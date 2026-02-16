@@ -306,7 +306,7 @@ impl TypeChecker {
                     Ok((HashMap::new(), Type::Borrow(Box::new(i))))
                 } else { Err(TypeError { message: "Not found".into(), span: e.span.clone() }) }
             }
-            Expr::Call { func, args, .. } => {
+            Expr::Call { func, args, perform } => {
                 let (mut s, ft) = if let Some(sch) = env.get(func).cloned() { (HashMap::new(), self.instantiate(&sch)) }
                 else { return Err(TypeError { message: format!("Fn {} not found", func), span: e.span.clone() }); };
                 let rt = self.new_var(); let pts: Vec<Type> = args.iter().map(|_| self.new_var()).collect(); let ec = self.new_var();
@@ -316,6 +316,18 @@ impl TypeChecker {
                 let eco = match eci { Type::Row(el, None) => Type::Row(el, Some(Box::new(self.new_var()))), Type::Unit => Type::Row(vec![], Some(Box::new(self.new_var()))), o => o };
                 let se = self.unify(&apply_subst_type(&s, ee), &eco).map_err(|m| TypeError { message: m, span: e.span.clone() })?;
                 s = compose_subst(&s, &se);
+
+                // Enforce perform
+                let actual_eff = apply_subst_type(&s, &ec);
+                let is_pure = match actual_eff {
+                    Type::Row(effs, tail) => effs.is_empty() && tail.is_none(),
+                    Type::Unit => true,
+                    _ => false,
+                };
+                if !perform && !is_pure {
+                    return Err(TypeError { message: "Effectful call requires 'perform'".into(), span: e.span.clone() });
+                }
+
                 for (pt, (_, ae)) in pts.iter().zip(args) {
                     let (sa, ta) = self.infer(env, ae, er, ee)?; s = compose_subst(&s, &sa);
                     let su = self.unify(&ta, &apply_subst_type(&s, pt)).map_err(|m| TypeError { message: m, span: ae.span.clone() })?;
