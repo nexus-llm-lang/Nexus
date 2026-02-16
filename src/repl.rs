@@ -1,6 +1,6 @@
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::{Config, DefaultEditor};
 use chumsky::prelude::*;
 
 use crate::ast::Program;
@@ -9,8 +9,16 @@ use crate::typecheck::TypeChecker;
 use crate::parser::stmt_parser;
 
 pub fn start() {
-    let mut rl = DefaultEditor::new().unwrap();
-    
+    let config = Config::builder()
+        .history_ignore_space(true)
+        .build();
+
+    let mut rl = DefaultEditor::with_config(config).unwrap();
+    let history_file = ".nexus_history";
+    if rl.load_history(history_file).is_err() {
+        // No history
+    }
+
     // Initialize empty program for context
     let program = Program { definitions: vec![] };
     let mut interpreter = Interpreter::new(program);
@@ -32,7 +40,7 @@ pub fn start() {
                     continue;
                 }
 
-                rl.add_history_entry(line_str).unwrap();
+                let _ = rl.add_history_entry(line.as_str());
 
                 // Parse
                 let parser = stmt_parser().then_ignore(end());
@@ -101,5 +109,9 @@ pub fn start() {
                 break;
             }
         }
+    }
+    
+    if let Err(e) = rl.save_history(history_file) {
+        println!("Error saving history: {}", e);
     }
 }
