@@ -90,7 +90,6 @@ impl TypeChecker {
         env.insert("db_driver.commit".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("tx".into(), Type::UserDefined("Tx".to_string(), vec![]))], Box::new(Type::Unit), Box::new(io_eff.clone())) });
         env.insert("db_driver.rollback".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("tx".into(), Type::UserDefined("Tx".to_string(), vec![]))], Box::new(Type::Unit), Box::new(io_eff.clone())) });
         env.insert("log.info".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("msg".into(), Type::Str)], Box::new(Type::Unit), Box::new(io_eff.clone())) });
-        env.insert("printf".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("fmt".into(), Type::Str), ("val".into(), Type::I64)], Box::new(Type::Unit), Box::new(io_eff.clone())) });
         env.insert("print_str".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("val".into(), Type::Str)], Box::new(Type::Unit), Box::new(io_eff.clone())) });
         env.insert("print_i64".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("val".into(), Type::I64)], Box::new(Type::Unit), Box::new(io_eff.clone())) });
         
@@ -339,6 +338,13 @@ impl TypeChecker {
                         let s4 = self.unify(&apply_subst_type(&s, &t2), &Type::I64).map_err(|m| TypeError { message: m, span: r.span.clone() })?;
                         s = compose_subst(&s, &s4);
                         Ok((s, Type::I64))
+                    }
+                    "++" => {
+                        let s3 = self.unify(&apply_subst_type(&s, &t1), &Type::Str).map_err(|m| TypeError { message: m, span: l.span.clone() })?;
+                        s = compose_subst(&s, &s3);
+                        let s4 = self.unify(&apply_subst_type(&s, &t2), &Type::Str).map_err(|m| TypeError { message: m, span: r.span.clone() })?;
+                        s = compose_subst(&s, &s4);
+                        Ok((s, Type::Str))
                     }
                     "+." | "-." | "*." | "/." => {
                         let s3 = self.unify(&apply_subst_type(&s, &t1), &Type::Float).map_err(|m| TypeError { message: m, span: l.span.clone() })?;

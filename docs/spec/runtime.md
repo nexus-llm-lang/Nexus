@@ -21,7 +21,7 @@ fn main() -> unit
 ### Execution
 
 When the program starts, the runtime executes the `main` function.
-Any side effects (such as printing to stdout via `printf` or logging) must be performed within `main` or functions called by it.
+Any side effects (such as printing to stdout via `print` or logging) must be performed within `main` or functions called by it.
 
 ### Exit Code
 

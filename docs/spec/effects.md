@@ -8,7 +8,7 @@ Effects are declared using the `effect` keyword in function signatures.
 
 ```nexus
 fn print_val(x: i64) -> unit effect { Console } do
-  perform printf(fmt: "{}", val: x)
+  perform print(val: "Value: " ++ to_string(val: x))
 endfn
 ```
 

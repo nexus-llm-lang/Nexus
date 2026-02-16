@@ -16,7 +16,7 @@ fn test_anonymous_record() {
         let r = { x: 1, y: "hello" }
         let i = r.x
         // let s = r.y // Type of s is Str. Unused variable? (No check yet)
-        perform printf(fmt: "i=%d", val: i)
+        perform print(val: "i=" ++ to_string(val: i))
         return ()
     endfn
     "#;

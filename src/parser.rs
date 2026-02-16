@@ -311,6 +311,7 @@ fn expr_parser() -> P<Spanned<Expr>> {
             just(">=").to(">=".to_string()),
             just("<").to("<".to_string()),
             just(">").to(">".to_string()),
+            just("++").to("++".to_string()),
             just("+").to("+".to_string()),
             just("-").to("-".to_string()),
             just("*").to("*".to_string()),

@@ -17,6 +17,8 @@ pub enum Value {
     List(Vec<Value>),
     Array(Rc<RefCell<Vec<Value>>>),
     Ref(Rc<RefCell<Value>>),
+    NativeFunction(String),
+    Function(String),
 }
 
 impl std::fmt::Display for Value {
@@ -64,6 +66,8 @@ impl std::fmt::Display for Value {
                 write!(f, " |]")
             }
             Value::Ref(_) => write!(f, "<ref>"),
+            Value::NativeFunction(n) => write!(f, "<native fn {}>", n),
+            Value::Function(n) => write!(f, "<fn {}>", n),
         }
     }
 }
@@ -295,6 +299,9 @@ impl Interpreter {
                             (Value::Int(a), "+", Value::Int(b)) => {
                                 Ok(ExprResult::Normal(Value::Int(a + b)))
                             }
+                            (Value::String(a), "++", Value::String(b)) => {
+                                Ok(ExprResult::Normal(Value::String(a + &b)))
+                            }
                             (Value::Int(a), "-", Value::Int(b)) => {
                                 Ok(ExprResult::Normal(Value::Int(a - b)))
                             }
@@ -357,6 +364,21 @@ impl Interpreter {
                     match res {
                         ExprResult::Normal(val) => evaluated_args.push(val),
                         ExprResult::EarlyReturn(val) => return Ok(ExprResult::EarlyReturn(val)),
+                    }
+                }
+
+                if let Some(val) = env.get(func) {
+                    match val {
+                        Value::NativeFunction(name) => {
+                            if let Some(res) = stdlib::handle_call(&name, &evaluated_args) {
+                                return res;
+                            }
+                        }
+                        Value::Function(name) => {
+                             let res = self.run_function(&name, evaluated_args)?;
+                             return Ok(ExprResult::Normal(res));
+                        }
+                        _ => {}
                     }
                 }
 
