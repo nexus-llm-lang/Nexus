@@ -99,6 +99,22 @@ impl TypeChecker {
             },
         );
 
+        env.insert(
+            "print_str".to_string(),
+            Scheme {
+                vars: vec![],
+                typ: Type::Arrow(vec![Type::Str], Box::new(Type::Unit)),
+            },
+        );
+
+        env.insert(
+            "print_i64".to_string(),
+            Scheme {
+                vars: vec![],
+                typ: Type::Arrow(vec![Type::I64], Box::new(Type::Unit)),
+            },
+        );
+
         TypeChecker { supply: 0, env }
     }
 
@@ -322,6 +338,25 @@ impl TypeChecker {
 
         // Tasks return Unit
         self.infer_body(&task.body, &mut task_env, &Type::Unit)
+    }
+
+    pub fn check_repl_stmt(&mut self, stmt: &Stmt) -> Result<Type, String> {
+        let mut env = std::mem::replace(&mut self.env, TypeEnv::new());
+        let res = (|| {
+            match stmt {
+                Stmt::Expr(expr) => {
+                    let (s, t) = self.infer(&env, expr, &Type::Unit)?;
+                    env.apply(&s);
+                    Ok(t)
+                }
+                _ => {
+                    self.infer_body(&[stmt.clone()], &mut env, &Type::Unit)?;
+                    Ok(Type::Unit)
+                }
+            }
+        })();
+        self.env = env;
+        res
     }
 
     fn infer(

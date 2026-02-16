@@ -21,6 +21,28 @@ pub fn handle_call(func: &str, args: &[Value]) -> Option<Result<ExprResult, Stri
                 Some(Err("First argument to printf must be a string".to_string()))
             }
         },
+        "print_str" => {
+            if args.len() != 1 {
+                return Some(Err("print_str requires exactly 1 argument".to_string()));
+            }
+            if let Value::String(s) = &args[0] {
+                println!("{}", s);
+                Some(Ok(ExprResult::Normal(Value::Unit)))
+            } else {
+                Some(Err("print_str requires a string".to_string()))
+            }
+        },
+        "print_i64" => {
+            if args.len() != 1 {
+                return Some(Err("print_i64 requires exactly 1 argument".to_string()));
+            }
+            if let Value::Int(i) = &args[0] {
+                println!("{}", i);
+                Some(Ok(ExprResult::Normal(Value::Unit)))
+            } else {
+                Some(Err("print_i64 requires an i64".to_string()))
+            }
+        },
         _ => None
     }
 }

@@ -8,12 +8,13 @@ mod parser;
 use std::env;
 
 mod interpreter;
+mod repl;
 mod typecheck;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: nexus <file.nx>");
+        repl::start();
         return;
     }
     let filename = &args[1];

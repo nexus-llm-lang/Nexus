@@ -191,7 +191,7 @@ fn expr_parser() -> P<Expr> {
     .boxed()
 }
 
-fn stmt_parser() -> P<Stmt> {
+pub fn stmt_parser() -> impl Parser<char, Stmt, Error = Simple<char>> {
     recursive(|stmt| {
         let expr = expr_parser();
 

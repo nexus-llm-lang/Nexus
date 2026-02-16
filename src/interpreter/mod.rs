@@ -58,7 +58,7 @@ impl Env {
 }
 
 pub struct Interpreter {
-    functions: HashMap<String, Function>,
+    pub functions: HashMap<String, Function>,
 }
 
 impl Interpreter {
@@ -70,6 +70,13 @@ impl Interpreter {
             }
         }
         Interpreter { functions }
+    }
+
+    pub fn eval_repl_stmt(&mut self, stmt: &Stmt, env: &mut Env) -> EvalResult {
+        match stmt {
+            Stmt::Expr(expr) => self.eval_expr(expr, env),
+            _ => self.eval_body(&[stmt.clone()], env),
+        }
     }
 
     pub fn run_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
