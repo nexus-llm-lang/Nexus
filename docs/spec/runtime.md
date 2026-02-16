@@ -1,0 +1,29 @@
+# Runtime & Entrypoint
+
+The Nexus language requires a specific entrypoint for execution.
+
+## Entrypoint: `main`
+
+Every executable program must define a `main` function.
+
+### Signature
+
+The `main` function must have the following signature:
+
+```nexus
+pub fn main() -> unit
+```
+
+- **Parameters**: It must take no arguments.
+- **Return Type**: It must return `unit`.
+- **Visibility**: It is conventionally marked as `pub`, though visibility rules for the entrypoint are currently relaxed.
+
+### Execution
+
+When the program starts, the runtime executes the `main` function.
+Any side effects (such as printing to stdout via `printf` or logging) must be performed within `main` or functions called by it.
+
+### Exit Code
+
+- If `main` executes successfully, the process exits with code 0.
+- If an unhandled error or panic occurs, the process exits with a non-zero code.
