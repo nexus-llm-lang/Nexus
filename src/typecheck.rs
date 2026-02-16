@@ -155,29 +155,39 @@ impl TypeChecker {
                 TopLevel::TypeDef(td) => {
                     self.env.types.insert(td.name.clone(), td.clone());
                 }
-                TopLevel::Function(func) => {
-                    let scheme = self.generalize_top_level(func);
-                    self.env.insert(func.name.clone(), scheme);
-                }
                 TopLevel::Port(port) => {
                     for sig in &port.functions {
                         let name = format!("{}.{}", port.name, sig.name);
                         let param_types: Vec<Type> =
                             sig.params.iter().map(|p| p.typ.clone()).collect();
-                        let typ = Type::Arrow(param_types, Box::new(sig.ret_type.clone()), Box::new(sig.effects.clone()));
+                        let typ = Type::Arrow(
+                            param_types,
+                            Box::new(sig.ret_type.clone()),
+                            Box::new(sig.effects.clone()),
+                        );
                         self.env.insert(name, Scheme { vars: vec![], typ });
                     }
+                }
+                TopLevel::Function(func) => {
+                    let scheme = self.generalize_top_level(func);
+                    self.env.insert(func.name.clone(), scheme);
                 }
                 _ => {}
             }
         }
 
         for def in &program.definitions {
-            if let TopLevel::Function(func) = def {
-                if func.name == "main" && func.is_public {
-                    return Err("main function must be private (remove 'pub')".to_string());
+            match def {
+                TopLevel::Function(func) => {
+                    if func.name == "main" && func.is_public {
+                        return Err("main function must be private (remove 'pub')".to_string());
+                    }
+                    self.check_function(func)?;
                 }
-                self.check_function(func)?;
+                TopLevel::Handler(handler) => {
+                    self.check_handler(handler)?;
+                }
+                _ => {}
             }
         }
 
@@ -257,6 +267,12 @@ impl TypeChecker {
                 tail.as_ref()
                     .map(|t| Box::new(self.convert_user_defined_to_var(t, vars))),
             ),
+            Type::Record(fields) => Type::Record(
+                fields
+                    .iter()
+                    .map(|(n, t)| (n.clone(), self.convert_user_defined_to_var(t, vars)))
+                    .collect(),
+            ),
             _ => typ.clone(),
         }
     }
@@ -287,6 +303,26 @@ impl TypeChecker {
         
         if !local_env.linear_vars.is_empty() {
              return Err(format!("Unused linear variables at end of function {}: {:?}", func.name, local_env.linear_vars));
+        }
+        Ok(())
+    }
+
+    fn check_handler(&mut self, handler: &Handler) -> Result<(), String> {
+        for func in &handler.functions {
+            let full_name = format!("{}.{}", handler.port_name, func.name);
+            if let Some(scheme) = self.env.get(&full_name).cloned() {
+                // Ensure the function signature in handler matches the port's signature.
+                let func_type = self.generalize_top_level(func).typ;
+                self.unify(&scheme.typ, &func_type)?;
+
+                // Now check the body
+                self.check_function(func)?;
+            } else {
+                return Err(format!(
+                    "Function {} not found in port {}",
+                    func.name, handler.port_name
+                ));
+            }
         }
         Ok(())
     }
@@ -567,17 +603,28 @@ impl TypeChecker {
             }
             Expr::Record(fields) => {
                 let mut subst = HashMap::new();
-                for (_, expr) in fields {
-                    let (s, _) = self.infer(env, expr, expected_ret, expected_eff)?;
+                let mut record_fields = Vec::new();
+                for (name, expr) in fields {
+                    let (s, t) = self.infer(env, expr, expected_ret, expected_eff)?;
                     subst = compose_subst(&subst, &s);
+                    record_fields.push((name.clone(), t));
                 }
                 Ok((
                     subst,
-                    Type::UserDefined("AnonymousRecord".to_string(), vec![]),
+                    Type::Record(record_fields),
                 ))
             }
             Expr::FieldAccess(receiver, field_name) => {
                 let (s1, t_rec) = self.infer(env, receiver, expected_ret, expected_eff)?;
+                let t_rec = apply_subst_type(&s1, &t_rec);
+
+                if let Type::Record(fields) = &t_rec {
+                    if let Some((_, t)) = fields.iter().find(|(n, _)| n == field_name) {
+                        return Ok((s1, t.clone()));
+                    }
+                    return Err(format!("Field {} not found in record", field_name));
+                }
+
                 if let Type::UserDefined(type_name, type_args) = &t_rec {
                     if let Some(td) = env.types.get(type_name).cloned() {
                         if let Some((_, f_type)) = td.fields.iter().find(|(n, _)| n == field_name) {
@@ -638,6 +685,10 @@ impl TypeChecker {
             Expr::Match { target, cases } => {
                 let (s1, t_target) = self.infer(env, target, expected_ret, expected_eff)?;
                 let mut s = s1;
+                
+                if let Err(e) = self.check_exhaustiveness(&apply_subst_type(&s, &t_target), cases) {
+                    return Err(e);
+                }
                 
                 // For match, we need to ensure all cases consume same linear vars.
                 // We'll track the "resulting available vars" from the first case, and compare others.
@@ -749,7 +800,61 @@ impl TypeChecker {
                 };
                 self.unify(t_target, &t_lit)
             }
-            Pattern::Wildcard => Ok(HashMap::new()),
+            Pattern::Wildcard => {
+                if contains_linear(t_target) {
+                    return Err(format!("Cannot discard linear type with wildcard pattern: {:?}", t_target));
+                }
+                Ok(HashMap::new())
+            },
+            Pattern::Record(pat_fields, is_open) => {
+                // Resolve target to fields
+                let target_fields_map = match t_target {
+                    Type::Record(fields) => {
+                        let mut map = HashMap::new();
+                        for (n, t) in fields { map.insert(n.clone(), t.clone()); }
+                        map
+                    },
+                    Type::UserDefined(name, args) => {
+                        if let Some(td) = env.types.get(name).cloned() {
+                            let mut map = HashMap::new();
+                            let mut subst = HashMap::new();
+                            for (p, a) in td.type_params.iter().zip(args) {
+                                subst.insert(p.clone(), a.clone());
+                            }
+                            for (n, t) in &td.fields {
+                                map.insert(n.clone(), apply_subst_type(&subst, t));
+                            }
+                            map
+                        } else {
+                            return Err(format!("Unknown type or not a record: {}", name));
+                        }
+                    },
+                    _ => return Err(format!("Pattern record match against non-record type: {:?}", t_target)),
+                };
+
+                let mut subst = HashMap::new();
+                let mut matched_fields = HashSet::new();
+
+                for (name, pat) in pat_fields {
+                    if let Some(t_field) = target_fields_map.get(name) {
+                        let s_field = self.bind_pattern(pat, &apply_subst_type(&subst, t_field), env)?;
+                        subst = compose_subst(&subst, &s_field);
+                        matched_fields.insert(name.clone());
+                    } else {
+                         return Err(format!("Field {} not found in target type", name));
+                    }
+                }
+
+                if !is_open {
+                    for key in target_fields_map.keys() {
+                        if !matched_fields.contains(key) {
+                            return Err(format!("Missing field in pattern: {}", key));
+                        }
+                    }
+                }
+                
+                Ok(subst)
+            }
         }
     }
 
@@ -759,6 +864,179 @@ impl TypeChecker {
             subst.insert(var.clone(), self.new_var());
         }
         apply_subst_type(&subst, &scheme.typ)
+    }
+
+    fn check_exhaustiveness(&self, target_type: &Type, cases: &[MatchCase]) -> Result<(), String> {
+        let patterns: Vec<&Pattern> = cases.iter().map(|c| &c.pattern).collect();
+        // Convert to matrix (Nx1)
+        let matrix: Vec<Vec<&Pattern>> = patterns.iter().map(|p| vec![*p]).collect();
+        let types = vec![target_type];
+        self.check_matrix(&matrix, &types)
+    }
+
+    fn check_matrix(&self, matrix: &[Vec<&Pattern>], types: &[&Type]) -> Result<(), String> {
+        if matrix.is_empty() {
+            return Err("Non-exhaustive patterns".to_string());
+        }
+        if types.is_empty() {
+            return Ok(());
+        }
+
+        let first_type = types[0];
+        let rest_types = &types[1..];
+
+        // Check if first column has wildcard
+        // But we need to handle constructors.
+        // Simplified: Split based on type.
+
+        match first_type {
+            Type::Bool => {
+                self.check_constructor_matrix(matrix, "true", 0, &[], rest_types)?;
+                self.check_constructor_matrix(matrix, "false", 0, &[], rest_types)?;
+                Ok(())
+            },
+            Type::Result(ok, err) => {
+                self.check_constructor_matrix(matrix, "Ok", 1, &[&**ok], rest_types)?;
+                self.check_constructor_matrix(matrix, "Err", 1, &[&**err], rest_types)?;
+                Ok(())
+            },
+            Type::Record(fields) => {
+                // Product type. Expand.
+                // New types: fields types + rest_types.
+                let mut field_types: Vec<&Type> = fields.iter().map(|(_, t)| t).collect();
+                field_types.extend_from_slice(rest_types);
+                
+                // Expand matrix
+                let mut new_matrix = Vec::new();
+                for row in matrix {
+                    let p = row[0];
+                    let rest_row = &row[1..];
+                    
+                    match p {
+                        Pattern::Record(pat_fields, is_open) => {
+                            // Map pat_fields to ordered fields.
+                            // If is_open and missing, Wildcard.
+                            // If !is_open and missing, impossible (checked by bind).
+                            let mut new_row = Vec::new();
+                            for (fname, _) in fields {
+                                if let Some((_, pat)) = pat_fields.iter().find(|(n, _)| n == fname) {
+                                    new_row.push(pat);
+                                } else if *is_open {
+                                    new_row.push(&Pattern::Wildcard);
+                                } else {
+                                    // Should not happen if well-typed
+                                    new_row.push(&Pattern::Wildcard); 
+                                }
+                            }
+                            new_row.extend_from_slice(rest_row);
+                            new_matrix.push(new_row);
+                        },
+                        Pattern::Wildcard | Pattern::Variable(..) => {
+                             // Expand wildcard to wildcards for all fields
+                             let mut new_row = vec![&Pattern::Wildcard; fields.len()];
+                             new_row.extend_from_slice(rest_row);
+                             new_matrix.push(new_row);
+                        },
+                        _ => {} // Skip mismatched patterns (shouldn't happen)
+                    }
+                }
+                self.check_matrix(&new_matrix, &field_types)
+            },
+            Type::Unit => {
+                self.check_constructor_matrix(matrix, "()", 0, &[], rest_types)?;
+                Ok(())
+            }
+            Type::UserDefined(name, _) => {
+                 // Try to resolve to Record/TypeDef?
+                 // If nominal type, we need to know if it's enum or struct.
+                 // Currently only TypeDef (Record-like).
+                 // So treat as Record if found in env?
+                 // check_exhaustiveness calls check_matrix.
+                 // env is not passed to check_matrix easily (self has env, but check_matrix is distinct?)
+                 // self is TypeChecker.
+                 if let Some(td) = self.env.types.get(name) {
+                     // It is a struct (record).
+                     // Treat same as Record.
+                     // Construct Type::Record equivalent for logic.
+                     // But types slice contains references.
+                     // We need to construct owned Type::Record or handle UserDefined same as Record logic.
+                     // Duplicate Record logic or recursion?
+                     // I'll assume Record logic logic.
+                     // We need to resolve generics? Yes.
+                     // But types[0] is instantiated type?
+                     // No, Type::UserDefined holds args.
+                     // So we can resolve field types.
+                     // This is complex.
+                     // For now, assume UserDefined requires Wildcard unless it is opaque?
+                     // Fallback to "Wildcard required".
+                     self.check_wildcard_matrix(matrix, rest_types)
+                 } else {
+                     self.check_wildcard_matrix(matrix, rest_types)
+                 }
+            },
+            _ => {
+                // Int, Str, etc.
+                self.check_wildcard_matrix(matrix, rest_types)
+            }
+        }
+    }
+
+    fn check_wildcard_matrix(&self, matrix: &[Vec<&Pattern>], rest_types: &[&Type]) -> Result<(), String> {
+         // Filter rows starting with Wildcard/Variable.
+         let mut new_matrix = Vec::new();
+         for row in matrix {
+             match row[0] {
+                 Pattern::Wildcard | Pattern::Variable(..) => {
+                     new_matrix.push(row[1..].to_vec());
+                 },
+                 _ => {}
+             }
+         }
+         if new_matrix.is_empty() {
+             return Err("Non-exhaustive: missing wildcard/variable case".to_string());
+         }
+         self.check_matrix(&new_matrix, rest_types)
+    }
+
+    fn check_constructor_matrix(&self, matrix: &[Vec<&Pattern>], ctor: &str, arity: usize, arg_types: &[&Type], rest_types: &[&Type]) -> Result<(), String> {
+        let mut new_matrix = Vec::new();
+        let mut new_types = arg_types.to_vec();
+        new_types.extend_from_slice(rest_types);
+
+        for row in matrix {
+            let p = row[0];
+            let rest = &row[1..];
+            match p {
+                 Pattern::Constructor(c, args) => {
+                     if c == ctor {
+                         let mut new_row: Vec<&Pattern> = args.iter().collect();
+                         new_row.extend_from_slice(rest);
+                         new_matrix.push(new_row);
+                     }
+                 },
+                 Pattern::Literal(lit) => {
+                     let name = match lit {
+                         Literal::Bool(true) => "true",
+                         Literal::Bool(false) => "false",
+                         Literal::Unit => "()",
+                         _ => "",
+                     };
+                     if name == ctor {
+                         let mut new_row = Vec::new(); // arity 0
+                         new_row.extend_from_slice(rest);
+                         new_matrix.push(new_row);
+                     }
+                 },
+                 Pattern::Wildcard | Pattern::Variable(..) => {
+                     let mut new_row = vec![&Pattern::Wildcard; arity];
+                     new_row.extend_from_slice(rest);
+                     new_matrix.push(new_row);
+                 },
+                 _ => {}
+            }
+        }
+        
+        self.check_matrix(&new_matrix, &new_types).map_err(|_| format!("Non-exhaustive: missing {} case", ctor))
     }
 
     fn generalize(&self, env: &TypeEnv, typ: Type) -> Scheme {
@@ -837,6 +1115,25 @@ impl TypeChecker {
 
                 Ok(s)
             }
+            (Type::Record(f1), Type::Record(f2)) => {
+                if f1.len() != f2.len() {
+                    return Err("Record arity mismatch".into());
+                }
+                let mut f1_sorted = f1.clone();
+                f1_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut f2_sorted = f2.clone();
+                f2_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+                let mut s = HashMap::new();
+                for ((n1, t1), (n2, t2)) in f1_sorted.iter().zip(f2_sorted.iter()) {
+                    if n1 != n2 {
+                        return Err(format!("Record field mismatch: {} vs {}", n1, n2));
+                    }
+                    let s_new = self.unify(&apply_subst_type(&s, t1), &apply_subst_type(&s, t2))?;
+                    s = compose_subst(&s, &s_new);
+                }
+                Ok(s)
+            }
             (Type::UserDefined(n1, args1), Type::UserDefined(n2, args2)) if n1 == n2 => {
                 if args1.len() != args2.len() {
                     return Err("Generic arity mismatch".into());
@@ -881,6 +1178,12 @@ pub fn apply_subst_type(subst: &Subst, typ: &Type) -> Type {
         Type::Row(effs, tail) => Type::Row(
             effs.iter().map(|e| apply_subst_type(subst, e)).collect(),
             tail.as_ref().map(|t| Box::new(apply_subst_type(subst, t))),
+        ),
+        Type::Record(fields) => Type::Record(
+            fields
+                .iter()
+                .map(|(n, t)| (n.clone(), apply_subst_type(subst, t)))
+                .collect(),
         ),
         _ => typ.clone(),
     }
@@ -933,6 +1236,13 @@ fn get_free_vars_type(typ: &Type) -> HashSet<String> {
             }
             s
         }
+        Type::Record(fields) => {
+            let mut s = HashSet::new();
+            for (_, t) in fields {
+                s.extend(get_free_vars_type(t));
+            }
+            s
+        }
         _ => HashSet::new(),
     }
 }
@@ -960,6 +1270,7 @@ fn occurs_check(name: &str, typ: &Type) -> bool {
         Type::Row(effs, tail) => {
             effs.iter().any(|e| occurs_check(name, e)) || tail.as_ref().map_or(false, |t| occurs_check(name, t))
         }
+        Type::Record(fields) => fields.iter().any(|(_, t)| occurs_check(name, t)),
         _ => false,
     }
 }
@@ -974,6 +1285,7 @@ fn contains_ref(typ: &Type) -> bool {
         Type::Row(effs, tail) => {
             effs.iter().any(contains_ref) || tail.as_ref().map_or(false, |t| contains_ref(t))
         }
+        Type::Record(fields) => fields.iter().any(|(_, t)| contains_ref(t)),
         _ => false,
     }
 }
@@ -988,6 +1300,7 @@ fn contains_linear(typ: &Type) -> bool {
         Type::Row(effs, tail) => {
             effs.iter().any(contains_linear) || tail.as_ref().map_or(false, |t| contains_linear(t))
         }
+        Type::Record(fields) => fields.iter().any(|(_, t)| contains_linear(t)),
         _ => false,
     }
 }

@@ -55,6 +55,7 @@ pub enum Pattern {
     Literal(Literal),
     Variable(String, Sigil), // e.g. case Ok(%new_tx)
     Constructor(String, Vec<Pattern>),
+    Record(Vec<(String, Pattern)>, bool), // { x: p, _ }
     Wildcard,
 }
 

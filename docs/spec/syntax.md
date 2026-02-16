@@ -41,7 +41,7 @@ endif
 
 ### Match
 
-Pattern matching is supported via `match`.
+Pattern matching is supported via `match`. The compiler enforces exhaustiveness, ensuring all possible cases are covered.
 
 ```nexus
 match result do
@@ -51,6 +51,23 @@ match result do
     // ...
 endmatch
 ```
+
+Supported patterns:
+- **Literals**: `1`, `true`, `"string"`.
+- **Constructors**: `Ok(x)`, `Err(e)`.
+- **Records**: `{ x: p1, y: p2 }` (exact match) or `{ x: p1, _ }` (partial match).
+- **Wildcard**: `_` (matches anything).
+- **Variables**: `x` (binds value).
+
+Example of record matching:
+```nexus
+match point do
+  case { x: 0, y: 0 } -> ...
+  case { x: _, y: 0 } -> ...
+  case _ -> ...
+endmatch
+```
+
 
 ## Comments
 

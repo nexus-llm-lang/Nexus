@@ -239,11 +239,12 @@ pub fn stmt_parser() -> impl Parser<char, Stmt, Error = Simple<char>> {
             .padded()
             .ignore_then(sigil())
             .then(ident())
+            .then(just(':').padded().ignore_then(type_parser()).or_not())
             .then(just('=').padded().ignore_then(expr.clone()))
-            .map(|((s, n), v)| Stmt::Let {
+            .map(|(((s, n), t), v)| Stmt::Let {
                 name: n,
                 sigil: s,
-                typ: None,
+                typ: t,
                 value: v,
             });
 
@@ -289,12 +290,41 @@ pub fn stmt_parser() -> impl Parser<char, Stmt, Error = Simple<char>> {
 
             let constructor = ident()
                 .then(
-                    p.separated_by(just(',').padded())
+                    p.clone().separated_by(just(',').padded())
                         .delimited_by(just('('), just(')')),
                 )
                 .map(|(c, args)| Pattern::Constructor(c, args));
 
-            choice((constructor, lit, wildcard, variable))
+            let record_pat = choice((
+                just('_').padded().to(None),
+                ident().then_ignore(just(':').padded()).then(p.clone()).map(Some),
+            ))
+            .separated_by(just(',').padded())
+            .allow_trailing()
+            .delimited_by(just('{'), just('}'))
+            .try_map(|entries, span| {
+                let mut fields = Vec::new();
+                let mut open = false;
+                for e in entries {
+                    match e {
+                        Some(f) => {
+                            if open {
+                                return Err(Simple::custom(span, "_ must be the last element"));
+                            }
+                            fields.push(f);
+                        }
+                        None => {
+                            if open {
+                                return Err(Simple::custom(span, "duplicate _"));
+                            }
+                            open = true;
+                        }
+                    }
+                }
+                Ok(Pattern::Record(fields, open))
+            });
+
+            choice((constructor, record_pat, lit, wildcard, variable))
         });
 
         let match_case = text::keyword("case")
