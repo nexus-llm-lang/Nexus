@@ -192,3 +192,14 @@ fn test_arg_mismatch() {
     "#;
     assert!(check_code(src).is_err());
 }
+
+#[test]
+fn test_label_mismatch() {
+    let src = r#"
+    fn foo(x: i64) -> i64 do return x endfn
+    fn main() -> i64 do
+        return foo(y: 10) // Fails due to label 'y'
+    endfn
+    "#;
+    assert!(check_code(src).is_err());
+}

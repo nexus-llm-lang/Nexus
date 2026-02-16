@@ -13,13 +13,14 @@ fn check(src: &str) -> Result<(), String> {
 fn test_linear_basic_pass() {
     let src = r#"
     fn consume(x: %i64) -> unit do
-        perform drop_i64(x: x)
+        drop_i64(val: x)
         return ()
     endfn
 
     fn main() -> unit do
         let %x = 10
-        perform consume(x: %x)
+        consume(x: %x)
+        return ()
     endfn
     "#;
     match check(src) {
@@ -70,16 +71,16 @@ fn test_linear_match_wildcard_fail() {
 #[test]
 fn test_linear_borrow_basic() {
     let src = r#"
-    fn peek(x: &i64) -> unit do
+    fn peek(x: &i64) -> unit effect { IO } do
         perform print_i64(val: x)
         return ()
     endfn
 
-    fn main() -> unit do
+    fn main() -> unit effect { IO } do
         let %x = 10
         perform peek(x: borrow %x)
         perform peek(x: borrow %x) // Borrow again
-        perform drop_i64(x: %x)    // Finally consume
+        drop_i64(val: %x)    // Finally consume
         return ()
     endfn
     "#;
@@ -109,8 +110,8 @@ fn test_linear_double_use_fail() {
 
     fn main() -> unit do
         let %x = 10
-        perform consume(x: %x)
-        perform consume(x: %x) // Double use
+        consume(x: %x)
+        consume(x: %x) // Double use
     endfn
     "#;
     assert!(check(src).is_err(), "Should fail because %x is used twice");
@@ -126,7 +127,7 @@ fn test_linear_branch_mismatch() {
     fn main() -> unit do
         let %x = 10
         if true then
-            perform consume(x: %x)
+            consume(x: %x)
         else
             // %x not consumed here
             return ()

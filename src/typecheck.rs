@@ -80,17 +80,37 @@ pub struct TypeChecker {
 impl TypeChecker {
     pub fn new() -> Self {
         let mut env = TypeEnv::new();
+        // Define IO type
+        env.types.insert("IO".to_string(), TypeDef { name: "IO".to_string(), type_params: vec![], fields: vec![] });
+        let io_eff = Type::Row(vec![Type::UserDefined("IO".into(), vec![])], None);
+        
         let scheme_tx = Scheme { vars: vec![], typ: Type::UserDefined("Tx".to_string(), vec![]) };
 
-        env.insert("db_driver.begin_tx".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![], Box::new(scheme_tx.typ.clone()), Box::new(Type::Row(vec![], None))) });
-        env.insert("db_driver.commit".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![Type::UserDefined("Tx".to_string(), vec![])], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
-        env.insert("db_driver.rollback".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![Type::UserDefined("Tx".to_string(), vec![])], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
-        env.insert("log.info".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![Type::Str], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
-        env.insert("printf".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![Type::Str, Type::I64], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
-        env.insert("print_str".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![Type::Str], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
-        env.insert("print_i64".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![Type::I64], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
-        env.insert("drop_i64".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![Type::Linear(Box::new(Type::I64))], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
-        env.insert("drop_array".to_string(), Scheme { vars: vec!["T".into()], typ: Type::Arrow(vec![Type::Array(Box::new(Type::Var("T".into())))], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
+        env.insert("db_driver.begin_tx".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![], Box::new(scheme_tx.typ.clone()), Box::new(io_eff.clone())) });
+        env.insert("db_driver.commit".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("tx".into(), Type::UserDefined("Tx".to_string(), vec![]))], Box::new(Type::Unit), Box::new(io_eff.clone())) });
+        env.insert("db_driver.rollback".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("tx".into(), Type::UserDefined("Tx".to_string(), vec![]))], Box::new(Type::Unit), Box::new(io_eff.clone())) });
+        env.insert("log.info".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("msg".into(), Type::Str)], Box::new(Type::Unit), Box::new(io_eff.clone())) });
+        env.insert("printf".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("fmt".into(), Type::Str), ("val".into(), Type::I64)], Box::new(Type::Unit), Box::new(io_eff.clone())) });
+        env.insert("print_str".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("val".into(), Type::Str)], Box::new(Type::Unit), Box::new(io_eff.clone())) });
+        env.insert("print_i64".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("val".into(), Type::I64)], Box::new(Type::Unit), Box::new(io_eff.clone())) });
+        
+        env.insert(
+            "print".to_string(),
+            Scheme {
+                vars: vec!["T".to_string()],
+                typ: Type::Arrow(vec![("val".into(), Type::Var("T".to_string()))], Box::new(Type::Unit), Box::new(io_eff.clone())),
+            },
+        );
+        env.insert(
+            "to_string".to_string(),
+            Scheme {
+                vars: vec!["T".to_string()],
+                typ: Type::Arrow(vec![("val".into(), Type::Var("T".to_string()))], Box::new(Type::Str), Box::new(Type::Row(vec![], None))),
+            },
+        );
+
+        env.insert("drop_i64".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![("val".into(), Type::Linear(Box::new(Type::I64)))], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
+        env.insert("drop_array".to_string(), Scheme { vars: vec!["T".into()], typ: Type::Arrow(vec![("arr".into(), Type::Array(Box::new(Type::Var("T".into()))))], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
 
         env.linear_vars.clear();
         TypeChecker { supply: 0, env }
@@ -118,7 +138,7 @@ impl TypeChecker {
                 TopLevel::Port(port) => {
                     for sig in &port.functions {
                         let name = format!("{}.{}", port.name, sig.name);
-                        let ptypes: Vec<Type> = sig.params.iter().map(|p| p.typ.clone()).collect();
+                        let ptypes: Vec<(String, Type)> = sig.params.iter().map(|p| (p.name.clone(), p.typ.clone())).collect();
                         self.env.insert(name, Scheme { vars: vec![], typ: Type::Arrow(ptypes, Box::new(sig.ret_type.clone()), Box::new(sig.effects.clone())) });
                     }
                 }
@@ -143,7 +163,7 @@ impl TypeChecker {
 
     fn generalize_top_level(&self, func: &Function) -> Scheme {
         let vars: HashSet<String> = func.type_params.iter().cloned().collect();
-        let pts: Vec<Type> = func.params.iter().map(|p| self.convert_user_defined_to_var(&p.typ, &vars)).collect();
+        let pts: Vec<(String, Type)> = func.params.iter().map(|p| (p.name.clone(), self.convert_user_defined_to_var(&p.typ, &vars))).collect();
         let rt = self.convert_user_defined_to_var(&func.ret_type, &vars);
         let ef = self.convert_user_defined_to_var(&func.effects, &vars);
         Scheme { vars: func.type_params.clone(), typ: Type::Arrow(pts, Box::new(rt), Box::new(ef)) }
@@ -152,7 +172,7 @@ impl TypeChecker {
     fn convert_user_defined_to_var(&self, typ: &Type, vars: &HashSet<String>) -> Type {
         match typ {
             Type::UserDefined(n, args) => { if args.is_empty() && vars.contains(n) { Type::Var(n.clone()) } else { Type::UserDefined(n.clone(), args.iter().map(|a| self.convert_user_defined_to_var(a, vars)).collect()) } }
-            Type::Arrow(p, r, e) => Type::Arrow(p.iter().map(|t| self.convert_user_defined_to_var(t, vars)).collect(), Box::new(self.convert_user_defined_to_var(r, vars)), Box::new(self.convert_user_defined_to_var(e, vars))),
+            Type::Arrow(p, r, e) => Type::Arrow(p.iter().map(|(n, t)| (n.clone(), self.convert_user_defined_to_var(t, vars))).collect(), Box::new(self.convert_user_defined_to_var(r, vars)), Box::new(self.convert_user_defined_to_var(e, vars))),
             Type::Result(o, e) => Type::Result(Box::new(self.convert_user_defined_to_var(o, vars)), Box::new(self.convert_user_defined_to_var(e, vars))),
             Type::Ref(i) => Type::Ref(Box::new(self.convert_user_defined_to_var(i, vars))),
             Type::Linear(i) => Type::Linear(Box::new(self.convert_user_defined_to_var(i, vars))),
@@ -354,7 +374,9 @@ impl TypeChecker {
             Expr::Call { func, args, perform } => {
                 let (mut s, ft) = if let Some(sch) = env.get(func).cloned() { (HashMap::new(), self.instantiate(&sch)) }
                 else { return Err(TypeError { message: format!("Fn {} not found", func), span: e.span.clone() }); };
-                let rt = self.new_var(); let pts: Vec<Type> = args.iter().map(|_| self.new_var()).collect(); let ec = self.new_var();
+                let rt = self.new_var(); 
+                let pts: Vec<(String, Type)> = args.iter().map(|(n, _)| (n.clone(), self.new_var())).collect(); 
+                let ec = self.new_var();
                 let sf = self.unify(&ft, &Type::Arrow(pts.clone(), Box::new(rt.clone()), Box::new(ec.clone()))).map_err(|m| TypeError { message: m, span: e.span.clone() })?;
                 s = compose_subst(&s, &sf);
                 let eci = apply_subst_type(&s, &ec);
@@ -372,8 +394,11 @@ impl TypeChecker {
                 if !perform && !is_pure {
                     return Err(TypeError { message: "Effectful call requires 'perform'".into(), span: e.span.clone() });
                 }
+                if *perform && is_pure {
+                    return Err(TypeError { message: "Pure call should not use 'perform'".into(), span: e.span.clone() });
+                }
 
-                for (pt, (_, ae)) in pts.iter().zip(args) {
+                for ((_, pt), (_, ae)) in pts.iter().zip(args) {
                     let (sa, ta) = self.infer(env, ae, er, ee)?; s = compose_subst(&s, &sa);
                     let su = self.unify(&ta, &apply_subst_type(&s, pt)).map_err(|m| TypeError { message: m, span: ae.span.clone() })?;
                     s = compose_subst(&s, &su);
@@ -666,7 +691,10 @@ impl TypeChecker {
             (Type::Arrow(p1, r1, e1), Type::Arrow(p2, r2, e2)) => {
                 if p1.len() != p2.len() { return Err("Arity mismatch".into()); }
                 let mut s = HashMap::new();
-                for (a, b) in p1.iter().zip(p2) { let sn = self.unify(&apply_subst_type(&s, a), &apply_subst_type(&s, b))?; s = compose_subst(&s, &sn); }
+                for ((n1, t1), (n2, t2)) in p1.iter().zip(p2) {
+                    if n1 != n2 { return Err(format!("Label mismatch: {} vs {}", n1, n2)); }
+                    let sn = self.unify(&apply_subst_type(&s, t1), &apply_subst_type(&s, t2))?; s = compose_subst(&s, &sn);
+                }
                 let sr = self.unify(&apply_subst_type(&s, r1), &apply_subst_type(&s, r2))?; s = compose_subst(&s, &sr);
                 let se = self.unify(&apply_subst_type(&s, e1), &apply_subst_type(&s, e2))?; s = compose_subst(&s, &se);
                 Ok(s)
@@ -705,7 +733,7 @@ impl TypeChecker {
 pub fn apply_subst_type(subst: &Subst, typ: &Type) -> Type {
     match typ {
         Type::Var(n) => subst.get(n).cloned().unwrap_or(typ.clone()),
-        Type::Arrow(p, r, e) => Type::Arrow(p.iter().map(|t| apply_subst_type(subst, t)).collect(), Box::new(apply_subst_type(subst, r)), Box::new(apply_subst_type(subst, e))),
+        Type::Arrow(p, r, e) => Type::Arrow(p.iter().map(|(n, t)| (n.clone(), apply_subst_type(subst, t))).collect(), Box::new(apply_subst_type(subst, r)), Box::new(apply_subst_type(subst, e))),
         Type::UserDefined(n, a) => Type::UserDefined(n.clone(), a.iter().map(|t| apply_subst_type(subst, t)).collect()),
         Type::Result(o, e) => Type::Result(Box::new(apply_subst_type(subst, o)), Box::new(apply_subst_type(subst, e))),
         Type::Ref(i) => Type::Ref(Box::new(apply_subst_type(subst, i))),
@@ -726,7 +754,7 @@ fn compose_subst(s1: &Subst, s2: &Subst) -> Subst {
 fn get_free_vars_type(typ: &Type) -> HashSet<String> {
     match typ {
         Type::Var(n) => { let mut s = HashSet::new(); s.insert(n.clone()); s }
-        Type::Arrow(p, r, e) => { let mut s = get_free_vars_type(r); for t in p { s.extend(get_free_vars_type(t)); } s.extend(get_free_vars_type(e)); s }
+        Type::Arrow(p, r, e) => { let mut s = get_free_vars_type(r); for (_, t) in p { s.extend(get_free_vars_type(t)); } s.extend(get_free_vars_type(e)); s }
         Type::UserDefined(_, a) => { let mut s = HashSet::new(); for t in a { s.extend(get_free_vars_type(t)); } s }
         Type::Result(o, e) => { let mut s = get_free_vars_type(o); s.extend(get_free_vars_type(e)); s }
         Type::Ref(i) | Type::Linear(i) | Type::Borrow(i) | Type::List(i) | Type::Array(i) => get_free_vars_type(i),
@@ -743,7 +771,7 @@ fn get_free_vars_env(env: &TypeEnv) -> HashSet<String> {
 fn occurs_check(n: &str, t: &Type) -> bool {
     match t {
         Type::Var(m) => n == m,
-        Type::Arrow(p, r, e) => occurs_check(n, r) || p.iter().any(|x| occurs_check(n, x)) || occurs_check(n, e),
+        Type::Arrow(p, r, e) => occurs_check(n, r) || p.iter().any(|(_, x)| occurs_check(n, x)) || occurs_check(n, e),
         Type::UserDefined(_, a) => a.iter().any(|x| occurs_check(n, x)),
         Type::Result(o, e) => occurs_check(n, o) || occurs_check(n, e),
         Type::Ref(i) | Type::Linear(i) | Type::Borrow(i) | Type::List(i) | Type::Array(i) => occurs_check(n, i),
@@ -756,7 +784,7 @@ fn occurs_check(n: &str, t: &Type) -> bool {
 fn contains_ref(t: &Type) -> bool {
     match t {
         Type::Ref(_) => true,
-        Type::Arrow(p, r, e) => contains_ref(r) || p.iter().any(contains_ref) || contains_ref(e),
+        Type::Arrow(p, r, e) => contains_ref(r) || p.iter().any(|(_, x)| contains_ref(x)) || contains_ref(e),
         Type::UserDefined(_, a) => a.iter().any(contains_ref),
         Type::Result(o, e) => contains_ref(o) || contains_ref(e),
         Type::Linear(i) | Type::Borrow(i) | Type::List(i) | Type::Array(i) => contains_ref(i),
@@ -770,7 +798,7 @@ fn contains_linear(t: &Type) -> bool {
     match t {
         Type::Linear(_) | Type::Array(_) => true,
         Type::Ref(i) | Type::Borrow(i) | Type::List(i) => contains_linear(i),
-        Type::Arrow(p, r, e) => contains_linear(r) || p.iter().any(contains_linear) || contains_linear(e),
+        Type::Arrow(p, r, e) => contains_linear(r) || p.iter().any(|(_, x)| contains_linear(x)) || contains_linear(e),
         Type::UserDefined(_, a) => a.iter().any(contains_linear),
         Type::Result(o, e) => contains_linear(o) || contains_linear(e),
         Type::Row(es, t) => es.iter().any(contains_linear) || t.as_ref().map_or(false, |x| contains_linear(x)),

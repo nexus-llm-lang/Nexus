@@ -11,7 +11,8 @@ fn type_bool() -> Type { Type::Bool }
 fn type_unit() -> Type { Type::Unit }
 fn type_var(n: &str) -> Type { Type::UserDefined(n.to_string(), vec![]) }
 fn type_arrow(params: Vec<Type>, ret: Type) -> Type {
-    Type::Arrow(params, Box::new(ret), Box::new(Type::Row(vec![], None)))
+    let labeled: Vec<(String, Type)> = params.into_iter().enumerate().map(|(i, t)| (format!("arg{}", i), t)).collect();
+    Type::Arrow(labeled, Box::new(ret), Box::new(Type::Row(vec![], None)))
 }
 
 fn expr_lit_int(i: i64) -> Spanned<Expr> {
@@ -172,18 +173,18 @@ fn test_prop_higher_order_apply() {
         ],
         ret_type: type_var("B"),
         effects: Type::Row(vec![], None),
-        body: vec![spanned(Stmt::Return(expr_call("f", vec![("arg", expr_var("x"))])))],
+        body: vec![spanned(Stmt::Return(expr_call("f", vec![("arg0", expr_var("x"))])))],
     };
 
     let func_to_int = Function {
         name: "to_int".to_string(),
         is_public: false,
         type_params: vec![],
-        params: vec![Param { name: "b".to_string(), sigil: Sigil::Immutable, typ: type_bool() }],
+        params: vec![Param { name: "arg0".to_string(), sigil: Sigil::Immutable, typ: type_bool() }],
         ret_type: type_i64(),
         effects: Type::Row(vec![], None),
         body: vec![spanned(Stmt::Expr(spanned(Expr::If {
-            cond: Box::new(expr_var("b")),
+            cond: Box::new(expr_var("arg0")),
             then_branch: vec![spanned(Stmt::Return(expr_lit_int(1)))],
             else_branch: Some(vec![spanned(Stmt::Return(expr_lit_int(0)))]),
         })))],

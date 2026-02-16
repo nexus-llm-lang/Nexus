@@ -12,7 +12,7 @@ fn check(src: &str) -> Result<(), String> {
 #[test]
 fn test_anonymous_record() {
     let src = r#"
-    fn main() -> unit do
+    fn main() -> unit effect { IO } do
         let r = { x: 1, y: "hello" }
         let i = r.x
         // let s = r.y // Type of s is Str. Unused variable? (No check yet)
@@ -34,8 +34,9 @@ fn test_record_unification() {
     fn main() -> unit do
         let r1 = { x: 1, y: 2 }
         let r2 = { y: 2, x: 1 } // Different order
-        perform take_record(r: r1)
-        perform take_record(r: r2)
+        take_record(r: r1)
+        take_record(r: r2)
+        return ()
     endfn
     "#;
     assert!(check(src).is_ok());

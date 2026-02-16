@@ -18,7 +18,7 @@ pub enum Type {
     Result(Box<Type>, Box<Type>),
     UserDefined(String, Vec<Type>),
     Var(String),
-    Arrow(Vec<Type>, Box<Type>, Box<Type>),
+    Arrow(Vec<(String, Type)>, Box<Type>, Box<Type>),
     Ref(Box<Type>),
     Linear(Box<Type>), // %T
     Row(Vec<Type>, Option<Box<Type>>), // { E1, E2 | r }

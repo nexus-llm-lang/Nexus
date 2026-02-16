@@ -15,17 +15,17 @@ fn run(src: &str) -> Result<Value, String> {
 fn test_port_basic() {
     let src = r#"
     port Logger do
-      fn log(msg: str) -> unit
+      fn log(msg: str) -> unit effect { IO }
     endport
 
     handler StdoutLogger for Logger do
-      fn log(msg: str) -> unit do
+      fn log(msg: str) -> unit effect { IO } do
         perform print_str(val: msg)
         return ()
       endfn
     endhandler
 
-    fn main() -> unit do
+    fn main() -> unit effect { IO } do
       perform Logger.log(msg: "test message")
       return ()
     endfn
@@ -53,12 +53,12 @@ fn test_port_redefinition_wins() {
       endfn
     endhandler
 
-    fn main() -> unit do
+    fn main() -> unit effect { IO } do
       let result = Adder.add_one(n: 10)
       perform print_i64(val: result)
       return ()
     endfn
     "#;
     let res = run(src);
-    assert!(res.is_ok());
+    assert!(res.is_ok(), "Execution failed: {:?}", res.err());
 }

@@ -12,12 +12,12 @@ fn check(src: &str) -> Result<(), String> {
 #[test]
 fn test_array_basic() {
     let src = r#"
-    fn main() -> unit do
+    fn main() -> unit effect { IO } do
         let %arr = [| 1, 2, 3 |]
         %arr[0] <- 42
         let val = (borrow %arr)[0]
         perform print_i64(val: val)
-        perform drop_array(arr: %arr)
+        drop_array(arr: %arr)
         return ()
     endfn
     "#;

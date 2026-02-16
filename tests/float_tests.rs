@@ -48,6 +48,8 @@ fn test_float_literal_type() {
     let src = r#"
     fn main() -> unit do
         let x: float = 3.14
+        let y: float = 0.01
+        let z: float = 123.456789
         return ()
     endfn
     "#;

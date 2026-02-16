@@ -36,7 +36,7 @@ fn test_call_pure_from_impure() {
     type IO = {}
     fn pure_fn() -> unit do return () endfn
     fn impure_fn() -> unit effect { IO } do
-        perform pure_fn() // Should be allowed
+        pure_fn() // Should be allowed without perform
         return ()
     endfn
     fn main() -> unit effect { IO } do
@@ -55,16 +55,18 @@ fn test_try_catch_removes_exn() {
         return ()
     endfn
 
-    fn main() -> unit do
+    fn main() -> unit effect { IO } do
         try
             perform risky()
         catch e ->
-            perform print_str(s: e)
+            perform print_str(val: e)
         endtry
         return ()
     endfn
     "#;
-    assert!(check(src).is_ok());
+    if let Err(e) = check(src) {
+        panic!("Typecheck failed: {}", e);
+    }
 }
 
 #[test]
@@ -120,7 +122,7 @@ fn test_effect_polymorphism() {
     endfn
 
     fn test_pure() -> unit effect {} do
-        perform apply(f: pure_fn)
+        apply(f: pure_fn)
     endfn
 
     fn test_impure() -> unit effect { IO } do

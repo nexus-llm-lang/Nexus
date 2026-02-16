@@ -95,8 +95,11 @@ fn type_parser() -> P<Type> {
                 }
             });
 
-        let arrow = t
-            .clone()
+        let arrow = ident()
+            .then_ignore(just(':').padded())
+            .then(t.clone())
+            .map(|(n, t)| (n, t))
+            .or(t.clone().map(|t| ("_".to_string(), t)))
             .separated_by(just(',').padded())
             .delimited_by(just('('), just(')'))
             .then_ignore(just("->").padded())
@@ -713,11 +716,29 @@ pub fn stmt_parser() -> impl Parser<char, Spanned<Stmt>, Error = Simple<char>> {
                         )
                         .then_ignore(just("->").padded())
                         .then(type_parser())
-                        .map(|((name, params), ret_type)| FunctionSignature {
+                        .then(
+                            text::keyword("effect")
+                                .padded()
+                                .ignore_then(choice((
+                                    type_parser()
+                                        .separated_by(just(',').padded())
+                                        .then(
+                                            just('|')
+                                                .padded()
+                                                .ignore_then(type_parser())
+                                                .or_not(),
+                                        )
+                                        .delimited_by(just('{'), just('}'))
+                                        .map(|(effs, tail)| Type::Row(effs, tail.map(Box::new))),
+                                    type_parser(),
+                                )))
+                                .or_not(),
+                        )
+                        .map(|(((name, params), ret_type), effects)| FunctionSignature {
                             name,
                             params,
                             ret_type,
-                            effects: Type::Row(vec![], None),
+                            effects: effects.unwrap_or(Type::Row(vec![], None)),
                         })
                         .repeated(),
                 )
