@@ -45,6 +45,18 @@ let nested = [[1], [2]]
 
 Lists cannot contain mutable references (`Ref<T>`).
 
+### Arrays
+
+Mutable, linear arrays are supported. Arrays are inherently linear to ensure unique ownership for mutation.
+
+```nexus
+let %arr: [| i64 |] = [| 1, 2, 3 |]
+%arr[0] <- 42
+let val = (borrow %arr)[0]
+```
+
+Arrays cannot contain mutable references (`Ref<T>`).
+
 ## Memory Management
 
 ### Linear Types

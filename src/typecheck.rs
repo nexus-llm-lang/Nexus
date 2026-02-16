@@ -90,6 +90,7 @@ impl TypeChecker {
         env.insert("print_str".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![Type::Str], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
         env.insert("print_i64".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![Type::I64], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
         env.insert("drop_i64".to_string(), Scheme { vars: vec![], typ: Type::Arrow(vec![Type::Linear(Box::new(Type::I64))], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
+        env.insert("drop_array".to_string(), Scheme { vars: vec!["T".into()], typ: Type::Arrow(vec![Type::Array(Box::new(Type::Var("T".into())))], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))) });
 
         env.linear_vars.clear();
         TypeChecker { supply: 0, env }
@@ -193,11 +194,13 @@ impl TypeChecker {
                     }
                     let ft = match sigil {
                         Sigil::Mutable => { if contains_linear(&t1) { return Err(TypeError { message: "Mutable linear".into(), span: value.span.clone() }); } Type::Ref(Box::new(t1)) }
-                        Sigil::Linear => Type::Linear(Box::new(t1)),
+                        Sigil::Linear => {
+                            if contains_linear(&t1) { t1 }
+                            else { Type::Linear(Box::new(t1)) }
+                        },
                         Sigil::Immutable => { if contains_ref(&t1) { return Err(TypeError { message: "Immutable Ref".into(), span: value.span.clone() }); } t1 }
                     };
                     env.insert(sigil.get_key(name), self.generalize(env, ft));
-                    if name == "_" { env.linear_vars.remove(&sigil.get_key(name)); }
                 }
                 Stmt::Return(e) => {
                     let (s1, t1) = self.infer(env, e, er, ee)?; env.apply(&s1);
@@ -205,13 +208,52 @@ impl TypeChecker {
                     self.unify(&t1, &apply_subst_type(&s1, er)).map_err(|err| TypeError { message: err, span: e.span.clone() })?;
                 }
                 Stmt::Expr(e) => { self.infer(env, e, er, ee)?; }
-                Stmt::Assign { name, sigil, value } => {
-                    if let Sigil::Immutable = sigil { return Err(TypeError { message: "Mutating immutable".into(), span: s.span.clone() }); }
+                Stmt::Assign { target, value } => {
                     let (s_v, t_v) = self.infer(env, value, er, ee)?; env.apply(&s_v);
-                    if let Some(sch) = env.get(&sigil.get_key(name)) {
-                        if let Type::Ref(i) = self.instantiate(sch) { self.unify(&t_v, &i).map_err(|e| TypeError { message: e, span: value.span.clone() })?; }
-                        else { return Err(TypeError { message: "Not a ref".into(), span: s.span.clone() }); }
-                    } else { return Err(TypeError { message: "Not found".into(), span: s.span.clone() }); }
+                    match &target.node {
+                        Expr::Variable(name, sigil) => {
+                            if let Sigil::Immutable = sigil { return Err(TypeError { message: "Mutating immutable".into(), span: s.span.clone() }); }
+                            if let Some(sch) = env.get(&sigil.get_key(name)) {
+                                if let Type::Ref(i) = self.instantiate(sch) { self.unify(&t_v, &i).map_err(|e| TypeError { message: e, span: value.span.clone() })?; }
+                                else { return Err(TypeError { message: "Not a ref".into(), span: s.span.clone() }); }
+                            } else { return Err(TypeError { message: "Not found".into(), span: s.span.clone() }); }
+                        }
+                        Expr::Index(arr, idx) => {
+                             // Typecheck index
+                             let (s_idx, t_idx) = self.infer(env, idx, er, ee)?;
+                             env.apply(&s_idx);
+                             self.unify(&t_idx, &Type::I64).map_err(|e| TypeError { message: e, span: idx.span.clone() })?;
+
+                             // Typecheck array WITHOUT consuming if it's a variable
+                             let t_arr = match &arr.node {
+                                 Expr::Variable(n, s) => {
+                                     let key = s.get_key(n);
+                                     if let Some(sch) = env.get(&key) { self.instantiate(sch) }
+                                     else { return Err(TypeError { message: format!("Not found: {}", key), span: arr.span.clone() }); }
+                                 }
+                                 _ => {
+                                     let (s_a, t_a) = self.infer(env, arr, er, ee)?;
+                                     env.apply(&s_a); t_a
+                                 }
+                             };
+
+                             let t_arr_unwrapped = match t_arr {
+                                 Type::Linear(inner) => *inner,
+                                 other => other,
+                             };
+
+                             let elem_t = match t_arr_unwrapped {
+                                 Type::Array(t) => *t,
+                                 Type::Borrow(inner) => match *inner {
+                                     Type::Array(t) => *t,
+                                     _ => return Err(TypeError { message: "Not an array".into(), span: arr.span.clone() }),
+                                 }
+                                 _ => return Err(TypeError { message: "Not an array".into(), span: arr.span.clone() }),
+                             };
+                             self.unify(&t_v, &elem_t).map_err(|e| TypeError { message: e, span: value.span.clone() })?;
+                        }
+                        _ => return Err(TypeError { message: "Invalid assignment target".into(), span: s.span.clone() }),
+                    }
                 }
                 Stmt::Conc(ts) => { for t in ts { self.check_task(t, env, &s.span)?; } }
                 Stmt::Try { body, catch_param, catch_body } => {
@@ -262,7 +304,7 @@ impl TypeChecker {
                     let mut t = self.instantiate(&sch);
                     if let Sigil::Mutable = s { if let Type::Ref(i) = t { t = *i; } }
                     if let Type::Borrow(i) = t { t = *i; }
-                    else if let Type::Linear(_) = t { env.consume(&key).map_err(|m| TypeError { message: m, span: e.span.clone() })?; }
+                    else if contains_linear(&t) { env.consume(&key).map_err(|m| TypeError { message: m, span: e.span.clone() })?; }
                     Ok((HashMap::new(), t))
                 } else { Err(TypeError { message: format!("Not found: {}", key), span: e.span.clone() }) }
             }
@@ -370,12 +412,58 @@ impl TypeChecker {
                     let s_unify = self.unify(&t_ex, &apply_subst_type(&s, &elem_type)).map_err(|m| TypeError { message: m, span: ex.span.clone() })?;
                     s = compose_subst(&s, &s_unify);
                 }
-                // Check linear/ref constraints inside List
                 let final_elem_type = apply_subst_type(&s, &elem_type);
                 if contains_ref(&final_elem_type) {
                      return Err(TypeError { message: "List cannot contain References".into(), span: e.span.clone() });
                 }
                 Ok((s, Type::List(Box::new(final_elem_type))))
+            }
+            Expr::Array(exprs) => {
+                let elem_type = self.new_var();
+                let mut s = HashMap::new();
+                for ex in exprs {
+                    let (s_ex, t_ex) = self.infer(env, ex, er, ee)?;
+                    s = compose_subst(&s, &s_ex);
+                    let s_unify = self.unify(&t_ex, &apply_subst_type(&s, &elem_type)).map_err(|m| TypeError { message: m, span: ex.span.clone() })?;
+                    s = compose_subst(&s, &s_unify);
+                }
+                let final_elem_type = apply_subst_type(&s, &elem_type);
+                if contains_ref(&final_elem_type) {
+                     return Err(TypeError { message: "Array cannot contain References".into(), span: e.span.clone() });
+                }
+                Ok((s, Type::Array(Box::new(final_elem_type))))
+            }
+            Expr::Index(arr, idx) => {
+                let (s1, t_arr) = self.infer(env, arr, er, ee)?;
+                let (s2, t_idx) = self.infer(env, idx, er, ee)?;
+                let mut s = compose_subst(&s1, &s2);
+                let s_idx = self.unify(&t_idx, &Type::I64).map_err(|m| TypeError { message: m, span: idx.span.clone() })?;
+                s = compose_subst(&s, &s_idx);
+                
+                let t_arr_inst = apply_subst_type(&s, &t_arr);
+                let t_arr_unwrapped = match t_arr_inst {
+                    Type::Linear(inner) => *inner,
+                    other => other,
+                };
+
+                let elem_t = match &t_arr_unwrapped {
+                    Type::Array(t) => (**t).clone(),
+                    Type::Borrow(inner) => match &**inner {
+                        Type::Array(t) => (**t).clone(),
+                        _ => return Err(TypeError { message: "Indexing non-array".into(), span: arr.span.clone() }),
+                    },
+                    _ => {
+                        let et = self.new_var();
+                        let su = self.unify(&t_arr_unwrapped, &Type::Array(Box::new(et.clone()))).map_err(|m| TypeError { message: m, span: arr.span.clone() })?;
+                        s = compose_subst(&s, &su);
+                        apply_subst_type(&s, &et)
+                    }
+                };
+
+                if contains_linear(&elem_t) {
+                     return Err(TypeError { message: "Cannot move linear element out of array".into(), span: e.span.clone() });
+                }
+                Ok((s, elem_t))
             }
             Expr::FieldAccess(rec, fnm) => {
                 let (s1, tr) = self.infer(env, rec, er, ee)?; let tr = apply_subst_type(&s1, &tr);
@@ -606,6 +694,7 @@ impl TypeChecker {
                 Ok(s)
             }
             (Type::List(i1), Type::List(i2)) => self.unify(i1, i2),
+            (Type::Array(i1), Type::Array(i2)) => self.unify(i1, i2),
             (Type::Result(o1, er1), Type::Result(o2, er2)) => { let s1 = self.unify(o1, o2)?; let s2 = self.unify(&apply_subst_type(&s1, er1), &apply_subst_type(&s1, er2))?; Ok(compose_subst(&s1, &s2)) }
             (Type::Ref(t1), Type::Ref(t2)) | (Type::Linear(t1), Type::Linear(t2)) | (Type::Borrow(t1), Type::Borrow(t2)) => self.unify(t1, t2),
             _ => Err(format!("Mismatch: {:?} vs {:?}", t1, t2)),
@@ -623,6 +712,7 @@ pub fn apply_subst_type(subst: &Subst, typ: &Type) -> Type {
         Type::Linear(i) => Type::Linear(Box::new(apply_subst_type(subst, i))),
         Type::Borrow(i) => Type::Borrow(Box::new(apply_subst_type(subst, i))),
         Type::List(i) => Type::List(Box::new(apply_subst_type(subst, i))),
+        Type::Array(i) => Type::Array(Box::new(apply_subst_type(subst, i))),
         Type::Row(es, t) => Type::Row(es.iter().map(|x| apply_subst_type(subst, x)).collect(), t.as_ref().map(|x| Box::new(apply_subst_type(subst, x)))),
         Type::Record(fs) => Type::Record(fs.iter().map(|(n, t)| (n.clone(), apply_subst_type(subst, t))).collect()),
         _ => typ.clone(),
@@ -639,7 +729,7 @@ fn get_free_vars_type(typ: &Type) -> HashSet<String> {
         Type::Arrow(p, r, e) => { let mut s = get_free_vars_type(r); for t in p { s.extend(get_free_vars_type(t)); } s.extend(get_free_vars_type(e)); s }
         Type::UserDefined(_, a) => { let mut s = HashSet::new(); for t in a { s.extend(get_free_vars_type(t)); } s }
         Type::Result(o, e) => { let mut s = get_free_vars_type(o); s.extend(get_free_vars_type(e)); s }
-        Type::Ref(i) | Type::Linear(i) | Type::Borrow(i) | Type::List(i) => get_free_vars_type(i),
+        Type::Ref(i) | Type::Linear(i) | Type::Borrow(i) | Type::List(i) | Type::Array(i) => get_free_vars_type(i),
         Type::Row(es, t) => { let mut s = HashSet::new(); for e in es { s.extend(get_free_vars_type(e)); } if let Some(x) = t { s.extend(get_free_vars_type(x)); } s }
         Type::Record(fs) => { let mut s = HashSet::new(); for (_, t) in fs { s.extend(get_free_vars_type(t)); } s }
         _ => HashSet::new(),
@@ -656,7 +746,7 @@ fn occurs_check(n: &str, t: &Type) -> bool {
         Type::Arrow(p, r, e) => occurs_check(n, r) || p.iter().any(|x| occurs_check(n, x)) || occurs_check(n, e),
         Type::UserDefined(_, a) => a.iter().any(|x| occurs_check(n, x)),
         Type::Result(o, e) => occurs_check(n, o) || occurs_check(n, e),
-        Type::Ref(i) | Type::Linear(i) | Type::Borrow(i) | Type::List(i) => occurs_check(n, i),
+        Type::Ref(i) | Type::Linear(i) | Type::Borrow(i) | Type::List(i) | Type::Array(i) => occurs_check(n, i),
         Type::Row(es, t) => es.iter().any(|x| occurs_check(n, x)) || t.as_ref().map_or(false, |x| occurs_check(n, x)),
         Type::Record(fs) => fs.iter().any(|(_, t)| occurs_check(n, t)),
         _ => false,
@@ -669,7 +759,7 @@ fn contains_ref(t: &Type) -> bool {
         Type::Arrow(p, r, e) => contains_ref(r) || p.iter().any(contains_ref) || contains_ref(e),
         Type::UserDefined(_, a) => a.iter().any(contains_ref),
         Type::Result(o, e) => contains_ref(o) || contains_ref(e),
-        Type::Linear(i) | Type::Borrow(i) | Type::List(i) => contains_ref(i),
+        Type::Linear(i) | Type::Borrow(i) | Type::List(i) | Type::Array(i) => contains_ref(i),
         Type::Row(es, t) => es.iter().any(contains_ref) || t.as_ref().map_or(false, |x| contains_ref(x)),
         Type::Record(fs) => fs.iter().any(|(_, t)| contains_ref(t)),
         _ => false,
@@ -678,7 +768,7 @@ fn contains_ref(t: &Type) -> bool {
 
 fn contains_linear(t: &Type) -> bool {
     match t {
-        Type::Linear(_) => true,
+        Type::Linear(_) | Type::Array(_) => true,
         Type::Ref(i) | Type::Borrow(i) | Type::List(i) => contains_linear(i),
         Type::Arrow(p, r, e) => contains_linear(r) || p.iter().any(contains_linear) || contains_linear(e),
         Type::UserDefined(_, a) => a.iter().any(contains_linear),

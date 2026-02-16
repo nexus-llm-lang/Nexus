@@ -24,6 +24,7 @@ pub enum Type {
     Row(Vec<Type>, Option<Box<Type>>), // { E1, E2 | r }
     Record(Vec<(String, Type)>), // { x: i64, y: str }
     List(Box<Type>), // [T]
+    Array(Box<Type>), // [| T |]
     Borrow(Box<Type>), // &T
 }
 
@@ -95,6 +96,8 @@ pub enum Expr {
     Constructor(String, Vec<Spanned<Expr>>),
     Record(Vec<(String, Spanned<Expr>)>),
     List(Vec<Spanned<Expr>>), // [1, 2, 3]
+    Array(Vec<Spanned<Expr>>), // [| 1, 2, 3 |]
+    Index(Box<Spanned<Expr>>, Box<Spanned<Expr>>), // a[i]
     FieldAccess(Box<Spanned<Expr>>, String),
     // If and Match can be expressions or statements.
     // In many FP languages they are expressions.
@@ -120,10 +123,9 @@ pub enum Stmt {
     },
     Expr(Spanned<Expr>), // For side-effecting calls or match/if used as statement
     Return(Spanned<Expr>),
-    // Assignment for mutable variables: ~counter <- ~counter + 1
+    // Assignment: target <- value
     Assign {
-        name: String,
-        sigil: Sigil,
+        target: Spanned<Expr>,
         value: Spanned<Expr>,
     },
     // Concurrent block

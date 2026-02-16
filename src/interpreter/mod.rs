@@ -15,6 +15,7 @@ pub enum Value {
     Record(HashMap<String, Value>),
     Variant(String, Vec<Value>),
     List(Vec<Value>),
+    Array(Rc<RefCell<Vec<Value>>>),
     Ref(Rc<RefCell<Value>>),
 }
 
@@ -167,22 +168,44 @@ impl Interpreter {
                         }
                     }
                 }
-                Stmt::Assign { name, sigil, value } => {
+                Stmt::Assign { target, value } => {
                     let val_res = self.eval_expr(value, env)?;
                     let val = match val_res {
                         ExprResult::Normal(v) => v,
                         ExprResult::EarlyReturn(v) => return Ok(ExprResult::EarlyReturn(v)),
                     };
 
-                    let key = sigil.get_key(name);
-                    if let Some(target) = env.get(&key) {
-                        if let Value::Ref(r) = target {
-                            *r.borrow_mut() = val;
-                        } else {
-                            return Err(format!("Cannot assign to immutable variable {}", name));
+                    match &target.node {
+                        Expr::Variable(name, sigil) => {
+                            let key = sigil.get_key(name);
+                            if let Some(target_val) = env.get(&key) {
+                                if let Value::Ref(r) = target_val {
+                                    *r.borrow_mut() = val;
+                                } else {
+                                    return Err(format!("Cannot assign to immutable variable {}", name));
+                                }
+                            } else {
+                                return Err(format!("Variable {} not found", key));
+                            }
                         }
-                    } else {
-                        return Err(format!("Variable {} not found", key));
+                        Expr::Index(arr, idx) => {
+                            let arr_res = self.eval_expr(arr, env)?;
+                            let idx_res = self.eval_expr(idx, env)?;
+                            match (arr_res, idx_res) {
+                                (ExprResult::Normal(Value::Array(a)), ExprResult::Normal(Value::Int(i))) => {
+                                    let mut l = a.borrow_mut();
+                                    let idx = i as usize;
+                                    if idx < l.len() {
+                                        l[idx] = val;
+                                    } else {
+                                        return Err(format!("Index out of bounds: {}", idx));
+                                    }
+                                }
+                                (ExprResult::EarlyReturn(v), _) | (_, ExprResult::EarlyReturn(v)) => return Ok(ExprResult::EarlyReturn(v)),
+                                _ => return Err("Invalid array assignment".to_string()),
+                            }
+                        }
+                        _ => return Err("Invalid assignment target".to_string()),
                     }
                 }
                 Stmt::Comment => continue,
@@ -350,6 +373,39 @@ impl Interpreter {
                     }
                 }
                 Ok(ExprResult::Normal(Value::List(vals)))
+            }
+            Expr::Array(exprs) => {
+                let mut vals = Vec::new();
+                for e in exprs {
+                    match self.eval_expr(e, env)? {
+                        ExprResult::Normal(v) => vals.push(v),
+                        ExprResult::EarlyReturn(v) => return Ok(ExprResult::EarlyReturn(v)),
+                    }
+                }
+                Ok(ExprResult::Normal(Value::Array(Rc::new(RefCell::new(vals)))))
+            }
+            Expr::Index(arr, idx) => {
+                let arr_res = self.eval_expr(arr, env)?;
+                let idx_res = self.eval_expr(idx, env)?;
+                match (arr_res, idx_res) {
+                    (ExprResult::Normal(arr_val), ExprResult::Normal(Value::Int(i))) => {
+                        let i = i as usize;
+                        match arr_val {
+                            Value::List(l) => {
+                                if i < l.len() { Ok(ExprResult::Normal(l[i].clone())) }
+                                else { Err(format!("Index out of bounds: {}", i)) }
+                            }
+                            Value::Array(a) => {
+                                let l = a.borrow();
+                                if i < l.len() { Ok(ExprResult::Normal(l[i].clone())) }
+                                else { Err(format!("Index out of bounds: {}", i)) }
+                            }
+                            _ => Err("Cannot index non-array value".to_string()),
+                        }
+                    }
+                    (ExprResult::EarlyReturn(v), _) | (_, ExprResult::EarlyReturn(v)) => Ok(ExprResult::EarlyReturn(v)),
+                    _ => Err("Index must be an integer".to_string()),
+                }
             }
             Expr::FieldAccess(receiver, field_name) => {
                 let res = self.eval_expr(receiver, env)?;

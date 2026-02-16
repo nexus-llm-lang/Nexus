@@ -75,6 +75,9 @@ fn type_parser() -> P<Type> {
             t.clone()
                 .delimited_by(just('['), just(']'))
                 .map(|inner| Type::List(Box::new(inner))),
+            t.clone()
+                .delimited_by(just("[|"), just("|]"))
+                .map(|inner| Type::Array(Box::new(inner))),
             ident().map(|n| Type::UserDefined(n, vec![])),
         ));
 
@@ -200,6 +203,13 @@ fn expr_parser() -> P<Spanned<Expr>> {
             .delimited_by(just('['), just(']'))
             .map(Expr::List);
 
+        let array = expr
+            .clone()
+            .separated_by(just(',').padded())
+            .allow_trailing()
+            .delimited_by(just("[|"), just("|]"))
+            .map(Expr::Array);
+
         let var = sigil().then(ident()).map(|(s, n)| Expr::Variable(n, s));
 
         let constructor = ident()
@@ -222,12 +232,16 @@ fn expr_parser() -> P<Spanned<Expr>> {
             .map(|(s, n)| Expr::Borrow(n, s));
 
         let atom = choice((
+            expr.clone()
+                .delimited_by(just('('), just(')'))
+                .map(|s| s.node),
             raise,
             borrow_expr,
             perform_call,
             constructor,
             simple_call,
             record,
+            array,
             list,
             literal().map(Expr::Literal),
             var,
@@ -235,19 +249,36 @@ fn expr_parser() -> P<Spanned<Expr>> {
         .padded()
         .map_with_span(|node, span| Spanned { node, span });
 
-        // Field Access: atom.ident
-        let atom_with_access = atom
+        enum Postfix {
+            Field(String, Span),
+            Index(Spanned<Expr>),
+        }
+
+        // Postfix ops: .ident and [expr]
+        let atom_with_postfix = atom
             .clone()
             .then(
-                just('.')
-                    .ignore_then(ident())
-                    .map_with_span(|n, s| (n, s))
-                    .repeated(),
+                choice((
+                    just('.')
+                        .ignore_then(ident())
+                        .map_with_span(|n, s| Postfix::Field(n, s)),
+                    expr.clone()
+                        .delimited_by(just('['), just(']'))
+                        .map(Postfix::Index),
+                ))
+                .repeated(),
             )
-            .foldl(|lhs, (name, name_span)| {
-                let span = lhs.span.start..name_span.end;
-                let node = Expr::FieldAccess(Box::new(lhs), name);
-                Spanned { node, span }
+            .foldl(|lhs, post| match post {
+                Postfix::Field(name, name_span) => {
+                    let span = lhs.span.start..name_span.end;
+                    let node = Expr::FieldAccess(Box::new(lhs), name);
+                    Spanned { node, span }
+                }
+                Postfix::Index(index) => {
+                    let span = lhs.span.start..index.span.end;
+                    let node = Expr::Index(Box::new(lhs), Box::new(index));
+                    Spanned { node, span }
+                }
             });
 
         let op = choice((
@@ -277,9 +308,9 @@ fn expr_parser() -> P<Spanned<Expr>> {
         ))
         .padded();
 
-        atom_with_access
+        atom_with_postfix
             .clone()
-            .then(op.then(atom_with_access).repeated())
+            .then(op.then(atom_with_postfix).repeated())
             .foldl(|lhs, (op, rhs)| {
                 let span = lhs.span.start..rhs.span.end;
                 let node = Expr::BinaryOp(Box::new(lhs), op, Box::new(rhs));
@@ -317,16 +348,12 @@ pub fn stmt_parser() -> impl Parser<char, Spanned<Stmt>, Error = Simple<char>> {
                 span,
             });
 
-        let assign_stmt = sigil()
-            .then(ident())
+        let assign_stmt = expr
+            .clone()
             .then_ignore(just("<-").padded())
             .then(expr.clone())
-            .map_with_span(|((s, n), v), span| Spanned {
-                node: Stmt::Assign {
-                    name: n,
-                    sigil: s,
-                    value: v,
-                },
+            .map_with_span(|(target, value), span| Spanned {
+                node: Stmt::Assign { target, value },
                 span,
             });
 
