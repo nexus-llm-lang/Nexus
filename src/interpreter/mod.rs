@@ -59,17 +59,25 @@ impl Env {
 
 pub struct Interpreter {
     pub functions: HashMap<String, Function>,
+    pub handlers: HashMap<String, Handler>,
 }
 
 impl Interpreter {
     pub fn new(program: Program) -> Self {
         let mut functions = HashMap::new();
+        let mut handlers = HashMap::new();
         for def in program.definitions {
-            if let TopLevel::Function(func) = def {
-                functions.insert(func.name.clone(), func);
+            match def {
+                TopLevel::Function(func) => {
+                    functions.insert(func.name.clone(), func);
+                }
+                TopLevel::Handler(handler) => {
+                    handlers.insert(handler.port_name.clone(), handler);
+                }
+                _ => {}
             }
         }
-        Interpreter { functions }
+        Interpreter { functions, handlers }
     }
 
     pub fn eval_repl_stmt(&mut self, stmt: &Stmt, env: &mut Env) -> EvalResult {
@@ -260,6 +268,35 @@ impl Interpreter {
                     }
                 }
 
+                // Dynamic dispatch for Ports & Handlers
+                if let Some(pos) = func.find('.') {
+                    let port_name = &func[..pos];
+                    let func_name = &func[pos + 1..];
+
+                    if let Some(handler) = self.handlers.get(port_name).cloned() {
+                        if let Some(target_func) =
+                            handler.functions.iter().find(|f| f.name == func_name)
+                        {
+                            let mut handler_env = Env::new();
+                            if target_func.params.len() != evaluated_args.len() {
+                                return Err(format!(
+                                    "Arity mismatch for handler {}.{}",
+                                    port_name, func_name
+                                ));
+                            }
+                                                            for (param, arg) in target_func.params.iter().zip(evaluated_args.iter())
+                                                        {
+                                                            handler_env.define(param.name.clone(), arg.clone());
+                                                        }
+                                                        let res = self.eval_body(&target_func.body, &mut handler_env)?;
+                                                        let val = match res {
+                                                            ExprResult::Normal(v) => v,
+                                                            ExprResult::EarlyReturn(v) => v,
+                                                        };
+                                                        return Ok(ExprResult::Normal(val));
+                                                    }
+                                                }
+                                            }
                 if let Some(res) = stdlib::handle_call(func, &evaluated_args) {
                     return res;
                 }

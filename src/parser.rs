@@ -11,7 +11,7 @@ const KEYWORDS: &[&str] = &[
 
     "task", "endtask", "conc", "endconc", "port", "endport", "perform", "type", "import", "from",
 
-    "pub", "effect", "raise", "try", "catch", "endtry",
+    "pub", "effect", "raise", "try", "catch", "endtry", "handler", "for", "endhandler",
 
 ];
 
@@ -59,6 +59,12 @@ fn type_parser() -> P<Type> {
                 .padded()
                 .ignore_then(t.clone())
                 .map(|inner| Type::Linear(Box::new(inner))),
+            ident()
+                .then_ignore(just(':').padded())
+                .then(t.clone())
+                .separated_by(just(',').padded())
+                .delimited_by(just('{'), just('}'))
+                .map(Type::Record),
             ident().map(|n| Type::UserDefined(n, vec![])),
         ));
 
@@ -82,7 +88,31 @@ fn type_parser() -> P<Type> {
             .delimited_by(just('('), just(')'))
             .then_ignore(just("->").padded())
             .then(t.clone())
-            .map(|(params, ret)| Type::Arrow(params, Box::new(ret)));
+            .then(
+                text::keyword("effect")
+                    .padded()
+                    .ignore_then(choice((
+                        t.clone()
+                            .separated_by(just(',').padded())
+                            .then(
+                                just('|')
+                                    .padded()
+                                    .ignore_then(t.clone())
+                                    .or_not(),
+                            )
+                            .delimited_by(just('{'), just('}'))
+                            .map(|(effs, tail)| Type::Row(effs, tail.map(Box::new))),
+                        t.clone(),
+                    )))
+                    .or_not(),
+            )
+            .map(|((params, ret), effects)| {
+                Type::Arrow(
+                    params,
+                    Box::new(ret),
+                    Box::new(effects.unwrap_or(Type::Row(vec![], None))),
+                )
+            });
 
         arrow.or(generic).or(base).padded()
     })
@@ -306,7 +336,7 @@ pub fn stmt_parser() -> impl Parser<char, Stmt, Error = Simple<char>> {
                         is_public: false,
                         params: vec![],
                         ret_type: Type::Unit,
-                        effects: vec![],
+                        effects: Type::Unit,
                         body,
                         type_params: vec![],
                     })
@@ -360,7 +390,7 @@ pub fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
         .then(type_parser())
         .map(|((sigil, name), typ)| Param { name, sigil, typ });
 
-    let func_def = text::keyword("pub")
+    let function_inner = text::keyword("pub")
         .or_not()
         .padded()
         .then_ignore(text::keyword("fn").padded())
@@ -382,27 +412,38 @@ pub fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
         .then(
             text::keyword("effect")
                 .padded()
-                .ignore_then(
-                    ident()
+                .ignore_then(choice((
+                    type_parser()
                         .separated_by(just(',').padded())
-                        .delimited_by(just('{'), just('}')),
-                )
+                        .then(
+                            just('|')
+                                .padded()
+                                .ignore_then(type_parser())
+                                .or_not(),
+                        )
+                        .delimited_by(just('{'), just('}'))
+                        .map(|(effs, tail)| Type::Row(effs, tail.map(Box::new))),
+                    type_parser(),
+                )))
                 .or_not(),
         )
         .then_ignore(text::keyword("do").padded())
         .then(stmt_parser().repeated())
         .then_ignore(text::keyword("endfn").padded())
-        .map(|((((((vis, name), type_params), params), ret_type), effects), body)| {
-            TopLevel::Function(Function {
+        .map(
+            |((((((vis, name), type_params), params), ret_type), effects), body)| Function {
                 name,
                 is_public: vis.is_some(),
                 type_params: type_params.unwrap_or_default(),
                 params,
                 ret_type,
-                effects: effects.unwrap_or_default(),
+                effects: effects.unwrap_or(Type::Row(vec![], None)),
                 body,
-            })
-        });
+            },
+        )
+        .boxed();
+
+    let func_def = function_inner.clone().map(TopLevel::Function);
 
     let type_def = text::keyword("type")
         .padded()
@@ -464,19 +505,42 @@ pub fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
                     name,
                     params,
                     ret_type,
-                    effects: vec![],
+                    effects: Type::Row(vec![], None),
                 })
                 .repeated(),
         )
         .then_ignore(text::keyword("endport").padded())
         .map(|(name, functions)| TopLevel::Port(Port { name, functions }));
 
+    let handler_def = text::keyword("handler")
+        .padded()
+        .ignore_then(ident())
+        .then_ignore(text::keyword("for").padded())
+        .then(ident())
+        .then_ignore(text::keyword("do").padded())
+        .then(function_inner.repeated())
+        .then_ignore(text::keyword("endhandler").padded())
+        .map(|((name, port_name), functions)| {
+            TopLevel::Handler(Handler {
+                name,
+                port_name,
+                functions,
+            })
+        });
+
     let comment = just("//")
         .then(take_until(just('\n')))
         .padded()
         .map(|_| TopLevel::Comment);
 
-    choice((func_def, type_def, import_def, port_def, comment))
+    choice((
+        func_def,
+        type_def,
+        import_def,
+        port_def,
+        handler_def,
+        comment,
+    ))
         .padded()
         .repeated()
         .map(|definitions| Program { definitions })

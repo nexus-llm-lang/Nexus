@@ -11,12 +11,12 @@ Every executable program must define a `main` function.
 The `main` function must have the following signature:
 
 ```nexus
-pub fn main() -> unit
+fn main() -> unit
 ```
 
 - **Parameters**: It must take no arguments.
 - **Return Type**: It must return `unit`.
-- **Visibility**: It is conventionally marked as `pub`, though visibility rules for the entrypoint are currently relaxed.
+- **Visibility**: It must be private (no `pub` modifier).
 
 ### Execution
 

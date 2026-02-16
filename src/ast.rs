@@ -7,9 +7,11 @@ pub enum Type {
     Result(Box<Type>, Box<Type>),
     UserDefined(String, Vec<Type>),
     Var(String),
-    Arrow(Vec<Type>, Box<Type>),
+    Arrow(Vec<Type>, Box<Type>, Box<Type>),
     Ref(Box<Type>),
     Linear(Box<Type>), // %T
+    Row(Vec<Type>, Option<Box<Type>>), // { E1, E2 | r }
+    Record(Vec<(String, Type)>), // { x: i64, y: str }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,7 +126,7 @@ pub struct Function {
     pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub ret_type: Type,
-    pub effects: Vec<String>,
+    pub effects: Type,
     pub body: Vec<Stmt>,
 }
 
@@ -148,11 +150,18 @@ pub struct Port {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Handler {
+    pub name: String,
+    pub port_name: String,
+    pub functions: Vec<Function>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct FunctionSignature {
     pub name: String,
     pub params: Vec<Param>,
     pub ret_type: Type,
-    pub effects: Vec<String>,
+    pub effects: Type,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +170,7 @@ pub enum TopLevel {
     TypeDef(TypeDef),
     Import(Import),
     Port(Port),
+    Handler(Handler),
     Comment,
 }
 
