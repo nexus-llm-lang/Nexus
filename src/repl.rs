@@ -1,3 +1,4 @@
+use ariadne::{Color, Label, Report, ReportKind, Source};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use chumsky::prelude::*;
@@ -23,19 +24,19 @@ pub fn start() {
         let readline = rl.readline(">> ");
         match readline {
             Ok(line) => {
-                let line = line.trim();
-                if line == "exit" {
+                let line_str = line.trim();
+                if line_str == "exit" {
                     break;
                 }
-                if line.is_empty() {
+                if line_str.is_empty() {
                     continue;
                 }
 
-                rl.add_history_entry(line).unwrap();
+                rl.add_history_entry(line_str).unwrap();
 
                 // Parse
                 let parser = stmt_parser().then_ignore(end());
-                let result = parser.parse(line);
+                let result = parser.parse(line_str);
 
                 match result {
                     Ok(stmt) => {
@@ -57,12 +58,32 @@ pub fn start() {
                                     Err(e) => println!("Runtime Error: {}", e),
                                 }
                             },
-                            Err(e) => println!("Type Error: {} at {:?}", e.message, e.span),
+                            Err(e) => {
+                                Report::build(ReportKind::Error, "<repl>", e.span.start)
+                                    .with_message(e.message.clone())
+                                    .with_label(
+                                        Label::new(("<repl>", e.span))
+                                            .with_message(e.message)
+                                            .with_color(Color::Red),
+                                    )
+                                    .finish()
+                                    .print(("<repl>", Source::from(&line_str)))
+                                    .unwrap();
+                            },
                         }
                     },
-                    Err(errs) => {
-                        for err in errs {
-                            println!("Parse Error: {:?}", err);
+                    Err(errors) => {
+                        for err in errors {
+                            Report::build(ReportKind::Error, "<repl>", err.span().start)
+                                .with_message(format!("{:?}", err))
+                                .with_label(
+                                    Label::new(("<repl>", err.span()))
+                                        .with_message(format!("{}", err))
+                                        .with_color(Color::Red),
+                                )
+                                .finish()
+                                .print(("<repl>", Source::from(&line_str)))
+                                .unwrap();
                         }
                     }
                 }
