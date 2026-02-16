@@ -31,7 +31,22 @@ let ~counter = 0
 - References cannot be captured by concurrent tasks (`conc`).
 - Immutable variables cannot hold mutable references.
 
-## Linear Types (`%`) (Planned)
+## Linear Types (`%`)
 
-Linear types (`%`) will enforce exact-once usage for resources (e.g., file handles, network sockets).
-Parsing is supported, but linear semantics are not yet enforced.
+Linear types (`%`) enforce exact-once usage semantics, ideal for resource management.
+
+```nexus
+fn consume(r: %Resource) -> unit do
+    // ... use r ...
+endfn
+
+let %res = create_resource()
+perform consume(r: %res)
+// perform consume(r: %res) // Error: Already consumed
+```
+
+### Properties
+
+- **Exactly Once**: A linear variable must be used exactly once.
+- **No Discard**: `let _ = %x` is allowed but `_` absorbs the linearity, effectively preventing usage and causing an error at scope end if not consumed.
+- **No Ref**: Mutable references to linear types (`Ref<Linear<T>>`) are forbidden to prevent aliasing violations.

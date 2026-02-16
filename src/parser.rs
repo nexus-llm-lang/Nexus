@@ -55,6 +55,10 @@ fn type_parser() -> P<Type> {
                 .padded()
                 .ignore_then(t.clone().delimited_by(just('('), just(')')))
                 .map(|inner| Type::Ref(Box::new(inner))),
+            just('%')
+                .padded()
+                .ignore_then(t.clone())
+                .map(|inner| Type::Linear(Box::new(inner))),
             ident().map(|n| Type::UserDefined(n, vec![])),
         ));
 

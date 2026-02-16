@@ -9,6 +9,7 @@ pub enum Type {
     Var(String),
     Arrow(Vec<Type>, Box<Type>),
     Ref(Box<Type>),
+    Linear(Box<Type>), // %T
 }
 
 #[derive(Debug, Clone, PartialEq)]

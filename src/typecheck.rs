@@ -11,6 +11,7 @@ pub struct Scheme {
 pub struct TypeEnv {
     pub vars: HashMap<String, Scheme>,
     pub types: HashMap<String, TypeDef>,
+    pub linear_vars: HashSet<String>,
 }
 
 type Subst = HashMap<String, Type>;
@@ -20,15 +21,29 @@ impl TypeEnv {
         TypeEnv {
             vars: HashMap::new(),
             types: HashMap::new(),
+            linear_vars: HashSet::new(),
         }
     }
 
     pub fn insert(&mut self, name: String, scheme: Scheme) {
+        if let Type::Linear(_) = scheme.typ {
+            self.linear_vars.insert(name.clone());
+        }
         self.vars.insert(name, scheme);
     }
 
     pub fn get(&self, name: &str) -> Option<&Scheme> {
         self.vars.get(name)
+    }
+    
+    pub fn consume(&mut self, name: &str) -> Result<(), String> {
+        if self.linear_vars.remove(name) {
+            Ok(())
+        } else {
+            // It might be double use, or it might be not linear.
+            // Caller ensures it IS linear type.
+            Err(format!("Linear variable '{}' used more than once", name))
+        }
     }
 
     pub fn apply(&mut self, subst: &Subst) {
@@ -112,6 +127,14 @@ impl TypeChecker {
             Scheme {
                 vars: vec![],
                 typ: Type::Arrow(vec![Type::I64], Box::new(Type::Unit)),
+            },
+        );
+
+        env.insert(
+            "drop_i64".to_string(),
+            Scheme {
+                vars: vec![],
+                typ: Type::Arrow(vec![Type::Linear(Box::new(Type::I64))], Box::new(Type::Unit)),
             },
         );
 
@@ -219,6 +242,9 @@ impl TypeChecker {
                 Box::new(self.convert_user_defined_to_var(ret, vars)),
             ),
             Type::Ref(inner) => Type::Ref(Box::new(self.convert_user_defined_to_var(inner, vars))),
+            Type::Linear(inner) => {
+                Type::Linear(Box::new(self.convert_user_defined_to_var(inner, vars)))
+            }
             _ => typ.clone(),
         }
     }
@@ -242,7 +268,14 @@ impl TypeChecker {
             ));
         }
 
-        self.infer_body(&func.body, &mut local_env, &expected_ret)
+        eprintln!("DEBUG: check_function start for {}. linear_vars: {:?}", func.name, local_env.linear_vars);
+        self.infer_body(&func.body, &mut local_env, &expected_ret)?;
+        eprintln!("DEBUG: check_function end for {}. linear_vars: {:?}", func.name, local_env.linear_vars);
+        
+        if !local_env.linear_vars.is_empty() {
+             return Err(format!("Unused linear variables at end of function {}: {:?}", func.name, local_env.linear_vars));
+        }
+        Ok(())
     }
 
     fn infer_body(
@@ -259,27 +292,41 @@ impl TypeChecker {
                                     let (s1, t1) = self.infer(env, value, expected_ret)?;
                                     env.apply(&s1);
                 
-                                    let final_type = if let Sigil::Mutable = sigil {
-                                        Type::Ref(Box::new(t1))
-                                    } else {
-                                        // Gravity Rule: Immutable variables cannot hold References (if they were explicitly Refs?)
-                                        // Since expr cannot be Expr::Ref anymore, t1 is the value type.
-                                        // If t1 is ALREADY a Ref type (e.g. returned from function?), we should check.
-                                        if contains_ref(&t1) {
-                                             return Err(format!("Immutable variable {} cannot hold a Reference type: {:?}", name, t1));
+                                    let final_type = match sigil {
+                                        Sigil::Mutable => {
+                                            if contains_linear(&t1) {
+                                                return Err(format!("Cannot create mutable reference to linear type: {:?}", t1));
+                                            }
+                                            Type::Ref(Box::new(t1))
+                                        },
+                                        Sigil::Linear => Type::Linear(Box::new(t1)),
+                                        Sigil::Immutable => {
+                                            // Gravity Rule: Immutable variables cannot hold References
+                                            if contains_ref(&t1) {
+                                                 return Err(format!("Immutable variable {} cannot hold a Reference type: {:?}", name, t1));
+                                            }
+                                            t1
                                         }
-                                        t1
                                     };
                 
                                     let scheme = self.generalize(env, final_type);
                                     let key = sigil.get_key(name);
                 
-                                    env.insert(key, scheme);
+                                    env.insert(key.clone(), scheme);
+                                    // if name == "_" {
+                                    //    env.linear_vars.remove(&key);
+                                    // }
+                                    eprintln!("DEBUG: Stmt::Let {}. linear_vars: {:?}", key, env.linear_vars);
                                 }
                 
                 Stmt::Return(expr) => {
                     let (s1, t1) = self.infer(env, expr, expected_ret)?;
                     env.apply(&s1);
+                    
+                    if !env.linear_vars.is_empty() {
+                         return Err(format!("Unused linear variables at return: {:?}", env.linear_vars));
+                    }
+
                     let current_ret = apply_subst_type(&s1, expected_ret);
                     let s2 = self.unify(&t1, &current_ret)?;
                     env.apply(&s2);
@@ -344,12 +391,11 @@ impl TypeChecker {
         let mut env = std::mem::replace(&mut self.env, TypeEnv::new());
         let res = (|| {
             match stmt {
-                Stmt::Expr(expr) => {
-                    let (s, t) = self.infer(&env, expr, &Type::Unit)?;
-                    env.apply(&s);
-                    Ok(t)
-                }
-                _ => {
+                            Stmt::Expr(expr) => {
+                                let (s, t) = self.infer(&mut env, expr, &Type::Unit)?;
+                                env.apply(&s);
+                                Ok(t)
+                            }                _ => {
                     self.infer_body(&[stmt.clone()], &mut env, &Type::Unit)?;
                     Ok(Type::Unit)
                 }
@@ -361,10 +407,11 @@ impl TypeChecker {
 
     fn infer(
         &mut self,
-        env: &TypeEnv,
+        env: &mut TypeEnv,
         expr: &Expr,
         expected_ret: &Type,
     ) -> Result<(Subst, Type), String> {
+        eprintln!("DEBUG: infer expr: {:?}", expr);
         match expr {
             Expr::Literal(lit) => {
                 let t = match lit {
@@ -377,12 +424,20 @@ impl TypeChecker {
             }
             Expr::Variable(name, sigil) => {
                 let key = sigil.get_key(name);
+                eprintln!("DEBUG: infer Variable key={}", key);
 
-                if let Some(scheme) = env.get(&key) {
-                    let mut t = self.instantiate(scheme);
+                // Clone scheme to avoid holding immutable borrow on env while consuming
+                if let Some(scheme) = env.get(&key).cloned() {
+                    let mut t = self.instantiate(&scheme);
                     if let Sigil::Mutable = sigil {
                         if let Type::Ref(inner) = t {
                             t = *inner;
+                        }
+                    }
+                    // Consume if Type is Linear
+                    if let Type::Linear(_) = t {
+                        if let Err(e) = env.consume(&key) {
+                            return Err(e);
                         }
                     }
                     Ok((HashMap::new(), t))
@@ -413,8 +468,8 @@ impl TypeChecker {
                 }
             }
             Expr::Call { func, args, .. } => {
-                let (mut subst, func_type) = if let Some(scheme) = env.get(func) {
-                    (HashMap::new(), self.instantiate(scheme))
+                let (mut subst, func_type) = if let Some(scheme) = env.get(func).cloned() {
+                    (HashMap::new(), self.instantiate(&scheme))
                 } else {
                     return Err(format!("Function not found: {}", func));
                 };
@@ -462,7 +517,7 @@ impl TypeChecker {
             Expr::FieldAccess(receiver, field_name) => {
                 let (s1, t_rec) = self.infer(env, receiver, expected_ret)?;
                 if let Type::UserDefined(type_name, type_args) = &t_rec {
-                    if let Some(td) = env.types.get(type_name) {
+                    if let Some(td) = env.types.get(type_name).cloned() {
                         if let Some((_, f_type)) = td.fields.iter().find(|(n, _)| n == field_name) {
                             let mut subst = HashMap::new();
                             for (p, a) in td.type_params.iter().zip(type_args) {
@@ -484,17 +539,48 @@ impl TypeChecker {
             } => {
                 let (s1, t_cond) = self.infer(env, cond, expected_ret)?;
                 let s = compose_subst(&s1, &self.unify(&t_cond, &Type::Bool)?);
-                let mut local_env = env.clone();
-                local_env.apply(&s);
-                self.infer_body(then_branch, &mut local_env, expected_ret)?;
+                
+                let mut env_then = env.clone();
+                env_then.apply(&s);
+                self.infer_body(then_branch, &mut env_then, expected_ret)?;
+                
+                let mut env_else = env.clone();
+                env_else.apply(&s);
                 if let Some(else_branch) = else_branch {
-                    self.infer_body(else_branch, &mut local_env, expected_ret)?;
+                    self.infer_body(else_branch, &mut env_else, expected_ret)?;
+                } else {
+                     // Implicit else branch (returns Unit). 
+                     // But implicit else does nothing, so it consumes NOTHING.
+                     // If 'then' branch consumes linear vars, this is a mismatch!
                 }
+                
+                // Merge linear vars
+                // Both branches must leave the SAME set of linear vars (Exactly Once).
+                // Or rather: "Consumed" set must be equal.
+                // env.linear_vars is "Available".
+                // Available_then must equal Available_else.
+                let available_then = &env_then.linear_vars;
+                let available_else = &env_else.linear_vars;
+                
+                if available_then != available_else {
+                    let diff1: Vec<_> = available_then.difference(available_else).collect();
+                    let diff2: Vec<_> = available_else.difference(available_then).collect();
+                    return Err(format!("Linear variable usage mismatch in branches. Unmatched: {:?}, {:?}", diff1, diff2));
+                }
+                
+                // Update outer env
+                env.linear_vars = env_then.linear_vars;
+                
                 Ok((s, Type::Unit))
             }
             Expr::Match { target, cases } => {
                 let (s1, t_target) = self.infer(env, target, expected_ret)?;
                 let mut s = s1;
+                
+                // For match, we need to ensure all cases consume same linear vars.
+                // We'll track the "resulting available vars" from the first case, and compare others.
+                let mut resulting_linear_vars: Option<HashSet<String>> = None;
+
                 for case in cases {
                     let mut local_env = env.clone();
                     local_env.apply(&s);
@@ -506,7 +592,20 @@ impl TypeChecker {
                     s = compose_subst(&s, &s_match);
                     local_env.apply(&s_match);
                     self.infer_body(&case.body, &mut local_env, expected_ret)?;
+                    
+                    if let Some(prev) = &resulting_linear_vars {
+                        if prev != &local_env.linear_vars {
+                             return Err("Linear variable usage mismatch in match cases".to_string());
+                        }
+                    } else {
+                        resulting_linear_vars = Some(local_env.linear_vars.clone());
+                    }
                 }
+                
+                if let Some(res_vars) = resulting_linear_vars {
+                    env.linear_vars = res_vars;
+                }
+                
                 Ok((s, Type::Unit))
             }
 
@@ -621,6 +720,7 @@ impl TypeChecker {
                 Ok(compose_subst(&s1, &s2))
             }
             (Type::Ref(t1), Type::Ref(t2)) => self.unify(t1, t2),
+            (Type::Linear(t1), Type::Linear(t2)) => self.unify(t1, t2),
             _ => Err(format!("Type mismatch: {:?} vs {:?}", t1, t2)),
         }
     }
@@ -642,6 +742,7 @@ pub fn apply_subst_type(subst: &Subst, typ: &Type) -> Type {
             Box::new(apply_subst_type(subst, err)),
         ),
         Type::Ref(inner) => Type::Ref(Box::new(apply_subst_type(subst, inner))),
+        Type::Linear(inner) => Type::Linear(Box::new(apply_subst_type(subst, inner))),
         _ => typ.clone(),
     }
 }
@@ -681,6 +782,7 @@ fn get_free_vars_type(typ: &Type) -> HashSet<String> {
             s
         }
         Type::Ref(inner) => get_free_vars_type(inner),
+        Type::Linear(inner) => get_free_vars_type(inner),
         _ => HashSet::new(),
     }
 }
@@ -704,6 +806,7 @@ fn occurs_check(name: &str, typ: &Type) -> bool {
         Type::UserDefined(_, args) => args.iter().any(|a| occurs_check(name, a)),
         Type::Result(ok, err) => occurs_check(name, ok) || occurs_check(name, err),
         Type::Ref(inner) => occurs_check(name, inner),
+        Type::Linear(inner) => occurs_check(name, inner),
         _ => false,
     }
 }
@@ -714,6 +817,18 @@ fn contains_ref(typ: &Type) -> bool {
         Type::Arrow(params, ret) => contains_ref(ret) || params.iter().any(contains_ref),
         Type::UserDefined(_, args) => args.iter().any(contains_ref),
         Type::Result(ok, err) => contains_ref(ok) || contains_ref(err),
+        Type::Linear(inner) => contains_ref(inner),
+        _ => false,
+    }
+}
+
+fn contains_linear(typ: &Type) -> bool {
+    match typ {
+        Type::Linear(_) => true,
+        Type::Ref(inner) => contains_linear(inner),
+        Type::Arrow(params, ret) => contains_linear(ret) || params.iter().any(contains_linear),
+        Type::UserDefined(_, args) => args.iter().any(contains_linear),
+        Type::Result(ok, err) => contains_linear(ok) || contains_linear(err),
         _ => false,
     }
 }
