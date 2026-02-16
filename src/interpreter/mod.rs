@@ -142,6 +142,21 @@ impl Interpreter {
                         let _ = self.eval_body(&task.body, env)?;
                     }
                 }
+                Stmt::Try { body, catch_param, catch_body } => {
+                    let res = self.eval_body(body, env);
+                    match res {
+                        Ok(ExprResult::EarlyReturn(val)) => return Ok(ExprResult::EarlyReturn(val)),
+                        Ok(ExprResult::Normal(_)) => {},
+                        Err(msg) => {
+                            let mut catch_env = Env::extend(env.clone());
+                            catch_env.define(catch_param.clone(), Value::String(msg));
+                            let catch_res = self.eval_body(catch_body, &mut catch_env)?;
+                            if let ExprResult::EarlyReturn(v) = catch_res {
+                                return Ok(ExprResult::EarlyReturn(v));
+                            }
+                        }
+                    }
+                }
                 Stmt::Assign { name, sigil, value } => {
                     let val_res = self.eval_expr(value, env)?;
                     let val = match val_res {
@@ -356,6 +371,18 @@ impl Interpreter {
                     }
                 }
                 Err("No match found".to_string())
+            }
+            Expr::Raise(expr) => {
+                let val_res = self.eval_expr(expr, env)?;
+                let val = match val_res {
+                    ExprResult::Normal(v) => v,
+                    ExprResult::EarlyReturn(v) => return Ok(ExprResult::EarlyReturn(v)),
+                };
+                let msg = match val {
+                    Value::String(s) => s,
+                    v => format!("{:?}", v),
+                };
+                Err(msg)
             }
 
         }

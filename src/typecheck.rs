@@ -72,7 +72,7 @@ impl TypeChecker {
             "db_driver.begin_tx".to_string(),
             Scheme {
                 vars: vec![],
-                typ: Type::Arrow(vec![], Box::new(scheme_tx.typ.clone())),
+                typ: Type::Arrow(vec![], Box::new(scheme_tx.typ.clone()), Box::new(Type::Row(vec![], None))),
             },
         );
         env.insert(
@@ -82,6 +82,7 @@ impl TypeChecker {
                 typ: Type::Arrow(
                     vec![Type::UserDefined("Tx".to_string(), vec![])],
                     Box::new(Type::Unit),
+                    Box::new(Type::Row(vec![], None)),
                 ),
             },
         );
@@ -92,6 +93,7 @@ impl TypeChecker {
                 typ: Type::Arrow(
                     vec![Type::UserDefined("Tx".to_string(), vec![])],
                     Box::new(Type::Unit),
+                    Box::new(Type::Row(vec![], None)),
                 ),
             },
         );
@@ -101,7 +103,7 @@ impl TypeChecker {
             "log.info".to_string(),
             Scheme {
                 vars: vec![],
-                typ: Type::Arrow(vec![Type::Str], Box::new(Type::Unit)),
+                typ: Type::Arrow(vec![Type::Str], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))),
             },
         );
 
@@ -110,7 +112,7 @@ impl TypeChecker {
             "printf".to_string(),
             Scheme {
                 vars: vec![],
-                typ: Type::Arrow(vec![Type::Str, Type::I64], Box::new(Type::Unit)),
+                typ: Type::Arrow(vec![Type::Str, Type::I64], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))),
             },
         );
 
@@ -118,7 +120,7 @@ impl TypeChecker {
             "print_str".to_string(),
             Scheme {
                 vars: vec![],
-                typ: Type::Arrow(vec![Type::Str], Box::new(Type::Unit)),
+                typ: Type::Arrow(vec![Type::Str], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))),
             },
         );
 
@@ -126,7 +128,7 @@ impl TypeChecker {
             "print_i64".to_string(),
             Scheme {
                 vars: vec![],
-                typ: Type::Arrow(vec![Type::I64], Box::new(Type::Unit)),
+                typ: Type::Arrow(vec![Type::I64], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))),
             },
         );
 
@@ -134,7 +136,7 @@ impl TypeChecker {
             "drop_i64".to_string(),
             Scheme {
                 vars: vec![],
-                typ: Type::Arrow(vec![Type::Linear(Box::new(Type::I64))], Box::new(Type::Unit)),
+                typ: Type::Arrow(vec![Type::Linear(Box::new(Type::I64))], Box::new(Type::Unit), Box::new(Type::Row(vec![], None))),
             },
         );
 
@@ -162,7 +164,7 @@ impl TypeChecker {
                         let name = format!("{}.{}", port.name, sig.name);
                         let param_types: Vec<Type> =
                             sig.params.iter().map(|p| p.typ.clone()).collect();
-                        let typ = Type::Arrow(param_types, Box::new(sig.ret_type.clone()));
+                        let typ = Type::Arrow(param_types, Box::new(sig.ret_type.clone()), Box::new(sig.effects.clone()));
                         self.env.insert(name, Scheme { vars: vec![], typ });
                     }
                 }
@@ -184,7 +186,7 @@ impl TypeChecker {
             if !scheme.vars.is_empty() {
                  return Err("main function cannot be generic".to_string());
             }
-            if let Type::Arrow(params, ret) = &scheme.typ {
+            if let Type::Arrow(params, ret, _) = &scheme.typ {
                 if !params.is_empty() {
                     return Err("main function cannot take arguments".to_string());
                 }
@@ -207,8 +209,10 @@ impl TypeChecker {
             param_types.push(self.convert_user_defined_to_var(&p.typ, &vars));
         }
         let ret_type = self.convert_user_defined_to_var(&func.ret_type, &vars);
+        
+        let effects = self.convert_user_defined_to_var(&func.effects, &vars);
 
-        let typ = Type::Arrow(param_types, Box::new(ret_type));
+        let typ = Type::Arrow(param_types, Box::new(ret_type), Box::new(effects));
 
         Scheme {
             vars: func.type_params.clone(),
@@ -234,17 +238,25 @@ impl TypeChecker {
                 Box::new(self.convert_user_defined_to_var(ok, vars)),
                 Box::new(self.convert_user_defined_to_var(err, vars)),
             ),
-            Type::Arrow(params, ret) => Type::Arrow(
+            Type::Arrow(params, ret, effects) => Type::Arrow(
                 params
                     .iter()
                     .map(|p| self.convert_user_defined_to_var(p, vars))
                     .collect(),
                 Box::new(self.convert_user_defined_to_var(ret, vars)),
+                Box::new(self.convert_user_defined_to_var(effects, vars)),
             ),
             Type::Ref(inner) => Type::Ref(Box::new(self.convert_user_defined_to_var(inner, vars))),
             Type::Linear(inner) => {
                 Type::Linear(Box::new(self.convert_user_defined_to_var(inner, vars)))
             }
+            Type::Row(effs, tail) => Type::Row(
+                effs.iter()
+                    .map(|e| self.convert_user_defined_to_var(e, vars))
+                    .collect(),
+                tail.as_ref()
+                    .map(|t| Box::new(self.convert_user_defined_to_var(t, vars))),
+            ),
             _ => typ.clone(),
         }
     }
@@ -259,6 +271,7 @@ impl TypeChecker {
             );
         }
         let expected_ret = func.ret_type.clone();
+        let expected_eff = func.effects.clone();
 
         // Gravity Rule: Return type cannot contain Ref
         if contains_ref(&expected_ret) {
@@ -269,7 +282,7 @@ impl TypeChecker {
         }
 
         eprintln!("DEBUG: check_function start for {}. linear_vars: {:?}", func.name, local_env.linear_vars);
-        self.infer_body(&func.body, &mut local_env, &expected_ret)?;
+        self.infer_body(&func.body, &mut local_env, &expected_ret, &expected_eff)?;
         eprintln!("DEBUG: check_function end for {}. linear_vars: {:?}", func.name, local_env.linear_vars);
         
         if !local_env.linear_vars.is_empty() {
@@ -283,13 +296,14 @@ impl TypeChecker {
         body: &[Stmt],
         env: &mut TypeEnv,
         expected_ret: &Type,
+        expected_eff: &Type,
     ) -> Result<(), String> {
         for stmt in body {
             match stmt {
                                 Stmt::Let {
                                     name, value, sigil, ..
                                 } => {
-                                    let (s1, t1) = self.infer(env, value, expected_ret)?;
+                                    let (s1, t1) = self.infer(env, value, expected_ret, expected_eff)?;
                                     env.apply(&s1);
                 
                                     let final_type = match sigil {
@@ -320,7 +334,7 @@ impl TypeChecker {
                                 }
                 
                 Stmt::Return(expr) => {
-                    let (s1, t1) = self.infer(env, expr, expected_ret)?;
+                    let (s1, t1) = self.infer(env, expr, expected_ret, expected_eff)?;
                     env.apply(&s1);
                     
                     if !env.linear_vars.is_empty() {
@@ -332,7 +346,7 @@ impl TypeChecker {
                     env.apply(&s2);
                 }
                 Stmt::Expr(expr) => {
-                    let (s1, _) = self.infer(env, expr, expected_ret)?;
+                    let (s1, _) = self.infer(env, expr, expected_ret, expected_eff)?;
                     env.apply(&s1);
                 }
 
@@ -345,7 +359,7 @@ impl TypeChecker {
                         ));
                     }
 
-                    let (s_val, t_val) = self.infer(env, value, expected_ret)?;
+                    let (s_val, t_val) = self.infer(env, value, expected_ret, expected_eff)?;
                     env.apply(&s_val);
 
                     let key = sigil.get_key(name);
@@ -366,6 +380,22 @@ impl TypeChecker {
                         self.check_task(task, env)?;
                     }
                 }
+                Stmt::Try { body, catch_param, catch_body } => {
+                    let mut env_try = env.clone();
+                    self.infer_body(body, &mut env_try, expected_ret, expected_eff)?;
+                    
+                    let mut env_catch = env.clone();
+                    env_catch.insert(catch_param.clone(), Scheme { vars: vec![], typ: Type::Str });
+                    self.infer_body(catch_body, &mut env_catch, expected_ret, expected_eff)?;
+                    
+                    // Merge linear vars
+                    let avail_try = &env_try.linear_vars;
+                    let avail_catch = &env_catch.linear_vars;
+                    if avail_try != avail_catch {
+                        return Err("Linear variable usage mismatch in try/catch".to_string());
+                    }
+                    env.linear_vars = env_try.linear_vars;
+                }
                 _ => {}
             }
         }
@@ -384,32 +414,55 @@ impl TypeChecker {
         }
 
         // Tasks return Unit
-        self.infer_body(&task.body, &mut task_env, &Type::Unit)
+        self.infer_body(&task.body, &mut task_env, &Type::Unit, &Type::Unit)
     }
 
-    pub fn check_repl_stmt(&mut self, stmt: &Stmt) -> Result<Type, String> {
-        let mut env = std::mem::replace(&mut self.env, TypeEnv::new());
-        let res = (|| {
-            match stmt {
-                            Stmt::Expr(expr) => {
-                                let (s, t) = self.infer(&mut env, expr, &Type::Unit)?;
-                                env.apply(&s);
-                                Ok(t)
-                            }                _ => {
-                    self.infer_body(&[stmt.clone()], &mut env, &Type::Unit)?;
-                    Ok(Type::Unit)
+        pub fn check_repl_stmt(&mut self, stmt: &Stmt) -> Result<Type, String> {
+
+            let mut env = std::mem::replace(&mut self.env, TypeEnv::new());
+
+            let res = (|| {
+
+                match stmt {
+
+                    Stmt::Expr(expr) => {
+
+                        let eff = self.new_var();
+
+                        let (s, t) = self.infer(&mut env, expr, &Type::Unit, &eff)?;
+
+                        env.apply(&s);
+
+                        Ok(t)
+
+                    }
+
+                    _ => {
+
+                        let eff = self.new_var();
+
+                        self.infer_body(&[stmt.clone()], &mut env, &Type::Unit, &eff)?;
+
+                        Ok(Type::Unit)
+
+                    }
+
                 }
-            }
-        })();
-        self.env = env;
-        res
-    }
+
+            })();
+
+            self.env = env;
+
+            res
+
+        }
 
     fn infer(
         &mut self,
         env: &mut TypeEnv,
         expr: &Expr,
         expected_ret: &Type,
+        expected_eff: &Type,
     ) -> Result<(Subst, Type), String> {
         eprintln!("DEBUG: infer expr: {:?}", expr);
         match expr {
@@ -446,8 +499,8 @@ impl TypeChecker {
                 }
             }
             Expr::BinaryOp(lhs, op, rhs) => {
-                let (s1, t1) = self.infer(env, lhs, expected_ret)?;
-                let (s2, t2) = self.infer(env, rhs, expected_ret)?;
+                let (s1, t1) = self.infer(env, lhs, expected_ret, expected_eff)?;
+                let (s2, t2) = self.infer(env, rhs, expected_ret, expected_eff)?;
                 let mut s = compose_subst(&s1, &s2);
                 match op.as_str() {
                     "+" | "-" | "*" | "/" => {
@@ -476,13 +529,22 @@ impl TypeChecker {
 
                 let ret_type = self.new_var();
                 let param_types: Vec<Type> = args.iter().map(|_| self.new_var()).collect();
-                let call_type = Type::Arrow(param_types.clone(), Box::new(ret_type.clone()));
+                let eff_call = self.new_var();
+                let call_type = Type::Arrow(
+                    param_types.clone(),
+                    Box::new(ret_type.clone()),
+                    Box::new(eff_call.clone()),
+                );
 
                 let s_fn = self.unify(&func_type, &call_type)?;
                 subst = compose_subst(&subst, &s_fn);
+                
+                // Check effects
+                let s_eff = self.unify(&apply_subst_type(&subst, expected_eff), &apply_subst_type(&subst, &eff_call))?;
+                subst = compose_subst(&subst, &s_eff);
 
                 for (param_type, (_, arg_expr)) in param_types.iter().zip(args) {
-                    let (s_arg, t_arg) = self.infer(env, arg_expr, expected_ret)?;
+                    let (s_arg, t_arg) = self.infer(env, arg_expr, expected_ret, expected_eff)?;
                     subst = compose_subst(&subst, &s_arg);
 
                     let current_param = apply_subst_type(&subst, param_type);
@@ -494,11 +556,11 @@ impl TypeChecker {
             }
             Expr::Constructor(name, args) => {
                 if name == "Ok" && args.len() == 1 {
-                    let (s, t) = self.infer(env, &args[0], expected_ret)?;
+                    let (s, t) = self.infer(env, &args[0], expected_ret, expected_eff)?;
                     return Ok((s, Type::Result(Box::new(t), Box::new(self.new_var()))));
                 }
                 if name == "Err" && args.len() == 1 {
-                    let (s, t) = self.infer(env, &args[0], expected_ret)?;
+                    let (s, t) = self.infer(env, &args[0], expected_ret, expected_eff)?;
                     return Ok((s, Type::Result(Box::new(self.new_var()), Box::new(t))));
                 }
                 Ok((HashMap::new(), Type::Unit))
@@ -506,7 +568,7 @@ impl TypeChecker {
             Expr::Record(fields) => {
                 let mut subst = HashMap::new();
                 for (_, expr) in fields {
-                    let (s, _) = self.infer(env, expr, expected_ret)?;
+                    let (s, _) = self.infer(env, expr, expected_ret, expected_eff)?;
                     subst = compose_subst(&subst, &s);
                 }
                 Ok((
@@ -515,7 +577,7 @@ impl TypeChecker {
                 ))
             }
             Expr::FieldAccess(receiver, field_name) => {
-                let (s1, t_rec) = self.infer(env, receiver, expected_ret)?;
+                let (s1, t_rec) = self.infer(env, receiver, expected_ret, expected_eff)?;
                 if let Type::UserDefined(type_name, type_args) = &t_rec {
                     if let Some(td) = env.types.get(type_name).cloned() {
                         if let Some((_, f_type)) = td.fields.iter().find(|(n, _)| n == field_name) {
@@ -537,17 +599,17 @@ impl TypeChecker {
                 then_branch,
                 else_branch,
             } => {
-                let (s1, t_cond) = self.infer(env, cond, expected_ret)?;
+                let (s1, t_cond) = self.infer(env, cond, expected_ret, expected_eff)?;
                 let s = compose_subst(&s1, &self.unify(&t_cond, &Type::Bool)?);
                 
                 let mut env_then = env.clone();
                 env_then.apply(&s);
-                self.infer_body(then_branch, &mut env_then, expected_ret)?;
+                self.infer_body(then_branch, &mut env_then, expected_ret, expected_eff)?;
                 
                 let mut env_else = env.clone();
                 env_else.apply(&s);
                 if let Some(else_branch) = else_branch {
-                    self.infer_body(else_branch, &mut env_else, expected_ret)?;
+                    self.infer_body(else_branch, &mut env_else, expected_ret, expected_eff)?;
                 } else {
                      // Implicit else branch (returns Unit). 
                      // But implicit else does nothing, so it consumes NOTHING.
@@ -574,7 +636,7 @@ impl TypeChecker {
                 Ok((s, Type::Unit))
             }
             Expr::Match { target, cases } => {
-                let (s1, t_target) = self.infer(env, target, expected_ret)?;
+                let (s1, t_target) = self.infer(env, target, expected_ret, expected_eff)?;
                 let mut s = s1;
                 
                 // For match, we need to ensure all cases consume same linear vars.
@@ -591,7 +653,7 @@ impl TypeChecker {
                     )?;
                     s = compose_subst(&s, &s_match);
                     local_env.apply(&s_match);
-                    self.infer_body(&case.body, &mut local_env, expected_ret)?;
+                    self.infer_body(&case.body, &mut local_env, expected_ret, expected_eff)?;
                     
                     if let Some(prev) = &resulting_linear_vars {
                         if prev != &local_env.linear_vars {
@@ -602,15 +664,41 @@ impl TypeChecker {
                     }
                 }
                 
-                if let Some(res_vars) = resulting_linear_vars {
-                    env.linear_vars = res_vars;
-                }
+                                if let Some(res_vars) = resulting_linear_vars {
                 
-                Ok((s, Type::Unit))
-            }
-
-        }
-    }
+                                    env.linear_vars = res_vars;
+                
+                                }
+                
+                                
+                
+                                Ok((s, Type::Unit))
+                
+                            }
+                
+                                        Expr::Raise(expr) => {
+                
+                                            let (s, t) = self.infer(env, expr, expected_ret, expected_eff)?;
+                
+                                            // Expect string error message
+                
+                                            let s_str = self.unify(&t, &Type::Str)?;
+                
+                                            let s = compose_subst(&s, &s_str);
+                
+                                            
+                
+                                            // Raise returns any type (diverges)
+                
+                                            let ret = self.new_var();
+                
+                                            Ok((s, ret))
+                
+                                        }
+                
+                        }
+                
+                    }
 
     fn bind_pattern(
         &mut self,
@@ -691,17 +779,63 @@ impl TypeChecker {
                 s.insert(n.clone(), t.clone());
                 Ok(s)
             }
-            (Type::Arrow(p1, r1), Type::Arrow(p2, r2)) => {
+            (Type::Arrow(p1, r1, e1), Type::Arrow(p2, r2, e2)) => {
                 if p1.len() != p2.len() {
                     return Err("Arity mismatch".into());
                 }
+                // Unify params
                 let mut s = HashMap::new();
                 for (a, b) in p1.iter().zip(p2) {
                     let s_new = self.unify(&apply_subst_type(&s, a), &apply_subst_type(&s, b))?;
                     s = compose_subst(&s, &s_new);
                 }
+                // Unify return type
                 let s_ret = self.unify(&apply_subst_type(&s, r1), &apply_subst_type(&s, r2))?;
-                Ok(compose_subst(&s, &s_ret))
+                s = compose_subst(&s, &s_ret);
+                
+                // Unify effects
+                let s_eff = self.unify(&apply_subst_type(&s, e1), &apply_subst_type(&s, e2))?;
+                s = compose_subst(&s, &s_eff);
+                
+                Ok(s)
+            }
+            (Type::Row(e1, t1), Type::Row(e2, t2)) => {
+                let mut s = HashMap::new();
+                let mut e2_remaining = e2.clone();
+                let mut e1_remaining = Vec::new();
+
+                for h1 in e1 {
+                    let h1_sub = apply_subst_type(&s, h1);
+                    if let Some(idx) = e2_remaining.iter().position(|h2| h1_sub == apply_subst_type(&s, h2)) {
+                        e2_remaining.remove(idx);
+                    } else {
+                        e1_remaining.push(h1.clone());
+                    }
+                }
+
+                let fresh_tail = if t1.is_some() || t2.is_some() || !e1_remaining.is_empty() || !e2_remaining.is_empty() {
+                    Some(Box::new(self.new_var()))
+                } else {
+                    None
+                };
+
+                if let Some(t1_inner) = t1 {
+                    let row = Type::Row(e2_remaining.clone(), fresh_tail.clone());
+                    let s_new = self.unify(&apply_subst_type(&s, t1_inner), &row)?;
+                    s = compose_subst(&s, &s_new);
+                } else if !e2_remaining.is_empty() {
+                    return Err(format!("Row mismatch: extra effects in RHS: {:?}", e2_remaining));
+                }
+
+                if let Some(t2_inner) = t2 {
+                    let row = Type::Row(e1_remaining, fresh_tail);
+                    let s_new = self.unify(&apply_subst_type(&s, t2_inner), &row)?;
+                    s = compose_subst(&s, &s_new);
+                } else if !e1_remaining.is_empty() {
+                    return Err(format!("Row mismatch: extra effects in LHS: {:?}", e1_remaining));
+                }
+
+                Ok(s)
             }
             (Type::UserDefined(n1, args1), Type::UserDefined(n2, args2)) if n1 == n2 => {
                 if args1.len() != args2.len() {
@@ -729,9 +863,10 @@ impl TypeChecker {
 pub fn apply_subst_type(subst: &Subst, typ: &Type) -> Type {
     match typ {
         Type::Var(n) => subst.get(n).cloned().unwrap_or(typ.clone()),
-        Type::Arrow(params, ret) => Type::Arrow(
+        Type::Arrow(params, ret, effects) => Type::Arrow(
             params.iter().map(|p| apply_subst_type(subst, p)).collect(),
             Box::new(apply_subst_type(subst, ret)),
+            Box::new(apply_subst_type(subst, effects)),
         ),
         Type::UserDefined(n, args) => Type::UserDefined(
             n.clone(),
@@ -743,6 +878,10 @@ pub fn apply_subst_type(subst: &Subst, typ: &Type) -> Type {
         ),
         Type::Ref(inner) => Type::Ref(Box::new(apply_subst_type(subst, inner))),
         Type::Linear(inner) => Type::Linear(Box::new(apply_subst_type(subst, inner))),
+        Type::Row(effs, tail) => Type::Row(
+            effs.iter().map(|e| apply_subst_type(subst, e)).collect(),
+            tail.as_ref().map(|t| Box::new(apply_subst_type(subst, t))),
+        ),
         _ => typ.clone(),
     }
 }
@@ -762,11 +901,12 @@ fn get_free_vars_type(typ: &Type) -> HashSet<String> {
             s.insert(n.clone());
             s
         }
-        Type::Arrow(params, ret) => {
+        Type::Arrow(params, ret, effects) => {
             let mut s = get_free_vars_type(ret);
             for p in params {
                 s.extend(get_free_vars_type(p));
             }
+            s.extend(get_free_vars_type(effects));
             s
         }
         Type::UserDefined(_, args) => {
@@ -783,6 +923,16 @@ fn get_free_vars_type(typ: &Type) -> HashSet<String> {
         }
         Type::Ref(inner) => get_free_vars_type(inner),
         Type::Linear(inner) => get_free_vars_type(inner),
+        Type::Row(effs, tail) => {
+            let mut s = HashSet::new();
+            for e in effs {
+                s.extend(get_free_vars_type(e));
+            }
+            if let Some(t) = tail {
+                s.extend(get_free_vars_type(t));
+            }
+            s
+        }
         _ => HashSet::new(),
     }
 }
@@ -800,13 +950,16 @@ fn get_free_vars_env(env: &TypeEnv) -> HashSet<String> {
 fn occurs_check(name: &str, typ: &Type) -> bool {
     match typ {
         Type::Var(n) => n == name,
-        Type::Arrow(params, ret) => {
-            occurs_check(name, ret) || params.iter().any(|p| occurs_check(name, p))
+        Type::Arrow(params, ret, effects) => {
+            occurs_check(name, ret) || params.iter().any(|p| occurs_check(name, p)) || occurs_check(name, effects)
         }
         Type::UserDefined(_, args) => args.iter().any(|a| occurs_check(name, a)),
         Type::Result(ok, err) => occurs_check(name, ok) || occurs_check(name, err),
         Type::Ref(inner) => occurs_check(name, inner),
         Type::Linear(inner) => occurs_check(name, inner),
+        Type::Row(effs, tail) => {
+            effs.iter().any(|e| occurs_check(name, e)) || tail.as_ref().map_or(false, |t| occurs_check(name, t))
+        }
         _ => false,
     }
 }
@@ -814,10 +967,13 @@ fn occurs_check(name: &str, typ: &Type) -> bool {
 fn contains_ref(typ: &Type) -> bool {
     match typ {
         Type::Ref(_) => true,
-        Type::Arrow(params, ret) => contains_ref(ret) || params.iter().any(contains_ref),
+        Type::Arrow(params, ret, effects) => contains_ref(ret) || params.iter().any(contains_ref) || contains_ref(effects),
         Type::UserDefined(_, args) => args.iter().any(contains_ref),
         Type::Result(ok, err) => contains_ref(ok) || contains_ref(err),
         Type::Linear(inner) => contains_ref(inner),
+        Type::Row(effs, tail) => {
+            effs.iter().any(contains_ref) || tail.as_ref().map_or(false, |t| contains_ref(t))
+        }
         _ => false,
     }
 }
@@ -826,9 +982,12 @@ fn contains_linear(typ: &Type) -> bool {
     match typ {
         Type::Linear(_) => true,
         Type::Ref(inner) => contains_linear(inner),
-        Type::Arrow(params, ret) => contains_linear(ret) || params.iter().any(contains_linear),
+        Type::Arrow(params, ret, effects) => contains_linear(ret) || params.iter().any(contains_linear) || contains_linear(effects),
         Type::UserDefined(_, args) => args.iter().any(contains_linear),
         Type::Result(ok, err) => contains_linear(ok) || contains_linear(err),
+        Type::Row(effs, tail) => {
+            effs.iter().any(contains_linear) || tail.as_ref().map_or(false, |t| contains_linear(t))
+        }
         _ => false,
     }
 }
