@@ -216,7 +216,9 @@ impl TypeChecker {
                 }
                 Stmt::Conc(ts) => { for t in ts { self.check_task(t, env, &s.span)?; } }
                 Stmt::Try { body, catch_param, catch_body } => {
-                    let mut et = env.clone(); self.infer_body(body, &mut et, er, ee)?;
+                    let exn_type = Type::UserDefined("Exn".into(), vec![]);
+                    let try_eff = Type::Row(vec![exn_type], Some(Box::new(ee.clone())));
+                    let mut et = env.clone(); self.infer_body(body, &mut et, er, &try_eff)?;
                     let mut ec = env.clone(); ec.insert(catch_param.clone(), Scheme { vars: vec![], typ: Type::Str });
                     self.infer_body(catch_body, &mut ec, er, ee)?;
                     if et.linear_vars != ec.linear_vars { return Err(TypeError { message: "Linear mismatch".into(), span: s.span.clone() }); }
@@ -396,7 +398,12 @@ impl TypeChecker {
             Expr::Raise(ex) => {
                 let (s, t) = self.infer(env, ex, er, ee)?;
                 let ss = self.unify(&t, &Type::Str).map_err(|m| TypeError { message: m, span: ex.span.clone() })?;
-                Ok((compose_subst(&s, &ss), self.new_var()))
+                let mut s = compose_subst(&s, &ss);
+                let exn_type = Type::UserDefined("Exn".into(), vec![]);
+                let required_eff = Type::Row(vec![exn_type], Some(Box::new(self.new_var())));
+                let s_eff = self.unify(&apply_subst_type(&s, ee), &required_eff).map_err(|_| TypeError { message: "raise requires 'Exn' effect".into(), span: e.span.clone() })?;
+                s = compose_subst(&s, &s_eff);
+                Ok((s, self.new_var()))
             }
         }
     }

@@ -48,6 +48,37 @@ fn test_call_pure_from_impure() {
 }
 
 #[test]
+fn test_try_catch_removes_exn() {
+    let src = r#"
+    fn risky() -> unit effect { Exn } do
+        raise "oops"
+        return ()
+    endfn
+
+    fn main() -> unit do
+        try
+            perform risky()
+        catch e ->
+            perform print_str(s: e)
+        endtry
+        return ()
+    endfn
+    "#;
+    assert!(check(src).is_ok());
+}
+
+#[test]
+fn test_raise_requires_exn() {
+    let src = r#"
+    fn fail() -> unit do
+        raise "oops" // Should fail: no Exn effect allowed
+        return ()
+    endfn
+    "#;
+    assert!(check(src).is_err());
+}
+
+#[test]
 fn test_effect_mismatch() {
     // g is declared pure but calls f (IO). Should fail.
     let src = r#"

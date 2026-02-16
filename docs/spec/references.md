@@ -48,5 +48,5 @@ perform consume(r: %res)
 ### Properties
 
 - **Exactly Once**: A linear variable must be used exactly once.
-- **No Discard**: `let _ = %x` is allowed but `_` absorbs the linearity, effectively preventing usage and causing an error at scope end if not consumed.
-- **No Ref**: Mutable references to linear types (`Ref<Linear<T>>`) are forbidden to prevent aliasing violations.
+- **No Discard**: The wildcard pattern `_` cannot be used to discard a linear value. This ensures that every resource is explicitly consumed or handled.
+- **No Ref**: Mutable references to linear types (`Ref<Linear<T>>`) are strictly forbidden to prevent aliasing violations.
