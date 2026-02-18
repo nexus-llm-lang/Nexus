@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::lang::stdlib::load_stdlib_nx_programs;
 use chumsky::Parser;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -87,7 +88,34 @@ pub enum ExprResult {
     EarlyReturn(Value),
 }
 
-type EvalResult = Result<ExprResult, String>;
+#[derive(Debug, Clone)]
+pub enum EvalError {
+    Exception(Value),
+}
+
+impl std::fmt::Display for EvalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EvalError::Exception(v) => write!(f, "Unhandled exception: {}", v),
+        }
+    }
+}
+
+type EvalResult = Result<ExprResult, EvalError>;
+
+fn runtime_error(msg: impl Into<String>) -> EvalError {
+    EvalError::Exception(Value::Variant(
+        "RuntimeError".to_string(),
+        vec![Value::String(msg.into())],
+    ))
+}
+
+fn invalid_index_error(index: i64) -> EvalError {
+    EvalError::Exception(Value::Variant(
+        "InvalidIndex".to_string(),
+        vec![Value::Int(index)],
+    ))
+}
 
 #[derive(Debug, Clone)]
 pub struct Env {
@@ -126,7 +154,7 @@ pub struct Interpreter {
     pub functions: HashMap<String, Function>,
     pub closures: HashMap<String, Env>,
     pub handlers: HashMap<String, Handler>,
-    pub native_functions: HashMap<String, Box<dyn Fn(&[Value]) -> Result<ExprResult, String>>>,
+    pub native_functions: HashMap<String, Box<dyn Fn(&[Value]) -> EvalResult>>,
     pub external_functions: HashMap<String, ExternalFn>,
     pub wasm_store: RefCell<Store<WasiCtx>>,
     pub wasm_instances: Vec<Instance>,
@@ -144,10 +172,8 @@ impl Interpreter {
         let mut handlers = HashMap::new();
         let mut external_functions = HashMap::new();
         let mut modules = HashMap::new();
-        let mut native_functions: HashMap<
-            String,
-            Box<dyn Fn(&[Value]) -> Result<ExprResult, String>>,
-        > = HashMap::new();
+        let mut native_functions: HashMap<String, Box<dyn Fn(&[Value]) -> EvalResult>> =
+            HashMap::new();
 
         let engine = Engine::default();
         let wasi = WasiCtxBuilder::new().inherit_stdio().build();
@@ -158,8 +184,8 @@ impl Interpreter {
 
         let mut all_definitions = Vec::new();
         if load_stdlib {
-            if let Ok(stdlib_src) = std::fs::read_to_string("nxlib/stdlib/stdio.nx") {
-                if let Ok(stdlib_program) = crate::parser::parser().parse(stdlib_src) {
+            if let Ok(stdlib_programs) = load_stdlib_nx_programs() {
+                for (_, stdlib_program) in stdlib_programs {
                     all_definitions.extend(stdlib_program.definitions);
                 }
             }
@@ -192,9 +218,7 @@ impl Interpreter {
                             .parse(src)
                             .expect("Failed to parse module");
 
-                        let is_stdlib_module =
-                            std::path::Path::new(&import.path).starts_with("nxlib/stdlib");
-                        let sub_interp = Interpreter::new_with_stdlib(p, !is_stdlib_module);
+                        let sub_interp = Interpreter::new_with_stdlib(p, true);
 
                         if !import.items.is_empty() {
                             for item in &import.items {
@@ -222,93 +246,17 @@ impl Interpreter {
             }
         }
 
-        // Register stdlib functions
+        // Keep only intrinsics that cannot be lowered through the current Wasm ABI.
         native_functions.insert(
-            "i64_to_string".to_string(),
+            "__nx_list_length".to_string(),
             Box::new(|args| {
                 if args.len() != 1 {
-                    return Some(Err("i64_to_string requires 1 arg".to_string())).unwrap();
-                }
-                if let Value::Int(i) = &args[0] {
-                    Ok(ExprResult::Normal(Value::String(i.to_string())))
-                } else {
-                    Err("Expected i64".to_string())
-                }
-            }),
-        );
-
-        native_functions.insert(
-            "float_to_string".to_string(),
-            Box::new(|args| {
-                if args.len() != 1 {
-                    return Some(Err("float_to_string requires 1 arg".to_string())).unwrap();
-                }
-                if let Value::Float(f) = &args[0] {
-                    Ok(ExprResult::Normal(Value::String(f.to_string())))
-                } else {
-                    Err("Expected float".to_string())
-                }
-            }),
-        );
-
-        native_functions.insert(
-            "bool_to_string".to_string(),
-            Box::new(|args| {
-                if args.len() != 1 {
-                    return Some(Err("bool_to_string requires 1 arg".to_string())).unwrap();
-                }
-                if let Value::Bool(b) = &args[0] {
-                    Ok(ExprResult::Normal(Value::String(b.to_string())))
-                } else {
-                    Err("Expected bool".to_string())
-                }
-            }),
-        );
-
-        native_functions.insert(
-            "drop_i64".to_string(),
-            Box::new(|args| {
-                if args.len() != 1 {
-                    return Some(Err("drop_i64 requires 1 arg".to_string())).unwrap();
-                }
-                Ok(ExprResult::Normal(Value::Unit))
-            }),
-        );
-
-        native_functions.insert(
-            "drop_array".to_string(),
-            Box::new(|args| {
-                if args.len() != 1 {
-                    return Some(Err("drop_array requires 1 arg".to_string())).unwrap();
-                }
-                Ok(ExprResult::Normal(Value::Unit))
-            }),
-        );
-
-        native_functions.insert(
-            "list_length".to_string(),
-            Box::new(|args| {
-                if args.len() != 1 {
-                    return Some(Err("list_length requires 1 arg".to_string())).unwrap();
+                    return Err(runtime_error("__nx_list_length requires 1 arg"));
                 }
                 if let Value::List(xs) = &args[0] {
                     Ok(ExprResult::Normal(Value::Int(xs.len() as i64)))
                 } else {
-                    Err("Expected list".to_string())
-                }
-            }),
-        );
-
-        native_functions.insert(
-            "array_length".to_string(),
-            Box::new(|args| {
-                if args.len() != 1 {
-                    return Some(Err("array_length requires 1 arg".to_string())).unwrap();
-                }
-                if let Value::Array(arr) = &args[0] {
-                    Ok(ExprResult::Normal(Value::Int(arr.borrow().len() as i64)))
-                } else {
-                    Err("Expected array".to_string())
+                    Err(runtime_error("Expected list"))
                 }
             }),
         );
@@ -376,7 +324,9 @@ impl Interpreter {
             env.define(param.name.clone(), arg.clone());
         }
 
-        let result = self.eval_body(&func.body, &mut env)?;
+        let result = self
+            .eval_body(&func.body, &mut env)
+            .map_err(|e| e.to_string())?;
         match result {
             ExprResult::Normal(v) => Ok(v),
             ExprResult::EarlyReturn(v) => Ok(v),
@@ -394,33 +344,36 @@ impl Interpreter {
             }
         }
 
-        let (func, func_instance) = func_with_inst.ok_or_else(|| {
-            format!(
-                "Wasm function {} not found in any loaded instance",
-                ext.wasm_name
-            )
-        })?;
-
         if args.len() != ext.params.len() {
-            return Err(format!(
+            return Err(runtime_error(format!(
                 "Arity mismatch: expected {}, got {}",
                 ext.params.len(),
                 args.len()
-            ));
+            )));
         }
+
+        let (func, func_instance) = if let Some(found) = func_with_inst {
+            found
+        } else {
+            return Err(runtime_error(format!(
+                "Wasm function {} not found in any loaded instance",
+                ext.wasm_name
+            )));
+        };
 
         let mut wasm_args = Vec::new();
         for (param, v) in ext.params.iter().zip(args.into_iter()) {
             match (&param.typ, v) {
                 (Type::I32, Value::Int(i)) => {
                     let converted = i32::try_from(i).map_err(|_| {
-                        format!(
+                        runtime_error(format!(
                             "Parameter '{}' expects i32, but {} overflows i32",
                             param.name, i
-                        )
+                        ))
                     })?;
                     wasm_args.push(Val::I32(converted));
                 }
+                (Type::Bool, Value::Bool(b)) => wasm_args.push(Val::I32(if b { 1 } else { 0 })),
                 (Type::I64, Value::Int(i)) => wasm_args.push(Val::I64(i)),
                 (Type::F32, Value::Float(f)) => wasm_args.push(Val::F32((f as f32).to_bits())),
                 (Type::F64, Value::Float(f)) => wasm_args.push(Val::F64(f.to_bits())),
@@ -429,11 +382,32 @@ impl Interpreter {
                     wasm_args.push(Val::I32(ptr));
                     wasm_args.push(Val::I32(s.len() as i32));
                 }
+                (Type::Array(_), Value::Array(arr)) => {
+                    let len = i32::try_from(arr.borrow().len()).map_err(|_| {
+                        runtime_error(format!(
+                            "Parameter '{}' array length overflows i32",
+                            param.name
+                        ))
+                    })?;
+                    // Current ABI passes array metadata only.
+                    wasm_args.push(Val::I32(0));
+                    wasm_args.push(Val::I32(len));
+                }
+                (Type::Borrow(inner), Value::Array(arr)) if matches!(&**inner, Type::Array(_)) => {
+                    let len = i32::try_from(arr.borrow().len()).map_err(|_| {
+                        runtime_error(format!(
+                            "Parameter '{}' array length overflows i32",
+                            param.name
+                        ))
+                    })?;
+                    wasm_args.push(Val::I32(0));
+                    wasm_args.push(Val::I32(len));
+                }
                 (expected, actual) => {
-                    return Err(format!(
+                    return Err(runtime_error(format!(
                         "Unsupported FFI arg for '{}': expected {}, got {:?}",
                         param.name, expected, actual
-                    ))
+                    )))
                 }
             }
         }
@@ -450,23 +424,28 @@ impl Interpreter {
             })
             .collect();
         func.call(&mut *store, &wasm_args, &mut results)
-            .map_err(|e| format!("Wasm call failed: {}", e))?;
+            .map_err(|e| runtime_error(format!("Wasm call failed: {}", e)))?;
 
         if results.is_empty() {
             Ok(ExprResult::Normal(Value::Unit))
         } else {
             match (&ext.ret_type, results[0].clone()) {
                 (Type::I32, Val::I32(i)) => Ok(ExprResult::Normal(Value::Int(i as i64))),
+                (Type::Bool, Val::I32(i)) => Ok(ExprResult::Normal(Value::Bool(i != 0))),
                 (Type::I64, Val::I64(i)) => Ok(ExprResult::Normal(Value::Int(i))),
                 (Type::F32, Val::F32(f)) => {
                     Ok(ExprResult::Normal(Value::Float(f32::from_bits(f) as f64)))
                 }
                 (Type::F64, Val::F64(f)) => Ok(ExprResult::Normal(Value::Float(f64::from_bits(f)))),
+                (Type::String, Val::I64(packed)) => {
+                    let s = self.read_string_from_wasm(packed, &mut *store, &func_instance)?;
+                    Ok(ExprResult::Normal(Value::String(s)))
+                }
                 (Type::Unit, _) => Ok(ExprResult::Normal(Value::Unit)),
-                (expected, actual) => Err(format!(
+                (expected, actual) => Err(runtime_error(format!(
                     "Wasm return type mismatch: declared {}, actual {:?}",
                     expected, actual
-                )),
+                ))),
             }
         }
     }
@@ -476,29 +455,51 @@ impl Interpreter {
         s: &str,
         store: &mut Store<WasiCtx>,
         instance: &Instance,
-    ) -> Result<i32, String> {
-        let alloc = instance
-            .get_func(&mut *store, "allocate")
-            .ok_or("Wasm instance must export 'allocate(i32) -> i32' to receive strings")?;
+    ) -> Result<i32, EvalError> {
+        let alloc = instance.get_func(&mut *store, "allocate").ok_or_else(|| {
+            runtime_error("Wasm instance must export 'allocate(i32) -> i32' to receive strings")
+        })?;
 
         let mut results = [Val::I32(0)];
         alloc
             .call(&mut *store, &[Val::I32(s.len() as i32)], &mut results)
-            .map_err(|e| format!("allocate failed: {}", e))?;
+            .map_err(|e| runtime_error(format!("allocate failed: {}", e)))?;
 
         let ptr = match results[0] {
             Val::I32(p) => p,
-            _ => return Err("allocate must return i32".to_string()),
+            _ => return Err(runtime_error("allocate must return i32")),
         };
 
         let mem = instance
             .get_memory(&mut *store, "memory")
-            .ok_or("Wasm instance must export 'memory'")?;
+            .ok_or_else(|| runtime_error("Wasm instance must export 'memory'"))?;
 
         mem.write(&mut *store, ptr as usize, s.as_bytes())
-            .map_err(|e| format!("memory write failed: {}", e))?;
+            .map_err(|e| runtime_error(format!("memory write failed: {}", e)))?;
 
         Ok(ptr)
+    }
+
+    fn read_string_from_wasm(
+        &self,
+        packed: i64,
+        store: &mut Store<WasiCtx>,
+        instance: &Instance,
+    ) -> Result<String, EvalError> {
+        let raw = packed as u64;
+        let ptr = (raw >> 32) as usize;
+        let len = (raw & 0xFFFF_FFFF) as usize;
+        if len == 0 {
+            return Ok(String::new());
+        }
+
+        let mem = instance
+            .get_memory(&mut *store, "memory")
+            .ok_or_else(|| runtime_error("Wasm instance must export 'memory'"))?;
+        let mut buf = vec![0u8; len];
+        mem.read(&mut *store, ptr, &mut buf)
+            .map_err(|e| runtime_error(format!("memory read failed: {}", e)))?;
+        String::from_utf8(buf).map_err(|e| runtime_error(format!("invalid utf-8 from wasm: {}", e)))
     }
 
     fn eval_body(&mut self, body: &[Spanned<Stmt>], env: &mut Env) -> EvalResult {
@@ -569,6 +570,12 @@ impl Interpreter {
                         return Ok(res);
                     }
                 }
+                Stmt::Drop(expr) => {
+                    let res = self.eval_expr(expr, env)?;
+                    if let ExprResult::EarlyReturn(_) = res {
+                        return Ok(res);
+                    }
+                }
                 Stmt::Conc(tasks) => {
                     for task in tasks {
                         let _ = self.eval_body(&task.body, env)?;
@@ -585,9 +592,9 @@ impl Interpreter {
                             return Ok(ExprResult::EarlyReturn(val))
                         }
                         Ok(ExprResult::Normal(_)) => {}
-                        Err(msg) => {
+                        Err(EvalError::Exception(exn)) => {
                             let mut catch_env = Env::extend(env.clone());
-                            catch_env.define(catch_param.clone(), Value::String(msg));
+                            catch_env.define(catch_param.clone(), exn);
                             let catch_res = self.eval_body(catch_body, &mut catch_env)?;
                             if let ExprResult::EarlyReturn(v) = catch_res {
                                 return Ok(ExprResult::EarlyReturn(v));
@@ -609,13 +616,13 @@ impl Interpreter {
                                 if let Value::Ref(r) = target_val {
                                     *r.borrow_mut() = val;
                                 } else {
-                                    return Err(format!(
+                                    return Err(runtime_error(format!(
                                         "Cannot assign to immutable variable {}",
                                         name
-                                    ));
+                                    )));
                                 }
                             } else {
-                                return Err(format!("Variable {} not found", key));
+                                return Err(runtime_error(format!("Variable {} not found", key)));
                             }
                         }
                         Expr::Index(arr, idx) => {
@@ -626,22 +633,25 @@ impl Interpreter {
                                     ExprResult::Normal(Value::Array(a)),
                                     ExprResult::Normal(Value::Int(i)),
                                 ) => {
+                                    if i < 0 {
+                                        return Err(invalid_index_error(i));
+                                    }
                                     let mut l = a.borrow_mut();
                                     let idx = i as usize;
                                     if idx < l.len() {
                                         l[idx] = val;
                                     } else {
-                                        return Err(format!("Index out of bounds: {}", idx));
+                                        return Err(invalid_index_error(i));
                                     }
                                 }
                                 (ExprResult::EarlyReturn(v), _)
                                 | (_, ExprResult::EarlyReturn(v)) => {
                                     return Ok(ExprResult::EarlyReturn(v))
                                 }
-                                _ => return Err("Invalid array assignment".to_string()),
+                                _ => return Err(runtime_error("Invalid array assignment")),
                             }
                         }
-                        _ => return Err("Invalid assignment target".to_string()),
+                        _ => return Err(runtime_error("Invalid assignment target")),
                     }
                 }
                 Stmt::Comment => continue,
@@ -667,10 +677,10 @@ impl Interpreter {
                             return Ok(ExprResult::Normal(r.borrow().clone()))
                         }
                         (Sigil::Mutable, _) => {
-                            return Err(format!(
+                            return Err(runtime_error(format!(
                                 "Variable {} is not a ref, cannot dereference with ~",
                                 name
-                            ))
+                            )))
                         }
                         _ => return Ok(ExprResult::Normal(val)),
                     }
@@ -681,7 +691,7 @@ impl Interpreter {
                 if self.native_functions.contains_key(&key) {
                     return Ok(ExprResult::Normal(Value::NativeFunction(key)));
                 }
-                Err(format!("Variable '{}' not found", key))
+                Err(runtime_error(format!("Variable '{}' not found", key)))
             }
             Expr::BinaryOp(lhs, op, rhs) => {
                 let l = self.eval_expr(lhs, env)?;
@@ -755,7 +765,10 @@ impl Interpreter {
                             (Value::String(a), "+", Value::String(b)) => {
                                 Ok(ExprResult::Normal(Value::String(a + &b)))
                             }
-                            (l, op, r) => Err(format!("Invalid binary op: {:?} {} {:?}", l, op, r)),
+                            (l, op, r) => Err(runtime_error(format!(
+                                "Invalid binary op: {:?} {} {:?}",
+                                l, op, r
+                            ))),
                         }
                     }
                     (ExprResult::EarlyReturn(v), _) | (_, ExprResult::EarlyReturn(v)) => {
@@ -767,7 +780,7 @@ impl Interpreter {
                 let key = sigil.get_key(name);
                 let val = env
                     .get(&key)
-                    .ok_or_else(|| format!("Variable '{}' not found", key))?;
+                    .ok_or_else(|| runtime_error(format!("Variable '{}' not found", key)))?;
                 Ok(ExprResult::Normal(val))
             }
             Expr::Call { func, args, .. } => {
@@ -786,11 +799,16 @@ impl Interpreter {
                             if let Some(f) = self.native_functions.get(&name) {
                                 return f(&evaluated_args);
                             } else {
-                                return Err(format!("Native function '{}' not found", name));
+                                return Err(runtime_error(format!(
+                                    "Native function '{}' not found",
+                                    name
+                                )));
                             }
                         }
                         Value::Function(name) => {
-                            let res = self.run_function(&name, evaluated_args)?;
+                            let res = self
+                                .run_function(&name, evaluated_args)
+                                .map_err(runtime_error)?;
                             return Ok(ExprResult::Normal(res));
                         }
                         _ => {}
@@ -806,7 +824,9 @@ impl Interpreter {
                     let item_name = &func[pos + 1..];
 
                     if let Some(sub_interp) = self.modules.get_mut(mod_name) {
-                        let res = sub_interp.run_function(item_name, evaluated_args)?;
+                        let res = sub_interp
+                            .run_function(item_name, evaluated_args)
+                            .map_err(runtime_error)?;
                         return Ok(ExprResult::Normal(res));
                     }
 
@@ -834,7 +854,9 @@ impl Interpreter {
                     return f(&evaluated_args);
                 }
 
-                let res = self.run_function(func, evaluated_args)?;
+                let res = self
+                    .run_function(func, evaluated_args)
+                    .map_err(runtime_error)?;
                 Ok(ExprResult::Normal(res))
             }
             Expr::Constructor(name, args) => {
@@ -888,30 +910,33 @@ impl Interpreter {
                 let idx_res = self.eval_expr(idx, env)?;
                 match (arr_res, idx_res) {
                     (ExprResult::Normal(arr_val), ExprResult::Normal(Value::Int(i))) => {
-                        let i = i as usize;
+                        if i < 0 {
+                            return Err(invalid_index_error(i));
+                        }
+                        let idx = i as usize;
                         match arr_val {
                             Value::List(l) => {
-                                if i < l.len() {
-                                    Ok(ExprResult::Normal(l[i].clone()))
+                                if idx < l.len() {
+                                    Ok(ExprResult::Normal(l[idx].clone()))
                                 } else {
-                                    Err(format!("Index out of bounds: {}", i))
+                                    Err(invalid_index_error(i))
                                 }
                             }
                             Value::Array(a) => {
                                 let l = a.borrow();
-                                if i < l.len() {
-                                    Ok(ExprResult::Normal(l[i].clone()))
+                                if idx < l.len() {
+                                    Ok(ExprResult::Normal(l[idx].clone()))
                                 } else {
-                                    Err(format!("Index out of bounds: {}", i))
+                                    Err(invalid_index_error(i))
                                 }
                             }
-                            _ => Err("Cannot index non-array value".to_string()),
+                            _ => Err(runtime_error("Cannot index non-array value")),
                         }
                     }
                     (ExprResult::EarlyReturn(v), _) | (_, ExprResult::EarlyReturn(v)) => {
                         Ok(ExprResult::EarlyReturn(v))
                     }
-                    _ => Err("Index must be an integer".to_string()),
+                    _ => Err(runtime_error("Index must be an integer")),
                 }
             }
             Expr::FieldAccess(receiver, field_name) => {
@@ -921,13 +946,16 @@ impl Interpreter {
                         if let Some(v) = map.get(field_name) {
                             Ok(ExprResult::Normal(v.clone()))
                         } else {
-                            Err(format!("Field {} not found in record", field_name))
+                            Err(runtime_error(format!(
+                                "Field {} not found in record",
+                                field_name
+                            )))
                         }
                     }
-                    ExprResult::Normal(v) => Err(format!(
+                    ExprResult::Normal(v) => Err(runtime_error(format!(
                         "Cannot access field {} on non-record value {:?}",
                         field_name, v
-                    )),
+                    ))),
                     ExprResult::EarlyReturn(v) => Ok(ExprResult::EarlyReturn(v)),
                 }
             }
@@ -947,7 +975,7 @@ impl Interpreter {
                             Ok(ExprResult::Normal(Value::Unit))
                         }
                     }
-                    ExprResult::Normal(_) => Err("If condition must be bool".to_string()),
+                    ExprResult::Normal(_) => Err(runtime_error("If condition must be bool")),
                     ExprResult::EarlyReturn(v) => Ok(ExprResult::EarlyReturn(v)),
                 }
             }
@@ -967,7 +995,7 @@ impl Interpreter {
                         return self.eval_body(&case.body, &mut new_env);
                     }
                 }
-                Err("No match found".to_string())
+                Err(runtime_error("No match found"))
             }
             Expr::Lambda {
                 params,
@@ -996,11 +1024,7 @@ impl Interpreter {
                     ExprResult::Normal(v) => v,
                     ExprResult::EarlyReturn(v) => return Ok(ExprResult::EarlyReturn(v)),
                 };
-                let msg = match val {
-                    Value::String(s) => s,
-                    v => format!("{:?}", v),
-                };
-                Err(msg)
+                Err(EvalError::Exception(val))
             }
         }
     }

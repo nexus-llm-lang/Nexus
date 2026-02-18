@@ -209,6 +209,7 @@ pub enum Stmt {
         typ: Option<Type>,
         value: Spanned<Expr>,
     },
+    Drop(Spanned<Expr>),
     Expr(Spanned<Expr>), // For side-effecting calls or match/if used as statement
     Return(Spanned<Expr>),
     // Assignment: target <- value
@@ -258,6 +259,12 @@ pub struct VariantDef {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ExceptionDef {
+    pub name: String,
+    pub fields: Vec<Type>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Import {
     pub path: String,
     pub alias: Option<String>,
@@ -302,6 +309,7 @@ pub enum TopLevel {
     ExternalFn(ExternalFn),
     TypeDef(TypeDef),
     Enum(EnumDef),
+    Exception(ExceptionDef),
     Import(Import),
     Port(Port),
     Handler(Handler),

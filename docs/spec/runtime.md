@@ -17,6 +17,7 @@ fn main() -> unit
 - **Parameters**: It must take no arguments.
 - **Return Type**: It must return `unit`.
 - **Visibility**: It must be private (no `pub` modifier).
+- **Effects**: It must not declare the `Exn` effect.
 
 ### Execution
 

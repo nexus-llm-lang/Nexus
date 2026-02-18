@@ -77,7 +77,9 @@ fn test_recursive_lambda_with_annotation_runtime() {
             if n == 0 then
                 return 1
             else
-                return n * fact(n: n - 1)
+                let n1 = n - 1
+                let rec = fact(n: n1)
+                return n * rec
             endif
         endfn
         return fact(n: 5)

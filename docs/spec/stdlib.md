@@ -1,10 +1,18 @@
 # Standard Library
 
-Nexus provides a set of built-in functions available in the global scope.
+Nexus provides a stdlib API available in the global scope.
+
+Public stdlib APIs are split across:
+- `nxlib/stdlib/stdio.nx` (I/O APIs, backed by `nxlib/stdlib/stdio.wasm`)
+- `nxlib/stdlib/stdlib.nx` (pure helpers, backed by `nxlib/stdlib/stdlib.wasm`)
+- collection helpers in `nxlib/stdlib/list.nx` and `nxlib/stdlib/array.nx`
+
+`drop` is a language statement, not a stdlib function.
 
 ## I/O Functions
 
 Functions that perform Input/Output operations have the `IO` effect.
+`stdio` should stay focused on I/O.
 
 ### `print`
 
@@ -42,24 +50,14 @@ Converts a boolean to "true" or "false".
 fn bool_to_string(val: bool) -> string
 ```
 
-## Resource Management
+## Array Helpers
 
-Functions for managing linear resources.
+### `array_length`
 
-### `drop_i64`
-
-Explicitly consumes and drops a linear integer.
+Returns the element count of a borrowed linear array.
 
 ```nexus
-fn drop_i64(val: %i64) -> unit
-```
-
-### `drop_array`
-
-Explicitly consumes and drops a linear array.
-
-```nexus
-fn drop_array<T>(arr: [| T |]) -> unit
+fn array_length<T>(arr: &[| T |]) -> i64
 ```
 
 ## Collection Modules

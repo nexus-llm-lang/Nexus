@@ -74,7 +74,23 @@ fn test_nested_calls() {
     let src = r#"
     fn id<T>(x: T) -> T do return x endfn
     fn main() -> i64 do
-        return id(x: id(x: 10))
+        let v = id(x: 10)
+        return id(x: v)
+    endfn
+    "#;
+    match check_code(src) {
+        Ok(_) => (),
+        Err(e) => panic!("Type check failed: {}", e),
+    }
+}
+
+#[test]
+fn test_labeled_arg_punning() {
+    let src = r#"
+    fn id<T>(x: T) -> T do return x endfn
+    fn main() -> i64 do
+        let x = 10
+        return id(x)
     endfn
     "#;
     match check_code(src) {
@@ -303,7 +319,7 @@ fn test_linear_capture_makes_lambda_linear_and_single_use() {
     fn main() -> i64 do
         let %x = 7
         let f = fn () -> i64 do
-            drop_i64(val: %x)
+            drop %x
             return 1
         endfn
         let y = f()
@@ -322,7 +338,7 @@ fn test_linear_capturing_lambda_cannot_be_called_twice() {
     fn main() -> i64 do
         let %x = 7
         let f = fn () -> i64 do
-            drop_i64(val: %x)
+            drop %x
             return 1
         endfn
         let _a = f()
@@ -346,7 +362,9 @@ fn test_recursive_lambda_with_annotation_typechecks() {
             if n == 0 then
                 return 1
             else
-                return n * fact(n: n - 1)
+                let n1 = n - 1
+                let rec = fact(n: n1)
+                return n * rec
             endif
         endfn
         return fact(n: 5)

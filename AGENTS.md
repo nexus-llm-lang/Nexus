@@ -8,6 +8,7 @@ This project is a language spec and implementation for LLM-friendly language.
 - Write clear commit messages
 - Update documentation every after feature implementation or fixes
 - Ensure `cargo test` and `cargo fmt` passes before committing
+- This repository is Nix-managed; when development tooling/targets change, update `flake.nix` first.
 
 ## Special Agents
 
@@ -44,4 +45,3 @@ This agent is responsible for maintaining strict consistency between documentati
 4.  **Clean & Update**:
     *   Remove resolved items from `FIXME.md`.
     *   If new discrepancies were found during the audit, add them to `FIXME.md`.
-

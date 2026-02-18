@@ -15,7 +15,8 @@
 - [x] Function values (named function as value) and inline lambda literals (`fn (...) -> ... do ... endfn`)
 - [x] Closure safety semantics (no `Ref` capture, linear-capture makes closure linear, recursive local lambda with explicit annotation)
 - [x] Linearity weakening at call sites (`T` can flow to `%T` parameters)
-- [x] Initial stdlib modules (`nxlib/stdlib/stdio.{nx,wasm}`, `list.nx`, `array.nx`)
+- [x] Initial stdlib modules (`nxlib/stdlib/stdio.nx`, `nxlib/stdlib/stdlib.nx`, `list.nx`, `array.nx`)
+- [x] Rust sources for stdlib wasm at `src/lib/{stdio,stdlib}` (build outputs: `nxlib/stdlib/{stdio,stdlib}.wasm`)
 - [x] Property-based tests for type/effect/reference/linear behaviors (proptest)
 
 ## Todo

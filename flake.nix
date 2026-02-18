@@ -28,33 +28,9 @@
           inherit system;
           overlays = [ rust-overlay.overlays.default ];
         };
-        rustBin = pkgs.rust-bin.stable.latest.default;
-        # rustPlatform = pkgs.makeRustPlatform {
-        #   cargo = rustBin;
-        #   rustc = rustBin;
-        # };
-
-        # gen-supported-languages = pkgs.writeShellApplication {
-        #   name = "gen-supported-languages";
-        #   runtimeInputs = [
-        #     # graft
-        #     pkgs.coreutils
-        #   ];
-        #   text = ''
-        #     OUTPUT=docs/SUPPORTED_LANGUAGES.md
-        #
-        #     cat <<'EOL' > "$OUTPUT"
-        #     Supported Languages
-        #     ===
-        #
-        #     The following languages are currently supported by Graft:
-        #
-        #     EOL
-        #
-        #     graft --list-languages >> "$OUTPUT"
-        #     echo "Generated $OUTPUT"
-        #   '';
-        # };
+        rustBin = pkgs.rust-bin.stable.latest.default.override {
+          targets = [ "wasm32-wasip1" ];
+        };
 
         rustPackages = [
           rustBin
@@ -67,22 +43,21 @@
           src = ./tree-sitter-nexus;
         };
 
+        tsDeps = [ pkgs.nodejs pkgs.tree-sitter ];
+
         formatter = pkgs.nixfmt-tree;
 
         devShells.default = pkgs.mkShellNoCC {
-          # inputsFrom = [ graft ];
-          packages = rustPackages ++ [
+          inputsFrom = [ treeSitterNexus ];
+          packages = rustPackages ++ tsDeps ++ [
             pkgs.actionlint
             pkgs.nil
             formatter
-            pkgs.tree-sitter
           ];
         };
       in
       {
         packages = {
-          # default = graft;
-          # inherit gen-supported-languages;
           tree-sitter-nexus = treeSitterNexus;
         };
         legacyPackages = pkgs;

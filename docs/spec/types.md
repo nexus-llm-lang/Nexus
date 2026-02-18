@@ -68,6 +68,16 @@ Arrays cannot contain mutable references (`Ref<T>`).
 
 Linear types (prefixed with `%`) must be consumed exactly once. They ensure resources (like database transactions) are never leaked or reused inappropriately.
 
+`drop` is a language statement for explicit consumption.
+
+```nexus
+drop <expr>
+```
+
+When `val` is linear (for example `%Tx`, arrays, or user-defined values bound with `%`), `drop` consumes it exactly once.
+For non-linear values (`i32`, `f64`, `string`, etc.), `drop` is allowed and simply discards the value.
+If a user-defined constructor takes a linear argument (for example `[| T |]`), constructed values of that ADT are also treated as linear.
+
 ```nexus
 let %tx = db.begin_tx()
 perform db.commit(tx: %tx) // tx is consumed
@@ -81,8 +91,9 @@ The `borrow` keyword allows temporary, immutable access to a linear value withou
 fn peek(x: &i64) -> unit do ... endfn
 
 let %x = 10
-perform peek(x: borrow %x) // %x is NOT consumed
-drop_i64(val: %x)          // %x is consumed here
+let x_ref = borrow %x
+perform peek(x: x_ref) // %x is NOT consumed
+drop %x          // %x is consumed here
 ```
 
 ### Mutable References

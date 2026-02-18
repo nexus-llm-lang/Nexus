@@ -15,8 +15,9 @@ fn test_array_basic() {
         let %arr = [| 1, 2, 3 |]
         %arr[0] <- 42
         let val = (borrow %arr)[0]
-        perform print(val: i64_to_string(val: val))
-        drop_array(arr: %arr)
+        let msg = i64_to_string(val: val)
+        perform print(val: msg)
+        drop %arr
         return ()
     endfn
     "#;
@@ -30,7 +31,7 @@ fn test_array_type_mismatch() {
     let src = r#"
     fn main() -> unit do
         let %arr = [| 1, true |]
-        perform drop_array(arr: %arr)
+        drop %arr
         return ()
     endfn
     "#;
@@ -55,7 +56,7 @@ fn test_array_assignment_mismatch() {
     fn main() -> unit do
         let %arr = [| 1, 2 |]
         %arr[0] <- true // Should fail: assigning bool to i64 array
-        perform drop_array(arr: %arr)
+        drop %arr
         return ()
     endfn
     "#;

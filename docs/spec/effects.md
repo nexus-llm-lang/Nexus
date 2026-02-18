@@ -13,7 +13,9 @@ Effects are declared using the `effect` keyword in function signatures.
 
 ```nexus
 fn print_val(x: i64) -> unit effect { Console } do
-  perform print(val: [=[Value: ]=] ++ i64_to_string(val: x))
+  let x_str = i64_to_string(val: x)
+  let msg = [=[Value: ]=] ++ x_str
+  perform print(val: msg)
 endfn
 ```
 
@@ -39,11 +41,18 @@ When `apply` is called, `E` is unified with the actual effects of the passed fun
 ## Exception Handling
 
 Nexus provides a native exception effect `Exn`.
+You can extend `Exn` with top-level exception constructors.
+
+```nexus
+exception NotFound(string)
+exception PermissionDenied(string, i64)
+```
 
 ### Raising Exceptions
 
 ```nexus
-raise [=[something went wrong]=]
+let err = NotFound([=[something went wrong]=])
+raise err
 ```
 
 ### Catching Exceptions
@@ -52,11 +61,21 @@ raise [=[something went wrong]=]
 try
   perform risky_action()
 catch e ->
-  perform handle_error(msg: e)
+  match e do
+    case NotFound(msg) -> perform handle_error(msg: msg)
+    case PermissionDenied(path, code) -> perform handle_perm(path: path, code: code)
+  endmatch
 endtry
 ```
 
 The `try-catch` block handles the `Exn` effect, removing it from the resulting effect row of the block.
+
+Runtime failures are also reified as `Exn`:
+
+```nexus
+case RuntimeError(msg) -> ...
+case InvalidIndex(i) -> ...
+```
 
 ## Ports and Handlers
 

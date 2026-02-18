@@ -49,8 +49,10 @@ fn test_call_pure_from_impure() {
 #[test]
 fn test_try_catch_removes_exn() {
     let src = r#"
+    exception Oops(string)
+
     fn risky() -> unit effect { Exn } do
-        raise [=[oops]=]
+        raise Oops([=[oops]=])
         return ()
     endfn
 
@@ -58,7 +60,13 @@ fn test_try_catch_removes_exn() {
         try
             perform risky()
         catch e ->
-            perform print(val: e)
+            match e do
+                case Oops(msg) -> perform print(val: msg)
+                case RuntimeError(msg) -> perform print(val: msg)
+                case InvalidIndex(i) ->
+                    let m = i64_to_string(val: i)
+                    perform print(val: m)
+            endmatch
         endtry
         return ()
     endfn
@@ -73,6 +81,16 @@ fn test_raise_requires_exn() {
     let src = r#"
     fn fail() -> unit do
         raise [=[oops]=] // Should fail: no Exn effect allowed
+        return ()
+    endfn
+    "#;
+    assert!(check(src).is_err());
+}
+
+#[test]
+fn test_main_cannot_declare_exn_effect() {
+    let src = r#"
+    fn main() -> unit effect { IO, Exn } do
         return ()
     endfn
     "#;

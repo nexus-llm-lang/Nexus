@@ -15,7 +15,9 @@ fn test_anonymous_record() {
         let r = { x: 1, y: [=[hello]=] }
         let i = r.x
         // let s = r.y // Type of s is Str. Unused variable? (No check yet)
-        perform print(val: [=[i=]=] ++ i64_to_string(val: i))
+        let i_s = i64_to_string(val: i)
+        let msg = [=[i=]=] ++ i_s
+        perform print(val: msg)
         return ()
     endfn
     "#;

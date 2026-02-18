@@ -62,18 +62,21 @@
   base: (type_identifier) @type)
 
 (type_def
-  name: (identifier) @type.definition)
+  name: (uident) @type.definition)
 
 (enum_def
-  name: (identifier) @type.definition)
+  name: (uident) @type.definition)
 
 (variant_def
-  name: (identifier) @constructor)
+  name: (uident) @constructor)
 
 ; ─── Functions ──────────────────────────────────────────────────────────────
 
 (function_def
   name: (identifier) @function)
+
+(lambda_expr
+  ret_type: _ @type)
 
 (external_fn_def
   name: (identifier) @function)
@@ -88,10 +91,10 @@
   func: (dotted_identifier) @function.call)
 
 (constructor_expr
-  name: (identifier) @constructor)
+  name: (uident) @constructor)
 
 (constructor_pattern
-  name: (identifier) @constructor)
+  name: (uident) @constructor)
 
 ; ─── Parameters & Labels ────────────────────────────────────────────────────
 
@@ -149,6 +152,7 @@
 ; ─── Comments ───────────────────────────────────────────────────────────────
 
 (line_comment) @comment @spell
+(block_comment) @comment @spell
 
 ; ─── Punctuation ────────────────────────────────────────────────────────────
 
@@ -170,8 +174,8 @@
 ; ─── Handler & Port ─────────────────────────────────────────────────────────
 
 (port_def
-  name: (identifier) @type)
+  name: (uident) @type)
 
 (handler_def
-  name: (identifier) @type
-  port_name: (identifier) @type)
+  name: (uident) @type
+  port_name: (uident) @type)

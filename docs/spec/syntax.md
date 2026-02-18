@@ -121,6 +121,15 @@ All binary operators are left-associative. Precedence from lowest to highest:
 
 Assigns a new value to a mutable binding. The left-hand side is any expression that resolves to a mutable location.
 
+### Drop statement
+
+```nexus
+drop %resource
+drop value
+```
+
+`drop` is a statement (not a function call). It explicitly consumes linear values and can also discard non-linear values.
+
 ## Types
 
 ### Primitive types
@@ -196,6 +205,15 @@ enum Color {
 
 > **Note:** Constructors with no fields still require `()` in patterns and expressions (e.g., `Red()`).
 
+### Exception declarations
+
+`exception` declarations extend the built-in `Exn` type with constructors.
+
+```nexus
+exception NotFound(string)
+exception PermissionDenied(string, i64)
+```
+
 ## Control Flow
 
 ### If-Else
@@ -241,20 +259,33 @@ try
   let result = risky_operation()
   return result
 catch err ->
-  perform print(val: err)
+  match err do
+    case NotFound(msg) -> perform print(val: msg)
+  endmatch
   return ()
 endtry
 ```
 
-`catch` binds the raised value to a single identifier. Only one catch clause is allowed.
+`catch` binds the raised `Exn` value to a single identifier. Only one catch clause is allowed.
 
 ### Raise
 
 ```nexus
-raise [=[ something went wrong ]=]
+raise NotFound([=[ something went wrong ]=])
 ```
 
 `raise` is an expression. It terminates the current computation and propagates to the nearest `catch`.
+Runtime errors are represented as built-in exceptions such as `RuntimeError(string)` and
+`InvalidIndex(i64)` and can be handled in `catch`.
+
+### Exception constructors
+
+Exception values are created with normal constructor syntax:
+
+```nexus
+let err = PermissionDenied([=[/tmp/data]=], 13)
+raise err
+```
 
 ## Effects and `perform`
 
@@ -313,10 +344,10 @@ endhandler
 Four import forms are available:
 
 ```nexus
-import from "path/to/module.nx"              // anonymous import
-import as math from "path/to/math.nx"        // namespace alias
-import { add, sub } from "path/to/math.nx"   // named items
-import external "path/to/lib.wasm"           // Wasm module
+import from path/to/module.nx              // anonymous import
+import as math from path/to/math.nx        // namespace alias
+import { add, sub } from path/to/math.nx   // named items
+import external path/to/lib.wasm           // Wasm module
 ```
 
 ## Concurrency (`conc`)
@@ -351,7 +382,7 @@ endconc
 Strings use `[=[ ... ]=]` delimiters. To include `]=]` literally, escape it as `\]=]`.
 Numeric literals default to `i64` (integers) and `f64` (floats) unless constrained by annotations or context.
 
-Double-quoted strings (`"..."`) are used **only** in import paths, Wasm binding names, and task names — they are not expression literals.
+Double-quoted strings (`"..."`) are used in Wasm binding names and task names — they are not expression literals.
 
 ---
 
@@ -365,6 +396,7 @@ top_level     ::= function_def
                 | external_fn_def
                 | type_def
                 | enum_def
+                | exception_def
                 | import_def
                 | port_def
                 | handler_def
@@ -385,11 +417,12 @@ type_def      ::= "type" IDENT [ type_params ] "=" record_type
 enum_def      ::= "enum" IDENT [ type_params ]
                   "{" variant_def ( "," variant_def )* [ "," ] "}"
 variant_def   ::= UIDENT [ "(" type ( "," type )* ")" ]
+exception_def ::= "exception" UIDENT [ "(" type ( "," type )* ")" ]
 
-import_def    ::= "import" "external" QUOTED_STRING
-                | "import" "{" IDENT ( "," IDENT )* "}" "from" QUOTED_STRING
-                | "import" "as" IDENT "from" QUOTED_STRING
-                | "import" "from" QUOTED_STRING
+import_def    ::= "import" "external" IMPORT_PATH
+                | "import" "{" IDENT ( "," IDENT )* "}" "from" IMPORT_PATH
+                | "import" "as" IDENT "from" IMPORT_PATH
+                | "import" "from" IMPORT_PATH
 
 port_def      ::= "port" IDENT "do" fn_signature* "endport"
 fn_signature  ::= "fn" IDENT param_list "->" type [ "effect" effect_type ]
@@ -509,7 +542,8 @@ lambda_expr       ::= "fn" "(" [ param ( "," param )* ] ")"
                       "do" stmt* "endfn"
 perform_call      ::= "perform" dotted_ident "(" [ labeled_arg ( "," labeled_arg )* ] ")"
 call_expr         ::= dotted_ident "(" [ labeled_arg ( "," labeled_arg )* ] ")"
-labeled_arg       ::= IDENT ":" expr
+labeled_arg       ::= IDENT [ ":" simple_arg ]
+simple_arg        ::= literal | variable
 constructor_expr  ::= UIDENT "(" [ expr ( "," expr )* ] ")"
 record_expr       ::= "{" [ IDENT ":" expr ( "," IDENT ":" expr )* ] "}"
 list_expr         ::= "[" [ expr ( "," expr )* [ "," ] ] "]"
@@ -555,9 +589,11 @@ line_comment      ::= "//" ANY* ( NEWLINE | EOF )
 block_comment     ::= "/*" ANY* "*/"
 
 QUOTED_STRING     ::= '"' ( NON_DQUOTE | "\" ANY )* '"'
-                      (* used in: import paths, external wasm names, task names *)
+                      (* used in: external wasm names, task names *)
+IMPORT_PATH       ::= QUOTED_STRING | NONSPACE+
 
 IDENT             ::= [a-zA-Z_] [a-zA-Z0-9_]*   (* not a keyword *)
 UIDENT            ::= [A-Z] [a-zA-Z0-9_]*       (* constructor names *)
 DIGIT             ::= [0-9]
+NONSPACE          ::= any non-whitespace character
 ```

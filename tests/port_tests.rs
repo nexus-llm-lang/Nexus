@@ -55,7 +55,8 @@ fn test_port_redefinition_wins() {
 
     fn main() -> unit effect { IO } do
       let result = Adder.add_one(n: 10)
-      perform print(val: i64_to_string(val: result))
+      let msg = i64_to_string(val: result)
+      perform print(val: msg)
       return ()
     endfn
     "#;

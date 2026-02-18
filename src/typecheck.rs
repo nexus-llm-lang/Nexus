@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::lang::stdlib::load_stdlib_nx_programs;
 use crate::parser;
 use chumsky::Parser;
 use std::collections::{HashMap, HashSet};
@@ -45,8 +46,77 @@ impl TypeEnv {
         }
     }
 
+    pub fn contains_linear_type(&self, typ: &Type) -> bool {
+        let mut visiting = HashSet::new();
+        self.contains_linear_type_inner(typ, &mut visiting)
+    }
+
+    fn contains_linear_type_inner(&self, typ: &Type, visiting: &mut HashSet<String>) -> bool {
+        match typ {
+            Type::Linear(_) | Type::Array(_) => true,
+            Type::Borrow(_) => false,
+            Type::Ref(inner) | Type::List(inner) => {
+                self.contains_linear_type_inner(inner, visiting)
+            }
+            Type::Arrow(_, _, _) => false,
+            Type::UserDefined(name, args) => {
+                if args
+                    .iter()
+                    .any(|arg| self.contains_linear_type_inner(arg, visiting))
+                {
+                    return true;
+                }
+
+                if !visiting.insert(name.clone()) {
+                    return false;
+                }
+
+                let mut subst = HashMap::new();
+                let mut has_linear = false;
+
+                if let Some(td) = self.get_type(name) {
+                    for (param, arg) in td.type_params.iter().zip(args.iter()) {
+                        subst.insert(param.clone(), arg.clone());
+                    }
+                    has_linear = td.fields.iter().any(|(_, field_type)| {
+                        let instantiated = apply_subst_type(&subst, field_type);
+                        self.contains_linear_type_inner(&instantiated, visiting)
+                    });
+                } else if let Some(ed) = self.get_enum(name) {
+                    for (param, arg) in ed.type_params.iter().zip(args.iter()) {
+                        subst.insert(param.clone(), arg.clone());
+                    }
+                    has_linear = ed.variants.iter().any(|variant| {
+                        variant.fields.iter().any(|field_type| {
+                            let instantiated = apply_subst_type(&subst, field_type);
+                            self.contains_linear_type_inner(&instantiated, visiting)
+                        })
+                    });
+                }
+
+                visiting.remove(name);
+                has_linear
+            }
+            Type::Result(ok, err) => {
+                self.contains_linear_type_inner(ok, visiting)
+                    || self.contains_linear_type_inner(err, visiting)
+            }
+            Type::Row(effs, tail) => {
+                effs.iter()
+                    .any(|eff| self.contains_linear_type_inner(eff, visiting))
+                    || tail.as_ref().map_or(false, |tail| {
+                        self.contains_linear_type_inner(tail, visiting)
+                    })
+            }
+            Type::Record(fields) => fields
+                .iter()
+                .any(|(_, field_type)| self.contains_linear_type_inner(field_type, visiting)),
+            _ => false,
+        }
+    }
+
     pub fn insert(&mut self, name: String, scheme: Scheme) {
-        if contains_linear(&scheme.typ) {
+        if self.contains_linear_type(&scheme.typ) {
             self.linear_vars.insert(name.clone());
         }
         self.vars.insert(name, scheme);
@@ -102,7 +172,7 @@ impl TypeEnv {
             Ok(())
         } else if self.vars.contains_key(name) {
             if let Some(s) = self.vars.get(name) {
-                if contains_linear(&s.typ) {
+                if self.contains_linear_type(&s.typ) {
                     return Err(format!("Linear variable {} already consumed", name));
                 }
             }
@@ -125,6 +195,181 @@ fn get_default_alias(path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or(path)
         .to_string()
+}
+
+fn exn_enum_def() -> EnumDef {
+    EnumDef {
+        name: "Exn".to_string(),
+        type_params: vec![],
+        variants: vec![
+            VariantDef {
+                name: "RuntimeError".to_string(),
+                fields: vec![Type::String],
+            },
+            VariantDef {
+                name: "InvalidIndex".to_string(),
+                fields: vec![Type::I64],
+            },
+        ],
+    }
+}
+
+fn register_nullary_variant_constructor(
+    env: &mut TypeEnv,
+    enum_name: &str,
+    type_params: &[String],
+    variant: &VariantDef,
+) {
+    if variant.fields.is_empty() {
+        let targs = type_params
+            .iter()
+            .map(|p| Type::Var(p.clone()))
+            .collect::<Vec<_>>();
+        env.insert(
+            variant.name.clone(),
+            Scheme {
+                vars: type_params.to_vec(),
+                typ: Type::UserDefined(enum_name.to_string(), targs),
+            },
+        );
+    }
+}
+
+fn register_exception_variant(
+    env: &mut TypeEnv,
+    exception: &ExceptionDef,
+    span: &Span,
+) -> Result<(), TypeError> {
+    {
+        let exn = env
+            .enums
+            .entry("Exn".to_string())
+            .or_insert_with(exn_enum_def);
+        if exn.variants.iter().any(|v| v.name == exception.name) {
+            return Err(TypeError {
+                message: format!("Duplicate exception constructor: {}", exception.name),
+                span: span.clone(),
+            });
+        }
+    }
+
+    let variant = VariantDef {
+        name: exception.name.clone(),
+        fields: exception.fields.clone(),
+    };
+    register_nullary_variant_constructor(env, "Exn", &[], &variant);
+    env.enums
+        .entry("Exn".to_string())
+        .or_insert_with(exn_enum_def)
+        .variants
+        .push(variant);
+    Ok(())
+}
+
+fn convert_generic_user_defined_to_var(typ: &Type, vars: &HashSet<String>) -> Type {
+    match typ {
+        Type::UserDefined(n, args) => {
+            if args.is_empty() && vars.contains(n) {
+                Type::Var(n.clone())
+            } else {
+                Type::UserDefined(
+                    n.clone(),
+                    args.iter()
+                        .map(|a| convert_generic_user_defined_to_var(a, vars))
+                        .collect(),
+                )
+            }
+        }
+        Type::Arrow(p, r, e) => Type::Arrow(
+            p.iter()
+                .map(|(n, t)| (n.clone(), convert_generic_user_defined_to_var(t, vars)))
+                .collect(),
+            Box::new(convert_generic_user_defined_to_var(r, vars)),
+            Box::new(convert_generic_user_defined_to_var(e, vars)),
+        ),
+        Type::Result(o, e) => Type::Result(
+            Box::new(convert_generic_user_defined_to_var(o, vars)),
+            Box::new(convert_generic_user_defined_to_var(e, vars)),
+        ),
+        Type::Ref(i) => Type::Ref(Box::new(convert_generic_user_defined_to_var(i, vars))),
+        Type::Linear(i) => Type::Linear(Box::new(convert_generic_user_defined_to_var(i, vars))),
+        Type::Borrow(i) => Type::Borrow(Box::new(convert_generic_user_defined_to_var(i, vars))),
+        Type::List(i) => Type::List(Box::new(convert_generic_user_defined_to_var(i, vars))),
+        Type::Array(i) => Type::Array(Box::new(convert_generic_user_defined_to_var(i, vars))),
+        Type::Row(es, t) => Type::Row(
+            es.iter()
+                .map(|x| convert_generic_user_defined_to_var(x, vars))
+                .collect(),
+            t.as_ref()
+                .map(|x| Box::new(convert_generic_user_defined_to_var(x, vars))),
+        ),
+        Type::Record(fs) => Type::Record(
+            fs.iter()
+                .map(|(n, t)| (n.clone(), convert_generic_user_defined_to_var(t, vars)))
+                .collect(),
+        ),
+        _ => typ.clone(),
+    }
+}
+
+fn scheme_for_function(func: &Function) -> Scheme {
+    let vars_set: HashSet<String> = func.type_params.iter().cloned().collect();
+    Scheme {
+        vars: func.type_params.clone(),
+        typ: Type::Arrow(
+            func.params
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        convert_generic_user_defined_to_var(&p.typ, &vars_set),
+                    )
+                })
+                .collect(),
+            Box::new(convert_generic_user_defined_to_var(
+                &func.ret_type,
+                &vars_set,
+            )),
+            Box::new(convert_generic_user_defined_to_var(
+                &func.effects,
+                &vars_set,
+            )),
+        ),
+    }
+}
+
+fn scheme_for_external(func: &ExternalFn) -> Scheme {
+    Scheme {
+        vars: vec![],
+        typ: Type::Arrow(
+            func.params
+                .iter()
+                .map(|p| (p.name.clone(), p.typ.clone()))
+                .collect(),
+            Box::new(func.ret_type.clone()),
+            Box::new(func.effects.clone()),
+        ),
+    }
+}
+
+fn register_public_stdlib_from_nx(env: &mut TypeEnv) {
+    let Ok(programs) = load_stdlib_nx_programs() else {
+        return;
+    };
+
+    for (_path, program) in programs {
+        for def in program.definitions {
+            match def.node {
+                TopLevel::Function(func) if func.is_public => {
+                    env.insert(func.name.clone(), scheme_for_function(&func));
+                }
+                TopLevel::ExternalFn(func) if func.is_public => {
+                    env.insert(func.name.clone(), scheme_for_external(&func));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn default_numeric_literals(typ: &Type) -> Type {
@@ -206,21 +451,10 @@ impl TypeChecker {
                 fields: vec![],
             },
         );
-        let io_eff = Type::Row(vec![Type::UserDefined("IO".into(), vec![])], None);
-
+        env.enums.insert("Exn".to_string(), exn_enum_def());
+        // Internal intrinsics used by stdlib modules.
         env.insert(
-            "print".to_string(),
-            Scheme {
-                vars: vec![],
-                typ: Type::Arrow(
-                    vec![("val".into(), Type::String)],
-                    Box::new(Type::Unit),
-                    Box::new(io_eff.clone()),
-                ),
-            },
-        );
-        env.insert(
-            "i64_to_string".to_string(),
+            "__nx_i64_to_string".to_string(),
             Scheme {
                 vars: vec![],
                 typ: Type::Arrow(
@@ -231,7 +465,7 @@ impl TypeChecker {
             },
         );
         env.insert(
-            "float_to_string".to_string(),
+            "__nx_float_to_string".to_string(),
             Scheme {
                 vars: vec![],
                 typ: Type::Arrow(
@@ -242,7 +476,7 @@ impl TypeChecker {
             },
         );
         env.insert(
-            "bool_to_string".to_string(),
+            "__nx_bool_to_string".to_string(),
             Scheme {
                 vars: vec![],
                 typ: Type::Arrow(
@@ -252,33 +486,8 @@ impl TypeChecker {
                 ),
             },
         );
-
         env.insert(
-            "drop_i64".to_string(),
-            Scheme {
-                vars: vec![],
-                typ: Type::Arrow(
-                    vec![("val".into(), Type::Linear(Box::new(Type::I64)))],
-                    Box::new(Type::Unit),
-                    Box::new(Type::Row(vec![], None)),
-                ),
-            },
-        );
-        env.insert(
-            "drop_array".to_string(),
-            Scheme {
-                vars: vec!["T".into()],
-                typ: Type::Arrow(
-                    vec![("arr".into(), Type::Array(Box::new(Type::Var("T".into()))))],
-                    Box::new(Type::Unit),
-                    Box::new(Type::Row(vec![], None)),
-                ),
-            },
-        );
-
-        // Internal functions used by stdlib modules.
-        env.insert(
-            "list_length".to_string(),
+            "__nx_list_length".to_string(),
             Scheme {
                 vars: vec!["T".into()],
                 typ: Type::Arrow(
@@ -289,7 +498,7 @@ impl TypeChecker {
             },
         );
         env.insert(
-            "array_length".to_string(),
+            "__nx_array_length".to_string(),
             Scheme {
                 vars: vec!["T".into()],
                 typ: Type::Arrow(
@@ -302,6 +511,8 @@ impl TypeChecker {
                 ),
             },
         );
+
+        register_public_stdlib_from_nx(&mut env);
 
         env.linear_vars.clear();
         TypeChecker {
@@ -369,22 +580,26 @@ impl TypeChecker {
                                     public_env.types.insert(td.name.clone(), td.clone());
                                 }
                                 TopLevel::Enum(ed) => {
+                                    if ed.name == "Exn" {
+                                        return Err(TypeError {
+                                            message:
+                                                "Reserved enum name 'Exn'; use 'exception ...' declarations"
+                                                    .into(),
+                                            span: def.span.clone(),
+                                        });
+                                    }
                                     public_env.enums.insert(ed.name.clone(), ed.clone());
                                     for v in &ed.variants {
-                                        if v.fields.is_empty() {
-                                            let mut targs = Vec::new();
-                                            for p in &ed.type_params {
-                                                targs.push(Type::Var(p.clone()));
-                                            }
-                                            public_env.insert(
-                                                v.name.clone(),
-                                                Scheme {
-                                                    vars: ed.type_params.clone(),
-                                                    typ: Type::UserDefined(ed.name.clone(), targs),
-                                                },
-                                            );
-                                        }
+                                        register_nullary_variant_constructor(
+                                            &mut public_env,
+                                            &ed.name,
+                                            &ed.type_params,
+                                            v,
+                                        );
                                     }
+                                }
+                                TopLevel::Exception(ex) => {
+                                    register_exception_variant(&mut public_env, ex, &def.span)?;
                                 }
                                 _ => {}
                             }
@@ -418,22 +633,25 @@ impl TypeChecker {
                     self.env.types.insert(td.name.clone(), td.clone());
                 }
                 TopLevel::Enum(ed) => {
+                    if ed.name == "Exn" {
+                        return Err(TypeError {
+                            message: "Reserved enum name 'Exn'; use 'exception ...' declarations"
+                                .into(),
+                            span: def.span.clone(),
+                        });
+                    }
                     self.env.enums.insert(ed.name.clone(), ed.clone());
                     for v in &ed.variants {
-                        if v.fields.is_empty() {
-                            let mut targs = Vec::new();
-                            for p in &ed.type_params {
-                                targs.push(Type::Var(p.clone()));
-                            }
-                            self.env.insert(
-                                v.name.clone(),
-                                Scheme {
-                                    vars: ed.type_params.clone(),
-                                    typ: Type::UserDefined(ed.name.clone(), targs),
-                                },
-                            );
-                        }
+                        register_nullary_variant_constructor(
+                            &mut self.env,
+                            &ed.name,
+                            &ed.type_params,
+                            v,
+                        );
                     }
+                }
+                TopLevel::Exception(ex) => {
+                    register_exception_variant(&mut self.env, ex, &def.span)?;
                 }
                 TopLevel::Port(port) => {
                     for sig in &port.functions {
@@ -484,11 +702,19 @@ impl TypeChecker {
         for def in &program.definitions {
             match &def.node {
                 TopLevel::Function(func) => {
-                    if func.name == "main" && func.is_public {
-                        return Err(TypeError {
-                            message: "main function must be private (remove 'pub')".into(),
-                            span: def.span.clone(),
-                        });
+                    if func.name == "main" {
+                        if func.is_public {
+                            return Err(TypeError {
+                                message: "main function must be private (remove 'pub')".into(),
+                                span: def.span.clone(),
+                            });
+                        }
+                        if contains_exn_effect(&func.effects) {
+                            return Err(TypeError {
+                                message: "main function must not declare Exn effect".into(),
+                                span: def.span.clone(),
+                            });
+                        }
                     }
                     self.check_function(func, &def.span)?;
                 }
@@ -666,7 +892,7 @@ impl TypeChecker {
                     }
                     let ft = match sigil {
                         Sigil::Mutable => {
-                            if contains_linear(&t1) {
+                            if env.contains_linear_type(&t1) {
                                 return Err(TypeError {
                                     message: "Mutable linear".into(),
                                     span: value.span.clone(),
@@ -675,7 +901,7 @@ impl TypeChecker {
                             Type::Ref(Box::new(t1))
                         }
                         Sigil::Linear => {
-                            if contains_linear(&t1) {
+                            if env.contains_linear_type(&t1) {
                                 t1
                             } else {
                                 Type::Linear(Box::new(t1))
@@ -707,6 +933,9 @@ impl TypeChecker {
                             message: err,
                             span: e.span.clone(),
                         })?;
+                }
+                Stmt::Drop(e) => {
+                    self.infer(env, e, er, ee)?;
                 }
                 Stmt::Expr(e) => {
                     self.infer(env, e, er, ee)?;
@@ -825,7 +1054,7 @@ impl TypeChecker {
                         catch_param.clone(),
                         Scheme {
                             vars: vec![],
-                            typ: Type::String,
+                            typ: Type::UserDefined("Exn".into(), vec![]),
                         },
                     );
                     self.infer_body(catch_body, &mut ec, er, ee)?;
@@ -902,9 +1131,7 @@ impl TypeChecker {
                             t = *i;
                         }
                     }
-                    if let Type::Borrow(i) = t {
-                        t = *i;
-                    } else if contains_linear(&t) {
+                    if env.contains_linear_type(&t) {
                         env.consume(&key).map_err(|m| TypeError {
                             message: m,
                             span: e.span.clone(),
@@ -1139,7 +1366,7 @@ impl TypeChecker {
                             // Linearity weakening at call sites:
                             // allow passing a plain value T to a linear parameter %T.
                             if let Type::Linear(inner) = expected {
-                                if contains_linear(&actual) {
+                                if env.contains_linear_type(&actual) {
                                     return Err(TypeError {
                                         message: primary_err,
                                         span: ae.span.clone(),
@@ -1208,7 +1435,10 @@ impl TypeChecker {
                         ));
                     }
                 }
-                Ok((HashMap::new(), Type::Unit))
+                Err(TypeError {
+                    message: format!("Unknown ctor {}", name),
+                    span: e.span.clone(),
+                })
             }
             Expr::Record(fs) => {
                 let mut s = HashMap::new();
@@ -1306,7 +1536,7 @@ impl TypeChecker {
                     }
                 };
 
-                if contains_linear(&elem_t) {
+                if env.contains_linear_type(&elem_t) {
                     return Err(TypeError {
                         message: "Cannot move linear element out of array".into(),
                         span: e.span.clone(),
@@ -1426,7 +1656,7 @@ impl TypeChecker {
                                 span: e.span.clone(),
                             });
                         }
-                        if contains_linear(&sch.typ) {
+                        if env.contains_linear_type(&sch.typ) {
                             captured_linear_keys.insert(key.clone());
                         }
                     }
@@ -1491,7 +1721,8 @@ impl TypeChecker {
             }
             Expr::Raise(ex) => {
                 let (s, t) = self.infer(env, ex, er, ee)?;
-                let ss = self.unify(&t, &Type::String).map_err(|m| TypeError {
+                let exn_value_type = Type::UserDefined("Exn".into(), vec![]);
+                let ss = self.unify(&t, &exn_value_type).map_err(|m| TypeError {
                     message: m,
                     span: ex.span.clone(),
                 })?;
@@ -1601,7 +1832,7 @@ impl TypeChecker {
                 })
             }
             Pattern::Wildcard => {
-                if contains_linear(tt) {
+                if env.contains_linear_type(tt) {
                     return Err(TypeError {
                         message: "Discard linear".into(),
                         span: p.span.clone(),
@@ -1946,6 +2177,8 @@ impl TypeChecker {
             (Type::Ref(t1), Type::Ref(t2))
             | (Type::Linear(t1), Type::Linear(t2))
             | (Type::Borrow(t1), Type::Borrow(t2)) => self.unify(t1, t2),
+            // Borrow can be read as its underlying value type.
+            (Type::Borrow(t1), t2) => self.unify(t1, t2),
             _ => Err(format!("Mismatch: {} vs {}", t1, t2)),
         }
     }
@@ -2093,18 +2326,27 @@ fn contains_ref(t: &Type) -> bool {
     }
 }
 
-fn contains_linear(t: &Type) -> bool {
+fn contains_exn_effect(t: &Type) -> bool {
     match t {
-        Type::Linear(_) | Type::Array(_) => true,
-        Type::Borrow(_) => false,
-        Type::Ref(i) | Type::List(i) => contains_linear(i),
-        Type::Arrow(_, _, _) => false,
-        Type::UserDefined(_, a) => a.iter().any(contains_linear),
-        Type::Result(o, e) => contains_linear(o) || contains_linear(e),
-        Type::Row(es, t) => {
-            es.iter().any(contains_linear) || t.as_ref().map_or(false, |x| contains_linear(x))
+        Type::UserDefined(name, args) => {
+            (name == "Exn" && args.is_empty()) || args.iter().any(contains_exn_effect)
         }
-        Type::Record(fs) => fs.iter().any(|(_, t)| contains_linear(t)),
+        Type::Arrow(params, ret, eff) => {
+            params.iter().any(|(_, p)| contains_exn_effect(p))
+                || contains_exn_effect(ret)
+                || contains_exn_effect(eff)
+        }
+        Type::Result(ok, err) => contains_exn_effect(ok) || contains_exn_effect(err),
+        Type::Ref(inner)
+        | Type::Linear(inner)
+        | Type::Borrow(inner)
+        | Type::List(inner)
+        | Type::Array(inner) => contains_exn_effect(inner),
+        Type::Row(effs, tail) => {
+            effs.iter().any(contains_exn_effect)
+                || tail.as_ref().is_some_and(|x| contains_exn_effect(x))
+        }
+        Type::Record(fields) => fields.iter().any(|(_, ft)| contains_exn_effect(ft)),
         _ => false,
     }
 }
@@ -2199,7 +2441,7 @@ fn collect_stmt_captures(
                     sigil,
                 );
             }
-            Stmt::Expr(expr) | Stmt::Return(expr) => {
+            Stmt::Expr(expr) | Stmt::Return(expr) | Stmt::Drop(expr) => {
                 collect_expr_captures(
                     expr,
                     outer_keys,

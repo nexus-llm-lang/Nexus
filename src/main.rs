@@ -3,6 +3,7 @@ use chumsky::prelude::*;
 use std::fs;
 
 mod ast;
+mod lang;
 mod parser;
 
 use std::env;

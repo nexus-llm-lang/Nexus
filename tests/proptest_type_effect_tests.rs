@@ -187,8 +187,10 @@ endfn
     fn prop_raise_without_exn_effect_is_error(msg in "[a-zA-Z0-9_]{1,16}") {
         let src = format!(
             r#"
+exception Fail(string)
+
 fn fail() -> unit do
-    raise [=[{msg}]=]
+    raise Fail([=[{msg}]=])
     return ()
 endfn
 "#
@@ -200,8 +202,10 @@ endfn
     fn prop_try_catch_with_io_handler_typechecks(msg in "[a-zA-Z0-9_]{1,16}") {
         let src = format!(
             r#"
+exception MsgError(string)
+
 fn risky(msg: string) -> unit effect {{ Exn }} do
-    raise msg
+    raise MsgError(msg)
     return ()
 endfn
 
@@ -209,7 +213,13 @@ fn main() -> unit effect {{ IO }} do
     try
         perform risky(msg: [=[{msg}]=])
     catch e ->
-        perform print(val: e)
+        match e do
+            case MsgError(m) -> perform print(val: m)
+            case RuntimeError(m) -> perform print(val: m)
+            case InvalidIndex(i) ->
+                let m = i64_to_string(val: i)
+                perform print(val: m)
+        endmatch
     endtry
     return ()
 endfn
@@ -227,12 +237,13 @@ endfn
             .join(", ");
         let src = format!(
             r#"
-import as array from "nxlib/stdlib/array.nx"
+import as array from nxlib/stdlib/array.nx
 
 fn main() -> i64 do
     let %arr = [| {elems} |]
-    let n = array.length(arr: borrow %arr)
-    drop_array(arr: %arr)
+    let arr_ref = borrow %arr
+    let n = array.length(arr: arr_ref)
+    drop %arr
     return n
 endfn
 "#
@@ -289,7 +300,7 @@ endfn
             r#"
 fn main() -> unit do
     let %x = {n}
-    drop_i64(val: %x)
+    drop %x
     return ()
 endfn
 "#
@@ -316,8 +327,8 @@ endfn
             r#"
 fn main() -> unit do
     let %x = {n}
-    drop_i64(val: %x)
-    drop_i64(val: %x)
+    drop %x
+    drop %x
     return ()
 endfn
 "#
@@ -349,9 +360,11 @@ endfn
 
 fn main() -> i64 do
     let %x = {n}
-    let a = peek(x: borrow %x)
-    let b = peek(x: borrow %x)
-    drop_i64(val: %x)
+    let x_ref1 = borrow %x
+    let a = peek(x: x_ref1)
+    let x_ref2 = borrow %x
+    let b = peek(x: x_ref2)
+    drop %x
     return a + b
 endfn
 "#
@@ -366,7 +379,7 @@ endfn
 fn main() -> unit do
     let %x = {n}
     if {cond} then
-        drop_i64(val: %x)
+        drop %x
     else
         return ()
     endif

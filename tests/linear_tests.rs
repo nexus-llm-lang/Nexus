@@ -12,7 +12,7 @@ fn check(src: &str) -> Result<(), String> {
 fn test_linear_basic_pass() {
     let src = r#"
     fn consume(x: %i64) -> unit do
-        drop_i64(val: x)
+        drop x
         return ()
     endfn
 
@@ -32,7 +32,7 @@ fn test_linear_basic_pass() {
 fn test_linear_param_accepts_plain_value_via_weakening() {
     let src = r#"
     fn consume(x: %i64) -> i64 do
-        drop_i64(val: x)
+        drop x
         return 1
     endfn
 
@@ -95,15 +95,18 @@ fn test_linear_match_wildcard_fail() {
 fn test_linear_borrow_basic() {
     let src = r#"
     fn peek(x: &i64) -> unit effect { IO } do
-        perform print(val: i64_to_string(val: x))
+        let msg = i64_to_string(val: x)
+        perform print(val: msg)
         return ()
     endfn
 
     fn main() -> unit effect { IO } do
         let %x = 10
-        perform peek(x: borrow %x)
-        perform peek(x: borrow %x) // Borrow again
-        drop_i64(val: %x)    // Finally consume
+        let x_ref1 = borrow %x
+        perform peek(x: x_ref1)
+        let x_ref2 = borrow %x
+        perform peek(x: x_ref2) // Borrow again
+        drop %x    // Finally consume
         return ()
     endfn
     "#;
@@ -161,4 +164,71 @@ fn test_linear_branch_mismatch() {
         check(src).is_err(),
         "Should fail because %x is not consumed in else branch"
     );
+}
+
+#[test]
+fn test_generic_drop_accepts_non_linear_primitives() {
+    let src = r#"
+    fn main() -> unit do
+        let x: i32 = 1
+        let y: f64 = 2.0
+        let s = [=[hello]=]
+        drop x
+        drop y
+        drop s
+        drop true
+        return ()
+    endfn
+    "#;
+    assert!(check(src).is_ok());
+}
+
+#[test]
+fn test_generic_drop_user_defined_linear_consumes_once() {
+    let src = r#"
+    type Token = {
+        id: i64
+    }
+
+    fn main() -> unit do
+        let %t: Token = { id: 1 }
+        drop %t
+        drop %t
+        return ()
+    endfn
+    "#;
+    assert!(check(src).is_err());
+}
+
+#[test]
+fn test_enum_constructor_with_linear_arg_requires_consumption() {
+    let src = r#"
+    enum Resource {
+        Open([| i64 |]),
+        Closed
+    }
+
+    fn main() -> unit do
+        let r = Open([| 1, 2, 3 |])
+        return ()
+    endfn
+    "#;
+    assert!(check(src).is_err());
+}
+
+#[test]
+fn test_enum_constructor_with_linear_arg_can_be_dropped_once() {
+    let src = r#"
+    enum Resource {
+        Open([| i64 |]),
+        Closed
+    }
+
+    fn main() -> unit do
+        let r = Open([| 1, 2, 3 |])
+        drop r
+        return ()
+    endfn
+    "#;
+    assert!(check(src).is_ok());
 }

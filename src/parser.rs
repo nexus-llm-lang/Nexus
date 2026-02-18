@@ -35,8 +35,10 @@ const KEYWORDS: &[&str] = &[
     "for",
     "endhandler",
     "enum",
+    "exception",
     "borrow",
     "external",
+    "drop",
 ];
 
 fn ident() -> impl Parser<char, String, Error = Simple<char>> + Clone {
@@ -215,7 +217,25 @@ fn expr_parser() -> P<Spanned<Expr>> {
             .at_least(1)
             .map(|v| v.join("."));
 
-        let call_arg = ident().then_ignore(just(':').padded()).then(expr.clone());
+        let call_arg_value = choice((
+            literal().map_with_span(|lit, span| Spanned {
+                node: Expr::Literal(lit),
+                span,
+            }),
+            sigil().then(ident()).map_with_span(|(s, n), span| Spanned {
+                node: Expr::Variable(n, s),
+                span,
+            }),
+        ));
+        let call_arg = ident()
+            .then(just(':').padded().ignore_then(call_arg_value).or_not())
+            .map_with_span(|(label, arg_opt), span| {
+                let arg = arg_opt.unwrap_or_else(|| Spanned {
+                    node: Expr::Variable(label.clone(), Sigil::Immutable),
+                    span: span.clone(),
+                });
+                (label, arg)
+            });
         let call_args = call_arg
             .separated_by(just(','))
             .delimited_by(just('('), just(')'));
@@ -286,6 +306,14 @@ fn expr_parser() -> P<Spanned<Expr>> {
                 .ignore_then(expr.clone())
                 .map_with_span(|v, span| Spanned {
                     node: Stmt::Return(v),
+                    span,
+                });
+
+            let drop_stmt = text::keyword("drop")
+                .padded()
+                .ignore_then(expr.clone())
+                .map_with_span(|v, span| Spanned {
+                    node: Stmt::Drop(v),
                     span,
                 });
 
@@ -469,6 +497,7 @@ fn expr_parser() -> P<Spanned<Expr>> {
                 comment.boxed(),
                 let_stmt.boxed(),
                 return_stmt.boxed(),
+                drop_stmt.boxed(),
                 assign_stmt.boxed(),
             ));
 
@@ -679,6 +708,14 @@ pub fn stmt_parser() -> impl Parser<char, Spanned<Stmt>, Error = Simple<char>> {
                 span,
             });
 
+        let drop_stmt = text::keyword("drop")
+            .padded()
+            .ignore_then(expr.clone())
+            .map_with_span(|v, span| Spanned {
+                node: Stmt::Drop(v),
+                span,
+            });
+
         let assign_stmt = expr
             .clone()
             .then_ignore(just("<-").padded())
@@ -859,6 +896,7 @@ pub fn stmt_parser() -> impl Parser<char, Spanned<Stmt>, Error = Simple<char>> {
             comment.boxed(),
             let_stmt.boxed(),
             return_stmt.boxed(),
+            drop_stmt.boxed(),
             assign_stmt.boxed(),
         ));
 
@@ -1041,9 +1079,45 @@ pub fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
             })
         });
 
+    let exception_def = text::keyword("exception")
+        .padded()
+        .ignore_then(ident().try_map(|name, span| {
+            if name
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_uppercase())
+                .unwrap_or(false)
+            {
+                Ok(name)
+            } else {
+                Err(Simple::custom(
+                    span,
+                    "exception constructor must start with uppercase letter",
+                ))
+            }
+        }))
+        .then(
+            type_parser()
+                .separated_by(just(',').padded())
+                .delimited_by(just('('), just(')'))
+                .or_not(),
+        )
+        .map(|(name, fields)| {
+            TopLevel::Exception(ExceptionDef {
+                name,
+                fields: fields.unwrap_or_default(),
+            })
+        });
+
     let string_lit_inner = just('"')
         .ignore_then(take_until(just('"')))
         .map(|(s, _)| s.into_iter().collect::<String>());
+    let unquoted_import_path =
+        filter(|c: &char| !c.is_whitespace() && !matches!(c, '{' | '}' | ',' | '(' | ')' | '"'))
+            .repeated()
+            .at_least(1)
+            .collect::<String>();
+    let import_path = string_lit_inner.clone().or(unquoted_import_path).padded();
 
     let import_def = text::keyword("import")
         .padded()
@@ -1051,7 +1125,7 @@ pub fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
             // import external "math.wasm"
             text::keyword("external")
                 .padded()
-                .ignore_then(string_lit_inner.clone())
+                .ignore_then(import_path.clone())
                 .map(|path| Import {
                     path,
                     alias: None,
@@ -1063,7 +1137,7 @@ pub fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
                 .separated_by(just(',').padded())
                 .delimited_by(just('{'), just('}'))
                 .then_ignore(text::keyword("from").padded())
-                .then(string_lit_inner.clone())
+                .then(import_path.clone())
                 .map(|(items, path)| Import {
                     path,
                     alias: None,
@@ -1076,7 +1150,7 @@ pub fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
                     .padded()
                     .ignore_then(ident())
                     .then_ignore(text::keyword("from").padded())
-                    .then(string_lit_inner.clone())
+                    .then(import_path.clone())
                     .map(|(alias, path)| Import {
                         path,
                         alias: Some(alias),
@@ -1085,7 +1159,7 @@ pub fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
                     }),
                 text::keyword("from")
                     .padded()
-                    .ignore_then(string_lit_inner.clone())
+                    .ignore_then(import_path.clone())
                     .map(|path| Import {
                         path,
                         alias: None,
@@ -1159,6 +1233,7 @@ pub fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
         external_fn_def,
         type_def,
         enum_def,
+        exception_def,
         import_def,
         port_def,
         handler_def,
