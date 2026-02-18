@@ -3,43 +3,51 @@ use chumsky::prelude::*;
 
 type P<T> = BoxedParser<'static, char, T, Simple<char>>;
 
-
-
 const KEYWORDS: &[&str] = &[
-
-    "let", "fn", "do", "endfn", "return", "if", "else", "endif", "match", "endmatch", "case",
-
-    "task", "endtask", "conc", "endconc", "port", "endport", "perform", "type", "import", "from",
-
-    "pub", "effect", "raise", "try", "catch", "endtry", "handler", "for", "endhandler", "enum",
-
+    "let",
+    "fn",
+    "do",
+    "endfn",
+    "return",
+    "if",
+    "else",
+    "endif",
+    "match",
+    "endmatch",
+    "case",
+    "task",
+    "endtask",
+    "conc",
+    "endconc",
+    "port",
+    "endport",
+    "perform",
+    "type",
+    "import",
+    "from",
+    "pub",
+    "effect",
+    "raise",
+    "try",
+    "catch",
+    "endtry",
+    "handler",
+    "for",
+    "endhandler",
+    "enum",
     "borrow",
-
+    "external",
 ];
 
-
-
 fn ident() -> impl Parser<char, String, Error = Simple<char>> + Clone {
-
     text::ident().padded().try_map(|s: String, span| {
-
         if KEYWORDS.contains(&s.as_str()) {
-
             Err(Simple::custom(span, format!("Keyword '{}' is reserved", s)))
-
         } else {
-
             Ok(s)
-
         }
-
     })
-
 }
-
-
-
-
 
 fn sigil() -> impl Parser<char, Sigil, Error = Simple<char>> + Clone {
     choice((just('~').to(Sigil::Mutable), just('%').to(Sigil::Linear)))
@@ -110,12 +118,7 @@ fn type_parser() -> P<Type> {
                     .ignore_then(choice((
                         t.clone()
                             .separated_by(just(',').padded())
-                            .then(
-                                just('|')
-                                    .padded()
-                                    .ignore_then(t.clone())
-                                    .or_not(),
-                            )
+                            .then(just('|').padded().ignore_then(t.clone()).or_not())
                             .delimited_by(just('{'), just('}'))
                             .map(|(effs, tail)| Type::Row(effs, tail.map(Box::new))),
                         t.clone(),
@@ -319,7 +322,6 @@ fn expr_parser() -> P<Spanned<Expr>> {
             just("-.").to("-.".to_string()),
             just("*.").to("*.".to_string()),
             just("/.").to("/.".to_string()),
-
             // Int/Generic operators
             just("==").to("==".to_string()),
             just("!=").to("!=".to_string()),
@@ -570,35 +572,239 @@ pub fn stmt_parser() -> impl Parser<char, Spanned<Stmt>, Error = Simple<char>> {
 
         basic_stmt
             .or(complex_stmt)
-            .or(expr.map(|v| {
-                let span = v.span.clone();
-                Spanned {
-                    node: Stmt::Expr(v),
+            .or(expr
+                .map(|v| {
+                    let span = v.span.clone();
+                    Spanned {
+                        node: Stmt::Expr(v),
+                        span,
+                    }
+                })
+                .boxed())
+            .padded()
+    })
+    .boxed()
+}
+
+pub fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
+    let param = sigil()
+        .then(ident())
+        .then_ignore(just(':').padded())
+        .then(type_parser())
+        .map(|((sigil, name), typ)| Param { name, sigil, typ });
+
+    let function_inner = text::keyword("pub")
+        .or_not()
+        .padded()
+        .then_ignore(text::keyword("fn").padded())
+        .then(ident())
+        .then(
+            just('<')
+                .ignore_then(ident().separated_by(just(',').padded()))
+                .then_ignore(just('>'))
+                .or_not(),
+        )
+        .then(
+            param
+                .clone()
+                .separated_by(just(','))
+                .delimited_by(just('('), just(')')),
+        )
+        .then_ignore(just("->").padded())
+        .then(type_parser())
+        .then(
+            text::keyword("effect")
+                .padded()
+                .ignore_then(choice((
+                    type_parser()
+                        .separated_by(just(',').padded())
+                        .then(just('|').padded().ignore_then(type_parser()).or_not())
+                        .delimited_by(just('{'), just('}'))
+                        .map(|(effs, tail)| Type::Row(effs, tail.map(Box::new))),
+                    type_parser(),
+                )))
+                .or_not(),
+        )
+        .then_ignore(text::keyword("do").padded())
+        .then(stmt_parser().repeated())
+        .then_ignore(text::keyword("endfn").padded())
+        .map(
+            |((((((vis, name), type_params), params), ret_type), effects), body)| Function {
+                name,
+                is_public: vis.is_some(),
+                type_params: type_params.unwrap_or_default(),
+                params,
+                ret_type,
+                effects: effects.unwrap_or(Type::Row(vec![], None)),
+                body,
+            },
+        )
+        .boxed();
+
+    let func_def = function_inner.clone().map(TopLevel::Function);
+
+    let external_fn_def = text::keyword("pub")
+        .or_not()
+        .padded()
+        .then_ignore(text::keyword("external").padded())
+        .then(ident())
+        .then_ignore(just(':').padded())
+        .then(type_parser())
+        .then_ignore(just('=').padded())
+        .then(
+            just('"')
+                .ignore_then(take_until(just('"')))
+                .map(|(s, _)| s.into_iter().collect::<String>())
+                .padded(),
+        )
+        .try_map(|(((vis, name), typ), wasm_name), span| {
+            if let Type::Arrow(params, ret_type, effects) = typ {
+                let params = params
+                    .into_iter()
+                    .map(|(n, t)| Param {
+                        name: n,
+                        sigil: Sigil::Immutable,
+                        typ: t,
+                    })
+                    .collect();
+                Ok(TopLevel::ExternalFn(ExternalFn {
+                    name,
+                    is_public: vis.is_some(),
+                    params,
+                    ret_type: *ret_type,
+                    effects: *effects,
+                    wasm_name,
+                }))
+            } else {
+                Err(Simple::custom(
                     span,
-                }
-            }).boxed())
-            .padded()            })
-            .boxed()
-        }
-        
-        pub fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
-            let param = sigil()
-                .then(ident())
+                    "External function must have an arrow type",
+                ))
+            }
+        });
+
+    let type_def = text::keyword("type")
+        .padded()
+        .ignore_then(ident())
+        .then(
+            just('<')
+                .ignore_then(ident().separated_by(just(',').padded()))
+                .then_ignore(just('>'))
+                .or_not(),
+        )
+        .then_ignore(just('=').padded())
+        .then(
+            ident()
                 .then_ignore(just(':').padded())
                 .then(type_parser())
-                .map(|((sigil, name), typ)| Param { name, sigil, typ });
-        
-            let function_inner = text::keyword("pub")
-                .or_not()
-                .padded()
-                .then_ignore(text::keyword("fn").padded())
-                .then(ident())
+                .separated_by(just(','))
+                .delimited_by(just('{'), just('}')),
+        )
+        .map(|((name, type_params), fields)| {
+            TopLevel::TypeDef(TypeDef {
+                name,
+                type_params: type_params.unwrap_or_default(),
+                fields,
+            })
+        });
+
+    let enum_def = text::keyword("enum")
+        .padded()
+        .ignore_then(ident())
+        .then(
+            just('<')
+                .ignore_then(ident().separated_by(just(',').padded()))
+                .then_ignore(just('>'))
+                .or_not(),
+        )
+        .then_ignore(just('{').padded())
+        .then(
+            ident()
                 .then(
-                    just('<')
-                        .ignore_then(ident().separated_by(just(',').padded()))
-                        .then_ignore(just('>'))
+                    type_parser()
+                        .separated_by(just(',').padded())
+                        .delimited_by(just('('), just(')'))
                         .or_not(),
                 )
+                .map(|(name, fields)| VariantDef {
+                    name,
+                    fields: fields.unwrap_or_default(),
+                })
+                .separated_by(just(',').padded())
+                .allow_trailing(),
+        )
+        .then_ignore(just('}').padded())
+        .map(|((name, type_params), variants)| {
+            TopLevel::Enum(EnumDef {
+                name,
+                type_params: type_params.unwrap_or_default(),
+                variants,
+            })
+        });
+
+    let string_lit_inner = just('"')
+        .ignore_then(take_until(just('"')))
+        .map(|(s, _)| s.into_iter().collect::<String>());
+
+    let import_def = text::keyword("import")
+        .padded()
+        .ignore_then(choice((
+            // import external "math.wasm"
+            text::keyword("external")
+                .padded()
+                .ignore_then(string_lit_inner.clone())
+                .map(|path| Import {
+                    path,
+                    alias: None,
+                    items: vec![],
+                    is_external: true,
+                }),
+            // import { a, b } from "math.nx"
+            ident()
+                .separated_by(just(',').padded())
+                .delimited_by(just('{'), just('}'))
+                .then_ignore(text::keyword("from").padded())
+                .then(string_lit_inner.clone())
+                .map(|(items, path)| Import {
+                    path,
+                    alias: None,
+                    items,
+                    is_external: false,
+                }),
+            // import as math from "math.nx" / import from "math.nx"
+            choice((
+                text::keyword("as")
+                    .padded()
+                    .ignore_then(ident())
+                    .then_ignore(text::keyword("from").padded())
+                    .then(string_lit_inner.clone())
+                    .map(|(alias, path)| Import {
+                        path,
+                        alias: Some(alias),
+                        items: vec![],
+                        is_external: false,
+                    }),
+                text::keyword("from")
+                    .padded()
+                    .ignore_then(string_lit_inner.clone())
+                    .map(|path| Import {
+                        path,
+                        alias: None,
+                        items: vec![],
+                        is_external: false,
+                    }),
+            )),
+        )))
+        .map(TopLevel::Import);
+
+    let port_def = text::keyword("port")
+        .padded()
+        .ignore_then(ident())
+        .then_ignore(text::keyword("do").padded())
+        .then(
+            text::keyword("fn")
+                .padded()
+                .ignore_then(ident())
                 .then(
                     param
                         .clone()
@@ -613,188 +819,58 @@ pub fn stmt_parser() -> impl Parser<char, Spanned<Stmt>, Error = Simple<char>> {
                         .ignore_then(choice((
                             type_parser()
                                 .separated_by(just(',').padded())
-                                .then(
-                                    just('|')
-                                        .padded()
-                                        .ignore_then(type_parser())
-                                        .or_not(),
-                                )
+                                .then(just('|').padded().ignore_then(type_parser()).or_not())
                                 .delimited_by(just('{'), just('}'))
                                 .map(|(effs, tail)| Type::Row(effs, tail.map(Box::new))),
                             type_parser(),
                         )))
                         .or_not(),
                 )
-                .then_ignore(text::keyword("do").padded())
-                .then(stmt_parser().repeated())
-                .then_ignore(text::keyword("endfn").padded())
-                .map(
-                    |((((((vis, name), type_params), params), ret_type), effects), body)| Function {
-                        name,
-                        is_public: vis.is_some(),
-                        type_params: type_params.unwrap_or_default(),
-                        params,
-                        ret_type,
-                        effects: effects.unwrap_or(Type::Row(vec![], None)),
-                        body,
-                    },
-                )
-                .boxed();
-        
-            let func_def = function_inner.clone().map(TopLevel::Function);
-        
-            let type_def = text::keyword("type")
-                .padded()
-                .ignore_then(ident())
-                .then(
-                    just('<')
-                        .ignore_then(ident().separated_by(just(',').padded()))
-                        .then_ignore(just('>'))
-                        .or_not(),
-                )
-                .then_ignore(just('=').padded())
-                .then(
-                    ident()
-                        .then_ignore(just(':').padded())
-                        .then(type_parser())
-                        .separated_by(just(','))
-                        .delimited_by(just('{'), just('}')),
-                )
-                .map(|((name, type_params), fields)| {
-                    TopLevel::TypeDef(TypeDef {
-                        name,
-                        type_params: type_params.unwrap_or_default(),
-                        fields,
-                    })
-                });
-        
-            let enum_def = text::keyword("enum")
-                .padded()
-                .ignore_then(ident())
-                .then(
-                    just('<')
-                        .ignore_then(ident().separated_by(just(',').padded()))
-                        .then_ignore(just('>'))
-                        .or_not(),
-                )
-                .then_ignore(just('{').padded())
-                .then(
-                    ident()
-                        .then(
-                            type_parser()
-                                .separated_by(just(',').padded())
-                                .delimited_by(just('('), just(')'))
-                                .or_not(),
-                        )
-                        .map(|(name, fields)| VariantDef {
-                            name,
-                            fields: fields.unwrap_or_default(),
-                        })
-                        .separated_by(just(',').padded())
-                        .allow_trailing(),
-                )
-                .then_ignore(just('}').padded())
-                .map(|((name, type_params), variants)| {
-                    TopLevel::Enum(EnumDef {
-                        name,
-                        type_params: type_params.unwrap_or_default(),
-                        variants,
-                    })
-                });
-        
-            let import_def = text::keyword("import")
-                .padded()
-                .ignore_then(
-                    ident()
-                        .separated_by(just(','))
-                        .delimited_by(just('{'), just('}')),
-                )
-                .then_ignore(text::keyword("from").padded())
-                .then(
-                    just('"')
-                        .ignore_then(take_until(just('"')))
-                        .map(|(s, _)| s.into_iter().collect::<String>()),
-                )
-                .map(|(items, module)| TopLevel::Import(Import { module, items }));
-        
-            let port_def = text::keyword("port")
-                .padded()
-                .ignore_then(ident())
-                .then_ignore(text::keyword("do").padded())
-                .then(
-                    text::keyword("fn")
-                        .padded()
-                        .ignore_then(ident())
-                        .then(
-                            param
-                                .clone()
-                                .separated_by(just(','))
-                                .delimited_by(just('('), just(')')),
-                        )
-                        .then_ignore(just("->").padded())
-                        .then(type_parser())
-                        .then(
-                            text::keyword("effect")
-                                .padded()
-                                .ignore_then(choice((
-                                    type_parser()
-                                        .separated_by(just(',').padded())
-                                        .then(
-                                            just('|')
-                                                .padded()
-                                                .ignore_then(type_parser())
-                                                .or_not(),
-                                        )
-                                        .delimited_by(just('{'), just('}'))
-                                        .map(|(effs, tail)| Type::Row(effs, tail.map(Box::new))),
-                                    type_parser(),
-                                )))
-                                .or_not(),
-                        )
-                        .map(|(((name, params), ret_type), effects)| FunctionSignature {
-                            name,
-                            params,
-                            ret_type,
-                            effects: effects.unwrap_or(Type::Row(vec![], None)),
-                        })
-                        .repeated(),
-                )
-                .then_ignore(text::keyword("endport").padded())
-                .map(|(name, functions)| TopLevel::Port(Port { name, functions }));
-        
-            let handler_def = text::keyword("handler")
-                .padded()
-                .ignore_then(ident())
-                .then_ignore(text::keyword("for").padded())
-                .then(ident())
-                .then_ignore(text::keyword("do").padded())
-                .then(function_inner.repeated())
-                .then_ignore(text::keyword("endhandler").padded())
-                .map(|((name, port_name), functions)| {
-                    TopLevel::Handler(Handler {
-                        name,
-                        port_name,
-                        functions,
-                    })
-                });
-        
-            let comment = just("//")
-                .then(take_until(just('\n')))
-                .padded()
-                .map(|_| TopLevel::Comment);
-        
-            choice((
-                func_def,
-                type_def,
-                enum_def,
-                import_def,
-                port_def,
-                handler_def,
-                comment,
-            ))
-            .padded()
-            .map_with_span(|node, span| Spanned { node, span })
-            .repeated()
-            .map(|definitions| Program { definitions })
-            .then_ignore(end())
-        }
+                .map(|(((name, params), ret_type), effects)| FunctionSignature {
+                    name,
+                    params,
+                    ret_type,
+                    effects: effects.unwrap_or(Type::Row(vec![], None)),
+                })
+                .repeated(),
+        )
+        .then_ignore(text::keyword("endport").padded())
+        .map(|(name, functions)| TopLevel::Port(Port { name, functions }));
+
+    let handler_def = text::keyword("handler")
+        .padded()
+        .ignore_then(ident())
+        .then_ignore(text::keyword("for").padded())
+        .then(ident())
+        .then_ignore(text::keyword("do").padded())
+        .then(function_inner.repeated())
+        .then_ignore(text::keyword("endhandler").padded())
+        .map(|((name, port_name), functions)| {
+            TopLevel::Handler(Handler {
+                name,
+                port_name,
+                functions,
+            })
+        });
+
+    let comment = just("//")
+        .then(take_until(just('\n')))
+        .padded()
+        .map(|_| TopLevel::Comment);
+
+    choice((
+        func_def,
+        external_fn_def,
+        type_def,
+        enum_def,
+        import_def,
+        port_def,
+        handler_def,
+        comment,
+    ))
+    .padded()
+    .map_with_span(|node, span| Spanned { node, span })
+    .repeated()
+    .map(|definitions| Program { definitions })
+    .then_ignore(end())
+}

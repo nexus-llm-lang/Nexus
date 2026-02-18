@@ -47,7 +47,7 @@ fn main() {
 
             let mut interpreter = interpreter::Interpreter::new(program);
             match interpreter.run_function("main", vec![]) {
-                Ok(interpreter::Value::Unit) => {}, // Do not print Unit result
+                Ok(interpreter::Value::Unit) => {} // Do not print Unit result
                 Ok(res) => println!("Result: {:?}", res),
                 Err(e) => {
                     // Check if error is just missing main

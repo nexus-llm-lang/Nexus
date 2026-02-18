@@ -61,3 +61,25 @@ Explicitly consumes and drops a linear array.
 ```nexus
 fn drop_array<T>(arr: [| T |]) -> unit
 ```
+
+## Collection Modules
+
+### `list.length`
+
+Returns the element count of an immutable list.
+
+```nexus
+import as list from "nxlib/stdlib/list.nx"
+
+fn list.length<T>(xs: [T]) -> i64
+```
+
+### `array.length`
+
+Returns the element count of a borrowed linear array.
+
+```nexus
+import as array from "nxlib/stdlib/array.nx"
+
+fn array.length<T>(arr: &[| T |]) -> i64
+```

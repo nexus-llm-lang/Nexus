@@ -1,19 +1,19 @@
 use ariadne::{Color, Label, Report, ReportKind, Source};
-use rustyline::error::ReadlineError;
-use rustyline::{Config, Helper};
+use chumsky::prelude::*;
 use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
-use chumsky::prelude::*;
+use rustyline::{Config, Helper};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::cell::RefCell;
 
 use crate::ast::{Program, Stmt};
-use crate::interpreter::{Interpreter, Env, ExprResult, Value};
-use crate::typecheck::TypeChecker;
+use crate::interpreter::{Env, ExprResult, Interpreter};
 use crate::parser::stmt_parser;
+use crate::typecheck::TypeChecker;
 
 struct NexusHelper {
     vars: Rc<RefCell<HashSet<String>>>,
@@ -21,8 +21,14 @@ struct NexusHelper {
 
 impl Completer for NexusHelper {
     type Candidate = Pair;
-    fn complete(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let (start, word) = rustyline::completion::extract_word(line, pos, None, |c| " \t\n\r(){}[],.".contains(c));
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let (start, word) =
+            rustyline::completion::extract_word(line, pos, None, |c| " \t\n\r(){}[],.".contains(c));
         let mut candidates = Vec::new();
         let vars = self.vars.borrow();
         for var in vars.iter() {
@@ -45,16 +51,16 @@ impl Validator for NexusHelper {}
 impl Helper for NexusHelper {}
 
 pub fn start() {
-    let config = Config::builder()
-        .history_ignore_space(true)
-        .build();
+    let config = Config::builder().history_ignore_space(true).build();
 
     let vars = Rc::new(RefCell::new(HashSet::new()));
     let helper = NexusHelper { vars: vars.clone() };
-    
-    let mut rl = rustyline::Editor::<NexusHelper, rustyline::history::DefaultHistory>::with_config(config).unwrap();
+
+    let mut rl =
+        rustyline::Editor::<NexusHelper, rustyline::history::DefaultHistory>::with_config(config)
+            .unwrap();
     rl.set_helper(Some(helper));
-    
+
     let history_file = ".nexus_history";
     if rl.load_history(history_file).is_err() {
         // No history
@@ -71,11 +77,12 @@ pub fn start() {
         "drop_array",
     ];
     for name in &stdlib_names {
-        env.define(name.to_string(), Value::NativeFunction(name.to_string()));
         vars.borrow_mut().insert(name.to_string());
     }
 
-    let program = Program { definitions: vec![] };
+    let program = Program {
+        definitions: vec![],
+    };
     let mut interpreter = Interpreter::new(program);
     let mut checker = TypeChecker::new();
 
@@ -87,7 +94,7 @@ pub fn start() {
         match readline {
             Ok(line) => {
                 let line_str = line.trim();
-                
+
                 if line_str.starts_with(':') {
                     match line_str {
                         ":exit" | ":quit" => break,
@@ -111,7 +118,7 @@ pub fn start() {
                         }
                     }
                 }
-                
+
                 if line_str.is_empty() {
                     continue;
                 }
@@ -137,19 +144,17 @@ pub fn start() {
                             Ok(typ) => {
                                 // Interpret
                                 match interpreter.eval_repl_stmt(&stmt, &mut env) {
-                                    Ok(res) => {
-                                        match res {
-                                            ExprResult::Normal(val) => {
-                                                println!("{} : {}", val, typ);
-                                            },
-                                            ExprResult::EarlyReturn(val) => {
-                                                println!("returned {} : {}", val, typ);
-                                            }
+                                    Ok(res) => match res {
+                                        ExprResult::Normal(val) => {
+                                            println!("{} : {}", val, typ);
+                                        }
+                                        ExprResult::EarlyReturn(val) => {
+                                            println!("returned {} : {}", val, typ);
                                         }
                                     },
                                     Err(e) => println!("Runtime Error: {}", e),
                                 }
-                            },
+                            }
                             Err(e) => {
                                 Report::build(ReportKind::Error, "<repl>", e.span.start)
                                     .with_message(e.message.clone())
@@ -161,9 +166,9 @@ pub fn start() {
                                     .finish()
                                     .print(("<repl>", Source::from(&line_str)))
                                     .unwrap();
-                            },
+                            }
                         }
-                    },
+                    }
                     Err(errors) => {
                         for err in errors {
                             Report::build(ReportKind::Error, "<repl>", err.span().start)
@@ -179,22 +184,22 @@ pub fn start() {
                         }
                     }
                 }
-            },
+            }
             Err(ReadlineError::Interrupted) => {
                 println!("CTRL-C");
                 break;
-            },
+            }
             Err(ReadlineError::Eof) => {
                 println!("CTRL-D");
                 break;
-            },
+            }
             Err(err) => {
                 println!("Error: {:?}", err);
                 break;
             }
         }
     }
-    
+
     if let Err(e) = rl.save_history(history_file) {
         println!("Error saving history: {}", e);
     }

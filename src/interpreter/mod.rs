@@ -1,7 +1,10 @@
 use crate::ast::*;
+use chumsky::Parser;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use wasmtime::*;
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -30,7 +33,9 @@ impl std::fmt::Display for Value {
             Value::Record(m) => {
                 write!(f, "{{")?;
                 for (i, (k, v)) in m.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}: {}", k, v)?;
                 }
                 write!(f, "}}")
@@ -40,7 +45,9 @@ impl std::fmt::Display for Value {
                 if !args.is_empty() {
                     write!(f, "(")?;
                     for (i, a) in args.iter().enumerate() {
-                        if i > 0 { write!(f, ", ")?; }
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
                         write!(f, "{}", a)?;
                     }
                     write!(f, ")")?;
@@ -50,7 +57,9 @@ impl std::fmt::Display for Value {
             Value::List(l) => {
                 write!(f, "[")?;
                 for (i, v) in l.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", v)?;
                 }
                 write!(f, "]")
@@ -58,7 +67,9 @@ impl std::fmt::Display for Value {
             Value::Array(a) => {
                 write!(f, "[| ")?;
                 for (i, v) in a.borrow().iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", v)?;
                 }
                 write!(f, " |]")
@@ -115,74 +126,200 @@ pub struct Interpreter {
     pub functions: HashMap<String, Function>,
     pub handlers: HashMap<String, Handler>,
     pub native_functions: HashMap<String, Box<dyn Fn(&[Value]) -> Result<ExprResult, String>>>,
+    pub external_functions: HashMap<String, ExternalFn>,
+    pub wasm_store: RefCell<Store<WasiCtx>>,
+    pub wasm_instances: Vec<Instance>,
+    pub modules: HashMap<String, Interpreter>,
 }
 
 impl Interpreter {
     pub fn new(program: Program) -> Self {
+        Self::new_with_stdlib(program, true)
+    }
+
+    fn new_with_stdlib(program: Program, load_stdlib: bool) -> Self {
         let mut functions = HashMap::new();
         let mut handlers = HashMap::new();
-        let mut native_functions: HashMap<String, Box<dyn Fn(&[Value]) -> Result<ExprResult, String>>> = HashMap::new();
+        let mut external_functions = HashMap::new();
+        let mut modules = HashMap::new();
+        let mut native_functions: HashMap<
+            String,
+            Box<dyn Fn(&[Value]) -> Result<ExprResult, String>>,
+        > = HashMap::new();
 
-        for def in program.definitions {
-            match def.node {
+        let engine = Engine::default();
+        let wasi = WasiCtxBuilder::new().inherit_stdio().build();
+        let mut store = Store::new(&engine, wasi);
+        let mut linker = Linker::new(&engine);
+        wasmtime_wasi::add_to_linker(&mut linker, |s| s).expect("Failed to add WASI to linker");
+        let mut wasm_instances = Vec::new();
+
+        let mut all_definitions = Vec::new();
+        if load_stdlib {
+            if let Ok(stdlib_src) = std::fs::read_to_string("nxlib/stdlib/stdio.nx") {
+                if let Ok(stdlib_program) = crate::parser::parser().parse(stdlib_src) {
+                    all_definitions.extend(stdlib_program.definitions);
+                }
+            }
+        }
+        all_definitions.extend(program.definitions);
+
+        for def in &all_definitions {
+            match &def.node {
                 TopLevel::Function(func) => {
-                    functions.insert(func.name.clone(), func);
+                    functions.insert(func.name.clone(), func.clone());
                 }
                 TopLevel::Handler(handler) => {
-                    handlers.insert(handler.port_name.clone(), handler);
+                    handlers.insert(handler.port_name.clone(), handler.clone());
+                }
+                TopLevel::ExternalFn(ext) => {
+                    external_functions.insert(ext.name.clone(), ext.clone());
+                }
+                TopLevel::Import(import) => {
+                    if import.is_external {
+                        let module = Module::from_file(&engine, &import.path)
+                            .expect("Failed to load wasm module");
+                        let instance = linker
+                            .instantiate(&mut store, &module)
+                            .expect("Failed to instantiate wasm module");
+                        wasm_instances.push(instance);
+                    } else {
+                        let src =
+                            std::fs::read_to_string(&import.path).expect("Failed to read module");
+                        let p = crate::parser::parser()
+                            .parse(src)
+                            .expect("Failed to parse module");
+
+                        let is_stdlib_module =
+                            std::path::Path::new(&import.path).starts_with("nxlib/stdlib");
+                        let sub_interp = Interpreter::new_with_stdlib(p, !is_stdlib_module);
+
+                        if !import.items.is_empty() {
+                            for item in &import.items {
+                                if let Some(f) = sub_interp.functions.get(item) {
+                                    functions.insert(item.clone(), f.clone());
+                                }
+                                if let Some(f) = sub_interp.external_functions.get(item) {
+                                    external_functions.insert(item.clone(), f.clone());
+                                }
+                                // native functions? handlers?
+                            }
+                        } else {
+                            let alias = import.alias.clone().unwrap_or_else(|| {
+                                std::path::Path::new(&import.path)
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or(&import.path)
+                                    .to_string()
+                            });
+                            modules.insert(alias, sub_interp);
+                        }
+                    }
                 }
                 _ => {}
             }
         }
 
         // Register stdlib functions
-        native_functions.insert("print".to_string(), Box::new(|args| {
-            if args.len() != 1 { return Some(Err("print requires 1 arg".to_string())).unwrap(); }
-            if let Value::String(s) = &args[0] {
-                println!("{}", s);
+        native_functions.insert(
+            "i64_to_string".to_string(),
+            Box::new(|args| {
+                if args.len() != 1 {
+                    return Some(Err("i64_to_string requires 1 arg".to_string())).unwrap();
+                }
+                if let Value::Int(i) = &args[0] {
+                    Ok(ExprResult::Normal(Value::String(i.to_string())))
+                } else {
+                    Err("Expected i64".to_string())
+                }
+            }),
+        );
+
+        native_functions.insert(
+            "float_to_string".to_string(),
+            Box::new(|args| {
+                if args.len() != 1 {
+                    return Some(Err("float_to_string requires 1 arg".to_string())).unwrap();
+                }
+                if let Value::Float(f) = &args[0] {
+                    Ok(ExprResult::Normal(Value::String(f.to_string())))
+                } else {
+                    Err("Expected float".to_string())
+                }
+            }),
+        );
+
+        native_functions.insert(
+            "bool_to_string".to_string(),
+            Box::new(|args| {
+                if args.len() != 1 {
+                    return Some(Err("bool_to_string requires 1 arg".to_string())).unwrap();
+                }
+                if let Value::Bool(b) = &args[0] {
+                    Ok(ExprResult::Normal(Value::String(b.to_string())))
+                } else {
+                    Err("Expected bool".to_string())
+                }
+            }),
+        );
+
+        native_functions.insert(
+            "drop_i64".to_string(),
+            Box::new(|args| {
+                if args.len() != 1 {
+                    return Some(Err("drop_i64 requires 1 arg".to_string())).unwrap();
+                }
                 Ok(ExprResult::Normal(Value::Unit))
-            } else {
-                Err("Expected string".to_string())
-            }
-        }));
-        
-        native_functions.insert("i64_to_string".to_string(), Box::new(|args| {
-            if args.len() != 1 { return Some(Err("i64_to_string requires 1 arg".to_string())).unwrap(); }
-            if let Value::Int(i) = &args[0] {
-                Ok(ExprResult::Normal(Value::String(i.to_string())))
-            } else {
-                Err("Expected i64".to_string())
-            }
-        }));
+            }),
+        );
 
-        native_functions.insert("float_to_string".to_string(), Box::new(|args| {
-            if args.len() != 1 { return Some(Err("float_to_string requires 1 arg".to_string())).unwrap(); }
-            if let Value::Float(f) = &args[0] {
-                Ok(ExprResult::Normal(Value::String(f.to_string())))
-            } else {
-                Err("Expected float".to_string())
-            }
-        }));
+        native_functions.insert(
+            "drop_array".to_string(),
+            Box::new(|args| {
+                if args.len() != 1 {
+                    return Some(Err("drop_array requires 1 arg".to_string())).unwrap();
+                }
+                Ok(ExprResult::Normal(Value::Unit))
+            }),
+        );
 
-        native_functions.insert("bool_to_string".to_string(), Box::new(|args| {
-            if args.len() != 1 { return Some(Err("bool_to_string requires 1 arg".to_string())).unwrap(); }
-            if let Value::Bool(b) = &args[0] {
-                Ok(ExprResult::Normal(Value::String(b.to_string())))
-            } else {
-                Err("Expected bool".to_string())
-            }
-        }));
+        native_functions.insert(
+            "list_length".to_string(),
+            Box::new(|args| {
+                if args.len() != 1 {
+                    return Some(Err("list_length requires 1 arg".to_string())).unwrap();
+                }
+                if let Value::List(xs) = &args[0] {
+                    Ok(ExprResult::Normal(Value::Int(xs.len() as i64)))
+                } else {
+                    Err("Expected list".to_string())
+                }
+            }),
+        );
 
-        native_functions.insert("drop_i64".to_string(), Box::new(|args| {
-            if args.len() != 1 { return Some(Err("drop_i64 requires 1 arg".to_string())).unwrap(); }
-            Ok(ExprResult::Normal(Value::Unit))
-        }));
-        native_functions.insert("drop_array".to_string(), Box::new(|args| {
-            if args.len() != 1 { return Some(Err("drop_array requires 1 arg".to_string())).unwrap(); }
-            Ok(ExprResult::Normal(Value::Unit))
-        }));
+        native_functions.insert(
+            "array_length".to_string(),
+            Box::new(|args| {
+                if args.len() != 1 {
+                    return Some(Err("array_length requires 1 arg".to_string())).unwrap();
+                }
+                if let Value::Array(arr) = &args[0] {
+                    Ok(ExprResult::Normal(Value::Int(arr.borrow().len() as i64)))
+                } else {
+                    Err("Expected array".to_string())
+                }
+            }),
+        );
 
-        Interpreter { functions, handlers, native_functions }
+        Interpreter {
+            functions,
+            handlers,
+            native_functions,
+            external_functions,
+            wasm_store: RefCell::new(store),
+            wasm_instances,
+            modules,
+        }
     }
 
     pub fn eval_repl_stmt(&mut self, stmt: &Spanned<Stmt>, env: &mut Env) -> EvalResult {
@@ -219,24 +356,105 @@ impl Interpreter {
         }
     }
 
+    fn run_external_function(&self, ext: &ExternalFn, args: Vec<Value>) -> EvalResult {
+        let mut store = self.wasm_store.borrow_mut();
+
+        let mut func_with_inst = None;
+        for instance in &self.wasm_instances {
+            if let Some(f) = instance.get_func(&mut *store, &ext.wasm_name) {
+                func_with_inst = Some((f, *instance));
+                break;
+            }
+        }
+
+        let (func, func_instance) = func_with_inst.ok_or_else(|| {
+            format!(
+                "Wasm function {} not found in any loaded instance",
+                ext.wasm_name
+            )
+        })?;
+
+        let mut wasm_args = Vec::new();
+        for v in args {
+            match v {
+                Value::Int(i) => wasm_args.push(Val::I64(i)),
+                Value::Float(f) => wasm_args.push(Val::F64(f.to_bits())),
+                Value::String(s) => {
+                    let ptr = self.pass_string_to_wasm(&s, &mut *store, &func_instance)?;
+                    wasm_args.push(Val::I32(ptr));
+                    wasm_args.push(Val::I32(s.len() as i32));
+                }
+                _ => return Err("Unsupported FFI type".to_string()),
+            }
+        }
+
+        let mut results = vec![Val::I64(0); func.ty(&mut *store).results().len()];
+        func.call(&mut *store, &wasm_args, &mut results)
+            .map_err(|e| format!("Wasm call failed: {}", e))?;
+
+        if results.is_empty() {
+            Ok(ExprResult::Normal(Value::Unit))
+        } else {
+            match results[0] {
+                Val::I64(i) => Ok(ExprResult::Normal(Value::Int(i))),
+                Val::F64(f) => Ok(ExprResult::Normal(Value::Float(f64::from_bits(f)))),
+                Val::I32(i) => Ok(ExprResult::Normal(Value::Int(i as i64))),
+                Val::F32(f) => Ok(ExprResult::Normal(Value::Float(f32::from_bits(f) as f64))),
+                _ => Err("Unsupported Wasm return type".to_string()),
+            }
+        }
+    }
+
+    fn pass_string_to_wasm(
+        &self,
+        s: &str,
+        store: &mut Store<WasiCtx>,
+        instance: &Instance,
+    ) -> Result<i32, String> {
+        let alloc = instance
+            .get_func(&mut *store, "allocate")
+            .ok_or("Wasm instance must export 'allocate(i32) -> i32' to receive strings")?;
+
+        let mut results = [Val::I32(0)];
+        alloc
+            .call(&mut *store, &[Val::I32(s.len() as i32)], &mut results)
+            .map_err(|e| format!("allocate failed: {}", e))?;
+
+        let ptr = match results[0] {
+            Val::I32(p) => p,
+            _ => return Err("allocate must return i32".to_string()),
+        };
+
+        let mem = instance
+            .get_memory(&mut *store, "memory")
+            .ok_or("Wasm instance must export 'memory'")?;
+
+        mem.write(&mut *store, ptr as usize, s.as_bytes())
+            .map_err(|e| format!("memory write failed: {}", e))?;
+
+        Ok(ptr)
+    }
+
     fn eval_body(&mut self, body: &[Spanned<Stmt>], env: &mut Env) -> EvalResult {
         for stmt in body {
             match &stmt.node {
-                                Stmt::Let { name, sigil, value, .. } => {
-                                    let res = self.eval_expr(value, env)?;
-                                    match res {
-                                        ExprResult::Normal(val) => {
-                                            let final_val = if let Sigil::Mutable = sigil {
-                                                Value::Ref(Rc::new(RefCell::new(val)))
-                                            } else {
-                                                val
-                                            };
-                                            env.define(sigil.get_key(name), final_val);
-                                        },
-                                        ExprResult::EarlyReturn(val) => return Ok(ExprResult::EarlyReturn(val)),
-                                    }
-                                }
-                
+                Stmt::Let {
+                    name, sigil, value, ..
+                } => {
+                    let res = self.eval_expr(value, env)?;
+                    match res {
+                        ExprResult::Normal(val) => {
+                            let final_val = if let Sigil::Mutable = sigil {
+                                Value::Ref(Rc::new(RefCell::new(val)))
+                            } else {
+                                val
+                            };
+                            env.define(sigil.get_key(name), final_val);
+                        }
+                        ExprResult::EarlyReturn(val) => return Ok(ExprResult::EarlyReturn(val)),
+                    }
+                }
+
                 Stmt::Return(expr) => {
                     let res = self.eval_expr(expr, env)?;
                     match res {
@@ -255,11 +473,17 @@ impl Interpreter {
                         let _ = self.eval_body(&task.body, env)?;
                     }
                 }
-                Stmt::Try { body, catch_param, catch_body } => {
+                Stmt::Try {
+                    body,
+                    catch_param,
+                    catch_body,
+                } => {
                     let res = self.eval_body(body, env);
                     match res {
-                        Ok(ExprResult::EarlyReturn(val)) => return Ok(ExprResult::EarlyReturn(val)),
-                        Ok(ExprResult::Normal(_)) => {},
+                        Ok(ExprResult::EarlyReturn(val)) => {
+                            return Ok(ExprResult::EarlyReturn(val))
+                        }
+                        Ok(ExprResult::Normal(_)) => {}
                         Err(msg) => {
                             let mut catch_env = Env::extend(env.clone());
                             catch_env.define(catch_param.clone(), Value::String(msg));
@@ -284,7 +508,10 @@ impl Interpreter {
                                 if let Value::Ref(r) = target_val {
                                     *r.borrow_mut() = val;
                                 } else {
-                                    return Err(format!("Cannot assign to immutable variable {}", name));
+                                    return Err(format!(
+                                        "Cannot assign to immutable variable {}",
+                                        name
+                                    ));
                                 }
                             } else {
                                 return Err(format!("Variable {} not found", key));
@@ -294,7 +521,10 @@ impl Interpreter {
                             let arr_res = self.eval_expr(arr, env)?;
                             let idx_res = self.eval_expr(idx, env)?;
                             match (arr_res, idx_res) {
-                                (ExprResult::Normal(Value::Array(a)), ExprResult::Normal(Value::Int(i))) => {
+                                (
+                                    ExprResult::Normal(Value::Array(a)),
+                                    ExprResult::Normal(Value::Int(i)),
+                                ) => {
                                     let mut l = a.borrow_mut();
                                     let idx = i as usize;
                                     if idx < l.len() {
@@ -303,7 +533,10 @@ impl Interpreter {
                                         return Err(format!("Index out of bounds: {}", idx));
                                     }
                                 }
-                                (ExprResult::EarlyReturn(v), _) | (_, ExprResult::EarlyReturn(v)) => return Ok(ExprResult::EarlyReturn(v)),
+                                (ExprResult::EarlyReturn(v), _)
+                                | (_, ExprResult::EarlyReturn(v)) => {
+                                    return Ok(ExprResult::EarlyReturn(v))
+                                }
                                 _ => return Err("Invalid array assignment".to_string()),
                             }
                         }
@@ -378,16 +611,36 @@ impl Interpreter {
                             (Value::Int(a), ">=", Value::Int(b)) => {
                                 Ok(ExprResult::Normal(Value::Bool(a >= b)))
                             }
-                            (Value::Float(a), "+.", Value::Float(b)) => Ok(ExprResult::Normal(Value::Float(a + b))),
-                            (Value::Float(a), "-.", Value::Float(b)) => Ok(ExprResult::Normal(Value::Float(a - b))),
-                            (Value::Float(a), "*.", Value::Float(b)) => Ok(ExprResult::Normal(Value::Float(a * b))),
-                            (Value::Float(a), "/.", Value::Float(b)) => Ok(ExprResult::Normal(Value::Float(a / b))),
-                            (Value::Float(a), "==.", Value::Float(b)) => Ok(ExprResult::Normal(Value::Bool(a == b))),
-                            (Value::Float(a), "!=.", Value::Float(b)) => Ok(ExprResult::Normal(Value::Bool(a != b))),
-                            (Value::Float(a), "<.", Value::Float(b)) => Ok(ExprResult::Normal(Value::Bool(a < b))),
-                            (Value::Float(a), ">.", Value::Float(b)) => Ok(ExprResult::Normal(Value::Bool(a > b))),
-                            (Value::Float(a), "<=.", Value::Float(b)) => Ok(ExprResult::Normal(Value::Bool(a <= b))),
-                            (Value::Float(a), ">=.", Value::Float(b)) => Ok(ExprResult::Normal(Value::Bool(a >= b))),
+                            (Value::Float(a), "+.", Value::Float(b)) => {
+                                Ok(ExprResult::Normal(Value::Float(a + b)))
+                            }
+                            (Value::Float(a), "-.", Value::Float(b)) => {
+                                Ok(ExprResult::Normal(Value::Float(a - b)))
+                            }
+                            (Value::Float(a), "*.", Value::Float(b)) => {
+                                Ok(ExprResult::Normal(Value::Float(a * b)))
+                            }
+                            (Value::Float(a), "/.", Value::Float(b)) => {
+                                Ok(ExprResult::Normal(Value::Float(a / b)))
+                            }
+                            (Value::Float(a), "==.", Value::Float(b)) => {
+                                Ok(ExprResult::Normal(Value::Bool(a == b)))
+                            }
+                            (Value::Float(a), "!=.", Value::Float(b)) => {
+                                Ok(ExprResult::Normal(Value::Bool(a != b)))
+                            }
+                            (Value::Float(a), "<.", Value::Float(b)) => {
+                                Ok(ExprResult::Normal(Value::Bool(a < b)))
+                            }
+                            (Value::Float(a), ">.", Value::Float(b)) => {
+                                Ok(ExprResult::Normal(Value::Bool(a > b)))
+                            }
+                            (Value::Float(a), "<=.", Value::Float(b)) => {
+                                Ok(ExprResult::Normal(Value::Bool(a <= b)))
+                            }
+                            (Value::Float(a), ">=.", Value::Float(b)) => {
+                                Ok(ExprResult::Normal(Value::Bool(a >= b)))
+                            }
                             (Value::String(a), "+", Value::String(b)) => {
                                 Ok(ExprResult::Normal(Value::String(a + &b)))
                             }
@@ -426,20 +679,29 @@ impl Interpreter {
                             }
                         }
                         Value::Function(name) => {
-                             let res = self.run_function(&name, evaluated_args)?;
-                             return Ok(ExprResult::Normal(res));
+                            let res = self.run_function(&name, evaluated_args)?;
+                            return Ok(ExprResult::Normal(res));
                         }
                         _ => {}
                     }
                 }
 
-                if let Some(pos) = func.find('.') {
-                    let port_name = &func[..pos];
-                    let func_name = &func[pos + 1..];
+                if let Some(ext) = self.external_functions.get(func).cloned() {
+                    return self.run_external_function(&ext, evaluated_args);
+                }
 
-                    if let Some(handler) = self.handlers.get(port_name).cloned() {
+                if let Some(pos) = func.find('.') {
+                    let mod_name = &func[..pos];
+                    let item_name = &func[pos + 1..];
+
+                    if let Some(sub_interp) = self.modules.get_mut(mod_name) {
+                        let res = sub_interp.run_function(item_name, evaluated_args)?;
+                        return Ok(ExprResult::Normal(res));
+                    }
+
+                    if let Some(handler) = self.handlers.get(mod_name).cloned() {
                         if let Some(target_func) =
-                            handler.functions.iter().find(|f| f.name == func_name)
+                            handler.functions.iter().find(|f| f.name == item_name)
                         {
                             let mut handler_env = Env::new();
                             for (param, arg) in target_func.params.iter().zip(evaluated_args.iter())
@@ -455,7 +717,7 @@ impl Interpreter {
                         }
                     }
                 }
-                
+
                 // Fallback to global native function lookup (for stdlib if not in Env as var)
                 if let Some(f) = self.native_functions.get(func) {
                     return f(&evaluated_args);
@@ -506,7 +768,9 @@ impl Interpreter {
                         ExprResult::EarlyReturn(v) => return Ok(ExprResult::EarlyReturn(v)),
                     }
                 }
-                Ok(ExprResult::Normal(Value::Array(Rc::new(RefCell::new(vals)))))
+                Ok(ExprResult::Normal(Value::Array(Rc::new(RefCell::new(
+                    vals,
+                )))))
             }
             Expr::Index(arr, idx) => {
                 let arr_res = self.eval_expr(arr, env)?;
@@ -516,18 +780,26 @@ impl Interpreter {
                         let i = i as usize;
                         match arr_val {
                             Value::List(l) => {
-                                if i < l.len() { Ok(ExprResult::Normal(l[i].clone())) }
-                                else { Err(format!("Index out of bounds: {}", i)) }
+                                if i < l.len() {
+                                    Ok(ExprResult::Normal(l[i].clone()))
+                                } else {
+                                    Err(format!("Index out of bounds: {}", i))
+                                }
                             }
                             Value::Array(a) => {
                                 let l = a.borrow();
-                                if i < l.len() { Ok(ExprResult::Normal(l[i].clone())) }
-                                else { Err(format!("Index out of bounds: {}", i)) }
+                                if i < l.len() {
+                                    Ok(ExprResult::Normal(l[i].clone()))
+                                } else {
+                                    Err(format!("Index out of bounds: {}", i))
+                                }
                             }
                             _ => Err("Cannot index non-array value".to_string()),
                         }
                     }
-                    (ExprResult::EarlyReturn(v), _) | (_, ExprResult::EarlyReturn(v)) => Ok(ExprResult::EarlyReturn(v)),
+                    (ExprResult::EarlyReturn(v), _) | (_, ExprResult::EarlyReturn(v)) => {
+                        Ok(ExprResult::EarlyReturn(v))
+                    }
                     _ => Err("Index must be an integer".to_string()),
                 }
             }
@@ -601,7 +873,11 @@ impl Interpreter {
         }
     }
 
-    fn match_pattern(&self, pattern: &Spanned<Pattern>, val: &Value) -> Option<HashMap<String, Value>> {
+    fn match_pattern(
+        &self,
+        pattern: &Spanned<Pattern>,
+        val: &Value,
+    ) -> Option<HashMap<String, Value>> {
         match (&pattern.node, val) {
             (Pattern::Variable(name, _), v) => {
                 let mut map = HashMap::new();
@@ -611,7 +887,9 @@ impl Interpreter {
             (Pattern::Wildcard, _) => Some(HashMap::new()),
             (Pattern::Literal(lit), v) => match (lit, v) {
                 (Literal::Int(a), Value::Int(b)) if a == b => Some(HashMap::new()),
-                (Literal::Float(a), Value::Float(b)) if (a - b).abs() < f64::EPSILON => Some(HashMap::new()),
+                (Literal::Float(a), Value::Float(b)) if (a - b).abs() < f64::EPSILON => {
+                    Some(HashMap::new())
+                }
                 (Literal::Bool(a), Value::Bool(b)) if a == b => Some(HashMap::new()),
                 (Literal::String(a), Value::String(b)) if a == b => Some(HashMap::new()),
                 (Literal::Unit, Value::Unit) => Some(HashMap::new()),
