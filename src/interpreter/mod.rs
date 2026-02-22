@@ -1,13 +1,33 @@
-use crate::ast::*;
-use crate::lang::stdlib::load_stdlib_nx_programs;
-use chumsky::Parser;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
-use wasmtime::*;
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
+//! Interpreter/runtime evaluator for Nexus AST.
+//! REPL is colocated here because it is an interpreter-facing frontend.
 
-#[derive(Debug, Clone, PartialEq)]
+pub mod repl;
+
+use crate::lang::ast::*;
+use crate::lang::stdlib::load_stdlib_nx_programs;
+use crate::runtime::ExecutionCapabilities;
+use bytes::Bytes;
+use chumsky::Parser;
+use http::{HeaderName, HeaderValue, Method};
+use http_body_util::{BodyExt, Full};
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use wasmtime::*;
+use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi_http::body::HyperOutgoingBody;
+use wasmtime_wasi_http::types::{default_send_request_handler, OutgoingRequestConfig};
+
+const NEXUS_HOST_HTTP_MODULE: &str = "nexus:cli/nexus-host";
+const NEXUS_HOST_HTTP_FUNC: &str = "host-http-request";
+const MAX_HTTP_URL_BYTES: usize = 8 * 1024;
+const MAX_HTTP_HEADERS_BYTES: usize = 64 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_FFI_STRING_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -16,11 +36,35 @@ pub enum Value {
     Unit,
     Record(HashMap<String, Value>),
     Variant(String, Vec<Value>),
-    List(Vec<Value>),
-    Array(Rc<RefCell<Vec<Value>>>),
-    Ref(Rc<RefCell<Value>>),
+    Array(Arc<Mutex<Vec<Value>>>),
+    Ref(Arc<Mutex<Value>>),
     NativeFunction(String),
     Function(String),
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => (a - b).abs() < f64::EPSILON,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Unit, Value::Unit) => true,
+            (Value::Record(a), Value::Record(b)) => a == b,
+            (Value::Variant(n1, a1), Value::Variant(n2, a2)) => n1 == n2 && a1 == a2,
+            (Value::Array(a), Value::Array(b)) => match (a.lock(), b.lock()) {
+                (Ok(a_lock), Ok(b_lock)) => *a_lock == *b_lock,
+                _ => false,
+            },
+            (Value::Ref(a), Value::Ref(b)) => match (a.lock(), b.lock()) {
+                (Ok(a_lock), Ok(b_lock)) => *a_lock == *b_lock,
+                _ => false,
+            },
+            (Value::NativeFunction(a), Value::NativeFunction(b)) => a == b,
+            (Value::Function(a), Value::Function(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for Value {
@@ -55,26 +99,19 @@ impl std::fmt::Display for Value {
                 }
                 Ok(())
             }
-            Value::List(l) => {
-                write!(f, "[")?;
-                for (i, v) in l.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
+            Value::Array(a) => match a.lock() {
+                Ok(lock) => {
+                    write!(f, "[| ")?;
+                    for (i, v) in lock.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", v)?;
                     }
-                    write!(f, "{}", v)?;
+                    write!(f, " |]")
                 }
-                write!(f, "]")
-            }
-            Value::Array(a) => {
-                write!(f, "[| ")?;
-                for (i, v) in a.borrow().iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", v)?;
-                }
-                write!(f, " |]")
-            }
+                Err(_) => write!(f, "[| <poisoned-array> |]"),
+            },
             Value::Ref(_) => write!(f, "<ref>"),
             Value::NativeFunction(n) => write!(f, "<native fn {}>", n),
             Value::Function(n) => write!(f, "<fn {}>", n),
@@ -103,6 +140,274 @@ impl std::fmt::Display for EvalError {
 
 type EvalResult = Result<ExprResult, EvalError>;
 
+fn body_to_hyper_outgoing(body: &[u8]) -> HyperOutgoingBody {
+    use std::convert::Infallible;
+    Full::new(Bytes::copy_from_slice(body))
+        .map_err(|never: Infallible| match never {})
+        .boxed_unsync()
+}
+
+fn perform_wasi_http_request(
+    method: &str,
+    url: &str,
+    headers: &str,
+    body: &str,
+) -> Result<(u16, String), String> {
+    let method = if method.trim().is_empty() {
+        "GET"
+    } else {
+        method.trim()
+    };
+    let method = Method::from_str(method).map_err(|e| format!("invalid method: {}", e))?;
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("empty URL".to_string());
+    }
+    if url.len() > MAX_HTTP_URL_BYTES {
+        return Err(format!("url exceeds {} bytes", MAX_HTTP_URL_BYTES));
+    }
+    if headers.len() > MAX_HTTP_HEADERS_BYTES {
+        return Err(format!("headers exceed {} bytes", MAX_HTTP_HEADERS_BYTES));
+    }
+    if body.len() > MAX_HTTP_BODY_BYTES {
+        return Err(format!("body exceeds {} bytes", MAX_HTTP_BODY_BYTES));
+    }
+
+    let use_tls = url.starts_with("https://");
+    let mut request = http::Request::builder()
+        .method(method)
+        .uri(url)
+        .body(body_to_hyper_outgoing(body.as_bytes()))
+        .map_err(|e| format!("invalid request: {}", e))?;
+
+    for line in headers.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let Ok(name) = HeaderName::from_str(name.trim()) else {
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_str(value.trim()) else {
+            continue;
+        };
+        request.headers_mut().append(name, value);
+    }
+
+    if !request.headers().contains_key(http::header::HOST) {
+        if let Some(authority) = request.uri().authority() {
+            if let Ok(value) = HeaderValue::from_str(authority.as_str()) {
+                request.headers_mut().insert(http::header::HOST, value);
+            }
+        }
+    }
+
+    let config = OutgoingRequestConfig {
+        use_tls,
+        connect_timeout: Duration::from_secs(10),
+        first_byte_timeout: Duration::from_secs(30),
+        between_bytes_timeout: Duration::from_secs(30),
+    };
+
+    wasmtime_wasi::runtime::in_tokio(async move {
+        let incoming = default_send_request_handler(request, config)
+            .await
+            .map_err(|e| format!("{:?}", e))?;
+        let status = incoming.resp.status().as_u16();
+        let bytes = incoming
+            .resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| format!("{:?}", e))?
+            .to_bytes();
+        if bytes.len() > MAX_HTTP_RESPONSE_BYTES {
+            return Err(format!(
+                "response exceeds {} bytes",
+                MAX_HTTP_RESPONSE_BYTES
+            ));
+        }
+        Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+    })
+}
+
+fn encode_http_bridge_error(message: impl AsRef<str>) -> String {
+    format!("0\n{}", message.as_ref())
+}
+
+fn run_nexus_host_http_request(
+    capabilities: &ExecutionCapabilities,
+    method: &str,
+    url: &str,
+    headers: &str,
+    body: &str,
+) -> String {
+    if let Err(err) = capabilities.ensure_url_allowed(url) {
+        return encode_http_bridge_error(err);
+    }
+    match perform_wasi_http_request(method, url, headers, body) {
+        Ok((status, response_body)) => format!("{}\n{}", status, response_body),
+        Err(err) => encode_http_bridge_error(format!("http request failed: {}", err)),
+    }
+}
+
+fn read_guest_string_from_memory(
+    memory: &Memory,
+    caller: &Caller<'_, wasmtime_wasi::p1::WasiP1Ctx>,
+    ptr: i32,
+    len: i32,
+) -> Option<String> {
+    if len == 0 {
+        return Some(String::new());
+    }
+    if len < 0 {
+        return None;
+    }
+    if ptr < 0 {
+        return None;
+    }
+    let len = len as usize;
+    if len > MAX_FFI_STRING_BYTES {
+        return None;
+    }
+    let mut bytes = vec![0u8; len];
+    memory.read(caller, ptr as usize, &mut bytes).ok()?;
+    match String::from_utf8(bytes) {
+        Ok(s) => Some(s),
+        Err(e) => Some(String::from_utf8_lossy(&e.into_bytes()).into_owned()),
+    }
+}
+
+fn allocate_and_write_bytes(
+    caller: &mut Caller<'_, wasmtime_wasi::p1::WasiP1Ctx>,
+    memory: &Memory,
+    bytes: &[u8],
+) -> Option<(i32, i32)> {
+    if bytes.is_empty() {
+        return Some((0, 0));
+    }
+
+    let len_i32 = i32::try_from(bytes.len()).ok()?;
+    let allocate = caller.get_export("allocate").and_then(|e| e.into_func())?;
+    let mut results = [Val::I32(0)];
+    allocate
+        .call(&mut *caller, &[Val::I32(len_i32)], &mut results)
+        .ok()?;
+    let ptr = match results[0] {
+        Val::I32(ptr) if ptr > 0 => ptr,
+        _ => return None,
+    };
+    memory.write(&mut *caller, ptr as usize, bytes).ok()?;
+    Some((ptr, len_i32))
+}
+
+fn write_component_string_result(
+    caller: &mut Caller<'_, wasmtime_wasi::p1::WasiP1Ctx>,
+    memory: &Memory,
+    ret_ptr: i32,
+    value: &str,
+) {
+    if ret_ptr < 0 {
+        return;
+    }
+    let bytes = value.as_bytes();
+    let (ptr, len) = match allocate_and_write_bytes(caller, memory, bytes) {
+        Some((ptr, len)) => (ptr, len),
+        None => (0, 0),
+    };
+
+    let mut pair = [0u8; 8];
+    pair[..4].copy_from_slice(&ptr.to_le_bytes());
+    pair[4..].copy_from_slice(&len.to_le_bytes());
+    let _ = memory.write(&mut *caller, ret_ptr as usize, &pair);
+}
+
+fn add_nexus_host_to_linker(
+    linker: &mut Linker<wasmtime_wasi::p1::WasiP1Ctx>,
+    capabilities: ExecutionCapabilities,
+) -> Result<(), String> {
+    linker
+        .func_wrap(
+            NEXUS_HOST_HTTP_MODULE,
+            NEXUS_HOST_HTTP_FUNC,
+            move |mut caller: Caller<'_, wasmtime_wasi::p1::WasiP1Ctx>,
+                  method_ptr: i32,
+                  method_len: i32,
+                  url_ptr: i32,
+                  url_len: i32,
+                  headers_ptr: i32,
+                  headers_len: i32,
+                  body_ptr: i32,
+                  body_len: i32,
+                  ret_ptr: i32| {
+                let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    return;
+                };
+                if url_len < 0 || url_len as usize > MAX_HTTP_URL_BYTES {
+                    let msg = encode_http_bridge_error(format!(
+                        "url exceeds {} bytes",
+                        MAX_HTTP_URL_BYTES
+                    ));
+                    write_component_string_result(&mut caller, &memory, ret_ptr, &msg);
+                    return;
+                }
+                if headers_len < 0 || headers_len as usize > MAX_HTTP_HEADERS_BYTES {
+                    let msg = encode_http_bridge_error(format!(
+                        "headers exceed {} bytes",
+                        MAX_HTTP_HEADERS_BYTES
+                    ));
+                    write_component_string_result(&mut caller, &memory, ret_ptr, &msg);
+                    return;
+                }
+                if body_len < 0 || body_len as usize > MAX_HTTP_BODY_BYTES {
+                    let msg = encode_http_bridge_error(format!(
+                        "body exceeds {} bytes",
+                        MAX_HTTP_BODY_BYTES
+                    ));
+                    write_component_string_result(&mut caller, &memory, ret_ptr, &msg);
+                    return;
+                }
+
+                let Some(method) =
+                    read_guest_string_from_memory(&memory, &caller, method_ptr, method_len)
+                else {
+                    let msg = encode_http_bridge_error("invalid method string");
+                    write_component_string_result(&mut caller, &memory, ret_ptr, &msg);
+                    return;
+                };
+                let Some(url) = read_guest_string_from_memory(&memory, &caller, url_ptr, url_len)
+                else {
+                    let msg = encode_http_bridge_error("invalid url string");
+                    write_component_string_result(&mut caller, &memory, ret_ptr, &msg);
+                    return;
+                };
+                let Some(headers) =
+                    read_guest_string_from_memory(&memory, &caller, headers_ptr, headers_len)
+                else {
+                    let msg = encode_http_bridge_error("invalid headers string");
+                    write_component_string_result(&mut caller, &memory, ret_ptr, &msg);
+                    return;
+                };
+                let Some(body) =
+                    read_guest_string_from_memory(&memory, &caller, body_ptr, body_len)
+                else {
+                    let msg = encode_http_bridge_error("invalid body string");
+                    write_component_string_result(&mut caller, &memory, ret_ptr, &msg);
+                    return;
+                };
+
+                let raw =
+                    run_nexus_host_http_request(&capabilities, &method, &url, &headers, &body);
+                write_component_string_result(&mut caller, &memory, ret_ptr, &raw);
+            },
+        )
+        .map_err(|e| format!("Failed to add nexus host HTTP import: {}", e))?;
+    Ok(())
+}
+
 fn runtime_error(msg: impl Into<String>) -> EvalError {
     EvalError::Exception(Value::Variant(
         "RuntimeError".to_string(),
@@ -120,10 +425,11 @@ fn invalid_index_error(index: i64) -> EvalError {
 #[derive(Debug, Clone)]
 pub struct Env {
     vars: HashMap<String, Value>,
-    parent: Option<Box<Env>>,
+    parent: Option<Arc<Env>>,
 }
 
 impl Env {
+    /// Creates an empty environment with no parent scope.
     pub fn new() -> Self {
         Env {
             vars: HashMap::new(),
@@ -131,13 +437,15 @@ impl Env {
         }
     }
 
+    /// Creates a child environment that can read bindings from `parent`.
     pub fn extend(parent: Env) -> Self {
         Env {
             vars: HashMap::new(),
-            parent: Some(Box::new(parent)),
+            parent: Some(Arc::new(parent)),
         }
     }
 
+    /// Looks up a value by name, searching parent scopes when necessary.
     pub fn get(&self, name: &str) -> Option<Value> {
         match self.vars.get(name) {
             Some(v) => Some(v.clone()),
@@ -145,80 +453,190 @@ impl Env {
         }
     }
 
+    /// Defines or overwrites a binding in the current environment scope.
     pub fn define(&mut self, name: String, value: Value) {
         self.vars.insert(name, value);
     }
 }
 
+#[derive(Clone)]
 pub struct Interpreter {
     pub functions: HashMap<String, Function>,
+    pub enums: HashMap<String, EnumDef>,
+    pub exceptions: HashMap<String, ExceptionDef>,
     pub closures: HashMap<String, Env>,
     pub handlers: HashMap<String, Handler>,
-    pub native_functions: HashMap<String, Box<dyn Fn(&[Value]) -> EvalResult>>,
-    pub external_functions: HashMap<String, ExternalFn>,
-    pub wasm_store: RefCell<Store<WasiCtx>>,
-    pub wasm_instances: Vec<Instance>,
+    pub native_functions: HashMap<String, Arc<dyn Fn(&[Value]) -> EvalResult + Send + Sync>>,
+    pub external_functions: HashMap<String, (String, Type)>, // wasm_name, type
+    pub engine: Engine,
+    pub wasm_modules: HashMap<String, Module>,
+    pub wasm_store: Arc<Mutex<Store<wasmtime_wasi::p1::WasiP1Ctx>>>,
+    pub wasm_instances: Arc<Mutex<Vec<Instance>>>,
     pub modules: HashMap<String, Interpreter>,
     pub lambda_counter: usize,
+    pub init_error: Option<EvalError>,
 }
 
 impl Interpreter {
+    /// Builds an interpreter instance and loads stdlib `.nx` modules.
     pub fn new(program: Program) -> Self {
-        Self::new_with_stdlib(program, true)
+        Self::new_with_capabilities(program, ExecutionCapabilities::permissive_legacy())
     }
 
-    fn new_with_stdlib(program: Program, load_stdlib: bool) -> Self {
+    /// Builds an interpreter instance with an explicit capability policy.
+    pub fn new_with_capabilities(program: Program, capabilities: ExecutionCapabilities) -> Self {
+        Self::new_with_stdlib(program, true, capabilities)
+    }
+
+    fn new_with_stdlib(
+        program: Program,
+        load_stdlib: bool,
+        capabilities: ExecutionCapabilities,
+    ) -> Self {
+        match Self::try_new_with_stdlib(program, load_stdlib, capabilities) {
+            Ok(interpreter) => interpreter,
+            Err(init_error) => Self::with_init_error(init_error),
+        }
+    }
+
+    fn with_init_error(init_error: EvalError) -> Self {
+        let engine = Engine::default();
+        let wasi = WasiCtxBuilder::new().build_p1();
+        let store = Store::new(&engine, wasi);
+        Interpreter {
+            functions: HashMap::new(),
+            enums: HashMap::new(),
+            exceptions: HashMap::new(),
+            closures: HashMap::new(),
+            handlers: HashMap::new(),
+            native_functions: HashMap::new(),
+            external_functions: HashMap::new(),
+            engine,
+            wasm_modules: HashMap::new(),
+            wasm_store: Arc::new(Mutex::new(store)),
+            wasm_instances: Arc::new(Mutex::new(Vec::new())),
+            modules: HashMap::new(),
+            lambda_counter: 0,
+            init_error: Some(init_error),
+        }
+    }
+
+    fn ensure_ready(&self) -> Result<(), EvalError> {
+        if let Some(err) = &self.init_error {
+            return Err(err.clone());
+        }
+        Ok(())
+    }
+
+    fn try_new_with_stdlib(
+        program: Program,
+        load_stdlib: bool,
+        capabilities: ExecutionCapabilities,
+    ) -> Result<Self, EvalError> {
         let mut functions = HashMap::new();
+        let mut enums = HashMap::new();
+        let mut exceptions = HashMap::new();
         let mut handlers = HashMap::new();
         let mut external_functions = HashMap::new();
         let mut modules = HashMap::new();
-        let mut native_functions: HashMap<String, Box<dyn Fn(&[Value]) -> EvalResult>> =
+        let native_functions: HashMap<String, Arc<dyn Fn(&[Value]) -> EvalResult + Send + Sync>> =
             HashMap::new();
 
         let engine = Engine::default();
-        let wasi = WasiCtxBuilder::new().inherit_stdio().build();
+        let mut wasm_modules = HashMap::new();
+
+        let mut builder = WasiCtxBuilder::new();
+        builder.inherit_stdio();
+        capabilities
+            .apply_to_wasi_builder(&mut builder)
+            .map_err(|e| runtime_error(format!("Failed to apply capability policy: {}", e)))?;
+        let wasi = builder.build_p1();
         let mut store = Store::new(&engine, wasi);
         let mut linker = Linker::new(&engine);
-        wasmtime_wasi::add_to_linker(&mut linker, |s| s).expect("Failed to add WASI to linker");
+        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s| s)
+            .map_err(|e| runtime_error(format!("Failed to add WASI to linker: {}", e)))?;
+        add_nexus_host_to_linker(&mut linker, capabilities.clone())
+            .map_err(|e| runtime_error(format!("Failed to add nexus host HTTP import: {}", e)))?;
+
         let mut wasm_instances = Vec::new();
 
         let mut all_definitions = Vec::new();
         if load_stdlib {
-            if let Ok(stdlib_programs) = load_stdlib_nx_programs() {
-                for (_, stdlib_program) in stdlib_programs {
-                    all_definitions.extend(stdlib_program.definitions);
-                }
+            let stdlib_programs = load_stdlib_nx_programs()
+                .map_err(|e| runtime_error(format!("Failed to load stdlib sources: {}", e)))?;
+            for (_, stdlib_program) in stdlib_programs {
+                all_definitions.extend(stdlib_program.definitions);
             }
         }
         all_definitions.extend(program.definitions);
 
         for def in &all_definitions {
             match &def.node {
-                TopLevel::Function(func) => {
-                    functions.insert(func.name.clone(), func.clone());
+                TopLevel::Let(gl) => match &gl.value.node {
+                    Expr::Lambda {
+                        type_params,
+                        params,
+                        ret_type,
+                        effects,
+                        body,
+                    } => {
+                        functions.insert(
+                            gl.name.clone(),
+                            Function {
+                                name: gl.name.clone(),
+                                is_public: gl.is_public,
+                                type_params: type_params.clone(),
+                                params: params.clone(),
+                                ret_type: ret_type.clone(),
+                                effects: effects.clone(),
+                                body: body.clone(),
+                            },
+                        );
+                    }
+                    Expr::External(wasm_name, typ) => {
+                        external_functions
+                            .insert(gl.name.clone(), (wasm_name.clone(), typ.clone()));
+                    }
+                    _ => {}
+                },
+                TopLevel::Enum(ed) => {
+                    enums.insert(ed.name.clone(), ed.clone());
+                }
+                TopLevel::Exception(ex) => {
+                    exceptions.insert(ex.name.clone(), ex.clone());
                 }
                 TopLevel::Handler(handler) => {
                     handlers.insert(handler.port_name.clone(), handler.clone());
                 }
-                TopLevel::ExternalFn(ext) => {
-                    external_functions.insert(ext.name.clone(), ext.clone());
-                }
                 TopLevel::Import(import) => {
                     if import.is_external {
-                        let module = Module::from_file(&engine, &import.path)
-                            .expect("Failed to load wasm module");
-                        let instance = linker
-                            .instantiate(&mut store, &module)
-                            .expect("Failed to instantiate wasm module");
+                        let module = Module::from_file(&engine, &import.path).map_err(|e| {
+                            runtime_error(format!(
+                                "Failed to load wasm module '{}': {}",
+                                import.path, e
+                            ))
+                        })?;
+                        wasm_modules.insert(import.path.clone(), module.clone());
+                        let instance = linker.instantiate(&mut store, &module).map_err(|e| {
+                            runtime_error(format!(
+                                "Failed to instantiate wasm module '{}': {}",
+                                import.path, e
+                            ))
+                        })?;
                         wasm_instances.push(instance);
                     } else {
-                        let src =
-                            std::fs::read_to_string(&import.path).expect("Failed to read module");
-                        let p = crate::parser::parser()
-                            .parse(src)
-                            .expect("Failed to parse module");
+                        let src = std::fs::read_to_string(&import.path).map_err(|e| {
+                            runtime_error(format!("Failed to read module '{}': {}", import.path, e))
+                        })?;
+                        let p = crate::lang::parser::parser().parse(src).map_err(|errs| {
+                            runtime_error(format!(
+                                "Failed to parse module '{}': {:?}",
+                                import.path, errs
+                            ))
+                        })?;
 
-                        let sub_interp = Interpreter::new_with_stdlib(p, true);
+                        let sub_interp =
+                            Interpreter::try_new_with_stdlib(p, true, capabilities.clone())?;
 
                         if !import.items.is_empty() {
                             for item in &import.items {
@@ -228,7 +646,6 @@ impl Interpreter {
                                 if let Some(f) = sub_interp.external_functions.get(item) {
                                     external_functions.insert(item.clone(), f.clone());
                                 }
-                                // native functions? handlers?
                             }
                         } else {
                             let alias = import.alias.clone().unwrap_or_else(|| {
@@ -246,35 +663,46 @@ impl Interpreter {
             }
         }
 
-        // Keep only intrinsics that cannot be lowered through the current Wasm ABI.
-        native_functions.insert(
-            "__nx_list_length".to_string(),
-            Box::new(|args| {
-                if args.len() != 1 {
-                    return Err(runtime_error("__nx_list_length requires 1 arg"));
-                }
-                if let Value::List(xs) = &args[0] {
-                    Ok(ExprResult::Normal(Value::Int(xs.len() as i64)))
-                } else {
-                    Err(runtime_error("Expected list"))
-                }
-            }),
-        );
-
-        Interpreter {
+        Ok(Interpreter {
             functions,
+            enums,
+            exceptions,
             closures: HashMap::new(),
             handlers,
             native_functions,
             external_functions,
-            wasm_store: RefCell::new(store),
-            wasm_instances,
+            engine,
+            wasm_modules,
+            wasm_store: Arc::new(Mutex::new(store)),
+            wasm_instances: Arc::new(Mutex::new(wasm_instances)),
             modules,
             lambda_counter: 0,
+            init_error: None,
+        })
+    }
+
+    fn spawn_task_interpreter(&self) -> Self {
+        Interpreter {
+            functions: self.functions.clone(),
+            enums: self.enums.clone(),
+            exceptions: self.exceptions.clone(),
+            closures: self.closures.clone(),
+            handlers: self.handlers.clone(),
+            native_functions: self.native_functions.clone(),
+            external_functions: self.external_functions.clone(),
+            engine: self.engine.clone(),
+            wasm_modules: self.wasm_modules.clone(),
+            wasm_store: Arc::clone(&self.wasm_store),
+            wasm_instances: Arc::clone(&self.wasm_instances),
+            modules: self.modules.clone(),
+            lambda_counter: self.lambda_counter,
+            init_error: self.init_error.clone(),
         }
     }
 
+    /// Evaluates one REPL statement against an existing environment.
     pub fn eval_repl_stmt(&mut self, stmt: &Spanned<Stmt>, env: &mut Env) -> EvalResult {
+        self.ensure_ready()?;
         match &stmt.node {
             Stmt::Expr(expr) => self.eval_expr(expr, env),
             _ => self.eval_body(&[stmt.clone()], env),
@@ -300,7 +728,87 @@ impl Interpreter {
         name
     }
 
+    fn labeled_to_positional_for_params(
+        params: &[Param],
+        labeled_args: &[(String, Value)],
+        callee: &str,
+    ) -> Result<Vec<Value>, EvalError> {
+        if params.len() != labeled_args.len() {
+            return Err(runtime_error(format!(
+                "Arity mismatch in {}: expected {}, got {}",
+                callee,
+                params.len(),
+                labeled_args.len()
+            )));
+        }
+
+        let mut remaining = labeled_args.to_vec();
+        let mut ordered = Vec::with_capacity(params.len());
+        for param in params {
+            let idx = remaining
+                .iter()
+                .position(|(label, _)| label == &param.name)
+                .ok_or_else(|| {
+                    runtime_error(format!("Missing label '{}' in {}", param.name, callee))
+                })?;
+            let (_, value) = remaining.remove(idx);
+            ordered.push(value);
+        }
+
+        if let Some((extra, _)) = remaining.first() {
+            return Err(runtime_error(format!(
+                "Unknown label '{}' in call to {}",
+                extra, callee
+            )));
+        }
+
+        Ok(ordered)
+    }
+
+    fn labeled_to_positional_for_arrow_params(
+        params: &[(String, Type)],
+        labeled_args: &[(String, Value)],
+        callee: &str,
+    ) -> Result<Vec<Value>, EvalError> {
+        if params.len() != labeled_args.len() {
+            return Err(runtime_error(format!(
+                "Arity mismatch in {}: expected {}, got {}",
+                callee,
+                params.len(),
+                labeled_args.len()
+            )));
+        }
+
+        let mut remaining = labeled_args.to_vec();
+        let mut ordered = Vec::with_capacity(params.len());
+        for (p_name, _) in params {
+            let idx = remaining
+                .iter()
+                .position(|(label, _)| label == p_name)
+                .ok_or_else(|| {
+                    runtime_error(format!("Missing label '{}' in {}", p_name, callee))
+                })?;
+            let (_, value) = remaining.remove(idx);
+            ordered.push(value);
+        }
+
+        if let Some((extra, _)) = remaining.first() {
+            return Err(runtime_error(format!(
+                "Unknown label '{}' in call to {}",
+                extra, callee
+            )));
+        }
+
+        Ok(ordered)
+    }
+
+    fn labeled_to_positional_call_order(labeled_args: &[(String, Value)]) -> Vec<Value> {
+        labeled_args.iter().map(|(_, v)| v.clone()).collect()
+    }
+
+    /// Executes a named Nexus function with already-evaluated arguments.
     pub fn run_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+        self.ensure_ready().map_err(|e| e.to_string())?;
         let func = self
             .functions
             .get(name)
@@ -333,21 +841,35 @@ impl Interpreter {
         }
     }
 
-    fn run_external_function(&self, ext: &ExternalFn, args: Vec<Value>) -> EvalResult {
-        let mut store = self.wasm_store.borrow_mut();
+    fn run_external_function(&self, wasm_name: &str, typ: &Type, args: Vec<Value>) -> EvalResult {
+        self.ensure_ready()?;
+        let mut store = self
+            .wasm_store
+            .lock()
+            .map_err(|_| runtime_error("Wasm store lock poisoned"))?;
 
         let mut func_with_inst = None;
-        for instance in &self.wasm_instances {
-            if let Some(f) = instance.get_func(&mut *store, &ext.wasm_name) {
+        let instances = self
+            .wasm_instances
+            .lock()
+            .map_err(|_| runtime_error("Wasm instance lock poisoned"))?;
+        for instance in instances.iter() {
+            if let Some(f) = instance.get_func(&mut *store, wasm_name) {
                 func_with_inst = Some((f, *instance));
                 break;
             }
         }
 
-        if args.len() != ext.params.len() {
+        let (params, ret_type) = if let Type::Arrow(p, r, _) = typ {
+            (p, r)
+        } else {
+            return Err(runtime_error("External function must have arrow type"));
+        };
+
+        if args.len() != params.len() {
             return Err(runtime_error(format!(
                 "Arity mismatch: expected {}, got {}",
-                ext.params.len(),
+                params.len(),
                 args.len()
             )));
         }
@@ -357,59 +879,81 @@ impl Interpreter {
         } else {
             return Err(runtime_error(format!(
                 "Wasm function {} not found in any loaded instance",
-                ext.wasm_name
+                wasm_name
             )));
         };
 
         let mut wasm_args = Vec::new();
-        for (param, v) in ext.params.iter().zip(args.into_iter()) {
-            match (&param.typ, v) {
-                (Type::I32, Value::Int(i)) => {
-                    let converted = i32::try_from(i).map_err(|_| {
-                        runtime_error(format!(
-                            "Parameter '{}' expects i32, but {} overflows i32",
-                            param.name, i
-                        ))
-                    })?;
-                    wasm_args.push(Val::I32(converted));
-                }
-                (Type::Bool, Value::Bool(b)) => wasm_args.push(Val::I32(if b { 1 } else { 0 })),
-                (Type::I64, Value::Int(i)) => wasm_args.push(Val::I64(i)),
-                (Type::F32, Value::Float(f)) => wasm_args.push(Val::F32((f as f32).to_bits())),
-                (Type::F64, Value::Float(f)) => wasm_args.push(Val::F64(f.to_bits())),
-                (Type::String, Value::String(s)) => {
-                    let ptr = self.pass_string_to_wasm(&s, &mut *store, &func_instance)?;
-                    wasm_args.push(Val::I32(ptr));
-                    wasm_args.push(Val::I32(s.len() as i32));
-                }
-                (Type::Array(_), Value::Array(arr)) => {
-                    let len = i32::try_from(arr.borrow().len()).map_err(|_| {
-                        runtime_error(format!(
-                            "Parameter '{}' array length overflows i32",
-                            param.name
-                        ))
-                    })?;
-                    // Current ABI passes array metadata only.
-                    wasm_args.push(Val::I32(0));
-                    wasm_args.push(Val::I32(len));
-                }
-                (Type::Borrow(inner), Value::Array(arr)) if matches!(&**inner, Type::Array(_)) => {
-                    let len = i32::try_from(arr.borrow().len()).map_err(|_| {
-                        runtime_error(format!(
-                            "Parameter '{}' array length overflows i32",
-                            param.name
-                        ))
-                    })?;
-                    wasm_args.push(Val::I32(0));
-                    wasm_args.push(Val::I32(len));
-                }
-                (expected, actual) => {
-                    return Err(runtime_error(format!(
-                        "Unsupported FFI arg for '{}': expected {}, got {:?}",
-                        param.name, expected, actual
-                    )))
+        let mut transient_allocations: Vec<(i32, i32)> = Vec::new();
+        let build_args_result: Result<(), EvalError> = (|| {
+            for ((p_name, p_type), v) in params.iter().zip(args.into_iter()) {
+                match (p_type, v) {
+                    (Type::I32, Value::Int(i)) => {
+                        let converted = i32::try_from(i).map_err(|_| {
+                            runtime_error(format!(
+                                "Parameter '{}' expects i32, but {} overflows i32",
+                                p_name, i
+                            ))
+                        })?;
+                        wasm_args.push(Val::I32(converted));
+                    }
+                    (Type::Bool, Value::Bool(b)) => wasm_args.push(Val::I32(if b { 1 } else { 0 })),
+                    (Type::I64, Value::Int(i)) => wasm_args.push(Val::I64(i)),
+                    (Type::F32, Value::Float(f)) => wasm_args.push(Val::F32((f as f32).to_bits())),
+                    (Type::F64, Value::Float(f)) => wasm_args.push(Val::F64(f.to_bits())),
+                    (Type::String, Value::String(s)) => {
+                        let (ptr, len) =
+                            self.pass_string_to_wasm(&s, &mut *store, &func_instance)?;
+                        transient_allocations.push((ptr, len));
+                        wasm_args.push(Val::I32(ptr));
+                        wasm_args.push(Val::I32(len));
+                    }
+                    (Type::Array(_), Value::Array(arr)) => {
+                        let lock = arr.lock().map_err(|_| {
+                            runtime_error(format!("Parameter '{}' array lock poisoned", p_name))
+                        })?;
+                        let len = i32::try_from(lock.len()).map_err(|_| {
+                            runtime_error(format!(
+                                "Parameter '{}' array length overflows i32",
+                                p_name
+                            ))
+                        })?;
+                        // Current ABI passes array metadata only.
+                        wasm_args.push(Val::I32(0));
+                        wasm_args.push(Val::I32(len));
+                    }
+                    (Type::Borrow(inner), Value::Array(arr))
+                        if matches!(inner.as_ref(), Type::Array(_)) =>
+                    {
+                        let lock = arr.lock().map_err(|_| {
+                            runtime_error(format!("Parameter '{}' array lock poisoned", p_name))
+                        })?;
+                        let len = i32::try_from(lock.len()).map_err(|_| {
+                            runtime_error(format!(
+                                "Parameter '{}' array length overflows i32",
+                                p_name
+                            ))
+                        })?;
+                        wasm_args.push(Val::I32(0));
+                        wasm_args.push(Val::I32(len));
+                    }
+                    (expected, actual) => {
+                        return Err(runtime_error(format!(
+                            "Unsupported FFI arg for '{}': expected {}, got {:?}",
+                            p_name, expected, actual
+                        )))
+                    }
                 }
             }
+            Ok(())
+        })();
+        if let Err(err) = build_args_result {
+            let _ = self.cleanup_transient_allocations(
+                &transient_allocations,
+                &mut *store,
+                &func_instance,
+            );
+            return Err(err);
         }
 
         let mut results: Vec<Val> = func
@@ -423,13 +967,18 @@ impl Interpreter {
                 _ => Val::I64(0),
             })
             .collect();
-        func.call(&mut *store, &wasm_args, &mut results)
-            .map_err(|e| runtime_error(format!("Wasm call failed: {}", e)))?;
+        let call_result = func.call(&mut *store, &wasm_args, &mut results);
+        let cleanup_result =
+            self.cleanup_transient_allocations(&transient_allocations, &mut *store, &func_instance);
+        if let Err(e) = call_result {
+            return Err(runtime_error(format!("Wasm call failed: {}", e)));
+        }
+        cleanup_result?;
 
         if results.is_empty() {
             Ok(ExprResult::Normal(Value::Unit))
         } else {
-            match (&ext.ret_type, results[0].clone()) {
+            match (ret_type.as_ref(), results[0].clone()) {
                 (Type::I32, Val::I32(i)) => Ok(ExprResult::Normal(Value::Int(i as i64))),
                 (Type::Bool, Val::I32(i)) => Ok(ExprResult::Normal(Value::Bool(i != 0))),
                 (Type::I64, Val::I64(i)) => Ok(ExprResult::Normal(Value::Int(i))),
@@ -450,55 +999,115 @@ impl Interpreter {
         }
     }
 
+    fn deallocate_wasm_memory(
+        &self,
+        ptr: i32,
+        len: i32,
+        store: &mut Store<wasmtime_wasi::p1::WasiP1Ctx>,
+        instance: &Instance,
+    ) -> Result<(), EvalError> {
+        if ptr == 0 || len <= 0 {
+            return Ok(());
+        }
+        let dealloc = instance.get_func(&mut *store, "deallocate").ok_or_else(|| {
+            runtime_error(
+                "Wasm instance must export 'deallocate(ptr: i32, size: i32) -> unit' for FFI strings",
+            )
+        })?;
+        dealloc
+            .call(&mut *store, &[Val::I32(ptr), Val::I32(len)], &mut [])
+            .map_err(|e| runtime_error(format!("deallocate failed: {}", e)))
+    }
+
+    fn cleanup_transient_allocations(
+        &self,
+        allocations: &[(i32, i32)],
+        store: &mut Store<wasmtime_wasi::p1::WasiP1Ctx>,
+        instance: &Instance,
+    ) -> Result<(), EvalError> {
+        for &(ptr, len) in allocations {
+            self.deallocate_wasm_memory(ptr, len, store, instance)?;
+        }
+        Ok(())
+    }
+
     fn pass_string_to_wasm(
         &self,
         s: &str,
-        store: &mut Store<WasiCtx>,
+        store: &mut Store<wasmtime_wasi::p1::WasiP1Ctx>,
         instance: &Instance,
-    ) -> Result<i32, EvalError> {
+    ) -> Result<(i32, i32), EvalError> {
+        if s.len() > MAX_FFI_STRING_BYTES {
+            return Err(runtime_error(format!(
+                "ffi string argument exceeds {} bytes",
+                MAX_FFI_STRING_BYTES
+            )));
+        }
+        let len = i32::try_from(s.len())
+            .map_err(|_| runtime_error("string argument length overflows i32"))?;
         let alloc = instance.get_func(&mut *store, "allocate").ok_or_else(|| {
             runtime_error("Wasm instance must export 'allocate(i32) -> i32' to receive strings")
         })?;
 
         let mut results = [Val::I32(0)];
         alloc
-            .call(&mut *store, &[Val::I32(s.len() as i32)], &mut results)
+            .call(&mut *store, &[Val::I32(len)], &mut results)
             .map_err(|e| runtime_error(format!("allocate failed: {}", e)))?;
 
         let ptr = match results[0] {
             Val::I32(p) => p,
             _ => return Err(runtime_error("allocate must return i32")),
         };
-
-        let mem = instance
-            .get_memory(&mut *store, "memory")
-            .ok_or_else(|| runtime_error("Wasm instance must export 'memory'"))?;
-
-        mem.write(&mut *store, ptr as usize, s.as_bytes())
-            .map_err(|e| runtime_error(format!("memory write failed: {}", e)))?;
-
-        Ok(ptr)
-    }
-
-    fn read_string_from_wasm(
-        &self,
-        packed: i64,
-        store: &mut Store<WasiCtx>,
-        instance: &Instance,
-    ) -> Result<String, EvalError> {
-        let raw = packed as u64;
-        let ptr = (raw >> 32) as usize;
-        let len = (raw & 0xFFFF_FFFF) as usize;
-        if len == 0 {
-            return Ok(String::new());
+        if ptr == 0 && len > 0 {
+            return Err(runtime_error(
+                "allocate returned null pointer for non-empty string",
+            ));
         }
 
         let mem = instance
             .get_memory(&mut *store, "memory")
             .ok_or_else(|| runtime_error("Wasm instance must export 'memory'"))?;
+
+        if let Err(e) = mem.write(&mut *store, ptr as usize, s.as_bytes()) {
+            let _ = self.deallocate_wasm_memory(ptr, len, store, instance);
+            return Err(runtime_error(format!("memory write failed: {}", e)));
+        }
+
+        Ok((ptr, len))
+    }
+
+    fn read_string_from_wasm(
+        &self,
+        packed: i64,
+        store: &mut Store<wasmtime_wasi::p1::WasiP1Ctx>,
+        instance: &Instance,
+    ) -> Result<String, EvalError> {
+        let raw = packed as u64;
+        let ptr_bits = (raw >> 32) as u32;
+        let len = (raw & 0xFFFF_FFFF) as usize;
+        if len == 0 {
+            return Ok(String::new());
+        }
+        if len > MAX_FFI_STRING_BYTES {
+            return Err(runtime_error(format!(
+                "ffi string result exceeds {} bytes",
+                MAX_FFI_STRING_BYTES
+            )));
+        }
+        let len_i32 =
+            i32::try_from(len).map_err(|_| runtime_error("ffi string length overflows i32"))?;
+        let ptr_i32 = ptr_bits as i32;
+
+        let mem = instance
+            .get_memory(&mut *store, "memory")
+            .ok_or_else(|| runtime_error("Wasm instance must export 'memory'"))?;
         let mut buf = vec![0u8; len];
-        mem.read(&mut *store, ptr, &mut buf)
-            .map_err(|e| runtime_error(format!("memory read failed: {}", e)))?;
+        let read_result = mem.read(&mut *store, ptr_bits as usize, &mut buf);
+        let dealloc_result = self.deallocate_wasm_memory(ptr_i32, len_i32, store, instance);
+        if let Err(e) = read_result {
+            return Err(runtime_error(format!("memory read failed: {}", e)));
+        }
+        dealloc_result?;
         String::from_utf8(buf).map_err(|e| runtime_error(format!("invalid utf-8 from wasm: {}", e)))
     }
 
@@ -509,6 +1118,7 @@ impl Interpreter {
                     name, sigil, value, ..
                 } => {
                     if let Expr::Lambda {
+                        type_params,
                         params,
                         ret_type,
                         effects,
@@ -524,7 +1134,7 @@ impl Interpreter {
                             Function {
                                 name: String::new(),
                                 is_public: false,
-                                type_params: vec![],
+                                type_params: type_params.clone(),
                                 params: params.clone(),
                                 ret_type: ret_type.clone(),
                                 effects: effects.clone(),
@@ -535,7 +1145,7 @@ impl Interpreter {
                         );
                         let val = Value::Function(fn_name);
                         let final_val = if let Sigil::Mutable = sigil {
-                            Value::Ref(Rc::new(RefCell::new(val)))
+                            Value::Ref(Arc::new(Mutex::new(val)))
                         } else {
                             val
                         };
@@ -547,7 +1157,7 @@ impl Interpreter {
                     match res {
                         ExprResult::Normal(val) => {
                             let final_val = if let Sigil::Mutable = sigil {
-                                Value::Ref(Rc::new(RefCell::new(val)))
+                                Value::Ref(Arc::new(Mutex::new(val)))
                             } else {
                                 val
                             };
@@ -577,8 +1187,27 @@ impl Interpreter {
                     }
                 }
                 Stmt::Conc(tasks) => {
+                    let mut thread_handles = Vec::new();
+                    let task_runtime = self.spawn_task_interpreter();
                     for task in tasks {
-                        let _ = self.eval_body(&task.body, env)?;
+                        let task_interp = task_runtime.clone();
+                        let mut task_env = env.clone();
+                        let task_node = task.clone();
+                        let handle = std::thread::spawn(move || {
+                            let mut task_interp = task_interp;
+                            task_interp.eval_body(&task_node.body, &mut task_env)
+                        });
+                        thread_handles.push(handle);
+                    }
+                    for handle in thread_handles {
+                        match handle.join() {
+                            Ok(res) => {
+                                if let Err(e) = res {
+                                    return Err(e);
+                                }
+                            }
+                            Err(_) => return Err(runtime_error("Task panicked")),
+                        }
                     }
                 }
                 Stmt::Try {
@@ -614,7 +1243,13 @@ impl Interpreter {
                             let key = sigil.get_key(name);
                             if let Some(target_val) = env.get(&key) {
                                 if let Value::Ref(r) = target_val {
-                                    *r.borrow_mut() = val;
+                                    let mut lock = r.lock().map_err(|_| {
+                                        runtime_error(format!(
+                                            "Mutable reference '{}' lock poisoned",
+                                            name
+                                        ))
+                                    })?;
+                                    *lock = val;
                                 } else {
                                     return Err(runtime_error(format!(
                                         "Cannot assign to immutable variable {}",
@@ -636,7 +1271,9 @@ impl Interpreter {
                                     if i < 0 {
                                         return Err(invalid_index_error(i));
                                     }
-                                    let mut l = a.borrow_mut();
+                                    let mut l = a
+                                        .lock()
+                                        .map_err(|_| runtime_error("Array lock poisoned"))?;
                                     let idx = i as usize;
                                     if idx < l.len() {
                                         l[idx] = val;
@@ -660,6 +1297,24 @@ impl Interpreter {
         Ok(ExprResult::Normal(Value::Unit))
     }
 
+    fn get_variant_fields(&self, name: &str) -> Option<Vec<(Option<String>, Type)>> {
+        for ed in self.enums.values() {
+            if let Some(v) = ed.variants.iter().find(|v| v.name == name) {
+                return Some(v.fields.clone());
+            }
+        }
+        if let Some(ex) = self.exceptions.get(name) {
+            return Some(ex.fields.clone());
+        }
+        if name == "RuntimeError" {
+            return Some(vec![(Some("val".into()), Type::String)]);
+        }
+        if name == "InvalidIndex" {
+            return Some(vec![(Some("val".into()), Type::I64)]);
+        }
+        None
+    }
+
     fn eval_expr(&mut self, expr: &Spanned<Expr>, env: &mut Env) -> EvalResult {
         match &expr.node {
             Expr::Literal(lit) => Ok(ExprResult::Normal(match lit {
@@ -674,7 +1329,10 @@ impl Interpreter {
                 if let Some(val) = env.get(&key) {
                     match (sigil, &val) {
                         (Sigil::Mutable, Value::Ref(r)) => {
-                            return Ok(ExprResult::Normal(r.borrow().clone()))
+                            let lock = r.lock().map_err(|_| {
+                                runtime_error(format!("Mutable reference '{}' lock poisoned", name))
+                            })?;
+                            return Ok(ExprResult::Normal(lock.clone()));
                         }
                         (Sigil::Mutable, _) => {
                             return Err(runtime_error(format!(
@@ -712,7 +1370,11 @@ impl Interpreter {
                                 Ok(ExprResult::Normal(Value::Int(a * b)))
                             }
                             (Value::Int(a), "/", Value::Int(b)) => {
-                                Ok(ExprResult::Normal(Value::Int(a / b)))
+                                if b == 0 {
+                                    Err(runtime_error("division by zero"))
+                                } else {
+                                    Ok(ExprResult::Normal(Value::Int(a / b)))
+                                }
                             }
                             (Value::Int(a), "==", Value::Int(b)) => {
                                 Ok(ExprResult::Normal(Value::Bool(a == b)))
@@ -784,11 +1446,11 @@ impl Interpreter {
                 Ok(ExprResult::Normal(val))
             }
             Expr::Call { func, args, .. } => {
-                let mut evaluated_args = Vec::new();
-                for (_, arg_expr) in args {
+                let mut evaluated_args: Vec<(String, Value)> = Vec::new();
+                for (label, arg_expr) in args {
                     let res = self.eval_expr(arg_expr, env)?;
                     match res {
-                        ExprResult::Normal(val) => evaluated_args.push(val),
+                        ExprResult::Normal(val) => evaluated_args.push((label.clone(), val)),
                         ExprResult::EarlyReturn(val) => return Ok(ExprResult::EarlyReturn(val)),
                     }
                 }
@@ -797,7 +1459,9 @@ impl Interpreter {
                     match val {
                         Value::NativeFunction(name) => {
                             if let Some(f) = self.native_functions.get(&name) {
-                                return f(&evaluated_args);
+                                let positional =
+                                    Interpreter::labeled_to_positional_call_order(&evaluated_args);
+                                return f(&positional);
                             } else {
                                 return Err(runtime_error(format!(
                                     "Native function '{}' not found",
@@ -806,8 +1470,20 @@ impl Interpreter {
                             }
                         }
                         Value::Function(name) => {
+                            let target = self
+                                .functions
+                                .get(&name)
+                                .ok_or_else(|| {
+                                    runtime_error(format!("Function '{}' not found", name))
+                                })?
+                                .clone();
+                            let positional = Interpreter::labeled_to_positional_for_params(
+                                &target.params,
+                                &evaluated_args,
+                                &name,
+                            )?;
                             let res = self
-                                .run_function(&name, evaluated_args)
+                                .run_function(&name, positional)
                                 .map_err(runtime_error)?;
                             return Ok(ExprResult::Normal(res));
                         }
@@ -815,28 +1491,87 @@ impl Interpreter {
                     }
                 }
 
-                if let Some(ext) = self.external_functions.get(func).cloned() {
-                    return self.run_external_function(&ext, evaluated_args);
+                if let Some(f) = self.native_functions.get(func) {
+                    let positional = Interpreter::labeled_to_positional_call_order(&evaluated_args);
+                    return f(&positional);
+                }
+
+                if let Some((wasm_name, typ)) = self.external_functions.get(func).cloned() {
+                    let positional = if let Type::Arrow(params, _, _) = &typ {
+                        Interpreter::labeled_to_positional_for_arrow_params(
+                            params,
+                            &evaluated_args,
+                            func,
+                        )?
+                    } else {
+                        return Err(runtime_error("External function must have arrow type"));
+                    };
+                    return self.run_external_function(&wasm_name, &typ, positional);
                 }
 
                 if let Some(pos) = func.find('.') {
                     let mod_name = &func[..pos];
                     let item_name = &func[pos + 1..];
+                    let mut callback_defs = Vec::new();
+                    for (_, value) in &evaluated_args {
+                        if let Value::Function(name) = value {
+                            if let Some(def) = self.functions.get(name).cloned() {
+                                callback_defs.push((name.clone(), def));
+                            }
+                        }
+                    }
 
                     if let Some(sub_interp) = self.modules.get_mut(mod_name) {
-                        let res = sub_interp
-                            .run_function(item_name, evaluated_args)
-                            .map_err(runtime_error)?;
-                        return Ok(ExprResult::Normal(res));
+                        for (name, def) in &callback_defs {
+                            sub_interp
+                                .functions
+                                .entry(name.clone())
+                                .or_insert_with(|| def.clone());
+                        }
+                        if let Some(target) = sub_interp.functions.get(item_name).cloned() {
+                            let positional = Interpreter::labeled_to_positional_for_params(
+                                &target.params,
+                                &evaluated_args,
+                                &format!("{}.{}", mod_name, item_name),
+                            )?;
+                            let res = sub_interp
+                                .run_function(item_name, positional)
+                                .map_err(runtime_error)?;
+                            return Ok(ExprResult::Normal(res));
+                        }
+                        if let Some((wasm_name, typ)) =
+                            sub_interp.external_functions.get(item_name).cloned()
+                        {
+                            let positional = if let Type::Arrow(params, _, _) = &typ {
+                                Interpreter::labeled_to_positional_for_arrow_params(
+                                    params,
+                                    &evaluated_args,
+                                    &format!("{}.{}", mod_name, item_name),
+                                )?
+                            } else {
+                                return Err(runtime_error(
+                                    "External function must have arrow type",
+                                ));
+                            };
+                            return sub_interp.run_external_function(&wasm_name, &typ, positional);
+                        }
+                        return Err(runtime_error(format!(
+                            "Function '{}.{}' not found",
+                            mod_name, item_name
+                        )));
                     }
 
                     if let Some(handler) = self.handlers.get(mod_name).cloned() {
                         if let Some(target_func) =
                             handler.functions.iter().find(|f| f.name == item_name)
                         {
+                            let positional = Interpreter::labeled_to_positional_for_params(
+                                &target_func.params,
+                                &evaluated_args,
+                                &format!("{}.{}", mod_name, item_name),
+                            )?;
                             let mut handler_env = Env::new();
-                            for (param, arg) in target_func.params.iter().zip(evaluated_args.iter())
-                            {
+                            for (param, arg) in target_func.params.iter().zip(positional.iter()) {
                                 handler_env.define(param.name.clone(), arg.clone());
                             }
                             let res = self.eval_body(&target_func.body, &mut handler_env)?;
@@ -849,26 +1584,49 @@ impl Interpreter {
                     }
                 }
 
-                // Fallback to global native function lookup (for stdlib if not in Env as var)
-                if let Some(f) = self.native_functions.get(func) {
-                    return f(&evaluated_args);
-                }
-
-                let res = self
-                    .run_function(func, evaluated_args)
-                    .map_err(runtime_error)?;
+                let target = self
+                    .functions
+                    .get(func)
+                    .ok_or_else(|| runtime_error(format!("Function '{}' not found", func)))?
+                    .clone();
+                let positional = Interpreter::labeled_to_positional_for_params(
+                    &target.params,
+                    &evaluated_args,
+                    func,
+                )?;
+                let res = self.run_function(func, positional).map_err(runtime_error)?;
                 Ok(ExprResult::Normal(res))
             }
             Expr::Constructor(name, args) => {
-                let mut vals = Vec::new();
-                for arg in args {
-                    let res = self.eval_expr(arg, env)?;
+                let fields = self.get_variant_fields(name).ok_or_else(|| {
+                    EvalError::Exception(Value::Variant(
+                        "RuntimeError".to_string(),
+                        vec![Value::String(format!("Unknown constructor {}", name))],
+                    ))
+                })?;
+
+                let mut evaluated_args = Vec::new();
+                for (label, arg_expr) in args {
+                    let res = self.eval_expr(arg_expr, env)?;
                     match res {
-                        ExprResult::Normal(val) => vals.push(val),
+                        ExprResult::Normal(val) => evaluated_args.push((label.clone(), val)),
                         ExprResult::EarlyReturn(val) => return Ok(ExprResult::EarlyReturn(val)),
                     }
                 }
-                Ok(ExprResult::Normal(Value::Variant(name.clone(), vals)))
+
+                let mut vals = vec![None; fields.len()];
+                for (label, val) in evaluated_args {
+                    if let Some(l) = label {
+                        if let Some(idx) = fields.iter().position(|f| f.0.as_ref() == Some(&l)) {
+                            vals[idx] = Some(val);
+                        }
+                    } else if let Some(idx) = vals.iter().position(|v| v.is_none()) {
+                        vals[idx] = Some(val);
+                    }
+                }
+
+                let final_vals = vals.into_iter().map(|v| v.unwrap_or(Value::Unit)).collect();
+                Ok(ExprResult::Normal(Value::Variant(name.clone(), final_vals)))
             }
             Expr::Record(fields) => {
                 let mut map = HashMap::new();
@@ -883,16 +1641,6 @@ impl Interpreter {
                 }
                 Ok(ExprResult::Normal(Value::Record(map)))
             }
-            Expr::List(exprs) => {
-                let mut vals = Vec::new();
-                for e in exprs {
-                    match self.eval_expr(e, env)? {
-                        ExprResult::Normal(v) => vals.push(v),
-                        ExprResult::EarlyReturn(v) => return Ok(ExprResult::EarlyReturn(v)),
-                    }
-                }
-                Ok(ExprResult::Normal(Value::List(vals)))
-            }
             Expr::Array(exprs) => {
                 let mut vals = Vec::new();
                 for e in exprs {
@@ -901,9 +1649,7 @@ impl Interpreter {
                         ExprResult::EarlyReturn(v) => return Ok(ExprResult::EarlyReturn(v)),
                     }
                 }
-                Ok(ExprResult::Normal(Value::Array(Rc::new(RefCell::new(
-                    vals,
-                )))))
+                Ok(ExprResult::Normal(Value::Array(Arc::new(Mutex::new(vals)))))
             }
             Expr::Index(arr, idx) => {
                 let arr_res = self.eval_expr(arr, env)?;
@@ -915,15 +1661,9 @@ impl Interpreter {
                         }
                         let idx = i as usize;
                         match arr_val {
-                            Value::List(l) => {
-                                if idx < l.len() {
-                                    Ok(ExprResult::Normal(l[idx].clone()))
-                                } else {
-                                    Err(invalid_index_error(i))
-                                }
-                            }
                             Value::Array(a) => {
-                                let l = a.borrow();
+                                let l =
+                                    a.lock().map_err(|_| runtime_error("Array lock poisoned"))?;
                                 if idx < l.len() {
                                     Ok(ExprResult::Normal(l[idx].clone()))
                                 } else {
@@ -998,6 +1738,7 @@ impl Interpreter {
                 Err(runtime_error("No match found"))
             }
             Expr::Lambda {
+                type_params,
                 params,
                 ret_type,
                 effects,
@@ -1007,7 +1748,7 @@ impl Interpreter {
                     Function {
                         name: String::new(),
                         is_public: false,
-                        type_params: vec![],
+                        type_params: type_params.clone(),
                         params: params.clone(),
                         ret_type: ret_type.clone(),
                         effects: effects.clone(),
@@ -1017,6 +1758,12 @@ impl Interpreter {
                     None,
                 );
                 Ok(ExprResult::Normal(Value::Function(fn_name)))
+            }
+            Expr::External(_wasm_name, _typ) => {
+                // External expression itself evaluates to a function handle if we want,
+                // but since it's only allowed in `let`, we can handle it there.
+                // However, for completeness in `eval_expr`:
+                Ok(ExprResult::Normal(Value::Unit)) // Or some meaningful value
             }
             Expr::Raise(expr) => {
                 let val_res = self.eval_expr(expr, env)?;
@@ -1052,13 +1799,31 @@ impl Interpreter {
                 _ => None,
             },
             (Pattern::Constructor(name, pats), Value::Variant(vname, vals)) => {
-                if name == vname && pats.len() == vals.len() {
+                if name == vname {
+                    let fields = self.get_variant_fields(name)?;
+                    if fields.len() != vals.len() {
+                        return None;
+                    }
+
+                    let mut matched = vec![None; fields.len()];
+                    for (label, pat) in pats {
+                        if let Some(l) = label {
+                            if let Some(idx) = fields.iter().position(|f| f.0.as_ref() == Some(l)) {
+                                matched[idx] = Some(pat);
+                            }
+                        } else if let Some(idx) = matched.iter().position(|m| m.is_none()) {
+                            matched[idx] = Some(pat);
+                        }
+                    }
+
                     let mut bindings = HashMap::new();
-                    for (p, v) in pats.iter().zip(vals.iter()) {
-                        if let Some(b) = self.match_pattern(p, v) {
-                            bindings.extend(b);
-                        } else {
-                            return None;
+                    for (i, p_opt) in matched.into_iter().enumerate() {
+                        if let Some(p) = p_opt {
+                            if let Some(b) = self.match_pattern(p, &vals[i]) {
+                                bindings.extend(b);
+                            } else {
+                                return None;
+                            }
                         }
                     }
                     Some(bindings)
@@ -1083,5 +1848,103 @@ impl Interpreter {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpreter_init_error_is_reported_not_panic() {
+        let src = r#"
+import external [=[/definitely/missing_module_for_test.wasm]=]
+
+let main = fn () -> i64 do
+  return 0
+endfn
+"#;
+        let program = crate::lang::parser::parser()
+            .parse(src)
+            .expect("test source should parse");
+        let mut interpreter = Interpreter::new(program);
+        let err = interpreter
+            .run_function("main", vec![])
+            .expect_err("init error should surface through run_function");
+        assert!(err.contains("missing_module_for_test.wasm"));
+    }
+
+    #[test]
+    fn spawn_task_interpreter_reuses_wasmtime_runtime() {
+        let interpreter = Interpreter::new(Program {
+            definitions: Vec::new(),
+        });
+        assert!(
+            interpreter.init_error.is_none(),
+            "interpreter init should succeed for empty program"
+        );
+        let task_interp = interpreter.spawn_task_interpreter();
+        assert!(Arc::ptr_eq(
+            &interpreter.wasm_store,
+            &task_interp.wasm_store
+        ));
+        assert!(Arc::ptr_eq(
+            &interpreter.wasm_instances,
+            &task_interp.wasm_instances
+        ));
+    }
+
+    #[test]
+    fn http_bridge_rejects_oversized_url_with_explicit_error() {
+        let url = format!("https://example.com/{}", "a".repeat(MAX_HTTP_URL_BYTES + 1));
+        let err = perform_wasi_http_request("GET", &url, "", "")
+            .expect_err("oversized url should be rejected before network");
+        assert!(err.contains("url exceeds"), "unexpected error: {}", err);
+
+        let capabilities = ExecutionCapabilities {
+            allow_net: true,
+            ..ExecutionCapabilities::deny_all()
+        };
+        let raw = run_nexus_host_http_request(&capabilities, "GET", &url, "", "");
+        assert!(
+            raw.starts_with("0\nhttp request failed: url exceeds"),
+            "unexpected bridge response: {}",
+            raw
+        );
+    }
+
+    #[test]
+    fn http_bridge_ignores_network_policy_in_allow_all_mode() {
+        let capabilities = ExecutionCapabilities {
+            net_block_hosts: vec!["example.com".to_string()],
+            ..ExecutionCapabilities::deny_all()
+        };
+        let raw = run_nexus_host_http_request(&capabilities, "GET", "", "", "");
+        assert!(
+            raw.starts_with("0\nhttp request failed: empty URL"),
+            "unexpected bridge response: {}",
+            raw
+        );
+    }
+
+    #[test]
+    fn integer_division_by_zero_returns_runtime_error() {
+        let src = r#"
+let main = fn () -> i64 do
+  return 1 / 0
+endfn
+"#;
+        let program = crate::lang::parser::parser()
+            .parse(src)
+            .expect("test source should parse");
+        let mut interpreter = Interpreter::new(program);
+        let err = interpreter
+            .run_function("main", vec![])
+            .expect_err("division by zero should return runtime error");
+        assert!(
+            err.contains("division by zero"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

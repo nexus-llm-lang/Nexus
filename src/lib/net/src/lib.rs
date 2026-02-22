@@ -1,0 +1,222 @@
+use nexus_wasm_alloc::{checked_ptr_len, remember_allocation, take_allocation};
+use std::alloc::{Layout, alloc, realloc};
+use std::io::{self, Write};
+
+const HOST_HTTP_MODULE: &str = "nexus:cli/nexus-host";
+const HOST_HTTP_FUNC: &str = "host-http-request";
+
+fn has_valid_optional_region(ptr: i32, len: i32) -> bool {
+    if len < 0 {
+        return false;
+    }
+    if len == 0 {
+        return true;
+    }
+    checked_ptr_len(ptr, len).is_some()
+}
+
+fn read_string_lossy(ptr: i32, len: i32) -> String {
+    let Some((offset, len)) = checked_ptr_len(ptr, len) else {
+        return String::new();
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(offset as *const u8, len) };
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+fn store_string_result(s: String) -> i64 {
+    let bytes = s.into_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        return 0;
+    }
+    let Ok(len_i32) = i32::try_from(len) else {
+        return 0;
+    };
+    let ptr = allocate(len_i32);
+    if ptr == 0 {
+        return 0;
+    }
+    let Some((offset, _)) = checked_ptr_len(ptr, len_i32) else {
+        return 0;
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), offset as *mut u8, len);
+    }
+    pack_ptr_len(ptr, len_i32)
+}
+
+#[link(wasm_import_module = "nexus:cli/nexus-host")]
+extern "C" {
+    #[link_name = "host-http-request"]
+    fn host_http_request(
+        method_ptr: i32,
+        method_len: i32,
+        url_ptr: i32,
+        url_len: i32,
+        headers_ptr: i32,
+        headers_len: i32,
+        body_ptr: i32,
+        body_len: i32,
+        ret_ptr: i32,
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn allocate(size: i32) -> i32 {
+    nexus_wasm_alloc::allocate(size)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
+    nexus_wasm_alloc::deallocate(ptr, size);
+}
+
+#[no_mangle]
+pub extern "C" fn print(ptr: i32, len: i32) {
+    let Some((offset, len)) = checked_ptr_len(ptr, len) else {
+        return;
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(offset as *const u8, len) };
+    let mut out = io::stdout();
+    let _ = out.write_all(bytes);
+    let _ = out.flush();
+}
+
+#[no_mangle]
+pub extern "C" fn http_get(url_ptr: i32, url_len: i32) -> i64 {
+    const GET: &[u8] = b"GET";
+    http_request(
+        GET.as_ptr() as i32,
+        GET.len() as i32,
+        url_ptr,
+        url_len,
+        0,
+        0,
+        0,
+        0,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn http_request(
+    method_ptr: i32,
+    method_len: i32,
+    url_ptr: i32,
+    url_len: i32,
+    headers_ptr: i32,
+    headers_len: i32,
+    body_ptr: i32,
+    body_len: i32,
+) -> i64 {
+    if checked_ptr_len(method_ptr, method_len).is_none() {
+        return 0;
+    }
+    if checked_ptr_len(url_ptr, url_len).is_none() {
+        return 0;
+    }
+    if !has_valid_optional_region(headers_ptr, headers_len) {
+        return 0;
+    }
+    if !has_valid_optional_region(body_ptr, body_len) {
+        return 0;
+    }
+
+    let mut ret = [0_i32; 2];
+    unsafe {
+        host_http_request(
+            method_ptr,
+            method_len,
+            url_ptr,
+            url_len,
+            headers_ptr,
+            headers_len,
+            body_ptr,
+            body_len,
+            ret.as_mut_ptr() as i32,
+        );
+    }
+    if !has_valid_optional_region(ret[0], ret[1]) {
+        return 0;
+    }
+    pack_ptr_len(ret[0], ret[1])
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_string_to_i64(s_ptr: i32, s_len: i32) -> i64 {
+    read_string_lossy(s_ptr, s_len)
+        .trim()
+        .parse::<i64>()
+        .unwrap_or_default()
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_string_length(s_ptr: i32, s_len: i32) -> i64 {
+    read_string_lossy(s_ptr, s_len).len() as i64
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_string_index_of(s_ptr: i32, s_len: i32, sub_ptr: i32, sub_len: i32) -> i64 {
+    let s = read_string_lossy(s_ptr, s_len);
+    let sub = read_string_lossy(sub_ptr, sub_len);
+    s.find(sub.as_str()).map(|idx| idx as i64).unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_string_substring(s_ptr: i32, s_len: i32, start: i64, len: i64) -> i64 {
+    let s = read_string_lossy(s_ptr, s_len);
+    let start = start.max(0) as usize;
+    let len = len.max(0) as usize;
+    let result: String = s.chars().skip(start).take(len).collect();
+    store_string_result(result)
+}
+
+fn pack_ptr_len(ptr: i32, len: i32) -> i64 {
+    ((ptr as u32 as u64) << 32 | (len as u32 as u64)) as i64
+}
+
+// Exported for component canonical ABI lowering of string returns.
+#[no_mangle]
+pub unsafe extern "C" fn cabi_realloc(
+    old_ptr: i32,
+    old_len: i32,
+    align: i32,
+    new_len: i32,
+) -> i32 {
+    if new_len <= 0 {
+        return 0;
+    }
+    let align = align.max(1) as usize;
+    let new_len = new_len as usize;
+
+    if old_ptr == 0 || old_len <= 0 {
+        let Ok(layout) = Layout::from_size_align(new_len, align) else {
+            return 0;
+        };
+        let ptr = alloc(layout);
+        let ptr = ptr as i32;
+        remember_allocation(ptr, new_len);
+        return ptr;
+    }
+
+    let old_len = old_len as usize;
+    if !take_allocation(old_ptr, old_len) {
+        return 0;
+    }
+    let Ok(old_layout) = Layout::from_size_align(old_len, align) else {
+        remember_allocation(old_ptr, old_len);
+        return 0;
+    };
+    let ptr = realloc(old_ptr as *mut u8, old_layout, new_len);
+    if ptr.is_null() {
+        remember_allocation(old_ptr, old_len);
+        return 0;
+    }
+    let ptr = ptr as i32;
+    remember_allocation(ptr, new_len);
+    ptr
+}
+
+#[allow(dead_code)]
+fn _module_identity() -> (&'static str, &'static str) {
+    (HOST_HTTP_MODULE, HOST_HTTP_FUNC)
+}

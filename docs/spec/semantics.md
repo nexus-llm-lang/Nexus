@@ -1,0 +1,60 @@
+# Semantics
+
+This document describes the execution model and behavioral rules of the Nexus language.
+
+## Evaluation Strategy
+
+Nexus is a **call-by-value** language. All expressions are fully evaluated to values before being passed to functions or used in constructors.
+
+### Evaluation Order
+Nexus follows a strict **left-to-right** evaluation order:
+- **Arguments:** In a function call `f(a: e1, b: e2)`, `e1` is evaluated before `e2`.
+- **Binary Operators:** In `e1 + e2`, `e1` is evaluated before `e2`.
+- **Records/Constructors:** Fields and arguments are evaluated in the order they appear in the source code.
+
+## Scoping
+
+Nexus uses **lexical scoping**. Bindings are visible only within the block where they are defined and in nested blocks.
+
+### Variable Shadowing
+Shadowing is permitted. A `let` binding in an inner block can reuse a name from an outer block, masking the outer binding until the inner block ends.
+
+## Sigil Semantics
+
+Sigils are not just syntactic markers; they represent fundamental semantic constraints on how data is handled at runtime.
+
+### Mutability (`~`)
+- **Scope-Bound:** Mutable bindings are restricted to the stack of the function that defines them.
+- **No Escape:** Mutable references cannot be returned from functions or stored in heap-allocated structures, ensuring mutation remains localized and predictable.
+- **Assignment:** The `<-` operator updates the value of a mutable binding.
+- **Concurrency:** Mutable references cannot be captured by concurrent tasks (`conc`) or asynchronous closures to prevent race conditions.
+
+### Linearity (`%`)
+- **Exactly Once:** A linear binding must be used exactly once. It must be consumed by a terminating operation, such as a function call, a return, or an explicit `drop`.
+- **Static Enforcement:** The type system ensures linear resources (like file handles or sockets) are never leaked and never used after consumption.
+- **No Discard:** The wildcard pattern `_` cannot be used to discard a linear value. Every linear resource must be explicitly handled.
+- **No Ref:** Mutable references to linear types (`Ref<%T>`) are strictly forbidden to prevent aliasing violations.
+- **Weakening at Calls:** A plain value `T` can be passed to a function expecting a linear parameter `%T`. In this context, the value is treated as a linear resource for the duration of the call.
+
+## Closures and Captures
+
+- **Lexical Captures:** Lambdas can capture immutable bindings from their lexical scope.
+- **Mutability Restriction:** Closures cannot capture mutable bindings (`~`).
+- **Linearity Propagation:** If a closure captures a linear value (`%`), the closure itself becomes linear and can only be invoked (consumed) once.
+
+Nexus uses a shallow effect system.
+
+- **Perform:** When `perform op(...)` is called, the current computation is suspended, and the runtime searches the stack for the nearest `handler` that handles the corresponding `port`.
+- **Resumption:** Nexus effects in the current implementation are non-resumable (one-shot). Once an effect is handled, the control flow is determined by the handler's return value within the context of the try-catch or handler block. (Note: Future versions may explore resumable continuations).
+
+## Concurrency Model
+
+### Structured Concurrency (`conc`)
+- A `conc` block spawns multiple `task` units.
+- The `conc` block is synchronous with respect to its caller: it blocks until **all** child tasks have completed.
+- In the reference interpreter, tasks may execute sequentially, but the semantics allow for parallel execution.
+
+## Exception Handling
+
+- `raise` immediately terminates the current computation and unwinds the stack until it hits a `try...catch` block.
+- The `Exn` value is passed to the `catch` parameter, and execution resumes in the catch block.

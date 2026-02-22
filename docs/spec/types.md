@@ -22,21 +22,18 @@ Numeric literals default to `i64` (integers) and `f64` (floats) unless constrain
 Records are structural and can be defined using `type`.
 
 ```nexus
-type User = {
+pub type User = {
   id: i64,
   name: string
 }
 ```
 
-### Enums (ADTs)
+### ADTs (Sum Types)
 
-Custom algebraic data types are defined via `enum`.
+Custom algebraic data types are defined via `type` with variant alternatives.
 
 ```nexus
-enum Option<T> {
-  Some(T),
-  None
-}
+pub type Option<T> = Some(val: T) | None
 ```
 
 ### Lists

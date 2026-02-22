@@ -4,39 +4,39 @@
 "fn" @keyword.function
 "endfn" @keyword.function
 "external" @keyword.function
-"pub" @keyword.modifier
+"pub" @keyword.modifier.pub
 
 ; Control flow
-"if" @keyword.control
-"then" @keyword.control
-"else" @keyword.control
-"endif" @keyword.control
-"match" @keyword.control
-"case" @keyword.control
-"endmatch" @keyword.control
-"return" @keyword.control
-"raise" @keyword.control
+"if" @keyword.if
+"then" @keyword.if
+"else" @keyword.if
+"endif" @keyword.if
+"match" @keyword.match
+"case" @keyword.match.case
+"endmatch" @keyword.match
+"return" @keyword.return
+"raise" @keyword.raise
 
 ; Effect system
-"perform" @keyword
-"effect" @keyword
-"borrow" @keyword
+"perform" @keyword.perform
+"effect" @keyword.effect
+"borrow" @keyword.borrow
 
 ; Error handling
-"try" @keyword.control
-"catch" @keyword.control
-"endtry" @keyword.control
+"try" @keyword.try
+"catch" @keyword.try
+"endtry" @keyword.try
 
 ; Concurrency
-"conc" @keyword
+"conc" @keyword.conc
 "do" @keyword
-"endconc" @keyword
-"task" @keyword
-"endtask" @keyword
+"endconc" @keyword.conc
+"task" @keyword.task
+"endtask" @keyword.task
 
-; Type/enum definitions
+; Type/exception definitions
 "type" @keyword.type
-"enum" @keyword.type
+"exception" @keyword.type
 
 ; Import
 "import" @keyword.import
@@ -44,13 +44,14 @@
 "as" @keyword.import
 
 ; Port/handler
-"port" @keyword
-"endport" @keyword
-"handler" @keyword
-"for" @keyword
-"endhandler" @keyword
+"port" @keyword.port
+"endport" @keyword.port
+"handler" @keyword.handler
+"for" @keyword.handler
+"endhandler" @keyword.handler
 
-"let" @keyword
+"let" @keyword.let
+"drop" @keyword.drop
 
 ; ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -64,22 +65,22 @@
 (type_def
   name: (uident) @type.definition)
 
-(enum_def
+(exception_def
   name: (uident) @type.definition)
 
 (variant_def
   name: (uident) @constructor)
 
+(variant_field
+  label: (identifier) @variable.member)
+
 ; ─── Functions ──────────────────────────────────────────────────────────────
 
-(function_def
+(handler_fn
   name: (identifier) @function)
 
 (lambda_expr
   ret_type: _ @type)
-
-(external_fn_def
-  name: (identifier) @function)
 
 (fn_signature
   name: (identifier) @function)
@@ -88,7 +89,7 @@
   func: (dotted_identifier) @function.call)
 
 (perform_call
-  func: (dotted_identifier) @function.call)
+  func: (perform_path) @function.call)
 
 (constructor_expr
   name: (uident) @constructor)
@@ -104,6 +105,12 @@
 (labeled_arg
   label: (identifier) @variable.parameter)
 
+(ctor_arg
+  label: (identifier) @variable.parameter)
+
+(ctor_pat_arg
+  label: (identifier) @variable.parameter)
+
 (record_type_field
   name: (identifier) @variable.member)
 
@@ -116,6 +123,9 @@
   name: (identifier) @variable)
 
 (let_stmt
+  name: (identifier) @variable)
+
+(let_def
   name: (identifier) @variable)
 
 (variable_pattern
@@ -137,7 +147,7 @@
 
 (string_literal) @string
 
-(quoted_string) @string
+(import_path) @string.special.path
 
 ; ─── Operators ──────────────────────────────────────────────────────────────
 

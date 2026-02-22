@@ -1,6 +1,7 @@
 ; ─── Scope definitions ──────────────────────────────────────────────────────
 
-(function_def) @local.scope
+(lambda_expr) @local.scope
+(handler_fn) @local.scope
 (if_stmt) @local.scope
 (match_case) @local.scope
 (try_stmt) @local.scope
@@ -12,10 +13,13 @@
 (let_stmt
   name: (identifier) @local.definition)
 
+(let_def
+  name: (identifier) @local.definition)
+
 (param
   name: (identifier) @local.definition)
 
-(function_def
+(handler_fn
   name: (identifier) @local.definition)
 
 (try_stmt

@@ -18,6 +18,9 @@
 - [x] Initial stdlib modules (`nxlib/stdlib/stdio.nx`, `nxlib/stdlib/stdlib.nx`, `list.nx`, `array.nx`)
 - [x] Rust sources for stdlib wasm at `src/lib/{stdio,stdlib}` (build outputs: `nxlib/stdlib/{stdio,stdlib}.wasm`)
 - [x] Property-based tests for type/effect/reference/linear behaviors (proptest)
+- [x] Typed ANF lowering prototype for WASM target (reachable call graph, monomorphic subset)
+- [x] WASM-oriented string runtime prototype (`src/runtime/string_heap.rs`, handle + refcount)
+- [x] Initial WASM codegen from typed ANF (numeric/bool/unit subset, exported `main`)
 
 ## Todo
 
@@ -28,16 +31,17 @@
 - [x] **Refined Effect Checking**: Enhance unification to support flexible subset/superset relationships for effects beyond basic row polymorphism.
 - [x] **Error Messages**: Implement rich diagnostics with source spans using Ariadne.
 - [x] Stabilize higher-order semantics around closures (recursion/capture corner cases, effect inference edge cases).
+- [x] enum integrate into type. e.g. `type Result<T, E> = Ok(val: T) | Err(val: E)`
 
 ### Infrastructure & Tooling (Medium Priority)
 - [x] FFI: Interoperate with WASM libraries for performance-critical code and system access.
-- [ ] **Standard Library**: Expand beyond List/Array/stdio (e.g. Map, richer collection/effect utilities).
+- [x] **Standard Library**: Expand beyond List/Array/stdio (e.g. Map, richer collection/effect utilities).
 - [ ] **Concurrency Runtime**: Implement actual parallel execution for `conc` blocks (currently sequential).
 - [ ] Profiler, Testing and Benchmarking Tools: Measure performance and identify bottlenecks.
-- [ ] Integrate `tree-sitter-nexus` parser into tooling/CI workflows.
+- [x] Integrate `tree-sitter-nexus` parser into tooling/CI workflows.
 
 ### Future Goals (Low Priority)
 - [x] **Modules & Imports**: File loading and namespace management (basic).
-- [ ] **WASM Compilation**: LLVM IR / MLIR backend.
+- [ ] **WASM Compilation**: complete backend coverage (strings/exceptions/ADTs/effects/runtime interop).
 - [ ] **LSP Server**: Editor support.
 - [ ] **Self-hosting**: Rewrite Nexus in Nexus.

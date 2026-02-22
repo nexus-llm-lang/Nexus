@@ -2,11 +2,12 @@ use chumsky::Parser;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::ast::Program;
-use crate::parser;
+use super::ast::Program;
+use super::parser;
 
 pub const STDLIB_DIR: &str = "nxlib/stdlib";
 
+/// Lists all `.nx` stdlib source files in lexical order.
 pub fn list_stdlib_nx_paths() -> Result<Vec<PathBuf>, String> {
     let dir = Path::new(STDLIB_DIR);
     let entries = fs::read_dir(dir).map_err(|e| format!("Failed to read {}: {}", STDLIB_DIR, e))?;
@@ -23,6 +24,7 @@ pub fn list_stdlib_nx_paths() -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
+/// Parses every stdlib `.nx` file and returns `(path, Program)` pairs.
 pub fn load_stdlib_nx_programs() -> Result<Vec<(PathBuf, Program)>, String> {
     let mut out = Vec::new();
     for path in list_stdlib_nx_paths()? {

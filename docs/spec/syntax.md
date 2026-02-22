@@ -13,45 +13,42 @@ Nexus supports C-style comments:
 
 ## Functions
 
-Functions are defined using `fn`. Argument types and return type must be specified.
-Blocks are terminated with `endfn`.
+Functions are first-class values in Nexus. At the top level, they are defined by binding a lambda expression to a name using `let`.
 
 ```nexus
-pub fn add(a: i64, b: i64) -> i64 do
+pub let add = fn (a: i64, b: i64) -> i64 do
   return a + b
 endfn
 ```
 
-- `pub` makes the function visible to other modules.
+- `pub let` makes the function visible to other modules.
 - All arguments are **labeled** at call sites: `add(a: 1, b: 2)`.
 - Generic type parameters can be declared with `<T, U>`:
 
 ```nexus
-fn identity<T>(x: T) -> T do
+let identity = fn <T>(x: T) -> T do
   return x
 endfn
 ```
 
 ### Function values and lambdas
 
-Functions are first-class values.
-
 ```nexus
-fn add1(x: i64) -> i64 do
+let add1 = fn (x: i64) -> i64 do
   return x + 1
 endfn
 
-fn main() -> i64 do
+let main = fn () -> unit do
   let f = add1
   let g = fn (x: i64) -> i64 do
     return x * 2
   endfn
-  return g(x: f(x: 10))
+  drop g(x: f(x: 10))
+  return ()
 endfn
 ```
 
-- Named functions can be assigned to variables.
-- Lambda literals use `fn (...) -> T do ... endfn`.
+- Local lambda literals use `fn (...) -> T do ... endfn`.
 - A local recursive lambda must use an immutable binding with an explicit type annotation.
 
 ### Effect annotation
@@ -59,7 +56,7 @@ endfn
 Functions that perform effects declare them with `effect`:
 
 ```nexus
-fn greet(name: string) -> unit effect { IO } do
+let greet = fn (name: string) -> unit effect { IO } do
   perform print(val: name)
   return ()
 endfn
@@ -69,18 +66,32 @@ The effect type can be a row `{ E1, E2 | r }`, a bare type name `IO`, or a gener
 
 ### External functions
 
-Foreign functions (e.g., from a Wasm module) are bound with `external`.
+Foreign functions are bound to a name using the `external` expression within a `let` binding.
 The type must be an arrow type and the Wasm export name is given as a string:
 
 ```nexus
-external sin : (x: float) -> float = "sin"
-pub external add_ints : (a: i64, b: i64) -> i64 = "add"
+pub let sin = external [=[sin]=] : (x: float) -> float
+pub let add_ints = external [=[add]=] : (a: i64, b: i64) -> i64
 ```
 
-## Variables (`let`)
+## Variables and Constants (`let`)
 
 Variables are defined with `let`. A type annotation is optional.
-A **sigil** controls linearity:
+
+### Top-level `let`
+
+At the top level, `let` defines a module-level constant or global variable. Sigils (`~`, `%`) are **not allowed** at the top level.
+
+```nexus
+pub let PI = 3.14159
+let internal_config = [=[ debug ]=]
+```
+
+- `pub let` makes the value visible to other modules.
+
+### Local `let`
+
+Inside functions, a **sigil** controls linearity and mutability:
 
 | Sigil | Meaning |
 |---|---|
@@ -89,10 +100,14 @@ A **sigil** controls linearity:
 | `%` | Linear binding (must be consumed exactly once) |
 
 ```nexus
-let x = 10
-let name: string = [=[ Nexus ]=]
-let ~counter: i64 = 0
-let %resource: %Handle = acquire()
+fn main() -> unit do
+  let x = 10
+  let name: string = [=[ Nexus ]=]
+  let ~counter: i64 = 0
+  let %resource: %Handle = acquire()
+  // ...
+  return ()
+endfn
 ```
 
 Variables are lexically scoped.
@@ -151,9 +166,9 @@ drop value
 |---|---|
 | `{ x: T, y: U }` | Record type |
 | `[T]` | Immutable list |
-| `[\ | T \ |]` | Linear array |
+| `[| T |]` | Linear array |
 | `Name<T, U>` | Generic user-defined type |
-| `Result<T, E>` | Result type (built-in special case) |
+| `Result<T, E>` | `Result` sum type from stdlib |
 
 ### Pointer / ownership types
 
@@ -188,20 +203,15 @@ Effect sets use `{}` with optional tail variable for polymorphism:
 ### Type definitions
 
 ```nexus
-type Point = { x: float, y: float }
-type Pair<A, B> = { fst: A, snd: B }
+pub type Point = { x: float, y: float }
+pub type Pair<A, B> = { fst: A, snd: B }
+pub type Result<T, E> = Ok(val: T) | Err(err: E)
 ```
 
-### Enum definitions
-
-```nexus
-enum Color {
-  Red,
-  Green,
-  Blue,
-  Rgb(i64, i64, i64)
-}
-```
+- `pub` makes the type visible to other modules.
+- `type` can define either:
+    - A record type (`{ ... }`)
+    - A sum/variant type (`A(...) | B(...)`)
 
 > **Note:** Constructors with no fields still require `()` in patterns and expressions (e.g., `Red()`).
 
@@ -210,9 +220,11 @@ enum Color {
 `exception` declarations extend the built-in `Exn` type with constructors.
 
 ```nexus
-exception NotFound(string)
-exception PermissionDenied(string, i64)
+pub exception NotFound(msg: string)
+pub exception PermissionDenied(msg: string, code: i64)
 ```
+
+- `pub` makes the exception constructor visible to other modules.
 
 ## Control Flow
 
@@ -246,7 +258,7 @@ Supported patterns:
 | Pattern | Example | Description |
 |---|---|---|
 | Literal | `1`, `true`, `[=[ hi ]=]` | Matches an exact value |
-| Constructor | `Ok(x)`, `Err(e)` | Destructures an enum variant |
+| Constructor | `Ok(x)`, `Err(e)` | Destructures a sum-type variant |
 | Record (exact) | `{ x: p1, y: p2 }` | All fields must match |
 | Record (partial) | `{ x: p1, _ }` | Remaining fields ignored; `_` must be last |
 | Wildcard | `_` | Matches anything without binding |
@@ -271,7 +283,7 @@ endtry
 ### Raise
 
 ```nexus
-raise NotFound([=[ something went wrong ]=])
+raise NotFound(msg: [=[ something went wrong ]=])
 ```
 
 `raise` is an expression. It terminates the current computation and propagates to the nearest `catch`.
@@ -283,7 +295,7 @@ Runtime errors are represented as built-in exceptions such as `RuntimeError(stri
 Exception values are created with normal constructor syntax:
 
 ```nexus
-let err = PermissionDenied([=[/tmp/data]=], 13)
+let err = PermissionDenied(msg: [=[/tmp/data]=], code: 13)
 raise err
 ```
 
@@ -316,18 +328,20 @@ let b3 = borrow %resource         // borrow linear
 A `port` defines an effect interface — a named set of function signatures:
 
 ```nexus
-port Logger do
+pub port Logger do
   fn log(msg: string) -> unit effect { IO }
   fn warn(msg: string) -> unit effect { IO }
 endport
 ```
+
+- `pub` makes the port visible to other modules.
 
 ### Handler
 
 A `handler` provides an implementation for a port:
 
 ```nexus
-handler StdoutLogger for Logger do
+pub handler StdoutLogger for Logger do
   fn log(msg: string) -> unit effect { IO } do
     perform print(val: msg)
     return ()
@@ -339,27 +353,29 @@ handler StdoutLogger for Logger do
 endhandler
 ```
 
+- `pub` makes the handler visible to other modules.
+
 ## Imports
 
-Four import forms are available:
+Three import forms are available:
 
 ```nexus
-import from path/to/module.nx              // anonymous import
-import as math from path/to/math.nx        // namespace alias
-import { add, sub } from path/to/math.nx   // named items
-import external path/to/lib.wasm           // Wasm module
+import from [=[path/to/module.nx]=]              // anonymous import
+import as math from [=[path/to/math.nx]=]        // namespace alias
+import { add, sub } from [=[path/to/math.nx]=]   // named items
+import external [=[path/to/lib.wasm]=]           // Wasm module
 ```
 
 ## Concurrency (`conc`)
 
-Structured concurrency via `conc` blocks. Task names are double-quoted strings:
+Structured concurrency via `conc` blocks. Task names are identifiers:
 
 ```nexus
 conc do
-  task "worker1" do
+  task worker1 do
     // ...
   endtask
-  task "worker2" do
+  task worker2 do
     // ...
   endtask
 endconc
@@ -382,7 +398,7 @@ endconc
 Strings use `[=[ ... ]=]` delimiters. To include `]=]` literally, escape it as `\]=]`.
 Numeric literals default to `i64` (integers) and `f64` (floats) unless constrained by annotations or context.
 
-Double-quoted strings (`"..."`) are used in Wasm binding names and task names — they are not expression literals.
+Bracket strings are also used for import paths and Wasm binding names.
 
 ---
 
@@ -392,48 +408,42 @@ Double-quoted strings (`"..."`) are used in Wasm binding names and task names �
 (* ── Top-level ─────────────────────────────────────────────── *)
 
 program       ::= top_level*
-top_level     ::= function_def
-                | external_fn_def
-                | type_def
-                | enum_def
+top_level     ::= type_def
                 | exception_def
                 | import_def
                 | port_def
                 | handler_def
+                | let_def
                 | comment
 
 (* ── Definitions ───────────────────────────────────────────── *)
 
-function_def  ::= [ "pub" ] "fn" IDENT [ type_params ] param_list
-                  "->" type [ "effect" effect_type ]
-                  "do" stmt* "endfn"
+type_def      ::= [ "pub" ] "type" UIDENT [ type_params ] "=" record_type
+                | [ "pub" ] "type" UIDENT [ type_params ] "=" type_sum_def
 
-external_fn_def
-              ::= [ "pub" ] "external" IDENT ":" arrow_type
-                  "=" QUOTED_STRING
+type_sum_def  ::= variant_def ( "|" variant_def )*
+variant_def   ::= UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
+variant_field ::= type | IDENT ":" type
+exception_def ::= [ "pub" ] "exception" UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
 
-type_def      ::= "type" IDENT [ type_params ] "=" record_type
+import_def    ::= "import" "external" STRING_LITERAL
+                | "import" "{" IDENT ( "," IDENT )* "}" "from" STRING_LITERAL
+                | "import" "as" IDENT "from" STRING_LITERAL
+                | "import" "from" STRING_LITERAL
 
-enum_def      ::= "enum" IDENT [ type_params ]
-                  "{" variant_def ( "," variant_def )* [ "," ] "}"
-variant_def   ::= UIDENT [ "(" type ( "," type )* ")" ]
-exception_def ::= "exception" UIDENT [ "(" type ( "," type )* ")" ]
-
-import_def    ::= "import" "external" IMPORT_PATH
-                | "import" "{" IDENT ( "," IDENT )* "}" "from" IMPORT_PATH
-                | "import" "as" IDENT "from" IMPORT_PATH
-                | "import" "from" IMPORT_PATH
-
-port_def      ::= "port" IDENT "do" fn_signature* "endport"
+port_def      ::= [ "pub" ] "port" UIDENT "do" fn_signature* "endport"
 fn_signature  ::= "fn" IDENT param_list "->" type [ "effect" effect_type ]
 
-handler_def   ::= "handler" IDENT "for" IDENT "do"
-                  function_def*
+handler_def   ::= [ "pub" ] "handler" UIDENT "for" UIDENT "do"
+                  handler_fn*
                   "endhandler"
+handler_fn    ::= "fn" IDENT [ type_params ] param_list "->" type [ "effect" effect_type ] "do" stmt* "endfn"
+
+let_def       ::= [ "pub" ] "let" IDENT [ ":" type ] "=" expr
 
 (* ── Parameters ─────────────────────────────────────────────── *)
 
-type_params   ::= "<" IDENT ( "," IDENT )* ">"
+type_params   ::= "<" UIDENT ( "," UIDENT )* ">"
 param_list    ::= "(" [ param ( "," param )* ] ")"
 param         ::= [ sigil ] IDENT ":" type
 sigil         ::= "~" | "%"
@@ -450,7 +460,7 @@ type          ::= arrow_type
                 | list_type
                 | array_type
                 | row_type
-                | IDENT               (* type variable or monotype *)
+                | UIDENT              (* type variable or monotype *)
 
 primitive_type ::= "i32" | "i64" | "f32" | "f64" | "float" | "bool" | "string" | "unit"
 
@@ -463,8 +473,7 @@ record_type   ::= "{" IDENT ":" type ( "," IDENT ":" type )* "}"
 list_type     ::= "[" type "]"
 array_type    ::= "[|" type "|]"
 
-generic_type  ::= IDENT "<" type ( "," type )* ">"
-                  (* Result<T,E> is a special case *)
+generic_type  ::= UIDENT "<" type ( "," type )* ">"
 
 row_type      ::= "{" type ( "," type )* [ "|" type ] "}"
                   (* used as effect sets *)
@@ -473,13 +482,14 @@ arrow_type    ::= "(" [ arrow_param ( "," arrow_param )* ] ")"
                   "->" type [ "effect" effect_type ]
 arrow_param   ::= IDENT ":" type | type
 
-effect_type   ::= row_type | generic_type | IDENT
+effect_type   ::= row_type | generic_type | UIDENT
 
 (* ── Statements ─────────────────────────────────────────────── *)
 
 stmt          ::= let_stmt
                 | return_stmt
                 | assign_stmt
+                | drop_stmt
                 | if_stmt
                 | match_stmt
                 | try_stmt
@@ -490,6 +500,7 @@ stmt          ::= let_stmt
 let_stmt      ::= "let" [ sigil ] IDENT [ ":" type ] "=" expr
 return_stmt   ::= "return" expr
 assign_stmt   ::= expr "<-" expr
+drop_stmt     ::= "drop" [ sigil ] IDENT
 
 if_stmt       ::= "if" expr "then" stmt* [ "else" stmt* ] "endif"
 
@@ -499,7 +510,7 @@ match_case    ::= "case" pattern "->" stmt*
 try_stmt      ::= "try" stmt* "catch" IDENT "->" stmt* "endtry"
 
 conc_stmt     ::= "conc" "do" task_def* "endconc"
-task_def      ::= "task" QUOTED_STRING "do" stmt* "endtask"
+task_def      ::= "task" IDENT [ "effect" effect_type ] "do" stmt* "endtask"
 
 expr_stmt     ::= expr
 
@@ -526,6 +537,7 @@ atom_expr     ::= "(" expr ")"
                 | raise_expr
                 | borrow_expr
                 | lambda_expr
+                | external_expr
                 | perform_call
                 | call_expr
                 | constructor_expr
@@ -537,14 +549,16 @@ atom_expr     ::= "(" expr ")"
 
 raise_expr        ::= "raise" expr
 borrow_expr       ::= "borrow" [ sigil ] IDENT
-lambda_expr       ::= "fn" "(" [ param ( "," param )* ] ")"
+lambda_expr       ::= "fn" [ type_params ] "(" [ param ( "," param )* ] ")"
                       "->" type [ "effect" effect_type ]
                       "do" stmt* "endfn"
+external_expr     ::= "external" STRING_LITERAL ":" arrow_type
 perform_call      ::= "perform" dotted_ident "(" [ labeled_arg ( "," labeled_arg )* ] ")"
 call_expr         ::= dotted_ident "(" [ labeled_arg ( "," labeled_arg )* ] ")"
-labeled_arg       ::= IDENT [ ":" simple_arg ]
+labeled_arg       ::= IDENT ":" simple_arg
 simple_arg        ::= literal | variable
-constructor_expr  ::= UIDENT "(" [ expr ( "," expr )* ] ")"
+constructor_expr  ::= UIDENT "(" [ ctor_arg ( "," ctor_arg )* ] ")"
+ctor_arg          ::= [ IDENT ":" ] expr
 record_expr       ::= "{" [ IDENT ":" expr ( "," IDENT ":" expr )* ] "}"
 list_expr         ::= "[" [ expr ( "," expr )* [ "," ] ] "]"
 array_expr        ::= "[|" [ expr ( "," expr )* [ "," ] ] "|]"
@@ -562,7 +576,8 @@ pattern           ::= literal_pattern
 literal_pattern   ::= literal
 variable_pattern  ::= [ sigil ] IDENT
 constructor_pattern
-                  ::= UIDENT "(" [ pattern ( "," pattern )* ] ")"
+                  ::= UIDENT "(" [ ctor_pat_arg ( "," ctor_pat_arg )* ] ")"
+ctor_pat_arg      ::= [ IDENT ":" ] pattern
 record_pattern    ::= "{" [ rec_pat_field ( "," rec_pat_field )* [ "," ] ] "}"
 rec_pat_field     ::= "_" | IDENT ":" pattern
                       (* "_" must be the last element; enables partial matching *)
@@ -588,12 +603,10 @@ comment           ::= line_comment | block_comment
 line_comment      ::= "//" ANY* ( NEWLINE | EOF )
 block_comment     ::= "/*" ANY* "*/"
 
-QUOTED_STRING     ::= '"' ( NON_DQUOTE | "\" ANY )* '"'
-                      (* used in: external wasm names, task names *)
-IMPORT_PATH       ::= QUOTED_STRING | NONSPACE+
+STRING_LITERAL    ::= string_literal
+                      (* used in: string values, import paths, external wasm names *)
 
-IDENT             ::= [a-zA-Z_] [a-zA-Z0-9_]*   (* not a keyword *)
+IDENT             ::= [a-z_] [a-zA-Z0-9_]*       (* not a keyword *)
 UIDENT            ::= [A-Z] [a-zA-Z0-9_]*       (* constructor names *)
 DIGIT             ::= [0-9]
-NONSPACE          ::= any non-whitespace character
 ```

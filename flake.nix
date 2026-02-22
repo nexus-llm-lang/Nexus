@@ -29,7 +29,10 @@
           overlays = [ rust-overlay.overlays.default ];
         };
         rustBin = pkgs.rust-bin.stable.latest.default.override {
-          targets = [ "wasm32-wasip1" ];
+          targets = [
+            "wasm32-wasip1"
+            "wasm32-wasip2"
+          ];
         };
 
         rustPackages = [
@@ -37,28 +40,41 @@
           pkgs.rust-bin.stable.latest.rust-analyzer
         ];
 
-        treeSitterNexus = pkgs.tree-sitter.buildGrammar {
+        tsNexus = pkgs.tree-sitter.buildGrammar {
           language = "nexus";
           version = "0.1.0";
           src = ./tree-sitter-nexus;
         };
 
-        tsDeps = [ pkgs.nodejs pkgs.tree-sitter ];
+        tsDeps = with pkgs; [
+          nodejs
+          tree-sitter
+        ];
+        runtimeDeps = with pkgs; [
+          wasmtime
+          wabt
+          binaryen
+          lld
+        ];
 
         formatter = pkgs.nixfmt-tree;
 
         devShells.default = pkgs.mkShellNoCC {
-          inputsFrom = [ treeSitterNexus ];
-          packages = rustPackages ++ tsDeps ++ [
-            pkgs.actionlint
-            pkgs.nil
-            formatter
-          ];
+          inputsFrom = [ tsNexus ];
+          packages =
+            rustPackages
+            ++ tsDeps
+            ++ runtimeDeps
+            ++ [
+              pkgs.actionlint
+              pkgs.nil
+              formatter
+            ];
         };
       in
       {
         packages = {
-          tree-sitter-nexus = treeSitterNexus;
+          tree-sitter-nexus = tsNexus;
         };
         legacyPackages = pkgs;
         inherit formatter devShells;

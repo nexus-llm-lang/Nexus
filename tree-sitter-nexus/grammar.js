@@ -33,6 +33,9 @@ module.exports = grammar({
   conflicts: ($) => [
     // `foo` vs `foo.bar` — variable or start of dotted_identifier
     [$.variable, $.dotted_identifier],
+    // `T` vs `T<U>` — bare type identifier or start of generic_type
+    [$.generic_type, $._type],
+    [$.generic_type, $._effect_type],
   ],
 
   rules: {
@@ -57,102 +60,86 @@ module.exports = grammar({
 
     _top_level: ($) =>
       choice(
-        $.function_def,
-        $.external_fn_def,
         $.type_def,
-        $.enum_def,
+        $.exception_def,
         $.import_def,
         $.port_def,
         $.handler_def,
+        $.let_def,
         $.line_comment,
         $.block_comment
       ),
 
-    // [pub] fn name[<T,U>](params) -> ret [effect eff] do body endfn
-    function_def: ($) =>
-      seq(
-        optional("pub"),
-        "fn",
-        field("name", $.identifier),
-        optional(field("type_params", $.type_params)),
-        field("params", $.param_list),
-        "->",
-        field("ret_type", $._type),
-        optional(seq("effect", field("effects", $._effect_type))),
-        "do",
-        field("body", repeat($._stmt)),
-        "endfn"
-      ),
-
-    // [pub] external name : arrow_type = "wasm_symbol"
-    external_fn_def: ($) =>
-      seq(
-        optional("pub"),
-        "external",
-        field("name", $.identifier),
-        ":",
-        field("type", $._type),
-        "=",
-        field("wasm_name", $.quoted_string)
-      ),
-
-    // type Name[<T>] = { field: type, ... }
+    // [pub] type Name[<T>] = { field: type, ... }
+    // [pub] type Name[<T>] = A(label: T) | B
     type_def: ($) =>
       seq(
+        optional("pub"),
         "type",
         field("name", $.uident),
         optional(field("type_params", $.type_params)),
         "=",
-        field("fields", $.record_type)
+        field("body", choice($.record_type, $.type_sum_def))
       ),
 
-    // enum Name[<T>] { Variant(types), ... }
-    enum_def: ($) =>
-      seq(
-        "enum",
-        field("name", $.uident),
-        optional(field("type_params", $.type_params)),
-        "{",
-        commaSep1($.variant_def),
-        optional(","),
-        "}"
-      ),
+    // A(label: T) | B(U)
+    type_sum_def: ($) => sep1("|", $.variant_def),
 
     variant_def: ($) =>
       seq(
         field("name", $.uident),
-        optional(seq("(", commaSep1($._type), ")"))
+        optional(seq("(", commaSep1($.variant_field), ")"))
       ),
 
-    // import external "path.wasm"
-    // import { a, b } from "path.nx"
-    // import as alias from "path.nx"
-    // import from "path.nx"
+    // type | label: type
+    variant_field: ($) =>
+      choice(
+        seq(field("label", $.identifier), ":", field("type", $._type)),
+        field("type", $._type)
+      ),
+
+    // [pub] exception NotFound(msg: string)
+    exception_def: ($) =>
+      seq(
+        optional("pub"),
+        "exception",
+        field("name", $.uident),
+        optional(seq("(", commaSep1($.variant_field), ")"))
+      ),
+
+    // import external path/to/lib.wasm
+    // import { a, b } from path/to/mod.nx
+    // import as alias from path/to/mod.nx
+    // import from path/to/mod.nx
     import_def: ($) =>
       seq(
         "import",
         choice(
-          seq("external", field("path", $.quoted_string)),
+          seq("external", field("path", $.import_path)),
           seq(
             "{",
             field("items", commaSep1($.identifier)),
             "}",
             "from",
-            field("path", $.quoted_string)
+            field("path", $.import_path)
           ),
           seq(
             "as",
             field("alias", $.identifier),
             "from",
-            field("path", $.quoted_string)
+            field("path", $.import_path)
           ),
-          seq("from", field("path", $.quoted_string))
+          seq("from", field("path", $.import_path))
         )
       ),
 
-    // port Name do fn sig ... endport
+    // Import path uses bracket string literal: [=[path/to/module.nx]=]
+    import_path: ($) => $.string_literal,
+
+    // [pub] port Name do fn sig ... endport
     port_def: ($) =>
       seq(
+        optional("pub"),
         "port",
         field("name", $.uident),
         "do",
@@ -170,16 +157,43 @@ module.exports = grammar({
         optional(seq("effect", field("effects", $._effect_type)))
       ),
 
-    // handler Name for PortName do fn ... endhandler
+    // [pub] handler Name for PortName do handler_fn* endhandler
     handler_def: ($) =>
       seq(
+        optional("pub"),
         "handler",
         field("name", $.uident),
         "for",
         field("port_name", $.uident),
         "do",
-        repeat($.function_def),
+        repeat($.handler_fn),
         "endhandler"
+      ),
+
+    // fn name[<T>](params) -> ret [effect eff] do body endfn
+    handler_fn: ($) =>
+      seq(
+        "fn",
+        field("name", $.identifier),
+        optional(field("type_params", $.type_params)),
+        field("params", $.param_list),
+        "->",
+        field("ret_type", $._type),
+        optional(seq("effect", field("effects", $._effect_type))),
+        "do",
+        field("body", repeat($._stmt)),
+        "endfn"
+      ),
+
+    // [pub] let name [: type] = expr
+    let_def: ($) =>
+      seq(
+        optional("pub"),
+        "let",
+        field("name", $.identifier),
+        optional(seq(":", field("type", $._type))),
+        "=",
+        field("value", $._expr)
       ),
 
     // ─── Parameters ──────────────────────────────────────────────────────────
@@ -229,7 +243,7 @@ module.exports = grammar({
     linear_type: ($) => seq("%", field("inner", $._type)),
 
     // { x: T, y: U }
-    record_type: ($) => seq("{", commaSep($.record_type_field), "}"),
+    record_type: ($) => seq("{", commaSep1($.record_type_field), "}"),
 
     record_type_field: ($) =>
       seq(field("name", $.identifier), ":", field("type", $._type)),
@@ -300,6 +314,7 @@ module.exports = grammar({
         $.let_stmt,
         $.return_stmt,
         $.assign_stmt,
+        $.drop_stmt,
         $.if_stmt,
         $.match_stmt,
         $.try_stmt,
@@ -325,6 +340,14 @@ module.exports = grammar({
     // target <- value
     assign_stmt: ($) =>
       seq(field("target", $._expr), "<-", field("value", $._expr)),
+
+    // drop [sigil] name
+    drop_stmt: ($) =>
+      seq(
+        "drop",
+        optional(field("sigil", $.sigil)),
+        field("name", $.identifier)
+      ),
 
     // if cond then stmts [else stmts] endif
     if_stmt: ($) =>
@@ -373,7 +396,8 @@ module.exports = grammar({
     task_def: ($) =>
       seq(
         "task",
-        field("name", $.quoted_string),
+        field("name", $.identifier),
+        optional(seq("effect", field("effects", $._effect_type))),
         "do",
         field("body", repeat($._stmt)),
         "endtask"
@@ -477,6 +501,7 @@ module.exports = grammar({
         $.raise_expr,
         $.borrow_expr,
         $.lambda_expr,
+        $.external_expr,
         $.perform_call,
         $.call_expr,
         $.constructor_expr,
@@ -500,12 +525,12 @@ module.exports = grammar({
         field("name", $.identifier)
       ),
 
-    // fn (params) -> ret [effect eff] do body endfn
-    // Anonymous lambda; no name field.
+    // fn [<T>](params) -> ret [effect eff] do body endfn
     lambda_expr: ($) =>
       prec.right(
         seq(
           "fn",
+          optional(field("type_params", $.type_params)),
           field("params", $.param_list),
           "->",
           field("ret_type", $._type),
@@ -516,14 +541,31 @@ module.exports = grammar({
         )
       ),
 
+    // external [=[wasm_symbol]=] : arrow_type
+    external_expr: ($) =>
+      seq(
+        "external",
+        field("wasm_name", $.string_literal),
+        ":",
+        field("type", $.arrow_type)
+      ),
+
     // perform path(label: value, ...)
+    // The path can start with UIDENT for port-qualified calls: perform Logger.log(msg)
     perform_call: ($) =>
       seq(
         "perform",
-        field("func", $.dotted_identifier),
+        field("func", $.perform_path),
         "(",
         field("args", commaSep($.labeled_arg)),
         ")"
+      ),
+
+    // Path used in perform calls — first segment can be UIDENT (port name) or IDENT (module/function)
+    perform_path: ($) =>
+      seq(
+        choice($.identifier, $.uident),
+        repeat(seq(".", $.identifier))
       ),
 
     // path(label: value, ...)
@@ -535,16 +577,30 @@ module.exports = grammar({
         ")"
       ),
 
+    // label: value
     labeled_arg: ($) =>
-      seq(field("label", $.identifier), ":", field("value", $._expr)),
+      seq(
+        field("label", $.identifier),
+        ":",
+        field("value", $._simple_arg)
+      ),
 
-    // Constructor(value, ...)  — positional args, UIDENT name
+    _simple_arg: ($) => choice($.literal, $.variable),
+
+    // Constructor(label: value, ...)  — optional labels, UIDENT name
     constructor_expr: ($) =>
       seq(
         field("name", $.uident),
         "(",
-        field("args", commaSep($._expr)),
+        field("args", commaSep($.ctor_arg)),
         ")"
+      ),
+
+    // [ label ":" ] expr
+    ctor_arg: ($) =>
+      choice(
+        seq(field("label", $.identifier), ":", field("value", $._expr)),
+        field("value", $._expr)
       ),
 
     // { field: value, ... }
@@ -618,10 +674,6 @@ module.exports = grammar({
         )
       ),
 
-    // "..." — used in import paths, wasm names, task names
-    quoted_string: (_) =>
-      token(seq('"', repeat(choice(/[^"\\]/, seq("\\", /./), '"')), '"')),
-
     // ─── Patterns ────────────────────────────────────────────────────────────
 
     _pattern: ($) =>
@@ -642,13 +694,20 @@ module.exports = grammar({
         field("name", $.identifier)
       ),
 
-    // Constructor(pat, ...)  — UIDENT name
+    // Constructor([ label ":" ] pat, ...)  — optional labels, UIDENT name
     constructor_pattern: ($) =>
       seq(
         field("name", $.uident),
         "(",
-        commaSep($._pattern),
+        commaSep($.ctor_pat_arg),
         ")"
+      ),
+
+    // [ label ":" ] pattern
+    ctor_pat_arg: ($) =>
+      choice(
+        seq(field("label", $.identifier), ":", field("pattern", $._pattern)),
+        field("pattern", $._pattern)
       ),
 
     // { field: pat, ..., _ }
