@@ -40,7 +40,6 @@ pub enum AnfStmt {
         typ: Type,
         expr: AnfExpr,
     },
-    Drop(AnfAtom),
     If {
         cond: AnfAtom,
         then_body: Vec<AnfStmt>,
@@ -77,7 +76,6 @@ pub enum AnfExpr {
         func: String,
         args: Vec<(String, AnfAtom)>,
         typ: Type,
-        perform: bool,
     },
     Constructor {
         name: String,

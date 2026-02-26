@@ -24,7 +24,12 @@ fn type_arrow(params: Vec<Type>, ret: Type) -> Type {
         .enumerate()
         .map(|(i, t)| (format!("arg{}", i), t))
         .collect();
-    Type::Arrow(labeled, Box::new(ret), Box::new(Type::Row(vec![], None)))
+    Type::Arrow(
+        labeled,
+        Box::new(ret),
+        Box::new(Type::Row(vec![], None)),
+        Box::new(Type::Row(vec![], None)),
+    )
 }
 
 fn expr_lit_int(i: i64) -> Spanned<Expr> {
@@ -37,7 +42,6 @@ fn expr_call(func: &str, args: Vec<(&str, Spanned<Expr>)>) -> Spanned<Expr> {
     spanned(Expr::Call {
         func: func.to_string(),
         args: args.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
-        perform: false,
     })
 }
 
@@ -57,6 +61,7 @@ fn test_prop_identity_polymorphism() {
                         typ: type_var("T"),
                     }],
                     ret_type: type_var("T"),
+                    requires: Type::Row(vec![], None),
                     effects: Type::Row(vec![], None),
                     body: vec![spanned(Stmt::Return(expr_var("x")))],
                 }),
@@ -69,6 +74,7 @@ fn test_prop_identity_polymorphism() {
                     type_params: vec![],
                     params: vec![],
                     ret_type: type_unit(),
+                    requires: Type::Row(vec![], None),
                     effects: Type::Row(vec![], None),
                     body: vec![
                         spanned(Stmt::Let {
@@ -138,6 +144,7 @@ fn test_prop_k_combinator() {
                         },
                     ],
                     ret_type: type_var("A"),
+                    requires: Type::Row(vec![], None),
                     effects: Type::Row(vec![], None),
                     body: vec![spanned(Stmt::Return(expr_var("a")))],
                 }),
@@ -150,6 +157,7 @@ fn test_prop_k_combinator() {
                     type_params: vec![],
                     params: vec![],
                     ret_type: type_unit(),
+                    requires: Type::Row(vec![], None),
                     effects: Type::Row(vec![], None),
                     body: vec![
                         spanned(Stmt::Let {
@@ -193,6 +201,7 @@ fn test_prop_occurs_check_fail() {
                     typ: type_var("T"),
                 }],
                 ret_type: type_var("T"),
+                requires: Type::Row(vec![], None),
                 effects: Type::Row(vec![], None),
                 body: vec![spanned(Stmt::Return(expr_call(
                     "f",
@@ -235,6 +244,7 @@ fn test_prop_higher_order_apply() {
                         },
                     ],
                     ret_type: type_var("B"),
+                    requires: Type::Row(vec![], None),
                     effects: Type::Row(vec![], None),
                     body: vec![spanned(Stmt::Return(expr_call(
                         "f",
@@ -254,6 +264,7 @@ fn test_prop_higher_order_apply() {
                         typ: type_bool(),
                     }],
                     ret_type: type_i64(),
+                    requires: Type::Row(vec![], None),
                     effects: Type::Row(vec![], None),
                     body: vec![spanned(Stmt::Expr(spanned(Expr::If {
                         cond: Box::new(expr_var("arg0")),
@@ -270,6 +281,7 @@ fn test_prop_higher_order_apply() {
                     type_params: vec![],
                     params: vec![],
                     ret_type: type_i64(),
+                    requires: Type::Row(vec![], None),
                     effects: Type::Row(vec![], None),
                     body: vec![spanned(Stmt::Return(expr_call(
                         "apply",
@@ -306,6 +318,7 @@ fn test_prop_parametricity_violation() {
                     typ: type_var("T"),
                 }],
                 ret_type: type_var("T"),
+                requires: Type::Row(vec![], None),
                 effects: Type::Row(vec![], None),
                 body: vec![spanned(Stmt::Return(expr_lit_int(42)))],
             }),

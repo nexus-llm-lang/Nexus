@@ -69,6 +69,40 @@ pub fn checked_mut_ptr(ptr: i32, len: usize) -> Option<*mut u8> {
     Some(offset as *mut u8)
 }
 
+pub fn pack_ptr_len(ptr: i32, len: i32) -> i64 {
+    (((ptr as u32 as u64) << 32) | (len as u32 as u64)) as i64
+}
+
+pub fn store_string_result(s: String) -> i64 {
+    let bytes = s.into_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        return 0;
+    }
+
+    let Ok(len_i32) = i32::try_from(len) else {
+        return 0;
+    };
+
+    let ptr = allocate(len_i32);
+    if ptr == 0 {
+        return 0;
+    }
+
+    let Some(dst) = checked_mut_ptr(ptr, len) else {
+        // SAFETY: `ptr` was returned by `allocate(len_i32)` above.
+        unsafe { deallocate(ptr, len_i32) };
+        return 0;
+    };
+
+    // SAFETY: `dst` points to an allocated region of `len` bytes and source is valid for `len`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, len);
+    }
+
+    pack_ptr_len(ptr, len_i32)
+}
+
 pub fn allocate(size: i32) -> i32 {
     if size <= 0 {
         return 0;

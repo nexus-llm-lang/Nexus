@@ -8,6 +8,7 @@ mod bindings {
 
 use bindings::wasi::http::outgoing_handler;
 use bindings::wasi::http::types::{Fields, Method, OutgoingBody, OutgoingRequest, Scheme};
+use http::Uri;
 
 const MAX_HTTP_URL_BYTES: usize = 8 * 1024;
 const MAX_HTTP_HEADERS_BYTES: usize = 64 * 1024;
@@ -44,25 +45,35 @@ fn parse_method(method: &str) -> Method {
 
 fn parse_url(url: &str) -> Result<(Scheme, String, String), String> {
     let trimmed = url.trim();
-    let (scheme, rest) = if let Some(rest) = trimmed.strip_prefix("https://") {
-        (Scheme::Https, rest)
-    } else if let Some(rest) = trimmed.strip_prefix("http://") {
-        (Scheme::Http, rest)
-    } else {
-        return Err("unsupported URL scheme".to_string());
-    };
-    if rest.is_empty() {
-        return Err("missing authority".to_string());
+    if trimmed.is_empty() {
+        return Err("empty URL".to_string());
     }
-    let (authority, path) = if let Some((a, p)) = rest.split_once('/') {
-        (a, format!("/{}", p))
-    } else {
-        (rest, "/".to_string())
+
+    let uri: Uri = trimmed
+        .parse()
+        .map_err(|e| format!("invalid URL: {}", e))?;
+
+    let scheme = match uri.scheme_str() {
+        Some("https") => Scheme::Https,
+        Some("http") => Scheme::Http,
+        Some(other) => return Err(format!("unsupported URL scheme: {}", other)),
+        None => return Err("missing URL scheme".to_string()),
     };
+
+    let authority = uri
+        .authority()
+        .map(|authority| authority.as_str().to_string())
+        .ok_or_else(|| "missing authority".to_string())?;
     if authority.is_empty() {
         return Err("missing authority".to_string());
     }
-    Ok((scheme, authority.to_string(), path))
+
+    let path = uri
+        .path_and_query()
+        .map(|path| path.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+
+    Ok((scheme, authority, path))
 }
 
 fn parse_headers(headers: &str, authority: &str) -> Fields {

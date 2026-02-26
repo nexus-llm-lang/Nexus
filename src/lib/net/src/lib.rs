@@ -23,28 +23,6 @@ fn read_string_lossy(ptr: i32, len: i32) -> String {
     String::from_utf8_lossy(bytes).to_string()
 }
 
-fn store_string_result(s: String) -> i64 {
-    let bytes = s.into_bytes();
-    let len = bytes.len();
-    if len == 0 {
-        return 0;
-    }
-    let Ok(len_i32) = i32::try_from(len) else {
-        return 0;
-    };
-    let ptr = allocate(len_i32);
-    if ptr == 0 {
-        return 0;
-    }
-    let Some((offset, _)) = checked_ptr_len(ptr, len_i32) else {
-        return 0;
-    };
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), offset as *mut u8, len);
-    }
-    pack_ptr_len(ptr, len_i32)
-}
-
 #[link(wasm_import_module = "nexus:cli/nexus-host")]
 extern "C" {
     #[link_name = "host-http-request"]
@@ -59,6 +37,25 @@ extern "C" {
         body_len: i32,
         ret_ptr: i32,
     );
+
+    #[link_name = "host-http-listen"]
+    fn host_http_listen(addr_ptr: i32, addr_len: i32) -> i64;
+
+    #[link_name = "host-http-accept"]
+    fn host_http_accept(server_id: i64, ret_ptr: i32);
+
+    #[link_name = "host-http-respond"]
+    fn host_http_respond(
+        req_id: i64,
+        status: i64,
+        headers_ptr: i32,
+        headers_len: i32,
+        body_ptr: i32,
+        body_len: i32,
+    ) -> i32;
+
+    #[link_name = "host-http-stop"]
+    fn host_http_stop(server_id: i64) -> i32;
 }
 
 #[no_mangle]
@@ -72,7 +69,7 @@ pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
 }
 
 #[no_mangle]
-pub extern "C" fn print(ptr: i32, len: i32) {
+pub extern "C" fn __nx_print(ptr: i32, len: i32) {
     let Some((offset, len)) = checked_ptr_len(ptr, len) else {
         return;
     };
@@ -83,9 +80,9 @@ pub extern "C" fn print(ptr: i32, len: i32) {
 }
 
 #[no_mangle]
-pub extern "C" fn http_get(url_ptr: i32, url_len: i32) -> i64 {
+pub extern "C" fn __nx_http_get(url_ptr: i32, url_len: i32) -> i64 {
     const GET: &[u8] = b"GET";
-    http_request(
+    __nx_http_request(
         GET.as_ptr() as i32,
         GET.len() as i32,
         url_ptr,
@@ -98,7 +95,7 @@ pub extern "C" fn http_get(url_ptr: i32, url_len: i32) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn http_request(
+pub extern "C" fn __nx_http_request(
     method_ptr: i32,
     method_len: i32,
     url_ptr: i32,
@@ -167,7 +164,50 @@ pub extern "C" fn __nx_string_substring(s_ptr: i32, s_len: i32, start: i64, len:
     let start = start.max(0) as usize;
     let len = len.max(0) as usize;
     let result: String = s.chars().skip(start).take(len).collect();
-    store_string_result(result)
+    nexus_wasm_alloc::store_string_result(result)
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_http_listen(addr_ptr: i32, addr_len: i32) -> i64 {
+    if checked_ptr_len(addr_ptr, addr_len).is_none() {
+        return -1;
+    }
+    unsafe { host_http_listen(addr_ptr, addr_len) }
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_http_accept(server_id: i64) -> i64 {
+    let mut ret = [0_i32; 2];
+    unsafe {
+        host_http_accept(server_id, ret.as_mut_ptr() as i32);
+    }
+    if !has_valid_optional_region(ret[0], ret[1]) {
+        return 0;
+    }
+    pack_ptr_len(ret[0], ret[1])
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_http_respond(
+    req_id: i64,
+    status: i64,
+    headers_ptr: i32,
+    headers_len: i32,
+    body_ptr: i32,
+    body_len: i32,
+) -> i32 {
+    if !has_valid_optional_region(headers_ptr, headers_len) {
+        return 0;
+    }
+    if !has_valid_optional_region(body_ptr, body_len) {
+        return 0;
+    }
+    unsafe { host_http_respond(req_id, status, headers_ptr, headers_len, body_ptr, body_len) }
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_http_stop(server_id: i64) -> i32 {
+    unsafe { host_http_stop(server_id) }
 }
 
 fn pack_ptr_len(ptr: i32, len: i32) -> i64 {

@@ -33,6 +33,7 @@ fn color_program_with_cases(case_ctors: &[&str]) -> Program {
             sp(TopLevel::Enum(EnumDef {
                 name: "Color".to_string(),
                 is_public: false,
+                is_opaque: false,
                 type_params: vec![],
                 variants: vec![
                     VariantDef {
@@ -57,7 +58,7 @@ fn color_program_with_cases(case_ctors: &[&str]) -> Program {
                     type_params: vec![],
                     params: vec![],
                     ret_type: Type::Unit,
-                    effects: Type::Row(vec![], None),
+                    requires: Type::Row(vec![], None), effects: Type::Row(vec![], None),
                     body: vec![
                         sp(Stmt::Let {
                             name: "c".to_string(),

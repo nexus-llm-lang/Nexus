@@ -1,14 +1,13 @@
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use chumsky::Parser as _;
 use clap::{Parser, Subcommand};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
-use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasm_compose::{
     composer::ComponentComposer,
@@ -54,21 +53,15 @@ enum Command {
     Build {
         /// Nexus source file path. Use '-' to read from stdin.
         input: Option<PathBuf>,
-        /// Output path (packed executable by default, or wasm with --wasm).
+        /// Output path (packed executable by default, or component wasm with --wasm).
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Emit a component-model wasm instead of a packed executable.
+        /// Emit a component-model wasm instead of an executable.
         #[arg(long)]
         wasm: bool,
-    },
-    /// Build a single executable by embedding bundled component wasm into the current nexus binary.
-    /// If no file is passed and stdin is piped, reads script from stdin.
-    Pack {
-        /// Nexus source file path. Use '-' to read from stdin.
-        input: Option<PathBuf>,
-        /// Output executable path.
-        #[arg(short, long)]
-        output: Option<PathBuf>,
+        /// Override `wasm-merge` executable path for `--wasm` dependency bundling.
+        #[arg(long, value_name = "PATH")]
+        wasm_merge: Option<PathBuf>,
     },
     /// Parse and typecheck only.
     /// If no file is passed and stdin is piped, reads script from stdin.
@@ -81,16 +74,17 @@ enum Command {
 struct LoadedSource {
     display_name: String,
     source: String,
-    source_path: Option<PathBuf>,
 }
 
 const WASI_SNAPSHOT_MODULE: &str = "wasi_snapshot_preview1";
 const NEXUS_HOST_HTTP_MODULE: &str = "nexus:cli/nexus-host";
+const WASM_MERGE_PATH_ENV: &str = "NEXUS_WASM_MERGE";
 const WASM_MERGE_MAIN_NAME: &str = "__nexus_main__";
-const MAX_BUNDLE_STEPS: usize = 128;
 const PACK_MAGIC: &[u8; 16] = b"NEXUS_PACK_WASM!";
 const PACK_TRAILER_LEN: usize = 8 + PACK_MAGIC.len();
-static TOOL_AVAILABILITY_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+const PACK_BUNDLE_MAGIC: &[u8; 16] = b"NEXUS_PACK_BNDL!";
+const PACK_BUNDLE_TRAILER_LEN: usize = 8 + PACK_BUNDLE_MAGIC.len();
+const PACK_BUNDLE_VERSION: u32 = 1;
 
 fn is_preview2_wasi_module(module_name: &str) -> bool {
     module_name.starts_with("wasi:")
@@ -127,8 +121,8 @@ fn main() -> ExitCode {
             input,
             output,
             wasm,
-        }) => build_command(input, output, wasm),
-        Some(Command::Pack { input, output }) => pack_command(input, output),
+            wasm_merge,
+        }) => build_command(input, output, wasm, wasm_merge),
         Some(Command::Check { input }) => check_command(input),
         None => {
             if io::stdin().is_terminal() {
@@ -188,13 +182,34 @@ fn run_command(input: Option<PathBuf>, capabilities: ExecutionCapabilities) -> E
 fn maybe_run_embedded_wasm() -> Option<ExitCode> {
     let exe_path = std::env::current_exe().ok()?;
     let exe_bytes = fs::read(&exe_path).ok()?;
-    let (_, wasm) = split_embedded_wasm(&exe_bytes)?;
-    let capabilities = match parse_packed_runtime_capabilities_from_env() {
+    if let Some((_, embedded_bundle)) = split_embedded_bundle(&exe_bytes) {
+        let (main_wasm, embedded_modules) = match parse_embedded_bundle(embedded_bundle) {
+            Ok(bundle) => bundle,
+            Err(msg) => {
+                eprintln!("Packed runtime decode error: {}", msg);
+                return Some(ExitCode::from(1));
+            }
+        };
+        let capabilities = match parse_runtime_capabilities_from_env() {
+            Ok(capabilities) => capabilities,
+            Err(code) => return Some(code),
+        };
+        return Some(runtime::wasm_exec::run_core_wasm_with_embedded_modules(
+            &main_wasm,
+            &embedded_modules,
+            exe_path.parent(),
+            &capabilities,
+        ));
+    }
+
+    let (_, embedded) = split_embedded_wasm(&exe_bytes)?;
+    let wasm = embedded.to_vec();
+    let capabilities = match parse_runtime_capabilities_from_env() {
         Ok(capabilities) => capabilities,
         Err(code) => return Some(code),
     };
     Some(runtime::wasm_exec::run_wasm_bytes(
-        wasm,
+        &wasm,
         exe_path.parent(),
         &capabilities,
     ))
@@ -215,10 +230,10 @@ fn build_execution_capabilities(
     Ok(capabilities)
 }
 
-fn parse_packed_runtime_capabilities_from_env() -> Result<ExecutionCapabilities, ExitCode> {
+fn parse_runtime_capabilities_from_env() -> Result<ExecutionCapabilities, ExitCode> {
     let program_name = std::env::args()
         .next()
-        .unwrap_or_else(|| "nexus-packed".to_string());
+        .unwrap_or_else(|| "nexus-component-runner".to_string());
     let mut allow_fs = false;
     let mut preopen_dirs = Vec::<PathBuf>::new();
     let mut args = std::env::args_os().skip(1).peekable();
@@ -229,7 +244,7 @@ fn parse_packed_runtime_capabilities_from_env() -> Result<ExecutionCapabilities,
             "--allow-fs" => allow_fs = true,
             "--preopen" => {
                 let Some(dir) = args.next() else {
-                    eprintln!("Packed runtime argument error: `--preopen` requires a directory");
+                    eprintln!("Runtime argument error: `--preopen` requires a directory");
                     eprintln!("Usage: {} [--allow-fs] [--preopen <dir>]...", program_name);
                     return Err(ExitCode::from(1));
                 };
@@ -246,10 +261,7 @@ fn parse_packed_runtime_capabilities_from_env() -> Result<ExecutionCapabilities,
                     preopen_dirs.push(PathBuf::from(dir));
                     continue;
                 }
-                eprintln!(
-                    "Packed runtime argument error: unknown argument '{}'",
-                    arg_string
-                );
+                eprintln!("Runtime argument error: unknown argument '{}'", arg_string);
                 eprintln!("Usage: {} [--allow-fs] [--preopen <dir>]...", program_name);
                 return Err(ExitCode::from(1));
             }
@@ -259,18 +271,18 @@ fn parse_packed_runtime_capabilities_from_env() -> Result<ExecutionCapabilities,
     match build_execution_capabilities(allow_fs, preopen_dirs) {
         Ok(capabilities) => Ok(capabilities),
         Err(msg) => {
-            eprintln!("Packed runtime argument error: {}", msg);
+            eprintln!("Runtime argument error: {}", msg);
             Err(ExitCode::from(1))
         }
     }
 }
 
-fn build_command(input: Option<PathBuf>, output: Option<PathBuf>, wasm: bool) -> ExitCode {
-    if !wasm {
-        let output = output.or_else(|| Some(default_build_output_path()));
-        return pack_command(input, output);
-    }
-
+fn build_command(
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    wasm: bool,
+    wasm_merge: Option<PathBuf>,
+) -> ExitCode {
     let loaded = match load_source(input) {
         Ok(loaded) => loaded,
         Err(msg) => {
@@ -278,42 +290,50 @@ fn build_command(input: Option<PathBuf>, output: Option<PathBuf>, wasm: bool) ->
             return ExitCode::from(1);
         }
     };
-    let core_wasm = match compile_loaded_source_to_wasm(&loaded, true, true) {
-        Ok(wasm) => wasm,
-        Err(code) => return code,
-    };
-    let wasm = match encode_core_wasm_as_component(&core_wasm) {
-        Ok(component_wasm) => component_wasm,
-        Err(msg) => {
-            eprintln!("Component Encode Error: {}", msg);
-            return ExitCode::from(1);
-        }
-    };
 
-    let output_path = output.unwrap_or_else(default_wasm_output_path);
-    if let Err(e) = fs::write(&output_path, wasm) {
-        eprintln!("Failed to write {}: {}", output_path.display(), e);
+    if !wasm && wasm_merge.is_some() {
+        eprintln!("Build Error: `--wasm-merge` can be used only with `--wasm`.");
         return ExitCode::from(1);
     }
-    ExitCode::SUCCESS
-}
 
-fn pack_command(input: Option<PathBuf>, output: Option<PathBuf>) -> ExitCode {
-    let loaded = match load_source(input) {
-        Ok(loaded) => loaded,
-        Err(msg) => {
-            eprintln!("{}", msg);
+    if wasm {
+        let wasm_merge_command = resolve_wasm_merge_command(wasm_merge.as_deref());
+        let core_wasm = match compile_loaded_source_to_wasm(&loaded, true, &wasm_merge_command) {
+            Ok(wasm) => wasm,
+            Err(code) => return code,
+        };
+        let component_wasm = match encode_core_wasm_as_component(&core_wasm) {
+            Ok(component_wasm) => component_wasm,
+            Err(msg) => {
+                eprintln!("Component Encode Error: {}", msg);
+                return ExitCode::from(1);
+            }
+        };
+        let output_path = output.unwrap_or_else(default_wasm_output_path);
+        if let Err(e) = fs::write(&output_path, component_wasm) {
+            eprintln!("Failed to write {}: {}", output_path.display(), e);
             return ExitCode::from(1);
         }
-    };
-    let core_wasm = match compile_loaded_source_to_wasm(&loaded, true, false) {
+        return ExitCode::SUCCESS;
+    }
+
+    let output_path = output.unwrap_or_else(default_build_output_path);
+    if output_path.extension().is_some_and(|ext| ext == "wasm") {
+        eprintln!(
+            "Build Error: output '{}' looks like wasm; use `--wasm` to emit component wasm",
+            output_path.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    let core_wasm = match compile_loaded_source_to_core_wasm(&loaded) {
         Ok(wasm) => wasm,
         Err(code) => return code,
     };
-    let wasm = match encode_core_wasm_as_component(&core_wasm) {
-        Ok(component_wasm) => component_wasm,
+    let embedded_modules = match collect_file_backed_dependency_modules(&core_wasm, false) {
+        Ok(modules) => modules,
         Err(msg) => {
-            eprintln!("Component Encode Error: {}", msg);
+            eprintln!("Link Error: {}", msg);
             return ExitCode::from(1);
         }
     };
@@ -336,15 +356,21 @@ fn pack_command(input: Option<PathBuf>, output: Option<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let base_exe = match split_embedded_wasm(&exe_bytes) {
-        Some((base, _)) => base.to_vec(),
-        None => exe_bytes,
+    let base_exe = if let Some((base, _)) = split_embedded_bundle(&exe_bytes) {
+        base.to_vec()
+    } else if let Some((base, _)) = split_embedded_wasm(&exe_bytes) {
+        base.to_vec()
+    } else {
+        exe_bytes
     };
-
-    let output_path =
-        output.unwrap_or_else(|| default_packed_output_path(loaded.source_path.as_deref()));
-    let packed = append_embedded_wasm(&base_exe, &wasm);
-    if let Err(e) = fs::write(&output_path, packed) {
+    let packed_executable = match append_embedded_bundle(&base_exe, &core_wasm, &embedded_modules) {
+        Ok(packed) => packed,
+        Err(msg) => {
+            eprintln!("Pack Error: {}", msg);
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = fs::write(&output_path, packed_executable) {
         eprintln!(
             "Failed to write packed executable {}: {}",
             output_path.display(),
@@ -394,7 +420,6 @@ fn load_source(input: Option<PathBuf>) -> Result<LoadedSource, String> {
         return Ok(LoadedSource {
             display_name: path.display().to_string(),
             source,
-            source_path: Some(path),
         });
     }
 
@@ -412,7 +437,6 @@ fn read_source_from_stdin() -> Result<LoadedSource, String> {
     Ok(LoadedSource {
         display_name: "<stdin>".to_string(),
         source: buf,
-        source_path: None,
     })
 }
 
@@ -439,18 +463,19 @@ fn default_wasm_output_path() -> PathBuf {
     PathBuf::from("main.wasm")
 }
 
-fn default_packed_output_path(input_path: Option<&Path>) -> PathBuf {
-    match input_path {
-        Some(path) => path.with_extension(""),
-        None => PathBuf::from("app"),
+fn resolve_wasm_merge_command(cli_override: Option<&Path>) -> PathBuf {
+    if let Some(path) = cli_override {
+        return path.to_path_buf();
     }
+    if let Some(path) = std::env::var_os(WASM_MERGE_PATH_ENV) {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    PathBuf::from("wasm-merge")
 }
 
-fn compile_loaded_source_to_wasm(
-    loaded: &LoadedSource,
-    allow_nexus_host_import: bool,
-    allow_unresolved_file_imports: bool,
-) -> Result<Vec<u8>, ExitCode> {
+fn compile_loaded_source_to_core_wasm(loaded: &LoadedSource) -> Result<Vec<u8>, ExitCode> {
     let src = strip_shebang(loaded.source.clone());
     let program = match parse_program(&loaded.display_name, &src) {
         Some(p) => p,
@@ -460,22 +485,29 @@ fn compile_loaded_source_to_wasm(
         return Err(ExitCode::from(1));
     }
 
-    let wasm = match compiler::codegen::compile_program_to_wasm(&program) {
-        Ok(wasm) => wasm,
+    match compiler::codegen::compile_program_to_wasm(&program) {
+        Ok(wasm) => Ok(wasm),
         Err(compiler::codegen::CompileError::Lower(e)) => {
             report_lower_error(&loaded.display_name, &src, &e);
-            return Err(ExitCode::from(1));
+            Err(ExitCode::from(1))
         }
         Err(compiler::codegen::CompileError::Codegen(e)) => {
             eprintln!("Codegen Error: {}", e);
-            return Err(ExitCode::from(1));
+            Err(ExitCode::from(1))
         }
+    }
+}
+
+fn compile_loaded_source_to_wasm(
+    loaded: &LoadedSource,
+    allow_nexus_host_import: bool,
+    wasm_merge_command: &Path,
+) -> Result<Vec<u8>, ExitCode> {
+    let wasm = match compile_loaded_source_to_core_wasm(loaded) {
+        Ok(wasm) => wasm,
+        Err(code) => return Err(code),
     };
-    match bundle_external_imports(
-        &wasm,
-        allow_nexus_host_import,
-        allow_unresolved_file_imports,
-    ) {
+    match bundle_external_imports(&wasm, allow_nexus_host_import, wasm_merge_command) {
         Ok(wasm) => Ok(wasm),
         Err(msg) => {
             eprintln!("Bundle Error: {}", msg);
@@ -653,14 +685,17 @@ fn encode_core_wasm_as_component(core_wasm: &[u8]) -> Result<Vec<u8>, String> {
         "package wasi:cli@0.2.6;\n\ninterface run {\n  run: func() -> result;\n}\n";
 
     let mut resolve = Resolve::default();
+    let wasi_cli_package_id = resolve
+        .push_str("wasi_cli_run.wit", wasi_cli_run_wit_source)
+        .map_err(|e| format!("failed to parse wasi:cli/run WIT package: {}", e))?;
     let app_package_id = resolve
         .push_str("app.wit", &wit_source)
         .map_err(|e| format!("failed to parse app WIT world: {}", e))?;
-    let _wasi_cli_package_id = resolve
-        .push_str("wasi_cli_run.wit", wasi_cli_run_wit_source)
-        .map_err(|e| format!("failed to parse wasi:cli/run WIT package: {}", e))?;
     let world = resolve
-        .select_world(&[app_package_id], Some("app"))
+        .select_world(
+            &[app_package_id, wasi_cli_package_id],
+            Some("nexus:cli/app"),
+        )
         .map_err(|e| format!("failed to resolve WIT world 'app': {}", e))?;
 
     let mut embedded = core_wasm.to_vec();
@@ -688,6 +723,132 @@ fn encode_core_wasm_as_component(core_wasm: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+fn append_embedded_bundle(
+    exe: &[u8],
+    main_wasm: &[u8],
+    modules: &BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<u8>, String> {
+    let main_len = u32::try_from(main_wasm.len())
+        .map_err(|_| "main wasm exceeds 4GiB and cannot be packed".to_string())?;
+    let module_count = u32::try_from(modules.len())
+        .map_err(|_| "module count exceeds u32 and cannot be packed".to_string())?;
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&PACK_BUNDLE_VERSION.to_le_bytes());
+    payload.extend_from_slice(&main_len.to_le_bytes());
+    payload.extend_from_slice(main_wasm);
+    payload.extend_from_slice(&module_count.to_le_bytes());
+    for (module_name, module_wasm) in modules {
+        let name_bytes = module_name.as_bytes();
+        let name_len = u32::try_from(name_bytes.len()).map_err(|_| {
+            format!(
+                "module name '{}' exceeds u32 length and cannot be packed",
+                module_name
+            )
+        })?;
+        let wasm_len = u32::try_from(module_wasm.len())
+            .map_err(|_| format!("module '{}' exceeds 4GiB and cannot be packed", module_name))?;
+        payload.extend_from_slice(&name_len.to_le_bytes());
+        payload.extend_from_slice(name_bytes);
+        payload.extend_from_slice(&wasm_len.to_le_bytes());
+        payload.extend_from_slice(module_wasm);
+    }
+
+    let payload_len = u64::try_from(payload.len())
+        .map_err(|_| "packed payload exceeds u64 and cannot be encoded".to_string())?;
+    let mut out = Vec::with_capacity(exe.len() + payload.len() + PACK_BUNDLE_TRAILER_LEN);
+    out.extend_from_slice(exe);
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(PACK_BUNDLE_MAGIC);
+    Ok(out)
+}
+
+fn split_embedded_bundle(blob: &[u8]) -> Option<(&[u8], &[u8])> {
+    if blob.len() < PACK_BUNDLE_TRAILER_LEN {
+        return None;
+    }
+    let magic_start = blob.len() - PACK_BUNDLE_MAGIC.len();
+    if &blob[magic_start..] != PACK_BUNDLE_MAGIC {
+        return None;
+    }
+    let len_end = magic_start;
+    let len_start = len_end.checked_sub(8)?;
+    let mut len_bytes = [0u8; 8];
+    len_bytes.copy_from_slice(&blob[len_start..len_end]);
+    let payload_len = usize::try_from(u64::from_le_bytes(len_bytes)).ok()?;
+    if payload_len > len_start {
+        return None;
+    }
+    let payload_start = len_start - payload_len;
+    Some((&blob[..payload_start], &blob[payload_start..len_start]))
+}
+
+fn parse_embedded_bundle(payload: &[u8]) -> Result<(Vec<u8>, HashMap<String, Vec<u8>>), String> {
+    fn read_u32(payload: &[u8], cursor: &mut usize) -> Result<u32, String> {
+        let end = cursor
+            .checked_add(4)
+            .ok_or_else(|| "embedded bundle decode overflow".to_string())?;
+        let bytes = payload
+            .get(*cursor..end)
+            .ok_or_else(|| "embedded bundle is truncated".to_string())?;
+        let mut array = [0u8; 4];
+        array.copy_from_slice(bytes);
+        *cursor = end;
+        Ok(u32::from_le_bytes(array))
+    }
+
+    fn read_bytes<'a>(
+        payload: &'a [u8],
+        cursor: &mut usize,
+        len: usize,
+    ) -> Result<&'a [u8], String> {
+        let end = cursor
+            .checked_add(len)
+            .ok_or_else(|| "embedded bundle decode overflow".to_string())?;
+        let bytes = payload
+            .get(*cursor..end)
+            .ok_or_else(|| "embedded bundle is truncated".to_string())?;
+        *cursor = end;
+        Ok(bytes)
+    }
+
+    let mut cursor = 0usize;
+    let version = read_u32(payload, &mut cursor)?;
+    if version != PACK_BUNDLE_VERSION {
+        return Err(format!(
+            "unsupported packed bundle version {}; expected {}",
+            version, PACK_BUNDLE_VERSION
+        ));
+    }
+
+    let main_len = usize::try_from(read_u32(payload, &mut cursor)?)
+        .map_err(|_| "main wasm length overflows usize".to_string())?;
+    let main_wasm = read_bytes(payload, &mut cursor, main_len)?.to_vec();
+
+    let module_count = usize::try_from(read_u32(payload, &mut cursor)?)
+        .map_err(|_| "module count overflows usize".to_string())?;
+    let mut modules = HashMap::new();
+    for _ in 0..module_count {
+        let name_len = usize::try_from(read_u32(payload, &mut cursor)?)
+            .map_err(|_| "module name length overflows usize".to_string())?;
+        let name_bytes = read_bytes(payload, &mut cursor, name_len)?;
+        let module_name = std::str::from_utf8(name_bytes)
+            .map_err(|e| format!("invalid utf-8 in module name: {}", e))?
+            .to_string();
+        let wasm_len = usize::try_from(read_u32(payload, &mut cursor)?)
+            .map_err(|_| "module wasm length overflows usize".to_string())?;
+        let module_wasm = read_bytes(payload, &mut cursor, wasm_len)?.to_vec();
+        modules.insert(module_name, module_wasm);
+    }
+
+    if cursor != payload.len() {
+        return Err("embedded bundle has unexpected trailing bytes".to_string());
+    }
+    Ok((main_wasm, modules))
+}
+
+#[cfg(test)]
 fn append_embedded_wasm(exe: &[u8], wasm: &[u8]) -> Vec<u8> {
     let wasm_len = u64::try_from(wasm.len()).unwrap_or(u64::MAX);
     let mut out = Vec::with_capacity(exe.len() + wasm.len() + PACK_TRAILER_LEN);
@@ -734,55 +895,91 @@ fn copy_executable_permissions(source_exe: &Path, output_path: &Path) -> Result<
     Ok(())
 }
 
+fn collect_file_backed_dependency_modules(
+    wasm: &[u8],
+    allow_nexus_host_import: bool,
+) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let imports = module_import_names(wasm)?;
+    let mut queue = VecDeque::new();
+    for module_name in file_backed_imports(&imports, allow_nexus_host_import)? {
+        queue.push_back(module_name);
+    }
+    let mut modules = BTreeMap::new();
+
+    while let Some(module_name) = queue.pop_front() {
+        if modules.contains_key(&module_name) {
+            continue;
+        }
+        let module_bytes = fs::read(&module_name)
+            .map_err(|e| format!("failed to read dependency module '{}': {}", module_name, e))?;
+        let dep_imports = module_import_names(&module_bytes)?;
+        for dep in file_backed_imports(&dep_imports, allow_nexus_host_import)? {
+            if !modules.contains_key(&dep) {
+                queue.push_back(dep);
+            }
+        }
+        modules.insert(module_name, module_bytes);
+    }
+
+    Ok(modules)
+}
+
 fn bundle_external_imports(
     wasm: &[u8],
     allow_nexus_host_import: bool,
-    allow_unresolved_file_imports: bool,
+    wasm_merge_command: &Path,
 ) -> Result<Vec<u8>, String> {
-    let mut current = wasm.to_vec();
-    let mut attempts: HashMap<String, usize> = HashMap::new();
-    let wasm_merge_available = tool_is_available("wasm-merge")?;
+    let imports = module_import_names(wasm)?;
+    let unresolved = file_backed_imports(&imports, allow_nexus_host_import)?;
+    if unresolved.is_empty() {
+        return Ok(wasm.to_vec());
+    }
+    let candidate_modules = bundle_candidate_modules(&unresolved, allow_nexus_host_import)?;
+    let merged = merge_dependencies_once(wasm, &candidate_modules, wasm_merge_command)?;
+    let merged_imports = module_import_names(&merged)?;
+    let merged_unresolved = file_backed_imports(&merged_imports, allow_nexus_host_import)?;
+    if !merged_unresolved.is_empty() {
+        let unresolved_list = merged_unresolved
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "failed to resolve imports while bundling; unresolved after internal linker pass: {}",
+            unresolved_list
+        ));
+    }
+    Ok(merged)
+}
 
-    for _ in 0..MAX_BUNDLE_STEPS {
-        let imports = module_import_names(&current)?;
-        let unresolved = file_backed_imports(&imports, allow_nexus_host_import)?;
-        if unresolved.is_empty() {
-            return Ok(current);
-        }
-
-        if !wasm_merge_available {
-            if allow_unresolved_file_imports {
-                let unresolved_list = unresolved.into_iter().collect::<Vec<_>>().join(", ");
-                eprintln!(
-                    "Bundle Warning: 'wasm-merge' not found; keeping unresolved file-backed imports: {}",
-                    unresolved_list
-                );
-                return Ok(current);
-            }
-            return Err(
-                "'wasm-merge' command not found; required for packed outputs with external module imports"
-                    .to_string(),
-            );
-        }
-        let module_name = unresolved.iter().next().cloned().ok_or_else(|| {
-            "codegen internal error: unresolved import set unexpectedly empty".to_string()
+fn bundle_candidate_modules(
+    unresolved: &BTreeSet<String>,
+    allow_nexus_host_import: bool,
+) -> Result<Vec<String>, String> {
+    let mut leaf = Vec::new();
+    let mut non_leaf = Vec::new();
+    for candidate in unresolved.iter().rev() {
+        let candidate_wasm = fs::read(candidate).map_err(|e| {
+            format!(
+                "failed to read dependency module '{}' while resolving bundle order: {}",
+                candidate, e
+            )
         })?;
-        let count = attempts.entry(module_name.clone()).or_insert(0);
-        if *count >= 2 {
-            return Err(format!(
-                "failed to resolve import module '{}' while bundling; import remains unresolved after merge",
-                module_name
-            ));
+        let candidate_imports = module_import_names(&candidate_wasm)?;
+        let candidate_unresolved =
+            file_backed_imports(&candidate_imports, allow_nexus_host_import)?;
+        let depends_on_other_unresolved = candidate_unresolved
+            .iter()
+            .any(|dep| dep != candidate && unresolved.contains(dep));
+        if depends_on_other_unresolved {
+            non_leaf.push(candidate.clone());
+        } else {
+            leaf.push(candidate.clone());
         }
-        *count += 1;
-
-        current = merge_single_dependency(&current, &module_name)?;
     }
 
-    Err(format!(
-        "failed to bundle external imports within {} merge steps",
-        MAX_BUNDLE_STEPS
-    ))
+    leaf.extend(non_leaf);
+    Ok(leaf)
 }
 
 fn module_import_names(wasm: &[u8]) -> Result<BTreeSet<String>, String> {
@@ -833,39 +1030,11 @@ fn file_backed_imports(
     Ok(out)
 }
 
-fn tool_is_available(tool: &str) -> Result<bool, String> {
-    let cache = TOOL_AVAILABILITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(cached) = guard.get(tool) {
-            return Ok(*cached);
-        }
-    }
-
-    match ProcessCommand::new(tool).arg("--help").output() {
-        Ok(_) => {
-            if let Ok(mut guard) = cache.lock() {
-                guard.insert(tool.to_string(), true);
-            }
-            Ok(true)
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            if let Ok(mut guard) = cache.lock() {
-                guard.insert(tool.to_string(), false);
-            }
-            Ok(false)
-        }
-        Err(e) => Err(format!("failed to execute '{}': {}", tool, e)),
-    }
-}
-
-fn merge_single_dependency(current_wasm: &[u8], module_name: &str) -> Result<Vec<u8>, String> {
-    let dep_path = PathBuf::from(module_name).canonicalize().map_err(|e| {
-        format!(
-            "failed to resolve import module '{}' as a filesystem path: {}",
-            module_name, e
-        )
-    })?;
-
+fn merge_dependencies_once(
+    current_wasm: &[u8],
+    module_names: &[String],
+    wasm_merge_command: &Path,
+) -> Result<Vec<u8>, String> {
     let temp_dir = std::env::temp_dir().join(format!(
         "nexus-bundle-{}-{}",
         std::process::id(),
@@ -882,36 +1051,50 @@ fn merge_single_dependency(current_wasm: &[u8], module_name: &str) -> Result<Vec
     fs::write(&current_path, current_wasm)
         .map_err(|e| format!("failed to write temporary wasm: {}", e))?;
 
-    let output = ProcessCommand::new("wasm-merge")
-        .arg(&current_path)
-        .arg(WASM_MERGE_MAIN_NAME)
-        .arg(&dep_path)
-        .arg(module_name)
+    let mut command = ProcessCommand::new(wasm_merge_command);
+    command.arg(&current_path).arg(WASM_MERGE_MAIN_NAME);
+    for module_name in module_names {
+        let dep_path = PathBuf::from(module_name).canonicalize().map_err(|e| {
+            format!(
+                "failed to resolve import module '{}' as a filesystem path: {}",
+                module_name, e
+            )
+        })?;
+        command.arg(dep_path).arg(module_name);
+    }
+    command
         .arg("--all-features")
         .arg("-o")
         .arg(&merged_path)
-        .arg("--skip-export-conflicts")
-        .output()
-        .map_err(|e| format!("failed to execute wasm-merge: {}", e))?;
+        .arg("--skip-export-conflicts");
 
+    let output = command.output().map_err(|e| {
+        format!(
+            "failed to execute '{}' while bundling dependencies: {} (use `--wasm-merge PATH` or {} env var)",
+            wasm_merge_command.display(),
+            e,
+            WASM_MERGE_PATH_ENV
+        )
+    })?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let _ = fs::remove_dir_all(&temp_dir);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        let detail = if stderr.is_empty() {
+            format!("exit status {}", output.status)
+        } else {
+            format!("exit status {}: {}", output.status, stderr)
+        };
         return Err(format!(
-            "wasm-merge failed while bundling '{}': {}\n{}",
-            module_name,
-            stderr.trim(),
-            stdout.trim()
+            "external wasm linker '{}' failed while bundling [{}] ({})",
+            wasm_merge_command.display(),
+            module_names.join(", "),
+            detail
         ));
     }
 
-    let merged = fs::read(&merged_path).map_err(|e| {
-        format!(
-            "failed to read merged wasm for dependency '{}': {}",
-            module_name, e
-        )
-    })?;
+    let merged =
+        fs::read(&merged_path).map_err(|e| format!("failed to read merged wasm output: {}", e))?;
     let _ = fs::remove_dir_all(&temp_dir);
     Ok(merged)
 }
@@ -944,7 +1127,22 @@ fn parse_program(filename: &str, src: &str) -> Option<lang::ast::Program> {
 fn typecheck_program(filename: &str, src: &str, program: &lang::ast::Program) -> bool {
     let mut checker = lang::typecheck::TypeChecker::new();
     match checker.check_program(program) {
-        Ok(_) => true,
+        Ok(_) => {
+            for warning in checker.take_warnings() {
+                let report = Report::build(ReportKind::Warning, filename, warning.span.start)
+                    .with_message(warning.message.clone())
+                    .with_label(
+                        Label::new((filename, warning.span))
+                            .with_message(warning.message)
+                            .with_color(Color::Yellow),
+                    )
+                    .finish();
+                if let Err(print_err) = report.print((filename, Source::from(src))) {
+                    eprintln!("Failed to render type warning: {}", print_err);
+                }
+            }
+            true
+        }
         Err(e) => {
             let report = Report::build(ReportKind::Error, filename, e.span.start)
                 .with_message(e.message.clone())
@@ -983,6 +1181,47 @@ fn report_lower_error(filename: &str, src: &str, err: &compiler::lower::LowerErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_bundle_roundtrip() {
+        let exe = b"nexus-binary";
+        let main_wasm = b"\0asm\x01\0\0\0main";
+        let mut modules = BTreeMap::new();
+        modules.insert(
+            "nxlib/stdlib/stdio.wasm".to_string(),
+            b"\0asm\x01\0\0\0stdio".to_vec(),
+        );
+        modules.insert(
+            "nxlib/stdlib/core.wasm".to_string(),
+            b"\0asm\x01\0\0\0core".to_vec(),
+        );
+        let packed =
+            append_embedded_bundle(exe, main_wasm, &modules).expect("bundle should be encodable");
+        let (base, payload) =
+            split_embedded_bundle(&packed).expect("packed buffer should contain embedded bundle");
+        assert_eq!(base, exe);
+        let (decoded_main, decoded_modules) =
+            parse_embedded_bundle(payload).expect("bundle payload should decode");
+        assert_eq!(decoded_main, main_wasm);
+        assert_eq!(
+            decoded_modules
+                .get("nxlib/stdlib/stdio.wasm")
+                .map(|m| m.as_slice()),
+            Some(&b"\0asm\x01\0\0\0stdio"[..])
+        );
+        assert_eq!(
+            decoded_modules
+                .get("nxlib/stdlib/core.wasm")
+                .map(|m| m.as_slice()),
+            Some(&b"\0asm\x01\0\0\0core"[..])
+        );
+    }
+
+    #[test]
+    fn split_embedded_bundle_rejects_invalid_trailer() {
+        let blob = b"not-packed-bundle";
+        assert!(split_embedded_bundle(blob).is_none());
+    }
 
     #[test]
     fn embedded_wasm_roundtrip() {
@@ -1036,7 +1275,26 @@ mod tests {
     }
 
     #[test]
-    fn cli_build_defaults_to_pack_mode_without_wasm_flag() {
+    fn cli_build_wasm_merge_flag_is_supported() {
+        let cli = Cli::try_parse_from([
+            "nexus",
+            "build",
+            "example.nx",
+            "--wasm",
+            "--wasm-merge",
+            "/opt/bin/wasm-merge",
+        ])
+        .expect("`--wasm-merge` should be accepted");
+        match cli.command {
+            Some(Command::Build { wasm_merge, .. }) => {
+                assert_eq!(wasm_merge, Some(PathBuf::from("/opt/bin/wasm-merge")));
+            }
+            other => panic!("unexpected parsed command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_build_defaults_to_executable_mode_without_wasm_flag() {
         let cli = Cli::try_parse_from(["nexus", "build", "example.nx"])
             .expect("plain build should be accepted");
         match cli.command {
@@ -1058,13 +1316,25 @@ mod tests {
     }
 
     #[test]
-    fn cli_pack_component_flag_is_rejected() {
-        let err = Cli::try_parse_from(["nexus", "pack", "example.nx", "--component"])
-            .expect_err("`pack --component` should not be accepted");
+    fn cli_pack_subcommand_is_rejected() {
+        let err = Cli::try_parse_from(["nexus", "pack", "example.nx"])
+            .expect_err("`pack` subcommand should not be accepted");
         let msg = err.to_string();
         assert!(
-            msg.contains("--component"),
-            "error message should mention removed flag, got: {}",
+            msg.contains("pack"),
+            "error message should mention removed subcommand, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn cli_unpack_subcommand_is_rejected() {
+        let err = Cli::try_parse_from(["nexus", "unpack", "packed.out"])
+            .expect_err("`unpack` subcommand should not be accepted");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unpack"),
+            "error message should mention removed subcommand, got: {}",
             msg
         );
     }

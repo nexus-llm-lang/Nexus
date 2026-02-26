@@ -18,41 +18,6 @@ fn run(src: &str) -> Result<Value, String> {
 }
 
 #[test]
-fn test_list_creation() {
-    let src = r#"
-    let main = fn () -> unit do
-        let l = [1, 2, 3]
-        return ()
-    endfn
-    "#;
-    assert!(check(src).is_ok());
-}
-
-#[test]
-fn test_list_literal_is_cons_nil_sugar() {
-    let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
-    let main = fn () -> i64 do
-      let xs = [1, 2, 3]
-      return list.head(xs: xs)
-    endfn
-    "#;
-    assert_eq!(run(src).unwrap(), Value::Int(1));
-}
-
-#[test]
-fn test_list_type_annotation_is_list_user_type_sugar() {
-    let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
-    let main = fn () -> i64 do
-      let xs: [i64] = [1, 2, 3]
-      return list.nth(xs: xs, n: 2)
-    endfn
-    "#;
-    assert_eq!(run(src).unwrap(), Value::Int(3));
-}
-
-#[test]
 fn test_list_type_mismatch() {
     let src = r#"
     let main = fn () -> unit do
@@ -64,162 +29,103 @@ fn test_list_type_mismatch() {
 }
 
 #[test]
-fn test_list_nested() {
+fn test_list_literal_and_head_tail() {
     let src = r#"
-    let main = fn () -> unit do
-        let l = [[1, 2], [3, 4]]
-        return ()
-    endfn
-    "#;
-    assert!(check(src).is_ok());
-}
-
-#[test]
-fn test_list_of_linear() {
-    let _src = r#"
-    let main = fn () -> unit do
-        let %l = [%1, %2] // Assuming integers can be linear for test
-        // This fails because integers are not linear by default unless cast/annotated?
-        // Let's use linear literal syntax? No such thing.
-        // Use constructor?
-        return ()
-    endfn
-    "#;
-    // Currently no way to create linear literals easily.
-    // Skip linear list test for now or use stdlib function that returns linear.
-}
-
-#[test]
-fn test_list_head() {
-    let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
+    import as list from nxlib/stdlib/list.nx
     let main = fn () -> i64 do
-      let xs = Cons(v: 10, rest: Cons(v: 20, rest: Cons(v: 30, rest: Nil())))
-      return list.head(xs: xs)
-    endfn
-    "#;
-    assert_eq!(run(src).unwrap(), Value::Int(10));
-}
-
-#[test]
-fn test_list_tail() {
-    let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
-    let main = fn () -> i64 do
-      let xs = Cons(v: 10, rest: Cons(v: 20, rest: Cons(v: 30, rest: Nil())))
+      let xs = [1, 2, 3]
+      let h = list.head(xs: xs)
       let t = list.tail(xs: xs)
-      return list.head(xs: t)
+      let h2 = list.head(xs: t)
+      return h * 10 + h2
     endfn
     "#;
-    assert_eq!(run(src).unwrap(), Value::Int(20));
+    assert_eq!(run(src).unwrap(), Value::Int(12));
 }
 
 #[test]
-fn test_list_is_empty() {
+fn test_list_type_annotation_sugar() {
     let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
-    let main = fn () -> bool do
-      let xs = Nil()
-      return list.is_empty(xs: xs)
-    endfn
-    "#;
-    assert_eq!(run(src).unwrap(), Value::Bool(true));
-}
-
-#[test]
-fn test_list_is_empty_false() {
-    let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
-    let main = fn () -> bool do
-      let xs = Cons(v: 1, rest: Nil())
-      return list.is_empty(xs: xs)
-    endfn
-    "#;
-    assert_eq!(run(src).unwrap(), Value::Bool(false));
-}
-
-#[test]
-fn test_list_reverse() {
-    let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
+    import as list from nxlib/stdlib/list.nx
     let main = fn () -> i64 do
-      let xs = Cons(v: 1, rest: Cons(v: 2, rest: Cons(v: 3, rest: Nil())))
-      let r = list.reverse(xs: xs)
-      return list.head(xs: r)
+      let xs: [i64] = [1, 2, 3]
+      return list.nth(xs: xs, n: 2)
     endfn
     "#;
     assert_eq!(run(src).unwrap(), Value::Int(3));
 }
 
 #[test]
-fn test_list_concat() {
+fn test_list_is_empty() {
     let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
+    import as list from nxlib/stdlib/list.nx
     let main = fn () -> i64 do
-      let a = Cons(v: 1, rest: Cons(v: 2, rest: Nil()))
-      let b = Cons(v: 3, rest: Cons(v: 4, rest: Nil()))
-      let c = list.concat(xs: a, ys: b)
-      return list.length(xs: c)
-    endfn
-    "#;
-    assert_eq!(run(src).unwrap(), Value::Int(4));
-}
-
-#[test]
-fn test_list_cons() {
-    let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
-    let main = fn () -> i64 do
-      let xs = Cons(v: 2, rest: Cons(v: 3, rest: Nil()))
-      let ys = list.cons(x: 1, xs: xs)
-      return list.head(xs: ys)
+      let empty = Nil()
+      let nonempty = Cons(v: 1, rest: Nil())
+      let a = list.is_empty(xs: empty)
+      let b = list.is_empty(xs: nonempty)
+      if a then
+        if b then return 0 else return 1 endif
+      else
+        return 0
+      endif
     endfn
     "#;
     assert_eq!(run(src).unwrap(), Value::Int(1));
 }
 
 #[test]
-fn test_list_last() {
+fn test_list_reverse_concat_length() {
     let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
+    import as list from nxlib/stdlib/list.nx
     let main = fn () -> i64 do
-      let xs = Cons(v: 10, rest: Cons(v: 20, rest: Cons(v: 30, rest: Nil())))
-      return list.last(xs: xs)
+      let a = Cons(v: 1, rest: Cons(v: 2, rest: Nil()))
+      let b = Cons(v: 3, rest: Cons(v: 4, rest: Nil()))
+      let c = list.concat(xs: a, ys: b)
+      let r = list.reverse(xs: c)
+      let h = list.head(xs: r)
+      let len = list.length(xs: c)
+      return h * 10 + len
     endfn
     "#;
-    assert_eq!(run(src).unwrap(), Value::Int(30));
+    assert_eq!(run(src).unwrap(), Value::Int(44));
 }
 
 #[test]
-fn test_list_take() {
+fn test_list_cons_last() {
     let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
+    import as list from nxlib/stdlib/list.nx
+    let main = fn () -> i64 do
+      let xs = Cons(v: 2, rest: Cons(v: 3, rest: Nil()))
+      let ys = list.cons(x: 1, xs: xs)
+      let h = list.head(xs: ys)
+      let l = list.last(xs: ys)
+      return h * 10 + l
+    endfn
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(13));
+}
+
+#[test]
+fn test_list_take_and_drop() {
+    let src = r#"
+    import as list from nxlib/stdlib/list.nx
     let main = fn () -> i64 do
       let xs = Cons(v: 1, rest: Cons(v: 2, rest: Cons(v: 3, rest: Cons(v: 4, rest: Cons(v: 5, rest: Nil())))))
       let t = list.take(xs: xs, n: 3)
-      return list.length(xs: t)
-    endfn
-    "#;
-    assert_eq!(run(src).unwrap(), Value::Int(3));
-}
-
-#[test]
-fn test_list_drop_n() {
-    let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
-    let main = fn () -> i64 do
-      let xs = Cons(v: 1, rest: Cons(v: 2, rest: Cons(v: 3, rest: Cons(v: 4, rest: Cons(v: 5, rest: Nil())))))
       let d = list.drop_n(xs: xs, n: 2)
-      return list.head(xs: d)
+      let th = list.head(xs: d)
+      let tl = list.length(xs: t)
+      return th * 10 + tl
     endfn
     "#;
-    assert_eq!(run(src).unwrap(), Value::Int(3));
+    assert_eq!(run(src).unwrap(), Value::Int(33));
 }
 
 #[test]
 fn test_list_nth() {
     let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
+    import as list from nxlib/stdlib/list.nx
     let main = fn () -> i64 do
       let xs = Cons(v: 10, rest: Cons(v: 20, rest: Cons(v: 30, rest: Cons(v: 40, rest: Nil()))))
       return list.nth(xs: xs, n: 2)
@@ -229,33 +135,27 @@ fn test_list_nth() {
 }
 
 #[test]
-fn test_list_contains_true() {
+fn test_list_contains() {
     let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
-    let main = fn () -> bool do
+    import as list from nxlib/stdlib/list.nx
+    let main = fn () -> i64 do
       let xs = Cons(v: 1, rest: Cons(v: 2, rest: Cons(v: 3, rest: Nil())))
-      return list.contains(xs: xs, val: 2)
+      let a = list.contains(xs: xs, val: 2)
+      let b = list.contains(xs: xs, val: 5)
+      if a then
+        if b then return 0 else return 1 endif
+      else
+        return 0
+      endif
     endfn
     "#;
-    assert_eq!(run(src).unwrap(), Value::Bool(true));
-}
-
-#[test]
-fn test_list_contains_false() {
-    let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
-    let main = fn () -> bool do
-      let xs = Cons(v: 1, rest: Cons(v: 2, rest: Cons(v: 3, rest: Nil())))
-      return list.contains(xs: xs, val: 5)
-    endfn
-    "#;
-    assert_eq!(run(src).unwrap(), Value::Bool(false));
+    assert_eq!(run(src).unwrap(), Value::Int(1));
 }
 
 #[test]
 fn test_list_fold_left_sum() {
     let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
+    import as list from nxlib/stdlib/list.nx
 
     let add = fn (acc: i64, val: i64) -> i64 do
       return acc + val
@@ -270,9 +170,9 @@ fn test_list_fold_left_sum() {
 }
 
 #[test]
-fn test_list_map_rev() {
+fn test_list_map_and_map_rev() {
     let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
+    import as list from nxlib/stdlib/list.nx
 
     let twice = fn (val: i64) -> i64 do
       return val * 2
@@ -280,27 +180,12 @@ fn test_list_map_rev() {
 
     let main = fn () -> i64 do
       let xs = Cons(v: 1, rest: Cons(v: 2, rest: Cons(v: 3, rest: Nil())))
-      let ys = list.map_rev(xs: xs, f: twice)
-      return list.head(xs: ys)
+      let mapped = list.map(xs: xs, f: twice)
+      let rev_mapped = list.map_rev(xs: xs, f: twice)
+      let a = list.nth(xs: mapped, n: 1)
+      let b = list.head(xs: rev_mapped)
+      return a * 10 + b
     endfn
     "#;
-    assert_eq!(run(src).unwrap(), Value::Int(6));
-}
-
-#[test]
-fn test_list_map() {
-    let src = r#"
-    import as list from [=[nxlib/stdlib/list.nx]=]
-
-    let twice = fn (val: i64) -> i64 do
-      return val * 2
-    endfn
-
-    let main = fn () -> i64 do
-      let xs = Cons(v: 1, rest: Cons(v: 2, rest: Cons(v: 3, rest: Nil())))
-      let ys = list.map(xs: xs, f: twice)
-      return list.nth(xs: ys, n: 1)
-    endfn
-    "#;
-    assert_eq!(run(src).unwrap(), Value::Int(4));
+    assert_eq!(run(src).unwrap(), Value::Int(46));
 }

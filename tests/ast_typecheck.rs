@@ -18,7 +18,6 @@ fn expr_call(func: &str, args: Vec<(&str, Spanned<Expr>)>) -> Spanned<Expr> {
     spanned(Expr::Call {
         func: func.to_string(),
         args: args.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
-        perform: false,
     })
 }
 
@@ -37,7 +36,7 @@ fn test_basic_poly() {
                     typ: Type::UserDefined("T".to_string(), vec![]),
                 }],
                 ret_type: Type::UserDefined("T".to_string(), vec![]),
-                effects: Type::Row(vec![], None),
+                requires: Type::Row(vec![], None), effects: Type::Row(vec![], None),
                 body: vec![spanned(Stmt::Return(expr_var("x")))],
             }),
         }))],
@@ -62,7 +61,7 @@ fn test_complex_typecheck() {
                         typ: Type::UserDefined("T".to_string(), vec![]),
                     }],
                     ret_type: Type::UserDefined("T".to_string(), vec![]),
-                    effects: Type::Row(vec![], None),
+                    requires: Type::Row(vec![], None), effects: Type::Row(vec![], None),
                     body: vec![spanned(Stmt::Return(expr_var("x")))],
                 }),
             })),
@@ -74,7 +73,7 @@ fn test_complex_typecheck() {
                     type_params: vec![],
                     params: vec![],
                     ret_type: Type::Unit,
-                    effects: Type::Row(vec![], None),
+                    requires: Type::Row(vec![], None), effects: Type::Row(vec![], None),
                     body: vec![
                         spanned(Stmt::Let {
                             name: "f".to_string(),
@@ -115,7 +114,7 @@ fn test_mismatch_fail() {
                 type_params: vec![],
                 params: vec![],
                 ret_type: Type::I64,
-                effects: Type::Row(vec![], None),
+                requires: Type::Row(vec![], None), effects: Type::Row(vec![], None),
                 body: vec![spanned(Stmt::Return(expr_lit_bool(true)))],
             }),
         }))],
@@ -148,7 +147,7 @@ fn test_labeled_call_out_of_order_typechecks() {
                         },
                     ],
                     ret_type: Type::I64,
-                    effects: Type::Row(vec![], None),
+                    requires: Type::Row(vec![], None), effects: Type::Row(vec![], None),
                     body: vec![spanned(Stmt::Return(spanned(Expr::BinaryOp(
                         Box::new(expr_var("a")),
                         "-".to_string(),
@@ -164,7 +163,7 @@ fn test_labeled_call_out_of_order_typechecks() {
                     type_params: vec![],
                     params: vec![],
                     ret_type: Type::Unit,
-                    effects: Type::Row(vec![], None),
+                    requires: Type::Row(vec![], None), effects: Type::Row(vec![], None),
                     body: vec![
                         spanned(Stmt::Let {
                             name: "x".to_string(),

@@ -1,7 +1,9 @@
 ; ─── Scope definitions ──────────────────────────────────────────────────────
 
 (lambda_expr) @local.scope
+(handler_expr) @local.scope
 (handler_fn) @local.scope
+(inject_stmt) @local.scope
 (if_stmt) @local.scope
 (match_case) @local.scope
 (try_stmt) @local.scope

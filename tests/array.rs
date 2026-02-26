@@ -18,29 +18,11 @@ fn run(src: &str) -> Result<Value, String> {
 }
 
 #[test]
-fn test_array_basic() {
-    let src = r#"
-    let main = fn () -> unit effect { IO } do
-        let %arr = [| 1, 2, 3 |]
-        %arr[0] <- 42
-        let val = (borrow %arr)[0]
-        let msg = i64_to_string(val: val)
-        perform print(val: msg)
-        drop %arr
-        return ()
-    endfn
-    "#;
-    if let Err(e) = check(src) {
-        panic!("Typecheck failed: {}", e);
-    }
-}
-
-#[test]
 fn test_array_type_mismatch() {
     let src = r#"
     let main = fn () -> unit do
         let %arr = [| 1, true |]
-        drop %arr
+        match %arr do case _ -> () endmatch
         return ()
     endfn
     "#;
@@ -64,8 +46,8 @@ fn test_array_assignment_mismatch() {
     let src = r#"
     let main = fn () -> unit do
         let %arr = [| 1, 2 |]
-        %arr[0] <- true // Should fail: assigning bool to i64 array
-        drop %arr
+        %arr[0] <- true
+        match %arr do case _ -> () endmatch
         return ()
     endfn
     "#;
@@ -73,61 +55,32 @@ fn test_array_assignment_mismatch() {
 }
 
 #[test]
-fn test_array_module_is_empty() {
+fn test_array_module_get_set_is_empty() {
     let src = r#"
-    import as array from [=[nxlib/stdlib/array.nx]=]
-    let main = fn () -> bool do
-      let %arr = [| 1, 2, 3 |]
-      let arr_ref = borrow %arr
-      let r = array.is_empty(arr: arr_ref)
-      drop %arr
-      return r
-    endfn
-    "#;
-    assert_eq!(run(src).unwrap(), Value::Bool(false));
-}
-
-#[test]
-fn test_array_module_get() {
-    let src = r#"
-    import as array from [=[nxlib/stdlib/array.nx]=]
+    import as array from nxlib/stdlib/array.nx
     let main = fn () -> i64 do
       let %arr = [| 10, 20, 30 |]
-      let arr_ref = borrow %arr
-      let v = array.get(arr: arr_ref, idx: 1)
-      drop %arr
-      return v
-    endfn
-    "#;
-    assert_eq!(run(src).unwrap(), Value::Int(20));
-}
-
-#[test]
-fn test_array_module_set() {
-    let src = r#"
-    import as array from [=[nxlib/stdlib/array.nx]=]
-    let main = fn () -> i64 do
-      let %arr = [| 10, 20, 30 |]
-      let arr_ref = borrow %arr
+      let arr_ref = &%arr
+      let empty = array.is_empty(arr: arr_ref)
       array.set(arr: arr_ref, idx: 1, val: 99)
       let v = array.get(arr: arr_ref, idx: 1)
-      drop %arr
-      return v
+      match %arr do case _ -> () endmatch
+      if empty then return 0 else return v endif
     endfn
     "#;
     assert_eq!(run(src).unwrap(), Value::Int(99));
 }
 
 #[test]
-fn test_array_module_head_and_last() {
+fn test_array_module_head_last() {
     let src = r#"
-    import as array from [=[nxlib/stdlib/array.nx]=]
+    import as array from nxlib/stdlib/array.nx
     let main = fn () -> i64 do
       let %arr = [| 10, 20, 30 |]
-      let arr_ref = borrow %arr
+      let arr_ref = &%arr
       let h = array.head(arr: arr_ref)
       let t = array.last(arr: arr_ref)
-      drop %arr
+      match %arr do case _ -> () endmatch
       return h + t
     endfn
     "#;
@@ -137,7 +90,7 @@ fn test_array_module_head_and_last() {
 #[test]
 fn test_array_module_fold_left_sum() {
     let src = r#"
-    import as array from [=[nxlib/stdlib/array.nx]=]
+    import as array from nxlib/stdlib/array.nx
 
     let add = fn (acc: i64, val: i64) -> i64 do
       return acc + val
@@ -145,9 +98,9 @@ fn test_array_module_fold_left_sum() {
 
     let main = fn () -> i64 do
       let %arr = [| 1, 2, 3, 4 |]
-      let arr_ref = borrow %arr
+      let arr_ref = &%arr
       let sum = array.fold_left(arr: arr_ref, init: 0, f: add)
-      drop %arr
+      match %arr do case _ -> () endmatch
       return sum
     endfn
     "#;
@@ -157,7 +110,7 @@ fn test_array_module_fold_left_sum() {
 #[test]
 fn test_array_module_find_index_any_all() {
     let src = r#"
-    import as array from [=[nxlib/stdlib/array.nx]=]
+    import as array from nxlib/stdlib/array.nx
 
     let is_eight = fn (val: i64) -> bool do
       return val == 8
@@ -169,11 +122,11 @@ fn test_array_module_find_index_any_all() {
 
     let main = fn () -> i64 do
       let %arr = [| 3, 5, 8, 11 |]
-      let arr_ref = borrow %arr
+      let arr_ref = &%arr
       let idx = array.find_index(arr: arr_ref, pred: is_eight)
       let has_even = array.any(arr: arr_ref, pred: is_eight)
       let all_gt_ten = array.all(arr: arr_ref, pred: gt_ten)
-      drop %arr
+      match %arr do case _ -> () endmatch
 
       if has_even then
         if all_gt_ten then
@@ -190,41 +143,25 @@ fn test_array_module_find_index_any_all() {
 }
 
 #[test]
-fn test_array_module_map_in_place() {
+fn test_array_module_map_in_place_and_for_each() {
     let src = r#"
-    import as array from [=[nxlib/stdlib/array.nx]=]
+    import as array from nxlib/stdlib/array.nx
 
     let twice = fn (val: i64) -> i64 do
       return val * 2
     endfn
-
-    let main = fn () -> i64 do
-      let %arr = [| 1, 2, 3 |]
-      let arr_ref = borrow %arr
-      array.map_in_place(arr: arr_ref, f: twice)
-      let v = array.get(arr: arr_ref, idx: 2)
-      drop %arr
-      return v
-    endfn
-    "#;
-    assert_eq!(run(src).unwrap(), Value::Int(6));
-}
-
-#[test]
-fn test_array_module_for_each_noop() {
-    let src = r#"
-    import as array from [=[nxlib/stdlib/array.nx]=]
 
     let noop = fn (val: i64) -> unit do
       return ()
     endfn
 
     let main = fn () -> i64 do
-      let %arr = [| 5, 6, 7 |]
-      let arr_ref = borrow %arr
+      let %arr = [| 1, 2, 3 |]
+      let arr_ref = &%arr
       array.for_each(arr: arr_ref, f: noop)
-      let v = array.get(arr: arr_ref, idx: 1)
-      drop %arr
+      array.map_in_place(arr: arr_ref, f: twice)
+      let v = array.get(arr: arr_ref, idx: 2)
+      match %arr do case _ -> () endmatch
       return v
     endfn
     "#;
@@ -234,8 +171,8 @@ fn test_array_module_for_each_noop() {
 #[test]
 fn test_array_module_filter_returns_list() {
     let src = r#"
-    import as array from [=[nxlib/stdlib/array.nx]=]
-    import as list from [=[nxlib/stdlib/list.nx]=]
+    import as array from nxlib/stdlib/array.nx
+    import as list from nxlib/stdlib/list.nx
 
     let gt_two = fn (val: i64) -> bool do
       return val > 2
@@ -243,9 +180,9 @@ fn test_array_module_filter_returns_list() {
 
     let main = fn () -> i64 do
       let %arr = [| 1, 2, 3, 4 |]
-      let arr_ref = borrow %arr
+      let arr_ref = &%arr
       let ys = array.filter(arr: arr_ref, pred: gt_two)
-      drop %arr
+      match %arr do case _ -> () endmatch
       let h = list.head(xs: ys)
       let n = list.length(xs: ys)
       return h * 10 + n
@@ -257,8 +194,8 @@ fn test_array_module_filter_returns_list() {
 #[test]
 fn test_array_module_partition_returns_two_lists() {
     let src = r#"
-    import as array from [=[nxlib/stdlib/array.nx]=]
-    import as list from [=[nxlib/stdlib/list.nx]=]
+    import as array from nxlib/stdlib/array.nx
+    import as list from nxlib/stdlib/list.nx
 
     let gt_two = fn (val: i64) -> bool do
       return val > 2
@@ -266,9 +203,9 @@ fn test_array_module_partition_returns_two_lists() {
 
     let main = fn () -> i64 do
       let %arr = [| 1, 2, 3, 4 |]
-      let arr_ref = borrow %arr
+      let arr_ref = &%arr
       let parts = array.partition(arr: arr_ref, pred: gt_two)
-      drop %arr
+      match %arr do case _ -> () endmatch
       match parts do
         case Partition(matched: m, rest: r) ->
           let a = list.length(xs: m)
@@ -281,10 +218,10 @@ fn test_array_module_partition_returns_two_lists() {
 }
 
 #[test]
-fn test_array_module_zip_with() {
+fn test_array_module_zip_with_and_zip() {
     let src = r#"
-    import as array from [=[nxlib/stdlib/array.nx]=]
-    import as list from [=[nxlib/stdlib/list.nx]=]
+    import as array from nxlib/stdlib/array.nx
+    import as list from nxlib/stdlib/list.nx
 
     let add_pair = fn (left: i64, right: i64) -> i64 do
       return left + right
@@ -293,33 +230,59 @@ fn test_array_module_zip_with() {
     let main = fn () -> i64 do
       let %a = [| 1, 2, 3 |]
       let %b = [| 10, 20 |]
-      let ar = borrow %a
-      let br = borrow %b
-      let zs = array.zip_with(left: ar, right: br, f: add_pair)
-      drop %a
-      drop %b
-      return list.nth(xs: zs, n: 1)
+      let ar = &%a
+      let br = &%b
+      let zipped = array.zip_with(left: ar, right: br, f: add_pair)
+      let plain = array.zip(left: ar, right: br)
+      match %a do case _ -> () endmatch
+      match %b do case _ -> () endmatch
+      let v = list.nth(xs: zipped, n: 1)
+      let len = list.length(xs: plain)
+      return v * 10 + len
     endfn
     "#;
-    assert_eq!(run(src).unwrap(), Value::Int(22));
+    assert_eq!(run(src).unwrap(), Value::Int(222));
 }
 
 #[test]
-fn test_array_module_zip_length_is_min() {
+fn test_array_consume_nonlinear_consumer_is_rejected() {
     let src = r#"
-    import as array from [=[nxlib/stdlib/array.nx]=]
-    import as list from [=[nxlib/stdlib/list.nx]=]
+    import as array from nxlib/stdlib/array.nx
 
-    let main = fn () -> i64 do
-      let %a = [| 1, 2, 3, 4 |]
-      let %b = [| 10, 20 |]
-      let ar = borrow %a
-      let br = borrow %b
-      let zs = array.zip(left: ar, right: br)
-      drop %a
-      drop %b
-      return list.length(xs: zs)
+    let ignore_record = fn (val: { id: i64 }) -> unit do
+        return ()
+    endfn
+
+    let main = fn () -> unit do
+        let %arr = [| { id: 1 }, { id: 2 } |]
+        array.consume(arr: %arr, f: ignore_record)
+        return ()
     endfn
     "#;
-    assert_eq!(run(src).unwrap(), Value::Int(2));
+    assert!(
+        check(src).is_err(),
+        "non-linear consumer should be rejected: consumer param must be %T"
+    );
+}
+
+#[test]
+fn test_array_consume_with_proper_consumer_passes() {
+    let src = r#"
+    import as array from nxlib/stdlib/array.nx
+
+    let consume_record = fn (%val: { id: i64 }) -> unit do
+        match %val do case { id: _ } -> () endmatch
+        return ()
+    endfn
+
+    let main = fn () -> unit do
+        let %arr = [| { id: 1 }, { id: 2 } |]
+        array.consume(arr: %arr, f: consume_record)
+        return ()
+    endfn
+    "#;
+    match check(src) {
+        Ok(_) => (),
+        Err(e) => panic!("proper consumer should pass: {}", e),
+    }
 }

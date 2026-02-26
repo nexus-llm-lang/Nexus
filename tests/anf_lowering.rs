@@ -100,8 +100,8 @@ endfn
 #[test]
 fn lowering_resolves_print_from_stdlib_signatures() {
     let src = r#"
-let main = fn () -> unit effect { IO } do
-    perform print(val: [=[hello]=])
+let main = fn () -> unit effect { Console } do
+    print(val: [=[hello]=])
     return ()
 endfn
 "#;
@@ -112,10 +112,10 @@ endfn
 #[test]
 fn lowering_rejects_external_without_import_external() {
     let src = r#"
-let foo = external [=[foo]=] : (x: i64) -> i64
+external foo = [=[foo]=] : (x: i64) -> i64
 
 let main = fn () -> i64 do
-    return perform foo(x: 1)
+    return foo(x: 1)
 endfn
 "#;
 
@@ -126,11 +126,11 @@ endfn
 #[test]
 fn lowering_rejects_missing_external_module_file() {
     let src = r#"
-import external [=[/tmp/__no_such_module__.wasm]=]
-let foo = external [=[foo]=] : (x: i64) -> i64
+import external /tmp/__no_such_module__.wasm
+external foo = [=[foo]=] : (x: i64) -> i64
 
 let main = fn () -> i64 do
-    return perform foo(x: 1)
+    return foo(x: 1)
 endfn
 "#;
 

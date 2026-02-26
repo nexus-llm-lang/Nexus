@@ -1,164 +1,135 @@
 # Standard Library
 
-Nexus provides a stdlib API available in the global scope.
+Nexus stdlib APIs are provided by `nxlib/stdlib/*.nx` modules.
 
-Public stdlib APIs are split across:
-- `nxlib/stdlib/stdio.nx` (I/O convenience APIs, backed by `nxlib/stdlib/stdio.wasm`)
-- `nxlib/stdlib/core.nx` (core helpers and conversions, backed by `nxlib/stdlib/core.wasm`)
-- `nxlib/stdlib/string.nx` / `nxlib/stdlib/math.nx` / `nxlib/stdlib/fs.nx` / `nxlib/stdlib/net.nx` (module-specific backends)
-- collection helpers in `nxlib/stdlib/list.nx`, `nxlib/stdlib/array.nx`, `nxlib/stdlib/set.nx`, and `nxlib/stdlib/hashmap.nx`
-- random utilities in `nxlib/stdlib/random.nx` (backed by `nxlib/stdlib/random.wasm`)
-- core ADTs like `Result<T, E>` in `nxlib/stdlib/result.nx`
+Core modules:
 
-`drop` is a language statement, not a stdlib function.
+- `nxlib/stdlib/core.nx`
+- `nxlib/stdlib/stdio.nx`
+- `nxlib/stdlib/fs.nx`
+- `nxlib/stdlib/net.nx`
+- `nxlib/stdlib/string.nx`
+- `nxlib/stdlib/math.nx`
+- `nxlib/stdlib/list.nx`
+- `nxlib/stdlib/array.nx`
+- `nxlib/stdlib/set.nx`
+- `nxlib/stdlib/hashmap.nx`
+- `nxlib/stdlib/random.nx`
+- `nxlib/stdlib/result.nx`
 
-## I/O Functions
+Primitive linear values are auto-dropped at scope end. Composite linear values must be consumed via pattern matching or function calls.
 
-Functions that perform Input/Output operations have the `IO` effect.
-`stdio` should stay focused on I/O.
-
-### `print`
-
-Prints a string to standard output as-is (no trailing newline is added).
+## Console (`stdio`)
 
 ```nexus
-pub let print = external [=[print]=] : (val: string) -> unit effect { IO }
+pub external print = [=[print]=] : (val: string) -> unit effect { Console }
 ```
 
-## Conversions
+## String (`string`)
 
-Pure functions for converting between types.
-
-### `i64_to_string`
-
-Converts a 64-bit integer to its string representation.
+### Conversions
 
 ```nexus
-pub let i64_to_string = external [=[i64_to_string]=] : (val: i64) -> string
+pub external i64_to_string = [=[__nx_i64_to_string]=] : (val: i64) -> string
+pub external float_to_string = [=[__nx_float_to_string]=] : (val: float) -> string
+pub external bool_to_string = [=[__nx_bool_to_string]=] : (val: bool) -> string
+pub external string_to_i64 = [=[__nx_string_to_i64]=] : (s: string) -> i64
 ```
 
-### `float_to_string`
+## File System (`fs`)
 
-Converts a 64-bit float to its string representation.
+All fs operations are defined in `port Fs` and dispatched via handler.
+Use `inject default_fs do ... endinject` for real filesystem access, or inject a mock handler for testing.
+
+### Query operations
 
 ```nexus
-pub let float_to_string = external [=[float_to_string]=] : (val: float) -> string
+fn exists(path: string) -> bool
+fn read_to_string(path: string) -> string
 ```
 
-### `bool_to_string`
+### Mutating path-level operations
 
-Converts a boolean to "true" or "false".
+These raise `RuntimeError` on failure instead of returning `bool`:
 
 ```nexus
-pub let bool_to_string = external [=[bool_to_string]=] : (val: bool) -> string
+fn write_string(path: string, content: string) -> unit effect { Exn }
+fn append_string(path: string, content: string) -> unit effect { Exn }
+fn remove_file(path: string) -> unit effect { Exn }
+fn create_dir_all(path: string) -> unit effect { Exn }
 ```
 
-## File System Access (`fs`)
+### Directory listing
 
-Functions for interacting with the file system. These have the `IO` effect.
-
-### `read_to_string`
-
-Reads the entire contents of a file into a string.
+`read_dir` returns a list of opened file handles (subdirectories are skipped):
 
 ```nexus
-pub let read_to_string = external [=[read_to_string]=] : (path: string) -> string effect { IO }
+fn read_dir(path: string) -> List<Handle> effect { Exn }
 ```
 
-### `write_string`
-
-Writes a string to a file. Returns `true` on success.
+### Stateful fd operations (consume-and-return pattern)
 
 ```nexus
-pub let write_string = external [=[write_string]=] : (path: string, content: string) -> bool effect { IO }
+pub type Handle = Handle(id: i64)   // non-opaque — any handler can construct
+
+fn open_read(path: string) -> %Handle effect { Exn }
+fn open_write(path: string) -> %Handle effect { Exn }
+fn open_append(path: string) -> %Handle effect { Exn }
+fn read(handle: %Handle) -> { content: string, handle: %Handle }
+fn fd_write(handle: %Handle, content: string) -> { ok: bool, handle: %Handle }
+fn fd_path(handle: %Handle) -> { path: string, handle: %Handle }
+fn close(handle: %Handle) -> unit
 ```
 
-### `append_string`
-
-Appends a string to a file. Creates the file if missing.
-
+Usage pattern:
 ```nexus
-pub let append_string = external [=[append_string]=] : (path: string, content: string) -> bool effect { IO }
+import { default_fs, Fs, Handle } from nxlib/stdlib/fs.nx
+
+inject default_fs do
+  try
+    Fs.write_string(path: [=[data.txt]=], content: [=[hello]=])
+    let %h = Fs.open_read(path: [=[data.txt]=])
+    let %r = Fs.read(handle: %h)
+    match %r do case { content: content, handle: %h2 } ->
+      Fs.close(handle: %h2)
+      // use content
+    endmatch
+  catch e ->
+    // handle error
+  endtry
+endinject
 ```
 
-### `exists`
+`open_*` and mutating operations may raise `RuntimeError`. The `read`, `fd_write`, and `fd_path` operations consume the handle and return a new one in the result record, enabling stateless handlers (no borrow needed).
 
-Checks whether a file or directory exists.
+## Network (`net`)
+
+`net` functions are capability-gated by `require { Net }`.
 
 ```nexus
-pub let exists = external [=[exists]=] : (path: string) -> bool effect { IO }
+pub type Header = Header(name: string, value: string)
+pub type Response = Response(status: i64, body: string)
+
+pub let header = fn (name: string, value: string) -> Header do ... endfn
+pub let request_response = fn (method: string, url: string, headers: List<Header>, body: string) -> Response require { Net } do ... endfn
+pub let request = fn (method: string, url: string, headers: List<Header>) -> string require { Net } do ... endfn
+pub let request_with_body = fn (method: string, url: string, headers: List<Header>, body: string) -> string require { Net } do ... endfn
+pub let get = fn (url: string) -> string require { Net } do ... endfn
 ```
 
-### `remove_file`
+## List and Array
 
-Removes a file.
-
-```nexus
-pub let remove_file = external [=[remove_file]=] : (path: string) -> bool effect { IO }
-```
-
-### `create_dir_all`
-
-Creates a directory and any missing parent directories.
+`List<T>` is an ADT with `Nil()` / `Cons(v: T, rest: List<T>)`.
 
 ```nexus
-pub let create_dir_all = external [=[create_dir_all]=] : (path: string) -> bool effect { IO }
-```
+import as list from nxlib/stdlib/list.nx
+import as array from nxlib/stdlib/array.nx
 
-### `read_dir`
+list.length(xs)
+list.fold_left(xs, init, f)
+list.map_rev(xs, f)
+list.map(xs, f)
 
-Reads direct children of a directory and returns their names as `List<string>`.
-
-```nexus
-pub let read_dir = fn (path: string) -> List<string> effect { IO } do ... endfn
-```
-
-### Linear `Closer`
-
-`open_*` APIs return a linear closer token (`%Closer`).
-This token must be consumed exactly once (normally via `close`), so forgetting to close is a type error.
-
-```nexus
-pub type Closer = Closer(path: string, mode: i64)
-
-pub let open_read = fn (path: string) -> %Closer effect { IO, Exn }
-pub let open_write = fn (path: string) -> %Closer effect { IO, Exn }
-pub let open_append = fn (path: string) -> %Closer effect { IO, Exn }
-pub let close = fn (closer: %Closer) -> unit
-```
-
-`open_read` raises `RuntimeError` when the path does not exist.
-`open_write`/`open_append` raise `RuntimeError` when the path cannot be opened (for example missing parent directory).
-
-## Network Access (`net`)
-
-Functions for network operations. These have the `Net` effect.
-
-### `get`
-
-Performs an HTTP GET request and returns the response body as a string.
-
-```nexus
-pub let get = fn (url: string) -> string effect { Net } do
-  return perform request(method: [=[GET]=], url: url, headers: Nil())
-endfn
-```
-
-## Array Helpers
-
-### `array_length`
-
-Returns the element count of a borrowed linear array.
-
-```nexus
-pub let array_length = fn <T>(arr: &[| T |]) -> i64 do ... endfn
-```
-
-### `array` module helpers
-
-`nxlib/stdlib/array.nx` provides:
-
-```nexus
 array.length(arr)
 array.is_empty(arr)
 array.get(arr, idx)
@@ -171,107 +142,51 @@ array.all(arr, pred)
 array.find_index(arr, pred)
 array.for_each(arr, f)
 array.map_in_place(arr, f)
-array.filter(arr, pred)                // -> List<T>
-array.partition(arr, pred)             // -> Partition<T> { matched, rest }
-array.zip_with(left, right, f)         // -> List<U> (length = min)
-array.zip(left, right)                 // -> List<Pair<A, B>>
+array.filter(arr, pred)
+array.partition(arr, pred)
+array.zip_with(left, right, f)
+array.zip(left, right)
 ```
 
-## Collection Modules
+## Set and HashMap
 
-### `list.length`
-
-Returns the element count of an immutable list.
+Both collections use dictionary-passed key operations (`eq`/`hash`).
 
 ```nexus
-import as list from [=[nxlib/stdlib/list.nx]=]
+import as set from nxlib/stdlib/set.nx
+import as hashmap from nxlib/stdlib/hashmap.nx
 
-pub let list.length = fn <T>(xs: [T]) -> i64 do ... endfn
-```
+let key_ops = set.make_key_ops(eq: eq_fn, hash: hash_fn)
+let s0 = set.empty(key_ops: key_ops)
+let s1 = set.insert(set: s0, val: 10)
 
-### `array.length`
-
-Returns the element count of a borrowed linear array.
-
-```nexus
-import as array from [=[nxlib/stdlib/array.nx]=]
-
-pub let array.length = fn <T>(arr: &[| T |]) -> i64 do ... endfn
-```
-
-### `set` module
-
-`nxlib/stdlib/set.nx` provides an immutable set with dictionary-passed key operations.
-
-```nexus
-import as set from [=[nxlib/stdlib/set.nx]=]
-
-let ops = set.i64_key_ops()
-
-set.empty(key_ops: ops)
-set.from_list(key_ops: ops, xs)
-set.to_list(set)
-set.contains(set, val)
-set.insert(set, val)
-set.remove(set, val)
-set.size(set)
-set.union(left, right)
-set.intersection(left, right)
-set.difference(left, right)
-set.make_key_ops(eq, hash)
-```
-
-### `hashmap` module
-
-`nxlib/stdlib/hashmap.nx` provides an immutable map with dictionary-passed key operations.
-
-```nexus
-import as hashmap from [=[nxlib/stdlib/hashmap.nx]=]
-
-let ops = hashmap.i64_key_ops()
-
-hashmap.empty(key_ops: ops)
-hashmap.put(map, key, value)
-hashmap.get(map, key)           // -> Found(value: V) | Missing
-hashmap.get_or(map, key, default)
-hashmap.contains_key(map, key)
-hashmap.remove(map, key)
-hashmap.size(map)
-hashmap.keys(map)               // -> List<i64>
-hashmap.values(map)             // -> List<V>
-hashmap.make_key_ops(eq, hash)  // custom dictionary
+let map_ops = hashmap.make_key_ops(eq: eq_fn, hash: hash_fn)
+let m0 = hashmap.empty(key_ops: map_ops)
+let m1 = hashmap.put(map: m0, key: 1, value: [=[one]=])
 ```
 
 ## Random
 
-`nxlib/stdlib/random.nx` provides random number helpers.
-These are effectful and require `perform`.
+`random` helpers are effectful (`effect { Console }`):
 
 ```nexus
-import as random from [=[nxlib/stdlib/random.nx]=]
+import as random from nxlib/stdlib/random.nx
 
-perform random.next_i64()
-perform random.range(min: 0, max: 10)  // [min, max)
-perform random.next_bool()
+random.next_i64()
+random.range(min: 0, max: 10)  // [min, max)
+random.next_bool()
 ```
 
 ## Result Helpers
 
-`Result<T, E>` is defined in `nxlib/stdlib/result.nx` with constructors:
+`result.nx` provides helpers and Exn bridges.
 
 ```nexus
-Ok(val: T)
-Err(err: E)
-```
+import as result from nxlib/stdlib/result.nx
 
-Helper functions:
-
-```nexus
-import as result from [=[nxlib/stdlib/result.nx]=]
-
-pub let result.is_ok = fn <T, E>(res: Result<T, E>) -> bool
-pub let result.is_err = fn <T, E>(res: Result<T, E>) -> bool
-pub let result.unwrap_or = fn <T, E>(res: Result<T, E>, default: T) -> T
-pub let result.from_exn = fn <T>(exn: Exn) -> Result<T, Exn>
-pub let result.to_exn = fn <T>(res: Result<T, Exn>) -> T effect { Exn }
+result.is_ok(res)
+result.is_err(res)
+result.unwrap_or(res, default)
+result.from_exn(exn)
+result.to_exn(res) // effect { Exn }
 ```

@@ -1,7 +1,68 @@
-use nexus_wasm_alloc::{checked_mut_ptr, checked_ptr_len};
-use std::fs::OpenOptions;
+use nexus_wasm_alloc::checked_ptr_len;
+use std::cell::RefCell;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 
-// Helper to allocate memory for string return (simple malloc)
+// --- fd table infrastructure ---
+
+struct FdEntry {
+    file: File,
+    path: String,
+    mode: u8, // 0=read, 1=write, 2=append
+}
+
+thread_local! {
+    static FD_TABLE: RefCell<Vec<Option<FdEntry>>> = RefCell::new(Vec::new());
+}
+
+fn fd_alloc(entry: FdEntry) -> i64 {
+    FD_TABLE.with(|table| {
+        let mut table = table.borrow_mut();
+        // Reuse a vacant slot if available.
+        for (i, slot) in table.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(entry);
+                return i as i64;
+            }
+        }
+        let idx = table.len();
+        table.push(Some(entry));
+        idx as i64
+    })
+}
+
+fn fd_take(fd: i64) -> Option<FdEntry> {
+    if fd < 0 {
+        return None;
+    }
+    FD_TABLE.with(|table| {
+        let mut table = table.borrow_mut();
+        let idx = fd as usize;
+        if idx < table.len() {
+            table[idx].take()
+        } else {
+            None
+        }
+    })
+}
+
+fn fd_with<R>(fd: i64, f: impl FnOnce(&mut FdEntry) -> R) -> Option<R> {
+    if fd < 0 {
+        return None;
+    }
+    FD_TABLE.with(|table| {
+        let mut table = table.borrow_mut();
+        let idx = fd as usize;
+        if idx < table.len() {
+            table[idx].as_mut().map(f)
+        } else {
+            None
+        }
+    })
+}
+
+// --- allocate / deallocate ---
+
 #[no_mangle]
 pub extern "C" fn allocate(size: i32) -> i32 {
     nexus_wasm_alloc::allocate(size)
@@ -12,17 +73,19 @@ pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
     nexus_wasm_alloc::deallocate(ptr, size);
 }
 
+// --- path-level operations (unchanged) ---
+
 #[no_mangle]
-pub extern "C" fn read_to_string(path_ptr: i32, path_len: i32) -> i64 {
+pub extern "C" fn __nx_read_to_string(path_ptr: i32, path_len: i32) -> i64 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return 0;
     };
     let content = std::fs::read_to_string(path).unwrap_or_default();
-    store_string_result(content)
+    nexus_wasm_alloc::store_string_result(content)
 }
 
 #[no_mangle]
-pub extern "C" fn write_string(
+pub extern "C" fn __nx_write_string(
     path_ptr: i32,
     path_len: i32,
     content_ptr: i32,
@@ -41,7 +104,7 @@ pub extern "C" fn write_string(
 }
 
 #[no_mangle]
-pub extern "C" fn append_string(
+pub extern "C" fn __nx_append_string(
     path_ptr: i32,
     path_len: i32,
     content_ptr: i32,
@@ -64,7 +127,7 @@ pub extern "C" fn append_string(
 }
 
 #[no_mangle]
-pub extern "C" fn exists(path_ptr: i32, path_len: i32) -> i32 {
+pub extern "C" fn __nx_exists(path_ptr: i32, path_len: i32) -> i32 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return 0;
     };
@@ -76,7 +139,19 @@ pub extern "C" fn exists(path_ptr: i32, path_len: i32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn remove_file(path_ptr: i32, path_len: i32) -> i32 {
+pub extern "C" fn __nx_is_file(path_ptr: i32, path_len: i32) -> i32 {
+    let Some(path) = read_required_string(path_ptr, path_len) else {
+        return 0;
+    };
+    if std::path::Path::new(&path).is_file() {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_remove_file(path_ptr: i32, path_len: i32) -> i32 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return 0;
     };
@@ -87,7 +162,7 @@ pub extern "C" fn remove_file(path_ptr: i32, path_len: i32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn create_dir_all(path_ptr: i32, path_len: i32) -> i32 {
+pub extern "C" fn __nx_create_dir_all(path_ptr: i32, path_len: i32) -> i32 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return 0;
     };
@@ -98,7 +173,7 @@ pub extern "C" fn create_dir_all(path_ptr: i32, path_len: i32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn read_dir(path_ptr: i32, path_len: i32) -> i64 {
+pub extern "C" fn __nx_read_dir(path_ptr: i32, path_len: i32) -> i64 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return 0;
     };
@@ -116,8 +191,117 @@ pub extern "C" fn read_dir(path_ptr: i32, path_len: i32) -> i64 {
         names.push(entry.file_name().to_string_lossy().to_string());
     }
     names.sort();
-    store_string_result(names.join("\n"))
+    nexus_wasm_alloc::store_string_result(names.join("\n"))
 }
+
+// --- fd-based operations ---
+
+/// Opens a file for reading. Returns fd (>= 0) on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn __nx_fd_open_read(path_ptr: i32, path_len: i32) -> i64 {
+    let Some(path) = read_required_string(path_ptr, path_len) else {
+        return -1;
+    };
+    match File::open(&path) {
+        Ok(file) => fd_alloc(FdEntry {
+            file,
+            path,
+            mode: 0,
+        }),
+        Err(_) => -1,
+    }
+}
+
+/// Opens a file for writing (truncate+create). Returns fd (>= 0) on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn __nx_fd_open_write(path_ptr: i32, path_len: i32) -> i64 {
+    let Some(path) = read_required_string(path_ptr, path_len) else {
+        return -1;
+    };
+    match OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+    {
+        Ok(file) => fd_alloc(FdEntry {
+            file,
+            path,
+            mode: 1,
+        }),
+        Err(_) => -1,
+    }
+}
+
+/// Opens a file for appending (create if not exists). Returns fd (>= 0) on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn __nx_fd_open_append(path_ptr: i32, path_len: i32) -> i64 {
+    let Some(path) = read_required_string(path_ptr, path_len) else {
+        return -1;
+    };
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => fd_alloc(FdEntry {
+            file,
+            path,
+            mode: 2,
+        }),
+        Err(_) => -1,
+    }
+}
+
+/// Closes an fd. Returns 1 on success, 0 on bad fd.
+#[no_mangle]
+pub extern "C" fn __nx_fd_close(fd: i64) -> i32 {
+    match fd_take(fd) {
+        Some(_entry) => 1, // File dropped here
+        None => 0,
+    }
+}
+
+/// Reads the entire file contents from fd. Seeks to 0 first.
+/// Returns packed ptr|len as i64 (0 on failure).
+#[no_mangle]
+pub extern "C" fn __nx_fd_read(fd: i64) -> i64 {
+    let result = fd_with(fd, |entry| {
+        let _ = entry.file.seek(SeekFrom::Start(0));
+        let mut buf = String::new();
+        match entry.file.read_to_string(&mut buf) {
+            Ok(_) => Some(buf),
+            Err(_) => None,
+        }
+    });
+    match result {
+        Some(Some(content)) => nexus_wasm_alloc::store_string_result(content),
+        _ => 0,
+    }
+}
+
+/// Writes content to fd. Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn __nx_fd_write(fd: i64, content_ptr: i32, content_len: i32) -> i32 {
+    let Some(content) = read_optional_string(content_ptr, content_len) else {
+        return 0;
+    };
+    let result = fd_with(fd, |entry| {
+        entry.file.write_all(content.as_bytes()).is_ok()
+    });
+    match result {
+        Some(true) => 1,
+        _ => 0,
+    }
+}
+
+/// Returns the path string for an fd. Returns packed ptr|len as i64 (0 on bad fd).
+#[no_mangle]
+pub extern "C" fn __nx_fd_path(fd: i64) -> i64 {
+    let result = fd_with(fd, |entry| entry.path.clone());
+    match result {
+        Some(path) => nexus_wasm_alloc::store_string_result(path),
+        None => 0,
+    }
+}
+
+// --- string helpers (used by fs.nx) ---
 
 fn read_required_string(ptr: i32, len: i32) -> Option<String> {
     let (offset, len) = checked_ptr_len(ptr, len)?;
@@ -163,33 +347,5 @@ pub extern "C" fn __nx_string_substring(s_ptr: i32, s_len: i32, start: i64, len:
     let start = start.max(0) as usize;
     let len = len.max(0) as usize;
     let result: String = s.chars().skip(start).take(len).collect();
-    store_string_result(result)
-}
-
-fn store_string_result(s: String) -> i64 {
-    let bytes = s.into_bytes();
-    let len = bytes.len();
-    if len == 0 {
-        return 0;
-    }
-
-    let Ok(len_i32) = i32::try_from(len) else {
-        return 0;
-    };
-
-    let ptr = allocate(len_i32);
-    if ptr == 0 {
-        return 0;
-    }
-
-    let Some(dst) = checked_mut_ptr(ptr, len) else {
-        unsafe { deallocate(ptr, len_i32) };
-        return 0;
-    };
-
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, len);
-    }
-
-    ((ptr as u32 as u64) << 32 | (len as u32 as u64)) as i64
+    nexus_wasm_alloc::store_string_result(result)
 }

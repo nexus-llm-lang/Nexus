@@ -43,7 +43,7 @@ let main = fn () -> unit do
   let g = fn (x: i64) -> i64 do
     return x * 2
   endfn
-  drop g(x: f(x: 10))
+  let _ = g(x: f(x: 10))
   return ()
 endfn
 ```
@@ -51,28 +51,36 @@ endfn
 - Local lambda literals use `fn (...) -> T do ... endfn`.
 - A local recursive lambda must use an immutable binding with an explicit type annotation.
 
-### Effect annotation
+### Coeffect/effect annotation
 
-Functions that perform effects declare them with `effect`:
+Functions may declare:
+
+- `require { ... }` for coeffects (ports).
+- `effect { ... }` for builtin effects.
+
+Both are optional; omitted means an empty row.
 
 ```nexus
-let greet = fn (name: string) -> unit effect { IO } do
-  perform print(val: name)
+let greet = fn (name: string) -> unit require { Logger } effect { Console } do
+  Logger.log(msg: name)
+  print(val: name)
   return ()
 endfn
 ```
 
-The effect type can be a row `{ E1, E2 | r }`, a bare type name `IO`, or a generic type.
-
 ### External functions
 
-Foreign functions are bound to a name using the `external` expression within a `let` binding.
-The type must be an arrow type and the Wasm export name is given as a string:
+Foreign functions are declared with the `external` keyword as a dedicated top-level statement.
+The Wasm export name is given as a string after `=`, followed by `:` and the type:
 
 ```nexus
-pub let sin = external [=[sin]=] : (x: float) -> float
-pub let add_ints = external [=[add]=] : (a: i64, b: i64) -> i64
+pub external sin = [=[sin]=] : (x: float) -> float
+pub external add_ints = [=[add]=] : (a: i64, b: i64) -> i64
+pub external length = [=[array_length]=] : <T>(arr: &[| T |]) -> i64
 ```
+
+Generic external bindings require explicit type parameters with `<T, U, ...>` before the arrow type.
+Using an unknown type name without declaring it as a type parameter is a type error.
 
 ## Variables and Constants (`let`)
 
@@ -98,9 +106,11 @@ Inside functions, a **sigil** controls linearity and mutability:
 | (none) | Immutable binding |
 | `~` | Mutable binding |
 | `%` | Linear binding (must be consumed exactly once) |
+| `&` | Borrowed reference (read-only access without consumption) |
+
 
 ```nexus
-fn main() -> unit do
+let main = fn() -> unit do
   let x = 10
   let name: string = [=[ Nexus ]=]
   let ~counter: i64 = 0
@@ -136,15 +146,6 @@ All binary operators are left-associative. Precedence from lowest to highest:
 
 Assigns a new value to a mutable binding. The left-hand side is any expression that resolves to a mutable location.
 
-### Drop statement
-
-```nexus
-drop %resource
-drop value
-```
-
-`drop` is a statement (not a function call). It explicitly consumes linear values and can also discard non-linear values.
-
 ## Types
 
 ### Primitive types
@@ -178,26 +179,26 @@ drop value
 | `&T` | Borrowed reference |
 | `%T` | Linear type (must be consumed once) |
 
-### Function / effect types
+### Function / signature types
 
 ```nexus
 (label: T) -> R                       // pure function
 (a: i64, b: i64) -> i64               // labeled parameters
-() -> unit effect { IO }              // with row effect
-(x: T) -> R effect IO                 // with bare effect name
-(x: T) -> R effect { E1, E2 | r }    // with open effect row
+() -> unit effect { Console }         // builtin effects
+() -> string require { Net }          // coeffect requirements
+(x: T) -> R require { C | r } effect { E | e } // open rows
 ```
 
 An unlabeled parameter uses `_` as an internal label.
 
-### Effect rows
+### Signature rows
 
-Effect sets use `{}` with optional tail variable for polymorphism:
+`require`/`effect` rows use `{}` with optional tail variables:
 
 ```nexus
-{ IO }                  // single effect
-{ IO, State }           // multiple effects
-{ IO | r }              // open row with tail variable r
+{ Console }             // single entry
+{ Net, Fs }             // multiple entries
+{ Console | e }         // open row with tail variable
 ```
 
 ### Type definitions
@@ -272,7 +273,7 @@ try
   return result
 catch err ->
   match err do
-    case NotFound(msg) -> perform print(val: msg)
+    case NotFound(msg) -> print(val: msg)
   endmatch
   return ()
 endtry
@@ -299,71 +300,72 @@ let err = PermissionDenied(msg: [=[/tmp/data]=], code: 13)
 raise err
 ```
 
-## Effects and `perform`
+## Function Calls and Signatures
 
-Effectful operations must be called with `perform`:
+Function calls are direct:
 
 ```nexus
-perform print(val: [=[ hello ]=])
-perform Logger.log(msg: text)
+print(val: [=[ hello ]=])
+Logger.log(msg: text)
 ```
 
-The function path in `perform` may be dotted (e.g., `Module.function`).
-Pure calls must not use `perform`.
+The type checker validates each call against the surrounding `require` and `effect` signatures.
 
 ## Borrow
 
-The `borrow` expression creates a borrowed reference to a binding without consuming it:
+The `&` sigil creates a borrowed reference to a binding without consuming it. It can be used as a prefix operator in expressions or as a sigil in `let` bindings:
 
 ```nexus
-let borrowed = borrow arr         // borrow immutable
-let b2 = borrow ~x                // borrow mutable
-let b3 = borrow %resource         // borrow linear
+let borrowed = &arr         // &immutable
+let &b2 = ~x                // &mutable using let sigil
+let b3 = &%resource         // &linear using prefix operator
 ```
+
+> **Note:** `&` serves both as a prefix operator (`&%arr`) and as a let-binding sigil (`let &b = ...`).
 
 ## Ports and Handlers
 
 ### Port
 
-A `port` defines an effect interface — a named set of function signatures:
+A `port` defines a coeffect interface.
 
 ```nexus
 pub port Logger do
-  fn log(msg: string) -> unit effect { IO }
-  fn warn(msg: string) -> unit effect { IO }
+  fn log(msg: string) -> unit
+  fn warn(msg: string) -> unit
 endport
 ```
 
-- `pub` makes the port visible to other modules.
+### Handler and Inject
 
-### Handler
-
-A `handler` provides an implementation for a port:
+A handler is an expression that implements one port.
 
 ```nexus
-pub handler StdoutLogger for Logger do
-  fn log(msg: string) -> unit effect { IO } do
-    perform print(val: msg)
+let stdout_logger = handler Logger do
+  fn log(msg: string) -> unit effect { Console } do
+    print(val: msg)
     return ()
   endfn
-  fn warn(msg: string) -> unit effect { IO } do
-    perform print(val: msg)
+  fn warn(msg: string) -> unit effect { Console } do
+    print(val: msg)
     return ()
   endfn
 endhandler
-```
 
-- `pub` makes the handler visible to other modules.
+inject stdout_logger do
+  Logger.log(msg: [=[from handler]=])
+endinject
+```
 
 ## Imports
 
 Three import forms are available:
 
 ```nexus
-import from [=[path/to/module.nx]=]              // anonymous import
-import as math from [=[path/to/math.nx]=]        // namespace alias
-import { add, sub } from [=[path/to/math.nx]=]   // named items
-import external [=[path/to/lib.wasm]=]           // Wasm module
+import from path/to/module.nx              // anonymous import
+import as math from path/to/math.nx        // namespace alias
+import { add, sub } from path/to/math.nx   // named items
+import external path/to/lib.wasm           // Wasm module
 ```
 
 ## Concurrency (`conc`)
@@ -412,7 +414,7 @@ top_level     ::= type_def
                 | exception_def
                 | import_def
                 | port_def
-                | handler_def
+                | external_def
                 | let_def
                 | comment
 
@@ -426,20 +428,17 @@ variant_def   ::= UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
 variant_field ::= type | IDENT ":" type
 exception_def ::= [ "pub" ] "exception" UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
 
-import_def    ::= "import" "external" STRING_LITERAL
-                | "import" "{" IDENT ( "," IDENT )* "}" "from" STRING_LITERAL
-                | "import" "as" IDENT "from" STRING_LITERAL
-                | "import" "from" STRING_LITERAL
+import_def    ::= "import" "external" import_path
+                | "import" "{" IDENT ( "," IDENT )* "}" "from" import_path
+                | "import" "as" IDENT "from" import_path
+                | "import" "from" import_path
+import_path   ::= ( ALPHA | DIGIT | "_" | "-" | "/" | "." )+
 
 port_def      ::= [ "pub" ] "port" UIDENT "do" fn_signature* "endport"
-fn_signature  ::= "fn" IDENT param_list "->" type [ "effect" effect_type ]
-
-handler_def   ::= [ "pub" ] "handler" UIDENT "for" UIDENT "do"
-                  handler_fn*
-                  "endhandler"
-handler_fn    ::= "fn" IDENT [ type_params ] param_list "->" type [ "effect" effect_type ] "do" stmt* "endfn"
+fn_signature  ::= "fn" IDENT param_list "->" type [ "require" effect_type ] [ "effect" effect_type ]
 
 let_def       ::= [ "pub" ] "let" IDENT [ ":" type ] "=" expr
+external_def  ::= [ "pub" ] "external" IDENT "=" STRING_LITERAL ":" [ type_params ] arrow_type
 
 (* ── Parameters ─────────────────────────────────────────────── *)
 
@@ -476,10 +475,10 @@ array_type    ::= "[|" type "|]"
 generic_type  ::= UIDENT "<" type ( "," type )* ">"
 
 row_type      ::= "{" type ( "," type )* [ "|" type ] "}"
-                  (* used as effect sets *)
+                  (* used as require/effect rows *)
 
 arrow_type    ::= "(" [ arrow_param ( "," arrow_param )* ] ")"
-                  "->" type [ "effect" effect_type ]
+                  "->" type [ "require" effect_type ] [ "effect" effect_type ]
 arrow_param   ::= IDENT ":" type | type
 
 effect_type   ::= row_type | generic_type | UIDENT
@@ -489,10 +488,10 @@ effect_type   ::= row_type | generic_type | UIDENT
 stmt          ::= let_stmt
                 | return_stmt
                 | assign_stmt
-                | drop_stmt
                 | if_stmt
                 | match_stmt
                 | try_stmt
+                | inject_stmt
                 | conc_stmt
                 | comment
                 | expr_stmt
@@ -500,7 +499,6 @@ stmt          ::= let_stmt
 let_stmt      ::= "let" [ sigil ] IDENT [ ":" type ] "=" expr
 return_stmt   ::= "return" expr
 assign_stmt   ::= expr "<-" expr
-drop_stmt     ::= "drop" [ sigil ] IDENT
 
 if_stmt       ::= "if" expr "then" stmt* [ "else" stmt* ] "endif"
 
@@ -508,6 +506,7 @@ match_stmt    ::= "match" expr "do" match_case* "endmatch"
 match_case    ::= "case" pattern "->" stmt*
 
 try_stmt      ::= "try" stmt* "catch" IDENT "->" stmt* "endtry"
+inject_stmt   ::= "inject" IDENT ( "," IDENT )* "do" stmt* "endinject"
 
 conc_stmt     ::= "conc" "do" task_def* "endconc"
 task_def      ::= "task" IDENT [ "effect" effect_type ] "do" stmt* "endtask"
@@ -537,8 +536,7 @@ atom_expr     ::= "(" expr ")"
                 | raise_expr
                 | borrow_expr
                 | lambda_expr
-                | external_expr
-                | perform_call
+                | handler_expr
                 | call_expr
                 | constructor_expr
                 | record_expr
@@ -548,15 +546,16 @@ atom_expr     ::= "(" expr ")"
                 | variable
 
 raise_expr        ::= "raise" expr
-borrow_expr       ::= "borrow" [ sigil ] IDENT
+borrow_expr       ::= "&" [ sigil ] IDENT
 lambda_expr       ::= "fn" [ type_params ] "(" [ param ( "," param )* ] ")"
-                      "->" type [ "effect" effect_type ]
+                      "->" type [ "require" effect_type ] [ "effect" effect_type ]
                       "do" stmt* "endfn"
-external_expr     ::= "external" STRING_LITERAL ":" arrow_type
-perform_call      ::= "perform" dotted_ident "(" [ labeled_arg ( "," labeled_arg )* ] ")"
+handler_expr      ::= "handler" UIDENT "do" handler_fn* "endhandler"
+handler_fn        ::= "fn" IDENT [ type_params ] "(" [ param ( "," param )* ] ")"
+                      "->" type [ "require" effect_type ] [ "effect" effect_type ]
+                      "do" stmt* "endfn"
 call_expr         ::= dotted_ident "(" [ labeled_arg ( "," labeled_arg )* ] ")"
-labeled_arg       ::= IDENT ":" simple_arg
-simple_arg        ::= literal | variable
+labeled_arg       ::= IDENT ":" expr
 constructor_expr  ::= UIDENT "(" [ ctor_arg ( "," ctor_arg )* ] ")"
 ctor_arg          ::= [ IDENT ":" ] expr
 record_expr       ::= "{" [ IDENT ":" expr ( "," IDENT ":" expr )* ] "}"

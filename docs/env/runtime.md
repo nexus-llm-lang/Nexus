@@ -11,15 +11,17 @@ Every executable program must define a `main` function.
 The `main` function must have the following signature:
 
 ```nexus
-fn main() -> unit
+let main = fn () -> unit require { ... } effect { ... } do
+  ...
+endfn
 ```
 
 - **Parameters**: It must take no arguments.
 - **Return Type**: It must return `unit`.
-- **Visibility**: It must be private (no `pub` modifier).
-- **Effects**: It must declare one of `effect {}`, `effect { IO }`, or `effect { IO, Net }`.
-  - `Exn` is not allowed on `main`.
-  - `effect { Net }` alone is rejected.
+- **Visibility**: It must be private (`pub let main` is rejected).
+- **Effects**: `main` may declare only `Console` in `effect` (or be empty).
+- **Coeffects**: `main` may declare only `Net` and/or `Fs` in `require` (or be empty).
+- **Exn**: `main` cannot expose `Exn` in its effect row.
 
 ### Execution
 

@@ -54,7 +54,7 @@ Mutable, linear arrays are supported. Arrays are inherently linear to ensure uni
 ```nexus
 let %arr: [| i64 |] = [| 1, 2, 3 |]
 %arr[0] <- 42
-let val = (borrow %arr)[0]
+let val = (&%arr)[0]
 ```
 
 Arrays cannot contain mutable references (`Ref<T>`).
@@ -63,34 +63,28 @@ Arrays cannot contain mutable references (`Ref<T>`).
 
 ### Linear Types
 
-Linear types (prefixed with `%`) must be consumed exactly once. They ensure resources (like database transactions) are never leaked or reused inappropriately.
+Linear types (prefixed with `%`) ensure resources (like database transactions) are never leaked or reused inappropriately.
 
-`drop` is a language statement for explicit consumption.
-
-```nexus
-drop <expr>
-```
-
-When `val` is linear (for example `%Tx`, arrays, or user-defined values bound with `%`), `drop` consumes it exactly once.
-For non-linear values (`i32`, `f64`, `string`, etc.), `drop` is allowed and simply discards the value.
-If a user-defined constructor takes a linear argument (for example `[| T |]`), constructed values of that ADT are also treated as linear.
+- **Primitive** linear values (`i64`, `f64`, `bool`, `string`, `unit`) are automatically released at scope end. The `%` sigil on primitives is unnecessary and triggers a compiler warning.
+- **Composite** linear values (Records, ADTs, arrays) must be explicitly consumed via pattern matching or function calls.
+- If a user-defined constructor takes a linear argument (for example `[| T |]`), constructed values of that ADT are also treated as linear.
 
 ```nexus
 let %tx = db.begin_tx()
-perform db.commit(tx: %tx) // tx is consumed
+db.commit(tx: %tx) // tx is consumed
 ```
 
 ### Borrowing
 
-The `borrow` keyword allows temporary, immutable access to a linear value without consuming it.
+The `&` keyword allows temporary, immutable access to a linear value without consuming it.
 
 ```nexus
 fn peek(x: &i64) -> unit do ... endfn
 
 let %x = 10
-let x_ref = borrow %x
-perform peek(x: x_ref) // %x is NOT consumed
-drop %x          // %x is consumed here
+let x_ref = &%x
+peek(x: x_ref) // %x is NOT consumed
+// %x is auto-dropped at scope end (primitive)
 ```
 
 ### Mutable References
@@ -104,17 +98,18 @@ let ~count = 1
 
 ## Effect Types
 
-Function effects are represented as row-polymorphic types `{ E1, E2 | r }`.
+Function signatures are split into:
+
+- `require { ... }` rows for coeffects (ports)
+- `effect { ... }` rows for builtin effects
+
+Both use row-polymorphic forms like `{ E1, E2 | r }`.
 
 ```nexus
-fn g() -> unit effect { IO, Net } do ... endfn
+fn g() -> unit require { Net } effect { Console } do ... endfn
 ```
 
-The `perform` keyword is mandatory for effectful calls and forbidden for pure calls.
-
-```nexus
-perform g()
-```
+Calls use normal function-call syntax; compatibility with `require`/`effect` is checked statically.
 
 ## Function Values and Closures
 

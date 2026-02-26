@@ -30,11 +30,18 @@ Sigils are not just syntactic markers; they represent fundamental semantic const
 - **Concurrency:** Mutable references cannot be captured by concurrent tasks (`conc`) or asynchronous closures to prevent race conditions.
 
 ### Linearity (`%`)
-- **Exactly Once:** A linear binding must be used exactly once. It must be consumed by a terminating operation, such as a function call, a return, or an explicit `drop`.
+- **Exactly Once (composites):** A non-primitive linear binding must be consumed exactly once via a function call, a return, or pattern matching.
+- **Auto-drop (primitives):** Primitive linear values (`i64`, `f64`, `bool`, `string`, `unit`) are automatically released at scope end. Using `%` on primitives is valid but triggers a warning.
 - **Static Enforcement:** The type system ensures linear resources (like file handles or sockets) are never leaked and never used after consumption.
-- **No Discard:** The wildcard pattern `_` cannot be used to discard a linear value. Every linear resource must be explicitly handled.
+- **No Discard:** The wildcard pattern `_` cannot be used to discard a non-primitive linear value. Every composite linear resource must be explicitly handled.
 - **No Ref:** Mutable references to linear types (`Ref<%T>`) are strictly forbidden to prevent aliasing violations.
 - **Weakening at Calls:** A plain value `T` can be passed to a function expecting a linear parameter `%T`. In this context, the value is treated as a linear resource for the duration of the call.
+
+### Borrowing (`&`)
+- **Immutable View:** The `&` sigil represents a **borrowed reference** that provides read-only access to a value.
+- **Non-Consuming:** Borrowing does not consume the resource, allowing it to be used again later. This is essential for inspecting linear values (`%T`) without destroying them.
+- **Generic Applicability:** While frequently seen with arrays (e.g., `&[| T |]`) to avoid copying large data, `&` is a general type constructor `&T` that can be applied to any type.
+- **Temporary access:** A &is always temporary and its lifetime is tied to the scope of the binding it was created from.
 
 ## Closures and Captures
 
@@ -42,10 +49,13 @@ Sigils are not just syntactic markers; they represent fundamental semantic const
 - **Mutability Restriction:** Closures cannot capture mutable bindings (`~`).
 - **Linearity Propagation:** If a closure captures a linear value (`%`), the closure itself becomes linear and can only be invoked (consumed) once.
 
-Nexus uses a shallow effect system.
+Nexus tracks two signature dimensions:
 
-- **Perform:** When `perform op(...)` is called, the current computation is suspended, and the runtime searches the stack for the nearest `handler` that handles the corresponding `port`.
-- **Resumption:** Nexus effects in the current implementation are non-resumable (one-shot). Once an effect is handled, the control flow is determined by the handler's return value within the context of the try-catch or handler block. (Note: Future versions may explore resumable continuations).
+- **Effects (`effect`)** for builtin runtime actions (`Console`, `Exn`).
+- **Coeffects (`require`)** for environment capabilities declared by `port`.
+
+Handlers are values (`handler Port do ... endhandler`) and are introduced lexically with `inject ... do ... endinject`.
+`try ... catch` discharges `Exn` from the protected region.
 
 ## Concurrency Model
 

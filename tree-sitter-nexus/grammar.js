@@ -36,6 +36,8 @@ module.exports = grammar({
     // `T` vs `T<U>` — bare type identifier or start of generic_type
     [$.generic_type, $._type],
     [$.generic_type, $._effect_type],
+    // `&x` — borrow_expr starting with `&` or sigil `&` in variable/let_stmt
+    [$.sigil, $.borrow_expr],
   ],
 
   rules: {
@@ -64,7 +66,7 @@ module.exports = grammar({
         $.exception_def,
         $.import_def,
         $.port_def,
-        $.handler_def,
+        $.external_def,
         $.let_def,
         $.line_comment,
         $.block_comment
@@ -118,7 +120,7 @@ module.exports = grammar({
           seq("external", field("path", $.import_path)),
           seq(
             "{",
-            field("items", commaSep1($.identifier)),
+            field("items", commaSep1(choice($.identifier, $.uident))),
             "}",
             "from",
             field("path", $.import_path)
@@ -133,8 +135,9 @@ module.exports = grammar({
         )
       ),
 
-    // Import path uses bracket string literal: [=[path/to/module.nx]=]
-    import_path: ($) => $.string_literal,
+    // Bare import path: alphanumeric segments separated by / with optional .ext
+    // e.g. nxlib/stdlib/fs.nx, math.wasm
+    import_path: ($) => /[a-zA-Z0-9_\-/.]+/,
 
     // [pub] port Name do fn sig ... endport
     port_def: ($) =>
@@ -154,23 +157,11 @@ module.exports = grammar({
         field("params", $.param_list),
         "->",
         field("ret_type", $._type),
+        optional(seq("require", field("requires", $._effect_type))),
         optional(seq("effect", field("effects", $._effect_type)))
       ),
 
-    // [pub] handler Name for PortName do handler_fn* endhandler
-    handler_def: ($) =>
-      seq(
-        optional("pub"),
-        "handler",
-        field("name", $.uident),
-        "for",
-        field("port_name", $.uident),
-        "do",
-        repeat($.handler_fn),
-        "endhandler"
-      ),
-
-    // fn name[<T>](params) -> ret [effect eff] do body endfn
+    // fn name[<T>](params) -> ret [require req] [effect eff] do body endfn
     handler_fn: ($) =>
       seq(
         "fn",
@@ -179,6 +170,7 @@ module.exports = grammar({
         field("params", $.param_list),
         "->",
         field("ret_type", $._type),
+        optional(seq("require", field("requires", $._effect_type))),
         optional(seq("effect", field("effects", $._effect_type))),
         "do",
         field("body", repeat($._stmt)),
@@ -210,8 +202,8 @@ module.exports = grammar({
         field("type", $._type)
       ),
 
-    // ~ = mutable, % = linear, (none) = immutable
-    sigil: (_) => choice("~", "%"),
+    // ~ = mutable, % = linear, & = borrow, (none) = immutable
+    sigil: (_) => choice("~", "%", "&"),
 
     // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -277,8 +269,8 @@ module.exports = grammar({
         ">"
       ),
 
-    // (label: T, ...) -> ret [effect eff]
-    // prec.right makes the optional 'effect' clause greedy (prefer consuming it)
+    // (label: T, ...) -> ret [require req] [effect eff]
+    // prec.right makes the optional require/effect clauses greedy
     arrow_type: ($) =>
       prec.right(
         seq(
@@ -296,6 +288,7 @@ module.exports = grammar({
           ")",
           "->",
           field("ret", $._type),
+          optional(seq("require", field("require", $._effect_type))),
           optional(seq("effect", field("effect", $._effect_type)))
         )
       ),
@@ -314,10 +307,10 @@ module.exports = grammar({
         $.let_stmt,
         $.return_stmt,
         $.assign_stmt,
-        $.drop_stmt,
         $.if_stmt,
         $.match_stmt,
         $.try_stmt,
+        $.inject_stmt,
         $.conc_stmt,
         $.line_comment,
         $.block_comment,
@@ -340,14 +333,6 @@ module.exports = grammar({
     // target <- value
     assign_stmt: ($) =>
       seq(field("target", $._expr), "<-", field("value", $._expr)),
-
-    // drop [sigil] name
-    drop_stmt: ($) =>
-      seq(
-        "drop",
-        optional(field("sigil", $.sigil)),
-        field("name", $.identifier)
-      ),
 
     // if cond then stmts [else stmts] endif
     if_stmt: ($) =>
@@ -388,6 +373,16 @@ module.exports = grammar({
         "->",
         field("catch_body", repeat($._stmt)),
         "endtry"
+      ),
+
+    // inject handler1, handler2 do stmts endinject
+    inject_stmt: ($) =>
+      seq(
+        "inject",
+        sep1(",", field("handler", $.identifier)),
+        "do",
+        field("body", repeat($._stmt)),
+        "endinject"
       ),
 
     // conc do task "name" do stmts endtask ... endconc
@@ -501,8 +496,7 @@ module.exports = grammar({
         $.raise_expr,
         $.borrow_expr,
         $.lambda_expr,
-        $.external_expr,
-        $.perform_call,
+        $.handler_expr,
         $.call_expr,
         $.constructor_expr,
         $.record_expr,
@@ -517,15 +511,15 @@ module.exports = grammar({
     // raise expr
     raise_expr: ($) => seq("raise", field("value", $._expr)),
 
-    // borrow [sigil] name
+    // & [sigil] name
     borrow_expr: ($) =>
       seq(
-        "borrow",
+        "&",
         optional(field("sigil", $.sigil)),
         field("name", $.identifier)
       ),
 
-    // fn [<T>](params) -> ret [effect eff] do body endfn
+    // fn [<T>](params) -> ret [require req] [effect eff] do body endfn
     lambda_expr: ($) =>
       prec.right(
         seq(
@@ -534,6 +528,7 @@ module.exports = grammar({
           field("params", $.param_list),
           "->",
           field("ret_type", $._type),
+          optional(seq("require", field("requires", $._effect_type))),
           optional(seq("effect", field("effects", $._effect_type))),
           "do",
           field("body", repeat($._stmt)),
@@ -541,31 +536,27 @@ module.exports = grammar({
         )
       ),
 
-    // external [=[wasm_symbol]=] : arrow_type
-    external_expr: ($) =>
+    // [pub] external name = [=[wasm_symbol]=] : [<T>] arrow_type
+    external_def: ($) =>
       seq(
+        optional("pub"),
         "external",
+        field("name", $.identifier),
+        "=",
         field("wasm_name", $.string_literal),
         ":",
+        optional(field("type_params", $.type_params)),
         field("type", $.arrow_type)
       ),
 
-    // perform path(label: value, ...)
-    // The path can start with UIDENT for port-qualified calls: perform Logger.log(msg)
-    perform_call: ($) =>
+    // handler PortName do handler_fn* endhandler
+    handler_expr: ($) =>
       seq(
-        "perform",
-        field("func", $.perform_path),
-        "(",
-        field("args", commaSep($.labeled_arg)),
-        ")"
-      ),
-
-    // Path used in perform calls — first segment can be UIDENT (port name) or IDENT (module/function)
-    perform_path: ($) =>
-      seq(
-        choice($.identifier, $.uident),
-        repeat(seq(".", $.identifier))
+        "handler",
+        field("port_name", $.uident),
+        "do",
+        repeat($.handler_fn),
+        "endhandler"
       ),
 
     // path(label: value, ...)
@@ -582,10 +573,8 @@ module.exports = grammar({
       seq(
         field("label", $.identifier),
         ":",
-        field("value", $._simple_arg)
+        field("value", $._expr)
       ),
-
-    _simple_arg: ($) => choice($.literal, $.variable),
 
     // Constructor(label: value, ...)  — optional labels, UIDENT name
     constructor_expr: ($) =>
@@ -629,8 +618,13 @@ module.exports = grammar({
         field("name", $.identifier)
       ),
 
-    // a.b.c  — used as function path in calls
-    dotted_identifier: ($) => sep1(".", $.identifier),
+    // a.b.c or Logger.log — used as function path in calls
+    // UIDENT-start requires at least one dot segment to avoid conflict with constructor_expr
+    dotted_identifier: ($) =>
+      choice(
+        sep1(".", $.identifier),
+        seq($.uident, ".", sep1(".", $.identifier))
+      ),
 
     // ─── Literals ────────────────────────────────────────────────────────────
 

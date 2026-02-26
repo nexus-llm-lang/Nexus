@@ -12,7 +12,7 @@ pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
 }
 
 #[no_mangle]
-pub extern "C" fn print(ptr: i32, len: i32) {
+pub extern "C" fn __nx_print(ptr: i32, len: i32) {
     let Some((offset, len)) = checked_ptr_len(ptr, len) else {
         return;
     };

@@ -441,7 +441,6 @@ fn collect_stmt_locals(
                 collect_stmt_locals(then_body, local_map, next_local_index, local_decls_flat)?;
                 collect_stmt_locals(else_body, local_map, next_local_index, local_decls_flat)?;
             }
-            AnfStmt::Drop(_) => {}
         }
     }
     Ok(())
@@ -488,13 +487,6 @@ fn compile_stmt(
                 ))
             })?;
             out.instruction(&Instruction::LocalSet(local.index));
-            Ok(())
-        }
-        AnfStmt::Drop(atom) => {
-            if !matches!(atom.typ(), Type::Unit) {
-                compile_atom(atom, out, local_map, layout)?;
-                out.instruction(&Instruction::Drop);
-            }
             Ok(())
         }
         AnfStmt::If {
@@ -1332,7 +1324,6 @@ fn stmt_uses_object_heap(stmt: &AnfStmt) -> bool {
             then_body.iter().any(stmt_uses_object_heap)
                 || else_body.iter().any(stmt_uses_object_heap)
         }
-        AnfStmt::Drop(_) => false,
         AnfStmt::TryCatch {
             body, catch_body, ..
         } => body.iter().any(stmt_uses_object_heap) || catch_body.iter().any(stmt_uses_object_heap),
@@ -1362,7 +1353,6 @@ fn external_uses_string_abi(ext: &AnfExternal) -> bool {
 fn collect_strings_in_stmt(stmt: &AnfStmt, out: &mut Vec<String>) {
     match stmt {
         AnfStmt::Let { expr, .. } => collect_strings_in_expr(expr, out),
-        AnfStmt::Drop(atom) => collect_strings_in_atom(atom, out),
         AnfStmt::If {
             cond,
             then_body,

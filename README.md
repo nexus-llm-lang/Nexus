@@ -32,7 +32,7 @@ Nexus is designed from the ground up to be "AI-friendly":
 Run the REPL:
 ```bash
 nexus
->> perform println(val: [=[hello]=])
+>> print(val: [=[hello]=])
 hello
 () : unit
 ```
@@ -44,7 +44,7 @@ nexus run example.nx
 
 Build artifacts:
 ```bash
-nexus build example.nx         # writes ./main.out (packed executable)
+nexus build example.nx         # writes packed ./main.out
 nexus build example.nx --wasm  # writes ./main.wasm (component wasm)
 ```
 
@@ -57,9 +57,10 @@ wasmtime run -Scli main.wasm
 wasmtime run -Scli -Shttp -Sinherit-network -Sallow-ip-name-lookup -Stcp main.wasm
 ```
 
-Pack into a single executable:
+Build packed executable with explicit output:
 ```bash
-nexus pack example.nx -o example
+nexus build example.nx -o example
+# writes ./example
 ```
 
 See [docs/cli.md](docs/cli.md) for the full CLI reference.
@@ -81,11 +82,11 @@ let fib = fn (n: i64) -> i64 do
   return a + b
 endfn
 
-let main = fn () -> unit effect { IO } do
+let main = fn () -> unit effect { Console } do
   let res = fib(n: 10)
   let s = i64_to_string(val: res)
   let msg = [=[ Fibonacci(10) = ]=] ++ s
-  perform print(val: msg)
+  print(val: msg)
   return ()
 endfn
 ```
@@ -97,7 +98,7 @@ endfn
 | [Syntax](docs/spec/syntax.md) | Grammar and EBNF |
 | [Types](docs/spec/types.md) | Type system and inference |
 | [Semantics](docs/spec/semantics.md) | Evaluation model |
-| [Effects](docs/spec/effects.md) | Effect system |
+| [Effects](docs/spec/effect_system.md) | Effect/coeffect system |
 | [FFI](docs/env/ffi.md) | Wasm interop |
 | [Runtime](docs/env/runtime.md) | Entrypoint and execution |
 | [Stdlib](docs/env/stdlib.md) | Standard library |

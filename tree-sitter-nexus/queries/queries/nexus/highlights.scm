@@ -17,10 +17,11 @@
 "return" @keyword.return
 "raise" @keyword.raise
 
-; Effect system
-"perform" @keyword.perform
+; Effect/coeffect system
 "effect" @keyword.effect
-"borrow" @keyword.borrow
+"require" @keyword.require
+"inject" @keyword.inject
+"endinject" @keyword.inject
 
 ; Error handling
 "try" @keyword.try
@@ -47,11 +48,9 @@
 "port" @keyword.port
 "endport" @keyword.port
 "handler" @keyword.handler
-"for" @keyword.handler
 "endhandler" @keyword.handler
 
 "let" @keyword.let
-"drop" @keyword.drop
 
 ; ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -88,9 +87,6 @@
 (call_expr
   func: (dotted_identifier) @function.call)
 
-(perform_call
-  func: (perform_path) @function.call)
-
 (constructor_expr
   name: (uident) @constructor)
 
@@ -126,6 +122,9 @@
   name: (identifier) @variable)
 
 (let_def
+  name: (identifier) @variable)
+
+(external_def
   name: (identifier) @variable)
 
 (variable_pattern
@@ -186,6 +185,8 @@
 (port_def
   name: (uident) @type)
 
-(handler_def
-  name: (uident) @type
+(handler_expr
   port_name: (uident) @type)
+
+(inject_stmt
+  handler: (identifier) @variable)

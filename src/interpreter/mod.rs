@@ -6,18 +6,15 @@ pub mod repl;
 use crate::lang::ast::*;
 use crate::lang::stdlib::load_stdlib_nx_programs;
 use crate::runtime::ExecutionCapabilities;
-use bytes::Bytes;
 use chumsky::Parser;
-use http::{HeaderName, HeaderValue, Method};
-use http_body_util::{BodyExt, Full};
 use std::collections::HashMap;
-use std::str::FromStr;
+use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
+use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use ureq::RequestExt;
 use wasmtime::*;
 use wasmtime_wasi::WasiCtxBuilder;
-use wasmtime_wasi_http::body::HyperOutgoingBody;
-use wasmtime_wasi_http::types::{default_send_request_handler, OutgoingRequestConfig};
 
 const NEXUS_HOST_HTTP_MODULE: &str = "nexus:cli/nexus-host";
 const NEXUS_HOST_HTTP_FUNC: &str = "host-http-request";
@@ -26,6 +23,18 @@ const MAX_HTTP_HEADERS_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_FFI_STRING_BYTES: usize = 4 * 1024 * 1024;
+
+struct ServerEntry {
+    listener: TcpListener,
+    _addr: String,
+}
+
+struct ConnectionEntry {
+    stream: std::net::TcpStream,
+}
+
+type ServerTable = Arc<Mutex<Vec<Option<ServerEntry>>>>;
+type ConnectionTable = Arc<Mutex<Vec<Option<ConnectionEntry>>>>;
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -40,6 +49,7 @@ pub enum Value {
     Ref(Arc<Mutex<Value>>),
     NativeFunction(String),
     Function(String),
+    Handler(String, Vec<Function>), // (coeffect_name, functions)
 }
 
 impl PartialEq for Value {
@@ -62,6 +72,7 @@ impl PartialEq for Value {
             },
             (Value::NativeFunction(a), Value::NativeFunction(b)) => a == b,
             (Value::Function(a), Value::Function(b)) => a == b,
+            (Value::Handler(a, _), Value::Handler(b, _)) => a == b,
             _ => false,
         }
     }
@@ -115,6 +126,7 @@ impl std::fmt::Display for Value {
             Value::Ref(_) => write!(f, "<ref>"),
             Value::NativeFunction(n) => write!(f, "<native fn {}>", n),
             Value::Function(n) => write!(f, "<fn {}>", n),
+            Value::Handler(name, _) => write!(f, "<handler {}>", name),
         }
     }
 }
@@ -140,13 +152,6 @@ impl std::fmt::Display for EvalError {
 
 type EvalResult = Result<ExprResult, EvalError>;
 
-fn body_to_hyper_outgoing(body: &[u8]) -> HyperOutgoingBody {
-    use std::convert::Infallible;
-    Full::new(Bytes::copy_from_slice(body))
-        .map_err(|never: Infallible| match never {})
-        .boxed_unsync()
-}
-
 fn perform_wasi_http_request(
     method: &str,
     url: &str,
@@ -158,7 +163,8 @@ fn perform_wasi_http_request(
     } else {
         method.trim()
     };
-    let method = Method::from_str(method).map_err(|e| format!("invalid method: {}", e))?;
+    let method = ureq::http::Method::from_bytes(method.trim().as_bytes())
+        .map_err(|e| format!("invalid method: {}", e))?;
     let url = url.trim();
     if url.is_empty() {
         return Err("empty URL".to_string());
@@ -173,11 +179,10 @@ fn perform_wasi_http_request(
         return Err(format!("body exceeds {} bytes", MAX_HTTP_BODY_BYTES));
     }
 
-    let use_tls = url.starts_with("https://");
-    let mut request = http::Request::builder()
-        .method(method)
+    let mut request = ureq::http::Request::builder()
+        .method(method.as_str())
         .uri(url)
-        .body(body_to_hyper_outgoing(body.as_bytes()))
+        .body(body.as_bytes().to_vec())
         .map_err(|e| format!("invalid request: {}", e))?;
 
     for line in headers.lines() {
@@ -188,50 +193,40 @@ fn perform_wasi_http_request(
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        let Ok(name) = HeaderName::from_str(name.trim()) else {
+        let Ok(name) = ureq::http::header::HeaderName::from_bytes(name.trim().as_bytes()) else {
             continue;
         };
-        let Ok(value) = HeaderValue::from_str(value.trim()) else {
+        let Ok(value) = ureq::http::HeaderValue::from_str(value.trim()) else {
             continue;
         };
         request.headers_mut().append(name, value);
     }
 
-    if !request.headers().contains_key(http::header::HOST) {
-        if let Some(authority) = request.uri().authority() {
-            if let Ok(value) = HeaderValue::from_str(authority.as_str()) {
-                request.headers_mut().insert(http::header::HOST, value);
-            }
-        }
+    let agent_config = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_response(Some(Duration::from_secs(30)))
+        .timeout_recv_body(Some(Duration::from_secs(30)))
+        .timeout_send_body(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build();
+    let agent: ureq::Agent = agent_config.into();
+
+    let mut response = request
+        .with_agent(&agent)
+        .run()
+        .map_err(|e| format!("{:?}", e))?;
+    let status = response.status().as_u16();
+    let response_body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("failed to read response body: {}", e))?;
+    if response_body.len() > MAX_HTTP_RESPONSE_BYTES {
+        return Err(format!(
+            "response exceeds {} bytes",
+            MAX_HTTP_RESPONSE_BYTES
+        ));
     }
-
-    let config = OutgoingRequestConfig {
-        use_tls,
-        connect_timeout: Duration::from_secs(10),
-        first_byte_timeout: Duration::from_secs(30),
-        between_bytes_timeout: Duration::from_secs(30),
-    };
-
-    wasmtime_wasi::runtime::in_tokio(async move {
-        let incoming = default_send_request_handler(request, config)
-            .await
-            .map_err(|e| format!("{:?}", e))?;
-        let status = incoming.resp.status().as_u16();
-        let bytes = incoming
-            .resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| format!("{:?}", e))?
-            .to_bytes();
-        if bytes.len() > MAX_HTTP_RESPONSE_BYTES {
-            return Err(format!(
-                "response exceeds {} bytes",
-                MAX_HTTP_RESPONSE_BYTES
-            ));
-        }
-        Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
-    })
+    Ok((status, response_body))
 }
 
 fn encode_http_bridge_error(message: impl AsRef<str>) -> String {
@@ -325,10 +320,59 @@ fn write_component_string_result(
     let _ = memory.write(&mut *caller, ret_ptr as usize, &pair);
 }
 
+fn parse_http_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String, String)> {
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+
+    // Read request line: METHOD PATH HTTP/1.x\r\n
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).ok()?;
+    let parts: Vec<&str> = request_line.trim_end().splitn(3, ' ').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let method = parts[0].to_string();
+    let path = parts[1].to_string();
+
+    // Read headers until \r\n\r\n
+    let mut headers = String::new();
+    let mut content_length: usize = 0;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        if line == "\r\n" || line == "\n" || line.is_empty() {
+            break;
+        }
+        let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+        if let Some(colon_pos) = trimmed.find(':') {
+            let name = trimmed[..colon_pos].trim();
+            let value = trimmed[colon_pos + 1..].trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.parse().unwrap_or(0);
+            }
+        }
+        headers.push_str(trimmed);
+        headers.push('\n');
+    }
+
+    // Read body based on Content-Length
+    let mut body = String::new();
+    if content_length > 0 {
+        let mut buf = vec![0u8; content_length];
+        reader.read_exact(&mut buf).ok()?;
+        body = String::from_utf8_lossy(&buf).to_string();
+    }
+
+    Some((method, path, headers, body))
+}
+
 fn add_nexus_host_to_linker(
     linker: &mut Linker<wasmtime_wasi::p1::WasiP1Ctx>,
     capabilities: ExecutionCapabilities,
 ) -> Result<(), String> {
+    let server_table: ServerTable = Arc::new(Mutex::new(Vec::new()));
+    let conn_table: ConnectionTable = Arc::new(Mutex::new(Vec::new()));
+
+    // --- host-http-request (existing) ---
     linker
         .func_wrap(
             NEXUS_HOST_HTTP_MODULE,
@@ -405,6 +449,264 @@ fn add_nexus_host_to_linker(
             },
         )
         .map_err(|e| format!("Failed to add nexus host HTTP import: {}", e))?;
+
+    // --- host-http-listen ---
+    {
+        let st = Arc::clone(&server_table);
+        linker
+            .func_wrap(
+                NEXUS_HOST_HTTP_MODULE,
+                "host-http-listen",
+                move |mut caller: Caller<'_, wasmtime_wasi::p1::WasiP1Ctx>,
+                      addr_ptr: i32,
+                      addr_len: i32|
+                      -> i64 {
+                    let Some(memory) =
+                        caller.get_export("memory").and_then(|e| e.into_memory())
+                    else {
+                        return -1;
+                    };
+                    let Some(addr) =
+                        read_guest_string_from_memory(&memory, &caller, addr_ptr, addr_len)
+                    else {
+                        return -1;
+                    };
+                    let listener = match TcpListener::bind(&addr) {
+                        Ok(l) => l,
+                        Err(_) => return -1,
+                    };
+                    let entry = ServerEntry {
+                        listener,
+                        _addr: addr,
+                    };
+                    let mut table = match st.lock() {
+                        Ok(t) => t,
+                        Err(_) => return -1,
+                    };
+                    // Reuse vacant slot
+                    for (i, slot) in table.iter_mut().enumerate() {
+                        if slot.is_none() {
+                            *slot = Some(entry);
+                            return i as i64;
+                        }
+                    }
+                    let idx = table.len();
+                    table.push(Some(entry));
+                    idx as i64
+                },
+            )
+            .map_err(|e| format!("Failed to add host-http-listen: {}", e))?;
+    }
+
+    // --- host-http-accept ---
+    {
+        let st = Arc::clone(&server_table);
+        let ct = Arc::clone(&conn_table);
+        linker
+            .func_wrap(
+                NEXUS_HOST_HTTP_MODULE,
+                "host-http-accept",
+                move |mut caller: Caller<'_, wasmtime_wasi::p1::WasiP1Ctx>,
+                      server_id: i64,
+                      ret_ptr: i32| {
+                    let Some(memory) =
+                        caller.get_export("memory").and_then(|e| e.into_memory())
+                    else {
+                        return;
+                    };
+
+                    let listener_clone = {
+                        let table = match st.lock() {
+                            Ok(t) => t,
+                            Err(_) => {
+                                write_component_string_result(
+                                    &mut caller, &memory, ret_ptr, "",
+                                );
+                                return;
+                            }
+                        };
+                        let idx = server_id as usize;
+                        match table.get(idx).and_then(|s| s.as_ref()) {
+                            Some(entry) => match entry.listener.try_clone() {
+                                Ok(l) => l,
+                                Err(_) => {
+                                    write_component_string_result(
+                                        &mut caller, &memory, ret_ptr, "",
+                                    );
+                                    return;
+                                }
+                            },
+                            None => {
+                                write_component_string_result(
+                                    &mut caller, &memory, ret_ptr, "",
+                                );
+                                return;
+                            }
+                        }
+                    };
+
+                    let (mut stream, _peer) = match listener_clone.accept() {
+                        Ok(pair) => pair,
+                        Err(_) => {
+                            write_component_string_result(
+                                &mut caller, &memory, ret_ptr, "",
+                            );
+                            return;
+                        }
+                    };
+
+                    let (method, path, headers, body) =
+                        match parse_http_request(&mut stream) {
+                            Some(parsed) => parsed,
+                            None => {
+                                write_component_string_result(
+                                    &mut caller, &memory, ret_ptr, "",
+                                );
+                                return;
+                            }
+                        };
+
+                    // Store stream in connection table
+                    let req_id = {
+                        let mut ct_lock = match ct.lock() {
+                            Ok(t) => t,
+                            Err(_) => {
+                                write_component_string_result(
+                                    &mut caller, &memory, ret_ptr, "",
+                                );
+                                return;
+                            }
+                        };
+                        let vacant = ct_lock.iter().position(|s| s.is_none());
+                        let entry = ConnectionEntry { stream };
+                        match vacant {
+                            Some(i) => {
+                                ct_lock[i] = Some(entry);
+                                i as i64
+                            }
+                            None => {
+                                let idx = ct_lock.len() as i64;
+                                ct_lock.push(Some(entry));
+                                idx
+                            }
+                        }
+                    };
+
+                    // Wire format: "req_id\nmethod\npath\nheaders\nbody"
+                    let wire = format!("{}\n{}\n{}\n{}\n{}", req_id, method, path, headers, body);
+                    write_component_string_result(&mut caller, &memory, ret_ptr, &wire);
+                },
+            )
+            .map_err(|e| format!("Failed to add host-http-accept: {}", e))?;
+    }
+
+    // --- host-http-respond ---
+    {
+        let ct = Arc::clone(&conn_table);
+        linker
+            .func_wrap(
+                NEXUS_HOST_HTTP_MODULE,
+                "host-http-respond",
+                move |mut caller: Caller<'_, wasmtime_wasi::p1::WasiP1Ctx>,
+                      req_id: i64,
+                      status: i64,
+                      headers_ptr: i32,
+                      headers_len: i32,
+                      body_ptr: i32,
+                      body_len: i32|
+                      -> i32 {
+                    let Some(memory) =
+                        caller.get_export("memory").and_then(|e| e.into_memory())
+                    else {
+                        return 0;
+                    };
+                    let headers_str =
+                        read_guest_string_from_memory(&memory, &caller, headers_ptr, headers_len)
+                            .unwrap_or_default();
+                    let body_str =
+                        read_guest_string_from_memory(&memory, &caller, body_ptr, body_len)
+                            .unwrap_or_default();
+
+                    let mut ct_lock = match ct.lock() {
+                        Ok(t) => t,
+                        Err(_) => return 0,
+                    };
+                    let idx = req_id as usize;
+                    let entry = if idx < ct_lock.len() {
+                        ct_lock[idx].take()
+                    } else {
+                        None
+                    };
+                    let Some(mut conn) = entry else {
+                        return 0;
+                    };
+
+                    let reason = match status {
+                        200 => "OK",
+                        201 => "Created",
+                        204 => "No Content",
+                        301 => "Moved Permanently",
+                        302 => "Found",
+                        400 => "Bad Request",
+                        403 => "Forbidden",
+                        404 => "Not Found",
+                        405 => "Method Not Allowed",
+                        500 => "Internal Server Error",
+                        _ => "OK",
+                    };
+
+                    let body_bytes = body_str.as_bytes();
+                    let mut response = format!("HTTP/1.1 {} {}\r\n", status, reason);
+                    // Add user-provided headers (newline-separated "name:value" pairs)
+                    for line in headers_str.lines() {
+                        if !line.is_empty() {
+                            response.push_str(line);
+                            response.push_str("\r\n");
+                        }
+                    }
+                    response.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
+                    response.push_str("\r\n");
+
+                    if conn.stream.write_all(response.as_bytes()).is_err() {
+                        return 0;
+                    }
+                    if conn.stream.write_all(body_bytes).is_err() {
+                        return 0;
+                    }
+                    let _ = conn.stream.flush();
+                    // Stream is dropped here, closing the connection
+                    1
+                },
+            )
+            .map_err(|e| format!("Failed to add host-http-respond: {}", e))?;
+    }
+
+    // --- host-http-stop ---
+    {
+        let st = Arc::clone(&server_table);
+        linker
+            .func_wrap(
+                NEXUS_HOST_HTTP_MODULE,
+                "host-http-stop",
+                move |_caller: Caller<'_, wasmtime_wasi::p1::WasiP1Ctx>,
+                      server_id: i64|
+                      -> i32 {
+                    let mut table = match st.lock() {
+                        Ok(t) => t,
+                        Err(_) => return 0,
+                    };
+                    let idx = server_id as usize;
+                    if idx < table.len() && table[idx].is_some() {
+                        table[idx].take(); // Drop listener
+                        1
+                    } else {
+                        0
+                    }
+                },
+            )
+            .map_err(|e| format!("Failed to add host-http-stop: {}", e))?;
+    }
+
     Ok(())
 }
 
@@ -465,7 +767,8 @@ pub struct Interpreter {
     pub enums: HashMap<String, EnumDef>,
     pub exceptions: HashMap<String, ExceptionDef>,
     pub closures: HashMap<String, Env>,
-    pub handlers: HashMap<String, Handler>,
+    pub top_level_values: HashMap<String, Value>,
+    pub handlers: HashMap<String, Vec<Function>>,
     pub native_functions: HashMap<String, Arc<dyn Fn(&[Value]) -> EvalResult + Send + Sync>>,
     pub external_functions: HashMap<String, (String, Type)>, // wasm_name, type
     pub engine: Engine,
@@ -508,6 +811,7 @@ impl Interpreter {
             enums: HashMap::new(),
             exceptions: HashMap::new(),
             closures: HashMap::new(),
+            top_level_values: HashMap::new(),
             handlers: HashMap::new(),
             native_functions: HashMap::new(),
             external_functions: HashMap::new(),
@@ -536,7 +840,8 @@ impl Interpreter {
         let mut functions = HashMap::new();
         let mut enums = HashMap::new();
         let mut exceptions = HashMap::new();
-        let mut handlers = HashMap::new();
+        let mut top_level_values = HashMap::new();
+        let handlers = HashMap::new();
         let mut external_functions = HashMap::new();
         let mut modules = HashMap::new();
         let native_functions: HashMap<String, Arc<dyn Fn(&[Value]) -> EvalResult + Send + Sync>> =
@@ -577,6 +882,7 @@ impl Interpreter {
                         type_params,
                         params,
                         ret_type,
+                        requires,
                         effects,
                         body,
                     } => {
@@ -588,14 +894,24 @@ impl Interpreter {
                                 type_params: type_params.clone(),
                                 params: params.clone(),
                                 ret_type: ret_type.clone(),
+                                requires: requires.clone(),
                                 effects: effects.clone(),
                                 body: body.clone(),
                             },
                         );
                     }
-                    Expr::External(wasm_name, typ) => {
+                    Expr::External(wasm_name, _, typ) => {
                         external_functions
                             .insert(gl.name.clone(), (wasm_name.clone(), typ.clone()));
+                    }
+                    Expr::Handler {
+                        coeffect_name,
+                        functions,
+                    } => {
+                        top_level_values.insert(
+                            gl.name.clone(),
+                            Value::Handler(coeffect_name.clone(), functions.clone()),
+                        );
                     }
                     _ => {}
                 },
@@ -605,9 +921,8 @@ impl Interpreter {
                 TopLevel::Exception(ex) => {
                     exceptions.insert(ex.name.clone(), ex.clone());
                 }
-                TopLevel::Handler(handler) => {
-                    handlers.insert(handler.port_name.clone(), handler.clone());
-                }
+                // Handlers are now expression-level (coeffect model);
+                // they get registered via inject blocks at runtime.
                 TopLevel::Import(import) => {
                     if import.is_external {
                         let module = Module::from_file(&engine, &import.path).map_err(|e| {
@@ -635,8 +950,24 @@ impl Interpreter {
                             ))
                         })?;
 
-                        let sub_interp =
-                            Interpreter::try_new_with_stdlib(p, true, capabilities.clone())?;
+                        // Imported modules should not recursively preload stdlib again.
+                        // They can still import what they need explicitly.
+                        let mut sub_interp =
+                            Interpreter::try_new_with_stdlib(p, false, capabilities.clone())?;
+                        // Imported modules still need constructor metadata (e.g. List/Nil/Cons)
+                        // that is preloaded in the parent interpreter.
+                        for (name, ed) in &enums {
+                            sub_interp
+                                .enums
+                                .entry(name.clone())
+                                .or_insert_with(|| ed.clone());
+                        }
+                        for (name, ex) in &exceptions {
+                            sub_interp
+                                .exceptions
+                                .entry(name.clone())
+                                .or_insert_with(|| ex.clone());
+                        }
 
                         if !import.items.is_empty() {
                             for item in &import.items {
@@ -645,6 +976,9 @@ impl Interpreter {
                                 }
                                 if let Some(f) = sub_interp.external_functions.get(item) {
                                     external_functions.insert(item.clone(), f.clone());
+                                }
+                                if let Some(v) = sub_interp.top_level_values.get(item) {
+                                    top_level_values.insert(item.clone(), v.clone());
                                 }
                             }
                         } else {
@@ -668,6 +1002,7 @@ impl Interpreter {
             enums,
             exceptions,
             closures: HashMap::new(),
+            top_level_values,
             handlers,
             native_functions,
             external_functions,
@@ -687,6 +1022,7 @@ impl Interpreter {
             enums: self.enums.clone(),
             exceptions: self.exceptions.clone(),
             closures: self.closures.clone(),
+            top_level_values: self.top_level_values.clone(),
             handlers: self.handlers.clone(),
             native_functions: self.native_functions.clone(),
             external_functions: self.external_functions.clone(),
@@ -828,6 +1164,11 @@ impl Interpreter {
         } else {
             Env::new()
         };
+        for (global_name, global_value) in &self.top_level_values {
+            if env.get(global_name).is_none() {
+                env.define(global_name.clone(), global_value.clone());
+            }
+        }
         for (param, arg) in func.params.iter().zip(args.iter()) {
             env.define(param.name.clone(), arg.clone());
         }
@@ -860,7 +1201,7 @@ impl Interpreter {
             }
         }
 
-        let (params, ret_type) = if let Type::Arrow(p, r, _) = typ {
+        let (params, ret_type) = if let Type::Arrow(p, r, _, _) = typ {
             (p, r)
         } else {
             return Err(runtime_error("External function must have arrow type"));
@@ -1101,14 +1442,23 @@ impl Interpreter {
         let mem = instance
             .get_memory(&mut *store, "memory")
             .ok_or_else(|| runtime_error("Wasm instance must export 'memory'"))?;
-        let mut buf = vec![0u8; len];
-        let read_result = mem.read(&mut *store, ptr_bits as usize, &mut buf);
+        let start = ptr_bits as usize;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| runtime_error("ffi string pointer range overflow"))?;
+        let decoded_result = {
+            let data = mem.data(&*store);
+            match data.get(start..end) {
+                Some(bytes) => std::str::from_utf8(bytes)
+                    .map(|s| s.to_owned())
+                    .map_err(|e| runtime_error(format!("invalid utf-8 from wasm: {}", e))),
+                None => Err(runtime_error("memory read failed: out of bounds")),
+            }
+        };
         let dealloc_result = self.deallocate_wasm_memory(ptr_i32, len_i32, store, instance);
-        if let Err(e) = read_result {
-            return Err(runtime_error(format!("memory read failed: {}", e)));
-        }
+        let decoded = decoded_result?;
         dealloc_result?;
-        String::from_utf8(buf).map_err(|e| runtime_error(format!("invalid utf-8 from wasm: {}", e)))
+        Ok(decoded)
     }
 
     fn eval_body(&mut self, body: &[Spanned<Stmt>], env: &mut Env) -> EvalResult {
@@ -1121,6 +1471,7 @@ impl Interpreter {
                         type_params,
                         params,
                         ret_type,
+                        requires,
                         effects,
                         body,
                     } = &value.node
@@ -1137,6 +1488,7 @@ impl Interpreter {
                                 type_params: type_params.clone(),
                                 params: params.clone(),
                                 ret_type: ret_type.clone(),
+                                requires: requires.clone(),
                                 effects: effects.clone(),
                                 body: body.clone(),
                             },
@@ -1175,12 +1527,6 @@ impl Interpreter {
                     }
                 }
                 Stmt::Expr(expr) => {
-                    let res = self.eval_expr(expr, env)?;
-                    if let ExprResult::EarlyReturn(_) = res {
-                        return Ok(res);
-                    }
-                }
-                Stmt::Drop(expr) => {
                     let res = self.eval_expr(expr, env)?;
                     if let ExprResult::EarlyReturn(_) = res {
                         return Ok(res);
@@ -1289,6 +1635,24 @@ impl Interpreter {
                             }
                         }
                         _ => return Err(runtime_error("Invalid assignment target")),
+                    }
+                }
+                Stmt::Inject { handlers, body } => {
+                    // Save current handlers, push injected ones, evaluate body, restore
+                    let saved = self.handlers.clone();
+                    for handler_name in handlers {
+                        let key = handler_name.clone();
+                        if let Some(val) = env.get(&key) {
+                            if let Value::Handler(coeffect_name, fns) = val {
+                                self.handlers.insert(coeffect_name.clone(), fns.clone());
+                            }
+                        }
+                    }
+                    let res = self.eval_body(body, env);
+                    self.handlers = saved;
+                    match res? {
+                        ExprResult::EarlyReturn(v) => return Ok(ExprResult::EarlyReturn(v)),
+                        ExprResult::Normal(_) => {}
                     }
                 }
                 Stmt::Comment => continue,
@@ -1497,7 +1861,7 @@ impl Interpreter {
                 }
 
                 if let Some((wasm_name, typ)) = self.external_functions.get(func).cloned() {
-                    let positional = if let Type::Arrow(params, _, _) = &typ {
+                    let positional = if let Type::Arrow(params, _, _, _) = &typ {
                         Interpreter::labeled_to_positional_for_arrow_params(
                             params,
                             &evaluated_args,
@@ -1542,7 +1906,7 @@ impl Interpreter {
                         if let Some((wasm_name, typ)) =
                             sub_interp.external_functions.get(item_name).cloned()
                         {
-                            let positional = if let Type::Arrow(params, _, _) = &typ {
+                            let positional = if let Type::Arrow(params, _, _, _) = &typ {
                                 Interpreter::labeled_to_positional_for_arrow_params(
                                     params,
                                     &evaluated_args,
@@ -1561,9 +1925,8 @@ impl Interpreter {
                         )));
                     }
 
-                    if let Some(handler) = self.handlers.get(mod_name).cloned() {
-                        if let Some(target_func) =
-                            handler.functions.iter().find(|f| f.name == item_name)
+                    if let Some(handler_fns) = self.handlers.get(mod_name).cloned() {
+                        if let Some(target_func) = handler_fns.iter().find(|f| f.name == item_name)
                         {
                             let positional = Interpreter::labeled_to_positional_for_params(
                                 &target_func.params,
@@ -1741,6 +2104,7 @@ impl Interpreter {
                 type_params,
                 params,
                 ret_type,
+                requires,
                 effects,
                 body,
             } => {
@@ -1751,6 +2115,7 @@ impl Interpreter {
                         type_params: type_params.clone(),
                         params: params.clone(),
                         ret_type: ret_type.clone(),
+                        requires: requires.clone(),
                         effects: effects.clone(),
                         body: body.clone(),
                     },
@@ -1759,12 +2124,19 @@ impl Interpreter {
                 );
                 Ok(ExprResult::Normal(Value::Function(fn_name)))
             }
-            Expr::External(_wasm_name, _typ) => {
+            Expr::External(_wasm_name, _, _typ) => {
                 // External expression itself evaluates to a function handle if we want,
                 // but since it's only allowed in `let`, we can handle it there.
                 // However, for completeness in `eval_expr`:
                 Ok(ExprResult::Normal(Value::Unit)) // Or some meaningful value
             }
+            Expr::Handler {
+                coeffect_name,
+                functions,
+            } => Ok(ExprResult::Normal(Value::Handler(
+                coeffect_name.clone(),
+                functions.clone(),
+            ))),
             Expr::Raise(expr) => {
                 let val_res = self.eval_expr(expr, env)?;
                 let val = match val_res {
@@ -1782,9 +2154,9 @@ impl Interpreter {
         val: &Value,
     ) -> Option<HashMap<String, Value>> {
         match (&pattern.node, val) {
-            (Pattern::Variable(name, _), v) => {
+            (Pattern::Variable(name, sigil), v) => {
                 let mut map = HashMap::new();
-                map.insert(name.clone(), v.clone());
+                map.insert(sigil.get_key(name), v.clone());
                 Some(map)
             }
             (Pattern::Wildcard, _) => Some(HashMap::new()),
@@ -1858,7 +2230,7 @@ mod tests {
     #[test]
     fn interpreter_init_error_is_reported_not_panic() {
         let src = r#"
-import external [=[/definitely/missing_module_for_test.wasm]=]
+import external /definitely/missing_module_for_test.wasm
 
 let main = fn () -> i64 do
   return 0

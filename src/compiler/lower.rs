@@ -33,8 +33,15 @@ impl std::error::Error for LowerError {}
 struct Signature {
     params: Vec<(String, Type)>,
     ret: Type,
+    requires: Type,
     effects: Type,
     is_generic: bool,
+}
+
+#[derive(Debug, Clone)]
+struct HandlerBinding {
+    coeffect_name: String,
+    methods: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +63,8 @@ pub struct CollectedDefinitions {
 pub fn lower_to_typed_anf(program: &Program) -> Result<AnfProgram, LowerError> {
     let mut functions: HashMap<String, Function> = HashMap::new();
     let mut signatures: HashMap<String, Signature> = HashMap::new();
+    let mut top_level_handlers: HashMap<String, HandlerBinding> = HashMap::new();
+    let mut synthesized_handler_functions: Vec<String> = Vec::new();
     let mut enums: HashMap<String, EnumDef> = HashMap::new();
     let mut exceptions: HashMap<String, ExceptionDef> = HashMap::new();
     let collected = collect_all_definitions(program)?;
@@ -68,6 +77,7 @@ pub fn lower_to_typed_anf(program: &Program) -> Result<AnfProgram, LowerError> {
                     type_params,
                     params,
                     ret_type,
+                    requires,
                     effects,
                     body,
                 } => {
@@ -79,6 +89,7 @@ pub fn lower_to_typed_anf(program: &Program) -> Result<AnfProgram, LowerError> {
                                 .map(|p| (p.name.clone(), p.typ.clone()))
                                 .collect(),
                             ret: ret_type.clone(),
+                            requires: requires.clone(),
                             effects: effects.clone(),
                             is_generic: !type_params.is_empty(),
                         },
@@ -91,23 +102,80 @@ pub fn lower_to_typed_anf(program: &Program) -> Result<AnfProgram, LowerError> {
                             type_params: type_params.clone(),
                             params: params.clone(),
                             ret_type: ret_type.clone(),
+                            requires: requires.clone(),
                             effects: effects.clone(),
                             body: body.clone(),
                         },
                     );
                 }
-                Expr::External(_, typ) => {
-                    if let Type::Arrow(params, ret, effects) = typ {
+                Expr::External(_, _, typ) => {
+                    if let Type::Arrow(params, ret, requires, effects) = typ {
                         signatures.insert(
                             gl.name.clone(),
                             Signature {
                                 params: params.clone(),
                                 ret: *ret.clone(),
+                                requires: *requires.clone(),
                                 effects: *effects.clone(),
                                 is_generic: false,
                             },
                         );
                     }
+                }
+                Expr::Handler {
+                    coeffect_name,
+                    functions: handler_functions,
+                } => {
+                    let mut methods = HashMap::new();
+                    for handler_fn in handler_functions {
+                        if !handler_fn.type_params.is_empty() {
+                            return Err(LowerError {
+                                message: format!(
+                                    "generic handler function '{}.{}' is not supported in wasm ANF lowering",
+                                    coeffect_name, handler_fn.name
+                                ),
+                                span: Some(def.span.clone()),
+                            });
+                        }
+                        let lowered_name =
+                            synthesized_handler_function_name(&gl.name, &handler_fn.name);
+                        signatures.insert(
+                            lowered_name.clone(),
+                            Signature {
+                                params: handler_fn
+                                    .params
+                                    .iter()
+                                    .map(|p| (p.name.clone(), p.typ.clone()))
+                                    .collect(),
+                                ret: handler_fn.ret_type.clone(),
+                                requires: handler_fn.requires.clone(),
+                                effects: handler_fn.effects.clone(),
+                                is_generic: false,
+                            },
+                        );
+                        functions.insert(
+                            lowered_name.clone(),
+                            Function {
+                                name: lowered_name.clone(),
+                                is_public: false,
+                                type_params: Vec::new(),
+                                params: handler_fn.params.clone(),
+                                ret_type: handler_fn.ret_type.clone(),
+                                requires: handler_fn.requires.clone(),
+                                effects: handler_fn.effects.clone(),
+                                body: handler_fn.body.clone(),
+                            },
+                        );
+                        methods.insert(handler_fn.name.clone(), lowered_name.clone());
+                        synthesized_handler_functions.push(lowered_name);
+                    }
+                    top_level_handlers.insert(
+                        gl.name.clone(),
+                        HandlerBinding {
+                            coeffect_name: coeffect_name.clone(),
+                            methods,
+                        },
+                    );
                 }
                 _ => {}
             },
@@ -121,12 +189,15 @@ pub fn lower_to_typed_anf(program: &Program) -> Result<AnfProgram, LowerError> {
         }
     }
 
-    let reachable = collect_reachable_functions(&functions, &collected.external_bindings);
+    let mut reachable = collect_reachable_functions(&functions, &collected.external_bindings);
     if !reachable.contains("main") {
         return Err(LowerError {
             message: "main function not found".to_string(),
             span: None,
         });
+    }
+    for lowered_handler_fn in &synthesized_handler_functions {
+        reachable.insert(lowered_handler_fn.clone());
     }
 
     let mut lowered = Vec::new();
@@ -145,10 +216,22 @@ pub fn lower_to_typed_anf(program: &Program) -> Result<AnfProgram, LowerError> {
                         span: Some(def.span.clone()),
                     });
                 }
-                let mut ctx = LowerCtx::new(&signatures, &enums, &exceptions);
+                let mut ctx = LowerCtx::new(&signatures, &enums, &exceptions, &top_level_handlers);
                 lowered.push(ctx.lower_function(functions.get(&gl.name).unwrap())?);
             }
         }
+    }
+    for handler_fn_name in &synthesized_handler_functions {
+        if !reachable.contains(handler_fn_name) {
+            continue;
+        }
+        let mut ctx = LowerCtx::new(&signatures, &enums, &exceptions, &top_level_handlers);
+        let lowered_handler =
+            ctx.lower_function(functions.get(handler_fn_name).ok_or_else(|| LowerError {
+                message: format!("lowered handler function '{}' not found", handler_fn_name),
+                span: None,
+            })?)?;
+        lowered.push(lowered_handler);
     }
 
     let mut reachable_externals = HashSet::new();
@@ -186,7 +269,7 @@ pub fn lower_to_typed_anf(program: &Program) -> Result<AnfProgram, LowerError> {
             });
         }
 
-        if let Type::Arrow(params, ret, effects) = &binding.typ {
+        if let Type::Arrow(params, ret, _requires, effects) = &binding.typ {
             lowered_externals.push(AnfExternal {
                 name: binding.name.clone(),
                 wasm_module,
@@ -255,7 +338,7 @@ fn collect_program_externals_only(
                 definitions_out.push(def.clone());
             }
             TopLevel::Let(gl) => {
-                if let Expr::External(wasm_name, typ) = &gl.value.node {
+                if let Expr::External(wasm_name, _, typ) = &gl.value.node {
                     externals_out.insert(
                         gl.name.clone(),
                         ExternalBinding {
@@ -323,7 +406,7 @@ fn collect_program_definitions_inner(
                 res?;
             }
             TopLevel::Let(gl) => {
-                if let Expr::External(wasm_name, typ) = &gl.value.node {
+                if let Expr::External(wasm_name, _, typ) = &gl.value.node {
                     externals_out.insert(
                         gl.name.clone(),
                         ExternalBinding {
@@ -380,10 +463,13 @@ fn build_import_rename_map(
 
     let mut selected = HashSet::new();
     for item in &import.items {
-        let found_public = program
-            .definitions
-            .iter()
-            .any(|def| matches!(&def.node, TopLevel::Let(gl) if gl.is_public && gl.name == *item));
+        let found_public = program.definitions.iter().any(|def| match &def.node {
+            TopLevel::Let(gl) if gl.is_public && gl.name == *item => true,
+            TopLevel::Port(port) if port.is_public && port.name == *item => true,
+            TopLevel::Enum(ed) if ed.is_public && ed.name == *item => true,
+            TopLevel::TypeDef(td) if td.is_public && td.name == *item => true,
+            _ => false,
+        });
         if !found_public {
             return Err(LowerError {
                 message: format!("Item {} not found in {}", item, import.path),
@@ -433,7 +519,7 @@ fn rewrite_top_level_calls(
 
 fn rewrite_expr_calls(expr: &Spanned<Expr>, rename_map: &HashMap<String, String>) -> Spanned<Expr> {
     let node = match &expr.node {
-        Expr::Literal(_) | Expr::Variable(_, _) | Expr::Borrow(_, _) | Expr::External(_, _) => {
+        Expr::Literal(_) | Expr::Variable(_, _) | Expr::Borrow(_, _) | Expr::External(_, _, _) => {
             expr.node.clone()
         }
         Expr::BinaryOp(lhs, op, rhs) => Expr::BinaryOp(
@@ -441,11 +527,7 @@ fn rewrite_expr_calls(expr: &Spanned<Expr>, rename_map: &HashMap<String, String>
             op.clone(),
             Box::new(rewrite_expr_calls(rhs, rename_map)),
         ),
-        Expr::Call {
-            func,
-            args,
-            perform,
-        } => {
+        Expr::Call { func, args } => {
             let next_func = rename_map
                 .get(func)
                 .cloned()
@@ -457,7 +539,6 @@ fn rewrite_expr_calls(expr: &Spanned<Expr>, rename_map: &HashMap<String, String>
             Expr::Call {
                 func: next_func,
                 args: next_args,
-                perform: *perform,
             }
         }
         Expr::Constructor(name, args) => Expr::Constructor(
@@ -508,14 +589,30 @@ fn rewrite_expr_calls(expr: &Spanned<Expr>, rename_map: &HashMap<String, String>
             type_params,
             params,
             ret_type,
+            requires,
             effects,
             body,
         } => Expr::Lambda {
             type_params: type_params.clone(),
             params: params.clone(),
             ret_type: ret_type.clone(),
+            requires: requires.clone(),
             effects: effects.clone(),
             body: rewrite_stmts_calls(body, rename_map),
+        },
+        Expr::Handler {
+            coeffect_name,
+            functions,
+        } => Expr::Handler {
+            coeffect_name: coeffect_name.clone(),
+            functions: functions
+                .iter()
+                .map(|f| {
+                    let mut next = f.clone();
+                    next.body = rewrite_stmts_calls(&f.body, rename_map);
+                    next
+                })
+                .collect(),
         },
         Expr::Raise(value) => Expr::Raise(Box::new(rewrite_expr_calls(value, rename_map))),
     };
@@ -556,7 +653,6 @@ fn rewrite_stmt_calls(stmt: &Spanned<Stmt>, rename_map: &HashMap<String, String>
             typ: typ.clone(),
             value: rewrite_expr_calls(value, rename_map),
         },
-        Stmt::Drop(value) => Stmt::Drop(rewrite_expr_calls(value, rename_map)),
         Stmt::Expr(value) => Stmt::Expr(rewrite_expr_calls(value, rename_map)),
         Stmt::Return(value) => Stmt::Return(rewrite_expr_calls(value, rename_map)),
         Stmt::Assign { target, value } => Stmt::Assign {
@@ -581,6 +677,10 @@ fn rewrite_stmt_calls(stmt: &Spanned<Stmt>, rename_map: &HashMap<String, String>
             body: rewrite_stmts_calls(body, rename_map),
             catch_param: catch_param.clone(),
             catch_body: rewrite_stmts_calls(catch_body, rename_map),
+        },
+        Stmt::Inject { handlers, body } => Stmt::Inject {
+            handlers: handlers.clone(),
+            body: rewrite_stmts_calls(body, rename_map),
         },
         Stmt::Comment => Stmt::Comment,
     };
@@ -632,8 +732,9 @@ pub fn collect_reachable_functions(
 fn collect_calls_in_stmts(stmts: &[Spanned<Stmt>], out: &mut Vec<String>) {
     for s in stmts {
         match &s.node {
-            Stmt::Let { value, .. } => collect_calls_in_expr(value, out),
-            Stmt::Drop(e) | Stmt::Expr(e) | Stmt::Return(e) => collect_calls_in_expr(e, out),
+            Stmt::Let { value, .. } | Stmt::Expr(value) | Stmt::Return(value) => {
+                collect_calls_in_expr(value, out)
+            }
             Stmt::Assign { target, value } => {
                 collect_calls_in_expr(target, out);
                 collect_calls_in_expr(value, out);
@@ -648,6 +749,9 @@ fn collect_calls_in_stmts(stmts: &[Spanned<Stmt>], out: &mut Vec<String>) {
             } => {
                 collect_calls_in_stmts(body, out);
                 collect_calls_in_stmts(catch_body, out);
+            }
+            Stmt::Inject { body, .. } => {
+                collect_calls_in_stmts(body, out);
             }
             Stmt::Comment => {}
         }
@@ -703,8 +807,13 @@ fn collect_calls_in_expr(expr: &Spanned<Expr>, out: &mut Vec<String>) {
             }
         }
         Expr::Lambda { body, .. } => collect_calls_in_stmts(body, out),
+        Expr::Handler { functions, .. } => {
+            for f in functions {
+                collect_calls_in_stmts(&f.body, out);
+            }
+        }
         Expr::Variable(name, _) => out.push(name.clone()),
-        Expr::Literal(_) | Expr::Borrow(_, _) | Expr::External(_, _) => {}
+        Expr::Literal(_) | Expr::Borrow(_, _) | Expr::External(_, _, _) => {}
     }
 }
 
@@ -730,6 +839,8 @@ struct LowerCtx<'a> {
     signatures: &'a HashMap<String, Signature>,
     enums: &'a HashMap<String, EnumDef>,
     exceptions: &'a HashMap<String, ExceptionDef>,
+    top_level_handlers: &'a HashMap<String, HandlerBinding>,
+    active_handlers: HashMap<String, HashMap<String, String>>,
     vars: HashMap<String, Type>,
     stmts: Vec<AnfStmt>,
     temp_counter: usize,
@@ -741,11 +852,14 @@ impl<'a> LowerCtx<'a> {
         signatures: &'a HashMap<String, Signature>,
         enums: &'a HashMap<String, EnumDef>,
         exceptions: &'a HashMap<String, ExceptionDef>,
+        top_level_handlers: &'a HashMap<String, HandlerBinding>,
     ) -> Self {
         Self {
             signatures,
             enums,
             exceptions,
+            top_level_handlers,
+            active_handlers: HashMap::new(),
             vars: HashMap::new(),
             stmts: Vec::new(),
             temp_counter: 0,
@@ -758,6 +872,7 @@ impl<'a> LowerCtx<'a> {
         self.stmts.clear();
         self.temp_counter = 0;
         self.current_ret_type = func.ret_type.clone();
+        self.active_handlers.clear();
 
         let params = func
             .params
@@ -824,11 +939,6 @@ impl<'a> LowerCtx<'a> {
                     expr: AnfExpr::Atom(atom),
                 });
                 self.vars.insert(key, final_type);
-                Ok(None)
-            }
-            Stmt::Drop(expr) => {
-                let atom = self.lower_expr_to_atom(expr)?;
-                self.stmts.push(AnfStmt::Drop(atom));
                 Ok(None)
             }
             Stmt::Expr(expr) => {
@@ -927,6 +1037,37 @@ impl<'a> LowerCtx<'a> {
                 });
                 Ok(None)
             }
+            Stmt::Inject { handlers, body } => {
+                let saved_handlers = self.active_handlers.clone();
+                let result = (|| -> Result<Option<AnfAtom>, LowerError> {
+                    for handler_name in handlers {
+                        let binding = self.top_level_handlers.get(handler_name).ok_or_else(|| {
+                            LowerError {
+                                message: format!(
+                                    "inject expects a top-level handler binding, but '{}' is not one",
+                                    handler_name
+                                ),
+                                span: Some(stmt.span.clone()),
+                            }
+                        })?;
+                        self.active_handlers
+                            .insert(binding.coeffect_name.clone(), binding.methods.clone());
+                    }
+
+                    let mut ret_atom = None;
+                    for inner_stmt in body {
+                        if ret_atom.is_some() {
+                            break;
+                        }
+                        if let Some(ret) = self.lower_stmt(inner_stmt)? {
+                            ret_atom = Some(ret);
+                        }
+                    }
+                    Ok(ret_atom)
+                })();
+                self.active_handlers = saved_handlers;
+                result
+            }
             Stmt::Comment => Ok(None),
             Stmt::Assign { .. } | Stmt::Conc(_) => Err(LowerError {
                 message: "statement is not supported by current wasm ANF lowering".to_string(),
@@ -1018,15 +1159,33 @@ impl<'a> LowerCtx<'a> {
                     typ,
                 )
             }
-            Expr::Call {
-                func,
-                args,
-                perform,
-            } => {
-                let sig = self.signatures.get(func).ok_or_else(|| LowerError {
-                    message: format!("unknown function '{}'", func),
-                    span: Some(expr.span.clone()),
-                })?;
+            Expr::Call { func, args } => {
+                let resolved_func = if let Some((coeffect_name, method_name)) = func.split_once('.')
+                {
+                    if let Some(methods) = self.active_handlers.get(coeffect_name) {
+                        methods
+                            .get(method_name)
+                            .cloned()
+                            .ok_or_else(|| LowerError {
+                                message: format!(
+                                    "handler for '{}' does not implement '{}'",
+                                    coeffect_name, method_name
+                                ),
+                                span: Some(expr.span.clone()),
+                            })?
+                    } else {
+                        func.clone()
+                    }
+                } else {
+                    func.clone()
+                };
+                let sig = self
+                    .signatures
+                    .get(&resolved_func)
+                    .ok_or_else(|| LowerError {
+                        message: format!("unknown function '{}'", func),
+                        span: Some(expr.span.clone()),
+                    })?;
                 if sig.is_generic {
                     return Err(LowerError {
                         message: format!(
@@ -1042,10 +1201,9 @@ impl<'a> LowerCtx<'a> {
                 }
                 self.bind_expr_to_temp(
                     AnfExpr::Call {
-                        func: func.clone(),
+                        func: resolved_func,
                         args: lowered_args,
                         typ: sig.ret.clone(),
-                        perform: *perform,
                     },
                     sig.ret.clone(),
                 )
@@ -1116,13 +1274,51 @@ impl<'a> LowerCtx<'a> {
                     Type::Unit,
                 )
             }
+            Expr::FieldAccess(receiver, field_name) => {
+                let receiver_atom = self.lower_expr_to_atom(receiver)?;
+                let receiver_type = receiver_atom.typ();
+
+                let fields = match &receiver_type {
+                    Type::Record(fields) => fields.clone(),
+                    Type::UserDefined(name, _) => {
+                        self.resolve_single_variant_fields(name, &expr.span)?
+                    }
+                    other => {
+                        return Err(LowerError {
+                            message: format!("cannot access field on type '{}'", other),
+                            span: Some(expr.span.clone()),
+                        });
+                    }
+                };
+
+                let mut sorted_fields = fields.clone();
+                sorted_fields.sort_by(|a, b| a.0.cmp(&b.0));
+
+                let (idx, (_, field_type)) = sorted_fields
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (name, _))| name == field_name)
+                    .ok_or_else(|| LowerError {
+                        message: format!("field '{}' not found", field_name),
+                        span: Some(expr.span.clone()),
+                    })?;
+
+                self.bind_expr_to_temp(
+                    AnfExpr::ObjectField {
+                        value: receiver_atom,
+                        index: idx,
+                        typ: field_type.clone(),
+                    },
+                    field_type.clone(),
+                )
+            }
             Expr::Array(_)
             | Expr::Index(_, _)
-            | Expr::FieldAccess(_, _)
             | Expr::If { .. }
             | Expr::Match { .. }
             | Expr::Lambda { .. }
-            | Expr::External(_, _) => Err(LowerError {
+            | Expr::Handler { .. }
+            | Expr::External(_, _, _) => Err(LowerError {
                 message: "expression is not supported by current wasm ANF lowering".to_string(),
                 span: Some(expr.span.clone()),
             }),
@@ -1307,6 +1503,32 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    fn resolve_single_variant_fields(
+        &self,
+        type_name: &str,
+        span: &Span,
+    ) -> Result<Vec<(String, Type)>, LowerError> {
+        let ed = self.enums.get(type_name).ok_or_else(|| LowerError {
+            message: format!("unknown type '{}' for field access", type_name),
+            span: Some(span.clone()),
+        })?;
+        if ed.variants.len() != 1 {
+            return Err(LowerError {
+                message: format!(
+                    "field access requires single-variant type, '{}' has {}",
+                    type_name,
+                    ed.variants.len()
+                ),
+                span: Some(span.clone()),
+            });
+        }
+        Ok(ed.variants[0]
+            .fields
+            .iter()
+            .filter_map(|(label, typ)| label.as_ref().map(|l| (l.clone(), typ.clone())))
+            .collect())
+    }
+
     fn bind_expr_to_temp(&mut self, expr: AnfExpr, typ: Type) -> Result<AnfAtom, LowerError> {
         let name = self.new_temp();
         self.stmts.push(AnfStmt::Let {
@@ -1471,12 +1693,17 @@ fn signature_type(sig: &Signature) -> Type {
     Type::Arrow(
         sig.params.clone(),
         Box::new(sig.ret.clone()),
+        Box::new(sig.requires.clone()),
         Box::new(sig.effects.clone()),
     )
 }
 
 fn sigil_key(name: &str, sigil: &Sigil) -> String {
     sigil.get_key(name)
+}
+
+fn synthesized_handler_function_name(handler_binding_name: &str, method_name: &str) -> String {
+    format!("__handler_{}_{}", handler_binding_name, method_name)
 }
 
 fn peel_linear(mut typ: &Type) -> &Type {

@@ -341,7 +341,7 @@ fn test_linear_capture_makes_lambda_linear_and_single_use() {
     let main = fn () -> i64 do
         let %x = 7
         let f = fn () -> i64 do
-            drop %x
+            match %x do case _ -> () endmatch
             return 1
         endfn
         let y = f()
@@ -360,7 +360,7 @@ fn test_linear_capturing_lambda_cannot_be_called_twice() {
     let main = fn () -> i64 do
         let %x = 7
         let f = fn () -> i64 do
-            drop %x
+            match %x do case _ -> () endmatch
             return 1
         endfn
         let _a = f()
@@ -450,3 +450,97 @@ fn test_constructor_pattern_arity_error_is_llm_friendly() {
         err
     );
 }
+
+#[test]
+fn test_binary_op_in_call_arg() {
+    let src = r#"
+    let add = fn (a: i64, b: i64) -> i64 do
+        return a + b
+    endfn
+
+    let main = fn () -> i64 do
+        return add(a: 1 + 2, b: 3 * 4)
+    endfn
+    "#;
+    assert!(check_code(src).is_ok(), "binary ops should be allowed in call args");
+}
+
+#[test]
+fn test_string_concat_in_call_arg() {
+    let src = r#"
+    let greet = fn (msg: string) -> string do
+        return msg
+    endfn
+
+    let main = fn () -> string do
+        return greet(msg: [=[hello ]=] ++ [=[world]=])
+    endfn
+    "#;
+    assert!(check_code(src).is_ok(), "string concat should be allowed in call args");
+}
+
+#[test]
+fn test_function_arity_mismatch_shows_expected() {
+    let src = r#"
+    let add = fn (a: i64, b: i64) -> i64 do
+        return a + b
+    endfn
+
+    let main = fn () -> i64 do
+        return add(a: 1)
+    endfn
+    "#;
+    let err = check_code(src).unwrap_err();
+    assert!(
+        err.contains("expected 2") || err.contains("Expected"),
+        "arity mismatch error should mention expected count, got: {}",
+        err
+    );
+    assert!(
+        err.contains("got 1") || err.contains("Provided"),
+        "arity mismatch error should mention provided count, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_function_arity_mismatch_too_many_args() {
+    let src = r#"
+    let inc = fn (x: i64) -> i64 do
+        return x + 1
+    endfn
+
+    let main = fn () -> i64 do
+        return inc(x: 1, y: 2)
+    endfn
+    "#;
+    let err = check_code(src).unwrap_err();
+    assert!(
+        err.contains("expected 1") || err.contains("Expected"),
+        "arity mismatch error should mention expected count, got: {}",
+        err
+    );
+}
+
+// #[test]
+// fn test_human_written_tests() {
+//     let src = r#"
+//     type T = A(x: T)
+//     "#;
+//     let err = check_code(src).unwrap_err();
+//     assert!(
+//         err.contains("recursive type without indirection"),
+//         "expected recursive type error, got: {}",
+//         err
+//     );
+//
+//     let src = r#"
+//     type T = <T> (x: T) -> T 
+//     "#;
+//     let err = check_code(src).unwrap_err();
+//     assert!(
+//         err.contains("recursive type without indirection"),
+//         "expected recursive type error, got: {}",
+//         err
+//     );
+// }

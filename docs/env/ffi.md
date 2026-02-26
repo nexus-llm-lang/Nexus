@@ -7,22 +7,33 @@ Nexus supports interfacing with WebAssembly (Wasm) modules, allowing developers 
 To load a Wasm module, use the `import external` directive.
 
 ```nexus
-import external [=[math.wasm]=]
+import external math.wasm
 ```
 
 ## Binding External Functions
 
-Once a module is loaded (or if the function is available in the global Wasm store), you can bind it to a Nexus name using the `external` expression within a `let` binding.
+Once a module is loaded (or if the function is available in the global Wasm store), you can bind it to a Nexus name using the `external` statement.
 
 ```nexus
-pub let add_ints = external [=[add]=] : (a: i64, b: i64) -> i64
-let internal_helper = external [=[helper]=] : (x: i64) -> unit
+pub external add_ints = [=[add]=] : (a: i64, b: i64) -> i64
+external internal_helper = [=[helper]=] : (x: i64) -> unit
 ```
 
-- **`pub let`**: Makes the binding visible to other modules. If omitted, the binding is private.
+- **`pub`**: Makes the binding visible to other modules. If omitted, the binding is private.
 - **Name**: The name of the function in Nexus (`add_ints`).
-- **Wasm Symbol**: The string literal `[=[add]=]` specifies the name of the exported function in the Wasm module.
-- **Type**: The type signature. It must be an arrow type.
+- **Wasm Symbol**: The string literal `[=[add]=]` after `=` specifies the name of the exported function in the Wasm module.
+- **Type**: The type signature after `:`. It must be an arrow type.
+
+## Generic External Bindings
+
+If the external function is polymorphic, type parameters must be declared explicitly with `<T, U, ...>`:
+
+```nexus
+pub external length = [=[array_length]=] : <T>(arr: &[| T |]) -> i64
+```
+
+Using an undeclared type variable (e.g., writing `T` without `<T>`) is a type error.
+This prevents typos like `Strng` from silently becoming type variables.
 
 ## Supported Types
 
@@ -36,14 +47,14 @@ Currently, the FFI supports basic types that map directly to Wasm types:
 ## Example
 
 ```nexus
-import external [=[utils.wasm]=]
+import external utils.wasm
 
-let process_data = external [=[process]=] : (val: float) -> float
+external process_data = [=[process]=] : (val: float) -> float
 
 let main = fn () -> unit do
   let result = process_data(val: 42.0)
   // assuming print_float is an effectful operation
-  perform print_float(val: result)
+  print_float(val: result)
   return ()
 endfn
 ```

@@ -14,7 +14,7 @@ fn run(src: &str) -> Result<Value, String> {
 #[test]
 fn hashmap_put_get_or_and_contains_key() {
     let src = r#"
-import as hashmap from [=[nxlib/stdlib/hashmap.nx]=]
+import as hashmap from nxlib/stdlib/hashmap.nx
 
 let main = fn () -> i64 do
   let ops = hashmap.i64_key_ops()
@@ -39,7 +39,7 @@ endfn
 #[test]
 fn hashmap_get_lookup_and_remove() {
     let src = r#"
-import as hashmap from [=[nxlib/stdlib/hashmap.nx]=]
+import as hashmap from nxlib/stdlib/hashmap.nx
 
 let main = fn () -> i64 do
   let ops = hashmap.i64_key_ops()
@@ -61,7 +61,7 @@ endfn
 #[test]
 fn hashmap_custom_key_ops_can_change_key_equivalence() {
     let src = r#"
-import as hashmap from [=[nxlib/stdlib/hashmap.nx]=]
+import as hashmap from nxlib/stdlib/hashmap.nx
 
 let eq_half = fn (left: i64, right: i64) -> bool do
   return (left / 2) == (right / 2)

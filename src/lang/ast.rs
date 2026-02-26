@@ -21,13 +21,14 @@ pub enum Type {
     Unit,
     UserDefined(String, Vec<Type>),
     Var(String),
-    Arrow(Vec<(String, Type)>, Box<Type>, Box<Type>),
+    Arrow(Vec<(String, Type)>, Box<Type>, Box<Type>, Box<Type>), // params, return, require, effect
     Ref(Box<Type>),
     Linear(Box<Type>),                 // %T
     Row(Vec<Type>, Option<Box<Type>>), // { E1, E2 | r }
     Record(Vec<(String, Type)>),       // { x: i64, y: string }
     Array(Box<Type>),                  // [| T |]
     Borrow(Box<Type>),                 // &T
+    Handler(String),                   // handler Port
 }
 
 impl std::fmt::Display for Type {
@@ -57,7 +58,7 @@ impl std::fmt::Display for Type {
                 Ok(())
             }
             Type::Var(name) => write!(f, "{}", name),
-            Type::Arrow(params, ret, eff) => {
+            Type::Arrow(params, ret, req, eff) => {
                 write!(f, "(")?;
                 for (i, (name, typ)) in params.iter().enumerate() {
                     if i > 0 {
@@ -66,6 +67,10 @@ impl std::fmt::Display for Type {
                     write!(f, "{}: {}", name, typ)?;
                 }
                 write!(f, ") -> {}", ret)?;
+                match &**req {
+                    Type::Row(reqs, tail) if reqs.is_empty() && tail.is_none() => {}
+                    _ => write!(f, " require {}", req)?,
+                }
                 match &**eff {
                     Type::Row(effs, tail) if effs.is_empty() && tail.is_none() => {}
                     _ => write!(f, " effect {}", eff)?,
@@ -102,6 +107,7 @@ impl std::fmt::Display for Type {
             }
             Type::Array(t) => write!(f, "[| {} |]", t),
             Type::Borrow(t) => write!(f, "&{}", t),
+            Type::Handler(name) => write!(f, "handler {}", name),
         }
     }
 }
@@ -111,6 +117,7 @@ pub enum Sigil {
     Immutable,
     Mutable, // ~
     Linear,  // %
+    Borrow,  // &
 }
 
 impl Sigil {
@@ -120,6 +127,7 @@ impl Sigil {
             Sigil::Immutable => "",
             Sigil::Mutable => "~",
             Sigil::Linear => "%",
+            Sigil::Borrow => "&",
         }
     }
 
@@ -171,7 +179,6 @@ pub enum Expr {
     Call {
         func: String,
         args: Vec<(String, Spanned<Expr>)>, // label, value
-        perform: bool,                      // true if 'perform' keyword is used
     },
     Constructor(String, Vec<(Option<String>, Spanned<Expr>)>),
     Record(Vec<(String, Spanned<Expr>)>),
@@ -193,11 +200,17 @@ pub enum Expr {
         type_params: Vec<String>,
         params: Vec<Param>,
         ret_type: Type,
+        requires: Type,
         effects: Type,
         body: Vec<Spanned<Stmt>>,
     },
     Raise(Box<Spanned<Expr>>), // raise "error"
-    External(String, Type),    // external "wasm_symbol" : arrow_type
+    External(String, Vec<String>, Type), // external "wasm_symbol" : <T> arrow_type
+    // handler Port do fn ... endfn endhandler — coeffect handler as expression
+    Handler {
+        coeffect_name: String,
+        functions: Vec<Function>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -208,7 +221,6 @@ pub enum Stmt {
         typ: Option<Type>,
         value: Spanned<Expr>,
     },
-    Drop(Spanned<Expr>),
     Expr(Spanned<Expr>), // For side-effecting calls or match/if used as statement
     Return(Spanned<Expr>),
     // Assignment: target <- value
@@ -223,6 +235,11 @@ pub enum Stmt {
         catch_param: String,
         catch_body: Vec<Spanned<Stmt>>,
     },
+    // inject handler_var, ... do body endinject
+    Inject {
+        handlers: Vec<String>,
+        body: Vec<Spanned<Stmt>>,
+    },
     Comment,
 }
 
@@ -233,6 +250,7 @@ pub struct Function {
     pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub ret_type: Type,
+    pub requires: Type,
     pub effects: Type,
     pub body: Vec<Spanned<Stmt>>,
 }
@@ -249,6 +267,7 @@ pub struct TypeDef {
 pub struct EnumDef {
     pub name: String,
     pub is_public: bool,
+    pub is_opaque: bool,
     pub type_params: Vec<String>,
     pub variants: Vec<VariantDef>,
 }
@@ -282,18 +301,11 @@ pub struct Port {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Handler {
-    pub name: String,
-    pub is_public: bool,
-    pub port_name: String,
-    pub functions: Vec<Function>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct FunctionSignature {
     pub name: String,
     pub params: Vec<Param>,
     pub ret_type: Type,
+    pub requires: Type,
     pub effects: Type,
 }
 
@@ -312,7 +324,6 @@ pub enum TopLevel {
     Exception(ExceptionDef),
     Import(Import),
     Port(Port),
-    Handler(Handler),
     Let(GlobalLet),
     Comment,
 }
