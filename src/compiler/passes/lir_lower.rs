@@ -410,9 +410,15 @@ impl LowerCtx {
         // Create scope with bindings
         let mut case_vars = self.vars.clone();
         let mut case_sem_vars = self.semantic_vars.clone();
+        // Compute semantic types for pattern-bound variables
+        let semantic_bindings = self.collect_pattern_semantic_types(target, pattern);
         for (name, atom) in &bindings {
             case_vars.insert(name.clone(), atom.typ());
-            case_sem_vars.insert(name.clone(), atom.typ());
+            let sem_type = semantic_bindings
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| atom.typ());
+            case_sem_vars.insert(name.clone(), sem_type);
         }
 
         let (mut case_stmts, case_ret) =
@@ -499,14 +505,40 @@ impl LowerCtx {
                 }
             }
             MirPattern::Record(fields, _open) => {
-                for (idx, (_name, field_pat)) in fields.iter().enumerate() {
+                // Resolve field types from the target's semantic type
+                let semantic_type = match target {
+                    LirAtom::Var { name, .. } => self
+                        .semantic_vars
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| target.typ()),
+                    _ => target.typ(),
+                };
+                let record_field_types: Vec<(String, Type)> =
+                    if let Type::Record(rt_fields) = strip_linear(&semantic_type) {
+                        rt_fields.clone()
+                    } else {
+                        Vec::new()
+                    };
+                for (name, field_pat) in fields.iter() {
+                    // Find the sorted index and type from the record layout
+                    let (sorted_idx, field_type) = record_field_types
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (n, _))| n == name)
+                        .map(|(i, (_, t))| (i, t.clone()))
+                        .unwrap_or_else(|| {
+                            // Fallback: use pattern order index (legacy behavior)
+                            let idx = fields.iter().position(|(n, _)| n == name).unwrap_or(0);
+                            (idx, Type::I64)
+                        });
                     let field_atom = self.bind_expr_to_temp(
                         LirExpr::ObjectField {
                             value: target.clone(),
-                            index: idx,
-                            typ: Type::I64,
+                            index: sorted_idx,
+                            typ: field_type.clone(),
                         },
-                        Type::I64,
+                        field_type,
                     );
                     self.collect_pattern_conditions_and_bindings(
                         &field_atom,
@@ -518,6 +550,62 @@ impl LowerCtx {
             }
         }
         Ok(())
+    }
+
+    /// Collect semantic types for pattern-bound variables by walking the pattern
+    /// and looking up target's semantic type.
+    fn collect_pattern_semantic_types(
+        &self,
+        target: &LirAtom,
+        pattern: &MirPattern,
+    ) -> HashMap<String, Type> {
+        let mut result = HashMap::new();
+        let target_sem_type = match target {
+            LirAtom::Var { name, .. } => self
+                .semantic_vars
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| target.typ()),
+            _ => target.typ(),
+        };
+        self.walk_pattern_semantic_types(&target_sem_type, pattern, &mut result);
+        result
+    }
+
+    fn walk_pattern_semantic_types(
+        &self,
+        sem_type: &Type,
+        pattern: &MirPattern,
+        out: &mut HashMap<String, Type>,
+    ) {
+        match pattern {
+            MirPattern::Variable(name, _) => {
+                out.insert(name.clone(), sem_type.clone());
+            }
+            MirPattern::Record(fields, _) => {
+                let record_fields: Vec<(String, Type)> =
+                    if let Type::Record(rf) = strip_linear(sem_type) {
+                        rf.clone()
+                    } else {
+                        Vec::new()
+                    };
+                for (name, field_pat) in fields {
+                    let field_type = record_fields
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, t)| t.clone())
+                        .unwrap_or(Type::I64);
+                    self.walk_pattern_semantic_types(&field_type, field_pat, out);
+                }
+            }
+            MirPattern::Constructor { fields, .. } => {
+                // Constructor fields don't have semantic types tracked yet
+                for (_, field_pat) in fields {
+                    self.walk_pattern_semantic_types(&Type::I64, field_pat, out);
+                }
+            }
+            MirPattern::Wildcard | MirPattern::Literal(_) => {}
+        }
     }
 
     /// Combine bool conditions with And operations
@@ -727,14 +815,23 @@ impl LowerCtx {
                 .get(name)
                 .cloned()
                 .unwrap_or(Type::I64),
+            MirExpr::Call { ret_type, .. } => ret_type.clone(),
             MirExpr::Record(fields) => {
                 let mut field_types: Vec<(String, Type)> = fields
                     .iter()
-                    .map(|(name, _)| (name.clone(), Type::I64)) // individual field types unknown
+                    .map(|(name, expr)| (name.clone(), self.infer_semantic_type(expr)))
                     .collect();
                 field_types.sort_by(|a, b| a.0.cmp(&b.0));
                 Type::Record(field_types)
             }
+            MirExpr::Constructor { .. } => Type::I64,
+            MirExpr::Literal(lit) => match lit {
+                Literal::Int(_) => Type::I64,
+                Literal::Float(_) => Type::F64,
+                Literal::Bool(_) => Type::Bool,
+                Literal::String(_) => Type::String,
+                Literal::Unit => Type::Unit,
+            },
             _ => Type::I64,
         }
     }
@@ -890,5 +987,12 @@ fn fallback_return_atom_from_terminal_stmt(stmts: &[LirStmt]) -> Option<LirAtom>
             ..
         } => catch_ret.clone().or_else(|| body_ret.clone()),
         _ => None,
+    }
+}
+
+fn strip_linear(typ: &Type) -> &Type {
+    match typ {
+        Type::Linear(inner) => strip_linear(inner),
+        other => other,
     }
 }

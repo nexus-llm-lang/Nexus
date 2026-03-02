@@ -1938,6 +1938,18 @@ fn emit_numeric_coercion(from: &Type, to: &Type, out: &mut Function) -> Result<(
     if adt_coercion_is_noop(from, to) {
         return Ok(());
     }
+    // Unit → anything is a no-op in certain control-flow contexts
+    // (e.g. void-returning call used where a value is expected)
+    if matches!(from, Type::Unit) || matches!(to, Type::Unit) {
+        return Ok(());
+    }
+    // If both types map to the same wasm valtype, no instruction needed
+    // (e.g. i64 ↔ UserDefined("Handle", []) — both are ValType::I64)
+    if let (Ok(wf), Ok(wt)) = (type_to_wasm_valtype(from), type_to_wasm_valtype(to)) {
+        if wf == wt {
+            return Ok(());
+        }
+    }
     match (from, to) {
         (Type::I64, Type::I32) => {
             out.instruction(&Instruction::I32WrapI64);
