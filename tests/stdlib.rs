@@ -400,3 +400,25 @@ end
 "#;
     assert_eq!(run(src).unwrap(), Value::Bool(true));
 }
+
+use proptest::prelude::*;
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn prop_math_abs_non_negative(n in -1000i64..1000) {
+        let src = format!("
+import {{ abs }} from nxlib/stdlib/math.nx
+let main = fn () -> bool do
+    let x = abs(val: {n})
+    return x >= 0
+end
+");
+        assert_eq!(run(&src).unwrap(), Value::Bool(true));
+    }
+}
