@@ -1,3 +1,5 @@
+mod common;
+
 use nexus::interpreter::Interpreter;
 use nexus::lang::ast;
 use nexus::lang::parser;

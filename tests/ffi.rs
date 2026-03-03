@@ -1,13 +1,6 @@
-use nexus::lang::parser;
-use nexus::lang::typecheck::TypeChecker;
+mod common;
 
-fn check_code(src: &str) -> Result<(), String> {
-    let parser = parser::parser();
-    let program = parser.parse(src).map_err(|e| format!("{:?}", e))?;
-
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).map_err(|e| e.message)
-}
+use common::source::check_raw as check_code;
 
 #[test]
 fn test_ffi_declaration() {

@@ -1,21 +1,8 @@
-use nexus::interpreter::{Interpreter, Value};
-use nexus::lang::parser::parser;
-use nexus::lang::typecheck::TypeChecker;
+mod common;
+
+use common::source::{check_raw, run};
+use nexus::interpreter::Value;
 use proptest::prelude::*;
-
-fn prepare_test_source(src: &str) -> String {
-    let s = src.replace("let main = fn ()", "pub let __test = fn ()");
-    format!("{}\nlet main = fn () -> unit do\n  return ()\nend\n", s)
-}
-
-fn run(src: &str) -> Result<Value, String> {
-    let src = prepare_test_source(src);
-    let p = parser().parse(src.as_str()).map_err(|e| format!("{:?}", e))?;
-    let mut checker = TypeChecker::new();
-    checker.check_program(&p).map_err(|e| e.message)?;
-    let mut interpreter = Interpreter::new(p);
-    interpreter.run_function("__test", vec![])
-}
 
 #[test]
 fn test_conc_parallel_execution() {
@@ -55,9 +42,7 @@ fn test_net_effect_enforcement() {
     end
     "#;
 
-    let program = parser().parse(src).unwrap();
-    let mut checker = TypeChecker::new();
-    let res = checker.check_program(&program);
+    let res = check_raw(src);
     assert!(
         res.is_err(),
         "Should fail typechecking because Net effect is missing"

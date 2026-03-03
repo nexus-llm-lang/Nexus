@@ -1,11 +1,6 @@
-use nexus::lang::parser::parser;
-use nexus::lang::typecheck::TypeChecker;
+mod common;
 
-fn check(src: &str) -> Result<(), String> {
-    let p = parser().parse(src).map_err(|e| format!("{:?}", e))?;
-    let mut checker = TypeChecker::new();
-    checker.check_program(&p).map_err(|e| e.message)
-}
+use common::source::check_raw as check;
 
 #[test]
 fn test_anonymous_record() {

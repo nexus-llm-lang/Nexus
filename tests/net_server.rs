@@ -1,27 +1,9 @@
-use nexus::interpreter::{Interpreter, Value};
-use nexus::lang::parser::parser;
-use nexus::lang::typecheck::TypeChecker;
+mod common;
 
-fn prepare_test_source(src: &str) -> String {
-    let s = src.replace("let main = fn ()", "pub let __test = fn ()");
-    format!("{}\nlet main = fn () -> unit do\n  return ()\nend\n", s)
-}
+use common::source::{check, run};
+use nexus::interpreter::Value;
+static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn check(src: &str) -> Result<(), String> {
-    let src = prepare_test_source(src);
-    let p = parser().parse(src.as_str()).map_err(|e| format!("{:?}", e))?;
-    let mut checker = TypeChecker::new();
-    checker.check_program(&p).map_err(|e| e.message)
-}
-
-fn run(src: &str) -> Result<Value, String> {
-    let src = prepare_test_source(src);
-    let p = parser().parse(src.as_str()).map_err(|e| format!("{:?}", e))?;
-    let mut checker = TypeChecker::new();
-    checker.check_program(&p).map_err(|e| e.message)?;
-    let mut interpreter = Interpreter::new(p);
-    interpreter.run_function("__test", vec![])
-}
 
 #[test]
 fn net_server_types_check() {
@@ -116,11 +98,8 @@ fn net_server_accept_and_respond() {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    // Find a free port
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
+    // Use a time-based port to avoid race conditions with other tests binding to 0
+    let port = 40000 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() % 10000) as u16;
     let addr = format!("127.0.0.1:{}", port);
 
     let src = format!(
@@ -148,20 +127,42 @@ fn net_server_accept_and_respond() {
     let addr_clone = addr.clone();
 
     // Spawn the server in a thread
-    let server_thread = std::thread::spawn(move || run(&src));
+    let server_thread = std::thread::spawn(move || {
+        println!("===> server thread starting: port {}", addr_clone);
+        let res = run(&src);
+        println!("===> server thread finished with {:?}", res);
+        res.expect("run(&src) failed")
+    });
 
     // Wait for server to start, retrying connection
     let mut stream = None;
-    for _ in 0..40 {
+    for i in 0..40 {
+        if server_thread.is_finished() {
+            println!("===> thread is finished at iteration {}", i);
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(250));
-        match TcpStream::connect(&addr_clone) {
+        match TcpStream::connect(&addr) {
             Ok(s) => {
+                println!("===> connection succeeded at iteration {}", i);
                 stream = Some(s);
                 break;
             }
-            Err(_) => continue,
+            Err(e) => {
+                if i % 10 == 0 {
+                    println!("===> connection failed at iteration {}: {}", i, e);
+                }
+                continue;
+            }
         }
     }
+    
+    if server_thread.is_finished() && stream.is_none() {
+        // Thread died early, let's join to see the panic
+        server_thread.join().expect("server thread panicked early");
+        panic!("server thread finished but did not panic, yet connection failed");
+    }
+
     let mut stream = stream.expect("could not connect to server after retries");
     stream
         .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -173,7 +174,7 @@ fn net_server_accept_and_respond() {
     stream.read_to_string(&mut response).expect("read failed");
 
     let server_result = server_thread.join().expect("server thread panicked");
-    assert_eq!(server_result.unwrap(), Value::Bool(true));
+    assert_eq!(server_result, Value::Bool(true));
 
     assert!(
         response.contains("200 OK"),

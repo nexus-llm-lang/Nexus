@@ -1,19 +1,8 @@
+mod common;
+
+use common::source::{check_raw as check, check_warnings};
 use nexus::lang::ast::*;
-use nexus::lang::parser::parser;
 use nexus::lang::typecheck::TypeChecker;
-
-fn check(src: &str) -> Result<(), String> {
-    let p = parser().parse(src).map_err(|e| format!("{:?}", e))?;
-    let mut checker = TypeChecker::new();
-    checker.check_program(&p).map_err(|e| e.message)
-}
-
-fn check_warnings(src: &str) -> Vec<String> {
-    let p = parser().parse(src).unwrap();
-    let mut checker = TypeChecker::new();
-    checker.check_program(&p).unwrap();
-    checker.take_warnings().into_iter().map(|w| w.message).collect()
-}
 
 fn check_program(program: &Program) -> Result<(), String> {
     let mut checker = TypeChecker::new();

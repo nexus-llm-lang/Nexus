@@ -1,26 +1,12 @@
-use nexus::interpreter::{Interpreter, Value};
+mod common;
+
+use common::source::{check_raw as check, run_raw};
+use nexus::interpreter::Value;
 use nexus::lang::parser;
-use nexus::lang::typecheck::TypeChecker;
 use proptest::prelude::*;
 
-fn check(src: &str) -> Result<(), String> {
-    let program = parser::parser()
-        .parse(src)
-        .map_err(|e| format!("{:?}", e))?;
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).map_err(|e| e.message)
-}
-
 fn run(src: &str) -> Result<Value, String> {
-    let program = parser::parser()
-        .parse(src)
-        .map_err(|e| format!("{:?}", e))?;
-    let mut checker = TypeChecker::new();
-    checker
-        .check_program(&program)
-        .map_err(|e| format!("type error: {}", e.message))?;
-    let mut interpreter = Interpreter::new(program);
-    interpreter.run_function("__test_main", vec![])
+    run_raw(src, "__test_main")
 }
 
 fn io_program(body: &str) -> String {

@@ -1,42 +1,11 @@
-use nexus::interpreter::Interpreter;
+mod common;
+
+use common::source::{check_and_run, prepare_test_source, run};
+use nexus::interpreter::{Interpreter, Value};
 use nexus::lang::parser;
 use nexus::lang::stdlib::list_stdlib_nx_paths;
 use nexus::lang::typecheck::TypeChecker;
 use std::fs;
-
-use nexus::interpreter::Value;
-
-fn prepare_test_source(src: &str) -> String {
-    let s = src.replace("let main = fn ()", "pub let __test = fn ()");
-    format!("{}\nlet main = fn () -> unit do\n  return ()\nend\n", s)
-}
-
-fn run(src: &str) -> Result<Value, String> {
-    let src = prepare_test_source(src);
-    let p = parser::parser()
-        .parse(&src)
-        .map_err(|e| format!("{:?}", e))?;
-    let mut checker = TypeChecker::new();
-    checker.check_program(&p).map_err(|e| e.message)?;
-    let mut interpreter = Interpreter::new(p);
-    interpreter.run_function("__test", vec![])
-}
-
-fn check_and_run(src_path: &str) -> Result<(), String> {
-    let raw_src = fs::read_to_string(src_path).map_err(|e| e.to_string())?;
-    let src = prepare_test_source(&raw_src);
-    let parser = parser::parser();
-    let program = parser.parse(&src).map_err(|e| format!("{:?}", e))?;
-
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).map_err(|e| e.message)?;
-
-    let mut interpreter = Interpreter::new(program);
-    interpreter
-        .run_function("__test", vec![])
-        .map(|_| ())
-        .map_err(|e| e)
-}
 
 #[test]
 fn test_module_import() {
@@ -110,29 +79,20 @@ fn test_pub_import_syntax_is_rejected() {
 
 #[test]
 fn test_stdlib_list_module_length() {
-    let src = prepare_test_source(r#"
+    let src = r#"
     import as list from nxlib/stdlib/list.nx
 
     let main = fn () -> i64 do
       let xs = Cons(v: 1, rest: Cons(v: 2, rest: Cons(v: 3, rest: Cons(v: 4, rest: Nil()))))
       return list.length(xs: xs)
     end
-    "#);
-    let parser = parser::parser();
-    let program = parser.parse(&src).unwrap();
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).unwrap();
-    let mut interpreter = Interpreter::new(program);
-    let res = interpreter.run_function("__test", vec![]).unwrap();
-    match res {
-        nexus::interpreter::Value::Int(4) => (),
-        _ => panic!("Expected 4, got {:?}", res),
-    }
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(4));
 }
 
 #[test]
 fn test_stdlib_array_module_length() {
-    let src = prepare_test_source(r#"
+    let src = r#"
     import as array from nxlib/stdlib/array.nx
 
     let main = fn () -> i64 do
@@ -142,22 +102,13 @@ fn test_stdlib_array_module_length() {
       match %arr do case _ -> () end
       return n
     end
-    "#);
-    let parser = parser::parser();
-    let program = parser.parse(&src).unwrap();
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).unwrap();
-    let mut interpreter = Interpreter::new(program);
-    let res = interpreter.run_function("__test", vec![]).unwrap();
-    match res {
-        nexus::interpreter::Value::Int(3) => (),
-        _ => panic!("Expected 3, got {:?}", res),
-    }
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(3));
 }
 
 #[test]
 fn test_stdlib_result_module_helpers() {
-    let src = prepare_test_source(r#"
+    let src = r#"
     import as result from nxlib/stdlib/result.nx
 
     let inc = fn (val: i64) -> i64 do
@@ -171,27 +122,19 @@ fn test_stdlib_result_module_helpers() {
       let b = result.unwrap_or(res: err, default: 31)
       return a + b + inc(val: a)
     end
-    "#);
-    let parser = parser::parser();
-    let program = parser.parse(&src).unwrap();
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).unwrap();
-    let mut interpreter = Interpreter::new(program);
-    let res = interpreter.run_function("__test", vec![]).unwrap();
-    match res {
-        nexus::interpreter::Value::Int(52) => (),
-        _ => panic!("Expected 52, got {:?}", res),
-    }
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(52));
 }
 
 #[test]
 fn test_stdlib_module_not_auto_exported() {
-    let src = prepare_test_source(r#"
+    let src = r#"
     let main = fn () -> i64 do
       let xs = [1, 2, 3]
       return list.length(xs: xs)
     end
-    "#);
+    "#;
+    let src = prepare_test_source(src);
     let parser = parser::parser();
     let program = parser.parse(&src).unwrap();
     let mut checker = TypeChecker::new();
@@ -284,7 +227,7 @@ fn test_stdlib_loader_uses_nx_only() {
 
 #[test]
 fn test_stdlib_global_array_length() {
-    let src = prepare_test_source(r#"
+    let src = r#"
     import { length } from nxlib/stdlib/array.nx
     let main = fn () -> i64 do
       let %arr = [| 10, 20, 30 |]
@@ -293,22 +236,13 @@ fn test_stdlib_global_array_length() {
       match %arr do case _ -> () end
       return n
     end
-    "#);
-    let parser = parser::parser();
-    let program = parser.parse(&src).unwrap();
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).unwrap();
-    let mut interpreter = Interpreter::new(program);
-    let res = interpreter.run_function("__test", vec![]).unwrap();
-    match res {
-        nexus::interpreter::Value::Int(3) => (),
-        _ => panic!("Expected 3, got {:?}", res),
-    }
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(3));
 }
 
 #[test]
 fn test_exception_constructor_raise_and_catch() {
-    let src = prepare_test_source(r#"
+    let src = r#"
     exception Boom(i64)
 
     let main = fn () -> i64 do
@@ -324,22 +258,13 @@ fn test_exception_constructor_raise_and_catch() {
       end
       return 0
     end
-    "#);
-    let parser = parser::parser();
-    let program = parser.parse(&src).unwrap();
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).unwrap();
-    let mut interpreter = Interpreter::new(program);
-    let res = interpreter.run_function("__test", vec![]).unwrap();
-    match res {
-        nexus::interpreter::Value::Int(42) => (),
-        _ => panic!("Expected 42, got {:?}", res),
-    }
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(42));
 }
 
 #[test]
 fn test_exception_constructor_with_labels_raise_and_catch() {
-    let src = prepare_test_source(r#"
+    let src = r#"
     exception Boom(code: i64)
 
     let main = fn () -> i64 do
@@ -355,22 +280,13 @@ fn test_exception_constructor_with_labels_raise_and_catch() {
       end
       return 0
     end
-    "#);
-    let parser = parser::parser();
-    let program = parser.parse(&src).unwrap();
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).unwrap();
-    let mut interpreter = Interpreter::new(program);
-    let res = interpreter.run_function("__test", vec![]).unwrap();
-    match res {
-        nexus::interpreter::Value::Int(42) => (),
-        _ => panic!("Expected 42, got {:?}", res),
-    }
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(42));
 }
 
 #[test]
 fn test_try_catch_can_catch_runtime_error_as_exception() {
-    let src = prepare_test_source(r#"
+    let src = r#"
     let main = fn () -> unit do
       try
         let _ = [| 1 |][10]
@@ -382,13 +298,8 @@ fn test_try_catch_can_catch_runtime_error_as_exception() {
       end
       return ()
     end
-    "#);
-    let parser = parser::parser();
-    let program = parser.parse(&src).unwrap();
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).unwrap();
-    let mut interpreter = Interpreter::new(program);
-    let res = interpreter.run_function("__test", vec![]);
+    "#;
+    let res = run(src);
     assert!(
         res.is_ok(),
         "runtime error should be reified as Exn and caught"

@@ -1,17 +1,6 @@
-use nexus::lang::parser::parser;
-use nexus::lang::typecheck::TypeChecker;
+mod common;
 
-fn prepare_test_source(src: &str) -> String {
-    let s = src.replace("let main = fn ()", "pub let __test = fn ()");
-    format!("{}\nlet main = fn () -> unit do\n  return ()\nend\n", s)
-}
-
-fn check(src: &str) -> Result<(), String> {
-    let src = prepare_test_source(src);
-    let p = parser().parse(src.as_str()).map_err(|e| format!("{:?}", e))?;
-    let mut checker = TypeChecker::new();
-    checker.check_program(&p).map_err(|e| e.message)
-}
+use common::source::check;
 
 #[test]
 fn proc_exit_typechecks_with_perm_proc() {

@@ -1,58 +1,9 @@
-use nexus::interpreter::{Interpreter, Value};
+mod common;
+
+use common::source::{check, run, TempDirGuard};
+use nexus::interpreter::Value;
 use nexus::lang::parser::parser;
 use nexus::lang::typecheck::TypeChecker;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-fn prepare_test_source(src: &str) -> String {
-    let s = src.replace("let main = fn ()", "pub let __test = fn ()");
-    format!("{}\nlet main = fn () -> unit do\n  return ()\nend\n", s)
-}
-
-fn check(src: &str) -> Result<(), String> {
-    let src = prepare_test_source(src);
-    let p = parser().parse(src.as_str()).map_err(|e| format!("{:?}", e))?;
-    let mut checker = TypeChecker::new();
-    checker.check_program(&p).map_err(|e| e.message)
-}
-
-fn run(src: &str) -> Result<Value, String> {
-    let src = prepare_test_source(src);
-    let p = parser().parse(src.as_str()).map_err(|e| format!("{:?}", e))?;
-    let mut checker = TypeChecker::new();
-    checker.check_program(&p).map_err(|e| e.message)?;
-    let mut interpreter = Interpreter::new(p);
-    interpreter.run_function("__test", vec![])
-}
-
-fn unique_temp_dir(label: &str) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock should be monotonic")
-        .as_nanos();
-    format!("/tmp/nexus_fs_test_{}_{}", label, nanos)
-}
-
-struct TempDirGuard {
-    path: String,
-}
-
-impl TempDirGuard {
-    fn new(label: &str) -> Self {
-        Self {
-            path: unique_temp_dir(label),
-        }
-    }
-
-    fn path(&self) -> &str {
-        &self.path
-    }
-}
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 #[test]
 fn fs_create_dir_and_exists_work() {

@@ -1,5 +1,7 @@
+mod common;
+
+use common::source::check_raw;
 use nexus::lang::parser;
-use nexus::lang::typecheck::TypeChecker;
 
 fn check_code(src: &str) -> Result<(), String> {
     let src = src
@@ -31,11 +33,7 @@ fn check_code(src: &str) -> Result<(), String> {
             "let main = fn () -> unit do",
             "let __test_main = fn () -> unit do",
         );
-    let parser = parser::parser();
-    let program = parser.parse(&src).map_err(|e| format!("{:?}", e))?;
-
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).map_err(|e| e.message)
+    check_raw(&src)
 }
 
 #[test]
@@ -129,13 +127,13 @@ fn test_two_generics() {
 fn test_record_access() {
     let src = r#"
     type Box<T> = { val: T }
-    
+
     let unbox = fn <T>(b: Box<T>) -> T do
         return b.val
     end
 
     let main = fn () -> i64 do
-        // Since my infer for Record currently returns AnonymousRecord, 
+        // Since my infer for Record currently returns AnonymousRecord,
         // we can't test full record inference yet, but unbox signature check works.
         return 42
     end
@@ -534,7 +532,7 @@ fn test_function_arity_mismatch_too_many_args() {
 //     );
 //
 //     let src = r#"
-//     type T = <T> (x: T) -> T 
+//     type T = <T> (x: T) -> T
 //     "#;
 //     let err = check_code(src).unwrap_err();
 //     assert!(

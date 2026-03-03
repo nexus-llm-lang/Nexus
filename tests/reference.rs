@@ -1,19 +1,12 @@
-use nexus::lang::parser;
-use nexus::lang::typecheck::TypeChecker;
+mod common;
 
-fn check_code(src: &str) -> Result<(), String> {
-    let parser = parser::parser();
-    let program = parser.parse(src).map_err(|e| format!("{:?}", e))?;
-
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).map_err(|e| e.message)
-}
+use common::source::check_raw as check_code;
 
 #[test]
 fn test_ref_creation_and_type() {
     let src = r#"
     let main = fn () -> unit do
-        let ~c = 0 
+        let ~c = 0
         return ()
     end
     "#;
@@ -41,7 +34,7 @@ fn test_gravity_rule_immutable_holds_value() {
         // If x was Ref, we could modify it? No, x is immutable.
         // But if x was Ref, we could potentially pass it to something expecting Ref?
         // But functions cannot take Ref arguments in Nexus?
-        // Wait, params can be `~x`. 
+        // Wait, params can be `~x`.
         // If I pass `x` (which holds Ref) to `fn f(~p)`, `p` becomes Ref.
         // But `x` is `i64`.
         return ()

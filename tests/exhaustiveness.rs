@@ -1,13 +1,9 @@
+mod common;
+
+use common::source::check_raw as check;
 use nexus::lang::ast::*;
-use nexus::lang::parser::parser;
 use nexus::lang::typecheck::TypeChecker;
 use proptest::prelude::*;
-
-fn check(src: &str) -> Result<(), String> {
-    let p = parser().parse(src).map_err(|e| format!("{:?}", e))?;
-    let mut checker = TypeChecker::new();
-    checker.check_program(&p).map_err(|e| e.message)
-}
 
 fn check_program(program: &Program) -> Result<(), String> {
     let mut checker = TypeChecker::new();
