@@ -115,7 +115,7 @@ end
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 8,
+        cases: 64,
         failure_persistence: None,
         .. ProptestConfig::default()
     })]
@@ -467,7 +467,7 @@ end
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 8,
+        cases: 64,
         failure_persistence: None,
         .. ProptestConfig::default()
     })]

@@ -127,7 +127,7 @@ fn test_net_request_response_status_and_body_with_request_body() {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 8,
+        cases: 64,
         failure_persistence: None,
         .. ProptestConfig::default()
     })]

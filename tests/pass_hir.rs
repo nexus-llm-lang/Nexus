@@ -17,9 +17,12 @@ fn snapshot_hir_basic() {
 #[test]
 fn snapshot_hir_with_handler() {
     let src = r#"
-    port Console { println: (string) -> unit }
+    port Console do fn println(s: string) -> unit end
+    let my_handler = handler Console do
+        fn println(s: string) -> unit do return () end
+    end
     let main = fn () -> unit do
-        handle Console { println: fn (s) -> unit do return () end } do
+        inject my_handler do
             Console.println(val: [=[hello]=])
         end
     end
