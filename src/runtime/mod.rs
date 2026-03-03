@@ -141,6 +141,10 @@ impl ExecutionCapabilities {
     /// Applies this capability policy to a WASI context builder.
     pub fn apply_to_wasi_builder(&self, builder: &mut WasiCtxBuilder) -> Result<(), String> {
         self.validate()?;
+        
+        if self.allow_console {
+            builder.inherit_stdio();
+        }
         if self.allow_net {
             builder.inherit_network();
         }

@@ -294,7 +294,9 @@ fn capability_wasmtime_flags(cap: &str) -> Vec<&'static str> {
     match Permission::from_cap_name(cap) {
         Some(Permission::Net) => vec!["--wasi", "http", "--wasi", "inherit-network"],
         Some(Permission::Fs) => vec!["--dir", "."],
-        // Console, Random, Clock, Proc: provided by wasmtime by default
+        // Console, Random, Clock, Proc are provided by the wasmtime CLI by default.
+        // At the API level, PermConsole explicitly maps to WasiCtxBuilder::inherit_stdio(),
+        // while Clock and Random are inherent to the default Wasmtime WasiCtx.
         _ => vec![],
     }
 }

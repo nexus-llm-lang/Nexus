@@ -87,7 +87,6 @@ fn run_component_wasm_bytes(wasm: &[u8], capabilities: &ExecutionCapabilities) -
     }
 
     let mut builder = WasiCtxBuilder::new();
-    builder.inherit_stdio();
     if let Err(msg) = capabilities.apply_to_wasi_builder(&mut builder) {
         eprintln!("Failed to apply capability policy: {}", msg);
         return ExitCode::from(1);
@@ -143,7 +142,6 @@ fn run_core_wasm_bytes(
         return ExitCode::from(1);
     }
     let mut builder = WasiCtxBuilder::new();
-    builder.inherit_stdio();
     if let Err(msg) = capabilities.apply_to_wasi_builder(&mut builder) {
         eprintln!("Failed to apply capability policy: {}", msg);
         return ExitCode::from(1);
