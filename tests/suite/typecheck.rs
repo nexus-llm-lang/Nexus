@@ -368,7 +368,6 @@ fn test_constructor_arity_error_is_llm_friendly() {
     "#;
     let err = check_code(src).unwrap_err();
     insta::assert_snapshot!(err);
-    insta::assert_snapshot!(err);
 }
 
 #[test]
