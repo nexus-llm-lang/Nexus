@@ -10,14 +10,14 @@ fn build_mir(src: &str) -> nexus::ir::mir::MirProgram {
 
 #[test]
 fn snapshot_mir_basic() {
-    let src = "let main = fn () -> i64 do let x = 42 return x end";
+    let src = "let main = fn () -> unit do let x = 42 return () end";
     let mir = build_mir(src);
     insta::assert_debug_snapshot!(mir);
 }
 
 #[test]
 fn snapshot_mir_with_control_flow() {
-    let src = "let main = fn () -> i64 do if true then return 1 else return 0 end end";
+    let src = "let main = fn () -> unit do if true then return () else return () end end";
     let mir = build_mir(src);
     insta::assert_debug_snapshot!(mir);
 }

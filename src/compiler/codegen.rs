@@ -157,6 +157,7 @@ pub enum CompileError {
     MirLower(MirLowerError),
     LirLower(LirLowerError),
     Codegen(CodegenError),
+    MainSignature(String),
 }
 
 impl std::fmt::Display for CompileError {
@@ -166,6 +167,7 @@ impl std::fmt::Display for CompileError {
             CompileError::MirLower(e) => write!(f, "{}", e),
             CompileError::LirLower(e) => write!(f, "{}", e),
             CompileError::Codegen(e) => write!(f, "{}", e),
+            CompileError::MainSignature(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -226,6 +228,8 @@ struct CodegenLayout {
 /// Compiles a parsed Nexus program through HIR → MIR → LIR → WASM pipeline.
 #[tracing::instrument(skip_all, name = "compile_program_to_wasm")]
 pub fn compile_program_to_wasm(program: &Program) -> Result<Vec<u8>, CompileError> {
+    validate_main_returns_unit(program)?;
+
     // Extract main's require ports from the AST before lowering
     // (the lowering pipeline currently drops the requires clause).
     let caps = extract_main_require_ports_from_ast(program);
@@ -412,6 +416,26 @@ fn perm_to_capability(name: &str) -> Option<&'static str> {
 }
 
 /// Extracts runtime permission names from main function's require row in the AST.
+fn validate_main_returns_unit(program: &Program) -> Result<(), CompileError> {
+    use crate::lang::ast::{Expr, TopLevel};
+    for def in &program.definitions {
+        if let TopLevel::Let(gl) = &def.node {
+            if gl.name == ENTRYPOINT {
+                if let Expr::Lambda { ret_type, .. } = &gl.value.node {
+                    if *ret_type != Type::Unit {
+                        return Err(CompileError::MainSignature(format!(
+                            "main must return unit, got '{}'",
+                            ret_type
+                        )));
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn extract_main_require_ports_from_ast(program: &Program) -> Vec<String> {
     use crate::lang::ast::{Expr, TopLevel};
     for def in &program.definitions {

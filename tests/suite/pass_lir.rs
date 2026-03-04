@@ -12,7 +12,7 @@ fn build_lir(src: &str) -> nexus::ir::lir::LirProgram {
 
 #[test]
 fn snapshot_lir_basic() {
-    let src = "let main = fn () -> i64 do let x = 42 return x end";
+    let src = "let main = fn () -> unit do let x = 42 return () end";
     let lir = build_lir(src);
     insta::assert_debug_snapshot!(lir);
 }
@@ -21,11 +21,11 @@ fn snapshot_lir_basic() {
 fn snapshot_lir_with_exception() {
     let src = r#"
     exception Boom(i64)
-    let main = fn () -> i64 do
+    let main = fn () -> unit do
         try
             raise Boom(42)
         catch e ->
-            return 0
+            return ()
         end
     end
     "#;

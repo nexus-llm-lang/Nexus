@@ -11,28 +11,6 @@ pub fn compile_src(src: &str) -> Result<Vec<u8>, String> {
     compile_program_to_wasm(&program).map_err(|e| e.to_string())
 }
 
-pub fn run_main_i64(wasm: &[u8]) -> Result<i64, String> {
-    let engine = Engine::default();
-    let module = Module::from_binary(&engine, wasm).map_err(|e| e.to_string())?;
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[]).map_err(|e| e.to_string())?;
-    let main = instance
-        .get_typed_func::<(), i64>(&mut store, "main")
-        .map_err(|e| e.to_string())?;
-    main.call(&mut store, ()).map_err(|e| e.to_string())
-}
-
-pub fn run_main_i32(wasm: &[u8]) -> Result<i32, String> {
-    let engine = Engine::default();
-    let module = Module::from_binary(&engine, wasm).map_err(|e| e.to_string())?;
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[]).map_err(|e| e.to_string())?;
-    let main = instance
-        .get_typed_func::<(), i32>(&mut store, "main")
-        .map_err(|e| e.to_string())?;
-    main.call(&mut store, ()).map_err(|e| e.to_string())
-}
-
 pub fn run_wasi_cli_run(wasm: &[u8]) -> Result<i32, String> {
     let engine = Engine::default();
     let module = Module::from_binary(&engine, wasm).map_err(|e| e.to_string())?;

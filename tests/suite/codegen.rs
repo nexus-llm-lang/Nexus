@@ -1,6 +1,10 @@
 
+use crate::common::source::run;
 use crate::common::wasm_runner::*;
+use nexus::interpreter::Value;
 use std::fs;
+
+// -- Interpreter-based value tests (verify computation correctness) --
 
 #[test]
 fn codegen_i64_function_call_works() {
@@ -13,23 +17,7 @@ let main = fn () -> i64 do
     return add(x: 40, y: 2)
 end
 "#;
-    let wasm = compile_src(src).expect("compile should succeed");
-    let result = run_main_i64(&wasm).expect("wasm main should run");
-    assert_eq!(result, 42);
-}
-
-#[test]
-fn codegen_exports_wasi_cli_run_wrapper() {
-    let src = r#"
-let main = fn () -> i64 do
-    return 42
-end
-"#;
-    let wasm = compile_src(src).expect("compile should succeed");
-    let main = run_main_i64(&wasm).expect("wasm main should run");
-    let run = run_wasi_cli_run(&wasm).expect("wasi:cli/run wrapper should run");
-    assert_eq!(main, 42);
-    assert_eq!(run, 0);
+    assert_eq!(run(src).unwrap(), Value::Int(42));
 }
 
 #[test]
@@ -44,9 +32,7 @@ let main = fn () -> i32 do
     return inc(x: x)
 end
 "#;
-    let wasm = compile_src(src).expect("compile should succeed");
-    let result = run_main_i32(&wasm).expect("wasm main should run");
-    assert_eq!(result, 42);
+    assert_eq!(run(src).unwrap(), Value::Int(42));
 }
 
 #[test]
@@ -56,9 +42,7 @@ let main = fn () -> bool do
     return 10 < 11
 end
 "#;
-    let wasm = compile_src(src).expect("compile should succeed");
-    let result = run_main_i32(&wasm).expect("wasm main should run");
-    assert_eq!(result, 1);
+    assert_eq!(run(src).unwrap(), Value::Bool(true));
 }
 
 #[test]
@@ -70,59 +54,7 @@ let main = fn () -> i64 do
     return math.add(a: 19, b: 23)
 end
 "#;
-    let wasm = compile_src(src).expect("compile should succeed");
-    let result = run_main_i64(&wasm).expect("wasm main should run");
-    assert_eq!(result, 42);
-}
-
-#[test]
-fn codegen_string_return_is_supported() {
-    let src = r#"
-let main = fn () -> string do
-    return [=[hello]=]
-end
-"#;
-    let wasm = compile_src(src).expect("compile should succeed");
-    let packed = run_main_i64(&wasm).expect("wasm main should run");
-    let len = (packed as u64 & 0xffff_ffff) as u32;
-    assert_eq!(len, 5);
-}
-
-#[test]
-fn codegen_string_concat_operator_is_supported() {
-    let src = r#"
-let main = fn () -> string do
-    let msg = [=[foo]=] ++ [=[bar]=]
-    return msg
-end
-"#;
-    let wasm = compile_src(src).expect("compile should succeed");
-    let packed = run_main_i64(&wasm).expect("wasm main should run");
-    let len = (packed as u64 & 0xffff_ffff) as u32;
-    assert_eq!(len, 6);
-}
-
-#[test]
-fn codegen_fixture_fib_works_in_wasm() {
-    let src = fs::read_to_string("examples/fib.nx").expect("fixture should exist");
-    let wasm = compile_src(&src).expect("fib fixture should compile");
-    run_main_unit_with_wasi(&wasm).expect("wasm main should run");
-}
-
-#[test]
-fn codegen_raise_compiles_and_traps() {
-    let src = r#"
-exception Boom(i64)
-
-let main = fn () -> unit effect { Exn } do
-    let err = Boom(42)
-    raise err
-    return ()
-end
-"#;
-
-    let wasm = compile_src(src).expect("compile should succeed");
-    let _err = run_main_unit_traps(&wasm).expect_err("main should trap");
+    assert_eq!(run(src).unwrap(), Value::Int(42));
 }
 
 #[test]
@@ -141,10 +73,7 @@ let main = fn () -> i64 effect { Exn } do
     return 0
 end
 "#;
-
-    let wasm = compile_src(src).expect("compile should succeed");
-    let result = run_main_i64(&wasm).expect("wasm main should run");
-    assert_eq!(result, 7);
+    assert_eq!(run(src).unwrap(), Value::Int(7));
 }
 
 #[test]
@@ -168,10 +97,7 @@ let main = fn () -> i64 effect { Exn } do
     return 0
 end
 "#;
-
-    let wasm = compile_src(src).expect("compile should succeed");
-    let result = run_main_i64(&wasm).expect("wasm main should run");
-    assert_eq!(result, 9);
+    assert_eq!(run(src).unwrap(), Value::Int(9));
 }
 
 #[test]
@@ -187,10 +113,7 @@ let main = fn () -> i64 do
     return 0
 end
 "#;
-
-    let wasm = compile_src(src).expect("compile should succeed");
-    let result = run_main_i64(&wasm).expect("wasm main should run");
-    assert_eq!(result, 20);
+    assert_eq!(run(src).unwrap(), Value::Int(20));
 }
 
 #[test]
@@ -211,10 +134,7 @@ let main = fn () -> i64 effect { Exn } do
     return 0
 end
 "#;
-
-    let wasm = compile_src(src).expect("compile should succeed");
-    let result = run_main_i64(&wasm).expect("wasm main should run");
-    assert_eq!(result, 1);
+    assert_eq!(run(src).unwrap(), Value::Int(1));
 }
 
 #[test]
@@ -235,10 +155,7 @@ let main = fn () -> i64 effect { Exn } do
     return 0
 end
 "#;
-
-    let wasm = compile_src(src).expect("compile should succeed");
-    let result = run_main_i64(&wasm).expect("wasm main should run");
-    assert_eq!(result, 42);
+    assert_eq!(run(src).unwrap(), Value::Int(42));
 }
 
 #[test]
@@ -252,10 +169,7 @@ let main = fn () -> i64 do
     return 0
 end
 "#;
-
-    let wasm = compile_src(src).expect("compile should succeed");
-    let result = run_main_i64(&wasm).expect("wasm main should run");
-    assert_eq!(result, 42);
+    assert_eq!(run(src).unwrap(), Value::Int(42));
 }
 
 #[test]
@@ -269,10 +183,7 @@ let main = fn () -> i64 do
     return 0
 end
 "#;
-
-    let wasm = compile_src(src).expect("compile should succeed");
-    let result = run_main_i64(&wasm).expect("wasm main should run");
-    assert_eq!(result, 42);
+    assert_eq!(run(src).unwrap(), Value::Int(42));
 }
 
 #[test]
@@ -287,10 +198,118 @@ let main = fn () -> i64 do
     return -1
 end
 "#;
+    assert_eq!(run(src).unwrap(), Value::Int(7));
+}
 
+#[test]
+fn codegen_record_field_access() {
+    let src = r#"
+let main = fn () -> i64 do
+    let r = { y: 2, x: 40 }
+    let v = r.x
+    return v
+end
+"#;
+    assert_eq!(run(src).unwrap(), Value::Int(40));
+}
+
+#[test]
+fn codegen_record_field_access_multiple() {
+    let src = r#"
+let main = fn () -> i64 do
+    let r = { a: 10, b: 32 }
+    let x = r.a
+    let y = r.b
+    return x + y
+end
+"#;
+    assert_eq!(run(src).unwrap(), Value::Int(42));
+}
+
+#[test]
+fn codegen_record_field_access_then_arithmetic() {
+    let src = r#"
+let main = fn () -> i64 do
+    let r = { x: 20, y: 22 }
+    let a = r.x
+    let b = r.y
+    return a + b
+end
+"#;
+    assert_eq!(run(src).unwrap(), Value::Int(42));
+}
+
+#[test]
+fn codegen_negate_function() {
+    let src = r#"
+import { negate } from nxlib/stdlib/core.nx
+
+let main = fn () -> i64 do
+    let t = negate(val: true)
+    let f = negate(val: false)
+    if t then return 1 else
+    if f then return 42 else return 0 end
+    end
+end
+"#;
+    assert_eq!(run(src).unwrap(), Value::Int(42));
+}
+
+#[test]
+fn codegen_string_return_is_supported() {
+    let src = r#"
+let main = fn () -> string do
+    return [=[hello]=]
+end
+"#;
+    assert_eq!(run(src).unwrap(), Value::String("hello".to_string()));
+}
+
+#[test]
+fn codegen_string_concat_operator_is_supported() {
+    let src = r#"
+let main = fn () -> string do
+    let msg = [=[foo]=] ++ [=[bar]=]
+    return msg
+end
+"#;
+    assert_eq!(run(src).unwrap(), Value::String("foobar".to_string()));
+}
+
+// -- WASM compilation + execution tests (main -> unit only) --
+
+#[test]
+fn codegen_exports_wasi_cli_run_wrapper() {
+    let src = r#"
+let main = fn () -> unit do
+    return ()
+end
+"#;
     let wasm = compile_src(src).expect("compile should succeed");
-    let result = run_main_i64(&wasm).expect("wasm main should run");
-    assert_eq!(result, 7);
+    let run = run_wasi_cli_run(&wasm).expect("wasi:cli/run wrapper should run");
+    assert_eq!(run, 0);
+}
+
+#[test]
+fn codegen_fixture_fib_works_in_wasm() {
+    let src = fs::read_to_string("examples/fib.nx").expect("fixture should exist");
+    let wasm = compile_src(&src).expect("fib fixture should compile");
+    run_main_unit_with_wasi(&wasm).expect("wasm main should run");
+}
+
+#[test]
+fn codegen_raise_compiles_and_traps() {
+    let src = r#"
+exception Boom(i64)
+
+let main = fn () -> unit effect { Exn } do
+    let err = Boom(42)
+    raise err
+    return ()
+end
+"#;
+    let wasm = compile_src(src).expect("compile should succeed");
+    let _err = run_main_unit_traps(&wasm).expect_err("main should trap");
 }
 
 #[test]
@@ -311,7 +330,6 @@ let main = fn () -> unit do
     return ()
 end
 "#;
-
     let wasm = compile_src(src).expect("compile should succeed");
     run_main_unit_with_wasi(&wasm).expect("wasm main should run");
 }
@@ -328,66 +346,8 @@ let main = fn () -> unit do
     return ()
 end
 "#;
-
     let wasm = compile_src(src).expect("compile should succeed");
     run_main_unit_with_wasi(&wasm).expect("wasm main should run");
-}
-
-#[test]
-fn codegen_record_field_access() {
-    let src = r#"
-let main = fn () -> i64 do
-    let r = { y: 2, x: 40 }
-    let v = r.x
-    return v
-end
-"#;
-    let wasm = compile_src(src).expect("compile");
-    assert_eq!(run_main_i64(&wasm).unwrap(), 40);
-}
-
-#[test]
-fn codegen_record_field_access_multiple() {
-    let src = r#"
-let main = fn () -> i64 do
-    let r = { a: 10, b: 32 }
-    let x = r.a
-    let y = r.b
-    return x + y
-end
-"#;
-    let wasm = compile_src(src).expect("compile");
-    assert_eq!(run_main_i64(&wasm).unwrap(), 42);
-}
-
-#[test]
-fn codegen_record_field_access_then_arithmetic() {
-    let src = r#"
-let main = fn () -> i64 do
-    let r = { x: 20, y: 22 }
-    let a = r.x
-    let b = r.y
-    return a + b
-end
-"#;
-    let wasm = compile_src(src).expect("compile");
-    assert_eq!(run_main_i64(&wasm).unwrap(), 42);
-}
-
-#[test]
-fn codegen_negate_function() {
-    let src = r#"
-import { negate } from nxlib/stdlib/core.nx
-let main = fn () -> i64 do
-    let t = negate(val: true)
-    let f = negate(val: false)
-    if t then return 1 else
-    if f then return 42 else return 0 end
-    end
-end
-"#;
-    let wasm = compile_src(src).expect("compile");
-    assert_eq!(run_main_i64(&wasm).unwrap(), 42);
 }
 
 #[test]
@@ -432,6 +392,17 @@ fn codegen_fixture_module_test_compiles() {
     run_main_unit_with_wasi(&wasm).expect("wasm main should run");
 }
 
+#[test]
+fn codegen_main_non_unit_return_is_rejected() {
+    let src = r#"
+let main = fn () -> i64 do
+    return 42
+end
+"#;
+    let err = compile_src(src).unwrap_err();
+    assert!(err.contains("main must return unit"), "got: {}", err);
+}
+
 use proptest::prelude::*;
 
 proptest! {
@@ -448,9 +419,10 @@ let main = fn () -> i64 do
     return ({} + {}) + {}
 end
 ", a, b, c);
-        let wasm = crate::common::wasm_runner::compile_src(&src).unwrap();
-        let result = crate::common::wasm_runner::run_main_i64(&wasm).unwrap();
-        assert_eq!(result, (a + b) + c);
+        assert_eq!(
+            crate::common::source::run(&src).unwrap(),
+            Value::Int((a + b) + c)
+        );
     }
 
     #[test]
@@ -465,9 +437,10 @@ let main = fn () -> i64 do
     return 0
 end
 ", a);
-        let wasm = crate::common::wasm_runner::compile_src(&src).unwrap();
-        let result = crate::common::wasm_runner::run_main_i64(&wasm).unwrap();
         let expected = if a > 5 { 1 } else { 2 };
-        assert_eq!(result, expected);
+        assert_eq!(
+            crate::common::source::run(&src).unwrap(),
+            Value::Int(expected)
+        );
     }
 }

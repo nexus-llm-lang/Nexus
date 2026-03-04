@@ -8,7 +8,7 @@ fn parse_and_build_hir(src: &str) -> Result<nexus::ir::hir::HirProgram, nexus::c
 
 #[test]
 fn snapshot_hir_basic() {
-    let src = "let main = fn () -> i64 do return 42 end";
+    let src = "let main = fn () -> unit do return () end";
     let hir = parse_and_build_hir(src).unwrap();
     insta::assert_debug_snapshot!(hir);
 }
