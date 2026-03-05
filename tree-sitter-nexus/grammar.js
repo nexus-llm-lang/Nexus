@@ -319,6 +319,7 @@ module.exports = grammar({
         $.let_stmt,
         $.return_stmt,
         $.assign_stmt,
+        $.drop_stmt,
         $.if_stmt,
         $.match_stmt,
         $.try_stmt,
@@ -416,6 +417,9 @@ module.exports = grammar({
         field("body", repeat($._stmt)),
         "end"
       ),
+
+    // drop %x
+    drop_stmt: ($) => seq("drop", field("value", $._expr)),
 
     expr_stmt: ($) => $._expr,
 
