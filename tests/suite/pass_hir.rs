@@ -22,7 +22,7 @@ fn snapshot_hir_with_handler() {
     end
     let main = fn () -> unit do
         inject my_handler do
-            Console.println(val: [=[hello]=])
+            Console.println(val: "hello")
         end
     end
     "#;

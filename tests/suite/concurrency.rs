@@ -16,7 +16,7 @@ fn test_net_effect_enforcement() {
     let src = r#"
     type IO = {}
     let main = fn () -> unit effect { IO } do
-        let res = get(url: [=[https://example.com]=])
+        let res = get(url: "https://example.com")
         return ()
     end
     "#;
@@ -35,9 +35,9 @@ fn test_net_request_method_and_headers_runtime() {
 
     let main = fn () -> string require { PermNet } do
       inject net_mod.system_handler do
-        let h = header(name: [=[X-Test]=], value: [=[abc]=])
+        let h = header(name: "X-Test", value: "abc")
         let hs = Cons(v: h, rest: Nil())
-        return Net.request(method: [=[POST]=], url: [=[http://127.0.0.1:1/ping]=], headers: hs)
+        return Net.request(method: "POST", url: "http://127.0.0.1:1/ping", headers: hs)
       end
     end
     "#;
@@ -62,7 +62,7 @@ fn test_net_request_https_url_is_accepted() {
     let main = fn () -> string require { PermNet } do
       inject net_mod.system_handler do
         let hs = Nil()
-        return Net.request(method: [=[GET]=], url: [=[https://127.0.0.1:1/]=], headers: hs)
+        return Net.request(method: "GET", url: "https://127.0.0.1:1/", headers: hs)
       end
     end
     "#;
@@ -82,12 +82,12 @@ fn test_net_request_response_status_and_body_with_request_body() {
 
     let main = fn () -> string require { PermNet } do
       inject net_mod.system_handler do
-        let hs = Cons(v: header(name: [=[Content-Type]=], value: [=[application/x-www-form-urlencoded]=]), rest: Nil())
-        let res = Net.request_response(method: [=[POST]=], url: [=[http://127.0.0.1:1/submit]=], headers: hs, body: [=[hello=nx]=])
+        let hs = Cons(v: header(name: "Content-Type", value: "application/x-www-form-urlencoded"), rest: Nil())
+        let res = Net.request_response(method: "POST", url: "http://127.0.0.1:1/submit", headers: hs, body: "hello=nx")
         let status = response_status(res: res)
         let body = response_body(res: res)
         let status_s = from_i64(val: status)
-        return status_s ++ [=[:]=] ++ body
+        return status_s ++ ":" ++ body
       end
     end
     "#;

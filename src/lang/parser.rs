@@ -1768,7 +1768,7 @@ impl Parser {
                 s
             }
             _ => return Err(ParseError {
-                message: "expected bracket string for external symbol".to_string(),
+                message: "expected string literal for external symbol".to_string(),
                 span: self.peek_span(),
             }),
         };

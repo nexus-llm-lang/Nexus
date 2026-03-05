@@ -172,7 +172,7 @@ fn test_complex_poly_logic() {
 
     let main = fn () -> unit do
         let a = weird(x: 1)
-        let b = weird(x: [=[string]=])
+        let b = weird(x: "string")
         return ()
     end
     "#;
@@ -408,7 +408,7 @@ fn test_string_concat_in_call_arg() {
     end
 
     let main = fn () -> string do
-        return greet(msg: [=[hello ]=] ++ [=[world]=])
+        return greet(msg: "hello " ++ "world")
     end
     "#;
     assert!(check_code(src).is_ok(), "string concat should be allowed in call args");
@@ -543,10 +543,10 @@ fn test_anonymous_record() {
     import { from_i64 } from nxlib/stdlib/string.nx
     let main = fn () -> unit require { PermConsole } do
         inject stdio.system_handler do
-            let r = { x: 1, y: [=[hello]=] }
+            let r = { x: 1, y: "hello" }
             let i = r.x
             let i_s = from_i64(val: i)
-            let msg = [=[i=]=] ++ i_s
+            let msg = "i=" ++ i_s
             Console.print(val: msg)
         end
         return ()
@@ -592,7 +592,7 @@ fn test_record_fail() {
 fn test_ffi_declaration() {
     let src = r#"
     import external math.wasm
-    pub external add_i64 = [=[add]=] : (a: i64, b: i64) -> i64
+    pub external add_i64 = "add" : (a: i64, b: i64) -> i64
 
     let main = fn () -> unit do
       let x = add_i64(a: 1, b: 2)
@@ -610,7 +610,7 @@ fn test_ffi_effectful() {
     let src = r#"
     import external time.wasm
     type IO = {}
-    pub external get_time = [=[get_time]=] : () -> float effect { IO }
+    pub external get_time = "get_time" : () -> float effect { IO }
 
     let helper = fn () -> unit effect { IO } do
       let t = get_time()
@@ -630,7 +630,7 @@ fn test_ffi_effectful() {
 #[test]
 fn test_ffi_mismatch() {
     let src = r#"
-    pub external foo = [=[foo]=] : (a: i64) -> i64
+    pub external foo = "foo" : (a: i64) -> i64
     let main = fn () -> unit do
       let x = foo(a: true)
     end
@@ -642,7 +642,7 @@ fn test_ffi_mismatch() {
 fn test_ffi_explicit_type_params() {
     let src = r#"
     import external core.wasm
-    pub external array_len = [=[array_length]=] : <T>(arr: &[| T |]) -> i64
+    pub external array_len = "array_length" : <T>(arr: &[| T |]) -> i64
 
     let main = fn () -> unit do
       let %a = [| 1, 2, 3 |]
@@ -661,7 +661,7 @@ fn test_ffi_explicit_type_params() {
 #[test]
 fn test_ffi_unintroduced_type_var_errors() {
     let src = r#"
-    pub external bad = [=[bad]=] : (arr: &[| T |]) -> i64
+    pub external bad = "bad" : (arr: &[| T |]) -> i64
     let main = fn () -> unit do
       return ()
     end
@@ -673,7 +673,7 @@ fn test_ffi_unintroduced_type_var_errors() {
 #[test]
 fn test_ffi_concrete_types_no_type_params_needed() {
     let src = r#"
-    pub external add = [=[add]=] : (a: i64, b: i64) -> i64
+    pub external add = "add" : (a: i64, b: i64) -> i64
     let main = fn () -> unit do
       let x = add(a: 1, b: 2)
       return ()

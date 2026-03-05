@@ -13,7 +13,7 @@ fn net_server_types_check() {
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
         try
-          let server = Net.listen(addr: [=[127.0.0.1:0]=])
+          let server = Net.listen(addr: "127.0.0.1:0")
           Net.stop(server: server)
         catch e ->
           return ()
@@ -52,7 +52,7 @@ fn net_server_linear_leak_is_rejected() {
     import { Net }, * as net_mod from nxlib/stdlib/net.nx
 
     let leak = fn () -> unit require { Net } effect { Exn } do
-      let server = Net.listen(addr: [=[127.0.0.1:0]=])
+      let server = Net.listen(addr: "127.0.0.1:0")
       return ()
     end
 
@@ -80,7 +80,7 @@ fn net_server_listen_and_stop() {
     let main = fn () -> bool require { PermNet } do
       inject net_mod.system_handler do
         try
-          let server = Net.listen(addr: [=[127.0.0.1:0]=])
+          let server = Net.listen(addr: "127.0.0.1:0")
           Net.stop(server: server)
           return true
         catch e ->
@@ -111,11 +111,11 @@ fn net_server_accept_and_respond() {
     let main = fn () -> bool require {{ PermNet }} effect {{ Console }} do
       inject net_mod.system_handler do
         try
-          let server = Net.listen(addr: [=[{addr}]=])
+          let server = Net.listen(addr: "{addr}")
           let req = Net.accept(server: &server)
           let method = request_method(req: &req)
           let path = request_path(req: &req)
-          let _ = Net.respond(req: req, status: 200, body: method ++ [=[ ]=] ++ path)
+          let _ = Net.respond(req: req, status: 200, body: method ++ " " ++ path)
           Net.stop(server: server)
           return true
         catch e ->
@@ -198,7 +198,7 @@ fn net_requires_inject() {
     import { Net } from nxlib/stdlib/net.nx
 
     let main = fn () -> string do
-      let body = Net.get(url: [=[https://example.com]=])
+      let body = Net.get(url: "https://example.com")
       return body
     end
     "#;

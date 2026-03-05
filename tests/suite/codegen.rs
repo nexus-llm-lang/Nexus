@@ -259,7 +259,7 @@ end
 fn codegen_string_return_is_supported() {
     let src = r#"
 let main = fn () -> string do
-    return [=[hello]=]
+    return "hello"
 end
 "#;
     assert_eq!(run(src).unwrap(), Value::String("hello".to_string()));
@@ -269,7 +269,7 @@ end
 fn codegen_string_concat_operator_is_supported() {
     let src = r#"
 let main = fn () -> string do
-    let msg = [=[foo]=] ++ [=[bar]=]
+    let msg = "foo" ++ "bar"
     return msg
 end
 "#;
@@ -323,10 +323,10 @@ fn codegen_fixture_network_access_compiles() {
 fn codegen_print_works_via_external_stdio_module() {
     let src = r#"
 import external nxlib/stdlib/stdio.wasm
-external __nx_print = [=[__nx_print]=] : (val: string) -> unit
+external __nx_print = "__nx_print" : (val: string) -> unit
 
 let main = fn () -> unit do
-    __nx_print(val: [=[hello wasm]=])
+    __nx_print(val: "hello wasm")
     return ()
 end
 "#;
@@ -338,7 +338,7 @@ end
 fn codegen_print_after_from_i64_works_via_single_string_abi_module() {
     let src = r#"
 import external nxlib/stdlib/stdio.wasm
-external __nx_print = [=[__nx_print]=] : (val: string) -> unit
+external __nx_print = "__nx_print" : (val: string) -> unit
 
 let main = fn () -> unit do
     let s = from_i64(val: 42)
@@ -357,7 +357,7 @@ import { Console }, * as stdio from nxlib/stdlib/stdio.nx
 
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do
-        Console.print(val: [=[hello]=])
+        Console.print(val: "hello")
     end
     return ()
 end
@@ -370,7 +370,7 @@ end
 fn codegen_exn_constructor_lowering() {
     let src = r#"
 let main = fn () -> unit effect { Exn } do
-    raise RuntimeError(val: [=[test error]=])
+    raise RuntimeError(val: "test error")
     return ()
 end
 "#;

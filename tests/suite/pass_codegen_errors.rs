@@ -11,7 +11,7 @@ fn get_codegen_error(src: &str) -> String {
 fn snapshot_codegen_error_unsupported_external() {
     let src = r#"
     import external fake.wasm
-    external bad = [=[bad]=] : (val: i64) -> { x: i64 }
+    external bad = "bad" : (val: i64) -> { x: i64 }
     let main = fn () -> unit do
         let x = bad(val: 42)
         return ()

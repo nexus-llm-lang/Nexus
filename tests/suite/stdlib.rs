@@ -9,7 +9,7 @@ fn test_to_string_runtime_error() {
 import { to_string } from nxlib/stdlib/exn.nx
 
 let main = fn () -> string do
-  let e: Exn = RuntimeError(val: [=[boom]=])
+  let e: Exn = RuntimeError(val: "boom")
   return to_string(exn: e)
 end
 "#;
@@ -41,7 +41,7 @@ fn test_backtrace_returns_frames() {
 import { backtrace } from nxlib/stdlib/exn.nx
 
 let inner = fn () -> unit effect { Exn } do
-  raise RuntimeError(val: [=[oops]=])
+  raise RuntimeError(val: "oops")
   return ()
 end
 
@@ -272,7 +272,7 @@ fn result_from_exn_builds_err() {
 import as result from nxlib/stdlib/result.nx
 
 let main = fn () -> bool do
-  let exn = RuntimeError(val: [=[boom]=])
+  let exn = RuntimeError(val: "boom")
   let r = result.from_exn(exn: exn)
   return result.is_err(res: r)
 end

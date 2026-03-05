@@ -296,6 +296,49 @@ impl Lexer {
         }
     }
 
+    fn lex_double_quoted_string(&mut self) -> TokenKind {
+        let start = self.pos - 1; // include the already-consumed '"'
+        let mut content = String::new();
+        loop {
+            match self.advance() {
+                None => {
+                    self.errors.push(LexError {
+                        message: "unterminated string literal".to_string(),
+                        span: start..self.pos,
+                    });
+                    return TokenKind::StringLit(content);
+                }
+                Some('\n') | Some('\r') => {
+                    self.errors.push(LexError {
+                        message: "unclosed string literal".to_string(),
+                        span: start..self.pos,
+                    });
+                    return TokenKind::StringLit(content);
+                }
+                Some('"') => {
+                    return TokenKind::StringLit(content);
+                }
+                Some('\\') => {
+                    match self.advance() {
+                        Some('"') => content.push('"'),
+                        Some('\\') => content.push('\\'),
+                        Some('n') => content.push('\n'),
+                        Some('r') => content.push('\r'),
+                        Some('t') => content.push('\t'),
+                        Some(c) => content.push(c),
+                        None => {
+                            self.errors.push(LexError {
+                                message: "unterminated escape in string".to_string(),
+                                span: start..self.pos,
+                            });
+                        }
+                    }
+                }
+                Some(c) => content.push(c),
+            }
+        }
+    }
+
     fn lex_number(&mut self, first: char) -> TokenKind {
         let mut s = String::new();
         s.push(first);
@@ -556,6 +599,9 @@ impl Lexer {
                     self.lex_ident_or_keyword('_')
                 }
 
+                // Double-quoted strings
+                '"' => self.lex_double_quoted_string(),
+
                 // Numbers
                 c if c.is_ascii_digit() => self.lex_number(c),
 
@@ -664,5 +710,29 @@ mod tests {
     fn test_negative_number() {
         let tokens = tokenize("-42").unwrap();
         assert!(matches!(tokens[0].kind, TokenKind::Int(-42)));
+    }
+
+    #[test]
+    fn test_double_quoted_string() {
+        let tokens = tokenize(r#""hello""#).unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::StringLit(ref s) if s == "hello"));
+    }
+
+    #[test]
+    fn test_double_quoted_string_escapes() {
+        let tokens = tokenize(r#""a\"b\\c\nd\re\tf""#).unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::StringLit(ref s) if s == "a\"b\\c\nd\re\tf"));
+    }
+
+    #[test]
+    fn test_double_quoted_string_unterminated() {
+        let err = tokenize(r#""hello"#).unwrap_err();
+        assert!(err[0].message.contains("unterminated string literal"));
+    }
+
+    #[test]
+    fn test_double_quoted_string_newline_rejected() {
+        let err = tokenize("\"hello\nworld\"").unwrap_err();
+        assert!(err[0].message.contains("unclosed string literal"));
     }
 }

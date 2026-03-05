@@ -153,7 +153,7 @@ fn test_generic_drop_accepts_non_linear_primitives() {
     let main = fn () -> unit do
         let x: i32 = 1
         let y: f64 = 2.0
-        let s = [=[hello]=]
+        let s = "hello"
         return ()
     end
     "#;

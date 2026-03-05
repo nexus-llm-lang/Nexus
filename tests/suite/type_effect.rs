@@ -239,7 +239,7 @@ end
 exception Fail(val: string)
 
 let fail = fn () -> unit do
-    raise Fail(val: [=[{msg}]=])
+    raise Fail(val: "{msg}")
     return ()
 end
 "#
@@ -263,7 +263,7 @@ end
 let main = fn () -> unit require {{ PermConsole }} do
     inject stdio.system_handler do
         try
-            risky(msg: [=[{msg}]=])
+            risky(msg: "{msg}")
         catch e ->
             match e do
                 case MsgError(val: m) -> Console.print(val: m)

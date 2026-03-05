@@ -20,7 +20,7 @@ fn test_port_basic() {
 
       inject stdio.system_handler do
         inject stdout_logger do
-          Logger.log(msg: [=[test message]=])
+          Logger.log(msg: "test message")
         end
       end
       return ()
@@ -73,7 +73,7 @@ fn test_handler_require_mock_needs_nothing() {
 
     let mock_fs = handler Fs do
       fn exists(path: string) -> bool do return false end
-      fn read_to_string(path: string) -> string do return [=[]=] end
+      fn read_to_string(path: string) -> string do return "" end
       fn write_string(path: string, content: string) -> unit effect { Exn } do return () end
       fn append_string(path: string, content: string) -> unit effect { Exn } do return () end
       fn remove_file(path: string) -> unit effect { Exn } do return () end
@@ -98,7 +98,7 @@ fn test_handler_require_mock_needs_nothing() {
         match handle do case Handle(id: id) ->
           let h = Handle(id: id)
           let %lh = h
-          return { content: [=[]=], handle: %lh }
+          return { content: "", handle: %lh }
         end
       end
       fn fd_write(handle: %Handle, content: string) -> { ok: bool, handle: %Handle } do
@@ -112,7 +112,7 @@ fn test_handler_require_mock_needs_nothing() {
         match handle do case Handle(id: id) ->
           let h = Handle(id: id)
           let %lh = h
-          return { path: [=[]=], handle: %lh }
+          return { path: "", handle: %lh }
         end
       end
       fn close(handle: %Handle) -> unit do
@@ -122,7 +122,7 @@ fn test_handler_require_mock_needs_nothing() {
 
     let main = fn () -> bool do
       inject mock_fs do
-        return Fs.exists(path: [=[anything]=])
+        return Fs.exists(path: "anything")
       end
     end
     "#;
@@ -143,7 +143,7 @@ fn test_handler_require_real_propagates_perm() {
 
     let main = fn () -> bool require { PermFs } do
       inject fs_mod.system_handler do
-        return Fs.exists(path: [=[/tmp]=])
+        return Fs.exists(path: "/tmp")
       end
     end
     "#;
@@ -252,7 +252,7 @@ fn test_handler_require_missing_is_rejected() {
 
     let main = fn () -> bool do
       inject fs_mod.system_handler do
-        return Fs.exists(path: [=[/tmp]=])
+        return Fs.exists(path: "/tmp")
       end
     end
     "#;

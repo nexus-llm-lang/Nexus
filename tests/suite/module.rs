@@ -56,7 +56,7 @@ fn test_module_selective_import() {
 fn test_import_external_syntax() {
     let src = prepare_test_source(r#"
     import external math.wasm
-    pub external add = [=[add]=] : (a: i64, b: i64) -> i64
+    pub external add = "add" : (a: i64, b: i64) -> i64
     "#);
     let parser = parser::parser();
     let program = parser.parse(&src).unwrap();
@@ -292,7 +292,7 @@ fn test_stdlib_string_length() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> i64 do
-      return string.length(s: [=[hello]=])
+      return string.length(s: "hello")
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::Int(5));
@@ -303,7 +303,7 @@ fn test_stdlib_string_contains() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> bool do
-      return string.contains(s: [=[hello world]=], sub: [=[world]=])
+      return string.contains(s: "hello world", sub: "world")
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::Bool(true));
@@ -314,7 +314,7 @@ fn test_stdlib_string_contains_false() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> bool do
-      return string.contains(s: [=[hello]=], sub: [=[xyz]=])
+      return string.contains(s: "hello", sub: "xyz")
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::Bool(false));
@@ -325,7 +325,7 @@ fn test_stdlib_string_substring() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> string do
-      return string.substring(s: [=[hello world]=], start: 6, len: 5)
+      return string.substring(s: "hello world", start: 6, len: 5)
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::String("world".to_string()));
@@ -336,7 +336,7 @@ fn test_stdlib_string_index_of() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> i64 do
-      return string.index_of(s: [=[abcdef]=], sub: [=[cd]=])
+      return string.index_of(s: "abcdef", sub: "cd")
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::Int(2));
@@ -347,7 +347,7 @@ fn test_stdlib_string_index_of_not_found() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> i64 do
-      return string.index_of(s: [=[abc]=], sub: [=[xyz]=])
+      return string.index_of(s: "abc", sub: "xyz")
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::Int(-1));
@@ -358,7 +358,7 @@ fn test_stdlib_string_starts_with() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> bool do
-      return string.starts_with(s: [=[hello]=], prefix: [=[hel]=])
+      return string.starts_with(s: "hello", prefix: "hel")
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::Bool(true));
@@ -369,7 +369,7 @@ fn test_stdlib_string_ends_with() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> bool do
-      return string.ends_with(s: [=[hello]=], suffix: [=[llo]=])
+      return string.ends_with(s: "hello", suffix: "llo")
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::Bool(true));
@@ -380,7 +380,7 @@ fn test_stdlib_string_trim() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> string do
-      return string.trim(s: [=[  hi  ]=])
+      return string.trim(s: "  hi  ")
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::String("hi".to_string()));
@@ -391,7 +391,7 @@ fn test_stdlib_string_to_upper() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> string do
-      return string.to_upper(s: [=[hello]=])
+      return string.to_upper(s: "hello")
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::String("HELLO".to_string()));
@@ -402,7 +402,7 @@ fn test_stdlib_string_to_lower() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> string do
-      return string.to_lower(s: [=[HELLO]=])
+      return string.to_lower(s: "HELLO")
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::String("hello".to_string()));
@@ -413,7 +413,7 @@ fn test_stdlib_string_replace() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> string do
-      return string.replace(s: [=[hello world]=], from_str: [=[world]=], to_str: [=[nexus]=])
+      return string.replace(s: "hello world", from_str: "world", to_str: "nexus")
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::String("hello nexus".to_string()));
@@ -425,7 +425,7 @@ fn test_stdlib_string_split() {
     import as string from nxlib/stdlib/string.nx
     import as list from nxlib/stdlib/list.nx
     let main = fn () -> i64 do
-      let parts = string.split(s: [=[a,b,c]=], sep: [=[,]=])
+      let parts = string.split(s: "a,b,c", sep: ",")
       return list.length(xs: parts)
     end
     "#;
@@ -437,7 +437,7 @@ fn test_stdlib_string_char_at() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> string do
-      return string.char_at(s: [=[hello]=], idx: 1)
+      return string.char_at(s: "hello", idx: 1)
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::String("e".to_string()));
@@ -575,7 +575,7 @@ fn test_stdlib_string_to_i64() {
     let src = r#"
     import as string from nxlib/stdlib/string.nx
     let main = fn () -> i64 do
-      return string.to_i64(s: [=[123]=])
+      return string.to_i64(s: "123")
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::Int(123));

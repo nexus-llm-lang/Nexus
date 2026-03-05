@@ -45,7 +45,7 @@ fn test_try_catch_removes_exn() {
     exception Oops(string)
 
     let risky = fn () -> unit effect { Exn } do
-        raise Oops([=[oops]=])
+        raise Oops("oops")
         return ()
     end
 
@@ -75,7 +75,7 @@ fn test_try_catch_removes_exn() {
 fn test_raise_requires_exn() {
     let src = r#"
     let fail = fn () -> unit do
-        raise [=[oops]=] // Should fail: no Exn effect allowed
+        raise "oops" // Should fail: no Exn effect allowed
         return ()
     end
     let main = fn () -> unit do
