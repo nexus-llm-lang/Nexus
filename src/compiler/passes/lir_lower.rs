@@ -924,6 +924,7 @@ fn wasm_type(typ: &Type) -> Type {
         Type::Record(_)
         | Type::UserDefined(_, _)
         | Type::Array(_)
+        | Type::List(_)
         | Type::Linear(_)
         | Type::Borrow(_)
         | Type::Ref(_)

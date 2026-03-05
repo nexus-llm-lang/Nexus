@@ -856,6 +856,7 @@ impl Interpreter {
     ) -> Result<Self, EvalError> {
         let mut functions = HashMap::new();
         let mut enums = HashMap::new();
+        enums.insert("List".to_string(), crate::lang::typecheck::list_enum_def());
         let mut exceptions = HashMap::new();
         let mut top_level_values = HashMap::new();
         let handlers = HashMap::new();
@@ -2079,6 +2080,19 @@ impl Interpreter {
                     }
                 }
                 Ok(ExprResult::Normal(Value::Array(Arc::new(Mutex::new(vals)))))
+            }
+            Expr::List(exprs) => {
+                // Build nested Cons/Nil from right to left
+                let mut acc = Value::Variant("Nil".to_string(), vec![]);
+                for e in exprs.iter().rev() {
+                    match self.eval_expr(e, env)? {
+                        ExprResult::Normal(v) => {
+                            acc = Value::Variant("Cons".to_string(), vec![v, acc]);
+                        }
+                        ExprResult::EarlyReturn(v) => return Ok(ExprResult::EarlyReturn(v)),
+                    }
+                }
+                Ok(ExprResult::Normal(acc))
             }
             Expr::Index(arr, idx) => {
                 let arr_res = self.eval_expr(arr, env)?;

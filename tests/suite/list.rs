@@ -1,6 +1,116 @@
 
 use crate::common::source::{check, run};
 use nexus::interpreter::Value;
+use nexus::lang::ast::{Expr, Type};
+use nexus::lang::parser;
+
+#[test]
+fn test_list_type_is_builtin() {
+    // Parser should produce Type::List, not Type::UserDefined("List", ...)
+    let src = r#"
+    let main = fn () -> unit do
+        let xs: [i64] = [1, 2, 3]
+        return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    // Find the let binding and check that its type annotation is Type::List
+    let found_list_type = program.definitions.iter().any(|def| {
+        if let nexus::lang::ast::TopLevel::Let(gl) = &def.node {
+            // Check the function body for let xs: [i64]
+            if let Expr::Lambda { body, .. } = &gl.value.node {
+                body.iter().any(|stmt| {
+                    if let nexus::lang::ast::Stmt::Let { typ: Some(t), .. } = &stmt.node {
+                        matches!(t, Type::List(_))
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    });
+    assert!(found_list_type, "Parser should produce Type::List for [i64] syntax");
+}
+
+#[test]
+fn test_list_expr_is_builtin() {
+    // Parser should produce Expr::List, not nested Expr::Constructor("Cons"/"Nil")
+    let src = r#"
+    let main = fn () -> unit do
+        let xs = [1, 2, 3]
+        return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let found_list_expr = program.definitions.iter().any(|def| {
+        if let nexus::lang::ast::TopLevel::Let(gl) = &def.node {
+            if let Expr::Lambda { body, .. } = &gl.value.node {
+                body.iter().any(|stmt| {
+                    if let nexus::lang::ast::Stmt::Let { value, .. } = &stmt.node {
+                        matches!(value.node, Expr::List(_))
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    });
+    assert!(found_list_expr, "Parser should produce Expr::List for [1,2,3] syntax");
+}
+
+#[test]
+fn test_list_builtin_no_import() {
+    // List constructors and pattern matching should work without importing stdlib
+    let src = r#"
+    let main = fn () -> i64 do
+        let xs = [10, 20, 30]
+        match xs do
+            case Nil() -> return 0
+            case Cons(v: h, rest: _) -> return h
+        end
+    end
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(10));
+}
+
+#[test]
+fn test_list_constructor_returns_list_type() {
+    // Cons/Nil constructors should be assignable to [T] typed bindings
+    let src = r#"
+    let main = fn () -> i64 do
+        let xs: [i64] = Cons(v: 1, rest: Nil())
+        match xs do
+            case Cons(v: h, rest: _) -> return h
+            case Nil() -> return 0
+        end
+    end
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(1));
+}
+
+#[test]
+fn test_list_stdlib_functions_with_builtin_type() {
+    // Stdlib functions should work with built-in [T] after removing pub type List<T> from stdlib
+    let src = r#"
+    import as list from nxlib/stdlib/list.nx
+    let main = fn () -> i64 do
+        let xs = [1, 2, 3, 4, 5]
+        let len = list.length(xs: xs)
+        let rev = list.reverse(xs: xs)
+        let h = list.head(xs: rev)
+        return len * 10 + h
+    end
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(55));
+}
 
 #[test]
 fn test_list_type_mismatch() {

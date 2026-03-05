@@ -27,6 +27,7 @@ pub enum Type {
     Row(Vec<Type>, Option<Box<Type>>), // { E1, E2 | r }
     Record(Vec<(String, Type)>),       // { x: i64, y: string }
     Array(Box<Type>),                  // [| T |]
+    List(Box<Type>),                   // [T]
     Borrow(Box<Type>),                 // &T
     Handler(String, Box<Type>),         // handler Port require { ... }
 }
@@ -106,6 +107,7 @@ impl std::fmt::Display for Type {
                 write!(f, "}}")
             }
             Type::Array(t) => write!(f, "[| {} |]", t),
+            Type::List(t) => write!(f, "[{}]", t),
             Type::Borrow(t) => write!(f, "&{}", t),
             Type::Handler(name, req) => {
                 write!(f, "handler {}", name)?;
@@ -290,6 +292,7 @@ pub enum Expr {
     Constructor(String, Vec<(Option<String>, Spanned<Expr>)>),
     Record(Vec<(String, Spanned<Expr>)>),
     Array(Vec<Spanned<Expr>>),                     // [| 1, 2, 3 |]
+    List(Vec<Spanned<Expr>>),                      // [1, 2, 3]
     Index(Box<Spanned<Expr>>, Box<Spanned<Expr>>), // a[i]
     FieldAccess(Box<Spanned<Expr>>, String),
     // If and Match can be expressions or statements.

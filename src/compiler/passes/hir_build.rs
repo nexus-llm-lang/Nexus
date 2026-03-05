@@ -527,6 +527,20 @@ impl HirBuilder {
             Expr::Array(items) => {
                 HirExpr::Array(items.iter().map(|e| self.convert_expr(e, rename_map)).collect())
             }
+            Expr::List(items) => {
+                // Desugar [a, b, c] → Cons(a, Cons(b, Cons(c, Nil)))
+                let mut acc = HirExpr::Constructor {
+                    variant: "Nil".to_string(),
+                    args: vec![],
+                };
+                for item in items.iter().rev() {
+                    acc = HirExpr::Constructor {
+                        variant: "Cons".to_string(),
+                        args: vec![self.convert_expr(item, rename_map), acc],
+                    };
+                }
+                acc
+            }
             Expr::Index(arr, idx) => {
                 HirExpr::Index(
                     Box::new(self.convert_expr(arr, rename_map)),

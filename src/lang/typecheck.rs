@@ -266,6 +266,31 @@ fn summarize_ctor_fields(fields: &[(Option<String>, Type)]) -> String {
         .join(", ")
 }
 
+pub fn list_enum_def() -> EnumDef {
+    EnumDef {
+        name: "List".to_string(),
+        is_public: true,
+        is_opaque: false,
+        type_params: vec!["T".to_string()],
+        variants: vec![
+            VariantDef {
+                name: "Nil".to_string(),
+                fields: vec![],
+            },
+            VariantDef {
+                name: "Cons".to_string(),
+                fields: vec![
+                    (Some("v".to_string()), Type::Var("T".to_string())),
+                    (
+                        Some("rest".to_string()),
+                        Type::List(Box::new(Type::Var("T".to_string()))),
+                    ),
+                ],
+            },
+        ],
+    }
+}
+
 pub fn exn_enum_def() -> EnumDef {
     EnumDef {
         name: "Exn".to_string(),
@@ -363,6 +388,7 @@ fn convert_generic_user_defined_to_var(typ: &Type, vars: &HashSet<String>) -> Ty
         Type::Linear(i) => Type::Linear(Box::new(convert_generic_user_defined_to_var(i, vars))),
         Type::Borrow(i) => Type::Borrow(Box::new(convert_generic_user_defined_to_var(i, vars))),
         Type::Array(i) => Type::Array(Box::new(convert_generic_user_defined_to_var(i, vars))),
+        Type::List(i) => Type::List(Box::new(convert_generic_user_defined_to_var(i, vars))),
         Type::Handler(name, req) => Type::Handler(
             name.clone(),
             Box::new(convert_generic_user_defined_to_var(req, vars)),
@@ -442,6 +468,7 @@ fn default_numeric_literals(typ: &Type) -> Type {
         Type::Linear(inner) => Type::Linear(Box::new(default_numeric_literals(inner))),
         Type::Borrow(inner) => Type::Borrow(Box::new(default_numeric_literals(inner))),
         Type::Array(inner) => Type::Array(Box::new(default_numeric_literals(inner))),
+        Type::List(inner) => Type::List(Box::new(default_numeric_literals(inner))),
         Type::Handler(name, req) => Type::Handler(
             name.clone(),
             Box::new(default_numeric_literals(req)),
@@ -522,7 +549,7 @@ fn collect_external_type_vars(typ: &Type, env: &TypeEnv, out: &mut HashSet<Strin
             }
             collect_external_type_vars(ret, env, out);
         }
-        Type::Ref(inner) | Type::Linear(inner) | Type::Borrow(inner) | Type::Array(inner) => {
+        Type::Ref(inner) | Type::Linear(inner) | Type::Borrow(inner) | Type::Array(inner) | Type::List(inner) => {
             collect_external_type_vars(inner, env, out)
         }
         Type::Row(effects, tail) => {
@@ -569,6 +596,7 @@ fn convert_external_type_vars(typ: &Type, vars: &HashSet<String>) -> Type {
         Type::Linear(inner) => Type::Linear(Box::new(convert_external_type_vars(inner, vars))),
         Type::Borrow(inner) => Type::Borrow(Box::new(convert_external_type_vars(inner, vars))),
         Type::Array(inner) => Type::Array(Box::new(convert_external_type_vars(inner, vars))),
+        Type::List(inner) => Type::List(Box::new(convert_external_type_vars(inner, vars))),
         Type::Handler(name, req) => Type::Handler(
             name.clone(),
             Box::new(convert_external_type_vars(req, vars)),
@@ -677,6 +705,8 @@ impl TypeChecker {
     pub fn new_without_stdlib() -> Self {
         let mut env = TypeEnv::new();
         env.enums.insert(EFFECT_EXN.to_string(), exn_enum_def());
+        env.enums.insert("List".to_string(), list_enum_def());
+        register_nullary_variant_constructor(&mut env, "List", &["T".to_string()], &list_enum_def().variants[0]);
 
         env.linear_vars.clear();
         TypeChecker {
@@ -1351,7 +1381,7 @@ impl TypeChecker {
                     self.collect_unused_local_variable_warnings_in_expr(value);
                 }
             }
-            Expr::Array(items) => {
+            Expr::Array(items) | Expr::List(items) => {
                 for item in items {
                     self.collect_unused_local_variable_warnings_in_expr(item);
                 }
@@ -1420,6 +1450,7 @@ impl TypeChecker {
             Type::Linear(i) => Type::Linear(Box::new(self.convert_user_defined_to_var(i, vars))),
             Type::Borrow(i) => Type::Borrow(Box::new(self.convert_user_defined_to_var(i, vars))),
             Type::Array(i) => Type::Array(Box::new(self.convert_user_defined_to_var(i, vars))),
+            Type::List(i) => Type::List(Box::new(self.convert_user_defined_to_var(i, vars))),
             Type::Row(es, t) => Type::Row(
                 es.iter()
                     .map(|x| self.convert_user_defined_to_var(x, vars))
@@ -2299,6 +2330,23 @@ impl TypeChecker {
                 }
                 Ok((s, Type::Array(Box::new(final_elem_type))))
             }
+            Expr::List(exprs) => {
+                let elem_type = self.new_var();
+                let mut s = HashMap::new();
+                for ex in exprs {
+                    let (s_ex, t_ex) = self.infer(env, ex, er, eq, ee)?;
+                    s = compose_subst(&s, &s_ex);
+                    let s_unify = self
+                        .unify(&t_ex, &apply_subst_type(&s, &elem_type))
+                        .map_err(|m| TypeError {
+                            message: m,
+                            span: ex.span.clone(),
+                        })?;
+                    s = compose_subst(&s, &s_unify);
+                }
+                let final_elem_type = apply_subst_type(&s, &elem_type);
+                Ok((s, Type::List(Box::new(final_elem_type))))
+            }
             Expr::Index(arr, idx) => {
                 let (s1, t_arr) = self.infer(env, arr, er, eq, ee)?;
                 let (s2, t_idx) = self.infer(env, idx, er, eq, ee)?;
@@ -2935,6 +2983,13 @@ impl TypeChecker {
                 self.check_constructor_matrix(env, matrix, "()", 0, &[], rt)?;
                 Ok(())
             }
+            Type::List(inner) => {
+                // Delegate to UserDefined("List", [inner]) path
+                let as_ud = Type::UserDefined("List".to_string(), vec![(**inner).clone()]);
+                let mut types = vec![&as_ud];
+                types.extend_from_slice(rt);
+                self.check_matrix(env, matrix, &types)
+            }
             Type::UserDefined(name, args) => {
                 if matrix.iter().all(|row| {
                     row.first().map_or(false, |p| {
@@ -3167,6 +3222,14 @@ impl TypeChecker {
                 Ok(s)
             }
             (Type::Array(i1), Type::Array(i2)) => self.unify(i1, i2),
+            (Type::List(i1), Type::List(i2)) => self.unify(i1, i2),
+            // Cross-unify List<T> with UserDefined("List", [T]) for stdlib compat
+            (Type::List(inner), Type::UserDefined(n, args))
+            | (Type::UserDefined(n, args), Type::List(inner))
+                if n == "List" && args.len() == 1 =>
+            {
+                self.unify(inner, &args[0])
+            }
             (Type::Ref(t1), Type::Ref(t2))
             | (Type::Linear(t1), Type::Linear(t2))
             | (Type::Borrow(t1), Type::Borrow(t2)) => self.unify(t1, t2),
@@ -3198,6 +3261,7 @@ pub fn apply_subst_type(subst: &Subst, typ: &Type) -> Type {
         Type::Linear(i) => Type::Linear(Box::new(apply_subst_type(subst, i))),
         Type::Borrow(i) => Type::Borrow(Box::new(apply_subst_type(subst, i))),
         Type::Array(i) => Type::Array(Box::new(apply_subst_type(subst, i))),
+        Type::List(i) => Type::List(Box::new(apply_subst_type(subst, i))),
         Type::Handler(name, req) => Type::Handler(
             name.clone(),
             Box::new(apply_subst_type(subst, req)),
@@ -3246,7 +3310,7 @@ fn get_free_vars_type(typ: &Type) -> HashSet<String> {
             }
             s
         }
-        Type::Ref(i) | Type::Linear(i) | Type::Borrow(i) | Type::Array(i) => get_free_vars_type(i),
+        Type::Ref(i) | Type::Linear(i) | Type::Borrow(i) | Type::Array(i) | Type::List(i) => get_free_vars_type(i),
         Type::Row(es, t) => {
             let mut s = HashSet::new();
             for e in es {
@@ -3288,7 +3352,7 @@ fn occurs_check(n: &str, t: &Type) -> bool {
                 || occurs_check(n, e)
         }
         Type::UserDefined(_, a) => a.iter().any(|x| occurs_check(n, x)),
-        Type::Ref(i) | Type::Linear(i) | Type::Borrow(i) | Type::Array(i) => occurs_check(n, i),
+        Type::Ref(i) | Type::Linear(i) | Type::Borrow(i) | Type::Array(i) | Type::List(i) => occurs_check(n, i),
         Type::Row(es, t) => {
             es.iter().any(|x| occurs_check(n, x))
                 || t.as_ref().map_or(false, |x| occurs_check(n, x))
@@ -3694,7 +3758,7 @@ fn collect_signature_needs_from_expr(
             }
             (reqs, effs, unknown)
         }
-        Expr::Array(items) => {
+        Expr::Array(items) | Expr::List(items) => {
             let mut reqs = HashSet::new();
             let mut effs = HashSet::new();
             let mut unknown = false;
@@ -3763,7 +3827,7 @@ fn expr_mentions_name(expr: &Spanned<Expr>, target: &str) -> bool {
         Expr::Record(fields) => fields
             .iter()
             .any(|(_, arg)| expr_mentions_name(arg, target)),
-        Expr::Array(items) => items.iter().any(|item| expr_mentions_name(item, target)),
+        Expr::Array(items) | Expr::List(items) => items.iter().any(|item| expr_mentions_name(item, target)),
         Expr::FieldAccess(receiver, _) | Expr::Raise(receiver) => {
             expr_mentions_name(receiver, target)
         }
@@ -3892,7 +3956,7 @@ fn collect_used_variable_keys_in_expr(expr: &Spanned<Expr>, out: &mut HashSet<St
                 collect_used_variable_keys_in_expr(value, out);
             }
         }
-        Expr::Array(items) => {
+        Expr::Array(items) | Expr::List(items) => {
             for item in items {
                 collect_used_variable_keys_in_expr(item, out);
             }
@@ -3980,7 +4044,7 @@ fn collect_local_let_bindings_in_expr(expr: &Spanned<Expr>, out: &mut Vec<(Strin
                 collect_local_let_bindings_in_expr(value, out);
             }
         }
-        Expr::Array(items) => {
+        Expr::Array(items) | Expr::List(items) => {
             for item in items {
                 collect_local_let_bindings_in_expr(item, out);
             }
@@ -4223,7 +4287,7 @@ fn collect_expr_captures(
                 collect_expr_captures(arg, outer_keys, bound_keys, bound_call_names, captures);
             }
         }
-        Expr::Array(args) => {
+        Expr::Array(args) | Expr::List(args) => {
             for arg in args {
                 collect_expr_captures(arg, outer_keys, bound_keys, bound_call_names, captures);
             }

@@ -332,7 +332,7 @@ impl Parser {
                 self.advance();
                 let inner = self.parse_type()?;
                 self.expect(&TokenKind::RBracket)?;
-                Ok(Type::UserDefined("List".to_string(), vec![inner]))
+                Ok(Type::List(Box::new(inner)))
             }
             TokenKind::LBracketPipe => {
                 // Array type: [| T |]
@@ -776,26 +776,9 @@ impl Parser {
                 }
                 let end_span = self.peek_span();
                 self.expect(&TokenKind::RBracket)?;
-                // Desugar to Cons/Nil
                 let list_span = start..end_span.end;
-                let mut acc = Expr::Constructor("Nil".to_string(), vec![]);
-                for item in items.into_iter().rev() {
-                    acc = Expr::Constructor(
-                        "Cons".to_string(),
-                        vec![
-                            (Some("v".to_string()), item),
-                            (
-                                Some("rest".to_string()),
-                                Spanned {
-                                    node: acc,
-                                    span: list_span.clone(),
-                                },
-                            ),
-                        ],
-                    );
-                }
                 Ok(Spanned {
-                    node: acc,
+                    node: Expr::List(items),
                     span: list_span,
                 })
             }
