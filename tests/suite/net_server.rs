@@ -6,8 +6,7 @@ static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn net_server_types_check() {
-    let _lock = TEST_MUTEX.lock().unwrap();
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let src = r#"
     import { Net }, * as net_mod from nxlib/stdlib/net.nx
 
@@ -28,8 +27,7 @@ fn net_server_types_check() {
 
 #[test]
 fn net_server_opaque_server_cannot_construct_externally() {
-    let _lock = TEST_MUTEX.lock().unwrap();
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let src = r#"
     import { Net }, * as net_mod from nxlib/stdlib/net.nx
 
@@ -49,8 +47,7 @@ fn net_server_opaque_server_cannot_construct_externally() {
 
 #[test]
 fn net_server_linear_leak_is_rejected() {
-    let _lock = TEST_MUTEX.lock().unwrap();
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let src = r#"
     import { Net }, * as net_mod from nxlib/stdlib/net.nx
 
@@ -76,8 +73,7 @@ fn net_server_linear_leak_is_rejected() {
 
 #[test]
 fn net_server_listen_and_stop() {
-    let _lock = TEST_MUTEX.lock().unwrap();
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let src = r#"
     import { Net }, * as net_mod from nxlib/stdlib/net.nx
 
@@ -98,13 +94,14 @@ fn net_server_listen_and_stop() {
 
 #[test]
 fn net_server_accept_and_respond() {
-    let _lock = TEST_MUTEX.lock().unwrap();
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use std::net::{TcpListener, TcpStream};
 
-    // Use a time-based port to avoid race conditions with other tests binding to 0
-    let port = 40000 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() % 10000) as u16;
+    // Bind to port 0 to get an OS-assigned free port, then release it
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
     let addr = format!("127.0.0.1:{}", port);
 
     let src = format!(
@@ -129,46 +126,42 @@ fn net_server_accept_and_respond() {
     "#
     );
 
-    let addr_clone = addr.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
 
     // Spawn the server in a thread
     let server_thread = std::thread::spawn(move || {
-        println!("===> server thread starting: port {}", addr_clone);
         let res = run(&src);
-        println!("===> server thread finished with {:?}", res);
+        let _ = tx.send(());
         res.expect("run(&src) failed")
     });
 
-    // Wait for server to start, retrying connection
+    // Wait for server to start, retrying connection (max ~15s)
     let mut stream = None;
-    for i in 0..40 {
+    for _ in 0..60 {
         if server_thread.is_finished() {
-            println!("===> thread is finished at iteration {}", i);
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
         match TcpStream::connect(&addr) {
             Ok(s) => {
-                println!("===> connection succeeded at iteration {}", i);
                 stream = Some(s);
                 break;
             }
-            Err(e) => {
-                if i % 10 == 0 {
-                    println!("===> connection failed at iteration {}: {}", i, e);
-                }
-                continue;
-            }
+            Err(_) => continue,
         }
     }
-    
-    if server_thread.is_finished() && stream.is_none() {
-        // Thread died early, let's join to see the panic
-        server_thread.join().expect("server thread panicked early");
-        panic!("server thread finished but did not panic, yet connection failed");
+
+    if stream.is_none() {
+        if server_thread.is_finished() {
+            server_thread.join().expect("server thread panicked early");
+        }
+        panic!("could not connect to server at {} after retries", addr);
     }
 
-    let mut stream = stream.expect("could not connect to server after retries");
+    let mut stream = stream.unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok();
     stream
         .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .expect("write failed");
@@ -178,6 +171,11 @@ fn net_server_accept_and_respond() {
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read failed");
 
+    // Wait for server thread with timeout
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(_) => {}
+        Err(_) => panic!("server thread did not finish within 10s"),
+    }
     let server_result = server_thread.join().expect("server thread panicked");
     assert_eq!(server_result, Value::Bool(true));
 
@@ -195,8 +193,7 @@ fn net_server_accept_and_respond() {
 
 #[test]
 fn net_requires_inject() {
-    let _lock = TEST_MUTEX.lock().unwrap();
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let src = r#"
     import { Net } from nxlib/stdlib/net.nx
 
