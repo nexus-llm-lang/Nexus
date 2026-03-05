@@ -34,7 +34,7 @@ end
 
 let console_logger = handler Logger require { Console } do
     fn info(msg: string) -> unit do
-        Console.println(val: [=[[INFO] ]=] ++ msg)
+        Console.println(val: "[INFO] " ++ msg)
         return ()
     end
 end
@@ -42,7 +42,7 @@ end
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do
         inject console_logger do
-            Logger.info(msg: [=[starting]=])
+            Logger.info(msg: "starting")
         end
     end
     return ()
@@ -87,8 +87,8 @@ Positional arguments require looking at the function signature to know what each
 ```nexus
 // Every argument is self-documenting
 let result = request_with_body(
-    method: [=[POST]=],
-    url: [=[https://api.example.com]=],
+    method: "POST",
+    url: "https://api.example.com",
     headers: headers,
     body: payload
 )
@@ -106,7 +106,7 @@ Ambient authority -- where any function can read files, make network requests, o
 ```nexus
 let main = fn () -> unit require { PermNet, PermConsole } do
     inject net_handler, stdio_handler do
-        let body = Net.get(url: [=[https://example.com]=])
+        let body = Net.get(url: "https://example.com")
         Console.println(val: body)
     end
     return ()

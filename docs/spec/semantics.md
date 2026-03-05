@@ -57,7 +57,7 @@ Sigils are not annotations -- they impose runtime behavioral constraints.
 
 ```nexus
 try
-    raise NotFound(msg: [=[key]=])
+    raise NotFound(msg: "key")
 catch e ->
     // e : Exn
     match e do
@@ -103,7 +103,7 @@ Every Nexus program must define a `main` function with these constraints:
 ```nexus
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do
-        Console.println(val: [=[Hello]=])
+        Console.println(val: "Hello")
     end
     return ()
 end

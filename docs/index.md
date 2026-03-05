@@ -24,7 +24,7 @@ import { Console }, * as stdio from nxlib/stdlib/stdio.nx
 
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do
-        Console.println(val: [=[Hello, Nexus!]=])
+        Console.println(val: "Hello, Nexus!")
     end
     return ()
 end
@@ -56,13 +56,13 @@ end
 
 let console_logger = handler Logger require { Console } do
     fn info(msg: string) -> unit do
-        Console.println(val: [=[[INFO] ]=] ++ msg)
+        Console.println(val: "[INFO] " ++ msg)
         return ()
     end
 end
 
 let program = fn () -> unit require { Logger } do
-    Logger.info(msg: [=[starting]=])
+    Logger.info(msg: "starting")
     return ()
 end
 
@@ -146,7 +146,7 @@ end
 
 let main = fn () -> unit do
     try
-        let _ = search(key: [=[missing]=])
+        let _ = search(key: "missing")
     catch e ->
         match e do
             case NotFound(msg: m) -> ()
@@ -175,7 +175,7 @@ Runtime permissions map to WASI capabilities:
 ```nexus
 let main = fn () -> unit require { PermNet, PermConsole } do
     inject net_mod.system_handler, stdio.system_handler do
-        let body = Net.get(url: [=[https://example.com]=])
+        let body = Net.get(url: "https://example.com")
         Console.println(val: body)
     end
     return ()

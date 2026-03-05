@@ -17,8 +17,8 @@ The module's exports become available for binding.
 Bind a WASM export to a Nexus name:
 
 ```nexus
-pub external add_ints = [=[add]=] : (a: i64, b: i64) -> i64
-external internal_helper = [=[helper]=] : (x: i64) -> unit
+pub external add_ints = "add" : (a: i64, b: i64) -> i64
+external internal_helper = "helper" : (x: i64) -> unit
 ```
 
 - `pub` makes the binding visible to other modules
@@ -30,7 +30,7 @@ external internal_helper = [=[helper]=] : (x: i64) -> unit
 Polymorphic externals require explicit type parameters:
 
 ```nexus
-pub external length = [=[array_length]=] : <T>(arr: &[| T |]) -> i64
+pub external length = "array_length" : <T>(arr: &[| T |]) -> i64
 ```
 
 Using an undeclared type variable (e.g., `T` without `<T>`) is a type error. This prevents typos from silently becoming type variables.
@@ -53,7 +53,7 @@ Using an undeclared type variable (e.g., `T` without `<T>`) is a type error. Thi
 ```nexus
 import external utils.wasm
 
-external process_data = [=[process]=] : (val: float) -> float
+external process_data = "process" : (val: float) -> float
 
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do

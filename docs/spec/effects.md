@@ -19,7 +19,7 @@ let greet = fn (msg: string) -> unit require { Console } do
 end
 
 let risky = fn () -> unit effect { Exn } do
-    raise RuntimeError(msg: [=[oops]=])
+    raise RuntimeError(msg: "oops")
 end
 ```
 
@@ -36,7 +36,7 @@ end
 
 let main = fn () -> unit do
     try
-        let _ = search(key: [=[missing]=])
+        let _ = search(key: "missing")
     catch e ->
         match e do
             case NotFound(msg: m) -> ()
@@ -85,11 +85,11 @@ A handler is a value that implements all methods of a port:
 ```nexus
 let console_logger = handler Logger require { Console } do
     fn info(msg: string) -> unit do
-        Console.println(val: [=[[INFO] ]=] ++ msg)
+        Console.println(val: "[INFO] " ++ msg)
         return ()
     end
     fn warn(msg: string) -> unit do
-        Console.println(val: [=[[WARN] ]=] ++ msg)
+        Console.println(val: "[WARN] " ++ msg)
         return ()
     end
 end
@@ -135,7 +135,7 @@ The `main` function has special restrictions:
 ```nexus
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do
-        Console.println(val: [=[Hello]=])
+        Console.println(val: "Hello")
     end
     return ()
 end
@@ -152,7 +152,7 @@ Effect and coeffect rows are checked by row unification (no subtyping). Open row
 ```nexus
 // This function is polymorphic over additional requirements
 let log_and_do = fn <R>(f: () -> unit require { Logger | R }) -> unit require { Logger | R } do
-    Logger.info(msg: [=[starting]=])
+    Logger.info(msg: "starting")
     f()
     return ()
 end

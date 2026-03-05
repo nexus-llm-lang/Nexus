@@ -42,8 +42,8 @@ Both `require { ... }` and `effect { ... }` are optional; omitted means empty ro
 Foreign function declarations bind a Wasm export to a Nexus name:
 
 ```nexus
-pub external sin = [=[sin]=] : (x: float) -> float
-pub external length = [=[array_length]=] : <T>(arr: &[| T |]) -> i64
+pub external sin = "sin" : (x: float) -> float
+pub external length = "array_length" : <T>(arr: &[| T |]) -> i64
 ```
 
 Generic externals require explicit type parameters with `<T, U, ...>`.
@@ -77,9 +77,9 @@ Extends the builtin `Exn` type with new constructors.
 | Float | `3.14`, `-0.5` | `f64` |
 | Boolean | `true`, `false` | `bool` |
 | Unit | `()` | `unit` |
-| String | `[=[ hello ]=]` | `string` |
+| String | `"hello"` | `string` |
 
-Strings use `[=[ ... ]=]` delimiters. Escape `]=]` as `\]=]`.
+Strings use `"..."` delimiters with escape sequences (`\n`, `\t`, `\\`, `\"`). Raw strings use `[=[ ... ]=]` delimiters (no escape processing).
 
 ### Operators
 
@@ -99,7 +99,7 @@ All binary operators are left-associative:
 
 ```nexus
 add(a: 1, b: 2)
-Console.println(val: [=[hello]=])
+Console.println(val: "hello")
 list.map(xs: items, f: transform)
 ```
 
@@ -156,7 +156,7 @@ let name = user.name           // record field access
 ### Raise Expression
 
 ```nexus
-raise NotFound(msg: [=[key]=])
+raise NotFound(msg: "key")
 ```
 
 ## Statements
@@ -165,7 +165,7 @@ raise NotFound(msg: [=[key]=])
 
 ```nexus
 let x = 10
-let name: string = [=[Nexus]=]
+let name: string = "Nexus"
 let ~counter: i64 = 0
 let %resource = acquire()
 let &view = ~data
@@ -254,7 +254,7 @@ end
 
 | Pattern | Example | Description |
 |---|---|---|
-| Literal | `1`, `true`, `[=[ hi ]=]` | Matches exact value |
+| Literal | `1`, `true`, `"hi"` | Matches exact value |
 | Variable | `x`, `~x`, `%x` | Binds with optional sigil |
 | Constructor | `Ok(val: v)`, `None()` | Destructures variant |
 | Record (exact) | `{ x: p1, y: p2 }` | All fields must match |
@@ -495,10 +495,12 @@ float_literal     ::= [ "-" ] DIGIT+ "." DIGIT+
 integer_literal   ::= [ "-" ] DIGIT+
 boolean_literal   ::= "true" | "false"
 unit_literal      ::= "()"
-string_literal    ::= "[=[" string_char* "]=]"
-string_char       ::= "\]=]"               (* escaped terminator *)
-                    | "\" NON_CLOSE_BRACKET
-                    | NON_BRACKET NON_BACKSLASH
+string_literal    ::= '"' string_char* '"'
+                    | "[=[" raw_char* "]=]"
+string_char       ::= '\"'               (* escaped double quote *)
+                    | '\n' | '\t' | '\\'  (* escape sequences *)
+                    | NON_QUOTE NON_BACKSLASH
+raw_char          ::= ANY - "]=]"
 
 (* ── Comments & Terminals ───────────────────────────────────── *)
 

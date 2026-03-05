@@ -35,8 +35,8 @@ port Logger do
 end
 
 let greet = fn (name: string) -> unit require { Logger, Console } do
-    Logger.info(msg: [=[Greeting ]=] ++ name)
-    Console.println(val: [=[Hello, ]=] ++ name ++ [=[!]=])
+    Logger.info(msg: "Greeting " ++ name)
+    Console.println(val: "Hello, " ++ name ++ "!")
     return ()
 end
 ```
@@ -46,7 +46,7 @@ end
 ```nexus
 let console_logger = handler Logger require { Console } do
     fn info(msg: string) -> unit do
-        Console.println(val: [=[[INFO] ]=] ++ msg)
+        Console.println(val: "[INFO] " ++ msg)
         return ()
     end
 end
@@ -58,7 +58,7 @@ end
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do
         inject console_logger do
-            greet(name: [=[Nexus User]=])
+            greet(name: "Nexus User")
         end
     end
     return ()
@@ -99,7 +99,7 @@ Runtime permissions map directly to WASI capabilities:
 ```nexus
 let main = fn () -> unit require { PermNet, PermConsole } do
     inject net_mod.system_handler, stdio.system_handler do
-        let body = Net.get(url: [=[https://example.com]=])
+        let body = Net.get(url: "https://example.com")
         Console.println(val: body)
     end
     return ()
@@ -136,7 +136,7 @@ end
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do
         let v = fib(n: 30)
-        Console.print(val: [=[fib(30) = ]=] ++ i64_to_string(val: v))
+        Console.print(val: "fib(30) = " ++ i64_to_string(val: v))
     end
     return ()
 end

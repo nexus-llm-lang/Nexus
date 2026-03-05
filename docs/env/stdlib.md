@@ -24,7 +24,7 @@ end
 ```nexus
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do
-        Console.println(val: [=[Hello]=])
+        Console.println(val: "Hello")
     end
     return ()
 end
@@ -69,7 +69,7 @@ end
 The fd operations use a **consume-and-return** pattern: the linear handle is consumed and a fresh handle is returned in the result record, enabling stateless handlers.
 
 ```nexus
-let %h = Fs.open_read(path: [=[data.txt]=])
+let %h = Fs.open_read(path: "data.txt")
 let %r = Fs.read(handle: %h)
 match %r do
     case { content: c, handle: %h2 } ->

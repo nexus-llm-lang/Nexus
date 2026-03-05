@@ -26,7 +26,7 @@ Structural record types. Defined with `type` or used inline:
 ```nexus
 pub type User = { id: i64, name: string }
 
-let u = { id: 1, name: [=[Alice]=] }
+let u = { id: 1, name: "Alice" }
 ```
 
 ### ADTs (Sum Types)
