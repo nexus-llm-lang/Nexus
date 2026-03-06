@@ -20,7 +20,7 @@ nexus build example.nx            # compile to main.wasm
 ## Hello World
 
 ```nexus
-import { Console }, * as stdio from nxlib/stdlib/stdio.nx
+import { Console }, * as stdio from stdlib/stdio.nx
 
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do

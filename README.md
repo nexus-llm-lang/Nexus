@@ -86,7 +86,7 @@ When you need to read without consuming, **borrow** with `&`:
 let server = Net.listen(addr: addr)
 let req = Net.accept(server: &server)    -- borrow: server not consumed
 let method = request_method(req: &req)   -- borrow: req not consumed
-let _ = Net.respond(req: req, ...)       -- req consumed
+Net.respond(req: req, ...)               -- req consumed
 Net.stop(server: server)                 -- server consumed
 ```
 
@@ -99,8 +99,12 @@ Runtime permissions map directly to WASI capabilities:
 ```nexus
 let main = fn () -> unit require { PermNet, PermConsole } do
     inject net_mod.system_handler, stdio.system_handler do
-        let body = Net.get(url: "https://example.com")
-        Console.println(val: body)
+        try
+            let body = Net.get(url: "https://example.com")
+            Console.println(val: body)
+        catch e ->
+            Console.println(val: "Request failed")
+        end
     end
     return ()
 end
@@ -125,8 +129,8 @@ wasmtime run -Scli -Shttp -Sinherit-network -Sallow-ip-name-lookup -Stcp main.wa
 ## Example
 
 ```nexus
-import { Console }, * as stdio from nxlib/stdlib/stdio.nx
-import { i64_to_string } from nxlib/stdlib/string.nx
+import { Console }, * as stdio from stdlib/stdio.nx
+import { from_i64 } from stdlib/string.nx
 
 let fib = fn (n: i64) -> i64 do
     if n <= 1 then return n end
@@ -136,7 +140,7 @@ end
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do
         let v = fib(n: 30)
-        Console.print(val: "fib(30) = " ++ i64_to_string(val: v))
+        Console.print(val: "fib(30) = " ++ from_i64(val: v))
     end
     return ()
 end

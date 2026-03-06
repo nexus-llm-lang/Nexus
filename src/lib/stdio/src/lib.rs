@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 #[cfg(not(feature = "no_alloc_export"))]
 #[no_mangle]
@@ -39,5 +39,27 @@ pub extern "C" fn __nx_read_line() -> i64 {
             nexus_wasm_alloc::store_string_result(line)
         }
         Err(_) => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_getchar() -> i64 {
+    let stdin = io::stdin();
+    let mut buf = [0u8; 4]; // max UTF-8 bytes per char
+    let mut handle = stdin.lock();
+    match handle.read(&mut buf[..1]) {
+        Ok(0) | Err(_) => nexus_wasm_alloc::store_string_result(String::new()),
+        Ok(_) => {
+            // Determine UTF-8 byte count from leading byte
+            let width = if buf[0] < 0x80 { 1 }
+                else if buf[0] < 0xE0 { 2 }
+                else if buf[0] < 0xF0 { 3 }
+                else { 4 };
+            if width > 1 {
+                let _ = handle.read_exact(&mut buf[1..width]);
+            }
+            let s = String::from_utf8_lossy(&buf[..width]).into_owned();
+            nexus_wasm_alloc::store_string_result(s)
+        }
     }
 }

@@ -6,6 +6,16 @@ use super::ast::Program;
 use super::parser;
 
 pub const STDLIB_DIR: &str = "nxlib/stdlib";
+const STDLIB_PREFIX: &str = "stdlib/";
+
+/// Resolves `stdlib/X` import paths to the physical `nxlib/stdlib/X` location.
+pub fn resolve_import_path(path: &str) -> String {
+    if path.starts_with(STDLIB_PREFIX) {
+        format!("nxlib/{}", path)
+    } else {
+        path.to_string()
+    }
+}
 
 /// Cached result of parsing all stdlib `.nx` files.
 static STDLIB_CACHE: LazyLock<Mutex<Option<Vec<(PathBuf, Program)>>>> =

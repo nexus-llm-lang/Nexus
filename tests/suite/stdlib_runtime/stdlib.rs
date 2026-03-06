@@ -4,7 +4,7 @@ use nexus::interpreter::Value;
 #[test]
 fn test_to_string_runtime_error() {
     let src = r#"
-import { to_string } from nxlib/stdlib/exn.nx
+import { to_string } from stdlib/exn.nx
 
 let main = fn () -> string do
   let e: Exn = RuntimeError(val: "boom")
@@ -20,7 +20,7 @@ end
 #[test]
 fn test_to_string_invalid_index() {
     let src = r#"
-import { to_string } from nxlib/stdlib/exn.nx
+import { to_string } from stdlib/exn.nx
 
 let main = fn () -> string do
   let e: Exn = InvalidIndex(val: 42)
@@ -36,7 +36,7 @@ end
 #[test]
 fn test_backtrace_returns_frames() {
     let src = r#"
-import { backtrace } from nxlib/stdlib/exn.nx
+import { backtrace } from stdlib/exn.nx
 
 let inner = fn () -> unit effect { Exn } do
   raise RuntimeError(val: "oops")
@@ -92,14 +92,6 @@ fn set_union_intersection_difference() {
 }
 
 #[test]
-fn set_custom_key_ops_can_change_membership_rule() {
-    let src = &crate::common::fixtures::read_test_fixture(
-        "set_custom_key_ops_can_change_membership_rule.nx",
-    );
-    assert_eq!(run(src).unwrap(), Value::Bool(true));
-}
-
-#[test]
 fn hashmap_put_get_or_and_contains_key() {
     let src = &crate::common::fixtures::read_test_fixture("hashmap_put_get_or_and_contains_key.nx");
     assert_eq!(run(src).unwrap(), Value::Int(126));
@@ -112,17 +104,9 @@ fn hashmap_get_lookup_and_remove() {
 }
 
 #[test]
-fn hashmap_custom_key_ops_can_change_key_equivalence() {
-    let src = &crate::common::fixtures::read_test_fixture(
-        "hashmap_custom_key_ops_can_change_key_equivalence.nx",
-    );
-    assert_eq!(run(src).unwrap(), Value::Int(40));
-}
-
-#[test]
 fn clock_now_returns_positive_value() {
     let src = r#"
-import { Clock }, * as clk from nxlib/stdlib/clock.nx
+import { Clock }, * as clk from stdlib/clock.nx
 
 let main = fn () -> bool require { PermClock } do
   inject clk.system_handler do
@@ -137,7 +121,7 @@ end
 #[test]
 fn clock_sleep_does_not_crash() {
     let src = r#"
-import { Clock }, * as clk from nxlib/stdlib/clock.nx
+import { Clock }, * as clk from stdlib/clock.nx
 
 let main = fn () -> bool require { PermClock } do
   inject clk.system_handler do
@@ -152,7 +136,7 @@ end
 #[test]
 fn clock_requires_perm_clock() {
     let src = r#"
-import { Clock }, * as clk from nxlib/stdlib/clock.nx
+import { Clock }, * as clk from stdlib/clock.nx
 
 let main = fn () -> i64 do
   inject clk.system_handler do
@@ -169,7 +153,7 @@ end
 #[test]
 fn random_range_returns_in_bounds_value() {
     let src = r#"
-import { Random }, * as rng from nxlib/stdlib/random.nx
+import { Random }, * as rng from stdlib/random.nx
 
 let main = fn () -> bool require { PermRandom } do
   inject rng.system_handler do
@@ -188,7 +172,7 @@ end
 #[test]
 fn random_range_requires_perform() {
     let src = r#"
-import { Random }, * as rng from nxlib/stdlib/random.nx
+import { Random }, * as rng from stdlib/random.nx
 
 let main = fn () -> i64 do
   inject rng.system_handler do
@@ -206,7 +190,7 @@ end
 #[test]
 fn proc_exit_typechecks_with_perm_proc() {
     let src = r#"
-import { Proc }, * as proc_mod from nxlib/stdlib/proc.nx
+import { Proc }, * as proc_mod from stdlib/proc.nx
 
 let main = fn () -> unit require { PermProc } do
   inject proc_mod.system_handler do
@@ -223,7 +207,7 @@ end
 #[test]
 fn proc_exit_requires_perm_proc() {
     let src = r#"
-import { Proc }, * as proc_mod from nxlib/stdlib/proc.nx
+import { Proc }, * as proc_mod from stdlib/proc.nx
 
 let main = fn () -> unit do
   inject proc_mod.system_handler do
@@ -242,16 +226,10 @@ fn proc_port_with_mock_handler() {
     // Test that Proc port can be implemented with a mock handler
     // (doesn't actually exit the process)
     let src = r#"
-import { Proc } from nxlib/stdlib/proc.nx
+import { Proc } from stdlib/proc.nx
 
 let mock_proc = handler Proc do
   fn exit(status: i64) -> unit do
-    return ()
-  end
-  fn get_env(key: string) -> string effect { Exn } do
-    return "mock"
-  end
-  fn set_env(key: string, value: string) -> unit do
     return ()
   end
 end
@@ -268,7 +246,7 @@ end
 #[test]
 fn result_from_exn_builds_err() {
     let src = r#"
-import as result from nxlib/stdlib/result.nx
+import as result from stdlib/result.nx
 
 let main = fn () -> bool do
   let exn = RuntimeError(val: "boom")
@@ -289,7 +267,7 @@ fn result_to_exn_raises_and_is_catchable() {
 #[test]
 fn console_read_line_requires_perm_console() {
     let src = r#"
-import { Console }, * as stdio from nxlib/stdlib/stdio.nx
+import { Console }, * as stdio from stdlib/stdio.nx
 
 let main = fn () -> string do
   inject stdio.system_handler do
@@ -304,9 +282,38 @@ end
 }
 
 #[test]
+fn console_getchar_with_mock_handler() {
+    let src = r#"
+import { Console } from stdlib/stdio.nx
+
+let mock_console = handler Console do
+  fn print(val: string) -> unit do
+    return ()
+  end
+  fn println(val: string) -> unit do
+    return ()
+  end
+  fn read_line() -> string do
+    return ""
+  end
+  fn getchar() -> string do
+    return "A"
+  end
+end
+
+let main = fn () -> string do
+  inject mock_console do
+    return Console.getchar()
+  end
+end
+"#;
+    assert_eq!(run(src).unwrap(), Value::String("A".to_string()));
+}
+
+#[test]
 fn console_read_line_with_mock_handler() {
     let src = r#"
-import { Console } from nxlib/stdlib/stdio.nx
+import { Console } from stdlib/stdio.nx
 
 let mock_console = handler Console do
   fn print(val: string) -> unit do
@@ -317,6 +324,9 @@ let mock_console = handler Console do
   end
   fn read_line() -> string do
     return "mock input"
+  end
+  fn getchar() -> string do
+    return ""
   end
 end
 
@@ -332,7 +342,7 @@ end
 #[test]
 fn console_read_line_typechecks_with_perm_console() {
     let src = r#"
-import { Console }, * as stdio from nxlib/stdlib/stdio.nx
+import { Console }, * as stdio from stdlib/stdio.nx
 
 let main = fn () -> string require { PermConsole } do
   inject stdio.system_handler do
@@ -347,95 +357,46 @@ end
 }
 
 #[test]
-fn proc_get_env_requires_perm_proc() {
+fn core_id_returns_argument() {
     let src = r#"
-import { Proc }, * as proc_mod from nxlib/stdlib/proc.nx
+import { id } from stdlib/core.nx
 
-let main = fn () -> string do
-  inject proc_mod.system_handler do
-    try
-      return Proc.get_env(key: "HOME")
-    catch e ->
-      return "error"
-    end
-  end
+let main = fn () -> i64 do
+  return id(val: 42)
 end
 "#;
-    assert!(
-        check(src).is_err(),
-        "Proc.get_env without PermProc should fail typechecking"
-    );
+    assert_eq!(run(src).unwrap(), Value::Int(42));
 }
 
 #[test]
-fn proc_set_env_typechecks_with_perm_proc() {
+fn partition_type_in_list_module() {
     let src = r#"
-import { Proc }, * as proc_mod from nxlib/stdlib/proc.nx
+import { Partition } from stdlib/list.nx
 
-let main = fn () -> unit require { PermProc } do
-  inject proc_mod.system_handler do
-    Proc.set_env(key: "TEST_VAR", value: "hello")
+let main = fn () -> i64 do
+  let p = Partition(matched: Cons(v: 1, rest: Nil()), rest: Nil())
+  match p do
+    case Partition(matched: m, rest: _) ->
+      match m do
+        case Cons(v: v, rest: _) -> return v
+        case Nil() -> return 0
+      end
   end
 end
 "#;
-    assert!(
-        check(src).is_ok(),
-        "Proc.set_env with PermProc should typecheck"
-    );
+    assert_eq!(run(src).unwrap(), Value::Int(1));
 }
 
 #[test]
-fn proc_env_with_mock_handler() {
+fn negate_in_math_module() {
     let src = r#"
-import { Proc } from nxlib/stdlib/proc.nx
+import { negate } from stdlib/math.nx
 
-let mock_proc = handler Proc do
-  fn exit(status: i64) -> unit do
-    return ()
-  end
-  fn get_env(key: string) -> string effect { Exn } do
-    return "mock_value"
-  end
-  fn set_env(key: string, value: string) -> unit do
-    return ()
-  end
-end
-
-let main = fn () -> string do
-  inject mock_proc do
-    try
-      return Proc.get_env(key: "MOCK_VAR")
-    catch e ->
-      return "error"
-    end
-  end
+let main = fn () -> bool do
+  return negate(val: false)
 end
 "#;
-    assert_eq!(
-        run(src).unwrap(),
-        Value::String("mock_value".to_string())
-    );
-}
-
-#[test]
-fn proc_get_env_typechecks_with_perm_proc() {
-    let src = r#"
-import { Proc }, * as proc_mod from nxlib/stdlib/proc.nx
-
-let main = fn () -> string require { PermProc } do
-  inject proc_mod.system_handler do
-    try
-      return Proc.get_env(key: "HOME")
-    catch e ->
-      return "error"
-    end
-  end
-end
-"#;
-    assert!(
-        check(src).is_ok(),
-        "Proc.get_env with PermProc should typecheck"
-    );
+    assert_eq!(run(src).unwrap(), Value::Bool(true));
 }
 
 use proptest::prelude::*;
@@ -450,7 +411,7 @@ proptest! {
     #[test]
     fn prop_math_abs_non_negative(n in -1000i64..1000) {
         let src = format!("
-import {{ abs }} from nxlib/stdlib/math.nx
+import {{ abs }} from stdlib/math.nx
 let main = fn () -> bool do
     let x = abs(val: {n})
     return x >= 0
@@ -470,11 +431,11 @@ proptest! {
     #[test]
     fn prop_math_max_symmetry(a in -1000i64..1000, b in -1000i64..1000) {
         let src1 = format!("
-import {{ max }} from nxlib/stdlib/math.nx
+import {{ max }} from stdlib/math.nx
 let main = fn () -> i64 do return max(a: {}, b: {}) end
 ", a, b);
         let src2 = format!("
-import {{ max }} from nxlib/stdlib/math.nx
+import {{ max }} from stdlib/math.nx
 let main = fn () -> i64 do return max(a: {}, b: {}) end
 ", b, a);
         let val1 = run(&src1).unwrap();
@@ -485,11 +446,11 @@ let main = fn () -> i64 do return max(a: {}, b: {}) end
     #[test]
     fn prop_math_min_symmetry(a in -1000i64..1000, b in -1000i64..1000) {
         let src1 = format!("
-import {{ min }} from nxlib/stdlib/math.nx
+import {{ min }} from stdlib/math.nx
 let main = fn () -> i64 do return min(a: {}, b: {}) end
 ", a, b);
         let src2 = format!("
-import {{ min }} from nxlib/stdlib/math.nx
+import {{ min }} from stdlib/math.nx
 let main = fn () -> i64 do return min(a: {}, b: {}) end
 ", b, a);
         assert_eq!(run(&src1).unwrap(), run(&src2).unwrap());
@@ -498,7 +459,7 @@ let main = fn () -> i64 do return min(a: {}, b: {}) end
     #[test]
     fn prop_math_max_gte(a in -1000i64..1000, b in -1000i64..1000) {
         let src = format!("
-import {{ max }} from nxlib/stdlib/math.nx
+import {{ max }} from stdlib/math.nx
 let main = fn () -> bool do
     let m = max(a: {}, b: {})
     if m >= {} then
@@ -514,7 +475,7 @@ end
     #[test]
     fn prop_string_length_concat(s1 in "[a-zA-Z0-9]{0,20}", s2 in "[a-zA-Z0-9]{0,20}") {
         let src = format!("
-import {{ length }} from nxlib/stdlib/string.nx
+import {{ length }} from stdlib/string.nx
 let main = fn () -> bool do
     let s1 = [=[{}]=]
     let s2 = [=[{}]=]

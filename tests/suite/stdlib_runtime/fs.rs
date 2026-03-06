@@ -9,7 +9,7 @@ fn fs_create_dir_and_exists_work() {
     let dir = dir_guard.path();
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from nxlib/stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -33,8 +33,8 @@ fn fs_append_and_read_roundtrip() {
     let file = format!("{}/note.txt", dir);
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from nxlib/stdlib/fs.nx
-import {{ length, contains }} from nxlib/stdlib/string.nx
+import {{ Fs }}, * as fs_mod from stdlib/fs.nx
+import {{ length, contains }} from stdlib/string.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -66,7 +66,7 @@ fn fs_remove_file_updates_exists() {
     let file = format!("{}/trash.txt", dir);
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from nxlib/stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -98,8 +98,8 @@ fn fs_read_dir_returns_handles() {
     let file_b = format!("{}/b.txt", dir);
     let src = format!(
         r#"
-import {{ Fs, Handle }}, * as fs_mod from nxlib/stdlib/fs.nx
-import {{ length, contains }} from nxlib/stdlib/string.nx
+import {{ Fs, Handle }}, * as fs_mod from stdlib/fs.nx
+import {{ length, contains }} from stdlib/string.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -141,7 +141,7 @@ fn fs_read_dir_skips_subdirectories() {
     let sub = format!("{}/sub", dir);
     let src = format!(
         r#"
-import {{ Fs, Handle }}, * as fs_mod from nxlib/stdlib/fs.nx
+import {{ Fs, Handle }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -176,7 +176,7 @@ fn fs_read_dir_empty_returns_nil() {
     let dir = dir_guard.path();
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from nxlib/stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -204,7 +204,7 @@ fn fs_linear_file_requires_close() {
     let file = format!("{}/x.txt", dir);
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from nxlib/stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> unit require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -239,7 +239,7 @@ fn fs_linear_file_double_close_is_rejected() {
     let file = format!("{}/x.txt", dir);
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from nxlib/stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> unit require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -276,8 +276,8 @@ fn fs_linear_file_read_then_close_works() {
     let file = format!("{}/x.txt", dir);
     let src = format!(
         r#"
-import {{ Fs, Handle }}, * as fs_mod from nxlib/stdlib/fs.nx
-import {{ length, contains }} from nxlib/stdlib/string.nx
+import {{ Fs, Handle }}, * as fs_mod from stdlib/fs.nx
+import {{ length, contains }} from stdlib/string.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -311,7 +311,7 @@ fn fs_open_read_missing_file_raises_exn() {
     let file = format!("{}/missing.txt", dir);
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from nxlib/stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -339,7 +339,7 @@ fn fs_open_write_missing_parent_raises_exn() {
     let file = format!("{}/no_parent/x.txt", dir);
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from nxlib/stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -367,7 +367,7 @@ fn fs_open_append_missing_parent_raises_exn() {
     let file = format!("{}/no_parent/x.txt", dir);
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from nxlib/stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -395,8 +395,8 @@ fn fs_write_through_controller() {
     let file = format!("{}/out.txt", dir);
     let src = format!(
         r#"
-import {{ Fs, Handle }}, * as fs_mod from nxlib/stdlib/fs.nx
-import {{ length, contains }} from nxlib/stdlib/string.nx
+import {{ Fs, Handle }}, * as fs_mod from stdlib/fs.nx
+import {{ length, contains }} from stdlib/string.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -434,8 +434,8 @@ fn fs_path_returns_path() {
     let file = format!("{}/x.txt", dir);
     let src = format!(
         r#"
-import {{ Fs, Handle }}, * as fs_mod from nxlib/stdlib/fs.nx
-import {{ length, contains }} from nxlib/stdlib/string.nx
+import {{ Fs, Handle }}, * as fs_mod from stdlib/fs.nx
+import {{ length, contains }} from stdlib/string.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -461,7 +461,7 @@ end
 #[test]
 fn fs_read_requires_fs_coeffect() {
     let src = r#"
-import { Fs } from nxlib/stdlib/fs.nx
+import { Fs } from stdlib/fs.nx
 
 let main = fn () -> bool do
   let ok = Fs.exists(path: "/tmp")
@@ -476,12 +476,12 @@ end
 fn fs_mock_handler_replaces_read() {
     let src = format!(
         r#"
-import {{ Fs, Handle }}, * as fs_mod from nxlib/stdlib/fs.nx
-import {{ length, contains }} from nxlib/stdlib/string.nx
+import {{ Fs, Handle }}, * as fs_mod from stdlib/fs.nx
+import {{ length, contains }} from stdlib/string.nx
 
 let mock_fs = handler Fs do
   fn exists(path: string) -> bool do return false end
-  fn read_to_string(path: string) -> string do return "" end
+  fn read_to_string(path: string) -> string effect {{ Exn }} do return "" end
   fn write_string(path: string, content: string) -> unit effect {{ Exn }} do return () end
   fn append_string(path: string, content: string) -> unit effect {{ Exn }} do return () end
   fn remove_file(path: string) -> unit effect {{ Exn }} do return () end
@@ -548,10 +548,34 @@ end
 }
 
 #[test]
+fn fs_read_to_string_raises_on_nonexistent() {
+    let src = format!(
+        r#"
+import {{ Fs }}, * as fs_mod from stdlib/fs.nx
+
+let main = fn () -> bool require {{ PermFs }} do
+  inject fs_mod.system_handler do
+    try
+      let _ = Fs.read_to_string(path: "/nonexistent_dir_xyz/file.txt")
+      return false
+    catch e ->
+      match e do
+        case RuntimeError(val: _) -> return true
+        case InvalidIndex(val: _) -> return false
+      end
+    end
+  end
+end
+"#
+    );
+    assert_eq!(run(&src).unwrap(), Value::Bool(true));
+}
+
+#[test]
 fn fs_write_string_raises_on_failure() {
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from nxlib/stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -575,7 +599,7 @@ end
 fn fs_read_dir_nonexistent_raises_exn() {
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from nxlib/stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> bool require {{ PermFs }} do
   inject fs_mod.system_handler do

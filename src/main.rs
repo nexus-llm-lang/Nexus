@@ -80,6 +80,9 @@ enum Command {
         /// Allow process operations (exit, etc.).
         #[arg(long)]
         allow_proc: bool,
+        /// Allow environment variable access.
+        #[arg(long)]
+        allow_env: bool,
         /// Preopen a host directory for guest filesystem access (repeatable).
         #[arg(long, value_name = "DIR")]
         preopen: Vec<PathBuf>,
@@ -125,11 +128,22 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     if cli.verbose {
-        tracing_subscriber::fmt()
+        use opentelemetry::trace::TracerProvider;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("nexus");
+        let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(tracer);
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-            .with_target(false)
-            .with_env_filter("nexus=trace")
+            .with_target(false);
+
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("nexus=info"))
+            .with(fmt_layer)
+            .with(otel_layer)
             .init();
     }
 
@@ -142,6 +156,7 @@ fn main() -> ExitCode {
             allow_random,
             allow_clock,
             allow_proc,
+            allow_env,
             preopen,
         }) => {
             let capabilities = match build_execution_capabilities(
@@ -151,6 +166,7 @@ fn main() -> ExitCode {
                 allow_random,
                 allow_clock,
                 allow_proc,
+                allow_env,
                 preopen,
             ) {
                 Ok(capabilities) => capabilities,
@@ -159,7 +175,7 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            run_command(input, capabilities)
+            run_command(input, capabilities, cli.verbose)
         }
         Some(Command::Build {
             input,
@@ -173,6 +189,7 @@ fn main() -> ExitCode {
             wasm_merge,
             explain_capabilities,
             explain_capabilities_format,
+            cli.verbose,
         ),
         Some(Command::Check { input }) => check_command(input),
         None => {
@@ -180,7 +197,7 @@ fn main() -> ExitCode {
                 repl::start(ExecutionCapabilities::deny_all());
                 ExitCode::SUCCESS
             } else {
-                run_command(None, ExecutionCapabilities::deny_all())
+                run_command(None, ExecutionCapabilities::deny_all(), cli.verbose)
             }
         }
     }
@@ -199,7 +216,11 @@ fn extract_main_requires(program: &lang::ast::Program) -> Option<&lang::ast::Typ
     })
 }
 
-fn run_command(input: Option<PathBuf>, capabilities: ExecutionCapabilities) -> ExitCode {
+fn run_command(
+    input: Option<PathBuf>,
+    capabilities: ExecutionCapabilities,
+    verbose: bool,
+) -> ExitCode {
     if let Some(path) = input.as_deref() {
         if path != Path::new("-") && path.extension().is_some_and(|ext| ext == "wasm") {
             eprintln!("`nexus run` executes Nexus source only, not wasm modules.");
@@ -234,7 +255,8 @@ fn run_command(input: Option<PathBuf>, capabilities: ExecutionCapabilities) -> E
 
     // Compile and execute via wasmtime
     let wasm_merge_command = bundler::resolve_wasm_merge_command(None);
-    let compiled = match compile_loaded_source_to_wasm(&loaded, true, &wasm_merge_command) {
+    let compiled = match compile_loaded_source_to_wasm(&loaded, true, &wasm_merge_command, verbose)
+    {
         Ok(compiled) => compiled,
         Err(code) => return code,
     };
@@ -250,6 +272,7 @@ fn build_execution_capabilities(
     allow_random: bool,
     allow_clock: bool,
     allow_proc: bool,
+    allow_env: bool,
     preopen_dirs: Vec<PathBuf>,
 ) -> Result<ExecutionCapabilities, String> {
     let capabilities = ExecutionCapabilities {
@@ -259,6 +282,7 @@ fn build_execution_capabilities(
         allow_random,
         allow_clock,
         allow_proc,
+        allow_env,
         preopen_dirs,
         net_allow_hosts: Vec::new(),
         net_block_hosts: Vec::new(),
@@ -273,6 +297,7 @@ fn build_command(
     wasm_merge: Option<PathBuf>,
     explain: ExplainCapabilities,
     format: ExplainCapabilitiesFormat,
+    verbose: bool,
 ) -> ExitCode {
     let loaded = match load_source(input) {
         Ok(loaded) => loaded,
@@ -283,7 +308,8 @@ fn build_command(
     };
 
     let wasm_merge_command = bundler::resolve_wasm_merge_command(wasm_merge.as_deref());
-    let compiled = match compile_loaded_source_to_wasm(&loaded, true, &wasm_merge_command) {
+    let compiled = match compile_loaded_source_to_wasm(&loaded, true, &wasm_merge_command, verbose)
+    {
         Ok(c) => c,
         Err(code) => return code,
     };
@@ -465,7 +491,10 @@ fn default_wasm_output_path() -> PathBuf {
     PathBuf::from("main.wasm")
 }
 
-fn compile_loaded_source_to_core_wasm(loaded: &LoadedSource) -> Result<Vec<u8>, ExitCode> {
+fn compile_loaded_source_to_core_wasm(
+    loaded: &LoadedSource,
+    verbose: bool,
+) -> Result<Vec<u8>, ExitCode> {
     let src = strip_shebang(loaded.source.clone());
     let program = match parse_program(&loaded.display_name, &src) {
         Some(p) => p,
@@ -475,8 +504,17 @@ fn compile_loaded_source_to_core_wasm(loaded: &LoadedSource) -> Result<Vec<u8>, 
         return Err(ExitCode::from(1));
     }
 
-    match compiler::codegen::compile_program_to_wasm(&program) {
-        Ok(wasm) => Ok(wasm),
+    match compiler::codegen::compile_program_to_wasm_with_metrics(&program) {
+        Ok((wasm, metrics)) => {
+            if verbose {
+                eprintln!(
+                    "compile pass metrics:
+{}",
+                    metrics
+                );
+            }
+            Ok(wasm)
+        }
         Err(e) => {
             eprintln!("Compile Error: {}", e);
             Err(ExitCode::from(1))
@@ -497,8 +535,9 @@ fn compile_loaded_source_to_wasm(
     loaded: &LoadedSource,
     allow_nexus_host_import: bool,
     wasm_merge_command: &Path,
+    verbose: bool,
 ) -> Result<CompiledWasm, ExitCode> {
-    let wasm = match compile_loaded_source_to_core_wasm(loaded) {
+    let wasm = match compile_loaded_source_to_core_wasm(loaded, verbose) {
         Ok(wasm) => wasm,
         Err(code) => return Err(code),
     };
@@ -1039,6 +1078,7 @@ mod tests {
     #[test]
     fn execution_capabilities_reject_preopen_without_allow_fs() {
         let err = build_execution_capabilities(
+            false,
             false,
             false,
             false,

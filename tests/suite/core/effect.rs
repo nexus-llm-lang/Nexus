@@ -39,8 +39,8 @@ fn test_call_pure_from_impure() {
 #[test]
 fn test_try_catch_removes_exn() {
     let src = r#"
-    import { Console }, * as stdio from nxlib/stdlib/stdio.nx
-    import { from_i64 } from nxlib/stdlib/string.nx
+    import { Console }, * as stdio from stdlib/stdio.nx
+    import { from_i64 } from stdlib/string.nx
     exception Oops(string)
 
     let risky = fn () -> unit effect { Exn } do

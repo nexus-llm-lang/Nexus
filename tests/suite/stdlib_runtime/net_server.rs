@@ -6,7 +6,7 @@ static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn net_server_types_check() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let src = r#"
-    import { Net }, * as net_mod from nxlib/stdlib/net.nx
+    import { Net }, * as net_mod from stdlib/net.nx
 
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
@@ -27,7 +27,7 @@ fn net_server_types_check() {
 fn net_server_opaque_server_cannot_construct_externally() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let src = r#"
-    import { Net }, * as net_mod from nxlib/stdlib/net.nx
+    import { Net }, * as net_mod from stdlib/net.nx
 
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
@@ -47,7 +47,7 @@ fn net_server_opaque_server_cannot_construct_externally() {
 fn net_server_linear_leak_is_rejected() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let src = r#"
-    import { Net }, * as net_mod from nxlib/stdlib/net.nx
+    import { Net }, * as net_mod from stdlib/net.nx
 
     let leak = fn () -> unit require { Net } effect { Exn } do
       let server = Net.listen(addr: "127.0.0.1:0")
@@ -73,7 +73,7 @@ fn net_server_linear_leak_is_rejected() {
 fn net_server_listen_and_stop() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let src = r#"
-    import { Net }, * as net_mod from nxlib/stdlib/net.nx
+    import { Net }, * as net_mod from stdlib/net.nx
 
     let main = fn () -> bool require { PermNet } do
       inject net_mod.system_handler do
@@ -104,7 +104,7 @@ fn net_server_accept_and_respond() {
 
     let src = format!(
         r#"
-    import {{ Net, request_method, request_path }}, * as net_mod from nxlib/stdlib/net.nx
+    import {{ Net, request_method, request_path }}, * as net_mod from stdlib/net.nx
 
     let main = fn () -> bool require {{ PermNet }} effect {{ Console }} do
       inject net_mod.system_handler do
@@ -113,7 +113,7 @@ fn net_server_accept_and_respond() {
           let req = Net.accept(server: &server)
           let method = request_method(req: &req)
           let path = request_path(req: &req)
-          let _ = Net.respond(req: req, status: 200, body: method ++ " " ++ path)
+          Net.respond(req: req, status: 200, body: method ++ " " ++ path)
           Net.stop(server: server)
           return true
         catch e ->
@@ -193,7 +193,7 @@ fn net_server_accept_and_respond() {
 fn net_requires_inject() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let src = r#"
-    import { Net } from nxlib/stdlib/net.nx
+    import { Net } from stdlib/net.nx
 
     let main = fn () -> string do
       let body = Net.get(url: "https://example.com")
@@ -202,4 +202,28 @@ fn net_requires_inject() {
     "#;
     let err = check(src).expect_err("Net.get without inject Net should be a type error");
     insta::assert_snapshot!(err);
+}
+
+#[test]
+fn net_respond_returns_unit_effect_exn() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let src = r#"
+import { Net }, * as net_mod from stdlib/net.nx
+
+let main = fn () -> string require { PermNet } do
+  inject net_mod.system_handler do
+    try
+      let body = Net.get(url: "http://example.com")
+      return body
+    catch e ->
+      return "error"
+    end
+  end
+end
+"#;
+    assert!(
+        check(src).is_ok(),
+        "Net.get with effect Exn should typecheck: {:?}",
+        check(src).err()
+    );
 }

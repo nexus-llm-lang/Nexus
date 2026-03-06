@@ -21,6 +21,8 @@ pub struct ExecutionCapabilities {
     pub allow_clock: bool,
     /// Allows process operations (exit, etc.).
     pub allow_proc: bool,
+    /// Allows environment variable access.
+    pub allow_env: bool,
     /// Host directories to preopen when filesystem access is enabled.
     pub preopen_dirs: Vec<PathBuf>,
     /// Allowed network destination host patterns (exact or subdomain match).
@@ -44,6 +46,7 @@ impl ExecutionCapabilities {
             allow_random: true,
             allow_clock: true,
             allow_proc: true,
+            allow_env: true,
             preopen_dirs: Vec::new(),
             net_allow_hosts: Vec::new(),
             net_block_hosts: Vec::new(),
@@ -59,6 +62,7 @@ impl ExecutionCapabilities {
             Permission::Random => self.allow_random,
             Permission::Clock => self.allow_clock,
             Permission::Proc => self.allow_proc,
+            Permission::Env => self.allow_env,
         }
     }
 

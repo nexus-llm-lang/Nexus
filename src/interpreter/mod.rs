@@ -6,6 +6,7 @@ pub mod repl;
 use crate::constants::{NEXUS_HOST_HTTP_FUNC, NEXUS_HOST_HTTP_MODULE};
 use crate::lang::ast::*;
 use crate::lang::stdlib::load_stdlib_nx_programs;
+use crate::lang::stdlib::resolve_import_path;
 use crate::runtime::ExecutionCapabilities;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
@@ -934,29 +935,33 @@ impl Interpreter {
                 // Handlers are now expression-level (coeffect model);
                 // they get registered via inject blocks at runtime.
                 TopLevel::Import(import) => {
+                    let resolved_path = resolve_import_path(&import.path);
                     if import.is_external {
-                        let module = Module::from_file(&engine, &import.path).map_err(|e| {
+                        let module = Module::from_file(&engine, &resolved_path).map_err(|e| {
                             runtime_error(format!(
                                 "Failed to load wasm module '{}': {}",
-                                import.path, e
+                                resolved_path, e
                             ))
                         })?;
-                        wasm_modules.insert(import.path.clone(), module.clone());
+                        wasm_modules.insert(resolved_path.clone(), module.clone());
                         let instance = linker.instantiate(&mut store, &module).map_err(|e| {
                             runtime_error(format!(
                                 "Failed to instantiate wasm module '{}': {}",
-                                import.path, e
+                                resolved_path, e
                             ))
                         })?;
                         wasm_instances.push(instance);
                     } else {
-                        let src = std::fs::read_to_string(&import.path).map_err(|e| {
-                            runtime_error(format!("Failed to read module '{}': {}", import.path, e))
+                        let src = std::fs::read_to_string(&resolved_path).map_err(|e| {
+                            runtime_error(format!(
+                                "Failed to read module '{}': {}",
+                                resolved_path, e
+                            ))
                         })?;
                         let p = crate::lang::parser::parser().parse(&src).map_err(|errs| {
                             runtime_error(format!(
                                 "Failed to parse module '{}': {:?}",
-                                import.path, errs
+                                resolved_path, errs
                             ))
                         })?;
 

@@ -105,7 +105,7 @@ fn test_list_constructor_returns_list_type() {
 fn test_list_stdlib_functions_with_builtin_type() {
     // Stdlib functions should work with built-in [T] after removing pub type List<T> from stdlib
     let src = r#"
-    import as list from nxlib/stdlib/list.nx
+    import as list from stdlib/list.nx
     let main = fn () -> i64 do
         let xs = [1, 2, 3, 4, 5]
         let len = list.length(xs: xs)
@@ -131,7 +131,7 @@ fn test_list_type_mismatch() {
 #[test]
 fn test_list_literal_and_head_tail() {
     let src = r#"
-    import as list from nxlib/stdlib/list.nx
+    import as list from stdlib/list.nx
     let main = fn () -> i64 do
       let xs = [1, 2, 3]
       let h = list.head(xs: xs)
@@ -146,7 +146,7 @@ fn test_list_literal_and_head_tail() {
 #[test]
 fn test_list_type_annotation_sugar() {
     let src = r#"
-    import as list from nxlib/stdlib/list.nx
+    import as list from stdlib/list.nx
     let main = fn () -> i64 do
       let xs: [i64] = [1, 2, 3]
       return list.nth(xs: xs, n: 2)
@@ -164,7 +164,7 @@ fn test_list_is_empty() {
 #[test]
 fn test_list_reverse_concat_length() {
     let src = r#"
-    import as list from nxlib/stdlib/list.nx
+    import as list from stdlib/list.nx
     let main = fn () -> i64 do
       let a = Cons(v: 1, rest: Cons(v: 2, rest: Nil()))
       let b = Cons(v: 3, rest: Cons(v: 4, rest: Nil()))
@@ -181,7 +181,7 @@ fn test_list_reverse_concat_length() {
 #[test]
 fn test_list_cons_last() {
     let src = r#"
-    import as list from nxlib/stdlib/list.nx
+    import as list from stdlib/list.nx
     let main = fn () -> i64 do
       let xs = Cons(v: 2, rest: Cons(v: 3, rest: Nil()))
       let ys = list.cons(x: 1, xs: xs)
@@ -196,7 +196,7 @@ fn test_list_cons_last() {
 #[test]
 fn test_list_take_and_drop() {
     let src = r#"
-    import as list from nxlib/stdlib/list.nx
+    import as list from stdlib/list.nx
     let main = fn () -> i64 do
       let xs = Cons(v: 1, rest: Cons(v: 2, rest: Cons(v: 3, rest: Cons(v: 4, rest: Cons(v: 5, rest: Nil())))))
       let t = list.take(xs: xs, n: 3)
@@ -212,7 +212,7 @@ fn test_list_take_and_drop() {
 #[test]
 fn test_list_nth() {
     let src = r#"
-    import as list from nxlib/stdlib/list.nx
+    import as list from stdlib/list.nx
     let main = fn () -> i64 do
       let xs = Cons(v: 10, rest: Cons(v: 20, rest: Cons(v: 30, rest: Cons(v: 40, rest: Nil()))))
       return list.nth(xs: xs, n: 2)
@@ -230,7 +230,7 @@ fn test_list_contains() {
 #[test]
 fn test_list_fold_left_sum() {
     let src = r#"
-    import as list from nxlib/stdlib/list.nx
+    import as list from stdlib/list.nx
 
     let add = fn (acc: i64, val: i64) -> i64 do
       return acc + val

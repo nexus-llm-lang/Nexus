@@ -140,8 +140,64 @@ pub extern "C" fn __nx_string_to_i64(s_ptr: i32, s_len: i32) -> i64 {
     match s.trim().parse::<i64>() {
         Ok(n) => n,
         Err(_) => {
-            eprintln!("math error: string_to_i64: invalid integer '{}'", s);
-            i64::MIN
+            panic!("to_i64: invalid integer '{}'", s);
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_string_repeat(s_ptr: i32, s_len: i32, n: i64) -> i64 {
+    let s = read_string(s_ptr, s_len);
+    let count = n.max(0) as usize;
+    nexus_wasm_alloc::store_string_result(s.repeat(count))
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_string_pad_left(
+    s_ptr: i32,
+    s_len: i32,
+    width: i64,
+    fill_ptr: i32,
+    fill_len: i32,
+) -> i64 {
+    let s = read_string(s_ptr, s_len);
+    let fill = read_string(fill_ptr, fill_len);
+    let w = width.max(0) as usize;
+    let char_count = s.chars().count();
+    if char_count >= w || fill.is_empty() {
+        nexus_wasm_alloc::store_string_result(s)
+    } else {
+        let pad_chars = w - char_count;
+        let fill_chars: Vec<char> = fill.chars().collect();
+        let padding: String = fill_chars.iter().cycle().take(pad_chars).collect();
+        nexus_wasm_alloc::store_string_result(format!("{}{}", padding, s))
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_string_pad_right(
+    s_ptr: i32,
+    s_len: i32,
+    width: i64,
+    fill_ptr: i32,
+    fill_len: i32,
+) -> i64 {
+    let s = read_string(s_ptr, s_len);
+    let fill = read_string(fill_ptr, fill_len);
+    let w = width.max(0) as usize;
+    let char_count = s.chars().count();
+    if char_count >= w || fill.is_empty() {
+        nexus_wasm_alloc::store_string_result(s)
+    } else {
+        let pad_chars = w - char_count;
+        let fill_chars: Vec<char> = fill.chars().collect();
+        let padding: String = fill_chars.iter().cycle().take(pad_chars).collect();
+        nexus_wasm_alloc::store_string_result(format!("{}{}", s, padding))
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_string_is_valid_i64(s_ptr: i32, s_len: i32) -> i32 {
+    let s = read_string(s_ptr, s_len);
+    if s.trim().parse::<i64>().is_ok() { 1 } else { 0 }
 }

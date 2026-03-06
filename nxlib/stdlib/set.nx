@@ -1,69 +1,52 @@
 /**
- * set: Hash-based set collection using equality and hash function dictionaries.
+ * set: FFI-backed hash set of i64 values.
  *
- * Like hashmap, keys are compared via a user-supplied SetKeyOps dictionary
- * that bundles equality and hash functions. Internally stores entries in a
- * flat List<SetEntry<K>>.
- *
+ * Backed by Rust std::collections::HashSet via WASM FFI.
+ * Uses opaque linear handles — each set must be freed after use.
  * Supports standard set algebra: insert, remove, contains, union,
- * intersection, and difference. All operations are O(n) in the number
- * of entries.
+ * intersection, and difference.
  */
+import external nxlib/stdlib/stdlib.wasm
+import { length, substring, index_of } from stdlib/string.nx
 
-/// Equality comparison dictionary for set keys.
-pub type SetEq<K> = SetEq(eq: (left: K, right: K) -> bool)
+external to_i64 = "__nx_string_to_i64" : (s: string) -> i64
 
-/// Hash function dictionary for set keys.
-pub type SetHash<K> = SetHash(hash: (key: K) -> i64)
+/// An opaque hash set handle (linear — must be freed).
+pub opaque type Set = Set(id: i64)
 
-/// Combined key operations (equality + hash) for a set.
-pub type SetKeyOps<K> = SetKeyOps(eq: SetEq<K>, hash: SetHash<K>)
+// --- FFI externals ---
 
-/// Internal entry storing the precomputed hash and key.
-pub type SetEntry<K> = SetEntry(hash: i64, key: K)
+external __nx_hset_new = "__nx_hset_new" : () -> i64
+external __nx_hset_insert = "__nx_hset_insert" : (id: i64, val: i64) -> bool
+external __nx_hset_contains = "__nx_hset_contains" : (id: i64, val: i64) -> bool
+external __nx_hset_remove = "__nx_hset_remove" : (id: i64, val: i64) -> bool
+external __nx_hset_size = "__nx_hset_size" : (id: i64) -> i64
+external __nx_hset_to_list = "__nx_hset_to_list" : (id: i64) -> string
+external __nx_hset_union = "__nx_hset_union" : (id_a: i64, id_b: i64) -> i64
+external __nx_hset_intersection = "__nx_hset_intersection" : (id_a: i64, id_b: i64) -> i64
+external __nx_hset_difference = "__nx_hset_difference" : (id_a: i64, id_b: i64) -> i64
+external __nx_hset_free = "__nx_hset_free" : (id: i64) -> bool
 
-/// A set of unique keys, parameterized by key operations.
-pub type Set<K> = Set(key_ops: SetKeyOps<K>, entries: List<SetEntry<K>>)
+// --- Helpers ---
 
-/// Creates key operations from an equality function and a hash function.
-pub let make_key_ops = fn <K>(eq: (left: K, right: K) -> bool, hash: (key: K) -> i64) -> SetKeyOps<K> do
-  let eq_dict = SetEq(eq: eq)
-  let hash_dict = SetHash(hash: hash)
-  return SetKeyOps(eq: eq_dict, hash: hash_dict)
-end
-
-let i64_eq = fn (left: i64, right: i64) -> bool do
-  return left == right
-end
-
-let i64_hash = fn (key: i64) -> i64 do
-  if key < 0 then
-    return 0 - key
+let parse_i64_list_go = fn (s: string, acc: List<i64>) -> List<i64> do
+  if length(s: s) == 0 then
+    return acc
   else
-    return key
-  end
-end
-
-/// Returns key operations for i64 keys.
-pub let i64_key_ops = fn () -> SetKeyOps<i64> do
-  return make_key_ops(eq: i64_eq, hash: i64_hash)
-end
-
-let key_eq = fn <K>(key_ops: SetKeyOps<K>, left: K, right: K) -> bool do
-  match key_ops do
-    case SetKeyOps(eq: eq_dict, hash: _) ->
-      match eq_dict do
-        case SetEq(eq: eq_fn) -> return eq_fn(left: left, right: right)
-      end
-  end
-end
-
-let key_hash = fn <K>(key_ops: SetKeyOps<K>, key: K) -> i64 do
-  match key_ops do
-    case SetKeyOps(eq: _, hash: hash_dict) ->
-      match hash_dict do
-        case SetHash(hash: hash_fn) -> return hash_fn(key: key)
-      end
+    let idx = index_of(s: s, sub: "\n")
+    if idx < 0 then
+      let v = to_i64(s: s)
+      let next = Cons(v: v, rest: acc)
+      return next
+    else
+      let head = substring(s: s, start: 0, len: idx)
+      let v = to_i64(s: head)
+      let tail_start = idx + 1
+      let tail_len = length(s: s) - tail_start
+      let tail = substring(s: s, start: tail_start, len: tail_len)
+      let next = Cons(v: v, rest: acc)
+      return parse_i64_list_go(s: tail, acc: next)
+    end
   end
 end
 
@@ -76,215 +59,123 @@ let reverse_go = fn <T>(xs: List<T>, acc: List<T>) -> List<T> do
   end
 end
 
-let reverse = fn <T>(xs: List<T>) -> List<T> do
+let parse_i64_list = fn (s: string) -> List<i64> do
   let empty = Nil()
-  return reverse_go(xs: xs, acc: empty)
+  let rev = parse_i64_list_go(s: s, acc: empty)
+  let empty2 = Nil()
+  return reverse_go(xs: rev, acc: empty2)
 end
 
-let set_key_ops = fn <K>(set: Set<K>) -> SetKeyOps<K> do
-  match set do
-    case Set(key_ops: key_ops, entries: _) -> return key_ops
-  end
-end
-
-let set_entries = fn <K>(set: Set<K>) -> List<SetEntry<K>> do
-  match set do
-    case Set(key_ops: _, entries: entries) -> return entries
-  end
-end
-
-/// Creates an empty set with the given key operations.
-pub let empty = fn <K>(key_ops: SetKeyOps<K>) -> Set<K> do
-  let empty_entries = Nil()
-  return Set(key_ops: key_ops, entries: empty_entries)
-end
-
-let contains_go = fn <K>(xs: List<SetEntry<K>>, key_ops: SetKeyOps<K>, target_hash: i64, target_key: K) -> bool do
+let insert_list_go = fn (id: i64, xs: List<i64>) -> unit do
   match xs do
-    case Nil() -> return false
-    case Cons(v: entry, rest: rest) ->
-      match entry do
-        case SetEntry(hash: hash, key: key) ->
-          if hash == target_hash then
-            if key_eq(key_ops: key_ops, left: key, right: target_key) then
-              return true
-            else
-              return contains_go(xs: rest, key_ops: key_ops, target_hash: target_hash, target_key: target_key)
-            end
-          else
-            return contains_go(xs: rest, key_ops: key_ops, target_hash: target_hash, target_key: target_key)
-          end
-      end
+    case Nil() -> return ()
+    case Cons(v: v, rest: rest) ->
+      let _ = __nx_hset_insert(id: id, val: v)
+      return insert_list_go(id: id, xs: rest)
+  end
+end
+
+// --- Public API ---
+
+/// Creates an empty set.
+pub let empty = fn () -> %Set do
+  let id = __nx_hset_new()
+  let s = Set(id: id)
+  let %ls = s
+  return %ls
+end
+
+/// Inserts a value into the set. Consumes and returns the set.
+pub let insert = fn (set: %Set, val: i64) -> %Set do
+  match set do case Set(id: id) ->
+    let _ = __nx_hset_insert(id: id, val: val)
+    let s = Set(id: id)
+    let %ls = s
+    return %ls
   end
 end
 
 /// Returns true if the set contains the given value.
-pub let contains = fn <K>(set: Set<K>, val: K) -> bool do
-  let ops = set_key_ops(set: set)
-  let h = key_hash(key_ops: ops, key: val)
-  let xs = set_entries(set: set)
-  return contains_go(xs: xs, key_ops: ops, target_hash: h, target_key: val)
-end
-
-let remove_go = fn <K>(xs: List<SetEntry<K>>, key_ops: SetKeyOps<K>, target_hash: i64, target_key: K, acc: List<SetEntry<K>>) -> List<SetEntry<K>> do
-  match xs do
-    case Nil() -> return reverse(xs: acc)
-    case Cons(v: entry, rest: rest) ->
-      match entry do
-        case SetEntry(hash: hash, key: key) ->
-          if hash == target_hash then
-            if key_eq(key_ops: key_ops, left: key, right: target_key) then
-              return remove_go(xs: rest, key_ops: key_ops, target_hash: target_hash, target_key: target_key, acc: acc)
-            else
-              let keep = SetEntry(hash: hash, key: key)
-              let next = Cons(v: keep, rest: acc)
-              return remove_go(xs: rest, key_ops: key_ops, target_hash: target_hash, target_key: target_key, acc: next)
-            end
-          else
-            let keep = SetEntry(hash: hash, key: key)
-            let next = Cons(v: keep, rest: acc)
-            return remove_go(xs: rest, key_ops: key_ops, target_hash: target_hash, target_key: target_key, acc: next)
-          end
-      end
+pub let contains = fn (set: &Set, val: i64) -> bool do
+  match set do case Set(id: id) ->
+    return __nx_hset_contains(id: id, val: val)
   end
 end
 
-/// Returns a new set with the given value removed.
-pub let remove = fn <K>(set: Set<K>, val: K) -> Set<K> do
-  let ops = set_key_ops(set: set)
-  let h = key_hash(key_ops: ops, key: val)
-  let xs = set_entries(set: set)
-  let empty_entries = Nil()
-  let next = remove_go(xs: xs, key_ops: ops, target_hash: h, target_key: val, acc: empty_entries)
-  return Set(key_ops: ops, entries: next)
-end
-
-/// Returns a new set with the given value inserted (no-op if already present).
-pub let insert = fn <K>(set: Set<K>, val: K) -> Set<K> do
-  let ops = set_key_ops(set: set)
-  let h = key_hash(key_ops: ops, key: val)
-  let xs = set_entries(set: set)
-  if contains_go(xs: xs, key_ops: ops, target_hash: h, target_key: val) then
-    return set
-  else
-    let entry = SetEntry(hash: h, key: val)
-    let next = Cons(v: entry, rest: xs)
-    return Set(key_ops: ops, entries: next)
-  end
-end
-
-let insert_go = fn <K>(xs: List<K>, set: Set<K>) -> Set<K> do
-  match xs do
-    case Nil() -> return set
-    case Cons(v: v, rest: rest) ->
-      let next = insert(set: set, val: v)
-      return insert_go(xs: rest, set: next)
-  end
-end
-
-/// Creates a set from a list of values.
-pub let from_list = fn <K>(key_ops: SetKeyOps<K>, xs: List<K>) -> Set<K> do
-  let init = empty(key_ops: key_ops)
-  return insert_go(xs: xs, set: init)
-end
-
-let to_list_go = fn <K>(xs: List<SetEntry<K>>, acc: List<K>) -> List<K> do
-  match xs do
-    case Nil() -> return reverse(xs: acc)
-    case Cons(v: entry, rest: rest) ->
-      match entry do
-        case SetEntry(hash: _, key: key) ->
-          let next = Cons(v: key, rest: acc)
-          return to_list_go(xs: rest, acc: next)
-      end
-  end
-end
-
-/// Converts the set to a list of its elements.
-pub let to_list = fn <K>(set: Set<K>) -> List<K> do
-  let xs = set_entries(set: set)
-  let empty_values = Nil()
-  return to_list_go(xs: xs, acc: empty_values)
-end
-
-let size_go = fn <T>(xs: List<T>, acc: i64) -> i64 do
-  match xs do
-    case Nil() -> return acc
-    case Cons(v: _, rest: rest) ->
-      let next = acc + 1
-      return size_go(xs: rest, acc: next)
+/// Removes a value from the set. Consumes and returns the set.
+pub let remove = fn (set: %Set, val: i64) -> %Set do
+  match set do case Set(id: id) ->
+    let _ = __nx_hset_remove(id: id, val: val)
+    let s = Set(id: id)
+    let %ls = s
+    return %ls
   end
 end
 
 /// Returns the number of elements in the set.
-pub let size = fn <K>(set: Set<K>) -> i64 do
-  let xs = set_entries(set: set)
-  return size_go(xs: xs, acc: 0)
-end
-
-let union_go = fn <K>(xs: List<K>, acc: Set<K>) -> Set<K> do
-  match xs do
-    case Nil() -> return acc
-    case Cons(v: v, rest: rest) ->
-      let next = insert(set: acc, val: v)
-      return union_go(xs: rest, acc: next)
+pub let size = fn (set: &Set) -> i64 do
+  match set do case Set(id: id) ->
+    return __nx_hset_size(id: id)
   end
 end
 
-/**
- * Returns the union of two sets.
- * Converts the right set to a list and inserts each element into left.
- * Duplicate entries are skipped by insert's contains check.
- */
-pub let union = fn <K>(left: Set<K>, right: Set<K>) -> Set<K> do
-  let xs = to_list(set: right)
-  return union_go(xs: xs, acc: left)
+/// Creates a set from a list of values.
+pub let from_list = fn (xs: List<i64>) -> %Set do
+  let id = __nx_hset_new()
+  let _ = insert_list_go(id: id, xs: xs)
+  let s = Set(id: id)
+  let %ls = s
+  return %ls
 end
 
-let intersection_go = fn <K>(xs: List<K>, right: Set<K>, acc: Set<K>) -> Set<K> do
-  match xs do
-    case Nil() -> return acc
-    case Cons(v: v, rest: rest) ->
-      if contains(set: right, val: v) then
-        let next = insert(set: acc, val: v)
-        return intersection_go(xs: rest, right: right, acc: next)
-      else
-        return intersection_go(xs: rest, right: right, acc: acc)
-      end
+/// Converts the set to a list of its elements.
+pub let to_list = fn (set: &Set) -> List<i64> do
+  match set do case Set(id: id) ->
+    let raw = __nx_hset_to_list(id: id)
+    return parse_i64_list(s: raw)
   end
 end
 
-/**
- * Returns the intersection of two sets.
- * Walks the left set's elements; keeps only those present in right.
- */
-pub let intersection = fn <K>(left: Set<K>, right: Set<K>) -> Set<K> do
-  let xs = to_list(set: left)
-  let ops = set_key_ops(set: left)
-  let init = empty(key_ops: ops)
-  return intersection_go(xs: xs, right: right, acc: init)
-end
-
-let difference_go = fn <K>(xs: List<K>, right: Set<K>, acc: Set<K>) -> Set<K> do
-  match xs do
-    case Nil() -> return acc
-    case Cons(v: v, rest: rest) ->
-      if contains(set: right, val: v) then
-        return difference_go(xs: rest, right: right, acc: acc)
-      else
-        let next = insert(set: acc, val: v)
-        return difference_go(xs: rest, right: right, acc: next)
-      end
+/// Returns the union of two sets (new set).
+pub let union = fn (left: &Set, right: &Set) -> %Set do
+  match left do case Set(id: lid) ->
+    match right do case Set(id: rid) ->
+      let new_id = __nx_hset_union(id_a: lid, id_b: rid)
+      let s = Set(id: new_id)
+      let %ls = s
+      return %ls
+    end
   end
 end
 
-/**
- * Returns elements in left that are not in right.
- * Walks the left set's elements; keeps only those absent from right.
- */
-pub let difference = fn <K>(left: Set<K>, right: Set<K>) -> Set<K> do
-  let xs = to_list(set: left)
-  let ops = set_key_ops(set: left)
-  let init = empty(key_ops: ops)
-  return difference_go(xs: xs, right: right, acc: init)
+/// Returns the intersection of two sets (new set).
+pub let intersection = fn (left: &Set, right: &Set) -> %Set do
+  match left do case Set(id: lid) ->
+    match right do case Set(id: rid) ->
+      let new_id = __nx_hset_intersection(id_a: lid, id_b: rid)
+      let s = Set(id: new_id)
+      let %ls = s
+      return %ls
+    end
+  end
+end
+
+/// Returns elements in left that are not in right (new set).
+pub let difference = fn (left: &Set, right: &Set) -> %Set do
+  match left do case Set(id: lid) ->
+    match right do case Set(id: rid) ->
+      let new_id = __nx_hset_difference(id_a: lid, id_b: rid)
+      let s = Set(id: new_id)
+      let %ls = s
+      return %ls
+    end
+  end
+end
+
+/// Frees the set. Consumes the linear handle.
+pub let free = fn (set: %Set) -> unit do
+  match set do case Set(id: id) ->
+    let _ = __nx_hset_free(id: id)
+    return ()
+  end
 end

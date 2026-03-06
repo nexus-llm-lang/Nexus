@@ -1,6 +1,10 @@
 pub mod array;
+pub mod env;
 pub mod fs;
 pub mod list;
 pub mod net_server;
+pub mod option;
 pub mod stdlib;
+pub mod string_api;
+pub mod tuple;
 pub mod wasi_imports;

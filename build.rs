@@ -44,6 +44,7 @@ fn main() {
         "src/lib/random/src",
         "src/lib/clock/src",
         "src/lib/proc/src",
+        "src/lib/collection/src",
         "src/lib/wasm_alloc/src",
     ] {
         println!("cargo:rerun-if-changed={}", sub);

@@ -41,7 +41,7 @@ fn test_array_assignment_mismatch() {
 #[test]
 fn test_array_module_get_set_is_empty() {
     let src = r#"
-    import as array from nxlib/stdlib/array.nx
+    import as array from stdlib/array.nx
     let main = fn () -> i64 do
       let %arr = [| 10, 20, 30 |]
       let arr_ref = &%arr
@@ -58,7 +58,7 @@ fn test_array_module_get_set_is_empty() {
 #[test]
 fn test_array_module_head_last() {
     let src = r#"
-    import as array from nxlib/stdlib/array.nx
+    import as array from stdlib/array.nx
     let main = fn () -> i64 do
       let %arr = [| 10, 20, 30 |]
       let arr_ref = &%arr
@@ -116,7 +116,7 @@ fn test_array_module_zip_with_and_zip() {
 #[test]
 fn test_array_consume_nonlinear_consumer_is_rejected() {
     let src = r#"
-    import as array from nxlib/stdlib/array.nx
+    import as array from stdlib/array.nx
 
     let ignore_record = fn (val: { id: i64 }) -> unit do
         return ()
@@ -137,7 +137,7 @@ fn test_array_consume_nonlinear_consumer_is_rejected() {
 #[test]
 fn test_array_consume_with_proper_consumer_passes() {
     let src = r#"
-    import as array from nxlib/stdlib/array.nx
+    import as array from stdlib/array.nx
 
     let consume_record = fn (%val: { id: i64 }) -> unit do
         match %val do case { id: _ } -> () end

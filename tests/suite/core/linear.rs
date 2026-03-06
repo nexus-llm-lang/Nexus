@@ -123,8 +123,8 @@ fn test_linear_primitive_match_wildcard_pass() {
 #[test]
 fn test_linear_borrow_basic() {
     let src = r#"
-    import { Console }, * as stdio from nxlib/stdlib/stdio.nx
-    import { from_i64 } from nxlib/stdlib/string.nx
+    import { Console }, * as stdio from stdlib/stdio.nx
+    import { from_i64 } from stdlib/string.nx
     let peek = fn (x: &i64) -> unit require { Console } do
         let msg = from_i64(val: x)
         Console.print(val: msg)

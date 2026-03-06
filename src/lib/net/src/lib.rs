@@ -210,7 +210,3 @@ pub unsafe extern "C" fn cabi_realloc(
     ptr
 }
 
-#[allow(dead_code)]
-fn _module_identity() -> (&'static str, &'static str) {
-    (HOST_HTTP_MODULE, HOST_HTTP_FUNC)
-}

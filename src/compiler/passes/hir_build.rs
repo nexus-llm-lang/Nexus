@@ -11,7 +11,7 @@
 use crate::ir::hir::*;
 use crate::lang::ast::*;
 use crate::lang::parser;
-use crate::lang::stdlib::load_stdlib_nx_programs;
+use crate::lang::stdlib::{load_stdlib_nx_programs, resolve_import_path};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 
@@ -236,7 +236,7 @@ impl HirBuilder {
         for def in &program.definitions {
             match &def.node {
                 TopLevel::Import(import) if import.is_external => {
-                    current_wasm_module = Some(import.path.clone());
+                    current_wasm_module = Some(resolve_import_path(&import.path));
                 }
                 TopLevel::Import(import) => {
                     self.process_import(import)?;
@@ -347,17 +347,19 @@ impl HirBuilder {
     }
 
     fn process_import(&mut self, import: &Import) -> Result<(), HirBuildError> {
-        if self.import_stack.iter().any(|p| p == &import.path) {
+        let resolved_path = resolve_import_path(&import.path);
+        if self.import_stack.iter().any(|p| p == &resolved_path) {
             return Err(HirBuildError::CyclicImport {
-                path: import.path.clone(),
+                path: resolved_path,
             });
         }
 
-        self.import_stack.push(import.path.clone());
-        let src = fs::read_to_string(&import.path).map_err(|e| HirBuildError::ImportReadError {
-            path: import.path.clone(),
-            detail: e.to_string(),
-        })?;
+        self.import_stack.push(resolved_path.clone());
+        let src =
+            fs::read_to_string(&resolved_path).map_err(|e| HirBuildError::ImportReadError {
+                path: resolved_path.clone(),
+                detail: e.to_string(),
+            })?;
         let imported_program =
             parser::parser()
                 .parse(&src)

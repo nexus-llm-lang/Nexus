@@ -250,8 +250,8 @@ end
     fn prop_try_catch_with_io_handler_typechecks(msg in "[a-zA-Z0-9_]{1,16}") {
         let src = format!(
             r#"
-import {{ Console }}, * as stdio from nxlib/stdlib/stdio.nx
-import {{ from_i64 }} from nxlib/stdlib/string.nx
+import {{ Console }}, * as stdio from stdlib/stdio.nx
+import {{ from_i64 }} from stdlib/string.nx
 exception MsgError(val: string)
 
 let risky = fn (msg: string) -> unit effect {{ Exn }} do
@@ -289,7 +289,7 @@ end
             .join(", ");
         let src = format!(
             r#"
-import as array from nxlib/stdlib/array.nx
+import as array from stdlib/array.nx
 
 let __test_main = fn () -> i64 do
     let %arr = [| {elems} |]

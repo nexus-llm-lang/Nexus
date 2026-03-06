@@ -1,7 +1,7 @@
 use super::ast::*;
 use super::parser;
 use crate::constants::{Permission, ENTRYPOINT};
-use crate::lang::stdlib::load_stdlib_nx_programs;
+use crate::lang::stdlib::{load_stdlib_nx_programs, resolve_import_path};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -808,8 +808,9 @@ impl TypeChecker {
                         }
                         self.visited_paths.insert(import.path.clone());
 
-                        let src = fs::read_to_string(&import.path).map_err(|e| TypeError {
-                            message: format!("Failed to read {}: {}", import.path, e),
+                        let resolved_path = resolve_import_path(&import.path);
+                        let src = fs::read_to_string(&resolved_path).map_err(|e| TypeError {
+                            message: format!("Failed to read {}: {}", resolved_path, e),
                             span: def.span.clone(),
                         })?;
                         let p = parser::parser().parse(&src).map_err(|_| TypeError {

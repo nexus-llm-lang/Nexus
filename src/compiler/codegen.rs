@@ -273,27 +273,70 @@ struct CodegenLayout {
     heap_base: u32,
 }
 
-/// Compiles a parsed Nexus program through HIR → MIR → LIR → WASM pipeline.
-#[tracing::instrument(skip_all, name = "compile_program_to_wasm")]
-pub fn compile_program_to_wasm(program: &Program) -> Result<Vec<u8>, CompileError> {
-    validate_main_returns_unit(program)?;
+/// Per-pass timing metrics from the compilation pipeline.
+#[derive(Debug, Clone)]
+pub struct CompileMetrics {
+    pub hir_build: std::time::Duration,
+    pub mir_lower: std::time::Duration,
+    pub lir_lower: std::time::Duration,
+    pub codegen: std::time::Duration,
+}
 
-    // Extract main's require ports from the AST before lowering
-    // (the lowering pipeline currently drops the requires clause).
+impl std::fmt::Display for CompileMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total = self.hir_build + self.mir_lower + self.lir_lower + self.codegen;
+        writeln!(f, "  hir_build  {:>8.2?}", self.hir_build)?;
+        writeln!(f, "  mir_lower  {:>8.2?}", self.mir_lower)?;
+        writeln!(f, "  lir_lower  {:>8.2?}", self.lir_lower)?;
+        writeln!(f, "  codegen    {:>8.2?}", self.codegen)?;
+        write!(f, "  total      {:>8.2?}", total)
+    }
+}
+
+/// Compiles a parsed Nexus program through HIR → MIR → LIR → WASM pipeline,
+/// returning per-pass timing metrics alongside the WASM bytes.
+#[tracing::instrument(skip_all, name = "compile_program_to_wasm")]
+pub fn compile_program_to_wasm_with_metrics(
+    program: &Program,
+) -> Result<(Vec<u8>, CompileMetrics), CompileError> {
+    use std::time::Instant;
+
+    validate_main_returns_unit(program)?;
     let caps = extract_main_require_ports_from_ast(program);
 
+    let t = Instant::now();
     let hir = build_hir(program).map_err(CompileError::HirBuild)?;
-    let mir = lower_hir_to_mir(&hir).map_err(CompileError::MirLower)?;
-    let lir = lower_mir_to_lir(&mir).map_err(CompileError::LirLower)?;
-    let mut wasm = compile_lir_to_wasm(&lir, &mir.evidence_table).map_err(CompileError::Codegen)?;
+    let hir_build = t.elapsed();
 
-    // Append nexus:capabilities section from AST requires, since the
-    // lowering pipeline doesn't preserve requires through to ANF.
+    let t = Instant::now();
+    let mir = lower_hir_to_mir(&hir).map_err(CompileError::MirLower)?;
+    let mir_lower = t.elapsed();
+
+    let t = Instant::now();
+    let lir = lower_mir_to_lir(&mir).map_err(CompileError::LirLower)?;
+    let lir_lower = t.elapsed();
+
+    let t = Instant::now();
+    let mut wasm = compile_lir_to_wasm(&lir, &mir.evidence_table).map_err(CompileError::Codegen)?;
+    let codegen = t.elapsed();
+
     if !caps.is_empty() {
         append_capabilities_section(&mut wasm, &caps);
     }
 
-    Ok(wasm)
+    let metrics = CompileMetrics {
+        hir_build,
+        mir_lower,
+        lir_lower,
+        codegen,
+    };
+
+    Ok((wasm, metrics))
+}
+
+/// Compiles a parsed Nexus program through HIR → MIR → LIR → WASM pipeline.
+pub fn compile_program_to_wasm(program: &Program) -> Result<Vec<u8>, CompileError> {
+    compile_program_to_wasm_with_metrics(program).map(|(wasm, _)| wasm)
 }
 
 /// Compiles typed ANF directly into core wasm bytes.

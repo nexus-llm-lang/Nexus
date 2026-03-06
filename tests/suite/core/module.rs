@@ -1,4 +1,4 @@
-use crate::common::source::{check_and_run, prepare_test_source, run};
+use crate::common::source::{check_and_run, check_raw, prepare_test_source, run};
 use nexus::interpreter::{Interpreter, Value};
 use nexus::lang::parser;
 use nexus::lang::stdlib::list_stdlib_nx_paths;
@@ -13,60 +13,34 @@ fn test_module_import() {
 
 #[test]
 fn test_module_default_alias() {
-    let src = prepare_test_source(
-        r#"
+    let src = r#"
     import from examples/math.nx
     let main = fn () -> i64 do
       return math.add(a: 5, b: 5)
     end
-    "#,
-    );
-    let parser = parser::parser();
-    let program = parser.parse(&src).unwrap();
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).unwrap();
-    let mut interpreter = Interpreter::new(program);
-    let res = interpreter.run_function("__test", vec![]).unwrap();
-    match res {
-        nexus::interpreter::Value::Int(10) => (),
-        _ => panic!("Expected 10, got {:?}", res),
-    }
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(10));
 }
 
 #[test]
 fn test_module_selective_import() {
-    let src = prepare_test_source(
-        r#"
+    let src = r#"
     import { add } from examples/math.nx
     let main = fn () -> i64 do
       return add(a: 1, b: 2)
     end
-    "#,
-    );
-    let parser = parser::parser();
-    let program = parser.parse(&src).unwrap();
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).unwrap();
-    let mut interpreter = Interpreter::new(program);
-    let res = interpreter.run_function("__test", vec![]).unwrap();
-    match res {
-        nexus::interpreter::Value::Int(3) => (),
-        _ => panic!("Expected 3, got {:?}", res),
-    }
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(3));
 }
 
 #[test]
 fn test_import_external_syntax() {
-    let src = prepare_test_source(
-        r#"
+    let src = r#"
     import external math.wasm
     pub external add = "add" : (a: i64, b: i64) -> i64
-    "#,
-    );
-    let parser = parser::parser();
-    let program = parser.parse(&src).unwrap();
-    let mut checker = TypeChecker::new();
-    checker.check_program(&program).unwrap();
+    let main = fn () -> unit do return () end
+    "#;
+    check_raw(src).unwrap();
 }
 
 #[test]
@@ -84,7 +58,7 @@ fn test_pub_import_syntax_is_rejected() {
 #[test]
 fn test_stdlib_list_module_length() {
     let src = r#"
-    import as list from nxlib/stdlib/list.nx
+    import as list from stdlib/list.nx
 
     let main = fn () -> i64 do
       let xs = Cons(v: 1, rest: Cons(v: 2, rest: Cons(v: 3, rest: Cons(v: 4, rest: Nil()))))
@@ -97,7 +71,7 @@ fn test_stdlib_list_module_length() {
 #[test]
 fn test_stdlib_array_module_length() {
     let src = r#"
-    import as array from nxlib/stdlib/array.nx
+    import as array from stdlib/array.nx
 
     let main = fn () -> i64 do
       let %arr = [| 10, 20, 30 |]
@@ -218,7 +192,7 @@ fn test_stdlib_loader_uses_nx_only() {
 #[test]
 fn test_stdlib_global_array_length() {
     let src = r#"
-    import { length } from nxlib/stdlib/array.nx
+    import { length } from stdlib/array.nx
     let main = fn () -> i64 do
       let %arr = [| 10, 20, 30 |]
       let arr_ref = &%arr
@@ -273,10 +247,8 @@ fn all_examples_parse() {
 
 #[test]
 fn all_examples_typecheck() {
-    // TODO(Claude): 2025-02-20 user_registry.nx fails because the typechecker
-    // does not resolve module imports inside conc task blocks. Skip it until fixed.
-    // TODO(Claude): 2026-02-28 user_registry.nx fails because the typechecker
-    // does not resolve module imports inside conc task blocks. Skip it until fixed.
+    // TODO: user_registry.nx fails because the typechecker
+    // does not resolve module imports inside conc task blocks.
     let skip = ["user_registry.nx"];
     for entry in fs::read_dir("examples").unwrap() {
         let path = entry.unwrap().path();
@@ -301,7 +273,7 @@ fn all_examples_typecheck() {
 #[test]
 fn test_stdlib_string_length() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> i64 do
       return string.length(s: "hello")
     end
@@ -312,7 +284,7 @@ fn test_stdlib_string_length() {
 #[test]
 fn test_stdlib_string_contains() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> bool do
       return string.contains(s: "hello world", sub: "world")
     end
@@ -323,7 +295,7 @@ fn test_stdlib_string_contains() {
 #[test]
 fn test_stdlib_string_contains_false() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> bool do
       return string.contains(s: "hello", sub: "xyz")
     end
@@ -334,7 +306,7 @@ fn test_stdlib_string_contains_false() {
 #[test]
 fn test_stdlib_string_substring() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> string do
       return string.substring(s: "hello world", start: 6, len: 5)
     end
@@ -345,7 +317,7 @@ fn test_stdlib_string_substring() {
 #[test]
 fn test_stdlib_string_index_of() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> i64 do
       return string.index_of(s: "abcdef", sub: "cd")
     end
@@ -356,7 +328,7 @@ fn test_stdlib_string_index_of() {
 #[test]
 fn test_stdlib_string_index_of_not_found() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> i64 do
       return string.index_of(s: "abc", sub: "xyz")
     end
@@ -367,7 +339,7 @@ fn test_stdlib_string_index_of_not_found() {
 #[test]
 fn test_stdlib_string_starts_with() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> bool do
       return string.starts_with(s: "hello", prefix: "hel")
     end
@@ -378,7 +350,7 @@ fn test_stdlib_string_starts_with() {
 #[test]
 fn test_stdlib_string_ends_with() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> bool do
       return string.ends_with(s: "hello", suffix: "llo")
     end
@@ -389,7 +361,7 @@ fn test_stdlib_string_ends_with() {
 #[test]
 fn test_stdlib_string_trim() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> string do
       return string.trim(s: "  hi  ")
     end
@@ -400,7 +372,7 @@ fn test_stdlib_string_trim() {
 #[test]
 fn test_stdlib_string_to_upper() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> string do
       return string.to_upper(s: "hello")
     end
@@ -411,7 +383,7 @@ fn test_stdlib_string_to_upper() {
 #[test]
 fn test_stdlib_string_to_lower() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> string do
       return string.to_lower(s: "HELLO")
     end
@@ -422,7 +394,7 @@ fn test_stdlib_string_to_lower() {
 #[test]
 fn test_stdlib_string_replace() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> string do
       return string.replace(s: "hello world", from_str: "world", to_str: "nexus")
     end
@@ -433,8 +405,8 @@ fn test_stdlib_string_replace() {
 #[test]
 fn test_stdlib_string_split() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
-    import as list from nxlib/stdlib/list.nx
+    import as string from stdlib/string.nx
+    import as list from stdlib/list.nx
     let main = fn () -> i64 do
       let parts = string.split(s: "a,b,c", sep: ",")
       return list.length(xs: parts)
@@ -446,7 +418,7 @@ fn test_stdlib_string_split() {
 #[test]
 fn test_stdlib_string_char_at() {
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import as string from stdlib/string.nx
     let main = fn () -> string do
       return string.char_at(s: "hello", idx: 1)
     end
@@ -459,7 +431,7 @@ fn test_stdlib_string_char_at() {
 #[test]
 fn test_stdlib_abs() {
     let src = r#"
-    import { abs } from nxlib/stdlib/math.nx
+    import { abs } from stdlib/math.nx
     let main = fn () -> i64 do
       let x = 0 - 42
       return abs(val: x)
@@ -471,7 +443,7 @@ fn test_stdlib_abs() {
 #[test]
 fn test_stdlib_max() {
     let src = r#"
-    import { max } from nxlib/stdlib/math.nx
+    import { max } from stdlib/math.nx
     let main = fn () -> i64 do
       return max(a: 10, b: 20)
     end
@@ -482,7 +454,7 @@ fn test_stdlib_max() {
 #[test]
 fn test_stdlib_min() {
     let src = r#"
-    import { min } from nxlib/stdlib/math.nx
+    import { min } from stdlib/math.nx
     let main = fn () -> i64 do
       return min(a: 10, b: 20)
     end
@@ -493,7 +465,7 @@ fn test_stdlib_min() {
 #[test]
 fn test_stdlib_mod_i64() {
     let src = r#"
-    import { mod_i64 } from nxlib/stdlib/math.nx
+    import { mod_i64 } from stdlib/math.nx
     let main = fn () -> i64 do
       return mod_i64(a: 10, b: 3)
     end
@@ -504,7 +476,7 @@ fn test_stdlib_mod_i64() {
 #[test]
 fn test_stdlib_sqrt() {
     let src = r#"
-    import { sqrt } from nxlib/stdlib/math.nx
+    import { sqrt } from stdlib/math.nx
     let main = fn () -> float do
       return sqrt(val: 9.0)
     end
@@ -515,7 +487,7 @@ fn test_stdlib_sqrt() {
 #[test]
 fn test_stdlib_floor() {
     let src = r#"
-    import { floor } from nxlib/stdlib/math.nx
+    import { floor } from stdlib/math.nx
     let main = fn () -> float do
       return floor(val: 3.7)
     end
@@ -526,7 +498,7 @@ fn test_stdlib_floor() {
 #[test]
 fn test_stdlib_ceil() {
     let src = r#"
-    import { ceil } from nxlib/stdlib/math.nx
+    import { ceil } from stdlib/math.nx
     let main = fn () -> float do
       return ceil(val: 3.2)
     end
@@ -537,7 +509,7 @@ fn test_stdlib_ceil() {
 #[test]
 fn test_stdlib_pow() {
     let src = r#"
-    import { pow } from nxlib/stdlib/math.nx
+    import { pow } from stdlib/math.nx
     let main = fn () -> float do
       return pow(base: 2.0, exp: 10.0)
     end
@@ -548,7 +520,7 @@ fn test_stdlib_pow() {
 #[test]
 fn test_stdlib_abs_float() {
     let src = r#"
-    import { abs_float } from nxlib/stdlib/math.nx
+    import { abs_float } from stdlib/math.nx
     let main = fn () -> float do
       let x = 0.0 -. 5.5
       return abs_float(val: x)
@@ -562,7 +534,7 @@ fn test_stdlib_abs_float() {
 #[test]
 fn test_stdlib_i64_to_float() {
     let src = r#"
-    import { i64_to_float } from nxlib/stdlib/math.nx
+    import { i64_to_float } from stdlib/math.nx
     let main = fn () -> float do
       return i64_to_float(val: 42)
     end
@@ -573,7 +545,7 @@ fn test_stdlib_i64_to_float() {
 #[test]
 fn test_stdlib_float_to_i64() {
     let src = r#"
-    import { float_to_i64 } from nxlib/stdlib/math.nx
+    import { float_to_i64 } from stdlib/math.nx
     let main = fn () -> i64 do
       return float_to_i64(val: 3.9)
     end
@@ -582,11 +554,26 @@ fn test_stdlib_float_to_i64() {
 }
 
 #[test]
-fn test_stdlib_string_to_i64() {
+fn test_stdlib_short_import_path() {
+    // Users can write `stdlib/X` instead of `nxlib/stdlib/X`
     let src = r#"
-    import as string from nxlib/stdlib/string.nx
+    import { length } from stdlib/string.nx
     let main = fn () -> i64 do
-      return string.to_i64(s: "123")
+      return length(s: "hello")
+    end
+    "#;
+    assert_eq!(run(src).unwrap(), Value::Int(5));
+}
+
+#[test]
+fn test_stdlib_string_parse_i64() {
+    let src = r#"
+    import as string from stdlib/string.nx
+    let main = fn () -> i64 do
+      match string.parse_i64(s: "123") do
+        case Some(val: v) -> return v
+        case None() -> return 0 - 1
+      end
     end
     "#;
     assert_eq!(run(src).unwrap(), Value::Int(123));

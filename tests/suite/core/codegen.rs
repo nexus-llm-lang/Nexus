@@ -1,5 +1,6 @@
 use crate::common::source::run;
 use crate::common::wasm_runner::*;
+use nexus::compiler::codegen::compile_program_to_wasm_with_metrics;
 use nexus::interpreter::Value;
 use std::fs;
 
@@ -241,7 +242,7 @@ end
 #[test]
 fn codegen_negate_function() {
     let src = r#"
-import { negate } from nxlib/stdlib/core.nx
+import { negate } from stdlib/core.nx
 
 let main = fn () -> i64 do
     let t = negate(val: true)
@@ -352,7 +353,7 @@ end
 #[test]
 fn codegen_handler_reachability_resolves_port_call() {
     let src = r#"
-import { Console }, * as stdio from nxlib/stdlib/stdio.nx
+import { Console }, * as stdio from stdlib/stdio.nx
 
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do
@@ -442,4 +443,20 @@ end
             Value::Int(expected)
         );
     }
+}
+
+#[test]
+fn compile_metrics_reports_all_pass_durations() {
+    let src = r#"
+let main = fn () -> unit do
+    return ()
+end
+"#;
+    let program = nexus::lang::parser::parser().parse(src).unwrap();
+    let (wasm, metrics) = compile_program_to_wasm_with_metrics(&program).unwrap();
+    assert!(!wasm.is_empty());
+    assert!(!metrics.hir_build.is_zero());
+    assert!(!metrics.mir_lower.is_zero());
+    assert!(!metrics.lir_lower.is_zero());
+    assert!(!metrics.codegen.is_zero());
 }

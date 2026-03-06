@@ -1,9 +1,9 @@
 # Standard Library
 
-All stdlib modules are in `nxlib/stdlib/`. Import with:
+Import stdlib modules from `stdlib/`:
 
 ```nexus
-import { Console }, * as stdio from nxlib/stdlib/stdio.nx
+import { Console }, * as stdio from stdlib/stdio.nx
 ```
 
 ## I/O Ports
@@ -18,6 +18,8 @@ Requires `PermConsole`. CLI flag: `--allow-console`.
 port Console do
     fn print(val: string) -> unit
     fn println(val: string) -> unit
+    fn read_line() -> string
+    fn getchar() -> string
 end
 ```
 
@@ -46,7 +48,7 @@ type Handle = Handle(id: i64)   // linear file handle
 port Fs do
     // Query
     fn exists(path: string) -> bool
-    fn read_to_string(path: string) -> string
+    fn read_to_string(path: string) -> string effect { Exn }
 
     // Mutating (raise on failure)
     fn write_string(path: string, content: string) -> unit effect { Exn }
@@ -86,7 +88,7 @@ Requires `PermNet`. CLI flag: `--allow-net`.
 ```nexus
 type Header = Header(name: string, value: string)
 type Response = Response(status: i64, body: string)
-type Server = Server(id: i64)     // linear server handle
+opaque type Server = Server(id: i64)     // linear server handle
 type Request = Request(method: string, path: string, headers: string, body: string, req_id: i64)
 ```
 
@@ -94,17 +96,17 @@ type Request = Request(method: string, path: string, headers: string, body: stri
 
 ```nexus
 port Net do
-    // HTTP client
-    fn get(url: string) -> string
-    fn request(method: string, url: string, headers: List<Header>) -> string
-    fn request_with_body(method: string, url: string, headers: List<Header>, body: string) -> string
-    fn request_response(method: string, url: string, headers: List<Header>, body: string) -> Response
+    // HTTP client (all raise on failure)
+    fn get(url: string) -> string effect { Exn }
+    fn request(method: string, url: string, headers: List<Header>) -> string effect { Exn }
+    fn request_with_body(method: string, url: string, headers: List<Header>, body: string) -> string effect { Exn }
+    fn request_response(method: string, url: string, headers: List<Header>, body: string) -> Response effect { Exn }
 
     // HTTP server
     fn listen(addr: string) -> %Server effect { Exn }
     fn accept(server: &Server) -> Request
-    fn respond(req: Request, status: i64, body: string) -> bool
-    fn respond_with_headers(req: Request, status: i64, headers: List<Header>, body: string) -> bool
+    fn respond(req: Request, status: i64, body: string) -> unit effect { Exn }
+    fn respond_with_headers(req: Request, status: i64, headers: List<Header>, body: string) -> unit effect { Exn }
     fn stop(server: %Server) -> unit
 end
 ```
@@ -153,13 +155,43 @@ port Proc do
 end
 ```
 
+### Environment (`env.nx`)
+
+Requires `PermEnv`. CLI flag: `--allow-env`.
+
+```nexus
+port Env do
+    fn get(key: string) -> Option<string>
+    fn set(key: string, value: string) -> unit
+end
+```
+
+`Env.get` returns `None()` when the variable is not set, avoiding exceptions for simple absence.
+
 ## Data Structures
+
+### Option (`option.nx`)
+
+```nexus
+type Option<T> = Some(val: T) | None
+
+fn is_some<T>(opt: Option<T>) -> bool
+fn is_none<T>(opt: Option<T>) -> bool
+fn unwrap_or<T>(opt: Option<T>, default: T) -> T
+fn map<T, U>(opt: Option<T>, f: (val: T) -> U) -> Option<U>
+fn and_then<T, U>(opt: Option<T>, f: (val: T) -> Option<U>) -> Option<U>
+fn or_else<T>(opt: Option<T>, other: Option<T>) -> Option<T>
+fn unwrap<T>(opt: Option<T>) -> T effect { Exn }
+fn expect<T>(opt: Option<T>, msg: string) -> T effect { Exn }
+```
 
 ### List (`list.nx`)
 
 Immutable singly-linked list: `type List<T> = Nil | Cons(v: T, rest: List<T>)`
 
 ```nexus
+type Partition<T> = Partition(matched: List<T>, rest: List<T>)
+
 fn empty<T>() -> List<T>
 fn cons<T>(x: T, xs: List<T>) -> List<T>
 fn is_empty<T>(xs: List<T>) -> bool
@@ -176,6 +208,15 @@ fn contains(xs: List<i64>, val: i64) -> bool
 fn fold_left<T, U>(xs: List<T>, init: U, f: (acc: U, val: T) -> U) -> U
 fn map<T, U>(xs: List<T>, f: (val: T) -> U) -> List<U>
 fn map_rev<T, U>(xs: List<T>, f: (val: T) -> U) -> List<U>
+```
+
+### Tuple (`tuple.nx`)
+
+```nexus
+type Pair<A, B> = Pair(left: A, right: B)
+
+fn fst<A, B>(p: Pair<A, B>) -> A
+fn snd<A, B>(p: Pair<A, B>) -> B
 ```
 
 ### Array (`array.nx`)
@@ -204,48 +245,42 @@ fn consume<T>(%arr: [| T |], f: (val: %T) -> unit) -> unit
 
 ### Set (`set.nx`)
 
-Hash set with dictionary-passed key operations:
+FFI-backed hash set of i64 values. Uses opaque linear handles backed by Rust `HashSet<i64>`.
 
 ```nexus
-type SetKeyOps<K> = SetKeyOps(eq: SetEq<K>, hash: SetHash<K>)
-type Set<K> = Set(key_ops: SetKeyOps<K>, entries: List<SetEntry<K>>)
+opaque type Set = Set(id: i64)    // linear — must be freed
 
-fn make_key_ops<K>(eq: (left: K, right: K) -> bool, hash: (key: K) -> i64) -> SetKeyOps<K>
-fn i64_key_ops() -> SetKeyOps<i64>
-fn empty<K>(key_ops: SetKeyOps<K>) -> Set<K>
-fn contains<K>(set: Set<K>, val: K) -> bool
-fn insert<K>(set: Set<K>, val: K) -> Set<K>
-fn remove<K>(set: Set<K>, val: K) -> Set<K>
-fn from_list<K>(key_ops: SetKeyOps<K>, xs: List<K>) -> Set<K>
-fn to_list<K>(set: Set<K>) -> List<K>
-fn size<K>(set: Set<K>) -> i64
-fn union<K>(left: Set<K>, right: Set<K>) -> Set<K>
-fn intersection<K>(left: Set<K>, right: Set<K>) -> Set<K>
-fn difference<K>(left: Set<K>, right: Set<K>) -> Set<K>
+fn empty() -> %Set
+fn insert(set: %Set, val: i64) -> %Set
+fn contains(set: &Set, val: i64) -> bool
+fn remove(set: %Set, val: i64) -> %Set
+fn size(set: &Set) -> i64
+fn from_list(xs: List<i64>) -> %Set
+fn to_list(set: &Set) -> List<i64>
+fn union(left: &Set, right: &Set) -> %Set
+fn intersection(left: &Set, right: &Set) -> %Set
+fn difference(left: &Set, right: &Set) -> %Set
+fn free(set: %Set) -> unit
 ```
 
 ### HashMap (`hashmap.nx`)
 
-Hash map with dictionary-passed key operations:
+FFI-backed hash map from i64 keys to i64 values. Uses opaque linear handles backed by Rust `HashMap<i64, i64>`.
 
 ```nexus
-type KeyOps<K> = KeyOps(eq: Eq<K>, hash: Hash<K>)
-type HashMap<K, V> = HashMap(key_ops: KeyOps<K>, entries: List<Entry<K, V>>)
-type Lookup<V> = Found(value: V) | Missing
+opaque type HashMap = HashMap(id: i64)  // linear — must be freed
+type Lookup = Found(value: i64) | Missing
 
-fn make_key_ops<K>(eq: (left: K, right: K) -> bool, hash: (key: K) -> i64) -> KeyOps<K>
-fn i64_key_ops() -> KeyOps<i64>
-fn empty<K, V>(key_ops: KeyOps<K>) -> HashMap<K, V>
-fn from_entries<K, V>(key_ops: KeyOps<K>, entries: List<Entry<K, V>>) -> HashMap<K, V>
-fn entries<K, V>(map: HashMap<K, V>) -> List<Entry<K, V>>
-fn size<K, V>(map: HashMap<K, V>) -> i64
-fn contains_key<K, V>(map: HashMap<K, V>, key: K) -> bool
-fn get<K, V>(map: HashMap<K, V>, key: K) -> Lookup<V>
-fn get_or<K, V>(map: HashMap<K, V>, key: K, default: V) -> V
-fn put<K, V>(map: HashMap<K, V>, key: K, value: V) -> HashMap<K, V>
-fn remove<K, V>(map: HashMap<K, V>, key: K) -> HashMap<K, V>
-fn keys<K, V>(map: HashMap<K, V>) -> List<K>
-fn values<K, V>(map: HashMap<K, V>) -> List<V>
+fn empty() -> %HashMap
+fn put(map: %HashMap, key: i64, value: i64) -> %HashMap
+fn get(map: &HashMap, key: i64) -> Lookup
+fn get_or(map: &HashMap, key: i64, default: i64) -> i64
+fn contains_key(map: &HashMap, key: i64) -> bool
+fn remove(map: %HashMap, key: i64) -> %HashMap
+fn size(map: &HashMap) -> i64
+fn keys(map: &HashMap) -> List<i64>
+fn values(map: &HashMap) -> List<i64>
+fn free(map: %HashMap) -> unit
 ```
 
 ## Utilities
@@ -253,22 +288,33 @@ fn values<K, V>(map: HashMap<K, V>) -> List<V>
 ### String (`string.nx`)
 
 ```nexus
+// Inspection
 fn length(s: string) -> i64
 fn contains(s: string, sub: string) -> bool
-fn substring(s: string, start: i64, len: i64) -> string
 fn index_of(s: string, sub: string) -> i64
 fn starts_with(s: string, prefix: string) -> bool
 fn ends_with(s: string, suffix: string) -> bool
+fn char_at(s: string, idx: i64) -> string
+
+// Transformation
+fn substring(s: string, start: i64, len: i64) -> string
 fn trim(s: string) -> string
 fn to_upper(s: string) -> string
 fn to_lower(s: string) -> string
 fn replace(s: string, from_str: string, to_str: string) -> string
-fn char_at(s: string, idx: i64) -> string
+fn concat(a: string, b: string) -> string
+fn repeat(s: string, n: i64) -> string
+fn pad_left(s: string, width: i64, fill: string) -> string
+fn pad_right(s: string, width: i64, fill: string) -> string
+fn join(xs: List<string>, sep: string) -> string
+fn split(s: string, sep: string) -> List<string>
+
+// Conversion
 fn from_i64(val: i64) -> string
 fn from_float(val: float) -> string
 fn from_bool(val: bool) -> string
 fn to_i64(s: string) -> i64
-fn split(s: string, sep: string) -> List<string>
+fn parse_i64(s: string) -> Option<i64>
 ```
 
 ### Math (`math.nx`)
@@ -278,6 +324,7 @@ fn abs(val: i64) -> i64
 fn max(a: i64, b: i64) -> i64
 fn min(a: i64, b: i64) -> i64
 fn mod_i64(a: i64, b: i64) -> i64
+fn negate(val: bool) -> bool
 fn abs_float(val: float) -> float
 fn sqrt(val: float) -> float
 fn floor(val: float) -> float
@@ -313,6 +360,8 @@ fn backtrace(exn: Exn) -> [string]
 
 ### Core (`core.nx`)
 
+Legacy re-exports for backwards compatibility. Prefer `tuple.nx`, `list.nx`, `math.nx` for new code.
+
 ```nexus
 type Pair<A, B> = Pair(left: A, right: B)
 type Partition<T> = Partition(matched: List<T>, rest: List<T>)
@@ -320,4 +369,5 @@ type Partition<T> = Partition(matched: List<T>, rest: List<T>)
 fn fst<A, B>(p: Pair<A, B>) -> A
 fn snd<A, B>(p: Pair<A, B>) -> B
 fn negate(val: bool) -> bool
+fn id<T>(val: T) -> T
 ```

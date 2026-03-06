@@ -21,6 +21,7 @@ pub enum Permission {
     Random,
     Clock,
     Proc,
+    Env,
 }
 
 impl Permission {
@@ -33,6 +34,7 @@ impl Permission {
             "PermRandom" => Some(Permission::Random),
             "PermClock" => Some(Permission::Clock),
             "PermProc" => Some(Permission::Proc),
+            "PermEnv" => Some(Permission::Env),
             _ => None,
         }
     }
@@ -46,6 +48,7 @@ impl Permission {
             "Random" => Some(Permission::Random),
             "Clock" => Some(Permission::Clock),
             "Proc" => Some(Permission::Proc),
+            "Env" => Some(Permission::Env),
             _ => None,
         }
     }
@@ -59,6 +62,7 @@ impl Permission {
             Permission::Random => "PermRandom",
             Permission::Clock => "PermClock",
             Permission::Proc => "PermProc",
+            Permission::Env => "PermEnv",
         }
     }
 
@@ -71,6 +75,7 @@ impl Permission {
             Permission::Random => "Random",
             Permission::Clock => "Clock",
             Permission::Proc => "Proc",
+            Permission::Env => "Env",
         }
     }
 
@@ -83,6 +88,7 @@ impl Permission {
             Permission::Random => "--allow-random",
             Permission::Clock => "--allow-clock",
             Permission::Proc => "--allow-proc",
+            Permission::Env => "--allow-env",
         }
     }
 }

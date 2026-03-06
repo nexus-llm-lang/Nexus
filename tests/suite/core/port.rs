@@ -3,7 +3,7 @@ use crate::common::source::{check, run};
 #[test]
 fn test_port_basic() {
     let src = r#"
-    import { Console }, * as stdio from nxlib/stdlib/stdio.nx
+    import { Console }, * as stdio from stdlib/stdio.nx
 
     port Logger do
       fn log(msg: string) -> unit
@@ -32,8 +32,8 @@ fn test_port_basic() {
 #[test]
 fn test_port_redefinition_wins() {
     let src = r#"
-    import { Console }, * as stdio from nxlib/stdlib/stdio.nx
-    import { from_i64 } from nxlib/stdlib/string.nx
+    import { Console }, * as stdio from stdlib/stdio.nx
+    import { from_i64 } from stdlib/string.nx
 
     port Adder do
       fn add_one(n: i64) -> i64
@@ -68,11 +68,11 @@ fn test_port_redefinition_wins() {
 fn test_handler_require_mock_needs_nothing() {
     // Mock handler (no require) → main needs nothing
     let src = r#"
-    import { Fs, Handle } from nxlib/stdlib/fs.nx
+    import { Fs, Handle } from stdlib/fs.nx
 
     let mock_fs = handler Fs do
       fn exists(path: string) -> bool do return false end
-      fn read_to_string(path: string) -> string do return "" end
+      fn read_to_string(path: string) -> string effect { Exn } do return "" end
       fn write_string(path: string, content: string) -> unit effect { Exn } do return () end
       fn append_string(path: string, content: string) -> unit effect { Exn } do return () end
       fn remove_file(path: string) -> unit effect { Exn } do return () end
@@ -138,7 +138,7 @@ fn test_handler_require_mock_needs_nothing() {
 fn test_handler_require_real_propagates_perm() {
     // Real handler (require { PermFs }) → main needs PermFs
     let src = r#"
-    import { Fs }, * as fs_mod from nxlib/stdlib/fs.nx
+    import { Fs }, * as fs_mod from stdlib/fs.nx
 
     let main = fn () -> bool require { PermFs } do
       inject fs_mod.system_handler do
@@ -244,7 +244,7 @@ fn test_handler_require_syntax_parses() {
 #[test]
 fn test_handler_require_missing_is_rejected() {
     let src = r#"
-    import { Fs }, * as fs_mod from nxlib/stdlib/fs.nx
+    import { Fs }, * as fs_mod from stdlib/fs.nx
 
     let main = fn () -> bool do
       inject fs_mod.system_handler do
