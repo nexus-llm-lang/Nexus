@@ -30,14 +30,15 @@ fn test_net_effect_enforcement() {
 #[test]
 fn test_net_request_method_and_headers_runtime() {
     let src = r#"
-    import { Net, header }, * as net_mod from stdlib/net.nx
+    import { Net, header, response_body }, * as net_mod from stdlib/net.nx
 
     let main = fn () -> string require { PermNet } do
       inject net_mod.system_handler do
         try
           let h = header(name: "X-Test", value: "abc")
           let hs = Cons(v: h, rest: Nil())
-          return Net.request(method: "POST", url: "http://127.0.0.1:1/ping", headers: hs)
+          let res = Net.request(method: "POST", url: "http://127.0.0.1:1/ping", headers: hs, body: "")
+          return response_body(res: res)
         catch e ->
           match e do
             case RuntimeError(val: msg) -> return msg
@@ -63,13 +64,14 @@ fn test_net_request_method_and_headers_runtime() {
 #[test]
 fn test_net_request_https_url_is_accepted() {
     let src = r#"
-    import { Net }, * as net_mod from stdlib/net.nx
+    import { Net, response_body }, * as net_mod from stdlib/net.nx
 
     let main = fn () -> string require { PermNet } do
       inject net_mod.system_handler do
         try
           let hs = Nil()
-          return Net.request(method: "GET", url: "https://127.0.0.1:1/", headers: hs)
+          let res = Net.request(method: "GET", url: "https://127.0.0.1:1/", headers: hs, body: "")
+          return response_body(res: res)
         catch e ->
           match e do
             case RuntimeError(val: msg) -> return msg
@@ -97,7 +99,7 @@ fn test_net_request_response_status_and_body_with_request_body() {
       inject net_mod.system_handler do
         try
           let hs = Cons(v: header(name: "Content-Type", value: "application/x-www-form-urlencoded"), rest: Nil())
-          let res = Net.request_response(method: "POST", url: "http://127.0.0.1:1/submit", headers: hs, body: "hello=nx")
+          let res = Net.request(method: "POST", url: "http://127.0.0.1:1/submit", headers: hs, body: "hello=nx")
           let status = response_status(res: res)
           let body = response_body(res: res)
           let status_s = from_i64(val: status)

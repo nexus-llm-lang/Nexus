@@ -1,7 +1,7 @@
 //! High-level IR — name-resolved AST with modules flattened.
 //! All identifiers are fully qualified. Handlers collected.
 
-use crate::lang::ast::{BinaryOp, Literal, Sigil, Type};
+use crate::lang::ast::{BinaryOp, EnumDef, Literal, Sigil, Type};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -11,6 +11,8 @@ pub struct HirProgram {
     pub externals: Vec<HirExternal>,
     /// binding_name → handler binding (port name + method implementations)
     pub handler_bindings: HashMap<String, HirHandlerBinding>,
+    /// All enum definitions (stdlib + user-defined + imported)
+    pub enum_defs: Vec<EnumDef>,
 }
 
 #[derive(Debug, Clone)]

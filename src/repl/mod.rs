@@ -51,15 +51,11 @@ impl ReplState {
     fn build_program(&self, main_body: Vec<Spanned<Stmt>>) -> Program {
         let mut defs = self.top_levels.clone();
 
-        // Synthetic main requires PermConsole so print/println work in REPL
-        let requires = if self.capabilities.allow_console {
-            Type::Row(
-                vec![Type::UserDefined("PermConsole".to_string(), vec![])],
-                None,
-            )
-        } else {
-            Type::Row(vec![], None)
-        };
+        // REPL always enables console (forced in start()), so always require PermConsole
+        let requires = Type::Row(
+            vec![Type::UserDefined("PermConsole".to_string(), vec![])],
+            None,
+        );
 
         // Add synthetic main function wrapping the body
         let main_fn = Spanned {

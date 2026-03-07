@@ -1,14 +1,5 @@
-/**
- * net: HTTP networking operations gated by the Net port (capability).
- *
- * All operations are defined in `port Net` and dispatched via handler.
- * Use `inject net_mod.system_handler do ... end` for real network access,
- * or inject a mock handler for testing.
- *
- * Headers are encoded as "name:value\n" pairs for transport, and the raw
- * response wire format is "status\nbody".
- */
-import external nxlib/stdlib/stdlib.wasm
+/** net: HTTP networking operations. */
+import external stdlib/stdlib.wasm
 import { length, substring, index_of } from stdlib/string.nx
 
 external to_i64 = "__nx_string_to_i64" : (s: string) -> i64
@@ -16,8 +7,8 @@ external to_i64 = "__nx_string_to_i64" : (s: string) -> i64
 /// An HTTP header with a name and value.
 pub type Header = Header(name: string, value: string)
 
-/// An HTTP response with a status code and body.
-pub type Response = Response(status: i64, body: string)
+/// An HTTP response with a status code, headers, and body.
+pub type Response = Response(status: i64, headers: string, body: string)
 
 /// A running HTTP server handle (linear — must be stopped).
 pub opaque type Server = Server(id: i64)
@@ -25,22 +16,18 @@ pub opaque type Server = Server(id: i64)
 /// An incoming HTTP request.
 pub type Request = Request(method: string, path: string, headers: string, body: string, req_id: i64)
 
-// --- Raw FFI (internal, no require) ---
-
 external __nx_http_request = "__nx_http_request" : (method: string, url: string, headers: string, body: string) -> string
 external __nx_http_listen = "__nx_http_listen" : (addr: string) -> i64
 external __nx_http_accept = "__nx_http_accept" : (server_id: i64) -> string
 external __nx_http_respond = "__nx_http_respond" : (req_id: i64, status: i64, headers: string, body: string) -> bool
 external __nx_http_stop = "__nx_http_stop" : (server_id: i64) -> bool
 
-// --- Helpers (pure, no require) ---
-
-/// Creates a Header from a name and value.
+/// Create a Header.
 pub let header = fn (name: string, value: string) -> Header do
   return Header(name: name, value: value)
 end
 
-let encode_headers_go = fn (headers: List<Header>, acc: string) -> string do
+let encode_headers_go = fn (headers: [ Header ], acc: string) -> string do
   match headers do
     case Nil() -> return acc
     case Cons(v: h, rest: rest) ->
@@ -53,218 +40,230 @@ let encode_headers_go = fn (headers: List<Header>, acc: string) -> string do
   end
 end
 
-let encode_headers = fn (headers: List<Header>) -> string do
+let encode_headers = fn (headers: [ Header ]) -> string do
   return encode_headers_go(headers: headers, acc: "")
 end
 
 let decode_response = fn (raw: string) -> Response do
-  let sep = index_of(s: raw, sub: "\n")
-  if sep < 0 then
-    return Response(status: 0, body: raw)
+  let sep1 = index_of(s: raw, sub: "\n")
+  if sep1 < 0 then
+    return Response(status: 0, headers: "", body: raw)
   else
-    let status_s = substring(s: raw, start: 0, len: sep)
-    let raw_len = length(s: raw)
-    let body_start = sep + 1
-    let body_len = raw_len - body_start
-    let body_s = substring(s: raw, start: body_start, len: body_len)
+    let status_s = substring(s: raw, start: 0, len: sep1)
     let status = to_i64(s: status_s)
-    return Response(status: status, body: body_s)
+    let rest1_start = sep1 + 1
+    let rest1_len = length(s: raw) - rest1_start
+    let rest1 = substring(s: raw, start: rest1_start, len: rest1_len)
+    let sep2 = index_of(s: rest1, sub: "\n")
+    if sep2 < 0 then
+      return Response(status: status, headers: "", body: rest1)
+    else
+      let hlen_s = substring(s: rest1, start: 0, len: sep2)
+      let hlen = to_i64(s: hlen_s)
+      let content_start = sep2 + 1
+      let headers_s = substring(s: rest1, start: content_start, len: hlen)
+      let body_start = content_start + hlen
+      let body_len = length(s: rest1) - body_start
+      let body_s = substring(s: rest1, start: body_start, len: body_len)
+      return Response(status: status, headers: headers_s, body: body_s)
+    end
   end
 end
 
-let decode_body_from_raw = fn (raw: string) -> string do
-  let sep = index_of(s: raw, sub: "\n")
+
+let split_at_newline = fn (s: string) -> { head: string, rest: string } do
+  let sep = index_of(s: s, sub: "\n")
   if sep < 0 then
-    return raw
+    return { head: s, rest: "" }
   else
-    let raw_len = length(s: raw)
-    let body_start = sep + 1
-    let body_len = raw_len - body_start
-    return substring(s: raw, start: body_start, len: body_len)
+    let head = substring(s: s, start: 0, len: sep)
+    let rest_start = sep + 1
+    let rest_len = length(s: s) - rest_start
+    let rest = substring(s: s, start: rest_start, len: rest_len)
+    return { head: head, rest: rest }
   end
 end
 
 let decode_request = fn (raw: string) -> Request do
-  let sep1 = index_of(s: raw, sub: "\n")
-  if sep1 < 0 then
+  let p1 = split_at_newline(s: raw)
+  let req_id_s = p1.head
+  if length(s: req_id_s) == 0 then
     return Request(method: "", path: "", headers: "", body: "", req_id: 0 - 1)
   else
-    let req_id_s = substring(s: raw, start: 0, len: sep1)
     let req_id = to_i64(s: req_id_s)
-    let rest1_start = sep1 + 1
-    let rest1_len = length(s: raw) - rest1_start
-    let rest1 = substring(s: raw, start: rest1_start, len: rest1_len)
-
-    let sep2 = index_of(s: rest1, sub: "\n")
-    if sep2 < 0 then
-      return Request(method: rest1, path: "", headers: "", body: "", req_id: req_id)
-    else
-      let method = substring(s: rest1, start: 0, len: sep2)
-      let rest2_start = sep2 + 1
-      let rest2_len = length(s: rest1) - rest2_start
-      let rest2 = substring(s: rest1, start: rest2_start, len: rest2_len)
-
-      let sep3 = index_of(s: rest2, sub: "\n")
-      if sep3 < 0 then
-        return Request(method: method, path: rest2, headers: "", body: "", req_id: req_id)
-      else
-        let path = substring(s: rest2, start: 0, len: sep3)
-        let rest3_start = sep3 + 1
-        let rest3_len = length(s: rest2) - rest3_start
-        let rest3 = substring(s: rest2, start: rest3_start, len: rest3_len)
-
-        let sep4 = index_of(s: rest3, sub: "\n")
-        if sep4 < 0 then
-          return Request(method: method, path: path, headers: rest3, body: "", req_id: req_id)
-        else
-          let headers = substring(s: rest3, start: 0, len: sep4)
-          let body_start = sep4 + 1
-          let body_len = length(s: rest3) - body_start
-          let body = substring(s: rest3, start: body_start, len: body_len)
-          return Request(method: method, path: path, headers: headers, body: body, req_id: req_id)
-        end
-      end
-    end
+    let p2 = split_at_newline(s: p1.rest)
+    let method = p2.head
+    let p3 = split_at_newline(s: p2.rest)
+    let path = p3.head
+    let p4 = split_at_newline(s: p3.rest)
+    let headers = p4.head
+    let body = p4.rest
+    return Request(method: method, path: path, headers: headers, body: body, req_id: req_id)
   end
 end
 
-/// Extracts the status code from a Response.
+/// Extract the status code from a Response.
 pub let response_status = fn (res: Response) -> i64 do
   match res do
-    case Response(status: status, body: _) -> return status
+    case Response(status: status, headers: _, body: _) -> return status
   end
 end
 
-/// Extracts the body string from a Response.
+/// Extract the headers string from a Response.
+pub let response_headers = fn (res: Response) -> string do
+  match res do
+    case Response(status: _, headers: headers, body: _) -> return headers
+  end
+end
+
+/// Extract the body from a Response.
 pub let response_body = fn (res: Response) -> string do
   match res do
-    case Response(status: _, body: body) -> return body
+    case Response(status: _, headers: _, body: body) -> return body
   end
 end
 
-/// Returns the method from a request (borrowed).
+/// Extract the method from a Request (borrowed).
 pub let request_method = fn (req: &Request) -> string do
   match req do case Request(method: m, path: _, headers: _, body: _, req_id: _) -> return m end
 end
 
-/// Returns the path from a request (borrowed).
+/// Extract the path from a Request (borrowed).
 pub let request_path = fn (req: &Request) -> string do
   match req do case Request(method: _, path: p, headers: _, body: _, req_id: _) -> return p end
 end
 
-/// Returns the body from a request (borrowed).
+/// Extract the body from a Request (borrowed).
 pub let request_body = fn (req: &Request) -> string do
   match req do case Request(method: _, path: _, headers: _, body: b, req_id: _) -> return b end
 end
 
-// --- Port definition ---
+/// HTTP GET request. Returns the response body. Raises on failure.
+pub let get = fn (url: string) -> string require { PermNet } effect { Exn } do
+  let raw = __nx_http_request(method: "GET", url: url, headers: "", body: "")
+  let res = decode_response(raw: raw)
+  let status = response_status(res: res)
+  if status == 0 then
+    raise RuntimeError(val: "net.get: request failed: " ++ url)
+  else
+    return response_body(res: res)
+  end
+end
+
+/// HTTP POST request. Returns the response body. Raises on failure.
+pub let post = fn (url: string, body: string) -> string require { PermNet } effect { Exn } do
+  let raw = __nx_http_request(method: "POST", url: url, headers: "", body: body)
+  let res = decode_response(raw: raw)
+  let status = response_status(res: res)
+  if status == 0 then
+    raise RuntimeError(val: "net.post: request failed: " ++ url)
+  else
+    return response_body(res: res)
+  end
+end
+
+/// HTTP request with custom method and raw header string. Raises on failure.
+pub let request_raw = fn (method: string, url: string, headers: string, body: string) -> Response require { PermNet } effect { Exn } do
+  let raw = __nx_http_request(method: method, url: url, headers: headers, body: body)
+  let res = decode_response(raw: raw)
+  let status = response_status(res: res)
+  if status == 0 then
+    raise RuntimeError(val: "net.request_raw: request failed: " ++ url)
+  else
+    return res
+  end
+end
+
+/// HTTP request with typed headers. Raises on failure.
+pub let request = fn (method: string, url: string, headers: [ Header ], body: string) -> Response require { PermNet } effect { Exn } do
+  let encoded = encode_headers(headers: headers)
+  return request_raw(method: method, url: url, headers: encoded, body: body)
+end
+
+/// Start listening on the given address. Returns a linear server handle. Raises on failure.
+pub let listen = fn (addr: string) -> %Server require { PermNet } effect { Exn } do
+  let id = __nx_http_listen(addr: addr)
+  if id < 0 then
+    raise RuntimeError(val: "net.listen: failed to bind: " ++ addr)
+  else
+    let s = Server(id: id)
+    let %ls = s
+    return %ls
+  end
+end
+
+/// Accept an incoming request from a server (borrows server handle).
+pub let accept = fn (server: &Server) -> Request require { PermNet } do
+  match server do case Server(id: id) ->
+    let raw = __nx_http_accept(server_id: id)
+    return decode_request(raw: raw)
+  end
+end
+
+/// Respond to an incoming request. Raises on failure.
+pub let respond = fn (req: Request, status: i64, body: string) -> unit require { PermNet } effect { Exn } do
+  match req do case Request(method: _, path: _, headers: _, body: _, req_id: rid) ->
+    let ok = __nx_http_respond(req_id: rid, status: status, headers: "", body: body)
+    if ok then
+      return ()
+    else
+      raise RuntimeError(val: "net.respond: failed to send response")
+    end
+  end
+end
+
+/// Respond to an incoming request with custom headers. Raises on failure.
+pub let respond_with_headers = fn (req: Request, status: i64, headers: [ Header ], body: string) -> unit require { PermNet } effect { Exn } do
+  match req do case Request(method: _, path: _, headers: _, body: _, req_id: rid) ->
+    let encoded = encode_headers(headers: headers)
+    let ok = __nx_http_respond(req_id: rid, status: status, headers: encoded, body: body)
+    if ok then
+      return ()
+    else
+      raise RuntimeError(val: "net.respond_with_headers: failed to send response")
+    end
+  end
+end
+
+/// Stop a server (consumes the linear handle).
+pub let stop = fn (server: %Server) -> unit require { PermNet } do
+  match server do case Server(id: id) ->
+    let _ = __nx_http_stop(server_id: id)
+    return ()
+  end
+end
 
 pub port Net do
   fn get(url: string) -> string effect { Exn }
-  fn request(method: string, url: string, headers: List<Header>) -> string effect { Exn }
-  fn request_with_body(method: string, url: string, headers: List<Header>, body: string) -> string effect { Exn }
-  fn request_response(method: string, url: string, headers: List<Header>, body: string) -> Response effect { Exn }
+  fn request(method: string, url: string, headers: [ Header ], body: string) -> Response effect { Exn }
   fn listen(addr: string) -> %Server effect { Exn }
   fn accept(server: &Server) -> Request
   fn respond(req: Request, status: i64, body: string) -> unit effect { Exn }
-  fn respond_with_headers(req: Request, status: i64, headers: List<Header>, body: string) -> unit effect { Exn }
+  fn respond_with_headers(req: Request, status: i64, headers: [ Header ], body: string) -> unit effect { Exn }
   fn stop(server: %Server) -> unit
 end
 
-/// Default Net handler — real network access via WASM FFI.
+/// Default Net handler — delegates to direct-call API.
 pub let system_handler = handler Net require { PermNet } do
   fn get(url: string) -> string effect { Exn } do
-    let raw = __nx_http_request(method: "GET", url: url, headers: "", body: "")
-    let res = decode_response(raw: raw)
-    let status = response_status(res: res)
-    if status == 0 then
-      raise RuntimeError(val: "net.get: request failed: " ++ url)
-    else
-      return response_body(res: res)
-    end
+    return get(url: url)
   end
-
-  fn request(method: string, url: string, headers: List<Header>) -> string effect { Exn } do
-    let encoded = encode_headers(headers: headers)
-    let raw = __nx_http_request(method: method, url: url, headers: encoded, body: "")
-    let res = decode_response(raw: raw)
-    let status = response_status(res: res)
-    if status == 0 then
-      raise RuntimeError(val: "net.request: request failed: " ++ url)
-    else
-      return response_body(res: res)
-    end
+  fn request(method: string, url: string, headers: [ Header ], body: string) -> Response effect { Exn } do
+    return request(method: method, url: url, headers: headers, body: body)
   end
-
-  fn request_with_body(method: string, url: string, headers: List<Header>, body: string) -> string effect { Exn } do
-    let encoded = encode_headers(headers: headers)
-    let raw = __nx_http_request(method: method, url: url, headers: encoded, body: body)
-    let res = decode_response(raw: raw)
-    let status = response_status(res: res)
-    if status == 0 then
-      raise RuntimeError(val: "net.request_with_body: request failed: " ++ url)
-    else
-      return response_body(res: res)
-    end
-  end
-
-  fn request_response(method: string, url: string, headers: List<Header>, body: string) -> Response effect { Exn } do
-    let encoded = encode_headers(headers: headers)
-    let raw = __nx_http_request(method: method, url: url, headers: encoded, body: body)
-    let res = decode_response(raw: raw)
-    let status = response_status(res: res)
-    if status == 0 then
-      raise RuntimeError(val: "net.request_response: request failed: " ++ url)
-    else
-      return res
-    end
-  end
-
   fn listen(addr: string) -> %Server effect { Exn } do
-    let id = __nx_http_listen(addr: addr)
-    if id < 0 then
-      raise RuntimeError(val: "net.listen: failed to bind: " ++ addr)
-    else
-      let s = Server(id: id)
-      let %ls = s
-      return %ls
-    end
+    return listen(addr: addr)
   end
-
   fn accept(server: &Server) -> Request do
-    match server do case Server(id: id) ->
-      let raw = __nx_http_accept(server_id: id)
-      return decode_request(raw: raw)
-    end
+    return accept(server: server)
   end
-
   fn respond(req: Request, status: i64, body: string) -> unit effect { Exn } do
-    match req do case Request(method: _, path: _, headers: _, body: _, req_id: rid) ->
-      let ok = __nx_http_respond(req_id: rid, status: status, headers: "", body: body)
-      if ok then
-        return ()
-      else
-        raise RuntimeError(val: "net.respond: failed to send response")
-      end
-    end
+    return respond(req: req, status: status, body: body)
   end
-
-  fn respond_with_headers(req: Request, status: i64, headers: List<Header>, body: string) -> unit effect { Exn } do
-    match req do case Request(method: _, path: _, headers: _, body: _, req_id: rid) ->
-      let encoded = encode_headers(headers: headers)
-      let ok = __nx_http_respond(req_id: rid, status: status, headers: encoded, body: body)
-      if ok then
-        return ()
-      else
-        raise RuntimeError(val: "net.respond_with_headers: failed to send response")
-      end
-    end
+  fn respond_with_headers(req: Request, status: i64, headers: [ Header ], body: string) -> unit effect { Exn } do
+    return respond_with_headers(req: req, status: status, headers: headers, body: body)
   end
-
   fn stop(server: %Server) -> unit do
-    match server do case Server(id: id) ->
-      let _ = __nx_http_stop(server_id: id)
-      return ()
-    end
+    return stop(server: server)
   end
 end

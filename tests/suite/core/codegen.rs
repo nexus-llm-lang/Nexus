@@ -322,7 +322,7 @@ fn codegen_fixture_network_access_compiles() {
 #[test]
 fn codegen_print_works_via_external_stdio_module() {
     let src = r#"
-import external nxlib/stdlib/stdlib.wasm
+import external stdlib/stdlib.wasm
 external __nx_print = "__nx_print" : (val: string) -> unit
 
 let main = fn () -> unit do
@@ -337,7 +337,7 @@ end
 #[test]
 fn codegen_print_after_from_i64_works_via_single_string_abi_module() {
     let src = r#"
-import external nxlib/stdlib/stdlib.wasm
+import external stdlib/stdlib.wasm
 external __nx_print = "__nx_print" : (val: string) -> unit
 
 let main = fn () -> unit do
@@ -390,6 +390,149 @@ fn codegen_fixture_module_test_compiles() {
     let src = fs::read_to_string("examples/module_test.nx").expect("fixture should exist");
     let wasm = compile_src(&src).expect("module_test fixture should compile");
     run_main_unit_with_wasi(&wasm).expect("wasm main should run");
+}
+
+#[test]
+fn codegen_conc_exports_tasks_and_imports_runtime() {
+    let src = r#"
+let main = fn () -> unit do
+    let x = 1
+    conc do
+        task t1 do
+            let a = x + 1
+            return ()
+        end
+        task t2 do
+            let b = x + 2
+            return ()
+        end
+    end
+    return ()
+end
+"#;
+    let wasm = compile_src(src).expect("conc block should compile");
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut has_spawn_import = false;
+    let mut has_join_import = false;
+    let mut exports = std::collections::HashSet::new();
+
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        match payload.unwrap() {
+            wasmparser::Payload::ImportSection(reader) => {
+                for import in reader.into_iter().flatten() {
+                    match import.name {
+                        "__nx_conc_spawn" => has_spawn_import = true,
+                        "__nx_conc_join" => has_join_import = true,
+                        _ => {}
+                    }
+                }
+            }
+            wasmparser::Payload::ExportSection(reader) => {
+                for export in reader.into_iter().flatten() {
+                    exports.insert(export.name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(has_spawn_import, "should import __nx_conc_spawn");
+    assert!(has_join_import, "should import __nx_conc_join");
+    assert!(exports.contains("__conc_t1"), "should export __conc_t1");
+    assert!(exports.contains("__conc_t2"), "should export __conc_t2");
+}
+
+#[test]
+fn codegen_conc_block_compiles_task_functions() {
+    let src = r#"
+let main = fn () -> unit do
+    let x = 1
+    conc do
+        task t1 do
+            let a = x + 1
+            return ()
+        end
+        task t2 do
+            let b = x + 2
+            return ()
+        end
+    end
+    return ()
+end
+"#;
+    let wasm = compile_src(src).expect("conc block should compile to WASM");
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    // Count internal functions via wasmparser: main + 2 tasks + wasi_cli_run wrapper = 4
+    let mut func_count = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(_) = payload.unwrap() {
+            func_count += 1;
+        }
+    }
+    assert_eq!(
+        func_count, 4,
+        "expected 4 code entries (main + 2 tasks + wasi:cli/run wrapper), got {}",
+        func_count
+    );
+}
+
+#[test]
+fn codegen_conc_block_executes_tasks_in_parallel() {
+    let src = r#"
+let main = fn () -> unit do
+    let x = 1
+    conc do
+        task t1 do
+            let a = x + 1
+            return ()
+        end
+        task t2 do
+            let b = x + 2
+            return ()
+        end
+    end
+    return ()
+end
+"#;
+    let wasm = compile_src(src).expect("conc block should compile");
+    run_wasi_cli_run(&wasm).expect("conc block should execute via wasi:cli/run");
+}
+
+#[test]
+fn codegen_conc_fs_writes_in_parallel() {
+    let src = r#"
+import as fs from stdlib/fs.nx
+
+let main = fn () -> unit require { PermFs } do
+    conc do
+        task write_a do
+            fs.write_string(path: "nexus_conc_test_a.txt", content: "hello")
+            return ()
+        end
+        task write_b do
+            fs.write_string(path: "nexus_conc_test_b.txt", content: "world")
+            return ()
+        end
+    end
+    return ()
+end
+"#;
+    let wasm = compile_src(src).expect("conc block should compile");
+    run_main_unit_with_wasi(&wasm).expect("conc fs should execute");
+
+    // Verify files were actually written by conc tasks
+    let a = fs::read_to_string("nexus_conc_test_a.txt").expect("file a should exist");
+    let b = fs::read_to_string("nexus_conc_test_b.txt").expect("file b should exist");
+    assert_eq!(a, "hello");
+    assert_eq!(b, "world");
+    let _ = fs::remove_file("nexus_conc_test_a.txt");
+    let _ = fs::remove_file("nexus_conc_test_b.txt");
 }
 
 #[test]
@@ -459,4 +602,76 @@ end
     assert!(!metrics.mir_lower.is_zero());
     assert!(!metrics.lir_lower.is_zero());
     assert!(!metrics.codegen.is_zero());
+}
+
+/// Regression: bundle_core_wasm must resolve stdlib memory import via wasm-merge.
+/// (nexus-rx0: --skip-export-conflicts caused memory import to remain unresolved)
+#[test]
+fn bundle_core_wasm_resolves_stdlib_imports() {
+    let src = r#"
+import { Console }, * as stdio from stdlib/stdio.nx
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    Console.println(val: "hello")
+  end
+  return ()
+end
+"#;
+    let wasm = compile_src(src).expect("compile stdlib program");
+    let config = nexus::compiler::bundler::BundleConfig::default();
+    let merged = nexus::compiler::bundler::bundle_core_wasm(&wasm, &config)
+        .expect("bundle_core_wasm should resolve stdlib imports");
+    let merged_imports =
+        nexus::compiler::bundler::module_import_names(&merged).expect("parse merged imports");
+    assert!(
+        !merged_imports.iter().any(|m| m.contains("stdlib")),
+        "stdlib imports should be resolved after bundling, got: {:?}",
+        merged_imports
+    );
+}
+
+/// Regression: conc programs with stdlib imports must also bundle successfully.
+/// nexus:runtime/conc is host-provided and must be skipped by the bundler.
+#[test]
+fn bundle_core_wasm_resolves_conc_plus_stdlib() {
+    let src = r#"
+import { Console }, * as stdio from stdlib/stdio.nx
+
+let work = fn () -> i64 do
+  return 42
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    conc do
+      task t1 do
+        let _ = work()
+      end
+    end
+    Console.println(val: "done")
+  end
+  return ()
+end
+"#;
+    let wasm = compile_src(src).expect("compile conc+stdlib program");
+    let imports = nexus::compiler::bundler::module_import_names(&wasm).expect("parse imports");
+    assert!(imports.contains("nexus:runtime/conc"));
+    assert!(imports.contains("nxlib/stdlib/stdlib.wasm"));
+
+    let config = nexus::compiler::bundler::BundleConfig::default();
+    let merged = nexus::compiler::bundler::bundle_core_wasm(&wasm, &config)
+        .expect("bundle_core_wasm should succeed for conc+stdlib programs");
+    let merged_imports =
+        nexus::compiler::bundler::module_import_names(&merged).expect("parse merged imports");
+    assert!(
+        !merged_imports.iter().any(|m| m.contains("stdlib")),
+        "stdlib should be resolved, got: {:?}",
+        merged_imports
+    );
+    assert!(
+        merged_imports.contains("nexus:runtime/conc"),
+        "nexus:runtime/conc should remain (host-provided), got: {:?}",
+        merged_imports
+    );
 }

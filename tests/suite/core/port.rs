@@ -77,7 +77,11 @@ fn test_handler_require_mock_needs_nothing() {
       fn append_string(path: string, content: string) -> unit effect { Exn } do return () end
       fn remove_file(path: string) -> unit effect { Exn } do return () end
       fn create_dir_all(path: string) -> unit effect { Exn } do return () end
-      fn read_dir(path: string) -> List<Handle> effect { Exn } do return Nil() end
+      fn read_dir(path: string) -> %[ Handle ] effect { Exn } do
+        let empty = Nil()
+        let %result = empty
+        return %result
+      end
       fn open_read(path: string) -> %Handle effect { Exn } do
         let h = Handle(id: 0)
         let %lh = h
@@ -100,14 +104,14 @@ fn test_handler_require_mock_needs_nothing() {
           return { content: "", handle: %lh }
         end
       end
-      fn fd_write(handle: %Handle, content: string) -> { ok: bool, handle: %Handle } do
+      fn write(handle: %Handle, content: string) -> { ok: bool, handle: %Handle } do
         match handle do case Handle(id: id) ->
           let h = Handle(id: id)
           let %lh = h
           return { ok: true, handle: %lh }
         end
       end
-      fn fd_path(handle: %Handle) -> { path: string, handle: %Handle } do
+      fn handle_path(handle: %Handle) -> { path: string, handle: %Handle } do
         match handle do case Handle(id: id) ->
           let h = Handle(id: id)
           let %lh = h

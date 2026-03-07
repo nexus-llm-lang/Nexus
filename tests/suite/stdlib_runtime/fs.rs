@@ -134,7 +134,7 @@ end
 }
 
 #[test]
-fn fs_read_dir_skips_subdirectories() {
+fn fs_read_dir_includes_subdirectories() {
     let dir_guard = TempDirGuard::new("readdir_subdir");
     let dir = dir_guard.path();
     let file = format!("{}/a.txt", dir);
@@ -153,10 +153,17 @@ let main = fn () -> bool require {{ PermFs }} do
       match entries do
         case Cons(v: h1, rest: rest1) ->
           match rest1 do
+            case Cons(v: h2, rest: rest2) ->
+              match rest2 do
+                case Nil() ->
+                  Fs.close(handle: h1)
+                  Fs.close(handle: h2)
+                  return true
+                case Cons(v: _, rest: _) -> return false
+              end
             case Nil() ->
               Fs.close(handle: h1)
-              return true
-            case Cons(v: _, rest: _) -> return false
+              return false
           end
         case Nil() -> return false
       end
@@ -403,7 +410,7 @@ let main = fn () -> bool require {{ PermFs }} do
     try
       Fs.create_dir_all(path: "{dir}")
       let %h = Fs.open_write(path: "{file}")
-      let %wr = Fs.fd_write(handle: %h, content: "hello controller")
+      let %wr = Fs.write(handle: %h, content: "hello controller")
       match %wr do case {{ ok: ok, handle: %h2 }} ->
         Fs.close(handle: %h2)
         if ok then
@@ -443,7 +450,7 @@ let main = fn () -> bool require {{ PermFs }} do
       Fs.create_dir_all(path: "{dir}")
       Fs.write_string(path: "{file}", content: "x")
       let %h = Fs.open_read(path: "{file}")
-      let %pr = Fs.fd_path(handle: %h)
+      let %pr = Fs.handle_path(handle: %h)
       match %pr do case {{ path: p, handle: %h2 }} ->
         Fs.close(handle: %h2)
         return contains(s: p, sub: "x.txt")
@@ -486,7 +493,11 @@ let mock_fs = handler Fs do
   fn append_string(path: string, content: string) -> unit effect {{ Exn }} do return () end
   fn remove_file(path: string) -> unit effect {{ Exn }} do return () end
   fn create_dir_all(path: string) -> unit effect {{ Exn }} do return () end
-  fn read_dir(path: string) -> List<Handle> effect {{ Exn }} do return Nil() end
+  fn read_dir(path: string) -> %[ Handle ] effect {{ Exn }} do
+    let empty = Nil()
+    let %result = empty
+    return %result
+  end
   fn open_read(path: string) -> %Handle effect {{ Exn }} do
     let h = Handle(id: 0)
     let %lh = h
@@ -509,14 +520,14 @@ let mock_fs = handler Fs do
       return {{ content: "mock content", handle: %lh }}
     end
   end
-  fn fd_write(handle: %Handle, content: string) -> {{ ok: bool, handle: %Handle }} do
+  fn write(handle: %Handle, content: string) -> {{ ok: bool, handle: %Handle }} do
     match handle do case Handle(id: id) ->
       let h = Handle(id: id)
       let %lh = h
       return {{ ok: true, handle: %lh }}
     end
   end
-  fn fd_path(handle: %Handle) -> {{ path: string, handle: %Handle }} do
+  fn handle_path(handle: %Handle) -> {{ path: string, handle: %Handle }} do
     match handle do case Handle(id: id) ->
       let h = Handle(id: id)
       let %lh = h
@@ -615,6 +626,104 @@ let main = fn () -> bool require {{ PermFs }} do
         case InvalidIndex(val: _) -> return false
       end
     end
+  end
+end
+"#
+    );
+    assert_eq!(run(&src).unwrap(), Value::Bool(true));
+}
+
+#[test]
+fn fs_list_dir_returns_names() {
+    let dir_guard = TempDirGuard::new("list_dir");
+    let dir = dir_guard.path();
+    let file_a = format!("{}/a.txt", dir);
+    let file_b = format!("{}/b.txt", dir);
+    let sub = format!("{}/sub", dir);
+    let src = format!(
+        r#"
+import as fs from stdlib/fs.nx
+import {{ length, contains }} from stdlib/string.nx
+
+let count = fn (xs: List<string>, acc: i64) -> i64 do
+  match xs do
+    case Nil() -> return acc
+    case Cons(v: _, rest: rest) -> return count(xs: rest, acc: acc + 1)
+  end
+end
+
+let main = fn () -> bool require {{ PermFs }} do
+  try
+    fs.create_dir_all(path: "{dir}")
+    fs.write_string(path: "{file_a}", content: "a")
+    fs.write_string(path: "{file_b}", content: "b")
+    fs.create_dir_all(path: "{sub}")
+    let entries = fs.list_dir(path: "{dir}")
+    return count(xs: entries, acc: 0) == 3
+  catch e ->
+    return false
+  end
+end
+"#
+    );
+    assert_eq!(run(&src).unwrap(), Value::Bool(true));
+}
+
+#[test]
+fn fs_direct_call_open_read_and_close() {
+    let dir_guard = TempDirGuard::new("direct_open_read");
+    let dir = dir_guard.path();
+    let file = format!("{}/x.txt", dir);
+    let src = format!(
+        r#"
+import as fs from stdlib/fs.nx
+import {{ length }} from stdlib/string.nx
+
+let main = fn () -> bool require {{ PermFs }} do
+  try
+    fs.create_dir_all(path: "{dir}")
+    fs.write_string(path: "{file}", content: "hello")
+    let %h = fs.open_read(path: "{file}")
+    let %r = fs.read(handle: %h)
+    match %r do case {{ content: content, handle: %h2 }} ->
+      fs.close(handle: %h2)
+      return length(s: content) == 5
+    end
+  catch e ->
+    return false
+  end
+end
+"#
+    );
+    assert_eq!(run(&src).unwrap(), Value::Bool(true));
+}
+
+#[test]
+fn fs_direct_call_open_write_and_close() {
+    let dir_guard = TempDirGuard::new("direct_open_write");
+    let dir = dir_guard.path();
+    let file = format!("{}/y.txt", dir);
+    let src = format!(
+        r#"
+import as fs from stdlib/fs.nx
+import {{ length, contains }} from stdlib/string.nx
+
+let main = fn () -> bool require {{ PermFs }} do
+  try
+    fs.create_dir_all(path: "{dir}")
+    let %h = fs.open_write(path: "{file}")
+    let %r = fs.write(handle: %h, content: "world")
+    match %r do case {{ ok: ok, handle: %h2 }} ->
+      fs.close(handle: %h2)
+      let content = fs.read_to_string(path: "{file}")
+      if length(s: content) == 5 then
+        return contains(s: content, sub: "world")
+      else
+        return false
+      end
+    end
+  catch e ->
+    return false
   end
 end
 "#

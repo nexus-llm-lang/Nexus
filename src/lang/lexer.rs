@@ -336,6 +336,7 @@ impl Lexer {
     }
 
     fn lex_number(&mut self, first: char) -> TokenKind {
+        let start = self.pos - 1; // first char already consumed
         let mut s = String::new();
         s.push(first);
         while let Some(c) = self.peek() {
@@ -358,9 +359,27 @@ impl Lexer {
                     break;
                 }
             }
-            TokenKind::Float(s.parse::<f64>().unwrap())
+            match s.parse::<f64>() {
+                Ok(v) => TokenKind::Float(v),
+                Err(_) => {
+                    self.errors.push(LexError {
+                        message: format!("invalid float literal '{}'", s),
+                        span: start..self.pos,
+                    });
+                    TokenKind::Float(0.0)
+                }
+            }
         } else {
-            TokenKind::Int(s.parse::<i64>().unwrap())
+            match s.parse::<i64>() {
+                Ok(v) => TokenKind::Int(v),
+                Err(_) => {
+                    self.errors.push(LexError {
+                        message: format!("integer literal '{}' overflows i64", s),
+                        span: start..self.pos,
+                    });
+                    TokenKind::Int(0)
+                }
+            }
         }
     }
 

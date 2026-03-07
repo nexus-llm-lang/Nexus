@@ -106,6 +106,11 @@ fn file_backed_imports(
         if is_preview2_wasi_module(module_name) {
             continue;
         }
+        // Skip host-provided nexus runtime modules (e.g. "nexus:runtime/conc").
+        // NEXUS_HOST_HTTP_MODULE is handled above with its own conditional logic.
+        if module_name.starts_with("nexus:") {
+            continue;
+        }
         let path = Path::new(module_name);
         if !path.exists() {
             return Err(format!(
@@ -184,7 +189,7 @@ fn merge_dependencies_once(
         .arg("--all-features")
         .arg("-o")
         .arg(&merged_path)
-        .arg("--skip-export-conflicts");
+        .arg("--rename-export-conflicts");
 
     let output = command.output().map_err(|e| {
         format!(
@@ -234,6 +239,20 @@ mod tests {
             err.contains(NEXUS_HOST_HTTP_MODULE),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn file_backed_imports_skips_nexus_runtime_modules() {
+        let mut imports = BTreeSet::new();
+        imports.insert(WASI_SNAPSHOT_MODULE.to_string());
+        imports.insert("nexus:runtime/conc".to_string());
+
+        let result = file_backed_imports(&imports, true).expect("should succeed");
+        assert!(
+            result.is_empty(),
+            "nexus:runtime/conc should be skipped, got: {:?}",
+            result
         );
     }
 }

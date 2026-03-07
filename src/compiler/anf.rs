@@ -62,6 +62,15 @@ pub enum AnfStmt {
         catch_body: Vec<AnfStmt>,
         catch_ret: Option<AnfAtom>,
     },
+    Conc {
+        tasks: Vec<ConcTaskCall>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConcTaskCall {
+    pub func_name: String,
+    pub args: Vec<(String, AnfAtom)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

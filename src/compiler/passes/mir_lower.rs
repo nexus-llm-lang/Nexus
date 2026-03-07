@@ -1,13 +1,9 @@
 //! HIR → MIR lowering (static port call resolution)
 //!
 //! Key transformations:
-//! 1. Build evidence table from ports and handlers (for future funcref table use)
+//! 1. Build port method layouts from HIR ports
 //! 2. Resolve all port method calls to direct calls to handler functions
 //! 3. Inject statements → inline body (inject is compile-time scope, no runtime effect)
-//! 4. No evidence params — all port calls resolved statically at compile time
-//!
-//! Future: when dynamic dispatch is needed, evidence params and CallIndirect
-//! can be re-enabled. For now, whole-program resolution suffices.
 
 use crate::ir::hir::*;
 use crate::ir::mir::*;
@@ -51,11 +47,10 @@ pub fn lower_hir_to_mir(hir: &HirProgram) -> Result<MirProgram, MirLowerError> {
 struct MirLowerer<'a> {
     hir: &'a HirProgram,
     port_layout: PortLayout,
-    evidence_table: EvidenceTable,
     functions: Vec<MirFunction>,
     externals: Vec<MirExternal>,
-    /// handler_binding_name → (port_name, base_index in evidence table)
-    handler_base_indices: HashMap<String, (String, usize)>,
+    /// handler_binding_name → port_name
+    handler_port_names: HashMap<String, String>,
     /// port_name → handler_binding_name (global resolution for functions with require clauses)
     global_port_handlers: HashMap<String, String>,
 }
@@ -67,10 +62,9 @@ impl<'a> MirLowerer<'a> {
             port_layout: PortLayout {
                 methods: HashMap::new(),
             },
-            evidence_table: EvidenceTable::new(),
             functions: Vec::new(),
             externals: Vec::new(),
-            handler_base_indices: HashMap::new(),
+            handler_port_names: HashMap::new(),
             global_port_handlers: HashMap::new(),
         }
     }
@@ -79,8 +73,8 @@ impl<'a> MirLowerer<'a> {
         // Step 1: Build port method layouts
         self.build_port_layouts();
 
-        // Step 2: Build evidence table from handler bindings
-        self.build_evidence_table()?;
+        // Step 2: Map handler bindings to port names
+        self.build_handler_port_names();
 
         // Step 3: Build global port→handler mapping (last handler wins for each port)
         self.build_global_port_handlers();
@@ -94,7 +88,6 @@ impl<'a> MirLowerer<'a> {
         Ok(MirProgram {
             functions: self.functions.clone(),
             externals: self.externals.clone(),
-            evidence_table: self.evidence_table.clone(),
         })
     }
 
@@ -106,34 +99,18 @@ impl<'a> MirLowerer<'a> {
         }
     }
 
-    /// Step 2: For each handler binding, register its method implementations
-    /// in the evidence table and record the base index
-    fn build_evidence_table(&mut self) -> Result<(), MirLowerError> {
+    /// Step 2: For each handler binding, record its port name
+    fn build_handler_port_names(&mut self) {
         for (binding_name, binding) in &self.hir.handler_bindings {
-            let port_name = &binding.port_name;
-            let port_methods = self
-                .port_layout
-                .methods
-                .get(port_name)
-                .cloned()
-                .unwrap_or_default();
-
-            let base_index = self.evidence_table.entries.len();
-
-            for _method_name in &port_methods {
-                self.evidence_table.entries.push(EvidenceEntry);
-            }
-
-            self.handler_base_indices
-                .insert(binding_name.clone(), (port_name.clone(), base_index));
+            self.handler_port_names
+                .insert(binding_name.clone(), binding.port_name.clone());
         }
-        Ok(())
     }
 
     /// Step 3: Build global port→handler mapping. For each port, the last registered
     /// handler binding is used as the default for functions with require clauses.
     fn build_global_port_handlers(&mut self) {
-        for (binding_name, (port_name, _)) in &self.handler_base_indices {
+        for (binding_name, port_name) in &self.handler_port_names {
             self.global_port_handlers
                 .insert(port_name.clone(), binding_name.clone());
         }
@@ -209,7 +186,6 @@ impl<'a> MirLowerer<'a> {
         func: &HirFunction,
         scope: &HandlerScope,
     ) -> Result<MirFunction, MirLowerError> {
-        // No evidence params — all port calls resolved statically
         let params: Vec<MirParam> = func
             .params
             .iter()
@@ -225,7 +201,6 @@ impl<'a> MirLowerer<'a> {
         Ok(MirFunction {
             name: func.name.clone(),
             params,
-            evidence_params: vec![], // no evidence params in static resolution mode
             ret_type: func.ret_type.clone(),
             body,
         })
@@ -287,7 +262,7 @@ impl<'a> MirLowerer<'a> {
                 // Inject activates handlers: create new scope with handler bindings
                 let mut new_scope = scope.clone();
                 for handler_name in handlers {
-                    if let Some((port_name, _)) = self.handler_base_indices.get(handler_name) {
+                    if let Some(port_name) = self.handler_port_names.get(handler_name) {
                         new_scope
                             .active
                             .insert(port_name.clone(), handler_name.clone());
@@ -318,7 +293,6 @@ impl<'a> MirLowerer<'a> {
                     }
                 }
 
-                // Regular function call — no evidence args in static resolution mode
                 let mir_args: Vec<(String, MirExpr)> = args
                     .iter()
                     .map(|(label, expr)| Ok((label.clone(), self.lower_expr(expr, scope)?)))
@@ -329,7 +303,7 @@ impl<'a> MirLowerer<'a> {
                 Ok(MirExpr::Call {
                     func: func.clone(),
                     args: mir_args,
-                    evidence_args: vec![],
+
                     ret_type,
                 })
             }
@@ -441,7 +415,6 @@ impl<'a> MirLowerer<'a> {
         Ok(MirExpr::Call {
             func: func_name,
             args: mir_args,
-            evidence_args: vec![],
             ret_type,
         })
     }

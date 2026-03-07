@@ -56,6 +56,7 @@ struct HirBuilder {
     externals: Vec<HirExternal>,
     handler_bindings: HashMap<String, HirHandlerBinding>,
     import_stack: Vec<String>,
+    enum_defs: Vec<EnumDef>,
 }
 
 impl HirBuilder {
@@ -66,6 +67,7 @@ impl HirBuilder {
             externals: Vec::new(),
             handler_bindings: HashMap::new(),
             import_stack: Vec::new(),
+            enum_defs: Vec::new(),
         }
     }
 
@@ -124,6 +126,7 @@ impl HirBuilder {
             functions,
             externals,
             handler_bindings,
+            enum_defs: self.enum_defs.clone(),
         })
     }
 
@@ -181,15 +184,22 @@ impl HirBuilder {
     }
 
     fn load_stdlib(&mut self) -> Result<(), HirBuildError> {
+        // Seed with builtin enum defs (List, Exn)
+        use crate::lang::typecheck::{exn_enum_def, list_enum_def};
+        self.enum_defs.push(list_enum_def());
+        self.enum_defs.push(exn_enum_def());
+
         if let Ok(stdlib_programs) = load_stdlib_nx_programs() {
             for (_, stdlib_program) in stdlib_programs {
                 let mut current_wasm_module: Option<String> = None;
                 for def in &stdlib_program.definitions {
                     match &def.node {
                         TopLevel::Import(import) if import.is_external => {
-                            current_wasm_module = Some(import.path.clone());
+                            current_wasm_module = Some(resolve_import_path(&import.path));
                         }
-                        TopLevel::Enum(_) => {}
+                        TopLevel::Enum(ed) => {
+                            self.enum_defs.push(ed.clone());
+                        }
                         TopLevel::Exception(_) => {}
                         TopLevel::Let(gl) if gl.is_public => {
                             if let Expr::External(wasm_name, _type_params, typ) = &gl.value.node {
@@ -242,7 +252,9 @@ impl HirBuilder {
                     self.process_import(import)?;
                 }
                 TopLevel::TypeDef(_) => {}
-                TopLevel::Enum(_) => {}
+                TopLevel::Enum(ed) => {
+                    self.enum_defs.push(ed.clone());
+                }
                 TopLevel::Exception(_) => {}
                 TopLevel::Port(port) => {
                     self.ports.push(HirPort {

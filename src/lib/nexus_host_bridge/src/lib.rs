@@ -149,7 +149,7 @@ fn perform_request(
     url: &str,
     headers: &str,
     body: &str,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, String, String), String> {
     validate_bridge_limits(url, headers, body)?;
     let (scheme, authority, path) = parse_url(url)?;
     let header_fields = parse_http_headers(headers, &authority);
@@ -188,6 +188,14 @@ fn perform_request(
     };
     let status = incoming.status();
 
+    let mut response_headers = String::new();
+    for (name, value) in &incoming.headers().entries() {
+        response_headers.push_str(name);
+        response_headers.push(':');
+        response_headers.push_str(&String::from_utf8_lossy(value));
+        response_headers.push('\n');
+    }
+
     let mut response_body = String::new();
     if let Ok(in_body) = incoming.consume() {
         if let Ok(stream) = in_body.stream() {
@@ -213,7 +221,7 @@ fn perform_request(
         let _ = bindings::wasi::http::types::IncomingBody::finish(in_body);
     }
 
-    Ok((status, response_body))
+    Ok((status, response_headers, response_body))
 }
 
 // ---------------------------------------------------------------------------
@@ -476,8 +484,11 @@ struct Guest;
 impl bindings::exports::nexus::cli::nexus_host::Guest for Guest {
     fn host_http_request(method: String, url: String, headers: String, body: String) -> String {
         match perform_request(&method, &url, &headers, &body) {
-            Ok((status, response_body)) => format!("{}\n{}", status, response_body),
-            Err(err) => format!("0\nhttp request failed: {}", err),
+            Ok((status, response_headers, response_body)) => {
+                let hlen = response_headers.len();
+                format!("{}\n{}\n{}{}", status, hlen, response_headers, response_body)
+            }
+            Err(err) => format!("0\n0\nhttp request failed: {}", err),
         }
     }
 

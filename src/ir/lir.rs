@@ -1,5 +1,4 @@
 //! Low-level IR — ANF form, WASM-ready.
-//! Adapted from the original `src/compiler/anf.rs` with additions for evidence-passing.
 
 use crate::lang::ast::{BinaryOp, Type};
 
@@ -23,8 +22,6 @@ pub struct LirExternal {
 pub struct LirFunction {
     pub name: String,
     pub params: Vec<LirParam>,
-    /// Evidence params (i32 base indices into funcref table)
-    pub evidence_params: Vec<LirParam>,
     pub ret_type: Type,
     pub requires: Type,
     pub effects: Type,
@@ -67,6 +64,15 @@ pub enum LirStmt {
         catch_body: Vec<LirStmt>,
         catch_ret: Option<LirAtom>,
     },
+    Conc {
+        tasks: Vec<ConcTaskRef>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConcTaskRef {
+    pub func_name: String,
+    pub args: Vec<(String, LirAtom)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

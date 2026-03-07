@@ -7,7 +7,7 @@ fn build_lir(src: &str) -> nexus::ir::lir::LirProgram {
     let program = parser::parser().parse(src).unwrap();
     let hir = build_hir(&program).unwrap();
     let mir = lower_hir_to_mir(&hir).unwrap();
-    lower_mir_to_lir(&mir).unwrap()
+    lower_mir_to_lir(&mir, &hir.enum_defs).unwrap()
 }
 
 #[test]

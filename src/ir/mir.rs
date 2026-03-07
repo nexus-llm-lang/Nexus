@@ -1,5 +1,5 @@
-//! Mid-level IR — effects eliminated via evidence-passing.
-//! No inject/handler/port.method() — replaced with evidence params and indirect calls.
+//! Mid-level IR — effects eliminated via static port resolution.
+//! No inject/handler/port.method() — all port calls resolved to direct function calls.
 
 use crate::lang::ast::{BinaryOp, Literal, Sigil, Type};
 
@@ -7,23 +7,6 @@ use crate::lang::ast::{BinaryOp, Literal, Sigil, Type};
 pub struct MirProgram {
     pub functions: Vec<MirFunction>,
     pub externals: Vec<MirExternal>,
-    pub evidence_table: EvidenceTable,
-}
-
-#[derive(Debug, Clone)]
-pub struct EvidenceTable {
-    pub entries: Vec<EvidenceEntry>,
-}
-
-#[derive(Debug, Clone)]
-pub struct EvidenceEntry;
-
-impl EvidenceTable {
-    pub fn new() -> Self {
-        EvidenceTable {
-            entries: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -40,8 +23,6 @@ pub struct MirExternal {
 pub struct MirFunction {
     pub name: String,
     pub params: Vec<MirParam>,
-    /// Evidence params: one i32 per required port (base index into funcref table)
-    pub evidence_params: Vec<MirEvidenceParam>,
     pub ret_type: Type,
     pub body: Vec<MirStmt>,
 }
@@ -51,11 +32,6 @@ pub struct MirParam {
     pub label: String,
     pub name: String,
     pub typ: Type,
-}
-
-#[derive(Debug, Clone)]
-pub struct MirEvidenceParam {
-    pub param_name: String, // e.g. "__ev_Logger"
 }
 
 #[derive(Debug, Clone)]
@@ -87,8 +63,6 @@ pub enum MirExpr {
     Call {
         func: String,
         args: Vec<(String, MirExpr)>,
-        /// Evidence arguments to thread through
-        evidence_args: Vec<MirExpr>,
         ret_type: Type,
     },
     Constructor {
