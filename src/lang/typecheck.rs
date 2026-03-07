@@ -224,6 +224,9 @@ pub struct TypeChecker {
     pub visited_paths: HashSet<String>,
     pub import_cache: HashMap<String, TypeEnv>,
     pub warnings: Vec<TypeWarning>,
+    /// Persistent copy of type definitions for use in `unify`,
+    /// which runs while `self.env` is temporarily taken.
+    type_defs: HashMap<String, TypeDef>,
 }
 
 fn get_default_alias(path: &str) -> String {
@@ -718,6 +721,7 @@ impl TypeChecker {
         env.linear_vars.clear();
         TypeChecker {
             supply: 0,
+            type_defs: env.types.clone(),
             env,
             visited_paths: HashSet::new(),
             import_cache: HashMap::new(),
@@ -765,6 +769,7 @@ impl TypeChecker {
                                         }
                                         if let Some(td) = public_env.types.get(item) {
                                             self.env.types.insert(item.clone(), td.clone());
+                                            self.type_defs.insert(item.clone(), td.clone());
                                             imported_any = true;
                                         }
                                         if let Some(ed) = public_env.enums.get(item) {
@@ -902,6 +907,7 @@ impl TypeChecker {
 
                                 if let Some(td) = public_env.types.get(item) {
                                     self.env.types.insert(item.clone(), td.clone());
+                                    self.type_defs.insert(item.clone(), td.clone());
                                     imported_any = true;
                                 }
 
@@ -955,6 +961,8 @@ impl TypeChecker {
                 }
                 TopLevel::TypeDef(td) => {
                     let td_norm = normalize_typedef_generic_params(td);
+                    self.type_defs
+                        .insert(td_norm.name.clone(), td_norm.clone());
                     self.env.types.insert(td_norm.name.clone(), td_norm);
                 }
                 TopLevel::Enum(ed) => {
@@ -3262,6 +3270,30 @@ impl TypeChecker {
             | (Type::Borrow(t1), Type::Borrow(t2)) => self.unify(t1, t2),
             (Type::Handler(a, req_a), Type::Handler(b, req_b)) if a == b => {
                 self.unify(req_a, req_b)
+            }
+            // Expand named record (TypeDef) to Record for structural unification
+            (Type::UserDefined(name, args), Type::Record(_))
+            | (Type::Record(_), Type::UserDefined(name, args)) => {
+                if let Some(td) = self.type_defs.get(name).cloned() {
+                    let mut su = HashMap::new();
+                    for (param, arg) in td.type_params.iter().zip(args) {
+                        su.insert(param.clone(), arg.clone());
+                    }
+                    let expanded = Type::Record(
+                        td.fields
+                            .iter()
+                            .map(|(n, t)| (n.clone(), apply_subst_type(&su, t)))
+                            .collect(),
+                    );
+                    // Unify both sides against the expanded record form
+                    let other = match t1 {
+                        Type::Record(_) => t1,
+                        _ => t2,
+                    };
+                    self.unify(other, &expanded)
+                } else {
+                    Err(format!("Mismatch: {} vs {}", t1, t2))
+                }
             }
             // Borrow can be read as its underlying value type.
             (Type::Borrow(t1), t2) => self.unify(t1, t2),

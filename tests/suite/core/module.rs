@@ -247,15 +247,9 @@ fn all_examples_parse() {
 
 #[test]
 fn all_examples_typecheck() {
-    // TODO: user_registry.nx fails because the typechecker
-    // does not resolve module imports inside conc task blocks.
-    let skip = ["user_registry.nx"];
     for entry in fs::read_dir("examples").unwrap() {
         let path = entry.unwrap().path();
         if path.extension().map_or(false, |e| e == "nx") {
-            if skip.iter().any(|s| path.ends_with(s)) {
-                continue;
-            }
             let src = fs::read_to_string(&path).unwrap();
             let program = parser::parser()
                 .parse(&src)
