@@ -1,7 +1,10 @@
 use crate::constants::*;
+use crate::runtime::conc;
+use crate::runtime::net_host;
 use crate::runtime::ExecutionCapabilities;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use wasmtime::{
     component::{Component, Linker as ComponentLinker, ResourceTable},
     Engine, Linker, Module, Store,
@@ -139,10 +142,25 @@ fn run_core_wasm_bytes(
         }
     };
 
+    let has_conc = conc::needs_conc_runtime(wasm);
+
     let mut linker = Linker::<wasmtime_wasi::p1::WasiP1Ctx>::new(&engine);
     if let Err(e) = wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx) {
         eprintln!("Failed to add WASI to linker: {}", e);
         return ExitCode::from(1);
+    }
+    if has_conc {
+        if let Err(e) = conc::add_conc_to_linker(&mut linker) {
+            eprintln!("Failed to add conc runtime to linker: {}", e);
+            return ExitCode::from(1);
+        }
+    }
+    let has_net_host = net_host::needs_net_host(wasm);
+    if has_net_host {
+        if let Err(e) = net_host::add_net_host_to_linker(&mut linker) {
+            eprintln!("Failed to add net host to linker: {}", e);
+            return ExitCode::from(1);
+        }
     }
     let mut builder = WasiCtxBuilder::new();
     if let Err(msg) = capabilities.apply_to_wasi_builder(&mut builder) {
@@ -157,19 +175,14 @@ fn run_core_wasm_bytes(
         .collect::<Vec<_>>();
     imported_modules.sort();
     imported_modules.dedup();
+
+    let mut conc_deps = Vec::new();
     for module_name in imported_modules {
-        if module_name == WASI_SNAPSHOT_MODULE {
+        if module_name == WASI_SNAPSHOT_MODULE || module_name == conc::CONC_HOST_MODULE {
             continue;
         }
         if module_name == NEXUS_HOST_HTTP_MODULE {
-            eprintln!(
-                "Runtime Error: import '{}' is deprecated in core-wasm mode",
-                NEXUS_HOST_HTTP_MODULE
-            );
-            eprintln!(
-                "Hint: build as component (`nexus build`) and run with `wasmtime run` to use WASI HTTP."
-            );
-            return ExitCode::from(1);
+            continue; // handled by net_host linker
         }
         if is_preview2_wasi_module(&module_name) {
             eprintln!(
@@ -211,6 +224,19 @@ fn run_core_wasm_bytes(
             eprintln!("Failed to link dependency module '{}': {}", module_name, e);
             return ExitCode::from(1);
         }
+        if has_conc {
+            conc_deps.push((module_name.clone(), Arc::new(dep)));
+        }
+    }
+
+    if has_conc {
+        conc::setup_conc_runtime(
+            engine.clone(),
+            Arc::new(module.clone()),
+            wasm,
+            conc_deps,
+            capabilities.clone(),
+        );
     }
 
     let instance = match linker.instantiate(&mut store, &module) {

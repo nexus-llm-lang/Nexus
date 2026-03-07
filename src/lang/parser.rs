@@ -608,39 +608,73 @@ impl Parser {
     }
 
     fn parse_binary_expr(&mut self) -> Result<Spanned<Expr>, ParseError> {
+        self.parse_prec_expr(0)
+    }
+
+    fn token_to_binop(tok: &TokenKind) -> Option<BinaryOp> {
+        match tok {
+            TokenKind::OrOr => Some(BinaryOp::Or),
+            TokenKind::AndAnd => Some(BinaryOp::And),
+            TokenKind::EqEq => Some(BinaryOp::Eq),
+            TokenKind::Ne => Some(BinaryOp::Ne),
+            TokenKind::Le => Some(BinaryOp::Le),
+            TokenKind::Ge => Some(BinaryOp::Ge),
+            TokenKind::Lt => Some(BinaryOp::Lt),
+            TokenKind::Gt => Some(BinaryOp::Gt),
+            TokenKind::EqDot => Some(BinaryOp::FEq),
+            TokenKind::NeDot => Some(BinaryOp::FNe),
+            TokenKind::LeDot => Some(BinaryOp::FLe),
+            TokenKind::GeDot => Some(BinaryOp::FGe),
+            TokenKind::LtDot => Some(BinaryOp::FLt),
+            TokenKind::GtDot => Some(BinaryOp::FGt),
+            TokenKind::Plus => Some(BinaryOp::Add),
+            TokenKind::Minus => Some(BinaryOp::Sub),
+            TokenKind::PlusPlus => Some(BinaryOp::Concat),
+            TokenKind::PlusDot => Some(BinaryOp::FAdd),
+            TokenKind::MinusDot => Some(BinaryOp::FSub),
+            TokenKind::Star => Some(BinaryOp::Mul),
+            TokenKind::Slash => Some(BinaryOp::Div),
+            TokenKind::Percent => Some(BinaryOp::Mod),
+            TokenKind::StarDot => Some(BinaryOp::FMul),
+            TokenKind::SlashDot => Some(BinaryOp::FDiv),
+            TokenKind::Ident(s) if s == "band" => Some(BinaryOp::BitAnd),
+            TokenKind::Ident(s) if s == "bor" => Some(BinaryOp::BitOr),
+            TokenKind::Ident(s) if s == "bxor" => Some(BinaryOp::BitXor),
+            TokenKind::Ident(s) if s == "bshl" => Some(BinaryOp::Shl),
+            TokenKind::Ident(s) if s == "bshr" => Some(BinaryOp::Shr),
+            _ => None,
+        }
+    }
+
+    fn binop_precedence(op: &BinaryOp) -> u8 {
+        match op {
+            BinaryOp::Or => 1,
+            BinaryOp::And => 2,
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le
+            | BinaryOp::Gt | BinaryOp::Ge
+            | BinaryOp::FEq | BinaryOp::FNe | BinaryOp::FLt | BinaryOp::FLe
+            | BinaryOp::FGt | BinaryOp::FGe => 3,
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Concat
+            | BinaryOp::FAdd | BinaryOp::FSub
+            | BinaryOp::BitOr | BinaryOp::BitXor => 4,
+            BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod
+            | BinaryOp::FMul | BinaryOp::FDiv
+            | BinaryOp::BitAnd => 5,
+            BinaryOp::Shl | BinaryOp::Shr => 6,
+        }
+    }
+
+    fn parse_prec_expr(&mut self, min_prec: u8) -> Result<Spanned<Expr>, ParseError> {
         let mut lhs = self.parse_postfix_expr()?;
 
         loop {
-            let op = match self.peek() {
-                // Float operators (must check before int)
-                TokenKind::EqDot => BinaryOp::FEq,
-                TokenKind::NeDot => BinaryOp::FNe,
-                TokenKind::LeDot => BinaryOp::FLe,
-                TokenKind::GeDot => BinaryOp::FGe,
-                TokenKind::LtDot => BinaryOp::FLt,
-                TokenKind::GtDot => BinaryOp::FGt,
-                TokenKind::PlusDot => BinaryOp::FAdd,
-                TokenKind::MinusDot => BinaryOp::FSub,
-                TokenKind::StarDot => BinaryOp::FMul,
-                TokenKind::SlashDot => BinaryOp::FDiv,
-                // Int operators
-                TokenKind::EqEq => BinaryOp::Eq,
-                TokenKind::Ne => BinaryOp::Ne,
-                TokenKind::Le => BinaryOp::Le,
-                TokenKind::Ge => BinaryOp::Ge,
-                TokenKind::Lt => BinaryOp::Lt,
-                TokenKind::Gt => BinaryOp::Gt,
-                TokenKind::PlusPlus => BinaryOp::Concat,
-                TokenKind::Plus => BinaryOp::Add,
-                TokenKind::Minus => BinaryOp::Sub,
-                TokenKind::Star => BinaryOp::Mul,
-                TokenKind::Slash => BinaryOp::Div,
-                TokenKind::AndAnd => BinaryOp::And,
-                TokenKind::OrOr => BinaryOp::Or,
+            let op = match Self::token_to_binop(&self.peek()) {
+                Some(op) if Self::binop_precedence(&op) >= min_prec => op,
                 _ => break,
             };
+            let prec = Self::binop_precedence(&op);
             self.advance();
-            let rhs = self.parse_postfix_expr()?;
+            let rhs = self.parse_prec_expr(prec + 1)?;
             let span = lhs.span.start..rhs.span.end;
             lhs = Spanned {
                 node: Expr::BinaryOp(Box::new(lhs), op, Box::new(rhs)),

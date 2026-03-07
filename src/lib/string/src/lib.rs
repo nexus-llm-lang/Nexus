@@ -201,3 +201,38 @@ pub extern "C" fn __nx_string_is_valid_i64(s_ptr: i32, s_len: i32) -> i32 {
     let s = read_string(s_ptr, s_len);
     if s.trim().parse::<i64>().is_ok() { 1 } else { 0 }
 }
+
+#[no_mangle]
+pub extern "C" fn __nx_string_char_code(s_ptr: i32, s_len: i32, idx: i64) -> i64 {
+    if idx < 0 {
+        return -1;
+    }
+    let s = read_string(s_ptr, s_len);
+    match s.chars().nth(idx as usize) {
+        Some(c) => c as i64,
+        None => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_string_from_char_code(code: i64) -> i64 {
+    match char::from_u32(code as u32) {
+        Some(c) => nexus_wasm_alloc::store_string_result(c.to_string()),
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_string_to_f64(s_ptr: i32, s_len: i32) -> f64 {
+    let s = read_string(s_ptr, s_len);
+    s.trim().parse::<f64>().unwrap_or(f64::NAN)
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_string_is_valid_f64(s_ptr: i32, s_len: i32) -> i32 {
+    let s = read_string(s_ptr, s_len);
+    match s.trim().parse::<f64>() {
+        Ok(v) if !v.is_nan() || s.trim() == "NaN" => 1,
+        _ => 0,
+    }
+}

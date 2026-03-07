@@ -27,7 +27,6 @@ const MAX_FFI_STRING_BYTES: usize = 4 * 1024 * 1024;
 
 struct ServerEntry {
     listener: TcpListener,
-    _addr: String,
 }
 
 struct ConnectionEntry {
@@ -158,7 +157,7 @@ fn perform_wasi_http_request(
     url: &str,
     headers: &str,
     body: &str,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, String, String), String> {
     let method = if method.trim().is_empty() {
         "GET"
     } else {
@@ -217,6 +216,13 @@ fn perform_wasi_http_request(
         .run()
         .map_err(|e| format!("{:?}", e))?;
     let status = response.status().as_u16();
+    let mut response_headers = String::new();
+    for (name, value) in response.headers().iter() {
+        response_headers.push_str(name.as_str());
+        response_headers.push(':');
+        response_headers.push_str(value.to_str().unwrap_or(""));
+        response_headers.push('\n');
+    }
     let response_body = response
         .body_mut()
         .read_to_string()
@@ -227,11 +233,11 @@ fn perform_wasi_http_request(
             MAX_HTTP_RESPONSE_BYTES
         ));
     }
-    Ok((status, response_body))
+    Ok((status, response_headers, response_body))
 }
 
 fn encode_http_bridge_error(message: impl AsRef<str>) -> String {
-    format!("0\n{}", message.as_ref())
+    format!("0\n0\n{}", message.as_ref())
 }
 
 fn run_nexus_host_http_request(
@@ -245,7 +251,13 @@ fn run_nexus_host_http_request(
         return encode_http_bridge_error(err);
     }
     match perform_wasi_http_request(method, url, headers, body) {
-        Ok((status, response_body)) => format!("{}\n{}", status, response_body),
+        Ok((status, response_headers, response_body)) => {
+            let hlen = response_headers.len();
+            format!(
+                "{}\n{}\n{}{}",
+                status, hlen, response_headers, response_body
+            )
+        }
         Err(err) => encode_http_bridge_error(format!("http request failed: {}", err)),
     }
 }
@@ -273,7 +285,13 @@ fn read_guest_string_from_memory(
     memory.read(caller, ptr as usize, &mut bytes).ok()?;
     match String::from_utf8(bytes) {
         Ok(s) => Some(s),
-        Err(e) => Some(String::from_utf8_lossy(&e.into_bytes()).into_owned()),
+        Err(e) => {
+            eprintln!(
+                "warning: invalid UTF-8 from WASM at ptr={}, len={}",
+                ptr, len
+            );
+            Some(String::from_utf8_lossy(&e.into_bytes()).into_owned())
+        }
     }
 }
 
@@ -481,10 +499,7 @@ fn add_nexus_host_to_linker(
                         Ok(l) => l,
                         Err(_) => return -1,
                     };
-                    let entry = ServerEntry {
-                        listener,
-                        _addr: addr,
-                    };
+                    let entry = ServerEntry { listener };
                     let mut table = match st.lock() {
                         Ok(t) => t,
                         Err(_) => return -1,
@@ -985,6 +1000,7 @@ impl Interpreter {
                         }
 
                         if !import.items.is_empty() {
+                            // Import the requested items explicitly.
                             for item in &import.items {
                                 if let Some(f) = sub_interp.functions.get(item) {
                                     functions.insert(item.clone(), f.clone());
@@ -994,6 +1010,18 @@ impl Interpreter {
                                 }
                                 if let Some(v) = sub_interp.top_level_values.get(item) {
                                     top_level_values.insert(item.clone(), v.clone());
+                                }
+                            }
+                            // Also bring in non-pub helper functions that the
+                            // imported items may call internally (e.g. split → split_go).
+                            for (name, f) in &sub_interp.functions {
+                                if !functions.contains_key(name) {
+                                    functions.insert(name.clone(), f.clone());
+                                }
+                            }
+                            for (name, f) in &sub_interp.external_functions {
+                                if !external_functions.contains_key(name) {
+                                    external_functions.insert(name.clone(), f.clone());
                                 }
                             }
                         }
@@ -1021,7 +1049,10 @@ impl Interpreter {
             native_functions.insert(
                 "backtrace".to_string(),
                 Arc::new(move |_args: &[Value]| {
-                    let stack = bt_ref.lock().unwrap().clone();
+                    let stack = match bt_ref.lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(poisoned) => poisoned.into_inner().clone(),
+                    };
                     let mut list = Value::Variant("Nil".to_string(), vec![]);
                     for frame in stack.into_iter().rev() {
                         list = Value::Variant("Cons".to_string(), vec![Value::String(frame), list]);
@@ -1628,7 +1659,10 @@ impl Interpreter {
                         }
                         Ok(ExprResult::Normal(_)) => {}
                         Err(EvalError::Exception(exn, bt)) => {
-                            *self.last_backtrace.lock().unwrap() = bt;
+                            match self.last_backtrace.lock() {
+                                Ok(mut guard) => *guard = bt,
+                                Err(poisoned) => *poisoned.into_inner() = bt,
+                            }
                             let mut catch_env = Env::extend(env.clone());
                             catch_env.define(catch_param.clone(), exn);
                             let catch_res = self.eval_body(catch_body, &mut catch_env)?;
@@ -1805,6 +1839,28 @@ impl Interpreter {
                                 } else {
                                     Ok(ExprResult::Normal(Value::Int(a / b)))
                                 }
+                            }
+                            (Value::Int(a), BinaryOp::Mod, Value::Int(b)) => {
+                                if b == 0 {
+                                    Err(runtime_error("modulo by zero"))
+                                } else {
+                                    Ok(ExprResult::Normal(Value::Int(a % b)))
+                                }
+                            }
+                            (Value::Int(a), BinaryOp::BitAnd, Value::Int(b)) => {
+                                Ok(ExprResult::Normal(Value::Int(a & b)))
+                            }
+                            (Value::Int(a), BinaryOp::BitOr, Value::Int(b)) => {
+                                Ok(ExprResult::Normal(Value::Int(a | b)))
+                            }
+                            (Value::Int(a), BinaryOp::BitXor, Value::Int(b)) => {
+                                Ok(ExprResult::Normal(Value::Int(a ^ b)))
+                            }
+                            (Value::Int(a), BinaryOp::Shl, Value::Int(b)) => {
+                                Ok(ExprResult::Normal(Value::Int(a << b)))
+                            }
+                            (Value::Int(a), BinaryOp::Shr, Value::Int(b)) => {
+                                Ok(ExprResult::Normal(Value::Int(a >> b)))
                             }
                             (Value::Int(a), BinaryOp::Eq, Value::Int(b)) => {
                                 Ok(ExprResult::Normal(Value::Bool(a == b)))
@@ -2356,7 +2412,7 @@ end
         };
         let raw = run_nexus_host_http_request(&capabilities, "GET", &url, "", "");
         assert!(
-            raw.starts_with("0\nhttp request failed: url exceeds"),
+            raw.starts_with("0\n0\nhttp request failed: url exceeds"),
             "unexpected bridge response: {}",
             raw
         );
@@ -2370,7 +2426,7 @@ end
         };
         let raw = run_nexus_host_http_request(&capabilities, "GET", "", "", "");
         assert!(
-            raw.starts_with("0\nNetwork access denied"),
+            raw.starts_with("0\n0\nNetwork access denied"),
             "unexpected bridge response: {}",
             raw
         );

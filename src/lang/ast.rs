@@ -179,11 +179,18 @@ pub struct MatchCase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
-    // Integer arithmetic: + - * /
+    // Integer arithmetic: + - * / %
     Add,
     Sub,
     Mul,
     Div,
+    Mod,
+    // Bitwise: band bor bxor bshl bshr
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
     // Float arithmetic: +. -. *. /.
     FAdd,
     FSub,
@@ -217,6 +224,12 @@ impl std::fmt::Display for BinaryOp {
             BinaryOp::Sub => "-",
             BinaryOp::Mul => "*",
             BinaryOp::Div => "/",
+            BinaryOp::Mod => "%",
+            BinaryOp::BitAnd => "band",
+            BinaryOp::BitOr => "bor",
+            BinaryOp::BitXor => "bxor",
+            BinaryOp::Shl => "bshl",
+            BinaryOp::Shr => "bshr",
             BinaryOp::FAdd => "+.",
             BinaryOp::FSub => "-.",
             BinaryOp::FMul => "*.",

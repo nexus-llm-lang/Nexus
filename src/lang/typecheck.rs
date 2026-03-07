@@ -820,6 +820,7 @@ impl TypeChecker {
 
                         let mut sub_checker = TypeChecker::new();
                         sub_checker.visited_paths = self.visited_paths.clone();
+                        sub_checker.import_cache = self.import_cache.clone();
                         sub_checker.check_program(&p)?;
 
                         let mut public_env = TypeEnv::new();
@@ -1942,7 +1943,8 @@ impl TypeChecker {
                 let (s2, t2) = self.infer(env, r, er, eq, ee)?;
                 let mut s = compose_subst(&s1, &s2);
                 match op {
-                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod
+                    | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr => {
                         let lt = apply_subst_type(&s, &t1);
                         let rt = apply_subst_type(&s, &t2);
                         let target = select_int_type(&lt, &rt).ok_or_else(|| TypeError {

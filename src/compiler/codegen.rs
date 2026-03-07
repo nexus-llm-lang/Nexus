@@ -12,16 +12,19 @@ use crate::constants::{
     Permission, ENTRYPOINT, MEMORY_EXPORT, NEXUS_CAPABILITIES_SECTION, WASI_CLI_RUN_EXPORT,
 };
 use crate::ir::lir::{LirAtom, LirExpr, LirFunction, LirProgram, LirStmt};
-use crate::ir::mir::EvidenceTable;
 use crate::lang::ast::{BinaryOp, Program, Type};
 
-use super::anf::{AnfAtom, AnfExpr, AnfExternal, AnfFunction, AnfProgram, AnfStmt};
+use super::anf::{AnfAtom, AnfExpr, AnfExternal, AnfFunction, AnfProgram, AnfStmt, ConcTaskCall};
 use super::passes::hir_build::{build_hir, HirBuildError};
 use super::passes::lir_lower::{lower_mir_to_lir, LirLowerError};
 use super::passes::mir_lower::{lower_hir_to_mir, MirLowerError};
 
 const STRING_DATA_BASE: u32 = 16;
 const OBJECT_HEAP_GLOBAL_INDEX: u32 = 0;
+const CONC_MODULE: &str = "nexus:runtime/conc";
+const CONC_SPAWN_NAME: &str = "__nx_conc_spawn";
+const CONC_JOIN_NAME: &str = "__nx_conc_join";
+const CONC_TASK_PREFIX: &str = "__conc_";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodegenError {
@@ -271,6 +274,8 @@ struct CodegenLayout {
     data_segments: Vec<DataSegment>,
     object_heap_enabled: bool,
     heap_base: u32,
+    conc_spawn_idx: Option<u32>,
+    conc_join_idx: Option<u32>,
 }
 
 /// Per-pass timing metrics from the compilation pipeline.
@@ -313,11 +318,11 @@ pub fn compile_program_to_wasm_with_metrics(
     let mir_lower = t.elapsed();
 
     let t = Instant::now();
-    let lir = lower_mir_to_lir(&mir).map_err(CompileError::LirLower)?;
+    let lir = lower_mir_to_lir(&mir, &hir.enum_defs).map_err(CompileError::LirLower)?;
     let lir_lower = t.elapsed();
 
     let t = Instant::now();
-    let mut wasm = compile_lir_to_wasm(&lir, &mir.evidence_table).map_err(CompileError::Codegen)?;
+    let mut wasm = compile_lir_to_wasm(&lir).map_err(CompileError::Codegen)?;
     let codegen = t.elapsed();
 
     if !caps.is_empty() {
@@ -341,12 +346,16 @@ pub fn compile_program_to_wasm(program: &Program) -> Result<Vec<u8>, CompileErro
 
 /// Compiles typed ANF directly into core wasm bytes.
 pub fn compile_typed_anf_to_wasm(program: &AnfProgram) -> Result<Vec<u8>, CodegenError> {
+    let has_conc = program
+        .functions
+        .iter()
+        .any(|f| f.name.starts_with(CONC_TASK_PREFIX));
+    let n_conc_imports: u32 = if has_conc { 2 } else { 0 };
+    let import_count = program.externals.len() as u32 + n_conc_imports;
+
     let mut internal_function_indices = HashMap::new();
     for (idx, func) in program.functions.iter().enumerate() {
-        internal_function_indices.insert(
-            func.name.clone(),
-            program.externals.len() as u32 + idx as u32,
-        );
+        internal_function_indices.insert(func.name.clone(), import_count + idx as u32);
     }
     let main_idx = internal_function_indices
         .get(ENTRYPOINT)
@@ -362,8 +371,20 @@ pub fn compile_typed_anf_to_wasm(program: &AnfProgram) -> Result<Vec<u8>, Codege
     for (idx, ext) in program.externals.iter().enumerate() {
         external_function_indices.insert(ext.name.clone(), idx as u32);
     }
+    if has_conc {
+        external_function_indices
+            .insert(CONC_SPAWN_NAME.to_string(), program.externals.len() as u32);
+        external_function_indices.insert(
+            CONC_JOIN_NAME.to_string(),
+            program.externals.len() as u32 + 1,
+        );
+    }
 
-    let layout = build_codegen_layout(program)?;
+    let mut layout = build_codegen_layout(program)?;
+    if has_conc {
+        layout.conc_spawn_idx = Some(program.externals.len() as u32);
+        layout.conc_join_idx = Some(program.externals.len() as u32 + 1);
+    }
 
     let mut module = Module::new();
 
@@ -376,6 +397,21 @@ pub fn compile_typed_anf_to_wasm(program: &AnfProgram) -> Result<Vec<u8>, Codege
         let results = external_return_types(ext)?;
         types.ty().function(params, results);
         external_type_indices.push(next_type_index);
+        next_type_index += 1;
+    }
+
+    let mut conc_spawn_type_idx = 0;
+    let mut conc_join_type_idx = 0;
+    if has_conc {
+        // __nx_conc_spawn(func_idx: i32, args_ptr: i32, n_args: i32) -> ()
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32, ValType::I32], []);
+        conc_spawn_type_idx = next_type_index;
+        next_type_index += 1;
+        // __nx_conc_join() -> ()
+        types.ty().function([], []);
+        conc_join_type_idx = next_type_index;
         next_type_index += 1;
     }
 
@@ -416,6 +452,19 @@ pub fn compile_typed_anf_to_wasm(program: &AnfProgram) -> Result<Vec<u8>, Codege
             &ext.wasm_module,
             &ext.wasm_name,
             EntityType::Function(*type_idx),
+        );
+        has_imports = true;
+    }
+    if has_conc {
+        imports.import(
+            CONC_MODULE,
+            CONC_SPAWN_NAME,
+            EntityType::Function(conc_spawn_type_idx),
+        );
+        imports.import(
+            CONC_MODULE,
+            CONC_JOIN_NAME,
+            EntityType::Function(conc_join_type_idx),
         );
         has_imports = true;
     }
@@ -460,10 +509,16 @@ pub fn compile_typed_anf_to_wasm(program: &AnfProgram) -> Result<Vec<u8>, Codege
 
     let mut exports = ExportSection::new();
     exports.export(ENTRYPOINT, ExportKind::Func, main_idx);
-    let wasi_cli_run_func_idx = program.externals.len() as u32 + program.functions.len() as u32;
+    let wasi_cli_run_func_idx = import_count + program.functions.len() as u32;
     exports.export(WASI_CLI_RUN_EXPORT, ExportKind::Func, wasi_cli_run_func_idx);
-    if matches!(layout.memory_mode, MemoryMode::Defined) {
+    if !matches!(layout.memory_mode, MemoryMode::None) {
         exports.export(MEMORY_EXPORT, ExportKind::Memory, 0);
+    }
+    for func in &program.functions {
+        if func.name.starts_with(CONC_TASK_PREFIX) {
+            let idx = internal_function_indices[&func.name];
+            exports.export(&func.name, ExportKind::Func, idx);
+        }
     }
     module.section(&exports);
 
@@ -746,6 +801,7 @@ fn collect_stmt_locals(
                 collect_stmt_locals(then_body, local_map, next_local_index, local_decls_flat)?;
                 collect_stmt_locals(else_body, local_map, next_local_index, local_decls_flat)?;
             }
+            AnfStmt::Conc { .. } => {}
         }
     }
     Ok(())
@@ -967,6 +1023,70 @@ fn compile_stmt(
             out.instruction(&Instruction::End);
             Ok(())
         }
+        AnfStmt::Conc { tasks } => {
+            let spawn_idx = layout
+                .conc_spawn_idx
+                .expect("conc_spawn_idx must be set for conc blocks");
+            let join_idx = layout
+                .conc_join_idx
+                .expect("conc_join_idx must be set for conc blocks");
+
+            for task in tasks {
+                let func_idx = internal_indices
+                    .get(&task.func_name)
+                    .copied()
+                    .ok_or_else(|| CodegenError::CallTargetNotFound {
+                        name: task.func_name.clone(),
+                    })?;
+                let n_args = task.args.len() as i32;
+
+                // Allocate space for args on the object heap
+                let args_ptr_local = temps.object_ptr_i32;
+                out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+                out.instruction(&Instruction::LocalSet(args_ptr_local));
+
+                // Write each captured arg as i64 to the heap
+                for (i, (_, arg)) in task.args.iter().enumerate() {
+                    out.instruction(&Instruction::LocalGet(args_ptr_local));
+                    compile_atom(arg, out, local_map, layout)?;
+                    // Widen to i64 if needed
+                    match arg.typ() {
+                        Type::I32 | Type::Bool => {
+                            out.instruction(&Instruction::I64ExtendI32U);
+                        }
+                        Type::F64 => {
+                            out.instruction(&Instruction::I64ReinterpretF64);
+                        }
+                        Type::F32 => {
+                            out.instruction(&Instruction::F64PromoteF32);
+                            out.instruction(&Instruction::I64ReinterpretF64);
+                        }
+                        _ => {} // i64, string (packed i64), objects (i64 ptr)
+                    }
+                    out.instruction(&Instruction::I64Store(MemArg {
+                        offset: (i * 8) as u64,
+                        align: 3, // 8-byte alignment
+                        memory_index: 0,
+                    }));
+                }
+
+                // Advance heap pointer
+                out.instruction(&Instruction::LocalGet(args_ptr_local));
+                out.instruction(&Instruction::I32Const(n_args * 8));
+                out.instruction(&Instruction::I32Add);
+                out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+
+                // Call __nx_conc_spawn(func_idx, args_ptr, n_args)
+                out.instruction(&Instruction::I32Const(func_idx as i32));
+                out.instruction(&Instruction::LocalGet(args_ptr_local));
+                out.instruction(&Instruction::I32Const(n_args));
+                out.instruction(&Instruction::Call(spawn_idx));
+            }
+
+            // Call __nx_conc_join()
+            out.instruction(&Instruction::Call(join_idx));
+            Ok(())
+        }
     }
 }
 
@@ -995,9 +1115,7 @@ fn compile_expr(
             emit_numeric_coercion(&rhs.typ(), &operand_type, out)?;
             compile_binary(*op, &operand_type, out)
         }
-        AnfExpr::Call {
-            func, args, typ, ..
-        } => {
+        AnfExpr::Call { func, args, .. } => {
             if let Some(callee_idx) = internal_indices.get(func).copied() {
                 let callee = program
                     .functions
@@ -1025,9 +1143,6 @@ fn compile_expr(
                     emit_numeric_coercion(&atom.typ(), &param.typ, out)?;
                 }
                 out.instruction(&Instruction::Call(callee_idx));
-                if matches!(typ, Type::Unit) {
-                    return Ok(());
-                }
                 return Ok(());
             }
 
@@ -1058,9 +1173,6 @@ fn compile_expr(
                 }
 
                 out.instruction(&Instruction::Call(callee_idx));
-                if matches!(typ, Type::Unit) {
-                    return Ok(());
-                }
                 return Ok(());
             }
 
@@ -1538,7 +1650,9 @@ fn build_codegen_layout(program: &AnfProgram) -> Result<CodegenLayout, CodegenEr
             offset: next_offset,
             bytes,
         });
-        next_offset = next_offset.saturating_add(len);
+        next_offset = next_offset
+            .checked_add(len)
+            .ok_or(CodegenError::StringLiteralsWithoutMemory)?;
     }
 
     if matches!(memory_mode, MemoryMode::None) && !data_segments.is_empty() {
@@ -1553,6 +1667,8 @@ fn build_codegen_layout(program: &AnfProgram) -> Result<CodegenLayout, CodegenEr
         data_segments,
         object_heap_enabled,
         heap_base,
+        conc_spawn_idx: None,
+        conc_join_idx: None,
     })
 }
 
@@ -1624,6 +1740,7 @@ fn stmt_uses_object_heap(stmt: &AnfStmt) -> bool {
         AnfStmt::TryCatch {
             body, catch_body, ..
         } => body.iter().any(stmt_uses_object_heap) || catch_body.iter().any(stmt_uses_object_heap),
+        AnfStmt::Conc { tasks } => !tasks.is_empty(),
     }
 }
 
@@ -1701,6 +1818,13 @@ fn collect_strings_in_stmt(stmt: &AnfStmt, out: &mut Vec<String>) {
             }
             if let Some(ret) = catch_ret {
                 collect_strings_in_atom(ret, out);
+            }
+        }
+        AnfStmt::Conc { tasks } => {
+            for task in tasks {
+                for (_, atom) in &task.args {
+                    collect_strings_in_atom(atom, out);
+                }
             }
         }
     }
@@ -1807,6 +1931,24 @@ fn compile_binary(
             BinaryOp::Div => {
                 out.instruction(&Instruction::I64DivS);
             }
+            BinaryOp::Mod => {
+                out.instruction(&Instruction::I64RemS);
+            }
+            BinaryOp::BitAnd => {
+                out.instruction(&Instruction::I64And);
+            }
+            BinaryOp::BitOr => {
+                out.instruction(&Instruction::I64Or);
+            }
+            BinaryOp::BitXor => {
+                out.instruction(&Instruction::I64Xor);
+            }
+            BinaryOp::Shl => {
+                out.instruction(&Instruction::I64Shl);
+            }
+            BinaryOp::Shr => {
+                out.instruction(&Instruction::I64ShrS);
+            }
             BinaryOp::Eq => {
                 out.instruction(&Instruction::I64Eq);
             }
@@ -1844,6 +1986,24 @@ fn compile_binary(
             }
             BinaryOp::Div => {
                 out.instruction(&Instruction::I32DivS);
+            }
+            BinaryOp::Mod => {
+                out.instruction(&Instruction::I32RemS);
+            }
+            BinaryOp::BitAnd => {
+                out.instruction(&Instruction::I32And);
+            }
+            BinaryOp::BitOr => {
+                out.instruction(&Instruction::I32Or);
+            }
+            BinaryOp::BitXor => {
+                out.instruction(&Instruction::I32Xor);
+            }
+            BinaryOp::Shl => {
+                out.instruction(&Instruction::I32Shl);
+            }
+            BinaryOp::Shr => {
+                out.instruction(&Instruction::I32ShrS);
             }
             BinaryOp::Eq => {
                 out.instruction(&Instruction::I32Eq);
@@ -2023,6 +2183,12 @@ fn binary_operand_type(op: BinaryOp, lhs: &Type, rhs: &Type) -> Result<Type, Cod
             | BinaryOp::Sub
             | BinaryOp::Mul
             | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr
             | BinaryOp::Eq
             | BinaryOp::Ne
             | BinaryOp::Lt
@@ -2157,15 +2323,6 @@ fn is_array_like_type(typ: &Type) -> bool {
     }
 }
 
-#[allow(dead_code)]
-fn memarg_i32() -> MemArg {
-    MemArg {
-        offset: 0,
-        align: 2,
-        memory_index: 0,
-    }
-}
-
 fn memarg_i8() -> MemArg {
     MemArg {
         offset: 0,
@@ -2175,32 +2332,16 @@ fn memarg_i8() -> MemArg {
 }
 
 // ============================================================
-// LIR Codegen: compile LirProgram with evidence table support
+// LIR Codegen: compile LirProgram to WASM
 // ============================================================
 
-/// Compile a LIR program to WASM bytes with evidence-passing support.
-pub fn compile_lir_to_wasm(
-    program: &LirProgram,
-    evidence_table: &EvidenceTable,
-) -> Result<Vec<u8>, CodegenError> {
-    // Convert LIR to ANF for reuse of existing codegen
+/// Compile a LIR program to WASM bytes.
+pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError> {
     let anf = lir_program_to_anf(program);
-    let wasm = compile_typed_anf_to_wasm(&anf)?;
-
-    // If evidence table is empty, no funcref table needed
-    if evidence_table.entries.is_empty() {
-        return Ok(wasm);
-    }
-
-    // TODO: In Phase 9 wiring, inject funcref table into the WASM module.
-    // For now, return the base WASM. The funcref table will be added when
-    // the full pipeline is wired.
-    Ok(wasm)
+    compile_typed_anf_to_wasm(&anf)
 }
 
 /// Convert LIR program to ANF program for codegen reuse.
-/// Evidence params become regular params, CallIndirect becomes Call to a
-/// resolved function name (static dispatch for now).
 fn lir_program_to_anf(program: &LirProgram) -> AnfProgram {
     let functions = program
         .functions
@@ -2235,7 +2376,7 @@ fn lir_program_to_anf(program: &LirProgram) -> AnfProgram {
 }
 
 fn lir_function_to_anf(func: &LirFunction) -> AnfFunction {
-    let mut params: Vec<super::anf::AnfParam> = func
+    let params: Vec<super::anf::AnfParam> = func
         .params
         .iter()
         .map(|p| super::anf::AnfParam {
@@ -2244,15 +2385,6 @@ fn lir_function_to_anf(func: &LirFunction) -> AnfFunction {
             typ: p.typ.clone(),
         })
         .collect();
-
-    // Add evidence params as additional i32 params
-    for ep in &func.evidence_params {
-        params.push(super::anf::AnfParam {
-            label: ep.label.clone(),
-            name: ep.name.clone(),
-            typ: Type::I32,
-        });
-    }
 
     let body = func.body.iter().map(|s| lir_stmt_to_anf(s)).collect();
     let ret = lir_atom_to_anf(&func.ret);
@@ -2313,6 +2445,19 @@ fn lir_stmt_to_anf(stmt: &LirStmt) -> AnfStmt {
             catch_param_typ: catch_param_typ.clone(),
             catch_body: catch_body.iter().map(|s| lir_stmt_to_anf(s)).collect(),
             catch_ret: catch_ret.as_ref().map(|a| lir_atom_to_anf(a)),
+        },
+        LirStmt::Conc { tasks } => AnfStmt::Conc {
+            tasks: tasks
+                .iter()
+                .map(|t| ConcTaskCall {
+                    func_name: t.func_name.clone(),
+                    args: t
+                        .args
+                        .iter()
+                        .map(|(l, a)| (l.clone(), lir_atom_to_anf(a)))
+                        .collect(),
+                })
+                .collect(),
         },
     }
 }

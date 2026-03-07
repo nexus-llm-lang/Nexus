@@ -226,11 +226,17 @@ fn proc_port_with_mock_handler() {
     // Test that Proc port can be implemented with a mock handler
     // (doesn't actually exit the process)
     let src = r#"
-import { Proc } from stdlib/proc.nx
+import { Proc, ExecResult } from stdlib/proc.nx
 
 let mock_proc = handler Proc do
   fn exit(status: i64) -> unit do
     return ()
+  end
+  fn argv() -> [ string ] do
+    return Nil()
+  end
+  fn exec(cmd: string, args: [ string ]) -> ExecResult do
+    return ExecResult(exit_code: 0, stdout: "", stderr: "")
   end
 end
 
