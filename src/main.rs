@@ -516,7 +516,24 @@ fn compile_loaded_source_to_core_wasm(
             Ok(wasm)
         }
         Err(e) => {
-            eprintln!("Compile Error: {}", e);
+            if let Some(span) = e.span() {
+                if !span.is_empty() {
+                    let report =
+                        Report::build(ReportKind::Error, &loaded.display_name, span.start)
+                            .with_message(format!("Compile Error: {}", e))
+                            .with_label(
+                                Label::new((&loaded.display_name, span.clone()))
+                                    .with_message(e.to_string())
+                                    .with_color(Color::Red),
+                            )
+                            .finish();
+                    let _ = report.print((&loaded.display_name, Source::from(&src)));
+                } else {
+                    eprintln!("Compile Error: {}", e);
+                }
+            } else {
+                eprintln!("Compile Error: {}", e);
+            }
             Err(ExitCode::from(1))
         }
     }

@@ -1,7 +1,7 @@
 //! Mid-level IR — effects eliminated via static port resolution.
 //! No inject/handler/port.method() — all port calls resolved to direct function calls.
 
-use crate::lang::ast::{BinaryOp, Literal, Sigil, Type};
+use crate::lang::ast::{BinaryOp, Literal, Sigil, Span, Type};
 
 #[derive(Debug, Clone)]
 pub struct MirProgram {
@@ -25,6 +25,7 @@ pub struct MirFunction {
     pub params: Vec<MirParam>,
     pub ret_type: Type,
     pub body: Vec<MirStmt>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]

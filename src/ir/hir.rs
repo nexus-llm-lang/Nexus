@@ -1,7 +1,7 @@
 //! High-level IR — name-resolved AST with modules flattened.
 //! All identifiers are fully qualified. Handlers collected.
 
-use crate::lang::ast::{BinaryOp, EnumDef, Literal, Sigil, Type};
+use crate::lang::ast::{BinaryOp, EnumDef, Literal, Sigil, Span, Type};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -48,6 +48,7 @@ pub struct HirFunction {
     pub params: Vec<HirParam>,
     pub ret_type: Type,
     pub body: Vec<HirStmt>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]

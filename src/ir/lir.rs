@@ -1,6 +1,7 @@
-//! Low-level IR — ANF form, WASM-ready.
+//! Low-level IR in A-normal form (ANF) — all sub-expressions are atoms.
+//! This is the final IR before WASM codegen; codegen consumes LIR directly.
 
-use crate::lang::ast::{BinaryOp, Type};
+use crate::lang::ast::{BinaryOp, Span, Type};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LirProgram {
@@ -27,6 +28,7 @@ pub struct LirFunction {
     pub effects: Type,
     pub body: Vec<LirStmt>,
     pub ret: LirAtom,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,12 +67,12 @@ pub enum LirStmt {
         catch_ret: Option<LirAtom>,
     },
     Conc {
-        tasks: Vec<ConcTaskRef>,
+        tasks: Vec<ConcTask>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ConcTaskRef {
+pub struct ConcTask {
     pub func_name: String,
     pub args: Vec<(String, LirAtom)>,
 }

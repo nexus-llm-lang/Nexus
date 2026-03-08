@@ -17,27 +17,38 @@ use std::fs;
 
 #[derive(Debug)]
 pub enum HirBuildError {
-    ImportReadError { path: String, detail: String },
-    ImportParseError { path: String, detail: String },
-    CyclicImport { path: String },
-    ImportItemNotFound { item: String, path: String },
+    ImportReadError { path: String, detail: String, span: Span },
+    ImportParseError { path: String, detail: String, span: Span },
+    CyclicImport { path: String, span: Span },
+    ImportItemNotFound { item: String, path: String, span: Span },
 }
 
 impl std::fmt::Display for HirBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HirBuildError::ImportReadError { path, detail } => {
+            HirBuildError::ImportReadError { path, detail, .. } => {
                 write!(f, "Failed to read '{}': {}", path, detail)
             }
-            HirBuildError::ImportParseError { path, detail } => {
+            HirBuildError::ImportParseError { path, detail, .. } => {
                 write!(f, "Failed to parse '{}': {}", path, detail)
             }
-            HirBuildError::CyclicImport { path } => {
+            HirBuildError::CyclicImport { path, .. } => {
                 write!(f, "Cyclic import detected: {}", path)
             }
-            HirBuildError::ImportItemNotFound { item, path } => {
+            HirBuildError::ImportItemNotFound { item, path, .. } => {
                 write!(f, "Item '{}' not found in '{}'", item, path)
             }
+        }
+    }
+}
+
+impl HirBuildError {
+    pub fn span(&self) -> &Span {
+        match self {
+            HirBuildError::ImportReadError { span, .. }
+            | HirBuildError::ImportParseError { span, .. }
+            | HirBuildError::CyclicImport { span, .. }
+            | HirBuildError::ImportItemNotFound { span, .. } => span,
         }
     }
 }
@@ -145,22 +156,25 @@ impl HirBuilder {
                 collect_calls_in_hir_stmts(&func.body, &mut calls);
                 for called in calls {
                     // Resolve port calls to handler functions
-                    if let Some((port, method)) = called.split_once('.') {
-                        let mut resolved_as_port = false;
+                    // Port names may contain dots (e.g. "stdio.Console" from aliased imports),
+                    // so match known port names as prefixes rather than splitting on first dot
+                    let mut resolved_as_port = false;
+                    if called.contains('.') {
                         for (binding_name, binding) in &self.handler_bindings {
-                            if binding.port_name == port {
-                                let handler_fn = format!("__handler_{}_{}", binding_name, method);
+                            if let Some(method) = called
+                                .strip_prefix(binding.port_name.as_str())
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                let handler_fn =
+                                    format!("__handler_{}_{}", binding_name, method);
                                 if !reachable.contains(&handler_fn) {
                                     worklist.push(handler_fn);
                                 }
                                 resolved_as_port = true;
                             }
                         }
-                        // If not a port call, treat as a module-qualified function name
-                        if !resolved_as_port && !reachable.contains(&called) {
-                            worklist.push(called);
-                        }
-                    } else if !reachable.contains(&called) {
+                    }
+                    if !resolved_as_port && !reachable.contains(&called) {
                         worklist.push(called);
                     }
                 }
@@ -249,7 +263,7 @@ impl HirBuilder {
                     current_wasm_module = Some(resolve_import_path(&import.path));
                 }
                 TopLevel::Import(import) => {
-                    self.process_import(import)?;
+                    self.process_import(import, &def.span)?;
                 }
                 TopLevel::TypeDef(_) => {}
                 TopLevel::Enum(ed) => {
@@ -291,6 +305,7 @@ impl HirBuilder {
                                     .collect(),
                                 ret_type: ret_type.clone(),
                                 body: self.convert_stmts(body, rename_map),
+                                span: def.span.clone(),
                             });
                         }
                         Expr::External(wasm_name, _type_params, typ) => {
@@ -337,6 +352,7 @@ impl HirBuilder {
                                         .collect(),
                                     ret_type: hf.ret_type.clone(),
                                     body: self.convert_stmts(&hf.body, rename_map),
+                                    span: def.span.clone(),
                                 });
                             }
                             self.handler_bindings.insert(
@@ -358,11 +374,12 @@ impl HirBuilder {
         Ok(())
     }
 
-    fn process_import(&mut self, import: &Import) -> Result<(), HirBuildError> {
+    fn process_import(&mut self, import: &Import, import_span: &Span) -> Result<(), HirBuildError> {
         let resolved_path = resolve_import_path(&import.path);
         if self.import_stack.iter().any(|p| p == &resolved_path) {
             return Err(HirBuildError::CyclicImport {
                 path: resolved_path,
+                span: import_span.clone(),
             });
         }
 
@@ -371,6 +388,7 @@ impl HirBuilder {
             fs::read_to_string(&resolved_path).map_err(|e| HirBuildError::ImportReadError {
                 path: resolved_path.clone(),
                 detail: e.to_string(),
+                span: import_span.clone(),
             })?;
         let imported_program =
             parser::parser()
@@ -378,9 +396,10 @@ impl HirBuilder {
                 .map_err(|e| HirBuildError::ImportParseError {
                     path: import.path.clone(),
                     detail: format!("{:?}", e),
+                    span: import_span.clone(),
                 })?;
 
-        let rename_map = self.build_rename_map(&imported_program, import)?;
+        let rename_map = self.build_rename_map(&imported_program, import, import_span)?;
         let result = self.process_program(&imported_program, &rename_map);
         self.import_stack.pop();
         result
@@ -390,6 +409,7 @@ impl HirBuilder {
         &self,
         program: &Program,
         import: &Import,
+        import_span: &Span,
     ) -> Result<HashMap<String, String>, HirBuildError> {
         let mut map = HashMap::new();
 
@@ -400,8 +420,14 @@ impl HirBuilder {
                 .clone()
                 .unwrap_or_else(|| get_default_alias(&import.path));
             for def in &program.definitions {
-                if let TopLevel::Let(gl) = &def.node {
-                    map.insert(gl.name.clone(), format!("{}.{}", alias, gl.name));
+                match &def.node {
+                    TopLevel::Let(gl) => {
+                        map.insert(gl.name.clone(), format!("{}.{}", alias, gl.name));
+                    }
+                    TopLevel::Port(port) => {
+                        map.insert(port.name.clone(), format!("{}.{}", alias, port.name));
+                    }
+                    _ => {}
                 }
             }
             return Ok(map);
@@ -421,29 +447,59 @@ impl HirBuilder {
                 return Err(HirBuildError::ImportItemNotFound {
                     item: item.clone(),
                     path: import.path.clone(),
+                    span: import_span.clone(),
                 });
             }
         }
 
         if let Some(alias) = &import.alias {
             for def in &program.definitions {
-                if let TopLevel::Let(gl) = &def.node {
-                    if gl.is_public && selected.contains(&gl.name) {
-                        map.insert(gl.name.clone(), gl.name.clone());
-                    } else {
-                        map.insert(gl.name.clone(), format!("{}.{}", alias, gl.name));
+                match &def.node {
+                    TopLevel::Let(gl) => {
+                        if gl.is_public && selected.contains(&gl.name) {
+                            map.insert(gl.name.clone(), gl.name.clone());
+                        } else {
+                            map.insert(gl.name.clone(), format!("{}.{}", alias, gl.name));
+                        }
                     }
+                    TopLevel::Port(port) => {
+                        if port.is_public && selected.contains(&port.name) {
+                            map.insert(port.name.clone(), port.name.clone());
+                        } else {
+                            map.insert(
+                                port.name.clone(),
+                                format!("{}.{}", alias, port.name),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
         } else {
             let alias_prefix = format!("__import_{}", self.import_stack.len());
             for def in &program.definitions {
-                if let TopLevel::Let(gl) = &def.node {
-                    if selected.contains(&gl.name) {
-                        map.insert(gl.name.clone(), gl.name.clone());
-                    } else {
-                        map.insert(gl.name.clone(), format!("{}_{}", alias_prefix, gl.name));
+                match &def.node {
+                    TopLevel::Let(gl) => {
+                        if selected.contains(&gl.name) {
+                            map.insert(gl.name.clone(), gl.name.clone());
+                        } else {
+                            map.insert(
+                                gl.name.clone(),
+                                format!("{}_{}", alias_prefix, gl.name),
+                            );
+                        }
                     }
+                    TopLevel::Port(port) => {
+                        if selected.contains(&port.name) {
+                            map.insert(port.name.clone(), port.name.clone());
+                        } else {
+                            map.insert(
+                                port.name.clone(),
+                                format!("{}_{}", alias_prefix, port.name),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -491,6 +547,7 @@ impl HirBuilder {
                         params: vec![],
                         ret_type: Type::Unit,
                         body: self.convert_stmts(&t.body, rename_map),
+                        span: 0..0, // synthesized task function
                     })
                     .collect();
                 Some(HirStmt::Conc(hir_tasks))
@@ -642,6 +699,7 @@ impl HirBuilder {
                             .collect(),
                         ret_type: f.ret_type.clone(),
                         body: self.convert_stmts(&f.body, rename_map),
+                        span: 0..0, // inline handler function
                     })
                     .collect(),
             },

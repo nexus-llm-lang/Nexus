@@ -7,24 +7,33 @@
 
 use crate::ir::lir::*;
 use crate::ir::mir::*;
-use crate::lang::ast::{BinaryOp, EnumDef, Literal, Type};
+use crate::lang::ast::{BinaryOp, EnumDef, Literal, Span, Type};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub enum LirLowerError {
-    UnsupportedExpression { detail: String },
-    FunctionMayNotReturn { name: String },
+    UnsupportedExpression { detail: String, span: Span },
+    FunctionMayNotReturn { name: String, span: Span },
 }
 
 impl std::fmt::Display for LirLowerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LirLowerError::UnsupportedExpression { detail } => {
+            LirLowerError::UnsupportedExpression { detail, .. } => {
                 write!(f, "Unsupported expression in LIR lowering: {}", detail)
             }
-            LirLowerError::FunctionMayNotReturn { name } => {
+            LirLowerError::FunctionMayNotReturn { name, .. } => {
                 write!(f, "Function '{}' may not return a value", name)
             }
+        }
+    }
+}
+
+impl LirLowerError {
+    pub fn span(&self) -> &Span {
+        match self {
+            LirLowerError::UnsupportedExpression { span, .. }
+            | LirLowerError::FunctionMayNotReturn { span, .. } => span,
         }
     }
 }
@@ -123,6 +132,7 @@ fn lower_mir_function(
     } else {
         return Err(LirLowerError::FunctionMayNotReturn {
             name: func.name.clone(),
+            span: func.span.clone(),
         });
     };
 
@@ -147,6 +157,7 @@ fn lower_mir_function(
             effects: Type::Row(Vec::new(), None),
             body: ctx.stmts,
             ret,
+            span: func.span.clone(),
         },
         task_functions,
     ))
@@ -280,6 +291,7 @@ impl<'a> LowerCtx<'a> {
                         params: capture_params,
                         ret_type: Type::Unit,
                         body: task.body.clone(),
+                        span: task.span.clone(),
                     };
                     let (lir_func, nested_tasks) = lower_mir_function(&task_mir, self.enum_defs)?;
                     self.task_functions.push(lir_func);
@@ -297,7 +309,7 @@ impl<'a> LowerCtx<'a> {
                             )
                         })
                         .collect();
-                    task_refs.push(ConcTaskRef {
+                    task_refs.push(ConcTask {
                         func_name: task_name,
                         args,
                     });
@@ -818,6 +830,7 @@ impl<'a> LowerCtx<'a> {
                 Err(LirLowerError::UnsupportedExpression {
                     detail: "If expression in atom position; should be lowered at statement level"
                         .to_string(),
+                    span: 0..0,
                 })
             }
             MirExpr::Match {
@@ -826,6 +839,7 @@ impl<'a> LowerCtx<'a> {
             } => Err(LirLowerError::UnsupportedExpression {
                 detail: "Match expression in atom position; should be lowered at statement level"
                     .to_string(),
+                span: 0..0,
             }),
             MirExpr::Borrow(name) => {
                 let typ = self.vars.get(name).cloned().unwrap_or(Type::I64);
@@ -995,6 +1009,7 @@ fn resolve_field_access(
                     "field '{}' not found in record type {:?}",
                     field_name, receiver_type
                 ),
+                span: 0..0,
             })
         }
         _ => Err(LirLowerError::UnsupportedExpression {
@@ -1002,6 +1017,7 @@ fn resolve_field_access(
                 "field access '.{}' on non-record type {:?}",
                 field_name, receiver_type
             ),
+            span: 0..0,
         }),
     }
 }

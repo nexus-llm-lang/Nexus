@@ -7,20 +7,32 @@
 
 use crate::ir::hir::*;
 use crate::ir::mir::*;
-use crate::lang::ast::Type;
+use crate::lang::ast::{Span, Type};
 use std::collections::HashMap;
 
 #[derive(Debug)]
 pub enum MirLowerError {
-    UnresolvedPort { port: String, method: String },
+    UnresolvedPort {
+        port: String,
+        method: String,
+        span: Span,
+    },
 }
 
 impl std::fmt::Display for MirLowerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MirLowerError::UnresolvedPort { port, method } => {
+            MirLowerError::UnresolvedPort { port, method, .. } => {
                 write!(f, "Unresolved port method: {}.{}", port, method)
             }
+        }
+    }
+}
+
+impl MirLowerError {
+    pub fn span(&self) -> &Span {
+        match self {
+            MirLowerError::UnresolvedPort { span, .. } => span,
         }
     }
 }
@@ -203,6 +215,7 @@ impl<'a> MirLowerer<'a> {
             params,
             ret_type: func.ret_type.clone(),
             body,
+            span: func.span.clone(),
         })
     }
 
@@ -286,9 +299,14 @@ impl<'a> MirLowerer<'a> {
             )),
             HirExpr::Borrow(name, _sigil) => Ok(MirExpr::Borrow(name.clone())),
             HirExpr::Call { func, args } => {
-                // Check if this is a port-qualified call (e.g., "Logger.info")
-                if let Some((port_name, method_name)) = func.split_once('.') {
-                    if self.port_layout.methods.contains_key(port_name) {
+                // Check if this is a port-qualified call (e.g., "Console.print")
+                // Port names may contain dots from aliased imports (e.g., "stdio.Console"),
+                // so match known port names as prefixes rather than splitting on first dot
+                for (port_name, _) in &self.port_layout.methods {
+                    if let Some(method_name) = func
+                        .strip_prefix(port_name.as_str())
+                        .and_then(|s| s.strip_prefix('.'))
+                    {
                         return self.lower_port_call(port_name, method_name, args, scope);
                     }
                 }
@@ -401,6 +419,7 @@ impl<'a> MirLowerer<'a> {
                 .ok_or_else(|| MirLowerError::UnresolvedPort {
                     port: port_name.to_string(),
                     method: method_name.to_string(),
+                    span: 0..0, // TODO: propagate from statement-level spans
                 })?;
 
         // Resolve to the handler's synthesized function

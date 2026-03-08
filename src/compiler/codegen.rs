@@ -11,10 +11,10 @@ use wasm_encoder::{
 use crate::constants::{
     Permission, ENTRYPOINT, MEMORY_EXPORT, NEXUS_CAPABILITIES_SECTION, WASI_CLI_RUN_EXPORT,
 };
-use crate::ir::lir::{LirAtom, LirExpr, LirFunction, LirProgram, LirStmt};
+use crate::ir::lir::{
+    LirAtom, LirExpr, LirExternal, LirFunction, LirProgram, LirStmt,
+};
 use crate::lang::ast::{BinaryOp, Program, Type};
-
-use super::anf::{AnfAtom, AnfExpr, AnfExternal, AnfFunction, AnfProgram, AnfStmt, ConcTaskCall};
 use super::passes::hir_build::{build_hir, HirBuildError};
 use super::passes::lir_lower::{lower_mir_to_lir, LirLowerError};
 use super::passes::mir_lower::{lower_hir_to_mir, MirLowerError};
@@ -211,6 +211,18 @@ pub enum CompileError {
     MainSignature(String),
 }
 
+impl CompileError {
+    /// Returns the source span associated with this error, if available.
+    pub fn span(&self) -> Option<&crate::lang::ast::Span> {
+        match self {
+            CompileError::HirBuild(e) => Some(e.span()),
+            CompileError::MirLower(e) => Some(e.span()),
+            CompileError::LirLower(e) => Some(e.span()),
+            CompileError::Codegen(_) | CompileError::MainSignature(_) => None,
+        }
+    }
+}
+
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -344,8 +356,8 @@ pub fn compile_program_to_wasm(program: &Program) -> Result<Vec<u8>, CompileErro
     compile_program_to_wasm_with_metrics(program).map(|(wasm, _)| wasm)
 }
 
-/// Compiles typed ANF directly into core wasm bytes.
-pub fn compile_typed_anf_to_wasm(program: &AnfProgram) -> Result<Vec<u8>, CodegenError> {
+/// Compiles LIR (in ANF) directly into core WASM bytes.
+pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError> {
     let has_conc = program
         .functions
         .iter()
@@ -631,8 +643,8 @@ fn compile_wasi_cli_run_wrapper(main_idx: u32, main_ret_type: &Type) -> Function
 }
 
 fn compile_function(
-    func: &AnfFunction,
-    program: &AnfProgram,
+    func: &LirFunction,
+    program: &LirProgram,
     internal_indices: &HashMap<String, u32>,
     external_indices: &HashMap<String, u32>,
     layout: &CodegenLayout,
@@ -758,17 +770,17 @@ fn register_local(
 }
 
 fn collect_stmt_locals(
-    stmts: &[AnfStmt],
+    stmts: &[LirStmt],
     local_map: &mut HashMap<String, LocalInfo>,
     next_local_index: &mut u32,
     local_decls_flat: &mut Vec<ValType>,
 ) -> Result<(), CodegenError> {
     for stmt in stmts {
         match stmt {
-            AnfStmt::Let { name, typ, .. } => {
+            LirStmt::Let { name, typ, .. } => {
                 register_local(local_map, next_local_index, local_decls_flat, name, typ)?;
             }
-            AnfStmt::TryCatch {
+            LirStmt::TryCatch {
                 body,
                 catch_param,
                 catch_param_typ,
@@ -785,7 +797,7 @@ fn collect_stmt_locals(
                 collect_stmt_locals(body, local_map, next_local_index, local_decls_flat)?;
                 collect_stmt_locals(catch_body, local_map, next_local_index, local_decls_flat)?;
             }
-            AnfStmt::If {
+            LirStmt::If {
                 then_body,
                 else_body,
                 ..
@@ -793,7 +805,7 @@ fn collect_stmt_locals(
                 collect_stmt_locals(then_body, local_map, next_local_index, local_decls_flat)?;
                 collect_stmt_locals(else_body, local_map, next_local_index, local_decls_flat)?;
             }
-            AnfStmt::IfReturn {
+            LirStmt::IfReturn {
                 then_body,
                 else_body,
                 ..
@@ -801,7 +813,7 @@ fn collect_stmt_locals(
                 collect_stmt_locals(then_body, local_map, next_local_index, local_decls_flat)?;
                 collect_stmt_locals(else_body, local_map, next_local_index, local_decls_flat)?;
             }
-            AnfStmt::Conc { .. } => {}
+            LirStmt::Conc { .. } => {}
         }
     }
     Ok(())
@@ -809,10 +821,10 @@ fn collect_stmt_locals(
 
 #[allow(clippy::too_many_arguments)]
 fn compile_stmt(
-    stmt: &AnfStmt,
+    stmt: &LirStmt,
     out: &mut Function,
     local_map: &HashMap<String, LocalInfo>,
-    program: &AnfProgram,
+    program: &LirProgram,
     internal_indices: &HashMap<String, u32>,
     external_indices: &HashMap<String, u32>,
     layout: &CodegenLayout,
@@ -821,7 +833,7 @@ fn compile_stmt(
     in_try: bool,
 ) -> Result<(), CodegenError> {
     match stmt {
-        AnfStmt::Let { name, typ, expr } => {
+        LirStmt::Let { name, typ, expr } => {
             compile_expr(
                 expr,
                 out,
@@ -847,7 +859,7 @@ fn compile_stmt(
             out.instruction(&Instruction::LocalSet(local.index));
             Ok(())
         }
-        AnfStmt::If {
+        LirStmt::If {
             cond,
             then_body,
             else_body,
@@ -889,7 +901,7 @@ fn compile_stmt(
             out.instruction(&Instruction::End);
             Ok(())
         }
-        AnfStmt::IfReturn {
+        LirStmt::IfReturn {
             cond,
             then_body,
             then_ret,
@@ -942,7 +954,7 @@ fn compile_stmt(
             out.instruction(&Instruction::End);
             Ok(())
         }
-        AnfStmt::TryCatch {
+        LirStmt::TryCatch {
             body,
             body_ret,
             catch_param,
@@ -1023,7 +1035,7 @@ fn compile_stmt(
             out.instruction(&Instruction::End);
             Ok(())
         }
-        AnfStmt::Conc { tasks } => {
+        LirStmt::Conc { tasks } => {
             let spawn_idx = layout
                 .conc_spawn_idx
                 .expect("conc_spawn_idx must be set for conc blocks");
@@ -1092,10 +1104,10 @@ fn compile_stmt(
 
 #[allow(clippy::too_many_arguments)]
 fn compile_expr(
-    expr: &AnfExpr,
+    expr: &LirExpr,
     out: &mut Function,
     local_map: &HashMap<String, LocalInfo>,
-    program: &AnfProgram,
+    program: &LirProgram,
     internal_indices: &HashMap<String, u32>,
     external_indices: &HashMap<String, u32>,
     layout: &CodegenLayout,
@@ -1103,8 +1115,8 @@ fn compile_expr(
     in_try: bool,
 ) -> Result<(), CodegenError> {
     match expr {
-        AnfExpr::Atom(atom) => compile_atom(atom, out, local_map, layout),
-        AnfExpr::Binary { op, lhs, rhs, typ } => {
+        LirExpr::Atom(atom) => compile_atom(atom, out, local_map, layout),
+        LirExpr::Binary { op, lhs, rhs, typ } => {
             if is_string_concat_operator(*op, typ) {
                 return emit_string_concat(lhs, rhs, out, local_map, layout, temps);
             }
@@ -1115,7 +1127,7 @@ fn compile_expr(
             emit_numeric_coercion(&rhs.typ(), &operand_type, out)?;
             compile_binary(*op, &operand_type, out)
         }
-        AnfExpr::Call { func, args, .. } => {
+        LirExpr::Call { func, args, .. } => {
             if let Some(callee_idx) = internal_indices.get(func).copied() {
                 let callee = program
                     .functions
@@ -1178,7 +1190,7 @@ fn compile_expr(
 
             Err(CodegenError::CallTargetNotFound { name: func.clone() })
         }
-        AnfExpr::Constructor { name, args, .. } => {
+        LirExpr::Constructor { name, args, .. } => {
             emit_alloc_object(out, temps, 1 + args.len(), layout)?;
 
             out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
@@ -1196,7 +1208,7 @@ fn compile_expr(
             out.instruction(&Instruction::I64ExtendI32U);
             Ok(())
         }
-        AnfExpr::Record { fields, .. } => {
+        LirExpr::Record { fields, .. } => {
             let mut field_names: Vec<String> =
                 fields.iter().map(|(name, _)| name.clone()).collect();
             field_names.sort();
@@ -1219,7 +1231,7 @@ fn compile_expr(
             out.instruction(&Instruction::I64ExtendI32U);
             Ok(())
         }
-        AnfExpr::ObjectTag { value, .. } => {
+        LirExpr::ObjectTag { value, .. } => {
             compile_atom(value, out, local_map, layout)?;
             out.instruction(&Instruction::I32WrapI64);
             out.instruction(&Instruction::LocalSet(temps.object_ptr_i32));
@@ -1228,7 +1240,7 @@ fn compile_expr(
             out.instruction(&Instruction::I64Load(memarg(0)));
             Ok(())
         }
-        AnfExpr::ObjectField { value, index, typ } => {
+        LirExpr::ObjectField { value, index, typ } => {
             compile_atom(value, out, local_map, layout)?;
             out.instruction(&Instruction::I32WrapI64);
             out.instruction(&Instruction::LocalSet(temps.object_ptr_i32));
@@ -1238,7 +1250,7 @@ fn compile_expr(
             emit_unpack_i64_to_value(typ, out)?;
             Ok(())
         }
-        AnfExpr::Raise { value, .. } => {
+        LirExpr::Raise { value, .. } => {
             compile_atom(value, out, local_map, layout)?;
             if !matches!(value.typ(), Type::Unit) {
                 out.instruction(&Instruction::LocalSet(temps.exn_value_i64));
@@ -1377,7 +1389,7 @@ fn emit_unpack_i64_to_value(typ: &Type, out: &mut Function) -> Result<(), Codege
 }
 
 fn compile_external_arg(
-    atom: &AnfAtom,
+    atom: &LirAtom,
     param_type: &Type,
     out: &mut Function,
     local_map: &HashMap<String, LocalInfo>,
@@ -1447,8 +1459,8 @@ fn is_string_concat_operator(op: BinaryOp, result_type: &Type) -> bool {
 }
 
 fn emit_string_concat(
-    lhs: &AnfAtom,
-    rhs: &AnfAtom,
+    lhs: &LirAtom,
+    rhs: &LirAtom,
     out: &mut Function,
     local_map: &HashMap<String, LocalInfo>,
     layout: &CodegenLayout,
@@ -1566,46 +1578,46 @@ fn emit_string_concat(
     Ok(())
 }
 
-fn expr_type(expr: &AnfExpr) -> Type {
+fn expr_type(expr: &LirExpr) -> Type {
     match expr {
-        AnfExpr::Atom(atom) => atom.typ(),
-        AnfExpr::Binary { typ, .. } => typ.clone(),
-        AnfExpr::Call { typ, .. } => typ.clone(),
-        AnfExpr::Constructor { typ, .. } => typ.clone(),
-        AnfExpr::Record { typ, .. } => typ.clone(),
-        AnfExpr::ObjectTag { typ, .. } => typ.clone(),
-        AnfExpr::ObjectField { typ, .. } => typ.clone(),
-        AnfExpr::Raise { typ, .. } => typ.clone(),
+        LirExpr::Atom(atom) => atom.typ(),
+        LirExpr::Binary { typ, .. } => typ.clone(),
+        LirExpr::Call { typ, .. } => typ.clone(),
+        LirExpr::Constructor { typ, .. } => typ.clone(),
+        LirExpr::Record { typ, .. } => typ.clone(),
+        LirExpr::ObjectTag { typ, .. } => typ.clone(),
+        LirExpr::ObjectField { typ, .. } => typ.clone(),
+        LirExpr::Raise { typ, .. } => typ.clone(),
     }
 }
 
 fn compile_atom(
-    atom: &AnfAtom,
+    atom: &LirAtom,
     out: &mut Function,
     local_map: &HashMap<String, LocalInfo>,
     layout: &CodegenLayout,
 ) -> Result<(), CodegenError> {
     match atom {
-        AnfAtom::Var { name, .. } => {
+        LirAtom::Var { name, .. } => {
             let local = local_map
                 .get(name)
                 .ok_or_else(|| CodegenError::ConflictingLocalTypes { name: name.clone() })?;
             out.instruction(&Instruction::LocalGet(local.index));
             Ok(())
         }
-        AnfAtom::Int(i) => {
+        LirAtom::Int(i) => {
             out.instruction(&Instruction::I64Const(*i));
             Ok(())
         }
-        AnfAtom::Float(f) => {
+        LirAtom::Float(f) => {
             out.instruction(&Instruction::F64Const((*f).into()));
             Ok(())
         }
-        AnfAtom::Bool(b) => {
+        LirAtom::Bool(b) => {
             out.instruction(&Instruction::I32Const(if *b { 1 } else { 0 }));
             Ok(())
         }
-        AnfAtom::String(s) => {
+        LirAtom::String(s) => {
             let packed = layout
                 .string_literals
                 .get(s)
@@ -1614,11 +1626,11 @@ fn compile_atom(
             out.instruction(&Instruction::I64Const(pack_string(packed)));
             Ok(())
         }
-        AnfAtom::Unit => Ok(()),
+        LirAtom::Unit => Ok(()),
     }
 }
 
-fn build_codegen_layout(program: &AnfProgram) -> Result<CodegenLayout, CodegenError> {
+fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout, CodegenError> {
     let mut string_literals = Vec::new();
     for func in &program.functions {
         for stmt in &func.body {
@@ -1673,7 +1685,7 @@ fn build_codegen_layout(program: &AnfProgram) -> Result<CodegenLayout, CodegenEr
 }
 
 fn choose_memory_mode(
-    program: &AnfProgram,
+    program: &LirProgram,
     has_string_literals: bool,
     object_heap_enabled: bool,
 ) -> Result<MemoryMode, CodegenError> {
@@ -1707,7 +1719,7 @@ fn align8(v: u32) -> u32 {
     (v + 7) & !7
 }
 
-fn program_uses_object_heap(program: &AnfProgram) -> bool {
+fn program_uses_object_heap(program: &LirProgram) -> bool {
     for func in &program.functions {
         for stmt in &func.body {
             if stmt_uses_object_heap(stmt) {
@@ -1718,10 +1730,10 @@ fn program_uses_object_heap(program: &AnfProgram) -> bool {
     false
 }
 
-fn stmt_uses_object_heap(stmt: &AnfStmt) -> bool {
+fn stmt_uses_object_heap(stmt: &LirStmt) -> bool {
     match stmt {
-        AnfStmt::Let { expr, .. } => expr_uses_object_heap(expr),
-        AnfStmt::If {
+        LirStmt::Let { expr, .. } => expr_uses_object_heap(expr),
+        LirStmt::If {
             then_body,
             else_body,
             ..
@@ -1729,7 +1741,7 @@ fn stmt_uses_object_heap(stmt: &AnfStmt) -> bool {
             then_body.iter().any(stmt_uses_object_heap)
                 || else_body.iter().any(stmt_uses_object_heap)
         }
-        AnfStmt::IfReturn {
+        LirStmt::IfReturn {
             then_body,
             else_body,
             ..
@@ -1737,37 +1749,37 @@ fn stmt_uses_object_heap(stmt: &AnfStmt) -> bool {
             then_body.iter().any(stmt_uses_object_heap)
                 || else_body.iter().any(stmt_uses_object_heap)
         }
-        AnfStmt::TryCatch {
+        LirStmt::TryCatch {
             body, catch_body, ..
         } => body.iter().any(stmt_uses_object_heap) || catch_body.iter().any(stmt_uses_object_heap),
-        AnfStmt::Conc { tasks } => !tasks.is_empty(),
+        LirStmt::Conc { tasks } => !tasks.is_empty(),
     }
 }
 
-fn expr_uses_object_heap(expr: &AnfExpr) -> bool {
+fn expr_uses_object_heap(expr: &LirExpr) -> bool {
     matches!(
         expr,
-        AnfExpr::Constructor { .. }
-            | AnfExpr::Record { .. }
-            | AnfExpr::ObjectTag { .. }
-            | AnfExpr::ObjectField { .. }
+        LirExpr::Constructor { .. }
+            | LirExpr::Record { .. }
+            | LirExpr::ObjectTag { .. }
+            | LirExpr::ObjectField { .. }
     ) || matches!(
         expr,
-        AnfExpr::Binary { op, typ, .. } if is_string_concat_operator(*op, typ)
+        LirExpr::Binary { op, typ, .. } if is_string_concat_operator(*op, typ)
     )
 }
 
-fn external_uses_string_abi(ext: &AnfExternal) -> bool {
+fn external_uses_string_abi(ext: &LirExternal) -> bool {
     ext.params
         .iter()
         .any(|p| matches!(peel_linear(&p.typ), Type::String))
         || matches!(peel_linear(&ext.ret_type), Type::String)
 }
 
-fn collect_strings_in_stmt(stmt: &AnfStmt, out: &mut Vec<String>) {
+fn collect_strings_in_stmt(stmt: &LirStmt, out: &mut Vec<String>) {
     match stmt {
-        AnfStmt::Let { expr, .. } => collect_strings_in_expr(expr, out),
-        AnfStmt::If {
+        LirStmt::Let { expr, .. } => collect_strings_in_expr(expr, out),
+        LirStmt::If {
             cond,
             then_body,
             else_body,
@@ -1780,7 +1792,7 @@ fn collect_strings_in_stmt(stmt: &AnfStmt, out: &mut Vec<String>) {
                 collect_strings_in_stmt(stmt, out);
             }
         }
-        AnfStmt::IfReturn {
+        LirStmt::IfReturn {
             cond,
             then_body,
             then_ret,
@@ -1800,7 +1812,7 @@ fn collect_strings_in_stmt(stmt: &AnfStmt, out: &mut Vec<String>) {
                 collect_strings_in_atom(else_ret, out);
             }
         }
-        AnfStmt::TryCatch {
+        LirStmt::TryCatch {
             body,
             body_ret,
             catch_body,
@@ -1820,7 +1832,7 @@ fn collect_strings_in_stmt(stmt: &AnfStmt, out: &mut Vec<String>) {
                 collect_strings_in_atom(ret, out);
             }
         }
-        AnfStmt::Conc { tasks } => {
+        LirStmt::Conc { tasks } => {
             for task in tasks {
                 for (_, atom) in &task.args {
                     collect_strings_in_atom(atom, out);
@@ -1830,36 +1842,36 @@ fn collect_strings_in_stmt(stmt: &AnfStmt, out: &mut Vec<String>) {
     }
 }
 
-fn collect_strings_in_expr(expr: &AnfExpr, out: &mut Vec<String>) {
+fn collect_strings_in_expr(expr: &LirExpr, out: &mut Vec<String>) {
     match expr {
-        AnfExpr::Atom(atom) => collect_strings_in_atom(atom, out),
-        AnfExpr::Binary { lhs, rhs, .. } => {
+        LirExpr::Atom(atom) => collect_strings_in_atom(atom, out),
+        LirExpr::Binary { lhs, rhs, .. } => {
             collect_strings_in_atom(lhs, out);
             collect_strings_in_atom(rhs, out);
         }
-        AnfExpr::Call { args, .. } => {
+        LirExpr::Call { args, .. } => {
             for (_, atom) in args {
                 collect_strings_in_atom(atom, out);
             }
         }
-        AnfExpr::Constructor { args, .. } => {
+        LirExpr::Constructor { args, .. } => {
             for atom in args {
                 collect_strings_in_atom(atom, out);
             }
         }
-        AnfExpr::Record { fields, .. } => {
+        LirExpr::Record { fields, .. } => {
             for (_, atom) in fields {
                 collect_strings_in_atom(atom, out);
             }
         }
-        AnfExpr::ObjectTag { value, .. } => collect_strings_in_atom(value, out),
-        AnfExpr::ObjectField { value, .. } => collect_strings_in_atom(value, out),
-        AnfExpr::Raise { value, .. } => collect_strings_in_atom(value, out),
+        LirExpr::ObjectTag { value, .. } => collect_strings_in_atom(value, out),
+        LirExpr::ObjectField { value, .. } => collect_strings_in_atom(value, out),
+        LirExpr::Raise { value, .. } => collect_strings_in_atom(value, out),
     }
 }
 
-fn collect_strings_in_atom(atom: &AnfAtom, out: &mut Vec<String>) {
-    if let AnfAtom::String(s) = atom {
+fn collect_strings_in_atom(atom: &LirAtom, out: &mut Vec<String>) {
+    if let LirAtom::String(s) = atom {
         out.push(s.clone());
     }
 }
@@ -1868,7 +1880,7 @@ fn pack_string(s: PackedString) -> i64 {
     (((s.offset as u64) << 32) | (s.len as u64)) as i64
 }
 
-fn external_param_types(ext: &AnfExternal) -> Result<Vec<ValType>, CodegenError> {
+fn external_param_types(ext: &LirExternal) -> Result<Vec<ValType>, CodegenError> {
     let mut out = Vec::new();
     for param in &ext.params {
         match peel_linear(&param.typ) {
@@ -1898,7 +1910,7 @@ fn external_param_types(ext: &AnfExternal) -> Result<Vec<ValType>, CodegenError>
     Ok(out)
 }
 
-fn external_return_types(ext: &AnfExternal) -> Result<Vec<ValType>, CodegenError> {
+fn external_return_types(ext: &LirExternal) -> Result<Vec<ValType>, CodegenError> {
     match peel_linear(&ext.ret_type) {
         Type::Unit => Ok(vec![]),
         Type::I32 | Type::Bool => Ok(vec![ValType::I32]),
@@ -2328,195 +2340,5 @@ fn memarg_i8() -> MemArg {
         offset: 0,
         align: 0,
         memory_index: 0,
-    }
-}
-
-// ============================================================
-// LIR Codegen: compile LirProgram to WASM
-// ============================================================
-
-/// Compile a LIR program to WASM bytes.
-pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError> {
-    let anf = lir_program_to_anf(program);
-    compile_typed_anf_to_wasm(&anf)
-}
-
-/// Convert LIR program to ANF program for codegen reuse.
-fn lir_program_to_anf(program: &LirProgram) -> AnfProgram {
-    let functions = program
-        .functions
-        .iter()
-        .map(|f| lir_function_to_anf(f))
-        .collect();
-    let externals = program
-        .externals
-        .iter()
-        .map(|e| AnfExternal {
-            name: e.name.clone(),
-            wasm_module: e.wasm_module.clone(),
-            wasm_name: e.wasm_name.clone(),
-            params: e
-                .params
-                .iter()
-                .map(|p| super::anf::AnfParam {
-                    label: p.label.clone(),
-                    name: p.name.clone(),
-                    typ: p.typ.clone(),
-                })
-                .collect(),
-            ret_type: e.ret_type.clone(),
-            effects: e.effects.clone(),
-        })
-        .collect();
-
-    AnfProgram {
-        functions,
-        externals,
-    }
-}
-
-fn lir_function_to_anf(func: &LirFunction) -> AnfFunction {
-    let params: Vec<super::anf::AnfParam> = func
-        .params
-        .iter()
-        .map(|p| super::anf::AnfParam {
-            label: p.label.clone(),
-            name: p.name.clone(),
-            typ: p.typ.clone(),
-        })
-        .collect();
-
-    let body = func.body.iter().map(|s| lir_stmt_to_anf(s)).collect();
-    let ret = lir_atom_to_anf(&func.ret);
-
-    AnfFunction {
-        name: func.name.clone(),
-        params,
-        ret_type: func.ret_type.clone(),
-        requires: func.requires.clone(),
-        effects: func.effects.clone(),
-        body,
-        ret,
-    }
-}
-
-fn lir_stmt_to_anf(stmt: &LirStmt) -> AnfStmt {
-    match stmt {
-        LirStmt::Let { name, typ, expr } => AnfStmt::Let {
-            name: name.clone(),
-            typ: typ.clone(),
-            expr: lir_expr_to_anf(expr),
-        },
-        LirStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => AnfStmt::If {
-            cond: lir_atom_to_anf(cond),
-            then_body: then_body.iter().map(|s| lir_stmt_to_anf(s)).collect(),
-            else_body: else_body.iter().map(|s| lir_stmt_to_anf(s)).collect(),
-        },
-        LirStmt::IfReturn {
-            cond,
-            then_body,
-            then_ret,
-            else_body,
-            else_ret,
-            ret_type,
-        } => AnfStmt::IfReturn {
-            cond: lir_atom_to_anf(cond),
-            then_body: then_body.iter().map(|s| lir_stmt_to_anf(s)).collect(),
-            then_ret: lir_atom_to_anf(then_ret),
-            else_body: else_body.iter().map(|s| lir_stmt_to_anf(s)).collect(),
-            else_ret: else_ret.as_ref().map(|a| lir_atom_to_anf(a)),
-            ret_type: ret_type.clone(),
-        },
-        LirStmt::TryCatch {
-            body,
-            body_ret,
-            catch_param,
-            catch_param_typ,
-            catch_body,
-            catch_ret,
-        } => AnfStmt::TryCatch {
-            body: body.iter().map(|s| lir_stmt_to_anf(s)).collect(),
-            body_ret: body_ret.as_ref().map(|a| lir_atom_to_anf(a)),
-            catch_param: catch_param.clone(),
-            catch_param_typ: catch_param_typ.clone(),
-            catch_body: catch_body.iter().map(|s| lir_stmt_to_anf(s)).collect(),
-            catch_ret: catch_ret.as_ref().map(|a| lir_atom_to_anf(a)),
-        },
-        LirStmt::Conc { tasks } => AnfStmt::Conc {
-            tasks: tasks
-                .iter()
-                .map(|t| ConcTaskCall {
-                    func_name: t.func_name.clone(),
-                    args: t
-                        .args
-                        .iter()
-                        .map(|(l, a)| (l.clone(), lir_atom_to_anf(a)))
-                        .collect(),
-                })
-                .collect(),
-        },
-    }
-}
-
-fn lir_expr_to_anf(expr: &LirExpr) -> AnfExpr {
-    match expr {
-        LirExpr::Atom(atom) => AnfExpr::Atom(lir_atom_to_anf(atom)),
-        LirExpr::Binary { op, lhs, rhs, typ } => AnfExpr::Binary {
-            op: *op,
-            lhs: lir_atom_to_anf(lhs),
-            rhs: lir_atom_to_anf(rhs),
-            typ: typ.clone(),
-        },
-        LirExpr::Call { func, args, typ } => AnfExpr::Call {
-            func: func.clone(),
-            args: args
-                .iter()
-                .map(|(l, a)| (l.clone(), lir_atom_to_anf(a)))
-                .collect(),
-            typ: typ.clone(),
-        },
-        LirExpr::Constructor { name, args, typ } => AnfExpr::Constructor {
-            name: name.clone(),
-            args: args.iter().map(|a| lir_atom_to_anf(a)).collect(),
-            typ: typ.clone(),
-        },
-        LirExpr::Record { fields, typ } => AnfExpr::Record {
-            fields: fields
-                .iter()
-                .map(|(n, a)| (n.clone(), lir_atom_to_anf(a)))
-                .collect(),
-            typ: typ.clone(),
-        },
-        LirExpr::ObjectTag { value, typ } => AnfExpr::ObjectTag {
-            value: lir_atom_to_anf(value),
-            typ: typ.clone(),
-        },
-        LirExpr::ObjectField { value, index, typ } => AnfExpr::ObjectField {
-            value: lir_atom_to_anf(value),
-            index: *index,
-            typ: typ.clone(),
-        },
-        LirExpr::Raise { value, typ } => AnfExpr::Raise {
-            value: lir_atom_to_anf(value),
-            typ: typ.clone(),
-        },
-    }
-}
-
-fn lir_atom_to_anf(atom: &LirAtom) -> AnfAtom {
-    match atom {
-        LirAtom::Var { name, typ } => AnfAtom::Var {
-            name: name.clone(),
-            typ: typ.clone(),
-        },
-        LirAtom::Int(i) => AnfAtom::Int(*i),
-        LirAtom::Float(f) => AnfAtom::Float(*f),
-        LirAtom::Bool(b) => AnfAtom::Bool(*b),
-        LirAtom::String(s) => AnfAtom::String(s.clone()),
-        LirAtom::Unit => AnfAtom::Unit,
     }
 }
