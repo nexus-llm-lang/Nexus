@@ -13,8 +13,9 @@ use rustyline::error::ReadlineError;
 use rustyline::Config;
 
 use crate::compiler::{bundler, codegen};
-use crate::constants::ENTRYPOINT;
+use crate::constants::{Permission, ENTRYPOINT};
 use crate::lang::ast::{Expr, GlobalLet, Literal, Program, Spanned, Stmt, TopLevel, Type};
+use crate::runtime::conc::add_nexus_host_stubs;
 use crate::lang::parser::{parser, stmt_parser, ParseError};
 use crate::lang::typecheck::TypeChecker;
 use crate::runtime::ExecutionCapabilities;
@@ -51,9 +52,13 @@ impl ReplState {
     fn build_program(&self, main_body: Vec<Spanned<Stmt>>) -> Program {
         let mut defs = self.top_levels.clone();
 
-        // REPL always enables console (forced in start()), so always require PermConsole
+        // REPL requires all permissions so users don't hit requires errors.
+        // The capabilities/WASI layer already gates actual access.
         let requires = Type::Row(
-            vec![Type::UserDefined("PermConsole".to_string(), vec![])],
+            Permission::ALL
+                .iter()
+                .map(|p| Type::UserDefined(p.perm_name().to_string(), vec![]))
+                .collect(),
             None,
         );
 
@@ -97,6 +102,10 @@ impl ReplState {
         let mut linker = Linker::<wasmtime_wasi::p1::WasiP1Ctx>::new(&self.engine);
         wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx)
             .map_err(|e| format!("WASI link error: {e}"))?;
+
+        // stdlib.wasm is monolithic and imports nexus:cli/nexus-host for net FFI.
+        // Add no-op stubs so instantiation succeeds even when net isn't used.
+        add_nexus_host_stubs(&mut linker);
 
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdio();
@@ -420,7 +429,13 @@ fn handle_top_levels(state: &mut ReplState, defs: Vec<Spanned<TopLevel>>, source
                             TopLevel::Exception(ex) => {
                                 println!("  exception {} defined", ex.name)
                             }
-                            _ => {}
+                            TopLevel::Import(imp) => {
+                                let alias = imp
+                                    .alias
+                                    .as_deref()
+                                    .unwrap_or(imp.path.as_str());
+                                println!("  imported {}", alias);
+                            }
                         }
                     }
                 }

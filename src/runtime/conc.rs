@@ -95,7 +95,7 @@ pub fn needs_conc_runtime(wasm_bytes: &[u8]) -> bool {
 
 /// Add no-op stubs for `nexus:cli/nexus-host` functions to a linker.
 /// Required when the stdlib bundle imports nexus-host but the task doesn't use net.
-fn add_nexus_host_stubs<T: 'static>(linker: &mut Linker<T>) {
+pub fn add_nexus_host_stubs<T: 'static>(linker: &mut Linker<T>) {
     let _ = linker.func_wrap(
         NEXUS_HOST_MODULE,
         "host-http-request",

@@ -25,6 +25,16 @@ pub enum Permission {
 }
 
 impl Permission {
+    pub const ALL: [Permission; 7] = [
+        Permission::Fs,
+        Permission::Net,
+        Permission::Console,
+        Permission::Random,
+        Permission::Clock,
+        Permission::Proc,
+        Permission::Env,
+    ];
+
     /// Parse a permission type name (e.g. "PermFs") → Some(Permission::Fs)
     pub fn from_perm_name(name: &str) -> Option<Self> {
         match name {

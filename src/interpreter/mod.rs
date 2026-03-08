@@ -1,7 +1,4 @@
 //! Interpreter/runtime evaluator for Nexus AST.
-//! REPL is colocated here because it is an interpreter-facing frontend.
-
-pub mod repl;
 
 use crate::constants::{NEXUS_HOST_HTTP_FUNC, NEXUS_HOST_HTTP_MODULE};
 use crate::lang::ast::*;
