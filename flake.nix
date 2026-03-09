@@ -71,6 +71,16 @@
               formatter
             ];
         };
+
+        devShells.docs = pkgs.mkShellNoCC {
+          packages = with pkgs.rubyPackages; [
+            pkgs.ruby
+            jekyll
+            jekyll-theme-slate
+            jekyll-seo-tag
+            kramdown-parser-gfm
+          ];
+        };
       in
       {
         packages = {
