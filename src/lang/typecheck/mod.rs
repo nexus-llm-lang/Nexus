@@ -13,7 +13,7 @@ use capture::{collect_lambda_captures, lambda_references_name};
 use helpers::{
     check_unintroduced_type_vars, contains_exn_throws, contains_ref, default_numeric_literals,
     describe_ctor_field, external_scheme, extract_row_port_names, get_default_alias,
-    is_allowed_main_throws_signature, is_allowed_main_require_signature, is_auto_droppable,
+    is_allowed_main_require_signature, is_allowed_main_throws_signature, is_auto_droppable,
     merge_type_rows, normalize_enum_generic_params, normalize_typedef_generic_params,
     register_exception_variant, register_nullary_variant_constructor, register_stdlib_types,
     select_float_type, select_int_type, strip_required_port_coeffect, summarize_ctor_args,
