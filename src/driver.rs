@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use wasmparser::Payload;
 
-use crate::cli::{LoadedSource, strip_shebang};
+use crate::cli::{strip_shebang, LoadedSource};
 use nexus::compiler;
 use nexus::compiler::bundler::{self, BundleConfig};
 use nexus::constants::NEXUS_HOST_HTTP_MODULE;
@@ -49,15 +49,14 @@ pub fn compile_loaded_source_to_core_wasm(
         Err(e) => {
             if let Some(span) = e.span() {
                 if !span.is_empty() {
-                    let report =
-                        Report::build(ReportKind::Error, &loaded.display_name, span.start)
-                            .with_message(format!("Compile Error: {}", e))
-                            .with_label(
-                                Label::new((&loaded.display_name, span.clone()))
-                                    .with_message(e.to_string())
-                                    .with_color(Color::Red),
-                            )
-                            .finish();
+                    let report = Report::build(ReportKind::Error, &loaded.display_name, span.start)
+                        .with_message(format!("Compile Error: {}", e))
+                        .with_label(
+                            Label::new((&loaded.display_name, span.clone()))
+                                .with_message(e.to_string())
+                                .with_color(Color::Red),
+                        )
+                        .finish();
                     let _ = report.print((&loaded.display_name, Source::from(&src)));
                 } else {
                     eprintln!("Compile Error: {}", e);

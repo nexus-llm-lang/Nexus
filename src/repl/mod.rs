@@ -15,9 +15,9 @@ use rustyline::Config;
 use crate::compiler::{bundler, codegen};
 use crate::constants::{Permission, ENTRYPOINT};
 use crate::lang::ast::{Expr, GlobalLet, Literal, Program, Spanned, Stmt, TopLevel, Type};
-use crate::runtime::conc::add_nexus_host_stubs;
 use crate::lang::parser::{parser, stmt_parser, ParseError};
 use crate::lang::typecheck::TypeChecker;
+use crate::runtime::conc::add_nexus_host_stubs;
 use crate::runtime::ExecutionCapabilities;
 
 use wasmtime::{Engine, Linker, Module, Store};
@@ -430,10 +430,7 @@ fn handle_top_levels(state: &mut ReplState, defs: Vec<Spanned<TopLevel>>, source
                                 println!("  exception {} defined", ex.name)
                             }
                             TopLevel::Import(imp) => {
-                                let alias = imp
-                                    .alias
-                                    .as_deref()
-                                    .unwrap_or(imp.path.as_str());
+                                let alias = imp.alias.as_deref().unwrap_or(imp.path.as_str());
                                 println!("  imported {}", alias);
                             }
                         }

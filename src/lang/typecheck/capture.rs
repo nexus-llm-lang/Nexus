@@ -1,11 +1,7 @@
 use crate::lang::ast::*;
 use std::collections::HashSet;
 
-pub(super) fn lambda_references_name(
-    body: &[Spanned<Stmt>],
-    params: &[Param],
-    name: &str,
-) -> bool {
+pub(super) fn lambda_references_name(body: &[Spanned<Stmt>], params: &[Param], name: &str) -> bool {
     let mut outer_keys = HashSet::new();
     outer_keys.insert(name.to_string());
     collect_lambda_captures(body, params, &outer_keys).contains(name)
@@ -305,7 +301,13 @@ fn collect_expr_captures(
             collect_expr_captures(end_expr, outer_keys, bound_keys, bound_call_names, captures);
             let mut for_bound_keys = bound_keys.clone();
             for_bound_keys.insert(var.clone());
-            collect_stmt_captures(body, outer_keys, &for_bound_keys, bound_call_names, captures);
+            collect_stmt_captures(
+                body,
+                outer_keys,
+                &for_bound_keys,
+                bound_call_names,
+                captures,
+            );
         }
         Expr::External(_, _, _) => {}
         Expr::Handler { functions, .. } => {

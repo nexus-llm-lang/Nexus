@@ -33,11 +33,12 @@ module.exports = grammar({
   conflicts: ($) => [
     // `foo` vs `foo.bar` — variable or start of dotted_identifier
     [$.variable, $.dotted_identifier],
-    // `T` vs `T<U>` — bare type identifier or start of generic_type
-    [$.generic_type, $._type],
-    [$.generic_type, $._effect_type],
     // `&x` — borrow_expr starting with `&` or sigil `&` in variable/let_stmt
     [$.sigil, $.borrow_expr],
+    // `match x do ...` — match_stmt (stmt body) vs match_expr (expr body) via expr_stmt
+    [$.match_stmt, $.match_expr],
+    // `case pat -> expr` — expr_stmt in match_case body vs match_case_expr value
+    [$.expr_stmt, $.match_case_expr],
   ],
 
   rules: {
@@ -322,6 +323,8 @@ module.exports = grammar({
         $.drop_stmt,
         $.if_stmt,
         $.match_stmt,
+        $.while_stmt,
+        $.for_stmt,
         $.try_stmt,
         $.inject_stmt,
         $.conc_stmt,
@@ -376,6 +379,30 @@ module.exports = grammar({
         field("body", repeat($._stmt))
       ),
 
+    // while cond do stmts end
+    while_stmt: ($) =>
+      seq(
+        "while",
+        field("cond", $._expr),
+        "do",
+        field("body", repeat($._stmt)),
+        "end"
+      ),
+
+    // for var = start to end do stmts end
+    for_stmt: ($) =>
+      seq(
+        "for",
+        field("var", $.identifier),
+        "=",
+        field("start", $._expr),
+        "to",
+        field("end", $._expr),
+        "do",
+        field("body", repeat($._stmt)),
+        "end"
+      ),
+
     // try stmts catch param -> stmts end
     try_stmt: ($) =>
       seq(
@@ -427,13 +454,31 @@ module.exports = grammar({
 
     _expr: ($) => choice($.binary_expr, $._postfix_expr),
 
-    // Binary operators with precedence levels
-    // Level 1: comparison  Level 2: additive  Level 3: multiplicative
+    // Binary operators with precedence levels (low → high)
+    // 1: ||  2: &&  3: comparison  4: additive  5: multiplicative
     binary_expr: ($) =>
       choice(
-        // Float comparisons (must come before int comparisons to avoid partial matches)
+        // Logical OR (lowest precedence)
         prec.left(
           1,
+          seq(
+            field("left", $._expr),
+            field("operator", "||"),
+            field("right", $._expr)
+          )
+        ),
+        // Logical AND
+        prec.left(
+          2,
+          seq(
+            field("left", $._expr),
+            field("operator", "&&"),
+            field("right", $._expr)
+          )
+        ),
+        // Float comparisons (must come before int comparisons to avoid partial matches)
+        prec.left(
+          3,
           seq(
             field("left", $._expr),
             field("operator", choice("==.", "!=.", "<=.", ">=.", "<.", ">.")),
@@ -442,7 +487,7 @@ module.exports = grammar({
         ),
         // Int/generic comparisons
         prec.left(
-          1,
+          3,
           seq(
             field("left", $._expr),
             field("operator", choice("==", "!=", "<=", ">=", "<", ">")),
@@ -451,7 +496,7 @@ module.exports = grammar({
         ),
         // Float additive
         prec.left(
-          2,
+          4,
           seq(
             field("left", $._expr),
             field("operator", choice("+.", "-.")),
@@ -460,7 +505,7 @@ module.exports = grammar({
         ),
         // Int/string additive (++ = string concat)
         prec.left(
-          2,
+          4,
           seq(
             field("left", $._expr),
             field("operator", choice("++", "+", "-")),
@@ -469,7 +514,7 @@ module.exports = grammar({
         ),
         // Float multiplicative
         prec.left(
-          3,
+          5,
           seq(
             field("left", $._expr),
             field("operator", choice("*.", "/.")),
@@ -478,7 +523,7 @@ module.exports = grammar({
         ),
         // Int multiplicative
         prec.left(
-          3,
+          5,
           seq(
             field("left", $._expr),
             field("operator", choice("*", "/")),
@@ -516,6 +561,7 @@ module.exports = grammar({
     _atom_expr: ($) =>
       choice(
         $.paren_expr,
+        $.match_expr,
         $.raise_expr,
         $.borrow_expr,
         $.lambda_expr,
@@ -527,6 +573,24 @@ module.exports = grammar({
         $.list_expr,
         $.literal,
         $.variable
+      ),
+
+    // match expr do case pat -> expr ... end  (expression position)
+    match_expr: ($) =>
+      seq(
+        "match",
+        field("target", $._expr),
+        "do",
+        repeat($.match_case_expr),
+        "end"
+      ),
+
+    match_case_expr: ($) =>
+      seq(
+        "case",
+        field("pattern", $._pattern),
+        "->",
+        field("value", $._expr)
       ),
 
     paren_expr: ($) => seq("(", $._expr, ")"),
@@ -572,11 +636,12 @@ module.exports = grammar({
         field("type", $.arrow_type)
       ),
 
-    // handler PortName do handler_fn* end
+    // handler PortName [require { ... }] do handler_fn* end
     handler_expr: ($) =>
       seq(
         "handler",
         field("port_name", $.uident),
+        optional(seq("require", field("requires", $._effect_type))),
         "do",
         repeat($.handler_fn),
         "end"
@@ -670,24 +735,32 @@ module.exports = grammar({
     // ()
     unit_literal: (_) => token("()"),
 
-    // [=[ content ]=]
-    // Escape: \]=] represents a literal ]=] inside the string.
+    // "..." or [=[ ... ]=]
     string_literal: (_) =>
       token(
-        seq(
-          "[=[",
-          repeat(
-            choice(
-              seq("\\", "]=]"), // escape sequence: \]=] → ]=]
-              seq("\\", /[^\]]/), // backslash + non-] character
-              seq("\\", "]", /[^=]/), // \] not starting \]=]
-              seq("\\", "]=", /[^\]]/), // \]= not completing \]=]
-              seq("]", /[^=]/), // ] not starting ]=]
-              seq("]=", /[^\]]/), // ]= not completing ]=]
-              /[^\]\\]/ // any char except ] and \
-            )
+        choice(
+          // double-quoted string with escape sequences
+          seq(
+            '"',
+            repeat(choice(/\\[nrt\\""]/, /[^"\\\n]/)),
+            '"'
           ),
-          "]=]"
+          // bracket string [=[ ... ]=]
+          seq(
+            "[=[",
+            repeat(
+              choice(
+                seq("\\", "]=]"), // escape sequence: \]=] → ]=]
+                seq("\\", /[^\]]/), // backslash + non-] character
+                seq("\\", "]", /[^=]/), // \] not starting \]=]
+                seq("\\", "]=", /[^\]]/), // \]= not completing \]=]
+                seq("]", /[^=]/), // ] not starting ]=]
+                seq("]=", /[^\]]/), // ]= not completing ]=]
+                /[^\]\\]/ // any char except ] and \
+              )
+            ),
+            "]=]"
+          )
         )
       ),
 

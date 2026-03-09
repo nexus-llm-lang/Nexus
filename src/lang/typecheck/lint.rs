@@ -234,7 +234,10 @@ impl TypeChecker {
                 self.collect_unused_local_variable_warnings_in_stmts(body);
             }
             Expr::For {
-                start, end_expr, body, ..
+                start,
+                end_expr,
+                body,
+                ..
             } => {
                 self.collect_unused_local_variable_warnings_in_expr(start);
                 self.collect_unused_local_variable_warnings_in_expr(end_expr);
@@ -525,7 +528,10 @@ fn collect_signature_needs_from_expr(
             (reqs, effs, unknown)
         }
         Expr::For {
-            start, end_expr, body, ..
+            start,
+            end_expr,
+            body,
+            ..
         } => {
             let (mut reqs, mut effs, mut unknown) = collect_signature_needs_from_expr(start, env);
             let (end_reqs, end_effs, end_unknown) =
@@ -598,7 +604,10 @@ fn expr_mentions_name(expr: &Spanned<Expr>, target: &str) -> bool {
                 || body.iter().any(|stmt| stmt_mentions_name(stmt, target))
         }
         Expr::For {
-            start, end_expr, body, ..
+            start,
+            end_expr,
+            body,
+            ..
         } => {
             expr_mentions_name(start, target)
                 || expr_mentions_name(end_expr, target)
@@ -734,7 +743,10 @@ fn collect_used_variable_keys_in_expr(expr: &Spanned<Expr>, out: &mut HashSet<St
             collect_used_variable_keys_in_stmts(body, out);
         }
         Expr::For {
-            start, end_expr, body, ..
+            start,
+            end_expr,
+            body,
+            ..
         } => {
             collect_used_variable_keys_in_expr(start, out);
             collect_used_variable_keys_in_expr(end_expr, out);
@@ -833,7 +845,10 @@ fn collect_local_let_bindings_in_expr(expr: &Spanned<Expr>, out: &mut Vec<(Strin
             collect_local_let_bindings(body, out);
         }
         Expr::For {
-            start, end_expr, body, ..
+            start,
+            end_expr,
+            body,
+            ..
         } => {
             collect_local_let_bindings_in_expr(start, out);
             collect_local_let_bindings_in_expr(end_expr, out);
@@ -841,8 +856,7 @@ fn collect_local_let_bindings_in_expr(expr: &Spanned<Expr>, out: &mut Vec<(Strin
         }
         // Nested functions/handlers are analyzed separately.
         Expr::Lambda { .. } | Expr::Handler { .. } => {}
-        Expr::Literal(_) | Expr::Variable(_, _) | Expr::Borrow(_, _) | Expr::External(_, _, _) => {
-        }
+        Expr::Literal(_) | Expr::Variable(_, _) | Expr::Borrow(_, _) | Expr::External(_, _, _) => {}
     }
 }
 

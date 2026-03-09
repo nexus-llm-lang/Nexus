@@ -175,7 +175,9 @@ pub fn build_execution_capabilities(
     Ok(capabilities)
 }
 
-pub fn extract_main_requires(program: &nexus::lang::ast::Program) -> Option<&nexus::lang::ast::Type> {
+pub fn extract_main_requires(
+    program: &nexus::lang::ast::Program,
+) -> Option<&nexus::lang::ast::Type> {
     program.definitions.iter().find_map(|def| {
         if let nexus::lang::ast::TopLevel::Let(gl) = &def.node {
             if gl.name == nexus::constants::ENTRYPOINT {

@@ -5,7 +5,7 @@ use crate::lang::ast::Type;
 
 use super::emit::{is_string_concat_operator, peel_linear};
 use super::error::CodegenError;
-use super::{STRING_DATA_BASE};
+use super::STRING_DATA_BASE;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PackedString {
@@ -162,10 +162,7 @@ fn stmt_uses_object_heap(stmt: &LirStmt) -> bool {
         LirStmt::Conc { tasks } => !tasks.is_empty(),
         LirStmt::Loop {
             cond_stmts, body, ..
-        } => {
-            cond_stmts.iter().any(stmt_uses_object_heap)
-                || body.iter().any(stmt_uses_object_heap)
-        }
+        } => cond_stmts.iter().any(stmt_uses_object_heap) || body.iter().any(stmt_uses_object_heap),
     }
 }
 

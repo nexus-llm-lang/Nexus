@@ -433,7 +433,10 @@ end
             }
         }
     }
-    assert!(has_return_call, "tail-recursive call should emit return_call instruction");
+    assert!(
+        has_return_call,
+        "tail-recursive call should emit return_call instruction"
+    );
 }
 
 #[test]
@@ -469,7 +472,10 @@ end
             }
         }
     }
-    assert!(has_return_call, "tail call in if-else branch should emit return_call");
+    assert!(
+        has_return_call,
+        "tail call in if-else branch should emit return_call"
+    );
 }
 
 #[test]
@@ -499,7 +505,10 @@ end
             }
         }
     }
-    assert!(!has_return_call, "non-tail call should not emit return_call");
+    assert!(
+        !has_return_call,
+        "non-tail call should not emit return_call"
+    );
 }
 
 #[test]

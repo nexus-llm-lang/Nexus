@@ -650,15 +650,30 @@ impl Parser {
         match op {
             BinaryOp::Or => 1,
             BinaryOp::And => 2,
-            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le
-            | BinaryOp::Gt | BinaryOp::Ge
-            | BinaryOp::FEq | BinaryOp::FNe | BinaryOp::FLt | BinaryOp::FLe
-            | BinaryOp::FGt | BinaryOp::FGe => 3,
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Concat
-            | BinaryOp::FAdd | BinaryOp::FSub
-            | BinaryOp::BitOr | BinaryOp::BitXor => 4,
-            BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod
-            | BinaryOp::FMul | BinaryOp::FDiv
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge
+            | BinaryOp::FEq
+            | BinaryOp::FNe
+            | BinaryOp::FLt
+            | BinaryOp::FLe
+            | BinaryOp::FGt
+            | BinaryOp::FGe => 3,
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Concat
+            | BinaryOp::FAdd
+            | BinaryOp::FSub
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor => 4,
+            BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::FMul
+            | BinaryOp::FDiv
             | BinaryOp::BitAnd => 5,
             BinaryOp::Shl | BinaryOp::Shr => 6,
         }

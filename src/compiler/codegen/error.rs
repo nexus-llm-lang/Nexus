@@ -1,7 +1,7 @@
-use crate::lang::ast::BinaryOp;
 use super::HirBuildError;
-use super::MirLowerError;
 use super::LirLowerError;
+use super::MirLowerError;
+use crate::lang::ast::BinaryOp;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodegenError {

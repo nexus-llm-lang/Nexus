@@ -1,4 +1,4 @@
-use super::env::{Scheme, TypeError, TypeEnv};
+use super::env::{Scheme, TypeEnv, TypeError};
 use crate::constants::Permission;
 use crate::lang::ast::*;
 use crate::lang::stdlib::load_stdlib_nx_programs;

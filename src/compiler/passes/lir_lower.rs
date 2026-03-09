@@ -1058,9 +1058,7 @@ impl<'a> LowerCtx<'a> {
                     span: 0..0,
                 })
             }
-            MirExpr::Match { target, cases } => {
-                self.lower_match_expr(target, cases)
-            }
+            MirExpr::Match { target, cases } => self.lower_match_expr(target, cases),
             MirExpr::While { .. } => Err(LirLowerError::UnsupportedExpression {
                 detail: "While loop in atom position; should be lowered at statement level"
                     .to_string(),

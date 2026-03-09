@@ -5,7 +5,7 @@ mod helpers;
 mod lint;
 mod unify;
 
-pub use env::{Scheme, TypeError, TypeEnv, TypeWarning};
+pub use env::{Scheme, TypeEnv, TypeError, TypeWarning};
 pub use helpers::{exn_enum_def, list_enum_def};
 pub use unify::apply_subst_type;
 
@@ -19,7 +19,10 @@ use helpers::{
     select_float_type, select_int_type, strip_required_port_coeffect, summarize_ctor_args,
     summarize_ctor_fields,
 };
-use lint::{collect_signature_needs_from_stmts, extract_named_row_members, find_private_type_in_public_signature};
+use lint::{
+    collect_signature_needs_from_stmts, extract_named_row_members,
+    find_private_type_in_public_signature,
+};
 use unify::compose_subst;
 
 use super::ast::*;
@@ -300,8 +303,7 @@ impl TypeChecker {
                 }
                 TopLevel::TypeDef(td) => {
                     let td_norm = normalize_typedef_generic_params(td);
-                    self.type_defs
-                        .insert(td_norm.name.clone(), td_norm.clone());
+                    self.type_defs.insert(td_norm.name.clone(), td_norm.clone());
                     self.env.types.insert(td_norm.name.clone(), td_norm);
                 }
                 TopLevel::Enum(ed) => {
@@ -1061,8 +1063,16 @@ impl TypeChecker {
                 let (s2, t2) = self.infer(env, r, er, eq, ee)?;
                 let mut s = compose_subst(&s1, &s2);
                 match op {
-                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod
-                    | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr => {
+                    BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Mod
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::BitXor
+                    | BinaryOp::Shl
+                    | BinaryOp::Shr => {
                         let lt = apply_subst_type(&s, &t1);
                         let rt = apply_subst_type(&s, &t2);
                         let target = select_int_type(&lt, &rt).ok_or_else(|| TypeError {
@@ -1618,8 +1628,7 @@ impl TypeChecker {
                         let last = &case.body[last_idx];
                         match &last.node {
                             Stmt::Expr(expr) => {
-                                let (s_tail, t_tail) =
-                                    self.infer(&mut le, expr, er, eq, ee)?;
+                                let (s_tail, t_tail) = self.infer(&mut le, expr, er, eq, ee)?;
                                 let tail = apply_subst_type(&s_tail, &t_tail);
                                 s = compose_subst(&s, &s_tail);
                                 case_tail_types.push(Some(apply_subst_type(&s, &tail)));
@@ -1628,11 +1637,12 @@ impl TypeChecker {
                                 let (s1, t1) = self.infer(&mut le, expr, er, eq, ee)?;
                                 le.apply(&s1);
                                 le.check_unused_linear(&expr.span)?;
-                                self.unify(&t1, &apply_subst_type(&s1, er))
-                                    .map_err(|err| TypeError {
+                                self.unify(&t1, &apply_subst_type(&s1, er)).map_err(|err| {
+                                    TypeError {
                                         message: err,
                                         span: expr.span.clone(),
-                                    })?;
+                                    }
+                                })?;
                                 case_tail_types.push(None); // diverges
                             }
                             _ => {
@@ -1664,7 +1674,9 @@ impl TypeChecker {
                     let mut result_type = non_diverging[0].clone();
                     for ct in &non_diverging[1..] {
                         let su = self.unify(&result_type, ct).map_err(|_| TypeError {
-                            message: "Match case type mismatch: all cases must produce the same type".into(),
+                            message:
+                                "Match case type mismatch: all cases must produce the same type"
+                                    .into(),
                             span: e.span.clone(),
                         })?;
                         s = compose_subst(&s, &su);

@@ -17,10 +17,25 @@ use std::fs;
 
 #[derive(Debug)]
 pub enum HirBuildError {
-    ImportReadError { path: String, detail: String, span: Span },
-    ImportParseError { path: String, detail: String, span: Span },
-    CyclicImport { path: String, span: Span },
-    ImportItemNotFound { item: String, path: String, span: Span },
+    ImportReadError {
+        path: String,
+        detail: String,
+        span: Span,
+    },
+    ImportParseError {
+        path: String,
+        detail: String,
+        span: Span,
+    },
+    CyclicImport {
+        path: String,
+        span: Span,
+    },
+    ImportItemNotFound {
+        item: String,
+        path: String,
+        span: Span,
+    },
 }
 
 impl std::fmt::Display for HirBuildError {
@@ -165,8 +180,7 @@ impl HirBuilder {
                                 .strip_prefix(binding.port_name.as_str())
                                 .and_then(|s| s.strip_prefix('.'))
                             {
-                                let handler_fn =
-                                    format!("__handler_{}_{}", binding_name, method);
+                                let handler_fn = format!("__handler_{}_{}", binding_name, method);
                                 if !reachable.contains(&handler_fn) {
                                     worklist.push(handler_fn);
                                 }
@@ -466,10 +480,7 @@ impl HirBuilder {
                         if port.is_public && selected.contains(&port.name) {
                             map.insert(port.name.clone(), port.name.clone());
                         } else {
-                            map.insert(
-                                port.name.clone(),
-                                format!("{}.{}", alias, port.name),
-                            );
+                            map.insert(port.name.clone(), format!("{}.{}", alias, port.name));
                         }
                     }
                     _ => {}
@@ -483,10 +494,7 @@ impl HirBuilder {
                         if selected.contains(&gl.name) {
                             map.insert(gl.name.clone(), gl.name.clone());
                         } else {
-                            map.insert(
-                                gl.name.clone(),
-                                format!("{}_{}", alias_prefix, gl.name),
-                            );
+                            map.insert(gl.name.clone(), format!("{}_{}", alias_prefix, gl.name));
                         }
                     }
                     TopLevel::Port(port) => {
@@ -838,7 +846,12 @@ fn collect_calls_in_hir_expr(expr: &HirExpr, out: &mut Vec<String>) {
             collect_calls_in_hir_expr(cond, out);
             collect_calls_in_hir_stmts(body, out);
         }
-        HirExpr::For { start, end_expr, body, .. } => {
+        HirExpr::For {
+            start,
+            end_expr,
+            body,
+            ..
+        } => {
             collect_calls_in_hir_expr(start, out);
             collect_calls_in_hir_expr(end_expr, out);
             collect_calls_in_hir_stmts(body, out);

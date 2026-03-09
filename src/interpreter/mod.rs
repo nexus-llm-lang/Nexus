@@ -2289,11 +2289,7 @@ impl Interpreter {
                     match cond_val {
                         Value::Bool(false) => break,
                         Value::Bool(true) => {}
-                        _ => {
-                            return Err(runtime_error(
-                                "while condition must be bool".to_string(),
-                            ))
-                        }
+                        _ => return Err(runtime_error("while condition must be bool".to_string())),
                     }
                     match self.eval_body(body, env)? {
                         ExprResult::EarlyReturn(v) => return Ok(ExprResult::EarlyReturn(v)),
@@ -2318,11 +2314,7 @@ impl Interpreter {
                 };
                 let (s, e) = match (&start_val, &end_val) {
                     (Value::Int(s), Value::Int(e)) => (*s, *e),
-                    _ => {
-                        return Err(runtime_error(
-                            "for range must be integers".to_string(),
-                        ))
-                    }
+                    _ => return Err(runtime_error("for range must be integers".to_string())),
                 };
                 for i in s..e {
                     env.define(var.clone(), Value::Int(i));

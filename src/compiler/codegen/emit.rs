@@ -436,7 +436,7 @@ pub(super) fn emit_string_compare(
     out.instruction(&Instruction::Br(1)); // br $done
 
     out.instruction(&Instruction::End); // end $not_equal
-    // Not equal path: push 0
+                                        // Not equal path: push 0
     out.instruction(&Instruction::I32Const(0));
     out.instruction(&Instruction::End); // end $done
 
@@ -452,7 +452,11 @@ pub(super) fn pack_string(s: PackedString) -> i64 {
     (((s.offset as u64) << 32) | (s.len as u64)) as i64
 }
 
-pub(super) fn emit_numeric_coercion(from: &Type, to: &Type, out: &mut Function) -> Result<(), CodegenError> {
+pub(super) fn emit_numeric_coercion(
+    from: &Type,
+    to: &Type,
+    out: &mut Function,
+) -> Result<(), CodegenError> {
     let from = peel_linear(from);
     let to = peel_linear(to);
     if from == to {

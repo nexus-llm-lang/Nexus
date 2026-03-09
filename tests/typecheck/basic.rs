@@ -122,8 +122,10 @@ fn test_poly_variants() {
 
 #[test]
 fn test_type_sum_definition_with_labeled_variant_fields() {
-    let src = std::fs::read_to_string("tests/fixtures/test_type_sum_definition_with_labeled_variant_fields.nx")
-        .expect("fixture should exist");
+    let src = std::fs::read_to_string(
+        "tests/fixtures/test_type_sum_definition_with_labeled_variant_fields.nx",
+    )
+    .expect("fixture should exist");
     should_typecheck(&src);
 }
 
@@ -273,8 +275,10 @@ fn test_linear_capturing_lambda_cannot_be_called_twice() {
 
 #[test]
 fn test_recursive_lambda_with_annotation_typechecks() {
-    let src = std::fs::read_to_string("tests/fixtures/test_recursive_lambda_with_annotation_typechecks.nx")
-        .expect("fixture should exist");
+    let src = std::fs::read_to_string(
+        "tests/fixtures/test_recursive_lambda_with_annotation_typechecks.nx",
+    )
+    .expect("fixture should exist");
     should_typecheck(&src);
 }
 

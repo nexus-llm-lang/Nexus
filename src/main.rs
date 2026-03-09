@@ -168,15 +168,16 @@ fn build_command(
         Ok(c) => c,
         Err(code) => return code,
     };
-    let component_wasm =
-        match artifact::encode_core_wasm_as_component(&compiled.wasm, compiled.app_needs_nexus_host)
-        {
-            Ok(component_wasm) => component_wasm,
-            Err(msg) => {
-                eprintln!("Component Encode Error: {}", msg);
-                return ExitCode::from(1);
-            }
-        };
+    let component_wasm = match artifact::encode_core_wasm_as_component(
+        &compiled.wasm,
+        compiled.app_needs_nexus_host,
+    ) {
+        Ok(component_wasm) => component_wasm,
+        Err(msg) => {
+            eprintln!("Component Encode Error: {}", msg);
+            return ExitCode::from(1);
+        }
+    };
     let output_path = output.unwrap_or_else(default_wasm_output_path);
     if let Err(e) = fs::write(&output_path, &component_wasm) {
         eprintln!("Failed to write {}: {}", output_path.display(), e);

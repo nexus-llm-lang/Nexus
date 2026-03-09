@@ -61,10 +61,7 @@ fn color_program_with_cases(case_ctors: &[&str]) -> Program {
                             value: sp(Expr::Constructor("Red".to_string(), vec![])),
                         }),
                         sp(Stmt::Expr(sp(Expr::Match {
-                            target: Box::new(sp(Expr::Variable(
-                                "c".to_string(),
-                                Sigil::Immutable,
-                            ))),
+                            target: Box::new(sp(Expr::Variable("c".to_string(), Sigil::Immutable))),
                             cases,
                         }))),
                         sp(Stmt::Return(sp(Expr::Literal(Literal::Unit)))),

@@ -104,9 +104,7 @@ fn do_http_request(method: &str, url: &str, headers: &str, body: &str) -> String
         }
 
         let response = if body.is_empty() {
-            let req = builder
-                .body(())
-                .map_err(|e: http::Error| e.to_string())?;
+            let req = builder.body(()).map_err(|e: http::Error| e.to_string())?;
             agent.run(req).map_err(|e: ureq::Error| e.to_string())?
         } else {
             let req = builder
@@ -174,9 +172,7 @@ fn do_accept(server_id: i64) -> Result<String, String> {
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| e.to_string())?;
+        reader.read_line(&mut line).map_err(|e| e.to_string())?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
@@ -199,8 +195,12 @@ fn do_accept(server_id: i64) -> Result<String, String> {
 
     let req_id = next_id();
     CONNS.with(|c| {
-        c.borrow_mut()
-            .insert(req_id, ConnEntry { stream: peer_stream })
+        c.borrow_mut().insert(
+            req_id,
+            ConnEntry {
+                stream: peer_stream,
+            },
+        )
     });
 
     Ok(format!(

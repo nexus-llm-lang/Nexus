@@ -13,23 +13,21 @@ use wasm_encoder::{
     Instruction, MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
-use crate::constants::{
-    Permission, ENTRYPOINT, MEMORY_EXPORT, NEXUS_CAPABILITIES_SECTION, WASI_CLI_RUN_EXPORT,
-};
-use crate::ir::lir::{
-    LirAtom, LirExpr, LirFunction, LirProgram, LirStmt,
-};
-use crate::lang::ast::{BinaryOp, Program, Type};
 use super::passes::hir_build::{build_hir, HirBuildError};
 use super::passes::lir_lower::{lower_mir_to_lir, LirLowerError};
 use super::passes::mir_lower::{lower_hir_to_mir, MirLowerError};
+use crate::constants::{
+    Permission, ENTRYPOINT, MEMORY_EXPORT, NEXUS_CAPABILITIES_SECTION, WASI_CLI_RUN_EXPORT,
+};
+use crate::ir::lir::{LirAtom, LirExpr, LirFunction, LirProgram, LirStmt};
+use crate::lang::ast::{BinaryOp, Program, Type};
 
 use emit::{
-    compile_external_arg, constructor_tag, emit_alloc_object,
-    emit_numeric_coercion, emit_pack_value_to_i64, emit_string_compare, emit_string_concat,
-    emit_unpack_i64_to_value, expr_type, external_param_types, external_return_types,
-    is_string_compare_operator, is_string_concat_operator, memarg, pack_string, peel_linear,
-    record_tag, return_type_to_wasm_result, type_to_wasm_valtype,
+    compile_external_arg, constructor_tag, emit_alloc_object, emit_numeric_coercion,
+    emit_pack_value_to_i64, emit_string_compare, emit_string_concat, emit_unpack_i64_to_value,
+    expr_type, external_param_types, external_return_types, is_string_compare_operator,
+    is_string_concat_operator, memarg, pack_string, peel_linear, record_tag,
+    return_type_to_wasm_result, type_to_wasm_valtype,
 };
 use layout::{build_codegen_layout, CodegenLayout, MemoryMode};
 
@@ -885,7 +883,7 @@ fn compile_stmt(
             compile_atom(cond, out, local_map, layout)?;
             emit_numeric_coercion(&cond.typ(), &Type::Bool, out)?;
             out.instruction(&Instruction::BrIf(1)); // break to outer block
-            // Body
+                                                    // Body
             for nested in body {
                 compile_stmt(
                     nested,
