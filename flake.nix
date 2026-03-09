@@ -83,9 +83,7 @@
         };
       in
       {
-        packages = {
-          tree-sitter-nexus = tsNexus;
-        };
+        packages.tree-sitter-nexus = tsNexus;
         legacyPackages = pkgs;
         inherit formatter devShells;
       }
