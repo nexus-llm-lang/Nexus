@@ -34,23 +34,23 @@ Nexus rejects continuations entirely. Instead:
 
 ```nexus
 port Logger do
-    fn info(msg: string) -> unit
+  fn info(msg: string) -> unit
 end
 
 let console_logger = handler Logger require { Console } do
-    fn info(msg: string) -> unit do
-        Console.println(val: "[INFO] " ++ msg)
-        return ()
-    end
+  fn info(msg: string) -> unit do
+    Console.println(val: "[INFO] " ++ msg)
+    return ()
+  end
 end
 
 let main = fn () -> unit require { PermConsole } do
-    inject stdio.system_handler do
-        inject console_logger do
-            Logger.info(msg: "starting")
-        end
+  inject stdio.system_handler do
+    inject console_logger do
+      Logger.info(msg: "starting")
     end
-    return ()
+  end
+  return ()
 end
 ```
 
@@ -61,11 +61,11 @@ The tradeoff is explicit: less expressive handlers in exchange for every call si
 Garbage collectors and finalizers are contextual -- resources disappear "sometime later" through an invisible mechanism. Nexus makes resource lifecycle visible in syntax with the `%` sigil:
 
 ```nexus
-let %h = Fs.open_read(path: path)       // acquire
-let %r = Fs.read(handle: %h)            // consume %h, get new handle back
+let %h = Fs.open_read(path: path)     // acquire
+let %r = Fs.read(handle: %h)      // consume %h, get new handle back
 match %r do
-    case { content: c, handle: %h2 } ->
-        Fs.close(handle: %h2)           // release
+  case { content: c, handle: %h2 } ->
+    Fs.close(handle: %h2)       // release
 end
 ```
 
@@ -77,10 +77,10 @@ Hidden aliasing is a major source of bugs in both human and LLM-generated code. 
 
 ```nexus
 let server = Net.listen(addr: addr)
-let req = Net.accept(server: &server)    // &server: borrow, not consume
+let req = Net.accept(server: &server)  // &server: borrow, not consume
 let method = request_method(req: &req)   // &req: borrow, not consume
-let _ = Net.respond(req: req, ...)       // consume req
-Net.stop(server: server)                 // consume server
+let _ = Net.respond(req: req, ...)     // consume req
+Net.stop(server: server)         // consume server
 ```
 
 Every read-without-consuming is syntactically marked. No hidden reference counting, no shared pointers, no implicit copies.
@@ -92,15 +92,15 @@ Positional arguments require looking at the function signature to know what each
 ```nexus
 // Every argument is self-documenting
 let result = request(
-    method: "POST",
-    url: "https://api.example.com",
-    headers: headers,
-    body: payload
+  method: "POST",
+  url: "https://api.example.com",
+  headers: headers,
+  body: payload
 )
 
 // Every block has an unambiguous terminator
 if condition then
-    // ...
+  // ...
 end
 ```
 
@@ -110,11 +110,11 @@ Ambient authority -- where any function can read files, make network requests, o
 
 ```nexus
 let main = fn () -> unit require { PermNet, PermConsole } do
-    inject net_handler, stdio_handler do
-        let body = Net.get(url: "https://example.com")
-        Console.println(val: body)
-    end
-    return ()
+  inject net_handler, stdio_handler do
+    let body = Net.get(url: "https://example.com")
+    Console.println(val: body)
+  end
+  return ()
 end
 ```
 

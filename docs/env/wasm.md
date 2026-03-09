@@ -34,7 +34,7 @@ Required permissions are stored in a custom WASM section named `nexus:capabiliti
 ```
 Section name: "nexus:capabilities"
 Data format:  UTF-8 newline-separated capability names
-Example:      "Fs\nNet\nConsole\n"
+Example:    "Fs\nNet\nConsole\n"
 ```
 
 This allows tools to inspect required permissions without executing the binary.
@@ -58,7 +58,7 @@ When a program requires `PermNet`, the compiler automatically composes this brid
 ### Compile to WASM
 
 ```bash
-nexus build program.nx                  # outputs main.wasm
+nexus build program.nx          # outputs main.wasm
 nexus build program.nx -o output.wasm   # custom output path
 ```
 
@@ -80,8 +80,8 @@ wasmtime run -Scli --dir ./data main.wasm
 ### Inspect Capabilities
 
 ```bash
-nexus build program.nx --explain-capabilities           # list capability names (default)
+nexus build program.nx --explain-capabilities       # list capability names (default)
 nexus build program.nx --explain-capabilities=wasmtime   # show wasmtime run command with flags
-nexus build program.nx --explain-capabilities=none       # suppress output
+nexus build program.nx --explain-capabilities=none     # suppress output
 nexus build program.nx --explain-capabilities-format=json  # machine-readable JSON
 ```

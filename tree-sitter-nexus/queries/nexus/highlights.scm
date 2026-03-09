@@ -124,9 +124,17 @@
 (variable_pattern
   name: (identifier) @variable)
 
-; ─── Sigils ─────────────────────────────────────────────────────────────────
+; ─── Sigils & Type modifiers ────────────────────────────────────────────────
 
 (sigil) @operator
+
+"opaque" @keyword.modifier
+
+(linear_type
+  "%" @operator)
+
+(borrow_type
+  "&" @operator)
 
 ; ─── Literals ───────────────────────────────────────────────────────────────
 
@@ -154,8 +162,8 @@
 
 ; ─── Comments ───────────────────────────────────────────────────────────────
 
-(line_comment) @comment @spell
-(block_comment) @comment @spell
+(line_comment) @comment
+(block_comment) @comment
 
 ; ─── Punctuation ────────────────────────────────────────────────────────────
 

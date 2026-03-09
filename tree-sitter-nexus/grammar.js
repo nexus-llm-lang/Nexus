@@ -73,11 +73,12 @@ module.exports = grammar({
         $.block_comment
       ),
 
-    // [pub] type Name[<T>] = { field: type, ... }
-    // [pub] type Name[<T>] = A(label: T) | B
+    // [pub] [opaque] type Name[<T>] = { field: type, ... }
+    // [pub] [opaque] type Name[<T>] = A(label: T) | B
     type_def: ($) =>
       seq(
         optional("pub"),
+        optional("opaque"),
         "type",
         field("name", $.uident),
         optional(field("type_params", $.type_params)),
@@ -190,11 +191,12 @@ module.exports = grammar({
         "end"
       ),
 
-    // [pub] let name [: type] = expr
+    // [pub] let [sigil] name [: type] = expr
     let_def: ($) =>
       seq(
         optional("pub"),
         "let",
+        optional(field("sigil", $.sigil)),
         field("name", $.identifier),
         optional(seq(":", field("type", $._type))),
         "=",

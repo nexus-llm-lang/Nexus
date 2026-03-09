@@ -111,8 +111,8 @@ If a closure captures a linear binding, the closure itself becomes linear and ca
 ```nexus
 let %resource = acquire()
 let f = fn () -> unit do
-    consume(r: %resource)
-    return ()
+  consume(r: %resource)
+  return ()
 end
 f()  // ok -- consumes the closure
 f()  // error -- closure already consumed
@@ -127,9 +127,9 @@ The `&` sigil creates an immutable, non-consuming view of a value (see [Design](
 `&` works both as a prefix operator and as a let-binding sigil:
 
 ```nexus
-let borrowed = &arr          // prefix operator on immutable binding
-let &b = ~x                  // let-binding sigil
-let b2 = &%resource          // prefix operator on linear binding
+let borrowed = &arr      // prefix operator on immutable binding
+let &b = ~x          // let-binding sigil
+let b2 = &%resource      // prefix operator on linear binding
 ```
 
 ### Coercion
@@ -142,8 +142,8 @@ Borrow patterns bind without consuming:
 
 ```nexus
 fn peek(x: &i64) -> unit do
-    // x is &i64, original not consumed
-    return ()
+  // x is &i64, original not consumed
+  return ()
 end
 ```
 
@@ -196,11 +196,11 @@ This ensures mutation remains localized and predictable.
 Functions are first-class values with labeled parameters and optional effect/coeffect annotations:
 
 ```nexus
-(label: T) -> R                                    // pure function
-(a: i64, b: i64) -> i64                            // multiple params
-() -> unit effect { Exn }                          // with effect
-() -> string require { Net }                       // with coeffect
-(x: T) -> R require { C | r } effect { E | e }    // open rows
+(label: T) -> R                  // pure function
+(a: i64, b: i64) -> i64              // multiple params
+() -> unit effect { Exn }              // with effect
+() -> string require { Net }             // with coeffect
+(x: T) -> R require { C | r } effect { E | e }  // open rows
 ```
 
 ### Closures
@@ -209,7 +209,7 @@ Lambdas capture immutable bindings from their lexical scope:
 
 ```nexus
 let f = fn (x: i64) -> i64 do
-    return x + 1
+  return x + 1
 end
 ```
 
@@ -223,9 +223,9 @@ Closure constraints:
 Effect and coeffect annotations use row types:
 
 ```nexus
-{ Exn }                // single entry
-{ Net, Fs }            // multiple entries
-{ Console | e }        // open row with tail variable
+{ Exn }        // single entry
+{ Net, Fs }      // multiple entries
+{ Console | e }    // open row with tail variable
 ```
 
 Empty row (omitted or `{}`) means no effects/requirements.

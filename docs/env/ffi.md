@@ -61,10 +61,10 @@ import external utils.wasm
 external process_data = "process" : (val: float) -> float
 
 let main = fn () -> unit require { PermConsole } do
-    inject stdio.system_handler do
-        let result = process_data(val: 42.0)
-        Console.println(val: string.from_float(val: result))
-    end
-    return ()
+  inject stdio.system_handler do
+    let result = process_data(val: 42.0)
+    Console.println(val: string.from_float(val: result))
+  end
+  return ()
 end
 ```

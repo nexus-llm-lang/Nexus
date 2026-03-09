@@ -62,13 +62,13 @@ Sigils are not annotations -- they impose runtime behavioral constraints.
 
 ```nexus
 try
-    raise NotFound(msg: "key")
+  raise NotFound(msg: "key")
 catch e ->
-    // e : Exn
-    match e do
-        case NotFound(msg: m) -> ()
-        case _ -> ()
-    end
+  // e : Exn
+  match e do
+    case NotFound(msg: m) -> ()
+    case _ -> ()
+  end
 end
 ```
 
@@ -80,7 +80,7 @@ Exceptions are the only builtin effect. There are no unchecked exceptions -- any
 
 ```nexus
 while condition do
-    body
+  body
 end
 ```
 
@@ -90,7 +90,7 @@ Evaluates `condition` before each iteration. If the condition is `false`, exits.
 
 ```nexus
 for var = start to end_expr do
-    body
+  body
 end
 ```
 
@@ -100,8 +100,8 @@ Desugared to:
 let ~var = start
 let ~__end = end_expr
 while ~var < ~__end do
-    body
-    ~var <- ~var + 1
+  body
+  ~var <- ~var + 1
 end
 ```
 
@@ -113,9 +113,9 @@ Match can appear in expression position. Each case body produces a value:
 
 ```nexus
 let result = match x do
-    case 1 -> 10
-    case 2 -> 20
-    case _ -> 30
+  case 1 -> 10
+  case 2 -> 20
+  case _ -> 30
 end
 ```
 
@@ -127,12 +127,12 @@ All non-diverging case bodies must produce the same type. Cases containing a `re
 
 ```nexus
 conc do
-    task worker1 do
-        // ...
-    end
-    task worker2 do
-        // ...
-    end
+  task worker1 do
+    // ...
+  end
+  task worker2 do
+    // ...
+  end
 end
 ```
 
@@ -154,10 +154,10 @@ Every Nexus program must define a `main` function with these constraints:
 
 ```nexus
 let main = fn () -> unit require { PermConsole } do
-    inject stdio.system_handler do
-        Console.println(val: "Hello")
-    end
-    return ()
+  inject stdio.system_handler do
+    Console.println(val: "Hello")
+  end
+  return ()
 end
 ```
 

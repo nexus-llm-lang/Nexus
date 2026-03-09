@@ -21,19 +21,19 @@ Requires `PermConsole`. CLI flag: `--allow-console`.
 
 ```nexus
 port Console do
-    fn print(val: string) -> unit
-    fn println(val: string) -> unit
-    fn read_line() -> string
-    fn getchar() -> string
+  fn print(val: string) -> unit
+  fn println(val: string) -> unit
+  fn read_line() -> string
+  fn getchar() -> string
 end
 ```
 
 ```nexus
 let main = fn () -> unit require { PermConsole } do
-    inject stdio.system_handler do
-        Console.println(val: "Hello")
-    end
-    return ()
+  inject stdio.system_handler do
+    Console.println(val: "Hello")
+  end
+  return ()
 end
 ```
 
@@ -71,25 +71,25 @@ fn close(handle: %Handle) -> unit require { PermFs }
 
 ```nexus
 port Fs do
-    // Query
-    fn exists(path: string) -> bool
-    fn read_to_string(path: string) -> string effect { Exn }
+  // Query
+  fn exists(path: string) -> bool
+  fn read_to_string(path: string) -> string effect { Exn }
 
-    // Mutating (raise on failure)
-    fn write_string(path: string, content: string) -> unit effect { Exn }
-    fn append_string(path: string, content: string) -> unit effect { Exn }
-    fn remove_file(path: string) -> unit effect { Exn }
-    fn create_dir_all(path: string) -> unit effect { Exn }
-    fn read_dir(path: string) -> %[ Handle ] effect { Exn }
+  // Mutating (raise on failure)
+  fn write_string(path: string, content: string) -> unit effect { Exn }
+  fn append_string(path: string, content: string) -> unit effect { Exn }
+  fn remove_file(path: string) -> unit effect { Exn }
+  fn create_dir_all(path: string) -> unit effect { Exn }
+  fn read_dir(path: string) -> %[ Handle ] effect { Exn }
 
-    // File descriptor operations (consume-and-return pattern)
-    fn open_read(path: string) -> %Handle effect { Exn }
-    fn open_write(path: string) -> %Handle effect { Exn }
-    fn open_append(path: string) -> %Handle effect { Exn }
-    fn read(handle: %Handle) -> { content: string, handle: %Handle }
-    fn write(handle: %Handle, content: string) -> { ok: bool, handle: %Handle }
-    fn handle_path(handle: %Handle) -> { path: string, handle: %Handle }
-    fn close(handle: %Handle) -> unit
+  // File descriptor operations (consume-and-return pattern)
+  fn open_read(path: string) -> %Handle effect { Exn }
+  fn open_write(path: string) -> %Handle effect { Exn }
+  fn open_append(path: string) -> %Handle effect { Exn }
+  fn read(handle: %Handle) -> { content: string, handle: %Handle }
+  fn write(handle: %Handle, content: string) -> { ok: bool, handle: %Handle }
+  fn handle_path(handle: %Handle) -> { path: string, handle: %Handle }
+  fn close(handle: %Handle) -> unit
 end
 ```
 
@@ -99,8 +99,8 @@ The fd operations use a **consume-and-return** pattern: the linear handle is con
 let %h = Fs.open_read(path: "data.txt")
 let %r = Fs.read(handle: %h)
 match %r do
-    case { content: c, handle: %h2 } ->
-        Fs.close(handle: %h2)
+  case { content: c, handle: %h2 } ->
+    Fs.close(handle: %h2)
 end
 ```
 
@@ -113,7 +113,7 @@ Requires `PermNet`. CLI flag: `--allow-net`.
 ```nexus
 type Header = Header(name: string, value: string)
 type Response = Response(status: i64, headers: string, body: string)
-opaque type Server = Server(id: i64)     // linear server handle
+opaque type Server = Server(id: i64)   // linear server handle
 type Request = Request(method: string, path: string, headers: string, body: string, req_id: i64)
 ```
 
@@ -138,16 +138,16 @@ fn stop(server: %Server) -> unit require { PermNet }
 
 ```nexus
 port Net do
-    // HTTP client (all raise on failure)
-    fn get(url: string) -> string effect { Exn }
-    fn request(method: string, url: string, headers: [ Header ], body: string) -> Response effect { Exn }
+  // HTTP client (all raise on failure)
+  fn get(url: string) -> string effect { Exn }
+  fn request(method: string, url: string, headers: [ Header ], body: string) -> Response effect { Exn }
 
-    // HTTP server
-    fn listen(addr: string) -> %Server effect { Exn }
-    fn accept(server: &Server) -> Request
-    fn respond(req: Request, status: i64, body: string) -> unit effect { Exn }
-    fn respond_with_headers(req: Request, status: i64, headers: [ Header ], body: string) -> unit effect { Exn }
-    fn stop(server: %Server) -> unit
+  // HTTP server
+  fn listen(addr: string) -> %Server effect { Exn }
+  fn accept(server: &Server) -> Request
+  fn respond(req: Request, status: i64, body: string) -> unit effect { Exn }
+  fn respond_with_headers(req: Request, status: i64, headers: [ Header ], body: string) -> unit effect { Exn }
+  fn stop(server: %Server) -> unit
 end
 ```
 
@@ -169,9 +169,9 @@ Requires `PermRandom`. CLI flag: `--allow-random`.
 
 ```nexus
 port Random do
-    fn next_i64() -> i64
-    fn range(min: i64, max: i64) -> i64
-    fn next_bool() -> bool
+  fn next_i64() -> i64
+  fn range(min: i64, max: i64) -> i64
+  fn next_bool() -> bool
 end
 ```
 
@@ -181,8 +181,8 @@ Requires `PermClock`. CLI flag: `--allow-clock`.
 
 ```nexus
 port Clock do
-    fn sleep(ms: i64) -> unit
-    fn now() -> i64
+  fn sleep(ms: i64) -> unit
+  fn now() -> i64
 end
 ```
 
@@ -192,7 +192,7 @@ Requires `PermProc`. CLI flag: `--allow-proc`.
 
 ```nexus
 port Proc do
-    fn exit(status: i64) -> unit
+  fn exit(status: i64) -> unit
 end
 ```
 
@@ -202,8 +202,8 @@ Requires `PermEnv`. CLI flag: `--allow-env`.
 
 ```nexus
 port Env do
-    fn get(key: string) -> Option<string>
-    fn set(key: string, value: string) -> unit
+  fn get(key: string) -> Option<string>
+  fn set(key: string, value: string) -> unit
 end
 ```
 
@@ -290,7 +290,7 @@ fn consume<T>(%arr: [| T |], f: (val: %T) -> unit) -> unit
 FFI-backed hash set of i64 values. Uses opaque linear handles backed by Rust `HashSet<i64>`.
 
 ```nexus
-opaque type Set = Set(id: i64)    // linear -- must be freed
+opaque type Set = Set(id: i64)  // linear -- must be freed
 
 fn empty() -> %Set
 fn insert(set: %Set, val: i64) -> %Set

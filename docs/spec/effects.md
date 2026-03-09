@@ -19,12 +19,12 @@ Both clauses are optional. Omitted means empty row (pure function with no requir
 let pure = fn (x: i64) -> i64 do return x + 1 end
 
 let greet = fn (msg: string) -> unit require { Console } do
-    Console.println(val: msg)
-    return ()
+  Console.println(val: msg)
+  return ()
 end
 
 let risky = fn () -> unit effect { Exn } do
-    raise RuntimeError(val: "oops")
+  raise RuntimeError(val: "oops")
 end
 ```
 
@@ -36,19 +36,19 @@ The only builtin effect is `Exn` (exceptions). `try/catch` discharges `Exn` from
 exception NotFound(msg: string)
 
 let search = fn (key: string) -> string effect { Exn } do
-    raise NotFound(msg: key)
+  raise NotFound(msg: key)
 end
 
 let main = fn () -> unit do
-    try
-        let _ = search(key: "missing")
-    catch e ->
-        match e do
-            case NotFound(msg: m) -> ()
-            case _ -> ()
-        end
+  try
+    let _ = search(key: "missing")
+  catch e ->
+    match e do
+      case NotFound(msg: m) -> ()
+      case _ -> ()
     end
-    return ()
+  end
+  return ()
 end
 ```
 
@@ -66,8 +66,8 @@ A `port` defines a coeffect interface -- a set of function signatures that must 
 
 ```nexus
 pub port Logger do
-    fn info(msg: string) -> unit
-    fn warn(msg: string) -> unit
+  fn info(msg: string) -> unit
+  fn warn(msg: string) -> unit
 end
 ```
 
@@ -77,9 +77,9 @@ Port methods can themselves declare effects and coeffects:
 
 ```nexus
 pub port Fs do
-    fn open_read(path: string) -> %Handle effect { Exn }
-    fn read(handle: %Handle) -> { content: string, handle: %Handle }
-    fn close(handle: %Handle) -> unit
+  fn open_read(path: string) -> %Handle effect { Exn }
+  fn read(handle: %Handle) -> { content: string, handle: %Handle }
+  fn close(handle: %Handle) -> unit
 end
 ```
 
@@ -89,19 +89,19 @@ A handler is a value that implements all methods of a port:
 
 ```nexus
 let console_logger = handler Logger require { Console } do
-    fn info(msg: string) -> unit do
-        Console.println(val: "[INFO] " ++ msg)
-        return ()
-    end
-    fn warn(msg: string) -> unit do
-        Console.println(val: "[WARN] " ++ msg)
-        return ()
-    end
+  fn info(msg: string) -> unit do
+    Console.println(val: "[INFO] " ++ msg)
+    return ()
+  end
+  fn warn(msg: string) -> unit do
+    Console.println(val: "[WARN] " ++ msg)
+    return ()
+  end
 end
 
 let mock_logger = handler Logger do
-    fn info(msg: string) -> unit do return () end
-    fn warn(msg: string) -> unit do return () end
+  fn info(msg: string) -> unit do return () end
+  fn warn(msg: string) -> unit do return () end
 end
 ```
 
@@ -118,9 +118,9 @@ The type checker enforces:
 
 ```nexus
 inject stdio.system_handler do
-    inject console_logger do
-        program()    // program's Logger + Console requirements satisfied
-    end
+  inject console_logger do
+    program()  // program's Logger + Console requirements satisfied
+  end
 end
 ```
 
@@ -139,10 +139,10 @@ The `main` function has special restrictions:
 
 ```nexus
 let main = fn () -> unit require { PermConsole } do
-    inject stdio.system_handler do
-        Console.println(val: "Hello")
-    end
-    return ()
+  inject stdio.system_handler do
+    Console.println(val: "Hello")
+  end
+  return ()
 end
 ```
 
@@ -157,9 +157,9 @@ Effect and coeffect rows are checked by row unification (no subtyping). Open row
 ```nexus
 // This function is polymorphic over additional requirements
 let log_and_do = fn <R>(f: () -> unit require { Logger | R }) -> unit require { Logger | R } do
-    Logger.info(msg: "starting")
-    f()
-    return ()
+  Logger.info(msg: "starting")
+  f()
+  return ()
 end
 ```
 
