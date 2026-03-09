@@ -5,7 +5,7 @@ title: Syntax
 
 # Syntax
 
-Nexus uses keyword-terminated blocks and mandatory labeled arguments to make program structure unambiguous (see [Design](../design)). This reference covers all syntactic constructs. For semantic behavior, see [Types](types), [Effects](effects), and [Semantics](semantics).
+Nexus uses keyword-terminated blocks and mandatory labeled arguments to make program structure unambiguous (see [Design](../../design)). This reference covers all syntactic constructs. For semantic behavior, see [Types](../types), [Effects](../effects), and [Semantics](../semantics).
 
 ## Comments
 

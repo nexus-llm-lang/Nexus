@@ -77,7 +77,7 @@ pub type Pair<A, B> = Pair(left: A, right: B)
 
 ## Linear Types (`%`)
 
-Linear types make resource lifecycle visible in syntax (see [Design](../design#linear-types-as-literal-resource-tracking)). The `%` sigil marks a binding that must be consumed **exactly once**.
+Linear types make resource lifecycle visible in syntax (see [Design](../../design#linear-types-as-literal-resource-tracking)). The `%` sigil marks a binding that must be consumed **exactly once**.
 
 ### Rules
 
@@ -120,7 +120,7 @@ f()  // error -- closure already consumed
 
 ## Borrowing (`&`)
 
-The `&` sigil creates an immutable, non-consuming view of a value (see [Design](../design#borrowing-as-explicit-aliasing)).
+The `&` sigil creates an immutable, non-consuming view of a value (see [Design](../../design#borrowing-as-explicit-aliasing)).
 
 ### Syntax
 
