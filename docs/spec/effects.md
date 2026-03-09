@@ -1,6 +1,11 @@
+---
+layout: default
+title: Effects and Coeffects
+---
+
 # Effects and Coeffects
 
-Nexus separates two concerns in function signatures: **coeffects** (what capabilities the function needs from its environment) and **effects** (what observable actions the function performs). This distinction is central to the [design thesis](../design.md#why-coeffects-not-effects) -- every dependency and side effect is declared, not implied.
+Nexus separates two concerns in function signatures: **coeffects** (what capabilities the function needs from its environment) and **effects** (what observable actions the function performs). This distinction is central to the [design thesis](../design#why-coeffects-not-effects) -- every dependency and side effect is declared, not implied.
 
 ## Function Signature Shape
 
@@ -143,7 +148,7 @@ end
 
 ## Permission Mapping
 
-Runtime permissions (`PermFs`, `PermNet`, etc.) are special coeffects that map to WASI capabilities. They serve as the bridge between the type system and the runtime sandbox. See [WASM and WASI](../env/wasm.md) for the complete mapping table.
+Runtime permissions (`PermFs`, `PermNet`, etc.) are special coeffects that map to WASI capabilities. They serve as the bridge between the type system and the runtime sandbox. See [WASM and WASI](../env/wasm) for the complete mapping table.
 
 ## Row Typing
 

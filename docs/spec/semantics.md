@@ -1,3 +1,8 @@
+---
+layout: default
+title: Semantics
+---
+
 # Semantics
 
 This document describes the execution model of Nexus.

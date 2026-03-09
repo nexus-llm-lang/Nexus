@@ -1,3 +1,8 @@
+---
+layout: default
+title: WASM and WASI
+---
+
 # WASM and WASI
 
 Nexus compiles to the WebAssembly Component Model with WASI for system interfaces. The coeffect system maps directly to WASI capabilities -- every `require { PermX }` in your program corresponds to a concrete WASI interface grant.

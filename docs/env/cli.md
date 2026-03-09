@@ -1,3 +1,8 @@
+---
+layout: default
+title: CLI
+---
+
 # CLI
 
 ## Global Flags
@@ -94,7 +99,7 @@ nexus
 | `--allow-env` | `PermEnv` | Environment variables |
 | `--preopen DIR` | (with `PermFs`) | Preopen a directory for filesystem access |
 
-Capability flags apply to `nexus run`. The compiled WASM binary encodes required capabilities in the `nexus:capabilities` section -- the host runtime (e.g., wasmtime) enforces them at execution time. See [WASM and WASI](wasm.md).
+Capability flags apply to `nexus run`. The compiled WASM binary encodes required capabilities in the `nexus:capabilities` section -- the host runtime (e.g., wasmtime) enforces them at execution time. See [WASM and WASI](wasm).
 
 ## Development
 

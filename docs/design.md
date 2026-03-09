@@ -1,3 +1,8 @@
+---
+layout: default
+title: Design
+---
+
 # Design
 
 Nexus is built on one observation: **LLMs are strong at literal program constructs but weak at contextual ones.** Garbage collection, implicit conversions, ambient I/O, continuation-based control flow -- these contextual mechanisms are where LLM-generated code breaks and where human review fails. Nexus replaces each with a syntactically explicit alternative.
@@ -113,4 +118,4 @@ let main = fn () -> unit require { PermNet, PermConsole } do
 end
 ```
 
-`require { PermNet, PermConsole }` is checked at compile time and enforced at the WASI runtime level. A function cannot perform network I/O unless it declares `PermNet` and a handler satisfying `Net` is injected. See [WASM and WASI](env/wasm.md) for the permission-to-capability mapping.
+`require { PermNet, PermConsole }` is checked at compile time and enforced at the WASI runtime level. A function cannot perform network I/O unless it declares `PermNet` and a handler satisfying `Net` is injected. See [WASM and WASI](env/wasm) for the permission-to-capability mapping.

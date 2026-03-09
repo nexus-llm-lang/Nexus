@@ -1,3 +1,8 @@
+---
+layout: default
+title: Foreign Function Interface (FFI)
+---
+
 # Foreign Function Interface (FFI)
 
 Nexus interoperates with WebAssembly modules, allowing extension with functions written in Rust, C, or other languages that compile to WASM.

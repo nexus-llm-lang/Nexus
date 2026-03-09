@@ -1,3 +1,8 @@
+---
+layout: default
+title: Standard Library
+---
+
 # Standard Library
 
 Import stdlib modules from `stdlib/`:
