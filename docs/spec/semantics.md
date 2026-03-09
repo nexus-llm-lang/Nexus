@@ -69,6 +69,53 @@ end
 
 Exceptions are the only builtin effect. There are no unchecked exceptions -- any function that may raise must declare `effect { Exn }`. `try/catch` discharges `Exn` from the protected region.
 
+## Loops
+
+### While Loop
+
+```nexus
+while condition do
+    body
+end
+```
+
+Evaluates `condition` before each iteration. If the condition is `false`, exits. The condition must be `bool`. Returns `unit`.
+
+### For Loop
+
+```nexus
+for var = start to end_expr do
+    body
+end
+```
+
+Desugared to:
+
+```nexus
+let ~var = start
+let ~__end = end_expr
+while ~var < ~__end do
+    body
+    ~var <- ~var + 1
+end
+```
+
+`start` and `end_expr` must be `i64`. The loop variable is immutable within the body. The range is `[start, end_expr)` (exclusive upper bound). If `start >= end_expr`, the body never executes.
+
+## Match as Expression
+
+Match can appear in expression position. Each case body produces a value:
+
+```nexus
+let result = match x do
+    case 1 -> 10
+    case 2 -> 20
+    case _ -> 30
+end
+```
+
+All non-diverging case bodies must produce the same type. Cases containing a `return` statement diverge and do not contribute to the unified result type.
+
 ## Concurrency Model
 
 ### Structured Concurrency (`conc`)
@@ -87,7 +134,7 @@ end
 - `conc` spawns multiple `task` units and blocks until **all** complete
 - Tasks cannot capture mutable (`~`) bindings from the enclosing scope
 - In the reference interpreter, tasks execute sequentially for deterministic debugging
-- The semantics allow parallel execution in compiled output
+- The compiled WASM output uses OS-thread parallelism via `std::thread::scope`
 
 ## Entrypoint
 

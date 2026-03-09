@@ -19,7 +19,7 @@ let greet = fn (msg: string) -> unit require { Console } do
 end
 
 let risky = fn () -> unit effect { Exn } do
-    raise RuntimeError(msg: "oops")
+    raise RuntimeError(val: "oops")
 end
 ```
 

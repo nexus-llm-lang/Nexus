@@ -83,17 +83,14 @@ Strings use `"..."` delimiters with escape sequences (`\n`, `\t`, `\\`, `\"`). R
 
 ### Operators
 
-All binary operators are left-associative with uniform precedence (no operator binds tighter than another; evaluation is strictly left-to-right):
+Binary operators with standard precedence (multiplicative binds tighter than additive, comparison, then logical):
 
 | Operators | Domain |
 |---|---|
-| `==` `!=` `<=` `>=` `<` `>` | Integer / generic comparison |
-| `==.` `!=.` `<=.` `>=.` `<.` `>.` | Float comparison |
-| `+` `-` | Integer arithmetic |
-| `++` | String concatenation |
-| `+.` `-.` | Float arithmetic |
-| `*` `/` | Integer arithmetic |
-| `*.` `/.` | Float arithmetic |
+| `*` `/` `*.` `/.` | Multiplicative |
+| `+` `-` `+.` `-.` `++` | Additive / string concat |
+| `==` `!=` `<` `>` `<=` `>=` | Integer / generic comparison |
+| `==.` `!=.` `<.` `>.` `<=.` `>=.` | Float comparison |
 | `&&` | Logical AND |
 | `\|\|` | Logical OR |
 
@@ -125,6 +122,20 @@ let logger = handler Logger require { Console } do
     end
 end
 ```
+
+### Match Expression
+
+Match can be used in expression position. Each case body produces a value:
+
+```nexus
+let code = match color do
+    case Red -> 1
+    case Green -> 2
+    case Blue -> 3
+end
+```
+
+All case bodies must produce the same type. Cases with `return` statements diverge and do not contribute to the unified type.
 
 ### Record and Constructor Expressions
 
@@ -210,6 +221,41 @@ match result do
     case Ok(val: v) -> process(v: v)
     case Err(err: e) -> handle_error(e: e)
 end
+```
+
+### While Loop
+
+```nexus
+while condition do
+    // body
+end
+```
+
+Evaluates `condition` before each iteration. If false, exits the loop. Returns `unit`.
+
+```nexus
+let ~i = 0
+while ~i < 10 do
+    ~i <- ~i + 1
+end
+```
+
+### For Loop
+
+```nexus
+for var = start to end_expr do
+    // body (var is immutable i64, scoped to body)
+end
+```
+
+Iterates `var` from `start` (inclusive) to `end_expr` (exclusive). Both must be `i64`. The loop variable is immutable within the body and increments by 1 each iteration. Returns `unit`.
+
+```nexus
+let ~sum = 0
+for i = 0 to 5 do
+    ~sum <- ~sum + i
+end
+// ~sum is 10
 ```
 
 ### Try / Catch
@@ -399,6 +445,8 @@ stmt          ::= let_stmt
                 | try_stmt
                 | inject_stmt
                 | conc_stmt
+                | while_stmt
+                | for_stmt
                 | comment
                 | expr_stmt
 
@@ -417,28 +465,36 @@ inject_stmt   ::= "inject" dotted_ident ( "," dotted_ident )* "do" stmt* "end"
 conc_stmt     ::= "conc" "do" task_def* "end"
 task_def      ::= "task" IDENT [ "effect" effect_type ] "do" stmt* "end"
 
+while_stmt    ::= "while" expr "do" stmt* "end"
+for_stmt      ::= "for" IDENT "=" expr "to" expr "do" stmt* "end"
+
 expr_stmt     ::= expr
 
 (* ── Expressions (precedence: low → high) ───────────────────── *)
 
 expr          ::= expr binary_op expr     (* left-associative *)
+                | match_expr
                 | postfix_expr
 
-binary_op     ::=                         (* comparison *)
+binary_op     ::=                         (* logical — lowest *)
+                  "||"
+                | "&&"
+                |                         (* comparison *)
                   "==" | "!=" | "<=" | ">=" | "<" | ">"
                 | "==." | "!=." | "<=." | ">=." | "<." | ">."
                 |                         (* additive *)
                   "+" | "-" | "++"
                 | "+." | "-."
-                |                         (* multiplicative *)
+                |                         (* multiplicative — highest *)
                   "*" | "/"
                 | "*." | "/."
-                |                         (* logical *)
-                  "&&" | "||"
 
 postfix_expr  ::= postfix_expr "." IDENT  (* field access *)
                 | postfix_expr "[" expr "]"  (* index *)
                 | atom_expr
+
+match_expr    ::= "match" expr "do" match_case_expr* "end"
+match_case_expr ::= "case" pattern "->" expr
 
 atom_expr     ::= "(" expr ")"
                 | raise_expr

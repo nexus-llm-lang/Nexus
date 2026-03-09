@@ -119,6 +119,7 @@ nexus                             # REPL
 nexus run example.nx              # interpret
 nexus build example.nx            # compile to main.wasm
 nexus build example.nx -o out.wasm
+nexus check example.nx            # typecheck only
 ```
 
 ```bash
@@ -140,7 +141,7 @@ end
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do
         let v = fib(n: 30)
-        Console.print(val: "fib(30) = " ++ from_i64(val: v))
+        Console.println(val: "fib(30) = " ++ from_i64(val: v))
     end
     return ()
 end

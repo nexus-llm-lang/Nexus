@@ -15,6 +15,7 @@ Garbage collection, implicit conversions, ambient I/O, continuation-based contro
 nexus                             # REPL
 nexus run example.nx              # interpret
 nexus build example.nx            # compile to main.wasm
+nexus check example.nx            # typecheck only
 ```
 
 ## Hello World
@@ -133,6 +134,60 @@ let ~count = 0
 | `%` | Linear (consumed once) | Lexical, tracked |
 | `&` | Borrowed (read-only view) | Temporary |
 
+## Control Flow
+
+### If-Else
+
+```nexus
+if condition then
+    // ...
+else
+    // ...
+end
+```
+
+### Match (Statement and Expression)
+
+Match works both as a statement and as an expression:
+
+```nexus
+// Statement — each case contains statements
+match result do
+    case Ok(val: v) -> return process(v: v)
+    case Err(err: e) -> return handle_error(e: e)
+end
+
+// Expression — each case produces a value
+let code = match color do
+    case Red -> 1
+    case Green -> 2
+    case Blue -> 3
+end
+```
+
+### While Loop
+
+```nexus
+let ~sum = 0
+let ~i = 0
+while ~i < 10 do
+    ~sum <- ~sum + ~i
+    ~i <- ~i + 1
+end
+```
+
+### For Loop
+
+```nexus
+let ~product = 1
+for i = 1 to 6 do
+    ~product <- ~product * i
+end
+// ~product is 120 (5!)
+```
+
+The loop variable `i` is immutable and scoped to the loop body. The range is `[start, end)` (exclusive upper bound).
+
 ## Exception Handling
 
 Traditional unwind semantics. No continuations.
@@ -197,6 +252,20 @@ end
 ```
 
 Labeled constructor arguments. Exhaustive pattern matching.
+
+## Structured Concurrency
+
+```nexus
+conc do
+    task worker1 do
+        // runs in parallel
+    end
+    task worker2 do
+        // runs in parallel
+    end
+end
+// both tasks complete before continuing
+```
 
 ## WebAssembly Target
 

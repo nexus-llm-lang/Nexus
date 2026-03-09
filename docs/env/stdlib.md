@@ -285,7 +285,7 @@ fn consume<T>(%arr: [| T |], f: (val: %T) -> unit) -> unit
 FFI-backed hash set of i64 values. Uses opaque linear handles backed by Rust `HashSet<i64>`.
 
 ```nexus
-opaque type Set = Set(id: i64)    // linear — must be freed
+opaque type Set = Set(id: i64)    // linear -- must be freed
 
 fn empty() -> %Set
 fn insert(set: %Set, val: i64) -> %Set
@@ -305,7 +305,7 @@ fn free(set: %Set) -> unit
 FFI-backed hash map from i64 keys to i64 values. Uses opaque linear handles backed by Rust `HashMap<i64, i64>`.
 
 ```nexus
-opaque type HashMap = HashMap(id: i64)  // linear — must be freed
+opaque type HashMap = HashMap(id: i64)  // linear -- must be freed
 type Lookup = Found(value: i64) | Missing
 
 fn empty() -> %HashMap
@@ -319,6 +319,50 @@ fn keys(map: &HashMap) -> [ i64 ]
 fn values(map: &HashMap) -> [ i64 ]
 fn free(map: %HashMap) -> unit
 ```
+
+### StringMap (`stringmap.nx`)
+
+FFI-backed hash map from string keys to i64 values. Uses opaque linear handles backed by Rust `HashMap<String, i64>`.
+
+```nexus
+opaque type StringMap = StringMap(id: i64)  // linear -- must be freed
+type Lookup = Found(value: i64) | Missing
+
+fn empty() -> %StringMap
+fn put(map: %StringMap, key: string, value: i64) -> %StringMap
+fn get(map: &StringMap, key: string) -> Lookup
+fn get_or(map: &StringMap, key: string, default: i64) -> i64
+fn contains_key(map: &StringMap, key: string) -> bool
+fn remove(map: %StringMap, key: string) -> %StringMap
+fn size(map: &StringMap) -> i64
+fn keys(map: &StringMap) -> [ string ]
+fn values(map: &StringMap) -> [ i64 ]
+fn free(map: %StringMap) -> unit
+```
+
+### ByteBuffer (`bytebuffer.nx`)
+
+FFI-backed mutable byte buffer for binary data construction. Uses opaque linear handles backed by Rust `Vec<u8>`. Provides LEB128 encoding, little-endian integer writes, and raw byte/string/buffer append operations.
+
+```nexus
+opaque type ByteBuffer = ByteBuffer(id: i64)  // linear -- must be freed
+
+fn empty() -> %ByteBuffer
+fn push_byte(buf: %ByteBuffer, byte: i64) -> %ByteBuffer
+fn push_i32_le(buf: %ByteBuffer, val: i64) -> %ByteBuffer
+fn push_i64_le(buf: %ByteBuffer, val: i64) -> %ByteBuffer
+fn push_uleb128(buf: %ByteBuffer, val: i64) -> %ByteBuffer
+fn push_sleb128(buf: %ByteBuffer, val: i64) -> %ByteBuffer
+fn push_string(buf: %ByteBuffer, s: string) -> %ByteBuffer
+fn push_buf(dst: %ByteBuffer, src: &ByteBuffer) -> %ByteBuffer
+fn length(buf: &ByteBuffer) -> i64
+fn get_byte(buf: &ByteBuffer, idx: i64) -> i64
+fn to_string(buf: &ByteBuffer) -> string
+fn write_file(buf: &ByteBuffer, path: string) -> bool require { PermFs }
+fn free(buf: %ByteBuffer) -> unit
+```
+
+All mutating operations consume the buffer and return a new handle (consume-and-return pattern).
 
 ## Utilities
 
