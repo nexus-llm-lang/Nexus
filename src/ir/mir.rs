@@ -83,6 +83,10 @@ pub enum MirExpr {
         target: Box<MirExpr>,
         cases: Vec<MirMatchCase>,
     },
+    While {
+        cond: Box<MirExpr>,
+        body: Vec<MirStmt>,
+    },
     Borrow(String),
     Raise(Box<MirExpr>),
 }

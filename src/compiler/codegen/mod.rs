@@ -567,6 +567,12 @@ fn collect_stmt_locals(
                 collect_stmt_locals(else_body, local_map, next_local_index, local_decls_flat)?;
             }
             LirStmt::Conc { .. } => {}
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                collect_stmt_locals(cond_stmts, local_map, next_local_index, local_decls_flat)?;
+                collect_stmt_locals(body, local_map, next_local_index, local_decls_flat)?;
+            }
         }
     }
     Ok(())
@@ -852,6 +858,53 @@ fn compile_stmt(
             out.instruction(&Instruction::Call(join_idx));
             Ok(())
         }
+        LirStmt::Loop {
+            cond_stmts,
+            cond,
+            body,
+        } => {
+            // WASM: block $break { loop $continue { cond_stmts; cond; br_if $break; body; br $continue } }
+            out.instruction(&Instruction::Block(BlockType::Empty));
+            out.instruction(&Instruction::Loop(BlockType::Empty));
+            // Evaluate condition preamble (compute the break condition)
+            for nested in cond_stmts {
+                compile_stmt(
+                    nested,
+                    out,
+                    local_map,
+                    program,
+                    internal_indices,
+                    external_indices,
+                    layout,
+                    temps,
+                    function_ret_type,
+                    in_try,
+                )?;
+            }
+            // Check break condition (cond is true when we should break)
+            compile_atom(cond, out, local_map, layout)?;
+            emit_numeric_coercion(&cond.typ(), &Type::Bool, out)?;
+            out.instruction(&Instruction::BrIf(1)); // break to outer block
+            // Body
+            for nested in body {
+                compile_stmt(
+                    nested,
+                    out,
+                    local_map,
+                    program,
+                    internal_indices,
+                    external_indices,
+                    layout,
+                    temps,
+                    function_ret_type,
+                    in_try,
+                )?;
+            }
+            out.instruction(&Instruction::Br(0)); // continue to loop head
+            out.instruction(&Instruction::End); // end loop
+            out.instruction(&Instruction::End); // end block
+            Ok(())
+        }
     }
 }
 
@@ -883,7 +936,9 @@ fn compile_expr(
             emit_numeric_coercion(&rhs.typ(), &operand_type, out)?;
             compile_binary(*op, &operand_type, out)
         }
-        LirExpr::Call { func, args, .. } => {
+        LirExpr::Call { func, args, .. } | LirExpr::TailCall { func, args, .. } => {
+            let is_tail = matches!(expr, LirExpr::TailCall { .. }) && !in_try;
+
             if let Some(callee_idx) = internal_indices.get(func).copied() {
                 let callee = program
                     .functions
@@ -910,7 +965,11 @@ fn compile_expr(
                     compile_atom(atom, out, local_map, layout)?;
                     emit_numeric_coercion(&atom.typ(), &param.typ, out)?;
                 }
-                out.instruction(&Instruction::Call(callee_idx));
+                if is_tail {
+                    out.instruction(&Instruction::ReturnCall(callee_idx));
+                } else {
+                    out.instruction(&Instruction::Call(callee_idx));
+                }
                 return Ok(());
             }
 
@@ -940,7 +999,11 @@ fn compile_expr(
                     compile_external_arg(atom, &param.typ, out, local_map, layout, temps)?;
                 }
 
-                out.instruction(&Instruction::Call(callee_idx));
+                if is_tail {
+                    out.instruction(&Instruction::ReturnCall(callee_idx));
+                } else {
+                    out.instruction(&Instruction::Call(callee_idx));
+                }
                 return Ok(());
             }
 

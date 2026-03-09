@@ -1,6 +1,7 @@
 use crate::common::wasm::{compile, exec, exec_with_stdlib};
 use nexus::compiler::codegen::compile_program_to_wasm_with_metrics;
 use std::fs;
+use wasmparser::Operator;
 
 #[test]
 fn codegen_exports_wasi_cli_run_wrapper() {
@@ -382,4 +383,139 @@ fn stdlib_wasm_modules_are_wasi_only_or_self_contained() {
     }
 
     assert!(checked > 0, "at least one stdlib wasm should be checked");
+}
+
+#[test]
+fn codegen_tail_recursive_function_executes_correctly() {
+    exec(
+        r#"
+let sum_tail = fn (n: i64, acc: i64) -> i64 do
+    if n <= 0 then return acc end
+    return sum_tail(n: n - 1, acc: acc + n)
+end
+
+let main = fn () -> unit do
+    let result = sum_tail(n: 100, acc: 0)
+    if result != 5050 then raise RuntimeError(val: "expected 5050") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_tail_call_emits_return_call_instruction() {
+    let wasm = compile(
+        r#"
+let sum_tail = fn (n: i64, acc: i64) -> i64 do
+    if n <= 0 then return acc end
+    return sum_tail(n: n - 1, acc: acc + n)
+end
+
+let main = fn () -> unit do
+    let _ = sum_tail(n: 10, acc: 0)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut has_return_call = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                if matches!(op.unwrap(), Operator::ReturnCall { .. }) {
+                    has_return_call = true;
+                }
+            }
+        }
+    }
+    assert!(has_return_call, "tail-recursive call should emit return_call instruction");
+}
+
+#[test]
+fn codegen_tail_call_in_if_branch_emits_return_call() {
+    let wasm = compile(
+        r#"
+let count_down = fn (n: i64) -> i64 do
+    if n <= 0 then
+        return 0
+    else
+        return count_down(n: n - 1)
+    end
+end
+
+let main = fn () -> unit do
+    let _ = count_down(n: 50)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut has_return_call = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                if matches!(op.unwrap(), Operator::ReturnCall { .. }) {
+                    has_return_call = true;
+                }
+            }
+        }
+    }
+    assert!(has_return_call, "tail call in if-else branch should emit return_call");
+}
+
+#[test]
+fn codegen_non_tail_call_does_not_emit_return_call() {
+    let wasm = compile(
+        r#"
+let add_one = fn (n: i64) -> i64 do
+    return n + 1
+end
+
+let main = fn () -> unit do
+    let x = add_one(n: 41)
+    if x != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+
+    let mut has_return_call = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                if matches!(op.unwrap(), Operator::ReturnCall { .. }) {
+                    has_return_call = true;
+                }
+            }
+        }
+    }
+    assert!(!has_return_call, "non-tail call should not emit return_call");
+}
+
+#[test]
+fn codegen_deep_tail_recursion_does_not_overflow() {
+    exec(
+        r#"
+let loop_n = fn (n: i64) -> i64 do
+    if n <= 0 then return 0 end
+    return loop_n(n: n - 1)
+end
+
+let main = fn () -> unit do
+    let result = loop_n(n: 1000000)
+    if result != 0 then raise RuntimeError(val: "expected 0") end
+    return ()
+end
+"#,
+    );
 }

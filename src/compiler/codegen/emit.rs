@@ -605,7 +605,7 @@ pub(super) fn expr_type(expr: &LirExpr) -> Type {
     match expr {
         LirExpr::Atom(atom) => atom.typ(),
         LirExpr::Binary { typ, .. } => typ.clone(),
-        LirExpr::Call { typ, .. } => typ.clone(),
+        LirExpr::Call { typ, .. } | LirExpr::TailCall { typ, .. } => typ.clone(),
         LirExpr::Constructor { typ, .. } => typ.clone(),
         LirExpr::Record { typ, .. } => typ.clone(),
         LirExpr::ObjectTag { typ, .. } => typ.clone(),

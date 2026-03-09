@@ -319,6 +319,16 @@ pub enum Expr {
         target: Box<Spanned<Expr>>,
         cases: Vec<MatchCase>,
     },
+    While {
+        cond: Box<Spanned<Expr>>,
+        body: Vec<Spanned<Stmt>>,
+    },
+    For {
+        var: String,
+        start: Box<Spanned<Expr>>,
+        end_expr: Box<Spanned<Expr>>,
+        body: Vec<Spanned<Stmt>>,
+    },
     Lambda {
         type_params: Vec<String>,
         params: Vec<Param>,

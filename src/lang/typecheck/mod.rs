@@ -1600,6 +1600,8 @@ impl TypeChecker {
                         span: e.span.clone(),
                     })?;
                 let mut rv: Option<HashSet<String>> = None;
+                // None = diverges (return), Some(type) = tail expression type
+                let mut case_tail_types: Vec<Option<Type>> = Vec::new();
                 for case in cases {
                     let mut le = env.clone();
                     le.apply(&s);
@@ -1607,7 +1609,38 @@ impl TypeChecker {
                         self.bind_pattern(&case.pattern, &apply_subst_type(&s, &tt), &mut le)?;
                     s = compose_subst(&s, &sm);
                     le.apply(&sm);
-                    self.infer_body(&case.body, &mut le, er, eq, ee)?;
+                    // Infer body and capture tail expression type
+                    if case.body.is_empty() {
+                        case_tail_types.push(Some(Type::Unit));
+                    } else {
+                        let last_idx = case.body.len() - 1;
+                        self.infer_body(&case.body[..last_idx], &mut le, er, eq, ee)?;
+                        let last = &case.body[last_idx];
+                        match &last.node {
+                            Stmt::Expr(expr) => {
+                                let (s_tail, t_tail) =
+                                    self.infer(&mut le, expr, er, eq, ee)?;
+                                let tail = apply_subst_type(&s_tail, &t_tail);
+                                s = compose_subst(&s, &s_tail);
+                                case_tail_types.push(Some(apply_subst_type(&s, &tail)));
+                            }
+                            Stmt::Return(expr) => {
+                                let (s1, t1) = self.infer(&mut le, expr, er, eq, ee)?;
+                                le.apply(&s1);
+                                le.check_unused_linear(&expr.span)?;
+                                self.unify(&t1, &apply_subst_type(&s1, er))
+                                    .map_err(|err| TypeError {
+                                        message: err,
+                                        span: expr.span.clone(),
+                                    })?;
+                                case_tail_types.push(None); // diverges
+                            }
+                            _ => {
+                                self.infer_body(&case.body[last_idx..], &mut le, er, eq, ee)?;
+                                case_tail_types.push(Some(Type::Unit));
+                            }
+                        }
+                    }
                     if let Some(p) = &rv {
                         if p != &le.linear_vars {
                             return Err(TypeError {
@@ -1622,6 +1655,68 @@ impl TypeChecker {
                 if let Some(vars) = rv {
                     env.linear_vars = vars;
                 }
+                // Unify non-diverging case tail types
+                let non_diverging: Vec<&Type> =
+                    case_tail_types.iter().filter_map(|t| t.as_ref()).collect();
+                if non_diverging.is_empty() {
+                    Ok((s, Type::Unit))
+                } else {
+                    let mut result_type = non_diverging[0].clone();
+                    for ct in &non_diverging[1..] {
+                        let su = self.unify(&result_type, ct).map_err(|_| TypeError {
+                            message: "Match case type mismatch: all cases must produce the same type".into(),
+                            span: e.span.clone(),
+                        })?;
+                        s = compose_subst(&s, &su);
+                        result_type = apply_subst_type(&su, &result_type);
+                    }
+                    Ok((s, result_type))
+                }
+            }
+            Expr::While { cond, body } => {
+                let (s1, tc) = self.infer(env, cond, er, eq, ee)?;
+                let s = compose_subst(
+                    &s1,
+                    &self.unify(&tc, &Type::Bool).map_err(|m| TypeError {
+                        message: m,
+                        span: cond.span.clone(),
+                    })?,
+                );
+                let mut le = env.clone();
+                le.apply(&s);
+                self.infer_body(body, &mut le, er, eq, ee)?;
+                Ok((s, Type::Unit))
+            }
+            Expr::For {
+                var,
+                start,
+                end_expr,
+                body,
+            } => {
+                let (s1, ts) = self.infer(env, start, er, eq, ee)?;
+                env.apply(&s1);
+                let su_start = self.unify(&ts, &Type::I64).map_err(|m| TypeError {
+                    message: m,
+                    span: start.span.clone(),
+                })?;
+                let mut s = compose_subst(&s1, &su_start);
+                let (s2, te) = self.infer(env, end_expr, er, eq, ee)?;
+                s = compose_subst(&s, &s2);
+                let su_end = self.unify(&te, &Type::I64).map_err(|m| TypeError {
+                    message: m,
+                    span: end_expr.span.clone(),
+                })?;
+                s = compose_subst(&s, &su_end);
+                let mut le = env.clone();
+                le.apply(&s);
+                le.insert(
+                    var.clone(),
+                    Scheme {
+                        vars: vec![],
+                        typ: Type::I64,
+                    },
+                );
+                self.infer_body(body, &mut le, er, eq, ee)?;
                 Ok((s, Type::Unit))
             }
             Expr::Lambda {

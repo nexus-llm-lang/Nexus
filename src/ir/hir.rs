@@ -110,6 +110,16 @@ pub enum HirExpr {
         target: Box<HirExpr>,
         cases: Vec<HirMatchCase>,
     },
+    While {
+        cond: Box<HirExpr>,
+        body: Vec<HirStmt>,
+    },
+    For {
+        var: String,
+        start: Box<HirExpr>,
+        end_expr: Box<HirExpr>,
+        body: Vec<HirStmt>,
+    },
     Lambda {
         params: Vec<HirParam>,
         ret_type: Type,

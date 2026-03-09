@@ -656,6 +656,21 @@ impl HirBuilder {
                     })
                     .collect(),
             },
+            Expr::While { cond, body } => HirExpr::While {
+                cond: Box::new(self.convert_expr(cond, rename_map)),
+                body: self.convert_stmts(body, rename_map),
+            },
+            Expr::For {
+                var,
+                start,
+                end_expr,
+                body,
+            } => HirExpr::For {
+                var: var.clone(),
+                start: Box::new(self.convert_expr(start, rename_map)),
+                end_expr: Box::new(self.convert_expr(end_expr, rename_map)),
+                body: self.convert_stmts(body, rename_map),
+            },
             Expr::Lambda {
                 type_params: _,
                 params,
@@ -818,6 +833,15 @@ fn collect_calls_in_hir_expr(expr: &HirExpr, out: &mut Vec<String>) {
             for case in cases {
                 collect_calls_in_hir_stmts(&case.body, out);
             }
+        }
+        HirExpr::While { cond, body } => {
+            collect_calls_in_hir_expr(cond, out);
+            collect_calls_in_hir_stmts(body, out);
+        }
+        HirExpr::For { start, end_expr, body, .. } => {
+            collect_calls_in_hir_expr(start, out);
+            collect_calls_in_hir_expr(end_expr, out);
+            collect_calls_in_hir_stmts(body, out);
         }
         HirExpr::Lambda { body, .. } => {
             collect_calls_in_hir_stmts(body, out);

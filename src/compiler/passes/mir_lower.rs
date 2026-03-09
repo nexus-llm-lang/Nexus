@@ -7,7 +7,7 @@
 
 use crate::ir::hir::*;
 use crate::ir::mir::*;
-use crate::lang::ast::{Span, Type};
+use crate::lang::ast::{BinaryOp, Literal, Span, Type};
 use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -245,6 +245,48 @@ impl<'a> MirLowerer<'a> {
                 typ: typ.clone().unwrap_or(Type::Unit),
                 expr: self.lower_expr(value, scope)?,
             })),
+            HirStmt::Expr(HirExpr::For {
+                var,
+                start,
+                end_expr,
+                body,
+            }) => {
+                // Desugar: for var = start to end do body end
+                // → let var = start; let __for_end_var = end;
+                //   while var < __for_end_var do body; var <- var + 1 end
+                let end_name = format!("__for_end_{}", var);
+                let mir_start = self.lower_expr(start, scope)?;
+                let mir_end = self.lower_expr(end_expr, scope)?;
+                let mut mir_body = self.lower_stmts(body, scope)?;
+                mir_body.push(MirStmt::Assign {
+                    target: MirExpr::Variable(var.clone()),
+                    value: MirExpr::BinaryOp(
+                        Box::new(MirExpr::Variable(var.clone())),
+                        BinaryOp::Add,
+                        Box::new(MirExpr::Literal(Literal::Int(1))),
+                    ),
+                });
+                Ok(InjectResult::Multiple(vec![
+                    MirStmt::Let {
+                        name: var.clone(),
+                        typ: Type::I64,
+                        expr: mir_start,
+                    },
+                    MirStmt::Let {
+                        name: end_name.clone(),
+                        typ: Type::I64,
+                        expr: mir_end,
+                    },
+                    MirStmt::Expr(MirExpr::While {
+                        cond: Box::new(MirExpr::BinaryOp(
+                            Box::new(MirExpr::Variable(var.clone())),
+                            BinaryOp::Lt,
+                            Box::new(MirExpr::Variable(end_name)),
+                        )),
+                        body: mir_body,
+                    }),
+                ]))
+            }
             HirStmt::Expr(expr) => Ok(InjectResult::Single(MirStmt::Expr(
                 self.lower_expr(expr, scope)?,
             ))),
@@ -382,6 +424,39 @@ impl<'a> MirLowerer<'a> {
                 Ok(MirExpr::Match {
                     target: Box::new(self.lower_expr(target, scope)?),
                     cases: mir_cases,
+                })
+            }
+            HirExpr::While { cond, body } => Ok(MirExpr::While {
+                cond: Box::new(self.lower_expr(cond, scope)?),
+                body: self.lower_stmts(body, scope)?,
+            }),
+            HirExpr::For {
+                var,
+                start: _,
+                end_expr: _,
+                body,
+            } => {
+                // For is desugared at statement level (lower_stmt → InjectResult::Multiple).
+                // This path is unreachable in practice but needed for exhaustiveness.
+                let end_name = format!("__for_end_{}", var);
+                Ok(MirExpr::While {
+                    cond: Box::new(MirExpr::BinaryOp(
+                        Box::new(MirExpr::Variable(var.clone())),
+                        BinaryOp::Lt,
+                        Box::new(MirExpr::Variable(end_name)),
+                    )),
+                    body: {
+                        let mut mir_body = self.lower_stmts(body, scope)?;
+                        mir_body.push(MirStmt::Assign {
+                            target: MirExpr::Variable(var.clone()),
+                            value: MirExpr::BinaryOp(
+                                Box::new(MirExpr::Variable(var.clone())),
+                                BinaryOp::Add,
+                                Box::new(MirExpr::Literal(Literal::Int(1))),
+                            ),
+                        });
+                        mir_body
+                    },
                 })
             }
             HirExpr::Lambda {

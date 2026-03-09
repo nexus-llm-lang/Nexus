@@ -35,6 +35,8 @@ pub enum TokenKind {
     Inject,
     Exception,
     External,
+    While,
+    For,
 
     // Sigils & operators
     Tilde,     // ~
@@ -420,6 +422,8 @@ impl Lexer {
             "inject" => TokenKind::Inject,
             "exception" => TokenKind::Exception,
             "external" => TokenKind::External,
+            "while" => TokenKind::While,
+            "for" => TokenKind::For,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             // "then", "as", "opaque", "ref", "borrow" are contextual —

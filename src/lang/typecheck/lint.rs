@@ -229,6 +229,17 @@ impl TypeChecker {
                     self.collect_unused_local_variable_warnings_in_function(&name, &f.body);
                 }
             }
+            Expr::While { cond, body } => {
+                self.collect_unused_local_variable_warnings_in_expr(cond);
+                self.collect_unused_local_variable_warnings_in_stmts(body);
+            }
+            Expr::For {
+                start, end_expr, body, ..
+            } => {
+                self.collect_unused_local_variable_warnings_in_expr(start);
+                self.collect_unused_local_variable_warnings_in_expr(end_expr);
+                self.collect_unused_local_variable_warnings_in_stmts(body);
+            }
             Expr::Literal(_)
             | Expr::Variable(_, _)
             | Expr::Borrow(_, _)
@@ -504,6 +515,31 @@ fn collect_signature_needs_from_expr(
             }
             (reqs, effs, unknown)
         }
+        Expr::While { cond, body } => {
+            let (mut reqs, mut effs, mut unknown) = collect_signature_needs_from_expr(cond, env);
+            let (body_reqs, body_effs, body_unknown) =
+                collect_signature_needs_from_stmts(body, env);
+            reqs.extend(body_reqs);
+            effs.extend(body_effs);
+            unknown |= body_unknown;
+            (reqs, effs, unknown)
+        }
+        Expr::For {
+            start, end_expr, body, ..
+        } => {
+            let (mut reqs, mut effs, mut unknown) = collect_signature_needs_from_expr(start, env);
+            let (end_reqs, end_effs, end_unknown) =
+                collect_signature_needs_from_expr(end_expr, env);
+            reqs.extend(end_reqs);
+            effs.extend(end_effs);
+            unknown |= end_unknown;
+            let (body_reqs, body_effs, body_unknown) =
+                collect_signature_needs_from_stmts(body, env);
+            reqs.extend(body_reqs);
+            effs.extend(body_effs);
+            unknown |= body_unknown;
+            (reqs, effs, unknown)
+        }
         // Nested closures/handlers are definitions; they don't imply this function's immediate signature needs.
         Expr::Lambda { .. } | Expr::Handler { .. } => (HashSet::new(), HashSet::new(), false),
         Expr::Literal(_) | Expr::Variable(_, _) | Expr::External(_, _, _) => {
@@ -556,6 +592,17 @@ fn expr_mentions_name(expr: &Spanned<Expr>, target: &str) -> bool {
                         .iter()
                         .any(|stmt| stmt_mentions_name(stmt, target))
                 })
+        }
+        Expr::While { cond, body } => {
+            expr_mentions_name(cond, target)
+                || body.iter().any(|stmt| stmt_mentions_name(stmt, target))
+        }
+        Expr::For {
+            start, end_expr, body, ..
+        } => {
+            expr_mentions_name(start, target)
+                || expr_mentions_name(end_expr, target)
+                || body.iter().any(|stmt| stmt_mentions_name(stmt, target))
         }
         Expr::Lambda { body, .. } => body.iter().any(|stmt| stmt_mentions_name(stmt, target)),
         Expr::Handler { functions, .. } => functions
@@ -682,6 +729,17 @@ fn collect_used_variable_keys_in_expr(expr: &Spanned<Expr>, out: &mut HashSet<St
                 collect_used_variable_keys_in_stmts(&case.body, out);
             }
         }
+        Expr::While { cond, body } => {
+            collect_used_variable_keys_in_expr(cond, out);
+            collect_used_variable_keys_in_stmts(body, out);
+        }
+        Expr::For {
+            start, end_expr, body, ..
+        } => {
+            collect_used_variable_keys_in_expr(start, out);
+            collect_used_variable_keys_in_expr(end_expr, out);
+            collect_used_variable_keys_in_stmts(body, out);
+        }
         Expr::Lambda { body, .. } => collect_used_variable_keys_in_stmts(body, out),
         Expr::Handler { functions, .. } => {
             for f in functions {
@@ -769,6 +827,17 @@ fn collect_local_let_bindings_in_expr(expr: &Spanned<Expr>, out: &mut Vec<(Strin
             for case in cases {
                 collect_local_let_bindings(&case.body, out);
             }
+        }
+        Expr::While { cond, body } => {
+            collect_local_let_bindings_in_expr(cond, out);
+            collect_local_let_bindings(body, out);
+        }
+        Expr::For {
+            start, end_expr, body, ..
+        } => {
+            collect_local_let_bindings_in_expr(start, out);
+            collect_local_let_bindings_in_expr(end_expr, out);
+            collect_local_let_bindings(body, out);
         }
         // Nested functions/handlers are analyzed separately.
         Expr::Lambda { .. } | Expr::Handler { .. } => {}

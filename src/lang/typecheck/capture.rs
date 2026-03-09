@@ -291,6 +291,22 @@ fn collect_expr_captures(
                 captures,
             );
         }
+        Expr::While { cond, body } => {
+            collect_expr_captures(cond, outer_keys, bound_keys, bound_call_names, captures);
+            collect_stmt_captures(body, outer_keys, bound_keys, bound_call_names, captures);
+        }
+        Expr::For {
+            var,
+            start,
+            end_expr,
+            body,
+        } => {
+            collect_expr_captures(start, outer_keys, bound_keys, bound_call_names, captures);
+            collect_expr_captures(end_expr, outer_keys, bound_keys, bound_call_names, captures);
+            let mut for_bound_keys = bound_keys.clone();
+            for_bound_keys.insert(var.clone());
+            collect_stmt_captures(body, outer_keys, &for_bound_keys, bound_call_names, captures);
+        }
         Expr::External(_, _, _) => {}
         Expr::Handler { functions, .. } => {
             for f in functions {

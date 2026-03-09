@@ -598,3 +598,56 @@ end
         should_fail_typecheck(&src);
     }
 }
+
+// ---- Match expression type inference ----
+
+#[test]
+fn test_match_expr_same_type_cases_typechecks() {
+    should_typecheck(
+        r#"
+let f = fn (x: i64) -> i64 do
+    let result: i64 = match x do
+      case 1 -> 10
+      case _ -> 20
+    end
+    return result
+end
+"#,
+    );
+}
+
+#[test]
+fn test_match_expr_type_mismatch_fails() {
+    let msg = should_fail_typecheck(
+        r#"
+let f = fn (x: i64) -> i64 do
+    let result: i64 = match x do
+      case 1 -> 10
+      case _ -> true
+    end
+    return result
+end
+"#,
+    );
+    assert!(
+        msg.contains("mismatch") || msg.contains("Mismatch") || msg.contains("unif"),
+        "expected type mismatch error, got: {}",
+        msg,
+    );
+}
+
+#[test]
+fn test_match_expr_with_return_cases_diverge() {
+    // Cases that return from the function are compatible with expression cases
+    should_typecheck(
+        r#"
+let f = fn (x: i64) -> i64 do
+    let result = match x do
+      case 0 -> return 999
+      case _ -> 42
+    end
+    return result
+end
+"#,
+    );
+}

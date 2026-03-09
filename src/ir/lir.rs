@@ -69,6 +69,14 @@ pub enum LirStmt {
     Conc {
         tasks: Vec<ConcTask>,
     },
+    /// Loop with condition check at the top.
+    /// cond_stmts compute the break condition, then cond is checked.
+    /// If cond is true, break. Otherwise, execute body and repeat.
+    Loop {
+        cond_stmts: Vec<LirStmt>,
+        cond: LirAtom,
+        body: Vec<LirStmt>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +95,11 @@ pub enum LirExpr {
         typ: Type,
     },
     Call {
+        func: String,
+        args: Vec<(String, LirAtom)>,
+        typ: Type,
+    },
+    TailCall {
         func: String,
         args: Vec<(String, LirAtom)>,
         typ: Type,

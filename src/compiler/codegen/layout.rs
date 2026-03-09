@@ -160,6 +160,12 @@ fn stmt_uses_object_heap(stmt: &LirStmt) -> bool {
             body, catch_body, ..
         } => body.iter().any(stmt_uses_object_heap) || catch_body.iter().any(stmt_uses_object_heap),
         LirStmt::Conc { tasks } => !tasks.is_empty(),
+        LirStmt::Loop {
+            cond_stmts, body, ..
+        } => {
+            cond_stmts.iter().any(stmt_uses_object_heap)
+                || body.iter().any(stmt_uses_object_heap)
+        }
     }
 }
 
@@ -246,6 +252,19 @@ fn collect_strings_in_stmt(stmt: &LirStmt, out: &mut Vec<String>) {
                 }
             }
         }
+        LirStmt::Loop {
+            cond_stmts,
+            cond,
+            body,
+        } => {
+            for stmt in cond_stmts {
+                collect_strings_in_stmt(stmt, out);
+            }
+            collect_strings_in_atom(cond, out);
+            for stmt in body {
+                collect_strings_in_stmt(stmt, out);
+            }
+        }
     }
 }
 
@@ -256,7 +275,7 @@ fn collect_strings_in_expr(expr: &LirExpr, out: &mut Vec<String>) {
             collect_strings_in_atom(lhs, out);
             collect_strings_in_atom(rhs, out);
         }
-        LirExpr::Call { args, .. } => {
+        LirExpr::Call { args, .. } | LirExpr::TailCall { args, .. } => {
             for (_, atom) in args {
                 collect_strings_in_atom(atom, out);
             }

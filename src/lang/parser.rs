@@ -856,6 +856,30 @@ impl Parser {
                 })
             }
 
+            // Match expression: match expr do case pat -> body ... end
+            TokenKind::Match => {
+                self.advance();
+                let target = self.parse_expr()?;
+                self.expect(&TokenKind::Do)?;
+                let mut cases = Vec::new();
+                while matches!(self.peek(), TokenKind::Case) {
+                    self.advance();
+                    let pattern = self.parse_pattern()?;
+                    self.expect(&TokenKind::Arrow)?;
+                    let body = self.parse_stmt_list()?;
+                    cases.push(MatchCase { pattern, body });
+                }
+                self.expect(&TokenKind::End)?;
+                let end = self.tokens[self.pos - 1].span.end;
+                Ok(Spanned {
+                    node: Expr::Match {
+                        target: Box::new(target),
+                        cases,
+                    },
+                    span: start..end,
+                })
+            }
+
             // Sigil + ident (variable with sigil)
             TokenKind::Tilde | TokenKind::Percent => {
                 let sigil = self.parse_sigil();
@@ -1210,6 +1234,10 @@ impl Parser {
 
             TokenKind::Match => self.parse_match_stmt(start),
 
+            TokenKind::While => self.parse_while_stmt(start),
+
+            TokenKind::For => self.parse_for_stmt(start),
+
             TokenKind::Try => self.parse_try_stmt(start),
 
             TokenKind::Conc => self.parse_conc_block(start),
@@ -1291,6 +1319,52 @@ impl Parser {
                 node: Expr::Match {
                     target: Box::new(target),
                     cases,
+                },
+                span: start..end,
+            }),
+            span: start..end,
+        })
+    }
+
+    fn parse_while_stmt(&mut self, start: usize) -> Result<Spanned<Stmt>, ParseError> {
+        self.advance(); // consume 'while'
+        let cond = self.parse_expr()?;
+        self.expect(&TokenKind::Do)?;
+        let body = self.parse_stmt_list()?;
+        self.expect(&TokenKind::End)?;
+        let end = self.tokens[self.pos - 1].span.end;
+
+        Ok(Spanned {
+            node: Stmt::Expr(Spanned {
+                node: Expr::While {
+                    cond: Box::new(cond),
+                    body,
+                },
+                span: start..end,
+            }),
+            span: start..end,
+        })
+    }
+
+    fn parse_for_stmt(&mut self, start: usize) -> Result<Spanned<Stmt>, ParseError> {
+        self.advance(); // consume 'for'
+        let var = self.expect_ident()?;
+        self.expect(&TokenKind::Eq)?;
+        let start_expr = self.parse_expr()?;
+        self.expect_contextual("to")?;
+        let end_expr = self.parse_expr()?;
+        self.expect(&TokenKind::Do)?;
+        let body = self.parse_stmt_list()?;
+        self.expect(&TokenKind::End)?;
+        let end = self.tokens[self.pos - 1].span.end;
+
+        Ok(Spanned {
+            node: Stmt::Expr(Spanned {
+                node: Expr::For {
+                    var,
+                    start: Box::new(start_expr),
+                    end_expr: Box::new(end_expr),
+                    body,
                 },
                 span: start..end,
             }),
