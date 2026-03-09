@@ -1,5 +1,10 @@
 # Nexus
 
+<center>
+  <img src="docs/assets/img/logo/default.png" alt="Nexus Logo" width="80%"/>
+</center>
+
+
 Nexus is a programming language designed around one observation: **LLMs are strong at literal program constructs but weak at contextual ones.**
 
 Implicit control flow, hidden state, and ambient authority are where LLMs (and humans reviewing LLM-generated code) fail. Nexus eliminates these by making every resource, every side effect, and every capability requirement syntactically visible at the point of use.
