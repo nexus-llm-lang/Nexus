@@ -26,10 +26,10 @@ use super::passes::mir_lower::{lower_hir_to_mir, MirLowerError};
 
 use emit::{
     compile_external_arg, constructor_tag, emit_alloc_object,
-    emit_numeric_coercion, emit_pack_value_to_i64, emit_string_concat, emit_unpack_i64_to_value,
-    expr_type, external_param_types, external_return_types, is_string_concat_operator, memarg,
-    pack_string, peel_linear, record_tag, return_type_to_wasm_result,
-    type_to_wasm_valtype,
+    emit_numeric_coercion, emit_pack_value_to_i64, emit_string_compare, emit_string_concat,
+    emit_unpack_i64_to_value, expr_type, external_param_types, external_return_types,
+    is_string_compare_operator, is_string_concat_operator, memarg, pack_string, peel_linear,
+    record_tag, return_type_to_wasm_result, type_to_wasm_valtype,
 };
 use layout::{build_codegen_layout, CodegenLayout, MemoryMode};
 
@@ -873,6 +873,9 @@ fn compile_expr(
             if is_string_concat_operator(*op, typ) {
                 return emit_string_concat(lhs, rhs, out, local_map, layout, temps);
             }
+            if is_string_compare_operator(*op, &lhs.typ(), &rhs.typ()) {
+                return emit_string_compare(*op, lhs, rhs, out, local_map, layout, temps);
+            }
             let operand_type = binary_operand_type(*op, &lhs.typ(), &rhs.typ())?;
             compile_atom(lhs, out, local_map, layout)?;
             emit_numeric_coercion(&lhs.typ(), &operand_type, out)?;
@@ -1308,6 +1311,9 @@ fn binary_operand_type(op: BinaryOp, lhs: &Type, rhs: &Type) -> Result<Type, Cod
         return Ok(Type::String);
     }
     if matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
+        if matches!(lhs, Type::String) && matches!(rhs, Type::String) {
+            return Ok(Type::String);
+        }
         if matches!(lhs, Type::Bool) && matches!(rhs, Type::Bool) {
             return Ok(Type::Bool);
         }

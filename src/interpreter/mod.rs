@@ -1910,6 +1910,12 @@ impl Interpreter {
                             (Value::String(a), BinaryOp::Add, Value::String(b)) => {
                                 Ok(ExprResult::Normal(Value::String(a + &b)))
                             }
+                            (Value::String(a), BinaryOp::Eq, Value::String(b)) => {
+                                Ok(ExprResult::Normal(Value::Bool(a == b)))
+                            }
+                            (Value::String(a), BinaryOp::Ne, Value::String(b)) => {
+                                Ok(ExprResult::Normal(Value::Bool(a != b)))
+                            }
                             (l, op, r) => Err(runtime_error(format!(
                                 "Invalid binary op: {:?} {} {:?}",
                                 l, op, r
