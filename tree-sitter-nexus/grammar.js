@@ -56,7 +56,7 @@ module.exports = grammar({
     // Lowercase/underscore-start: variables, function names, labels, keywords
     identifier: (_) => /[a-z_][a-zA-Z0-9_]*/,
 
-    // Uppercase-start: constructor names, type names, effect names, type vars
+    // Uppercase-start: constructor names, type names, exception names, type vars
     uident: (_) => /[A-Z][a-zA-Z0-9_]*/,
 
     // ─── Top-level definitions ───────────────────────────────────────────────
@@ -172,10 +172,10 @@ module.exports = grammar({
         "->",
         field("ret_type", $._type),
         optional(seq("require", field("requires", $._effect_type))),
-        optional(seq("effect", field("effects", $._effect_type)))
+        optional(seq("throws", field("throws", $._effect_type)))
       ),
 
-    // fn name[<T>](params) -> ret [require req] [effect eff] do body end
+    // fn name[<T>](params) -> ret [require req] [throws eff] do body end
     handler_fn: ($) =>
       seq(
         "fn",
@@ -185,7 +185,7 @@ module.exports = grammar({
         "->",
         field("ret_type", $._type),
         optional(seq("require", field("requires", $._effect_type))),
-        optional(seq("effect", field("effects", $._effect_type))),
+        optional(seq("throws", field("throws", $._effect_type))),
         "do",
         field("body", repeat($._stmt)),
         "end"
@@ -284,8 +284,8 @@ module.exports = grammar({
         ">"
       ),
 
-    // (label: T, ...) -> ret [require req] [effect eff]
-    // prec.right makes the optional require/effect clauses greedy
+    // (label: T, ...) -> ret [require req] [throws eff]
+    // prec.right makes the optional require/throws clauses greedy
     arrow_type: ($) =>
       prec.right(
         seq(
@@ -304,7 +304,7 @@ module.exports = grammar({
           "->",
           field("ret", $._type),
           optional(seq("require", field("require", $._effect_type))),
-          optional(seq("effect", field("effect", $._effect_type)))
+          optional(seq("throws", field("throws", $._effect_type)))
         )
       ),
 
@@ -441,7 +441,7 @@ module.exports = grammar({
       seq(
         "task",
         field("name", $.identifier),
-        optional(seq("effect", field("effects", $._effect_type))),
+        optional(seq("throws", field("throws", $._effect_type))),
         "do",
         field("body", repeat($._stmt)),
         "end"
@@ -608,7 +608,7 @@ module.exports = grammar({
         field("name", $.identifier)
       ),
 
-    // fn [<T>](params) -> ret [require req] [effect eff] do body end
+    // fn [<T>](params) -> ret [require req] [throws eff] do body end
     lambda_expr: ($) =>
       prec.right(
         seq(
@@ -618,7 +618,7 @@ module.exports = grammar({
           "->",
           field("ret_type", $._type),
           optional(seq("require", field("requires", $._effect_type))),
-          optional(seq("effect", field("effects", $._effect_type))),
+          optional(seq("throws", field("throws", $._effect_type))),
           "do",
           field("body", repeat($._stmt)),
           "end"

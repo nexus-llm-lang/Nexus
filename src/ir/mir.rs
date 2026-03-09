@@ -1,4 +1,4 @@
-//! Mid-level IR — effects eliminated via static port resolution.
+//! Mid-level IR — throws eliminated via static port resolution.
 //! No inject/handler/port.method() — all port calls resolved to direct function calls.
 
 use crate::lang::ast::{BinaryOp, Literal, Sigil, Span, Type};
@@ -16,7 +16,7 @@ pub struct MirExternal {
     pub wasm_name: String,
     pub params: Vec<MirParam>,
     pub ret_type: Type,
-    pub effects: Type,
+    pub throws: Type,
 }
 
 #[derive(Debug, Clone)]

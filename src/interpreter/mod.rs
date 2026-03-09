@@ -905,7 +905,7 @@ impl Interpreter {
                         params,
                         ret_type,
                         requires,
-                        effects,
+                        throws,
                         body,
                     } => {
                         functions.insert(
@@ -917,7 +917,7 @@ impl Interpreter {
                                 params: params.clone(),
                                 ret_type: ret_type.clone(),
                                 requires: requires.clone(),
-                                effects: effects.clone(),
+                                throws: throws.clone(),
                                 body: body.clone(),
                             },
                         );
@@ -1560,7 +1560,7 @@ impl Interpreter {
                         params,
                         ret_type,
                         requires,
-                        effects,
+                        throws,
                         body,
                     } = &value.node
                     {
@@ -1577,7 +1577,7 @@ impl Interpreter {
                                 params: params.clone(),
                                 ret_type: ret_type.clone(),
                                 requires: requires.clone(),
-                                effects: effects.clone(),
+                                throws: throws.clone(),
                                 body: body.clone(),
                             },
                             env.clone(),
@@ -2239,7 +2239,7 @@ impl Interpreter {
                 params,
                 ret_type,
                 requires,
-                effects,
+                throws,
                 body,
             } => {
                 let fn_name = self.register_lambda(
@@ -2250,7 +2250,7 @@ impl Interpreter {
                         params: params.clone(),
                         ret_type: ret_type.clone(),
                         requires: requires.clone(),
-                        effects: effects.clone(),
+                        throws: throws.clone(),
                         body: body.clone(),
                     },
                     env.clone(),

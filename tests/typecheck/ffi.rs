@@ -21,9 +21,9 @@ fn test_ffi_effectful() {
         r#"
     import external time.wasm
     type IO = {}
-    pub external get_time = "get_time" : () -> float effect { IO }
+    pub external get_time = "get_time" : () -> float throws { IO }
 
-    let helper = fn () -> unit effect { IO } do
+    let helper = fn () -> unit throws { IO } do
       let t = get_time()
       return ()
     end

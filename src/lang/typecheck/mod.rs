@@ -11,9 +11,9 @@ pub use unify::apply_subst_type;
 
 use capture::{collect_lambda_captures, lambda_references_name};
 use helpers::{
-    check_unintroduced_type_vars, contains_exn_effect, contains_ref, default_numeric_literals,
+    check_unintroduced_type_vars, contains_exn_throws, contains_ref, default_numeric_literals,
     describe_ctor_field, external_scheme, extract_row_port_names, get_default_alias,
-    is_allowed_main_effect_signature, is_allowed_main_require_signature, is_auto_droppable,
+    is_allowed_main_throws_signature, is_allowed_main_require_signature, is_auto_droppable,
     merge_type_rows, normalize_enum_generic_params, normalize_typedef_generic_params,
     register_exception_variant, register_nullary_variant_constructor, register_stdlib_types,
     select_float_type, select_int_type, strip_required_port_coeffect, summarize_ctor_args,
@@ -32,7 +32,7 @@ use crate::lang::stdlib::resolve_import_path;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 
-const EFFECT_EXN: &str = "Exn";
+const THROWS_EXN: &str = "Exn";
 
 type Subst = HashMap<String, Type>;
 
@@ -51,7 +51,7 @@ impl TypeChecker {
     /// Creates a checker with only language-core builtins (no stdlib `.nx` imports).
     pub fn new_without_stdlib() -> Self {
         let mut env = TypeEnv::new();
-        env.enums.insert(EFFECT_EXN.to_string(), exn_enum_def());
+        env.enums.insert(THROWS_EXN.to_string(), exn_enum_def());
         env.enums.insert("List".to_string(), list_enum_def());
         register_nullary_variant_constructor(
             &mut env,
@@ -355,8 +355,8 @@ impl TypeChecker {
                                     ptypes,
                                     Box::new(sig.ret_type.clone()),
                                     Box::new(requires),
-                                    // Ports are coeffects (environment requirements), not builtin effects.
-                                    Box::new(sig.effects.clone()),
+                                    // Ports are coeffects (environment requirements), not builtin throws.
+                                    Box::new(sig.throws.clone()),
                                 ),
                             },
                         );
@@ -370,7 +370,7 @@ impl TypeChecker {
                             params,
                             ret_type,
                             requires,
-                            effects,
+                            throws,
                             ..
                         } => {
                             let vars_set: HashSet<String> = type_params.iter().cloned().collect();
@@ -397,7 +397,7 @@ impl TypeChecker {
                                             self.convert_user_defined_to_var(requires, &vars_set),
                                         ),
                                         Box::new(
-                                            self.convert_user_defined_to_var(effects, &vars_set),
+                                            self.convert_user_defined_to_var(throws, &vars_set),
                                         ),
                                     ),
                                 },
@@ -479,15 +479,15 @@ impl TypeChecker {
                             });
                         }
                         let final_ef = apply_subst_type(&sm, &ef);
-                        if contains_exn_effect(&final_ef) {
+                        if contains_exn_throws(&final_ef) {
                             return Err(TypeError {
-                                message: "main function must not declare Exn effect".into(),
+                                message: "main function must not declare Exn in throws".into(),
                                 span: def.span.clone(),
                             });
                         }
-                        if !is_allowed_main_effect_signature(&final_ef) {
+                        if !is_allowed_main_throws_signature(&final_ef) {
                             return Err(TypeError {
-                                message: "main function effects must be {}".into(),
+                                message: "main function throws must be {}".into(),
                                 span: def.span.clone(),
                             });
                         }
@@ -626,7 +626,7 @@ impl TypeChecker {
             &mut env,
             &func.ret_type,
             &merged_requires,
-            &func.effects,
+            &func.throws,
         )?;
         env.check_unused_linear(span)?;
         Ok(())
@@ -969,7 +969,7 @@ impl TypeChecker {
             }
         }
         let merged_requires = merge_type_rows(&t.requires, outer_eq);
-        self.infer_body(&t.body, &mut te, &Type::Unit, &merged_requires, &t.effects)?;
+        self.infer_body(&t.body, &mut te, &Type::Unit, &merged_requires, &t.throws)?;
 
         let unused_local_linear: Vec<_> = te
             .linear_vars
@@ -1736,7 +1736,7 @@ impl TypeChecker {
                 params,
                 ret_type,
                 requires,
-                effects,
+                throws,
                 body,
             } => {
                 if contains_ref(ret_type) {
@@ -1776,7 +1776,7 @@ impl TypeChecker {
                     );
                 }
 
-                self.infer_body(body, &mut lambda_env, ret_type, requires, effects)?;
+                self.infer_body(body, &mut lambda_env, ret_type, requires, throws)?;
                 let remaining_lambda_linear: HashSet<String> = lambda_env
                     .linear_vars
                     .difference(&before_linear)
@@ -1823,7 +1823,7 @@ impl TypeChecker {
                         .collect(),
                     Box::new(self.convert_user_defined_to_var(ret_type, &vars_set)),
                     Box::new(self.convert_user_defined_to_var(requires, &vars_set)),
-                    Box::new(self.convert_user_defined_to_var(effects, &vars_set)),
+                    Box::new(self.convert_user_defined_to_var(throws, &vars_set)),
                 );
 
                 Ok((
@@ -1874,7 +1874,7 @@ impl TypeChecker {
                             .collect(),
                         Box::new(f.ret_type.clone()),
                         Box::new(f.requires.clone()),
-                        Box::new(f.effects.clone()),
+                        Box::new(f.throws.clone()),
                     );
                     self.unify(&actual_impl_type, &expected_impl_type)
                         .map_err(|m| TypeError {

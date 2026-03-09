@@ -193,14 +193,14 @@ This ensures mutation remains localized and predictable.
 
 ## Function Types
 
-Functions are first-class values with labeled parameters and optional effect/coeffect annotations:
+Functions are first-class values with labeled parameters and optional throws/coeffect annotations:
 
 ```nexus
 (label: T) -> R                  // pure function
 (a: i64, b: i64) -> i64              // multiple params
-() -> unit effect { Exn }              // with effect
+() -> unit throws { Exn }              // with throws
 () -> string require { Net }             // with coeffect
-(x: T) -> R require { C | r } effect { E | e }  // open rows
+(x: T) -> R require { C | r } throws { E | e }  // open rows
 ```
 
 ### Closures

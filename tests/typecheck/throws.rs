@@ -2,20 +2,20 @@ use crate::common::check::{should_fail_typecheck, should_typecheck};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
-// Deterministic tests (from effect.rs)
+// Deterministic tests (from throws.rs)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_effect_propagation() {
+fn test_throws_propagation() {
     should_typecheck(
         r#"
     type IO = {}
 
-    let f = fn () -> unit effect { IO } do
+    let f = fn () -> unit throws { IO } do
         return ()
     end
 
-    let g = fn () -> unit effect { IO } do
+    let g = fn () -> unit throws { IO } do
         f()
     end
 
@@ -32,7 +32,7 @@ fn test_call_pure_from_impure() {
         r#"
     type IO = {}
     let pure_fn = fn () -> unit do return () end
-    let impure_fn = fn () -> unit effect { IO } do
+    let impure_fn = fn () -> unit throws { IO } do
         pure_fn()
     end
     let main = fn () -> unit do
@@ -50,7 +50,7 @@ fn test_try_catch_removes_exn() {
     import { from_i64 } from stdlib/string.nx
     exception Oops(string)
 
-    let risky = fn () -> unit effect { Exn } do
+    let risky = fn () -> unit throws { Exn } do
         raise Oops("oops")
         return ()
     end
@@ -80,7 +80,7 @@ fn test_raise_requires_exn() {
     should_fail_typecheck(
         r#"
     let fail = fn () -> unit do
-        raise "oops" // Should fail: no Exn effect allowed
+        raise "oops" // Should fail: no Exn in throws clause
         return ()
     end
     let main = fn () -> unit do
@@ -91,10 +91,10 @@ fn test_raise_requires_exn() {
 }
 
 #[test]
-fn test_main_cannot_declare_exn_effect() {
+fn test_main_cannot_declare_exn_throws() {
     should_fail_typecheck(
         r#"
-    let main = fn () -> unit effect { Exn } do
+    let main = fn () -> unit throws { Exn } do
         return ()
     end
     "#,
@@ -114,11 +114,11 @@ fn test_main_must_return_unit() {
 }
 
 #[test]
-fn test_main_effect_net_only_is_rejected() {
+fn test_main_throws_net_only_is_rejected() {
     let err = should_fail_typecheck(
         r#"
     type Net = {}
-    let main = fn () -> unit effect { Net } do
+    let main = fn () -> unit throws { Net } do
         return ()
     end
     "#,
@@ -163,16 +163,16 @@ fn test_main_require_port_name_is_rejected() {
 }
 
 #[test]
-fn test_effect_mismatch() {
+fn test_throws_mismatch() {
     should_fail_typecheck(
         r#"
     type IO = {}
 
-    let f = fn () -> unit effect { IO } do
+    let f = fn () -> unit throws { IO } do
         return ()
     end
 
-    let g = fn () -> unit effect {} do // Pure
+    let g = fn () -> unit throws {} do // Pure
         f()
     end
 
@@ -184,28 +184,28 @@ fn test_effect_mismatch() {
 }
 
 #[test]
-fn test_effect_polymorphism() {
+fn test_throws_polymorphism() {
     should_typecheck(
         r#"
     type IO = {}
 
-    let apply = fn <E>(f: () -> unit effect E) -> unit effect E do
+    let apply = fn <E>(f: () -> unit throws E) -> unit throws E do
         f()
     end
 
-    let pure_fn = fn () -> unit effect {} do
+    let pure_fn = fn () -> unit throws {} do
         return ()
     end
 
-    let impure_fn = fn () -> unit effect { IO } do
+    let impure_fn = fn () -> unit throws { IO } do
         return ()
     end
 
-    let test_pure = fn () -> unit effect {} do
+    let test_pure = fn () -> unit throws {} do
         apply(f: pure_fn)
     end
 
-    let test_impure = fn () -> unit effect { IO } do
+    let test_impure = fn () -> unit throws { IO } do
         apply(f: impure_fn)
     end
 
@@ -217,20 +217,20 @@ fn test_effect_polymorphism() {
 }
 
 #[test]
-fn test_effect_polymorphism_mismatch() {
+fn test_throws_polymorphism_mismatch() {
     should_fail_typecheck(
         r#"
     type IO = {}
 
-    let apply = fn <E>(f: () -> unit effect E) -> unit effect E do
+    let apply = fn <E>(f: () -> unit throws E) -> unit throws E do
         f()
     end
 
-    let impure_fn = fn () -> unit effect { IO } do
+    let impure_fn = fn () -> unit throws { IO } do
         return ()
     end
 
-    let test_fail = fn () -> unit effect {} do // Declared Pure
+    let test_fail = fn () -> unit throws {} do // Declared Pure
         apply(f: impure_fn)     // Call is Impure (IO)
     end
 
@@ -242,7 +242,7 @@ fn test_effect_polymorphism_mismatch() {
 }
 
 // ---------------------------------------------------------------------------
-// Property-based tests (typecheck-only, from type_effect.rs)
+// Property-based tests (typecheck-only)
 // ---------------------------------------------------------------------------
 
 fn io_program(body: &str) -> String {
@@ -250,11 +250,11 @@ fn io_program(body: &str) -> String {
         r#"
 type IO = {{}}
 
-let io = fn (x: i64) -> unit effect {{ IO }} do
+let io = fn (x: i64) -> unit throws {{ IO }} do
     return ()
 end
 
-let helper = fn () -> unit effect {{ IO }} do
+let helper = fn () -> unit throws {{ IO }} do
 {body}
     return ()
 end
@@ -382,11 +382,11 @@ end
             r#"
 type IO = {{}}
 
-let io = fn (x: i64) -> unit effect {{ IO }} do
+let io = fn (x: i64) -> unit throws {{ IO }} do
     return ()
 end
 
-let pure_wrap = fn (x: i64) -> unit effect {{}} do
+let pure_wrap = fn (x: i64) -> unit throws {{}} do
 {body}
     return ()
 end
@@ -401,7 +401,7 @@ end
     }
 
     #[test]
-    fn prop_raise_without_exn_effect_is_error(msg in "[a-zA-Z0-9_]{1,16}") {
+    fn prop_raise_without_exn_throws_is_error(msg in "[a-zA-Z0-9_]{1,16}") {
         let src = format!(
             r#"
 exception Fail(val: string)
@@ -423,7 +423,7 @@ import {{ Console }}, * as stdio from stdlib/stdio.nx
 import {{ from_i64 }} from stdlib/string.nx
 exception MsgError(val: string)
 
-let risky = fn (msg: string) -> unit effect {{ Exn }} do
+let risky = fn (msg: string) -> unit throws {{ Exn }} do
     raise MsgError(val: msg)
     return ()
 end

@@ -30,7 +30,7 @@ fn test_conc_parallel_execution() {
 fn test_net_effect_enforcement() {
     let src = r#"
     type IO = {}
-    let main = fn () -> unit effect { IO } do
+    let main = fn () -> unit throws { IO } do
         let res = get(url: "https://example.com")
         return ()
     end
@@ -39,7 +39,7 @@ fn test_net_effect_enforcement() {
     let err = should_fail_typecheck(src);
     assert!(
         !err.is_empty(),
-        "Should fail typechecking because Net effect is missing"
+        "Should fail typechecking because Net is missing from throws"
     );
 }
 

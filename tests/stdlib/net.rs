@@ -53,7 +53,7 @@ fn net_server_linear_leak_is_rejected() {
         r#"
     import { Net }, * as net_mod from stdlib/net.nx
 
-    let leak = fn () -> unit require { Net } effect { Exn } do
+    let leak = fn () -> unit require { Net } throws { Exn } do
       let server = Net.listen(addr: "127.0.0.1:0")
       return ()
     end

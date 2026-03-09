@@ -4,7 +4,7 @@ use super::TypeChecker;
 use crate::lang::ast::*;
 use std::collections::HashSet;
 
-use super::EFFECT_EXN;
+use super::THROWS_EXN;
 
 impl TypeChecker {
     pub(super) fn collect_lint_warnings(&mut self, program: &Program) {
@@ -62,7 +62,7 @@ impl TypeChecker {
             };
             let Expr::Lambda {
                 requires,
-                effects,
+                throws,
                 body,
                 ..
             } = &gl.value.node
@@ -93,7 +93,7 @@ impl TypeChecker {
                 }
             }
 
-            let (declared_effs, eff_unknown) = extract_named_row_members(effects);
+            let (declared_effs, eff_unknown) = extract_named_row_members(throws);
             if !eff_unknown {
                 let mut redundant_effs: Vec<String> =
                     declared_effs.difference(&used_effs).cloned().collect();
@@ -101,7 +101,7 @@ impl TypeChecker {
                 if !redundant_effs.is_empty() {
                     self.warnings.push(TypeWarning {
                         message: format!(
-                            "Function '{}' declares reducible effects: {}",
+                            "Function '{}' declares reducible throws: {}",
                             gl.name,
                             redundant_effs.join(", ")
                         ),
@@ -369,7 +369,7 @@ pub(super) fn collect_signature_needs_from_stmts(
                     collect_signature_needs_from_stmts(body, env);
                 let (catch_reqs, catch_effs, catch_unknown) =
                     collect_signature_needs_from_stmts(catch_body, env);
-                body_effs.remove(EFFECT_EXN);
+                body_effs.remove(THROWS_EXN);
                 reqs.extend(body_reqs);
                 reqs.extend(catch_reqs);
                 effs.extend(body_effs);
@@ -435,7 +435,7 @@ fn collect_signature_needs_from_expr(
         }
         Expr::Raise(inner) => {
             let (reqs, mut effs, unknown) = collect_signature_needs_from_expr(inner, env);
-            effs.insert(EFFECT_EXN.to_string());
+            effs.insert(THROWS_EXN.to_string());
             (reqs, effs, unknown)
         }
         Expr::BinaryOp(lhs, _, rhs) | Expr::Index(lhs, rhs) => {

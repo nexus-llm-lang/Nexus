@@ -74,7 +74,7 @@ impl ReplState {
                         params: vec![],
                         ret_type: Type::Unit,
                         requires,
-                        effects: Type::Row(vec![], None),
+                        throws: Type::Row(vec![], None),
                         body: main_body,
                     },
                     span: 0..0,

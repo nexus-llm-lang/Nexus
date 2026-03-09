@@ -82,27 +82,27 @@ fn test_handler_require_mock_needs_nothing() {
 
     let mock_fs = handler Fs do
       fn exists(path: string) -> bool do return false end
-      fn read_to_string(path: string) -> string effect { Exn } do return "" end
-      fn write_string(path: string, content: string) -> unit effect { Exn } do return () end
-      fn append_string(path: string, content: string) -> unit effect { Exn } do return () end
-      fn remove_file(path: string) -> unit effect { Exn } do return () end
-      fn create_dir_all(path: string) -> unit effect { Exn } do return () end
-      fn read_dir(path: string) -> %[ Handle ] effect { Exn } do
+      fn read_to_string(path: string) -> string throws { Exn } do return "" end
+      fn write_string(path: string, content: string) -> unit throws { Exn } do return () end
+      fn append_string(path: string, content: string) -> unit throws { Exn } do return () end
+      fn remove_file(path: string) -> unit throws { Exn } do return () end
+      fn create_dir_all(path: string) -> unit throws { Exn } do return () end
+      fn read_dir(path: string) -> %[ Handle ] throws { Exn } do
         let empty = Nil()
         let %result = empty
         return %result
       end
-      fn open_read(path: string) -> %Handle effect { Exn } do
+      fn open_read(path: string) -> %Handle throws { Exn } do
         let h = Handle(id: 0)
         let %lh = h
         return %lh
       end
-      fn open_write(path: string) -> %Handle effect { Exn } do
+      fn open_write(path: string) -> %Handle throws { Exn } do
         let h = Handle(id: 0)
         let %lh = h
         return %lh
       end
-      fn open_append(path: string) -> %Handle effect { Exn } do
+      fn open_append(path: string) -> %Handle throws { Exn } do
         let h = Handle(id: 0)
         let %lh = h
         return %lh

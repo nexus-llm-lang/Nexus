@@ -17,8 +17,8 @@
 "return" @keyword.return
 "raise" @keyword.raise
 
-; Effect/coeffect system
-"effect" @keyword.effect
+; Throws/coeffect system
+"throws" @keyword.throws
 "require" @keyword.require
 "inject" @keyword.inject
 

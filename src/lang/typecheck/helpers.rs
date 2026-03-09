@@ -321,8 +321,8 @@ fn collect_external_type_vars(typ: &Type, env: &TypeEnv, out: &mut HashSet<Strin
                 out.insert(name.clone());
             }
         }
-        Type::Arrow(params, ret, _requires, _effects) => {
-            // Skip requires/effects: their Row entries are port/effect names, not type variables.
+        Type::Arrow(params, ret, _requires, _throws) => {
+            // Skip requires/throws: their Row entries are port/throws names, not type variables.
             for (_, typ) in params {
                 collect_external_type_vars(typ, env, out);
             }
@@ -333,9 +333,9 @@ fn collect_external_type_vars(typ: &Type, env: &TypeEnv, out: &mut HashSet<Strin
         | Type::Borrow(inner)
         | Type::Array(inner)
         | Type::List(inner) => collect_external_type_vars(inner, env, out),
-        Type::Row(effects, tail) => {
-            for effect in effects {
-                collect_external_type_vars(effect, env, out);
+        Type::Row(throws, tail) => {
+            for t in throws {
+                collect_external_type_vars(t, env, out);
             }
             if let Some(tail) = tail {
                 collect_external_type_vars(tail, env, out);
@@ -364,14 +364,14 @@ fn convert_external_type_vars(typ: &Type, vars: &HashSet<String>) -> Type {
                 )
             }
         }
-        Type::Arrow(params, ret, requires, effects) => Type::Arrow(
+        Type::Arrow(params, ret, requires, throws) => Type::Arrow(
             params
                 .iter()
                 .map(|(name, typ)| (name.clone(), convert_external_type_vars(typ, vars)))
                 .collect(),
             Box::new(convert_external_type_vars(ret, vars)),
             Box::new(convert_external_type_vars(requires, vars)),
-            Box::new(convert_external_type_vars(effects, vars)),
+            Box::new(convert_external_type_vars(throws, vars)),
         ),
         Type::Ref(inner) => Type::Ref(Box::new(convert_external_type_vars(inner, vars))),
         Type::Linear(inner) => Type::Linear(Box::new(convert_external_type_vars(inner, vars))),
@@ -382,10 +382,10 @@ fn convert_external_type_vars(typ: &Type, vars: &HashSet<String>) -> Type {
             name.clone(),
             Box::new(convert_external_type_vars(req, vars)),
         ),
-        Type::Row(effects, tail) => Type::Row(
-            effects
+        Type::Row(throws, tail) => Type::Row(
+            throws
                 .iter()
-                .map(|effect| convert_external_type_vars(effect, vars))
+                .map(|t| convert_external_type_vars(t, vars))
                 .collect(),
             tail.as_ref()
                 .map(|tail| Box::new(convert_external_type_vars(tail, vars))),
@@ -525,8 +525,8 @@ pub(super) fn strip_required_port_coeffect(t: &Type, coeffect_name: &str) -> Typ
     }
 }
 
-pub(super) fn contains_exn_effect(t: &Type) -> bool {
-    contains_named_effect(t, super::EFFECT_EXN)
+pub(super) fn contains_exn_throws(t: &Type) -> bool {
+    contains_named_throws(t, super::THROWS_EXN)
 }
 
 /// Merges two requirement row types, deduplicating entries.
@@ -573,39 +573,39 @@ pub(super) fn extract_row_port_names(t: &Type) -> Vec<String> {
     }
 }
 
-pub(super) fn contains_named_effect(t: &Type, effect_name: &str) -> bool {
+pub(super) fn contains_named_throws(t: &Type, effect_name: &str) -> bool {
     match t {
         Type::UserDefined(name, args) => {
             (name == effect_name && args.is_empty())
                 || args
                     .iter()
-                    .any(|inner| contains_named_effect(inner, effect_name))
+                    .any(|inner| contains_named_throws(inner, effect_name))
         }
         Type::Arrow(params, ret, req, eff) => {
             params
                 .iter()
-                .any(|(_, p)| contains_named_effect(p, effect_name))
-                || contains_named_effect(ret, effect_name)
-                || contains_named_effect(req, effect_name)
-                || contains_named_effect(eff, effect_name)
+                .any(|(_, p)| contains_named_throws(p, effect_name))
+                || contains_named_throws(ret, effect_name)
+                || contains_named_throws(req, effect_name)
+                || contains_named_throws(eff, effect_name)
         }
         Type::Ref(inner) | Type::Linear(inner) | Type::Borrow(inner) | Type::Array(inner) => {
-            contains_named_effect(inner, effect_name)
+            contains_named_throws(inner, effect_name)
         }
         Type::Row(effs, tail) => {
-            effs.iter().any(|e| contains_named_effect(e, effect_name))
+            effs.iter().any(|e| contains_named_throws(e, effect_name))
                 || tail
                     .as_ref()
-                    .is_some_and(|x| contains_named_effect(x, effect_name))
+                    .is_some_and(|x| contains_named_throws(x, effect_name))
         }
         Type::Record(fields) => fields
             .iter()
-            .any(|(_, ft)| contains_named_effect(ft, effect_name)),
+            .any(|(_, ft)| contains_named_throws(ft, effect_name)),
         _ => false,
     }
 }
 
-pub(super) fn is_allowed_main_effect_signature(t: &Type) -> bool {
+pub(super) fn is_allowed_main_throws_signature(t: &Type) -> bool {
     match t {
         Type::Unit => true,
         Type::Row(effs, tail) => tail.is_none() && effs.is_empty(),

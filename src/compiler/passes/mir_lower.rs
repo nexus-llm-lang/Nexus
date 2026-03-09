@@ -166,7 +166,7 @@ impl<'a> MirLowerer<'a> {
                     })
                     .collect(),
                 ret_type: ext.ret_type.clone(),
-                effects: ext.effects.clone(),
+                throws: ext.throws.clone(),
             });
         }
     }

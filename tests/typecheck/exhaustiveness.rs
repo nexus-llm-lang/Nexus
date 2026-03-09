@@ -52,7 +52,7 @@ fn color_program_with_cases(case_ctors: &[&str]) -> Program {
                     params: vec![],
                     ret_type: Type::Unit,
                     requires: Type::Row(vec![], None),
-                    effects: Type::Row(vec![], None),
+                    throws: Type::Row(vec![], None),
                     body: vec![
                         sp(Stmt::Let {
                             name: "c".to_string(),

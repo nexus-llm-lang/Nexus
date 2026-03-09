@@ -39,7 +39,7 @@ fn codegen_raise_compiles_and_traps() {
         r#"
 exception Boom(i64)
 
-let main = fn () -> unit effect { Exn } do
+let main = fn () -> unit throws { Exn } do
     let err = Boom(42)
     raise err
     return ()
@@ -53,7 +53,7 @@ end
 fn codegen_exn_constructor_lowering() {
     let msg = exec_should_trap(
         r#"
-let main = fn () -> unit effect { Exn } do
+let main = fn () -> unit throws { Exn } do
     raise RuntimeError(val: "test error")
     return ()
 end

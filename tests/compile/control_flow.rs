@@ -106,7 +106,7 @@ fn codegen_try_catch_handles_raised_exception() {
         r#"
 exception Boom(i64)
 
-let check = fn () -> i64 effect { Exn } do
+let check = fn () -> i64 throws { Exn } do
     try
       let err = Boom(42)
       raise err
@@ -117,7 +117,7 @@ let check = fn () -> i64 effect { Exn } do
     return 0
 end
 
-let main = fn () -> unit effect { Exn } do
+let main = fn () -> unit throws { Exn } do
     let result = check()
     if result != 7 then raise RuntimeError(val: "expected 7") end
     return ()
@@ -132,7 +132,7 @@ fn codegen_nested_try_catch_reraise_propagates_to_outer_catch() {
         r#"
 exception Boom(i64)
 
-let check = fn () -> i64 effect { Exn } do
+let check = fn () -> i64 throws { Exn } do
     try
       try
         raise Boom(1)
@@ -148,7 +148,7 @@ let check = fn () -> i64 effect { Exn } do
     return 0
 end
 
-let main = fn () -> unit effect { Exn } do
+let main = fn () -> unit throws { Exn } do
     let result = check()
     if result != 9 then raise RuntimeError(val: "expected 9") end
     return ()
@@ -163,7 +163,7 @@ fn codegen_try_catch_match_constructor_wildcard_case() {
         r#"
 exception Boom(i64)
 
-let check = fn () -> i64 effect { Exn } do
+let check = fn () -> i64 throws { Exn } do
     try
       raise Boom(42)
       return -1
@@ -176,7 +176,7 @@ let check = fn () -> i64 effect { Exn } do
     return 0
 end
 
-let main = fn () -> unit effect { Exn } do
+let main = fn () -> unit throws { Exn } do
     let result = check()
     if result != 1 then raise RuntimeError(val: "expected 1") end
     return ()
@@ -191,7 +191,7 @@ fn codegen_try_catch_match_constructor_binds_payload() {
         r#"
 exception Boom(i64)
 
-let check = fn () -> i64 effect { Exn } do
+let check = fn () -> i64 throws { Exn } do
     try
       raise Boom(42)
       return -1
@@ -204,7 +204,7 @@ let check = fn () -> i64 effect { Exn } do
     return 0
 end
 
-let main = fn () -> unit effect { Exn } do
+let main = fn () -> unit throws { Exn } do
     let result = check()
     if result != 42 then raise RuntimeError(val: "expected 42") end
     return ()

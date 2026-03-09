@@ -43,7 +43,7 @@ fn resource_program(consume_resource: bool) -> Program {
                 params: vec![],
                 ret_type: Type::Unit,
                 requires: Type::Row(vec![], None),
-                effects: Type::Row(vec![], None),
+                throws: Type::Row(vec![], None),
                 body,
             }),
         }))],

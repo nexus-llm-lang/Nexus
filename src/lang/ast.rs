@@ -21,7 +21,7 @@ pub enum Type {
     Unit,
     UserDefined(String, Vec<Type>),
     Var(String),
-    Arrow(Vec<(String, Type)>, Box<Type>, Box<Type>, Box<Type>), // params, return, require, effect
+    Arrow(Vec<(String, Type)>, Box<Type>, Box<Type>, Box<Type>), // params, return, require, throws
     Ref(Box<Type>),
     Linear(Box<Type>),                 // %T
     Row(Vec<Type>, Option<Box<Type>>), // { E1, E2 | r }
@@ -74,7 +74,7 @@ impl std::fmt::Display for Type {
                 }
                 match &**eff {
                     Type::Row(effs, tail) if effs.is_empty() && tail.is_none() => {}
-                    _ => write!(f, " effect {}", eff)?,
+                    _ => write!(f, " throws {}", eff)?,
                 }
                 Ok(())
             }
@@ -334,7 +334,7 @@ pub enum Expr {
         params: Vec<Param>,
         ret_type: Type,
         requires: Type,
-        effects: Type,
+        throws: Type,
         body: Vec<Spanned<Stmt>>,
     },
     Raise(Box<Spanned<Expr>>),           // raise "error"
@@ -384,7 +384,7 @@ pub struct Function {
     pub params: Vec<Param>,
     pub ret_type: Type,
     pub requires: Type,
-    pub effects: Type,
+    pub throws: Type,
     pub body: Vec<Spanned<Stmt>>,
 }
 
@@ -439,7 +439,7 @@ pub struct FunctionSignature {
     pub params: Vec<Param>,
     pub ret_type: Type,
     pub requires: Type,
-    pub effects: Type,
+    pub throws: Type,
 }
 
 #[derive(Debug, Clone, PartialEq)]

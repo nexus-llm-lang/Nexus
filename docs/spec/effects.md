@@ -1,16 +1,16 @@
 ---
 layout: default
-title: Effects and Coeffects
+title: Checked Exceptions and Coeffects
 ---
 
-# Effects and Coeffects
+# Checked Exceptions and Coeffects
 
-Nexus separates two concerns in function signatures: **coeffects** (what capabilities the function needs from its environment) and **effects** (what observable actions the function performs). This distinction is central to the [design thesis](../design#why-coeffects-not-effects) -- every dependency and side effect is declared, not implied.
+Nexus separates two concerns in function signatures: **coeffects** (what capabilities the function needs from its environment) and **checked exceptions** (what exceptions the function may throw). This distinction is central to the [design thesis](../design#why-coeffects-not-effects) -- every dependency and side effect is declared, not implied.
 
 ## Function Signature Shape
 
 ```nexus
-fn (args...) -> Ret require { Coeffects } effect { Effects }
+fn (args...) -> Ret require { Coeffects } throws { Exceptions }
 ```
 
 Both clauses are optional. Omitted means empty row (pure function with no requirements).
@@ -23,19 +23,19 @@ let greet = fn (msg: string) -> unit require { Console } do
   return ()
 end
 
-let risky = fn () -> unit effect { Exn } do
+let risky = fn () -> unit throws { Exn } do
   raise RuntimeError(val: "oops")
 end
 ```
 
-## Builtin Effects
+## Checked Exceptions
 
-The only builtin effect is `Exn` (exceptions). `try/catch` discharges `Exn` from the protected block:
+The only builtin throws type is `Exn`. `try/catch` discharges `Exn` from the protected block:
 
 ```nexus
 exception NotFound(msg: string)
 
-let search = fn (key: string) -> string effect { Exn } do
+let search = fn (key: string) -> string throws { Exn } do
   raise NotFound(msg: key)
 end
 
@@ -58,7 +58,7 @@ Exception declarations extend the builtin `Exn` type:
 pub exception PermissionDenied(msg: string, code: i64)
 ```
 
-`raise` is an expression that immediately unwinds to the nearest `catch`. There are no other builtin effects -- all I/O capabilities use the coeffect system.
+`raise` is an expression that immediately unwinds to the nearest `catch`. All I/O capabilities use the coeffect system, not throws.
 
 ## Ports
 
@@ -73,11 +73,11 @@ end
 
 When a function calls `Logger.info(...)`, it must have `Logger` in its `require` row.
 
-Port methods can themselves declare effects and coeffects:
+Port methods can themselves declare throws and coeffects:
 
 ```nexus
 pub port Fs do
-  fn open_read(path: string) -> %Handle effect { Exn }
+  fn open_read(path: string) -> %Handle throws { Exn }
   fn read(handle: %Handle) -> { content: string, handle: %Handle }
   fn close(handle: %Handle) -> unit
 end
@@ -134,7 +134,7 @@ Rules:
 The `main` function has special restrictions:
 
 - Signature: `() -> unit`
-- `effect` must be empty (all exceptions must be handled internally)
+- `throws` must be empty (all exceptions must be handled internally)
 - `require` may contain any subset of runtime permissions: `{ PermFs, PermNet, PermConsole, PermRandom, PermClock, PermProc, PermEnv }`
 
 ```nexus
@@ -152,7 +152,7 @@ Runtime permissions (`PermFs`, `PermNet`, etc.) are special coeffects that map t
 
 ## Row Typing
 
-Effect and coeffect rows are checked by row unification (no subtyping). Open rows use tail variables for polymorphism:
+Throws and coeffect rows are checked by row unification (no subtyping). Open rows use tail variables for polymorphism:
 
 ```nexus
 // This function is polymorphic over additional requirements

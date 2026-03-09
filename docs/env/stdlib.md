@@ -52,15 +52,15 @@ type Handle = Handle(id: i64)   // linear file handle
 ```nexus
 fn exists(path: string) -> bool require { PermFs }
 fn is_file(path: string) -> bool require { PermFs }
-fn read_to_string(path: string) -> string require { PermFs } effect { Exn }
-fn write_string(path: string, content: string) -> unit require { PermFs } effect { Exn }
-fn append_string(path: string, content: string) -> unit require { PermFs } effect { Exn }
-fn remove_file(path: string) -> unit require { PermFs } effect { Exn }
-fn create_dir_all(path: string) -> unit require { PermFs } effect { Exn }
-fn list_dir(path: string) -> [ string ] require { PermFs } effect { Exn }
-fn open_read(path: string) -> %Handle require { PermFs } effect { Exn }
-fn open_write(path: string) -> %Handle require { PermFs } effect { Exn }
-fn open_append(path: string) -> %Handle require { PermFs } effect { Exn }
+fn read_to_string(path: string) -> string require { PermFs } throws { Exn }
+fn write_string(path: string, content: string) -> unit require { PermFs } throws { Exn }
+fn append_string(path: string, content: string) -> unit require { PermFs } throws { Exn }
+fn remove_file(path: string) -> unit require { PermFs } throws { Exn }
+fn create_dir_all(path: string) -> unit require { PermFs } throws { Exn }
+fn list_dir(path: string) -> [ string ] require { PermFs } throws { Exn }
+fn open_read(path: string) -> %Handle require { PermFs } throws { Exn }
+fn open_write(path: string) -> %Handle require { PermFs } throws { Exn }
+fn open_append(path: string) -> %Handle require { PermFs } throws { Exn }
 fn read(handle: %Handle) -> { content: string, handle: %Handle } require { PermFs }
 fn write(handle: %Handle, content: string) -> { ok: bool, handle: %Handle } require { PermFs }
 fn handle_path(handle: %Handle) -> { path: string, handle: %Handle } require { PermFs }
@@ -73,19 +73,19 @@ fn close(handle: %Handle) -> unit require { PermFs }
 port Fs do
   // Query
   fn exists(path: string) -> bool
-  fn read_to_string(path: string) -> string effect { Exn }
+  fn read_to_string(path: string) -> string throws { Exn }
 
   // Mutating (raise on failure)
-  fn write_string(path: string, content: string) -> unit effect { Exn }
-  fn append_string(path: string, content: string) -> unit effect { Exn }
-  fn remove_file(path: string) -> unit effect { Exn }
-  fn create_dir_all(path: string) -> unit effect { Exn }
-  fn read_dir(path: string) -> %[ Handle ] effect { Exn }
+  fn write_string(path: string, content: string) -> unit throws { Exn }
+  fn append_string(path: string, content: string) -> unit throws { Exn }
+  fn remove_file(path: string) -> unit throws { Exn }
+  fn create_dir_all(path: string) -> unit throws { Exn }
+  fn read_dir(path: string) -> %[ Handle ] throws { Exn }
 
   // File descriptor operations (consume-and-return pattern)
-  fn open_read(path: string) -> %Handle effect { Exn }
-  fn open_write(path: string) -> %Handle effect { Exn }
-  fn open_append(path: string) -> %Handle effect { Exn }
+  fn open_read(path: string) -> %Handle throws { Exn }
+  fn open_write(path: string) -> %Handle throws { Exn }
+  fn open_append(path: string) -> %Handle throws { Exn }
   fn read(handle: %Handle) -> { content: string, handle: %Handle }
   fn write(handle: %Handle, content: string) -> { ok: bool, handle: %Handle }
   fn handle_path(handle: %Handle) -> { path: string, handle: %Handle }
@@ -121,16 +121,16 @@ type Request = Request(method: string, path: string, headers: string, body: stri
 
 ```nexus
 // HTTP client (all raise on failure)
-fn get(url: string) -> string require { PermNet } effect { Exn }
-fn post(url: string, body: string) -> string require { PermNet } effect { Exn }
-fn request_raw(method: string, url: string, headers: string, body: string) -> Response require { PermNet } effect { Exn }
-fn request(method: string, url: string, headers: [ Header ], body: string) -> Response require { PermNet } effect { Exn }
+fn get(url: string) -> string require { PermNet } throws { Exn }
+fn post(url: string, body: string) -> string require { PermNet } throws { Exn }
+fn request_raw(method: string, url: string, headers: string, body: string) -> Response require { PermNet } throws { Exn }
+fn request(method: string, url: string, headers: [ Header ], body: string) -> Response require { PermNet } throws { Exn }
 
 // HTTP server
-fn listen(addr: string) -> %Server require { PermNet } effect { Exn }
+fn listen(addr: string) -> %Server require { PermNet } throws { Exn }
 fn accept(server: &Server) -> Request require { PermNet }
-fn respond(req: Request, status: i64, body: string) -> unit require { PermNet } effect { Exn }
-fn respond_with_headers(req: Request, status: i64, headers: [ Header ], body: string) -> unit require { PermNet } effect { Exn }
+fn respond(req: Request, status: i64, body: string) -> unit require { PermNet } throws { Exn }
+fn respond_with_headers(req: Request, status: i64, headers: [ Header ], body: string) -> unit require { PermNet } throws { Exn }
 fn stop(server: %Server) -> unit require { PermNet }
 ```
 
@@ -139,14 +139,14 @@ fn stop(server: %Server) -> unit require { PermNet }
 ```nexus
 port Net do
   // HTTP client (all raise on failure)
-  fn get(url: string) -> string effect { Exn }
-  fn request(method: string, url: string, headers: [ Header ], body: string) -> Response effect { Exn }
+  fn get(url: string) -> string throws { Exn }
+  fn request(method: string, url: string, headers: [ Header ], body: string) -> Response throws { Exn }
 
   // HTTP server
-  fn listen(addr: string) -> %Server effect { Exn }
+  fn listen(addr: string) -> %Server throws { Exn }
   fn accept(server: &Server) -> Request
-  fn respond(req: Request, status: i64, body: string) -> unit effect { Exn }
-  fn respond_with_headers(req: Request, status: i64, headers: [ Header ], body: string) -> unit effect { Exn }
+  fn respond(req: Request, status: i64, body: string) -> unit throws { Exn }
+  fn respond_with_headers(req: Request, status: i64, headers: [ Header ], body: string) -> unit throws { Exn }
   fn stop(server: %Server) -> unit
 end
 ```
@@ -222,8 +222,8 @@ fn unwrap_or<T>(opt: Option<T>, default: T) -> T
 fn map<T, U>(opt: Option<T>, f: (val: T) -> U) -> Option<U>
 fn and_then<T, U>(opt: Option<T>, f: (val: T) -> Option<U>) -> Option<U>
 fn or_else<T>(opt: Option<T>, other: Option<T>) -> Option<T>
-fn unwrap<T>(opt: Option<T>) -> T effect { Exn }
-fn expect<T>(opt: Option<T>, msg: string) -> T effect { Exn }
+fn unwrap<T>(opt: Option<T>) -> T throws { Exn }
+fn expect<T>(opt: Option<T>, msg: string) -> T throws { Exn }
 ```
 
 ### List (`list.nx`)
@@ -431,7 +431,7 @@ fn map<T, U, E>(res: Result<T, E>, f: (val: T) -> U) -> Result<U, E>
 fn map_err<T, E, F>(res: Result<T, E>, f: (val: E) -> F) -> Result<T, F>
 fn and_then<T, U, E>(res: Result<T, E>, f: (val: T) -> Result<U, E>) -> Result<U, E>
 fn from_exn<T>(exn: Exn) -> Result<T, Exn>
-fn to_exn<T>(res: Result<T, Exn>) -> T effect { Exn }
+fn to_exn<T>(res: Result<T, Exn>) -> T throws { Exn }
 ```
 
 ### Exception Utilities (`exn.nx`)

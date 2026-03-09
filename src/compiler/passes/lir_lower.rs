@@ -89,7 +89,7 @@ impl<'a> LirLowerer<'a> {
                     })
                     .collect(),
                 ret_type: ext.ret_type.clone(),
-                effects: ext.effects.clone(),
+                throws: ext.throws.clone(),
             })
             .collect();
 
@@ -154,7 +154,7 @@ fn lower_mir_function(
             params,
             ret_type: func.ret_type.clone(),
             requires: Type::Row(Vec::new(), None),
-            effects: Type::Row(Vec::new(), None),
+            throws: Type::Row(Vec::new(), None),
             body: ctx.stmts,
             ret,
             span: func.span.clone(),

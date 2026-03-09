@@ -72,7 +72,7 @@ catch e ->
 end
 ```
 
-Exceptions are the only builtin effect. There are no unchecked exceptions -- any function that may raise must declare `effect { Exn }`. `try/catch` discharges `Exn` from the protected region.
+Exceptions are checked -- any function that may raise must declare `throws { Exn }`. `try/catch` discharges `Exn` from the protected region.
 
 ## Loops
 

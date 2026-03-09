@@ -19,7 +19,7 @@ const KEYWORDS: &[&str] = &[
     "from",
     "pub",
     "require",
-    "effect",
+    "throws",
     "raise",
     "try",
     "catch",
@@ -154,7 +154,7 @@ impl Parser {
     // ---- Type Parsing ----
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
-        // Try arrow type first: (params) -> ret [require ...] [effect ...]
+        // Try arrow type first: (params) -> ret [require ...] [throws ...]
         if matches!(self.peek(), TokenKind::LParen) {
             let saved = self.pos;
             if let Ok(t) = self.try_parse_arrow_type() {
@@ -176,7 +176,7 @@ impl Parser {
         } else {
             Type::Row(vec![], None)
         };
-        let effects = if self.match_keyword(&TokenKind::Effect) {
+        let throws = if self.match_keyword(&TokenKind::Throws) {
             self.parse_row_or_type()?
         } else {
             Type::Row(vec![], None)
@@ -185,7 +185,7 @@ impl Parser {
             params,
             Box::new(ret),
             Box::new(requires),
-            Box::new(effects),
+            Box::new(throws),
         ))
     }
 
@@ -593,8 +593,8 @@ impl Parser {
         }
     }
 
-    fn parse_effect_clause(&mut self) -> Result<Type, ParseError> {
-        if self.match_keyword(&TokenKind::Effect) {
+    fn parse_throws_clause(&mut self) -> Result<Type, ParseError> {
+        if self.match_keyword(&TokenKind::Throws) {
             self.parse_row_or_type()
         } else {
             Ok(Type::Row(vec![], None))
@@ -1102,7 +1102,7 @@ impl Parser {
         self.expect(&TokenKind::Arrow)?;
         let ret_type = self.parse_type()?;
         let requires = self.parse_require_clause()?;
-        let effects = self.parse_effect_clause()?;
+        let throws = self.parse_throws_clause()?;
         self.expect(&TokenKind::Do)?;
         let body = self.parse_stmt_list()?;
         self.expect(&TokenKind::End)?;
@@ -1114,7 +1114,7 @@ impl Parser {
                 params,
                 ret_type,
                 requires,
-                effects,
+                throws,
                 body,
             },
             span: start..end,
@@ -1172,7 +1172,7 @@ impl Parser {
         self.expect(&TokenKind::Arrow)?;
         let ret_type = self.parse_type()?;
         let requires = self.parse_require_clause()?;
-        let effects = self.parse_effect_clause()?;
+        let throws = self.parse_throws_clause()?;
         self.expect(&TokenKind::Do)?;
         let body = self.parse_stmt_list()?;
         self.expect(&TokenKind::End)?;
@@ -1184,7 +1184,7 @@ impl Parser {
             params,
             ret_type,
             requires,
-            effects,
+            throws,
             body,
         })
     }
@@ -1416,8 +1416,8 @@ impl Parser {
             self.advance();
             let name = self.expect_ident()?;
 
-            let effects = if self.match_keyword(&TokenKind::Effect) {
-                let effs = self.parse_effect_ident_list()?;
+            let throws = if self.match_keyword(&TokenKind::Throws) {
+                let effs = self.parse_throws_ident_list()?;
                 Type::Row(
                     effs.into_iter()
                         .map(|e| Type::UserDefined(e, vec![]))
@@ -1438,7 +1438,7 @@ impl Parser {
                 params: vec![],
                 ret_type: Type::Unit,
                 requires: Type::Row(vec![], None),
-                effects,
+                throws,
                 body,
                 type_params: vec![],
             });
@@ -1453,7 +1453,7 @@ impl Parser {
         })
     }
 
-    fn parse_effect_ident_list(&mut self) -> Result<Vec<String>, ParseError> {
+    fn parse_throws_ident_list(&mut self) -> Result<Vec<String>, ParseError> {
         self.expect(&TokenKind::LBrace)?;
         let mut idents = Vec::new();
         if !matches!(self.peek(), TokenKind::RBrace) {
@@ -1820,14 +1820,14 @@ impl Parser {
             self.expect(&TokenKind::Arrow)?;
             let ret_type = self.parse_type()?;
             let requires = self.parse_require_clause()?;
-            let effects = self.parse_effect_clause()?;
+            let throws = self.parse_throws_clause()?;
 
             functions.push(FunctionSignature {
                 name: fn_name,
                 params,
                 ret_type,
                 requires,
-                effects,
+                throws,
             });
         }
 

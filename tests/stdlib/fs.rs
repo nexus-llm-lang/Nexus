@@ -97,7 +97,7 @@ import {{ Fs }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> unit require {{ PermFs }} do
   inject fs_mod.system_handler do
-    let leak = fn () -> unit require {{ Fs }} effect {{ Exn }} do
+    let leak = fn () -> unit require {{ Fs }} throws {{ Exn }} do
       Fs.create_dir_all(path: "{dir}")
       Fs.write_string(path: "{file}", content: "abc")
       let %h = Fs.open_read(path: "{file}")
@@ -128,7 +128,7 @@ import {{ Fs }}, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> unit require {{ PermFs }} do
   inject fs_mod.system_handler do
-    let bad = fn () -> unit require {{ Fs }} effect {{ Exn }} do
+    let bad = fn () -> unit require {{ Fs }} throws {{ Exn }} do
       Fs.create_dir_all(path: "{dir}")
       Fs.write_string(path: "{file}", content: "abc")
       let %h = Fs.open_read(path: "{file}")

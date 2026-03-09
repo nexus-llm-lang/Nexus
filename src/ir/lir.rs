@@ -16,7 +16,7 @@ pub struct LirExternal {
     pub wasm_name: String,
     pub params: Vec<LirParam>,
     pub ret_type: Type,
-    pub effects: Type,
+    pub throws: Type,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,7 +25,7 @@ pub struct LirFunction {
     pub params: Vec<LirParam>,
     pub ret_type: Type,
     pub requires: Type,
-    pub effects: Type,
+    pub throws: Type,
     pub body: Vec<LirStmt>,
     pub ret: LirAtom,
     pub span: Span,

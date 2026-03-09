@@ -39,7 +39,7 @@ pub struct HirExternal {
     pub wasm_name: String,
     pub params: Vec<HirParam>,
     pub ret_type: Type,
-    pub effects: Type,
+    pub throws: Type,
 }
 
 #[derive(Debug, Clone)]

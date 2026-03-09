@@ -1,5 +1,5 @@
 pub mod basic;
-pub mod effects;
+pub mod throws;
 pub mod exhaustiveness;
 pub mod ffi;
 pub mod linear;

@@ -40,7 +40,7 @@ let greet = fn (name: string) -> unit require { Logger, Console } do
 end
 ```
 
-Both `require { ... }` and `effect { ... }` are optional; omitted means empty row.
+Both `require { ... }` and `throws { ... }` are optional; omitted means empty row.
 
 ### External Functions
 
@@ -392,7 +392,7 @@ import_def  ::= "import" "external" import_path
 import_path   ::= ( ALPHA | DIGIT | "_" | "-" | "/" | "." )+
 
 port_def    ::= [ "pub" ] "port" UIDENT "do" fn_signature* "end"
-fn_signature  ::= "fn" IDENT param_list "->" type [ "require" effect_type ] [ "effect" effect_type ]
+fn_signature  ::= "fn" IDENT param_list "->" type [ "require" throws_type ] [ "throws" throws_type ]
 
 let_def     ::= [ "pub" ] "let" IDENT [ ":" type ] "=" expr
 external_def  ::= [ "pub" ] "external" IDENT "=" STRING_LITERAL ":" [ type_params ] arrow_type
@@ -432,13 +432,13 @@ array_type  ::= "[|" type "|]"
 generic_type  ::= UIDENT "<" type ( "," type )* ">"
 
 row_type    ::= "{" type ( "," type )* [ "|" type ] "}"
-          (* used as require/effect rows *)
+          (* used as require/throws rows *)
 
 arrow_type  ::= "(" [ arrow_param ( "," arrow_param )* ] ")"
-          "->" type [ "require" effect_type ] [ "effect" effect_type ]
+          "->" type [ "require" throws_type ] [ "throws" throws_type ]
 arrow_param   ::= IDENT ":" type | type
 
-effect_type   ::= row_type | generic_type | UIDENT
+throws_type   ::= row_type | generic_type | UIDENT
 
 (* ── Statements ─────────────────────────────────────────────── *)
 
@@ -468,7 +468,7 @@ try_stmt    ::= "try" stmt* "catch" IDENT "->" stmt* "end"
 inject_stmt   ::= "inject" dotted_ident ( "," dotted_ident )* "do" stmt* "end"
 
 conc_stmt   ::= "conc" "do" task_def* "end"
-task_def    ::= "task" IDENT [ "effect" effect_type ] "do" stmt* "end"
+task_def    ::= "task" IDENT [ "throws" throws_type ] "do" stmt* "end"
 
 while_stmt  ::= "while" expr "do" stmt* "end"
 for_stmt    ::= "for" IDENT "=" expr "to" expr "do" stmt* "end"
@@ -517,11 +517,11 @@ atom_expr   ::= "(" expr ")"
 raise_expr    ::= "raise" expr
 borrow_expr     ::= "&" [ sigil ] IDENT
 lambda_expr     ::= "fn" [ type_params ] "(" [ param ( "," param )* ] ")"
-            "->" type [ "require" effect_type ] [ "effect" effect_type ]
+            "->" type [ "require" throws_type ] [ "throws" throws_type ]
             "do" stmt* "end"
 handler_expr    ::= "handler" UIDENT [ "require" row_type ] "do" handler_fn* "end"
 handler_fn    ::= "fn" IDENT [ type_params ] "(" [ param ( "," param )* ] ")"
-            "->" type [ "require" effect_type ] [ "effect" effect_type ]
+            "->" type [ "require" throws_type ] [ "throws" throws_type ]
             "do" stmt* "end"
 call_expr     ::= dotted_ident "(" [ labeled_arg ( "," labeled_arg )* ] ")"
 labeled_arg     ::= IDENT ":" expr

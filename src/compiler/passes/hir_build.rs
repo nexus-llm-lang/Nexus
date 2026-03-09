@@ -231,7 +231,7 @@ impl HirBuilder {
                         TopLevel::Exception(_) => {}
                         TopLevel::Let(gl) if gl.is_public => {
                             if let Expr::External(wasm_name, _type_params, typ) = &gl.value.node {
-                                if let Type::Arrow(params, ret, _requires, effects) = typ {
+                                if let Type::Arrow(params, ret, _requires, throws) = typ {
                                     if let Some(ref wasm_mod) = current_wasm_module {
                                         // Skip if already loaded (avoid duplicates)
                                         if self.externals.iter().any(|e| e.name == gl.name) {
@@ -250,7 +250,7 @@ impl HirBuilder {
                                                 })
                                                 .collect(),
                                             ret_type: *ret.clone(),
-                                            effects: *effects.clone(),
+                                            throws: *throws.clone(),
                                         });
                                     }
                                 }
@@ -304,7 +304,7 @@ impl HirBuilder {
                             params,
                             ret_type,
                             requires: _,
-                            effects: _,
+                            throws: _,
                             body,
                         } => {
                             self.functions.push(HirFunction {
@@ -323,7 +323,7 @@ impl HirBuilder {
                             });
                         }
                         Expr::External(wasm_name, _type_params, typ) => {
-                            if let Type::Arrow(params, ret, _requires, effects) = typ {
+                            if let Type::Arrow(params, ret, _requires, throws) = typ {
                                 if let Some(ref wasm_mod) = current_wasm_module {
                                     // If already defined, replace it (explicit import overrides auto-loaded)
                                     self.externals.retain(|e| e.name != name);
@@ -340,7 +340,7 @@ impl HirBuilder {
                                             })
                                             .collect(),
                                         ret_type: *ret.clone(),
-                                        effects: *effects.clone(),
+                                        throws: *throws.clone(),
                                     });
                                 }
                             }
@@ -684,7 +684,7 @@ impl HirBuilder {
                 params,
                 ret_type,
                 requires: _,
-                effects: _,
+                throws: _,
                 body,
             } => HirExpr::Lambda {
                 params: params

@@ -1,7 +1,7 @@
 //! Language frontend layer:
 //! - syntax tree (`ast`)
 //! - parser (`parser`)
-//! - type/effect checker (`typecheck`)
+//! - type/throws checker (`typecheck`)
 //! - stdlib source loader (`stdlib`)
 
 pub mod ast;
