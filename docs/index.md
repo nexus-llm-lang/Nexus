@@ -74,6 +74,7 @@ Everything is explicit: the function requires `PermConsole`, a handler is inject
 <li><a href="env/wasm">WASM and WASI</a> — Capability mapping</li>
 <li><a href="env/ffi">FFI</a> — Wasm interop</li>
 <li><a href="env/stdlib">Standard Library</a> — Builtin modules</li>
+<li><a href="env/tools">Tools</a> — AI coding agent skill</li>
 </ul>
 </div>
 </div>

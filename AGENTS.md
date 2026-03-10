@@ -2,6 +2,14 @@
 
 This project is a language spec and implementation for LLM-friendly language.
 
+## Nexus Language Skill
+
+A Claude Code skill for writing Nexus code is available at `skills/nexus-lang/`. Install it to your environment:
+
+```bash
+npx skills add Nymphium/Nexus --skill nexus-lang
+```
+
 ## Guidelines
 
 - Follow TDD (Test Driven Development)

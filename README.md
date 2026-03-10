@@ -152,6 +152,16 @@ let main = fn () -> unit require { PermConsole } do
 end
 ```
 
+## AI Coding Agent Support
+
+Nexus ships a [Claude Code skill](https://docs.anthropic.com/en/docs/claude-code/skills) that teaches coding agents the language syntax, type system, effect system, and standard library.
+
+```bash
+npx skills add Nymphium/Nexus --skill nexus-lang
+```
+
+Once installed, Claude Code automatically activates the skill when writing or reviewing `.nx` files.
+
 ## Documentation
 
 | Document | Description |
@@ -165,6 +175,7 @@ end
 | [WASM](docs/env/wasm.md) | WASM compilation and WASI capabilities |
 | [FFI](docs/env/ffi.md) | Wasm interop |
 | [Stdlib](docs/env/stdlib.md) | Standard library |
+| [Tools](docs/env/tools.md) | AI coding agent skill |
 
 ## License
 
