@@ -45,10 +45,8 @@ let console_logger = handler Logger require { Console } do
 end
 
 let main = fn () -> unit require { PermConsole } do
-  inject stdio.system_handler do
-    inject console_logger do
-      Logger.info(msg: "starting")
-    end
+  inject stdio.system_handler, console_logger do
+    Logger.info(msg: "starting")
   end
   return ()
 end
@@ -61,11 +59,11 @@ The tradeoff is explicit: less expressive handlers in exchange for every call si
 Garbage collectors and finalizers are contextual -- resources disappear "sometime later" through an invisible mechanism. Nexus makes resource lifecycle visible in syntax with the `%` sigil:
 
 ```nexus
-let %h = Fs.open_read(path: path)     // acquire
-let %r = Fs.read(handle: %h)      // consume %h, get new handle back
+let %h = Fs.open_read(path: path)   // acquire
+let %r = Fs.read(handle: %h)    // consume %h, get new handle back
 match %r do
   case { content: c, handle: %h2 } ->
-    Fs.close(handle: %h2)       // release
+    Fs.close(handle: %h2)     // release
 end
 ```
 
@@ -78,9 +76,9 @@ Hidden aliasing is a major source of bugs in both human and LLM-generated code. 
 ```nexus
 let server = Net.listen(addr: addr)
 let req = Net.accept(server: &server)  // &server: borrow, not consume
-let method = request_method(req: &req)   // &req: borrow, not consume
+let method = request_method(req: &req) // &req: borrow, not consume
 let _ = Net.respond(req: req, ...)     // consume req
-Net.stop(server: server)         // consume server
+Net.stop(server: server)               // consume server
 ```
 
 Every read-without-consuming is syntactically marked. No hidden reference counting, no shared pointers, no implicit copies.

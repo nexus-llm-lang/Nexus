@@ -123,7 +123,7 @@ end
 let logger = handler Logger require { Console } do
   fn info(msg: string) -> unit do
     Console.println(val: msg)
-    return ()
+  return ()
   end
 end
 ```
@@ -152,23 +152,23 @@ let result = Ok(val: 42)
 ### Collection Literals
 
 ```nexus
-let xs = [1, 2, 3]      // list
-let %arr = [| 1, 2, 3 |]    // array (linear)
+let xs = [1, 2, 3]        // list
+let %arr = [| 1, 2, 3 |]  // array (linear)
 ```
 
 ### Borrow Expression
 
 ```nexus
-let b = &arr           // borrow immutable binding
-let b2 = &%resource      // borrow linear binding
+let b = &arr         // borrow immutable binding
+let b2 = &%resource  // borrow linear binding
 ```
 
 ### Index and Field Access
 
 ```nexus
-let val = (&%arr)[0]       // array index
-%arr[0] <- 42          // array index assignment
-let name = user.name       // record field access
+let val = (&%arr)[0]  // array index
+%arr[0] <- 42         // array index assignment
+let name = user.name  // record field access
 ```
 
 ### Raise Expression
@@ -317,11 +317,11 @@ end
 ## Imports
 
 ```nexus
-import from path/to/module.nx            // anonymous
-import as math from path/to/math.nx          // namespace alias
-import { add, sub } from path/to/math.nx       // named items
+import from path/to/module.nx                        // anonymous
+import as math from path/to/math.nx                  // namespace alias
+import { add, sub } from path/to/math.nx             // named items
 import { add, sub }, * as math from path/to/math.nx  // named + namespace
-import external path/to/lib.wasm           // Wasm module
+import external path/to/lib.wasm                     // Wasm module
 ```
 
 ## Ports and Handlers
@@ -366,98 +366,98 @@ Task names are identifiers. `conc` blocks wait for all tasks.
 ```ebnf
 (* ── Top-level ─────────────────────────────────────────────── *)
 
-program     ::= top_level*
-top_level   ::= type_def
-        | exception_def
-        | import_def
-        | port_def
-        | external_def
-        | let_def
-        | comment
+program   ::= top_level*
+top_level ::= type_def
+            | exception_def
+            | import_def
+            | port_def
+            | external_def
+            | let_def
+            | comment
 
 (* ── Definitions ───────────────────────────────────────────── *)
 
-type_def    ::= [ "pub" ] [ "opaque" ] "type" UIDENT [ type_params ] "=" record_type
-        | [ "pub" ] [ "opaque" ] "type" UIDENT [ type_params ] "=" type_sum_def
+type_def      ::= [ "pub" ] [ "opaque" ] "type" UIDENT [ type_params ] "=" record_type
+                | [ "pub" ] [ "opaque" ] "type" UIDENT [ type_params ] "=" type_sum_def
 
 type_sum_def  ::= variant_def ( "|" variant_def )*
 variant_def   ::= UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
 variant_field ::= type | IDENT ":" type
 exception_def ::= [ "pub" ] "exception" UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
 
-import_def  ::= "import" "external" import_path
-        | "import" "{" IDENT ( "," IDENT )* "}" [ "," "*" "as" IDENT ] "from" import_path
-        | "import" "as" IDENT "from" import_path
-        | "import" "from" import_path
+import_def    ::= "import" "external" import_path
+                | "import" "{" IDENT ( "," IDENT )* "}" [ "," "*" "as" IDENT ] "from" import_path
+                | "import" "as" IDENT "from" import_path
+                | "import" "from" import_path
 import_path   ::= ( ALPHA | DIGIT | "_" | "-" | "/" | "." )+
 
-port_def    ::= [ "pub" ] "port" UIDENT "do" fn_signature* "end"
+port_def      ::= [ "pub" ] "port" UIDENT "do" fn_signature* "end"
 fn_signature  ::= "fn" IDENT param_list "->" type [ "require" throws_type ] [ "throws" throws_type ]
 
-let_def     ::= [ "pub" ] "let" IDENT [ ":" type ] "=" expr
+let_def       ::= [ "pub" ] "let" IDENT [ ":" type ] "=" expr
 external_def  ::= [ "pub" ] "external" IDENT "=" STRING_LITERAL ":" [ type_params ] arrow_type
 
 (* ── Parameters ─────────────────────────────────────────────── *)
 
-type_params   ::= "<" UIDENT ( "," UIDENT )* ">"
+type_params ::= "<" UIDENT ( "," UIDENT )* ">"
 param_list  ::= "(" [ param ( "," param )* ] ")"
-param     ::= [ sigil ] IDENT ":" type
-sigil     ::= "~" | "%"
+param       ::= [ sigil ] IDENT ":" type
+sigil       ::= "~" | "%"
 
 (* ── Types ──────────────────────────────────────────────────── *)
 
-type      ::= arrow_type
-        | generic_type
-        | primitive_type
-        | ref_type
-        | borrow_type
-        | linear_type
-        | record_type
-        | list_type
-        | array_type
-        | row_type
-        | UIDENT        (* type variable or monotype *)
+type           ::= arrow_type
+                 | generic_type
+                 | primitive_type
+                 | ref_type
+                 | borrow_type
+                 | linear_type
+                 | record_type
+                 | list_type
+                 | array_type
+                 | row_type
+                 | UIDENT              (* type variable or monotype *)
 
 primitive_type ::= "i32" | "i64" | "f32" | "f64" | "float" | "bool" | "string" | "unit"
 
-ref_type    ::= "ref" "(" type ")"
-borrow_type   ::= "&" type
-linear_type   ::= "%" type
+ref_type       ::= "ref" "(" type ")"
+borrow_type    ::= "&" type
+linear_type    ::= "%" type
 
-record_type   ::= "{" IDENT ":" type ( "," IDENT ":" type )* "}"
+record_type    ::= "{" IDENT ":" type ( "," IDENT ":" type )* "}"
 
-list_type   ::= "[" type "]"
-array_type  ::= "[|" type "|]"
+list_type      ::= "[" type "]"
+array_type     ::= "[|" type "|]"
 
-generic_type  ::= UIDENT "<" type ( "," type )* ">"
+generic_type   ::= UIDENT "<" type ( "," type )* ">"
 
-row_type    ::= "{" type ( "," type )* [ "|" type ] "}"
-          (* used as require/throws rows *)
+row_type       ::= "{" type ( "," type )* [ "|" type ] "}"
+                    (* used as require/throws rows *)
 
-arrow_type  ::= "(" [ arrow_param ( "," arrow_param )* ] ")"
-          "->" type [ "require" throws_type ] [ "throws" throws_type ]
-arrow_param   ::= IDENT ":" type | type
+arrow_type     ::= "(" [ arrow_param ( "," arrow_param )* ] ")"
+                    "->" type [ "require" throws_type ] [ "throws" throws_type ]
+arrow_param    ::= IDENT ":" type | type
 
-throws_type   ::= row_type | generic_type | UIDENT
+throws_type    ::= row_type | generic_type | UIDENT
 
 (* ── Statements ─────────────────────────────────────────────── *)
 
-stmt      ::= let_stmt
-        | return_stmt
-        | assign_stmt
-        | if_stmt
-        | match_stmt
-        | try_stmt
-        | inject_stmt
-        | conc_stmt
-        | while_stmt
-        | for_stmt
-        | comment
-        | expr_stmt
+stmt        ::= let_stmt
+              | return_stmt
+              | assign_stmt
+              | if_stmt
+              | match_stmt
+              | try_stmt
+              | inject_stmt
+              | conc_stmt
+              | while_stmt
+              | for_stmt
+              | comment
+              | expr_stmt
 
 let_stmt    ::= "let" [ sigil ] IDENT [ ":" type ] "=" expr
-return_stmt   ::= "return" expr
-assign_stmt   ::= expr "<-" expr
+return_stmt ::= "return" expr
+assign_stmt ::= expr "<-" expr
 
 if_stmt     ::= "if" expr "then" stmt* [ "else" stmt* ] "end"
 
@@ -465,7 +465,7 @@ match_stmt  ::= "match" expr "do" match_case* "end"
 match_case  ::= "case" pattern "->" stmt*
 
 try_stmt    ::= "try" stmt* "catch" IDENT "->" stmt* "end"
-inject_stmt   ::= "inject" dotted_ident ( "," dotted_ident )* "do" stmt* "end"
+inject_stmt ::= "inject" dotted_ident ( "," dotted_ident )* "do" stmt* "end"
 
 conc_stmt   ::= "conc" "do" task_def* "end"
 task_def    ::= "task" IDENT [ "throws" throws_type ] "do" stmt* "end"
@@ -477,106 +477,101 @@ expr_stmt   ::= expr
 
 (* ── Expressions (precedence: low → high) ───────────────────── *)
 
-expr      ::= expr binary_op expr   (* left-associative *)
-        | match_expr
-        | postfix_expr
+expr             ::= expr binary_op expr   (* left-associative *)
+                   | match_expr
+                   | postfix_expr
 
-binary_op   ::=             (* logical — lowest *)
-          "||"
-        | "&&"
-        |             (* comparison *)
-          "==" | "!=" | "<=" | ">=" | "<" | ">"
-        | "==." | "!=." | "<=." | ">=." | "<." | ">."
-        |             (* additive *)
-          "+" | "-" | "++"
-        | "+." | "-."
-        |             (* multiplicative — highest *)
-          "*" | "/"
-        | "*." | "/."
+binary_op        ::= "||"                                          (* logical — lowest *)
+                   | "&&"
+                   | "==" | "!=" | "<=" | ">=" | "<" | ">"        (* comparison *)
+                   | "==." | "!=." | "<=." | ">=." | "<." | ">."
+                   | "+" | "-" | "++"                              (* additive *)
+                   | "+." | "-."
+                   | "*" | "/"                                     (* multiplicative — highest *)
+                   | "*." | "/."
 
-postfix_expr  ::= postfix_expr "." IDENT  (* field access *)
-        | postfix_expr "[" expr "]"  (* index *)
-        | atom_expr
+postfix_expr     ::= postfix_expr "." IDENT                       (* field access *)
+                   | postfix_expr "[" expr "]"                     (* index *)
+                   | atom_expr
 
-match_expr  ::= "match" expr "do" match_case_expr* "end"
-match_case_expr ::= "case" pattern "->" expr
+match_expr       ::= "match" expr "do" match_case_expr* "end"
+match_case_expr  ::= "case" pattern "->" expr
 
-atom_expr   ::= "(" expr ")"
-        | raise_expr
-        | borrow_expr
-        | lambda_expr
-        | handler_expr
-        | call_expr
-        | constructor_expr
-        | record_expr
-        | array_expr
-        | list_expr
-        | literal
-        | variable
+atom_expr        ::= "(" expr ")"
+                   | raise_expr
+                   | borrow_expr
+                   | lambda_expr
+                   | handler_expr
+                   | call_expr
+                   | constructor_expr
+                   | record_expr
+                   | array_expr
+                   | list_expr
+                   | literal
+                   | variable
 
-raise_expr    ::= "raise" expr
-borrow_expr     ::= "&" [ sigil ] IDENT
-lambda_expr     ::= "fn" [ type_params ] "(" [ param ( "," param )* ] ")"
-            "->" type [ "require" throws_type ] [ "throws" throws_type ]
-            "do" stmt* "end"
-handler_expr    ::= "handler" UIDENT [ "require" row_type ] "do" handler_fn* "end"
-handler_fn    ::= "fn" IDENT [ type_params ] "(" [ param ( "," param )* ] ")"
-            "->" type [ "require" throws_type ] [ "throws" throws_type ]
-            "do" stmt* "end"
-call_expr     ::= dotted_ident "(" [ labeled_arg ( "," labeled_arg )* ] ")"
-labeled_arg     ::= IDENT ":" expr
-constructor_expr  ::= UIDENT "(" [ ctor_arg ( "," ctor_arg )* ] ")"
-ctor_arg      ::= [ IDENT ":" ] expr
-record_expr     ::= "{" [ IDENT ":" expr ( "," IDENT ":" expr )* ] "}"
-list_expr     ::= "[" [ expr ( "," expr )* [ "," ] ] "]"
-array_expr    ::= "[|" [ expr ( "," expr )* [ "," ] ] "|]"
-variable      ::= [ sigil ] IDENT
-dotted_ident    ::= IDENT ( "." IDENT )*
+raise_expr       ::= "raise" expr
+borrow_expr      ::= "&" [ sigil ] IDENT
+lambda_expr      ::= "fn" [ type_params ] "(" [ param ( "," param )* ] ")"
+                     "->" type [ "require" throws_type ] [ "throws" throws_type ]
+                     "do" stmt* "end"
+handler_expr     ::= "handler" UIDENT [ "require" row_type ] "do" handler_fn* "end"
+handler_fn       ::= "fn" IDENT [ type_params ] "(" [ param ( "," param )* ] ")"
+                     "->" type [ "require" throws_type ] [ "throws" throws_type ]
+                     "do" stmt* "end"
+call_expr        ::= dotted_ident "(" [ labeled_arg ( "," labeled_arg )* ] ")"
+labeled_arg      ::= IDENT ":" expr
+constructor_expr ::= UIDENT "(" [ ctor_arg ( "," ctor_arg )* ] ")"
+ctor_arg         ::= [ IDENT ":" ] expr
+record_expr      ::= "{" [ IDENT ":" expr ( "," IDENT ":" expr )* ] "}"
+list_expr        ::= "[" [ expr ( "," expr )* [ "," ] ] "]"
+array_expr       ::= "[|" [ expr ( "," expr )* [ "," ] ] "|]"
+variable         ::= [ sigil ] IDENT
+dotted_ident     ::= IDENT ( "." IDENT )*
 
 (* ── Patterns ───────────────────────────────────────────────── *)
 
-pattern       ::= literal_pattern
-          | constructor_pattern
-          | record_pattern
-          | wildcard_pattern
-          | variable_pattern
+pattern             ::= literal_pattern
+                       | constructor_pattern
+                       | record_pattern
+                       | wildcard_pattern
+                       | variable_pattern
 
-literal_pattern   ::= literal
-variable_pattern  ::= [ sigil ] IDENT
-constructor_pattern
-          ::= UIDENT "(" [ ctor_pat_arg ( "," ctor_pat_arg )* ] ")"
-ctor_pat_arg    ::= [ IDENT ":" ] pattern
-record_pattern  ::= "{" [ rec_pat_field ( "," rec_pat_field )* [ "," ] ] "}"
-rec_pat_field   ::= "_" | IDENT ":" pattern
-            (* "_" must be the last element; enables partial matching *)
-wildcard_pattern  ::= "_"
+literal_pattern     ::= literal
+variable_pattern    ::= [ sigil ] IDENT
+constructor_pattern ::= UIDENT "(" [ ctor_pat_arg ( "," ctor_pat_arg )* ] ")"
+ctor_pat_arg        ::= [ IDENT ":" ] pattern
+record_pattern      ::= "{" [ rec_pat_field ( "," rec_pat_field )* [ "," ] ] "}"
+rec_pat_field       ::= "_" | IDENT ":" pattern
+                         (* "_" must be the last element; enables partial matching *)
+wildcard_pattern    ::= "_"
 
 (* ── Literals ───────────────────────────────────────────────── *)
 
-literal       ::= float_literal | integer_literal | boolean_literal
-          | unit_literal  | string_literal
+literal         ::= float_literal | integer_literal | boolean_literal
+                  | unit_literal  | string_literal
 
 float_literal   ::= [ "-" ] DIGIT+ "." DIGIT+
-integer_literal   ::= [ "-" ] DIGIT+
-boolean_literal   ::= "true" | "false"
+integer_literal ::= [ "-" ] DIGIT+
+boolean_literal ::= "true" | "false"
 unit_literal    ::= "()"
 string_literal  ::= '"' string_char* '"'
-          | "[=[" raw_char* "]=]"
-string_char     ::= '\"'         (* escaped double quote *)
-          | '\n' | '\t' | '\\'  (* escape sequences *)
-          | NON_QUOTE NON_BACKSLASH
-raw_char      ::= ANY - "]=]"
+                  | "[=[" raw_char* "]=]"
+string_char     ::= '\"'     (* escaped double quote *)
+                  | '\n' | '\t' | '\\'  (* escape sequences *)
+                  | NON_QUOTE NON_BACKSLASH
+raw_char        ::= ANY - "]=]"
 
 (* ── Comments & Terminals ───────────────────────────────────── *)
 
-comment       ::= line_comment | block_comment
-line_comment    ::= "//" ANY* ( NEWLINE | EOF )
-block_comment   ::= "/*" ANY* "*/"
+comment        ::= line_comment | block_comment
+line_comment   ::= "//" ANY* ( NEWLINE | EOF )
+block_comment  ::= "/*" ANY* "*/"
 
-STRING_LITERAL  ::= string_literal
-            (* used in: string values, import paths, external wasm names *)
+STRING_LITERAL ::= string_literal
+                    (* used in: string values, import paths, external wasm names *)
 
-IDENT       ::= [a-z_] [a-zA-Z0-9_]*     (* not a keyword *)
-UIDENT      ::= [A-Z] [a-zA-Z0-9_]*     (* constructor names *)
-DIGIT       ::= [0-9]
+IDENT          ::= [a-z_] [a-zA-Z0-9_]*   (* not a keyword *)
+UIDENT         ::= [A-Z] [a-zA-Z0-9_]*    (* constructor names *)
+DIGIT          ::= [0-9]
 ```

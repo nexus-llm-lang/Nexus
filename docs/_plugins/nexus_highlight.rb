@@ -16,13 +16,13 @@ module NexusHighlight
 
   # Separate top-level defs from bare fn signatures
   top_lines = []   # type/opaque/exception/comment/blank
-  fn_lines = []    # fn signatures
+  fn_lines = []  # fn signatures
   lines.each do |line|
     t = line.strip
     if t.match?(/\Afn\b/)
-    fn_lines << line
+      fn_lines << line
     else
-    top_lines << line
+      top_lines << line
     end
   end
 
@@ -67,12 +67,12 @@ end
 
 Jekyll::Hooks.register [:pages, :documents], :pre_render do |doc|
   doc.content = doc.content.gsub(/```nexus\s*\n(.*?)```/m) do
-  code = Regexp.last_match(1).rstrip
-  highlighted = NexusHighlight.highlight(code)
-  if highlighted
-    %(<div class="highlight-nexus"><pre><code>#{highlighted}</code></pre></div>)
-  else
-    Regexp.last_match(0)
-  end
+    code = Regexp.last_match(1).rstrip
+    highlighted = NexusHighlight.highlight(code)
+    if highlighted
+      %(<div class="highlight-nexus"><pre><code>#{highlighted}</code></pre></div>)
+    else
+      Regexp.last_match(0)
+    end
   end
 end

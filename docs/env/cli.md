@@ -30,7 +30,7 @@ Supports stdin piping and shebang scripts.
 Compile to a WASM component:
 
 ```bash
-nexus build program.nx          # outputs main.wasm
+nexus build program.nx                  # outputs main.wasm
 nexus build program.nx -o output.wasm   # custom output path
 ```
 
@@ -43,8 +43,8 @@ Resolution order: `--wasm-merge` > `NEXUS_WASM_MERGE` > `wasm-merge` from `PATH`
 Inspect declared capabilities:
 
 ```bash
-nexus build program.nx --explain-capabilities    # list capability names (default)
-nexus build program.nx --explain-capabilities=none  # suppress capability output
+nexus build program.nx --explain-capabilities           # list capability names (default)
+nexus build program.nx --explain-capabilities=none      # suppress capability output
 nexus build program.nx --explain-capabilities=wasmtime  # show wasmtime run command
 ```
 

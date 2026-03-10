@@ -22,7 +22,6 @@ Nexus inverts this:
 | Ambient I/O | `require { Net }` -- declared capability |
 | Implicit control transfer (continuations) | `try/catch` -- traditional unwind semantics |
 | Positional arguments | `add(a: 1, b: 2)` -- mandatory labels |
-| Brace-matching (off-by-one) | `do ... end` -- keyword-terminated blocks |
 
 Every resource state, every side effect, every environmental dependency is visible in the source text. Nothing is implied by context.
 
@@ -36,13 +35,13 @@ Instead, Nexus uses **coeffects** -- the `require { ... }` clause declares what 
 
 ```nexus
 port Logger do
-    fn info(msg: string) -> unit
+  fn info(msg: string) -> unit
 end
 
 let greet = fn (name: string) -> unit require { Logger, Console } do
-    Logger.info(msg: "Greeting " ++ name)
-    Console.println(val: "Hello, " ++ name ++ "!")
-    return ()
+  Logger.info(msg: "Greeting " ++ name)
+  Console.println(val: "Hello, " ++ name ++ "!")
+  return ()
 end
 ```
 
@@ -50,10 +49,10 @@ end
 
 ```nexus
 let console_logger = handler Logger require { Console } do
-    fn info(msg: string) -> unit do
-        Console.println(val: "[INFO] " ++ msg)
-        return ()
-    end
+  fn info(msg: string) -> unit do
+    Console.println(val: "[INFO] " ++ msg)
+    return ()
+  end
 end
 ```
 
@@ -61,12 +60,12 @@ end
 
 ```nexus
 let main = fn () -> unit require { PermConsole } do
-    inject stdio.system_handler do
-        inject console_logger do
-            greet(name: "Nexus User")
-        end
+  inject stdio.system_handler do
+    inject console_logger do
+      greet(name: "Nexus User")
     end
-    return ()
+  end
+  return ()
 end
 ```
 
@@ -78,10 +77,10 @@ Resources that must be properly released -- file handles, server sockets, databa
 
 ```nexus
 let %h = Fs.open_read(path: path)
-let %r = Fs.read(handle: %h)            -- %h consumed here
+let %r = Fs.read(handle: %h)      -- %h consumed here
 match %r do
-    case { content: c, handle: %h2 } ->  -- %h2 extracted
-        Fs.close(handle: %h2)            -- %h2 consumed
+  case { content: c, handle: %h2 } ->  -- %h2 extracted
+    Fs.close(handle: %h2)      -- %h2 consumed
 end
 ```
 
@@ -89,10 +88,10 @@ When you need to read without consuming, **borrow** with `&`:
 
 ```nexus
 let server = Net.listen(addr: addr)
-let req = Net.accept(server: &server)    -- borrow: server not consumed
+let req = Net.accept(server: &server)  -- borrow: server not consumed
 let method = request_method(req: &req)   -- borrow: req not consumed
-Net.respond(req: req, ...)               -- req consumed
-Net.stop(server: server)                 -- server consumed
+Net.respond(req: req, ...)         -- req consumed
+Net.stop(server: server)         -- server consumed
 ```
 
 No garbage collector. No implicit drop. The resource lifecycle is visible in the syntax.
@@ -103,15 +102,15 @@ Runtime permissions map directly to WASI capabilities:
 
 ```nexus
 let main = fn () -> unit require { PermNet, PermConsole } do
-    inject net_mod.system_handler, stdio.system_handler do
-        try
-            let body = Net.get(url: "https://example.com")
-            Console.println(val: body)
-        catch e ->
-            Console.println(val: "Request failed")
-        end
+  inject net_mod.system_handler, stdio.system_handler do
+    try
+      let body = Net.get(url: "https://example.com")
+      Console.println(val: body)
+    catch e ->
+      Console.println(val: "Request failed")
     end
-    return ()
+  end
+  return ()
 end
 ```
 
@@ -120,11 +119,11 @@ The `require { PermNet, PermConsole }` clause is checked at compile time and enf
 ## Usage
 
 ```bash
-nexus                             # REPL
-nexus run example.nx              # interpret
-nexus build example.nx            # compile to main.wasm
+nexus               # REPL
+nexus run example.nx        # interpret
+nexus build example.nx      # compile to main.wasm
 nexus build example.nx -o out.wasm
-nexus check example.nx            # typecheck only
+nexus check example.nx      # typecheck only
 ```
 
 ```bash
@@ -139,16 +138,16 @@ import { Console }, * as stdio from stdlib/stdio.nx
 import { from_i64 } from stdlib/string.nx
 
 let fib = fn (n: i64) -> i64 do
-    if n <= 1 then return n end
-    return fib(n: n - 1) + fib(n: n - 2)
+  if n <= 1 then return n end
+  return fib(n: n - 1) + fib(n: n - 2)
 end
 
 let main = fn () -> unit require { PermConsole } do
-    inject stdio.system_handler do
-        let v = fib(n: 30)
-        Console.println(val: "fib(30) = " ++ from_i64(val: v))
-    end
-    return ()
+  inject stdio.system_handler do
+    let v = fib(n: 30)
+    Console.println(val: "fib(30) = " ++ from_i64(val: v))
+  end
+  return ()
 end
 ```
 

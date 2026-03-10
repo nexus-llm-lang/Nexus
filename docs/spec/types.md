@@ -127,9 +127,9 @@ The `&` sigil creates an immutable, non-consuming view of a value (see [Design](
 `&` works both as a prefix operator and as a let-binding sigil:
 
 ```nexus
-let borrowed = &arr      // prefix operator on immutable binding
+let borrowed = &arr  // prefix operator on immutable binding
 let &b = ~x          // let-binding sigil
-let b2 = &%resource      // prefix operator on linear binding
+let b2 = &%resource  // prefix operator on linear binding
 ```
 
 ### Coercion
@@ -196,10 +196,10 @@ This ensures mutation remains localized and predictable.
 Functions are first-class values with labeled parameters and optional throws/coeffect annotations:
 
 ```nexus
-(label: T) -> R                  // pure function
-(a: i64, b: i64) -> i64              // multiple params
-() -> unit throws { Exn }              // with throws
-() -> string require { Net }             // with coeffect
+(label: T) -> R                                 // pure function
+(a: i64, b: i64) -> i64                         // multiple params
+() -> unit throws { Exn }                       // with throws
+() -> string require { Net }                    // with coeffect
 (x: T) -> R require { C | r } throws { E | e }  // open rows
 ```
 
@@ -223,9 +223,9 @@ Closure constraints:
 Effect and coeffect annotations use row types:
 
 ```nexus
-{ Exn }        // single entry
+{ Exn }          // single entry
 { Net, Fs }      // multiple entries
-{ Console | e }    // open row with tail variable
+{ Console | e }  // open row with tail variable
 ```
 
 Empty row (omitted or `{}`) means no effects/requirements.
