@@ -1,4 +1,5 @@
 use crate::constants::*;
+use crate::runtime::backtrace;
 use crate::runtime::conc;
 use crate::runtime::net_host;
 use crate::runtime::ExecutionCapabilities;
@@ -46,6 +47,7 @@ pub fn run_wasm_bytes(
     wasm: &[u8],
     module_dir: Option<&Path>,
     capabilities: &ExecutionCapabilities,
+    guest_args: &[String],
 ) -> ExitCode {
     // Validate declared capabilities before running
     if let Err(msg) = capabilities.validate_wasm_capabilities(wasm) {
@@ -55,7 +57,7 @@ pub fn run_wasm_bytes(
     if is_component_wasm(wasm) {
         return run_component_wasm_bytes(wasm, capabilities);
     }
-    run_core_wasm_bytes(wasm, module_dir, capabilities)
+    run_core_wasm_bytes(wasm, module_dir, capabilities, guest_args)
 }
 
 fn run_component_wasm_bytes(wasm: &[u8], capabilities: &ExecutionCapabilities) -> ExitCode {
@@ -132,8 +134,18 @@ fn run_core_wasm_bytes(
     wasm: &[u8],
     module_dir: Option<&Path>,
     capabilities: &ExecutionCapabilities,
+    guest_args: &[String],
 ) -> ExitCode {
-    let engine = Engine::default();
+    let mut config = wasmtime::Config::new();
+    config.max_wasm_stack(64 * 1024 * 1024); // 64 MiB
+    config.wasm_tail_call(true);
+    let engine = match Engine::new(&config) {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("Failed to create engine: {}", e);
+            return ExitCode::from(1);
+        }
+    };
     let module = match Module::from_binary(&engine, wasm) {
         Ok(module) => module,
         Err(e) => {
@@ -143,6 +155,7 @@ fn run_core_wasm_bytes(
     };
 
     let has_conc = conc::needs_conc_runtime(wasm);
+    let has_bt = backtrace::needs_bt_runtime(wasm);
 
     let mut linker = Linker::<wasmtime_wasi::p1::WasiP1Ctx>::new(&engine);
     if let Err(e) = wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx) {
@@ -152,6 +165,13 @@ fn run_core_wasm_bytes(
     if has_conc {
         if let Err(e) = conc::add_conc_to_linker(&mut linker) {
             eprintln!("Failed to add conc runtime to linker: {}", e);
+            return ExitCode::from(1);
+        }
+    }
+    if has_bt {
+        backtrace::reset();
+        if let Err(e) = backtrace::add_bt_to_linker(&mut linker) {
+            eprintln!("Failed to add backtrace runtime to linker: {}", e);
             return ExitCode::from(1);
         }
     }
@@ -167,6 +187,12 @@ fn run_core_wasm_bytes(
         eprintln!("Failed to apply capability policy: {}", msg);
         return ExitCode::from(1);
     }
+    if !guest_args.is_empty() {
+        // Prepend program name as argv[0] (Unix convention).
+        let mut all_args = vec!["nexus".to_string()];
+        all_args.extend(guest_args.iter().cloned());
+        builder.args(&all_args);
+    }
     let mut store = Store::new(&engine, builder.build_p1());
 
     let mut imported_modules = module
@@ -180,6 +206,9 @@ fn run_core_wasm_bytes(
     for module_name in imported_modules {
         if module_name == WASI_SNAPSHOT_MODULE || module_name == conc::CONC_HOST_MODULE {
             continue;
+        }
+        if module_name == backtrace::BT_HOST_MODULE {
+            continue; // handled by backtrace linker
         }
         if module_name == NEXUS_HOST_HTTP_MODULE {
             continue; // handled by net_host linker

@@ -1795,6 +1795,10 @@ impl Parser {
                     path.push('-');
                     self.advance();
                 }
+                TokenKind::Colon => {
+                    path.push(':');
+                    self.advance();
+                }
                 _ => break,
             }
         }

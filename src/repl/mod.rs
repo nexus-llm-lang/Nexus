@@ -17,6 +17,7 @@ use crate::constants::{Permission, ENTRYPOINT};
 use crate::lang::ast::{Expr, GlobalLet, Literal, Program, Spanned, Stmt, TopLevel, Type};
 use crate::lang::parser::{parser, stmt_parser, ParseError};
 use crate::lang::typecheck::TypeChecker;
+use crate::runtime::backtrace;
 use crate::runtime::conc::add_nexus_host_stubs;
 use crate::runtime::ExecutionCapabilities;
 
@@ -106,6 +107,11 @@ impl ReplState {
         // stdlib.wasm is monolithic and imports nexus:cli/nexus-host for net FFI.
         // Add no-op stubs so instantiation succeeds even when net isn't used.
         add_nexus_host_stubs(&mut linker);
+
+        // Backtrace host functions — always add for REPL (stdlib may need them).
+        backtrace::reset();
+        backtrace::add_bt_to_linker(&mut linker)
+            .map_err(|e| format!("Backtrace link error: {e}"))?;
 
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdio();

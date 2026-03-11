@@ -3,6 +3,7 @@ use crate::lang::ast::Type;
 use std::path::PathBuf;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
+pub mod backtrace;
 pub mod conc;
 pub mod net_host;
 pub mod string_heap;

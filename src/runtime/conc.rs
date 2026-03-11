@@ -244,6 +244,9 @@ fn run_task_thread(
         linker.func_wrap(CONC_HOST_MODULE, CONC_JOIN_FUNC, || {})?;
         // nexus-host stubs (needed by stdlib bundle even if task doesn't use net)
         add_nexus_host_stubs(&mut linker);
+        // Backtrace stubs (tasks share thread-local bt state)
+        super::backtrace::add_bt_to_linker(&mut linker)
+            .map_err(wasmtime::Error::msg)?;
 
         let mut builder = WasiCtxBuilder::new();
         capabilities
@@ -268,6 +271,8 @@ fn run_task_thread(
             |_: i32, _: i32, _: i32| {},
         )?;
         linker.func_wrap(CONC_HOST_MODULE, CONC_JOIN_FUNC, || {})?;
+        super::backtrace::add_bt_to_linker(&mut linker)
+            .map_err(wasmtime::Error::msg)?;
 
         let mut store = Store::new(engine, ());
         let instance = linker.instantiate(&mut store, module)?;

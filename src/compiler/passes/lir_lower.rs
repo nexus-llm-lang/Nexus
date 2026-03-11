@@ -205,6 +205,24 @@ impl<'a> LowerCtx<'a> {
         LirAtom::Var { name, typ }
     }
 
+    /// Like bind_expr_to_temp but also registers the semantic type for pattern matching.
+    fn bind_expr_to_temp_semantic(
+        &mut self,
+        expr: LirExpr,
+        typ: Type,
+        semantic_type: Type,
+    ) -> LirAtom {
+        let name = self.new_temp();
+        self.vars.insert(name.clone(), typ.clone());
+        self.semantic_vars.insert(name.clone(), semantic_type);
+        self.stmts.push(LirStmt::Let {
+            name: name.clone(),
+            typ: typ.clone(),
+            expr,
+        });
+        LirAtom::Var { name, typ }
+    }
+
     /// Lower a MIR statement, optionally returning an atom for explicit returns
     fn lower_stmt(
         &mut self,
@@ -215,7 +233,7 @@ impl<'a> LowerCtx<'a> {
             MirStmt::Let { name, typ, expr } => {
                 // Infer semantic type from expression BEFORE lowering
                 // (MIR typ is often None/Unit for unannotated lets)
-                let semantic_type = {
+                let pre_semantic_type = {
                     let expr_inferred = self.infer_semantic_type(expr);
                     if matches!(typ, Type::Unit) || matches!(typ, Type::I64) {
                         expr_inferred
@@ -225,6 +243,19 @@ impl<'a> LowerCtx<'a> {
                 };
                 let atom = self.lower_expr_to_atom(expr)?;
                 let inferred = atom.typ();
+                // After lowering, the result atom (if a temp var from match/if expr)
+                // may have a more accurate semantic type set by lower_match_expr/lower_if_expr.
+                // Prefer that over the pre-lowering inference which can't resolve pattern bindings.
+                let semantic_type = match &atom {
+                    LirAtom::Var {
+                        name: var_name, ..
+                    } => self
+                        .semantic_vars
+                        .get(var_name)
+                        .cloned()
+                        .unwrap_or(pre_semantic_type),
+                    _ => pre_semantic_type,
+                };
                 self.vars.insert(name.clone(), inferred.clone());
                 self.semantic_vars.insert(name.clone(), semantic_type);
                 self.stmts.push(LirStmt::Let {
@@ -387,7 +418,7 @@ impl<'a> LowerCtx<'a> {
                 self.stmts.push(LirStmt::IfReturn {
                     cond: cond_atom,
                     then_body: then_stmts,
-                    then_ret: then_ret.unwrap_or(LirAtom::Unit),
+                    then_ret: then_ret.unwrap_or_else(|| default_atom_for_type(ret_type)),
                     else_body: else_stmts,
                     else_ret,
                     ret_type: ret_type.clone(),
@@ -404,7 +435,7 @@ impl<'a> LowerCtx<'a> {
             self.stmts.push(LirStmt::IfReturn {
                 cond: cond_atom,
                 then_body: then_stmts,
-                then_ret: then_ret.unwrap_or(LirAtom::Unit),
+                then_ret: then_ret.unwrap_or_else(|| default_atom_for_type(ret_type)),
                 else_body: Vec::new(),
                 else_ret: None,
                 ret_type: ret_type.clone(),
@@ -417,6 +448,102 @@ impl<'a> LowerCtx<'a> {
             });
         }
         Ok(())
+    }
+
+    /// Lower an if expression in atom position (as a value).
+    /// Creates a temp variable, assigns in each branch, returns the temp.
+    fn lower_if_expr(
+        &mut self,
+        cond: &MirExpr,
+        then_body: &[MirStmt],
+        else_body: Option<&[MirStmt]>,
+    ) -> Result<LirAtom, LirLowerError> {
+        let cond_atom = self.lower_expr_to_atom(cond)?;
+
+        // Infer result type from the then branch's last statement
+        let semantic_result_type = if let Some(last) = then_body.last() {
+            self.infer_stmt_type(last)
+        } else {
+            Type::Unit
+        };
+        let result_type = wasm_type(&semantic_result_type);
+
+        let result_name = self.new_temp();
+        self.vars.insert(result_name.clone(), result_type.clone());
+        self.semantic_vars
+            .insert(result_name.clone(), semantic_result_type);
+
+        // Initialize with placeholder
+        self.stmts.push(LirStmt::Let {
+            name: result_name.clone(),
+            typ: result_type.clone(),
+            expr: LirExpr::Atom(default_atom_for_type(&result_type)),
+        });
+
+        // Lower branches directly — do NOT use promote_last_expr_to_return, which
+        // creates synthetic Return stmts that trigger TailCall optimization and
+        // incorrectly return from the enclosing function instead of just producing
+        // a value for the if-expression.
+        let then_stmts =
+            self.lower_branch_for_value(then_body, &result_name, &result_type)?;
+
+        let else_stmts = if let Some(else_body) = else_body {
+            self.lower_branch_for_value(else_body, &result_name, &result_type)?
+        } else {
+            Vec::new()
+        };
+
+        self.stmts.push(LirStmt::If {
+            cond: cond_atom,
+            then_body: then_stmts,
+            else_body: else_stmts,
+        });
+
+        Ok(LirAtom::Var {
+            name: result_name,
+            typ: result_type,
+        })
+    }
+
+    /// Lower a branch body (then/else) for value extraction without synthetic Returns.
+    /// Lowers all statements, then assigns the last expression's value to `result_name`.
+    fn lower_branch_for_value(
+        &mut self,
+        body: &[MirStmt],
+        result_name: &str,
+        result_type: &Type,
+    ) -> Result<Vec<LirStmt>, LirLowerError> {
+        let saved_stmts = std::mem::take(&mut self.stmts);
+        let saved_vars = self.vars.clone();
+        let saved_semantic_vars = self.semantic_vars.clone();
+
+        if !body.is_empty() {
+            let last_idx = body.len() - 1;
+            for stmt in &body[..last_idx] {
+                self.lower_stmt(stmt, &Type::Unit)?;
+            }
+            // Extract the value from the last statement
+            let value = match &body[last_idx] {
+                MirStmt::Expr(expr) => Some(self.lower_expr_to_atom(expr)?),
+                MirStmt::Return(expr) => Some(self.lower_expr_to_atom(expr)?),
+                _ => {
+                    self.lower_stmt(&body[last_idx], &Type::Unit)?;
+                    None
+                }
+            };
+            if let Some(val) = value {
+                self.stmts.push(LirStmt::Let {
+                    name: result_name.to_string(),
+                    typ: result_type.clone(),
+                    expr: LirExpr::Atom(val),
+                });
+            }
+        }
+
+        let branch_stmts = std::mem::replace(&mut self.stmts, saved_stmts);
+        self.vars = saved_vars;
+        self.semantic_vars = saved_semantic_vars;
+        Ok(branch_stmts)
     }
 
     /// Lower a match expression into a chain of IfReturn statements
@@ -450,7 +577,16 @@ impl<'a> LowerCtx<'a> {
 
             let then_ret = case_ret
                 .or_else(|| fallback_return_atom_from_terminal_stmt(&case_stmts))
-                .unwrap_or(LirAtom::Unit);
+                .unwrap_or_else(|| default_atom_for_type(ret_type));
+            // If the case diverges (e.g. raise), case_ret may be Unit-typed
+            // even though the function returns non-Unit. Use a placeholder of
+            // the correct type so codegen can register a proper WASM local.
+            let then_ret =
+                if matches!(then_ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
+                    default_atom_for_type(ret_type)
+                } else {
+                    then_ret
+                };
 
             chain = Some(LirStmt::IfReturn {
                 cond,
@@ -523,13 +659,39 @@ impl<'a> LowerCtx<'a> {
             return Ok(LirAtom::Unit);
         }
 
-        // Infer result type from first case's tail expression
-        let result_type = self.infer_match_expr_type(cases);
+        // Lower all cases first to get accurate types from actual lowered values
+        let mut lowered_cases: Vec<(Option<LirAtom>, Vec<LirStmt>, LirAtom)> = Vec::new();
+        for case in cases.iter().rev() {
+            let result =
+                self.lower_match_case_expr(&target_atom, &case.pattern, &case.body)?;
+            lowered_cases.push(result);
+        }
+
+        // Infer semantic result type from the first non-Unit case value
+        let semantic_result_type = lowered_cases
+            .iter()
+            .find_map(|(_, _, val)| {
+                let t = val.typ();
+                if matches!(t, Type::Unit) {
+                    None
+                } else {
+                    // For Var atoms, look up their semantic type
+                    match val {
+                        LirAtom::Var { name, .. } => {
+                            self.semantic_vars.get(name).cloned().or(Some(t))
+                        }
+                        _ => Some(t),
+                    }
+                }
+            })
+            .unwrap_or(Type::Unit);
+        let result_type = wasm_type(&semantic_result_type);
+
         let result_name = self.new_temp();
-        // Pre-register the result variable
+        // Pre-register the result variable with correct semantic type
         self.vars.insert(result_name.clone(), result_type.clone());
         self.semantic_vars
-            .insert(result_name.clone(), result_type.clone());
+            .insert(result_name.clone(), semantic_result_type);
         // Initialize with a placeholder
         self.stmts.push(LirStmt::Let {
             name: result_name.clone(),
@@ -540,10 +702,7 @@ impl<'a> LowerCtx<'a> {
         // Build nested If chain that assigns to result_name
         let mut chain: Option<LirStmt> = None;
 
-        for case in cases.iter().rev() {
-            let (cond_opt, mut case_stmts, case_val) =
-                self.lower_match_case_expr(&target_atom, &case.pattern, &case.body)?;
-
+        for (cond_opt, mut case_stmts, case_val) in lowered_cases {
             let else_body = chain.take().map_or_else(Vec::new, |next| vec![next]);
 
             let cond = if else_body.is_empty() {
@@ -576,20 +735,6 @@ impl<'a> LowerCtx<'a> {
         })
     }
 
-    /// Infer the WASM-level result type for a match expression from the first case body.
-    fn infer_match_expr_type(&self, cases: &[MirMatchCase]) -> Type {
-        for case in cases {
-            if let Some(last) = case.body.last() {
-                match last {
-                    MirStmt::Expr(expr) => return wasm_type(&self.infer_semantic_type(expr)),
-                    MirStmt::Return(_) => continue, // diverges, try next
-                    _ => return Type::Unit,
-                }
-            }
-        }
-        Type::Unit
-    }
-
     /// Lower a single match case for expression position.
     /// Returns (condition, body_stmts, value_atom) — the value to assign.
     fn lower_match_case_expr(
@@ -601,10 +746,26 @@ impl<'a> LowerCtx<'a> {
         let mut conds = Vec::new();
         let mut bindings: HashMap<String, LirAtom> = HashMap::new();
 
+        let stmts_before = self.stmts.len();
         self.collect_pattern_conditions_and_bindings(target, pattern, &mut conds, &mut bindings)?;
+
+        // Guard field extraction stmts for Constructor patterns (same as lower_match_case)
+        let has_ctor_fields = matches!(pattern, MirPattern::Constructor { fields, .. } if !fields.is_empty());
+        let guarded_stmts: Vec<LirStmt> = if has_ctor_fields {
+            let tag_check_end = stmts_before + 2;
+            if self.stmts.len() > tag_check_end {
+                self.stmts.drain(tag_check_end..).collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
 
         let combined_cond = if conds.is_empty() {
             None
+        } else if !guarded_stmts.is_empty() && !conds.is_empty() {
+            Some(conds[0].clone())
         } else {
             Some(self.combine_bool_conditions(&conds))
         };
@@ -626,6 +787,9 @@ impl<'a> LowerCtx<'a> {
         let saved_stmts = std::mem::take(&mut self.stmts);
         let saved_vars = std::mem::replace(&mut self.vars, case_vars);
         let saved_semantic_vars = std::mem::replace(&mut self.semantic_vars, case_sem_vars);
+
+        // Prepend guarded pattern stmts
+        self.stmts.extend(guarded_stmts);
 
         // Prepend binding let-statements
         for (name, atom) in &bindings {
@@ -678,11 +842,36 @@ impl<'a> LowerCtx<'a> {
         let mut conds = Vec::new();
         let mut bindings: HashMap<String, LirAtom> = HashMap::new();
 
+        // Track stmts emitted by pattern extraction
+        let stmts_before = self.stmts.len();
         self.collect_pattern_conditions_and_bindings(target, pattern, &mut conds, &mut bindings)?;
 
-        // Combine conditions with And
+        // For Constructor patterns with fields, the first 2 stmts are the
+        // top-level tag check (ObjectTag read + Eq), which only reads offset 0
+        // and is always safe. Remaining stmts (field extractions, nested tag
+        // checks) dereference field pointers and are only valid when the tag
+        // matches. Move them inside the case body so they execute only after
+        // the tag check passes.
+        let has_ctor_fields = matches!(pattern, MirPattern::Constructor { fields, .. } if !fields.is_empty());
+        let guarded_stmts: Vec<LirStmt> = if has_ctor_fields {
+            let tag_check_end = stmts_before + 2;
+            if self.stmts.len() > tag_check_end {
+                self.stmts.drain(tag_check_end..).collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // For Constructor patterns with guarded stmts, use only the outer
+        // tag check as the condition (first cond). Inner conditions from
+        // nested patterns are inside guarded_stmts and will be validated
+        // inside the then_body.
         let combined_cond = if conds.is_empty() {
             None
+        } else if !guarded_stmts.is_empty() && !conds.is_empty() {
+            Some(conds[0].clone())
         } else {
             Some(self.combine_bool_conditions(&conds))
         };
@@ -701,22 +890,82 @@ impl<'a> LowerCtx<'a> {
             case_sem_vars.insert(name.clone(), sem_type);
         }
 
-        let (mut case_stmts, case_ret) =
-            self.lower_block_with_vars(body, ret_type, case_vars, case_sem_vars)?;
+        // Lower body, capturing the last expression's value as case_ret.
+        // Save state and set up scoped vars.
+        let saved_stmts = std::mem::take(&mut self.stmts);
+        let saved_vars = std::mem::replace(&mut self.vars, case_vars);
+        let saved_semantic_vars = std::mem::replace(&mut self.semantic_vars, case_sem_vars);
+
+        // Prepend guarded pattern stmts (field extractions, nested checks)
+        // before the binding lets — they define the atoms used by bindings.
+        self.stmts.extend(guarded_stmts);
 
         // Prepend binding let-statements
-        let mut binding_stmts: Vec<LirStmt> = Vec::new();
         for (name, atom) in bindings {
             let typ = atom.typ();
-            binding_stmts.push(LirStmt::Let {
+            self.stmts.push(LirStmt::Let {
                 name,
                 typ: typ.clone(),
                 expr: LirExpr::Atom(atom),
             });
         }
-        binding_stmts.append(&mut case_stmts);
 
-        Ok((combined_cond, binding_stmts, case_ret))
+        let case_ret = if body.is_empty() {
+            None
+        } else {
+            // Process all but the last statement
+            let last_idx = body.len() - 1;
+            for stmt in &body[..last_idx] {
+                self.lower_stmt(stmt, ret_type)?;
+            }
+            // The last statement: capture its value if it's an expression
+            match &body[last_idx] {
+                MirStmt::Expr(expr) => match expr {
+                    MirExpr::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    } => {
+                        self.lower_if_stmt(cond, then_body, else_body.as_deref(), ret_type)?;
+                        None
+                    }
+                    MirExpr::Match { target, cases } => {
+                        self.lower_match_stmt(target, cases, ret_type)?;
+                        None
+                    }
+                    MirExpr::While { cond, body: wb } => {
+                        self.lower_while_stmt(cond, wb, ret_type)?;
+                        None
+                    }
+                    _ => {
+                        let atom = self.lower_expr_to_atom(expr)?;
+                        if matches!(atom.typ(), Type::Unit) {
+                            None
+                        } else {
+                            Some(atom)
+                        }
+                    }
+                },
+                MirStmt::Return(expr) => {
+                    let atom = self.lower_expr_to_atom(expr)?;
+                    if matches!(atom.typ(), Type::Unit) {
+                        None
+                    } else {
+                        Some(atom)
+                    }
+                }
+                _ => {
+                    self.lower_stmt(&body[last_idx], ret_type)?;
+                    None
+                }
+            }
+        };
+
+        let case_stmts = std::mem::replace(&mut self.stmts, saved_stmts);
+        self.vars = saved_vars;
+        self.semantic_vars = saved_semantic_vars;
+
+        Ok((combined_cond, case_stmts, case_ret))
     }
 
     /// Collect pattern matching conditions and variable bindings
@@ -766,16 +1015,43 @@ impl<'a> LowerCtx<'a> {
                 );
                 conds.push(tag_cond);
 
+                // Resolve field types from enum definition so unpack
+                // conversion (I64 → I32 for Bool, etc.) is correct.
+                let target_sem_type = match target {
+                    LirAtom::Var { name: vn, .. } => self
+                        .semantic_vars
+                        .get(vn)
+                        .cloned()
+                        .unwrap_or_else(|| target.typ()),
+                    _ => target.typ(),
+                };
+                let resolved_field_types =
+                    resolve_constructor_field_types(name, &target_sem_type, self.enum_defs);
+
                 // Field checks
                 for (idx, (_label, field_pat)) in fields.iter().enumerate() {
+                    let semantic_ft = resolved_field_types
+                        .as_ref()
+                        .and_then(|fts| fts.get(idx))
+                        .cloned();
+                    let wasm_ft = semantic_ft
+                        .as_ref()
+                        .map(|ft| wasm_type(ft))
+                        .unwrap_or(Type::I64);
                     let field_atom = self.bind_expr_to_temp(
                         LirExpr::ObjectField {
                             value: target.clone(),
                             index: idx,
-                            typ: Type::I64, // generic object field type
+                            typ: wasm_ft.clone(),
                         },
-                        Type::I64,
+                        wasm_ft,
                     );
+                    // Register semantic type for nested pattern matching
+                    if let (LirAtom::Var { name: fn_name, .. }, Some(sft)) =
+                        (&field_atom, &semantic_ft)
+                    {
+                        self.semantic_vars.insert(fn_name.clone(), sft.clone());
+                    }
                     self.collect_pattern_conditions_and_bindings(
                         &field_atom,
                         field_pat,
@@ -957,13 +1233,14 @@ impl<'a> LowerCtx<'a> {
                     lir_args.push((label.clone(), atom));
                 }
                 let typ = wasm_type(ret_type);
-                Ok(self.bind_expr_to_temp(
+                Ok(self.bind_expr_to_temp_semantic(
                     LirExpr::Call {
                         func: func.clone(),
                         args: lir_args,
                         typ: typ.clone(),
                     },
                     typ,
+                    ret_type.clone(),
                 ))
             }
             MirExpr::Constructor { name, args } => {
@@ -1047,17 +1324,10 @@ impl<'a> LowerCtx<'a> {
                 ))
             }
             MirExpr::If {
-                cond: _,
-                then_body: _,
-                else_body: _,
-            } => {
-                // If used as expression — lower to IfReturn
-                Err(LirLowerError::UnsupportedExpression {
-                    detail: "If expression in atom position; should be lowered at statement level"
-                        .to_string(),
-                    span: 0..0,
-                })
-            }
+                cond,
+                then_body,
+                else_body,
+            } => self.lower_if_expr(cond, then_body, else_body.as_deref()),
             MirExpr::Match { target, cases } => self.lower_match_expr(target, cases),
             MirExpr::While { .. } => Err(LirLowerError::UnsupportedExpression {
                 detail: "While loop in atom position; should be lowered at statement level"
@@ -1147,7 +1417,13 @@ impl<'a> LowerCtx<'a> {
                     _ => Type::I64,
                 }
             }
-            MirExpr::BinaryOp(lhs, _, _) => self.infer_semantic_type(lhs),
+            MirExpr::BinaryOp(lhs, op, _) => {
+                if op.is_comparison() || matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    Type::Bool
+                } else {
+                    self.infer_semantic_type(lhs)
+                }
+            }
             MirExpr::While { .. } => Type::Unit,
             MirExpr::Borrow(name) => self.semantic_vars.get(name).cloned().unwrap_or(Type::I64),
             MirExpr::Raise(_) => Type::I64,
@@ -1324,6 +1600,14 @@ fn fallback_return_atom_from_terminal_stmt(stmts: &[LirStmt]) -> Option<LirAtom>
             body_ret,
             ..
         } => catch_ret.clone().or_else(|| body_ret.clone()),
+        // A trailing Let binding (e.g. from lowering a bare Call expression) —
+        // use the bound variable as the implicit return value.
+        LirStmt::Let { name, typ, .. } if !matches!(typ, Type::Unit) => {
+            Some(LirAtom::Var {
+                name: name.clone(),
+                typ: typ.clone(),
+            })
+        }
         _ => None,
     }
 }

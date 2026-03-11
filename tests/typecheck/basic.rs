@@ -655,3 +655,46 @@ end
 "#,
     );
 }
+
+#[test]
+fn test_main_with_args_typechecks() {
+    should_typecheck(
+        r#"
+let main = fn (args: [string]) -> unit do
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn test_main_with_wrong_arg_type_fails() {
+    let msg = should_fail_typecheck(
+        r#"
+let main = fn (x: i64) -> unit do
+    return ()
+end
+"#,
+    );
+    assert!(
+        msg.contains("main must be"),
+        "expected main signature error, got: {}",
+        msg
+    );
+}
+
+#[test]
+fn test_main_with_too_many_args_fails() {
+    let msg = should_fail_typecheck(
+        r#"
+let main = fn (args: [string], extra: i64) -> unit do
+    return ()
+end
+"#,
+    );
+    assert!(
+        msg.contains("main must be"),
+        "expected main signature error, got: {}",
+        msg
+    );
+}

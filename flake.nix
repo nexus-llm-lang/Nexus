@@ -66,6 +66,7 @@
             ++ tsDeps
             ++ runtimeDeps
             ++ [
+              pkgs.wasm-tools
               pkgs.actionlint
               pkgs.nil
               formatter

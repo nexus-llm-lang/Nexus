@@ -462,6 +462,181 @@ end
     );
 }
 
+// ---- If-expression inside match-expression as let initializer ----
+
+#[test]
+fn codegen_if_expr_inside_match_expr_as_let_value() {
+    exec(
+        r#"
+let pick = fn (flag: bool, a: i64, b: i64) -> i64 do
+    let result = match flag do
+      case true ->
+        if a > b then a else b end
+      case false -> 0
+    end
+    return result
+end
+
+let main = fn () -> unit do
+    let r1 = pick(flag: true, a: 10, b: 20)
+    if r1 != 20 then raise RuntimeError(val: "expected 20") end
+    let r2 = pick(flag: true, a: 30, b: 5)
+    if r2 != 30 then raise RuntimeError(val: "expected 30") end
+    let r3 = pick(flag: false, a: 10, b: 20)
+    if r3 != 0 then raise RuntimeError(val: "expected 0") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_if_expr_inside_nested_match_expr_as_let_value() {
+    exec(
+        r#"
+type Wrapper = Wrapper(val: i64)
+type Outer = OuterA(inner: Wrapper) | OuterB
+
+let classify = fn (x: Outer, threshold: i64) -> i64 do
+    let result = match x do
+      case OuterA(inner: w) ->
+        match w do case Wrapper(val: v) ->
+          if v > threshold then v else threshold end
+        end
+      case OuterB -> 0
+    end
+    return result
+end
+
+let main = fn () -> unit do
+    let r1 = classify(x: OuterA(inner: Wrapper(val: 100)), threshold: 50)
+    if r1 != 100 then raise RuntimeError(val: "expected 100") end
+    let r2 = classify(x: OuterA(inner: Wrapper(val: 10)), threshold: 50)
+    if r2 != 50 then raise RuntimeError(val: "expected 50") end
+    let r3 = classify(x: OuterB, threshold: 50)
+    if r3 != 0 then raise RuntimeError(val: "expected 0") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_if_expr_with_call_inside_nested_match() {
+    exec(
+        r#"
+type Wrapper = Wrapper(val: i64)
+type Outer = OuterA(inner: Wrapper) | OuterB
+
+let add10 = fn (x: i64) -> i64 do
+    return x + 10
+end
+
+let compute = fn (x: Outer, flag: bool) -> i64 do
+    let result = match x do
+      case OuterA(inner: w) ->
+        match w do case Wrapper(val: v) ->
+          if flag then add10(x: v) else v end
+        end
+      case OuterB -> 0
+    end
+    return result
+end
+
+let main = fn () -> unit do
+    let r1 = compute(x: OuterA(inner: Wrapper(val: 5)), flag: true)
+    if r1 != 15 then raise RuntimeError(val: "expected 15") end
+    let r2 = compute(x: OuterA(inner: Wrapper(val: 5)), flag: false)
+    if r2 != 5 then raise RuntimeError(val: "expected 5") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_if_expr_returning_list_inside_nested_match() {
+    exec(
+        r#"
+type Wrapper = Wrapper(name: string)
+type Outer = OuterA(inner: Wrapper) | OuterB
+
+let classify = fn (x: Outer, flag: bool) -> [string] do
+    let result = match x do
+      case OuterA(inner: w) ->
+        match w do case Wrapper(name: n) ->
+          if flag then Cons(v: n, rest: Nil()) else Nil() end
+        end
+      case OuterB -> Nil()
+    end
+    return result
+end
+
+let main = fn () -> unit do
+    let r1 = classify(x: OuterA(inner: Wrapper(name: "hello")), flag: true)
+    match r1 do
+      case Cons(v: s, rest: Nil()) ->
+        if s != "hello" then raise RuntimeError(val: "expected hello") end
+      case _ -> raise RuntimeError(val: "expected Cons")
+    end
+    let r2 = classify(x: OuterA(inner: Wrapper(name: "hello")), flag: false)
+    match r2 do
+      case Nil() -> return ()
+      case _ -> raise RuntimeError(val: "expected Nil")
+    end
+    return ()
+end
+"#,
+    );
+}
+
+// Repro: exact pattern from build_selective_rename_go in resolve.nx
+// let result = match outer do
+//   case OuterA(inner) ->
+//     match inner do case Inner(name) ->
+//       if cond then fn_call() else fn_call() end
+//     end
+//   case _ -> default_val
+// end
+#[test]
+fn codegen_if_call_inside_double_nested_match_as_let() {
+    exec(
+        r#"
+type Inner = Inner(name: string)
+type Outer = OuterA(inner: Inner) | OuterB
+
+let prepend = fn (s: string, prefix: string) -> string do
+    return prefix ++ s
+end
+
+let identity = fn (s: string) -> string do
+    return s
+end
+
+let classify = fn (x: Outer, flag: bool) -> string do
+    let result = match x do
+      case OuterA(inner: w) ->
+        match w do case Inner(name: n) ->
+          if flag then identity(s: n) else prepend(s: n, prefix: "pfx.") end
+        end
+      case OuterB -> "none"
+    end
+    return result
+end
+
+let main = fn () -> unit do
+    let r1 = classify(x: OuterA(inner: Inner(name: "hello")), flag: true)
+    if r1 != "hello" then raise RuntimeError(val: "expected hello") end
+    let r2 = classify(x: OuterA(inner: Inner(name: "hello")), flag: false)
+    if r2 != "pfx.hello" then raise RuntimeError(val: "expected pfx.hello") end
+    let r3 = classify(x: OuterB, flag: true)
+    if r3 != "none" then raise RuntimeError(val: "expected none") end
+    return ()
+end
+"#,
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 64,

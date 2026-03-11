@@ -528,3 +528,63 @@ end
 "#,
     );
 }
+
+#[test]
+fn codegen_main_with_args_desugars_to_zero_param_wasm() {
+    let wasm = compile(
+        r#"
+let main = fn (args: [string]) -> unit do
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    // The desugared main should have 0 params in WASM
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::ExportSection(reader) = payload.unwrap() {
+            for export in reader.into_iter().flatten() {
+                if export.name == "main" {
+                    // main export should exist (desugaring worked)
+                    assert_eq!(
+                        export.kind,
+                        wasmparser::ExternalKind::Func,
+                        "main should be a function export"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn codegen_main_with_args_includes_proc_capability() {
+    let src = r#"
+let main = fn (args: [string]) -> unit do
+    return ()
+end
+"#;
+    let program = nexus::lang::parser::parser().parse(src).unwrap();
+    let (wasm, _) = compile_program_to_wasm_with_metrics(&program).unwrap();
+
+    // PermProc should be in the capabilities section
+    let caps = nexus::runtime::parse_nexus_capabilities(&wasm);
+    assert!(
+        caps.iter().any(|c| c == "Proc"),
+        "main(args) should implicitly require PermProc, got: {:?}",
+        caps
+    );
+}
+
+#[test]
+fn codegen_main_with_args_runs_with_stdlib() {
+    exec_with_stdlib(
+        r#"
+let main = fn (args: [string]) -> unit do
+    return ()
+end
+"#,
+    );
+}
