@@ -3,6 +3,7 @@
 use nexus::compiler::codegen::compile_program_to_wasm;
 use nexus::lang::parser;
 use nexus::lang::stdlib::resolve_import_path;
+use nexus::runtime::backtrace;
 use nexus::runtime::conc;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,18 +53,31 @@ fn run_main(wasm: &[u8]) -> Result<(), String> {
     let engine = Engine::default();
     let module = Module::from_binary(&engine, wasm).map_err(|e| e.to_string())?;
     let has_conc = conc::needs_conc_runtime(wasm);
+    let has_bt = backtrace::needs_bt_runtime(wasm);
 
-    if has_conc {
-        let module = Arc::new(module);
-        conc::setup_conc_runtime(
-            engine.clone(),
-            module.clone(),
-            wasm,
-            vec![],
-            nexus::runtime::ExecutionCapabilities::permissive_legacy(),
-        );
+    if has_conc || has_bt {
+        let module = if has_conc {
+            Arc::new(module)
+        } else {
+            Arc::new(module)
+        };
+        if has_conc {
+            conc::setup_conc_runtime(
+                engine.clone(),
+                module.clone(),
+                wasm,
+                vec![],
+                nexus::runtime::ExecutionCapabilities::permissive_legacy(),
+            );
+        }
         let mut linker = Linker::new(&engine);
-        conc::add_conc_to_linker(&mut linker).map_err(|e| e.to_string())?;
+        if has_conc {
+            conc::add_conc_to_linker(&mut linker).map_err(|e| e.to_string())?;
+        }
+        if has_bt {
+            backtrace::reset();
+            backtrace::add_bt_to_linker(&mut linker)?;
+        }
         let mut store = Store::new(&engine, ());
         let instance = linker
             .instantiate(&mut store, &*module)
@@ -85,7 +99,7 @@ fn run_main(wasm: &[u8]) -> Result<(), String> {
 /// Execute main() -> () with WASI P1, stdlib dependency resolution, and conc runtime.
 fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
     let engine = Engine::default();
-    let module = Module::from_binary(&engine, wasm).map_err(|e| e.to_string())?;
+    let module = Module::from_binary(&engine, wasm).map_err(|e| format!("{:#}", e))?;
     let has_conc = conc::needs_conc_runtime(wasm);
 
     let mut linker = Linker::new(&engine);
@@ -94,6 +108,9 @@ fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
     if has_conc {
         conc::add_conc_to_linker(&mut linker)?;
     }
+    // Always add backtrace to linker — stdlib modules may import it
+    backtrace::reset();
+    backtrace::add_bt_to_linker(&mut linker)?;
 
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
@@ -112,6 +129,7 @@ fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
     for module_name in imported_modules {
         if module_name == "wasi_snapshot_preview1"
             || module_name == conc::CONC_HOST_MODULE
+            || module_name == backtrace::BT_HOST_MODULE
             || module_name == "nexus:cli/nexus-host"
         {
             continue;

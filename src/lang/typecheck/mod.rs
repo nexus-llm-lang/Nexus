@@ -453,22 +453,40 @@ impl TypeChecker {
                                 span: def.span.clone(),
                             });
                         }
-                        let req = self.new_var();
-                        let ef = self.new_var();
-                        let sm = self
-                            .unify(
+                        // Accept main() -> unit or main(args: [string]) -> unit
+                        let (sm, req, ef) = {
+                            let req0 = self.new_var();
+                            let ef0 = self.new_var();
+                            if let Ok(sm) = self.unify(
                                 &t,
                                 &Type::Arrow(
                                     vec![],
                                     Box::new(Type::Unit),
-                                    Box::new(req.clone()),
-                                    Box::new(ef.clone()),
+                                    Box::new(req0.clone()),
+                                    Box::new(ef0.clone()),
                                 ),
-                            )
-                            .map_err(|_| TypeError {
-                                message: "main must be a function '() -> unit'".into(),
-                                span: def.span.clone(),
-                            })?;
+                            ) {
+                                (sm, req0, ef0)
+                            } else {
+                                let req1 = self.new_var();
+                                let ef1 = self.new_var();
+                                let sm = self
+                                    .unify(
+                                        &t,
+                                        &Type::Arrow(
+                                            vec![("args".to_string(), Type::List(Box::new(Type::String)))],
+                                            Box::new(Type::Unit),
+                                            Box::new(req1.clone()),
+                                            Box::new(ef1.clone()),
+                                        ),
+                                    )
+                                    .map_err(|_| TypeError {
+                                        message: "main must be '() -> unit' or '(args: [string]) -> unit'".into(),
+                                        span: def.span.clone(),
+                                    })?;
+                                (sm, req1, ef1)
+                            }
+                        };
                         let final_req = apply_subst_type(&sm, &req);
                         if !is_allowed_main_require_signature(&final_req) {
                             return Err(TypeError {
@@ -658,10 +676,49 @@ impl TypeChecker {
                                 span: value.span.clone(),
                             });
                         }
-                        let ann = typ.clone().ok_or_else(|| TypeError {
-                            message: "Recursive lambda requires an explicit type annotation".into(),
-                            span: value.span.clone(),
-                        })?;
+                        let ann = if let Some(t) = typ.clone() {
+                            t
+                        } else if let Expr::Lambda {
+                            type_params,
+                            params,
+                            ret_type,
+                            requires,
+                            throws,
+                            ..
+                        } = &value.node
+                        {
+                            let vars_set: HashSet<String> =
+                                type_params.iter().cloned().collect();
+                            Type::Arrow(
+                                params
+                                    .iter()
+                                    .map(|p| {
+                                        (
+                                            p.name.clone(),
+                                            self.convert_user_defined_to_var(
+                                                &p.typ, &vars_set,
+                                            ),
+                                        )
+                                    })
+                                    .collect(),
+                                Box::new(
+                                    self.convert_user_defined_to_var(ret_type, &vars_set),
+                                ),
+                                Box::new(
+                                    self.convert_user_defined_to_var(requires, &vars_set),
+                                ),
+                                Box::new(
+                                    self.convert_user_defined_to_var(throws, &vars_set),
+                                ),
+                            )
+                        } else {
+                            return Err(TypeError {
+                                message:
+                                    "Recursive lambda requires an explicit type annotation"
+                                        .into(),
+                                span: value.span.clone(),
+                            });
+                        };
                         env.insert(
                             key.clone(),
                             Scheme {
@@ -1133,9 +1190,43 @@ impl TypeChecker {
                         s = compose_subst(&s, &s4);
                         Ok((s, target))
                     }
-                    BinaryOp::Eq
-                    | BinaryOp::Ne
-                    | BinaryOp::Lt
+                    BinaryOp::Eq | BinaryOp::Ne => {
+                        let lt = apply_subst_type(&s, &t1);
+                        let rt = apply_subst_type(&s, &t2);
+                        // Eq/Ne work on int, string, and bool
+                        let target = select_int_type(&lt, &rt)
+                            .or_else(|| {
+                                if matches!((&lt, &rt), (Type::String, Type::String)) {
+                                    Some(Type::String)
+                                } else if matches!((&lt, &rt), (Type::Bool, Type::Bool)) {
+                                    Some(Type::Bool)
+                                } else {
+                                    None
+                                }
+                            })
+                            .ok_or_else(|| TypeError {
+                                message: format!(
+                                    "Equality comparison expects matching types, got {} and {}",
+                                    lt, rt
+                                ),
+                                span: e.span.clone(),
+                            })?;
+
+                        let s3 = self.unify(&lt, &target).map_err(|m| TypeError {
+                            message: m,
+                            span: l.span.clone(),
+                        })?;
+                        s = compose_subst(&s, &s3);
+                        let s4 = self
+                            .unify(&apply_subst_type(&s, &t2), &target)
+                            .map_err(|m| TypeError {
+                                message: m,
+                                span: r.span.clone(),
+                            })?;
+                        s = compose_subst(&s, &s4);
+                        Ok((s, Type::Bool))
+                    }
+                    BinaryOp::Lt
                     | BinaryOp::Gt
                     | BinaryOp::Le
                     | BinaryOp::Ge => {
@@ -1193,10 +1284,23 @@ impl TypeChecker {
                         s = compose_subst(&s, &s4);
                         Ok((s, Type::Bool))
                     }
-                    BinaryOp::And | BinaryOp::Or => Err(TypeError {
-                        message: format!("Operator {} is not available in source expressions", op),
-                        span: e.span.clone(),
-                    }),
+                    BinaryOp::And | BinaryOp::Or => {
+                        let s3 = self
+                            .unify(&apply_subst_type(&s, &t1), &Type::Bool)
+                            .map_err(|m| TypeError {
+                                message: m,
+                                span: l.span.clone(),
+                            })?;
+                        s = compose_subst(&s, &s3);
+                        let s4 = self
+                            .unify(&apply_subst_type(&s, &t2), &Type::Bool)
+                            .map_err(|m| TypeError {
+                                message: m,
+                                span: r.span.clone(),
+                            })?;
+                        s = compose_subst(&s, &s4);
+                        Ok((s, Type::Bool))
+                    }
                 }
             }
             Expr::Borrow(n, s) => {
@@ -1631,7 +1735,12 @@ impl TypeChecker {
                                 let (s_tail, t_tail) = self.infer(&mut le, expr, er, eq, ee)?;
                                 let tail = apply_subst_type(&s_tail, &t_tail);
                                 s = compose_subst(&s, &s_tail);
-                                case_tail_types.push(Some(apply_subst_type(&s, &tail)));
+                                let diverges = matches!(&expr.node, Expr::Raise(_));
+                                if diverges {
+                                    case_tail_types.push(None);
+                                } else {
+                                    case_tail_types.push(Some(apply_subst_type(&s, &tail)));
+                                }
                             }
                             Stmt::Return(expr) => {
                                 let (s1, t1) = self.infer(&mut le, expr, er, eq, ee)?;
@@ -1651,19 +1760,26 @@ impl TypeChecker {
                             }
                         }
                     }
-                    if let Some(p) = &rv {
-                        if p != &le.linear_vars {
-                            return Err(TypeError {
-                                message: "Linear mismatch".into(),
-                                span: case.pattern.span.clone(),
-                            });
+                    let case_diverges = case_tail_types.last() == Some(&None);
+                    if !case_diverges {
+                        if let Some(p) = &rv {
+                            if p != &le.linear_vars {
+                                return Err(TypeError {
+                                    message: "Linear mismatch".into(),
+                                    span: case.pattern.span.clone(),
+                                });
+                            }
+                        } else {
+                            rv = Some(le.linear_vars.clone());
                         }
-                    } else {
-                        rv = Some(le.linear_vars.clone());
                     }
                 }
                 if let Some(vars) = rv {
                     env.linear_vars = vars;
+                } else {
+                    // All cases diverge (return/raise) — code after match is
+                    // unreachable, so clear linear obligations.
+                    env.linear_vars.clear();
                 }
                 // Unify non-diverging case tail types
                 let non_diverging: Vec<&Type> =

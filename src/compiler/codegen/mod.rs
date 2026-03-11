@@ -29,7 +29,7 @@ use emit::{
     is_string_concat_operator, memarg, pack_string, peel_linear, record_tag,
     return_type_to_wasm_result, type_to_wasm_valtype,
 };
-use layout::{build_codegen_layout, CodegenLayout, MemoryMode};
+use layout::{build_codegen_layout, program_uses_object_heap, CodegenLayout, MemoryMode};
 
 const STRING_DATA_BASE: u32 = 16;
 const OBJECT_HEAP_GLOBAL_INDEX: u32 = 0;
@@ -37,6 +37,11 @@ const CONC_MODULE: &str = "nexus:runtime/conc";
 const CONC_SPAWN_NAME: &str = "__nx_conc_spawn";
 const CONC_JOIN_NAME: &str = "__nx_conc_join";
 const CONC_TASK_PREFIX: &str = "__conc_";
+const BT_MODULE: &str = "nexus:runtime/backtrace";
+const BT_PUSH_NAME: &str = "__nx_bt_push";
+const BT_POP_NAME: &str = "__nx_bt_pop";
+const BT_FREEZE_NAME: &str = "__nx_bt_freeze";
+const ALLOCATE_WASM_NAME: &str = "allocate";
 
 #[derive(Debug, Clone, Copy)]
 struct LocalInfo {
@@ -113,12 +118,30 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         .functions
         .iter()
         .any(|f| f.name.starts_with(CONC_TASK_PREFIX));
+    let has_bt = program_needs_backtrace(program);
     let n_conc_imports: u32 = if has_conc { 2 } else { 0 };
-    let import_count = program.externals.len() as u32 + n_conc_imports;
+    let n_bt_imports: u32 = if has_bt { 3 } else { 0 }; // push, pop, freeze
+
+    // Route object heap allocations through stdlib's allocate() to avoid
+    // conflicting with dlmalloc in the merged WASM module.
+    let stdlib_alloc_module = if program_uses_object_heap(program) {
+        program
+            .externals
+            .iter()
+            .find(|ext| ext.wasm_module.ends_with("stdlib.wasm"))
+            .map(|ext| ext.wasm_module.clone())
+    } else {
+        None
+    };
+    let n_alloc_imports: u32 = if stdlib_alloc_module.is_some() { 1 } else { 0 };
+
+    let import_count =
+        program.externals.len() as u32 + n_conc_imports + n_bt_imports + n_alloc_imports;
 
     let mut internal_function_indices = HashMap::new();
     for (idx, func) in program.functions.iter().enumerate() {
-        internal_function_indices.insert(func.name.clone(), import_count + idx as u32);
+        let fidx = import_count + idx as u32;
+        internal_function_indices.insert(func.name.clone(), fidx);
     }
     let main_idx = internal_function_indices
         .get(ENTRYPOINT)
@@ -148,6 +171,16 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         layout.conc_spawn_idx = Some(program.externals.len() as u32);
         layout.conc_join_idx = Some(program.externals.len() as u32 + 1);
     }
+    if has_bt {
+        let base = program.externals.len() as u32 + n_conc_imports;
+        layout.bt_push_idx = Some(base);
+        layout.bt_pop_idx = Some(base + 1);
+        layout.bt_freeze_idx = Some(base + 2);
+    }
+    if stdlib_alloc_module.is_some() {
+        let alloc_idx = program.externals.len() as u32 + n_conc_imports + n_bt_imports;
+        layout.allocate_func_idx = Some(alloc_idx);
+    }
 
     let mut module = Module::new();
 
@@ -175,6 +208,27 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         // __nx_conc_join() -> ()
         types.ty().function([], []);
         conc_join_type_idx = next_type_index;
+        next_type_index += 1;
+    }
+
+    let mut bt_push_type_idx = 0;
+    let mut bt_void_type_idx = 0;
+    if has_bt {
+        // __nx_bt_push(name: i64) -> ()
+        types.ty().function([ValType::I64], []);
+        bt_push_type_idx = next_type_index;
+        next_type_index += 1;
+        // __nx_bt_pop() -> (), __nx_bt_freeze() -> ()  (share type)
+        types.ty().function([], []);
+        bt_void_type_idx = next_type_index;
+        next_type_index += 1;
+    }
+
+    let mut allocate_type_idx = 0;
+    if stdlib_alloc_module.is_some() {
+        // allocate(size: i32) -> i32
+        types.ty().function([ValType::I32], [ValType::I32]);
+        allocate_type_idx = next_type_index;
         next_type_index += 1;
     }
 
@@ -231,6 +285,32 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         );
         has_imports = true;
     }
+    if has_bt {
+        imports.import(
+            BT_MODULE,
+            BT_PUSH_NAME,
+            EntityType::Function(bt_push_type_idx),
+        );
+        imports.import(
+            BT_MODULE,
+            BT_POP_NAME,
+            EntityType::Function(bt_void_type_idx),
+        );
+        imports.import(
+            BT_MODULE,
+            BT_FREEZE_NAME,
+            EntityType::Function(bt_void_type_idx),
+        );
+        has_imports = true;
+    }
+    if let Some(alloc_module) = &stdlib_alloc_module {
+        imports.import(
+            alloc_module,
+            ALLOCATE_WASM_NAME,
+            EntityType::Function(allocate_type_idx),
+        );
+        has_imports = true;
+    }
     if has_imports {
         module.section(&imports);
     }
@@ -244,11 +324,11 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
 
     if matches!(layout.memory_mode, MemoryMode::Defined) {
         let mut memories = MemorySection::new();
-        // 17 pages (~1.1 MB).  With the single stdlib bundle the app imports
-        // memory from the bundle, so this branch is only reached when there
-        // are no external imports (MemoryMode::Defined).
+        // 256 pages (16 MB).  Start with enough room for the bump-allocated
+        // object heap and the stdlib's dlmalloc heap to coexist without
+        // running out of memory on large programs.
         memories.memory(MemoryType {
-            minimum: 17,
+            minimum: 256,
             maximum: None,
             memory64: false,
             shared: false,
@@ -257,7 +337,10 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         module.section(&memories);
     }
 
-    if layout.object_heap_enabled {
+    if layout.object_heap_enabled && layout.allocate_func_idx.is_none() {
+        // Only emit the bump-allocator global when NOT using stdlib's allocate().
+        // When stdlib is present, all heap allocations route through its allocator
+        // to avoid conflicting with dlmalloc in the merged WASM module.
         let mut globals = GlobalSection::new();
         globals.global(
             GlobalType {
@@ -326,12 +409,30 @@ fn validate_main_returns_unit(program: &Program) -> Result<(), CompileError> {
     for def in &program.definitions {
         if let TopLevel::Let(gl) = &def.node {
             if gl.name == ENTRYPOINT {
-                if let Expr::Lambda { ret_type, .. } = &gl.value.node {
+                if let Expr::Lambda {
+                    ret_type, params, ..
+                } = &gl.value.node
+                {
                     if *ret_type != Type::Unit {
                         return Err(CompileError::MainSignature(format!(
                             "main must return unit, got '{}'",
                             ret_type
                         )));
+                    }
+                    // Allow 0 params or 1 param of [string]
+                    if params.len() > 1 {
+                        return Err(CompileError::MainSignature(
+                            "main must have 0 or 1 parameter (args: [string])".into(),
+                        ));
+                    }
+                    if params.len() == 1 {
+                        let param_type = &params[0].typ;
+                        if *param_type != Type::List(Box::new(Type::String)) {
+                            return Err(CompileError::MainSignature(format!(
+                                "main parameter must be [string], got '{}'",
+                                param_type
+                            )));
+                        }
                     }
                 }
                 return Ok(());
@@ -346,8 +447,11 @@ fn extract_main_require_ports_from_ast(program: &Program) -> Vec<String> {
     for def in &program.definitions {
         if let TopLevel::Let(gl) = &def.node {
             if gl.name == ENTRYPOINT {
-                if let Expr::Lambda { requires, .. } = &gl.value.node {
-                    return match requires {
+                if let Expr::Lambda {
+                    requires, params, ..
+                } = &gl.value.node
+                {
+                    let mut caps: Vec<String> = match requires {
                         Type::Row(reqs, _) => reqs
                             .iter()
                             .filter_map(|r| match r {
@@ -359,6 +463,11 @@ fn extract_main_require_ports_from_ast(program: &Program) -> Vec<String> {
                             .collect(),
                         _ => vec![],
                     };
+                    // main(args: [string]) implicitly requires PermProc
+                    if !params.is_empty() && !caps.contains(&"Proc".to_string()) {
+                        caps.push("Proc".to_string());
+                    }
+                    return caps;
                 }
             }
         }
@@ -462,6 +571,18 @@ fn compile_function(
     }
 
     let mut out = Function::new(wasm_locals);
+
+    // Backtrace: push function name onto call stack at entry
+    if let Some(bt_push_idx) = layout.bt_push_idx {
+        let packed_name = layout
+            .string_literals
+            .get(&func.name)
+            .map(|p| pack_string(*p))
+            .unwrap_or(0);
+        out.instruction(&Instruction::I64Const(packed_name));
+        out.instruction(&Instruction::Call(bt_push_idx));
+    }
+
     for stmt in &func.body {
         compile_stmt(
             stmt,
@@ -475,6 +596,11 @@ fn compile_function(
             &func.ret_type,
             false,
         )?;
+    }
+
+    // Backtrace: pop frame before implicit return
+    if let Some(bt_pop_idx) = layout.bt_pop_idx {
+        out.instruction(&Instruction::Call(bt_pop_idx));
     }
 
     if !matches!(func.ret_type, Type::Unit) {
@@ -610,9 +736,9 @@ fn compile_stmt(
                 return Ok(());
             }
             emit_numeric_coercion(&et, typ, out)?;
-            let local = local_map
-                .get(name)
-                .ok_or_else(|| CodegenError::ConflictingLocalTypes { name: name.clone() })?;
+            let local = local_map.get(name).ok_or_else(|| {
+                CodegenError::ConflictingLocalTypes { name: name.clone() }
+            })?;
             out.instruction(&Instruction::LocalSet(local.index));
             Ok(())
         }
@@ -685,6 +811,9 @@ fn compile_stmt(
             }
             compile_atom(then_ret, out, local_map, layout)?;
             emit_numeric_coercion(&then_ret.typ(), ret_type, out)?;
+            if let Some(bt_pop_idx) = layout.bt_pop_idx {
+                out.instruction(&Instruction::Call(bt_pop_idx));
+            }
             out.instruction(&Instruction::Return);
             if !else_body.is_empty() || else_ret.is_some() {
                 out.instruction(&Instruction::Else);
@@ -705,6 +834,9 @@ fn compile_stmt(
                 if let Some(else_ret) = else_ret {
                     compile_atom(else_ret, out, local_map, layout)?;
                     emit_numeric_coercion(&else_ret.typ(), ret_type, out)?;
+                    if let Some(bt_pop_idx) = layout.bt_pop_idx {
+                        out.instruction(&Instruction::Call(bt_pop_idx));
+                    }
                     out.instruction(&Instruction::Return);
                 }
             }
@@ -749,6 +881,9 @@ fn compile_stmt(
             if let Some(ret) = body_ret {
                 compile_atom(ret, out, local_map, layout)?;
                 emit_numeric_coercion(&ret.typ(), function_ret_type, out)?;
+                if let Some(bt_pop_idx) = layout.bt_pop_idx {
+                    out.instruction(&Instruction::Call(bt_pop_idx));
+                }
                 out.instruction(&Instruction::Return);
             }
             out.instruction(&Instruction::End);
@@ -784,6 +919,9 @@ fn compile_stmt(
             if let Some(ret) = catch_ret {
                 compile_atom(ret, out, local_map, layout)?;
                 emit_numeric_coercion(&ret.typ(), function_ret_type, out)?;
+                if let Some(bt_pop_idx) = layout.bt_pop_idx {
+                    out.instruction(&Instruction::Call(bt_pop_idx));
+                }
                 out.instruction(&Instruction::Return);
             }
             if in_try {
@@ -809,10 +947,16 @@ fn compile_stmt(
                     })?;
                 let n_args = task.args.len() as i32;
 
-                // Allocate space for args on the object heap
+                // Allocate space for args on the heap
                 let args_ptr_local = temps.object_ptr_i32;
-                out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
-                out.instruction(&Instruction::LocalSet(args_ptr_local));
+                if let Some(alloc_idx) = layout.allocate_func_idx {
+                    out.instruction(&Instruction::I32Const(n_args * 8));
+                    out.instruction(&Instruction::Call(alloc_idx));
+                    out.instruction(&Instruction::LocalSet(args_ptr_local));
+                } else {
+                    out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+                    out.instruction(&Instruction::LocalSet(args_ptr_local));
+                }
 
                 // Write each captured arg as i64 to the heap
                 for (i, (_, arg)) in task.args.iter().enumerate() {
@@ -839,11 +983,13 @@ fn compile_stmt(
                     }));
                 }
 
-                // Advance heap pointer
-                out.instruction(&Instruction::LocalGet(args_ptr_local));
-                out.instruction(&Instruction::I32Const(n_args * 8));
-                out.instruction(&Instruction::I32Add);
-                out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+                // Advance heap pointer (only for bump allocator)
+                if layout.allocate_func_idx.is_none() {
+                    out.instruction(&Instruction::LocalGet(args_ptr_local));
+                    out.instruction(&Instruction::I32Const(n_args * 8));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+                }
 
                 // Call __nx_conc_spawn(func_idx, args_ptr, n_args)
                 out.instruction(&Instruction::I32Const(func_idx as i32));
@@ -964,6 +1110,9 @@ fn compile_expr(
                     emit_numeric_coercion(&atom.typ(), &param.typ, out)?;
                 }
                 if is_tail {
+                    if let Some(bt_pop_idx) = layout.bt_pop_idx {
+                        out.instruction(&Instruction::Call(bt_pop_idx));
+                    }
                     out.instruction(&Instruction::ReturnCall(callee_idx));
                 } else {
                     out.instruction(&Instruction::Call(callee_idx));
@@ -998,6 +1147,9 @@ fn compile_expr(
                 }
 
                 if is_tail {
+                    if let Some(bt_pop_idx) = layout.bt_pop_idx {
+                        out.instruction(&Instruction::Call(bt_pop_idx));
+                    }
                     out.instruction(&Instruction::ReturnCall(callee_idx));
                 } else {
                     out.instruction(&Instruction::Call(callee_idx));
@@ -1068,6 +1220,10 @@ fn compile_expr(
             Ok(())
         }
         LirExpr::Raise { value, .. } => {
+            // Freeze backtrace before raising
+            if let Some(bt_freeze_idx) = layout.bt_freeze_idx {
+                out.instruction(&Instruction::Call(bt_freeze_idx));
+            }
             compile_atom(value, out, local_map, layout)?;
             if !matches!(value.typ(), Type::Unit) {
                 out.instruction(&Instruction::LocalSet(temps.exn_value_i64));
@@ -1093,9 +1249,9 @@ fn compile_atom(
 ) -> Result<(), CodegenError> {
     match atom {
         LirAtom::Var { name, .. } => {
-            let local = local_map
-                .get(name)
-                .ok_or_else(|| CodegenError::ConflictingLocalTypes { name: name.clone() })?;
+            let local = local_map.get(name).ok_or_else(|| {
+                CodegenError::ConflictingLocalTypes { name: name.clone() }
+            })?;
             out.instruction(&Instruction::LocalGet(local.index));
             Ok(())
         }
@@ -1360,6 +1516,39 @@ fn compile_binary(
         }
     }
     Ok(())
+}
+
+/// Check if the LIR program needs backtrace instrumentation.
+/// Returns true if any function contains a Raise or TryCatch expression.
+fn program_needs_backtrace(program: &LirProgram) -> bool {
+    fn stmt_needs_bt(stmt: &LirStmt) -> bool {
+        match stmt {
+            LirStmt::Let { expr, .. } => matches!(expr, LirExpr::Raise { .. }),
+            LirStmt::TryCatch { .. } => true,
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                then_body.iter().any(stmt_needs_bt) || else_body.iter().any(stmt_needs_bt)
+            }
+            LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                then_body.iter().any(stmt_needs_bt) || else_body.iter().any(stmt_needs_bt)
+            }
+            LirStmt::Conc { .. } => false,
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => cond_stmts.iter().any(stmt_needs_bt) || body.iter().any(stmt_needs_bt),
+        }
+    }
+    program
+        .functions
+        .iter()
+        .any(|f| f.body.iter().any(stmt_needs_bt))
 }
 
 fn binary_operand_type(op: BinaryOp, lhs: &Type, rhs: &Type) -> Result<Type, CodegenError> {

@@ -1,0 +1,185 @@
+/**
+ * driver: Self-hosting compiler CLI.
+ *
+ * Reads a Nexus source file, compiles it through the full pipeline
+ * (lex → parse → HIR → MIR → LIR → WASM), and writes the output.
+ */
+import { tokenize } from nxc/lexer.nx
+import { parse } from nxc/parser.nx
+import { Program, SpannedTopLevel, TopLevel, ImportDef, EnumDef } from nxc/ast.nx
+import { RenameEntry } from nxc/symtab.nx
+import { default_alias, build_rename_map, extract_imports,
+         merge_rename_entries, collect_enum_defs } from nxc/resolve.nx
+import { HirAccum, HirProgram, empty_accum, process_defs,
+         accum_to_program } from nxc/hir.nx
+import { lower_hir_to_mir } from nxc/mir.nx
+import { lower_mir_to_lir } from nxc/lir.nx
+import { compile_lir_to_wasm } from nxc/codegen.nx
+import { write_file, free } from stdlib/bytebuffer.nx
+import as fs from stdlib/fs.nx
+import { println } from stdlib/stdio.nx
+
+// ─── Import processing ─────────────────────────────────────────────────────
+
+/// Process all imports in a program, reading and parsing each imported module.
+/// Returns the accumulated HIR definitions from all imports merged into accum.
+let process_imports = fn (imports: [ImportDef], accum: HirAccum,
+    import_stack: [string], depth: i64) -> HirAccum throws { Exn } do
+  match imports do
+    case Nil() -> return accum
+    case Cons(v: imp, rest: rest) ->
+      match imp do case ImportDef(path: path, alias: _, items: _, is_external: is_ext) ->
+        if is_ext then
+          // External import — just pass through (process_defs handles wasm_module tracking)
+          println(val: "[nxc]   skip external: " ++ path)
+          return process_imports(imports: rest, accum: accum,
+            import_stack: import_stack, depth: depth)
+        else
+          // Cycle detection
+          if list_has_str(xs: import_stack, s: path) then
+            raise RuntimeError(val: "cyclic import: " ++ path)
+          end
+
+          // Read and parse the imported module
+          println(val: "[nxc]   import: " ++ path)
+          let src = fs.read_to_string(path: path)
+          println(val: "[nxc]   read OK: " ++ path)
+          let tokens = tokenize(src: src)
+          println(val: "[nxc]   tokenized: " ++ path)
+          println(val: "[nxc]   parsing " ++ path ++ " ...")
+          let imported_prog = parse(tokens: tokens)
+          println(val: "[nxc]   parsed OK: " ++ path)
+          let imported_defs = get_defs(prog: imported_prog)
+          println(val: "[nxc]   got defs: " ++ path)
+
+          let entries = build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
+          println(val: "[nxc]   rename map built for: " ++ path)
+          let sub_imports = extract_imports(defs: imported_defs)
+          let new_stack = Cons(v: path, rest: import_stack)
+          let accum2 = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, depth: depth + 1)
+          println(val: "[nxc]   sub-imports done for: " ++ path)
+          let accum3 = process_defs(defs: imported_defs, entries: entries, accum: accum2)
+          println(val: "[nxc]   defs processed for: " ++ path)
+          return process_imports(imports: rest, accum: accum3, import_stack: import_stack, depth: depth)
+        end
+      end
+  end
+end
+
+let list_has_str = fn (xs: [string], s: string) -> bool do
+  match xs do
+    case Nil() -> return false
+    case Cons(v: x, rest: rest) ->
+      if x == s then return true
+      else return list_has_str(xs: rest, s: s)
+      end
+  end
+end
+
+// ─── Full pipeline ─────────────────────────────────────────────────────────
+
+/// Build HIR from a parsed program, processing all imports.
+let build_hir = fn (prog: Program) -> HirProgram throws { Exn } do
+  let defs = get_defs(prog: prog)
+
+  // Process imports first
+  let imports = extract_imports(defs: defs)
+  let accum = process_imports(imports: imports, accum: empty_accum(),
+    import_stack: Nil(), depth: 1)
+
+  // Process the main program's definitions (no rename for top-level)
+  let accum2 = process_defs(defs: defs, entries: Nil(), accum: accum)
+
+  // Reachability filter and assemble
+  return accum_to_program(accum: accum2)
+end
+
+/// Compile a source string to WASM bytes (as ByteBuffer).
+let compile = fn (src: string) -> HirProgram throws { Exn } do
+  let tokens = tokenize(src: src)
+  let prog = parse(tokens: tokens)
+  return build_hir(prog: prog)
+end
+
+let get_defs = fn (prog: Program) -> [SpannedTopLevel] do
+  match prog do case Program(defs: defs) ->
+    return defs
+  end
+end
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+
+/// Monomorphic nth for string lists (avoids generic type defaulting to i64).
+let str_nth = fn (xs: [string], n: i64) -> string do
+  match xs do
+    case Nil() -> return str_nth(xs: xs, n: n)
+    case Cons(v: v, rest: rest) ->
+      if n == 0 then return v
+      else return str_nth(xs: rest, n: n - 1)
+      end
+  end
+end
+
+/// Monomorphic length for string lists.
+let str_list_length = fn (xs: [string]) -> i64 do
+  match xs do
+    case Nil() -> return 0
+    case Cons(v: _, rest: rest) -> return 1 + str_list_length(xs: rest)
+  end
+end
+
+// ─── CLI entry point ───────────────────────────────────────────────────────
+
+let main = fn (args: [string]) -> unit
+    require { PermFs, PermProc, PermConsole } throws { Exn } do
+  let argc = str_list_length(xs: args)
+  if argc < 2 then
+    println(val: "Usage: nxc <input.nx> [output.wasm]")
+    println(val: "  Compiles a Nexus source file to WASM.")
+    raise RuntimeError(val: "missing input file argument")
+  end
+
+  let input_path = str_nth(xs: args, n: 1)
+  let output_path = default_output(argc: argc, args: args)
+
+  println(val: "nxc: compiling " ++ input_path ++ " -> " ++ output_path)
+
+  // Read source
+  println(val: "[nxc] reading source...")
+  let src = fs.read_to_string(path: input_path)
+  println(val: "[nxc] source read OK")
+  println(val: "[nxc] lexing...")
+  let tokens = tokenize(src: src)
+  println(val: "[nxc] parsing...")
+  let prog = parse(tokens: tokens)
+  println(val: "[nxc] building HIR...")
+  let hir = build_hir(prog: prog)
+  println(val: "[nxc] lowering to MIR...")
+  let mir = lower_hir_to_mir(hir: hir)
+  let lir = lower_mir_to_lir(mir: mir, enum_defs: get_enum_defs(hir: hir))
+  let %wasm_buf = compile_lir_to_wasm(program: lir)
+
+  // Write output
+  let ok = write_file(buf: &wasm_buf, path: output_path)
+  free(buf: %wasm_buf)
+
+  if ok then
+    println(val: "nxc: wrote " ++ output_path)
+  else
+    raise RuntimeError(val: "nxc: failed to write " ++ output_path)
+  end
+
+  return ()
+end
+
+let default_output = fn (argc: i64, args: [string]) -> string do
+  if argc >= 3 then return str_nth(xs: args, n: 2)
+  else return "output.wasm"
+  end
+end
+
+let get_enum_defs = fn (hir: HirProgram) -> [EnumDef] do
+  match hir do case HirProgram(ports: _, functions: _, externals: _, handler_bindings: _, enum_defs: eds) ->
+    return eds
+  end
+end

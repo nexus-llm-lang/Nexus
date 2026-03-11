@@ -76,6 +76,15 @@ pub fn build_hir(program: &Program) -> Result<HirProgram, HirBuildError> {
     builder.build(program)
 }
 
+/// Cached info about an already-processed import module.
+#[derive(Clone)]
+struct ImportCache {
+    /// Maps original definition name → registered HIR name
+    name_map: HashMap<String, String>,
+    /// Set of public definition names (for validation on reimport)
+    public_names: HashSet<String>,
+}
+
 struct HirBuilder {
     ports: Vec<HirPort>,
     functions: Vec<HirFunction>,
@@ -83,6 +92,10 @@ struct HirBuilder {
     handler_bindings: HashMap<String, HirHandlerBinding>,
     import_stack: Vec<String>,
     enum_defs: Vec<EnumDef>,
+    /// Tracks already-processed modules to avoid diamond import duplication
+    imported_modules: HashMap<String, ImportCache>,
+    /// Top-level `let` bindings with literal values, inlined at reference sites.
+    global_constants: HashMap<String, Literal>,
 }
 
 impl HirBuilder {
@@ -94,6 +107,8 @@ impl HirBuilder {
             handler_bindings: HashMap::new(),
             import_stack: Vec::new(),
             enum_defs: Vec::new(),
+            imported_modules: HashMap::new(),
+            global_constants: HashMap::new(),
         }
     }
 
@@ -307,20 +322,57 @@ impl HirBuilder {
                             throws: _,
                             body,
                         } => {
-                            self.functions.push(HirFunction {
-                                name: name.clone(),
-                                params: params
-                                    .iter()
-                                    .map(|p| HirParam {
-                                        name: p.name.clone(),
-                                        label: p.name.clone(),
-                                        typ: p.typ.clone(),
-                                    })
-                                    .collect(),
-                                ret_type: ret_type.clone(),
-                                body: self.convert_stmts(body, rename_map),
-                                span: def.span.clone(),
-                            });
+                            // Desugar main(args: [string]) -> unit
+                            // into main() -> unit with `let args = argv()` prepended
+                            if name == "main"
+                                && params.len() == 1
+                                && params[0].typ
+                                    == Type::List(Box::new(Type::String))
+                            {
+                                // Auto-import stdlib/proc.nx for argv
+                                let proc_import = Import {
+                                    path: "stdlib/proc.nx".to_string(),
+                                    alias: None,
+                                    items: vec!["argv".to_string()],
+                                    is_external: false,
+                                };
+                                self.process_import(&proc_import, &def.span)?;
+
+                                let arg_name = params[0].name.clone();
+                                let mut desugared_body = vec![HirStmt::Let {
+                                    name: arg_name,
+                                    typ: Some(Type::List(Box::new(Type::String))),
+                                    value: HirExpr::Call {
+                                        func: "argv".to_string(),
+                                        args: vec![],
+                                    },
+                                }];
+                                desugared_body
+                                    .extend(self.convert_stmts(body, rename_map));
+
+                                self.functions.push(HirFunction {
+                                    name: name.clone(),
+                                    params: vec![],
+                                    ret_type: ret_type.clone(),
+                                    body: desugared_body,
+                                    span: def.span.clone(),
+                                });
+                            } else {
+                                self.functions.push(HirFunction {
+                                    name: name.clone(),
+                                    params: params
+                                        .iter()
+                                        .map(|p| HirParam {
+                                            name: p.name.clone(),
+                                            label: p.name.clone(),
+                                            typ: p.typ.clone(),
+                                        })
+                                        .collect(),
+                                    ret_type: ret_type.clone(),
+                                    body: self.convert_stmts(body, rename_map),
+                                    span: def.span.clone(),
+                                });
+                            }
                         }
                         Expr::External(wasm_name, _type_params, typ) => {
                             if let Type::Arrow(params, ret, _requires, throws) = typ {
@@ -377,9 +429,12 @@ impl HirBuilder {
                                 },
                             );
                         }
+                        Expr::Literal(lit) => {
+                            // Inline top-level literal constants at reference sites
+                            self.global_constants.insert(name.clone(), lit.clone());
+                        }
                         _ => {
-                            // Global let values not represented in HIR
-                            // (no downstream consumer reads them)
+                            // Other global let values not represented in HIR
                         }
                     }
                 }
@@ -395,6 +450,11 @@ impl HirBuilder {
                 path: resolved_path,
                 span: import_span.clone(),
             });
+        }
+
+        // Diamond import dedup: if this module was already processed, reuse cached results
+        if let Some(cache) = self.imported_modules.get(&resolved_path).cloned() {
+            return self.handle_reimport(import, import_span, &cache);
         }
 
         self.import_stack.push(resolved_path.clone());
@@ -415,8 +475,104 @@ impl HirBuilder {
 
         let rename_map = self.build_rename_map(&imported_program, import, import_span)?;
         let result = self.process_program(&imported_program, &rename_map);
+
+        // Cache the processed module for future reimports
+        let public_names: HashSet<String> = imported_program
+            .definitions
+            .iter()
+            .filter_map(|def| match &def.node {
+                TopLevel::Let(gl) if gl.is_public => Some(gl.name.clone()),
+                TopLevel::Port(port) if port.is_public => Some(port.name.clone()),
+                TopLevel::Enum(ed) if ed.is_public => Some(ed.name.clone()),
+                TopLevel::TypeDef(td) if td.is_public => Some(td.name.clone()),
+                _ => None,
+            })
+            .collect();
+        self.imported_modules.insert(
+            resolved_path.clone(),
+            ImportCache {
+                name_map: rename_map,
+                public_names,
+            },
+        );
+
         self.import_stack.pop();
         result
+    }
+
+    /// Handle reimport of an already-processed module.
+    /// Creates aliases for newly-selected items that were registered with a prefix.
+    fn handle_reimport(
+        &mut self,
+        import: &Import,
+        import_span: &Span,
+        cache: &ImportCache,
+    ) -> Result<(), HirBuildError> {
+        if import.items.is_empty() {
+            // Wildcard reimport: create aliases with the requested prefix
+            let alias = import
+                .alias
+                .clone()
+                .unwrap_or_else(|| get_default_alias(&import.path));
+            for (original_name, registered_name) in &cache.name_map {
+                let aliased_name = format!("{}.{}", alias, original_name);
+                if aliased_name != *registered_name {
+                    self.create_function_alias(&aliased_name, registered_name);
+                    self.create_external_alias(&aliased_name, registered_name);
+                }
+            }
+            return Ok(());
+        }
+
+        // Selective reimport: validate and create aliases for items registered with a prefix
+        for item in &import.items {
+            if !cache.public_names.contains(item) {
+                return Err(HirBuildError::ImportItemNotFound {
+                    item: item.clone(),
+                    path: import.path.clone(),
+                    span: import_span.clone(),
+                });
+            }
+            if let Some(registered_name) = cache.name_map.get(item) {
+                if registered_name != item {
+                    // Item was registered with a prefix — create an alias with the bare name
+                    self.create_function_alias(item, registered_name);
+                    self.create_external_alias(item, registered_name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Clone a function under a new name (alias), replacing any existing function with that name.
+    fn create_function_alias(&mut self, alias_name: &str, registered_name: &str) {
+        if let Some(func) = self
+            .functions
+            .iter()
+            .find(|f| f.name == registered_name)
+            .cloned()
+        {
+            self.functions.retain(|f| f.name != alias_name);
+            let mut aliased = func;
+            aliased.name = alias_name.to_string();
+            self.functions.push(aliased);
+        }
+    }
+
+    /// Clone an external under a new name (alias), replacing any existing external with that name.
+    fn create_external_alias(&mut self, alias_name: &str, registered_name: &str) {
+        if let Some(ext) = self
+            .externals
+            .iter()
+            .find(|e| e.name == registered_name)
+            .cloned()
+        {
+            // Remove any existing external with the alias name (e.g. stdlib auto-loaded version)
+            self.externals.retain(|e| e.name != alias_name);
+            let mut aliased = ext;
+            aliased.name = alias_name.to_string();
+            self.externals.push(aliased);
+        }
     }
 
     fn build_rename_map(
@@ -487,7 +643,17 @@ impl HirBuilder {
                 }
             }
         } else {
-            let alias_prefix = format!("__import_{}", self.import_stack.len());
+            let alias_prefix = {
+                let path_hash = {
+                    let mut h: u64 = 0xcbf29ce484222325;
+                    for b in import.path.bytes() {
+                        h ^= b as u64;
+                        h = h.wrapping_mul(0x100000001b3);
+                    }
+                    h % 10000
+                };
+                format!("__import_{}_{}", self.import_stack.len(), path_hash)
+            };
             for def in &program.definitions {
                 match &def.node {
                     TopLevel::Let(gl) => {
@@ -583,7 +749,12 @@ impl HirBuilder {
         match &expr.node {
             Expr::Literal(lit) => HirExpr::Literal(lit.clone()),
             Expr::Variable(name, sigil) => {
-                HirExpr::Variable(self.rename(name, rename_map), sigil.clone())
+                let resolved = self.rename(name, rename_map);
+                if let Some(lit) = self.global_constants.get(&resolved) {
+                    HirExpr::Literal(lit.clone())
+                } else {
+                    HirExpr::Variable(resolved, sigil.clone())
+                }
             }
             Expr::BinaryOp(lhs, op, rhs) => HirExpr::BinaryOp(
                 Box::new(self.convert_expr(lhs, rename_map)),
@@ -603,13 +774,22 @@ impl HirBuilder {
                         .collect(),
                 }
             }
-            Expr::Constructor(name, args) => HirExpr::Constructor {
-                variant: name.clone(),
-                args: args
-                    .iter()
-                    .map(|(_, e)| self.convert_expr(e, rename_map))
-                    .collect(),
-            },
+            Expr::Constructor(name, args) => {
+                // Zero-arg constructors that match a global constant are inlined
+                if args.is_empty() {
+                    let resolved = self.rename(name, rename_map);
+                    if let Some(lit) = self.global_constants.get(&resolved) {
+                        return HirExpr::Literal(lit.clone());
+                    }
+                }
+                HirExpr::Constructor {
+                    variant: name.clone(),
+                    args: args
+                        .iter()
+                        .map(|(_, e)| self.convert_expr(e, rename_map))
+                        .collect(),
+                }
+            }
             Expr::Record(fields) => HirExpr::Record(
                 fields
                     .iter()

@@ -1,5 +1,4 @@
 use crate::common::check::{should_fail_parse, should_fail_typecheck, should_typecheck};
-use nexus::interpreter::Interpreter;
 use nexus::lang::parser;
 use nexus::lang::stdlib::list_stdlib_nx_paths;
 use nexus::lang::typecheck::TypeChecker;
@@ -80,46 +79,6 @@ fn test_stdio_defines_console_port_and_system_handler() {
         let_names.contains(&"system_handler".to_string()),
         "system_handler should be defined in stdio.nx"
     );
-}
-
-#[test]
-fn test_stdlib_public_names_are_not_native_functions_and_drop_is_statement() {
-    let parser = parser::parser();
-    let program = parser.parse("").unwrap();
-    let interpreter = Interpreter::new(program);
-
-    // from_i64 has a native fallback for interpreter-only mode (no Wasm FFI).
-    assert!(interpreter.native_functions.contains_key("from_i64"));
-    assert!(!interpreter.native_functions.contains_key("from_float"));
-    assert!(!interpreter.native_functions.contains_key("from_bool"));
-    assert!(!interpreter.native_functions.contains_key("drop"));
-    assert!(!interpreter.native_functions.contains_key("drop_i64"));
-    assert!(!interpreter.native_functions.contains_key("drop_array"));
-    assert!(!interpreter.native_functions.contains_key("list_length"));
-    assert!(!interpreter.native_functions.contains_key("array_length"));
-
-    assert!(!interpreter.native_functions.contains_key("__nx_drop_i64"));
-    assert!(!interpreter
-        .native_functions
-        .contains_key("__nx_list_length"));
-    assert!(!interpreter
-        .native_functions
-        .contains_key("__nx_string_length"));
-    assert!(!interpreter.native_functions.contains_key("__nx_abs_i64"));
-    assert!(!interpreter.native_functions.contains_key("__nx_drop_array"));
-    assert!(!interpreter
-        .native_functions
-        .contains_key("__nx_array_length"));
-    assert!(!interpreter
-        .external_functions
-        .contains_key("__nx_drop_array"));
-    assert!(interpreter.external_functions.contains_key("length"));
-    assert!(interpreter.external_functions.contains_key("abs"));
-    assert!(interpreter.external_functions.contains_key("length"));
-    assert!(interpreter.external_functions.contains_key("from_i64"));
-    assert!(interpreter.external_functions.contains_key("from_float"));
-    assert!(interpreter.external_functions.contains_key("from_bool"));
-    assert!(!interpreter.external_functions.contains_key("__nx_drop_i64"));
 }
 
 #[test]

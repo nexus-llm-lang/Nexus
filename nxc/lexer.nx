@@ -1,0 +1,435 @@
+/**
+ * lexer: Tokenizer for Nexus source code.
+ *
+ * Scans source string character-by-character via char_code/char_at,
+ * producing a list of SpannedTokens. Handles:
+ * - Keywords and identifiers (lowercase/uppercase)
+ * - Integer and float literals (with optional leading minus)
+ * - String literals (double-quoted with escapes, bracket [=[ ... ]=])
+ * - Operators (multi-char lookahead for ++, ->, ==, etc.)
+ * - Comments (line // and block /* */)
+ * - Whitespace skipping with line/col tracking
+ */
+
+import as str from stdlib/string.nx
+import as char from stdlib/char.nx
+import { Token, Span, SpannedToken, keyword_lookup } from nxc/token.nx
+
+// ─── Lexer state ──────────────────────────────────────────────────────────────
+
+type LexerState = LexerState(src: string, pos: i64, line: i64, col: i64, len: i64)
+
+let make_lexer = fn (src: string) -> LexerState do
+  return LexerState(src: src, pos: 0, line: 1, col: 1, len: str.length(s: src))
+end
+
+// ─── Character access helpers ─────────────────────────────────────────────────
+
+let peek = fn (st: LexerState) -> i64 do
+  match st do
+    case LexerState(src: s, pos: p, line: _, col: _, len: l) ->
+      if p >= l then return 0 - 1 end
+      return str.char_code(s: s, idx: p)
+  end
+end
+
+let peek_at = fn (st: LexerState, offset: i64) -> i64 do
+  match st do
+    case LexerState(src: s, pos: p, line: _, col: _, len: l) ->
+      let idx = p + offset
+      if idx >= l then return 0 - 1 end
+      return str.char_code(s: s, idx: idx)
+  end
+end
+
+let advance = fn (st: LexerState) -> LexerState do
+  match st do
+    case LexerState(src: s, pos: p, line: ln, col: c, len: l) ->
+      let ch = str.char_code(s: s, idx: p)
+      if ch == 10 then
+        return LexerState(src: s, pos: p + 1, line: ln + 1, col: 1, len: l)
+      else
+        return LexerState(src: s, pos: p + 1, line: ln, col: c + 1, len: l)
+      end
+  end
+end
+
+let advance_n = fn (st: LexerState, n: i64) -> LexerState do
+  if n <= 0 then return st end
+  return advance_n(st: advance(st: st), n: n - 1)
+end
+
+let at_end = fn (st: LexerState) -> bool do
+  match st do
+    case LexerState(src: _, pos: p, line: _, col: _, len: l) -> return p >= l
+  end
+end
+
+let current_span = fn (st: LexerState) -> Span do
+  match st do
+    case LexerState(src: _, pos: p, line: ln, col: c, len: _) ->
+      return Span(offset: p, line: ln, col: c)
+  end
+end
+
+let slice = fn (st: LexerState, start: i64, length: i64) -> string do
+  match st do
+    case LexerState(src: s, pos: _, line: _, col: _, len: _) -> return str.substring(s: s, start: start, len: length)
+  end
+end
+
+// ─── Skip whitespace and comments ─────────────────────────────────────────────
+
+let skip_whitespace_and_comments = fn (st: LexerState) -> LexerState do
+  if at_end(st: st) then return st end
+  let c = peek(st: st)
+  // Whitespace
+  if char.is_whitespace(c: c) then
+    return skip_whitespace_and_comments(st: advance(st: st))
+  end
+  // Line comment
+  let c2 = peek_at(st: st, offset: 1)
+  if c == 47 && c2 == 47 then
+    return skip_whitespace_and_comments(st: skip_line_comment(st: st))
+  end
+  // Block comment
+  if c == 47 && c2 == 42 then
+    return skip_whitespace_and_comments(st: skip_block_comment(st: advance_n(st: st, n: 2), depth: 1))
+  end
+  return st
+end
+
+let skip_line_comment = fn (st: LexerState) -> LexerState do
+  if at_end(st: st) then return st end
+  let c = peek(st: st)
+  if c == 10 then return advance(st: st) end
+  return skip_line_comment(st: advance(st: st))
+end
+
+let skip_block_comment = fn (st: LexerState, depth: i64) -> LexerState do
+  if at_end(st: st) then return st end
+  if depth <= 0 then return st end
+  let c = peek(st: st)
+  let c2 = peek_at(st: st, offset: 1)
+  if c == 42 && c2 == 47 then
+    return skip_block_comment(st: advance_n(st: st, n: 2), depth: depth - 1)
+  end
+  if c == 47 && c2 == 42 then
+    return skip_block_comment(st: advance_n(st: st, n: 2), depth: depth + 1)
+  end
+  return skip_block_comment(st: advance(st: st), depth: depth)
+end
+
+// ─── Lex identifier / keyword ─────────────────────────────────────────────────
+
+let lex_ident_rest = fn (st: LexerState) -> LexerState do
+  if at_end(st: st) then return st end
+  let c = peek(st: st)
+  if char.is_ident_char(c: c) then
+    return lex_ident_rest(st: advance(st: st))
+  end
+  return st
+end
+
+let lex_identifier = fn (st: LexerState, span: Span) -> { st: LexerState, tok: SpannedToken } do
+  match span do
+    case Span(offset: start, line: _, col: _) ->
+      let st2 = lex_ident_rest(st: st)
+      match st2 do
+        case LexerState(src: _, pos: end_pos, line: _, col: _, len: _) ->
+          let name = slice(st: st2, start: start, length: end_pos - start)
+          let kw = keyword_lookup(name: name)
+          match kw do
+            case Some(val: tk) -> return { st: st2, tok: SpannedToken(token: tk, span: span) }
+            case None() -> return { st: st2, tok: SpannedToken(token: TkIdent(name: name), span: span) }
+          end
+      end
+  end
+end
+
+let lex_uident = fn (st: LexerState, span: Span) -> { st: LexerState, tok: SpannedToken } do
+  match span do
+    case Span(offset: start, line: _, col: _) ->
+      let st2 = lex_ident_rest(st: st)
+      match st2 do
+        case LexerState(src: _, pos: end_pos, line: _, col: _, len: _) ->
+          let name = slice(st: st2, start: start, length: end_pos - start)
+          return { st: st2, tok: SpannedToken(token: TkUident(name: name), span: span) }
+      end
+  end
+end
+
+// ─── Lex number ───────────────────────────────────────────────────────────────
+
+let lex_digits = fn (st: LexerState) -> LexerState do
+  if at_end(st: st) then return st end
+  let c = peek(st: st)
+  if char.is_digit(c: c) then
+    return lex_digits(st: advance(st: st))
+  end
+  return st
+end
+
+let lex_number = fn (st: LexerState, span: Span) -> { st: LexerState, tok: SpannedToken } do
+  match span do
+    case Span(offset: start, line: _, col: _) ->
+      let st2 = lex_digits(st: st)
+      let c = peek(st: st2)
+      // Check for float: digits followed by '.' then digit
+      if c == 46 then
+        let c2 = peek_at(st: st2, offset: 1)
+        if char.is_digit(c: c2) then
+          let st3 = lex_digits(st: advance(st: st2))
+          match st3 do
+            case LexerState(src: _, pos: end_pos, line: _, col: _, len: _) ->
+              let text = slice(st: st3, start: start, length: end_pos - start)
+              return { st: st3, tok: SpannedToken(token: TkFloat(val: text), span: span) }
+          end
+        end
+      end
+      match st2 do
+        case LexerState(src: _, pos: end_pos, line: _, col: _, len: _) ->
+          let text = slice(st: st2, start: start, length: end_pos - start)
+          let parsed = str.parse_i64(s: text)
+          match parsed do
+            case Some(val: v) ->
+              return { st: st2, tok: SpannedToken(token: TkInt(val: v), span: span) }
+            case None() ->
+              return { st: st2, tok: SpannedToken(token: TkInt(val: 0), span: span) }
+          end
+      end
+  end
+end
+
+// ─── Lex string literal ──────────────────────────────────────────────────────
+
+let lex_string_body = fn (st: LexerState, acc: string) -> { st: LexerState, val: string } do
+  if at_end(st: st) then return { st: st, val: acc } end
+  let c = peek(st: st)
+  // End of string
+  if c == 34 then
+    return { st: advance(st: st), val: acc }
+  end
+  // Escape sequence
+  if c == 92 then
+    let c2 = peek_at(st: st, offset: 1)
+    let st2 = advance_n(st: st, n: 2)
+    if c2 == 110 then return lex_string_body(st: st2, acc: acc ++ "\n") end
+    if c2 == 114 then return lex_string_body(st: st2, acc: acc ++ "\r") end
+    if c2 == 116 then return lex_string_body(st: st2, acc: acc ++ "\t") end
+    if c2 == 92 then return lex_string_body(st: st2, acc: acc ++ "\\") end
+    if c2 == 34 then return lex_string_body(st: st2, acc: acc ++ "\"") end
+    // Unknown escape: keep as-is
+    return lex_string_body(st: st2, acc: acc ++ "\\" ++ str.from_char_code(code: c2))
+  end
+  // Regular character
+  match st do
+    case LexerState(src: s, pos: p, line: _, col: _, len: _) ->
+      let ch = str.char_at(s: s, idx: p)
+      return lex_string_body(st: advance(st: st), acc: acc ++ ch)
+  end
+end
+
+let lex_string = fn (st: LexerState, span: Span) -> { st: LexerState, tok: SpannedToken } do
+  // st is positioned after the opening "
+  let result = lex_string_body(st: st, acc: "")
+  return { st: result.st, tok: SpannedToken(token: TkString(val: result.val), span: span) }
+end
+
+// ─── Lex bracket string [=[ ... ]=] ──────────────────────────────────────────
+
+let lex_bracket_string_body = fn (st: LexerState, acc: string) -> { st: LexerState, val: string } do
+  if at_end(st: st) then return { st: st, val: acc } end
+  let c = peek(st: st)
+  // Check for ]=]
+  if c == 93 then
+    let c2 = peek_at(st: st, offset: 1)
+    let c3 = peek_at(st: st, offset: 2)
+    if c2 == 61 && c3 == 93 then
+      return { st: advance_n(st: st, n: 3), val: acc }
+    end
+  end
+  // Check for escape: \]=] → ]=]
+  if c == 92 then
+    let c2 = peek_at(st: st, offset: 1)
+    let c3 = peek_at(st: st, offset: 2)
+    let c4 = peek_at(st: st, offset: 3)
+    if c2 == 93 && c3 == 61 && c4 == 93 then
+      return lex_bracket_string_body(st: advance_n(st: st, n: 4), acc: acc ++ "]=]")
+    end
+  end
+  match st do
+    case LexerState(src: s, pos: p, line: _, col: _, len: _) ->
+      let ch = str.char_at(s: s, idx: p)
+      return lex_bracket_string_body(st: advance(st: st), acc: acc ++ ch)
+  end
+end
+
+let lex_bracket_string = fn (st: LexerState, span: Span) -> { st: LexerState, tok: SpannedToken } do
+  // st is positioned after [=[
+  let result = lex_bracket_string_body(st: st, acc: "")
+  return { st: result.st, tok: SpannedToken(token: TkString(val: result.val), span: span) }
+end
+
+// ─── Main lex_token ───────────────────────────────────────────────────────────
+
+let lex_token = fn (st: LexerState) -> { st: LexerState, tok: SpannedToken } do
+  let st0 = skip_whitespace_and_comments(st: st)
+  if at_end(st: st0) then
+    return { st: st0, tok: SpannedToken(token: TkEof(), span: current_span(st: st0)) }
+  end
+
+  let span = current_span(st: st0)
+  let c = peek(st: st0)
+  let c2 = peek_at(st: st0, offset: 1)
+
+  // Lowercase identifier or keyword
+  if char.is_lower(c: c) || c == 95 then
+    return lex_identifier(st: advance(st: st0), span: span)
+  end
+
+  // Uppercase identifier
+  if char.is_upper(c: c) then
+    return lex_uident(st: advance(st: st0), span: span)
+  end
+
+  // Number (digit or minus followed by digit)
+  if char.is_digit(c: c) then
+    return lex_number(st: advance(st: st0), span: span)
+  end
+  if c == 45 && char.is_digit(c: c2) then
+    return lex_number(st: advance_n(st: st0, n: 2), span: span)
+  end
+
+  // String literal
+  if c == 34 then
+    return lex_string(st: advance(st: st0), span: span)
+  end
+
+  // Bracket string [=[
+  if c == 91 && c2 == 61 then
+    let c3 = peek_at(st: st0, offset: 2)
+    if c3 == 91 then
+      return lex_bracket_string(st: advance_n(st: st0, n: 3), span: span)
+    end
+  end
+
+  // Array brackets [| and |]
+  if c == 91 && c2 == 124 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkLArray(), span: span) }
+  end
+  if c == 124 && c2 == 93 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkRArray(), span: span) }
+  end
+
+  // Two-character operators
+  if c == 43 && c2 == 43 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkPlusPlus(), span: span) }
+  end
+  if c == 43 && c2 == 46 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkPlusDot(), span: span) }
+  end
+  if c == 45 && c2 == 46 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkMinusDot(), span: span) }
+  end
+  if c == 45 && c2 == 62 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkArrow(), span: span) }
+  end
+  if c == 42 && c2 == 46 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkStarDot(), span: span) }
+  end
+  if c == 47 && c2 == 46 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkSlashDot(), span: span) }
+  end
+  if c == 60 && c2 == 45 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkLArrow(), span: span) }
+  end
+  if c == 38 && c2 == 38 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkAndAnd(), span: span) }
+  end
+  if c == 124 && c2 == 124 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkPipePipe(), span: span) }
+  end
+
+  // Three-character operators with dot (==. !=. <=. >=. <. >.)
+  let c3 = peek_at(st: st0, offset: 2)
+  if c == 61 && c2 == 61 && c3 == 46 then
+    return { st: advance_n(st: st0, n: 3), tok: SpannedToken(token: TkEqEqDot(), span: span) }
+  end
+  if c == 33 && c2 == 61 && c3 == 46 then
+    return { st: advance_n(st: st0, n: 3), tok: SpannedToken(token: TkBangEqDot(), span: span) }
+  end
+  if c == 60 && c2 == 61 && c3 == 46 then
+    return { st: advance_n(st: st0, n: 3), tok: SpannedToken(token: TkLeDot(), span: span) }
+  end
+  if c == 62 && c2 == 61 && c3 == 46 then
+    return { st: advance_n(st: st0, n: 3), tok: SpannedToken(token: TkGeDot(), span: span) }
+  end
+  if c == 60 && c2 == 46 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkLtDot(), span: span) }
+  end
+  if c == 62 && c2 == 46 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkGtDot(), span: span) }
+  end
+
+  // Two-character operators (==, !=, <=, >=)
+  if c == 61 && c2 == 61 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkEqEq(), span: span) }
+  end
+  if c == 33 && c2 == 61 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkBangEq(), span: span) }
+  end
+  if c == 60 && c2 == 61 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkLe(), span: span) }
+  end
+  if c == 62 && c2 == 61 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkGe(), span: span) }
+  end
+
+  // Unit literal ()
+  if c == 40 && c2 == 41 then
+    return { st: advance_n(st: st0, n: 2), tok: SpannedToken(token: TkUnit(), span: span) }
+  end
+
+  // Single-character tokens
+  if c == 40 then return { st: advance(st: st0), tok: SpannedToken(token: TkLParen(), span: span) } end
+  if c == 41 then return { st: advance(st: st0), tok: SpannedToken(token: TkRParen(), span: span) } end
+  if c == 123 then return { st: advance(st: st0), tok: SpannedToken(token: TkLBrace(), span: span) } end
+  if c == 125 then return { st: advance(st: st0), tok: SpannedToken(token: TkRBrace(), span: span) } end
+  if c == 91 then return { st: advance(st: st0), tok: SpannedToken(token: TkLBracket(), span: span) } end
+  if c == 93 then return { st: advance(st: st0), tok: SpannedToken(token: TkRBracket(), span: span) } end
+  if c == 44 then return { st: advance(st: st0), tok: SpannedToken(token: TkComma(), span: span) } end
+  if c == 46 then return { st: advance(st: st0), tok: SpannedToken(token: TkDot(), span: span) } end
+  if c == 58 then return { st: advance(st: st0), tok: SpannedToken(token: TkColon(), span: span) } end
+  if c == 61 then return { st: advance(st: st0), tok: SpannedToken(token: TkEq(), span: span) } end
+  if c == 43 then return { st: advance(st: st0), tok: SpannedToken(token: TkPlus(), span: span) } end
+  if c == 45 then return { st: advance(st: st0), tok: SpannedToken(token: TkMinus(), span: span) } end
+  if c == 42 then return { st: advance(st: st0), tok: SpannedToken(token: TkStar(), span: span) } end
+  if c == 47 then return { st: advance(st: st0), tok: SpannedToken(token: TkSlash(), span: span) } end
+  if c == 60 then return { st: advance(st: st0), tok: SpannedToken(token: TkLt(), span: span) } end
+  if c == 62 then return { st: advance(st: st0), tok: SpannedToken(token: TkGt(), span: span) } end
+  if c == 124 then return { st: advance(st: st0), tok: SpannedToken(token: TkPipe(), span: span) } end
+  if c == 126 then return { st: advance(st: st0), tok: SpannedToken(token: TkTilde(), span: span) } end
+  if c == 37 then return { st: advance(st: st0), tok: SpannedToken(token: TkPercent(), span: span) } end
+  if c == 38 then return { st: advance(st: st0), tok: SpannedToken(token: TkAmpersand(), span: span) } end
+
+  // Unknown character: skip and report as error (TkEof for now)
+  return { st: advance(st: st0), tok: SpannedToken(token: TkEof(), span: span) }
+end
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+let tokenize_go = fn (st: LexerState) -> [ SpannedToken ] do
+  if at_end(st: skip_whitespace_and_comments(st: st)) then
+    let eof_span = current_span(st: st)
+    return Cons(v: SpannedToken(token: TkEof(), span: eof_span), rest: Nil())
+  end
+  let result = lex_token(st: st)
+  return Cons(v: result.tok, rest: tokenize_go(st: result.st))
+end
+
+/// Tokenize a source string into a list of SpannedTokens (ending with TkEof).
+pub let tokenize = fn (src: string) -> [ SpannedToken ] do
+  let st = make_lexer(src: src)
+  return tokenize_go(st: st)
+end

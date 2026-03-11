@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use wasm_encoder::{Function, Instruction, MemArg, ValType};
+use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 use crate::ir::lir::{LirAtom, LirExpr, LirExternal};
 use crate::lang::ast::{BinaryOp, Type};
@@ -67,11 +67,43 @@ pub(super) fn emit_alloc_object(
             context: "object heap allocation",
         });
     }
-    out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
-    out.instruction(&Instruction::LocalTee(temps.object_ptr_i32));
-    out.instruction(&Instruction::I32Const((words as i32) * 8));
-    out.instruction(&Instruction::I32Add);
-    out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+
+    if let Some(alloc_idx) = layout.allocate_func_idx {
+        // Use stdlib's allocate() — goes through dlmalloc, no conflict.
+        out.instruction(&Instruction::I32Const((words as i32) * 8));
+        out.instruction(&Instruction::Call(alloc_idx));
+        out.instruction(&Instruction::LocalSet(temps.object_ptr_i32));
+    } else {
+        // Fallback bump-allocate for programs without stdlib.
+        out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+        out.instruction(&Instruction::LocalTee(temps.object_ptr_i32));
+        out.instruction(&Instruction::I32Const((words as i32) * 8));
+        out.instruction(&Instruction::I32Add);
+        out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+
+        // Grow memory if the new heap pointer exceeds current memory size.
+        out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+        out.instruction(&Instruction::MemorySize(0));
+        out.instruction(&Instruction::I32Const(16));
+        out.instruction(&Instruction::I32Shl);
+        out.instruction(&Instruction::I32GtU);
+        out.instruction(&Instruction::If(BlockType::Empty));
+        {
+            out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+            out.instruction(&Instruction::MemorySize(0));
+            out.instruction(&Instruction::I32Const(16));
+            out.instruction(&Instruction::I32Shl);
+            out.instruction(&Instruction::I32Sub);
+            out.instruction(&Instruction::I32Const(65535));
+            out.instruction(&Instruction::I32Add);
+            out.instruction(&Instruction::I32Const(16));
+            out.instruction(&Instruction::I32ShrU);
+            out.instruction(&Instruction::MemoryGrow(0));
+            out.instruction(&Instruction::Drop);
+        }
+        out.instruction(&Instruction::End);
+    }
+
     Ok(())
 }
 
@@ -80,6 +112,8 @@ pub(super) fn emit_pack_value_to_i64(typ: &Type, out: &mut Function) -> Result<(
         Type::I64
         | Type::String
         | Type::Array(_)
+        | Type::List(_)
+        | Type::Record(_)
         | Type::UserDefined(_, _)
         | Type::Var(_)
         | Type::Borrow(_) => Ok(()),
@@ -112,6 +146,8 @@ pub(super) fn emit_unpack_i64_to_value(typ: &Type, out: &mut Function) -> Result
         Type::I64
         | Type::String
         | Type::Array(_)
+        | Type::List(_)
+        | Type::Record(_)
         | Type::UserDefined(_, _)
         | Type::Var(_)
         | Type::Borrow(_) => Ok(()),
@@ -257,11 +293,19 @@ pub(super) fn emit_string_concat(
     out.instruction(&Instruction::I32Add);
     out.instruction(&Instruction::LocalSet(temps.concat_out_len_i32));
 
-    out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
-    out.instruction(&Instruction::LocalTee(temps.concat_out_ptr_i32));
-    out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
-    out.instruction(&Instruction::I32Add);
-    out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+    if let Some(alloc_idx) = layout.allocate_func_idx {
+        // Use stdlib's allocate() for the concatenated string buffer.
+        out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+        out.instruction(&Instruction::Call(alloc_idx));
+        out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
+    } else {
+        // Fallback bump-allocate for programs without stdlib.
+        out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+        out.instruction(&Instruction::LocalTee(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+        out.instruction(&Instruction::I32Add);
+        out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+    }
 
     out.instruction(&Instruction::I32Const(0));
     out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
@@ -533,12 +577,12 @@ pub(super) fn type_to_wasm_valtype(typ: &Type) -> Result<ValType, CodegenError> 
         Type::Borrow(inner)
             if matches!(
                 peel_linear(inner),
-                Type::Record(_) | Type::UserDefined(_, _) | Type::Var(_)
+                Type::Record(_) | Type::UserDefined(_, _) | Type::List(_) | Type::Var(_)
             ) =>
         {
             Ok(ValType::I64)
         }
-        Type::UserDefined(_, _) | Type::Var(_) => Ok(ValType::I64),
+        Type::UserDefined(_, _) | Type::List(_) | Type::Var(_) => Ok(ValType::I64),
         Type::Unit => Err(CodegenError::UnitWasmType),
         other => Err(CodegenError::UnsupportedWasmType {
             typ: other.to_string(),

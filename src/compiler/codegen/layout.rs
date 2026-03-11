@@ -35,6 +35,10 @@ pub(super) struct CodegenLayout {
     pub(super) heap_base: u32,
     pub(super) conc_spawn_idx: Option<u32>,
     pub(super) conc_join_idx: Option<u32>,
+    pub(super) bt_push_idx: Option<u32>,
+    pub(super) bt_pop_idx: Option<u32>,
+    pub(super) bt_freeze_idx: Option<u32>,
+    pub(super) allocate_func_idx: Option<u32>,
 }
 
 pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout, CodegenError> {
@@ -44,6 +48,10 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
             collect_strings_in_stmt(stmt, &mut string_literals);
         }
         collect_strings_in_atom(&func.ret, &mut string_literals);
+    }
+    // Collect function names for backtrace instrumentation
+    for func in &program.functions {
+        string_literals.push(func.name.clone());
     }
 
     let object_heap_enabled = program_uses_object_heap(program);
@@ -88,6 +96,10 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
         heap_base,
         conc_spawn_idx: None,
         conc_join_idx: None,
+        bt_push_idx: None,
+        bt_pop_idx: None,
+        bt_freeze_idx: None,
+        allocate_func_idx: None,
     })
 }
 
@@ -126,7 +138,7 @@ pub(super) fn align8(v: u32) -> u32 {
     (v + 7) & !7
 }
 
-fn program_uses_object_heap(program: &LirProgram) -> bool {
+pub(super) fn program_uses_object_heap(program: &LirProgram) -> bool {
     for func in &program.functions {
         for stmt in &func.body {
             if stmt_uses_object_heap(stmt) {

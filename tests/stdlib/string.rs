@@ -124,6 +124,34 @@ end
     );
 }
 
+#[test]
+fn test_backtrace_captures_call_stack() {
+    exec_with_stdlib(
+        r#"
+import { backtrace } from stdlib/exn.nx
+import { println } from stdlib/stdio.nx
+
+let main = fn () -> unit require { PermConsole } throws { Exn } do
+  try
+    raise RuntimeError(val: "boom")
+  catch e ->
+    let bt = backtrace(exn: e)
+    match bt do
+      case Cons(val: first, rest: _) ->
+        if first != "main" then
+          println(val: "expected frame 'main', got '" ++ first ++ "'")
+          raise RuntimeError(val: "wrong frame")
+        end
+      case Nil() ->
+        raise RuntimeError(val: "expected non-empty backtrace")
+    end
+  end
+  return ()
+end
+"#,
+    );
+}
+
 use proptest::prelude::*;
 
 proptest! {

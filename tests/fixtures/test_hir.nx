@@ -1,0 +1,305 @@
+// Tests for nxc/hir.nx — HIR types, AST→HIR conversion, and reachability analysis.
+import { tokenize } from nxc/lexer.nx
+import { parse } from nxc/parser.nx
+import { Span } from nxc/token.nx
+import { Program, SpannedTopLevel, TopLevel, GlobalLet, EnumDef,
+         VariantDef, Port, SpannedExpr, Expr, Literal, TypeExpr } from nxc/ast.nx
+import { RenameEntry, rename, rename_add } from nxc/symtab.nx
+import { HirExpr, HirStmt, HirCallArg, HirParam, HirFunction,
+         HirMatchCase, HirPattern, HirPatternField,
+         HirPort, HirPortMethod, HirExternal, HirHandlerBinding,
+         HirHandlerBindingEntry, HirProgram, HirAccum,
+         convert_expr, convert_stmts, convert_pattern,
+         process_defs, empty_accum, collect_calls_stmts, collect_reachable,
+         filter_reachable_functions } from nxc/hir.nx
+
+let assert = fn (cond: bool, msg: string) -> unit throws { Exn } do
+  if cond then return ()
+  else raise RuntimeError(val: msg)
+  end
+end
+
+let get_defs = fn (prog: Program) -> [SpannedTopLevel] do
+  match prog do case Program(definitions: defs) -> return defs end
+end
+
+// ─── Helper: count list length ────────────────────────────────────────────
+let list_len = fn (xs: [HirFunction]) -> i64 do
+  match xs do
+    case Nil() -> return 0
+    case Cons(v: _, rest: rest) -> return 1 + list_len(xs: rest)
+  end
+end
+
+let str_list_len = fn (xs: [string]) -> i64 do
+  match xs do
+    case Nil() -> return 0
+    case Cons(v: _, rest: rest) -> return 1 + str_list_len(xs: rest)
+  end
+end
+
+let port_list_len = fn (xs: [HirPort]) -> i64 do
+  match xs do
+    case Nil() -> return 0
+    case Cons(v: _, rest: rest) -> return 1 + port_list_len(xs: rest)
+  end
+end
+
+let enum_list_len = fn (xs: [EnumDef]) -> i64 do
+  match xs do
+    case Nil() -> return 0
+    case Cons(v: _, rest: rest) -> return 1 + enum_list_len(xs: rest)
+  end
+end
+
+let binding_list_len = fn (xs: [HirHandlerBindingEntry]) -> i64 do
+  match xs do
+    case Nil() -> return 0
+    case Cons(v: _, rest: rest) -> return 1 + binding_list_len(xs: rest)
+  end
+end
+
+let str_in_list = fn (s: string, xs: [string]) -> bool do
+  match xs do
+    case Nil() -> return false
+    case Cons(v: x, rest: rest) ->
+      if x == s then return true
+      else return str_in_list(s: s, xs: rest)
+      end
+  end
+end
+
+// ─── Test convert_expr: literal passthrough ───────────────────────────────
+let test_convert_expr_literal = fn () -> unit throws { Exn } do
+  let src = "pub let x = fn () -> i64 do return 42 end\n"
+  let prog = parse(tokens: tokenize(src: src))
+  let defs = get_defs(prog: prog)
+  // Process defs into HIR, check the function body has a HirStmtReturn with HirLiteral
+  let accum = process_defs(defs: defs, entries: Nil(),
+    accum: empty_accum())
+  match accum do case HirAccum(ports: _, functions: fs, externals: _, handler_bindings: _, enum_defs: _, wasm_module: _) ->
+    assert(cond: list_len(xs: fs) == 1, msg: "literal: expected 1 function")
+    match fs do case Cons(v: f, rest: _) ->
+      match f do case HirFunction(name: n, params: _, ret_type: _, body: body, span: _) ->
+        assert(cond: n == "x", msg: "literal: function name is x")
+        // Body should have a return stmt with literal 42
+        match body do case Cons(v: s, rest: _) ->
+          match s do
+            case HirStmtReturn(expr: e) ->
+              match e do
+                case HirLiteral(lit: l) ->
+                  match l do
+                    case LitInt(val: v) ->
+                      assert(cond: v == 42, msg: "literal: value is 42")
+                    case _ -> raise RuntimeError(val: "literal: expected LitInt")
+                  end
+                case _ -> raise RuntimeError(val: "literal: expected HirLiteral")
+              end
+            case _ -> raise RuntimeError(val: "literal: expected HirStmtReturn")
+          end
+        case Nil() -> raise RuntimeError(val: "literal: expected non-empty body")
+        end
+      end
+    case Nil() -> raise RuntimeError(val: "literal: no functions")
+    end
+  end
+end
+
+// ─── Test convert_expr: variable renaming ─────────────────────────────────
+let test_convert_expr_rename = fn () -> unit throws { Exn } do
+  let src = "pub let f = fn (x: i64) -> i64 do return x end\n"
+  let prog = parse(tokens: tokenize(src: src))
+  let defs = get_defs(prog: prog)
+  // Use rename entries to qualify "f" → "mod.f"
+  let entries = rename_add(entries: Nil(), original: "f", qualified: "mod.f")
+  let accum = process_defs(defs: defs, entries: entries,
+    accum: empty_accum())
+  match accum do case HirAccum(ports: _, functions: fs, externals: _, handler_bindings: _, enum_defs: _, wasm_module: _) ->
+    match fs do case Cons(v: func, rest: _) ->
+      match func do case HirFunction(name: n, params: _, ret_type: _, body: _, span: _) ->
+        assert(cond: n == "mod.f", msg: "rename: function name is mod.f, got " ++ n)
+      end
+    case Nil() -> raise RuntimeError(val: "rename: no functions")
+    end
+  end
+end
+
+// ─── Test process_defs: port extraction ───────────────────────────────────
+let test_process_defs_port = fn () -> unit throws { Exn } do
+  let src = "port Logger do\n  fn log(msg: string) -> unit\nend\n"
+  let prog = parse(tokens: tokenize(src: src))
+  let defs = get_defs(prog: prog)
+  let accum = process_defs(defs: defs, entries: Nil(),
+    accum: empty_accum())
+  match accum do case HirAccum(ports: ps, functions: _, externals: _, handler_bindings: _, enum_defs: _, wasm_module: _) ->
+    assert(cond: port_list_len(xs: ps) == 1, msg: "port: expected 1 port")
+    match ps do case Cons(v: p, rest: _) ->
+      match p do case HirPort(name: n, methods: ms) ->
+        assert(cond: n == "Logger", msg: "port: name is Logger")
+        match ms do case Cons(v: m, rest: _) ->
+          match m do case HirPortMethod(name: mn) ->
+            assert(cond: mn == "log", msg: "port: method name is log")
+          end
+        case Nil() -> raise RuntimeError(val: "port: no methods")
+        end
+      end
+    case Nil() -> raise RuntimeError(val: "port: no ports")
+    end
+  end
+end
+
+// ─── Test process_defs: enum extraction ───────────────────────────────────
+let test_process_defs_enum = fn () -> unit throws { Exn } do
+  let src = "type Color = Red | Green | Blue\n"
+  let prog = parse(tokens: tokenize(src: src))
+  let defs = get_defs(prog: prog)
+  let accum = process_defs(defs: defs, entries: Nil(),
+    accum: empty_accum())
+  match accum do case HirAccum(ports: _, functions: _, externals: _, handler_bindings: _, enum_defs: eds, wasm_module: _) ->
+    assert(cond: enum_list_len(xs: eds) == 1, msg: "enum: expected 1 enum def")
+    match eds do case Cons(v: ed, rest: _) ->
+      match ed do case EnumDef(name: n, is_public: _, is_opaque: _, type_params: _, variants: _) ->
+        assert(cond: n == "Color", msg: "enum: name is Color")
+      end
+    case Nil() -> raise RuntimeError(val: "enum: no enum defs")
+    end
+  end
+end
+
+// ─── Test process_defs: multiple definitions ──────────────────────────────
+let test_process_defs_mixed = fn () -> unit throws { Exn } do
+  let src = "pub let add = fn (a: i64, b: i64) -> i64 do return a + b end\npub let sub = fn (a: i64, b: i64) -> i64 do return a - b end\ntype Pair = Pair(x: i64, y: i64)\nport Printer do\n  fn print(s: string) -> unit\nend\n"
+  let prog = parse(tokens: tokenize(src: src))
+  let defs = get_defs(prog: prog)
+  let accum = process_defs(defs: defs, entries: Nil(),
+    accum: empty_accum())
+  match accum do case HirAccum(ports: ps, functions: fs, externals: _, handler_bindings: _, enum_defs: eds, wasm_module: _) ->
+    assert(cond: list_len(xs: fs) == 2, msg: "mixed: expected 2 functions")
+    assert(cond: port_list_len(xs: ps) == 1, msg: "mixed: expected 1 port")
+    assert(cond: enum_list_len(xs: eds) == 1, msg: "mixed: expected 1 enum")
+  end
+end
+
+// ─── Test collect_calls and reachability ──────────────────────────────────
+let test_reachability = fn () -> unit throws { Exn } do
+  // Build HIR functions manually for reachability test
+  let main_body = Cons(
+    v: HirStmtExpr(expr: HirCall(func: "helper", args: Nil())),
+    rest: Cons(
+      v: HirStmtReturn(expr: HirLiteral(lit: LitUnit)),
+      rest: Nil()
+    )
+  )
+  let main_fn = HirFunction(name: "main", params: Nil(), ret_type: TyUnit, body: main_body, span: Span(offset: 0, line: 0, col: 0))
+
+  let helper_body = Cons(
+    v: HirStmtReturn(expr: HirCall(func: "utility", args: Nil())),
+    rest: Nil()
+  )
+  let helper_fn = HirFunction(name: "helper", params: Nil(), ret_type: TyI64, body: helper_body, span: Span(offset: 0, line: 0, col: 0))
+
+  let utility_body = Cons(
+    v: HirStmtReturn(expr: HirLiteral(lit: LitInt(val: 42))),
+    rest: Nil()
+  )
+  let utility_fn = HirFunction(name: "utility", params: Nil(), ret_type: TyI64, body: utility_body, span: Span(offset: 0, line: 0, col: 0))
+
+  // Dead function — not called from main
+  let dead_body = Cons(
+    v: HirStmtReturn(expr: HirLiteral(lit: LitInt(val: 0))),
+    rest: Nil()
+  )
+  let dead_fn = HirFunction(name: "dead_func", params: Nil(), ret_type: TyI64, body: dead_body, span: Span(offset: 0, line: 0, col: 0))
+
+  let all_funcs = Cons(v: main_fn, rest: Cons(v: helper_fn, rest: Cons(v: utility_fn, rest: Cons(v: dead_fn, rest: Nil()))))
+
+  // Test collect_calls_stmts
+  let main_calls = collect_calls_stmts(stmts: main_body)
+  assert(cond: str_in_list(s: "helper", xs: main_calls), msg: "calls: main calls helper")
+
+  // Test collect_reachable
+  let reachable = collect_reachable(functions: all_funcs, handler_bindings: Nil())
+  assert(cond: str_in_list(s: "main", xs: reachable), msg: "reachable: main is reachable")
+  assert(cond: str_in_list(s: "helper", xs: reachable), msg: "reachable: helper is reachable")
+  assert(cond: str_in_list(s: "utility", xs: reachable), msg: "reachable: utility is reachable")
+  assert(cond: str_in_list(s: "dead_func", xs: reachable) == false, msg: "reachable: dead_func is NOT reachable")
+
+  // Test filter_reachable_functions
+  let filtered = filter_reachable_functions(functions: all_funcs, reachable: reachable)
+  assert(cond: list_len(xs: filtered) == 3, msg: "filter: 3 reachable functions (not 4)")
+end
+
+// ─── Test desugar list literal ────────────────────────────────────────────
+let test_list_desugar = fn () -> unit throws { Exn } do
+  let src = "pub let xs = fn () -> [i64] do return [1, 2] end\n"
+  let prog = parse(tokens: tokenize(src: src))
+  let defs = get_defs(prog: prog)
+  let accum = process_defs(defs: defs, entries: Nil(),
+    accum: empty_accum())
+  match accum do case HirAccum(ports: _, functions: fs, externals: _, handler_bindings: _, enum_defs: _, wasm_module: _) ->
+    assert(cond: list_len(xs: fs) == 1, msg: "list: expected 1 function")
+    match fs do case Cons(v: f, rest: _) ->
+      match f do case HirFunction(name: _, params: _, ret_type: _, body: body, span: _) ->
+        // Body should return a desugared Cons/Nil chain: Cons(1, Cons(2, Nil))
+        match body do case Cons(v: s, rest: _) ->
+          match s do
+            case HirStmtReturn(expr: e) ->
+              match e do
+                case HirConstructor(variant: v, args: _) ->
+                  assert(cond: v == "Cons", msg: "list: outer is Cons")
+                case _ -> raise RuntimeError(val: "list: expected HirConstructor(Cons)")
+              end
+            case _ -> raise RuntimeError(val: "list: expected HirStmtReturn")
+          end
+        case Nil() -> raise RuntimeError(val: "list: empty body")
+        end
+      end
+    case Nil() -> raise RuntimeError(val: "list: no functions")
+    end
+  end
+end
+
+// ─── Test if-expression in HIR ────────────────────────────────────────────
+let test_if_expr = fn () -> unit throws { Exn } do
+  let src = "pub let pick = fn (a: i64, b: i64) -> i64 do\n  let r = if a > b then a else b end\n  return r\nend\n"
+  let prog = parse(tokens: tokenize(src: src))
+  let defs = get_defs(prog: prog)
+  let accum = process_defs(defs: defs, entries: Nil(),
+    accum: empty_accum())
+  match accum do case HirAccum(ports: _, functions: fs, externals: _, handler_bindings: _, enum_defs: _, wasm_module: _) ->
+    assert(cond: list_len(xs: fs) == 1, msg: "if: expected 1 function")
+    match fs do case Cons(v: f, rest: _) ->
+      match f do case HirFunction(name: n, params: ps, ret_type: _, body: body, span: _) ->
+        assert(cond: n == "pick", msg: "if: function name is pick")
+        // Body: [let r = if ..., return r]
+        match body do
+          case Cons(v: s1, rest: Cons(v: s2, rest: Nil())) ->
+            match s1 do
+              case HirStmtLet(name: rn, typ: _, value: val) ->
+                assert(cond: rn == "r", msg: "if: let name is r")
+                match val do
+                  case HirIf(cond: _, then_branch: _, else_branch: _) ->
+                    return ()  // Success — if-expression properly converted
+                  case _ -> raise RuntimeError(val: "if: expected HirIf in let value")
+                end
+              case _ -> raise RuntimeError(val: "if: expected HirStmtLet")
+            end
+          case _ -> raise RuntimeError(val: "if: expected 2 stmts in body")
+        end
+      end
+    case Nil() -> raise RuntimeError(val: "if: no functions")
+    end
+  end
+end
+
+// ─── Main ────────────────────────────────────────────────────────────────
+let main = fn () -> unit throws { Exn } do
+  test_convert_expr_literal()
+  test_convert_expr_rename()
+  test_process_defs_port()
+  test_process_defs_enum()
+  test_process_defs_mixed()
+  test_reachability()
+  test_list_desugar()
+  test_if_expr()
+end

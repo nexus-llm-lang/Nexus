@@ -16,7 +16,10 @@ use cli::{
     build_execution_capabilities, default_wasm_output_path, extract_main_requires, load_source,
     strip_shebang, Cli, Command,
 };
-use driver::{compile_loaded_source_to_wasm, parse_program, typecheck_program};
+use driver::{
+    compile_loaded_source_to_wasm, compile_loaded_source_to_wasm_no_typecheck, parse_program,
+    typecheck_program,
+};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -52,6 +55,8 @@ fn main() -> ExitCode {
             allow_proc,
             allow_env,
             preopen,
+            skip_typecheck,
+            guest_args,
         }) => {
             let capabilities = match build_execution_capabilities(
                 allow_fs,
@@ -69,7 +74,7 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            run_command(input, capabilities, cli.verbose)
+            run_command(input, capabilities, cli.verbose, skip_typecheck, guest_args)
         }
         Some(Command::Build {
             input,
@@ -77,6 +82,7 @@ fn main() -> ExitCode {
             wasm_merge,
             explain_capabilities,
             explain_capabilities_format,
+            skip_typecheck,
         }) => build_command(
             input,
             output,
@@ -84,6 +90,7 @@ fn main() -> ExitCode {
             explain_capabilities,
             explain_capabilities_format,
             cli.verbose,
+            skip_typecheck,
         ),
         Some(Command::Check { input }) => check_command(input),
         None => {
@@ -91,7 +98,7 @@ fn main() -> ExitCode {
                 repl::start(ExecutionCapabilities::deny_all());
                 ExitCode::SUCCESS
             } else {
-                run_command(None, ExecutionCapabilities::deny_all(), cli.verbose)
+                run_command(None, ExecutionCapabilities::deny_all(), cli.verbose, false, vec![])
             }
         }
     }
@@ -101,6 +108,8 @@ fn run_command(
     input: Option<std::path::PathBuf>,
     capabilities: ExecutionCapabilities,
     verbose: bool,
+    skip_typecheck: bool,
+    guest_args: Vec<String>,
 ) -> ExitCode {
     if let Some(path) = input.as_deref() {
         if path != Path::new("-") && path.extension().is_some_and(|ext| ext == "wasm") {
@@ -136,14 +145,19 @@ fn run_command(
 
     // Compile and execute via wasmtime
     let wasm_merge_command = bundler::resolve_wasm_merge_command(None);
-    let compiled = match compile_loaded_source_to_wasm(&loaded, true, &wasm_merge_command, verbose)
+    let compile_fn = if skip_typecheck {
+        compile_loaded_source_to_wasm_no_typecheck
+    } else {
+        compile_loaded_source_to_wasm
+    };
+    let compiled = match compile_fn(&loaded, true, &wasm_merge_command, verbose)
     {
         Ok(compiled) => compiled,
         Err(code) => return code,
     };
 
     let module_dir = input_path.as_deref().and_then(|p| p.parent());
-    nexus::runtime::wasm_exec::run_wasm_bytes(&compiled.wasm, module_dir, &capabilities)
+    nexus::runtime::wasm_exec::run_wasm_bytes(&compiled.wasm, module_dir, &capabilities, &guest_args)
 }
 
 fn build_command(
@@ -153,6 +167,7 @@ fn build_command(
     explain: cli::ExplainCapabilities,
     format: cli::ExplainCapabilitiesFormat,
     verbose: bool,
+    skip_typecheck: bool,
 ) -> ExitCode {
     let loaded = match load_source(input) {
         Ok(loaded) => loaded,
@@ -163,23 +178,33 @@ fn build_command(
     };
 
     let wasm_merge_command = bundler::resolve_wasm_merge_command(wasm_merge.as_deref());
-    let compiled = match compile_loaded_source_to_wasm(&loaded, true, &wasm_merge_command, verbose)
+    let compile_fn = if skip_typecheck {
+        compile_loaded_source_to_wasm_no_typecheck
+    } else {
+        compile_loaded_source_to_wasm
+    };
+    let compiled = match compile_fn(&loaded, true, &wasm_merge_command, verbose)
     {
         Ok(c) => c,
         Err(code) => return code,
     };
-    let component_wasm = match artifact::encode_core_wasm_as_component(
-        &compiled.wasm,
-        compiled.app_needs_nexus_host,
-    ) {
-        Ok(component_wasm) => component_wasm,
-        Err(msg) => {
-            eprintln!("Component Encode Error: {}", msg);
-            return ExitCode::from(1);
+    let final_wasm = if skip_typecheck {
+        // Skip component encoding for bootstrap builds
+        compiled.wasm.clone()
+    } else {
+        match artifact::encode_core_wasm_as_component(
+            &compiled.wasm,
+            compiled.app_needs_nexus_host,
+        ) {
+            Ok(component_wasm) => component_wasm,
+            Err(msg) => {
+                eprintln!("Component Encode Error: {}", msg);
+                return ExitCode::from(1);
+            }
         }
     };
     let output_path = output.unwrap_or_else(default_wasm_output_path);
-    if let Err(e) = fs::write(&output_path, &component_wasm) {
+    if let Err(e) = fs::write(&output_path, &final_wasm) {
         eprintln!("Failed to write {}: {}", output_path.display(), e);
         return ExitCode::from(1);
     }
@@ -187,7 +212,7 @@ fn build_command(
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
-    let caps = runtime::parse_nexus_capabilities(&component_wasm);
+    let caps = runtime::parse_nexus_capabilities(&final_wasm);
     artifact::print_build_result(&output_name, &caps, &explain, &format);
     ExitCode::SUCCESS
 }
