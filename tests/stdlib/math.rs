@@ -1,4 +1,4 @@
-use crate::common::wasm::exec_with_stdlib;
+use crate::harness::exec_with_stdlib;
 
 #[test]
 fn negate_in_math_module() {
@@ -56,7 +56,7 @@ end
 
 #[test]
 fn random_range_requires_perform() {
-    let err = crate::common::check::should_fail_typecheck(
+    let err = crate::harness::should_fail_typecheck(
         r#"
 import { Random }, * as rng from stdlib/random.nx
 

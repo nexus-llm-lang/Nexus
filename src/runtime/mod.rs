@@ -1,5 +1,5 @@
 use crate::constants::{Permission, NEXUS_CAPABILITIES_SECTION};
-use crate::lang::ast::Type;
+use crate::types::Type;
 use std::path::PathBuf;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 

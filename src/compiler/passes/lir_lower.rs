@@ -5,9 +5,10 @@
 //! - Complex expressions are extracted into let-bound temporaries
 //! - If/Match compiled into IfReturn chains
 
+use crate::intern::Symbol;
 use crate::ir::lir::*;
 use crate::ir::mir::*;
-use crate::lang::ast::{BinaryOp, EnumDef, Literal, Span, Type};
+use crate::types::{BinaryOp, EnumDef, Literal, Span, Type};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
@@ -131,12 +132,12 @@ fn lower_mir_function(
         LirAtom::Unit
     } else {
         return Err(LirLowerError::FunctionMayNotReturn {
-            name: func.name.clone(),
+            name: func.name.to_string(),
             span: func.span.clone(),
         });
     };
 
-    let params: Vec<LirParam> = func
+    let mut params: Vec<LirParam> = func
         .params
         .iter()
         .map(|p| LirParam {
@@ -145,6 +146,7 @@ fn lower_mir_function(
             typ: p.typ.clone(),
         })
         .collect();
+    params.sort_by(|a, b| a.label.cmp(&b.label));
 
     let task_functions = ctx.task_functions;
 
@@ -165,9 +167,9 @@ fn lower_mir_function(
 
 /// Context for lowering a single function body
 struct LowerCtx<'a> {
-    vars: HashMap<String, Type>,
+    vars: HashMap<Symbol, Type>,
     /// Semantic types for variables (pre-wasm-lowering) — used for field access resolution
-    semantic_vars: HashMap<String, Type>,
+    semantic_vars: HashMap<Symbol, Type>,
     stmts: Vec<LirStmt>,
     temp_counter: usize,
     /// Task functions lifted from conc blocks
@@ -187,8 +189,8 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    fn new_temp(&mut self) -> String {
-        let name = format!("__t{}", self.temp_counter);
+    fn new_temp(&mut self) -> Symbol {
+        let name = Symbol::from(format!("__t{}", self.temp_counter));
         self.temp_counter += 1;
         name
     }
@@ -196,9 +198,9 @@ impl<'a> LowerCtx<'a> {
     /// Bind a complex expression to a temporary variable, returning an atom reference
     fn bind_expr_to_temp(&mut self, expr: LirExpr, typ: Type) -> LirAtom {
         let name = self.new_temp();
-        self.vars.insert(name.clone(), typ.clone());
+        self.vars.insert(name, typ.clone());
         self.stmts.push(LirStmt::Let {
-            name: name.clone(),
+            name,
             typ: typ.clone(),
             expr,
         });
@@ -213,10 +215,10 @@ impl<'a> LowerCtx<'a> {
         semantic_type: Type,
     ) -> LirAtom {
         let name = self.new_temp();
-        self.vars.insert(name.clone(), typ.clone());
-        self.semantic_vars.insert(name.clone(), semantic_type);
+        self.vars.insert(name, typ.clone());
+        self.semantic_vars.insert(name, semantic_type);
         self.stmts.push(LirStmt::Let {
-            name: name.clone(),
+            name,
             typ: typ.clone(),
             expr,
         });
@@ -299,6 +301,7 @@ impl<'a> LowerCtx<'a> {
                         let atom = self.lower_expr_to_atom(e)?;
                         lir_args.push((label.clone(), atom));
                     }
+                    lir_args.sort_by(|(a, _), (b, _)| a.cmp(b));
                     let typ = wasm_type(ret_type);
                     let atom = self.bind_expr_to_temp(
                         LirExpr::TailCall {
@@ -331,20 +334,20 @@ impl<'a> LowerCtx<'a> {
                 let mut task_refs = Vec::new();
                 for task in tasks {
                     let free_vars = collect_free_vars(&task.body);
-                    let task_name = format!("__conc_{}", task.name);
+                    let task_name = Symbol::from(format!("__conc_{}", task.name));
                     let capture_params: Vec<MirParam> = free_vars
                         .iter()
-                        .map(|name| {
-                            let typ = self.semantic_vars.get(name).cloned().unwrap_or(Type::I64);
+                        .map(|&name| {
+                            let typ = self.semantic_vars.get(&name).cloned().unwrap_or(Type::I64);
                             MirParam {
-                                label: name.clone(),
-                                name: name.clone(),
+                                label: name,
+                                name,
                                 typ,
                             }
                         })
                         .collect();
                     let task_mir = MirFunction {
-                        name: task_name.clone(),
+                        name: task_name,
                         params: capture_params,
                         ret_type: Type::Unit,
                         body: task.body.clone(),
@@ -353,14 +356,14 @@ impl<'a> LowerCtx<'a> {
                     let (lir_func, nested_tasks) = lower_mir_function(&task_mir, self.enum_defs)?;
                     self.task_functions.push(lir_func);
                     self.task_functions.extend(nested_tasks);
-                    let args: Vec<(String, LirAtom)> = free_vars
+                    let args: Vec<(Symbol, LirAtom)> = free_vars
                         .iter()
-                        .map(|name| {
-                            let typ = self.vars.get(name).cloned().unwrap_or(Type::I64);
+                        .map(|&name| {
+                            let typ = self.vars.get(&name).cloned().unwrap_or(Type::I64);
                             (
-                                name.clone(),
+                                name,
                                 LirAtom::Var {
-                                    name: name.clone(),
+                                    name,
                                     typ,
                                 },
                             )
@@ -485,10 +488,10 @@ impl<'a> LowerCtx<'a> {
         // incorrectly return from the enclosing function instead of just producing
         // a value for the if-expression.
         let then_stmts =
-            self.lower_branch_for_value(then_body, &result_name, &result_type)?;
+            self.lower_branch_for_value(then_body, result_name, &result_type)?;
 
         let else_stmts = if let Some(else_body) = else_body {
-            self.lower_branch_for_value(else_body, &result_name, &result_type)?
+            self.lower_branch_for_value(else_body, result_name, &result_type)?
         } else {
             Vec::new()
         };
@@ -510,7 +513,7 @@ impl<'a> LowerCtx<'a> {
     fn lower_branch_for_value(
         &mut self,
         body: &[MirStmt],
-        result_name: &str,
+        result_name: Symbol,
         result_type: &Type,
     ) -> Result<Vec<LirStmt>, LirLowerError> {
         let saved_stmts = std::mem::take(&mut self.stmts);
@@ -533,7 +536,7 @@ impl<'a> LowerCtx<'a> {
             };
             if let Some(val) = value {
                 self.stmts.push(LirStmt::Let {
-                    name: result_name.to_string(),
+                    name: result_name,
                     typ: result_type.clone(),
                     expr: LirExpr::Atom(val),
                 });
@@ -744,7 +747,7 @@ impl<'a> LowerCtx<'a> {
         body: &[MirStmt],
     ) -> Result<(Option<LirAtom>, Vec<LirStmt>, LirAtom), LirLowerError> {
         let mut conds = Vec::new();
-        let mut bindings: HashMap<String, LirAtom> = HashMap::new();
+        let mut bindings: HashMap<Symbol, LirAtom> = HashMap::new();
 
         let stmts_before = self.stmts.len();
         self.collect_pattern_conditions_and_bindings(target, pattern, &mut conds, &mut bindings)?;
@@ -840,7 +843,7 @@ impl<'a> LowerCtx<'a> {
         ret_type: &Type,
     ) -> Result<(Option<LirAtom>, Vec<LirStmt>, Option<LirAtom>), LirLowerError> {
         let mut conds = Vec::new();
-        let mut bindings: HashMap<String, LirAtom> = HashMap::new();
+        let mut bindings: HashMap<Symbol, LirAtom> = HashMap::new();
 
         // Track stmts emitted by pattern extraction
         let stmts_before = self.stmts.len();
@@ -974,12 +977,12 @@ impl<'a> LowerCtx<'a> {
         target: &LirAtom,
         pattern: &MirPattern,
         conds: &mut Vec<LirAtom>,
-        bindings: &mut HashMap<String, LirAtom>,
+        bindings: &mut HashMap<Symbol, LirAtom>,
     ) -> Result<(), LirLowerError> {
         match pattern {
             MirPattern::Wildcard => {} // always matches
             MirPattern::Variable(name, _sigil) => {
-                bindings.insert(name.clone(), target.clone());
+                bindings.insert(*name, target.clone());
             }
             MirPattern::Literal(lit) => {
                 let lit_atom = literal_to_atom(lit);
@@ -995,6 +998,11 @@ impl<'a> LowerCtx<'a> {
                 conds.push(cond);
             }
             MirPattern::Constructor { name, fields } => {
+                // Use enum definition arity for tag (not pattern field count)
+                let def_arity = lookup_constructor_field_labels(name.as_str(), self.enum_defs)
+                    .map(|labels| labels.len())
+                    .unwrap_or(fields.len());
+
                 // Tag check
                 let tag_atom = self.bind_expr_to_temp(
                     LirExpr::ObjectTag {
@@ -1003,7 +1011,7 @@ impl<'a> LowerCtx<'a> {
                     },
                     Type::I64,
                 );
-                let expected_tag = constructor_tag(name, fields.len());
+                let expected_tag = constructor_tag(name.as_str(), def_arity);
                 let tag_cond = self.bind_expr_to_temp(
                     LirExpr::Binary {
                         op: BinaryOp::Eq,
@@ -1026,13 +1034,46 @@ impl<'a> LowerCtx<'a> {
                     _ => target.typ(),
                 };
                 let resolved_field_types =
-                    resolve_constructor_field_types(name, &target_sem_type, self.enum_defs);
+                    resolve_constructor_field_types(name.as_str(), &target_sem_type, self.enum_defs);
 
-                // Field checks
-                for (idx, (_label, field_pat)) in fields.iter().enumerate() {
+                // Compute sorted field order for labeled constructors
+                let sorted_indices = constructor_sorted_field_indices(name.as_str(), self.enum_defs);
+
+                // Field checks — use sorted index for memory layout
+                for (pat_idx, (label, field_pat)) in fields.iter().enumerate() {
+                    // Determine the memory index for this field:
+                    // - If the pattern has a label, find its sorted position
+                    // - Otherwise, use the pattern index mapped through sorted order
+                    let mem_idx = if let Some(ref si) = sorted_indices {
+                        if let Some(lbl) = label {
+                            // Find this label's definition index, then map to sorted index
+                            lookup_constructor_field_labels(name.as_str(), self.enum_defs)
+                                .and_then(|labels| {
+                                    labels.iter().position(|l| l.as_ref() == Some(lbl))
+                                })
+                                .map(|def_idx| si[def_idx])
+                                .unwrap_or(pat_idx)
+                        } else {
+                            // Positional: pat_idx is definition order
+                            si.get(pat_idx).copied().unwrap_or(pat_idx)
+                        }
+                    } else {
+                        pat_idx
+                    };
+
+                    // Resolve semantic field type using definition index (not memory index)
+                    let def_idx = if let Some(lbl) = label {
+                        lookup_constructor_field_labels(name.as_str(), self.enum_defs)
+                            .and_then(|labels| {
+                                labels.iter().position(|l| l.as_ref() == Some(lbl))
+                            })
+                            .unwrap_or(pat_idx)
+                    } else {
+                        pat_idx
+                    };
                     let semantic_ft = resolved_field_types
                         .as_ref()
-                        .and_then(|fts| fts.get(idx))
+                        .and_then(|fts| fts.get(def_idx))
                         .cloned();
                     let wasm_ft = semantic_ft
                         .as_ref()
@@ -1041,7 +1082,7 @@ impl<'a> LowerCtx<'a> {
                     let field_atom = self.bind_expr_to_temp(
                         LirExpr::ObjectField {
                             value: target.clone(),
-                            index: idx,
+                            index: mem_idx,
                             typ: wasm_ft.clone(),
                         },
                         wasm_ft,
@@ -1114,7 +1155,7 @@ impl<'a> LowerCtx<'a> {
         &self,
         target: &LirAtom,
         pattern: &MirPattern,
-    ) -> HashMap<String, Type> {
+    ) -> HashMap<Symbol, Type> {
         let mut result = HashMap::new();
         let target_sem_type = match target {
             LirAtom::Var { name, .. } => self
@@ -1132,11 +1173,11 @@ impl<'a> LowerCtx<'a> {
         &self,
         sem_type: &Type,
         pattern: &MirPattern,
-        out: &mut HashMap<String, Type>,
+        out: &mut HashMap<Symbol, Type>,
     ) {
         match pattern {
             MirPattern::Variable(name, _) => {
-                out.insert(name.clone(), sem_type.clone());
+                out.insert(*name, sem_type.clone());
             }
             MirPattern::Record(fields, _) => {
                 let record_fields: Vec<(String, Type)> =
@@ -1148,7 +1189,7 @@ impl<'a> LowerCtx<'a> {
                 for (name, field_pat) in fields {
                     let field_type = record_fields
                         .iter()
-                        .find(|(n, _)| n == name)
+                        .find(|(n, _)| *n == name.as_str())
                         .map(|(_, t)| t.clone())
                         .unwrap_or(Type::I64);
                     self.walk_pattern_semantic_types(&field_type, field_pat, out);
@@ -1156,11 +1197,21 @@ impl<'a> LowerCtx<'a> {
             }
             MirPattern::Constructor { name, fields } => {
                 // Look up constructor's enum definition to resolve field types
-                let field_types = resolve_constructor_field_types(name, sem_type, self.enum_defs);
-                for (idx, (_, field_pat)) in fields.iter().enumerate() {
+                let field_types = resolve_constructor_field_types(name.as_str(), sem_type, self.enum_defs);
+                for (pat_idx, (label, field_pat)) in fields.iter().enumerate() {
+                    // Resolve definition index for this field (label-aware)
+                    let def_idx = if let Some(lbl) = label {
+                        lookup_constructor_field_labels(name.as_str(), self.enum_defs)
+                            .and_then(|labels| {
+                                labels.iter().position(|l| l.as_ref() == Some(lbl))
+                            })
+                            .unwrap_or(pat_idx)
+                    } else {
+                        pat_idx
+                    };
                     let ft = field_types
                         .as_ref()
-                        .and_then(|fts| fts.get(idx))
+                        .and_then(|fts| fts.get(def_idx))
                         .cloned()
                         .unwrap_or(Type::I64);
                     self.walk_pattern_semantic_types(&ft, field_pat, out);
@@ -1227,11 +1278,13 @@ impl<'a> LowerCtx<'a> {
                 args,
                 ret_type,
             } => {
-                let mut lir_args: Vec<(String, LirAtom)> = Vec::new();
+                // Evaluate args left-to-right, then sort by label
+                let mut lir_args: Vec<(Symbol, LirAtom)> = Vec::new();
                 for (label, expr) in args {
                     let atom = self.lower_expr_to_atom(expr)?;
-                    lir_args.push((label.clone(), atom));
+                    lir_args.push((*label, atom));
                 }
+                lir_args.sort_by(|(a, _), (b, _)| a.cmp(b));
                 let typ = wasm_type(ret_type);
                 Ok(self.bind_expr_to_temp_semantic(
                     LirExpr::Call {
@@ -1244,10 +1297,35 @@ impl<'a> LowerCtx<'a> {
                 ))
             }
             MirExpr::Constructor { name, args } => {
-                let mut lir_args = Vec::new();
-                for arg in args {
-                    lir_args.push(self.lower_expr_to_atom(arg)?);
+                // 1. Evaluate args left-to-right (preserving side-effect order)
+                let mut labeled_args: Vec<(Option<Symbol>, LirAtom)> = Vec::new();
+                for (label, arg) in args {
+                    let atom = self.lower_expr_to_atom(arg)?;
+                    labeled_args.push((*label, atom));
                 }
+
+                // 2. Fill in missing labels from enum definition (positional → labeled)
+                let def_labels = lookup_constructor_field_labels(name.as_str(), self.enum_defs);
+                if let Some(ref labels) = def_labels {
+                    for (i, (label, _)) in labeled_args.iter_mut().enumerate() {
+                        if label.is_none() {
+                            if let Some(def_label) = labels.get(i) {
+                                if let Some(l) = def_label {
+                                    *label = Some(*l);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. Sort labeled args by label (lexicographic), unlabeled stay in order
+                let all_labeled = labeled_args.iter().all(|(l, _)| l.is_some());
+                if all_labeled && labeled_args.len() > 1 {
+                    labeled_args.sort_by(|(a, _), (b, _)| a.cmp(b));
+                }
+
+                // 4. Strip labels
+                let lir_args: Vec<LirAtom> = labeled_args.into_iter().map(|(_, atom)| atom).collect();
                 let typ = Type::I64; // object pointer
                 Ok(self.bind_expr_to_temp(
                     LirExpr::Constructor {
@@ -1280,7 +1358,7 @@ impl<'a> LowerCtx<'a> {
                 let mut lir_items = Vec::new();
                 for (idx, item) in items.iter().enumerate() {
                     let atom = self.lower_expr_to_atom(item)?;
-                    lir_items.push((idx.to_string(), atom));
+                    lir_items.push((Symbol::from(idx.to_string()), atom));
                 }
                 let typ = Type::I64;
                 Ok(self.bind_expr_to_temp(
@@ -1299,8 +1377,8 @@ impl<'a> LowerCtx<'a> {
                 let typ = Type::I64;
                 Ok(self.bind_expr_to_temp(
                     LirExpr::Call {
-                        func: "__array_get".to_string(),
-                        args: vec![("arr".to_string(), arr_atom), ("idx".to_string(), idx_atom)],
+                        func: Symbol::from("__array_get"),
+                        args: vec![(Symbol::from("arr"), arr_atom), (Symbol::from("idx"), idx_atom)],
                         typ: typ.clone(),
                     },
                     typ,
@@ -1311,7 +1389,7 @@ impl<'a> LowerCtx<'a> {
                 let receiver_semantic_type = self.infer_semantic_type(expr);
                 let obj_atom = self.lower_expr_to_atom(expr)?;
 
-                let (idx, field_type) = resolve_field_access(&receiver_semantic_type, field)?;
+                let (idx, field_type) = resolve_field_access(&receiver_semantic_type, field.as_str())?;
 
                 let typ = wasm_type(&field_type);
                 Ok(self.bind_expr_to_temp(
@@ -1364,7 +1442,7 @@ impl<'a> LowerCtx<'a> {
             MirExpr::Record(fields) => {
                 let mut field_types: Vec<(String, Type)> = fields
                     .iter()
-                    .map(|(name, expr)| (name.clone(), self.infer_semantic_type(expr)))
+                    .map(|(name, expr)| (name.to_string(), self.infer_semantic_type(expr)))
                     .collect();
                 field_types.sort_by(|a, b| a.0.cmp(&b.0));
                 Type::Record(field_types)
@@ -1379,7 +1457,7 @@ impl<'a> LowerCtx<'a> {
             },
             MirExpr::FieldAccess(receiver, field) => {
                 let receiver_type = self.infer_semantic_type(receiver);
-                resolve_field_access(&receiver_type, field)
+                resolve_field_access(&receiver_type, field.as_str())
                     .map(|(_, typ)| typ)
                     .unwrap_or(Type::I64)
             }
@@ -1453,8 +1531,8 @@ impl<'a> LowerCtx<'a> {
         &mut self,
         stmts: &[MirStmt],
         ret_type: &Type,
-        vars: HashMap<String, Type>,
-        semantic_vars: HashMap<String, Type>,
+        vars: HashMap<Symbol, Type>,
+        semantic_vars: HashMap<Symbol, Type>,
     ) -> Result<(Vec<LirStmt>, Option<LirAtom>), LirLowerError> {
         // Save state
         let saved_stmts = std::mem::take(&mut self.stmts);
@@ -1633,7 +1711,7 @@ fn default_atom_for_type(typ: &Type) -> LirAtom {
 
 /// Collect free variables in a MIR statement block (referenced but not defined).
 /// Returns names in a stable order.
-fn collect_free_vars(body: &[MirStmt]) -> Vec<String> {
+fn collect_free_vars(body: &[MirStmt]) -> Vec<Symbol> {
     let mut defined = HashSet::new();
     let mut referenced = Vec::new();
     let mut seen = HashSet::new();
@@ -1648,14 +1726,14 @@ fn collect_free_vars(body: &[MirStmt]) -> Vec<String> {
 
 fn collect_mir_stmt_refs(
     stmt: &MirStmt,
-    defined: &mut HashSet<String>,
-    referenced: &mut Vec<String>,
-    seen: &mut HashSet<String>,
+    defined: &mut HashSet<Symbol>,
+    referenced: &mut Vec<Symbol>,
+    seen: &mut HashSet<Symbol>,
 ) {
     match stmt {
         MirStmt::Let { name, expr, .. } => {
             collect_mir_expr_refs(expr, referenced, seen);
-            defined.insert(name.clone());
+            defined.insert(*name);
         }
         MirStmt::Expr(expr) | MirStmt::Return(expr) => {
             collect_mir_expr_refs(expr, referenced, seen);
@@ -1679,7 +1757,7 @@ fn collect_mir_stmt_refs(
             for s in body {
                 collect_mir_stmt_refs(s, defined, referenced, seen);
             }
-            defined.insert(catch_param.clone());
+            defined.insert(*catch_param);
             for s in catch_body {
                 collect_mir_stmt_refs(s, defined, referenced, seen);
             }
@@ -1687,11 +1765,11 @@ fn collect_mir_stmt_refs(
     }
 }
 
-fn collect_mir_expr_refs(expr: &MirExpr, referenced: &mut Vec<String>, seen: &mut HashSet<String>) {
+fn collect_mir_expr_refs(expr: &MirExpr, referenced: &mut Vec<Symbol>, seen: &mut HashSet<Symbol>) {
     match expr {
         MirExpr::Variable(name) | MirExpr::Borrow(name) => {
-            if seen.insert(name.clone()) {
-                referenced.push(name.clone());
+            if seen.insert(*name) {
+                referenced.push(*name);
             }
         }
         MirExpr::BinaryOp(lhs, _, rhs) => {
@@ -1704,7 +1782,7 @@ fn collect_mir_expr_refs(expr: &MirExpr, referenced: &mut Vec<String>, seen: &mu
             }
         }
         MirExpr::Constructor { args, .. } => {
-            for arg in args {
+            for (_, arg) in args {
                 collect_mir_expr_refs(arg, referenced, seen);
             }
         }
@@ -1763,10 +1841,10 @@ fn collect_mir_expr_refs(expr: &MirExpr, referenced: &mut Vec<String>, seen: &mu
     }
 }
 
-fn collect_mir_pattern_defs(pattern: &MirPattern, seen: &mut HashSet<String>) {
+fn collect_mir_pattern_defs(pattern: &MirPattern, seen: &mut HashSet<Symbol>) {
     match pattern {
         MirPattern::Variable(name, _) => {
-            seen.insert(name.clone());
+            seen.insert(*name);
         }
         MirPattern::Constructor { fields, .. } => {
             for (_, pat) in fields {
@@ -1866,4 +1944,60 @@ fn apply_type_subst(typ: &Type, subst: &HashMap<String, Type>) -> Type {
         // Primitive types (I32, I64, F32, F64, Bool, String, Unit, etc.): no substitution
         _ => typ.clone(),
     }
+}
+
+/// Look up constructor field labels from enum definitions.
+/// Returns `Some(vec![...])` where each entry is `Some(label)` or `None` (positional).
+/// Returns `None` if the constructor is not found in any enum def.
+fn lookup_constructor_field_labels(
+    ctor_name: &str,
+    enum_defs: &[EnumDef],
+) -> Option<Vec<Option<Symbol>>> {
+    for def in enum_defs.iter().rev() {
+        for variant in &def.variants {
+            if variant.name == ctor_name {
+                return Some(
+                    variant
+                        .fields
+                        .iter()
+                        .map(|(label, _)| label.as_ref().map(|l| Symbol::from(l.as_str())))
+                        .collect(),
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Look up the sorted field order for a constructor from enum definitions.
+/// Returns a mapping from definition-order index to sorted-order index.
+/// Only applies when all fields have labels.
+fn constructor_sorted_field_indices(
+    ctor_name: &str,
+    enum_defs: &[EnumDef],
+) -> Option<Vec<usize>> {
+    for def in enum_defs.iter().rev() {
+        for variant in &def.variants {
+            if variant.name == ctor_name {
+                let all_labeled = variant.fields.iter().all(|(l, _)| l.is_some());
+                if !all_labeled || variant.fields.is_empty() {
+                    return None;
+                }
+                let mut labeled: Vec<(usize, &str)> = variant
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (l, _))| (i, l.as_ref().unwrap().as_str()))
+                    .collect();
+                labeled.sort_by(|a, b| a.1.cmp(b.1));
+                // Build def_idx → sorted_idx mapping
+                let mut mapping = vec![0usize; labeled.len()];
+                for (sorted_idx, (def_idx, _)) in labeled.iter().enumerate() {
+                    mapping[*def_idx] = sorted_idx;
+                }
+                return Some(mapping);
+            }
+        }
+    }
+    None
 }

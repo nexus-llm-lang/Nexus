@@ -1,0 +1,320 @@
+/**
+ * wasm_collect: Pre-codegen analysis passes.
+ *
+ * Collects string literals, detects heap usage, analyzes external ABIs,
+ * determines memory mode, and collects local variables from LIR.
+ */
+
+import { BinaryOp, TypeExpr } from nxc/common/ast.nx
+import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom,
+         LirExternal, LirParam, LirCallArg, LirNamedAtom } from nxc/ir/lir_types.nx
+import { peel_linear, type_to_valtype, is_unit, string_data_base,
+         LocalEntry, StringEntry, lookup_local } from nxc/backend/wasm_defs.nx
+import as list from stdlib/list.nx
+
+import external stdlib/stdlib.wasm
+external str_length = "__nx_string_length" : (s: string) -> i64
+
+// ─── String literal collection ──────────────────────────────────────────────
+
+let collect_atom_strings = fn (atom: LirAtom, acc: [string]) -> [string] do
+  match atom
+    case LirAtomString(val: s) -> Cons(v: s, rest: acc)
+    case _ -> acc
+  end
+end
+
+let collect_call_arg_strings = fn (args: [LirCallArg], acc: [string]) -> [string] do
+  match args
+    case Nil() -> acc
+    case Cons(v: LirCallArg(label: _, value: v), rest: rest) ->
+      collect_call_arg_strings(args: rest, acc: collect_atom_strings(atom: v, acc: acc))
+  end
+end
+
+let collect_atom_list_strings = fn (atoms: [LirAtom], acc: [string]) -> [string] do
+  match atoms
+    case Nil() -> acc
+    case Cons(v: a, rest: rest) ->
+      collect_atom_list_strings(atoms: rest, acc: collect_atom_strings(atom: a, acc: acc))
+  end
+end
+
+let collect_named_atom_strings = fn (fields: [LirNamedAtom], acc: [string]) -> [string] do
+  match fields
+    case Nil() -> acc
+    case Cons(v: LirNamedAtom(name: _, value: v), rest: rest) ->
+      collect_named_atom_strings(fields: rest, acc: collect_atom_strings(atom: v, acc: acc))
+  end
+end
+
+let collect_expr_strings = fn (expr: LirExpr, acc: [string]) -> [string] do
+  match expr
+    case LirExprAtom(atom: a) -> collect_atom_strings(atom: a, acc: acc)
+    case LirExprBinary(op: _, lhs: l, rhs: r, typ: _) ->
+      collect_atom_strings(atom: r, acc: collect_atom_strings(atom: l, acc: acc))
+    case LirExprCall(func: _, args: args, typ: _) -> collect_call_arg_strings(args: args, acc: acc)
+    case LirExprTailCall(func: _, args: args, typ: _) -> collect_call_arg_strings(args: args, acc: acc)
+    case LirExprConstructor(name: _, args: atoms, typ: _) -> collect_atom_list_strings(atoms: atoms, acc: acc)
+    case LirExprRecord(fields: fields, typ: _) -> collect_named_atom_strings(fields: fields, acc: acc)
+    case LirExprObjectTag(value: v, typ: _) -> collect_atom_strings(atom: v, acc: acc)
+    case LirExprObjectField(value: v, index: _, typ: _) -> collect_atom_strings(atom: v, acc: acc)
+    case LirExprRaise(value: v, typ: _) -> collect_atom_strings(atom: v, acc: acc)
+  end
+end
+
+let collect_stmt_strings = fn (stmt: LirStmt, acc: [string]) -> [string] do
+  match stmt
+    case LirStmtLet(name: _, typ: _, expr: e) ->
+      collect_expr_strings(expr: e, acc: acc)
+    case LirStmtIf(cond: c, then_body: tb, else_body: eb) ->
+      collect_stmts_strings(stmts: eb, acc: collect_stmts_strings(stmts: tb, acc: collect_atom_strings(atom: c, acc: acc)))
+    case LirStmtIfReturn(cond: c, then_body: tb, then_ret: tr, else_body: eb, else_ret: er, ret_type: _) ->
+      let acc2 = collect_stmts_strings(stmts: eb, acc: collect_atom_strings(atom: tr, acc: collect_stmts_strings(stmts: tb, acc: collect_atom_strings(atom: c, acc: acc))))
+      match er
+        case Some(val: a) -> collect_atom_strings(atom: a, acc: acc2)
+        case None() -> acc2
+      end
+    case LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
+      collect_stmts_strings(stmts: b, acc: collect_atom_strings(atom: c, acc: collect_stmts_strings(stmts: cs, acc: acc)))
+    case LirStmtTryCatch(body: b, body_ret: br, catch_param: _, catch_param_typ: _,
+                          catch_body: cb, catch_ret: cr) ->
+      let acc2 = match br
+        case Some(val: a) -> collect_atom_strings(atom: a, acc: collect_stmts_strings(stmts: b, acc: acc))
+        case None() -> collect_stmts_strings(stmts: b, acc: acc)
+      end
+      let acc3 = collect_stmts_strings(stmts: cb, acc: acc2)
+      match cr
+        case Some(val: a) -> collect_atom_strings(atom: a, acc: acc3)
+        case None() -> acc3
+      end
+  end
+end
+
+let collect_stmts_strings = fn (stmts: [LirStmt], acc: [string]) -> [string] do
+  match stmts
+    case Nil() -> acc
+    case Cons(v: s, rest: rest) ->
+      collect_stmts_strings(stmts: rest, acc: collect_stmt_strings(stmt: s, acc: acc))
+  end
+end
+
+let collect_func_strings = fn (func: LirFunction, acc: [string]) -> [string] do
+  match func
+    case LirFunction(name: _, params: _, ret_type: _, body: b, ret: r, span: _) ->
+      collect_atom_strings(atom: r, acc: collect_stmts_strings(stmts: b, acc: acc))
+  end
+end
+
+pub let collect_program_strings = fn (funcs: [LirFunction], acc: [string]) -> [string] do
+  match funcs
+    case Nil() -> acc
+    case Cons(v: f, rest: rest) ->
+      collect_program_strings(funcs: rest, acc: collect_func_strings(func: f, acc: acc))
+  end
+end
+
+// ─── String deduplication ───────────────────────────────────────────────────
+
+let string_already_seen = fn (s: string, entries: [StringEntry]) -> bool do
+  match entries
+    case Nil() -> false
+    case Cons(v: StringEntry(value: v, offset: _, slen: _), rest: rest) ->
+      if v == s then true
+      else string_already_seen(s: s, entries: rest)
+      end
+  end
+end
+
+pub let build_string_entries = fn (strings: [string], next_offset: i64, acc: [StringEntry]) -> [StringEntry] do
+  match strings
+    case Nil() -> list.reverse(xs: acc)
+    case Cons(v: s, rest: rest) ->
+      if string_already_seen(s: s, entries: acc) then
+        build_string_entries(strings: rest, next_offset: next_offset, acc: acc)
+      else
+        let slen = str_length(s: s)
+        build_string_entries(strings: rest, next_offset: next_offset + slen,
+                             acc: Cons(v: StringEntry(value: s, offset: next_offset, slen: slen), rest: acc))
+      end
+  end
+end
+
+pub let compute_last_string_end = fn (entries: [StringEntry]) -> i64 do
+  match entries
+    case Nil() -> string_data_base
+    case Cons(v: StringEntry(value: _, offset: off, slen: sl), rest: Nil()) -> off + sl
+    case Cons(v: _, rest: rest) -> compute_last_string_end(entries: rest)
+  end
+end
+
+// ─── Object heap detection ──────────────────────────────────────────────────
+
+let expr_uses_heap = fn (expr: LirExpr) -> bool do
+  match expr
+    case LirExprConstructor(name: _, args: _, typ: _) -> true
+    case LirExprRecord(fields: _, typ: _) -> true
+    case LirExprObjectTag(value: _, typ: _) -> true
+    case LirExprObjectField(value: _, index: _, typ: _) -> true
+    case LirExprBinary(op: OpConcat(), lhs: _, rhs: _, typ: _) -> true
+    case LirExprBinary(op: OpAdd(), lhs: _, rhs: _, typ: t) ->
+      match peel_linear(typ: t)
+        case TyString() -> true
+        case _ -> false
+      end
+    case _ -> false
+  end
+end
+
+let stmt_uses_heap = fn (stmt: LirStmt) -> bool do
+  match stmt
+    case LirStmtLet(name: _, typ: _, expr: e) -> expr_uses_heap(expr: e)
+    case LirStmtIf(cond: _, then_body: tb, else_body: eb) ->
+      stmts_use_heap(stmts: tb) || stmts_use_heap(stmts: eb)
+    case LirStmtIfReturn(cond: _, then_body: tb, then_ret: _, else_body: eb, else_ret: _, ret_type: _) ->
+      stmts_use_heap(stmts: tb) || stmts_use_heap(stmts: eb)
+    case LirStmtLoop(cond_stmts: cs, cond: _, body: b) ->
+      stmts_use_heap(stmts: cs) || stmts_use_heap(stmts: b)
+    case LirStmtTryCatch(body: b, body_ret: _, catch_param: _, catch_param_typ: _,
+                          catch_body: cb, catch_ret: _) ->
+      stmts_use_heap(stmts: b) || stmts_use_heap(stmts: cb)
+  end
+end
+
+let stmts_use_heap = fn (stmts: [LirStmt]) -> bool do
+  match stmts
+    case Nil() -> false
+    case Cons(v: s, rest: rest) ->
+      if stmt_uses_heap(stmt: s) then true
+      else stmts_use_heap(stmts: rest)
+      end
+  end
+end
+
+pub let program_uses_heap = fn (funcs: [LirFunction]) -> bool do
+  match funcs
+    case Nil() -> false
+    case Cons(v: LirFunction(name: _, params: _, ret_type: _, body: b, ret: _, span: _), rest: rest) ->
+      if stmts_use_heap(stmts: b) then true
+      else program_uses_heap(funcs: rest)
+      end
+  end
+end
+
+// ─── External ABI helpers ───────────────────────────────────────────────────
+
+let ext_param_is_string = fn (typ: TypeExpr) -> bool do
+  match peel_linear(typ: typ)
+    case TyString() -> true
+    case _ -> false
+  end
+end
+
+let external_uses_string_abi = fn (ext: LirExternal) -> bool do
+  match ext
+    case LirExternal(name: _, wasm_module: _, wasm_name: _, params: ps, ret_type: rt, throw_row: _) ->
+      if ext_param_is_string(typ: rt) then true
+      else ext_params_use_string(params: ps)
+      end
+  end
+end
+
+let ext_params_use_string = fn (params: [LirParam]) -> bool do
+  match params
+    case Nil() -> false
+    case Cons(v: LirParam(label: _, name: _, typ: t), rest: rest) ->
+      if ext_param_is_string(typ: t) then true
+      else ext_params_use_string(params: rest)
+      end
+  end
+end
+
+pub let count_ext_param_slots = fn (params: [LirParam]) -> i64 do
+  match params
+    case Nil() -> 0
+    case Cons(v: LirParam(label: _, name: _, typ: t), rest: rest) ->
+      let slots = match peel_linear(typ: t)
+        case TyString() -> 2
+        case TyArray(elem: _) -> 2
+        case _ -> 1
+      end
+      slots + count_ext_param_slots(params: rest)
+  end
+end
+
+// ─── Memory mode ────────────────────────────────────────────────────────────
+
+let find_string_abi_module = fn (exts: [LirExternal]) -> Option<string> do
+  match exts
+    case Nil() -> None()
+    case Cons(v: e, rest: rest) ->
+      if external_uses_string_abi(ext: e) then
+        match e
+          case LirExternal(name: _, wasm_module: m, wasm_name: _, params: _, ret_type: _, throw_row: _) ->
+            Some(val: m)
+        end
+      else find_string_abi_module(exts: rest)
+      end
+  end
+end
+
+pub let choose_memory_mode = fn (externals: [LirExternal], has_strings: bool, has_heap: bool) -> string do
+  match find_string_abi_module(exts: externals)
+    case None() ->
+      if has_strings || has_heap then "defined"
+      else "none"
+      end
+    case Some(val: m) -> m
+  end
+end
+
+pub let align8 = fn (v: i64) -> i64 do
+  return (v + 7) / 8 * 8
+end
+
+// ─── Local variable collection ──────────────────────────────────────────────
+
+pub let register_local = fn (name: string, typ: TypeExpr, locals: [LocalEntry], next_idx: i64)
+    -> { locals: [LocalEntry], next_idx: i64 } do
+  if is_unit(typ: typ) then
+    return { locals: locals, next_idx: next_idx }
+  end
+  if lookup_local(name: name, entries: locals) >= 0 then
+    return { locals: locals, next_idx: next_idx }
+  else
+    let vt = type_to_valtype(typ: typ)
+    return { locals: Cons(v: LocalEntry(name: name, index: next_idx, valtype: vt), rest: locals), next_idx: next_idx + 1 }
+  end
+end
+
+pub let collect_local_stmts = fn (stmts: [LirStmt], locals: [LocalEntry], next_idx: i64)
+    -> { locals: [LocalEntry], next_idx: i64 } do
+  match stmts
+    case Nil() -> { locals: locals, next_idx: next_idx }
+    case Cons(v: s, rest: rest) ->
+      let r = collect_local_stmt(stmt: s, locals: locals, next_idx: next_idx)
+      collect_local_stmts(stmts: rest, locals: r.locals, next_idx: r.next_idx)
+  end
+end
+
+pub let collect_local_stmt = fn (stmt: LirStmt, locals: [LocalEntry], next_idx: i64)
+    -> { locals: [LocalEntry], next_idx: i64 } do
+  match stmt
+    case LirStmtLet(name: n, typ: t, expr: _) ->
+      register_local(name: n, typ: t, locals: locals, next_idx: next_idx)
+    case LirStmtIf(cond: _, then_body: tb, else_body: eb) ->
+      let r = collect_local_stmts(stmts: tb, locals: locals, next_idx: next_idx)
+      collect_local_stmts(stmts: eb, locals: r.locals, next_idx: r.next_idx)
+    case LirStmtIfReturn(cond: _, then_body: tb, then_ret: _, else_body: eb, else_ret: _, ret_type: _) ->
+      let r = collect_local_stmts(stmts: tb, locals: locals, next_idx: next_idx)
+      collect_local_stmts(stmts: eb, locals: r.locals, next_idx: r.next_idx)
+    case LirStmtLoop(cond_stmts: cs, cond: _, body: b) ->
+      let r = collect_local_stmts(stmts: cs, locals: locals, next_idx: next_idx)
+      collect_local_stmts(stmts: b, locals: r.locals, next_idx: r.next_idx)
+    case LirStmtTryCatch(body: b, body_ret: _, catch_param: cp, catch_param_typ: cpt,
+                          catch_body: cb, catch_ret: _) ->
+      let r = register_local(name: cp, typ: cpt, locals: locals, next_idx: next_idx)
+      let r2 = collect_local_stmts(stmts: b, locals: r.locals, next_idx: r.next_idx)
+      collect_local_stmts(stmts: cb, locals: r2.locals, next_idx: r2.next_idx)
+  end
+end

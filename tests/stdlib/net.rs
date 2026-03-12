@@ -1,4 +1,4 @@
-use crate::common::check::{should_fail_typecheck, should_typecheck};
+use crate::harness::{should_fail_typecheck, should_typecheck};
 
 static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

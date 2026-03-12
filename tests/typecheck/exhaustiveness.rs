@@ -1,4 +1,4 @@
-use crate::common::check::{should_fail_typecheck, should_typecheck};
+use crate::harness::{should_fail_typecheck, should_typecheck};
 use nexus::lang::ast::*;
 use nexus::lang::typecheck::TypeChecker;
 use proptest::prelude::*;

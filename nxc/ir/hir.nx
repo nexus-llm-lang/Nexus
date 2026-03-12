@@ -1,0 +1,706 @@
+/**
+ * hir: AST -> HIR conversion + reachability analysis.
+ *
+ * Type definitions live in nxc/ir/hir_types.nx.
+ * This file handles:
+ * - AST expression/statement/pattern conversion to HIR
+ * - Top-level definition processing (functions, externals, handlers, ports)
+ * - Reachability analysis (worklist from "main")
+ * - Dead code filtering
+ */
+import { Span } from nxc/common/token.nx
+import { Sigil, SigilMutable, TypeExpr, TyUnit, TyArrow,
+         Expr, ExprLiteral, ExprVariable, ExprBinaryOp, ExprBorrow,
+         ExprCall, ExprConstructor, ExprRecord, ExprArray, ExprIndex,
+         ExprFieldAccess, ExprIf, ExprMatch, ExprWhile, ExprFor,
+         ExprLambda, ExprRaise, ExprExternal, ExprHandler, ExprList,
+         Stmt, StmtLet, StmtExpr, StmtReturn, StmtAssign, StmtConc,
+         StmtTry, StmtInject,
+         Pattern, PatLiteral, PatVariable, PatConstructor, PatRecord, PatWildcard,
+         SpannedExpr, SpannedStmt, SpannedPattern, SpannedTopLevel,
+         Param, Function, MatchCase, CallArg, CtorArg, NamedExpr,
+         NamedType, CtorPatternField, RecordPatField,
+         EnumDef, ImportDef, FunctionSig, Port, GlobalLet,
+         TopLevel, TLImport, TLLet, TLPort, TLEnum, TLTypeDef, TLException } from nxc/common/ast.nx
+import { RenameEntry, rename } from nxc/ir/symtab.nx
+import { HirParam, HirPortMethod, HirPort, HirExternal,
+         HirExpr, HirLiteral, HirVariable, HirBinaryOp, HirBorrow,
+         HirCall, HirConstructor, HirRecord, HirArray, HirIndex,
+         HirFieldAccess, HirIf, HirMatch, HirWhile, HirFor,
+         HirLambda, HirRaise, HirExternal_, HirHandler,
+         HirCallArg, HirNamedExpr,
+         HirStmt, HirStmtLet, HirStmtExpr, HirStmtReturn, HirStmtAssign,
+         HirStmtConc, HirStmtTry, HirStmtInject,
+         HirMatchCase, HirPattern, HirPatLiteral, HirPatVariable,
+         HirPatConstructor, HirPatRecord, HirPatWildcard,
+         HirPatternField, HirRecordPatField,
+         HirFunction, HirHandlerBinding, HirHandlerBindingEntry,
+         HirProgram, HirAccum } from nxc/ir/hir_types.nx
+
+// ─── AST -> HIR Conversion ──────────────────────────────────────────────────
+
+/// Convert an AST expression (SpannedExpr) to HIR.
+pub let convert_expr = fn (expr: SpannedExpr, entries: [RenameEntry]) -> HirExpr do
+  match expr
+    case SpannedExpr(node: ExprLiteral(lit: lit), span: _) ->
+      return HirLiteral(lit: lit)
+    case SpannedExpr(node: ExprVariable(name: name, sigil: sig), span: _) ->
+      return HirVariable(name: rename(name: name, entries: entries), sigil: sig)
+    case SpannedExpr(node: ExprBinaryOp(left: l, op: op, right: r), span: _) ->
+      return HirBinaryOp(
+        left: convert_expr(expr: l, entries: entries),
+        op: op,
+        right: convert_expr(expr: r, entries: entries)
+      )
+    case SpannedExpr(node: ExprBorrow(name: name, sigil: sig), span: _) ->
+      return HirBorrow(name: rename(name: name, entries: entries), sigil: sig)
+    case SpannedExpr(node: ExprCall(func: f, args: args), span: _) ->
+      return HirCall(
+        func: rename(name: f, entries: entries),
+        args: convert_call_args(args: args, entries: entries)
+      )
+    case SpannedExpr(node: ExprConstructor(name: v, args: args), span: _) ->
+      return HirConstructor(
+        variant: rename(name: v, entries: entries),
+        args: convert_ctor_args(args: args, entries: entries)
+      )
+    case SpannedExpr(node: ExprRecord(fields: fs), span: _) ->
+      return HirRecord(fields: convert_named_exprs(exprs: fs, entries: entries))
+    case SpannedExpr(node: ExprArray(elements: es), span: _) ->
+      return HirArray(elems: convert_expr_list(exprs: es, entries: entries))
+    case SpannedExpr(node: ExprIndex(target: t, index: i), span: _) ->
+      return HirIndex(
+        target: convert_expr(expr: t, entries: entries),
+        index: convert_expr(expr: i, entries: entries)
+      )
+    case SpannedExpr(node: ExprFieldAccess(target: t, field: f), span: _) ->
+      return HirFieldAccess(target: convert_expr(expr: t, entries: entries), field: f)
+    case SpannedExpr(node: ExprIf(cond: c, then_branch: tb, else_branch: eb), span: _) ->
+      let hir_else = match eb
+        case Nil() -> None()
+        case Cons(v: _, rest: _) -> Some(val: convert_stmts(stmts: eb, entries: entries))
+      end
+      return HirIf(
+        cond: convert_expr(expr: c, entries: entries),
+        then_branch: convert_stmts(stmts: tb, entries: entries),
+        else_branch: hir_else
+      )
+    case SpannedExpr(node: ExprMatch(target: t, cases: cs), span: _) ->
+      return HirMatch(
+        target: convert_expr(expr: t, entries: entries),
+        cases: convert_match_cases(cases: cs, entries: entries)
+      )
+    case SpannedExpr(node: ExprWhile(cond: c, body: b), span: _) ->
+      return HirWhile(
+        cond: convert_expr(expr: c, entries: entries),
+        body: convert_stmts(stmts: b, entries: entries)
+      )
+    case SpannedExpr(node: ExprFor(var: v, start: s, end_expr: e, body: b), span: _) ->
+      return HirFor(
+        var: v,
+        start: convert_expr(expr: s, entries: entries),
+        end_expr: convert_expr(expr: e, entries: entries),
+        body: convert_stmts(stmts: b, entries: entries)
+      )
+    case SpannedExpr(node: ExprLambda(type_params: _, params: ps, ret_type: rt, requires: _, throw_row: _, body: b), span: _) ->
+      return HirLambda(
+        params: convert_params(params: ps),
+        ret_type: rt,
+        body: convert_stmts(stmts: b, entries: entries)
+      )
+    case SpannedExpr(node: ExprRaise(value: e), span: _) ->
+      return HirRaise(expr: convert_expr(expr: e, entries: entries))
+    case SpannedExpr(node: ExprExternal(symbol: sym, arg_names: names, typ: t), span: _) ->
+      return HirExternal_(symbol: sym, arg_names: names, typ: t)
+    case SpannedExpr(node: ExprHandler(coeffect_name: _, requires: _, functions: fs), span: _) ->
+      return HirHandler(functions: convert_functions(funcs: fs, entries: entries))
+    case SpannedExpr(node: ExprList(elements: es), span: _) ->
+      return desugar_list(elems: es, entries: entries)
+  end
+end
+
+/// Desugar [a, b, c] -> Cons(a, Cons(b, Cons(c, Nil)))
+let desugar_list = fn (elems: [SpannedExpr], entries: [RenameEntry]) -> HirExpr do
+  match elems
+    case Nil() -> return HirConstructor(variant: "Nil", args: Nil())
+    case Cons(v: e, rest: rest) ->
+      let head = convert_expr(expr: e, entries: entries)
+      let tail = desugar_list(elems: rest, entries: entries)
+      return HirConstructor(variant: "Cons",
+        args: Cons(v: head, rest: Cons(v: tail, rest: Nil())))
+  end
+end
+
+let convert_call_args = fn (args: [CallArg], entries: [RenameEntry]) -> [HirCallArg] do
+  match args
+    case Nil() -> return Nil()
+    case Cons(v: CallArg(name: l, value: v), rest: rest) ->
+      return Cons(
+        v: HirCallArg(label: l, value: convert_expr(expr: v, entries: entries)),
+        rest: convert_call_args(args: rest, entries: entries)
+      )
+  end
+end
+
+let convert_ctor_args = fn (args: [CtorArg], entries: [RenameEntry]) -> [HirExpr] do
+  match args
+    case Nil() -> return Nil()
+    case Cons(v: CtorArg(name: _, value: v), rest: rest) ->
+      return Cons(
+        v: convert_expr(expr: v, entries: entries),
+        rest: convert_ctor_args(args: rest, entries: entries)
+      )
+  end
+end
+
+let convert_named_exprs = fn (exprs: [NamedExpr], entries: [RenameEntry]) -> [HirNamedExpr] do
+  match exprs
+    case Nil() -> return Nil()
+    case Cons(v: NamedExpr(name: n, value: v), rest: rest) ->
+      return Cons(
+        v: HirNamedExpr(name: n, value: convert_expr(expr: v, entries: entries)),
+        rest: convert_named_exprs(exprs: rest, entries: entries)
+      )
+  end
+end
+
+let convert_expr_list = fn (exprs: [SpannedExpr], entries: [RenameEntry]) -> [HirExpr] do
+  match exprs
+    case Nil() -> return Nil()
+    case Cons(v: e, rest: rest) ->
+      return Cons(
+        v: convert_expr(expr: e, entries: entries),
+        rest: convert_expr_list(exprs: rest, entries: entries)
+      )
+  end
+end
+
+// ─── Statement Conversion ───────────────────────────────────────────────────
+
+/// Convert AST statements to HIR statements.
+pub let convert_stmts = fn (stmts: [SpannedStmt], entries: [RenameEntry]) -> [HirStmt] do
+  match stmts
+    case Nil() -> return Nil()
+    case Cons(v: SpannedStmt(node: StmtLet(name: n, sigil: _, typ: t, value: v), span: _), rest: rest) ->
+      return Cons(
+        v: HirStmtLet(name: n, typ: t, value: convert_expr(expr: v, entries: entries)),
+        rest: convert_stmts(stmts: rest, entries: entries)
+      )
+    case Cons(v: SpannedStmt(node: StmtExpr(expr: e), span: _), rest: rest) ->
+      return Cons(
+        v: HirStmtExpr(expr: convert_expr(expr: e, entries: entries)),
+        rest: convert_stmts(stmts: rest, entries: entries)
+      )
+    case Cons(v: SpannedStmt(node: StmtReturn(value: e), span: _), rest: rest) ->
+      return Cons(
+        v: HirStmtReturn(expr: convert_expr(expr: e, entries: entries)),
+        rest: convert_stmts(stmts: rest, entries: entries)
+      )
+    case Cons(v: SpannedStmt(node: StmtAssign(target: t, value: v), span: _), rest: rest) ->
+      return Cons(
+        v: HirStmtAssign(
+          target: HirVariable(name: rename(name: t, entries: entries), sigil: SigilMutable()),
+          value: convert_expr(expr: v, entries: entries)
+        ),
+        rest: convert_stmts(stmts: rest, entries: entries)
+      )
+    case Cons(v: SpannedStmt(node: StmtConc(tasks: tasks), span: _), rest: rest) ->
+      return Cons(
+        v: HirStmtConc(tasks: convert_functions(funcs: tasks, entries: entries)),
+        rest: convert_stmts(stmts: rest, entries: entries)
+      )
+    case Cons(v: SpannedStmt(node: StmtTry(body: b, catch_param: p, catch_body: cb), span: _), rest: rest) ->
+      return Cons(
+        v: HirStmtTry(
+          body: convert_stmts(stmts: b, entries: entries),
+          catch_param: p,
+          catch_body: convert_stmts(stmts: cb, entries: entries)
+        ),
+        rest: convert_stmts(stmts: rest, entries: entries)
+      )
+    case Cons(v: SpannedStmt(node: StmtInject(handlers: hs, body: b), span: _), rest: rest) ->
+      let handler_names = extract_handler_names(exprs: hs)
+      let qualified_handlers = rename_strings(names: handler_names, entries: entries)
+      return Cons(
+        v: HirStmtInject(
+          handlers: qualified_handlers,
+          body: convert_stmts(stmts: b, entries: entries)
+        ),
+        rest: convert_stmts(stmts: rest, entries: entries)
+      )
+  end
+end
+
+let rename_strings = fn (names: [string], entries: [RenameEntry]) -> [string] do
+  match names
+    case Nil() -> return Nil()
+    case Cons(v: n, rest: rest) ->
+      return Cons(v: rename(name: n, entries: entries),
+                  rest: rename_strings(names: rest, entries: entries))
+  end
+end
+
+/// Extract handler variable names from inject handler expressions.
+let extract_handler_names = fn (exprs: [SpannedExpr]) -> [string] do
+  match exprs
+    case Nil() -> return Nil()
+    case Cons(v: SpannedExpr(node: ExprVariable(name: name, sigil: _), span: _), rest: rest) ->
+      return Cons(v: name, rest: extract_handler_names(exprs: rest))
+    case Cons(v: _, rest: rest) ->
+      return extract_handler_names(exprs: rest)
+  end
+end
+
+// ─── Pattern Conversion ─────────────────────────────────────────────────────
+
+/// Convert match cases to HIR.
+let convert_match_cases = fn (cases: [MatchCase], entries: [RenameEntry]) -> [HirMatchCase] do
+  match cases
+    case Nil() -> return Nil()
+    case Cons(v: MatchCase(pattern: p, body: b), rest: rest) ->
+      return Cons(
+        v: HirMatchCase(
+          pattern: convert_pattern(pat: p, entries: entries),
+          body: convert_stmts(stmts: b, entries: entries)
+        ),
+        rest: convert_match_cases(cases: rest, entries: entries)
+      )
+  end
+end
+
+/// Convert a pattern to HIR pattern.
+pub let convert_pattern = fn (pat: SpannedPattern, entries: [RenameEntry]) -> HirPattern do
+  match pat
+    case SpannedPattern(node: PatLiteral(lit: lit), span: _) ->
+      return HirPatLiteral(lit: lit)
+    case SpannedPattern(node: PatVariable(name: name, sigil: sig), span: _) ->
+      return HirPatVariable(name: name, sigil: sig)
+    case SpannedPattern(node: PatConstructor(name: v, fields: fs), span: _) ->
+      return HirPatConstructor(
+        variant: rename(name: v, entries: entries),
+        fields: convert_pattern_fields(fs: fs, entries: entries)
+      )
+    case SpannedPattern(node: PatRecord(fields: fs, has_wildcard: p), span: _) ->
+      return HirPatRecord(
+        fields: convert_record_pat_fields(fs: fs, entries: entries),
+        is_partial: p
+      )
+    case SpannedPattern(node: PatWildcard, span: _) ->
+      return HirPatWildcard()
+  end
+end
+
+let convert_pattern_fields = fn (fs: [CtorPatternField], entries: [RenameEntry]) -> [HirPatternField] do
+  match fs
+    case Nil() -> return Nil()
+    case Cons(v: CtorPatternField(name: n, pattern: p), rest: rest) ->
+      return Cons(
+        v: HirPatternField(name: n, pattern: convert_pattern(pat: p, entries: entries)),
+        rest: convert_pattern_fields(fs: rest, entries: entries)
+      )
+  end
+end
+
+let convert_record_pat_fields = fn (fs: [RecordPatField], entries: [RenameEntry]) -> [HirRecordPatField] do
+  match fs
+    case Nil() -> return Nil()
+    case Cons(v: RecordPatField(name: n, pattern: p), rest: rest) ->
+      return Cons(
+        v: HirRecordPatField(name: n, pattern: convert_pattern(pat: p, entries: entries)),
+        rest: convert_record_pat_fields(fs: rest, entries: entries)
+      )
+  end
+end
+
+// ─── Param / Function Conversion ────────────────────────────────────────────
+
+/// Convert AST params to HIR params.
+let convert_params = fn (params: [Param]) -> [HirParam] do
+  match params
+    case Nil() -> return Nil()
+    case Cons(v: Param(name: n, sigil: _, typ: t), rest: rest) ->
+      return Cons(
+        v: HirParam(name: n, label: n, typ: t),
+        rest: convert_params(params: rest)
+      )
+  end
+end
+
+/// Convert AST functions to HIR functions.
+let convert_functions = fn (funcs: [Function], entries: [RenameEntry]) -> [HirFunction] do
+  match funcs
+    case Nil() -> return Nil()
+    case Cons(v: Function(name: n, is_public: _, type_params: _, params: ps, ret_type: rt, requires: _, throw_row: _, body: b), rest: rest) ->
+      return Cons(
+        v: HirFunction(
+          name: n,
+          params: convert_params(params: ps),
+          ret_type: rt,
+          body: convert_stmts(stmts: b, entries: entries),
+          span: Span(offset: 0, line: 0, col: 0)
+        ),
+        rest: convert_functions(funcs: rest, entries: entries)
+      )
+  end
+end
+
+// ─── Top-level definition processing ────────────────────────────────────────
+
+/// Create an empty HirAccum.
+pub let empty_accum = fn () -> HirAccum do
+  return HirAccum(
+    ports: Nil(), functions: Nil(), externals: Nil(),
+    handler_bindings: Nil(), enum_defs: Nil(), wasm_module: None()
+  )
+end
+
+/// Process a list of top-level definitions into HIR components.
+pub let process_defs = fn (defs: [SpannedTopLevel], entries: [RenameEntry], accum: HirAccum) -> HirAccum do
+  match defs
+    case Nil() -> return accum
+    case Cons(v: SpannedTopLevel(node: node, span: sp), rest: rest) ->
+      let new_accum = process_top_level(node: node, span: sp, entries: entries, accum: accum)
+      return process_defs(defs: rest, entries: entries, accum: new_accum)
+  end
+end
+
+let process_top_level = fn (node: TopLevel, span: Span, entries: [RenameEntry], accum: HirAccum) -> HirAccum do
+  match accum
+    case HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod) ->
+      match node
+        case TLImport(def: ImportDef(path: path, alias: _, items: _, is_external: is_ext)) ->
+          if is_ext then
+            return HirAccum(ports: ps, functions: fs, externals: exts,
+              handler_bindings: hbs, enum_defs: eds, wasm_module: Some(val: path))
+          else
+            return accum
+          end
+        case TLLet(def: GlobalLet(name: name, is_public: _, typ: _, value: val)) ->
+          let qname = rename(name: name, entries: entries)
+          let hir_val = convert_expr(expr: val, entries: entries)
+          match hir_val
+            case HirHandler(functions: handler_funcs) ->
+              let binding = synthesize_handler(
+                binding_name: qname, functions: handler_funcs)
+              return HirAccum(ports: ps, functions: fs, externals: exts,
+                handler_bindings: Cons(v: binding, rest: hbs),
+                enum_defs: eds, wasm_module: wmod)
+            case HirLambda(params: lps, ret_type: rt, body: body) ->
+              let func = HirFunction(name: qname, params: lps, ret_type: rt, body: body, span: span)
+              return HirAccum(ports: ps, functions: Cons(v: func, rest: fs),
+                externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod)
+            case HirExternal_(symbol: sym, arg_names: anames, typ: t) ->
+              match wmod
+                case Some(val: wm) ->
+                  let ext = make_hir_external(name: qname, wasm_module: wm,
+                    wasm_name: sym, arg_names: anames, typ: t)
+                  return HirAccum(ports: ps, functions: fs,
+                    externals: Cons(v: ext, rest: exts),
+                    handler_bindings: hbs, enum_defs: eds, wasm_module: wmod)
+                case None() ->
+                  return accum
+              end
+            case _ ->
+              let func = HirFunction(
+                name: qname, params: Nil(), ret_type: TyUnit(),
+                body: Cons(v: HirStmtReturn(expr: hir_val), rest: Nil()),
+                span: span)
+              return HirAccum(ports: ps, functions: Cons(v: func, rest: fs),
+                externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod)
+          end
+        case TLPort(def: Port(name: pname, is_public: _, functions: sigs)) ->
+          let qname = rename(name: pname, entries: entries)
+          let hir_port = HirPort(name: qname, methods: convert_port_sigs(sigs: sigs))
+          return HirAccum(ports: Cons(v: hir_port, rest: ps), functions: fs,
+            externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod)
+        case TLEnum(def: ed) ->
+          return HirAccum(ports: ps, functions: fs, externals: exts,
+            handler_bindings: hbs,
+            enum_defs: Cons(v: ed, rest: eds), wasm_module: wmod)
+        case TLTypeDef(def: _) -> return accum
+        case TLException(def: _) -> return accum
+      end
+  end
+end
+
+/// Build HirExternal from an external declaration's type arrow.
+let make_hir_external = fn (name: string, wasm_module: string, wasm_name: string, arg_names: [string], typ: TypeExpr) -> HirExternal do
+  match typ
+    case TyArrow(params: params, ret: ret, requires: _, throw_row: tw) ->
+      return HirExternal(name: name, wasm_module: wasm_module, wasm_name: wasm_name,
+        params: named_types_to_hir_params(nts: params),
+        ret_type: ret, throw_row: tw)
+    case _ ->
+      return HirExternal(name: name, wasm_module: wasm_module, wasm_name: wasm_name,
+        params: Nil(), ret_type: typ, throw_row: TyUnit())
+  end
+end
+
+let named_types_to_hir_params = fn (nts: [NamedType]) -> [HirParam] do
+  match nts
+    case Nil() -> return Nil()
+    case Cons(v: NamedType(name: n, typ: t), rest: rest) ->
+      return Cons(
+        v: HirParam(name: n, label: n, typ: t),
+        rest: named_types_to_hir_params(nts: rest))
+  end
+end
+
+let convert_port_sigs = fn (sigs: [FunctionSig]) -> [HirPortMethod] do
+  match sigs
+    case Nil() -> return Nil()
+    case Cons(v: FunctionSig(name: n, params: _, ret_type: _, requires: _, throw_row: _), rest: rest) ->
+      return Cons(v: HirPortMethod(name: n), rest: convert_port_sigs(sigs: rest))
+  end
+end
+
+/// Synthesize handler binding: create named function entries for each method.
+let synthesize_handler = fn (binding_name: string, functions: [HirFunction]) -> HirHandlerBindingEntry do
+  let synth_funcs = synthesize_handler_funcs(binding_name: binding_name, functions: functions)
+  return HirHandlerBindingEntry(
+    name: binding_name,
+    binding: HirHandlerBinding(port_name: binding_name, functions: synth_funcs)
+  )
+end
+
+let synthesize_handler_funcs = fn (binding_name: string, functions: [HirFunction]) -> [HirFunction] do
+  match functions
+    case Nil() -> return Nil()
+    case Cons(v: HirFunction(name: n, params: ps, ret_type: rt, body: b, span: sp), rest: rest) ->
+      let synth_name = "__handler_" ++ binding_name ++ "_" ++ n
+      return Cons(
+        v: HirFunction(name: synth_name, params: ps, ret_type: rt, body: b, span: sp),
+        rest: synthesize_handler_funcs(binding_name: binding_name, functions: rest)
+      )
+  end
+end
+
+// ─── Reachability Analysis ──────────────────────────────────────────────────
+
+/// Collect all function names called from a list of HIR statements.
+pub let collect_calls_stmts = fn (stmts: [HirStmt]) -> [string] do
+  match stmts
+    case Nil() -> return Nil()
+    case Cons(v: s, rest: rest) ->
+      let calls = collect_calls_stmt(stmt: s)
+      return concat_str_lists(a: calls, b: collect_calls_stmts(stmts: rest))
+  end
+end
+
+let collect_calls_stmt = fn (stmt: HirStmt) -> [string] do
+  match stmt
+    case HirStmtLet(name: _, typ: _, value: v) -> return collect_calls_expr(expr: v)
+    case HirStmtExpr(expr: e) -> return collect_calls_expr(expr: e)
+    case HirStmtReturn(expr: e) -> return collect_calls_expr(expr: e)
+    case HirStmtAssign(target: t, value: v) ->
+      return concat_str_lists(a: collect_calls_expr(expr: t), b: collect_calls_expr(expr: v))
+    case HirStmtConc(tasks: ts) -> return collect_calls_functions(funcs: ts)
+    case HirStmtTry(body: b, catch_param: _, catch_body: cb) ->
+      return concat_str_lists(a: collect_calls_stmts(stmts: b), b: collect_calls_stmts(stmts: cb))
+    case HirStmtInject(handlers: hs, body: b) ->
+      return concat_str_lists(a: hs, b: collect_calls_stmts(stmts: b))
+  end
+end
+
+let collect_calls_expr = fn (expr: HirExpr) -> [string] do
+  match expr
+    case HirLiteral(lit: _) -> return Nil()
+    case HirVariable(name: _, sigil: _) -> return Nil()
+    case HirBinaryOp(left: l, op: _, right: r) ->
+      return concat_str_lists(a: collect_calls_expr(expr: l), b: collect_calls_expr(expr: r))
+    case HirBorrow(name: _, sigil: _) -> return Nil()
+    case HirCall(func: f, args: args) ->
+      return Cons(v: f, rest: collect_calls_args(args: args))
+    case HirConstructor(variant: _, args: args) -> return collect_calls_expr_list(exprs: args)
+    case HirRecord(fields: fs) -> return collect_calls_named_exprs(exprs: fs)
+    case HirArray(elems: es) -> return collect_calls_expr_list(exprs: es)
+    case HirIndex(target: t, index: i) ->
+      return concat_str_lists(a: collect_calls_expr(expr: t), b: collect_calls_expr(expr: i))
+    case HirFieldAccess(target: t, field: _) -> return collect_calls_expr(expr: t)
+    case HirIf(cond: c, then_branch: tb, else_branch: eb) ->
+      let base = concat_str_lists(a: collect_calls_expr(expr: c), b: collect_calls_stmts(stmts: tb))
+      match eb
+        case Some(val: stmts) -> return concat_str_lists(a: base, b: collect_calls_stmts(stmts: stmts))
+        case None() -> return base
+      end
+    case HirMatch(target: t, cases: cs) ->
+      return concat_str_lists(a: collect_calls_expr(expr: t), b: collect_calls_cases(cases: cs))
+    case HirWhile(cond: c, body: b) ->
+      return concat_str_lists(a: collect_calls_expr(expr: c), b: collect_calls_stmts(stmts: b))
+    case HirFor(var: _, start: s, end_expr: e, body: b) ->
+      return concat_str_lists(
+        a: collect_calls_expr(expr: s),
+        b: concat_str_lists(a: collect_calls_expr(expr: e), b: collect_calls_stmts(stmts: b))
+      )
+    case HirLambda(params: _, ret_type: _, body: b) -> return collect_calls_stmts(stmts: b)
+    case HirRaise(expr: e) -> return collect_calls_expr(expr: e)
+    case HirExternal_(symbol: _, arg_names: _, typ: _) -> return Nil()
+    case HirHandler(functions: fs) -> return collect_calls_functions(funcs: fs)
+  end
+end
+
+let collect_calls_args = fn (args: [HirCallArg]) -> [string] do
+  match args
+    case Nil() -> return Nil()
+    case Cons(v: HirCallArg(label: _, value: v), rest: rest) ->
+      return concat_str_lists(a: collect_calls_expr(expr: v), b: collect_calls_args(args: rest))
+  end
+end
+
+let collect_calls_named_exprs = fn (exprs: [HirNamedExpr]) -> [string] do
+  match exprs
+    case Nil() -> return Nil()
+    case Cons(v: HirNamedExpr(name: _, value: v), rest: rest) ->
+      return concat_str_lists(a: collect_calls_expr(expr: v), b: collect_calls_named_exprs(exprs: rest))
+  end
+end
+
+let collect_calls_expr_list = fn (exprs: [HirExpr]) -> [string] do
+  match exprs
+    case Nil() -> return Nil()
+    case Cons(v: e, rest: rest) ->
+      return concat_str_lists(a: collect_calls_expr(expr: e), b: collect_calls_expr_list(exprs: rest))
+  end
+end
+
+let collect_calls_cases = fn (cases: [HirMatchCase]) -> [string] do
+  match cases
+    case Nil() -> return Nil()
+    case Cons(v: HirMatchCase(pattern: _, body: b), rest: rest) ->
+      return concat_str_lists(a: collect_calls_stmts(stmts: b), b: collect_calls_cases(cases: rest))
+  end
+end
+
+let collect_calls_functions = fn (funcs: [HirFunction]) -> [string] do
+  match funcs
+    case Nil() -> return Nil()
+    case Cons(v: HirFunction(name: _, params: _, ret_type: _, body: b, span: _), rest: rest) ->
+      return concat_str_lists(a: collect_calls_stmts(stmts: b), b: collect_calls_functions(funcs: rest))
+  end
+end
+
+/// Worklist reachability: starting from "main", collect all transitively called functions.
+pub let collect_reachable = fn (functions: [HirFunction], handler_bindings: [HirHandlerBindingEntry]) -> [string] do
+  let worklist = Cons(v: "main", rest: Nil())
+  return reachable_go(worklist: worklist, visited: Nil(), functions: functions, handler_bindings: handler_bindings)
+end
+
+let reachable_go = fn (worklist: [string], visited: [string], functions: [HirFunction], handler_bindings: [HirHandlerBindingEntry]) -> [string] do
+  match worklist
+    case Nil() -> return visited
+    case Cons(v: name, rest: rest) ->
+      if str_in_list(s: name, xs: visited) then
+        return reachable_go(worklist: rest, visited: visited, functions: functions, handler_bindings: handler_bindings)
+      else
+        let new_visited = Cons(v: name, rest: visited)
+        let calls = find_calls_for_name(name: name, functions: functions, handler_bindings: handler_bindings)
+        let new_worklist = concat_str_lists(a: calls, b: rest)
+        return reachable_go(worklist: new_worklist, visited: new_visited, functions: functions, handler_bindings: handler_bindings)
+      end
+  end
+end
+
+let find_calls_for_name = fn (name: string, functions: [HirFunction], handler_bindings: [HirHandlerBindingEntry]) -> [string] do
+  let func = find_function(name: name, functions: functions)
+  match func
+    case Some(val: HirFunction(name: _, params: _, ret_type: _, body: b, span: _)) ->
+      return collect_calls_stmts(stmts: b)
+    case None() ->
+      return find_calls_in_handlers(name: name, bindings: handler_bindings)
+  end
+end
+
+let find_function = fn (name: string, functions: [HirFunction]) -> Option<HirFunction> do
+  match functions
+    case Nil() -> return None()
+    case Cons(v: f, rest: rest) ->
+      match f
+        case HirFunction(name: n, params: _, ret_type: _, body: _, span: _) ->
+          if n == name then return Some(val: f)
+          else return find_function(name: name, functions: rest)
+          end
+      end
+  end
+end
+
+let find_calls_in_handlers = fn (name: string, bindings: [HirHandlerBindingEntry]) -> [string] do
+  match bindings
+    case Nil() -> return Nil()
+    case Cons(v: HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, functions: fs)), rest: rest) ->
+      let found = find_function(name: name, functions: fs)
+      match found
+        case Some(val: HirFunction(name: _, params: _, ret_type: _, body: body, span: _)) ->
+          return collect_calls_stmts(stmts: body)
+        case None() -> return find_calls_in_handlers(name: name, bindings: rest)
+      end
+  end
+end
+
+/// Filter functions to only reachable ones.
+pub let filter_reachable_functions = fn (functions: [HirFunction], reachable: [string]) -> [HirFunction] do
+  match functions
+    case Nil() -> return Nil()
+    case Cons(v: f, rest: rest) ->
+      match f
+        case HirFunction(name: n, params: _, ret_type: _, body: _, span: _) ->
+          if str_in_list(s: n, xs: reachable) then
+            return Cons(v: f, rest: filter_reachable_functions(functions: rest, reachable: reachable))
+          else
+            return filter_reachable_functions(functions: rest, reachable: reachable)
+          end
+      end
+  end
+end
+
+/// Filter externals to only reachable ones.
+pub let filter_reachable_externals = fn (externals: [HirExternal], reachable: [string]) -> [HirExternal] do
+  match externals
+    case Nil() -> return Nil()
+    case Cons(v: ext, rest: rest) ->
+      match ext
+        case HirExternal(name: n, wasm_module: _, wasm_name: _, params: _, ret_type: _, throw_row: _) ->
+          if str_in_list(s: n, xs: reachable) then
+            return Cons(v: ext, rest: filter_reachable_externals(externals: rest, reachable: reachable))
+          else
+            return filter_reachable_externals(externals: rest, reachable: reachable)
+          end
+      end
+  end
+end
+
+/// Assemble a HirProgram from an accumulator with reachability filtering.
+pub let accum_to_program = fn (accum: HirAccum) -> HirProgram do
+  match accum
+    case HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: _) ->
+      let reachable = collect_reachable(functions: fs, handler_bindings: hbs)
+      let filtered_funcs = filter_reachable_functions(functions: fs, reachable: reachable)
+      let filtered_exts = filter_reachable_externals(externals: exts, reachable: reachable)
+      return HirProgram(
+        ports: ps,
+        functions: filtered_funcs,
+        externals: filtered_exts,
+        handler_bindings: hbs,
+        enum_defs: eds
+      )
+  end
+end
+
+// ─── String list helpers ────────────────────────────────────────────────────
+
+let concat_str_lists = fn (a: [string], b: [string]) -> [string] do
+  match a
+    case Nil() -> return b
+    case Cons(v: x, rest: rest) ->
+      return Cons(v: x, rest: concat_str_lists(a: rest, b: b))
+  end
+end
+
+let str_in_list = fn (s: string, xs: [string]) -> bool do
+  match xs
+    case Nil() -> return false
+    case Cons(v: x, rest: rest) ->
+      if x == s then return true
+      else return str_in_list(s: s, xs: rest)
+      end
+  end
+end

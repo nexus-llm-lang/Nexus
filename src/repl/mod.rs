@@ -14,7 +14,8 @@ use rustyline::Config;
 
 use crate::compiler::{bundler, codegen};
 use crate::constants::{Permission, ENTRYPOINT};
-use crate::lang::ast::{Expr, GlobalLet, Literal, Program, Spanned, Stmt, TopLevel, Type};
+use crate::lang::ast::{Expr, GlobalLet, Program, Stmt, TopLevel};
+use crate::types::{Literal, Spanned, Type};
 use crate::lang::parser::{parser, stmt_parser, ParseError};
 use crate::lang::typecheck::TypeChecker;
 use crate::runtime::backtrace;

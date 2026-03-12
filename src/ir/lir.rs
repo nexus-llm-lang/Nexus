@@ -1,7 +1,8 @@
 //! Low-level IR in A-normal form (ANF) — all sub-expressions are atoms.
 //! This is the final IR before WASM codegen; codegen consumes LIR directly.
 
-use crate::lang::ast::{BinaryOp, Span, Type};
+use crate::intern::Symbol;
+use crate::types::{BinaryOp, Span, Type};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LirProgram {
@@ -11,9 +12,9 @@ pub struct LirProgram {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LirExternal {
-    pub name: String,
-    pub wasm_module: String,
-    pub wasm_name: String,
+    pub name: Symbol,
+    pub wasm_module: Symbol,
+    pub wasm_name: Symbol,
     pub params: Vec<LirParam>,
     pub ret_type: Type,
     pub throws: Type,
@@ -21,7 +22,7 @@ pub struct LirExternal {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LirFunction {
-    pub name: String,
+    pub name: Symbol,
     pub params: Vec<LirParam>,
     pub ret_type: Type,
     pub requires: Type,
@@ -33,15 +34,15 @@ pub struct LirFunction {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LirParam {
-    pub label: String,
-    pub name: String,
+    pub label: Symbol,
+    pub name: Symbol,
     pub typ: Type,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LirStmt {
     Let {
-        name: String,
+        name: Symbol,
         typ: Type,
         expr: LirExpr,
     },
@@ -61,7 +62,7 @@ pub enum LirStmt {
     TryCatch {
         body: Vec<LirStmt>,
         body_ret: Option<LirAtom>,
-        catch_param: String,
+        catch_param: Symbol,
         catch_param_typ: Type,
         catch_body: Vec<LirStmt>,
         catch_ret: Option<LirAtom>,
@@ -81,8 +82,8 @@ pub enum LirStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConcTask {
-    pub func_name: String,
-    pub args: Vec<(String, LirAtom)>,
+    pub func_name: Symbol,
+    pub args: Vec<(Symbol, LirAtom)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,22 +96,22 @@ pub enum LirExpr {
         typ: Type,
     },
     Call {
-        func: String,
-        args: Vec<(String, LirAtom)>,
+        func: Symbol,
+        args: Vec<(Symbol, LirAtom)>,
         typ: Type,
     },
     TailCall {
-        func: String,
-        args: Vec<(String, LirAtom)>,
+        func: Symbol,
+        args: Vec<(Symbol, LirAtom)>,
         typ: Type,
     },
     Constructor {
-        name: String,
+        name: Symbol,
         args: Vec<LirAtom>,
         typ: Type,
     },
     Record {
-        fields: Vec<(String, LirAtom)>,
+        fields: Vec<(Symbol, LirAtom)>,
         typ: Type,
     },
     ObjectTag {
@@ -130,7 +131,7 @@ pub enum LirExpr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LirAtom {
-    Var { name: String, typ: Type },
+    Var { name: Symbol, typ: Type },
     Int(i64),
     Float(f64),
     Bool(bool),

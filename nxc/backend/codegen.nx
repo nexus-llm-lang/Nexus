@@ -1,0 +1,1035 @@
+/**
+ * codegen: WASM instruction emission and module assembly.
+ *
+ * Contains the mutually recursive emit_stmt/emit_stmts/emit_expr chain,
+ * atom/coercion/pack helpers, string operations, call emission,
+ * function body compilation, and the top-level compile_lir_to_wasm entry.
+ *
+ * ~700 lines due to mutual recursion preventing further splitting.
+ */
+
+import { ByteBuffer, empty, push_byte, push_uleb128, push_sleb128,
+         push_string, push_buf, free } from stdlib/bytebuffer.nx
+import as bb from stdlib/bytebuffer.nx
+import { BinaryOp, TypeExpr } from nxc/common/ast.nx
+import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom,
+         LirExternal, LirParam, LirCallArg, LirNamedAtom } from nxc/ir/lir_types.nx
+import { CodegenCtx, LocalEntry, FuncEntry, StringEntry,
+         ctx_locals, ctx_internal_funcs, ctx_external_funcs, ctx_string_lits,
+         ctx_heap_enabled, ctx_temps_base, ctx_func_ret_type, ctx_functions, ctx_externals,
+         peel_linear, type_to_valtype, is_unit, atom_type, expr_type,
+         lookup_local, lookup_func, lookup_string, find_function, find_external,
+         constructor_tag, record_tag,
+         emit_name, emit_section, emit_memarg, emit_memarg_i64, emit_memarg_i8,
+         sec_type, sec_import, sec_function, sec_memory, sec_global, sec_export, sec_code, sec_data,
+         vt_i32, vt_i64, bt_void, bt_i32, desc_func, desc_memory, heap_global_idx, string_data_base,
+         op_unreachable, op_block, op_loop, op_if, op_else, op_end, op_br, op_br_if, op_return,
+         op_call, op_return_call, op_drop,
+         op_local_get, op_local_set, op_local_tee, op_global_get, op_global_set,
+         op_i32_load, op_i64_load, op_i32_load8_u, op_i32_store, op_i64_store, op_i32_store8,
+         op_i32_const, op_i64_const, op_f64_const,
+         op_i32_eqz, op_i32_eq, op_i32_ne, op_i32_ge_u, op_i32_add,
+         op_i64_eq, op_i64_ne, op_i64_lt_s, op_i64_le_s, op_i64_gt_s, op_i64_ge_s,
+         op_i64_add, op_i64_sub, op_i64_mul, op_i64_div_s, op_i64_rem_s,
+         op_i64_and, op_i64_or, op_i64_xor, op_i64_shl, op_i64_shr_s, op_i64_shr_u,
+         op_f64_eq, op_f64_ne, op_f64_lt, op_f64_le, op_f64_gt, op_f64_ge,
+         op_f64_add, op_f64_sub, op_f64_mul, op_f64_div,
+         op_i32_wrap_i64, op_i64_extend_i32_s, op_i64_extend_i32_u,
+         op_f64_reinterpret_i64, op_i64_reinterpret_f64,
+         op_i32_and, op_i32_or } from nxc/backend/wasm_defs.nx
+import { collect_program_strings, build_string_entries, compute_last_string_end,
+         program_uses_heap, choose_memory_mode, align8,
+         collect_local_stmts } from nxc/backend/wasm_collect.nx
+import { build_type_section, build_import_section, build_function_section,
+         build_memory_section, build_global_section, build_export_section,
+         build_data_section, emit_local_decls } from nxc/backend/wasm_section.nx
+import as list from stdlib/list.nx
+
+// ─── Atom emission ──────────────────────────────────────────────────────────
+
+let emit_atom = fn (atom: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+  match atom
+    case LirAtomVar(name: n, typ: _) ->
+      let idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      return push_uleb128(buf: %buf, val: idx)
+    case LirAtomInt(val: v) ->
+      let %buf = push_byte(buf: %buf, byte: op_i64_const)
+      return push_sleb128(buf: %buf, val: v)
+    case LirAtomFloat(val: _) ->
+      // TODO: f64 emission requires __nx_buf_push_f64_le FFI
+      let %buf = push_byte(buf: %buf, byte: op_i64_const)
+      return push_sleb128(buf: %buf, val: 0)
+    case LirAtomBool(val: bv) ->
+      let %buf = push_byte(buf: %buf, byte: op_i32_const)
+      return push_sleb128(buf: %buf, val: match bv case true -> 1 case false -> 0 end)
+    case LirAtomString(val: s) ->
+      let %buf = push_byte(buf: %buf, byte: op_i64_const)
+      return push_sleb128(buf: %buf, val: lookup_string(value: s, entries: ctx_string_lits(ctx: ctx)))
+    case LirAtomUnit() -> %buf
+  end
+end
+
+// ─── Coercion / pack / unpack ───────────────────────────────────────────────
+
+let emit_coercion = fn (from_type: TypeExpr, to_type: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
+  let f = peel_linear(typ: from_type)
+  let t = peel_linear(typ: to_type)
+  match f case TyUnit() -> return %buf case _ ->
+    match t case TyUnit() -> return %buf case _ ->
+      let fv = type_to_valtype(typ: f)
+      let tv = type_to_valtype(typ: t)
+      if fv == tv then return %buf
+      else if fv == vt_i64 && tv == vt_i32 then return push_byte(buf: %buf, byte: op_i32_wrap_i64)
+      else if fv == vt_i32 && tv == vt_i64 then return push_byte(buf: %buf, byte: op_i64_extend_i32_s)
+      else return %buf
+      end end end
+    end
+  end
+end
+
+let emit_pack_to_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
+  match peel_linear(typ: typ)
+    case TyI32() -> push_byte(buf: %buf, byte: op_i64_extend_i32_s)
+    case TyBool() -> push_byte(buf: %buf, byte: op_i64_extend_i32_s)
+    case TyUnit() ->
+      let %buf = push_byte(buf: %buf, byte: op_drop)
+      let %buf = push_byte(buf: %buf, byte: op_i64_const)
+      push_sleb128(buf: %buf, val: 0)
+    case TyF64() -> push_byte(buf: %buf, byte: op_i64_reinterpret_f64)
+    case _ -> %buf
+  end
+end
+
+let emit_unpack_from_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
+  match peel_linear(typ: typ)
+    case TyI32() -> push_byte(buf: %buf, byte: op_i32_wrap_i64)
+    case TyBool() -> push_byte(buf: %buf, byte: op_i32_wrap_i64)
+    case TyF64() -> push_byte(buf: %buf, byte: op_f64_reinterpret_i64)
+    case _ -> %buf
+  end
+end
+
+// ─── Object allocation ──────────────────────────────────────────────────────
+
+let emit_alloc_object = fn (buf: %ByteBuffer, ctx: CodegenCtx, words: i64) -> %ByteBuffer do
+  let obj_ptr = ctx_temps_base(ctx: ctx) + 3
+  let %buf = push_byte(buf: %buf, byte: op_global_get)
+  let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
+  let %buf = push_byte(buf: %buf, byte: op_local_tee)
+  let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: words * 8)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_global_set)
+  return push_uleb128(buf: %buf, val: heap_global_idx)
+end
+
+// ─── String unpack ──────────────────────────────────────────────────────────
+
+let emit_unpack_string = fn (buf: %ByteBuffer, packed_local: i64, ptr_local: i64, len_local: i64) -> %ByteBuffer do
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: packed_local)
+  let %buf = push_byte(buf: %buf, byte: op_i64_const)
+  let %buf = push_sleb128(buf: %buf, val: 32)
+  let %buf = push_byte(buf: %buf, byte: op_i64_shr_u)
+  let %buf = push_byte(buf: %buf, byte: op_i32_wrap_i64)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  let %buf = push_uleb128(buf: %buf, val: ptr_local)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: packed_local)
+  let %buf = push_byte(buf: %buf, byte: op_i32_wrap_i64)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  return push_uleb128(buf: %buf, val: len_local)
+end
+
+// ─── Memcpy loops ───────────────────────────────────────────────────────────
+
+let emit_memcpy_loop = fn (buf: %ByteBuffer, src_ptr: i64, dst_ptr: i64, dst_offset: i64,
+                            len_local: i64, idx_local: i64) -> %ByteBuffer do
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 0)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  let %buf = push_uleb128(buf: %buf, val: idx_local)
+  let %buf = push_byte(buf: %buf, byte: op_block)
+  let %buf = push_byte(buf: %buf, byte: bt_void)
+  let %buf = push_byte(buf: %buf, byte: op_loop)
+  let %buf = push_byte(buf: %buf, byte: bt_void)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: idx_local)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: len_local)
+  let %buf = push_byte(buf: %buf, byte: op_i32_ge_u)
+  let %buf = push_byte(buf: %buf, byte: op_br_if)
+  let %buf = push_uleb128(buf: %buf, val: 1)
+  // dst[idx] = src[idx]
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: dst_ptr)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: idx_local)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: src_ptr)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: idx_local)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_i32_load8_u)
+  let %buf = emit_memarg_i8(buf: %buf)
+  let %buf = push_byte(buf: %buf, byte: op_i32_store8)
+  let %buf = emit_memarg_i8(buf: %buf)
+  // idx++
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: idx_local)
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 1)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  let %buf = push_uleb128(buf: %buf, val: idx_local)
+  let %buf = push_byte(buf: %buf, byte: op_br)
+  let %buf = push_uleb128(buf: %buf, val: 0)
+  let %buf = push_byte(buf: %buf, byte: op_end)
+  return push_byte(buf: %buf, byte: op_end)
+end
+
+let emit_memcpy_loop_offset = fn (buf: %ByteBuffer, src_ptr: i64, dst_ptr: i64,
+                                   offset_local: i64, len_local: i64, idx_local: i64) -> %ByteBuffer do
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 0)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  let %buf = push_uleb128(buf: %buf, val: idx_local)
+  let %buf = push_byte(buf: %buf, byte: op_block)
+  let %buf = push_byte(buf: %buf, byte: bt_void)
+  let %buf = push_byte(buf: %buf, byte: op_loop)
+  let %buf = push_byte(buf: %buf, byte: bt_void)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: idx_local)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: len_local)
+  let %buf = push_byte(buf: %buf, byte: op_i32_ge_u)
+  let %buf = push_byte(buf: %buf, byte: op_br_if)
+  let %buf = push_uleb128(buf: %buf, val: 1)
+  // dst[offset + idx]
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: dst_ptr)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: offset_local)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: idx_local)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  // src[idx]
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: src_ptr)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: idx_local)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_i32_load8_u)
+  let %buf = emit_memarg_i8(buf: %buf)
+  let %buf = push_byte(buf: %buf, byte: op_i32_store8)
+  let %buf = emit_memarg_i8(buf: %buf)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: idx_local)
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 1)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  let %buf = push_uleb128(buf: %buf, val: idx_local)
+  let %buf = push_byte(buf: %buf, byte: op_br)
+  let %buf = push_uleb128(buf: %buf, val: 0)
+  let %buf = push_byte(buf: %buf, byte: op_end)
+  return push_byte(buf: %buf, byte: op_end)
+end
+
+// ─── String concat ──────────────────────────────────────────────────────────
+
+let emit_string_concat = fn (lhs: LirAtom, rhs: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+  let t = ctx_temps_base(ctx: ctx)
+  let lhs_packed = t + 4
+  let rhs_packed = t + 5
+  let lhs_ptr = t + 6
+  let lhs_len = t + 7
+  let rhs_ptr = t + 8
+  let rhs_len = t + 9
+  let out_ptr = t + 10
+  let out_len = t + 11
+  let idx_var = t + 12
+
+  let %buf = emit_atom(atom: lhs, buf: %buf, ctx: ctx)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  let %buf = push_uleb128(buf: %buf, val: lhs_packed)
+  let %buf = emit_atom(atom: rhs, buf: %buf, ctx: ctx)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  let %buf = push_uleb128(buf: %buf, val: rhs_packed)
+  let %buf = emit_unpack_string(buf: %buf, packed_local: lhs_packed, ptr_local: lhs_ptr, len_local: lhs_len)
+  let %buf = emit_unpack_string(buf: %buf, packed_local: rhs_packed, ptr_local: rhs_ptr, len_local: rhs_len)
+
+  // out_len = lhs_len + rhs_len
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: lhs_len)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: rhs_len)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  let %buf = push_uleb128(buf: %buf, val: out_len)
+
+  // Allocate on heap
+  let %buf = push_byte(buf: %buf, byte: op_global_get)
+  let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
+  let %buf = push_byte(buf: %buf, byte: op_local_tee)
+  let %buf = push_uleb128(buf: %buf, val: out_ptr)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: out_len)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_global_set)
+  let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
+
+  let %buf = emit_memcpy_loop(buf: %buf, src_ptr: lhs_ptr, dst_ptr: out_ptr, dst_offset: -1,
+                               len_local: lhs_len, idx_local: idx_var)
+  let %buf = emit_memcpy_loop_offset(buf: %buf, src_ptr: rhs_ptr, dst_ptr: out_ptr,
+                                      offset_local: lhs_len, len_local: rhs_len, idx_local: idx_var)
+
+  // Pack result: (out_ptr as i64) << 32 | (out_len as i64)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: out_ptr)
+  let %buf = push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+  let %buf = push_byte(buf: %buf, byte: op_i64_const)
+  let %buf = push_sleb128(buf: %buf, val: 32)
+  let %buf = push_byte(buf: %buf, byte: op_i64_shl)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: out_len)
+  let %buf = push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+  return push_byte(buf: %buf, byte: op_i64_or)
+end
+
+// ─── String compare ─────────────────────────────────────────────────────────
+
+let is_string_op = fn (op: BinaryOp, lhs_type: TypeExpr, rhs_type: TypeExpr) -> bool do
+  match peel_linear(typ: lhs_type) case TyString() ->
+    match peel_linear(typ: rhs_type) case TyString() ->
+      match op
+        case OpEq() -> true case OpNe() -> true
+        case OpConcat() -> true case OpAdd() -> true
+        case _ -> false
+      end
+    case _ -> false end
+  case _ -> false end
+end
+
+let is_string_concat_op = fn (op: BinaryOp, typ: TypeExpr) -> bool do
+  match peel_linear(typ: typ) case TyString() ->
+    match op case OpConcat() -> true case OpAdd() -> true case _ -> false end
+  case _ -> false end
+end
+
+let emit_string_compare = fn (op: BinaryOp, lhs: LirAtom, rhs: LirAtom,
+                               buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+  let t = ctx_temps_base(ctx: ctx)
+  let lhs_packed = t + 4
+  let rhs_packed = t + 5
+  let lhs_ptr = t + 6
+  let lhs_len = t + 7
+  let rhs_ptr = t + 8
+  let rhs_len = t + 9
+  let idx_var = t + 12
+
+  let %buf = emit_atom(atom: lhs, buf: %buf, ctx: ctx)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  let %buf = push_uleb128(buf: %buf, val: lhs_packed)
+  let %buf = emit_atom(atom: rhs, buf: %buf, ctx: ctx)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  let %buf = push_uleb128(buf: %buf, val: rhs_packed)
+  let %buf = emit_unpack_string(buf: %buf, packed_local: lhs_packed, ptr_local: lhs_ptr, len_local: lhs_len)
+  let %buf = emit_unpack_string(buf: %buf, packed_local: rhs_packed, ptr_local: rhs_ptr, len_local: rhs_len)
+
+  // block $done (result i32) { block $not_equal {
+  let %buf = push_byte(buf: %buf, byte: op_block)
+  let %buf = push_byte(buf: %buf, byte: bt_i32)
+  let %buf = push_byte(buf: %buf, byte: op_block)
+  let %buf = push_byte(buf: %buf, byte: bt_void)
+
+  // Compare lengths
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: lhs_len)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: rhs_len)
+  let %buf = push_byte(buf: %buf, byte: op_i32_ne)
+  let %buf = push_byte(buf: %buf, byte: op_br_if)
+  let %buf = push_uleb128(buf: %buf, val: 0)
+
+  // Byte comparison loop
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 0)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  let %buf = push_uleb128(buf: %buf, val: idx_var)
+  let %buf = push_byte(buf: %buf, byte: op_block)
+  let %buf = push_byte(buf: %buf, byte: bt_void)
+  let %buf = push_byte(buf: %buf, byte: op_loop)
+  let %buf = push_byte(buf: %buf, byte: bt_void)
+
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: idx_var)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: lhs_len)
+  let %buf = push_byte(buf: %buf, byte: op_i32_ge_u)
+  let %buf = push_byte(buf: %buf, byte: op_br_if)
+  let %buf = push_uleb128(buf: %buf, val: 1)
+
+  // Compare bytes
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: lhs_ptr)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: idx_var)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_i32_load8_u)
+  let %buf = emit_memarg_i8(buf: %buf)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: rhs_ptr)
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: idx_var)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_i32_load8_u)
+  let %buf = emit_memarg_i8(buf: %buf)
+  let %buf = push_byte(buf: %buf, byte: op_i32_ne)
+  let %buf = push_byte(buf: %buf, byte: op_br_if)
+  let %buf = push_uleb128(buf: %buf, val: 2)
+
+  // idx++
+  let %buf = push_byte(buf: %buf, byte: op_local_get)
+  let %buf = push_uleb128(buf: %buf, val: idx_var)
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 1)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_local_set)
+  let %buf = push_uleb128(buf: %buf, val: idx_var)
+  let %buf = push_byte(buf: %buf, byte: op_br)
+  let %buf = push_uleb128(buf: %buf, val: 0)
+  let %buf = push_byte(buf: %buf, byte: op_end)
+  let %buf = push_byte(buf: %buf, byte: op_end)
+
+  // Equal: push 1, br $done
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 1)
+  let %buf = push_byte(buf: %buf, byte: op_br)
+  let %buf = push_uleb128(buf: %buf, val: 1)
+  let %buf = push_byte(buf: %buf, byte: op_end)
+  // Not equal: push 0
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 0)
+  let %buf = push_byte(buf: %buf, byte: op_end)
+
+  match op
+    case OpNe() -> return push_byte(buf: %buf, byte: op_i32_eqz)
+    case _ -> return %buf
+  end
+end
+
+// ─── Binary operation ───────────────────────────────────────────────────────
+
+let emit_binary = fn (op: BinaryOp, buf: %ByteBuffer) -> %ByteBuffer do
+  let opcode = match op
+    case OpAdd() -> op_i64_add case OpSub() -> op_i64_sub
+    case OpMul() -> op_i64_mul case OpDiv() -> op_i64_div_s case OpMod() -> op_i64_rem_s
+    case OpFAdd() -> op_f64_add case OpFSub() -> op_f64_sub
+    case OpFMul() -> op_f64_mul case OpFDiv() -> op_f64_div
+    case OpEq() -> op_i64_eq case OpNe() -> op_i64_ne
+    case OpLt() -> op_i64_lt_s case OpLe() -> op_i64_le_s
+    case OpGt() -> op_i64_gt_s case OpGe() -> op_i64_ge_s
+    case OpFEq() -> op_f64_eq case OpFNe() -> op_f64_ne
+    case OpFLt() -> op_f64_lt case OpFLe() -> op_f64_le
+    case OpFGt() -> op_f64_gt case OpFGe() -> op_f64_ge
+    case OpBitAnd() -> op_i64_and case OpBitOr() -> op_i64_or case OpBitXor() -> op_i64_xor
+    case OpShl() -> op_i64_shl case OpShr() -> op_i64_shr_s
+    case OpAnd() -> op_i32_and case OpOr() -> op_i32_or
+    case _ -> op_i64_add
+  end
+  return push_byte(buf: %buf, byte: opcode)
+end
+
+// ─── External call arg ──────────────────────────────────────────────────────
+
+let emit_external_arg = fn (atom: LirAtom, param_type: TypeExpr, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+  match peel_linear(typ: param_type)
+    case TyString() ->
+      let packed_tmp = ctx_temps_base(ctx: ctx)
+      let %buf = emit_atom(atom: atom, buf: %buf, ctx: ctx)
+      let %buf = push_byte(buf: %buf, byte: op_local_set)
+      let %buf = push_uleb128(buf: %buf, val: packed_tmp)
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: packed_tmp)
+      let %buf = push_byte(buf: %buf, byte: op_i64_const)
+      let %buf = push_sleb128(buf: %buf, val: 32)
+      let %buf = push_byte(buf: %buf, byte: op_i64_shr_s)
+      let %buf = push_byte(buf: %buf, byte: op_i32_wrap_i64)
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: packed_tmp)
+      return push_byte(buf: %buf, byte: op_i32_wrap_i64)
+    case TyArray(elem: _) ->
+      let packed_tmp = ctx_temps_base(ctx: ctx)
+      let %buf = emit_atom(atom: atom, buf: %buf, ctx: ctx)
+      let %buf = push_byte(buf: %buf, byte: op_local_set)
+      let %buf = push_uleb128(buf: %buf, val: packed_tmp)
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: packed_tmp)
+      let %buf = push_byte(buf: %buf, byte: op_i64_const)
+      let %buf = push_sleb128(buf: %buf, val: 32)
+      let %buf = push_byte(buf: %buf, byte: op_i64_shr_s)
+      let %buf = push_byte(buf: %buf, byte: op_i32_wrap_i64)
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: packed_tmp)
+      return push_byte(buf: %buf, byte: op_i32_wrap_i64)
+    case _ ->
+      let %buf = emit_atom(atom: atom, buf: %buf, ctx: ctx)
+      return emit_coercion(from_type: atom_type(atom: atom), to_type: param_type, buf: %buf)
+  end
+end
+
+// ─── Constructor/record field emission ──────────────────────────────────────
+
+let emit_constructor_fields = fn (buf: %ByteBuffer, args: [LirAtom], ctx: CodegenCtx,
+                                   obj_ptr: i64, field_idx: i64) -> %ByteBuffer do
+  match args
+    case Nil() -> %buf
+    case Cons(v: a, rest: rest) ->
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = emit_atom(atom: a, buf: %buf, ctx: ctx)
+      let %buf = emit_pack_to_i64(typ: atom_type(atom: a), buf: %buf)
+      let %buf = push_byte(buf: %buf, byte: op_i64_store)
+      let %buf = emit_memarg_i64(buf: %buf, offset: field_idx * 8)
+      emit_constructor_fields(buf: %buf, args: rest, ctx: ctx, obj_ptr: obj_ptr, field_idx: field_idx + 1)
+  end
+end
+
+let emit_record_fields = fn (buf: %ByteBuffer, fields: [LirNamedAtom], ctx: CodegenCtx,
+                              obj_ptr: i64, field_idx: i64) -> %ByteBuffer do
+  match fields
+    case Nil() -> %buf
+    case Cons(v: LirNamedAtom(name: _, value: v), rest: rest) ->
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = emit_atom(atom: v, buf: %buf, ctx: ctx)
+      let %buf = emit_pack_to_i64(typ: atom_type(atom: v), buf: %buf)
+      let %buf = push_byte(buf: %buf, byte: op_i64_store)
+      let %buf = emit_memarg_i64(buf: %buf, offset: field_idx * 8)
+      emit_record_fields(buf: %buf, fields: rest, ctx: ctx, obj_ptr: obj_ptr, field_idx: field_idx + 1)
+  end
+end
+
+let extract_field_names = fn (fields: [LirNamedAtom]) -> [string] do
+  match fields
+    case Nil() -> Nil()
+    case Cons(v: LirNamedAtom(name: n, value: _), rest: rest) ->
+      Cons(v: n, rest: extract_field_names(fields: rest))
+  end
+end
+
+// ─── Call emission ──────────────────────────────────────────────────────────
+
+let emit_internal_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer do
+  match args
+    case Nil() -> %buf
+    case Cons(v: LirCallArg(label: _, value: v), rest: rest_args) ->
+      match params
+        case Nil() -> %buf
+        case Cons(v: LirParam(label: _, name: _, typ: pt), rest: rest_params) ->
+          let %buf = emit_atom(atom: v, buf: %buf, ctx: ctx)
+          let %buf = emit_coercion(from_type: atom_type(atom: v), to_type: pt, buf: %buf)
+          emit_internal_call_args(buf: %buf, args: rest_args, params: rest_params, ctx: ctx)
+      end
+  end
+end
+
+let emit_external_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer do
+  match args
+    case Nil() -> %buf
+    case Cons(v: LirCallArg(label: _, value: v), rest: rest_args) ->
+      match params
+        case Nil() -> %buf
+        case Cons(v: LirParam(label: _, name: _, typ: pt), rest: rest_params) ->
+          let %buf = emit_external_arg(atom: v, param_type: pt, buf: %buf, ctx: ctx)
+          emit_external_call_args(buf: %buf, args: rest_args, params: rest_params, ctx: ctx)
+      end
+  end
+end
+
+let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
+                     is_tail: bool, in_try: bool) -> %ByteBuffer do
+  let int_idx = lookup_func(name: func, entries: ctx_internal_funcs(ctx: ctx))
+  if int_idx >= 0 then
+    match find_function(name: func, funcs: ctx_functions(ctx: ctx))
+      case Some(val: LirFunction(name: _, params: params, ret_type: _, body: _, ret: _, span: _)) ->
+        let %buf = emit_internal_call_args(buf: %buf, args: args, params: params, ctx: ctx)
+        let use_tail = is_tail && (in_try == false)
+        let call_op = match use_tail case true -> op_return_call case false -> op_call end
+        let %buf = push_byte(buf: %buf, byte: call_op)
+        return push_uleb128(buf: %buf, val: int_idx)
+      case None() -> return %buf
+    end
+  end
+
+  let ext_idx = lookup_func(name: func, entries: ctx_external_funcs(ctx: ctx))
+  if ext_idx >= 0 then
+    match find_external(name: func, exts: ctx_externals(ctx: ctx))
+      case Some(val: LirExternal(name: _, wasm_module: _, wasm_name: _, params: params, ret_type: _, throw_row: _)) ->
+        let %buf = emit_external_call_args(buf: %buf, args: args, params: params, ctx: ctx)
+        let %buf = push_byte(buf: %buf, byte: op_call)
+        return push_uleb128(buf: %buf, val: ext_idx)
+      case None() -> return %buf
+    end
+  end
+
+  return %buf
+end
+
+// ─── Expression emission ────────────────────────────────────────────────────
+
+let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool) -> %ByteBuffer do
+  match expr
+    case LirExprAtom(atom: a) -> emit_atom(atom: a, buf: %buf, ctx: ctx)
+
+    case LirExprBinary(op: op, lhs: l, rhs: r, typ: t) ->
+      if is_string_concat_op(op: op, typ: t) then
+        return emit_string_concat(lhs: l, rhs: r, buf: %buf, ctx: ctx)
+      else if is_string_op(op: op, lhs_type: atom_type(atom: l), rhs_type: atom_type(atom: r)) then
+        return emit_string_compare(op: op, lhs: l, rhs: r, buf: %buf, ctx: ctx)
+      else
+        let %buf = emit_atom(atom: l, buf: %buf, ctx: ctx)
+        let %buf = emit_atom(atom: r, buf: %buf, ctx: ctx)
+        return emit_binary(op: op, buf: %buf)
+      end end
+
+    case LirExprCall(func: fname, args: args, typ: _) ->
+      emit_call(func: fname, args: args, buf: %buf, ctx: ctx, is_tail: false, in_try: in_try)
+
+    case LirExprTailCall(func: fname, args: args, typ: _) ->
+      emit_call(func: fname, args: args, buf: %buf, ctx: ctx, is_tail: true, in_try: in_try)
+
+    case LirExprConstructor(name: cname, args: cargs, typ: _) ->
+      let arity = list.length(xs: cargs)
+      let tag = constructor_tag(name: cname, arity: arity)
+      let %buf = emit_alloc_object(buf: %buf, ctx: ctx, words: 1 + arity)
+      let obj_ptr = ctx_temps_base(ctx: ctx) + 3
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = push_byte(buf: %buf, byte: op_i64_const)
+      let %buf = push_sleb128(buf: %buf, val: tag)
+      let %buf = push_byte(buf: %buf, byte: op_i64_store)
+      let %buf = emit_memarg_i64(buf: %buf, offset: 0)
+      let %buf = emit_constructor_fields(buf: %buf, args: cargs, ctx: ctx, obj_ptr: obj_ptr, field_idx: 1)
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      return push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+
+    case LirExprRecord(fields: fields, typ: _) ->
+      let names = extract_field_names(fields: fields)
+      let tag = record_tag(sorted_names: names)
+      let n_fields = list.length(xs: fields)
+      let %buf = emit_alloc_object(buf: %buf, ctx: ctx, words: 1 + n_fields)
+      let obj_ptr = ctx_temps_base(ctx: ctx) + 3
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = push_byte(buf: %buf, byte: op_i64_const)
+      let %buf = push_sleb128(buf: %buf, val: tag)
+      let %buf = push_byte(buf: %buf, byte: op_i64_store)
+      let %buf = emit_memarg_i64(buf: %buf, offset: 0)
+      let %buf = emit_record_fields(buf: %buf, fields: fields, ctx: ctx, obj_ptr: obj_ptr, field_idx: 1)
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      return push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+
+    case LirExprObjectTag(value: v, typ: _) ->
+      let obj_ptr = ctx_temps_base(ctx: ctx) + 3
+      let %buf = emit_atom(atom: v, buf: %buf, ctx: ctx)
+      let %buf = push_byte(buf: %buf, byte: op_i32_wrap_i64)
+      let %buf = push_byte(buf: %buf, byte: op_local_set)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = push_byte(buf: %buf, byte: op_i64_load)
+      return emit_memarg_i64(buf: %buf, offset: 0)
+
+    case LirExprObjectField(value: v, index: idx, typ: ftyp) ->
+      let obj_ptr = ctx_temps_base(ctx: ctx) + 3
+      let %buf = emit_atom(atom: v, buf: %buf, ctx: ctx)
+      let %buf = push_byte(buf: %buf, byte: op_i32_wrap_i64)
+      let %buf = push_byte(buf: %buf, byte: op_local_set)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = push_byte(buf: %buf, byte: op_i64_load)
+      let %buf = emit_memarg_i64(buf: %buf, offset: (idx + 1) * 8)
+      return emit_unpack_from_i64(typ: ftyp, buf: %buf)
+
+    case LirExprRaise(value: v, typ: _) ->
+      let exn_value = ctx_temps_base(ctx: ctx) + 1
+      let exn_flag = ctx_temps_base(ctx: ctx) + 2
+      let %buf = emit_atom(atom: v, buf: %buf, ctx: ctx)
+      if is_unit(typ: atom_type(atom: v)) then
+        let %buf = push_byte(buf: %buf, byte: op_i64_const)
+        let %buf = push_sleb128(buf: %buf, val: 0)
+      end
+      let %buf = push_byte(buf: %buf, byte: op_local_set)
+      let %buf = push_uleb128(buf: %buf, val: exn_value)
+      let %buf = push_byte(buf: %buf, byte: op_i32_const)
+      let %buf = push_sleb128(buf: %buf, val: 1)
+      let %buf = push_byte(buf: %buf, byte: op_local_set)
+      let %buf = push_uleb128(buf: %buf, val: exn_flag)
+      if in_try == false then
+        let %buf = push_byte(buf: %buf, byte: op_unreachable)
+      end
+      return %buf
+  end
+end
+
+// ─── Statement emission (mutually recursive) ────────────────────────────────
+
+let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool) -> %ByteBuffer do
+  match stmt
+    case LirStmtLet(name: n, typ: t, expr: e) ->
+      let %buf = emit_expr(expr: e, buf: %buf, ctx: ctx, in_try: in_try)
+      let et = expr_type(expr: e)
+      if is_unit(typ: t) then
+        if is_unit(typ: et) == false then return push_byte(buf: %buf, byte: op_drop)
+        else return %buf end
+      else
+        let %buf = emit_coercion(from_type: et, to_type: t, buf: %buf)
+        let idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
+        let %buf = push_byte(buf: %buf, byte: op_local_set)
+        return push_uleb128(buf: %buf, val: idx)
+      end
+
+    case LirStmtIf(cond: c, then_body: tb, else_body: eb) ->
+      let %buf = emit_atom(atom: c, buf: %buf, ctx: ctx)
+      let %buf = emit_coercion(from_type: atom_type(atom: c), to_type: TyBool(), buf: %buf)
+      let %buf = push_byte(buf: %buf, byte: op_if)
+      let %buf = push_byte(buf: %buf, byte: bt_void)
+      let %buf = emit_stmts(stmts: tb, buf: %buf, ctx: ctx, in_try: in_try)
+      if list.length(xs: eb) > 0 then
+        let %buf = push_byte(buf: %buf, byte: op_else)
+        let %buf = emit_stmts(stmts: eb, buf: %buf, ctx: ctx, in_try: in_try)
+      end
+      return push_byte(buf: %buf, byte: op_end)
+
+    case LirStmtIfReturn(cond: c, then_body: tb, then_ret: tr, else_body: eb, else_ret: er, ret_type: rt) ->
+      let %buf = emit_atom(atom: c, buf: %buf, ctx: ctx)
+      let %buf = emit_coercion(from_type: atom_type(atom: c), to_type: TyBool(), buf: %buf)
+      let %buf = push_byte(buf: %buf, byte: op_if)
+      let %buf = push_byte(buf: %buf, byte: bt_void)
+      let %buf = emit_stmts(stmts: tb, buf: %buf, ctx: ctx, in_try: in_try)
+      let %buf = emit_atom(atom: tr, buf: %buf, ctx: ctx)
+      let %buf = emit_coercion(from_type: atom_type(atom: tr), to_type: rt, buf: %buf)
+      let %buf = push_byte(buf: %buf, byte: op_return)
+      let has_else = list.length(xs: eb) > 0
+      let has_else_ret = match er case Some(val: _) -> true case None() -> false end
+      if has_else || has_else_ret then
+        let %buf = push_byte(buf: %buf, byte: op_else)
+        let %buf = emit_stmts(stmts: eb, buf: %buf, ctx: ctx, in_try: in_try)
+        match er
+          case Some(val: a) ->
+            let %buf = emit_atom(atom: a, buf: %buf, ctx: ctx)
+            let %buf = emit_coercion(from_type: atom_type(atom: a), to_type: rt, buf: %buf)
+            let %buf = push_byte(buf: %buf, byte: op_return)
+          case None() -> ()
+        end
+      end
+      return push_byte(buf: %buf, byte: op_end)
+
+    case LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
+      let %buf = push_byte(buf: %buf, byte: op_block)
+      let %buf = push_byte(buf: %buf, byte: bt_void)
+      let %buf = push_byte(buf: %buf, byte: op_loop)
+      let %buf = push_byte(buf: %buf, byte: bt_void)
+      let %buf = emit_stmts(stmts: cs, buf: %buf, ctx: ctx, in_try: in_try)
+      let %buf = emit_atom(atom: c, buf: %buf, ctx: ctx)
+      let %buf = emit_coercion(from_type: atom_type(atom: c), to_type: TyBool(), buf: %buf)
+      let %buf = push_byte(buf: %buf, byte: op_br_if)
+      let %buf = push_uleb128(buf: %buf, val: 1)
+      let %buf = emit_stmts(stmts: b, buf: %buf, ctx: ctx, in_try: in_try)
+      let %buf = push_byte(buf: %buf, byte: op_br)
+      let %buf = push_uleb128(buf: %buf, val: 0)
+      let %buf = push_byte(buf: %buf, byte: op_end)
+      return push_byte(buf: %buf, byte: op_end)
+
+    case LirStmtTryCatch(body: b, body_ret: br, catch_param: cp, catch_param_typ: _,
+                          catch_body: cb, catch_ret: cr) ->
+      let exn_value = ctx_temps_base(ctx: ctx) + 1
+      let exn_flag = ctx_temps_base(ctx: ctx) + 2
+      let catch_local_idx = lookup_local(name: cp, entries: ctx_locals(ctx: ctx))
+
+      // exn_flag = 0
+      let %buf = push_byte(buf: %buf, byte: op_i32_const)
+      let %buf = push_sleb128(buf: %buf, val: 0)
+      let %buf = push_byte(buf: %buf, byte: op_local_set)
+      let %buf = push_uleb128(buf: %buf, val: exn_flag)
+
+      // block { body + exn_flag check after each stmt }
+      let %buf = push_byte(buf: %buf, byte: op_block)
+      let %buf = push_byte(buf: %buf, byte: bt_void)
+      let %buf = emit_try_body_stmts(stmts: b, buf: %buf, ctx: ctx, exn_flag: exn_flag)
+      let %buf = match br
+        case Some(val: a) ->
+          let %b = emit_atom(atom: a, buf: %buf, ctx: ctx)
+          let %b = emit_coercion(from_type: atom_type(atom: a), to_type: ctx_func_ret_type(ctx: ctx), buf: %b)
+          push_byte(buf: %b, byte: op_return)
+        case None() -> %buf
+      end
+      let %buf = push_byte(buf: %buf, byte: op_end)
+
+      // if exn_flag { catch_param = exn_value; catch_body }
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: exn_flag)
+      let %buf = push_byte(buf: %buf, byte: op_if)
+      let %buf = push_byte(buf: %buf, byte: bt_void)
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: exn_value)
+      if catch_local_idx >= 0 then
+        let %buf = push_byte(buf: %buf, byte: op_local_set)
+        let %buf = push_uleb128(buf: %buf, val: catch_local_idx)
+      end
+      // Reset flag
+      let %buf = push_byte(buf: %buf, byte: op_i32_const)
+      let %buf = push_sleb128(buf: %buf, val: 0)
+      let %buf = push_byte(buf: %buf, byte: op_local_set)
+      let %buf = push_uleb128(buf: %buf, val: exn_flag)
+
+      if in_try then
+        let %buf = push_byte(buf: %buf, byte: op_block)
+        let %buf = push_byte(buf: %buf, byte: bt_void)
+      end
+      let %buf = emit_try_catch_body_stmts(stmts: cb, buf: %buf, ctx: ctx,
+                                             exn_flag: exn_flag, in_try: in_try)
+      let %buf = match cr
+        case Some(val: a) ->
+          let %b = emit_atom(atom: a, buf: %buf, ctx: ctx)
+          let %b = emit_coercion(from_type: atom_type(atom: a), to_type: ctx_func_ret_type(ctx: ctx), buf: %b)
+          push_byte(buf: %b, byte: op_return)
+        case None() -> %buf
+      end
+      if in_try then
+        let %buf = push_byte(buf: %buf, byte: op_end)
+      end
+      return push_byte(buf: %buf, byte: op_end)
+  end
+end
+
+let emit_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool) -> %ByteBuffer do
+  match stmts
+    case Nil() -> %buf
+    case Cons(v: s, rest: rest) ->
+      emit_stmts(stmts: rest, buf: emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: in_try), ctx: ctx, in_try: in_try)
+  end
+end
+
+let emit_try_body_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: CodegenCtx, exn_flag: i64) -> %ByteBuffer do
+  match stmts
+    case Nil() -> %buf
+    case Cons(v: s, rest: rest) ->
+      let %buf = emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: true)
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: exn_flag)
+      let %buf = push_byte(buf: %buf, byte: op_br_if)
+      let %buf = push_uleb128(buf: %buf, val: 0)
+      emit_try_body_stmts(stmts: rest, buf: %buf, ctx: ctx, exn_flag: exn_flag)
+  end
+end
+
+let emit_try_catch_body_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: CodegenCtx,
+                                     exn_flag: i64, in_try: bool) -> %ByteBuffer do
+  match stmts
+    case Nil() -> %buf
+    case Cons(v: s, rest: rest) ->
+      let %buf = emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: in_try)
+      if in_try then
+        let %buf = push_byte(buf: %buf, byte: op_local_get)
+        let %buf = push_uleb128(buf: %buf, val: exn_flag)
+        let %buf = push_byte(buf: %buf, byte: op_br_if)
+        let %buf = push_uleb128(buf: %buf, val: 0)
+      end
+      emit_try_catch_body_stmts(stmts: rest, buf: %buf, ctx: ctx, exn_flag: exn_flag, in_try: in_try)
+  end
+end
+
+// ─── Function body compilation ──────────────────────────────────────────────
+
+let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuffer do
+  match func
+    case LirFunction(name: _, params: ps, ret_type: rt, body: b, ret: r, span: _) ->
+      let %body = empty()
+      let %body = emit_local_decls(buf: %body, locals: ctx_locals(ctx: ctx), param_count: list.length(xs: ps))
+      let %body = emit_stmts(stmts: b, buf: %body, ctx: ctx, in_try: false)
+      if is_unit(typ: rt) == false then
+        let %body = emit_atom(atom: r, buf: %body, ctx: ctx)
+        let %body = emit_coercion(from_type: atom_type(atom: r), to_type: rt, buf: %body)
+      end
+      return push_byte(buf: %body, byte: op_end)
+  end
+end
+
+let compile_wasi_run_wrapper = fn (main_idx: i64, main_ret_type: TypeExpr) -> %ByteBuffer do
+  let %body = empty()
+  let %body = push_uleb128(buf: %body, val: 0)
+  let %body = push_byte(buf: %body, byte: op_call)
+  let %body = push_uleb128(buf: %body, val: main_idx)
+  if is_unit(typ: main_ret_type) == false then
+    let %body = push_byte(buf: %body, byte: op_drop)
+  end
+  let %body = push_byte(buf: %body, byte: op_i32_const)
+  let %body = push_sleb128(buf: %body, val: 0)
+  return push_byte(buf: %body, byte: op_end)
+end
+
+// ─── Code section / context building ────────────────────────────────────────
+
+let build_param_locals = fn (params: [LirParam], idx: i64) -> [LocalEntry] do
+  match params
+    case Nil() -> Nil()
+    case Cons(v: LirParam(label: _, name: n, typ: t), rest: rest) ->
+      Cons(v: LocalEntry(name: n, index: idx, valtype: type_to_valtype(typ: t)),
+           rest: build_param_locals(params: rest, idx: idx + 1))
+  end
+end
+
+let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
+                          external_funcs: [FuncEntry], string_lits: [StringEntry],
+                          heap_enabled: bool, functions: [LirFunction],
+                          externals: [LirExternal]) -> CodegenCtx do
+  match func
+    case LirFunction(name: _, params: ps, ret_type: rt, body: b, ret: _, span: _) ->
+      let param_locals = build_param_locals(params: ps, idx: 0)
+      let param_count = list.length(xs: ps)
+      let r = collect_local_stmts(stmts: b, locals: param_locals, next_idx: param_count)
+      CodegenCtx(
+        locals: r.locals, internal_funcs: internal_funcs, external_funcs: external_funcs,
+        string_lits: string_lits, heap_enabled: heap_enabled, temps_base: r.next_idx,
+        func_ret_type: rt, functions: functions, externals: externals
+      )
+  end
+end
+
+let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
+                            internal_funcs: [FuncEntry], external_funcs: [FuncEntry],
+                            string_lits: [StringEntry], heap_enabled: bool,
+                            functions: [LirFunction], externals: [LirExternal]) -> %ByteBuffer do
+  match funcs
+    case Nil() -> %buf
+    case Cons(v: f, rest: rest) ->
+      let ctx = build_func_ctx(func: f, internal_funcs: internal_funcs,
+                                external_funcs: external_funcs, string_lits: string_lits,
+                                heap_enabled: heap_enabled, functions: functions, externals: externals)
+      let %body = compile_function_body(func: f, ctx: ctx)
+      let body_len = bb.length(buf: &body)
+      let %buf = push_uleb128(buf: %buf, val: body_len)
+      let %buf = push_buf(dst: %buf, src: &body)
+      free(buf: %body)
+      emit_code_bodies(buf: %buf, funcs: rest, internal_funcs: internal_funcs,
+                        external_funcs: external_funcs, string_lits: string_lits,
+                        heap_enabled: heap_enabled, functions: functions, externals: externals)
+  end
+end
+
+// ─── Module assembly ────────────────────────────────────────────────────────
+
+let build_internal_func_entries = fn (funcs: [LirFunction], import_count: i64, idx: i64) -> [FuncEntry] do
+  match funcs
+    case Nil() -> Nil()
+    case Cons(v: LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _), rest: rest) ->
+      Cons(v: FuncEntry(name: n, index: import_count + idx),
+           rest: build_internal_func_entries(funcs: rest, import_count: import_count, idx: idx + 1))
+  end
+end
+
+let build_external_func_entries = fn (exts: [LirExternal], idx: i64) -> [FuncEntry] do
+  match exts
+    case Nil() -> Nil()
+    case Cons(v: LirExternal(name: n, wasm_module: _, wasm_name: _, params: _, ret_type: _, throw_row: _), rest: rest) ->
+      Cons(v: FuncEntry(name: n, index: idx),
+           rest: build_external_func_entries(exts: rest, idx: idx + 1))
+  end
+end
+
+pub let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
+  match program
+    case LirProgram(functions: funcs, externals: exts) ->
+      let n_exts = list.length(xs: exts)
+      let n_funcs = list.length(xs: funcs)
+      let import_count = n_exts
+
+      let internal_funcs = build_internal_func_entries(funcs: funcs, import_count: import_count, idx: 0)
+      let external_funcs = build_external_func_entries(exts: exts, idx: 0)
+
+      let main_idx = lookup_func(name: "main", entries: internal_funcs)
+      let main_ret = match find_function(name: "main", funcs: funcs)
+        case Some(val: LirFunction(name: _, params: _, ret_type: rt, body: _, ret: _, span: _)) -> rt
+        case None() -> TyUnit()
+      end
+
+      let all_strings = collect_program_strings(funcs: funcs, acc: Nil())
+      let string_entries = build_string_entries(strings: all_strings, next_offset: string_data_base, acc: Nil())
+      let has_strings = list.length(xs: string_entries) > 0
+
+      let heap_enabled = program_uses_heap(funcs: funcs)
+      let mem_mode = choose_memory_mode(externals: exts, has_strings: has_strings, has_heap: heap_enabled)
+
+      let last_end = compute_last_string_end(entries: string_entries)
+      let heap_base_raw = match last_end > string_data_base case true -> last_end case false -> string_data_base end
+      let heap_base = align8(v: heap_base_raw)
+
+      let wasi_run_idx = import_count + n_funcs
+
+      // WASM magic + version
+      let %m = empty()
+      let %m = push_byte(buf: %m, byte: 0)
+      let %m = push_byte(buf: %m, byte: 97)
+      let %m = push_byte(buf: %m, byte: 115)
+      let %m = push_byte(buf: %m, byte: 109)
+      let %m = push_byte(buf: %m, byte: 1)
+      let %m = push_byte(buf: %m, byte: 0)
+      let %m = push_byte(buf: %m, byte: 0)
+      let %m = push_byte(buf: %m, byte: 0)
+
+      // Type section
+      let %m = emit_section(buf: %m, id: sec_type, content: build_type_section(program: program))
+
+      // Import section
+      if n_exts > 0 || (mem_mode != "none" && mem_mode != "defined") then
+        let %m = emit_section(buf: %m, id: sec_import, content: build_import_section(exts: exts, mem_mode: mem_mode))
+      end
+
+      // Function section
+      let %m = emit_section(buf: %m, id: sec_function, content: build_function_section(n_funcs: n_funcs, n_exts: n_exts))
+
+      // Memory section
+      if mem_mode == "defined" then
+        let %m = emit_section(buf: %m, id: sec_memory, content: build_memory_section())
+      end
+
+      // Global section
+      if heap_enabled then
+        let %m = emit_section(buf: %m, id: sec_global, content: build_global_section(heap_base: heap_base))
+      end
+
+      // Export section
+      let %m = emit_section(buf: %m, id: sec_export,
+                             content: build_export_section(main_idx: main_idx, wasi_run_idx: wasi_run_idx, mem_mode: mem_mode))
+
+      // Code section
+      let %code = empty()
+      let %code = push_uleb128(buf: %code, val: n_funcs + 1)
+      let %code = emit_code_bodies(buf: %code, funcs: funcs, internal_funcs: internal_funcs,
+                                    external_funcs: external_funcs, string_lits: string_entries,
+                                    heap_enabled: heap_enabled, functions: funcs, externals: exts)
+      let %wasi_body = compile_wasi_run_wrapper(main_idx: main_idx, main_ret_type: main_ret)
+      let wasi_len = bb.length(buf: &wasi_body)
+      let %code = push_uleb128(buf: %code, val: wasi_len)
+      let %code = push_buf(dst: %code, src: &wasi_body)
+      free(buf: %wasi_body)
+      let %m = emit_section(buf: %m, id: sec_code, content: %code)
+
+      // Data section
+      if has_strings then
+        let %m = emit_section(buf: %m, id: sec_data, content: build_data_section(entries: string_entries))
+      end
+
+      return %m
+  end
+end

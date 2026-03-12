@@ -436,20 +436,24 @@ end
 // ─── Top-level definition processing ─────────────────────────────────────────
 
 /// Process result for accumulating HIR definitions.
+pub type ConstantEntry = ConstantEntry(name: string, lit: Literal)
+
 pub type HirAccum = HirAccum(
   ports: [HirPort],
   functions: [HirFunction],
   externals: [HirExternal],
   handler_bindings: [HirHandlerBindingEntry],
   enum_defs: [EnumDef],
-  wasm_module: Option<string>
+  wasm_module: Option<string>,
+  constants: [ConstantEntry]
 )
 
 /// Create an empty HirAccum.
 pub let empty_accum = fn () -> HirAccum do
   return HirAccum(
     ports: Nil(), functions: Nil(), externals: Nil(),
-    handler_bindings: Nil(), enum_defs: Nil(), wasm_module: None()
+    handler_bindings: Nil(), enum_defs: Nil(), wasm_module: None(),
+    constants: Nil()
   )
 end
 
@@ -466,14 +470,14 @@ pub let process_defs = fn (defs: [SpannedTopLevel], entries: [RenameEntry], accu
 end
 
 let process_top_level = fn (node: TopLevel, span: Span, entries: [RenameEntry], accum: HirAccum) -> HirAccum do
-  match accum do case HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod) ->
+  match accum do case HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, constants: csts) ->
     match node do
       case TLImport(def: imp) ->
         match imp do case ImportDef(path: path, alias: _, items: _, is_external: is_ext) ->
           if is_ext then
-            // Track current wasm module for subsequent external declarations
             return HirAccum(ports: ps, functions: fs, externals: exts,
-              handler_bindings: hbs, enum_defs: eds, wasm_module: Some(val: path))
+              handler_bindings: hbs, enum_defs: eds, wasm_module: Some(val: path),
+              constants: csts)
           else
             return accum
           end
@@ -482,41 +486,44 @@ let process_top_level = fn (node: TopLevel, span: Span, entries: [RenameEntry], 
         match gl do case GlobalLet(name: name, is_public: _, typ: _, value: val) ->
           let qname = rename(name: name, entries: entries)
           let hir_val = convert_expr(expr: val, entries: entries)
-          // Check if this is a handler binding
           match hir_val do
             case HirHandler(functions: handler_funcs) ->
-              // Synthesize handler binding
               let binding = synthesize_handler(
                 binding_name: qname, functions: handler_funcs)
               return HirAccum(ports: ps, functions: fs, externals: exts,
                 handler_bindings: Cons(v: binding, rest: hbs),
-                enum_defs: eds, wasm_module: wmod)
+                enum_defs: eds, wasm_module: wmod, constants: csts)
             case HirLambda(params: lps, ret_type: rt, body: body) ->
-              // Regular function
               let func = HirFunction(name: qname, params: lps, ret_type: rt, body: body, span: span)
               return HirAccum(ports: ps, functions: Cons(v: func, rest: fs),
-                externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod)
+                externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod,
+                constants: csts)
             case HirExternal_(symbol: sym, arg_names: anames, typ: t) ->
-              // External: collect with current wasm module
               match wmod do
                 case Some(val: wm) ->
                   let ext = make_hir_external(name: qname, wasm_module: wm,
                     wasm_name: sym, arg_names: anames, typ: t)
                   return HirAccum(ports: ps, functions: fs,
                     externals: Cons(v: ext, rest: exts),
-                    handler_bindings: hbs, enum_defs: eds, wasm_module: wmod)
+                    handler_bindings: hbs, enum_defs: eds, wasm_module: wmod,
+                    constants: csts)
                 case None() ->
-                  // No wasm module context, skip
                   return accum
               end
+            case HirLiteral(lit: lit) ->
+              // Literal constant — store for inlining, don't create a function
+              return HirAccum(ports: ps, functions: fs, externals: exts,
+                handler_bindings: hbs, enum_defs: eds, wasm_module: wmod,
+                constants: Cons(v: ConstantEntry(name: qname, lit: lit), rest: csts))
             case _ ->
-              // Constant binding — wrap as zero-arg function
+              // Non-literal non-function binding — wrap as zero-arg function
               let func = HirFunction(
                 name: qname, params: Nil(), ret_type: TyUnit,
                 body: Cons(v: HirStmtReturn(expr: hir_val), rest: Nil()),
                 span: span)
               return HirAccum(ports: ps, functions: Cons(v: func, rest: fs),
-                externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod)
+                externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod,
+                constants: csts)
           end
         end
       case TLPort(def: p) ->
@@ -524,12 +531,13 @@ let process_top_level = fn (node: TopLevel, span: Span, entries: [RenameEntry], 
           let qname = rename(name: pname, entries: entries)
           let hir_port = HirPort(name: qname, methods: convert_port_sigs(sigs: sigs))
           return HirAccum(ports: Cons(v: hir_port, rest: ps), functions: fs,
-            externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod)
+            externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod,
+            constants: csts)
         end
       case TLEnum(def: ed) ->
         return HirAccum(ports: ps, functions: fs, externals: exts,
           handler_bindings: hbs,
-          enum_defs: Cons(v: ed, rest: eds), wasm_module: wmod)
+          enum_defs: Cons(v: ed, rest: eds), wasm_module: wmod, constants: csts)
       case TLTypeDef(def: _) -> return accum
       case TLException(def: _) -> return accum
     end
@@ -807,9 +815,11 @@ end
 
 /// Assemble a HirProgram from an accumulator with reachability filtering.
 pub let accum_to_program = fn (accum: HirAccum) -> HirProgram do
-  match accum do case HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: _) ->
-    let reachable = collect_reachable(functions: fs, handler_bindings: hbs)
-    let filtered_funcs = filter_reachable_functions(functions: fs, reachable: reachable)
+  match accum do case HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: _, constants: csts) ->
+    // Inline top-level constants into function bodies
+    let inlined_funcs = inline_constants_in_functions(functions: fs, constants: csts)
+    let reachable = collect_reachable(functions: inlined_funcs, handler_bindings: hbs)
+    let filtered_funcs = filter_reachable_functions(functions: inlined_funcs, reachable: reachable)
     let filtered_exts = filter_reachable_externals(externals: exts, reachable: reachable)
     return HirProgram(
       ports: ps,
@@ -837,6 +847,173 @@ let str_in_list = fn (s: string, xs: [string]) -> bool do
     case Cons(v: x, rest: rest) ->
       if x == s then return true
       else return str_in_list(s: s, xs: rest)
+      end
+  end
+end
+
+// ─── Constant Inlining ────────────────────────────────────────────────────
+
+let lookup_constant = fn (name: string, constants: [ConstantEntry]) -> Option<Literal> do
+  match constants do
+    case Nil() -> return None()
+    case Cons(v: c, rest: rest) ->
+      match c do case ConstantEntry(name: n, lit: l) ->
+        if n == name then return Some(val: l)
+        else return lookup_constant(name: name, constants: rest)
+        end
+      end
+  end
+end
+
+let inline_constants_in_functions = fn (functions: [HirFunction], constants: [ConstantEntry]) -> [HirFunction] do
+  match functions do
+    case Nil() -> return Nil()
+    case Cons(v: f, rest: rest) ->
+      match f do case HirFunction(name: n, params: ps, ret_type: rt, body: b, span: sp) ->
+        let new_body = inline_constants_stmts(stmts: b, constants: constants)
+        return Cons(
+          v: HirFunction(name: n, params: ps, ret_type: rt, body: new_body, span: sp),
+          rest: inline_constants_in_functions(functions: rest, constants: constants))
+      end
+  end
+end
+
+let inline_constants_stmts = fn (stmts: [HirStmt], constants: [ConstantEntry]) -> [HirStmt] do
+  match stmts do
+    case Nil() -> return Nil()
+    case Cons(v: s, rest: rest) ->
+      return Cons(v: inline_constants_stmt(stmt: s, constants: constants),
+        rest: inline_constants_stmts(stmts: rest, constants: constants))
+  end
+end
+
+let inline_constants_stmt = fn (stmt: HirStmt, constants: [ConstantEntry]) -> HirStmt do
+  match stmt do
+    case HirStmtLet(name: n, typ: t, value: v) ->
+      return HirStmtLet(name: n, typ: t, value: inline_constants_expr(expr: v, constants: constants))
+    case HirStmtExpr(expr: e) ->
+      return HirStmtExpr(expr: inline_constants_expr(expr: e, constants: constants))
+    case HirStmtReturn(expr: e) ->
+      return HirStmtReturn(expr: inline_constants_expr(expr: e, constants: constants))
+    case HirStmtAssign(target: t, value: v) ->
+      return HirStmtAssign(
+        target: inline_constants_expr(expr: t, constants: constants),
+        value: inline_constants_expr(expr: v, constants: constants))
+    case HirStmtConc(tasks: _) -> return stmt
+    case HirStmtTry(body: b, catch_param: cp, catch_body: cb) ->
+      return HirStmtTry(
+        body: inline_constants_stmts(stmts: b, constants: constants),
+        catch_param: cp,
+        catch_body: inline_constants_stmts(stmts: cb, constants: constants))
+    case HirStmtInject(handlers: _, body: b) ->
+      return stmt
+  end
+end
+
+let inline_constants_expr = fn (expr: HirExpr, constants: [ConstantEntry]) -> HirExpr do
+  match expr do
+    case HirVariable(name: n, sigil: _) ->
+      match lookup_constant(name: n, constants: constants) do
+        case Some(val: lit) -> return HirLiteral(lit: lit)
+        case None() -> return expr
+      end
+    case HirLiteral(lit: _) -> return expr
+    case HirBinaryOp(left: l, op: op, right: r) ->
+      return HirBinaryOp(
+        left: inline_constants_expr(expr: l, constants: constants),
+        op: op,
+        right: inline_constants_expr(expr: r, constants: constants))
+    case HirCall(func: f, args: args) ->
+      return HirCall(func: f,
+        args: inline_constants_call_args(args: args, constants: constants))
+    case HirConstructor(variant: v, args: args) ->
+      return HirConstructor(variant: v,
+        args: inline_constants_expr_list(exprs: args, constants: constants))
+    case HirRecord(fields: fs) ->
+      return HirRecord(fields: inline_constants_named_exprs(exprs: fs, constants: constants))
+    case HirArray(elems: es) ->
+      return HirArray(elems: inline_constants_expr_list(exprs: es, constants: constants))
+    case HirIndex(target: t, index: i) ->
+      return HirIndex(
+        target: inline_constants_expr(expr: t, constants: constants),
+        index: inline_constants_expr(expr: i, constants: constants))
+    case HirFieldAccess(target: t, field: f) ->
+      return HirFieldAccess(target: inline_constants_expr(expr: t, constants: constants), field: f)
+    case HirIf(cond: c, then_branch: tb, else_branch: eb) ->
+      let new_eb = match eb do
+        case Some(val: stmts) -> Some(val: inline_constants_stmts(stmts: stmts, constants: constants))
+        case None() -> None()
+      end
+      return HirIf(
+        cond: inline_constants_expr(expr: c, constants: constants),
+        then_branch: inline_constants_stmts(stmts: tb, constants: constants),
+        else_branch: new_eb)
+    case HirMatch(target: t, cases: cs) ->
+      return HirMatch(
+        target: inline_constants_expr(expr: t, constants: constants),
+        cases: inline_constants_match_cases(cases: cs, constants: constants))
+    case HirWhile(cond: c, body: b) ->
+      return HirWhile(
+        cond: inline_constants_expr(expr: c, constants: constants),
+        body: inline_constants_stmts(stmts: b, constants: constants))
+    case HirFor(var: v, start: s, end_expr: e, body: b) ->
+      return HirFor(var: v,
+        start: inline_constants_expr(expr: s, constants: constants),
+        end_expr: inline_constants_expr(expr: e, constants: constants),
+        body: inline_constants_stmts(stmts: b, constants: constants))
+    case HirLambda(params: ps, ret_type: rt, body: b) ->
+      return HirLambda(params: ps, ret_type: rt,
+        body: inline_constants_stmts(stmts: b, constants: constants))
+    case HirRaise(expr: e) ->
+      return HirRaise(expr: inline_constants_expr(expr: e, constants: constants))
+    case HirBorrow(name: _, sigil: _) -> return expr
+    case HirExternal_(symbol: _, arg_names: _, typ: _) -> return expr
+    case HirHandler(functions: _) -> return expr
+  end
+end
+
+let inline_constants_call_args = fn (args: [HirCallArg], constants: [ConstantEntry]) -> [HirCallArg] do
+  match args do
+    case Nil() -> return Nil()
+    case Cons(v: a, rest: rest) ->
+      match a do case HirCallArg(label: l, value: v) ->
+        return Cons(
+          v: HirCallArg(label: l, value: inline_constants_expr(expr: v, constants: constants)),
+          rest: inline_constants_call_args(args: rest, constants: constants))
+      end
+  end
+end
+
+let inline_constants_expr_list = fn (exprs: [HirExpr], constants: [ConstantEntry]) -> [HirExpr] do
+  match exprs do
+    case Nil() -> return Nil()
+    case Cons(v: e, rest: rest) ->
+      return Cons(v: inline_constants_expr(expr: e, constants: constants),
+        rest: inline_constants_expr_list(exprs: rest, constants: constants))
+  end
+end
+
+let inline_constants_named_exprs = fn (exprs: [HirNamedExpr], constants: [ConstantEntry]) -> [HirNamedExpr] do
+  match exprs do
+    case Nil() -> return Nil()
+    case Cons(v: ne, rest: rest) ->
+      match ne do case HirNamedExpr(name: n, value: v) ->
+        return Cons(
+          v: HirNamedExpr(name: n, value: inline_constants_expr(expr: v, constants: constants)),
+          rest: inline_constants_named_exprs(exprs: rest, constants: constants))
+      end
+  end
+end
+
+let inline_constants_match_cases = fn (cases: [HirMatchCase], constants: [ConstantEntry]) -> [HirMatchCase] do
+  match cases do
+    case Nil() -> return Nil()
+    case Cons(v: c, rest: rest) ->
+      match c do case HirMatchCase(pattern: p, body: b) ->
+        return Cons(
+          v: HirMatchCase(pattern: p,
+            body: inline_constants_stmts(stmts: b, constants: constants)),
+          rest: inline_constants_match_cases(cases: rest, constants: constants))
       end
   end
 end

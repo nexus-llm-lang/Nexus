@@ -1,4 +1,4 @@
-use crate::common::wasm::{exec_with_stdlib, read_fixture};
+use crate::harness::{exec_with_stdlib, read_fixture};
 
 #[test]
 fn hashmap_put_get_or_and_contains_key() {

@@ -959,8 +959,10 @@ let emit_atom = fn (atom: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBu
   match atom do
     case LirAtomVar(name: n, typ: _) ->
       let idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
+      // Guard: prevent invalid WASM from unresolved variables (9-byte LEB128)
+      let safe_idx = match idx < 0 do case true -> 0 case false -> idx end
       let %buf = push_byte(buf: %buf, byte: op_local_get)
-      let %buf = push_uleb128(buf: %buf, val: idx)
+      let %buf = push_uleb128(buf: %buf, val: safe_idx)
       return %buf
     case LirAtomInt(val: v) ->
       let %buf = push_byte(buf: %buf, byte: op_i64_const)
@@ -1696,6 +1698,16 @@ end
 
 // ─── Statement Emission ─────────────────────────────────────────────────────
 
+let emit_optional_else_ret = fn (buf: %ByteBuffer, er: Option<LirAtom>, rt: TypeExpr, ctx: CodegenCtx) -> %ByteBuffer do
+  match er do
+    case Some(val: a) ->
+      let %buf = emit_atom(atom: a, buf: %buf, ctx: ctx)
+      let %buf = emit_coercion(from_type: atom_type(atom: a), to_type: rt, buf: %buf)
+      return push_byte(buf: %buf, byte: op_return)
+    case None() -> return %buf
+  end
+end
+
 let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool) -> %ByteBuffer do
   match stmt do
     case LirStmtLet(name: n, typ: t, expr: e) ->
@@ -1708,8 +1720,9 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       else
         let %buf = emit_coercion(from_type: et, to_type: t, buf: %buf)
         let idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
+        let safe_idx = match idx < 0 do case true -> 0 case false -> idx end
         let %buf = push_byte(buf: %buf, byte: op_local_set)
-        let %buf = push_uleb128(buf: %buf, val: idx)
+        let %buf = push_uleb128(buf: %buf, val: safe_idx)
         return %buf
       end
 
@@ -1719,10 +1732,8 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = push_byte(buf: %buf, byte: op_if)
       let %buf = push_byte(buf: %buf, byte: bt_void)
       let %buf = emit_stmts(stmts: tb, buf: %buf, ctx: ctx, in_try: in_try)
-      if list.length(xs: eb) > 0 then
-        let %buf = push_byte(buf: %buf, byte: op_else)
-        let %buf = emit_stmts(stmts: eb, buf: %buf, ctx: ctx, in_try: in_try)
-      end
+      let %buf = push_byte(buf: %buf, byte: op_else)
+      let %buf = emit_stmts(stmts: eb, buf: %buf, ctx: ctx, in_try: in_try)
       let %buf = push_byte(buf: %buf, byte: op_end)
       return %buf
 
@@ -1735,19 +1746,9 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = emit_atom(atom: tr, buf: %buf, ctx: ctx)
       let %buf = emit_coercion(from_type: atom_type(atom: tr), to_type: rt, buf: %buf)
       let %buf = push_byte(buf: %buf, byte: op_return)
-      let has_else = list.length(xs: eb) > 0
-      let has_else_ret = match er do case Some(val: _) -> true case None() -> false end
-      if has_else || has_else_ret then
-        let %buf = push_byte(buf: %buf, byte: op_else)
-        let %buf = emit_stmts(stmts: eb, buf: %buf, ctx: ctx, in_try: in_try)
-        match er do
-          case Some(val: a) ->
-            let %buf = emit_atom(atom: a, buf: %buf, ctx: ctx)
-            let %buf = emit_coercion(from_type: atom_type(atom: a), to_type: rt, buf: %buf)
-            let %buf = push_byte(buf: %buf, byte: op_return)
-          case None() -> ()
-        end
-      end
+      let %buf = push_byte(buf: %buf, byte: op_else)
+      let %buf = emit_stmts(stmts: eb, buf: %buf, ctx: ctx, in_try: in_try)
+      let %buf = emit_optional_else_ret(buf: %buf, er: er, rt: rt, ctx: ctx)
       let %buf = push_byte(buf: %buf, byte: op_end)
       return %buf
 
@@ -1773,7 +1774,8 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
                           catch_body: cb, catch_ret: cr) ->
       let exn_value = ctx_temps_base(ctx: ctx) + 1
       let exn_flag = ctx_temps_base(ctx: ctx) + 2
-      let catch_local_idx = lookup_local(name: cp, entries: ctx_locals(ctx: ctx))
+      let catch_local_raw = lookup_local(name: cp, entries: ctx_locals(ctx: ctx))
+      let catch_local_idx = match catch_local_raw < 0 do case true -> 0 case false -> catch_local_raw end
 
       // exn_flag = 0
       let %buf = push_byte(buf: %buf, byte: op_i32_const)
@@ -1877,15 +1879,47 @@ end
 
 // ─── Function Body Compilation ──────────────────────────────────────────────
 
+// Sort locals by index so WASM declaration order matches registered indices.
+// register_local assigns sequential indices but Cons prepends, reversing the list.
+let sort_locals_by_index = fn (locals: [LocalEntry]) -> [LocalEntry] do
+  return sort_locals_insert(sorted: Nil(), remaining: locals)
+end
+
+let sort_locals_insert = fn (sorted: [LocalEntry], remaining: [LocalEntry]) -> [LocalEntry] do
+  match remaining do
+    case Nil() -> return sorted
+    case Cons(v: e, rest: rest) ->
+      return sort_locals_insert(sorted: insert_local_sorted(entry: e, into: sorted), remaining: rest)
+  end
+end
+
+let insert_local_sorted = fn (entry: LocalEntry, into: [LocalEntry]) -> [LocalEntry] do
+  match entry do case LocalEntry(name: _, index: ei, valtype: _) ->
+    match into do
+      case Nil() -> return Cons(v: entry, rest: Nil())
+      case Cons(v: head, rest: tail) ->
+        match head do case LocalEntry(name: _, index: hi, valtype: _) ->
+          if ei <= hi then
+            return Cons(v: entry, rest: into)
+          else
+            return Cons(v: head, rest: insert_local_sorted(entry: entry, into: tail))
+          end
+        end
+    end
+  end
+end
+
 let emit_local_decls = fn (buf: %ByteBuffer, locals: [LocalEntry], param_count: i64) -> %ByteBuffer do
   // Filter out params (indices < param_count) and count non-param locals
   let non_param = count_non_param_locals(locals: locals, param_count: param_count)
   // Add 13 reserved temp locals
   let total_groups = non_param + 13
+  // Sort locals by index so declaration order matches registered indices
+  let sorted = sort_locals_by_index(locals: locals)
   // For simplicity, emit each local as a separate group (count=1, type)
   // This is valid WASM, just slightly less compact
   let %buf = push_uleb128(buf: %buf, val: count_local_groups(locals: locals, param_count: param_count))
-  let %buf = emit_local_entries(buf: %buf, locals: locals, param_count: param_count)
+  let %buf = emit_local_entries(buf: %buf, locals: sorted, param_count: param_count)
   // Reserved temps: 2x i64, 1x i32, 1x i32, 2x i64, 7x i32
   let %buf = push_uleb128(buf: %buf, val: 2)
   let %buf = push_byte(buf: %buf, byte: vt_i64)

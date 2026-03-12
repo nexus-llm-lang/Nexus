@@ -102,6 +102,38 @@ pub enum Command {
         /// Nexus source file path. Use '-' to read from stdin.
         input: Option<PathBuf>,
     },
+    /// Execute a pre-compiled WASM module with the Nexus runtime.
+    Exec {
+        /// Path to a `.wasm` file.
+        input: PathBuf,
+        /// Allow filesystem access.
+        #[arg(long)]
+        allow_fs: bool,
+        /// Allow network access.
+        #[arg(long)]
+        allow_net: bool,
+        /// Allow console I/O (print, println).
+        #[arg(long)]
+        allow_console: bool,
+        /// Allow random number generation.
+        #[arg(long)]
+        allow_random: bool,
+        /// Allow clock/time operations.
+        #[arg(long)]
+        allow_clock: bool,
+        /// Allow process operations (exit, etc.).
+        #[arg(long)]
+        allow_proc: bool,
+        /// Allow environment variable access.
+        #[arg(long)]
+        allow_env: bool,
+        /// Preopen a host directory for guest filesystem access (repeatable).
+        #[arg(long, value_name = "DIR")]
+        preopen: Vec<PathBuf>,
+        /// Arguments to pass to the guest program (after --).
+        #[arg(last = true)]
+        guest_args: Vec<String>,
+    },
 }
 
 pub struct LoadedSource {

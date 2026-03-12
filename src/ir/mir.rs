@@ -1,19 +1,21 @@
 //! Mid-level IR — throws eliminated via static port resolution.
 //! No inject/handler/port.method() — all port calls resolved to direct function calls.
 
-use crate::lang::ast::{BinaryOp, Literal, Sigil, Span, Type};
+use crate::intern::Symbol;
+use crate::types::{BinaryOp, Literal, Sigil, Span, Type};
 
 #[derive(Debug, Clone)]
 pub struct MirProgram {
     pub functions: Vec<MirFunction>,
     pub externals: Vec<MirExternal>,
+    pub enum_defs: Vec<crate::types::EnumDef>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MirExternal {
-    pub name: String,
-    pub wasm_module: String,
-    pub wasm_name: String,
+    pub name: Symbol,
+    pub wasm_module: Symbol,
+    pub wasm_name: Symbol,
     pub params: Vec<MirParam>,
     pub ret_type: Type,
     pub throws: Type,
@@ -21,7 +23,7 @@ pub struct MirExternal {
 
 #[derive(Debug, Clone)]
 pub struct MirFunction {
-    pub name: String,
+    pub name: Symbol,
     pub params: Vec<MirParam>,
     pub ret_type: Type,
     pub body: Vec<MirStmt>,
@@ -30,15 +32,15 @@ pub struct MirFunction {
 
 #[derive(Debug, Clone)]
 pub struct MirParam {
-    pub label: String,
-    pub name: String,
+    pub label: Symbol,
+    pub name: Symbol,
     pub typ: Type,
 }
 
 #[derive(Debug, Clone)]
 pub enum MirStmt {
     Let {
-        name: String,
+        name: Symbol,
         typ: Type,
         expr: MirExpr,
     },
@@ -51,7 +53,7 @@ pub enum MirStmt {
     Conc(Vec<MirFunction>),
     Try {
         body: Vec<MirStmt>,
-        catch_param: String,
+        catch_param: Symbol,
         catch_body: Vec<MirStmt>,
     },
 }
@@ -59,21 +61,21 @@ pub enum MirStmt {
 #[derive(Debug, Clone)]
 pub enum MirExpr {
     Literal(Literal),
-    Variable(String),
+    Variable(Symbol),
     BinaryOp(Box<MirExpr>, BinaryOp, Box<MirExpr>),
     Call {
-        func: String,
-        args: Vec<(String, MirExpr)>,
+        func: Symbol,
+        args: Vec<(Symbol, MirExpr)>,
         ret_type: Type,
     },
     Constructor {
-        name: String,
-        args: Vec<MirExpr>,
+        name: Symbol,
+        args: Vec<(Option<Symbol>, MirExpr)>,
     },
-    Record(Vec<(String, MirExpr)>),
+    Record(Vec<(Symbol, MirExpr)>),
     Array(Vec<MirExpr>),
     Index(Box<MirExpr>, Box<MirExpr>),
-    FieldAccess(Box<MirExpr>, String),
+    FieldAccess(Box<MirExpr>, Symbol),
     If {
         cond: Box<MirExpr>,
         then_body: Vec<MirStmt>,
@@ -87,7 +89,7 @@ pub enum MirExpr {
         cond: Box<MirExpr>,
         body: Vec<MirStmt>,
     },
-    Borrow(String),
+    Borrow(Symbol),
     Raise(Box<MirExpr>),
 }
 
@@ -100,11 +102,11 @@ pub struct MirMatchCase {
 #[derive(Debug, Clone)]
 pub enum MirPattern {
     Literal(Literal),
-    Variable(String, Sigil),
+    Variable(Symbol, Sigil),
     Constructor {
-        name: String,
-        fields: Vec<(Option<String>, MirPattern)>,
+        name: Symbol,
+        fields: Vec<(Option<Symbol>, MirPattern)>,
     },
-    Record(Vec<(String, MirPattern)>, bool),
+    Record(Vec<(Symbol, MirPattern)>, bool),
     Wildcard,
 }

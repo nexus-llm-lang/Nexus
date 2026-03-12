@@ -1,7 +1,6 @@
 use super::HirBuildError;
 use super::LirLowerError;
-use super::MirLowerError;
-use crate::lang::ast::BinaryOp;
+use crate::types::BinaryOp;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodegenError {
@@ -28,12 +27,6 @@ pub enum CodegenError {
         name: String,
         expected: usize,
         got: usize,
-    },
-    /// E2009: call label mismatch
-    CallLabelMismatch {
-        name: String,
-        expected: String,
-        got: String,
     },
     /// E2010: conflicting wasm local types
     ConflictingLocalTypes { name: String },
@@ -66,7 +59,6 @@ impl CodegenError {
             CodegenError::UnsupportedCoercion { .. } => "E2006",
             CodegenError::CallTargetNotFound { .. } => "E2007",
             CodegenError::CallArityMismatch { .. } => "E2008",
-            CodegenError::CallLabelMismatch { .. } => "E2009",
             CodegenError::ConflictingLocalTypes { .. } => "E2010",
             CodegenError::ObjectHeapRequired { .. } => "E2011",
             CodegenError::UnsupportedPack { .. } => "E2012",
@@ -116,16 +108,6 @@ impl std::fmt::Display for CodegenError {
             } => {
                 format!(
                     "call arity mismatch for '{}': expected {}, got {}",
-                    name, expected, got
-                )
-            }
-            CodegenError::CallLabelMismatch {
-                name,
-                expected,
-                got,
-            } => {
-                format!(
-                    "call label mismatch for '{}': expected '{}', got '{}'",
                     name, expected, got
                 )
             }
@@ -182,7 +164,6 @@ impl std::error::Error for CodegenError {}
 #[derive(Debug)]
 pub enum CompileError {
     HirBuild(HirBuildError),
-    MirLower(MirLowerError),
     LirLower(LirLowerError),
     Codegen(CodegenError),
     MainSignature(String),
@@ -190,10 +171,9 @@ pub enum CompileError {
 
 impl CompileError {
     /// Returns the source span associated with this error, if available.
-    pub fn span(&self) -> Option<&crate::lang::ast::Span> {
+    pub fn span(&self) -> Option<&crate::types::Span> {
         match self {
             CompileError::HirBuild(e) => Some(e.span()),
-            CompileError::MirLower(e) => Some(e.span()),
             CompileError::LirLower(e) => Some(e.span()),
             CompileError::Codegen(_) | CompileError::MainSignature(_) => None,
         }
@@ -204,7 +184,6 @@ impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CompileError::HirBuild(e) => write!(f, "{}", e),
-            CompileError::MirLower(e) => write!(f, "{}", e),
             CompileError::LirLower(e) => write!(f, "{}", e),
             CompileError::Codegen(e) => write!(f, "{}", e),
             CompileError::MainSignature(msg) => write!(f, "{}", msg),
@@ -218,16 +197,14 @@ impl std::error::Error for CompileError {}
 #[derive(Debug, Clone)]
 pub struct CompileMetrics {
     pub hir_build: std::time::Duration,
-    pub mir_lower: std::time::Duration,
     pub lir_lower: std::time::Duration,
     pub codegen: std::time::Duration,
 }
 
 impl std::fmt::Display for CompileMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let total = self.hir_build + self.mir_lower + self.lir_lower + self.codegen;
-        writeln!(f, "  hir_build  {:>8.2?}", self.hir_build)?;
-        writeln!(f, "  mir_lower  {:>8.2?}", self.mir_lower)?;
+        let total = self.hir_build + self.lir_lower + self.codegen;
+        writeln!(f, "  build      {:>8.2?}", self.hir_build)?;
         writeln!(f, "  lir_lower  {:>8.2?}", self.lir_lower)?;
         writeln!(f, "  codegen    {:>8.2?}", self.codegen)?;
         write!(f, "  total      {:>8.2?}", total)

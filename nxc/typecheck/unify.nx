@@ -1,0 +1,371 @@
+/**
+ * unify: Robinson-style type unification.
+ *
+ * Supports numeric flex (IntLit ↔ I32/I64), borrow transparency,
+ * row polymorphism for effects, and record structural matching.
+ */
+
+import { TypeExpr, NamedType } from nxc/common/ast.nx
+import { SubstEntry, apply_subst, compose_subst, singleton_subst,
+         occurs_check } from nxc/typecheck/subst.nx
+
+// ─── Types ──────────────────────────────────────────────────────────────────
+
+pub type UnifyResult =
+  UnifyOk(subst: [SubstEntry])
+  | UnifyErr(msg: string)
+
+type RowSplit = RowSplit(only1: [TypeExpr], only2: [TypeExpr])
+
+// ─── Type equality ──────────────────────────────────────────────────────────
+
+pub let type_eq = fn (a: TypeExpr, b: TypeExpr) -> bool do
+  match a
+    case TyI32() -> match b case TyI32() -> true case _ -> false end
+    case TyI64() -> match b case TyI64() -> true case _ -> false end
+    case TyF32() -> match b case TyF32() -> true case _ -> false end
+    case TyF64() -> match b case TyF64() -> true case _ -> false end
+    case TyBool() -> match b case TyBool() -> true case _ -> false end
+    case TyString() -> match b case TyString() -> true case _ -> false end
+    case TyUnit() -> match b case TyUnit() -> true case _ -> false end
+    case TyIntLit() -> match b case TyIntLit() -> true case _ -> false end
+    case TyFloatLit() -> match b case TyFloatLit() -> true case _ -> false end
+    case TyVar(name: n1) ->
+      match b case TyVar(name: n2) -> n1 == n2 case _ -> false end
+    case TyUserDefined(name: n1, args: a1) ->
+      match b
+        case TyUserDefined(name: n2, args: a2) ->
+          if n1 == n2 then type_list_eq(a: a1, b: a2) else false end
+        case _ -> false
+      end
+    case TyArrow(params: p1, ret: r1, requires: req1, throw_row: thr1) ->
+      match b
+        case TyArrow(params: p2, ret: r2, requires: req2, throw_row: thr2) ->
+          type_eq(a: r1, b: r2)
+          && type_eq(a: req1, b: req2)
+          && type_eq(a: thr1, b: thr2)
+          && named_type_list_eq(a: p1, b: p2)
+        case _ -> false
+      end
+    case TyRef(inner: i1) ->
+      match b case TyRef(inner: i2) -> type_eq(a: i1, b: i2) case _ -> false end
+    case TyLinear(inner: i1) ->
+      match b case TyLinear(inner: i2) -> type_eq(a: i1, b: i2) case _ -> false end
+    case TyBorrow(inner: i1) ->
+      match b case TyBorrow(inner: i2) -> type_eq(a: i1, b: i2) case _ -> false end
+    case TyArray(elem: e1) ->
+      match b case TyArray(elem: e2) -> type_eq(a: e1, b: e2) case _ -> false end
+    case TyList(elem: e1) ->
+      match b case TyList(elem: e2) -> type_eq(a: e1, b: e2) case _ -> false end
+    case TyRecord(fields: f1) ->
+      match b case TyRecord(fields: f2) -> named_type_list_eq(a: f1, b: f2) case _ -> false end
+    case TyRow(types: e1, rest: t1) ->
+      match b
+        case TyRow(types: e2, rest: t2) ->
+          if type_list_eq(a: e1, b: e2) == false then false
+          else match t1
+            case Some(val: tt1) ->
+              match t2 case Some(val: tt2) -> type_eq(a: tt1, b: tt2) case None() -> false end
+            case None() ->
+              match t2 case Some(val: _) -> false case None() -> true end
+          end end
+        case _ -> false
+      end
+    case TyHandler(name: n1, requires: r1) ->
+      match b
+        case TyHandler(name: n2, requires: r2) ->
+          if n1 == n2 then type_eq(a: r1, b: r2) else false end
+        case _ -> false
+      end
+  end
+end
+
+let type_list_eq = fn (a: [TypeExpr], b: [TypeExpr]) -> bool do
+  match { l: a, r: b }
+    case { l: Nil(), r: Nil() } -> true
+    case { l: Cons(v: x, rest: xs), r: Cons(v: y, rest: ys) } ->
+      if type_eq(a: x, b: y) then type_list_eq(a: xs, b: ys) else false end
+    case _ -> false
+  end
+end
+
+let named_type_list_eq = fn (a: [NamedType], b: [NamedType]) -> bool do
+  match { l: a, r: b }
+    case { l: Nil(), r: Nil() } -> true
+    case { l: Cons(v: NamedType(name: n1, typ: t1), rest: xs),
+           r: Cons(v: NamedType(name: n2, typ: t2), rest: ys) } ->
+      if n1 == n2 && type_eq(a: t1, b: t2) then named_type_list_eq(a: xs, b: ys)
+      else false
+      end
+    case _ -> false
+  end
+end
+
+// ─── Unification ────────────────────────────────────────────────────────────
+
+pub let unify = fn (t1: TypeExpr, t2: TypeExpr) -> UnifyResult do
+  if type_eq(a: t1, b: t2) then return UnifyOk(subst: Nil()) end
+
+  // Numeric flex: IntLit ↔ I32/I64, FloatLit ↔ F32/F64
+  match t1
+    case TyIntLit() ->
+      match t2
+        case TyI32() -> return UnifyOk(subst: Nil())
+        case TyI64() -> return UnifyOk(subst: Nil())
+        case _ -> return unify_continue(t1: t1, t2: t2)
+      end
+    case TyFloatLit() ->
+      match t2
+        case TyF32() -> return UnifyOk(subst: Nil())
+        case TyF64() -> return UnifyOk(subst: Nil())
+        case _ -> return unify_continue(t1: t1, t2: t2)
+      end
+    case TyI32() -> match t2 case TyIntLit() -> UnifyOk(subst: Nil()) case _ -> unify_continue(t1: t1, t2: t2) end
+    case TyI64() -> match t2 case TyIntLit() -> UnifyOk(subst: Nil()) case _ -> unify_continue(t1: t1, t2: t2) end
+    case TyF32() -> match t2 case TyFloatLit() -> UnifyOk(subst: Nil()) case _ -> unify_continue(t1: t1, t2: t2) end
+    case TyF64() -> match t2 case TyFloatLit() -> UnifyOk(subst: Nil()) case _ -> unify_continue(t1: t1, t2: t2) end
+    case _ -> unify_continue(t1: t1, t2: t2)
+  end
+end
+
+let unify_continue = fn (t1: TypeExpr, t2: TypeExpr) -> UnifyResult do
+  match t1
+    case TyVar(name: n) ->
+      if occurs_check(var: n, typ: t2) then UnifyErr(msg: "Recursive type")
+      else UnifyOk(subst: singleton_subst(var: n, typ: t2))
+      end
+    case _ ->
+      match t2
+        case TyVar(name: n) ->
+          if occurs_check(var: n, typ: t1) then UnifyErr(msg: "Recursive type")
+          else UnifyOk(subst: singleton_subst(var: n, typ: t1))
+          end
+        case _ -> unify_structural(t1: t1, t2: t2)
+      end
+  end
+end
+
+let unify_structural = fn (t1: TypeExpr, t2: TypeExpr) -> UnifyResult do
+  match t1
+    case TyArrow(params: p1, ret: r1, requires: req1, throw_row: thr1) ->
+      match t2
+        case TyArrow(params: p2, ret: r2, requires: req2, throw_row: thr2) ->
+          unify_arrows(p1: p1, r1: r1, req1: req1, thr1: thr1, p2: p2, r2: r2, req2: req2, thr2: thr2)
+        case _ -> UnifyErr(msg: "Type mismatch: arrow vs non-arrow")
+      end
+    case TyUserDefined(name: n1, args: a1) ->
+      match t2
+        case TyUserDefined(name: n2, args: a2) ->
+          if n1 == n2 then unify_type_lists(t1s: a1, t2s: a2, s: Nil())
+          else UnifyErr(msg: "Type mismatch: " ++ n1 ++ " vs " ++ n2)
+          end
+        case TyList(elem: inner) ->
+          if n1 == "List" then unify_ud_list(args: a1, inner: inner)
+          else UnifyErr(msg: "Type mismatch")
+          end
+        case _ -> UnifyErr(msg: "Type mismatch")
+      end
+    case TyList(elem: inner) ->
+      match t2
+        case TyList(elem: inner2) -> unify(t1: inner, t2: inner2)
+        case TyUserDefined(name: n, args: args) ->
+          if n == "List" then unify_ud_list(args: args, inner: inner)
+          else UnifyErr(msg: "Type mismatch")
+          end
+        case _ -> UnifyErr(msg: "Type mismatch")
+      end
+    case TyArray(elem: e1) ->
+      match t2 case TyArray(elem: e2) -> unify(t1: e1, t2: e2)
+               case _ -> UnifyErr(msg: "Type mismatch: array") end
+    case TyRef(inner: i1) ->
+      match t2 case TyRef(inner: i2) -> unify(t1: i1, t2: i2)
+               case _ -> UnifyErr(msg: "Type mismatch: ref") end
+    case TyLinear(inner: i1) ->
+      match t2 case TyLinear(inner: i2) -> unify(t1: i1, t2: i2)
+               case _ -> UnifyErr(msg: "Type mismatch: linear") end
+    case TyBorrow(inner: i1) ->
+      match t2
+        case TyBorrow(inner: i2) -> unify(t1: i1, t2: i2)
+        case _ -> unify(t1: i1, t2: t2)  // borrow transparency
+      end
+    case TyRecord(fields: f1) ->
+      match t2 case TyRecord(fields: f2) -> unify_named_type_lists(nt1s: f1, nt2s: f2, s: Nil())
+               case _ -> UnifyErr(msg: "Type mismatch: record") end
+    case TyRow(types: e1, rest: tail1) ->
+      match t2
+        case TyRow(types: e2, rest: tail2) -> unify_rows(e1: e1, tail1: tail1, e2: e2, tail2: tail2)
+        case _ -> UnifyErr(msg: "Type mismatch: row")
+      end
+    case TyHandler(name: n1, requires: req1) ->
+      match t2
+        case TyHandler(name: n2, requires: req2) ->
+          if n1 == n2 then unify(t1: req1, t2: req2)
+          else UnifyErr(msg: "Handler mismatch: " ++ n1 ++ " vs " ++ n2)
+          end
+        case _ -> UnifyErr(msg: "Type mismatch: handler")
+      end
+    case _ ->
+      match t2
+        case TyBorrow(inner: i2) -> unify(t1: t1, t2: i2)  // borrow transparency (rhs)
+        case _ -> UnifyErr(msg: "Type mismatch")
+      end
+  end
+end
+
+// ─── Unification helpers ────────────────────────────────────────────────────
+
+let unify_ud_list = fn (args: [TypeExpr], inner: TypeExpr) -> UnifyResult do
+  match args
+    case Cons(v: arg, rest: Nil()) -> unify(t1: arg, t2: inner)
+    case _ -> UnifyErr(msg: "List arity mismatch")
+  end
+end
+
+let unify_type_lists = fn (t1s: [TypeExpr], t2s: [TypeExpr], s: [SubstEntry]) -> UnifyResult do
+  match t1s
+    case Nil() -> match t2s case Nil() -> UnifyOk(subst: s) case _ -> UnifyErr(msg: "Type argument arity mismatch") end
+    case Cons(v: a, rest: ar) ->
+      match t2s
+        case Nil() -> UnifyErr(msg: "Type argument arity mismatch")
+        case Cons(v: b, rest: br) ->
+          match unify(t1: apply_subst(subst: s, typ: a), t2: apply_subst(subst: s, typ: b))
+            case UnifyOk(subst: sn) -> unify_type_lists(t1s: ar, t2s: br, s: compose_subst(s1: s, s2: sn))
+            case UnifyErr(msg: m) -> UnifyErr(msg: m)
+          end
+      end
+  end
+end
+
+let unify_arrows = fn (p1: [NamedType], r1: TypeExpr, req1: TypeExpr, thr1: TypeExpr,
+                        p2: [NamedType], r2: TypeExpr, req2: TypeExpr, thr2: TypeExpr) -> UnifyResult do
+  match unify_named_type_lists(nt1s: p1, nt2s: p2, s: Nil())
+    case UnifyErr(msg: m) -> UnifyErr(msg: m)
+    case UnifyOk(subst: s) ->
+      match unify(t1: apply_subst(subst: s, typ: r1), t2: apply_subst(subst: s, typ: r2))
+        case UnifyErr(msg: m) -> UnifyErr(msg: m)
+        case UnifyOk(subst: sr) ->
+          let s2 = compose_subst(s1: s, s2: sr)
+          match unify(t1: apply_subst(subst: s2, typ: req1), t2: apply_subst(subst: s2, typ: req2))
+            case UnifyErr(msg: m) -> UnifyErr(msg: m)
+            case UnifyOk(subst: sreq) ->
+              let s3 = compose_subst(s1: s2, s2: sreq)
+              match unify(t1: apply_subst(subst: s3, typ: thr1), t2: apply_subst(subst: s3, typ: thr2))
+                case UnifyErr(msg: m) -> UnifyErr(msg: m)
+                case UnifyOk(subst: sthr) -> UnifyOk(subst: compose_subst(s1: s3, s2: sthr))
+              end
+          end
+      end
+  end
+end
+
+let unify_named_type_lists = fn (nt1s: [NamedType], nt2s: [NamedType], s: [SubstEntry]) -> UnifyResult do
+  match nt1s
+    case Nil() -> match nt2s case Nil() -> UnifyOk(subst: s) case _ -> UnifyErr(msg: "Param arity mismatch") end
+    case Cons(v: NamedType(name: n1, typ: t1), rest: rest1) ->
+      match find_and_remove_by_name(name: n1, nts: nt2s)
+        case None() -> UnifyErr(msg: "Label mismatch: missing " ++ n1)
+        case Some(val: NamedType(name: _, typ: t2)) ->
+          match unify(t1: apply_subst(subst: s, typ: t1), t2: apply_subst(subst: s, typ: t2))
+            case UnifyErr(msg: m) -> UnifyErr(msg: m)
+            case UnifyOk(subst: sn) ->
+              unify_named_type_lists(nt1s: rest1, nt2s: remove_by_name(name: n1, nts: nt2s),
+                                     s: compose_subst(s1: s, s2: sn))
+          end
+      end
+  end
+end
+
+let find_and_remove_by_name = fn (name: string, nts: [NamedType]) -> Option<NamedType> do
+  match nts
+    case Nil() -> None()
+    case Cons(v: nt, rest: rest) ->
+      match nt case NamedType(name: n, typ: _) ->
+        if n == name then Some(val: nt)
+        else find_and_remove_by_name(name: name, nts: rest)
+        end
+      end
+  end
+end
+
+let remove_by_name = fn (name: string, nts: [NamedType]) -> [NamedType] do
+  match nts
+    case Nil() -> Nil()
+    case Cons(v: nt, rest: rest) ->
+      match nt case NamedType(name: n, typ: _) ->
+        if n == name then rest
+        else Cons(v: nt, rest: remove_by_name(name: name, nts: rest))
+        end
+      end
+  end
+end
+
+// ─── Row unification ────────────────────────────────────────────────────────
+
+let unify_rows = fn (e1: [TypeExpr], tail1: Option<TypeExpr>,
+                      e2: [TypeExpr], tail2: Option<TypeExpr>) -> UnifyResult do
+  let only1 = remove_common(src: e1, targets: e2)
+  let only2 = remove_common(src: e2, targets: e1)
+  match only1
+    case Nil() ->
+      match only2
+        case Nil() -> unify_row_tails(tail1: tail1, tail2: tail2)
+        case _ ->
+          match tail1
+            case Some(val: t1) -> unify(t1: t1, t2: TyRow(types: only2, rest: tail2))
+            case None() -> UnifyErr(msg: "Row mismatch: extra elements")
+          end
+      end
+    case _ ->
+      match tail2
+        case Some(val: t2) -> unify(t1: t2, t2: TyRow(types: only1, rest: tail1))
+        case None() ->
+          match only2
+            case Nil() ->
+              match tail1
+                case Some(val: t1) -> unify(t1: t1, t2: TyRow(types: Nil(), rest: None()))
+                case None() -> UnifyErr(msg: "Row mismatch: extra elements")
+              end
+            case _ -> UnifyErr(msg: "Row mismatch: extra elements on both sides")
+          end
+      end
+  end
+end
+
+let unify_row_tails = fn (tail1: Option<TypeExpr>, tail2: Option<TypeExpr>) -> UnifyResult do
+  match tail1
+    case Some(val: t1) ->
+      match tail2
+        case Some(val: t2) -> unify(t1: t1, t2: t2)
+        case None() -> UnifyOk(subst: singleton_subst(var: extract_var_name(t: t1), typ: TyRow(types: Nil(), rest: None())))
+      end
+    case None() ->
+      match tail2
+        case Some(val: t2) -> UnifyOk(subst: singleton_subst(var: extract_var_name(t: t2), typ: TyRow(types: Nil(), rest: None())))
+        case None() -> UnifyOk(subst: Nil())
+      end
+  end
+end
+
+let remove_common = fn (src: [TypeExpr], targets: [TypeExpr]) -> [TypeExpr] do
+  match src
+    case Nil() -> Nil()
+    case Cons(v: x, rest: rest) ->
+      if type_in_list(t: x, ts: targets) then remove_common(src: rest, targets: targets)
+      else Cons(v: x, rest: remove_common(src: rest, targets: targets))
+      end
+  end
+end
+
+let type_in_list = fn (t: TypeExpr, ts: [TypeExpr]) -> bool do
+  match ts
+    case Nil() -> false
+    case Cons(v: x, rest: rest) ->
+      if type_eq(a: t, b: x) then true
+      else type_in_list(t: t, ts: rest)
+      end
+  end
+end
+
+let extract_var_name = fn (t: TypeExpr) -> string do
+  match t case TyVar(name: n) -> n case _ -> "__unknown" end
+end

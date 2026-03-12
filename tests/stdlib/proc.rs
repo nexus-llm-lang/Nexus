@@ -1,4 +1,4 @@
-use crate::common::check::{should_fail_typecheck, should_typecheck};
+use crate::harness::{should_fail_typecheck, should_typecheck};
 
 #[test]
 fn proc_exit_typechecks_with_perm_proc() {

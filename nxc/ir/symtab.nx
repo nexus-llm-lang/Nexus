@@ -1,0 +1,195 @@
+/**
+ * symtab: Scoped symbol table with rename tracking.
+ *
+ * Provides a generation-based scope stack and a StringMap-backed
+ * symbol table that supports namespace-partitioned lookup (value,
+ * type, port, constructor).
+ */
+
+import as stringmap from stdlib/stringmap.nx
+import { Lookup, StringMap } from stdlib/stringmap.nx
+import { from_i64 } from stdlib/string.nx
+import { CompileError, error_no_span, PhaseHir } from nxc/common/error.nx
+
+// ─── Symbol kinds ──────────────────────────────────────────────────────────
+
+pub type SymbolKind =
+  SkFunction
+  | SkVariable
+  | SkExternal
+  | SkConstructor
+  | SkPort
+  | SkType
+  | SkException
+
+pub let symbol_kind_to_i64 = fn (kind: SymbolKind) -> i64 do
+  match kind
+    case SkFunction() -> return 0
+    case SkVariable() -> return 1
+    case SkExternal() -> return 2
+    case SkConstructor() -> return 3
+    case SkPort() -> return 4
+    case SkType() -> return 5
+    case SkException() -> return 6
+  end
+end
+
+pub let i64_to_symbol_kind = fn (tag: i64) -> SymbolKind throws { CompileError } do
+  match tag
+    case 0 -> return SkFunction()
+    case 1 -> return SkVariable()
+    case 2 -> return SkExternal()
+    case 3 -> return SkConstructor()
+    case 4 -> return SkPort()
+    case 5 -> return SkType()
+    case 6 -> return SkException()
+    case _ -> error_no_span(phase: PhaseHir(), message: "i64_to_symbol_kind: invalid tag")
+  end
+end
+
+// ─── Rename entries ────────────────────────────────────────────────────────
+
+pub type RenameEntry = RenameEntry(original: string, qualified: string)
+
+pub let rename = fn (name: string, entries: [RenameEntry]) -> string do
+  match entries
+    case Nil() -> return name
+    case Cons(v: RenameEntry(original: orig, qualified: qual), rest: rest) ->
+      if orig == name then return qual
+      else return rename(name: name, entries: rest)
+      end
+  end
+end
+
+pub let rename_add = fn (entries: [RenameEntry], original: string, qualified: string) -> [RenameEntry] do
+  return Cons(v: RenameEntry(original: original, qualified: qualified), rest: entries)
+end
+
+pub let rename_has = fn (name: string, entries: [RenameEntry]) -> bool do
+  match entries
+    case Nil() -> return false
+    case Cons(v: RenameEntry(original: orig, qualified: _), rest: rest) ->
+      if orig == name then return true
+      else return rename_has(name: name, entries: rest)
+      end
+  end
+end
+
+// ─── Scope state ───────────────────────────────────────────────────────────
+
+pub type ScopeState = ScopeState(scopes: [i64], next_gen: i64)
+
+pub let scope_new = fn () -> ScopeState do
+  return ScopeState(scopes: Cons(v: 0, rest: Nil()), next_gen: 1)
+end
+
+pub let scope_push = fn (state: ScopeState) -> ScopeState do
+  match state
+    case ScopeState(scopes: scopes, next_gen: gen) ->
+      return ScopeState(scopes: Cons(v: gen, rest: scopes), next_gen: gen + 1)
+  end
+end
+
+pub let scope_pop = fn (state: ScopeState) -> ScopeState throws { CompileError } do
+  match state
+    case ScopeState(scopes: Nil(), next_gen: _) ->
+      error_no_span(phase: PhaseHir(), message: "scope_pop: empty scope stack")
+    case ScopeState(scopes: Cons(v: _, rest: rest), next_gen: gen) ->
+      return ScopeState(scopes: rest, next_gen: gen)
+  end
+end
+
+let count_i64_list = fn (xs: [i64], acc: i64) -> i64 do
+  match xs
+    case Nil() -> return acc
+    case Cons(v: _, rest: rest) -> return count_i64_list(xs: rest, acc: acc + 1)
+  end
+end
+
+pub let scope_depth = fn (state: ScopeState) -> i64 do
+  match state
+    case ScopeState(scopes: scopes, next_gen: _) ->
+      return count_i64_list(xs: scopes, acc: 0)
+  end
+end
+
+// ─── Symbol table ──────────────────────────────────────────────────────────
+
+let make_key = fn (gen: i64, ns: string, name: string) -> string do
+  return from_i64(val: gen) ++ ":" ++ ns ++ ":" ++ name
+end
+
+pub let symtab_new = fn () -> %StringMap do
+  return stringmap.empty()
+end
+
+pub let symtab_define = fn (tab: %StringMap, state: ScopeState, ns: string, name: string, kind: SymbolKind) -> %StringMap throws { CompileError } do
+  match state
+    case ScopeState(scopes: Nil(), next_gen: _) ->
+      error_no_span(phase: PhaseHir(), message: "symtab_define: no active scope")
+    case ScopeState(scopes: Cons(v: gen, rest: _), next_gen: _) ->
+      let key = make_key(gen: gen, ns: ns, name: name)
+      return stringmap.put(map: tab, key: key, value: symbol_kind_to_i64(kind: kind))
+  end
+end
+
+let lookup_go = fn (tab: &StringMap, scopes: [i64], ns: string, name: string) -> Option<SymbolKind> throws { CompileError } do
+  match scopes
+    case Nil() -> return None()
+    case Cons(v: gen, rest: rest) ->
+      let key = make_key(gen: gen, ns: ns, name: name)
+      match stringmap.get(map: tab, key: key)
+        case Found(value: v) -> return Some(val: i64_to_symbol_kind(tag: v))
+        case Missing() -> return lookup_go(tab: tab, scopes: rest, ns: ns, name: name)
+      end
+  end
+end
+
+pub let symtab_lookup = fn (tab: &StringMap, state: ScopeState, ns: string, name: string) -> Option<SymbolKind> throws { CompileError } do
+  match state
+    case ScopeState(scopes: scopes, next_gen: _) ->
+      return lookup_go(tab: tab, scopes: scopes, ns: ns, name: name)
+  end
+end
+
+// ─── Convenience namespace-specific functions ──────────────────────────────
+
+pub let define_value = fn (tab: %StringMap, state: ScopeState, name: string, kind: SymbolKind) -> %StringMap throws { CompileError } do
+  return symtab_define(tab: tab, state: state, ns: "v", name: name, kind: kind)
+end
+
+pub let lookup_value = fn (tab: &StringMap, state: ScopeState, name: string) -> Option<SymbolKind> throws { CompileError } do
+  return symtab_lookup(tab: tab, state: state, ns: "v", name: name)
+end
+
+pub let define_type = fn (tab: %StringMap, state: ScopeState, name: string) -> %StringMap throws { CompileError } do
+  return symtab_define(tab: tab, state: state, ns: "t", name: name, kind: SkType())
+end
+
+pub let lookup_type = fn (tab: &StringMap, state: ScopeState, name: string) -> Option<SymbolKind> throws { CompileError } do
+  return symtab_lookup(tab: tab, state: state, ns: "t", name: name)
+end
+
+pub let define_port = fn (tab: %StringMap, state: ScopeState, name: string) -> %StringMap throws { CompileError } do
+  return symtab_define(tab: tab, state: state, ns: "p", name: name, kind: SkPort())
+end
+
+pub let lookup_port = fn (tab: &StringMap, state: ScopeState, name: string) -> Option<SymbolKind> throws { CompileError } do
+  return symtab_lookup(tab: tab, state: state, ns: "p", name: name)
+end
+
+pub let define_constructor = fn (tab: %StringMap, state: ScopeState, name: string) -> %StringMap throws { CompileError } do
+  return symtab_define(tab: tab, state: state, ns: "c", name: name, kind: SkConstructor())
+end
+
+pub let lookup_constructor = fn (tab: &StringMap, state: ScopeState, name: string) -> Option<SymbolKind> throws { CompileError } do
+  return symtab_lookup(tab: tab, state: state, ns: "c", name: name)
+end
+
+pub let define_exception = fn (tab: %StringMap, state: ScopeState, name: string) -> %StringMap throws { CompileError } do
+  return symtab_define(tab: tab, state: state, ns: "t", name: name, kind: SkException())
+end
+
+pub let symtab_free = fn (tab: %StringMap) -> unit do
+  return stringmap.free(map: tab)
+end

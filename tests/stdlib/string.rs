@@ -1,4 +1,4 @@
-use crate::common::wasm::exec_with_stdlib;
+use crate::harness::exec_with_stdlib;
 
 #[test]
 fn string_repeat_basic() {
@@ -137,7 +137,7 @@ let main = fn () -> unit require { PermConsole } throws { Exn } do
   catch e ->
     let bt = backtrace(exn: e)
     match bt do
-      case Cons(val: first, rest: _) ->
+      case Cons(v: first, rest: _) ->
         if first != "main" then
           println(val: "expected frame 'main', got '" ++ first ++ "'")
           raise RuntimeError(val: "wrong frame")
@@ -181,7 +181,7 @@ end
 
 #[test]
 fn console_read_line_requires_perm_console() {
-    let err = crate::common::check::should_fail_typecheck(
+    let err = crate::harness::should_fail_typecheck(
         r#"
 import { Console }, * as stdio from stdlib/stdio.nx
 
@@ -201,7 +201,7 @@ end
 
 #[test]
 fn console_read_line_typechecks_with_perm_console() {
-    crate::common::check::should_typecheck(
+    crate::harness::should_typecheck(
         r#"
 import { Console }, * as stdio from stdlib/stdio.nx
 

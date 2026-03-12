@@ -1,0 +1,1041 @@
+/**
+ * parser: Recursive descent parser for Nexus.
+ *
+ * Expression, statement, control flow, top-level definition parsing,
+ * and the public entry point. Type and pattern parsing are in separate
+ * modules (parse_type.nx, parse_pattern.nx).
+ */
+
+import { Token, Span, SpannedToken } from nxc/common/token.nx
+import { Sigil, BinaryOp, Literal, TypeExpr, Pattern, Expr, Stmt,
+         SpannedExpr, SpannedStmt, SpannedPattern, SpannedTopLevel,
+         Param, Function, MatchCase, CallArg, CtorArg, NamedExpr,
+         NamedType, VariantField, CtorPatternField, RecordPatField,
+         VariantDef, EnumDef, RecordDef, ExceptionDef, ImportDef,
+         FunctionSig, Port, GlobalLet, TopLevel, Program } from nxc/common/ast.nx
+import { Phase, CompileError, error, error_no_span, PhaseParse } from nxc/common/error.nx
+import { ParsedType, ParsedExpr, ParsedStmt, ParsedPat, ParsedIdent,
+         ParsedSigil, ParsedStmts, ParsedCallArgs, ParsedCtorArgs,
+         ParsedParams, ParsedMatchCases, ParsedNamedTypes, ParsedTypes,
+         ParsedVariants, ParsedVariantFields, ParsedFunctions,
+         ParsedFunctionSigs, ParsedExprs, ParsedNamedExprs,
+         ParsedStrings, ParsedTopLevel,
+         peek_token, peek_span, skip, token_tag, is_tok, expect,
+         expect_ident, expect_uident, parse_sigil, is_block_end,
+         get_binop_prec, token_to_binop, is_arrow_start } from nxc/frontend/parse_core.nx
+import { parse_type, parse_optional_require, parse_optional_throws,
+         parse_record_type_fields, empty_row } from nxc/frontend/parse_type.nx
+import { parse_pattern, parse_ctor_pat_fields, parse_record_pat_fields } from nxc/frontend/parse_pattern.nx
+import as list from stdlib/list.nx
+import as str from stdlib/string.nx
+
+// ─── Expression parsing ──────────────────────────────────────────────────────
+
+let parse_expr = fn (toks: [SpannedToken]) -> ParsedExpr do
+  return parse_prec_expr(toks: toks, min_prec: 1)
+end
+
+let parse_prec_expr = fn (toks: [SpannedToken], min_prec: i64) -> ParsedExpr do
+  match parse_postfix_expr(toks: toks)
+    case ParsedExpr(expr: left, rest: r) ->
+      return parse_prec_loop(toks: r, left: left, min_prec: min_prec)
+  end
+end
+
+let parse_prec_loop = fn (toks: [SpannedToken], left: SpannedExpr, min_prec: i64) -> ParsedExpr do
+  let prec = get_binop_prec(tok: peek_token(toks: toks))
+  if prec < min_prec then return ParsedExpr(expr: left, rest: toks) end
+  match token_to_binop(tok: peek_token(toks: toks))
+    case Some(val: op) ->
+      match parse_prec_expr(toks: skip(toks: toks), min_prec: prec + 1)
+        case ParsedExpr(expr: right, rest: r2) ->
+          match left
+            case SpannedExpr(node: _, span: sp) ->
+              let new_left = SpannedExpr(node: ExprBinaryOp(left: left, op: op, right: right), span: sp)
+              return parse_prec_loop(toks: r2, left: new_left, min_prec: min_prec)
+          end
+      end
+    case None() -> return ParsedExpr(expr: left, rest: toks)
+  end
+end
+
+let parse_postfix_expr = fn (toks: [SpannedToken]) -> ParsedExpr do
+  match parse_atom(toks: toks)
+    case ParsedExpr(expr: base, rest: r) ->
+      return parse_postfix_loop(toks: r, base: base)
+  end
+end
+
+let parse_postfix_loop = fn (toks: [SpannedToken], base: SpannedExpr) -> ParsedExpr do
+  match peek_token(toks: toks)
+    case TkDot() ->
+      match expect_ident(toks: skip(toks: toks))
+        case ParsedIdent(name: n, rest: r2) ->
+          match base
+            case SpannedExpr(node: _, span: sp) ->
+              return parse_postfix_loop(toks: r2, base: SpannedExpr(node: ExprFieldAccess(target: base, field: n), span: sp))
+          end
+      end
+    case TkLBracket() ->
+      match parse_expr(toks: skip(toks: toks))
+        case ParsedExpr(expr: idx, rest: r2) ->
+          let r3 = expect(toks: r2, expected: "]")
+          match base
+            case SpannedExpr(node: _, span: sp) ->
+              return parse_postfix_loop(toks: r3, base: SpannedExpr(node: ExprIndex(target: base, index: idx), span: sp))
+          end
+      end
+    case _ -> return ParsedExpr(expr: base, rest: toks)
+  end
+end
+
+// ─── Atom parsing ────────────────────────────────────────────────────────────
+
+let parse_atom = fn (toks: [SpannedToken]) -> ParsedExpr do
+  let sp = peek_span(toks: toks)
+  match peek_token(toks: toks)
+    case TkInt(val: v) ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprLiteral(lit: LitInt(val: v)), span: sp), rest: skip(toks: toks))
+    case TkFloat(val: v) ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprLiteral(lit: LitFloat(val: v)), span: sp), rest: skip(toks: toks))
+    case TkString(val: v) ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprLiteral(lit: LitString(val: v)), span: sp), rest: skip(toks: toks))
+    case TkTrue() ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprLiteral(lit: LitBool(val: true)), span: sp), rest: skip(toks: toks))
+    case TkFalse() ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprLiteral(lit: LitBool(val: false)), span: sp), rest: skip(toks: toks))
+    case TkUnit() ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprLiteral(lit: LitUnit()), span: sp), rest: skip(toks: toks))
+    case TkLParen() -> return parse_paren_expr(toks: toks, sp: sp)
+    case TkMinus() -> return parse_neg_literal(toks: toks, sp: sp)
+    case TkRaise() -> return parse_raise_expr(toks: toks, sp: sp)
+    case TkIf() -> return parse_if_expr(toks: toks)
+    case TkMatch() -> return parse_match_expr(toks: toks)
+    case TkWhile() -> return parse_while_expr(toks: toks)
+    case TkFor() -> return parse_for_expr(toks: toks)
+    case TkFn() -> return parse_lambda(toks: toks)
+    case TkLBracket() -> return parse_list_literal(toks: toks, sp: sp)
+    case TkLArray() -> return parse_array_literal(toks: toks, sp: sp)
+    case TkLBrace() -> return parse_record_literal(toks: toks, sp: sp)
+    case TkTilde() -> return parse_sigil_var(toks: toks, sp: sp, sigil: SigilMutable())
+    case TkPercent() -> return parse_sigil_var(toks: toks, sp: sp, sigil: SigilLinear())
+    case TkAmpersand() -> return parse_borrow_expr(toks: toks, sp: sp)
+    case TkUident(name: n) -> return parse_constructor_expr(toks: toks, sp: sp, name: n)
+    case TkIdent(name: n) -> return parse_ident_expr(toks: toks, sp: sp, name: n)
+    case TkHandler() -> return parse_handler_expr(toks: toks)
+    case _ ->
+      error(phase: PhaseParse(), message: "expected expression, got '" ++ token_tag(tok: peek_token(toks: toks)) ++ "'", span: sp)
+  end
+end
+
+let parse_paren_expr = fn (toks: [SpannedToken], sp: Span) -> ParsedExpr do
+  let r = skip(toks: toks)
+  if is_tok(toks: r, expected: ")") then
+    return ParsedExpr(expr: SpannedExpr(node: ExprLiteral(lit: LitUnit()), span: sp), rest: skip(toks: r))
+  end
+  match parse_expr(toks: r)
+    case ParsedExpr(expr: e, rest: r2) ->
+      return ParsedExpr(expr: e, rest: expect(toks: r2, expected: ")"))
+  end
+end
+
+let parse_neg_literal = fn (toks: [SpannedToken], sp: Span) -> ParsedExpr do
+  let r = skip(toks: toks)
+  match peek_token(toks: r)
+    case TkInt(val: v) ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprLiteral(lit: LitInt(val: 0 - v)), span: sp), rest: skip(toks: r))
+    case _ ->
+      error(phase: PhaseParse(), message: "expected number after '-'", span: sp)
+  end
+end
+
+let parse_raise_expr = fn (toks: [SpannedToken], sp: Span) -> ParsedExpr do
+  match parse_expr(toks: skip(toks: toks))
+    case ParsedExpr(expr: e, rest: r2) ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprRaise(value: e), span: sp), rest: r2)
+  end
+end
+
+let parse_list_literal = fn (toks: [SpannedToken], sp: Span) -> ParsedExpr do
+  let r = skip(toks: toks)
+  if is_tok(toks: r, expected: "]") then
+    return ParsedExpr(expr: SpannedExpr(node: ExprList(elements: []), span: sp), rest: skip(toks: r))
+  end
+  match parse_comma_exprs(toks: r, acc: [])
+    case ParsedExprs(exprs: es, rest: r2) ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprList(elements: es), span: sp), rest: expect(toks: r2, expected: "]"))
+  end
+end
+
+let parse_array_literal = fn (toks: [SpannedToken], sp: Span) -> ParsedExpr do
+  let r = skip(toks: toks)
+  if is_tok(toks: r, expected: "|]") then
+    return ParsedExpr(expr: SpannedExpr(node: ExprArray(elements: []), span: sp), rest: skip(toks: r))
+  end
+  match parse_comma_exprs(toks: r, acc: [])
+    case ParsedExprs(exprs: es, rest: r2) ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprArray(elements: es), span: sp), rest: expect(toks: r2, expected: "|]"))
+  end
+end
+
+let parse_record_literal = fn (toks: [SpannedToken], sp: Span) -> ParsedExpr do
+  match parse_record_expr_fields(toks: skip(toks: toks), acc: [])
+    case ParsedNamedExprs(fields: fs, rest: r2) ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprRecord(fields: fs), span: sp), rest: expect(toks: r2, expected: "}"))
+  end
+end
+
+let parse_sigil_var = fn (toks: [SpannedToken], sp: Span, sigil: Sigil) -> ParsedExpr do
+  match expect_ident(toks: skip(toks: toks))
+    case ParsedIdent(name: n, rest: r2) ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprVariable(name: n, sigil: sigil), span: sp), rest: r2)
+  end
+end
+
+let parse_borrow_expr = fn (toks: [SpannedToken], sp: Span) -> ParsedExpr do
+  let r = skip(toks: toks)
+  match parse_sigil(toks: r)
+    case ParsedSigil(sigil: sig, rest: r2) ->
+      match expect_ident(toks: r2)
+        case ParsedIdent(name: n, rest: r3) ->
+          return ParsedExpr(expr: SpannedExpr(node: ExprBorrow(name: n, sigil: sig), span: sp), rest: r3)
+      end
+  end
+end
+
+let parse_constructor_expr = fn (toks: [SpannedToken], sp: Span, name: string) -> ParsedExpr do
+  let r = skip(toks: toks)
+  match peek_token(toks: r)
+    case TkUnit() ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprConstructor(name: name, args: []), span: sp), rest: skip(toks: r))
+    case TkLParen() ->
+      let r2 = skip(toks: r)
+      if is_tok(toks: r2, expected: ")") then
+        return ParsedExpr(expr: SpannedExpr(node: ExprConstructor(name: name, args: []), span: sp), rest: skip(toks: r2))
+      end
+      match parse_ctor_call_args(toks: r2, acc: [])
+        case ParsedCtorArgs(args: args, rest: r3) ->
+          return ParsedExpr(expr: SpannedExpr(node: ExprConstructor(name: name, args: args), span: sp), rest: expect(toks: r3, expected: ")"))
+      end
+    case _ ->
+      return ParsedExpr(expr: SpannedExpr(node: ExprConstructor(name: name, args: []), span: sp), rest: r)
+  end
+end
+
+let parse_ident_expr = fn (toks: [SpannedToken], sp: Span, name: string) -> ParsedExpr do
+  let r = skip(toks: toks)
+  match parse_dotted_name(toks: r, prefix: name)
+    case ParsedIdent(name: full_name, rest: r2) ->
+      match peek_token(toks: r2)
+        case TkUnit() ->
+          return ParsedExpr(expr: SpannedExpr(node: ExprCall(func: full_name, args: []), span: sp), rest: skip(toks: r2))
+        case TkLParen() ->
+          let r3 = skip(toks: r2)
+          if is_tok(toks: r3, expected: ")") then
+            return ParsedExpr(expr: SpannedExpr(node: ExprCall(func: full_name, args: []), span: sp), rest: skip(toks: r3))
+          end
+          match parse_fn_call_args(toks: r3, acc: [])
+            case ParsedCallArgs(args: args, rest: r4) ->
+              return ParsedExpr(expr: SpannedExpr(node: ExprCall(func: full_name, args: args), span: sp), rest: expect(toks: r4, expected: ")"))
+          end
+        case _ ->
+          return ParsedExpr(expr: SpannedExpr(node: ExprVariable(name: full_name, sigil: SigilImmutable()), span: sp), rest: r2)
+      end
+  end
+end
+
+let parse_handler_expr = fn (toks: [SpannedToken]) -> ParsedExpr do
+  let sp = peek_span(toks: toks)
+  match expect_uident(toks: expect(toks: toks, expected: "handler"))
+    case ParsedIdent(name: n, rest: r2) ->
+      match parse_optional_require(toks: r2)
+        case ParsedType(typ: req, rest: r3) ->
+          match parse_handler_fns(toks: expect(toks: r3, expected: "do"), acc: [])
+            case ParsedFunctions(functions: fs, rest: r5) ->
+              return ParsedExpr(expr: SpannedExpr(
+                node: ExprHandler(coeffect_name: n, requires: req, functions: fs),
+                span: sp
+              ), rest: expect(toks: r5, expected: "end"))
+          end
+      end
+  end
+end
+
+let parse_handler_fns = fn (toks: [SpannedToken], acc: [Function]) -> ParsedFunctions do
+  match peek_token(toks: toks)
+    case TkFn() ->
+      match expect_ident(toks: skip(toks: toks))
+        case ParsedIdent(name: n, rest: r2) ->
+          match parse_fn_params_or_unit(toks: r2)
+            case ParsedParams(params: ps, rest: r5) ->
+              match parse_type(toks: expect(toks: r5, expected: "->"))
+                case ParsedType(typ: ret, rest: r7) ->
+                  match parse_optional_throws(toks: r7)
+                    case ParsedType(typ: thr, rest: r8) ->
+                      match parse_stmts(toks: expect(toks: r8, expected: "do"), acc: [])
+                        case ParsedStmts(stmts: body, rest: r10) ->
+                          let f = Function(name: n, is_public: false, type_params: [],
+                            params: ps, ret_type: ret, requires: empty_row(), throw_row: thr, body: body)
+                          return parse_handler_fns(toks: expect(toks: r10, expected: "end"), acc: Cons(v: f, rest: acc))
+                      end
+                  end
+              end
+          end
+      end
+    case _ -> return ParsedFunctions(functions: list.reverse(xs: acc), rest: toks)
+  end
+end
+
+// ─── Argument parsing helpers ────────────────────────────────────────────────
+
+let parse_dotted_name = fn (toks: [SpannedToken], prefix: string) -> ParsedIdent do
+  match peek_token(toks: toks)
+    case TkDot() ->
+      let r = skip(toks: toks)
+      match peek_token(toks: r)
+        case TkIdent(name: n) -> return parse_dotted_name(toks: skip(toks: r), prefix: prefix ++ "." ++ n)
+        case TkUident(name: n) -> return ParsedIdent(name: prefix ++ "." ++ n, rest: skip(toks: r))
+        case _ -> return ParsedIdent(name: prefix, rest: toks)
+      end
+    case _ -> return ParsedIdent(name: prefix, rest: toks)
+  end
+end
+
+let parse_fn_call_args = fn (toks: [SpannedToken], acc: [CallArg]) -> ParsedCallArgs do
+  match expect_ident(toks: toks)
+    case ParsedIdent(name: n, rest: r) ->
+      match parse_expr(toks: expect(toks: r, expected: ":"))
+        case ParsedExpr(expr: v, rest: r3) ->
+          let new_acc = Cons(v: CallArg(name: n, value: v), rest: acc)
+          if is_tok(toks: r3, expected: ",") then
+            return parse_fn_call_args(toks: skip(toks: r3), acc: new_acc)
+          else
+            return ParsedCallArgs(args: list.reverse(xs: new_acc), rest: r3)
+          end
+      end
+  end
+end
+
+let parse_ctor_call_args = fn (toks: [SpannedToken], acc: [CtorArg]) -> ParsedCtorArgs do
+  // Check if labeled: ident followed by colon
+  let is_labeled = match peek_token(toks: toks)
+    case TkIdent(name: _) ->
+      match peek_token(toks: skip(toks: toks))
+        case TkColon() -> true
+        case _ -> false
+      end
+    case _ -> false
+  end
+  if is_labeled then
+    return parse_ctor_args_labeled(toks: toks, acc: acc)
+  else
+    return parse_ctor_args_positional(toks: toks, acc: acc)
+  end
+end
+
+let parse_ctor_args_labeled = fn (toks: [SpannedToken], acc: [CtorArg]) -> ParsedCtorArgs do
+  match expect_ident(toks: toks)
+    case ParsedIdent(name: n, rest: r) ->
+      match parse_expr(toks: expect(toks: r, expected: ":"))
+        case ParsedExpr(expr: v, rest: r3) ->
+          let new_acc = Cons(v: CtorArg(name: Some(val: n), value: v), rest: acc)
+          if is_tok(toks: r3, expected: ",") then
+            return parse_ctor_call_args(toks: skip(toks: r3), acc: new_acc)
+          else
+            return ParsedCtorArgs(args: list.reverse(xs: new_acc), rest: r3)
+          end
+      end
+  end
+end
+
+let parse_ctor_args_positional = fn (toks: [SpannedToken], acc: [CtorArg]) -> ParsedCtorArgs do
+  match parse_expr(toks: toks)
+    case ParsedExpr(expr: v, rest: r) ->
+      let new_acc = Cons(v: CtorArg(name: None(), value: v), rest: acc)
+      if is_tok(toks: r, expected: ",") then
+        return parse_ctor_call_args(toks: skip(toks: r), acc: new_acc)
+      else
+        return ParsedCtorArgs(args: list.reverse(xs: new_acc), rest: r)
+      end
+  end
+end
+
+let parse_comma_exprs = fn (toks: [SpannedToken], acc: [SpannedExpr]) -> ParsedExprs do
+  match parse_expr(toks: toks)
+    case ParsedExpr(expr: e, rest: r) ->
+      let new_acc = Cons(v: e, rest: acc)
+      if is_tok(toks: r, expected: ",") then
+        return parse_comma_exprs(toks: skip(toks: r), acc: new_acc)
+      else
+        return ParsedExprs(exprs: list.reverse(xs: new_acc), rest: r)
+      end
+  end
+end
+
+let parse_record_expr_fields = fn (toks: [SpannedToken], acc: [NamedExpr]) -> ParsedNamedExprs do
+  match peek_token(toks: toks)
+    case TkRBrace() -> return ParsedNamedExprs(fields: list.reverse(xs: acc), rest: toks)
+    case _ ->
+      match expect_ident(toks: toks)
+        case ParsedIdent(name: n, rest: r) ->
+          match parse_expr(toks: expect(toks: r, expected: ":"))
+            case ParsedExpr(expr: v, rest: r3) ->
+              let new_acc = Cons(v: NamedExpr(name: n, value: v), rest: acc)
+              if is_tok(toks: r3, expected: ",") then
+                return parse_record_expr_fields(toks: skip(toks: r3), acc: new_acc)
+              else
+                return ParsedNamedExprs(fields: list.reverse(xs: new_acc), rest: r3)
+              end
+          end
+      end
+  end
+end
+
+let parse_fn_params_or_unit = fn (toks: [SpannedToken]) -> ParsedParams do
+  if is_tok(toks: toks, expected: "()") then
+    return ParsedParams(params: [], rest: skip(toks: toks))
+  end
+  match parse_params(toks: expect(toks: toks, expected: "("), acc: [])
+    case ParsedParams(params: ps, rest: r2) ->
+      return ParsedParams(params: ps, rest: expect(toks: r2, expected: ")"))
+  end
+end
+
+let parse_params = fn (toks: [SpannedToken], acc: [Param]) -> ParsedParams do
+  match peek_token(toks: toks)
+    case TkRParen() -> return ParsedParams(params: list.reverse(xs: acc), rest: toks)
+    case _ ->
+      match parse_sigil(toks: toks)
+        case ParsedSigil(sigil: sig, rest: r) ->
+          match expect_ident(toks: r)
+            case ParsedIdent(name: n, rest: r2) ->
+              match parse_type(toks: expect(toks: r2, expected: ":"))
+                case ParsedType(typ: t, rest: r4) ->
+                  let new_acc = Cons(v: Param(name: n, sigil: sig, typ: t), rest: acc)
+                  if is_tok(toks: r4, expected: ",") then
+                    return parse_params(toks: skip(toks: r4), acc: new_acc)
+                  else
+                    return ParsedParams(params: list.reverse(xs: new_acc), rest: r4)
+                  end
+              end
+          end
+      end
+  end
+end
+
+let parse_optional_type_params = fn (toks: [SpannedToken]) -> ParsedStrings do
+  match peek_token(toks: toks)
+    case TkLt() ->
+      match parse_type_param_list(toks: skip(toks: toks), acc: [])
+        case ParsedStrings(items: ps, rest: r2) ->
+          match peek_token(toks: r2)
+            case TkGt() -> return ParsedStrings(items: ps, rest: skip(toks: r2))
+            case _ -> return ParsedStrings(items: [], rest: toks)
+          end
+      end
+    case _ -> return ParsedStrings(items: [], rest: toks)
+  end
+end
+
+let parse_type_param_list = fn (toks: [SpannedToken], acc: [string]) -> ParsedStrings do
+  match peek_token(toks: toks)
+    case TkGt() -> return ParsedStrings(items: list.reverse(xs: acc), rest: toks)
+    case TkUident(name: n) ->
+      let r = skip(toks: toks)
+      if is_tok(toks: r, expected: ",") then
+        return parse_type_param_list(toks: skip(toks: r), acc: Cons(v: n, rest: acc))
+      else
+        return ParsedStrings(items: list.reverse(xs: Cons(v: n, rest: acc)), rest: r)
+      end
+    case _ ->
+      error(phase: PhaseParse(), message: "expected type parameter", span: peek_span(toks: toks))
+  end
+end
+
+// ─── Control flow expressions ────────────────────────────────────────────────
+
+let parse_if_expr = fn (toks: [SpannedToken]) -> ParsedExpr do
+  let sp = peek_span(toks: toks)
+  match parse_expr(toks: expect(toks: toks, expected: "if"))
+    case ParsedExpr(expr: cond, rest: r2) ->
+      match parse_stmts(toks: expect(toks: r2, expected: "then"), acc: [])
+        case ParsedStmts(stmts: then_body, rest: r4) ->
+          match peek_token(toks: r4)
+            case TkElse() ->
+              match parse_stmts(toks: skip(toks: r4), acc: [])
+                case ParsedStmts(stmts: else_body, rest: r6) ->
+                  return ParsedExpr(expr: SpannedExpr(node: ExprIf(cond: cond, then_branch: then_body, else_branch: else_body), span: sp),
+                    rest: expect(toks: r6, expected: "end"))
+              end
+            case _ ->
+              return ParsedExpr(expr: SpannedExpr(node: ExprIf(cond: cond, then_branch: then_body, else_branch: []), span: sp),
+                rest: expect(toks: r4, expected: "end"))
+          end
+      end
+  end
+end
+
+let parse_match_expr = fn (toks: [SpannedToken]) -> ParsedExpr do
+  let sp = peek_span(toks: toks)
+  match parse_expr(toks: expect(toks: toks, expected: "match"))
+    case ParsedExpr(expr: target, rest: r2) ->
+      match parse_match_cases(toks: r2, acc: [])
+        case ParsedMatchCases(cases: cs, rest: r4) ->
+          return ParsedExpr(expr: SpannedExpr(node: ExprMatch(target: target, cases: cs), span: sp),
+            rest: expect(toks: r4, expected: "end"))
+      end
+  end
+end
+
+let parse_match_cases = fn (toks: [SpannedToken], acc: [MatchCase]) -> ParsedMatchCases do
+  match peek_token(toks: toks)
+    case TkCase() ->
+      match parse_pattern(toks: skip(toks: toks))
+        case ParsedPat(pat: p, rest: r2) ->
+          match parse_stmts(toks: expect(toks: r2, expected: "->"), acc: [])
+            case ParsedStmts(stmts: body, rest: r4) ->
+              return parse_match_cases(toks: r4, acc: Cons(v: MatchCase(pattern: p, body: body), rest: acc))
+          end
+      end
+    case _ -> return ParsedMatchCases(cases: list.reverse(xs: acc), rest: toks)
+  end
+end
+
+let parse_while_expr = fn (toks: [SpannedToken]) -> ParsedExpr do
+  let sp = peek_span(toks: toks)
+  match parse_expr(toks: expect(toks: toks, expected: "while"))
+    case ParsedExpr(expr: cond, rest: r2) ->
+      match parse_stmts(toks: expect(toks: r2, expected: "do"), acc: [])
+        case ParsedStmts(stmts: body, rest: r4) ->
+          return ParsedExpr(expr: SpannedExpr(node: ExprWhile(cond: cond, body: body), span: sp),
+            rest: expect(toks: r4, expected: "end"))
+      end
+  end
+end
+
+let parse_for_expr = fn (toks: [SpannedToken]) -> ParsedExpr do
+  let sp = peek_span(toks: toks)
+  match expect_ident(toks: expect(toks: toks, expected: "for"))
+    case ParsedIdent(name: var, rest: r2) ->
+      match parse_expr(toks: expect(toks: r2, expected: "="))
+        case ParsedExpr(expr: start_e, rest: r4) ->
+          match parse_expr(toks: expect(toks: r4, expected: "to"))
+            case ParsedExpr(expr: end_e, rest: r6) ->
+              match parse_stmts(toks: expect(toks: r6, expected: "do"), acc: [])
+                case ParsedStmts(stmts: body, rest: r8) ->
+                  return ParsedExpr(expr: SpannedExpr(node: ExprFor(var: var, start: start_e, end_expr: end_e, body: body), span: sp),
+                    rest: expect(toks: r8, expected: "end"))
+              end
+          end
+      end
+  end
+end
+
+let parse_lambda = fn (toks: [SpannedToken]) -> ParsedExpr do
+  let sp = peek_span(toks: toks)
+  match parse_optional_type_params(toks: expect(toks: toks, expected: "fn"))
+    case ParsedStrings(items: tps, rest: r_tp) ->
+      if is_tok(toks: r_tp, expected: "()") then
+        return parse_lambda_body(toks: skip(toks: r_tp), type_params: tps, params: [], sp: sp)
+      end
+      match parse_params(toks: expect(toks: r_tp, expected: "("), acc: [])
+        case ParsedParams(params: ps, rest: r3) ->
+          return parse_lambda_body(toks: expect(toks: r3, expected: ")"), type_params: tps, params: ps, sp: sp)
+      end
+  end
+end
+
+let parse_lambda_body = fn (toks: [SpannedToken], type_params: [string], params: [Param], sp: Span) -> ParsedExpr do
+  match parse_type(toks: expect(toks: toks, expected: "->"))
+    case ParsedType(typ: ret, rest: r6) ->
+      match parse_optional_require(toks: r6)
+        case ParsedType(typ: req, rest: r7) ->
+          match parse_optional_throws(toks: r7)
+            case ParsedType(typ: thr, rest: r8) ->
+              match parse_stmts(toks: expect(toks: r8, expected: "do"), acc: [])
+                case ParsedStmts(stmts: body, rest: r10) ->
+                  return ParsedExpr(expr: SpannedExpr(
+                    node: ExprLambda(type_params: type_params, params: params, ret_type: ret, requires: req, throw_row: thr, body: body),
+                    span: sp
+                  ), rest: expect(toks: r10, expected: "end"))
+              end
+          end
+      end
+  end
+end
+
+// ─── Statement parsing ───────────────────────────────────────────────────────
+
+let parse_stmts = fn (toks: [SpannedToken], acc: [SpannedStmt]) -> ParsedStmts do
+  if is_block_end(tok: peek_token(toks: toks)) then
+    return ParsedStmts(stmts: list.reverse(xs: acc), rest: toks)
+  end
+  match parse_stmt(toks: toks)
+    case ParsedStmt(stmt: s, rest: rest) ->
+      return parse_stmts(toks: rest, acc: Cons(v: s, rest: acc))
+  end
+end
+
+let parse_stmt = fn (toks: [SpannedToken]) -> ParsedStmt do
+  let sp = peek_span(toks: toks)
+  match peek_token(toks: toks)
+    case TkLet() -> return parse_let_stmt(toks: toks)
+    case TkReturn() ->
+      match parse_expr(toks: skip(toks: toks))
+        case ParsedExpr(expr: e, rest: r2) ->
+          return ParsedStmt(stmt: SpannedStmt(node: StmtReturn(value: e), span: sp), rest: r2)
+      end
+    case TkTry() -> return parse_try_stmt(toks: toks)
+    case TkInject() -> return parse_inject_stmt(toks: toks)
+    case TkConc() -> return parse_conc_stmt(toks: toks)
+    case _ ->
+      // Expression statement or assignment
+      match parse_expr(toks: toks)
+        case ParsedExpr(expr: e, rest: r) ->
+          match peek_token(toks: r)
+            case TkLArrow() ->
+              match parse_expr(toks: skip(toks: r))
+                case ParsedExpr(expr: v, rest: r3) ->
+                  let target_name = match e
+                    case SpannedExpr(node: ExprVariable(name: nm, sigil: _), span: _) -> nm
+                    case _ -> "unknown"
+                  end
+                  return ParsedStmt(stmt: SpannedStmt(node: StmtAssign(target: target_name, value: v), span: sp), rest: r3)
+              end
+            case _ ->
+              return ParsedStmt(stmt: SpannedStmt(node: StmtExpr(expr: e), span: sp), rest: r)
+          end
+      end
+  end
+end
+
+let parse_let_stmt = fn (toks: [SpannedToken]) -> ParsedStmt do
+  let sp = peek_span(toks: toks)
+  match parse_sigil(toks: expect(toks: toks, expected: "let"))
+    case ParsedSigil(sigil: sig, rest: r2) ->
+      match expect_ident(toks: r2)
+        case ParsedIdent(name: n, rest: r3) ->
+          if is_tok(toks: r3, expected: ":") then
+            match parse_type(toks: skip(toks: r3))
+              case ParsedType(typ: t, rest: r5) ->
+                match parse_expr(toks: expect(toks: r5, expected: "="))
+                  case ParsedExpr(expr: v, rest: r7) ->
+                    return ParsedStmt(stmt: SpannedStmt(node: StmtLet(name: n, sigil: sig, typ: Some(val: t), value: v), span: sp), rest: r7)
+                end
+            end
+          else
+            match parse_expr(toks: expect(toks: r3, expected: "="))
+              case ParsedExpr(expr: v, rest: r5) ->
+                return ParsedStmt(stmt: SpannedStmt(node: StmtLet(name: n, sigil: sig, typ: None(), value: v), span: sp), rest: r5)
+            end
+          end
+      end
+  end
+end
+
+let parse_try_stmt = fn (toks: [SpannedToken]) -> ParsedStmt do
+  let sp = peek_span(toks: toks)
+  match parse_stmts(toks: expect(toks: toks, expected: "try"), acc: [])
+    case ParsedStmts(stmts: body, rest: r2) ->
+      match expect_ident(toks: expect(toks: r2, expected: "catch"))
+        case ParsedIdent(name: param, rest: r4) ->
+          match parse_stmts(toks: expect(toks: r4, expected: "->"), acc: [])
+            case ParsedStmts(stmts: catch_body, rest: r6) ->
+              return ParsedStmt(stmt: SpannedStmt(node: StmtTry(body: body, catch_param: param, catch_body: catch_body), span: sp),
+                rest: expect(toks: r6, expected: "end"))
+          end
+      end
+  end
+end
+
+let parse_inject_stmt = fn (toks: [SpannedToken]) -> ParsedStmt do
+  let sp = peek_span(toks: toks)
+  match parse_comma_exprs(toks: expect(toks: toks, expected: "inject"), acc: [])
+    case ParsedExprs(exprs: hs, rest: r2) ->
+      match parse_stmts(toks: expect(toks: r2, expected: "do"), acc: [])
+        case ParsedStmts(stmts: body, rest: r4) ->
+          return ParsedStmt(stmt: SpannedStmt(node: StmtInject(handlers: hs, body: body), span: sp),
+            rest: expect(toks: r4, expected: "end"))
+      end
+  end
+end
+
+let parse_conc_stmt = fn (toks: [SpannedToken]) -> ParsedStmt do
+  let sp = peek_span(toks: toks)
+  match parse_conc_tasks(toks: expect(toks: expect(toks: toks, expected: "conc"), expected: "do"), acc: [])
+    case ParsedFunctions(functions: tasks, rest: r3) ->
+      return ParsedStmt(stmt: SpannedStmt(node: StmtConc(tasks: tasks), span: sp),
+        rest: expect(toks: r3, expected: "end"))
+  end
+end
+
+let parse_conc_tasks = fn (toks: [SpannedToken], acc: [Function]) -> ParsedFunctions do
+  match peek_token(toks: toks)
+    case TkTask() ->
+      match expect_ident(toks: skip(toks: toks))
+        case ParsedIdent(name: n, rest: r2) ->
+          match parse_optional_throws(toks: r2)
+            case ParsedType(typ: thr, rest: r3) ->
+              match parse_stmts(toks: expect(toks: r3, expected: "do"), acc: [])
+                case ParsedStmts(stmts: body, rest: r5) ->
+                  let t_fn = Function(
+                    name: n, is_public: false, type_params: [],
+                    params: [], ret_type: TyUnit(), requires: empty_row(),
+                    throw_row: thr, body: body
+                  )
+                  return parse_conc_tasks(toks: expect(toks: r5, expected: "end"), acc: Cons(v: t_fn, rest: acc))
+              end
+          end
+      end
+    case _ -> return ParsedFunctions(functions: list.reverse(xs: acc), rest: toks)
+  end
+end
+
+// ─── Top-level parsing ───────────────────────────────────────────────────────
+
+let parse_import_path = fn (toks: [SpannedToken]) -> ParsedIdent do
+  return parse_import_path_loop(toks: toks, acc: "")
+end
+
+let parse_import_path_loop = fn (toks: [SpannedToken], acc: string) -> ParsedIdent do
+  match peek_token(toks: toks)
+    case TkIdent(name: n) -> return parse_import_path_loop(toks: skip(toks: toks), acc: acc ++ n)
+    case TkUident(name: n) -> return parse_import_path_loop(toks: skip(toks: toks), acc: acc ++ n)
+    case TkSlash() -> return parse_import_path_loop(toks: skip(toks: toks), acc: acc ++ "/")
+    case TkDot() -> return parse_import_path_loop(toks: skip(toks: toks), acc: acc ++ ".")
+    case TkMinus() -> return parse_import_path_loop(toks: skip(toks: toks), acc: acc ++ "-")
+    case TkColon() -> return parse_import_path_loop(toks: skip(toks: toks), acc: acc ++ ":")
+    case _ ->
+      if acc == "" then
+        error(phase: PhaseParse(), message: "expected import path", span: peek_span(toks: toks))
+      end
+      return ParsedIdent(name: acc, rest: toks)
+  end
+end
+
+let parse_import_items = fn (toks: [SpannedToken], acc: [string]) -> ParsedStrings do
+  match peek_token(toks: toks)
+    case TkRBrace() -> return ParsedStrings(items: list.reverse(xs: acc), rest: toks)
+    case TkIdent(name: n) ->
+      let r = skip(toks: toks)
+      if is_tok(toks: r, expected: ",") then return parse_import_items(toks: skip(toks: r), acc: Cons(v: n, rest: acc))
+      else return ParsedStrings(items: list.reverse(xs: Cons(v: n, rest: acc)), rest: r)
+      end
+    case TkUident(name: n) ->
+      let r = skip(toks: toks)
+      if is_tok(toks: r, expected: ",") then return parse_import_items(toks: skip(toks: r), acc: Cons(v: n, rest: acc))
+      else return ParsedStrings(items: list.reverse(xs: Cons(v: n, rest: acc)), rest: r)
+      end
+    case _ ->
+      error(phase: PhaseParse(), message: "expected import item", span: peek_span(toks: toks))
+  end
+end
+
+let parse_import = fn (toks: [SpannedToken]) -> ParsedTopLevel do
+  let sp = peek_span(toks: toks)
+  let r = expect(toks: toks, expected: "import")
+  match peek_token(toks: r)
+    case TkExternal() ->
+      match parse_import_path(toks: skip(toks: r))
+        case ParsedIdent(name: p, rest: r3) ->
+          return ParsedTopLevel(item: SpannedTopLevel(node: TLImport(def: ImportDef(path: p, alias: None(), items: [], is_external: true)), span: sp), rest: r3)
+      end
+    case TkLBrace() ->
+      match parse_import_items(toks: skip(toks: r), acc: [])
+        case ParsedStrings(items: items, rest: r3) ->
+          match parse_import_path(toks: expect(toks: expect(toks: r3, expected: "}"), expected: "from"))
+            case ParsedIdent(name: p, rest: r6) ->
+              return ParsedTopLevel(item: SpannedTopLevel(node: TLImport(def: ImportDef(path: p, alias: None(), items: items, is_external: false)), span: sp), rest: r6)
+          end
+      end
+    case TkAs() ->
+      match expect_ident(toks: skip(toks: r))
+        case ParsedIdent(name: a, rest: r3) ->
+          match parse_import_path(toks: expect(toks: r3, expected: "from"))
+            case ParsedIdent(name: p, rest: r5) ->
+              return ParsedTopLevel(item: SpannedTopLevel(node: TLImport(def: ImportDef(path: p, alias: Some(val: a), items: [], is_external: false)), span: sp), rest: r5)
+          end
+      end
+    case TkFrom() ->
+      match parse_import_path(toks: skip(toks: r))
+        case ParsedIdent(name: p, rest: r3) ->
+          return ParsedTopLevel(item: SpannedTopLevel(node: TLImport(def: ImportDef(path: p, alias: None(), items: [], is_external: false)), span: sp), rest: r3)
+      end
+    case _ ->
+      error(phase: PhaseParse(), message: "expected '{', 'as', 'from', or 'external' after 'import'", span: peek_span(toks: r))
+  end
+end
+
+let parse_type_def = fn (toks: [SpannedToken], is_pub: bool) -> ParsedTopLevel do
+  let sp = peek_span(toks: toks)
+  let is_opaque = is_tok(toks: toks, expected: "opaque")
+  let r_after_opaque = match peek_token(toks: toks)
+    case TkOpaque() -> skip(toks: toks)
+    case _ -> toks
+  end
+  match expect_uident(toks: expect(toks: r_after_opaque, expected: "type"))
+    case ParsedIdent(name: n, rest: r3) ->
+      match parse_optional_type_params(toks: r3)
+        case ParsedStrings(items: tps, rest: r4) ->
+          let r5 = expect(toks: r4, expected: "=")
+          match peek_token(toks: r5)
+            case TkLBrace() ->
+              match parse_record_type_fields(toks: skip(toks: r5), acc: [])
+                case ParsedNamedTypes(fields: fs, rest: r7) ->
+                  return ParsedTopLevel(item: SpannedTopLevel(node: TLTypeDef(def: RecordDef(name: n, is_public: is_pub, type_params: tps, fields: fs)), span: sp),
+                    rest: expect(toks: r7, expected: "}"))
+              end
+            case _ ->
+              match parse_enum_variants(toks: r5, acc: [])
+                case ParsedVariants(variants: vs, rest: r6) ->
+                  return ParsedTopLevel(item: SpannedTopLevel(node: TLEnum(def: EnumDef(name: n, is_public: is_pub, is_opaque: is_opaque, type_params: tps, variants: vs)), span: sp), rest: r6)
+              end
+          end
+      end
+  end
+end
+
+let parse_enum_variants = fn (toks: [SpannedToken], acc: [VariantDef]) -> ParsedVariants do
+  match expect_uident(toks: toks)
+    case ParsedIdent(name: n, rest: r) ->
+      if is_tok(toks: r, expected: "(") then
+        match parse_variant_fields(toks: skip(toks: r), acc: [])
+          case ParsedVariantFields(fields: fs, rest: r3) ->
+            let r4 = expect(toks: r3, expected: ")")
+            let new_acc = Cons(v: VariantDef(name: n, fields: fs), rest: acc)
+            if is_tok(toks: r4, expected: "|") then
+              return parse_enum_variants(toks: skip(toks: r4), acc: new_acc)
+            else
+              return ParsedVariants(variants: list.reverse(xs: new_acc), rest: r4)
+            end
+        end
+      else
+        let new_acc = Cons(v: VariantDef(name: n, fields: []), rest: acc)
+        if is_tok(toks: r, expected: "|") then
+          return parse_enum_variants(toks: skip(toks: r), acc: new_acc)
+        else
+          return ParsedVariants(variants: list.reverse(xs: new_acc), rest: r)
+        end
+      end
+  end
+end
+
+let parse_variant_fields = fn (toks: [SpannedToken], acc: [VariantField]) -> ParsedVariantFields do
+  match peek_token(toks: toks)
+    case TkRParen() -> return ParsedVariantFields(fields: list.reverse(xs: acc), rest: toks)
+    case _ ->
+      // Check if labeled: ident followed by colon
+      let is_labeled = match peek_token(toks: toks)
+        case TkIdent(name: _) ->
+          match peek_token(toks: skip(toks: toks))
+            case TkColon() -> true
+            case _ -> false
+          end
+        case _ -> false
+      end
+      if is_labeled then
+        match expect_ident(toks: toks)
+          case ParsedIdent(name: n, rest: r) ->
+            match parse_type(toks: expect(toks: r, expected: ":"))
+              case ParsedType(typ: t, rest: r3) ->
+                let new_acc = Cons(v: VariantField(name: Some(val: n), typ: t), rest: acc)
+                if is_tok(toks: r3, expected: ",") then
+                  return parse_variant_fields(toks: skip(toks: r3), acc: new_acc)
+                else
+                  return ParsedVariantFields(fields: list.reverse(xs: new_acc), rest: r3)
+                end
+            end
+        end
+      else
+        match parse_type(toks: toks)
+          case ParsedType(typ: t, rest: r) ->
+            let new_acc = Cons(v: VariantField(name: None(), typ: t), rest: acc)
+            if is_tok(toks: r, expected: ",") then
+              return parse_variant_fields(toks: skip(toks: r), acc: new_acc)
+            else
+              return ParsedVariantFields(fields: list.reverse(xs: new_acc), rest: r)
+            end
+        end
+      end
+  end
+end
+
+let parse_global_let = fn (toks: [SpannedToken], is_pub: bool) -> ParsedTopLevel do
+  let sp = peek_span(toks: toks)
+  match expect_ident(toks: expect(toks: toks, expected: "let"))
+    case ParsedIdent(name: n, rest: r2) ->
+      if is_tok(toks: r2, expected: ":") then
+        match parse_type(toks: skip(toks: r2))
+          case ParsedType(typ: t, rest: r4) ->
+            match parse_expr(toks: expect(toks: r4, expected: "="))
+              case ParsedExpr(expr: v, rest: r6) ->
+                return ParsedTopLevel(item: SpannedTopLevel(node: TLLet(def: GlobalLet(name: n, is_public: is_pub, typ: Some(val: t), value: v)), span: sp), rest: r6)
+            end
+        end
+      else
+        match parse_expr(toks: expect(toks: r2, expected: "="))
+          case ParsedExpr(expr: v, rest: r4) ->
+            return ParsedTopLevel(item: SpannedTopLevel(node: TLLet(def: GlobalLet(name: n, is_public: is_pub, typ: None(), value: v)), span: sp), rest: r4)
+        end
+      end
+  end
+end
+
+let parse_exception_def = fn (toks: [SpannedToken], is_pub: bool) -> ParsedTopLevel do
+  let sp = peek_span(toks: toks)
+  match expect_uident(toks: expect(toks: toks, expected: "exception"))
+    case ParsedIdent(name: n, rest: r2) ->
+      if is_tok(toks: r2, expected: "(") then
+        match parse_variant_fields(toks: skip(toks: r2), acc: [])
+          case ParsedVariantFields(fields: fs, rest: r4) ->
+            return ParsedTopLevel(item: SpannedTopLevel(node: TLException(def: ExceptionDef(name: n, is_public: is_pub, fields: fs)), span: sp),
+              rest: expect(toks: r4, expected: ")"))
+        end
+      else
+        return ParsedTopLevel(item: SpannedTopLevel(node: TLException(def: ExceptionDef(name: n, is_public: is_pub, fields: [])), span: sp), rest: r2)
+      end
+  end
+end
+
+let parse_port_def = fn (toks: [SpannedToken], is_pub: bool) -> ParsedTopLevel do
+  let sp = peek_span(toks: toks)
+  match expect_uident(toks: expect(toks: toks, expected: "port"))
+    case ParsedIdent(name: n, rest: r2) ->
+      match parse_port_sigs(toks: expect(toks: r2, expected: "do"), acc: [])
+        case ParsedFunctionSigs(sigs: fs, rest: r4) ->
+          return ParsedTopLevel(item: SpannedTopLevel(node: TLPort(def: Port(name: n, is_public: is_pub, functions: fs)), span: sp),
+            rest: expect(toks: r4, expected: "end"))
+      end
+  end
+end
+
+let parse_port_sigs = fn (toks: [SpannedToken], acc: [FunctionSig]) -> ParsedFunctionSigs do
+  match peek_token(toks: toks)
+    case TkFn() ->
+      match expect_ident(toks: skip(toks: toks))
+        case ParsedIdent(name: n, rest: r2) ->
+          match parse_fn_params_or_unit(toks: r2)
+            case ParsedParams(params: ps, rest: r5) ->
+              match parse_type(toks: expect(toks: r5, expected: "->"))
+                case ParsedType(typ: ret, rest: r7) ->
+                  match parse_optional_require(toks: r7)
+                    case ParsedType(typ: req, rest: r8) ->
+                      match parse_optional_throws(toks: r8)
+                        case ParsedType(typ: thr, rest: r9) ->
+                          let sig = FunctionSig(name: n, params: ps, ret_type: ret, requires: req, throw_row: thr)
+                          return parse_port_sigs(toks: r9, acc: Cons(v: sig, rest: acc))
+                      end
+                  end
+              end
+          end
+      end
+    case _ -> return ParsedFunctionSigs(sigs: list.reverse(xs: acc), rest: toks)
+  end
+end
+
+type ParsedExternalSig = ParsedExternalSig(params: [NamedType], arg_names: [string], ret: TypeExpr, rest: [SpannedToken])
+type ParsedExternalParams = ParsedExternalParams(params: [NamedType], names: [string], rest: [SpannedToken])
+
+let parse_external_def = fn (toks: [SpannedToken], is_pub: bool) -> ParsedTopLevel do
+  let sp = peek_span(toks: toks)
+  match expect_ident(toks: expect(toks: toks, expected: "external"))
+    case ParsedIdent(name: n, rest: r2) ->
+      let r3 = expect(toks: r2, expected: "=")
+      match peek_token(toks: r3)
+        case TkString(val: symbol) ->
+          match parse_external_sig(toks: expect(toks: skip(toks: r3), expected: ":"))
+            case ParsedExternalSig(params: params, arg_names: arg_names, ret: ret, rest: r6) ->
+              let t = TyArrow(params: params, ret: ret, requires: empty_row(), throw_row: empty_row())
+              let def = GlobalLet(
+                name: n, is_public: is_pub, typ: Some(val: t),
+                value: SpannedExpr(node: ExprExternal(symbol: symbol, arg_names: arg_names, typ: t), span: sp)
+              )
+              return ParsedTopLevel(item: SpannedTopLevel(node: TLLet(def: def), span: sp), rest: r6)
+          end
+        case _ ->
+          error(phase: PhaseParse(), message: "expected string literal for external symbol", span: peek_span(toks: r3))
+      end
+  end
+end
+
+let parse_external_sig = fn (toks: [SpannedToken]) -> ParsedExternalSig do
+  match peek_token(toks: toks)
+    case TkUnit() ->
+      match parse_type(toks: expect(toks: skip(toks: toks), expected: "->"))
+        case ParsedType(typ: ret, rest: r3) ->
+          return ParsedExternalSig(params: [], arg_names: [], ret: ret, rest: r3)
+      end
+    case _ ->
+      match parse_external_params(toks: expect(toks: toks, expected: "("), acc_params: [], acc_names: [])
+        case ParsedExternalParams(params: ps, names: ns, rest: r2) ->
+          match parse_type(toks: expect(toks: expect(toks: r2, expected: ")"), expected: "->"))
+            case ParsedType(typ: ret, rest: r5) ->
+              return ParsedExternalSig(params: ps, arg_names: ns, ret: ret, rest: r5)
+          end
+      end
+  end
+end
+
+let parse_external_params = fn (toks: [SpannedToken], acc_params: [NamedType], acc_names: [string]) -> ParsedExternalParams do
+  match peek_token(toks: toks)
+    case TkRParen() -> return ParsedExternalParams(params: list.reverse(xs: acc_params), names: list.reverse(xs: acc_names), rest: toks)
+    case _ ->
+      match expect_ident(toks: toks)
+        case ParsedIdent(name: n, rest: r) ->
+          match parse_type(toks: expect(toks: r, expected: ":"))
+            case ParsedType(typ: t, rest: r3) ->
+              let new_params = Cons(v: NamedType(name: n, typ: t), rest: acc_params)
+              let new_names = Cons(v: n, rest: acc_names)
+              if is_tok(toks: r3, expected: ",") then
+                return parse_external_params(toks: skip(toks: r3), acc_params: new_params, acc_names: new_names)
+              else
+                return ParsedExternalParams(params: list.reverse(xs: new_params), names: list.reverse(xs: new_names), rest: r3)
+              end
+          end
+      end
+  end
+end
+
+let parse_top_level = fn (toks: [SpannedToken]) -> ParsedTopLevel do
+  match peek_token(toks: toks)
+    case TkImport() -> return parse_import(toks: toks)
+    case TkPub() ->
+      let r = skip(toks: toks)
+      match peek_token(toks: r)
+        case TkType() -> return parse_type_def(toks: r, is_pub: true)
+        case TkOpaque() -> return parse_type_def(toks: r, is_pub: true)
+        case TkLet() -> return parse_global_let(toks: r, is_pub: true)
+        case TkException() -> return parse_exception_def(toks: r, is_pub: true)
+        case TkPort() -> return parse_port_def(toks: r, is_pub: true)
+        case TkExternal() -> return parse_external_def(toks: r, is_pub: true)
+        case _ ->
+          error(phase: PhaseParse(), message: "expected definition after 'pub'", span: peek_span(toks: r))
+      end
+    case TkType() -> return parse_type_def(toks: toks, is_pub: false)
+    case TkOpaque() -> return parse_type_def(toks: toks, is_pub: false)
+    case TkLet() -> return parse_global_let(toks: toks, is_pub: false)
+    case TkException() -> return parse_exception_def(toks: toks, is_pub: false)
+    case TkPort() -> return parse_port_def(toks: toks, is_pub: false)
+    case TkExternal() -> return parse_external_def(toks: toks, is_pub: false)
+    case _ ->
+      error(phase: PhaseParse(), message: "expected top-level definition, got '" ++ token_tag(tok: peek_token(toks: toks)) ++ "'", span: peek_span(toks: toks))
+  end
+end
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
+let parse_program_loop = fn (toks: [SpannedToken], acc: [SpannedTopLevel]) -> Program do
+  match peek_token(toks: toks)
+    case TkEof() -> return Program(definitions: list.reverse(xs: acc))
+    case _ ->
+      match parse_top_level(toks: toks)
+        case ParsedTopLevel(item: item, rest: r) ->
+          return parse_program_loop(toks: r, acc: Cons(v: item, rest: acc))
+      end
+  end
+end
+
+/// Parse a token list into a Program AST.
+pub let parse = fn (tokens: [SpannedToken]) -> Program do
+  return parse_program_loop(toks: tokens, acc: [])
+end

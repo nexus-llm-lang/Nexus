@@ -1,0 +1,136 @@
+/**
+ * driver: Self-hosting compiler CLI entry point.
+ *
+ * Reads a Nexus source file, processes imports with cycle detection,
+ * and compiles through the full pipeline:
+ *   Lex → Parse → HIR → MIR → LIR → WASM
+ */
+
+import { tokenize } from nxc/lexer.nx
+import { parse } from nxc/frontend/parser.nx
+import { Program, SpannedTopLevel, TopLevel, ImportDef, EnumDef } from nxc/common/ast.nx
+import { CompileError, error_no_span, PhaseDriver } from nxc/common/error.nx
+import { RenameEntry } from nxc/ir/symtab.nx
+import { default_alias, build_rename_map, extract_imports } from nxc/ir/resolve.nx
+import { HirAccum, HirProgram } from nxc/ir/hir_types.nx
+import { empty_accum, process_defs, accum_to_program } from nxc/ir/hir.nx
+import { lower_hir_to_mir } from nxc/ir/mir.nx
+import { lower_mir_to_lir } from nxc/ir/lir.nx
+import { compile_lir_to_wasm } from nxc/backend/codegen.nx
+import { write_file, free } from stdlib/bytebuffer.nx
+import as fs from stdlib/fs.nx
+import { println } from stdlib/stdio.nx
+import as list from stdlib/list.nx
+
+// ─── Import processing ──────────────────────────────────────────────────────
+
+let list_has_str = fn (xs: [string], s: string) -> bool do
+  match xs
+    case Nil() -> return false
+    case Cons(v: x, rest: rest) ->
+      if x == s then return true end
+      return list_has_str(xs: rest, s: s)
+  end
+end
+
+let process_imports = fn (imports: [ImportDef], accum: HirAccum,
+    import_stack: [string], depth: i64) -> HirAccum throws { CompileError } do
+  match imports
+    case Nil() -> accum
+    case Cons(v: imp, rest: rest) ->
+      match imp case ImportDef(path: path, alias: _, items: _, is_external: is_ext) ->
+      if is_ext then
+        println(val: "[nxc]   skip external: " ++ path)
+        process_imports(imports: rest, accum: accum, import_stack: import_stack, depth: depth)
+      else
+        if list_has_str(xs: import_stack, s: path) then
+          error_no_span(phase: PhaseDriver(), message: "cyclic import: " ++ path)
+        end
+
+        println(val: "[nxc]   import: " ++ path)
+        let src = fs.read_to_string(path: path)
+        let tokens = tokenize(src: src)
+        let imported_prog = parse(tokens: tokens)
+        let imported_defs = get_defs(prog: imported_prog)
+
+        let entries = build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
+        let sub_imports = extract_imports(defs: imported_defs)
+        let new_stack = Cons(v: path, rest: import_stack)
+        let accum2 = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, depth: depth + 1)
+        let accum3 = process_defs(defs: imported_defs, entries: entries, accum: accum2)
+        process_imports(imports: rest, accum: accum3, import_stack: import_stack, depth: depth)
+      end
+      end
+  end
+end
+
+// ─── Pipeline ───────────────────────────────────────────────────────────────
+
+let get_defs = fn (prog: Program) -> [SpannedTopLevel] do
+  match prog case Program(definitions: defs) -> defs end
+end
+
+let get_enum_defs = fn (hir: HirProgram) -> [EnumDef] do
+  match hir case HirProgram(ports: _, functions: _, externals: _, handler_bindings: _, enum_defs: eds) -> eds end
+end
+
+let build_hir = fn (prog: Program) -> HirProgram throws { CompileError } do
+  let defs = get_defs(prog: prog)
+  let imports = extract_imports(defs: defs)
+  let accum = process_imports(imports: imports, accum: empty_accum(), import_stack: Nil(), depth: 1)
+  let accum2 = process_defs(defs: defs, entries: Nil(), accum: accum)
+  return accum_to_program(accum: accum2)
+end
+
+// ─── CLI ────────────────────────────────────────────────────────────────────
+
+let str_nth = fn (xs: [string], n: i64) -> string do
+  match xs
+    case Nil() -> str_nth(xs: xs, n: n)
+    case Cons(v: v, rest: rest) ->
+      if n == 0 then return v end
+      return str_nth(xs: rest, n: n - 1)
+  end
+end
+
+let get_output_path = fn (xs: [string], argc: i64) -> string do
+  if argc >= 3 then return str_nth(xs: xs, n: 2) end
+  return "output.wasm"
+end
+
+let main = fn (args: [string]) -> unit
+    require { PermFs, PermProc, PermConsole } throws { CompileError } do
+  let argc = list.length(xs: args)
+  if argc < 2 then
+    println(val: "Usage: nxc <input.nx> [output.wasm]")
+    error_no_span(phase: PhaseDriver(), message: "missing input file argument")
+  end
+
+  let input_path = str_nth(xs: args, n: 1)
+  let output_path = get_output_path(xs: args, argc: argc)
+
+  println(val: "nxc: compiling " ++ input_path ++ " -> " ++ output_path)
+
+  println(val: "[nxc] reading source...")
+  let src = fs.read_to_string(path: input_path)
+  println(val: "[nxc] source read ok")
+  println(val: "[nxc] lexing...")
+  let tokens = tokenize(src: src)
+  println(val: "[nxc] parsing...")
+  let prog = parse(tokens: tokens)
+  println(val: "[nxc] building HIR...")
+  let hir = build_hir(prog: prog)
+  println(val: "[nxc] lowering to MIR...")
+  let mir = lower_hir_to_mir(hir: hir)
+  println(val: "[nxc] lowering to LIR...")
+  let lir = lower_mir_to_lir(mir: mir, enum_defs: get_enum_defs(hir: hir))
+  println(val: "[nxc] generating WASM...")
+  let %wasm_buf = compile_lir_to_wasm(program: lir)
+
+  let ok = write_file(buf: &wasm_buf, path: output_path)
+  free(buf: %wasm_buf)
+
+  if ok then println(val: "nxc: wrote " ++ output_path)
+  else error_no_span(phase: PhaseDriver(), message: "failed to write " ++ output_path)
+  end
+end

@@ -1,7 +1,9 @@
-mod common;
+mod harness;
 
-mod compile;
-mod ir;
-mod runtime;
+mod capabilities;
+mod execution;
+mod nxc;
+mod pipeline;
 mod stdlib;
 mod typecheck;
+mod unit;

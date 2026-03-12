@@ -1,5 +1,4 @@
-use crate::common::check::should_fail_typecheck;
-use crate::common::wasm::exec;
+use crate::harness::{exec, should_fail_typecheck};
 use nexus::lang::ast::{Expr, Type};
 use nexus::lang::parser;
 

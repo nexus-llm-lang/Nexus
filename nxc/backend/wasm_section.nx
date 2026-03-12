@@ -1,0 +1,250 @@
+/**
+ * wasm_section: WASM binary section builders.
+ *
+ * Builds type, import, function, memory, global, export, and data sections.
+ * Each builder returns a ByteBuffer containing the section content.
+ */
+
+import { ByteBuffer, empty, push_byte, push_uleb128, push_sleb128,
+         push_string, push_buf, free } from stdlib/bytebuffer.nx
+import as bb from stdlib/bytebuffer.nx
+import { TypeExpr } from nxc/common/ast.nx
+import { LirProgram, LirFunction, LirExternal, LirParam } from nxc/ir/lir_types.nx
+import { vt_i32, vt_i64, desc_func, desc_memory,
+         op_i32_const, op_end, type_to_valtype, is_unit, peel_linear,
+         emit_name, StringEntry, LocalEntry } from nxc/backend/wasm_defs.nx
+import { count_ext_param_slots } from nxc/backend/wasm_collect.nx
+import as list from stdlib/list.nx
+
+// ─── Type section ───────────────────────────────────────────────────────────
+
+let emit_ext_param_types = fn (buf: %ByteBuffer, params: [LirParam]) -> %ByteBuffer do
+  match params
+    case Nil() -> %buf
+    case Cons(v: LirParam(label: _, name: _, typ: t), rest: rest) ->
+      let %buf = match peel_linear(typ: t)
+        case TyString() ->
+          let %b = push_byte(buf: %buf, byte: vt_i32)
+          push_byte(buf: %b, byte: vt_i32)
+        case TyArray(elem: _) ->
+          let %b = push_byte(buf: %buf, byte: vt_i32)
+          push_byte(buf: %b, byte: vt_i32)
+        case _ -> push_byte(buf: %buf, byte: type_to_valtype(typ: t))
+      end
+      emit_ext_param_types(buf: %buf, params: rest)
+  end
+end
+
+let emit_ext_return_type = fn (buf: %ByteBuffer, typ: TypeExpr) -> %ByteBuffer do
+  if is_unit(typ: typ) then return push_uleb128(buf: %buf, val: 0)
+  else
+    let %buf = push_uleb128(buf: %buf, val: 1)
+    return push_byte(buf: %buf, byte: type_to_valtype(typ: typ))
+  end
+end
+
+let emit_internal_param_types = fn (buf: %ByteBuffer, params: [LirParam]) -> %ByteBuffer do
+  match params
+    case Nil() -> %buf
+    case Cons(v: LirParam(label: _, name: _, typ: t), rest: rest) ->
+      emit_internal_param_types(buf: push_byte(buf: %buf, byte: type_to_valtype(typ: t)), params: rest)
+  end
+end
+
+let emit_ext_type_entries = fn (buf: %ByteBuffer, exts: [LirExternal]) -> %ByteBuffer do
+  match exts
+    case Nil() -> %buf
+    case Cons(v: LirExternal(name: _, wasm_module: _, wasm_name: _, params: ps, ret_type: rt, throw_row: _), rest: rest) ->
+      let %buf = push_byte(buf: %buf, byte: 96)
+      let %buf = push_uleb128(buf: %buf, val: count_ext_param_slots(params: ps))
+      let %buf = emit_ext_param_types(buf: %buf, params: ps)
+      let %buf = emit_ext_return_type(buf: %buf, typ: rt)
+      emit_ext_type_entries(buf: %buf, exts: rest)
+  end
+end
+
+let emit_func_type_entries = fn (buf: %ByteBuffer, funcs: [LirFunction]) -> %ByteBuffer do
+  match funcs
+    case Nil() -> %buf
+    case Cons(v: LirFunction(name: _, params: ps, ret_type: rt, body: _, ret: _, span: _), rest: rest) ->
+      let %buf = push_byte(buf: %buf, byte: 96)
+      let %buf = push_uleb128(buf: %buf, val: list.length(xs: ps))
+      let %buf = emit_internal_param_types(buf: %buf, params: ps)
+      let %buf = emit_ext_return_type(buf: %buf, typ: rt)
+      emit_func_type_entries(buf: %buf, funcs: rest)
+  end
+end
+
+pub let build_type_section = fn (program: LirProgram) -> %ByteBuffer do
+  match program
+    case LirProgram(functions: funcs, externals: exts) ->
+      let total = list.length(xs: exts) + list.length(xs: funcs) + 1
+      let %sec = empty()
+      let %sec = push_uleb128(buf: %sec, val: total)
+      let %sec = emit_ext_type_entries(buf: %sec, exts: exts)
+      let %sec = emit_func_type_entries(buf: %sec, funcs: funcs)
+      // wasi:cli/run type: () -> i32
+      let %sec = push_byte(buf: %sec, byte: 96)
+      let %sec = push_uleb128(buf: %sec, val: 0)
+      let %sec = push_uleb128(buf: %sec, val: 1)
+      let %sec = push_byte(buf: %sec, byte: vt_i32)
+      return %sec
+  end
+end
+
+// ─── Import section ─────────────────────────────────────────────────────────
+
+let emit_import_entries = fn (buf: %ByteBuffer, exts: [LirExternal], type_idx: i64) -> %ByteBuffer do
+  match exts
+    case Nil() -> %buf
+    case Cons(v: LirExternal(name: _, wasm_module: m, wasm_name: wn, params: _, ret_type: _, throw_row: _), rest: rest) ->
+      let %buf = emit_name(buf: %buf, name: m)
+      let %buf = emit_name(buf: %buf, name: wn)
+      let %buf = push_byte(buf: %buf, byte: desc_func)
+      let %buf = push_uleb128(buf: %buf, val: type_idx)
+      emit_import_entries(buf: %buf, exts: rest, type_idx: type_idx + 1)
+  end
+end
+
+pub let build_import_section = fn (exts: [LirExternal], mem_mode: string) -> %ByteBuffer do
+  let n_exts = list.length(xs: exts)
+  let has_mem_import = mem_mode != "none" && mem_mode != "defined"
+  let mem_count = match has_mem_import case true -> 1 case false -> 0 end
+  let %sec = empty()
+  let %sec = push_uleb128(buf: %sec, val: n_exts + mem_count)
+  if has_mem_import then
+    let %sec = emit_name(buf: %sec, name: mem_mode)
+    let %sec = emit_name(buf: %sec, name: "memory")
+    let %sec = push_byte(buf: %sec, byte: desc_memory)
+    let %sec = push_byte(buf: %sec, byte: 0)
+    let %sec = push_uleb128(buf: %sec, val: 1)
+  end
+  let %sec = emit_import_entries(buf: %sec, exts: exts, type_idx: 0)
+  return %sec
+end
+
+// ─── Function section ───────────────────────────────────────────────────────
+
+let emit_func_type_indices = fn (buf: %ByteBuffer, count: i64, start_idx: i64) -> %ByteBuffer do
+  if count <= 0 then return %buf
+  else
+    emit_func_type_indices(buf: push_uleb128(buf: %buf, val: start_idx), count: count - 1, start_idx: start_idx + 1)
+  end
+end
+
+pub let build_function_section = fn (n_funcs: i64, n_exts: i64) -> %ByteBuffer do
+  let %sec = empty()
+  let %sec = push_uleb128(buf: %sec, val: n_funcs + 1)
+  let %sec = emit_func_type_indices(buf: %sec, count: n_funcs, start_idx: n_exts)
+  let %sec = push_uleb128(buf: %sec, val: n_exts + n_funcs)
+  return %sec
+end
+
+// ─── Memory section ─────────────────────────────────────────────────────────
+
+pub let build_memory_section = fn () -> %ByteBuffer do
+  let %sec = empty()
+  let %sec = push_uleb128(buf: %sec, val: 1)
+  let %sec = push_byte(buf: %sec, byte: 0)
+  let %sec = push_uleb128(buf: %sec, val: 17)
+  return %sec
+end
+
+// ─── Global section ─────────────────────────────────────────────────────────
+
+pub let build_global_section = fn (heap_base: i64) -> %ByteBuffer do
+  let %sec = empty()
+  let %sec = push_uleb128(buf: %sec, val: 1)
+  let %sec = push_byte(buf: %sec, byte: vt_i32)
+  let %sec = push_byte(buf: %sec, byte: 1)
+  let %sec = push_byte(buf: %sec, byte: op_i32_const)
+  let %sec = push_sleb128(buf: %sec, val: heap_base)
+  let %sec = push_byte(buf: %sec, byte: op_end)
+  return %sec
+end
+
+// ─── Export section ─────────────────────────────────────────────────────────
+
+pub let build_export_section = fn (main_idx: i64, wasi_run_idx: i64, mem_mode: string) -> %ByteBuffer do
+  let has_mem_export = mem_mode != "none"
+  let mem_count = match has_mem_export case true -> 1 case false -> 0 end
+  let %sec = empty()
+  let %sec = push_uleb128(buf: %sec, val: 2 + mem_count)
+  let %sec = emit_name(buf: %sec, name: "main")
+  let %sec = push_byte(buf: %sec, byte: desc_func)
+  let %sec = push_uleb128(buf: %sec, val: main_idx)
+  let %sec = emit_name(buf: %sec, name: "wasi:cli/run@0.2.6#run")
+  let %sec = push_byte(buf: %sec, byte: desc_func)
+  let %sec = push_uleb128(buf: %sec, val: wasi_run_idx)
+  if has_mem_export then
+    let %sec = emit_name(buf: %sec, name: "memory")
+    let %sec = push_byte(buf: %sec, byte: desc_memory)
+    let %sec = push_uleb128(buf: %sec, val: 0)
+  end
+  return %sec
+end
+
+// ─── Data section ───────────────────────────────────────────────────────────
+
+let emit_data_segments = fn (buf: %ByteBuffer, entries: [StringEntry]) -> %ByteBuffer do
+  match entries
+    case Nil() -> %buf
+    case Cons(v: StringEntry(value: v, offset: off, slen: sl), rest: rest) ->
+      let %buf = push_byte(buf: %buf, byte: 0)
+      let %buf = push_byte(buf: %buf, byte: op_i32_const)
+      let %buf = push_sleb128(buf: %buf, val: off)
+      let %buf = push_byte(buf: %buf, byte: op_end)
+      let %buf = push_uleb128(buf: %buf, val: sl)
+      let %buf = push_string(buf: %buf, s: v)
+      emit_data_segments(buf: %buf, entries: rest)
+  end
+end
+
+pub let build_data_section = fn (entries: [StringEntry]) -> %ByteBuffer do
+  let %sec = empty()
+  let %sec = push_uleb128(buf: %sec, val: list.length(xs: entries))
+  let %sec = emit_data_segments(buf: %sec, entries: entries)
+  return %sec
+end
+
+// ─── Local declaration emission ─────────────────────────────────────────────
+
+let count_non_param_locals = fn (locals: [LocalEntry], param_count: i64) -> i64 do
+  match locals
+    case Nil() -> 0
+    case Cons(v: LocalEntry(name: _, index: idx, valtype: _), rest: rest) ->
+      if idx >= param_count then 1 + count_non_param_locals(locals: rest, param_count: param_count)
+      else count_non_param_locals(locals: rest, param_count: param_count)
+      end
+  end
+end
+
+let emit_local_entries = fn (buf: %ByteBuffer, locals: [LocalEntry], param_count: i64) -> %ByteBuffer do
+  match locals
+    case Nil() -> %buf
+    case Cons(v: LocalEntry(name: _, index: idx, valtype: vt), rest: rest) ->
+      if idx >= param_count then
+        let %buf = push_uleb128(buf: %buf, val: 1)
+        let %buf = push_byte(buf: %buf, byte: vt)
+        emit_local_entries(buf: %buf, locals: rest, param_count: param_count)
+      else
+        emit_local_entries(buf: %buf, locals: rest, param_count: param_count)
+      end
+  end
+end
+
+pub let emit_local_decls = fn (buf: %ByteBuffer, locals: [LocalEntry], param_count: i64) -> %ByteBuffer do
+  let n = count_non_param_locals(locals: locals, param_count: param_count)
+  let %buf = push_uleb128(buf: %buf, val: n + 4)
+  let %buf = emit_local_entries(buf: %buf, locals: locals, param_count: param_count)
+  // Reserved temps: 2x i64, 2x i32, 2x i64, 7x i32
+  let %buf = push_uleb128(buf: %buf, val: 2)
+  let %buf = push_byte(buf: %buf, byte: vt_i64)
+  let %buf = push_uleb128(buf: %buf, val: 2)
+  let %buf = push_byte(buf: %buf, byte: vt_i32)
+  let %buf = push_uleb128(buf: %buf, val: 2)
+  let %buf = push_byte(buf: %buf, byte: vt_i64)
+  let %buf = push_uleb128(buf: %buf, val: 7)
+  let %buf = push_byte(buf: %buf, byte: vt_i32)
+  return %buf
+end

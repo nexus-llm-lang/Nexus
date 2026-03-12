@@ -1,5 +1,4 @@
-use crate::common::check::{should_fail_typecheck, should_typecheck};
-use crate::common::wasm::exec_with_stdlib;
+use crate::harness::{exec_with_stdlib, should_fail_typecheck, should_typecheck};
 
 #[test]
 fn env_port_typechecks_with_perm_env() {

@@ -1,4 +1,4 @@
-use crate::common::wasm::exec_with_stdlib;
+use crate::harness::exec_with_stdlib;
 
 #[test]
 fn result_from_exn_builds_err() {

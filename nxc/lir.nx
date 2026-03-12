@@ -659,6 +659,8 @@ end
 
 type LoweredMatchCase = LoweredMatchCase(cond: Option<LirAtom>, stmts: [LirStmt], value: LirAtom)
 
+type LoweredMatchCaseWithCtx = LoweredMatchCaseWithCtx(lmc: LoweredMatchCase, next_temp: i64)
+
 type LowerMatchCasesExprResult = LowerMatchCasesExprResult(ctx: LowerCtx, lowered: [LoweredMatchCase])
 
 let lower_match_cases_expr = fn (cases: [MirMatchCase], target_atom: LirAtom, ctx: LowerCtx) -> LowerMatchCasesExprResult do
@@ -666,17 +668,51 @@ let lower_match_cases_expr = fn (cases: [MirMatchCase], target_atom: LirAtom, ct
     case Nil() -> return LowerMatchCasesExprResult(ctx: ctx, lowered: Nil())
     case Cons(v: c, rest: rest) ->
       match c do case MirMatchCase(pattern: pat, body: body) ->
-        let cr = lower_match_case_expr(target_atom: target_atom, pattern: pat, body: body, ctx: ctx)
-        match cr do case LoweredMatchCase(cond: cond, stmts: stmts, value: val) ->
-          // We need to get the updated ctx — but lower_match_case_expr returns the case in isolation
-          // The ctx continues with updated temp_counter
-          let rr = lower_match_cases_expr(cases: rest, target_atom: target_atom, ctx: ctx)
-          match rr do case LowerMatchCasesExprResult(ctx: ctx2, lowered: rest_lowered) ->
-            return LowerMatchCasesExprResult(ctx: ctx2,
-              lowered: Cons(v: LoweredMatchCase(cond: cond, stmts: stmts, value: val), rest: rest_lowered))
+        let cr = lower_match_case_expr_tracked(target_atom: target_atom, pattern: pat, body: body, ctx: ctx)
+        match cr do case LoweredMatchCaseWithCtx(lmc: lmc, next_temp: nt) ->
+          match lmc do case LoweredMatchCase(cond: cond, stmts: stmts, value: val) ->
+            // Advance temp_counter for next case to avoid name collisions
+            match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: _, enum_defs: ed) ->
+              let next_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: nt, enum_defs: ed)
+              let rr = lower_match_cases_expr(cases: rest, target_atom: target_atom, ctx: next_ctx)
+              match rr do case LowerMatchCasesExprResult(ctx: ctx2, lowered: rest_lowered) ->
+                return LowerMatchCasesExprResult(ctx: ctx2,
+                  lowered: Cons(v: LoweredMatchCase(cond: cond, stmts: stmts, value: val), rest: rest_lowered))
+              end
+            end
           end
         end
       end
+  end
+end
+
+let lower_match_case_expr_tracked = fn (target_atom: LirAtom, pattern: MirPattern,
+    body: [MirStmt], ctx: LowerCtx) -> LoweredMatchCaseWithCtx do
+  let result = lower_match_case_expr(target_atom: target_atom, pattern: pattern, body: body, ctx: ctx)
+  // Extract max temp_counter used during this case
+  // The body lowering allocates temps via lower_case_body_value which resets stmts but advances temp_counter
+  // We estimate by counting stmts that look like temp bindings
+  match ctx do case LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: start_tc, enum_defs: _) ->
+    // Count temps used: each stmt in the result may have used temps
+    let estimated_temps = count_let_stmts(stmts: match result do case LoweredMatchCase(cond: _, stmts: s, value: _) -> s end)
+    let next_tc = start_tc + estimated_temps + 5 // +5 for tag check and overhead
+    return LoweredMatchCaseWithCtx(lmc: result, next_temp: next_tc)
+  end
+end
+
+let count_let_stmts = fn (stmts: [LirStmt]) -> i64 do
+  match stmts do
+    case Nil() -> return 0
+    case Cons(v: s, rest: rest) ->
+      let this_count = match s do
+        case LirStmtLet(name: _, typ: _, expr: _) -> 1
+        case LirStmtIf(cond: _, then_body: tb, else_body: eb) ->
+          count_let_stmts(stmts: tb) + count_let_stmts(stmts: eb)
+        case LirStmtIfReturn(cond: _, then_body: tb, then_ret: _, else_body: eb, else_ret: _, ret_type: _) ->
+          count_let_stmts(stmts: tb) + count_let_stmts(stmts: eb)
+        case _ -> 0
+      end
+      return this_count + count_let_stmts(stmts: rest)
   end
 end
 
@@ -717,20 +753,103 @@ let lower_match_case_expr = fn (target_atom: LirAtom, pattern: MirPattern, body:
       end
 
     case MirPatConstructor(name: n, fields: fields) ->
-      // Tag check + field extraction
       let arity = list_length(lst: fields)
       let tag = constructor_tag(name: n, arity: arity)
-      // TODO: emit proper tag check condition
-      let vr = lower_case_body_value(body: body, ctx: ctx)
-      match vr do case CaseBodyValueResult(stmts: stmts, value: val) ->
-        return LoweredMatchCase(cond: Some(val: LirAtomBool(val: true)), stmts: stmts, value: val)
+      // Build field extraction in a fresh stmt context
+      match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: _, temp_counter: tc, enum_defs: ed) ->
+        let fresh_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: Nil(), temp_counter: tc, enum_defs: ed)
+        // Tag check: let __tN = ObjectTag(target); let __tN+1 = (__tN == expected_tag)
+        let tag_br = bind_expr_to_temp(ctx: fresh_ctx,
+          expr: LirExprObjectTag(value: target_atom, typ: TyI64), typ: TyI64)
+        match tag_br do case BindResult(ctx: ctx2, atom: tag_atom) ->
+          let cond_br = bind_expr_to_temp(ctx: ctx2,
+            expr: LirExprBinary(op: OpEq, lhs: tag_atom, rhs: LirAtomInt(val: tag), typ: TyBool),
+            typ: TyBool)
+          match cond_br do case BindResult(ctx: ctx3, atom: cond_atom) ->
+            // Extract each field and bind pattern variables
+            let field_ctx = extract_ctor_fields(
+              target_atom: target_atom, fields: fields, field_idx: 0, ctx: ctx3)
+            // Extraction stmts are in field_ctx.stmts (accumulated in reverse)
+            match field_ctx do case LowerCtx(vars: _, semantic_vars: _, stmts: extract_stmts, temp_counter: _, enum_defs: _) ->
+              let prefix_stmts = reverse_stmts(stmts: extract_stmts)
+              // Lower body with field vars available
+              let vr = lower_case_body_value(body: body, ctx: field_ctx)
+              match vr do case CaseBodyValueResult(stmts: body_stmts, value: val) ->
+                let all_stmts = append_stmts(stmts: prefix_stmts, tail: body_stmts)
+                return LoweredMatchCase(cond: Some(val: cond_atom), stmts: all_stmts, value: val)
+              end
+            end
+          end
+        end
       end
 
-    case MirPatRecord(fields: _, is_partial: _) ->
-      let vr = lower_case_body_value(body: body, ctx: ctx)
-      match vr do case CaseBodyValueResult(stmts: stmts, value: val) ->
-        return LoweredMatchCase(cond: None(), stmts: stmts, value: val)
+    case MirPatRecord(fields: rec_fields, is_partial: _) ->
+      // Extract record fields and bind pattern variables
+      match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: _, temp_counter: tc, enum_defs: ed) ->
+        let fresh_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: Nil(), temp_counter: tc, enum_defs: ed)
+        let field_ctx = extract_record_fields(
+          target_atom: target_atom, fields: rec_fields, field_idx: 0, ctx: fresh_ctx)
+        match field_ctx do case LowerCtx(vars: _, semantic_vars: _, stmts: extract_stmts, temp_counter: _, enum_defs: _) ->
+          let prefix_stmts = reverse_stmts(stmts: extract_stmts)
+          let vr = lower_case_body_value(body: body, ctx: field_ctx)
+          match vr do case CaseBodyValueResult(stmts: body_stmts, value: val) ->
+            let all_stmts = append_stmts(stmts: prefix_stmts, tail: body_stmts)
+            return LoweredMatchCase(cond: None(), stmts: all_stmts, value: val)
+          end
+        end
       end
+  end
+end
+
+// ─── Constructor/Record Field Extraction ──────────────────────────────────────
+
+let extract_ctor_fields = fn (target_atom: LirAtom, fields: [MirPatternField],
+                               field_idx: i64, ctx: LowerCtx) -> LowerCtx do
+  match fields do
+    case Nil() -> return ctx
+    case Cons(v: f, rest: rest) ->
+      match f do case MirPatternField(name: _, pattern: pat) ->
+        let ctx2 = extract_pattern_field(
+          target_atom: target_atom, pat: pat, field_idx: field_idx, ctx: ctx)
+        return extract_ctor_fields(
+          target_atom: target_atom, fields: rest, field_idx: field_idx + 1, ctx: ctx2)
+      end
+  end
+end
+
+let extract_record_fields = fn (target_atom: LirAtom, fields: [MirRecordPatField],
+                                 field_idx: i64, ctx: LowerCtx) -> LowerCtx do
+  match fields do
+    case Nil() -> return ctx
+    case Cons(v: f, rest: rest) ->
+      match f do case MirRecordPatField(name: _, pattern: pat) ->
+        let ctx2 = extract_pattern_field(
+          target_atom: target_atom, pat: pat, field_idx: field_idx, ctx: ctx)
+        return extract_record_fields(
+          target_atom: target_atom, fields: rest, field_idx: field_idx + 1, ctx: ctx2)
+      end
+  end
+end
+
+let extract_pattern_field = fn (target_atom: LirAtom, pat: MirPattern,
+                                 field_idx: i64, ctx: LowerCtx) -> LowerCtx do
+  match pat do
+    case MirPatVariable(name: var_name, sigil: _) ->
+      // Bind: let var_name = ObjectField(target, field_idx)
+      match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
+        let binding_stmt = LirStmtLet(name: var_name, typ: TyI64,
+          expr: LirExprObjectField(value: target_atom, index: field_idx, typ: TyI64))
+        return LowerCtx(
+          vars: insert_type(name: var_name, typ: TyI64, entries: v),
+          semantic_vars: insert_type(name: var_name, typ: TyI64, entries: sv),
+          stmts: Cons(v: binding_stmt, rest: s),
+          temp_counter: c, enum_defs: ed)
+      end
+    case MirPatWildcard ->
+      return ctx
+    case _ ->
+      // Nested patterns: extract to temp, skip binding for now
+      return ctx
   end
 end
 

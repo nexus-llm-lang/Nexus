@@ -1,5 +1,4 @@
-use crate::common::check::should_fail_typecheck;
-use crate::common::wasm::exec_with_stdlib;
+use crate::harness::{exec_with_stdlib, should_fail_typecheck};
 
 #[test]
 fn clock_now_returns_positive_value() {

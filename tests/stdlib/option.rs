@@ -1,4 +1,4 @@
-use crate::common::wasm::exec_with_stdlib;
+use crate::harness::exec_with_stdlib;
 
 #[test]
 fn option_some_is_some() {

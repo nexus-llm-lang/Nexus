@@ -93,6 +93,36 @@ fn main() -> ExitCode {
             skip_typecheck,
         ),
         Some(Command::Check { input }) => check_command(input),
+        Some(Command::Exec {
+            input,
+            allow_fs,
+            allow_net,
+            allow_console,
+            allow_random,
+            allow_clock,
+            allow_proc,
+            allow_env,
+            preopen,
+            guest_args,
+        }) => {
+            let capabilities = match build_execution_capabilities(
+                allow_fs,
+                allow_net,
+                allow_console,
+                allow_random,
+                allow_clock,
+                allow_proc,
+                allow_env,
+                preopen,
+            ) {
+                Ok(capabilities) => capabilities,
+                Err(msg) => {
+                    eprintln!("Capability Error: {}", msg);
+                    return ExitCode::from(1);
+                }
+            };
+            exec_command(input, capabilities, guest_args)
+        }
         None => {
             if io::stdin().is_terminal() {
                 repl::start(ExecutionCapabilities::deny_all());
@@ -215,6 +245,22 @@ fn build_command(
     let caps = runtime::parse_nexus_capabilities(&final_wasm);
     artifact::print_build_result(&output_name, &caps, &explain, &format);
     ExitCode::SUCCESS
+}
+
+fn exec_command(
+    input: std::path::PathBuf,
+    capabilities: ExecutionCapabilities,
+    guest_args: Vec<String>,
+) -> ExitCode {
+    let wasm = match fs::read(&input) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("Failed to read {}: {}", input.display(), e);
+            return ExitCode::from(1);
+        }
+    };
+    let module_dir = input.parent();
+    runtime::wasm_exec::run_wasm_bytes(&wasm, module_dir, &capabilities, &guest_args)
 }
 
 fn check_command(input: Option<std::path::PathBuf>) -> ExitCode {

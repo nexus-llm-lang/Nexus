@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::lir::{LirAtom, LirExpr, LirExternal, LirProgram, LirStmt};
-use crate::lang::ast::Type;
+use crate::types::Type;
 
-use super::emit::{is_string_concat_operator, peel_linear};
+use super::emit::peel_linear;
+use super::string::is_string_concat_operator;
 use super::error::CodegenError;
 use super::STRING_DATA_BASE;
 
@@ -51,7 +52,7 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
     }
     // Collect function names for backtrace instrumentation
     for func in &program.functions {
-        string_literals.push(func.name.clone());
+        string_literals.push(func.name.to_string());
     }
 
     let object_heap_enabled = program_uses_object_heap(program);
@@ -124,7 +125,7 @@ fn choose_memory_mode(
     }
 
     if let Some(module) = modules_with_string_abi.into_iter().next() {
-        return Ok(MemoryMode::Imported { module });
+        return Ok(MemoryMode::Imported { module: module.to_string() });
     }
 
     if has_string_literals || object_heap_enabled {

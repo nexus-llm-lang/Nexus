@@ -1,0 +1,212 @@
+use crate::harness::{compile, exec, exec_with_stdlib};
+use std::fs;
+
+#[test]
+fn codegen_module_alias_call_compiles() {
+    exec(
+        r#"
+import as math from examples/math.nx
+
+let main = fn () -> unit do
+    let result = math.add(a: 19, b: 23)
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_fixture_fib_works_in_wasm() {
+    let src = fs::read_to_string("examples/fib.nx").expect("fixture should exist");
+    exec_with_stdlib(&src);
+}
+
+#[test]
+fn codegen_fixture_di_port_compiles() {
+    let src = fs::read_to_string("examples/di_port.nx").expect("fixture should exist");
+    exec_with_stdlib(&src);
+}
+
+#[test]
+fn codegen_fixture_module_test_compiles() {
+    let src = fs::read_to_string("examples/module_test.nx").expect("fixture should exist");
+    exec_with_stdlib(&src);
+}
+
+#[test]
+fn codegen_fixture_network_access_compiles() {
+    let src = fs::read_to_string("examples/network_access.nx").expect("fixture should exist");
+    let wasm = compile(&src);
+    assert!(!wasm.is_empty(), "compiled wasm should not be empty");
+}
+
+#[test]
+fn codegen_print_works_via_external_stdio_module() {
+    exec_with_stdlib(
+        r#"
+import external stdlib/stdlib.wasm
+external __nx_print = "__nx_print" : (val: string) -> unit
+
+let main = fn () -> unit do
+    __nx_print(val: "hello wasm")
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_print_after_from_i64_works_via_single_string_abi_module() {
+    exec_with_stdlib(
+        r#"
+import external stdlib/stdlib.wasm
+external __nx_print = "__nx_print" : (val: string) -> unit
+
+let main = fn () -> unit do
+    let s = from_i64(val: 42)
+    __nx_print(val: s)
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_handler_reachability_resolves_port_call() {
+    exec_with_stdlib(
+        r#"
+import { Console }, * as stdio from stdlib/stdio.nx
+
+let main = fn () -> unit require { PermConsole } do
+    inject stdio.system_handler do
+        Console.print(val: "hello")
+    end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_tail_recursive_function_executes_correctly() {
+    exec(
+        r#"
+let sum_tail = fn (n: i64, acc: i64) -> i64 do
+    if n <= 0 then return acc end
+    return sum_tail(n: n - 1, acc: acc + n)
+end
+
+let main = fn () -> unit do
+    let result = sum_tail(n: 100, acc: 0)
+    if result != 5050 then raise RuntimeError(val: "expected 5050") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_deep_tail_recursion_does_not_overflow() {
+    exec(
+        r#"
+let loop_n = fn (n: i64) -> i64 do
+    if n <= 0 then return 0 end
+    return loop_n(n: n - 1)
+end
+
+let main = fn () -> unit do
+    let result = loop_n(n: 1000000)
+    if result != 0 then raise RuntimeError(val: "expected 0") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_main_with_args_runs_with_stdlib() {
+    exec_with_stdlib(
+        r#"
+let main = fn (args: [string]) -> unit do
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_labeled_args_reordered_function_call() {
+    exec(
+        r#"
+let add = fn (a: i64, b: i64) -> i64 do
+    return a - b
+end
+
+let main = fn () -> unit do
+    let result = add(b: 10, a: 52)
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_labeled_args_reordered_constructor() {
+    exec(
+        r#"
+type Pair = MkPair(fst: i64, snd: i64)
+
+let main = fn () -> unit do
+    let p = MkPair(snd: 10, fst: 32)
+    match p do
+      case MkPair(fst: a, snd: b) ->
+        if a + b != 42 then raise RuntimeError(val: "expected 42") end
+    end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_labeled_args_constructor_pattern_match_same_result() {
+    exec(
+        r#"
+type Pair = MkPair(fst: i64, snd: i64)
+
+let main = fn () -> unit do
+    let p1 = MkPair(fst: 1, snd: 2)
+    let p2 = MkPair(snd: 2, fst: 1)
+    match p1 do
+      case MkPair(fst: a1, snd: b1) ->
+        match p2 do
+          case MkPair(fst: a2, snd: b2) ->
+            if a1 != a2 then raise RuntimeError(val: "fst mismatch") end
+            if b1 != b2 then raise RuntimeError(val: "snd mismatch") end
+        end
+    end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_labeled_args_tail_call_reordered() {
+    exec(
+        r#"
+let sub_tail = fn (a: i64, b: i64) -> i64 do
+    if b == 0 then return a end
+    return sub_tail(b: b - 1, a: a)
+end
+
+let main = fn () -> unit do
+    let result = sub_tail(a: 42, b: 0)
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}
