@@ -569,8 +569,13 @@ let lower_branch_for_value = fn (body: [MirStmt], result_name: string, result_ty
         // Assign value if present
         let final_stmts = match val_opt do
           case Some(val: atom) ->
+            // If atom is unit but result_type is non-unit, use default to avoid empty stack
+            let safe_atom = match atom do
+              case LirAtomUnit -> default_atom(typ: result_type)
+              case _ -> atom
+            end
             Cons(v: LirStmtLet(name: result_name, typ: result_type,
-                               expr: LirExprAtom(atom: atom)), rest: branch_stmts)
+                               expr: LirExprAtom(atom: safe_atom)), rest: branch_stmts)
           case None() -> branch_stmts
         end
         // Restore outer context with updated temp counter
@@ -638,17 +643,14 @@ let lower_match_expr = fn (target: MirExpr, cases: [MirMatchCase], ctx: LowerCtx
                 temp_counter: c, enum_defs: ed
               )
               // Build nested if chain
-              let chain = build_match_if_chain(cases: lowered, result_name: result_name,
-                                                result_type: result_type)
-              match chain do
-                case Some(val: if_stmt) ->
-                  match ctx5 do case LowerCtx(vars: v2, semantic_vars: sv2, stmts: s2, temp_counter: c2, enum_defs: ed2) ->
-                    let ctx6 = LowerCtx(vars: v2, semantic_vars: sv2,
-                      stmts: Cons(v: if_stmt, rest: s2), temp_counter: c2, enum_defs: ed2)
-                    return BindResult(ctx: ctx6, atom: LirAtomVar(name: result_name, typ: result_type))
-                  end
-                case None() ->
-                  return BindResult(ctx: ctx5, atom: LirAtomVar(name: result_name, typ: result_type))
+              let chain_stmts = build_match_if_chain(cases: lowered, result_name: result_name,
+                                                      result_type: result_type)
+              match ctx5 do case LowerCtx(vars: v2, semantic_vars: sv2, stmts: s2, temp_counter: c2, enum_defs: ed2) ->
+                // chain_stmts is forward-order; context stmts are reversed (newest first)
+                let ctx6 = LowerCtx(vars: v2, semantic_vars: sv2,
+                  stmts: append_stmts(stmts: reverse_stmts(stmts: chain_stmts), tail: s2),
+                  temp_counter: c2, enum_defs: ed2)
+                return BindResult(ctx: ctx6, atom: LirAtomVar(name: result_name, typ: result_type))
               end
             end
           end
@@ -657,7 +659,7 @@ let lower_match_expr = fn (target: MirExpr, cases: [MirMatchCase], ctx: LowerCtx
   end
 end
 
-type LoweredMatchCase = LoweredMatchCase(cond: Option<LirAtom>, stmts: [LirStmt], value: LirAtom)
+type LoweredMatchCase = LoweredMatchCase(cond: Option<LirAtom>, cond_stmts: [LirStmt], stmts: [LirStmt], value: LirAtom, final_temp: i64)
 
 type LoweredMatchCaseWithCtx = LoweredMatchCaseWithCtx(lmc: LoweredMatchCase, next_temp: i64)
 
@@ -670,14 +672,14 @@ let lower_match_cases_expr = fn (cases: [MirMatchCase], target_atom: LirAtom, ct
       match c do case MirMatchCase(pattern: pat, body: body) ->
         let cr = lower_match_case_expr_tracked(target_atom: target_atom, pattern: pat, body: body, ctx: ctx)
         match cr do case LoweredMatchCaseWithCtx(lmc: lmc, next_temp: nt) ->
-          match lmc do case LoweredMatchCase(cond: cond, stmts: stmts, value: val) ->
+          match lmc do case LoweredMatchCase(cond: cond, cond_stmts: cs, stmts: stmts, value: val, final_temp: ft) ->
             // Advance temp_counter for next case to avoid name collisions
             match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: _, enum_defs: ed) ->
               let next_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: nt, enum_defs: ed)
               let rr = lower_match_cases_expr(cases: rest, target_atom: target_atom, ctx: next_ctx)
               match rr do case LowerMatchCasesExprResult(ctx: ctx2, lowered: rest_lowered) ->
                 return LowerMatchCasesExprResult(ctx: ctx2,
-                  lowered: Cons(v: LoweredMatchCase(cond: cond, stmts: stmts, value: val), rest: rest_lowered))
+                  lowered: Cons(v: LoweredMatchCase(cond: cond, cond_stmts: cs, stmts: stmts, value: val, final_temp: ft), rest: rest_lowered))
               end
             end
           end
@@ -689,14 +691,9 @@ end
 let lower_match_case_expr_tracked = fn (target_atom: LirAtom, pattern: MirPattern,
     body: [MirStmt], ctx: LowerCtx) -> LoweredMatchCaseWithCtx do
   let result = lower_match_case_expr(target_atom: target_atom, pattern: pattern, body: body, ctx: ctx)
-  // Extract max temp_counter used during this case
-  // The body lowering allocates temps via lower_case_body_value which resets stmts but advances temp_counter
-  // We estimate by counting stmts that look like temp bindings
-  match ctx do case LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: start_tc, enum_defs: _) ->
-    // Count temps used: each stmt in the result may have used temps
-    let estimated_temps = count_let_stmts(stmts: match result do case LoweredMatchCase(cond: _, stmts: s, value: _) -> s end)
-    let next_tc = start_tc + estimated_temps + 5 // +5 for tag check and overhead
-    return LoweredMatchCaseWithCtx(lmc: result, next_temp: next_tc)
+  // Use the actual final temp counter from the lowering result
+  match result do case LoweredMatchCase(cond: _, cond_stmts: _, stmts: _, value: _, final_temp: ft) ->
+    return LoweredMatchCaseWithCtx(lmc: result, next_temp: ft)
   end
 end
 
@@ -722,8 +719,8 @@ let lower_match_case_expr = fn (target_atom: LirAtom, pattern: MirPattern, body:
   match pattern do
     case MirPatWildcard ->
       let vr = lower_case_body_value(body: body, ctx: ctx)
-      match vr do case CaseBodyValueResult(stmts: stmts, value: val) ->
-        return LoweredMatchCase(cond: None(), stmts: stmts, value: val)
+      match vr do case CaseBodyValueResult(stmts: stmts, value: val, final_temp: ft) ->
+        return LoweredMatchCase(cond: None(), cond_stmts: Nil(), stmts: stmts, value: val, final_temp: ft)
       end
 
     case MirPatVariable(name: n, sigil: _) ->
@@ -736,10 +733,10 @@ let lower_match_case_expr = fn (target_atom: LirAtom, pattern: MirPattern, body:
           enum_defs: match ctx do case LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) -> ed end
         )
         let vr = lower_case_body_value(body: body, ctx: bound_ctx)
-        match vr do case CaseBodyValueResult(stmts: stmts, value: val) ->
+        match vr do case CaseBodyValueResult(stmts: stmts, value: val, final_temp: ft) ->
           let binding_stmt = LirStmtLet(name: n, typ: atom_type(atom: target_atom),
                                          expr: LirExprAtom(atom: target_atom))
-          return LoweredMatchCase(cond: None(), stmts: Cons(v: binding_stmt, rest: stmts), value: val)
+          return LoweredMatchCase(cond: None(), cond_stmts: Nil(), stmts: Cons(v: binding_stmt, rest: stmts), value: val, final_temp: ft)
         end
       end
 
@@ -748,8 +745,8 @@ let lower_match_case_expr = fn (target_atom: LirAtom, pattern: MirPattern, body:
       let cond_atom = LirAtomBool(val: true)
       // TODO: proper equality check
       let vr = lower_case_body_value(body: body, ctx: ctx)
-      match vr do case CaseBodyValueResult(stmts: stmts, value: val) ->
-        return LoweredMatchCase(cond: Some(val: cond_atom), stmts: stmts, value: val)
+      match vr do case CaseBodyValueResult(stmts: stmts, value: val, final_temp: ft) ->
+        return LoweredMatchCase(cond: Some(val: cond_atom), cond_stmts: Nil(), stmts: stmts, value: val, final_temp: ft)
       end
 
     case MirPatConstructor(name: n, fields: fields) ->
@@ -766,17 +763,21 @@ let lower_match_case_expr = fn (target_atom: LirAtom, pattern: MirPattern, body:
             expr: LirExprBinary(op: OpEq, lhs: tag_atom, rhs: LirAtomInt(val: tag), typ: TyBool),
             typ: TyBool)
           match cond_br do case BindResult(ctx: ctx3, atom: cond_atom) ->
-            // Extract each field and bind pattern variables
-            let field_ctx = extract_ctor_fields(
-              target_atom: target_atom, fields: fields, field_idx: 0, ctx: ctx3)
-            // Extraction stmts are in field_ctx.stmts (accumulated in reverse)
-            match field_ctx do case LowerCtx(vars: _, semantic_vars: _, stmts: extract_stmts, temp_counter: _, enum_defs: _) ->
-              let prefix_stmts = reverse_stmts(stmts: extract_stmts)
-              // Lower body with field vars available
-              let vr = lower_case_body_value(body: body, ctx: field_ctx)
-              match vr do case CaseBodyValueResult(stmts: body_stmts, value: val) ->
-                let all_stmts = append_stmts(stmts: prefix_stmts, tail: body_stmts)
-                return LoweredMatchCase(cond: Some(val: cond_atom), stmts: all_stmts, value: val)
+            // Separate cond_stmts (tag check + comparison) from field extraction
+            match ctx3 do case LowerCtx(vars: v3, semantic_vars: sv3, stmts: cond_stmts_rev, temp_counter: tc3, enum_defs: ed3) ->
+              let cond_stmts = reverse_stmts(stmts: cond_stmts_rev)
+              // Extract fields in fresh context (without cond stmts)
+              let field_start_ctx = LowerCtx(vars: v3, semantic_vars: sv3, stmts: Nil(), temp_counter: tc3, enum_defs: ed3)
+              let field_ctx = extract_ctor_fields(
+                target_atom: target_atom, fields: fields, field_idx: 0, ctx: field_start_ctx)
+              match field_ctx do case LowerCtx(vars: _, semantic_vars: _, stmts: field_stmts_rev, temp_counter: _, enum_defs: _) ->
+                let field_stmts = reverse_stmts(stmts: field_stmts_rev)
+                // Lower body with field vars available
+                let vr = lower_case_body_value(body: body, ctx: field_ctx)
+                match vr do case CaseBodyValueResult(stmts: body_stmts, value: val, final_temp: ft) ->
+                  let body_and_fields = append_stmts(stmts: field_stmts, tail: body_stmts)
+                  return LoweredMatchCase(cond: Some(val: cond_atom), cond_stmts: cond_stmts, stmts: body_and_fields, value: val, final_temp: ft)
+                end
               end
             end
           end
@@ -792,9 +793,9 @@ let lower_match_case_expr = fn (target_atom: LirAtom, pattern: MirPattern, body:
         match field_ctx do case LowerCtx(vars: _, semantic_vars: _, stmts: extract_stmts, temp_counter: _, enum_defs: _) ->
           let prefix_stmts = reverse_stmts(stmts: extract_stmts)
           let vr = lower_case_body_value(body: body, ctx: field_ctx)
-          match vr do case CaseBodyValueResult(stmts: body_stmts, value: val) ->
+          match vr do case CaseBodyValueResult(stmts: body_stmts, value: val, final_temp: ft) ->
             let all_stmts = append_stmts(stmts: prefix_stmts, tail: body_stmts)
-            return LoweredMatchCase(cond: None(), stmts: all_stmts, value: val)
+            return LoweredMatchCase(cond: None(), cond_stmts: Nil(), stmts: all_stmts, value: val, final_temp: ft)
           end
         end
       end
@@ -853,20 +854,20 @@ let extract_pattern_field = fn (target_atom: LirAtom, pat: MirPattern,
   end
 end
 
-type CaseBodyValueResult = CaseBodyValueResult(stmts: [LirStmt], value: LirAtom)
+type CaseBodyValueResult = CaseBodyValueResult(stmts: [LirStmt], value: LirAtom, final_temp: i64)
 
 let lower_case_body_value = fn (body: [MirStmt], ctx: LowerCtx) -> CaseBodyValueResult do
   match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: _, temp_counter: c, enum_defs: ed) ->
     let work_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: Nil(), temp_counter: c, enum_defs: ed)
     let result = lower_branch_body(body: body, result_name: "__case_val", result_type: TyI64, ctx: work_ctx)
     match result do case BranchBodyResult(ctx: ctx2, value_opt: val_opt) ->
-      match ctx2 do case LowerCtx(vars: _, semantic_vars: _, stmts: branch_stmts, temp_counter: _, enum_defs: _) ->
+      match ctx2 do case LowerCtx(vars: _, semantic_vars: _, stmts: branch_stmts, temp_counter: final_tc, enum_defs: _) ->
         let stmts = reverse_stmts(stmts: branch_stmts)
         let val = match val_opt do
           case Some(val: a) -> a
-          case None() -> LirAtomUnit
+          case None() -> LirAtomInt(val: 0)
         end
-        return CaseBodyValueResult(stmts: stmts, value: val)
+        return CaseBodyValueResult(stmts: stmts, value: val, final_temp: final_tc)
       end
     end
   end
@@ -876,7 +877,7 @@ let infer_case_value_type = fn (cases: [LoweredMatchCase], ctx: LowerCtx) -> Typ
   match cases do
     case Nil() -> return TyUnit
     case Cons(v: c, rest: rest) ->
-      match c do case LoweredMatchCase(cond: _, stmts: _, value: val) ->
+      match c do case LoweredMatchCase(cond: _, cond_stmts: _, stmts: _, value: val, final_temp: _) ->
         let t = atom_type(atom: val)
         match t do
           case TyUnit -> return infer_case_value_type(cases: rest, ctx: ctx)
@@ -897,22 +898,19 @@ let infer_case_value_type = fn (cases: [LoweredMatchCase], ctx: LowerCtx) -> Typ
   end
 end
 
-let build_match_if_chain = fn (cases: [LoweredMatchCase], result_name: string, result_type: TypeExpr) -> Option<LirStmt> do
+let build_match_if_chain = fn (cases: [LoweredMatchCase], result_name: string, result_type: TypeExpr) -> [LirStmt] do
   // Build reversed (cases processed last-to-first to nest else bodies)
-  return build_chain_reversed(cases: reverse_lowered_cases(cases: cases), chain: None(),
+  return build_chain_reversed(cases: reverse_lowered_cases(cases: cases), chain: Nil(),
                                result_name: result_name, result_type: result_type)
 end
 
-let build_chain_reversed = fn (cases: [LoweredMatchCase], chain: Option<LirStmt>,
-                                result_name: string, result_type: TypeExpr) -> Option<LirStmt> do
+let build_chain_reversed = fn (cases: [LoweredMatchCase], chain: [LirStmt],
+                                result_name: string, result_type: TypeExpr) -> [LirStmt] do
   match cases do
     case Nil() -> return chain
     case Cons(v: c, rest: rest) ->
-      match c do case LoweredMatchCase(cond: cond_opt, stmts: case_stmts, value: val) ->
-        let else_body = match chain do
-          case Some(val: stmt) -> Cons(v: stmt, rest: Nil())
-          case None() -> Nil()
-        end
+      match c do case LoweredMatchCase(cond: cond_opt, cond_stmts: cs, stmts: case_stmts, value: val, final_temp: _) ->
+        let else_body = chain
         let cond = match else_body do
           case Nil() -> LirAtomBool(val: true)
           case _ ->
@@ -921,11 +919,18 @@ let build_chain_reversed = fn (cases: [LoweredMatchCase], chain: Option<LirStmt>
               case None() -> LirAtomBool(val: true)
             end
         end
+        // If val is unit but result_type is non-unit, use default atom to avoid empty stack
+        let safe_val = match val do
+          case LirAtomUnit -> default_atom(typ: result_type)
+          case _ -> val
+        end
         let assign_stmt = LirStmtLet(name: result_name, typ: result_type,
-                                      expr: LirExprAtom(atom: val))
+                                      expr: LirExprAtom(atom: safe_val))
         let then_body = append_stmts(stmts: case_stmts, tail: Cons(v: assign_stmt, rest: Nil()))
         let if_stmt = LirStmtIf(cond: cond, then_body: then_body, else_body: else_body)
-        return build_chain_reversed(cases: rest, chain: Some(val: if_stmt),
+        // cond_stmts go BEFORE the if so the condition variable is computed first
+        let this_chain = append_stmts(stmts: cs, tail: Cons(v: if_stmt, rest: Nil()))
+        return build_chain_reversed(cases: rest, chain: this_chain,
                                      result_name: result_name, result_type: result_type)
       end
   end
@@ -1065,7 +1070,7 @@ let lower_if_stmt = fn (cond: MirExpr, then_body: [MirStmt], else_body: Option<[
                     match ctx4 do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
                       let ctx5 = LowerCtx(vars: v, semantic_vars: sv,
                         stmts: Cons(v: LirStmtIfReturn(cond: cond_atom,
-                          then_body: then_stmts, then_ret: LirAtomUnit,
+                          then_body: then_stmts, then_ret: default_atom(typ: ret_type),
                           else_body: else_stmts, else_ret: else_ret,
                           ret_type: ret_type), rest: s),
                         temp_counter: c, enum_defs: ed)

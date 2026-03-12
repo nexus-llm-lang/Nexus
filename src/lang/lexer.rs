@@ -282,6 +282,8 @@ impl Lexer {
                     Some('n') => content.push('\n'),
                     Some('r') => content.push('\r'),
                     Some('t') => content.push('\t'),
+                    Some('e') => content.push('\x1b'),
+                    Some('0') => content.push('\0'),
                     Some('\\') => content.push('\\'),
                     Some(c) => content.push(c),
                     None => {
@@ -324,6 +326,8 @@ impl Lexer {
                     Some('n') => content.push('\n'),
                     Some('r') => content.push('\r'),
                     Some('t') => content.push('\t'),
+                    Some('e') => content.push('\x1b'),
+                    Some('0') => content.push('\0'),
                     Some(c) => content.push(c),
                     None => {
                         self.errors.push(LexError {

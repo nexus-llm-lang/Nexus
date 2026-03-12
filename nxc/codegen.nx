@@ -11,13 +11,15 @@ import as bb from stdlib/bytebuffer.nx
 import { BinaryOp, TypeExpr, NamedType } from nxc/ast.nx
 import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom,
          LirExternal, LirParam, LirCallArg, LirNamedAtom } from nxc/lir.nx
-import { from_i64, join } from stdlib/string.nx
+import { join } from stdlib/string.nx
 import { char_code } from stdlib/string.nx
 import as list from stdlib/list.nx
 
 import external stdlib/stdlib.wasm
 external str_length = "__nx_string_length" : (s: string) -> i64
 external str_starts_with = "__nx_string_starts_with" : (s: string, prefix: string) -> bool
+external str_substring = "__nx_string_substring" : (s: string, start: i64, len: i64) -> string
+external str_index_of = "__nx_string_index_of" : (s: string, sub: string) -> i64
 
 
 // ─── WASM Constants ─────────────────────────────────────────────────────────
@@ -305,6 +307,51 @@ let lookup_func = fn (name: string, entries: [FuncEntry]) -> i64 do
       match e do case FuncEntry(name: n, index: idx) ->
         if n == name then return idx
         else return lookup_func(name: name, entries: rest)
+        end
+      end
+  end
+end
+
+/// Extract the base name from an import-prefixed function name.
+/// "__import_N.foo" -> "foo", "foo" -> "foo"
+let extract_base_name = fn (name: string) -> string do
+  if str_starts_with(s: name, prefix: "__import_") then
+    let dot_pos = str_index_of(s: name, sub: ".")
+    if dot_pos >= 0 then
+      return str_substring(s: name, start: dot_pos + 1, len: str_length(s: name) - dot_pos - 1)
+    else return name
+    end
+  else return name
+  end
+end
+
+/// Check if a function entry's name has the same base name.
+let has_base_name = fn (entry_name: string, base: string) -> bool do
+  let entry_base = extract_base_name(name: entry_name)
+  return entry_base == base
+end
+
+/// Lookup a function by base name (ignoring __import_N. prefix differences).
+let lookup_func_by_base = fn (base: string, entries: [FuncEntry]) -> i64 do
+  match entries do
+    case Nil() -> return -1
+    case Cons(v: e, rest: rest) ->
+      match e do case FuncEntry(name: n, index: idx) ->
+        if has_base_name(entry_name: n, base: base) then return idx
+        else return lookup_func_by_base(base: base, entries: rest)
+        end
+      end
+  end
+end
+
+/// Find a function definition by base name (ignoring __import_N. prefix differences).
+let find_function_by_base = fn (base: string, funcs: [LirFunction]) -> Option<LirFunction> do
+  match funcs do
+    case Nil() -> return None()
+    case Cons(v: f, rest: rest) ->
+      match f do case LirFunction(name: fname, params: _, ret_type: _, body: _, ret: _, span: _) ->
+        if has_base_name(entry_name: fname, base: base) then return Some(val: f)
+        else return find_function_by_base(base: base, funcs: rest)
         end
       end
   end
@@ -989,6 +1036,17 @@ end
 
 // ─── Numeric Coercion ───────────────────────────────────────────────────────
 
+// Coerce between WASM valtypes (raw i32/i64/f32/f64 values)
+let emit_valtype_coercion = fn (from_vt: i64, to_vt: i64, buf: %ByteBuffer) -> %ByteBuffer do
+  if from_vt == to_vt then return %buf
+  else if from_vt == vt_i32 && to_vt == vt_i64 then
+    return push_byte(buf: %buf, byte: op_i64_extend_i32_s)
+  else if from_vt == vt_i64 && to_vt == vt_i32 then
+    return push_byte(buf: %buf, byte: op_i32_wrap_i64)
+  else return %buf
+  end end end
+end
+
 let emit_coercion = fn (from_type: TypeExpr, to_type: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
   let f = peel_linear(typ: from_type)
   let t = peel_linear(typ: to_type)
@@ -1386,6 +1444,56 @@ end
 
 // ─── Binary Operation Emission ──────────────────────────────────────────────
 
+// Returns the expected WASM valtype for operands of a binary operator.
+let binary_operand_valtype = fn (op: BinaryOp) -> i64 do
+  match op do
+    case OpAnd -> return vt_i32
+    case OpOr -> return vt_i32
+    case OpFAdd -> return vt_f64
+    case OpFSub -> return vt_f64
+    case OpFMul -> return vt_f64
+    case OpFDiv -> return vt_f64
+    case OpFEq -> return vt_f64
+    case OpFNe -> return vt_f64
+    case OpFLt -> return vt_f64
+    case OpFLe -> return vt_f64
+    case OpFGt -> return vt_f64
+    case OpFGe -> return vt_f64
+    case _ -> return vt_i64
+  end
+end
+
+/// Returns the ACTUAL WASM valtype that a binary op pushes onto the stack.
+/// Comparison and logical ops always produce i32, regardless of operand type.
+let binary_result_valtype = fn (op: BinaryOp) -> i64 do
+  match op do
+    // Integer comparisons -> i32
+    case OpEq -> return vt_i32
+    case OpNe -> return vt_i32
+    case OpLt -> return vt_i32
+    case OpLe -> return vt_i32
+    case OpGt -> return vt_i32
+    case OpGe -> return vt_i32
+    // Float comparisons -> i32
+    case OpFEq -> return vt_i32
+    case OpFNe -> return vt_i32
+    case OpFLt -> return vt_i32
+    case OpFLe -> return vt_i32
+    case OpFGt -> return vt_i32
+    case OpFGe -> return vt_i32
+    // Logical -> i32
+    case OpAnd -> return vt_i32
+    case OpOr -> return vt_i32
+    // Float arithmetic -> f64
+    case OpFAdd -> return vt_f64
+    case OpFSub -> return vt_f64
+    case OpFMul -> return vt_f64
+    case OpFDiv -> return vt_f64
+    // Integer arithmetic -> i64
+    case _ -> return vt_i64
+  end
+end
+
 let emit_binary = fn (op: BinaryOp, buf: %ByteBuffer) -> %ByteBuffer do
   let opcode = match op do
     case OpAdd -> op_i64_add
@@ -1476,11 +1584,24 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       if is_string_concat_op(op: op, typ: t) then
         return emit_string_concat(lhs: l, rhs: r, buf: %buf, ctx: ctx)
       else if is_string_op(op: op, lhs_type: atom_type(atom: l), rhs_type: atom_type(atom: r)) then
-        return emit_string_compare(op: op, lhs: l, rhs: r, buf: %buf, ctx: ctx)
+        let %buf = emit_string_compare(op: op, lhs: l, rhs: r, buf: %buf, ctx: ctx)
+        // String compare produces i32; coerce to target type if needed
+        let target_vt = type_to_valtype(typ: t)
+        return emit_valtype_coercion(from_vt: vt_i32, to_vt: target_vt, buf: %buf)
       else
+        let expected_vt = binary_operand_valtype(op: op)
         let %buf = emit_atom(atom: l, buf: %buf, ctx: ctx)
+        let lhs_vt = type_to_valtype(typ: atom_type(atom: l))
+        let %buf = emit_valtype_coercion(from_vt: lhs_vt, to_vt: expected_vt, buf: %buf)
         let %buf = emit_atom(atom: r, buf: %buf, ctx: ctx)
-        return emit_binary(op: op, buf: %buf)
+        let rhs_vt = type_to_valtype(typ: atom_type(atom: r))
+        let %buf = emit_valtype_coercion(from_vt: rhs_vt, to_vt: expected_vt, buf: %buf)
+        let %buf = emit_binary(op: op, buf: %buf)
+        // Coerce binary result to match the LIR expression's declared type.
+        // Comparisons produce i32 but typ may expect i64.
+        let result_vt = binary_result_valtype(op: op)
+        let target_vt = type_to_valtype(typ: t)
+        return emit_valtype_coercion(from_vt: result_vt, to_vt: target_vt, buf: %buf)
       end end
 
     case LirExprCall(func: fname, args: args, typ: _) ->
@@ -1579,7 +1700,7 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
                      is_tail: bool, in_try: bool) -> %ByteBuffer do
   let int_idx = lookup_func(name: func, entries: ctx_internal_funcs(ctx: ctx))
   if int_idx >= 0 then
-    // Internal call
+    // Internal call — exact match
     let callee = find_function(name: func, funcs: ctx_functions(ctx: ctx))
     match callee do
       case Some(val: f) ->
@@ -1593,6 +1714,7 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
         end
       case None() ->
         // Should not happen
+        let %buf = push_byte(buf: %buf, byte: op_unreachable)
         return %buf
     end
   else
@@ -1607,11 +1729,35 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
             let %buf = push_uleb128(buf: %buf, val: ext_idx)
             return %buf
           end
-        case None() -> return %buf
+        case None() ->
+          let %buf = push_byte(buf: %buf, byte: op_unreachable)
+          return %buf
       end
     else
-      // Unknown function
-      return %buf
+      // Exact match failed — try fuzzy lookup by base name (handles __import_N. prefix mismatch)
+      let base = extract_base_name(name: func)
+      let fuzzy_int_idx = lookup_func_by_base(base: base, entries: ctx_internal_funcs(ctx: ctx))
+      if fuzzy_int_idx >= 0 then
+        let fuzzy_callee = find_function_by_base(base: base, funcs: ctx_functions(ctx: ctx))
+        match fuzzy_callee do
+          case Some(val: f) ->
+            match f do case LirFunction(name: _, params: params, ret_type: _, body: _, ret: _, span: _) ->
+              let %buf = emit_internal_call_args(buf: %buf, args: args, params: params, ctx: ctx)
+              let use_tail = is_tail && (in_try == false)
+              let call_op = match use_tail do case true -> op_return_CALL case false -> op_call end
+              let %buf = push_byte(buf: %buf, byte: call_op)
+              let %buf = push_uleb128(buf: %buf, val: fuzzy_int_idx)
+              return %buf
+            end
+          case None() ->
+            let %buf = push_byte(buf: %buf, byte: op_unreachable)
+            return %buf
+        end
+      else
+        // Unknown function — emit unreachable to prevent invalid dead code
+        let %buf = push_byte(buf: %buf, byte: op_unreachable)
+        return %buf
+      end
     end
   end
   return %buf
@@ -1718,13 +1864,37 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
           return push_byte(buf: %buf, byte: op_drop)
         else return %buf end
       else
-        let %buf = emit_coercion(from_type: et, to_type: t, buf: %buf)
-        let idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
-        let safe_idx = match idx < 0 do case true -> 0 case false -> idx end
-        let %buf = push_byte(buf: %buf, byte: op_local_set)
-        let %buf = push_uleb128(buf: %buf, val: safe_idx)
-        return %buf
+        if is_unit(typ: et) then
+          // Expression pushed nothing but we need a value for local.set.
+          // Push a zero constant matching the target WASM type.
+          let vt = type_to_valtype(typ: t)
+          if vt == vt_i32 then
+            let %buf = push_byte(buf: %buf, byte: op_i32_const)
+            let %buf = push_sleb128(buf: %buf, val: 0)
+            let idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
+            let safe_idx = match idx < 0 do case true -> 0 case false -> idx end
+            let %buf = push_byte(buf: %buf, byte: op_local_set)
+            let %buf = push_uleb128(buf: %buf, val: safe_idx)
+            return %buf
+          else
+            let %buf = push_byte(buf: %buf, byte: op_i64_const)
+            let %buf = push_sleb128(buf: %buf, val: 0)
+            let idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
+            let safe_idx = match idx < 0 do case true -> 0 case false -> idx end
+            let %buf = push_byte(buf: %buf, byte: op_local_set)
+            let %buf = push_uleb128(buf: %buf, val: safe_idx)
+            return %buf
+          end
+        else
+          let %buf = emit_coercion(from_type: et, to_type: t, buf: %buf)
+          let idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
+          let safe_idx = match idx < 0 do case true -> 0 case false -> idx end
+          let %buf = push_byte(buf: %buf, byte: op_local_set)
+          let %buf = push_uleb128(buf: %buf, val: safe_idx)
+          return %buf
+        end
       end
+      return %buf
 
     case LirStmtIf(cond: c, then_body: tb, else_body: eb) ->
       let %buf = emit_atom(atom: c, buf: %buf, ctx: ctx)
@@ -1750,6 +1920,9 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = emit_stmts(stmts: eb, buf: %buf, ctx: ctx, in_try: in_try)
       let %buf = emit_optional_else_ret(buf: %buf, er: er, rt: rt, ctx: ctx)
       let %buf = push_byte(buf: %buf, byte: op_end)
+      // Both branches return, so code after this if-else is unreachable.
+      // Emit unreachable to prevent WASM validation errors from dead code.
+      let %buf = push_byte(buf: %buf, byte: op_unreachable)
       return %buf
 
     case LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
@@ -1987,10 +2160,42 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuff
 end
 
 // WASI CLI run wrapper: calls main, drops result if non-unit, returns i32 0
-let compile_wasi_run_wrapper = fn (main_idx: i64, main_ret_type: TypeExpr) -> %ByteBuffer do
+// If main takes args (i64 parameter), allocate a Nil() list on the heap and push it.
+let compile_wasi_run_wrapper = fn (main_idx: i64, main_ret_type: TypeExpr,
+                                    main_has_args: bool) -> %ByteBuffer do
   let %body = empty()
-  // 0 locals
-  let %body = push_uleb128(buf: %body, val: 0)
+  if main_has_args then
+    // 1 local (i32) for Nil object pointer
+    let %body = push_uleb128(buf: %body, val: 1)
+    let %body = push_uleb128(buf: %body, val: 1)
+    let %body = push_byte(buf: %body, byte: vt_i32)
+    // Allocate Nil() on heap: global.get 0; local.tee 0; i32.const 8; i32.add; global.set 0
+    let nil_tag = constructor_tag(name: "Nil", arity: 0)
+    let %body = push_byte(buf: %body, byte: op_global_get)
+    let %body = push_uleb128(buf: %body, val: heap_global_idx)
+    let %body = push_byte(buf: %body, byte: op_local_tee)
+    let %body = push_uleb128(buf: %body, val: 0)
+    let %body = push_byte(buf: %body, byte: op_i32_const)
+    let %body = push_sleb128(buf: %body, val: 8)
+    let %body = push_byte(buf: %body, byte: op_i32_add)
+    let %body = push_byte(buf: %body, byte: op_global_set)
+    let %body = push_uleb128(buf: %body, val: heap_global_idx)
+    // Store Nil tag at offset 0
+    let %body = push_byte(buf: %body, byte: op_local_get)
+    let %body = push_uleb128(buf: %body, val: 0)
+    let %body = push_byte(buf: %body, byte: op_i64_const)
+    let %body = push_sleb128(buf: %body, val: nil_tag)
+    let %body = push_byte(buf: %body, byte: op_i64_store)
+    let %body = emit_memarg_i64(buf: %body, offset: 0)
+    // Push pointer as i64 for main's args parameter
+    let %body = push_byte(buf: %body, byte: op_local_get)
+    let %body = push_uleb128(buf: %body, val: 0)
+    let %body = push_byte(buf: %body, byte: op_i64_extend_i32_u)
+  else
+    // 0 locals
+    let %body = push_uleb128(buf: %body, val: 0)
+  end
+  // call main
   let %body = push_byte(buf: %body, byte: op_call)
   let %body = push_uleb128(buf: %body, val: main_idx)
   if is_unit(typ: main_ret_type) == false then
@@ -2106,6 +2311,13 @@ pub let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
         match f do case LirFunction(name: _, params: _, ret_type: rt, body: _, ret: _, span: _) -> rt end
       case None() -> TyUnit
     end
+    let main_has_args = match main_func do
+      case Some(val: f) ->
+        match f do case LirFunction(name: _, params: ps, ret_type: _, body: _, ret: _, span: _) ->
+          list.length(xs: ps) > 0
+        end
+      case None() -> false
+    end
 
     // Collect string literals
     let all_strings = collect_program_strings(funcs: funcs, acc: Nil())
@@ -2179,7 +2391,8 @@ pub let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
                                       functions: funcs,
                                       externals: exts)
     // WASI CLI run wrapper
-    let %wasi_body = compile_wasi_run_wrapper(main_idx: main_idx, main_ret_type: main_ret)
+    let %wasi_body = compile_wasi_run_wrapper(main_idx: main_idx, main_ret_type: main_ret,
+                                                main_has_args: main_has_args)
     let wasi_len = bb.length(buf: &wasi_body)
     let %code_sec = push_uleb128(buf: %code_sec, val: wasi_len)
     let %code_sec = push_buf(dst: %code_sec, src: &wasi_body)
