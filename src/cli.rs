@@ -209,8 +209,6 @@ pub fn build_execution_capabilities(
         allow_proc,
         allow_env,
         preopen_dirs,
-        net_allow_hosts: Vec::new(),
-        net_block_hosts: Vec::new(),
     };
     capabilities.validate()?;
     Ok(capabilities)
