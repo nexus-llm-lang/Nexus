@@ -25,6 +25,15 @@ pub enum ExplainCapabilitiesFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Default, clap::ValueEnum)]
+pub enum CheckFormat {
+    /// Human-readable text (default).
+    #[default]
+    Text,
+    /// Structured JSON (LLM-friendly).
+    Json,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "nexus")]
 #[command(about = "Nexus language CLI")]
@@ -101,7 +110,12 @@ pub enum Command {
     Check {
         /// Nexus source file path. Use '-' to read from stdin.
         input: Option<PathBuf>,
+        /// Output format: text (default) or json (structured, LLM-friendly).
+        #[arg(long, default_value = "text")]
+        format: CheckFormat,
     },
+    /// Start the Language Server Protocol server (stdio).
+    Lsp,
     /// Execute a pre-compiled WASM module with the Nexus runtime.
     Exec {
         /// Path to a `.wasm` file.

@@ -92,7 +92,8 @@ fn main() -> ExitCode {
             cli.verbose,
             skip_typecheck,
         ),
-        Some(Command::Check { input }) => check_command(input),
+        Some(Command::Check { input, format }) => check_command(input, format),
+        Some(Command::Lsp) => lsp_command(),
         Some(Command::Exec {
             input,
             allow_fs,
@@ -263,23 +264,61 @@ fn exec_command(
     runtime::wasm_exec::run_wasm_bytes(&wasm, module_dir, &capabilities, &guest_args)
 }
 
-fn check_command(input: Option<std::path::PathBuf>) -> ExitCode {
-    let loaded = match load_source(input) {
-        Ok(loaded) => loaded,
-        Err(msg) => {
-            eprintln!("{}", msg);
-            return ExitCode::from(1);
+fn check_command(input: Option<std::path::PathBuf>, format: cli::CheckFormat) -> ExitCode {
+    match format {
+        cli::CheckFormat::Json => {
+            let loaded = match load_source(input) {
+                Ok(loaded) => loaded,
+                Err(msg) => {
+                    // Even errors should be valid JSON
+                    let err = serde_json::json!({
+                        "file": "<stdin>",
+                        "ok": false,
+                        "diagnostics": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "severity": "error", "message": msg}],
+                        "symbols": []
+                    });
+                    println!("{}", serde_json::to_string_pretty(&err).unwrap());
+                    return ExitCode::from(1);
+                }
+            };
+            let src = strip_shebang(loaded.source);
+            let result = nexus::lsp::analyze(&loaded.display_name, &src);
+            println!("{}", serde_json::to_string_pretty(&result.check).unwrap());
+            if result.check.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
         }
-    };
-    let src = strip_shebang(loaded.source);
-    let program = match parse_program(&loaded.display_name, &src) {
-        Some(p) => p,
-        None => return ExitCode::from(1),
-    };
-    if typecheck_program(&loaded.display_name, &src, &program) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
+        cli::CheckFormat::Text => {
+            let loaded = match load_source(input) {
+                Ok(loaded) => loaded,
+                Err(msg) => {
+                    eprintln!("{}", msg);
+                    return ExitCode::from(1);
+                }
+            };
+            let src = strip_shebang(loaded.source);
+            let program = match parse_program(&loaded.display_name, &src) {
+                Some(p) => p,
+                None => return ExitCode::from(1),
+            };
+            if typecheck_program(&loaded.display_name, &src, &program) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+    }
+}
+
+fn lsp_command() -> ExitCode {
+    match nexus::lsp::serve() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("LSP server error: {}", e);
+            ExitCode::from(1)
+        }
     }
 }
 
