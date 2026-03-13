@@ -1,4 +1,5 @@
-use crate::harness::exec_with_stdlib;
+use crate::harness::{exec_with_stdlib, exec_with_stdlib_caps_should_trap};
+use nexus::runtime::ExecutionCapabilities;
 
 #[test]
 fn negate_in_math_module() {
@@ -71,6 +72,34 @@ end
     assert!(
         !err.is_empty(),
         "random.range without PermRandom should fail typechecking"
+    );
+}
+
+#[test]
+fn random_denied_at_wasi_level_without_allow_random() {
+    let caps = ExecutionCapabilities {
+        allow_console: true,
+        allow_fs: true,
+        ..ExecutionCapabilities::deny_all()
+    };
+    let err = exec_with_stdlib_caps_should_trap(
+        r#"
+import { Random }, * as rng from stdlib/random.nx
+
+let main = fn () -> unit require { PermRandom } do
+  inject rng.system_handler do
+    let _ = Random.range(min: 0, max: 10)
+    return ()
+  end
+end
+"#,
+        caps,
+    );
+    // The stub returns ENOSYS (errno 76), which the stdlib propagates as a wasm trap.
+    assert!(
+        err.contains("error while executing"),
+        "expected wasm trap from denied random access, got: {}",
+        err
     );
 }
 
