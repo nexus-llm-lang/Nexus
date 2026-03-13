@@ -1133,6 +1133,12 @@ impl Parser {
         let throws = self.parse_throws_clause()?;
         self.expect(&TokenKind::Do)?;
         let body = self.parse_stmt_list()?;
+        if body.is_empty() {
+            return Err(ParseError {
+                message: "Function body cannot be empty".into(),
+                span: self.peek_span(),
+            });
+        }
         self.expect(&TokenKind::End)?;
         let end = self.tokens[self.pos - 1].span.end;
 
@@ -1192,6 +1198,12 @@ impl Parser {
         let throws = self.parse_throws_clause()?;
         self.expect(&TokenKind::Do)?;
         let body = self.parse_stmt_list()?;
+        if body.is_empty() {
+            return Err(ParseError {
+                message: "Function body cannot be empty".into(),
+                span: self.peek_span(),
+            });
+        }
         self.expect(&TokenKind::End)?;
 
         Ok(Function {
