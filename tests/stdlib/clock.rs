@@ -76,8 +76,5 @@ let main = fn () -> i64 do
 end
 "#,
     );
-    assert!(
-        !err.is_empty(),
-        "Clock.now without PermClock should fail typechecking"
-    );
+    insta::assert_snapshot!(err);
 }

@@ -12,4 +12,6 @@ pub use execute::{
     exec_with_stdlib_caps_should_trap, exec_with_stdlib_should_trap,
 };
 pub use fixture::{read_fixture, TempDir};
-pub use typecheck::{should_fail_parse, should_fail_typecheck, should_typecheck, typecheck_warnings};
+pub use typecheck::{
+    parse_and_check, should_fail_parse, should_fail_typecheck, should_typecheck, typecheck_warnings,
+};

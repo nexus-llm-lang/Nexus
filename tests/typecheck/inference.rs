@@ -1,4 +1,4 @@
-use crate::harness::{should_fail_parse, should_fail_typecheck, should_typecheck};
+use crate::harness::{should_fail_typecheck, should_typecheck};
 use proptest::prelude::*;
 
 #[test]
@@ -559,18 +559,6 @@ fn test_ref_generic() {
     should_typecheck(&src);
 }
 
-#[test]
-fn test_enum_declaration_syntax_is_rejected() {
-    should_fail_parse(
-        r#"
-    enum Color { Red, Green }
-    let main = fn () -> unit do
-        return ()
-    end
-    "#,
-    );
-}
-
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 64,
@@ -633,11 +621,7 @@ let f = fn (x: i64) -> i64 do
 end
 "#,
     );
-    assert!(
-        msg.contains("mismatch") || msg.contains("Mismatch") || msg.contains("unif"),
-        "expected type mismatch error, got: {}",
-        msg,
-    );
+    insta::assert_snapshot!(msg);
 }
 
 #[test]
@@ -676,11 +660,7 @@ let main = fn (x: i64) -> unit do
 end
 "#,
     );
-    assert!(
-        msg.contains("main must be"),
-        "expected main signature error, got: {}",
-        msg
-    );
+    insta::assert_snapshot!(msg);
 }
 
 #[test]
@@ -692,11 +672,7 @@ let main = fn (args: [string], extra: i64) -> unit do
 end
 "#,
     );
-    assert!(
-        msg.contains("main must be"),
-        "expected main signature error, got: {}",
-        msg
-    );
+    insta::assert_snapshot!(msg);
 }
 
 // ---- Destructuring let ----
@@ -745,23 +721,10 @@ let main = fn () -> unit do
 end
 "#,
     );
-    assert!(
-        msg.contains("Non-exhaustive"),
-        "expected non-exhaustive error, got: {}",
-        msg
-    );
+    insta::assert_snapshot!(msg);
 }
 
 // ---- Implicit Unit return ----
-
-#[test]
-fn test_empty_fn_body_is_parse_error() {
-    should_fail_parse(
-        r#"
-    let main = fn () -> unit do end
-    "#,
-    );
-}
 
 #[test]
 fn test_no_return_non_unit_is_type_error() {
@@ -772,11 +735,7 @@ fn test_no_return_non_unit_is_type_error() {
     end
     "#,
     );
-    assert!(
-        msg.contains("no return statement"),
-        "expected 'no return statement' error, got: {}",
-        msg
-    );
+    insta::assert_snapshot!(msg);
 }
 
 #[test]

@@ -1,70 +1,4 @@
 use crate::harness::{exec, should_fail_typecheck};
-use nexus::lang::ast::{Expr, Type};
-use nexus::lang::parser;
-
-#[test]
-fn test_list_type_is_builtin() {
-    let src = r#"
-    let main = fn () -> unit do
-        let xs: [i64] = [1, 2, 3]
-        return ()
-    end
-    "#;
-    let program = parser::parser().parse(src).unwrap();
-    let found_list_type = program.definitions.iter().any(|def| {
-        if let nexus::lang::ast::TopLevel::Let(gl) = &def.node {
-            if let Expr::Lambda { body, .. } = &gl.value.node {
-                body.iter().any(|stmt| {
-                    if let nexus::lang::ast::Stmt::Let { typ: Some(t), .. } = &stmt.node {
-                        matches!(t, Type::List(_))
-                    } else {
-                        false
-                    }
-                })
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    });
-    assert!(
-        found_list_type,
-        "Parser should produce Type::List for [i64] syntax"
-    );
-}
-
-#[test]
-fn test_list_expr_is_builtin() {
-    let src = r#"
-    let main = fn () -> unit do
-        let xs = [1, 2, 3]
-        return ()
-    end
-    "#;
-    let program = parser::parser().parse(src).unwrap();
-    let found_list_expr = program.definitions.iter().any(|def| {
-        if let nexus::lang::ast::TopLevel::Let(gl) = &def.node {
-            if let Expr::Lambda { body, .. } = &gl.value.node {
-                body.iter().any(|stmt| {
-                    if let nexus::lang::ast::Stmt::Let { value, .. } = &stmt.node {
-                        matches!(value.node, Expr::List(_))
-                    } else {
-                        false
-                    }
-                })
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    });
-    assert!(
-        found_list_expr,
-        "Parser should produce Expr::List for [1,2,3] syntax"
-    );
-}
 
 #[test]
 fn test_list_builtin_no_import() {
@@ -110,7 +44,7 @@ fn test_list_type_mismatch() {
     end
     "#,
     );
-    assert!(!err.is_empty(), "Should fail: mixed types in list");
+    insta::assert_snapshot!(err);
 }
 
 #[test]

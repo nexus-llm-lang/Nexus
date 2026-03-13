@@ -30,10 +30,7 @@ let main = fn () -> unit do
 end
 "#,
     );
-    assert!(
-        !err.is_empty(),
-        "Env.get without PermEnv should fail typechecking"
-    );
+    insta::assert_snapshot!(err);
 }
 
 #[test]
