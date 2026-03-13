@@ -60,7 +60,11 @@ pub fn run_main(wasm: &[u8]) -> Result<(), String> {
         let main = instance
             .get_typed_func::<(), ()>(&mut store, "main")
             .map_err(|e| e.to_string())?;
-        return main.call(&mut store, ()).map_err(|e| e.to_string());
+        let result = main.call(&mut store, ()).map_err(|e| e.to_string());
+        if has_conc {
+            conc::reset_conc_runtime();
+        }
+        return result;
     }
 
     let mut store = Store::new(&engine, ());
@@ -162,7 +166,11 @@ pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
     let main = instance
         .get_typed_func::<(), ()>(&mut store, "main")
         .map_err(|e| e.to_string())?;
-    main.call(&mut store, ()).map_err(|e| e.to_string())
+    let result = main.call(&mut store, ()).map_err(|e| e.to_string());
+    if has_conc {
+        conc::reset_conc_runtime();
+    }
+    result
 }
 
 /// Execute main() -> () with WASI P1, stdlib, and custom capability enforcement.
@@ -231,7 +239,11 @@ pub fn run_main_with_deps_caps(
     let main = instance
         .get_typed_func::<(), ()>(&mut store, "main")
         .map_err(|e| e.to_string())?;
-    main.call(&mut store, ()).map_err(|e| e.to_string())
+    let result = main.call(&mut store, ()).map_err(|e| e.to_string());
+    if has_conc {
+        conc::reset_conc_runtime();
+    }
+    result
 }
 
 /// Stub implementations for nexus-host functions (trapping).
