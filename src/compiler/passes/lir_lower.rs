@@ -5,6 +5,7 @@
 //! - Complex expressions are extracted into let-bound temporaries
 //! - If/Match compiled into IfReturn chains
 
+use crate::compiler::type_tag::constructor_tag;
 use crate::intern::Symbol;
 use crate::ir::lir::*;
 use crate::ir::mir::*;
@@ -1690,18 +1691,6 @@ fn wasm_type(typ: &Type) -> Type {
             }
         },
     }
-}
-
-/// Compute constructor tag (FNV-1a-like hash of name + arity)
-fn constructor_tag(name: &str, arity: usize) -> i64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in name.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash ^= arity as u64;
-    hash = hash.wrapping_mul(0x100000001b3);
-    hash as i64
 }
 
 /// Infer the result type of a binary operation (matches old lower.rs logic exactly)

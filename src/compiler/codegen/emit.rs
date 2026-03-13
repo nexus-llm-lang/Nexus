@@ -11,36 +11,7 @@ use super::layout::CodegenLayout;
 use super::string::unpack_packed_i64_to_ptr_len;
 use super::{FunctionTemps, LocalInfo, OBJECT_HEAP_GLOBAL_INDEX};
 
-pub(super) fn constructor_tag(name: &str, arity: usize) -> i64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in name.as_bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash ^= arity as u64;
-    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    hash as i64
-}
-
-pub(super) fn record_tag(sorted_field_names: &[String]) -> i64 {
-    let shape = sorted_field_names.join(",");
-    hash_tag("rec", &shape, sorted_field_names.len())
-}
-
-fn hash_tag(kind: &str, name: &str, arity: usize) -> i64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in kind.as_bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    for &b in name.as_bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash ^= arity as u64;
-    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    hash as i64
-}
+pub(super) use crate::compiler::type_tag::{constructor_tag, record_tag};
 
 pub(super) fn memarg(offset: u64) -> MemArg {
     MemArg {

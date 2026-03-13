@@ -731,14 +731,8 @@ impl MirBuilder {
             }
         } else {
             let alias_prefix = {
-                let path_hash = {
-                    let mut h: u64 = 0xcbf29ce484222325;
-                    for b in import.path.bytes() {
-                        h ^= b as u64;
-                        h = h.wrapping_mul(0x100000001b3);
-                    }
-                    h % 10000
-                };
+                let path_hash =
+                    crate::compiler::type_tag::fnv1a_hash(&[import.path.as_bytes()]) % 10000;
                 format!("__import_{}_{}", self.import_stack.len(), path_hash)
             };
             for def in &program.definitions {
