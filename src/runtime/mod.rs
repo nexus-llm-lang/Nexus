@@ -28,10 +28,6 @@ pub struct ExecutionCapabilities {
     pub allow_env: bool,
     /// Host directories to preopen when filesystem access is enabled.
     pub preopen_dirs: Vec<PathBuf>,
-    /// Allowed network destination host patterns (exact or subdomain match).
-    pub net_allow_hosts: Vec<String>,
-    /// Blocked network destination host patterns (exact or subdomain match).
-    pub net_block_hosts: Vec<String>,
 }
 
 impl ExecutionCapabilities {
@@ -51,8 +47,6 @@ impl ExecutionCapabilities {
             allow_proc: true,
             allow_env: true,
             preopen_dirs: Vec::new(),
-            net_allow_hosts: Vec::new(),
-            net_block_hosts: Vec::new(),
         }
     }
 
@@ -73,14 +67,6 @@ impl ExecutionCapabilities {
     pub fn validate(&self) -> Result<(), String> {
         if !self.allow_fs && !self.preopen_dirs.is_empty() {
             return Err("`--preopen` requires `--allow-fs`".to_string());
-        }
-        Ok(())
-    }
-
-    /// Validates and enforces URL policy for outbound network calls.
-    pub fn ensure_url_allowed(&self, _url: &str) -> Result<(), String> {
-        if !self.allow_net {
-            return Err("Network access denied: --allow-net not specified".into());
         }
         Ok(())
     }
@@ -221,24 +207,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_deny_all_blocks_network() {
-        let caps = ExecutionCapabilities {
-            allow_net: false,
-            net_allow_hosts: vec!["example.com".to_string()],
-            net_block_hosts: vec!["blocked.local".to_string()],
-            ..ExecutionCapabilities::deny_all()
-        };
-        assert!(
-            caps.validate().is_ok(),
-            "validation should pass for deny-all configuration"
-        );
-        assert!(
-            caps.ensure_url_allowed("https://blocked.local").is_err(),
-            "ensure_url_allowed should reject when allow_net is false"
-        );
-    }
-
-    #[test]
     fn validate_program_requires_unit_is_ok() {
         let caps = ExecutionCapabilities::deny_all();
         assert!(caps.validate_program_requires(&Type::Unit).is_ok());
@@ -301,15 +269,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_allow_net_permits_network() {
-        let caps = ExecutionCapabilities {
-            allow_net: true,
-            ..ExecutionCapabilities::deny_all()
-        };
-        assert!(
-            caps.ensure_url_allowed("https://example.com").is_ok(),
-            "ensure_url_allowed should allow when allow_net is true"
-        );
-    }
 }
