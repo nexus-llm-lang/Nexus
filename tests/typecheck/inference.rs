@@ -751,3 +751,81 @@ end
         msg
     );
 }
+
+// ---- Implicit Unit return ----
+
+#[test]
+fn test_empty_fn_body_is_parse_error() {
+    should_fail_parse(
+        r#"
+    let main = fn () -> unit do end
+    "#,
+    );
+}
+
+#[test]
+fn test_no_return_non_unit_is_type_error() {
+    let msg = should_fail_typecheck(
+        r#"
+    let main = fn () -> i64 do
+        let x = 1
+    end
+    "#,
+    );
+    assert!(
+        msg.contains("no return statement"),
+        "expected 'no return statement' error, got: {}",
+        msg
+    );
+}
+
+#[test]
+fn test_no_return_unit_is_ok() {
+    should_typecheck(
+        r#"
+    let main = fn () -> unit do
+        let x = 1
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_implicit_unit_return_with_side_effect() {
+    should_typecheck(
+        r#"
+    let side_effect = fn () -> unit do
+        let x = 1 + 2
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_return_in_if_branch_counts_as_return() {
+    should_typecheck(
+        r#"
+    let f = fn (x: i64) -> i64 do
+        if x > 0 then
+            return x
+        else
+            return 0 - x
+        end
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_return_in_match_counts_as_return() {
+    should_typecheck(
+        r#"
+    let f = fn (x: bool) -> i64 do
+        match x do
+        case true -> return 1
+        case false -> return 0
+        end
+    end
+    "#,
+    );
+}

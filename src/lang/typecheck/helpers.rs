@@ -633,3 +633,34 @@ pub(super) fn is_allowed_main_require_signature(t: &Type) -> bool {
 fn is_known_runtime_perm(name: &str) -> bool {
     Permission::from_perm_name(name).is_some()
 }
+
+/// Check whether a statement list contains at least one `Return` statement,
+/// recursively inspecting if/match/try branches.
+pub(super) fn contains_return(body: &[Spanned<Stmt>]) -> bool {
+    body.iter().any(|s| match &s.node {
+        Stmt::Return(_) => true,
+        Stmt::Expr(e) => expr_contains_return(e),
+        Stmt::Try {
+            body,
+            catch_body,
+            ..
+        } => contains_return(body) || contains_return(catch_body),
+        Stmt::Inject { body, .. } => contains_return(body),
+        _ => false,
+    })
+}
+
+fn expr_contains_return(e: &Spanned<Expr>) -> bool {
+    match &e.node {
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            contains_return(then_branch)
+                || else_branch.as_ref().is_some_and(|b| contains_return(b))
+        }
+        Expr::Match { cases, .. } => cases.iter().any(|c| contains_return(&c.body)),
+        _ => false,
+    }
+}
