@@ -11,7 +11,7 @@ fn test_array_type_mismatch() {
     end
     "#,
     );
-    assert!(!err.is_empty());
+    insta::assert_snapshot!(err);
 }
 
 #[test]
@@ -25,7 +25,7 @@ fn test_array_indexing_non_array() {
     end
     "#,
     );
-    assert!(!err.is_empty());
+    insta::assert_snapshot!(err);
 }
 
 #[test]
@@ -40,7 +40,7 @@ fn test_array_assignment_mismatch() {
     end
     "#,
     );
-    assert!(!err.is_empty());
+    insta::assert_snapshot!(err);
 }
 
 #[test]
@@ -60,10 +60,7 @@ fn test_array_consume_nonlinear_consumer_is_rejected() {
     end
     "#,
     );
-    assert!(
-        !err.is_empty(),
-        "non-linear consumer should be rejected: consumer param must be %T"
-    );
+    insta::assert_snapshot!(err);
 }
 
 #[test]

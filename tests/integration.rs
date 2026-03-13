@@ -1,9 +1,11 @@
 mod harness;
 
 mod capabilities;
-mod execution;
+mod codegen;
+mod ir;
 mod nxc;
-mod pipeline;
+mod parse;
+mod runtime;
 mod stdlib;
 mod typecheck;
 mod unit;

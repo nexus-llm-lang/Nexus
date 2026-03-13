@@ -69,10 +69,7 @@ let main = fn () -> i64 do
 end
 "#,
     );
-    assert!(
-        !err.is_empty(),
-        "random.range without PermRandom should fail typechecking"
-    );
+    insta::assert_snapshot!(err);
 }
 
 #[test]

@@ -40,10 +40,7 @@ fn net_server_opaque_server_cannot_construct_externally() {
     end
     "#,
     );
-    assert!(
-        !err.is_empty(),
-        "constructing opaque Server externally should be rejected"
-    );
+    insta::assert_snapshot!(err);
 }
 
 #[test]
