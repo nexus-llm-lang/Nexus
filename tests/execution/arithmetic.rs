@@ -20,9 +20,8 @@ end
 
 #[test]
 fn codegen_i32_arithmetic_works() {
-    // NOTE: i32 arithmetic was only tested via the interpreter (not WASM codegen).
-    // The WASM backend does not currently support i32 functions. This test verifies
-    // the source at least parses and typechecks, then runs via WASM using i64.
+    // NOTE: The WASM backend does not currently support i32 functions. This test
+    // verifies the source at least parses and typechecks, then runs via WASM using i64.
     exec(
         r#"
 let inc = fn (x: i64) -> i64 do

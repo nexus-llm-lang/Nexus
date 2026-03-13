@@ -42,7 +42,7 @@ pub fn run_main(wasm: &[u8]) -> Result<(), String> {
                 module.clone(),
                 wasm,
                 vec![],
-                nexus::runtime::ExecutionCapabilities::permissive_legacy(),
+                nexus::runtime::ExecutionCapabilities::allow_all(),
             );
         }
         let mut linker = Linker::new(&engine);
@@ -124,7 +124,7 @@ pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
             Arc::new(module.clone()),
             wasm,
             deps,
-            nexus::runtime::ExecutionCapabilities::permissive_legacy(),
+            nexus::runtime::ExecutionCapabilities::allow_all(),
         );
     }
 
