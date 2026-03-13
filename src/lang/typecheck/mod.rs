@@ -11,13 +11,13 @@ pub use unify::apply_subst_type;
 
 use capture::{collect_lambda_captures, lambda_references_name};
 use helpers::{
-    check_unintroduced_type_vars, contains_exn_throws, contains_ref, default_numeric_literals,
-    describe_ctor_field, external_scheme, extract_row_port_names, get_default_alias,
-    is_allowed_main_require_signature, is_allowed_main_throws_signature, is_auto_droppable,
-    merge_type_rows, normalize_enum_generic_params, normalize_typedef_generic_params,
-    register_exception_variant, register_nullary_variant_constructor, register_stdlib_types,
-    select_float_type, select_int_type, strip_required_port_coeffect, summarize_ctor_args,
-    summarize_ctor_fields,
+    check_unintroduced_type_vars, contains_exn_throws, contains_ref, contains_return,
+    default_numeric_literals, describe_ctor_field, external_scheme, extract_row_port_names,
+    get_default_alias, is_allowed_main_require_signature, is_allowed_main_throws_signature,
+    is_auto_droppable, merge_type_rows, normalize_enum_generic_params,
+    normalize_typedef_generic_params, register_exception_variant,
+    register_nullary_variant_constructor, register_stdlib_types, select_float_type,
+    select_int_type, strip_required_port_coeffect, summarize_ctor_args, summarize_ctor_fields,
 };
 use lint::{
     collect_signature_needs_from_stmts, extract_named_row_members,
@@ -646,6 +646,13 @@ impl TypeChecker {
             &merged_requires,
             &func.throws,
         )?;
+        if !contains_return(&func.body) && !matches!(func.ret_type, Type::Unit) {
+            return Err(TypeError {
+                message: "Function body has no return statement; implicit return type is Unit"
+                    .into(),
+                span: span.clone(),
+            });
+        }
         env.check_unused_linear(span)?;
         Ok(())
     }
@@ -1921,6 +1928,14 @@ impl TypeChecker {
                 }
 
                 self.infer_body(body, &mut lambda_env, ret_type, requires, throws)?;
+                if !contains_return(body) && !matches!(ret_type, Type::Unit) {
+                    return Err(TypeError {
+                        message:
+                            "Function body has no return statement; implicit return type is Unit"
+                                .into(),
+                        span: e.span.clone(),
+                    });
+                }
                 let remaining_lambda_linear: HashSet<String> = lambda_env
                     .linear_vars
                     .difference(&before_linear)
