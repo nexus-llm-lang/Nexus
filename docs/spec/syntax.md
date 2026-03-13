@@ -21,12 +21,12 @@ Nexus uses keyword-terminated blocks and mandatory labeled arguments to make pro
 Functions are first-class values bound with `let`:
 
 ```nexus
-pub let add = fn (a: i64, b: i64) -> i64 do
+export let add = fn (a: i64, b: i64) -> i64 do
   return a + b
 end
 ```
 
-- `pub let` makes the function visible to other modules
+- `export let` makes the function visible to other modules
 - All arguments are **labeled** at call sites: `add(a: 1, b: 2)`
 - Generic type parameters: `fn <T>(x: T) -> T do ... end`
 
@@ -47,8 +47,8 @@ Both `require { ... }` and `throws { ... }` are optional; omitted means empty ro
 Foreign function declarations bind a Wasm export to a Nexus name:
 
 ```nexus
-pub external sin = "sin" : (x: float) -> float
-pub external length = "array_length" : <T>(arr: &[| T |]) -> i64
+export external sin = "sin" : (x: float) -> float
+export external length = "array_length" : <T>(arr: &[| T |]) -> i64
 ```
 
 Generic externals require explicit type parameters with `<T, U, ...>`.
@@ -56,9 +56,9 @@ Generic externals require explicit type parameters with `<T, U, ...>`.
 ### Type Definitions
 
 ```nexus
-pub type Point = { x: float, y: float }
-pub type Pair<A, B> = { fst: A, snd: B }
-pub type Result<T, E> = Ok(val: T) | Err(err: E)
+export type Point = { x: float, y: float }
+export type Pair<A, B> = { fst: A, snd: B }
+export type Result<T, E> = Ok(val: T) | Err(err: E)
 ```
 
 Defines either a record type (`{ ... }`) or a sum type (`A(...) | B(...)`).
@@ -66,8 +66,8 @@ Defines either a record type (`{ ... }`) or a sum type (`A(...) | B(...)`).
 ### Exception Declarations
 
 ```nexus
-pub exception NotFound(msg: string)
-pub exception PermissionDenied(msg: string, code: i64)
+export exception NotFound(msg: string)
+export exception PermissionDenied(msg: string, code: i64)
 ```
 
 Extends the builtin `Exn` type with new constructors.
@@ -327,7 +327,7 @@ import external path/to/lib.wasm                     // Wasm module
 ## Ports and Handlers
 
 ```nexus
-pub port Logger do
+export port Logger do
   fn info(msg: string) -> unit
   fn warn(msg: string) -> unit
 end
@@ -377,13 +377,13 @@ top_level ::= type_def
 
 (* ── Definitions ───────────────────────────────────────────── *)
 
-type_def      ::= [ "pub" ] [ "opaque" ] "type" UIDENT [ type_params ] "=" record_type
-                | [ "pub" ] [ "opaque" ] "type" UIDENT [ type_params ] "=" type_sum_def
+type_def      ::= [ "export" ] [ "opaque" ] "type" UIDENT [ type_params ] "=" record_type
+                | [ "export" ] [ "opaque" ] "type" UIDENT [ type_params ] "=" type_sum_def
 
 type_sum_def  ::= variant_def ( "|" variant_def )*
 variant_def   ::= UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
 variant_field ::= type | IDENT ":" type
-exception_def ::= [ "pub" ] "exception" UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
+exception_def ::= [ "export" ] "exception" UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
 
 import_def    ::= "import" "external" import_path
                 | "import" "{" IDENT ( "," IDENT )* "}" [ "," "*" "as" IDENT ] "from" import_path
@@ -391,11 +391,11 @@ import_def    ::= "import" "external" import_path
                 | "import" "from" import_path
 import_path   ::= ( ALPHA | DIGIT | "_" | "-" | "/" | "." )+
 
-port_def      ::= [ "pub" ] "port" UIDENT "do" fn_signature* "end"
+port_def      ::= [ "export" ] "port" UIDENT "do" fn_signature* "end"
 fn_signature  ::= "fn" IDENT param_list "->" type [ "require" throws_type ] [ "throws" throws_type ]
 
-let_def       ::= [ "pub" ] "let" IDENT [ ":" type ] "=" expr
-external_def  ::= [ "pub" ] "external" IDENT "=" STRING_LITERAL ":" [ type_params ] arrow_type
+let_def       ::= [ "export" ] "let" IDENT [ ":" type ] "=" expr
+external_def  ::= [ "export" ] "external" IDENT "=" STRING_LITERAL ":" [ type_params ] arrow_type
 
 (* ── Parameters ─────────────────────────────────────────────── *)
 

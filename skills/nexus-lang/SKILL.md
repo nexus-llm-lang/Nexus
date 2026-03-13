@@ -76,12 +76,12 @@ end
 
 ### 3. Functions are `let` bindings to lambdas
 ```nexus
-pub let add = fn (a: i64, b: i64) -> i64 do
+export let add = fn (a: i64, b: i64) -> i64 do
   return a + b
 end
 
 // With generics
-pub let map = fn <T, U>(opt: Option<T>, f: (val: T) -> U) -> Option<U> do
+export let map = fn <T, U>(opt: Option<T>, f: (val: T) -> U) -> Option<U> do
   match opt do
     case Some(val: v) ->
       let mapped = f(val: v)

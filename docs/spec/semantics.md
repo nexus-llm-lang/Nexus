@@ -150,7 +150,7 @@ Every Nexus program must define a `main` function with these constraints:
 - **Signature**: `() -> unit`
 - **Effects**: must be empty (all exceptions handled internally)
 - **Requirements**: may include any subset of `{ PermFs, PermNet, PermConsole, PermRandom, PermClock, PermProc, PermEnv }`
-- **Visibility**: must not be `pub`
+- **Visibility**: must not be `export`
 
 ```nexus
 let main = fn () -> unit require { PermConsole } do

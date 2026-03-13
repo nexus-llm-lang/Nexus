@@ -8,7 +8,7 @@ use std::fs;
 fn test_import_external_syntax() {
     let src = r#"
     import external math.wasm
-    pub external add = "add" : (a: i64, b: i64) -> i64
+    export external add = "add" : (a: i64, b: i64) -> i64
     let main = fn () -> unit do return () end
     "#;
     should_typecheck(src);

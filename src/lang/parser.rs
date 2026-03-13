@@ -17,7 +17,7 @@ const KEYWORDS: &[&str] = &[
     "type",
     "import",
     "from",
-    "pub",
+    "export",
     "require",
     "throws",
     "raise",
@@ -1543,7 +1543,7 @@ impl Parser {
 
     fn parse_top_level(&mut self) -> Result<TopLevel, ParseError> {
         match self.peek().clone() {
-            TokenKind::Pub => {
+            TokenKind::Export => {
                 self.advance();
                 self.parse_top_level_pub(true)
             }
@@ -1577,7 +1577,7 @@ impl Parser {
             TokenKind::External => self.parse_external_def(is_public),
             TokenKind::Let => self.parse_global_let(is_public),
             _ => Err(ParseError {
-                message: format!("expected definition after 'pub', got {:?}", self.peek()),
+                message: format!("expected definition after 'export', got {:?}", self.peek()),
                 span: self.peek_span(),
             }),
         }

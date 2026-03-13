@@ -55,7 +55,7 @@ end
 Exception declarations extend the builtin `Exn` type:
 
 ```nexus
-pub exception PermissionDenied(msg: string, code: i64)
+export exception PermissionDenied(msg: string, code: i64)
 ```
 
 `raise` is an expression that immediately unwinds to the nearest `catch`. All I/O capabilities use the coeffect system, not throws.
@@ -65,7 +65,7 @@ pub exception PermissionDenied(msg: string, code: i64)
 A `port` defines a coeffect interface -- a set of function signatures that must be provided by the environment:
 
 ```nexus
-pub port Logger do
+export port Logger do
   fn info(msg: string) -> unit
   fn warn(msg: string) -> unit
 end
@@ -76,7 +76,7 @@ When a function calls `Logger.info(...)`, it must have `Logger` in its `require`
 Port methods can themselves declare throws and coeffects:
 
 ```nexus
-pub port Fs do
+export port Fs do
   fn open_read(path: string) -> %Handle throws { Exn }
   fn read(handle: %Handle) -> { content: string, handle: %Handle }
   fn close(handle: %Handle) -> unit

@@ -20,18 +20,18 @@ Both `require` and `throws` are optional.
 A port declares an abstract interface that the environment must provide:
 
 ```nexus
-pub port Logger do
+export port Logger do
   fn info(msg: string) -> unit
   fn error(msg: string) -> unit
 end
 
-pub port UserRepository do
+export port UserRepository do
   fn find(id: i64) -> Option<User>
   fn save(user: User) -> Result<unit, string>
 end
 
 // Port methods can themselves require/throw
-pub port DataService do
+export port DataService do
   fn fetch(url: string) -> string throws { Exn }
 end
 ```

@@ -29,7 +29,7 @@ Numeric literals default to `i64` (integers) and `f64` (floats) unless constrain
 Structural record types. Defined with `type` or used inline:
 
 ```nexus
-pub type User = { id: i64, name: string }
+export type User = { id: i64, name: string }
 
 let u = { id: 1, name: "Alice" }
 ```
@@ -39,8 +39,8 @@ let u = { id: 1, name: "Alice" }
 Algebraic data types with labeled constructor arguments:
 
 ```nexus
-pub type Result<T, E> = Ok(val: T) | Err(err: E)
-pub type Option<T> = Some(val: T) | None
+export type Result<T, E> = Ok(val: T) | Err(err: E)
+export type Option<T> = Some(val: T) | None
 ```
 
 ### Lists
@@ -70,7 +70,7 @@ Arrays cannot contain mutable references.
 User-defined types can be parameterized:
 
 ```nexus
-pub type Pair<A, B> = Pair(left: A, right: B)
+export type Pair<A, B> = Pair(left: A, right: B)
 ```
 
 ## Linear Types (`%`)

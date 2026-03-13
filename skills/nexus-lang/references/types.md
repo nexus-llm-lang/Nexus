@@ -16,7 +16,7 @@
 
 ```nexus
 // Named record type
-pub type User = { id: i64, name: string, email: string }
+export type User = { id: i64, name: string, email: string }
 
 // Construction
 let u = { id: 1, name: "Alice", email: "a@b.com" }
@@ -31,9 +31,9 @@ let pair = { x: 10, y: 20 }
 ## Algebraic Data Types (Sum Types)
 
 ```nexus
-pub type Option<T> = Some(val: T) | None
-pub type Result<T, E> = Ok(val: T) | Err(err: E)
-pub type List<T> = Nil | Cons(v: T, rest: List<T>)
+export type Option<T> = Some(val: T) | None
+export type Result<T, E> = Ok(val: T) | Err(err: E)
+export type List<T> = Nil | Cons(v: T, rest: List<T>)
 
 // Constructors always use labeled fields (except nullary constructors)
 let x = Some(val: 42)
@@ -45,8 +45,8 @@ let xs = Cons(v: 1, rest: Nil)
 
 ```nexus
 // Constructors hidden from importers — only module can create/destructure
-pub opaque type Handle = Handle(id: i64)
-pub opaque type Set = Set(id: i64)
+export opaque type Handle = Handle(id: i64)
+export opaque type Set = Set(id: i64)
 ```
 
 ## List Type `[ T ]`
@@ -162,10 +162,10 @@ let val = ~counter           // dereference
 
 ```nexus
 // Generic type definition
-pub type Pair<A, B> = Pair(left: A, right: B)
+export type Pair<A, B> = Pair(left: A, right: B)
 
 // Generic function
-pub let map = fn <T, U>(opt: Option<T>, f: (val: T) -> U) -> Option<U> do
+export let map = fn <T, U>(opt: Option<T>, f: (val: T) -> U) -> Option<U> do
   match opt do
     case Some(val: v) ->
       let mapped = f(val: v)
@@ -182,8 +182,8 @@ end
 
 ```nexus
 // Declare custom exceptions
-pub exception NotFound(msg: string)
-pub exception Timeout(ms: i64)
+export exception NotFound(msg: string)
+export exception Timeout(ms: i64)
 
 // Built-in root type: Exn
 // All exceptions extend Exn and can be caught as Exn
