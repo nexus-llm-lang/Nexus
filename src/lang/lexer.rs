@@ -632,17 +632,6 @@ impl Lexer {
                     } else if self.peek() == Some('.') {
                         self.advance();
                         TokenKind::MinusDot
-                    } else if self.peek().map_or(false, |c| c.is_ascii_digit()) {
-                        // Negative number
-                        let first_digit = self.advance().unwrap();
-                        let tok = self.lex_number(first_digit);
-                        // Negate the value
-                        match tok {
-                            TokenKind::Int(n) => TokenKind::Int(-n),
-                            TokenKind::Float(n) => TokenKind::Float(-n),
-                            TokenKind::Error => TokenKind::Error,
-                            _ => unreachable!(),
-                        }
                     } else {
                         TokenKind::Minus
                     }
@@ -867,7 +856,8 @@ mod tests {
     #[test]
     fn test_negative_number() {
         let tokens = tokenize("-42").unwrap();
-        assert!(matches!(tokens[0].kind, TokenKind::Int(-42)));
+        assert!(matches!(tokens[0].kind, TokenKind::Minus));
+        assert!(matches!(tokens[1].kind, TokenKind::Int(42)));
     }
 
     #[test]

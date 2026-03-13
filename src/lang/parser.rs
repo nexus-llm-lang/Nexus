@@ -485,6 +485,29 @@ impl Parser {
                 self.advance();
                 Ok(Literal::Float(n))
             }
+            TokenKind::Minus => {
+                // Negative number literal: - followed by Int or Float
+                match self.peek_at_offset(1) {
+                    Some(TokenKind::Int(_) | TokenKind::Float(_)) => {
+                        self.advance(); // consume minus
+                        match self.peek().clone() {
+                            TokenKind::Int(n) => {
+                                self.advance();
+                                Ok(Literal::Int(-n))
+                            }
+                            TokenKind::Float(n) => {
+                                self.advance();
+                                Ok(Literal::Float(-n))
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => Err(ParseError {
+                        message: format!("expected literal, got {:?}", self.peek()),
+                        span: self.peek_span(),
+                    }),
+                }
+            }
             TokenKind::True => {
                 self.advance();
                 Ok(Literal::Bool(true))
@@ -1047,37 +1070,12 @@ impl Parser {
 
             // Negative number as atom (when preceded by minus as prefix, not binary)
             TokenKind::Minus => {
-                // Check if next is a number literal
-                if matches!(
-                    self.peek_at_offset(1),
-                    Some(TokenKind::Int(_) | TokenKind::Float(_))
-                ) {
-                    self.advance(); // consume minus
-                    match self.peek().clone() {
-                        TokenKind::Int(n) => {
-                            self.advance();
-                            let end = self.tokens[self.pos - 1].span.end;
-                            Ok(Spanned {
-                                node: Expr::Literal(Literal::Int(-n)),
-                                span: start..end,
-                            })
-                        }
-                        TokenKind::Float(n) => {
-                            self.advance();
-                            let end = self.tokens[self.pos - 1].span.end;
-                            Ok(Spanned {
-                                node: Expr::Literal(Literal::Float(-n)),
-                                span: start..end,
-                            })
-                        }
-                        _ => unreachable!(),
-                    }
-                } else {
-                    Err(ParseError {
-                        message: format!("unexpected token {:?}", self.peek()),
-                        span: self.peek_span(),
-                    })
-                }
+                let lit = self.parse_literal()?;
+                let end = self.tokens[self.pos - 1].span.end;
+                Ok(Spanned {
+                    node: Expr::Literal(lit),
+                    span: start..end,
+                })
             }
 
             _ => Err(ParseError {
