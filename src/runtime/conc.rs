@@ -10,6 +10,7 @@
 //! Task threads get WASI P1 environments governed by the parent's ExecutionCapabilities,
 //! with all dependency modules loaded.
 
+use crate::constants::NEXUS_HOST_HTTP_MODULE;
 use crate::runtime::ExecutionCapabilities;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -22,7 +23,6 @@ pub const CONC_SPAWN_FUNC: &str = "__nx_conc_spawn";
 pub const CONC_JOIN_FUNC: &str = "__nx_conc_join";
 pub const CONC_EXPORT_PREFIX: &str = "__conc_";
 
-const NEXUS_HOST_MODULE: &str = "nexus:cli/nexus-host";
 
 struct PendingTask {
     export_name: String,
@@ -97,22 +97,22 @@ pub fn needs_conc_runtime(wasm_bytes: &[u8]) -> bool {
 /// Required when the stdlib bundle imports nexus-host but the task doesn't use net.
 pub fn add_nexus_host_stubs<T: 'static>(linker: &mut Linker<T>) {
     let _ = linker.func_wrap(
-        NEXUS_HOST_MODULE,
+        NEXUS_HOST_HTTP_MODULE,
         "host-http-request",
         |_: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32| {},
     );
     let _ = linker.func_wrap(
-        NEXUS_HOST_MODULE,
+        NEXUS_HOST_HTTP_MODULE,
         "host-http-listen",
         |_: i32, _: i32| -> i64 { -1 },
     );
-    let _ = linker.func_wrap(NEXUS_HOST_MODULE, "host-http-accept", |_: i64, _: i32| {});
+    let _ = linker.func_wrap(NEXUS_HOST_HTTP_MODULE, "host-http-accept", |_: i64, _: i32| {});
     let _ = linker.func_wrap(
-        NEXUS_HOST_MODULE,
+        NEXUS_HOST_HTTP_MODULE,
         "host-http-respond",
         |_: i64, _: i64, _: i32, _: i32, _: i32, _: i32| -> i32 { 0 },
     );
-    let _ = linker.func_wrap(NEXUS_HOST_MODULE, "host-http-stop", |_: i64| -> i32 { 0 });
+    let _ = linker.func_wrap(NEXUS_HOST_HTTP_MODULE, "host-http-stop", |_: i64| -> i32 { 0 });
 }
 
 /// Add conc host functions (`__nx_conc_spawn`, `__nx_conc_join`) to a linker.
