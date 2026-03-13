@@ -45,8 +45,7 @@ fn test_net_effect_enforcement() {
 
 #[test]
 fn test_net_request_method_and_headers_runtime() {
-    // TODO: This test uses list types ([Header]) and the interpreter's built-in HTTP client.
-    // Neither list types nor HTTP requests are supported in WASM codegen.
+    // TODO: List types ([Header]) and HTTP requests are not yet supported in WASM codegen.
     // Converted to a typecheck-only test to verify the source is well-typed.
     should_typecheck(
         r#"
@@ -174,5 +173,4 @@ end
 // NOTE: The proptest conc tests (prop_conc_independent_array_updates,
 // prop_conc_task_capture_linearity) used mutable arrays (`[| ... |]`) with
 // `&%arr` borrows and array indexing, which are not supported by the WASM
-// codegen (`__array_get` not found). These tests remain in the old test suite
-// (tests/suite/core/concurrency.rs) running via the interpreter.
+// codegen (`__array_get` not found).

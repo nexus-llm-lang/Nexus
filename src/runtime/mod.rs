@@ -9,7 +9,7 @@ pub mod net_host;
 pub mod string_heap;
 pub mod wasm_exec;
 
-/// Runtime capability policy used by interpreter and wasm execution paths.
+/// Runtime capability policy used by wasm execution paths.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExecutionCapabilities {
     /// Allows outbound network access for WASI and host HTTP bridge.
@@ -40,8 +40,8 @@ impl ExecutionCapabilities {
         Self::default()
     }
 
-    /// Returns a permissive capability set used by legacy in-process interpreter APIs.
-    pub fn permissive_legacy() -> Self {
+    /// Returns a capability set with all permissions enabled.
+    pub fn allow_all() -> Self {
         Self {
             allow_net: true,
             allow_fs: true,

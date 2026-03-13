@@ -39,7 +39,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Parse, typecheck, and execute Nexus source (`.nx`) using interpreter.
+    /// Parse, typecheck, compile, and execute Nexus source (`.nx`).
     /// If no file is passed and stdin is piped, reads script from stdin.
     Run {
         /// Nexus source file path. Use '-' to read from stdin.
