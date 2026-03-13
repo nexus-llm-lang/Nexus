@@ -312,11 +312,15 @@ fn run_core_wasm_bytes_inner(
             return ExitCode::from(1);
         }
     };
-    match main.call(&mut store, ()) {
+    let result = match main.call(&mut store, ()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Runtime Error: {}", e);
             ExitCode::from(1)
         }
+    };
+    if has_conc {
+        conc::reset_conc_runtime();
     }
+    result
 }
