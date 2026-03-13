@@ -698,3 +698,56 @@ end
         msg
     );
 }
+
+// ---- Destructuring let ----
+
+#[test]
+fn test_let_destructure_record() {
+    should_typecheck(
+        r#"
+    type Point = { x: i64, y: i64 }
+
+    let main = fn () -> unit do
+        let p: Point = { x: 10, y: 20 }
+        let {x: a, y: b} = p
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_let_destructure_nested_record() {
+    should_typecheck(
+        r#"
+    type Inner = { a: i64 }
+    type Outer = { inner: Inner, b: bool }
+
+    let main = fn () -> unit do
+        let o: Outer = { inner: { a: 1 }, b: true }
+        let {inner: {a: x}, b: y} = o
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_let_destructure_non_exhaustive_fails() {
+    let msg = should_fail_typecheck(
+        r#"
+type Option<T> = Some(value: T) | None
+
+let main = fn () -> unit do
+    let x: Option<i64> = Some(value: 42)
+    let Some(value: v) = x
+    return ()
+end
+"#,
+    );
+    assert!(
+        msg.contains("Non-exhaustive"),
+        "expected non-exhaustive error, got: {}",
+        msg
+    );
+}

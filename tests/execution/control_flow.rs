@@ -565,9 +565,9 @@ let classify = fn (x: Outer, flag: bool) -> [string] do
     let result = match x do
       case OuterA(inner: w) ->
         match w do case Wrapper(name: n) ->
-          if flag then Cons(v: n, rest: Nil()) else Nil() end
+          if flag then Cons(v: n, rest: Nil) else Nil end
         end
-      case OuterB -> Nil()
+      case OuterB -> Nil
     end
     return result
 end
@@ -575,13 +575,13 @@ end
 let main = fn () -> unit do
     let r1 = classify(x: OuterA(inner: Wrapper(name: "hello")), flag: true)
     match r1 do
-      case Cons(v: s, rest: Nil()) ->
+      case Cons(v: s, rest: Nil) ->
         if s != "hello" then raise RuntimeError(val: "expected hello") end
       case _ -> raise RuntimeError(val: "expected Cons")
     end
     let r2 = classify(x: OuterA(inner: Wrapper(name: "hello")), flag: false)
     match r2 do
-      case Nil() -> return ()
+      case Nil -> return ()
       case _ -> raise RuntimeError(val: "expected Nil")
     end
     return ()

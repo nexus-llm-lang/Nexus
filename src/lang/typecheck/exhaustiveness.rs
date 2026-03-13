@@ -105,6 +105,24 @@ impl TypeChecker {
                 }) {
                     return self.check_wildcard_matrix(env, matrix, rt);
                 }
+                // Resolve type aliases (record types) to their structural type
+                if let Some(td) = env.get_type(name).cloned() {
+                    if env.get_enum(name).is_none() {
+                        let mut subst = HashMap::new();
+                        for (p, a) in td.type_params.iter().zip(args) {
+                            subst.insert(p.clone(), a.clone());
+                        }
+                        let fields: Vec<(String, Type)> = td
+                            .fields
+                            .iter()
+                            .map(|(n, t)| (n.clone(), apply_subst_type(&subst, t)))
+                            .collect();
+                        let resolved = Type::Record(fields);
+                        let mut new_types = vec![&resolved];
+                        new_types.extend_from_slice(rt);
+                        return self.check_matrix(env, matrix, &new_types);
+                    }
+                }
                 if let Some(ed) = env.get_enum(name).cloned() {
                     let mut subst = HashMap::new();
                     for (p, a) in ed.type_params.iter().zip(args) {

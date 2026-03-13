@@ -14,8 +14,6 @@ pub enum CodegenError {
         lhs: String,
         rhs: String,
     },
-    /// E2004: unsupported wasm type
-    UnsupportedWasmType { typ: String },
     /// E2005: unit cannot be represented as wasm valtype
     UnitWasmType,
     /// E2006: unsupported numeric coercion
@@ -32,8 +30,6 @@ pub enum CodegenError {
     ConflictingLocalTypes { name: String },
     /// E2011: object heap not enabled
     ObjectHeapRequired { context: &'static str },
-    /// E2012: cannot pack value type into object field
-    UnsupportedPack { typ: String },
     /// E2013: cannot unpack object field into type
     UnsupportedUnpack { typ: String },
     /// E2014: external param type not supported
@@ -54,14 +50,12 @@ impl CodegenError {
             CodegenError::MissingMain => "E2001",
             CodegenError::UnsupportedBinaryOp { .. } => "E2002",
             CodegenError::UnsupportedBinaryOpPair { .. } => "E2003",
-            CodegenError::UnsupportedWasmType { .. } => "E2004",
             CodegenError::UnitWasmType => "E2005",
             CodegenError::UnsupportedCoercion { .. } => "E2006",
             CodegenError::CallTargetNotFound { .. } => "E2007",
             CodegenError::CallArityMismatch { .. } => "E2008",
             CodegenError::ConflictingLocalTypes { .. } => "E2010",
             CodegenError::ObjectHeapRequired { .. } => "E2011",
-            CodegenError::UnsupportedPack { .. } => "E2012",
             CodegenError::UnsupportedUnpack { .. } => "E2013",
             CodegenError::UnsupportedExternalParamType { .. } => "E2014",
             CodegenError::UnsupportedExternalReturnType { .. } => "E2015",
@@ -85,9 +79,6 @@ impl std::fmt::Display for CodegenError {
                     "unsupported binary operator '{}' for operand types ({}, {})",
                     op, lhs, rhs
                 )
-            }
-            CodegenError::UnsupportedWasmType { typ } => {
-                format!("type '{}' is not supported by current wasm codegen", typ)
             }
             CodegenError::UnitWasmType => {
                 "unit cannot be represented as a local/param wasm valtype".to_string()
@@ -116,9 +107,6 @@ impl std::fmt::Display for CodegenError {
             }
             CodegenError::ObjectHeapRequired { context } => {
                 format!("{} requested without object heap", context)
-            }
-            CodegenError::UnsupportedPack { typ } => {
-                format!("cannot pack value of type '{}' into object field", typ)
             }
             CodegenError::UnsupportedUnpack { typ } => {
                 format!("cannot unpack object field into type '{}'", typ)

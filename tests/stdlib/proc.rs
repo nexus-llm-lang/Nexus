@@ -45,7 +45,7 @@ let mock_proc = handler Proc do
     return ()
   end
   fn argv() -> [ string ] do
-    return Nil()
+    return Nil
   end
   fn exec(cmd: string, args: [ string ]) -> ExecResult do
     return ExecResult(exit_code: 0, stdout: "", stderr: "")

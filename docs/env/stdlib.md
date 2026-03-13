@@ -207,7 +207,7 @@ port Env do
 end
 ```
 
-`Env.get` returns `None()` when the variable is not set, avoiding exceptions for simple absence.
+`Env.get` returns `None` when the variable is not set, avoiding exceptions for simple absence.
 
 ## Data Structures
 

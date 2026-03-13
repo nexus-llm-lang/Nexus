@@ -108,6 +108,12 @@ pub enum Stmt {
         handlers: Vec<String>,
         body: Vec<Spanned<Stmt>>,
     },
+    // Destructuring let: `let {x, y} = expr` or `let Some(v) = expr`
+    // Desugared to a single-case match during HIR lowering.
+    LetPattern {
+        pattern: Spanned<Pattern>,
+        value: Spanned<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

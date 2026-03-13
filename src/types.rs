@@ -13,6 +13,24 @@ pub struct Spanned<T> {
     pub span: Span,
 }
 
+/// WASM-level value representation for a Nexus type.
+///
+/// Single source of truth for "what WASM value type does this Nexus type use at runtime?"
+/// Adding a new `Type` variant requires updating only `Type::wasm_repr()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmRepr {
+    /// i32: Bool, Char, I32
+    I32,
+    /// i64: I64, String, and all heap-allocated types (Array, List, Record, etc.)
+    I64,
+    /// f32: F32
+    F32,
+    /// f64: F64
+    F64,
+    /// No runtime value: Unit, Row
+    Unit,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     I32,
@@ -22,6 +40,7 @@ pub enum Type {
     IntLit,
     FloatLit,
     Bool,
+    Char,
     String,
     Unit,
     UserDefined(String, Vec<Type>),
@@ -37,6 +56,34 @@ pub enum Type {
     Handler(String, Box<Type>),        // handler Port require { ... }
 }
 
+impl Type {
+    /// Classify this type into its WASM-level value representation.
+    ///
+    /// This is the single dispatcher for "is this type primitive or heap?"
+    /// All codegen paths that need this classification should use this method.
+    pub fn wasm_repr(&self) -> WasmRepr {
+        match self {
+            Type::Linear(inner) => inner.wasm_repr(),
+            Type::I32 | Type::Bool | Type::Char => WasmRepr::I32,
+            Type::I64
+            | Type::IntLit
+            | Type::String
+            | Type::Array(_)
+            | Type::List(_)
+            | Type::Record(_)
+            | Type::UserDefined(_, _)
+            | Type::Var(_)
+            | Type::Borrow(_)
+            | Type::Ref(_)
+            | Type::Handler(_, _)
+            | Type::Arrow(_, _, _, _) => WasmRepr::I64,
+            Type::F32 => WasmRepr::F32,
+            Type::F64 | Type::FloatLit => WasmRepr::F64,
+            Type::Unit | Type::Row(_, _) => WasmRepr::Unit,
+        }
+    }
+}
+
 impl std::fmt::Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -47,6 +94,7 @@ impl std::fmt::Display for Type {
             Type::IntLit => write!(f, "i64"),
             Type::FloatLit => write!(f, "f64"),
             Type::Bool => write!(f, "bool"),
+            Type::Char => write!(f, "char"),
             Type::String => write!(f, "string"),
             Type::Unit => write!(f, "unit"),
             Type::UserDefined(name, args) => {
@@ -156,6 +204,7 @@ pub enum Literal {
     Int(i64),
     Float(f64),
     Bool(bool),
+    Char(char),
     String(String), // Includes RawString
     Unit,
 }

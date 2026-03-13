@@ -39,7 +39,7 @@ fn option_or_else_prefers_some() {
 import { Option, or_else, unwrap_or } from stdlib/option.nx
 
 let main = fn () -> unit do
-  let a: Option<i64> = None()
+  let a: Option<i64> = None
   let b = Some(val: 42)
   let result = unwrap_or(opt: or_else(opt: a, other: b), default: 0)
   if result != 42 then raise RuntimeError(val: "expected 42") end
@@ -56,7 +56,7 @@ fn option_none_is_none() {
 import { Option, is_none } from stdlib/option.nx
 
 let main = fn () -> unit do
-  let opt: Option<i64> = None()
+  let opt: Option<i64> = None
   let result = is_none(opt: opt)
   if result != true then raise RuntimeError(val: "expected is_none true") end
   return ()
@@ -72,7 +72,7 @@ fn option_unwrap_or_none() {
 import { Option, unwrap_or } from stdlib/option.nx
 
 let main = fn () -> unit do
-  let opt: Option<i64> = None()
+  let opt: Option<i64> = None
   let result = unwrap_or(opt: opt, default: 99)
   if result != 99 then raise RuntimeError(val: "expected 99") end
   return ()

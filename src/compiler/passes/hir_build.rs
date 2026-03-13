@@ -781,7 +781,21 @@ impl MirBuilder {
         scope: &HandlerScope,
     ) -> Result<Vec<MirStmt>, HirBuildError> {
         let mut result = Vec::new();
-        for s in stmts {
+        for (i, s) in stmts.iter().enumerate() {
+            if let Stmt::LetPattern { pattern, value } = &s.node {
+                // Desugar: remaining statements become the body of a single-case match
+                let remaining = self.convert_stmts(&stmts[i + 1..], rename_map, scope)?;
+                let case = MirMatchCase {
+                    pattern: self.convert_pattern(&pattern.node),
+                    body: remaining,
+                };
+                let match_expr = MirExpr::Match {
+                    target: Box::new(self.convert_expr(value, rename_map, scope)?),
+                    cases: vec![case],
+                };
+                result.push(MirStmt::Expr(match_expr));
+                break;
+            }
             result.extend(self.convert_stmt(&s.node, rename_map, scope)?);
         }
         Ok(result)
@@ -896,6 +910,8 @@ impl MirBuilder {
                 // Inline: return body stmts directly (no Inject wrapper)
                 self.convert_stmts(body, rename_map, &new_scope)
             }
+            // LetPattern is handled in convert_stmts before calling convert_stmt
+            Stmt::LetPattern { .. } => unreachable!("LetPattern should be handled in convert_stmts"),
         }
     }
 

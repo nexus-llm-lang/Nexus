@@ -37,8 +37,8 @@ pub type List<T> = Nil | Cons(v: T, rest: List<T>)
 
 // Constructors always use labeled fields (except nullary constructors)
 let x = Some(val: 42)
-let empty = None()       // () required even for nullary
-let xs = Cons(v: 1, rest: Nil())
+let empty = None
+let xs = Cons(v: 1, rest: Nil)
 ```
 
 ## Opaque Types
@@ -53,17 +53,17 @@ pub opaque type Set = Set(id: i64)
 
 ```nexus
 // Immutable singly-linked list
-let xs: [ i64 ] = [1, 2, 3]    // sugar for Cons(v:1, rest:Cons(v:2, rest:Cons(v:3, rest:Nil())))
+let xs: [ i64 ] = [1, 2, 3]    // sugar for Cons(v:1, rest:Cons(v:2, rest:Cons(v:3, rest:Nil)))
 
 // Pattern matching
 match xs do
-  case Nil() -> return 0
+  case Nil -> return 0
   case Cons(v: head, rest: tail) -> return head + sum(xs: tail)
 end
 ```
 
 - Cannot contain mutable references
-- `[ T ]` is the type, `Nil()` / `Cons(v:, rest:)` are constructors
+- `[ T ]` is the type, `Nil` / `Cons(v:, rest:)` are constructors
 
 ## Array Type `[| T |]` (Linear)
 
@@ -170,7 +170,7 @@ pub let map = fn <T, U>(opt: Option<T>, f: (val: T) -> U) -> Option<U> do
     case Some(val: v) ->
       let mapped = f(val: v)
       return Some(val: mapped)
-    case None() -> return None()
+    case None -> return None
   end
 end
 

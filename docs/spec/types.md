@@ -40,10 +40,8 @@ Algebraic data types with labeled constructor arguments:
 
 ```nexus
 pub type Result<T, E> = Ok(val: T) | Err(err: E)
-pub type Option<T> = Some(val: T) | None()
+pub type Option<T> = Some(val: T) | None
 ```
-
-Constructors with no fields still require `()` in patterns and expressions (e.g., `None()`).
 
 ### Lists
 

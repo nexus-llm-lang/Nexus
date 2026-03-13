@@ -6,6 +6,7 @@ pub enum TokenKind {
     Int(i64),
     Float(f64),
     StringLit(String),
+    CharLit(char),
     True,
     False,
 
@@ -99,6 +100,10 @@ pub enum TokenKind {
 
     // Special
     Ident(String),
+
+    /// Placeholder emitted after a lex error (e.g. invalid literal).
+    /// Never reaches the parser — `tokenize()` returns `Err` when any errors exist.
+    Error,
 
     Eof,
 }
@@ -218,6 +223,115 @@ impl Lexer {
         }
     }
 
+    /// Resolve an escape sequence after consuming the backslash.
+    /// Handles: \0 \a \b \t \n \v \f \r \e \\ \' \" \xNN \u{NNNN}
+    /// Returns None on error (error already pushed).
+    fn resolve_escape(&mut self, start: usize) -> Option<char> {
+        match self.advance() {
+            Some('0') => Some('\0'),
+            Some('a') => Some('\x07'),
+            Some('b') => Some('\x08'),
+            Some('t') => Some('\t'),
+            Some('n') => Some('\n'),
+            Some('v') => Some('\x0b'),
+            Some('f') => Some('\x0c'),
+            Some('r') => Some('\r'),
+            Some('e') => Some('\x1b'),
+            Some('\\') => Some('\\'),
+            Some('\'') => Some('\''),
+            Some('"') => Some('"'),
+            Some('x') => {
+                let mut hex = String::with_capacity(2);
+                for _ in 0..2 {
+                    match self.peek() {
+                        Some(c) if c.is_ascii_hexdigit() => {
+                            hex.push(c);
+                            self.advance();
+                        }
+                        _ => {
+                            self.errors.push(LexError {
+                                message: format!(
+                                    "\\x requires exactly 2 hex digits, got '{}'",
+                                    hex
+                                ),
+                                span: start..self.pos,
+                            });
+                            return None;
+                        }
+                    }
+                }
+                let val = u8::from_str_radix(&hex, 16).unwrap();
+                Some(val as char)
+            }
+            Some('u') => {
+                if self.peek() != Some('{') {
+                    self.errors.push(LexError {
+                        message: "expected '{' after \\u".to_string(),
+                        span: start..self.pos,
+                    });
+                    return None;
+                }
+                self.advance();
+                let mut hex = String::new();
+                loop {
+                    match self.peek() {
+                        Some('}') => {
+                            self.advance();
+                            break;
+                        }
+                        Some(c) if c.is_ascii_hexdigit() => {
+                            hex.push(c);
+                            self.advance();
+                        }
+                        _ => {
+                            self.errors.push(LexError {
+                                message: format!(
+                                    "invalid hex in \\u{{...}} escape: '{}'",
+                                    hex
+                                ),
+                                span: start..self.pos,
+                            });
+                            return None;
+                        }
+                    }
+                }
+                match u32::from_str_radix(&hex, 16) {
+                    Ok(cp) => match char::from_u32(cp) {
+                        Some(c) => Some(c),
+                        None => {
+                            self.errors.push(LexError {
+                                message: format!("invalid Unicode codepoint U+{:X}", cp),
+                                span: start..self.pos,
+                            });
+                            None
+                        }
+                    },
+                    Err(_) => {
+                        self.errors.push(LexError {
+                            message: format!("invalid hex in \\u{{...}} escape: '{}'", hex),
+                            span: start..self.pos,
+                        });
+                        None
+                    }
+                }
+            }
+            Some(c) => {
+                self.errors.push(LexError {
+                    message: format!("unknown escape sequence '\\{}'", c),
+                    span: start..self.pos,
+                });
+                None
+            }
+            None => {
+                self.errors.push(LexError {
+                    message: "unterminated escape sequence".to_string(),
+                    span: start..self.pos,
+                });
+                None
+            }
+        }
+    }
+
     fn lex_bracket_string(&mut self) -> Option<TokenKind> {
         // We've already consumed the first '[', check for '=' or '['
         let start = self.pos - 1; // include the already-consumed '['
@@ -269,30 +383,20 @@ impl Lexer {
                         message: "unterminated bracket string".to_string(),
                         span: start..self.pos,
                     });
-                    return Some(TokenKind::StringLit(content));
+                    return Some(TokenKind::Error);
                 }
                 Some('\n') | Some('\r') => {
                     self.errors.push(LexError {
                         message: "unclosed string literal".to_string(),
                         span: start..self.pos,
                     });
-                    return Some(TokenKind::StringLit(content));
+                    return Some(TokenKind::Error);
                 }
-                Some('\\') if !is_raw => match self.advance() {
-                    Some('n') => content.push('\n'),
-                    Some('r') => content.push('\r'),
-                    Some('t') => content.push('\t'),
-                    Some('e') => content.push('\x1b'),
-                    Some('0') => content.push('\0'),
-                    Some('\\') => content.push('\\'),
-                    Some(c) => content.push(c),
-                    None => {
-                        self.errors.push(LexError {
-                            message: "unterminated escape in string".to_string(),
-                            span: start..self.pos,
-                        });
+                Some('\\') if !is_raw => {
+                    if let Some(c) = self.resolve_escape(start) {
+                        content.push(c);
                     }
-                },
+                }
                 Some(c) => content.push(c),
             }
         }
@@ -308,35 +412,59 @@ impl Lexer {
                         message: "unterminated string literal".to_string(),
                         span: start..self.pos,
                     });
-                    return TokenKind::StringLit(content);
+                    return TokenKind::Error;
                 }
                 Some('\n') | Some('\r') => {
                     self.errors.push(LexError {
                         message: "unclosed string literal".to_string(),
                         span: start..self.pos,
                     });
-                    return TokenKind::StringLit(content);
+                    return TokenKind::Error;
                 }
                 Some('"') => {
                     return TokenKind::StringLit(content);
                 }
-                Some('\\') => match self.advance() {
-                    Some('"') => content.push('"'),
-                    Some('\\') => content.push('\\'),
-                    Some('n') => content.push('\n'),
-                    Some('r') => content.push('\r'),
-                    Some('t') => content.push('\t'),
-                    Some('e') => content.push('\x1b'),
-                    Some('0') => content.push('\0'),
-                    Some(c) => content.push(c),
-                    None => {
-                        self.errors.push(LexError {
-                            message: "unterminated escape in string".to_string(),
-                            span: start..self.pos,
-                        });
+                Some('\\') => {
+                    if let Some(c) = self.resolve_escape(start) {
+                        content.push(c);
                     }
-                },
+                }
                 Some(c) => content.push(c),
+            }
+        }
+    }
+
+    fn lex_char_literal(&mut self) -> TokenKind {
+        let start = self.pos - 1; // include the already-consumed '\''
+        let ch = match self.advance() {
+            None => {
+                self.errors.push(LexError {
+                    message: "unterminated char literal".to_string(),
+                    span: start..self.pos,
+                });
+                return TokenKind::Error;
+            }
+            Some('\\') => match self.resolve_escape(start) {
+                Some(c) => c,
+                None => return TokenKind::Error,
+            },
+            Some('\'') => {
+                self.errors.push(LexError {
+                    message: "empty char literal".to_string(),
+                    span: start..self.pos,
+                });
+                return TokenKind::Error;
+            }
+            Some(c) => c,
+        };
+        match self.advance() {
+            Some('\'') => TokenKind::CharLit(ch),
+            _ => {
+                self.errors.push(LexError {
+                    message: "expected closing ' for char literal".to_string(),
+                    span: start..self.pos,
+                });
+                TokenKind::Error
             }
         }
     }
@@ -372,7 +500,7 @@ impl Lexer {
                         message: format!("invalid float literal '{}'", s),
                         span: start..self.pos,
                     });
-                    TokenKind::Float(0.0)
+                    TokenKind::Error
                 }
             }
         } else {
@@ -383,7 +511,7 @@ impl Lexer {
                         message: format!("integer literal '{}' overflows i64", s),
                         span: start..self.pos,
                     });
-                    TokenKind::Int(0)
+                    TokenKind::Error
                 }
             }
         }
@@ -512,6 +640,7 @@ impl Lexer {
                         match tok {
                             TokenKind::Int(n) => TokenKind::Int(-n),
                             TokenKind::Float(n) => TokenKind::Float(-n),
+                            TokenKind::Error => TokenKind::Error,
                             _ => unreachable!(),
                         }
                     } else {
@@ -622,6 +751,9 @@ impl Lexer {
                     self.lex_ident_or_keyword('_')
                 }
 
+                // Char literals
+                '\'' => self.lex_char_literal(),
+
                 // Double-quoted strings
                 '"' => self.lex_double_quoted_string(),
 
@@ -640,6 +772,9 @@ impl Lexer {
                 }
             };
 
+            if matches!(kind, TokenKind::Error) {
+                continue;
+            }
             self.tokens.push(Token {
                 kind,
                 span: start..self.pos,
@@ -748,6 +883,31 @@ mod tests {
     }
 
     #[test]
+    fn test_string_all_standard_escapes() {
+        let tokens = tokenize(r#""\0\a\b\t\n\v\f\r\e\\\"""#).unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::StringLit(ref s)
+            if s == "\0\x07\x08\t\n\x0b\x0c\r\x1b\\\""));
+    }
+
+    #[test]
+    fn test_string_hex_escape() {
+        let tokens = tokenize(r#""\x41\x7a""#).unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::StringLit(ref s) if s == "Az"));
+    }
+
+    #[test]
+    fn test_string_unicode_escape() {
+        let tokens = tokenize(r#""\u{1F600}""#).unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::StringLit(ref s) if s == "\u{1F600}"));
+    }
+
+    #[test]
+    fn test_string_unknown_escape_is_error() {
+        let err = tokenize(r#""\q""#).unwrap_err();
+        assert!(err[0].message.contains("unknown escape"));
+    }
+
+    #[test]
     fn test_double_quoted_string_unterminated() {
         let err = tokenize(r#""hello"#).unwrap_err();
         assert!(err[0].message.contains("unterminated string literal"));
@@ -757,5 +917,60 @@ mod tests {
     fn test_double_quoted_string_newline_rejected() {
         let err = tokenize("\"hello\nworld\"").unwrap_err();
         assert!(err[0].message.contains("unclosed string literal"));
+    }
+
+    #[test]
+    fn test_char_literal() {
+        let tokens = tokenize("'a'").unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::CharLit('a')));
+    }
+
+    #[test]
+    fn test_char_all_standard_escapes() {
+        for (input, expected) in [
+            (r"'\0'", '\0'),
+            (r"'\a'", '\x07'),
+            (r"'\b'", '\x08'),
+            (r"'\t'", '\t'),
+            (r"'\n'", '\n'),
+            (r"'\v'", '\x0b'),
+            (r"'\f'", '\x0c'),
+            (r"'\r'", '\r'),
+            (r"'\e'", '\x1b'),
+            (r"'\\'", '\\'),
+            (r"'\''", '\''),
+        ] {
+            let tokens = tokenize(input).unwrap();
+            assert!(
+                matches!(tokens[0].kind, TokenKind::CharLit(c) if c == expected),
+                "escape {} should produce {:?}",
+                input,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn test_char_hex_escape() {
+        let tokens = tokenize(r"'\x41'").unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::CharLit('A')));
+    }
+
+    #[test]
+    fn test_char_unicode_escape() {
+        let tokens = tokenize(r"'\u{41}'").unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::CharLit('A')));
+    }
+
+    #[test]
+    fn test_char_literal_empty_is_error() {
+        let err = tokenize("''").unwrap_err();
+        assert!(err[0].message.contains("empty char literal"));
+    }
+
+    #[test]
+    fn test_char_unknown_escape_is_error() {
+        let err = tokenize(r"'\q'").unwrap_err();
+        assert!(err[0].message.contains("unknown escape"));
     }
 }

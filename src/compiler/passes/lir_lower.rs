@@ -8,13 +8,14 @@
 use crate::intern::Symbol;
 use crate::ir::lir::*;
 use crate::ir::mir::*;
-use crate::types::{BinaryOp, EnumDef, Literal, Span, Type};
+use crate::types::{BinaryOp, EnumDef, Literal, Span, Type, WasmRepr};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub enum LirLowerError {
     UnsupportedExpression { detail: String, span: Span },
     FunctionMayNotReturn { name: String, span: Span },
+    UnresolvedType { detail: String, span: Span },
 }
 
 impl std::fmt::Display for LirLowerError {
@@ -26,6 +27,9 @@ impl std::fmt::Display for LirLowerError {
             LirLowerError::FunctionMayNotReturn { name, .. } => {
                 write!(f, "Function '{}' may not return a value", name)
             }
+            LirLowerError::UnresolvedType { detail, .. } => {
+                write!(f, "Unresolved type in LIR lowering: {}", detail)
+            }
         }
     }
 }
@@ -34,7 +38,8 @@ impl LirLowerError {
     pub fn span(&self) -> &Span {
         match self {
             LirLowerError::UnsupportedExpression { span, .. }
-            | LirLowerError::FunctionMayNotReturn { span, .. } => span,
+            | LirLowerError::FunctionMayNotReturn { span, .. }
+            | LirLowerError::UnresolvedType { span, .. } => span,
         }
     }
 }
@@ -344,14 +349,18 @@ impl<'a> LowerCtx<'a> {
                     let capture_params: Vec<MirParam> = free_vars
                         .iter()
                         .map(|&name| {
-                            let typ = self.semantic_vars.get(&name).cloned().unwrap_or(Type::I64);
-                            MirParam {
+                            let typ = self.semantic_vars.get(&name).cloned()
+                                .ok_or_else(|| LirLowerError::UnresolvedType {
+                                    detail: format!("conc capture variable '{}' not in semantic_vars", name),
+                                    span: task.span.clone(),
+                                })?;
+                            Ok(MirParam {
                                 label: name,
                                 name,
                                 typ,
-                            }
+                            })
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>, _>>()?;
                     let task_mir = MirFunction {
                         name: task_name,
                         params: capture_params,
@@ -367,16 +376,20 @@ impl<'a> LowerCtx<'a> {
                     let args: Vec<(Symbol, LirAtom)> = free_vars
                         .iter()
                         .map(|&name| {
-                            let typ = self.vars.get(&name).cloned().unwrap_or(Type::I64);
-                            (
+                            let typ = self.vars.get(&name).cloned()
+                                .ok_or_else(|| LirLowerError::UnresolvedType {
+                                    detail: format!("conc capture variable '{}' not in vars", name),
+                                    span: task.span.clone(),
+                                })?;
+                            Ok((
                                 name,
                                 LirAtom::Var {
                                     name,
                                     typ,
                                 },
-                            )
+                            ))
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>, _>>()?;
                     task_refs.push(ConcTask {
                         func_name: task_name,
                         args,
@@ -1086,7 +1099,15 @@ impl<'a> LowerCtx<'a> {
                     let wasm_ft = semantic_ft
                         .as_ref()
                         .map(|ft| wasm_type(ft))
-                        .unwrap_or(Type::I64);
+                        .unwrap_or_else(|| {
+                            // Generic/polymorphic constructor fields — I64 is the correct
+                            // WASM representation for unresolved type parameters
+                            tracing::debug!(
+                                "constructor '{}' field at index {}: unresolved type, using I64",
+                                name, def_idx
+                            );
+                            Type::I64
+                        });
                     let field_atom = self.bind_expr_to_temp(
                         LirExpr::ObjectField {
                             value: target.clone(),
@@ -1132,11 +1153,10 @@ impl<'a> LowerCtx<'a> {
                         .enumerate()
                         .find(|(_, (n, _))| n == name)
                         .map(|(i, (_, t))| (i, t.clone()))
-                        .unwrap_or_else(|| {
-                            // Fallback: use pattern order index (legacy behavior)
-                            let idx = fields.iter().position(|(n, _)| n == name).unwrap_or(0);
-                            (idx, Type::I64)
-                        });
+                        .ok_or_else(|| LirLowerError::UnresolvedType {
+                            detail: format!("record field '{}' not found in record type {:?}", name, semantic_type),
+                            span: 0..0,
+                        })?;
                     let field_atom = self.bind_expr_to_temp(
                         LirExpr::ObjectField {
                             value: target.clone(),
@@ -1199,7 +1219,13 @@ impl<'a> LowerCtx<'a> {
                         .iter()
                         .find(|(n, _)| *n == name.as_str())
                         .map(|(_, t)| t.clone())
-                        .unwrap_or(Type::I64);
+                        .unwrap_or_else(|| {
+                            tracing::debug!(
+                                "record field '{}' not found in semantic type {:?}, using I64",
+                                name, sem_type
+                            );
+                            Type::I64
+                        });
                     self.walk_pattern_semantic_types(&field_type, field_pat, out);
                 }
             }
@@ -1221,7 +1247,14 @@ impl<'a> LowerCtx<'a> {
                         .as_ref()
                         .and_then(|fts| fts.get(def_idx))
                         .cloned()
-                        .unwrap_or(Type::I64);
+                        .unwrap_or_else(|| {
+                            // Generic/polymorphic constructor — I64 is correct for unresolved type params
+                            tracing::debug!(
+                                "constructor '{}' field at index {}: unresolved type, using I64",
+                                name, def_idx
+                            );
+                            Type::I64
+                        });
                     self.walk_pattern_semantic_types(&ft, field_pat, out);
                 }
             }
@@ -1261,7 +1294,10 @@ impl<'a> LowerCtx<'a> {
                     .get(name)
                     .map(|st| wasm_type(st))
                     .or_else(|| self.vars.get(name).cloned())
-                    .unwrap_or(Type::I64);
+                    .ok_or_else(|| LirLowerError::UnresolvedType {
+                        detail: format!("variable '{}' not in scope", name),
+                        span: 0..0,
+                    })?;
                 Ok(LirAtom::Var {
                     name: name.clone(),
                     typ,
@@ -1421,7 +1457,11 @@ impl<'a> LowerCtx<'a> {
                 span: 0..0,
             }),
             MirExpr::Borrow(name) => {
-                let typ = self.vars.get(name).cloned().unwrap_or(Type::I64);
+                let typ = self.vars.get(name).cloned()
+                    .ok_or_else(|| LirLowerError::UnresolvedType {
+                        detail: format!("borrowed variable '{}' not in scope", name),
+                        span: 0..0,
+                    })?;
                 Ok(LirAtom::Var {
                     name: name.clone(),
                     typ,
@@ -1445,7 +1485,11 @@ impl<'a> LowerCtx<'a> {
     /// variable bindings in semantic_vars.
     fn infer_semantic_type(&self, expr: &MirExpr) -> Type {
         match expr {
-            MirExpr::Variable(name) => self.semantic_vars.get(name).cloned().unwrap_or(Type::I64),
+            MirExpr::Variable(name) => self.semantic_vars.get(name).cloned()
+                .unwrap_or_else(|| {
+                    tracing::debug!("variable '{}' not in semantic_vars during type inference, using I64", name);
+                    Type::I64
+                }),
             MirExpr::Call { ret_type, .. } => ret_type.clone(),
             MirExpr::Record(fields) => {
                 let mut field_types: Vec<(String, Type)> = fields
@@ -1460,6 +1504,7 @@ impl<'a> LowerCtx<'a> {
                 Literal::Int(_) => Type::I64,
                 Literal::Float(_) => Type::F64,
                 Literal::Bool(_) => Type::Bool,
+                Literal::Char(_) => Type::Char,
                 Literal::String(_) => Type::String,
                 Literal::Unit => Type::Unit,
             },
@@ -1467,7 +1512,10 @@ impl<'a> LowerCtx<'a> {
                 let receiver_type = self.infer_semantic_type(receiver);
                 resolve_field_access(&receiver_type, field.as_str())
                     .map(|(_, typ)| typ)
-                    .unwrap_or(Type::I64)
+                    .unwrap_or_else(|e| {
+                        tracing::debug!("field '{}' not resolvable on type {:?}: {}", field, receiver_type, e);
+                        Type::I64
+                    })
             }
             MirExpr::If { then_body, .. } => {
                 // Infer from last statement of then branch
@@ -1493,14 +1541,20 @@ impl<'a> LowerCtx<'a> {
                 let elem_type = items
                     .first()
                     .map(|e| self.infer_semantic_type(e))
-                    .unwrap_or(Type::I64);
+                    .unwrap_or_else(|| {
+                        tracing::debug!("empty array literal, using I64 element type");
+                        Type::I64
+                    });
                 Type::Array(Box::new(elem_type))
             }
             MirExpr::Index(arr, _) => {
                 let arr_type = self.infer_semantic_type(arr);
                 match arr_type {
                     Type::Array(elem) => *elem,
-                    _ => Type::I64,
+                    other => {
+                        tracing::debug!("index operation on non-array type {:?}, using I64", other);
+                        Type::I64
+                    }
                 }
             }
             MirExpr::BinaryOp(lhs, op, _) => {
@@ -1511,7 +1565,12 @@ impl<'a> LowerCtx<'a> {
                 }
             }
             MirExpr::While { .. } => Type::Unit,
-            MirExpr::Borrow(name) => self.semantic_vars.get(name).cloned().unwrap_or(Type::I64),
+            MirExpr::Borrow(name) => self.semantic_vars.get(name).cloned()
+                .unwrap_or_else(|| {
+                    tracing::debug!("borrowed variable '{}' not in semantic_vars during type inference, using I64", name);
+                    Type::I64
+                }),
+            // Raise never returns; I64 is a placeholder (no Type::Never exists)
             MirExpr::Raise(_) => Type::I64,
         }
     }
@@ -1569,6 +1628,7 @@ fn literal_to_atom(lit: &Literal) -> LirAtom {
         Literal::Int(i) => LirAtom::Int(*i),
         Literal::Float(f) => LirAtom::Float(*f),
         Literal::Bool(b) => LirAtom::Bool(*b),
+        Literal::Char(c) => LirAtom::Char(*c),
         Literal::String(s) => LirAtom::String(s.clone()),
         Literal::Unit => LirAtom::Unit,
     }
@@ -1609,30 +1669,26 @@ fn resolve_field_access(
 }
 
 /// Map a high-level AST type to its WASM-level representation.
-/// Records, enums, arrays, and other heap-allocated types become I64 (object pointer).
-/// Primitives pass through unchanged.
+/// Primitives pass through with semantic type preserved (Bool stays Bool, etc.).
+/// Heap-allocated and compound types collapse to I64 (object pointer).
 fn wasm_type(typ: &Type) -> Type {
     match typ {
-        Type::I32 | Type::I64 | Type::F32 | Type::F64 | Type::Bool | Type::String | Type::Unit => {
+        // Primitives: keep semantic type for downstream codegen
+        Type::I32 | Type::I64 | Type::F32 | Type::F64 | Type::Bool | Type::Char | Type::String | Type::Unit => {
             typ.clone()
         }
+        // Literal types: resolve to concrete numeric type
         Type::IntLit => Type::I64,
         Type::FloatLit => Type::F64,
-        // Heap-allocated compound types → I64 (object pointer)
-        Type::Record(_)
-        | Type::UserDefined(_, _)
-        | Type::Array(_)
-        | Type::List(_)
-        | Type::Linear(_)
-        | Type::Borrow(_)
-        | Type::Ref(_)
-        | Type::Handler(_, _) => Type::I64,
-        // Function types → I64 (funcref / closure pointer)
-        Type::Arrow(_, _, _, _) => Type::I64,
-        // Rows are not values
+        // Rows are not runtime values
         Type::Row(_, _) => Type::Unit,
-        // Type variables (generics) → I64 as fallback
-        Type::Var(_) => Type::I64,
+        // All compound/heap types: classify via wasm_repr
+        _ => match typ.wasm_repr() {
+            WasmRepr::I64 => Type::I64,
+            WasmRepr::I32 | WasmRepr::F32 | WasmRepr::F64 | WasmRepr::Unit => {
+                unreachable!("compound type {typ} has unexpected wasm_repr")
+            }
+        },
     }
 }
 
@@ -1711,6 +1767,7 @@ fn default_atom_for_type(typ: &Type) -> LirAtom {
         Type::I32 | Type::I64 => LirAtom::Int(0),
         Type::F32 | Type::F64 => LirAtom::Float(0.0),
         Type::Bool => LirAtom::Bool(false),
+        Type::Char => LirAtom::Char('\0'),
         Type::String => LirAtom::String(String::new()),
         Type::Unit => LirAtom::Unit,
         _ => LirAtom::Int(0), // heap pointer types default to 0

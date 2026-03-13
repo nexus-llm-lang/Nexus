@@ -436,6 +436,10 @@ pub(super) fn compile_atom(
             out.instruction(&Instruction::I32Const(if *b { 1 } else { 0 }));
             Ok(())
         }
+        LirAtom::Char(c) => {
+            out.instruction(&Instruction::I32Const(*c as i32));
+            Ok(())
+        }
         LirAtom::String(s) => {
             let packed = layout
                 .string_literals

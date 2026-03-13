@@ -174,6 +174,16 @@ fn collect_stmt_captures(
                     captures,
                 );
             }
+            Stmt::LetPattern { pattern, value } => {
+                collect_expr_captures(
+                    value,
+                    outer_keys,
+                    &local_bound_keys,
+                    &local_bound_call_names,
+                    captures,
+                );
+                bind_pattern_names(pattern, &mut local_bound_keys, &mut local_bound_call_names);
+            }
         }
     }
 }

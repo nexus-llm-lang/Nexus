@@ -303,6 +303,7 @@ pub(super) fn is_auto_droppable(typ: &Type) -> bool {
         | Type::IntLit
         | Type::FloatLit
         | Type::Bool
+        | Type::Char
         | Type::String
         | Type::Unit
         | Type::Array(_) => true,

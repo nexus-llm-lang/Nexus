@@ -137,6 +137,7 @@ pub enum LirAtom {
     Int(i64),
     Float(f64),
     Bool(bool),
+    Char(char),
     String(String),
     Unit,
 }
@@ -148,6 +149,7 @@ impl LirAtom {
             LirAtom::Int(_) => Type::I64,
             LirAtom::Float(_) => Type::F64,
             LirAtom::Bool(_) => Type::Bool,
+            LirAtom::Char(_) => Type::Char,
             LirAtom::String(_) => Type::String,
             LirAtom::Unit => Type::Unit,
         }

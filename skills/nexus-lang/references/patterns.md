@@ -63,7 +63,7 @@ end
 let db_repo = handler UserRepository require { PermFs } do
   fn find_by_id(id: i64) -> Option<User> do
     // ... real implementation
-    return None()
+    return None
   end
   fn save(user: User) -> Result<unit, string> do
     // ... real implementation
@@ -144,7 +144,7 @@ end
 ```nexus
 let sum = fn (xs: [ i64 ]) -> i64 do
   match xs do
-    case Nil() -> return 0
+    case Nil -> return 0
     case Cons(v: v, rest: rest) -> return v + sum(xs: rest)
   end
 end
@@ -155,7 +155,7 @@ end
 ```nexus
 let sum_acc = fn (xs: [ i64 ], acc: i64) -> i64 do
   match xs do
-    case Nil() -> return acc
+    case Nil -> return acc
     case Cons(v: v, rest: rest) -> return sum_acc(xs: rest, acc: acc + v)
   end
 end
@@ -171,7 +171,7 @@ end
 // Build in reverse order (O(1) per element), then reverse
 let filter_go = fn (xs: [ i64 ], pred: (val: i64) -> bool, acc: [ i64 ]) -> [ i64 ] do
   match xs do
-    case Nil() -> return list.reverse(xs: acc)
+    case Nil -> return list.reverse(xs: acc)
     case Cons(v: v, rest: rest) ->
       if pred(val: v) then
         let next = Cons(v: v, rest: acc)
@@ -183,7 +183,7 @@ let filter_go = fn (xs: [ i64 ], pred: (val: i64) -> bool, acc: [ i64 ]) -> [ i6
 end
 
 let filter = fn (xs: [ i64 ], pred: (val: i64) -> bool) -> [ i64 ] do
-  return filter_go(xs: xs, pred: pred, acc: Nil())
+  return filter_go(xs: xs, pred: pred, acc: Nil)
 end
 ```
 
@@ -200,7 +200,7 @@ end
 // String join
 let join = fn (xs: [ string ], sep: string) -> string do
   match xs do
-    case Nil() -> return ""
+    case Nil -> return ""
     case Cons(v: first, rest: rest) ->
       return list.fold_left(xs: rest, init: first, f: fn (acc: string, val: string) -> string do
         return acc ++ sep ++ val

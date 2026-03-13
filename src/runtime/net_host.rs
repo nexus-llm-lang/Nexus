@@ -118,7 +118,11 @@ fn do_http_request(method: &str, url: &str, headers: &str, body: &str) -> String
         for (name, value) in response.headers() {
             resp_headers.push_str(name.as_str());
             resp_headers.push_str(": ");
-            resp_headers.push_str(value.to_str().unwrap_or(""));
+            resp_headers.push_str(
+                value
+                    .to_str()
+                    .unwrap_or("[non-ASCII header value]"),
+            );
             resp_headers.push('\n');
         }
         let resp_body = response
@@ -165,8 +169,15 @@ fn do_accept(server_id: i64) -> Result<String, String> {
         .read_line(&mut request_line)
         .map_err(|e| e.to_string())?;
     let parts: Vec<&str> = request_line.trim().splitn(3, ' ').collect();
-    let method = parts.first().copied().unwrap_or("");
-    let path = parts.get(1).copied().unwrap_or("/");
+    let method = parts
+        .first()
+        .copied()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "malformed HTTP request: missing method".to_string())?;
+    let path = parts
+        .get(1)
+        .copied()
+        .ok_or_else(|| "malformed HTTP request: missing path".to_string())?;
 
     let mut headers_raw = String::new();
     let mut content_length: usize = 0;
@@ -179,7 +190,9 @@ fn do_accept(server_id: i64) -> Result<String, String> {
         }
         if let Some((name, value)) = trimmed.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse().unwrap_or(0);
+                content_length = value.trim().parse().map_err(|_| {
+                    format!("invalid Content-Length header: '{}'", value.trim())
+                })?;
             }
         }
         headers_raw.push_str(trimmed);
@@ -283,12 +296,14 @@ pub fn add_net_host_to_linker<T: 'static>(linker: &mut Linker<T>) -> Result<(), 
              body_ptr: i32,
              body_len: i32,
              ret_ptr: i32| {
-                let method =
-                    read_wasm_string(&mut caller, method_ptr, method_len).unwrap_or_default();
-                let url = read_wasm_string(&mut caller, url_ptr, url_len).unwrap_or_default();
-                let headers =
-                    read_wasm_string(&mut caller, headers_ptr, headers_len).unwrap_or_default();
-                let body = read_wasm_string(&mut caller, body_ptr, body_len).unwrap_or_default();
+                let method = read_wasm_string(&mut caller, method_ptr, method_len)
+                    .expect("failed to read HTTP method from WASM memory");
+                let url = read_wasm_string(&mut caller, url_ptr, url_len)
+                    .expect("failed to read HTTP URL from WASM memory");
+                let headers = read_wasm_string(&mut caller, headers_ptr, headers_len)
+                    .expect("failed to read HTTP headers from WASM memory");
+                let body = read_wasm_string(&mut caller, body_ptr, body_len)
+                    .expect("failed to read HTTP body from WASM memory");
 
                 let result = do_http_request(&method, &url, &headers, &body);
 
@@ -307,8 +322,15 @@ pub fn add_net_host_to_linker<T: 'static>(linker: &mut Linker<T>) -> Result<(), 
             NEXUS_HOST_HTTP_MODULE,
             "host-http-listen",
             |mut caller: Caller<'_, T>, addr_ptr: i32, addr_len: i32| -> i64 {
-                let addr = read_wasm_string(&mut caller, addr_ptr, addr_len).unwrap_or_default();
-                do_listen(&addr).unwrap_or(-1)
+                let addr = read_wasm_string(&mut caller, addr_ptr, addr_len)
+                    .expect("failed to read listen address from WASM memory");
+                match do_listen(&addr) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("nexus: listen failed on '{}': {}", addr, e);
+                        -1
+                    }
+                }
             },
         )
         .map_err(|e| e.to_string())?;
@@ -342,12 +364,16 @@ pub fn add_net_host_to_linker<T: 'static>(linker: &mut Linker<T>) -> Result<(), 
              body_ptr: i32,
              body_len: i32|
              -> i32 {
-                let headers =
-                    read_wasm_string(&mut caller, headers_ptr, headers_len).unwrap_or_default();
-                let body = read_wasm_string(&mut caller, body_ptr, body_len).unwrap_or_default();
+                let headers = read_wasm_string(&mut caller, headers_ptr, headers_len)
+                    .expect("failed to read response headers from WASM memory");
+                let body = read_wasm_string(&mut caller, body_ptr, body_len)
+                    .expect("failed to read response body from WASM memory");
                 match do_respond(req_id, status, &headers, &body) {
                     Ok(()) => 1,
-                    Err(_) => 0,
+                    Err(e) => {
+                        eprintln!("nexus: respond failed: {}", e);
+                        0
+                    }
                 }
             },
         )
@@ -361,7 +387,10 @@ pub fn add_net_host_to_linker<T: 'static>(linker: &mut Linker<T>) -> Result<(), 
             |_caller: Caller<'_, T>, server_id: i64| -> i32 {
                 match do_stop(server_id) {
                     Ok(()) => 1,
-                    Err(_) => 0,
+                    Err(e) => {
+                        eprintln!("nexus: stop server {} failed: {}", server_id, e);
+                        0
+                    }
                 }
             },
         )

@@ -107,13 +107,21 @@ pub extern "C" fn __nx_string_replace(
 }
 
 #[no_mangle]
-pub extern "C" fn __nx_string_char_at(s_ptr: i32, s_len: i32, idx: i64) -> i64 {
+pub extern "C" fn __nx_string_char_at(s_ptr: i32, s_len: i32, idx: i64) -> i32 {
     if idx < 0 {
         return 0;
     }
     let s = read_string(s_ptr, s_len);
     match s.chars().nth(idx as usize) {
-        Some(c) => nexus_wasm_alloc::store_string_result(c.to_string()),
+        Some(c) => c as i32,
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_string_from_char(c: i32) -> i64 {
+    match char::from_u32(c as u32) {
+        Some(ch) => nexus_wasm_alloc::store_string_result(ch.to_string()),
         None => 0,
     }
 }
@@ -212,6 +220,11 @@ pub extern "C" fn __nx_string_char_code(s_ptr: i32, s_len: i32, idx: i64) -> i64
         Some(c) => c as i64,
         None => -1,
     }
+}
+
+#[no_mangle]
+pub extern "C" fn __nx_char_ord(c: i32) -> i64 {
+    c as i64
 }
 
 #[no_mangle]

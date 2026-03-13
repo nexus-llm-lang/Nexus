@@ -142,7 +142,7 @@ let main = fn () -> unit require { PermConsole } throws { Exn } do
           println(val: "expected frame 'main', got '" ++ first ++ "'")
           raise RuntimeError(val: "wrong frame")
         end
-      case Nil() ->
+      case Nil ->
         raise RuntimeError(val: "expected non-empty backtrace")
     end
   end

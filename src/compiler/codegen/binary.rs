@@ -71,6 +71,20 @@ pub(super) fn compile_binary(
                 })
             }
         },
+        Type::Char => match op {
+            BinaryOp::Eq => out.instruction(&Instruction::I32Eq),
+            BinaryOp::Ne => out.instruction(&Instruction::I32Ne),
+            BinaryOp::Lt => out.instruction(&Instruction::I32LtU),
+            BinaryOp::Le => out.instruction(&Instruction::I32LeU),
+            BinaryOp::Gt => out.instruction(&Instruction::I32GtU),
+            BinaryOp::Ge => out.instruction(&Instruction::I32GeU),
+            _ => {
+                return Err(CodegenError::UnsupportedBinaryOp {
+                    op,
+                    operand_type: "char".to_string(),
+                })
+            }
+        },
         Type::UserDefined(_, _) | Type::Var(_) | Type::Record(_) => match op {
             BinaryOp::Eq => out.instruction(&Instruction::I64Eq),
             BinaryOp::Ne => out.instruction(&Instruction::I64Ne),
@@ -141,6 +155,9 @@ pub(super) fn binary_operand_type(
         return Ok(Type::String);
     }
     if matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
+        if matches!(lhs, Type::Char) && matches!(rhs, Type::Char) {
+            return Ok(Type::Char);
+        }
         if matches!(lhs, Type::String) && matches!(rhs, Type::String) {
             return Ok(Type::String);
         }
@@ -154,6 +171,11 @@ pub(super) fn binary_operand_type(
         }
         if matches!(lhs, Type::Record(_)) && matches!(rhs, Type::Record(_)) {
             return Ok(lhs.clone());
+        }
+    }
+    if matches!(op, BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge) {
+        if matches!(lhs, Type::Char) && matches!(rhs, Type::Char) {
+            return Ok(Type::Char);
         }
     }
     if matches!(op, BinaryOp::And | BinaryOp::Or) {

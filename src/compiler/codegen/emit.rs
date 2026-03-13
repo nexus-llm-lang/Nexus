@@ -4,7 +4,7 @@ use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 use crate::intern::Symbol;
 use crate::ir::lir::{LirAtom, LirExpr, LirExternal};
-use crate::types::Type;
+use crate::types::{Type, WasmRepr};
 
 use super::error::CodegenError;
 use super::layout::CodegenLayout;
@@ -99,67 +99,47 @@ pub(super) fn emit_alloc_object(
 }
 
 pub(super) fn emit_pack_value_to_i64(typ: &Type, out: &mut Function) -> Result<(), CodegenError> {
-    match peel_linear(typ) {
-        Type::I64
-        | Type::String
-        | Type::Array(_)
-        | Type::List(_)
-        | Type::Record(_)
-        | Type::UserDefined(_, _)
-        | Type::Var(_)
-        | Type::Borrow(_) => Ok(()),
-        Type::I32 | Type::Bool => {
+    match typ.wasm_repr() {
+        WasmRepr::I64 => Ok(()),
+        WasmRepr::I32 => {
             out.instruction(&Instruction::I64ExtendI32S);
             Ok(())
         }
-        Type::F64 => {
+        WasmRepr::F64 => {
             out.instruction(&Instruction::I64ReinterpretF64);
             Ok(())
         }
-        Type::F32 => {
+        WasmRepr::F32 => {
             out.instruction(&Instruction::I32ReinterpretF32);
             out.instruction(&Instruction::I64ExtendI32U);
             Ok(())
         }
-        Type::Unit => {
+        WasmRepr::Unit => {
             out.instruction(&Instruction::Drop);
             out.instruction(&Instruction::I64Const(0));
             Ok(())
         }
-        other => Err(CodegenError::UnsupportedPack {
-            typ: other.to_string(),
-        }),
     }
 }
 
 pub(super) fn emit_unpack_i64_to_value(typ: &Type, out: &mut Function) -> Result<(), CodegenError> {
-    match peel_linear(typ) {
-        Type::I64
-        | Type::String
-        | Type::Array(_)
-        | Type::List(_)
-        | Type::Record(_)
-        | Type::UserDefined(_, _)
-        | Type::Var(_)
-        | Type::Borrow(_) => Ok(()),
-        Type::I32 | Type::Bool => {
+    match typ.wasm_repr() {
+        WasmRepr::I64 => Ok(()),
+        WasmRepr::I32 => {
             out.instruction(&Instruction::I32WrapI64);
             Ok(())
         }
-        Type::F64 => {
+        WasmRepr::F64 => {
             out.instruction(&Instruction::F64ReinterpretI64);
             Ok(())
         }
-        Type::F32 => {
+        WasmRepr::F32 => {
             out.instruction(&Instruction::I32WrapI64);
             out.instruction(&Instruction::F32ReinterpretI32);
             Ok(())
         }
-        Type::Unit => Err(CodegenError::UnsupportedUnpack {
+        WasmRepr::Unit => Err(CodegenError::UnsupportedUnpack {
             typ: "unit".to_string(),
-        }),
-        other => Err(CodegenError::UnsupportedUnpack {
-            typ: other.to_string(),
         }),
     }
 }
@@ -281,34 +261,18 @@ pub(super) fn peel_linear(mut typ: &Type) -> &Type {
 }
 
 pub(super) fn type_to_wasm_valtype(typ: &Type) -> Result<ValType, CodegenError> {
-    match peel_linear(typ) {
-        Type::I32 | Type::Bool => Ok(ValType::I32),
-        Type::I64 => Ok(ValType::I64),
-        Type::F32 => Ok(ValType::F32),
-        Type::F64 => Ok(ValType::F64),
-        Type::String => Ok(ValType::I64),
-        Type::Array(_) => Ok(ValType::I64),
-        Type::Record(_) => Ok(ValType::I64),
-        Type::Borrow(inner) if matches!(peel_linear(inner), Type::Array(_)) => Ok(ValType::I64),
-        Type::Borrow(inner)
-            if matches!(
-                peel_linear(inner),
-                Type::Record(_) | Type::UserDefined(_, _) | Type::List(_) | Type::Var(_)
-            ) =>
-        {
-            Ok(ValType::I64)
-        }
-        Type::UserDefined(_, _) | Type::List(_) | Type::Var(_) => Ok(ValType::I64),
-        Type::Unit => Err(CodegenError::UnitWasmType),
-        other => Err(CodegenError::UnsupportedWasmType {
-            typ: other.to_string(),
-        }),
+    match typ.wasm_repr() {
+        WasmRepr::I32 => Ok(ValType::I32),
+        WasmRepr::I64 => Ok(ValType::I64),
+        WasmRepr::F32 => Ok(ValType::F32),
+        WasmRepr::F64 => Ok(ValType::F64),
+        WasmRepr::Unit => Err(CodegenError::UnitWasmType),
     }
 }
 
 pub(super) fn return_type_to_wasm_result(ret: &Type) -> Result<Vec<ValType>, CodegenError> {
-    match peel_linear(ret) {
-        Type::Unit => Ok(vec![]),
+    match ret.wasm_repr() {
+        WasmRepr::Unit => Ok(vec![]),
         _ => Ok(vec![type_to_wasm_valtype(ret)?]),
     }
 }
@@ -317,7 +281,7 @@ pub(super) fn external_param_types(ext: &LirExternal) -> Result<Vec<ValType>, Co
     let mut out = Vec::new();
     for param in &ext.params {
         match peel_linear(&param.typ) {
-            Type::I32 | Type::Bool => out.push(ValType::I32),
+            Type::I32 | Type::Bool | Type::Char => out.push(ValType::I32),
             Type::I64 => out.push(ValType::I64),
             Type::F32 => out.push(ValType::F32),
             Type::F64 => out.push(ValType::F64),
@@ -344,9 +308,10 @@ pub(super) fn external_param_types(ext: &LirExternal) -> Result<Vec<ValType>, Co
 }
 
 pub(super) fn external_return_types(ext: &LirExternal) -> Result<Vec<ValType>, CodegenError> {
+    // FFI ABI boundary: only a restricted set of types can be returned from externals.
     match peel_linear(&ext.ret_type) {
         Type::Unit => Ok(vec![]),
-        Type::I32 | Type::Bool => Ok(vec![ValType::I32]),
+        Type::I32 | Type::Bool | Type::Char => Ok(vec![ValType::I32]),
         Type::I64 => Ok(vec![ValType::I64]),
         Type::F32 => Ok(vec![ValType::F32]),
         Type::F64 => Ok(vec![ValType::F64]),

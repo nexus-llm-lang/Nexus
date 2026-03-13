@@ -158,6 +158,9 @@ impl TypeChecker {
                 Stmt::Inject { body, .. } => {
                     self.collect_unused_local_variable_warnings_in_stmts(body);
                 }
+                Stmt::LetPattern { value, .. } => {
+                    self.collect_unused_local_variable_warnings_in_expr(value);
+                }
                 Stmt::Conc(tasks) => {
                     for task in tasks {
                         self.collect_unused_local_variable_warnings_in_function(
@@ -401,6 +404,13 @@ pub(super) fn collect_signature_needs_from_stmts(
                 reqs.extend(body_reqs);
                 effs.extend(body_effs);
                 unknown |= body_unknown;
+            }
+            Stmt::LetPattern { value, .. } => {
+                let (inner_reqs, inner_effs, inner_unknown) =
+                    collect_signature_needs_from_expr(value, env);
+                reqs.extend(inner_reqs);
+                effs.extend(inner_effs);
+                unknown |= inner_unknown;
             }
         }
     }
@@ -648,6 +658,7 @@ fn stmt_mentions_name(stmt: &Spanned<Stmt>, target: &str) -> bool {
                 .any(|h| h == target || h.starts_with(&format!("{}.", target)))
                 || body.iter().any(|stmt| stmt_mentions_name(stmt, target))
         }
+        Stmt::LetPattern { value, .. } => expr_mentions_name(value, target),
     }
 }
 
@@ -681,6 +692,9 @@ fn collect_used_variable_keys_in_stmts(stmts: &[Spanned<Stmt>], out: &mut HashSe
                     }
                 }
                 collect_used_variable_keys_in_stmts(body, out);
+            }
+            Stmt::LetPattern { value, .. } => {
+                collect_used_variable_keys_in_expr(value, out);
             }
         }
     }
@@ -789,6 +803,9 @@ fn collect_local_let_bindings(stmts: &[Spanned<Stmt>], out: &mut Vec<(String, Si
                 for task in tasks {
                     collect_local_let_bindings(&task.body, out);
                 }
+            }
+            Stmt::LetPattern { value, .. } => {
+                collect_local_let_bindings_in_expr(value, out);
             }
         }
     }

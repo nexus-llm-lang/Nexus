@@ -45,3 +45,33 @@ end
 "#,
     );
 }
+
+#[test]
+fn codegen_let_destructure_record() {
+    exec(
+        r#"
+let main = fn () -> unit do
+    let r = { x: 20, y: 22 }
+    let {x: a, y: b} = r
+    let result = a + b
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_let_destructure_record_multiple_uses() {
+    exec(
+        r#"
+let main = fn () -> unit do
+    let r = { a: 10, b: 20, c: 12 }
+    let {a: x, b: y, c: z} = r
+    let result = x + y + z
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}

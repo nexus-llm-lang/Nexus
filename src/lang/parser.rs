@@ -151,16 +151,102 @@ impl Parser {
         }
     }
 
+    /// Parse optional type parameters: `<T, U, ...>`. Returns empty vec if no `<` found.
+    fn parse_type_params(&mut self) -> Result<Vec<String>, ParseError> {
+        if !matches!(self.peek(), TokenKind::Lt) {
+            return Ok(vec![]);
+        }
+        self.advance();
+        let mut params = vec![self.expect_ident()?];
+        while self.match_token(&TokenKind::Comma) {
+            params.push(self.expect_ident()?);
+        }
+        self.expect(&TokenKind::Gt)?;
+        Ok(params)
+    }
+
+    /// Parse a comma-separated list of items between open/close delimiters.
+    /// `parse_item` is called for each element.
+    fn parse_delimited_list<T>(
+        &mut self,
+        open: &TokenKind,
+        close: &TokenKind,
+        mut parse_item: impl FnMut(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<Vec<T>, ParseError> {
+        self.expect(open)?;
+        let mut items = Vec::new();
+        if std::mem::discriminant(self.peek()) != std::mem::discriminant(close) {
+            items.push(parse_item(self)?);
+            while self.match_token(&TokenKind::Comma) {
+                if std::mem::discriminant(self.peek()) == std::mem::discriminant(close) {
+                    break;
+                }
+                items.push(parse_item(self)?);
+            }
+        }
+        self.expect(close)?;
+        Ok(items)
+    }
+
+    /// Parse a comma-separated list without delimiters (no open/close tokens).
+    /// Stops when `is_end` returns true.
+    fn parse_comma_separated<T>(
+        &mut self,
+        is_end: impl Fn(&TokenKind) -> bool,
+        mut parse_item: impl FnMut(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<Vec<T>, ParseError> {
+        let mut items = Vec::new();
+        if !is_end(self.peek()) {
+            items.push(parse_item(self)?);
+            while self.match_token(&TokenKind::Comma) {
+                if is_end(self.peek()) {
+                    break;
+                }
+                items.push(parse_item(self)?);
+            }
+        }
+        Ok(items)
+    }
+
+    /// Try parsing `ident : value` (labeled), falling back to just `value` (unlabeled).
+    fn parse_optional_labeled<T>(
+        &mut self,
+        mut parse_value: impl FnMut(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<(Option<String>, T), ParseError> {
+        let saved = self.pos;
+        if let Ok(name) = self.expect_ident() {
+            if self.match_token(&TokenKind::Colon) {
+                let val = parse_value(self)?;
+                return Ok((Some(name), val));
+            }
+        }
+        self.pos = saved;
+        let val = parse_value(self)?;
+        Ok((None, val))
+    }
+
+    fn is_uppercase_ident(s: &str) -> bool {
+        s.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+    }
+
     // ---- Type Parsing ----
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
         // Try arrow type first: (params) -> ret [require ...] [throws ...]
         if matches!(self.peek(), TokenKind::LParen) {
             let saved = self.pos;
-            if let Ok(t) = self.try_parse_arrow_type() {
-                return Ok(t);
-            }
+            let arrow_err = match self.try_parse_arrow_type() {
+                Ok(t) => return Ok(t),
+                Err(e) => e,
+            };
             self.pos = saved;
+            return self.parse_type_atom().map_err(|mut e| {
+                e.message = format!(
+                    "{} (also tried as arrow type: {})",
+                    e.message, arrow_err.message
+                );
+                e
+            });
         }
         self.parse_type_atom()
     }
@@ -190,15 +276,10 @@ impl Parser {
     }
 
     fn parse_arrow_params(&mut self) -> Result<Vec<(String, Type)>, ParseError> {
-        let mut params = Vec::new();
-        if matches!(self.peek(), TokenKind::RParen) {
-            return Ok(params);
-        }
-        params.push(self.parse_arrow_param()?);
-        while self.match_token(&TokenKind::Comma) {
-            params.push(self.parse_arrow_param()?);
-        }
-        Ok(params)
+        self.parse_comma_separated(
+            |t| matches!(t, TokenKind::RParen),
+            Self::parse_arrow_param,
+        )
     }
 
     fn parse_arrow_param(&mut self) -> Result<(String, Type), ParseError> {
@@ -274,6 +355,10 @@ impl Parser {
                         self.advance();
                         Ok(Type::Bool)
                     }
+                    "char" => {
+                        self.advance();
+                        Ok(Type::Char)
+                    }
                     "string" => {
                         self.advance();
                         Ok(Type::String)
@@ -320,12 +405,19 @@ impl Parser {
                 // Record type or row type
                 // Try record: { name: type, ... }
                 let saved = self.pos;
-                if let Ok(record) = self.try_parse_record_type() {
-                    return Ok(record);
-                }
+                let record_err = match self.try_parse_record_type() {
+                    Ok(record) => return Ok(record),
+                    Err(e) => e,
+                };
                 self.pos = saved;
-                // row type
-                self.parse_row_type()
+                // row type, with record error context if this also fails
+                self.parse_row_type().map_err(|mut e| {
+                    e.message = format!(
+                        "{} (also tried as record type: {})",
+                        e.message, record_err.message
+                    );
+                    e
+                })
             }
             TokenKind::LBracket => {
                 // List type: [T]
@@ -349,39 +441,16 @@ impl Parser {
     }
 
     fn try_parse_record_type(&mut self) -> Result<Type, ParseError> {
-        self.expect(&TokenKind::LBrace)?;
-        let mut fields = Vec::new();
-        if matches!(self.peek(), TokenKind::RBrace) {
-            self.advance();
-            return Ok(Type::Record(fields));
-        }
-        // First field: ident : type
-        let name = self.expect_ident()?;
-        self.expect(&TokenKind::Colon)?;
-        let typ = self.parse_type()?;
-        fields.push((name, typ));
-        while self.match_token(&TokenKind::Comma) {
-            if matches!(self.peek(), TokenKind::RBrace) {
-                break;
-            }
-            let name = self.expect_ident()?;
-            self.expect(&TokenKind::Colon)?;
-            let typ = self.parse_type()?;
-            fields.push((name, typ));
-        }
-        self.expect(&TokenKind::RBrace)?;
+        let fields = self.parse_delimited_list(
+            &TokenKind::LBrace,
+            &TokenKind::RBrace,
+            Self::parse_named_field,
+        )?;
         Ok(Type::Record(fields))
     }
 
     fn parse_generic_args(&mut self) -> Result<Vec<Type>, ParseError> {
-        self.expect(&TokenKind::Lt)?;
-        let mut args = Vec::new();
-        args.push(self.parse_type()?);
-        while self.match_token(&TokenKind::Comma) {
-            args.push(self.parse_type()?);
-        }
-        self.expect(&TokenKind::Gt)?;
-        Ok(args)
+        self.parse_delimited_list(&TokenKind::Lt, &TokenKind::Gt, Self::parse_type)
     }
 
     // ---- Sigil parsing ----
@@ -423,6 +492,10 @@ impl Parser {
             TokenKind::False => {
                 self.advance();
                 Ok(Literal::Bool(false))
+            }
+            TokenKind::CharLit(c) => {
+                self.advance();
+                Ok(Literal::Char(c))
             }
             TokenKind::StringLit(ref s) => {
                 let s = s.clone();
@@ -493,9 +566,7 @@ impl Parser {
                     span: start..end,
                 })
             }
-            TokenKind::Ident(ref s)
-                if s.chars().next().map_or(false, |c| c.is_ascii_uppercase()) =>
-            {
+            TokenKind::Ident(ref s) if Self::is_uppercase_ident(s) => {
                 // Constructor pattern
                 let name = s.clone();
                 self.advance();
@@ -547,17 +618,7 @@ impl Parser {
     }
 
     fn parse_ctor_pat_arg(&mut self) -> Result<(Option<String>, Spanned<Pattern>), ParseError> {
-        // Try labeled: ident : pattern
-        let saved = self.pos;
-        if let Ok(name) = self.expect_ident() {
-            if self.match_token(&TokenKind::Colon) {
-                let pat = self.parse_pattern()?;
-                return Ok((Some(name), pat));
-            }
-        }
-        self.pos = saved;
-        let pat = self.parse_pattern()?;
-        Ok((None, pat))
+        self.parse_optional_labeled(Self::parse_pattern)
     }
 
     // ---- Param parsing ----
@@ -571,16 +632,7 @@ impl Parser {
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
-        self.expect(&TokenKind::LParen)?;
-        let mut params = Vec::new();
-        if !matches!(self.peek(), TokenKind::RParen) {
-            params.push(self.parse_param()?);
-            while self.match_token(&TokenKind::Comma) {
-                params.push(self.parse_param()?);
-            }
-        }
-        self.expect(&TokenKind::RParen)?;
-        Ok(params)
+        self.parse_delimited_list(&TokenKind::LParen, &TokenKind::RParen, Self::parse_param)
     }
 
     // ---- Require/Effect parsing (shared helper) ----
@@ -862,6 +914,7 @@ impl Parser {
             | TokenKind::Float(_)
             | TokenKind::True
             | TokenKind::False
+            | TokenKind::CharLit(_)
             | TokenKind::StringLit(_) => {
                 let lit = self.parse_literal()?;
                 let end = self.tokens[self.pos - 1].span.end;
@@ -912,7 +965,7 @@ impl Parser {
             // Identifier — could be variable, function call, constructor, or path call
             TokenKind::Ident(ref s) => {
                 let s = s.clone();
-                let is_upper = s.chars().next().map_or(false, |c| c.is_ascii_uppercase());
+                let is_upper = Self::is_uppercase_ident(&s);
 
                 // First, try to read a dotted path: a.b.c
                 // This handles both Console.println(...) calls and module.fn(...) calls
@@ -1039,15 +1092,13 @@ impl Parser {
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<(String, Spanned<Expr>)>, ParseError> {
-        let mut args = Vec::new();
-        if !matches!(self.peek(), TokenKind::RParen) {
-            args.push(self.parse_call_arg()?);
-            while self.match_token(&TokenKind::Comma) {
-                args.push(self.parse_call_arg()?);
-            }
-        }
-        self.expect(&TokenKind::RParen)?;
-        Ok(args)
+        self.parse_comma_separated(
+            |t| matches!(t, TokenKind::RParen),
+            Self::parse_call_arg,
+        ).and_then(|args| {
+            self.expect(&TokenKind::RParen)?;
+            Ok(args)
+        })
     }
 
     fn parse_call_arg(&mut self) -> Result<(String, Spanned<Expr>), ParseError> {
@@ -1059,47 +1110,23 @@ impl Parser {
     }
 
     fn parse_ctor_args(&mut self) -> Result<Vec<(Option<String>, Spanned<Expr>)>, ParseError> {
-        let mut args = Vec::new();
-        if !matches!(self.peek(), TokenKind::RParen) {
-            args.push(self.parse_ctor_arg()?);
-            while self.match_token(&TokenKind::Comma) {
-                args.push(self.parse_ctor_arg()?);
-            }
-        }
-        self.expect(&TokenKind::RParen)?;
-        Ok(args)
+        self.parse_comma_separated(
+            |t| matches!(t, TokenKind::RParen),
+            Self::parse_ctor_arg,
+        ).and_then(|args| {
+            self.expect(&TokenKind::RParen)?;
+            Ok(args)
+        })
     }
 
     fn parse_ctor_arg(&mut self) -> Result<(Option<String>, Spanned<Expr>), ParseError> {
-        // Try labeled: ident : expr
-        let saved = self.pos;
-        if let Ok(name) = self.expect_ident() {
-            if self.match_token(&TokenKind::Colon) {
-                let val = self.parse_expr()?;
-                return Ok((Some(name), val));
-            }
-        }
-        self.pos = saved;
-        let val = self.parse_expr()?;
-        Ok((None, val))
+        self.parse_optional_labeled(Self::parse_expr)
     }
 
     fn parse_lambda(&mut self, start: usize) -> Result<Spanned<Expr>, ParseError> {
         self.advance(); // consume 'fn'
 
-        // Optional type params: <T, U>
-        let type_params = if matches!(self.peek(), TokenKind::Lt) {
-            self.advance();
-            let mut params = Vec::new();
-            params.push(self.expect_ident()?);
-            while self.match_token(&TokenKind::Comma) {
-                params.push(self.expect_ident()?);
-            }
-            self.expect(&TokenKind::Gt)?;
-            params
-        } else {
-            vec![]
-        };
+        let type_params = self.parse_type_params()?;
 
         let params = self.parse_params()?;
         self.expect(&TokenKind::Arrow)?;
@@ -1158,18 +1185,7 @@ impl Parser {
         self.expect(&TokenKind::Fn)?;
         let name = self.expect_ident()?;
 
-        let type_params = if matches!(self.peek(), TokenKind::Lt) {
-            self.advance();
-            let mut params = Vec::new();
-            params.push(self.expect_ident()?);
-            while self.match_token(&TokenKind::Comma) {
-                params.push(self.expect_ident()?);
-            }
-            self.expect(&TokenKind::Gt)?;
-            params
-        } else {
-            vec![]
-        };
+        let type_params = self.parse_type_params()?;
 
         let params = self.parse_params()?;
         self.expect(&TokenKind::Arrow)?;
@@ -1217,6 +1233,20 @@ impl Parser {
         match self.peek().clone() {
             TokenKind::Let => {
                 self.advance();
+                // Check for destructuring pattern: `let { ... } = expr` or `let Ctor(...) = expr`
+                let is_record_pattern = matches!(self.peek(), TokenKind::LBrace);
+                let is_ctor_pattern = matches!(self.peek(), TokenKind::Ident(ref s) if Self::is_uppercase_ident(s))
+                    && matches!(self.peek_at_offset(1), Some(TokenKind::LParen));
+                if is_record_pattern || is_ctor_pattern {
+                    let pattern = self.parse_pattern()?;
+                    self.expect(&TokenKind::Eq)?;
+                    let value = self.parse_expr()?;
+                    let end = value.span.end;
+                    return Ok(Spanned {
+                        node: Stmt::LetPattern { pattern, value },
+                        span: start..end,
+                    });
+                }
                 let sigil = self.parse_sigil();
                 let name = self.expect_ident()?;
                 let typ = if self.match_token(&TokenKind::Colon) {
@@ -1460,16 +1490,7 @@ impl Parser {
     }
 
     fn parse_throws_ident_list(&mut self) -> Result<Vec<String>, ParseError> {
-        self.expect(&TokenKind::LBrace)?;
-        let mut idents = Vec::new();
-        if !matches!(self.peek(), TokenKind::RBrace) {
-            idents.push(self.expect_ident()?);
-            while self.match_token(&TokenKind::Comma) {
-                idents.push(self.expect_ident()?);
-            }
-        }
-        self.expect(&TokenKind::RBrace)?;
-        Ok(idents)
+        self.parse_delimited_list(&TokenKind::LBrace, &TokenKind::RBrace, Self::expect_ident)
     }
 
     fn parse_inject_stmt(&mut self, start: usize) -> Result<Spanned<Stmt>, ParseError> {
@@ -1568,38 +1589,42 @@ impl Parser {
         self.expect(&TokenKind::Type)?;
         let name = self.expect_ident()?;
 
-        let type_params = if matches!(self.peek(), TokenKind::Lt) {
-            self.advance();
-            let mut params = Vec::new();
-            params.push(self.expect_ident()?);
-            while self.match_token(&TokenKind::Comma) {
-                params.push(self.expect_ident()?);
-            }
-            self.expect(&TokenKind::Gt)?;
-            params
-        } else {
-            vec![]
-        };
+        let type_params = self.parse_type_params()?;
 
         self.expect(&TokenKind::Eq)?;
 
         // Try record body { ... }
-        if matches!(self.peek(), TokenKind::LBrace) {
+        let record_err = if matches!(self.peek(), TokenKind::LBrace) {
             let saved = self.pos;
-            if let Ok(fields) = self.try_parse_record_body() {
-                return Ok(TopLevel::TypeDef(TypeDef {
-                    name,
-                    is_public,
-                    type_params,
-                    fields,
-                }));
+            match self.try_parse_record_body() {
+                Ok(fields) => {
+                    return Ok(TopLevel::TypeDef(TypeDef {
+                        name,
+                        is_public,
+                        type_params,
+                        fields,
+                    }));
+                }
+                Err(e) => {
+                    self.pos = saved;
+                    Some(e)
+                }
             }
-            self.pos = saved;
-        }
+        } else {
+            None
+        };
 
         // Sum type: Variant1(args) | Variant2(args) | ...
         let mut variants = Vec::new();
-        variants.push(self.parse_variant_def()?);
+        variants.push(self.parse_variant_def().map_err(|mut e| {
+            if let Some(record_err) = &record_err {
+                e.message = format!(
+                    "{} (also tried as record type: {})",
+                    e.message, record_err.message
+                );
+            }
+            e
+        })?);
         while self.match_token(&TokenKind::Pipe) {
             variants.push(self.parse_variant_def()?);
         }
@@ -1613,41 +1638,25 @@ impl Parser {
         }))
     }
 
+    fn parse_named_field(&mut self) -> Result<(String, Type), ParseError> {
+        let name = self.expect_ident()?;
+        self.expect(&TokenKind::Colon)?;
+        let typ = self.parse_type()?;
+        Ok((name, typ))
+    }
+
     fn try_parse_record_body(&mut self) -> Result<Vec<(String, Type)>, ParseError> {
-        self.expect(&TokenKind::LBrace)?;
-        let mut fields = Vec::new();
-        if !matches!(self.peek(), TokenKind::RBrace) {
-            let name = self.expect_ident()?;
-            self.expect(&TokenKind::Colon)?;
-            let typ = self.parse_type()?;
-            fields.push((name, typ));
-            while self.match_token(&TokenKind::Comma) {
-                if matches!(self.peek(), TokenKind::RBrace) {
-                    break;
-                }
-                let name = self.expect_ident()?;
-                self.expect(&TokenKind::Colon)?;
-                let typ = self.parse_type()?;
-                fields.push((name, typ));
-            }
-        }
-        self.expect(&TokenKind::RBrace)?;
-        Ok(fields)
+        self.parse_delimited_list(&TokenKind::LBrace, &TokenKind::RBrace, Self::parse_named_field)
     }
 
     fn parse_variant_def(&mut self) -> Result<VariantDef, ParseError> {
         let name = self.expect_ident()?;
         let fields = if matches!(self.peek(), TokenKind::LParen) {
-            self.advance();
-            let mut fields = Vec::new();
-            if !matches!(self.peek(), TokenKind::RParen) {
-                fields.push(self.parse_variant_field()?);
-                while self.match_token(&TokenKind::Comma) {
-                    fields.push(self.parse_variant_field()?);
-                }
-            }
-            self.expect(&TokenKind::RParen)?;
-            fields
+            self.parse_delimited_list(
+                &TokenKind::LParen,
+                &TokenKind::RParen,
+                Self::parse_variant_field,
+            )?
         } else {
             vec![]
         };
@@ -1655,43 +1664,24 @@ impl Parser {
     }
 
     fn parse_variant_field(&mut self) -> Result<(Option<String>, Type), ParseError> {
-        // Try labeled: ident : type
-        let saved = self.pos;
-        if let Ok(name) = self.expect_ident() {
-            if self.match_token(&TokenKind::Colon) {
-                let typ = self.parse_type()?;
-                return Ok((Some(name), typ));
-            }
-        }
-        self.pos = saved;
-        let typ = self.parse_type()?;
-        Ok((None, typ))
+        self.parse_optional_labeled(Self::parse_type)
     }
 
     fn parse_exception_def(&mut self, is_public: bool) -> Result<TopLevel, ParseError> {
         self.expect(&TokenKind::Exception)?;
         let name = self.expect_ident()?;
-        if !name
-            .chars()
-            .next()
-            .map_or(false, |c| c.is_ascii_uppercase())
-        {
+        if !Self::is_uppercase_ident(&name) {
             return Err(ParseError {
                 message: "exception constructor must start with uppercase letter".to_string(),
                 span: self.tokens[self.pos - 1].span.clone(),
             });
         }
         let fields = if matches!(self.peek(), TokenKind::LParen) {
-            self.advance();
-            let mut fields = Vec::new();
-            if !matches!(self.peek(), TokenKind::RParen) {
-                fields.push(self.parse_variant_field()?);
-                while self.match_token(&TokenKind::Comma) {
-                    fields.push(self.parse_variant_field()?);
-                }
-            }
-            self.expect(&TokenKind::RParen)?;
-            fields
+            self.parse_delimited_list(
+                &TokenKind::LParen,
+                &TokenKind::RParen,
+                Self::parse_variant_field,
+            )?
         } else {
             vec![]
         };
@@ -1720,18 +1710,11 @@ impl Parser {
             // import { items } from path
             // import { items }, * as alias from path
             TokenKind::LBrace => {
-                self.advance();
-                let mut items = Vec::new();
-                if !matches!(self.peek(), TokenKind::RBrace) {
-                    items.push(self.expect_ident()?);
-                    while self.match_token(&TokenKind::Comma) {
-                        if matches!(self.peek(), TokenKind::RBrace) {
-                            break;
-                        }
-                        items.push(self.expect_ident()?);
-                    }
-                }
-                self.expect(&TokenKind::RBrace)?;
+                let items = self.parse_delimited_list(
+                    &TokenKind::LBrace,
+                    &TokenKind::RBrace,
+                    Self::expect_ident,
+                )?;
 
                 // Optional: , * as alias
                 let alias = if self.match_token(&TokenKind::Comma) {
@@ -1876,19 +1859,7 @@ impl Parser {
 
         self.expect(&TokenKind::Colon)?;
 
-        // Optional type params: <T, U>
-        let type_params = if matches!(self.peek(), TokenKind::Lt) {
-            self.advance();
-            let mut params = Vec::new();
-            params.push(self.expect_ident()?);
-            while self.match_token(&TokenKind::Comma) {
-                params.push(self.expect_ident()?);
-            }
-            self.expect(&TokenKind::Gt)?;
-            params
-        } else {
-            vec![]
-        };
+        let type_params = self.parse_type_params()?;
 
         let typ = self.parse_type()?;
         let end = self.tokens[self.pos - 1].span.end;

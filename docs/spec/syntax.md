@@ -309,7 +309,7 @@ end
 |---|---|---|
 | Literal | `1`, `true`, `"hi"` | Matches exact value |
 | Variable | `x`, `~x`, `%x` | Binds with optional sigil |
-| Constructor | `Ok(val: v)`, `None()` | Destructures variant |
+| Constructor | `Ok(val: v)`, `None` | Destructures variant |
 | Record (exact) | `{ x: p1, y: p2 }` | All fields must match |
 | Record (partial) | `{ x: p1, _ }` | `_` must be last; remaining fields ignored |
 | Wildcard | `_` | Matches anything, no binding |

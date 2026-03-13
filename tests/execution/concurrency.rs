@@ -56,7 +56,7 @@ fn test_net_request_method_and_headers_runtime() {
       inject net_mod.system_handler do
         try
           let h = header(name: "X-Test", value: "abc")
-          let hs = Cons(v: h, rest: Nil())
+          let hs = Cons(v: h, rest: Nil)
           let res = Net.request(method: "POST", url: "http://127.0.0.1:1/ping", headers: hs, body: "")
           let _body = response_body(res: res)
           return ()
@@ -80,7 +80,7 @@ fn test_net_request_https_url_is_accepted() {
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
         try
-          let hs = Nil()
+          let hs = Nil
           let res = Net.request(method: "GET", url: "https://127.0.0.1:1/", headers: hs, body: "")
           let _body = response_body(res: res)
           return ()
@@ -105,7 +105,7 @@ fn test_net_request_response_status_and_body_with_request_body() {
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
         try
-          let hs = Cons(v: header(name: "Content-Type", value: "application/x-www-form-urlencoded"), rest: Nil())
+          let hs = Cons(v: header(name: "Content-Type", value: "application/x-www-form-urlencoded"), rest: Nil)
           let res = Net.request(method: "POST", url: "http://127.0.0.1:1/submit", headers: hs, body: "hello=nx")
           let _status = response_status(res: res)
           let _body = response_body(res: res)

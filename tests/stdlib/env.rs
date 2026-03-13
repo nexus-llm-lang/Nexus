@@ -74,7 +74,7 @@ let main = fn () -> unit do
       case Some(val: v) ->
         if v != "mock_value" then raise RuntimeError(val: "expected mock_value") end
         return ()
-      case None() -> raise RuntimeError(val: "expected Some")
+      case None -> raise RuntimeError(val: "expected Some")
     end
   end
 end

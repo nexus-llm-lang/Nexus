@@ -88,7 +88,7 @@ fn test_handler_require_mock_needs_nothing() {
       fn remove_file(path: string) -> unit throws { Exn } do return () end
       fn create_dir_all(path: string) -> unit throws { Exn } do return () end
       fn read_dir(path: string) -> %[ Handle ] throws { Exn } do
-        let empty = Nil()
+        let empty = Nil
         let %result = empty
         return %result
       end

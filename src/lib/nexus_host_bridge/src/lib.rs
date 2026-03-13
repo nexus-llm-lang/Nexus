@@ -168,13 +168,18 @@ fn perform_request(
         .set_path_with_query(Some(&path))
         .map_err(|_| "invalid path".to_string())?;
 
-    if let Ok(out_body) = request.body() {
-        if let Ok(stream) = out_body.write() {
-            let _ = stream.blocking_write_and_flush(body.as_bytes());
-            drop(stream);
-        }
-        let _ = OutgoingBody::finish(out_body, None);
-    }
+    let out_body = request
+        .body()
+        .map_err(|_| "failed to get request body handle".to_string())?;
+    let stream = out_body
+        .write()
+        .map_err(|_| "failed to get body write stream".to_string())?;
+    stream
+        .blocking_write_and_flush(body.as_bytes())
+        .map_err(|_| "failed to write request body".to_string())?;
+    drop(stream);
+    OutgoingBody::finish(out_body, None)
+        .map_err(|_| "failed to finalize request body".to_string())?;
 
     let future = outgoing_handler::handle(request, None).map_err(|e| format!("{:?}", e))?;
     let pollable = future.subscribe();
@@ -377,7 +382,9 @@ fn read_http_request(
             let name = name.trim();
             let value = value.trim();
             if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse().unwrap_or(0);
+                content_length = value
+                    .parse()
+                    .map_err(|_| format!("invalid Content-Length header: '{}'", value))?;
             }
             headers_out.push_str(name);
             headers_out.push(':');
@@ -495,7 +502,11 @@ impl bindings::exports::nexus::cli::nexus_host::Guest for Guest {
     fn host_http_listen(addr: String) -> i64 {
         match do_listen(&addr) {
             Ok(id) => id,
-            Err(_) => -1,
+            Err(_e) => {
+                // Error details are not propagable via i64 return;
+                // the caller (stdlib) checks for -1 as failure sentinel
+                -1
+            }
         }
     }
 

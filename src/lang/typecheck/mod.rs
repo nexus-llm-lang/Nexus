@@ -1001,6 +1001,23 @@ impl TypeChecker {
                     };
                     self.infer_body(body, env, er, &injected_eq, ee)?;
                 }
+                Stmt::LetPattern { pattern, value } => {
+                    let (s1, t1) = self.infer(env, value, er, eq, ee)?;
+                    env.apply(&s1);
+                    let t1 = default_numeric_literals(&apply_subst_type(&s1, &t1));
+                    // Reuse match exhaustiveness check with a single-case match
+                    let dummy_case = MatchCase {
+                        pattern: pattern.clone(),
+                        body: vec![],
+                    };
+                    self.check_exhaustiveness(env, &t1, &[dummy_case])
+                        .map_err(|m| TypeError {
+                            message: format!("Non-exhaustive destructuring pattern: {}", m),
+                            span: pattern.span.clone(),
+                        })?;
+                    let sp = self.bind_pattern(pattern, &t1, env)?;
+                    env.apply(&sp);
+                }
             }
         }
         Ok(())
@@ -1088,6 +1105,7 @@ impl TypeChecker {
                     Literal::Int(_) => Type::IntLit,
                     Literal::Float(_) => Type::FloatLit,
                     Literal::Bool(_) => Type::Bool,
+                    Literal::Char(_) => Type::Char,
                     Literal::String(_) => Type::String,
                     Literal::Unit => Type::Unit,
                 },
@@ -1193,10 +1211,12 @@ impl TypeChecker {
                     BinaryOp::Eq | BinaryOp::Ne => {
                         let lt = apply_subst_type(&s, &t1);
                         let rt = apply_subst_type(&s, &t2);
-                        // Eq/Ne work on int, string, and bool
+                        // Eq/Ne work on int, char, string, and bool
                         let target = select_int_type(&lt, &rt)
                             .or_else(|| {
-                                if matches!((&lt, &rt), (Type::String, Type::String)) {
+                                if matches!((&lt, &rt), (Type::Char, Type::Char)) {
+                                    Some(Type::Char)
+                                } else if matches!((&lt, &rt), (Type::String, Type::String)) {
                                     Some(Type::String)
                                 } else if matches!((&lt, &rt), (Type::Bool, Type::Bool)) {
                                     Some(Type::Bool)
@@ -1232,9 +1252,17 @@ impl TypeChecker {
                     | BinaryOp::Ge => {
                         let lt = apply_subst_type(&s, &t1);
                         let rt = apply_subst_type(&s, &t2);
-                        let target = select_int_type(&lt, &rt).ok_or_else(|| TypeError {
+                        let target = select_int_type(&lt, &rt)
+                            .or_else(|| {
+                                if matches!((&lt, &rt), (Type::Char, Type::Char)) {
+                                    Some(Type::Char)
+                                } else {
+                                    None
+                                }
+                            })
+                            .ok_or_else(|| TypeError {
                             message: format!(
-                                "Integer comparison expects i32/i64, got {} and {}",
+                                "Ordered comparison expects i32/i64/char, got {} and {}",
                                 lt, rt
                             ),
                             span: e.span.clone(),
@@ -2176,6 +2204,7 @@ impl TypeChecker {
                     Literal::Int(_) => Type::IntLit,
                     Literal::Float(_) => Type::FloatLit,
                     Literal::Bool(_) => Type::Bool,
+                    Literal::Char(_) => Type::Char,
                     Literal::String(_) => Type::String,
                     Literal::Unit => Type::Unit,
                 };

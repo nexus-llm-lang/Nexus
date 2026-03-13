@@ -66,7 +66,7 @@ end
 
 match opt do
   case Some(val: v) -> return v
-  case None() -> return 0
+  case None -> return 0
 end
 
 while running do
@@ -86,7 +86,7 @@ pub let map = fn <T, U>(opt: Option<T>, f: (val: T) -> U) -> Option<U> do
     case Some(val: v) ->
       let mapped = f(val: v)
       return Some(val: mapped)
-    case None() -> return None()
+    case None -> return None
   end
 end
 ```
@@ -107,18 +107,6 @@ let v = ~x                      // dereference
 let double = fn (n: i64) -> i64 do
   return n * 2
 end
-```
-
-### 6. Empty constructor parentheses required
-```nexus
-// CORRECT
-None()
-Nil()
-Some(val: 42)
-
-// WRONG — missing parentheses
-None
-Nil
 ```
 
 ## Effect System (Ports & Handlers)
@@ -222,7 +210,7 @@ import as list from stdlib/list.nx
 
 let sum = fn (xs: [ i64 ]) -> i64 do
   match xs do
-    case Nil() -> return 0
+    case Nil -> return 0
     case Cons(v: v, rest: rest) -> return v + sum(xs: rest)
   end
 end
@@ -255,7 +243,6 @@ end
 |-------|-------------|
 | Positional arguments: `f(1, 2)` | Labeled: `f(a: 1, b: 2)` |
 | Brace blocks: `{ ... }` | `do ... end` / `then ... end` |
-| `None` without parens | `None()` |
 | `return` omitted | Always write explicit `return` |
 | Capturing `~x` in closure | Only immutable bindings captured |
 | `let _ = linear_val` | Consume linear values via function call or pattern match |
