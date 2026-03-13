@@ -22,11 +22,11 @@ The module's exports become available for binding.
 Bind a WASM export to a Nexus name:
 
 ```nexus
-pub external add_ints = "add" : (a: i64, b: i64) -> i64
+export external add_ints = "add" : (a: i64, b: i64) -> i64
 external internal_helper = "helper" : (x: i64) -> unit
 ```
 
-- `pub` makes the binding visible to other modules
+- `export` makes the binding visible to other modules
 - The string literal after `=` is the WASM export name
 - The type after `:` must be an arrow type
 
@@ -35,7 +35,7 @@ external internal_helper = "helper" : (x: i64) -> unit
 Polymorphic externals require explicit type parameters:
 
 ```nexus
-pub external length = "array_length" : <T>(arr: &[| T |]) -> i64
+export external length = "array_length" : <T>(arr: &[| T |]) -> i64
 ```
 
 Using an undeclared type variable (e.g., `T` without `<T>`) is a type error. This prevents typos from silently becoming type variables.

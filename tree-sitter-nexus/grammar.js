@@ -77,7 +77,7 @@ module.exports = grammar({
     // [pub] [opaque] type Name[<T>] = A(label: T) | B
     type_def: ($) =>
       seq(
-        optional("pub"),
+        optional("export"),
         optional("opaque"),
         "type",
         field("name", $.uident),
@@ -105,7 +105,7 @@ module.exports = grammar({
     // [pub] exception NotFound(msg: string)
     exception_def: ($) =>
       seq(
-        optional("pub"),
+        optional("export"),
         "exception",
         field("name", $.uident),
         optional(seq("(", commaSep1($.variant_field), ")"))
@@ -156,7 +156,7 @@ module.exports = grammar({
     // [pub] port Name do fn sig ... end
     port_def: ($) =>
       seq(
-        optional("pub"),
+        optional("export"),
         "port",
         field("name", $.uident),
         "do",
@@ -194,7 +194,7 @@ module.exports = grammar({
     // [pub] let [sigil] name [: type] = expr
     let_def: ($) =>
       seq(
-        optional("pub"),
+        optional("export"),
         "let",
         optional(field("sigil", $.sigil)),
         field("name", $.identifier),
@@ -628,7 +628,7 @@ module.exports = grammar({
     // [pub] external name = [=[wasm_symbol]=] : [<T>] arrow_type
     external_def: ($) =>
       seq(
-        optional("pub"),
+        optional("export"),
         "external",
         field("name", $.identifier),
         "=",
