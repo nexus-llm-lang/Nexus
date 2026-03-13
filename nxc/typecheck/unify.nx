@@ -1,0 +1,373 @@
+/**
+ * typecheck/unify: Robinson unification for Nexus types.
+ *
+ * Handles all TypeExpr variants including numeric literal promotion,
+ * cross-unification of List<T> with UserDefined("List", [T]),
+ * and simplified row unification.
+ */
+
+import {
+  TypeExpr, TyI32, TyI64, TyF32, TyF64, TyBool, TyChar, TyString, TyUnit,
+  TyIntLit, TyFloatLit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear, TyBorrow,
+  TyArray, TyList, TyRecord, TyRow, TyHandler, NamedType
+} from nxc/common/ast.nx
+import {
+  SubstEntry, UnifyResult, UnifyOk, UnifyErr, CheckState, TypeDefEntry
+} from nxc/typecheck/types.nx
+import {
+  subst_empty, subst_single, subst_apply, subst_compose, type_eq,
+  type_list_eq, occurs_check
+} from nxc/typecheck/subst.nx
+import { typedef_lookup } from nxc/typecheck/types.nx
+import { from_i64 } from stdlib/string.nx
+
+// ─── Main unification ───────────────────────────────────────────────────────
+
+export let unify = fn (t1: TypeExpr, t2: TypeExpr, tdefs: [TypeDefEntry]) -> UnifyResult do
+  // Identical types
+  if type_eq(a: t1, b: t2) then
+    return UnifyOk(subst: subst_empty())
+  end
+
+  // Numeric literal promotion
+  match t1
+    case TyIntLit ->
+      match t2
+        case TyI32 -> return UnifyOk(subst: subst_empty())
+        case TyI64 -> return UnifyOk(subst: subst_empty())
+        case TyIntLit -> return UnifyOk(subst: subst_empty())
+        case _ -> return UnifyErr(message: "cannot unify int literal with non-integer type")
+      end
+    case TyFloatLit ->
+      match t2
+        case TyF32 -> return UnifyOk(subst: subst_empty())
+        case TyF64 -> return UnifyOk(subst: subst_empty())
+        case TyFloatLit -> return UnifyOk(subst: subst_empty())
+        case _ -> return UnifyErr(message: "cannot unify float literal with non-float type")
+      end
+    case _ -> return ()
+  end
+  match t2
+    case TyIntLit ->
+      match t1
+        case TyI32 -> return UnifyOk(subst: subst_empty())
+        case TyI64 -> return UnifyOk(subst: subst_empty())
+        case _ -> return UnifyErr(message: "cannot unify int literal with non-integer type")
+      end
+    case TyFloatLit ->
+      match t1
+        case TyF32 -> return UnifyOk(subst: subst_empty())
+        case TyF64 -> return UnifyOk(subst: subst_empty())
+        case _ -> return UnifyErr(message: "cannot unify float literal with non-float type")
+      end
+    case _ -> return ()
+  end
+
+  // Type variable binding
+  match t1
+    case TyVar(name: n) ->
+      if occurs_check(var: n, typ: t2) then
+        return UnifyErr(message: "recursive type: " ++ n)
+      end
+      return UnifyOk(subst: subst_single(var: n, typ: t2))
+    case _ -> return ()
+  end
+  match t2
+    case TyVar(name: n) ->
+      if occurs_check(var: n, typ: t1) then
+        return UnifyErr(message: "recursive type: " ++ n)
+      end
+      return UnifyOk(subst: subst_single(var: n, typ: t1))
+    case _ -> return ()
+  end
+
+  // Arrow types
+  match t1
+    case TyArrow(params: p1, ret: r1, requires: req1, throw_row: thr1) ->
+      match t2
+        case TyArrow(params: p2, ret: r2, requires: req2, throw_row: thr2) ->
+          return unify_arrow(p1: p1, p2: p2, r1: r1, r2: r2, req1: req1, req2: req2, thr1: thr1, thr2: thr2, tdefs: tdefs)
+        case _ -> return UnifyErr(message: "expected arrow type")
+      end
+    case _ -> return ()
+  end
+
+  // UserDefined types
+  match t1
+    case TyUserDefined(name: n1, args: a1) ->
+      match t2
+        case TyUserDefined(name: n2, args: a2) ->
+          if n1 == n2 then
+            return unify_type_lists(ts1: a1, ts2: a2, tdefs: tdefs)
+          end
+          return UnifyErr(message: "type mismatch: " ++ n1 ++ " vs " ++ n2)
+        // Cross-unify UserDefined("List", [T]) with TyList(T)
+        case TyList(elem: inner) ->
+          if n1 == "List" then
+            match a1
+              case Cons(v: arg, rest: Nil) ->
+                return unify(t1: arg, t2: inner, tdefs: tdefs)
+              case _ -> return UnifyErr(message: "List type arity mismatch")
+            end
+          end
+          return UnifyErr(message: "cannot unify " ++ n1 ++ " with list")
+        // Cross-unify UserDefined with Record (expand typedef)
+        case TyRecord(fields: _) ->
+          return unify_typedef_record(name: n1, args: a1, record: t2, tdefs: tdefs)
+        case _ -> return UnifyErr(message: "type mismatch: user-defined vs other")
+      end
+    case _ -> return ()
+  end
+
+  // List cross-unify
+  match t1
+    case TyList(elem: inner) ->
+      match t2
+        case TyList(elem: inner2) -> return unify(t1: inner, t2: inner2, tdefs: tdefs)
+        case TyUserDefined(name: n, args: args) ->
+          if n == "List" then
+            match args
+              case Cons(v: arg, rest: Nil) ->
+                return unify(t1: inner, t2: arg, tdefs: tdefs)
+              case _ -> return UnifyErr(message: "List type arity mismatch")
+            end
+          end
+          return UnifyErr(message: "cannot unify list with " ++ n)
+        case _ -> return UnifyErr(message: "expected list type")
+      end
+    case _ -> return ()
+  end
+
+  // Array
+  match t1
+    case TyArray(elem: e1) ->
+      match t2
+        case TyArray(elem: e2) -> return unify(t1: e1, t2: e2, tdefs: tdefs)
+        case _ -> return UnifyErr(message: "expected array type")
+      end
+    case _ -> return ()
+  end
+
+  // Record
+  match t1
+    case TyRecord(fields: f1) ->
+      match t2
+        case TyRecord(fields: f2) -> return unify_named_types(nts1: f1, nts2: f2, tdefs: tdefs)
+        case TyUserDefined(name: n, args: args) ->
+          return unify_typedef_record(name: n, args: args, record: t1, tdefs: tdefs)
+        case _ -> return UnifyErr(message: "expected record type")
+      end
+    case _ -> return ()
+  end
+
+  // Ref / Linear / Borrow
+  match t1
+    case TyRef(inner: i1) ->
+      match t2
+        case TyRef(inner: i2) -> return unify(t1: i1, t2: i2, tdefs: tdefs)
+        case _ -> return UnifyErr(message: "expected ref type")
+      end
+    case TyLinear(inner: i1) ->
+      match t2
+        case TyLinear(inner: i2) -> return unify(t1: i1, t2: i2, tdefs: tdefs)
+        case _ -> return UnifyErr(message: "expected linear type")
+      end
+    case TyBorrow(inner: i1) ->
+      match t2
+        // Borrow unifies with its underlying type (read-only access)
+        case TyBorrow(inner: i2) -> return unify(t1: i1, t2: i2, tdefs: tdefs)
+        case _ -> return unify(t1: i1, t2: t2, tdefs: tdefs)
+      end
+    case _ -> return ()
+  end
+
+  // Row types (simplified)
+  match t1
+    case TyRow(types: ts1, rest: r1) ->
+      match t2
+        case TyRow(types: ts2, rest: r2) ->
+          return unify_rows(ts1: ts1, r1: r1, ts2: ts2, r2: r2, tdefs: tdefs)
+        case _ -> return UnifyErr(message: "expected row type")
+      end
+    case _ -> return ()
+  end
+
+  // Handler
+  match t1
+    case TyHandler(name: n1, requires: req1) ->
+      match t2
+        case TyHandler(name: n2, requires: req2) ->
+          if n1 == n2 then
+            return unify(t1: req1, t2: req2, tdefs: tdefs)
+          end
+          return UnifyErr(message: "handler mismatch: " ++ n1 ++ " vs " ++ n2)
+        case _ -> return UnifyErr(message: "expected handler type")
+      end
+    case _ -> return ()
+  end
+
+  return UnifyErr(message: "type mismatch")
+end
+
+// ─── Arrow unification ──────────────────────────────────────────────────────
+
+let unify_arrow = fn (
+  p1: [NamedType], p2: [NamedType],
+  r1: TypeExpr, r2: TypeExpr,
+  req1: TypeExpr, req2: TypeExpr,
+  thr1: TypeExpr, thr2: TypeExpr,
+  tdefs: [TypeDefEntry]
+) -> UnifyResult do
+  match unify_named_types(nts1: p1, nts2: p2, tdefs: tdefs)
+    case UnifyErr(message: m) -> return UnifyErr(message: m)
+    case UnifyOk(subst: s1) ->
+      match unify(t1: subst_apply(subst: s1, typ: r1), t2: subst_apply(subst: s1, typ: r2), tdefs: tdefs)
+        case UnifyErr(message: m) -> return UnifyErr(message: m)
+        case UnifyOk(subst: s2) ->
+          let s12 = subst_compose(s1: s1, s2: s2)
+          match unify(t1: subst_apply(subst: s12, typ: req1), t2: subst_apply(subst: s12, typ: req2), tdefs: tdefs)
+            case UnifyErr(message: m) -> return UnifyErr(message: m)
+            case UnifyOk(subst: s3) ->
+              let s123 = subst_compose(s1: s12, s2: s3)
+              match unify(t1: subst_apply(subst: s123, typ: thr1), t2: subst_apply(subst: s123, typ: thr2), tdefs: tdefs)
+                case UnifyErr(message: m) -> return UnifyErr(message: m)
+                case UnifyOk(subst: s4) ->
+                  return UnifyOk(subst: subst_compose(s1: s123, s2: s4))
+              end
+          end
+      end
+  end
+end
+
+// ─── Named type list unification (params, record fields) ────────────────────
+
+let unify_named_types = fn (nts1: [NamedType], nts2: [NamedType], tdefs: [TypeDefEntry]) -> UnifyResult do
+  match nts1
+    case Nil ->
+      match nts2
+        case Nil -> return UnifyOk(subst: subst_empty())
+        case _ -> return UnifyErr(message: "arity mismatch")
+      end
+    case Cons(v: NamedType(name: n1, typ: t1), rest: r1) ->
+      match nts2
+        case Nil -> return UnifyErr(message: "arity mismatch")
+        case Cons(v: NamedType(name: n2, typ: t2), rest: r2) ->
+          match unify(t1: t1, t2: t2, tdefs: tdefs)
+            case UnifyErr(message: m) -> return UnifyErr(message: "field " ++ n1 ++ ": " ++ m)
+            case UnifyOk(subst: s1) ->
+              let r1a = apply_subst_named_types(subst: s1, nts: r1)
+              let r2a = apply_subst_named_types(subst: s1, nts: r2)
+              match unify_named_types(nts1: r1a, nts2: r2a, tdefs: tdefs)
+                case UnifyErr(message: m) -> return UnifyErr(message: m)
+                case UnifyOk(subst: s2) ->
+                  return UnifyOk(subst: subst_compose(s1: s1, s2: s2))
+              end
+          end
+      end
+  end
+end
+
+let apply_subst_named_types = fn (subst: [SubstEntry], nts: [NamedType]) -> [NamedType] do
+  match nts
+    case Nil -> return Nil
+    case Cons(v: NamedType(name: n, typ: t), rest: rest) ->
+      return Cons(
+        v: NamedType(name: n, typ: subst_apply(subst: subst, typ: t)),
+        rest: apply_subst_named_types(subst: subst, nts: rest)
+      )
+  end
+end
+
+// ─── Type list unification ──────────────────────────────────────────────────
+
+let unify_type_lists = fn (ts1: [TypeExpr], ts2: [TypeExpr], tdefs: [TypeDefEntry]) -> UnifyResult do
+  match ts1
+    case Nil ->
+      match ts2
+        case Nil -> return UnifyOk(subst: subst_empty())
+        case _ -> return UnifyErr(message: "type argument arity mismatch")
+      end
+    case Cons(v: h1, rest: r1) ->
+      match ts2
+        case Nil -> return UnifyErr(message: "type argument arity mismatch")
+        case Cons(v: h2, rest: r2) ->
+          match unify(t1: h1, t2: h2, tdefs: tdefs)
+            case UnifyErr(message: m) -> return UnifyErr(message: m)
+            case UnifyOk(subst: s1) ->
+              let r1a = apply_subst_type_list(subst: s1, types: r1)
+              let r2a = apply_subst_type_list(subst: s1, types: r2)
+              match unify_type_lists(ts1: r1a, ts2: r2a, tdefs: tdefs)
+                case UnifyErr(message: m) -> return UnifyErr(message: m)
+                case UnifyOk(subst: s2) ->
+                  return UnifyOk(subst: subst_compose(s1: s1, s2: s2))
+              end
+          end
+      end
+  end
+end
+
+let apply_subst_type_list = fn (subst: [SubstEntry], types: [TypeExpr]) -> [TypeExpr] do
+  match types
+    case Nil -> return Nil
+    case Cons(v: t, rest: rest) ->
+      return Cons(
+        v: subst_apply(subst: subst, typ: t),
+        rest: apply_subst_type_list(subst: subst, types: rest)
+      )
+  end
+end
+
+// ─── Row unification (simplified) ───────────────────────────────────────────
+
+let unify_rows = fn (
+  ts1: [TypeExpr], r1: Option<TypeExpr>,
+  ts2: [TypeExpr], r2: Option<TypeExpr>,
+  tdefs: [TypeDefEntry]
+) -> UnifyResult do
+  // Simplified: just unify the heads pairwise, then tails
+  match unify_type_lists(ts1: ts1, ts2: ts2, tdefs: tdefs)
+    case UnifyErr(message: m) -> return UnifyErr(message: "row: " ++ m)
+    case UnifyOk(subst: s1) ->
+      match r1
+        case Some(val: tail1) ->
+          match r2
+            case Some(val: tail2) ->
+              match unify(t1: subst_apply(subst: s1, typ: tail1), t2: subst_apply(subst: s1, typ: tail2), tdefs: tdefs)
+                case UnifyErr(message: m) -> return UnifyErr(message: "row tail: " ++ m)
+                case UnifyOk(subst: s2) -> return UnifyOk(subst: subst_compose(s1: s1, s2: s2))
+              end
+            case None -> return UnifyOk(subst: s1)
+          end
+        case None -> return UnifyOk(subst: s1)
+      end
+  end
+end
+
+// ─── TypeDef expansion for structural record unification ────────────────────
+
+let unify_typedef_record = fn (name: string, args: [TypeExpr], record: TypeExpr, tdefs: [TypeDefEntry]) -> UnifyResult do
+  match typedef_lookup(defs: tdefs, name: name)
+    case Some(val: RecordDef(name: _, is_public: _, type_params: tps, fields: fields)) ->
+      let param_subst = build_param_subst(params: tps, args: args)
+      let expanded_fields = apply_subst_named_types(subst: param_subst, nts: fields)
+      let expanded = TyRecord(fields: expanded_fields)
+      return unify(t1: record, t2: expanded, tdefs: tdefs)
+    case None ->
+      return UnifyErr(message: "unknown type definition: " ++ name)
+  end
+end
+
+let build_param_subst = fn (params: [string], args: [TypeExpr]) -> [SubstEntry] do
+  match params
+    case Nil -> return Nil
+    case Cons(v: p, rest: rp) ->
+      match args
+        case Nil -> return Nil
+        case Cons(v: a, rest: ra) ->
+          return Cons(
+            v: SubstEntry(var: p, typ: a),
+            rest: build_param_subst(params: rp, args: ra)
+          )
+      end
+  end
+end
