@@ -7,6 +7,9 @@ pub mod typecheck;
 // Re-export convenience functions for concise test code.
 pub use builder::TestRunner;
 pub use compile::{compile, try_compile};
-pub use execute::{exec, exec_should_trap, exec_with_stdlib};
+pub use execute::{
+    exec, exec_should_trap, exec_with_stdlib, exec_with_stdlib_caps,
+    exec_with_stdlib_caps_should_trap, exec_with_stdlib_should_trap,
+};
 pub use fixture::{read_fixture, TempDir};
 pub use typecheck::{should_fail_parse, should_fail_typecheck, should_typecheck, typecheck_warnings};
