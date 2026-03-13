@@ -206,7 +206,7 @@ end
 
 ### List Recursion
 ```nexus
-import as list from stdlib/list.nx
+import * as list from stdlib/list.nx
 
 let sum = fn (xs: [ i64 ]) -> i64 do
   match xs do

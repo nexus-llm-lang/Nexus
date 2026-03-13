@@ -1732,9 +1732,10 @@ impl Parser {
                     is_external: false,
                 }))
             }
-            // import as alias from path
-            TokenKind::Ident(ref s) if s == "as" => {
+            // import * as alias from path
+            TokenKind::Star => {
                 self.advance();
+                self.expect_contextual("as")?;
                 let alias = self.expect_ident()?;
                 self.expect(&TokenKind::From)?;
                 let path = self.parse_import_path()?;

@@ -143,7 +143,7 @@ end
 #[test]
 fn codegen_conc_fs_writes_in_parallel() {
     let src = r#"
-import as fs from stdlib/fs.nx
+import * as fs from stdlib/fs.nx
 
 let main = fn () -> unit require { PermFs } do
     conc do
