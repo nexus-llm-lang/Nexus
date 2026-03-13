@@ -108,6 +108,9 @@ impl ReplState {
         let mut linker = Linker::<wasmtime_wasi::p1::WasiP1Ctx>::new(&self.engine);
         wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx)
             .map_err(|e| format!("WASI link error: {e}"))?;
+        self.capabilities
+            .enforce_denied_wasi_functions(&mut linker)
+            .map_err(|e| format!("WASI capability enforcement error: {e}"))?;
 
         // stdlib.wasm is monolithic and imports nexus:cli/nexus-host for net FFI.
         // Add no-op stubs so instantiation succeeds even when net isn't used.

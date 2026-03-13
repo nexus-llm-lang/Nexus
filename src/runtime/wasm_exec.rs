@@ -184,6 +184,10 @@ fn run_core_wasm_bytes_inner(
         eprintln!("Failed to add WASI to linker: {}", e);
         return ExitCode::from(1);
     }
+    if let Err(msg) = capabilities.enforce_denied_wasi_functions(&mut linker) {
+        eprintln!("Failed to enforce WASI capability policy: {}", msg);
+        return ExitCode::from(1);
+    }
     if has_conc {
         if let Err(e) = conc::add_conc_to_linker(&mut linker) {
             eprintln!("Failed to add conc runtime to linker: {}", e);

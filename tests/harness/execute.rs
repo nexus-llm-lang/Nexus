@@ -72,6 +72,34 @@ pub fn run_main(wasm: &[u8]) -> Result<(), String> {
     main.call(&mut store, ()).map_err(|e| e.to_string())
 }
 
+/// Compile and execute main() with stdlib, expecting a trap. Returns the trap message.
+pub fn exec_with_stdlib_should_trap(src: &str) -> String {
+    let wasm = super::compile::compile(src);
+    match run_main_with_deps(&wasm) {
+        Ok(()) => panic!("expected trap but main returned successfully"),
+        Err(msg) => msg,
+    }
+}
+
+/// Compile and execute main() with stdlib and specific capabilities.
+/// Panics if main traps or compilation fails.
+pub fn exec_with_stdlib_caps(src: &str, caps: nexus::runtime::ExecutionCapabilities) {
+    let wasm = super::compile::compile(src);
+    run_main_with_deps_caps(&wasm, caps).unwrap_or_else(|e| panic!("execution failed: {}", e));
+}
+
+/// Compile and execute main() with stdlib and specific capabilities, expecting a trap.
+pub fn exec_with_stdlib_caps_should_trap(
+    src: &str,
+    caps: nexus::runtime::ExecutionCapabilities,
+) -> String {
+    let wasm = super::compile::compile(src);
+    match run_main_with_deps_caps(&wasm, caps) {
+        Ok(()) => panic!("expected trap but main returned successfully"),
+        Err(msg) => msg,
+    }
+}
+
 /// Execute main() -> () with WASI P1, stdlib dependency resolution, and conc runtime.
 pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
     let engine = Engine::default();
@@ -125,6 +153,75 @@ pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
             wasm,
             deps,
             nexus::runtime::ExecutionCapabilities::permissive_legacy(),
+        );
+    }
+
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(|e| e.to_string())?;
+    let main = instance
+        .get_typed_func::<(), ()>(&mut store, "main")
+        .map_err(|e| e.to_string())?;
+    main.call(&mut store, ()).map_err(|e| e.to_string())
+}
+
+/// Execute main() -> () with WASI P1, stdlib, and custom capability enforcement.
+pub fn run_main_with_deps_caps(
+    wasm: &[u8],
+    caps: nexus::runtime::ExecutionCapabilities,
+) -> Result<(), String> {
+    let engine = Engine::default();
+    let module = Module::from_binary(&engine, wasm).map_err(|e| format!("{:#}", e))?;
+    let has_conc = conc::needs_conc_runtime(wasm);
+
+    let mut linker = Linker::new(&engine);
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx).map_err(|e| e.to_string())?;
+    caps.enforce_denied_wasi_functions(&mut linker)?;
+    define_nexus_host_stubs(&mut linker)?;
+    if has_conc {
+        conc::add_conc_to_linker(&mut linker)?;
+    }
+    backtrace::reset();
+    backtrace::add_bt_to_linker(&mut linker)?;
+
+    let mut builder = WasiCtxBuilder::new();
+    builder.inherit_stdio();
+    let _ = builder.preopened_dir(".", "/", DirPerms::all(), FilePerms::all());
+    let wasi = builder.build_p1();
+    let mut store = Store::new(&engine, wasi);
+
+    let mut imported_modules = module
+        .imports()
+        .map(|i| i.module().to_string())
+        .collect::<Vec<_>>();
+    imported_modules.sort();
+    imported_modules.dedup();
+
+    let mut deps = Vec::new();
+    for module_name in imported_modules {
+        if module_name == "wasi_snapshot_preview1"
+            || module_name == conc::CONC_HOST_MODULE
+            || module_name == backtrace::BT_HOST_MODULE
+            || module_name == "nexus:cli/nexus-host"
+        {
+            continue;
+        }
+        let resolved = resolve_import_path(&module_name);
+        let path = PathBuf::from(&resolved);
+        let dep = Arc::new(Module::from_file(&engine, &path).map_err(|e| e.to_string())?);
+        linker
+            .module(&mut store, &module_name, &*dep)
+            .map_err(|e| e.to_string())?;
+        deps.push((module_name.clone(), dep));
+    }
+
+    if has_conc {
+        conc::setup_conc_runtime(
+            engine.clone(),
+            Arc::new(module.clone()),
+            wasm,
+            deps,
+            caps,
         );
     }
 

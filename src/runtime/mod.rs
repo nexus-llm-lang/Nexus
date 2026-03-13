@@ -1,6 +1,8 @@
-use crate::constants::{Permission, NEXUS_CAPABILITIES_SECTION};
+use crate::constants::{Permission, NEXUS_CAPABILITIES_SECTION, WASI_SNAPSHOT_MODULE};
 use crate::types::Type;
 use std::path::PathBuf;
+use wasmtime::Linker;
+use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 pub mod backtrace;
@@ -186,6 +188,54 @@ impl ExecutionCapabilities {
                     )
                 })?;
         }
+        Ok(())
+    }
+
+    /// Overrides WASI P1 linker functions with trapping stubs for denied capabilities.
+    /// Must be called after `wasmtime_wasi::p1::add_to_linker_sync`.
+    pub fn enforce_denied_wasi_functions(
+        &self,
+        linker: &mut Linker<WasiP1Ctx>,
+    ) -> Result<(), String> {
+        linker.allow_shadowing(true);
+
+        if !self.allow_clock {
+            linker
+                .func_wrap(
+                    WASI_SNAPSHOT_MODULE,
+                    "clock_res_get",
+                    |_id: i32, _result_ptr: i32| -> i32 {
+                        eprintln!("Clock access denied: --allow-clock not specified");
+                        76 // ENOSYS
+                    },
+                )
+                .map_err(|e| format!("failed to override clock_res_get: {e}"))?;
+            linker
+                .func_wrap(
+                    WASI_SNAPSHOT_MODULE,
+                    "clock_time_get",
+                    |_id: i32, _precision: i64, _result_ptr: i32| -> i32 {
+                        eprintln!("Clock access denied: --allow-clock not specified");
+                        76 // ENOSYS
+                    },
+                )
+                .map_err(|e| format!("failed to override clock_time_get: {e}"))?;
+        }
+
+        if !self.allow_random {
+            linker
+                .func_wrap(
+                    WASI_SNAPSHOT_MODULE,
+                    "random_get",
+                    |_buf: i32, _buf_len: i32| -> i32 {
+                        eprintln!("Random access denied: --allow-random not specified");
+                        76 // ENOSYS
+                    },
+                )
+                .map_err(|e| format!("failed to override random_get: {e}"))?;
+        }
+
+        linker.allow_shadowing(false);
         Ok(())
     }
 }

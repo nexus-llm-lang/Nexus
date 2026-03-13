@@ -1,4 +1,5 @@
-use crate::harness::{exec_with_stdlib, should_fail_typecheck};
+use crate::harness::{exec_with_stdlib, exec_with_stdlib_caps_should_trap, should_fail_typecheck};
+use nexus::runtime::ExecutionCapabilities;
 
 #[test]
 fn clock_now_returns_positive_value() {
@@ -30,6 +31,35 @@ let main = fn () -> unit require { PermClock } do
   end
 end
 "#,
+    );
+}
+
+#[test]
+fn clock_denied_at_wasi_level_without_allow_clock() {
+    let caps = ExecutionCapabilities {
+        allow_console: true,
+        allow_fs: true,
+        ..ExecutionCapabilities::deny_all()
+    };
+    let err = exec_with_stdlib_caps_should_trap(
+        r#"
+import { Clock }, * as clk from stdlib/clock.nx
+
+let main = fn () -> unit require { PermClock } do
+  inject clk.system_handler do
+    let _ = Clock.now()
+    return ()
+  end
+end
+"#,
+        caps,
+    );
+    // The stub returns ENOSYS (errno 76), which the stdlib propagates as a wasm trap.
+    // The eprintln message goes to stderr, not the trap string.
+    assert!(
+        err.contains("error while executing"),
+        "expected wasm trap from denied clock access, got: {}",
+        err
     );
 }
 

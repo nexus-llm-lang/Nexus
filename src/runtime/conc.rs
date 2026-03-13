@@ -235,6 +235,9 @@ fn run_task_thread(
         // Full WASI environment with dependency modules
         let mut linker = Linker::<wasmtime_wasi::p1::WasiP1Ctx>::new(engine);
         wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx)?;
+        capabilities
+            .enforce_denied_wasi_functions(&mut linker)
+            .map_err(wasmtime::Error::msg)?;
         // Conc stubs (tasks don't spawn nested conc blocks)
         linker.func_wrap(
             CONC_HOST_MODULE,
