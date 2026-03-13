@@ -34,6 +34,8 @@ fn resource_program(consume_resource: bool) -> Program {
     body.push(sp(Stmt::Return(sp(Expr::Literal(Literal::Unit)))));
 
     Program {
+        source_file: None,
+        source_text: None,
         definitions: vec![sp(TopLevel::Let(GlobalLet {
             name: "main".to_string(),
             is_public: false,

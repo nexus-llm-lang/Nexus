@@ -86,6 +86,16 @@ pub fn build_hir(program: &Program) -> Result<MirProgram, HirBuildError> {
     builder.build(program)
 }
 
+/// Convert a byte offset to a 1-based line number.
+fn offset_to_line(source: &str, offset: usize) -> u32 {
+    let end = offset.min(source.len());
+    source.as_bytes()[..end]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count() as u32
+        + 1
+}
+
 /// Cached info about an already-processed import module.
 #[derive(Clone)]
 struct ImportCache {
@@ -118,6 +128,8 @@ struct PendingFunction {
     span: Span,
     /// MIR statements prepended before the converted body (e.g., main(args) desugaring)
     preamble: Vec<MirStmt>,
+    source_file: Option<String>,
+    source_line: Option<u32>,
 }
 
 struct MirBuilder {
@@ -139,9 +151,19 @@ struct MirBuilder {
     global_constants: HashMap<String, Literal>,
     /// Functions collected during declaration pass, bodies converted in second pass
     pending_functions: Vec<PendingFunction>,
+    /// Current source file path (set during collect_declarations)
+    current_source_file: Option<String>,
+    /// Current source text (for byte-offset → line-number conversion)
+    current_source_text: Option<String>,
 }
 
 impl MirBuilder {
+    fn source_line_at(&self, span: &Span) -> Option<u32> {
+        self.current_source_text
+            .as_ref()
+            .map(|src| offset_to_line(src, span.start))
+    }
+
     fn new() -> Self {
         MirBuilder {
             port_methods: HashMap::new(),
@@ -155,12 +177,18 @@ impl MirBuilder {
             imported_modules: HashMap::new(),
             global_constants: HashMap::new(),
             pending_functions: Vec::new(),
+            current_source_file: None,
+            current_source_text: None,
         }
     }
 
     fn build(&mut self, program: &Program) -> Result<MirProgram, HirBuildError> {
         // Load stdlib definitions (enums, exceptions, externals)
         self.load_stdlib()?;
+
+        // Set source context for the entry file
+        self.current_source_file = program.source_file.clone();
+        self.current_source_text = program.source_text.clone();
 
         // Pass 1: Collect all declarations (ports, handlers, externals, etc.)
         // Function bodies are stored as pending for the second pass.
@@ -178,6 +206,8 @@ impl MirBuilder {
                 ret_type: pf.ret_type,
                 body,
                 span: pf.span,
+                source_file: pf.source_file,
+                source_line: pf.source_line,
             });
         }
 
@@ -373,6 +403,8 @@ impl MirBuilder {
                                     ret_type: ret_type.clone(),
                                     body: body.clone(),
                                     rename_map: rename_map.clone(),
+                                    source_file: self.current_source_file.clone(),
+                                    source_line: self.source_line_at(&def.span),
                                     span: def.span.clone(),
                                     preamble,
                                 });
@@ -392,6 +424,8 @@ impl MirBuilder {
                                     ret_type: ret_type.clone(),
                                     body: body.clone(),
                                     rename_map: rename_map.clone(),
+                                    source_file: self.current_source_file.clone(),
+                                    source_line: self.source_line_at(&def.span),
                                     span: def.span.clone(),
                                     preamble: vec![],
                                 });
@@ -445,6 +479,8 @@ impl MirBuilder {
                                     ret_type: hf.ret_type.clone(),
                                     body: hf.body.clone(),
                                     rename_map: rename_map.clone(),
+                                    source_file: self.current_source_file.clone(),
+                                    source_line: self.source_line_at(&def.span),
                                     span: def.span.clone(),
                                     preamble: vec![],
                                 });
@@ -497,8 +533,18 @@ impl MirBuilder {
                     span: import_span.clone(),
                 })?;
 
+        // Save and swap source context for the imported module
+        let saved_source_file = self.current_source_file.take();
+        let saved_source_text = self.current_source_text.take();
+        self.current_source_file = Some(resolved_path.clone());
+        self.current_source_text = Some(src.clone());
+
         let rename_map = self.build_rename_map(&imported_program, import, import_span)?;
         let result = self.collect_declarations(&imported_program, &rename_map);
+
+        // Restore source context
+        self.current_source_file = saved_source_file;
+        self.current_source_text = saved_source_text;
 
         // Cache the processed module
         let public_names: HashSet<String> = imported_program
@@ -820,6 +866,8 @@ impl MirBuilder {
                             ret_type: Type::Unit,
                             body,
                             span: 0..0,
+                            source_file: None,
+                            source_line: None,
                         })
                     })
                     .collect::<Result<_, HirBuildError>>()?;

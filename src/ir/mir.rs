@@ -28,6 +28,8 @@ pub struct MirFunction {
     pub ret_type: Type,
     pub body: Vec<MirStmt>,
     pub span: Span,
+    pub source_file: Option<String>,
+    pub source_line: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

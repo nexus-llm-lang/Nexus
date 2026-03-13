@@ -13,7 +13,7 @@ use super::emit::{
     type_to_wasm_valtype,
 };
 use super::error::CodegenError;
-use super::layout::CodegenLayout;
+use super::layout::{bt_label, CodegenLayout};
 use super::stmt::compile_stmt;
 use super::string::{
     emit_string_compare, emit_string_concat, is_string_compare_operator,
@@ -83,11 +83,12 @@ pub(super) fn compile_function(
 
     let mut out = Function::new(wasm_locals);
 
-    // Backtrace: push function name onto call stack at entry
+    // Backtrace: push "file:line funcname" onto call stack at entry
     if let Some(bt_push_idx) = layout.bt_push_idx {
+        let label = bt_label(func);
         let packed_name = layout
             .string_literals
-            .get(func.name.as_str())
+            .get(&label)
             .map(|p| pack_string(*p))
             .unwrap_or(0);
         out.instruction(&Instruction::I64Const(packed_name));

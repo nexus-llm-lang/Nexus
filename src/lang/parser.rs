@@ -1515,7 +1515,11 @@ impl Parser {
                 span: start..end,
             });
         }
-        Ok(Program { definitions })
+        Ok(Program {
+            definitions,
+            source_file: None,
+            source_text: None,
+        })
     }
 
     fn parse_top_level(&mut self) -> Result<TopLevel, ParseError> {

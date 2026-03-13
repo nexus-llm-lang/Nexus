@@ -86,7 +86,11 @@ impl ReplState {
         };
         defs.push(main_fn);
 
-        Program { definitions: defs }
+        Program {
+            definitions: defs,
+            source_file: Some("<repl>".to_string()),
+            source_text: None,
+        }
     }
 
     /// Compile and execute the program via wasmtime.

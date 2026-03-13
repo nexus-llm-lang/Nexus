@@ -182,4 +182,8 @@ pub enum TopLevel {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub definitions: Vec<Spanned<TopLevel>>,
+    /// Source file path — set by the driver after parsing.
+    pub source_file: Option<String>,
+    /// Raw source text — needed for byte-offset → line-number conversion.
+    pub source_text: Option<String>,
 }

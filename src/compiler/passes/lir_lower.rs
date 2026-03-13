@@ -107,7 +107,7 @@ fn lower_mir_function(
     func: &MirFunction,
     enum_defs: &[EnumDef],
 ) -> Result<(LirFunction, Vec<LirFunction>), LirLowerError> {
-    let mut ctx = LowerCtx::new(enum_defs);
+    let mut ctx = LowerCtx::new(enum_defs, func.source_file.clone(), func.source_line);
 
     // Register params in vars (both wasm and semantic types)
     for p in &func.params {
@@ -160,6 +160,8 @@ fn lower_mir_function(
             body: ctx.stmts,
             ret,
             span: func.span.clone(),
+            source_file: func.source_file.clone(),
+            source_line: func.source_line,
         },
         task_functions,
     ))
@@ -175,10 +177,12 @@ struct LowerCtx<'a> {
     /// Task functions lifted from conc blocks
     task_functions: Vec<LirFunction>,
     enum_defs: &'a [EnumDef],
+    source_file: Option<String>,
+    source_line: Option<u32>,
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(enum_defs: &'a [EnumDef]) -> Self {
+    fn new(enum_defs: &'a [EnumDef], source_file: Option<String>, source_line: Option<u32>) -> Self {
         LowerCtx {
             vars: HashMap::new(),
             semantic_vars: HashMap::new(),
@@ -186,6 +190,8 @@ impl<'a> LowerCtx<'a> {
             temp_counter: 0,
             task_functions: Vec::new(),
             enum_defs,
+            source_file,
+            source_line,
         }
     }
 
@@ -352,6 +358,8 @@ impl<'a> LowerCtx<'a> {
                         ret_type: Type::Unit,
                         body: task.body.clone(),
                         span: task.span.clone(),
+                        source_file: self.source_file.clone(),
+                        source_line: self.source_line,
                     };
                     let (lir_func, nested_tasks) = lower_mir_function(&task_mir, self.enum_defs)?;
                     self.task_functions.push(lir_func);

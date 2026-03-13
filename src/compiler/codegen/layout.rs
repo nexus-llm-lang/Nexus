@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::lir::{LirAtom, LirExpr, LirExternal, LirProgram, LirStmt};
+use crate::ir::lir::{LirAtom, LirExpr, LirExternal, LirFunction, LirProgram, LirStmt};
 use crate::types::Type;
 
 use super::emit::peel_linear;
@@ -50,9 +50,9 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
         }
         collect_strings_in_atom(&func.ret, &mut string_literals);
     }
-    // Collect function names for backtrace instrumentation
+    // Collect backtrace labels (file:line funcname) for instrumentation
     for func in &program.functions {
-        string_literals.push(func.name.to_string());
+        string_literals.push(bt_label(func));
     }
 
     let object_heap_enabled = program_uses_object_heap(program);
@@ -132,6 +132,14 @@ fn choose_memory_mode(
         Ok(MemoryMode::Defined)
     } else {
         Ok(MemoryMode::None)
+    }
+}
+
+/// Build a backtrace label: "file:line funcname" or just "funcname".
+pub(super) fn bt_label(func: &LirFunction) -> String {
+    match (&func.source_file, func.source_line) {
+        (Some(file), Some(line)) => format!("{}:{} {}", file, line, func.name),
+        _ => func.name.to_string(),
     }
 }
 

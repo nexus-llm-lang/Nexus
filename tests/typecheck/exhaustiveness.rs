@@ -22,6 +22,8 @@ fn color_program_with_cases(case_ctors: &[&str]) -> Program {
         .collect();
 
     Program {
+        source_file: None,
+        source_text: None,
         definitions: vec![
             sp(TopLevel::Enum(EnumDef {
                 name: "Color".to_string(),

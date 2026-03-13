@@ -30,6 +30,8 @@ pub struct LirFunction {
     pub body: Vec<LirStmt>,
     pub ret: LirAtom,
     pub span: Span,
+    pub source_file: Option<String>,
+    pub source_line: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -357,6 +357,8 @@ mod tests {
     fn extract_main_requires_returns_none_when_no_main() {
         let program = nexus::lang::ast::Program {
             definitions: vec![],
+            source_file: None,
+            source_text: None,
         };
         assert!(extract_main_requires(&program).is_none());
     }

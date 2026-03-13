@@ -35,10 +35,12 @@ fn compile_loaded_source_to_core_wasm_impl(
     skip_typecheck: bool,
 ) -> Result<Vec<u8>, ExitCode> {
     let src = strip_shebang(loaded.source.clone());
-    let program = match parse_program(&loaded.display_name, &src) {
+    let mut program = match parse_program(&loaded.display_name, &src) {
         Some(p) => p,
         None => return Err(ExitCode::from(1)),
     };
+    program.source_file = Some(loaded.display_name.clone());
+    program.source_text = Some(src.clone());
     if !skip_typecheck && !typecheck_program(&loaded.display_name, &src, &program) {
         return Err(ExitCode::from(1));
     }
