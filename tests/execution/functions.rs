@@ -5,7 +5,7 @@ use std::fs;
 fn codegen_module_alias_call_compiles() {
     exec(
         r#"
-import as math from examples/math.nx
+import * as math from examples/math.nx
 
 let main = fn () -> unit do
     let result = math.add(a: 19, b: 23)

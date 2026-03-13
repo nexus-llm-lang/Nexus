@@ -249,7 +249,7 @@ import { Console, println } from stdlib/stdio.nx
 import { Console }, * as stdio from stdlib/stdio.nx
 
 // Import as module alias only
-import as list from stdlib/list.nx
+import * as list from stdlib/list.nx
 
 // Import for side effects (rare)
 import from some/module.nx

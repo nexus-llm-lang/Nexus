@@ -32,9 +32,9 @@ import { Option, Some, None } from stdlib/option.nx
 import { Result, Ok, Err } from stdlib/result.nx
 
 // Import as module alias (for utility functions)
-import as list from stdlib/list.nx
-import as str from stdlib/string.nx
-import as math from stdlib/math.nx
+import * as list from stdlib/list.nx
+import * as str from stdlib/string.nx
+import * as math from stdlib/math.nx
 
 // Combine both
 import { Net, Request, Response }, * as net_mod from stdlib/net.nx
@@ -88,7 +88,7 @@ end
 
 ```nexus
 import { Result, Ok, Err } from stdlib/result.nx
-import as result from stdlib/result.nx
+import * as result from stdlib/result.nx
 
 let parse_config = fn (raw: string) -> Result<Config, string> do
   if str.length(s: raw) == 0 then
@@ -336,7 +336,7 @@ end
 ## String Processing
 
 ```nexus
-import as str from stdlib/string.nx
+import * as str from stdlib/string.nx
 
 // String concatenation with ++
 let greeting = "Hello, " ++ name ++ "!"

@@ -140,6 +140,7 @@ module.exports = grammar({
             field("path", $.import_path)
           ),
           seq(
+            "*",
             "as",
             field("alias", $.identifier),
             "from",

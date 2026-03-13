@@ -127,7 +127,7 @@ Env.set(key: string, value: string) -> unit
 
 ```nexus
 import { Option, Some, None } from stdlib/option.nx
-import as option from stdlib/option.nx
+import * as option from stdlib/option.nx
 
 type Option<T> = Some(val: T) | None
 
@@ -145,7 +145,7 @@ option.expect(opt: Option<T>, msg: string) -> T throws { Exn }
 
 ```nexus
 import { Result, Ok, Err } from stdlib/result.nx
-import as result from stdlib/result.nx
+import * as result from stdlib/result.nx
 
 type Result<T, E> = Ok(val: T) | Err(err: E)
 
@@ -162,7 +162,7 @@ result.to_exn(res: Result<T, Exn>) -> T throws { Exn }
 ### List — `stdlib/list.nx`
 
 ```nexus
-import as list from stdlib/list.nx
+import * as list from stdlib/list.nx
 
 type List<T> = Nil | Cons(v: T, rest: List<T>)
 // Alias: [ T ]
@@ -189,7 +189,7 @@ list.map(xs: [ T ], f: (val: T) -> U) -> [ U ]
 
 ```nexus
 import { Pair } from stdlib/tuple.nx
-import as tuple from stdlib/tuple.nx
+import * as tuple from stdlib/tuple.nx
 
 type Pair<A, B> = Pair(left: A, right: B)
 
@@ -200,7 +200,7 @@ tuple.snd(p: Pair<A, B>) -> B
 ### Array — `stdlib/array.nx` (Linear)
 
 ```nexus
-import as array from stdlib/array.nx
+import * as array from stdlib/array.nx
 
 // Arrays are [| T |] — linear, mutable
 
@@ -227,7 +227,7 @@ array.consume(arr: [| T |]) -> unit       // explicit linear consumption
 
 ```nexus
 import { Set } from stdlib/set.nx
-import as set from stdlib/set.nx
+import * as set from stdlib/set.nx
 
 opaque type Set = Set(id: i64)
 
@@ -248,7 +248,7 @@ set.free(s: Set) -> unit                  // explicit cleanup
 
 ```nexus
 import { HashMap, Lookup, Found, Missing } from stdlib/hashmap.nx
-import as hmap from stdlib/hashmap.nx
+import * as hmap from stdlib/hashmap.nx
 
 opaque type HashMap = HashMap(id: i64)
 type Lookup = Found(value: i64) | Missing
@@ -269,7 +269,7 @@ hmap.free(m: HashMap) -> unit
 
 ```nexus
 import { StringMap } from stdlib/stringmap.nx
-import as smap from stdlib/stringmap.nx
+import * as smap from stdlib/stringmap.nx
 
 // Same API as HashMap but keys are string
 smap.empty() -> StringMap
@@ -283,7 +283,7 @@ smap.free(m: StringMap) -> unit
 
 ```nexus
 import { ByteBuffer } from stdlib/bytebuffer.nx
-import as buf from stdlib/bytebuffer.nx
+import * as buf from stdlib/bytebuffer.nx
 
 opaque type ByteBuffer = ByteBuffer(id: i64)
 
@@ -309,7 +309,7 @@ buf.free(b: ByteBuffer) -> unit
 ### String — `stdlib/string.nx`
 
 ```nexus
-import as str from stdlib/string.nx
+import * as str from stdlib/string.nx
 
 // Inspection
 str.length(s: string) -> i64
@@ -342,7 +342,7 @@ str.parse_i64(s: string) -> i64 throws { Exn }
 ### Math — `stdlib/math.nx`
 
 ```nexus
-import as math from stdlib/math.nx
+import * as math from stdlib/math.nx
 
 // Integer
 math.abs(n: i64) -> i64
@@ -366,7 +366,7 @@ math.negate(b: bool) -> bool
 ### Exception Utilities — `stdlib/exn.nx`
 
 ```nexus
-import as exn from stdlib/exn.nx
+import * as exn from stdlib/exn.nx
 
 exn.to_string(exn: Exn) -> string
 exn.backtrace(exn: Exn) -> [ string ]

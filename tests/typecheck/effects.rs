@@ -458,7 +458,7 @@ end
             .join(", ");
         let src = format!(
             r#"
-import as array from stdlib/array.nx
+import * as array from stdlib/array.nx
 
 let __test_main = fn () -> i64 do
     let %arr = [| {elems} |]
