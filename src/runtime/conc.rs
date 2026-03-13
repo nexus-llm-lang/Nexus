@@ -67,6 +67,17 @@ pub fn imports_module(wasm_bytes: &[u8], target: &str) -> bool {
     false
 }
 
+/// Reset all conc thread-local state, releasing held resources (Engine, Module, etc.).
+/// Call this after execution completes to prevent stale state from leaking across runs.
+pub fn reset_conc_runtime() {
+    CONC_PENDING.with(|p| p.borrow_mut().clear());
+    CONC_MODULE.with(|m| *m.borrow_mut() = None);
+    CONC_ENGINE.with(|e| *e.borrow_mut() = None);
+    CONC_FUNC_MAP.with(|fm| fm.borrow_mut().clear());
+    CONC_DEPS.with(|d| d.borrow_mut().clear());
+    CONC_CAPS.with(|c| *c.borrow_mut() = None);
+}
+
 /// Prepare the conc runtime for a module that uses conc blocks.
 /// Must be called before instantiating the module.
 ///
@@ -79,13 +90,13 @@ pub fn setup_conc_runtime(
     deps: Vec<(String, Arc<Module>)>,
     capabilities: ExecutionCapabilities,
 ) {
+    reset_conc_runtime();
     let map = build_conc_export_map(wasm_bytes);
     CONC_ENGINE.with(|e| *e.borrow_mut() = Some(engine));
     CONC_MODULE.with(|m| *m.borrow_mut() = Some(module));
     CONC_FUNC_MAP.with(|fm| *fm.borrow_mut() = map);
     CONC_DEPS.with(|d| *d.borrow_mut() = deps);
     CONC_CAPS.with(|c| *c.borrow_mut() = Some(capabilities));
-    CONC_PENDING.with(|p| p.borrow_mut().clear());
 }
 
 /// Returns true if the WASM bytes contain imports from the conc host module.
