@@ -3,7 +3,7 @@
 ; Definition keywords
 "fn" @keyword.function
 "external" @keyword.function
-"pub" @keyword.modifier.pub
+"export" @keyword.modifier
 
 ; Unified block-end keyword
 "end" @keyword

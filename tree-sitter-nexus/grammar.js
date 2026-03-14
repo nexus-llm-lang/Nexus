@@ -20,7 +20,7 @@ const commaSep = (rule) => optional(sep1(",", rule));
  */
 const commaSep1 = (rule) => sep1(",", rule);
 
-module.exports = grammar({
+export default grammar({
   name: "nexus",
 
   extras: ($) => [/\s+/, $.line_comment, $.block_comment],
