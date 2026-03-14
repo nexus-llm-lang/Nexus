@@ -248,16 +248,46 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
     }
 
     // === Global Section ===
-    if layout.object_heap_enabled && layout.allocate_func_idx.is_none() {
+    {
         let mut globals = GlobalSection::new();
+        let mut next_global: u32 = 0;
+
+        // Heap pointer global (index 0 when present — OBJECT_HEAP_GLOBAL_INDEX)
+        if layout.object_heap_enabled && layout.allocate_func_idx.is_none() {
+            globals.global(
+                GlobalType {
+                    val_type: ValType::I32,
+                    mutable: true,
+                    shared: false,
+                },
+                &ConstExpr::i32_const(layout.heap_base as i32),
+            );
+            next_global += 1;
+        }
+
+        // Exception flag (i32): 0 = no exception, 1 = exception raised
+        layout.exn_flag_global = next_global;
         globals.global(
             GlobalType {
                 val_type: ValType::I32,
                 mutable: true,
                 shared: false,
             },
-            &ConstExpr::i32_const(layout.heap_base as i32),
+            &ConstExpr::i32_const(0),
         );
+        next_global += 1;
+
+        // Exception value (i64): packed exception object
+        layout.exn_value_global = next_global;
+        globals.global(
+            GlobalType {
+                val_type: ValType::I64,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i64_const(0),
+        );
+
         module.section(&globals);
     }
 

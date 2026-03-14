@@ -41,8 +41,6 @@ struct LocalInfo {
 #[derive(Debug, Clone, Copy)]
 struct FunctionTemps {
     packed_tmp_i64: u32,
-    exn_value_i64: u32,
-    exn_flag_i32: u32,
     object_ptr_i32: u32,
     concat_lhs_packed_i64: u32,
     concat_rhs_packed_i64: u32,
