@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::intern::Symbol;
 use crate::ir::lir::{LirAtom, LirExpr, LirExternal, LirFunction, LirProgram, LirStmt};
 use crate::types::Type;
 
@@ -42,6 +43,10 @@ pub(super) struct CodegenLayout {
     pub(super) allocate_func_idx: Option<u32>,
     pub(super) exn_flag_global: u32,
     pub(super) exn_value_global: u32,
+    /// Map from function name to its index in the funcref table
+    pub(super) funcref_table_indices: HashMap<Symbol, u32>,
+    /// Map from WASM signature key (params+results) to type index for call_indirect
+    pub(super) indirect_type_indices: HashMap<String, u32>,
 }
 
 pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout, CodegenError> {
@@ -105,6 +110,8 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
         allocate_func_idx: None,
         exn_flag_global: 0,
         exn_value_global: 0,
+        funcref_table_indices: HashMap::new(),
+        indirect_type_indices: HashMap::new(),
     })
 }
 
@@ -202,6 +209,7 @@ fn expr_uses_object_heap(expr: &LirExpr) -> bool {
         expr,
         LirExpr::Binary { op, typ, .. } if is_string_concat_operator(*op, typ)
     )
+    // FuncRef and CallIndirect don't use object heap
 }
 
 fn external_uses_string_abi(ext: &LirExternal) -> bool {
@@ -317,6 +325,13 @@ fn collect_strings_in_expr(expr: &LirExpr, out: &mut Vec<String>) {
         LirExpr::ObjectTag { value, .. } => collect_strings_in_atom(value, out),
         LirExpr::ObjectField { value, .. } => collect_strings_in_atom(value, out),
         LirExpr::Raise { value, .. } => collect_strings_in_atom(value, out),
+        LirExpr::FuncRef { .. } => {}
+        LirExpr::CallIndirect { callee, args, .. } => {
+            collect_strings_in_atom(callee, out);
+            for (_, atom) in args {
+                collect_strings_in_atom(atom, out);
+            }
+        }
     }
 }
 

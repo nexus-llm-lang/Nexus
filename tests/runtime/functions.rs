@@ -210,3 +210,80 @@ end
 "#,
     );
 }
+
+#[test]
+fn higher_order_function_passed_as_argument() {
+    exec(
+        r#"
+let double = fn (x: i64) -> i64 do
+    return x * 2
+end
+
+let apply = fn (f: (x: i64) -> i64, val: i64) -> i64 do
+    return f(x: val)
+end
+
+let main = fn () -> unit do
+    let result = apply(f: double, val: 21)
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn higher_order_lambda_expression_passed_as_argument() {
+    exec(
+        r#"
+let apply = fn (f: (x: i64) -> i64, val: i64) -> i64 do
+    return f(x: val)
+end
+
+let main = fn () -> unit do
+    let result = apply(f: fn (x: i64) -> i64 do return x + 1 end, val: 41)
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn higher_order_function_stored_in_variable() {
+    exec(
+        r#"
+let add_one = fn (x: i64) -> i64 do
+    return x + 1
+end
+
+let main = fn () -> unit do
+    let f = add_one
+    let result = f(x: 41)
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn higher_order_function_multiple_params() {
+    exec(
+        r#"
+let add = fn (a: i64, b: i64) -> i64 do
+    return a + b
+end
+
+let apply2 = fn (f: (a: i64, b: i64) -> i64, x: i64, y: i64) -> i64 do
+    return f(a: x, b: y)
+end
+
+let main = fn () -> unit do
+    let result = apply2(f: add, x: 19, y: 23)
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}

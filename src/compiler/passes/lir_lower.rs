@@ -1495,6 +1495,53 @@ impl<'a> LowerCtx<'a> {
                     typ,
                 ))
             }
+            MirExpr::FuncRef(name) => {
+                let typ = Type::I64; // funcref stored as i64 table index
+                Ok(self.bind_expr_to_temp(
+                    LirExpr::FuncRef {
+                        func: *name,
+                        typ: typ.clone(),
+                    },
+                    typ,
+                ))
+            }
+            MirExpr::CallIndirect {
+                callee,
+                args,
+                ret_type: _,
+                callee_type: _,
+            } => {
+                let callee_atom = self.lower_expr_to_atom(callee)?;
+                // Resolve the actual Arrow type from semantic_vars
+                let callee_type = if let MirExpr::Variable(name) = callee.as_ref() {
+                    self.semantic_vars.get(name).cloned().unwrap_or(Type::I64)
+                } else {
+                    Type::I64
+                };
+                // Infer return type from the Arrow type
+                let ret_type = if let Type::Arrow(_, ret, _, _) = &callee_type {
+                    *ret.clone()
+                } else {
+                    Type::I64
+                };
+                let mut lir_args: Vec<(Symbol, LirAtom)> = Vec::new();
+                for (label, expr) in args {
+                    let atom = self.lower_expr_to_atom(expr)?;
+                    lir_args.push((*label, atom));
+                }
+                lir_args.sort_by(|(a, _), (b, _)| a.cmp(b));
+                let typ = wasm_type(&ret_type);
+                Ok(self.bind_expr_to_temp_semantic(
+                    LirExpr::CallIndirect {
+                        callee: callee_atom,
+                        args: lir_args,
+                        typ: typ.clone(),
+                        callee_type,
+                    },
+                    typ,
+                    ret_type,
+                ))
+            }
         }
     }
 
@@ -1589,6 +1636,8 @@ impl<'a> LowerCtx<'a> {
                 }),
             // Raise never returns; I64 is a placeholder (no Type::Never exists)
             MirExpr::Raise(_) => Type::I64,
+            MirExpr::FuncRef(_) => Type::I64,
+            MirExpr::CallIndirect { ret_type, .. } => ret_type.clone(),
         }
     }
 
@@ -1906,7 +1955,13 @@ fn collect_mir_expr_refs(expr: &MirExpr, referenced: &mut Vec<Symbol>, seen: &mu
                 collect_mir_stmt_refs(s, &mut defined, referenced, seen);
             }
         }
-        MirExpr::Literal(_) => {}
+        MirExpr::FuncRef(_) | MirExpr::Literal(_) => {}
+        MirExpr::CallIndirect { callee, args, .. } => {
+            collect_mir_expr_refs(callee, referenced, seen);
+            for (_, arg) in args {
+                collect_mir_expr_refs(arg, referenced, seen);
+            }
+        }
     }
 }
 

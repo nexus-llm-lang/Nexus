@@ -93,6 +93,15 @@ pub enum MirExpr {
     },
     Borrow(Symbol),
     Raise(Box<MirExpr>),
+    /// Reference to a function as a first-class value (yields table index at runtime)
+    FuncRef(Symbol),
+    /// Indirect call through a variable holding a function reference
+    CallIndirect {
+        callee: Box<MirExpr>,
+        args: Vec<(Symbol, MirExpr)>,
+        ret_type: Type,
+        callee_type: Type,
+    },
 }
 
 #[derive(Debug, Clone)]

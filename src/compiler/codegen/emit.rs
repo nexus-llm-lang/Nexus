@@ -311,5 +311,7 @@ pub(super) fn expr_type(expr: &LirExpr) -> Type {
         LirExpr::ObjectTag { typ, .. } => typ.clone(),
         LirExpr::ObjectField { typ, .. } => typ.clone(),
         LirExpr::Raise { typ, .. } => typ.clone(),
+        LirExpr::FuncRef { typ, .. } => typ.clone(),
+        LirExpr::CallIndirect { typ, .. } => typ.clone(),
     }
 }
