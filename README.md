@@ -124,6 +124,8 @@ nexus run example.nx        # interpret
 nexus build example.nx      # compile to main.wasm
 nexus build example.nx -o out.wasm
 nexus check example.nx      # typecheck only
+nexus check --format json example.nx  # structured diagnostics (LLM-friendly)
+nexus lsp            # start Language Server (stdio)
 ```
 
 ```bash
@@ -174,7 +176,7 @@ Once installed, Claude Code automatically activates the skill when writing or re
 | [WASM](docs/env/wasm.md) | WASM compilation and WASI capabilities |
 | [FFI](docs/env/ffi.md) | Wasm interop |
 | [Stdlib](docs/env/stdlib.md) | Standard library |
-| [Tools](docs/env/tools.md) | AI coding agent skill |
+| [Tools](docs/env/tools.md) | LSP server, CLI diagnostics, AI coding agent skill |
 
 ## License
 
