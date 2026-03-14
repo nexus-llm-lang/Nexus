@@ -349,7 +349,6 @@ end
 ## Imports
 
 ```nexus
-import from path/to/module.nx                        // anonymous
 import * as math from path/to/math.nx                // namespace alias
 import { add, sub } from path/to/math.nx             // named items
 import { add, sub }, * as math from path/to/math.nx  // named + namespace
@@ -420,7 +419,6 @@ exception_def ::= [ "export" ] "exception" UIDENT [ "(" variant_field ( "," vari
 import_def    ::= "import" "external" import_path
                 | "import" "{" IDENT ( "," IDENT )* "}" [ "," "*" "as" IDENT ] "from" import_path
                 | "import" "*" "as" IDENT "from" import_path
-                | "import" "from" import_path
 import_path   ::= ( ALPHA | DIGIT | "_" | "-" | "/" | "." )+
 
 port_def      ::= [ "export" ] "port" UIDENT "do" fn_signature* "end"

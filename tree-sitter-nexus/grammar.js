@@ -115,7 +115,6 @@ export default grammar({
     // import { a, b } from path/to/mod.nx
     // import { a, b }, * as alias from path/to/mod.nx
     // import as alias from path/to/mod.nx
-    // import from path/to/mod.nx
     import_def: ($) =>
       seq(
         "import",
@@ -145,8 +144,7 @@ export default grammar({
             field("alias", $.identifier),
             "from",
             field("path", $.import_path)
-          ),
-          seq("from", field("path", $.import_path))
+          )
         )
       ),
 
