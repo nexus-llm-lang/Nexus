@@ -70,6 +70,63 @@ Parse and typecheck only. No execution, no WASM output.
 nexus check program.nx
 ```
 
+Structured JSON output for CI, scripting, and LLM tool use:
+
+```bash
+nexus check --format json program.nx
+```
+
+```json
+{
+  "file": "program.nx",
+  "ok": false,
+  "diagnostics": [
+    {
+      "range": {
+        "start": { "line": 5, "character": 9 },
+        "end": { "line": 5, "character": 16 }
+      },
+      "severity": "error",
+      "message": "Mismatch: string vs i64"
+    }
+  ],
+  "symbols": [
+    {
+      "name": "main",
+      "kind": "function",
+      "range": {
+        "start": { "line": 0, "character": 0 },
+        "end": { "line": 10, "character": 3 }
+      }
+    }
+  ]
+}
+```
+
+Exit code is `0` on success, `1` if any errors are present. Warnings alone do not cause failure.
+
+### `nexus lsp`
+
+Start the Language Server Protocol server over stdio. Connect from any LSP-compatible editor (VS Code, Neovim, Emacs, Helix, etc.).
+
+```bash
+nexus lsp
+```
+
+Supported LSP features:
+
+| Feature | Method | Description |
+|---|---|---|
+| Diagnostics | `publishDiagnostics` | Parse errors, type errors, warnings on open/change |
+| Hover | `textDocument/hover` | Type info for variables, functions, types, enums |
+| Go to Definition | `textDocument/definition` | Jump to definition (same file) |
+| Document Symbols | `textDocument/documentSymbol` | List functions, types, enums, ports, exceptions |
+| References | `textDocument/references` | Find all occurrences of an identifier |
+| Rename | `textDocument/rename` | Rename an identifier across the file |
+| Completion | `textDocument/completion` | Keywords, env symbols, module members |
+
+Project root is detected by walking up from the file to the nearest `.git` directory.
+
 ### REPL
 
 Run `nexus` with no arguments to start an interactive session:
