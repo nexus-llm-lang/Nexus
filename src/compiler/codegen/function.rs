@@ -19,6 +19,7 @@ use super::string::{
     emit_string_compare, emit_string_concat, is_string_compare_operator,
     is_string_concat_operator, pack_string,
 };
+use crate::constants::ENTRYPOINT;
 use super::{FunctionTemps, LocalInfo};
 
 pub(super) fn compile_function(
@@ -51,22 +52,20 @@ pub(super) fn compile_function(
 
     let temps = FunctionTemps {
         packed_tmp_i64: next_local_index,
-        exn_value_i64: next_local_index + 1,
-        exn_flag_i32: next_local_index + 2,
-        object_ptr_i32: next_local_index + 3,
-        concat_lhs_packed_i64: next_local_index + 4,
-        concat_rhs_packed_i64: next_local_index + 5,
-        concat_lhs_ptr_i32: next_local_index + 6,
-        concat_lhs_len_i32: next_local_index + 7,
-        concat_rhs_ptr_i32: next_local_index + 8,
-        concat_rhs_len_i32: next_local_index + 9,
-        concat_out_ptr_i32: next_local_index + 10,
-        concat_out_len_i32: next_local_index + 11,
-        concat_idx_i32: next_local_index + 12,
+        object_ptr_i32: next_local_index + 1,
+        concat_lhs_packed_i64: next_local_index + 2,
+        concat_rhs_packed_i64: next_local_index + 3,
+        concat_lhs_ptr_i32: next_local_index + 4,
+        concat_lhs_len_i32: next_local_index + 5,
+        concat_rhs_ptr_i32: next_local_index + 6,
+        concat_rhs_len_i32: next_local_index + 7,
+        concat_out_ptr_i32: next_local_index + 8,
+        concat_out_len_i32: next_local_index + 9,
+        concat_idx_i32: next_local_index + 10,
     };
-    // Temps: 2×i64, 1×i32, 1×i32, 2×i64, 7×i32
+    // Temps: 1×i64, 1×i32, 2×i64, 7×i32
     local_decls_flat.extend_from_slice(&[
-        ValType::I64, ValType::I64, ValType::I32, ValType::I32,
+        ValType::I64, ValType::I32,
         ValType::I64, ValType::I64,
         ValType::I32, ValType::I32, ValType::I32, ValType::I32,
         ValType::I32, ValType::I32, ValType::I32,
@@ -95,6 +94,7 @@ pub(super) fn compile_function(
         out.instruction(&Instruction::Call(bt_push_idx));
     }
 
+    let is_entrypoint = func.name == ENTRYPOINT;
     for stmt in &func.body {
         compile_stmt(
             stmt,
@@ -107,6 +107,7 @@ pub(super) fn compile_function(
             &temps,
             &func.ret_type,
             false,
+            is_entrypoint,
         )?;
     }
 
@@ -223,7 +224,9 @@ pub(super) fn compile_expr(
     external_indices: &HashMap<Symbol, u32>,
     layout: &CodegenLayout,
     temps: &FunctionTemps,
+    function_ret_type: &Type,
     in_try: bool,
+    is_entrypoint: bool,
 ) -> Result<(), CodegenError> {
     match expr {
         LirExpr::Atom(atom) => compile_atom(atom, out, local_map, layout),
@@ -273,6 +276,11 @@ pub(super) fn compile_expr(
                     out.instruction(&Instruction::ReturnCall(callee_idx));
                 } else {
                     out.instruction(&Instruction::Call(callee_idx));
+                    // Propagate exception from callee if not in try
+                    // (in try, the stmt-level check after each statement handles it)
+                    if !in_try {
+                        emit_exn_propagate(out, layout, function_ret_type, is_entrypoint);
+                    }
                 }
                 return Ok(());
             }
@@ -393,15 +401,16 @@ pub(super) fn compile_expr(
             }
             compile_atom(value, out, local_map, layout)?;
             if !matches!(value.typ(), Type::Unit) {
-                out.instruction(&Instruction::LocalSet(temps.exn_value_i64));
+                out.instruction(&Instruction::GlobalSet(layout.exn_value_global));
             } else {
                 out.instruction(&Instruction::I64Const(0));
-                out.instruction(&Instruction::LocalSet(temps.exn_value_i64));
+                out.instruction(&Instruction::GlobalSet(layout.exn_value_global));
             }
             out.instruction(&Instruction::I32Const(1));
-            out.instruction(&Instruction::LocalSet(temps.exn_flag_i32));
+            out.instruction(&Instruction::GlobalSet(layout.exn_flag_global));
             if !in_try {
-                out.instruction(&Instruction::Unreachable);
+                // Exit the function: trap in entrypoint, return-with-dummy in others
+                emit_exn_bail(out, layout, function_ret_type, is_entrypoint);
             }
             Ok(())
         }
@@ -451,4 +460,54 @@ pub(super) fn compile_atom(
         }
         LirAtom::Unit => Ok(()),
     }
+}
+
+/// Emit an early exit for uncaught exceptions.
+/// - In entrypoint (main): trap via Unreachable (uncaught exception = fatal)
+/// - In other functions: return with a dummy value so caller can check the flag
+fn emit_exn_bail(
+    out: &mut Function,
+    layout: &CodegenLayout,
+    ret_type: &Type,
+    is_entrypoint: bool,
+) {
+    if is_entrypoint {
+        out.instruction(&Instruction::Unreachable);
+    } else {
+        if let Some(bt_pop_idx) = layout.bt_pop_idx {
+            out.instruction(&Instruction::Call(bt_pop_idx));
+        }
+        match ret_type {
+            Type::Unit => {}
+            Type::I32 | Type::Bool | Type::Char => {
+                out.instruction(&Instruction::I32Const(0));
+            }
+            Type::F64 => {
+                out.instruction(&Instruction::F64Const(0.0.into()));
+            }
+            Type::F32 => {
+                out.instruction(&Instruction::F32Const(0.0.into()));
+            }
+            _ => {
+                // I64, String, ADTs (all represented as i64)
+                out.instruction(&Instruction::I64Const(0));
+            }
+        }
+        out.instruction(&Instruction::Return);
+    }
+}
+
+/// After a non-tail Call when NOT in a try block: check the global exception
+/// flag and propagate by bailing out if the callee raised.
+fn emit_exn_propagate(
+    out: &mut Function,
+    layout: &CodegenLayout,
+    function_ret_type: &Type,
+    is_entrypoint: bool,
+) {
+    use wasm_encoder::BlockType;
+    out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
+    out.instruction(&Instruction::If(BlockType::Empty));
+    emit_exn_bail(out, layout, function_ret_type, is_entrypoint);
+    out.instruction(&Instruction::End);
 }
