@@ -120,7 +120,7 @@ Binary operators with standard precedence (multiplicative binds tighter than add
 | `==` `!=` `<` `>` `<=` `>=` | Integer / generic comparison |
 | `==.` `!=.` `<.` `>.` `<=.` `>=.` | Float comparison |
 | `&&` | Logical AND |
-| <code>&#124;&#124;</code> | Logical OR |
+| `\|\|` | Logical OR |
 
 ### Function Calls
 
