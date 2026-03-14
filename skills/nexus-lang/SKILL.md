@@ -33,6 +33,8 @@ nexus                    # REPL
 nexus run example.nx     # compile + run via WASM
 nexus build example.nx   # compile to main.wasm
 nexus check example.nx   # typecheck only
+nexus check --format json example.nx  # structured diagnostics (JSON)
+nexus lsp                # start Language Server (stdio)
 ```
 
 ### Permission Flags (for run/build)
@@ -249,6 +251,31 @@ end
 | Implicit I/O | Declare via `require { PermConsole }` + inject handler |
 | `var x = 5` | `let ~x = 5` for mutable |
 | `for x in list` | Use `match`/recursion or `list.fold_left` |
+
+## Tooling
+
+### Language Server (LSP)
+
+`nexus lsp` starts an LSP server over stdio. Supports diagnostics, hover (type info), go-to-definition, document symbols, references, rename, and completion.
+
+### Structured Diagnostics
+
+Use `nexus check --format json` as a tool call to get parse/type errors and symbol lists in machine-readable JSON:
+
+```json
+{
+  "file": "example.nx",
+  "ok": false,
+  "diagnostics": [
+    { "range": { "start": { "line": 5, "character": 9 }, "end": { "line": 5, "character": 16 } },
+      "severity": "error", "message": "Mismatch: string vs i64" }
+  ],
+  "symbols": [
+    { "name": "main", "kind": "function",
+      "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 10, "character": 3 } } }
+  ]
+}
+```
 
 ## Reference Files
 
