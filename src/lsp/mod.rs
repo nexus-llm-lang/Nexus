@@ -4,8 +4,10 @@
 //! - `nexus check --format json` — one-shot structured diagnostics for CLI / LLM
 
 mod analysis;
+mod completion;
 mod hover;
 mod position;
+mod references;
 mod server;
 mod symbols;
 

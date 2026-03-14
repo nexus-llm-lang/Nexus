@@ -6,13 +6,16 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
-    DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _,
+    Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, References,
+    Rename, Request as _,
 };
 use lsp_types::*;
 
 use super::analysis;
+use super::completion;
 use super::hover;
 use super::position::LineIndex;
+use super::references;
 use super::symbols;
 
 use crate::lang::ast::Program;
@@ -45,6 +48,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![".".to_string()]),
+            ..Default::default()
+        }),
         ..Default::default()
     })?;
 
@@ -228,6 +240,106 @@ fn handle_request(req: &Request, documents: &HashMap<DocKey, DocumentState>) -> 
                     range,
                 }))
             });
+            Response {
+                id: req.id.clone(),
+                result: Some(serde_json::to_value(result).unwrap()),
+                error: None,
+            }
+        }
+        References::METHOD => {
+            let params: ReferenceParams = match serde_json::from_value(req.params.clone()) {
+                Ok(p) => p,
+                Err(e) => return error_response(req.id.clone(), e),
+            };
+            let uri = &params.text_document_position.text_document.uri;
+            let pos = params.text_document_position.position;
+            let key = DocKey::from_uri(uri);
+            let result = documents.get(&key).and_then(|doc| {
+                let offset = doc.line_index.position_to_offset(pos);
+                let (_, _, spans) = references::find_all_references(&doc.text, offset)?;
+                let locs: Vec<Location> = spans
+                    .into_iter()
+                    .map(|span| Location {
+                        uri: uri.clone(),
+                        range: doc.line_index.span_to_range(&span),
+                    })
+                    .collect();
+                Some(locs)
+            });
+            Response {
+                id: req.id.clone(),
+                result: Some(serde_json::to_value(result).unwrap()),
+                error: None,
+            }
+        }
+        Rename::METHOD => {
+            let params: RenameParams = match serde_json::from_value(req.params.clone()) {
+                Ok(p) => p,
+                Err(e) => return error_response(req.id.clone(), e),
+            };
+            let uri = &params.text_document_position.text_document.uri;
+            let pos = params.text_document_position.position;
+            let new_name = params.new_name;
+            let key = DocKey::from_uri(uri);
+            let result = documents.get(&key).and_then(|doc| {
+                let offset = doc.line_index.position_to_offset(pos);
+                let (_, _, spans) = references::find_all_references(&doc.text, offset)?;
+                let edits: Vec<TextEdit> = spans
+                    .into_iter()
+                    .map(|span| TextEdit {
+                        range: doc.line_index.span_to_range(&span),
+                        new_text: new_name.clone(),
+                    })
+                    .collect();
+                let mut changes = HashMap::new();
+                changes.insert(uri.clone(), edits);
+                Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                })
+            });
+            Response {
+                id: req.id.clone(),
+                result: Some(serde_json::to_value(result).unwrap()),
+                error: None,
+            }
+        }
+        "textDocument/prepareRename" => {
+            let params: TextDocumentPositionParams =
+                match serde_json::from_value(req.params.clone()) {
+                    Ok(p) => p,
+                    Err(e) => return error_response(req.id.clone(), e),
+                };
+            let uri = &params.text_document.uri;
+            let pos = params.position;
+            let key = DocKey::from_uri(uri);
+            let result = documents.get(&key).and_then(|doc| {
+                let offset = doc.line_index.position_to_offset(pos);
+                let (name, origin_span, _) =
+                    references::find_all_references(&doc.text, offset)?;
+                Some(PrepareRenameResponse::RangeWithPlaceholder {
+                    range: doc.line_index.span_to_range(&origin_span),
+                    placeholder: name,
+                })
+            });
+            Response {
+                id: req.id.clone(),
+                result: Some(serde_json::to_value(result).unwrap()),
+                error: None,
+            }
+        }
+        Completion::METHOD => {
+            let params: CompletionParams = match serde_json::from_value(req.params.clone()) {
+                Ok(p) => p,
+                Err(e) => return error_response(req.id.clone(), e),
+            };
+            let uri = &params.text_document_position.text_document.uri;
+            let key = DocKey::from_uri(uri);
+            let items = documents
+                .get(&key)
+                .map(|doc| completion::completions(doc.env.as_ref()))
+                .unwrap_or_default();
+            let result = CompletionResponse::Array(items);
             Response {
                 id: req.id.clone(),
                 result: Some(serde_json::to_value(result).unwrap()),
