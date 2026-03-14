@@ -225,6 +225,26 @@ let lex_number = fn (st: LexerState, span: Span) -> LexResult do
   end
 end
 
+// ─── Escape helpers ─────────────────────────────────────────────────────────
+
+type HexAccum = HexOk(st: LexerState, code: i64) | HexErr(st: LexerState, msg: string)
+
+let collect_hex_digits = fn (st: LexerState, code: i64) -> HexAccum do
+  if at_end(st: st) then
+    return HexErr(st: st, msg: "unterminated \\u{} escape")
+  end
+  let c = peek(st: st)
+  if c == ch_rbrace then
+    return HexOk(st: advance(st: st), code: code)
+  end
+  let v = char.hex_digit_value(c: c)
+  if v >= 0 then
+    return collect_hex_digits(st: advance(st: st), code: code * 16 + v)
+  else
+    return HexErr(st: st, msg: "invalid hex digit in \\u{} escape")
+  end
+end
+
 // ─── String literals ─────────────────────────────────────────────────────────
 
 let lex_string_body = fn (st: LexerState, acc: string) -> LexResult do
@@ -239,13 +259,61 @@ let lex_string_body = fn (st: LexerState, acc: string) -> LexResult do
   // Escape sequence
   if c == ch_backslash then
     let c2 = peek_at(st: st, offset: 1)
-    let st2 = advance_n(st: st, n: 2)
-    if c2 == 'n' then return lex_string_body(st: st2, acc: acc ++ "\n") end
-    if c2 == 'r' then return lex_string_body(st: st2, acc: acc ++ "\r") end
-    if c2 == 't' then return lex_string_body(st: st2, acc: acc ++ "\t") end
-    if c2 == ch_backslash then return lex_string_body(st: st2, acc: acc ++ "\\") end
-    if c2 == ch_dquote then return lex_string_body(st: st2, acc: acc ++ "\"") end
-    return lex_string_body(st: st2, acc: acc ++ "\\" ++ str.from_char(c: c2))
+    // Named escapes
+    if c2 == 'n' then return lex_string_body(st: advance_n(st: st, n: 2), acc: acc ++ "\n") end
+    if c2 == 'r' then return lex_string_body(st: advance_n(st: st, n: 2), acc: acc ++ "\r") end
+    if c2 == 't' then return lex_string_body(st: advance_n(st: st, n: 2), acc: acc ++ "\t") end
+    if c2 == 'a' then return lex_string_body(st: advance_n(st: st, n: 2), acc: acc ++ str.from_char_code(code: 7)) end
+    if c2 == 'b' then return lex_string_body(st: advance_n(st: st, n: 2), acc: acc ++ str.from_char_code(code: 8)) end
+    if c2 == 'v' then return lex_string_body(st: advance_n(st: st, n: 2), acc: acc ++ str.from_char_code(code: 11)) end
+    if c2 == 'f' then return lex_string_body(st: advance_n(st: st, n: 2), acc: acc ++ str.from_char_code(code: 12)) end
+    if c2 == 'e' then return lex_string_body(st: advance_n(st: st, n: 2), acc: acc ++ str.from_char_code(code: 27)) end
+    if c2 == ch_backslash then return lex_string_body(st: advance_n(st: st, n: 2), acc: acc ++ "\\") end
+    if c2 == ch_dquote then return lex_string_body(st: advance_n(st: st, n: 2), acc: acc ++ "\"") end
+    // Unicode escape: \u{NNNN}
+    if c2 == 'u' then
+      if peek_at(st: st, offset: 2) == ch_lbrace then
+        match collect_hex_digits(st: advance_n(st: st, n: 3), code: 0)
+          case HexOk(st: st3, code: code) ->
+            return lex_string_body(st: st3, acc: acc ++ str.from_char_code(code: code))
+          case HexErr(st: st3, msg: msg) ->
+            return spanned(st: st3, token: TkError(msg: msg), span: current_span(st: st3))
+        end
+      else
+        return spanned(st: advance_n(st: st, n: 2), token: TkError(msg: "expected '{' after \\u"), span: current_span(st: st))
+      end
+    end
+    // Hex escape: \xNN (exactly 2 hex digits)
+    if c2 == 'x' then
+      let h1 = peek_at(st: st, offset: 2)
+      let h2 = peek_at(st: st, offset: 3)
+      let v1 = char.hex_digit_value(c: h1)
+      let v2 = char.hex_digit_value(c: h2)
+      if v1 >= 0 && v2 >= 0 then
+        return lex_string_body(st: advance_n(st: st, n: 4), acc: acc ++ str.from_char_code(code: v1 * 16 + v2))
+      else
+        return spanned(st: advance_n(st: st, n: 2), token: TkError(msg: "\\x requires exactly 2 hex digits"), span: current_span(st: st))
+      end
+    end
+    // Octal escape: \NNN (1-3 octal digits)
+    if c2 >= '0' && c2 <= '7' then
+      let d1 = char.digit_value(c: c2)
+      let c3 = peek_at(st: st, offset: 2)
+      if c3 >= '0' && c3 <= '7' then
+        let d2 = char.digit_value(c: c3)
+        let c4 = peek_at(st: st, offset: 3)
+        if c4 >= '0' && c4 <= '7' then
+          let d3 = char.digit_value(c: c4)
+          return lex_string_body(st: advance_n(st: st, n: 4), acc: acc ++ str.from_char_code(code: d1 * 64 + d2 * 8 + d3))
+        else
+          return lex_string_body(st: advance_n(st: st, n: 3), acc: acc ++ str.from_char_code(code: d1 * 8 + d2))
+        end
+      else
+        return lex_string_body(st: advance_n(st: st, n: 2), acc: acc ++ str.from_char_code(code: d1))
+      end
+    end
+    // Unknown escape: pass through as-is
+    return lex_string_body(st: advance_n(st: st, n: 2), acc: acc ++ "\\" ++ str.from_char(c: c2))
   end
   // Regular character
   match st

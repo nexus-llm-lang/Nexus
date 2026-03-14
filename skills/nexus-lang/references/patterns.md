@@ -225,7 +225,7 @@ let len = array.length(arr: &%arr)
 
 // Iterate
 array.for_each(arr: &%arr, f: fn (val: i64) -> unit do
-  Console.println(val: str.from_i64(n: val))
+  Console.println(val: str.from_i64(val: val))
   return ()
 end)
 
@@ -342,7 +342,7 @@ import * as str from stdlib/string.nx
 let greeting = "Hello, " ++ name ++ "!"
 
 // Conversion
-let num_str = str.from_i64(n: 42)
+let num_str = str.from_i64(val: 42)
 let parsed = str.parse_i64(s: "123")    // throws Exn
 
 // Splitting and joining
@@ -358,7 +358,7 @@ let first_five = str.substring(s: text, start: 0, len: 5)
 ```nexus
 // For loop: exclusive upper bound [start, end)
 for i = 0 to 10 do
-  Console.println(val: str.from_i64(n: i))    // prints 0..9
+  Console.println(val: str.from_i64(val: i))    // prints 0..9
 end
 
 // Loop variable is stack-confined mutable (implicit ~)

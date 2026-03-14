@@ -80,11 +80,34 @@ Extends the builtin `Exn` type with new constructors.
 |---|---|---|
 | Integer | `42`, `-7` | `i64` |
 | Float | `3.14`, `-0.5` | `f64` |
+| Char | `'a'`, `'\n'`, `'\t'` | `char` |
 | Boolean | `true`, `false` | `bool` |
 | Unit | `()` | `unit` |
 | String | `"hello"` | `string` |
 
-Strings use `"..."` delimiters with escape sequences (`\n`, `\t`, `\\`, `\"`). Raw strings use `[=[ ... ]=]` delimiters (no escape processing).
+Strings use `"..."` delimiters with escape sequences. Raw strings use `[=[ ... ]=]` delimiters (no escape processing).
+
+Supported escape sequences (in both strings and char literals):
+
+| Escape | Value | Description |
+|---|---|---|
+| `\0` | 0x00 | Null (octal shorthand) |
+| `\a` | 0x07 | Bell |
+| `\b` | 0x08 | Backspace |
+| `\t` | 0x09 | Tab |
+| `\n` | 0x0A | Newline |
+| `\v` | 0x0B | Vertical tab |
+| `\f` | 0x0C | Form feed |
+| `\r` | 0x0D | Carriage return |
+| `\e` | 0x1B | Escape (for ANSI sequences) |
+| `\\` | 0x5C | Backslash |
+| `\'` | 0x27 | Single quote |
+| `\"` | 0x22 | Double quote |
+| `\NNN` | octal | 1–3 octal digits (e.g. `\033` = ESC, `\177` = DEL) |
+| `\xNN` | hex | Exactly 2 hex digits (e.g. `\x1b` = ESC, `\x41` = 'A') |
+| `\u{N..}` | unicode | Variable-length hex codepoint (e.g. `\u{1F600}`) |
+
+Char literals use single quotes: `'a'`, `'\n'`, `'\x41'`, `'\033'`.
 
 ### Operators
 
@@ -192,6 +215,15 @@ let &view = ~data
 Sigils: (none) immutable, `~` mutable, `%` linear, `&` borrowed.
 
 Top-level `let` does not allow `~` or `%` sigils.
+
+### Let-Pattern Destructuring
+
+```nexus
+let { x: x, y: y } = point
+let Ok(val: v) = result
+```
+
+Destructures a value directly in a `let` binding. Desugared to a single-case `match` during compilation.
 
 ### Assignment
 
@@ -418,7 +450,7 @@ type           ::= arrow_type
                  | row_type
                  | UIDENT              (* type variable or monotype *)
 
-primitive_type ::= "i32" | "i64" | "f32" | "f64" | "float" | "bool" | "string" | "unit"
+primitive_type ::= "i32" | "i64" | "f32" | "f64" | "float" | "bool" | "char" | "string" | "unit"
 
 ref_type       ::= "ref" "(" type ")"
 borrow_type    ::= "&" type
@@ -456,6 +488,7 @@ stmt        ::= let_stmt
               | expr_stmt
 
 let_stmt    ::= "let" [ sigil ] IDENT [ ":" type ] "=" expr
+              | "let" pattern "=" expr
 return_stmt ::= "return" expr
 assign_stmt ::= expr "<-" expr
 
@@ -549,7 +582,7 @@ wildcard_pattern    ::= "_"
 (* ── Literals ───────────────────────────────────────────────── *)
 
 literal         ::= float_literal | integer_literal | boolean_literal
-                  | unit_literal  | string_literal
+                  | unit_literal  | string_literal | char_literal
 
 float_literal   ::= [ "-" ] DIGIT+ "." DIGIT+
 integer_literal ::= [ "-" ] DIGIT+
@@ -557,10 +590,20 @@ boolean_literal ::= "true" | "false"
 unit_literal    ::= "()"
 string_literal  ::= '"' string_char* '"'
                   | "[=[" raw_char* "]=]"
-string_char     ::= '\"'     (* escaped double quote *)
-                  | '\n' | '\t' | '\\'  (* escape sequences *)
-                  | NON_QUOTE NON_BACKSLASH
+string_char     ::= escape_seq | NON_QUOTE NON_BACKSLASH
 raw_char        ::= ANY - "]=]"
+
+char_literal    ::= "'" char_body "'"
+char_body       ::= escape_seq | NON_QUOTE NON_BACKSLASH
+
+escape_seq      ::= '\' named_esc
+                  | '\' OCTAL_DIGIT OCTAL_DIGIT? OCTAL_DIGIT?
+                  | '\x' HEX_DIGIT HEX_DIGIT
+                  | '\u{' HEX_DIGIT+ '}'
+named_esc       ::= 'a' | 'b' | 't' | 'n' | 'v' | 'f' | 'r' | 'e'
+                  | '\\' | '\'' | '"'
+OCTAL_DIGIT     ::= '0'..'7'
+HEX_DIGIT       ::= '0'..'9' | 'a'..'f' | 'A'..'F'
 
 (* ── Comments & Terminals ───────────────────────────────────── *)
 

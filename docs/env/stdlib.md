@@ -380,7 +380,8 @@ fn contains(s: string, sub: string) -> bool
 fn index_of(s: string, sub: string) -> i64
 fn starts_with(s: string, prefix: string) -> bool
 fn ends_with(s: string, suffix: string) -> bool
-fn char_at(s: string, idx: i64) -> string
+fn char_at(s: string, idx: i64) -> char
+fn char_code(s: string, idx: i64) -> i64              // Unicode codepoint, -1 if OOB
 
 // Transformation
 fn substring(s: string, start: i64, len: i64) -> string
@@ -399,6 +400,8 @@ fn split(s: string, sep: string) -> [ string ]
 fn from_i64(val: i64) -> string
 fn from_float(val: float) -> string
 fn from_bool(val: bool) -> string
+fn from_char(c: char) -> string
+fn from_char_code(code: i64) -> string                // Unicode codepoint → string
 fn parse_i64(s: string) -> Option<i64>
 ```
 
@@ -441,7 +444,27 @@ fn to_string(exn: Exn) -> string
 fn backtrace(exn: Exn) -> [string]
 ```
 
-`backtrace` returns call-stack frames captured at raise point (interpreter only; returns `[]` in WASM builds).
+`backtrace` returns call-stack frames (with source file and line info) captured at the raise point.
+
+### Char (`char.nx`)
+
+Character classification functions for ASCII analysis:
+
+```nexus
+fn ord(c: char) -> i64
+fn is_upper(c: char) -> bool
+fn is_lower(c: char) -> bool
+fn is_alpha(c: char) -> bool
+fn is_digit(c: char) -> bool
+fn is_alnum(c: char) -> bool
+fn is_hex_digit(c: char) -> bool
+fn is_whitespace(c: char) -> bool
+fn is_ident_start(c: char) -> bool
+fn is_ident_char(c: char) -> bool
+fn is_newline(c: char) -> bool
+fn digit_value(c: char) -> i64
+fn hex_digit_value(c: char) -> i64
+```
 
 ### Core (`core.nx`)
 

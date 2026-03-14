@@ -136,7 +136,7 @@ option.is_none(opt: Option<T>) -> bool
 option.unwrap_or(opt: Option<T>, default: T) -> T
 option.map(opt: Option<T>, f: (val: T) -> U) -> Option<U>
 option.and_then(opt: Option<T>, f: (val: T) -> Option<U>) -> Option<U>
-option.or_else(opt: Option<T>, f: () -> Option<T>) -> Option<T>
+option.or_else(opt: Option<T>, other: Option<T>) -> Option<T>
 option.unwrap(opt: Option<T>) -> T throws { Exn }
 option.expect(opt: Option<T>, msg: string) -> T throws { Exn }
 ```
@@ -317,7 +317,8 @@ str.contains(s: string, sub: string) -> bool
 str.index_of(s: string, sub: string) -> i64          // -1 if not found
 str.starts_with(s: string, prefix: string) -> bool
 str.ends_with(s: string, suffix: string) -> bool
-str.char_at(s: string, idx: i64) -> string
+str.char_at(s: string, idx: i64) -> char
+str.char_code(s: string, idx: i64) -> i64            // Unicode codepoint, -1 if OOB
 str.substring(s: string, start: i64, len: i64) -> string
 
 // Transformation
@@ -333,10 +334,12 @@ str.join(xs: [ string ], sep: string) -> string
 str.split(s: string, sep: string) -> [ string ]
 
 // Conversion
-str.from_i64(n: i64) -> string
-str.from_float(n: f64) -> string
-str.from_bool(b: bool) -> string
-str.parse_i64(s: string) -> i64 throws { Exn }
+str.from_i64(val: i64) -> string
+str.from_float(val: f64) -> string
+str.from_bool(val: bool) -> string
+str.from_char(c: char) -> string
+str.from_char_code(code: i64) -> string               // Unicode codepoint → string
+str.parse_i64(s: string) -> Option<i64>
 ```
 
 ### Math — `stdlib/math.nx`
@@ -369,5 +372,25 @@ math.negate(b: bool) -> bool
 import * as exn from stdlib/exn.nx
 
 exn.to_string(exn: Exn) -> string
-exn.backtrace(exn: Exn) -> [ string ]
+exn.backtrace(exn: Exn) -> [ string ]    // frames with file:line info
+```
+
+### Char — `stdlib/char.nx`
+
+```nexus
+import * as char from stdlib/char.nx
+
+char.ord(c: char) -> i64
+char.is_upper(c: char) -> bool
+char.is_lower(c: char) -> bool
+char.is_alpha(c: char) -> bool
+char.is_digit(c: char) -> bool
+char.is_alnum(c: char) -> bool
+char.is_hex_digit(c: char) -> bool
+char.is_whitespace(c: char) -> bool
+char.is_ident_start(c: char) -> bool
+char.is_ident_char(c: char) -> bool
+char.is_newline(c: char) -> bool
+char.digit_value(c: char) -> i64
+char.hex_digit_value(c: char) -> i64
 ```

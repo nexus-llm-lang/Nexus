@@ -224,11 +224,10 @@ impl Lexer {
     }
 
     /// Resolve an escape sequence after consuming the backslash.
-    /// Handles: \0 \a \b \t \n \v \f \r \e \\ \' \" \xNN \u{NNNN}
+    /// Handles: \a \b \t \n \v \f \r \e \\ \' \" \NNN (octal) \xNN \u{NNNN}
     /// Returns None on error (error already pushed).
     fn resolve_escape(&mut self, start: usize) -> Option<char> {
         match self.advance() {
-            Some('0') => Some('\0'),
             Some('a') => Some('\x07'),
             Some('b') => Some('\x08'),
             Some('t') => Some('\t'),
@@ -240,6 +239,31 @@ impl Lexer {
             Some('\\') => Some('\\'),
             Some('\'') => Some('\''),
             Some('"') => Some('"'),
+            // Octal escape: \0 through \377 (1–3 octal digits)
+            Some(c) if ('0'..='7').contains(&c) => {
+                let mut oct = String::with_capacity(3);
+                oct.push(c);
+                for _ in 0..2 {
+                    match self.peek() {
+                        Some(d) if ('0'..='7').contains(&d) => {
+                            oct.push(d);
+                            self.advance();
+                        }
+                        _ => break,
+                    }
+                }
+                let val = u32::from_str_radix(&oct, 8).unwrap();
+                match char::from_u32(val) {
+                    Some(ch) => Some(ch),
+                    None => {
+                        self.errors.push(LexError {
+                            message: format!("invalid octal escape \\{}", oct),
+                            span: start..self.pos,
+                        });
+                        None
+                    }
+                }
+            }
             Some('x') => {
                 let mut hex = String::with_capacity(2);
                 for _ in 0..2 {
@@ -880,6 +904,21 @@ mod tests {
     }
 
     #[test]
+    fn test_string_octal_escape() {
+        // \033 = ESC (27), \0 = NUL, \177 = DEL (127), \101 = 'A' (65)
+        let tokens = tokenize(r#""\033\0\177\101""#).unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::StringLit(ref s)
+            if s == "\x1b\0\x7f\x41"));
+    }
+
+    #[test]
+    fn test_string_octal_escape_greedy() {
+        // \0 followed by non-octal 'A' → NUL + A
+        let tokens = tokenize(r#""\0A""#).unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::StringLit(ref s) if s == "\0A"));
+    }
+
+    #[test]
     fn test_string_hex_escape() {
         let tokens = tokenize(r#""\x41\x7a""#).unwrap();
         assert!(matches!(tokens[0].kind, TokenKind::StringLit(ref s) if s == "Az"));
@@ -938,6 +977,12 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn test_char_octal_escape() {
+        let tokens = tokenize(r"'\033'").unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::CharLit('\x1b')));
     }
 
     #[test]

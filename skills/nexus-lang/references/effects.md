@@ -166,7 +166,7 @@ catch e ->
     case NotFound(msg: m) ->
       Console.println(val: "Not found: " ++ m)
     case Timeout(ms: t, url: u) ->
-      Console.println(val: "Timeout after " ++ from_i64(n: t) ++ "ms")
+      Console.println(val: "Timeout after " ++ from_i64(val: t) ++ "ms")
     case _ ->
       Console.println(val: "Unknown error")
   end
@@ -190,7 +190,7 @@ end
 // MAY:
 // - Require runtime permissions
 // MUST NOT:
-// - Be pub
+// - Be export
 // - Throw unhandled exceptions
 
 let main = fn () -> unit require { PermConsole } do

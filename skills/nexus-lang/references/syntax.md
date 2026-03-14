@@ -24,25 +24,25 @@ top_level   ::= type_def
 
 (* ── Definitions ───────────────────────────────────────────── *)
 
-type_def    ::= [ "pub" ] [ "opaque" ] "type" UIDENT [ type_params ] "=" record_type
-        | [ "pub" ] [ "opaque" ] "type" UIDENT [ type_params ] "=" type_sum_def
+type_def    ::= [ "export" ] [ "opaque" ] "type" UIDENT [ type_params ] "=" record_type
+        | [ "export" ] [ "opaque" ] "type" UIDENT [ type_params ] "=" type_sum_def
 
 type_sum_def  ::= variant_def ( "|" variant_def )*
 variant_def   ::= UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
 variant_field ::= type | IDENT ":" type
-exception_def ::= [ "pub" ] "exception" UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
+exception_def ::= [ "export" ] "exception" UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
 
 import_def  ::= "import" "external" import_path
         | "import" "{" IDENT ( "," IDENT )* "}" [ "," "*" "as" IDENT ] "from" import_path
-        | "import" "as" IDENT "from" import_path
+        | "import" "*" "as" IDENT "from" import_path
         | "import" "from" import_path
 import_path   ::= ( ALPHA | DIGIT | "_" | "-" | "/" | "." )+
 
-port_def    ::= [ "pub" ] "port" UIDENT "do" fn_signature* "end"
+port_def    ::= [ "export" ] "port" UIDENT "do" fn_signature* "end"
 fn_signature  ::= "fn" IDENT param_list "->" type [ "require" throws_type ] [ "throws" throws_type ]
 
-let_def     ::= [ "pub" ] "let" IDENT [ ":" type ] "=" expr
-external_def  ::= [ "pub" ] "external" IDENT "=" STRING_LITERAL ":" [ type_params ] arrow_type
+let_def     ::= [ "export" ] "let" IDENT [ ":" type ] "=" expr
+external_def  ::= [ "export" ] "external" IDENT "=" STRING_LITERAL ":" [ type_params ] arrow_type
 
 (* ── Parameters ─────────────────────────────────────────────── *)
 
@@ -65,7 +65,7 @@ type      ::= arrow_type
         | row_type
         | UIDENT        (* type variable or monotype *)
 
-primitive_type ::= "i32" | "i64" | "f32" | "f64" | "float" | "bool" | "string" | "unit"
+primitive_type ::= "i32" | "i64" | "f32" | "f64" | "float" | "bool" | "char" | "string" | "unit"
 
 ref_type    ::= "ref" "(" type ")"
 borrow_type   ::= "&" type
@@ -102,6 +102,7 @@ stmt      ::= let_stmt
         | expr_stmt
 
 let_stmt    ::= "let" [ sigil ] IDENT [ ":" type ] "=" expr
+              | "let" pattern "=" expr
 return_stmt   ::= "return" expr
 assign_stmt   ::= expr "<-" expr
 
@@ -200,7 +201,7 @@ wildcard_pattern  ::= "_"
 (* ── Literals ───────────────────────────────────────────────── *)
 
 literal       ::= float_literal | integer_literal | boolean_literal
-          | unit_literal  | string_literal
+          | unit_literal  | string_literal | char_literal
 
 float_literal   ::= [ "-" ] DIGIT+ "." DIGIT+
 integer_literal   ::= [ "-" ] DIGIT+
@@ -208,10 +209,20 @@ boolean_literal   ::= "true" | "false"
 unit_literal    ::= "()"
 string_literal  ::= '"' string_char* '"'
           | "[=[" raw_char* "]=]"
-string_char     ::= '\"'         (* escaped double quote *)
-          | '\n' | '\t' | '\\'  (* escape sequences *)
-          | NON_QUOTE NON_BACKSLASH
+string_char     ::= escape_seq | NON_QUOTE NON_BACKSLASH
 raw_char      ::= ANY - "]=]"
+
+char_literal    ::= "'" char_body "'"
+char_body       ::= escape_seq | NON_QUOTE NON_BACKSLASH
+
+escape_seq      ::= '\' named_esc
+          | '\' OCTAL_DIGIT OCTAL_DIGIT? OCTAL_DIGIT?
+          | '\x' HEX_DIGIT HEX_DIGIT
+          | '\u{' HEX_DIGIT+ '}'
+named_esc       ::= 'a' | 'b' | 't' | 'n' | 'v' | 'f' | 'r' | 'e'
+          | '\\' | '\'' | '"'
+OCTAL_DIGIT     ::= '0'..'7'
+HEX_DIGIT       ::= '0'..'9' | 'a'..'f' | 'A'..'F'
 
 (* ── Comments & Terminals ───────────────────────────────────── *)
 
@@ -261,7 +272,7 @@ import external stdlib/stdlib.wasm
 ## Keywords
 
 ```
-pub, opaque, type, exception, import, external, from, as,
+export, opaque, type, exception, import, external, from, as,
 port, handler, inject, require, throws,
 let, fn, return, do, end,
 if, then, else, match, case,
