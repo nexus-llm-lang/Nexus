@@ -1758,17 +1758,6 @@ impl Parser {
                     is_external: false,
                 }))
             }
-            // import from path
-            TokenKind::From => {
-                self.advance();
-                let path = self.parse_import_path()?;
-                Ok(TopLevel::Import(Import {
-                    path,
-                    alias: None,
-                    items: vec![],
-                    is_external: false,
-                }))
-            }
             _ => Err(ParseError {
                 message: format!("expected import form, got {:?}", self.peek()),
                 span: self.peek_span(),
