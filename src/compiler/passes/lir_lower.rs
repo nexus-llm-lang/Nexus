@@ -607,14 +607,31 @@ impl<'a> LowerCtx<'a> {
         for (cond_opt, case_stmts, case_ret) in lowered_cases.into_iter().rev() {
             let else_body = chain.take().map_or_else(Vec::new, |next| vec![next]);
 
-            // Last remaining arm: treat as exhaustive fallback (cond=true)
-            let cond = if else_body.is_empty() {
+            // Last remaining arm: only treat as unconditional fallback for
+            // single-case matches (truly exhaustive). Multi-case matches need
+            // the actual tag condition on the last arm too.
+            let cond = if else_body.is_empty() && cases.len() == 1 {
                 LirAtom::Bool(true)
             } else {
                 cond_opt.unwrap_or(LirAtom::Bool(true))
             };
 
-            if any_returns {
+            // Check if the case body is trivially unit (empty or just unit atoms).
+            // Such cases should fall through (plain If) instead of returning
+            // from the enclosing function (IfReturn). This prevents e.g.
+            // `case None -> ()` from emitting a spurious WASM return.
+            let body_is_trivially_unit = case_stmts.is_empty()
+                || case_stmts.iter().all(|s| {
+                    matches!(
+                        s,
+                        LirStmt::Let {
+                            expr: LirExpr::Atom(LirAtom::Unit),
+                            ..
+                        }
+                    )
+                });
+
+            if any_returns && !(body_is_trivially_unit && case_ret.is_none()) {
                 let then_ret = case_ret
                     .or_else(|| fallback_return_atom_from_terminal_stmt(&case_stmts))
                     .unwrap_or_else(|| default_atom_for_type(ret_type));
@@ -752,8 +769,11 @@ impl<'a> LowerCtx<'a> {
         for (cond_opt, mut case_stmts, case_val) in lowered_cases {
             let else_body = chain.take().map_or_else(Vec::new, |next| vec![next]);
 
-            let cond = if else_body.is_empty() {
-                LirAtom::Bool(true) // last arm = exhaustive fallback
+            // Last remaining arm: only treat as unconditional fallback for
+            // single-case matches (truly exhaustive). Multi-case matches need
+            // the actual tag condition on the last arm too.
+            let cond = if else_body.is_empty() && cases.len() == 1 {
+                LirAtom::Bool(true)
             } else {
                 cond_opt.unwrap_or(LirAtom::Bool(true))
             };
