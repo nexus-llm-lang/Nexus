@@ -40,6 +40,8 @@ pub(super) struct CodegenLayout {
     pub(super) bt_pop_idx: Option<u32>,
     pub(super) bt_freeze_idx: Option<u32>,
     pub(super) allocate_func_idx: Option<u32>,
+    pub(super) exn_flag_global: u32,
+    pub(super) exn_value_global: u32,
 }
 
 pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout, CodegenError> {
@@ -101,6 +103,8 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
         bt_pop_idx: None,
         bt_freeze_idx: None,
         allocate_func_idx: None,
+        exn_flag_global: 0,
+        exn_value_global: 0,
     })
 }
 
