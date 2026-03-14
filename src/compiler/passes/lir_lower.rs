@@ -584,82 +584,43 @@ impl<'a> LowerCtx<'a> {
             return Ok(());
         }
 
-        // Lower all cases first
-        let mut lowered_cases = Vec::new();
-        for case in cases {
-            let (cond_opt, case_stmts, case_ret) =
-                self.lower_match_case(&target_atom, &case.pattern, &case.body, ret_type)?;
-            lowered_cases.push((cond_opt, case_stmts, case_ret));
-        }
-
-        // Check if any case has an explicit return value (case_ret from bare
-        // expression or Return stmt, or an IfReturn/TryCatch in the lowered body).
-        // Do NOT use fallback_return_atom_from_terminal_stmt here — it also matches
-        // trailing Let bindings which are NOT returns and would cause spurious WASM
-        // `return` instructions that prevent code after the match from executing.
-        let any_returns = lowered_cases.iter().any(|(_, stmts, ret)| {
-            ret.is_some() || has_terminal_return(stmts)
-        });
-
-        // Build chain in reverse
+        // Build chain: each case becomes an IfReturn with cond=true for the last (fallback) case
         let mut chain: Option<LirStmt> = None;
 
-        for (cond_opt, case_stmts, case_ret) in lowered_cases.into_iter().rev() {
+        for case in cases.iter().rev() {
+            let (cond_opt, case_stmts, case_ret) =
+                self.lower_match_case(&target_atom, &case.pattern, &case.body, ret_type)?;
+
             let else_body = chain.take().map_or_else(Vec::new, |next| vec![next]);
 
-            // Last remaining arm: only treat as unconditional fallback for
-            // single-case matches (truly exhaustive). Multi-case matches need
-            // the actual tag condition on the last arm too.
-            let cond = if else_body.is_empty() && cases.len() == 1 {
+            // Last remaining arm: treat as exhaustive fallback (cond=true)
+            let cond = if else_body.is_empty() {
                 LirAtom::Bool(true)
             } else {
                 cond_opt.unwrap_or(LirAtom::Bool(true))
             };
 
-            // Check if the case body is trivially unit (empty or just unit atoms).
-            // Such cases should fall through (plain If) instead of returning
-            // from the enclosing function (IfReturn). This prevents e.g.
-            // `case None -> ()` from emitting a spurious WASM return.
-            let body_is_trivially_unit = case_stmts.is_empty()
-                || case_stmts.iter().all(|s| {
-                    matches!(
-                        s,
-                        LirStmt::Let {
-                            expr: LirExpr::Atom(LirAtom::Unit),
-                            ..
-                        }
-                    )
-                });
+            let then_ret = case_ret
+                .or_else(|| fallback_return_atom_from_terminal_stmt(&case_stmts))
+                .unwrap_or_else(|| default_atom_for_type(ret_type));
+            // If the case diverges (e.g. raise), case_ret may be Unit-typed
+            // even though the function returns non-Unit. Use a placeholder of
+            // the correct type so codegen can register a proper WASM local.
+            let then_ret =
+                if matches!(then_ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
+                    default_atom_for_type(ret_type)
+                } else {
+                    then_ret
+                };
 
-            if any_returns && !(body_is_trivially_unit && case_ret.is_none()) {
-                let then_ret = case_ret
-                    .or_else(|| fallback_return_atom_from_terminal_stmt(&case_stmts))
-                    .unwrap_or_else(|| default_atom_for_type(ret_type));
-                // If the case diverges (e.g. raise), case_ret may be Unit-typed
-                // even though the function returns non-Unit. Use a placeholder of
-                // the correct type so codegen can register a proper WASM local.
-                let then_ret =
-                    if matches!(then_ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
-                        default_atom_for_type(ret_type)
-                    } else {
-                        then_ret
-                    };
-
-                chain = Some(LirStmt::IfReturn {
-                    cond,
-                    then_body: case_stmts,
-                    then_ret,
-                    else_body,
-                    else_ret: None,
-                    ret_type: ret_type.clone(),
-                });
-            } else {
-                chain = Some(LirStmt::If {
-                    cond,
-                    then_body: case_stmts,
-                    else_body,
-                });
-            }
+            chain = Some(LirStmt::IfReturn {
+                cond,
+                then_body: case_stmts,
+                then_ret,
+                else_body,
+                else_ret: None,
+                ret_type: ret_type.clone(),
+            });
         }
 
         if let Some(stmt) = chain {
@@ -769,11 +730,8 @@ impl<'a> LowerCtx<'a> {
         for (cond_opt, mut case_stmts, case_val) in lowered_cases {
             let else_body = chain.take().map_or_else(Vec::new, |next| vec![next]);
 
-            // Last remaining arm: only treat as unconditional fallback for
-            // single-case matches (truly exhaustive). Multi-case matches need
-            // the actual tag condition on the last arm too.
-            let cond = if else_body.is_empty() && cases.len() == 1 {
-                LirAtom::Bool(true)
+            let cond = if else_body.is_empty() {
+                LirAtom::Bool(true) // last arm = exhaustive fallback
             } else {
                 cond_opt.unwrap_or(LirAtom::Bool(true))
             };
@@ -1761,21 +1719,6 @@ fn infer_binary_type(op: BinaryOp, lhs: &Type, rhs: &Type) -> Type {
         Type::I32
     } else {
         Type::I64
-    }
-}
-
-/// Check if the terminal statement in a block is a genuine return-containing
-/// statement (IfReturn or TryCatch with returns). Unlike `fallback_return_atom_from_terminal_stmt`,
-/// this does NOT match trailing Let bindings, which are not actual returns.
-fn has_terminal_return(stmts: &[LirStmt]) -> bool {
-    match stmts.last() {
-        Some(LirStmt::IfReturn { .. }) => true,
-        Some(LirStmt::TryCatch {
-            catch_ret,
-            body_ret,
-            ..
-        }) => catch_ret.is_some() || body_ret.is_some(),
-        _ => false,
     }
 }
 
