@@ -213,6 +213,100 @@ end
     );
 }
 
+// ---- Cross-function exception handling ----
+
+#[test]
+fn codegen_cross_function_raise_caught_by_caller_try_catch() {
+    exec(
+        r#"
+exception Boom(i64)
+
+let thrower = fn () -> unit throws { Exn } do
+    raise Boom(42)
+    return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+    try
+        thrower()
+        raise RuntimeError(val: "should not reach here")
+    catch e ->
+        match e do
+          case Boom(code) ->
+            if code != 42 then raise RuntimeError(val: "expected 42") end
+            return ()
+          case _ -> raise RuntimeError(val: "unexpected exception")
+        end
+    end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_cross_function_raise_with_return_value_caught() {
+    exec(
+        r#"
+exception Boom(i64)
+
+let thrower = fn () -> i64 throws { Exn } do
+    raise Boom(99)
+    return 0
+end
+
+let main = fn () -> unit throws { Exn } do
+    try
+        let _ = thrower()
+        raise RuntimeError(val: "should not reach here")
+    catch e ->
+        match e do
+          case Boom(code) ->
+            if code != 99 then raise RuntimeError(val: "expected 99") end
+            return ()
+          case _ -> raise RuntimeError(val: "unexpected exception")
+        end
+    end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_cross_function_raise_propagates_through_intermediate() {
+    exec(
+        r#"
+exception Boom(i64)
+
+let deep_thrower = fn () -> unit throws { Exn } do
+    raise Boom(7)
+    return ()
+end
+
+let middle = fn () -> unit throws { Exn } do
+    deep_thrower()
+    return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+    try
+        middle()
+        raise RuntimeError(val: "should not reach here")
+    catch e ->
+        match e do
+          case Boom(code) ->
+            if code != 7 then raise RuntimeError(val: "expected 7") end
+            return ()
+          case _ -> raise RuntimeError(val: "unexpected exception")
+        end
+    end
+    return ()
+end
+"#,
+    );
+}
+
 // ---- Match as expression ----
 
 #[test]

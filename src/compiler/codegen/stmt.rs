@@ -24,6 +24,7 @@ pub(super) fn compile_stmt(
     temps: &FunctionTemps,
     function_ret_type: &Type,
     in_try: bool,
+    is_entrypoint: bool,
 ) -> Result<(), CodegenError> {
     match stmt {
         LirStmt::Let { name, typ, expr } => {
@@ -36,7 +37,9 @@ pub(super) fn compile_stmt(
                 external_indices,
                 layout,
                 temps,
+                function_ret_type,
                 in_try,
+                is_entrypoint,
             )?;
             let et = super::emit::expr_type(expr);
             if matches!(typ, Type::Unit) {
@@ -74,6 +77,7 @@ pub(super) fn compile_stmt(
                     temps,
                     function_ret_type,
                     in_try,
+                    is_entrypoint,
                 )?;
             }
             if !else_body.is_empty() {
@@ -90,6 +94,7 @@ pub(super) fn compile_stmt(
                         temps,
                         function_ret_type,
                         in_try,
+                        is_entrypoint,
                     )?;
                 }
             }
@@ -119,6 +124,7 @@ pub(super) fn compile_stmt(
                     temps,
                     function_ret_type,
                     in_try,
+                    is_entrypoint,
                 )?;
             }
             compile_atom(then_ret, out, local_map, layout)?;
@@ -141,6 +147,7 @@ pub(super) fn compile_stmt(
                         temps,
                         function_ret_type,
                         in_try,
+                        is_entrypoint,
                     )?;
                 }
                 if let Some(else_ret) = else_ret {
@@ -170,8 +177,9 @@ pub(super) fn compile_stmt(
                         name: catch_param.to_string(),
                     })?;
 
+            // Reset global exception flag at try entry
             out.instruction(&Instruction::I32Const(0));
-            out.instruction(&Instruction::LocalSet(temps.exn_flag_i32));
+            out.instruction(&Instruction::GlobalSet(layout.exn_flag_global));
 
             out.instruction(&Instruction::Block(BlockType::Empty));
             for nested in body {
@@ -186,8 +194,9 @@ pub(super) fn compile_stmt(
                     temps,
                     function_ret_type,
                     true,
+                    is_entrypoint,
                 )?;
-                out.instruction(&Instruction::LocalGet(temps.exn_flag_i32));
+                out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
                 out.instruction(&Instruction::BrIf(0));
             }
             if let Some(ret) = body_ret {
@@ -200,12 +209,13 @@ pub(super) fn compile_stmt(
             }
             out.instruction(&Instruction::End);
 
-            out.instruction(&Instruction::LocalGet(temps.exn_flag_i32));
+            // Check global flag: if exception was raised, run catch
+            out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
             out.instruction(&Instruction::If(BlockType::Empty));
-            out.instruction(&Instruction::LocalGet(temps.exn_value_i64));
+            out.instruction(&Instruction::GlobalGet(layout.exn_value_global));
             out.instruction(&Instruction::LocalSet(catch_local.index));
             out.instruction(&Instruction::I32Const(0));
-            out.instruction(&Instruction::LocalSet(temps.exn_flag_i32));
+            out.instruction(&Instruction::GlobalSet(layout.exn_flag_global));
 
             if in_try {
                 out.instruction(&Instruction::Block(BlockType::Empty));
@@ -222,9 +232,10 @@ pub(super) fn compile_stmt(
                     temps,
                     function_ret_type,
                     in_try,
+                    is_entrypoint,
                 )?;
                 if in_try {
-                    out.instruction(&Instruction::LocalGet(temps.exn_flag_i32));
+                    out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
                     out.instruction(&Instruction::BrIf(0));
                 }
             }
@@ -334,6 +345,7 @@ pub(super) fn compile_stmt(
                     temps,
                     function_ret_type,
                     in_try,
+                    is_entrypoint,
                 )?;
             }
             // Check break condition
@@ -353,6 +365,7 @@ pub(super) fn compile_stmt(
                     temps,
                     function_ret_type,
                     in_try,
+                    is_entrypoint,
                 )?;
             }
             out.instruction(&Instruction::Br(0)); // continue to loop head
