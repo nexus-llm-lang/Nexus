@@ -120,7 +120,7 @@ Binary operators with standard precedence (multiplicative binds tighter than add
 | `==` `!=` `<` `>` `<=` `>=` | Integer / generic comparison |
 | `==.` `!=.` `<.` `>.` `<=.` `>=.` | Float comparison |
 | `&&` | Logical AND |
-| `\|\|` | Logical OR |
+| <code>&#124;&#124;</code> | Logical OR |
 
 ### Function Calls
 
@@ -350,7 +350,7 @@ end
 
 ```nexus
 import from path/to/module.nx                        // anonymous
-import * as math from path/to/math.nx                 // namespace alias
+import * as math from path/to/math.nx                // namespace alias
 import { add, sub } from path/to/math.nx             // named items
 import { add, sub }, * as math from path/to/math.nx  // named + namespace
 import external path/to/lib.wasm                     // Wasm module
