@@ -9,6 +9,7 @@
 | `f32` | 32-bit float | — | Requires explicit annotation |
 | `f64` / `float` | 64-bit float | Yes | Float literals default to this |
 | `bool` | — | — | `true` / `false` |
+| `char` | — | — | Single Unicode character (`'a'`, `'\n'`, `'\x41'`, `'\u{1F600}'`) |
 | `string` | — | — | UTF-8, immutable |
 | `unit` | — | — | `()` literal |
 

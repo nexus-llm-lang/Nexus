@@ -138,8 +138,20 @@ end
 
 - `conc` spawns multiple `task` units and blocks until **all** complete
 - Tasks cannot capture mutable (`~`) bindings from the enclosing scope
-- In the reference interpreter, tasks execute sequentially for deterministic debugging
 - The compiled WASM output uses OS-thread parallelism via `std::thread::scope`
+
+## Implicit Unit Return
+
+Functions with return type `unit` may omit the trailing `return ()`. If the function body does not contain any `return` statement, the compiler implicitly appends `return ()`:
+
+```nexus
+let greet = fn (name: string) -> unit require { Console } do
+  Console.println(val: "Hello, " ++ name)
+  // implicit return ()
+end
+```
+
+Functions with non-`unit` return types still require explicit `return`.
 
 ## Entrypoint
 

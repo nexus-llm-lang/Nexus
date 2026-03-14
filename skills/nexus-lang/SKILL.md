@@ -103,11 +103,16 @@ let ~x = 10                     // mutable ref, stack-confined
 let v = ~x                      // dereference
 ```
 
-### 5. Explicit `return` required
+### 5. Explicit `return` required (except Unit)
 ```nexus
-// Every function must have explicit return
+// Non-unit functions must have explicit return
 let double = fn (n: i64) -> i64 do
   return n * 2
+end
+
+// Unit-returning functions may omit return ()
+let greet = fn (name: string) -> unit require { Console } do
+  Console.println(val: "Hello, " ++ name)
 end
 ```
 
@@ -155,7 +160,7 @@ end
 
 | Type | Syntax | Notes |
 |------|--------|-------|
-| Primitives | `i32`, `i64`, `f32`, `f64`/`float`, `bool`, `string`, `unit` | `i64` and `f64` are defaults |
+| Primitives | `i32`, `i64`, `f32`, `f64`/`float`, `bool`, `char`, `string`, `unit` | `i64` and `f64` are defaults |
 | Record | `{ x: i64, y: i64 }` | Structural typing |
 | ADT/Enum | `Ok(val: T) \| Err(err: E)` | Labeled fields |
 | List | `[ T ]` | Immutable singly-linked |
@@ -245,7 +250,7 @@ end
 |-------|-------------|
 | Positional arguments: `f(1, 2)` | Labeled: `f(a: 1, b: 2)` |
 | Brace blocks: `{ ... }` | `do ... end` / `then ... end` |
-| `return` omitted | Always write explicit `return` |
+| `return` omitted for non-unit | Explicit `return` for non-unit functions |
 | Capturing `~x` in closure | Only immutable bindings captured |
 | `let _ = linear_val` | Consume linear values via function call or pattern match |
 | Implicit I/O | Declare via `require { PermConsole }` + inject handler |

@@ -17,6 +17,7 @@ Nexus uses a strict type system with Hindley-Milner inference, structural record
 | `f64` | 64-bit floating-point |
 | `float` | Alias of `f64` |
 | `bool` | Boolean (`true` / `false`) |
+| `char` | Single Unicode character (`'a'`, `'\n'`, `'\x41'`, `'\u{1F600}'`) |
 | `string` | Immutable UTF-8 string |
 | `unit` | The unit type, written `()` as a value |
 
