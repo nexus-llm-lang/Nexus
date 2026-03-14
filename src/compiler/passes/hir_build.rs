@@ -155,6 +155,10 @@ struct MirBuilder {
     current_source_file: Option<String>,
     /// Current source text (for byte-offset → line-number conversion)
     current_source_text: Option<String>,
+    /// Counter for generating unique lambda names
+    lambda_counter: usize,
+    /// Full Arrow types for known functions (for FuncRef type resolution)
+    fn_types: HashMap<String, Type>,
 }
 
 impl MirBuilder {
@@ -179,6 +183,8 @@ impl MirBuilder {
             pending_functions: Vec::new(),
             current_source_file: None,
             current_source_text: None,
+            lambda_counter: 0,
+            fn_types: HashMap::new(),
         }
     }
 
@@ -194,21 +200,27 @@ impl MirBuilder {
         // Function bodies are stored as pending for the second pass.
         self.collect_declarations(program, &HashMap::new())?;
 
-        // Pass 2: Convert all pending function bodies with full handler scope
+        // Pass 2: Convert all pending function bodies with full handler scope.
+        // Loop until no new lambda-lifted functions are generated.
         let scope = self.build_global_scope();
-        let pending = std::mem::take(&mut self.pending_functions);
-        for pf in pending {
-            let mut body = pf.preamble;
-            body.extend(self.convert_stmts(&pf.body, &pf.rename_map, &scope)?);
-            self.functions.push(MirFunction {
-                name: Symbol::from(&pf.name),
-                params: pf.params,
-                ret_type: pf.ret_type,
-                body,
-                span: pf.span,
-                source_file: pf.source_file,
-                source_line: pf.source_line,
-            });
+        loop {
+            let pending = std::mem::take(&mut self.pending_functions);
+            if pending.is_empty() {
+                break;
+            }
+            for pf in pending {
+                let mut body = pf.preamble;
+                body.extend(self.convert_stmts(&pf.body, &pf.rename_map, &scope)?);
+                self.functions.push(MirFunction {
+                    name: Symbol::from(&pf.name),
+                    params: pf.params,
+                    ret_type: pf.ret_type,
+                    body,
+                    span: pf.span,
+                    source_file: pf.source_file,
+                    source_line: pf.source_line,
+                });
+            }
         }
 
         // Collect reachable functions from main
@@ -368,8 +380,8 @@ impl MirBuilder {
                             type_params: _,
                             params,
                             ret_type,
-                            requires: _,
-                            throws: _,
+                            requires,
+                            throws,
                             body,
                         } => {
                             // Desugar main(args: [string]) -> unit
@@ -411,6 +423,13 @@ impl MirBuilder {
                             } else {
                                 self.fn_ret_types
                                     .insert(name.clone(), ret_type.clone());
+                                let arrow_type = Type::Arrow(
+                                    params.iter().map(|p| (p.name.clone(), p.typ.clone())).collect(),
+                                    Box::new(ret_type.clone()),
+                                    Box::new(requires.clone()),
+                                    Box::new(throws.clone()),
+                                );
+                                self.fn_types.insert(name.clone(), arrow_type);
                                 self.pending_functions.push(PendingFunction {
                                     name,
                                     params: params
@@ -643,6 +662,9 @@ impl MirBuilder {
             if let Some(ty) = self.fn_ret_types.get(registered_name).cloned() {
                 self.fn_ret_types.insert(alias_name.to_string(), ty);
             }
+            if let Some(ty) = self.fn_types.get(registered_name).cloned() {
+                self.fn_types.insert(alias_name.to_string(), ty);
+            }
             self.pending_functions.push(aliased);
         }
     }
@@ -769,7 +791,7 @@ impl MirBuilder {
     // ---- AST → MIR conversion (with port resolution & desugaring) ----
 
     fn convert_stmts(
-        &self,
+        &mut self,
         stmts: &[Spanned<Stmt>],
         rename_map: &HashMap<String, String>,
         scope: &HandlerScope,
@@ -796,7 +818,7 @@ impl MirBuilder {
     }
 
     fn convert_stmt(
-        &self,
+        &mut self,
         stmt: &Stmt,
         rename_map: &HashMap<String, String>,
         scope: &HandlerScope,
@@ -910,7 +932,7 @@ impl MirBuilder {
     }
 
     fn convert_expr(
-        &self,
+        &mut self,
         expr: &Spanned<Expr>,
         rename_map: &HashMap<String, String>,
         scope: &HandlerScope,
@@ -921,6 +943,9 @@ impl MirBuilder {
                 let resolved = self.rename(name, rename_map);
                 if let Some(lit) = self.global_constants.get(&resolved) {
                     Ok(MirExpr::Literal(lit.clone()))
+                } else if self.fn_ret_types.contains_key(&resolved) {
+                    // Function name used as a value → emit FuncRef
+                    Ok(MirExpr::FuncRef(Symbol::from(resolved)))
                 } else {
                     Ok(MirExpr::Variable(Symbol::from(resolved)))
                 }
@@ -937,15 +962,17 @@ impl MirBuilder {
                 let renamed_func = self.rename(func, rename_map);
 
                 // Check if this is a port-qualified call (e.g., "Console.print")
-                for (port_name, _) in &self.port_methods {
-                    if let Some(method_name) = renamed_func
-                        .strip_prefix(port_name.as_str())
-                        .and_then(|s| s.strip_prefix('.'))
-                    {
-                        return self.resolve_port_call(
-                            port_name, method_name, args, rename_map, scope, &expr.span,
-                        );
-                    }
+                let port_match = self.port_methods.keys()
+                    .find_map(|port_name| {
+                        renamed_func
+                            .strip_prefix(port_name.as_str())
+                            .and_then(|s| s.strip_prefix('.'))
+                            .map(|method_name| (port_name.clone(), method_name.to_string()))
+                    });
+                if let Some((port_name, method_name)) = port_match {
+                    return self.resolve_port_call(
+                        &port_name, &method_name, args, rename_map, scope, &expr.span,
+                    );
                 }
 
                 let mir_args: Vec<(Symbol, MirExpr)> = args
@@ -955,13 +982,26 @@ impl MirBuilder {
                     })
                     .collect::<Result<_, HirBuildError>>()?;
 
-                let ret_type = self.lookup_ret_type(&renamed_func);
+                let is_known_function = self.fn_ret_types.contains_key(&renamed_func)
+                    || self.externals.iter().any(|e| e.name == renamed_func.as_str());
 
-                Ok(MirExpr::Call {
-                    func: Symbol::from(renamed_func),
-                    args: mir_args,
-                    ret_type,
-                })
+                if is_known_function {
+                    let ret_type = self.lookup_ret_type(&renamed_func);
+                    Ok(MirExpr::Call {
+                        func: Symbol::from(renamed_func),
+                        args: mir_args,
+                        ret_type,
+                    })
+                } else {
+                    // Dynamic call — callee is a variable holding a funcref
+                    // callee_type is I64 here; actual Arrow type resolved in LIR lowering via semantic_vars
+                    Ok(MirExpr::CallIndirect {
+                        callee: Box::new(MirExpr::Variable(Symbol::from(renamed_func.as_str()))),
+                        args: mir_args,
+                        ret_type: Type::I64,
+                        callee_type: Type::I64,
+                    })
+                }
             }
             Expr::Constructor(name, args) => {
                 if args.is_empty() {
@@ -1077,9 +1117,44 @@ impl MirBuilder {
                     },
                 })
             }
-            Expr::Lambda { .. } => {
-                // Lambda in expression position — emit unit placeholder
-                Ok(MirExpr::Literal(Literal::Unit))
+            Expr::Lambda {
+                type_params: _,
+                params,
+                ret_type,
+                requires,
+                throws,
+                body,
+            } => {
+                // Lambda-lift to a top-level function and emit FuncRef
+                let lifted_name = format!("__lambda_{}", self.lambda_counter);
+                self.lambda_counter += 1;
+                let arrow_type = Type::Arrow(
+                    params.iter().map(|p| (p.name.clone(), p.typ.clone())).collect(),
+                    Box::new(ret_type.clone()),
+                    Box::new(requires.clone()),
+                    Box::new(throws.clone()),
+                );
+                self.fn_ret_types.insert(lifted_name.clone(), ret_type.clone());
+                self.fn_types.insert(lifted_name.clone(), arrow_type);
+                self.pending_functions.push(PendingFunction {
+                    name: lifted_name.clone(),
+                    params: params
+                        .iter()
+                        .map(|p| MirParam {
+                            name: Symbol::from(&p.name),
+                            label: Symbol::from(&p.name),
+                            typ: p.typ.clone(),
+                        })
+                        .collect(),
+                    ret_type: ret_type.clone(),
+                    body: body.clone(),
+                    rename_map: rename_map.clone(),
+                    source_file: self.current_source_file.clone(),
+                    source_line: self.source_line_at(&expr.span),
+                    span: expr.span.clone(),
+                    preamble: vec![],
+                });
+                Ok(MirExpr::FuncRef(Symbol::from(lifted_name)))
             }
             Expr::Raise(e) => Ok(MirExpr::Raise(Box::new(
                 self.convert_expr(e, rename_map, scope)?,
@@ -1094,7 +1169,7 @@ impl MirBuilder {
 
     /// Resolve a port method call to a direct call to the handler function.
     fn resolve_port_call(
-        &self,
+        &mut self,
         port_name: &str,
         method_name: &str,
         args: &[(String, Spanned<Expr>)],
@@ -1241,6 +1316,13 @@ fn collect_calls_in_mir_expr(expr: &MirExpr, out: &mut Vec<Symbol>) {
             collect_calls_in_mir_stmts(body, out);
         }
         MirExpr::Raise(expr) => collect_calls_in_mir_expr(expr, out),
+        MirExpr::FuncRef(name) => out.push(*name),
+        MirExpr::CallIndirect { callee, args, .. } => {
+            collect_calls_in_mir_expr(callee, out);
+            for (_, arg) in args {
+                collect_calls_in_mir_expr(arg, out);
+            }
+        }
         MirExpr::Borrow(_) | MirExpr::Literal(_) | MirExpr::Variable(_) => {}
     }
 }

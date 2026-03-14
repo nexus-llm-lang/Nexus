@@ -131,6 +131,18 @@ pub enum LirExpr {
         value: LirAtom,
         typ: Type,
     },
+    /// Reference to a function as a first-class value (table index as i64)
+    FuncRef {
+        func: Symbol,
+        typ: Type,
+    },
+    /// Indirect call through a funcref value
+    CallIndirect {
+        callee: LirAtom,
+        args: Vec<(Symbol, LirAtom)>,
+        typ: Type,
+        callee_type: Type,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

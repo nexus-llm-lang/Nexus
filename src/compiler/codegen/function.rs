@@ -414,6 +414,61 @@ pub(super) fn compile_expr(
             }
             Ok(())
         }
+        LirExpr::FuncRef { func, .. } => {
+            let table_idx = layout
+                .funcref_table_indices
+                .get(func)
+                .copied()
+                .ok_or_else(|| CodegenError::CallTargetNotFound {
+                    name: func.to_string(),
+                })?;
+            out.instruction(&Instruction::I64Const(table_idx as i64));
+            Ok(())
+        }
+        LirExpr::CallIndirect {
+            callee,
+            args,
+            callee_type,
+            ..
+        } => {
+            // Look up the type index for call_indirect
+            let callee_type_key = format!("{:?}", callee_type);
+            let type_index = layout
+                .indirect_type_indices
+                .get(&callee_type_key)
+                .copied()
+                .ok_or_else(|| {
+                    // Fallback: try to compute the signature and look up
+                    CodegenError::CallTargetNotFound {
+                        name: format!("indirect call type: {:?}", callee_type),
+                    }
+                })?;
+
+            // Push args onto stack
+            if let Type::Arrow(param_types, _, _, _) = callee_type {
+                // Emit args in sorted label order (they're already sorted in LIR)
+                for ((_, atom), (_, param_type)) in args.iter().zip(param_types.iter()) {
+                    compile_atom(atom, out, local_map, layout)?;
+                    emit_numeric_coercion(&atom.typ(), param_type, out)?;
+                }
+            } else {
+                // No Arrow type info — emit args as-is
+                for (_, atom) in args {
+                    compile_atom(atom, out, local_map, layout)?;
+                }
+            }
+
+            // Push callee (table index) — convert i64 to i32
+            compile_atom(callee, out, local_map, layout)?;
+            out.instruction(&Instruction::I32WrapI64);
+
+            // Emit call_indirect
+            out.instruction(&Instruction::CallIndirect {
+                type_index,
+                table_index: 0,
+            });
+            Ok(())
+        }
     }
 }
 

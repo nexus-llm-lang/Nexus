@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use wasm_encoder::{
-    CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
-    FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction, MemorySection,
-    MemoryType, Module, TypeSection, ValType,
+    CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType, ExportKind,
+    ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
+    Instruction, MemorySection, MemoryType, Module, RefType, TableSection, TableType, TypeSection,
+    ValType,
 };
 
 use crate::constants::{ENTRYPOINT, MEMORY_EXPORT, WASI_CLI_RUN_EXPORT};
@@ -80,6 +81,11 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         );
     }
 
+    // Collect funcref targets and indirect call types
+    let funcref_targets = collect_funcref_targets(program);
+    let indirect_call_types = collect_indirect_call_types(program);
+    let has_funcref = !funcref_targets.is_empty();
+
     let mut layout = build_codegen_layout(program)?;
     if has_conc {
         layout.conc_spawn_idx = Some(program.externals.len() as u32);
@@ -96,17 +102,28 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         layout.allocate_func_idx = Some(alloc_idx);
     }
 
+    // Build funcref table indices
+    if has_funcref {
+        for (table_idx, func_name) in funcref_targets.iter().enumerate() {
+            layout.funcref_table_indices.insert(*func_name, table_idx as u32);
+        }
+    }
+
     let mut module = Module::new();
 
     // === Type Section ===
     let mut types = TypeSection::new();
     let mut next_type_index: u32 = 0;
+    // Track signature→type_index for deduplication
+    let mut sig_to_type_idx: HashMap<String, u32> = HashMap::new();
 
     let mut external_type_indices = Vec::with_capacity(program.externals.len());
     for ext in &program.externals {
         let params = external_param_types(ext)?;
         let results = external_return_types(ext)?;
+        let key = sig_key(&params, &results);
         types.ty().function(params, results);
+        sig_to_type_idx.entry(key).or_insert(next_type_index);
         external_type_indices.push(next_type_index);
         next_type_index += 1;
     }
@@ -150,12 +167,36 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
             .map(|p| type_to_wasm_valtype(&p.typ))
             .collect::<Result<Vec<_>, _>>()?;
         let results = return_type_to_wasm_result(&func.ret_type)?;
+        let key = sig_key(&params, &results);
         types.ty().function(params, results);
+        sig_to_type_idx.entry(key).or_insert(next_type_index);
         internal_type_indices.push(next_type_index);
         next_type_index += 1;
     }
     let wasi_cli_run_type_index = next_type_index;
     types.ty().function([], [ValType::I32]);
+    next_type_index += 1;
+
+    // Add type signatures for indirect call Arrow types
+    for arrow in &indirect_call_types {
+        let (params, results) = arrow_type_to_wasm_sig(arrow)?;
+        let key = sig_key(&params, &results);
+        if !sig_to_type_idx.contains_key(&key) {
+            types.ty().function(params, results);
+            sig_to_type_idx.insert(key.clone(), next_type_index);
+            next_type_index += 1;
+        }
+        layout.indirect_type_indices.insert(format!("{:?}", arrow), *sig_to_type_idx.get(&key).unwrap());
+    }
+    // Also register type indices for any existing signatures that match indirect call patterns
+    for arrow in &indirect_call_types {
+        let (params, results) = arrow_type_to_wasm_sig(arrow)?;
+        let key = sig_key(&params, &results);
+        if let Some(&idx) = sig_to_type_idx.get(&key) {
+            layout.indirect_type_indices.insert(format!("{:?}", arrow), idx);
+        }
+    }
+
     module.section(&types);
 
     // === Import Section ===
@@ -234,6 +275,20 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
     functions.function(wasi_cli_run_type_index);
     module.section(&functions);
 
+    // === Table Section ===
+    if has_funcref {
+        let table_size = funcref_targets.len() as u64;
+        let mut tables = TableSection::new();
+        tables.table(TableType {
+            element_type: RefType::FUNCREF,
+            minimum: table_size,
+            maximum: Some(table_size),
+            table64: false,
+            shared: false,
+        });
+        module.section(&tables);
+    }
+
     // === Memory Section ===
     if matches!(layout.memory_mode, MemoryMode::Defined) {
         let mut memories = MemorySection::new();
@@ -307,6 +362,31 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
     }
     module.section(&exports);
 
+    // === Element Section (funcref table) ===
+    if has_funcref {
+        let func_indices: Vec<u32> = funcref_targets
+            .iter()
+            .map(|name| {
+                internal_function_indices
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        external_function_indices
+                            .get(name)
+                            .copied()
+                            .unwrap_or(0)
+                    })
+            })
+            .collect();
+        let mut elements = ElementSection::new();
+        elements.active(
+            Some(0),
+            &ConstExpr::i32_const(0),
+            Elements::Functions(std::borrow::Cow::Borrowed(&func_indices)),
+        );
+        module.section(&elements);
+    }
+
     // === Code Section ===
     let mut code = CodeSection::new();
     for func in &program.functions {
@@ -348,6 +428,117 @@ fn compile_wasi_cli_run_wrapper(main_idx: u32, main_ret_type: &Type) -> Function
     body.instruction(&Instruction::I32Const(0));
     body.instruction(&Instruction::End);
     body
+}
+
+/// Collect all function names referenced via FuncRef (functions used as values).
+fn collect_funcref_targets(program: &LirProgram) -> Vec<Symbol> {
+    let mut targets = HashSet::new();
+    fn scan_expr(expr: &LirExpr, targets: &mut HashSet<Symbol>) {
+        match expr {
+            LirExpr::FuncRef { func, .. } => { targets.insert(*func); }
+            LirExpr::CallIndirect { callee, args, .. } => {
+                scan_atom(callee, targets);
+                for (_, a) in args { scan_atom(a, targets); }
+            }
+            LirExpr::Call { args, .. } | LirExpr::TailCall { args, .. } => {
+                for (_, a) in args { scan_atom(a, targets); }
+            }
+            LirExpr::Binary { lhs, rhs, .. } => { scan_atom(lhs, targets); scan_atom(rhs, targets); }
+            LirExpr::Constructor { args, .. } => { for a in args { scan_atom(a, targets); } }
+            LirExpr::Record { fields, .. } => { for (_, a) in fields { scan_atom(a, targets); } }
+            LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } | LirExpr::Raise { value, .. } => { scan_atom(value, targets); }
+            LirExpr::Atom(a) => scan_atom(a, targets),
+        }
+    }
+    fn scan_atom(_atom: &crate::ir::lir::LirAtom, _targets: &mut HashSet<Symbol>) {}
+    fn scan_stmt(stmt: &LirStmt, targets: &mut HashSet<Symbol>) {
+        match stmt {
+            LirStmt::Let { expr, .. } => scan_expr(expr, targets),
+            LirStmt::If { then_body, else_body, .. } => {
+                for s in then_body { scan_stmt(s, targets); }
+                for s in else_body { scan_stmt(s, targets); }
+            }
+            LirStmt::IfReturn { then_body, else_body, .. } => {
+                for s in then_body { scan_stmt(s, targets); }
+                for s in else_body { scan_stmt(s, targets); }
+            }
+            LirStmt::TryCatch { body, catch_body, .. } => {
+                for s in body { scan_stmt(s, targets); }
+                for s in catch_body { scan_stmt(s, targets); }
+            }
+            LirStmt::Conc { .. } => {}
+            LirStmt::Loop { cond_stmts, body, .. } => {
+                for s in cond_stmts { scan_stmt(s, targets); }
+                for s in body { scan_stmt(s, targets); }
+            }
+        }
+    }
+    for func in &program.functions {
+        for stmt in &func.body { scan_stmt(stmt, &mut targets); }
+    }
+    let mut result: Vec<Symbol> = targets.into_iter().collect();
+    result.sort_by_key(|s| s.to_string());
+    result
+}
+
+/// Collect all distinct Arrow types used in CallIndirect (for type signature dedup).
+fn collect_indirect_call_types(program: &LirProgram) -> Vec<Type> {
+    let mut types = Vec::new();
+    let mut seen = HashSet::new();
+    fn scan_expr(expr: &LirExpr, types: &mut Vec<Type>, seen: &mut HashSet<String>) {
+        if let LirExpr::CallIndirect { callee_type, .. } = expr {
+            let key = format!("{:?}", callee_type);
+            if seen.insert(key) {
+                types.push(callee_type.clone());
+            }
+        }
+    }
+    fn scan_stmt(stmt: &LirStmt, types: &mut Vec<Type>, seen: &mut HashSet<String>) {
+        match stmt {
+            LirStmt::Let { expr, .. } => scan_expr(expr, types, seen),
+            LirStmt::If { then_body, else_body, .. } => {
+                for s in then_body { scan_stmt(s, types, seen); }
+                for s in else_body { scan_stmt(s, types, seen); }
+            }
+            LirStmt::IfReturn { then_body, else_body, .. } => {
+                for s in then_body { scan_stmt(s, types, seen); }
+                for s in else_body { scan_stmt(s, types, seen); }
+            }
+            LirStmt::TryCatch { body, catch_body, .. } => {
+                for s in body { scan_stmt(s, types, seen); }
+                for s in catch_body { scan_stmt(s, types, seen); }
+            }
+            LirStmt::Conc { .. } => {}
+            LirStmt::Loop { cond_stmts, body, .. } => {
+                for s in cond_stmts { scan_stmt(s, types, seen); }
+                for s in body { scan_stmt(s, types, seen); }
+            }
+        }
+    }
+    for func in &program.functions {
+        for stmt in &func.body { scan_stmt(stmt, &mut types, &mut seen); }
+    }
+    types
+}
+
+/// Build a WASM type signature key from an Arrow type for deduplication.
+fn arrow_type_to_wasm_sig(arrow: &Type) -> Result<(Vec<ValType>, Vec<ValType>), CodegenError> {
+    if let Type::Arrow(params, ret, _, _) = arrow {
+        let wasm_params: Vec<ValType> = params
+            .iter()
+            .map(|(_, t)| type_to_wasm_valtype(t))
+            .collect::<Result<_, _>>()?;
+        let wasm_results = return_type_to_wasm_result(ret)?;
+        Ok((wasm_params, wasm_results))
+    } else {
+        // Fallback: treat as (i64) -> i64
+        Ok((vec![ValType::I64], vec![ValType::I64]))
+    }
+}
+
+/// Create a string key for signature deduplication.
+fn sig_key(params: &[ValType], results: &[ValType]) -> String {
+    format!("{:?}->{:?}", params, results)
 }
 
 /// Check if the LIR program needs backtrace instrumentation.
