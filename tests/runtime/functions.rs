@@ -287,3 +287,73 @@ end
 "#,
     );
 }
+
+#[test]
+fn closure_captures_single_variable() {
+    exec(
+        r#"
+let make_adder = fn (n: i64) -> (x: i64) -> i64 do
+    return fn (x: i64) -> i64 do
+        return x + n
+    end
+end
+
+let main = fn () -> unit do
+    let add5 = make_adder(n: 5)
+    let result = add5(x: 37)
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn closure_captures_multiple_variables() {
+    exec(
+        r#"
+let make_linear = fn (a: i64, b: i64) -> (x: i64) -> i64 do
+    return fn (x: i64) -> i64 do
+        return a * x + b
+    end
+end
+
+let main = fn () -> unit do
+    let f = make_linear(a: 2, b: 10)
+    let result = f(x: 16)
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn closure_and_non_closure_same_type() {
+    exec(
+        r#"
+let double = fn (x: i64) -> i64 do
+    return x * 2
+end
+
+let make_adder = fn (n: i64) -> (x: i64) -> i64 do
+    return fn (x: i64) -> i64 do
+        return x + n
+    end
+end
+
+let apply = fn (f: (x: i64) -> i64, val: i64) -> i64 do
+    return f(x: val)
+end
+
+let main = fn () -> unit do
+    let r1 = apply(f: double, val: 21)
+    if r1 != 42 then raise RuntimeError(val: "expected 42 from double") end
+    let add10 = make_adder(n: 10)
+    let r2 = apply(f: add10, val: 32)
+    if r2 != 42 then raise RuntimeError(val: "expected 42 from adder") end
+    return ()
+end
+"#,
+    );
+}

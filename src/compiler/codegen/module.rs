@@ -436,6 +436,10 @@ fn collect_funcref_targets(program: &LirProgram) -> Vec<Symbol> {
     fn scan_expr(expr: &LirExpr, targets: &mut HashSet<Symbol>) {
         match expr {
             LirExpr::FuncRef { func, .. } => { targets.insert(*func); }
+            LirExpr::Closure { func, captures, .. } => {
+                targets.insert(*func);
+                for (_, a) in captures { scan_atom(a, targets); }
+            }
             LirExpr::CallIndirect { callee, args, .. } => {
                 scan_atom(callee, targets);
                 for (_, a) in args { scan_atom(a, targets); }
@@ -447,6 +451,7 @@ fn collect_funcref_targets(program: &LirProgram) -> Vec<Symbol> {
             LirExpr::Constructor { args, .. } => { for a in args { scan_atom(a, targets); } }
             LirExpr::Record { fields, .. } => { for (_, a) in fields { scan_atom(a, targets); } }
             LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } | LirExpr::Raise { value, .. } => { scan_atom(value, targets); }
+            LirExpr::ClosureEnvLoad { .. } => {}
             LirExpr::Atom(a) => scan_atom(a, targets),
         }
     }
@@ -521,18 +526,22 @@ fn collect_indirect_call_types(program: &LirProgram) -> Vec<Type> {
     types
 }
 
-/// Build a WASM type signature key from an Arrow type for deduplication.
+/// Build a WASM type signature key from an Arrow type for call_indirect.
+/// Prepends `i64` (__env) as first param for uniform closure calling convention.
 fn arrow_type_to_wasm_sig(arrow: &Type) -> Result<(Vec<ValType>, Vec<ValType>), CodegenError> {
     if let Type::Arrow(params, ret, _, _) = arrow {
-        let wasm_params: Vec<ValType> = params
-            .iter()
-            .map(|(_, t)| type_to_wasm_valtype(t))
-            .collect::<Result<_, _>>()?;
+        let mut wasm_params: Vec<ValType> = vec![ValType::I64]; // __env
+        wasm_params.extend(
+            params
+                .iter()
+                .map(|(_, t)| type_to_wasm_valtype(t))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
         let wasm_results = return_type_to_wasm_result(ret)?;
         Ok((wasm_params, wasm_results))
     } else {
-        // Fallback: treat as (i64) -> i64
-        Ok((vec![ValType::I64], vec![ValType::I64]))
+        // Fallback: treat as (i64, i64) -> i64 (env + one arg)
+        Ok((vec![ValType::I64, ValType::I64], vec![ValType::I64]))
     }
 }
 

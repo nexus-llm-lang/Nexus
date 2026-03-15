@@ -100,6 +100,9 @@ impl<'a> LirLowerer<'a> {
             })
             .collect();
 
+        // Closure conversion: transform funcref-target functions for uniform closure calling convention
+        closure_convert(&mut functions, &self.mir.functions)?;
+
         Ok(LirProgram {
             functions,
             externals,
@@ -371,6 +374,7 @@ impl<'a> LowerCtx<'a> {
                         span: task.span.clone(),
                         source_file: self.source_file.clone(),
                         source_line: self.source_line,
+                        captures: vec![],
                     };
                     let (lir_func, nested_tasks) = lower_mir_function(&task_mir, self.enum_defs)?;
                     self.task_functions.push(lir_func);
@@ -1496,10 +1500,34 @@ impl<'a> LowerCtx<'a> {
                 ))
             }
             MirExpr::FuncRef(name) => {
-                let typ = Type::I64; // funcref stored as i64 table index
+                let typ = Type::I64; // funcref stored as i64 closure pointer
                 Ok(self.bind_expr_to_temp(
                     LirExpr::FuncRef {
                         func: *name,
+                        typ: typ.clone(),
+                    },
+                    typ,
+                ))
+            }
+            MirExpr::Closure { func, captures } => {
+                // Lower each captured variable to an atom
+                let capture_atoms: Vec<(Symbol, LirAtom)> = captures
+                    .iter()
+                    .map(|name| {
+                        let typ = self
+                            .semantic_vars
+                            .get(name)
+                            .map(|st| wasm_type(st))
+                            .or_else(|| self.vars.get(name).cloned())
+                            .unwrap_or(Type::I64);
+                        (*name, LirAtom::Var { name: *name, typ })
+                    })
+                    .collect();
+                let typ = Type::I64; // closure pointer as i64
+                Ok(self.bind_expr_to_temp(
+                    LirExpr::Closure {
+                        func: *func,
+                        captures: capture_atoms,
                         typ: typ.clone(),
                     },
                     typ,
@@ -1636,7 +1664,7 @@ impl<'a> LowerCtx<'a> {
                 }),
             // Raise never returns; I64 is a placeholder (no Type::Never exists)
             MirExpr::Raise(_) => Type::I64,
-            MirExpr::FuncRef(_) => Type::I64,
+            MirExpr::FuncRef(_) | MirExpr::Closure { .. } => Type::I64,
             MirExpr::CallIndirect { ret_type, .. } => ret_type.clone(),
         }
     }
@@ -1956,6 +1984,13 @@ fn collect_mir_expr_refs(expr: &MirExpr, referenced: &mut Vec<Symbol>, seen: &mu
             }
         }
         MirExpr::FuncRef(_) | MirExpr::Literal(_) => {}
+        MirExpr::Closure { captures, .. } => {
+            for name in captures {
+                if seen.insert(*name) {
+                    referenced.push(*name);
+                }
+            }
+        }
         MirExpr::CallIndirect { callee, args, .. } => {
             collect_mir_expr_refs(callee, referenced, seen);
             for (_, arg) in args {
@@ -2124,4 +2159,257 @@ fn constructor_sorted_field_indices(
         }
     }
     None
+}
+
+// ────────────────────────────────────────────────────────────────
+// Closure conversion: ensure all funcref-target functions have a
+// uniform `(__env: i64, params...) -> ret` calling convention.
+// ────────────────────────────────────────────────────────────────
+
+/// Collect all function names that are used as FuncRef or Closure targets in the LIR.
+fn collect_lir_funcref_targets(functions: &[LirFunction]) -> HashSet<Symbol> {
+    let mut targets = HashSet::new();
+    fn scan_expr(expr: &LirExpr, targets: &mut HashSet<Symbol>) {
+        match expr {
+            LirExpr::FuncRef { func, .. } | LirExpr::Closure { func, .. } => {
+                targets.insert(*func);
+            }
+            _ => {}
+        }
+    }
+    fn scan_stmt(stmt: &LirStmt, targets: &mut HashSet<Symbol>) {
+        match stmt {
+            LirStmt::Let { expr, .. } => scan_expr(expr, targets),
+            LirStmt::If { then_body, else_body, .. } => {
+                for s in then_body { scan_stmt(s, targets); }
+                for s in else_body { scan_stmt(s, targets); }
+            }
+            LirStmt::IfReturn { then_body, else_body, .. } => {
+                for s in then_body { scan_stmt(s, targets); }
+                for s in else_body { scan_stmt(s, targets); }
+            }
+            LirStmt::TryCatch { body, catch_body, .. } => {
+                for s in body { scan_stmt(s, targets); }
+                for s in catch_body { scan_stmt(s, targets); }
+            }
+            LirStmt::Conc { .. } => {}
+            LirStmt::Loop { cond_stmts, body, .. } => {
+                for s in cond_stmts { scan_stmt(s, targets); }
+                for s in body { scan_stmt(s, targets); }
+            }
+        }
+    }
+    for func in functions {
+        for stmt in &func.body { scan_stmt(stmt, &mut targets); }
+    }
+    targets
+}
+
+/// Perform closure conversion on all funcref-target functions.
+///
+/// - Capturing lambdas: replace capture params with `__env: i64`, prepend ClosureEnvLoad
+/// - Non-capturing lambdas: add `__env: i64` as first param (unused)
+/// - Named functions: generate a thin wrapper with `__env: i64`
+fn closure_convert(
+    functions: &mut Vec<LirFunction>,
+    mir_functions: &[MirFunction],
+) -> Result<(), LirLowerError> {
+    let targets = collect_lir_funcref_targets(functions);
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let env_sym = Symbol::from("__env");
+
+    // Build a set of lambda function names and their capture info from MIR
+    let mir_captures: HashMap<Symbol, &[Symbol]> = mir_functions
+        .iter()
+        .filter(|f| !f.captures.is_empty())
+        .map(|f| (f.name, f.captures.as_slice()))
+        .collect();
+
+    // Collect names of functions that need wrappers (non-lambda funcref targets)
+    let mut wrapper_targets: Vec<Symbol> = Vec::new();
+
+    for &target in &targets {
+        let is_lambda = target.as_str().starts_with("__lambda_");
+        if is_lambda {
+            // Transform the lambda function in-place
+            if let Some(func) = functions.iter_mut().find(|f| f.name == target) {
+                if let Some(&captures) = mir_captures.get(&target) {
+                    // Capturing lambda: replace capture params with __env, add ClosureEnvLoad preamble
+                    let n_captures = captures.len();
+
+                    // Extract capture param types (the first N params)
+                    let capture_types: Vec<Type> = func.params[..n_captures]
+                        .iter()
+                        .map(|p| p.typ.clone())
+                        .collect();
+
+                    // Remove capture params, add __env as first
+                    func.params = std::iter::once(LirParam {
+                        label: env_sym,
+                        name: env_sym,
+                        typ: Type::I64,
+                    })
+                    .chain(func.params[n_captures..].iter().cloned())
+                    .collect();
+
+                    // Prepend ClosureEnvLoad for each capture
+                    let mut preamble: Vec<LirStmt> = captures
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &cap_name)| LirStmt::Let {
+                            name: cap_name,
+                            typ: wasm_type(&capture_types[i]),
+                            expr: LirExpr::ClosureEnvLoad {
+                                index: i,
+                                typ: capture_types[i].clone(),
+                            },
+                        })
+                        .collect();
+                    preamble.append(&mut func.body);
+                    func.body = preamble;
+                } else {
+                    // Non-capturing lambda: just add __env as first param
+                    func.params.insert(
+                        0,
+                        LirParam {
+                            label: env_sym,
+                            name: env_sym,
+                            typ: Type::I64,
+                        },
+                    );
+                }
+            }
+        } else {
+            // Named function: needs a wrapper
+            wrapper_targets.push(target);
+        }
+    }
+
+    // Generate wrapper functions for named funcref targets
+    for target in wrapper_targets {
+        if let Some(original) = functions.iter().find(|f| f.name == target) {
+            let wrapper_name = Symbol::from(format!("__closure_wrap_{}", target));
+            let result_sym = Symbol::from("__closure_wrap_result");
+
+            // Wrapper params: __env + original params
+            let wrapper_params: Vec<LirParam> = std::iter::once(LirParam {
+                label: env_sym,
+                name: env_sym,
+                typ: Type::I64,
+            })
+            .chain(original.params.iter().cloned())
+            .collect();
+
+            // Build call args from original params (skip __env)
+            let call_args: Vec<(Symbol, LirAtom)> = original
+                .params
+                .iter()
+                .map(|p| {
+                    (
+                        p.label,
+                        LirAtom::Var {
+                            name: p.name,
+                            typ: p.typ.clone(),
+                        },
+                    )
+                })
+                .collect();
+
+            let ret_type = original.ret_type.clone();
+            let wasm_ret = wasm_type(&ret_type);
+
+            let body = if matches!(wasm_ret, Type::Unit) {
+                vec![LirStmt::Let {
+                    name: result_sym,
+                    typ: wasm_ret.clone(),
+                    expr: LirExpr::Call {
+                        func: target,
+                        args: call_args,
+                        typ: wasm_ret.clone(),
+                    },
+                }]
+            } else {
+                vec![LirStmt::Let {
+                    name: result_sym,
+                    typ: wasm_ret.clone(),
+                    expr: LirExpr::Call {
+                        func: target,
+                        args: call_args,
+                        typ: wasm_ret.clone(),
+                    },
+                }]
+            };
+
+            let ret_atom = if matches!(wasm_ret, Type::Unit) {
+                LirAtom::Unit
+            } else {
+                LirAtom::Var {
+                    name: result_sym,
+                    typ: wasm_ret,
+                }
+            };
+
+            let wrapper = LirFunction {
+                name: wrapper_name,
+                params: wrapper_params,
+                ret_type: ret_type.clone(),
+                requires: Type::Row(Vec::new(), None),
+                throws: Type::Row(Vec::new(), None),
+                body,
+                ret: ret_atom,
+                span: 0..0,
+                source_file: None,
+                source_line: None,
+            };
+
+            functions.push(wrapper);
+
+            // Update FuncRef nodes: FuncRef(target) → FuncRef(wrapper_name)
+            update_funcref_targets(functions, target, wrapper_name);
+        }
+    }
+
+    Ok(())
+}
+
+/// Update all FuncRef nodes for a given target to point to a new name.
+fn update_funcref_targets(functions: &mut [LirFunction], old_name: Symbol, new_name: Symbol) {
+    fn update_expr(expr: &mut LirExpr, old: Symbol, new: Symbol) {
+        match expr {
+            LirExpr::FuncRef { func, .. } if *func == old => {
+                *func = new;
+            }
+            _ => {}
+        }
+    }
+    fn update_stmt(stmt: &mut LirStmt, old: Symbol, new: Symbol) {
+        match stmt {
+            LirStmt::Let { expr, .. } => update_expr(expr, old, new),
+            LirStmt::If { then_body, else_body, .. } => {
+                for s in then_body { update_stmt(s, old, new); }
+                for s in else_body { update_stmt(s, old, new); }
+            }
+            LirStmt::IfReturn { then_body, else_body, .. } => {
+                for s in then_body { update_stmt(s, old, new); }
+                for s in else_body { update_stmt(s, old, new); }
+            }
+            LirStmt::TryCatch { body, catch_body, .. } => {
+                for s in body { update_stmt(s, old, new); }
+                for s in catch_body { update_stmt(s, old, new); }
+            }
+            LirStmt::Conc { .. } => {}
+            LirStmt::Loop { cond_stmts, body, .. } => {
+                for s in cond_stmts { update_stmt(s, old, new); }
+                for s in body { update_stmt(s, old, new); }
+            }
+        }
+    }
+    for func in functions.iter_mut() {
+        for stmt in &mut func.body {
+            update_stmt(stmt, old_name, new_name);
+        }
+    }
 }

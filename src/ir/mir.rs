@@ -30,6 +30,9 @@ pub struct MirFunction {
     pub span: Span,
     pub source_file: Option<String>,
     pub source_line: Option<u32>,
+    /// Captured variable names (non-empty for closure-converted lambdas).
+    /// These correspond to the first N params of the function.
+    pub captures: Vec<Symbol>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +98,11 @@ pub enum MirExpr {
     Raise(Box<MirExpr>),
     /// Reference to a function as a first-class value (yields table index at runtime)
     FuncRef(Symbol),
+    /// Closure: a function reference with captured free variables
+    Closure {
+        func: Symbol,
+        captures: Vec<Symbol>,
+    },
     /// Indirect call through a variable holding a function reference
     CallIndirect {
         callee: Box<MirExpr>,
