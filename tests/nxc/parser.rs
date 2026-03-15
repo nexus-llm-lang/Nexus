@@ -11,8 +11,6 @@ fn parser_parse_minimal() {
 }
 
 #[test]
-fn parser_dump_wasm() {
-    let wasm = compile(&read_fixture("nxc/test_parser.nx"));
-    std::fs::write("/tmp/parser_test.wasm", &wasm).unwrap();
-    eprintln!("Wrote {} bytes to /tmp/parser_test.wasm", wasm.len());
+fn parser_tokenize_only() {
+    exec_with_stdlib(&read_fixture("nxc/test_parser_tokenize_only.nx"));
 }

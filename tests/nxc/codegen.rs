@@ -94,3 +94,8 @@ fn codegen_validate_wasm_output() {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[test]
+fn bytebuffer_minimal() {
+    exec_with_stdlib(&read_fixture("nxc/test_bytebuffer_minimal.nx"));
+}
