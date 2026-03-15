@@ -62,13 +62,16 @@ pub(super) fn compile_function(
         concat_out_ptr_i32: next_local_index + 8,
         concat_out_len_i32: next_local_index + 9,
         concat_idx_i32: next_local_index + 10,
+        closure_ptr_i64: next_local_index + 11,
+        closure_table_idx_i64: next_local_index + 12,
     };
-    // Temps: 1×i64, 1×i32, 2×i64, 7×i32
+    // Temps: 1×i64, 1×i32, 2×i64, 7×i32, 2×i64 (closure)
     local_decls_flat.extend_from_slice(&[
         ValType::I64, ValType::I32,
         ValType::I64, ValType::I64,
         ValType::I32, ValType::I32, ValType::I32, ValType::I32,
         ValType::I32, ValType::I32, ValType::I32,
+        ValType::I64, ValType::I64,
     ]);
 
     // RLE-compress local declarations for WASM
@@ -415,6 +418,7 @@ pub(super) fn compile_expr(
             Ok(())
         }
         LirExpr::FuncRef { func, .. } => {
+            // Allocate closure object [table_idx] (1 word)
             let table_idx = layout
                 .funcref_table_indices
                 .get(func)
@@ -422,7 +426,54 @@ pub(super) fn compile_expr(
                 .ok_or_else(|| CodegenError::CallTargetNotFound {
                     name: func.to_string(),
                 })?;
+            emit_alloc_object(out, temps, 1, layout)?;
+            // Store table_idx at offset 0
+            out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
             out.instruction(&Instruction::I64Const(table_idx as i64));
+            out.instruction(&Instruction::I64Store(memarg(0)));
+            // Return closure ptr as i64
+            out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+            out.instruction(&Instruction::I64ExtendI32U);
+            Ok(())
+        }
+        LirExpr::Closure {
+            func,
+            captures,
+            ..
+        } => {
+            // Allocate closure object [table_idx, cap0, cap1, ...] (1 + N words)
+            let table_idx = layout
+                .funcref_table_indices
+                .get(func)
+                .copied()
+                .ok_or_else(|| CodegenError::CallTargetNotFound {
+                    name: func.to_string(),
+                })?;
+            let n_words = 1 + captures.len();
+            emit_alloc_object(out, temps, n_words, layout)?;
+            // Store table_idx at offset 0
+            out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+            out.instruction(&Instruction::I64Const(table_idx as i64));
+            out.instruction(&Instruction::I64Store(memarg(0)));
+            // Store captures at offsets 8, 16, ...
+            for (i, (_, atom)) in captures.iter().enumerate() {
+                out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+                compile_atom(atom, out, local_map, layout)?;
+                emit_pack_value_to_i64(&atom.typ(), out)?;
+                out.instruction(&Instruction::I64Store(memarg(((i + 1) * 8) as u64)));
+            }
+            // Return closure ptr as i64
+            out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+            out.instruction(&Instruction::I64ExtendI32U);
+            Ok(())
+        }
+        LirExpr::ClosureEnvLoad { index, typ } => {
+            // Load captured value from __env (first function parameter, local 0)
+            out.instruction(&Instruction::LocalGet(0)); // __env: i64
+            out.instruction(&Instruction::I32WrapI64);   // convert to address
+            out.instruction(&Instruction::I64Load(memarg(((index + 1) * 8) as u64)));
+            // Unpack from i64 to target type
+            emit_unpack_i64_to_value(typ, out)?;
             Ok(())
         }
         LirExpr::CallIndirect {
@@ -431,35 +482,45 @@ pub(super) fn compile_expr(
             callee_type,
             ..
         } => {
-            // Look up the type index for call_indirect
+            // Look up the type index for call_indirect (with __env prefix)
             let callee_type_key = format!("{:?}", callee_type);
             let type_index = layout
                 .indirect_type_indices
                 .get(&callee_type_key)
                 .copied()
                 .ok_or_else(|| {
-                    // Fallback: try to compute the signature and look up
                     CodegenError::CallTargetNotFound {
                         name: format!("indirect call type: {:?}", callee_type),
                     }
                 })?;
 
-            // Push args onto stack
+            // Save callee closure pointer to temp
+            compile_atom(callee, out, local_map, layout)?;
+            out.instruction(&Instruction::LocalSet(temps.closure_ptr_i64));
+
+            // Load table_idx from closure[0]
+            out.instruction(&Instruction::LocalGet(temps.closure_ptr_i64));
+            out.instruction(&Instruction::I32WrapI64);
+            out.instruction(&Instruction::I64Load(memarg(0)));
+            out.instruction(&Instruction::LocalSet(temps.closure_table_idx_i64));
+
+            // Push __env (closure pointer) as first argument
+            out.instruction(&Instruction::LocalGet(temps.closure_ptr_i64));
+
+            // Push normal args onto stack
             if let Type::Arrow(param_types, _, _, _) = callee_type {
-                // Emit args in sorted label order (they're already sorted in LIR)
                 for ((_, atom), (_, param_type)) in args.iter().zip(param_types.iter()) {
                     compile_atom(atom, out, local_map, layout)?;
                     emit_numeric_coercion(&atom.typ(), param_type, out)?;
                 }
             } else {
-                // No Arrow type info — emit args as-is
                 for (_, atom) in args {
                     compile_atom(atom, out, local_map, layout)?;
                 }
             }
 
-            // Push callee (table index) — convert i64 to i32
-            compile_atom(callee, out, local_map, layout)?;
+            // Push table index (i32) for call_indirect
+            out.instruction(&Instruction::LocalGet(temps.closure_table_idx_i64));
             out.instruction(&Instruction::I32WrapI64);
 
             // Emit call_indirect

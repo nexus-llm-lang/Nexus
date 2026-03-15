@@ -51,6 +51,10 @@ struct FunctionTemps {
     concat_out_ptr_i32: u32,
     concat_out_len_i32: u32,
     concat_idx_i32: u32,
+    /// Temp for closure pointer during call_indirect
+    closure_ptr_i64: u32,
+    /// Temp for table index loaded from closure during call_indirect
+    closure_table_idx_i64: u32,
 }
 
 /// Compiles a parsed Nexus program through HIR -> MIR -> LIR -> WASM pipeline,

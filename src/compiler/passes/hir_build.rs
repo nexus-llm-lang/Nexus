@@ -130,6 +130,8 @@ struct PendingFunction {
     preamble: Vec<MirStmt>,
     source_file: Option<String>,
     source_line: Option<u32>,
+    /// Captured variable names (for closure-converted lambdas)
+    captures: Vec<Symbol>,
 }
 
 struct MirBuilder {
@@ -159,6 +161,8 @@ struct MirBuilder {
     lambda_counter: usize,
     /// Full Arrow types for known functions (for FuncRef type resolution)
     fn_types: HashMap<String, Type>,
+    /// Types of local variables in the current conversion scope (for closure capture type resolution)
+    scope_var_types: HashMap<String, Type>,
 }
 
 impl MirBuilder {
@@ -185,6 +189,7 @@ impl MirBuilder {
             current_source_text: None,
             lambda_counter: 0,
             fn_types: HashMap::new(),
+            scope_var_types: HashMap::new(),
         }
     }
 
@@ -209,6 +214,11 @@ impl MirBuilder {
                 break;
             }
             for pf in pending {
+                // Set up scope_var_types from function params for capture type resolution
+                self.scope_var_types.clear();
+                for p in &pf.params {
+                    self.scope_var_types.insert(p.name.to_string(), p.typ.clone());
+                }
                 let mut body = pf.preamble;
                 body.extend(self.convert_stmts(&pf.body, &pf.rename_map, &scope)?);
                 self.functions.push(MirFunction {
@@ -219,6 +229,7 @@ impl MirBuilder {
                     span: pf.span,
                     source_file: pf.source_file,
                     source_line: pf.source_line,
+                    captures: pf.captures.clone(),
                 });
             }
         }
@@ -419,6 +430,7 @@ impl MirBuilder {
                                     source_line: self.source_line_at(&def.span),
                                     span: def.span.clone(),
                                     preamble,
+                                    captures: vec![],
                                 });
                             } else {
                                 self.fn_ret_types
@@ -447,6 +459,7 @@ impl MirBuilder {
                                     source_line: self.source_line_at(&def.span),
                                     span: def.span.clone(),
                                     preamble: vec![],
+                                    captures: vec![],
                                 });
                             }
                         }
@@ -502,6 +515,7 @@ impl MirBuilder {
                                     source_line: self.source_line_at(&def.span),
                                     span: def.span.clone(),
                                     preamble: vec![],
+                                    captures: vec![],
                                 });
                             }
                             self.handler_port_names
@@ -826,11 +840,17 @@ impl MirBuilder {
         match stmt {
             Stmt::Let {
                 name, typ, value, ..
-            } => Ok(vec![MirStmt::Let {
-                name: Symbol::from(name.as_str()),
-                typ: typ.clone().unwrap_or(Type::Unit),
-                expr: self.convert_expr(value, rename_map, scope)?,
-            }]),
+            } => {
+                // Track variable types for closure capture resolution
+                if let Some(t) = typ {
+                    self.scope_var_types.insert(name.clone(), t.clone());
+                }
+                Ok(vec![MirStmt::Let {
+                    name: Symbol::from(name.as_str()),
+                    typ: typ.clone().unwrap_or(Type::Unit),
+                    expr: self.convert_expr(value, rename_map, scope)?,
+                }])
+            }
             Stmt::Expr(expr) => {
                 // Desugar for-loop at statement level
                 if let Expr::For {
@@ -898,6 +918,7 @@ impl MirBuilder {
                             span: 0..0,
                             source_file: None,
                             source_line: None,
+                            captures: vec![],
                         })
                     })
                     .collect::<Result<_, HirBuildError>>()?;
@@ -1125,9 +1146,47 @@ impl MirBuilder {
                 throws,
                 body,
             } => {
-                // Lambda-lift to a top-level function and emit FuncRef
+                // Lambda-lift to a top-level function
                 let lifted_name = format!("__lambda_{}", self.lambda_counter);
                 self.lambda_counter += 1;
+
+                // Collect free variables (captures) from the lambda body
+                let param_names: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+                let mut known_names: HashSet<String> = self.fn_ret_types.keys().cloned().collect();
+                for ext in &self.externals {
+                    known_names.insert(ext.name.to_string());
+                }
+                for key in self.global_constants.keys() {
+                    known_names.insert(key.clone());
+                }
+                // Also apply rename_map to see through aliases
+                for v in rename_map.values() {
+                    if self.fn_ret_types.contains_key(v) || self.global_constants.contains_key(v) {
+                        known_names.insert(v.clone());
+                    }
+                }
+                let captures = collect_ast_free_vars(body, &param_names, &known_names);
+
+                // Build capture params (prepended before original params)
+                let capture_params: Vec<MirParam> = captures
+                    .iter()
+                    .map(|name| {
+                        let typ = self.scope_var_types.get(name).cloned().unwrap_or(Type::I64);
+                        MirParam {
+                            name: Symbol::from(name.as_str()),
+                            label: Symbol::from(name.as_str()),
+                            typ,
+                        }
+                    })
+                    .collect();
+
+                let mut all_params = capture_params;
+                all_params.extend(params.iter().map(|p| MirParam {
+                    name: Symbol::from(&p.name),
+                    label: Symbol::from(&p.name),
+                    typ: p.typ.clone(),
+                }));
+
                 let arrow_type = Type::Arrow(
                     params.iter().map(|p| (p.name.clone(), p.typ.clone())).collect(),
                     Box::new(ret_type.clone()),
@@ -1136,16 +1195,12 @@ impl MirBuilder {
                 );
                 self.fn_ret_types.insert(lifted_name.clone(), ret_type.clone());
                 self.fn_types.insert(lifted_name.clone(), arrow_type);
+
+                let capture_symbols: Vec<Symbol> = captures.iter().map(|n| Symbol::from(n.as_str())).collect();
+
                 self.pending_functions.push(PendingFunction {
                     name: lifted_name.clone(),
-                    params: params
-                        .iter()
-                        .map(|p| MirParam {
-                            name: Symbol::from(&p.name),
-                            label: Symbol::from(&p.name),
-                            typ: p.typ.clone(),
-                        })
-                        .collect(),
+                    params: all_params,
                     ret_type: ret_type.clone(),
                     body: body.clone(),
                     rename_map: rename_map.clone(),
@@ -1153,8 +1208,17 @@ impl MirBuilder {
                     source_line: self.source_line_at(&expr.span),
                     span: expr.span.clone(),
                     preamble: vec![],
+                    captures: capture_symbols.clone(),
                 });
-                Ok(MirExpr::FuncRef(Symbol::from(lifted_name)))
+
+                if captures.is_empty() {
+                    Ok(MirExpr::FuncRef(Symbol::from(lifted_name)))
+                } else {
+                    Ok(MirExpr::Closure {
+                        func: Symbol::from(lifted_name),
+                        captures: capture_symbols,
+                    })
+                }
             }
             Expr::Raise(e) => Ok(MirExpr::Raise(Box::new(
                 self.convert_expr(e, rename_map, scope)?,
@@ -1317,6 +1381,7 @@ fn collect_calls_in_mir_expr(expr: &MirExpr, out: &mut Vec<Symbol>) {
         }
         MirExpr::Raise(expr) => collect_calls_in_mir_expr(expr, out),
         MirExpr::FuncRef(name) => out.push(*name),
+        MirExpr::Closure { func, .. } => out.push(*func),
         MirExpr::CallIndirect { callee, args, .. } => {
             collect_calls_in_mir_expr(callee, out);
             for (_, arg) in args {
@@ -1324,5 +1389,182 @@ fn collect_calls_in_mir_expr(expr: &MirExpr, out: &mut Vec<Symbol>) {
             }
         }
         MirExpr::Borrow(_) | MirExpr::Literal(_) | MirExpr::Variable(_) => {}
+    }
+}
+
+/// Collect free variables in an AST statement block.
+/// Returns variable names that are referenced but not locally defined.
+fn collect_ast_free_vars(
+    body: &[Spanned<Stmt>],
+    params: &HashSet<String>,
+    known_names: &HashSet<String>,
+) -> Vec<String> {
+    let mut defined = params.clone();
+    let mut referenced = Vec::new();
+    let mut seen = HashSet::new();
+    for stmt in body {
+        collect_ast_stmt_refs(&stmt.node, &mut defined, &mut referenced, &mut seen, known_names);
+    }
+    referenced
+}
+
+fn collect_ast_stmt_refs(
+    stmt: &Stmt,
+    defined: &mut HashSet<String>,
+    referenced: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    known: &HashSet<String>,
+) {
+    match stmt {
+        Stmt::Let { name, value, .. } => {
+            collect_ast_expr_refs(&value.node, defined, referenced, seen, known);
+            defined.insert(name.clone());
+        }
+        Stmt::Expr(expr) | Stmt::Return(expr) => {
+            collect_ast_expr_refs(&expr.node, defined, referenced, seen, known);
+        }
+        Stmt::Assign { target, value } => {
+            collect_ast_expr_refs(&target.node, defined, referenced, seen, known);
+            collect_ast_expr_refs(&value.node, defined, referenced, seen, known);
+        }
+        Stmt::Conc(tasks) => {
+            for t in tasks {
+                for s in &t.body {
+                    collect_ast_stmt_refs(&s.node, defined, referenced, seen, known);
+                }
+            }
+        }
+        Stmt::Try { body, catch_param, catch_body } => {
+            for s in body {
+                collect_ast_stmt_refs(&s.node, defined, referenced, seen, known);
+            }
+            defined.insert(catch_param.clone());
+            for s in catch_body {
+                collect_ast_stmt_refs(&s.node, defined, referenced, seen, known);
+            }
+        }
+        Stmt::Inject { body, .. } => {
+            for s in body {
+                collect_ast_stmt_refs(&s.node, defined, referenced, seen, known);
+            }
+        }
+        Stmt::LetPattern { pattern, value } => {
+            collect_ast_expr_refs(&value.node, defined, referenced, seen, known);
+            collect_ast_pattern_defs(&pattern.node, defined);
+        }
+    }
+}
+
+fn collect_ast_expr_refs(
+    expr: &Expr,
+    defined: &HashSet<String>,
+    referenced: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    known: &HashSet<String>,
+) {
+    match expr {
+        Expr::Variable(name, _) | Expr::Borrow(name, _) => {
+            if !defined.contains(name) && !known.contains(name) && seen.insert(name.clone()) {
+                referenced.push(name.clone());
+            }
+        }
+        Expr::BinaryOp(lhs, _, rhs) => {
+            collect_ast_expr_refs(&lhs.node, defined, referenced, seen, known);
+            collect_ast_expr_refs(&rhs.node, defined, referenced, seen, known);
+        }
+        Expr::Call { func, args } => {
+            // func might be a variable holding a funcref — check if it's not a known function
+            if !defined.contains(func) && !known.contains(func) && seen.insert(func.clone()) {
+                referenced.push(func.clone());
+            }
+            for (_, arg) in args {
+                collect_ast_expr_refs(&arg.node, defined, referenced, seen, known);
+            }
+        }
+        Expr::Constructor(_, args) => {
+            for (_, arg) in args {
+                collect_ast_expr_refs(&arg.node, defined, referenced, seen, known);
+            }
+        }
+        Expr::Record(fields) => {
+            for (_, e) in fields {
+                collect_ast_expr_refs(&e.node, defined, referenced, seen, known);
+            }
+        }
+        Expr::Array(items) | Expr::List(items) => {
+            for item in items {
+                collect_ast_expr_refs(&item.node, defined, referenced, seen, known);
+            }
+        }
+        Expr::Index(arr, idx) => {
+            collect_ast_expr_refs(&arr.node, defined, referenced, seen, known);
+            collect_ast_expr_refs(&idx.node, defined, referenced, seen, known);
+        }
+        Expr::FieldAccess(expr, _) => {
+            collect_ast_expr_refs(&expr.node, defined, referenced, seen, known);
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            collect_ast_expr_refs(&cond.node, defined, referenced, seen, known);
+            for s in then_branch {
+                collect_ast_stmt_refs(&s.node, &mut defined.clone(), referenced, seen, known);
+            }
+            if let Some(else_stmts) = else_branch {
+                for s in else_stmts {
+                    collect_ast_stmt_refs(&s.node, &mut defined.clone(), referenced, seen, known);
+                }
+            }
+        }
+        Expr::Match { target, cases } => {
+            collect_ast_expr_refs(&target.node, defined, referenced, seen, known);
+            for case in cases {
+                let mut case_defined = defined.clone();
+                collect_ast_pattern_defs(&case.pattern.node, &mut case_defined);
+                for s in &case.body {
+                    collect_ast_stmt_refs(&s.node, &mut case_defined, referenced, seen, known);
+                }
+            }
+        }
+        Expr::While { cond, body } => {
+            collect_ast_expr_refs(&cond.node, defined, referenced, seen, known);
+            for s in body {
+                collect_ast_stmt_refs(&s.node, &mut defined.clone(), referenced, seen, known);
+            }
+        }
+        Expr::For { var, start, end_expr, body } => {
+            collect_ast_expr_refs(&start.node, defined, referenced, seen, known);
+            collect_ast_expr_refs(&end_expr.node, defined, referenced, seen, known);
+            let mut inner_defined = defined.clone();
+            inner_defined.insert(var.clone());
+            for s in body {
+                collect_ast_stmt_refs(&s.node, &mut inner_defined, referenced, seen, known);
+            }
+        }
+        Expr::Lambda { params, body, .. } => {
+            // Lambda introduces a new scope — params are local, don't leak
+            let mut inner_defined = defined.clone();
+            for p in params {
+                inner_defined.insert(p.name.clone());
+            }
+            for s in body {
+                collect_ast_stmt_refs(&s.node, &mut inner_defined, referenced, seen, known);
+            }
+        }
+        Expr::Raise(e) => {
+            collect_ast_expr_refs(&e.node, defined, referenced, seen, known);
+        }
+        Expr::Literal(_) | Expr::External(_, _, _) | Expr::Handler { .. } => {}
+    }
+}
+
+fn collect_ast_pattern_defs(pattern: &Pattern, defined: &mut HashSet<String>) {
+    match pattern {
+        Pattern::Variable(name, _) => { defined.insert(name.clone()); }
+        Pattern::Constructor(_, fields) => {
+            for (_, pat) in fields { collect_ast_pattern_defs(&pat.node, defined); }
+        }
+        Pattern::Record(fields, _) => {
+            for (_, pat) in fields { collect_ast_pattern_defs(&pat.node, defined); }
+        }
+        Pattern::Wildcard | Pattern::Literal(_) => {}
     }
 }

@@ -205,11 +205,12 @@ fn expr_uses_object_heap(expr: &LirExpr) -> bool {
             | LirExpr::Record { .. }
             | LirExpr::ObjectTag { .. }
             | LirExpr::ObjectField { .. }
+            | LirExpr::FuncRef { .. }
+            | LirExpr::Closure { .. }
     ) || matches!(
         expr,
         LirExpr::Binary { op, typ, .. } if is_string_concat_operator(*op, typ)
     )
-    // FuncRef and CallIndirect don't use object heap
 }
 
 fn external_uses_string_abi(ext: &LirExternal) -> bool {
@@ -325,7 +326,12 @@ fn collect_strings_in_expr(expr: &LirExpr, out: &mut Vec<String>) {
         LirExpr::ObjectTag { value, .. } => collect_strings_in_atom(value, out),
         LirExpr::ObjectField { value, .. } => collect_strings_in_atom(value, out),
         LirExpr::Raise { value, .. } => collect_strings_in_atom(value, out),
-        LirExpr::FuncRef { .. } => {}
+        LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
+        LirExpr::Closure { captures, .. } => {
+            for (_, atom) in captures {
+                collect_strings_in_atom(atom, out);
+            }
+        }
         LirExpr::CallIndirect { callee, args, .. } => {
             collect_strings_in_atom(callee, out);
             for (_, atom) in args {

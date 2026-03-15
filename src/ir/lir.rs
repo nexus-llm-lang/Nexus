@@ -131,9 +131,21 @@ pub enum LirExpr {
         value: LirAtom,
         typ: Type,
     },
-    /// Reference to a function as a first-class value (table index as i64)
+    /// Reference to a function as a first-class value (closure pointer as i64)
     FuncRef {
         func: Symbol,
+        typ: Type,
+    },
+    /// Closure: function reference with captured values (closure pointer as i64)
+    Closure {
+        func: Symbol,
+        captures: Vec<(Symbol, LirAtom)>,
+        typ: Type,
+    },
+    /// Load a captured variable from the __env closure pointer.
+    /// index 0 = first capture (stored at __env offset 8), etc.
+    ClosureEnvLoad {
+        index: usize,
         typ: Type,
     },
     /// Indirect call through a funcref value
