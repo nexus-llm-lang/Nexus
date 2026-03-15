@@ -210,6 +210,98 @@ fn append_custom_section(wasm: &mut Vec<u8>, caps: &[String]) {
     wasm.extend_from_slice(&encoded[8..]);
 }
 
+/// Builds a tiny wasm module with no-op stubs for the 3 backtrace host
+/// functions (`__nx_bt_push`, `__nx_bt_pop`, `__nx_bt_freeze`).  Used to
+/// satisfy `nexus:runtime/backtrace` imports so the component encoder sees
+/// no unresolved host imports.
+fn build_backtrace_stub_module() -> Vec<u8> {
+    use wenc::*;
+    let mut module = wenc::Module::new();
+
+    // Type section:
+    //   0: (i64) -> ()   __nx_bt_push
+    //   1: () -> ()       __nx_bt_pop, __nx_bt_freeze
+    let mut types = TypeSection::new();
+    types.ty().function(vec![ValType::I64], vec![]);
+    types.ty().function(vec![], vec![]);
+    module.section(&types);
+
+    // Function section
+    let mut functions = FunctionSection::new();
+    functions.function(0); // __nx_bt_push
+    functions.function(1); // __nx_bt_pop
+    functions.function(1); // __nx_bt_freeze
+    module.section(&functions);
+
+    // Export section
+    let mut exports = ExportSection::new();
+    exports.export("__nx_bt_push", ExportKind::Func, 0);
+    exports.export("__nx_bt_pop", ExportKind::Func, 1);
+    exports.export("__nx_bt_freeze", ExportKind::Func, 2);
+    module.section(&exports);
+
+    // Code section: all functions are no-ops
+    let mut codes = CodeSection::new();
+    for _ in 0..3 {
+        let mut f = Function::new(vec![]);
+        f.instruction(&Instruction::End);
+        codes.function(&f);
+    }
+    module.section(&codes);
+
+    module.finish()
+}
+
+/// Merges no-op stubs for the 3 `nexus:runtime/backtrace` host functions into
+/// `wasm`, satisfying those imports for component encoding.
+pub fn merge_backtrace_stubs(wasm: &[u8], wasm_merge_command: &Path) -> Result<Vec<u8>, String> {
+    let stub = build_backtrace_stub_module();
+    let temp_dir = std::env::temp_dir().join(format!(
+        "nexus-bt-stub-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&temp_dir)
+        .map_err(|e| format!("failed to create temp bt-stub directory: {}", e))?;
+
+    let result = (|| -> Result<Vec<u8>, String> {
+        let main_path = temp_dir.join("main.wasm");
+        let stub_path = temp_dir.join("bt_stub.wasm");
+        let merged_path = temp_dir.join("merged.wasm");
+        fs::write(&main_path, wasm)
+            .map_err(|e| format!("failed to write main wasm for bt-stub merge: {}", e))?;
+        fs::write(&stub_path, &stub)
+            .map_err(|e| format!("failed to write bt-stub wasm: {}", e))?;
+
+        let output = ProcessCommand::new(wasm_merge_command)
+            .arg(&main_path)
+            .arg(WASM_MERGE_MAIN_NAME)
+            .arg(&stub_path)
+            .arg(runtime::backtrace::BT_HOST_MODULE)
+            .arg("--all-features")
+            .arg("-o")
+            .arg(&merged_path)
+            .arg("--skip-export-conflicts")
+            .output()
+            .map_err(|e| format!("failed to run wasm-merge for bt-stub: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "wasm-merge bt-stub failed: {} {}",
+                output.status,
+                stderr.trim()
+            ));
+        }
+        fs::read(&merged_path).map_err(|e| format!("failed to read bt-stub-merged wasm: {}", e))
+    })();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
+}
+
 /// Builds a tiny wasm module that provides stub (unreachable) implementations
 /// of the 5 nexus-host functions.  Used to satisfy imports from the stdlib
 /// bundle's net sub-crate when the app doesn't actually use networking.

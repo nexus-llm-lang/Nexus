@@ -11,7 +11,7 @@ use nexus::compiler::bundler::{self, BundleConfig};
 use nexus::constants::NEXUS_HOST_HTTP_MODULE;
 use nexus::lang;
 
-use crate::artifact::merge_nexus_host_stubs;
+use crate::artifact::{merge_backtrace_stubs, merge_nexus_host_stubs};
 
 /// Compiled wasm with metadata about the pre-merge module.
 pub struct CompiledWasm {
@@ -142,6 +142,22 @@ fn compile_loaded_source_to_wasm_impl(
         }
     } else {
         merged
+    };
+    // Satisfy nexus:runtime/backtrace imports with no-op stubs so the
+    // component encoder sees no unresolved host imports.
+    let merged = {
+        let merged_imports = bundler::module_import_names(&merged).unwrap_or_default();
+        if merged_imports.contains(nexus::runtime::backtrace::BT_HOST_MODULE) {
+            match merge_backtrace_stubs(&merged, wasm_merge_command) {
+                Ok(m) => m,
+                Err(msg) => {
+                    eprintln!("Bundle Error (bt-stub merge): {}", msg);
+                    return Err(ExitCode::from(1));
+                }
+            }
+        } else {
+            merged
+        }
     };
     Ok(CompiledWasm {
         wasm: merged,
