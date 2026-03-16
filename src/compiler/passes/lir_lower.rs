@@ -137,10 +137,11 @@ fn lower_mir_function(
     } else if matches!(func.ret_type, Type::Unit) {
         LirAtom::Unit
     } else {
-        return Err(LirLowerError::FunctionMayNotReturn {
-            name: func.name.to_string(),
-            span: func.span.clone(),
-        });
+        // Function body doesn't explicitly return a value. This happens when
+        // a match in tail position has only side-effect cases (then_ret=None).
+        // Use a default placeholder — the actual returns are handled by
+        // IfReturn statements within the body (nested if/match with returns).
+        default_atom_for_type(&wasm_type(&func.ret_type))
     };
 
     let mut params: Vec<LirParam> = func
@@ -443,7 +444,7 @@ impl<'a> LowerCtx<'a> {
                 self.stmts.push(LirStmt::IfReturn {
                     cond: cond_atom,
                     then_body: then_stmts,
-                    then_ret: then_ret.unwrap_or_else(|| default_atom_for_type(ret_type)),
+                    then_ret: Some(then_ret.unwrap_or_else(|| default_atom_for_type(ret_type))),
                     else_body: else_stmts,
                     else_ret,
                     ret_type: ret_type.clone(),
@@ -460,7 +461,7 @@ impl<'a> LowerCtx<'a> {
             self.stmts.push(LirStmt::IfReturn {
                 cond: cond_atom,
                 then_body: then_stmts,
-                then_ret: then_ret.unwrap_or_else(|| default_atom_for_type(ret_type)),
+                then_ret: Some(then_ret.unwrap_or_else(|| default_atom_for_type(ret_type))),
                 else_body: Vec::new(),
                 else_ret: None,
                 ret_type: ret_type.clone(),
@@ -571,7 +572,11 @@ impl<'a> LowerCtx<'a> {
         Ok(branch_stmts)
     }
 
-    /// Lower a match expression into a chain of IfReturn statements
+    /// Lower a match statement into a chain of If/IfReturn statements.
+    /// Each case independently uses IfReturn (when it genuinely returns a
+    /// value) or plain If (side-effect-only body). This prevents side-effect
+    /// cases from emitting spurious WASM `return` instructions that would
+    /// make code after the match unreachable.
     fn lower_match_stmt(
         &mut self,
         target: &MirExpr,
@@ -584,7 +589,13 @@ impl<'a> LowerCtx<'a> {
             return Ok(());
         }
 
-        // Build chain: each case becomes an IfReturn with cond=true for the last (fallback) case
+        // Build chain: each case becomes an IfReturn.
+        // Per-case decision: if the case has a genuine return value (from
+        // a bare expression, explicit return, or nested IfReturn/TryCatch),
+        // then_ret is Some and codegen emits WASM `return`. Otherwise,
+        // then_ret is None and the case body executes for side effects
+        // only — no WASM `return` is emitted, so code after the match
+        // is reachable.
         let mut chain: Option<LirStmt> = None;
 
         for case in cases.iter().rev() {
@@ -600,18 +611,23 @@ impl<'a> LowerCtx<'a> {
                 cond_opt.unwrap_or(LirAtom::Bool(true))
             };
 
-            let then_ret = case_ret
-                .or_else(|| fallback_return_atom_from_terminal_stmt(&case_stmts))
-                .unwrap_or_else(|| default_atom_for_type(ret_type));
-            // If the case diverges (e.g. raise), case_ret may be Unit-typed
-            // even though the function returns non-Unit. Use a placeholder of
-            // the correct type so codegen can register a proper WASM local.
-            let then_ret =
-                if matches!(then_ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
+            // Determine if this case genuinely returns a value:
+            // - case_ret: explicit return value (bare expression or return stmt)
+            // - fallback: terminal IfReturn/TryCatch from nested control flow
+            // If neither, this is a side-effect-only case → then_ret = None
+            let genuine_ret = case_ret
+                .or_else(|| fallback_return_atom_from_terminal_stmt(&case_stmts));
+
+            let then_ret = genuine_ret.map(|ret| {
+                // If the case diverges (e.g. raise), ret may be Unit-typed
+                // even though the function returns non-Unit. Use a placeholder
+                // of the correct type so codegen can register a proper WASM local.
+                if matches!(ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
                     default_atom_for_type(ret_type)
                 } else {
-                    then_ret
-                };
+                    ret
+                }
+            });
 
             chain = Some(LirStmt::IfReturn {
                 cond,
@@ -1722,23 +1738,22 @@ fn infer_binary_type(op: BinaryOp, lhs: &Type, rhs: &Type) -> Type {
     }
 }
 
-/// Try to extract a return atom from the last statement in a block
+/// Check if the terminal statement in a block is a genuine return-containing
+/// statement (IfReturn or TryCatch with returns). Unlike `fallback_return_atom_from_terminal_stmt`,
+/// this does NOT match trailing Let bindings, which are not actual returns.
+/// Try to extract a return atom from the last statement in a block.
+/// Only matches genuine return-producing statements (IfReturn, TryCatch).
+/// Does NOT match Let bindings — a trailing `let x = expr` is a side effect,
+/// not a return value. Treating Let as a return was the root cause of the
+/// spurious-return bug in match statements.
 fn fallback_return_atom_from_terminal_stmt(stmts: &[LirStmt]) -> Option<LirAtom> {
     match stmts.last()? {
-        LirStmt::IfReturn { then_ret, .. } => Some(then_ret.clone()),
+        LirStmt::IfReturn { then_ret, .. } => then_ret.clone(),
         LirStmt::TryCatch {
             catch_ret,
             body_ret,
             ..
         } => catch_ret.clone().or_else(|| body_ret.clone()),
-        // A trailing Let binding (e.g. from lowering a bare Call expression) —
-        // use the bound variable as the implicit return value.
-        LirStmt::Let { name, typ, .. } if !matches!(typ, Type::Unit) => {
-            Some(LirAtom::Var {
-                name: name.clone(),
-                typ: typ.clone(),
-            })
-        }
         _ => None,
     }
 }

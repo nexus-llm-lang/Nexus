@@ -56,7 +56,9 @@ pub enum LirStmt {
     IfReturn {
         cond: LirAtom,
         then_body: Vec<LirStmt>,
-        then_ret: LirAtom,
+        /// When Some, emits WASM `return` with this value after the body.
+        /// When None, the body executes for side effects only (no WASM return).
+        then_ret: Option<LirAtom>,
         else_body: Vec<LirStmt>,
         else_ret: Option<LirAtom>,
         ret_type: Type,
