@@ -142,6 +142,59 @@ pub(super) fn register_exception_variant(
     Ok(())
 }
 
+/// Import a variant by name from a public_env into the target env.
+/// Searches all enums (including Exn) in public_env for a variant matching `name`.
+/// If found, imports the entire parent enum into target_env (merging if already present).
+/// Returns true if the name matched a variant.
+pub(super) fn import_variant_by_name(
+    target_env: &mut TypeEnv,
+    public_env: &TypeEnv,
+    name: &str,
+) -> bool {
+    // Find the enum containing this variant
+    let found = public_env.enums.iter().find_map(|(enum_name, ed)| {
+        if ed.variants.iter().any(|v| v.name == name) {
+            Some((enum_name.clone(), ed.clone()))
+        } else {
+            None
+        }
+    });
+    let Some((enum_name, ed)) = found else {
+        return false;
+    };
+    // Collect new variants to add
+    let existing: Vec<String> = target_env
+        .enums
+        .get(&enum_name)
+        .map(|e| e.variants.iter().map(|v| v.name.clone()).collect())
+        .unwrap_or_default();
+    let new_variants: Vec<_> = ed
+        .variants
+        .iter()
+        .filter(|v| !existing.contains(&v.name))
+        .cloned()
+        .collect();
+    // Register nullary constructors first (before borrowing enums mutably)
+    for v in &new_variants {
+        register_nullary_variant_constructor(target_env, &enum_name, &ed.type_params, v);
+    }
+    // Now insert/merge enum
+    let target_ed = target_env
+        .enums
+        .entry(enum_name.clone())
+        .or_insert_with(|| EnumDef {
+            name: enum_name,
+            is_public: ed.is_public,
+            is_opaque: ed.is_opaque,
+            type_params: ed.type_params.clone(),
+            variants: vec![],
+        });
+    for v in new_variants {
+        target_ed.variants.push(v);
+    }
+    true
+}
+
 pub(super) fn convert_generic_user_defined_to_var(typ: &Type, vars: &HashSet<String>) -> Type {
     match typ {
         Type::UserDefined(n, args) => {
@@ -635,7 +688,9 @@ fn is_known_runtime_perm(name: &str) -> bool {
 }
 
 /// Check whether a statement list contains at least one `Return` statement,
-/// recursively inspecting if/match/try branches.
+/// recursively inspecting if/match/try branches. Also returns true if the
+/// body ends with a tail expression (match/call/raise) that can serve as an
+/// implicit return value.
 pub(super) fn contains_return(body: &[Spanned<Stmt>]) -> bool {
     body.iter().any(|s| match &s.node {
         Stmt::Return(_) => true,
@@ -647,7 +702,13 @@ pub(super) fn contains_return(body: &[Spanned<Stmt>]) -> bool {
         } => contains_return(body) || contains_return(catch_body),
         Stmt::Inject { body, .. } => contains_return(body),
         _ => false,
-    })
+    }) || body_ends_with_tail_expr(body)
+}
+
+/// Check whether the body ends with an expression that can serve as
+/// an implicit return value (tail expression semantics).
+fn body_ends_with_tail_expr(body: &[Spanned<Stmt>]) -> bool {
+    body.last().is_some_and(|s| matches!(&s.node, Stmt::Expr(_)))
 }
 
 fn expr_contains_return(e: &Spanned<Expr>) -> bool {

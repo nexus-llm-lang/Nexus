@@ -16,7 +16,8 @@ use helpers::{
     get_default_alias, is_allowed_main_require_signature, is_allowed_main_throws_signature,
     is_auto_droppable, merge_type_rows, normalize_enum_generic_params,
     normalize_typedef_generic_params, register_exception_variant,
-    register_nullary_variant_constructor, register_stdlib_types, select_float_type,
+    import_variant_by_name, register_nullary_variant_constructor,
+    register_stdlib_types, select_float_type,
     select_int_type, strip_required_port_coeffect, summarize_ctor_args, summarize_ctor_fields,
 };
 use lint::{
@@ -139,6 +140,10 @@ impl TypeChecker {
                                             }
                                             imported_any = true;
                                         }
+                                        // Always check for variant imports to ensure parent enum is imported for constructor resolution.
+                                        if import_variant_by_name(&mut self.env, &public_env, item) {
+                                            imported_any = true;
+                                        }
                                         if !imported_any {
                                             return Err(TypeError {
                                                 message: format!(
@@ -149,6 +154,14 @@ impl TypeChecker {
                                             });
                                         }
                                     }
+                                }
+                                // Handle `import * as alias` for cached paths
+                                if import.alias.is_some() || import.items.is_empty() {
+                                    let alias = import
+                                        .alias
+                                        .clone()
+                                        .unwrap_or_else(|| get_default_alias(&import.path));
+                                    self.env.modules.insert(alias, cached.clone());
                                 }
                             }
                             continue;
@@ -168,7 +181,17 @@ impl TypeChecker {
                         let mut sub_checker = TypeChecker::new();
                         sub_checker.visited_paths = self.visited_paths.clone();
                         sub_checker.import_cache = self.import_cache.clone();
-                        sub_checker.check_program(&p)?;
+                        sub_checker.check_program(&p).map_err(|e| {
+                            // Include byte offset range for rough line estimation
+                            let loc = format!("@{}..{}", e.span.start, e.span.end);
+                            TypeError {
+                                message: format!(
+                                    "in imported module '{}' {}: {}",
+                                    import.path, loc, e.message
+                                ),
+                                span: def.span.clone(),
+                            }
+                        })?;
 
                         let mut public_env = TypeEnv::new();
                         for sub_def in &p.definitions {
@@ -281,6 +304,10 @@ impl TypeChecker {
                                     imported_any = true;
                                 }
 
+                                // Always check for variant imports to ensure parent enum is imported for constructor resolution.
+                                if import_variant_by_name(&mut self.env, &public_env, item) {
+                                    imported_any = true;
+                                }
                                 if !imported_any {
                                     return Err(TypeError {
                                         message: format!(
@@ -612,6 +639,10 @@ impl TypeChecker {
         }
     }
 
+    fn param_key(p: &Param) -> String {
+        p.sigil.get_key(&p.name)
+    }
+
     /// Check a function body. `extra_requires` is merged into the function's
     /// declared requires -- used for handler method bodies so that the
     /// handler-level `require` clause is visible inside each method.
@@ -625,7 +656,7 @@ impl TypeChecker {
         let mut env = base_env.clone();
         for p in &func.params {
             env.insert(
-                p.sigil.get_key(&p.name),
+                Self::param_key(p),
                 Scheme {
                     vars: vec![],
                     typ: p.typ.clone(),
@@ -1478,7 +1509,22 @@ impl TypeChecker {
                 Ok((s.clone(), apply_subst_type(&s, &rt)))
             }
             Expr::Constructor(name, args) => {
-                for ed in env.enums.values().cloned() {
+                let mut all_enums: Vec<EnumDef> = env.enums.values().cloned().collect();
+                for cached_env in self.import_cache.values() {
+                    for ed in cached_env.enums.values() {
+                        if !all_enums.iter().any(|e| e.name == ed.name) {
+                            all_enums.push(ed.clone());
+                        }
+                    }
+                }
+                for mod_env in env.modules.values() {
+                    for ed in mod_env.enums.values() {
+                        if !all_enums.iter().any(|e| e.name == ed.name) {
+                            all_enums.push(ed.clone());
+                        }
+                    }
+                }
+                for ed in all_enums {
                     if let Some(v) = ed.variants.iter().find(|x| x.name == *name) {
                         if v.fields.len() != args.len() {
                             return Err(TypeError {
@@ -1919,7 +1965,7 @@ impl TypeChecker {
                 let before_linear = lambda_env.linear_vars.clone();
                 for p in params {
                     lambda_env.insert(
-                        p.sigil.get_key(&p.name),
+                        Self::param_key(p),
                         Scheme {
                             vars: vec![],
                             typ: p.typ.clone(),
@@ -2112,7 +2158,22 @@ impl TypeChecker {
                 Ok(HashMap::new())
             }
             Pattern::Constructor(n, pats) => {
-                for ed in env.enums.values().cloned() {
+                let mut all_enums: Vec<EnumDef> = env.enums.values().cloned().collect();
+                for cached_env in self.import_cache.values() {
+                    for ed in cached_env.enums.values() {
+                        if !all_enums.iter().any(|e| e.name == ed.name) {
+                            all_enums.push(ed.clone());
+                        }
+                    }
+                }
+                for mod_env in env.modules.values() {
+                    for ed in mod_env.enums.values() {
+                        if !all_enums.iter().any(|e| e.name == ed.name) {
+                            all_enums.push(ed.clone());
+                        }
+                    }
+                }
+                for ed in all_enums {
                     if let Some(v) = ed.variants.iter().find(|x| x.name == *n) {
                         if v.fields.len() != pats.len() {
                             return Err(TypeError {
