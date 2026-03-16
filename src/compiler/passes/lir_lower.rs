@@ -593,56 +593,138 @@ impl<'a> LowerCtx<'a> {
             return Ok(());
         }
 
-        // Build chain: each case becomes an IfReturn.
-        // Per-case decision: if the case has a genuine return value (from
-        // a bare expression, explicit return, or nested IfReturn/TryCatch),
-        // then_ret is Some and codegen emits WASM `return`. Otherwise,
-        // then_ret is None and the case body executes for side effects
-        // only — no WASM `return` is emitted, so code after the match
-        // is reachable.
-        let mut chain: Option<LirStmt> = None;
-
-        for case in cases.iter().rev() {
-            let (cond_opt, case_stmts, case_ret) =
-                self.lower_match_case(&target_atom, &case.pattern, &case.body, ret_type)?;
-
-            let else_body = chain.take().map_or_else(Vec::new, |next| vec![next]);
-
-            // Last remaining arm: treat as exhaustive fallback (cond=true)
-            let cond = if else_body.is_empty() {
-                LirAtom::Bool(true)
-            } else {
-                cond_opt.unwrap_or(LirAtom::Bool(true))
-            };
-
-            // Determine if this case genuinely returns a value:
-            // - case_ret: explicit return value (bare expression or return stmt)
-            // - fallback: terminal IfReturn/TryCatch from nested control flow
-            // If neither, this is a side-effect-only case → then_ret = None
-            let genuine_ret = case_ret
-                .or_else(|| fallback_return_atom_from_terminal_stmt(&case_stmts));
-
-            let then_ret = genuine_ret.map(|ret| {
-                // If the case diverges (e.g. raise), ret may be Unit-typed
-                // even though the function returns non-Unit. Use a placeholder
-                // of the correct type so codegen can register a proper WASM local.
-                if matches!(ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
-                    default_atom_for_type(ret_type)
-                } else {
-                    ret
+        // Pre-analyze: find outer constructor names that appear more than once.
+        // When multiple cases share the same outer constructor (e.g.
+        // Cons(TLLet(...)) and Cons(TLPort(...))), the inner condition must be
+        // checked INSIDE the outer If block so that a mismatch can fall through
+        // to the next case instead of unconditionally returning.
+        let mut outer_ctor_counts: HashMap<Symbol, usize> = HashMap::new();
+        for case in cases {
+            if let MirPattern::Constructor { name, fields, .. } = &case.pattern {
+                if !fields.is_empty() {
+                    *outer_ctor_counts.entry(name.clone()).or_default() += 1;
                 }
-            });
-
-            chain = Some(LirStmt::IfReturn {
-                cond,
-                then_body: case_stmts,
-                then_ret,
-                else_body,
-                else_ret: None,
-                ret_type: ret_type.clone(),
-            });
+            }
         }
 
+        let mut chain: Option<LirStmt> = None;
+        let mut pre_chain_blocks: Vec<LirStmt> = Vec::new();
+
+        for case in cases.iter().rev() {
+            let needs_inner_split = match &case.pattern {
+                MirPattern::Constructor { name, fields, .. } if !fields.is_empty() => {
+                    outer_ctor_counts.get(name).copied().unwrap_or(0) > 1
+                }
+                _ => false,
+            };
+
+            let (cond_opt, case_stmts, case_ret, has_inner_split) = self.lower_match_case(
+                &target_atom,
+                &case.pattern,
+                &case.body,
+                ret_type,
+                needs_inner_split,
+            )?;
+
+            if has_inner_split {
+                let cond = cond_opt.unwrap_or(LirAtom::Bool(true));
+
+                if chain.is_none() && pre_chain_blocks.is_empty() {
+                    // This is the LAST case in original match order (first
+                    // encountered in reverse).  Put it in the chain as IfReturn
+                    // so the function is guaranteed to return.  The inner
+                    // IfReturn inside then_body handles the real return; the
+                    // outer then_ret is a placeholder (unreachable for
+                    // exhaustive matches).
+                    let then_ret = fallback_return_atom_from_terminal_stmt(&case_stmts)
+                        .unwrap_or_else(|| default_atom_for_type(ret_type));
+                    let then_ret =
+                        if matches!(then_ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
+                            default_atom_for_type(ret_type)
+                        } else {
+                            then_ret
+                        };
+                    chain = Some(LirStmt::IfReturn {
+                        cond,
+                        then_body: case_stmts,
+                        then_ret: Some(then_ret),
+                        else_body: vec![],
+                        else_ret: None,
+                        ret_type: ret_type.clone(),
+                    });
+                } else {
+                    // Emit as standalone If: if outer tag matches, enter body
+                    // and check inner conditions via nested IfReturn.  If inner
+                    // doesn't match, the If completes without returning,
+                    // falling through to the next block or the chain.
+                    pre_chain_blocks.push(LirStmt::If {
+                        cond,
+                        then_body: case_stmts,
+                        else_body: vec![],
+                    });
+                }
+            } else {
+                let else_body = chain.take().map_or_else(Vec::new, |next| vec![next]);
+
+                // Last remaining arm: only treat as unconditional fallback for
+                // single-case matches (truly exhaustive). Multi-case matches need
+                // the actual tag condition on the last arm too.
+                let cond = if else_body.is_empty() && cases.len() == 1 {
+                    LirAtom::Bool(true)
+                } else {
+                    cond_opt.unwrap_or(LirAtom::Bool(true))
+                };
+
+                // Check if the case body is trivially unit (empty or just `()`).
+                // Such cases should fall through (plain If) instead of returning
+                // from the enclosing function (IfReturn). This prevents e.g.
+                // `case None -> ()` from emitting a spurious WASM return.
+                let body_is_trivially_unit = case.body.is_empty()
+                    || case.body.iter().all(|s| {
+                        matches!(s, MirStmt::Expr(MirExpr::Literal(Literal::Unit)))
+                    });
+
+                if body_is_trivially_unit && case_ret.is_none() {
+                    chain = Some(LirStmt::If {
+                        cond,
+                        then_body: case_stmts,
+                        else_body,
+                    });
+                } else {
+                    // Determine if this case genuinely returns a value:
+                    // - case_ret: explicit return value (bare expression or return stmt)
+                    // - fallback: terminal IfReturn/TryCatch from nested control flow
+                    // If neither, this is a side-effect-only case → then_ret = None
+                    let genuine_ret = case_ret
+                        .or_else(|| fallback_return_atom_from_terminal_stmt(&case_stmts));
+
+                    let then_ret = genuine_ret.map(|ret| {
+                        // If the case diverges (e.g. raise), ret may be Unit-typed
+                        // even though the function returns non-Unit. Use a placeholder
+                        // of the correct type so codegen can register a proper WASM local.
+                        if matches!(ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
+                            default_atom_for_type(ret_type)
+                        } else {
+                            ret
+                        }
+                    });
+
+                    chain = Some(LirStmt::IfReturn {
+                        cond,
+                        then_body: case_stmts,
+                        then_ret,
+                        else_body,
+                        else_ret: None,
+                        ret_type: ret_type.clone(),
+                    });
+                }
+            }
+        }
+
+        // Emit standalone If blocks in original case order (collected in reverse)
+        for block in pre_chain_blocks.into_iter().rev() {
+            self.stmts.push(block);
+        }
         if let Some(stmt) = chain {
             self.stmts.push(stmt);
         }
@@ -704,23 +786,59 @@ impl<'a> LowerCtx<'a> {
             return Ok(LirAtom::Unit);
         }
 
-        // Lower all cases first to get accurate types from actual lowered values
-        let mut lowered_cases: Vec<(Option<LirAtom>, Vec<LirStmt>, LirAtom)> = Vec::new();
+        // Pre-analyze outer constructor sharing (same as lower_match_stmt).
+        let mut outer_ctor_counts: HashMap<Symbol, usize> = HashMap::new();
+        for case in cases {
+            if let MirPattern::Constructor { name, fields, .. } = &case.pattern {
+                if !fields.is_empty() {
+                    *outer_ctor_counts.entry(name.clone()).or_default() += 1;
+                }
+            }
+        }
+
+        // First pass: lower all cases to get accurate types.
+        // We need result_name/result_type before lowering inner-split cases,
+        // but need case values to infer the type.  Do a two-phase approach:
+        // lower non-inner-split cases first to infer type, then lower
+        // inner-split cases with result info.
+        //
+        // Actually, we can lower ALL cases without result_assign first
+        // (needs_inner_split=false), just to infer the result type.
+        // Then re-lower inner-split cases with the correct result info.
+        //
+        // To avoid double-lowering, we do it in one pass but defer
+        // inner-split wrapping to lower_match_expr.  lower_match_case_expr
+        // with needs_inner_split=false computes everything but doesn't wrap.
+        // We note which cases need wrapping and do it here.
+
+        // One-pass: lower all cases, passing needs_inner_split and result_assign=None
+        // for the first pass to infer types.  Then we'll handle wrapping.
+        let mut lowered_cases: Vec<(Option<LirAtom>, Vec<LirStmt>, LirAtom, bool)> = Vec::new();
         for case in cases.iter().rev() {
-            let result =
-                self.lower_match_case_expr(&target_atom, &case.pattern, &case.body)?;
+            let needs_inner_split = match &case.pattern {
+                MirPattern::Constructor { name, fields, .. } if !fields.is_empty() => {
+                    outer_ctor_counts.get(name).copied().unwrap_or(0) > 1
+                }
+                _ => false,
+            };
+            let result = self.lower_match_case_expr(
+                &target_atom,
+                &case.pattern,
+                &case.body,
+                needs_inner_split,
+                None, // result_assign — will handle wrapping below
+            )?;
             lowered_cases.push(result);
         }
 
         // Infer semantic result type from the first non-Unit case value
         let semantic_result_type = lowered_cases
             .iter()
-            .find_map(|(_, _, val)| {
+            .find_map(|(_, _, val, _)| {
                 let t = val.typ();
                 if matches!(t, Type::Unit) {
                     None
                 } else {
-                    // For Var atoms, look up their semantic type
                     match val {
                         LirAtom::Var { name, .. } => {
                             self.semantic_vars.get(name).cloned().or(Some(t))
@@ -733,7 +851,6 @@ impl<'a> LowerCtx<'a> {
         let result_type = wasm_type(&semantic_result_type);
 
         let result_name = self.new_temp();
-        // Pre-register the result variable with correct semantic type
         self.vars.insert(result_name.clone(), result_type.clone());
         self.semantic_vars
             .insert(result_name.clone(), semantic_result_type);
@@ -744,32 +861,61 @@ impl<'a> LowerCtx<'a> {
             expr: LirExpr::Atom(default_atom_for_type(&result_type)),
         });
 
-        // Build nested If chain that assigns to result_name
+        // Build If chain + standalone If blocks for inner-split cases.
         let mut chain: Option<LirStmt> = None;
+        let mut pre_chain_blocks: Vec<LirStmt> = Vec::new();
 
-        for (cond_opt, mut case_stmts, case_val) in lowered_cases {
-            let else_body = chain.take().map_or_else(Vec::new, |next| vec![next]);
+        for (cond_opt, mut case_stmts, case_val, has_inner_split) in lowered_cases {
+            if has_inner_split {
+                // The case_stmts already contain a nested If wrapping
+                // bindings+body.  But the result assignment was NOT placed
+                // inside (result_assign was None).  We need to add it now
+                // inside the nested If.
+                //
+                // The last stmt in case_stmts is the nested If { cond: inner_cond }.
+                // Append the result assignment to its then_body.
+                if let Some(LirStmt::If { then_body, .. }) = case_stmts.last_mut() {
+                    then_body.push(LirStmt::Let {
+                        name: result_name.clone(),
+                        typ: result_type.clone(),
+                        expr: LirExpr::Atom(case_val),
+                    });
+                }
 
-            let cond = if else_body.is_empty() {
-                LirAtom::Bool(true) // last arm = exhaustive fallback
+                let cond = cond_opt.unwrap_or(LirAtom::Bool(true));
+                pre_chain_blocks.push(LirStmt::If {
+                    cond,
+                    then_body: case_stmts,
+                    else_body: vec![],
+                });
             } else {
-                cond_opt.unwrap_or(LirAtom::Bool(true))
-            };
+                let else_body = chain.take().map_or_else(Vec::new, |next| vec![next]);
 
-            // Assign the case value to the result variable
-            case_stmts.push(LirStmt::Let {
-                name: result_name.clone(),
-                typ: result_type.clone(),
-                expr: LirExpr::Atom(case_val),
-            });
+                let cond = if else_body.is_empty() && cases.len() == 1 {
+                    LirAtom::Bool(true)
+                } else {
+                    cond_opt.unwrap_or(LirAtom::Bool(true))
+                };
 
-            chain = Some(LirStmt::If {
-                cond,
-                then_body: case_stmts,
-                else_body,
-            });
+                // Assign the case value to the result variable
+                case_stmts.push(LirStmt::Let {
+                    name: result_name.clone(),
+                    typ: result_type.clone(),
+                    expr: LirExpr::Atom(case_val),
+                });
+
+                chain = Some(LirStmt::If {
+                    cond,
+                    then_body: case_stmts,
+                    else_body,
+                });
+            }
         }
 
+        // Emit standalone If blocks in original case order
+        for block in pre_chain_blocks.into_iter().rev() {
+            self.stmts.push(block);
+        }
         if let Some(stmt) = chain {
             self.stmts.push(stmt);
         }
@@ -781,13 +927,21 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Lower a single match case for expression position.
-    /// Returns (condition, body_stmts, value_atom) — the value to assign.
+    /// Returns (condition, body_stmts, value_atom, has_inner_split).
+    ///
+    /// When `needs_inner_split` is true and inner conditions exist, the
+    /// bindings + body + result assignment are wrapped in a nested `If`
+    /// checking the inner condition.  `result_assign` provides the
+    /// (name, type) of the result variable so the assignment can be placed
+    /// inside the inner `If`.
     fn lower_match_case_expr(
         &mut self,
         target: &LirAtom,
         pattern: &MirPattern,
         body: &[MirStmt],
-    ) -> Result<(Option<LirAtom>, Vec<LirStmt>, LirAtom), LirLowerError> {
+        needs_inner_split: bool,
+        result_assign: Option<(&Symbol, &Type)>,
+    ) -> Result<(Option<LirAtom>, Vec<LirStmt>, LirAtom, bool), LirLowerError> {
         let mut conds = Vec::new();
         let mut bindings: HashMap<Symbol, LirAtom> = HashMap::new();
 
@@ -807,12 +961,21 @@ impl<'a> LowerCtx<'a> {
             Vec::new()
         };
 
+        let has_inner_conditions =
+            needs_inner_split && !guarded_stmts.is_empty() && conds.len() > 1;
+
         let combined_cond = if conds.is_empty() {
             None
         } else if !guarded_stmts.is_empty() && !conds.is_empty() {
             Some(conds[0].clone())
         } else {
             Some(self.combine_bool_conditions(&conds))
+        };
+
+        let inner_cond_atoms: Vec<LirAtom> = if has_inner_conditions {
+            conds[1..].to_vec()
+        } else {
+            vec![]
         };
 
         // Create scope with bindings
@@ -835,6 +998,18 @@ impl<'a> LowerCtx<'a> {
 
         // Prepend guarded pattern stmts
         self.stmts.extend(guarded_stmts);
+
+        // Combine inner conditions inside the case body (after guarded stmts
+        // define the referenced variables).
+        let inner_cond = if !inner_cond_atoms.is_empty() {
+            let cond = self.combine_bool_conditions(&inner_cond_atoms);
+            Some(cond)
+        } else {
+            None
+        };
+
+        // guarded_len: everything before bindings (guarded + combine stmts)
+        let guarded_len = self.stmts.len();
 
         // Prepend binding let-statements
         for (name, atom) in &bindings {
@@ -869,21 +1044,53 @@ impl<'a> LowerCtx<'a> {
             }
         };
 
+        // When inner conditions are present, wrap bindings + body + result
+        // assignment in a nested If.  Only the inner-matching case assigns
+        // to the result variable; otherwise it keeps its default value.
+        if let Some(inner_cond) = inner_cond {
+            let mut case_stmts = std::mem::replace(&mut self.stmts, saved_stmts);
+            self.vars = saved_vars;
+            self.semantic_vars = saved_semantic_vars;
+
+            let mut inner_body: Vec<LirStmt> = case_stmts.drain(guarded_len..).collect();
+            // Place the result assignment inside the inner If
+            if let Some((rname, rtyp)) = result_assign {
+                inner_body.push(LirStmt::Let {
+                    name: rname.clone(),
+                    typ: rtyp.clone(),
+                    expr: LirExpr::Atom(value_atom.clone()),
+                });
+            }
+            case_stmts.push(LirStmt::If {
+                cond: inner_cond,
+                then_body: inner_body,
+                else_body: vec![],
+            });
+            // Return the real value_atom so the caller can place the
+            // result assignment inside the nested If if needed.
+            return Ok((combined_cond, case_stmts, value_atom, true));
+        }
+
         let case_stmts = std::mem::replace(&mut self.stmts, saved_stmts);
         self.vars = saved_vars;
         self.semantic_vars = saved_semantic_vars;
 
-        Ok((combined_cond, case_stmts, value_atom))
+        Ok((combined_cond, case_stmts, value_atom, false))
     }
 
-    /// Lower a single match case, returning (condition, body_stmts, return_atom)
+    /// Lower a single match case, returning (condition, body_stmts, return_atom, has_inner_split).
+    /// When `needs_inner_split` is true (multiple cases share the same outer
+    /// constructor), the body is wrapped in a nested IfReturn that checks the
+    /// inner conditions, and has_inner_split=true signals the caller to use a
+    /// standalone If instead of an IfReturn.
     fn lower_match_case(
         &mut self,
         target: &LirAtom,
         pattern: &MirPattern,
         body: &[MirStmt],
         ret_type: &Type,
-    ) -> Result<(Option<LirAtom>, Vec<LirStmt>, Option<LirAtom>), LirLowerError> {
+        needs_inner_split: bool,
+    ) -> Result<(Option<LirAtom>, Vec<LirStmt>, Option<LirAtom>, bool), LirLowerError> {
         let mut conds = Vec::new();
         let mut bindings: HashMap<Symbol, LirAtom> = HashMap::new();
 
@@ -909,16 +1116,29 @@ impl<'a> LowerCtx<'a> {
             Vec::new()
         };
 
-        // For Constructor patterns with guarded stmts, use only the outer
-        // tag check as the condition (first cond). Inner conditions from
-        // nested patterns are inside guarded_stmts and will be validated
-        // inside the then_body.
+        // Inner conditions exist when nested patterns produce multiple tag checks.
+        // Only split into outer/inner when the caller indicates the outer
+        // constructor is shared with other cases (needs_inner_split).
+        let has_inner_conditions =
+            needs_inner_split && !guarded_stmts.is_empty() && conds.len() > 1;
+
+        // For the main condition, use only the outer tag check when
+        // there are guarded stmts (inner checks depend on extracted fields).
         let combined_cond = if conds.is_empty() {
             None
         } else if !guarded_stmts.is_empty() && !conds.is_empty() {
             Some(conds[0].clone())
         } else {
             Some(self.combine_bool_conditions(&conds))
+        };
+
+        // Save inner condition atoms (NOT combined yet — the AND stmts must be
+        // emitted inside the case body where guarded stmts define the referenced
+        // variables).
+        let inner_cond_atoms: Vec<LirAtom> = if has_inner_conditions {
+            conds[1..].to_vec()
+        } else {
+            vec![]
         };
 
         // Create scope with bindings
@@ -944,6 +1164,21 @@ impl<'a> LowerCtx<'a> {
         // Prepend guarded pattern stmts (field extractions, nested checks)
         // before the binding lets — they define the atoms used by bindings.
         self.stmts.extend(guarded_stmts);
+
+        // Now combine inner conditions inside the case body context so
+        // the AND temps are defined after the guarded stmts that define
+        // the referenced condition variables.
+        let inner_cond = if !inner_cond_atoms.is_empty() {
+            let cond = self.combine_bool_conditions(&inner_cond_atoms);
+            Some(cond)
+        } else {
+            None
+        };
+
+        // guarded_len includes guarded stmts + combine stmts: everything
+        // that must stay BEFORE the inner IfReturn (the combine defines
+        // the inner_cond variable referenced by the IfReturn's cond).
+        let guarded_len = self.stmts.len();
 
         // Prepend binding let-statements
         for (name, atom) in bindings {
@@ -1006,11 +1241,40 @@ impl<'a> LowerCtx<'a> {
             }
         };
 
-        let case_stmts = std::mem::replace(&mut self.stmts, saved_stmts);
+        let mut case_stmts = std::mem::replace(&mut self.stmts, saved_stmts);
         self.vars = saved_vars;
         self.semantic_vars = saved_semantic_vars;
 
-        Ok((combined_cond, case_stmts, case_ret))
+        // When there are inner conditions from nested patterns, wrap the
+        // body (everything after guarded stmts) in a nested IfReturn.
+        // This ensures the outer IfReturn only checks the outer tag,
+        // and inner tag checks happen inside after field extraction.
+        // If inner conditions don't match, the nested IfReturn doesn't
+        // return, and execution falls through the outer If block to
+        // the next match case.
+        if let Some(inner_cond) = inner_cond {
+            let inner_body: Vec<LirStmt> = case_stmts.drain(guarded_len..).collect();
+            let inner_ret = case_ret
+                .or_else(|| fallback_return_atom_from_terminal_stmt(&inner_body))
+                .unwrap_or_else(|| default_atom_for_type(ret_type));
+            let inner_ret =
+                if matches!(inner_ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
+                    default_atom_for_type(ret_type)
+                } else {
+                    inner_ret
+                };
+            case_stmts.push(LirStmt::IfReturn {
+                cond: inner_cond,
+                then_body: inner_body,
+                then_ret: Some(inner_ret),
+                else_body: vec![],
+                else_ret: None,
+                ret_type: ret_type.clone(),
+            });
+            return Ok((combined_cond, case_stmts, None, true));
+        }
+
+        Ok((combined_cond, case_stmts, case_ret, false))
     }
 
     /// Collect pattern matching conditions and variable bindings
