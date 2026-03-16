@@ -666,10 +666,12 @@ impl<'a> LowerCtx<'a> {
             } else {
                 let else_body = chain.take().map_or_else(Vec::new, |next| vec![next]);
 
-                // Last remaining arm: only treat as unconditional fallback for
-                // single-case matches (truly exhaustive). Multi-case matches need
-                // the actual tag condition on the last arm too.
-                let cond = if else_body.is_empty() && cases.len() == 1 {
+                // Last arm in the chain (first encountered in reverse iteration,
+                // i.e. else_body is empty): treat as unconditional fallback.
+                // Nexus matches are exhaustive, so if all prior cases failed,
+                // this case must match.  Using Bool(true) avoids a fall-through
+                // path with uninitialized locals.
+                let cond = if else_body.is_empty() {
                     LirAtom::Bool(true)
                 } else {
                     cond_opt.unwrap_or(LirAtom::Bool(true))
