@@ -760,3 +760,67 @@ end
         exec(&src);
     }
 }
+
+#[test]
+fn codegen_stmt_after_nested_match_is_reachable() {
+    exec(
+        r#"
+type Color = Red | Green | Blue
+type Shape = Circle | Square
+
+let describe = fn (c: Color, s: Shape) -> i64 do
+    let x = 0
+    match c do
+      case Red ->
+        match s do
+          case Circle -> let x = 1
+          case Square -> let x = 2
+        end
+      case Green ->
+        let x = 10
+      case Blue ->
+        let x = 20
+    end
+    let after = 100
+    return after
+end
+
+let main = fn () -> unit do
+    let r = describe(c: Red(), s: Circle())
+    if r != 100 then raise RuntimeError(val: "code after nested match not reached") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_recursive_call_after_match_is_reachable() {
+    exec(
+        r#"
+type Color = Red | Green | Blue
+
+let count = fn (xs: [Color], acc: i64) -> i64 do
+    match xs do
+      case Nil -> return acc
+      case Cons(v: c, rest: rest) ->
+        let inc = match c do
+          case Red -> 1
+          case Green -> 2
+          case Blue -> 3
+        end
+        let next = acc + inc
+        return count(xs: rest, acc: next)
+    end
+    return acc
+end
+
+let main = fn () -> unit do
+    let items = Cons(v: Red(), rest: Cons(v: Blue(), rest: Cons(v: Green(), rest: Nil)))
+    let total = count(xs: items, acc: 0)
+    if total != 6 then raise RuntimeError(val: "expected 6") end
+    return ()
+end
+"#,
+    );
+}

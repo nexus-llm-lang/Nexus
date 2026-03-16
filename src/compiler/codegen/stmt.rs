@@ -127,12 +127,14 @@ pub(super) fn compile_stmt(
                     is_entrypoint,
                 )?;
             }
-            compile_atom(then_ret, out, local_map, layout)?;
-            emit_numeric_coercion(&then_ret.typ(), ret_type, out)?;
-            if let Some(bt_pop_idx) = layout.bt_pop_idx {
-                out.instruction(&Instruction::Call(bt_pop_idx));
+            if let Some(then_ret) = then_ret {
+                compile_atom(then_ret, out, local_map, layout)?;
+                emit_numeric_coercion(&then_ret.typ(), ret_type, out)?;
+                if let Some(bt_pop_idx) = layout.bt_pop_idx {
+                    out.instruction(&Instruction::Call(bt_pop_idx));
+                }
+                out.instruction(&Instruction::Return);
             }
-            out.instruction(&Instruction::Return);
             if !else_body.is_empty() || else_ret.is_some() {
                 out.instruction(&Instruction::Else);
                 for nested in else_body {

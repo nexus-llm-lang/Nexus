@@ -239,7 +239,9 @@ fn collect_strings_in_stmt(stmt: &LirStmt, out: &mut Vec<String>) {
             for stmt in then_body {
                 collect_strings_in_stmt(stmt, out);
             }
-            collect_strings_in_atom(then_ret, out);
+            if let Some(then_ret) = then_ret {
+                collect_strings_in_atom(then_ret, out);
+            }
             for stmt in else_body {
                 collect_strings_in_stmt(stmt, out);
             }
