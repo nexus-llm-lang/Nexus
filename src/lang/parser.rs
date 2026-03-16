@@ -535,6 +535,29 @@ impl Parser {
     // ---- Pattern parsing ----
 
     fn parse_pattern(&mut self) -> Result<Spanned<Pattern>, ParseError> {
+        let lhs = self.parse_primary_pattern()?;
+
+        // :: (cons) pattern — right-associative, desugars to Cons(v: lhs, rest: rhs)
+        if matches!(self.peek(), TokenKind::ColonColon) {
+            self.advance();
+            let rhs = self.parse_pattern()?; // recursive → right-assoc
+            let span = lhs.span.start..rhs.span.end;
+            Ok(Spanned {
+                node: Pattern::Constructor(
+                    "Cons".to_string(),
+                    vec![
+                        (Some("v".to_string()), lhs),
+                        (Some("rest".to_string()), rhs),
+                    ],
+                ),
+                span,
+            })
+        } else {
+            Ok(lhs)
+        }
+    }
+
+    fn parse_primary_pattern(&mut self) -> Result<Spanned<Pattern>, ParseError> {
         let start = self.peek_span().start;
 
         match self.peek().clone() {
@@ -615,6 +638,16 @@ impl Parser {
                         span: start..end,
                     })
                 }
+            }
+            // []: empty list pattern — sugar for Nil
+            TokenKind::LBracket if matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::RBracket)) => {
+                self.advance(); // [
+                let end = self.peek_span().end;
+                self.advance(); // ]
+                Ok(Spanned {
+                    node: Pattern::Constructor("Nil".to_string(), vec![]),
+                    span: start..end,
+                })
             }
             _ => {
                 // Try literal
@@ -754,10 +787,31 @@ impl Parser {
         }
     }
 
+    /// Precedence for `::` (cons) — same level as additive operators.
+    const CONS_PREC: u8 = 4;
+
     fn parse_prec_expr(&mut self, min_prec: u8) -> Result<Spanned<Expr>, ParseError> {
         let mut lhs = self.parse_postfix_expr()?;
 
         loop {
+            // :: (cons) — right-associative, desugars to Cons(v: lhs, rest: rhs)
+            if matches!(self.peek(), TokenKind::ColonColon) && Self::CONS_PREC >= min_prec {
+                self.advance();
+                let rhs = self.parse_prec_expr(Self::CONS_PREC)?; // same prec → right-assoc
+                let span = lhs.span.start..rhs.span.end;
+                lhs = Spanned {
+                    node: Expr::Constructor(
+                        "Cons".to_string(),
+                        vec![
+                            (Some("v".to_string()), lhs),
+                            (Some("rest".to_string()), rhs),
+                        ],
+                    ),
+                    span,
+                };
+                continue;
+            }
+
             let op = match Self::token_to_binop(&self.peek()) {
                 Some(op) if Self::binop_precedence(&op) >= min_prec => op,
                 _ => break,
