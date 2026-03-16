@@ -94,6 +94,7 @@ pub enum TokenKind {
 
     // Punctuation
     Colon,
+    ColonColon, // ::
     Comma,
     Dot,
     Pipe,
@@ -754,7 +755,14 @@ impl Lexer {
                 }
 
                 // Punctuation
-                ':' => TokenKind::Colon,
+                ':' => {
+                    if self.peek() == Some(':') {
+                        self.advance();
+                        TokenKind::ColonColon
+                    } else {
+                        TokenKind::Colon
+                    }
+                }
                 ',' => TokenKind::Comma,
                 '.' => TokenKind::Dot,
                 '~' => TokenKind::Tilde,
@@ -946,6 +954,24 @@ mod tests {
     fn test_double_quoted_string_newline_rejected() {
         let err = tokenize("\"hello\nworld\"").unwrap_err();
         assert!(err[0].message.contains("unclosed string literal"));
+    }
+
+    #[test]
+    fn test_colon_colon() {
+        let tokens = tokenize("x :: xs").unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::Ident(ref s) if s == "x"));
+        assert!(matches!(tokens[1].kind, TokenKind::ColonColon));
+        assert!(matches!(tokens[2].kind, TokenKind::Ident(ref s) if s == "xs"));
+    }
+
+    #[test]
+    fn test_colon_vs_colon_colon() {
+        let tokens = tokenize("a: b :: c").unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::Ident(ref s) if s == "a"));
+        assert!(matches!(tokens[1].kind, TokenKind::Colon));
+        assert!(matches!(tokens[2].kind, TokenKind::Ident(ref s) if s == "b"));
+        assert!(matches!(tokens[3].kind, TokenKind::ColonColon));
+        assert!(matches!(tokens[4].kind, TokenKind::Ident(ref s) if s == "c"));
     }
 
     #[test]
