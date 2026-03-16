@@ -535,7 +535,7 @@ impl Parser {
     // ---- Pattern parsing ----
 
     fn parse_pattern(&mut self) -> Result<Spanned<Pattern>, ParseError> {
-        let lhs = self.parse_primary_pattern()?;
+        let lhs = self.parse_atom_pattern()?;
 
         // :: (cons) pattern — right-associative, desugars to Cons(v: lhs, rest: rhs)
         if matches!(self.peek(), TokenKind::ColonColon) {
@@ -557,7 +557,7 @@ impl Parser {
         }
     }
 
-    fn parse_primary_pattern(&mut self) -> Result<Spanned<Pattern>, ParseError> {
+    fn parse_atom_pattern(&mut self) -> Result<Spanned<Pattern>, ParseError> {
         let start = self.peek_span().start;
 
         match self.peek().clone() {
