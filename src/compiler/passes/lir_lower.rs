@@ -1427,7 +1427,9 @@ impl<'a> LowerCtx<'a> {
                 };
                 let record_field_types: Vec<(String, Type)> =
                     if let Type::Record(rt_fields) = strip_linear(&semantic_type) {
-                        rt_fields.clone()
+                        let mut sorted = rt_fields.clone();
+                        sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+                        sorted
                     } else {
                         Vec::new()
                     };
