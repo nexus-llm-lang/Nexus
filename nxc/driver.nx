@@ -9,7 +9,7 @@
 import { tokenize } from nxc/frontend/lexer.nx
 import { parse } from nxc/frontend/parser.nx
 import { Program, SpannedTopLevel, TopLevel, ImportDef, EnumDef } from nxc/common/ast.nx
-import { CompileError, error_no_span, PhaseDriver } from nxc/common/error.nx
+import { CompileError, error_no_span, format_error, PhaseDriver } from nxc/common/error.nx
 import { RenameEntry } from nxc/ir/symtab.nx
 import { default_alias, build_rename_map, extract_imports } from nxc/ir/resolve.nx
 import { HirAccum, HirProgram } from nxc/ir/hir_types.nx
@@ -35,32 +35,31 @@ let list_has_str = fn (xs: [string], s: string) -> bool do
 end
 
 let process_imports = fn (imports: [ImportDef], accum: HirAccum,
-    import_stack: [string], depth: i64) -> HirAccum throws { CompileError } do
+    import_stack: [string], depth: i64) -> HirAccum require { PermFs, PermConsole } throws { Exn } do
   match imports
     case Nil -> accum
     case imp :: rest ->
       match imp case ImportDef(path: path, alias: _, items: _, is_external: is_ext) ->
-      if is_ext then
-        println(val: "[nxc]   skip external: " ++ path)
-        return process_imports(imports: rest, accum: accum, import_stack: import_stack, depth: depth)
-      else
-        if list_has_str(xs: import_stack, s: path) then
-          error_no_span(phase: PhaseDriver, message: "cyclic import: " ++ path)
+        match is_ext
+          case true ->
+            println(val: "[nxc]   skip external: " ++ path)
+            process_imports(imports: rest, accum: accum, import_stack: import_stack, depth: depth)
+          case false ->
+            if list_has_str(xs: import_stack, s: path) then
+              error_no_span(phase: PhaseDriver, message: "cyclic import: " ++ path)
+            end
+            println(val: "[nxc]   import: " ++ path)
+            let src = fs.read_to_string(path: path)
+            let tokens = tokenize(src: src)
+            let imported_prog = parse(tokens: tokens)
+            let imported_defs = get_defs(prog: imported_prog)
+            let entries = build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
+            let sub_imports = extract_imports(defs: imported_defs)
+            let new_stack = Cons(v: path, rest: import_stack)
+            let accum2 = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, depth: depth + 1)
+            let accum3 = process_defs(defs: imported_defs, entries: entries, accum: accum2)
+            process_imports(imports: rest, accum: accum3, import_stack: import_stack, depth: depth)
         end
-
-        println(val: "[nxc]   import: " ++ path)
-        let src = fs.read_to_string(path: path)
-        let tokens = tokenize(src: src)
-        let imported_prog = parse(tokens: tokens)
-        let imported_defs = get_defs(prog: imported_prog)
-
-        let entries = build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
-        let sub_imports = extract_imports(defs: imported_defs)
-        let new_stack = Cons(v: path, rest: import_stack)
-        let accum2 = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, depth: depth + 1)
-        let accum3 = process_defs(defs: imported_defs, entries: entries, accum: accum2)
-        return process_imports(imports: rest, accum: accum3, import_stack: import_stack, depth: depth)
-      end
       end
   end
 end
@@ -75,7 +74,7 @@ let get_enum_defs = fn (hir: HirProgram) -> [EnumDef] do
   match hir case HirProgram(ports: _, functions: _, externals: _, handler_bindings: _, enum_defs: eds) -> eds end
 end
 
-let build_hir = fn (prog: Program) -> HirProgram throws { CompileError } do
+let build_hir = fn (prog: Program) -> HirProgram require { PermFs, PermConsole } throws { Exn } do
   let defs = get_defs(prog: prog)
   let imports = extract_imports(defs: defs)
   let accum = process_imports(imports: imports, accum: empty_accum(), import_stack: Nil, depth: 1)
@@ -99,41 +98,50 @@ let get_output_path = fn (xs: [string], argc: i64) -> string do
   return "output.wasm"
 end
 
+let write_and_free = fn (buf: %ByteBuffer, path: string) -> bool require { PermFs } do
+  let ok = write_file(buf: &buf, path: path)
+  free(buf: %buf)
+  return ok
+end
+
 let main = fn (args: [string]) -> unit
-    require { PermFs, PermProc, PermConsole } throws { CompileError } do
-  let argc = list.length(xs: args)
-  if argc < 2 then
-    println(val: "Usage: nxc <input.nx> [output.wasm]")
-    error_no_span(phase: PhaseDriver, message: "missing input file argument")
-  end
+    require { PermFs, PermConsole } do
+  try
+    let argc = list.length(xs: args)
+    if argc < 2 then
+      println(val: "Usage: nxc <input.nx> [output.wasm]")
+      error_no_span(phase: PhaseDriver, message: "missing input file argument")
+    end
 
-  let input_path = str_nth(xs: args, n: 1)
-  let output_path = get_output_path(xs: args, argc: argc)
+    let input_path = str_nth(xs: args, n: 1)
+    let output_path = get_output_path(xs: args, argc: argc)
 
-  println(val: "nxc: compiling " ++ input_path ++ " -> " ++ output_path)
+    println(val: "nxc: compiling " ++ input_path ++ " -> " ++ output_path)
 
-  println(val: "[nxc] reading source...")
-  let src = fs.read_to_string(path: input_path)
-  println(val: "[nxc] source read ok")
-  println(val: "[nxc] lexing...")
-  let tokens = tokenize(src: src)
-  println(val: "[nxc] parsing...")
-  let prog = parse(tokens: tokens)
-  println(val: "[nxc] building HIR...")
-  let hir = build_hir(prog: prog)
-  println(val: "[nxc] typechecking...")
-  let hir_checked = check_program(hir: hir)
-  println(val: "[nxc] lowering to MIR...")
-  let mir = lower_hir_to_mir(hir: hir_checked)
-  println(val: "[nxc] lowering to LIR...")
-  let lir = lower_mir_to_lir(mir: mir, enum_defs: get_enum_defs(hir: hir))
-  println(val: "[nxc] generating WASM...")
-  let %wasm_buf = compile_lir_to_wasm(program: lir)
+    println(val: "[nxc] reading source...")
+    let src = fs.read_to_string(path: input_path)
+    println(val: "[nxc] source read ok")
+    println(val: "[nxc] lexing...")
+    let tokens = tokenize(src: src)
+    println(val: "[nxc] parsing...")
+    let prog = parse(tokens: tokens)
+    println(val: "[nxc] building HIR...")
+    let hir = build_hir(prog: prog)
+    println(val: "[nxc] typechecking...")
+    let hir_checked = check_program(hir: hir)
+    println(val: "[nxc] lowering to MIR...")
+    let mir = lower_hir_to_mir(hir: hir_checked)
+    println(val: "[nxc] lowering to LIR...")
+    let lir = lower_mir_to_lir(mir: mir, enum_defs: get_enum_defs(hir: hir))
+    println(val: "[nxc] generating WASM...")
+    let %wasm_buf = compile_lir_to_wasm(program: lir)
 
-  let ok = write_file(buf: &wasm_buf, path: output_path)
-  free(buf: %wasm_buf)
+    let ok = write_and_free(buf: %wasm_buf, path: output_path)
 
-  if ok then println(val: "nxc: wrote " ++ output_path)
-  else error_no_span(phase: PhaseDriver, message: "failed to write " ++ output_path)
+    if ok then println(val: "nxc: wrote " ++ output_path)
+    else error_no_span(phase: PhaseDriver, message: "failed to write " ++ output_path)
+    end
+  catch e ->
+    println(val: "error: " ++ format_error(err: e))
   end
 end

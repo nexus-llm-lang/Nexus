@@ -123,7 +123,20 @@ impl TypeChecker {
                         return self.check_matrix(env, matrix, &new_types);
                     }
                 }
-                if let Some(ed) = env.get_enum(name).cloned() {
+                let resolved_enum = env.get_enum(name).cloned().or_else(|| {
+                    for cached_env in self.import_cache.values() {
+                        if let Some(ed) = cached_env.enums.get(name) {
+                            return Some(ed.clone());
+                        }
+                    }
+                    for mod_env in env.modules.values() {
+                        if let Some(ed) = mod_env.enums.get(name) {
+                            return Some(ed.clone());
+                        }
+                    }
+                    None
+                });
+                if let Some(ed) = resolved_enum {
                     let mut subst = HashMap::new();
                     for (p, a) in ed.type_params.iter().zip(args) {
                         subst.insert(p.clone(), a.clone());

@@ -147,9 +147,19 @@ impl TypeEnv {
     }
 
     /// Resolves a value binding by local name or `module.item`.
+    /// For linear references (`%name`), also tries the unsigiled name (`name`)
+    /// since `fn (x: %Type)` stores the parameter as `x`, not `%x`.
     pub fn get(&self, name: &str) -> Option<&Scheme> {
         if let Some(scheme) = self.vars.get(name) {
             return Some(scheme);
+        }
+        // %name → try name (linear param stored without sigil)
+        if let Some(stripped) = name.strip_prefix('%') {
+            if let Some(scheme) = self.vars.get(stripped) {
+                if matches!(&scheme.typ, crate::types::Type::Linear(_)) {
+                    return Some(scheme);
+                }
+            }
         }
         if let Some(pos) = name.find('.') {
             let mod_name = &name[..pos];
@@ -196,18 +206,33 @@ impl TypeEnv {
     }
 
     /// Marks a linear binding as consumed, returning an error on invalid reuse.
+    /// For `%name`, also checks unsigiled `name` (linear param stored without prefix).
     pub fn consume(&mut self, name: &str) -> Result<(), String> {
         if self.linear_vars.remove(name) {
-            Ok(())
-        } else if self.vars.contains_key(name) {
-            if let Some(s) = self.vars.get(name) {
-                if self.contains_linear_type(&s.typ) {
-                    return Err(format!("Linear variable {} already consumed", name));
-                }
-            }
-            Ok(())
-        } else {
-            Err(format!("Variable {} not found", name))
+            return Ok(());
         }
+        // %name → try name (linear param stored without sigil prefix)
+        if let Some(stripped) = name.strip_prefix('%') {
+            if self.linear_vars.remove(stripped) {
+                return Ok(());
+            }
+        }
+        let check_name = if self.vars.contains_key(name) {
+            name.to_string()
+        } else if let Some(stripped) = name.strip_prefix('%') {
+            if self.vars.contains_key(stripped) {
+                stripped.to_string()
+            } else {
+                return Err(format!("Variable {} not found", name));
+            }
+        } else {
+            return Err(format!("Variable {} not found", name));
+        };
+        if let Some(s) = self.vars.get(&check_name) {
+            if self.contains_linear_type(&s.typ) {
+                return Err(format!("Linear variable {} already consumed", name));
+            }
+        }
+        Ok(())
     }
 }
