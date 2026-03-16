@@ -535,6 +535,34 @@ impl Parser {
     // ---- Pattern parsing ----
 
     fn parse_pattern(&mut self) -> Result<Spanned<Pattern>, ParseError> {
+        let lhs = self.parse_atom_pattern()?;
+
+        // Check for :: (cons pattern, right-associative)
+        if matches!(self.peek(), TokenKind::Colon)
+            && self.pos + 1 < self.tokens.len()
+            && matches!(self.tokens[self.pos + 1].kind, TokenKind::Colon)
+        {
+            self.advance(); // first :
+            self.advance(); // second :
+            let rhs = self.parse_pattern()?; // right-associative
+            let start = lhs.span.start;
+            let end = rhs.span.end;
+            return Ok(Spanned {
+                node: Pattern::Constructor(
+                    "Cons".to_string(),
+                    vec![
+                        (Some("v".to_string()), lhs),
+                        (Some("rest".to_string()), rhs),
+                    ],
+                ),
+                span: start..end,
+            });
+        }
+
+        Ok(lhs)
+    }
+
+    fn parse_atom_pattern(&mut self) -> Result<Spanned<Pattern>, ParseError> {
         let start = self.peek_span().start;
 
         match self.peek().clone() {
