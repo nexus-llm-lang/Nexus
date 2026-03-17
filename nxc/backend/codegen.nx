@@ -14,17 +14,18 @@ import * as bb from stdlib/bytebuffer.nx
 import { BinaryOp, TypeExpr } from nxc/common/ast.nx
 import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom,
          LirExternal, LirParam, LirCallArg, LirNamedAtom, ConcTask } from nxc/ir/lir_types.nx
-import { CodegenCtx, LocalEntry, FuncEntry, StringEntry,
+import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          ctx_locals, ctx_internal_funcs, ctx_external_funcs, ctx_string_lits,
          ctx_heap_enabled, ctx_temps_base, ctx_func_ret_type, ctx_functions, ctx_externals,
+         ctx_closure_table, ctx_closure_type_indices, is_closure_func,
          peel_linear, type_to_valtype, is_unit, atom_type, expr_type,
          lookup_local, lookup_func, lookup_string, find_function, find_external,
          constructor_tag, record_tag,
          emit_name, emit_section, emit_memarg, emit_memarg_i64, emit_memarg_i8,
-         sec_type, sec_import, sec_function, sec_memory, sec_global, sec_export, sec_code, sec_data,
-         vt_i32, vt_i64, bt_void, bt_i32, desc_func, desc_memory, heap_global_idx, string_data_base,
+         sec_type, sec_import, sec_function, sec_table, sec_memory, sec_global, sec_export, sec_element, sec_code, sec_data,
+         vt_i32, vt_i64, vt_funcref, bt_void, bt_i32, desc_func, desc_table, desc_memory, heap_global_idx, string_data_base,
          op_unreachable, op_block, op_loop, op_if, op_else, op_end, op_br, op_br_if, op_return,
-         op_call, op_return_call, op_drop,
+         op_call, op_call_indirect, op_return_call, op_drop,
          op_local_get, op_local_set, op_local_tee, op_global_get, op_global_set,
          op_i32_load, op_i64_load, op_i32_load8_u, op_i32_store, op_i64_store, op_i32_store8,
          op_i32_const, op_i64_const, op_f64_const,
@@ -43,7 +44,8 @@ import { collect_program_strings, build_string_entries, compute_last_string_end,
          collect_bt_strings } from nxc/backend/wasm_collect.nx
 import { build_type_section, build_import_section, build_function_section,
          build_memory_section, build_global_section, build_export_section,
-         build_data_section, emit_local_decls } from nxc/backend/wasm_section.nx
+         build_data_section, emit_local_decls,
+         build_table_section, build_element_section, emit_closure_type_entries } from nxc/backend/wasm_section.nx
 import * as list from stdlib/list.nx
 import { starts_with } from stdlib/string.nx
 
@@ -632,6 +634,58 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
   end
 end
 
+// ─── Closure helpers ────────────────────────────────────────────────────────
+
+/// Returns the table index (position) for a closure function name.
+let lookup_closure_table_idx = fn (name: string, entries: [FuncEntry]) -> i64 do
+  return lookup_closure_table_idx_go(name: name, entries: entries, pos: 0)
+end
+
+let lookup_closure_table_idx_go = fn (name: string, entries: [FuncEntry], pos: i64) -> i64 do
+  match entries
+    case Nil -> -1
+    case FuncEntry(name: n, index: _) :: rest ->
+      if n == name then pos
+      else lookup_closure_table_idx_go(name: name, entries: rest, pos: pos + 1)
+      end
+  end
+end
+
+/// Look up the type section index for a closure call with the given arity.
+let lookup_closure_type_idx_pairs = fn (arity: i64, pairs: [ArityTypeIdx]) -> i64 do
+  match pairs
+    case Nil -> 0
+    case ArityTypeIdx(arity: a, type_idx: ti) :: rest ->
+      if a == arity then ti
+      else lookup_closure_type_idx_pairs(arity: arity, pairs: rest)
+      end
+  end
+end
+
+let emit_closure_captures = fn (buf: %ByteBuffer, caps: [LirAtom], ctx: CodegenCtx, obj_ptr: i64, field_idx: i64) -> %ByteBuffer do
+  match caps
+    case Nil -> %buf
+    case a :: rest ->
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = emit_atom(atom: a, buf: %buf, ctx: ctx)
+      let %buf = emit_pack_to_i64(typ: atom_type(atom: a), buf: %buf)
+      let %buf = push_byte(buf: %buf, byte: op_i64_store)
+      let %buf = emit_memarg_i64(buf: %buf, offset: field_idx * 8)
+      emit_closure_captures(buf: %buf, caps: rest, ctx: ctx, obj_ptr: obj_ptr, field_idx: field_idx + 1)
+  end
+end
+
+let emit_closure_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], ctx: CodegenCtx) -> %ByteBuffer do
+  match args
+    case Nil -> %buf
+    case LirCallArg(label: _, value: a) :: rest ->
+      let %buf = emit_atom(atom: a, buf: %buf, ctx: ctx)
+      let %buf = emit_pack_to_i64(typ: atom_type(atom: a), buf: %buf)
+      emit_closure_call_args(buf: %buf, args: rest, ctx: ctx)
+  end
+end
+
 // ─── Expression emission ────────────────────────────────────────────────────
 
 let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool) -> %ByteBuffer do
@@ -734,6 +788,50 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
         case true -> push_byte(buf: %buf, byte: op_unreachable)
         case false -> %buf
       end
+      return %buf
+
+    case LirExprMakeClosure(func_name: fname, captures: caps, typ: _) ->
+      // Allocate (1 + n_captures) words on heap
+      let n_caps = list.length(xs: caps)
+      let %buf = emit_alloc_object(buf: %buf, ctx: ctx, words: 1 + n_caps)
+      let obj_ptr = ctx_temps_base(ctx: ctx) + 3
+      // Store table_idx at offset 0
+      let table_idx = lookup_closure_table_idx(name: fname, entries: ctx_closure_table(ctx: ctx))
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = push_byte(buf: %buf, byte: op_i64_const)
+      let %buf = push_sleb128(buf: %buf, val: table_idx)
+      let %buf = push_byte(buf: %buf, byte: op_i64_store)
+      let %buf = emit_memarg_i64(buf: %buf, offset: 0)
+      // Store captures at offset 8, 16, ...
+      let %buf = emit_closure_captures(buf: %buf, caps: caps, ctx: ctx, obj_ptr: obj_ptr, field_idx: 1)
+      // Result: obj_ptr as i64
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      return push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+
+    case LirExprCallClosure(closure: clos, args: cargs, typ: _) ->
+      // Push env (closure pointer) as first arg
+      let %buf = emit_atom(atom: clos, buf: %buf, ctx: ctx)
+      // Push actual args (packed to i64)
+      let %buf = emit_closure_call_args(buf: %buf, args: cargs, ctx: ctx)
+      // Load table_idx from closure
+      let obj_ptr = ctx_temps_base(ctx: ctx) + 3
+      let %buf = emit_atom(atom: clos, buf: %buf, ctx: ctx)
+      let %buf = push_byte(buf: %buf, byte: op_i32_wrap_i64)
+      let %buf = push_byte(buf: %buf, byte: op_local_set)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = push_byte(buf: %buf, byte: op_i64_load)
+      let %buf = emit_memarg_i64(buf: %buf, offset: 0)
+      let %buf = push_byte(buf: %buf, byte: op_i32_wrap_i64)
+      // call_indirect: type_idx, table 0
+      let n_args = list.length(xs: cargs)
+      let type_idx = lookup_closure_type_idx_pairs(arity: n_args, pairs: ctx_closure_type_indices(ctx: ctx))
+      let %buf = push_byte(buf: %buf, byte: op_call_indirect)
+      let %buf = push_uleb128(buf: %buf, val: type_idx)
+      let %buf = push_uleb128(buf: %buf, val: 0)
       return %buf
   end
 end
@@ -1039,7 +1137,9 @@ end
 let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
                           external_funcs: [FuncEntry], string_lits: [StringEntry],
                           heap_enabled: bool, functions: [LirFunction],
-                          externals: [LirExternal]) -> CodegenCtx do
+                          externals: [LirExternal],
+                          closure_table: [FuncEntry],
+                          closure_type_indices: [ArityTypeIdx]) -> CodegenCtx do
   match func
     case LirFunction(name: _, params: ps, ret_type: rt, body: b, ret: _, span: _) ->
       let param_locals = build_param_locals(params: ps, idx: 0)
@@ -1048,7 +1148,8 @@ let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
       CodegenCtx(
         locals: r.locals, internal_funcs: internal_funcs, external_funcs: external_funcs,
         string_lits: string_lits, heap_enabled: heap_enabled, temps_base: r.next_idx,
-        func_ret_type: rt, functions: functions, externals: externals
+        func_ret_type: rt, functions: functions, externals: externals,
+        closure_table: closure_table, closure_type_indices: closure_type_indices
       )
   end
 end
@@ -1064,18 +1165,22 @@ end
 let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
                             internal_funcs: [FuncEntry], external_funcs: [FuncEntry],
                             string_lits: [StringEntry], heap_enabled: bool,
-                            functions: [LirFunction], externals: [LirExternal]) -> %ByteBuffer do
+                            functions: [LirFunction], externals: [LirExternal],
+                            closure_table: [FuncEntry],
+                            closure_type_indices: [ArityTypeIdx]) -> %ByteBuffer do
   match funcs
     case Nil -> %buf
     case f :: rest ->
       let ctx = build_func_ctx(func: f, internal_funcs: internal_funcs,
                                 external_funcs: external_funcs, string_lits: string_lits,
-                                heap_enabled: heap_enabled, functions: functions, externals: externals)
+                                heap_enabled: heap_enabled, functions: functions, externals: externals,
+                                closure_table: closure_table, closure_type_indices: closure_type_indices)
       let %body = compile_function_body(func: f, ctx: ctx)
       let %buf = append_body_to_buf(buf: %buf, body: %body)
       emit_code_bodies(buf: %buf, funcs: rest, internal_funcs: internal_funcs,
                         external_funcs: external_funcs, string_lits: string_lits,
-                        heap_enabled: heap_enabled, functions: functions, externals: externals)
+                        heap_enabled: heap_enabled, functions: functions, externals: externals,
+                        closure_table: closure_table, closure_type_indices: closure_type_indices)
   end
 end
 
@@ -1156,6 +1261,68 @@ let append_externals = fn (a: [LirExternal], b: [LirExternal]) -> [LirExternal] 
   end
 end
 
+// ─── Closure analysis helpers ───────────────────────────────────────────────
+
+/// Build closure table entries: maps table index → function index for __closure_* functions.
+let build_closure_table = fn (funcs: [LirFunction], internal_funcs: [FuncEntry], table_idx: i64) -> [FuncEntry] do
+  match funcs
+    case Nil -> Nil
+    case LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
+      if is_closure_func(name: n) then
+        let func_idx = lookup_func(name: n, entries: internal_funcs)
+        Cons(v: FuncEntry(name: n, index: func_idx),
+             rest: build_closure_table(funcs: rest, internal_funcs: internal_funcs, table_idx: table_idx + 1))
+      else
+        build_closure_table(funcs: rest, internal_funcs: internal_funcs, table_idx: table_idx)
+      end
+  end
+end
+
+/// Get distinct closure arities from __closure_* functions.
+/// Arity = param count - 1 (subtract the __env param).
+let collect_closure_arities = fn (funcs: [LirFunction]) -> [i64] do
+  return dedup_i64(xs: collect_closure_arities_raw(funcs: funcs))
+end
+
+let collect_closure_arities_raw = fn (funcs: [LirFunction]) -> [i64] do
+  match funcs
+    case Nil -> Nil
+    case LirFunction(name: n, params: ps, ret_type: _, body: _, ret: _, span: _) :: rest ->
+      if is_closure_func(name: n) then
+        let arity = list.length(xs: ps) - 1
+        Cons(v: arity, rest: collect_closure_arities_raw(funcs: rest))
+      else
+        collect_closure_arities_raw(funcs: rest)
+      end
+  end
+end
+
+let dedup_i64 = fn (xs: [i64]) -> [i64] do
+  return dedup_i64_go(xs: xs, seen: Nil)
+end
+
+let dedup_i64_go = fn (xs: [i64], seen: [i64]) -> [i64] do
+  match xs
+    case Nil -> Nil
+    case x :: rest ->
+      if contains_i64(val: x, xs: seen) then dedup_i64_go(xs: rest, seen: seen)
+      else Cons(v: x, rest: dedup_i64_go(xs: rest, seen: Cons(v: x, rest: seen)))
+      end
+  end
+end
+
+let contains_i64 = fn (val: i64, xs: [i64]) -> bool do
+  match xs
+    case Nil -> false
+    case x :: rest ->
+      if x == val then true
+      else contains_i64(val: val, xs: rest)
+      end
+  end
+end
+
+// ─── Module entry point ────────────────────────────────────────────────────
+
 export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
   match program
     case LirProgram(functions: funcs, externals: orig_exts) ->
@@ -1183,6 +1350,14 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
                 rest: base_external_funcs)))
         case false -> base_external_funcs
       end
+
+      // Closure analysis
+      let closure_table = build_closure_table(funcs: funcs, internal_funcs: internal_funcs, table_idx: 0)
+      let n_closures = list.length(xs: closure_table)
+      let closure_arities = collect_closure_arities(funcs: funcs)
+      let n_closure_types = list.length(xs: closure_arities)
+      // Closure type indices start after all ext + func + wasi_run types
+      let closure_type_base = n_exts + n_funcs + 1
 
       let main_idx = lookup_func(name: "main", entries: internal_funcs)
       let main_ret = match find_function(name: "main", funcs: funcs)
@@ -1224,8 +1399,12 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
       let %m = push_byte(buf: %m, byte: 0)
       let %m = push_byte(buf: %m, byte: 0)
 
-      // Type section
-      let %m = emit_section(buf: %m, id: sec_type, content: build_type_section(program: augmented_program, has_bt: has_bt))
+      // Type section (with backtrace + closure call types appended)
+      let %type_sec = build_type_section(program: augmented_program, has_bt: has_bt, n_closure_types: n_closure_types)
+      if n_closure_types > 0 then
+        let %type_sec = emit_closure_type_entries(buf: %type_sec, arities: closure_arities)
+      end
+      let %m = emit_section(buf: %m, id: sec_type, content: %type_sec)
 
       // Import section
       if n_exts > 0 || (mem_mode != "none" && mem_mode != "defined") || has_bt then
@@ -1239,6 +1418,11 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
 
       // Function section
       let %m = emit_section(buf: %m, id: sec_function, content: build_function_section(n_funcs: n_funcs, n_exts: n_exts))
+
+      // Table section (if closures exist)
+      if n_closures > 0 then
+        let %m = emit_section(buf: %m, id: sec_table, content: build_table_section(n_closures: n_closures))
+      end
 
       // Memory section
       if mem_mode == "defined" then
@@ -1255,12 +1439,20 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
                              content: build_export_section(main_idx: main_idx, wasi_run_idx: wasi_run_idx,
                                                            mem_mode: mem_mode, conc_exports: conc_exports))
 
+      // Element section (populate funcref table)
+      if n_closures > 0 then
+        let %m = emit_section(buf: %m, id: sec_element, content: build_element_section(closure_entries: closure_table))
+      end
+
       // Code section
+      // Build closure_type_indices: map arity → type section index
+      let closure_type_idx_list = build_closure_type_idx_list(arities: closure_arities, base: closure_type_base)
       let %code = empty()
       let %code = push_uleb128(buf: %code, val: n_funcs + 1)
       let %code = emit_code_bodies(buf: %code, funcs: funcs, internal_funcs: internal_funcs,
                                     external_funcs: external_funcs, string_lits: string_entries,
-                                    heap_enabled: heap_enabled, functions: funcs, externals: exts)
+                                    heap_enabled: heap_enabled, functions: funcs, externals: exts,
+                                    closure_table: closure_table, closure_type_indices: closure_type_idx_list)
       let %wasi_body = compile_wasi_run_wrapper(main_idx: main_idx, main_ret_type: main_ret)
       let %code = append_body_to_buf(buf: %code, body: %wasi_body)
       let %m = emit_section(buf: %m, id: sec_code, content: %code)
@@ -1271,5 +1463,14 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
       end
 
       return %m
+  end
+end
+
+let build_closure_type_idx_list = fn (arities: [i64], base: i64) -> [ArityTypeIdx] do
+  match arities
+    case Nil -> Nil
+    case a :: rest ->
+      Cons(v: ArityTypeIdx(arity: a, type_idx: base),
+           rest: build_closure_type_idx_list(arities: rest, base: base + 1))
   end
 end
