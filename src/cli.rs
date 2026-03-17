@@ -116,6 +116,12 @@ pub enum Command {
     },
     /// Start the Language Server Protocol server (stdio).
     Lsp,
+    /// Invoke the self-hosted nxc compiler (auto-builds and caches nxc_driver.wasm).
+    Nxc {
+        /// Arguments to pass to the nxc compiler (e.g. input.nx output.wasm).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Execute a pre-compiled WASM module with the Nexus runtime.
     Exec {
         /// Path to a `.wasm` file.
