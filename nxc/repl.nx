@@ -1,0 +1,125 @@
+/**
+ * repl: Interactive REPL for the Nexus language (nxc).
+ *
+ * Architecture: source-assembly with incremental accumulation.
+ * - Definitions (type, enum, fn, exception, import, port): accumulated as
+ *   top-level source, never re-executed (side-effect-free).
+ * - Let bindings: accumulated in main body. Re-evaluated each round but
+ *   typically pure. Value capture planned for future.
+ * - Bare expressions: compiled and executed ONCE, then discarded.
+ *   This is the key improvement over the Rust REPL's accumulate-everything
+ *   approach — print/IO side effects never re-execute.
+ *
+ * Execution: writes a .nx temp file and delegates to `nexus run`.
+ *
+ * NOTE: Works around codegen E2010/E2017 bugs by limiting string concat
+ * chains and match case counts per function. The total number of `++`
+ * operations across the program must stay within codegen temp limits.
+ */
+
+import { print, println, read_line } from stdlib/stdio.nx
+import { exec, ExecResult } from stdlib/proc.nx
+import * as fs from stdlib/fs.nx
+import * as string from stdlib/string.nx
+
+// ─── Input categorization ───────────────────────────────────────────────────
+
+// Dispatch tag: exactly 4 variants to stay within match case limit.
+// Empty and commands are folded into KindQuit/KindExpr.
+type InputKind = KindQuit | KindDef | KindLetBinding | KindExpr
+
+let categorize = fn (input: string) -> InputKind do
+  let t = string.trim(s: input)
+  if t == "" then return KindQuit end
+  if t == ":quit" then return KindQuit end
+  if t == ":q" then return KindQuit end
+  if t == ":exit" then return KindQuit end
+  if string.starts_with(s: t, prefix: "type ") then return KindDef end
+  if string.starts_with(s: t, prefix: "export type ") then return KindDef end
+  if string.starts_with(s: t, prefix: "opaque type ") then return KindDef end
+  if string.starts_with(s: t, prefix: "exception ") then return KindDef end
+  if string.starts_with(s: t, prefix: "export exception ") then return KindDef end
+  if string.starts_with(s: t, prefix: "import ") then return KindDef end
+  if string.starts_with(s: t, prefix: "from ") then return KindDef end
+  if string.starts_with(s: t, prefix: "port ") then return KindDef end
+  if string.starts_with(s: t, prefix: "export port ") then return KindDef end
+  if string.starts_with(s: t, prefix: "external ") then return KindDef end
+  if string.starts_with(s: t, prefix: "export ") then return KindDef end
+  if string.starts_with(s: t, prefix: "let ") then
+    if string.contains(s: t, sub: "= fn ") then return KindDef end
+    if string.contains(s: t, sub: "= fn(") then return KindDef end
+    return KindLetBinding
+  end
+  return KindExpr
+end
+
+// ─── Execute ────────────────────────────────────────────────────────────────
+
+let run_source = fn (src: string) -> i64 require { PermFs, PermProc, PermConsole } throws { Exn } do
+  fs.write_string(path: "/tmp/__nxc_repl__.nx", content: src)
+  let result = exec(cmd: "nexus", args: [
+    "run", "--allow-fs", "--allow-net", "--allow-console",
+    "--allow-random", "--allow-clock", "--allow-proc", "--allow-env",
+    "/tmp/__nxc_repl__.nx"
+  ])
+  match result
+    case ExecResult(exit_code: code, stdout: out, stderr: err) ->
+      if string.length(s: out) > 0 then print(val: out) end
+      if code != 0 then
+        if string.length(s: err) > 0 then print(val: err) end
+      end
+      return code
+  end
+end
+
+// ─── Source assembly ────────────────────────────────────────────────────────
+
+// Build a complete .nx source. Exactly 4 ++ operations (codegen limit).
+let build_source = fn (defs: string, bindings: string, body: string) -> string do
+  defs ++
+  "\nlet main = fn () -> unit require { PermConsole, PermFs, PermNet, PermProc, PermRandom, PermClock } do\n" ++
+  bindings ++ body ++ "\nreturn ()\nend\n"
+end
+
+// ─── REPL loop ──────────────────────────────────────────────────────────────
+
+// Main loop with exactly 4 match cases (codegen limit).
+// No string concat (`++`) inside this function — all concat is in callees.
+let repl_loop = fn (defs: string, bindings: string, round: i64) -> unit
+    require { PermConsole, PermFs, PermProc } throws { Exn } do
+  let input = read_line()
+  let kind = categorize(input: input)
+  match kind
+    case KindQuit -> return ()
+    case KindDef ->
+      let new_defs = defs ++ input ++ "\n"
+      repl_loop(defs: new_defs, bindings: bindings, round: round)
+    case KindLetBinding ->
+      let new_bindings = bindings ++ input ++ "\n"
+      let src = build_source(defs: defs, bindings: new_bindings, body: "")
+      let code = run_source(src: src)
+      match code == 0
+        case true -> repl_loop(defs: defs, bindings: new_bindings, round: round + 1)
+        case false -> repl_loop(defs: defs, bindings: bindings, round: round)
+      end
+    case KindExpr ->
+      let src = build_source(defs: defs, bindings: bindings, body: input)
+      let _ = run_source(src: src)
+      repl_loop(defs: defs, bindings: bindings, round: round + 1)
+  end
+end
+
+// ─── Entry point ────────────────────────────────────────────────────────────
+
+let main = fn () -> unit require { PermConsole, PermFs, PermProc } do
+  println(val: "nxc REPL v0.1.0 (incremental, no re-execution of expressions)")
+  println(val: "Type :quit to exit.")
+  try
+    repl_loop(defs: "", bindings: "", round: 0)
+  catch e ->
+    match e
+      case RuntimeError(val: msg) -> println(val: msg)
+      case InvalidIndex(val: _) -> return ()
+    end
+  end
+end
