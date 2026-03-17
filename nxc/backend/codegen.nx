@@ -39,7 +39,8 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry,
          op_i32_and, op_i32_or } from nxc/backend/wasm_defs.nx
 import { collect_program_strings, build_string_entries, compute_last_string_end,
          program_uses_heap, choose_memory_mode, align8,
-         collect_local_stmts } from nxc/backend/wasm_collect.nx
+         collect_local_stmts, program_needs_backtrace,
+         collect_bt_strings } from nxc/backend/wasm_collect.nx
 import { build_type_section, build_import_section, build_function_section,
          build_memory_section, build_global_section, build_export_section,
          build_data_section, emit_local_decls } from nxc/backend/wasm_section.nx
@@ -554,12 +555,49 @@ let emit_external_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], params: 
   end
 end
 
+// ─── Backtrace emission helpers ─────────────────────────────────────────────
+
+let emit_bt_push = fn (buf: %ByteBuffer, ctx: CodegenCtx, func_name: string) -> %ByteBuffer do
+  let idx = lookup_func(name: "__nx_bt_push", entries: ctx_external_funcs(ctx: ctx))
+  if idx < 0 then return %buf end
+  let packed = lookup_string(value: func_name, entries: ctx_string_lits(ctx: ctx))
+  let packed_val = match packed < 0 case true -> 0 case false -> packed end
+  let %buf = push_byte(buf: %buf, byte: op_i64_const)
+  let %buf = push_sleb128(buf: %buf, val: packed_val)
+  let %buf = push_byte(buf: %buf, byte: op_call)
+  return push_uleb128(buf: %buf, val: idx)
+end
+
+let emit_bt_pop = fn (buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+  let idx = lookup_func(name: "__nx_bt_pop", entries: ctx_external_funcs(ctx: ctx))
+  if idx < 0 then return %buf end
+  let %buf = push_byte(buf: %buf, byte: op_call)
+  return push_uleb128(buf: %buf, val: idx)
+end
+
+let emit_bt_freeze = fn (buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+  let idx = lookup_func(name: "__nx_bt_freeze", entries: ctx_external_funcs(ctx: ctx))
+  if idx < 0 then return %buf end
+  let %buf = push_byte(buf: %buf, byte: op_call)
+  return push_uleb128(buf: %buf, val: idx)
+end
+
+let emit_bt_pop_if = fn (buf: %ByteBuffer, ctx: CodegenCtx, cond: bool) -> %ByteBuffer do
+  match cond
+    case true -> emit_bt_pop(buf: %buf, ctx: ctx)
+    case false -> %buf
+  end
+end
+
+// ─── Call emission ──────────────────────────────────────────────────────────
+
 let emit_internal_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
                               is_tail: bool, in_try: bool, int_idx: i64) -> %ByteBuffer do
   match find_function(name: func, funcs: ctx_functions(ctx: ctx))
     case Some(val: LirFunction(name: _, params: params, ret_type: _, body: _, ret: _, span: _)) ->
       let %buf = emit_internal_call_args(buf: %buf, args: args, params: params, ctx: ctx)
       let use_tail = is_tail && (in_try == false)
+      let %buf = emit_bt_pop_if(buf: %buf, ctx: ctx, cond: use_tail)
       let call_op = match use_tail case true -> op_return_call case false -> op_call end
       let %buf = push_byte(buf: %buf, byte: call_op)
       push_uleb128(buf: %buf, val: int_idx)
@@ -675,6 +713,7 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       return emit_unpack_from_i64(typ: ftyp, buf: %buf)
 
     case LirExprRaise(value: v, typ: _) ->
+      let %buf = emit_bt_freeze(buf: %buf, ctx: ctx)
       let exn_value = ctx_temps_base(ctx: ctx) + 1
       let exn_flag = ctx_temps_base(ctx: ctx) + 2
       let %buf = emit_atom(atom: v, buf: %buf, ctx: ctx)
@@ -735,6 +774,7 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = emit_stmts(stmts: tb, buf: %buf, ctx: ctx, in_try: in_try)
       let %buf = emit_atom(atom: tr, buf: %buf, ctx: ctx)
       let %buf = emit_coercion(from_type: atom_type(atom: tr), to_type: rt, buf: %buf)
+      let %buf = emit_bt_pop(buf: %buf, ctx: ctx)
       let %buf = push_byte(buf: %buf, byte: op_return)
       let has_else = list.length(xs: eb) > 0
       let has_else_ret = match er case Some(val: _) -> true case None -> false end
@@ -745,6 +785,7 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
           case Some(val: a) ->
             let %buf = emit_atom(atom: a, buf: %buf, ctx: ctx)
             let %buf = emit_coercion(from_type: atom_type(atom: a), to_type: rt, buf: %buf)
+            let %buf = emit_bt_pop(buf: %buf, ctx: ctx)
             let %buf = push_byte(buf: %buf, byte: op_return)
           case None -> ()
         end
@@ -787,6 +828,7 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
         case Some(val: a) ->
           let %b = emit_atom(atom: a, buf: %buf, ctx: ctx)
           let %b = emit_coercion(from_type: atom_type(atom: a), to_type: ctx_func_ret_type(ctx: ctx), buf: %b)
+          let %b = emit_bt_pop(buf: %b, ctx: ctx)
           push_byte(buf: %b, byte: op_return)
         case None -> %buf
       end
@@ -819,6 +861,7 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
         case Some(val: a) ->
           let %b = emit_atom(atom: a, buf: %buf, ctx: ctx)
           let %b = emit_coercion(from_type: atom_type(atom: a), to_type: ctx_func_ret_type(ctx: ctx), buf: %b)
+          let %b = emit_bt_pop(buf: %b, ctx: ctx)
           push_byte(buf: %b, byte: op_return)
         case None -> %buf
       end
@@ -879,11 +922,13 @@ end
 
 let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuffer do
   match func
-    case LirFunction(name: _, params: ps, ret_type: rt, body: b, ret: r, span: _) ->
+    case LirFunction(name: fname, params: ps, ret_type: rt, body: b, ret: r, span: _) ->
       let %body = empty()
       let %body = emit_local_decls(buf: %body, locals: ctx_locals(ctx: ctx), param_count: list.length(xs: ps))
+      let %body = emit_bt_push(buf: %body, ctx: ctx, func_name: fname)
       let %body = emit_stmts(stmts: b, buf: %body, ctx: ctx, in_try: false)
       let %body = emit_return_value(body: %body, rt: rt, r: r, ctx: ctx)
+      let %body = emit_bt_pop(buf: %body, ctx: ctx)
       push_byte(buf: %body, byte: op_end)
   end
 end
@@ -981,10 +1026,20 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
     case LirProgram(functions: funcs, externals: exts) ->
       let n_exts = list.length(xs: exts)
       let n_funcs = list.length(xs: funcs)
-      let import_count = n_exts
+      let has_bt = program_needs_backtrace(funcs: funcs)
+      let n_bt_imports = match has_bt case true -> 3 case false -> 0 end
+      let import_count = n_exts + n_bt_imports
 
       let internal_funcs = build_internal_func_entries(funcs: funcs, import_count: import_count, idx: 0)
-      let external_funcs = build_external_func_entries(exts: exts, idx: 0)
+      let base_external_funcs = build_external_func_entries(exts: exts, idx: 0)
+      let external_funcs = match has_bt
+        case true ->
+          Cons(v: FuncEntry(name: "__nx_bt_push", index: n_exts),
+            rest: Cons(v: FuncEntry(name: "__nx_bt_pop", index: n_exts + 1),
+              rest: Cons(v: FuncEntry(name: "__nx_bt_freeze", index: n_exts + 2),
+                rest: base_external_funcs)))
+        case false -> base_external_funcs
+      end
 
       let main_idx = lookup_func(name: "main", entries: internal_funcs)
       let main_ret = match find_function(name: "main", funcs: funcs)
@@ -992,7 +1047,11 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
         case None -> TyUnit
       end
 
-      let all_strings = collect_program_strings(funcs: funcs, acc: Nil)
+      let base_strings = collect_program_strings(funcs: funcs, acc: Nil)
+      let all_strings = match has_bt
+        case true -> collect_bt_strings(funcs: funcs, acc: base_strings)
+        case false -> base_strings
+      end
       let string_entries = build_string_entries(strings: all_strings, next_offset: string_data_base, acc: Nil)
       let has_strings = list.length(xs: string_entries) > 0
 
@@ -1017,11 +1076,16 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
       let %m = push_byte(buf: %m, byte: 0)
 
       // Type section
-      let %m = emit_section(buf: %m, id: sec_type, content: build_type_section(program: program))
+      let %m = emit_section(buf: %m, id: sec_type, content: build_type_section(program: program, has_bt: has_bt))
 
       // Import section
-      if n_exts > 0 || (mem_mode != "none" && mem_mode != "defined") then
-        let %m = emit_section(buf: %m, id: sec_import, content: build_import_section(exts: exts, mem_mode: mem_mode))
+      if n_exts > 0 || (mem_mode != "none" && mem_mode != "defined") || has_bt then
+        let bt_push_type_idx = n_exts + n_funcs + 1
+        let bt_void_type_idx = n_exts + n_funcs + 2
+        let %m = emit_section(buf: %m, id: sec_import,
+                               content: build_import_section(exts: exts, mem_mode: mem_mode,
+                                 has_bt: has_bt, bt_push_type_idx: bt_push_type_idx,
+                                 bt_void_type_idx: bt_void_type_idx))
       end
 
       // Function section
