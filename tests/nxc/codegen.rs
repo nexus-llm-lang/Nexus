@@ -15,6 +15,7 @@ fn codegen_validate_wasm_output() {
         "nxc_test_call.wasm",
         "nxc_test_arith.wasm",
         "nxc_test_if.wasm",
+        "nxc_test_f64.wasm",
     ];
     for path in &files {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {}", path, e));
@@ -88,6 +89,23 @@ fn codegen_validate_wasm_output() {
             .get_typed_func::<(), ()>(&mut store, "main")
             .unwrap();
         main.call(&mut store, ()).unwrap();
+    }
+
+    // f64 literal: main() should return 3.14
+    {
+        let bytes = std::fs::read("nxc_test_f64.wasm").unwrap();
+        let module = wasmtime::Module::from_binary(&engine, &bytes).unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+        let main = instance
+            .get_typed_func::<(), f64>(&mut store, "main")
+            .unwrap();
+        let result = main.call(&mut store, ()).unwrap();
+        assert!(
+            (result - 3.14).abs() < 1e-10,
+            "f64 literal: expected 3.14, got {}",
+            result
+        );
     }
 
     for path in &files {
