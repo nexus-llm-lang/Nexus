@@ -393,6 +393,17 @@ pub extern "C" fn __nx_buf_push_i64_le(id: i64, val: i64) {
 }
 
 #[no_mangle]
+pub extern "C" fn __nx_buf_push_f64_str_le(id: i64, s_ptr: i32, s_len: i32) {
+    let s = nexus_wasm_alloc::read_string(s_ptr, s_len);
+    let val: f64 = s.trim().parse().unwrap_or(0.0);
+    BUFS.with(|bufs| {
+        if let Some(buf) = bufs.borrow_mut().get_mut(&id) {
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+    });
+}
+
+#[no_mangle]
 pub extern "C" fn __nx_buf_push_leb128_u(id: i64, mut val: i64) {
     BUFS.with(|bufs| {
         if let Some(buf) = bufs.borrow_mut().get_mut(&id) {

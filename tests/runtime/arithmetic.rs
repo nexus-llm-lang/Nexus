@@ -1,4 +1,4 @@
-use crate::harness::exec;
+use crate::harness::{exec, exec_with_stdlib};
 use proptest::prelude::*;
 
 #[test]
@@ -53,6 +53,37 @@ let main = fn () -> unit do
     else
         raise RuntimeError(val: "negate(false) should be true")
     end
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_f64_literal_and_arithmetic() {
+    exec_with_stdlib(
+        r#"
+import { abs_float } from stdlib/math.nx
+import { from_float } from stdlib/string.nx
+
+let check_f64 = fn (actual: f64, expected: f64, label: string) -> unit throws { Exn } do
+  let diff = actual -. expected
+  let abs_diff = abs_float(val: diff)
+  if abs_diff >. 0.0001 then
+    raise RuntimeError(val: "f64 mismatch in " ++ label ++ ": got " ++ from_float(val: actual))
+  end
+  return ()
+end
+
+let main = fn () -> unit do
+    let x = 3.14
+    let y = 2.0
+    let z = x +. y
+    check_f64(actual: z, expected: 5.14, label: "add")
+    let w = x *. y
+    check_f64(actual: w, expected: 6.28, label: "mul")
+    let d = x -. y
+    check_f64(actual: d, expected: 1.14, label: "sub")
+    return ()
 end
 "#,
     );
