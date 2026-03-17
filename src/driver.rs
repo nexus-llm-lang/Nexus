@@ -22,14 +22,7 @@ pub struct CompiledWasm {
     pub app_needs_nexus_host: bool,
 }
 
-pub fn compile_loaded_source_to_core_wasm(
-    loaded: &LoadedSource,
-    verbose: bool,
-) -> Result<Vec<u8>, ExitCode> {
-    compile_loaded_source_to_core_wasm_impl(loaded, verbose, false)
-}
-
-fn compile_loaded_source_to_core_wasm_impl(
+fn compile_loaded_source_to_core_wasm(
     loaded: &LoadedSource,
     verbose: bool,
     skip_typecheck: bool,
@@ -104,7 +97,7 @@ fn compile_loaded_source_to_wasm_impl(
     verbose: bool,
     skip_typecheck: bool,
 ) -> Result<CompiledWasm, ExitCode> {
-    let wasm = match compile_loaded_source_to_core_wasm_impl(loaded, verbose, skip_typecheck) {
+    let wasm = match compile_loaded_source_to_core_wasm(loaded, verbose, skip_typecheck) {
         Ok(wasm) => wasm,
         Err(code) => return Err(code),
     };
