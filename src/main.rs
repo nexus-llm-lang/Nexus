@@ -1,6 +1,7 @@
 mod artifact;
 mod cli;
 mod driver;
+mod nxc_cache;
 
 use clap::Parser;
 use std::fs;
@@ -92,6 +93,7 @@ fn main() -> ExitCode {
             cli.verbose,
             skip_typecheck,
         ),
+        Some(Command::Nxc { args }) => nxc_command(args, cli.verbose),
         Some(Command::Check { input, format }) => check_command(input, format),
         Some(Command::Lsp) => lsp_command(),
         Some(Command::Exec {
@@ -262,6 +264,36 @@ fn exec_command(
     };
     let module_dir = input.parent();
     runtime::wasm_exec::run_wasm_bytes(&wasm, module_dir, &capabilities, &guest_args)
+}
+
+fn nxc_command(args: Vec<String>, verbose: bool) -> ExitCode {
+    let project_root = std::env::current_dir().unwrap_or_default();
+    let wasm_path = match nxc_cache::ensure_nxc_driver(&project_root, verbose) {
+        Ok(path) => path,
+        Err(msg) => {
+            eprintln!("nxc: {}", msg);
+            return ExitCode::from(1);
+        }
+    };
+    let wasm = match fs::read(&wasm_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("nxc: failed to read {}: {}", wasm_path.display(), e);
+            return ExitCode::from(1);
+        }
+    };
+    let capabilities = ExecutionCapabilities {
+        allow_fs: true,
+        allow_console: true,
+        allow_proc: true,
+        ..ExecutionCapabilities::deny_all()
+    };
+    nexus::runtime::wasm_exec::run_wasm_bytes(
+        &wasm,
+        Some(project_root.as_path()),
+        &capabilities,
+        &args,
+    )
 }
 
 fn check_command(input: Option<std::path::PathBuf>, format: cli::CheckFormat) -> ExitCode {

@@ -39,10 +39,20 @@ info "Using Rust compiler: $NEXUS"
 mkdir -p "$BUILD_DIR"
 
 # ─── Stage 0: Rust compiler → stage0.wasm ─────────────────────────────────
+# Try to reuse `nexus nxc` auto-cache (target/nxc/nxc_driver.wasm).
+# If the cache is valid, copy it as stage0 instead of recompiling.
 
 STAGE0="$BUILD_DIR/stage0.wasm"
-info "Stage 0: nexus build $NXC_ENTRY → $STAGE0"
-"$NEXUS" build $NEXUS_BUILD_FLAGS "$NXC_ENTRY" -o "$STAGE0"
+NXC_CACHE="target/nxc/nxc_driver.wasm"
+
+# Trigger cache build (nxc with no args exits with usage, but populates cache).
+if "$NEXUS" nxc >/dev/null 2>&1 || [[ -f "$NXC_CACHE" ]]; then
+  info "Stage 0: reusing cached nxc_driver.wasm"
+  cp "$NXC_CACHE" "$STAGE0"
+else
+  info "Stage 0: nexus build $NXC_ENTRY → $STAGE0"
+  "$NEXUS" build $NEXUS_BUILD_FLAGS "$NXC_ENTRY" -o "$STAGE0"
+fi
 ok "Stage 0 complete: $STAGE0 ($(wc -c < "$STAGE0" | tr -d ' ') bytes)"
 
 # ─── Stage 1: stage0.wasm compiles nxc → stage1.wasm ──────────────────────
