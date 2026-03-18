@@ -1,6 +1,17 @@
 // Entry point
 pub const ENTRYPOINT: &str = "main";
 
+// WASM module identifiers
+pub const WASI_SNAPSHOT_MODULE: &str = "wasi_snapshot_preview1";
+pub const WASI_MODULE_PREFIX: &str = "wasi:";
+pub const WASI_CLI_RUN_EXPORT: &str = "wasi:cli/run@0.2.6#run";
+pub const NEXUS_HOST_HTTP_MODULE: &str = "nexus:cli/nexus-host";
+pub const NEXUS_HOST_HTTP_FUNC: &str = "host-http-request";
+pub const MEMORY_EXPORT: &str = "memory";
+
+// Custom section
+pub const NEXUS_CAPABILITIES_SECTION: &str = "nexus:capabilities";
+
 /// Runtime permission — parse-don't-validate enum for capability names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Permission {
@@ -90,4 +101,8 @@ impl Permission {
             Permission::Env => "--allow-env",
         }
     }
+}
+
+pub fn is_preview2_wasi_module(module_name: &str) -> bool {
+    module_name.starts_with(WASI_MODULE_PREFIX)
 }
