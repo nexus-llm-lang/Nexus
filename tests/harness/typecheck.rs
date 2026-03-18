@@ -48,14 +48,3 @@ pub fn should_fail_parse(src: &str) {
     }
 }
 
-/// Parse + typecheck. Returns the checked program.
-pub fn parse_and_check(src: &str) -> nexus::lang::ast::Program {
-    let program = parser::parser()
-        .parse(src)
-        .expect("parse should succeed");
-    let mut checker = TypeChecker::new();
-    checker
-        .check_program(&program)
-        .expect("typecheck should succeed");
-    program
-}
