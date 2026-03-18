@@ -1,4 +1,4 @@
-use crate::harness::should_fail_parse;
+use crate::harness::{should_fail_parse, should_typecheck};
 use nexus::lang::ast::{Expr, Type};
 use nexus::lang::parser;
 use std::fs;
