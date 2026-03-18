@@ -2,10 +2,12 @@
 #
 # bootstrap.sh — Multi-stage bootstrap for the Nexus self-hosted compiler (nxc/)
 #
-# Stage 0: Rust compiler (nexus build) compiles nxc/driver.nx → stage0.wasm
-# Stage 1: Run stage0.wasm (nexus exec) to compile nxc/driver.nx → stage1.wasm
-# Stage 2: Run stage1.wasm (nexus exec) to compile nxc/driver.nx → stage2.wasm
+# Stage 0: Locate a seed nxc_driver.wasm (pre-built, cached, or via NXC_SEED)
+# Stage 1: Run stage0 to compile nxc/driver.nx → stage1.wasm
+# Stage 2: Run stage1 to compile nxc/driver.nx → stage2.wasm
 # Verify:  stage1.wasm == stage2.wasm (fixed point)
+#
+# No Rust compiler needed — all stages use wasmtime directly.
 #
 # Usage: ./bootstrap.sh [--ci]
 #   --ci    Strict mode for CI: fail on stage2 failure or non-identical output
@@ -20,11 +22,8 @@ for arg in "$@"; do
   esac
 done
 
-NEXUS="${NEXUS:-./target/release/nexus}"
 NXC_ENTRY="nxc/driver.nx"
 BUILD_DIR="bootstrap_out"
-NEXUS_EXEC_FLAGS="--allow-fs --allow-console --allow-proc"
-NEXUS_BUILD_FLAGS="--skip-typecheck"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -37,60 +36,100 @@ ok()    { printf "${GREEN}[bootstrap]${RESET} %s\n" "$*"; }
 warn()  { printf "${YELLOW}[bootstrap]${RESET} %s\n" "$*"; }
 fail()  { printf "${RED}[bootstrap]${RESET} %s\n" "$*" >&2; exit 1; }
 
-# ─── Ensure the Rust compiler is built ─────────────────────────────────────
+# ─── Ensure tools are available ──────────────────────────────────────────────
 
-if [[ ! -x "$NEXUS" ]]; then
-  info "Building Rust compiler (cargo build --release)..."
-  cargo build --release
-fi
+command -v wasmtime >/dev/null 2>&1 || fail "wasmtime not found in PATH"
+command -v wasm-tools >/dev/null 2>&1 || fail "wasm-tools not found in PATH"
 
-[[ -x "$NEXUS" ]] || fail "Rust compiler not found at $NEXUS"
-info "Using Rust compiler: $NEXUS"
+# ─── Locate seed nxc_driver.wasm (stage 0) ───────────────────────────────────
+
+find_seed() {
+  if [[ -n "${NXC_SEED:-}" ]] && [[ -f "$NXC_SEED" ]]; then
+    echo "$NXC_SEED"
+    return
+  fi
+
+  if [[ -f "nxc_driver.wasm" ]]; then
+    echo "nxc_driver.wasm"
+    return
+  fi
+
+  if [[ -f "target/nxc/nxc_driver.wasm" ]]; then
+    echo "target/nxc/nxc_driver.wasm"
+    return
+  fi
+
+  return 1
+}
+
+SEED=$(find_seed) || fail "No seed nxc_driver.wasm found.
+  Provide one via NXC_SEED=/path/to/nxc_driver.wasm
+  or place nxc_driver.wasm in the project root."
+
+info "Using seed: $SEED"
+
+# ─── Ensure seed has _start export ───────────────────────────────────────────
+# The Rust-built nxc_driver.wasm exports "main" but not "_start".
+# wasmtime run needs _start, so we patch it via WAT roundtrip if needed.
+
+ensure_start_export() {
+  local wasm="$1"
+  if wasm-tools print "$wasm" 2>/dev/null | grep -q 'export "_start"'; then
+    return 0
+  fi
+
+  info "Patching $wasm: adding _start export..."
+  local wat
+  wat=$(mktemp /tmp/nxc_patch_XXXXXX.wat)
+  wasm-tools print "$wasm" > "$wat"
+  # Add _start as alias for main (both are (func) → void)
+  perl -pi -e 's/\(export "main" \(func (\d+)\)\)/(export "main" (func $1))\n  (export "_start" (func $1))/' "$wat"
+  wasm-tools parse "$wat" -o "$wasm"
+  rm -f "$wat"
+  ok "Patched $wasm with _start export"
+}
+
+ensure_start_export "$SEED"
+
+# ─── Helper to run a wasm compiler stage ─────────────────────────────────────
+
+run_stage() {
+  local wasm="$1"
+  local input="$2"
+  local output="$3"
+  wasmtime run -S preview2=n --dir=. "$wasm" "$input" "$output"
+}
 
 mkdir -p "$BUILD_DIR"
 
-# ─── Stage 0: Rust compiler → stage0.wasm ─────────────────────────────────
-# Try to reuse `nexus nxc` auto-cache (target/nxc/nxc_driver.wasm).
-# If the cache is valid, copy it as stage0 instead of recompiling.
+# ─── Stage 0 → Stage 1 ──────────────────────────────────────────────────────
 
-STAGE0="$BUILD_DIR/stage0.wasm"
-NXC_CACHE="target/nxc/nxc_driver.wasm"
-
-# Trigger cache build (nxc with no args exits with usage, but populates cache).
-if "$NEXUS" nxc >/dev/null 2>&1 || [[ -f "$NXC_CACHE" ]]; then
-  info "Stage 0: reusing cached nxc_driver.wasm"
-  cp "$NXC_CACHE" "$STAGE0"
-else
-  info "Stage 0: nexus build $NXC_ENTRY → $STAGE0"
-  "$NEXUS" build $NEXUS_BUILD_FLAGS "$NXC_ENTRY" -o "$STAGE0"
-fi
-ok "Stage 0 complete: $STAGE0 ($(wc -c < "$STAGE0" | tr -d ' ') bytes)"
-
-# ─── Stage 1: stage0.wasm compiles nxc → stage1.wasm ──────────────────────
-
+STAGE0="$SEED"
 STAGE1="$BUILD_DIR/stage1.wasm"
-info "Stage 1: nexus exec $STAGE0 -- $NXC_ENTRY $STAGE1"
-"$NEXUS" exec $NEXUS_EXEC_FLAGS "$STAGE0" -- "$NXC_ENTRY" "$STAGE1"
+
+info "Stage 1: $STAGE0 compiles $NXC_ENTRY → $STAGE1"
+run_stage "$STAGE0" "$NXC_ENTRY" "$STAGE1"
 ok "Stage 1 complete: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
 
-# ─── Stage 2: stage1.wasm compiles nxc → stage2.wasm ──────────────────────
+# ─── Stage 1 → Stage 2 ──────────────────────────────────────────────────────
 
 STAGE2="$BUILD_DIR/stage2.wasm"
-info "Stage 2: nexus exec $STAGE1 -- $NXC_ENTRY $STAGE2"
-if "$NEXUS" exec $NEXUS_EXEC_FLAGS "$STAGE1" -- "$NXC_ENTRY" "$STAGE2" 2>&1; then
+
+info "Stage 2: $STAGE1 compiles $NXC_ENTRY → $STAGE2"
+if run_stage "$STAGE1" "$NXC_ENTRY" "$STAGE2" 2>&1; then
   ok "Stage 2 complete: $STAGE2 ($(wc -c < "$STAGE2" | tr -d ' ') bytes)"
 else
   if [[ "$CI_MODE" == true ]]; then
     fail "Stage 2 failed — nxc-produced WASM is not self-executable."
   fi
   warn "Stage 2 failed — nxc-produced WASM not yet self-executable."
-  warn "Stage 1 output is still valid (compiled by the Rust-built stage0)."
+  warn "Stage 1 output is still valid (compiled by the seed)."
   cp "$STAGE1" nxc_driver.wasm
   ok "Installed (stage 1): nxc_driver.wasm ($(wc -c < nxc_driver.wasm | tr -d ' ') bytes)"
   exit 0
 fi
 
-# ─── Verify fixed point ───────────────────────────────────────────────────
+# ─── Verify fixed point ─────────────────────────────────────────────────────
 
 info "Verifying fixed point: stage1 == stage2"
 if cmp -s "$STAGE1" "$STAGE2"; then
