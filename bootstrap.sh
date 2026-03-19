@@ -23,7 +23,7 @@ done
 NEXUS="${NEXUS:-./target/release/nexus}"
 NXC_ENTRY="nxc/driver.nx"
 BUILD_DIR="bootstrap_out"
-NEXUS_EXEC_FLAGS="--allow-fs --allow-console --allow-proc"
+NEXUS_EXEC_FLAGS="--allow-fs --allow-console --allow-proc --allow-random"
 NEXUS_BUILD_FLAGS="--skip-typecheck"
 
 RED='\033[0;31m'
