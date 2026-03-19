@@ -14,7 +14,7 @@ pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
 
 #[no_mangle]
 pub extern "C" fn __nx_string_length(s_ptr: i32, s_len: i32) -> i64 {
-    read_string(s_ptr, s_len).len() as i64
+    read_string(s_ptr, s_len).chars().count() as i64
 }
 
 #[no_mangle]
