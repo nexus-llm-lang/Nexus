@@ -221,6 +221,14 @@ impl MirBuilder {
                 }
                 let mut body = pf.preamble;
                 body.extend(self.convert_stmts(&pf.body, &pf.rename_map, &scope)?);
+                // Implicit return: if the last statement is a bare expression
+                // (not already a Return), promote it to Return so the value
+                // is used as the function's return value.
+                if let Some(MirStmt::Expr(expr)) = body.last().cloned() {
+                    if !matches!(expr, MirExpr::If { .. } | MirExpr::Match { .. } | MirExpr::While { .. }) {
+                        *body.last_mut().unwrap() = MirStmt::Return(expr);
+                    }
+                }
                 self.functions.push(MirFunction {
                     name: Symbol::from(&pf.name),
                     params: pf.params,
