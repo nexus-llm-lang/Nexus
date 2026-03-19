@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use crate::cli::LoadedSource;
-use crate::driver::compile_loaded_source_to_wasm_no_typecheck;
+use crate::driver::compile_loaded_source_to_wasm;
 use nexus::compiler::bundler;
 
 /// Subdirectory under `target/` for cached nxc build artifacts.
@@ -56,7 +56,7 @@ pub fn ensure_nxc_driver(project_root: &Path, verbose: bool) -> Result<PathBuf, 
 
     let wasm_merge_command = bundler::resolve_wasm_merge_command(None);
     let compiled =
-        compile_loaded_source_to_wasm_no_typecheck(&loaded, true, &wasm_merge_command, verbose)
+        compile_loaded_source_to_wasm(&loaded, true, &wasm_merge_command, verbose)
             .map_err(|_| "Failed to compile nxc/driver.nx".to_string())?;
 
     fs::write(&wasm_path, &compiled.wasm)

@@ -25,7 +25,6 @@ pub struct CompiledWasm {
 fn compile_loaded_source_to_core_wasm(
     loaded: &LoadedSource,
     verbose: bool,
-    skip_typecheck: bool,
 ) -> Result<Vec<u8>, ExitCode> {
     let src = strip_shebang(loaded.source.clone());
     let mut program = match parse_program(&loaded.display_name, &src) {
@@ -34,7 +33,7 @@ fn compile_loaded_source_to_core_wasm(
     };
     program.source_file = Some(loaded.display_name.clone());
     program.source_text = Some(src.clone());
-    if !skip_typecheck && !typecheck_program(&loaded.display_name, &src, &program) {
+    if !typecheck_program(&loaded.display_name, &src, &program) {
         return Err(ExitCode::from(1));
     }
 
@@ -72,32 +71,13 @@ fn compile_loaded_source_to_core_wasm(
     }
 }
 
-pub fn compile_loaded_source_to_wasm_no_typecheck(
-    loaded: &LoadedSource,
-    allow_nexus_host_import: bool,
-    wasm_merge_command: &Path,
-    verbose: bool,
-) -> Result<CompiledWasm, ExitCode> {
-    compile_loaded_source_to_wasm_impl(loaded, allow_nexus_host_import, wasm_merge_command, verbose, true)
-}
-
 pub fn compile_loaded_source_to_wasm(
     loaded: &LoadedSource,
     allow_nexus_host_import: bool,
     wasm_merge_command: &Path,
     verbose: bool,
 ) -> Result<CompiledWasm, ExitCode> {
-    compile_loaded_source_to_wasm_impl(loaded, allow_nexus_host_import, wasm_merge_command, verbose, false)
-}
-
-fn compile_loaded_source_to_wasm_impl(
-    loaded: &LoadedSource,
-    allow_nexus_host_import: bool,
-    wasm_merge_command: &Path,
-    verbose: bool,
-    skip_typecheck: bool,
-) -> Result<CompiledWasm, ExitCode> {
-    let wasm = match compile_loaded_source_to_core_wasm(loaded, verbose, skip_typecheck) {
+    let wasm = match compile_loaded_source_to_core_wasm(loaded, verbose) {
         Ok(wasm) => wasm,
         Err(code) => return Err(code),
     };

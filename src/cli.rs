@@ -77,9 +77,6 @@ pub enum Command {
         /// Preopen a host directory for guest filesystem access (repeatable).
         #[arg(long, value_name = "DIR")]
         preopen: Vec<PathBuf>,
-        /// Skip typechecking (for bootstrapping).
-        #[arg(long)]
-        skip_typecheck: bool,
         /// Arguments to pass to the guest program (after --).
         #[arg(last = true)]
         guest_args: Vec<String>,
@@ -101,9 +98,6 @@ pub enum Command {
         /// Output format for capability information.
         #[arg(long, value_enum, default_value_t = ExplainCapabilitiesFormat::Text)]
         explain_capabilities_format: ExplainCapabilitiesFormat,
-        /// Skip typechecking (for bootstrapping).
-        #[arg(long)]
-        skip_typecheck: bool,
     },
     /// Parse and typecheck only.
     /// If no file is passed and stdin is piped, reads script from stdin.
