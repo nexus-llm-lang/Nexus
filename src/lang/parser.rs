@@ -1412,10 +1412,7 @@ impl Parser {
     fn parse_match_stmt(&mut self, start: usize) -> Result<Spanned<Stmt>, ParseError> {
         self.advance(); // consume 'match'
         let target = self.parse_expr()?;
-        // `do` is optional after match target (allow `match x case ...`)
-        if matches!(self.peek(), TokenKind::Do) {
-            self.advance();
-        }
+        self.expect(&TokenKind::Do)?;
 
         let mut cases = Vec::new();
         while matches!(self.peek(), TokenKind::Case) {
