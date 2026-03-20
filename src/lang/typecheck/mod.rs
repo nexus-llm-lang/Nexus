@@ -35,6 +35,45 @@ use std::fs;
 
 const THROWS_EXN: &str = "Exn";
 
+/// Convert byte offset range to "line:col-line:col" for readable error messages.
+fn byte_offset_to_loc(src: &str, start: usize, end: usize) -> String {
+    let (mut line, mut col) = (1usize, 1usize);
+    let (mut sl, mut sc) = (1, 1);
+    let (mut found_start, mut found_end) = (false, false);
+    let (mut el, mut ec) = (1, 1);
+    for (i, ch) in src.char_indices() {
+        if i == start {
+            sl = line;
+            sc = col;
+            found_start = true;
+        }
+        if i == end {
+            el = line;
+            ec = col;
+            found_end = true;
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    if !found_start {
+        return format!("@{}..{}", start, end);
+    }
+    if !found_end {
+        el = line;
+        ec = col;
+    }
+    if sl == el {
+        format!("{}:{}-{}", sl, sc, ec)
+    } else {
+        format!("{}:{}-{}:{}", sl, sc, el, ec)
+    }
+}
+
 type Subst = HashMap<String, Type>;
 
 pub struct TypeChecker {
@@ -182,8 +221,7 @@ impl TypeChecker {
                         sub_checker.visited_paths = self.visited_paths.clone();
                         sub_checker.import_cache = self.import_cache.clone();
                         sub_checker.check_program(&p).map_err(|e| {
-                            // Include byte offset range for rough line estimation
-                            let loc = format!("@{}..{}", e.span.start, e.span.end);
+                            let loc = byte_offset_to_loc(&src, e.span.start, e.span.end);
                             TypeError {
                                 message: format!(
                                     "in imported module '{}' {}: {}",
