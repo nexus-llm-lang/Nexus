@@ -25,6 +25,10 @@ import * as list from stdlib/list.nx
 
 // ─── Import processing ──────────────────────────────────────────────────────
 
+type ImportResult = ImportResult(accum: HirAccum, visited: [string])
+type ImportEdge = ImportEdge(from_path: string, to_path: string, is_external: bool)
+type GraphResult = GraphResult(edges: [ImportEdge], visited: [string])
+
 let list_has_str = fn (xs: [string], s: string) -> bool do
   match xs do
     case Nil -> return false
@@ -35,18 +39,21 @@ let list_has_str = fn (xs: [string], s: string) -> bool do
 end
 
 let process_imports = fn (imports: [ImportDef], accum: HirAccum,
-    import_stack: [string], depth: i64) -> HirAccum require { PermFs, PermConsole } throws { Exn } do
+    import_stack: [string], visited: [string], depth: i64) -> ImportResult require { PermFs, PermConsole } throws { Exn } do
   match imports do
-    case Nil -> accum
+    case Nil -> ImportResult(accum: accum, visited: visited)
     case imp :: rest ->
       match imp do case ImportDef(path: path, alias: _, items: _, is_external: is_ext) ->
         match is_ext do
           case true ->
             println(val: "[nxc]   skip external: " ++ path)
-            process_imports(imports: rest, accum: accum, import_stack: import_stack, depth: depth)
+            process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, depth: depth)
           case false ->
             if list_has_str(xs: import_stack, s: path) then
               error_no_span(phase: PhaseDriver, message: "cyclic import: " ++ path)
+            end
+            if list_has_str(xs: visited, s: path) then
+              return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, depth: depth)
             end
             println(val: "[nxc]   import: " ++ path)
             let src = fs.read_to_string(path: path)
@@ -56,11 +63,91 @@ let process_imports = fn (imports: [ImportDef], accum: HirAccum,
             let entries = build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
             let sub_imports = extract_imports(defs: imported_defs)
             let new_stack = Cons(v: path, rest: import_stack)
-            let accum2 = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, depth: depth + 1)
-            let accum3 = process_defs(defs: imported_defs, entries: entries, accum: accum2)
-            process_imports(imports: rest, accum: accum3, import_stack: import_stack, depth: depth)
+            let sub_result = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, visited: Cons(v: path, rest: visited), depth: depth + 1)
+            match sub_result do case ImportResult(accum: accum2, visited: visited2) ->
+              let accum3 = process_defs(defs: imported_defs, entries: entries, accum: accum2)
+              process_imports(imports: rest, accum: accum3, import_stack: import_stack, visited: visited2, depth: depth)
+            end
         end
       end
+  end
+end
+
+// ─── Import graph (DOT output) ──────────────────────────────────────────────
+
+let append_edges = fn (xs: [ImportEdge], ys: [ImportEdge]) -> [ImportEdge] do
+  match xs do
+    case Nil -> ys
+    case x :: rest -> Cons(v: x, rest: append_edges(xs: rest, ys: ys))
+  end
+end
+
+let collect_import_graph = fn (imports: [ImportDef], from_path: string,
+    visited: [string]) -> GraphResult require { PermFs } throws { Exn } do
+  match imports do
+    case Nil -> GraphResult(edges: Nil, visited: visited)
+    case imp :: rest ->
+      match imp do case ImportDef(path: path, alias: _, items: _, is_external: is_ext) ->
+        let edge = ImportEdge(from_path: from_path, to_path: path, is_external: is_ext)
+        match is_ext do
+          case true ->
+            let rest_r = collect_import_graph(imports: rest, from_path: from_path, visited: visited)
+            match rest_r do case GraphResult(edges: re, visited: rv) ->
+              GraphResult(edges: Cons(v: edge, rest: re), visited: rv)
+            end
+          case false ->
+            if list_has_str(xs: visited, s: path) then
+              let rest_r = collect_import_graph(imports: rest, from_path: from_path, visited: visited)
+              match rest_r do case GraphResult(edges: re, visited: rv) ->
+                return GraphResult(edges: Cons(v: edge, rest: re), visited: rv)
+              end
+            end
+            let src = fs.read_to_string(path: path)
+            let tokens = tokenize(src: src)
+            let imported_prog = parse(tokens: tokens)
+            let sub_imports = extract_imports(defs: get_defs(prog: imported_prog))
+            let sub_r = collect_import_graph(imports: sub_imports, from_path: path, visited: Cons(v: path, rest: visited))
+            match sub_r do case GraphResult(edges: se, visited: sv) ->
+              let rest_r = collect_import_graph(imports: rest, from_path: from_path, visited: sv)
+              match rest_r do case GraphResult(edges: re, visited: rv) ->
+                GraphResult(edges: Cons(v: edge, rest: append_edges(xs: se, ys: re)), visited: rv)
+              end
+            end
+        end
+      end
+  end
+end
+
+let print_dot_edge = fn (edge: ImportEdge) -> unit require { PermConsole } do
+  match edge do case ImportEdge(from_path: f, to_path: t, is_external: ext) ->
+    match ext do
+      case true -> println(val: "  \"" ++ f ++ "\" -> \"" ++ t ++ "\" [style=dashed];")
+      case false -> println(val: "  \"" ++ f ++ "\" -> \"" ++ t ++ "\";")
+    end
+  end
+end
+
+let print_dot_edges = fn (edges: [ImportEdge]) -> unit require { PermConsole } do
+  match edges do
+    case Nil -> ()
+    case edge :: rest ->
+      print_dot_edge(edge: edge)
+      print_dot_edges(edges: rest)
+  end
+end
+
+let dump_import_graph = fn (input_path: string) -> unit
+    require { PermFs, PermConsole } throws { Exn } do
+  let src = fs.read_to_string(path: input_path)
+  let tokens = tokenize(src: src)
+  let prog = parse(tokens: tokens)
+  let imports = extract_imports(defs: get_defs(prog: prog))
+  let result = collect_import_graph(imports: imports, from_path: input_path, visited: Cons(v: input_path, rest: Nil))
+  match result do case GraphResult(edges: edges, visited: _) ->
+    println(val: "digraph imports {")
+    println(val: "  rankdir=LR;")
+    print_dot_edges(edges: edges)
+    println(val: "}")
   end
 end
 
@@ -77,9 +164,11 @@ end
 let build_hir = fn (prog: Program) -> HirProgram require { PermFs, PermConsole } throws { Exn } do
   let defs = get_defs(prog: prog)
   let imports = extract_imports(defs: defs)
-  let accum = process_imports(imports: imports, accum: empty_accum(), import_stack: Nil, depth: 1)
-  let accum2 = process_defs(defs: defs, entries: Nil, accum: accum)
-  return accum_to_program(accum: accum2)
+  let result = process_imports(imports: imports, accum: empty_accum(), import_stack: Nil, visited: Nil, depth: 1)
+  match result do case ImportResult(accum: accum, visited: _) ->
+    let accum2 = process_defs(defs: defs, entries: Nil, accum: accum)
+    return accum_to_program(accum: accum2)
+  end
 end
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
@@ -110,10 +199,20 @@ let main = fn (args: [string]) -> unit
     let argc = list.length(xs: args)
     if argc < 2 then
       println(val: "Usage: nxc <input.nx> [output.wasm]")
+      println(val: "       nxc --dump-imports <input.nx>")
       error_no_span(phase: PhaseDriver, message: "missing input file argument")
     end
 
-    let input_path = str_nth(xs: args, n: 1)
+    let first_arg = str_nth(xs: args, n: 1)
+    if first_arg == "--dump-imports" then
+      if argc < 3 then
+        error_no_span(phase: PhaseDriver, message: "usage: nxc --dump-imports <input.nx>")
+      end
+      dump_import_graph(input_path: str_nth(xs: args, n: 2))
+      return ()
+    end
+
+    let input_path = first_arg
     let output_path = get_output_path(xs: args, argc: argc)
 
     println(val: "nxc: compiling " ++ input_path ++ " -> " ++ output_path)
