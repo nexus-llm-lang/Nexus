@@ -133,19 +133,98 @@ let register_externals = fn (state: CheckState, exts: [HirExternal]) -> CheckSta
   end
 end
 
+// ─── Generic type parameter resolution ──────────────────────────────────────
+// Convert TyUserDefined("T", []) → TyVar("T") when "T" is a type parameter.
+// Mirrors Rust compiler's convert_generic_user_defined_to_var.
+
+let str_list_contains = fn (xs: [string], s: string) -> bool do
+  match xs do
+    case Nil -> return false
+    case x :: rest ->
+      if x == s then return true end
+      return str_list_contains(xs: rest, s: s)
+  end
+end
+
+let convert_ud_to_var = fn (typ: TypeExpr, vars: [string]) -> TypeExpr do
+  match typ do
+    case TyUserDefined(name: n, args: Nil) ->
+      if str_list_contains(xs: vars, s: n) then return TyVar(name: n) end
+      return typ
+    case TyUserDefined(name: n, args: targs) ->
+      return TyUserDefined(name: n, args: convert_type_list(types: targs, vars: vars))
+    case TyArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
+      return TyArrow(
+        params: convert_named_types(nts: ps, vars: vars),
+        ret: convert_ud_to_var(typ: r, vars: vars),
+        requires: convert_ud_to_var(typ: req, vars: vars),
+        throw_row: convert_ud_to_var(typ: thr, vars: vars)
+      )
+    case TyList(elem: e) -> return TyList(elem: convert_ud_to_var(typ: e, vars: vars))
+    case TyArray(elem: e) -> return TyArray(elem: convert_ud_to_var(typ: e, vars: vars))
+    case TyRef(inner: i) -> return TyRef(inner: convert_ud_to_var(typ: i, vars: vars))
+    case TyLinear(inner: i) -> return TyLinear(inner: convert_ud_to_var(typ: i, vars: vars))
+    case TyBorrow(inner: i) -> return TyBorrow(inner: convert_ud_to_var(typ: i, vars: vars))
+    case TyRecord(fields: fs) -> return TyRecord(fields: convert_named_types(nts: fs, vars: vars))
+    case TyRow(types: ts, rest: r) ->
+      let new_rest = match r do
+        case Some(val: t) -> Some(val: convert_ud_to_var(typ: t, vars: vars))
+        case None -> None
+      end
+      return TyRow(types: convert_type_list(types: ts, vars: vars), rest: new_rest)
+    case TyHandler(name: n, requires: req) ->
+      return TyHandler(name: n, requires: convert_ud_to_var(typ: req, vars: vars))
+    case _ -> return typ
+  end
+end
+
+let convert_named_types = fn (nts: [NamedType], vars: [string]) -> [NamedType] do
+  match nts do
+    case Nil -> return Nil
+    case NamedType(name: n, typ: t) :: rest ->
+      return Cons(
+        v: NamedType(name: n, typ: convert_ud_to_var(typ: t, vars: vars)),
+        rest: convert_named_types(nts: rest, vars: vars)
+      )
+  end
+end
+
+let convert_type_list = fn (types: [TypeExpr], vars: [string]) -> [TypeExpr] do
+  match types do
+    case Nil -> return Nil
+    case t :: rest ->
+      return Cons(
+        v: convert_ud_to_var(typ: t, vars: vars),
+        rest: convert_type_list(types: rest, vars: vars)
+      )
+  end
+end
+
+let convert_hir_params = fn (params: [HirParam], vars: [string]) -> [HirParam] do
+  match params do
+    case Nil -> return Nil
+    case HirParam(name: n, label: l, typ: t) :: rest ->
+      return Cons(
+        v: HirParam(name: n, label: l, typ: convert_ud_to_var(typ: t, vars: vars)),
+        rest: convert_hir_params(params: rest, vars: vars)
+      )
+  end
+end
+
 // ─── Register functions ─────────────────────────────────────────────────────
 
 let register_functions = fn (state: CheckState, funcs: [HirFunction]) -> CheckState do
   match funcs do
     case Nil -> return state
-    case HirFunction(name: n, params: params, ret_type: ret, body: _, span: _) :: rest ->
+    case HirFunction(name: n, type_params: tps, params: params, ret_type: ret, body: _, span: _) :: rest ->
       let param_types = hir_params_to_named_types(params: params)
       let arrow = TyArrow(
-        params: param_types, ret: ret,
+        params: convert_named_types(nts: param_types, vars: tps),
+        ret: convert_ud_to_var(typ: ret, vars: tps),
         requires: TyRow(types: Nil, rest: None),
         throw_row: TyRow(types: Nil, rest: None)
       )
-      let env = env_insert(env: state_env(state: state), name: n, scheme: mono(typ: arrow))
+      let env = env_insert(env: state_env(state: state), name: n, scheme: Scheme(vars: tps, typ: arrow))
       return register_functions(state: state_with_env(state: state, env: env), funcs: rest)
   end
 end
@@ -179,7 +258,7 @@ end
 let register_handler_methods = fn (env: [EnvEntry], port_name: string, funcs: [HirFunction]) -> [EnvEntry] do
   match funcs do
     case Nil -> return env
-    case HirFunction(name: n, params: params, ret_type: ret, body: _, span: _) :: rest ->
+    case HirFunction(name: n, type_params: _, params: params, ret_type: ret, body: _, span: _) :: rest ->
       let method_name = port_name ++ "." ++ n
       let param_types = hir_params_to_named_types(params: params)
       let arrow = TyArrow(
@@ -266,11 +345,14 @@ end
 
 let check_function = fn (state: CheckState, func: HirFunction) -> unit throws { Exn } do
   match func do
-    case HirFunction(name: name, params: params, ret_type: ret, body: body, span: span) ->
+    case HirFunction(name: name, type_params: tps, params: params, ret_type: ret, body: body, span: span) ->
+      // Convert UserDefined type params to TyVar in param types and return type
+      let conv_params = convert_hir_params(params: params, vars: tps)
+      let conv_ret = convert_ud_to_var(typ: ret, vars: tps)
       // Build local env with function params
-      let body_env = add_func_params(env: state_env(state: state), params: params)
+      let body_env = add_func_params(env: state_env(state: state), params: conv_params)
       let body_state = state_with_env(state: state, env: body_env)
-      match infer_stmts(state: body_state, stmts: body, ret_type: ret) do
+      match infer_stmts(state: body_state, stmts: body, ret_type: conv_ret) do
         case InferExprErr(message: m) ->
           error(phase: PhaseTypecheck, message: "in " ++ name ++ ": " ++ m, span: span)
         case InferExprOk(state: _, subst: _, typ: _) ->
