@@ -213,6 +213,26 @@ fn collect_stmt_locals(
                 collect_stmt_locals(cond_stmts, local_map, next_local_index, local_decls_flat)?;
                 collect_stmt_locals(body, local_map, next_local_index, local_decls_flat)?;
             }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for case in cases {
+                    collect_stmt_locals(
+                        &case.body,
+                        local_map,
+                        next_local_index,
+                        local_decls_flat,
+                    )?;
+                }
+                collect_stmt_locals(
+                    default_body,
+                    local_map,
+                    next_local_index,
+                    local_decls_flat,
+                )?;
+            }
         }
     }
     Ok(())

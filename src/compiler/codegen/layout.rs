@@ -195,6 +195,16 @@ fn stmt_uses_object_heap(stmt: &LirStmt) -> bool {
         LirStmt::Loop {
             cond_stmts, body, ..
         } => cond_stmts.iter().any(stmt_uses_object_heap) || body.iter().any(stmt_uses_object_heap),
+        LirStmt::Switch {
+            cases,
+            default_body,
+            ..
+        } => {
+            cases
+                .iter()
+                .any(|c| c.body.iter().any(stmt_uses_object_heap))
+                || default_body.iter().any(stmt_uses_object_heap)
+        }
     }
 }
 
@@ -296,6 +306,29 @@ fn collect_strings_in_stmt(stmt: &LirStmt, out: &mut Vec<String>) {
             collect_strings_in_atom(cond, out);
             for stmt in body {
                 collect_strings_in_stmt(stmt, out);
+            }
+        }
+        LirStmt::Switch {
+            tag,
+            cases,
+            default_body,
+            default_ret,
+            ..
+        } => {
+            collect_strings_in_atom(tag, out);
+            for case in cases {
+                for stmt in &case.body {
+                    collect_strings_in_stmt(stmt, out);
+                }
+                if let Some(ret) = &case.ret {
+                    collect_strings_in_atom(ret, out);
+                }
+            }
+            for stmt in default_body {
+                collect_strings_in_stmt(stmt, out);
+            }
+            if let Some(ret) = default_ret {
+                collect_strings_in_atom(ret, out);
             }
         }
     }
