@@ -245,24 +245,23 @@ impl MirBuilder {
         // Collect reachable functions from main
         let reachable = self.collect_reachable();
 
-        // Filter to only reachable functions and externals
+        // Filter to only reachable functions and externals.
+        // Drain instead of clone — builder is not used after build() returns.
         let functions: Vec<MirFunction> = self
             .functions
-            .iter()
+            .drain(..)
             .filter(|f| reachable.contains(&f.name))
-            .cloned()
             .collect();
         let externals: Vec<MirExternal> = self
             .externals
-            .iter()
+            .drain(..)
             .filter(|e| reachable.contains(&e.name))
-            .cloned()
             .collect();
 
         Ok(MirProgram {
             functions,
             externals,
-            enum_defs: self.enum_defs.clone(),
+            enum_defs: std::mem::take(&mut self.enum_defs),
         })
     }
 
