@@ -140,18 +140,20 @@ end
 #[test]
 fn codegen_conc_fs_writes_in_parallel() {
     let src = r#"
-import * as fs from stdlib/fs.nx
+import { Fs }, * as fs_mod from stdlib/fs.nx
 
 let main = fn () -> unit require { PermFs } do
+    inject fs_mod.system_handler do
     conc do
         task write_a do
-            fs.write_string(path: "nexus_conc_test_a.txt", content: "hello")
+            Fs.write_string(path: "nexus_conc_test_a.txt", content: "hello")
             return ()
         end
         task write_b do
-            fs.write_string(path: "nexus_conc_test_b.txt", content: "world")
+            Fs.write_string(path: "nexus_conc_test_b.txt", content: "world")
             return ()
         end
+    end
     end
     return ()
 end

@@ -253,8 +253,8 @@ String concatenation: `++`
 ## Import Forms
 
 ```nexus
-// Import specific names
-import { Console, println } from stdlib/stdio.nx
+// Import specific names (ports, types, handlers)
+import { Console, system_handler } from stdlib/stdio.nx
 
 // Import specific names + module alias
 import { Console }, * as stdio from stdlib/stdio.nx

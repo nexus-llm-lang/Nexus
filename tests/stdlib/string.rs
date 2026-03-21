@@ -129,9 +129,10 @@ fn test_backtrace_captures_call_stack() {
     exec_with_stdlib(
         r#"
 import { backtrace } from stdlib/exn.nx
-import { println } from stdlib/stdio.nx
+import { Console }, * as stdio from stdlib/stdio.nx
 
-let main = fn () -> unit require { PermConsole } throws { Exn } do
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
   try
     raise RuntimeError(val: "boom")
   catch e ->
@@ -139,12 +140,13 @@ let main = fn () -> unit require { PermConsole } throws { Exn } do
     match bt do
       case Cons(v: first, rest: _) ->
         if first != "main" then
-          println(val: "expected frame 'main', got '" ++ first ++ "'")
+          Console.println(val: "expected frame 'main', got '" ++ first ++ "'")
           raise RuntimeError(val: "wrong frame")
         end
       case Nil ->
         raise RuntimeError(val: "expected non-empty backtrace")
     end
+  end
   end
   return ()
 end
