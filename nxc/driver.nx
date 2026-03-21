@@ -8,7 +8,7 @@
 
 import { tokenize } from nxc/frontend/lexer.nx
 import { parse } from nxc/frontend/parser.nx
-import { Program, SpannedTopLevel, TopLevel, ImportDef, EnumDef } from nxc/common/ast.nx
+import { Program, SpannedTopLevel, TopLevel, ImportDef, EnumDef, GlobalLet } from nxc/common/ast.nx
 import { CompileError, error_no_span, format_error, PhaseDriver } from nxc/common/error.nx
 import { RenameEntry } from nxc/ir/symtab.nx
 import { default_alias, build_rename_map, extract_imports } from nxc/ir/resolve.nx
@@ -38,6 +38,25 @@ let list_has_str = fn (xs: [string], s: string) -> bool do
   end
 end
 
+/// Filter defs to only TLLet definitions whose names are in the items list.
+/// Used for diamond import re-processing: only re-register the selectively
+/// imported functions without duplicating enums, ports, or unrelated lets.
+let filter_defs_by_items = fn (defs: [SpannedTopLevel], items: [string]) -> [SpannedTopLevel] do
+  match defs do
+    case Nil -> return Nil
+    case d :: rest ->
+      match d do
+        case SpannedTopLevel(node: TLLet(def: GlobalLet(name: name, is_public: _, typ: _, value: _)), span: _) ->
+          if list_has_str(xs: items, s: name) then
+            return Cons(v: d, rest: filter_defs_by_items(defs: rest, items: items))
+          else
+            return filter_defs_by_items(defs: rest, items: items)
+          end
+        case _ -> return filter_defs_by_items(defs: rest, items: items)
+      end
+  end
+end
+
 let process_imports = fn (imports: [ImportDef], accum: HirAccum,
     import_stack: [string], visited: [string], depth: i64) -> ImportResult require { PermFs, PermConsole } throws { Exn } do
   match imports do
@@ -53,7 +72,26 @@ let process_imports = fn (imports: [ImportDef], accum: HirAccum,
               error_no_span(phase: PhaseDriver, message: "cyclic import: " ++ path)
             end
             if list_has_str(xs: visited, s: path) then
-              return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, depth: depth)
+              // Diamond import fix: when a module is already visited, selective
+              // imports may reference functions that were given prefixed names by
+              // the first importer. Re-parse and re-process ONLY the selected
+              // TLLet defs with the current import's rename entries.
+              match imp do case ImportDef(path: _, alias: _, items: items, is_external: _) ->
+                match items do
+                  case Nil ->
+                    // Wildcard import — all names get alias prefix, no conflict
+                    return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, depth: depth)
+                  case _ :: _ ->
+                    let re_src = fs.read_to_string(path: path)
+                    let re_tokens = tokenize(src: re_src)
+                    let re_prog = parse(tokens: re_tokens)
+                    let re_defs = get_defs(prog: re_prog)
+                    let selected = filter_defs_by_items(defs: re_defs, items: items)
+                    let re_entries = build_rename_map(imported_defs: re_defs, import_def: imp, import_depth: depth)
+                    let accum2 = process_defs(defs: selected, entries: re_entries, accum: accum)
+                    return process_imports(imports: rest, accum: accum2, import_stack: import_stack, visited: visited, depth: depth)
+                end
+              end
             end
             println(val: "[nxc]   import: " ++ path)
             let src = fs.read_to_string(path: path)
