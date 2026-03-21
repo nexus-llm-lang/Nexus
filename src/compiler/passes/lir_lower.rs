@@ -2588,6 +2588,7 @@ fn closure_convert(
     }
 
     // Generate wrapper functions for named funcref targets
+    let func_index: HashMap<Symbol, usize> = functions.iter().enumerate().map(|(i, f)| (f.name, i)).collect();
     for target in wrapper_targets {
         if let Some(&idx) = func_index.get(&target) {
             let original = &functions[idx];
