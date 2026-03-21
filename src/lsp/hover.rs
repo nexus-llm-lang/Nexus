@@ -7,12 +7,7 @@ use crate::types::Spanned;
 ///
 /// Strategy: tokenise the source, find the identifier token spanning the offset,
 /// then look up that name in the type environment.
-pub fn hover_at(
-    source: &str,
-    offset: usize,
-    program: &Program,
-    env: &TypeEnv,
-) -> Option<String> {
+pub fn hover_at(source: &str, offset: usize, program: &Program, env: &TypeEnv) -> Option<String> {
     // 1. Find the identifier at offset using the lexer
     let name = find_ident_at(source, offset)?;
 
@@ -148,7 +143,11 @@ fn format_global_let(gl: &GlobalLet) -> String {
 }
 
 /// Find the definition location (byte span) of a name in the program.
-pub fn find_definition(program: &Program, source: &str, offset: usize) -> Option<std::ops::Range<usize>> {
+pub fn find_definition(
+    program: &Program,
+    source: &str,
+    offset: usize,
+) -> Option<std::ops::Range<usize>> {
     let name = find_ident_at(source, offset)?;
 
     for def in &program.definitions {
@@ -193,13 +192,16 @@ pub fn find_definition(program: &Program, source: &str, offset: usize) -> Option
 fn find_let_in_stmts(stmts: &[Spanned<Stmt>], name: &str) -> Option<std::ops::Range<usize>> {
     for stmt in stmts {
         match &stmt.node {
-            Stmt::Let {
-                name: n, value, ..
-            } if n == name => {
+            Stmt::Let { name: n, value, .. } if n == name => {
                 return Some(stmt.span.clone());
             }
             Stmt::Expr(Spanned {
-                node: Expr::If { then_branch, else_branch, .. },
+                node:
+                    Expr::If {
+                        then_branch,
+                        else_branch,
+                        ..
+                    },
                 ..
             }) => {
                 if let Some(span) = find_let_in_stmts(then_branch, name) {

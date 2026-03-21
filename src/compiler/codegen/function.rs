@@ -9,18 +9,17 @@ use crate::types::Type;
 use super::binary::{binary_operand_type, compile_binary};
 use super::emit::{
     compile_external_arg, constructor_tag, emit_alloc_object, emit_numeric_coercion,
-    emit_pack_value_to_i64, emit_unpack_i64_to_value, memarg, record_tag,
-    type_to_wasm_valtype,
+    emit_pack_value_to_i64, emit_unpack_i64_to_value, memarg, record_tag, type_to_wasm_valtype,
 };
 use super::error::CodegenError;
 use super::layout::{bt_label, CodegenLayout};
 use super::stmt::compile_stmt;
 use super::string::{
-    emit_string_compare, emit_string_concat, is_string_compare_operator,
-    is_string_concat_operator, pack_string,
+    emit_string_compare, emit_string_concat, is_string_compare_operator, is_string_concat_operator,
+    pack_string,
 };
-use crate::constants::ENTRYPOINT;
 use super::{FunctionTemps, LocalInfo};
+use crate::constants::ENTRYPOINT;
 
 pub(super) fn compile_function(
     func: &LirFunction,
@@ -67,17 +66,28 @@ pub(super) fn compile_function(
     };
     // Temps: 1×i64, 1×i32, 2×i64, 7×i32, 2×i64 (closure)
     local_decls_flat.extend_from_slice(&[
-        ValType::I64, ValType::I32,
-        ValType::I64, ValType::I64,
-        ValType::I32, ValType::I32, ValType::I32, ValType::I32,
-        ValType::I32, ValType::I32, ValType::I32,
-        ValType::I64, ValType::I64,
+        ValType::I64,
+        ValType::I32,
+        ValType::I64,
+        ValType::I64,
+        ValType::I32,
+        ValType::I32,
+        ValType::I32,
+        ValType::I32,
+        ValType::I32,
+        ValType::I32,
+        ValType::I32,
+        ValType::I64,
+        ValType::I64,
     ]);
 
     // RLE-compress local declarations for WASM
     let wasm_locals = local_decls_flat.iter().fold(Vec::new(), |mut acc, &vt| {
         if let Some((count, last_ty)) = acc.last_mut() {
-            if *last_ty == vt { *count += 1; return acc; }
+            if *last_ty == vt {
+                *count += 1;
+                return acc;
+            }
         }
         acc.push((1u32, vt));
         acc
@@ -219,19 +229,9 @@ fn collect_stmt_locals(
                 ..
             } => {
                 for case in cases {
-                    collect_stmt_locals(
-                        &case.body,
-                        local_map,
-                        next_local_index,
-                        local_decls_flat,
-                    )?;
+                    collect_stmt_locals(&case.body, local_map, next_local_index, local_decls_flat)?;
                 }
-                collect_stmt_locals(
-                    default_body,
-                    local_map,
-                    next_local_index,
-                    local_decls_flat,
-                )?;
+                collect_stmt_locals(default_body, local_map, next_local_index, local_decls_flat)?;
             }
         }
     }
@@ -456,11 +456,7 @@ pub(super) fn compile_expr(
             out.instruction(&Instruction::I64ExtendI32U);
             Ok(())
         }
-        LirExpr::Closure {
-            func,
-            captures,
-            ..
-        } => {
+        LirExpr::Closure { func, captures, .. } => {
             // Allocate closure object [table_idx, cap0, cap1, ...] (1 + N words)
             let table_idx = layout
                 .funcref_table_indices
@@ -490,7 +486,7 @@ pub(super) fn compile_expr(
         LirExpr::ClosureEnvLoad { index, typ } => {
             // Load captured value from __env (first function parameter, local 0)
             out.instruction(&Instruction::LocalGet(0)); // __env: i64
-            out.instruction(&Instruction::I32WrapI64);   // convert to address
+            out.instruction(&Instruction::I32WrapI64); // convert to address
             out.instruction(&Instruction::I64Load(memarg(((index + 1) * 8) as u64)));
             // Unpack from i64 to target type
             emit_unpack_i64_to_value(typ, out)?;
@@ -508,10 +504,8 @@ pub(super) fn compile_expr(
                 .indirect_type_indices
                 .get(&callee_type_key)
                 .copied()
-                .ok_or_else(|| {
-                    CodegenError::CallTargetNotFound {
-                        name: format!("indirect call type: {:?}", callee_type),
-                    }
+                .ok_or_else(|| CodegenError::CallTargetNotFound {
+                    name: format!("indirect call type: {:?}", callee_type),
                 })?;
 
             // Save callee closure pointer to temp
@@ -561,11 +555,11 @@ pub(super) fn compile_atom(
 ) -> Result<(), CodegenError> {
     match atom {
         LirAtom::Var { name, .. } => {
-            let local = local_map.get(name).ok_or_else(|| {
-                CodegenError::ConflictingLocalTypes {
+            let local = local_map
+                .get(name)
+                .ok_or_else(|| CodegenError::ConflictingLocalTypes {
                     name: name.to_string(),
-                }
-            })?;
+                })?;
             out.instruction(&Instruction::LocalGet(local.index));
             Ok(())
         }
@@ -601,12 +595,7 @@ pub(super) fn compile_atom(
 /// Emit an early exit for uncaught exceptions.
 /// - In entrypoint (main): trap via Unreachable (uncaught exception = fatal)
 /// - In other functions: return with a dummy value so caller can check the flag
-fn emit_exn_bail(
-    out: &mut Function,
-    layout: &CodegenLayout,
-    ret_type: &Type,
-    is_entrypoint: bool,
-) {
+fn emit_exn_bail(out: &mut Function, layout: &CodegenLayout, ret_type: &Type, is_entrypoint: bool) {
     if is_entrypoint {
         out.instruction(&Instruction::Unreachable);
     } else {

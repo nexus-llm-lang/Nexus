@@ -17,10 +17,7 @@ use cli::{
     build_execution_capabilities, default_wasm_output_path, extract_main_requires, load_source,
     strip_shebang, Cli, Command,
 };
-use driver::{
-    compile_loaded_source_to_wasm, parse_program,
-    typecheck_program,
-};
+use driver::{compile_loaded_source_to_wasm, parse_program, typecheck_program};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -181,7 +178,12 @@ fn run_command(
     };
 
     let module_dir = input_path.as_deref().and_then(|p| p.parent());
-    nexus::runtime::wasm_exec::run_wasm_bytes(&compiled.wasm, module_dir, &capabilities, &guest_args)
+    nexus::runtime::wasm_exec::run_wasm_bytes(
+        &compiled.wasm,
+        module_dir,
+        &capabilities,
+        &guest_args,
+    )
 }
 
 fn build_command(

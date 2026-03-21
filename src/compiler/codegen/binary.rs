@@ -173,7 +173,10 @@ pub(super) fn binary_operand_type(
             return Ok(lhs.clone());
         }
     }
-    if matches!(op, BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge) {
+    if matches!(
+        op,
+        BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+    ) {
         if matches!(lhs, Type::Char) && matches!(rhs, Type::Char) {
             return Ok(Type::Char);
         }

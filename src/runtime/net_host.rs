@@ -118,11 +118,7 @@ fn do_http_request(method: &str, url: &str, headers: &str, body: &str) -> String
         for (name, value) in response.headers() {
             resp_headers.push_str(name.as_str());
             resp_headers.push_str(": ");
-            resp_headers.push_str(
-                value
-                    .to_str()
-                    .unwrap_or("[non-ASCII header value]"),
-            );
+            resp_headers.push_str(value.to_str().unwrap_or("[non-ASCII header value]"));
             resp_headers.push('\n');
         }
         let resp_body = response
@@ -190,9 +186,10 @@ fn do_accept(server_id: i64) -> Result<String, String> {
         }
         if let Some((name, value)) = trimmed.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse().map_err(|_| {
-                    format!("invalid Content-Length header: '{}'", value.trim())
-                })?;
+                content_length = value
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("invalid Content-Length header: '{}'", value.trim()))?;
             }
         }
         headers_raw.push_str(trimmed);

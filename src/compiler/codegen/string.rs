@@ -270,7 +270,7 @@ pub(super) fn emit_string_compare(
     out.instruction(&Instruction::Br(1)); // br $done
 
     out.instruction(&Instruction::End); // end $not_equal
-    // Not equal path: push 0
+                                        // Not equal path: push 0
     out.instruction(&Instruction::I32Const(0));
     out.instruction(&Instruction::End); // end $done
 

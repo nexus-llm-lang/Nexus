@@ -266,10 +266,7 @@ fn can_convert_to_switch(
 
 /// Convert a verified IfReturn chain into a Switch stmt.
 /// Caller must ensure `can_convert_to_switch` returned true.
-fn build_switch_from_chain(
-    stmt: LirStmt,
-    cond_defs: &HashMap<Symbol, (Symbol, i64)>,
-) -> LirStmt {
+fn build_switch_from_chain(stmt: LirStmt, cond_defs: &HashMap<Symbol, (Symbol, i64)>) -> LirStmt {
     let mut cases = Vec::new();
     let mut default_body = Vec::new();
     let mut default_ret = None;

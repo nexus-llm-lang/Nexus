@@ -26,7 +26,10 @@ impl LineIndex {
 
     pub fn offset_to_position(&self, offset: usize) -> lsp_types::Position {
         let offset = offset.min(self.text_len);
-        let line = self.line_starts.partition_point(|&s| s <= offset).saturating_sub(1);
+        let line = self
+            .line_starts
+            .partition_point(|&s| s <= offset)
+            .saturating_sub(1);
         let col = offset - self.line_starts[line];
         lsp_types::Position {
             line: line as u32,
@@ -65,16 +68,43 @@ mod tests {
     #[test]
     fn multi_line() {
         let idx = LineIndex::new("ab\ncd\nef");
-        assert_eq!(idx.offset_to_position(0), lsp_types::Position { line: 0, character: 0 });
-        assert_eq!(idx.offset_to_position(3), lsp_types::Position { line: 1, character: 0 });
-        assert_eq!(idx.offset_to_position(4), lsp_types::Position { line: 1, character: 1 });
-        assert_eq!(idx.offset_to_position(6), lsp_types::Position { line: 2, character: 0 });
+        assert_eq!(
+            idx.offset_to_position(0),
+            lsp_types::Position {
+                line: 0,
+                character: 0
+            }
+        );
+        assert_eq!(
+            idx.offset_to_position(3),
+            lsp_types::Position {
+                line: 1,
+                character: 0
+            }
+        );
+        assert_eq!(
+            idx.offset_to_position(4),
+            lsp_types::Position {
+                line: 1,
+                character: 1
+            }
+        );
+        assert_eq!(
+            idx.offset_to_position(6),
+            lsp_types::Position {
+                line: 2,
+                character: 0
+            }
+        );
     }
 
     #[test]
     fn roundtrip() {
         let idx = LineIndex::new("ab\ncd\nef");
-        let pos = lsp_types::Position { line: 1, character: 1 };
+        let pos = lsp_types::Position {
+            line: 1,
+            character: 1,
+        };
         let offset = idx.position_to_offset(pos);
         assert_eq!(offset, 4);
         assert_eq!(idx.offset_to_position(offset), pos);

@@ -50,11 +50,11 @@ pub(super) fn compile_stmt(
                 return Ok(());
             }
             emit_numeric_coercion(&et, typ, out)?;
-            let local = local_map.get(name).ok_or_else(|| {
-                CodegenError::ConflictingLocalTypes {
+            let local = local_map
+                .get(name)
+                .ok_or_else(|| CodegenError::ConflictingLocalTypes {
                     name: name.to_string(),
-                }
-            })?;
+                })?;
             out.instruction(&Instruction::LocalSet(local.index));
             Ok(())
         }
@@ -355,7 +355,7 @@ pub(super) fn compile_stmt(
             compile_atom(cond, out, local_map, layout)?;
             emit_numeric_coercion(&cond.typ(), &Type::Bool, out)?;
             out.instruction(&Instruction::BrIf(1)); // break to outer block
-            // Body
+                                                    // Body
             for nested in body {
                 compile_stmt(
                     nested,
@@ -591,10 +591,7 @@ fn compile_switch_br_table(
     out.instruction(&Instruction::I32WrapI64);
 
     // br_table dispatch
-    out.instruction(&Instruction::BrTable(
-        Cow::Owned(targets),
-        default_target,
-    ));
+    out.instruction(&Instruction::BrTable(Cow::Owned(targets), default_target));
 
     // Close default block → emit default body
     out.instruction(&Instruction::End);

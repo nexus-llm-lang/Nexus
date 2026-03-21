@@ -100,8 +100,7 @@ pub fn run_main(wasm: &[u8]) -> Result<(), String> {
     }
 
     let mut store = Store::new(&engine, ());
-    let instance =
-        wasmtime::Instance::new(&mut store, &module, &[]).map_err(|e| e.to_string())?;
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).map_err(|e| e.to_string())?;
     let main = instance
         .get_typed_func::<(), ()>(&mut store, "main")
         .map_err(|e| e.to_string())?;
@@ -253,13 +252,7 @@ pub fn run_main_with_deps_caps(
     }
 
     if has_conc {
-        conc::setup_conc_runtime(
-            engine.clone(),
-            Arc::new(module.clone()),
-            wasm,
-            deps,
-            caps,
-        );
+        conc::setup_conc_runtime(engine.clone(), Arc::new(module.clone()), wasm, deps, caps);
     }
 
     let instance = linker

@@ -43,11 +43,7 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
     } else {
         None
     };
-    let n_alloc_imports: u32 = if stdlib_alloc_module.is_some() {
-        1
-    } else {
-        0
-    };
+    let n_alloc_imports: u32 = if stdlib_alloc_module.is_some() { 1 } else { 0 };
 
     let import_count =
         program.externals.len() as u32 + n_conc_imports + n_bt_imports + n_alloc_imports;
@@ -73,8 +69,10 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         external_function_indices.insert(ext.name.clone(), idx as u32);
     }
     if has_conc {
-        external_function_indices
-            .insert(Symbol::from(CONC_SPAWN_NAME), program.externals.len() as u32);
+        external_function_indices.insert(
+            Symbol::from(CONC_SPAWN_NAME),
+            program.externals.len() as u32,
+        );
         external_function_indices.insert(
             Symbol::from(CONC_JOIN_NAME),
             program.externals.len() as u32 + 1,
@@ -105,7 +103,9 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
     // Build funcref table indices
     if has_funcref {
         for (table_idx, func_name) in funcref_targets.iter().enumerate() {
-            layout.funcref_table_indices.insert(*func_name, table_idx as u32);
+            layout
+                .funcref_table_indices
+                .insert(*func_name, table_idx as u32);
         }
     }
 
@@ -186,14 +186,18 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
             sig_to_type_idx.insert(key.clone(), next_type_index);
             next_type_index += 1;
         }
-        layout.indirect_type_indices.insert(format!("{:?}", arrow), *sig_to_type_idx.get(&key).unwrap());
+        layout
+            .indirect_type_indices
+            .insert(format!("{:?}", arrow), *sig_to_type_idx.get(&key).unwrap());
     }
     // Also register type indices for any existing signatures that match indirect call patterns
     for arrow in &indirect_call_types {
         let (params, results) = arrow_type_to_wasm_sig(arrow)?;
         let key = sig_key(&params, &results);
         if let Some(&idx) = sig_to_type_idx.get(&key) {
-            layout.indirect_type_indices.insert(format!("{:?}", arrow), idx);
+            layout
+                .indirect_type_indices
+                .insert(format!("{:?}", arrow), idx);
         }
     }
 
@@ -370,12 +374,7 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
                 internal_function_indices
                     .get(name)
                     .copied()
-                    .unwrap_or_else(|| {
-                        external_function_indices
-                            .get(name)
-                            .copied()
-                            .unwrap_or(0)
-                    })
+                    .unwrap_or_else(|| external_function_indices.get(name).copied().unwrap_or(0))
             })
             .collect();
         let mut elements = ElementSection::new();
@@ -435,22 +434,45 @@ fn collect_funcref_targets(program: &LirProgram) -> Vec<Symbol> {
     let mut targets = HashSet::new();
     fn scan_expr(expr: &LirExpr, targets: &mut HashSet<Symbol>) {
         match expr {
-            LirExpr::FuncRef { func, .. } => { targets.insert(*func); }
+            LirExpr::FuncRef { func, .. } => {
+                targets.insert(*func);
+            }
             LirExpr::Closure { func, captures, .. } => {
                 targets.insert(*func);
-                for (_, a) in captures { scan_atom(a, targets); }
+                for (_, a) in captures {
+                    scan_atom(a, targets);
+                }
             }
             LirExpr::CallIndirect { callee, args, .. } => {
                 scan_atom(callee, targets);
-                for (_, a) in args { scan_atom(a, targets); }
+                for (_, a) in args {
+                    scan_atom(a, targets);
+                }
             }
             LirExpr::Call { args, .. } | LirExpr::TailCall { args, .. } => {
-                for (_, a) in args { scan_atom(a, targets); }
+                for (_, a) in args {
+                    scan_atom(a, targets);
+                }
             }
-            LirExpr::Binary { lhs, rhs, .. } => { scan_atom(lhs, targets); scan_atom(rhs, targets); }
-            LirExpr::Constructor { args, .. } => { for a in args { scan_atom(a, targets); } }
-            LirExpr::Record { fields, .. } => { for (_, a) in fields { scan_atom(a, targets); } }
-            LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } | LirExpr::Raise { value, .. } => { scan_atom(value, targets); }
+            LirExpr::Binary { lhs, rhs, .. } => {
+                scan_atom(lhs, targets);
+                scan_atom(rhs, targets);
+            }
+            LirExpr::Constructor { args, .. } => {
+                for a in args {
+                    scan_atom(a, targets);
+                }
+            }
+            LirExpr::Record { fields, .. } => {
+                for (_, a) in fields {
+                    scan_atom(a, targets);
+                }
+            }
+            LirExpr::ObjectTag { value, .. }
+            | LirExpr::ObjectField { value, .. }
+            | LirExpr::Raise { value, .. } => {
+                scan_atom(value, targets);
+            }
             LirExpr::ClosureEnvLoad { .. } => {}
             LirExpr::Atom(a) => scan_atom(a, targets),
         }
@@ -459,31 +481,71 @@ fn collect_funcref_targets(program: &LirProgram) -> Vec<Symbol> {
     fn scan_stmt(stmt: &LirStmt, targets: &mut HashSet<Symbol>) {
         match stmt {
             LirStmt::Let { expr, .. } => scan_expr(expr, targets),
-            LirStmt::If { then_body, else_body, .. } => {
-                for s in then_body { scan_stmt(s, targets); }
-                for s in else_body { scan_stmt(s, targets); }
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                for s in then_body {
+                    scan_stmt(s, targets);
+                }
+                for s in else_body {
+                    scan_stmt(s, targets);
+                }
             }
-            LirStmt::IfReturn { then_body, else_body, .. } => {
-                for s in then_body { scan_stmt(s, targets); }
-                for s in else_body { scan_stmt(s, targets); }
+            LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                for s in then_body {
+                    scan_stmt(s, targets);
+                }
+                for s in else_body {
+                    scan_stmt(s, targets);
+                }
             }
-            LirStmt::TryCatch { body, catch_body, .. } => {
-                for s in body { scan_stmt(s, targets); }
-                for s in catch_body { scan_stmt(s, targets); }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                for s in body {
+                    scan_stmt(s, targets);
+                }
+                for s in catch_body {
+                    scan_stmt(s, targets);
+                }
             }
             LirStmt::Conc { .. } => {}
-            LirStmt::Loop { cond_stmts, body, .. } => {
-                for s in cond_stmts { scan_stmt(s, targets); }
-                for s in body { scan_stmt(s, targets); }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                for s in cond_stmts {
+                    scan_stmt(s, targets);
+                }
+                for s in body {
+                    scan_stmt(s, targets);
+                }
             }
-            LirStmt::Switch { cases, default_body, .. } => {
-                for c in cases { for s in &c.body { scan_stmt(s, targets); } }
-                for s in default_body { scan_stmt(s, targets); }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for c in cases {
+                    for s in &c.body {
+                        scan_stmt(s, targets);
+                    }
+                }
+                for s in default_body {
+                    scan_stmt(s, targets);
+                }
             }
         }
     }
     for func in &program.functions {
-        for stmt in &func.body { scan_stmt(stmt, &mut targets); }
+        for stmt in &func.body {
+            scan_stmt(stmt, &mut targets);
+        }
     }
     let mut result: Vec<Symbol> = targets.into_iter().collect();
     result.sort_by_key(|s| s.to_string());
@@ -505,31 +567,71 @@ fn collect_indirect_call_types(program: &LirProgram) -> Vec<Type> {
     fn scan_stmt(stmt: &LirStmt, types: &mut Vec<Type>, seen: &mut HashSet<String>) {
         match stmt {
             LirStmt::Let { expr, .. } => scan_expr(expr, types, seen),
-            LirStmt::If { then_body, else_body, .. } => {
-                for s in then_body { scan_stmt(s, types, seen); }
-                for s in else_body { scan_stmt(s, types, seen); }
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                for s in then_body {
+                    scan_stmt(s, types, seen);
+                }
+                for s in else_body {
+                    scan_stmt(s, types, seen);
+                }
             }
-            LirStmt::IfReturn { then_body, else_body, .. } => {
-                for s in then_body { scan_stmt(s, types, seen); }
-                for s in else_body { scan_stmt(s, types, seen); }
+            LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                for s in then_body {
+                    scan_stmt(s, types, seen);
+                }
+                for s in else_body {
+                    scan_stmt(s, types, seen);
+                }
             }
-            LirStmt::TryCatch { body, catch_body, .. } => {
-                for s in body { scan_stmt(s, types, seen); }
-                for s in catch_body { scan_stmt(s, types, seen); }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                for s in body {
+                    scan_stmt(s, types, seen);
+                }
+                for s in catch_body {
+                    scan_stmt(s, types, seen);
+                }
             }
             LirStmt::Conc { .. } => {}
-            LirStmt::Loop { cond_stmts, body, .. } => {
-                for s in cond_stmts { scan_stmt(s, types, seen); }
-                for s in body { scan_stmt(s, types, seen); }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                for s in cond_stmts {
+                    scan_stmt(s, types, seen);
+                }
+                for s in body {
+                    scan_stmt(s, types, seen);
+                }
             }
-            LirStmt::Switch { cases, default_body, .. } => {
-                for c in cases { for s in &c.body { scan_stmt(s, types, seen); } }
-                for s in default_body { scan_stmt(s, types, seen); }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for c in cases {
+                    for s in &c.body {
+                        scan_stmt(s, types, seen);
+                    }
+                }
+                for s in default_body {
+                    scan_stmt(s, types, seen);
+                }
             }
         }
     }
     for func in &program.functions {
-        for stmt in &func.body { scan_stmt(stmt, &mut types, &mut seen); }
+        for stmt in &func.body {
+            scan_stmt(stmt, &mut types, &mut seen);
+        }
     }
     types
 }
