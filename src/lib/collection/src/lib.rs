@@ -120,6 +120,28 @@ pub extern "C" fn __nx_hmap_vals(id: i64) -> i64 {
     })
 }
 
+/// Returns the key at the given index (iteration order). Returns 0 if out of bounds.
+#[no_mangle]
+pub extern "C" fn __nx_hmap_key_at(id: i64, idx: i64) -> i64 {
+    MAPS.with(|maps| {
+        maps.borrow()
+            .get(&id)
+            .and_then(|map| map.keys().nth(idx as usize).copied())
+            .unwrap_or(0)
+    })
+}
+
+/// Returns the value at the given index (iteration order). Returns 0 if out of bounds.
+#[no_mangle]
+pub extern "C" fn __nx_hmap_val_at(id: i64, idx: i64) -> i64 {
+    MAPS.with(|maps| {
+        maps.borrow()
+            .get(&id)
+            .and_then(|map| map.values().nth(idx as usize).copied())
+            .unwrap_or(0)
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn __nx_hmap_free(id: i64) -> i32 {
     MAPS.with(|maps| maps.borrow_mut().remove(&id).is_some()) as i32
@@ -345,6 +367,28 @@ pub extern "C" fn __nx_smap_vals(id: i64) -> i64 {
             })
             .unwrap_or_default();
         nexus_wasm_alloc::store_string_result(result)
+    })
+}
+
+/// Returns the number of values (== size). Used for index-based iteration.
+#[no_mangle]
+pub extern "C" fn __nx_smap_val_count(id: i64) -> i64 {
+    SMAPS.with(|maps| {
+        maps.borrow()
+            .get(&id)
+            .map(|map| map.len() as i64)
+            .unwrap_or(0)
+    })
+}
+
+/// Returns the value at the given index (iteration order). Returns 0 if out of bounds.
+#[no_mangle]
+pub extern "C" fn __nx_smap_val_at(id: i64, idx: i64) -> i64 {
+    SMAPS.with(|maps| {
+        maps.borrow()
+            .get(&id)
+            .and_then(|map| map.values().nth(idx as usize).copied())
+            .unwrap_or(0)
     })
 }
 
