@@ -1,6 +1,6 @@
+use super::position::LineIndex;
 use crate::lang::ast::{Program, TopLevel};
 use crate::types::Type;
-use super::position::LineIndex;
 
 /// Extract document symbols from a parsed program.
 pub fn extract(program: &Program, idx: &LineIndex) -> Vec<lsp_types::DocumentSymbol> {

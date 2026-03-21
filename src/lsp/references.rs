@@ -4,10 +4,7 @@ use crate::types::Span;
 /// Find the identifier at byte offset and all its occurrences in the source.
 ///
 /// Returns `(name, ident_span_at_offset, all_spans)`.
-pub fn find_all_references(
-    source: &str,
-    offset: usize,
-) -> Option<(String, Span, Vec<Span>)> {
+pub fn find_all_references(source: &str, offset: usize) -> Option<(String, Span, Vec<Span>)> {
     let tokens = lexer::tokenize(source).ok()?;
 
     // Find the ident at offset

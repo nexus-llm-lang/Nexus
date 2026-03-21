@@ -276,10 +276,7 @@ impl Parser {
     }
 
     fn parse_arrow_params(&mut self) -> Result<Vec<(String, Type)>, ParseError> {
-        self.parse_comma_separated(
-            |t| matches!(t, TokenKind::RParen),
-            Self::parse_arrow_param,
-        )
+        self.parse_comma_separated(|t| matches!(t, TokenKind::RParen), Self::parse_arrow_param)
     }
 
     fn parse_arrow_param(&mut self) -> Result<(String, Type), ParseError> {
@@ -640,7 +637,12 @@ impl Parser {
                 }
             }
             // []: empty list pattern — sugar for Nil
-            TokenKind::LBracket if matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::RBracket)) => {
+            TokenKind::LBracket
+                if matches!(
+                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::RBracket)
+                ) =>
+            {
                 self.advance(); // [
                 let end = self.peek_span().end;
                 self.advance(); // ]
@@ -1144,13 +1146,11 @@ impl Parser {
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<(String, Spanned<Expr>)>, ParseError> {
-        self.parse_comma_separated(
-            |t| matches!(t, TokenKind::RParen),
-            Self::parse_call_arg,
-        ).and_then(|args| {
-            self.expect(&TokenKind::RParen)?;
-            Ok(args)
-        })
+        self.parse_comma_separated(|t| matches!(t, TokenKind::RParen), Self::parse_call_arg)
+            .and_then(|args| {
+                self.expect(&TokenKind::RParen)?;
+                Ok(args)
+            })
     }
 
     fn parse_call_arg(&mut self) -> Result<(String, Spanned<Expr>), ParseError> {
@@ -1162,13 +1162,11 @@ impl Parser {
     }
 
     fn parse_ctor_args(&mut self) -> Result<Vec<(Option<String>, Spanned<Expr>)>, ParseError> {
-        self.parse_comma_separated(
-            |t| matches!(t, TokenKind::RParen),
-            Self::parse_ctor_arg,
-        ).and_then(|args| {
-            self.expect(&TokenKind::RParen)?;
-            Ok(args)
-        })
+        self.parse_comma_separated(|t| matches!(t, TokenKind::RParen), Self::parse_ctor_arg)
+            .and_then(|args| {
+                self.expect(&TokenKind::RParen)?;
+                Ok(args)
+            })
     }
 
     fn parse_ctor_arg(&mut self) -> Result<(Option<String>, Spanned<Expr>), ParseError> {
@@ -1707,7 +1705,11 @@ impl Parser {
     }
 
     fn try_parse_record_body(&mut self) -> Result<Vec<(String, Type)>, ParseError> {
-        self.parse_delimited_list(&TokenKind::LBrace, &TokenKind::RBrace, Self::parse_named_field)
+        self.parse_delimited_list(
+            &TokenKind::LBrace,
+            &TokenKind::RBrace,
+            Self::parse_named_field,
+        )
     }
 
     fn parse_variant_def(&mut self) -> Result<VariantDef, ParseError> {

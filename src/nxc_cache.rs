@@ -55,9 +55,8 @@ pub fn ensure_nxc_driver(project_root: &Path, verbose: bool) -> Result<PathBuf, 
     };
 
     let wasm_merge_command = bundler::resolve_wasm_merge_command(None);
-    let compiled =
-        compile_loaded_source_to_wasm(&loaded, true, &wasm_merge_command, verbose)
-            .map_err(|_| "Failed to compile nxc/driver.nx".to_string())?;
+    let compiled = compile_loaded_source_to_wasm(&loaded, true, &wasm_merge_command, verbose)
+        .map_err(|_| "Failed to compile nxc/driver.nx".to_string())?;
 
     fs::write(&wasm_path, &compiled.wasm)
         .map_err(|e| format!("Failed to write {}: {}", wasm_path.display(), e))?;

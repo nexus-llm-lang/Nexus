@@ -74,10 +74,7 @@ pub fn analyze(filename: &str, source: &str) -> AnalysisResult {
         Ok(prog) => {
             // Extract document symbols
             let doc_syms = symbols::extract(&prog, &line_index);
-            syms = doc_syms
-                .iter()
-                .map(|s| to_check_symbol(s))
-                .collect();
+            syms = doc_syms.iter().map(|s| to_check_symbol(s)).collect();
 
             // Typecheck
             let mut checker = TypeChecker::new();
@@ -102,24 +99,14 @@ pub fn analyze(filename: &str, source: &str) -> AnalysisResult {
                             &w.message,
                         ));
                     }
-                    diagnostics.push(to_check_diag(
-                        &line_index,
-                        &e.span,
-                        "error",
-                        &e.message,
-                    ));
+                    diagnostics.push(to_check_diag(&line_index, &e.span, "error", &e.message));
                 }
             }
             program = Some(prog);
         }
         Err(errors) => {
             for e in errors {
-                diagnostics.push(to_check_diag(
-                    &line_index,
-                    &e.span,
-                    "error",
-                    &e.message,
-                ));
+                diagnostics.push(to_check_diag(&line_index, &e.span, "error", &e.message));
             }
         }
     }

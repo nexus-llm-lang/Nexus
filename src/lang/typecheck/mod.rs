@@ -13,11 +13,10 @@ use capture::{collect_lambda_captures, lambda_references_name};
 use helpers::{
     check_unintroduced_type_vars, contains_exn_throws, contains_ref, contains_return,
     default_numeric_literals, describe_ctor_field, external_scheme, extract_row_port_names,
-    get_default_alias, is_allowed_main_require_signature, is_allowed_main_throws_signature,
-    is_auto_droppable, merge_type_rows, normalize_enum_generic_params,
-    normalize_typedef_generic_params, register_exception_variant,
-    import_variant_by_name, register_nullary_variant_constructor,
-    register_stdlib_types, select_float_type,
+    get_default_alias, import_variant_by_name, is_allowed_main_require_signature,
+    is_allowed_main_throws_signature, is_auto_droppable, merge_type_rows,
+    normalize_enum_generic_params, normalize_typedef_generic_params, register_exception_variant,
+    register_nullary_variant_constructor, register_stdlib_types, select_float_type,
     select_int_type, strip_required_port_coeffect, summarize_ctor_args, summarize_ctor_fields,
 };
 use lint::{
@@ -180,7 +179,8 @@ impl TypeChecker {
                                             imported_any = true;
                                         }
                                         // Always check for variant imports to ensure parent enum is imported for constructor resolution.
-                                        if import_variant_by_name(&mut self.env, &public_env, item) {
+                                        if import_variant_by_name(&mut self.env, &public_env, item)
+                                        {
                                             imported_any = true;
                                         }
                                         if !imported_any {
@@ -763,35 +763,25 @@ impl TypeChecker {
                             ..
                         } = &value.node
                         {
-                            let vars_set: HashSet<String> =
-                                type_params.iter().cloned().collect();
+                            let vars_set: HashSet<String> = type_params.iter().cloned().collect();
                             Type::Arrow(
                                 params
                                     .iter()
                                     .map(|p| {
                                         (
                                             p.name.clone(),
-                                            self.convert_user_defined_to_var(
-                                                &p.typ, &vars_set,
-                                            ),
+                                            self.convert_user_defined_to_var(&p.typ, &vars_set),
                                         )
                                     })
                                     .collect(),
-                                Box::new(
-                                    self.convert_user_defined_to_var(ret_type, &vars_set),
-                                ),
-                                Box::new(
-                                    self.convert_user_defined_to_var(requires, &vars_set),
-                                ),
-                                Box::new(
-                                    self.convert_user_defined_to_var(throws, &vars_set),
-                                ),
+                                Box::new(self.convert_user_defined_to_var(ret_type, &vars_set)),
+                                Box::new(self.convert_user_defined_to_var(requires, &vars_set)),
+                                Box::new(self.convert_user_defined_to_var(throws, &vars_set)),
                             )
                         } else {
                             return Err(TypeError {
-                                message:
-                                    "Recursive lambda requires an explicit type annotation"
-                                        .into(),
+                                message: "Recursive lambda requires an explicit type annotation"
+                                    .into(),
                                 span: value.span.clone(),
                             });
                         };
@@ -1322,10 +1312,7 @@ impl TypeChecker {
                         s = compose_subst(&s, &s4);
                         Ok((s, Type::Bool))
                     }
-                    BinaryOp::Lt
-                    | BinaryOp::Gt
-                    | BinaryOp::Le
-                    | BinaryOp::Ge => {
+                    BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => {
                         let lt = apply_subst_type(&s, &t1);
                         let rt = apply_subst_type(&s, &t2);
                         let target = select_int_type(&lt, &rt)
@@ -1337,12 +1324,12 @@ impl TypeChecker {
                                 }
                             })
                             .ok_or_else(|| TypeError {
-                            message: format!(
-                                "Ordered comparison expects i32/i64/char, got {} and {}",
-                                lt, rt
-                            ),
-                            span: e.span.clone(),
-                        })?;
+                                message: format!(
+                                    "Ordered comparison expects i32/i64/char, got {} and {}",
+                                    lt, rt
+                                ),
+                                span: e.span.clone(),
+                            })?;
 
                         let s3 = self.unify(&lt, &target).map_err(|m| TypeError {
                             message: m,

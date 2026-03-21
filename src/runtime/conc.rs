@@ -23,7 +23,6 @@ pub const CONC_SPAWN_FUNC: &str = "__nx_conc_spawn";
 pub const CONC_JOIN_FUNC: &str = "__nx_conc_join";
 pub const CONC_EXPORT_PREFIX: &str = "__conc_";
 
-
 struct PendingTask {
     export_name: String,
     args: Vec<i64>,
@@ -117,13 +116,19 @@ pub fn add_nexus_host_stubs<T: 'static>(linker: &mut Linker<T>) {
         "host-http-listen",
         |_: i32, _: i32| -> i64 { -1 },
     );
-    let _ = linker.func_wrap(NEXUS_HOST_HTTP_MODULE, "host-http-accept", |_: i64, _: i32| {});
+    let _ = linker.func_wrap(
+        NEXUS_HOST_HTTP_MODULE,
+        "host-http-accept",
+        |_: i64, _: i32| {},
+    );
     let _ = linker.func_wrap(
         NEXUS_HOST_HTTP_MODULE,
         "host-http-respond",
         |_: i64, _: i64, _: i32, _: i32, _: i32, _: i32| -> i32 { 0 },
     );
-    let _ = linker.func_wrap(NEXUS_HOST_HTTP_MODULE, "host-http-stop", |_: i64| -> i32 { 0 });
+    let _ = linker.func_wrap(NEXUS_HOST_HTTP_MODULE, "host-http-stop", |_: i64| -> i32 {
+        0
+    });
 }
 
 /// Add conc host functions (`__nx_conc_spawn`, `__nx_conc_join`) to a linker.
@@ -259,8 +264,7 @@ fn run_task_thread(
         // nexus-host stubs (needed by stdlib bundle even if task doesn't use net)
         add_nexus_host_stubs(&mut linker);
         // Backtrace stubs (tasks share thread-local bt state)
-        super::backtrace::add_bt_to_linker(&mut linker)
-            .map_err(wasmtime::Error::msg)?;
+        super::backtrace::add_bt_to_linker(&mut linker).map_err(wasmtime::Error::msg)?;
 
         let mut builder = WasiCtxBuilder::new();
         capabilities
@@ -285,8 +289,7 @@ fn run_task_thread(
             |_: i32, _: i32, _: i32| {},
         )?;
         linker.func_wrap(CONC_HOST_MODULE, CONC_JOIN_FUNC, || {})?;
-        super::backtrace::add_bt_to_linker(&mut linker)
-            .map_err(wasmtime::Error::msg)?;
+        super::backtrace::add_bt_to_linker(&mut linker).map_err(wasmtime::Error::msg)?;
 
         let mut store = Store::new(engine, ());
         let instance = linker.instantiate(&mut store, module)?;

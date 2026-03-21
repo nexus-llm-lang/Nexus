@@ -6,8 +6,8 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, References,
-    Rename, Request as _,
+    Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, References, Rename,
+    Request as _,
 };
 use lsp_types::*;
 
@@ -42,9 +42,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (connection, io_threads) = Connection::stdio();
 
     let server_capabilities = serde_json::to_value(ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(
-            TextDocumentSyncKind::FULL,
-        )),
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
@@ -77,9 +75,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-fn main_loop(
-    connection: &Connection,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main_loop(connection: &Connection) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut documents: HashMap<DocKey, DocumentState> = HashMap::new();
 
     for msg in &connection.receiver {
@@ -315,8 +311,7 @@ fn handle_request(req: &Request, documents: &HashMap<DocKey, DocumentState>) -> 
             let key = DocKey::from_uri(uri);
             let result = documents.get(&key).and_then(|doc| {
                 let offset = doc.line_index.position_to_offset(pos);
-                let (name, origin_span, _) =
-                    references::find_all_references(&doc.text, offset)?;
+                let (name, origin_span, _) = references::find_all_references(&doc.text, offset)?;
                 Some(PrepareRenameResponse::RangeWithPlaceholder {
                     range: doc.line_index.span_to_range(&origin_span),
                     placeholder: name,

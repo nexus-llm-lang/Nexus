@@ -206,7 +206,11 @@ struct LowerCtx<'a> {
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(enum_defs: &'a [EnumDef], source_file: Option<String>, source_line: Option<u32>) -> Self {
+    fn new(
+        enum_defs: &'a [EnumDef],
+        source_file: Option<String>,
+        source_line: Option<u32>,
+    ) -> Self {
         LowerCtx {
             vars: HashMap::new(),
             semantic_vars: HashMap::new(),
@@ -280,9 +284,7 @@ impl<'a> LowerCtx<'a> {
                 // may have a more accurate semantic type set by lower_match_expr/lower_if_expr.
                 // Prefer that over the pre-lowering inference which can't resolve pattern bindings.
                 let semantic_type = match &atom {
-                    LirAtom::Var {
-                        name: var_name, ..
-                    } => self
+                    LirAtom::Var { name: var_name, .. } => self
                         .semantic_vars
                         .get(var_name)
                         .cloned()
@@ -369,11 +371,15 @@ impl<'a> LowerCtx<'a> {
                     let capture_params: Vec<MirParam> = free_vars
                         .iter()
                         .map(|&name| {
-                            let typ = self.semantic_vars.get(&name).cloned()
-                                .ok_or_else(|| LirLowerError::UnresolvedType {
-                                    detail: format!("conc capture variable '{}' not in semantic_vars", name),
+                            let typ = self.semantic_vars.get(&name).cloned().ok_or_else(|| {
+                                LirLowerError::UnresolvedType {
+                                    detail: format!(
+                                        "conc capture variable '{}' not in semantic_vars",
+                                        name
+                                    ),
                                     span: task.span.clone(),
-                                })?;
+                                }
+                            })?;
                             Ok(MirParam {
                                 label: name,
                                 name,
@@ -397,18 +403,13 @@ impl<'a> LowerCtx<'a> {
                     let args: Vec<(Symbol, LirAtom)> = free_vars
                         .iter()
                         .map(|&name| {
-                            let typ = self.vars.get(&name).cloned()
-                                .ok_or_else(|| LirLowerError::UnresolvedType {
+                            let typ = self.vars.get(&name).cloned().ok_or_else(|| {
+                                LirLowerError::UnresolvedType {
                                     detail: format!("conc capture variable '{}' not in vars", name),
                                     span: task.span.clone(),
-                                })?;
-                            Ok((
-                                name,
-                                LirAtom::Var {
-                                    name,
-                                    typ,
-                                },
-                            ))
+                                }
+                            })?;
+                            Ok((name, LirAtom::Var { name, typ }))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     task_refs.push(ConcTask {
@@ -529,8 +530,7 @@ impl<'a> LowerCtx<'a> {
         // creates synthetic Return stmts that trigger TailCall optimization and
         // incorrectly return from the enclosing function instead of just producing
         // a value for the if-expression.
-        let then_stmts =
-            self.lower_branch_for_value(then_body, result_name, &result_type)?;
+        let then_stmts = self.lower_branch_for_value(then_body, result_name, &result_type)?;
 
         let else_stmts = if let Some(else_body) = else_body {
             self.lower_branch_for_value(else_body, result_name, &result_type)?
@@ -653,12 +653,13 @@ impl<'a> LowerCtx<'a> {
                     // exhaustive matches).
                     let then_ret = fallback_return_atom_from_terminal_stmt(&case_stmts)
                         .unwrap_or_else(|| default_atom_for_type(ret_type));
-                    let then_ret =
-                        if matches!(then_ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
-                            default_atom_for_type(ret_type)
-                        } else {
-                            then_ret
-                        };
+                    let then_ret = if matches!(then_ret.typ(), Type::Unit)
+                        && !matches!(ret_type, Type::Unit)
+                    {
+                        default_atom_for_type(ret_type)
+                    } else {
+                        then_ret
+                    };
                     chain = Some(LirStmt::IfReturn {
                         cond,
                         then_body: case_stmts,
@@ -697,9 +698,10 @@ impl<'a> LowerCtx<'a> {
                 // from the enclosing function (IfReturn). This prevents e.g.
                 // `case None -> ()` from emitting a spurious WASM return.
                 let body_is_trivially_unit = case.body.is_empty()
-                    || case.body.iter().all(|s| {
-                        matches!(s, MirStmt::Expr(MirExpr::Literal(Literal::Unit)))
-                    });
+                    || case
+                        .body
+                        .iter()
+                        .all(|s| matches!(s, MirStmt::Expr(MirExpr::Literal(Literal::Unit))));
 
                 if body_is_trivially_unit && case_ret.is_none() {
                     chain = Some(LirStmt::If {
@@ -712,8 +714,8 @@ impl<'a> LowerCtx<'a> {
                     // - case_ret: explicit return value (bare expression or return stmt)
                     // - fallback: terminal IfReturn/TryCatch from nested control flow
                     // If neither, this is a side-effect-only case → then_ret = None
-                    let genuine_ret = case_ret
-                        .or_else(|| fallback_return_atom_from_terminal_stmt(&case_stmts));
+                    let genuine_ret =
+                        case_ret.or_else(|| fallback_return_atom_from_terminal_stmt(&case_stmts));
 
                     let then_ret = genuine_ret.map(|ret| {
                         // If the case diverges (e.g. raise), ret may be Unit-typed
@@ -966,7 +968,8 @@ impl<'a> LowerCtx<'a> {
         self.collect_pattern_conditions_and_bindings(target, pattern, &mut conds, &mut bindings)?;
 
         // Guard field extraction stmts for Constructor patterns (same as lower_match_case)
-        let has_ctor_fields = matches!(pattern, MirPattern::Constructor { fields, .. } if !fields.is_empty());
+        let has_ctor_fields =
+            matches!(pattern, MirPattern::Constructor { fields, .. } if !fields.is_empty());
         let guarded_stmts: Vec<LirStmt> = if has_ctor_fields {
             let tag_check_end = stmts_before + 2;
             if self.stmts.len() > tag_check_end {
@@ -1121,7 +1124,8 @@ impl<'a> LowerCtx<'a> {
         // checks) dereference field pointers and are only valid when the tag
         // matches. Move them inside the case body so they execute only after
         // the tag check passes.
-        let has_ctor_fields = matches!(pattern, MirPattern::Constructor { fields, .. } if !fields.is_empty());
+        let has_ctor_fields =
+            matches!(pattern, MirPattern::Constructor { fields, .. } if !fields.is_empty());
         let guarded_stmts: Vec<LirStmt> = if has_ctor_fields {
             let tag_check_end = stmts_before + 2;
             if self.stmts.len() > tag_check_end {
@@ -1364,8 +1368,12 @@ impl<'a> LowerCtx<'a> {
                         .unwrap_or_else(|| target.typ()),
                     _ => target.typ(),
                 };
-                let resolved_field_types =
-                    resolve_constructor_field_types(name.as_str(), &target_sem_type, &self.ctor_index, self.enum_defs);
+                let resolved_field_types = resolve_constructor_field_types(
+                    name.as_str(),
+                    &target_sem_type,
+                    &self.ctor_index,
+                    self.enum_defs,
+                );
 
                 // Field checks — use sorted index for memory layout
                 for (pat_idx, (label, field_pat)) in fields.iter().enumerate() {
@@ -1394,9 +1402,7 @@ impl<'a> LowerCtx<'a> {
                     let def_idx = if let Some(lbl) = label {
                         field_labels
                             .as_ref()
-                            .and_then(|labels| {
-                                labels.iter().position(|l| l.as_ref() == Some(lbl))
-                            })
+                            .and_then(|labels| labels.iter().position(|l| l.as_ref() == Some(lbl)))
                             .unwrap_or(pat_idx)
                     } else {
                         pat_idx
@@ -1405,18 +1411,19 @@ impl<'a> LowerCtx<'a> {
                         .as_ref()
                         .and_then(|fts| fts.get(def_idx))
                         .cloned();
-                    let wasm_ft = semantic_ft
-                        .as_ref()
-                        .map(|ft| wasm_type(ft))
-                        .unwrap_or_else(|| {
-                            // Generic/polymorphic constructor fields — I64 is the correct
-                            // WASM representation for unresolved type parameters
-                            tracing::debug!(
+                    let wasm_ft =
+                        semantic_ft
+                            .as_ref()
+                            .map(|ft| wasm_type(ft))
+                            .unwrap_or_else(|| {
+                                // Generic/polymorphic constructor fields — I64 is the correct
+                                // WASM representation for unresolved type parameters
+                                tracing::debug!(
                                 "constructor '{}' field at index {}: unresolved type, using I64",
                                 name, def_idx
                             );
-                            Type::I64
-                        });
+                                Type::I64
+                            });
                     let field_atom = self.bind_expr_to_temp(
                         LirExpr::ObjectField {
                             value: target.clone(),
@@ -1465,7 +1472,10 @@ impl<'a> LowerCtx<'a> {
                         .find(|(_, (n, _))| n == name)
                         .map(|(i, (_, t))| (i, t.clone()))
                         .ok_or_else(|| LirLowerError::UnresolvedType {
-                            detail: format!("record field '{}' not found in record type {:?}", name, semantic_type),
+                            detail: format!(
+                                "record field '{}' not found in record type {:?}",
+                                name, semantic_type
+                            ),
                             span: 0..0,
                         })?;
                     let field_atom = self.bind_expr_to_temp(
@@ -1533,7 +1543,8 @@ impl<'a> LowerCtx<'a> {
                         .unwrap_or_else(|| {
                             tracing::debug!(
                                 "record field '{}' not found in semantic type {:?}, using I64",
-                                name, sem_type
+                                name,
+                                sem_type
                             );
                             Type::I64
                         });
@@ -1542,14 +1553,21 @@ impl<'a> LowerCtx<'a> {
             }
             MirPattern::Constructor { name, fields } => {
                 // Look up constructor's enum definition to resolve field types
-                let field_types = resolve_constructor_field_types(name.as_str(), sem_type, &self.ctor_index, self.enum_defs);
+                let field_types = resolve_constructor_field_types(
+                    name.as_str(),
+                    sem_type,
+                    &self.ctor_index,
+                    self.enum_defs,
+                );
                 let ctor_info = self.ctor_index.get(name.as_str());
                 for (pat_idx, (label, field_pat)) in fields.iter().enumerate() {
                     // Resolve definition index for this field (label-aware)
                     let def_idx = if let Some(lbl) = label {
                         ctor_info
                             .and_then(|info| {
-                                info.field_labels.iter().position(|l| l.as_ref() == Some(lbl))
+                                info.field_labels
+                                    .iter()
+                                    .position(|l| l.as_ref() == Some(lbl))
                             })
                             .unwrap_or(pat_idx)
                     } else {
@@ -1563,7 +1581,8 @@ impl<'a> LowerCtx<'a> {
                             // Generic/polymorphic constructor — I64 is correct for unresolved type params
                             tracing::debug!(
                                 "constructor '{}' field at index {}: unresolved type, using I64",
-                                name, def_idx
+                                name,
+                                def_idx
                             );
                             Type::I64
                         });
@@ -1661,7 +1680,10 @@ impl<'a> LowerCtx<'a> {
                 }
 
                 // 2. Fill in missing labels from enum definition (positional → labeled)
-                let def_labels = self.ctor_index.get(name.as_str()).map(|info| &info.field_labels);
+                let def_labels = self
+                    .ctor_index
+                    .get(name.as_str())
+                    .map(|info| &info.field_labels);
                 if let Some(labels) = def_labels {
                     for (i, (label, _)) in labeled_args.iter_mut().enumerate() {
                         if label.is_none() {
@@ -1681,7 +1703,8 @@ impl<'a> LowerCtx<'a> {
                 }
 
                 // 4. Strip labels
-                let lir_args: Vec<LirAtom> = labeled_args.into_iter().map(|(_, atom)| atom).collect();
+                let lir_args: Vec<LirAtom> =
+                    labeled_args.into_iter().map(|(_, atom)| atom).collect();
                 let typ = Type::I64; // object pointer
                 Ok(self.bind_expr_to_temp(
                     LirExpr::Constructor {
@@ -1734,7 +1757,10 @@ impl<'a> LowerCtx<'a> {
                 Ok(self.bind_expr_to_temp(
                     LirExpr::Call {
                         func: Symbol::from("__array_get"),
-                        args: vec![(Symbol::from("arr"), arr_atom), (Symbol::from("idx"), idx_atom)],
+                        args: vec![
+                            (Symbol::from("arr"), arr_atom),
+                            (Symbol::from("idx"), idx_atom),
+                        ],
                         typ: typ.clone(),
                     },
                     typ,
@@ -1745,7 +1771,8 @@ impl<'a> LowerCtx<'a> {
                 let receiver_semantic_type = self.infer_semantic_type(expr);
                 let obj_atom = self.lower_expr_to_atom(expr)?;
 
-                let (idx, field_type) = resolve_field_access(&receiver_semantic_type, field.as_str())?;
+                let (idx, field_type) =
+                    resolve_field_access(&receiver_semantic_type, field.as_str())?;
 
                 let typ = wasm_type(&field_type);
                 Ok(self.bind_expr_to_temp(
@@ -1769,11 +1796,14 @@ impl<'a> LowerCtx<'a> {
                 span: 0..0,
             }),
             MirExpr::Borrow(name) => {
-                let typ = self.vars.get(name).cloned()
-                    .ok_or_else(|| LirLowerError::UnresolvedType {
-                        detail: format!("borrowed variable '{}' not in scope", name),
-                        span: 0..0,
-                    })?;
+                let typ =
+                    self.vars
+                        .get(name)
+                        .cloned()
+                        .ok_or_else(|| LirLowerError::UnresolvedType {
+                            detail: format!("borrowed variable '{}' not in scope", name),
+                            span: 0..0,
+                        })?;
                 Ok(LirAtom::Var {
                     name: name.clone(),
                     typ,
@@ -1868,11 +1898,13 @@ impl<'a> LowerCtx<'a> {
     /// variable bindings in semantic_vars.
     fn infer_semantic_type(&self, expr: &MirExpr) -> Type {
         match expr {
-            MirExpr::Variable(name) => self.semantic_vars.get(name).cloned()
-                .unwrap_or_else(|| {
-                    tracing::debug!("variable '{}' not in semantic_vars during type inference, using I64", name);
-                    Type::I64
-                }),
+            MirExpr::Variable(name) => self.semantic_vars.get(name).cloned().unwrap_or_else(|| {
+                tracing::debug!(
+                    "variable '{}' not in semantic_vars during type inference, using I64",
+                    name
+                );
+                Type::I64
+            }),
             MirExpr::Call { ret_type, .. } => ret_type.clone(),
             MirExpr::Record(fields) => {
                 let mut field_types: Vec<(String, Type)> = fields
@@ -1896,7 +1928,12 @@ impl<'a> LowerCtx<'a> {
                 resolve_field_access(&receiver_type, field.as_str())
                     .map(|(_, typ)| typ)
                     .unwrap_or_else(|e| {
-                        tracing::debug!("field '{}' not resolvable on type {:?}: {}", field, receiver_type, e);
+                        tracing::debug!(
+                            "field '{}' not resolvable on type {:?}: {}",
+                            field,
+                            receiver_type,
+                            e
+                        );
                         Type::I64
                     })
             }
@@ -1948,11 +1985,13 @@ impl<'a> LowerCtx<'a> {
                 }
             }
             MirExpr::While { .. } => Type::Unit,
-            MirExpr::Borrow(name) => self.semantic_vars.get(name).cloned()
-                .unwrap_or_else(|| {
-                    tracing::debug!("borrowed variable '{}' not in semantic_vars during type inference, using I64", name);
-                    Type::I64
-                }),
+            MirExpr::Borrow(name) => self.semantic_vars.get(name).cloned().unwrap_or_else(|| {
+                tracing::debug!(
+                    "borrowed variable '{}' not in semantic_vars during type inference, using I64",
+                    name
+                );
+                Type::I64
+            }),
             // Raise never returns; I64 is a placeholder (no Type::Never exists)
             MirExpr::Raise(_) => Type::I64,
             MirExpr::FuncRef(_) | MirExpr::Closure { .. } => Type::I64,
@@ -2059,9 +2098,14 @@ fn resolve_field_access(
 fn wasm_type(typ: &Type) -> Type {
     match typ {
         // Primitives: keep semantic type for downstream codegen
-        Type::I32 | Type::I64 | Type::F32 | Type::F64 | Type::Bool | Type::Char | Type::String | Type::Unit => {
-            typ.clone()
-        }
+        Type::I32
+        | Type::I64
+        | Type::F32
+        | Type::F64
+        | Type::Bool
+        | Type::Char
+        | Type::String
+        | Type::Unit => typ.clone(),
         // Literal types: resolve to concrete numeric type
         Type::IntLit => Type::I64,
         Type::FloatLit => Type::F64,
@@ -2467,31 +2511,71 @@ fn collect_lir_funcref_targets(functions: &[LirFunction]) -> HashSet<Symbol> {
     fn scan_stmt(stmt: &LirStmt, targets: &mut HashSet<Symbol>) {
         match stmt {
             LirStmt::Let { expr, .. } => scan_expr(expr, targets),
-            LirStmt::If { then_body, else_body, .. } => {
-                for s in then_body { scan_stmt(s, targets); }
-                for s in else_body { scan_stmt(s, targets); }
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                for s in then_body {
+                    scan_stmt(s, targets);
+                }
+                for s in else_body {
+                    scan_stmt(s, targets);
+                }
             }
-            LirStmt::IfReturn { then_body, else_body, .. } => {
-                for s in then_body { scan_stmt(s, targets); }
-                for s in else_body { scan_stmt(s, targets); }
+            LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                for s in then_body {
+                    scan_stmt(s, targets);
+                }
+                for s in else_body {
+                    scan_stmt(s, targets);
+                }
             }
-            LirStmt::TryCatch { body, catch_body, .. } => {
-                for s in body { scan_stmt(s, targets); }
-                for s in catch_body { scan_stmt(s, targets); }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                for s in body {
+                    scan_stmt(s, targets);
+                }
+                for s in catch_body {
+                    scan_stmt(s, targets);
+                }
             }
             LirStmt::Conc { .. } => {}
-            LirStmt::Loop { cond_stmts, body, .. } => {
-                for s in cond_stmts { scan_stmt(s, targets); }
-                for s in body { scan_stmt(s, targets); }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                for s in cond_stmts {
+                    scan_stmt(s, targets);
+                }
+                for s in body {
+                    scan_stmt(s, targets);
+                }
             }
-            LirStmt::Switch { cases, default_body, .. } => {
-                for c in cases { for s in &c.body { scan_stmt(s, targets); } }
-                for s in default_body { scan_stmt(s, targets); }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for c in cases {
+                    for s in &c.body {
+                        scan_stmt(s, targets);
+                    }
+                }
+                for s in default_body {
+                    scan_stmt(s, targets);
+                }
             }
         }
     }
     for func in functions {
-        for stmt in &func.body { scan_stmt(stmt, &mut targets); }
+        for stmt in &func.body {
+            scan_stmt(stmt, &mut targets);
+        }
     }
     targets
 }
@@ -2588,7 +2672,11 @@ fn closure_convert(
     }
 
     // Generate wrapper functions for named funcref targets
-    let func_index: HashMap<Symbol, usize> = functions.iter().enumerate().map(|(i, f)| (f.name, i)).collect();
+    let func_index: HashMap<Symbol, usize> = functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name, i))
+        .collect();
     for target in wrapper_targets {
         if let Some(&idx) = func_index.get(&target) {
             let original = &functions[idx];
@@ -2689,26 +2777,64 @@ fn update_funcref_targets(functions: &mut [LirFunction], old_name: Symbol, new_n
     fn update_stmt(stmt: &mut LirStmt, old: Symbol, new: Symbol) {
         match stmt {
             LirStmt::Let { expr, .. } => update_expr(expr, old, new),
-            LirStmt::If { then_body, else_body, .. } => {
-                for s in then_body { update_stmt(s, old, new); }
-                for s in else_body { update_stmt(s, old, new); }
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                for s in then_body {
+                    update_stmt(s, old, new);
+                }
+                for s in else_body {
+                    update_stmt(s, old, new);
+                }
             }
-            LirStmt::IfReturn { then_body, else_body, .. } => {
-                for s in then_body { update_stmt(s, old, new); }
-                for s in else_body { update_stmt(s, old, new); }
+            LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                for s in then_body {
+                    update_stmt(s, old, new);
+                }
+                for s in else_body {
+                    update_stmt(s, old, new);
+                }
             }
-            LirStmt::TryCatch { body, catch_body, .. } => {
-                for s in body { update_stmt(s, old, new); }
-                for s in catch_body { update_stmt(s, old, new); }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                for s in body {
+                    update_stmt(s, old, new);
+                }
+                for s in catch_body {
+                    update_stmt(s, old, new);
+                }
             }
             LirStmt::Conc { .. } => {}
-            LirStmt::Loop { cond_stmts, body, .. } => {
-                for s in cond_stmts { update_stmt(s, old, new); }
-                for s in body { update_stmt(s, old, new); }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                for s in cond_stmts {
+                    update_stmt(s, old, new);
+                }
+                for s in body {
+                    update_stmt(s, old, new);
+                }
             }
-            LirStmt::Switch { cases, default_body, .. } => {
-                for c in cases { for s in &mut c.body { update_stmt(s, old, new); } }
-                for s in default_body { update_stmt(s, old, new); }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for c in cases {
+                    for s in &mut c.body {
+                        update_stmt(s, old, new);
+                    }
+                }
+                for s in default_body {
+                    update_stmt(s, old, new);
+                }
             }
         }
     }

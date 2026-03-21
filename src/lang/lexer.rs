@@ -310,10 +310,7 @@ impl Lexer {
                         }
                         _ => {
                             self.errors.push(LexError {
-                                message: format!(
-                                    "invalid hex in \\u{{...}} escape: '{}'",
-                                    hex
-                                ),
+                                message: format!("invalid hex in \\u{{...}} escape: '{}'", hex),
                                 span: start..self.pos,
                             });
                             return None;

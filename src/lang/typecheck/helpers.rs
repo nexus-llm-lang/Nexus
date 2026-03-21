@@ -696,9 +696,7 @@ pub(super) fn contains_return(body: &[Spanned<Stmt>]) -> bool {
         Stmt::Return(_) => true,
         Stmt::Expr(e) => expr_contains_return(e),
         Stmt::Try {
-            body,
-            catch_body,
-            ..
+            body, catch_body, ..
         } => contains_return(body) || contains_return(catch_body),
         Stmt::Inject { body, .. } => contains_return(body),
         _ => false,
@@ -708,7 +706,8 @@ pub(super) fn contains_return(body: &[Spanned<Stmt>]) -> bool {
 /// Check whether the body ends with an expression that can serve as
 /// an implicit return value (tail expression semantics).
 fn body_ends_with_tail_expr(body: &[Spanned<Stmt>]) -> bool {
-    body.last().is_some_and(|s| matches!(&s.node, Stmt::Expr(_)))
+    body.last()
+        .is_some_and(|s| matches!(&s.node, Stmt::Expr(_)))
 }
 
 fn expr_contains_return(e: &Spanned<Expr>) -> bool {
@@ -718,8 +717,7 @@ fn expr_contains_return(e: &Spanned<Expr>) -> bool {
             else_branch,
             ..
         } => {
-            contains_return(then_branch)
-                || else_branch.as_ref().is_some_and(|b| contains_return(b))
+            contains_return(then_branch) || else_branch.as_ref().is_some_and(|b| contains_return(b))
         }
         Expr::Match { cases, .. } => cases.iter().any(|c| contains_return(&c.body)),
         _ => false,

@@ -217,7 +217,8 @@ impl MirBuilder {
                 // Set up scope_var_types from function params for capture type resolution
                 self.scope_var_types.clear();
                 for p in &pf.params {
-                    self.scope_var_types.insert(p.name.to_string(), p.typ.clone());
+                    self.scope_var_types
+                        .insert(p.name.to_string(), p.typ.clone());
                 }
                 let mut body = pf.preamble;
                 body.extend(self.convert_stmts(&pf.body, &pf.rename_map, &scope)?);
@@ -225,7 +226,10 @@ impl MirBuilder {
                 // (not already a Return), promote it to Return so the value
                 // is used as the function's return value.
                 if let Some(MirStmt::Expr(expr)) = body.last().cloned() {
-                    if !matches!(expr, MirExpr::If { .. } | MirExpr::Match { .. } | MirExpr::While { .. }) {
+                    if !matches!(
+                        expr,
+                        MirExpr::If { .. } | MirExpr::Match { .. } | MirExpr::While { .. }
+                    ) {
                         *body.last_mut().unwrap() = MirStmt::Return(expr);
                     }
                 }
@@ -445,8 +449,7 @@ impl MirBuilder {
                                         ret_type: Type::List(Box::new(Type::String)),
                                     },
                                 }];
-                                self.fn_ret_types
-                                    .insert(name.clone(), ret_type.clone());
+                                self.fn_ret_types.insert(name.clone(), ret_type.clone());
                                 self.pending_functions.push(PendingFunction {
                                     name,
                                     params: vec![],
@@ -460,10 +463,12 @@ impl MirBuilder {
                                     captures: vec![],
                                 });
                             } else {
-                                self.fn_ret_types
-                                    .insert(name.clone(), ret_type.clone());
+                                self.fn_ret_types.insert(name.clone(), ret_type.clone());
                                 let arrow_type = Type::Arrow(
-                                    params.iter().map(|p| (p.name.clone(), p.typ.clone())).collect(),
+                                    params
+                                        .iter()
+                                        .map(|p| (p.name.clone(), p.typ.clone()))
+                                        .collect(),
                                     Box::new(ret_type.clone()),
                                     Box::new(requires.clone()),
                                     Box::new(throws.clone()),
@@ -520,8 +525,7 @@ impl MirBuilder {
                         } => {
                             let port_name = self.rename(coeffect_name, rename_map);
                             for hf in handler_fns {
-                                let synth_name =
-                                    format!("__handler_{}_{}", name, hf.name);
+                                let synth_name = format!("__handler_{}_{}", name, hf.name);
                                 self.fn_ret_types
                                     .insert(synth_name.clone(), hf.ret_type.clone());
                                 self.pending_functions.push(PendingFunction {
@@ -547,10 +551,8 @@ impl MirBuilder {
                             }
                             self.handler_port_names
                                 .insert(name.clone(), port_name.clone());
-                            self.handler_bindings.insert(
-                                name.clone(),
-                                HandlerBinding { port_name },
-                            );
+                            self.handler_bindings
+                                .insert(name.clone(), HandlerBinding { port_name });
                         }
                         Expr::Literal(lit) => {
                             self.global_constants.insert(name.clone(), lit.clone());
@@ -578,12 +580,13 @@ impl MirBuilder {
         }
 
         self.import_stack.push(resolved_path.clone());
-        let src =
-            std::fs::read_to_string(&resolved_path).map_err(|e| HirBuildError::ImportReadError {
+        let src = std::fs::read_to_string(&resolved_path).map_err(|e| {
+            HirBuildError::ImportReadError {
                 path: resolved_path.clone(),
                 detail: e.to_string(),
                 span: import_span.clone(),
-            })?;
+            }
+        })?;
         let imported_program =
             parser::parser()
                 .parse(&src)
@@ -966,16 +969,16 @@ impl MirBuilder {
                 for handler_name in handlers {
                     let renamed = self.rename(handler_name, rename_map);
                     if let Some(port_name) = self.handler_port_names.get(&renamed) {
-                        new_scope
-                            .active
-                            .insert(port_name.clone(), renamed);
+                        new_scope.active.insert(port_name.clone(), renamed);
                     }
                 }
                 // Inline: return body stmts directly (no Inject wrapper)
                 self.convert_stmts(body, rename_map, &new_scope)
             }
             // LetPattern is handled in convert_stmts before calling convert_stmt
-            Stmt::LetPattern { .. } => unreachable!("LetPattern should be handled in convert_stmts"),
+            Stmt::LetPattern { .. } => {
+                unreachable!("LetPattern should be handled in convert_stmts")
+            }
         }
     }
 
@@ -1010,28 +1013,38 @@ impl MirBuilder {
                 let renamed_func = self.rename(func, rename_map);
 
                 // Check if this is a port-qualified call (e.g., "Console.print")
-                let port_match = self.port_methods.keys()
-                    .find_map(|port_name| {
-                        renamed_func
-                            .strip_prefix(port_name.as_str())
-                            .and_then(|s| s.strip_prefix('.'))
-                            .map(|method_name| (port_name.clone(), method_name.to_string()))
-                    });
+                let port_match = self.port_methods.keys().find_map(|port_name| {
+                    renamed_func
+                        .strip_prefix(port_name.as_str())
+                        .and_then(|s| s.strip_prefix('.'))
+                        .map(|method_name| (port_name.clone(), method_name.to_string()))
+                });
                 if let Some((port_name, method_name)) = port_match {
                     return self.resolve_port_call(
-                        &port_name, &method_name, args, rename_map, scope, &expr.span,
+                        &port_name,
+                        &method_name,
+                        args,
+                        rename_map,
+                        scope,
+                        &expr.span,
                     );
                 }
 
                 let mir_args: Vec<(Symbol, MirExpr)> = args
                     .iter()
                     .map(|(label, e)| {
-                        Ok((Symbol::from(label.as_str()), self.convert_expr(e, rename_map, scope)?))
+                        Ok((
+                            Symbol::from(label.as_str()),
+                            self.convert_expr(e, rename_map, scope)?,
+                        ))
                     })
                     .collect::<Result<_, HirBuildError>>()?;
 
                 let is_known_function = self.fn_ret_types.contains_key(&renamed_func)
-                    || self.externals.iter().any(|e| e.name == renamed_func.as_str());
+                    || self
+                        .externals
+                        .iter()
+                        .any(|e| e.name == renamed_func.as_str());
 
                 if is_known_function {
                     let ret_type = self.lookup_ret_type(&renamed_func);
@@ -1061,7 +1074,10 @@ impl MirBuilder {
                 let mir_args: Vec<(Option<Symbol>, MirExpr)> = args
                     .iter()
                     .map(|(label, e)| {
-                        Ok((label.as_ref().map(|l| Symbol::from(l.as_str())), self.convert_expr(e, rename_map, scope)?))
+                        Ok((
+                            label.as_ref().map(|l| Symbol::from(l.as_str())),
+                            self.convert_expr(e, rename_map, scope)?,
+                        ))
                     })
                     .collect::<Result<_, HirBuildError>>()?;
                 Ok(MirExpr::Constructor {
@@ -1072,7 +1088,12 @@ impl MirBuilder {
             Expr::Record(fields) => {
                 let mir_fields: Vec<(Symbol, MirExpr)> = fields
                     .iter()
-                    .map(|(n, e)| Ok((Symbol::from(n.as_str()), self.convert_expr(e, rename_map, scope)?)))
+                    .map(|(n, e)| {
+                        Ok((
+                            Symbol::from(n.as_str()),
+                            self.convert_expr(e, rename_map, scope)?,
+                        ))
+                    })
                     .collect::<Result<_, HirBuildError>>()?;
                 Ok(MirExpr::Record(mir_fields))
             }
@@ -1092,7 +1113,10 @@ impl MirBuilder {
                 for item in items.iter().rev() {
                     acc = MirExpr::Constructor {
                         name: Symbol::from("Cons"),
-                        args: vec![(None, self.convert_expr(item, rename_map, scope)?), (None, acc)],
+                        args: vec![
+                            (None, self.convert_expr(item, rename_map, scope)?),
+                            (None, acc),
+                        ],
                     };
                 }
                 Ok(acc)
@@ -1215,15 +1239,20 @@ impl MirBuilder {
                 }));
 
                 let arrow_type = Type::Arrow(
-                    params.iter().map(|p| (p.name.clone(), p.typ.clone())).collect(),
+                    params
+                        .iter()
+                        .map(|p| (p.name.clone(), p.typ.clone()))
+                        .collect(),
                     Box::new(ret_type.clone()),
                     Box::new(requires.clone()),
                     Box::new(throws.clone()),
                 );
-                self.fn_ret_types.insert(lifted_name.clone(), ret_type.clone());
+                self.fn_ret_types
+                    .insert(lifted_name.clone(), ret_type.clone());
                 self.fn_types.insert(lifted_name.clone(), arrow_type);
 
-                let capture_symbols: Vec<Symbol> = captures.iter().map(|n| Symbol::from(n.as_str())).collect();
+                let capture_symbols: Vec<Symbol> =
+                    captures.iter().map(|n| Symbol::from(n.as_str())).collect();
 
                 self.pending_functions.push(PendingFunction {
                     name: lifted_name.clone(),
@@ -1250,7 +1279,9 @@ impl MirBuilder {
             Expr::Raise(e) => Ok(MirExpr::Raise(Box::new(
                 self.convert_expr(e, rename_map, scope)?,
             ))),
-            Expr::External(sym, _tparams, _typ) => Ok(MirExpr::Variable(Symbol::from(sym.as_str()))),
+            Expr::External(sym, _tparams, _typ) => {
+                Ok(MirExpr::Variable(Symbol::from(sym.as_str())))
+            }
             Expr::Handler { .. } => {
                 // Handler expressions collected during process_program
                 Ok(MirExpr::Literal(Literal::Unit))
@@ -1283,7 +1314,12 @@ impl MirBuilder {
 
         let mir_args: Vec<(Symbol, MirExpr)> = args
             .iter()
-            .map(|(label, e)| Ok((Symbol::from(label.as_str()), self.convert_expr(e, rename_map, scope)?)))
+            .map(|(label, e)| {
+                Ok((
+                    Symbol::from(label.as_str()),
+                    self.convert_expr(e, rename_map, scope)?,
+                ))
+            })
             .collect::<Result<_, HirBuildError>>()?;
 
         Ok(MirExpr::Call {
@@ -1296,12 +1332,19 @@ impl MirBuilder {
     fn convert_pattern(&self, pattern: &Pattern) -> MirPattern {
         match pattern {
             Pattern::Literal(lit) => MirPattern::Literal(lit.clone()),
-            Pattern::Variable(name, sigil) => MirPattern::Variable(Symbol::from(name.as_str()), sigil.clone()),
+            Pattern::Variable(name, sigil) => {
+                MirPattern::Variable(Symbol::from(name.as_str()), sigil.clone())
+            }
             Pattern::Constructor(name, fields) => MirPattern::Constructor {
                 name: Symbol::from(name.as_str()),
                 fields: fields
                     .iter()
-                    .map(|(label, p)| (label.as_ref().map(|l| Symbol::from(l.as_str())), self.convert_pattern(&p.node)))
+                    .map(|(label, p)| {
+                        (
+                            label.as_ref().map(|l| Symbol::from(l.as_str())),
+                            self.convert_pattern(&p.node),
+                        )
+                    })
                     .collect(),
             },
             Pattern::Record(fields, open) => MirPattern::Record(
@@ -1430,7 +1473,13 @@ fn collect_ast_free_vars(
     let mut referenced = Vec::new();
     let mut seen = HashSet::new();
     for stmt in body {
-        collect_ast_stmt_refs(&stmt.node, &mut defined, &mut referenced, &mut seen, known_names);
+        collect_ast_stmt_refs(
+            &stmt.node,
+            &mut defined,
+            &mut referenced,
+            &mut seen,
+            known_names,
+        );
     }
     referenced
 }
@@ -1461,7 +1510,11 @@ fn collect_ast_stmt_refs(
                 }
             }
         }
-        Stmt::Try { body, catch_param, catch_body } => {
+        Stmt::Try {
+            body,
+            catch_param,
+            catch_body,
+        } => {
             for s in body {
                 collect_ast_stmt_refs(&s.node, defined, referenced, seen, known);
             }
@@ -1530,7 +1583,11 @@ fn collect_ast_expr_refs(
         Expr::FieldAccess(expr, _) => {
             collect_ast_expr_refs(&expr.node, defined, referenced, seen, known);
         }
-        Expr::If { cond, then_branch, else_branch } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             collect_ast_expr_refs(&cond.node, defined, referenced, seen, known);
             for s in then_branch {
                 collect_ast_stmt_refs(&s.node, &mut defined.clone(), referenced, seen, known);
@@ -1557,7 +1614,12 @@ fn collect_ast_expr_refs(
                 collect_ast_stmt_refs(&s.node, &mut defined.clone(), referenced, seen, known);
             }
         }
-        Expr::For { var, start, end_expr, body } => {
+        Expr::For {
+            var,
+            start,
+            end_expr,
+            body,
+        } => {
             collect_ast_expr_refs(&start.node, defined, referenced, seen, known);
             collect_ast_expr_refs(&end_expr.node, defined, referenced, seen, known);
             let mut inner_defined = defined.clone();
@@ -1585,12 +1647,18 @@ fn collect_ast_expr_refs(
 
 fn collect_ast_pattern_defs(pattern: &Pattern, defined: &mut HashSet<String>) {
     match pattern {
-        Pattern::Variable(name, _) => { defined.insert(name.clone()); }
+        Pattern::Variable(name, _) => {
+            defined.insert(name.clone());
+        }
         Pattern::Constructor(_, fields) => {
-            for (_, pat) in fields { collect_ast_pattern_defs(&pat.node, defined); }
+            for (_, pat) in fields {
+                collect_ast_pattern_defs(&pat.node, defined);
+            }
         }
         Pattern::Record(fields, _) => {
-            for (_, pat) in fields { collect_ast_pattern_defs(&pat.node, defined); }
+            for (_, pat) in fields {
+                collect_ast_pattern_defs(&pat.node, defined);
+            }
         }
         Pattern::Wildcard | Pattern::Literal(_) => {}
     }

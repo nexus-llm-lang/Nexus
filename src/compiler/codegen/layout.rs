@@ -5,8 +5,8 @@ use crate::ir::lir::{LirAtom, LirExpr, LirExternal, LirFunction, LirProgram, Lir
 use crate::types::Type;
 
 use super::emit::peel_linear;
-use super::string::is_string_concat_operator;
 use super::error::CodegenError;
+use super::string::is_string_concat_operator;
 use super::STRING_DATA_BASE;
 
 #[derive(Debug, Clone, Copy)]
@@ -136,7 +136,9 @@ fn choose_memory_mode(
     }
 
     if let Some(module) = modules_with_string_abi.into_iter().next() {
-        return Ok(MemoryMode::Imported { module: module.to_string() });
+        return Ok(MemoryMode::Imported {
+            module: module.to_string(),
+        });
     }
 
     if has_string_literals || object_heap_enabled {

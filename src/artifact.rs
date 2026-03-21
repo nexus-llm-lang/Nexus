@@ -273,8 +273,7 @@ pub fn merge_backtrace_stubs(wasm: &[u8], wasm_merge_command: &Path) -> Result<V
         let merged_path = temp_dir.join("merged.wasm");
         fs::write(&main_path, wasm)
             .map_err(|e| format!("failed to write main wasm for bt-stub merge: {}", e))?;
-        fs::write(&stub_path, &stub)
-            .map_err(|e| format!("failed to write bt-stub wasm: {}", e))?;
+        fs::write(&stub_path, &stub).map_err(|e| format!("failed to write bt-stub wasm: {}", e))?;
 
         let output = ProcessCommand::new(wasm_merge_command)
             .arg(&main_path)
