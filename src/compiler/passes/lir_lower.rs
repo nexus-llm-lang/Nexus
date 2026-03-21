@@ -2519,6 +2519,13 @@ fn closure_convert(
         .map(|f| (f.name, f.captures.as_slice()))
         .collect();
 
+    // O(1) function lookup by name → index
+    let func_index: HashMap<Symbol, usize> = functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name, i))
+        .collect();
+
     // Collect names of functions that need wrappers (non-lambda funcref targets)
     let mut wrapper_targets: Vec<Symbol> = Vec::new();
 
@@ -2526,7 +2533,8 @@ fn closure_convert(
         let is_lambda = target.as_str().starts_with("__lambda_");
         if is_lambda {
             // Transform the lambda function in-place
-            if let Some(func) = functions.iter_mut().find(|f| f.name == target) {
+            if let Some(&idx) = func_index.get(&target) {
+                let func = &mut functions[idx];
                 if let Some(&captures) = mir_captures.get(&target) {
                     // Capturing lambda: replace capture params with __env, add ClosureEnvLoad preamble
                     let n_captures = captures.len();
@@ -2581,7 +2589,8 @@ fn closure_convert(
 
     // Generate wrapper functions for named funcref targets
     for target in wrapper_targets {
-        if let Some(original) = functions.iter().find(|f| f.name == target) {
+        if let Some(&idx) = func_index.get(&target) {
+            let original = &functions[idx];
             let wrapper_name = Symbol::from(format!("__closure_wrap_{}", target));
             let result_sym = Symbol::from("__closure_wrap_result");
 
