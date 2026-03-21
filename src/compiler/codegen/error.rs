@@ -186,14 +186,16 @@ impl std::error::Error for CompileError {}
 pub struct CompileMetrics {
     pub hir_build: std::time::Duration,
     pub lir_lower: std::time::Duration,
+    pub optimize: std::time::Duration,
     pub codegen: std::time::Duration,
 }
 
 impl std::fmt::Display for CompileMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let total = self.hir_build + self.lir_lower + self.codegen;
+        let total = self.hir_build + self.lir_lower + self.optimize + self.codegen;
         writeln!(f, "  build      {:>8.2?}", self.hir_build)?;
         writeln!(f, "  lir_lower  {:>8.2?}", self.lir_lower)?;
+        writeln!(f, "  optimize   {:>8.2?}", self.optimize)?;
         writeln!(f, "  codegen    {:>8.2?}", self.codegen)?;
         write!(f, "  total      {:>8.2?}", total)
     }

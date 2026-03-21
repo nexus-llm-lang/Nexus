@@ -476,6 +476,10 @@ fn collect_funcref_targets(program: &LirProgram) -> Vec<Symbol> {
                 for s in cond_stmts { scan_stmt(s, targets); }
                 for s in body { scan_stmt(s, targets); }
             }
+            LirStmt::Switch { cases, default_body, .. } => {
+                for c in cases { for s in &c.body { scan_stmt(s, targets); } }
+                for s in default_body { scan_stmt(s, targets); }
+            }
         }
     }
     for func in &program.functions {
@@ -517,6 +521,10 @@ fn collect_indirect_call_types(program: &LirProgram) -> Vec<Type> {
             LirStmt::Loop { cond_stmts, body, .. } => {
                 for s in cond_stmts { scan_stmt(s, types, seen); }
                 for s in body { scan_stmt(s, types, seen); }
+            }
+            LirStmt::Switch { cases, default_body, .. } => {
+                for c in cases { for s in &c.body { scan_stmt(s, types, seen); } }
+                for s in default_body { scan_stmt(s, types, seen); }
             }
         }
     }
@@ -570,6 +578,14 @@ fn program_needs_backtrace(program: &LirProgram) -> bool {
             LirStmt::Loop {
                 cond_stmts, body, ..
             } => cond_stmts.iter().any(stmt_needs_bt) || body.iter().any(stmt_needs_bt),
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                cases.iter().any(|c| c.body.iter().any(stmt_needs_bt))
+                    || default_body.iter().any(stmt_needs_bt)
+            }
         }
     }
     program

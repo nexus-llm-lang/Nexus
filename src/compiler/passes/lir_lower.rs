@@ -2465,6 +2465,10 @@ fn collect_lir_funcref_targets(functions: &[LirFunction]) -> HashSet<Symbol> {
                 for s in cond_stmts { scan_stmt(s, targets); }
                 for s in body { scan_stmt(s, targets); }
             }
+            LirStmt::Switch { cases, default_body, .. } => {
+                for c in cases { for s in &c.body { scan_stmt(s, targets); } }
+                for s in default_body { scan_stmt(s, targets); }
+            }
         }
     }
     for func in functions {
@@ -2672,6 +2676,10 @@ fn update_funcref_targets(functions: &mut [LirFunction], old_name: Symbol, new_n
             LirStmt::Loop { cond_stmts, body, .. } => {
                 for s in cond_stmts { update_stmt(s, old, new); }
                 for s in body { update_stmt(s, old, new); }
+            }
+            LirStmt::Switch { cases, default_body, .. } => {
+                for c in cases { for s in &mut c.body { update_stmt(s, old, new); } }
+                for s in default_body { update_stmt(s, old, new); }
             }
         }
     }

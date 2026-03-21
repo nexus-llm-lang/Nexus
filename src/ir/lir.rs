@@ -82,12 +82,34 @@ pub enum LirStmt {
         cond: LirAtom,
         body: Vec<LirStmt>,
     },
+    /// Tag-based multi-way branch — compiled to WASM br_table when tags form
+    /// a dense integer range, otherwise falls back to a linear if-else chain.
+    /// Produced by the LIR optimization pass from IfReturn chains.
+    Switch {
+        /// The tag atom to dispatch on (typically an ObjectTag result).
+        tag: LirAtom,
+        /// Cases with known tag values.
+        cases: Vec<SwitchCase>,
+        /// Default case body (wildcard/variable pattern or last exhaustive case).
+        default_body: Vec<LirStmt>,
+        default_ret: Option<LirAtom>,
+        /// Return type of the overall match.
+        ret_type: Type,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConcTask {
     pub func_name: Symbol,
     pub args: Vec<(Symbol, LirAtom)>,
+}
+
+/// A single case in a Switch statement (tag-based multi-way branch).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchCase {
+    pub tag_value: i64,
+    pub body: Vec<LirStmt>,
+    pub ret: Option<LirAtom>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

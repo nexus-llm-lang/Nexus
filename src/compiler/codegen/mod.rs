@@ -16,6 +16,7 @@ use wasm_encoder::{CustomSection, Module, ValType};
 
 use super::passes::hir_build::{build_hir, HirBuildError};
 use super::passes::lir_lower::{lower_mir_to_lir, LirLowerError};
+use super::passes::lir_opt::optimize_lir;
 use crate::constants::{Permission, ENTRYPOINT, NEXUS_CAPABILITIES_SECTION};
 use crate::lang::ast::Program;
 use crate::types::Type;
@@ -73,8 +74,12 @@ pub fn compile_program_to_wasm_with_metrics(
     let hir_build = t.elapsed();
 
     let t = Instant::now();
-    let lir = lower_mir_to_lir(&mir, &mir.enum_defs).map_err(CompileError::LirLower)?;
+    let mut lir = lower_mir_to_lir(&mir, &mir.enum_defs).map_err(CompileError::LirLower)?;
     let lir_lower = t.elapsed();
+
+    let t = Instant::now();
+    optimize_lir(&mut lir);
+    let optimize = t.elapsed();
 
     let t = Instant::now();
     let mut wasm = compile_lir_to_wasm(&lir).map_err(CompileError::Codegen)?;
@@ -87,6 +92,7 @@ pub fn compile_program_to_wasm_with_metrics(
     let metrics = CompileMetrics {
         hir_build,
         lir_lower,
+        optimize,
         codegen,
     };
 
