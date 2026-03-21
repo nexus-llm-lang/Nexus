@@ -55,12 +55,16 @@ pub fn run_wasm_bytes(
         return ExitCode::from(1);
     }
     if is_component_wasm(wasm) {
-        return run_component_wasm_bytes(wasm, capabilities);
+        return run_component_wasm_bytes(wasm, capabilities, guest_args);
     }
     run_core_wasm_bytes(wasm, module_dir, capabilities, guest_args)
 }
 
-fn run_component_wasm_bytes(wasm: &[u8], capabilities: &ExecutionCapabilities) -> ExitCode {
+fn run_component_wasm_bytes(
+    wasm: &[u8],
+    capabilities: &ExecutionCapabilities,
+    guest_args: &[String],
+) -> ExitCode {
     let mut config = wasmtime::Config::new();
     config.wasm_component_model(true);
     let engine = match Engine::new(&config) {
@@ -92,6 +96,11 @@ fn run_component_wasm_bytes(wasm: &[u8], capabilities: &ExecutionCapabilities) -
     }
 
     let mut builder = WasiCtxBuilder::new();
+    if !guest_args.is_empty() {
+        let mut all_args = vec!["nexus".to_string()];
+        all_args.extend(guest_args.iter().cloned());
+        builder.args(&all_args);
+    }
     if let Err(msg) = capabilities.apply_to_wasi_builder(&mut builder) {
         eprintln!("Failed to apply capability policy: {}", msg);
         return ExitCode::from(1);
