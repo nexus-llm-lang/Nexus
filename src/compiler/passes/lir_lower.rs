@@ -177,6 +177,18 @@ fn lower_mir_function(
     ))
 }
 
+/// Pre-computed per-constructor lookup data, built once from enum_defs.
+struct ConstructorInfo {
+    /// Index into enum_defs slice for the owning enum
+    enum_idx: usize,
+    /// Index into that enum's variants vec
+    variant_idx: usize,
+    /// Cached field labels: Some(label) or None (positional)
+    field_labels: Vec<Option<Symbol>>,
+    /// Cached sorted field order (def_idx → sorted_idx), None if not all-labeled or empty
+    sorted_indices: Option<Vec<usize>>,
+}
+
 /// Context for lowering a single function body
 struct LowerCtx<'a> {
     vars: HashMap<Symbol, Type>,
@@ -187,6 +199,8 @@ struct LowerCtx<'a> {
     /// Task functions lifted from conc blocks
     task_functions: Vec<LirFunction>,
     enum_defs: &'a [EnumDef],
+    /// O(1) constructor lookup index: ctor_name → ConstructorInfo
+    ctor_index: HashMap<String, ConstructorInfo>,
     source_file: Option<String>,
     source_line: Option<u32>,
 }
@@ -199,6 +213,7 @@ impl<'a> LowerCtx<'a> {
             stmts: Vec::new(),
             temp_counter: 0,
             task_functions: Vec::new(),
+            ctor_index: build_constructor_index(enum_defs),
             enum_defs,
             source_file,
             source_line,
@@ -1307,9 +1322,17 @@ impl<'a> LowerCtx<'a> {
             }
             MirPattern::Constructor { name, fields } => {
                 // Use enum definition arity for tag (not pattern field count)
-                let def_arity = lookup_constructor_field_labels(name.as_str(), self.enum_defs)
-                    .map(|labels| labels.len())
-                    .unwrap_or(fields.len());
+                // Extract cached constructor data upfront (O(1) lookup, values cloned to avoid borrow conflicts)
+                let (def_arity, field_labels, sorted_indices) =
+                    if let Some(info) = self.ctor_index.get(name.as_str()) {
+                        (
+                            info.field_labels.len(),
+                            Some(info.field_labels.clone()),
+                            info.sorted_indices.clone(),
+                        )
+                    } else {
+                        (fields.len(), None, None)
+                    };
 
                 // Tag check
                 let tag_atom = self.bind_expr_to_temp(
@@ -1342,10 +1365,7 @@ impl<'a> LowerCtx<'a> {
                     _ => target.typ(),
                 };
                 let resolved_field_types =
-                    resolve_constructor_field_types(name.as_str(), &target_sem_type, self.enum_defs);
-
-                // Compute sorted field order for labeled constructors
-                let sorted_indices = constructor_sorted_field_indices(name.as_str(), self.enum_defs);
+                    resolve_constructor_field_types(name.as_str(), &target_sem_type, &self.ctor_index, self.enum_defs);
 
                 // Field checks — use sorted index for memory layout
                 for (pat_idx, (label, field_pat)) in fields.iter().enumerate() {
@@ -1355,7 +1375,8 @@ impl<'a> LowerCtx<'a> {
                     let mem_idx = if let Some(ref si) = sorted_indices {
                         if let Some(lbl) = label {
                             // Find this label's definition index, then map to sorted index
-                            lookup_constructor_field_labels(name.as_str(), self.enum_defs)
+                            field_labels
+                                .as_ref()
                                 .and_then(|labels| {
                                     labels.iter().position(|l| l.as_ref() == Some(lbl))
                                 })
@@ -1371,7 +1392,8 @@ impl<'a> LowerCtx<'a> {
 
                     // Resolve semantic field type using definition index (not memory index)
                     let def_idx = if let Some(lbl) = label {
-                        lookup_constructor_field_labels(name.as_str(), self.enum_defs)
+                        field_labels
+                            .as_ref()
                             .and_then(|labels| {
                                 labels.iter().position(|l| l.as_ref() == Some(lbl))
                             })
@@ -1520,13 +1542,14 @@ impl<'a> LowerCtx<'a> {
             }
             MirPattern::Constructor { name, fields } => {
                 // Look up constructor's enum definition to resolve field types
-                let field_types = resolve_constructor_field_types(name.as_str(), sem_type, self.enum_defs);
+                let field_types = resolve_constructor_field_types(name.as_str(), sem_type, &self.ctor_index, self.enum_defs);
+                let ctor_info = self.ctor_index.get(name.as_str());
                 for (pat_idx, (label, field_pat)) in fields.iter().enumerate() {
                     // Resolve definition index for this field (label-aware)
                     let def_idx = if let Some(lbl) = label {
-                        lookup_constructor_field_labels(name.as_str(), self.enum_defs)
-                            .and_then(|labels| {
-                                labels.iter().position(|l| l.as_ref() == Some(lbl))
+                        ctor_info
+                            .and_then(|info| {
+                                info.field_labels.iter().position(|l| l.as_ref() == Some(lbl))
                             })
                             .unwrap_or(pat_idx)
                     } else {
@@ -1638,8 +1661,8 @@ impl<'a> LowerCtx<'a> {
                 }
 
                 // 2. Fill in missing labels from enum definition (positional → labeled)
-                let def_labels = lookup_constructor_field_labels(name.as_str(), self.enum_defs);
-                if let Some(ref labels) = def_labels {
+                let def_labels = self.ctor_index.get(name.as_str()).map(|info| &info.field_labels);
+                if let Some(labels) = def_labels {
                     for (i, (label, _)) in labeled_args.iter_mut().enumerate() {
                         if label.is_none() {
                             if let Some(def_label) = labels.get(i) {
@@ -2287,6 +2310,53 @@ fn collect_mir_pattern_defs(pattern: &MirPattern, seen: &mut HashSet<Symbol>) {
     }
 }
 
+/// Build a HashMap from constructor name → ConstructorInfo for O(1) lookups.
+/// Later entries in enum_defs shadow earlier ones (user defs over stdlib).
+fn build_constructor_index(enum_defs: &[EnumDef]) -> HashMap<String, ConstructorInfo> {
+    let mut index = HashMap::new();
+    // Forward iteration: later defs overwrite earlier ones (same as rfind semantics)
+    for (enum_idx, def) in enum_defs.iter().enumerate() {
+        for (variant_idx, variant) in def.variants.iter().enumerate() {
+            let field_labels: Vec<Option<Symbol>> = variant
+                .fields
+                .iter()
+                .map(|(label, _)| label.as_ref().map(|l| Symbol::from(l.as_str())))
+                .collect();
+
+            let sorted_indices = {
+                let all_labeled = variant.fields.iter().all(|(l, _)| l.is_some());
+                if !all_labeled || variant.fields.is_empty() {
+                    None
+                } else {
+                    let mut labeled: Vec<(usize, &str)> = variant
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (l, _))| (i, l.as_ref().unwrap().as_str()))
+                        .collect();
+                    labeled.sort_by(|a, b| a.1.cmp(b.1));
+                    let mut mapping = vec![0usize; labeled.len()];
+                    for (sorted_idx, (def_idx, _)) in labeled.iter().enumerate() {
+                        mapping[*def_idx] = sorted_idx;
+                    }
+                    Some(mapping)
+                }
+            };
+
+            index.insert(
+                variant.name.clone(),
+                ConstructorInfo {
+                    enum_idx,
+                    variant_idx,
+                    field_labels,
+                    sorted_indices,
+                },
+            );
+        }
+    }
+    index
+}
+
 /// Resolve the concrete field types for a constructor variant, applying type parameter
 /// substitution from the matched enum type.
 ///
@@ -2295,6 +2365,7 @@ fn collect_mir_pattern_defs(pattern: &MirPattern, seen: &mut HashSet<Symbol>) {
 fn resolve_constructor_field_types(
     ctor_name: &str,
     matched_type: &Type,
+    ctor_index: &HashMap<String, ConstructorInfo>,
     enum_defs: &[EnumDef],
 ) -> Option<Vec<Type>> {
     // Extract the enum name and type arguments from the matched type
@@ -2304,11 +2375,15 @@ fn resolve_constructor_field_types(
         _ => return None,
     };
 
-    // Find the enum definition (search from end so user defs shadow stdlib)
-    let enum_def = enum_defs.iter().rfind(|e| e.name == enum_name)?;
+    let info = ctor_index.get(ctor_name)?;
+    let enum_def = &enum_defs[info.enum_idx];
 
-    // Find the variant
-    let variant = enum_def.variants.iter().find(|v| v.name == ctor_name)?;
+    // Verify this constructor belongs to the expected enum
+    if enum_def.name != enum_name {
+        return None;
+    }
+
+    let variant = &enum_def.variants[info.variant_idx];
 
     // Build substitution map: type_param → concrete_type
     let subst: HashMap<String, Type> = enum_def
@@ -2371,62 +2446,6 @@ fn apply_type_subst(typ: &Type, subst: &HashMap<String, Type>) -> Type {
         // Primitive types (I32, I64, F32, F64, Bool, String, Unit, etc.): no substitution
         _ => typ.clone(),
     }
-}
-
-/// Look up constructor field labels from enum definitions.
-/// Returns `Some(vec![...])` where each entry is `Some(label)` or `None` (positional).
-/// Returns `None` if the constructor is not found in any enum def.
-fn lookup_constructor_field_labels(
-    ctor_name: &str,
-    enum_defs: &[EnumDef],
-) -> Option<Vec<Option<Symbol>>> {
-    for def in enum_defs.iter().rev() {
-        for variant in &def.variants {
-            if variant.name == ctor_name {
-                return Some(
-                    variant
-                        .fields
-                        .iter()
-                        .map(|(label, _)| label.as_ref().map(|l| Symbol::from(l.as_str())))
-                        .collect(),
-                );
-            }
-        }
-    }
-    None
-}
-
-/// Look up the sorted field order for a constructor from enum definitions.
-/// Returns a mapping from definition-order index to sorted-order index.
-/// Only applies when all fields have labels.
-fn constructor_sorted_field_indices(
-    ctor_name: &str,
-    enum_defs: &[EnumDef],
-) -> Option<Vec<usize>> {
-    for def in enum_defs.iter().rev() {
-        for variant in &def.variants {
-            if variant.name == ctor_name {
-                let all_labeled = variant.fields.iter().all(|(l, _)| l.is_some());
-                if !all_labeled || variant.fields.is_empty() {
-                    return None;
-                }
-                let mut labeled: Vec<(usize, &str)> = variant
-                    .fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (l, _))| (i, l.as_ref().unwrap().as_str()))
-                    .collect();
-                labeled.sort_by(|a, b| a.1.cmp(b.1));
-                // Build def_idx → sorted_idx mapping
-                let mut mapping = vec![0usize; labeled.len()];
-                for (sorted_idx, (def_idx, _)) in labeled.iter().enumerate() {
-                    mapping[*def_idx] = sorted_idx;
-                }
-                return Some(mapping);
-            }
-        }
-    }
-    None
 }
 
 // ────────────────────────────────────────────────────────────────
