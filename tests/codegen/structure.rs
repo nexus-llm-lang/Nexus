@@ -331,3 +331,100 @@ fn stdlib_wasm_modules_are_wasi_only_or_self_contained() {
 
     assert!(checked > 0, "at least one stdlib wasm should be checked");
 }
+
+/// Regression test for nexus-7nm: duplicate external declarations across modules
+/// that point to the same WASM function should produce a single WASM import.
+#[test]
+fn codegen_deduplicates_externals_by_wasm_identity() {
+    use nexus::compiler::codegen::compile_lir_to_wasm;
+    use nexus::intern::Symbol;
+    use nexus::ir::lir::{
+        LirAtom, LirExpr, LirExternal, LirFunction, LirParam, LirProgram, LirStmt,
+    };
+    use nexus::types::Type;
+
+    let wasm_mod = Symbol::from("stdlib/stdlib.wasm");
+    let wasm_name = Symbol::from("__nx_string_to_i64");
+    let s_label = Symbol::from("s");
+
+    // Two externals with different Nexus names but same (wasm_module, wasm_name)
+    let ext_a = LirExternal {
+        name: Symbol::from("mod_a.to_i64"),
+        wasm_module: wasm_mod,
+        wasm_name,
+        params: vec![LirParam {
+            label: s_label,
+            name: s_label,
+            typ: Type::String,
+        }],
+        ret_type: Type::I64,
+        throws: Type::Unit,
+    };
+    let ext_b = LirExternal {
+        name: Symbol::from("mod_b.to_i64"),
+        wasm_module: wasm_mod,
+        wasm_name,
+        params: vec![LirParam {
+            label: s_label,
+            name: s_label,
+            typ: Type::String,
+        }],
+        ret_type: Type::I64,
+        throws: Type::Unit,
+    };
+
+    let main_fn = LirFunction {
+        name: Symbol::from("main"),
+        params: vec![],
+        ret_type: Type::Unit,
+        requires: Type::Unit,
+        throws: Type::Unit,
+        body: vec![
+            LirStmt::Let {
+                name: Symbol::from("x"),
+                typ: Type::I64,
+                expr: LirExpr::Call {
+                    func: Symbol::from("mod_a.to_i64"),
+                    args: vec![(s_label, LirAtom::String("42".into()))],
+                    typ: Type::I64,
+                },
+            },
+            LirStmt::Let {
+                name: Symbol::from("y"),
+                typ: Type::I64,
+                expr: LirExpr::Call {
+                    func: Symbol::from("mod_b.to_i64"),
+                    args: vec![(s_label, LirAtom::String("99".into()))],
+                    typ: Type::I64,
+                },
+            },
+        ],
+        ret: LirAtom::Unit,
+        span: 0..0,
+        source_file: None,
+        source_line: None,
+    };
+
+    let program = LirProgram {
+        functions: vec![main_fn],
+        externals: vec![ext_a, ext_b],
+    };
+
+    let wasm = compile_lir_to_wasm(&program).expect("should compile without E2010");
+
+    // Count WASM imports for __nx_string_to_i64
+    let mut import_count = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+            for import in reader.into_iter().flatten() {
+                if import.name == "__nx_string_to_i64" {
+                    import_count += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        import_count, 1,
+        "duplicate externals should produce exactly one WASM import"
+    );
+}
