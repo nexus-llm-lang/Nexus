@@ -311,6 +311,22 @@ impl MirBuilder {
         Type::I64
     }
 
+    /// Register an exception definition as a variant in the Exn enum within enum_defs.
+    /// This ensures that the LIR lowerer can look up field labels for exception constructors,
+    /// which is needed for correct sorted field layout in pattern matching.
+    fn register_exception_in_enum_defs(&mut self, ex: &ExceptionDef) {
+        let variant = VariantDef {
+            name: ex.name.clone(),
+            fields: ex.fields.clone(),
+        };
+        // Find the Exn enum and add this variant (if not already present)
+        if let Some(exn_def) = self.enum_defs.iter_mut().find(|d| d.name == "Exn") {
+            if !exn_def.variants.iter().any(|v| v.name == ex.name) {
+                exn_def.variants.push(variant);
+            }
+        }
+    }
+
     fn load_stdlib(&mut self) -> Result<(), HirBuildError> {
         // Seed with builtin enum defs (List, Exn)
         use crate::lang::typecheck::{exn_enum_def, list_enum_def};
@@ -328,7 +344,9 @@ impl MirBuilder {
                         TopLevel::Enum(ed) => {
                             self.enum_defs.push(ed.clone());
                         }
-                        TopLevel::Exception(_) => {}
+                        TopLevel::Exception(ex) => {
+                            self.register_exception_in_enum_defs(ex);
+                        }
                         TopLevel::Let(gl) if gl.is_public => {
                             if let Expr::External(wasm_name, _type_params, typ) = &gl.value.node {
                                 if let Type::Arrow(params, ret, _requires, throws) = typ {
@@ -385,7 +403,9 @@ impl MirBuilder {
                 TopLevel::Enum(ed) => {
                     self.enum_defs.push(ed.clone());
                 }
-                TopLevel::Exception(_) => {}
+                TopLevel::Exception(ex) => {
+                    self.register_exception_in_enum_defs(ex);
+                }
                 TopLevel::Port(port) => {
                     let port_name = self.rename(&port.name, rename_map);
                     let methods: Vec<String> =
