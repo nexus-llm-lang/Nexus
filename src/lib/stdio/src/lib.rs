@@ -24,6 +24,17 @@ pub extern "C" fn __nx_print(ptr: i32, len: i32) {
 }
 
 #[no_mangle]
+pub extern "C" fn __nx_eprint(ptr: i32, len: i32) {
+    let Some((offset, len)) = nexus_wasm_alloc::checked_ptr_len(ptr, len) else {
+        return;
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(offset as *const u8, len) };
+    let mut out = io::stderr();
+    let _ = out.write_all(bytes);
+    let _ = out.flush();
+}
+
+#[no_mangle]
 pub extern "C" fn __nx_read_line() -> i64 {
     let stdin = io::stdin();
     let mut line = String::new();
