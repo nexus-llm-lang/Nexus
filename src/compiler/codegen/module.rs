@@ -9,7 +9,7 @@ use wasm_encoder::{
 
 use crate::constants::{ENTRYPOINT, MEMORY_EXPORT, WASI_CLI_RUN_EXPORT};
 use crate::intern::Symbol;
-use crate::ir::lir::{LirExpr, LirProgram, LirStmt};
+use crate::ir::lir::{LirExpr, LirExternal, LirProgram, LirStmt};
 use crate::types::Type;
 
 use super::emit::{
@@ -45,8 +45,26 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
     };
     let n_alloc_imports: u32 = if stdlib_alloc_module.is_some() { 1 } else { 0 };
 
-    let import_count =
-        program.externals.len() as u32 + n_conc_imports + n_bt_imports + n_alloc_imports;
+    // Deduplicate externals by (wasm_module, wasm_name) — multiple Nexus names
+    // pointing to the same underlying WASM function share a single WASM import.
+    let mut wasm_import_dedup: HashMap<(Symbol, Symbol), u32> = HashMap::new();
+    let mut deduped_externals: Vec<&LirExternal> = Vec::new();
+    let mut external_function_indices = HashMap::new();
+    for ext in &program.externals {
+        let key = (ext.wasm_module, ext.wasm_name);
+        if let Some(&idx) = wasm_import_dedup.get(&key) {
+            // Reuse existing import index for this Nexus name
+            external_function_indices.insert(ext.name, idx);
+        } else {
+            let idx = deduped_externals.len() as u32;
+            wasm_import_dedup.insert(key, idx);
+            deduped_externals.push(ext);
+            external_function_indices.insert(ext.name, idx);
+        }
+    }
+    let deduped_ext_count = deduped_externals.len() as u32;
+
+    let import_count = deduped_ext_count + n_conc_imports + n_bt_imports + n_alloc_imports;
 
     let mut internal_function_indices = HashMap::new();
     for (idx, func) in program.functions.iter().enumerate() {
@@ -64,19 +82,9 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         .find(|func| func.name == ENTRYPOINT)
         .ok_or_else(|| CodegenError::MissingMain)?;
 
-    let mut external_function_indices = HashMap::new();
-    for (idx, ext) in program.externals.iter().enumerate() {
-        external_function_indices.insert(ext.name.clone(), idx as u32);
-    }
     if has_conc {
-        external_function_indices.insert(
-            Symbol::from(CONC_SPAWN_NAME),
-            program.externals.len() as u32,
-        );
-        external_function_indices.insert(
-            Symbol::from(CONC_JOIN_NAME),
-            program.externals.len() as u32 + 1,
-        );
+        external_function_indices.insert(Symbol::from(CONC_SPAWN_NAME), deduped_ext_count);
+        external_function_indices.insert(Symbol::from(CONC_JOIN_NAME), deduped_ext_count + 1);
     }
 
     // Collect funcref targets and indirect call types
@@ -86,17 +94,17 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
 
     let mut layout = build_codegen_layout(program)?;
     if has_conc {
-        layout.conc_spawn_idx = Some(program.externals.len() as u32);
-        layout.conc_join_idx = Some(program.externals.len() as u32 + 1);
+        layout.conc_spawn_idx = Some(deduped_ext_count);
+        layout.conc_join_idx = Some(deduped_ext_count + 1);
     }
     if has_bt {
-        let base = program.externals.len() as u32 + n_conc_imports;
+        let base = deduped_ext_count + n_conc_imports;
         layout.bt_push_idx = Some(base);
         layout.bt_pop_idx = Some(base + 1);
         layout.bt_freeze_idx = Some(base + 2);
     }
     if stdlib_alloc_module.is_some() {
-        let alloc_idx = program.externals.len() as u32 + n_conc_imports + n_bt_imports;
+        let alloc_idx = deduped_ext_count + n_conc_imports + n_bt_imports;
         layout.allocate_func_idx = Some(alloc_idx);
     }
 
@@ -117,8 +125,8 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
     // Track signature→type_index for deduplication
     let mut sig_to_type_idx: HashMap<String, u32> = HashMap::new();
 
-    let mut external_type_indices = Vec::with_capacity(program.externals.len());
-    for ext in &program.externals {
+    let mut external_type_indices = Vec::with_capacity(deduped_externals.len());
+    for ext in &deduped_externals {
         let params = external_param_types(ext)?;
         let results = external_return_types(ext)?;
         let key = sig_key(&params, &results);
@@ -220,7 +228,7 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         );
         has_imports = true;
     }
-    for (ext, type_idx) in program.externals.iter().zip(external_type_indices.iter()) {
+    for (ext, type_idx) in deduped_externals.iter().zip(external_type_indices.iter()) {
         imports.import(
             ext.wasm_module.as_str(),
             ext.wasm_name.as_str(),
