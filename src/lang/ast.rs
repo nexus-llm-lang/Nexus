@@ -144,10 +144,16 @@ pub struct ExceptionDef {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ImportItem {
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Import {
     pub path: String,
     pub alias: Option<String>,
-    pub items: Vec<String>,
+    pub items: Vec<ImportItem>,
     pub is_external: bool,
 }
 

@@ -1,5 +1,5 @@
 use crate::harness::{should_fail_parse, should_typecheck};
-use nexus::lang::ast::{Expr, Type};
+use nexus::lang::ast::{Expr, TopLevel, Type};
 use nexus::lang::parser;
 use std::fs;
 
@@ -111,4 +111,31 @@ fn parse_list_expr_is_builtin() {
         found_list_expr,
         "Parser should produce Expr::List for [1,2,3] syntax"
     );
+}
+
+#[test]
+fn parse_import_as_alias() {
+    let src = r#"
+    import { foo as bar, baz } from examples/math.nx
+    let main = fn () -> unit do
+        return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let import = program
+        .definitions
+        .iter()
+        .find_map(|def| {
+            if let TopLevel::Import(imp) = &def.node {
+                Some(imp)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(import.items.len(), 2);
+    assert_eq!(import.items[0].name, "foo");
+    assert_eq!(import.items[0].alias.as_deref(), Some("bar"));
+    assert_eq!(import.items[1].name, "baz");
+    assert_eq!(import.items[1].alias, None);
 }
