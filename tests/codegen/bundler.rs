@@ -3,7 +3,7 @@ use crate::harness::compile;
 #[test]
 fn bundle_core_wasm_resolves_stdlib_imports() {
     let src = r#"
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do
@@ -28,7 +28,7 @@ end
 #[test]
 fn bundle_core_wasm_resolves_conc_plus_stdlib() {
     let src = r#"
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 let work = fn () -> i64 do
   return 42

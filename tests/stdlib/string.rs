@@ -4,7 +4,7 @@ use crate::harness::exec_with_stdlib;
 fn string_repeat_basic() {
     exec_with_stdlib(
         r#"
-import { repeat, length } from stdlib/string.nx
+import { repeat, length } from "stdlib/string.nx"
 
 let main = fn () -> unit do
   let result = repeat(s: "ab", n: 3)
@@ -19,7 +19,7 @@ end
 fn string_pad_left_basic() {
     exec_with_stdlib(
         r#"
-import { pad_left, length } from stdlib/string.nx
+import { pad_left, length } from "stdlib/string.nx"
 
 let main = fn () -> unit do
   let result = pad_left(s: "42", width: 5, fill: "0")
@@ -34,7 +34,7 @@ end
 fn string_pad_right_basic() {
     exec_with_stdlib(
         r#"
-import { pad_right, length } from stdlib/string.nx
+import { pad_right, length } from "stdlib/string.nx"
 
 let main = fn () -> unit do
   let result = pad_right(s: "hi", width: 5, fill: ".")
@@ -49,7 +49,7 @@ end
 fn string_concat_basic() {
     exec_with_stdlib(
         r#"
-import { concat, length } from stdlib/string.nx
+import { concat, length } from "stdlib/string.nx"
 
 let main = fn () -> unit do
   let result = concat(a: "hello", b: " world")
@@ -64,8 +64,8 @@ end
 fn string_parse_i64_valid() {
     exec_with_stdlib(
         r#"
-import { parse_i64 } from stdlib/string.nx
-import { Option, unwrap_or } from stdlib/option.nx
+import { parse_i64 } from "stdlib/string.nx"
+import { Option, unwrap_or } from "stdlib/option.nx"
 
 let main = fn () -> unit do
   let result = unwrap_or(opt: parse_i64(s: "42"), default: 0)
@@ -80,8 +80,8 @@ end
 fn string_parse_i64_invalid() {
     exec_with_stdlib(
         r#"
-import { parse_i64 } from stdlib/string.nx
-import { Option, is_none } from stdlib/option.nx
+import { parse_i64 } from "stdlib/string.nx"
+import { Option, is_none } from "stdlib/option.nx"
 
 let main = fn () -> unit do
   let result = is_none(opt: parse_i64(s: "not_a_number"))
@@ -96,7 +96,7 @@ end
 fn test_to_string_runtime_error() {
     exec_with_stdlib(
         r#"
-import { to_string } from stdlib/exn.nx
+import { to_string } from "stdlib/exn.nx"
 
 let main = fn () -> unit do
   let e: Exn = RuntimeError(val: "boom")
@@ -112,7 +112,7 @@ end
 fn test_to_string_invalid_index() {
     exec_with_stdlib(
         r#"
-import { to_string } from stdlib/exn.nx
+import { to_string } from "stdlib/exn.nx"
 
 let main = fn () -> unit do
   let e: Exn = InvalidIndex(val: 42)
@@ -128,8 +128,8 @@ end
 fn test_backtrace_captures_call_stack() {
     exec_with_stdlib(
         r#"
-import { backtrace } from stdlib/exn.nx
-import { Console }, * as stdio from stdlib/stdio.nx
+import { backtrace } from "stdlib/exn.nx"
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do
@@ -166,7 +166,7 @@ proptest! {
     #[test]
     fn prop_string_length_concat(s1 in "[a-zA-Z0-9]{0,20}", s2 in "[a-zA-Z0-9]{0,20}") {
         let src = format!("
-import {{ length }} from stdlib/string.nx
+import {{ length }} from \"stdlib/string.nx\"
 let main = fn () -> unit do
     let s1 = [=[{}]=]
     let s2 = [=[{}]=]
@@ -185,7 +185,7 @@ end
 fn console_read_line_requires_perm_console() {
     let err = crate::harness::should_fail_typecheck(
         r#"
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 let main = fn () -> unit do
   inject stdio.system_handler do
@@ -202,7 +202,7 @@ end
 fn console_read_line_typechecks_with_perm_console() {
     crate::harness::should_typecheck(
         r#"
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do
@@ -218,7 +218,7 @@ end
 fn console_getchar_with_mock_handler() {
     exec_with_stdlib(
         r#"
-import { Console } from stdlib/stdio.nx
+import { Console } from "stdlib/stdio.nx"
 
 let mock_console = handler Console do
   fn print(val: string) -> unit do
@@ -250,7 +250,7 @@ end
 fn console_read_line_with_mock_handler() {
     exec_with_stdlib(
         r#"
-import { Console } from stdlib/stdio.nx
+import { Console } from "stdlib/stdio.nx"
 
 let mock_console = handler Console do
   fn print(val: string) -> unit do

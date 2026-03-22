@@ -191,7 +191,7 @@ fn test_cons_operator_typechecks() {
 fn partition_type_in_list_module() {
     exec(
         r#"
-import { Partition } from stdlib/list.nx
+import { Partition } from "stdlib/list.nx"
 
 let main = fn () -> unit do
   let p = Partition(matched: Cons(v: 1, rest: Nil), rest: Nil)

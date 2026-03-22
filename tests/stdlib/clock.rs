@@ -5,7 +5,7 @@ use nexus::runtime::ExecutionCapabilities;
 fn clock_now_returns_positive_value() {
     exec_with_stdlib(
         r#"
-import { Clock }, * as clk from stdlib/clock.nx
+import { Clock }, * as clk from "stdlib/clock.nx"
 
 let main = fn () -> unit require { PermClock } do
   inject clk.system_handler do
@@ -22,7 +22,7 @@ end
 fn clock_sleep_does_not_crash() {
     exec_with_stdlib(
         r#"
-import { Clock }, * as clk from stdlib/clock.nx
+import { Clock }, * as clk from "stdlib/clock.nx"
 
 let main = fn () -> unit require { PermClock } do
   inject clk.system_handler do
@@ -43,7 +43,7 @@ fn clock_denied_at_wasi_level_without_allow_clock() {
     };
     let err = exec_with_stdlib_caps_should_trap(
         r#"
-import { Clock }, * as clk from stdlib/clock.nx
+import { Clock }, * as clk from "stdlib/clock.nx"
 
 let main = fn () -> unit require { PermClock } do
   inject clk.system_handler do
@@ -67,7 +67,7 @@ end
 fn clock_requires_perm_clock() {
     let err = should_fail_typecheck(
         r#"
-import { Clock }, * as clk from stdlib/clock.nx
+import { Clock }, * as clk from "stdlib/clock.nx"
 
 let main = fn () -> i64 do
   inject clk.system_handler do

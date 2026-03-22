@@ -1849,42 +1849,17 @@ impl Parser {
     }
 
     fn parse_import_path(&mut self) -> Result<String, ParseError> {
-        // Import path is a sequence of idents, /, and . characters
-        // e.g. nxlib/stdlib/stdio.nx, math.wasm
-        // We collect from the token stream — paths consist of Ident, Slash, Dot tokens
-        let mut path = String::new();
-        loop {
-            match self.peek().clone() {
-                TokenKind::Ident(ref s) => {
-                    path.push_str(s);
-                    self.advance();
-                }
-                TokenKind::Slash => {
-                    path.push('/');
-                    self.advance();
-                }
-                TokenKind::Dot => {
-                    path.push('.');
-                    self.advance();
-                }
-                TokenKind::Minus => {
-                    path.push('-');
-                    self.advance();
-                }
-                TokenKind::Colon => {
-                    path.push(':');
-                    self.advance();
-                }
-                _ => break,
+        // Import path must be a quoted string, e.g. "stdlib/stdio.nx"
+        match self.peek().clone() {
+            TokenKind::StringLit(s) => {
+                self.advance();
+                Ok(s)
             }
-        }
-        if path.is_empty() {
-            return Err(ParseError {
-                message: "expected import path".to_string(),
+            _ => Err(ParseError {
+                message: "expected quoted import path (e.g. \"stdlib/foo.nx\")".to_string(),
                 span: self.peek_span(),
-            });
+            }),
         }
-        Ok(path)
     }
 
     fn parse_port_def(&mut self, is_public: bool) -> Result<TopLevel, ParseError> {

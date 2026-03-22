@@ -7,7 +7,7 @@ use std::fs;
 #[test]
 fn test_import_external_syntax() {
     let src = r#"
-    import external math.wasm
+    import external "math.wasm"
     export external add = "add" : (a: i64, b: i64) -> i64
     let main = fn () -> unit do return () end
     "#;
@@ -91,7 +91,7 @@ fn all_examples_typecheck() {
 fn test_import_as_alias_typecheck() {
     should_typecheck(
         r#"
-    import { add as plus } from examples/math.nx
+    import { add as plus } from "examples/math.nx"
     let main = fn () -> unit do
         let _ = plus(a: 1, b: 2)
         return ()
@@ -103,7 +103,7 @@ fn test_import_as_alias_typecheck() {
 #[test]
 fn test_import_as_alias_original_name_not_visible() {
     let src = r#"
-    import { add as plus } from examples/math.nx
+    import { add as plus } from "examples/math.nx"
     let main = fn () -> unit do
         let _ = add(a: 1, b: 2)
         return ()

@@ -28,7 +28,7 @@ fn parse_empty_fn_body_is_error() {
 fn parse_pub_import_syntax_is_rejected() {
     should_fail_parse(
         r#"
-    pub import from examples/math.nx
+    pub import from "examples/math.nx"
     let main = fn () -> i64 do
       return 0
     end
@@ -116,7 +116,7 @@ fn parse_list_expr_is_builtin() {
 #[test]
 fn parse_import_as_alias() {
     let src = r#"
-    import { foo as bar, baz } from examples/math.nx
+    import { foo as bar, baz } from "examples/math.nx"
     let main = fn () -> unit do
         return ()
     end

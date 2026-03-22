@@ -4,7 +4,7 @@ use crate::harness::{should_fail_typecheck, should_typecheck};
 fn test_ffi_declaration() {
     should_typecheck(
         r#"
-    import external math.wasm
+    import external "math.wasm"
     export external add_i64 = "add" : (a: i64, b: i64) -> i64
 
     let main = fn () -> unit do
@@ -19,7 +19,7 @@ fn test_ffi_declaration() {
 fn test_ffi_effectful() {
     should_typecheck(
         r#"
-    import external time.wasm
+    import external "time.wasm"
     type IO = {}
     export external get_time = "get_time" : () -> float throws { IO }
 
@@ -51,7 +51,7 @@ fn test_ffi_mismatch() {
 fn test_ffi_explicit_type_params() {
     should_typecheck(
         r#"
-    import external core.wasm
+    import external "core.wasm"
     export external array_len = "array_length" : <T>(arr: &[| T |]) -> i64
 
     let main = fn () -> unit do

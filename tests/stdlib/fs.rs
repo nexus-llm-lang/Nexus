@@ -6,7 +6,7 @@ fn fs_create_dir_and_exists_work() {
     let dir = tmp.path();
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from "stdlib/fs.nx"
 
 let main = fn () -> unit require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -32,8 +32,8 @@ fn fs_append_and_read_roundtrip() {
     let file = format!("{}/note.txt", dir);
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from stdlib/fs.nx
-import {{ length, contains }} from stdlib/string.nx
+import {{ Fs }}, * as fs_mod from "stdlib/fs.nx"
+import {{ length, contains }} from "stdlib/string.nx"
 
 let main = fn () -> unit require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -64,7 +64,7 @@ fn fs_remove_file_updates_exists() {
     let file = format!("{}/trash.txt", dir);
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from "stdlib/fs.nx"
 
 let main = fn () -> unit require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -92,7 +92,7 @@ fn fs_linear_file_requires_close() {
     let file = format!("{}/x.txt", dir);
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from "stdlib/fs.nx"
 
 let main = fn () -> unit require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -123,7 +123,7 @@ fn fs_linear_file_double_close_is_rejected() {
     let file = format!("{}/x.txt", dir);
     let src = format!(
         r#"
-import {{ Fs }}, * as fs_mod from stdlib/fs.nx
+import {{ Fs }}, * as fs_mod from "stdlib/fs.nx"
 
 let main = fn () -> unit require {{ PermFs }} do
   inject fs_mod.system_handler do
@@ -153,7 +153,7 @@ end
 fn fs_read_requires_fs_coeffect() {
     let err = should_fail_typecheck(
         r#"
-import { Fs } from stdlib/fs.nx
+import { Fs } from "stdlib/fs.nx"
 
 let main = fn () -> bool do
   let ok = Fs.exists(path: "/tmp")

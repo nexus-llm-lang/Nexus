@@ -46,7 +46,7 @@ fn test_net_request_method_and_headers_runtime() {
     // Converted to a typecheck-only test to verify the source is well-typed.
     should_typecheck(
         r#"
-    import { Net, header, response_body }, * as net_mod from stdlib/net.nx
+    import { Net, header, response_body }, * as net_mod from "stdlib/net.nx"
 
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
@@ -71,7 +71,7 @@ fn test_net_request_https_url_is_accepted() {
     // Converted to a typecheck-only test.
     should_typecheck(
         r#"
-    import { Net, response_body }, * as net_mod from stdlib/net.nx
+    import { Net, response_body }, * as net_mod from "stdlib/net.nx"
 
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
@@ -95,8 +95,8 @@ fn test_net_request_response_status_and_body_with_request_body() {
     // Converted to a typecheck-only test.
     should_typecheck(
         r#"
-    import { Net, header, response_status, response_body }, * as net_mod from stdlib/net.nx
-    import { from_i64 } from stdlib/string.nx
+    import { Net, header, response_status, response_body }, * as net_mod from "stdlib/net.nx"
+    import { from_i64 } from "stdlib/string.nx"
 
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
@@ -140,7 +140,7 @@ end
 #[test]
 fn codegen_conc_fs_writes_in_parallel() {
     let src = r#"
-import { Fs }, * as fs_mod from stdlib/fs.nx
+import { Fs }, * as fs_mod from "stdlib/fs.nx"
 
 let main = fn () -> unit require { PermFs } do
     inject fs_mod.system_handler do

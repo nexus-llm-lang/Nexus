@@ -42,7 +42,7 @@ end
 fn codegen_negate_function() {
     exec(
         r#"
-import { negate } from stdlib/core.nx
+import { negate } from "stdlib/core.nx"
 
 let main = fn () -> unit do
     let t = negate(val: true)
@@ -62,8 +62,8 @@ end
 fn codegen_f64_literal_and_arithmetic() {
     exec_with_stdlib(
         r#"
-import { abs_float } from stdlib/math.nx
-import { from_float } from stdlib/string.nx
+import { abs_float } from "stdlib/math.nx"
+import { from_float } from "stdlib/string.nx"
 
 let check_f64 = fn (actual: f64, expected: f64, label: string) -> unit throws { Exn } do
   let diff = actual -. expected
