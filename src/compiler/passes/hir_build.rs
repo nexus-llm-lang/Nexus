@@ -434,7 +434,10 @@ impl MirBuilder {
                                 let proc_import = Import {
                                     path: "stdlib/proc.nx".to_string(),
                                     alias: None,
-                                    items: vec!["argv".to_string()],
+                                    items: vec![ImportItem {
+                                        name: "argv".to_string(),
+                                        alias: None,
+                                    }],
                                     is_external: false,
                                 };
                                 self.process_import(&proc_import, &def.span)?;
@@ -662,17 +665,18 @@ impl MirBuilder {
         }
 
         for item in &import.items {
-            if !cache.public_names.contains(item) {
+            if !cache.public_names.contains(&item.name) {
                 return Err(HirBuildError::ImportItemNotFound {
-                    item: item.clone(),
+                    item: item.name.clone(),
                     path: import.path.clone(),
                     span: import_span.clone(),
                 });
             }
-            if let Some(registered_name) = cache.name_map.get(item) {
-                if registered_name != item {
-                    self.create_function_alias(item, registered_name);
-                    self.create_external_alias(item, registered_name);
+            let visible = item.alias.as_ref().unwrap_or(&item.name);
+            if let Some(registered_name) = cache.name_map.get(&item.name) {
+                if registered_name != visible {
+                    self.create_function_alias(visible, registered_name);
+                    self.create_external_alias(visible, registered_name);
                 }
             }
         }
@@ -754,21 +758,29 @@ impl MirBuilder {
             return Ok(map);
         }
 
-        let selected: HashSet<String> = import.items.iter().cloned().collect();
+        // Map original_name → visible_name (alias if provided, else original)
+        let selected: HashMap<String, String> = import
+            .items
+            .iter()
+            .map(|item| {
+                let visible = item.alias.clone().unwrap_or_else(|| item.name.clone());
+                (item.name.clone(), visible)
+            })
+            .collect();
         for item in &import.items {
             let found = program.definitions.iter().any(|def| match &def.node {
-                TopLevel::Let(gl) if gl.is_public && gl.name == *item => true,
-                TopLevel::Port(port) if port.is_public && port.name == *item => true,
+                TopLevel::Let(gl) if gl.is_public && gl.name == item.name => true,
+                TopLevel::Port(port) if port.is_public && port.name == item.name => true,
                 TopLevel::Enum(ed) if ed.is_public => {
-                    ed.name == *item || ed.variants.iter().any(|v| v.name == *item)
+                    ed.name == item.name || ed.variants.iter().any(|v| v.name == item.name)
                 }
-                TopLevel::TypeDef(td) if td.is_public && td.name == *item => true,
-                TopLevel::Exception(ex) if ex.is_public && ex.name == *item => true,
+                TopLevel::TypeDef(td) if td.is_public && td.name == item.name => true,
+                TopLevel::Exception(ex) if ex.is_public && ex.name == item.name => true,
                 _ => false,
             });
             if !found {
                 return Err(HirBuildError::ImportItemNotFound {
-                    item: item.clone(),
+                    item: item.name.clone(),
                     path: import.path.clone(),
                     span: import_span.clone(),
                 });
@@ -779,15 +791,19 @@ impl MirBuilder {
             for def in &program.definitions {
                 match &def.node {
                     TopLevel::Let(gl) => {
-                        if gl.is_public && selected.contains(&gl.name) {
-                            map.insert(gl.name.clone(), gl.name.clone());
+                        if let Some(visible) =
+                            gl.is_public.then(|| selected.get(&gl.name)).flatten()
+                        {
+                            map.insert(gl.name.clone(), visible.clone());
                         } else {
                             map.insert(gl.name.clone(), format!("{}.{}", alias, gl.name));
                         }
                     }
                     TopLevel::Port(port) => {
-                        if port.is_public && selected.contains(&port.name) {
-                            map.insert(port.name.clone(), port.name.clone());
+                        if let Some(visible) =
+                            port.is_public.then(|| selected.get(&port.name)).flatten()
+                        {
+                            map.insert(port.name.clone(), visible.clone());
                         } else {
                             map.insert(port.name.clone(), format!("{}.{}", alias, port.name));
                         }
@@ -804,15 +820,15 @@ impl MirBuilder {
             for def in &program.definitions {
                 match &def.node {
                     TopLevel::Let(gl) => {
-                        if selected.contains(&gl.name) {
-                            map.insert(gl.name.clone(), gl.name.clone());
+                        if let Some(visible) = selected.get(&gl.name) {
+                            map.insert(gl.name.clone(), visible.clone());
                         } else {
                             map.insert(gl.name.clone(), format!("{}_{}", alias_prefix, gl.name));
                         }
                     }
                     TopLevel::Port(port) => {
-                        if selected.contains(&port.name) {
-                            map.insert(port.name.clone(), port.name.clone());
+                        if let Some(visible) = selected.get(&port.name) {
+                            map.insert(port.name.clone(), visible.clone());
                         } else {
                             map.insert(
                                 port.name.clone(),

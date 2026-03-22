@@ -143,34 +143,45 @@ impl TypeChecker {
                                 if !import.items.is_empty() {
                                     let public_env = cached.clone();
                                     for item in &import.items {
+                                        let visible = item.alias.as_ref().unwrap_or(&item.name);
                                         let mut imported_any = false;
-                                        if let Some(sch) = public_env.vars.get(item) {
-                                            self.env.insert(item.clone(), sch.clone());
+                                        if let Some(sch) = public_env.vars.get(&item.name) {
+                                            self.env.insert(visible.clone(), sch.clone());
                                             imported_any = true;
                                         }
-                                        if let Some(td) = public_env.types.get(item) {
-                                            self.env.types.insert(item.clone(), td.clone());
-                                            self.type_defs.insert(item.clone(), td.clone());
+                                        if let Some(td) = public_env.types.get(&item.name) {
+                                            self.env.types.insert(visible.clone(), td.clone());
+                                            self.type_defs.insert(visible.clone(), td.clone());
                                             imported_any = true;
                                         }
-                                        if let Some(ed) = public_env.enums.get(item) {
-                                            self.env.enums.insert(item.clone(), ed.clone());
-                                            for v in &ed.variants {
+                                        if let Some(ed) = public_env.enums.get(&item.name) {
+                                            let mut aliased_ed = ed.clone();
+                                            if item.alias.is_some() {
+                                                aliased_ed.name = visible.clone();
+                                            }
+                                            self.env
+                                                .enums
+                                                .insert(visible.clone(), aliased_ed.clone());
+                                            for v in &aliased_ed.variants {
                                                 register_nullary_variant_constructor(
                                                     &mut self.env,
-                                                    &ed.name,
-                                                    &ed.type_params,
+                                                    &aliased_ed.name,
+                                                    &aliased_ed.type_params,
                                                     v,
                                                 );
                                             }
                                             imported_any = true;
                                         }
-                                        let port_prefix = format!("{}.", item);
+                                        let port_prefix = format!("{}.", item.name);
                                         let port_items: Vec<(String, Scheme)> = public_env
                                             .vars
                                             .iter()
                                             .filter(|(name, _)| name.starts_with(&port_prefix))
-                                            .map(|(name, sch)| (name.clone(), sch.clone()))
+                                            .map(|(name, sch)| {
+                                                let suffix = &name[port_prefix.len()..];
+                                                let new_name = format!("{}.{}", visible, suffix);
+                                                (new_name, sch.clone())
+                                            })
                                             .collect();
                                         if !port_items.is_empty() {
                                             for (name, sch) in port_items {
@@ -179,15 +190,18 @@ impl TypeChecker {
                                             imported_any = true;
                                         }
                                         // Always check for variant imports to ensure parent enum is imported for constructor resolution.
-                                        if import_variant_by_name(&mut self.env, &public_env, item)
-                                        {
+                                        if import_variant_by_name(
+                                            &mut self.env,
+                                            &public_env,
+                                            &item.name,
+                                        ) {
                                             imported_any = true;
                                         }
                                         if !imported_any {
                                             return Err(TypeError {
                                                 message: format!(
                                                     "Definition {} not found in {}",
-                                                    item, import.path
+                                                    item.name, import.path
                                                 ),
                                                 span: def.span.clone(),
                                             });
@@ -301,26 +315,31 @@ impl TypeChecker {
 
                         if !import.items.is_empty() {
                             for item in &import.items {
+                                let visible = item.alias.as_ref().unwrap_or(&item.name);
                                 let mut imported_any = false;
 
-                                if let Some(sch) = public_env.vars.get(item) {
-                                    self.env.insert(item.clone(), sch.clone());
+                                if let Some(sch) = public_env.vars.get(&item.name) {
+                                    self.env.insert(visible.clone(), sch.clone());
                                     imported_any = true;
                                 }
 
-                                if let Some(td) = public_env.types.get(item) {
-                                    self.env.types.insert(item.clone(), td.clone());
-                                    self.type_defs.insert(item.clone(), td.clone());
+                                if let Some(td) = public_env.types.get(&item.name) {
+                                    self.env.types.insert(visible.clone(), td.clone());
+                                    self.type_defs.insert(visible.clone(), td.clone());
                                     imported_any = true;
                                 }
 
-                                if let Some(ed) = public_env.enums.get(item) {
-                                    self.env.enums.insert(item.clone(), ed.clone());
-                                    for v in &ed.variants {
+                                if let Some(ed) = public_env.enums.get(&item.name) {
+                                    let mut aliased_ed = ed.clone();
+                                    if item.alias.is_some() {
+                                        aliased_ed.name = visible.clone();
+                                    }
+                                    self.env.enums.insert(visible.clone(), aliased_ed.clone());
+                                    for v in &aliased_ed.variants {
                                         register_nullary_variant_constructor(
                                             &mut self.env,
-                                            &ed.name,
-                                            &ed.type_params,
+                                            &aliased_ed.name,
+                                            &aliased_ed.type_params,
                                             v,
                                         );
                                     }
@@ -328,12 +347,16 @@ impl TypeChecker {
                                 }
 
                                 // Selective import of a port namespace imports all `Port.fn` entries.
-                                let port_prefix = format!("{}.", item);
+                                let port_prefix = format!("{}.", item.name);
                                 let port_items: Vec<(String, Scheme)> = public_env
                                     .vars
                                     .iter()
                                     .filter(|(name, _)| name.starts_with(&port_prefix))
-                                    .map(|(name, sch)| (name.clone(), sch.clone()))
+                                    .map(|(name, sch)| {
+                                        let suffix = &name[port_prefix.len()..];
+                                        let new_name = format!("{}.{}", visible, suffix);
+                                        (new_name, sch.clone())
+                                    })
                                     .collect();
                                 if !port_items.is_empty() {
                                     for (name, sch) in port_items {
@@ -343,14 +366,14 @@ impl TypeChecker {
                                 }
 
                                 // Always check for variant imports to ensure parent enum is imported for constructor resolution.
-                                if import_variant_by_name(&mut self.env, &public_env, item) {
+                                if import_variant_by_name(&mut self.env, &public_env, &item.name) {
                                     imported_any = true;
                                 }
                                 if !imported_any {
                                     return Err(TypeError {
                                         message: format!(
                                             "Definition {} not found in {}",
-                                            item, import.path
+                                            item.name, import.path
                                         ),
                                         span: def.span.clone(),
                                     });
