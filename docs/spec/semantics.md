@@ -18,6 +18,10 @@ Strict **left-to-right**:
 - Binary operators: `e1 + e2` evaluates `e1` before `e2`
 - Records and constructors: fields evaluated in source order
 
+### Label Order Independence
+
+Labeled arguments at call sites may appear in any order. `f(b: 2, a: 1)` and `f(a: 1, b: 2)` pass the same values. Argument expressions are evaluated left-to-right in source order regardless of label names.
+
 ## Scoping
 
 **Lexical scoping.** Bindings are visible in the block where they are defined and in nested blocks.

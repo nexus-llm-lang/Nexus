@@ -22,7 +22,6 @@ let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do
     Console.println(val: "Hello, Nexus!")
   end
-  return ()
 end
 ```
 
@@ -96,7 +95,7 @@ nexus check example.nx  # typecheck only
     <h4>Environment</h4>
     <ul>
       <li><a href="env/cli">CLI</a> — Command-line interface</li>
-      <li><a href="env/wasm">WASM and WASI</a> — Capability mapping</li>
+      <li><a href="env/wasm">WASM and WASI</a> — Capability mapping and ABI</li>
       <li><a href="env/ffi">FFI</a> — Wasm interop</li>
       <li><a href="env/stdlib">Standard Library</a> — Builtin modules</li>
       <li><a href="env/tools">Tools</a> — AI coding agent skill</li>

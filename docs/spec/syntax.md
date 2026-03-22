@@ -29,6 +29,7 @@ end
 - `export let` makes the function visible to other modules
 - All arguments are **labeled** at call sites: `add(a: 1, b: 2)`
 - Generic type parameters: `fn <T>(x: T) -> T do ... end`
+- `unit`-returning functions may omit `return ()` (implicit unit return)
 
 ### Coeffect/Effect Annotations
 
@@ -62,6 +63,12 @@ export type Result<T, E> = Ok(val: T) | Err(err: E)
 ```
 
 Defines either a record type (`{ ... }`) or a sum type (`A(...) | B(...)`).
+
+The `opaque` modifier hides constructors from importers:
+
+```nexus
+export opaque type Handle = Handle(id: i64)
+```
 
 ### Exception Declarations
 
@@ -115,12 +122,13 @@ Binary operators with standard precedence (multiplicative binds tighter than add
 
 | Operators | Domain |
 |---|---|
-| `*` `/` `*.` `/.` | Multiplicative |
-| `+` `-` `+.` `-.` `++` | Additive / string concat |
+| `bshl` `bshr` | Bit shift (highest) |
+| `*` `/` `*.` `/.` `band` | Multiplicative / bitwise AND |
+| `+` `-` `+.` `-.` `++` `bor` `bxor` | Additive / string concat / bitwise OR, XOR |
 | `==` `!=` `<` `>` `<=` `>=` | Integer / generic comparison |
 | `==.` `!=.` `<.` `>.` `<=.` `>=.` | Float comparison |
 | `&&` | Logical AND |
-| `\|\|` | Logical OR |
+| `\|\|` | Logical OR (lowest) |
 
 ### Function Calls
 
@@ -130,7 +138,7 @@ Console.println(val: "hello")
 list.map(xs: items, f: transform)
 ```
 
-All arguments are labeled. Port method calls use `Port.method(...)` syntax.
+All arguments are labeled. Argument order at the call site does not matter -- `add(b: 2, a: 1)` is equivalent to `add(a: 1, b: 2)`. Port method calls use `Port.method(...)` syntax.
 
 ### Lambda Expressions
 
@@ -519,10 +527,11 @@ binary_op        ::= "||"                                          (* logical �
                    | "&&"
                    | "==" | "!=" | "<=" | ">=" | "<" | ">"        (* comparison *)
                    | "==." | "!=." | "<=." | ">=." | "<." | ">."
-                   | "+" | "-" | "++"                              (* additive *)
+                   | "+" | "-" | "++" | "bor" | "bxor"            (* additive / bitwise OR, XOR *)
                    | "+." | "-."
-                   | "*" | "/"                                     (* multiplicative — highest *)
+                   | "*" | "/" | "band"                            (* multiplicative / bitwise AND *)
                    | "*." | "/."
+                   | "bshl" | "bshr"                               (* bit shift — highest *)
 
 postfix_expr     ::= postfix_expr "." IDENT                       (* field access *)
                    | postfix_expr "[" expr "]"                     (* index *)

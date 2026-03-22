@@ -46,10 +46,11 @@ nexus lsp                # start Language Server (stdio)
 
 ## Core Syntax Rules
 
-### 1. All arguments are labeled
+### 1. All arguments are labeled (order-independent)
 ```nexus
-// CORRECT
+// CORRECT — label order does not matter
 add(a: 1, b: 2)
+add(b: 2, a: 1)          // equivalent
 Console.println(val: "hello")
 Cons(v: x, rest: xs)
 
@@ -103,7 +104,7 @@ let ~x = 10                     // mutable ref, stack-confined
 let v = ~x                      // dereference
 ```
 
-### 5. Explicit `return` required (except Unit)
+### 5. Explicit `return` required (except unit)
 ```nexus
 // Non-unit functions must have explicit return
 let double = fn (n: i64) -> i64 do
@@ -118,7 +119,7 @@ end
 
 ## Effect System (Ports & Handlers)
 
-Nexus uses coeffects for dependency injection, NOT algebraic effects. See `./references/effects.md` for details.
+Nexus uses coeffects for dependency injection, NOT algebraic effects. See https://nymphium.github.io/Nexus/latest/spec/effects for details.
 
 ```nexus
 // 1. Define a port (interface)
@@ -284,9 +285,9 @@ Use `nexus check --format json` as a tool call to get parse/type errors and symb
 
 ## Reference Files
 
-- `./references/syntax.md` — Complete EBNF grammar
-- `./references/types.md` — Type system, linear types, borrowing
-- `./references/effects.md` — Ports, handlers, inject, permissions
-- `./references/stdlib.md` — Standard library API reference
+- https://nymphium.github.io/Nexus/latest/spec/syntax — Syntax and EBNF grammar
+- https://nymphium.github.io/Nexus/latest/spec/types — Type system, linear types, borrowing
+- https://nymphium.github.io/Nexus/latest/spec/effects — Ports, handlers, inject, permissions
+- https://nymphium.github.io/Nexus/latest/env/stdlib — Standard library API reference
 - `./references/patterns.md` — Idiomatic code patterns with examples
 - `./templates/` — Starter templates for common program structures
