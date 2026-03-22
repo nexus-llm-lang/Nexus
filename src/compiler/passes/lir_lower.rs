@@ -11,6 +11,7 @@ use crate::ir::lir::*;
 use crate::ir::mir::*;
 use crate::types::{BinaryOp, EnumDef, Literal, Span, Type, WasmRepr};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 
 #[derive(Debug)]
 pub enum LirLowerError {
@@ -196,6 +197,8 @@ struct LowerCtx<'a> {
     semantic_vars: HashMap<Symbol, Type>,
     stmts: Vec<LirStmt>,
     temp_counter: usize,
+    /// Reusable buffer for formatting temp variable names (avoids per-call allocation)
+    temp_buf: String,
     /// Task functions lifted from conc blocks
     task_functions: Vec<LirFunction>,
     enum_defs: &'a [EnumDef],
@@ -216,6 +219,7 @@ impl<'a> LowerCtx<'a> {
             semantic_vars: HashMap::new(),
             stmts: Vec::new(),
             temp_counter: 0,
+            temp_buf: String::with_capacity(16),
             task_functions: Vec::new(),
             ctor_index: build_constructor_index(enum_defs),
             enum_defs,
@@ -225,9 +229,10 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn new_temp(&mut self) -> Symbol {
-        let name = Symbol::from(format!("__t{}", self.temp_counter));
+        self.temp_buf.clear();
+        write!(self.temp_buf, "__t{}", self.temp_counter).unwrap();
         self.temp_counter += 1;
-        name
+        Symbol::intern(&self.temp_buf)
     }
 
     /// Bind a complex expression to a temporary variable, returning an atom reference
