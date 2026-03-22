@@ -636,20 +636,45 @@ impl Parser {
                     })
                 }
             }
-            // []: empty list pattern — sugar for Nil
-            TokenKind::LBracket
-                if matches!(
-                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                    Some(TokenKind::RBracket)
-                ) =>
-            {
+            // [p1, p2, ...]: list pattern — desugars to nested Cons/Nil
+            TokenKind::LBracket => {
                 self.advance(); // [
-                let end = self.peek_span().end;
-                self.advance(); // ]
-                Ok(Spanned {
-                    node: Pattern::Constructor("Nil".to_string(), vec![]),
-                    span: start..end,
-                })
+                if matches!(self.peek(), TokenKind::RBracket) {
+                    let end = self.peek_span().end;
+                    self.advance(); // ]
+                    Ok(Spanned {
+                        node: Pattern::Constructor("Nil".to_string(), vec![]),
+                        span: start..end,
+                    })
+                } else {
+                    let mut pats = vec![self.parse_pattern()?];
+                    while self.match_token(&TokenKind::Comma) {
+                        if matches!(self.peek(), TokenKind::RBracket) {
+                            break;
+                        }
+                        pats.push(self.parse_pattern()?);
+                    }
+                    let end = self.peek_span().end;
+                    self.expect(&TokenKind::RBracket)?;
+                    // Desugar [p1, p2, ...] → Cons(v: p1, rest: Cons(v: p2, rest: ... Nil))
+                    let mut result = Spanned {
+                        node: Pattern::Constructor("Nil".to_string(), vec![]),
+                        span: start..end,
+                    };
+                    for pat in pats.into_iter().rev() {
+                        result = Spanned {
+                            node: Pattern::Constructor(
+                                "Cons".to_string(),
+                                vec![
+                                    (Some("v".to_string()), pat),
+                                    (Some("rest".to_string()), result),
+                                ],
+                            ),
+                            span: start..end,
+                        };
+                    }
+                    Ok(result)
+                }
             }
             _ => {
                 // Try literal
