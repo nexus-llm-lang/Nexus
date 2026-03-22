@@ -122,10 +122,10 @@ pub(super) fn register_exception_variant(
             .entry("Exn".to_string())
             .or_insert_with(exn_enum_def);
         if exn.variants.iter().any(|v| v.name == exception.name) {
-            return Err(TypeError {
-                message: format!("Duplicate exception constructor: {}", exception.name),
-                span: span.clone(),
-            });
+            return Err(TypeError::new(
+                format!("Duplicate exception constructor: {}", exception.name),
+                span.clone(),
+            ));
         }
     }
 
