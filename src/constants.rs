@@ -9,6 +9,13 @@ pub const NEXUS_HOST_HTTP_MODULE: &str = "nexus:cli/nexus-host";
 pub const NEXUS_HOST_HTTP_FUNC: &str = "host-http-request";
 pub const MEMORY_EXPORT: &str = "memory";
 
+// Handler function naming
+pub const HANDLER_PREFIX: &str = "__handler_";
+
+pub fn handler_func_name(handler_name: &str, method_name: &str) -> String {
+    format!("{HANDLER_PREFIX}{handler_name}_{method_name}")
+}
+
 // Custom section
 pub const NEXUS_CAPABILITIES_SECTION: &str = "nexus:capabilities";
 
