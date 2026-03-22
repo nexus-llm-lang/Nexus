@@ -1773,11 +1773,16 @@ impl Parser {
             // import { items } from path
             // import { items }, * as alias from path
             TokenKind::LBrace => {
-                let items = self.parse_delimited_list(
-                    &TokenKind::LBrace,
-                    &TokenKind::RBrace,
-                    Self::expect_ident,
-                )?;
+                let items =
+                    self.parse_delimited_list(&TokenKind::LBrace, &TokenKind::RBrace, |this| {
+                        let name = this.expect_ident()?;
+                        let alias = if this.match_contextual("as") {
+                            Some(this.expect_ident()?)
+                        } else {
+                            None
+                        };
+                        Ok(ImportItem { name, alias })
+                    })?;
 
                 // Optional: , * as alias
                 let alias = if self.match_token(&TokenKind::Comma) {

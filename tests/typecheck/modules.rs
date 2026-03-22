@@ -86,3 +86,28 @@ fn all_examples_typecheck() {
         }
     }
 }
+
+#[test]
+fn test_import_as_alias_typecheck() {
+    should_typecheck(
+        r#"
+    import { add as plus } from examples/math.nx
+    let main = fn () -> unit do
+        let _ = plus(a: 1, b: 2)
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_import_as_alias_original_name_not_visible() {
+    let src = r#"
+    import { add as plus } from examples/math.nx
+    let main = fn () -> unit do
+        let _ = add(a: 1, b: 2)
+        return ()
+    end
+    "#;
+    should_fail_typecheck(src);
+}

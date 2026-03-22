@@ -167,7 +167,12 @@ pub fn find_definition(
             TopLevel::Exception(exc) if exc.name == name => return Some(def.span.clone()),
             TopLevel::Port(port) if port.name == name => return Some(def.span.clone()),
             TopLevel::Import(imp) => {
-                if imp.alias.as_deref() == Some(&name) || imp.items.contains(&name.to_string()) {
+                if imp.alias.as_deref() == Some(&name)
+                    || imp
+                        .items
+                        .iter()
+                        .any(|item| item.name == name || item.alias.as_deref() == Some(&name))
+                {
                     return Some(def.span.clone());
                 }
             }
