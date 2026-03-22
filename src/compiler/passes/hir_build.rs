@@ -8,6 +8,7 @@
 //! - For-loop desugaring (→ while loop)
 //! - Inject inlining (scope-based handler activation)
 
+use crate::constants::handler_func_name;
 use crate::intern::Symbol;
 use crate::ir::mir::*;
 use crate::lang::ast::*;
@@ -528,7 +529,7 @@ impl MirBuilder {
                         } => {
                             let port_name = self.rename(coeffect_name, rename_map);
                             for hf in handler_fns {
-                                let synth_name = format!("__handler_{}_{}", name, hf.name);
+                                let synth_name = handler_func_name(&name, &hf.name);
                                 self.fn_ret_types
                                     .insert(synth_name.clone(), hf.ret_type.clone());
                                 self.pending_functions.push(PendingFunction {
@@ -1325,7 +1326,7 @@ impl MirBuilder {
                     span: span.clone(),
                 })?;
 
-        let func_name = format!("__handler_{}_{}", handler_name, method_name);
+        let func_name = handler_func_name(handler_name, method_name);
         let ret_type = self.lookup_ret_type(&func_name);
 
         let mir_args: Vec<(Symbol, MirExpr)> = args
