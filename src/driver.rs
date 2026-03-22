@@ -183,14 +183,21 @@ pub fn typecheck_program(filename: &str, src: &str, program: &lang::ast::Program
             true
         }
         Err(e) => {
-            let report = Report::build(ReportKind::Error, filename, e.span.start)
+            let mut builder = Report::build(ReportKind::Error, filename, e.span.start)
                 .with_message(e.message.clone())
                 .with_label(
                     Label::new((filename, e.span))
                         .with_message(e.message)
                         .with_color(Color::Red),
-                )
-                .finish();
+                );
+            for (span, msg) in e.labels {
+                builder = builder.with_label(
+                    Label::new((filename, span))
+                        .with_message(msg)
+                        .with_color(Color::Blue),
+                );
+            }
+            let report = builder.finish();
             if let Err(print_err) = report.print((filename, Source::from(src))) {
                 eprintln!("Failed to render type diagnostic: {}", print_err);
             }

@@ -8,6 +8,23 @@ use std::collections::{HashMap, HashSet};
 pub struct TypeError {
     pub message: String,
     pub span: Span,
+    /// Additional labeled spans for multi-location diagnostics (e.g. "expected X here, found Y there").
+    pub labels: Vec<(Span, String)>,
+}
+
+impl TypeError {
+    pub fn new(message: impl Into<String>, span: Span) -> Self {
+        TypeError {
+            message: message.into(),
+            span,
+            labels: Vec::new(),
+        }
+    }
+
+    pub fn with_labels(mut self, labels: Vec<(Span, String)>) -> Self {
+        self.labels = labels;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -18,7 +35,7 @@ pub struct TypeWarning {
 
 impl From<(String, Span)> for TypeError {
     fn from((message, span): (String, Span)) -> Self {
-        TypeError { message, span }
+        TypeError::new(message, span)
     }
 }
 
@@ -72,10 +89,10 @@ impl TypeEnv {
             .cloned()
             .collect();
         if !unused.is_empty() {
-            return Err(TypeError {
-                message: format!("Unused linear: {:?}", unused),
-                span: span.clone(),
-            });
+            return Err(TypeError::new(
+                format!("Unused linear: {:?}", unused),
+                span.clone(),
+            ));
         }
         Ok(())
     }

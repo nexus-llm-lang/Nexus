@@ -198,13 +198,13 @@ impl TypeChecker {
                                             imported_any = true;
                                         }
                                         if !imported_any {
-                                            return Err(TypeError {
-                                                message: format!(
+                                            return Err(TypeError::new(
+                                                format!(
                                                     "Definition {} not found in {}",
                                                     item.name, import.path
                                                 ),
-                                                span: def.span.clone(),
-                                            });
+                                                def.span.clone(),
+                                            ));
                                         }
                                     }
                                 }
@@ -222,13 +222,17 @@ impl TypeChecker {
                         self.visited_paths.insert(import.path.clone());
 
                         let resolved_path = resolve_import_path(&import.path);
-                        let src = fs::read_to_string(&resolved_path).map_err(|e| TypeError {
-                            message: format!("Failed to read {}: {}", resolved_path, e),
-                            span: def.span.clone(),
+                        let src = fs::read_to_string(&resolved_path).map_err(|e| {
+                            TypeError::new(
+                                format!("Failed to read {}: {}", resolved_path, e),
+                                def.span.clone(),
+                            )
                         })?;
-                        let p = parser::parser().parse(&src).map_err(|_| TypeError {
-                            message: format!("Failed to parse {}", import.path),
-                            span: def.span.clone(),
+                        let p = parser::parser().parse(&src).map_err(|_| {
+                            TypeError::new(
+                                format!("Failed to parse {}", import.path),
+                                def.span.clone(),
+                            )
                         })?;
 
                         let mut sub_checker = TypeChecker::new();
@@ -236,13 +240,13 @@ impl TypeChecker {
                         sub_checker.import_cache = self.import_cache.clone();
                         sub_checker.check_program(&p).map_err(|e| {
                             let loc = byte_offset_to_loc(&src, e.span.start, e.span.end);
-                            TypeError {
-                                message: format!(
+                            TypeError::new(
+                                format!(
                                     "in imported module '{}' {}: {}",
                                     import.path, loc, e.message
                                 ),
-                                span: def.span.clone(),
-                            }
+                                def.span.clone(),
+                            )
                         })?;
 
                         let mut public_env = TypeEnv::new();
@@ -254,12 +258,7 @@ impl TypeChecker {
                                 }
                                 TopLevel::Enum(ed) if ed.is_public => {
                                     if ed.name == "Exn" {
-                                        return Err(TypeError {
-                                            message:
-                                                "Reserved enum name 'Exn'; use 'exception ...' declarations"
-                                                    .into(),
-                                            span: sub_def.span.clone(),
-                                        });
+                                        return Err(TypeError::new("Reserved enum name 'Exn'; use 'exception ...' declarations", sub_def.span.clone()));
                                     }
                                     let ed_norm = normalize_enum_generic_params(ed);
                                     if ed.is_opaque {
@@ -370,13 +369,13 @@ impl TypeChecker {
                                     imported_any = true;
                                 }
                                 if !imported_any {
-                                    return Err(TypeError {
-                                        message: format!(
+                                    return Err(TypeError::new(
+                                        format!(
                                             "Definition {} not found in {}",
                                             item.name, import.path
                                         ),
-                                        span: def.span.clone(),
-                                    });
+                                        def.span.clone(),
+                                    ));
                                 }
                             }
                         }
@@ -396,11 +395,10 @@ impl TypeChecker {
                 }
                 TopLevel::Enum(ed) => {
                     if ed.name == "Exn" {
-                        return Err(TypeError {
-                            message: "Reserved enum name 'Exn'; use 'exception ...' declarations"
-                                .into(),
-                            span: def.span.clone(),
-                        });
+                        return Err(TypeError::new(
+                            "Reserved enum name 'Exn'; use 'exception ...' declarations",
+                            def.span.clone(),
+                        ));
                     }
                     let ed_norm = normalize_enum_generic_params(ed);
                     self.env.enums.insert(ed_norm.name.clone(), ed_norm.clone());
@@ -493,12 +491,8 @@ impl TypeChecker {
                         }
                         Expr::External(_, type_params, typ) => {
                             let vars_set: HashSet<String> = type_params.iter().cloned().collect();
-                            check_unintroduced_type_vars(typ, &vars_set, &self.env).map_err(
-                                |e| TypeError {
-                                    message: e,
-                                    span: gl.value.span.clone(),
-                                },
-                            )?;
+                            check_unintroduced_type_vars(typ, &vars_set, &self.env)
+                                .map_err(|e| TypeError::new(e, gl.value.span.clone()))?;
                             let scheme = external_scheme(type_params, typ);
                             self.env.insert(gl.name.clone(), scheme);
                         }
@@ -525,10 +519,9 @@ impl TypeChecker {
                     let (s, t) = res?;
                     let mut t = apply_subst_type(&s, &t);
                     if let Some(ann) = &gl.typ {
-                        let sa = self.unify(&t, ann).map_err(|e| TypeError {
-                            message: e,
-                            span: gl.value.span.clone(),
-                        })?;
+                        let sa = self
+                            .unify(&t, ann)
+                            .map_err(|e| TypeError::new(e, gl.value.span.clone()))?;
                         t = apply_subst_type(&sa, ann);
                     } else {
                         t = default_numeric_literals(&t);
@@ -536,10 +529,10 @@ impl TypeChecker {
 
                     if gl.name == ENTRYPOINT {
                         if gl.is_public {
-                            return Err(TypeError {
-                                message: "main function must be private (remove 'pub')".into(),
-                                span: def.span.clone(),
-                            });
+                            return Err(TypeError::new(
+                                "main function must be private (remove 'pub')",
+                                def.span.clone(),
+                            ));
                         }
                         // Accept main() -> unit or main(args: [string]) -> unit
                         let (sm, req, ef) = {
@@ -568,34 +561,26 @@ impl TypeChecker {
                                             Box::new(ef1.clone()),
                                         ),
                                     )
-                                    .map_err(|_| TypeError {
-                                        message: "main must be '() -> unit' or '(args: [string]) -> unit'".into(),
-                                        span: def.span.clone(),
-                                    })?;
+                                    .map_err(|_| TypeError::new("main must be '() -> unit' or '(args: [string]) -> unit'", def.span.clone()))?;
                                 (sm, req1, ef1)
                             }
                         };
                         let final_req = apply_subst_type(&sm, &req);
                         if !is_allowed_main_require_signature(&final_req) {
-                            return Err(TypeError {
-                                message:
-                                    "main function requires must be {}, or a subset of { PermFs, PermNet, PermConsole, PermRandom, PermClock, PermProc }"
-                                        .into(),
-                                span: def.span.clone(),
-                            });
+                            return Err(TypeError::new("main function requires must be {}, or a subset of { PermFs, PermNet, PermConsole, PermRandom, PermClock, PermProc }", def.span.clone()));
                         }
                         let final_ef = apply_subst_type(&sm, &ef);
                         if contains_exn_throws(&final_ef) {
-                            return Err(TypeError {
-                                message: "main function must not declare Exn in throws".into(),
-                                span: def.span.clone(),
-                            });
+                            return Err(TypeError::new(
+                                "main function must not declare Exn in throws",
+                                def.span.clone(),
+                            ));
                         }
                         if !is_allowed_main_throws_signature(&final_ef) {
-                            return Err(TypeError {
-                                message: "main function throws must be {}".into(),
-                                span: def.span.clone(),
-                            });
+                            return Err(TypeError::new(
+                                "main function throws must be {}",
+                                def.span.clone(),
+                            ));
                         }
                     }
 
@@ -603,13 +588,13 @@ impl TypeChecker {
                         if let Some(private_type_name) =
                             find_private_type_in_public_signature(&t, &self.env)
                         {
-                            return Err(TypeError {
-                                message: format!(
+                            return Err(TypeError::new(
+                                format!(
                                     "public definition '{}' exposes private type '{}'",
                                     gl.name, private_type_name
                                 ),
-                                span: def.span.clone(),
-                            });
+                                def.span.clone(),
+                            ));
                         }
                     }
 
@@ -644,14 +629,14 @@ impl TypeChecker {
             let mut missing: Vec<String> = used_reqs.difference(&declared_reqs).cloned().collect();
             missing.sort();
             if !missing.is_empty() {
-                return Err(TypeError {
-                    message: format!(
+                return Err(TypeError::new(
+                    format!(
                         "Function '{}' uses coeffects [{}] not declared in its require clause",
                         gl.name,
                         missing.join(", ")
                     ),
-                    span: def.span.clone(),
-                });
+                    def.span.clone(),
+                ));
             }
         }
         Ok(())
@@ -725,10 +710,7 @@ impl TypeChecker {
             );
         }
         if contains_ref(&func.ret_type) {
-            return Err(TypeError {
-                message: "Cannot return Ref".into(),
-                span: span.clone(),
-            });
+            return Err(TypeError::new("Cannot return Ref", span.clone()));
         }
         let merged_requires = merge_type_rows(&func.requires, extra_requires);
         self.infer_body(
@@ -739,11 +721,10 @@ impl TypeChecker {
             &func.throws,
         )?;
         if !contains_return(&func.body) && !matches!(func.ret_type, Type::Unit) {
-            return Err(TypeError {
-                message: "Function body has no return statement; implicit return type is Unit"
-                    .into(),
-                span: span.clone(),
-            });
+            return Err(TypeError::new(
+                "Function body has no return statement; implicit return type is Unit",
+                span.clone(),
+            ));
         }
         env.check_unused_linear(span)?;
         Ok(())
@@ -770,10 +751,10 @@ impl TypeChecker {
                     let key = sigil.get_key(name);
                     if is_recursive_lambda {
                         if !matches!(sigil, Sigil::Immutable) {
-                            return Err(TypeError {
-                                message: "Recursive lambda binding must be immutable".into(),
-                                span: value.span.clone(),
-                            });
+                            return Err(TypeError::new(
+                                "Recursive lambda binding must be immutable",
+                                value.span.clone(),
+                            ));
                         }
                         let ann = if let Some(t) = typ.clone() {
                             t
@@ -802,11 +783,10 @@ impl TypeChecker {
                                 Box::new(self.convert_user_defined_to_var(throws, &vars_set)),
                             )
                         } else {
-                            return Err(TypeError {
-                                message: "Recursive lambda requires an explicit type annotation"
-                                    .into(),
-                                span: value.span.clone(),
-                            });
+                            return Err(TypeError::new(
+                                "Recursive lambda requires an explicit type annotation",
+                                value.span.clone(),
+                            ));
                         };
                         env.insert(
                             key.clone(),
@@ -820,10 +800,9 @@ impl TypeChecker {
                     env.apply(&s1);
                     let mut t1 = apply_subst_type(&s1, &t1);
                     if let Some(ann) = typ {
-                        let sa = self.unify(&t1, ann).map_err(|e| TypeError {
-                            message: e,
-                            span: value.span.clone(),
-                        })?;
+                        let sa = self
+                            .unify(&t1, ann)
+                            .map_err(|e| TypeError::new(e, value.span.clone()))?;
                         env.apply(&sa);
                         t1 = apply_subst_type(&sa, ann);
                     } else {
@@ -832,10 +811,7 @@ impl TypeChecker {
                     let ft = match sigil {
                         Sigil::Mutable => {
                             if env.contains_linear_type(&t1) {
-                                return Err(TypeError {
-                                    message: "Mutable linear".into(),
-                                    span: value.span.clone(),
-                                });
+                                return Err(TypeError::new("Mutable linear", value.span.clone()));
                             }
                             Type::Ref(Box::new(t1))
                         }
@@ -857,10 +833,7 @@ impl TypeChecker {
                         }
                         Sigil::Immutable => {
                             if contains_ref(&t1) {
-                                return Err(TypeError {
-                                    message: "Immutable Ref".into(),
-                                    span: value.span.clone(),
-                                });
+                                return Err(TypeError::new("Immutable Ref", value.span.clone()));
                             }
                             t1
                         }
@@ -879,10 +852,7 @@ impl TypeChecker {
                     env.apply(&s1);
                     env.check_unused_linear(&e.span)?;
                     self.unify(&t1, &apply_subst_type(&s1, er))
-                        .map_err(|err| TypeError {
-                            message: err,
-                            span: e.span.clone(),
-                        })?;
+                        .map_err(|err| TypeError::new(err, e.span.clone()))?;
                 }
                 Stmt::Expr(e) => {
                     self.infer(env, e, er, eq, ee)?;
@@ -893,38 +863,25 @@ impl TypeChecker {
                     match &target.node {
                         Expr::Variable(name, sigil) => {
                             if let Sigil::Immutable = sigil {
-                                return Err(TypeError {
-                                    message: "Mutating immutable".into(),
-                                    span: s.span.clone(),
-                                });
+                                return Err(TypeError::new("Mutating immutable", s.span.clone()));
                             }
                             if let Some(sch) = env.get(&sigil.get_key(name)) {
                                 if let Type::Ref(i) = self.instantiate(sch) {
-                                    self.unify(&t_v, &i).map_err(|e| TypeError {
-                                        message: e,
-                                        span: value.span.clone(),
-                                    })?;
+                                    self.unify(&t_v, &i)
+                                        .map_err(|e| TypeError::new(e, value.span.clone()))?;
                                 } else {
-                                    return Err(TypeError {
-                                        message: "Not a ref".into(),
-                                        span: s.span.clone(),
-                                    });
+                                    return Err(TypeError::new("Not a ref", s.span.clone()));
                                 }
                             } else {
-                                return Err(TypeError {
-                                    message: "Not found".into(),
-                                    span: s.span.clone(),
-                                });
+                                return Err(TypeError::new("Not found", s.span.clone()));
                             }
                         }
                         Expr::Index(arr, idx) => {
                             // Typecheck index
                             let (s_idx, t_idx) = self.infer(env, idx, er, eq, ee)?;
                             env.apply(&s_idx);
-                            self.unify(&t_idx, &Type::I64).map_err(|e| TypeError {
-                                message: e,
-                                span: idx.span.clone(),
-                            })?;
+                            self.unify(&t_idx, &Type::I64)
+                                .map_err(|e| TypeError::new(e, idx.span.clone()))?;
 
                             // Typecheck array WITHOUT consuming if it's a variable
                             let t_arr = match &arr.node {
@@ -933,10 +890,10 @@ impl TypeChecker {
                                     if let Some(sch) = env.get(&key) {
                                         self.instantiate(sch)
                                     } else {
-                                        return Err(TypeError {
-                                            message: format!("Not found: {}", key),
-                                            span: arr.span.clone(),
-                                        });
+                                        return Err(TypeError::new(
+                                            format!("Not found: {}", key),
+                                            arr.span.clone(),
+                                        ));
                                     }
                                 }
                                 _ => {
@@ -956,29 +913,19 @@ impl TypeChecker {
                                 Type::Borrow(inner) => match *inner {
                                     Type::Array(t) => *t,
                                     _ => {
-                                        return Err(TypeError {
-                                            message: "Not an array".into(),
-                                            span: arr.span.clone(),
-                                        })
+                                        return Err(TypeError::new(
+                                            "Not an array",
+                                            arr.span.clone(),
+                                        ))
                                     }
                                 },
-                                _ => {
-                                    return Err(TypeError {
-                                        message: "Not an array".into(),
-                                        span: arr.span.clone(),
-                                    })
-                                }
+                                _ => return Err(TypeError::new("Not an array", arr.span.clone())),
                             };
-                            self.unify(&t_v, &elem_t).map_err(|e| TypeError {
-                                message: e,
-                                span: value.span.clone(),
-                            })?;
+                            self.unify(&t_v, &elem_t)
+                                .map_err(|e| TypeError::new(e, value.span.clone()))?;
                         }
                         _ => {
-                            return Err(TypeError {
-                                message: "Invalid assignment target".into(),
-                                span: s.span.clone(),
-                            })
+                            return Err(TypeError::new("Invalid assignment target", s.span.clone()))
                         }
                     }
                 }
@@ -1006,10 +953,7 @@ impl TypeChecker {
                     );
                     self.infer_body(catch_body, &mut ec, er, eq, ee)?;
                     if et.linear_vars != ec.linear_vars {
-                        return Err(TypeError {
-                            message: "Linear mismatch".into(),
-                            span: s.span.clone(),
-                        });
+                        return Err(TypeError::new("Linear mismatch", s.span.clone()));
                     }
                     env.linear_vars = et.linear_vars;
                 }
@@ -1019,10 +963,10 @@ impl TypeChecker {
                     let mut handler_extra_reqs = HashSet::new();
                     for handler_name in handlers {
                         let Some(scheme) = env.get(handler_name).cloned() else {
-                            return Err(TypeError {
-                                message: format!("Handler '{}' not found in scope", handler_name),
-                                span: s.span.clone(),
-                            });
+                            return Err(TypeError::new(
+                                format!("Handler '{}' not found in scope", handler_name),
+                                s.span.clone(),
+                            ));
                         };
                         let instantiated = self.instantiate(&scheme);
                         match instantiated {
@@ -1038,13 +982,10 @@ impl TypeChecker {
                                 }
                             }
                             _ => {
-                                return Err(TypeError {
-                                    message: format!(
+                                return Err(TypeError::new(format!(
                                         "'{}' is not a handler value (expected type 'handler <Port>')",
                                         handler_name
-                                    ),
-                                    span: s.span.clone(),
-                                });
+                                    ), s.span.clone()));
                             }
                         }
                     }
@@ -1058,13 +999,10 @@ impl TypeChecker {
                             .collect();
                         non_reducing_handlers.sort();
                         if !non_reducing_handlers.is_empty() {
-                            return Err(TypeError {
-                                message: format!(
+                            return Err(TypeError::new(format!(
                                     "Inject handler(s) {} does not reduce requirements in this scope",
                                     non_reducing_handlers.join(", ")
-                                ),
-                                span: s.span.clone(),
-                            });
+                                ), s.span.clone()));
                         }
                     }
                     // Build the inject requirement: body's ports + handler extra requires
@@ -1100,9 +1038,11 @@ impl TypeChecker {
                         body: vec![],
                     };
                     self.check_exhaustiveness(env, &t1, &[dummy_case])
-                        .map_err(|m| TypeError {
-                            message: format!("Non-exhaustive destructuring pattern: {}", m),
-                            span: pattern.span.clone(),
+                        .map_err(|m| {
+                            TypeError::new(
+                                format!("Non-exhaustive destructuring pattern: {}", m),
+                                pattern.span.clone(),
+                            )
                         })?;
                     let sp = self.bind_pattern(pattern, &t1, env)?;
                     env.apply(&sp);
@@ -1149,10 +1089,10 @@ impl TypeChecker {
             .collect();
 
         if !unused_local_linear.is_empty() {
-            return Err(TypeError {
-                message: format!("Unused linear in task: {:?}", unused_local_linear),
-                span: _span.clone(),
-            });
+            return Err(TypeError::new(
+                format!("Unused linear in task: {:?}", unused_local_linear),
+                _span.clone(),
+            ));
         }
         Ok(())
     }
@@ -1209,17 +1149,15 @@ impl TypeChecker {
                         }
                     }
                     if env.contains_linear_type(&t) {
-                        env.consume(&key).map_err(|m| TypeError {
-                            message: m,
-                            span: e.span.clone(),
-                        })?;
+                        env.consume(&key)
+                            .map_err(|m| TypeError::new(m, e.span.clone()))?;
                     }
                     Ok((HashMap::new(), t))
                 } else {
-                    Err(TypeError {
-                        message: format!("Not found: {}", key),
-                        span: e.span.clone(),
-                    })
+                    Err(TypeError::new(
+                        format!("Not found: {}", key),
+                        e.span.clone(),
+                    ))
                 }
             }
             Expr::BinaryOp(l, op, r) => {
@@ -1239,61 +1177,51 @@ impl TypeChecker {
                     | BinaryOp::Shr => {
                         let lt = apply_subst_type(&s, &t1);
                         let rt = apply_subst_type(&s, &t2);
-                        let target = select_int_type(&lt, &rt).ok_or_else(|| TypeError {
-                            message: format!("Integer op expects i32/i64, got {} and {}", lt, rt),
-                            span: e.span.clone(),
+                        let target = select_int_type(&lt, &rt).ok_or_else(|| {
+                            TypeError::new(
+                                format!("Integer op expects i32/i64, got {} and {}", lt, rt),
+                                e.span.clone(),
+                            )
                         })?;
 
-                        let s3 = self.unify(&lt, &target).map_err(|m| TypeError {
-                            message: m,
-                            span: l.span.clone(),
-                        })?;
+                        let s3 = self
+                            .unify(&lt, &target)
+                            .map_err(|m| TypeError::new(m, l.span.clone()))?;
                         s = compose_subst(&s, &s3);
                         let s4 = self
                             .unify(&apply_subst_type(&s, &t2), &target)
-                            .map_err(|m| TypeError {
-                                message: m,
-                                span: r.span.clone(),
-                            })?;
+                            .map_err(|m| TypeError::new(m, r.span.clone()))?;
                         s = compose_subst(&s, &s4);
                         Ok((s, target))
                     }
                     BinaryOp::Concat => {
                         let s3 = self
                             .unify(&apply_subst_type(&s, &t1), &Type::String)
-                            .map_err(|m| TypeError {
-                                message: m,
-                                span: l.span.clone(),
-                            })?;
+                            .map_err(|m| TypeError::new(m, l.span.clone()))?;
                         s = compose_subst(&s, &s3);
                         let s4 = self
                             .unify(&apply_subst_type(&s, &t2), &Type::String)
-                            .map_err(|m| TypeError {
-                                message: m,
-                                span: r.span.clone(),
-                            })?;
+                            .map_err(|m| TypeError::new(m, r.span.clone()))?;
                         s = compose_subst(&s, &s4);
                         Ok((s, Type::String))
                     }
                     BinaryOp::FAdd | BinaryOp::FSub | BinaryOp::FMul | BinaryOp::FDiv => {
                         let lt = apply_subst_type(&s, &t1);
                         let rt = apply_subst_type(&s, &t2);
-                        let target = select_float_type(&lt, &rt).ok_or_else(|| TypeError {
-                            message: format!("Float op expects f32/f64, got {} and {}", lt, rt),
-                            span: e.span.clone(),
+                        let target = select_float_type(&lt, &rt).ok_or_else(|| {
+                            TypeError::new(
+                                format!("Float op expects f32/f64, got {} and {}", lt, rt),
+                                e.span.clone(),
+                            )
                         })?;
 
-                        let s3 = self.unify(&lt, &target).map_err(|m| TypeError {
-                            message: m,
-                            span: l.span.clone(),
-                        })?;
+                        let s3 = self
+                            .unify(&lt, &target)
+                            .map_err(|m| TypeError::new(m, l.span.clone()))?;
                         s = compose_subst(&s, &s3);
                         let s4 = self
                             .unify(&apply_subst_type(&s, &t2), &target)
-                            .map_err(|m| TypeError {
-                                message: m,
-                                span: r.span.clone(),
-                            })?;
+                            .map_err(|m| TypeError::new(m, r.span.clone()))?;
                         s = compose_subst(&s, &s4);
                         Ok((s, target))
                     }
@@ -1313,25 +1241,23 @@ impl TypeChecker {
                                     None
                                 }
                             })
-                            .ok_or_else(|| TypeError {
-                                message: format!(
-                                    "Equality comparison expects matching types, got {} and {}",
-                                    lt, rt
-                                ),
-                                span: e.span.clone(),
+                            .ok_or_else(|| {
+                                TypeError::new(
+                                    format!(
+                                        "Equality comparison expects matching types, got {} and {}",
+                                        lt, rt
+                                    ),
+                                    e.span.clone(),
+                                )
                             })?;
 
-                        let s3 = self.unify(&lt, &target).map_err(|m| TypeError {
-                            message: m,
-                            span: l.span.clone(),
-                        })?;
+                        let s3 = self
+                            .unify(&lt, &target)
+                            .map_err(|m| TypeError::new(m, l.span.clone()))?;
                         s = compose_subst(&s, &s3);
                         let s4 = self
                             .unify(&apply_subst_type(&s, &t2), &target)
-                            .map_err(|m| TypeError {
-                                message: m,
-                                span: r.span.clone(),
-                            })?;
+                            .map_err(|m| TypeError::new(m, r.span.clone()))?;
                         s = compose_subst(&s, &s4);
                         Ok((s, Type::Bool))
                     }
@@ -1346,25 +1272,23 @@ impl TypeChecker {
                                     None
                                 }
                             })
-                            .ok_or_else(|| TypeError {
-                                message: format!(
-                                    "Ordered comparison expects i32/i64/char, got {} and {}",
-                                    lt, rt
-                                ),
-                                span: e.span.clone(),
+                            .ok_or_else(|| {
+                                TypeError::new(
+                                    format!(
+                                        "Ordered comparison expects i32/i64/char, got {} and {}",
+                                        lt, rt
+                                    ),
+                                    e.span.clone(),
+                                )
                             })?;
 
-                        let s3 = self.unify(&lt, &target).map_err(|m| TypeError {
-                            message: m,
-                            span: l.span.clone(),
-                        })?;
+                        let s3 = self
+                            .unify(&lt, &target)
+                            .map_err(|m| TypeError::new(m, l.span.clone()))?;
                         s = compose_subst(&s, &s3);
                         let s4 = self
                             .unify(&apply_subst_type(&s, &t2), &target)
-                            .map_err(|m| TypeError {
-                                message: m,
-                                span: r.span.clone(),
-                            })?;
+                            .map_err(|m| TypeError::new(m, r.span.clone()))?;
                         s = compose_subst(&s, &s4);
                         Ok((s, Type::Bool))
                     }
@@ -1376,42 +1300,31 @@ impl TypeChecker {
                     | BinaryOp::FGe => {
                         let lt = apply_subst_type(&s, &t1);
                         let rt = apply_subst_type(&s, &t2);
-                        let target = select_float_type(&lt, &rt).ok_or_else(|| TypeError {
-                            message: format!(
-                                "Float comparison expects f32/f64, got {} and {}",
-                                lt, rt
-                            ),
-                            span: e.span.clone(),
+                        let target = select_float_type(&lt, &rt).ok_or_else(|| {
+                            TypeError::new(
+                                format!("Float comparison expects f32/f64, got {} and {}", lt, rt),
+                                e.span.clone(),
+                            )
                         })?;
 
-                        let s3 = self.unify(&lt, &target).map_err(|m| TypeError {
-                            message: m,
-                            span: l.span.clone(),
-                        })?;
+                        let s3 = self
+                            .unify(&lt, &target)
+                            .map_err(|m| TypeError::new(m, l.span.clone()))?;
                         s = compose_subst(&s, &s3);
                         let s4 = self
                             .unify(&apply_subst_type(&s, &t2), &target)
-                            .map_err(|m| TypeError {
-                                message: m,
-                                span: r.span.clone(),
-                            })?;
+                            .map_err(|m| TypeError::new(m, r.span.clone()))?;
                         s = compose_subst(&s, &s4);
                         Ok((s, Type::Bool))
                     }
                     BinaryOp::And | BinaryOp::Or => {
                         let s3 = self
                             .unify(&apply_subst_type(&s, &t1), &Type::Bool)
-                            .map_err(|m| TypeError {
-                                message: m,
-                                span: l.span.clone(),
-                            })?;
+                            .map_err(|m| TypeError::new(m, l.span.clone()))?;
                         s = compose_subst(&s, &s3);
                         let s4 = self
                             .unify(&apply_subst_type(&s, &t2), &Type::Bool)
-                            .map_err(|m| TypeError {
-                                message: m,
-                                span: r.span.clone(),
-                            })?;
+                            .map_err(|m| TypeError::new(m, r.span.clone()))?;
                         s = compose_subst(&s, &s4);
                         Ok((s, Type::Bool))
                     }
@@ -1426,27 +1339,22 @@ impl TypeChecker {
                     };
                     Ok((HashMap::new(), Type::Borrow(Box::new(i))))
                 } else {
-                    Err(TypeError {
-                        message: "Not found".into(),
-                        span: e.span.clone(),
-                    })
+                    Err(TypeError::new("Not found", e.span.clone()))
                 }
             }
             Expr::Call { func, args } => {
                 let (mut s, ft_raw) = if let Some(sch) = env.get(func).cloned() {
                     (HashMap::new(), self.instantiate(&sch))
                 } else {
-                    return Err(TypeError {
-                        message: format!("Fn {} not found", func),
-                        span: e.span.clone(),
-                    });
+                    return Err(TypeError::new(
+                        format!("Fn {} not found", func),
+                        e.span.clone(),
+                    ));
                 };
                 let ft = match ft_raw {
                     Type::Linear(inner) => {
-                        env.consume(func).map_err(|m| TypeError {
-                            message: m,
-                            span: e.span.clone(),
-                        })?;
+                        env.consume(func)
+                            .map_err(|m| TypeError::new(m, e.span.clone()))?;
                         *inner
                     }
                     other => other,
@@ -1458,17 +1366,14 @@ impl TypeChecker {
                             expected_params.iter().map(|(n, _)| n.as_str()).collect();
                         let provided_labels: Vec<&str> =
                             args.iter().map(|(n, _)| n.as_str()).collect();
-                        return Err(TypeError {
-                            message: format!(
+                        return Err(TypeError::new(format!(
                                 "Arity mismatch in call to `{}`: expected {} arguments, got {}.\nExpected parameters: ({})\nProvided arguments: ({})",
                                 func,
                                 expected_params.len(),
                                 args.len(),
                                 expected_labels.join(", "),
                                 provided_labels.join(", "),
-                            ),
-                            span: e.span.clone(),
-                        });
+                            ), e.span.clone()));
                     }
                 }
                 let rt = self.new_var();
@@ -1488,10 +1393,7 @@ impl TypeChecker {
                             Box::new(ec.clone()),
                         ),
                     )
-                    .map_err(|m| TypeError {
-                        message: m,
-                        span: e.span.clone(),
-                    })?;
+                    .map_err(|m| TypeError::new(m, e.span.clone()))?;
                 s = compose_subst(&s, &sf);
                 let eci = apply_subst_type(&s, &ec);
                 let eco = match eci {
@@ -1501,10 +1403,7 @@ impl TypeChecker {
                 };
                 let se = self
                     .unify(&apply_subst_type(&s, ee), &eco)
-                    .map_err(|m| TypeError {
-                        message: m,
-                        span: e.span.clone(),
-                    })?;
+                    .map_err(|m| TypeError::new(m, e.span.clone()))?;
                 s = compose_subst(&s, &se);
                 let reqi = apply_subst_type(&s, &req);
                 let reqo = match reqi.clone() {
@@ -1512,12 +1411,12 @@ impl TypeChecker {
                     Type::Unit => Type::Row(vec![], Some(Box::new(self.new_var()))),
                     other => other,
                 };
-                let sr = self
-                    .unify(&apply_subst_type(&s, eq), &reqo)
-                    .map_err(|_| TypeError {
-                        message: format!("Call to '{}' requires {}", func, reqi),
-                        span: e.span.clone(),
-                    })?;
+                let sr = self.unify(&apply_subst_type(&s, eq), &reqo).map_err(|_| {
+                    TypeError::new(
+                        format!("Call to '{}' requires {}", func, reqi),
+                        e.span.clone(),
+                    )
+                })?;
                 s = compose_subst(&s, &sr);
 
                 for ((_, pt), (_, ae)) in pts.iter().zip(args) {
@@ -1532,23 +1431,19 @@ impl TypeChecker {
                             // allow passing a plain value T to a linear parameter %T.
                             if let Type::Linear(inner) = expected {
                                 if env.contains_linear_type(&actual) {
-                                    return Err(TypeError {
-                                        message: primary_err,
-                                        span: ae.span.clone(),
-                                    });
+                                    return Err(TypeError::new(primary_err, ae.span.clone()));
                                 }
-                                self.unify(&actual, &inner).map_err(|m| TypeError {
-                                    message: format!(
-                                        "{} (and linear weakening failed: {})",
-                                        primary_err, m
-                                    ),
-                                    span: ae.span.clone(),
+                                self.unify(&actual, &inner).map_err(|m| {
+                                    TypeError::new(
+                                        format!(
+                                            "{} (and linear weakening failed: {})",
+                                            primary_err, m
+                                        ),
+                                        ae.span.clone(),
+                                    )
                                 })?
                             } else {
-                                return Err(TypeError {
-                                    message: primary_err,
-                                    span: ae.span.clone(),
-                                });
+                                return Err(TypeError::new(primary_err, ae.span.clone()));
                             }
                         }
                     };
@@ -1575,17 +1470,14 @@ impl TypeChecker {
                 for ed in all_enums {
                     if let Some(v) = ed.variants.iter().find(|x| x.name == *name) {
                         if v.fields.len() != args.len() {
-                            return Err(TypeError {
-                                message: format!(
+                            return Err(TypeError::new(format!(
                                     "Arity mismatch in constructor `{}`: expected {} arguments, got {}.\nExpected fields: {}\nProvided arguments: {}",
                                     name,
                                     v.fields.len(),
                                     args.len(),
                                     summarize_ctor_fields(&v.fields),
                                     summarize_ctor_args(args)
-                                ),
-                                span: e.span.clone(),
-                            });
+                                ), e.span.clone()));
                         }
                         let mut s = HashMap::new();
                         let targs: Vec<Type> =
@@ -1601,70 +1493,60 @@ impl TypeChecker {
                                     v.fields.iter().position(|(fl, _)| fl.as_ref() == Some(l))
                                 {
                                     if matched[idx].is_some() {
-                                        return Err(TypeError {
-                                            message: format!(
+                                        return Err(TypeError::new(format!(
                                                 "Duplicate labeled argument `{}` in constructor `{}`.\nExpected fields: {}\nProvided arguments: {}",
                                                 l,
                                                 name,
                                                 summarize_ctor_fields(&v.fields),
                                                 summarize_ctor_args(args)
-                                            ),
-                                            span: arg_expr.span.clone(),
-                                        });
+                                            ), arg_expr.span.clone()));
                                     }
                                     matched[idx] = Some(arg_expr);
                                 } else {
-                                    return Err(TypeError {
-                                        message: format!(
+                                    return Err(TypeError::new(format!(
                                             "Unknown label `{}` for constructor `{}`.\nExpected fields: {}\nProvided arguments: {}",
                                             l,
                                             name,
                                             summarize_ctor_fields(&v.fields),
                                             summarize_ctor_args(args)
-                                        ),
-                                        span: arg_expr.span.clone(),
-                                    });
+                                        ), arg_expr.span.clone()));
                                 }
                             } else {
                                 if let Some(idx) = matched.iter().position(|m| m.is_none()) {
                                     matched[idx] = Some(arg_expr);
                                 } else {
-                                    return Err(TypeError {
-                                        message: format!(
+                                    return Err(TypeError::new(format!(
                                             "Too many positional arguments for constructor `{}`.\nExpected fields: {}\nProvided arguments: {}",
                                             name,
                                             summarize_ctor_fields(&v.fields),
                                             summarize_ctor_args(args)
-                                        ),
-                                        span: arg_expr.span.clone(),
-                                    });
+                                        ), arg_expr.span.clone()));
                                 }
                             }
                         }
 
                         for (i, (field_label, ft)) in v.fields.iter().enumerate() {
-                            let ae = matched[i].ok_or_else(|| TypeError {
-                                message: format!(
+                            let ae = matched[i].ok_or_else(|| TypeError::new(format!(
                                     "Missing constructor argument for `{}` at {}.\nExpected fields: {}\nProvided arguments: {}\nHint: provide all fields exactly once (labels are recommended).",
                                     name,
                                     describe_ctor_field(field_label, i),
                                     summarize_ctor_fields(&v.fields),
                                     summarize_ctor_args(args)
-                                ),
-                                span: e.span.clone(),
-                            })?;
+                                ), e.span.clone()))?;
                             let (sa, ta) = self.infer(env, ae, er, eq, ee)?;
                             s = compose_subst(&s, &sa);
                             let su = self
                                 .unify(&ta, &apply_subst_type(&s, &apply_subst_type(&inst, ft)))
-                                .map_err(|m| TypeError {
-                                    message: format!(
-                                        "Type mismatch in constructor `{}` at {}.\nDetails: {}",
-                                        name,
-                                        describe_ctor_field(field_label, i),
-                                        m
-                                    ),
-                                    span: ae.span.clone(),
+                                .map_err(|m| {
+                                    TypeError::new(
+                                        format!(
+                                            "Type mismatch in constructor `{}` at {}.\nDetails: {}",
+                                            name,
+                                            describe_ctor_field(field_label, i),
+                                            m
+                                        ),
+                                        ae.span.clone(),
+                                    )
                                 })?;
                             s = compose_subst(&s, &su);
                         }
@@ -1677,10 +1559,10 @@ impl TypeChecker {
                         ));
                     }
                 }
-                Err(TypeError {
-                    message: format!("Unknown ctor {}", name),
-                    span: e.span.clone(),
-                })
+                Err(TypeError::new(
+                    format!("Unknown ctor {}", name),
+                    e.span.clone(),
+                ))
             }
             Expr::Record(fs) => {
                 let mut s = HashMap::new();
@@ -1700,18 +1582,15 @@ impl TypeChecker {
                     s = compose_subst(&s, &s_ex);
                     let s_unify = self
                         .unify(&t_ex, &apply_subst_type(&s, &elem_type))
-                        .map_err(|m| TypeError {
-                            message: m,
-                            span: ex.span.clone(),
-                        })?;
+                        .map_err(|m| TypeError::new(m, ex.span.clone()))?;
                     s = compose_subst(&s, &s_unify);
                 }
                 let final_elem_type = apply_subst_type(&s, &elem_type);
                 if contains_ref(&final_elem_type) {
-                    return Err(TypeError {
-                        message: "Array cannot contain References".into(),
-                        span: e.span.clone(),
-                    });
+                    return Err(TypeError::new(
+                        "Array cannot contain References",
+                        e.span.clone(),
+                    ));
                 }
                 Ok((s, Type::Array(Box::new(final_elem_type))))
             }
@@ -1723,10 +1602,7 @@ impl TypeChecker {
                     s = compose_subst(&s, &s_ex);
                     let s_unify = self
                         .unify(&t_ex, &apply_subst_type(&s, &elem_type))
-                        .map_err(|m| TypeError {
-                            message: m,
-                            span: ex.span.clone(),
-                        })?;
+                        .map_err(|m| TypeError::new(m, ex.span.clone()))?;
                     s = compose_subst(&s, &s_unify);
                 }
                 let final_elem_type = apply_subst_type(&s, &elem_type);
@@ -1736,10 +1612,9 @@ impl TypeChecker {
                 let (s1, t_arr) = self.infer(env, arr, er, eq, ee)?;
                 let (s2, t_idx) = self.infer(env, idx, er, eq, ee)?;
                 let mut s = compose_subst(&s1, &s2);
-                let s_idx = self.unify(&t_idx, &Type::I64).map_err(|m| TypeError {
-                    message: m,
-                    span: idx.span.clone(),
-                })?;
+                let s_idx = self
+                    .unify(&t_idx, &Type::I64)
+                    .map_err(|m| TypeError::new(m, idx.span.clone()))?;
                 s = compose_subst(&s, &s_idx);
 
                 let t_arr_inst = apply_subst_type(&s, &t_arr);
@@ -1752,31 +1627,23 @@ impl TypeChecker {
                     Type::Array(t) => (**t).clone(),
                     Type::Borrow(inner) => match &**inner {
                         Type::Array(t) => (**t).clone(),
-                        _ => {
-                            return Err(TypeError {
-                                message: "Indexing non-array".into(),
-                                span: arr.span.clone(),
-                            })
-                        }
+                        _ => return Err(TypeError::new("Indexing non-array", arr.span.clone())),
                     },
                     _ => {
                         let et = self.new_var();
                         let su = self
                             .unify(&t_arr_unwrapped, &Type::Array(Box::new(et.clone())))
-                            .map_err(|m| TypeError {
-                                message: m,
-                                span: arr.span.clone(),
-                            })?;
+                            .map_err(|m| TypeError::new(m, arr.span.clone()))?;
                         s = compose_subst(&s, &su);
                         apply_subst_type(&s, &et)
                     }
                 };
 
                 if env.contains_linear_type(&elem_t) {
-                    return Err(TypeError {
-                        message: "Cannot move linear element out of array".into(),
-                        span: e.span.clone(),
-                    });
+                    return Err(TypeError::new(
+                        "Cannot move linear element out of array",
+                        e.span.clone(),
+                    ));
                 }
                 Ok((s, elem_t))
             }
@@ -1799,10 +1666,10 @@ impl TypeChecker {
                         }
                     }
                 }
-                Err(TypeError {
-                    message: format!("Field {} not found", fnm),
-                    span: e.span.clone(),
-                })
+                Err(TypeError::new(
+                    format!("Field {} not found", fnm),
+                    e.span.clone(),
+                ))
             }
             Expr::If {
                 cond,
@@ -1812,10 +1679,9 @@ impl TypeChecker {
                 let (s1, tc) = self.infer(env, cond, er, eq, ee)?;
                 let s = compose_subst(
                     &s1,
-                    &self.unify(&tc, &Type::Bool).map_err(|m| TypeError {
-                        message: m,
-                        span: cond.span.clone(),
-                    })?,
+                    &self
+                        .unify(&tc, &Type::Bool)
+                        .map_err(|m| TypeError::new(m, cond.span.clone()))?,
                 );
                 let mut et = env.clone();
                 et.apply(&s);
@@ -1826,10 +1692,7 @@ impl TypeChecker {
                     self.infer_body(eb, &mut ee_env, er, eq, ee)?;
                 }
                 if et.linear_vars != ee_env.linear_vars {
-                    return Err(TypeError {
-                        message: "Linear mismatch".into(),
-                        span: e.span.clone(),
-                    });
+                    return Err(TypeError::new("Linear mismatch", e.span.clone()));
                 }
                 env.linear_vars = et.linear_vars;
                 Ok((s, Type::Unit))
@@ -1838,13 +1701,10 @@ impl TypeChecker {
                 let (s1, tt) = self.infer(env, target, er, eq, ee)?;
                 let mut s = s1;
                 self.check_exhaustiveness(env, &apply_subst_type(&s, &tt), cases)
-                    .map_err(|m| TypeError {
-                        message: m,
-                        span: e.span.clone(),
-                    })?;
+                    .map_err(|m| TypeError::new(m, e.span.clone()))?;
                 let mut rv: Option<HashSet<String>> = None;
-                // None = diverges (return), Some(type) = tail expression type
-                let mut case_tail_types: Vec<Option<Type>> = Vec::new();
+                // None = diverges (return), Some((type, span)) = tail expression type + span
+                let mut case_tail_types: Vec<Option<(Type, Span)>> = Vec::new();
                 for case in cases {
                     let mut le = env.clone();
                     le.apply(&s);
@@ -1854,7 +1714,7 @@ impl TypeChecker {
                     le.apply(&sm);
                     // Infer body and capture tail expression type
                     if case.body.is_empty() {
-                        case_tail_types.push(Some(Type::Unit));
+                        case_tail_types.push(Some((Type::Unit, case.pattern.span.clone())));
                     } else {
                         let last_idx = case.body.len() - 1;
                         self.infer_body(&case.body[..last_idx], &mut le, er, eq, ee)?;
@@ -1868,24 +1728,23 @@ impl TypeChecker {
                                 if diverges {
                                     case_tail_types.push(None);
                                 } else {
-                                    case_tail_types.push(Some(apply_subst_type(&s, &tail)));
+                                    case_tail_types.push(Some((
+                                        apply_subst_type(&s, &tail),
+                                        expr.span.clone(),
+                                    )));
                                 }
                             }
                             Stmt::Return(expr) => {
                                 let (s1, t1) = self.infer(&mut le, expr, er, eq, ee)?;
                                 le.apply(&s1);
                                 le.check_unused_linear(&expr.span)?;
-                                self.unify(&t1, &apply_subst_type(&s1, er)).map_err(|err| {
-                                    TypeError {
-                                        message: err,
-                                        span: expr.span.clone(),
-                                    }
-                                })?;
+                                self.unify(&t1, &apply_subst_type(&s1, er))
+                                    .map_err(|err| TypeError::new(err, expr.span.clone()))?;
                                 case_tail_types.push(None); // diverges
                             }
                             _ => {
                                 self.infer_body(&case.body[last_idx..], &mut le, er, eq, ee)?;
-                                case_tail_types.push(Some(Type::Unit));
+                                case_tail_types.push(Some((Type::Unit, last.span.clone())));
                             }
                         }
                     }
@@ -1893,10 +1752,10 @@ impl TypeChecker {
                     if !case_diverges {
                         if let Some(p) = &rv {
                             if p != &le.linear_vars {
-                                return Err(TypeError {
-                                    message: "Linear mismatch".into(),
-                                    span: case.pattern.span.clone(),
-                                });
+                                return Err(TypeError::new(
+                                    "Linear mismatch",
+                                    case.pattern.span.clone(),
+                                ));
                             }
                         } else {
                             rv = Some(le.linear_vars.clone());
@@ -1911,18 +1770,28 @@ impl TypeChecker {
                     env.linear_vars.clear();
                 }
                 // Unify non-diverging case tail types
-                let non_diverging: Vec<&Type> =
-                    case_tail_types.iter().filter_map(|t| t.as_ref()).collect();
+                let non_diverging: Vec<(&Type, &Span)> = case_tail_types
+                    .iter()
+                    .filter_map(|t| t.as_ref().map(|(ty, sp)| (ty, sp)))
+                    .collect();
                 if non_diverging.is_empty() {
                     Ok((s, Type::Unit))
                 } else {
-                    let mut result_type = non_diverging[0].clone();
-                    for ct in &non_diverging[1..] {
-                        let su = self.unify(&result_type, ct).map_err(|_| TypeError {
-                            message:
-                                "Match case type mismatch: all cases must produce the same type"
-                                    .into(),
-                            span: e.span.clone(),
+                    let (first_type, first_span) = non_diverging[0];
+                    let mut result_type = first_type.clone();
+                    for (ct, ct_span) in &non_diverging[1..] {
+                        let su = self.unify(&result_type, ct).map_err(|_| {
+                            TypeError::new(
+                                format!(
+                                    "Match case type mismatch: expected `{}`, found `{}`",
+                                    result_type, ct
+                                ),
+                                (*ct_span).clone(),
+                            )
+                            .with_labels(vec![(
+                                first_span.clone(),
+                                format!("first case has type `{}`", result_type),
+                            )])
                         })?;
                         s = compose_subst(&s, &su);
                         result_type = apply_subst_type(&su, &result_type);
@@ -1934,10 +1803,9 @@ impl TypeChecker {
                 let (s1, tc) = self.infer(env, cond, er, eq, ee)?;
                 let s = compose_subst(
                     &s1,
-                    &self.unify(&tc, &Type::Bool).map_err(|m| TypeError {
-                        message: m,
-                        span: cond.span.clone(),
-                    })?,
+                    &self
+                        .unify(&tc, &Type::Bool)
+                        .map_err(|m| TypeError::new(m, cond.span.clone()))?,
                 );
                 let mut le = env.clone();
                 le.apply(&s);
@@ -1952,17 +1820,15 @@ impl TypeChecker {
             } => {
                 let (s1, ts) = self.infer(env, start, er, eq, ee)?;
                 env.apply(&s1);
-                let su_start = self.unify(&ts, &Type::I64).map_err(|m| TypeError {
-                    message: m,
-                    span: start.span.clone(),
-                })?;
+                let su_start = self
+                    .unify(&ts, &Type::I64)
+                    .map_err(|m| TypeError::new(m, start.span.clone()))?;
                 let mut s = compose_subst(&s1, &su_start);
                 let (s2, te) = self.infer(env, end_expr, er, eq, ee)?;
                 s = compose_subst(&s, &s2);
-                let su_end = self.unify(&te, &Type::I64).map_err(|m| TypeError {
-                    message: m,
-                    span: end_expr.span.clone(),
-                })?;
+                let su_end = self
+                    .unify(&te, &Type::I64)
+                    .map_err(|m| TypeError::new(m, end_expr.span.clone()))?;
                 s = compose_subst(&s, &su_end);
                 let mut le = env.clone();
                 le.apply(&s);
@@ -1985,10 +1851,7 @@ impl TypeChecker {
                 body,
             } => {
                 if contains_ref(ret_type) {
-                    return Err(TypeError {
-                        message: "Cannot return Ref".into(),
-                        span: e.span.clone(),
-                    });
+                    return Err(TypeError::new("Cannot return Ref", e.span.clone()));
                 }
 
                 let mut lambda_env = env.clone();
@@ -2000,10 +1863,10 @@ impl TypeChecker {
                 for key in &captured {
                     if let Some(sch) = env.get(key) {
                         if contains_ref(&sch.typ) {
-                            return Err(TypeError {
-                                message: format!("Lambda cannot capture Ref value '{}'", key),
-                                span: e.span.clone(),
-                            });
+                            return Err(TypeError::new(
+                                format!("Lambda cannot capture Ref value '{}'", key),
+                                e.span.clone(),
+                            ));
                         }
                         if env.contains_linear_type(&sch.typ) {
                             captured_linear_keys.insert(key.clone());
@@ -2023,12 +1886,10 @@ impl TypeChecker {
 
                 self.infer_body(body, &mut lambda_env, ret_type, requires, throws)?;
                 if !contains_return(body) && !matches!(ret_type, Type::Unit) {
-                    return Err(TypeError {
-                        message:
-                            "Function body has no return statement; implicit return type is Unit"
-                                .into(),
-                        span: e.span.clone(),
-                    });
+                    return Err(TypeError::new(
+                        "Function body has no return statement; implicit return type is Unit",
+                        e.span.clone(),
+                    ));
                 }
                 let remaining_lambda_linear: HashSet<String> = lambda_env
                     .linear_vars
@@ -2043,10 +1904,10 @@ impl TypeChecker {
                     .cloned()
                     .collect();
                 if !remaining_lambda_linear.is_empty() {
-                    return Err(TypeError {
-                        message: format!("Unused linear in lambda: {:?}", remaining_lambda_linear),
-                        span: e.span.clone(),
-                    });
+                    return Err(TypeError::new(
+                        format!("Unused linear in lambda: {:?}", remaining_lambda_linear),
+                        e.span.clone(),
+                    ));
                 }
                 let consumed_outer_linear: HashSet<String> = before_linear
                     .difference(&lambda_env.linear_vars)
@@ -2055,10 +1916,8 @@ impl TypeChecker {
                 captured_linear_keys.extend(consumed_outer_linear);
                 let has_linear_capture = !captured_linear_keys.is_empty();
                 for key in captured_linear_keys {
-                    env.consume(&key).map_err(|m| TypeError {
-                        message: m,
-                        span: e.span.clone(),
-                    })?;
+                    env.consume(&key)
+                        .map_err(|m| TypeError::new(m, e.span.clone()))?;
                 }
 
                 let arrow_typ = Type::Arrow(
@@ -2109,13 +1968,13 @@ impl TypeChecker {
                     self.check_function(f, env, &e.span, handler_requires)?;
 
                     let Some(expected_method_type) = expected_methods.get(&f.name).cloned() else {
-                        return Err(TypeError {
-                            message: format!(
+                        return Err(TypeError::new(
+                            format!(
                                 "Handler '{}.{}' is not declared in port '{}'",
                                 coeffect_name, f.name, coeffect_name
                             ),
-                            span: e.span.clone(),
-                        });
+                            e.span.clone(),
+                        ));
                     };
 
                     let expected_impl_type =
@@ -2130,12 +1989,14 @@ impl TypeChecker {
                         Box::new(f.throws.clone()),
                     );
                     self.unify(&actual_impl_type, &expected_impl_type)
-                        .map_err(|m| TypeError {
-                            message: format!(
-                                "Handler '{}.{}' signature mismatch: {}",
-                                coeffect_name, f.name, m
-                            ),
-                            span: e.span.clone(),
+                        .map_err(|m| {
+                            TypeError::new(
+                                format!(
+                                    "Handler '{}.{}' signature mismatch: {}",
+                                    coeffect_name, f.name, m
+                                ),
+                                e.span.clone(),
+                            )
                         })?;
                     implemented.insert(f.name.clone());
                 }
@@ -2147,14 +2008,14 @@ impl TypeChecker {
                     .collect();
                 missing.sort();
                 if !missing.is_empty() {
-                    return Err(TypeError {
-                        message: format!(
+                    return Err(TypeError::new(
+                        format!(
                             "Handler '{}' is missing methods: {}",
                             coeffect_name,
                             missing.join(", ")
                         ),
-                        span: e.span.clone(),
-                    });
+                        e.span.clone(),
+                    ));
                 }
                 Ok((
                     HashMap::new(),
@@ -2164,19 +2025,15 @@ impl TypeChecker {
             Expr::Raise(ex) => {
                 let (s, t) = self.infer(env, ex, er, eq, ee)?;
                 let exn_value_type = Type::UserDefined("Exn".into(), vec![]);
-                let ss = self.unify(&t, &exn_value_type).map_err(|m| TypeError {
-                    message: m,
-                    span: ex.span.clone(),
-                })?;
+                let ss = self
+                    .unify(&t, &exn_value_type)
+                    .map_err(|m| TypeError::new(m, ex.span.clone()))?;
                 let mut s = compose_subst(&s, &ss);
                 let exn_type = Type::UserDefined("Exn".into(), vec![]);
                 let required_eff = Type::Row(vec![exn_type], Some(Box::new(self.new_var())));
                 let s_eff = self
                     .unify(&apply_subst_type(&s, ee), &required_eff)
-                    .map_err(|_| TypeError {
-                        message: "raise requires 'Exn'".into(),
-                        span: e.span.clone(),
-                    })?;
+                    .map_err(|_| TypeError::new("raise requires 'Exn'", e.span.clone()))?;
                 s = compose_subst(&s, &s_eff);
                 Ok((s, self.new_var()))
             }
@@ -2224,26 +2081,20 @@ impl TypeChecker {
                 for ed in all_enums {
                     if let Some(v) = ed.variants.iter().find(|x| x.name == *n) {
                         if v.fields.len() != pats.len() {
-                            return Err(TypeError {
-                                message: format!(
+                            return Err(TypeError::new(format!(
                                     "Arity mismatch in pattern `{}`: expected {} fields, got {}.\nExpected fields: {}\nProvided pattern arguments: {}",
                                     n,
                                     v.fields.len(),
                                     pats.len(),
                                     summarize_ctor_fields(&v.fields),
                                     summarize_ctor_args(pats)
-                                ),
-                                span: p.span.clone(),
-                            });
+                                ), p.span.clone()));
                         }
                         let targs: Vec<Type> =
                             ed.type_params.iter().map(|_| self.new_var()).collect();
                         let s_en = self
                             .unify(tt, &Type::UserDefined(ed.name.clone(), targs.clone()))
-                            .map_err(|m| TypeError {
-                                message: m,
-                                span: p.span.clone(),
-                            })?;
+                            .map_err(|m| TypeError::new(m, p.span.clone()))?;
                         let mut subst = s_en;
                         let mut inst = HashMap::new();
                         for (pa, a) in ed.type_params.iter().zip(targs) {
@@ -2256,58 +2107,46 @@ impl TypeChecker {
                                     v.fields.iter().position(|(fl, _)| fl.as_ref() == Some(l))
                                 {
                                     if matched[idx].is_some() {
-                                        return Err(TypeError {
-                                            message: format!(
+                                        return Err(TypeError::new(format!(
                                                 "Duplicate labeled pattern argument `{}` in constructor `{}`.\nExpected fields: {}\nProvided pattern arguments: {}",
                                                 l,
                                                 n,
                                                 summarize_ctor_fields(&v.fields),
                                                 summarize_ctor_args(pats)
-                                            ),
-                                            span: pat.span.clone(),
-                                        });
+                                            ), pat.span.clone()));
                                     }
                                     matched[idx] = Some(pat);
                                 } else {
-                                    return Err(TypeError {
-                                        message: format!(
+                                    return Err(TypeError::new(format!(
                                             "Unknown label `{}` for constructor pattern `{}`.\nExpected fields: {}\nProvided pattern arguments: {}",
                                             l,
                                             n,
                                             summarize_ctor_fields(&v.fields),
                                             summarize_ctor_args(pats)
-                                        ),
-                                        span: pat.span.clone(),
-                                    });
+                                        ), pat.span.clone()));
                                 }
                             } else {
                                 if let Some(idx) = matched.iter().position(|m| m.is_none()) {
                                     matched[idx] = Some(pat);
                                 } else {
-                                    return Err(TypeError {
-                                        message: format!(
+                                    return Err(TypeError::new(format!(
                                             "Too many positional pattern arguments for constructor `{}`.\nExpected fields: {}\nProvided pattern arguments: {}",
                                             n,
                                             summarize_ctor_fields(&v.fields),
                                             summarize_ctor_args(pats)
-                                        ),
-                                        span: pat.span.clone(),
-                                    });
+                                        ), pat.span.clone()));
                                 }
                             }
                         }
 
                         for (i, (field_label, ft)) in v.fields.iter().enumerate() {
-                            let pt = matched[i].ok_or_else(|| TypeError {
-                                message: format!(
+                            let pt = matched[i].ok_or_else(|| TypeError::new(format!(
                                     "Missing constructor pattern argument for `{}` at {}.\nExpected fields: {}\nProvided pattern arguments: {}\nHint: provide a pattern for every field.",
                                     n,
                                     describe_ctor_field(field_label, i),
                                     summarize_ctor_fields(&v.fields),
                                     summarize_ctor_args(pats)
-                                ),
-                                span: p.span.clone(),
-                            })?;
+                                ), p.span.clone()))?;
                             let sp = self.bind_pattern(
                                 pt,
                                 &apply_subst_type(&subst, &apply_subst_type(&inst, ft)),
@@ -2318,10 +2157,10 @@ impl TypeChecker {
                         return Ok(subst);
                     }
                 }
-                Err(TypeError {
-                    message: format!("Unknown ctor {}", n),
-                    span: p.span.clone(),
-                })
+                Err(TypeError::new(
+                    format!("Unknown ctor {}", n),
+                    p.span.clone(),
+                ))
             }
             Pattern::Literal(l) => {
                 let tl = match l {
@@ -2332,20 +2171,15 @@ impl TypeChecker {
                     Literal::String(_) => Type::String,
                     Literal::Unit => Type::Unit,
                 };
-                self.unify(tt, &tl).map_err(|m| TypeError {
-                    message: m,
-                    span: p.span.clone(),
-                })
+                self.unify(tt, &tl)
+                    .map_err(|m| TypeError::new(m, p.span.clone()))
             }
             Pattern::Wildcard => {
                 if env.contains_linear_type(tt) && !is_auto_droppable(tt) {
-                    return Err(TypeError {
-                        message: format!(
+                    return Err(TypeError::new(format!(
                             "Wildcard pattern '_' cannot discard non-primitive linear value of type {:?}",
                             tt
-                        ),
-                        span: p.span.clone(),
-                    });
+                        ), p.span.clone()));
                 }
                 Ok(HashMap::new())
             }
@@ -2370,18 +2204,10 @@ impl TypeChecker {
                             }
                             m
                         } else {
-                            return Err(TypeError {
-                                message: "Unknown type".into(),
-                                span: p.span.clone(),
-                            });
+                            return Err(TypeError::new("Unknown type", p.span.clone()));
                         }
                     }
-                    _ => {
-                        return Err(TypeError {
-                            message: "Not record".into(),
-                            span: p.span.clone(),
-                        })
-                    }
+                    _ => return Err(TypeError::new("Not record", p.span.clone())),
                 };
                 let mut sub = HashMap::new();
                 let mut matched = HashSet::new();
@@ -2391,19 +2217,13 @@ impl TypeChecker {
                         sub = compose_subst(&sub, &sp);
                         matched.insert(n.clone());
                     } else {
-                        return Err(TypeError {
-                            message: format!("No field {}", n),
-                            span: pt.span.clone(),
-                        });
+                        return Err(TypeError::new(format!("No field {}", n), pt.span.clone()));
                     }
                 }
                 if !open {
                     for k in tfs.keys() {
                         if !matched.contains(k) {
-                            return Err(TypeError {
-                                message: format!("Missing {}", k),
-                                span: p.span.clone(),
-                            });
+                            return Err(TypeError::new(format!("Missing {}", k), p.span.clone()));
                         }
                     }
                 }
