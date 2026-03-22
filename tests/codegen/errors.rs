@@ -4,7 +4,7 @@ use crate::harness::{exec_should_trap, try_compile};
 #[test]
 fn snapshot_codegen_error_unsupported_external() {
     let src = r#"
-    import external fake.wasm
+    import external "fake.wasm"
     external bad = "bad" : (val: i64) -> { x: i64 }
     let main = fn () -> unit do
         let x = bad(val: 42)

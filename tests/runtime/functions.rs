@@ -5,7 +5,7 @@ use std::fs;
 fn codegen_module_alias_call_compiles() {
     exec(
         r#"
-import * as math from examples/math.nx
+import * as math from "examples/math.nx"
 
 let main = fn () -> unit do
     let result = math.add(a: 19, b: 23)
@@ -45,7 +45,7 @@ fn codegen_fixture_network_access_compiles() {
 fn codegen_print_works_via_external_stdio_module() {
     exec_with_stdlib(
         r#"
-import external stdlib/stdlib.wasm
+import external "stdlib/stdlib.wasm"
 external __nx_print = "__nx_print" : (val: string) -> unit
 
 let main = fn () -> unit do
@@ -60,7 +60,7 @@ end
 fn codegen_print_after_from_i64_works_via_single_string_abi_module() {
     exec_with_stdlib(
         r#"
-import external stdlib/stdlib.wasm
+import external "stdlib/stdlib.wasm"
 external __nx_print = "__nx_print" : (val: string) -> unit
 
 let main = fn () -> unit do
@@ -76,7 +76,7 @@ end
 fn codegen_handler_reachability_resolves_port_call() {
     exec_with_stdlib(
         r#"
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do

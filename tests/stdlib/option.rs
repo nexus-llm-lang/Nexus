@@ -4,7 +4,7 @@ use crate::harness::exec_with_stdlib;
 fn option_some_is_some() {
     exec_with_stdlib(
         r#"
-import { Option, is_some } from stdlib/option.nx
+import { Option, is_some } from "stdlib/option.nx"
 
 let main = fn () -> unit do
   let opt = Some(val: 42)
@@ -20,7 +20,7 @@ end
 fn option_unwrap_or_some() {
     exec_with_stdlib(
         r#"
-import { Option, unwrap_or } from stdlib/option.nx
+import { Option, unwrap_or } from "stdlib/option.nx"
 
 let main = fn () -> unit do
   let opt = Some(val: 10)
@@ -36,7 +36,7 @@ end
 fn option_or_else_prefers_some() {
     exec_with_stdlib(
         r#"
-import { Option, or_else, unwrap_or } from stdlib/option.nx
+import { Option, or_else, unwrap_or } from "stdlib/option.nx"
 
 let main = fn () -> unit do
   let a: Option<i64> = None
@@ -53,7 +53,7 @@ end
 fn option_none_is_none() {
     exec_with_stdlib(
         r#"
-import { Option, is_none } from stdlib/option.nx
+import { Option, is_none } from "stdlib/option.nx"
 
 let main = fn () -> unit do
   let opt: Option<i64> = None
@@ -69,7 +69,7 @@ end
 fn option_unwrap_or_none() {
     exec_with_stdlib(
         r#"
-import { Option, unwrap_or } from stdlib/option.nx
+import { Option, unwrap_or } from "stdlib/option.nx"
 
 let main = fn () -> unit do
   let opt: Option<i64> = None
@@ -85,7 +85,7 @@ end
 fn tuple_fst_returns_left() {
     exec_with_stdlib(
         r#"
-import { Pair, fst } from stdlib/tuple.nx
+import { Pair, fst } from "stdlib/tuple.nx"
 
 let main = fn () -> unit do
   let p = Pair(left: 10, right: 20)
