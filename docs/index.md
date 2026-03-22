@@ -16,7 +16,7 @@ Garbage collection, implicit conversions, ambient I/O, continuation-based contro
 Capability requirements declared in function signatures. Dependency injection via ports and handlers.
 
 ```nexus
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do

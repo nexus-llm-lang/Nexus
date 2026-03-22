@@ -33,10 +33,11 @@ variant_field ::= type | IDENT ":" type
 exception_def ::= [ "export" ] "exception" UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
 
 import_def  ::= "import" "external" import_path
-        | "import" "{" IDENT ( "," IDENT )* "}" [ "," "*" "as" IDENT ] "from" import_path
+        | "import" "{" import_item ( "," import_item )* "}" [ "," "*" "as" IDENT ] "from" import_path
         | "import" "*" "as" IDENT "from" import_path
         | "import" "from" import_path
-import_path   ::= ( ALPHA | DIGIT | "_" | "-" | "/" | "." )+
+import_item   ::= IDENT [ "as" IDENT ]
+import_path   ::= STRING_LITERAL
 
 port_def    ::= [ "export" ] "port" UIDENT "do" fn_signature* "end"
 fn_signature  ::= "fn" IDENT param_list "->" type [ "require" throws_type ] [ "throws" throws_type ]
@@ -254,19 +255,22 @@ String concatenation: `++`
 
 ```nexus
 // Import specific names (ports, types, handlers)
-import { Console, system_handler } from stdlib/stdio.nx
+import { Console, system_handler } from "stdlib/stdio.nx"
+
+// Import with renaming
+import { Console as C, system_handler } from "stdlib/stdio.nx"
 
 // Import specific names + module alias
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 // Import as module alias only
-import * as list from stdlib/list.nx
+import * as list from "stdlib/list.nx"
 
 // Import for side effects (rare)
-import from some/module.nx
+import from "some/module.nx"
 
 // Import WASM module
-import external stdlib/stdlib.wasm
+import external "stdlib/stdlib.wasm"
 ```
 
 ## Keywords

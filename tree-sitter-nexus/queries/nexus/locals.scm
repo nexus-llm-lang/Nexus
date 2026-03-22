@@ -30,6 +30,23 @@
 (variable_pattern
   name: (identifier) @local.definition)
 
+(let_pattern_stmt) @local.scope
+
+(let_pattern_stmt
+  pattern: (variable_pattern
+    name: (identifier) @local.definition))
+
+(let_pattern_stmt
+  pattern: (constructor_pattern
+    (ctor_pat_arg
+      pattern: (variable_pattern
+        name: (identifier) @local.definition))))
+
+(let_pattern_stmt
+  pattern: (record_pattern
+    field_pattern: (variable_pattern
+      name: (identifier) @local.definition)))
+
 ; ─── References ─────────────────────────────────────────────────────────────
 
 (variable

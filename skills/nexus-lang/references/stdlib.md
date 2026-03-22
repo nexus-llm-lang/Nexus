@@ -1,6 +1,6 @@
 # Nexus Standard Library Reference
 
-All stdlib modules are in `stdlib/` and imported with `import ... from stdlib/<module>.nx`.
+All stdlib modules are in `stdlib/` and imported with `import ... from "stdlib/<module>.nx"`.
 
 ## I/O Modules (Capability-Gated)
 
@@ -9,10 +9,12 @@ All stdlib modules are in `stdlib/` and imported with `import ... from stdlib/<m
 **Port**: `Console` | **Handler**: `system_handler`
 
 ```nexus
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 Console.print(val: string) -> unit        // print without newline
 Console.println(val: string) -> unit      // print with newline
+Console.eprint(val: string) -> unit       // print to stderr without newline
+Console.eprintln(val: string) -> unit     // print to stderr with newline
 Console.read_line() -> string             // read line from stdin
 Console.getchar() -> string               // read single char
 ```
@@ -23,7 +25,7 @@ Console.getchar() -> string               // read single char
 **Linear type**: `Handle = Handle(id: i64)`
 
 ```nexus
-import { Fs, Handle }, * as fs_mod from stdlib/fs.nx
+import { Fs, Handle }, * as fs_mod from "stdlib/fs.nx"
 
 // Direct file operations
 Fs.exists(path: string) -> bool
@@ -50,7 +52,7 @@ Fs.close(handle: Handle) -> unit                     // consumes handle
 **Port**: `Net` | **Handler**: `system_handler`
 
 ```nexus
-import { Net, Header, Response, Server, Request, request_method, request_path, request_body }, * as net_mod from stdlib/net.nx
+import { Net, Header, Response, Server, Request, request_method, request_path, request_body }, * as net_mod from "stdlib/net.nx"
 
 // HTTP Client
 Net.get(url: string) -> Response throws { Exn }
@@ -80,7 +82,7 @@ request_body(req: &Request) -> string
 **Port**: `Random` | **Handler**: `system_handler`
 
 ```nexus
-import { Random }, * as rand_mod from stdlib/random.nx
+import { Random }, * as rand_mod from "stdlib/random.nx"
 
 Random.next_i64() -> i64
 Random.range(min: i64, max: i64) -> i64
@@ -92,7 +94,7 @@ Random.next_bool() -> bool
 **Port**: `Clock` | **Handler**: `system_handler`
 
 ```nexus
-import { Clock }, * as clock_mod from stdlib/clock.nx
+import { Clock }, * as clock_mod from "stdlib/clock.nx"
 
 Clock.sleep(ms: i64) -> unit
 Clock.now() -> i64                // milliseconds since epoch
@@ -103,9 +105,16 @@ Clock.now() -> i64                // milliseconds since epoch
 **Port**: `Proc` | **Handler**: `system_handler`
 
 ```nexus
-import { Proc }, * as proc_mod from stdlib/proc.nx
+import { Proc }, * as proc_mod from "stdlib/proc.nx"
+
+type ExecResult = ExecResult(exit_code: i64, stdout: string, stderr: string)
 
 Proc.exit(status: i64) -> unit
+Proc.argv() -> [ string ]
+Proc.exec(cmd: string, args: [ string ]) -> ExecResult
+
+// Direct-call (no inject needed):
+proc_mod.argv() -> [ string ] require { PermProc }
 ```
 
 ### Environment — `stdlib/env.nx`
@@ -113,7 +122,7 @@ Proc.exit(status: i64) -> unit
 **Port**: `Env` | **Handler**: `system_handler`
 
 ```nexus
-import { Env }, * as env_mod from stdlib/env.nx
+import { Env }, * as env_mod from "stdlib/env.nx"
 
 Env.get(key: string) -> Option<string>
 Env.set(key: string, value: string) -> unit
@@ -126,8 +135,8 @@ Env.set(key: string, value: string) -> unit
 ### Option — `stdlib/option.nx`
 
 ```nexus
-import { Option, Some, None } from stdlib/option.nx
-import * as option from stdlib/option.nx
+import { Option, Some, None } from "stdlib/option.nx"
+import * as option from "stdlib/option.nx"
 
 type Option<T> = Some(val: T) | None
 
@@ -144,8 +153,8 @@ option.expect(opt: Option<T>, msg: string) -> T throws { Exn }
 ### Result — `stdlib/result.nx`
 
 ```nexus
-import { Result, Ok, Err } from stdlib/result.nx
-import * as result from stdlib/result.nx
+import { Result, Ok, Err } from "stdlib/result.nx"
+import * as result from "stdlib/result.nx"
 
 type Result<T, E> = Ok(val: T) | Err(err: E)
 
@@ -162,7 +171,7 @@ result.to_exn(res: Result<T, Exn>) -> T throws { Exn }
 ### List — `stdlib/list.nx`
 
 ```nexus
-import * as list from stdlib/list.nx
+import * as list from "stdlib/list.nx"
 
 type List<T> = Nil | Cons(v: T, rest: List<T>)
 // Alias: [ T ]
@@ -188,8 +197,8 @@ list.map(xs: [ T ], f: (val: T) -> U) -> [ U ]
 ### Tuple — `stdlib/tuple.nx`
 
 ```nexus
-import { Pair } from stdlib/tuple.nx
-import * as tuple from stdlib/tuple.nx
+import { Pair } from "stdlib/tuple.nx"
+import * as tuple from "stdlib/tuple.nx"
 
 type Pair<A, B> = Pair(left: A, right: B)
 
@@ -200,7 +209,7 @@ tuple.snd(p: Pair<A, B>) -> B
 ### Array — `stdlib/array.nx` (Linear)
 
 ```nexus
-import * as array from stdlib/array.nx
+import * as array from "stdlib/array.nx"
 
 // Arrays are [| T |] — linear, mutable
 
@@ -226,8 +235,8 @@ array.consume(arr: [| T |]) -> unit       // explicit linear consumption
 ### Set — `stdlib/set.nx` (Linear, Opaque)
 
 ```nexus
-import { Set } from stdlib/set.nx
-import * as set from stdlib/set.nx
+import { Set } from "stdlib/set.nx"
+import * as set from "stdlib/set.nx"
 
 opaque type Set = Set(id: i64)
 
@@ -247,8 +256,8 @@ set.free(s: Set) -> unit                  // explicit cleanup
 ### HashMap — `stdlib/hashmap.nx` (Linear, Opaque, i64→i64)
 
 ```nexus
-import { HashMap, Lookup, Found, Missing } from stdlib/hashmap.nx
-import * as hmap from stdlib/hashmap.nx
+import { HashMap, Lookup, Found, Missing } from "stdlib/hashmap.nx"
+import * as hmap from "stdlib/hashmap.nx"
 
 opaque type HashMap = HashMap(id: i64)
 type Lookup = Found(value: i64) | Missing
@@ -268,8 +277,8 @@ hmap.free(m: HashMap) -> unit
 ### StringMap — `stdlib/stringmap.nx` (Linear, Opaque, string→i64)
 
 ```nexus
-import { StringMap } from stdlib/stringmap.nx
-import * as smap from stdlib/stringmap.nx
+import { StringMap } from "stdlib/stringmap.nx"
+import * as smap from "stdlib/stringmap.nx"
 
 // Same API as HashMap but keys are string
 smap.empty() -> StringMap
@@ -282,8 +291,8 @@ smap.free(m: StringMap) -> unit
 ### ByteBuffer — `stdlib/bytebuffer.nx` (Linear, Opaque)
 
 ```nexus
-import { ByteBuffer } from stdlib/bytebuffer.nx
-import * as buf from stdlib/bytebuffer.nx
+import { ByteBuffer } from "stdlib/bytebuffer.nx"
+import * as buf from "stdlib/bytebuffer.nx"
 
 opaque type ByteBuffer = ByteBuffer(id: i64)
 
@@ -309,7 +318,7 @@ buf.free(b: ByteBuffer) -> unit
 ### String — `stdlib/string.nx`
 
 ```nexus
-import * as str from stdlib/string.nx
+import * as str from "stdlib/string.nx"
 
 // Inspection
 str.length(s: string) -> i64
@@ -340,12 +349,14 @@ str.from_bool(val: bool) -> string
 str.from_char(c: char) -> string
 str.from_char_code(code: i64) -> string               // Unicode codepoint → string
 str.parse_i64(s: string) -> Option<i64>
+str.parse_f64(s: string) -> Option<f64>
+str.to_f64(s: string) -> f64 throws { Exn }
 ```
 
 ### Math — `stdlib/math.nx`
 
 ```nexus
-import * as math from stdlib/math.nx
+import * as math from "stdlib/math.nx"
 
 // Integer
 math.abs(n: i64) -> i64
@@ -369,7 +380,7 @@ math.negate(b: bool) -> bool
 ### Exception Utilities — `stdlib/exn.nx`
 
 ```nexus
-import * as exn from stdlib/exn.nx
+import * as exn from "stdlib/exn.nx"
 
 exn.to_string(exn: Exn) -> string
 exn.backtrace(exn: Exn) -> [ string ]    // frames with file:line info
@@ -378,7 +389,7 @@ exn.backtrace(exn: Exn) -> [ string ]    // frames with file:line info
 ### Char — `stdlib/char.nx`
 
 ```nexus
-import * as char from stdlib/char.nx
+import * as char from "stdlib/char.nx"
 
 char.ord(c: char) -> i64
 char.is_upper(c: char) -> bool

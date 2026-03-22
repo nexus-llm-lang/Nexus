@@ -122,7 +122,7 @@ export default grammar({
           seq("external", field("path", $.import_path)),
           seq(
             "{",
-            field("items", commaSep1(choice($.identifier, $.uident))),
+            field("items", commaSep1($.import_item)),
             "}",
             ",",
             "*",
@@ -133,7 +133,7 @@ export default grammar({
           ),
           seq(
             "{",
-            field("items", commaSep1(choice($.identifier, $.uident))),
+            field("items", commaSep1($.import_item)),
             "}",
             "from",
             field("path", $.import_path)
@@ -148,9 +148,15 @@ export default grammar({
         )
       ),
 
-    // Bare import path: alphanumeric segments separated by / with optional .ext
-    // e.g. nxlib/stdlib/fs.nx, math.wasm
-    import_path: ($) => /[a-zA-Z0-9_\-/.]+/,
+    // Import item: name or Name, optionally renamed with `as`
+    import_item: ($) =>
+      seq(
+        field("name", choice($.identifier, $.uident)),
+        optional(seq("as", field("alias", $.identifier)))
+      ),
+
+    // Import path: quoted string (e.g. "nxlib/stdlib/fs.nx")
+    import_path: ($) => $.string_literal,
 
     // [pub] port Name do fn sig ... end
     port_def: ($) =>
@@ -190,12 +196,11 @@ export default grammar({
         "end"
       ),
 
-    // [pub] let [sigil] name [: type] = expr
+    // [pub] let name [: type] = expr
     let_def: ($) =>
       seq(
         optional("export"),
         "let",
-        optional(field("sigil", $.sigil)),
         field("name", $.identifier),
         optional(seq(":", field("type", $._type))),
         "=",
@@ -237,7 +242,7 @@ export default grammar({
       ),
 
     primitive_type: (_) =>
-      choice("i32", "i64", "f32", "f64", "float", "bool", "string", "unit"),
+      choice("i32", "i64", "f32", "f64", "float", "bool", "string", "char", "unit"),
 
     // ref(T)
     ref_type: ($) => seq("ref", "(", field("inner", $._type), ")"),
@@ -321,7 +326,7 @@ export default grammar({
         $.let_stmt,
         $.return_stmt,
         $.assign_stmt,
-        $.drop_stmt,
+        $.let_pattern_stmt,
         $.if_stmt,
         $.match_stmt,
         $.while_stmt,
@@ -336,14 +341,14 @@ export default grammar({
 
     // let [sigil] name [: type] = expr
     let_stmt: ($) =>
-      seq(
+      prec(1, seq(
         "let",
         optional(field("sigil", $.sigil)),
         field("name", $.identifier),
         optional(seq(":", field("type", $._type))),
         "=",
         field("value", $._expr)
-      ),
+      )),
 
     return_stmt: ($) => seq("return", field("value", $._expr)),
 
@@ -446,8 +451,14 @@ export default grammar({
         "end"
       ),
 
-    // drop %x
-    drop_stmt: ($) => seq("drop", field("value", $._expr)),
+    // let pattern = expr  (destructuring)
+    let_pattern_stmt: ($) =>
+      seq(
+        "let",
+        field("pattern", $._pattern),
+        "=",
+        field("value", $._expr)
+      ),
 
     expr_stmt: ($) => $._expr,
 
@@ -571,6 +582,7 @@ export default grammar({
         $.constructor_expr,
         $.record_expr,
         $.array_expr,
+        $.linear_list_expr,
         $.list_expr,
         $.literal,
         $.variable
@@ -691,6 +703,10 @@ export default grammar({
     list_expr: ($) =>
       seq("[", field("elements", commaSep($._expr)), optional(","), "]"),
 
+    // %[e1, e2, ...]  — linear list literal
+    linear_list_expr: ($) =>
+      seq("%", "[", field("elements", commaSep($._expr)), optional(","), "]"),
+
     // [| e1, e2, ... |]  — trailing comma allowed per spec
     array_expr: ($) =>
       seq(
@@ -723,8 +739,13 @@ export default grammar({
         $.integer_literal,
         $.boolean_literal,
         $.unit_literal,
-        $.string_literal
+        $.string_literal,
+        $.char_literal
       ),
+
+    // 'a', '\n', '\xNN', '\u{HHHH}', etc.
+    char_literal: (_) =>
+      token(seq("'", choice(/\\[0abtnvfre\\'"]/, /\\[0-7]{1,3}/, /\\x[0-9a-fA-F]{2}/, /\\u\{[0-9a-fA-F]+\}/, /[^'\\]/), "'")),
 
     // Must come before integer_literal to consume the decimal part
     float_literal: (_) => token(prec(2, /-?[0-9]+\.[0-9]+/)),

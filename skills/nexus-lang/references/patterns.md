@@ -11,7 +11,7 @@ let main = fn () -> unit do
 end
 
 // With I/O
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do
@@ -25,19 +25,19 @@ end
 
 ```nexus
 // Import port + module alias (most common for I/O)
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 // Import specific items
-import { Option, Some, None } from stdlib/option.nx
-import { Result, Ok, Err } from stdlib/result.nx
+import { Option, Some, None } from "stdlib/option.nx"
+import { Result, Ok, Err } from "stdlib/result.nx"
 
 // Import as module alias (for utility functions)
-import * as list from stdlib/list.nx
-import * as str from stdlib/string.nx
-import * as math from stdlib/math.nx
+import * as list from "stdlib/list.nx"
+import * as str from "stdlib/string.nx"
+import * as math from "stdlib/math.nx"
 
 // Combine both
-import { Net, Request, Response }, * as net_mod from stdlib/net.nx
+import { Net, Request, Response }, * as net_mod from "stdlib/net.nx"
 ```
 
 ## Custom Port + Handler (Dependency Injection)
@@ -87,8 +87,8 @@ end
 ### Result-based (prefer for recoverable errors)
 
 ```nexus
-import { Result, Ok, Err } from stdlib/result.nx
-import * as result from stdlib/result.nx
+import { Result, Ok, Err } from "stdlib/result.nx"
+import * as result from "stdlib/result.nx"
 
 let parse_config = fn (raw: string) -> Result<Config, string> do
   if str.length(s: raw) == 0 then
@@ -296,8 +296,8 @@ end
 ## Web Server Pattern
 
 ```nexus
-import { Net, Request, Server, request_method, request_path, request_body }, * as net_mod from stdlib/net.nx
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Net, Request, Server, request_method, request_path, request_body }, * as net_mod from "stdlib/net.nx"
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 let handle = fn (req: Request) -> unit require { Net, Console } throws { Exn } do
   let method = request_method(req: &req)
@@ -336,7 +336,7 @@ end
 ## String Processing
 
 ```nexus
-import * as str from stdlib/string.nx
+import * as str from "stdlib/string.nx"
 
 // String concatenation with ++
 let greeting = "Hello, " ++ name ++ "!"

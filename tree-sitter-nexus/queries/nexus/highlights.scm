@@ -148,6 +148,8 @@
 
 (string_literal) @string
 
+(char_literal) @character
+
 (import_path) @string.special.path
 
 ; ─── Operators ──────────────────────────────────────────────────────────────

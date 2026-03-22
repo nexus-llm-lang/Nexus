@@ -175,7 +175,7 @@ end
 
 ### Hello World
 ```nexus
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
 let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do
@@ -187,7 +187,7 @@ end
 
 ### Error Handling
 ```nexus
-import { Result, Ok, Err } from stdlib/result.nx
+import { Result, Ok, Err } from "stdlib/result.nx"
 
 exception NotFound(msg: string)
 
@@ -213,7 +213,7 @@ end
 
 ### List Recursion
 ```nexus
-import * as list from stdlib/list.nx
+import * as list from "stdlib/list.nx"
 
 let sum = fn (xs: [ i64 ]) -> i64 do
   match xs do

@@ -138,13 +138,13 @@ end
 Each stdlib I/O module provides a `system_handler`:
 
 ```nexus
-import { Console }, * as stdio from stdlib/stdio.nx      // stdio.system_handler → PermConsole
-import { Fs }, * as fs_mod from stdlib/fs.nx              // fs_mod.system_handler → PermFs
-import { Net }, * as net_mod from stdlib/net.nx           // net_mod.system_handler → PermNet
-import { Random }, * as rand_mod from stdlib/random.nx    // rand_mod.system_handler → PermRandom
-import { Clock }, * as clock_mod from stdlib/clock.nx     // clock_mod.system_handler → PermClock
-import { Proc }, * as proc_mod from stdlib/proc.nx        // proc_mod.system_handler → PermProc
-import { Env }, * as env_mod from stdlib/env.nx           // env_mod.system_handler → PermEnv
+import { Console }, * as stdio from "stdlib/stdio.nx"      // stdio.system_handler → PermConsole
+import { Fs }, * as fs_mod from "stdlib/fs.nx"              // fs_mod.system_handler → PermFs
+import { Net }, * as net_mod from "stdlib/net.nx"           // net_mod.system_handler → PermNet
+import { Random }, * as rand_mod from "stdlib/random.nx"    // rand_mod.system_handler → PermRandom
+import { Clock }, * as clock_mod from "stdlib/clock.nx"     // clock_mod.system_handler → PermClock
+import { Proc }, * as proc_mod from "stdlib/proc.nx"        // proc_mod.system_handler → PermProc
+import { Env }, * as env_mod from "stdlib/env.nx"           // env_mod.system_handler → PermEnv
 ```
 
 ## Checked Exceptions
