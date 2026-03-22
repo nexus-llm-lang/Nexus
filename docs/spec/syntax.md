@@ -176,6 +176,7 @@ let result = Ok(val: 42)
 
 ```nexus
 let xs = [1, 2, 3]        // list
+let %lxs = %[1, 2, 3]     // linear list
 let %arr = [| 1, 2, 3 |]  // array (linear)
 ```
 
@@ -349,10 +350,11 @@ end
 ## Imports
 
 ```nexus
-import * as math from path/to/math.nx                // namespace alias
-import { add, sub } from path/to/math.nx             // named items
-import { add, sub }, * as math from path/to/math.nx  // named + namespace
-import external path/to/lib.wasm                     // Wasm module
+import * as math from "path/to/math.nx"                // namespace alias
+import { add, sub } from "path/to/math.nx"             // named items
+import { add as my_add, sub } from "path/to/math.nx"   // named with renaming
+import { add, sub }, * as math from "path/to/math.nx"  // named + namespace
+import external "path/to/lib.wasm"                     // Wasm module
 ```
 
 ## Ports and Handlers
@@ -417,9 +419,10 @@ variant_field ::= type | IDENT ":" type
 exception_def ::= [ "export" ] "exception" UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
 
 import_def    ::= "import" "external" import_path
-                | "import" "{" IDENT ( "," IDENT )* "}" [ "," "*" "as" IDENT ] "from" import_path
+                | "import" "{" import_item ( "," import_item )* "}" [ "," "*" "as" IDENT ] "from" import_path
                 | "import" "*" "as" IDENT "from" import_path
-import_path   ::= ( ALPHA | DIGIT | "_" | "-" | "/" | "." )+
+import_item   ::= IDENT [ "as" IDENT ]
+import_path   ::= STRING_LITERAL
 
 port_def      ::= [ "export" ] "port" UIDENT "do" fn_signature* "end"
 fn_signature  ::= "fn" IDENT param_list "->" type [ "require" throws_type ] [ "throws" throws_type ]
@@ -537,6 +540,7 @@ atom_expr        ::= "(" expr ")"
                    | constructor_expr
                    | record_expr
                    | array_expr
+                   | linear_list_expr
                    | list_expr
                    | literal
                    | variable
@@ -556,6 +560,7 @@ constructor_expr ::= UIDENT "(" [ ctor_arg ( "," ctor_arg )* ] ")"
 ctor_arg         ::= [ IDENT ":" ] expr
 record_expr      ::= "{" [ IDENT ":" expr ( "," IDENT ":" expr )* ] "}"
 list_expr        ::= "[" [ expr ( "," expr )* [ "," ] ] "]"
+linear_list_expr ::= "%" "[" [ expr ( "," expr )* [ "," ] ] "]"
 array_expr       ::= "[|" [ expr ( "," expr )* [ "," ] ] "|]"
 variable         ::= [ sigil ] IDENT
 dotted_ident     ::= IDENT ( "." IDENT )*

@@ -8,7 +8,7 @@ title: Standard Library
 Import stdlib modules from `stdlib/`:
 
 ```nexus
-import { Console }, * as stdio from stdlib/stdio.nx
+import { Console }, * as stdio from "stdlib/stdio.nx"
 ```
 
 ## I/O Ports
@@ -23,6 +23,8 @@ Requires `PermConsole`. CLI flag: `--allow-console`.
 port Console do
   fn print(val: string) -> unit
   fn println(val: string) -> unit
+  fn eprint(val: string) -> unit
+  fn eprintln(val: string) -> unit
   fn read_line() -> string
   fn getchar() -> string
 end
@@ -190,9 +192,25 @@ end
 
 Requires `PermProc`. CLI flag: `--allow-proc`.
 
+**Types:**
+
+```nexus
+type ExecResult = ExecResult(exit_code: i64, stdout: string, stderr: string)
+```
+
+**Direct-call API:**
+
+```nexus
+fn argv() -> [ string ] require { PermProc }
+```
+
+**Port methods:**
+
 ```nexus
 port Proc do
   fn exit(status: i64) -> unit
+  fn argv() -> [ string ]
+  fn exec(cmd: string, args: [ string ]) -> ExecResult
 end
 ```
 
@@ -403,6 +421,8 @@ fn from_bool(val: bool) -> string
 fn from_char(c: char) -> string
 fn from_char_code(code: i64) -> string                // Unicode codepoint → string
 fn parse_i64(s: string) -> Option<i64>
+fn parse_f64(s: string) -> Option<f64>
+fn to_f64(s: string) -> f64 throws { Exn }
 ```
 
 ### Math (`math.nx`)

@@ -12,7 +12,7 @@ Nexus interoperates with WebAssembly modules, allowing extension with functions 
 Load a WASM module with `import external`:
 
 ```nexus
-import external math.wasm
+import external "math.wasm"
 ```
 
 The module's exports become available for binding.
@@ -56,7 +56,7 @@ Using an undeclared type variable (e.g., `T` without `<T>`) is a type error. Thi
 ## Example
 
 ```nexus
-import external utils.wasm
+import external "utils.wasm"
 
 external process_data = "process" : (val: float) -> float
 
