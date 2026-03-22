@@ -1030,8 +1030,33 @@ impl Parser {
                 })
             }
 
-            // Sigil + ident (variable with sigil)
+            // Sigil + ident (variable with sigil), or %[...] (linear list literal)
             TokenKind::Tilde | TokenKind::Percent => {
+                // %[...] is a linear list literal — parse as Expr::List
+                if matches!(self.peek(), TokenKind::Percent)
+                    && matches!(self.peek_at_offset(1), Some(TokenKind::LBracket))
+                {
+                    self.advance(); // skip %
+                    self.advance(); // skip [
+                    let mut items = Vec::new();
+                    if !matches!(self.peek(), TokenKind::RBracket) {
+                        items.push(self.parse_expr()?);
+                        while self.match_token(&TokenKind::Comma) {
+                            if matches!(self.peek(), TokenKind::RBracket) {
+                                break;
+                            }
+                            items.push(self.parse_expr()?);
+                        }
+                    }
+                    let end_span = self.peek_span();
+                    self.expect(&TokenKind::RBracket)?;
+                    let list_span = start..end_span.end;
+                    return Ok(Spanned {
+                        node: Expr::List(items),
+                        span: list_span,
+                    });
+                }
+
                 let sigil = self.parse_sigil();
                 let name = self.expect_ident()?;
                 let end = self.tokens[self.pos - 1].span.end;
