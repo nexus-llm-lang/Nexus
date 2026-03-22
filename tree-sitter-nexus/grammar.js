@@ -111,10 +111,10 @@ export default grammar({
         optional(seq("(", commaSep1($.variant_field), ")"))
       ),
 
-    // import external path/to/lib.wasm
-    // import { a, b } from path/to/mod.nx
-    // import { a, b }, * as alias from path/to/mod.nx
-    // import as alias from path/to/mod.nx
+    // import external "path/to/lib.wasm"
+    // import { a, b } from "path/to/mod.nx"
+    // import { a, b }, * as alias from "path/to/mod.nx"
+    // import * as alias from "path/to/mod.nx"
     import_def: ($) =>
       seq(
         "import",
@@ -539,6 +539,33 @@ export default grammar({
           seq(
             field("left", $._expr),
             field("operator", choice("*", "/")),
+            field("right", $._expr)
+          )
+        ),
+        // Bitwise OR / XOR (same precedence as additive)
+        prec.left(
+          4,
+          seq(
+            field("left", $._expr),
+            field("operator", choice("bor", "bxor")),
+            field("right", $._expr)
+          )
+        ),
+        // Bitwise AND (same precedence as multiplicative)
+        prec.left(
+          5,
+          seq(
+            field("left", $._expr),
+            field("operator", "band"),
+            field("right", $._expr)
+          )
+        ),
+        // Bit shift (highest precedence)
+        prec.left(
+          6,
+          seq(
+            field("left", $._expr),
+            field("operator", choice("bshl", "bshr")),
             field("right", $._expr)
           )
         )

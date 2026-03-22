@@ -44,6 +44,16 @@ export type Result<T, E> = Ok(val: T) | Err(err: E)
 export type Option<T> = Some(val: T) | None
 ```
 
+### Opaque Types
+
+The `opaque` modifier hides constructors from importers. The type name is visible but construction and pattern matching are only possible inside the defining module:
+
+```nexus
+export opaque type Set = Set(id: i64)
+```
+
+Importers see `Set` as a type but cannot use `Set(id: ...)` to construct or destructure it. The module must provide functions for creation and access.
+
 ### Lists
 
 Immutable singly-linked lists:
