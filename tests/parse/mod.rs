@@ -139,3 +139,67 @@ fn parse_import_as_alias() {
     assert_eq!(import.items[1].name, "baz");
     assert_eq!(import.items[1].alias, None);
 }
+
+#[test]
+fn parse_linear_list_literal() {
+    let src = r#"
+    let main = fn () -> unit do
+        let %xs: %[i64] = %[1, 2, 3]
+        return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let found_list_expr = program.definitions.iter().any(|def| {
+        if let nexus::lang::ast::TopLevel::Let(gl) = &def.node {
+            if let Expr::Lambda { body, .. } = &gl.value.node {
+                body.iter().any(|stmt| {
+                    if let nexus::lang::ast::Stmt::Let { value, .. } = &stmt.node {
+                        matches!(value.node, Expr::List(_))
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    });
+    assert!(
+        found_list_expr,
+        "Parser should produce Expr::List for %[1,2,3] syntax"
+    );
+}
+
+#[test]
+fn parse_empty_linear_list_literal() {
+    let src = r#"
+    let main = fn () -> unit do
+        let %xs: %[i64] = %[]
+        return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let found_list_expr = program.definitions.iter().any(|def| {
+        if let nexus::lang::ast::TopLevel::Let(gl) = &def.node {
+            if let Expr::Lambda { body, .. } = &gl.value.node {
+                body.iter().any(|stmt| {
+                    if let nexus::lang::ast::Stmt::Let { value, .. } = &stmt.node {
+                        matches!(value.node, Expr::List(_))
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    });
+    assert!(
+        found_list_expr,
+        "Parser should produce Expr::List for %[] syntax"
+    );
+}
