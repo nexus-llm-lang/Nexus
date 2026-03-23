@@ -23,7 +23,8 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          constructor_tag, record_tag,
          emit_name, emit_section, emit_memarg, emit_memarg_i64, emit_memarg_i8,
          sec_type, sec_import, sec_function, sec_table, sec_memory, sec_global, sec_export, sec_element, sec_code, sec_data,
-         vt_i32, vt_i64, vt_funcref, bt_void, bt_i32, desc_func, desc_table, desc_memory, heap_global_idx, string_data_base,
+         vt_i32, vt_i64, vt_funcref, bt_void, bt_i32, desc_func, desc_table, desc_memory,
+         heap_global_idx, exn_value_global_idx, exn_flag_global_idx, string_data_base,
          op_unreachable, op_block, op_loop, op_if, op_else, op_end, op_br, op_br_if, op_return,
          op_call, op_call_indirect, op_return_call, op_drop,
          op_local_get, op_local_set, op_local_tee, op_global_get, op_global_set,
@@ -789,8 +790,6 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
 
     case LirExprRaise(value: v, typ: _) ->
       let %buf = emit_bt_freeze(buf: %buf, ctx: ctx)
-      let exn_value = ctx_temps_base(ctx: ctx) + 1
-      let exn_flag = ctx_temps_base(ctx: ctx) + 2
       let %buf = emit_atom(atom: v, buf: %buf, ctx: ctx)
       let %buf = match is_unit(typ: atom_type(atom: v)) == false do
         case true -> %buf
@@ -798,15 +797,38 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
           let %b = push_byte(buf: %buf, byte: op_i64_const)
           push_sleb128(buf: %b, val: 0)
       end
-      let %buf = push_byte(buf: %buf, byte: op_local_set)
-      let %buf = push_uleb128(buf: %buf, val: exn_value)
+      // Store exception value and flag in GLOBALS (cross-function propagation)
+      let %buf = push_byte(buf: %buf, byte: op_global_set)
+      let %buf = push_uleb128(buf: %buf, val: exn_value_global_idx)
       let %buf = push_byte(buf: %buf, byte: op_i32_const)
       let %buf = push_sleb128(buf: %buf, val: 1)
-      let %buf = push_byte(buf: %buf, byte: op_local_set)
-      let %buf = push_uleb128(buf: %buf, val: exn_flag)
+      let %buf = push_byte(buf: %buf, byte: op_global_set)
+      let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
       let %buf = match in_try do
-        case true -> %buf
-        case false -> push_byte(buf: %buf, byte: op_unreachable)
+        case true ->
+          // Push dummy value so Let's local_set doesn't see empty stack.
+          // The try block's br_if will skip past it.
+          let %b = push_byte(buf: %buf, byte: op_i64_const)
+          push_sleb128(buf: %b, val: 0)
+        case false ->
+          // Return with exn flag set so caller's try/catch can catch it
+          let frt = ctx_func_ret_type(ctx: ctx)
+          let %b = emit_bt_pop(buf: %buf, ctx: ctx)
+          match is_unit(typ: frt) do
+            case true -> push_byte(buf: %b, byte: op_return)
+            case false ->
+              let vt = type_to_valtype(typ: frt)
+              match vt == vt_i32 do
+                case true ->
+                  let %b = push_byte(buf: %b, byte: op_i32_const)
+                  let %b = push_sleb128(buf: %b, val: 0)
+                  push_byte(buf: %b, byte: op_return)
+                case false ->
+                  let %b = push_byte(buf: %b, byte: op_i64_const)
+                  let %b = push_sleb128(buf: %b, val: 0)
+                  push_byte(buf: %b, byte: op_return)
+              end
+          end
       end
       return %buf
 
@@ -929,20 +951,18 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
 
     case LirStmtTryCatch(body: b, body_ret: br, catch_param: cp, catch_param_typ: _,
                           catch_body: cb, catch_ret: cr) ->
-      let exn_value = ctx_temps_base(ctx: ctx) + 1
-      let exn_flag = ctx_temps_base(ctx: ctx) + 2
       let catch_local_idx = lookup_local(name: cp, entries: ctx_locals(ctx: ctx))
 
-      // exn_flag = 0
+      // Clear global exn_flag
       let %buf = push_byte(buf: %buf, byte: op_i32_const)
       let %buf = push_sleb128(buf: %buf, val: 0)
-      let %buf = push_byte(buf: %buf, byte: op_local_set)
-      let %buf = push_uleb128(buf: %buf, val: exn_flag)
+      let %buf = push_byte(buf: %buf, byte: op_global_set)
+      let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
 
-      // block { body + exn_flag check after each stmt }
+      // block { body + global exn_flag check after each stmt }
       let %buf = push_byte(buf: %buf, byte: op_block)
       let %buf = push_byte(buf: %buf, byte: bt_void)
-      let %buf = emit_try_body_stmts(stmts: b, buf: %buf, ctx: ctx, exn_flag: exn_flag)
+      let %buf = emit_try_body_stmts(stmts: b, buf: %buf, ctx: ctx, exn_flag: -1)
       let %buf = match br do
         case Some(val: a) ->
           let %b = emit_atom(atom: a, buf: %buf, ctx: ctx)
@@ -953,29 +973,29 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       end
       let %buf = push_byte(buf: %buf, byte: op_end)
 
-      // if exn_flag { catch_param = exn_value; catch_body }
-      let %buf = push_byte(buf: %buf, byte: op_local_get)
-      let %buf = push_uleb128(buf: %buf, val: exn_flag)
+      // if global exn_flag { catch_param = global exn_value; catch_body }
+      let %buf = push_byte(buf: %buf, byte: op_global_get)
+      let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
       let %buf = push_byte(buf: %buf, byte: op_if)
       let %buf = push_byte(buf: %buf, byte: bt_void)
-      let %buf = push_byte(buf: %buf, byte: op_local_get)
-      let %buf = push_uleb128(buf: %buf, val: exn_value)
+      let %buf = push_byte(buf: %buf, byte: op_global_get)
+      let %buf = push_uleb128(buf: %buf, val: exn_value_global_idx)
       if catch_local_idx >= 0 then
         let %buf = push_byte(buf: %buf, byte: op_local_set)
         let %buf = push_uleb128(buf: %buf, val: catch_local_idx)
       end
-      // Reset flag
+      // Reset global flag
       let %buf = push_byte(buf: %buf, byte: op_i32_const)
       let %buf = push_sleb128(buf: %buf, val: 0)
-      let %buf = push_byte(buf: %buf, byte: op_local_set)
-      let %buf = push_uleb128(buf: %buf, val: exn_flag)
+      let %buf = push_byte(buf: %buf, byte: op_global_set)
+      let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
 
       if in_try then
         let %buf = push_byte(buf: %buf, byte: op_block)
         let %buf = push_byte(buf: %buf, byte: bt_void)
       end
       let %buf = emit_try_catch_body_stmts(stmts: cb, buf: %buf, ctx: ctx,
-                                             exn_flag: exn_flag, in_try: in_try)
+                                             exn_flag: -1, in_try: in_try)
       let %buf = match cr do
         case Some(val: a) ->
           let %b = emit_atom(atom: a, buf: %buf, ctx: ctx)
@@ -1081,8 +1101,9 @@ let emit_try_body_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: CodegenCt
     case [] -> %buf
     case s :: rest ->
       let %buf = emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: true)
-      let %buf = push_byte(buf: %buf, byte: op_local_get)
-      let %buf = push_uleb128(buf: %buf, val: exn_flag)
+      // Check global exn_flag after each statement
+      let %buf = push_byte(buf: %buf, byte: op_global_get)
+      let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
       let %buf = push_byte(buf: %buf, byte: op_br_if)
       let %buf = push_uleb128(buf: %buf, val: 0)
       emit_try_body_stmts(stmts: rest, buf: %buf, ctx: ctx, exn_flag: exn_flag)
@@ -1096,8 +1117,8 @@ let emit_try_catch_body_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: Cod
     case s :: rest ->
       let %buf = emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: in_try)
       if in_try then
-        let %buf = push_byte(buf: %buf, byte: op_local_get)
-        let %buf = push_uleb128(buf: %buf, val: exn_flag)
+        let %buf = push_byte(buf: %buf, byte: op_global_get)
+        let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
         let %buf = push_byte(buf: %buf, byte: op_br_if)
         let %buf = push_uleb128(buf: %buf, val: 0)
       end
