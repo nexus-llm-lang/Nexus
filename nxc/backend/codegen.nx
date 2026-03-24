@@ -53,20 +53,43 @@ import { starts_with } from "stdlib/string.nx"
 
 // ─── Atom emission ──────────────────────────────────────────────────────────
 
-let emit_atom = fn (atom: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
-  match atom do
-    case LirAtomVar(name: n, typ: at) ->
-      let raw_idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
-      let idx = match raw_idx < 0 do case true -> 0 case false -> raw_idx end
+let emit_atom_var = fn (name: string, typ: TypeExpr, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+  let raw_idx = lookup_local(name: name, entries: ctx_locals(ctx: ctx))
+  match raw_idx < 0 do
+    case true ->
+      // Not a local — try top-level function (zero-arg constant)
+      let func_idx = lookup_func(name: name, entries: ctx_internal_funcs(ctx: ctx))
+      match func_idx >= 0 do
+        case true ->
+          let %buf = push_byte(buf: %buf, byte: op_call)
+          return push_uleb128(buf: %buf, val: func_idx)
+        case false ->
+          let ext_idx = lookup_func(name: name, entries: ctx_external_funcs(ctx: ctx))
+          match ext_idx >= 0 do
+            case true ->
+              let %buf = push_byte(buf: %buf, byte: op_call)
+              return push_uleb128(buf: %buf, val: ext_idx)
+            case false ->
+              return push_byte(buf: %buf, byte: op_unreachable)
+          end
+      end
+    case false ->
       let %buf = push_byte(buf: %buf, byte: op_local_get)
-      let %buf = push_uleb128(buf: %buf, val: idx)
+      let %buf = push_uleb128(buf: %buf, val: raw_idx)
       // Narrow i64→i32 if local was widened but atom type is i32
-      let atom_vt = type_to_valtype(typ: peel_linear(typ: at))
-      let local_vt = lookup_local_valtype(name: n, entries: ctx_locals(ctx: ctx))
+      let atom_vt = type_to_valtype(typ: peel_linear(typ: typ))
+      let local_vt = lookup_local_valtype(name: name, entries: ctx_locals(ctx: ctx))
       return match atom_vt == vt_i32 && local_vt == vt_i64 do
         case true -> push_byte(buf: %buf, byte: op_i32_wrap_i64)
         case false -> %buf
       end
+  end
+end
+
+let emit_atom = fn (atom: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+  match atom do
+    case LirAtomVar(name: n, typ: at) ->
+      return emit_atom_var(name: n, typ: at, buf: %buf, ctx: ctx)
     case LirAtomInt(val: v) ->
       let %buf = push_byte(buf: %buf, byte: op_i64_const)
       return push_sleb128(buf: %buf, val: v)
@@ -77,7 +100,7 @@ let emit_atom = fn (atom: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBu
       let %buf = push_byte(buf: %buf, byte: op_i32_const)
       return push_sleb128(buf: %buf, val: match bv do case true -> 1 case false -> 0 end)
     case LirAtomChar(val: cv) ->
-      let %buf = push_byte(buf: %buf, byte: op_i64_const)
+      let %buf = push_byte(buf: %buf, byte: op_i32_const)
       return push_sleb128(buf: %buf, val: cv)
     case LirAtomString(val: s) ->
       let %buf = push_byte(buf: %buf, byte: op_i64_const)
@@ -108,6 +131,7 @@ let emit_pack_to_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
   match peel_linear(typ: typ) do
     case TyI32 -> push_byte(buf: %buf, byte: op_i64_extend_i32_s)
     case TyBool -> push_byte(buf: %buf, byte: op_i64_extend_i32_s)
+    case TyChar -> push_byte(buf: %buf, byte: op_i64_extend_i32_s)
     case TyUnit ->
       let %buf = push_byte(buf: %buf, byte: op_drop)
       let %buf = push_byte(buf: %buf, byte: op_i64_const)
@@ -121,6 +145,7 @@ let emit_unpack_from_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer d
   match peel_linear(typ: typ) do
     case TyI32 -> push_byte(buf: %buf, byte: op_i32_wrap_i64)
     case TyBool -> push_byte(buf: %buf, byte: op_i32_wrap_i64)
+    case TyChar -> push_byte(buf: %buf, byte: op_i32_wrap_i64)
     case TyF64 -> push_byte(buf: %buf, byte: op_f64_reinterpret_i64)
     case _ -> %buf
   end
@@ -504,9 +529,9 @@ let emit_external_arg = fn (atom: LirAtom, param_type: TypeExpr, buf: %ByteBuffe
       let %buf = push_uleb128(buf: %buf, val: packed_tmp)
       return push_byte(buf: %buf, byte: op_i32_wrap_i64)
     case TyChar ->
-      // External ABI: char is i32, but internal representation is i64
+      // Internal and external both use i32 for char — no conversion needed
       let %buf = emit_atom(atom: atom, buf: %buf, ctx: ctx)
-      return push_byte(buf: %buf, byte: op_i32_wrap_i64)
+      return emit_coercion(from_type: atom_type(atom: atom), to_type: param_type, buf: %buf)
     case _ ->
       let %buf = emit_atom(atom: atom, buf: %buf, ctx: ctx)
       return emit_coercion(from_type: atom_type(atom: atom), to_type: param_type, buf: %buf)
@@ -646,15 +671,10 @@ end
 let emit_external_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
                                ext_idx: i64) -> %ByteBuffer do
   match find_external(name: func, exts: ctx_externals(ctx: ctx)) do
-    case Some(val: LirExternal(name: _, wasm_module: _, wasm_name: _, params: params, ret_type: rt, throw_row: _)) ->
+    case Some(val: LirExternal(name: _, wasm_module: _, wasm_name: _, params: params, ret_type: _, throw_row: _)) ->
       let %buf = emit_external_call_args(buf: %buf, args: args, params: params, ctx: ctx)
       let %buf = push_byte(buf: %buf, byte: op_call)
-      let %buf = push_uleb128(buf: %buf, val: ext_idx)
-      // Widen i32→i64 for char return values (external ABI uses i32)
-      match peel_linear(typ: rt) do
-        case TyChar -> push_byte(buf: %buf, byte: op_i64_extend_i32_u)
-        case _ -> %buf
-      end
+      return push_uleb128(buf: %buf, val: ext_idx)
     case None ->
       // External definition not found — emit unreachable
       push_byte(buf: %buf, byte: op_unreachable)
