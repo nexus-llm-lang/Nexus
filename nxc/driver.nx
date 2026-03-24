@@ -28,7 +28,8 @@ import * as list from "stdlib/list.nx"
 
 // ─── Import processing ──────────────────────────────────────────────────────
 
-type ImportResult = ImportResult(accum: HirAccum, visited: [string])
+type CacheEntry = CacheEntry(path: string, defs: [SpannedTopLevel])
+type ImportResult = ImportResult(accum: HirAccum, visited: [string], cache: [CacheEntry])
 type ImportEdge = ImportEdge(from_path: string, to_path: string, is_external: bool)
 type GraphResult = GraphResult(edges: [ImportEdge], visited: [string])
 
@@ -47,6 +48,15 @@ let import_items_has = fn (items: [ImportItem], name: string) -> bool do
     case ImportItem(name: item_name, item_alias: _) :: rest ->
       if item_name == name then return true end
       return import_items_has(items: rest, name: name)
+  end
+end
+
+let cache_lookup = fn (cache: [CacheEntry], path: string) -> [SpannedTopLevel] do
+  match cache do
+    case Nil -> return Nil
+    case CacheEntry(path: p, defs: d) :: rest ->
+      if p == path then return d end
+      return cache_lookup(cache: rest, path: path)
   end
 end
 
@@ -70,38 +80,32 @@ let filter_defs_by_items = fn (defs: [SpannedTopLevel], items: [ImportItem]) -> 
 end
 
 let process_imports = fn (imports: [ImportDef], accum: HirAccum,
-    import_stack: [string], visited: [string], depth: i64, verbose: bool) -> ImportResult require { Fs, Console } throws { Exn } do
+    import_stack: [string], visited: [string], cache: [CacheEntry], depth: i64, verbose: bool) -> ImportResult require { Fs, Console } throws { Exn } do
   match imports do
-    case Nil -> ImportResult(accum: accum, visited: visited)
+    case Nil -> ImportResult(accum: accum, visited: visited, cache: cache)
     case imp :: rest ->
       match imp do case ImportDef(path: path, alias: _, items: _, is_external: is_ext) ->
         match is_ext do
           case true ->
             if verbose then Console.eprintln(val: "[nxc]   skip external: " ++ path) end
-            process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, depth: depth, verbose: verbose)
+            process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
           case false ->
             if list_has_str(xs: import_stack, s: path) then
               error_no_span(phase: PhaseDriver, message: "cyclic import: " ++ path)
             end
             if list_has_str(xs: visited, s: path) then
-              // Diamond import fix: when a module is already visited, selective
-              // imports may reference functions that were given prefixed names by
-              // the first importer. Re-parse and re-process ONLY the selected
-              // TLLet defs with the current import's rename entries.
+              // Diamond import: reuse cached parse result instead of re-reading file
               match imp do case ImportDef(path: _, alias: _, items: items, is_external: _) ->
                 match items do
                   case Nil ->
-                    // Wildcard import — all names get alias prefix, no conflict
-                    return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, depth: depth, verbose: verbose)
+                    return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
                   case _ :: _ ->
-                    let re_src = Fs.read_to_string(path: path)
-                    let re_tokens = tokenize(src: re_src)
-                    let re_prog = parse(tokens: re_tokens)
-                    let re_defs = get_defs(prog: re_prog)
-                    let selected = filter_defs_by_items(defs: re_defs, items: items)
-                    let re_entries = build_rename_map(imported_defs: re_defs, import_def: imp, import_depth: depth)
+                    if verbose then Console.eprintln(val: "[nxc]   diamond (cached): " ++ path) end
+                    let cached_defs = cache_lookup(cache: cache, path: path)
+                    let selected = filter_defs_by_items(defs: cached_defs, items: items)
+                    let re_entries = build_rename_map(imported_defs: cached_defs, import_def: imp, import_depth: depth)
                     let accum2 = process_defs(defs: selected, entries: re_entries, accum: accum)
-                    return process_imports(imports: rest, accum: accum2, import_stack: import_stack, visited: visited, depth: depth, verbose: verbose)
+                    return process_imports(imports: rest, accum: accum2, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
                 end
               end
             end
@@ -113,10 +117,11 @@ let process_imports = fn (imports: [ImportDef], accum: HirAccum,
             let entries = build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
             let sub_imports = extract_imports(defs: imported_defs)
             let new_stack = Cons(v: path, rest: import_stack)
-            let sub_result = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, visited: Cons(v: path, rest: visited), depth: depth + 1, verbose: verbose)
-            match sub_result do case ImportResult(accum: accum2, visited: visited2) ->
+            let new_cache = Cons(v: CacheEntry(path: path, defs: imported_defs), rest: cache)
+            let sub_result = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, visited: Cons(v: path, rest: visited), cache: new_cache, depth: depth + 1, verbose: verbose)
+            match sub_result do case ImportResult(accum: accum2, visited: visited2, cache: cache2) ->
               let accum3 = process_defs(defs: imported_defs, entries: entries, accum: accum2)
-              process_imports(imports: rest, accum: accum3, import_stack: import_stack, visited: visited2, depth: depth, verbose: verbose)
+              process_imports(imports: rest, accum: accum3, import_stack: import_stack, visited: visited2, cache: cache2, depth: depth, verbose: verbose)
             end
         end
       end
@@ -223,8 +228,8 @@ end
 let build_hir = fn (prog: Program, verbose: bool) -> HirProgram require { Fs, Console } throws { Exn } do
   let defs = get_defs(prog: prog)
   let imports = extract_imports(defs: defs)
-  let result = process_imports(imports: imports, accum: empty_accum(), import_stack: Nil, visited: Nil, depth: 1, verbose: verbose)
-  match result do case ImportResult(accum: accum, visited: _) ->
+  let result = process_imports(imports: imports, accum: empty_accum(), import_stack: Nil, visited: Nil, cache: Nil, depth: 1, verbose: verbose)
+  match result do case ImportResult(accum: accum, visited: _, cache: _) ->
     let accum2 = process_defs(defs: defs, entries: Nil, accum: accum)
     return accum_to_program(accum: accum2)
   end
