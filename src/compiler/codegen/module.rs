@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType, ExportKind,
     ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
-    Instruction, MemorySection, MemoryType, Module, RefType, TableSection, TableType, TypeSection,
-    ValType,
+    Instruction, MemorySection, MemoryType, Module, NameMap, NameSection, RefType, TableSection,
+    TableType, TypeSection, ValType,
 };
 
 use crate::constants::{ENTRYPOINT, MEMORY_EXPORT, WASI_CLI_RUN_EXPORT};
@@ -421,6 +421,45 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
             );
         }
         module.section(&data);
+    }
+
+    // === Name Section (custom) ===
+    {
+        let mut names = NameSection::new();
+        let mut func_names = NameMap::new();
+        // Imported functions first (indices 0..import_count)
+        let mut idx: u32 = 0;
+        for ext in &deduped_externals {
+            func_names.append(idx, ext.wasm_name.as_str());
+            idx += 1;
+        }
+        if has_conc {
+            func_names.append(idx, CONC_SPAWN_NAME);
+            idx += 1;
+            func_names.append(idx, CONC_JOIN_NAME);
+            idx += 1;
+        }
+        if has_bt {
+            func_names.append(idx, BT_PUSH_NAME);
+            idx += 1;
+            func_names.append(idx, BT_POP_NAME);
+            idx += 1;
+            func_names.append(idx, BT_FREEZE_NAME);
+            idx += 1;
+        }
+        if stdlib_alloc_module.is_some() {
+            func_names.append(idx, ALLOCATE_WASM_NAME);
+            idx += 1;
+        }
+        // Internal functions (indices import_count..import_count+n_funcs)
+        for func in &program.functions {
+            func_names.append(idx, func.name.as_str());
+            idx += 1;
+        }
+        // WASI CLI run wrapper
+        func_names.append(idx, WASI_CLI_RUN_EXPORT);
+        names.functions(&func_names);
+        module.section(&names);
     }
 
     Ok(module.finish())
