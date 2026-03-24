@@ -873,7 +873,10 @@ impl TypeChecker {
                                     return Err(TypeError::new("Not a ref", s.span.clone()));
                                 }
                             } else {
-                                return Err(TypeError::new("Not found", s.span.clone()));
+                                return Err(TypeError::new(
+                                    format!("Assign target not found: '{}'", sigil.get_key(name)),
+                                    s.span.clone(),
+                                ));
                             }
                         }
                         Expr::Index(arr, idx) => {
@@ -1339,7 +1342,10 @@ impl TypeChecker {
                     };
                     Ok((HashMap::new(), Type::Borrow(Box::new(i))))
                 } else {
-                    Err(TypeError::new("Not found", e.span.clone()))
+                    Err(TypeError::new(
+                        format!("Cannot borrow '{}': not found in scope", s.get_key(n)),
+                        e.span.clone(),
+                    ))
                 }
             }
             Expr::Call { func, args } => {

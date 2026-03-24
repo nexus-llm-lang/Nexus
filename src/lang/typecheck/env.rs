@@ -170,9 +170,18 @@ impl TypeEnv {
         if let Some(scheme) = self.vars.get(name) {
             return Some(scheme);
         }
-        // %name → try name (linear param stored without sigil)
+        // %name → try name (linear param stored without sigil prefix)
         if let Some(stripped) = name.strip_prefix('%') {
             if let Some(scheme) = self.vars.get(stripped) {
+                if matches!(&scheme.typ, crate::types::Type::Linear(_)) {
+                    return Some(scheme);
+                }
+            }
+        }
+        // name → try %name (linear let-binding stored with sigil prefix)
+        if !name.starts_with('%') && !name.starts_with('&') && !name.starts_with('~') {
+            let linear_key = format!("%{}", name);
+            if let Some(scheme) = self.vars.get(&linear_key) {
                 if matches!(&scheme.typ, crate::types::Type::Linear(_)) {
                     return Some(scheme);
                 }

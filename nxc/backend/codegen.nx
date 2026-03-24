@@ -19,7 +19,7 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          ctx_heap_enabled, ctx_temps_base, ctx_func_ret_type, ctx_functions, ctx_externals,
          ctx_closure_table, ctx_closure_type_indices, is_closure_func,
          peel_linear, type_to_valtype, is_unit, atom_type, expr_type,
-         lookup_local, lookup_func, lookup_string, find_function, find_external,
+         lookup_local, lookup_local_valtype, lookup_func, lookup_string, find_function, find_external,
          constructor_tag, record_tag,
          emit_name, emit_section, emit_memarg, emit_memarg_i64, emit_memarg_i8,
          sec_type, sec_import, sec_function, sec_table, sec_memory, sec_global, sec_export, sec_element, sec_code, sec_data, sec_custom,
@@ -55,11 +55,18 @@ import { starts_with } from "stdlib/string.nx"
 
 let emit_atom = fn (atom: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
   match atom do
-    case LirAtomVar(name: n, typ: _) ->
+    case LirAtomVar(name: n, typ: at) ->
       let raw_idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
       let idx = match raw_idx < 0 do case true -> 0 case false -> raw_idx end
       let %buf = push_byte(buf: %buf, byte: op_local_get)
-      return push_uleb128(buf: %buf, val: idx)
+      let %buf = push_uleb128(buf: %buf, val: idx)
+      // Narrow i64→i32 if local was widened but atom type is i32
+      let atom_vt = type_to_valtype(typ: peel_linear(typ: at))
+      let local_vt = lookup_local_valtype(name: n, entries: ctx_locals(ctx: ctx))
+      return match atom_vt == vt_i32 && local_vt == vt_i64 do
+        case true -> push_byte(buf: %buf, byte: op_i32_wrap_i64)
+        case false -> %buf
+      end
     case LirAtomInt(val: v) ->
       let %buf = push_byte(buf: %buf, byte: op_i64_const)
       return push_sleb128(buf: %buf, val: v)
@@ -496,6 +503,10 @@ let emit_external_arg = fn (atom: LirAtom, param_type: TypeExpr, buf: %ByteBuffe
       let %buf = push_byte(buf: %buf, byte: op_local_get)
       let %buf = push_uleb128(buf: %buf, val: packed_tmp)
       return push_byte(buf: %buf, byte: op_i32_wrap_i64)
+    case TyChar ->
+      // External ABI: char is i32, but internal representation is i64
+      let %buf = emit_atom(atom: atom, buf: %buf, ctx: ctx)
+      return push_byte(buf: %buf, byte: op_i32_wrap_i64)
     case _ ->
       let %buf = emit_atom(atom: atom, buf: %buf, ctx: ctx)
       return emit_coercion(from_type: atom_type(atom: atom), to_type: param_type, buf: %buf)
@@ -635,10 +646,15 @@ end
 let emit_external_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
                                ext_idx: i64) -> %ByteBuffer do
   match find_external(name: func, exts: ctx_externals(ctx: ctx)) do
-    case Some(val: LirExternal(name: _, wasm_module: _, wasm_name: _, params: params, ret_type: _, throw_row: _)) ->
+    case Some(val: LirExternal(name: _, wasm_module: _, wasm_name: _, params: params, ret_type: rt, throw_row: _)) ->
       let %buf = emit_external_call_args(buf: %buf, args: args, params: params, ctx: ctx)
       let %buf = push_byte(buf: %buf, byte: op_call)
-      push_uleb128(buf: %buf, val: ext_idx)
+      let %buf = push_uleb128(buf: %buf, val: ext_idx)
+      // Widen i32→i64 for char return values (external ABI uses i32)
+      match peel_linear(typ: rt) do
+        case TyChar -> push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+        case _ -> %buf
+      end
     case None ->
       // External definition not found — emit unreachable
       push_byte(buf: %buf, byte: op_unreachable)
@@ -904,6 +920,13 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
         end
         let raw_idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
         let idx = match raw_idx < 0 do case true -> 0 case false -> raw_idx end
+        // Widen i32→i64 if local was widened due to type conflict
+        let expr_vt = type_to_valtype(typ: peel_linear(typ: et))
+        let local_vt = lookup_local_valtype(name: n, entries: ctx_locals(ctx: ctx))
+        let %buf = match expr_vt == vt_i32 && local_vt == vt_i64 do
+          case true -> push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+          case false -> %buf
+        end
         let %buf = push_byte(buf: %buf, byte: op_local_set)
         return push_uleb128(buf: %buf, val: idx)
       end
@@ -1398,15 +1421,19 @@ let emit_external_name_entries = fn (buf: %ByteBuffer, exts: [LirExternal], idx:
   end
 end
 
-/// Build name subsection entries for backtrace imports
-let emit_bt_name_entries = fn (buf: %ByteBuffer, idx: i64) -> %ByteBuffer do
-  let %buf = push_uleb128(buf: %buf, val: idx)
-  let %buf = emit_name(buf: %buf, name: "__nx_bt_push")
-  let %buf = push_uleb128(buf: %buf, val: idx + 1)
-  let %buf = emit_name(buf: %buf, name: "__nx_bt_pop")
-  let %buf = push_uleb128(buf: %buf, val: idx + 2)
-  let %buf = emit_name(buf: %buf, name: "__nx_bt_freeze")
-  return %buf
+/// Conditionally emit backtrace import name entries
+let maybe_emit_bt_name_entries = fn (buf: %ByteBuffer, has_bt: bool, idx: i64) -> %ByteBuffer do
+  match has_bt do
+    case true ->
+      let %buf = push_uleb128(buf: %buf, val: idx)
+      let %buf = emit_name(buf: %buf, name: "__nx_bt_push")
+      let %buf = push_uleb128(buf: %buf, val: idx + 1)
+      let %buf = emit_name(buf: %buf, name: "__nx_bt_pop")
+      let %buf = push_uleb128(buf: %buf, val: idx + 2)
+      let %buf = emit_name(buf: %buf, name: "__nx_bt_freeze")
+      return %buf
+    case false -> return %buf
+  end
 end
 
 /// Build name subsection entries for internal functions
@@ -1423,23 +1450,16 @@ end
 /// Build the WASM name custom section payload (section name + function subsection)
 let build_name_section = fn (exts: [LirExternal], funcs: [LirFunction], has_bt: bool,
                               n_exts: i64, n_bt_imports: i64, total_funcs: i64) -> %ByteBuffer do
-  // Build function name entries into a temp buffer
   let %entries = empty()
   let %entries = push_uleb128(buf: %entries, val: total_funcs)
   let %entries = emit_external_name_entries(buf: %entries, exts: exts, idx: 0)
-  let bt_start = n_exts
-  let %entries = match has_bt do
-    case true -> emit_bt_name_entries(buf: %entries, idx: bt_start)
-    case false -> %entries
-  end
+  let %entries = maybe_emit_bt_name_entries(buf: %entries, has_bt: has_bt, idx: n_exts)
   let internal_start = n_exts + n_bt_imports
   let %entries = emit_internal_name_entries(buf: %entries, funcs: funcs, idx: internal_start)
-  // WASI run wrapper
   let wasi_idx = total_funcs - 1
   let %entries = push_uleb128(buf: %entries, val: wasi_idx)
   let %entries = emit_name(buf: %entries, name: "wasi:cli/run@0.2.0#run")
 
-  // Build the function subsection: [0x01][size][entries...]
   let entries_len = bb.length(buf: &entries)
   let %subsec = empty()
   let %subsec = push_byte(buf: %subsec, byte: 1)
@@ -1447,7 +1467,6 @@ let build_name_section = fn (exts: [LirExternal], funcs: [LirFunction], has_bt: 
   let %subsec = push_buf(dst: %subsec, src: &entries)
   free(buf: %entries)
 
-  // Build custom section payload: [name "name"][function subsection]
   let %payload = empty()
   let %payload = emit_name(buf: %payload, name: "name")
   let %payload = push_buf(dst: %payload, src: &subsec)
