@@ -23,7 +23,7 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          constructor_tag, record_tag,
          emit_name, emit_section, emit_memarg, emit_memarg_i64, emit_memarg_i8,
          sec_type, sec_import, sec_function, sec_table, sec_memory, sec_global, sec_export, sec_element, sec_code, sec_data,
-         vt_i32, vt_i64, vt_funcref, bt_void, bt_i32, desc_func, desc_table, desc_memory,
+         vt_i32, vt_i64, vt_f64, vt_funcref, bt_void, bt_i32, desc_func, desc_table, desc_memory,
          heap_global_idx, exn_value_global_idx, exn_flag_global_idx, string_data_base,
          op_unreachable, op_block, op_loop, op_if, op_else, op_end, op_br, op_br_if, op_return,
          op_call, op_call_indirect, op_return_call, op_drop,
@@ -56,7 +56,8 @@ import { starts_with } from "stdlib/string.nx"
 let emit_atom = fn (atom: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
   match atom do
     case LirAtomVar(name: n, typ: _) ->
-      let idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
+      let raw_idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
+      let idx = match raw_idx < 0 do case true -> 0 case false -> raw_idx end
       let %buf = push_byte(buf: %buf, byte: op_local_get)
       return push_uleb128(buf: %buf, val: idx)
     case LirAtomInt(val: v) ->
@@ -625,7 +626,9 @@ let emit_internal_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer,
       let call_op = match use_tail do case true -> op_return_call case false -> op_call end
       let %buf = push_byte(buf: %buf, byte: call_op)
       push_uleb128(buf: %buf, val: int_idx)
-    case None -> %buf
+    case None ->
+      // Function definition not found — emit unreachable (stack becomes polymorphic)
+      push_byte(buf: %buf, byte: op_unreachable)
   end
 end
 
@@ -636,7 +639,9 @@ let emit_external_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer,
       let %buf = emit_external_call_args(buf: %buf, args: args, params: params, ctx: ctx)
       let %buf = push_byte(buf: %buf, byte: op_call)
       push_uleb128(buf: %buf, val: ext_idx)
-    case None -> %buf
+    case None ->
+      // External definition not found — emit unreachable
+      push_byte(buf: %buf, byte: op_unreachable)
   end
 end
 
@@ -650,7 +655,8 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
     if ext_idx >= 0 then
       return emit_external_call(func: func, args: args, buf: %buf, ctx: ctx, ext_idx: ext_idx)
     else
-      return %buf
+      // Neither internal nor external — emit unreachable
+      return push_byte(buf: %buf, byte: op_unreachable)
     end
   end
 end
@@ -889,8 +895,15 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
         if is_unit(typ: et) == false then return push_byte(buf: %buf, byte: op_drop)
         else return %buf end
       else
-        let %buf = emit_coercion(from_type: et, to_type: t, buf: %buf)
-        let idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
+        // If expr is Unit-typed but binding is not, emit a default value.
+        // This happens for dead-code Let bindings where value comes from
+        // explicit returns inside branches (if/match).
+        let %buf = match is_unit(typ: et) do
+          case true -> emit_default_for_type(buf: %buf, typ: t)
+          case false -> emit_coercion(from_type: et, to_type: t, buf: %buf)
+        end
+        let raw_idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
+        let idx = match raw_idx < 0 do case true -> 0 case false -> raw_idx end
         let %buf = push_byte(buf: %buf, byte: op_local_set)
         return push_uleb128(buf: %buf, val: idx)
       end
@@ -1128,12 +1141,39 @@ end
 
 // ─── Function body compilation ──────────────────────────────────────────────
 
+let emit_default_for_type = fn (buf: %ByteBuffer, typ: TypeExpr) -> %ByteBuffer do
+  let vt = type_to_valtype(typ: typ)
+  match vt == vt_i32 do
+    case true ->
+      let %buf = push_byte(buf: %buf, byte: op_i32_const)
+      return push_sleb128(buf: %buf, val: 0)
+    case false ->
+      match vt == vt_f64 do
+        case true ->
+          let %buf = push_byte(buf: %buf, byte: op_f64_const)
+          return push_f64_str_le(buf: %buf, s: "0.0")
+        case false ->
+          let %buf = push_byte(buf: %buf, byte: op_i64_const)
+          return push_sleb128(buf: %buf, val: 0)
+      end
+  end
+end
+
 let emit_return_value = fn (body: %ByteBuffer, rt: TypeExpr, r: LirAtom, ctx: CodegenCtx) -> %ByteBuffer do
   match is_unit(typ: rt) do
     case true -> %body
     case false ->
-      let %body = emit_atom(atom: r, buf: %body, ctx: ctx)
-      emit_coercion(from_type: atom_type(atom: r), to_type: rt, buf: %body)
+      // If ret atom is Unit but return type is not, emit a default value for the
+      // return type. This happens when all code paths have explicit `return` and
+      // the LIR fallback ret atom is LirAtomUnit — the value is dead code but
+      // WASM validation requires a structurally valid stack at function end.
+      let actual = match r do
+        case LirAtomUnit -> emit_default_for_type(buf: %body, typ: rt)
+        case _ ->
+          let %body = emit_atom(atom: r, buf: %body, ctx: ctx)
+          emit_coercion(from_type: atom_type(atom: r), to_type: rt, buf: %body)
+      end
+      return actual
   end
 end
 
