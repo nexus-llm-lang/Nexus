@@ -187,6 +187,8 @@ fn merge_dependencies_once(
     }
     command
         .arg("--all-features")
+        .arg("--enable-tail-call")
+        .arg("--enable-multimemory")
         .arg("-o")
         .arg(&merged_path)
         .arg("--rename-export-conflicts");
