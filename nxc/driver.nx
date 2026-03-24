@@ -29,7 +29,7 @@ import * as list from "stdlib/list.nx"
 
 // ─── Import processing ──────────────────────────────────────────────────────
 
-type CacheEntry = CacheEntry(path: string, defs: [SpannedTopLevel])
+type CacheEntry = CacheEntry(path: string, defs: [SpannedTopLevel], entries: [RenameEntry])
 type ImportResult = ImportResult(accum: HirAccum, visited: [string], cache: [CacheEntry])
 type ImportEdge = ImportEdge(from_path: string, to_path: string, is_external: bool)
 type GraphResult = GraphResult(edges: [ImportEdge], visited: [string])
@@ -52,12 +52,54 @@ let import_items_has = fn (items: [ImportItem], name: string) -> bool do
   end
 end
 
-let cache_lookup = fn (cache: [CacheEntry], path: string) -> [SpannedTopLevel] do
+type CacheLookupResult = CacheHit(defs: [SpannedTopLevel], entries: [RenameEntry]) | CacheMiss
+
+let cache_lookup = fn (cache: [CacheEntry], path: string) -> CacheLookupResult do
   match cache do
-    case Nil -> return Nil
-    case CacheEntry(path: p, defs: d) :: rest ->
-      if p == path then return d end
+    case Nil -> return CacheMiss
+    case CacheEntry(path: p, defs: d, entries: e) :: rest ->
+      if p == path then return CacheHit(defs: d, entries: e) end
       return cache_lookup(cache: rest, path: path)
+  end
+end
+
+/// Merge rename entries: start with original entries, override selected items
+/// with their new names from the selective import. This ensures internal
+/// references (e.g. split calling split_go) use the original names that
+/// were registered during the first import.
+let merge_rename_entries = fn (orig: [RenameEntry], new_selective: [RenameEntry], items: [ImportItem]) -> [RenameEntry] do
+  match orig do
+    case Nil -> return Nil
+    case RenameEntry(original: name, qualified: _) :: rest ->
+      match import_items_has(items: items, name: name) do
+        case true ->
+          // Selected item — use the new selective entry
+          match find_in_entries(name: name, entries: new_selective) do
+            case Some(val: new_qual) ->
+              return Cons(v: RenameEntry(original: name, qualified: new_qual), rest: merge_rename_entries(orig: rest, new_selective: new_selective, items: items))
+            case None ->
+              return Cons(v: RenameEntry(original: name, qualified: name), rest: merge_rename_entries(orig: rest, new_selective: new_selective, items: items))
+          end
+        case false ->
+          // Non-selected — keep original entry (resolves to existing function)
+          return Cons(v: RenameEntry(original: name, qualified: find_in_entries_or(name: name, entries: orig, fallback: name)), rest: merge_rename_entries(orig: rest, new_selective: new_selective, items: items))
+      end
+  end
+end
+
+let find_in_entries = fn (name: string, entries: [RenameEntry]) -> Option<string> do
+  match entries do
+    case Nil -> return None
+    case RenameEntry(original: orig, qualified: qual) :: rest ->
+      if orig == name then return Some(val: qual) end
+      return find_in_entries(name: name, entries: rest)
+  end
+end
+
+let find_in_entries_or = fn (name: string, entries: [RenameEntry], fallback: string) -> string do
+  match find_in_entries(name: name, entries: entries) do
+    case Some(val: q) -> return q
+    case None -> return fallback
   end
 end
 
@@ -102,11 +144,20 @@ let process_imports = fn (imports: [ImportDef], accum: HirAccum,
                     return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
                   case _ :: _ ->
                     if verbose then Console.eprintln(val: "[nxc]   diamond (cached): " ++ path) end
-                    let cached_defs = cache_lookup(cache: cache, path: path)
-                    let selected = filter_defs_by_items(defs: cached_defs, items: items)
-                    let re_entries = build_rename_map(imported_defs: cached_defs, import_def: imp, import_depth: depth)
-                    let accum2 = process_defs(defs: selected, entries: re_entries, accum: accum)
-                    return process_imports(imports: rest, accum: accum2, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
+                    match cache_lookup(cache: cache, path: path) do
+                      case CacheMiss ->
+                        return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
+                      case CacheHit(defs: cached_defs, entries: orig_entries) ->
+                        // Merge entries: selected items get new names (bare/aliased),
+                        // everything else keeps original names from first import.
+                        // This ensures internal refs (split→split_go) resolve to
+                        // already-registered functions at their original depth.
+                        let new_entries = build_rename_map(imported_defs: cached_defs, import_def: imp, import_depth: depth)
+                        let merged = merge_rename_entries(orig: orig_entries, new_selective: new_entries, items: items)
+                        let selected = filter_defs_by_items(defs: cached_defs, items: items)
+                        let accum2 = process_defs(defs: selected, entries: merged, accum: accum)
+                        return process_imports(imports: rest, accum: accum2, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
+                    end
                 end
               end
             end
@@ -118,7 +169,7 @@ let process_imports = fn (imports: [ImportDef], accum: HirAccum,
             let entries = build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
             let sub_imports = extract_imports(defs: imported_defs)
             let new_stack = Cons(v: path, rest: import_stack)
-            let new_cache = Cons(v: CacheEntry(path: path, defs: imported_defs), rest: cache)
+            let new_cache = Cons(v: CacheEntry(path: path, defs: imported_defs, entries: entries), rest: cache)
             let sub_result = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, visited: Cons(v: path, rest: visited), cache: new_cache, depth: depth + 1, verbose: verbose)
             match sub_result do case ImportResult(accum: accum2, visited: visited2, cache: cache2) ->
               let accum3 = process_defs(defs: imported_defs, entries: entries, accum: accum2)
