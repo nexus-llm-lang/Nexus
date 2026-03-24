@@ -894,7 +894,7 @@ impl TypeChecker {
                                         self.instantiate(sch)
                                     } else {
                                         return Err(TypeError::new(
-                                            format!("Not found: {}", key),
+                                            format!("Undefined variable '{}' in index assignment", key),
                                             arr.span.clone(),
                                         ));
                                     }
@@ -1158,7 +1158,7 @@ impl TypeChecker {
                     Ok((HashMap::new(), t))
                 } else {
                     Err(TypeError::new(
-                        format!("Not found: {}", key),
+                        format!("Undefined variable '{}'", key),
                         e.span.clone(),
                     ))
                 }
