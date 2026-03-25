@@ -43,6 +43,9 @@ pub enum TokenKind {
     Tilde,     // ~
     Percent,   // %
     Ampersand, // &
+    Caret,     // ^
+    Shl,       // <<
+    Shr,       // >>
 
     Arrow,    // ->
     FatArrow, // =>
@@ -708,7 +711,10 @@ impl Lexer {
                     }
                 }
                 '<' => {
-                    if self.peek() == Some('-') {
+                    if self.peek() == Some('<') {
+                        self.advance();
+                        TokenKind::Shl
+                    } else if self.peek() == Some('-') {
                         self.advance();
                         TokenKind::Assign
                     } else if self.peek() == Some('=') {
@@ -727,7 +733,10 @@ impl Lexer {
                     }
                 }
                 '>' => {
-                    if self.peek() == Some('=') {
+                    if self.peek() == Some('>') {
+                        self.advance();
+                        TokenKind::Shr
+                    } else if self.peek() == Some('=') {
                         self.advance();
                         if self.peek() == Some('.') {
                             self.advance();
@@ -764,6 +773,7 @@ impl Lexer {
                 '.' => TokenKind::Dot,
                 '~' => TokenKind::Tilde,
                 '%' => TokenKind::Percent,
+                '^' => TokenKind::Caret,
                 '_' => {
                     // _ or _identifier — always treated as identifier
                     self.lex_ident_or_keyword('_')

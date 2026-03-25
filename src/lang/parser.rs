@@ -772,11 +772,11 @@ impl Parser {
             TokenKind::Percent => Some(BinaryOp::Mod),
             TokenKind::StarDot => Some(BinaryOp::FMul),
             TokenKind::SlashDot => Some(BinaryOp::FDiv),
-            TokenKind::Ident(s) if s == "band" => Some(BinaryOp::BitAnd),
-            TokenKind::Ident(s) if s == "bor" => Some(BinaryOp::BitOr),
-            TokenKind::Ident(s) if s == "bxor" => Some(BinaryOp::BitXor),
-            TokenKind::Ident(s) if s == "bshl" => Some(BinaryOp::Shl),
-            TokenKind::Ident(s) if s == "bshr" => Some(BinaryOp::Shr),
+            TokenKind::Ampersand => Some(BinaryOp::BitAnd),
+            TokenKind::Pipe => Some(BinaryOp::BitOr),
+            TokenKind::Caret => Some(BinaryOp::BitXor),
+            TokenKind::Shl => Some(BinaryOp::Shl),
+            TokenKind::Shr => Some(BinaryOp::Shr),
             _ => None,
         }
     }
