@@ -239,18 +239,6 @@ For HTTP networking, Nexus includes a host bridge component (`nexus_host_bridge`
 
 When a program requires `PermNet`, the compiler automatically composes this bridge into the final WASM component. This ensures the `Net` port works on any WASI-compliant host.
 
-## Self-Hosted Compiler (nxc)
-
-The Nexus self-hosted compiler (`nxc/`) compiles itself through a multi-stage bootstrap:
-
-```
-Stage 0: Rust compiler compiles nxc source → stage0.wasm
-Stage 1: stage0.wasm compiles nxc source → stage1.wasm
-Stage 2: stage1.wasm compiles nxc source → stage2.wasm
-```
-
-Run `./bootstrap.sh` to execute all stages. The self-hosted compiler is invoked via `nexus nxc <input.nx> [output.wasm]`.
-
 ## Building and Running
 
 ### Compile to WASM
