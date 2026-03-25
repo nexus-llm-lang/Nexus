@@ -9,7 +9,7 @@ use crate::types::Type;
 
 use super::emit::emit_numeric_coercion;
 use super::error::CodegenError;
-use super::function::{compile_atom, compile_expr};
+use super::function::{compile_atom, compile_expr, TcoLoop};
 use super::layout::CodegenLayout;
 use super::{FunctionTemps, LocalInfo, OBJECT_HEAP_GLOBAL_INDEX};
 
@@ -26,6 +26,7 @@ pub(super) fn compile_stmt(
     function_ret_type: &Type,
     in_try: bool,
     is_entrypoint: bool,
+    tco_loop: Option<TcoLoop>,
 ) -> Result<(), CodegenError> {
     match stmt {
         LirStmt::Let { name, typ, expr } => {
@@ -41,6 +42,7 @@ pub(super) fn compile_stmt(
                 function_ret_type,
                 in_try,
                 is_entrypoint,
+                tco_loop,
             )?;
             let et = super::emit::expr_type(expr);
             if matches!(typ, Type::Unit) {
@@ -63,6 +65,8 @@ pub(super) fn compile_stmt(
             then_body,
             else_body,
         } => {
+            // If opens 1 WASM block
+            let inner_tco = tco_loop.map(|t| t.deeper(1));
             compile_atom(cond, out, local_map, layout)?;
             emit_numeric_coercion(&cond.typ(), &Type::Bool, out)?;
             out.instruction(&Instruction::If(BlockType::Empty));
@@ -79,6 +83,7 @@ pub(super) fn compile_stmt(
                     function_ret_type,
                     in_try,
                     is_entrypoint,
+                    inner_tco,
                 )?;
             }
             if !else_body.is_empty() {
@@ -96,6 +101,7 @@ pub(super) fn compile_stmt(
                         function_ret_type,
                         in_try,
                         is_entrypoint,
+                        inner_tco,
                     )?;
                 }
             }
@@ -110,6 +116,8 @@ pub(super) fn compile_stmt(
             else_ret,
             ret_type,
         } => {
+            // IfReturn opens 1 WASM block (If)
+            let inner_tco = tco_loop.map(|t| t.deeper(1));
             compile_atom(cond, out, local_map, layout)?;
             emit_numeric_coercion(&cond.typ(), &Type::Bool, out)?;
             out.instruction(&Instruction::If(BlockType::Empty));
@@ -126,6 +134,7 @@ pub(super) fn compile_stmt(
                     function_ret_type,
                     in_try,
                     is_entrypoint,
+                    inner_tco,
                 )?;
             }
             if let Some(then_ret) = then_ret {
@@ -151,6 +160,7 @@ pub(super) fn compile_stmt(
                         function_ret_type,
                         in_try,
                         is_entrypoint,
+                        inner_tco,
                     )?;
                 }
                 if let Some(else_ret) = else_ret {
@@ -173,6 +183,7 @@ pub(super) fn compile_stmt(
             catch_body,
             catch_ret,
         } => {
+            // Disable TCO inside try-catch: self-tail-call br would skip exception handling
             let catch_local =
                 local_map
                     .get(catch_param)
@@ -198,6 +209,7 @@ pub(super) fn compile_stmt(
                     function_ret_type,
                     true,
                     is_entrypoint,
+                    None, // TCO disabled in try body
                 )?;
                 out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
                 out.instruction(&Instruction::BrIf(0));
@@ -236,6 +248,7 @@ pub(super) fn compile_stmt(
                     function_ret_type,
                     in_try,
                     is_entrypoint,
+                    None, // TCO disabled in catch body
                 )?;
                 if in_try {
                     out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
@@ -333,6 +346,8 @@ pub(super) fn compile_stmt(
             cond,
             body,
         } => {
+            // Loop opens Block + Loop = 2 WASM blocks
+            let inner_tco = tco_loop.map(|t| t.deeper(2));
             out.instruction(&Instruction::Block(BlockType::Empty));
             out.instruction(&Instruction::Loop(BlockType::Empty));
             // Evaluate condition preamble
@@ -349,6 +364,7 @@ pub(super) fn compile_stmt(
                     function_ret_type,
                     in_try,
                     is_entrypoint,
+                    inner_tco,
                 )?;
             }
             // Check break condition
@@ -369,6 +385,7 @@ pub(super) fn compile_stmt(
                     function_ret_type,
                     in_try,
                     is_entrypoint,
+                    inner_tco,
                 )?;
             }
             out.instruction(&Instruction::Br(0)); // continue to loop head
@@ -401,6 +418,7 @@ pub(super) fn compile_stmt(
                     function_ret_type,
                     in_try,
                     is_entrypoint,
+                    tco_loop,
                 )
             } else {
                 compile_switch_linear(
@@ -419,6 +437,7 @@ pub(super) fn compile_stmt(
                     function_ret_type,
                     in_try,
                     is_entrypoint,
+                    tco_loop,
                 )
             }
         }
@@ -470,7 +489,10 @@ fn compile_switch_linear(
     function_ret_type: &Type,
     in_try: bool,
     is_entrypoint: bool,
+    tco_loop: Option<TcoLoop>,
 ) -> Result<(), CodegenError> {
+    // Each case opens 1 If block (sequential, not nested)
+    let case_tco = tco_loop.map(|t| t.deeper(1));
     for case in cases {
         compile_atom(tag, out, local_map, layout)?;
         out.instruction(&Instruction::I64Const(case.tag_value));
@@ -489,6 +511,7 @@ fn compile_switch_linear(
                 function_ret_type,
                 in_try,
                 is_entrypoint,
+                case_tco,
             )?;
         }
         if let Some(ret) = &case.ret {
@@ -501,7 +524,7 @@ fn compile_switch_linear(
         }
         out.instruction(&Instruction::End);
     }
-    // Default body
+    // Default body (no extra block — same depth as outer)
     for nested in default_body {
         compile_stmt(
             nested,
@@ -515,6 +538,7 @@ fn compile_switch_linear(
             function_ret_type,
             in_try,
             is_entrypoint,
+            tco_loop,
         )?;
     }
     if let Some(ret) = default_ret {
@@ -562,6 +586,7 @@ fn compile_switch_br_table(
     function_ret_type: &Type,
     in_try: bool,
     is_entrypoint: bool,
+    tco_loop: Option<TcoLoop>,
 ) -> Result<(), CodegenError> {
     let n = cases.len();
 
@@ -594,7 +619,9 @@ fn compile_switch_br_table(
     out.instruction(&Instruction::BrTable(Cow::Owned(targets), default_target));
 
     // Close default block → emit default body
+    // After closing 1 of n+1 blocks: n blocks remain above us
     out.instruction(&Instruction::End);
+    let default_tco = tco_loop.map(|t| t.deeper(n as u32));
     for nested in default_body {
         compile_stmt(
             nested,
@@ -608,6 +635,7 @@ fn compile_switch_br_table(
             function_ret_type,
             in_try,
             is_entrypoint,
+            default_tco,
         )?;
     }
     if let Some(ret) = default_ret {
@@ -620,8 +648,10 @@ fn compile_switch_br_table(
     }
 
     // Close case blocks in reverse sorted order + emit bodies
-    for &case_idx in sorted_indices.iter().rev() {
+    // After closing j+2 blocks total: n-1-j blocks remain above us
+    for (j, &case_idx) in sorted_indices.iter().rev().enumerate() {
         out.instruction(&Instruction::End);
+        let case_tco = tco_loop.map(|t| t.deeper((n - 1 - j) as u32));
         for nested in &cases[case_idx].body {
             compile_stmt(
                 nested,
@@ -635,6 +665,7 @@ fn compile_switch_br_table(
                 function_ret_type,
                 in_try,
                 is_entrypoint,
+                case_tco,
             )?;
         }
         if let Some(ret) = &cases[case_idx].ret {

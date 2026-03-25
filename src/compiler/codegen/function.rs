@@ -1,10 +1,30 @@
 use std::collections::HashMap;
 
-use wasm_encoder::{Function, Instruction, ValType};
+use wasm_encoder::{BlockType, Function, Instruction, ValType};
 
 use crate::intern::Symbol;
 use crate::ir::lir::{LirAtom, LirExpr, LirFunction, LirProgram, LirStmt};
 use crate::types::Type;
+
+/// TCO loop context for self-recursion-to-loop optimization.
+/// When present, self-tail-calls emit param reassignment + `br` instead of `return_call`.
+#[derive(Clone, Copy)]
+pub(super) struct TcoLoop {
+    /// Name of the current function (to detect self-tail-calls).
+    pub self_name: Symbol,
+    /// WASM block depth from current position to the TCO loop header.
+    pub loop_depth: u32,
+}
+
+impl TcoLoop {
+    /// Return a new TcoLoop with depth incremented by `n` (for entering WASM blocks).
+    pub fn deeper(self, n: u32) -> Self {
+        TcoLoop {
+            loop_depth: self.loop_depth + n,
+            ..self
+        }
+    }
+}
 
 use super::binary::{binary_operand_type, compile_binary};
 use super::emit::{
@@ -108,6 +128,23 @@ pub(super) fn compile_function(
     }
 
     let is_entrypoint = func.name == ENTRYPOINT;
+
+    // Self-recursion-to-loop: if the function contains self-tail-calls,
+    // wrap the body in a WASM `loop` and replace self-tail-calls with
+    // param reassignment + `br` instead of `return_call`.
+    let tco_loop = if has_self_tail_call(func) {
+        Some(TcoLoop {
+            self_name: func.name,
+            loop_depth: 0,
+        })
+    } else {
+        None
+    };
+
+    if tco_loop.is_some() {
+        out.instruction(&Instruction::Loop(BlockType::Empty));
+    }
+
     for stmt in &func.body {
         compile_stmt(
             stmt,
@@ -121,7 +158,12 @@ pub(super) fn compile_function(
             &func.ret_type,
             false,
             is_entrypoint,
+            tco_loop,
         )?;
+    }
+
+    if tco_loop.is_some() {
+        out.instruction(&Instruction::End); // end loop
     }
 
     // Backtrace: pop frame before implicit return
@@ -250,6 +292,7 @@ pub(super) fn compile_expr(
     function_ret_type: &Type,
     in_try: bool,
     is_entrypoint: bool,
+    tco_loop: Option<TcoLoop>,
 ) -> Result<(), CodegenError> {
     match expr {
         LirExpr::Atom(atom) => compile_atom(atom, out, local_map, layout),
@@ -269,6 +312,40 @@ pub(super) fn compile_expr(
         }
         LirExpr::Call { func, args, .. } | LirExpr::TailCall { func, args, .. } => {
             let is_tail = matches!(expr, LirExpr::TailCall { .. }) && !in_try;
+
+            // Self-recursion-to-loop: self-tail-call → param reassignment + br
+            if is_tail {
+                if let Some(tco) = tco_loop {
+                    if *func == tco.self_name {
+                        let callee = program
+                            .functions
+                            .iter()
+                            .find(|f| f.name == *func)
+                            .ok_or_else(|| CodegenError::CallTargetNotFound {
+                                name: func.to_string(),
+                            })?;
+
+                        // Push all arg values onto the WASM stack (in param order)
+                        for ((_label, atom), param) in args.iter().zip(callee.params.iter()) {
+                            compile_atom(atom, out, local_map, layout)?;
+                            emit_numeric_coercion(&atom.typ(), &param.typ, out)?;
+                        }
+                        // Pop into params in reverse order (WASM stack is LIFO)
+                        // This ensures atomic read-before-write for swaps like (a: b, b: a)
+                        for param in callee.params.iter().rev() {
+                            let local = local_map
+                                .get(&param.name)
+                                .ok_or_else(|| CodegenError::ConflictingLocalTypes {
+                                    name: param.name.to_string(),
+                                })?;
+                            out.instruction(&Instruction::LocalSet(local.index));
+                        }
+                        // No bt_pop — we stay in the same function frame
+                        out.instruction(&Instruction::Br(tco.loop_depth));
+                        return Ok(());
+                    }
+                }
+            }
 
             if let Some(callee_idx) = internal_indices.get(func).copied() {
                 let callee = program
@@ -630,9 +707,62 @@ fn emit_exn_propagate(
     function_ret_type: &Type,
     is_entrypoint: bool,
 ) {
-    use wasm_encoder::BlockType;
     out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
     out.instruction(&Instruction::If(BlockType::Empty));
     emit_exn_bail(out, layout, function_ret_type, is_entrypoint);
     out.instruction(&Instruction::End);
+}
+
+/// Check if a function contains any self-tail-calls (TailCall where func == self.name).
+/// Used to decide whether to wrap the function body in a TCO loop.
+fn has_self_tail_call(func: &LirFunction) -> bool {
+    stmts_have_self_tail_call(&func.body, &func.name)
+}
+
+fn stmts_have_self_tail_call(stmts: &[LirStmt], self_name: &Symbol) -> bool {
+    stmts
+        .iter()
+        .any(|s| stmt_has_self_tail_call(s, self_name))
+}
+
+fn stmt_has_self_tail_call(stmt: &LirStmt, self_name: &Symbol) -> bool {
+    match stmt {
+        LirStmt::Let { expr, .. } => matches!(
+            expr,
+            LirExpr::TailCall { func, .. } if func == self_name
+        ),
+        LirStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            stmts_have_self_tail_call(then_body, self_name)
+                || stmts_have_self_tail_call(else_body, self_name)
+        }
+        LirStmt::IfReturn {
+            then_body,
+            else_body,
+            ..
+        } => {
+            stmts_have_self_tail_call(then_body, self_name)
+                || stmts_have_self_tail_call(else_body, self_name)
+        }
+        LirStmt::Switch {
+            cases,
+            default_body,
+            ..
+        } => {
+            cases
+                .iter()
+                .any(|c| stmts_have_self_tail_call(&c.body, self_name))
+                || stmts_have_self_tail_call(default_body, self_name)
+        }
+        LirStmt::Loop { cond_stmts, body, .. } => {
+            stmts_have_self_tail_call(cond_stmts, self_name)
+                || stmts_have_self_tail_call(body, self_name)
+        }
+        // TryCatch: TCO is disabled inside try blocks, so don't look there.
+        // Conc: task bodies don't contain tail calls.
+        _ => false,
+    }
 }
