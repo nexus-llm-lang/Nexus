@@ -122,6 +122,14 @@ ok "Stage 1 complete: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
 
 WASM_MERGE="${NEXUS_WASM_MERGE:-wasm-merge}"
 STAGE1_BUNDLED="$BUILD_DIR/stage1_bundled.wasm"
+HOST_STUB_WAT="$(pwd)/nxlib/stdlib/nexus_host_stub.wat"
+HOST_STUB_WASM="$(pwd)/stdlib/nexus_host_stub.wasm"
+if [[ -f "$HOST_STUB_WAT" && ! -f "$HOST_STUB_WASM" ]]; then
+  if command -v wat2wasm >/dev/null 2>&1; then
+    info "Compiling nexus_host_stub.wat → .wasm"
+    wat2wasm "$HOST_STUB_WAT" -o "$HOST_STUB_WASM"
+  fi
+fi
 if command -v "$WASM_MERGE" >/dev/null 2>&1 || [[ -x "$WASM_MERGE" ]]; then
   info "Bundling stage1 with stdlib..."
   "$WASM_MERGE" "$STAGE1" __main \
