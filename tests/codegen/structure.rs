@@ -132,6 +132,7 @@ end
 
 #[test]
 fn codegen_tail_call_emits_return_call_instruction() {
+    // Self-tail-recursive calls should be optimized to loop+br (not return_call)
     let wasm = compile(
         r#"
 let sum_tail = fn (n: i64, acc: i64) -> i64 do
@@ -149,25 +150,35 @@ end
         .validate_all(&wasm)
         .expect("WASM should be valid");
 
+    let mut has_loop = false;
+    let mut has_br = false;
     let mut has_return_call = false;
     for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
         if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
             let reader = body.get_operators_reader().unwrap();
             for op in reader {
-                if matches!(op.unwrap(), Operator::ReturnCall { .. }) {
-                    has_return_call = true;
+                match op.unwrap() {
+                    Operator::Loop { .. } => has_loop = true,
+                    Operator::Br { .. } => has_br = true,
+                    Operator::ReturnCall { .. } => has_return_call = true,
+                    _ => {}
                 }
             }
         }
     }
     assert!(
-        has_return_call,
-        "tail-recursive call should emit return_call instruction"
+        has_loop && has_br,
+        "self-tail-recursive call should emit loop + br (TCO-to-loop)"
+    );
+    assert!(
+        !has_return_call,
+        "self-tail-recursive call should NOT emit return_call (uses loop instead)"
     );
 }
 
 #[test]
-fn codegen_tail_call_in_if_branch_emits_return_call() {
+fn codegen_tail_call_in_if_branch_emits_loop_br() {
+    // Self-tail-call in if-else branch should be optimized to loop+br
     let wasm = compile(
         r#"
 let count_down = fn (n: i64) -> i64 do
@@ -188,6 +199,55 @@ end
         .validate_all(&wasm)
         .expect("WASM should be valid");
 
+    let mut has_loop = false;
+    let mut has_return_call = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                match op.unwrap() {
+                    Operator::Loop { .. } => has_loop = true,
+                    Operator::ReturnCall { .. } => has_return_call = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(
+        has_loop,
+        "self-tail-call in if-else branch should emit loop (TCO-to-loop)"
+    );
+    assert!(
+        !has_return_call,
+        "self-tail-call should NOT emit return_call (uses loop instead)"
+    );
+}
+
+#[test]
+fn codegen_non_self_tail_call_emits_return_call() {
+    // Non-self tail calls (mutual recursion) should still use return_call
+    let wasm = compile(
+        r#"
+let is_even = fn (n: i64) -> bool do
+    if n == 0 then return true end
+    return is_odd(n: n - 1)
+end
+
+let is_odd = fn (n: i64) -> bool do
+    if n == 0 then return false end
+    return is_even(n: n - 1)
+end
+
+let main = fn () -> unit do
+    let _ = is_even(n: 10)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
     let mut has_return_call = false;
     for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
         if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
@@ -201,7 +261,7 @@ end
     }
     assert!(
         has_return_call,
-        "tail call in if-else branch should emit return_call"
+        "non-self tail call (mutual recursion) should still use return_call"
     );
 }
 
