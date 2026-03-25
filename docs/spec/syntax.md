@@ -122,9 +122,9 @@ Binary operators with standard precedence (multiplicative binds tighter than add
 
 | Operators | Domain |
 |---|---|
-| `bshl` `bshr` | Bit shift (highest) |
-| `*` `/` `*.` `/.` `band` | Multiplicative / bitwise AND |
-| `+` `-` `+.` `-.` `++` `bor` `bxor` | Additive / string concat / bitwise OR, XOR |
+| `<<` `>>` | Bit shift (highest) |
+| `*` `/` `*.` `/.` `&` | Multiplicative / bitwise AND |
+| `+` `-` `+.` `-.` `++` `\|` `^` | Additive / string concat / bitwise OR, XOR |
 | `==` `!=` `<` `>` `<=` `>=` | Integer / generic comparison |
 | `==.` `!=.` `<.` `>.` `<=.` `>=.` | Float comparison |
 | `&&` | Logical AND |
@@ -523,18 +523,18 @@ expr             ::= expr binary_op expr   (* left-associative *)
                    | match_expr
                    | postfix_expr
 
-binary_op        ::= "||"                                          (* logical — lowest *)
+binary_op        ::= "||"
                    | "&&"
-                   | "==" | "!=" | "<=" | ">=" | "<" | ">"        (* comparison *)
+                   | "==" | "!=" | "<=" | ">=" | "<" | ">"
                    | "==." | "!=." | "<=." | ">=." | "<." | ">."
-                   | "+" | "-" | "++" | "bor" | "bxor"            (* additive / bitwise OR, XOR *)
+                   | "+" | "-" | "++" | "|" | "^"
                    | "+." | "-."
-                   | "*" | "/" | "band"                            (* multiplicative / bitwise AND *)
+                   | "*" | "/" | "&"
                    | "*." | "/."
-                   | "bshl" | "bshr"                               (* bit shift — highest *)
+                   | "<<" | ">>"
 
-postfix_expr     ::= postfix_expr "." IDENT                       (* field access *)
-                   | postfix_expr "[" expr "]"                     (* index *)
+postfix_expr     ::= postfix_expr "." IDENT        (* field access *)
+                   | postfix_expr "[" expr "]"     (* index *)
                    | atom_expr
 
 match_expr       ::= "match" expr "do" match_case_expr* "end"

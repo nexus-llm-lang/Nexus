@@ -547,7 +547,7 @@ export default grammar({
           4,
           seq(
             field("left", $._expr),
-            field("operator", choice("bor", "bxor")),
+            field("operator", choice("|", "^")),
             field("right", $._expr)
           )
         ),
@@ -556,7 +556,7 @@ export default grammar({
           5,
           seq(
             field("left", $._expr),
-            field("operator", "band"),
+            field("operator", "&"),
             field("right", $._expr)
           )
         ),
@@ -565,7 +565,7 @@ export default grammar({
           6,
           seq(
             field("left", $._expr),
-            field("operator", choice("bshl", "bshr")),
+            field("operator", choice("<<", ">>")),
             field("right", $._expr)
           )
         )
