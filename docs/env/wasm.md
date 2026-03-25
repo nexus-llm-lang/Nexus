@@ -113,7 +113,7 @@ Word 2:  i64  field[1]
 ...
 ```
 
-The tag is computed via FNV-1a: `hash(name) ^ arity * FNV_PRIME`. Pattern matching compares tags with `i64.eq`.
+The tag is computed via FNV-1a: `hash(name) ^ arity * FNV_PRIME`. Pattern matching compares tags with `i64.eq`. Fields are stored in **lexicographic order** by field name, matching the extraction convention.
 
 #### Record
 
@@ -153,7 +153,8 @@ When storing values in heap objects, all values are normalized to `i64`:
 
 ### Calling Convention
 
-- All labeled arguments become positional WASM parameters, sorted by label name.
+- **Internal functions**: All labeled parameters and arguments are sorted **lexicographically by label**. Both the function signature and call sites use the same sorted order.
+- **External functions (FFI)**: Parameters stay in **source (definition) order** to match the stdlib WASM ABI. Call arguments are matched to external parameters **by label**, not by position.
 - `unit` parameters generate no WASM parameter.
 - `unit`-returning functions have an empty WASM result type.
 - Tail calls use WASM `return_call` when not inside a `try` block.
@@ -237,6 +238,18 @@ If the program uses closures or function references, a funcref table is emitted:
 For HTTP networking, Nexus includes a host bridge component (`nexus_host_bridge`) that translates Nexus FFI calls (prefixed with `__nx_http`) into WASI HTTP component calls.
 
 When a program requires `PermNet`, the compiler automatically composes this bridge into the final WASM component. This ensures the `Net` port works on any WASI-compliant host.
+
+## Self-Hosted Compiler (nxc)
+
+The Nexus self-hosted compiler (`nxc/`) compiles itself through a multi-stage bootstrap:
+
+```
+Stage 0: Rust compiler compiles nxc source → stage0.wasm
+Stage 1: stage0.wasm compiles nxc source → stage1.wasm
+Stage 2: stage1.wasm compiles nxc source → stage2.wasm
+```
+
+Run `./bootstrap.sh` to execute all stages. The self-hosted compiler is invoked via `nexus nxc <input.nx> [output.wasm]`.
 
 ## Building and Running
 
