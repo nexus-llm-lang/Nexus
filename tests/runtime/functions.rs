@@ -357,3 +357,76 @@ end
 "#,
     );
 }
+
+// ---- TCMC (Tail Call Modulo Constructor) ----
+
+#[test]
+fn tcmc_list_map_produces_correct_result() {
+    exec(
+        r#"
+type IntList = Nil | Cons(v: i64, rest: IntList)
+
+let map_double = fn (xs: IntList) -> IntList do
+    match xs do
+        case Nil -> return Nil
+        case Cons(v: v, rest: rest) ->
+            return Cons(v: v * 2, rest: map_double(xs: rest))
+    end
+end
+
+let sum = fn (xs: IntList, acc: i64) -> i64 do
+    match xs do
+        case Nil -> return acc
+        case Cons(v: v, rest: rest) -> return sum(xs: rest, acc: acc + v)
+    end
+end
+
+let main = fn () -> unit do
+    let xs = Cons(v: 1, rest: Cons(v: 2, rest: Cons(v: 3, rest: Nil)))
+    let doubled = map_double(xs: xs)
+    let result = sum(xs: doubled, acc: 0)
+    if result != 12 then raise RuntimeError(val: "expected 12") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn tcmc_deep_list_build_does_not_overflow() {
+    // iota uses TCMC pattern (Cons(n, iota(n-1))): should build long lists without stack overflow
+    // head extracts the first element to verify correctness
+    exec(
+        r#"
+type IntList = Nil | Cons(v: i64, rest: IntList)
+
+let iota = fn (n: i64) -> IntList do
+    if n <= 0 then return Nil end
+    return Cons(v: n, rest: iota(n: n - 1))
+end
+
+let head = fn (xs: IntList) -> i64 do
+    match xs do
+        case Nil -> return 0
+        case Cons(v: v, rest: _) -> return v
+    end
+end
+
+let length_acc = fn (xs: IntList, acc: i64) -> i64 do
+    match xs do
+        case Nil -> return acc
+        case Cons(v: _, rest: rest) -> return length_acc(xs: rest, acc: acc + 1)
+    end
+end
+
+let main = fn () -> unit do
+    let xs = iota(n: 5000)
+    let h = head(xs: xs)
+    if h != 5000 then raise RuntimeError(val: "expected head 5000") end
+    let len = length_acc(xs: xs, acc: 0)
+    if len != 5000 then raise RuntimeError(val: "expected length 5000") end
+    return ()
+end
+"#,
+    );
+}

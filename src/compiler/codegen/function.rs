@@ -26,6 +26,41 @@ impl TcoLoop {
     }
 }
 
+/// Pre-detection info for TCMC (before WASM local allocation).
+struct TcmcPreInfo {
+    call_var: Symbol,
+    call_args: Vec<(Symbol, LirAtom)>,
+    cons_var: Symbol,
+    ctor_name: Symbol,
+    ctor_num_fields: usize,
+    rest_field_idx: usize,
+    non_rec_fields: Vec<(usize, LirAtom)>,
+}
+
+/// TCMC codegen context: tail call modulo cons(tructor) optimization.
+/// Builds lists in-place by allocating Cons cells with placeholder `rest`,
+/// linking them forward, and looping back via the TCO loop.
+pub(super) struct TcmcInfo {
+    /// WASM local index for the head pointer (i64, first cell allocated).
+    pub head_local: u32,
+    /// WASM local index for the previous cell pointer (i32, for field mutation).
+    pub prev_local: u32,
+    /// Constructor field index for the recursive result (e.g., 0 for Cons.rest).
+    pub rest_field_idx: usize,
+    /// LIR symbol for the Let binding of the self-call result (to skip).
+    pub call_var: Symbol,
+    /// LIR symbol for the Let binding of the Constructor result (to intercept).
+    pub cons_var: Symbol,
+    /// Self-call args saved from detection (for param reassignment).
+    pub call_args: Vec<(Symbol, LirAtom)>,
+    /// Constructor name (e.g., "Cons").
+    pub ctor_name: Symbol,
+    /// Number of constructor fields.
+    pub ctor_num_fields: usize,
+    /// Non-recursive constructor fields: (field_idx, value atom).
+    pub non_rec_fields: Vec<(usize, LirAtom)>,
+}
+
 use super::binary::{binary_operand_type, compile_binary};
 use super::emit::{
     compile_external_arg, constructor_tag, emit_alloc_object, emit_numeric_coercion,
@@ -101,6 +136,26 @@ pub(super) fn compile_function(
         ValType::I64,
     ]);
 
+    // TCMC: detect tail-call-modulo-constructor pattern and allocate extra locals
+    let tcmc_pre = detect_tcmc(func);
+    let tcmc_info = tcmc_pre.map(|pre| {
+        let head_idx = next_local_index + 13; // after FunctionTemps (13 slots)
+        let prev_idx = next_local_index + 14;
+        local_decls_flat.push(ValType::I64); // __tcmc_head
+        local_decls_flat.push(ValType::I32); // __tcmc_prev
+        TcmcInfo {
+            head_local: head_idx,
+            prev_local: prev_idx,
+            rest_field_idx: pre.rest_field_idx,
+            call_var: pre.call_var,
+            cons_var: pre.cons_var,
+            call_args: pre.call_args,
+            ctor_name: pre.ctor_name,
+            ctor_num_fields: pre.ctor_num_fields,
+            non_rec_fields: pre.non_rec_fields,
+        }
+    });
+
     // RLE-compress local declarations for WASM
     let wasm_locals = local_decls_flat.iter().fold(Vec::new(), |mut acc, &vt| {
         if let Some((count, last_ty)) = acc.last_mut() {
@@ -129,10 +184,10 @@ pub(super) fn compile_function(
 
     let is_entrypoint = func.name == ENTRYPOINT;
 
-    // Self-recursion-to-loop: if the function contains self-tail-calls,
-    // wrap the body in a WASM `loop` and replace self-tail-calls with
-    // param reassignment + `br` instead of `return_call`.
-    let tco_loop = if has_self_tail_call(func) {
+    // Self-recursion-to-loop: if the function contains self-tail-calls
+    // or TCMC patterns, wrap the body in a WASM `loop`.
+    let needs_loop = has_self_tail_call(func) || tcmc_info.is_some();
+    let tco_loop = if needs_loop {
         Some(TcoLoop {
             self_name: func.name,
             loop_depth: 0,
@@ -141,7 +196,15 @@ pub(super) fn compile_function(
         None
     };
 
-    if tco_loop.is_some() {
+    // TCMC init: set head=0, prev=0 BEFORE the loop (only runs once)
+    if let Some(ref tcmc) = tcmc_info {
+        out.instruction(&Instruction::I64Const(0));
+        out.instruction(&Instruction::LocalSet(tcmc.head_local));
+        out.instruction(&Instruction::I32Const(0));
+        out.instruction(&Instruction::LocalSet(tcmc.prev_local));
+    }
+
+    if needs_loop {
         out.instruction(&Instruction::Loop(BlockType::Empty));
     }
 
@@ -159,10 +222,11 @@ pub(super) fn compile_function(
             false,
             is_entrypoint,
             tco_loop,
+            tcmc_info.as_ref(),
         )?;
     }
 
-    if tco_loop.is_some() {
+    if needs_loop {
         out.instruction(&Instruction::End); // end loop
     }
 
@@ -171,9 +235,35 @@ pub(super) fn compile_function(
         out.instruction(&Instruction::Call(bt_pop_idx));
     }
 
+    // Function epilogue: return value (with TCMC linking if active)
     if !matches!(func.ret_type, Type::Unit) {
-        compile_atom(&func.ret, &mut out, &local_map, layout)?;
-        emit_numeric_coercion(&func.ret.typ(), &func.ret_type, &mut out)?;
+        if let Some(ref tcmc) = tcmc_info {
+            // Conditional TCMC return for fallthrough path
+            let ret_vt = type_to_wasm_valtype(&func.ret_type)?;
+            out.instruction(&Instruction::LocalGet(tcmc.prev_local));
+            out.instruction(&Instruction::I32Const(0));
+            out.instruction(&Instruction::I32Ne);
+            out.instruction(&Instruction::If(BlockType::Result(ret_vt)));
+            {
+                // Link last cell's rest to fallthrough value
+                out.instruction(&Instruction::LocalGet(tcmc.prev_local));
+                compile_atom(&func.ret, &mut out, &local_map, layout)?;
+                emit_pack_value_to_i64(&func.ret.typ(), &mut out)?;
+                out.instruction(&Instruction::I64Store(memarg(
+                    ((tcmc.rest_field_idx + 1) * 8) as u64,
+                )));
+                out.instruction(&Instruction::LocalGet(tcmc.head_local));
+            }
+            out.instruction(&Instruction::Else);
+            {
+                compile_atom(&func.ret, &mut out, &local_map, layout)?;
+                emit_numeric_coercion(&func.ret.typ(), &func.ret_type, &mut out)?;
+            }
+            out.instruction(&Instruction::End);
+        } else {
+            compile_atom(&func.ret, &mut out, &local_map, layout)?;
+            emit_numeric_coercion(&func.ret.typ(), &func.ret_type, &mut out)?;
+        }
     }
     out.instruction(&Instruction::End);
 
@@ -765,4 +855,188 @@ fn stmt_has_self_tail_call(stmt: &LirStmt, self_name: &Symbol) -> bool {
         // Conc: task bodies don't contain tail calls.
         _ => false,
     }
+}
+
+// ── TCMC: Tail Call Modulo Constructor ──────────────────────────────────
+
+/// Detect the TCMC pattern: `Let A = Call(self, args)` followed by
+/// `Let B = Constructor(name, [..A..])` where A is one of the constructor args.
+fn detect_tcmc(func: &LirFunction) -> Option<TcmcPreInfo> {
+    find_tcmc_in_stmts(&func.body, &func.name)
+}
+
+fn find_tcmc_in_stmts(stmts: &[LirStmt], self_name: &Symbol) -> Option<TcmcPreInfo> {
+    // Check consecutive pairs of Let bindings
+    for i in 0..stmts.len().saturating_sub(1) {
+        if let LirStmt::Let {
+            name: call_name,
+            expr: LirExpr::Call { func, args, .. },
+            ..
+        } = &stmts[i]
+        {
+            if func == self_name {
+                if let LirStmt::Let {
+                    expr:
+                        LirExpr::Constructor {
+                            name: ctor_name,
+                            args: ctor_args,
+                            ..
+                        },
+                    name: cons_name,
+                    ..
+                } = &stmts[i + 1]
+                {
+                    if let Some(rest_idx) = ctor_args.iter().position(|a| {
+                        matches!(a, LirAtom::Var { name, .. } if name == call_name)
+                    }) {
+                        let non_rec_fields: Vec<(usize, LirAtom)> = ctor_args
+                            .iter()
+                            .enumerate()
+                            .filter(|(j, _)| *j != rest_idx)
+                            .map(|(j, a)| (j, a.clone()))
+                            .collect();
+
+                        return Some(TcmcPreInfo {
+                            call_var: *call_name,
+                            call_args: args.clone(),
+                            cons_var: *cons_name,
+                            ctor_name: *ctor_name,
+                            ctor_num_fields: ctor_args.len(),
+                            rest_field_idx: rest_idx,
+                            non_rec_fields,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse into branches
+    for stmt in stmts {
+        let result = match stmt {
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            }
+            | LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => find_tcmc_in_stmts(then_body, self_name)
+                .or_else(|| find_tcmc_in_stmts(else_body, self_name)),
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => cases
+                .iter()
+                .find_map(|c| find_tcmc_in_stmts(&c.body, self_name))
+                .or_else(|| find_tcmc_in_stmts(default_body, self_name)),
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => find_tcmc_in_stmts(cond_stmts, self_name)
+                .or_else(|| find_tcmc_in_stmts(body, self_name)),
+            _ => None,
+        };
+        if result.is_some() {
+            return result;
+        }
+    }
+
+    None
+}
+
+/// Emit the TCMC sequence: allocate constructor with placeholder rest,
+/// link to previous cell, update prev, reassign params, and br to loop.
+pub(super) fn emit_tcmc_cons_and_loop(
+    tcmc: &TcmcInfo,
+    out: &mut Function,
+    local_map: &HashMap<Symbol, LocalInfo>,
+    program: &LirProgram,
+    layout: &CodegenLayout,
+    temps: &FunctionTemps,
+    tco_loop: Option<TcoLoop>,
+) -> Result<(), CodegenError> {
+    // 1. Allocate constructor cell (tag + fields)
+    emit_alloc_object(out, temps, 1 + tcmc.ctor_num_fields, layout)?;
+
+    // Store tag
+    out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+    out.instruction(&Instruction::I64Const(constructor_tag(
+        tcmc.ctor_name.as_str(),
+        tcmc.ctor_num_fields,
+    )));
+    out.instruction(&Instruction::I64Store(memarg(0)));
+
+    // Store rest field = 0 (placeholder, filled by next iteration or base case)
+    out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+    out.instruction(&Instruction::I64Const(0));
+    out.instruction(&Instruction::I64Store(memarg(
+        ((tcmc.rest_field_idx + 1) * 8) as u64,
+    )));
+
+    // Store non-recursive fields
+    for &(idx, ref atom) in &tcmc.non_rec_fields {
+        out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+        compile_atom(atom, out, local_map, layout)?;
+        emit_pack_value_to_i64(&atom.typ(), out)?;
+        out.instruction(&Instruction::I64Store(memarg(((idx + 1) * 8) as u64)));
+    }
+
+    // 2. Link to previous cell (or set head if first)
+    out.instruction(&Instruction::LocalGet(tcmc.prev_local));
+    out.instruction(&Instruction::I32Const(0));
+    out.instruction(&Instruction::I32Ne);
+    out.instruction(&Instruction::If(BlockType::Empty));
+    {
+        // prev.rest = current cell pointer
+        out.instruction(&Instruction::LocalGet(tcmc.prev_local));
+        out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+        out.instruction(&Instruction::I64ExtendI32U);
+        out.instruction(&Instruction::I64Store(memarg(
+            ((tcmc.rest_field_idx + 1) * 8) as u64,
+        )));
+    }
+    out.instruction(&Instruction::Else);
+    {
+        // First cell: save as head
+        out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+        out.instruction(&Instruction::I64ExtendI32U);
+        out.instruction(&Instruction::LocalSet(tcmc.head_local));
+    }
+    out.instruction(&Instruction::End);
+
+    // 3. Update prev = current cell
+    out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+    out.instruction(&Instruction::LocalSet(tcmc.prev_local));
+
+    // 4. Reassign params from saved call args + br to loop
+    if let Some(tco) = tco_loop {
+        let callee = program
+            .functions
+            .iter()
+            .find(|f| f.name == tco.self_name)
+            .ok_or_else(|| CodegenError::CallTargetNotFound {
+                name: tco.self_name.to_string(),
+            })?;
+
+        // Push all arg values onto the WASM stack
+        for ((_label, atom), param) in tcmc.call_args.iter().zip(callee.params.iter()) {
+            compile_atom(atom, out, local_map, layout)?;
+            emit_numeric_coercion(&atom.typ(), &param.typ, out)?;
+        }
+        // Pop into params in reverse order
+        for param in callee.params.iter().rev() {
+            let local = local_map
+                .get(&param.name)
+                .ok_or_else(|| CodegenError::ConflictingLocalTypes {
+                    name: param.name.to_string(),
+                })?;
+            out.instruction(&Instruction::LocalSet(local.index));
+        }
+        out.instruction(&Instruction::Br(tco.loop_depth));
+    }
+
+    Ok(())
 }
