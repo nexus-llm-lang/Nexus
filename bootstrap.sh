@@ -86,7 +86,7 @@ generate_nxc_wrapper() {
 #
 set -euo pipefail
 SCRIPT_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
-exec wasmtime run ${wt_flags:+${wt_flags} }"\$SCRIPT_DIR/nxc_driver.wasm" "\$@"
+exec wasmtime run -W max-wasm-stack=67108864,tail-call=y ${wt_flags:+${wt_flags} }"\$SCRIPT_DIR/nxc_driver.wasm" "\$@"
 WRAPPER
   chmod +x "$wrapper"
   ok "Generated wrapper: $wrapper"
