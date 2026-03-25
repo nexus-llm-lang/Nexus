@@ -63,8 +63,22 @@ type TcmcCtx = NoTcmc | TcmcActive(
   call_args: [LirCallArg],   // self-call args (for param reassignment)
   ctor_name: string,          // constructor name (for tag computation)
   ctor_args: [LirAtom],       // constructor field values (including placeholder rest)
-  func_name: string
+  func_name: string,
+  loop_depth: i64             // WASM block depth from current pos to TCO loop header
 )
+
+/// Return TcmcCtx with loop_depth incremented by n (for entering WASM blocks).
+let tcmc_deeper = fn (tcmc: TcmcCtx, n: i64) -> TcmcCtx do
+  match tcmc do
+    case NoTcmc -> NoTcmc
+    case TcmcActive(head_local: hl, prev_local: pl, rest_field_idx: rfi,
+                     call_var: cv, cons_var: consv, call_args: ca,
+                     ctor_name: cn, ctor_args: cta, func_name: fn2, loop_depth: d) ->
+      TcmcActive(head_local: hl, prev_local: pl, rest_field_idx: rfi,
+                  call_var: cv, cons_var: consv, call_args: ca,
+                  ctor_name: cn, ctor_args: cta, func_name: fn2, loop_depth: d + n)
+  end
+end
 
 /// Detect TCMC pattern: consecutive Let Call(self) + Let Constructor using the call result.
 let detect_tcmc = fn (body: [LirStmt], func_name: string) -> TcmcCtx do
@@ -148,7 +162,7 @@ let emit_tcmc_init = fn (buf: %ByteBuffer, tcmc: TcmcCtx) -> %ByteBuffer do
   match tcmc do
     case NoTcmc -> %buf
     case TcmcActive(head_local: hl, prev_local: pl, rest_field_idx: _, call_var: _,
-                     cons_var: _, call_args: _, ctor_name: _, ctor_args: _, func_name: _) ->
+                     cons_var: _, call_args: _, ctor_name: _, ctor_args: _, func_name: _, loop_depth: _) ->
       let %buf = push_byte(buf: %buf, byte: op_i64_const)
       let %buf = push_sleb128(buf: %buf, val: 0)
       let %buf = push_byte(buf: %buf, byte: op_local_set)
@@ -166,7 +180,8 @@ let emit_tcmc_cons_and_loop = fn (buf: %ByteBuffer, ctx: CodegenCtx, tcmc: TcmcC
     case NoTcmc -> %buf
     case TcmcActive(head_local: hl, prev_local: pl, rest_field_idx: rfi,
                      call_var: _, cons_var: _, call_args: cargs,
-                     ctor_name: cname, ctor_args: cargs_ctor, func_name: fname) ->
+                     ctor_name: cname, ctor_args: cargs_ctor, func_name: fname,
+                     loop_depth: ldepth) ->
       let obj_ptr = ctx_temps_base(ctx: ctx) + 3
       // Find the function to get its params
       match find_function(name: fname, funcs: ctx_functions(ctx: ctx)) do
@@ -225,11 +240,11 @@ let emit_tcmc_cons_and_loop = fn (buf: %ByteBuffer, ctx: CodegenCtx, tcmc: TcmcC
           let %buf = push_byte(buf: %buf, byte: op_local_set)
           let %buf = push_uleb128(buf: %buf, val: pl)
 
-          // 4. Reassign params from call_args + br 0
+          // 4. Reassign params from call_args + br to loop
           let %buf = emit_tcmc_param_push(buf: %buf, args: cargs, params: params, ctx: ctx)
           let %buf = emit_tcmc_param_set(buf: %buf, params: list.reverse(xs: params), ctx: ctx)
           let %buf = push_byte(buf: %buf, byte: op_br)
-          return push_uleb128(buf: %buf, val: 0)
+          return push_uleb128(buf: %buf, val: ldepth)
       end
   end
 end
@@ -295,7 +310,7 @@ let emit_return_with_tcmc = fn (buf: %ByteBuffer, ret_val: LirAtom, ret_type: Ty
       let %buf = emit_bt_pop(buf: %buf, ctx: ctx)
       return push_byte(buf: %buf, byte: op_return)
     case TcmcActive(head_local: hl, prev_local: pl, rest_field_idx: rfi,
-                     call_var: _, cons_var: _, call_args: _, ctor_name: _, ctor_args: _, func_name: _) ->
+                     call_var: _, cons_var: _, call_args: _, ctor_name: _, ctor_args: _, func_name: _, loop_depth: _) ->
       // if (prev != 0)
       let %buf = push_byte(buf: %buf, byte: op_local_get)
       let %buf = push_uleb128(buf: %buf, val: pl)
@@ -1282,7 +1297,7 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       // TCMC interception: skip self-call, intercept constructor
       match tcmc do
         case TcmcActive(head_local: _, prev_local: _, rest_field_idx: _, call_var: cv,
-                         cons_var: consv, call_args: _, ctor_name: _, ctor_args: _, func_name: _) ->
+                         cons_var: consv, call_args: _, ctor_name: _, ctor_args: _, func_name: _, loop_depth: _) ->
           if n == cv then
             match e do case LirExprCall(func: _, args: _, typ: _) -> return %buf case _ -> () end
           end
@@ -1326,10 +1341,11 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = emit_coercion(from_type: atom_type(atom: c), to_type: TyBool, buf: %buf)
       let %buf = push_byte(buf: %buf, byte: op_if)
       let %buf = push_byte(buf: %buf, byte: bt_void)
-      let %buf = emit_stmts(stmts: tb, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc)
+      let inner_tcmc = tcmc_deeper(tcmc: tcmc, n: 1)
+      let %buf = emit_stmts(stmts: tb, buf: %buf, ctx: ctx, in_try: in_try, tcmc: inner_tcmc)
       if list.length(xs: eb) > 0 then
         let %buf = push_byte(buf: %buf, byte: op_else)
-        let %buf = emit_stmts(stmts: eb, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc)
+        let %buf = emit_stmts(stmts: eb, buf: %buf, ctx: ctx, in_try: in_try, tcmc: inner_tcmc)
       end
       return push_byte(buf: %buf, byte: op_end)
 
@@ -1340,21 +1356,23 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
           return emit_if_return_unconditional(buf: %buf, then_body: tb, then_ret: tr,
             ret_type: rt, ctx: ctx, in_try: in_try, tcmc: tcmc)
         case false ->
+          let inner_tcmc = tcmc_deeper(tcmc: tcmc, n: 1)
           return emit_if_return_conditional(buf: %buf, cond: c, then_body: tb, then_ret: tr,
-            else_body: eb, else_ret: er, ret_type: rt, ctx: ctx, in_try: in_try, tcmc: tcmc)
+            else_body: eb, else_ret: er, ret_type: rt, ctx: ctx, in_try: in_try, tcmc: inner_tcmc)
       end
 
     case LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
+      let inner_tcmc = tcmc_deeper(tcmc: tcmc, n: 2)
       let %buf = push_byte(buf: %buf, byte: op_block)
       let %buf = push_byte(buf: %buf, byte: bt_void)
       let %buf = push_byte(buf: %buf, byte: op_loop)
       let %buf = push_byte(buf: %buf, byte: bt_void)
-      let %buf = emit_stmts(stmts: cs, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc)
+      let %buf = emit_stmts(stmts: cs, buf: %buf, ctx: ctx, in_try: in_try, tcmc: inner_tcmc)
       let %buf = emit_atom(atom: c, buf: %buf, ctx: ctx)
       let %buf = emit_coercion(from_type: atom_type(atom: c), to_type: TyBool, buf: %buf)
       let %buf = push_byte(buf: %buf, byte: op_br_if)
       let %buf = push_uleb128(buf: %buf, val: 1)
-      let %buf = emit_stmts(stmts: b, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc)
+      let %buf = emit_stmts(stmts: b, buf: %buf, ctx: ctx, in_try: in_try, tcmc: inner_tcmc)
       let %buf = push_byte(buf: %buf, byte: op_br)
       let %buf = push_uleb128(buf: %buf, val: 0)
       let %buf = push_byte(buf: %buf, byte: op_end)
@@ -1599,17 +1617,18 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuff
   let tcmc = match tcmc_raw do
     case NoTcmc -> NoTcmc
     case TcmcActive(head_local: _, prev_local: _, rest_field_idx: rfi, call_var: cv,
-                     cons_var: consv, call_args: ca, ctor_name: cn, ctor_args: cta, func_name: fn2) ->
+                     cons_var: consv, call_args: ca, ctor_name: cn, ctor_args: cta,
+                     func_name: fn2, loop_depth: _) ->
       TcmcActive(head_local: ctx_temps_base(ctx: ctx) + 13,
                   prev_local: ctx_temps_base(ctx: ctx) + 14,
                   rest_field_idx: rfi, call_var: cv, cons_var: consv, call_args: ca,
-                  ctor_name: cn, ctor_args: cta, func_name: fn2)
+                  ctor_name: cn, ctor_args: cta, func_name: fn2, loop_depth: 0)
   end
 
   // TCMC init (before loop, runs once)
   let %body = emit_tcmc_init(buf: %body, tcmc: tcmc)
   // Wrap body in loop if TCMC detected
-  let is_tcmc = match tcmc do case TcmcActive(head_local: _, prev_local: _, rest_field_idx: _, call_var: _, cons_var: _, call_args: _, ctor_name: _, ctor_args: _, func_name: _) -> true case NoTcmc -> false end
+  let is_tcmc = match tcmc do case TcmcActive(head_local: _, prev_local: _, rest_field_idx: _, call_var: _, cons_var: _, call_args: _, ctor_name: _, ctor_args: _, func_name: _, loop_depth: _) -> true case NoTcmc -> false end
   if is_tcmc then
     let %body = push_byte(buf: %body, byte: op_loop)
     let %body = push_byte(buf: %body, byte: bt_void)
