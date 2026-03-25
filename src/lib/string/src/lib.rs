@@ -18,6 +18,11 @@ pub extern "C" fn __nx_string_length(s_ptr: i32, s_len: i32) -> i64 {
 }
 
 #[no_mangle]
+pub extern "C" fn __nx_string_byte_length(_s_ptr: i32, s_len: i32) -> i64 {
+    s_len as i64
+}
+
+#[no_mangle]
 pub extern "C" fn __nx_string_contains(s_ptr: i32, s_len: i32, sub_ptr: i32, sub_len: i32) -> i32 {
     let s = read_string(s_ptr, s_len);
     let sub = read_string(sub_ptr, sub_len);
