@@ -4,14 +4,70 @@ use std::collections::HashMap;
 use wasm_encoder::{BlockType, Function, Instruction, MemArg};
 
 use crate::intern::Symbol;
-use crate::ir::lir::{LirProgram, LirStmt, SwitchCase};
+use crate::ir::lir::{LirExpr, LirProgram, LirStmt, SwitchCase};
 use crate::types::Type;
 
-use super::emit::emit_numeric_coercion;
+use super::emit::{emit_numeric_coercion, emit_pack_value_to_i64, memarg};
 use super::error::CodegenError;
-use super::function::{compile_atom, compile_expr, TcoLoop};
+use super::function::{compile_atom, compile_expr, emit_tcmc_cons_and_loop, TcmcInfo, TcoLoop};
 use super::layout::CodegenLayout;
 use super::{FunctionTemps, LocalInfo, OBJECT_HEAP_GLOBAL_INDEX};
+
+/// Emit a return value, wrapping with TCMC conditional linking if active.
+/// When TCMC is active (prev != 0), links the last cell's rest field to the
+/// return value and returns the head pointer instead.
+#[allow(clippy::too_many_arguments)]
+fn emit_return_with_tcmc(
+    ret_val: &crate::ir::lir::LirAtom,
+    ret_type: &Type,
+    out: &mut Function,
+    local_map: &HashMap<Symbol, LocalInfo>,
+    layout: &CodegenLayout,
+    tcmc: Option<&TcmcInfo>,
+) -> Result<(), CodegenError> {
+    if let Some(tcmc) = tcmc {
+        // Check if TCMC iterations happened (prev != 0)
+        out.instruction(&Instruction::LocalGet(tcmc.prev_local));
+        out.instruction(&Instruction::I32Const(0));
+        out.instruction(&Instruction::I32Ne);
+        out.instruction(&Instruction::If(BlockType::Empty));
+        {
+            // Link last cell's rest to base value
+            out.instruction(&Instruction::LocalGet(tcmc.prev_local));
+            compile_atom(ret_val, out, local_map, layout)?;
+            emit_pack_value_to_i64(&ret_val.typ(), out)?;
+            out.instruction(&Instruction::I64Store(memarg(
+                ((tcmc.rest_field_idx + 1) * 8) as u64,
+            )));
+            if let Some(bt_pop_idx) = layout.bt_pop_idx {
+                out.instruction(&Instruction::Call(bt_pop_idx));
+            }
+            // Return head of built list
+            out.instruction(&Instruction::LocalGet(tcmc.head_local));
+            out.instruction(&Instruction::Return);
+        }
+        out.instruction(&Instruction::Else);
+        {
+            // No TCMC iterations: return original value
+            compile_atom(ret_val, out, local_map, layout)?;
+            emit_numeric_coercion(&ret_val.typ(), ret_type, out)?;
+            if let Some(bt_pop_idx) = layout.bt_pop_idx {
+                out.instruction(&Instruction::Call(bt_pop_idx));
+            }
+            out.instruction(&Instruction::Return);
+        }
+        out.instruction(&Instruction::End);
+    } else {
+        // Normal return
+        compile_atom(ret_val, out, local_map, layout)?;
+        emit_numeric_coercion(&ret_val.typ(), ret_type, out)?;
+        if let Some(bt_pop_idx) = layout.bt_pop_idx {
+            out.instruction(&Instruction::Call(bt_pop_idx));
+        }
+        out.instruction(&Instruction::Return);
+    }
+    Ok(())
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compile_stmt(
@@ -27,9 +83,25 @@ pub(super) fn compile_stmt(
     in_try: bool,
     is_entrypoint: bool,
     tco_loop: Option<TcoLoop>,
+    tcmc: Option<&TcmcInfo>,
 ) -> Result<(), CodegenError> {
     match stmt {
         LirStmt::Let { name, typ, expr } => {
+            // TCMC interception: skip the self-call and intercept the constructor
+            if let Some(tcmc) = tcmc {
+                if *name == tcmc.call_var && matches!(expr, LirExpr::Call { .. }) {
+                    // Skip the self-call — args are pre-saved in tcmc.call_args
+                    return Ok(());
+                }
+                if *name == tcmc.cons_var && matches!(expr, LirExpr::Constructor { .. }) {
+                    // Emit TCMC: alloc + link + param reassign + br
+                    emit_tcmc_cons_and_loop(
+                        tcmc, out, local_map, program, layout, temps, tco_loop,
+                    )?;
+                    return Ok(());
+                }
+            }
+
             compile_expr(
                 expr,
                 out,
@@ -72,36 +144,17 @@ pub(super) fn compile_stmt(
             out.instruction(&Instruction::If(BlockType::Empty));
             for nested in then_body {
                 compile_stmt(
-                    nested,
-                    out,
-                    local_map,
-                    program,
-                    internal_indices,
-                    external_indices,
-                    layout,
-                    temps,
-                    function_ret_type,
-                    in_try,
-                    is_entrypoint,
-                    inner_tco,
+                    nested, out, local_map, program, internal_indices, external_indices,
+                    layout, temps, function_ret_type, in_try, is_entrypoint, inner_tco, tcmc,
                 )?;
             }
             if !else_body.is_empty() {
                 out.instruction(&Instruction::Else);
                 for nested in else_body {
                     compile_stmt(
-                        nested,
-                        out,
-                        local_map,
-                        program,
-                        internal_indices,
-                        external_indices,
-                        layout,
-                        temps,
-                        function_ret_type,
-                        in_try,
-                        is_entrypoint,
-                        inner_tco,
+                        nested, out, local_map, program, internal_indices, external_indices,
+                        layout, temps, function_ret_type, in_try, is_entrypoint, inner_tco,
+                        tcmc,
                     )?;
                 }
             }
@@ -123,53 +176,24 @@ pub(super) fn compile_stmt(
             out.instruction(&Instruction::If(BlockType::Empty));
             for nested in then_body {
                 compile_stmt(
-                    nested,
-                    out,
-                    local_map,
-                    program,
-                    internal_indices,
-                    external_indices,
-                    layout,
-                    temps,
-                    function_ret_type,
-                    in_try,
-                    is_entrypoint,
-                    inner_tco,
+                    nested, out, local_map, program, internal_indices, external_indices,
+                    layout, temps, function_ret_type, in_try, is_entrypoint, inner_tco, tcmc,
                 )?;
             }
             if let Some(then_ret) = then_ret {
-                compile_atom(then_ret, out, local_map, layout)?;
-                emit_numeric_coercion(&then_ret.typ(), ret_type, out)?;
-                if let Some(bt_pop_idx) = layout.bt_pop_idx {
-                    out.instruction(&Instruction::Call(bt_pop_idx));
-                }
-                out.instruction(&Instruction::Return);
+                emit_return_with_tcmc(then_ret, ret_type, out, local_map, layout, tcmc)?;
             }
             if !else_body.is_empty() || else_ret.is_some() {
                 out.instruction(&Instruction::Else);
                 for nested in else_body {
                     compile_stmt(
-                        nested,
-                        out,
-                        local_map,
-                        program,
-                        internal_indices,
-                        external_indices,
-                        layout,
-                        temps,
-                        function_ret_type,
-                        in_try,
-                        is_entrypoint,
-                        inner_tco,
+                        nested, out, local_map, program, internal_indices, external_indices,
+                        layout, temps, function_ret_type, in_try, is_entrypoint, inner_tco,
+                        tcmc,
                     )?;
                 }
                 if let Some(else_ret) = else_ret {
-                    compile_atom(else_ret, out, local_map, layout)?;
-                    emit_numeric_coercion(&else_ret.typ(), ret_type, out)?;
-                    if let Some(bt_pop_idx) = layout.bt_pop_idx {
-                        out.instruction(&Instruction::Call(bt_pop_idx));
-                    }
-                    out.instruction(&Instruction::Return);
+                    emit_return_with_tcmc(else_ret, ret_type, out, local_map, layout, tcmc)?;
                 }
             }
             out.instruction(&Instruction::End);
@@ -183,7 +207,7 @@ pub(super) fn compile_stmt(
             catch_body,
             catch_ret,
         } => {
-            // Disable TCO inside try-catch: self-tail-call br would skip exception handling
+            // Disable TCO and TCMC inside try-catch
             let catch_local =
                 local_map
                     .get(catch_param)
@@ -191,40 +215,24 @@ pub(super) fn compile_stmt(
                         name: catch_param.to_string(),
                     })?;
 
-            // Reset global exception flag at try entry
             out.instruction(&Instruction::I32Const(0));
             out.instruction(&Instruction::GlobalSet(layout.exn_flag_global));
 
             out.instruction(&Instruction::Block(BlockType::Empty));
             for nested in body {
                 compile_stmt(
-                    nested,
-                    out,
-                    local_map,
-                    program,
-                    internal_indices,
-                    external_indices,
-                    layout,
-                    temps,
-                    function_ret_type,
-                    true,
-                    is_entrypoint,
-                    None, // TCO disabled in try body
+                    nested, out, local_map, program, internal_indices, external_indices,
+                    layout, temps, function_ret_type, true, is_entrypoint,
+                    None, None, // TCO + TCMC disabled in try body
                 )?;
                 out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
                 out.instruction(&Instruction::BrIf(0));
             }
             if let Some(ret) = body_ret {
-                compile_atom(ret, out, local_map, layout)?;
-                emit_numeric_coercion(&ret.typ(), function_ret_type, out)?;
-                if let Some(bt_pop_idx) = layout.bt_pop_idx {
-                    out.instruction(&Instruction::Call(bt_pop_idx));
-                }
-                out.instruction(&Instruction::Return);
+                emit_return_with_tcmc(ret, function_ret_type, out, local_map, layout, None)?;
             }
             out.instruction(&Instruction::End);
 
-            // Check global flag: if exception was raised, run catch
             out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
             out.instruction(&Instruction::If(BlockType::Empty));
             out.instruction(&Instruction::GlobalGet(layout.exn_value_global));
@@ -237,18 +245,9 @@ pub(super) fn compile_stmt(
             }
             for nested in catch_body {
                 compile_stmt(
-                    nested,
-                    out,
-                    local_map,
-                    program,
-                    internal_indices,
-                    external_indices,
-                    layout,
-                    temps,
-                    function_ret_type,
-                    in_try,
-                    is_entrypoint,
-                    None, // TCO disabled in catch body
+                    nested, out, local_map, program, internal_indices, external_indices,
+                    layout, temps, function_ret_type, in_try, is_entrypoint,
+                    None, None, // TCO + TCMC disabled in catch body
                 )?;
                 if in_try {
                     out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
@@ -256,12 +255,7 @@ pub(super) fn compile_stmt(
                 }
             }
             if let Some(ret) = catch_ret {
-                compile_atom(ret, out, local_map, layout)?;
-                emit_numeric_coercion(&ret.typ(), function_ret_type, out)?;
-                if let Some(bt_pop_idx) = layout.bt_pop_idx {
-                    out.instruction(&Instruction::Call(bt_pop_idx));
-                }
-                out.instruction(&Instruction::Return);
+                emit_return_with_tcmc(ret, function_ret_type, out, local_map, layout, None)?;
             }
             if in_try {
                 out.instruction(&Instruction::End);
@@ -286,7 +280,6 @@ pub(super) fn compile_stmt(
                     })?;
                 let n_args = task.args.len() as i32;
 
-                // Allocate space for args on the heap
                 let args_ptr_local = temps.object_ptr_i32;
                 if let Some(alloc_idx) = layout.allocate_func_idx {
                     out.instruction(&Instruction::I32Const(n_args * 8));
@@ -297,11 +290,9 @@ pub(super) fn compile_stmt(
                     out.instruction(&Instruction::LocalSet(args_ptr_local));
                 }
 
-                // Write each captured arg as i64 to the heap
                 for (i, (_, arg)) in task.args.iter().enumerate() {
                     out.instruction(&Instruction::LocalGet(args_ptr_local));
                     compile_atom(arg, out, local_map, layout)?;
-                    // Widen to i64 if needed
                     match arg.typ() {
                         Type::I32 | Type::Bool => {
                             out.instruction(&Instruction::I64ExtendI32U);
@@ -313,7 +304,7 @@ pub(super) fn compile_stmt(
                             out.instruction(&Instruction::F64PromoteF32);
                             out.instruction(&Instruction::I64ReinterpretF64);
                         }
-                        _ => {} // i64, string (packed i64), objects (i64 ptr)
+                        _ => {}
                     }
                     out.instruction(&Instruction::I64Store(MemArg {
                         offset: (i * 8) as u64,
@@ -322,7 +313,6 @@ pub(super) fn compile_stmt(
                     }));
                 }
 
-                // Advance heap pointer (only for bump allocator)
                 if layout.allocate_func_idx.is_none() {
                     out.instruction(&Instruction::LocalGet(args_ptr_local));
                     out.instruction(&Instruction::I32Const(n_args * 8));
@@ -330,14 +320,12 @@ pub(super) fn compile_stmt(
                     out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
                 }
 
-                // Call __nx_conc_spawn(func_idx, args_ptr, n_args)
                 out.instruction(&Instruction::I32Const(func_idx as i32));
                 out.instruction(&Instruction::LocalGet(args_ptr_local));
                 out.instruction(&Instruction::I32Const(n_args));
                 out.instruction(&Instruction::Call(spawn_idx));
             }
 
-            // Call __nx_conc_join()
             out.instruction(&Instruction::Call(join_idx));
             Ok(())
         }
@@ -350,47 +338,24 @@ pub(super) fn compile_stmt(
             let inner_tco = tco_loop.map(|t| t.deeper(2));
             out.instruction(&Instruction::Block(BlockType::Empty));
             out.instruction(&Instruction::Loop(BlockType::Empty));
-            // Evaluate condition preamble
             for nested in cond_stmts {
                 compile_stmt(
-                    nested,
-                    out,
-                    local_map,
-                    program,
-                    internal_indices,
-                    external_indices,
-                    layout,
-                    temps,
-                    function_ret_type,
-                    in_try,
-                    is_entrypoint,
-                    inner_tco,
+                    nested, out, local_map, program, internal_indices, external_indices,
+                    layout, temps, function_ret_type, in_try, is_entrypoint, inner_tco, tcmc,
                 )?;
             }
-            // Check break condition
             compile_atom(cond, out, local_map, layout)?;
             emit_numeric_coercion(&cond.typ(), &Type::Bool, out)?;
-            out.instruction(&Instruction::BrIf(1)); // break to outer block
-                                                    // Body
+            out.instruction(&Instruction::BrIf(1));
             for nested in body {
                 compile_stmt(
-                    nested,
-                    out,
-                    local_map,
-                    program,
-                    internal_indices,
-                    external_indices,
-                    layout,
-                    temps,
-                    function_ret_type,
-                    in_try,
-                    is_entrypoint,
-                    inner_tco,
+                    nested, out, local_map, program, internal_indices, external_indices,
+                    layout, temps, function_ret_type, in_try, is_entrypoint, inner_tco, tcmc,
                 )?;
             }
-            out.instruction(&Instruction::Br(0)); // continue to loop head
-            out.instruction(&Instruction::End); // end loop
-            out.instruction(&Instruction::End); // end block
+            out.instruction(&Instruction::Br(0));
+            out.instruction(&Instruction::End);
+            out.instruction(&Instruction::End);
             Ok(())
         }
         LirStmt::Switch {
@@ -402,42 +367,15 @@ pub(super) fn compile_stmt(
         } => {
             if let Some((min_tag, _table_size)) = check_dense_tags(cases) {
                 compile_switch_br_table(
-                    tag,
-                    cases,
-                    default_body,
-                    default_ret,
-                    ret_type,
-                    min_tag,
-                    out,
-                    local_map,
-                    program,
-                    internal_indices,
-                    external_indices,
-                    layout,
-                    temps,
-                    function_ret_type,
-                    in_try,
-                    is_entrypoint,
-                    tco_loop,
+                    tag, cases, default_body, default_ret, ret_type, min_tag,
+                    out, local_map, program, internal_indices, external_indices,
+                    layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
                 )
             } else {
                 compile_switch_linear(
-                    tag,
-                    cases,
-                    default_body,
-                    default_ret,
-                    ret_type,
-                    out,
-                    local_map,
-                    program,
-                    internal_indices,
-                    external_indices,
-                    layout,
-                    temps,
-                    function_ret_type,
-                    in_try,
-                    is_entrypoint,
-                    tco_loop,
+                    tag, cases, default_body, default_ret, ret_type,
+                    out, local_map, program, internal_indices, external_indices,
+                    layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
                 )
             }
         }
@@ -445,7 +383,6 @@ pub(super) fn compile_stmt(
 }
 
 /// Check if Switch case tag values form a dense integer range suitable for br_table.
-/// Returns (min_tag, table_size) if dense, None otherwise.
 fn check_dense_tags(cases: &[SwitchCase]) -> Option<(i64, usize)> {
     if cases.is_empty() {
         return None;
@@ -454,16 +391,14 @@ fn check_dense_tags(cases: &[SwitchCase]) -> Option<(i64, usize)> {
     tags.sort();
     tags.dedup();
     if tags.len() != cases.len() {
-        return None; // duplicate tags
+        return None;
     }
     let min = tags[0];
     let max = tags[tags.len() - 1];
-    // Guard against i64 overflow in range computation
     let range_size = match (max as u64).checked_sub(min as u64) {
         Some(diff) => diff as usize + 1,
         None => return None,
     };
-    // Only use br_table if perfectly dense and range fits comfortably
     if range_size == cases.len() && range_size <= 256 {
         Some((min, range_size))
     } else {
@@ -490,8 +425,8 @@ fn compile_switch_linear(
     in_try: bool,
     is_entrypoint: bool,
     tco_loop: Option<TcoLoop>,
+    tcmc: Option<&TcmcInfo>,
 ) -> Result<(), CodegenError> {
-    // Each case opens 1 If block (sequential, not nested)
     let case_tco = tco_loop.map(|t| t.deeper(1));
     for case in cases {
         compile_atom(tag, out, local_map, layout)?;
@@ -500,54 +435,23 @@ fn compile_switch_linear(
         out.instruction(&Instruction::If(BlockType::Empty));
         for nested in &case.body {
             compile_stmt(
-                nested,
-                out,
-                local_map,
-                program,
-                internal_indices,
-                external_indices,
-                layout,
-                temps,
-                function_ret_type,
-                in_try,
-                is_entrypoint,
-                case_tco,
+                nested, out, local_map, program, internal_indices, external_indices,
+                layout, temps, function_ret_type, in_try, is_entrypoint, case_tco, tcmc,
             )?;
         }
         if let Some(ret) = &case.ret {
-            compile_atom(ret, out, local_map, layout)?;
-            emit_numeric_coercion(&ret.typ(), ret_type, out)?;
-            if let Some(bt_pop_idx) = layout.bt_pop_idx {
-                out.instruction(&Instruction::Call(bt_pop_idx));
-            }
-            out.instruction(&Instruction::Return);
+            emit_return_with_tcmc(ret, ret_type, out, local_map, layout, tcmc)?;
         }
         out.instruction(&Instruction::End);
     }
-    // Default body (no extra block — same depth as outer)
     for nested in default_body {
         compile_stmt(
-            nested,
-            out,
-            local_map,
-            program,
-            internal_indices,
-            external_indices,
-            layout,
-            temps,
-            function_ret_type,
-            in_try,
-            is_entrypoint,
-            tco_loop,
+            nested, out, local_map, program, internal_indices, external_indices,
+            layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
         )?;
     }
     if let Some(ret) = default_ret {
-        compile_atom(ret, out, local_map, layout)?;
-        emit_numeric_coercion(&ret.typ(), ret_type, out)?;
-        if let Some(bt_pop_idx) = layout.bt_pop_idx {
-            out.instruction(&Instruction::Call(bt_pop_idx));
-        }
-        out.instruction(&Instruction::Return);
+        emit_return_with_tcmc(ret, ret_type, out, local_map, layout, tcmc)?;
     }
     Ok(())
 }
@@ -587,94 +491,56 @@ fn compile_switch_br_table(
     in_try: bool,
     is_entrypoint: bool,
     tco_loop: Option<TcoLoop>,
+    tcmc: Option<&TcmcInfo>,
 ) -> Result<(), CodegenError> {
     let n = cases.len();
 
-    // Sort cases by tag value to build correct br_table mapping
     let mut sorted_indices: Vec<usize> = (0..n).collect();
     sorted_indices.sort_by_key(|&i| cases[i].tag_value);
 
-    // Build br_table targets: for index i (= tag - min_tag),
-    // jump to the block depth for sorted_cases[i].
-    // Depth 0 = default (innermost), depth k = sorted_cases[n-k] (outermost = sorted[0])
-    let mut targets = vec![0u32; n]; // default (0) for any gaps
+    let mut targets = vec![0u32; n];
     for (sorted_pos, &case_idx) in sorted_indices.iter().enumerate() {
         let index = (cases[case_idx].tag_value - min_tag) as usize;
         targets[index] = (n - sorted_pos) as u32;
     }
     let default_target = 0u32;
 
-    // Open n+1 blocks: n for cases + 1 for default
     for _ in 0..=n {
         out.instruction(&Instruction::Block(BlockType::Empty));
     }
 
-    // Compute index = i32.wrap_i64(tag - min_tag)
     compile_atom(tag, out, local_map, layout)?;
     out.instruction(&Instruction::I64Const(min_tag));
     out.instruction(&Instruction::I64Sub);
     out.instruction(&Instruction::I32WrapI64);
 
-    // br_table dispatch
     out.instruction(&Instruction::BrTable(Cow::Owned(targets), default_target));
 
     // Close default block → emit default body
-    // After closing 1 of n+1 blocks: n blocks remain above us
     out.instruction(&Instruction::End);
     let default_tco = tco_loop.map(|t| t.deeper(n as u32));
     for nested in default_body {
         compile_stmt(
-            nested,
-            out,
-            local_map,
-            program,
-            internal_indices,
-            external_indices,
-            layout,
-            temps,
-            function_ret_type,
-            in_try,
-            is_entrypoint,
-            default_tco,
+            nested, out, local_map, program, internal_indices, external_indices,
+            layout, temps, function_ret_type, in_try, is_entrypoint, default_tco, tcmc,
         )?;
     }
     if let Some(ret) = default_ret {
-        compile_atom(ret, out, local_map, layout)?;
-        emit_numeric_coercion(&ret.typ(), ret_type, out)?;
-        if let Some(bt_pop_idx) = layout.bt_pop_idx {
-            out.instruction(&Instruction::Call(bt_pop_idx));
-        }
-        out.instruction(&Instruction::Return);
+        emit_return_with_tcmc(ret, ret_type, out, local_map, layout, tcmc)?;
     }
 
     // Close case blocks in reverse sorted order + emit bodies
-    // After closing j+2 blocks total: n-1-j blocks remain above us
     for (j, &case_idx) in sorted_indices.iter().rev().enumerate() {
         out.instruction(&Instruction::End);
         let case_tco = tco_loop.map(|t| t.deeper((n - 1 - j) as u32));
         for nested in &cases[case_idx].body {
             compile_stmt(
-                nested,
-                out,
-                local_map,
-                program,
-                internal_indices,
-                external_indices,
-                layout,
-                temps,
-                function_ret_type,
-                in_try,
-                is_entrypoint,
-                case_tco,
+                nested, out, local_map, program, internal_indices, external_indices,
+                layout, temps, function_ret_type, in_try, is_entrypoint, case_tco, tcmc,
             )?;
         }
         if let Some(ret) = &cases[case_idx].ret {
-            compile_atom(ret, out, local_map, layout)?;
-            emit_numeric_coercion(&ret.typ(), ret_type, out)?;
-            if let Some(bt_pop_idx) = layout.bt_pop_idx {
-                out.instruction(&Instruction::Call(bt_pop_idx));
-            }
-            out.instruction(&Instruction::Return);
+            emit_return_with_tcmc(ret, ret_type, out, local_map, layout, tcmc)?;
         }
     }
 
