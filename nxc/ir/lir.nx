@@ -189,11 +189,22 @@ let infer_semantic_type = fn (expr: MirExpr, ctx: LowerCtx) -> TypeExpr do
             return infer_stmts_type(stmts: b, ctx: ctx)
           case [] -> return TyUnit
         end
+      case MirRecord(fields: fs) ->
+        return TyRecord(fields: infer_record_field_types(fields: fs, ctx: ctx))
       case MirMakeClosure(func_name: _, captures: _) -> return TyI64
       case MirCallClosure(closure: _, args: _, ret_type: rt) -> return rt
       case MirEnvLoad(env_var: _, index: _) -> return TyI64
       case _ -> return TyI64
     end
+  end
+end
+
+let infer_record_field_types = fn (fields: [MirNamedExpr], ctx: LowerCtx) -> [NamedType] do
+  match fields do
+    case [] -> return []
+    case MirNamedExpr(name: n, value: e) :: rest ->
+      let ft = infer_semantic_type(expr: e, ctx: ctx)
+      return NamedType(name: n, typ: ft) :: infer_record_field_types(fields: rest, ctx: ctx)
   end
 end
 
@@ -363,6 +374,77 @@ let lir_str_less_than = fn (a: string, b: string) -> bool do
   return lir_str_less_than_loop(a: a, b: b, idx: 0, la: length(s: a), lb: length(s: b))
 end
 
+// ─── Sorting helpers (alphabetical by label, matching Rust compiler) ────────
+
+let insert_mir_param = fn (p: MirParam, sorted: [MirParam]) -> [MirParam] do
+  match sorted do
+    case [] -> return [p]
+    case head :: rest ->
+      match p do case MirParam(label: la, name: _, typ: _) ->
+        match head do case MirParam(label: lb, name: _, typ: _) ->
+          if lir_str_less_than(a: la, b: lb) then
+            return p :: sorted
+          else
+            return head :: insert_mir_param(p: p, sorted: rest)
+          end
+        end
+      end
+  end
+end
+
+let sort_mir_params = fn (params: [MirParam]) -> [MirParam] do
+  match params do
+    case [] -> return []
+    case p :: rest -> return insert_mir_param(p: p, sorted: sort_mir_params(params: rest))
+  end
+end
+
+let insert_lir_call_arg = fn (a: LirCallArg, sorted: [LirCallArg]) -> [LirCallArg] do
+  match sorted do
+    case [] -> return [a]
+    case head :: rest ->
+      match a do case LirCallArg(label: la, value: _) ->
+        match head do case LirCallArg(label: lb, value: _) ->
+          if lir_str_less_than(a: la, b: lb) then
+            return a :: sorted
+          else
+            return head :: insert_lir_call_arg(a: a, sorted: rest)
+          end
+        end
+      end
+  end
+end
+
+let sort_lir_call_args = fn (args: [LirCallArg]) -> [LirCallArg] do
+  match args do
+    case [] -> return []
+    case a :: rest -> return insert_lir_call_arg(a: a, sorted: sort_lir_call_args(args: rest))
+  end
+end
+
+let insert_lir_named_atom = fn (a: LirNamedAtom, sorted: [LirNamedAtom]) -> [LirNamedAtom] do
+  match sorted do
+    case [] -> return [a]
+    case head :: rest ->
+      match a do case LirNamedAtom(name: na, value: _) ->
+        match head do case LirNamedAtom(name: nb, value: _) ->
+          if lir_str_less_than(a: na, b: nb) then
+            return a :: sorted
+          else
+            return head :: insert_lir_named_atom(a: a, sorted: rest)
+          end
+        end
+      end
+  end
+end
+
+let sort_lir_named_atoms = fn (atoms: [LirNamedAtom]) -> [LirNamedAtom] do
+  match atoms do
+    case [] -> return []
+    case a :: rest -> return insert_lir_named_atom(a: a, sorted: sort_lir_named_atoms(atoms: rest))
+  end
+end
+
 // Count field names that sort before target (gives sorted position)
 let sorted_field_index = fn (field_name: string, all_names: [string]) -> i64 do
   match all_names do
@@ -402,6 +484,40 @@ let constructor_field_heap_index = fn (field_name: string, ctor_name: string, en
       let all_names = get_variant_field_names(vd: vd)
       return sorted_field_index(field_name: field_name, all_names: all_names)
     case None -> return 0
+  end
+end
+
+// ─── Record Semantic Type Builder ────────────────────────────────────────────
+
+let build_record_semantic_type = fn (atoms: [LirNamedAtom], ctx: LowerCtx) -> TypeExpr do
+  return TyRecord(fields: build_named_types_from_atoms(atoms: atoms, ctx: ctx))
+end
+
+let build_named_types_from_atoms = fn (atoms: [LirNamedAtom], ctx: LowerCtx) -> [NamedType] do
+  match atoms do
+    case [] -> return []
+    case LirNamedAtom(name: n, value: v) :: rest ->
+      let sem = match v do
+        case LirAtomVar(name: vn, typ: _) ->
+          match ctx do case LowerCtx(vars: _, semantic_vars: sv, stmts: _, temp_counter: _, enum_defs: _) ->
+            match lookup_type(name: vn, entries: sv) do
+              case Some(val: t) -> t
+              case None -> wasm_to_semantic(typ: atom_type(atom: v))
+            end
+          end
+        case _ -> wasm_to_semantic(typ: atom_type(atom: v))
+      end
+      return NamedType(name: n, typ: sem) :: build_named_types_from_atoms(atoms: rest, ctx: ctx)
+  end
+end
+
+let wasm_to_semantic = fn (typ: TypeExpr) -> TypeExpr do
+  // Best-effort reverse mapping from WASM type to semantic type
+  match typ do
+    case TyI32 -> return TyI64
+    case TyF64 -> return TyF64
+    case TyI64 -> return TyI64
+    case _ -> return typ
   end
 end
 
@@ -641,9 +757,12 @@ let lower_expr_to_atom = fn (expr: MirExpr, ctx: LowerCtx) -> BindResult do
 
     case MirRecord(fields: fields) ->
       match lir_lower_named_exprs(fields: fields, ctx: ctx) do case LowerNamedExprsResult(ctx: ctx2, atoms: named_atoms) ->
-        return bind_expr_to_temp(ctx: ctx2,
-          expr: LirExprRecord(fields: named_atoms, typ: TyI64),
-          typ: TyI64)
+        // Sort fields alphabetically by name (matching Rust compiler layout)
+        let sorted_atoms = sort_lir_named_atoms(atoms: named_atoms)
+        let sem_type = build_record_semantic_type(atoms: sorted_atoms, ctx: ctx2)
+        return bind_expr_to_temp_semantic(ctx: ctx2,
+          expr: LirExprRecord(fields: sorted_atoms, typ: TyI64),
+          typ: TyI64, semantic_type: sem_type)
       end
 
     case MirFieldAccess(target: recv, field: field) ->
@@ -739,16 +858,24 @@ end
 
 type LowerCallArgsResult = LowerCallArgsResult(ctx: LowerCtx, lir_args: [LirCallArg])
 
-let lir_lower_call_args = fn (args: [MirCallArg], ctx: LowerCtx) -> LowerCallArgsResult do
+let lir_lower_call_args_inner = fn (args: [MirCallArg], ctx: LowerCtx) -> LowerCallArgsResult do
   match args do
     case [] -> return LowerCallArgsResult(ctx: ctx, lir_args: [])
     case MirCallArg(label: l, value: e) :: rest ->
       match lower_expr_to_atom(expr: e, ctx: ctx) do case BindResult(ctx: ctx2, atom: a) ->
-        match lir_lower_call_args(args: rest, ctx: ctx2) do case LowerCallArgsResult(ctx: ctx3, lir_args: la) ->
+        match lir_lower_call_args_inner(args: rest, ctx: ctx2) do case LowerCallArgsResult(ctx: ctx3, lir_args: la) ->
           return LowerCallArgsResult(ctx: ctx3,
             lir_args: LirCallArg(label: l, value: a) :: la)
         end
       end
+  end
+end
+
+let lir_lower_call_args = fn (args: [MirCallArg], ctx: LowerCtx) -> LowerCallArgsResult do
+  // Lower args in source order (preserving side-effect evaluation), then sort by label
+  match lir_lower_call_args_inner(args: args, ctx: ctx) do
+    case LowerCallArgsResult(ctx: c, lir_args: la) ->
+      return LowerCallArgsResult(ctx: c, lir_args: sort_lir_call_args(args: la))
   end
 end
 
@@ -1709,7 +1836,9 @@ end
 // ─── Function Lowering ──────────────────────────────────────────────────────
 
 let lir_lower_function = fn (f: MirFunction, enum_defs: [EnumDef], func_types: [TypeEntry]) -> LirFunction do
-  match f do case MirFunction(name: fname, params: params, ret_type: rt, body: body, span: sp) ->
+  match f do case MirFunction(name: fname, params: raw_params, ret_type: rt, body: body, span: sp) ->
+    // Sort params alphabetically by label (matching Rust compiler layout)
+    let params = sort_mir_params(params: raw_params)
     let wasm_ret = wasm_type(typ: rt)
     // Build initial context with params
     // Prepend param_vars before func_types so params shadow any same-named functions
@@ -1769,6 +1898,7 @@ end
 
 let convert_external = fn (ext: MirExternal) -> LirExternal do
   match ext do case MirExternal(name: n, wasm_module: wm, wasm_name: wn, params: ps, ret_type: rt, throw_row: tr) ->
+    // External params stay in source order (must match stdlib WASM ABI)
     return LirExternal(
       name: n, wasm_module: wm, wasm_name: wn,
       params: convert_ext_params(params: ps),
@@ -1782,7 +1912,8 @@ let convert_ext_params = fn (params: [MirParam]) -> [LirParam] do
   match params do
     case [] -> return []
     case MirParam(label: l, name: n, typ: t) :: rest ->
-      return LirParam(label: l, name: n, typ: wasm_type(typ: t)) :: convert_ext_params(params: rest)
+      // Preserve semantic type for externals (emit_external_arg needs TyString/TyArray)
+      return LirParam(label: l, name: n, typ: t) :: convert_ext_params(params: rest)
   end
 end
 
