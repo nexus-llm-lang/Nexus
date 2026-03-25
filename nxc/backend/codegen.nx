@@ -17,8 +17,11 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          ctx_locals, ctx_internal_funcs, ctx_external_funcs, ctx_string_lits,
          ctx_alloc_mode, ctx_temps_base, ctx_func_ret_type, ctx_functions, ctx_externals,
          ctx_closure_table, ctx_closure_type_indices, is_closure_func,
+         ctx_internal_func_map, ctx_external_func_map,
          peel_linear, type_to_valtype, is_unit, atom_type, expr_type,
-         lookup_local, lookup_local_valtype, lookup_func, lookup_string, find_function, find_external,
+         lookup_local, lookup_local_valtype, lookup_func_fast,
+         lookup_string, find_function, find_external,
+         build_func_map, build_local_map, free_func_map, hash_name,
          constructor_tag, record_tag,
          emit_name, emit_section, emit_memarg, emit_memarg_i64, emit_memarg_i8,
          sec_type, sec_import, sec_function, sec_table, sec_memory, sec_global, sec_export, sec_element, sec_code, sec_data, sec_custom,
@@ -330,13 +333,13 @@ let emit_atom_var = fn (name: string, typ: TypeExpr, buf: %ByteBuffer, ctx: Code
   match raw_idx < 0 do
     case true ->
       // Not a local — try top-level function (zero-arg constant)
-      let func_idx = lookup_func(name: name, entries: ctx_internal_funcs(ctx: ctx))
+      let func_idx = lookup_func_fast(name: name, map_id: ctx_internal_func_map(ctx: ctx))
       match func_idx >= 0 do
         case true ->
           let %buf = push_byte(buf: %buf, byte: op_call)
           return push_uleb128(buf: %buf, val: func_idx)
         case false ->
-          let ext_idx = lookup_func(name: name, entries: ctx_external_funcs(ctx: ctx))
+          let ext_idx = lookup_func_fast(name: name, map_id: ctx_external_func_map(ctx: ctx))
           match ext_idx >= 0 do
             case true ->
               let %buf = push_byte(buf: %buf, byte: op_call)
@@ -427,7 +430,7 @@ end
 
 let emit_alloc_object = fn (buf: %ByteBuffer, ctx: CodegenCtx, words: i64) -> %ByteBuffer do
   let obj_ptr = ctx_temps_base(ctx: ctx) + 3
-  let alloc_idx = lookup_func(name: "__nx_allocate", entries: ctx_external_funcs(ctx: ctx))
+  let alloc_idx = lookup_func_fast(name: "__nx_allocate", map_id: ctx_external_func_map(ctx: ctx))
   match alloc_idx >= 0 do
     case true ->
       // stdlib allocate: call allocate(bytes) -> ptr
@@ -599,7 +602,7 @@ let emit_string_concat = fn (lhs: LirAtom, rhs: LirAtom, buf: %ByteBuffer, ctx: 
   let %buf = push_uleb128(buf: %buf, val: out_len)
 
   // Allocate on heap
-  let alloc_idx = lookup_func(name: "__nx_allocate", entries: ctx_external_funcs(ctx: ctx))
+  let alloc_idx = lookup_func_fast(name: "__nx_allocate", map_id: ctx_external_func_map(ctx: ctx))
   match alloc_idx >= 0 do
     case true ->
       // stdlib allocate
@@ -922,7 +925,7 @@ end
 // ─── Backtrace emission helpers ─────────────────────────────────────────────
 
 let emit_bt_push = fn (buf: %ByteBuffer, ctx: CodegenCtx, func_name: string) -> %ByteBuffer do
-  let idx = lookup_func(name: "__nx_bt_push", entries: ctx_external_funcs(ctx: ctx))
+  let idx = lookup_func_fast(name: "__nx_bt_push", map_id: ctx_external_func_map(ctx: ctx))
   if idx < 0 then
     return %buf
   else
@@ -936,7 +939,7 @@ let emit_bt_push = fn (buf: %ByteBuffer, ctx: CodegenCtx, func_name: string) -> 
 end
 
 let emit_bt_pop = fn (buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
-  let idx = lookup_func(name: "__nx_bt_pop", entries: ctx_external_funcs(ctx: ctx))
+  let idx = lookup_func_fast(name: "__nx_bt_pop", map_id: ctx_external_func_map(ctx: ctx))
   if idx < 0 then
     return %buf
   else
@@ -946,7 +949,7 @@ let emit_bt_pop = fn (buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
 end
 
 let emit_bt_freeze = fn (buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
-  let idx = lookup_func(name: "__nx_bt_freeze", entries: ctx_external_funcs(ctx: ctx))
+  let idx = lookup_func_fast(name: "__nx_bt_freeze", map_id: ctx_external_func_map(ctx: ctx))
   if idx < 0 then
     return %buf
   else
@@ -995,11 +998,11 @@ end
 
 let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
                      is_tail: bool, in_try: bool) -> %ByteBuffer do
-  let int_idx = lookup_func(name: func, entries: ctx_internal_funcs(ctx: ctx))
+  let int_idx = lookup_func_fast(name: func, map_id: ctx_internal_func_map(ctx: ctx))
   if int_idx >= 0 then
     return emit_internal_call(func: func, args: args, buf: %buf, ctx: ctx, is_tail: is_tail, in_try: in_try, int_idx: int_idx)
   else
-    let ext_idx = lookup_func(name: func, entries: ctx_external_funcs(ctx: ctx))
+    let ext_idx = lookup_func_fast(name: func, map_id: ctx_external_func_map(ctx: ctx))
     if ext_idx >= 0 then
       return emit_external_call(func: func, args: args, buf: %buf, ctx: ctx, ext_idx: ext_idx)
     else
@@ -1418,8 +1421,8 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       return push_byte(buf: %buf, byte: op_end)
 
     case LirStmtConc(tasks: tasks) ->
-      let spawn_idx = lookup_func(name: "__nx_conc_spawn", entries: ctx_external_funcs(ctx: ctx))
-      let join_idx = lookup_func(name: "__nx_conc_join", entries: ctx_external_funcs(ctx: ctx))
+      let spawn_idx = lookup_func_fast(name: "__nx_conc_spawn", map_id: ctx_external_func_map(ctx: ctx))
+      let join_idx = lookup_func_fast(name: "__nx_conc_join", map_id: ctx_external_func_map(ctx: ctx))
       let args_ptr_local = ctx_temps_base(ctx: ctx) + 2
       let %buf = emit_conc_tasks(tasks: tasks, buf: %buf, ctx: ctx,
         spawn_idx: spawn_idx, args_ptr_local: args_ptr_local)
@@ -1434,9 +1437,9 @@ let emit_conc_tasks = fn (tasks: [ConcTask], buf: %ByteBuffer, ctx: CodegenCtx,
   match tasks do
     case [] -> %buf
     case ConcTask(func_name: fname, args: args) :: rest ->
-      let func_idx = lookup_func(name: fname, entries: ctx_internal_funcs(ctx: ctx))
+      let func_idx = lookup_func_fast(name: fname, map_id: ctx_internal_func_map(ctx: ctx))
       let n_args = list.length(xs: args)
-      let conc_alloc_idx = lookup_func(name: "__nx_allocate", entries: ctx_external_funcs(ctx: ctx))
+      let conc_alloc_idx = lookup_func_fast(name: "__nx_allocate", map_id: ctx_external_func_map(ctx: ctx))
       // Allocate heap space for args (n_args * 8 bytes)
       match conc_alloc_idx >= 0 do
         case true ->
@@ -1653,16 +1656,21 @@ let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
                           alloc_mode: i64, functions: [LirFunction],
                           externals: [LirExternal],
                           closure_table: [FuncEntry],
-                          closure_type_indices: [ArityTypeIdx]) -> CodegenCtx do
+                          closure_type_indices: [ArityTypeIdx],
+                          internal_func_map: i64,
+                          external_func_map: i64) -> CodegenCtx do
   let LirFunction(name: _, params: ps, ret_type: rt, body: b, ret: _, span: _) = func
   let param_locals = build_param_locals(params: ps, idx: 0)
   let param_count = list.length(xs: ps)
-  match collect_local_stmts(stmts: b, locals: param_locals, next_idx: param_count) do case LocalResult(locals: collected_locals, next_idx: collected_next_idx) ->
+  let local_map = build_local_map(entries: param_locals)
+  match collect_local_stmts(stmts: b, locals: param_locals, next_idx: param_count, local_map: local_map) do case LocalResult(locals: collected_locals, next_idx: collected_next_idx, local_map: lm) ->
+  free_func_map(map_id: lm)
   return CodegenCtx(
     locals: collected_locals, internal_funcs: internal_funcs, external_funcs: external_funcs,
     string_lits: string_lits, alloc_mode: alloc_mode, temps_base: collected_next_idx,
     func_ret_type: rt, functions: functions, externals: externals,
-    closure_table: closure_table, closure_type_indices: closure_type_indices
+    closure_table: closure_table, closure_type_indices: closure_type_indices,
+    internal_func_map: internal_func_map, external_func_map: external_func_map
   )
   end
 end
@@ -1680,20 +1688,24 @@ let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
                             string_lits: [StringEntry], alloc_mode: i64,
                             functions: [LirFunction], externals: [LirExternal],
                             closure_table: [FuncEntry],
-                            closure_type_indices: [ArityTypeIdx]) -> %ByteBuffer do
+                            closure_type_indices: [ArityTypeIdx],
+                            internal_func_map: i64,
+                            external_func_map: i64) -> %ByteBuffer do
   match funcs do
     case [] -> %buf
     case f :: rest ->
       let ctx = build_func_ctx(func: f, internal_funcs: internal_funcs,
                                 external_funcs: external_funcs, string_lits: string_lits,
                                 alloc_mode: alloc_mode, functions: functions, externals: externals,
-                                closure_table: closure_table, closure_type_indices: closure_type_indices)
+                                closure_table: closure_table, closure_type_indices: closure_type_indices,
+                                internal_func_map: internal_func_map, external_func_map: external_func_map)
       let %body = compile_function_body(func: f, ctx: ctx)
       let %buf = append_body_to_buf(buf: %buf, body: %body)
       emit_code_bodies(buf: %buf, funcs: rest, internal_funcs: internal_funcs,
                         external_funcs: external_funcs, string_lits: string_lits,
                         alloc_mode: alloc_mode, functions: functions, externals: externals,
-                        closure_table: closure_table, closure_type_indices: closure_type_indices)
+                        closure_table: closure_table, closure_type_indices: closure_type_indices,
+                        internal_func_map: internal_func_map, external_func_map: external_func_map)
   end
 end
 
@@ -1773,16 +1785,16 @@ end
 // ─── Closure analysis helpers ───────────────────────────────────────────────
 
 /// Build closure table entries: maps table index → function index for __closure_* functions.
-let build_closure_table = fn (funcs: [LirFunction], internal_funcs: [FuncEntry], table_idx: i64) -> [FuncEntry] do
+let build_closure_table = fn (funcs: [LirFunction], internal_func_map: i64, table_idx: i64) -> [FuncEntry] do
   match funcs do
     case [] -> []
     case LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
       if is_closure_func(name: n) then
-        let func_idx = lookup_func(name: n, entries: internal_funcs)
+        let func_idx = lookup_func_fast(name: n, map_id: internal_func_map)
         return FuncEntry(name: n, index: func_idx)
-             :: build_closure_table(funcs: rest, internal_funcs: internal_funcs, table_idx: table_idx + 1)
+             :: build_closure_table(funcs: rest, internal_func_map: internal_func_map, table_idx: table_idx + 1)
       end
-      return build_closure_table(funcs: rest, internal_funcs: internal_funcs, table_idx: table_idx)
+      return build_closure_table(funcs: rest, internal_func_map: internal_func_map, table_idx: table_idx)
   end
 end
 
@@ -1940,15 +1952,19 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
           end
       end
 
+      // Build hash maps for O(1) function lookup
+      let internal_func_map = build_func_map(entries: internal_funcs)
+      let external_func_map = build_func_map(entries: external_funcs)
+
       // Closure analysis
-      let closure_table = build_closure_table(funcs: funcs, internal_funcs: internal_funcs, table_idx: 0)
+      let closure_table = build_closure_table(funcs: funcs, internal_func_map: internal_func_map, table_idx: 0)
       let n_closures = list.length(xs: closure_table)
       let closure_arities = collect_closure_arities(funcs: funcs)
       let n_closure_types = list.length(xs: closure_arities)
       // Closure type indices start after all ext + func + wasi_run + bt + alloc types
       let closure_type_base = n_exts + n_funcs + 1 + match has_bt do case true -> 2 case false -> 0 end + n_alloc_imports
 
-      let main_idx = lookup_func(name: "main", entries: internal_funcs)
+      let main_idx = lookup_func_fast(name: "main", map_id: internal_func_map)
       let main_ret = match find_function(name: "main", funcs: funcs) do
         case Some(val: LirFunction(name: _, params: _, ret_type: rt, body: _, ret: _, span: _)) -> rt
         case None -> TyUnit
@@ -2044,7 +2060,8 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
       let %code = emit_code_bodies(buf: %code, funcs: funcs, internal_funcs: internal_funcs,
                                     external_funcs: external_funcs, string_lits: string_entries,
                                     alloc_mode: alloc_mode, functions: funcs, externals: exts,
-                                    closure_table: closure_table, closure_type_indices: closure_type_idx_list)
+                                    closure_table: closure_table, closure_type_indices: closure_type_idx_list,
+                                    internal_func_map: internal_func_map, external_func_map: external_func_map)
       let %wasi_body = compile_wasi_run_wrapper(main_idx: main_idx, main_ret_type: main_ret)
       let %code = append_body_to_buf(buf: %code, body: %wasi_body)
       let %m = emit_section(buf: %m, id: sec_code, content: %code)
@@ -2066,6 +2083,10 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
       let %m = push_uleb128(buf: %m, val: name_payload_len)
       let %m = push_buf(dst: %m, src: &name_payload)
       free(buf: %name_payload)
+
+      // Free function lookup maps
+      free_func_map(map_id: internal_func_map)
+      free_func_map(map_id: external_func_map)
 
       return %m
   end
