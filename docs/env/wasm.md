@@ -113,7 +113,9 @@ Word 2:  i64  field[1]
 ...
 ```
 
-The tag is computed via FNV-1a: `hash(name) ^ arity * FNV_PRIME`. Pattern matching compares tags with `i64.eq`. Fields are stored in **lexicographic order** by field name, matching the extraction convention.
+The tag is computed via FNV-1a: `hash(name) ^ arity * FNV_PRIME`. Pattern matching compares tags with `i64.eq`.
+
+**Field ordering**: Fields are stored in **lexicographic order by field name**. When a constructor is created with labeled arguments (e.g., `Cons(v: x, rest: xs)`), the arguments are sorted before storage. Field extraction via pattern matching uses the same sorted index. List literals `[a, b, c]` desugar to `Cons` with positional arguments in this sorted order.
 
 #### Record
 
@@ -185,7 +187,7 @@ Exceptions use two WASM globals (not WASM exception handling):
 
 ### FFI Boundary
 
-External functions use a different parameter encoding for strings and arrays:
+External functions use a different parameter encoding for strings and arrays. The packed `i64` representation is split into separate pointer and length parameters:
 
 | Nexus Type | WASM Params (FFI) | Notes |
 |---|---|---|
@@ -193,8 +195,12 @@ External functions use a different parameter encoding for strings and arrays:
 | `i64` | 1x `i64` | Direct |
 | `f32` | 1x `f32` | Direct |
 | `f64` | 1x `f64` | Direct |
-| `string` | 2x `i32` (ptr, len) | Unpacked from i64 at boundary |
+| `string` | 2x `i32` (ptr, len) | Unpacked from packed i64 at boundary |
+| `[| T |]` (array) | 2x `i32` (ptr, len) | Same unpacking as string |
+| `%ByteBuffer`, opaque | 1x `i64` | Handle passed directly |
 | `unit` | (none) | No parameter generated |
+
+Parameter order: external function parameters preserve **source (definition) order**, not lexicographic order. This is because the WASM function type signature must match the stdlib export exactly. Call-site arguments are reordered to match by looking up each external parameter's label.
 
 Return values use the same types as internal functions (strings return as packed `i64`).
 
