@@ -9,7 +9,8 @@ import { BinaryOp, TypeExpr } from "nxc/common/ast.nx"
 import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom,
          LirExternal, LirParam, LirCallArg, LirNamedAtom, ConcTask } from "nxc/ir/lir_types.nx"
 import { peel_linear, type_to_valtype, is_unit, string_data_base,
-         LocalEntry, StringEntry, lookup_local, lookup_local_valtype, widen_local } from "nxc/backend/wasm_defs.nx"
+         LocalEntry, StringEntry, lookup_local, lookup_local_valtype, widen_local,
+         hash_name } from "nxc/backend/wasm_defs.nx"
 import * as list from "stdlib/list.nx"
 
 import { char_code } from "stdlib/string.nx"
@@ -17,6 +18,10 @@ import { char_code } from "stdlib/string.nx"
 import external "stdlib/stdlib.wasm"
 external str_length = "__nx_string_length" : (s: string) -> i64
 external str_byte_length = "__nx_string_byte_length" : (s: string) -> i64
+external __nx_hmap_new = "__nx_hmap_new" : () -> i64
+external __nx_hmap_put = "__nx_hmap_put" : (id: i64, key: i64, value: i64) -> i64
+external __nx_hmap_get = "__nx_hmap_get" : (id: i64, key: i64, default_val: i64) -> i64
+external __nx_hmap_free = "__nx_hmap_free" : (id: i64) -> bool
 
 // ─── String literal collection ──────────────────────────────────────────────
 
@@ -387,68 +392,71 @@ end
 
 // ─── Local variable collection ──────────────────────────────────────────────
 
-export let register_local = fn (name: string, typ: TypeExpr, locals: [LocalEntry], next_idx: i64)
+export let register_local = fn (name: string, typ: TypeExpr, locals: [LocalEntry], next_idx: i64, local_map: i64)
     -> LocalResult do
   if is_unit(typ: typ) then
-    return LocalResult(locals: locals, next_idx: next_idx)
+    return LocalResult(locals: locals, next_idx: next_idx, local_map: local_map)
   end
   let vt = type_to_valtype(typ: typ)
-  let existing_vt = lookup_local_valtype(name: name, entries: locals)
+  let existing_vt = __nx_hmap_get(id: local_map, key: hash_name(name: name), default_val: -1)
   match existing_vt < 0 do
     case true ->
-      return LocalResult(locals: LocalEntry(name: name, index: next_idx, valtype: vt) :: locals, next_idx: next_idx + 1)
+      let _ = __nx_hmap_put(id: local_map, key: hash_name(name: name), value: vt)
+      return LocalResult(locals: LocalEntry(name: name, index: next_idx, valtype: vt) :: locals, next_idx: next_idx + 1, local_map: local_map)
     case false ->
       match existing_vt == vt do
-        case true -> return LocalResult(locals: locals, next_idx: next_idx)
-        case false -> return LocalResult(locals: widen_local(name: name, new_vt: 126, entries: locals), next_idx: next_idx)
+        case true -> return LocalResult(locals: locals, next_idx: next_idx, local_map: local_map)
+        case false ->
+          let _ = __nx_hmap_put(id: local_map, key: hash_name(name: name), value: 126)
+          return LocalResult(locals: widen_local(name: name, new_vt: 126, entries: locals), next_idx: next_idx, local_map: local_map)
       end
   end
 end
 
-export type LocalResult = LocalResult(locals: [LocalEntry], next_idx: i64)
+export type LocalResult = LocalResult(locals: [LocalEntry], next_idx: i64, local_map: i64)
 
-export let collect_local_stmts = fn (stmts: [LirStmt], locals: [LocalEntry], next_idx: i64)
+export let collect_local_stmts = fn (stmts: [LirStmt], locals: [LocalEntry], next_idx: i64, local_map: i64)
     -> LocalResult do
   match stmts do
-    case [] -> return LocalResult(locals: locals, next_idx: next_idx)
+    case [] -> return LocalResult(locals: locals, next_idx: next_idx, local_map: local_map)
     case s :: rest ->
-      match collect_local_stmt(stmt: s, locals: locals, next_idx: next_idx) do
-        case LocalResult(locals: ls, next_idx: ni) ->
-          return collect_local_stmts(stmts: rest, locals: ls, next_idx: ni)
+      match collect_local_stmt(stmt: s, locals: locals, next_idx: next_idx, local_map: local_map) do
+        case LocalResult(locals: ls, next_idx: ni, local_map: lm) ->
+          return collect_local_stmts(stmts: rest, locals: ls, next_idx: ni, local_map: lm)
       end
   end
 end
 
-export let collect_local_stmt = fn (stmt: LirStmt, locals: [LocalEntry], next_idx: i64)
+export let collect_local_stmt = fn (stmt: LirStmt, locals: [LocalEntry], next_idx: i64, local_map: i64)
     -> LocalResult do
   match stmt do
     case LirStmtLet(name: n, typ: t, expr: _) ->
-      return register_local(name: n, typ: t, locals: locals, next_idx: next_idx)
+      return register_local(name: n, typ: t, locals: locals, next_idx: next_idx, local_map: local_map)
     case LirStmtIf(cond: _, then_body: tb, else_body: eb) ->
-      match collect_local_stmts(stmts: tb, locals: locals, next_idx: next_idx) do
-        case LocalResult(locals: ls, next_idx: ni) ->
-          return collect_local_stmts(stmts: eb, locals: ls, next_idx: ni)
+      match collect_local_stmts(stmts: tb, locals: locals, next_idx: next_idx, local_map: local_map) do
+        case LocalResult(locals: ls, next_idx: ni, local_map: lm) ->
+          return collect_local_stmts(stmts: eb, locals: ls, next_idx: ni, local_map: lm)
       end
     case LirStmtIfReturn(cond: _, then_body: tb, then_ret: _, else_body: eb, else_ret: _, ret_type: _) ->
-      match collect_local_stmts(stmts: tb, locals: locals, next_idx: next_idx) do
-        case LocalResult(locals: ls, next_idx: ni) ->
-          return collect_local_stmts(stmts: eb, locals: ls, next_idx: ni)
+      match collect_local_stmts(stmts: tb, locals: locals, next_idx: next_idx, local_map: local_map) do
+        case LocalResult(locals: ls, next_idx: ni, local_map: lm) ->
+          return collect_local_stmts(stmts: eb, locals: ls, next_idx: ni, local_map: lm)
       end
     case LirStmtLoop(cond_stmts: cs, cond: _, body: b) ->
-      match collect_local_stmts(stmts: cs, locals: locals, next_idx: next_idx) do
-        case LocalResult(locals: ls, next_idx: ni) ->
-          return collect_local_stmts(stmts: b, locals: ls, next_idx: ni)
+      match collect_local_stmts(stmts: cs, locals: locals, next_idx: next_idx, local_map: local_map) do
+        case LocalResult(locals: ls, next_idx: ni, local_map: lm) ->
+          return collect_local_stmts(stmts: b, locals: ls, next_idx: ni, local_map: lm)
       end
     case LirStmtTryCatch(body: b, body_ret: _, catch_param: cp, catch_param_typ: cpt,
                           catch_body: cb, catch_ret: _) ->
-      match register_local(name: cp, typ: cpt, locals: locals, next_idx: next_idx) do
-        case LocalResult(locals: ls, next_idx: ni) ->
-          match collect_local_stmts(stmts: b, locals: ls, next_idx: ni) do
-            case LocalResult(locals: ls2, next_idx: ni2) ->
-              return collect_local_stmts(stmts: cb, locals: ls2, next_idx: ni2)
+      match register_local(name: cp, typ: cpt, locals: locals, next_idx: next_idx, local_map: local_map) do
+        case LocalResult(locals: ls, next_idx: ni, local_map: lm) ->
+          match collect_local_stmts(stmts: b, locals: ls, next_idx: ni, local_map: lm) do
+            case LocalResult(locals: ls2, next_idx: ni2, local_map: lm2) ->
+              return collect_local_stmts(stmts: cb, locals: ls2, next_idx: ni2, local_map: lm2)
           end
       end
     case LirStmtConc(tasks: _) ->
-      return LocalResult(locals: locals, next_idx: next_idx)
+      return LocalResult(locals: locals, next_idx: next_idx, local_map: local_map)
   end
 end
