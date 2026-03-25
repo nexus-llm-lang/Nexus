@@ -50,6 +50,279 @@ import { build_type_section, build_import_section, build_function_section,
 import * as list from "stdlib/list.nx"
 import { starts_with } from "stdlib/string.nx"
 
+// ─── TCMC (Tail Call Modulo Constructor) ─────────────────────────────────────
+
+/// TCMC context: tracks in-place list building state.
+/// head_local/prev_local at temps_base + 13/14 (always allocated).
+type TcmcCtx = NoTcmc | TcmcActive(
+  head_local: i64, prev_local: i64, rest_field_idx: i64,
+  call_var: string, cons_var: string,
+  call_args: [LirCallArg],   // self-call args (for param reassignment)
+  ctor_name: string,          // constructor name (for tag computation)
+  ctor_args: [LirAtom],       // constructor field values (including placeholder rest)
+  func_name: string
+)
+
+/// Detect TCMC pattern: consecutive Let Call(self) + Let Constructor using the call result.
+let detect_tcmc = fn (body: [LirStmt], func_name: string) -> TcmcCtx do
+  return find_tcmc_in_stmts(stmts: body, func_name: func_name)
+end
+
+/// Check if two consecutive stmts form a TCMC pair: Let Call(self) + Let Constructor.
+let check_tcmc_pair = fn (first: LirStmt, rest: [LirStmt], func_name: string) -> TcmcCtx do
+  match first do
+    case LirStmtLet(name: call_name, typ: _, expr: LirExprCall(func: f, args: call_args, typ: _)) ->
+      if f == func_name then
+        match rest do
+          case LirStmtLet(name: cons_name, typ: _, expr: LirExprConstructor(name: ctor_name, args: ctor_args, typ: _)) :: _ ->
+            match find_var_in_atoms(atoms: ctor_args, target: call_name, idx: 0) do
+              case Some(val: rest_idx) ->
+                return TcmcActive(head_local: 0, prev_local: 0, rest_field_idx: rest_idx,
+                  call_var: call_name, cons_var: cons_name, call_args: call_args,
+                  ctor_name: ctor_name, ctor_args: ctor_args, func_name: func_name)
+              case None -> return NoTcmc
+            end
+          case _ -> return NoTcmc
+        end
+      else return NoTcmc
+      end
+    case _ -> return NoTcmc
+  end
+end
+
+/// Recurse into a statement's branches looking for TCMC patterns.
+let find_tcmc_in_branches = fn (stmt: LirStmt, func_name: string) -> TcmcCtx do
+  match stmt do
+    case LirStmtIf(cond: _, then_body: tb, else_body: eb) ->
+      match find_tcmc_in_stmts(stmts: tb, func_name: func_name) do
+        case NoTcmc -> find_tcmc_in_stmts(stmts: eb, func_name: func_name)
+        case found -> found
+      end
+    case LirStmtIfReturn(cond: _, then_body: tb, then_ret: _, else_body: eb, else_ret: _, ret_type: _) ->
+      match find_tcmc_in_stmts(stmts: tb, func_name: func_name) do
+        case NoTcmc -> find_tcmc_in_stmts(stmts: eb, func_name: func_name)
+        case found -> found
+      end
+    case LirStmtLoop(cond_stmts: cs, cond: _, body: b) ->
+      match find_tcmc_in_stmts(stmts: cs, func_name: func_name) do
+        case NoTcmc -> find_tcmc_in_stmts(stmts: b, func_name: func_name)
+        case found -> found
+      end
+    case _ -> NoTcmc
+  end
+end
+
+let find_tcmc_in_stmts = fn (stmts: [LirStmt], func_name: string) -> TcmcCtx do
+  match stmts do
+    case s :: rest ->
+      // Check if s + rest[0] form a TCMC pair
+      match check_tcmc_pair(first: s, rest: rest, func_name: func_name) do
+        case NoTcmc ->
+          // Not a pair — recurse into branches of s, then continue with rest
+          match find_tcmc_in_branches(stmt: s, func_name: func_name) do
+            case NoTcmc -> return find_tcmc_in_stmts(stmts: rest, func_name: func_name)
+            case found -> return found
+          end
+        case found -> return found
+      end
+    case [] -> NoTcmc
+  end
+end
+
+let find_var_in_atoms = fn (atoms: [LirAtom], target: string, idx: i64) -> Option<i64> do
+  match atoms do
+    case [] -> None
+    case LirAtomVar(name: n, typ: _) :: rest ->
+      if n == target then Some(val: idx)
+      else find_var_in_atoms(atoms: rest, target: target, idx: idx + 1)
+      end
+    case _ :: rest -> find_var_in_atoms(atoms: rest, target: target, idx: idx + 1)
+  end
+end
+
+/// Emit TCMC init: head = 0, prev = 0 (called before the loop, runs once).
+let emit_tcmc_init = fn (buf: %ByteBuffer, tcmc: TcmcCtx) -> %ByteBuffer do
+  match tcmc do
+    case NoTcmc -> %buf
+    case TcmcActive(head_local: hl, prev_local: pl, rest_field_idx: _, call_var: _,
+                     cons_var: _, call_args: _, ctor_name: _, ctor_args: _, func_name: _) ->
+      let %buf = push_byte(buf: %buf, byte: op_i64_const)
+      let %buf = push_sleb128(buf: %buf, val: 0)
+      let %buf = push_byte(buf: %buf, byte: op_local_set)
+      let %buf = push_uleb128(buf: %buf, val: hl)
+      let %buf = push_byte(buf: %buf, byte: op_i32_const)
+      let %buf = push_sleb128(buf: %buf, val: 0)
+      let %buf = push_byte(buf: %buf, byte: op_local_set)
+      return push_uleb128(buf: %buf, val: pl)
+  end
+end
+
+/// Emit TCMC alloc + link + param reassign + br to loop.
+let emit_tcmc_cons_and_loop = fn (buf: %ByteBuffer, ctx: CodegenCtx, tcmc: TcmcCtx) -> %ByteBuffer do
+  match tcmc do
+    case NoTcmc -> %buf
+    case TcmcActive(head_local: hl, prev_local: pl, rest_field_idx: rfi,
+                     call_var: _, cons_var: _, call_args: cargs,
+                     ctor_name: cname, ctor_args: cargs_ctor, func_name: fname) ->
+      let obj_ptr = ctx_temps_base(ctx: ctx) + 3
+      // Find the function to get its params
+      match find_function(name: fname, funcs: ctx_functions(ctx: ctx)) do
+        case None -> push_byte(buf: %buf, byte: op_unreachable)
+        case Some(val: LirFunction(name: _, params: params, ret_type: _, body: _, ret: _, span: _)) ->
+          let arity = list.length(xs: cargs_ctor)
+          // 1. Allocate constructor cell
+          let %buf = emit_alloc_object(buf: %buf, ctx: ctx, words: 1 + arity)
+          // Store tag
+          let tag = constructor_tag(name: cname, arity: arity)
+          let %buf = push_byte(buf: %buf, byte: op_local_get)
+          let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+          let %buf = push_byte(buf: %buf, byte: op_i64_const)
+          let %buf = push_sleb128(buf: %buf, val: tag)
+          let %buf = push_byte(buf: %buf, byte: op_i64_store)
+          let %buf = emit_memarg_i64(buf: %buf, offset: 0)
+          // Store rest = 0 placeholder
+          let %buf = push_byte(buf: %buf, byte: op_local_get)
+          let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+          let %buf = push_byte(buf: %buf, byte: op_i64_const)
+          let %buf = push_sleb128(buf: %buf, val: 0)
+          let %buf = push_byte(buf: %buf, byte: op_i64_store)
+          let %buf = emit_memarg_i64(buf: %buf, offset: (rfi + 1) * 8)
+          // Store non-recursive fields (all fields except rest_field_idx)
+          let %buf = emit_tcmc_non_rec_fields(buf: %buf, ctx: ctx, obj_ptr: obj_ptr,
+            args: cargs_ctor, rest_idx: rfi, field_idx: 0)
+
+          // 2. Link: if prev != 0 → prev.rest = current, else head = current
+          let %buf = push_byte(buf: %buf, byte: op_local_get)
+          let %buf = push_uleb128(buf: %buf, val: pl)
+          let %buf = push_byte(buf: %buf, byte: op_i32_const)
+          let %buf = push_sleb128(buf: %buf, val: 0)
+          let %buf = push_byte(buf: %buf, byte: op_i32_ne)
+          let %buf = push_byte(buf: %buf, byte: op_if)
+          let %buf = push_byte(buf: %buf, byte: bt_void)
+          // prev.rest = current cell ptr (i64)
+          let %buf = push_byte(buf: %buf, byte: op_local_get)
+          let %buf = push_uleb128(buf: %buf, val: pl)
+          let %buf = push_byte(buf: %buf, byte: op_local_get)
+          let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+          let %buf = push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+          let %buf = push_byte(buf: %buf, byte: op_i64_store)
+          let %buf = emit_memarg_i64(buf: %buf, offset: (rfi + 1) * 8)
+          let %buf = push_byte(buf: %buf, byte: op_else)
+          // head = current cell ptr
+          let %buf = push_byte(buf: %buf, byte: op_local_get)
+          let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+          let %buf = push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+          let %buf = push_byte(buf: %buf, byte: op_local_set)
+          let %buf = push_uleb128(buf: %buf, val: hl)
+          let %buf = push_byte(buf: %buf, byte: op_end)
+
+          // 3. Update prev = current
+          let %buf = push_byte(buf: %buf, byte: op_local_get)
+          let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+          let %buf = push_byte(buf: %buf, byte: op_local_set)
+          let %buf = push_uleb128(buf: %buf, val: pl)
+
+          // 4. Reassign params from call_args + br 0
+          let %buf = emit_tcmc_param_push(buf: %buf, args: cargs, params: params, ctx: ctx)
+          let %buf = emit_tcmc_param_set(buf: %buf, params: list.reverse(xs: params), ctx: ctx)
+          let %buf = push_byte(buf: %buf, byte: op_br)
+          return push_uleb128(buf: %buf, val: 0)
+      end
+  end
+end
+
+/// Emit non-recursive constructor fields (skip the rest_field_idx).
+let emit_tcmc_non_rec_fields = fn (buf: %ByteBuffer, ctx: CodegenCtx, obj_ptr: i64,
+                                     args: [LirAtom], rest_idx: i64, field_idx: i64) -> %ByteBuffer do
+  match args do
+    case [] -> %buf
+    case a :: rest ->
+      if field_idx == rest_idx then
+        // Skip rest field (already set to 0)
+        return emit_tcmc_non_rec_fields(buf: %buf, ctx: ctx, obj_ptr: obj_ptr,
+          args: rest, rest_idx: rest_idx, field_idx: field_idx + 1)
+      end
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: obj_ptr)
+      let %buf = emit_atom(atom: a, buf: %buf, ctx: ctx)
+      let %buf = emit_pack_to_i64(typ: atom_type(atom: a), buf: %buf)
+      let %buf = push_byte(buf: %buf, byte: op_i64_store)
+      let %buf = emit_memarg_i64(buf: %buf, offset: (field_idx + 1) * 8)
+      return emit_tcmc_non_rec_fields(buf: %buf, ctx: ctx, obj_ptr: obj_ptr,
+        args: rest, rest_idx: rest_idx, field_idx: field_idx + 1)
+  end
+end
+
+/// Push all call arg values onto the WASM stack (for param reassignment).
+let emit_tcmc_param_push = fn (buf: %ByteBuffer, args: [LirCallArg], params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer do
+  match args do
+    case [] -> %buf
+    case LirCallArg(name: _, atom: a) :: arest ->
+      match params do
+        case [] -> %buf
+        case LirParam(label: _, name: _, typ: pt) :: prest ->
+          let %buf = emit_atom(atom: a, buf: %buf, ctx: ctx)
+          let %buf = emit_coercion(from_type: atom_type(atom: a), to_type: pt, buf: %buf)
+          return emit_tcmc_param_push(buf: %buf, args: arest, params: prest, ctx: ctx)
+      end
+  end
+end
+
+/// Pop params from stack in reverse order (WASM stack is LIFO).
+let emit_tcmc_param_set = fn (buf: %ByteBuffer, params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer do
+  match params do
+    case [] -> %buf
+    case LirParam(label: _, name: n, typ: _) :: rest ->
+      let idx = lookup_local(name: n, entries: ctx_locals(ctx: ctx))
+      let %buf = push_byte(buf: %buf, byte: op_local_set)
+      let %buf = push_uleb128(buf: %buf, val: idx)
+      return emit_tcmc_param_set(buf: %buf, params: rest, ctx: ctx)
+  end
+end
+
+/// Emit a return value with conditional TCMC linking.
+/// If TCMC prev != 0: link last cell's rest to ret_val, return head.
+/// Otherwise: return ret_val normally.
+let emit_return_with_tcmc = fn (buf: %ByteBuffer, ret_val: LirAtom, ret_type: TypeExpr,
+                                 ctx: CodegenCtx, tcmc: TcmcCtx) -> %ByteBuffer do
+  match tcmc do
+    case NoTcmc ->
+      let %buf = emit_atom(atom: ret_val, buf: %buf, ctx: ctx)
+      let %buf = emit_coercion(from_type: atom_type(atom: ret_val), to_type: ret_type, buf: %buf)
+      let %buf = emit_bt_pop(buf: %buf, ctx: ctx)
+      return push_byte(buf: %buf, byte: op_return)
+    case TcmcActive(head_local: hl, prev_local: pl, rest_field_idx: rfi,
+                     call_var: _, cons_var: _, call_args: _, ctor_name: _, ctor_args: _, func_name: _) ->
+      // if (prev != 0)
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: pl)
+      let %buf = push_byte(buf: %buf, byte: op_i32_const)
+      let %buf = push_sleb128(buf: %buf, val: 0)
+      let %buf = push_byte(buf: %buf, byte: op_i32_ne)
+      let %buf = push_byte(buf: %buf, byte: op_if)
+      let %buf = push_byte(buf: %buf, byte: bt_void)
+      // Link: prev.rest = ret_val
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: pl)
+      let %buf = emit_atom(atom: ret_val, buf: %buf, ctx: ctx)
+      let %buf = emit_pack_to_i64(typ: atom_type(atom: ret_val), buf: %buf)
+      let %buf = push_byte(buf: %buf, byte: op_i64_store)
+      let %buf = emit_memarg_i64(buf: %buf, offset: (rfi + 1) * 8)
+      let %buf = emit_bt_pop(buf: %buf, ctx: ctx)
+      // Return head
+      let %buf = push_byte(buf: %buf, byte: op_local_get)
+      let %buf = push_uleb128(buf: %buf, val: hl)
+      let %buf = push_byte(buf: %buf, byte: op_return)
+      let %buf = push_byte(buf: %buf, byte: op_else)
+      // Normal return
+      let %buf = emit_atom(atom: ret_val, buf: %buf, ctx: ctx)
+      let %buf = emit_coercion(from_type: atom_type(atom: ret_val), to_type: ret_type, buf: %buf)
+      let %buf = emit_bt_pop(buf: %buf, ctx: ctx)
+      let %buf = push_byte(buf: %buf, byte: op_return)
+      return push_byte(buf: %buf, byte: op_end)
+  end
+end
+
 // ─── Atom emission ──────────────────────────────────────────────────────────
 
 let emit_atom_var = fn (name: string, typ: TypeExpr, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
@@ -960,37 +1233,28 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
 end
 
 let emit_if_return_unconditional = fn (buf: %ByteBuffer, then_body: [LirStmt], then_ret: LirAtom,
-    ret_type: TypeExpr, ctx: CodegenCtx, in_try: bool) -> %ByteBuffer do
-  let %buf = emit_stmts(stmts: then_body, buf: %buf, ctx: ctx, in_try: in_try)
-  let %buf = emit_atom(atom: then_ret, buf: %buf, ctx: ctx)
-  let %buf = emit_coercion(from_type: atom_type(atom: then_ret), to_type: ret_type, buf: %buf)
-  let %buf = emit_bt_pop(buf: %buf, ctx: ctx)
-  return push_byte(buf: %buf, byte: op_return)
+    ret_type: TypeExpr, ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer do
+  let %buf = emit_stmts(stmts: then_body, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc)
+  return emit_return_with_tcmc(buf: %buf, ret_val: then_ret, ret_type: ret_type, ctx: ctx, tcmc: tcmc)
 end
 
 let emit_if_return_conditional = fn (buf: %ByteBuffer, cond: LirAtom, then_body: [LirStmt], then_ret: LirAtom,
     else_body: [LirStmt], else_ret: Option<LirAtom>, ret_type: TypeExpr,
-    ctx: CodegenCtx, in_try: bool) -> %ByteBuffer do
+    ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer do
   let %buf = emit_atom(atom: cond, buf: %buf, ctx: ctx)
   let %buf = emit_coercion(from_type: atom_type(atom: cond), to_type: TyBool, buf: %buf)
   let %buf = push_byte(buf: %buf, byte: op_if)
   let %buf = push_byte(buf: %buf, byte: bt_void)
-  let %buf = emit_stmts(stmts: then_body, buf: %buf, ctx: ctx, in_try: in_try)
-  let %buf = emit_atom(atom: then_ret, buf: %buf, ctx: ctx)
-  let %buf = emit_coercion(from_type: atom_type(atom: then_ret), to_type: ret_type, buf: %buf)
-  let %buf = emit_bt_pop(buf: %buf, ctx: ctx)
-  let %buf = push_byte(buf: %buf, byte: op_return)
+  let %buf = emit_stmts(stmts: then_body, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc)
+  let %buf = emit_return_with_tcmc(buf: %buf, ret_val: then_ret, ret_type: ret_type, ctx: ctx, tcmc: tcmc)
   let has_else = list.length(xs: else_body) > 0
   let has_else_ret = match else_ret do case Some(val: _) -> true case None -> false end
   if has_else || has_else_ret then
     let %buf = push_byte(buf: %buf, byte: op_else)
-    let %buf = emit_stmts(stmts: else_body, buf: %buf, ctx: ctx, in_try: in_try)
+    let %buf = emit_stmts(stmts: else_body, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc)
     match else_ret do
       case Some(val: a) ->
-        let %buf = emit_atom(atom: a, buf: %buf, ctx: ctx)
-        let %buf = emit_coercion(from_type: atom_type(atom: a), to_type: ret_type, buf: %buf)
-        let %buf = emit_bt_pop(buf: %buf, ctx: ctx)
-        let %buf = push_byte(buf: %buf, byte: op_return)
+        let %buf = emit_return_with_tcmc(buf: %buf, ret_val: a, ret_type: ret_type, ctx: ctx, tcmc: tcmc)
       case None -> ()
     end
   end
@@ -1009,9 +1273,25 @@ end
 
 // ─── Statement emission (mutually recursive) ────────────────────────────────
 
-let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool) -> %ByteBuffer do
+let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer do
   match stmt do
     case LirStmtLet(name: n, typ: t, expr: e) ->
+      // TCMC interception: skip self-call, intercept constructor
+      match tcmc do
+        case TcmcActive(head_local: _, prev_local: _, rest_field_idx: _, call_var: cv,
+                         cons_var: consv, call_args: _, ctor_name: _, ctor_args: _, func_name: _) ->
+          if n == cv then
+            match e do case LirExprCall(func: _, args: _, typ: _) -> return %buf case _ -> () end
+          end
+          if n == consv then
+            match e do
+              case LirExprConstructor(name: _, args: _, typ: _) ->
+                return emit_tcmc_cons_and_loop(buf: %buf, ctx: ctx, tcmc: tcmc)
+              case _ -> ()
+            end
+          end
+        case NoTcmc -> ()
+      end
       let %buf = emit_expr(expr: e, buf: %buf, ctx: ctx, in_try: in_try)
       let et = expr_type(expr: e)
       if is_unit(typ: t) then
@@ -1043,10 +1323,10 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = emit_coercion(from_type: atom_type(atom: c), to_type: TyBool, buf: %buf)
       let %buf = push_byte(buf: %buf, byte: op_if)
       let %buf = push_byte(buf: %buf, byte: bt_void)
-      let %buf = emit_stmts(stmts: tb, buf: %buf, ctx: ctx, in_try: in_try)
+      let %buf = emit_stmts(stmts: tb, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc)
       if list.length(xs: eb) > 0 then
         let %buf = push_byte(buf: %buf, byte: op_else)
-        let %buf = emit_stmts(stmts: eb, buf: %buf, ctx: ctx, in_try: in_try)
+        let %buf = emit_stmts(stmts: eb, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc)
       end
       return push_byte(buf: %buf, byte: op_end)
 
@@ -1055,10 +1335,10 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       match is_unconditional_return(cond: c, else_body: eb, else_ret: er) do
         case true ->
           return emit_if_return_unconditional(buf: %buf, then_body: tb, then_ret: tr,
-            ret_type: rt, ctx: ctx, in_try: in_try)
+            ret_type: rt, ctx: ctx, in_try: in_try, tcmc: tcmc)
         case false ->
           return emit_if_return_conditional(buf: %buf, cond: c, then_body: tb, then_ret: tr,
-            else_body: eb, else_ret: er, ret_type: rt, ctx: ctx, in_try: in_try)
+            else_body: eb, else_ret: er, ret_type: rt, ctx: ctx, in_try: in_try, tcmc: tcmc)
       end
 
     case LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
@@ -1066,12 +1346,12 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = push_byte(buf: %buf, byte: bt_void)
       let %buf = push_byte(buf: %buf, byte: op_loop)
       let %buf = push_byte(buf: %buf, byte: bt_void)
-      let %buf = emit_stmts(stmts: cs, buf: %buf, ctx: ctx, in_try: in_try)
+      let %buf = emit_stmts(stmts: cs, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc)
       let %buf = emit_atom(atom: c, buf: %buf, ctx: ctx)
       let %buf = emit_coercion(from_type: atom_type(atom: c), to_type: TyBool, buf: %buf)
       let %buf = push_byte(buf: %buf, byte: op_br_if)
       let %buf = push_uleb128(buf: %buf, val: 1)
-      let %buf = emit_stmts(stmts: b, buf: %buf, ctx: ctx, in_try: in_try)
+      let %buf = emit_stmts(stmts: b, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc)
       let %buf = push_byte(buf: %buf, byte: op_br)
       let %buf = push_uleb128(buf: %buf, val: 0)
       let %buf = push_byte(buf: %buf, byte: op_end)
@@ -1229,11 +1509,11 @@ let emit_widen_to_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
   end
 end
 
-let emit_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool) -> %ByteBuffer do
+let emit_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer do
   match stmts do
     case [] -> %buf
     case s :: rest ->
-      emit_stmts(stmts: rest, buf: emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: in_try), ctx: ctx, in_try: in_try)
+      emit_stmts(stmts: rest, buf: emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc), ctx: ctx, in_try: in_try, tcmc: tcmc)
   end
 end
 
@@ -1241,7 +1521,7 @@ let emit_try_body_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: CodegenCt
   match stmts do
     case [] -> %buf
     case s :: rest ->
-      let %buf = emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: true)
+      let %buf = emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: true, tcmc: NoTcmc)
       // Check global exn_flag after each statement
       let %buf = push_byte(buf: %buf, byte: op_global_get)
       let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
@@ -1256,7 +1536,7 @@ let emit_try_catch_body_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: Cod
   match stmts do
     case [] -> %buf
     case s :: rest ->
-      let %buf = emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: in_try)
+      let %buf = emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: in_try, tcmc: NoTcmc)
       if in_try then
         let %buf = push_byte(buf: %buf, byte: op_global_get)
         let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
@@ -1310,7 +1590,34 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuff
   let %body = empty()
   let %body = emit_local_decls(buf: %body, locals: ctx_locals(ctx: ctx), param_count: list.length(xs: ps))
   let %body = emit_bt_push(buf: %body, ctx: ctx, func_name: fname)
-  let %body = emit_stmts(stmts: b, buf: %body, ctx: ctx, in_try: false)
+
+  // TCMC: detect pattern and set up locals
+  let tcmc_raw = detect_tcmc(body: b, func_name: fname)
+  let tcmc = match tcmc_raw do
+    case NoTcmc -> NoTcmc
+    case TcmcActive(head_local: _, prev_local: _, rest_field_idx: rfi, call_var: cv,
+                     cons_var: consv, call_args: ca, ctor_name: cn, ctor_args: cta, func_name: fn2) ->
+      TcmcActive(head_local: ctx_temps_base(ctx: ctx) + 13,
+                  prev_local: ctx_temps_base(ctx: ctx) + 14,
+                  rest_field_idx: rfi, call_var: cv, cons_var: consv, call_args: ca,
+                  ctor_name: cn, ctor_args: cta, func_name: fn2)
+  end
+
+  // TCMC init (before loop, runs once)
+  let %body = emit_tcmc_init(buf: %body, tcmc: tcmc)
+  // Wrap body in loop if TCMC detected
+  let is_tcmc = match tcmc do case TcmcActive(head_local: _, prev_local: _, rest_field_idx: _, call_var: _, cons_var: _, call_args: _, ctor_name: _, ctor_args: _, func_name: _) -> true case NoTcmc -> false end
+  if is_tcmc then
+    let %body = push_byte(buf: %body, byte: op_loop)
+    let %body = push_byte(buf: %body, byte: bt_void)
+  end
+
+  let %body = emit_stmts(stmts: b, buf: %body, ctx: ctx, in_try: false, tcmc: tcmc)
+
+  if is_tcmc then
+    let %body = push_byte(buf: %body, byte: op_end)
+  end
+
   let %body = emit_return_value(body: %body, rt: rt, r: r, ctx: ctx)
   let %body = emit_bt_pop(buf: %body, ctx: ctx)
   push_byte(buf: %body, byte: op_end)
