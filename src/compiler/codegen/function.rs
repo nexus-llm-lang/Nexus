@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use wasm_encoder::{BlockType, Function, Instruction, ValType};
 
@@ -103,6 +103,12 @@ pub(super) fn compile_function(
         &mut next_local_index,
         &mut local_decls_flat,
     )?;
+
+    // Coalesce WASM locals: reuse indices for variables with non-overlapping lifetimes
+    let param_count = func.params.len() as u32;
+    coalesce_wasm_locals(func, &mut local_map, &mut local_decls_flat, param_count);
+    // Recount next_local_index after coalescing
+    next_local_index = param_count + local_decls_flat.len() as u32;
 
     let temps = FunctionTemps {
         packed_tmp_i64: next_local_index,
@@ -352,6 +358,239 @@ fn collect_stmt_locals(
         }
     }
     Ok(())
+}
+
+/// Coalesce WASM locals by reusing indices for variables with non-overlapping
+/// lifetimes and the same WASM type. Uses flat sequential numbering over all
+/// statements; references inside nested scopes (branches, loops) are projected
+/// to the enclosing statement's position in the parent scope.
+fn coalesce_wasm_locals(
+    func: &LirFunction,
+    local_map: &mut HashMap<Symbol, LocalInfo>,
+    local_decls_flat: &mut Vec<ValType>,
+    param_count: u32,
+) {
+    // 1. Compute liveness: (def_pos, last_use_pos) for each non-param variable.
+    //    Position is a flat counter at the top-level scope. Nested scopes
+    //    contribute to the enclosing stmt's position.
+    let mut def_pos: HashMap<Symbol, usize> = HashMap::new();
+    let mut last_use: HashMap<Symbol, usize> = HashMap::new();
+    for (pos, stmt) in func.body.iter().enumerate() {
+        // Record definitions
+        if let LirStmt::Let { name, .. } = stmt {
+            def_pos.entry(*name).or_insert(pos);
+        }
+        collect_defs_nested(stmt, pos, &mut def_pos);
+        // Record all variable references (including in nested bodies)
+        let mut refs = HashSet::new();
+        collect_refs_in_stmt(stmt, &mut refs);
+        for name in refs {
+            last_use.entry(name).and_modify(|e| *e = (*e).max(pos)).or_insert(pos);
+        }
+    }
+    // Also include return atom references
+    if let LirAtom::Var { name, .. } = &func.ret {
+        let end = func.body.len();
+        last_use.entry(*name).and_modify(|e| *e = (*e).max(end)).or_insert(end);
+    }
+
+    // 2. Build sorted list of (variable, def_pos, end_pos, wasm_type, old_index)
+    //    excluding params (they have fixed indices).
+    let param_names: HashSet<Symbol> = func.params.iter().map(|p| p.name).collect();
+    let mut intervals: Vec<(Symbol, usize, usize, ValType, u32)> = Vec::new();
+    for (name, info) in local_map.iter() {
+        if param_names.contains(name) {
+            continue;
+        }
+        let dp = def_pos.get(name).copied().unwrap_or(0);
+        let lu = last_use.get(name).copied().unwrap_or(dp);
+        intervals.push((*name, dp, lu, info.val_type, info.index));
+    }
+    if intervals.len() < 2 {
+        return; // nothing to coalesce
+    }
+    intervals.sort_by_key(|&(_, dp, _, _, _)| dp);
+
+    // 3. Linear scan: greedily assign to reusable slots.
+    //    A slot is reusable when its current occupant's last_use < new variable's def_pos.
+    struct Slot {
+        new_index: u32,
+        val_type: ValType,
+        end_pos: usize,
+    }
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut remap: HashMap<u32, u32> = HashMap::new(); // old_index → new_index
+
+    for &(_, dp, lu, vt, old_idx) in &intervals {
+        // Find an expired slot with matching type
+        let mut found = None;
+        for (i, slot) in slots.iter_mut().enumerate() {
+            if slot.end_pos < dp && slot.val_type == vt {
+                found = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = found {
+            remap.insert(old_idx, slots[i].new_index);
+            slots[i].end_pos = lu;
+        } else {
+            let new_idx = param_count + slots.len() as u32;
+            if new_idx != old_idx {
+                remap.insert(old_idx, new_idx);
+            }
+            slots.push(Slot {
+                new_index: new_idx,
+                val_type: vt,
+                end_pos: lu,
+            });
+        }
+    }
+
+    if remap.is_empty() || slots.len() >= intervals.len() {
+        return; // no savings
+    }
+
+    // 4. Apply remapping to local_map
+    for info in local_map.values_mut() {
+        if let Some(&new_idx) = remap.get(&info.index) {
+            info.index = new_idx;
+        }
+    }
+
+    // 5. Rebuild local_decls_flat from slots
+    local_decls_flat.clear();
+    local_decls_flat.extend(slots.iter().map(|s| s.val_type));
+}
+
+/// Collect variable definitions from nested scopes, projecting them
+/// to the parent scope's position.
+fn collect_defs_nested(stmt: &LirStmt, pos: usize, def_pos: &mut HashMap<Symbol, usize>) {
+    match stmt {
+        LirStmt::If { then_body, else_body, .. }
+        | LirStmt::IfReturn { then_body, else_body, .. } => {
+            for s in then_body.iter().chain(else_body.iter()) {
+                if let LirStmt::Let { name, .. } = s {
+                    def_pos.entry(*name).or_insert(pos);
+                }
+                collect_defs_nested(s, pos, def_pos);
+            }
+        }
+        LirStmt::TryCatch { body, catch_param, catch_body, .. } => {
+            def_pos.entry(*catch_param).or_insert(pos);
+            for s in body.iter().chain(catch_body.iter()) {
+                if let LirStmt::Let { name, .. } = s {
+                    def_pos.entry(*name).or_insert(pos);
+                }
+                collect_defs_nested(s, pos, def_pos);
+            }
+        }
+        LirStmt::Loop { cond_stmts, body, .. } => {
+            for s in cond_stmts.iter().chain(body.iter()) {
+                if let LirStmt::Let { name, .. } = s {
+                    def_pos.entry(*name).or_insert(pos);
+                }
+                collect_defs_nested(s, pos, def_pos);
+            }
+        }
+        LirStmt::Switch { cases, default_body, .. } => {
+            for case in cases {
+                for s in &case.body {
+                    if let LirStmt::Let { name, .. } = s {
+                        def_pos.entry(*name).or_insert(pos);
+                    }
+                    collect_defs_nested(s, pos, def_pos);
+                }
+            }
+            for s in default_body {
+                if let LirStmt::Let { name, .. } = s {
+                    def_pos.entry(*name).or_insert(pos);
+                }
+                collect_defs_nested(s, pos, def_pos);
+            }
+        }
+        LirStmt::Let { .. } | LirStmt::Conc { .. } => {}
+    }
+}
+
+/// Collect all variable references (Var atoms) from a statement and its nested bodies.
+fn collect_refs_in_stmt(stmt: &LirStmt, refs: &mut HashSet<Symbol>) {
+    match stmt {
+        LirStmt::Let { expr, .. } => collect_refs_in_expr(expr, refs),
+        LirStmt::If { cond, then_body, else_body } => {
+            collect_refs_in_atom(cond, refs);
+            for s in then_body { collect_refs_in_stmt(s, refs); }
+            for s in else_body { collect_refs_in_stmt(s, refs); }
+        }
+        LirStmt::IfReturn { cond, then_body, then_ret, else_body, else_ret, .. } => {
+            collect_refs_in_atom(cond, refs);
+            for s in then_body { collect_refs_in_stmt(s, refs); }
+            if let Some(r) = then_ret { collect_refs_in_atom(r, refs); }
+            for s in else_body { collect_refs_in_stmt(s, refs); }
+            if let Some(r) = else_ret { collect_refs_in_atom(r, refs); }
+        }
+        LirStmt::TryCatch { body, body_ret, catch_body, catch_ret, .. } => {
+            for s in body { collect_refs_in_stmt(s, refs); }
+            if let Some(r) = body_ret { collect_refs_in_atom(r, refs); }
+            for s in catch_body { collect_refs_in_stmt(s, refs); }
+            if let Some(r) = catch_ret { collect_refs_in_atom(r, refs); }
+        }
+        LirStmt::Loop { cond_stmts, cond, body } => {
+            for s in cond_stmts { collect_refs_in_stmt(s, refs); }
+            collect_refs_in_atom(cond, refs);
+            for s in body { collect_refs_in_stmt(s, refs); }
+        }
+        LirStmt::Switch { tag, cases, default_body, default_ret, .. } => {
+            collect_refs_in_atom(tag, refs);
+            for case in cases {
+                for s in &case.body { collect_refs_in_stmt(s, refs); }
+                if let Some(r) = &case.ret { collect_refs_in_atom(r, refs); }
+            }
+            for s in default_body { collect_refs_in_stmt(s, refs); }
+            if let Some(r) = default_ret { collect_refs_in_atom(r, refs); }
+        }
+        LirStmt::Conc { tasks } => {
+            for task in tasks {
+                for (_, arg) in &task.args { collect_refs_in_atom(arg, refs); }
+            }
+        }
+    }
+}
+
+fn collect_refs_in_expr(expr: &LirExpr, refs: &mut HashSet<Symbol>) {
+    match expr {
+        LirExpr::Atom(a) => collect_refs_in_atom(a, refs),
+        LirExpr::Binary { lhs, rhs, .. } => {
+            collect_refs_in_atom(lhs, refs);
+            collect_refs_in_atom(rhs, refs);
+        }
+        LirExpr::Call { args, .. } | LirExpr::TailCall { args, .. } => {
+            for (_, a) in args { collect_refs_in_atom(a, refs); }
+        }
+        LirExpr::Constructor { args, .. } => {
+            for a in args { collect_refs_in_atom(a, refs); }
+        }
+        LirExpr::Record { fields, .. } => {
+            for (_, a) in fields { collect_refs_in_atom(a, refs); }
+        }
+        LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } => {
+            collect_refs_in_atom(value, refs);
+        }
+        LirExpr::Raise { value, .. } => collect_refs_in_atom(value, refs),
+        LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
+        LirExpr::Closure { captures, .. } => {
+            for (_, a) in captures { collect_refs_in_atom(a, refs); }
+        }
+        LirExpr::CallIndirect { callee, args, .. } => {
+            collect_refs_in_atom(callee, refs);
+            for (_, a) in args { collect_refs_in_atom(a, refs); }
+        }
+    }
+}
+
+fn collect_refs_in_atom(atom: &LirAtom, refs: &mut HashSet<Symbol>) {
+    if let LirAtom::Var { name, .. } = atom {
+        refs.insert(*name);
+    }
 }
 
 pub(super) fn compile_expr(
