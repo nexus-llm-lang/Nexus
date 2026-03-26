@@ -22,6 +22,9 @@ pub fn optimize_lir(program: &mut LirProgram) {
     for func in &mut program.functions {
         optimize_function(func);
     }
+
+    // Phase 7: Identical code folding (after all per-function optimizations)
+    fold_identical_functions(program);
 }
 
 fn optimize_function(func: &mut LirFunction) {
@@ -1509,5 +1512,514 @@ fn rename_atom(atom: &mut LirAtom, map: &HashMap<Symbol, Symbol>) {
         if let Some(&new_name) = map.get(name) {
             *name = new_name;
         }
+    }
+}
+
+// ─── Identical Code Folding (ICF) ───────────────────────────────────────────
+
+/// Detect functions with structurally identical bodies (modulo variable names)
+/// and merge them by redirecting all calls to a single canonical version.
+/// Particularly effective for enum constructors and small wrapper functions.
+fn fold_identical_functions(program: &mut LirProgram) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // 1. Compute structural fingerprints for each function.
+    //    The fingerprint ignores variable names but captures the structure:
+    //    types, operations, call targets, literal values, and nesting.
+    let mut fingerprints: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (idx, func) in program.functions.iter().enumerate() {
+        let fp = structural_fingerprint(func);
+        fingerprints.entry(fp).or_default().push(idx);
+    }
+
+    // 2. For groups with identical fingerprints, verify structural equality
+    //    and build a redirect map (duplicate → canonical).
+    let mut redirect: HashMap<Symbol, Symbol> = HashMap::new();
+    for (_fp, indices) in &fingerprints {
+        if indices.len() < 2 {
+            continue;
+        }
+        // Pairwise comparison within group — first match wins as canonical
+        let mut canonical: Vec<usize> = Vec::new();
+        for &idx in indices {
+            let mut found = false;
+            for &canon_idx in &canonical {
+                if functions_structurally_equal(
+                    &program.functions[canon_idx],
+                    &program.functions[idx],
+                ) {
+                    redirect.insert(program.functions[idx].name, program.functions[canon_idx].name);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                canonical.push(idx);
+            }
+        }
+    }
+
+    if redirect.is_empty() {
+        return;
+    }
+
+    // 3. Rewrite all Call targets using the redirect map.
+    for func in &mut program.functions {
+        redirect_calls_in_stmts(&mut func.body, &redirect);
+    }
+
+    // 4. Remove redirected functions (they're now unused).
+    //    Keep exported functions (__conc_, __wasi_, main) that the runtime calls by name.
+    program.functions.retain(|f| {
+        if !redirect.contains_key(&f.name) {
+            return true;
+        }
+        let name = f.name.as_str();
+        name == "main"
+            || name.starts_with("__conc_")
+            || name.starts_with("__wasi_")
+            || name.starts_with("__closure_wrap_")
+    });
+}
+
+/// Compute a structural hash of a function, ignoring variable names.
+fn structural_fingerprint(func: &LirFunction) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+
+    // Hash param count and types (not names)
+    func.params.len().hash(&mut h);
+    for p in &func.params {
+        format!("{:?}", p.typ).hash(&mut h);
+    }
+    format!("{:?}", func.ret_type).hash(&mut h);
+
+    // Hash body structure
+    hash_stmts(&func.body, &mut h);
+
+    // Hash return atom structure (not var name)
+    hash_atom_structure(&func.ret, &mut h);
+
+    h.finish()
+}
+
+fn hash_stmts(stmts: &[LirStmt], h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    stmts.len().hash(h);
+    for stmt in stmts {
+        hash_stmt(stmt, h);
+    }
+}
+
+fn hash_stmt(stmt: &LirStmt, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    std::mem::discriminant(stmt).hash(h);
+    match stmt {
+        LirStmt::Let { typ, expr, .. } => {
+            format!("{:?}", typ).hash(h);
+            hash_expr(expr, h);
+        }
+        LirStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            hash_stmts(then_body, h);
+            hash_stmts(else_body, h);
+        }
+        LirStmt::IfReturn {
+            then_body,
+            then_ret,
+            else_body,
+            else_ret,
+            ret_type,
+            ..
+        } => {
+            hash_stmts(then_body, h);
+            then_ret.is_some().hash(h);
+            if let Some(r) = then_ret {
+                hash_atom_structure(r, h);
+            }
+            hash_stmts(else_body, h);
+            else_ret.is_some().hash(h);
+            if let Some(r) = else_ret {
+                hash_atom_structure(r, h);
+            }
+            format!("{:?}", ret_type).hash(h);
+        }
+        LirStmt::Switch {
+            cases,
+            default_body,
+            default_ret,
+            ret_type,
+            ..
+        } => {
+            cases.len().hash(h);
+            for case in cases {
+                case.tag_value.hash(h);
+                hash_stmts(&case.body, h);
+                case.ret.is_some().hash(h);
+                if let Some(r) = &case.ret {
+                    hash_atom_structure(r, h);
+                }
+            }
+            hash_stmts(default_body, h);
+            default_ret.is_some().hash(h);
+            format!("{:?}", ret_type).hash(h);
+        }
+        LirStmt::TryCatch {
+            body,
+            body_ret,
+            catch_body,
+            catch_ret,
+            catch_param_typ,
+            ..
+        } => {
+            hash_stmts(body, h);
+            body_ret.is_some().hash(h);
+            hash_stmts(catch_body, h);
+            catch_ret.is_some().hash(h);
+            format!("{:?}", catch_param_typ).hash(h);
+        }
+        LirStmt::Loop {
+            cond_stmts,
+            body,
+            ..
+        } => {
+            hash_stmts(cond_stmts, h);
+            hash_stmts(body, h);
+        }
+        LirStmt::Conc { tasks } => {
+            tasks.len().hash(h);
+        }
+    }
+}
+
+fn hash_expr(expr: &LirExpr, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    std::mem::discriminant(expr).hash(h);
+    match expr {
+        LirExpr::Atom(a) => hash_atom_structure(a, h),
+        LirExpr::Binary { op, typ, .. } => {
+            op.hash(h);
+            format!("{:?}", typ).hash(h);
+        }
+        LirExpr::Call { func, args, typ } => {
+            func.hash(h);
+            args.len().hash(h);
+            format!("{:?}", typ).hash(h);
+        }
+        LirExpr::TailCall { func, args, typ } => {
+            func.hash(h);
+            args.len().hash(h);
+            format!("{:?}", typ).hash(h);
+        }
+        LirExpr::Constructor { name, args, typ } => {
+            name.hash(h);
+            args.len().hash(h);
+            format!("{:?}", typ).hash(h);
+        }
+        LirExpr::Record { fields, typ } => {
+            fields.len().hash(h);
+            format!("{:?}", typ).hash(h);
+        }
+        LirExpr::ObjectTag { typ, .. } => format!("{:?}", typ).hash(h),
+        LirExpr::ObjectField { index, typ, .. } => {
+            index.hash(h);
+            format!("{:?}", typ).hash(h);
+        }
+        LirExpr::Raise { typ, .. } => format!("{:?}", typ).hash(h),
+        LirExpr::FuncRef { func, .. } => func.hash(h),
+        LirExpr::Closure { func, captures, .. } => {
+            func.hash(h);
+            captures.len().hash(h);
+        }
+        LirExpr::ClosureEnvLoad { index, typ } => {
+            index.hash(h);
+            format!("{:?}", typ).hash(h);
+        }
+        LirExpr::CallIndirect { args, typ, callee_type, .. } => {
+            args.len().hash(h);
+            format!("{:?}", typ).hash(h);
+            format!("{:?}", callee_type).hash(h);
+        }
+    }
+}
+
+/// Hash the structure of an atom, ignoring variable names but keeping
+/// the type and literal values.
+fn hash_atom_structure(atom: &LirAtom, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    std::mem::discriminant(atom).hash(h);
+    match atom {
+        LirAtom::Var { typ, .. } => format!("{:?}", typ).hash(h),
+        LirAtom::Int(v) => v.hash(h),
+        LirAtom::Float(v) => v.to_bits().hash(h),
+        LirAtom::Bool(v) => v.hash(h),
+        LirAtom::Char(v) => v.hash(h),
+        LirAtom::String(v) => v.hash(h),
+        LirAtom::Unit => {}
+    }
+}
+
+/// Check structural equality of two functions, ignoring variable names.
+/// Both functions must have the same param/return types, same body structure,
+/// and same operations (calls to the same functions, same constructors, etc).
+fn functions_structurally_equal(a: &LirFunction, b: &LirFunction) -> bool {
+    if a.params.len() != b.params.len() || a.ret_type != b.ret_type {
+        return false;
+    }
+    for (pa, pb) in a.params.iter().zip(b.params.iter()) {
+        if pa.typ != pb.typ {
+            return false;
+        }
+    }
+    if a.body.len() != b.body.len() {
+        return false;
+    }
+    // Build a variable-name mapping: a's names → b's names
+    let mut name_map: HashMap<Symbol, Symbol> = HashMap::new();
+    for (pa, pb) in a.params.iter().zip(b.params.iter()) {
+        name_map.insert(pa.name, pb.name);
+    }
+    stmts_structurally_equal(&a.body, &b.body, &mut name_map)
+        && atoms_structurally_equal(&a.ret, &b.ret, &name_map)
+}
+
+fn stmts_structurally_equal(
+    a: &[LirStmt],
+    b: &[LirStmt],
+    name_map: &mut HashMap<Symbol, Symbol>,
+) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for (sa, sb) in a.iter().zip(b.iter()) {
+        if std::mem::discriminant(sa) != std::mem::discriminant(sb) {
+            return false;
+        }
+        match (sa, sb) {
+            (
+                LirStmt::Let {
+                    name: na,
+                    typ: ta,
+                    expr: ea,
+                },
+                LirStmt::Let {
+                    name: nb,
+                    typ: tb,
+                    expr: eb,
+                },
+            ) => {
+                if ta != tb || !exprs_structurally_equal(ea, eb, name_map) {
+                    return false;
+                }
+                name_map.insert(*na, *nb);
+            }
+            (
+                LirStmt::If {
+                    cond: ca,
+                    then_body: ta,
+                    else_body: ea,
+                },
+                LirStmt::If {
+                    cond: cb,
+                    then_body: tb,
+                    else_body: eb,
+                },
+            ) => {
+                if !atoms_structurally_equal(ca, cb, name_map)
+                    || !stmts_structurally_equal(ta, tb, name_map)
+                    || !stmts_structurally_equal(ea, eb, name_map)
+                {
+                    return false;
+                }
+            }
+            // For other stmt types, fall back to Debug equality (conservative)
+            _ => {
+                if format!("{:?}", sa) != format!("{:?}", sb) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn exprs_structurally_equal(
+    a: &LirExpr,
+    b: &LirExpr,
+    name_map: &HashMap<Symbol, Symbol>,
+) -> bool {
+    if std::mem::discriminant(a) != std::mem::discriminant(b) {
+        return false;
+    }
+    match (a, b) {
+        (LirExpr::Atom(aa), LirExpr::Atom(ab)) => atoms_structurally_equal(aa, ab, name_map),
+        (
+            LirExpr::Binary {
+                op: oa,
+                lhs: la,
+                rhs: ra,
+                typ: ta,
+            },
+            LirExpr::Binary {
+                op: ob,
+                lhs: lb,
+                rhs: rb,
+                typ: tb,
+            },
+        ) => {
+            oa == ob
+                && ta == tb
+                && atoms_structurally_equal(la, lb, name_map)
+                && atoms_structurally_equal(ra, rb, name_map)
+        }
+        (
+            LirExpr::Call {
+                func: fa,
+                args: aa,
+                typ: ta,
+            },
+            LirExpr::Call {
+                func: fb,
+                args: ab,
+                typ: tb,
+            },
+        ) => {
+            fa == fb
+                && ta == tb
+                && aa.len() == ab.len()
+                && aa.iter()
+                    .zip(ab.iter())
+                    .all(|((_, a), (_, b))| atoms_structurally_equal(a, b, name_map))
+        }
+        (
+            LirExpr::Constructor {
+                name: na,
+                args: aa,
+                typ: ta,
+            },
+            LirExpr::Constructor {
+                name: nb,
+                args: ab,
+                typ: tb,
+            },
+        ) => {
+            na == nb
+                && ta == tb
+                && aa.len() == ab.len()
+                && aa.iter()
+                    .zip(ab.iter())
+                    .all(|(a, b)| atoms_structurally_equal(a, b, name_map))
+        }
+        (
+            LirExpr::ObjectTag {
+                value: va,
+                typ: ta,
+            },
+            LirExpr::ObjectTag {
+                value: vb,
+                typ: tb,
+            },
+        ) => ta == tb && atoms_structurally_equal(va, vb, name_map),
+        (
+            LirExpr::ObjectField {
+                value: va,
+                index: ia,
+                typ: ta,
+            },
+            LirExpr::ObjectField {
+                value: vb,
+                index: ib,
+                typ: tb,
+            },
+        ) => ia == ib && ta == tb && atoms_structurally_equal(va, vb, name_map),
+        // Conservative fallback for other variants
+        _ => format!("{:?}", a) == format!("{:?}", b),
+    }
+}
+
+fn atoms_structurally_equal(
+    a: &LirAtom,
+    b: &LirAtom,
+    name_map: &HashMap<Symbol, Symbol>,
+) -> bool {
+    match (a, b) {
+        (LirAtom::Var { name: na, typ: ta }, LirAtom::Var { name: nb, typ: tb }) => {
+            ta == tb && name_map.get(na).map_or(*na == *nb, |mapped| *mapped == *nb)
+        }
+        (LirAtom::Int(a), LirAtom::Int(b)) => a == b,
+        (LirAtom::Float(a), LirAtom::Float(b)) => a == b,
+        (LirAtom::Bool(a), LirAtom::Bool(b)) => a == b,
+        (LirAtom::Char(a), LirAtom::Char(b)) => a == b,
+        (LirAtom::String(a), LirAtom::String(b)) => a == b,
+        (LirAtom::Unit, LirAtom::Unit) => true,
+        _ => false,
+    }
+}
+
+/// Rewrite Call targets in all statements using the redirect map.
+fn redirect_calls_in_stmts(stmts: &mut [LirStmt], redirect: &HashMap<Symbol, Symbol>) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            LirStmt::Let { expr, .. } => {
+                redirect_calls_in_expr(expr, redirect);
+            }
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            }
+            | LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                redirect_calls_in_stmts(then_body, redirect);
+                redirect_calls_in_stmts(else_body, redirect);
+            }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                redirect_calls_in_stmts(body, redirect);
+                redirect_calls_in_stmts(catch_body, redirect);
+            }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                redirect_calls_in_stmts(cond_stmts, redirect);
+                redirect_calls_in_stmts(body, redirect);
+            }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for case in cases {
+                    redirect_calls_in_stmts(&mut case.body, redirect);
+                }
+                redirect_calls_in_stmts(default_body, redirect);
+            }
+            LirStmt::Conc { .. } => {}
+        }
+    }
+}
+
+fn redirect_calls_in_expr(expr: &mut LirExpr, redirect: &HashMap<Symbol, Symbol>) {
+    match expr {
+        LirExpr::Call { func, .. } | LirExpr::TailCall { func, .. } => {
+            if let Some(&target) = redirect.get(func) {
+                *func = target;
+            }
+        }
+        LirExpr::FuncRef { func, .. } | LirExpr::Closure { func, .. } => {
+            if let Some(&target) = redirect.get(func) {
+                *func = target;
+            }
+        }
+        _ => {}
     }
 }
