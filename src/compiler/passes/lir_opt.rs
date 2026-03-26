@@ -392,7 +392,10 @@ fn constant_fold_stmt(stmt: &mut LirStmt) {
 
 fn try_fold_expr(expr: &LirExpr) -> Option<LirAtom> {
     if let LirExpr::Binary { op, lhs, rhs, .. } = expr {
-        return fold_binary(*op, lhs, rhs);
+        if let Some(folded) = fold_binary(*op, lhs, rhs) {
+            return Some(folded);
+        }
+        return simplify_binary(*op, lhs, rhs);
     }
     None
 }
@@ -402,6 +405,56 @@ fn fold_binary(op: BinaryOp, lhs: &LirAtom, rhs: &LirAtom) -> Option<LirAtom> {
         (LirAtom::Int(a), LirAtom::Int(b)) => fold_int(op, *a, *b),
         (LirAtom::Float(a), LirAtom::Float(b)) => fold_float(op, *a, *b),
         (LirAtom::Bool(a), LirAtom::Bool(b)) => fold_bool(op, *a, *b),
+        _ => None,
+    }
+}
+
+/// Identity and absorbing element simplification (one operand literal).
+fn simplify_binary(op: BinaryOp, lhs: &LirAtom, rhs: &LirAtom) -> Option<LirAtom> {
+    match op {
+        BinaryOp::Add => match (lhs, rhs) {
+            (LirAtom::Int(0), _) => Some(rhs.clone()),
+            (_, LirAtom::Int(0)) => Some(lhs.clone()),
+            _ => None,
+        },
+        BinaryOp::Sub => match rhs {
+            LirAtom::Int(0) => Some(lhs.clone()),
+            _ => None,
+        },
+        BinaryOp::Mul => match (lhs, rhs) {
+            (LirAtom::Int(0), _) | (_, LirAtom::Int(0)) => Some(LirAtom::Int(0)),
+            (LirAtom::Int(1), _) => Some(rhs.clone()),
+            (_, LirAtom::Int(1)) => Some(lhs.clone()),
+            _ => None,
+        },
+        BinaryOp::Div => match rhs {
+            LirAtom::Int(1) => Some(lhs.clone()),
+            _ => None,
+        },
+        BinaryOp::And => match (lhs, rhs) {
+            (LirAtom::Bool(false), _) | (_, LirAtom::Bool(false)) => Some(LirAtom::Bool(false)),
+            (LirAtom::Bool(true), _) => Some(rhs.clone()),
+            (_, LirAtom::Bool(true)) => Some(lhs.clone()),
+            _ => None,
+        },
+        BinaryOp::Or => match (lhs, rhs) {
+            (LirAtom::Bool(true), _) | (_, LirAtom::Bool(true)) => Some(LirAtom::Bool(true)),
+            (LirAtom::Bool(false), _) => Some(rhs.clone()),
+            (_, LirAtom::Bool(false)) => Some(lhs.clone()),
+            _ => None,
+        },
+        BinaryOp::FAdd => match (lhs, rhs) {
+            (LirAtom::Float(v), _) if *v == 0.0 => Some(rhs.clone()),
+            (_, LirAtom::Float(v)) if *v == 0.0 => Some(lhs.clone()),
+            _ => None,
+        },
+        BinaryOp::FMul => match (lhs, rhs) {
+            (LirAtom::Float(v), _) if *v == 1.0 => Some(rhs.clone()),
+            (_, LirAtom::Float(v)) if *v == 1.0 => Some(lhs.clone()),
+            (LirAtom::Float(v), _) if *v == 0.0 => Some(LirAtom::Float(0.0)),
+            (_, LirAtom::Float(v)) if *v == 0.0 => Some(LirAtom::Float(0.0)),
+            _ => None,
+        },
         _ => None,
     }
 }
