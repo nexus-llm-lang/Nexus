@@ -986,8 +986,7 @@ impl<'a> LowerCtx<'a> {
             Vec::new()
         };
 
-        let has_inner_conditions =
-            needs_inner_split && !guarded_stmts.is_empty() && conds.len() > 1;
+        let has_inner_conditions = !guarded_stmts.is_empty() && conds.len() > 1;
 
         let combined_cond = if conds.is_empty() {
             None
@@ -1142,11 +1141,12 @@ impl<'a> LowerCtx<'a> {
             Vec::new()
         };
 
-        // Inner conditions exist when nested patterns produce multiple tag checks.
-        // Only split into outer/inner when the caller indicates the outer
-        // constructor is shared with other cases (needs_inner_split).
-        let has_inner_conditions =
-            needs_inner_split && !guarded_stmts.is_empty() && conds.len() > 1;
+        // Inner conditions exist when constructor patterns have field-level
+        // literal checks (e.g. `case Foo(val: 0) ->`).  These conditions
+        // depend on the guarded field-extraction stmts and must be emitted
+        // *inside* the case body after those stmts.  This applies regardless
+        // of whether the constructor appears in multiple cases.
+        let has_inner_conditions = !guarded_stmts.is_empty() && conds.len() > 1;
 
         // For the main condition, use only the outer tag check when
         // there are guarded stmts (inner checks depend on extracted fields).
