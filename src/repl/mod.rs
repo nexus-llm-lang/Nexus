@@ -39,7 +39,12 @@ impl ReplState {
     fn new(capabilities: ExecutionCapabilities) -> Self {
         ReplState {
             top_levels: Vec::new(),
-            engine: Engine::default(),
+            engine: {
+                let mut config = wasmtime::Config::new();
+                config.wasm_tail_call(true);
+                config.wasm_exceptions(true);
+                Engine::new(&config).expect("failed to create engine")
+            },
             capabilities,
         }
     }
