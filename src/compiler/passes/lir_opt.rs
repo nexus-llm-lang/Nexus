@@ -35,6 +35,8 @@ fn optimize_function(func: &mut LirFunction) {
     count_uses_in_stmts(&func.body, &mut uses);
     count_uses_in_atom(&func.ret, &mut uses);
     eliminate_dead_lets(&mut func.body, &uses);
+    // 5. Unreachable code stripping (remove stmts after divergent stmts)
+    strip_unreachable_stmts(&mut func.body);
 }
 
 /// Collect names that are bound by Let more than once (across all nested scopes).
@@ -831,4 +833,92 @@ fn expr_has_side_effects(expr: &LirExpr) -> bool {
             | LirExpr::Raise { .. }
             | LirExpr::CallIndirect { .. }
     )
+}
+
+// ─── Unreachable Code Stripping ─────────────────────────────────────────────
+
+/// Returns true if a statement always diverges (never falls through to the next).
+fn stmt_diverges(stmt: &LirStmt) -> bool {
+    match stmt {
+        LirStmt::Let { expr, .. } => matches!(expr, LirExpr::Raise { .. } | LirExpr::TailCall { .. }),
+        LirStmt::IfReturn {
+            then_ret,
+            else_ret,
+            ..
+        } => {
+            // Diverges only if BOTH branches return (or the then branch returns
+            // and there is no else branch — the else IS the continuation)
+            then_ret.is_some() && else_ret.is_some()
+        }
+        LirStmt::Switch {
+            cases,
+            default_ret,
+            ..
+        } => {
+            // Diverges if all cases AND default return
+            default_ret.is_some() && cases.iter().all(|c| c.ret.is_some())
+        }
+        _ => false,
+    }
+}
+
+/// Remove statements that follow a divergent statement in the same block.
+/// Recurse into nested blocks.
+fn strip_unreachable_stmts(stmts: &mut Vec<LirStmt>) {
+    // Find first divergent statement
+    let mut truncate_at = None;
+    for (i, stmt) in stmts.iter().enumerate() {
+        if stmt_diverges(stmt) && i + 1 < stmts.len() {
+            truncate_at = Some(i + 1);
+            break;
+        }
+    }
+    if let Some(at) = truncate_at {
+        stmts.truncate(at);
+    }
+
+    // Recurse into nested blocks
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                strip_unreachable_stmts(then_body);
+                strip_unreachable_stmts(else_body);
+            }
+            LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                strip_unreachable_stmts(then_body);
+                strip_unreachable_stmts(else_body);
+            }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                strip_unreachable_stmts(body);
+                strip_unreachable_stmts(catch_body);
+            }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                strip_unreachable_stmts(cond_stmts);
+                strip_unreachable_stmts(body);
+            }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for case in cases {
+                    strip_unreachable_stmts(&mut case.body);
+                }
+                strip_unreachable_stmts(default_body);
+            }
+            LirStmt::Let { .. } | LirStmt::Conc { .. } => {}
+        }
+    }
 }
