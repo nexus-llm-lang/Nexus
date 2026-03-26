@@ -4,7 +4,7 @@ use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType, ExportKind,
     ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
     Instruction, MemorySection, MemoryType, Module, NameMap, NameSection, RefType, TableSection,
-    TableType, TypeSection, ValType,
+    TableType, TagKind, TagSection, TagType, TypeSection, ValType,
 };
 
 use crate::constants::{ENTRYPOINT, MEMORY_EXPORT, WASI_CLI_RUN_EXPORT};
@@ -19,10 +19,7 @@ use super::emit::{
 use super::error::CodegenError;
 use super::function::compile_function;
 use super::layout::{build_codegen_layout, program_uses_object_heap, MemoryMode};
-use super::{
-    ALLOCATE_WASM_NAME, BT_FREEZE_NAME, BT_MODULE, BT_POP_NAME, BT_PUSH_NAME, CONC_JOIN_NAME,
-    CONC_MODULE, CONC_SPAWN_NAME, CONC_TASK_PREFIX,
-};
+use super::{ALLOCATE_WASM_NAME, CONC_JOIN_NAME, CONC_MODULE, CONC_SPAWN_NAME, CONC_TASK_PREFIX};
 
 /// Compiles LIR (in ANF) directly into core WASM bytes.
 pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError> {
@@ -30,9 +27,8 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         .functions
         .iter()
         .any(|f| f.name.starts_with(CONC_TASK_PREFIX));
-    let has_bt = program_needs_backtrace(program);
+    let has_eh = program_needs_eh(program);
     let n_conc_imports: u32 = if has_conc { 2 } else { 0 };
-    let n_bt_imports: u32 = if has_bt { 3 } else { 0 };
 
     let stdlib_alloc_module = if program_uses_object_heap(program) {
         program
@@ -64,7 +60,7 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
     }
     let deduped_ext_count = deduped_externals.len() as u32;
 
-    let import_count = deduped_ext_count + n_conc_imports + n_bt_imports + n_alloc_imports;
+    let import_count = deduped_ext_count + n_conc_imports + n_alloc_imports;
 
     let mut internal_function_indices = HashMap::new();
     for (idx, func) in program.functions.iter().enumerate() {
@@ -97,14 +93,8 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         layout.conc_spawn_idx = Some(deduped_ext_count);
         layout.conc_join_idx = Some(deduped_ext_count + 1);
     }
-    if has_bt {
-        let base = deduped_ext_count + n_conc_imports;
-        layout.bt_push_idx = Some(base);
-        layout.bt_pop_idx = Some(base + 1);
-        layout.bt_freeze_idx = Some(base + 2);
-    }
     if stdlib_alloc_module.is_some() {
-        let alloc_idx = deduped_ext_count + n_conc_imports + n_bt_imports;
+        let alloc_idx = deduped_ext_count + n_conc_imports;
         layout.allocate_func_idx = Some(alloc_idx);
     }
 
@@ -149,14 +139,11 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         next_type_index += 1;
     }
 
-    let mut bt_push_type_idx = 0;
-    let mut bt_void_type_idx = 0;
-    if has_bt {
+    // Exception tag type: (i64) -> () — the exception payload is a packed i64
+    let mut exn_tag_type_idx = 0;
+    if has_eh {
         types.ty().function([ValType::I64], []);
-        bt_push_type_idx = next_type_index;
-        next_type_index += 1;
-        types.ty().function([], []);
-        bt_void_type_idx = next_type_index;
+        exn_tag_type_idx = next_type_index;
         next_type_index += 1;
     }
 
@@ -249,24 +236,6 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         );
         has_imports = true;
     }
-    if has_bt {
-        imports.import(
-            BT_MODULE,
-            BT_PUSH_NAME,
-            EntityType::Function(bt_push_type_idx),
-        );
-        imports.import(
-            BT_MODULE,
-            BT_POP_NAME,
-            EntityType::Function(bt_void_type_idx),
-        );
-        imports.import(
-            BT_MODULE,
-            BT_FREEZE_NAME,
-            EntityType::Function(bt_void_type_idx),
-        );
-        has_imports = true;
-    }
     if let Some(alloc_module) = &stdlib_alloc_module {
         imports.import(
             alloc_module,
@@ -314,13 +283,23 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         module.section(&memories);
     }
 
+    // === Tag Section (WASM EH) ===
+    if has_eh {
+        let mut tags = TagSection::new();
+        tags.tag(TagType {
+            kind: TagKind::Exception,
+            func_type_idx: exn_tag_type_idx,
+        });
+        layout.exn_tag_idx = Some(0); // tag index 0
+        module.section(&tags);
+    }
+
     // === Global Section ===
     {
-        let mut globals = GlobalSection::new();
-        let mut next_global: u32 = 0;
-
-        // Heap pointer global (index 0 when present — OBJECT_HEAP_GLOBAL_INDEX)
-        if layout.object_heap_enabled && layout.allocate_func_idx.is_none() {
+        let needs_globals = layout.object_heap_enabled && layout.allocate_func_idx.is_none();
+        if needs_globals {
+            let mut globals = GlobalSection::new();
+            // Heap pointer global (index 0 — OBJECT_HEAP_GLOBAL_INDEX)
             globals.global(
                 GlobalType {
                     val_type: ValType::I32,
@@ -329,33 +308,8 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
                 },
                 &ConstExpr::i32_const(layout.heap_base as i32),
             );
-            next_global += 1;
+            module.section(&globals);
         }
-
-        // Exception flag (i32): 0 = no exception, 1 = exception raised
-        layout.exn_flag_global = next_global;
-        globals.global(
-            GlobalType {
-                val_type: ValType::I32,
-                mutable: true,
-                shared: false,
-            },
-            &ConstExpr::i32_const(0),
-        );
-        next_global += 1;
-
-        // Exception value (i64): packed exception object
-        layout.exn_value_global = next_global;
-        globals.global(
-            GlobalType {
-                val_type: ValType::I64,
-                mutable: true,
-                shared: false,
-            },
-            &ConstExpr::i64_const(0),
-        );
-
-        module.section(&globals);
     }
 
     // === Export Section ===
@@ -437,14 +391,6 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
             func_names.append(idx, CONC_SPAWN_NAME);
             idx += 1;
             func_names.append(idx, CONC_JOIN_NAME);
-            idx += 1;
-        }
-        if has_bt {
-            func_names.append(idx, BT_PUSH_NAME);
-            idx += 1;
-            func_names.append(idx, BT_POP_NAME);
-            idx += 1;
-            func_names.append(idx, BT_FREEZE_NAME);
             idx += 1;
         }
         if stdlib_alloc_module.is_some() {
@@ -708,7 +654,7 @@ fn sig_key(params: &[ValType], results: &[ValType]) -> String {
 }
 
 /// Check if the LIR program needs backtrace instrumentation.
-fn program_needs_backtrace(program: &LirProgram) -> bool {
+fn program_needs_eh(program: &LirProgram) -> bool {
     fn stmt_needs_bt(stmt: &LirStmt) -> bool {
         match stmt {
             LirStmt::Let { expr, .. } => matches!(expr, LirExpr::Raise { .. }),

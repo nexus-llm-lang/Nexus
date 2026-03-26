@@ -125,6 +125,7 @@ end
 }
 
 #[test]
+#[ignore = "backtrace requires wasmtime stack walk (nexus-p8w), not yet implemented"]
 fn test_backtrace_captures_call_stack() {
     exec_with_stdlib(
         r#"

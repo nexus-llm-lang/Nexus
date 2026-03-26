@@ -27,10 +27,6 @@ const CONC_MODULE: &str = "nexus:runtime/conc";
 const CONC_SPAWN_NAME: &str = "__nx_conc_spawn";
 const CONC_JOIN_NAME: &str = "__nx_conc_join";
 const CONC_TASK_PREFIX: &str = "__conc_";
-const BT_MODULE: &str = "nexus:runtime/backtrace";
-const BT_PUSH_NAME: &str = "__nx_bt_push";
-const BT_POP_NAME: &str = "__nx_bt_pop";
-const BT_FREEZE_NAME: &str = "__nx_bt_freeze";
 const ALLOCATE_WASM_NAME: &str = "allocate";
 
 #[derive(Debug, Clone, Copy)]
