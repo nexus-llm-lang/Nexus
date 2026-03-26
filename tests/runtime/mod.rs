@@ -5,3 +5,4 @@ pub mod control_flow;
 pub mod functions;
 pub mod records;
 pub mod strings;
+pub mod wasm_eh;
