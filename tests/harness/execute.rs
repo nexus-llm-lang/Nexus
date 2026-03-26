@@ -14,7 +14,12 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 
-static SHARED_ENGINE: LazyLock<Engine> = LazyLock::new(Engine::default);
+static SHARED_ENGINE: LazyLock<Engine> = LazyLock::new(|| {
+    let mut config = wasmtime::Config::new();
+    config.wasm_tail_call(true);
+    config.wasm_exceptions(true);
+    Engine::new(&config).expect("failed to create shared engine")
+});
 
 static DEP_MODULE_CACHE: LazyLock<Mutex<HashMap<String, Arc<Module>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -61,7 +66,10 @@ pub fn exec_should_trap(src: &str) -> String {
 
 /// Execute main() -> () on raw WASM bytes (no WASI, no stdlib).
 pub fn run_main(wasm: &[u8]) -> Result<(), String> {
-    let engine = Engine::default();
+    let mut config = wasmtime::Config::new();
+    config.wasm_tail_call(true);
+    config.wasm_exceptions(true);
+    let engine = Engine::new(&config).map_err(|e| e.to_string())?;
     let module = Module::from_binary(&engine, wasm).map_err(|e| e.to_string())?;
     let has_conc = conc::needs_conc_runtime(wasm);
     let has_bt = backtrace::needs_bt_runtime(wasm);

@@ -26,7 +26,12 @@ fn codegen_validate_wasm_output() {
             });
     }
 
-    let engine = wasmtime::Engine::default();
+    let engine = {
+        let mut config = wasmtime::Config::new();
+        config.wasm_tail_call(true);
+        config.wasm_exceptions(true);
+        wasmtime::Engine::new(&config).unwrap()
+    };
 
     // empty main
     {
