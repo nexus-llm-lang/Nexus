@@ -67,7 +67,7 @@ use super::emit::{
     emit_pack_value_to_i64, emit_unpack_i64_to_value, memarg, record_tag, type_to_wasm_valtype,
 };
 use super::error::CodegenError;
-use super::layout::{bt_label, CodegenLayout};
+use super::layout::CodegenLayout;
 use super::stmt::compile_stmt;
 use super::string::{
     emit_string_compare, emit_string_concat, is_string_compare_operator, is_string_concat_operator,
@@ -171,18 +171,6 @@ pub(super) fn compile_function(
 
     let mut out = Function::new(wasm_locals);
 
-    // Backtrace: push "file:line funcname" onto call stack at entry
-    if let Some(bt_push_idx) = layout.bt_push_idx {
-        let label = bt_label(func);
-        let packed_name = layout
-            .string_literals
-            .get(&label)
-            .map(|p| pack_string(*p))
-            .unwrap_or(0);
-        out.instruction(&Instruction::I64Const(packed_name));
-        out.instruction(&Instruction::Call(bt_push_idx));
-    }
-
     let is_entrypoint = func.name == ENTRYPOINT;
 
     // Self-recursion-to-loop: if the function contains self-tail-calls
@@ -229,11 +217,6 @@ pub(super) fn compile_function(
 
     if needs_loop {
         out.instruction(&Instruction::End); // end loop
-    }
-
-    // Backtrace: pop frame before implicit return
-    if let Some(bt_pop_idx) = layout.bt_pop_idx {
-        out.instruction(&Instruction::Call(bt_pop_idx));
     }
 
     // Function epilogue: return value (with TCMC linking if active)
@@ -380,9 +363,9 @@ pub(super) fn compile_expr(
     external_indices: &HashMap<Symbol, u32>,
     layout: &CodegenLayout,
     temps: &FunctionTemps,
-    function_ret_type: &Type,
+    _function_ret_type: &Type,
     in_try: bool,
-    is_entrypoint: bool,
+    _is_entrypoint: bool,
     tco_loop: Option<TcoLoop>,
 ) -> Result<(), CodegenError> {
     match expr {
@@ -461,17 +444,9 @@ pub(super) fn compile_expr(
                     emit_numeric_coercion(&atom.typ(), &param.typ, out)?;
                 }
                 if is_tail {
-                    if let Some(bt_pop_idx) = layout.bt_pop_idx {
-                        out.instruction(&Instruction::Call(bt_pop_idx));
-                    }
                     out.instruction(&Instruction::ReturnCall(callee_idx));
                 } else {
                     out.instruction(&Instruction::Call(callee_idx));
-                    // Propagate exception from callee if not in try
-                    // (in try, the stmt-level check after each statement handles it)
-                    if !in_try {
-                        emit_exn_propagate(out, layout, function_ret_type, is_entrypoint);
-                    }
                 }
                 return Ok(());
             }
@@ -508,9 +483,6 @@ pub(super) fn compile_expr(
                 }
 
                 if is_tail {
-                    if let Some(bt_pop_idx) = layout.bt_pop_idx {
-                        out.instruction(&Instruction::Call(bt_pop_idx));
-                    }
                     out.instruction(&Instruction::ReturnCall(callee_idx));
                 } else {
                     out.instruction(&Instruction::Call(callee_idx));
@@ -586,23 +558,15 @@ pub(super) fn compile_expr(
             Ok(())
         }
         LirExpr::Raise { value, .. } => {
-            // Freeze backtrace before raising
-            if let Some(bt_freeze_idx) = layout.bt_freeze_idx {
-                out.instruction(&Instruction::Call(bt_freeze_idx));
-            }
+            let tag_idx = layout
+                .exn_tag_idx
+                .expect("exn_tag_idx must be set for programs with raise");
             compile_atom(value, out, local_map, layout)?;
-            if !matches!(value.typ(), Type::Unit) {
-                out.instruction(&Instruction::GlobalSet(layout.exn_value_global));
-            } else {
+            if matches!(value.typ(), Type::Unit) {
+                // Unit-typed raise: push i64(0) as payload
                 out.instruction(&Instruction::I64Const(0));
-                out.instruction(&Instruction::GlobalSet(layout.exn_value_global));
             }
-            out.instruction(&Instruction::I32Const(1));
-            out.instruction(&Instruction::GlobalSet(layout.exn_flag_global));
-            if !in_try {
-                // Exit the function: trap in entrypoint, return-with-dummy in others
-                emit_exn_bail(out, layout, function_ret_type, is_entrypoint);
-            }
+            out.instruction(&Instruction::Throw(tag_idx));
             Ok(())
         }
         LirExpr::FuncRef { func, .. } => {
@@ -758,50 +722,6 @@ pub(super) fn compile_atom(
         }
         LirAtom::Unit => Ok(()),
     }
-}
-
-/// Emit an early exit for uncaught exceptions.
-/// - In entrypoint (main): trap via Unreachable (uncaught exception = fatal)
-/// - In other functions: return with a dummy value so caller can check the flag
-fn emit_exn_bail(out: &mut Function, layout: &CodegenLayout, ret_type: &Type, is_entrypoint: bool) {
-    if is_entrypoint {
-        out.instruction(&Instruction::Unreachable);
-    } else {
-        if let Some(bt_pop_idx) = layout.bt_pop_idx {
-            out.instruction(&Instruction::Call(bt_pop_idx));
-        }
-        match ret_type {
-            Type::Unit => {}
-            Type::I32 | Type::Bool | Type::Char => {
-                out.instruction(&Instruction::I32Const(0));
-            }
-            Type::F64 => {
-                out.instruction(&Instruction::F64Const(0.0.into()));
-            }
-            Type::F32 => {
-                out.instruction(&Instruction::F32Const(0.0.into()));
-            }
-            _ => {
-                // I64, String, ADTs (all represented as i64)
-                out.instruction(&Instruction::I64Const(0));
-            }
-        }
-        out.instruction(&Instruction::Return);
-    }
-}
-
-/// After a non-tail Call when NOT in a try block: check the global exception
-/// flag and propagate by bailing out if the callee raised.
-fn emit_exn_propagate(
-    out: &mut Function,
-    layout: &CodegenLayout,
-    function_ret_type: &Type,
-    is_entrypoint: bool,
-) {
-    out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
-    out.instruction(&Instruction::If(BlockType::Empty));
-    emit_exn_bail(out, layout, function_ret_type, is_entrypoint);
-    out.instruction(&Instruction::End);
 }
 
 /// Check if a function contains any self-tail-calls (TailCall where func == self.name).

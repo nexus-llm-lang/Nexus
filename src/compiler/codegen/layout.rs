@@ -37,12 +37,9 @@ pub(super) struct CodegenLayout {
     pub(super) heap_base: u32,
     pub(super) conc_spawn_idx: Option<u32>,
     pub(super) conc_join_idx: Option<u32>,
-    pub(super) bt_push_idx: Option<u32>,
-    pub(super) bt_pop_idx: Option<u32>,
-    pub(super) bt_freeze_idx: Option<u32>,
     pub(super) allocate_func_idx: Option<u32>,
-    pub(super) exn_flag_global: u32,
-    pub(super) exn_value_global: u32,
+    /// Exception tag index (WASM EH): defined in tag section, used by throw/try_table
+    pub(super) exn_tag_idx: Option<u32>,
     /// Map from function name to its index in the funcref table
     pub(super) funcref_table_indices: HashMap<Symbol, u32>,
     /// Map from WASM signature key (params+results) to type index for call_indirect
@@ -56,10 +53,6 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
             collect_strings_in_stmt(stmt, &mut string_literals);
         }
         collect_strings_in_atom(&func.ret, &mut string_literals);
-    }
-    // Collect backtrace labels (file:line funcname) for instrumentation
-    for func in &program.functions {
-        string_literals.push(bt_label(func));
     }
 
     let object_heap_enabled = program_uses_object_heap(program);
@@ -104,12 +97,8 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
         heap_base,
         conc_spawn_idx: None,
         conc_join_idx: None,
-        bt_push_idx: None,
-        bt_pop_idx: None,
-        bt_freeze_idx: None,
         allocate_func_idx: None,
-        exn_flag_global: 0,
-        exn_value_global: 0,
+        exn_tag_idx: None,
         funcref_table_indices: HashMap::new(),
         indirect_type_indices: HashMap::new(),
     })
@@ -145,14 +134,6 @@ fn choose_memory_mode(
         Ok(MemoryMode::Defined)
     } else {
         Ok(MemoryMode::None)
-    }
-}
-
-/// Build a backtrace label: "file:line funcname" or just "funcname".
-pub(super) fn bt_label(func: &LirFunction) -> String {
-    match (&func.source_file, func.source_line) {
-        (Some(file), Some(line)) => format!("{}:{} {}", file, line, func.name),
-        _ => func.name.to_string(),
     }
 }
 

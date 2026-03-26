@@ -24,11 +24,12 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          build_func_map, build_local_map, free_func_map, hash_name,
          constructor_tag, record_tag,
          emit_name, emit_section, emit_memarg, emit_memarg_i64, emit_memarg_i8,
-         sec_type, sec_import, sec_function, sec_table, sec_memory, sec_global, sec_export, sec_element, sec_code, sec_data, sec_custom,
-         vt_i32, vt_i64, vt_f64, vt_funcref, bt_void, bt_i32, desc_func, desc_table, desc_memory,
-         heap_global_idx, exn_value_global_idx, exn_flag_global_idx, string_data_base,
+         sec_type, sec_import, sec_function, sec_table, sec_memory, sec_global, sec_export, sec_element, sec_code, sec_data, sec_custom, sec_tag,
+         vt_i32, vt_i64, vt_f64, vt_funcref, bt_void, bt_i32, bt_i64, desc_func, desc_table, desc_memory,
+         heap_global_idx, string_data_base,
+         catch_kind_one,
          op_unreachable, op_block, op_loop, op_if, op_else, op_end, op_br, op_br_if, op_return,
-         op_call, op_call_indirect, op_return_call, op_drop,
+         op_call, op_call_indirect, op_return_call, op_drop, op_throw, op_try_table,
          op_local_get, op_local_set, op_local_tee, op_global_get, op_global_set,
          op_i32_load, op_i64_load, op_i32_load8_u, op_i32_store, op_i64_store, op_i32_store8,
          op_i32_const, op_i64_const, op_f64_const,
@@ -44,12 +45,12 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          op_i32_and, op_i32_or } from "nxc/backend/wasm_defs.nx"
 import { collect_program_strings, build_string_entries, compute_last_string_end,
          program_uses_heap, choose_memory_mode, has_stdlib, align8,
-         collect_local_stmts, LocalResult, program_needs_backtrace,
-         collect_bt_strings } from "nxc/backend/wasm_collect.nx"
+         collect_local_stmts, LocalResult, program_needs_eh } from "nxc/backend/wasm_collect.nx"
 import { build_type_section, build_import_section, build_function_section,
          build_memory_section, build_global_section, build_export_section,
          build_data_section, emit_local_decls,
-         build_table_section, build_element_section, emit_closure_type_entries } from "nxc/backend/wasm_section.nx"
+         build_table_section, build_element_section, emit_closure_type_entries,
+         build_tag_section } from "nxc/backend/wasm_section.nx"
 import * as list from "stdlib/list.nx"
 import { starts_with } from "stdlib/string.nx"
 
@@ -310,7 +311,6 @@ let emit_return_with_tcmc = fn (buf: %ByteBuffer, ret_val: LirAtom, ret_type: Ty
     case NoTcmc ->
       let %buf = emit_atom(atom: ret_val, buf: %buf, ctx: ctx)
       let %buf = emit_coercion(from_type: atom_type(atom: ret_val), to_type: ret_type, buf: %buf)
-      let %buf = emit_bt_pop(buf: %buf, ctx: ctx)
       return push_byte(buf: %buf, byte: op_return)
     case TcmcActive(head_local: hl, prev_local: pl, rest_field_idx: rfi,
                      call_var: _, cons_var: _, call_args: _, ctor_name: _, ctor_args: _, func_name: _, loop_depth: _) ->
@@ -329,7 +329,6 @@ let emit_return_with_tcmc = fn (buf: %ByteBuffer, ret_val: LirAtom, ret_type: Ty
       let %buf = emit_pack_to_i64(typ: atom_type(atom: ret_val), buf: %buf)
       let %buf = push_byte(buf: %buf, byte: op_i64_store)
       let %buf = emit_memarg_i64(buf: %buf, offset: (rfi + 1) * 8)
-      let %buf = emit_bt_pop(buf: %buf, ctx: ctx)
       // Return head
       let %buf = push_byte(buf: %buf, byte: op_local_get)
       let %buf = push_uleb128(buf: %buf, val: hl)
@@ -338,7 +337,6 @@ let emit_return_with_tcmc = fn (buf: %ByteBuffer, ret_val: LirAtom, ret_type: Ty
       // Normal return
       let %buf = emit_atom(atom: ret_val, buf: %buf, ctx: ctx)
       let %buf = emit_coercion(from_type: atom_type(atom: ret_val), to_type: ret_type, buf: %buf)
-      let %buf = emit_bt_pop(buf: %buf, ctx: ctx)
       let %buf = push_byte(buf: %buf, byte: op_return)
       return push_byte(buf: %buf, byte: op_end)
   end
@@ -940,49 +938,6 @@ let emit_external_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], params: 
   end
 end
 
-// ─── Backtrace emission helpers ─────────────────────────────────────────────
-
-let emit_bt_push = fn (buf: %ByteBuffer, ctx: CodegenCtx, func_name: string) -> %ByteBuffer do
-  let idx = lookup_func_fast(name: "__nx_bt_push", map_id: ctx_external_func_map(ctx: ctx))
-  if idx < 0 then
-    return %buf
-  else
-    let packed = lookup_string(value: func_name, entries: ctx_string_lits(ctx: ctx))
-    let packed_val = match packed < 0 do case true -> 0 case false -> packed end
-    let %buf = push_byte(buf: %buf, byte: op_i64_const)
-    let %buf = push_sleb128(buf: %buf, val: packed_val)
-    let %buf = push_byte(buf: %buf, byte: op_call)
-    return push_uleb128(buf: %buf, val: idx)
-  end
-end
-
-let emit_bt_pop = fn (buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
-  let idx = lookup_func_fast(name: "__nx_bt_pop", map_id: ctx_external_func_map(ctx: ctx))
-  if idx < 0 then
-    return %buf
-  else
-    let %buf = push_byte(buf: %buf, byte: op_call)
-    return push_uleb128(buf: %buf, val: idx)
-  end
-end
-
-let emit_bt_freeze = fn (buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
-  let idx = lookup_func_fast(name: "__nx_bt_freeze", map_id: ctx_external_func_map(ctx: ctx))
-  if idx < 0 then
-    return %buf
-  else
-    let %buf = push_byte(buf: %buf, byte: op_call)
-    return push_uleb128(buf: %buf, val: idx)
-  end
-end
-
-let emit_bt_pop_if = fn (buf: %ByteBuffer, ctx: CodegenCtx, cond: bool) -> %ByteBuffer do
-  match cond == false do
-    case true -> %buf
-    case false -> emit_bt_pop(buf: %buf, ctx: ctx)
-  end
-end
-
 // ─── Call emission ──────────────────────────────────────────────────────────
 
 let emit_internal_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
@@ -991,7 +946,6 @@ let emit_internal_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer,
     case Some(val: LirFunction(name: _, params: params, ret_type: _, body: _, ret: _, span: _)) ->
       let %buf = emit_internal_call_args(buf: %buf, args: args, params: params, ctx: ctx)
       let use_tail = is_tail && (in_try == false)
-      let %buf = emit_bt_pop_if(buf: %buf, ctx: ctx, cond: use_tail)
       let call_op = match use_tail do case true -> op_return_call case false -> op_call end
       let %buf = push_byte(buf: %buf, byte: call_op)
       push_uleb128(buf: %buf, val: int_idx)
@@ -1164,47 +1118,16 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       return emit_unpack_from_i64(typ: ftyp, buf: %buf)
 
     case LirExprRaise(value: v, typ: _) ->
-      let %buf = emit_bt_freeze(buf: %buf, ctx: ctx)
       let %buf = emit_atom(atom: v, buf: %buf, ctx: ctx)
-      let %buf = match is_unit(typ: atom_type(atom: v)) == false do
-        case true -> %buf
-        case false ->
-          let %b = push_byte(buf: %buf, byte: op_i64_const)
-          push_sleb128(buf: %b, val: 0)
-      end
-      // Store exception value and flag in GLOBALS (cross-function propagation)
-      let %buf = push_byte(buf: %buf, byte: op_global_set)
-      let %buf = push_uleb128(buf: %buf, val: exn_value_global_idx)
-      let %buf = push_byte(buf: %buf, byte: op_i32_const)
-      let %buf = push_sleb128(buf: %buf, val: 1)
-      let %buf = push_byte(buf: %buf, byte: op_global_set)
-      let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
-      let %buf = match in_try do
+      // Unit-typed raise: push i64(0) as payload
+      let %buf = match is_unit(typ: atom_type(atom: v)) do
         case true ->
-          // Push dummy value so Let's local_set doesn't see empty stack.
-          // The try block's br_if will skip past it.
           let %b = push_byte(buf: %buf, byte: op_i64_const)
           push_sleb128(buf: %b, val: 0)
-        case false ->
-          // Return with exn flag set so caller's try/catch can catch it
-          let frt = ctx_func_ret_type(ctx: ctx)
-          let %b = emit_bt_pop(buf: %buf, ctx: ctx)
-          match is_unit(typ: frt) do
-            case true -> push_byte(buf: %b, byte: op_return)
-            case false ->
-              let vt = type_to_valtype(typ: frt)
-              match vt == vt_i32 do
-                case true ->
-                  let %b = push_byte(buf: %b, byte: op_i32_const)
-                  let %b = push_sleb128(buf: %b, val: 0)
-                  push_byte(buf: %b, byte: op_return)
-                case false ->
-                  let %b = push_byte(buf: %b, byte: op_i64_const)
-                  let %b = push_sleb128(buf: %b, val: 0)
-                  push_byte(buf: %b, byte: op_return)
-              end
-          end
+        case false -> %buf
       end
+      let %buf = push_byte(buf: %buf, byte: op_throw)
+      let %buf = push_uleb128(buf: %buf, val: 0)
       return %buf
 
     case LirExprMakeClosure(func_name: fname, captures: caps, typ: _) ->
@@ -1385,59 +1308,49 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
                           catch_body: cb, catch_ret: cr) ->
       let catch_local_idx = lookup_local(name: cp, entries: ctx_locals(ctx: ctx))
 
-      // Clear global exn_flag
-      let %buf = push_byte(buf: %buf, byte: op_i32_const)
-      let %buf = push_sleb128(buf: %buf, val: 0)
-      let %buf = push_byte(buf: %buf, byte: op_global_set)
-      let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
-
-      // block { body + global exn_flag check after each stmt }
+      // WASM EH: block $skip { block $catch (result i64) { try_table (catch tag0 $catch) { body } end; br 1 } end; catch body } end
+      // Emit block $skip
       let %buf = push_byte(buf: %buf, byte: op_block)
       let %buf = push_byte(buf: %buf, byte: bt_void)
-      let %buf = emit_try_body_stmts(stmts: b, buf: %buf, ctx: ctx, exn_flag: -1)
+      // Emit block $catch (result i64)
+      let %buf = push_byte(buf: %buf, byte: op_block)
+      let %buf = push_byte(buf: %buf, byte: bt_i64)
+      // Emit try_table (catch tag0 label0)
+      let %buf = push_byte(buf: %buf, byte: op_try_table)
+      let %buf = push_byte(buf: %buf, byte: bt_void)
+      let %buf = push_uleb128(buf: %buf, val: 1)
+      let %buf = push_byte(buf: %buf, byte: catch_kind_one)
+      let %buf = push_uleb128(buf: %buf, val: 0)
+      let %buf = push_uleb128(buf: %buf, val: 0)
+
+      // Emit try body
+      let %buf = emit_stmts(stmts: b, buf: %buf, ctx: ctx, in_try: true, tcmc: NoTcmc)
       let %buf = match br do
         case Some(val: a) ->
           let %b = emit_atom(atom: a, buf: %buf, ctx: ctx)
           let %b = emit_coercion(from_type: atom_type(atom: a), to_type: ctx_func_ret_type(ctx: ctx), buf: %b)
-          let %b = emit_bt_pop(buf: %b, ctx: ctx)
           push_byte(buf: %b, byte: op_return)
         case None -> %buf
       end
       let %buf = push_byte(buf: %buf, byte: op_end)
 
-      // if global exn_flag { catch_param = global exn_value; catch_body }
-      let %buf = push_byte(buf: %buf, byte: op_global_get)
-      let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
-      let %buf = push_byte(buf: %buf, byte: op_if)
-      let %buf = push_byte(buf: %buf, byte: bt_void)
-      let %buf = push_byte(buf: %buf, byte: op_global_get)
-      let %buf = push_uleb128(buf: %buf, val: exn_value_global_idx)
+      // Try succeeded — skip catch
+      let %buf = push_byte(buf: %buf, byte: op_br)
+      let %buf = push_uleb128(buf: %buf, val: 1)
+      let %buf = push_byte(buf: %buf, byte: op_end)
+
+      // Catch body — i64 payload on stack from $catch block
       if catch_local_idx >= 0 then
         let %buf = push_byte(buf: %buf, byte: op_local_set)
         let %buf = push_uleb128(buf: %buf, val: catch_local_idx)
       end
-      // Reset global flag
-      let %buf = push_byte(buf: %buf, byte: op_i32_const)
-      let %buf = push_sleb128(buf: %buf, val: 0)
-      let %buf = push_byte(buf: %buf, byte: op_global_set)
-      let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
-
-      if in_try then
-        let %buf = push_byte(buf: %buf, byte: op_block)
-        let %buf = push_byte(buf: %buf, byte: bt_void)
-      end
-      let %buf = emit_try_catch_body_stmts(stmts: cb, buf: %buf, ctx: ctx,
-                                             exn_flag: -1, in_try: in_try)
+      let %buf = emit_stmts(stmts: cb, buf: %buf, ctx: ctx, in_try: in_try, tcmc: NoTcmc)
       let %buf = match cr do
         case Some(val: a) ->
           let %b = emit_atom(atom: a, buf: %buf, ctx: ctx)
           let %b = emit_coercion(from_type: atom_type(atom: a), to_type: ctx_func_ret_type(ctx: ctx), buf: %b)
-          let %b = emit_bt_pop(buf: %b, ctx: ctx)
           push_byte(buf: %b, byte: op_return)
         case None -> %buf
-      end
-      if in_try then
-        let %buf = push_byte(buf: %buf, byte: op_end)
       end
       return push_byte(buf: %buf, byte: op_end)
 
@@ -1541,36 +1454,6 @@ let emit_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: CodegenCtx, in_try
   end
 end
 
-let emit_try_body_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: CodegenCtx, exn_flag: i64) -> %ByteBuffer do
-  match stmts do
-    case [] -> %buf
-    case s :: rest ->
-      let %buf = emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: true, tcmc: NoTcmc)
-      // Check global exn_flag after each statement
-      let %buf = push_byte(buf: %buf, byte: op_global_get)
-      let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
-      let %buf = push_byte(buf: %buf, byte: op_br_if)
-      let %buf = push_uleb128(buf: %buf, val: 0)
-      emit_try_body_stmts(stmts: rest, buf: %buf, ctx: ctx, exn_flag: exn_flag)
-  end
-end
-
-let emit_try_catch_body_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: CodegenCtx,
-                                     exn_flag: i64, in_try: bool) -> %ByteBuffer do
-  match stmts do
-    case [] -> %buf
-    case s :: rest ->
-      let %buf = emit_stmt(stmt: s, buf: %buf, ctx: ctx, in_try: in_try, tcmc: NoTcmc)
-      if in_try then
-        let %buf = push_byte(buf: %buf, byte: op_global_get)
-        let %buf = push_uleb128(buf: %buf, val: exn_flag_global_idx)
-        let %buf = push_byte(buf: %buf, byte: op_br_if)
-        let %buf = push_uleb128(buf: %buf, val: 0)
-      end
-      emit_try_catch_body_stmts(stmts: rest, buf: %buf, ctx: ctx, exn_flag: exn_flag, in_try: in_try)
-  end
-end
-
 // ─── Function body compilation ──────────────────────────────────────────────
 
 let emit_default_for_type = fn (buf: %ByteBuffer, typ: TypeExpr) -> %ByteBuffer do
@@ -1613,7 +1496,6 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuff
   let LirFunction(name: fname, params: ps, ret_type: rt, body: b, ret: r, span: _) = func
   let %body = empty()
   let %body = emit_local_decls(buf: %body, locals: ctx_locals(ctx: ctx), param_count: list.length(xs: ps))
-  let %body = emit_bt_push(buf: %body, ctx: ctx, func_name: fname)
 
   // TCMC: detect pattern and set up locals
   let tcmc_raw = detect_tcmc(body: b, func_name: fname)
@@ -1644,7 +1526,6 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuff
   end
 
   let %body = emit_return_value(body: %body, rt: rt, r: r, ctx: ctx)
-  let %body = emit_bt_pop(buf: %body, ctx: ctx)
   push_byte(buf: %body, byte: op_end)
 end
 
@@ -1868,21 +1749,6 @@ let emit_external_name_entries = fn (buf: %ByteBuffer, exts: [LirExternal], idx:
   end
 end
 
-/// Conditionally emit backtrace import name entries
-let maybe_emit_bt_name_entries = fn (buf: %ByteBuffer, has_bt: bool, idx: i64) -> %ByteBuffer do
-  match has_bt do
-    case true ->
-      let %buf = push_uleb128(buf: %buf, val: idx)
-      let %buf = emit_name(buf: %buf, name: "__nx_bt_push")
-      let %buf = push_uleb128(buf: %buf, val: idx + 1)
-      let %buf = emit_name(buf: %buf, name: "__nx_bt_pop")
-      let %buf = push_uleb128(buf: %buf, val: idx + 2)
-      let %buf = emit_name(buf: %buf, name: "__nx_bt_freeze")
-      return %buf
-    case false -> return %buf
-  end
-end
-
 /// Build name subsection entries for internal functions
 let emit_internal_name_entries = fn (buf: %ByteBuffer, funcs: [LirFunction], idx: i64) -> %ByteBuffer do
   match funcs do
@@ -1895,19 +1761,18 @@ let emit_internal_name_entries = fn (buf: %ByteBuffer, funcs: [LirFunction], idx
 end
 
 /// Build the WASM name custom section payload (section name + function subsection)
-let build_name_section = fn (exts: [LirExternal], funcs: [LirFunction], has_bt: bool,
+let build_name_section = fn (exts: [LirExternal], funcs: [LirFunction],
                               has_alloc: bool,
-                              n_exts: i64, n_bt_imports: i64, n_alloc_imports: i64,
+                              n_exts: i64, n_alloc_imports: i64,
                               total_funcs: i64) -> %ByteBuffer do
   let %entries = empty()
   let %entries = push_uleb128(buf: %entries, val: total_funcs)
   let %entries = emit_external_name_entries(buf: %entries, exts: exts, idx: 0)
-  let %entries = maybe_emit_bt_name_entries(buf: %entries, has_bt: has_bt, idx: n_exts)
   if has_alloc then
-    let %entries = push_uleb128(buf: %entries, val: n_exts + n_bt_imports)
+    let %entries = push_uleb128(buf: %entries, val: n_exts)
     let %entries = emit_name(buf: %entries, name: "allocate")
   end
-  let internal_start = n_exts + n_bt_imports + n_alloc_imports
+  let internal_start = n_exts + n_alloc_imports
   let %entries = emit_internal_name_entries(buf: %entries, funcs: funcs, idx: internal_start)
   let wasi_idx = total_funcs - 1
   let %entries = push_uleb128(buf: %entries, val: wasi_idx)
@@ -1942,7 +1807,7 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
 
       let n_exts = list.length(xs: exts)
       let n_funcs = list.length(xs: funcs)
-      let has_bt = program_needs_backtrace(funcs: funcs)
+      let has_eh = program_needs_eh(funcs: funcs)
       let heap_enabled = program_uses_heap(funcs: funcs)
       let uses_stdlib = has_stdlib(externals: exts)
       // alloc_mode: 0=none, 1=bump allocator, 2=stdlib allocate
@@ -1950,28 +1815,15 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
         case false -> 0
         case true -> match uses_stdlib do case true -> 2 case false -> 1 end
       end
-      let n_bt_imports = match has_bt do case true -> 3 case false -> 0 end
       let n_alloc_imports = match alloc_mode == 2 do case true -> 1 case false -> 0 end
-      let import_count = n_exts + n_bt_imports + n_alloc_imports
+      let import_count = n_exts + n_alloc_imports
 
       let internal_funcs = build_internal_func_entries(funcs: funcs, import_count: import_count, idx: 0)
       let base_external_funcs = build_external_func_entries(exts: exts, idx: 0)
-      // Add bt imports + allocate import to external_funcs for lookup
-      let external_funcs = match has_bt do
-        case true ->
-          let bt_funcs = FuncEntry(name: "__nx_bt_push", index: n_exts)
-            :: FuncEntry(name: "__nx_bt_pop", index: n_exts + 1)
-            :: FuncEntry(name: "__nx_bt_freeze", index: n_exts + 2)
-            :: base_external_funcs
-          match alloc_mode == 2 do
-            case true -> FuncEntry(name: "__nx_allocate", index: n_exts + 3) :: bt_funcs
-            case false -> bt_funcs
-          end
-        case false ->
-          match alloc_mode == 2 do
-            case true -> FuncEntry(name: "__nx_allocate", index: n_exts + n_bt_imports) :: base_external_funcs
-            case false -> base_external_funcs
-          end
+      // Add allocate import to external_funcs for lookup
+      let external_funcs = match alloc_mode == 2 do
+        case true -> FuncEntry(name: "__nx_allocate", index: n_exts) :: base_external_funcs
+        case false -> base_external_funcs
       end
 
       // Build hash maps for O(1) function lookup
@@ -1983,8 +1835,9 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
       let n_closures = list.length(xs: closure_table)
       let closure_arities = collect_closure_arities(funcs: funcs)
       let n_closure_types = list.length(xs: closure_arities)
-      // Closure type indices start after all ext + func + wasi_run + bt + alloc types
-      let closure_type_base = n_exts + n_funcs + 1 + match has_bt do case true -> 2 case false -> 0 end + n_alloc_imports
+      // Closure type indices start after all ext + func + wasi_run + eh_tag + alloc types
+      let n_eh_types = match has_eh do case true -> 1 case false -> 0 end
+      let closure_type_base = n_exts + n_funcs + 1 + n_eh_types + n_alloc_imports
 
       let main_idx = lookup_func_fast(name: "main", map_id: internal_func_map)
       let main_ret = match find_function(name: "main", funcs: funcs) do
@@ -1992,11 +1845,7 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
         case None -> TyUnit
       end
 
-      let base_strings = collect_program_strings(funcs: funcs, acc: [])
-      let all_strings = match has_bt do
-        case true -> collect_bt_strings(funcs: funcs, acc: base_strings)
-        case false -> base_strings
-      end
+      let all_strings = collect_program_strings(funcs: funcs, acc: [])
       let string_entries = build_string_entries(strings: all_strings, next_offset: string_data_base, acc: [])
       let has_strings = list.length(xs: string_entries) > 0
 
@@ -2025,23 +1874,19 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
       let %m = push_byte(buf: %m, byte: 0)
       let %m = push_byte(buf: %m, byte: 0)
 
-      // Type section (with backtrace + allocate + closure call types appended)
+      // Type section (with EH tag + allocate + closure call types appended)
       let has_alloc = alloc_mode == 2
-      let %type_sec = build_type_section(program: augmented_program, has_bt: has_bt, has_alloc: has_alloc, n_closure_types: n_closure_types)
+      let %type_sec = build_type_section(program: augmented_program, has_eh: has_eh, has_alloc: has_alloc, n_closure_types: n_closure_types)
       if n_closure_types > 0 then
         let %type_sec = emit_closure_type_entries(buf: %type_sec, arities: closure_arities)
       end
       let %m = emit_section(buf: %m, id: sec_type, content: %type_sec)
 
       // Import section
-      if n_exts > 0 || (mem_mode != "none" && mem_mode != "defined") || has_bt || has_alloc then
-        let bt_push_type_idx = n_exts + n_funcs + 1
-        let bt_void_type_idx = n_exts + n_funcs + 2
-        let alloc_type_idx = n_exts + n_funcs + 1 + match has_bt do case true -> 2 case false -> 0 end
+      if n_exts > 0 || (mem_mode != "none" && mem_mode != "defined") || has_alloc then
+        let alloc_type_idx = n_exts + n_funcs + 1 + n_eh_types
         let %m = emit_section(buf: %m, id: sec_import,
                                content: build_import_section(exts: exts, mem_mode: mem_mode,
-                                 has_bt: has_bt, bt_push_type_idx: bt_push_type_idx,
-                                 bt_void_type_idx: bt_void_type_idx,
                                  has_alloc: has_alloc, alloc_type_idx: alloc_type_idx,
                                  alloc_module: mem_mode))
       end
@@ -2074,6 +1919,12 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
         let %m = emit_section(buf: %m, id: sec_element, content: build_element_section(closure_entries: closure_table))
       end
 
+      // Tag section (WASM EH)
+      if has_eh then
+        let exn_tag_type_idx = n_exts + n_funcs + 1
+        let %m = emit_section(buf: %m, id: sec_tag, content: build_tag_section(exn_tag_type_idx: exn_tag_type_idx))
+      end
+
       // Code section
       // Build closure_type_indices: map arity → type section index
       let closure_type_idx_list = build_closure_type_idx_list(arities: closure_arities, base: closure_type_base)
@@ -2095,9 +1946,9 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
 
       // Name section (custom)
       let total_named_funcs = import_count + n_funcs + 1
-      let %name_payload = build_name_section(exts: exts, funcs: funcs, has_bt: has_bt,
+      let %name_payload = build_name_section(exts: exts, funcs: funcs,
                                               has_alloc: has_alloc,
-                                              n_exts: n_exts, n_bt_imports: n_bt_imports,
+                                              n_exts: n_exts,
                                               n_alloc_imports: n_alloc_imports,
                                               total_funcs: total_named_funcs)
       let name_payload_len = buf_length(buf: &name_payload)

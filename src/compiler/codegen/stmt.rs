@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use wasm_encoder::{BlockType, Function, Instruction, MemArg};
+use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 use crate::intern::Symbol;
 use crate::ir::lir::{LirExpr, LirProgram, LirStmt, SwitchCase};
@@ -39,9 +39,6 @@ fn emit_return_with_tcmc(
             out.instruction(&Instruction::I64Store(memarg(
                 ((tcmc.rest_field_idx + 1) * 8) as u64,
             )));
-            if let Some(bt_pop_idx) = layout.bt_pop_idx {
-                out.instruction(&Instruction::Call(bt_pop_idx));
-            }
             // Return head of built list
             out.instruction(&Instruction::LocalGet(tcmc.head_local));
             out.instruction(&Instruction::Return);
@@ -51,9 +48,6 @@ fn emit_return_with_tcmc(
             // No TCMC iterations: return original value
             compile_atom(ret_val, out, local_map, layout)?;
             emit_numeric_coercion(&ret_val.typ(), ret_type, out)?;
-            if let Some(bt_pop_idx) = layout.bt_pop_idx {
-                out.instruction(&Instruction::Call(bt_pop_idx));
-            }
             out.instruction(&Instruction::Return);
         }
         out.instruction(&Instruction::End);
@@ -61,9 +55,6 @@ fn emit_return_with_tcmc(
         // Normal return
         compile_atom(ret_val, out, local_map, layout)?;
         emit_numeric_coercion(&ret_val.typ(), ret_type, out)?;
-        if let Some(bt_pop_idx) = layout.bt_pop_idx {
-            out.instruction(&Instruction::Call(bt_pop_idx));
-        }
         out.instruction(&Instruction::Return);
     }
     Ok(())
@@ -249,7 +240,32 @@ pub(super) fn compile_stmt(
             catch_body,
             catch_ret,
         } => {
-            // Disable TCO and TCMC inside try-catch
+            // WASM EH: try_table with catch tag → branch to catch block
+            // Structure:
+            //   block $catch (result i64)     ;; catch landing — receives payload
+            //     try_table (catch $exn_tag $catch)
+            //       <try body>
+            //     end
+            //     <fall-through: try body succeeded, skip catch>
+            //     br $skip                    ;; jump past catch block
+            //   end                           ;; $catch — exception payload on stack
+            //   <catch body>
+            //
+            // We use block nesting:
+            //   block $skip                   ;; label 1 — skip catch
+            //     block $catch (result i64)   ;; label 0 — catch landing
+            //       try_table (catch $tag 0)
+            //         <try body>
+            //       end
+            //       br 1                      ;; try succeeded, skip to after catch
+            //     end
+            //     ;; caught: i64 payload on stack
+            //     local.set catch_param
+            //     <catch body>
+            //   end
+            let tag_idx = layout
+                .exn_tag_idx
+                .expect("exn_tag_idx must be set for programs with try/catch");
             let catch_local =
                 local_map
                     .get(catch_param)
@@ -257,10 +273,17 @@ pub(super) fn compile_stmt(
                         name: catch_param.to_string(),
                     })?;
 
-            out.instruction(&Instruction::I32Const(0));
-            out.instruction(&Instruction::GlobalSet(layout.exn_flag_global));
-
+            // block $skip
             out.instruction(&Instruction::Block(BlockType::Empty));
+            // block $catch (result i64) — catch label delivers payload
+            out.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
+            // try_table (catch $exn_tag 0) — branch to $catch with i64
+            out.instruction(&Instruction::TryTable(
+                BlockType::Empty,
+                Cow::Owned(vec![wasm_encoder::Catch::One { tag: tag_idx, label: 0 }]),
+            ));
+
+            // Try body — TCO/TCMC disabled inside try
             for nested in body {
                 compile_stmt(
                     nested,
@@ -275,26 +298,18 @@ pub(super) fn compile_stmt(
                     true,
                     is_entrypoint,
                     None,
-                    None, // TCO + TCMC disabled in try body
+                    None,
                 )?;
-                out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
-                out.instruction(&Instruction::BrIf(0));
             }
             if let Some(ret) = body_ret {
                 emit_return_with_tcmc(ret, function_ret_type, out, local_map, layout, None)?;
             }
-            out.instruction(&Instruction::End);
+            out.instruction(&Instruction::End); // end try_table
+            out.instruction(&Instruction::Br(1)); // try succeeded → skip catch
+            out.instruction(&Instruction::End); // end block $catch
 
-            out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
-            out.instruction(&Instruction::If(BlockType::Empty));
-            out.instruction(&Instruction::GlobalGet(layout.exn_value_global));
+            // Catch body — exception payload (i64) is on the stack
             out.instruction(&Instruction::LocalSet(catch_local.index));
-            out.instruction(&Instruction::I32Const(0));
-            out.instruction(&Instruction::GlobalSet(layout.exn_flag_global));
-
-            if in_try {
-                out.instruction(&Instruction::Block(BlockType::Empty));
-            }
             for nested in catch_body {
                 compile_stmt(
                     nested,
@@ -309,20 +324,13 @@ pub(super) fn compile_stmt(
                     in_try,
                     is_entrypoint,
                     None,
-                    None, // TCO + TCMC disabled in catch body
+                    None,
                 )?;
-                if in_try {
-                    out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
-                    out.instruction(&Instruction::BrIf(0));
-                }
             }
             if let Some(ret) = catch_ret {
                 emit_return_with_tcmc(ret, function_ret_type, out, local_map, layout, None)?;
             }
-            if in_try {
-                out.instruction(&Instruction::End);
-            }
-            out.instruction(&Instruction::End);
+            out.instruction(&Instruction::End); // end block $skip
             Ok(())
         }
         LirStmt::Conc { tasks } => {
