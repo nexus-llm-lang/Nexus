@@ -120,10 +120,16 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         let params = external_param_types(ext)?;
         let results = external_return_types(ext)?;
         let key = sig_key(&params, &results);
-        types.ty().function(params, results);
-        sig_to_type_idx.entry(key).or_insert(next_type_index);
-        external_type_indices.push(next_type_index);
-        next_type_index += 1;
+        let type_idx = if let Some(&existing) = sig_to_type_idx.get(&key) {
+            existing
+        } else {
+            types.ty().function(params, results);
+            sig_to_type_idx.insert(key, next_type_index);
+            let idx = next_type_index;
+            next_type_index += 1;
+            idx
+        };
+        external_type_indices.push(type_idx);
     }
 
     let mut conc_spawn_type_idx = 0;
@@ -163,14 +169,27 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
             .collect::<Result<Vec<_>, _>>()?;
         let results = return_type_to_wasm_result(&func.ret_type)?;
         let key = sig_key(&params, &results);
-        types.ty().function(params, results);
-        sig_to_type_idx.entry(key).or_insert(next_type_index);
-        internal_type_indices.push(next_type_index);
-        next_type_index += 1;
+        let type_idx = if let Some(&existing) = sig_to_type_idx.get(&key) {
+            existing
+        } else {
+            types.ty().function(params, results);
+            sig_to_type_idx.insert(key, next_type_index);
+            let idx = next_type_index;
+            next_type_index += 1;
+            idx
+        };
+        internal_type_indices.push(type_idx);
     }
-    let wasi_cli_run_type_index = next_type_index;
-    types.ty().function([], [ValType::I32]);
-    next_type_index += 1;
+    let wasi_key = sig_key(&[], &[ValType::I32]);
+    let wasi_cli_run_type_index = if let Some(&existing) = sig_to_type_idx.get(&wasi_key) {
+        existing
+    } else {
+        types.ty().function([], [ValType::I32]);
+        sig_to_type_idx.insert(wasi_key, next_type_index);
+        let idx = next_type_index;
+        next_type_index += 1;
+        idx
+    };
 
     // Add type signatures for indirect call Arrow types
     for arrow in &indirect_call_types {
