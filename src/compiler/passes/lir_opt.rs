@@ -1304,6 +1304,14 @@ fn collect_funcref_bindings(stmts: &[LirStmt], map: &mut HashMap<Symbol, Symbol>
             } => {
                 map.insert(*name, *func);
             }
+            // Empty-capture Closure is effectively a FuncRef
+            LirStmt::Let {
+                name,
+                expr: LirExpr::Closure { func, captures, .. },
+                ..
+            } if captures.is_empty() => {
+                map.insert(*name, *func);
+            }
             LirStmt::If {
                 then_body,
                 else_body,
@@ -1357,9 +1365,14 @@ fn devirtualize_calls_in_stmts(stmts: &mut [LirStmt], funcref_map: &HashMap<Symb
                 } = expr
                 {
                     if let Some(&target_func) = funcref_map.get(name) {
+                        // All funcref targets have __env as first param (closure convention).
+                        // Add a dummy __env arg (Int(0), never used for non-capturing closures).
+                        let env_sym = Symbol::intern("__env");
+                        let mut new_args = vec![(env_sym, LirAtom::Int(0))];
+                        new_args.append(&mut std::mem::take(args));
                         *expr = LirExpr::Call {
                             func: target_func,
-                            args: std::mem::take(args),
+                            args: new_args,
                             typ: typ.clone(),
                         };
                         count += 1;
