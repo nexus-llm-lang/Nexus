@@ -424,11 +424,11 @@ pub(super) fn compile_expr(
                         // Pop into params in reverse order (WASM stack is LIFO)
                         // This ensures atomic read-before-write for swaps like (a: b, b: a)
                         for param in callee.params.iter().rev() {
-                            let local = local_map
-                                .get(&param.name)
-                                .ok_or_else(|| CodegenError::ConflictingLocalTypes {
+                            let local = local_map.get(&param.name).ok_or_else(|| {
+                                CodegenError::ConflictingLocalTypes {
                                     name: param.name.to_string(),
-                                })?;
+                                }
+                            })?;
                             out.instruction(&Instruction::LocalSet(local.index));
                         }
                         // No bt_pop — we stay in the same function frame
@@ -811,9 +811,7 @@ fn has_self_tail_call(func: &LirFunction) -> bool {
 }
 
 fn stmts_have_self_tail_call(stmts: &[LirStmt], self_name: &Symbol) -> bool {
-    stmts
-        .iter()
-        .any(|s| stmt_has_self_tail_call(s, self_name))
+    stmts.iter().any(|s| stmt_has_self_tail_call(s, self_name))
 }
 
 fn stmt_has_self_tail_call(stmt: &LirStmt, self_name: &Symbol) -> bool {
@@ -848,7 +846,9 @@ fn stmt_has_self_tail_call(stmt: &LirStmt, self_name: &Symbol) -> bool {
                 .any(|c| stmts_have_self_tail_call(&c.body, self_name))
                 || stmts_have_self_tail_call(default_body, self_name)
         }
-        LirStmt::Loop { cond_stmts, body, .. } => {
+        LirStmt::Loop {
+            cond_stmts, body, ..
+        } => {
             stmts_have_self_tail_call(cond_stmts, self_name)
                 || stmts_have_self_tail_call(body, self_name)
         }
@@ -887,9 +887,10 @@ fn find_tcmc_in_stmts(stmts: &[LirStmt], self_name: &Symbol) -> Option<TcmcPreIn
                     ..
                 } = &stmts[i + 1]
                 {
-                    if let Some(rest_idx) = ctor_args.iter().position(|a| {
-                        matches!(a, LirAtom::Var { name, .. } if name == call_name)
-                    }) {
+                    if let Some(rest_idx) = ctor_args
+                        .iter()
+                        .position(|a| matches!(a, LirAtom::Var { name, .. } if name == call_name))
+                    {
                         let non_rec_fields: Vec<(usize, LirAtom)> = ctor_args
                             .iter()
                             .enumerate()
@@ -1029,11 +1030,12 @@ pub(super) fn emit_tcmc_cons_and_loop(
         }
         // Pop into params in reverse order
         for param in callee.params.iter().rev() {
-            let local = local_map
-                .get(&param.name)
-                .ok_or_else(|| CodegenError::ConflictingLocalTypes {
-                    name: param.name.to_string(),
-                })?;
+            let local =
+                local_map
+                    .get(&param.name)
+                    .ok_or_else(|| CodegenError::ConflictingLocalTypes {
+                        name: param.name.to_string(),
+                    })?;
             out.instruction(&Instruction::LocalSet(local.index));
         }
         out.instruction(&Instruction::Br(tco.loop_depth));
