@@ -32,6 +32,8 @@ fn optimize_function(func: &mut LirFunction) {
     recognize_switches_in_stmts(&mut func.body);
     // 1.5. Known-call devirtualization: FuncRef(f) + CallIndirect → Call(f)
     devirtualize_known_calls(&mut func.body);
+    // 1.6. LICM: hoist loop-invariant let bindings out of loops
+    hoist_loop_invariants(&mut func.body);
     // 2. Constant folding: Binary(Lit, op, Lit) → Atom(Lit)
     constant_fold_stmts(&mut func.body);
     // 3. Copy propagation: Let x = Atom(y) → substitute y for x
@@ -1025,6 +1027,181 @@ fn strip_unreachable_stmts(stmts: &mut Vec<LirStmt>) {
             }
             LirStmt::Let { .. } | LirStmt::Conc { .. } => {}
         }
+    }
+}
+
+// ─── Loop Invariant Code Motion (LICM) ──────────────────────────────────────
+
+/// Hoist loop-invariant let bindings out of Loop statements.
+/// A let binding is loop-invariant if its expression doesn't reference any
+/// variable defined inside the loop and has no side effects.
+fn hoist_loop_invariants(stmts: &mut Vec<LirStmt>) {
+    let mut i = 0;
+    while i < stmts.len() {
+        // Recurse into nested bodies first
+        match &mut stmts[i] {
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            }
+            | LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                hoist_loop_invariants(then_body);
+                hoist_loop_invariants(else_body);
+            }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                hoist_loop_invariants(body);
+                hoist_loop_invariants(catch_body);
+            }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for case in cases {
+                    hoist_loop_invariants(&mut case.body);
+                }
+                hoist_loop_invariants(default_body);
+            }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                // Recurse into nested loops first
+                hoist_loop_invariants(cond_stmts);
+                hoist_loop_invariants(body);
+
+                // Collect all variables defined inside the loop
+                let mut loop_defs = HashSet::new();
+                collect_defined_vars(cond_stmts, &mut loop_defs);
+                collect_defined_vars(body, &mut loop_defs);
+
+                // Extract invariant lets from cond_stmts
+                let hoisted = extract_invariant_lets(cond_stmts, &loop_defs);
+
+                // Insert hoisted lets before the Loop statement
+                if !hoisted.is_empty() {
+                    let n = hoisted.len();
+                    stmts.splice(i..i, hoisted);
+                    i += n; // skip past hoisted stmts to reach the Loop
+                }
+            }
+            LirStmt::Let { .. } | LirStmt::Conc { .. } => {}
+        }
+        i += 1;
+    }
+}
+
+/// Collect all variable names defined by Let bindings in the given stmts.
+fn collect_defined_vars(stmts: &[LirStmt], defs: &mut HashSet<Symbol>) {
+    for stmt in stmts {
+        match stmt {
+            LirStmt::Let { name, .. } => {
+                defs.insert(*name);
+            }
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            }
+            | LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_defined_vars(then_body, defs);
+                collect_defined_vars(else_body, defs);
+            }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                collect_defined_vars(body, defs);
+                collect_defined_vars(catch_body, defs);
+            }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                collect_defined_vars(cond_stmts, defs);
+                collect_defined_vars(body, defs);
+            }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for case in cases {
+                    collect_defined_vars(&case.body, defs);
+                }
+                collect_defined_vars(default_body, defs);
+            }
+            LirStmt::Conc { .. } => {}
+        }
+    }
+}
+
+/// Extract let bindings that are loop-invariant from the front of a stmt list.
+/// A let is invariant if:
+/// - Its expression has no side effects
+/// - Its expression doesn't reference any variable in `loop_defs`
+/// Stops at the first non-invariant let or non-let statement.
+fn extract_invariant_lets(
+    stmts: &mut Vec<LirStmt>,
+    loop_defs: &HashSet<Symbol>,
+) -> Vec<LirStmt> {
+    let mut hoisted = Vec::new();
+    while !stmts.is_empty() {
+        let is_invariant = if let LirStmt::Let { expr, .. } = &stmts[0] {
+            !expr_has_side_effects(expr) && !expr_references_any(expr, loop_defs)
+        } else {
+            false
+        };
+        if is_invariant {
+            hoisted.push(stmts.remove(0));
+        } else {
+            break;
+        }
+    }
+    hoisted
+}
+
+/// Check if an expression references any variable in the given set.
+fn expr_references_any(expr: &LirExpr, vars: &HashSet<Symbol>) -> bool {
+    match expr {
+        LirExpr::Atom(a) => atom_references_any(a, vars),
+        LirExpr::Binary { lhs, rhs, .. } => {
+            atom_references_any(lhs, vars) || atom_references_any(rhs, vars)
+        }
+        LirExpr::Call { args, .. } | LirExpr::TailCall { args, .. } => {
+            args.iter().any(|(_, a)| atom_references_any(a, vars))
+        }
+        LirExpr::Constructor { args, .. } => args.iter().any(|a| atom_references_any(a, vars)),
+        LirExpr::Record { fields, .. } => {
+            fields.iter().any(|(_, a)| atom_references_any(a, vars))
+        }
+        LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } => {
+            atom_references_any(value, vars)
+        }
+        LirExpr::Raise { value, .. } => atom_references_any(value, vars),
+        LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => false,
+        LirExpr::Closure { captures, .. } => {
+            captures.iter().any(|(_, a)| atom_references_any(a, vars))
+        }
+        LirExpr::CallIndirect { callee, args, .. } => {
+            atom_references_any(callee, vars) || args.iter().any(|(_, a)| atom_references_any(a, vars))
+        }
+    }
+}
+
+fn atom_references_any(atom: &LirAtom, vars: &HashSet<Symbol>) -> bool {
+    if let LirAtom::Var { name, .. } = atom {
+        vars.contains(name)
+    } else {
+        false
     }
 }
 
