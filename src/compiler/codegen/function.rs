@@ -137,7 +137,8 @@ pub(super) fn compile_function(
     ]);
 
     // TCMC: detect tail-call-modulo-constructor pattern and allocate extra locals
-    let tcmc_pre = detect_tcmc(func);
+    // TODO: TCMC disabled pending runtime bug fix (bootstrap crash)
+    let tcmc_pre: Option<TcmcPreInfo> = None; // detect_tcmc(func);
     let tcmc_info = tcmc_pre.map(|pre| {
         let head_idx = next_local_index + 13; // after FunctionTemps (13 slots)
         let prev_idx = next_local_index + 14;

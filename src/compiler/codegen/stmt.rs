@@ -372,8 +372,17 @@ pub(super) fn compile_stmt(
                     layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
                 )
             } else {
-                compile_switch_linear(
-                    tag, cases, default_body, default_ret, ret_type,
+                // Sort cases by tag for binary search dispatch (O(log N))
+                let mut sorted: Vec<usize> = (0..cases.len()).collect();
+                sorted.sort_by_key(|&i| cases[i].tag_value);
+                compile_switch_bsearch(
+                    tag, cases, &sorted, default_body, default_ret, ret_type,
+                    out, local_map, program, internal_indices, external_indices,
+                    layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
+                )?;
+                // Default body: reached when no case matched (all cases return)
+                emit_switch_default(
+                    default_body, default_ret, ret_type,
                     out, local_map, program, internal_indices, external_indices,
                     layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
                 )
@@ -406,11 +415,19 @@ fn check_dense_tags(cases: &[SwitchCase]) -> Option<(i64, usize)> {
     }
 }
 
-/// Compile Switch as a linear if-else chain (fallback when tags are sparse).
+
+/// Compile Switch using binary search for O(log N) dispatch (sparse tags).
+///
+/// Recursively partitions sorted cases at the midpoint, emitting
+/// `if (tag < pivot) { left-half } else { right-half }` at each level.
+/// Leaf partitions (≤ 3 cases) use linear if-equals checks.
+/// All matched cases return from the function; non-matching paths fall
+/// through to the default body emitted by the top-level caller.
 #[allow(clippy::too_many_arguments)]
-fn compile_switch_linear(
+fn compile_switch_bsearch(
     tag: &crate::ir::lir::LirAtom,
     cases: &[SwitchCase],
+    sorted: &[usize], // indices into `cases`, sorted by tag_value
     default_body: &[LirStmt],
     default_ret: &Option<crate::ir::lir::LirAtom>,
     ret_type: &Type,
@@ -427,23 +444,78 @@ fn compile_switch_linear(
     tco_loop: Option<TcoLoop>,
     tcmc: Option<&TcmcInfo>,
 ) -> Result<(), CodegenError> {
-    let case_tco = tco_loop.map(|t| t.deeper(1));
-    for case in cases {
-        compile_atom(tag, out, local_map, layout)?;
-        out.instruction(&Instruction::I64Const(case.tag_value));
-        out.instruction(&Instruction::I64Eq);
-        out.instruction(&Instruction::If(BlockType::Empty));
-        for nested in &case.body {
-            compile_stmt(
-                nested, out, local_map, program, internal_indices, external_indices,
-                layout, temps, function_ret_type, in_try, is_entrypoint, case_tco, tcmc,
-            )?;
+    if sorted.len() <= 3 {
+        // Leaf: linear scan on small partition
+        let case_tco = tco_loop.map(|t| t.deeper(1));
+        for &idx in sorted {
+            compile_atom(tag, out, local_map, layout)?;
+            out.instruction(&Instruction::I64Const(cases[idx].tag_value));
+            out.instruction(&Instruction::I64Eq);
+            out.instruction(&Instruction::If(BlockType::Empty));
+            for nested in &cases[idx].body {
+                compile_stmt(
+                    nested, out, local_map, program, internal_indices, external_indices,
+                    layout, temps, function_ret_type, in_try, is_entrypoint, case_tco, tcmc,
+                )?;
+            }
+            if let Some(ret) = &cases[idx].ret {
+                emit_return_with_tcmc(ret, ret_type, out, local_map, layout, tcmc)?;
+            }
+            out.instruction(&Instruction::End);
         }
-        if let Some(ret) = &case.ret {
-            emit_return_with_tcmc(ret, ret_type, out, local_map, layout, tcmc)?;
-        }
-        out.instruction(&Instruction::End);
+        return Ok(());
     }
+
+    // Binary partition: split at midpoint
+    let mid = sorted.len() / 2;
+    let pivot = cases[sorted[mid]].tag_value;
+
+    // if (tag < pivot)
+    compile_atom(tag, out, local_map, layout)?;
+    out.instruction(&Instruction::I64Const(pivot));
+    out.instruction(&Instruction::I64LtS);
+    out.instruction(&Instruction::If(BlockType::Empty));
+
+    // Left half: sorted[..mid]
+    compile_switch_bsearch(
+        tag, cases, &sorted[..mid], default_body, default_ret, ret_type,
+        out, local_map, program, internal_indices, external_indices,
+        layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
+    )?;
+
+    out.instruction(&Instruction::Else);
+
+    // Right half: sorted[mid..]
+    compile_switch_bsearch(
+        tag, cases, &sorted[mid..], default_body, default_ret, ret_type,
+        out, local_map, program, internal_indices, external_indices,
+        layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
+    )?;
+
+    out.instruction(&Instruction::End);
+
+    Ok(())
+}
+
+/// Emit the default body after binary-search dispatch.
+/// Called by the top-level Switch handler — not by compile_switch_bsearch itself.
+fn emit_switch_default(
+    default_body: &[LirStmt],
+    default_ret: &Option<crate::ir::lir::LirAtom>,
+    ret_type: &Type,
+    out: &mut Function,
+    local_map: &HashMap<Symbol, LocalInfo>,
+    program: &LirProgram,
+    internal_indices: &HashMap<Symbol, u32>,
+    external_indices: &HashMap<Symbol, u32>,
+    layout: &CodegenLayout,
+    temps: &FunctionTemps,
+    function_ret_type: &Type,
+    in_try: bool,
+    is_entrypoint: bool,
+    tco_loop: Option<TcoLoop>,
+    tcmc: Option<&TcmcInfo>,
+) -> Result<(), CodegenError> {
     for nested in default_body {
         compile_stmt(
             nested, out, local_map, program, internal_indices, external_indices,
