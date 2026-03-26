@@ -92,7 +92,11 @@ pub fn encode_core_wasm_as_component(
 }
 
 fn validate_main_export(core_wasm: &[u8]) -> Result<(), String> {
-    let engine = Engine::default();
+    let mut config = wasmtime::Config::new();
+    config.wasm_tail_call(true);
+    config.wasm_exceptions(true);
+    let engine = Engine::new(&config)
+        .map_err(|e| format!("failed to create engine: {}", e))?;
     let module = Module::from_binary(&engine, core_wasm)
         .map_err(|e| format!("failed to inspect core wasm module: {}", e))?;
 
