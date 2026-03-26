@@ -218,11 +218,16 @@ fn can_convert_to_switch(
         match current {
             LirStmt::IfReturn {
                 cond,
+                then_ret,
                 else_body,
                 else_ret,
                 ..
             } => {
                 if else_ret.is_some() {
+                    return false;
+                }
+                // Require all cases to return (binary search dispatch needs it)
+                if then_ret.is_none() {
                     return false;
                 }
                 match cond {
