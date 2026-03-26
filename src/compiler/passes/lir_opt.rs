@@ -2,9 +2,11 @@
 //!
 //! Runs between LIR lowering and WASM codegen:
 //! 1. Switch recognition: convert IfReturn chains (from match lowering) to Switch nodes
-//! 2. Constant folding: evaluate Binary(Lit, op, Lit) at compile time
-//! 3. Copy propagation: replace Let x = Atom(y) by substituting y for x everywhere
-//! 4. Dead let elimination: remove Let with unused result and no side effects
+//! 2. Known-call devirtualization: replace CallIndirect(FuncRef(f), args) with Call(f, args)
+//! 3. Constant folding: evaluate Binary(Lit, op, Lit) at compile time
+//! 4. Copy propagation: replace Let x = Atom(y) by substituting y for x everywhere
+//! 5. Dead let elimination (fixpoint): remove Let with unused result and no side effects
+//! 6. Unreachable code stripping: remove stmts after divergent stmts
 
 use std::collections::HashMap;
 
@@ -14,6 +16,9 @@ use crate::types::{BinaryOp, Type};
 
 /// Run all LIR optimization passes on the program (mutates in place).
 pub fn optimize_lir(program: &mut LirProgram) {
+    // Phase 0: Program-level function inlining (before per-function passes)
+    inline_small_functions(program);
+
     for func in &mut program.functions {
         optimize_function(func);
     }
@@ -22,6 +27,8 @@ pub fn optimize_lir(program: &mut LirProgram) {
 fn optimize_function(func: &mut LirFunction) {
     // 1. Recognize IfReturn chains from match lowering → Switch nodes
     recognize_switches_in_stmts(&mut func.body);
+    // 1.5. Known-call devirtualization: FuncRef(f) + CallIndirect → Call(f)
+    devirtualize_known_calls(&mut func.body);
     // 2. Constant folding: Binary(Lit, op, Lit) → Atom(Lit)
     constant_fold_stmts(&mut func.body);
     // 3. Copy propagation: Let x = Atom(y) → substitute y for x
@@ -30,11 +37,18 @@ fn optimize_function(func: &mut LirFunction) {
     let mut subst = HashMap::new();
     copy_propagate_stmts(&mut func.body, &mut subst, &multi_bound);
     subst_atom(&mut func.ret, &subst);
-    // 4. Dead let elimination
-    let mut uses = HashMap::new();
-    count_uses_in_stmts(&func.body, &mut uses);
-    count_uses_in_atom(&func.ret, &mut uses);
-    eliminate_dead_lets(&mut func.body, &uses);
+    // 4. Dead let elimination — iterate to fixpoint because removing a dead Let
+    //    may make its referenced variables dead too (cascading dead code).
+    for _ in 0..8 {
+        let mut uses = HashMap::new();
+        count_uses_in_stmts(&func.body, &mut uses);
+        count_uses_in_atom(&func.ret, &mut uses);
+        let dead_count = count_dead_lets(&func.body, &uses);
+        if dead_count == 0 {
+            break;
+        }
+        eliminate_dead_lets(&mut func.body, &uses);
+    }
     // 5. Unreachable code stripping (remove stmts after divergent stmts)
     strip_unreachable_stmts(&mut func.body);
 }
@@ -824,6 +838,41 @@ fn count_uses_in_atom(atom: &LirAtom, uses: &mut HashMap<Symbol, u32>) {
     }
 }
 
+fn count_dead_lets(stmts: &[LirStmt], uses: &HashMap<Symbol, u32>) -> usize {
+    let mut count = 0;
+    for stmt in stmts {
+        match stmt {
+            LirStmt::Let { name, expr, .. } => {
+                let used = uses.get(name).copied().unwrap_or(0) > 0;
+                if !used && !expr_has_side_effects(expr) {
+                    count += 1;
+                }
+            }
+            LirStmt::If { then_body, else_body, .. }
+            | LirStmt::IfReturn { then_body, else_body, .. } => {
+                count += count_dead_lets(then_body, uses);
+                count += count_dead_lets(else_body, uses);
+            }
+            LirStmt::TryCatch { body, catch_body, .. } => {
+                count += count_dead_lets(body, uses);
+                count += count_dead_lets(catch_body, uses);
+            }
+            LirStmt::Loop { cond_stmts, body, .. } => {
+                count += count_dead_lets(cond_stmts, uses);
+                count += count_dead_lets(body, uses);
+            }
+            LirStmt::Switch { cases, default_body, .. } => {
+                for case in cases {
+                    count += count_dead_lets(&case.body, uses);
+                }
+                count += count_dead_lets(default_body, uses);
+            }
+            LirStmt::Conc { .. } => {}
+        }
+    }
+    count
+}
+
 fn eliminate_dead_lets(stmts: &mut Vec<LirStmt>, uses: &HashMap<Symbol, u32>) {
     stmts.retain_mut(|stmt| {
         match stmt {
@@ -972,6 +1021,493 @@ fn strip_unreachable_stmts(stmts: &mut Vec<LirStmt>) {
                 strip_unreachable_stmts(default_body);
             }
             LirStmt::Let { .. } | LirStmt::Conc { .. } => {}
+        }
+    }
+}
+
+// ─── Known-Call Devirtualization ─────────────────────────────────────────────
+
+/// Track FuncRef bindings and replace CallIndirect with direct Call when the
+/// callee is a known FuncRef. This eliminates call_indirect overhead and
+/// enables further optimizations (the FuncRef Let becomes dead code).
+fn devirtualize_known_calls(stmts: &mut [LirStmt]) {
+    let mut funcref_map: HashMap<Symbol, Symbol> = HashMap::new();
+    collect_funcref_bindings(stmts, &mut funcref_map);
+    if !funcref_map.is_empty() {
+        devirtualize_calls_in_stmts(stmts, &funcref_map);
+    }
+}
+
+fn collect_funcref_bindings(stmts: &[LirStmt], map: &mut HashMap<Symbol, Symbol>) {
+    for stmt in stmts {
+        match stmt {
+            LirStmt::Let {
+                name,
+                expr: LirExpr::FuncRef { func, .. },
+                ..
+            } => {
+                map.insert(*name, *func);
+            }
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            }
+            | LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_funcref_bindings(then_body, map);
+                collect_funcref_bindings(else_body, map);
+            }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                collect_funcref_bindings(body, map);
+                collect_funcref_bindings(catch_body, map);
+            }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                collect_funcref_bindings(cond_stmts, map);
+                collect_funcref_bindings(body, map);
+            }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for case in cases {
+                    collect_funcref_bindings(&case.body, map);
+                }
+                collect_funcref_bindings(default_body, map);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn devirtualize_calls_in_stmts(stmts: &mut [LirStmt], funcref_map: &HashMap<Symbol, Symbol>) -> u32 {
+    let mut count = 0;
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            LirStmt::Let { expr, .. } => {
+                if let LirExpr::CallIndirect {
+                    callee: LirAtom::Var { name, .. },
+                    args,
+                    typ,
+                    ..
+                } = expr
+                {
+                    if let Some(&target_func) = funcref_map.get(name) {
+                        *expr = LirExpr::Call {
+                            func: target_func,
+                            args: std::mem::take(args),
+                            typ: typ.clone(),
+                        };
+                        count += 1;
+                    }
+                }
+            }
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            }
+            | LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                count += devirtualize_calls_in_stmts(then_body, funcref_map);
+                count += devirtualize_calls_in_stmts(else_body, funcref_map);
+            }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                count += devirtualize_calls_in_stmts(body, funcref_map);
+                count += devirtualize_calls_in_stmts(catch_body, funcref_map);
+            }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                count += devirtualize_calls_in_stmts(cond_stmts, funcref_map);
+                count += devirtualize_calls_in_stmts(body, funcref_map);
+            }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for case in cases {
+                    count += devirtualize_calls_in_stmts(&mut case.body, funcref_map);
+                }
+                count += devirtualize_calls_in_stmts(default_body, funcref_map);
+            }
+            LirStmt::Conc { .. } => {}
+        }
+    }
+    count
+}
+
+// ─── Function Inlining ──────────────────────────────────────────────────────
+
+/// Maximum number of LIR statements for a function to be considered inlineable.
+const INLINE_THRESHOLD: usize = 12;
+
+/// Inline small, non-recursive functions at call sites.
+/// Only inlines functions whose bodies contain no control flow (Let-only).
+fn inline_small_functions(program: &mut LirProgram) {
+    // Collect inlineable function bodies (cloned for ownership)
+    let inlineable: HashMap<Symbol, InlineCandidate> = program
+        .functions
+        .iter()
+        .filter(|f| is_inlineable(f))
+        .map(|f| {
+            (
+                f.name,
+                InlineCandidate {
+                    params: f.params.clone(),
+                    body: f.body.clone(),
+                    ret: f.ret.clone(),
+                },
+            )
+        })
+        .collect();
+
+    if inlineable.is_empty() {
+        return;
+    }
+
+    let mut inline_counter: u32 = 0;
+    for func in &mut program.functions {
+        let subst = inline_calls_in_stmts(&mut func.body, &inlineable, &mut inline_counter);
+        // Apply inline substitutions to the function's return atom
+        if !subst.is_empty() {
+            if let LirAtom::Var { name, .. } = &func.ret {
+                if let Some(replacement) = subst.get(name) {
+                    func.ret = replacement.clone();
+                }
+            }
+        }
+    }
+
+    // Note: we do NOT remove inlined functions because they may be called from
+    // other compilation units (imported modules). The dead code will be handled
+    // by wasmtime's JIT or wasm-opt.
+}
+
+struct InlineCandidate {
+    params: Vec<crate::ir::lir::LirParam>,
+    body: Vec<LirStmt>,
+    ret: LirAtom,
+}
+
+/// A function is inlineable if:
+/// - Not main or a WASI export wrapper
+/// - Body contains only Let statements (no control flow)
+/// - Body size ≤ INLINE_THRESHOLD
+/// - Not self-recursive
+/// - Body has no TailCall expressions
+fn is_inlineable(func: &LirFunction) -> bool {
+    let name_str = func.name.as_str();
+    // Never inline entry points or exported functions
+    if name_str == "main" || name_str.starts_with("__wasi_") || name_str.starts_with("__conc_") {
+        return false;
+    }
+    if func.body.len() > INLINE_THRESHOLD {
+        return false;
+    }
+    let name = func.name;
+    for stmt in &func.body {
+        match stmt {
+            LirStmt::Let { expr, .. } => {
+                // No self-recursion or TailCall
+                match expr {
+                    LirExpr::Call { func: callee, .. } if *callee == name => return false,
+                    LirExpr::TailCall { .. } => return false,
+                    _ => {}
+                }
+            }
+            // Any control flow makes it non-inlineable
+            _ => return false,
+        }
+    }
+    true
+}
+
+
+/// Inline calls in a statement list, replacing Call expressions with the
+/// inlined function body. Each inline site gets unique variable names via
+/// a monotonic counter.
+///
+/// Instead of creating `Let result = Atom(renamed_ret)` copy bindings (which
+/// can cause issues when copy propagation can't propagate due to type mismatch),
+/// we substitute `result → renamed_ret` directly in subsequent statements.
+fn inline_calls_in_stmts(
+    stmts: &mut Vec<LirStmt>,
+    inlineable: &HashMap<Symbol, InlineCandidate>,
+    counter: &mut u32,
+) -> HashMap<Symbol, LirAtom> {
+    // Accumulated substitutions from inlined call results.
+    // Applied eagerly to subsequent statements to avoid copy chains.
+    let mut inline_subst: HashMap<Symbol, LirAtom> = HashMap::new();
+
+    let mut i = 0;
+    while i < stmts.len() {
+        // Apply pending substitutions to the current stmt
+        if !inline_subst.is_empty() {
+            apply_subst_to_stmt(&mut stmts[i], &inline_subst);
+        }
+
+        let should_inline = if let LirStmt::Let {
+            expr: LirExpr::Call { func, .. },
+            ..
+        } = &stmts[i]
+        {
+            inlineable.contains_key(func)
+        } else {
+            false
+        };
+
+        if should_inline {
+            let site_id = *counter;
+            *counter += 1;
+
+            // Extract the Let statement
+            let placeholder = LirStmt::Let {
+                name: Symbol::intern("__placeholder"),
+                typ: Type::Unit,
+                expr: LirExpr::Atom(LirAtom::Unit),
+            };
+            let original = std::mem::replace(&mut stmts[i], placeholder);
+
+            if let LirStmt::Let {
+                name: result_name,
+                typ: _result_typ,
+                expr: LirExpr::Call { func, args, .. },
+            } = original
+            {
+                let candidate = &inlineable[&func];
+                let mut inserted = Vec::new();
+
+                // 1. Bind parameters to arguments
+                for (param, (_, arg_atom)) in candidate.params.iter().zip(args.iter()) {
+                    let renamed_param =
+                        Symbol::intern(&format!("__il{}_{}", site_id, param.name.as_str()));
+                    inserted.push(LirStmt::Let {
+                        name: renamed_param,
+                        typ: param.typ.clone(),
+                        expr: LirExpr::Atom(arg_atom.clone()),
+                    });
+                }
+
+                // 2. Build rename map for body locals
+                let mut rename_map: HashMap<Symbol, Symbol> = HashMap::new();
+                for param in &candidate.params {
+                    rename_map.insert(
+                        param.name,
+                        Symbol::intern(&format!("__il{}_{}", site_id, param.name.as_str())),
+                    );
+                }
+                for stmt in &candidate.body {
+                    if let LirStmt::Let { name, .. } = stmt {
+                        rename_map.insert(
+                            *name,
+                            Symbol::intern(&format!("__il{}_{}", site_id, name.as_str())),
+                        );
+                    }
+                }
+
+                // 3. Clone and rename body stmts
+                for body_stmt in &candidate.body {
+                    let mut cloned = body_stmt.clone();
+                    rename_stmt(&mut cloned, &rename_map);
+                    inserted.push(cloned);
+                }
+
+                // 4. Instead of creating `Let result_name = Atom(renamed_ret)`,
+                //    record result_name → renamed_ret in the substitution map.
+                //    This avoids copy chains that confuse dead let elimination.
+                let mut ret_atom = candidate.ret.clone();
+                rename_atom(&mut ret_atom, &rename_map);
+                // Also resolve through existing substitutions
+                if let LirAtom::Var { name, .. } = &ret_atom {
+                    if let Some(resolved) = inline_subst.get(name) {
+                        ret_atom = resolved.clone();
+                    }
+                }
+                inline_subst.insert(result_name, ret_atom);
+
+                // Replace the single stmt with the inlined sequence
+                stmts.splice(i..=i, inserted.into_iter());
+                // Don't increment i — process the newly inserted stmts
+                continue;
+            }
+        }
+        // Note: we do NOT recurse into nested bodies (if/match/loop/etc.)
+        // for inlining. Only top-level calls in a scope are inlined.
+        i += 1;
+    }
+    inline_subst
+}
+
+/// Apply inline substitutions to atoms within a statement.
+fn apply_subst_to_stmt(stmt: &mut LirStmt, subst: &HashMap<Symbol, LirAtom>) {
+    match stmt {
+        LirStmt::Let { expr, .. } => {
+            subst_expr(expr, subst);
+        }
+        LirStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            subst_atom(cond, subst);
+            apply_subst_to_stmts(then_body, subst);
+            apply_subst_to_stmts(else_body, subst);
+        }
+        LirStmt::IfReturn {
+            cond,
+            then_body,
+            then_ret,
+            else_body,
+            else_ret,
+            ..
+        } => {
+            subst_atom(cond, subst);
+            apply_subst_to_stmts(then_body, subst);
+            if let Some(ret) = then_ret {
+                subst_atom(ret, subst);
+            }
+            apply_subst_to_stmts(else_body, subst);
+            if let Some(ret) = else_ret {
+                subst_atom(ret, subst);
+            }
+        }
+        LirStmt::TryCatch {
+            body,
+            body_ret,
+            catch_body,
+            catch_ret,
+            ..
+        } => {
+            apply_subst_to_stmts(body, subst);
+            if let Some(ret) = body_ret {
+                subst_atom(ret, subst);
+            }
+            apply_subst_to_stmts(catch_body, subst);
+            if let Some(ret) = catch_ret {
+                subst_atom(ret, subst);
+            }
+        }
+        LirStmt::Loop {
+            cond_stmts,
+            cond,
+            body,
+        } => {
+            apply_subst_to_stmts(cond_stmts, subst);
+            subst_atom(cond, subst);
+            apply_subst_to_stmts(body, subst);
+        }
+        LirStmt::Switch {
+            tag,
+            cases,
+            default_body,
+            default_ret,
+            ..
+        } => {
+            subst_atom(tag, subst);
+            for case in cases {
+                apply_subst_to_stmts(&mut case.body, subst);
+                if let Some(ret) = &mut case.ret {
+                    subst_atom(ret, subst);
+                }
+            }
+            apply_subst_to_stmts(default_body, subst);
+            if let Some(ret) = default_ret {
+                subst_atom(ret, subst);
+            }
+        }
+        LirStmt::Conc { tasks } => {
+            for task in tasks {
+                for (_, arg) in &mut task.args {
+                    subst_atom(arg, subst);
+                }
+            }
+        }
+    }
+}
+
+fn apply_subst_to_stmts(stmts: &mut [LirStmt], subst: &HashMap<Symbol, LirAtom>) {
+    for stmt in stmts.iter_mut() {
+        apply_subst_to_stmt(stmt, subst);
+    }
+}
+
+fn rename_stmt(stmt: &mut LirStmt, map: &HashMap<Symbol, Symbol>) {
+    match stmt {
+        LirStmt::Let { name, expr, .. } => {
+            if let Some(&new_name) = map.get(name) {
+                *name = new_name;
+            }
+            rename_expr(expr, map);
+        }
+        _ => {} // Inlined bodies are Let-only, but be safe
+    }
+}
+
+fn rename_expr(expr: &mut LirExpr, map: &HashMap<Symbol, Symbol>) {
+    match expr {
+        LirExpr::Atom(a) => rename_atom(a, map),
+        LirExpr::Binary { lhs, rhs, .. } => {
+            rename_atom(lhs, map);
+            rename_atom(rhs, map);
+        }
+        LirExpr::Call { args, .. } => {
+            for (_, arg) in args {
+                rename_atom(arg, map);
+            }
+        }
+        LirExpr::TailCall { args, .. } => {
+            for (_, arg) in args {
+                rename_atom(arg, map);
+            }
+        }
+        LirExpr::Constructor { args, .. } => {
+            for arg in args {
+                rename_atom(arg, map);
+            }
+        }
+        LirExpr::Record { fields, .. } => {
+            for (_, val) in fields {
+                rename_atom(val, map);
+            }
+        }
+        LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } => {
+            rename_atom(value, map);
+        }
+        LirExpr::Raise { value, .. } => rename_atom(value, map),
+        LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
+        LirExpr::Closure { captures, .. } => {
+            for (_, cap) in captures {
+                rename_atom(cap, map);
+            }
+        }
+        LirExpr::CallIndirect { callee, args, .. } => {
+            rename_atom(callee, map);
+            for (_, arg) in args {
+                rename_atom(arg, map);
+            }
+        }
+    }
+}
+
+fn rename_atom(atom: &mut LirAtom, map: &HashMap<Symbol, Symbol>) {
+    if let LirAtom::Var { name, .. } = atom {
+        if let Some(&new_name) = map.get(name) {
+            *name = new_name;
         }
     }
 }
