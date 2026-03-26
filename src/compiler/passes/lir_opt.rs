@@ -36,6 +36,8 @@ fn optimize_function(func: &mut LirFunction) {
     hoist_loop_invariants(&mut func.body);
     // 2. Constant folding: Binary(Lit, op, Lit) → Atom(Lit)
     constant_fold_stmts(&mut func.body);
+    // 2.5. Constant branch elimination: if Bool(true/false), replace with live branch
+    eliminate_constant_branches(&mut func.body);
     // 3. Copy propagation: Let x = Atom(y) → substitute y for x
     //    Skip variables bound multiple times (match-expr result temps) — not SSA-safe.
     let multi_bound = find_multiply_bound(&func.body);
@@ -524,6 +526,80 @@ fn fold_bool(op: BinaryOp, a: bool, b: bool) -> Option<LirAtom> {
         BinaryOp::Ne => LirAtom::Bool(a != b),
         _ => return None,
     })
+}
+
+// ─── Constant Branch Elimination ─────────────────────────────────────────────
+
+/// Replace If/IfReturn with literal conditions by the live branch body.
+/// After constant folding, conditions like `Bool(true)` or `Bool(false)` may appear.
+fn eliminate_constant_branches(stmts: &mut Vec<LirStmt>) {
+    let mut i = 0;
+    while i < stmts.len() {
+        // First recurse into nested bodies
+        match &mut stmts[i] {
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                eliminate_constant_branches(then_body);
+                eliminate_constant_branches(else_body);
+            }
+            LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                eliminate_constant_branches(then_body);
+                eliminate_constant_branches(else_body);
+            }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                eliminate_constant_branches(body);
+                eliminate_constant_branches(catch_body);
+            }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                eliminate_constant_branches(cond_stmts);
+                eliminate_constant_branches(body);
+            }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for case in cases {
+                    eliminate_constant_branches(&mut case.body);
+                }
+                eliminate_constant_branches(default_body);
+            }
+            LirStmt::Let { .. } | LirStmt::Conc { .. } => {}
+        }
+
+        // Now check if this stmt has a constant condition
+        let replacement = match &stmts[i] {
+            LirStmt::If {
+                cond: LirAtom::Bool(true),
+                then_body,
+                ..
+            } => Some(then_body.clone()),
+            LirStmt::If {
+                cond: LirAtom::Bool(false),
+                else_body,
+                ..
+            } => Some(else_body.clone()),
+            _ => None,
+        };
+
+        if let Some(live_body) = replacement {
+            stmts.splice(i..=i, live_body);
+            // Don't increment — process the spliced-in stmts
+            continue;
+        }
+        i += 1;
+    }
 }
 
 // ─── Copy Propagation ────────────────────────────────────────────────────────
