@@ -894,7 +894,10 @@ impl TypeChecker {
                                         self.instantiate(sch)
                                     } else {
                                         return Err(TypeError::new(
-                                            format!("Undefined variable '{}' in index assignment", key),
+                                            format!(
+                                                "Undefined variable '{}' in index assignment",
+                                                key
+                                            ),
                                             arr.span.clone(),
                                         ));
                                     }

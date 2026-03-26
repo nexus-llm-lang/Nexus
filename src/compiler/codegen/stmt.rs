@@ -144,16 +144,37 @@ pub(super) fn compile_stmt(
             out.instruction(&Instruction::If(BlockType::Empty));
             for nested in then_body {
                 compile_stmt(
-                    nested, out, local_map, program, internal_indices, external_indices,
-                    layout, temps, function_ret_type, in_try, is_entrypoint, inner_tco, tcmc,
+                    nested,
+                    out,
+                    local_map,
+                    program,
+                    internal_indices,
+                    external_indices,
+                    layout,
+                    temps,
+                    function_ret_type,
+                    in_try,
+                    is_entrypoint,
+                    inner_tco,
+                    tcmc,
                 )?;
             }
             if !else_body.is_empty() {
                 out.instruction(&Instruction::Else);
                 for nested in else_body {
                     compile_stmt(
-                        nested, out, local_map, program, internal_indices, external_indices,
-                        layout, temps, function_ret_type, in_try, is_entrypoint, inner_tco,
+                        nested,
+                        out,
+                        local_map,
+                        program,
+                        internal_indices,
+                        external_indices,
+                        layout,
+                        temps,
+                        function_ret_type,
+                        in_try,
+                        is_entrypoint,
+                        inner_tco,
                         tcmc,
                     )?;
                 }
@@ -176,8 +197,19 @@ pub(super) fn compile_stmt(
             out.instruction(&Instruction::If(BlockType::Empty));
             for nested in then_body {
                 compile_stmt(
-                    nested, out, local_map, program, internal_indices, external_indices,
-                    layout, temps, function_ret_type, in_try, is_entrypoint, inner_tco, tcmc,
+                    nested,
+                    out,
+                    local_map,
+                    program,
+                    internal_indices,
+                    external_indices,
+                    layout,
+                    temps,
+                    function_ret_type,
+                    in_try,
+                    is_entrypoint,
+                    inner_tco,
+                    tcmc,
                 )?;
             }
             if let Some(then_ret) = then_ret {
@@ -187,8 +219,18 @@ pub(super) fn compile_stmt(
                 out.instruction(&Instruction::Else);
                 for nested in else_body {
                     compile_stmt(
-                        nested, out, local_map, program, internal_indices, external_indices,
-                        layout, temps, function_ret_type, in_try, is_entrypoint, inner_tco,
+                        nested,
+                        out,
+                        local_map,
+                        program,
+                        internal_indices,
+                        external_indices,
+                        layout,
+                        temps,
+                        function_ret_type,
+                        in_try,
+                        is_entrypoint,
+                        inner_tco,
                         tcmc,
                     )?;
                 }
@@ -221,9 +263,19 @@ pub(super) fn compile_stmt(
             out.instruction(&Instruction::Block(BlockType::Empty));
             for nested in body {
                 compile_stmt(
-                    nested, out, local_map, program, internal_indices, external_indices,
-                    layout, temps, function_ret_type, true, is_entrypoint,
-                    None, None, // TCO + TCMC disabled in try body
+                    nested,
+                    out,
+                    local_map,
+                    program,
+                    internal_indices,
+                    external_indices,
+                    layout,
+                    temps,
+                    function_ret_type,
+                    true,
+                    is_entrypoint,
+                    None,
+                    None, // TCO + TCMC disabled in try body
                 )?;
                 out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
                 out.instruction(&Instruction::BrIf(0));
@@ -245,9 +297,19 @@ pub(super) fn compile_stmt(
             }
             for nested in catch_body {
                 compile_stmt(
-                    nested, out, local_map, program, internal_indices, external_indices,
-                    layout, temps, function_ret_type, in_try, is_entrypoint,
-                    None, None, // TCO + TCMC disabled in catch body
+                    nested,
+                    out,
+                    local_map,
+                    program,
+                    internal_indices,
+                    external_indices,
+                    layout,
+                    temps,
+                    function_ret_type,
+                    in_try,
+                    is_entrypoint,
+                    None,
+                    None, // TCO + TCMC disabled in catch body
                 )?;
                 if in_try {
                     out.instruction(&Instruction::GlobalGet(layout.exn_flag_global));
@@ -340,8 +402,19 @@ pub(super) fn compile_stmt(
             out.instruction(&Instruction::Loop(BlockType::Empty));
             for nested in cond_stmts {
                 compile_stmt(
-                    nested, out, local_map, program, internal_indices, external_indices,
-                    layout, temps, function_ret_type, in_try, is_entrypoint, inner_tco, tcmc,
+                    nested,
+                    out,
+                    local_map,
+                    program,
+                    internal_indices,
+                    external_indices,
+                    layout,
+                    temps,
+                    function_ret_type,
+                    in_try,
+                    is_entrypoint,
+                    inner_tco,
+                    tcmc,
                 )?;
             }
             compile_atom(cond, out, local_map, layout)?;
@@ -349,8 +422,19 @@ pub(super) fn compile_stmt(
             out.instruction(&Instruction::BrIf(1));
             for nested in body {
                 compile_stmt(
-                    nested, out, local_map, program, internal_indices, external_indices,
-                    layout, temps, function_ret_type, in_try, is_entrypoint, inner_tco, tcmc,
+                    nested,
+                    out,
+                    local_map,
+                    program,
+                    internal_indices,
+                    external_indices,
+                    layout,
+                    temps,
+                    function_ret_type,
+                    in_try,
+                    is_entrypoint,
+                    inner_tco,
+                    tcmc,
                 )?;
             }
             out.instruction(&Instruction::Br(0));
@@ -367,24 +451,66 @@ pub(super) fn compile_stmt(
         } => {
             if let Some((min_tag, _table_size)) = check_dense_tags(cases) {
                 compile_switch_br_table(
-                    tag, cases, default_body, default_ret, ret_type, min_tag,
-                    out, local_map, program, internal_indices, external_indices,
-                    layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
+                    tag,
+                    cases,
+                    default_body,
+                    default_ret,
+                    ret_type,
+                    min_tag,
+                    out,
+                    local_map,
+                    program,
+                    internal_indices,
+                    external_indices,
+                    layout,
+                    temps,
+                    function_ret_type,
+                    in_try,
+                    is_entrypoint,
+                    tco_loop,
+                    tcmc,
                 )
             } else {
                 // Sort cases by tag for binary search dispatch (O(log N))
                 let mut sorted: Vec<usize> = (0..cases.len()).collect();
                 sorted.sort_by_key(|&i| cases[i].tag_value);
                 compile_switch_bsearch(
-                    tag, cases, &sorted, default_body, default_ret, ret_type,
-                    out, local_map, program, internal_indices, external_indices,
-                    layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
+                    tag,
+                    cases,
+                    &sorted,
+                    default_body,
+                    default_ret,
+                    ret_type,
+                    out,
+                    local_map,
+                    program,
+                    internal_indices,
+                    external_indices,
+                    layout,
+                    temps,
+                    function_ret_type,
+                    in_try,
+                    is_entrypoint,
+                    tco_loop,
+                    tcmc,
                 )?;
                 // Default body: reached when no case matched (all cases return)
                 emit_switch_default(
-                    default_body, default_ret, ret_type,
-                    out, local_map, program, internal_indices, external_indices,
-                    layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
+                    default_body,
+                    default_ret,
+                    ret_type,
+                    out,
+                    local_map,
+                    program,
+                    internal_indices,
+                    external_indices,
+                    layout,
+                    temps,
+                    function_ret_type,
+                    in_try,
+                    is_entrypoint,
+                    tco_loop,
+                    tcmc,
                 )
             }
         }
@@ -414,7 +540,6 @@ fn check_dense_tags(cases: &[SwitchCase]) -> Option<(i64, usize)> {
         None
     }
 }
-
 
 /// Compile Switch using binary search for O(log N) dispatch (sparse tags).
 ///
@@ -454,8 +579,19 @@ fn compile_switch_bsearch(
             out.instruction(&Instruction::If(BlockType::Empty));
             for nested in &cases[idx].body {
                 compile_stmt(
-                    nested, out, local_map, program, internal_indices, external_indices,
-                    layout, temps, function_ret_type, in_try, is_entrypoint, case_tco, tcmc,
+                    nested,
+                    out,
+                    local_map,
+                    program,
+                    internal_indices,
+                    external_indices,
+                    layout,
+                    temps,
+                    function_ret_type,
+                    in_try,
+                    is_entrypoint,
+                    case_tco,
+                    tcmc,
                 )?;
             }
             if let Some(ret) = &cases[idx].ret {
@@ -478,18 +614,48 @@ fn compile_switch_bsearch(
 
     // Left half: sorted[..mid]
     compile_switch_bsearch(
-        tag, cases, &sorted[..mid], default_body, default_ret, ret_type,
-        out, local_map, program, internal_indices, external_indices,
-        layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
+        tag,
+        cases,
+        &sorted[..mid],
+        default_body,
+        default_ret,
+        ret_type,
+        out,
+        local_map,
+        program,
+        internal_indices,
+        external_indices,
+        layout,
+        temps,
+        function_ret_type,
+        in_try,
+        is_entrypoint,
+        tco_loop,
+        tcmc,
     )?;
 
     out.instruction(&Instruction::Else);
 
     // Right half: sorted[mid..]
     compile_switch_bsearch(
-        tag, cases, &sorted[mid..], default_body, default_ret, ret_type,
-        out, local_map, program, internal_indices, external_indices,
-        layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
+        tag,
+        cases,
+        &sorted[mid..],
+        default_body,
+        default_ret,
+        ret_type,
+        out,
+        local_map,
+        program,
+        internal_indices,
+        external_indices,
+        layout,
+        temps,
+        function_ret_type,
+        in_try,
+        is_entrypoint,
+        tco_loop,
+        tcmc,
     )?;
 
     out.instruction(&Instruction::End);
@@ -518,8 +684,19 @@ fn emit_switch_default(
 ) -> Result<(), CodegenError> {
     for nested in default_body {
         compile_stmt(
-            nested, out, local_map, program, internal_indices, external_indices,
-            layout, temps, function_ret_type, in_try, is_entrypoint, tco_loop, tcmc,
+            nested,
+            out,
+            local_map,
+            program,
+            internal_indices,
+            external_indices,
+            layout,
+            temps,
+            function_ret_type,
+            in_try,
+            is_entrypoint,
+            tco_loop,
+            tcmc,
         )?;
     }
     if let Some(ret) = default_ret {
@@ -593,8 +770,19 @@ fn compile_switch_br_table(
     let default_tco = tco_loop.map(|t| t.deeper(n as u32));
     for nested in default_body {
         compile_stmt(
-            nested, out, local_map, program, internal_indices, external_indices,
-            layout, temps, function_ret_type, in_try, is_entrypoint, default_tco, tcmc,
+            nested,
+            out,
+            local_map,
+            program,
+            internal_indices,
+            external_indices,
+            layout,
+            temps,
+            function_ret_type,
+            in_try,
+            is_entrypoint,
+            default_tco,
+            tcmc,
         )?;
     }
     if let Some(ret) = default_ret {
@@ -607,8 +795,19 @@ fn compile_switch_br_table(
         let case_tco = tco_loop.map(|t| t.deeper((n - 1 - j) as u32));
         for nested in &cases[case_idx].body {
             compile_stmt(
-                nested, out, local_map, program, internal_indices, external_indices,
-                layout, temps, function_ret_type, in_try, is_entrypoint, case_tco, tcmc,
+                nested,
+                out,
+                local_map,
+                program,
+                internal_indices,
+                external_indices,
+                layout,
+                temps,
+                function_ret_type,
+                in_try,
+                is_entrypoint,
+                case_tco,
+                tcmc,
             )?;
         }
         if let Some(ret) = &cases[case_idx].ret {

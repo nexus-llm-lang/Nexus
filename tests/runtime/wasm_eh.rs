@@ -89,7 +89,7 @@ fn build_throw_catch_module() -> Vec<u8> {
     f.instruction(&Instruction::End); // end try_table
     f.instruction(&Instruction::Unreachable);
     f.instruction(&Instruction::End); // end block — caught value on stack
-    // stack: [i64]
+                                      // stack: [i64]
     f.instruction(&Instruction::I64Const(42));
     f.instruction(&Instruction::I64Ne);
     f.instruction(&Instruction::If(BlockType::Empty));
@@ -195,7 +195,7 @@ fn build_cross_function_throw_catch() -> Vec<u8> {
     let mut module = Module::new();
 
     let mut types = TypeSection::new();
-    types.ty().function(vec![], vec![]);          // type 0: () -> ()
+    types.ty().function(vec![], vec![]); // type 0: () -> ()
     types.ty().function(vec![ValType::I64], vec![]); // type 1: (i64) -> ()
     module.section(&types);
 
@@ -270,15 +270,15 @@ fn eh_engine() -> Engine {
 }
 
 fn run_wasm(engine: &Engine, wasm: &[u8]) -> Result<(), String> {
-    let module =
-        wasmtime::Module::from_binary(engine, wasm).map_err(|e| format!("load: {}", e))?;
+    let module = wasmtime::Module::from_binary(engine, wasm).map_err(|e| format!("load: {}", e))?;
     let mut store = Store::new(engine, ());
     let instance = wasmtime::Instance::new(&mut store, &module, &[])
         .map_err(|e| format!("instantiate: {}", e))?;
     let main = instance
         .get_typed_func::<(), ()>(&mut store, "main")
         .map_err(|e| format!("get main: {}", e))?;
-    main.call(&mut store, ()).map_err(|e| format!("call: {}", e))
+    main.call(&mut store, ())
+        .map_err(|e| format!("call: {}", e))
 }
 
 #[test]
@@ -299,7 +299,10 @@ fn wasm_eh_uncaught_traps() {
     let wasm = build_uncaught_throw_module();
     let err = run_wasm(&engine, &wasm).expect_err("uncaught throw should trap");
     assert!(
-        err.contains("uncaught") || err.contains("exception") || err.contains("unhandled") || err.contains("wasm trap"),
+        err.contains("uncaught")
+            || err.contains("exception")
+            || err.contains("unhandled")
+            || err.contains("wasm trap"),
         "unexpected trap message: {}",
         err
     );
