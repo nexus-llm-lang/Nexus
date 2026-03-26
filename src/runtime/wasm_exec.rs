@@ -170,6 +170,7 @@ fn run_core_wasm_bytes_inner(
     let mut config = wasmtime::Config::new();
     config.max_wasm_stack(64 * 1024 * 1024); // 64 MiB
     config.wasm_tail_call(true);
+    config.wasm_exceptions(true);
     let engine = match Engine::new(&config) {
         Ok(engine) => engine,
         Err(e) => {
