@@ -991,6 +991,29 @@ let lir_build_ctor_switch = fn (rows: [PatRow], col: i64, col_ids: [i64],
   end
 end
 
+// Get constructor arity from pattern matrix (fallback for built-in constructors like Cons/Nil).
+let lir_ctor_arity_from_rows = fn (rows: [PatRow], col: i64, ctor_name: string) -> i64 do
+  match rows do
+    case [] -> return 0
+    case PatRow(pats: pats, case_idx: _, bindings: _) :: rest ->
+      match lir_list_nth_pat(lst: pats, n: col) do
+        case MirPatConstructor(name: n, fields: fields) ->
+          match n == ctor_name do
+            case true -> return lir_pat_fields_length(lst: fields)
+            case false -> return lir_ctor_arity_from_rows(rows: rest, col: col, ctor_name: ctor_name)
+          end
+        case _ -> return lir_ctor_arity_from_rows(rows: rest, col: col, ctor_name: ctor_name)
+      end
+  end
+end
+
+let lir_pat_fields_length = fn (lst: [MirPatternField]) -> i64 do
+  match lst do
+    case [] -> return 0
+    case _ :: rest -> return 1 + lir_pat_fields_length(lst: rest)
+  end
+end
+
 type CtorBranchesResult = CtorBranchesResult(branches: [CtorBranch], next_id: i64)
 
 let lir_build_ctor_branches = fn (ctor_names: [string], rows: [PatRow], col: i64,
@@ -998,7 +1021,8 @@ let lir_build_ctor_branches = fn (ctor_names: [string], rows: [PatRow], col: i64
   match ctor_names do
     case [] -> return CtorBranchesResult(branches: [], next_id: next_id)
     case cn :: rest_names ->
-      let arity = lookup_constructor_arity(name: cn, enum_defs: enum_defs, fallback: 0)
+      let pat_arity = lir_ctor_arity_from_rows(rows: rows, col: col, ctor_name: cn)
+      let arity = lookup_constructor_arity(name: cn, enum_defs: enum_defs, fallback: pat_arity)
       let field_ids = lir_alloc_ids(n: arity, next_id: next_id)
       let nid2 = next_id + arity
       // Build new col_ids: replace col with field_ids
@@ -1825,23 +1849,32 @@ let lir_extract_fields_loop = fn (scr_atom: LirAtom, scr_sem: TypeExpr, ctor_nam
     case true -> return FieldLoopResult(ctx: ctx, atoms: atoms)
     case false ->
       let fid = lir_id_nth(lst: field_ids, n: idx)
-      // Get field name from enum def
-      let field_name = match lookup_variant_def(name: ctor_name, enum_defs: enum_defs) do
+      // Resolve field heap index and type: from enum def if available, else positional
+      match lookup_variant_def(name: ctor_name, enum_defs: enum_defs) do
         case Some(val: vd) ->
           let names = get_variant_field_names(vd: vd)
-          match lir_nth_string(lst: names, n: idx) do case s -> s end
-        case None -> ""
-      end
-      let heap_idx = constructor_field_heap_index(field_name: field_name, ctor_name: ctor_name, enum_defs: enum_defs)
-      let sem_ft = constructor_field_type(field_name: field_name, ctor_name: ctor_name, enum_defs: enum_defs)
-      let wasm_ft = wasm_type(typ: sem_ft)
-      match bind_expr_to_temp_semantic(ctx: ctx,
-        expr: LirExprObjectField(value: scr_atom, index: heap_idx, typ: wasm_ft),
-        typ: wasm_ft, semantic_type: sem_ft) do case BindResult(ctx: ctx2, atom: field_atom) ->
-        let new_atoms = AtomEntry(id: fid, atom: field_atom, sem_type: sem_ft) :: atoms
-        return lir_extract_fields_loop(scr_atom: scr_atom, scr_sem: scr_sem, ctor_name: ctor_name,
-          field_ids: field_ids, idx: idx + 1, arity: arity, atoms: new_atoms, ctx: ctx2,
-          enum_defs: enum_defs)
+          let field_name = lir_nth_string(lst: names, n: idx)
+          let heap_idx = constructor_field_heap_index(field_name: field_name, ctor_name: ctor_name, enum_defs: enum_defs)
+          let sem_ft = constructor_field_type(field_name: field_name, ctor_name: ctor_name, enum_defs: enum_defs)
+          let wasm_ft = wasm_type(typ: sem_ft)
+          match bind_expr_to_temp_semantic(ctx: ctx,
+            expr: LirExprObjectField(value: scr_atom, index: heap_idx, typ: wasm_ft),
+            typ: wasm_ft, semantic_type: sem_ft) do case BindResult(ctx: ctx2, atom: field_atom) ->
+            let new_atoms = AtomEntry(id: fid, atom: field_atom, sem_type: sem_ft) :: atoms
+            return lir_extract_fields_loop(scr_atom: scr_atom, scr_sem: scr_sem, ctor_name: ctor_name,
+              field_ids: field_ids, idx: idx + 1, arity: arity, atoms: new_atoms, ctx: ctx2,
+              enum_defs: enum_defs)
+          end
+        case None ->
+          // Built-in constructor (Cons, Some, etc.) — use positional index, I64 type
+          match bind_expr_to_temp(ctx: ctx,
+            expr: LirExprObjectField(value: scr_atom, index: idx, typ: TyI64),
+            typ: TyI64) do case BindResult(ctx: ctx2, atom: field_atom) ->
+            let new_atoms = AtomEntry(id: fid, atom: field_atom, sem_type: TyI64) :: atoms
+            return lir_extract_fields_loop(scr_atom: scr_atom, scr_sem: scr_sem, ctor_name: ctor_name,
+              field_ids: field_ids, idx: idx + 1, arity: arity, atoms: new_atoms, ctx: ctx2,
+              enum_defs: enum_defs)
+          end
       end
   end
 end
