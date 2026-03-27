@@ -1361,6 +1361,7 @@ impl<'a> LowerCtx<'a> {
                     },
                     Type::Bool,
                 );
+                let tag_cond_for_guard = tag_cond.clone();
                 conds.push(tag_cond);
 
                 // Resolve field types from enum definition so unpack
@@ -1379,6 +1380,10 @@ impl<'a> LowerCtx<'a> {
                     &self.ctor_index,
                     self.enum_defs,
                 );
+
+                // Save position after the outer tag check so we can wrap
+                // all field extractions in a guard block.
+                let fields_start = self.stmts.len();
 
                 // Field checks — use sorted index for memory layout
                 for (pat_idx, (label, field_pat)) in fields.iter().enumerate() {
@@ -1449,6 +1454,20 @@ impl<'a> LowerCtx<'a> {
                         conds,
                         bindings,
                     )?;
+                }
+
+                // Guard field extraction stmts: wrap everything emitted after the
+                // tag check in an If block so nested field dereferences only execute
+                // when the constructor tag matches.  Without this, accessing fields
+                // of a mismatched constructor (e.g. reading Cons fields from Nil)
+                // causes an out-of-bounds memory access.
+                if self.stmts.len() > fields_start {
+                    let guarded: Vec<LirStmt> = self.stmts.drain(fields_start..).collect();
+                    self.stmts.push(LirStmt::If {
+                        cond: tag_cond_for_guard,
+                        then_body: guarded,
+                        else_body: vec![],
+                    });
                 }
             }
             MirPattern::Record(fields, _open) => {
