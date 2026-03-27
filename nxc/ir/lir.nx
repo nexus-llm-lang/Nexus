@@ -574,199 +574,689 @@ let resolve_record_field = fn (atom: LirAtom, field: string, ctx: LowerCtx) -> F
   end
 end
 
-// ─── Pattern Condition Collection ───────────────────────────────────────────
+// ─── Maranget Decision Tree Types ───────────────────────────────────────────
 
-type PatCondResult = PatCondResult(ctx: LowerCtx, cond_opt: Option<LirAtom>)
+type PatBinding = PatBinding(name: string, scrutinee_id: i64)
+type PatRow = PatRow(pats: [MirPattern], case_idx: i64, bindings: [PatBinding])
 
-// Phase 1: Generate only the condition check (stmts safe for outer scope)
-let collect_pattern_condition = fn (target_atom: LirAtom, pattern: MirPattern, ctx: LowerCtx) -> PatCondResult do
-  match pattern do
-    case MirPatWildcard ->
-      return PatCondResult(ctx: ctx, cond_opt: None)
-    case MirPatVariable(name: _, sigil: _) ->
-      return PatCondResult(ctx: ctx, cond_opt: None)
-    case MirPatLiteral(lit: l) ->
-      let expected = literal_to_atom(lit: l)
-      match bind_expr_to_temp(ctx: ctx,
-        expr: LirExprBinary(op: OpEq, lhs: target_atom, rhs: expected, typ: TyBool),
-        typ: TyBool) do case BindResult(ctx: ctx2, atom: cond_atom) ->
-        return PatCondResult(ctx: ctx2, cond_opt: Some(val: cond_atom))
-      end
-    case MirPatConstructor(name: n, fields: fields) ->
-      match ctx do case LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) ->
-        let def_arity = lookup_constructor_arity(name: n, enum_defs: ed, fallback: list_length(lst: fields))
-        let tag = constructor_tag(name: n, arity: def_arity)
-        match bind_expr_to_temp(ctx: ctx,
-          expr: LirExprObjectTag(value: target_atom, typ: TyI64),
-          typ: TyI64) do case BindResult(ctx: ctx2, atom: tag_atom) ->
-          match bind_expr_to_temp(ctx: ctx2,
-            expr: LirExprBinary(op: OpEq, lhs: tag_atom, rhs: LirAtomInt(val: tag), typ: TyBool),
-            typ: TyBool) do case BindResult(ctx: ctx3, atom: tag_cond) ->
-            // Recursively collect inner constructor conditions from fields
-            return collect_inner_field_conditions(target_atom: target_atom,
-              fields: fields, ctor_name: n, ctx: ctx3, outer_cond: tag_cond, pos: 0)
-          end
-        end
-      end
-    case MirPatRecord(fields: _, is_partial: _) ->
-      return PatCondResult(ctx: ctx, cond_opt: None)
-  end
-end
+type DecTree =
+  DecLeaf(case_idx: i64, bindings: [PatBinding])
+  | DecCtorSwitch(scrutinee_id: i64, branches: [CtorBranch], fallback: Option<DecTree>)
+  | DecLitSwitch(scrutinee_id: i64, branches: [LitBranch], fallback: DecTree)
+  | DecRecordDestructure(scrutinee_id: i64, field_names: [string], field_ids: [i64], subtree: DecTree)
+  | DecFail
 
-// Recursively collect conditions from nested constructor sub-patterns in fields.
-// Extracts each field, checks if its sub-pattern is a constructor, and ANDs conditions.
-let collect_inner_field_conditions = fn (target_atom: LirAtom, fields: [MirPatternField],
-    ctor_name: string, ctx: LowerCtx, outer_cond: LirAtom, pos: i64) -> PatCondResult do
-  match fields do
-    case [] -> return PatCondResult(ctx: ctx, cond_opt: Some(val: outer_cond))
-    case MirPatternField(name: n_opt, pattern: sub_pat) :: rest ->
-      match sub_pat do
-        case MirPatConstructor(name: _, fields: _) ->
-          // Inner constructor — extract field and recursively collect its condition
-          match ctx do case LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) ->
-            let field_name = match n_opt do
-              case Some(val: n) -> n
-              case None ->
-                match lookup_variant_def(name: ctor_name, enum_defs: ed) do
-                  case Some(val: vd) -> nth_str(xs: get_variant_field_names(vd: vd), n: pos)
-                  case None -> ""
-                end
-            end
-            let heap_idx = constructor_field_heap_index(field_name: field_name, ctor_name: ctor_name, enum_defs: ed)
-            match bind_expr_to_temp(ctx: ctx,
-              expr: LirExprObjectField(value: target_atom, index: heap_idx, typ: TyI64),
-              typ: TyI64) do case BindResult(ctx: ctx2, atom: field_atom) ->
-              match collect_pattern_condition(target_atom: field_atom, pattern: sub_pat, ctx: ctx2) do case PatCondResult(ctx: ctx3, cond_opt: inner_cond_opt) ->
-                match inner_cond_opt do
-                  case Some(val: inner_cond) ->
-                    match bind_expr_to_temp(ctx: ctx3,
-                      expr: LirExprBinary(op: OpAnd, lhs: outer_cond, rhs: inner_cond, typ: TyBool),
-                      typ: TyBool) do case BindResult(ctx: ctx4, atom: and_cond) ->
-                      return collect_inner_field_conditions(target_atom: target_atom, fields: rest,
-                        ctor_name: ctor_name, ctx: ctx4, outer_cond: and_cond, pos: pos + 1)
-                    end
-                  case None ->
-                    return collect_inner_field_conditions(target_atom: target_atom, fields: rest,
-                      ctor_name: ctor_name, ctx: ctx3, outer_cond: outer_cond, pos: pos + 1)
-                end
-              end
-            end
-          end
-        case _ ->
-          // Not a constructor sub-pattern — no additional condition needed
-          return collect_inner_field_conditions(target_atom: target_atom, fields: rest,
-            ctor_name: ctor_name, ctx: ctx, outer_cond: outer_cond, pos: pos + 1)
+type CtorBranch = CtorBranch(ctor_name: string, ctor_tag: i64, arity: i64, field_ids: [i64], subtree: DecTree)
+type LitBranch = LitBranch(lit: Literal, subtree: DecTree)
+
+type AtomEntry = AtomEntry(id: i64, atom: LirAtom, sem_type: TypeExpr)
+
+type DecTreeResult = DecTreeResult(tree: DecTree, next_id: i64)
+
+// ─── List Helpers for Decision Trees ────────────────────────────────────────
+
+let lir_list_take = fn (lst: [MirPattern], n: i64) -> [MirPattern] do
+  match n <= 0 do
+    case true -> return []
+    case false ->
+      match lst do
+        case [] -> return []
+        case x :: rest -> return x :: lir_list_take(lst: rest, n: n - 1)
       end
   end
 end
 
-type PatBindResult = PatBindResult(ctx: LowerCtx)
-
-// Phase 2: Generate field extractions and variable bindings (guarded stmts)
-let collect_pattern_bindings = fn (target_atom: LirAtom, pattern: MirPattern, ctx: LowerCtx) -> PatBindResult do
-  match pattern do
-    case MirPatWildcard ->
-      return PatBindResult(ctx: ctx)
-    case MirPatVariable(name: n, sigil: _) ->
-      match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
-        let typ = atom_type(atom: target_atom)
-        let sem_type = match target_atom do
-          case LirAtomVar(name: vn, typ: _) ->
-            match lookup_type(name: vn, entries: sv) do
-              case Some(val: st) -> st
-              case None -> typ
-            end
-          case _ -> typ
-        end
-        let new_ctx = LowerCtx(
-          vars: insert_type(name: n, typ: typ, entries: v),
-          semantic_vars: insert_type(name: n, typ: sem_type, entries: sv),
-          stmts: LirStmtLet(name: n, typ: typ, expr: LirExprAtom(atom: target_atom)) :: s,
-          temp_counter: c, enum_defs: ed
-        )
-        return PatBindResult(ctx: new_ctx)
+let lir_list_drop = fn (lst: [MirPattern], n: i64) -> [MirPattern] do
+  match n <= 0 do
+    case true -> return lst
+    case false ->
+      match lst do
+        case [] -> return []
+        case _ :: rest -> return lir_list_drop(lst: rest, n: n - 1)
       end
-    case MirPatLiteral(lit: _) ->
-      return PatBindResult(ctx: ctx)
-    case MirPatConstructor(name: n, fields: fields) ->
-      return extract_field_bindings(target_atom: target_atom, fields: fields, ctor_name: n, ctx: ctx, pos: 0)
-    case MirPatRecord(fields: _, is_partial: _) ->
-      return PatBindResult(ctx: ctx)
   end
 end
 
-let nth_str = fn (xs: [string], n: i64) -> string do
-  match xs do
-    case [] -> return ""
+let lir_list_nth_pat = fn (lst: [MirPattern], n: i64) -> MirPattern do
+  match lst do
+    case [] -> return MirPatWildcard
     case x :: rest ->
       match n == 0 do
         case true -> return x
-        case false -> return nth_str(xs: rest, n: n - 1)
+        case false -> return lir_list_nth_pat(lst: rest, n: n - 1)
       end
   end
 end
 
-let extract_field_bindings = fn (target_atom: LirAtom, fields: [MirPatternField],
-                                  ctor_name: string, ctx: LowerCtx, pos: i64) -> PatBindResult do
-  match fields do
-    case [] -> return PatBindResult(ctx: ctx)
-    case MirPatternField(name: name_opt, pattern: pat) :: rest ->
-      match ctx do case LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) ->
-        // For positional fields (name=None), resolve name from enum definition
-        let field_name = match name_opt do
-          case Some(val: n) -> n
-          case None ->
-            match lookup_variant_def(name: ctor_name, enum_defs: ed) do
-              case Some(val: vd) -> nth_str(xs: get_variant_field_names(vd: vd), n: pos)
-              case None -> ""
-            end
-        end
-        let heap_idx = constructor_field_heap_index(field_name: field_name, ctor_name: ctor_name, enum_defs: ed)
-        let field_sem_type = constructor_field_type(field_name: field_name, ctor_name: ctor_name, enum_defs: ed)
-        let field_wt = wasm_type(typ: field_sem_type)
-        match bind_expr_to_temp_semantic(ctx: ctx,
-          expr: LirExprObjectField(value: target_atom, index: heap_idx, typ: field_wt),
-          typ: field_wt, semantic_type: field_sem_type) do case BindResult(ctx: ctx2, atom: field_atom) ->
-          match bind_sub_pattern(atom: field_atom, pattern: pat, ctx: ctx2) do case PatBindResult(ctx: ctx3) ->
-            return extract_field_bindings(target_atom: target_atom, fields: rest,
-                                          ctor_name: ctor_name, ctx: ctx3, pos: pos + 1)
-          end
-        end
+let lir_ids_take = fn (lst: [i64], n: i64) -> [i64] do
+  match n <= 0 do
+    case true -> return []
+    case false ->
+      match lst do
+        case [] -> return []
+        case x :: rest -> return x :: lir_ids_take(lst: rest, n: n - 1)
       end
   end
 end
 
-let bind_sub_pattern = fn (atom: LirAtom, pattern: MirPattern, ctx: LowerCtx) -> PatBindResult do
-  match pattern do
-    case MirPatVariable(name: n, sigil: _) ->
-      match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
-        let typ = atom_type(atom: atom)
-        let sem_type = match atom do
-          case LirAtomVar(name: vn, typ: _) ->
-            match lookup_type(name: vn, entries: sv) do
-              case Some(val: st) -> st
-              case None -> typ
-            end
-          case _ -> typ
-        end
-        let new_ctx = LowerCtx(
-          vars: insert_type(name: n, typ: typ, entries: v),
-          semantic_vars: insert_type(name: n, typ: sem_type, entries: sv),
-          stmts: LirStmtLet(name: n, typ: typ, expr: LirExprAtom(atom: atom)) :: s,
-          temp_counter: c, enum_defs: ed
-        )
-        return PatBindResult(ctx: new_ctx)
+let lir_ids_drop = fn (lst: [i64], n: i64) -> [i64] do
+  match n <= 0 do
+    case true -> return lst
+    case false ->
+      match lst do
+        case [] -> return []
+        case _ :: rest -> return lir_ids_drop(lst: rest, n: n - 1)
       end
-    case MirPatWildcard ->
-      return PatBindResult(ctx: ctx)
+  end
+end
+
+let lir_id_nth = fn (lst: [i64], n: i64) -> i64 do
+  match lst do
+    case [] -> return 0
+    case x :: rest ->
+      match n == 0 do
+        case true -> return x
+        case false -> return lir_id_nth(lst: rest, n: n - 1)
+      end
+  end
+end
+
+let lir_str_contains = fn (lst: [string], name: string) -> bool do
+  match lst do
+    case [] -> return false
+    case x :: rest ->
+      match x == name do
+        case true -> return true
+        case false -> return lir_str_contains(lst: rest, name: name)
+      end
+  end
+end
+
+let lir_str_index = fn (lst: [string], name: string, idx: i64) -> i64 do
+  match lst do
+    case [] -> return 0 - 1
+    case x :: rest ->
+      match x == name do
+        case true -> return idx
+        case false -> return lir_str_index(lst: rest, name: name, idx: idx + 1)
+      end
+  end
+end
+
+let lir_repeat_wildcard = fn (n: i64) -> [MirPattern] do
+  match n <= 0 do
+    case true -> return []
+    case false -> return MirPatWildcard :: lir_repeat_wildcard(n: n - 1)
+  end
+end
+
+let lir_alloc_ids = fn (n: i64, next_id: i64) -> [i64] do
+  match n <= 0 do
+    case true -> return []
+    case false -> return next_id :: lir_alloc_ids(n: n - 1, next_id: next_id + 1)
+  end
+end
+
+let lir_append_pats = fn (a: [MirPattern], b: [MirPattern]) -> [MirPattern] do
+  match a do
+    case [] -> return b
+    case x :: rest -> return x :: lir_append_pats(a: rest, b: b)
+  end
+end
+
+let lir_append_ids = fn (a: [i64], b: [i64]) -> [i64] do
+  match a do
+    case [] -> return b
+    case x :: rest -> return x :: lir_append_ids(a: rest, b: b)
+  end
+end
+
+let lir_lit_eq = fn (a: Literal, b: Literal) -> bool do
+  match a do
+    case LitInt(val: ai) ->
+      match b do case LitInt(val: bi) -> return ai == bi case _ -> return false end
+    case LitBool(val: ab) ->
+      match b do case LitBool(val: bb) -> return ab == bb case _ -> return false end
+    case LitString(val: as_) ->
+      match b do case LitString(val: bs) -> return as_ == bs case _ -> return false end
+    case LitChar(val: ac) ->
+      match b do case LitChar(val: bc) -> return ac == bc case _ -> return false end
+    case LitUnit ->
+      match b do case LitUnit -> return true case _ -> return false end
+    case _ -> return false
+  end
+end
+
+let lir_lit_in_list = fn (lit: Literal, lst: [Literal]) -> bool do
+  match lst do
+    case [] -> return false
+    case x :: rest ->
+      match lir_lit_eq(a: lit, b: x) do
+        case true -> return true
+        case false -> return lir_lit_in_list(lit: lit, lst: rest)
+      end
+  end
+end
+
+let lookup_atom_entry = fn (id: i64, atoms: [AtomEntry]) -> AtomEntry do
+  match atoms do
+    case [] -> return AtomEntry(id: id, atom: LirAtomUnit, sem_type: TyUnit)
+    case AtomEntry(id: eid, atom: a, sem_type: st) :: rest ->
+      match eid == id do
+        case true -> return AtomEntry(id: eid, atom: a, sem_type: st)
+        case false -> return lookup_atom_entry(id: id, atoms: rest)
+      end
+  end
+end
+
+let lir_reverse_ctors = fn (lst: [CtorBranch], acc: [CtorBranch]) -> [CtorBranch] do
+  match lst do
+    case [] -> return acc
+    case x :: rest -> return lir_reverse_ctors(lst: rest, acc: x :: acc)
+  end
+end
+
+let lir_reverse_lit_branches = fn (lst: [LitBranch], acc: [LitBranch]) -> [LitBranch] do
+  match lst do
+    case [] -> return acc
+    case x :: rest -> return lir_reverse_lit_branches(lst: rest, acc: x :: acc)
+  end
+end
+
+// ─── Decision Tree Construction (Maranget) ──────────────────────────────────
+
+// Find leftmost column with a non-wildcard, non-variable pattern.
+let lir_find_active_column = fn (rows: [PatRow], n_cols: i64) -> Option<i64> do
+  return lir_scan_columns(rows: rows, n_cols: n_cols, col: 0)
+end
+
+let lir_scan_columns = fn (rows: [PatRow], n_cols: i64, col: i64) -> Option<i64> do
+  match col >= n_cols do
+    case true -> return None
+    case false ->
+      match lir_column_has_active(rows: rows, col: col) do
+        case true -> return Some(val: col)
+        case false -> return lir_scan_columns(rows: rows, n_cols: n_cols, col: col + 1)
+      end
+  end
+end
+
+let lir_column_has_active = fn (rows: [PatRow], col: i64) -> bool do
+  match rows do
+    case [] -> return false
+    case PatRow(pats: pats, case_idx: _, bindings: _) :: rest ->
+      match lir_list_nth_pat(lst: pats, n: col) do
+        case MirPatWildcard -> return lir_column_has_active(rows: rest, col: col)
+        case MirPatVariable(name: _, sigil: _) -> return lir_column_has_active(rows: rest, col: col)
+        case _ -> return true
+      end
+  end
+end
+
+// Build a decision tree from a pattern matrix.
+let lir_build_decision_tree = fn (rows: [PatRow], col_ids: [i64], next_id: i64, enum_defs: [EnumDef]) -> DecTreeResult do
+  match rows do
+    case [] -> return DecTreeResult(tree: DecFail, next_id: next_id)
     case _ ->
-      // Nested constructor/literal patterns: extract bindings recursively
-      match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
-        // Generate nested condition stmts (included in guarded body)
-        let nested_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed)
-        match collect_pattern_condition(target_atom: atom, pattern: pattern, ctx: nested_ctx) do case PatCondResult(ctx: ctx2, cond_opt: _) ->
-          return collect_pattern_bindings(target_atom: atom, pattern: pattern, ctx: ctx2)
+      let n_cols = lir_ids_length(lst: col_ids)
+      match lir_find_active_column(rows: rows, n_cols: n_cols) do
+        case None ->
+          // First row matches unconditionally — collect variable bindings
+          match rows do
+            case [] -> return DecTreeResult(tree: DecFail, next_id: next_id)
+            case PatRow(pats: pats, case_idx: ci, bindings: bs) :: _ ->
+            let all_bs = lir_collect_var_bindings(pats: pats, col_ids: col_ids, idx: 0, acc: bs)
+            return DecTreeResult(tree: DecLeaf(case_idx: ci, bindings: all_bs), next_id: next_id)
+          end
+        case Some(val: col) ->
+          // Determine what kind of pattern is active
+          match lir_first_active_pat(rows: rows, col: col) do
+            case MirPatConstructor(name: _, fields: _) ->
+              return lir_build_ctor_switch(rows: rows, col: col, col_ids: col_ids, next_id: next_id, enum_defs: enum_defs)
+            case MirPatLiteral(lit: _) ->
+              return lir_build_lit_switch(rows: rows, col: col, col_ids: col_ids, next_id: next_id, enum_defs: enum_defs)
+            case MirPatRecord(fields: _, is_partial: _) ->
+              let fnames = lir_collect_record_fields(rows: rows, col: col)
+              let sorted_fnames = lir_sort_strings(lst: fnames)
+              return lir_build_record_destructure(rows: rows, col: col, col_ids: col_ids,
+                field_names: sorted_fnames, next_id: next_id, enum_defs: enum_defs)
+            case _ -> return DecTreeResult(tree: DecFail, next_id: next_id)
+          end
+      end
+  end
+end
+
+let lir_ids_length = fn (lst: [i64]) -> i64 do
+  match lst do
+    case [] -> return 0
+    case _ :: rest -> return 1 + lir_ids_length(lst: rest)
+  end
+end
+
+let lir_collect_var_bindings = fn (pats: [MirPattern], col_ids: [i64], idx: i64, acc: [PatBinding]) -> [PatBinding] do
+  match pats do
+    case [] -> return acc
+    case p :: rest ->
+      let scr_id = lir_id_nth(lst: col_ids, n: idx)
+      match p do
+        case MirPatVariable(name: n, sigil: _) ->
+          return lir_collect_var_bindings(pats: rest, col_ids: col_ids, idx: idx + 1,
+            acc: PatBinding(name: n, scrutinee_id: scr_id) :: acc)
+        case _ ->
+          return lir_collect_var_bindings(pats: rest, col_ids: col_ids, idx: idx + 1, acc: acc)
+      end
+  end
+end
+
+let lir_first_active_pat = fn (rows: [PatRow], col: i64) -> MirPattern do
+  match rows do
+    case [] -> return MirPatWildcard
+    case PatRow(pats: pats, case_idx: _, bindings: _) :: rest ->
+      match lir_list_nth_pat(lst: pats, n: col) do
+        case MirPatWildcard -> return lir_first_active_pat(rows: rest, col: col)
+        case MirPatVariable(name: _, sigil: _) -> return lir_first_active_pat(rows: rest, col: col)
+        case p -> return p
+      end
+  end
+end
+
+// Collect unique constructor names from column.
+let lir_collect_ctor_names = fn (rows: [PatRow], col: i64) -> [string] do
+  return lir_collect_ctor_names_go(rows: rows, col: col, seen: [])
+end
+
+let lir_collect_ctor_names_go = fn (rows: [PatRow], col: i64, seen: [string]) -> [string] do
+  match rows do
+    case [] -> return seen
+    case PatRow(pats: pats, case_idx: _, bindings: _) :: rest ->
+      match lir_list_nth_pat(lst: pats, n: col) do
+        case MirPatConstructor(name: n, fields: _) ->
+          match lir_str_contains(lst: seen, name: n) do
+            case true -> return lir_collect_ctor_names_go(rows: rest, col: col, seen: seen)
+            case false ->
+              let new_seen = lir_append_strings(a: seen, b: [n])
+              return lir_collect_ctor_names_go(rows: rest, col: col, seen: new_seen)
+          end
+        case _ -> return lir_collect_ctor_names_go(rows: rest, col: col, seen: seen)
+      end
+  end
+end
+
+let lir_append_strings = fn (a: [string], b: [string]) -> [string] do
+  match a do
+    case [] -> return b
+    case x :: rest -> return x :: lir_append_strings(a: rest, b: b)
+  end
+end
+
+// Collect unique literals from column.
+let lir_collect_lits = fn (rows: [PatRow], col: i64) -> [Literal] do
+  return lir_collect_lits_go(rows: rows, col: col, seen: [])
+end
+
+let lir_collect_lits_go = fn (rows: [PatRow], col: i64, seen: [Literal]) -> [Literal] do
+  match rows do
+    case [] -> return seen
+    case PatRow(pats: pats, case_idx: _, bindings: _) :: rest ->
+      match lir_list_nth_pat(lst: pats, n: col) do
+        case MirPatLiteral(lit: l) ->
+          match lir_lit_in_list(lit: l, lst: seen) do
+            case true -> return lir_collect_lits_go(rows: rest, col: col, seen: seen)
+            case false ->
+              let new_seen = lir_append_lits(a: seen, b: [l])
+              return lir_collect_lits_go(rows: rest, col: col, seen: new_seen)
+          end
+        case _ -> return lir_collect_lits_go(rows: rest, col: col, seen: seen)
+      end
+  end
+end
+
+let lir_append_lits = fn (a: [Literal], b: [Literal]) -> [Literal] do
+  match a do
+    case [] -> return b
+    case x :: rest -> return x :: lir_append_lits(a: rest, b: b)
+  end
+end
+
+// Collect unique record field names from column.
+let lir_collect_record_fields = fn (rows: [PatRow], col: i64) -> [string] do
+  return lir_collect_record_fields_go(rows: rows, col: col, seen: [])
+end
+
+let lir_collect_record_fields_go = fn (rows: [PatRow], col: i64, seen: [string]) -> [string] do
+  match rows do
+    case [] -> return seen
+    case PatRow(pats: pats, case_idx: _, bindings: _) :: rest ->
+      match lir_list_nth_pat(lst: pats, n: col) do
+        case MirPatRecord(fields: fields, is_partial: _) ->
+          let new_seen = lir_add_record_field_names(fields: fields, seen: seen)
+          return lir_collect_record_fields_go(rows: rest, col: col, seen: new_seen)
+        case _ -> return lir_collect_record_fields_go(rows: rest, col: col, seen: seen)
+      end
+  end
+end
+
+let lir_add_record_field_names = fn (fields: [MirRecordPatField], seen: [string]) -> [string] do
+  match fields do
+    case [] -> return seen
+    case MirRecordPatField(name: n, pattern: _) :: rest ->
+      match lir_str_contains(lst: seen, name: n) do
+        case true -> return lir_add_record_field_names(fields: rest, seen: seen)
+        case false -> return lir_add_record_field_names(fields: rest, seen: lir_append_strings(a: seen, b: [n]))
+      end
+  end
+end
+
+// Simple insertion sort for strings.
+let lir_sort_strings = fn (lst: [string]) -> [string] do
+  match lst do
+    case [] -> return []
+    case x :: rest -> return lir_insert_sorted(val: x, sorted: lir_sort_strings(lst: rest))
+  end
+end
+
+let lir_insert_sorted = fn (val: string, sorted: [string]) -> [string] do
+  match sorted do
+    case [] -> return [val]
+    case x :: rest ->
+      // val <= x means val < x || val == x
+      match lir_str_less_than(a: val, b: x) || val == x do
+        case true -> return val :: sorted
+        case false -> return x :: lir_insert_sorted(val: val, sorted: rest)
+      end
+  end
+end
+
+// ─── Build CtorSwitch ───────────────────────────────────────────────────────
+
+let lir_build_ctor_switch = fn (rows: [PatRow], col: i64, col_ids: [i64],
+    next_id: i64, enum_defs: [EnumDef]) -> DecTreeResult do
+  let scr_id = lir_id_nth(lst: col_ids, n: col)
+  let ctor_names = lir_collect_ctor_names(rows: rows, col: col)
+  // Build branches for each constructor
+  match lir_build_ctor_branches(ctor_names: ctor_names, rows: rows, col: col, col_ids: col_ids,
+      next_id: next_id, enum_defs: enum_defs) do case CtorBranchesResult(branches: branches, next_id: nid2) ->
+    // Build default matrix
+    let default_rows = lir_default_matrix(rows: rows, col: col, col_ids: col_ids)
+    let new_col_ids = lir_append_ids(a: lir_ids_take(lst: col_ids, n: col),
+                                      b: lir_ids_drop(lst: col_ids, n: col + 1))
+    match default_rows do
+      case [] ->
+        return DecTreeResult(tree: DecCtorSwitch(scrutinee_id: scr_id, branches: branches, fallback: None), next_id: nid2)
+      case _ ->
+        match lir_build_decision_tree(rows: default_rows, col_ids: new_col_ids, next_id: nid2, enum_defs: enum_defs) do case DecTreeResult(tree: fb, next_id: nid3) ->
+          return DecTreeResult(tree: DecCtorSwitch(scrutinee_id: scr_id, branches: branches, fallback: Some(val: fb)), next_id: nid3)
         end
+    end
+  end
+end
+
+type CtorBranchesResult = CtorBranchesResult(branches: [CtorBranch], next_id: i64)
+
+let lir_build_ctor_branches = fn (ctor_names: [string], rows: [PatRow], col: i64,
+    col_ids: [i64], next_id: i64, enum_defs: [EnumDef]) -> CtorBranchesResult do
+  match ctor_names do
+    case [] -> return CtorBranchesResult(branches: [], next_id: next_id)
+    case cn :: rest_names ->
+      let arity = lookup_constructor_arity(name: cn, enum_defs: enum_defs, fallback: 0)
+      let field_ids = lir_alloc_ids(n: arity, next_id: next_id)
+      let nid2 = next_id + arity
+      // Build new col_ids: replace col with field_ids
+      let new_col_ids = lir_append_ids(a: lir_ids_take(lst: col_ids, n: col),
+                          b: lir_append_ids(a: field_ids, b: lir_ids_drop(lst: col_ids, n: col + 1)))
+      // Specialize rows
+      let spec_rows = lir_specialize_ctor(rows: rows, col: col, col_ids: col_ids, ctor_name: cn,
+                                            arity: arity, enum_defs: enum_defs)
+      match lir_build_decision_tree(rows: spec_rows, col_ids: new_col_ids, next_id: nid2, enum_defs: enum_defs) do case DecTreeResult(tree: subtree, next_id: nid3) ->
+        let tag = constructor_tag(name: cn, arity: arity)
+        let branch = CtorBranch(ctor_name: cn, ctor_tag: tag, arity: arity, field_ids: field_ids, subtree: subtree)
+        match lir_build_ctor_branches(ctor_names: rest_names, rows: rows, col: col, col_ids: col_ids,
+            next_id: nid3, enum_defs: enum_defs) do case CtorBranchesResult(branches: rest_branches, next_id: nid4) ->
+          return CtorBranchesResult(branches: branch :: rest_branches, next_id: nid4)
+        end
+      end
+  end
+end
+
+// Specialize rows for a specific constructor.
+let lir_specialize_ctor = fn (rows: [PatRow], col: i64, col_ids: [i64],
+    ctor_name: string, arity: i64, enum_defs: [EnumDef]) -> [PatRow] do
+  match rows do
+    case [] -> return []
+    case PatRow(pats: pats, case_idx: ci, bindings: bs) :: rest ->
+      let pat = lir_list_nth_pat(lst: pats, n: col)
+      let rest_spec = lir_specialize_ctor(rows: rest, col: col, col_ids: col_ids,
+                                            ctor_name: ctor_name, arity: arity, enum_defs: enum_defs)
+      match pat do
+        case MirPatConstructor(name: n, fields: fields) ->
+          match n == ctor_name do
+            case true ->
+              // Reorder sub-patterns to definition order
+              let sub_pats = lir_reorder_ctor_fields(fields: fields, ctor_name: ctor_name,
+                                                       arity: arity, enum_defs: enum_defs)
+              let new_pats = lir_append_pats(a: lir_list_take(lst: pats, n: col),
+                              b: lir_append_pats(a: sub_pats, b: lir_list_drop(lst: pats, n: col + 1)))
+              return PatRow(pats: new_pats, case_idx: ci, bindings: bs) :: rest_spec
+            case false -> return rest_spec
+          end
+        case MirPatWildcard ->
+          let wild_pats = lir_repeat_wildcard(n: arity)
+          let new_pats = lir_append_pats(a: lir_list_take(lst: pats, n: col),
+                          b: lir_append_pats(a: wild_pats, b: lir_list_drop(lst: pats, n: col + 1)))
+          return PatRow(pats: new_pats, case_idx: ci, bindings: bs) :: rest_spec
+        case MirPatVariable(name: vn, sigil: _) ->
+          let scr_id = lir_id_nth(lst: col_ids, n: col)
+          let new_bs = PatBinding(name: vn, scrutinee_id: scr_id) :: bs
+          let wild_pats = lir_repeat_wildcard(n: arity)
+          let new_pats = lir_append_pats(a: lir_list_take(lst: pats, n: col),
+                          b: lir_append_pats(a: wild_pats, b: lir_list_drop(lst: pats, n: col + 1)))
+          return PatRow(pats: new_pats, case_idx: ci, bindings: new_bs) :: rest_spec
+        case _ -> return rest_spec
+      end
+  end
+end
+
+// Reorder constructor fields to definition order.
+let lir_reorder_ctor_fields = fn (fields: [MirPatternField], ctor_name: string,
+    arity: i64, enum_defs: [EnumDef]) -> [MirPattern] do
+  let base = lir_repeat_wildcard(n: arity)
+  match lookup_variant_def(name: ctor_name, enum_defs: enum_defs) do
+    case Some(val: vd) ->
+      let def_names = get_variant_field_names(vd: vd)
+      return lir_place_fields(fields: fields, base: base, def_names: def_names, pos: 0)
+    case None ->
+      return lir_extract_field_pats(fields: fields)
+  end
+end
+
+let lir_place_fields = fn (fields: [MirPatternField], base: [MirPattern],
+    def_names: [string], pos: i64) -> [MirPattern] do
+  match fields do
+    case [] -> return base
+    case MirPatternField(name: name_opt, pattern: p) :: rest ->
+      let def_idx = match name_opt do
+        case Some(val: n) -> lir_str_index(lst: def_names, name: n, idx: 0)
+        case None -> pos
+      end
+      let new_base = lir_set_nth_pat(lst: base, idx: def_idx, val: p)
+      return lir_place_fields(fields: rest, base: new_base, def_names: def_names, pos: pos + 1)
+  end
+end
+
+let lir_set_nth_pat = fn (lst: [MirPattern], idx: i64, val: MirPattern) -> [MirPattern] do
+  match lst do
+    case [] -> return []
+    case x :: rest ->
+      match idx == 0 do
+        case true -> return val :: rest
+        case false -> return x :: lir_set_nth_pat(lst: rest, idx: idx - 1, val: val)
+      end
+  end
+end
+
+let lir_extract_field_pats = fn (fields: [MirPatternField]) -> [MirPattern] do
+  match fields do
+    case [] -> return []
+    case MirPatternField(name: _, pattern: p) :: rest -> return p :: lir_extract_field_pats(fields: rest)
+  end
+end
+
+// ─── Build LitSwitch ────────────────────────────────────────────────────────
+
+let lir_build_lit_switch = fn (rows: [PatRow], col: i64, col_ids: [i64],
+    next_id: i64, enum_defs: [EnumDef]) -> DecTreeResult do
+  let scr_id = lir_id_nth(lst: col_ids, n: col)
+  let lits = lir_collect_lits(rows: rows, col: col)
+  let new_col_ids = lir_append_ids(a: lir_ids_take(lst: col_ids, n: col),
+                                    b: lir_ids_drop(lst: col_ids, n: col + 1))
+  match lir_build_lit_branches(lits: lits, rows: rows, col: col, col_ids: col_ids,
+      new_col_ids: new_col_ids, next_id: next_id, enum_defs: enum_defs) do case LitBranchesResult(branches: branches, next_id: nid2) ->
+    let default_rows = lir_default_matrix(rows: rows, col: col, col_ids: col_ids)
+    match lir_build_decision_tree(rows: default_rows, col_ids: new_col_ids, next_id: nid2, enum_defs: enum_defs) do case DecTreeResult(tree: fb, next_id: nid3) ->
+      return DecTreeResult(tree: DecLitSwitch(scrutinee_id: scr_id, branches: branches, fallback: fb), next_id: nid3)
+    end
+  end
+end
+
+type LitBranchesResult = LitBranchesResult(branches: [LitBranch], next_id: i64)
+
+let lir_build_lit_branches = fn (lits: [Literal], rows: [PatRow], col: i64,
+    col_ids: [i64], new_col_ids: [i64], next_id: i64, enum_defs: [EnumDef]) -> LitBranchesResult do
+  match lits do
+    case [] -> return LitBranchesResult(branches: [], next_id: next_id)
+    case l :: rest_lits ->
+      let spec_rows = lir_specialize_literal(rows: rows, col: col, col_ids: col_ids, lit: l)
+      match lir_build_decision_tree(rows: spec_rows, col_ids: new_col_ids, next_id: next_id, enum_defs: enum_defs) do case DecTreeResult(tree: subtree, next_id: nid2) ->
+        match lir_build_lit_branches(lits: rest_lits, rows: rows, col: col, col_ids: col_ids,
+            new_col_ids: new_col_ids, next_id: nid2, enum_defs: enum_defs) do case LitBranchesResult(branches: rest_branches, next_id: nid3) ->
+          return LitBranchesResult(branches: LitBranch(lit: l, subtree: subtree) :: rest_branches, next_id: nid3)
+        end
+      end
+  end
+end
+
+// Specialize rows for a specific literal.
+let lir_specialize_literal = fn (rows: [PatRow], col: i64, col_ids: [i64], lit: Literal) -> [PatRow] do
+  match rows do
+    case [] -> return []
+    case PatRow(pats: pats, case_idx: ci, bindings: bs) :: rest ->
+      let pat = lir_list_nth_pat(lst: pats, n: col)
+      let rest_spec = lir_specialize_literal(rows: rest, col: col, col_ids: col_ids, lit: lit)
+      match pat do
+        case MirPatLiteral(lit: l) ->
+          match lir_lit_eq(a: l, b: lit) do
+            case true ->
+              let new_pats = lir_append_pats(a: lir_list_take(lst: pats, n: col),
+                              b: lir_list_drop(lst: pats, n: col + 1))
+              return PatRow(pats: new_pats, case_idx: ci, bindings: bs) :: rest_spec
+            case false -> return rest_spec
+          end
+        case MirPatWildcard ->
+          let new_pats = lir_append_pats(a: lir_list_take(lst: pats, n: col),
+                          b: lir_list_drop(lst: pats, n: col + 1))
+          return PatRow(pats: new_pats, case_idx: ci, bindings: bs) :: rest_spec
+        case MirPatVariable(name: vn, sigil: _) ->
+          let scr_id = lir_id_nth(lst: col_ids, n: col)
+          let new_bs = PatBinding(name: vn, scrutinee_id: scr_id) :: bs
+          let new_pats = lir_append_pats(a: lir_list_take(lst: pats, n: col),
+                          b: lir_list_drop(lst: pats, n: col + 1))
+          return PatRow(pats: new_pats, case_idx: ci, bindings: new_bs) :: rest_spec
+        case _ -> return rest_spec
+      end
+  end
+end
+
+// ─── Build RecordDestructure ────────────────────────────────────────────────
+
+let lir_build_record_destructure = fn (rows: [PatRow], col: i64, col_ids: [i64],
+    field_names: [string], next_id: i64, enum_defs: [EnumDef]) -> DecTreeResult do
+  let scr_id = lir_id_nth(lst: col_ids, n: col)
+  let k = lir_strings_length(lst: field_names)
+  let field_ids = lir_alloc_ids(n: k, next_id: next_id)
+  let nid2 = next_id + k
+  let new_col_ids = lir_append_ids(a: lir_ids_take(lst: col_ids, n: col),
+                      b: lir_append_ids(a: field_ids, b: lir_ids_drop(lst: col_ids, n: col + 1)))
+  let spec_rows = lir_specialize_record(rows: rows, col: col, col_ids: col_ids,
+                                          field_names: field_names, k: k)
+  match lir_build_decision_tree(rows: spec_rows, col_ids: new_col_ids, next_id: nid2, enum_defs: enum_defs) do case DecTreeResult(tree: subtree, next_id: nid3) ->
+    return DecTreeResult(tree: DecRecordDestructure(scrutinee_id: scr_id, field_names: field_names,
+                                                      field_ids: field_ids, subtree: subtree), next_id: nid3)
+  end
+end
+
+let lir_strings_length = fn (lst: [string]) -> i64 do
+  match lst do
+    case [] -> return 0
+    case _ :: rest -> return 1 + lir_strings_length(lst: rest)
+  end
+end
+
+let lir_specialize_record = fn (rows: [PatRow], col: i64, col_ids: [i64],
+    field_names: [string], k: i64) -> [PatRow] do
+  match rows do
+    case [] -> return []
+    case PatRow(pats: pats, case_idx: ci, bindings: bs) :: rest ->
+      let pat = lir_list_nth_pat(lst: pats, n: col)
+      let rest_spec = lir_specialize_record(rows: rest, col: col, col_ids: col_ids,
+                                              field_names: field_names, k: k)
+      match pat do
+        case MirPatRecord(fields: fields, is_partial: _) ->
+          let sub_pats = lir_expand_record_fields(fields: fields, field_names: field_names, k: k)
+          let new_pats = lir_append_pats(a: lir_list_take(lst: pats, n: col),
+                          b: lir_append_pats(a: sub_pats, b: lir_list_drop(lst: pats, n: col + 1)))
+          return PatRow(pats: new_pats, case_idx: ci, bindings: bs) :: rest_spec
+        case MirPatWildcard ->
+          let wild_pats = lir_repeat_wildcard(n: k)
+          let new_pats = lir_append_pats(a: lir_list_take(lst: pats, n: col),
+                          b: lir_append_pats(a: wild_pats, b: lir_list_drop(lst: pats, n: col + 1)))
+          return PatRow(pats: new_pats, case_idx: ci, bindings: bs) :: rest_spec
+        case MirPatVariable(name: vn, sigil: _) ->
+          let scr_id = lir_id_nth(lst: col_ids, n: col)
+          let new_bs = PatBinding(name: vn, scrutinee_id: scr_id) :: bs
+          let wild_pats = lir_repeat_wildcard(n: k)
+          let new_pats = lir_append_pats(a: lir_list_take(lst: pats, n: col),
+                          b: lir_append_pats(a: wild_pats, b: lir_list_drop(lst: pats, n: col + 1)))
+          return PatRow(pats: new_pats, case_idx: ci, bindings: new_bs) :: rest_spec
+        case _ -> return rest_spec
+      end
+  end
+end
+
+let lir_expand_record_fields = fn (fields: [MirRecordPatField], field_names: [string], k: i64) -> [MirPattern] do
+  let base = lir_repeat_wildcard(n: k)
+  return lir_place_record_pats(fields: fields, base: base, field_names: field_names)
+end
+
+let lir_place_record_pats = fn (fields: [MirRecordPatField], base: [MirPattern], field_names: [string]) -> [MirPattern] do
+  match fields do
+    case [] -> return base
+    case MirRecordPatField(name: n, pattern: p) :: rest ->
+      let idx = lir_str_index(lst: field_names, name: n, idx: 0)
+      let new_base = lir_set_nth_pat(lst: base, idx: idx, val: p)
+      return lir_place_record_pats(fields: rest, base: new_base, field_names: field_names)
+  end
+end
+
+// ─── Default Matrix ─────────────────────────────────────────────────────────
+
+let lir_default_matrix = fn (rows: [PatRow], col: i64, col_ids: [i64]) -> [PatRow] do
+  match rows do
+    case [] -> return []
+    case PatRow(pats: pats, case_idx: ci, bindings: bs) :: rest ->
+      let pat = lir_list_nth_pat(lst: pats, n: col)
+      let rest_default = lir_default_matrix(rows: rest, col: col, col_ids: col_ids)
+      match pat do
+        case MirPatWildcard ->
+          let new_pats = lir_append_pats(a: lir_list_take(lst: pats, n: col),
+                          b: lir_list_drop(lst: pats, n: col + 1))
+          return PatRow(pats: new_pats, case_idx: ci, bindings: bs) :: rest_default
+        case MirPatVariable(name: vn, sigil: _) ->
+          let scr_id = lir_id_nth(lst: col_ids, n: col)
+          let new_bs = PatBinding(name: vn, scrutinee_id: scr_id) :: bs
+          let new_pats = lir_append_pats(a: lir_list_take(lst: pats, n: col),
+                          b: lir_list_drop(lst: pats, n: col + 1))
+          return PatRow(pats: new_pats, case_idx: ci, bindings: new_bs) :: rest_default
+        case _ -> return rest_default
       end
   end
 end
@@ -1076,85 +1566,164 @@ let lower_branch_body = fn (body: [MirStmt], result_name: string, result_type: T
   end
 end
 
-// ─── Match Expression Lowering ───────────────────────────────────────────────
+// ─── Decision Tree Match Lowering ────────────────────────────────────────────
 
+// Lower match expression using Maranget decision tree.
 let lower_match_expr = fn (target: MirExpr, cases: [MirMatchCase], ctx: LowerCtx) -> BindResult do
   match lower_expr_to_atom(expr: target, ctx: ctx) do case BindResult(ctx: ctx2, atom: target_atom) ->
     match cases do
       case [] -> return BindResult(ctx: ctx2, atom: LirAtomUnit)
       case _ ->
-        // Lower all cases to get accurate types
-        match lower_match_cases_expr(cases: cases, target_atom: target_atom, ctx: ctx2) do case LowerMatchCasesExprResult(ctx: ctx3, lowered: lowered) ->
-          // Infer semantic type from first case value
-          let sem_type = infer_case_value_type(cases: lowered, ctx: ctx3)
-          let result_type = wasm_type(typ: sem_type)
-          match new_temp(ctx: ctx3) do case TempResult(ctx: LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed), name: result_name) ->
-            let ctx5 = LowerCtx(
+        let target_sem = lir_get_atom_sem_type(atom: target_atom, ctx: ctx2)
+        // Infer result type from case bodies
+        let sem_type = lir_infer_match_result_type(cases: cases, ctx: ctx2)
+        let result_type = wasm_type(typ: sem_type)
+        match new_temp(ctx: ctx2) do case TempResult(ctx: ctx3, name: result_name) ->
+          match ctx3 do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
+            let ctx4 = LowerCtx(
               vars: insert_type(name: result_name, typ: result_type, entries: v),
               semantic_vars: insert_type(name: result_name, typ: sem_type, entries: sv),
               stmts: LirStmtLet(name: result_name, typ: result_type,
                              expr: LirExprAtom(atom: default_atom(typ: result_type))) :: s,
               temp_counter: c, enum_defs: ed
             )
-            // Build nested if chain
-            match build_match_if_chain(cases: lowered, result_name: result_name,
-                                        result_type: result_type) do
-              case MatchIfChainResult(outer_cond_stmts: ocs, chain: chain_opt) ->
-                match chain_opt do
-                  case Some(val: if_stmt) ->
-                    match ctx5 do case LowerCtx(vars: v2, semantic_vars: sv2, stmts: s2, temp_counter: c2, enum_defs: ed2) ->
-                      // Add outer cond_stmts then the if chain to scope
-                      let s3 = push_stmts_to_reverse(stmts: ocs, acc: s2)
-                      let ctx6 = LowerCtx(vars: v2, semantic_vars: sv2,
-                        stmts: if_stmt :: s3, temp_counter: c2, enum_defs: ed2)
-                      return BindResult(ctx: ctx6, atom: LirAtomVar(name: result_name, typ: result_type))
-                    end
-                  case None ->
-                    return BindResult(ctx: ctx5, atom: LirAtomVar(name: result_name, typ: result_type))
+            // Build pattern matrix and decision tree
+            let rows = lir_cases_to_rows(cases: cases, idx: 0)
+            match lir_build_decision_tree(rows: rows, col_ids: [0], next_id: 1, enum_defs: ed) do case DecTreeResult(tree: tree, next_id: _) ->
+              let atoms = [AtomEntry(id: 0, atom: target_atom, sem_type: target_sem)]
+              match lir_emit_decision_tree_expr(tree: tree, atoms: atoms, cases: cases,
+                  result_name: result_name, result_type: result_type, ctx: ctx4) do case EmitExprResult(ctx: ctx5, chain_stmts: chain) ->
+                match ctx5 do case LowerCtx(vars: v5, semantic_vars: sv5, stmts: s5, temp_counter: c5, enum_defs: ed5) ->
+                  let s6 = push_stmts_to_reverse(stmts: chain, acc: s5)
+                  let ctx6 = LowerCtx(vars: v5, semantic_vars: sv5, stmts: s6, temp_counter: c5, enum_defs: ed5)
+                  return BindResult(ctx: ctx6, atom: LirAtomVar(name: result_name, typ: result_type))
                 end
+              end
+            end
           end
-        end
         end
     end
   end
 end
 
-type LoweredMatchCase = LoweredMatchCase(cond: Option<LirAtom>, cond_stmts: [LirStmt], stmts: [LirStmt], value: LirAtom)
-
-type LowerMatchCasesExprResult = LowerMatchCasesExprResult(ctx: LowerCtx, lowered: [LoweredMatchCase])
-
-let lower_match_cases_expr = fn (cases: [MirMatchCase], target_atom: LirAtom, ctx: LowerCtx) -> LowerMatchCasesExprResult do
-  match cases do
-    case [] -> return LowerMatchCasesExprResult(ctx: ctx, lowered: [])
-    case MirMatchCase(pattern: pat, body: body) :: rest ->
-      match lower_match_case_expr(target_atom: target_atom, pattern: pat, body: body, ctx: ctx) do case LoweredMatchCase(cond: cond, cond_stmts: cs, stmts: stmts, value: val) ->
-        // We need to get the updated ctx — but lower_match_case_expr returns the case in isolation
-        // The ctx continues with updated temp_counter
-        match lower_match_cases_expr(cases: rest, target_atom: target_atom, ctx: ctx) do case LowerMatchCasesExprResult(ctx: ctx2, lowered: rest_lowered) ->
-          return LowerMatchCasesExprResult(ctx: ctx2,
-            lowered: LoweredMatchCase(cond: cond, cond_stmts: cs, stmts: stmts, value: val) :: rest_lowered)
+let lir_get_atom_sem_type = fn (atom: LirAtom, ctx: LowerCtx) -> TypeExpr do
+  match atom do
+    case LirAtomVar(name: n, typ: t) ->
+      match ctx do case LowerCtx(vars: _, semantic_vars: sv, stmts: _, temp_counter: _, enum_defs: _) ->
+        match lookup_type(name: n, entries: sv) do
+          case Some(val: st) -> return st
+          case None -> return t
         end
+      end
+    case _ -> return atom_type(atom: atom)
+  end
+end
+
+let lir_infer_match_result_type = fn (cases: [MirMatchCase], ctx: LowerCtx) -> TypeExpr do
+  match cases do
+    case [] -> return TyUnit
+    case MirMatchCase(pattern: _, body: body) :: rest ->
+      match body do
+        case [] -> return lir_infer_match_result_type(cases: rest, ctx: ctx)
+        case _ ->
+          let t = infer_semantic_type(expr: lir_last_mir_expr(body: body), ctx: ctx)
+          match t do
+            case TyUnit -> return lir_infer_match_result_type(cases: rest, ctx: ctx)
+            case _ -> return t
+          end
       end
   end
 end
 
-let lower_match_case_expr = fn (target_atom: LirAtom, pattern: MirPattern, body: [MirStmt], ctx: LowerCtx) -> LoweredMatchCase do
-  match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: _, temp_counter: c, enum_defs: ed) ->
-    // Phase 1: Generate condition in isolation
-    let cond_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: [], temp_counter: c, enum_defs: ed)
-    match collect_pattern_condition(target_atom: target_atom, pattern: pattern, ctx: cond_ctx) do case PatCondResult(ctx: ctx2, cond_opt: cond_opt) ->
-      match ctx2 do case LowerCtx(vars: v2, semantic_vars: sv2, stmts: cond_stmts, temp_counter: c2, enum_defs: _) ->
-        // Phase 2: Generate bindings in isolation
-        let bind_ctx = LowerCtx(vars: v2, semantic_vars: sv2, stmts: [], temp_counter: c2, enum_defs: ed)
-        match collect_pattern_bindings(target_atom: target_atom, pattern: pattern, ctx: bind_ctx) do case PatBindResult(ctx: ctx3) ->
-          match ctx3 do case LowerCtx(vars: v3, semantic_vars: sv3, stmts: bind_stmts, temp_counter: c3, enum_defs: _) ->
-            // Phase 3: Lower body with bindings in scope
-            let body_ctx = LowerCtx(vars: v3, semantic_vars: sv3, stmts: [], temp_counter: c3, enum_defs: ed)
-            match lower_case_body_value(body: body, ctx: body_ctx) do case CaseBodyValueResult(stmts: body_stmts, value: val) ->
-              let guarded_stmts = append_stmts(stmts: reverse_stmts(stmts: bind_stmts), tail: body_stmts)
-              return LoweredMatchCase(cond: cond_opt,
-                cond_stmts: reverse_stmts(stmts: cond_stmts),
-                stmts: guarded_stmts, value: val)
+let lir_last_mir_expr = fn (body: [MirStmt]) -> MirExpr do
+  match body do
+    case [] -> return MirLiteral(lit: LitUnit)
+    case [MirStmtExpr(expr: e)] -> return e
+    case [MirStmtReturn(expr: e)] -> return e
+    case _ :: rest -> return lir_last_mir_expr(body: rest)
+  end
+end
+
+let lir_cases_to_rows = fn (cases: [MirMatchCase], idx: i64) -> [PatRow] do
+  match cases do
+    case [] -> return []
+    case MirMatchCase(pattern: p, body: _) :: rest ->
+      return PatRow(pats: [p], case_idx: idx, bindings: []) :: lir_cases_to_rows(cases: rest, idx: idx + 1)
+  end
+end
+
+// ─── Decision Tree Emission (Expr Mode) ─────────────────────────────────────
+
+type EmitExprResult = EmitExprResult(ctx: LowerCtx, chain_stmts: [LirStmt])
+
+let lir_emit_decision_tree_expr = fn (tree: DecTree, atoms: [AtomEntry], cases: [MirMatchCase],
+    result_name: string, result_type: TypeExpr, ctx: LowerCtx) -> EmitExprResult do
+  match tree do
+    case DecFail -> return EmitExprResult(ctx: ctx, chain_stmts: [])
+    case DecLeaf(case_idx: ci, bindings: bs) ->
+      return lir_emit_leaf_expr(case_idx: ci, bindings: bs, atoms: atoms, cases: cases,
+                                  result_name: result_name, result_type: result_type, ctx: ctx)
+    case DecCtorSwitch(scrutinee_id: sid, branches: branches, fallback: fb) ->
+      return lir_emit_ctor_switch_expr(scrutinee_id: sid, branches: branches, fallback: fb,
+        atoms: atoms, cases: cases, result_name: result_name, result_type: result_type, ctx: ctx)
+    case DecLitSwitch(scrutinee_id: sid, branches: branches, fallback: fb) ->
+      return lir_emit_lit_switch_expr(scrutinee_id: sid, branches: branches, fallback: fb,
+        atoms: atoms, cases: cases, result_name: result_name, result_type: result_type, ctx: ctx)
+    case DecRecordDestructure(scrutinee_id: sid, field_names: fns, field_ids: fids, subtree: st) ->
+      return lir_emit_record_expr(scrutinee_id: sid, field_names: fns, field_ids: fids, subtree: st,
+        atoms: atoms, cases: cases, result_name: result_name, result_type: result_type, ctx: ctx)
+  end
+end
+
+let lir_emit_leaf_expr = fn (case_idx: i64, bindings: [PatBinding], atoms: [AtomEntry],
+    cases: [MirMatchCase], result_name: string, result_type: TypeExpr, ctx: LowerCtx) -> EmitExprResult do
+  let case_body = lir_nth_case_body(cases: cases, idx: case_idx)
+  // Set up scoped vars and emit bindings
+  let ctx2 = lir_emit_bindings(bindings: bindings, atoms: atoms, ctx: ctx)
+  // Lower body for value extraction
+  match lower_branch_body(body: case_body, result_name: result_name, result_type: result_type, ctx: ctx2) do case BranchBodyResult(ctx: ctx3, value_opt: val_opt) ->
+    // Extract stmts emitted during body lowering
+    match ctx3 do case LowerCtx(vars: _, semantic_vars: _, stmts: body_stmts, temp_counter: c3, enum_defs: _) ->
+      match ctx do case LowerCtx(vars: v0, semantic_vars: sv0, stmts: s0, temp_counter: _, enum_defs: ed0) ->
+        let restored_ctx = LowerCtx(vars: v0, semantic_vars: sv0, stmts: s0, temp_counter: c3, enum_defs: ed0)
+        // Assign value if body produced one
+        let leaf_stmts = reverse_stmts(stmts: body_stmts)
+        let final_stmts = match val_opt do
+          case Some(val: va) ->
+            append_stmts(stmts: leaf_stmts, tail: [LirStmtLet(name: result_name, typ: result_type, expr: LirExprAtom(atom: va))])
+          case None -> leaf_stmts
+        end
+        return EmitExprResult(ctx: restored_ctx, chain_stmts: final_stmts)
+      end
+    end
+  end
+end
+
+let lir_emit_ctor_switch_expr = fn (scrutinee_id: i64, branches: [CtorBranch], fallback: Option<DecTree>,
+    atoms: [AtomEntry], cases: [MirMatchCase], result_name: string, result_type: TypeExpr, ctx: LowerCtx) -> EmitExprResult do
+  match lookup_atom_entry(id: scrutinee_id, atoms: atoms) do case AtomEntry(id: _, atom: scr_atom, sem_type: scr_sem) ->
+    // Extract tag
+    match bind_expr_to_temp(ctx: ctx, expr: LirExprObjectTag(value: scr_atom, typ: TyI64), typ: TyI64) do case BindResult(ctx: ctx2, atom: tag_atom) ->
+      // Pre-compute conditions
+      let has_fb = match fallback do case Some(val: _) -> true case None -> false end
+      match lir_emit_ctor_conds(branches: branches, tag_atom: tag_atom, has_fb: has_fb, pos: 0, ctx: ctx2) do case CtorCondsResult(ctx: ctx3, conds: conds) ->
+        // Extract cond stmts from ctx
+        match ctx3 do case LowerCtx(vars: _, semantic_vars: _, stmts: cond_stmts, temp_counter: c3, enum_defs: _) ->
+          match ctx do case LowerCtx(vars: v0, semantic_vars: sv0, stmts: s0, temp_counter: _, enum_defs: ed0) ->
+            let base_ctx = LowerCtx(vars: v0, semantic_vars: sv0, stmts: s0, temp_counter: c3, enum_defs: ed0)
+            // Build chain: start with fallback
+            match lir_emit_fb_expr(fallback: fallback, atoms: atoms, cases: cases,
+                result_name: result_name, result_type: result_type, ctx: base_ctx) do case EmitExprResult(ctx: ctx4, chain_stmts: chain_else) ->
+              // Process branches in reverse
+              let rev_branches = lir_reverse_ctors(lst: branches, acc: [])
+              let rev_conds = lir_reverse_atoms(lst: conds, acc: [])
+              match lir_build_expr_chain(branches: rev_branches, conds: rev_conds, scr_atom: scr_atom,
+                  scr_sem: scr_sem, atoms: atoms, cases: cases, result_name: result_name,
+                  result_type: result_type, chain_else: chain_else, ctx: ctx4) do case EmitExprResult(ctx: ctx5, chain_stmts: final_chain) ->
+                // Prepend cond stmts
+                let all_stmts = append_stmts(stmts: reverse_stmts(stmts: cond_stmts), tail: final_chain)
+                return EmitExprResult(ctx: ctx5, chain_stmts: all_stmts)
+              end
             end
           end
         end
@@ -1163,80 +1732,498 @@ let lower_match_case_expr = fn (target_atom: LirAtom, pattern: MirPattern, body:
   end
 end
 
-type CaseBodyValueResult = CaseBodyValueResult(stmts: [LirStmt], value: LirAtom)
+type CtorCondsResult = CtorCondsResult(ctx: LowerCtx, conds: [LirAtom])
 
-let lower_case_body_value = fn (body: [MirStmt], ctx: LowerCtx) -> CaseBodyValueResult do
-  match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: _, temp_counter: c, enum_defs: ed) ->
-    let work_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: [], temp_counter: c, enum_defs: ed)
-    match lower_branch_body(body: body, result_name: "__case_val", result_type: TyI64, ctx: work_ctx) do case BranchBodyResult(ctx: LowerCtx(vars: _, semantic_vars: _, stmts: branch_stmts, temp_counter: _, enum_defs: _), value_opt: val_opt) ->
-      let stmts = reverse_stmts(stmts: branch_stmts)
-      let val = match val_opt do
-        case Some(val: a) -> a
-        case None -> LirAtomUnit
+let lir_emit_ctor_conds = fn (branches: [CtorBranch], tag_atom: LirAtom, has_fb: bool, pos: i64, ctx: LowerCtx) -> CtorCondsResult do
+  match branches do
+    case [] -> return CtorCondsResult(ctx: ctx, conds: [])
+    case CtorBranch(ctor_name: _, ctor_tag: tag, arity: _, field_ids: _, subtree: _) :: rest ->
+      let n_branches = lir_ctors_length(lst: branches)
+      let is_last_no_fb = (pos == n_branches - 1) && (has_fb == false)
+      match is_last_no_fb do
+        case true ->
+          match lir_emit_ctor_conds(branches: rest, tag_atom: tag_atom, has_fb: has_fb, pos: pos + 1, ctx: ctx) do case CtorCondsResult(ctx: ctx2, conds: rest_conds) ->
+            return CtorCondsResult(ctx: ctx2, conds: LirAtomBool(val: true) :: rest_conds)
+          end
+        case false ->
+          match bind_expr_to_temp(ctx: ctx,
+            expr: LirExprBinary(op: OpEq, lhs: tag_atom, rhs: LirAtomInt(val: tag), typ: TyBool),
+            typ: TyBool) do case BindResult(ctx: ctx2, atom: cond) ->
+            match lir_emit_ctor_conds(branches: rest, tag_atom: tag_atom, has_fb: has_fb, pos: pos + 1, ctx: ctx2) do case CtorCondsResult(ctx: ctx3, conds: rest_conds) ->
+              return CtorCondsResult(ctx: ctx3, conds: cond :: rest_conds)
+            end
+          end
       end
-      return CaseBodyValueResult(stmts: stmts, value: val)
+  end
+end
+
+let lir_ctors_length = fn (lst: [CtorBranch]) -> i64 do
+  match lst do
+    case [] -> return 0
+    case _ :: rest -> return 1 + lir_ctors_length(lst: rest)
+  end
+end
+
+let lir_emit_fb_expr = fn (fallback: Option<DecTree>, atoms: [AtomEntry], cases: [MirMatchCase],
+    result_name: string, result_type: TypeExpr, ctx: LowerCtx) -> EmitExprResult do
+  match fallback do
+    case None -> return EmitExprResult(ctx: ctx, chain_stmts: [])
+    case Some(val: fb) ->
+      return lir_emit_decision_tree_expr(tree: fb, atoms: atoms, cases: cases,
+        result_name: result_name, result_type: result_type, ctx: ctx)
+  end
+end
+
+let lir_build_expr_chain = fn (branches: [CtorBranch], conds: [LirAtom], scr_atom: LirAtom,
+    scr_sem: TypeExpr, atoms: [AtomEntry], cases: [MirMatchCase], result_name: string,
+    result_type: TypeExpr, chain_else: [LirStmt], ctx: LowerCtx) -> EmitExprResult do
+  match branches do
+    case [] -> return EmitExprResult(ctx: ctx, chain_stmts: chain_else)
+    case CtorBranch(ctor_name: cn, ctor_tag: _, arity: ar, field_ids: fids, subtree: st) :: rest_b ->
+      match conds do
+        case [] -> return EmitExprResult(ctx: ctx, chain_stmts: chain_else)
+        case cond :: rest_c ->
+        // Extract fields and emit subtree
+        match lir_extract_ctor_fields(scr_atom: scr_atom, scr_sem: scr_sem, ctor_name: cn,
+            arity: ar, field_ids: fids, atoms: atoms, ctx: ctx) do case FieldExtractResult(ctx: ctx2, atoms: atoms2, field_stmts: fstmts) ->
+          match lir_emit_decision_tree_expr(tree: st, atoms: atoms2, cases: cases,
+              result_name: result_name, result_type: result_type, ctx: ctx2) do case EmitExprResult(ctx: ctx3, chain_stmts: sub_stmts) ->
+            let then_body = append_stmts(stmts: fstmts, tail: sub_stmts)
+            let if_stmt = LirStmtIf(cond: cond, then_body: then_body, else_body: chain_else)
+            return lir_build_expr_chain(branches: rest_b, conds: rest_c, scr_atom: scr_atom,
+              scr_sem: scr_sem, atoms: atoms, cases: cases, result_name: result_name,
+              result_type: result_type, chain_else: [if_stmt], ctx: ctx3)
+          end
+        end
+      end
+  end
+end
+
+type FieldExtractResult = FieldExtractResult(ctx: LowerCtx, atoms: [AtomEntry], field_stmts: [LirStmt])
+
+let lir_extract_ctor_fields = fn (scr_atom: LirAtom, scr_sem: TypeExpr, ctor_name: string,
+    arity: i64, field_ids: [i64], atoms: [AtomEntry], ctx: LowerCtx) -> FieldExtractResult do
+  match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: saved, temp_counter: c, enum_defs: ed) ->
+    let work_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: [], temp_counter: c, enum_defs: ed)
+    match lir_extract_fields_loop(scr_atom: scr_atom, scr_sem: scr_sem, ctor_name: ctor_name,
+        field_ids: field_ids, idx: 0, arity: arity, atoms: atoms, ctx: work_ctx,
+        enum_defs: ed) do case FieldLoopResult(ctx: ctx2, atoms: atoms2) ->
+      match ctx2 do case LowerCtx(vars: _, semantic_vars: _, stmts: field_stmts, temp_counter: c2, enum_defs: _) ->
+        let restored = LowerCtx(vars: v, semantic_vars: sv, stmts: saved, temp_counter: c2, enum_defs: ed)
+        return FieldExtractResult(ctx: restored, atoms: atoms2, field_stmts: reverse_stmts(stmts: field_stmts))
+      end
     end
   end
 end
 
-let infer_case_value_type = fn (cases: [LoweredMatchCase], ctx: LowerCtx) -> TypeExpr do
-  match cases do
-    case [] -> return TyUnit
-    case LoweredMatchCase(cond: _, cond_stmts: _, stmts: _, value: val) :: rest ->
-      let t = atom_type(atom: val)
-      match t do
-        case TyUnit -> return infer_case_value_type(cases: rest, ctx: ctx)
-        case _ ->
-          // For Var atoms, look up their semantic type
-          match val do
-            case LirAtomVar(name: n, typ: _) ->
-              match ctx do case LowerCtx(vars: _, semantic_vars: sv, stmts: _, temp_counter: _, enum_defs: _) ->
-                match lookup_type(name: n, entries: sv) do
-                  case Some(val: st) -> return st
-                  case None -> return t
-                end
-              end
-            case _ -> return t
-          end
+type FieldLoopResult = FieldLoopResult(ctx: LowerCtx, atoms: [AtomEntry])
+
+let lir_extract_fields_loop = fn (scr_atom: LirAtom, scr_sem: TypeExpr, ctor_name: string,
+    field_ids: [i64], idx: i64, arity: i64, atoms: [AtomEntry], ctx: LowerCtx,
+    enum_defs: [EnumDef]) -> FieldLoopResult do
+  match idx >= arity do
+    case true -> return FieldLoopResult(ctx: ctx, atoms: atoms)
+    case false ->
+      let fid = lir_id_nth(lst: field_ids, n: idx)
+      // Get field name from enum def
+      let field_name = match lookup_variant_def(name: ctor_name, enum_defs: enum_defs) do
+        case Some(val: vd) ->
+          let names = get_variant_field_names(vd: vd)
+          match lir_nth_string(lst: names, n: idx) do case s -> s end
+        case None -> ""
+      end
+      let heap_idx = constructor_field_heap_index(field_name: field_name, ctor_name: ctor_name, enum_defs: enum_defs)
+      let sem_ft = constructor_field_type(field_name: field_name, ctor_name: ctor_name, enum_defs: enum_defs)
+      let wasm_ft = wasm_type(typ: sem_ft)
+      match bind_expr_to_temp_semantic(ctx: ctx,
+        expr: LirExprObjectField(value: scr_atom, index: heap_idx, typ: wasm_ft),
+        typ: wasm_ft, semantic_type: sem_ft) do case BindResult(ctx: ctx2, atom: field_atom) ->
+        let new_atoms = AtomEntry(id: fid, atom: field_atom, sem_type: sem_ft) :: atoms
+        return lir_extract_fields_loop(scr_atom: scr_atom, scr_sem: scr_sem, ctor_name: ctor_name,
+          field_ids: field_ids, idx: idx + 1, arity: arity, atoms: new_atoms, ctx: ctx2,
+          enum_defs: enum_defs)
       end
   end
 end
 
-type MatchIfChainResult = MatchIfChainResult(outer_cond_stmts: [LirStmt], chain: Option<LirStmt>)
-
-let build_match_if_chain = fn (cases: [LoweredMatchCase], result_name: string, result_type: TypeExpr) -> MatchIfChainResult do
-  // Build reversed (cases processed last-to-first to nest else bodies)
-  return build_chain_reversed(cases: reverse_lowered_cases(cases: cases), chain: None,
-                               pending_cond_stmts: [],
-                               result_name: result_name, result_type: result_type)
+let lir_nth_string = fn (lst: [string], n: i64) -> string do
+  match lst do
+    case [] -> return ""
+    case x :: rest ->
+      match n == 0 do
+        case true -> return x
+        case false -> return lir_nth_string(lst: rest, n: n - 1)
+      end
+  end
 end
 
-let build_chain_reversed = fn (cases: [LoweredMatchCase], chain: Option<LirStmt>,
-                                pending_cond_stmts: [LirStmt],
-                                result_name: string, result_type: TypeExpr) -> MatchIfChainResult do
-  match cases do
-    case [] -> return MatchIfChainResult(outer_cond_stmts: pending_cond_stmts, chain: chain)
-    case LoweredMatchCase(cond: cond_opt, cond_stmts: cs, stmts: case_stmts, value: val) :: rest ->
-      // Inner case's cond_stmts go into else_body (before the nested if)
-      let else_body = match chain do
-        case Some(val: stmt) -> append_stmts(stmts: pending_cond_stmts, tail: [stmt])
-        case None -> []
-      end
-      let cond = match else_body do
-        case [] -> LirAtomBool(val: true)
-        case _ ->
-          match cond_opt do
-            case Some(val: c) -> c
-            case None -> LirAtomBool(val: true)
+let lir_emit_lit_switch_expr = fn (scrutinee_id: i64, branches: [LitBranch], fallback: DecTree,
+    atoms: [AtomEntry], cases: [MirMatchCase], result_name: string, result_type: TypeExpr, ctx: LowerCtx) -> EmitExprResult do
+  match lookup_atom_entry(id: scrutinee_id, atoms: atoms) do case AtomEntry(id: _, atom: scr_atom, sem_type: _) ->
+    // Pre-compute conditions
+    match lir_emit_lit_conds(branches: branches, scr_atom: scr_atom, ctx: ctx) do case LitCondsResult(ctx: ctx2, conds: conds) ->
+      match ctx2 do case LowerCtx(vars: _, semantic_vars: _, stmts: cond_stmts, temp_counter: c2, enum_defs: _) ->
+        match ctx do case LowerCtx(vars: v0, semantic_vars: sv0, stmts: s0, temp_counter: _, enum_defs: ed0) ->
+          let base_ctx = LowerCtx(vars: v0, semantic_vars: sv0, stmts: s0, temp_counter: c2, enum_defs: ed0)
+          // Start with fallback
+          match lir_emit_decision_tree_expr(tree: fallback, atoms: atoms, cases: cases,
+              result_name: result_name, result_type: result_type, ctx: base_ctx) do case EmitExprResult(ctx: ctx3, chain_stmts: chain_else) ->
+            let rev_branches = lir_reverse_lit_branches(lst: branches, acc: [])
+            let rev_conds = lir_reverse_atoms(lst: conds, acc: [])
+            match lir_build_lit_expr_chain(branches: rev_branches, conds: rev_conds, atoms: atoms,
+                cases: cases, result_name: result_name, result_type: result_type,
+                chain_else: chain_else, ctx: ctx3) do case EmitExprResult(ctx: ctx4, chain_stmts: final_chain) ->
+              let all_stmts = append_stmts(stmts: reverse_stmts(stmts: cond_stmts), tail: final_chain)
+              return EmitExprResult(ctx: ctx4, chain_stmts: all_stmts)
+            end
           end
+        end
       end
-      let assign_stmt = LirStmtLet(name: result_name, typ: result_type,
-                                    expr: LirExprAtom(atom: val))
-      let then_body = append_stmts(stmts: case_stmts, tail: [assign_stmt])
-      let if_stmt = LirStmtIf(cond: cond, then_body: then_body, else_body: else_body)
-      return build_chain_reversed(cases: rest, chain: Some(val: if_stmt),
-                                   pending_cond_stmts: cs,
-                                   result_name: result_name, result_type: result_type)
+    end
+  end
+end
+
+type LitCondsResult = LitCondsResult(ctx: LowerCtx, conds: [LirAtom])
+
+let lir_emit_lit_conds = fn (branches: [LitBranch], scr_atom: LirAtom, ctx: LowerCtx) -> LitCondsResult do
+  match branches do
+    case [] -> return LitCondsResult(ctx: ctx, conds: [])
+    case LitBranch(lit: l, subtree: _) :: rest ->
+      let lit_atom = literal_to_atom(lit: l)
+      match bind_expr_to_temp(ctx: ctx,
+        expr: LirExprBinary(op: OpEq, lhs: scr_atom, rhs: lit_atom, typ: TyBool),
+        typ: TyBool) do case BindResult(ctx: ctx2, atom: cond) ->
+        match lir_emit_lit_conds(branches: rest, scr_atom: scr_atom, ctx: ctx2) do case LitCondsResult(ctx: ctx3, conds: rest_conds) ->
+          return LitCondsResult(ctx: ctx3, conds: cond :: rest_conds)
+        end
+      end
+  end
+end
+
+let lir_build_lit_expr_chain = fn (branches: [LitBranch], conds: [LirAtom], atoms: [AtomEntry],
+    cases: [MirMatchCase], result_name: string, result_type: TypeExpr,
+    chain_else: [LirStmt], ctx: LowerCtx) -> EmitExprResult do
+  match branches do
+    case [] -> return EmitExprResult(ctx: ctx, chain_stmts: chain_else)
+    case LitBranch(lit: _, subtree: st) :: rest_b ->
+      match conds do
+        case [] -> return EmitExprResult(ctx: ctx, chain_stmts: chain_else)
+        case cond :: rest_c ->
+        match lir_emit_decision_tree_expr(tree: st, atoms: atoms, cases: cases,
+            result_name: result_name, result_type: result_type, ctx: ctx) do case EmitExprResult(ctx: ctx2, chain_stmts: sub_stmts) ->
+          let if_stmt = LirStmtIf(cond: cond, then_body: sub_stmts, else_body: chain_else)
+          return lir_build_lit_expr_chain(branches: rest_b, conds: rest_c, atoms: atoms,
+            cases: cases, result_name: result_name, result_type: result_type,
+            chain_else: [if_stmt], ctx: ctx2)
+        end
+      end
+  end
+end
+
+let lir_emit_record_expr = fn (scrutinee_id: i64, field_names: [string], field_ids: [i64],
+    subtree: DecTree, atoms: [AtomEntry], cases: [MirMatchCase],
+    result_name: string, result_type: TypeExpr, ctx: LowerCtx) -> EmitExprResult do
+  match lookup_atom_entry(id: scrutinee_id, atoms: atoms) do case AtomEntry(id: _, atom: scr_atom, sem_type: scr_sem) ->
+    match lir_extract_record_fields(scr_atom: scr_atom, scr_sem: scr_sem,
+        field_names: field_names, field_ids: field_ids, atoms: atoms, ctx: ctx) do case FieldExtractResult(ctx: ctx2, atoms: atoms2, field_stmts: fstmts) ->
+      match lir_emit_decision_tree_expr(tree: subtree, atoms: atoms2, cases: cases,
+          result_name: result_name, result_type: result_type, ctx: ctx2) do case EmitExprResult(ctx: ctx3, chain_stmts: sub_stmts) ->
+        return EmitExprResult(ctx: ctx3, chain_stmts: append_stmts(stmts: fstmts, tail: sub_stmts))
+      end
+    end
+  end
+end
+
+let lir_extract_record_fields = fn (scr_atom: LirAtom, scr_sem: TypeExpr,
+    field_names: [string], field_ids: [i64], atoms: [AtomEntry], ctx: LowerCtx) -> FieldExtractResult do
+  match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: saved, temp_counter: c, enum_defs: ed) ->
+    let work_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: [], temp_counter: c, enum_defs: ed)
+    match lir_extract_record_loop(scr_atom: scr_atom, scr_sem: scr_sem,
+        field_names: field_names, field_ids: field_ids, atoms: atoms, ctx: work_ctx) do case FieldLoopResult(ctx: ctx2, atoms: atoms2) ->
+      match ctx2 do case LowerCtx(vars: _, semantic_vars: _, stmts: field_stmts, temp_counter: c2, enum_defs: _) ->
+        let restored = LowerCtx(vars: v, semantic_vars: sv, stmts: saved, temp_counter: c2, enum_defs: ed)
+        return FieldExtractResult(ctx: restored, atoms: atoms2, field_stmts: reverse_stmts(stmts: field_stmts))
+      end
+    end
+  end
+end
+
+let lir_extract_record_loop = fn (scr_atom: LirAtom, scr_sem: TypeExpr,
+    field_names: [string], field_ids: [i64], atoms: [AtomEntry], ctx: LowerCtx) -> FieldLoopResult do
+  match field_names do
+    case [] -> return FieldLoopResult(ctx: ctx, atoms: atoms)
+    case fn_ :: rest_names ->
+      match field_ids do
+        case [] -> return FieldLoopResult(ctx: ctx, atoms: atoms)
+        case fid :: rest_ids ->
+        // Look up field type from record semantic type
+        let field_type = lir_record_field_type(sem: scr_sem, name: fn_)
+        let sorted_idx = lir_record_sorted_idx(sem: scr_sem, name: fn_)
+        let wasm_ft = wasm_type(typ: field_type)
+        match bind_expr_to_temp_semantic(ctx: ctx,
+          expr: LirExprObjectField(value: scr_atom, index: sorted_idx, typ: wasm_ft),
+          typ: wasm_ft, semantic_type: field_type) do case BindResult(ctx: ctx2, atom: field_atom) ->
+          let new_atoms = AtomEntry(id: fid, atom: field_atom, sem_type: field_type) :: atoms
+          return lir_extract_record_loop(scr_atom: scr_atom, scr_sem: scr_sem,
+            field_names: rest_names, field_ids: rest_ids, atoms: new_atoms, ctx: ctx2)
+        end
+      end
+  end
+end
+
+let lir_record_field_type = fn (sem: TypeExpr, name: string) -> TypeExpr do
+  match sem do
+    case TyRecord(fields: fields) ->
+      return lir_find_named_type(fields: fields, name: name)
+    case _ -> return TyI64
+  end
+end
+
+let lir_find_named_type = fn (fields: [NamedType], name: string) -> TypeExpr do
+  match fields do
+    case [] -> return TyI64
+    case NamedType(name: fn_, typ: ft) :: rest ->
+      match fn_ == name do
+        case true -> return ft
+        case false -> return lir_find_named_type(fields: rest, name: name)
+      end
+  end
+end
+
+let lir_record_sorted_idx = fn (sem: TypeExpr, name: string) -> i64 do
+  match sem do
+    case TyRecord(fields: fields) ->
+      let names = lir_extract_named_type_names(fields: fields)
+      let sorted = lir_sort_strings(lst: names)
+      return lir_str_index(lst: sorted, name: name, idx: 0)
+    case _ -> return 0
+  end
+end
+
+let lir_extract_named_type_names = fn (fields: [NamedType]) -> [string] do
+  match fields do
+    case [] -> return []
+    case NamedType(name: n, typ: _) :: rest -> return n :: lir_extract_named_type_names(fields: rest)
+  end
+end
+
+let lir_reverse_atoms = fn (lst: [LirAtom], acc: [LirAtom]) -> [LirAtom] do
+  match lst do
+    case [] -> return acc
+    case x :: rest -> return lir_reverse_atoms(lst: rest, acc: x :: acc)
+  end
+end
+
+let lir_emit_bindings = fn (bindings: [PatBinding], atoms: [AtomEntry], ctx: LowerCtx) -> LowerCtx do
+  match bindings do
+    case [] -> return ctx
+    case PatBinding(name: n, scrutinee_id: sid) :: rest ->
+      match lookup_atom_entry(id: sid, atoms: atoms) do case AtomEntry(id: _, atom: a, sem_type: st) ->
+        match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
+          let typ = atom_type(atom: a)
+          let ctx2 = LowerCtx(
+            vars: insert_type(name: n, typ: typ, entries: v),
+            semantic_vars: insert_type(name: n, typ: st, entries: sv),
+            stmts: LirStmtLet(name: n, typ: typ, expr: LirExprAtom(atom: a)) :: s,
+            temp_counter: c, enum_defs: ed
+          )
+          return lir_emit_bindings(bindings: rest, atoms: atoms, ctx: ctx2)
+        end
+      end
+  end
+end
+
+let lir_nth_case_body = fn (cases: [MirMatchCase], idx: i64) -> [MirStmt] do
+  match cases do
+    case [] -> return []
+    case MirMatchCase(pattern: _, body: b) :: rest ->
+      match idx == 0 do
+        case true -> return b
+        case false -> return lir_nth_case_body(cases: rest, idx: idx - 1)
+      end
+  end
+end
+
+// ─── Decision Tree Emission (Stmt Mode) ─────────────────────────────────────
+
+type EmitStmtResult = EmitStmtResult(ctx: LowerCtx, chain_stmts: [LirStmt])
+
+let lir_emit_decision_tree_stmt = fn (tree: DecTree, atoms: [AtomEntry], cases: [MirMatchCase],
+    ret_type: TypeExpr, ctx: LowerCtx) -> EmitStmtResult do
+  match tree do
+    case DecFail -> return EmitStmtResult(ctx: ctx, chain_stmts: [])
+    case DecLeaf(case_idx: ci, bindings: bs) ->
+      return lir_emit_leaf_stmt(case_idx: ci, bindings: bs, atoms: atoms, cases: cases,
+                                  ret_type: ret_type, ctx: ctx)
+    case DecCtorSwitch(scrutinee_id: sid, branches: branches, fallback: fb) ->
+      return lir_emit_ctor_switch_stmt(scrutinee_id: sid, branches: branches, fallback: fb,
+        atoms: atoms, cases: cases, ret_type: ret_type, ctx: ctx)
+    case DecLitSwitch(scrutinee_id: sid, branches: branches, fallback: fb) ->
+      return lir_emit_lit_switch_stmt(scrutinee_id: sid, branches: branches, fallback: fb,
+        atoms: atoms, cases: cases, ret_type: ret_type, ctx: ctx)
+    case DecRecordDestructure(scrutinee_id: sid, field_names: fns, field_ids: fids, subtree: st) ->
+      return lir_emit_record_stmt(scrutinee_id: sid, field_names: fns, field_ids: fids, subtree: st,
+        atoms: atoms, cases: cases, ret_type: ret_type, ctx: ctx)
+  end
+end
+
+let lir_emit_leaf_stmt = fn (case_idx: i64, bindings: [PatBinding], atoms: [AtomEntry],
+    cases: [MirMatchCase], ret_type: TypeExpr, ctx: LowerCtx) -> EmitStmtResult do
+  let case_body = lir_nth_case_body(cases: cases, idx: case_idx)
+  let ctx2 = lir_emit_bindings(bindings: bindings, atoms: atoms, ctx: ctx)
+  match lower_block(stmts: case_body, ret_type: ret_type, ctx: ctx2) do case BlockResult(ctx: ctx3, stmts: body_stmts, ret: case_ret) ->
+    let is_trivial = is_trivially_unit_body(stmts: case_body)
+    let genuine_ret = match case_ret do
+      case Some(val: _) -> case_ret
+      case None -> fallback_ret_from_last_stmt(stmts: body_stmts)
+    end
+    match is_trivial && (match genuine_ret do case None -> true case _ -> false end) do
+      case true ->
+        // Side-effect only — emit stmts inline, wrapped in unconditional IfReturn
+        return EmitStmtResult(ctx: ctx3, chain_stmts: body_stmts)
+      case false ->
+        let then_ret = match genuine_ret do
+          case Some(val: a) -> a
+          case None -> default_atom(typ: ret_type)
+        end
+        let stmt = LirStmtIfReturn(cond: LirAtomBool(val: true), then_body: body_stmts,
+          then_ret: then_ret, else_body: [], else_ret: None, ret_type: ret_type)
+        return EmitStmtResult(ctx: ctx3, chain_stmts: [stmt])
+    end
+  end
+end
+
+let lir_emit_ctor_switch_stmt = fn (scrutinee_id: i64, branches: [CtorBranch], fallback: Option<DecTree>,
+    atoms: [AtomEntry], cases: [MirMatchCase], ret_type: TypeExpr, ctx: LowerCtx) -> EmitStmtResult do
+  match lookup_atom_entry(id: scrutinee_id, atoms: atoms) do case AtomEntry(id: _, atom: scr_atom, sem_type: scr_sem) ->
+    match bind_expr_to_temp(ctx: ctx, expr: LirExprObjectTag(value: scr_atom, typ: TyI64), typ: TyI64) do case BindResult(ctx: ctx2, atom: tag_atom) ->
+      let has_fb = match fallback do case Some(val: _) -> true case None -> false end
+      match lir_emit_ctor_conds(branches: branches, tag_atom: tag_atom, has_fb: has_fb, pos: 0, ctx: ctx2) do case CtorCondsResult(ctx: ctx3, conds: conds) ->
+        match ctx3 do case LowerCtx(vars: _, semantic_vars: _, stmts: cond_stmts, temp_counter: c3, enum_defs: _) ->
+          match ctx do case LowerCtx(vars: v0, semantic_vars: sv0, stmts: s0, temp_counter: _, enum_defs: ed0) ->
+            let base_ctx = LowerCtx(vars: v0, semantic_vars: sv0, stmts: s0, temp_counter: c3, enum_defs: ed0)
+            match lir_emit_fb_stmt(fallback: fallback, atoms: atoms, cases: cases,
+                ret_type: ret_type, ctx: base_ctx) do case EmitStmtResult(ctx: ctx4, chain_stmts: chain_else) ->
+              let rev_branches = lir_reverse_ctors(lst: branches, acc: [])
+              let rev_conds = lir_reverse_atoms(lst: conds, acc: [])
+              match lir_build_stmt_chain(branches: rev_branches, conds: rev_conds, scr_atom: scr_atom,
+                  scr_sem: scr_sem, atoms: atoms, cases: cases, ret_type: ret_type,
+                  chain_else: chain_else, ctx: ctx4) do case EmitStmtResult(ctx: ctx5, chain_stmts: final_chain) ->
+                let all_stmts = append_stmts(stmts: reverse_stmts(stmts: cond_stmts), tail: final_chain)
+                return EmitStmtResult(ctx: ctx5, chain_stmts: all_stmts)
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+let lir_emit_fb_stmt = fn (fallback: Option<DecTree>, atoms: [AtomEntry], cases: [MirMatchCase],
+    ret_type: TypeExpr, ctx: LowerCtx) -> EmitStmtResult do
+  match fallback do
+    case None -> return EmitStmtResult(ctx: ctx, chain_stmts: [])
+    case Some(val: fb) ->
+      return lir_emit_decision_tree_stmt(tree: fb, atoms: atoms, cases: cases, ret_type: ret_type, ctx: ctx)
+  end
+end
+
+let lir_build_stmt_chain = fn (branches: [CtorBranch], conds: [LirAtom], scr_atom: LirAtom,
+    scr_sem: TypeExpr, atoms: [AtomEntry], cases: [MirMatchCase], ret_type: TypeExpr,
+    chain_else: [LirStmt], ctx: LowerCtx) -> EmitStmtResult do
+  match branches do
+    case [] -> return EmitStmtResult(ctx: ctx, chain_stmts: chain_else)
+    case CtorBranch(ctor_name: cn, ctor_tag: _, arity: ar, field_ids: fids, subtree: st) :: rest_b ->
+      match conds do
+        case [] -> return EmitStmtResult(ctx: ctx, chain_stmts: chain_else)
+        case cond :: rest_c ->
+        match lir_extract_ctor_fields(scr_atom: scr_atom, scr_sem: scr_sem, ctor_name: cn,
+            arity: ar, field_ids: fids, atoms: atoms, ctx: ctx) do case FieldExtractResult(ctx: ctx2, atoms: atoms2, field_stmts: fstmts) ->
+          match lir_emit_decision_tree_stmt(tree: st, atoms: atoms2, cases: cases,
+              ret_type: ret_type, ctx: ctx2) do case EmitStmtResult(ctx: ctx3, chain_stmts: sub_stmts) ->
+            let then_body = append_stmts(stmts: fstmts, tail: sub_stmts)
+            let then_ret_opt = fallback_ret_from_last_stmt(stmts: then_body)
+            match then_ret_opt do
+              case Some(val: then_ret) ->
+                let stmt = LirStmtIfReturn(cond: cond, then_body: then_body, then_ret: then_ret,
+                  else_body: chain_else, else_ret: None, ret_type: ret_type)
+                return lir_build_stmt_chain(branches: rest_b, conds: rest_c, scr_atom: scr_atom,
+                  scr_sem: scr_sem, atoms: atoms, cases: cases, ret_type: ret_type,
+                  chain_else: [stmt], ctx: ctx3)
+              case None ->
+                let stmt = LirStmtIf(cond: cond, then_body: then_body, else_body: chain_else)
+                return lir_build_stmt_chain(branches: rest_b, conds: rest_c, scr_atom: scr_atom,
+                  scr_sem: scr_sem, atoms: atoms, cases: cases, ret_type: ret_type,
+                  chain_else: [stmt], ctx: ctx3)
+            end
+          end
+        end
+      end
+  end
+end
+
+let lir_emit_lit_switch_stmt = fn (scrutinee_id: i64, branches: [LitBranch], fallback: DecTree,
+    atoms: [AtomEntry], cases: [MirMatchCase], ret_type: TypeExpr, ctx: LowerCtx) -> EmitStmtResult do
+  match lookup_atom_entry(id: scrutinee_id, atoms: atoms) do case AtomEntry(id: _, atom: scr_atom, sem_type: _) ->
+    match lir_emit_lit_conds(branches: branches, scr_atom: scr_atom, ctx: ctx) do case LitCondsResult(ctx: ctx2, conds: conds) ->
+      match ctx2 do case LowerCtx(vars: _, semantic_vars: _, stmts: cond_stmts, temp_counter: c2, enum_defs: _) ->
+        match ctx do case LowerCtx(vars: v0, semantic_vars: sv0, stmts: s0, temp_counter: _, enum_defs: ed0) ->
+          let base_ctx = LowerCtx(vars: v0, semantic_vars: sv0, stmts: s0, temp_counter: c2, enum_defs: ed0)
+          match lir_emit_decision_tree_stmt(tree: fallback, atoms: atoms, cases: cases,
+              ret_type: ret_type, ctx: base_ctx) do case EmitStmtResult(ctx: ctx3, chain_stmts: chain_else) ->
+            let rev_branches = lir_reverse_lit_branches(lst: branches, acc: [])
+            let rev_conds = lir_reverse_atoms(lst: conds, acc: [])
+            match lir_build_lit_stmt_chain(branches: rev_branches, conds: rev_conds, atoms: atoms,
+                cases: cases, ret_type: ret_type, chain_else: chain_else, ctx: ctx3) do case EmitStmtResult(ctx: ctx4, chain_stmts: final_chain) ->
+              let all_stmts = append_stmts(stmts: reverse_stmts(stmts: cond_stmts), tail: final_chain)
+              return EmitStmtResult(ctx: ctx4, chain_stmts: all_stmts)
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+let lir_build_lit_stmt_chain = fn (branches: [LitBranch], conds: [LirAtom], atoms: [AtomEntry],
+    cases: [MirMatchCase], ret_type: TypeExpr, chain_else: [LirStmt], ctx: LowerCtx) -> EmitStmtResult do
+  match branches do
+    case [] -> return EmitStmtResult(ctx: ctx, chain_stmts: chain_else)
+    case LitBranch(lit: _, subtree: st) :: rest_b ->
+      match conds do
+        case [] -> return EmitStmtResult(ctx: ctx, chain_stmts: chain_else)
+        case cond :: rest_c ->
+        match lir_emit_decision_tree_stmt(tree: st, atoms: atoms, cases: cases,
+            ret_type: ret_type, ctx: ctx) do case EmitStmtResult(ctx: ctx2, chain_stmts: sub_stmts) ->
+          let then_ret_opt = fallback_ret_from_last_stmt(stmts: sub_stmts)
+          match then_ret_opt do
+            case Some(val: then_ret) ->
+              let stmt = LirStmtIfReturn(cond: cond, then_body: sub_stmts, then_ret: then_ret,
+                else_body: chain_else, else_ret: None, ret_type: ret_type)
+              return lir_build_lit_stmt_chain(branches: rest_b, conds: rest_c, atoms: atoms,
+                cases: cases, ret_type: ret_type, chain_else: [stmt], ctx: ctx2)
+            case None ->
+              let stmt = LirStmtIf(cond: cond, then_body: sub_stmts, else_body: chain_else)
+              return lir_build_lit_stmt_chain(branches: rest_b, conds: rest_c, atoms: atoms,
+                cases: cases, ret_type: ret_type, chain_else: [stmt], ctx: ctx2)
+          end
+        end
+      end
+  end
+end
+
+let lir_emit_record_stmt = fn (scrutinee_id: i64, field_names: [string], field_ids: [i64],
+    subtree: DecTree, atoms: [AtomEntry], cases: [MirMatchCase],
+    ret_type: TypeExpr, ctx: LowerCtx) -> EmitStmtResult do
+  match lookup_atom_entry(id: scrutinee_id, atoms: atoms) do case AtomEntry(id: _, atom: scr_atom, sem_type: scr_sem) ->
+    match lir_extract_record_fields(scr_atom: scr_atom, scr_sem: scr_sem,
+        field_names: field_names, field_ids: field_ids, atoms: atoms, ctx: ctx) do case FieldExtractResult(ctx: ctx2, atoms: atoms2, field_stmts: fstmts) ->
+      match lir_emit_decision_tree_stmt(tree: subtree, atoms: atoms2, cases: cases,
+          ret_type: ret_type, ctx: ctx2) do case EmitStmtResult(ctx: ctx3, chain_stmts: sub_stmts) ->
+        return EmitStmtResult(ctx: ctx3, chain_stmts: append_stmts(stmts: fstmts, tail: sub_stmts))
+      end
+    end
   end
 end
 
@@ -1423,96 +2410,28 @@ let is_trivially_unit_body = fn (stmts: [MirStmt]) -> bool do
   end
 end
 
-type MatchStmtChainResult = MatchStmtChainResult(ctx: LowerCtx, outer_cond_stmts: [LirStmt], chain: Option<LirStmt>)
-
+// Lower match statement using Maranget decision tree.
 let lower_match_stmt = fn (target: MirExpr, cases: [MirMatchCase], ret_type: TypeExpr, ctx: LowerCtx) -> LowerStmtResult do
   match lower_expr_to_atom(expr: target, ctx: ctx) do case BindResult(ctx: ctx2, atom: target_atom) ->
-    // Lower each case and build IfReturn chain
-    let reversed = reverse_match_cases(cases: cases)
-    match build_match_stmt_chain(cases: reversed, target_atom: target_atom, ret_type: ret_type,
-                                   chain: None, pending_cond_stmts: [], ctx: ctx2) do case MatchStmtChainResult(ctx: ctx3, outer_cond_stmts: ocs, chain: chain) ->
-      match chain do
-        case Some(val: stmt) ->
-          match ctx3 do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
-            // Add outer cond_stmts then the if chain to scope
-            let s2 = push_stmts_to_reverse(stmts: ocs, acc: s)
-            let ctx4 = LowerCtx(vars: v, semantic_vars: sv, stmts: stmt :: s2,
-              temp_counter: c, enum_defs: ed)
-            return LowerStmtResult(ctx: ctx4, ret: None)
-          end
-        case None -> return LowerStmtResult(ctx: ctx3, ret: None)
-      end
-    end
-  end
-end
-
-let build_match_stmt_chain = fn (cases: [MirMatchCase], target_atom: LirAtom, ret_type: TypeExpr,
-                                  chain: Option<LirStmt>, pending_cond_stmts: [LirStmt], ctx: LowerCtx) -> MatchStmtChainResult do
-  match cases do
-    case [] -> return MatchStmtChainResult(ctx: ctx, outer_cond_stmts: pending_cond_stmts, chain: chain)
-    case MirMatchCase(pattern: pat, body: body) :: rest ->
-      // Phase 1: Generate condition in isolation
-      match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: saved_stmts, temp_counter: c, enum_defs: ed) ->
-        let cond_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: [], temp_counter: c, enum_defs: ed)
-        match collect_pattern_condition(target_atom: target_atom, pattern: pat, ctx: cond_ctx) do case PatCondResult(ctx: ctx2, cond_opt: cond_opt) ->
-          match ctx2 do case LowerCtx(vars: v2, semantic_vars: sv2, stmts: cond_stmts, temp_counter: c2, enum_defs: _) ->
-            // Phase 2: Generate bindings in isolation
-            let bind_ctx = LowerCtx(vars: v2, semantic_vars: sv2, stmts: [], temp_counter: c2, enum_defs: ed)
-            match collect_pattern_bindings(target_atom: target_atom, pattern: pat, ctx: bind_ctx) do case PatBindResult(ctx: ctx3) ->
-              match ctx3 do case LowerCtx(vars: v3, semantic_vars: sv3, stmts: bind_stmts, temp_counter: c3, enum_defs: _) ->
-                // Phase 3: Lower body with bindings in scope
-                let body_ctx = LowerCtx(vars: v3, semantic_vars: sv3, stmts: saved_stmts, temp_counter: c3, enum_defs: ed)
-                match lower_block(stmts: body, ret_type: ret_type, ctx: body_ctx) do case BlockResult(ctx: ctx4, stmts: case_stmts, ret: case_ret) ->
-                  // then_body = bindings + body stmts
-                  let then_stmts = append_stmts(stmts: reverse_stmts(stmts: bind_stmts), tail: case_stmts)
-                  // else_body includes pending inner cond_stmts before the nested if
-                  let else_body = match chain do
-                    case Some(val: stmt) -> append_stmts(stmts: pending_cond_stmts, tail: [stmt])
-                    case None -> []
-                  end
-                  let cond = match else_body do
-                    case [] -> LirAtomBool(val: true)
-                    case _ ->
-                      match cond_opt do
-                        case Some(val: c) -> c
-                        case None -> LirAtomBool(val: true)
-                      end
-                  end
-                  // Detect trivially-unit case bodies (empty or just unit literal).
-                  // These should fall through (LirStmtIf) not return (LirStmtIfReturn).
-                  let is_trivially_unit = is_trivially_unit_body(stmts: body)
-                  if is_trivially_unit && (match case_ret do case None -> true case _ -> false end) then
-                    let new_chain = Some(val: LirStmtIf(
-                      cond: cond, then_body: then_stmts, else_body: else_body
-                    ))
-                    return build_match_stmt_chain(cases: rest, target_atom: target_atom, ret_type: ret_type,
-                                                     chain: new_chain,
-                                                     pending_cond_stmts: reverse_stmts(stmts: cond_stmts),
-                                                     ctx: ctx4)
-                  end
-                  let then_ret = match case_ret do
-                    case Some(val: a) -> a
-                    case None ->
-                      // No explicit return — try extracting from terminal stmt
-                      match fallback_ret_from_last_stmt(stmts: then_stmts) do
-                        case Some(val: a) -> a
-                        case None -> default_atom(typ: ret_type)
-                      end
-                  end
-                  let new_chain = Some(val: LirStmtIfReturn(
-                    cond: cond, then_body: then_stmts, then_ret: then_ret,
-                    else_body: else_body, else_ret: None, ret_type: ret_type
-                  ))
-                  return build_match_stmt_chain(cases: rest, target_atom: target_atom, ret_type: ret_type,
-                                                 chain: new_chain,
-                                                 pending_cond_stmts: reverse_stmts(stmts: cond_stmts),
-                                                 ctx: ctx4)
-                end
+    match cases do
+      case [] -> return LowerStmtResult(ctx: ctx2, ret: None)
+      case _ ->
+        let target_sem = lir_get_atom_sem_type(atom: target_atom, ctx: ctx2)
+        match ctx2 do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
+          let rows = lir_cases_to_rows(cases: cases, idx: 0)
+          match lir_build_decision_tree(rows: rows, col_ids: [0], next_id: 1, enum_defs: ed) do case DecTreeResult(tree: tree, next_id: _) ->
+            let atoms = [AtomEntry(id: 0, atom: target_atom, sem_type: target_sem)]
+            match lir_emit_decision_tree_stmt(tree: tree, atoms: atoms, cases: cases,
+                ret_type: ret_type, ctx: ctx2) do case EmitStmtResult(ctx: ctx3, chain_stmts: chain) ->
+              match ctx3 do case LowerCtx(vars: v3, semantic_vars: sv3, stmts: s3, temp_counter: c3, enum_defs: ed3) ->
+                let s4 = push_stmts_to_reverse(stmts: chain, acc: s3)
+                let ctx4 = LowerCtx(vars: v3, semantic_vars: sv3, stmts: s4, temp_counter: c3, enum_defs: ed3)
+                return LowerStmtResult(ctx: ctx4, ret: None)
               end
             end
           end
         end
-      end
+    end
   end
 end
 
@@ -2148,24 +3067,3 @@ let append_stmts = fn (stmts: [LirStmt], tail: [LirStmt]) -> [LirStmt] do
   end
 end
 
-let reverse_lowered_cases = fn (cases: [LoweredMatchCase]) -> [LoweredMatchCase] do
-  return reverse_lowered_go(cases: cases, acc: [])
-end
-
-let reverse_lowered_go = fn (cases: [LoweredMatchCase], acc: [LoweredMatchCase]) -> [LoweredMatchCase] do
-  match cases do
-    case [] -> return acc
-    case c :: rest -> return reverse_lowered_go(cases: rest, acc: c :: acc)
-  end
-end
-
-let reverse_match_cases = fn (cases: [MirMatchCase]) -> [MirMatchCase] do
-  return reverse_mc_go(cases: cases, acc: [])
-end
-
-let reverse_mc_go = fn (cases: [MirMatchCase], acc: [MirMatchCase]) -> [MirMatchCase] do
-  match cases do
-    case [] -> return acc
-    case c :: rest -> return reverse_mc_go(cases: rest, acc: c :: acc)
-  end
-end
