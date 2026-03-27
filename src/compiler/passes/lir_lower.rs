@@ -208,6 +208,485 @@ struct LowerCtx<'a> {
     source_line: Option<u32>,
 }
 
+// ── Maranget decision tree types and construction ────────────────
+
+/// A row in the pattern matrix for decision tree compilation.
+struct PatRow {
+    pats: Vec<MirPattern>,
+    case_idx: usize,
+    /// Accumulated variable bindings: (var_name, scrutinee_id).
+    bindings: Vec<(Symbol, usize)>,
+}
+
+/// Decision tree for compiled pattern matching (Maranget's algorithm).
+enum DecTree {
+    /// All patterns matched — execute case body with these bindings.
+    Leaf {
+        case_idx: usize,
+        bindings: Vec<(Symbol, usize)>,
+    },
+    /// Switch on constructor tag.
+    CtorSwitch {
+        scrutinee_id: usize,
+        branches: Vec<CtorBranch>,
+        /// Fallback for wildcard/variable rows (None if exhaustive over all constructors).
+        fallback: Option<Box<DecTree>>,
+    },
+    /// Switch on literal value.
+    LitSwitch {
+        scrutinee_id: usize,
+        branches: Vec<(Literal, DecTree)>,
+        fallback: Box<DecTree>,
+    },
+    /// Unconditionally decompose a record into fields (no tag check needed).
+    RecordDestructure {
+        scrutinee_id: usize,
+        /// Sorted field names (determines extraction order).
+        field_names: Vec<Symbol>,
+        /// Scrutinee IDs for each extracted field.
+        field_ids: Vec<usize>,
+        subtree: Box<DecTree>,
+    },
+    /// Unreachable (should not happen with exhaustive patterns).
+    Fail,
+}
+
+struct CtorBranch {
+    ctor_name: Symbol,
+    ctor_tag: i64,
+    arity: usize,
+    /// Scrutinee IDs for the extracted fields (in definition order).
+    field_ids: Vec<usize>,
+    subtree: DecTree,
+}
+
+/// Match emission mode.
+enum MatchEmitMode {
+    /// Statement position: emit IfReturn chain.
+    Stmt,
+    /// Expression position: assign result to variable.
+    Expr {
+        result_name: Symbol,
+        result_type: Type,
+    },
+}
+
+/// Find the leftmost column that has at least one non-wildcard, non-variable pattern.
+fn find_active_column(rows: &[PatRow], n_cols: usize) -> Option<usize> {
+    for col in 0..n_cols {
+        for row in rows {
+            match &row.pats[col] {
+                MirPattern::Wildcard | MirPattern::Variable(_, _) => {}
+                _ => return Some(col),
+            }
+        }
+    }
+    None
+}
+
+/// Build a decision tree from a pattern matrix using Maranget's algorithm.
+fn build_decision_tree(
+    rows: Vec<PatRow>,
+    col_ids: &[usize],
+    next_id: &mut usize,
+    ctor_index: &HashMap<String, ConstructorInfo>,
+    enum_defs: &[EnumDef],
+) -> DecTree {
+    if rows.is_empty() {
+        return DecTree::Fail;
+    }
+
+    let n_cols = col_ids.len();
+
+    // Find active column
+    let active_col = find_active_column(&rows, n_cols);
+
+    match active_col {
+        None => {
+            // First row is all wildcards/variables — it matches unconditionally.
+            let row = &rows[0];
+            let mut bindings = row.bindings.clone();
+            for (col, pat) in row.pats.iter().enumerate() {
+                if let MirPattern::Variable(name, _) = pat {
+                    bindings.push((*name, col_ids[col]));
+                }
+            }
+            DecTree::Leaf {
+                case_idx: row.case_idx,
+                bindings,
+            }
+        }
+        Some(col) => {
+            // Determine pattern kind in this column
+            let first_non_wild = rows.iter().find_map(|r| match &r.pats[col] {
+                MirPattern::Wildcard | MirPattern::Variable(_, _) => None,
+                other => Some(other),
+            });
+
+            match first_non_wild {
+                Some(MirPattern::Constructor { .. }) => build_ctor_switch(
+                    rows, col, col_ids, next_id, ctor_index, enum_defs,
+                ),
+                Some(MirPattern::Literal(_)) => build_lit_switch(
+                    rows, col, col_ids, next_id, ctor_index, enum_defs,
+                ),
+                Some(MirPattern::Record(_fields, _)) => {
+                    // Collect all field names from record patterns at this column
+                    let mut field_set: Vec<Symbol> = Vec::new();
+                    for row in &rows {
+                        if let MirPattern::Record(fields, _) = &row.pats[col] {
+                            for (name, _) in fields {
+                                if !field_set.contains(name) {
+                                    field_set.push(*name);
+                                }
+                            }
+                        }
+                    }
+                    field_set.sort();
+                    build_record_destructure(
+                        rows, col, col_ids, &field_set, next_id, ctor_index, enum_defs,
+                    )
+                }
+                _ => unreachable!("find_active_column returned column with no active pattern"),
+            }
+        }
+    }
+}
+
+/// Build a CtorSwitch node at the given column.
+fn build_ctor_switch(
+    rows: Vec<PatRow>,
+    col: usize,
+    col_ids: &[usize],
+    next_id: &mut usize,
+    ctor_index: &HashMap<String, ConstructorInfo>,
+    enum_defs: &[EnumDef],
+) -> DecTree {
+    // Collect unique constructors in order of first appearance
+    let mut seen_ctors: Vec<Symbol> = Vec::new();
+    for row in &rows {
+        if let MirPattern::Constructor { name, .. } = &row.pats[col] {
+            if !seen_ctors.contains(name) {
+                seen_ctors.push(*name);
+            }
+        }
+    }
+
+    let scrutinee_id = col_ids[col];
+    let mut branches = Vec::new();
+
+    for ctor_name in &seen_ctors {
+        let ctor_info = ctor_index.get(ctor_name.as_str());
+        let arity = ctor_info.map(|ci| ci.field_labels.len()).unwrap_or(0);
+        let field_labels = ctor_info.map(|ci| &ci.field_labels);
+
+        // Allocate scrutinee IDs for fields
+        let field_ids: Vec<usize> = (0..arity).map(|_| { let id = *next_id; *next_id += 1; id }).collect();
+
+        // Build new column IDs: replace col with field IDs
+        let mut new_col_ids: Vec<usize> = col_ids[..col].to_vec();
+        new_col_ids.extend_from_slice(&field_ids);
+        new_col_ids.extend_from_slice(&col_ids[col + 1..]);
+
+        // Specialize rows for this constructor
+        let specialized = specialize_ctor(&rows, col, col_ids, ctor_name, arity, field_labels);
+
+        let def_arity = ctor_info.map(|ci| ci.field_labels.len()).unwrap_or(arity);
+        let tag = constructor_tag(ctor_name.as_str(), def_arity);
+
+        let subtree = build_decision_tree(specialized, &new_col_ids, next_id, ctor_index, enum_defs);
+        branches.push(CtorBranch {
+            ctor_name: *ctor_name,
+            ctor_tag: tag,
+            arity,
+            field_ids,
+            subtree,
+        });
+    }
+
+    // Build default matrix (rows with wildcard/variable at col)
+    let default_rows = default_matrix(&rows, col, col_ids);
+    let fallback = if default_rows.is_empty() {
+        None
+    } else {
+        let mut new_col_ids: Vec<usize> = col_ids[..col].to_vec();
+        new_col_ids.extend_from_slice(&col_ids[col + 1..]);
+        Some(Box::new(build_decision_tree(
+            default_rows,
+            &new_col_ids,
+            next_id,
+            ctor_index,
+            enum_defs,
+        )))
+    };
+
+    DecTree::CtorSwitch {
+        scrutinee_id,
+        branches,
+        fallback,
+    }
+}
+
+/// Build a LitSwitch node at the given column.
+fn build_lit_switch(
+    rows: Vec<PatRow>,
+    col: usize,
+    col_ids: &[usize],
+    next_id: &mut usize,
+    ctor_index: &HashMap<String, ConstructorInfo>,
+    enum_defs: &[EnumDef],
+) -> DecTree {
+    let scrutinee_id = col_ids[col];
+
+    // Collect unique literals in order of first appearance
+    let mut seen_lits: Vec<Literal> = Vec::new();
+    for row in &rows {
+        if let MirPattern::Literal(lit) = &row.pats[col] {
+            if !seen_lits.contains(lit) {
+                seen_lits.push(lit.clone());
+            }
+        }
+    }
+
+    // New col_ids: remove col
+    let mut new_col_ids: Vec<usize> = col_ids[..col].to_vec();
+    new_col_ids.extend_from_slice(&col_ids[col + 1..]);
+
+    let mut branches = Vec::new();
+    for lit in &seen_lits {
+        let specialized = specialize_literal(&rows, col, col_ids, lit);
+        let subtree = build_decision_tree(specialized, &new_col_ids, next_id, ctor_index, enum_defs);
+        branches.push((lit.clone(), subtree));
+    }
+
+    let default_rows = default_matrix(&rows, col, col_ids);
+    let fallback = build_decision_tree(default_rows, &new_col_ids, next_id, ctor_index, enum_defs);
+
+    DecTree::LitSwitch {
+        scrutinee_id,
+        branches,
+        fallback: Box::new(fallback),
+    }
+}
+
+/// Build a RecordDestructure node at the given column.
+fn build_record_destructure(
+    rows: Vec<PatRow>,
+    col: usize,
+    col_ids: &[usize],
+    field_names: &[Symbol],
+    next_id: &mut usize,
+    ctor_index: &HashMap<String, ConstructorInfo>,
+    enum_defs: &[EnumDef],
+) -> DecTree {
+    let scrutinee_id = col_ids[col];
+    let k = field_names.len();
+
+    // Allocate scrutinee IDs for fields
+    let field_ids: Vec<usize> = (0..k).map(|_| { let id = *next_id; *next_id += 1; id }).collect();
+
+    // New col_ids: replace col with field IDs
+    let mut new_col_ids: Vec<usize> = col_ids[..col].to_vec();
+    new_col_ids.extend_from_slice(&field_ids);
+    new_col_ids.extend_from_slice(&col_ids[col + 1..]);
+
+    // Specialize each row: replace Record pattern with sub-patterns in field_names order
+    let mut specialized: Vec<PatRow> = Vec::new();
+    for row in &rows {
+        match &row.pats[col] {
+            MirPattern::Record(fields, _) => {
+                // Build sub-patterns in field_names order
+                let mut sub_pats: Vec<MirPattern> = vec![MirPattern::Wildcard; k];
+                for (name, sub_pat) in fields {
+                    if let Some(pos) = field_names.iter().position(|n| n == name) {
+                        sub_pats[pos] = sub_pat.clone();
+                    }
+                }
+                let mut new_pats: Vec<MirPattern> = row.pats[..col].to_vec();
+                new_pats.extend(sub_pats);
+                new_pats.extend(row.pats[col + 1..].iter().cloned());
+                specialized.push(PatRow {
+                    pats: new_pats,
+                    case_idx: row.case_idx,
+                    bindings: row.bindings.clone(),
+                });
+            }
+            MirPattern::Wildcard => {
+                let mut new_pats: Vec<MirPattern> = row.pats[..col].to_vec();
+                new_pats.extend(std::iter::repeat(MirPattern::Wildcard).take(k));
+                new_pats.extend(row.pats[col + 1..].iter().cloned());
+                specialized.push(PatRow {
+                    pats: new_pats,
+                    case_idx: row.case_idx,
+                    bindings: row.bindings.clone(),
+                });
+            }
+            MirPattern::Variable(name, _) => {
+                let mut bindings = row.bindings.clone();
+                bindings.push((*name, col_ids[col]));
+                let mut new_pats: Vec<MirPattern> = row.pats[..col].to_vec();
+                new_pats.extend(std::iter::repeat(MirPattern::Wildcard).take(k));
+                new_pats.extend(row.pats[col + 1..].iter().cloned());
+                specialized.push(PatRow {
+                    pats: new_pats,
+                    case_idx: row.case_idx,
+                    bindings,
+                });
+            }
+            _ => {} // Other patterns at a record column — skip
+        }
+    }
+
+    let subtree = build_decision_tree(specialized, &new_col_ids, next_id, ctor_index, enum_defs);
+
+    DecTree::RecordDestructure {
+        scrutinee_id,
+        field_names: field_names.to_vec(),
+        field_ids,
+        subtree: Box::new(subtree),
+    }
+}
+
+/// Specialize the pattern matrix for a specific constructor at column `col`.
+fn specialize_ctor(
+    rows: &[PatRow],
+    col: usize,
+    col_ids: &[usize],
+    ctor_name: &Symbol,
+    arity: usize,
+    field_labels: Option<&Vec<Option<Symbol>>>,
+) -> Vec<PatRow> {
+    let mut result = Vec::new();
+    for row in rows {
+        match &row.pats[col] {
+            MirPattern::Constructor { name, fields } if name == ctor_name => {
+                // Reorder sub-patterns to definition order
+                let mut sub_pats: Vec<MirPattern> = vec![MirPattern::Wildcard; arity];
+                for (pat_idx, (label, sub_pat)) in fields.iter().enumerate() {
+                    let def_idx = if let Some(lbl) = label {
+                        field_labels
+                            .and_then(|labels| labels.iter().position(|l| l.as_ref() == Some(lbl)))
+                            .unwrap_or(pat_idx)
+                    } else {
+                        pat_idx
+                    };
+                    if def_idx < arity {
+                        sub_pats[def_idx] = sub_pat.clone();
+                    }
+                }
+                let mut new_pats: Vec<MirPattern> = row.pats[..col].to_vec();
+                new_pats.extend(sub_pats);
+                new_pats.extend(row.pats[col + 1..].iter().cloned());
+                result.push(PatRow {
+                    pats: new_pats,
+                    case_idx: row.case_idx,
+                    bindings: row.bindings.clone(),
+                });
+            }
+            MirPattern::Wildcard => {
+                let mut new_pats: Vec<MirPattern> = row.pats[..col].to_vec();
+                new_pats.extend(std::iter::repeat(MirPattern::Wildcard).take(arity));
+                new_pats.extend(row.pats[col + 1..].iter().cloned());
+                result.push(PatRow {
+                    pats: new_pats,
+                    case_idx: row.case_idx,
+                    bindings: row.bindings.clone(),
+                });
+            }
+            MirPattern::Variable(name, _) => {
+                let mut bindings = row.bindings.clone();
+                bindings.push((*name, col_ids[col]));
+                let mut new_pats: Vec<MirPattern> = row.pats[..col].to_vec();
+                new_pats.extend(std::iter::repeat(MirPattern::Wildcard).take(arity));
+                new_pats.extend(row.pats[col + 1..].iter().cloned());
+                result.push(PatRow {
+                    pats: new_pats,
+                    case_idx: row.case_idx,
+                    bindings,
+                });
+            }
+            _ => {} // Different constructor — skip
+        }
+    }
+    result
+}
+
+/// Specialize the pattern matrix for a specific literal at column `col`.
+fn specialize_literal(
+    rows: &[PatRow],
+    col: usize,
+    col_ids: &[usize],
+    lit: &Literal,
+) -> Vec<PatRow> {
+    let mut result = Vec::new();
+    for row in rows {
+        match &row.pats[col] {
+            MirPattern::Literal(l) if l == lit => {
+                let mut new_pats: Vec<MirPattern> = row.pats[..col].to_vec();
+                new_pats.extend(row.pats[col + 1..].iter().cloned());
+                result.push(PatRow {
+                    pats: new_pats,
+                    case_idx: row.case_idx,
+                    bindings: row.bindings.clone(),
+                });
+            }
+            MirPattern::Wildcard => {
+                let mut new_pats: Vec<MirPattern> = row.pats[..col].to_vec();
+                new_pats.extend(row.pats[col + 1..].iter().cloned());
+                result.push(PatRow {
+                    pats: new_pats,
+                    case_idx: row.case_idx,
+                    bindings: row.bindings.clone(),
+                });
+            }
+            MirPattern::Variable(name, _) => {
+                let mut bindings = row.bindings.clone();
+                bindings.push((*name, col_ids[col]));
+                let mut new_pats: Vec<MirPattern> = row.pats[..col].to_vec();
+                new_pats.extend(row.pats[col + 1..].iter().cloned());
+                result.push(PatRow {
+                    pats: new_pats,
+                    case_idx: row.case_idx,
+                    bindings,
+                });
+            }
+            _ => {} // Different literal — skip
+        }
+    }
+    result
+}
+
+/// Build the default matrix: rows with wildcard/variable at column `col`.
+fn default_matrix(rows: &[PatRow], col: usize, col_ids: &[usize]) -> Vec<PatRow> {
+    let mut result = Vec::new();
+    for row in rows {
+        match &row.pats[col] {
+            MirPattern::Wildcard => {
+                let mut new_pats: Vec<MirPattern> = row.pats[..col].to_vec();
+                new_pats.extend(row.pats[col + 1..].iter().cloned());
+                result.push(PatRow {
+                    pats: new_pats,
+                    case_idx: row.case_idx,
+                    bindings: row.bindings.clone(),
+                });
+            }
+            MirPattern::Variable(name, _) => {
+                let mut bindings = row.bindings.clone();
+                bindings.push((*name, col_ids[col]));
+                let mut new_pats: Vec<MirPattern> = row.pats[..col].to_vec();
+                new_pats.extend(row.pats[col + 1..].iter().cloned());
+                result.push(PatRow {
+                    pats: new_pats,
+                    case_idx: row.case_idx,
+                    bindings,
+                });
+            }
+            _ => {} // Constructor/Literal/Record — skip in default
+        }
+    }
+    result
+}
+
 impl<'a> LowerCtx<'a> {
     fn new(
         enum_defs: &'a [EnumDef],
@@ -596,11 +1075,10 @@ impl<'a> LowerCtx<'a> {
         Ok(branch_stmts)
     }
 
-    /// Lower a match statement into a chain of If/IfReturn statements.
-    /// Each case independently uses IfReturn (when it genuinely returns a
-    /// value) or plain If (side-effect-only body). This prevents side-effect
-    /// cases from emitting spurious WASM `return` instructions that would
-    /// make code after the match unreachable.
+    /// Lower a match statement using Maranget's decision tree algorithm.
+    /// Builds a decision tree from the pattern matrix, then emits LIR.
+    /// Field extractions only occur inside branches where the tag check passed,
+    /// structurally preventing out-of-bounds memory access.
     fn lower_match_stmt(
         &mut self,
         target: &MirExpr,
@@ -608,150 +1086,39 @@ impl<'a> LowerCtx<'a> {
         ret_type: &Type,
     ) -> Result<(), LirLowerError> {
         let target_atom = self.lower_expr_to_atom(target)?;
-
         if cases.is_empty() {
             return Ok(());
         }
 
-        // Pre-analyze: find outer constructor names that appear more than once.
-        // When multiple cases share the same outer constructor (e.g.
-        // Cons(TLLet(...)) and Cons(TLPort(...))), the inner condition must be
-        // checked INSIDE the outer If block so that a mismatch can fall through
-        // to the next case instead of unconditionally returning.
-        let mut outer_ctor_counts: HashMap<Symbol, usize> = HashMap::new();
-        for case in cases {
-            if let MirPattern::Constructor { name, fields, .. } = &case.pattern {
-                if !fields.is_empty() {
-                    *outer_ctor_counts.entry(name.clone()).or_default() += 1;
-                }
-            }
-        }
+        let target_sem_type = match &target_atom {
+            LirAtom::Var { name, .. } => self
+                .semantic_vars
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| target_atom.typ()),
+            _ => target_atom.typ(),
+        };
 
-        let mut chain: Option<LirStmt> = None;
-        let mut pre_chain_blocks: Vec<LirStmt> = Vec::new();
+        // Build pattern matrix and decision tree
+        let rows: Vec<PatRow> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, case)| PatRow {
+                pats: vec![case.pattern.clone()],
+                case_idx: i,
+                bindings: vec![],
+            })
+            .collect();
+        let col_ids = vec![0usize];
+        let mut next_id = 1usize;
+        let tree =
+            build_decision_tree(rows, &col_ids, &mut next_id, &self.ctor_index, self.enum_defs);
 
-        for case in cases.iter().rev() {
-            let needs_inner_split = match &case.pattern {
-                MirPattern::Constructor { name, fields, .. } if !fields.is_empty() => {
-                    outer_ctor_counts.get(name).copied().unwrap_or(0) > 1
-                }
-                _ => false,
-            };
+        // Emit the decision tree as LIR
+        let mut atoms: HashMap<usize, (LirAtom, Type)> = HashMap::new();
+        atoms.insert(0, (target_atom, target_sem_type));
+        self.emit_decision_tree(&tree, &mut atoms, cases, ret_type, &MatchEmitMode::Stmt)?;
 
-            let (cond_opt, case_stmts, case_ret, has_inner_split) = self.lower_match_case(
-                &target_atom,
-                &case.pattern,
-                &case.body,
-                ret_type,
-                needs_inner_split,
-            )?;
-
-            if has_inner_split {
-                let cond = cond_opt.unwrap_or(LirAtom::Bool(true));
-
-                if chain.is_none() && pre_chain_blocks.is_empty() {
-                    // This is the LAST case in original match order (first
-                    // encountered in reverse).  Put it in the chain as IfReturn
-                    // so the function is guaranteed to return.  The inner
-                    // IfReturn inside then_body handles the real return; the
-                    // outer then_ret is a placeholder (unreachable for
-                    // exhaustive matches).
-                    let then_ret = fallback_return_atom_from_terminal_stmt(&case_stmts)
-                        .unwrap_or_else(|| default_atom_for_type(ret_type));
-                    let then_ret = if matches!(then_ret.typ(), Type::Unit)
-                        && !matches!(ret_type, Type::Unit)
-                    {
-                        default_atom_for_type(ret_type)
-                    } else {
-                        then_ret
-                    };
-                    chain = Some(LirStmt::IfReturn {
-                        cond,
-                        then_body: case_stmts,
-                        then_ret: Some(then_ret),
-                        else_body: vec![],
-                        else_ret: None,
-                        ret_type: ret_type.clone(),
-                    });
-                } else {
-                    // Emit as standalone If: if outer tag matches, enter body
-                    // and check inner conditions via nested IfReturn.  If inner
-                    // doesn't match, the If completes without returning,
-                    // falling through to the next block or the chain.
-                    pre_chain_blocks.push(LirStmt::If {
-                        cond,
-                        then_body: case_stmts,
-                        else_body: vec![],
-                    });
-                }
-            } else {
-                let else_body = chain.take().map_or_else(Vec::new, |next| vec![next]);
-
-                // Last arm in the chain (first encountered in reverse iteration,
-                // i.e. else_body is empty): treat as unconditional fallback.
-                // Nexus matches are exhaustive, so if all prior cases failed,
-                // this case must match.  Using Bool(true) avoids a fall-through
-                // path with uninitialized locals.
-                let cond = if else_body.is_empty() {
-                    LirAtom::Bool(true)
-                } else {
-                    cond_opt.unwrap_or(LirAtom::Bool(true))
-                };
-
-                // Check if the case body is trivially unit (empty or just `()`).
-                // Such cases should fall through (plain If) instead of returning
-                // from the enclosing function (IfReturn). This prevents e.g.
-                // `case None -> ()` from emitting a spurious WASM return.
-                let body_is_trivially_unit = case.body.is_empty()
-                    || case
-                        .body
-                        .iter()
-                        .all(|s| matches!(s, MirStmt::Expr(MirExpr::Literal(Literal::Unit))));
-
-                if body_is_trivially_unit && case_ret.is_none() {
-                    chain = Some(LirStmt::If {
-                        cond,
-                        then_body: case_stmts,
-                        else_body,
-                    });
-                } else {
-                    // Determine if this case genuinely returns a value:
-                    // - case_ret: explicit return value (bare expression or return stmt)
-                    // - fallback: terminal IfReturn/TryCatch from nested control flow
-                    // If neither, this is a side-effect-only case → then_ret = None
-                    let genuine_ret =
-                        case_ret.or_else(|| fallback_return_atom_from_terminal_stmt(&case_stmts));
-
-                    let then_ret = genuine_ret.map(|ret| {
-                        // If the case diverges (e.g. raise), ret may be Unit-typed
-                        // even though the function returns non-Unit. Use a placeholder
-                        // of the correct type so codegen can register a proper WASM local.
-                        if matches!(ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
-                            default_atom_for_type(ret_type)
-                        } else {
-                            ret
-                        }
-                    });
-
-                    chain = Some(LirStmt::IfReturn {
-                        cond,
-                        then_body: case_stmts,
-                        then_ret,
-                        else_body,
-                        else_ret: None,
-                        ret_type: ret_type.clone(),
-                    });
-                }
-            }
-        }
-
-        // Emit standalone If blocks in original case order (collected in reverse)
-        for block in pre_chain_blocks.into_iter().rev() {
-            self.stmts.push(block);
-        }
-        if let Some(stmt) = chain {
-            self.stmts.push(stmt);
-        }
         Ok(())
     }
 
@@ -799,76 +1166,40 @@ impl<'a> LowerCtx<'a> {
 
     /// Lower a match expression to an atom (for use in expression position).
     /// Creates a temp result variable and assigns to it in each branch.
+    /// Lower a match expression using Maranget's decision tree algorithm.
+    /// Creates a temp result variable and assigns to it in each branch.
     fn lower_match_expr(
         &mut self,
         target: &MirExpr,
         cases: &[MirMatchCase],
     ) -> Result<LirAtom, LirLowerError> {
         let target_atom = self.lower_expr_to_atom(target)?;
-
         if cases.is_empty() {
             return Ok(LirAtom::Unit);
         }
 
-        // Pre-analyze outer constructor sharing (same as lower_match_stmt).
-        let mut outer_ctor_counts: HashMap<Symbol, usize> = HashMap::new();
-        for case in cases {
-            if let MirPattern::Constructor { name, fields, .. } = &case.pattern {
-                if !fields.is_empty() {
-                    *outer_ctor_counts.entry(name.clone()).or_default() += 1;
-                }
-            }
-        }
+        let target_sem_type = match &target_atom {
+            LirAtom::Var { name, .. } => self
+                .semantic_vars
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| target_atom.typ()),
+            _ => target_atom.typ(),
+        };
 
-        // First pass: lower all cases to get accurate types.
-        // We need result_name/result_type before lowering inner-split cases,
-        // but need case values to infer the type.  Do a two-phase approach:
-        // lower non-inner-split cases first to infer type, then lower
-        // inner-split cases with result info.
-        //
-        // Actually, we can lower ALL cases without result_assign first
-        // (needs_inner_split=false), just to infer the result type.
-        // Then re-lower inner-split cases with the correct result info.
-        //
-        // To avoid double-lowering, we do it in one pass but defer
-        // inner-split wrapping to lower_match_expr.  lower_match_case_expr
-        // with needs_inner_split=false computes everything but doesn't wrap.
-        // We note which cases need wrapping and do it here.
-
-        // One-pass: lower all cases, passing needs_inner_split and result_assign=None
-        // for the first pass to infer types.  Then we'll handle wrapping.
-        let mut lowered_cases: Vec<(Option<LirAtom>, Vec<LirStmt>, LirAtom, bool)> = Vec::new();
-        for case in cases.iter().rev() {
-            let needs_inner_split = match &case.pattern {
-                MirPattern::Constructor { name, fields, .. } if !fields.is_empty() => {
-                    outer_ctor_counts.get(name).copied().unwrap_or(0) > 1
-                }
-                _ => false,
-            };
-            let result = self.lower_match_case_expr(
-                &target_atom,
-                &case.pattern,
-                &case.body,
-                needs_inner_split,
-                None, // result_assign — will handle wrapping below
-            )?;
-            lowered_cases.push(result);
-        }
-
-        // Infer semantic result type from the first non-Unit case value
-        let semantic_result_type = lowered_cases
+        // Infer result type from case bodies
+        let semantic_result_type = cases
             .iter()
-            .find_map(|(_, _, val, _)| {
-                let t = val.typ();
-                if matches!(t, Type::Unit) {
-                    None
-                } else {
-                    match val {
-                        LirAtom::Var { name, .. } => {
-                            self.semantic_vars.get(name).cloned().or(Some(t))
-                        }
-                        _ => Some(t),
+            .find_map(|case| {
+                if let Some(last) = case.body.last() {
+                    let t = self.infer_stmt_type(last);
+                    if matches!(t, Type::Unit) {
+                        None
+                    } else {
+                        Some(t)
                     }
+                } else {
+                    None
                 }
             })
             .unwrap_or(Type::Unit);
@@ -878,71 +1209,40 @@ impl<'a> LowerCtx<'a> {
         self.vars.insert(result_name.clone(), result_type.clone());
         self.semantic_vars
             .insert(result_name.clone(), semantic_result_type);
-        // Initialize with a placeholder
         self.stmts.push(LirStmt::Let {
             name: result_name.clone(),
             typ: result_type.clone(),
             expr: LirExpr::Atom(default_atom_for_type(&result_type)),
         });
 
-        // Build If chain + standalone If blocks for inner-split cases.
-        let mut chain: Option<LirStmt> = None;
-        let mut pre_chain_blocks: Vec<LirStmt> = Vec::new();
+        // Build pattern matrix and decision tree
+        let rows: Vec<PatRow> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, case)| PatRow {
+                pats: vec![case.pattern.clone()],
+                case_idx: i,
+                bindings: vec![],
+            })
+            .collect();
+        let col_ids = vec![0usize];
+        let mut next_id = 1usize;
+        let tree =
+            build_decision_tree(rows, &col_ids, &mut next_id, &self.ctor_index, self.enum_defs);
 
-        for (cond_opt, mut case_stmts, case_val, has_inner_split) in lowered_cases {
-            if has_inner_split {
-                // The case_stmts already contain a nested If wrapping
-                // bindings+body.  But the result assignment was NOT placed
-                // inside (result_assign was None).  We need to add it now
-                // inside the nested If.
-                //
-                // The last stmt in case_stmts is the nested If { cond: inner_cond }.
-                // Append the result assignment to its then_body.
-                if let Some(LirStmt::If { then_body, .. }) = case_stmts.last_mut() {
-                    then_body.push(LirStmt::Let {
-                        name: result_name.clone(),
-                        typ: result_type.clone(),
-                        expr: LirExpr::Atom(case_val),
-                    });
-                }
-
-                let cond = cond_opt.unwrap_or(LirAtom::Bool(true));
-                pre_chain_blocks.push(LirStmt::If {
-                    cond,
-                    then_body: case_stmts,
-                    else_body: vec![],
-                });
-            } else {
-                let else_body = chain.take().map_or_else(Vec::new, |next| vec![next]);
-
-                let cond = if else_body.is_empty() && cases.len() == 1 {
-                    LirAtom::Bool(true)
-                } else {
-                    cond_opt.unwrap_or(LirAtom::Bool(true))
-                };
-
-                // Assign the case value to the result variable
-                case_stmts.push(LirStmt::Let {
-                    name: result_name.clone(),
-                    typ: result_type.clone(),
-                    expr: LirExpr::Atom(case_val),
-                });
-
-                chain = Some(LirStmt::If {
-                    cond,
-                    then_body: case_stmts,
-                    else_body,
-                });
-            }
-        }
-
-        // Emit standalone If blocks in original case order
-        for block in pre_chain_blocks.into_iter().rev() {
-            self.stmts.push(block);
-        }
-        if let Some(stmt) = chain {
-            self.stmts.push(stmt);
-        }
+        // Emit the decision tree as LIR
+        let mut atoms: HashMap<usize, (LirAtom, Type)> = HashMap::new();
+        atoms.insert(0, (target_atom, target_sem_type));
+        self.emit_decision_tree(
+            &tree,
+            &mut atoms,
+            cases,
+            &result_type,
+            &MatchEmitMode::Expr {
+                result_name: result_name.clone(),
+                result_type: result_type.clone(),
+            },
+        )?;
 
         Ok(LirAtom::Var {
             name: result_name,
@@ -950,691 +1250,538 @@ impl<'a> LowerCtx<'a> {
         })
     }
 
-    /// Lower a single match case for expression position.
-    /// Returns (condition, body_stmts, value_atom, has_inner_split).
-    ///
-    /// When `needs_inner_split` is true and inner conditions exist, the
-    /// bindings + body + result assignment are wrapped in a nested `If`
-    /// checking the inner condition.  `result_assign` provides the
-    /// (name, type) of the result variable so the assignment can be placed
-    /// inside the inner `If`.
-    fn lower_match_case_expr(
+    // ── Decision tree emission ─────────────────────────────────────
+
+    /// Emit a decision tree as LIR statements.
+    /// `atoms` maps scrutinee IDs to their current (atom, semantic_type) pairs.
+    fn emit_decision_tree(
         &mut self,
-        target: &LirAtom,
-        pattern: &MirPattern,
-        body: &[MirStmt],
-        needs_inner_split: bool,
-        result_assign: Option<(&Symbol, &Type)>,
-    ) -> Result<(Option<LirAtom>, Vec<LirStmt>, LirAtom, bool), LirLowerError> {
-        let mut conds = Vec::new();
-        let mut bindings: HashMap<Symbol, LirAtom> = HashMap::new();
-
-        let stmts_before = self.stmts.len();
-        self.collect_pattern_conditions_and_bindings(target, pattern, &mut conds, &mut bindings)?;
-
-        // Guard field extraction stmts for Constructor patterns (same as lower_match_case)
-        let has_ctor_fields =
-            matches!(pattern, MirPattern::Constructor { fields, .. } if !fields.is_empty());
-        let guarded_stmts: Vec<LirStmt> = if has_ctor_fields {
-            let tag_check_end = stmts_before + 2;
-            if self.stmts.len() > tag_check_end {
-                self.stmts.drain(tag_check_end..).collect()
-            } else {
-                Vec::new()
+        tree: &DecTree,
+        atoms: &mut HashMap<usize, (LirAtom, Type)>,
+        cases: &[MirMatchCase],
+        ret_type: &Type,
+        mode: &MatchEmitMode,
+    ) -> Result<(), LirLowerError> {
+        match tree {
+            DecTree::Fail => {
+                // Unreachable for exhaustive matches — emit nothing
+                Ok(())
             }
-        } else {
-            Vec::new()
-        };
+            DecTree::Leaf {
+                case_idx,
+                bindings,
+            } => {
+                self.emit_leaf(*case_idx, bindings, atoms, cases, ret_type, mode)
+            }
+            DecTree::CtorSwitch {
+                scrutinee_id,
+                branches,
+                fallback,
+            } => {
+                self.emit_ctor_switch(
+                    *scrutinee_id,
+                    branches,
+                    fallback.as_deref(),
+                    atoms,
+                    cases,
+                    ret_type,
+                    mode,
+                )
+            }
+            DecTree::LitSwitch {
+                scrutinee_id,
+                branches,
+                fallback,
+            } => {
+                self.emit_lit_switch(
+                    *scrutinee_id,
+                    branches,
+                    fallback,
+                    atoms,
+                    cases,
+                    ret_type,
+                    mode,
+                )
+            }
+            DecTree::RecordDestructure {
+                scrutinee_id,
+                field_names,
+                field_ids,
+                subtree,
+            } => {
+                self.emit_record_destructure(
+                    *scrutinee_id,
+                    field_names,
+                    field_ids,
+                    subtree,
+                    atoms,
+                    cases,
+                    ret_type,
+                    mode,
+                )
+            }
+        }
+    }
 
-        let has_inner_conditions = !guarded_stmts.is_empty() && conds.len() > 1;
+    /// Emit a Leaf node: variable bindings + case body.
+    fn emit_leaf(
+        &mut self,
+        case_idx: usize,
+        bindings: &[(Symbol, usize)],
+        atoms: &HashMap<usize, (LirAtom, Type)>,
+        cases: &[MirMatchCase],
+        ret_type: &Type,
+        mode: &MatchEmitMode,
+    ) -> Result<(), LirLowerError> {
+        let case = &cases[case_idx];
 
-        let combined_cond = if conds.is_empty() {
-            None
-        } else if !guarded_stmts.is_empty() && !conds.is_empty() {
-            Some(conds[0].clone())
-        } else {
-            Some(self.combine_bool_conditions(&conds))
-        };
-
-        let inner_cond_atoms: Vec<LirAtom> = if has_inner_conditions {
-            conds[1..].to_vec()
-        } else {
-            vec![]
-        };
-
-        // Create scope with bindings
+        // Set up scoped vars with bindings
         let mut case_vars = self.vars.clone();
         let mut case_sem_vars = self.semantic_vars.clone();
-        let semantic_bindings = self.collect_pattern_semantic_types(target, pattern);
-        for (name, atom) in &bindings {
-            case_vars.insert(name.clone(), atom.typ());
-            let sem_type = semantic_bindings
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| atom.typ());
-            case_sem_vars.insert(name.clone(), sem_type);
+        for (name, scr_id) in bindings {
+            if let Some((atom, sem_type)) = atoms.get(scr_id) {
+                case_vars.insert(*name, atom.typ());
+                case_sem_vars.insert(*name, sem_type.clone());
+            }
         }
 
-        // Lower the body: all but the last statement, then the last produces the value
         let saved_stmts = std::mem::take(&mut self.stmts);
         let saved_vars = std::mem::replace(&mut self.vars, case_vars);
-        let saved_semantic_vars = std::mem::replace(&mut self.semantic_vars, case_sem_vars);
+        let saved_sem = std::mem::replace(&mut self.semantic_vars, case_sem_vars);
 
-        // Prepend guarded pattern stmts
-        self.stmts.extend(guarded_stmts);
-
-        // Combine inner conditions inside the case body (after guarded stmts
-        // define the referenced variables).
-        let inner_cond = if !inner_cond_atoms.is_empty() {
-            let cond = self.combine_bool_conditions(&inner_cond_atoms);
-            Some(cond)
-        } else {
-            None
-        };
-
-        // guarded_len: everything before bindings (guarded + combine stmts)
-        let guarded_len = self.stmts.len();
-
-        // Prepend binding let-statements
-        for (name, atom) in &bindings {
-            let typ = atom.typ();
-            self.stmts.push(LirStmt::Let {
-                name: name.clone(),
-                typ,
-                expr: LirExpr::Atom(atom.clone()),
-            });
-        }
-
-        let value_atom = if body.is_empty() {
-            LirAtom::Unit
-        } else {
-            // Process all but the last statement
-            let last_idx = body.len() - 1;
-            for stmt in &body[..last_idx] {
-                self.lower_stmt(stmt, &Type::Unit)?;
-            }
-            // The last statement produces the value
-            match &body[last_idx] {
-                MirStmt::Expr(expr) => self.lower_expr_to_atom(expr)?,
-                MirStmt::Return(expr) => {
-                    // Return diverges from the function — still produce the value
-                    // (the IfReturn will handle the actual return)
-                    self.lower_expr_to_atom(expr)?
-                }
-                _ => {
-                    self.lower_stmt(&body[last_idx], &Type::Unit)?;
-                    LirAtom::Unit
-                }
-            }
-        };
-
-        // When inner conditions are present, wrap bindings + body + result
-        // assignment in a nested If.  Only the inner-matching case assigns
-        // to the result variable; otherwise it keeps its default value.
-        if let Some(inner_cond) = inner_cond {
-            let mut case_stmts = std::mem::replace(&mut self.stmts, saved_stmts);
-            self.vars = saved_vars;
-            self.semantic_vars = saved_semantic_vars;
-
-            let mut inner_body: Vec<LirStmt> = case_stmts.drain(guarded_len..).collect();
-            // Place the result assignment inside the inner If
-            if let Some((rname, rtyp)) = result_assign {
-                inner_body.push(LirStmt::Let {
-                    name: rname.clone(),
-                    typ: rtyp.clone(),
-                    expr: LirExpr::Atom(value_atom.clone()),
+        // Emit binding lets
+        for (name, scr_id) in bindings {
+            if let Some((atom, _)) = atoms.get(scr_id) {
+                self.stmts.push(LirStmt::Let {
+                    name: *name,
+                    typ: atom.typ(),
+                    expr: LirExpr::Atom(atom.clone()),
                 });
             }
-            case_stmts.push(LirStmt::If {
-                cond: inner_cond,
-                then_body: inner_body,
-                else_body: vec![],
-            });
-            // Return the real value_atom so the caller can place the
-            // result assignment inside the nested If if needed.
-            return Ok((combined_cond, case_stmts, value_atom, true));
         }
 
-        let case_stmts = std::mem::replace(&mut self.stmts, saved_stmts);
-        self.vars = saved_vars;
-        self.semantic_vars = saved_semantic_vars;
+        match mode {
+            MatchEmitMode::Stmt => {
+                // Lower body in statement position
+                let case_ret = self.lower_case_body_stmt(&case.body, ret_type)?;
+                let leaf_stmts = std::mem::replace(&mut self.stmts, saved_stmts);
+                self.vars = saved_vars;
+                self.semantic_vars = saved_sem;
 
-        Ok((combined_cond, case_stmts, value_atom, false))
-    }
+                // Determine if this is a side-effect-only case
+                let body_is_trivially_unit = case.body.is_empty()
+                    || case
+                        .body
+                        .iter()
+                        .all(|s| matches!(s, MirStmt::Expr(MirExpr::Literal(Literal::Unit))));
 
-    /// Lower a single match case, returning (condition, body_stmts, return_atom, has_inner_split).
-    /// When `needs_inner_split` is true (multiple cases share the same outer
-    /// constructor), the body is wrapped in a nested IfReturn that checks the
-    /// inner conditions, and has_inner_split=true signals the caller to use a
-    /// standalone If instead of an IfReturn.
-    fn lower_match_case(
-        &mut self,
-        target: &LirAtom,
-        pattern: &MirPattern,
-        body: &[MirStmt],
-        ret_type: &Type,
-        needs_inner_split: bool,
-    ) -> Result<(Option<LirAtom>, Vec<LirStmt>, Option<LirAtom>, bool), LirLowerError> {
-        let mut conds = Vec::new();
-        let mut bindings: HashMap<Symbol, LirAtom> = HashMap::new();
+                let genuine_ret = case_ret
+                    .or_else(|| fallback_return_atom_from_terminal_stmt(&leaf_stmts));
 
-        // Track stmts emitted by pattern extraction
-        let stmts_before = self.stmts.len();
-        self.collect_pattern_conditions_and_bindings(target, pattern, &mut conds, &mut bindings)?;
-
-        // For Constructor patterns with fields, the first 2 stmts are the
-        // top-level tag check (ObjectTag read + Eq), which only reads offset 0
-        // and is always safe. Remaining stmts (field extractions, nested tag
-        // checks) dereference field pointers and are only valid when the tag
-        // matches. Move them inside the case body so they execute only after
-        // the tag check passes.
-        let has_ctor_fields =
-            matches!(pattern, MirPattern::Constructor { fields, .. } if !fields.is_empty());
-        let guarded_stmts: Vec<LirStmt> = if has_ctor_fields {
-            let tag_check_end = stmts_before + 2;
-            if self.stmts.len() > tag_check_end {
-                self.stmts.drain(tag_check_end..).collect()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        // Inner conditions exist when constructor patterns have field-level
-        // literal checks (e.g. `case Foo(val: 0) ->`).  These conditions
-        // depend on the guarded field-extraction stmts and must be emitted
-        // *inside* the case body after those stmts.  This applies regardless
-        // of whether the constructor appears in multiple cases.
-        let has_inner_conditions = !guarded_stmts.is_empty() && conds.len() > 1;
-
-        // For the main condition, use only the outer tag check when
-        // there are guarded stmts (inner checks depend on extracted fields).
-        let combined_cond = if conds.is_empty() {
-            None
-        } else if !guarded_stmts.is_empty() && !conds.is_empty() {
-            Some(conds[0].clone())
-        } else {
-            Some(self.combine_bool_conditions(&conds))
-        };
-
-        // Save inner condition atoms (NOT combined yet — the AND stmts must be
-        // emitted inside the case body where guarded stmts define the referenced
-        // variables).
-        let inner_cond_atoms: Vec<LirAtom> = if has_inner_conditions {
-            conds[1..].to_vec()
-        } else {
-            vec![]
-        };
-
-        // Create scope with bindings
-        let mut case_vars = self.vars.clone();
-        let mut case_sem_vars = self.semantic_vars.clone();
-        // Compute semantic types for pattern-bound variables
-        let semantic_bindings = self.collect_pattern_semantic_types(target, pattern);
-        for (name, atom) in &bindings {
-            case_vars.insert(name.clone(), atom.typ());
-            let sem_type = semantic_bindings
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| atom.typ());
-            case_sem_vars.insert(name.clone(), sem_type);
-        }
-
-        // Lower body, capturing the last expression's value as case_ret.
-        // Save state and set up scoped vars.
-        let saved_stmts = std::mem::take(&mut self.stmts);
-        let saved_vars = std::mem::replace(&mut self.vars, case_vars);
-        let saved_semantic_vars = std::mem::replace(&mut self.semantic_vars, case_sem_vars);
-
-        // Prepend guarded pattern stmts (field extractions, nested checks)
-        // before the binding lets — they define the atoms used by bindings.
-        self.stmts.extend(guarded_stmts);
-
-        // Now combine inner conditions inside the case body context so
-        // the AND temps are defined after the guarded stmts that define
-        // the referenced condition variables.
-        let inner_cond = if !inner_cond_atoms.is_empty() {
-            let cond = self.combine_bool_conditions(&inner_cond_atoms);
-            Some(cond)
-        } else {
-            None
-        };
-
-        // guarded_len includes guarded stmts + combine stmts: everything
-        // that must stay BEFORE the inner IfReturn (the combine defines
-        // the inner_cond variable referenced by the IfReturn's cond).
-        let guarded_len = self.stmts.len();
-
-        // Prepend binding let-statements
-        for (name, atom) in bindings {
-            let typ = atom.typ();
-            self.stmts.push(LirStmt::Let {
-                name,
-                typ: typ.clone(),
-                expr: LirExpr::Atom(atom),
-            });
-        }
-
-        let case_ret = if body.is_empty() {
-            None
-        } else {
-            // Process all but the last statement
-            let last_idx = body.len() - 1;
-            for stmt in &body[..last_idx] {
-                self.lower_stmt(stmt, ret_type)?;
-            }
-            // The last statement: capture its value if it's an expression
-            match &body[last_idx] {
-                MirStmt::Expr(expr) => match expr {
-                    MirExpr::If {
-                        cond,
-                        then_body,
-                        else_body,
-                    } => {
-                        self.lower_if_stmt(cond, then_body, else_body.as_deref(), ret_type)?;
-                        None
-                    }
-                    MirExpr::Match { target, cases } => {
-                        self.lower_match_stmt(target, cases, ret_type)?;
-                        None
-                    }
-                    MirExpr::While { cond, body: wb } => {
-                        self.lower_while_stmt(cond, wb, ret_type)?;
-                        None
-                    }
-                    _ => {
-                        let atom = self.lower_expr_to_atom(expr)?;
-                        if matches!(atom.typ(), Type::Unit) {
-                            None
-                        } else {
-                            Some(atom)
-                        }
-                    }
-                },
-                MirStmt::Return(expr) => {
-                    let atom = self.lower_expr_to_atom(expr)?;
-                    if matches!(atom.typ(), Type::Unit) {
-                        None
-                    } else {
-                        Some(atom)
-                    }
-                }
-                _ => {
-                    self.lower_stmt(&body[last_idx], ret_type)?;
-                    None
-                }
-            }
-        };
-
-        let mut case_stmts = std::mem::replace(&mut self.stmts, saved_stmts);
-        self.vars = saved_vars;
-        self.semantic_vars = saved_semantic_vars;
-
-        // When there are inner conditions from nested patterns, wrap the
-        // body (everything after guarded stmts) in a nested IfReturn.
-        // This ensures the outer IfReturn only checks the outer tag,
-        // and inner tag checks happen inside after field extraction.
-        // If inner conditions don't match, the nested IfReturn doesn't
-        // return, and execution falls through the outer If block to
-        // the next match case.
-        if let Some(inner_cond) = inner_cond {
-            let inner_body: Vec<LirStmt> = case_stmts.drain(guarded_len..).collect();
-            let inner_ret = case_ret
-                .or_else(|| fallback_return_atom_from_terminal_stmt(&inner_body))
-                .unwrap_or_else(|| default_atom_for_type(ret_type));
-            let inner_ret =
-                if matches!(inner_ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
-                    default_atom_for_type(ret_type)
+                if body_is_trivially_unit && genuine_ret.is_none() {
+                    // Side-effect only — just emit the stmts inline
+                    self.stmts.extend(leaf_stmts);
                 } else {
-                    inner_ret
-                };
-            case_stmts.push(LirStmt::IfReturn {
-                cond: inner_cond,
-                then_body: inner_body,
-                then_ret: Some(inner_ret),
-                else_body: vec![],
-                else_ret: None,
-                ret_type: ret_type.clone(),
-            });
-            return Ok((combined_cond, case_stmts, None, true));
-        }
-
-        Ok((combined_cond, case_stmts, case_ret, false))
-    }
-
-    /// Collect pattern matching conditions and variable bindings
-    fn collect_pattern_conditions_and_bindings(
-        &mut self,
-        target: &LirAtom,
-        pattern: &MirPattern,
-        conds: &mut Vec<LirAtom>,
-        bindings: &mut HashMap<Symbol, LirAtom>,
-    ) -> Result<(), LirLowerError> {
-        match pattern {
-            MirPattern::Wildcard => {} // always matches
-            MirPattern::Variable(name, _sigil) => {
-                bindings.insert(*name, target.clone());
-            }
-            MirPattern::Literal(lit) => {
-                let lit_atom = literal_to_atom(lit);
-                let cond = self.bind_expr_to_temp(
-                    LirExpr::Binary {
-                        op: BinaryOp::Eq,
-                        lhs: target.clone(),
-                        rhs: lit_atom,
-                        typ: Type::Bool,
-                    },
-                    Type::Bool,
-                );
-                conds.push(cond);
-            }
-            MirPattern::Constructor { name, fields } => {
-                // Use enum definition arity for tag (not pattern field count)
-                // Extract cached constructor data upfront (O(1) lookup, values cloned to avoid borrow conflicts)
-                let (def_arity, field_labels, sorted_indices) =
-                    if let Some(info) = self.ctor_index.get(name.as_str()) {
-                        (
-                            info.field_labels.len(),
-                            Some(info.field_labels.clone()),
-                            info.sorted_indices.clone(),
-                        )
-                    } else {
-                        (fields.len(), None, None)
-                    };
-
-                // Tag check
-                let tag_atom = self.bind_expr_to_temp(
-                    LirExpr::ObjectTag {
-                        value: target.clone(),
-                        typ: Type::I64,
-                    },
-                    Type::I64,
-                );
-                let expected_tag = constructor_tag(name.as_str(), def_arity);
-                let tag_cond = self.bind_expr_to_temp(
-                    LirExpr::Binary {
-                        op: BinaryOp::Eq,
-                        lhs: tag_atom,
-                        rhs: LirAtom::Int(expected_tag),
-                        typ: Type::Bool,
-                    },
-                    Type::Bool,
-                );
-                let tag_cond_for_guard = tag_cond.clone();
-                conds.push(tag_cond);
-
-                // Resolve field types from enum definition so unpack
-                // conversion (I64 → I32 for Bool, etc.) is correct.
-                let target_sem_type = match target {
-                    LirAtom::Var { name: vn, .. } => self
-                        .semantic_vars
-                        .get(vn)
-                        .cloned()
-                        .unwrap_or_else(|| target.typ()),
-                    _ => target.typ(),
-                };
-                let resolved_field_types = resolve_constructor_field_types(
-                    name.as_str(),
-                    &target_sem_type,
-                    &self.ctor_index,
-                    self.enum_defs,
-                );
-
-                // Save position after the outer tag check so we can wrap
-                // all field extractions in a guard block.
-                let fields_start = self.stmts.len();
-
-                // Field checks — use sorted index for memory layout
-                for (pat_idx, (label, field_pat)) in fields.iter().enumerate() {
-                    // Determine the memory index for this field:
-                    // - If the pattern has a label, find its sorted position
-                    // - Otherwise, use the pattern index mapped through sorted order
-                    let mem_idx = if let Some(ref si) = sorted_indices {
-                        if let Some(lbl) = label {
-                            // Find this label's definition index, then map to sorted index
-                            field_labels
-                                .as_ref()
-                                .and_then(|labels| {
-                                    labels.iter().position(|l| l.as_ref() == Some(lbl))
-                                })
-                                .map(|def_idx| si[def_idx])
-                                .unwrap_or(pat_idx)
+                    // Has a return value — emit IfReturn with Bool(true) as condition
+                    // (the branching is handled by the parent CtorSwitch/LitSwitch)
+                    let then_ret = genuine_ret.map(|ret| {
+                        if matches!(ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
+                            default_atom_for_type(ret_type)
                         } else {
-                            // Positional: pat_idx is definition order
-                            si.get(pat_idx).copied().unwrap_or(pat_idx)
+                            ret
                         }
-                    } else {
-                        pat_idx
-                    };
-
-                    // Resolve semantic field type using definition index (not memory index)
-                    let def_idx = if let Some(lbl) = label {
-                        field_labels
-                            .as_ref()
-                            .and_then(|labels| labels.iter().position(|l| l.as_ref() == Some(lbl)))
-                            .unwrap_or(pat_idx)
-                    } else {
-                        pat_idx
-                    };
-                    let semantic_ft = resolved_field_types
-                        .as_ref()
-                        .and_then(|fts| fts.get(def_idx))
-                        .cloned();
-                    let wasm_ft =
-                        semantic_ft
-                            .as_ref()
-                            .map(|ft| wasm_type(ft))
-                            .unwrap_or_else(|| {
-                                // Generic/polymorphic constructor fields — I64 is the correct
-                                // WASM representation for unresolved type parameters
-                                tracing::debug!(
-                                "constructor '{}' field at index {}: unresolved type, using I64",
-                                name, def_idx
-                            );
-                                Type::I64
-                            });
-                    let field_atom = self.bind_expr_to_temp(
-                        LirExpr::ObjectField {
-                            value: target.clone(),
-                            index: mem_idx,
-                            typ: wasm_ft.clone(),
-                        },
-                        wasm_ft,
-                    );
-                    // Register semantic type for nested pattern matching
-                    if let (LirAtom::Var { name: fn_name, .. }, Some(sft)) =
-                        (&field_atom, &semantic_ft)
-                    {
-                        self.semantic_vars.insert(fn_name.clone(), sft.clone());
-                    }
-                    self.collect_pattern_conditions_and_bindings(
-                        &field_atom,
-                        field_pat,
-                        conds,
-                        bindings,
-                    )?;
-                }
-
-                // Guard field extraction stmts: wrap everything emitted after the
-                // tag check in an If block so nested field dereferences only execute
-                // when the constructor tag matches.  Without this, accessing fields
-                // of a mismatched constructor (e.g. reading Cons fields from Nil)
-                // causes an out-of-bounds memory access.
-                if self.stmts.len() > fields_start {
-                    let guarded: Vec<LirStmt> = self.stmts.drain(fields_start..).collect();
-                    self.stmts.push(LirStmt::If {
-                        cond: tag_cond_for_guard,
-                        then_body: guarded,
+                    });
+                    self.stmts.push(LirStmt::IfReturn {
+                        cond: LirAtom::Bool(true),
+                        then_body: leaf_stmts,
+                        then_ret,
                         else_body: vec![],
+                        else_ret: None,
+                        ret_type: ret_type.clone(),
                     });
                 }
             }
-            MirPattern::Record(fields, _open) => {
-                // Resolve field types from the target's semantic type
-                let semantic_type = match target {
-                    LirAtom::Var { name, .. } => self
-                        .semantic_vars
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_else(|| target.typ()),
-                    _ => target.typ(),
-                };
-                let record_field_types: Vec<(String, Type)> =
-                    if let Type::Record(rt_fields) = strip_linear(&semantic_type) {
-                        let mut sorted = rt_fields.clone();
-                        sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
-                        sorted
-                    } else {
-                        Vec::new()
-                    };
-                for (name, field_pat) in fields.iter() {
-                    // Find the sorted index and type from the record layout
-                    let (sorted_idx, field_type) = record_field_types
-                        .iter()
-                        .enumerate()
-                        .find(|(_, (n, _))| n == name)
-                        .map(|(i, (_, t))| (i, t.clone()))
-                        .ok_or_else(|| LirLowerError::UnresolvedType {
-                            detail: format!(
-                                "record field '{}' not found in record type {:?}",
-                                name, semantic_type
-                            ),
-                            span: 0..0,
-                        })?;
-                    let field_atom = self.bind_expr_to_temp(
-                        LirExpr::ObjectField {
-                            value: target.clone(),
-                            index: sorted_idx,
-                            typ: field_type.clone(),
-                        },
-                        field_type,
-                    );
-                    self.collect_pattern_conditions_and_bindings(
-                        &field_atom,
-                        field_pat,
-                        conds,
-                        bindings,
-                    )?;
-                }
+            MatchEmitMode::Expr {
+                result_name,
+                result_type,
+            } => {
+                // Lower body for value extraction
+                let value = self.lower_case_body_expr(&case.body)?;
+                // Assign value to result
+                self.stmts.push(LirStmt::Let {
+                    name: *result_name,
+                    typ: result_type.clone(),
+                    expr: LirExpr::Atom(value),
+                });
+
+                let leaf_stmts = std::mem::replace(&mut self.stmts, saved_stmts);
+                self.vars = saved_vars;
+                self.semantic_vars = saved_sem;
+                self.stmts.extend(leaf_stmts);
             }
         }
         Ok(())
     }
 
-    /// Collect semantic types for pattern-bound variables by walking the pattern
-    /// and looking up target's semantic type.
-    fn collect_pattern_semantic_types(
-        &self,
-        target: &LirAtom,
-        pattern: &MirPattern,
-    ) -> HashMap<Symbol, Type> {
-        let mut result = HashMap::new();
-        let target_sem_type = match target {
-            LirAtom::Var { name, .. } => self
-                .semantic_vars
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| target.typ()),
-            _ => target.typ(),
-        };
-        self.walk_pattern_semantic_types(&target_sem_type, pattern, &mut result);
-        result
-    }
-
-    fn walk_pattern_semantic_types(
-        &self,
-        sem_type: &Type,
-        pattern: &MirPattern,
-        out: &mut HashMap<Symbol, Type>,
-    ) {
-        match pattern {
-            MirPattern::Variable(name, _) => {
-                out.insert(*name, sem_type.clone());
-            }
-            MirPattern::Record(fields, _) => {
-                let record_fields: Vec<(String, Type)> =
-                    if let Type::Record(rf) = strip_linear(sem_type) {
-                        rf.clone()
+    /// Lower a case body in statement position.
+    /// Returns the return atom if the body produces a value.
+    fn lower_case_body_stmt(
+        &mut self,
+        body: &[MirStmt],
+        ret_type: &Type,
+    ) -> Result<Option<LirAtom>, LirLowerError> {
+        if body.is_empty() {
+            return Ok(None);
+        }
+        let last_idx = body.len() - 1;
+        for stmt in &body[..last_idx] {
+            self.lower_stmt(stmt, ret_type)?;
+        }
+        match &body[last_idx] {
+            MirStmt::Expr(expr) => match expr {
+                MirExpr::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    self.lower_if_stmt(cond, then_body, else_body.as_deref(), ret_type)?;
+                    Ok(None)
+                }
+                MirExpr::Match { target, cases } => {
+                    self.lower_match_stmt(target, cases, ret_type)?;
+                    Ok(None)
+                }
+                MirExpr::While { cond, body: wb } => {
+                    self.lower_while_stmt(cond, wb, ret_type)?;
+                    Ok(None)
+                }
+                _ => {
+                    let atom = self.lower_expr_to_atom(expr)?;
+                    if matches!(atom.typ(), Type::Unit) {
+                        Ok(None)
                     } else {
-                        Vec::new()
-                    };
-                for (name, field_pat) in fields {
-                    let field_type = record_fields
-                        .iter()
-                        .find(|(n, _)| *n == name.as_str())
-                        .map(|(_, t)| t.clone())
-                        .unwrap_or_else(|| {
-                            tracing::debug!(
-                                "record field '{}' not found in semantic type {:?}, using I64",
-                                name,
-                                sem_type
-                            );
-                            Type::I64
-                        });
-                    self.walk_pattern_semantic_types(&field_type, field_pat, out);
+                        Ok(Some(atom))
+                    }
+                }
+            },
+            MirStmt::Return(expr) => {
+                let atom = self.lower_expr_to_atom(expr)?;
+                if matches!(atom.typ(), Type::Unit) {
+                    Ok(None)
+                } else {
+                    Ok(Some(atom))
                 }
             }
-            MirPattern::Constructor { name, fields } => {
-                // Look up constructor's enum definition to resolve field types
-                let field_types = resolve_constructor_field_types(
-                    name.as_str(),
-                    sem_type,
-                    &self.ctor_index,
-                    self.enum_defs,
+            _ => {
+                self.lower_stmt(&body[last_idx], ret_type)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Lower a case body in expression position.
+    /// Returns the value atom.
+    fn lower_case_body_expr(
+        &mut self,
+        body: &[MirStmt],
+    ) -> Result<LirAtom, LirLowerError> {
+        if body.is_empty() {
+            return Ok(LirAtom::Unit);
+        }
+        let last_idx = body.len() - 1;
+        for stmt in &body[..last_idx] {
+            self.lower_stmt(stmt, &Type::Unit)?;
+        }
+        match &body[last_idx] {
+            MirStmt::Expr(expr) => self.lower_expr_to_atom(expr),
+            MirStmt::Return(expr) => self.lower_expr_to_atom(expr),
+            _ => {
+                self.lower_stmt(&body[last_idx], &Type::Unit)?;
+                Ok(LirAtom::Unit)
+            }
+        }
+    }
+
+    /// Emit a CtorSwitch: tag extraction + IfReturn/If chain.
+    fn emit_ctor_switch(
+        &mut self,
+        scrutinee_id: usize,
+        branches: &[CtorBranch],
+        fallback: Option<&DecTree>,
+        atoms: &mut HashMap<usize, (LirAtom, Type)>,
+        cases: &[MirMatchCase],
+        ret_type: &Type,
+        mode: &MatchEmitMode,
+    ) -> Result<(), LirLowerError> {
+        let (scr_atom, scr_sem_type) = atoms[&scrutinee_id].clone();
+
+        // Extract tag once
+        let tag_atom = self.bind_expr_to_temp(
+            LirExpr::ObjectTag {
+                value: scr_atom.clone(),
+                typ: Type::I64,
+            },
+            Type::I64,
+        );
+
+        // Pre-compute conditions for all branches
+        let n = branches.len();
+        let has_fallback = fallback.is_some();
+        let mut branch_conds: Vec<LirAtom> = Vec::new();
+        for (i, branch) in branches.iter().enumerate() {
+            let is_last_no_fb = i == n - 1 && !has_fallback;
+            if is_last_no_fb {
+                branch_conds.push(LirAtom::Bool(true));
+            } else {
+                let cond = self.bind_expr_to_temp(
+                    LirExpr::Binary {
+                        op: BinaryOp::Eq,
+                        lhs: tag_atom.clone(),
+                        rhs: LirAtom::Int(branch.ctor_tag),
+                        typ: Type::Bool,
+                    },
+                    Type::Bool,
                 );
-                let ctor_info = self.ctor_index.get(name.as_str());
-                for (pat_idx, (label, field_pat)) in fields.iter().enumerate() {
-                    // Resolve definition index for this field (label-aware)
-                    let def_idx = if let Some(lbl) = label {
-                        ctor_info
-                            .and_then(|info| {
-                                info.field_labels
-                                    .iter()
-                                    .position(|l| l.as_ref() == Some(lbl))
-                            })
-                            .unwrap_or(pat_idx)
-                    } else {
-                        pat_idx
-                    };
-                    let ft = field_types
-                        .as_ref()
-                        .and_then(|fts| fts.get(def_idx))
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            // Generic/polymorphic constructor — I64 is correct for unresolved type params
-                            tracing::debug!(
-                                "constructor '{}' field at index {}: unresolved type, using I64",
-                                name,
-                                def_idx
-                            );
-                            Type::I64
+                branch_conds.push(cond);
+            }
+        }
+
+        // Build chain in reverse
+        // Start with fallback as the innermost else
+        let mut chain_else: Vec<LirStmt> = Vec::new();
+        if let Some(fb) = fallback {
+            let saved = std::mem::take(&mut self.stmts);
+            self.emit_decision_tree(fb, atoms, cases, ret_type, mode)?;
+            chain_else = std::mem::replace(&mut self.stmts, saved);
+        }
+
+        for (_i, (branch, cond)) in branches.iter().zip(branch_conds.iter()).enumerate().rev() {
+            // Emit field extractions + subtree in isolated stmts
+            let saved = std::mem::take(&mut self.stmts);
+
+            // Extract fields
+            let resolved_fts = resolve_constructor_field_types(
+                branch.ctor_name.as_str(),
+                &scr_sem_type,
+                &self.ctor_index,
+                self.enum_defs,
+            );
+            let ctor_info_data = self.ctor_index.get(branch.ctor_name.as_str()).map(|ci| {
+                (ci.sorted_indices.clone(), ci.field_labels.clone())
+            });
+
+            for fi in 0..branch.arity {
+                let mem_idx = ctor_info_data
+                    .as_ref()
+                    .and_then(|(si, _)| si.as_ref())
+                    .map(|si| si[fi])
+                    .unwrap_or(fi);
+                let sem_ft = resolved_fts
+                    .as_ref()
+                    .and_then(|fts| fts.get(fi))
+                    .cloned()
+                    .unwrap_or(Type::I64);
+                let wasm_ft = wasm_type(&sem_ft);
+                let field_atom = self.bind_expr_to_temp(
+                    LirExpr::ObjectField {
+                        value: scr_atom.clone(),
+                        index: mem_idx,
+                        typ: wasm_ft.clone(),
+                    },
+                    wasm_ft,
+                );
+                if let LirAtom::Var { name, .. } = &field_atom {
+                    self.semantic_vars.insert(*name, sem_ft.clone());
+                }
+                atoms.insert(branch.field_ids[fi], (field_atom, sem_ft));
+            }
+
+            // Emit subtree
+            self.emit_decision_tree(&branch.subtree, atoms, cases, ret_type, mode)?;
+
+            let then_body = std::mem::replace(&mut self.stmts, saved);
+
+            match mode {
+                MatchEmitMode::Stmt => {
+                    // Determine return value from the branch body
+                    let then_ret = fallback_return_atom_from_terminal_stmt(&then_body)
+                        .map(|ret| {
+                            if matches!(ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
+                                default_atom_for_type(ret_type)
+                            } else {
+                                ret
+                            }
                         });
-                    self.walk_pattern_semantic_types(&ft, field_pat, out);
+
+                    // Use IfReturn for value-returning branches, If for side-effect
+                    if then_ret.is_some() {
+                        let stmt = LirStmt::IfReturn {
+                            cond: cond.clone(),
+                            then_body,
+                            then_ret,
+                            else_body: std::mem::take(&mut chain_else),
+                            else_ret: None,
+                            ret_type: ret_type.clone(),
+                        };
+                        chain_else = vec![stmt];
+                    } else {
+                        let stmt = LirStmt::If {
+                            cond: cond.clone(),
+                            then_body,
+                            else_body: std::mem::take(&mut chain_else),
+                        };
+                        chain_else = vec![stmt];
+                    }
+                }
+                MatchEmitMode::Expr { .. } => {
+                    let stmt = LirStmt::If {
+                        cond: cond.clone(),
+                        then_body,
+                        else_body: std::mem::take(&mut chain_else),
+                    };
+                    chain_else = vec![stmt];
                 }
             }
-            MirPattern::Wildcard | MirPattern::Literal(_) => {}
         }
+
+        self.stmts.extend(chain_else);
+        Ok(())
     }
 
-    /// Combine bool conditions with And operations
-    fn combine_bool_conditions(&mut self, conds: &[LirAtom]) -> LirAtom {
-        if conds.len() == 1 {
-            return conds[0].clone();
-        }
-        let mut result = conds[0].clone();
-        for cond in &conds[1..] {
-            result = self.bind_expr_to_temp(
+    /// Emit a LitSwitch: literal equality checks + If/IfReturn chain.
+    fn emit_lit_switch(
+        &mut self,
+        scrutinee_id: usize,
+        branches: &[(Literal, DecTree)],
+        fallback: &DecTree,
+        atoms: &mut HashMap<usize, (LirAtom, Type)>,
+        cases: &[MirMatchCase],
+        ret_type: &Type,
+        mode: &MatchEmitMode,
+    ) -> Result<(), LirLowerError> {
+        let (scr_atom, _scr_sem_type) = atoms[&scrutinee_id].clone();
+
+        // Pre-compute conditions
+        let mut branch_conds: Vec<LirAtom> = Vec::new();
+        for (lit, _) in branches {
+            let lit_atom = literal_to_atom(lit);
+            let cond = self.bind_expr_to_temp(
                 LirExpr::Binary {
-                    op: BinaryOp::And,
-                    lhs: result,
-                    rhs: cond.clone(),
+                    op: BinaryOp::Eq,
+                    lhs: scr_atom.clone(),
+                    rhs: lit_atom,
                     typ: Type::Bool,
                 },
                 Type::Bool,
             );
+            branch_conds.push(cond);
         }
-        result
+
+        // Build chain: start with fallback
+        let saved = std::mem::take(&mut self.stmts);
+        self.emit_decision_tree(fallback, atoms, cases, ret_type, mode)?;
+        let mut chain_else = std::mem::replace(&mut self.stmts, saved);
+
+        for ((_lit, subtree), cond) in branches.iter().zip(branch_conds.iter()).rev() {
+            let saved = std::mem::take(&mut self.stmts);
+            self.emit_decision_tree(subtree, atoms, cases, ret_type, mode)?;
+            let then_body = std::mem::replace(&mut self.stmts, saved);
+
+            match mode {
+                MatchEmitMode::Stmt => {
+                    let then_ret = fallback_return_atom_from_terminal_stmt(&then_body)
+                        .map(|ret| {
+                            if matches!(ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
+                                default_atom_for_type(ret_type)
+                            } else {
+                                ret
+                            }
+                        });
+
+                    if then_ret.is_some() {
+                        let stmt = LirStmt::IfReturn {
+                            cond: cond.clone(),
+                            then_body,
+                            then_ret,
+                            else_body: std::mem::take(&mut chain_else),
+                            else_ret: None,
+                            ret_type: ret_type.clone(),
+                        };
+                        chain_else = vec![stmt];
+                    } else {
+                        let stmt = LirStmt::If {
+                            cond: cond.clone(),
+                            then_body,
+                            else_body: std::mem::take(&mut chain_else),
+                        };
+                        chain_else = vec![stmt];
+                    }
+                }
+                MatchEmitMode::Expr { .. } => {
+                    let stmt = LirStmt::If {
+                        cond: cond.clone(),
+                        then_body,
+                        else_body: std::mem::take(&mut chain_else),
+                    };
+                    chain_else = vec![stmt];
+                }
+            }
+        }
+
+        self.stmts.extend(chain_else);
+        Ok(())
+    }
+
+    /// Emit a RecordDestructure: extract fields and recurse.
+    fn emit_record_destructure(
+        &mut self,
+        scrutinee_id: usize,
+        field_names: &[Symbol],
+        field_ids: &[usize],
+        subtree: &DecTree,
+        atoms: &mut HashMap<usize, (LirAtom, Type)>,
+        cases: &[MirMatchCase],
+        ret_type: &Type,
+        mode: &MatchEmitMode,
+    ) -> Result<(), LirLowerError> {
+        let (scr_atom, scr_sem_type) = atoms[&scrutinee_id].clone();
+
+        // Resolve record field types from semantic type
+        let record_field_types: Vec<(String, Type)> =
+            if let Type::Record(rt_fields) = strip_linear(&scr_sem_type) {
+                let mut sorted = rt_fields.clone();
+                sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+                sorted
+            } else {
+                Vec::new()
+            };
+
+        // Extract each field
+        for (i, field_name) in field_names.iter().enumerate() {
+            let (sorted_idx, field_type) = record_field_types
+                .iter()
+                .enumerate()
+                .find(|(_, (n, _))| n == field_name.as_str())
+                .map(|(idx, (_, t))| (idx, t.clone()))
+                .unwrap_or((i, Type::I64));
+
+            let wasm_ft = wasm_type(&field_type);
+            let field_atom = self.bind_expr_to_temp(
+                LirExpr::ObjectField {
+                    value: scr_atom.clone(),
+                    index: sorted_idx,
+                    typ: wasm_ft.clone(),
+                },
+                wasm_ft,
+            );
+            if let LirAtom::Var { name, .. } = &field_atom {
+                self.semantic_vars.insert(*name, field_type.clone());
+            }
+            atoms.insert(field_ids[i], (field_atom, field_type));
+        }
+
+        // Recurse on subtree
+        self.emit_decision_tree(subtree, atoms, cases, ret_type, mode)
     }
 
     /// Lower a MIR expression to an atom (flattening complex sub-expressions)
