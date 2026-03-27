@@ -1787,9 +1787,6 @@ fn rename_atom(atom: &mut LirAtom, map: &HashMap<Symbol, Symbol>) {
 /// and merge them by redirecting all calls to a single canonical version.
 /// Particularly effective for enum constructors and small wrapper functions.
 fn fold_identical_functions(program: &mut LirProgram) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     // 1. Compute structural fingerprints for each function.
     //    The fingerprint ignores variable names but captures the structure:
     //    types, operations, call targets, literal values, and nesting.
