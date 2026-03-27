@@ -37,15 +37,31 @@ ok()    { printf "${GREEN}[bootstrap]${RESET} %s\n" "$*"; }
 warn()  { printf "${YELLOW}[bootstrap]${RESET} %s\n" "$*"; }
 fail()  { printf "${RED}[bootstrap]${RESET} %s\n" "$*" >&2; exit 1; }
 
-# ─── Ensure the Rust compiler is built ─────────────────────────────────────
+# ─── Ensure the Rust compiler is built and up to date ─────────────────────
 
-if [[ ! -x "$NEXUS" ]]; then
+CURRENT_COMMIT="$(git rev-parse HEAD)"
+COMMIT_FILE="target/release/.nexus_commit"
+
+needs_rebuild() {
+  [[ ! -x "$NEXUS" ]] && return 0
+  [[ ! -f "$COMMIT_FILE" ]] && return 0
+  [[ "$(cat "$COMMIT_FILE")" != "$CURRENT_COMMIT" ]] && return 0
+  return 1
+}
+
+if needs_rebuild; then
+  if [[ -x "$NEXUS" && -f "$COMMIT_FILE" ]]; then
+    local_hash="$(cat "$COMMIT_FILE")"
+    info "Rust compiler is stale (built from ${local_hash:0:7}, current ${CURRENT_COMMIT:0:7})"
+  fi
   info "Building Rust compiler (cargo build --release)..."
   cargo build --release
+  mkdir -p "$(dirname "$COMMIT_FILE")"
+  echo "$CURRENT_COMMIT" > "$COMMIT_FILE"
 fi
 
 [[ -x "$NEXUS" ]] || fail "Rust compiler not found at $NEXUS"
-info "Using Rust compiler: $NEXUS"
+info "Using Rust compiler: $NEXUS (commit ${CURRENT_COMMIT:0:7})"
 
 mkdir -p "$BUILD_DIR"
 
@@ -55,14 +71,30 @@ mkdir -p "$BUILD_DIR"
 
 STAGE0="$BUILD_DIR/stage0.wasm"
 NXC_CACHE="target/nxc/nxc_driver.wasm"
+NXC_CACHE_COMMIT="target/nxc/.nxc_commit"
 
-# Trigger cache build (nxc with no args exits with usage, but populates cache).
-if "$NEXUS" nxc >/dev/null 2>&1 || [[ -f "$NXC_CACHE" ]]; then
-  info "Stage 0: reusing cached nxc_driver.wasm"
+# Reuse cache only if it was built from the current commit.
+nxc_cache_valid() {
+  [[ -f "$NXC_CACHE" ]] || return 1
+  [[ -f "$NXC_CACHE_COMMIT" ]] || return 1
+  [[ "$(cat "$NXC_CACHE_COMMIT")" == "$CURRENT_COMMIT" ]] || return 1
+  return 0
+}
+
+if nxc_cache_valid; then
+  info "Stage 0: reusing cached nxc_driver.wasm (commit ${CURRENT_COMMIT:0:7})"
   cp "$NXC_CACHE" "$STAGE0"
 else
   info "Stage 0: nexus build $NXC_ENTRY → $STAGE0"
-  "$NEXUS" build $NEXUS_BUILD_FLAGS "$NXC_ENTRY" -o "$STAGE0"
+  # Trigger nxc cache rebuild
+  "$NEXUS" nxc >/dev/null 2>&1 || true
+  if [[ -f "$NXC_CACHE" ]]; then
+    cp "$NXC_CACHE" "$STAGE0"
+    mkdir -p "$(dirname "$NXC_CACHE_COMMIT")"
+    echo "$CURRENT_COMMIT" > "$NXC_CACHE_COMMIT"
+  else
+    "$NEXUS" build $NEXUS_BUILD_FLAGS "$NXC_ENTRY" -o "$STAGE0"
+  fi
 fi
 ok "Stage 0 complete: $STAGE0 ($(wc -c < "$STAGE0" | tr -d ' ') bytes)"
 
