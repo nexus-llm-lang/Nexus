@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::intern::Symbol;
-use crate::ir::lir::{LirAtom, LirExpr, LirExternal, LirFunction, LirProgram, LirStmt};
+use crate::ir::lir::{LirAtom, LirExpr, LirExternal, LirProgram, LirStmt};
 use crate::types::Type;
 
 use super::emit::peel_linear;
