@@ -65,31 +65,12 @@ if [[ ! -f "$WASMPARSER_LIMITS" ]] || ! grep -q '128_000_000' "$WASMPARSER_LIMIT
   fi
 fi
 
-# ─── Ensure the Rust compiler is built and up to date ─────────────────────
-
+# ─── Build the Nexus compiler (Rust) ──────────────────────────────────────
 CURRENT_COMMIT="$(git rev-parse HEAD)"
-COMMIT_FILE="target/release/.nexus_commit"
-
-needs_rebuild() {
-  [[ ! -x "$NEXUS" ]] && return 0
-  [[ ! -f "$COMMIT_FILE" ]] && return 0
-  [[ "$(cat "$COMMIT_FILE")" != "$CURRENT_COMMIT" ]] && return 0
-  return 1
-}
-
-if needs_rebuild; then
-  if [[ -x "$NEXUS" && -f "$COMMIT_FILE" ]]; then
-    local_hash="$(cat "$COMMIT_FILE")"
-    info "Rust compiler is stale (built from ${local_hash:0:7}, current ${CURRENT_COMMIT:0:7})"
-  fi
-  info "Building Rust compiler (cargo build --release)..."
-  cargo build --release
-  mkdir -p "$(dirname "$COMMIT_FILE")"
-  echo "$CURRENT_COMMIT" > "$COMMIT_FILE"
-fi
-
-[[ -x "$NEXUS" ]] || fail "Rust compiler not found at $NEXUS"
-info "Using Rust compiler: $NEXUS (commit ${CURRENT_COMMIT:0:7})"
+info "Building Nexus compiler (cargo build --release)..."
+cargo build --release
+[[ -x "$NEXUS" ]] || fail "Nexus compiler not found at $NEXUS"
+info "Using Nexus compiler: $NEXUS (commit ${CURRENT_COMMIT:0:7})"
 
 mkdir -p "$BUILD_DIR"
 
