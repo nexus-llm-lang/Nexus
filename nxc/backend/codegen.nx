@@ -15,7 +15,7 @@ import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom,
          LirExternal, LirParam, LirCallArg, LirNamedAtom, ConcTask } from "nxc/ir/lir_types.nx"
 import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          ctx_locals, ctx_internal_funcs, ctx_external_funcs, ctx_string_lits,
-         ctx_alloc_mode, ctx_temps_base, ctx_func_ret_type, ctx_functions, ctx_externals,
+         ctx_alloc_mode, ctx_temps_base, ctx_func_ret_type, ctx_functions, ctx_externals, ctx_func_name,
          ctx_closure_table, ctx_closure_type_indices, is_closure_func,
          ctx_internal_func_map, ctx_external_func_map,
          peel_linear, type_to_valtype, is_unit, atom_type, expr_type,
@@ -53,6 +53,7 @@ import { build_type_section, build_import_section, build_function_section,
          build_tag_section } from "nxc/backend/wasm_section.nx"
 import * as list from "stdlib/list.nx"
 import { starts_with } from "stdlib/string.nx"
+import { CompileError, error_no_span, PhaseCodegen } from "nxc/common/error.nx"
 
 // ─── TCMC (Tail Call Modulo Constructor) ─────────────────────────────────────
 
@@ -69,7 +70,7 @@ type TcmcCtx = NoTcmc | TcmcActive(
 )
 
 /// Return TcmcCtx with loop_depth incremented by n (for entering WASM blocks).
-let tcmc_deeper = fn (tcmc: TcmcCtx, n: i64) -> TcmcCtx do
+let tcmc_deeper = fn (tcmc: TcmcCtx, n: i64) -> TcmcCtx throws { Exn } do
   match tcmc do
     case NoTcmc -> NoTcmc
     case TcmcActive(head_local: hl, prev_local: pl, rest_field_idx: rfi,
@@ -83,12 +84,12 @@ end
 
 /// Detect TCMC pattern: consecutive Let Call(self) + Let Constructor using the call result.
 // TODO: TCMC detection disabled — runtime bugs in nxc codegen need fixing
-let detect_tcmc = fn (body: [LirStmt], func_name: string) -> TcmcCtx do
+let detect_tcmc = fn (body: [LirStmt], func_name: string) -> TcmcCtx throws { Exn } do
   return NoTcmc
 end
 
 /// Check if two consecutive stmts form a TCMC pair: Let Call(self) + Let Constructor.
-let check_tcmc_pair = fn (first: LirStmt, rest: [LirStmt], func_name: string) -> TcmcCtx do
+let check_tcmc_pair = fn (first: LirStmt, rest: [LirStmt], func_name: string) -> TcmcCtx throws { Exn } do
   match first do
     case LirStmtLet(name: call_name, typ: _, expr: LirExprCall(func: f, args: call_args, typ: _)) ->
       if f == func_name then
@@ -111,7 +112,7 @@ let check_tcmc_pair = fn (first: LirStmt, rest: [LirStmt], func_name: string) ->
 end
 
 /// Recurse into a statement's branches looking for TCMC patterns.
-let find_tcmc_in_branches = fn (stmt: LirStmt, func_name: string) -> TcmcCtx do
+let find_tcmc_in_branches = fn (stmt: LirStmt, func_name: string) -> TcmcCtx throws { Exn } do
   match stmt do
     case LirStmtIf(cond: _, then_body: tb, else_body: eb) ->
       match find_tcmc_in_stmts(stmts: tb, func_name: func_name) do
@@ -132,7 +133,7 @@ let find_tcmc_in_branches = fn (stmt: LirStmt, func_name: string) -> TcmcCtx do
   end
 end
 
-let find_tcmc_in_stmts = fn (stmts: [LirStmt], func_name: string) -> TcmcCtx do
+let find_tcmc_in_stmts = fn (stmts: [LirStmt], func_name: string) -> TcmcCtx throws { Exn } do
   match stmts do
     case s :: rest ->
       // Check if s + rest[0] form a TCMC pair
@@ -149,7 +150,7 @@ let find_tcmc_in_stmts = fn (stmts: [LirStmt], func_name: string) -> TcmcCtx do
   end
 end
 
-let find_var_in_atoms = fn (atoms: [LirAtom], target: string, idx: i64) -> Option<i64> do
+let find_var_in_atoms = fn (atoms: [LirAtom], target: string, idx: i64) -> Option<i64> throws { Exn } do
   match atoms do
     case [] -> return None
     case LirAtomVar(name: n, typ: _) :: rest ->
@@ -161,7 +162,7 @@ let find_var_in_atoms = fn (atoms: [LirAtom], target: string, idx: i64) -> Optio
 end
 
 /// Emit TCMC init: head = 0, prev = 0 (called before the loop, runs once).
-let emit_tcmc_init = fn (buf: %ByteBuffer, tcmc: TcmcCtx) -> %ByteBuffer do
+let emit_tcmc_init = fn (buf: %ByteBuffer, tcmc: TcmcCtx) -> %ByteBuffer throws { Exn } do
   match tcmc do
     case NoTcmc -> return %buf
     case TcmcActive(head_local: hl, prev_local: pl, rest_field_idx: _, call_var: _,
@@ -178,7 +179,7 @@ let emit_tcmc_init = fn (buf: %ByteBuffer, tcmc: TcmcCtx) -> %ByteBuffer do
 end
 
 /// Emit TCMC alloc + link + param reassign + br to loop.
-let emit_tcmc_cons_and_loop = fn (buf: %ByteBuffer, ctx: CodegenCtx, tcmc: TcmcCtx) -> %ByteBuffer do
+let emit_tcmc_cons_and_loop = fn (buf: %ByteBuffer, ctx: CodegenCtx, tcmc: TcmcCtx) -> %ByteBuffer throws { Exn } do
   match tcmc do
     case NoTcmc -> return %buf
     case TcmcActive(head_local: hl, prev_local: pl, rest_field_idx: rfi,
@@ -188,7 +189,9 @@ let emit_tcmc_cons_and_loop = fn (buf: %ByteBuffer, ctx: CodegenCtx, tcmc: TcmcC
       let obj_ptr = ctx_temps_base(ctx: ctx) + 3
       // Find the function to get its params
       match find_function(name: fname, funcs: ctx_functions(ctx: ctx)) do
-        case None -> return push_byte(buf: %buf, byte: op_unreachable)
+        case None ->
+          error_no_span(phase: PhaseCodegen, message: "TCMC: function not found: " ++ fname)
+          return %buf
         case Some(val: LirFunction(name: _, params: params, ret_type: _, body: _, ret: _, span: _)) ->
           let arity = list.length(xs: cargs_ctor)
           // 1. Allocate constructor cell
@@ -254,7 +257,7 @@ end
 
 /// Emit non-recursive constructor fields (skip the rest_field_idx).
 let emit_tcmc_non_rec_fields = fn (buf: %ByteBuffer, ctx: CodegenCtx, obj_ptr: i64,
-                                     args: [LirAtom], rest_idx: i64, field_idx: i64) -> %ByteBuffer do
+                                     args: [LirAtom], rest_idx: i64, field_idx: i64) -> %ByteBuffer throws { Exn } do
   match args do
     case [] -> return %buf
     case a :: rest ->
@@ -276,7 +279,7 @@ let emit_tcmc_non_rec_fields = fn (buf: %ByteBuffer, ctx: CodegenCtx, obj_ptr: i
 end
 
 /// Push all call arg values onto the WASM stack (for param reassignment).
-let emit_tcmc_param_push = fn (buf: %ByteBuffer, args: [LirCallArg], params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer do
+let emit_tcmc_param_push = fn (buf: %ByteBuffer, args: [LirCallArg], params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   match args do
     case [] -> return %buf
     case LirCallArg(label: _, value: a) :: arest ->
@@ -291,7 +294,7 @@ let emit_tcmc_param_push = fn (buf: %ByteBuffer, args: [LirCallArg], params: [Li
 end
 
 /// Pop params from stack in reverse order (WASM stack is LIFO).
-let emit_tcmc_param_set = fn (buf: %ByteBuffer, params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer do
+let emit_tcmc_param_set = fn (buf: %ByteBuffer, params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   match params do
     case [] -> return %buf
     case LirParam(label: _, name: n, typ: _) :: rest ->
@@ -306,7 +309,7 @@ end
 /// If TCMC prev != 0: link last cell's rest to ret_val, return head.
 /// Otherwise: return ret_val normally.
 let emit_return_with_tcmc = fn (buf: %ByteBuffer, ret_val: LirAtom, ret_type: TypeExpr,
-                                 ctx: CodegenCtx, tcmc: TcmcCtx) -> %ByteBuffer do
+                                 ctx: CodegenCtx, tcmc: TcmcCtx) -> %ByteBuffer throws { Exn } do
   match tcmc do
     case NoTcmc ->
       let %buf = emit_atom(atom: ret_val, buf: %buf, ctx: ctx)
@@ -344,7 +347,8 @@ end
 
 // ─── Atom emission ──────────────────────────────────────────────────────────
 
-let emit_atom_var = fn (name: string, typ: TypeExpr, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+let emit_atom_var = fn (name: string, typ: TypeExpr, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  match peel_linear(typ: typ) do case TyUnit -> return %buf case _ -> () end
   let raw_idx = lookup_local(name: name, entries: ctx_locals(ctx: ctx))
   match raw_idx < 0 do
     case true ->
@@ -361,7 +365,8 @@ let emit_atom_var = fn (name: string, typ: TypeExpr, buf: %ByteBuffer, ctx: Code
               let %buf = push_byte(buf: %buf, byte: op_call)
               return push_uleb128(buf: %buf, val: ext_idx)
             case false ->
-              return push_byte(buf: %buf, byte: op_unreachable)
+              error_no_span(phase: PhaseCodegen, message: "in " ++ ctx_func_name(ctx: ctx) ++ ": variable not found as local/func/external: " ++ name)
+              return %buf
           end
       end
     case false ->
@@ -377,7 +382,7 @@ let emit_atom_var = fn (name: string, typ: TypeExpr, buf: %ByteBuffer, ctx: Code
   end
 end
 
-let emit_atom = fn (atom: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+let emit_atom = fn (atom: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   match atom do
     case LirAtomVar(name: n, typ: at) ->
       return emit_atom_var(name: n, typ: at, buf: %buf, ctx: ctx)
@@ -402,7 +407,7 @@ end
 
 // ─── Coercion / pack / unpack ───────────────────────────────────────────────
 
-let emit_coercion = fn (from_type: TypeExpr, to_type: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
+let emit_coercion = fn (from_type: TypeExpr, to_type: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer throws { Exn } do
   let f = peel_linear(typ: from_type)
   let t = peel_linear(typ: to_type)
   match f do case TyUnit -> return %buf case _ ->
@@ -418,7 +423,7 @@ let emit_coercion = fn (from_type: TypeExpr, to_type: TypeExpr, buf: %ByteBuffer
   end
 end
 
-let emit_pack_to_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
+let emit_pack_to_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer throws { Exn } do
   match peel_linear(typ: typ) do
     case TyI32 -> push_byte(buf: %buf, byte: op_i64_extend_i32_s)
     case TyBool -> push_byte(buf: %buf, byte: op_i64_extend_i32_s)
@@ -432,7 +437,7 @@ let emit_pack_to_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
   end
 end
 
-let emit_unpack_from_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
+let emit_unpack_from_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer throws { Exn } do
   match peel_linear(typ: typ) do
     case TyI32 -> push_byte(buf: %buf, byte: op_i32_wrap_i64)
     case TyBool -> push_byte(buf: %buf, byte: op_i32_wrap_i64)
@@ -444,7 +449,7 @@ end
 
 // ─── Object allocation ──────────────────────────────────────────────────────
 
-let emit_alloc_object = fn (buf: %ByteBuffer, ctx: CodegenCtx, words: i64) -> %ByteBuffer do
+let emit_alloc_object = fn (buf: %ByteBuffer, ctx: CodegenCtx, words: i64) -> %ByteBuffer throws { Exn } do
   let obj_ptr = ctx_temps_base(ctx: ctx) + 3
   let alloc_idx = lookup_func_fast(name: "__nx_allocate", map_id: ctx_external_func_map(ctx: ctx))
   match alloc_idx >= 0 do
@@ -472,7 +477,7 @@ end
 
 // ─── String unpack ──────────────────────────────────────────────────────────
 
-let emit_unpack_string = fn (buf: %ByteBuffer, packed_local: i64, ptr_local: i64, len_local: i64) -> %ByteBuffer do
+let emit_unpack_string = fn (buf: %ByteBuffer, packed_local: i64, ptr_local: i64, len_local: i64) -> %ByteBuffer throws { Exn } do
   let %buf = push_byte(buf: %buf, byte: op_local_get)
   let %buf = push_uleb128(buf: %buf, val: packed_local)
   let %buf = push_byte(buf: %buf, byte: op_i64_const)
@@ -491,7 +496,7 @@ end
 // ─── Memcpy loops ───────────────────────────────────────────────────────────
 
 let emit_memcpy_loop = fn (buf: %ByteBuffer, src_ptr: i64, dst_ptr: i64, dst_offset: i64,
-                            len_local: i64, idx_local: i64) -> %ByteBuffer do
+                            len_local: i64, idx_local: i64) -> %ByteBuffer throws { Exn } do
   let %buf = push_byte(buf: %buf, byte: op_i32_const)
   let %buf = push_sleb128(buf: %buf, val: 0)
   let %buf = push_byte(buf: %buf, byte: op_local_set)
@@ -537,7 +542,7 @@ let emit_memcpy_loop = fn (buf: %ByteBuffer, src_ptr: i64, dst_ptr: i64, dst_off
 end
 
 let emit_memcpy_loop_offset = fn (buf: %ByteBuffer, src_ptr: i64, dst_ptr: i64,
-                                   offset_local: i64, len_local: i64, idx_local: i64) -> %ByteBuffer do
+                                   offset_local: i64, len_local: i64, idx_local: i64) -> %ByteBuffer throws { Exn } do
   let %buf = push_byte(buf: %buf, byte: op_i32_const)
   let %buf = push_sleb128(buf: %buf, val: 0)
   let %buf = push_byte(buf: %buf, byte: op_local_set)
@@ -587,7 +592,7 @@ end
 
 // ─── String concat ──────────────────────────────────────────────────────────
 
-let emit_string_concat = fn (lhs: LirAtom, rhs: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+let emit_string_concat = fn (lhs: LirAtom, rhs: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   let t = ctx_temps_base(ctx: ctx)
   let lhs_packed = t + 4
   let rhs_packed = t + 5
@@ -661,11 +666,11 @@ end
 
 // ─── String compare ─────────────────────────────────────────────────────────
 
-let is_string_type = fn (t: TypeExpr) -> bool do
+let is_string_type = fn (t: TypeExpr) -> bool throws { Exn } do
   match peel_linear(typ: t) do case TyString -> true case _ -> false end
 end
 
-let is_string_op = fn (op: BinaryOp, lhs_type: TypeExpr, rhs_type: TypeExpr) -> bool do
+let is_string_op = fn (op: BinaryOp, lhs_type: TypeExpr, rhs_type: TypeExpr) -> bool throws { Exn } do
   // Either operand being TyString indicates string operation.
   // Pattern-extracted string vars have TyI64 (WASM type), but string literals
   // have TyString. If either side is TyString, use string comparison/concat.
@@ -679,14 +684,14 @@ let is_string_op = fn (op: BinaryOp, lhs_type: TypeExpr, rhs_type: TypeExpr) -> 
   return false
 end
 
-let is_string_concat_op = fn (op: BinaryOp, typ: TypeExpr) -> bool do
+let is_string_concat_op = fn (op: BinaryOp, typ: TypeExpr) -> bool throws { Exn } do
   match peel_linear(typ: typ) do case TyString ->
     match op do case OpConcat -> true case OpAdd -> true case _ -> false end
   case _ -> false end
 end
 
 let emit_string_compare = fn (op: BinaryOp, lhs: LirAtom, rhs: LirAtom,
-                               buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+                               buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   let t = ctx_temps_base(ctx: ctx)
   let lhs_packed = t + 4
   let rhs_packed = t + 5
@@ -789,7 +794,7 @@ end
 
 // ─── Binary operation ───────────────────────────────────────────────────────
 
-let emit_binary = fn (op: BinaryOp, operand_type: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
+let emit_binary = fn (op: BinaryOp, operand_type: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer throws { Exn } do
   let use_i32 = match peel_linear(typ: operand_type) do
     case TyBool -> true case TyI32 -> true case TyChar -> true case _ -> false
   end
@@ -821,7 +826,7 @@ end
 
 // ─── External call arg ──────────────────────────────────────────────────────
 
-let emit_external_arg = fn (atom: LirAtom, param_type: TypeExpr, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+let emit_external_arg = fn (atom: LirAtom, param_type: TypeExpr, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   match peel_linear(typ: param_type) do
     case TyString ->
       let packed_tmp = ctx_temps_base(ctx: ctx)
@@ -864,7 +869,7 @@ end
 // ─── Constructor/record field emission ──────────────────────────────────────
 
 let emit_constructor_fields = fn (buf: %ByteBuffer, args: [LirAtom], ctx: CodegenCtx,
-                                   obj_ptr: i64, field_idx: i64) -> %ByteBuffer do
+                                   obj_ptr: i64, field_idx: i64) -> %ByteBuffer throws { Exn } do
   match args do
     case [] -> %buf
     case a :: rest ->
@@ -879,7 +884,7 @@ let emit_constructor_fields = fn (buf: %ByteBuffer, args: [LirAtom], ctx: Codege
 end
 
 let emit_record_fields = fn (buf: %ByteBuffer, fields: [LirNamedAtom], ctx: CodegenCtx,
-                              obj_ptr: i64, field_idx: i64) -> %ByteBuffer do
+                              obj_ptr: i64, field_idx: i64) -> %ByteBuffer throws { Exn } do
   match fields do
     case [] -> %buf
     case LirNamedAtom(name: _, value: v) :: rest ->
@@ -893,7 +898,7 @@ let emit_record_fields = fn (buf: %ByteBuffer, fields: [LirNamedAtom], ctx: Code
   end
 end
 
-let extract_field_names = fn (fields: [LirNamedAtom]) -> [string] do
+let extract_field_names = fn (fields: [LirNamedAtom]) -> [string] throws { Exn } do
   match fields do
     case [] -> []
     case LirNamedAtom(name: n, value: _) :: rest ->
@@ -903,7 +908,7 @@ end
 
 // ─── Call emission ──────────────────────────────────────────────────────────
 
-let emit_internal_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer do
+let emit_internal_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   match args do
     case [] -> %buf
     case LirCallArg(label: _, value: v) :: rest_args ->
@@ -917,7 +922,7 @@ let emit_internal_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], params: 
   end
 end
 
-let find_call_arg_value = fn (label: string, args: [LirCallArg]) -> LirAtom do
+let find_call_arg_value = fn (label: string, args: [LirCallArg]) -> LirAtom throws { Exn } do
   match args do
     case [] -> return LirAtomInt(val: 0)
     case LirCallArg(label: l, value: v) :: rest ->
@@ -927,7 +932,7 @@ let find_call_arg_value = fn (label: string, args: [LirCallArg]) -> LirAtom do
   end
 end
 
-let emit_external_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer do
+let emit_external_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   // Iterate params in source order (matching stdlib ABI), look up args by label
   match params do
     case [] -> %buf
@@ -941,7 +946,7 @@ end
 // ─── Call emission ──────────────────────────────────────────────────────────
 
 let emit_internal_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
-                              is_tail: bool, in_try: bool, int_idx: i64) -> %ByteBuffer do
+                              is_tail: bool, in_try: bool, int_idx: i64) -> %ByteBuffer throws { Exn } do
   match find_function(name: func, funcs: ctx_functions(ctx: ctx)) do
     case Some(val: LirFunction(name: _, params: params, ret_type: _, body: _, ret: _, span: _)) ->
       let %buf = emit_internal_call_args(buf: %buf, args: args, params: params, ctx: ctx)
@@ -950,26 +955,26 @@ let emit_internal_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer,
       let %buf = push_byte(buf: %buf, byte: call_op)
       push_uleb128(buf: %buf, val: int_idx)
     case None ->
-      // Function definition not found — emit unreachable (stack becomes polymorphic)
-      push_byte(buf: %buf, byte: op_unreachable)
+      error_no_span(phase: PhaseCodegen, message: "internal call: function not found: " ++ func)
+      return %buf
   end
 end
 
 let emit_external_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
-                               ext_idx: i64) -> %ByteBuffer do
+                               ext_idx: i64) -> %ByteBuffer throws { Exn } do
   match find_external(name: func, exts: ctx_externals(ctx: ctx)) do
     case Some(val: LirExternal(name: _, wasm_module: _, wasm_name: _, params: params, ret_type: _, throw_row: _)) ->
       let %buf = emit_external_call_args(buf: %buf, args: args, params: params, ctx: ctx)
       let %buf = push_byte(buf: %buf, byte: op_call)
       return push_uleb128(buf: %buf, val: ext_idx)
     case None ->
-      // External definition not found — emit unreachable
-      push_byte(buf: %buf, byte: op_unreachable)
+      error_no_span(phase: PhaseCodegen, message: "external call: function not found: " ++ func)
+      return %buf
   end
 end
 
 let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
-                     is_tail: bool, in_try: bool) -> %ByteBuffer do
+                     is_tail: bool, in_try: bool) -> %ByteBuffer throws { Exn } do
   let int_idx = lookup_func_fast(name: func, map_id: ctx_internal_func_map(ctx: ctx))
   if int_idx >= 0 then
     return emit_internal_call(func: func, args: args, buf: %buf, ctx: ctx, is_tail: is_tail, in_try: in_try, int_idx: int_idx)
@@ -978,8 +983,8 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
     if ext_idx >= 0 then
       return emit_external_call(func: func, args: args, buf: %buf, ctx: ctx, ext_idx: ext_idx)
     else
-      // Neither internal nor external — emit unreachable
-      return push_byte(buf: %buf, byte: op_unreachable)
+      error_no_span(phase: PhaseCodegen, message: "in " ++ ctx_func_name(ctx: ctx) ++ ": call: function not found: " ++ func)
+      return %buf
     end
   end
 end
@@ -987,11 +992,11 @@ end
 // ─── Closure helpers ────────────────────────────────────────────────────────
 
 /// Returns the table index (position) for a closure function name.
-let lookup_closure_table_idx = fn (name: string, entries: [FuncEntry]) -> i64 do
+let lookup_closure_table_idx = fn (name: string, entries: [FuncEntry]) -> i64 throws { Exn } do
   return lookup_closure_table_idx_go(name: name, entries: entries, pos: 0)
 end
 
-let lookup_closure_table_idx_go = fn (name: string, entries: [FuncEntry], pos: i64) -> i64 do
+let lookup_closure_table_idx_go = fn (name: string, entries: [FuncEntry], pos: i64) -> i64 throws { Exn } do
   match entries do
     case [] -> return -1
     case FuncEntry(name: n, index: _) :: rest ->
@@ -1002,7 +1007,7 @@ let lookup_closure_table_idx_go = fn (name: string, entries: [FuncEntry], pos: i
 end
 
 /// Look up the type section index for a closure call with the given arity.
-let lookup_closure_type_idx_pairs = fn (arity: i64, pairs: [ArityTypeIdx]) -> i64 do
+let lookup_closure_type_idx_pairs = fn (arity: i64, pairs: [ArityTypeIdx]) -> i64 throws { Exn } do
   match pairs do
     case [] -> return 0
     case ArityTypeIdx(arity: a, type_idx: ti) :: rest ->
@@ -1012,7 +1017,7 @@ let lookup_closure_type_idx_pairs = fn (arity: i64, pairs: [ArityTypeIdx]) -> i6
   end
 end
 
-let emit_closure_captures = fn (buf: %ByteBuffer, caps: [LirAtom], ctx: CodegenCtx, obj_ptr: i64, field_idx: i64) -> %ByteBuffer do
+let emit_closure_captures = fn (buf: %ByteBuffer, caps: [LirAtom], ctx: CodegenCtx, obj_ptr: i64, field_idx: i64) -> %ByteBuffer throws { Exn } do
   match caps do
     case [] -> %buf
     case a :: rest ->
@@ -1026,7 +1031,7 @@ let emit_closure_captures = fn (buf: %ByteBuffer, caps: [LirAtom], ctx: CodegenC
   end
 end
 
-let emit_closure_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], ctx: CodegenCtx) -> %ByteBuffer do
+let emit_closure_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   match args do
     case [] -> %buf
     case LirCallArg(label: _, value: a) :: rest ->
@@ -1038,7 +1043,7 @@ end
 
 // ─── Expression emission ────────────────────────────────────────────────────
 
-let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool) -> %ByteBuffer do
+let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool) -> %ByteBuffer throws { Exn } do
   match expr do
     case LirExprAtom(atom: a) -> emit_atom(atom: a, buf: %buf, ctx: ctx)
 
@@ -1177,14 +1182,14 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
 end
 
 let emit_if_return_unconditional = fn (buf: %ByteBuffer, then_body: [LirStmt], then_ret: LirAtom,
-    ret_type: TypeExpr, ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer do
+    ret_type: TypeExpr, ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer throws { Exn } do
   let %buf = emit_stmts(stmts: then_body, buf: %buf, ctx: ctx, in_try: in_try, tcmc: tcmc)
   return emit_return_with_tcmc(buf: %buf, ret_val: then_ret, ret_type: ret_type, ctx: ctx, tcmc: tcmc)
 end
 
 let emit_if_return_conditional = fn (buf: %ByteBuffer, cond: LirAtom, then_body: [LirStmt], then_ret: LirAtom,
     else_body: [LirStmt], else_ret: Option<LirAtom>, ret_type: TypeExpr,
-    ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer do
+    ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer throws { Exn } do
   let %buf = emit_atom(atom: cond, buf: %buf, ctx: ctx)
   let %buf = emit_coercion(from_type: atom_type(atom: cond), to_type: TyBool, buf: %buf)
   let %buf = push_byte(buf: %buf, byte: op_if)
@@ -1205,7 +1210,7 @@ let emit_if_return_conditional = fn (buf: %ByteBuffer, cond: LirAtom, then_body:
   return push_byte(buf: %buf, byte: op_end)
 end
 
-let is_unconditional_return = fn (cond: LirAtom, else_body: [LirStmt], else_ret: Option<LirAtom>) -> bool do
+let is_unconditional_return = fn (cond: LirAtom, else_body: [LirStmt], else_ret: Option<LirAtom>) -> bool throws { Exn } do
   match cond do
     case LirAtomBool(val: true) ->
       let has_else = list.length(xs: else_body) > 0
@@ -1217,7 +1222,7 @@ end
 
 // ─── Statement emission (mutually recursive) ────────────────────────────────
 
-let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer do
+let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer throws { Exn } do
   match stmt do
     case LirStmtLet(name: n, typ: t, expr: e) ->
       // TCMC interception: skip self-call, intercept constructor
@@ -1367,7 +1372,7 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
 end
 
 let emit_conc_tasks = fn (tasks: [ConcTask], buf: %ByteBuffer, ctx: CodegenCtx,
-                           spawn_idx: i64, args_ptr_local: i64) -> %ByteBuffer do
+                           spawn_idx: i64, args_ptr_local: i64) -> %ByteBuffer throws { Exn } do
   match tasks do
     case [] -> %buf
     case ConcTask(func_name: fname, args: args) :: rest ->
@@ -1417,7 +1422,7 @@ let emit_conc_tasks = fn (tasks: [ConcTask], buf: %ByteBuffer, ctx: CodegenCtx,
 end
 
 let emit_conc_args = fn (args: [LirNamedAtom], buf: %ByteBuffer, ctx: CodegenCtx,
-                          args_ptr_local: i64, offset: i64) -> %ByteBuffer do
+                          args_ptr_local: i64, offset: i64) -> %ByteBuffer throws { Exn } do
   match args do
     case [] -> %buf
     case LirNamedAtom(name: _, value: atom) :: rest ->
@@ -1437,7 +1442,7 @@ let emit_conc_args = fn (args: [LirNamedAtom], buf: %ByteBuffer, ctx: CodegenCtx
   end
 end
 
-let emit_widen_to_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
+let emit_widen_to_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer throws { Exn } do
   match peel_linear(typ: typ) do
     case TyI32 -> push_byte(buf: %buf, byte: op_i64_extend_i32_u)
     case TyBool -> push_byte(buf: %buf, byte: op_i64_extend_i32_u)
@@ -1446,7 +1451,7 @@ let emit_widen_to_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer do
   end
 end
 
-let emit_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer do
+let emit_stmts = fn (stmts: [LirStmt], buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer throws { Exn } do
   match stmts do
     case [] -> %buf
     case s :: rest ->
@@ -1456,7 +1461,7 @@ end
 
 // ─── Function body compilation ──────────────────────────────────────────────
 
-let emit_default_for_type = fn (buf: %ByteBuffer, typ: TypeExpr) -> %ByteBuffer do
+let emit_default_for_type = fn (buf: %ByteBuffer, typ: TypeExpr) -> %ByteBuffer throws { Exn } do
   let vt = type_to_valtype(typ: typ)
   match vt == vt_i32 do
     case true ->
@@ -1474,14 +1479,10 @@ let emit_default_for_type = fn (buf: %ByteBuffer, typ: TypeExpr) -> %ByteBuffer 
   end
 end
 
-let emit_return_value = fn (body: %ByteBuffer, rt: TypeExpr, r: LirAtom, ctx: CodegenCtx) -> %ByteBuffer do
+let emit_return_value = fn (body: %ByteBuffer, rt: TypeExpr, r: LirAtom, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   match is_unit(typ: rt) do
     case true -> %body
     case false ->
-      // If ret atom is Unit but return type is not, emit a default value for the
-      // return type. This happens when all code paths have explicit `return` and
-      // the LIR fallback ret atom is LirAtomUnit — the value is dead code but
-      // WASM validation requires a structurally valid stack at function end.
       let actual = match r do
         case LirAtomUnit -> emit_default_for_type(buf: %body, typ: rt)
         case _ ->
@@ -1492,7 +1493,7 @@ let emit_return_value = fn (body: %ByteBuffer, rt: TypeExpr, r: LirAtom, ctx: Co
   end
 end
 
-let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuffer do
+let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   let LirFunction(name: fname, params: ps, ret_type: rt, body: b, ret: r, span: _) = func
   let %body = empty()
   let %body = emit_local_decls(buf: %body, locals: ctx_locals(ctx: ctx), param_count: list.length(xs: ps))
@@ -1529,7 +1530,7 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuff
   push_byte(buf: %body, byte: op_end)
 end
 
-let compile_wasi_run_wrapper = fn (main_idx: i64, main_ret_type: TypeExpr) -> %ByteBuffer do
+let compile_wasi_run_wrapper = fn (main_idx: i64, main_ret_type: TypeExpr) -> %ByteBuffer throws { Exn } do
   let %body = empty()
   let %body = push_uleb128(buf: %body, val: 0)
   let %body = push_byte(buf: %body, byte: op_call)
@@ -1545,7 +1546,7 @@ end
 
 // ─── Code section / context building ────────────────────────────────────────
 
-let build_param_locals = fn (params: [LirParam], idx: i64) -> [LocalEntry] do
+let build_param_locals = fn (params: [LirParam], idx: i64) -> [LocalEntry] throws { Exn } do
   match params do
     case [] -> []
     case LirParam(label: _, name: n, typ: t) :: rest ->
@@ -1561,8 +1562,8 @@ let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
                           closure_table: [FuncEntry],
                           closure_type_indices: [ArityTypeIdx],
                           internal_func_map: i64,
-                          external_func_map: i64) -> CodegenCtx do
-  let LirFunction(name: _, params: ps, ret_type: rt, body: b, ret: _, span: _) = func
+                          external_func_map: i64) -> CodegenCtx throws { Exn } do
+  let LirFunction(name: fname, params: ps, ret_type: rt, body: b, ret: _, span: _) = func
   let param_locals = build_param_locals(params: ps, idx: 0)
   let param_count = list.length(xs: ps)
   let local_map = build_local_map(entries: param_locals)
@@ -1573,12 +1574,13 @@ let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
     string_lits: string_lits, alloc_mode: alloc_mode, temps_base: collected_next_idx,
     func_ret_type: rt, functions: functions, externals: externals,
     closure_table: closure_table, closure_type_indices: closure_type_indices,
-    internal_func_map: internal_func_map, external_func_map: external_func_map
+    internal_func_map: internal_func_map, external_func_map: external_func_map,
+    func_name: fname
   )
   end
 end
 
-let append_body_to_buf = fn (buf: %ByteBuffer, body: %ByteBuffer) -> %ByteBuffer do
+let append_body_to_buf = fn (buf: %ByteBuffer, body: %ByteBuffer) -> %ByteBuffer throws { Exn } do
   let body_len = buf_length(buf: &body)
   let %buf = push_uleb128(buf: %buf, val: body_len)
   let %buf = push_buf(dst: %buf, src: &body)
@@ -1593,7 +1595,7 @@ let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
                             closure_table: [FuncEntry],
                             closure_type_indices: [ArityTypeIdx],
                             internal_func_map: i64,
-                            external_func_map: i64) -> %ByteBuffer do
+                            external_func_map: i64) -> %ByteBuffer throws { Exn } do
   match funcs do
     case [] -> %buf
     case f :: rest ->
@@ -1614,7 +1616,7 @@ end
 
 // ─── Module assembly ────────────────────────────────────────────────────────
 
-let build_internal_func_entries = fn (funcs: [LirFunction], import_count: i64, idx: i64) -> [FuncEntry] do
+let build_internal_func_entries = fn (funcs: [LirFunction], import_count: i64, idx: i64) -> [FuncEntry] throws { Exn } do
   match funcs do
     case [] -> []
     case LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
@@ -1623,7 +1625,7 @@ let build_internal_func_entries = fn (funcs: [LirFunction], import_count: i64, i
   end
 end
 
-let build_external_func_entries = fn (exts: [LirExternal], idx: i64) -> [FuncEntry] do
+let build_external_func_entries = fn (exts: [LirExternal], idx: i64) -> [FuncEntry] throws { Exn } do
   match exts do
     case [] -> []
     case LirExternal(name: n, wasm_module: _, wasm_name: _, params: _, ret_type: _, throw_row: _) :: rest ->
@@ -1634,7 +1636,7 @@ end
 
 // ─── Conc detection helpers ──────────────────────────────────────────────────
 
-let has_conc_tasks = fn (funcs: [LirFunction]) -> bool do
+let has_conc_tasks = fn (funcs: [LirFunction]) -> bool throws { Exn } do
   match funcs do
     case [] -> return false
     case LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
@@ -1644,7 +1646,7 @@ let has_conc_tasks = fn (funcs: [LirFunction]) -> bool do
   end
 end
 
-let collect_conc_exports = fn (funcs: [FuncEntry]) -> [FuncEntry] do
+let collect_conc_exports = fn (funcs: [FuncEntry]) -> [FuncEntry] throws { Exn } do
   match funcs do
     case [] -> return []
     case FuncEntry(name: n, index: idx) :: rest ->
@@ -1655,7 +1657,7 @@ let collect_conc_exports = fn (funcs: [FuncEntry]) -> [FuncEntry] do
   end
 end
 
-let make_conc_externals = fn () -> [LirExternal] do
+let make_conc_externals = fn () -> [LirExternal] throws { Exn } do
   return [
     LirExternal(
       name: "__nx_conc_spawn",
@@ -1678,7 +1680,7 @@ let make_conc_externals = fn () -> [LirExternal] do
   ]
 end
 
-let append_externals = fn (a: [LirExternal], b: [LirExternal]) -> [LirExternal] do
+let append_externals = fn (a: [LirExternal], b: [LirExternal]) -> [LirExternal] throws { Exn } do
   match a do
     case [] -> b
     case e :: rest -> e :: append_externals(a: rest, b: b)
@@ -1688,7 +1690,7 @@ end
 // ─── Closure analysis helpers ───────────────────────────────────────────────
 
 /// Build closure table entries: maps table index → function index for __closure_* functions.
-let build_closure_table = fn (funcs: [LirFunction], internal_func_map: i64, table_idx: i64) -> [FuncEntry] do
+let build_closure_table = fn (funcs: [LirFunction], internal_func_map: i64, table_idx: i64) -> [FuncEntry] throws { Exn } do
   match funcs do
     case [] -> []
     case LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
@@ -1702,7 +1704,7 @@ let build_closure_table = fn (funcs: [LirFunction], internal_func_map: i64, tabl
 end
 
 /// Insert a value into a sorted list, skipping if already present. O(K) per insert.
-let insert_sorted_i64 = fn (val: i64, xs: [i64]) -> [i64] do
+let insert_sorted_i64 = fn (val: i64, xs: [i64]) -> [i64] throws { Exn } do
   match xs do
     case [] -> [val]
     case x :: rest ->
@@ -1720,11 +1722,11 @@ end
 /// Get distinct closure arities from __closure_* functions.
 /// Arity = param count - 1 (subtract the __env param).
 /// Builds a sorted+deduped list in a single pass.
-let collect_closure_arities = fn (funcs: [LirFunction]) -> [i64] do
+let collect_closure_arities = fn (funcs: [LirFunction]) -> [i64] throws { Exn } do
   return collect_closure_arities_acc(funcs: funcs, acc: [])
 end
 
-let collect_closure_arities_acc = fn (funcs: [LirFunction], acc: [i64]) -> [i64] do
+let collect_closure_arities_acc = fn (funcs: [LirFunction], acc: [i64]) -> [i64] throws { Exn } do
   match funcs do
     case [] -> acc
     case LirFunction(name: n, params: ps, ret_type: _, body: _, ret: _, span: _) :: rest ->
@@ -1739,7 +1741,7 @@ end
 // ─── Name section (custom) ─────────────────────────────────────────────────
 
 /// Build name subsection entries for external (imported) functions
-let emit_external_name_entries = fn (buf: %ByteBuffer, exts: [LirExternal], idx: i64) -> %ByteBuffer do
+let emit_external_name_entries = fn (buf: %ByteBuffer, exts: [LirExternal], idx: i64) -> %ByteBuffer throws { Exn } do
   match exts do
     case [] -> return %buf
     case LirExternal(name: _, wasm_module: _, wasm_name: wn, params: _, ret_type: _, throw_row: _) :: rest ->
@@ -1750,7 +1752,7 @@ let emit_external_name_entries = fn (buf: %ByteBuffer, exts: [LirExternal], idx:
 end
 
 /// Build name subsection entries for internal functions
-let emit_internal_name_entries = fn (buf: %ByteBuffer, funcs: [LirFunction], idx: i64) -> %ByteBuffer do
+let emit_internal_name_entries = fn (buf: %ByteBuffer, funcs: [LirFunction], idx: i64) -> %ByteBuffer throws { Exn } do
   match funcs do
     case [] -> return %buf
     case LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
@@ -1764,7 +1766,7 @@ end
 let build_name_section = fn (exts: [LirExternal], funcs: [LirFunction],
                               has_alloc: bool,
                               n_exts: i64, n_alloc_imports: i64,
-                              total_funcs: i64) -> %ByteBuffer do
+                              total_funcs: i64) -> %ByteBuffer throws { Exn } do
   let %entries = empty()
   let %entries = push_uleb128(buf: %entries, val: total_funcs)
   let %entries = emit_external_name_entries(buf: %entries, exts: exts, idx: 0)
@@ -1794,7 +1796,7 @@ end
 
 // ─── Module entry point ────────────────────────────────────────────────────
 
-export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
+export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws { Exn } do
   match program do
     case LirProgram(functions: funcs, externals: orig_exts) ->
       // Detect conc tasks and add conc imports if needed
@@ -1967,7 +1969,7 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer do
   end
 end
 
-let build_closure_type_idx_list = fn (arities: [i64], base: i64) -> [ArityTypeIdx] do
+let build_closure_type_idx_list = fn (arities: [i64], base: i64) -> [ArityTypeIdx] throws { Exn } do
   match arities do
     case [] -> []
     case a :: rest ->
