@@ -211,12 +211,11 @@ fn run_core_wasm_bytes_inner(
             return ExitCode::from(1);
         }
     }
-    let has_net_host = net_host::needs_net_host(wasm);
-    if has_net_host {
-        if let Err(e) = net_host::add_net_host_to_linker(&mut linker) {
-            eprintln!("Failed to add net host to linker: {}", e);
-            return ExitCode::from(1);
-        }
+    // Always add net_host — dep modules (e.g. stdlib) may import from it
+    // even if the main module doesn't directly.
+    if let Err(e) = net_host::add_net_host_to_linker(&mut linker) {
+        eprintln!("Failed to add net host to linker: {}", e);
+        return ExitCode::from(1);
     }
     let mut builder = WasiCtxBuilder::new();
     if let Err(msg) = capabilities.apply_to_wasi_builder(&mut builder) {
