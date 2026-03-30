@@ -1028,6 +1028,29 @@ impl Parser {
                 })
             }
 
+            // If expression: if cond then body else body end
+            TokenKind::If => {
+                self.advance();
+                let cond = self.parse_expr()?;
+                self.expect_contextual("then")?;
+                let then_branch = self.parse_stmt_list()?;
+                let else_branch = if self.match_keyword(&TokenKind::Else) {
+                    Some(self.parse_stmt_list()?)
+                } else {
+                    None
+                };
+                self.expect(&TokenKind::End)?;
+                let end = self.tokens[self.pos - 1].span.end;
+                Ok(Spanned {
+                    node: Expr::If {
+                        cond: Box::new(cond),
+                        then_branch,
+                        else_branch,
+                    },
+                    span: start..end,
+                })
+            }
+
             // Match expression: match expr do case pat -> body ... end
             TokenKind::Match => {
                 self.advance();
