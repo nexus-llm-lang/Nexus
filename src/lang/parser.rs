@@ -1028,8 +1028,7 @@ impl Parser {
                 })
             }
 
-            // If expression in atom position: desugar to match
-            // `if cond then A else B end` → `match cond do case true -> A case false -> B end`
+            // If expression: if cond then body else body end
             TokenKind::If => {
                 self.advance();
                 let cond = self.parse_expr()?;
@@ -1042,40 +1041,14 @@ impl Parser {
                 };
                 self.expect(&TokenKind::End)?;
                 let end = self.tokens[self.pos - 1].span.end;
-                // Desugar: if with else → match on bool
-                if let Some(eb) = else_branch {
-                    let true_case = MatchCase {
-                        pattern: Spanned {
-                            node: Pattern::Literal(Literal::Bool(true)),
-                            span: start..end,
-                        },
-                        body: then_branch,
-                    };
-                    let false_case = MatchCase {
-                        pattern: Spanned {
-                            node: Pattern::Literal(Literal::Bool(false)),
-                            span: start..end,
-                        },
-                        body: eb,
-                    };
-                    Ok(Spanned {
-                        node: Expr::Match {
-                            target: Box::new(cond),
-                            cases: vec![true_case, false_case],
-                        },
-                        span: start..end,
-                    })
-                } else {
-                    // if without else stays as Expr::If (statement, returns unit)
-                    Ok(Spanned {
-                        node: Expr::If {
-                            cond: Box::new(cond),
-                            then_branch,
-                            else_branch: None,
-                        },
-                        span: start..end,
-                    })
-                }
+                Ok(Spanned {
+                    node: Expr::If {
+                        cond: Box::new(cond),
+                        then_branch,
+                        else_branch,
+                    },
+                    span: start..end,
+                })
             }
 
             // Match expression: match expr do case pat -> body ... end
