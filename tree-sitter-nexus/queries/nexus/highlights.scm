@@ -87,6 +87,13 @@
 (constructor_pattern
   name: (uident) @constructor)
 
+(cons_pattern
+  "::" @operator)
+
+(list_pattern
+  "[" @punctuation.bracket
+  "]" @punctuation.bracket)
+
 ; ─── Parameters & Labels ────────────────────────────────────────────────────
 
 (param
