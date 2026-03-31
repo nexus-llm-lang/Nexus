@@ -1028,7 +1028,9 @@ impl Parser {
                 })
             }
 
-            // If expression: if cond then body else body end
+            // If expression: desugar if-else to match on bool
+            // `if c then A else B end` → `match c do case true -> A case false -> B end`
+            // `if c then A end` (no else) → Expr::If (statement, returns unit)
             TokenKind::If => {
                 self.advance();
                 let cond = self.parse_expr()?;
@@ -1041,14 +1043,40 @@ impl Parser {
                 };
                 self.expect(&TokenKind::End)?;
                 let end = self.tokens[self.pos - 1].span.end;
-                Ok(Spanned {
-                    node: Expr::If {
-                        cond: Box::new(cond),
-                        then_branch,
-                        else_branch,
-                    },
-                    span: start..end,
-                })
+                if let Some(eb) = else_branch {
+                    // Desugar to match bool — gets proper expression type inference
+                    Ok(Spanned {
+                        node: Expr::Match {
+                            target: Box::new(cond),
+                            cases: vec![
+                                MatchCase {
+                                    pattern: Spanned {
+                                        node: Pattern::Literal(Literal::Bool(true)),
+                                        span: start..end,
+                                    },
+                                    body: then_branch,
+                                },
+                                MatchCase {
+                                    pattern: Spanned {
+                                        node: Pattern::Literal(Literal::Bool(false)),
+                                        span: start..end,
+                                    },
+                                    body: eb,
+                                },
+                            ],
+                        },
+                        span: start..end,
+                    })
+                } else {
+                    Ok(Spanned {
+                        node: Expr::If {
+                            cond: Box::new(cond),
+                            then_branch,
+                            else_branch: None,
+                        },
+                        span: start..end,
+                    })
+                }
             }
 
             // Match expression: match expr do case pat -> body ... end
@@ -1467,15 +1495,42 @@ impl Parser {
         self.expect(&TokenKind::End)?;
         let end = self.tokens[self.pos - 1].span.end;
 
-        Ok(Spanned {
-            node: Stmt::Expr(Spanned {
+        // Desugar if-else to match on bool (same as expression form)
+        let expr = if let Some(eb) = else_branch {
+            Spanned {
+                node: Expr::Match {
+                    target: Box::new(cond),
+                    cases: vec![
+                        MatchCase {
+                            pattern: Spanned {
+                                node: Pattern::Literal(Literal::Bool(true)),
+                                span: start..end,
+                            },
+                            body: then_branch,
+                        },
+                        MatchCase {
+                            pattern: Spanned {
+                                node: Pattern::Literal(Literal::Bool(false)),
+                                span: start..end,
+                            },
+                            body: eb,
+                        },
+                    ],
+                },
+                span: start..end,
+            }
+        } else {
+            Spanned {
                 node: Expr::If {
                     cond: Box::new(cond),
                     then_branch,
-                    else_branch,
+                    else_branch: None,
                 },
                 span: start..end,
-            }),
+            }
+        };
+        Ok(Spanned {
+            node: Stmt::Expr(expr),
             span: start..end,
         })
     }
