@@ -788,3 +788,71 @@ fn test_return_in_match_counts_as_return() {
     "#,
     );
 }
+
+// ─── If-else expression type inference ───────────────────────────────────────
+
+#[test]
+fn if_else_expr_infers_i64() {
+    should_typecheck(
+        r#"
+    let main = fn () -> unit do
+        let x: i64 = if true then 1 else 2 end
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn if_else_expr_infers_string() {
+    should_typecheck(
+        r#"
+    let main = fn () -> unit do
+        let s: string = if true then "yes" else "no" end
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn if_else_expr_type_mismatch_fails() {
+    should_fail_typecheck(
+        r#"
+    let main = fn () -> unit do
+        let x: i64 = if true then 1 else "no" end
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn if_else_expr_as_return_value() {
+    should_typecheck(
+        r#"
+    let max = fn (a: i64, b: i64) -> i64 do
+        return if a > b then a else b end
+    end
+    let main = fn () -> unit do
+        let _ = max(a: 1, b: 2)
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn if_else_expr_nested() {
+    should_typecheck(
+        r#"
+    let classify = fn (x: i64) -> i64 do
+        return if x > 0 then if x > 100 then 2 else 1 end else 0 end
+    end
+    let main = fn () -> unit do
+        let _ = classify(x: 5)
+        return ()
+    end
+    "#,
+    );
+}

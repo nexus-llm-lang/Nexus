@@ -615,6 +615,7 @@ end
 
     #[test]
     fn prop_linear_branch_mismatch_is_error(n in any::<i64>(), cond in any::<bool>()) {
+        // if-else where then consumes %x but else does not (non-diverging)
         let src = format!(
             r#"
 let main = fn () -> unit do
@@ -622,7 +623,7 @@ let main = fn () -> unit do
     if {cond} then
         match %x do case _ -> () end
     else
-        return ()
+        ()
     end
     return ()
 end

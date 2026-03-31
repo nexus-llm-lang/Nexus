@@ -824,3 +824,99 @@ end
 "#,
     );
 }
+
+// ─── If-else expression tests ────────────────────────────────────────────────
+
+#[test]
+fn if_else_expr_returns_then_branch_value() {
+    exec(
+        r#"
+let main = fn () -> unit do
+    let x = if true then 42 else 0 end
+    if x != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn if_else_expr_returns_else_branch_value() {
+    exec(
+        r#"
+let main = fn () -> unit do
+    let x = if false then 42 else 99 end
+    if x != 99 then raise RuntimeError(val: "expected 99") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn if_else_expr_with_condition_variable() {
+    exec(
+        r#"
+let pick = fn (flag: bool, a: i64, b: i64) -> i64 do
+    return if flag then a else b end
+end
+let main = fn () -> unit do
+    let r1 = pick(flag: true, a: 10, b: 20)
+    let r2 = pick(flag: false, a: 10, b: 20)
+    if r1 != 10 then raise RuntimeError(val: "expected 10") end
+    if r2 != 20 then raise RuntimeError(val: "expected 20") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn if_else_expr_with_string_type() {
+    exec(
+        r#"
+let greet = fn (formal: bool) -> string do
+    return if formal then "Good day" else "Hey" end
+end
+let main = fn () -> unit do
+    let g = greet(formal: true)
+    if g != "Good day" then raise RuntimeError(val: "expected formal") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn if_else_expr_nested() {
+    exec(
+        r#"
+let classify = fn (x: i64) -> i64 do
+    return if x > 0 then
+        if x > 100 then 2 else 1 end
+    else 0 end
+end
+let main = fn () -> unit do
+    if classify(x: 200) != 2 then raise RuntimeError(val: "expected 2") end
+    if classify(x: 50) != 1 then raise RuntimeError(val: "expected 1") end
+    if classify(x: -5) != 0 then raise RuntimeError(val: "expected 0") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn if_else_expr_in_let_binding() {
+    exec(
+        r#"
+let main = fn () -> unit do
+    let a = 10
+    let b = 20
+    let max_val = if a > b then a else b end
+    if max_val != 20 then raise RuntimeError(val: "expected 20") end
+    return ()
+end
+"#,
+    );
+}
