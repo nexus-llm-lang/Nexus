@@ -123,12 +123,14 @@ Binary operators with standard precedence (multiplicative binds tighter than add
 | Operators | Domain |
 |---|---|
 | `<<` `>>` | Bit shift (highest) |
-| `*` `/` `*.` `/.` `&` | Multiplicative / bitwise AND |
-| `+` `-` `+.` `-.` `++` `\|` `^` | Additive / string concat / bitwise OR, XOR |
+| `*` `/` `%` `*.` `/.` `&` | Multiplicative / modulo / bitwise AND |
+| `+` `-` `+.` `-.` `++` `::` `\|` `^` | Additive / string concat / cons / bitwise OR, XOR |
 | `==` `!=` `<` `>` `<=` `>=` | Integer / generic comparison |
 | `==.` `!=.` `<.` `>.` `<=.` `>=.` | Float comparison |
 | `&&` | Logical AND |
 | `\|\|` | Logical OR (lowest) |
+
+The `::` operator is right-associative and desugars to `Cons(v: lhs, rest: rhs)`. For example, `1 :: 2 :: []` produces `Cons(v: 1, rest: Cons(v: 2, rest: Nil))`.
 
 ### Function Calls
 
@@ -351,6 +353,8 @@ end
 | Literal | `1`, `true`, `"hi"` | Matches exact value |
 | Variable | `x`, `~x`, `%x` | Binds with optional sigil |
 | Constructor | `Ok(val: v)`, `None` | Destructures variant |
+| List | `[1, 2, 3]`, `[]` | Desugars to nested Cons/Nil |
+| Cons | `x :: xs` | Right-associative, desugars to `Cons(v: x, rest: xs)` |
 | Record (exact) | `{ x: p1, y: p2 }` | All fields must match |
 | Record (partial) | `{ x: p1, _ }` | `_` must be last; remaining fields ignored |
 | Wildcard | `_` | Matches anything, no binding |
@@ -443,7 +447,7 @@ external_def  ::= [ "export" ] "external" IDENT "=" STRING_LITERAL ":" [ type_pa
 type_params ::= "<" UIDENT ( "," UIDENT )* ">"
 param_list  ::= "(" [ param ( "," param )* ] ")"
 param       ::= [ sigil ] IDENT ":" type
-sigil       ::= "~" | "%"
+sigil       ::= "~" | "%" | "&"
 
 (* ── Types ──────────────────────────────────────────────────── *)
 
@@ -527,9 +531,9 @@ binary_op        ::= "||"
                    | "&&"
                    | "==" | "!=" | "<=" | ">=" | "<" | ">"
                    | "==." | "!=." | "<=." | ">=." | "<." | ">."
-                   | "+" | "-" | "++" | "|" | "^"
+                   | "+" | "-" | "++" | "::" | "|" | "^"
                    | "+." | "-."
-                   | "*" | "/" | "&"
+                   | "*" | "/" | "%" | "&"
                    | "*." | "/."
                    | "<<" | ">>"
 
@@ -573,15 +577,21 @@ linear_list_expr ::= "%" "[" [ expr ( "," expr )* [ "," ] ] "]"
 array_expr       ::= "[|" [ expr ( "," expr )* [ "," ] ] "|]"
 variable         ::= [ sigil ] IDENT
 dotted_ident     ::= IDENT ( "." IDENT )*
+                   | UIDENT "." IDENT ( "." IDENT )*
 
 (* ── Patterns ───────────────────────────────────────────────── *)
 
-pattern             ::= literal_pattern
+pattern             ::= cons_pattern
+                       | literal_pattern
                        | constructor_pattern
+                       | list_pattern
                        | record_pattern
                        | wildcard_pattern
                        | variable_pattern
 
+cons_pattern        ::= pattern "::" pattern          (* right-associative; desugars to Cons *)
+list_pattern        ::= "[" [ pattern ( "," pattern )* [ "," ] ] "]"
+                                                       (* desugars to nested Cons/Nil *)
 literal_pattern     ::= literal
 variable_pattern    ::= [ sigil ] IDENT
 constructor_pattern ::= UIDENT "(" [ ctor_pat_arg ( "," ctor_pat_arg )* ] ")"

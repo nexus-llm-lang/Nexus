@@ -506,6 +506,15 @@ export default grammar({
             field("right", $._expr)
           )
         ),
+        // :: cons (right-associative, same precedence as additive)
+        prec.right(
+          4,
+          seq(
+            field("left", $._expr),
+            field("operator", "::"),
+            field("right", $._expr)
+          )
+        ),
         // Float additive
         prec.left(
           4,
@@ -533,12 +542,12 @@ export default grammar({
             field("right", $._expr)
           )
         ),
-        // Int multiplicative
+        // Int multiplicative + modulo
         prec.left(
           5,
           seq(
             field("left", $._expr),
-            field("operator", choice("*", "/")),
+            field("operator", choice("*", "/", "%")),
             field("right", $._expr)
           )
         ),
@@ -817,12 +826,29 @@ export default grammar({
 
     _pattern: ($) =>
       choice(
+        $.cons_pattern,
         $.literal_pattern,
         $.constructor_pattern,
+        $.list_pattern,
         $.record_pattern,
         $.wildcard_pattern,
         $.variable_pattern
       ),
+
+    // p1 :: p2  — right-associative cons pattern, desugars to Cons(v: p1, rest: p2)
+    cons_pattern: ($) =>
+      prec.right(
+        4,
+        seq(
+          field("head", $._pattern),
+          "::",
+          field("tail", $._pattern)
+        )
+      ),
+
+    // [p1, p2, ...]  — list pattern, desugars to nested Cons/Nil
+    list_pattern: ($) =>
+      seq("[", commaSep($._pattern), optional(","), "]"),
 
     literal_pattern: ($) => $.literal,
 
