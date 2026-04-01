@@ -54,7 +54,6 @@
           wasmtime
           wabt
           binaryen
-          lld
         ];
 
         formatter = pkgs.nixfmt-tree;

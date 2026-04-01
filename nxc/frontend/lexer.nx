@@ -1,9 +1,9 @@
 /**
  * lexer: Tokenizer for Nexus source code.
  *
- * Scans source string character-by-character via char_at, producing a list of
- * SpannedTokens. Emits TkError for unrecognized characters instead of
- * aborting, allowing downstream passes to report multiple errors.
+ * Uses byte-level scanning primitives (byte_at, scan_ident, scan_digits, etc.)
+ * for O(1) character access instead of O(n) char_at. Bulk scan functions reduce
+ * FFI crossings from O(chars) to O(tokens).
  */
 
 import * as str from "stdlib/string.nx"
@@ -48,27 +48,27 @@ let ch_eof       = '\0'
 type LexerState = LexerState(src: string, pos: i64, line: i64, col: i64, len: i64)
 
 let make_lexer = fn (src: string) -> LexerState do
-  return LexerState(src: src, pos: 0, line: 1, col: 1, len: str.length(s: src))
+  return LexerState(src: src, pos: 0, line: 1, col: 1, len: str.byte_length(s: src))
 end
 
-// ─── Character access ────────────────────────────────────────────────────────
+// ─── Character access (byte-level, O(1) per call) ───────────────────────────
 
 let peek = fn (st: LexerState) -> char do
   let LexerState(src: s, pos: p, line: _, col: _, len: l) = st
   if p >= l then return ch_eof end
-  return str.char_at(s: s, idx: p)
+  return str.byte_at(s: s, idx: p)
 end
 
 let peek_at = fn (st: LexerState, offset: i64) -> char do
   let LexerState(src: s, pos: p, line: _, col: _, len: l) = st
   let idx = p + offset
   if idx >= l then return ch_eof end
-  return str.char_at(s: s, idx: idx)
+  return str.byte_at(s: s, idx: idx)
 end
 
 let advance = fn (st: LexerState) -> LexerState do
   let LexerState(src: s, pos: p, line: ln, col: c, len: l) = st
-  if str.char_at(s: s, idx: p) == ch_newline then
+  if str.byte_at(s: s, idx: p) == ch_newline then
     return LexerState(src: s, pos: p + 1, line: ln + 1, col: 1, len: l)
   else
     return LexerState(src: s, pos: p + 1, line: ln, col: c + 1, len: l)
@@ -92,7 +92,23 @@ end
 
 let slice = fn (st: LexerState, start: i64, length: i64) -> string do
   let LexerState(src: s, pos: _, line: _, col: _, len: _) = st
-  return str.substring(s: s, start: start, len: length)
+  return str.byte_substring(s: s, start: start, len: length)
+end
+
+// ─── Bulk state update helper ────────────────────────────────────────────────
+
+// Update LexerState after jumping from current pos to new_pos,
+// correctly tracking line/col by counting newlines in the skipped range.
+let update_state_bulk = fn (st: LexerState, new_pos: i64) -> LexerState do
+  let LexerState(src: s, pos: old_pos, line: ln, col: c, len: l) = st
+  if new_pos == old_pos then return st end
+  let nl_count = str.count_newlines_in(s: s, start: old_pos, end_pos: new_pos)
+  if nl_count > 0 then
+    let last_nl = str.last_newline_in(s: s, start: old_pos, end_pos: new_pos)
+    return LexerState(src: s, pos: new_pos, line: ln + nl_count, col: new_pos - last_nl, len: l)
+  else
+    return LexerState(src: s, pos: new_pos, line: ln, col: c + (new_pos - old_pos), len: l)
+  end
 end
 
 // ─── Lexer result ────────────────────────────────────────────────────────────
@@ -106,9 +122,13 @@ end
 // ─── Skip whitespace and comments ────────────────────────────────────────────
 
 let skip_line_comment = fn (st: LexerState) -> LexerState do
-  if at_end(st: st) then return st end
-  if peek(st: st) == ch_newline then return advance(st: st) end
-  return skip_line_comment(st: advance(st: st))
+  let LexerState(src: s, pos: p, line: ln, col: _, len: l) = st
+  let nl_pos = str.find_byte(s: s, start: p, ch: ch_newline)
+  if nl_pos < 0 then
+    return LexerState(src: s, pos: l, line: ln, col: 1 + l - p, len: l)
+  else
+    return LexerState(src: s, pos: nl_pos + 1, line: ln + 1, col: 1, len: l)
+  end
 end
 
 let skip_block_comment = fn (st: LexerState, depth: i64) -> LexerState do
@@ -126,29 +146,34 @@ let skip_block_comment = fn (st: LexerState, depth: i64) -> LexerState do
 end
 
 let skip_whitespace_and_comments = fn (st: LexerState) -> LexerState do
-  if at_end(st: st) then return st end
-  let c = peek(st: st)
-  if char.is_whitespace(c: c) then
-    return skip_whitespace_and_comments(st: advance(st: st))
+  let LexerState(src: s, pos: p, line: _, col: _, len: l) = st
+  if p >= l then return st end
+  // Bulk skip whitespace
+  let ws_end = str.skip_ws(s: s, start: p)
+  if ws_end > p then
+    let st1 = update_state_bulk(st: st, new_pos: ws_end)
+    return skip_whitespace_and_comments(st: st1)
   end
-  let c2 = peek_at(st: st, offset: 1)
-  if c == ch_slash && c2 == ch_slash then
-    return skip_whitespace_and_comments(st: skip_line_comment(st: st))
-  end
-  if c == ch_slash && c2 == ch_star then
-    return skip_whitespace_and_comments(st: skip_block_comment(st: advance_n(st: st, n: 2), depth: 1))
+  // Check for comments (byte_at is O(1))
+  let c = str.byte_at(s: s, idx: p)
+  if c == ch_slash then
+    let c2 = str.byte_at(s: s, idx: p + 1)
+    if c2 == ch_slash then
+      return skip_whitespace_and_comments(st: skip_line_comment(st: st))
+    end
+    if c2 == ch_star then
+      return skip_whitespace_and_comments(st: skip_block_comment(st: advance_n(st: st, n: 2), depth: 1))
+    end
   end
   return st
 end
 
-// ─── Identifiers and keywords ────────────────────────────────────────────────
+// ─── Identifiers and keywords (bulk scan) ────────────────────────────────────
 
 let lex_ident_rest = fn (st: LexerState) -> LexerState do
-  if at_end(st: st) then return st end
-  if char.is_ident_char(c: peek(st: st)) then
-    return lex_ident_rest(st: advance(st: st))
-  end
-  return st
+  let LexerState(src: s, pos: p, line: ln, col: c, len: l) = st
+  let end_pos = str.scan_ident(s: s, start: p)
+  return LexerState(src: s, pos: end_pos, line: ln, col: c + (end_pos - p), len: l)
 end
 
 let lex_identifier = fn (st: LexerState, span: Span) -> LexResult do
@@ -170,14 +195,12 @@ let lex_uident = fn (st: LexerState, span: Span) -> LexResult do
   return spanned(st: st2, token: TkUident(name: name), span: span)
 end
 
-// ─── Numbers ─────────────────────────────────────────────────────────────────
+// ─── Numbers (bulk scan) ─────────────────────────────────────────────────────
 
 let lex_digits = fn (st: LexerState) -> LexerState do
-  if at_end(st: st) then return st end
-  if char.is_digit(c: peek(st: st)) then
-    return lex_digits(st: advance(st: st))
-  end
-  return st
+  let LexerState(src: s, pos: p, line: ln, col: c, len: l) = st
+  let end_pos = str.scan_digits(s: s, start: p)
+  return LexerState(src: s, pos: end_pos, line: ln, col: c + (end_pos - p), len: l)
 end
 
 let lex_number = fn (st: LexerState, span: Span) -> LexResult do
@@ -294,7 +317,7 @@ let lex_string_body = fn (st: LexerState, acc: string) -> LexResult do
   end
   // Regular character
   let LexerState(src: s, pos: p, line: _, col: _, len: _) = st
-  return lex_string_body(st: advance(st: st), acc: acc ++ str.from_char(c: str.char_at(s: s, idx: p)))
+  return lex_string_body(st: advance(st: st), acc: acc ++ str.from_char(c: str.byte_at(s: s, idx: p)))
 end
 
 let lex_string = fn (st: LexerState, span: Span) -> LexResult do
@@ -345,7 +368,7 @@ let lex_char_literal = fn (st: LexerState, span: Span) -> LexResult do
     return lex_char_escape(st: st, span: span, c2: peek_at(st: st, offset: 1))
   end
   let LexerState(src: s, pos: p, line: _, col: _, len: _) = st
-  let code = char.ord(c: str.char_at(s: s, idx: p))
+  let code = char.ord(c: str.byte_at(s: s, idx: p))
   return lex_char_close(st: advance(st: st), span: span, code: code)
 end
 
@@ -369,7 +392,7 @@ let lex_bracket_body = fn (st: LexerState, acc: string) -> LexResult do
     end
   end
   let LexerState(src: s, pos: p, line: _, col: _, len: _) = st
-  return lex_bracket_body(st: advance(st: st), acc: acc ++ str.from_char(c: str.char_at(s: s, idx: p)))
+  return lex_bracket_body(st: advance(st: st), acc: acc ++ str.from_char(c: str.byte_at(s: s, idx: p)))
 end
 
 let lex_bracket_string = fn (st: LexerState, span: Span) -> LexResult do
