@@ -3,6 +3,7 @@ pub mod char;
 pub mod clock;
 pub mod collections;
 pub mod env;
+pub mod exn;
 pub mod fs;
 pub mod list;
 pub mod math;

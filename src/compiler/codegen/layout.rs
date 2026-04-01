@@ -40,6 +40,8 @@ pub(super) struct CodegenLayout {
     pub(super) allocate_func_idx: Option<u32>,
     /// Exception tag index (WASM EH): defined in tag section, used by throw/try_table
     pub(super) exn_tag_idx: Option<u32>,
+    /// Index of imported __nx_capture_backtrace function (called before throw)
+    pub(super) capture_bt_func_idx: Option<u32>,
     /// Map from function name to its index in the funcref table
     pub(super) funcref_table_indices: HashMap<Symbol, u32>,
     /// Map from WASM signature key (params+results) to type index for call_indirect
@@ -99,6 +101,7 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
         conc_join_idx: None,
         allocate_func_idx: None,
         exn_tag_idx: None,
+        capture_bt_func_idx: None,
         funcref_table_indices: HashMap::new(),
         indirect_type_indices: HashMap::new(),
     })

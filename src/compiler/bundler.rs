@@ -171,7 +171,11 @@ fn merge_dependencies_once(
 
     let current_path = temp_dir.join("current.wasm");
     let merged_path = temp_dir.join("merged.wasm");
-    fs::write(&current_path, current_wasm)
+    // Strip .debug_* custom sections before merge — wasm-merge v124 crashes (SIGSEGV)
+    // when it encounters DWARF debug sections. They will be re-emitted post-bundle
+    // if needed (currently unbundled output only).
+    let stripped = strip_debug_sections(current_wasm);
+    fs::write(&current_path, &stripped)
         .map_err(|e| format!("failed to write temporary wasm: {}", e))?;
 
     let mut command = ProcessCommand::new(wasm_merge_command);
@@ -222,6 +226,33 @@ fn merge_dependencies_once(
         fs::read(&merged_path).map_err(|e| format!("failed to read merged wasm output: {}", e))?;
     let _ = fs::remove_dir_all(&temp_dir);
     Ok(merged)
+}
+
+/// Remove `.debug_*` custom sections from a WASM binary.
+/// Needed because wasm-merge v124 crashes on DWARF sections.
+fn strip_debug_sections(wasm: &[u8]) -> Vec<u8> {
+    use wasm_encoder::{Module, RawSection};
+    let parser = wasmparser::Parser::new(0);
+    let mut module = Module::new();
+    for payload in parser.parse_all(wasm) {
+        let payload = match payload {
+            Ok(p) => p,
+            Err(_) => return wasm.to_vec(), // fallback: return as-is
+        };
+        match &payload {
+            Payload::CustomSection(reader) if reader.name().starts_with(".debug_") => {
+                continue; // skip debug sections
+            }
+            _ => {}
+        }
+        if let Some((id, range)) = payload.as_section() {
+            module.section(&RawSection {
+                id,
+                data: &wasm[range],
+            });
+        }
+    }
+    module.finish()
 }
 
 #[cfg(test)]

@@ -19,10 +19,16 @@ use super::emit::{
 use super::error::CodegenError;
 use super::function::compile_function;
 use super::layout::{build_codegen_layout, program_uses_object_heap, MemoryMode};
-use super::{ALLOCATE_WASM_NAME, CONC_JOIN_NAME, CONC_MODULE, CONC_SPAWN_NAME, CONC_TASK_PREFIX};
+use super::dwarf::FuncDebugEntry;
+use super::{
+    ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, CONC_JOIN_NAME, CONC_MODULE, CONC_SPAWN_NAME,
+    CONC_TASK_PREFIX,
+};
 
-/// Compiles LIR (in ANF) directly into core WASM bytes.
-pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError> {
+/// Compiles LIR (in ANF) directly into core WASM bytes, plus debug entries for DWARF.
+pub fn compile_lir_to_wasm(
+    program: &LirProgram,
+) -> Result<(Vec<u8>, Vec<FuncDebugEntry>), CodegenError> {
     let has_conc = program
         .functions
         .iter()
@@ -59,8 +65,9 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         }
     }
     let deduped_ext_count = deduped_externals.len() as u32;
+    let n_bt_imports: u32 = if has_eh { 1 } else { 0 };
 
-    let import_count = deduped_ext_count + n_conc_imports + n_alloc_imports;
+    let import_count = deduped_ext_count + n_conc_imports + n_alloc_imports + n_bt_imports;
 
     let mut internal_function_indices = HashMap::new();
     for (idx, func) in program.functions.iter().enumerate() {
@@ -96,6 +103,10 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
     if stdlib_alloc_module.is_some() {
         let alloc_idx = deduped_ext_count + n_conc_imports;
         layout.allocate_func_idx = Some(alloc_idx);
+    }
+    if has_eh {
+        let bt_idx = deduped_ext_count + n_conc_imports + n_alloc_imports;
+        layout.capture_bt_func_idx = Some(bt_idx);
     }
 
     // Build funcref table indices
@@ -158,6 +169,21 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         types.ty().function([ValType::I32], [ValType::I32]);
         allocate_type_idx = next_type_index;
         next_type_index += 1;
+    }
+
+    // Backtrace capture type: () -> () — called before throw
+    let mut bt_capture_type_idx = 0;
+    if has_eh {
+        let key = sig_key(&[], &[]);
+        bt_capture_type_idx = if let Some(&existing) = sig_to_type_idx.get(&key) {
+            existing
+        } else {
+            types.ty().function([], []);
+            sig_to_type_idx.insert(key, next_type_index);
+            let idx = next_type_index;
+            next_type_index += 1;
+            idx
+        };
     }
 
     let mut internal_type_indices = Vec::with_capacity(program.functions.len());
@@ -260,6 +286,14 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
             alloc_module,
             ALLOCATE_WASM_NAME,
             EntityType::Function(allocate_type_idx),
+        );
+        has_imports = true;
+    }
+    if has_eh {
+        imports.import(
+            BT_MODULE,
+            BT_CAPTURE_NAME,
+            EntityType::Function(bt_capture_type_idx),
         );
         has_imports = true;
     }
@@ -369,6 +403,10 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
 
     // === Code Section ===
     let mut code = CodeSection::new();
+    let mut debug_entries = Vec::new();
+    // The code section body starts with a LEB128 function count.
+    let total_func_count = program.functions.len() + 1; // +1 for WASI CLI run wrapper
+    let mut code_body_offset = uleb128_encoded_size(total_func_count as u64) as u32;
     for func in &program.functions {
         let body = compile_function(
             func,
@@ -377,6 +415,18 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
             &external_function_indices,
             &layout,
         )?;
+        let body_byte_len = body.byte_len();
+        // Each function entry is LEB128(body_size) + body_bytes
+        let func_encoded_size =
+            uleb128_encoded_size(body_byte_len as u64) as u32 + body_byte_len as u32;
+        debug_entries.push(FuncDebugEntry {
+            name: func.name.to_string(),
+            code_offset: code_body_offset,
+            code_size: func_encoded_size,
+            source_file: func.source_file.clone(),
+            source_line: func.source_line,
+        });
+        code_body_offset += func_encoded_size;
         code.function(&body);
     }
     let run_wrapper = compile_wasi_cli_run_wrapper(main_idx, &main_func.ret_type);
@@ -427,7 +477,7 @@ pub fn compile_lir_to_wasm(program: &LirProgram) -> Result<Vec<u8>, CodegenError
         module.section(&names);
     }
 
-    Ok(module.finish())
+    Ok((module.finish(), debug_entries))
 }
 
 fn compile_wasi_cli_run_wrapper(main_idx: u32, main_ret_type: &Type) -> Function {
@@ -670,6 +720,19 @@ fn arrow_type_to_wasm_sig(arrow: &Type) -> Result<(Vec<ValType>, Vec<ValType>), 
 /// Create a string key for signature deduplication.
 fn sig_key(params: &[ValType], results: &[ValType]) -> String {
     format!("{:?}->{:?}", params, results)
+}
+
+/// Compute the encoded size of a ULEB128 value.
+fn uleb128_encoded_size(mut val: u64) -> usize {
+    let mut size = 0;
+    loop {
+        val >>= 7;
+        size += 1;
+        if val == 0 {
+            break;
+        }
+    }
+    size
 }
 
 /// Check if the LIR program needs backtrace instrumentation.

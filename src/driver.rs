@@ -116,8 +116,10 @@ pub fn compile_loaded_source_to_wasm(
     } else {
         merged
     };
-    // Satisfy nexus:runtime/backtrace imports with no-op stubs so the
-    // component encoder sees no unresolved host imports.
+    // Satisfy nexus:runtime/backtrace imports with no-op stubs so that
+    // wasm-merge unifies memory. Host backtrace functions work via the
+    // runtime linker (test harness, REPL); in bundled mode (nexus run/build)
+    // the stubs provide a graceful fallback (backtrace returns []).
     let merged = {
         let merged_imports = bundler::module_import_names(&merged).unwrap_or_default();
         if merged_imports.contains(nexus::runtime::backtrace::BT_HOST_MODULE) {

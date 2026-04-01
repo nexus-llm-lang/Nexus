@@ -171,6 +171,7 @@ fn run_core_wasm_bytes_inner(
     config.max_wasm_stack(64 * 1024 * 1024); // 64 MiB
     config.wasm_tail_call(true);
     config.wasm_exceptions(true);
+    config.wasm_backtrace(true);
     let engine = match Engine::new(&config) {
         Ok(engine) => engine,
         Err(e) => {
@@ -204,13 +205,6 @@ fn run_core_wasm_bytes_inner(
             return ExitCode::from(1);
         }
     }
-    if has_bt {
-        backtrace::reset();
-        if let Err(e) = backtrace::add_bt_to_linker(&mut linker) {
-            eprintln!("Failed to add backtrace runtime to linker: {}", e);
-            return ExitCode::from(1);
-        }
-    }
     // Always add net_host — dep modules (e.g. stdlib) may import from it
     // even if the main module doesn't directly.
     if let Err(e) = net_host::add_net_host_to_linker(&mut linker) {
@@ -229,6 +223,13 @@ fn run_core_wasm_bytes_inner(
         builder.args(&all_args);
     }
     let mut store = Store::new(&engine, builder.build_p1());
+    if has_bt {
+        backtrace::reset();
+        if let Err(e) = backtrace::add_bt_to_linker(&mut linker, &mut store) {
+            eprintln!("Failed to add backtrace runtime to linker: {}", e);
+            return ExitCode::from(1);
+        }
+    }
 
     let mut imported_modules = module
         .imports()

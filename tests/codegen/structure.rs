@@ -1,5 +1,5 @@
 use crate::harness::compile;
-use nexus::compiler::codegen::compile_program_to_wasm_with_metrics;
+use nexus::compiler::codegen::{compile_program_to_wasm_with_dwarf, compile_program_to_wasm_with_metrics};
 use wasmparser::Operator;
 
 #[test]
@@ -466,7 +466,7 @@ fn codegen_deduplicates_externals_by_wasm_identity() {
         externals: vec![ext_a, ext_b],
     };
 
-    let wasm = compile_lir_to_wasm(&program).expect("should compile without E2010");
+    let (wasm, _) = compile_lir_to_wasm(&program).expect("should compile without E2010");
 
     // Count WASM imports for __nx_string_to_i64
     let mut import_count = 0;
@@ -483,4 +483,50 @@ fn codegen_deduplicates_externals_by_wasm_identity() {
         import_count, 1,
         "duplicate externals should produce exactly one WASM import"
     );
+}
+
+#[test]
+fn codegen_dwarf_sections_emitted() {
+    let src = r#"
+let add = fn (a: i64, b: i64) -> i64 do
+  return a + b
+end
+
+let main = fn () -> unit do
+  let r = add(a: 1, b: 2)
+  return ()
+end
+"#;
+    let mut program = nexus::lang::parser::parser().parse(src).unwrap();
+    program.source_file = Some("test.nx".to_string());
+    program.source_text = Some(src.to_string());
+    let wasm = compile_program_to_wasm_with_dwarf(&program).unwrap();
+
+    let mut sections = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let Ok(wasmparser::Payload::CustomSection(reader)) = payload {
+            sections.push(reader.name().to_string());
+        }
+    }
+    assert!(
+        sections.contains(&".debug_abbrev".to_string()),
+        "expected .debug_abbrev section, got: {:?}",
+        sections
+    );
+    assert!(
+        sections.contains(&".debug_info".to_string()),
+        "expected .debug_info section, got: {:?}",
+        sections
+    );
+    assert!(
+        sections.contains(&".debug_line".to_string()),
+        "expected .debug_line section, got: {:?}",
+        sections
+    );
+
+    // Write WASM to temp file for manual inspection with wasm-tools
+    if std::env::var("NEXUS_DUMP_DWARF").is_ok() {
+        std::fs::write("/tmp/nexus_dwarf_demo.wasm", &wasm).unwrap();
+        eprintln!("Wrote /tmp/nexus_dwarf_demo.wasm ({} bytes)", wasm.len());
+    }
 }

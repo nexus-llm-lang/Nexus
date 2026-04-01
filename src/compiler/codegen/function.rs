@@ -800,6 +800,10 @@ pub(super) fn compile_expr(
             let tag_idx = layout
                 .exn_tag_idx
                 .expect("exn_tag_idx must be set for programs with raise");
+            // Capture backtrace via stack walk before throwing
+            if let Some(bt_idx) = layout.capture_bt_func_idx {
+                out.instruction(&Instruction::Call(bt_idx));
+            }
             compile_atom(value, out, local_map, layout)?;
             if matches!(value.typ(), Type::Unit) {
                 // Unit-typed raise: push i64(0) as payload
