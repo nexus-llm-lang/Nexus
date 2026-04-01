@@ -118,6 +118,45 @@ fn codegen_validate_wasm_output() {
     }
 }
 
+/// Regression test for nexus-928: exception constructor fields must use sorted
+/// (alphabetical) heap indices in pattern matching, not positional indices.
+/// When exception defs were missing from enum_defs, fields like "phase" and
+/// "message" got swapped because positional order != alphabetical order.
+#[test]
+fn exn_field_order_regression() {
+    exec_with_stdlib(&read_fixture("nxc/test_exn_field_order.nx"));
+
+    let path = "nxc_test_exn_field_order.wasm";
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {}", path, e));
+    wasmparser::Validator::new()
+        .validate_all(&bytes)
+        .unwrap_or_else(|e| panic!("{} failed validation: {}", path, e));
+
+    let engine = {
+        let mut config = wasmtime::Config::new();
+        config.wasm_tail_call(true);
+        config.wasm_exceptions(true);
+        wasmtime::Engine::new(&config).unwrap()
+    };
+
+    let module = wasmtime::Module::from_binary(&engine, &bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let main = instance
+        .get_typed_func::<(), i64>(&mut store, "main")
+        .unwrap();
+    let result = main.call(&mut store, ()).unwrap();
+    // MyExn(phase: 10, message: 20) — match extracts "message" field → should be 20
+    // If fields are swapped (bug), "message" binding gets phase value → returns 10
+    assert_eq!(
+        result, 20,
+        "exn field order: expected message=20, got {} (fields likely swapped)",
+        result
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn bytebuffer_minimal() {
     exec_with_stdlib(&read_fixture("nxc/test_bytebuffer_minimal.nx"));
