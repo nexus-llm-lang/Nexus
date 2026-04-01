@@ -1,4 +1,4 @@
-use nexus_wasm_alloc::read_string;
+use nexus_wasm_alloc::{checked_ptr_len, read_string};
 
 #[cfg(not(feature = "no_alloc_export"))]
 #[no_mangle]
@@ -253,4 +253,137 @@ pub extern "C" fn __nx_string_is_valid_f64(s_ptr: i32, s_len: i32) -> i32 {
         Ok(v) if !v.is_nan() || s.trim() == "NaN" => 1,
         _ => 0,
     }
+}
+
+// ─── Byte-level scanning primitives for lexer performance ────────────────────
+
+fn raw_bytes(s_ptr: i32, s_len: i32) -> Option<&'static [u8]> {
+    let (offset, len) = checked_ptr_len(s_ptr, s_len)?;
+    Some(unsafe { std::slice::from_raw_parts(offset as *const u8, len) })
+}
+
+/// Returns the raw byte value at the given byte position (0-255). O(1).
+/// Returns 0 if out of bounds.
+#[no_mangle]
+pub extern "C" fn __nx_string_byte_at(s_ptr: i32, s_len: i32, idx: i64) -> i32 {
+    let Some(bytes) = raw_bytes(s_ptr, s_len) else {
+        return 0;
+    };
+    if idx < 0 || (idx as usize) >= bytes.len() {
+        return 0;
+    }
+    bytes[idx as usize] as i32
+}
+
+/// Scans from `start` while characters are ASCII identifier chars (a-z, A-Z, 0-9, _).
+/// Returns the byte position of the first non-ident character.
+#[no_mangle]
+pub extern "C" fn __nx_string_scan_ident(s_ptr: i32, s_len: i32, start: i64) -> i64 {
+    let Some(bytes) = raw_bytes(s_ptr, s_len) else {
+        return start;
+    };
+    let mut i = (start.max(0) as usize).min(bytes.len());
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i as i64
+}
+
+/// Scans from `start` while characters are ASCII digits (0-9).
+/// Returns the byte position of the first non-digit character.
+#[no_mangle]
+pub extern "C" fn __nx_string_scan_digits(s_ptr: i32, s_len: i32, start: i64) -> i64 {
+    let Some(bytes) = raw_bytes(s_ptr, s_len) else {
+        return start;
+    };
+    let mut i = (start.max(0) as usize).min(bytes.len());
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    i as i64
+}
+
+/// Skips ASCII whitespace (space, tab, \n, \r) from `start`.
+/// Returns the byte position of the first non-whitespace character.
+#[no_mangle]
+pub extern "C" fn __nx_string_skip_ws(s_ptr: i32, s_len: i32, start: i64) -> i64 {
+    let Some(bytes) = raw_bytes(s_ptr, s_len) else {
+        return start;
+    };
+    let mut i = (start.max(0) as usize).min(bytes.len());
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i as i64
+}
+
+/// Counts the number of newline characters (\n) in the byte range [start, end).
+#[no_mangle]
+pub extern "C" fn __nx_string_count_newlines_in(s_ptr: i32, s_len: i32, start: i64, end: i64) -> i64 {
+    let Some(bytes) = raw_bytes(s_ptr, s_len) else {
+        return 0;
+    };
+    let start = (start.max(0) as usize).min(bytes.len());
+    let end = (end.max(0) as usize).min(bytes.len());
+    bytes[start..end].iter().filter(|&&b| b == b'\n').count() as i64
+}
+
+/// Returns the byte position of the last newline (\n) in range [start, end),
+/// or -1 if no newline is found.
+#[no_mangle]
+pub extern "C" fn __nx_string_last_newline_in(s_ptr: i32, s_len: i32, start: i64, end: i64) -> i64 {
+    let Some(bytes) = raw_bytes(s_ptr, s_len) else {
+        return -1;
+    };
+    let start = (start.max(0) as usize).min(bytes.len());
+    let end = (end.max(0) as usize).min(bytes.len());
+    for i in (start..end).rev() {
+        if bytes[i] == b'\n' {
+            return i as i64;
+        }
+    }
+    -1
+}
+
+/// Finds the first occurrence of byte `ch` starting from `start`.
+/// Returns the byte position, or -1 if not found.
+#[no_mangle]
+pub extern "C" fn __nx_string_find_byte(s_ptr: i32, s_len: i32, start: i64, ch: i32) -> i64 {
+    let Some(bytes) = raw_bytes(s_ptr, s_len) else {
+        return -1;
+    };
+    let start = (start.max(0) as usize).min(bytes.len());
+    let target = ch as u8;
+    for i in start..bytes.len() {
+        if bytes[i] == target {
+            return i as i64;
+        }
+    }
+    -1
+}
+
+/// Extracts a substring by byte offset and byte length. O(len).
+/// Unlike `substring` which uses character indices, this uses raw byte positions.
+#[no_mangle]
+pub extern "C" fn __nx_string_byte_substring(s_ptr: i32, s_len: i32, start: i64, len: i64) -> i64 {
+    let Some(bytes) = raw_bytes(s_ptr, s_len) else {
+        return 0;
+    };
+    let start = (start.max(0) as usize).min(bytes.len());
+    let len = (len.max(0) as usize).min(bytes.len().saturating_sub(start));
+    if len == 0 {
+        return 0;
+    }
+    let result = String::from_utf8_lossy(&bytes[start..start + len]).to_string();
+    nexus_wasm_alloc::store_string_result(result)
 }
