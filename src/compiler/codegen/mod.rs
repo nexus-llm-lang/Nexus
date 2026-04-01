@@ -1,4 +1,5 @@
 mod binary;
+mod dwarf;
 mod emit;
 mod error;
 mod function;
@@ -28,6 +29,8 @@ const CONC_SPAWN_NAME: &str = "__nx_conc_spawn";
 const CONC_JOIN_NAME: &str = "__nx_conc_join";
 const CONC_TASK_PREFIX: &str = "__conc_";
 const ALLOCATE_WASM_NAME: &str = "allocate";
+const BT_MODULE: &str = "nexus:runtime/backtrace";
+const BT_CAPTURE_NAME: &str = "__nx_capture_backtrace";
 
 #[derive(Debug, Clone, Copy)]
 struct LocalInfo {
@@ -78,12 +81,18 @@ pub fn compile_program_to_wasm_with_metrics(
     let optimize = t.elapsed();
 
     let t = Instant::now();
-    let mut wasm = compile_lir_to_wasm(&lir).map_err(CompileError::Codegen)?;
+    let (mut wasm, debug_entries) =
+        compile_lir_to_wasm(&lir).map_err(CompileError::Codegen)?;
     let codegen = t.elapsed();
 
     if !caps.is_empty() {
         append_capabilities_section(&mut wasm, &caps);
     }
+
+    // Append DWARF debug sections. The bundler's strip_debug_sections()
+    // removes them before wasm-merge (which crashes on .debug_* in v124).
+    // For unbundled output these survive intact.
+    dwarf::append_dwarf_sections(&mut wasm, &debug_entries);
 
     let metrics = CompileMetrics {
         hir_build,
@@ -98,6 +107,23 @@ pub fn compile_program_to_wasm_with_metrics(
 /// Compiles a parsed Nexus program through HIR -> MIR -> LIR -> WASM pipeline.
 pub fn compile_program_to_wasm(program: &Program) -> Result<Vec<u8>, CompileError> {
     compile_program_to_wasm_with_metrics(program).map(|(wasm, _)| wasm)
+}
+
+/// Compiles a parsed Nexus program to WASM **with DWARF debug sections**.
+/// Use this for final output that won't be processed by wasm-merge.
+pub fn compile_program_to_wasm_with_dwarf(program: &Program) -> Result<Vec<u8>, CompileError> {
+    validate_main_returns_unit(program)?;
+    let caps = extract_main_require_ports_from_ast(program);
+    let mir = build_hir(program).map_err(CompileError::HirBuild)?;
+    let mut lir = lower_mir_to_lir(&mir, &mir.enum_defs).map_err(CompileError::LirLower)?;
+    optimize_lir(&mut lir);
+    let (mut wasm, debug_entries) =
+        compile_lir_to_wasm(&lir).map_err(CompileError::Codegen)?;
+    if !caps.is_empty() {
+        append_capabilities_section(&mut wasm, &caps);
+    }
+    dwarf::append_dwarf_sections(&mut wasm, &debug_entries);
+    Ok(wasm)
 }
 
 fn perm_to_capability(name: &str) -> Option<&'static str> {

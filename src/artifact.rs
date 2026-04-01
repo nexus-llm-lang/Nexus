@@ -213,50 +213,65 @@ fn append_custom_section(wasm: &mut Vec<u8>, caps: &[String]) {
     wasm.extend_from_slice(&encoded[8..]);
 }
 
-/// Builds a tiny wasm module with no-op stubs for the 3 backtrace host
-/// functions (`__nx_bt_push`, `__nx_bt_pop`, `__nx_bt_freeze`).  Used to
-/// satisfy `nexus:runtime/backtrace` imports so the component encoder sees
-/// no unresolved host imports.
+/// Builds a tiny wasm module with no-op stubs for all `nexus:runtime/backtrace`
+/// host functions. Used to satisfy imports so the component encoder (and
+/// wasm-merge during `nexus run`) sees no unresolved host imports.
+///
+/// Functions:
+///   0: __nx_capture_backtrace () -> ()     — codegen calls before throw
+///   1: __nx_bt_depth          () -> i64    — stdlib exn.nx reads frame count
+///   2: __nx_bt_frame          (i64) -> i64 — stdlib exn.nx reads frame names
 fn build_backtrace_stub_module() -> Vec<u8> {
     use wenc::*;
     let mut module = wenc::Module::new();
 
     // Type section:
-    //   0: (i64) -> ()   __nx_bt_push
-    //   1: () -> ()       __nx_bt_pop, __nx_bt_freeze
+    //   0: () -> ()      __nx_capture_backtrace
+    //   1: () -> (i64)   __nx_bt_depth
+    //   2: (i64) -> (i64) __nx_bt_frame
     let mut types = TypeSection::new();
-    types.ty().function(vec![ValType::I64], vec![]);
     types.ty().function(vec![], vec![]);
+    types.ty().function(vec![], vec![ValType::I64]);
+    types.ty().function(vec![ValType::I64], vec![ValType::I64]);
     module.section(&types);
 
     // Function section
     let mut functions = FunctionSection::new();
-    functions.function(0); // __nx_bt_push
-    functions.function(1); // __nx_bt_pop
-    functions.function(1); // __nx_bt_freeze
+    functions.function(0); // __nx_capture_backtrace
+    functions.function(1); // __nx_bt_depth
+    functions.function(2); // __nx_bt_frame
     module.section(&functions);
 
     // Export section
     let mut exports = ExportSection::new();
-    exports.export("__nx_bt_push", ExportKind::Func, 0);
-    exports.export("__nx_bt_pop", ExportKind::Func, 1);
-    exports.export("__nx_bt_freeze", ExportKind::Func, 2);
+    exports.export("__nx_capture_backtrace", ExportKind::Func, 0);
+    exports.export("__nx_bt_depth", ExportKind::Func, 1);
+    exports.export("__nx_bt_frame", ExportKind::Func, 2);
     module.section(&exports);
 
-    // Code section: all functions are no-ops
+    // Code section
     let mut codes = CodeSection::new();
-    for _ in 0..3 {
-        let mut f = Function::new(vec![]);
-        f.instruction(&Instruction::End);
-        codes.function(&f);
-    }
+    // __nx_capture_backtrace: no-op
+    let mut f0 = Function::new(vec![]);
+    f0.instruction(&Instruction::End);
+    codes.function(&f0);
+    // __nx_bt_depth: return 0
+    let mut f1 = Function::new(vec![]);
+    f1.instruction(&Instruction::I64Const(0));
+    f1.instruction(&Instruction::End);
+    codes.function(&f1);
+    // __nx_bt_frame: return 0
+    let mut f2 = Function::new(vec![]);
+    f2.instruction(&Instruction::I64Const(0));
+    f2.instruction(&Instruction::End);
+    codes.function(&f2);
     module.section(&codes);
 
     module.finish()
 }
 
-/// Merges no-op stubs for the 3 `nexus:runtime/backtrace` host functions into
-/// `wasm`, satisfying those imports for component encoding.
+/// Merges no-op stub for `nexus:runtime/backtrace` host function into
+/// `wasm`, satisfying the import for component encoding.
 pub fn merge_backtrace_stubs(wasm: &[u8], wasm_merge_command: &Path) -> Result<Vec<u8>, String> {
     let stub = build_backtrace_stub_module();
     let temp_dir = std::env::temp_dir().join(format!(

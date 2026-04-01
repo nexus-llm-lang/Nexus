@@ -121,11 +121,6 @@ impl ReplState {
         // Add no-op stubs so instantiation succeeds even when net isn't used.
         add_nexus_host_stubs(&mut linker);
 
-        // Backtrace host functions — always add for REPL (stdlib may need them).
-        backtrace::reset();
-        backtrace::add_bt_to_linker(&mut linker)
-            .map_err(|e| format!("Backtrace link error: {e}"))?;
-
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdio();
 
@@ -135,6 +130,11 @@ impl ReplState {
         }
 
         let mut store = Store::new(&self.engine, builder.build_p1());
+
+        // Backtrace host functions — always add for REPL (stdlib may need them).
+        backtrace::reset();
+        backtrace::add_bt_to_linker(&mut linker, &mut store)
+            .map_err(|e| format!("Backtrace link error: {e}"))?;
 
         let instance = linker
             .instantiate(&mut store, &module)

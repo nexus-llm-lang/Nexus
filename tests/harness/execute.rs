@@ -89,11 +89,11 @@ pub fn run_main(wasm: &[u8]) -> Result<(), String> {
         if has_conc {
             conc::add_conc_to_linker(&mut linker).map_err(|e| e.to_string())?;
         }
+        let mut store = Store::new(&engine, ());
         if has_bt {
             backtrace::reset();
-            backtrace::add_bt_to_linker(&mut linker)?;
+            backtrace::add_bt_to_linker(&mut linker, &mut store)?;
         }
-        let mut store = Store::new(&engine, ());
         let instance = linker
             .instantiate(&mut store, &*module)
             .map_err(|e| e.to_string())?;
@@ -156,14 +156,15 @@ pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
     if has_conc {
         conc::add_conc_to_linker(&mut linker)?;
     }
-    backtrace::reset();
-    backtrace::add_bt_to_linker(&mut linker)?;
 
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
     let _ = builder.preopened_dir(".", "/", DirPerms::all(), FilePerms::all());
     let wasi = builder.build_p1();
     let mut store = Store::new(engine, wasi);
+
+    backtrace::reset();
+    backtrace::add_bt_to_linker(&mut linker, &mut store)?;
 
     let mut imported_modules = module
         .imports()
@@ -227,14 +228,15 @@ pub fn run_main_with_deps_caps(
     if has_conc {
         conc::add_conc_to_linker(&mut linker)?;
     }
-    backtrace::reset();
-    backtrace::add_bt_to_linker(&mut linker)?;
 
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
     let _ = builder.preopened_dir(".", "/", DirPerms::all(), FilePerms::all());
     let wasi = builder.build_p1();
     let mut store = Store::new(engine, wasi);
+
+    backtrace::reset();
+    backtrace::add_bt_to_linker(&mut linker, &mut store)?;
 
     let mut imported_modules = module
         .imports()

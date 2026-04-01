@@ -263,14 +263,15 @@ fn run_task_thread(
         linker.func_wrap(CONC_HOST_MODULE, CONC_JOIN_FUNC, || {})?;
         // nexus-host stubs (needed by stdlib bundle even if task doesn't use net)
         add_nexus_host_stubs(&mut linker);
-        // Backtrace stubs (tasks share thread-local bt state)
-        super::backtrace::add_bt_to_linker(&mut linker).map_err(wasmtime::Error::msg)?;
-
         let mut builder = WasiCtxBuilder::new();
         capabilities
             .apply_to_wasi_builder(&mut builder)
             .map_err(wasmtime::Error::msg)?;
         let mut store = Store::new(engine, builder.build_p1());
+
+        // Backtrace (tasks share thread-local bt state)
+        super::backtrace::add_bt_to_linker(&mut linker, &mut store)
+            .map_err(wasmtime::Error::msg)?;
 
         for (name, dep) in deps {
             linker.module(&mut store, name, dep).map_err(|e| {
@@ -289,9 +290,10 @@ fn run_task_thread(
             |_: i32, _: i32, _: i32| {},
         )?;
         linker.func_wrap(CONC_HOST_MODULE, CONC_JOIN_FUNC, || {})?;
-        super::backtrace::add_bt_to_linker(&mut linker).map_err(wasmtime::Error::msg)?;
 
         let mut store = Store::new(engine, ());
+        super::backtrace::add_bt_to_linker(&mut linker, &mut store)
+            .map_err(wasmtime::Error::msg)?;
         let instance = linker.instantiate(&mut store, module)?;
         call_task_func(&mut store, &instance, task)
     }
