@@ -37,34 +37,6 @@ ok()    { printf "${GREEN}[bootstrap]${RESET} %s\n" "$*"; }
 warn()  { printf "${YELLOW}[bootstrap]${RESET} %s\n" "$*"; }
 fail()  { printf "${RED}[bootstrap]${RESET} %s\n" "$*" >&2; exit 1; }
 
-# ─── Patch wasmparser function body size limit ────────────────────────────
-# nxc-produced WASM has functions up to ~9MB; wasmparser's default limit
-# (7654321) prevents wasmtime from loading them. Vendor a patched copy.
-
-WASMPARSER_VENDOR="vendor/wasmparser"
-WASMPARSER_LIMITS="$WASMPARSER_VENDOR/src/limits.rs"
-
-if [[ ! -f "$WASMPARSER_LIMITS" ]] || ! grep -q '128_000_000' "$WASMPARSER_LIMITS" 2>/dev/null; then
-  # Find the wasmparser 0.243 source in cargo registry
-  WASMPARSER_SRC="$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" \
-    -maxdepth 2 -type d -name 'wasmparser-0.243.*' 2>/dev/null | head -1)"
-  if [[ -z "$WASMPARSER_SRC" ]]; then
-    # Fetch it by building once (populates cargo registry)
-    cargo check --quiet 2>/dev/null || true
-    WASMPARSER_SRC="$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" \
-      -maxdepth 2 -type d -name 'wasmparser-0.243.*' 2>/dev/null | head -1)"
-  fi
-  if [[ -n "$WASMPARSER_SRC" ]]; then
-    info "Patching wasmparser MAX_WASM_FUNCTION_SIZE (7.6MB → 128MB)..."
-    rm -rf "$WASMPARSER_VENDOR"
-    cp -r "$WASMPARSER_SRC" "$WASMPARSER_VENDOR"
-    sed -i.bak 's/7_654_321/128_000_000/g' "$WASMPARSER_LIMITS"
-    rm -f "$WASMPARSER_LIMITS.bak"
-  else
-    warn "Could not find wasmparser source to patch — stage2 may fail to load"
-  fi
-fi
-
 # ─── Build the Nexus compiler (Rust) ──────────────────────────────────────
 CURRENT_COMMIT="$(git rev-parse HEAD)"
 info "Building Nexus compiler (cargo build --release)..."
