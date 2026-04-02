@@ -24,6 +24,14 @@ pub struct MatchCase {
     pub body: Vec<Spanned<Stmt>>,
 }
 
+/// A single arm of a selective catch block.
+/// Each arm matches a specific exception pattern (constructor or wildcard).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatchArm {
+    pub pattern: Spanned<Pattern>,
+    pub body: Vec<Spanned<Stmt>>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal),
@@ -100,8 +108,7 @@ pub enum Stmt {
     Conc(Vec<Function>), // 'task' blocks look like functions/closures
     Try {
         body: Vec<Spanned<Stmt>>,
-        catch_param: String,
-        catch_body: Vec<Spanned<Stmt>>,
+        catch_arms: Vec<CatchArm>,
     },
     // inject handler_var, ... do body end
     Inject {
@@ -141,6 +148,15 @@ pub struct ExceptionDef {
     pub name: String,
     pub is_public: bool,
     pub fields: Vec<(Option<String>, Type)>,
+}
+
+/// Groups multiple exception types under a single name (Phase 2).
+/// `exception group IOError = NotFound | PermDenied`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExceptionGroupDef {
+    pub name: String,
+    pub is_public: bool,
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,6 +202,7 @@ pub enum TopLevel {
     TypeDef(TypeDef),
     Enum(EnumDef),
     Exception(ExceptionDef),
+    ExceptionGroup(ExceptionGroupDef),
     Import(Import),
     Port(Port),
     Let(GlobalLet),

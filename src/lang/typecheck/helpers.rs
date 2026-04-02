@@ -696,8 +696,11 @@ pub(super) fn contains_return(body: &[Spanned<Stmt>]) -> bool {
         Stmt::Return(_) => true,
         Stmt::Expr(e) => expr_contains_return(e),
         Stmt::Try {
-            body, catch_body, ..
-        } => contains_return(body) || contains_return(catch_body),
+            body, catch_arms, ..
+        } => {
+            contains_return(body)
+                || catch_arms.iter().any(|arm| contains_return(&arm.body))
+        }
         Stmt::Inject { body, .. } => contains_return(body),
         _ => false,
     }) || body_ends_with_tail_expr(body)

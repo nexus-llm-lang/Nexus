@@ -414,6 +414,7 @@ impl TypeChecker {
                 TopLevel::Exception(ex) => {
                     register_exception_variant(&mut self.env, ex, &def.span)?;
                 }
+                TopLevel::ExceptionGroup(_) => {}
                 TopLevel::Port(port) => {
                     for sig in &port.functions {
                         let name = format!("{}.{}", port.name, sig.name);
@@ -942,26 +943,27 @@ impl TypeChecker {
                 }
                 Stmt::Try {
                     body,
-                    catch_param,
-                    catch_body,
+                    catch_arms,
                 } => {
                     let exn = Type::UserDefined("Exn".into(), vec![]);
-                    let try_eff = Type::Row(vec![exn], Some(Box::new(ee.clone())));
+                    let try_eff = Type::Row(vec![exn.clone()], Some(Box::new(ee.clone())));
                     let mut et = env.clone();
                     self.infer_body(body, &mut et, er, eq, &try_eff)?;
-                    let mut ec = env.clone();
-                    ec.insert(
-                        catch_param.clone(),
-                        Scheme {
-                            vars: vec![],
-                            typ: Type::UserDefined("Exn".into(), vec![]),
-                        },
-                    );
-                    self.infer_body(catch_body, &mut ec, er, eq, ee)?;
-                    if et.linear_vars != ec.linear_vars {
-                        return Err(TypeError::new("Linear mismatch", s.span.clone()));
+                    let mut last_linear = et.linear_vars.clone();
+                    for arm in catch_arms {
+                        let mut ec = env.clone();
+                        ec.linear_vars = et.linear_vars.clone();
+                        self.bind_pattern(&arm.pattern, &exn, &mut ec)?;
+                        self.infer_body(&arm.body, &mut ec, er, eq, ee)?;
+                        if last_linear != ec.linear_vars {
+                            return Err(TypeError::new(
+                                "Linear mismatch across catch arms",
+                                s.span.clone(),
+                            ));
+                        }
+                        last_linear = ec.linear_vars;
                     }
-                    env.linear_vars = et.linear_vars;
+                    env.linear_vars = last_linear;
                 }
                 Stmt::Inject { handlers, body } => {
                     let mut injected_reqs = Vec::new();

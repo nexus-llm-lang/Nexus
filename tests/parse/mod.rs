@@ -1,5 +1,5 @@
 use crate::harness::{should_fail_parse, should_typecheck};
-use nexus::lang::ast::{Expr, TopLevel, Type};
+use nexus::lang::ast::{CatchArm, Expr, Pattern, Stmt, TopLevel, Type};
 use nexus::lang::parser;
 use std::fs;
 
@@ -202,4 +202,78 @@ fn parse_empty_linear_list_literal() {
         found_list_expr,
         "Parser should produce Expr::List for %[] syntax"
     );
+}
+
+#[test]
+fn parse_selective_catch_multi_arm() {
+    let src = r#"
+    exception Boom(i64)
+
+    let main = fn () -> i64 do
+      try
+        raise Boom(42)
+      catch
+        case Boom(code) -> return code
+        case _ -> return -1
+      end
+      return 0
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    // Find the try statement and verify it has 2 catch arms
+    let gl = program.definitions.iter().find_map(|def| {
+        if let TopLevel::Let(gl) = &def.node {
+            Some(gl)
+        } else {
+            None
+        }
+    }).unwrap();
+    let Expr::Lambda { body, .. } = &gl.value.node else { panic!("expected lambda") };
+    let Stmt::Try { catch_arms, .. } = &body[0].node else { panic!("expected try") };
+    assert_eq!(catch_arms.len(), 2, "expected 2 catch arms");
+    assert!(matches!(&catch_arms[0].pattern.node, Pattern::Constructor(name, _) if name == "Boom"));
+    assert!(matches!(&catch_arms[1].pattern.node, Pattern::Wildcard));
+}
+
+#[test]
+fn parse_legacy_catch_still_works() {
+    let src = r#"
+    exception Boom(i64)
+
+    let main = fn () -> i64 do
+      try
+        raise Boom(42)
+      catch e ->
+        return 0
+      end
+      return 1
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let gl = program.definitions.iter().find_map(|def| {
+        if let TopLevel::Let(gl) = &def.node { Some(gl) } else { None }
+    }).unwrap();
+    let Expr::Lambda { body, .. } = &gl.value.node else { panic!("expected lambda") };
+    let Stmt::Try { catch_arms, .. } = &body[0].node else { panic!("expected try") };
+    assert_eq!(catch_arms.len(), 1, "legacy catch should produce single arm");
+    assert!(matches!(&catch_arms[0].pattern.node, Pattern::Variable(name, _) if name == "e"));
+}
+
+#[test]
+fn parse_exception_group_def() {
+    let src = r#"
+    exception NotFound
+    exception PermDenied
+    exception group IOError = NotFound | PermDenied
+
+    let main = fn () -> unit do
+      return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let eg = program.definitions.iter().find_map(|def| {
+        if let TopLevel::ExceptionGroup(eg) = &def.node { Some(eg) } else { None }
+    }).unwrap();
+    assert_eq!(eg.name, "IOError");
+    assert_eq!(eg.members, vec!["NotFound", "PermDenied"]);
 }

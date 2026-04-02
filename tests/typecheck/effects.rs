@@ -632,3 +632,80 @@ end
         should_fail_typecheck(&src);
     }
 }
+
+#[test]
+fn test_selective_catch_constructor_field_binding() {
+    should_typecheck(
+        r#"
+    exception Boom(i64)
+
+    let main = fn () -> unit do
+      try
+        raise Boom(42)
+      catch
+        case Boom(code) ->
+          let x: i64 = code
+          return ()
+        case _ -> return ()
+      end
+      return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_selective_catch_multiple_exceptions() {
+    should_typecheck(
+        r#"
+    exception Boom(i64)
+    exception Oops(string)
+
+    let main = fn () -> unit do
+      try
+        raise Boom(42)
+      catch
+        case Boom(code) -> return ()
+        case Oops(msg) -> return ()
+        case _ -> return ()
+      end
+      return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_selective_catch_wrong_field_type_fails() {
+    should_fail_typecheck(
+        r#"
+    exception Boom(i64)
+
+    let main = fn () -> unit do
+      try
+        raise Boom(42)
+      catch
+        case Boom(code) ->
+          let x: string = code
+          return ()
+        case _ -> return ()
+      end
+      return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_main_rejects_nonempty_throws() {
+    should_fail_typecheck(
+        r#"
+    exception Boom(i64)
+
+    let main = fn () -> unit throws { Exn } do
+      raise Boom(42)
+      return ()
+    end
+    "#,
+    );
+}

@@ -991,3 +991,149 @@ end
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Selective catch tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn codegen_selective_catch_matches_correct_arm() {
+    exec(
+        r#"
+exception Boom(i64)
+exception Oops(i64)
+
+let check = fn () -> i64 throws { Exn } do
+    try
+        raise Boom(42)
+        return -1
+    catch
+        case Boom(code) -> return code
+        case Oops(n) -> return n + 100
+        case _ -> return -2
+    end
+    return -3
+end
+
+let main = fn () -> unit throws { Exn } do
+    let result = check()
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_selective_catch_wildcard_catches_unmatched() {
+    exec(
+        r#"
+exception Boom(i64)
+exception Oops(i64)
+
+let check = fn () -> i64 throws { Exn } do
+    try
+        raise Oops(99)
+        return -1
+    catch
+        case Boom(code) -> return code
+        case _ -> return 77
+    end
+    return -3
+end
+
+let main = fn () -> unit throws { Exn } do
+    let result = check()
+    if result != 77 then raise RuntimeError(val: "expected 77") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_selective_catch_labeled_fields() {
+    exec(
+        r#"
+exception DbError(code: i64, msg: string)
+
+let check = fn () -> i64 throws { Exn } do
+    try
+        raise DbError(code: 404, msg: "not found")
+        return -1
+    catch
+        case DbError(code: c, msg: _) -> return c
+        case _ -> return -2
+    end
+    return -3
+end
+
+let main = fn () -> unit throws { Exn } do
+    let result = check()
+    if result != 404 then raise RuntimeError(val: "expected 404") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_legacy_catch_still_works() {
+    exec(
+        r#"
+exception Boom(i64)
+
+let check = fn () -> i64 throws { Exn } do
+    try
+        raise Boom(55)
+        return -1
+    catch e ->
+        match e do
+            case Boom(code) -> return code
+            case _ -> return -2
+        end
+    end
+    return -3
+end
+
+let main = fn () -> unit throws { Exn } do
+    let result = check()
+    if result != 55 then raise RuntimeError(val: "expected 55") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_selective_catch_nested_try_routes_exceptions() {
+    exec(
+        r#"
+exception Boom(i64)
+exception Oops(i64)
+
+let check = fn () -> i64 throws { Exn } do
+    try
+        try
+            raise Oops(10)
+            return -1
+        catch
+            case Boom(code) -> return code
+            case _ -> raise RuntimeError(val: "inner fallthrough")
+        end
+        return -2
+    catch
+        case RuntimeError(_) -> return 77
+        case _ -> return -3
+    end
+    return -4
+end
+
+let main = fn () -> unit throws { Exn } do
+    let result = check()
+    if result != 77 then raise RuntimeError(val: "expected 77") end
+    return ()
+end
+"#,
+    );
+}

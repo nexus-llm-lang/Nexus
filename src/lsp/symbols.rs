@@ -126,6 +126,7 @@ pub fn extract(program: &Program, idx: &LineIndex) -> Vec<lsp_types::DocumentSym
                     },
                 });
             }
+            TopLevel::ExceptionGroup(_) => {}
             TopLevel::Import(_) => {}
         }
     }
