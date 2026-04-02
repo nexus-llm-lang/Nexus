@@ -448,6 +448,9 @@ fn handle_top_levels(state: &mut ReplState, defs: Vec<Spanned<TopLevel>>, source
                             TopLevel::Exception(ex) => {
                                 println!("  exception {} defined", ex.name)
                             }
+                            TopLevel::ExceptionGroup(eg) => {
+                                println!("  exception group {} defined", eg.name)
+                            }
                             TopLevel::Import(imp) => {
                                 let alias = imp.alias.as_deref().unwrap_or(imp.path.as_str());
                                 println!("  imported {}", alias);

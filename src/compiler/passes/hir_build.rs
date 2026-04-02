@@ -419,6 +419,7 @@ impl MirBuilder {
                 TopLevel::Exception(ex) => {
                     self.register_exception_in_enum_defs(ex);
                 }
+                TopLevel::ExceptionGroup(_) => {}
                 TopLevel::Port(port) => {
                     let port_name = self.rename(&port.name, rename_map);
                     let methods: Vec<String> =
@@ -982,13 +983,44 @@ impl MirBuilder {
             }
             Stmt::Try {
                 body,
-                catch_param,
-                catch_body,
-            } => Ok(vec![MirStmt::Try {
-                body: self.convert_stmts(body, rename_map, scope)?,
-                catch_param: Symbol::from(catch_param.as_str()),
-                catch_body: self.convert_stmts(catch_body, rename_map, scope)?,
-            }]),
+                catch_arms,
+            } => {
+                let mir_body = self.convert_stmts(body, rename_map, scope)?;
+                // Check if this is a legacy single-arm catch with variable pattern
+                if catch_arms.len() == 1 {
+                    if let Pattern::Variable(name, _) = &catch_arms[0].pattern.node {
+                        return Ok(vec![MirStmt::Try {
+                            body: mir_body,
+                            catch_param: Symbol::from(name.as_str()),
+                            catch_body: self.convert_stmts(
+                                &catch_arms[0].body,
+                                rename_map,
+                                scope,
+                            )?,
+                        }]);
+                    }
+                }
+                // Multi-arm or non-variable pattern: desugar to catch __exn -> match __exn do ... end
+                let exn_sym = Symbol::from("__exn");
+                let mir_cases: Vec<MirMatchCase> = catch_arms
+                    .iter()
+                    .map(|arm| {
+                        Ok(MirMatchCase {
+                            pattern: self.convert_pattern(&arm.pattern.node),
+                            body: self.convert_stmts(&arm.body, rename_map, scope)?,
+                        })
+                    })
+                    .collect::<Result<_, HirBuildError>>()?;
+                let match_expr = MirExpr::Match {
+                    target: Box::new(MirExpr::Variable(exn_sym)),
+                    cases: mir_cases,
+                };
+                Ok(vec![MirStmt::Try {
+                    body: mir_body,
+                    catch_param: exn_sym,
+                    catch_body: vec![MirStmt::Expr(match_expr)],
+                }])
+            }
             Stmt::Inject { handlers, body } => {
                 // Inject activates handlers: push into scope and inline body
                 let mut new_scope = scope.clone();
@@ -1540,15 +1572,18 @@ fn collect_ast_stmt_refs(
         }
         Stmt::Try {
             body,
-            catch_param,
-            catch_body,
+            catch_arms,
         } => {
             for s in body {
                 collect_ast_stmt_refs(&s.node, defined, referenced, seen, known);
             }
-            defined.insert(catch_param.clone());
-            for s in catch_body {
-                collect_ast_stmt_refs(&s.node, defined, referenced, seen, known);
+            for arm in catch_arms {
+                if let Pattern::Variable(name, _) = &arm.pattern.node {
+                    defined.insert(name.clone());
+                }
+                for s in &arm.body {
+                    collect_ast_stmt_refs(&s.node, defined, referenced, seen, known);
+                }
             }
         }
         Stmt::Inject { body, .. } => {

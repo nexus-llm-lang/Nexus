@@ -150,10 +150,12 @@ impl TypeChecker {
                     self.collect_unused_local_variable_warnings_in_expr(value);
                 }
                 Stmt::Try {
-                    body, catch_body, ..
+                    body, catch_arms, ..
                 } => {
                     self.collect_unused_local_variable_warnings_in_stmts(body);
-                    self.collect_unused_local_variable_warnings_in_stmts(catch_body);
+                    for arm in catch_arms {
+                        self.collect_unused_local_variable_warnings_in_stmts(&arm.body);
+                    }
                 }
                 Stmt::Inject { body, .. } => {
                     self.collect_unused_local_variable_warnings_in_stmts(body);
@@ -366,18 +368,21 @@ pub(super) fn collect_signature_needs_from_stmts(
                 }
             }
             Stmt::Try {
-                body, catch_body, ..
+                body, catch_arms, ..
             } => {
                 let (body_reqs, mut body_effs, body_unknown) =
                     collect_signature_needs_from_stmts(body, env);
-                let (catch_reqs, catch_effs, catch_unknown) =
-                    collect_signature_needs_from_stmts(catch_body, env);
                 body_effs.remove(THROWS_EXN);
                 reqs.extend(body_reqs);
-                reqs.extend(catch_reqs);
                 effs.extend(body_effs);
-                effs.extend(catch_effs);
-                unknown |= body_unknown || catch_unknown;
+                unknown |= body_unknown;
+                for arm in catch_arms {
+                    let (catch_reqs, catch_effs, catch_unknown) =
+                        collect_signature_needs_from_stmts(&arm.body, env);
+                    reqs.extend(catch_reqs);
+                    effs.extend(catch_effs);
+                    unknown |= catch_unknown;
+                }
             }
             Stmt::Inject { handlers, body } => {
                 let (mut body_reqs, body_effs, body_unknown) =
@@ -645,12 +650,14 @@ fn stmt_mentions_name(stmt: &Spanned<Stmt>, target: &str) -> bool {
                 .any(|stmt| stmt_mentions_name(stmt, target))
         }),
         Stmt::Try {
-            body, catch_body, ..
+            body, catch_arms, ..
         } => {
             body.iter().any(|stmt| stmt_mentions_name(stmt, target))
-                || catch_body
-                    .iter()
-                    .any(|stmt| stmt_mentions_name(stmt, target))
+                || catch_arms.iter().any(|arm| {
+                    arm.body
+                        .iter()
+                        .any(|stmt| stmt_mentions_name(stmt, target))
+                })
         }
         Stmt::Inject { handlers, body } => {
             handlers
@@ -678,10 +685,12 @@ fn collect_used_variable_keys_in_stmts(stmts: &[Spanned<Stmt>], out: &mut HashSe
                 }
             }
             Stmt::Try {
-                body, catch_body, ..
+                body, catch_arms, ..
             } => {
                 collect_used_variable_keys_in_stmts(body, out);
-                collect_used_variable_keys_in_stmts(catch_body, out);
+                for arm in catch_arms {
+                    collect_used_variable_keys_in_stmts(&arm.body, out);
+                }
             }
             Stmt::Inject { handlers, body } => {
                 for handler in handlers {
@@ -793,10 +802,12 @@ fn collect_local_let_bindings(stmts: &[Spanned<Stmt>], out: &mut Vec<(String, Si
                 collect_local_let_bindings_in_expr(value, out);
             }
             Stmt::Try {
-                body, catch_body, ..
+                body, catch_arms, ..
             } => {
                 collect_local_let_bindings(body, out);
-                collect_local_let_bindings(catch_body, out);
+                for arm in catch_arms {
+                    collect_local_let_bindings(&arm.body, out);
+                }
             }
             Stmt::Inject { body, .. } => collect_local_let_bindings(body, out),
             Stmt::Conc(tasks) => {

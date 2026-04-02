@@ -139,8 +139,7 @@ fn collect_stmt_captures(
             }
             Stmt::Try {
                 body,
-                catch_param,
-                catch_body,
+                catch_arms,
             } => {
                 collect_stmt_captures(
                     body,
@@ -149,21 +148,25 @@ fn collect_stmt_captures(
                     &local_bound_call_names,
                     captures,
                 );
-                let mut catch_bound_keys = local_bound_keys.clone();
-                let mut catch_bound_call_names = local_bound_call_names.clone();
-                register_bound_name(
-                    &mut catch_bound_keys,
-                    &mut catch_bound_call_names,
-                    catch_param,
-                    &Sigil::Immutable,
-                );
-                collect_stmt_captures(
-                    catch_body,
-                    outer_keys,
-                    &catch_bound_keys,
-                    &catch_bound_call_names,
-                    captures,
-                );
+                for arm in catch_arms {
+                    let mut catch_bound_keys = local_bound_keys.clone();
+                    let mut catch_bound_call_names = local_bound_call_names.clone();
+                    if let Pattern::Variable(name, sigil) = &arm.pattern.node {
+                        register_bound_name(
+                            &mut catch_bound_keys,
+                            &mut catch_bound_call_names,
+                            name,
+                            sigil,
+                        );
+                    }
+                    collect_stmt_captures(
+                        &arm.body,
+                        outer_keys,
+                        &catch_bound_keys,
+                        &catch_bound_call_names,
+                        captures,
+                    );
+                }
             }
             Stmt::Inject { handlers: _, body } => {
                 collect_stmt_captures(

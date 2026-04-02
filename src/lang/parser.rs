@@ -1736,20 +1736,51 @@ impl Parser {
         self.advance(); // consume 'try'
         let body = self.parse_stmt_list()?;
         self.expect(&TokenKind::Catch)?;
-        let catch_param = self.expect_ident()?;
-        self.expect(&TokenKind::Arrow)?;
-        let catch_body = self.parse_stmt_list()?;
+
+        let catch_arms = if matches!(self.peek(), TokenKind::Case) {
+            // Selective catch: catch case Pattern -> body case Pattern -> body ...
+            self.parse_catch_arms()?
+        } else {
+            // Legacy catch: catch param -> body
+            let param_start = self.tokens[self.pos].span.start;
+            let catch_param = self.expect_ident()?;
+            let param_end = self.tokens[self.pos - 1].span.end;
+            self.expect(&TokenKind::Arrow)?;
+            let catch_body = self.parse_stmt_list()?;
+            vec![CatchArm {
+                pattern: Spanned {
+                    node: Pattern::Variable(catch_param, Sigil::Immutable),
+                    span: param_start..param_end,
+                },
+                body: catch_body,
+            }]
+        };
+
         self.expect(&TokenKind::End)?;
         let end = self.tokens[self.pos - 1].span.end;
 
         Ok(Spanned {
-            node: Stmt::Try {
-                body,
-                catch_param,
-                catch_body,
-            },
+            node: Stmt::Try { body, catch_arms },
             span: start..end,
         })
+    }
+
+    fn parse_catch_arms(&mut self) -> Result<Vec<CatchArm>, ParseError> {
+        let mut arms = Vec::new();
+        while matches!(self.peek(), TokenKind::Case) {
+            self.advance(); // consume 'case'
+            let pattern = self.parse_pattern()?;
+            self.expect(&TokenKind::Arrow)?;
+            let body = self.parse_stmt_list()?;
+            arms.push(CatchArm { pattern, body });
+        }
+        if arms.is_empty() {
+            return Err(ParseError {
+                message: "expected at least one catch arm".to_string(),
+                span: self.peek_span(),
+            });
+        }
+        Ok(arms)
     }
 
     fn parse_conc_block(&mut self, start: usize) -> Result<Spanned<Stmt>, ParseError> {
@@ -1982,6 +2013,12 @@ impl Parser {
 
     fn parse_exception_def(&mut self, is_public: bool) -> Result<TopLevel, ParseError> {
         self.expect(&TokenKind::Exception)?;
+
+        // Check for "exception group Name = E1 | E2 | ..."
+        if self.is_contextual("group") {
+            return self.parse_exception_group_def(is_public);
+        }
+
         let name = self.expect_ident()?;
         if !Self::is_uppercase_ident(&name) {
             return Err(ParseError {
@@ -2002,6 +2039,27 @@ impl Parser {
             name,
             is_public,
             fields,
+        }))
+    }
+
+    fn parse_exception_group_def(&mut self, is_public: bool) -> Result<TopLevel, ParseError> {
+        self.advance(); // consume 'group' (contextual keyword)
+        let name = self.expect_ident()?;
+        if !Self::is_uppercase_ident(&name) {
+            return Err(ParseError {
+                message: "exception group name must start with uppercase letter".to_string(),
+                span: self.tokens[self.pos - 1].span.clone(),
+            });
+        }
+        self.expect(&TokenKind::Eq)?;
+        let mut members = vec![self.expect_ident()?];
+        while self.match_token(&TokenKind::Pipe) {
+            members.push(self.expect_ident()?);
+        }
+        Ok(TopLevel::ExceptionGroup(ExceptionGroupDef {
+            name,
+            is_public,
+            members,
         }))
     }
 

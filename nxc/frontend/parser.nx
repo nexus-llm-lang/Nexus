@@ -9,14 +9,16 @@
 import { Token, Span, SpannedToken } from "nxc/common/token.nx"
 import { Sigil, BinaryOp, Literal, TypeExpr, Pattern, Expr, Stmt,
          SpannedExpr, SpannedStmt, SpannedPattern, SpannedTopLevel,
-         Param, Function, MatchCase, CallArg, CtorArg, NamedExpr,
+         Param, Function, MatchCase, CatchArm, CallArg, CtorArg, NamedExpr,
          NamedType, VariantField, CtorPatternField, RecordPatField,
-         VariantDef, EnumDef, RecordDef, ExceptionDef, ImportDef, ImportItem,
+         VariantDef, EnumDef, RecordDef, ExceptionDef, ExceptionGroupDef,
+         ImportDef, ImportItem,
          FunctionSig, Port, GlobalLet, TopLevel, Program } from "nxc/common/ast.nx"
 import { Phase, CompileError, error, error_no_span, PhaseParse } from "nxc/common/error.nx"
 import { ParsedType, ParsedExpr, ParsedStmt, ParsedPat, ParsedIdent,
          ParsedSigil, ParsedStmts, ParsedCallArgs, ParsedCtorArgs,
-         ParsedParams, ParsedMatchCases, ParsedNamedTypes, ParsedTypes,
+         ParsedParams, ParsedMatchCases, ParsedCatchArms,
+         ParsedNamedTypes, ParsedTypes,
          ParsedVariants, ParsedVariantFields, ParsedFunctions,
          ParsedFunctionSigs, ParsedExprs, ParsedNamedExprs,
          ParsedStrings, ParsedImportItems, ParsedTopLevel,
@@ -645,10 +647,31 @@ end
 let parse_try_stmt = fn (toks: [SpannedToken]) -> ParsedStmt throws { Exn } do
   let sp = peek_span(toks: toks)
   let ParsedStmts(stmts: body, rest: r2) = parse_stmts(toks: expect(toks: toks, expected: "try"), acc: [])
-  let ParsedIdent(name: param, rest: r4) = expect_ident(toks: expect(toks: r2, expected: "catch"))
-  let ParsedStmts(stmts: catch_body, rest: r6) = parse_stmts(toks: expect(toks: r4, expected: "->"), acc: [])
-  return ParsedStmt(stmt: SpannedStmt(node: StmtTry(body: body, catch_param: param, catch_body: catch_body), span: sp),
-    rest: expect(toks: r6, expected: "end"))
+  let r_after_catch = expect(toks: r2, expected: "catch")
+  match peek_token(toks: r_after_catch) do
+    case TkCase ->
+      // Selective catch: catch case Pattern -> body case Pattern -> body ...
+      let ParsedCatchArms(arms: arms, rest: r4) = parse_catch_arms(toks: r_after_catch, acc: [])
+      return ParsedStmt(stmt: SpannedStmt(node: StmtTry(body: body, catch_arms: arms), span: sp),
+        rest: expect(toks: r4, expected: "end"))
+    case _ ->
+      // Legacy catch: catch param -> body
+      let ParsedIdent(name: param, rest: r4) = expect_ident(toks: r_after_catch)
+      let ParsedStmts(stmts: catch_body, rest: r6) = parse_stmts(toks: expect(toks: r4, expected: "->"), acc: [])
+      let arm = CatchArm(pattern: SpannedPattern(node: PatVariable(name: param, sigil: SigilImmutable), span: sp), body: catch_body)
+      return ParsedStmt(stmt: SpannedStmt(node: StmtTry(body: body, catch_arms: [arm]), span: sp),
+        rest: expect(toks: r6, expected: "end"))
+  end
+end
+
+let parse_catch_arms = fn (toks: [SpannedToken], acc: [CatchArm]) -> ParsedCatchArms throws { Exn } do
+  match peek_token(toks: toks) do
+    case TkCase ->
+      let ParsedPat(pat: p, rest: r2) = parse_pattern(toks: skip(toks: toks))
+      let ParsedStmts(stmts: arm_body, rest: r4) = parse_stmts(toks: expect(toks: r2, expected: "->"), acc: [])
+      return parse_catch_arms(toks: r4, acc: CatchArm(pattern: p, body: arm_body) :: acc)
+    case _ -> return ParsedCatchArms(arms: list.reverse(xs: acc), rest: toks)
+  end
 end
 
 let parse_inject_stmt = fn (toks: [SpannedToken]) -> ParsedStmt throws { Exn } do
@@ -841,13 +864,45 @@ end
 
 let parse_exception_def = fn (toks: [SpannedToken], is_pub: bool) -> ParsedTopLevel throws { Exn } do
   let sp = peek_span(toks: toks)
-  let ParsedIdent(name: n, rest: r2) = expect_uident(toks: expect(toks: toks, expected: "exception"))
+  let after_exception = expect(toks: toks, expected: "exception")
+  // Check for "exception group Name = E1 | E2 | ..."
+  match peek_token(toks: after_exception) do
+    case TkIdent(name: g) ->
+      if g == "group" then
+        return parse_exception_group_def(toks: skip(toks: after_exception), is_pub: is_pub, sp: sp)
+      else
+        let ParsedIdent(name: n, rest: r2) = expect_uident(toks: after_exception)
+        return parse_exception_fields(n: n, is_pub: is_pub, r2: r2, sp: sp)
+      end
+    case _ ->
+      let ParsedIdent(name: n, rest: r2) = expect_uident(toks: after_exception)
+      return parse_exception_fields(n: n, is_pub: is_pub, r2: r2, sp: sp)
+  end
+end
+
+let parse_exception_fields = fn (n: string, is_pub: bool, r2: [SpannedToken], sp: Span) -> ParsedTopLevel throws { Exn } do
   if is_tok(toks: r2, expected: "(") then
     let ParsedVariantFields(fields: fs, rest: r4) = parse_variant_fields(toks: skip(toks: r2), acc: [])
     return ParsedTopLevel(item: SpannedTopLevel(node: TLException(def: ExceptionDef(name: n, is_public: is_pub, fields: fs)), span: sp),
       rest: expect(toks: r4, expected: ")"))
   else
     return ParsedTopLevel(item: SpannedTopLevel(node: TLException(def: ExceptionDef(name: n, is_public: is_pub, fields: [])), span: sp), rest: r2)
+  end
+end
+
+let parse_exception_group_def = fn (toks: [SpannedToken], is_pub: bool, sp: Span) -> ParsedTopLevel throws { Exn } do
+  let ParsedIdent(name: n, rest: r2) = expect_uident(toks: toks)
+  let ParsedStrings(items: members, rest: r4) = parse_group_members(toks: expect(toks: r2, expected: "="), acc: [])
+  return ParsedTopLevel(item: SpannedTopLevel(node: TLExceptionGroup(def: ExceptionGroupDef(name: n, is_public: is_pub, members: members)), span: sp), rest: r4)
+end
+
+let parse_group_members = fn (toks: [SpannedToken], acc: [string]) -> ParsedStrings throws { Exn } do
+  let ParsedIdent(name: m, rest: r2) = expect_uident(toks: toks)
+  let new_acc = m :: acc
+  if is_tok(toks: r2, expected: "|") then
+    return parse_group_members(toks: skip(toks: r2), acc: new_acc)
+  else
+    return ParsedStrings(items: list.reverse(xs: new_acc), rest: r2)
   end
 end
 
