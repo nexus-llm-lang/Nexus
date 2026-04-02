@@ -113,6 +113,37 @@ fn snapshot_lir_tail_call() {
 }
 
 #[test]
+fn mutual_recursion_produces_tail_call_in_lir() {
+    let src = r#"
+    let is_even = fn (n: i64) -> bool do
+        if n == 0 then return true end
+        return is_odd(n: n - 1)
+    end
+    let is_odd = fn (n: i64) -> bool do
+        if n == 0 then return false end
+        return is_even(n: n - 1)
+    end
+    let main = fn () -> unit do
+        let _ = is_even(n: 10)
+        return ()
+    end
+    "#;
+    let lir = build_lir(src);
+    let is_even_fn = lir.functions.iter().find(|f| f.name == "is_even").unwrap();
+    let is_odd_fn = lir.functions.iter().find(|f| f.name == "is_odd").unwrap();
+    let even_body = format!("{:?}", is_even_fn.body);
+    let odd_body = format!("{:?}", is_odd_fn.body);
+    assert!(
+        even_body.contains("TailCall"),
+        "is_even's call to is_odd should be TailCall, got: {even_body}"
+    );
+    assert!(
+        odd_body.contains("TailCall"),
+        "is_odd's call to is_even should be TailCall, got: {odd_body}"
+    );
+}
+
+#[test]
 fn tail_call_in_if_else_branches() {
     let src = r#"
     let count = fn (n: i64) -> i64 do
