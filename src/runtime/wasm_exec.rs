@@ -65,8 +65,31 @@ fn run_component_wasm_bytes(
     capabilities: &ExecutionCapabilities,
     guest_args: &[String],
 ) -> ExitCode {
+    // Spawn a thread with a large stack so deeply-recursive WASM programs
+    // (e.g. the self-hosting compiler) don't overflow the default 8 MiB stack.
+    let wasm = wasm.to_vec();
+    let capabilities = capabilities.clone();
+    let guest_args = guest_args.to_vec();
+    let handle = std::thread::Builder::new()
+        .name("wasm-component-exec".into())
+        .stack_size(64 * 1024 * 1024) // 64 MiB native stack
+        .spawn(move || {
+            run_component_wasm_bytes_inner(&wasm, &capabilities, &guest_args)
+        })
+        .expect("failed to spawn wasm-component-exec thread");
+    handle.join().unwrap_or(ExitCode::from(1))
+}
+
+fn run_component_wasm_bytes_inner(
+    wasm: &[u8],
+    capabilities: &ExecutionCapabilities,
+    guest_args: &[String],
+) -> ExitCode {
     let mut config = wasmtime::Config::new();
     config.wasm_component_model(true);
+    config.max_wasm_stack(64 * 1024 * 1024); // 64 MiB
+    config.wasm_tail_call(true);
+    config.wasm_exceptions(true);
     let engine = match Engine::new(&config) {
         Ok(engine) => engine,
         Err(e) => {
