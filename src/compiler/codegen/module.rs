@@ -7,11 +7,12 @@ use wasm_encoder::{
     TableType, TagKind, TagSection, TagType, TypeSection, ValType,
 };
 
-use crate::constants::{ENTRYPOINT, MEMORY_EXPORT, WASI_CLI_RUN_EXPORT};
+use crate::constants::{ENTRYPOINT, MEMORY_EXPORT};
 use crate::intern::Symbol;
 use crate::ir::lir::{LirExpr, LirExternal, LirProgram, LirStmt};
 use crate::types::Type;
 
+use super::dwarf::FuncDebugEntry;
 use super::emit::{
     external_param_types, external_return_types, peel_linear, return_type_to_wasm_result,
     type_to_wasm_valtype,
@@ -19,7 +20,6 @@ use super::emit::{
 use super::error::CodegenError;
 use super::function::compile_function;
 use super::layout::{build_codegen_layout, program_uses_object_heap, MemoryMode};
-use super::dwarf::FuncDebugEntry;
 use super::{
     ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, CONC_JOIN_NAME, CONC_MODULE, CONC_SPAWN_NAME,
     CONC_TASK_PREFIX,
@@ -373,7 +373,8 @@ pub fn compile_lir_to_wasm(
     let mut exports = ExportSection::new();
     exports.export(ENTRYPOINT, ExportKind::Func, main_idx);
     let wasi_cli_run_func_idx = import_count + program.functions.len() as u32;
-    exports.export(WASI_CLI_RUN_EXPORT, ExportKind::Func, wasi_cli_run_func_idx);
+    // _start: WASI P1 entry point for wasmtime core module execution
+    exports.export("_start", ExportKind::Func, wasi_cli_run_func_idx);
     if !matches!(layout.memory_mode, MemoryMode::None) {
         exports.export(MEMORY_EXPORT, ExportKind::Memory, 0);
     }
@@ -475,8 +476,8 @@ pub fn compile_lir_to_wasm(
             func_names.append(idx, func.name.as_str());
             idx += 1;
         }
-        // WASI CLI run wrapper
-        func_names.append(idx, WASI_CLI_RUN_EXPORT);
+        // WASI P1 _start wrapper
+        func_names.append(idx, "_start");
         names.functions(&func_names);
         module.section(&names);
     }

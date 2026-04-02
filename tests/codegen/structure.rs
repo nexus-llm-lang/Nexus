@@ -1,5 +1,7 @@
 use crate::harness::compile;
-use nexus::compiler::codegen::{compile_program_to_wasm_with_dwarf, compile_program_to_wasm_with_metrics};
+use nexus::compiler::codegen::{
+    compile_program_to_wasm_with_dwarf, compile_program_to_wasm_with_metrics,
+};
 use wasmparser::Operator;
 
 #[test]
@@ -11,17 +13,17 @@ let main = fn () -> unit do
 end
 "#,
     );
-    let mut has_run_export = false;
+    let mut has_start_export = false;
     for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
         if let wasmparser::Payload::ExportSection(reader) = payload.unwrap() {
             for export in reader.into_iter().flatten() {
-                if export.name == "wasi:cli/run@0.2.6#run" {
-                    has_run_export = true;
+                if export.name == "_start" {
+                    has_start_export = true;
                 }
             }
         }
     }
-    assert!(has_run_export, "should export wasi:cli/run@0.2.6#run");
+    assert!(has_start_export, "should export _start (WASI P1 entry point)");
 }
 
 #[test]
@@ -650,7 +652,9 @@ end
     );
     let imports = wasm_imports(&wasm);
     assert!(
-        !imports.iter().any(|(m, n)| m == "nexus:runtime/backtrace" && n == "__nx_capture_backtrace"),
+        !imports
+            .iter()
+            .any(|(m, n)| m == "nexus:runtime/backtrace" && n == "__nx_capture_backtrace"),
         "notrace: should NOT import __nx_capture_backtrace when backtrace() is unused, got: {:?}",
         imports
     );
@@ -678,7 +682,9 @@ end
     );
     let imports = wasm_imports(&wasm);
     assert!(
-        imports.iter().any(|(m, n)| m == "nexus:runtime/backtrace" && n == "__nx_capture_backtrace"),
+        imports
+            .iter()
+            .any(|(m, n)| m == "nexus:runtime/backtrace" && n == "__nx_capture_backtrace"),
         "should import __nx_capture_backtrace when backtrace() is used, got: {:?}",
         imports
     );
