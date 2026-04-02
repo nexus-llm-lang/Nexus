@@ -167,11 +167,9 @@ let check = fn () -> i64 throws { Exn } do
     try
       raise Boom(42)
       return -1
-    catch e ->
-      match e do
-        case Boom(_) -> return 1
-        case _ -> return 2
-      end
+    catch
+      case Boom(_) -> return 1
+      case _ -> return 2
     end
     return 0
 end
@@ -195,11 +193,9 @@ let check = fn () -> i64 throws { Exn } do
     try
       raise Boom(42)
       return -1
-    catch e ->
-      match e do
-        case Boom(code) -> return code
-        case _ -> return -2
-      end
+    catch
+      case Boom(code) -> return code
+      case _ -> return -2
     end
     return 0
 end
@@ -230,13 +226,11 @@ let main = fn () -> unit throws { Exn } do
     try
         thrower()
         raise RuntimeError(val: "should not reach here")
-    catch e ->
-        match e do
+    catch
           case Boom(code) ->
             if code != 42 then raise RuntimeError(val: "expected 42") end
             return ()
           case _ -> raise RuntimeError(val: "unexpected exception")
-        end
     end
     return ()
 end
@@ -259,13 +253,11 @@ let main = fn () -> unit throws { Exn } do
     try
         let _ = thrower()
         raise RuntimeError(val: "should not reach here")
-    catch e ->
-        match e do
+    catch
           case Boom(code) ->
             if code != 99 then raise RuntimeError(val: "expected 99") end
             return ()
           case _ -> raise RuntimeError(val: "unexpected exception")
-        end
     end
     return ()
 end
@@ -293,13 +285,11 @@ let main = fn () -> unit throws { Exn } do
     try
         middle()
         raise RuntimeError(val: "should not reach here")
-    catch e ->
-        match e do
+    catch
           case Boom(code) ->
             if code != 7 then raise RuntimeError(val: "expected 7") end
             return ()
           case _ -> raise RuntimeError(val: "unexpected exception")
-        end
     end
     return ()
 end
@@ -1087,11 +1077,9 @@ let check = fn () -> i64 throws { Exn } do
     try
         raise Boom(55)
         return -1
-    catch e ->
-        match e do
-            case Boom(code) -> return code
-            case _ -> return -2
-        end
+    catch
+        case Boom(code) -> return code
+        case _ -> return -2
     end
     return -3
 end
