@@ -1104,6 +1104,11 @@ impl Parser {
             // `if c then A end` (no else) → Expr::If (statement, returns unit)
             TokenKind::If => {
                 self.advance();
+                // if let <pattern> = <expr> then ... [else ...] end
+                if matches!(self.peek(), TokenKind::Let) {
+                    self.advance();
+                    return self.parse_if_let_expr(start);
+                }
                 let cond = self.parse_expr()?;
                 self.expect_contextual("then")?;
                 let then_branch = self.parse_stmt_list()?;
@@ -1556,8 +1561,54 @@ impl Parser {
         }
     }
 
+    /// Parse `if let <pattern> = <expr> then <body> [else <body>] end`
+    /// Desugars to `match <expr> do case <pattern> -> <then> case _ -> <else> end`
+    /// Caller must have already consumed `if` and `let`.
+    fn parse_if_let_expr(&mut self, start: usize) -> Result<Spanned<Expr>, ParseError> {
+        let pattern = self.parse_pattern()?;
+        self.expect(&TokenKind::Eq)?;
+        let target = self.parse_expr()?;
+        self.expect_contextual("then")?;
+        let then_branch = self.parse_stmt_list()?;
+        let else_branch = if self.match_keyword(&TokenKind::Else) {
+            self.parse_stmt_list()?
+        } else {
+            vec![]
+        };
+        self.expect(&TokenKind::End)?;
+        let end = self.tokens[self.pos - 1].span.end;
+        Ok(Spanned {
+            node: Expr::Match {
+                target: Box::new(target),
+                cases: vec![
+                    MatchCase {
+                        pattern,
+                        body: then_branch,
+                    },
+                    MatchCase {
+                        pattern: Spanned {
+                            node: Pattern::Wildcard,
+                            span: start..end,
+                        },
+                        body: else_branch,
+                    },
+                ],
+            },
+            span: start..end,
+        })
+    }
+
     fn parse_if_stmt(&mut self, start: usize) -> Result<Spanned<Stmt>, ParseError> {
         self.advance(); // consume 'if'
+        // if let <pattern> = <expr> then ... [else ...] end
+        if matches!(self.peek(), TokenKind::Let) {
+            self.advance();
+            let expr = self.parse_if_let_expr(start)?;
+            return Ok(Spanned {
+                span: expr.span.clone(),
+                node: Stmt::Expr(expr),
+            });
+        }
         let cond = self.parse_expr()?;
         self.expect_contextual("then")?;
         let then_branch = self.parse_stmt_list()?;
