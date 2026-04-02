@@ -945,7 +945,7 @@ type Option<T> = Some(value: T) | None
 
 let main = fn () -> unit do
     let opt: Option<i64> = None
-    let result = if let Some(value: _) = opt then 1 else 0 end
+    let result = if let Some(_) = opt then 1 else 0 end
     if result != 0 then raise RuntimeError(val: "expected 0") end
     return ()
 end
