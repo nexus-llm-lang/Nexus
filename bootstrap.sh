@@ -23,7 +23,8 @@ done
 NEXUS="${NEXUS:-./target/release/nexus}"
 NXC_ENTRY="nxc/driver.nx"
 BUILD_DIR="bootstrap_out"
-NEXUS_EXEC_FLAGS="--allow-fs --allow-console --allow-proc --allow-random --allow-clock"
+WASMTIME="${WASMTIME:-wasmtime}"
+WASMTIME_FLAGS="-W tail-call=y,exceptions=y --dir=."
 NEXUS_BUILD_FLAGS=""
 
 RED='\033[0;31m'
@@ -82,8 +83,8 @@ ok "Stage 0 complete: $STAGE0 ($(wc -c < "$STAGE0" | tr -d ' ') bytes)"
 # ─── Stage 1: stage0.wasm compiles nxc → stage1.wasm ──────────────────────
 
 STAGE1="$BUILD_DIR/stage1.wasm"
-info "Stage 1: nexus exec $STAGE0 -- $NXC_ENTRY $STAGE1"
-"$NEXUS" exec $NEXUS_EXEC_FLAGS "$STAGE0" -- "$NXC_ENTRY" --verbose "$STAGE1"
+info "Stage 1: wasmtime run $STAGE0 -- $NXC_ENTRY $STAGE1"
+"$WASMTIME" run $WASMTIME_FLAGS "$STAGE0" -- "$NXC_ENTRY" --verbose "$STAGE1"
 ok "Stage 1 complete: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
 
 # ─── Bundle stage1 with stdlib ─────────────────────────────────────────────
@@ -116,8 +117,8 @@ fi
 # ─── Stage 2: stage1.wasm compiles nxc → stage2.wasm ──────────────────────
 
 STAGE2="$BUILD_DIR/stage2.wasm"
-info "Stage 2: nexus exec $STAGE1_BUNDLED -- $NXC_ENTRY $STAGE2"
-if "$NEXUS" exec $NEXUS_EXEC_FLAGS "$STAGE1_BUNDLED" -- "$NXC_ENTRY" --verbose "$STAGE2" 2>&1; then
+info "Stage 2: wasmtime run $STAGE1_BUNDLED -- $NXC_ENTRY $STAGE2"
+if "$WASMTIME" run $WASMTIME_FLAGS "$STAGE1_BUNDLED" -- "$NXC_ENTRY" --verbose "$STAGE2" 2>&1; then
   ok "Stage 2 complete: $STAGE2 ($(wc -c < "$STAGE2" | tr -d ' ') bytes)"
 else
   if [[ "$CI_MODE" == true ]]; then
