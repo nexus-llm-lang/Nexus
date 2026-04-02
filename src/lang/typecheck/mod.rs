@@ -1476,8 +1476,10 @@ impl TypeChecker {
                         }
                     }
                 }
+                // Strip module qualifier for qualified constructors (e.g., "hir.Literal" → "Literal")
+                let ctor_name = name.rfind('.').map_or(name.as_str(), |pos| &name[pos + 1..]);
                 for ed in all_enums {
-                    if let Some(v) = ed.variants.iter().find(|x| x.name == *name) {
+                    if let Some(v) = ed.variants.iter().find(|x| x.name == ctor_name) {
                         if v.fields.len() != args.len() {
                             return Err(TypeError::new(format!(
                                     "Arity mismatch in constructor `{}`: expected {} arguments, got {}.\nExpected fields: {}\nProvided arguments: {}",
@@ -2087,12 +2089,14 @@ impl TypeChecker {
                         }
                     }
                 }
+                // Strip module qualifier for qualified constructors (e.g., "hir.Literal" → "Literal")
+                let ctor_name = n.rfind('.').map_or(n.as_str(), |pos| &n[pos + 1..]);
                 for ed in all_enums {
-                    if let Some(v) = ed.variants.iter().find(|x| x.name == *n) {
+                    if let Some(v) = ed.variants.iter().find(|x| x.name == ctor_name) {
                         if v.fields.len() != pats.len() {
                             return Err(TypeError::new(format!(
                                     "Arity mismatch in pattern `{}`: expected {} fields, got {}.\nExpected fields: {}\nProvided pattern arguments: {}",
-                                    n,
+                                    ctor_name,
                                     v.fields.len(),
                                     pats.len(),
                                     summarize_ctor_fields(&v.fields),

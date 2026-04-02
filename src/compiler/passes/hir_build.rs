@@ -87,6 +87,15 @@ pub fn build_hir(program: &Program) -> Result<MirProgram, HirBuildError> {
     builder.build(program)
 }
 
+/// Strip module qualifier from a constructor name (e.g., "hir.Literal" → "Literal").
+/// Returns the name unchanged if there is no qualifier.
+fn strip_qualifier(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(pos) => &name[pos + 1..],
+        None => name,
+    }
+}
+
 /// Convert a byte offset to a 1-based line number.
 fn offset_to_line(source: &str, offset: usize) -> u32 {
     let end = offset.min(source.len());
@@ -1082,8 +1091,10 @@ impl MirBuilder {
                 }
             }
             Expr::Constructor(name, args) => {
+                // Strip module qualifier for qualified constructors (e.g., "hir.Literal" → "Literal")
+                let ctor_name = strip_qualifier(name);
                 if args.is_empty() {
-                    let resolved = self.rename(name, rename_map);
+                    let resolved = self.rename(&ctor_name, rename_map);
                     if let Some(lit) = self.global_constants.get(&resolved) {
                         return Ok(MirExpr::Literal(lit.clone()));
                     }
@@ -1098,7 +1109,7 @@ impl MirBuilder {
                     })
                     .collect::<Result<_, HirBuildError>>()?;
                 Ok(MirExpr::Constructor {
-                    name: Symbol::from(name.as_str()),
+                    name: Symbol::from(ctor_name),
                     args: mir_args,
                 })
             }
@@ -1353,7 +1364,7 @@ impl MirBuilder {
                 MirPattern::Variable(Symbol::from(name.as_str()), sigil.clone())
             }
             Pattern::Constructor(name, fields) => MirPattern::Constructor {
-                name: Symbol::from(name.as_str()),
+                name: Symbol::from(strip_qualifier(name)),
                 fields: fields
                     .iter()
                     .map(|(label, p)| {
