@@ -106,7 +106,7 @@ if command -v "$WASM_MERGE" >/dev/null 2>&1 || [[ -x "$WASM_MERGE" ]]; then
   "$WASM_MERGE" "$STAGE1" __main \
     "$(pwd)/stdlib/stdlib.wasm" "stdlib/stdlib.wasm" \
     "$(pwd)/stdlib/nexus_host_stub.wasm" "nexus:cli/nexus-host" \
-    --all-features --enable-tail-call --rename-export-conflicts \
+    --all-features --enable-tail-call --enable-exception-handling --rename-export-conflicts \
     -o "$STAGE1_BUNDLED"
   ok "Bundled: $STAGE1_BUNDLED ($(wc -c < "$STAGE1_BUNDLED" | tr -d ' ') bytes)"
 else

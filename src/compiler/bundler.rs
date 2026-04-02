@@ -192,6 +192,7 @@ fn merge_dependencies_once(
     command
         .arg("--all-features")
         .arg("--enable-tail-call")
+        .arg("--enable-exception-handling")
         .arg("--enable-multimemory")
         .arg("-o")
         .arg(&merged_path)
