@@ -52,7 +52,100 @@ pub fn lower_mir_to_lir(
     enum_defs: &[EnumDef],
 ) -> Result<LirProgram, LirLowerError> {
     let mut lowerer = LirLowerer::new(mir, enum_defs);
-    lowerer.lower()
+    let mut program = lowerer.lower()?;
+
+    // Post-lowering: promote Call → TailCall in return positions.
+    // Match case bodies emit plain Call instead of TailCall (they go through
+    // lower_case_body_stmt, not lower_stmt's Return(Call) path). This pass
+    // detects self-recursive calls whose result is immediately returned and
+    // promotes them to TailCall for TCO.
+    for func in &mut program.functions {
+        promote_tail_calls_in_stmts(&mut func.body, &func.name);
+    }
+
+    Ok(program)
+}
+
+/// Promote Call → TailCall for the last Let in IfReturn/Switch bodies
+/// when the result is used as the return value.
+fn promote_tail_calls_in_stmts(stmts: &mut [LirStmt], self_name: &Symbol) {
+    for stmt in stmts.iter_mut() {
+        promote_tail_calls_in_stmt(stmt, self_name);
+    }
+}
+
+fn promote_tail_calls_in_stmt(stmt: &mut LirStmt, self_name: &Symbol) {
+    match stmt {
+        LirStmt::IfReturn {
+            then_body,
+            then_ret,
+            else_body,
+            else_ret,
+            ..
+        } => {
+            promote_tail_calls_in_stmts(then_body, self_name);
+            promote_tail_calls_in_stmts(else_body, self_name);
+            promote_last_call_to_tail_call(then_body, then_ret.as_ref(), self_name);
+            promote_last_call_to_tail_call(else_body, else_ret.as_ref(), self_name);
+        }
+        LirStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            promote_tail_calls_in_stmts(then_body, self_name);
+            promote_tail_calls_in_stmts(else_body, self_name);
+        }
+        LirStmt::Switch {
+            cases,
+            default_body,
+            default_ret,
+            ..
+        } => {
+            for case in cases.iter_mut() {
+                promote_tail_calls_in_stmts(&mut case.body, self_name);
+                promote_last_call_to_tail_call(&mut case.body, case.ret.as_ref(), self_name);
+            }
+            promote_tail_calls_in_stmts(default_body, self_name);
+            promote_last_call_to_tail_call(default_body, default_ret.as_ref(), self_name);
+        }
+        LirStmt::Loop { cond_stmts, body, .. } => {
+            promote_tail_calls_in_stmts(cond_stmts, self_name);
+            promote_tail_calls_in_stmts(body, self_name);
+        }
+        LirStmt::TryCatch { body, catch_body, .. } => {
+            promote_tail_calls_in_stmts(body, self_name);
+            promote_tail_calls_in_stmts(catch_body, self_name);
+        }
+        _ => {}
+    }
+}
+
+/// If the last statement in `body` is `Let { name, expr: Call { func: self_name, .. } }`
+/// and `ret_atom` is `Some(Var { name: same_name })`, promote Call → TailCall.
+/// Only promotes self-recursive calls to enable TCO loop optimization.
+fn promote_last_call_to_tail_call(
+    body: &mut [LirStmt],
+    ret_atom: Option<&LirAtom>,
+    self_name: &Symbol,
+) {
+    let ret_name = match ret_atom {
+        Some(LirAtom::Var { name, .. }) => *name,
+        _ => return,
+    };
+    if let Some(LirStmt::Let { name, expr, .. }) = body.last_mut() {
+        if *name == ret_name {
+            if let LirExpr::Call { func, args, typ } = expr {
+                if func == self_name {
+                    *expr = LirExpr::TailCall {
+                        func: *func,
+                        args: std::mem::take(args),
+                        typ: std::mem::replace(typ, Type::Unit),
+                    };
+                }
+            }
+        }
+    }
 }
 
 struct LirLowerer<'a> {

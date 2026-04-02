@@ -111,3 +111,27 @@ fn snapshot_lir_tail_call() {
     let lir = build_lir(src);
     insta::assert_debug_snapshot!(lir);
 }
+
+#[test]
+fn tail_call_in_if_else_branches() {
+    let src = r#"
+    let count = fn (n: i64) -> i64 do
+        if n <= 0 then
+            return 0
+        else
+            return count(n: n - 1)
+        end
+    end
+    let main = fn () -> unit do
+        let _ = count(n: 10)
+        return ()
+    end
+    "#;
+    let lir = build_lir(src);
+    let count_fn = lir.functions.iter().find(|f| f.name == "count").unwrap();
+    let body_str = format!("{:?}", count_fn.body);
+    assert!(
+        body_str.contains("TailCall"),
+        "if-else branch return should produce TailCall, not Call"
+    );
+}

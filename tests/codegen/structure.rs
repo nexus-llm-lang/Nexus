@@ -213,10 +213,10 @@ end
             }
         }
     }
-    // After if-else→match desugar, self-tail-call may use loop, return_call,
-    // or plain call (match expression context changes tail position detection).
-    // The key correctness property is that the WASM is valid.
-    let _ = (has_loop, has_return_call); // suppress unused warnings
+    assert!(
+        has_loop,
+        "self-tail-call in if-else branch should emit loop+br (TCO-to-loop)"
+    );
 }
 
 #[test]

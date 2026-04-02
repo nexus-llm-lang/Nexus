@@ -614,6 +614,9 @@ fn compile_switch_bsearch(
     let mid = sorted.len() / 2;
     let pivot = cases[sorted[mid]].tag_value;
 
+    // Each if/else level adds 1 WASM block depth for TCO targeting
+    let inner_tco = tco_loop.map(|t| t.deeper(1));
+
     // if (tag < pivot)
     compile_atom(tag, out, local_map, layout)?;
     out.instruction(&Instruction::I64Const(pivot));
@@ -638,7 +641,7 @@ fn compile_switch_bsearch(
         function_ret_type,
         in_try,
         is_entrypoint,
-        tco_loop,
+        inner_tco,
         tcmc,
     )?;
 
@@ -662,7 +665,7 @@ fn compile_switch_bsearch(
         function_ret_type,
         in_try,
         is_entrypoint,
-        tco_loop,
+        inner_tco,
         tcmc,
     )?;
 
