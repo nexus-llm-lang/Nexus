@@ -59,14 +59,12 @@ fn test_try_catch_removes_exn() {
         inject stdio.system_handler do
             try
                 risky()
-            catch e ->
-                match e do
+            catch
                     case Oops(msg) -> Console.print(val: msg)
                     case RuntimeError(msg) -> Console.print(val: msg)
                     case InvalidIndex(i) ->
                         let m = from_i64(val: i)
                         Console.print(val: m)
-                end
             end
         end
         return ()
@@ -432,14 +430,12 @@ let main = fn () -> unit require {{ PermConsole }} do
     inject stdio.system_handler do
         try
             risky(msg: "{msg}")
-        catch e ->
-            match e do
+        catch
                 case MsgError(val: m) -> Console.print(val: m)
                 case RuntimeError(val: m) -> Console.print(val: m)
                 case InvalidIndex(val: i) ->
                     let m = from_i64(val: i)
                     Console.print(val: m)
-            end
         end
     end
     return ()
