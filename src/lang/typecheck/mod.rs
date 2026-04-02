@@ -2093,6 +2093,31 @@ impl TypeChecker {
                 let ctor_name = n.rfind('.').map_or(n.as_str(), |pos| &n[pos + 1..]);
                 for ed in all_enums {
                     if let Some(v) = ed.variants.iter().find(|x| x.name == ctor_name) {
+                        // Ctor(_) with a single positional wildcard means "ignore all fields"
+                        let is_wildcard_spread = pats.len() == 1
+                            && pats[0].0.is_none()
+                            && matches!(pats[0].1.node, Pattern::Wildcard)
+                            && v.fields.len() != 1;
+                        let expanded_pats: Vec<(Option<String>, Spanned<Pattern>)>;
+                        let pats = if is_wildcard_spread {
+                            if v.fields.is_empty() {
+                                return Err(TypeError::new(format!(
+                                    "Arity mismatch in pattern `{}`: expected 0 fields, got 1.\nProvided pattern arguments: #1 positional",
+                                    ctor_name,
+                                ), p.span.clone()));
+                            }
+                            expanded_pats = (0..v.fields.len())
+                                .map(|_| {
+                                    (
+                                        None,
+                                        Spanned { node: Pattern::Wildcard, span: p.span.clone() },
+                                    )
+                                })
+                                .collect();
+                            &expanded_pats
+                        } else {
+                            pats
+                        };
                         if v.fields.len() != pats.len() {
                             return Err(TypeError::new(format!(
                                     "Arity mismatch in pattern `{}`: expected {} fields, got {}.\nExpected fields: {}\nProvided pattern arguments: {}",
