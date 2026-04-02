@@ -530,3 +530,69 @@ end
         eprintln!("Wrote /tmp/nexus_dwarf_demo.wasm ({} bytes)", wasm.len());
     }
 }
+
+/// Helper: collect all import (module, name) pairs from a WASM binary.
+fn wasm_imports(wasm: &[u8]) -> Vec<(String, String)> {
+    let mut imports = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let Ok(wasmparser::Payload::ImportSection(reader)) = payload {
+            for import in reader.into_iter().flatten() {
+                imports.push((import.module.to_string(), import.name.to_string()));
+            }
+        }
+    }
+    imports
+}
+
+/// Try/catch WITHOUT backtrace() should NOT import __nx_capture_backtrace.
+#[test]
+fn notrace_elides_capture_backtrace_import() {
+    let wasm = compile(
+        r#"
+exception Boom(i64)
+
+let main = fn () -> unit throws { Exn } do
+    try
+        raise Boom(42)
+    catch e ->
+        return ()
+    end
+    return ()
+end
+"#,
+    );
+    let imports = wasm_imports(&wasm);
+    assert!(
+        !imports.iter().any(|(m, n)| m == "nexus:runtime/backtrace" && n == "__nx_capture_backtrace"),
+        "notrace: should NOT import __nx_capture_backtrace when backtrace() is unused, got: {:?}",
+        imports
+    );
+}
+
+/// Try/catch WITH backtrace() SHOULD import __nx_capture_backtrace.
+#[test]
+fn backtrace_usage_keeps_capture_import() {
+    let wasm = compile(
+        r#"
+import { backtrace } from "stdlib/exn.nx"
+
+exception Boom(i64)
+
+let main = fn () -> unit throws { Exn } do
+    try
+        raise Boom(42)
+    catch e ->
+        let frames = backtrace(exn: e)
+        return ()
+    end
+    return ()
+end
+"#,
+    );
+    let imports = wasm_imports(&wasm);
+    assert!(
+        imports.iter().any(|(m, n)| m == "nexus:runtime/backtrace" && n == "__nx_capture_backtrace"),
+        "should import __nx_capture_backtrace when backtrace() is used, got: {:?}",
+        imports
+    );
+}

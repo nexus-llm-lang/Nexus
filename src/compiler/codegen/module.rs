@@ -34,6 +34,10 @@ pub fn compile_lir_to_wasm(
         .iter()
         .any(|f| f.name.starts_with(CONC_TASK_PREFIX));
     let has_eh = program_needs_eh(program);
+    // Only import __nx_capture_backtrace when a catch body actually uses backtrace().
+    // This is the "notrace" optimization: most programs use try/catch without inspecting
+    // the call stack, so we skip the expensive wasmtime stack walk at every throw.
+    let needs_bt_capture = has_eh && program_uses_backtrace(program);
     let n_conc_imports: u32 = if has_conc { 2 } else { 0 };
 
     let stdlib_alloc_module = if program_uses_object_heap(program) {
@@ -65,7 +69,7 @@ pub fn compile_lir_to_wasm(
         }
     }
     let deduped_ext_count = deduped_externals.len() as u32;
-    let n_bt_imports: u32 = if has_eh { 1 } else { 0 };
+    let n_bt_imports: u32 = if needs_bt_capture { 1 } else { 0 };
 
     let import_count = deduped_ext_count + n_conc_imports + n_alloc_imports + n_bt_imports;
 
@@ -104,7 +108,7 @@ pub fn compile_lir_to_wasm(
         let alloc_idx = deduped_ext_count + n_conc_imports;
         layout.allocate_func_idx = Some(alloc_idx);
     }
-    if has_eh {
+    if needs_bt_capture {
         let bt_idx = deduped_ext_count + n_conc_imports + n_alloc_imports;
         layout.capture_bt_func_idx = Some(bt_idx);
     }
@@ -171,9 +175,9 @@ pub fn compile_lir_to_wasm(
         next_type_index += 1;
     }
 
-    // Backtrace capture type: () -> () — called before throw
+    // Backtrace capture type: () -> () — called before throw (only when backtrace is used)
     let mut bt_capture_type_idx = 0;
-    if has_eh {
+    if needs_bt_capture {
         let key = sig_key(&[], &[]);
         bt_capture_type_idx = if let Some(&existing) = sig_to_type_idx.get(&key) {
             existing
@@ -289,7 +293,7 @@ pub fn compile_lir_to_wasm(
         );
         has_imports = true;
     }
-    if has_eh {
+    if needs_bt_capture {
         imports.import(
             BT_MODULE,
             BT_CAPTURE_NAME,
@@ -735,7 +739,18 @@ fn uleb128_encoded_size(mut val: u64) -> usize {
     size
 }
 
-/// Check if the LIR program needs backtrace instrumentation.
+/// Check if any catch body in the program uses the backtrace runtime
+/// (i.e., the program imports `__nx_bt_depth` or `__nx_bt_frame`).
+/// When false, `__nx_capture_backtrace` can be elided from raise sites
+/// because no catch handler ever inspects the captured stack frames.
+fn program_uses_backtrace(program: &LirProgram) -> bool {
+    program.externals.iter().any(|ext| {
+        let m = ext.wasm_module.as_ref();
+        m == "nexus:runtime/backtrace"
+    })
+}
+
+/// Check if the LIR program needs exception handling (throw/catch).
 fn program_needs_eh(program: &LirProgram) -> bool {
     fn stmt_needs_bt(stmt: &LirStmt) -> bool {
         match stmt {
