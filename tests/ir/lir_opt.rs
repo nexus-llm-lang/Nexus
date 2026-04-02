@@ -355,6 +355,78 @@ end
     );
 }
 
+/// Test that full compilation (parse → LIR → optimize → codegen) succeeds.
+/// This catches the case where optimization produces LIR that codegen can't handle.
+#[test]
+fn opt_full_compile_succeeds_for_pattern_match() {
+    let src = r#"
+type SubstEntry = SubstEntry(name: string, atom: i64)
+type FoldResult = FoldResult(stmts: [i64], subst: [SubstEntry])
+
+let opt_lookup = fn (name: string, entries: [SubstEntry]) -> Option<i64> do
+  match entries do
+    case [] -> return None
+    case SubstEntry(name: n, atom: a) :: rest ->
+      if n == name then return Some(val: a) end
+      return opt_lookup(name: name, entries: rest)
+  end
+end
+
+let main = fn () -> unit do
+  let entries = [SubstEntry(name: "x", atom: 42)]
+  match opt_lookup(name: "x", entries: entries) do
+    case Some(val: _) -> ()
+    case None -> ()
+  end
+end
+"#;
+    // This should not panic — if it does, the optimizer broke codegen
+    let _wasm = crate::harness::compile::compile(src);
+}
+
+/// Full compile with the exact type structure from lir_opt.nx
+#[test]
+fn opt_full_compile_multi_variant_atom() {
+    let src = r#"
+type LirAtom =
+  LirAtomVar(name: string, typ: i64)
+  | LirAtomInt(val: i64)
+  | LirAtomBool(val: bool)
+  | LirAtomChar(val: i64)
+  | LirAtomString(val: string)
+  | LirAtomUnit
+
+type SubstEntry = SubstEntry(name: string, atom: LirAtom)
+
+let opt_lookup = fn (name: string, entries: [SubstEntry]) -> Option<LirAtom> do
+  match entries do
+    case [] -> return None
+    case SubstEntry(name: n, atom: a) :: rest ->
+      if n == name then return Some(val: a) end
+      return opt_lookup(name: name, entries: rest)
+  end
+end
+
+let opt_has_name = fn (name: string, names: [string]) -> bool do
+  match names do
+    case [] -> return false
+    case nm :: rest ->
+      if nm == name then return true end
+      return opt_has_name(name: name, names: rest)
+  end
+end
+
+let main = fn () -> unit do
+  let entries = [SubstEntry(name: "x", atom: LirAtomInt(val: 42))]
+  match opt_lookup(name: "x", entries: entries) do
+    case Some(val: _) -> ()
+    case None -> ()
+  end
+end
+"#;
+    let _wasm = crate::harness::compile::compile(src);
+}
+
 /// The actual program that triggers the bug (compiled as a single file for testing)
 #[test]
 fn opt_preserves_refs_in_optimizer_like_code() {
