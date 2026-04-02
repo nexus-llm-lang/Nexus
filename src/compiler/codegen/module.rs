@@ -210,11 +210,11 @@ pub fn compile_lir_to_wasm(
         };
         internal_type_indices.push(type_idx);
     }
-    let wasi_key = sig_key(&[], &[ValType::I32]);
+    let wasi_key = sig_key(&[], &[]);
     let wasi_cli_run_type_index = if let Some(&existing) = sig_to_type_idx.get(&wasi_key) {
         existing
     } else {
-        types.ty().function([], [ValType::I32]);
+        types.ty().function([], []);
         sig_to_type_idx.insert(wasi_key, next_type_index);
         let idx = next_type_index;
         next_type_index += 1;
@@ -491,7 +491,6 @@ fn compile_wasi_cli_run_wrapper(main_idx: u32, main_ret_type: &Type) -> Function
     if !matches!(peel_linear(main_ret_type), Type::Unit) {
         body.instruction(&Instruction::Drop);
     }
-    body.instruction(&Instruction::I32Const(0));
     body.instruction(&Instruction::End);
     body
 }
