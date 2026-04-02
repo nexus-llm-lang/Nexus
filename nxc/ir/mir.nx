@@ -11,14 +11,34 @@ import { Span } from "nxc/common/token.nx"
 import { concat } from "stdlib/bytebuffer.nx"
 import { handler_func_name } from "nxc/common/naming.nx"
 import { BinaryOp, Literal, TypeExpr } from "nxc/common/ast.nx"
-import { HirExpr, HirStmt, HirCallArg, HirParam, HirFunction,
-         HirMatchCase, HirPattern, HirPatternField, HirRecordPatField,
+import * as hir from "nxc/ir/hir_types.nx"
+import { HirExprKind, HirStmtKind, HirCallArg, HirParam, HirFunction,
+         HirMatchCase, HirPatternKind, HirPatternField, HirRecordPatField,
          HirPort, HirPortMethod, HirExternal, HirHandlerBinding,
-         HirHandlerBindingEntry, HirProgram, HirNamedExpr } from "nxc/ir/hir_types.nx"
+         HirHandlerBindingEntry, HirProgram, HirNamedExpr,
+         HirExpr, HirStmt } from "nxc/ir/hir_types.nx"
 import { MirParam, MirExternal, MirFunction, MirCallArg, MirExpr,
          MirNamedExpr, MirStmt, MirMatchCase, MirPattern,
          MirPatternField, MirRecordPatField, MirProgram } from "nxc/ir/mir_types.nx"
-import { length, substring } from "stdlib/string.nx"
+import { length, substring, char_code } from "stdlib/string.nx"
+
+/// Strip module qualifier from a constructor name (e.g., "hir.PLit" → "PLit").
+let strip_qual = fn (name: string) -> string do
+  let len = length(s: name)
+  return strip_qual_go(name: name, i: len - 1)
+end
+
+let strip_qual_go = fn (name: string, i: i64) -> string do
+  if i < 0 then
+    return name
+  else
+    if char_code(s: name, idx: i) == 46 then
+      return substring(s: name, start: i + 1, len: length(s: name) - i - 1)
+    else
+      return strip_qual_go(name: name, i: i - 1)
+    end
+  end
+end
 
 // ─── Internal Helper Types ──────────────────────────────────────────────────
 
@@ -308,7 +328,7 @@ end
 let lower_stmts = fn (stmts: [HirStmt], ctx: MirCtx) -> [MirStmt] do
   match stmts do
     case [] -> return []
-    case s :: rest ->
+    case HirStmt(node: s, span: _) :: rest ->
       let lowered = lower_stmt(stmt: s, ctx: ctx)
       let rest_lowered = lower_stmts(stmts: rest, ctx: ctx)
       return concat_mir_stmts(a: lowered, b: rest_lowered)
@@ -316,9 +336,9 @@ let lower_stmts = fn (stmts: [HirStmt], ctx: MirCtx) -> [MirStmt] do
 end
 
 /// Lower a statement, returning a list (inject/for desugar may produce multiple).
-let lower_stmt = fn (stmt: HirStmt, ctx: MirCtx) -> [MirStmt] do
+let lower_stmt = fn (stmt: HirStmtKind, ctx: MirCtx) -> [MirStmt] do
   match stmt do
-    case HirStmtLet(name: n, typ: t, value: v) ->
+    case Let(name: n, typ: t, value: v) ->
       let mir_typ = match t do
         case Some(val: te) -> te
         case None -> TyUnit
@@ -326,34 +346,35 @@ let lower_stmt = fn (stmt: HirStmt, ctx: MirCtx) -> [MirStmt] do
       let mir_val = lower_expr(expr: v, ctx: ctx)
       return [MirStmtLet(name: n, typ: mir_typ, expr: mir_val)]
 
-    case HirStmtExpr(expr: e) ->
+    case Expr(expr: se) ->
+      let HirExpr(node: e, span: _) = se
       match e do
-        case HirFor(var: var, start: s, end_expr: end_e, body: b) ->
+        case For(var: var, start: s, end_expr: end_e, body: b) ->
           return desugar_for(var: var, start_expr: s, end_expr: end_e, body: b, ctx: ctx)
         case _ ->
-          let mir_e = lower_expr(expr: e, ctx: ctx)
+          let mir_e = lower_expr(expr: se, ctx: ctx)
           return [MirStmtExpr(expr: mir_e)]
       end
 
-    case HirStmtReturn(expr: e) ->
+    case Return(expr: e) ->
       let mir_e = lower_expr(expr: e, ctx: ctx)
       return [MirStmtReturn(expr: mir_e)]
 
-    case HirStmtAssign(target: t, value: v) ->
+    case Assign(target: t, value: v) ->
       let mir_t = lower_expr(expr: t, ctx: ctx)
       let mir_v = lower_expr(expr: v, ctx: ctx)
       return [MirStmtAssign(target: mir_t, value: mir_v)]
 
-    case HirStmtConc(tasks: ts) ->
+    case Conc(tasks: ts) ->
       let mir_tasks = lower_conc_tasks(tasks: ts, ctx: ctx)
       return [MirStmtConc(tasks: mir_tasks)]
 
-    case HirStmtTry(body: b, catch_param: cp, catch_body: cb) ->
+    case Try(body: b, catch_param: cp, catch_body: cb) ->
       let mir_b = lower_stmts(stmts: b, ctx: ctx)
       let mir_cb = lower_stmts(stmts: cb, ctx: ctx)
       return [MirStmtTry(body: mir_b, catch_param: cp, catch_body: mir_cb)]
 
-    case HirStmtInject(handlers: hs, body: b) ->
+    case Inject(handlers: hs, body: b) ->
       let MirCtx(scope: scope, port_layouts: pl, handler_port_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf) = ctx
       let new_scope = activate_handlers(handler_names: hs, handler_port_names: hpn, scope: scope)
       let new_ctx = MirCtx(scope: new_scope, port_layouts: pl, handler_port_names: hpn,
@@ -414,17 +435,18 @@ end
 // ─── Lower Expressions ─────────────────────────────────────────────────────
 
 let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExpr do
-  match expr do
-    case HirLiteral(lit: l) -> return MirLiteral(lit: l)
-    case HirVariable(name: n, sigil: _) -> return MirVariable(name: n)
-    case HirBinaryOp(left: l, op: op, right: r) ->
+  let HirExpr(node: node, span: _) = expr
+  match node do
+    case Literal(lit: l) -> return MirLiteral(lit: l)
+    case Variable(name: n, sigil: _) -> return MirVariable(name: n)
+    case BinOp(left: l, op: op, right: r) ->
       return MirBinaryOp(
         left: lower_expr(expr: l, ctx: ctx),
         op: op,
         right: lower_expr(expr: r, ctx: ctx)
       )
-    case HirBorrow(name: n, sigil: _) -> return MirBorrow(name: n)
-    case HirCall(func: f, args: args) ->
+    case Borrow(name: n, sigil: _) -> return MirBorrow(name: n)
+    case Call(func: f, args: args) ->
       match ctx do
         case MirCtx(scope: _, port_layouts: pl, handler_port_names: _, all_funcs: _, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: _) ->
           let port_result = detect_port_call(func: f, port_layouts: pl)
@@ -437,23 +459,23 @@ let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExpr do
               return MirCall(func: f, args: mir_args, ret_type: ret_type)
           end
       end
-    case HirConstructor(variant: v, args: args) ->
-      return MirConstructor(name: v, args: lower_expr_list(exprs: args, ctx: ctx))
-    case HirRecord(fields: fs) ->
+    case Ctor(variant: v, args: args) ->
+      return MirConstructor(name: strip_qual(name: v), args: lower_expr_list(exprs: args, ctx: ctx))
+    case Record(fields: fs) ->
       return MirRecord(fields: lower_named_exprs(exprs: fs, ctx: ctx))
-    case HirArray(elems: es) ->
+    case Array(elems: es) ->
       return MirArray(elems: lower_expr_list(exprs: es, ctx: ctx))
-    case HirIndex(target: t, index: i) ->
+    case Index(target: t, index: i) ->
       return MirIndex(
         target: lower_expr(expr: t, ctx: ctx),
         index: lower_expr(expr: i, ctx: ctx)
       )
-    case HirFieldAccess(target: t, field: f) ->
+    case FieldAccess(target: t, field: f) ->
       return MirFieldAccess(
         target: lower_expr(expr: t, ctx: ctx),
         field: f
       )
-    case HirIf(cond: c, then_branch: tb, else_branch: eb) ->
+    case If(cond: c, then_branch: tb, else_branch: eb) ->
       let mir_cond = lower_expr(expr: c, ctx: ctx)
       let mir_then = lower_stmts(stmts: tb, ctx: ctx)
       let mir_else = match eb do
@@ -461,16 +483,16 @@ let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExpr do
         case None -> None
       end
       return MirIf(cond: mir_cond, then_body: mir_then, else_body: mir_else)
-    case HirMatch(target: t, cases: cs) ->
+    case Match(target: t, cases: cs) ->
       let mir_target = lower_expr(expr: t, ctx: ctx)
       let mir_cases = lower_match_cases(cases: cs, ctx: ctx)
       return MirMatch(target: mir_target, cases: mir_cases)
-    case HirWhile(cond: c, body: b) ->
+    case While(cond: c, body: b) ->
       return MirWhile(
         cond: lower_expr(expr: c, ctx: ctx),
         body: lower_stmts(stmts: b, ctx: ctx)
       )
-    case HirFor(var: var, start: s, end_expr: e, body: b) ->
+    case For(var: var, start: s, end_expr: e, body: b) ->
       // For in expression position — desugar to while
       let end_name = "__for_end_" ++ var
       let mir_body = lower_stmts(stmts: b, ctx: ctx)
@@ -482,13 +504,13 @@ let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExpr do
         cond: MirBinaryOp(left: MirVariable(name: var), op: OpLt, right: MirVariable(name: end_name)),
         body: concat_mir_stmts(a: mir_body, b: [incr])
       )
-    case HirLambda(type_params: _, params: _, ret_type: _, body: _) ->
+    case Lambda(type_params: _, params: _, ret_type: _, body: _) ->
       return MirLiteral(lit: LitUnit)
-    case HirRaise(expr: e) ->
+    case Raise(expr: e) ->
       return MirRaise(expr: lower_expr(expr: e, ctx: ctx))
-    case HirExternal_(symbol: sym, arg_names: _, typ: _) ->
+    case ExternalRef(symbol: sym, arg_names: _, typ: _) ->
       return MirVariable(name: sym)
-    case HirHandler(port_name: _, functions: _) ->
+    case Handler(port_name: _, functions: _) ->
       return MirLiteral(lit: LitUnit)
   end
 end
@@ -565,15 +587,15 @@ let lower_match_cases_go = fn (cases: [HirMatchCase], ctx: MirCtx, acc: [MirMatc
   end
 end
 
-export let lower_pattern = fn (pat: HirPattern) -> MirPattern do
+export let lower_pattern = fn (pat: HirPatternKind) -> MirPattern do
   match pat do
-    case HirPatLiteral(lit: l) -> return MirPatLiteral(lit: l)
-    case HirPatVariable(name: n, sigil: s) -> return MirPatVariable(name: n, sigil: s)
-    case HirPatConstructor(variant: v, fields: fs) ->
-      return MirPatConstructor(name: v, fields: lower_pattern_fields(fs: fs))
-    case HirPatRecord(fields: fs, is_partial: p) ->
+    case hir.PLit(lit: l) -> return MirPatLiteral(lit: l)
+    case hir.PVar(name: n, sigil: s) -> return MirPatVariable(name: n, sigil: s)
+    case hir.PCtor(variant: v, fields: fs) ->
+      return MirPatConstructor(name: strip_qual(name: v), fields: lower_pattern_fields(fs: fs))
+    case hir.PRec(fields: fs, is_partial: p) ->
       return MirPatRecord(fields: lower_record_pat_fields(fs: fs), is_partial: p)
-    case HirPatWildcard -> return MirPatWildcard
+    case hir.PWild -> return MirPatWildcard
   end
 end
 
