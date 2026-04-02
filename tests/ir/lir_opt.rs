@@ -214,10 +214,7 @@ fn validate_function_refs(func: &LirFunction) -> Vec<String> {
     collect_stmt_refs(&func.body, &mut refs);
     collect_atom_refs(&func.ret, &mut refs);
 
-    let mut missing: Vec<String> = refs
-        .difference(&defs)
-        .map(|s| s.to_string())
-        .collect();
+    let mut missing: Vec<String> = refs.difference(&defs).map(|s| s.to_string()).collect();
     missing.sort();
     missing
 }

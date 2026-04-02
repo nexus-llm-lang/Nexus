@@ -280,7 +280,10 @@ pub(super) fn compile_stmt(
             // try_table (catch $exn_tag 0) — branch to $catch with i64
             out.instruction(&Instruction::TryTable(
                 BlockType::Empty,
-                Cow::Owned(vec![wasm_encoder::Catch::One { tag: tag_idx, label: 0 }]),
+                Cow::Owned(vec![wasm_encoder::Catch::One {
+                    tag: tag_idx,
+                    label: 0,
+                }]),
             ));
 
             // Try body — TCO/TCMC disabled inside try

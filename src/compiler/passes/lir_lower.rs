@@ -109,11 +109,15 @@ fn promote_tail_calls_in_stmt(stmt: &mut LirStmt, self_name: &Symbol) {
             promote_tail_calls_in_stmts(default_body, self_name);
             promote_last_call_to_tail_call(default_body, default_ret.as_ref(), self_name);
         }
-        LirStmt::Loop { cond_stmts, body, .. } => {
+        LirStmt::Loop {
+            cond_stmts, body, ..
+        } => {
             promote_tail_calls_in_stmts(cond_stmts, self_name);
             promote_tail_calls_in_stmts(body, self_name);
         }
-        LirStmt::TryCatch { body, catch_body, .. } => {
+        LirStmt::TryCatch {
+            body, catch_body, ..
+        } => {
             promote_tail_calls_in_stmts(body, self_name);
             promote_tail_calls_in_stmts(catch_body, self_name);
         }
@@ -417,12 +421,12 @@ fn build_decision_tree(
             });
 
             match first_non_wild {
-                Some(MirPattern::Constructor { .. }) => build_ctor_switch(
-                    rows, col, col_ids, next_id, ctor_index, enum_defs,
-                ),
-                Some(MirPattern::Literal(_)) => build_lit_switch(
-                    rows, col, col_ids, next_id, ctor_index, enum_defs,
-                ),
+                Some(MirPattern::Constructor { .. }) => {
+                    build_ctor_switch(rows, col, col_ids, next_id, ctor_index, enum_defs)
+                }
+                Some(MirPattern::Literal(_)) => {
+                    build_lit_switch(rows, col, col_ids, next_id, ctor_index, enum_defs)
+                }
                 Some(MirPattern::Record(_fields, _)) => {
                     // Collect all field names from record patterns at this column
                     let mut field_set: Vec<Symbol> = Vec::new();
@@ -474,7 +478,13 @@ fn build_ctor_switch(
         let field_labels = ctor_info.map(|ci| &ci.field_labels);
 
         // Allocate scrutinee IDs for fields
-        let field_ids: Vec<usize> = (0..arity).map(|_| { let id = *next_id; *next_id += 1; id }).collect();
+        let field_ids: Vec<usize> = (0..arity)
+            .map(|_| {
+                let id = *next_id;
+                *next_id += 1;
+                id
+            })
+            .collect();
 
         // Build new column IDs: replace col with field IDs
         let mut new_col_ids: Vec<usize> = col_ids[..col].to_vec();
@@ -487,7 +497,8 @@ fn build_ctor_switch(
         let def_arity = ctor_info.map(|ci| ci.field_labels.len()).unwrap_or(arity);
         let tag = constructor_tag(ctor_name.as_str(), def_arity);
 
-        let subtree = build_decision_tree(specialized, &new_col_ids, next_id, ctor_index, enum_defs);
+        let subtree =
+            build_decision_tree(specialized, &new_col_ids, next_id, ctor_index, enum_defs);
         branches.push(CtorBranch {
             ctor_name: *ctor_name,
             ctor_tag: tag,
@@ -548,7 +559,8 @@ fn build_lit_switch(
     let mut branches = Vec::new();
     for lit in &seen_lits {
         let specialized = specialize_literal(&rows, col, col_ids, lit);
-        let subtree = build_decision_tree(specialized, &new_col_ids, next_id, ctor_index, enum_defs);
+        let subtree =
+            build_decision_tree(specialized, &new_col_ids, next_id, ctor_index, enum_defs);
         branches.push((lit.clone(), subtree));
     }
 
@@ -576,7 +588,13 @@ fn build_record_destructure(
     let k = field_names.len();
 
     // Allocate scrutinee IDs for fields
-    let field_ids: Vec<usize> = (0..k).map(|_| { let id = *next_id; *next_id += 1; id }).collect();
+    let field_ids: Vec<usize> = (0..k)
+        .map(|_| {
+            let id = *next_id;
+            *next_id += 1;
+            id
+        })
+        .collect();
 
     // New col_ids: replace col with field IDs
     let mut new_col_ids: Vec<usize> = col_ids[..col].to_vec();
@@ -1204,8 +1222,13 @@ impl<'a> LowerCtx<'a> {
             .collect();
         let col_ids = vec![0usize];
         let mut next_id = 1usize;
-        let tree =
-            build_decision_tree(rows, &col_ids, &mut next_id, &self.ctor_index, self.enum_defs);
+        let tree = build_decision_tree(
+            rows,
+            &col_ids,
+            &mut next_id,
+            &self.ctor_index,
+            self.enum_defs,
+        );
 
         // Emit the decision tree as LIR
         let mut atoms: HashMap<usize, (LirAtom, Type)> = HashMap::new();
@@ -1320,8 +1343,13 @@ impl<'a> LowerCtx<'a> {
             .collect();
         let col_ids = vec![0usize];
         let mut next_id = 1usize;
-        let tree =
-            build_decision_tree(rows, &col_ids, &mut next_id, &self.ctor_index, self.enum_defs);
+        let tree = build_decision_tree(
+            rows,
+            &col_ids,
+            &mut next_id,
+            &self.ctor_index,
+            self.enum_defs,
+        );
 
         // Emit the decision tree as LIR
         let mut atoms: HashMap<usize, (LirAtom, Type)> = HashMap::new();
@@ -1360,59 +1388,50 @@ impl<'a> LowerCtx<'a> {
                 // Unreachable for exhaustive matches — emit nothing
                 Ok(())
             }
-            DecTree::Leaf {
-                case_idx,
-                bindings,
-            } => {
+            DecTree::Leaf { case_idx, bindings } => {
                 self.emit_leaf(*case_idx, bindings, atoms, cases, ret_type, mode)
             }
             DecTree::CtorSwitch {
                 scrutinee_id,
                 branches,
                 fallback,
-            } => {
-                self.emit_ctor_switch(
-                    *scrutinee_id,
-                    branches,
-                    fallback.as_deref(),
-                    atoms,
-                    cases,
-                    ret_type,
-                    mode,
-                )
-            }
+            } => self.emit_ctor_switch(
+                *scrutinee_id,
+                branches,
+                fallback.as_deref(),
+                atoms,
+                cases,
+                ret_type,
+                mode,
+            ),
             DecTree::LitSwitch {
                 scrutinee_id,
                 branches,
                 fallback,
-            } => {
-                self.emit_lit_switch(
-                    *scrutinee_id,
-                    branches,
-                    fallback,
-                    atoms,
-                    cases,
-                    ret_type,
-                    mode,
-                )
-            }
+            } => self.emit_lit_switch(
+                *scrutinee_id,
+                branches,
+                fallback,
+                atoms,
+                cases,
+                ret_type,
+                mode,
+            ),
             DecTree::RecordDestructure {
                 scrutinee_id,
                 field_names,
                 field_ids,
                 subtree,
-            } => {
-                self.emit_record_destructure(
-                    *scrutinee_id,
-                    field_names,
-                    field_ids,
-                    subtree,
-                    atoms,
-                    cases,
-                    ret_type,
-                    mode,
-                )
-            }
+            } => self.emit_record_destructure(
+                *scrutinee_id,
+                field_names,
+                field_ids,
+                subtree,
+                atoms,
+                cases,
+                ret_type,
+                mode,
+            ),
         }
     }
 
@@ -1468,8 +1487,8 @@ impl<'a> LowerCtx<'a> {
                         .iter()
                         .all(|s| matches!(s, MirStmt::Expr(MirExpr::Literal(Literal::Unit))));
 
-                let genuine_ret = case_ret
-                    .or_else(|| fallback_return_atom_from_terminal_stmt(&leaf_stmts));
+                let genuine_ret =
+                    case_ret.or_else(|| fallback_return_atom_from_terminal_stmt(&leaf_stmts));
 
                 if body_is_trivially_unit && genuine_ret.is_none() {
                     // Side-effect only — just emit the stmts inline
@@ -1597,10 +1616,7 @@ impl<'a> LowerCtx<'a> {
 
     /// Lower a case body in expression position.
     /// Returns the value atom.
-    fn lower_case_body_expr(
-        &mut self,
-        body: &[MirStmt],
-    ) -> Result<LirAtom, LirLowerError> {
+    fn lower_case_body_expr(&mut self, body: &[MirStmt]) -> Result<LirAtom, LirLowerError> {
         if body.is_empty() {
             return Ok(LirAtom::Unit);
         }
@@ -1682,9 +1698,10 @@ impl<'a> LowerCtx<'a> {
                 &self.ctor_index,
                 self.enum_defs,
             );
-            let ctor_info_data = self.ctor_index.get(branch.ctor_name.as_str()).map(|ci| {
-                (ci.sorted_indices.clone(), ci.field_labels.clone())
-            });
+            let ctor_info_data = self
+                .ctor_index
+                .get(branch.ctor_name.as_str())
+                .map(|ci| (ci.sorted_indices.clone(), ci.field_labels.clone()));
 
             for fi in 0..branch.arity {
                 let mem_idx = ctor_info_data
@@ -1720,14 +1737,13 @@ impl<'a> LowerCtx<'a> {
             match mode {
                 MatchEmitMode::Stmt => {
                     // Determine return value from the branch body
-                    let then_ret = fallback_return_atom_from_terminal_stmt(&then_body)
-                        .map(|ret| {
-                            if matches!(ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
-                                default_atom_for_type(ret_type)
-                            } else {
-                                ret
-                            }
-                        });
+                    let then_ret = fallback_return_atom_from_terminal_stmt(&then_body).map(|ret| {
+                        if matches!(ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
+                            default_atom_for_type(ret_type)
+                        } else {
+                            ret
+                        }
+                    });
 
                     // Use IfReturn for value-returning branches, If for side-effect
                     if then_ret.is_some() {
@@ -1805,14 +1821,13 @@ impl<'a> LowerCtx<'a> {
 
             match mode {
                 MatchEmitMode::Stmt => {
-                    let then_ret = fallback_return_atom_from_terminal_stmt(&then_body)
-                        .map(|ret| {
-                            if matches!(ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
-                                default_atom_for_type(ret_type)
-                            } else {
-                                ret
-                            }
-                        });
+                    let then_ret = fallback_return_atom_from_terminal_stmt(&then_body).map(|ret| {
+                        if matches!(ret.typ(), Type::Unit) && !matches!(ret_type, Type::Unit) {
+                            default_atom_for_type(ret_type)
+                        } else {
+                            ret
+                        }
+                    });
 
                     if then_ret.is_some() {
                         let stmt = LirStmt::IfReturn {

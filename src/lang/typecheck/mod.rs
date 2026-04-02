@@ -1477,7 +1477,9 @@ impl TypeChecker {
                     }
                 }
                 // Strip module qualifier for qualified constructors (e.g., "hir.Literal" → "Literal")
-                let ctor_name = name.rfind('.').map_or(name.as_str(), |pos| &name[pos + 1..]);
+                let ctor_name = name
+                    .rfind('.')
+                    .map_or(name.as_str(), |pos| &name[pos + 1..]);
                 for ed in all_enums {
                     if let Some(v) = ed.variants.iter().find(|x| x.name == ctor_name) {
                         if v.fields.len() != args.len() {
@@ -2110,7 +2112,10 @@ impl TypeChecker {
                                 .map(|_| {
                                     (
                                         None,
-                                        Spanned { node: Pattern::Wildcard, span: p.span.clone() },
+                                        Spanned {
+                                            node: Pattern::Wildcard,
+                                            span: p.span.clone(),
+                                        },
                                     )
                                 })
                                 .collect();

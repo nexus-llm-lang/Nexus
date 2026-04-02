@@ -89,11 +89,8 @@ pub fn add_bt_to_linker<T: Send + 'static>(
     // Provide a shared memory for modules that import memory from this namespace.
     // The actual string data is written into the caller's memory (via allocate export),
     // but the WASM module import still needs a memory definition to satisfy the linker.
-    let memory = Memory::new(
-        &mut *store,
-        MemoryType::new(1, None),
-    )
-    .map_err(|e| format!("Failed to create backtrace memory: {}", e))?;
+    let memory = Memory::new(&mut *store, MemoryType::new(1, None))
+        .map_err(|e| format!("Failed to create backtrace memory: {}", e))?;
     linker
         .define(&mut *store, BT_HOST_MODULE, "memory", memory)
         .map_err(|e| format!("Failed to define backtrace memory: {}", e))?;
