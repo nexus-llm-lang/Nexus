@@ -328,6 +328,7 @@ export default grammar({
         $.assign_stmt,
         $.let_pattern_stmt,
         $.if_stmt,
+        $.if_let_stmt,
         $.match_stmt,
         $.while_stmt,
         $.for_stmt,
@@ -361,6 +362,20 @@ export default grammar({
       seq(
         "if",
         field("cond", $._expr),
+        "then",
+        field("then_branch", repeat($._stmt)),
+        optional(seq("else", field("else_branch", repeat($._stmt)))),
+        "end"
+      ),
+
+    // if let pattern = expr then stmts [else stmts] end
+    if_let_stmt: ($) =>
+      seq(
+        "if",
+        "let",
+        field("pattern", $._pattern),
+        "=",
+        field("target", $._expr),
         "then",
         field("then_branch", repeat($._stmt)),
         optional(seq("else", field("else_branch", repeat($._stmt)))),
@@ -609,6 +624,7 @@ export default grammar({
     _atom_expr: ($) =>
       choice(
         $.paren_expr,
+        $.if_let_expr,
         $.match_expr,
         $.raise_expr,
         $.borrow_expr,
@@ -622,6 +638,20 @@ export default grammar({
         $.list_expr,
         $.literal,
         $.variable
+      ),
+
+    // if let pattern = expr then expr [else expr] end  (expression position)
+    if_let_expr: ($) =>
+      seq(
+        "if",
+        "let",
+        field("pattern", $._pattern),
+        "=",
+        field("target", $._expr),
+        "then",
+        field("then_branch", $._expr),
+        optional(seq("else", field("else_branch", $._expr))),
+        "end"
       ),
 
     // match expr do case pat -> expr ... end  (expression position)

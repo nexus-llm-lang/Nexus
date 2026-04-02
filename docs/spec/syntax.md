@@ -262,6 +262,18 @@ end
 
 The `else` branch is optional.
 
+### If-Let
+
+```nexus
+if let Some(value: v) = opt then
+  process(v: v)
+else
+  default_value
+end
+```
+
+Desugars to a `match` with the given pattern and a wildcard fallback. The `else` branch is optional (defaults to unit).
+
 ### Match
 
 ```nexus
@@ -506,6 +518,7 @@ return_stmt ::= "return" expr
 assign_stmt ::= expr "<-" expr
 
 if_stmt     ::= "if" expr "then" stmt* [ "else" stmt* ] "end"
+if_let_stmt ::= "if" "let" pattern "=" expr "then" stmt* [ "else" stmt* ] "end"
 
 match_stmt  ::= "match" expr "do" match_case* "end"
 match_case  ::= "case" pattern "->" stmt*
@@ -541,6 +554,7 @@ postfix_expr     ::= postfix_expr "." IDENT        (* field access *)
                    | postfix_expr "[" expr "]"     (* index *)
                    | atom_expr
 
+if_let_expr      ::= "if" "let" pattern "=" expr "then" expr [ "else" expr ] "end"
 match_expr       ::= "match" expr "do" match_case_expr* "end"
 match_case_expr  ::= "case" pattern "->" expr
 

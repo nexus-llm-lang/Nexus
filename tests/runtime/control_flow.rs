@@ -920,3 +920,74 @@ end
 "#,
     );
 }
+
+#[test]
+fn if_let_some_branch() {
+    exec(
+        r#"
+type Option<T> = Some(value: T) | None
+
+let main = fn () -> unit do
+    let opt: Option<i64> = Some(value: 42)
+    let result = if let Some(value: v) = opt then v else 0 end
+    if result != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn if_let_none_branch() {
+    exec(
+        r#"
+type Option<T> = Some(value: T) | None
+
+let main = fn () -> unit do
+    let opt: Option<i64> = None
+    let result = if let Some(value: _) = opt then 1 else 0 end
+    if result != 0 then raise RuntimeError(val: "expected 0") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn if_let_statement_no_else() {
+    exec(
+        r#"
+type Option<T> = Some(value: T) | None
+
+let check = fn (opt: Option<i64>) -> i64 do
+    let result = 0
+    if let Some(value: v) = opt then
+        return v
+    end
+    return result
+end
+
+let main = fn () -> unit do
+    let r = check(opt: Some(value: 10))
+    if r != 10 then raise RuntimeError(val: "expected 10") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn if_let_record_pattern() {
+    exec(
+        r#"
+type Pair = MkPair(fst: i64, snd: i64) | Empty
+
+let main = fn () -> unit do
+    let p: Pair = MkPair(fst: 3, snd: 4)
+    let result = if let MkPair(fst: a, snd: b) = p then a + b else 0 end
+    if result != 7 then raise RuntimeError(val: "expected 7") end
+    return ()
+end
+"#,
+    );
+}
