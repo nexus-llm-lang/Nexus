@@ -294,6 +294,93 @@ end
     );
 }
 
+// ---- match arm tail call TCO ----
+
+#[test]
+fn codegen_match_arm_tail_call_emits_tco() {
+    // Self-tail-call inside match arms should be optimized (loop+br for self-recursion)
+    let wasm = compile(
+        r#"
+let sum_list = fn (xs: [i64], acc: i64) -> i64 do
+    match xs do
+        case Nil -> return acc
+        case h :: t -> return sum_list(xs: t, acc: acc + h)
+    end
+end
+
+let main = fn () -> unit do
+    let _ = sum_list(xs: [1, 2, 3], acc: 0)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut has_loop = false;
+    let mut has_br = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                match op.unwrap() {
+                    Operator::Loop { .. } => has_loop = true,
+                    Operator::Br { .. } => has_br = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(
+        has_loop && has_br,
+        "self-tail-recursive call in match arm should emit loop + br (TCO-to-loop)"
+    );
+}
+
+#[test]
+fn codegen_match_arm_mutual_tail_call_emits_return_call() {
+    // Non-self tail call in match arm should emit return_call
+    let wasm = compile(
+        r#"
+let process = fn (n: i64) -> i64 do
+    return helper(n: n)
+end
+
+let helper = fn (n: i64) -> i64 do
+    match n do
+        case 0 -> return 0
+        case _ -> return process(n: n - 1)
+    end
+end
+
+let main = fn () -> unit do
+    let _ = helper(n: 5)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut has_return_call = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                if matches!(op.unwrap(), Operator::ReturnCall { .. }) {
+                    has_return_call = true;
+                }
+            }
+        }
+    }
+    assert!(
+        has_return_call,
+        "non-self tail call in match arm should emit return_call"
+    );
+}
+
 // ---- main(args) desugaring ----
 
 #[test]
