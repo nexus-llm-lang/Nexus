@@ -1558,6 +1558,29 @@ impl<'a> LowerCtx<'a> {
                 }
             },
             MirStmt::Return(expr) => {
+                if let MirExpr::Call {
+                    func,
+                    args,
+                    ret_type,
+                } = expr
+                {
+                    let mut lir_args = Vec::new();
+                    for (label, e) in args {
+                        let atom = self.lower_expr_to_atom(e)?;
+                        lir_args.push((label.clone(), atom));
+                    }
+                    lir_args.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    let typ = wasm_type(ret_type);
+                    let atom = self.bind_expr_to_temp(
+                        LirExpr::TailCall {
+                            func: func.clone(),
+                            args: lir_args,
+                            typ: typ.clone(),
+                        },
+                        typ,
+                    );
+                    return Ok(Some(atom));
+                }
                 let atom = self.lower_expr_to_atom(expr)?;
                 if matches!(atom.typ(), Type::Unit) {
                     Ok(None)
