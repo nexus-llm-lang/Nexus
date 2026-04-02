@@ -211,7 +211,12 @@ impl TypeChecker {
                     // Strip module qualifier for qualified constructors
                     let bare_c = c.rfind('.').map_or(c.as_str(), |pos| &c[pos + 1..]);
                     if bare_c == ctor {
-                        if args.len() != arity {
+                        // Ctor(_) with a single positional wildcard means "ignore all fields"
+                        let is_wildcard_spread = args.len() == 1
+                            && args[0].0.is_none()
+                            && matches!(args[0].1.node, Pattern::Wildcard)
+                            && arity != 1;
+                        if !is_wildcard_spread && args.len() != arity {
                             return Err(format!(
                                 "Arity mismatch in pattern `{}`: expected {} fields, got {}.\nProvided pattern arguments: {}",
                                 ctor,
@@ -220,8 +225,14 @@ impl TypeChecker {
                                 summarize_ctor_args(args)
                             ));
                         }
-                        let mut nr: Vec<PatRef> =
-                            args.iter().map(|(_, a)| PatRef::Original(a)).collect();
+                        let mut nr: Vec<PatRef> = if is_wildcard_spread {
+                            let span = args[0].1.span.clone();
+                            (0..arity)
+                                .map(|_| PatRef::Synthetic(Pattern::Wildcard, span.clone()))
+                                .collect()
+                        } else {
+                            args.iter().map(|(_, a)| PatRef::Original(a)).collect()
+                        };
                         nr.extend_from_slice(rest);
                         nm.push(nr);
                     }
