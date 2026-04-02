@@ -350,7 +350,14 @@ pub(super) fn append_dwarf_sections(wasm: &mut Vec<u8>, entries: &[FuncDebugEntr
 
     // Build sections
     let abbrev = build_debug_abbrev();
-    let info = build_debug_info(entries, &file_indices, cu_low_pc, cu_high_pc, comp_dir, comp_name);
+    let info = build_debug_info(
+        entries,
+        &file_indices,
+        cu_low_pc,
+        cu_high_pc,
+        comp_dir,
+        comp_name,
+    );
     let line = build_debug_line(entries, &file_indices, &files);
 
     // Append as WASM custom sections

@@ -81,8 +81,7 @@ pub fn compile_program_to_wasm_with_metrics(
     let optimize = t.elapsed();
 
     let t = Instant::now();
-    let (mut wasm, debug_entries) =
-        compile_lir_to_wasm(&lir).map_err(CompileError::Codegen)?;
+    let (mut wasm, debug_entries) = compile_lir_to_wasm(&lir).map_err(CompileError::Codegen)?;
     let codegen = t.elapsed();
 
     if !caps.is_empty() {
@@ -117,8 +116,7 @@ pub fn compile_program_to_wasm_with_dwarf(program: &Program) -> Result<Vec<u8>, 
     let mir = build_hir(program).map_err(CompileError::HirBuild)?;
     let mut lir = lower_mir_to_lir(&mir, &mir.enum_defs).map_err(CompileError::LirLower)?;
     optimize_lir(&mut lir);
-    let (mut wasm, debug_entries) =
-        compile_lir_to_wasm(&lir).map_err(CompileError::Codegen)?;
+    let (mut wasm, debug_entries) = compile_lir_to_wasm(&lir).map_err(CompileError::Codegen)?;
     if !caps.is_empty() {
         append_capabilities_section(&mut wasm, &caps);
     }

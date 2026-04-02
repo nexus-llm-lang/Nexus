@@ -73,9 +73,7 @@ fn run_component_wasm_bytes(
     let handle = std::thread::Builder::new()
         .name("wasm-component-exec".into())
         .stack_size(64 * 1024 * 1024) // 64 MiB native stack
-        .spawn(move || {
-            run_component_wasm_bytes_inner(&wasm, &capabilities, &guest_args)
-        })
+        .spawn(move || run_component_wasm_bytes_inner(&wasm, &capabilities, &guest_args))
         .expect("failed to spawn wasm-component-exec thread");
     handle.join().unwrap_or(ExitCode::from(1))
 }

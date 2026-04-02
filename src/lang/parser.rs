@@ -1219,10 +1219,7 @@ impl Parser {
             }
 
             // Identifier — could be variable, function call, constructor, or path call
-            TokenKind::Ident(ref s) => {
-                let s = s.clone();
-                let is_upper = Self::is_uppercase_ident(&s);
-
+            TokenKind::Ident(_) => {
                 // First, try to read a dotted path: a.b.c
                 // This handles both Console.println(...) calls and module.fn(...) calls
                 let first = self.expect_ident()?;
@@ -1600,7 +1597,7 @@ impl Parser {
 
     fn parse_if_stmt(&mut self, start: usize) -> Result<Spanned<Stmt>, ParseError> {
         self.advance(); // consume 'if'
-        // if let <pattern> = <expr> then ... [else ...] end
+                        // if let <pattern> = <expr> then ... [else ...] end
         if matches!(self.peek(), TokenKind::Let) {
             self.advance();
             let expr = self.parse_if_let_expr(start)?;

@@ -929,20 +929,36 @@ fn count_dead_lets(stmts: &[LirStmt], uses: &HashMap<Symbol, u32>) -> usize {
                     count += 1;
                 }
             }
-            LirStmt::If { then_body, else_body, .. }
-            | LirStmt::IfReturn { then_body, else_body, .. } => {
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            }
+            | LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
                 count += count_dead_lets(then_body, uses);
                 count += count_dead_lets(else_body, uses);
             }
-            LirStmt::TryCatch { body, catch_body, .. } => {
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
                 count += count_dead_lets(body, uses);
                 count += count_dead_lets(catch_body, uses);
             }
-            LirStmt::Loop { cond_stmts, body, .. } => {
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
                 count += count_dead_lets(cond_stmts, uses);
                 count += count_dead_lets(body, uses);
             }
-            LirStmt::Switch { cases, default_body, .. } => {
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
                 for case in cases {
                     count += count_dead_lets(&case.body, uses);
                 }
@@ -1023,20 +1039,18 @@ fn expr_has_side_effects(expr: &LirExpr) -> bool {
 /// Returns true if a statement always diverges (never falls through to the next).
 fn stmt_diverges(stmt: &LirStmt) -> bool {
     match stmt {
-        LirStmt::Let { expr, .. } => matches!(expr, LirExpr::Raise { .. } | LirExpr::TailCall { .. }),
+        LirStmt::Let { expr, .. } => {
+            matches!(expr, LirExpr::Raise { .. } | LirExpr::TailCall { .. })
+        }
         LirStmt::IfReturn {
-            then_ret,
-            else_ret,
-            ..
+            then_ret, else_ret, ..
         } => {
             // Diverges only if BOTH branches return (or the then branch returns
             // and there is no else branch — the else IS the continuation)
             then_ret.is_some() && else_ret.is_some()
         }
         LirStmt::Switch {
-            cases,
-            default_ret,
-            ..
+            cases, default_ret, ..
         } => {
             // Diverges if all cases AND default return
             default_ret.is_some() && cases.iter().all(|c| c.ret.is_some())
@@ -1225,10 +1239,7 @@ fn collect_defined_vars(stmts: &[LirStmt], defs: &mut HashSet<Symbol>) {
 /// - Its expression has no side effects
 /// - Its expression doesn't reference any variable in `loop_defs`
 /// Stops at the first non-invariant let or non-let statement.
-fn extract_invariant_lets(
-    stmts: &mut Vec<LirStmt>,
-    loop_defs: &HashSet<Symbol>,
-) -> Vec<LirStmt> {
+fn extract_invariant_lets(stmts: &mut Vec<LirStmt>, loop_defs: &HashSet<Symbol>) -> Vec<LirStmt> {
     let mut hoisted = Vec::new();
     while !stmts.is_empty() {
         let is_invariant = if let LirStmt::Let { expr, .. } = &stmts[0] {
@@ -1256,9 +1267,7 @@ fn expr_references_any(expr: &LirExpr, vars: &HashSet<Symbol>) -> bool {
             args.iter().any(|(_, a)| atom_references_any(a, vars))
         }
         LirExpr::Constructor { args, .. } => args.iter().any(|a| atom_references_any(a, vars)),
-        LirExpr::Record { fields, .. } => {
-            fields.iter().any(|(_, a)| atom_references_any(a, vars))
-        }
+        LirExpr::Record { fields, .. } => fields.iter().any(|(_, a)| atom_references_any(a, vars)),
         LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } => {
             atom_references_any(value, vars)
         }
@@ -1268,7 +1277,8 @@ fn expr_references_any(expr: &LirExpr, vars: &HashSet<Symbol>) -> bool {
             captures.iter().any(|(_, a)| atom_references_any(a, vars))
         }
         LirExpr::CallIndirect { callee, args, .. } => {
-            atom_references_any(callee, vars) || args.iter().any(|(_, a)| atom_references_any(a, vars))
+            atom_references_any(callee, vars)
+                || args.iter().any(|(_, a)| atom_references_any(a, vars))
         }
     }
 }
@@ -1352,7 +1362,10 @@ fn collect_funcref_bindings(stmts: &[LirStmt], map: &mut HashMap<Symbol, Symbol>
     }
 }
 
-fn devirtualize_calls_in_stmts(stmts: &mut [LirStmt], funcref_map: &HashMap<Symbol, Symbol>) -> u32 {
+fn devirtualize_calls_in_stmts(
+    stmts: &mut [LirStmt],
+    funcref_map: &HashMap<Symbol, Symbol>,
+) -> u32 {
     let mut count = 0;
     for stmt in stmts.iter_mut() {
         match stmt {
@@ -1505,7 +1518,6 @@ fn is_inlineable(func: &LirFunction) -> bool {
     }
     true
 }
-
 
 /// Inline calls in a statement list, replacing Call expressions with the
 /// inlined function body. Each inline site gets unique variable names via
@@ -1812,7 +1824,10 @@ fn fold_identical_functions(program: &mut LirProgram) {
                     &program.functions[canon_idx],
                     &program.functions[idx],
                 ) {
-                    redirect.insert(program.functions[idx].name, program.functions[canon_idx].name);
+                    redirect.insert(
+                        program.functions[idx].name,
+                        program.functions[canon_idx].name,
+                    );
                     found = true;
                     break;
                 }
@@ -1947,9 +1962,7 @@ fn hash_stmt(stmt: &LirStmt, h: &mut impl std::hash::Hasher) {
             format!("{:?}", catch_param_typ).hash(h);
         }
         LirStmt::Loop {
-            cond_stmts,
-            body,
-            ..
+            cond_stmts, body, ..
         } => {
             hash_stmts(cond_stmts, h);
             hash_stmts(body, h);
@@ -2003,7 +2016,12 @@ fn hash_expr(expr: &LirExpr, h: &mut impl std::hash::Hasher) {
             index.hash(h);
             format!("{:?}", typ).hash(h);
         }
-        LirExpr::CallIndirect { args, typ, callee_type, .. } => {
+        LirExpr::CallIndirect {
+            args,
+            typ,
+            callee_type,
+            ..
+        } => {
             args.len().hash(h);
             format!("{:?}", typ).hash(h);
             format!("{:?}", callee_type).hash(h);
@@ -2111,11 +2129,7 @@ fn stmts_structurally_equal(
     true
 }
 
-fn exprs_structurally_equal(
-    a: &LirExpr,
-    b: &LirExpr,
-    name_map: &HashMap<Symbol, Symbol>,
-) -> bool {
+fn exprs_structurally_equal(a: &LirExpr, b: &LirExpr, name_map: &HashMap<Symbol, Symbol>) -> bool {
     if std::mem::discriminant(a) != std::mem::discriminant(b) {
         return false;
     }
@@ -2155,7 +2169,8 @@ fn exprs_structurally_equal(
             fa == fb
                 && ta == tb
                 && aa.len() == ab.len()
-                && aa.iter()
+                && aa
+                    .iter()
                     .zip(ab.iter())
                     .all(|((_, a), (_, b))| atoms_structurally_equal(a, b, name_map))
         }
@@ -2174,20 +2189,14 @@ fn exprs_structurally_equal(
             na == nb
                 && ta == tb
                 && aa.len() == ab.len()
-                && aa.iter()
+                && aa
+                    .iter()
                     .zip(ab.iter())
                     .all(|(a, b)| atoms_structurally_equal(a, b, name_map))
         }
-        (
-            LirExpr::ObjectTag {
-                value: va,
-                typ: ta,
-            },
-            LirExpr::ObjectTag {
-                value: vb,
-                typ: tb,
-            },
-        ) => ta == tb && atoms_structurally_equal(va, vb, name_map),
+        (LirExpr::ObjectTag { value: va, typ: ta }, LirExpr::ObjectTag { value: vb, typ: tb }) => {
+            ta == tb && atoms_structurally_equal(va, vb, name_map)
+        }
         (
             LirExpr::ObjectField {
                 value: va,
@@ -2205,11 +2214,7 @@ fn exprs_structurally_equal(
     }
 }
 
-fn atoms_structurally_equal(
-    a: &LirAtom,
-    b: &LirAtom,
-    name_map: &HashMap<Symbol, Symbol>,
-) -> bool {
+fn atoms_structurally_equal(a: &LirAtom, b: &LirAtom, name_map: &HashMap<Symbol, Symbol>) -> bool {
     match (a, b) {
         (LirAtom::Var { name: na, typ: ta }, LirAtom::Var { name: nb, typ: tb }) => {
             ta == tb && name_map.get(na).map_or(*na == *nb, |mapped| *mapped == *nb)
