@@ -208,7 +208,9 @@ impl TypeChecker {
             };
             match p.node() {
                 Pattern::Constructor(c, args) => {
-                    if c == ctor {
+                    // Strip module qualifier for qualified constructors
+                    let bare_c = c.rfind('.').map_or(c.as_str(), |pos| &c[pos + 1..]);
+                    if bare_c == ctor {
                         if args.len() != arity {
                             return Err(format!(
                                 "Arity mismatch in pattern `{}`: expected {} fields, got {}.\nProvided pattern arguments: {}",

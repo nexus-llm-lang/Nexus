@@ -610,9 +610,25 @@ impl Parser {
                 })
             }
             TokenKind::Ident(ref s) if Self::is_uppercase_ident(s) => {
-                // Constructor pattern
-                let name = s.clone();
+                // Constructor pattern — may be qualified (e.g., hir.Literal)
+                let mut name = s.clone();
                 self.advance();
+                // Check for dot-qualified constructor: mod.Ctor
+                while matches!(self.peek(), TokenKind::Dot) {
+                    let saved = self.pos;
+                    self.advance(); // consume dot
+                    match self.peek() {
+                        TokenKind::Ident(ref next) if Self::is_uppercase_ident(next) => {
+                            let next = next.clone();
+                            self.advance();
+                            name = format!("{}.{}", name, next);
+                        }
+                        _ => {
+                            self.pos = saved;
+                            break;
+                        }
+                    }
+                }
                 if matches!(self.peek(), TokenKind::LParen) {
                     self.advance();
                     let mut args = Vec::new();
@@ -688,9 +704,64 @@ impl Parser {
                 }
                 self.pos = saved;
 
-                // Variable pattern (with sigil)
+                // Variable pattern (with sigil) — or qualified constructor (mod.Ctor)
                 let sigil = self.parse_sigil();
                 let name = self.expect_ident()?;
+
+                // Check for qualified constructor: lowercase.Uppercase(...)
+                if matches!(self.peek(), TokenKind::Dot) {
+                    let dot_saved = self.pos;
+                    self.advance(); // consume dot
+                    if let TokenKind::Ident(ref next) = self.peek().clone() {
+                        if Self::is_uppercase_ident(next) {
+                            // Qualified constructor pattern: mod.Ctor or mod.Ctor(...)
+                            let mut qname = format!("{}.{}", name, next);
+                            self.advance();
+                            // Continue reading dots for deeper qualification
+                            while matches!(self.peek(), TokenKind::Dot) {
+                                let inner_saved = self.pos;
+                                self.advance();
+                                if let TokenKind::Ident(ref n2) = self.peek().clone() {
+                                    if Self::is_uppercase_ident(n2) {
+                                        qname = format!("{}.{}", qname, n2);
+                                        self.advance();
+                                    } else {
+                                        self.pos = inner_saved;
+                                        break;
+                                    }
+                                } else {
+                                    self.pos = inner_saved;
+                                    break;
+                                }
+                            }
+                            if matches!(self.peek(), TokenKind::LParen) {
+                                self.advance();
+                                let mut args = Vec::new();
+                                if !matches!(self.peek(), TokenKind::RParen) {
+                                    args.push(self.parse_ctor_pat_arg()?);
+                                    while self.match_token(&TokenKind::Comma) {
+                                        args.push(self.parse_ctor_pat_arg()?);
+                                    }
+                                }
+                                let end = self.peek_span().end;
+                                self.expect(&TokenKind::RParen)?;
+                                return Ok(Spanned {
+                                    node: Pattern::Constructor(qname, args),
+                                    span: start..end,
+                                });
+                            } else {
+                                let end = self.tokens[self.pos - 1].span.end;
+                                return Ok(Spanned {
+                                    node: Pattern::Constructor(qname, vec![]),
+                                    span: start..end,
+                                });
+                            }
+                        }
+                    }
+                    // Not a qualified constructor — rewind the dot
+                    self.pos = dot_saved;
+                }
+
                 let end = self.tokens[self.pos - 1].span.end;
                 Ok(Spanned {
                     node: Pattern::Variable(name, sigil),
@@ -1170,18 +1241,12 @@ impl Parser {
                     }
                 }
 
+                // Check if last segment is uppercase — determines Constructor vs Call
+                let last_is_upper = Self::is_uppercase_ident(segments.last().unwrap());
+
                 if matches!(self.peek(), TokenKind::LParen) {
-                    if segments.len() > 1 || !is_upper {
-                        // Multi-segment path call or lowercase function call
-                        self.advance();
-                        let args = self.parse_call_args()?;
-                        let end = self.tokens[self.pos - 1].span.end;
-                        return Ok(Spanned {
-                            node: Expr::Call { func: path, args },
-                            span: start..end,
-                        });
-                    } else {
-                        // Single uppercase name with () — Constructor call
+                    if last_is_upper {
+                        // Uppercase final segment: Constructor (e.g., Foo(...) or hir.Literal(...))
                         self.advance();
                         let args = self.parse_ctor_args()?;
                         let end = self.tokens[self.pos - 1].span.end;
@@ -1189,12 +1254,21 @@ impl Parser {
                             node: Expr::Constructor(path, args),
                             span: start..end,
                         });
+                    } else {
+                        // Lowercase final segment: function call (e.g., foo(...) or mod.func(...))
+                        self.advance();
+                        let args = self.parse_call_args()?;
+                        let end = self.tokens[self.pos - 1].span.end;
+                        return Ok(Spanned {
+                            node: Expr::Call { func: path, args },
+                            span: start..end,
+                        });
                     }
                 }
 
                 // No parens following
-                if is_upper && segments.len() == 1 {
-                    // Single uppercase: Constructor with no args
+                if last_is_upper {
+                    // Uppercase final segment without args: Constructor (e.g., Nil or hir.Nil)
                     let end = self.tokens[self.pos - 1].span.end;
                     Ok(Spanned {
                         node: Expr::Constructor(path, vec![]),
