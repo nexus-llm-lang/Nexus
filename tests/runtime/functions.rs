@@ -125,6 +125,29 @@ end
 }
 
 #[test]
+fn codegen_deep_mutual_tail_recursion_does_not_overflow() {
+    exec(
+        r#"
+let is_even = fn (n: i64) -> bool do
+    if n == 0 then return true end
+    return is_odd(n: n - 1)
+end
+
+let is_odd = fn (n: i64) -> bool do
+    if n == 0 then return false end
+    return is_even(n: n - 1)
+end
+
+let main = fn () -> unit do
+    let result = is_even(n: 1000000)
+    if result != true then raise RuntimeError(val: "expected true") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
 fn codegen_main_with_args_runs_with_stdlib() {
     exec_with_stdlib(
         r#"
