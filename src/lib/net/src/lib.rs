@@ -50,18 +50,18 @@ extern "C" {
 }
 
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn allocate(size: i32) -> i32 {
     nexus_wasm_alloc::allocate(size)
 }
 
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
     nexus_wasm_alloc::deallocate(ptr, size);
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_http_get(url_ptr: i32, url_len: i32) -> i64 {
     const GET: &[u8] = b"GET";
     __nx_http_request(
@@ -76,7 +76,7 @@ pub extern "C" fn __nx_http_get(url_ptr: i32, url_len: i32) -> i64 {
     )
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_http_request(
     method_ptr: i32,
     method_len: i32,
@@ -120,7 +120,7 @@ pub extern "C" fn __nx_http_request(
     pack_ptr_len(ret[0], ret[1])
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_http_listen(addr_ptr: i32, addr_len: i32) -> i64 {
     if checked_ptr_len(addr_ptr, addr_len).is_none() {
         return -1;
@@ -128,7 +128,7 @@ pub extern "C" fn __nx_http_listen(addr_ptr: i32, addr_len: i32) -> i64 {
     unsafe { host_http_listen(addr_ptr, addr_len) }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_http_accept(server_id: i64) -> i64 {
     let mut ret = [0_i32; 2];
     unsafe {
@@ -140,7 +140,7 @@ pub extern "C" fn __nx_http_accept(server_id: i64) -> i64 {
     pack_ptr_len(ret[0], ret[1])
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_http_respond(
     req_id: i64,
     status: i64,
@@ -158,7 +158,7 @@ pub extern "C" fn __nx_http_respond(
     unsafe { host_http_respond(req_id, status, headers_ptr, headers_len, body_ptr, body_len) }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_http_stop(server_id: i64) -> i32 {
     unsafe { host_http_stop(server_id) }
 }
@@ -169,7 +169,7 @@ fn pack_ptr_len(ptr: i32, len: i32) -> i64 {
 
 // Exported for component canonical ABI lowering of string returns.
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub unsafe extern "C" fn cabi_realloc(
     old_ptr: i32,
     old_len: i32,

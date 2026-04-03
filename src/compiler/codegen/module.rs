@@ -34,11 +34,17 @@ pub fn compile_lir_to_wasm(
     let needs_bt_capture = has_eh && program_uses_backtrace(program);
     let needs_lazy = program_needs_lazy(program);
 
+    // Only import allocate from stdlib when using shared-memory bundling (packed ABI).
+    // With component-model (canonical ABI), each component has its own memory and
+    // the user code uses an internal bump allocator for heap operations.
     let stdlib_alloc_module = if program_uses_object_heap(program) {
         program
             .externals
             .iter()
-            .find(|ext| is_stdlib_module(ext.wasm_module.as_ref()))
+            .find(|ext| {
+                is_stdlib_module(ext.wasm_module.as_ref())
+                    && string_abi_for_external(ext) == super::string::StringABI::Packed
+            })
             .map(|ext| ext.wasm_module.to_string())
     } else {
         None
@@ -384,7 +390,10 @@ pub fn compile_lir_to_wasm(
 
     // === Global Section ===
     {
-        let needs_globals = layout.object_heap_enabled && layout.allocate_func_idx.is_none();
+        // Emit bump-allocator global when object heap is active without stdlib
+        // allocator, OR when cabi_realloc needs a fallback allocator.
+        let needs_globals = (layout.object_heap_enabled || needs_cabi_realloc)
+            && layout.allocate_func_idx.is_none();
         if needs_globals {
             let mut globals = GlobalSection::new();
             // Heap pointer global (index 0 — OBJECT_HEAP_GLOBAL_INDEX)
@@ -545,20 +554,40 @@ fn compile_cabi_realloc(layout: &CodegenLayout) -> Function {
     use super::OBJECT_HEAP_GLOBAL_INDEX;
 
     // Locals: params are 0=old_ptr, 1=old_size, 2=align, 3=new_size
-    let mut body = Function::new(Vec::new());
+    // One extra local for the aligned pointer
+    let mut body = Function::new(vec![(1, ValType::I32)]);
+    let aligned_ptr_local = 4u32;
 
-    // Simply allocate new_size bytes, ignoring old_ptr/old_size/align.
-    // This is sufficient for the canonical ABI's needs (it only calls realloc
-    // for fresh allocations in practice).
     if let Some(alloc_idx) = layout.allocate_func_idx {
-        // Use stdlib allocator
+        // Use stdlib allocator (handles alignment internally)
         body.instruction(&Instruction::LocalGet(3)); // new_size
         body.instruction(&Instruction::Call(alloc_idx));
     } else {
-        // Bump allocator: return current heap ptr, advance by new_size
+        // Bump allocator with alignment: align heap ptr UP to required alignment,
+        // then bump by new_size.
+        //
+        // aligned_ptr = (heap_ptr + align - 1) & ~(align - 1)
+        // new_heap = aligned_ptr + new_size
+
+        // Compute aligned_ptr
         body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
-        // Advance heap pointer
-        body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+        body.instruction(&Instruction::LocalGet(2)); // align
+        body.instruction(&Instruction::I32Add);
+        body.instruction(&Instruction::I32Const(1));
+        body.instruction(&Instruction::I32Sub); // heap_ptr + align - 1
+        // ~(align - 1) = -(align) when align is power of 2, but safer:
+        // mask = 0 - align (two's complement negation gives the AND mask)
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::LocalGet(2)); // align
+        body.instruction(&Instruction::I32Sub); // 0 - align = mask
+        body.instruction(&Instruction::I32And); // (heap_ptr + align - 1) & mask
+        body.instruction(&Instruction::LocalSet(aligned_ptr_local));
+
+        // Return aligned_ptr
+        body.instruction(&Instruction::LocalGet(aligned_ptr_local));
+
+        // Advance heap pointer: new_heap = aligned_ptr + new_size
+        body.instruction(&Instruction::LocalGet(aligned_ptr_local));
         body.instruction(&Instruction::LocalGet(3)); // new_size
         body.instruction(&Instruction::I32Add);
         body.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));

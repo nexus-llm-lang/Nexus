@@ -208,9 +208,9 @@ pub fn typecheck_program(filename: &str, src: &str, program: &lang::ast::Program
     }
 }
 
-/// Returns true if the wasm module imports any function whose name starts with
-/// `__nx_http` — i.e. it actually uses the net FFI.  Used to decide whether the
-/// nexus-host adapter component should be composed in.
+/// Returns true if the wasm module imports from `nexus:stdlib/network` — i.e.
+/// it actually uses the net FFI. Used to decide whether the nexus-host adapter
+/// component should be composed in.
 fn module_uses_net_ffi(wasm: &[u8]) -> bool {
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
         let Ok(payload) = payload else {
@@ -221,7 +221,10 @@ fn module_uses_net_ffi(wasm: &[u8]) -> bool {
                 let Ok(import) = import else {
                     continue;
                 };
-                if import.name.starts_with("__nx_http") {
+                // WIT canonical names: module=nexus:stdlib/network, name=http-get etc.
+                if import.module == "nexus:stdlib/network"
+                    || import.name.starts_with("__nx_http")
+                {
                     return true;
                 }
             }

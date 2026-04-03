@@ -812,17 +812,26 @@ pub(super) fn compile_expr(
                 // For canonical ABI string returns: allocate 8 bytes for retptr
                 // (2 x i32 for ptr and len) before emitting args
                 if canonical_string_ret {
-                    // Allocate 8 bytes on the heap for the return area
+                    // Allocate 8 bytes on the heap for the return area.
+                    // Must be 4-byte aligned (stores two i32 values: ptr + len).
                     if let Some(alloc_idx) = layout.allocate_func_idx {
                         out.instruction(&Instruction::I32Const(8));
                         out.instruction(&Instruction::Call(alloc_idx));
                     } else {
-                        // Bump allocator
+                        // Bump allocator: align to 4 bytes, then bump by 8
+                        // aligned = (heap_ptr + 3) & ~3
                         out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
-                        out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+                        out.instruction(&Instruction::I32Const(3));
+                        out.instruction(&Instruction::I32Add);
+                        out.instruction(&Instruction::I32Const(-4i32)); // ~3 = 0xFFFFFFFC
+                        out.instruction(&Instruction::I32And);
+                        // Save aligned ptr as return value, then advance heap
+                        out.instruction(&Instruction::LocalTee(temps.object_ptr_i32));
                         out.instruction(&Instruction::I32Const(8));
                         out.instruction(&Instruction::I32Add);
                         out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+                        // Push aligned ptr as result (already in object_ptr_i32)
+                        out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
                     }
                     // Save retptr to a temp local
                     out.instruction(&Instruction::LocalSet(temps.object_ptr_i32));

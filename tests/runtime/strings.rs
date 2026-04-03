@@ -97,18 +97,17 @@ end
         "pre-bundle WASM should contain raw UTF-8 bytes"
     );
 
-    // Post-bundle: wasm-merge should preserve the bytes
-    let config = nexus::compiler::bundler::BundleConfig::default();
-    let merged = nexus::compiler::bundler::bundle_core_wasm(&wasm, &config)
-        .expect("bundle_core_wasm should succeed");
+    // Post-compose: component composition should preserve the bytes
+    let composed = nexus::compiler::compose::compose_with_stdlib(&wasm)
+        .expect("compose_with_stdlib should succeed");
     let double_encoded: &[u8] = &[0xC3, 0xB0, 0xC2, 0x9F];
     assert!(
-        !merged.windows(4).any(|w| w == double_encoded),
-        "bundled WASM contains double-encoded UTF-8 — wasm-merge corrupted string data"
+        !composed.windows(4).any(|w| w == double_encoded),
+        "composed WASM contains double-encoded UTF-8 — composition corrupted string data"
     );
     assert!(
-        merged.windows(4).any(|w| w == correct_bytes),
-        "bundled WASM should contain raw UTF-8 bytes after merge"
+        composed.windows(4).any(|w| w == correct_bytes),
+        "composed WASM should contain raw UTF-8 bytes after composition"
     );
 }
 

@@ -45,11 +45,12 @@ fn codegen_fixture_network_access_compiles() {
 fn codegen_print_works_via_external_stdio_module() {
     exec_with_stdlib(
         r#"
-import external "stdlib/stdlib.wasm"
-external __nx_print = "__nx_print" : (val: string) -> unit
+import { Console }, * as stdio from "stdlib/stdio.nx"
 
-let main = fn () -> unit do
-    __nx_print(val: "hello wasm")
+let main = fn () -> unit require { PermConsole } do
+    inject stdio.system_handler do
+        Console.println(val: "hello wasm")
+    end
     return ()
 end
 "#,
@@ -60,12 +61,14 @@ end
 fn codegen_print_after_from_i64_works_via_single_string_abi_module() {
     exec_with_stdlib(
         r#"
-import external "stdlib/stdlib.wasm"
-external __nx_print = "__nx_print" : (val: string) -> unit
+import { Console }, * as stdio from "stdlib/stdio.nx"
+import { from_i64 } from "stdlib/string.nx"
 
-let main = fn () -> unit do
+let main = fn () -> unit require { PermConsole } do
     let s = from_i64(val: 42)
-    __nx_print(val: s)
+    inject stdio.system_handler do
+        Console.println(val: s)
+    end
     return ()
 end
 "#,

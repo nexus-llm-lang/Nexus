@@ -64,20 +64,20 @@ fn fd_with<R>(fd: i64, f: impl FnOnce(&mut FdEntry) -> R) -> Option<R> {
 // --- allocate / deallocate ---
 
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn allocate(size: i32) -> i32 {
     nexus_wasm_alloc::allocate(size)
 }
 
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
     nexus_wasm_alloc::deallocate(ptr, size);
 }
 
 // --- path-level operations (unchanged) ---
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_read_to_string(path_ptr: i32, path_len: i32) -> i64 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return 0;
@@ -86,7 +86,7 @@ pub extern "C" fn __nx_read_to_string(path_ptr: i32, path_len: i32) -> i64 {
     nexus_wasm_alloc::store_string_result(content)
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_write_string(
     path_ptr: i32,
     path_len: i32,
@@ -105,7 +105,7 @@ pub extern "C" fn __nx_write_string(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_append_string(
     path_ptr: i32,
     path_len: i32,
@@ -128,7 +128,7 @@ pub extern "C" fn __nx_append_string(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_exists(path_ptr: i32, path_len: i32) -> i32 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return 0;
@@ -140,7 +140,7 @@ pub extern "C" fn __nx_exists(path_ptr: i32, path_len: i32) -> i32 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_is_file(path_ptr: i32, path_len: i32) -> i32 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return 0;
@@ -152,7 +152,7 @@ pub extern "C" fn __nx_is_file(path_ptr: i32, path_len: i32) -> i32 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_remove_file(path_ptr: i32, path_len: i32) -> i32 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return 0;
@@ -163,7 +163,7 @@ pub extern "C" fn __nx_remove_file(path_ptr: i32, path_len: i32) -> i32 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_create_dir_all(path_ptr: i32, path_len: i32) -> i32 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return 0;
@@ -174,7 +174,7 @@ pub extern "C" fn __nx_create_dir_all(path_ptr: i32, path_len: i32) -> i32 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_read_dir(path_ptr: i32, path_len: i32) -> i64 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return 0;
@@ -199,7 +199,7 @@ pub extern "C" fn __nx_read_dir(path_ptr: i32, path_len: i32) -> i64 {
 // --- fd-based operations ---
 
 /// Opens a file for reading. Returns fd (>= 0) on success, -1 on error.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_fd_open_read(path_ptr: i32, path_len: i32) -> i64 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return -1;
@@ -215,7 +215,7 @@ pub extern "C" fn __nx_fd_open_read(path_ptr: i32, path_len: i32) -> i64 {
 }
 
 /// Opens a file for writing (truncate+create). Returns fd (>= 0) on success, -1 on error.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_fd_open_write(path_ptr: i32, path_len: i32) -> i64 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return -1;
@@ -236,7 +236,7 @@ pub extern "C" fn __nx_fd_open_write(path_ptr: i32, path_len: i32) -> i64 {
 }
 
 /// Opens a file for appending (create if not exists). Returns fd (>= 0) on success, -1 on error.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_fd_open_append(path_ptr: i32, path_len: i32) -> i64 {
     let Some(path) = read_required_string(path_ptr, path_len) else {
         return -1;
@@ -252,7 +252,7 @@ pub extern "C" fn __nx_fd_open_append(path_ptr: i32, path_len: i32) -> i64 {
 }
 
 /// Closes an fd. Returns 1 on success, 0 on bad fd.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_fd_close(fd: i64) -> i32 {
     match fd_take(fd) {
         Some(_entry) => 1, // File dropped here
@@ -262,7 +262,7 @@ pub extern "C" fn __nx_fd_close(fd: i64) -> i32 {
 
 /// Reads the entire file contents from fd. Seeks to 0 first.
 /// Returns packed ptr|len as i64 (0 on failure).
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_fd_read(fd: i64) -> i64 {
     let result = fd_with(fd, |entry| {
         let _ = entry.file.seek(SeekFrom::Start(0));
@@ -279,7 +279,7 @@ pub extern "C" fn __nx_fd_read(fd: i64) -> i64 {
 }
 
 /// Writes content to fd. Returns 1 on success, 0 on failure.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_fd_write(fd: i64, content_ptr: i32, content_len: i32) -> i32 {
     let Some(content) = read_optional_string(content_ptr, content_len) else {
         return 0;
@@ -294,7 +294,7 @@ pub extern "C" fn __nx_fd_write(fd: i64, content_ptr: i32, content_len: i32) -> 
 }
 
 /// Returns the path string for an fd. Returns packed ptr|len as i64 (0 on bad fd).
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_fd_path(fd: i64) -> i64 {
     let result = fd_with(fd, |entry| entry.path.clone());
     match result {

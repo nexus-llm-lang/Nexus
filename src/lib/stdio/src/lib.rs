@@ -1,18 +1,18 @@
 use std::io::{self, BufRead, Read, Write};
 
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn allocate(size: i32) -> i32 {
     nexus_wasm_alloc::allocate(size)
 }
 
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
     nexus_wasm_alloc::deallocate(ptr, size);
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_print(ptr: i32, len: i32) {
     let Some((offset, len)) = nexus_wasm_alloc::checked_ptr_len(ptr, len) else {
         return;
@@ -23,7 +23,7 @@ pub extern "C" fn __nx_print(ptr: i32, len: i32) {
     let _ = out.flush();
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_eprint(ptr: i32, len: i32) {
     let Some((offset, len)) = nexus_wasm_alloc::checked_ptr_len(ptr, len) else {
         return;
@@ -34,7 +34,7 @@ pub extern "C" fn __nx_eprint(ptr: i32, len: i32) {
     let _ = out.flush();
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_read_line() -> i64 {
     let stdin = io::stdin();
     let mut line = String::new();
@@ -53,7 +53,7 @@ pub extern "C" fn __nx_read_line() -> i64 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_getchar() -> i64 {
     let stdin = io::stdin();
     let mut buf = [0u8; 4]; // max UTF-8 bytes per char

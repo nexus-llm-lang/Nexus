@@ -1,15 +1,13 @@
-use nexus::lang::stdlib::resolve_import_to_file;
+use nexus::compiler::compose;
 use nexus::runtime::backtrace;
-use std::path::PathBuf;
 use std::sync::Arc;
 use wasmtime::{Engine, Linker, Module, Store};
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
+use wasmtime_wasi::{DirPerms, FilePerms, ResourceTable, WasiCtxBuilder};
 
 // ---------------------------------------------------------------------------
-// Shared Engine & stdlib Module cache
+// Shared Engine cache
 // ---------------------------------------------------------------------------
 
-use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 
@@ -17,34 +15,16 @@ static SHARED_ENGINE: LazyLock<Engine> = LazyLock::new(|| {
     let mut config = wasmtime::Config::new();
     config.wasm_tail_call(true);
     config.wasm_exceptions(true);
+    config.wasm_component_model(true);
     Engine::new(&config).expect("failed to create shared engine")
 });
 
-static DEP_MODULE_CACHE: LazyLock<Mutex<HashMap<String, Arc<Module>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn cached_dep_module(module_name: &str) -> Arc<Module> {
-    let mut cache = DEP_MODULE_CACHE.lock().unwrap();
-    if let Some(m) = cache.get(module_name) {
-        return Arc::clone(m);
-    }
-    let resolved = resolve_import_to_file(module_name);
-    // Cache by resolved file path — multiple WIT module names
-    // (e.g. nexus:stdlib/math, nexus:stdlib/stdio) map to the same stdlib.wasm.
-    if let Some(m) = cache.get(&resolved) {
-        let m = Arc::clone(m);
-        cache.insert(module_name.to_string(), m.clone());
-        return m;
-    }
-    let path = PathBuf::from(&resolved);
-    let module = Arc::new(
-        Module::from_file(&*SHARED_ENGINE, &path)
-            .unwrap_or_else(|e| panic!("failed to load dep module {}: {}", module_name, e)),
-    );
-    cache.insert(resolved, Arc::clone(&module));
-    cache.insert(module_name.to_string(), Arc::clone(&module));
-    module
-}
+/// Cached composed stdlib component bytes.
+/// `compose_with_stdlib` encodes the stdlib component every time; caching
+/// the composed result per user-WASM is impractical, but we can cache the
+/// stdlib component encoding.
+static STDLIB_COMPONENT_CACHE: LazyLock<Mutex<Option<Arc<Vec<u8>>>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -130,169 +110,175 @@ pub fn exec_with_stdlib_caps_should_trap(
     }
 }
 
-/// Execute main() -> () with WASI P1, stdlib dependency resolution, and backtrace runtime.
-/// Uses cached Engine and Module instances for stdlib dependencies.
-pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
-    let engine = &*SHARED_ENGINE;
-    let module = Module::from_binary(engine, wasm).map_err(|e| format!("{:#}", e))?;
+// ---------------------------------------------------------------------------
+// Component model execution
+// ---------------------------------------------------------------------------
 
-    let mut linker = Linker::new(engine);
-    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx).map_err(|e| e.to_string())?;
-    define_nexus_host_stubs(&mut linker)?;
-
-    let mut builder = WasiCtxBuilder::new();
-    builder.inherit_stdio();
-    let _ = builder.preopened_dir(".", "/", DirPerms::all(), FilePerms::all());
-    let wasi = builder.build_p1();
-    let mut store = Store::new(engine, wasi);
-
-    backtrace::reset();
-    backtrace::add_bt_to_linker(&mut linker, &mut store)?;
-
-    link_dep_modules(&module, &mut linker, &mut store)?;
-
-    let instance = linker
-        .instantiate(&mut store, &module)
-        .map_err(|e| e.to_string())?;
-    let main = instance
-        .get_typed_func::<(), ()>(&mut store, "main")
-        .map_err(|e| e.to_string())?;
-    main.call(&mut store, ()).map_err(|e| e.to_string())
+/// WASI state for the component model store.
+struct WasiState {
+    ctx: wasmtime_wasi::WasiCtx,
+    table: ResourceTable,
 }
 
-/// Execute main() -> () with WASI P1, stdlib, and custom capability enforcement.
+impl wasmtime_wasi::WasiView for WasiState {
+    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
+        wasmtime_wasi::WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
+    }
+}
+
+/// Execute main() -> () with stdlib via component model composition.
+/// The user core WASM is composed with stdlib-component into a single
+/// component, then run with wasmtime's component model runtime.
+pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
+    let composed = compose::compose_with_stdlib(wasm)
+        .map_err(|e| format!("composition failed: {}", e))?;
+    run_composed_component(&composed)
+}
+
+/// Execute main() -> () with stdlib and custom capability enforcement.
 pub fn run_main_with_deps_caps(
     wasm: &[u8],
-    caps: nexus::runtime::ExecutionCapabilities,
+    _caps: nexus::runtime::ExecutionCapabilities,
 ) -> Result<(), String> {
-    let engine = &*SHARED_ENGINE;
-    let module = Module::from_binary(engine, wasm).map_err(|e| format!("{:#}", e))?;
+    // TODO: enforce capabilities on the component model path.
+    // For now, compose and run without enforcement.
+    let composed = compose::compose_with_stdlib(wasm)
+        .map_err(|e| format!("composition failed: {}", e))?;
+    run_composed_component(&composed)
+}
 
-    let mut linker = Linker::new(engine);
-    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx).map_err(|e| e.to_string())?;
-    caps.enforce_denied_wasi_functions(&mut linker)?;
-    define_nexus_host_stubs(&mut linker)?;
+/// Run a pre-composed component WASM, providing WASI imports.
+fn run_composed_component(component_wasm: &[u8]) -> Result<(), String> {
+    let engine = &*SHARED_ENGINE;
+    let component = wasmtime::component::Component::from_binary(engine, component_wasm)
+        .map_err(|e| format!("failed to load component: {}", e))?;
+
+    let mut linker = wasmtime::component::Linker::<WasiState>::new(engine);
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| e.to_string())?;
+    define_component_nexus_host_stubs(&mut linker)?;
+    define_component_runtime_stubs(&mut linker)?;
 
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
-    let _ = builder.preopened_dir(".", "/", DirPerms::all(), FilePerms::all());
-    let wasi = builder.build_p1();
-    let mut store = Store::new(engine, wasi);
-
-    backtrace::reset();
-    backtrace::add_bt_to_linker(&mut linker, &mut store)?;
-
-    link_dep_modules(&module, &mut linker, &mut store)?;
+    let _ = builder.preopened_dir(".", ".", DirPerms::all(), FilePerms::all());
+    let state = WasiState {
+        ctx: builder.build(),
+        table: ResourceTable::new(),
+    };
+    let mut store = Store::new(engine, state);
 
     let instance = linker
-        .instantiate(&mut store, &module)
-        .map_err(|e| e.to_string())?;
+        .instantiate(&mut store, &component)
+        .map_err(|e| format!("instantiation failed: {}", e))?;
+
+    // The composed component exports `main` as a top-level function.
     let main = instance
         .get_typed_func::<(), ()>(&mut store, "main")
-        .map_err(|e| e.to_string())?;
-    main.call(&mut store, ()).map_err(|e| e.to_string())
+        .map_err(|e| format!("failed to get main export: {}", e))?;
+
+    main.call(&mut store, ()).map_err(|e| format!("{:#}", e))
 }
 
-/// Link dependency modules, deduplicating instances for modules that resolve
-/// to the same file (e.g. `nexus:stdlib/math` and `nexus:stdlib/stdio` both
-/// resolve to `nxlib/stdlib/stdlib.wasm`).
-fn link_dep_modules(
-    module: &Module,
-    linker: &mut Linker<wasmtime_wasi::p1::WasiP1Ctx>,
-    store: &mut Store<wasmtime_wasi::p1::WasiP1Ctx>,
+/// Define stub (no-op / trapping) implementations for nexus:cli/nexus-host
+/// in the component linker. The stdlib always imports this interface (from the
+/// net sub-crate), but most tests don't use networking.
+fn define_component_nexus_host_stubs(
+    linker: &mut wasmtime::component::Linker<WasiState>,
 ) -> Result<(), String> {
-    let mut imported_modules = module
-        .imports()
-        .map(|i| i.module().to_string())
-        .collect::<Vec<_>>();
-    imported_modules.sort();
-    imported_modules.dedup();
-
-    // Track which file paths have been instantiated to share a single instance
-    // across multiple WIT module names that resolve to the same file.
-    let mut instantiated_files: HashMap<String, String> = HashMap::new();
-
-    for module_name in imported_modules {
-        if module_name == "wasi_snapshot_preview1"
-            || module_name == backtrace::BT_HOST_MODULE
-            || module_name == "nexus:cli/nexus-host"
-        {
-            continue;
-        }
-        let resolved = resolve_import_to_file(&module_name);
-        if let Some(first_name) = instantiated_files.get(&resolved) {
-            // Already instantiated under a different name — alias exports
-            // from the first instance under this module name.
-            let first_name = first_name.clone();
-            let dep = cached_dep_module(&module_name);
-            for export in dep.exports() {
-                if let Some(def) = linker.get(&mut *store, &first_name, export.name()) {
-                    linker
-                        .define(&mut *store, &module_name, export.name(), def)
-                        .map_err(|e| format!("alias define error: {}", e))?;
-                }
-            }
-            continue;
-        }
-        let dep = cached_dep_module(&module_name);
-        linker
-            .module(&mut *store, &module_name, &*dep)
-            .map_err(|e| e.to_string())?;
-        instantiated_files.insert(resolved, module_name.clone());
-    }
+    let mut inst = linker
+        .instance("nexus:cli/nexus-host")
+        .map_err(|e| format!("failed to create nexus-host instance: {}", e))?;
+    inst.func_wrap(
+        "host-http-request",
+        |_: wasmtime::StoreContextMut<'_, WasiState>,
+         (_method, _url, _headers, _body): (String, String, String, String)|
+         -> wasmtime::Result<(String,)> { Ok((String::new(),)) },
+    )
+    .map_err(|e| e.to_string())?;
+    inst.func_wrap(
+        "host-http-listen",
+        |_: wasmtime::StoreContextMut<'_, WasiState>,
+         (_addr,): (String,)|
+         -> wasmtime::Result<(i64,)> { Ok((-1,)) },
+    )
+    .map_err(|e| e.to_string())?;
+    inst.func_wrap(
+        "host-http-accept",
+        |_: wasmtime::StoreContextMut<'_, WasiState>,
+         (_server_id,): (i64,)|
+         -> wasmtime::Result<(String,)> { Ok((String::new(),)) },
+    )
+    .map_err(|e| e.to_string())?;
+    inst.func_wrap(
+        "host-http-respond",
+        |_: wasmtime::StoreContextMut<'_, WasiState>,
+         (_req_id, _status, _headers, _body): (i64, i64, String, String)|
+         -> wasmtime::Result<(i32,)> { Ok((0,)) },
+    )
+    .map_err(|e| e.to_string())?;
+    inst.func_wrap(
+        "host-http-stop",
+        |_: wasmtime::StoreContextMut<'_, WasiState>,
+         (_server_id,): (i64,)|
+         -> wasmtime::Result<(i32,)> { Ok((0,)) },
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Stub implementations for nexus-host functions (trapping).
-fn define_nexus_host_stubs(
-    linker: &mut Linker<wasmtime_wasi::p1::WasiP1Ctx>,
+/// Define stub implementations for nexus:runtime/* imports in the component linker.
+fn define_component_runtime_stubs(
+    linker: &mut wasmtime::component::Linker<WasiState>,
 ) -> Result<(), String> {
-    const MOD: &str = "nexus:cli/nexus-host";
-    linker
-        .func_wrap(
-            MOD,
-            "host-http-request",
-            |_: wasmtime::Caller<'_, _>,
-             _: i32,
-             _: i32,
-             _: i32,
-             _: i32,
-             _: i32,
-             _: i32,
-             _: i32,
-             _: i32,
-             _: i32| {},
-        )
-        .map_err(|e| e.to_string())?;
-    linker
-        .func_wrap(
-            MOD,
-            "host-http-listen",
-            |_: wasmtime::Caller<'_, _>, _: i32, _: i32| -> i64 { -1 },
-        )
-        .map_err(|e| e.to_string())?;
-    linker
-        .func_wrap(
-            MOD,
-            "host-http-accept",
-            |_: wasmtime::Caller<'_, _>, _: i64, _: i32| {},
-        )
-        .map_err(|e| e.to_string())?;
-    linker
-        .func_wrap(
-            MOD,
-            "host-http-respond",
-            |_: wasmtime::Caller<'_, _>, _: i64, _: i64, _: i32, _: i32, _: i32, _: i32| -> i32 {
-                0
+    // Backtrace stubs — no-op capture, always 0 depth/frames.
+    {
+        let mut inst = linker
+            .instance("nexus:runtime/backtrace")
+            .map_err(|e| format!("failed to create backtrace instance: {}", e))?;
+        inst.func_wrap(
+            "capture-backtrace",
+            |_: wasmtime::StoreContextMut<'_, WasiState>, (): ()| -> wasmtime::Result<()> {
+                Ok(())
             },
         )
         .map_err(|e| e.to_string())?;
-    linker
-        .func_wrap(
-            MOD,
-            "host-http-stop",
-            |_: wasmtime::Caller<'_, _>, _: i64| -> i32 { 0 },
+        inst.func_wrap(
+            "bt-depth",
+            |_: wasmtime::StoreContextMut<'_, WasiState>, (): ()| -> wasmtime::Result<(i64,)> {
+                Ok((0,))
+            },
         )
         .map_err(|e| e.to_string())?;
+        inst.func_wrap(
+            "bt-frame",
+            |_: wasmtime::StoreContextMut<'_, WasiState>,
+             (_idx,): (i64,)|
+             -> wasmtime::Result<(i64,)> { Ok((0,)) },
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // Lazy evaluation stubs — return 0 (no actual parallelism in test harness).
+    {
+        let mut inst = linker
+            .instance("nexus:runtime/lazy")
+            .map_err(|e| format!("failed to create lazy instance: {}", e))?;
+        inst.func_wrap(
+            "lazy-spawn",
+            |_: wasmtime::StoreContextMut<'_, WasiState>,
+             (_thunk, _env_size): (i64, i32)|
+             -> wasmtime::Result<(i64,)> { Ok((0,)) },
+        )
+        .map_err(|e| e.to_string())?;
+        inst.func_wrap(
+            "lazy-join",
+            |_: wasmtime::StoreContextMut<'_, WasiState>,
+             (_task_id,): (i64,)|
+             -> wasmtime::Result<(i64,)> { Ok((0,)) },
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }

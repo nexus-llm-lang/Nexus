@@ -15,23 +15,23 @@ thread_local! {
 }
 
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn allocate(size: i32) -> i32 {
     nexus_wasm_alloc::allocate(size)
 }
 
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
     nexus_wasm_alloc::deallocate(ptr, size);
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_exit(status: i64) {
     std::process::exit(status as i32);
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_get_env(key_ptr: i32, key_len: i32) -> i64 {
     let Some((offset, len)) = checked_ptr_len(key_ptr, key_len) else {
         return 0;
@@ -44,7 +44,7 @@ pub extern "C" fn __nx_get_env(key_ptr: i32, key_len: i32) -> i64 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_set_env(
     key_ptr: i32,
     key_len: i32,
@@ -66,7 +66,7 @@ pub extern "C" fn __nx_set_env(
     unsafe { std::env::set_var(key.as_ref(), val.as_ref()) };
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_argv() -> i64 {
     let args: Vec<String> = std::env::args().collect();
     let joined = args.join("\n");
@@ -76,7 +76,7 @@ pub extern "C" fn __nx_argv() -> i64 {
 // ── Subprocess execution ────────────────────────────────────────────
 
 /// Executes a command with newline-separated args. Returns a handle ID.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_exec(cmd_ptr: i32, cmd_len: i32, args_ptr: i32, args_len: i32) -> i64 {
     let Some((c_off, c_len)) = checked_ptr_len(cmd_ptr, cmd_len) else {
         return store_exec_result(-1, String::new(), "invalid command pointer".into());
@@ -129,13 +129,13 @@ fn store_exec_result(exit_code: i64, stdout: String, stderr: String) -> i64 {
 }
 
 /// Returns the exit code of an exec result.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_exec_exit_code(id: i64) -> i64 {
     EXEC_RESULTS.with(|r| r.borrow().get(&id).map_or(-1, |r| r.exit_code))
 }
 
 /// Returns the stdout of an exec result.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_exec_stdout(id: i64) -> i64 {
     EXEC_RESULTS.with(|r| {
         r.borrow()
@@ -145,7 +145,7 @@ pub extern "C" fn __nx_exec_stdout(id: i64) -> i64 {
 }
 
 /// Returns the stderr of an exec result.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_exec_stderr(id: i64) -> i64 {
     EXEC_RESULTS.with(|r| {
         r.borrow()
@@ -155,7 +155,7 @@ pub extern "C" fn __nx_exec_stderr(id: i64) -> i64 {
 }
 
 /// Frees an exec result handle.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_exec_free(id: i64) -> i32 {
     EXEC_RESULTS.with(|r| if r.borrow_mut().remove(&id).is_some() { 1 } else { 0 })
 }

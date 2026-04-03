@@ -109,7 +109,7 @@ pub fn add_bt_to_linker<T: Send + 'static>(
     linker
         .func_wrap(
             BT_HOST_MODULE,
-            "__nx_capture_backtrace",
+            "capture-backtrace",
             |caller: Caller<'_, T>| {
                 let bt = WasmBacktrace::capture(&caller);
                 let frames: Vec<String> = bt
@@ -135,7 +135,7 @@ pub fn add_bt_to_linker<T: Send + 'static>(
 
     // Return number of captured frames
     linker
-        .func_wrap(BT_HOST_MODULE, "__nx_bt_depth", || -> i64 {
+        .func_wrap(BT_HOST_MODULE, "bt-depth", || -> i64 {
             BT_FRAMES.with(|f| f.borrow().len() as i64)
         })
         .map_err(|e| e.to_string())?;
@@ -144,7 +144,7 @@ pub fn add_bt_to_linker<T: Send + 'static>(
     linker
         .func_wrap(
             BT_HOST_MODULE,
-            "__nx_bt_frame",
+            "bt-frame",
             |mut caller: Caller<'_, T>, idx: i64| -> i64 {
                 let name = BT_FRAMES.with(|f| {
                     let frames = f.borrow();
