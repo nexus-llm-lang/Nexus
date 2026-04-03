@@ -896,7 +896,10 @@ impl MirBuilder {
     ) -> Result<Vec<MirStmt>, HirBuildError> {
         match stmt {
             Stmt::Let {
-                name, sigil, typ, value,
+                name,
+                sigil,
+                typ,
+                value,
             } => {
                 // Track variable types for closure capture resolution
                 if let Some(t) = typ {
@@ -937,8 +940,7 @@ impl MirBuilder {
                         node: Stmt::Return(value.clone()),
                         span: value.span.clone(),
                     }];
-                    let captures =
-                        collect_ast_free_vars(&thunk_body, &param_names, &known_names);
+                    let captures = collect_ast_free_vars(&thunk_body, &param_names, &known_names);
 
                     // Build capture params
                     let capture_params: Vec<MirParam> = captures
@@ -1056,10 +1058,7 @@ impl MirBuilder {
                 target: self.convert_expr(target, rename_map, scope)?,
                 value: self.convert_expr(value, rename_map, scope)?,
             }]),
-            Stmt::Try {
-                body,
-                catch_arms,
-            } => {
+            Stmt::Try { body, catch_arms } => {
                 let mir_body = self.convert_stmts(body, rename_map, scope)?;
                 // Check if this is a legacy single-arm catch with variable pattern
                 if catch_arms.len() == 1 {
@@ -1642,10 +1641,7 @@ fn collect_ast_stmt_refs(
             collect_ast_expr_refs(&target.node, defined, referenced, seen, known);
             collect_ast_expr_refs(&value.node, defined, referenced, seen, known);
         }
-        Stmt::Try {
-            body,
-            catch_arms,
-        } => {
+        Stmt::Try { body, catch_arms } => {
             for s in body {
                 collect_ast_stmt_refs(&s.node, defined, referenced, seen, known);
             }

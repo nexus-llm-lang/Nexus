@@ -114,7 +114,7 @@ pub(super) fn register_nullary_variant_constructor(
 pub(super) fn register_exception_variant(
     env: &mut TypeEnv,
     exception: &ExceptionDef,
-    span: &Span,
+    _span: &Span,
 ) -> Result<(), TypeError> {
     {
         let exn = env
@@ -360,7 +360,9 @@ pub(super) fn is_auto_droppable(typ: &Type) -> bool {
         | Type::String
         | Type::Unit
         | Type::Array(_) => true,
-        Type::Linear(inner) | Type::Lazy(inner) | Type::Borrow(inner) | Type::Ref(inner) => is_auto_droppable(inner),
+        Type::Linear(inner) | Type::Lazy(inner) | Type::Borrow(inner) | Type::Ref(inner) => {
+            is_auto_droppable(inner)
+        }
         _ => false,
     }
 }
@@ -645,9 +647,11 @@ pub(super) fn contains_named_throws(t: &Type, effect_name: &str) -> bool {
                 || contains_named_throws(req, effect_name)
                 || contains_named_throws(eff, effect_name)
         }
-        Type::Ref(inner) | Type::Linear(inner) | Type::Lazy(inner) | Type::Borrow(inner) | Type::Array(inner) => {
-            contains_named_throws(inner, effect_name)
-        }
+        Type::Ref(inner)
+        | Type::Linear(inner)
+        | Type::Lazy(inner)
+        | Type::Borrow(inner)
+        | Type::Array(inner) => contains_named_throws(inner, effect_name),
         Type::Row(effs, tail) => {
             effs.iter().any(|e| contains_named_throws(e, effect_name))
                 || tail
@@ -699,10 +703,7 @@ pub(super) fn contains_return(body: &[Spanned<Stmt>]) -> bool {
         Stmt::Expr(e) => expr_contains_return(e),
         Stmt::Try {
             body, catch_arms, ..
-        } => {
-            contains_return(body)
-                || catch_arms.iter().any(|arm| contains_return(&arm.body))
-        }
+        } => contains_return(body) || catch_arms.iter().any(|arm| contains_return(&arm.body)),
         Stmt::Inject { body, .. } => contains_return(body),
         _ => false,
     }) || body_ends_with_tail_expr(body)

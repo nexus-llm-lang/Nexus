@@ -116,10 +116,7 @@ fn collect_stmt_captures(
                     captures,
                 );
             }
-            Stmt::Try {
-                body,
-                catch_arms,
-            } => {
+            Stmt::Try { body, catch_arms } => {
                 collect_stmt_captures(
                     body,
                     outer_keys,

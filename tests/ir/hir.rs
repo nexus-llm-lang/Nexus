@@ -105,4 +105,3 @@ fn snapshot_hir_while_loop() {
     let mir = parse_and_build_mir(src).unwrap();
     insta::assert_debug_snapshot!(mir);
 }
-
