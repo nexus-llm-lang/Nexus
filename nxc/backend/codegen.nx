@@ -53,6 +53,7 @@ import { build_type_section, build_import_section, build_function_section,
          build_table_section, build_element_section, emit_closure_type_entries,
          build_tag_section } from "nxc/backend/wasm_section.nx"
 import * as list from "stdlib/list.nx"
+import { contains, starts_with } from "stdlib/string.nx"
 import { SymbolNotFound } from "nxc/common/error.nx"
 
 // ─── TCMC (Tail Call Modulo Constructor) ─────────────────────────────────────
@@ -1038,10 +1039,74 @@ end
 let emit_external_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
                                ext_idx: i64) -> %ByteBuffer throws { Exn } do
   match find_external(name: func, exts: ctx_externals(ctx: ctx)) do
-    case Some(val: LirExternal(name: _, wasm_module: _, wasm_name: _, params: params, ret_type: _, throw_row: _)) ->
+    case Some(val: LirExternal(name: _, wasm_module: m, wasm_name: _, params: params, ret_type: rt, throw_row: _)) ->
+      let canonical_str_ret = contains(s: m, sub: ":")
+        && starts_with(s: m, prefix: "nexus:runtime/") == false
+        && (match peel_linear(typ: rt) do case TyString -> true case _ -> false end)
+      let %buf = if canonical_str_ret then
+        // Allocate 8-byte retptr (4-byte aligned) for canonical string return.
+        // aligned_ptr = (global.get 0 + 3) & ~3
+        let retptr_local = ctx_temps_base(ctx: ctx)
+        let %buf = push_byte(buf: %buf, byte: op_global_get)
+        let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
+        let %buf = push_byte(buf: %buf, byte: op_i32_const)
+        let %buf = push_sleb128(buf: %buf, val: 3)
+        let %buf = push_byte(buf: %buf, byte: op_i32_add)
+        let %buf = push_byte(buf: %buf, byte: op_i32_const)
+        let %buf = push_sleb128(buf: %buf, val: -4)
+        let %buf = push_byte(buf: %buf, byte: op_i32_and)
+        let %buf = push_byte(buf: %buf, byte: op_local_tee)
+        let %buf = push_uleb128(buf: %buf, val: retptr_local)
+        // Advance heap: global.set 0 = aligned_ptr + 8
+        let %buf = push_byte(buf: %buf, byte: op_i32_const)
+        let %buf = push_sleb128(buf: %buf, val: 8)
+        let %buf = push_byte(buf: %buf, byte: op_i32_add)
+        let %buf = push_byte(buf: %buf, byte: op_global_set)
+        push_uleb128(buf: %buf, val: heap_global_idx)
+      else %buf end
       let %buf = emit_external_call_args(buf: %buf, args: args, params: params, ctx: ctx)
+      // For canonical string return: push retptr as last argument
+      let %buf = if canonical_str_ret then
+        let retptr_local = ctx_temps_base(ctx: ctx)
+        let %buf = push_byte(buf: %buf, byte: op_local_get)
+        push_uleb128(buf: %buf, val: retptr_local)
+      else %buf end
       let %buf = push_byte(buf: %buf, byte: op_call)
-      return push_uleb128(buf: %buf, val: ext_idx)
+      let %buf = push_uleb128(buf: %buf, val: ext_idx)
+      // For canonical string return: read (ptr, len) from retptr and pack to i64
+      let %buf = if canonical_str_ret then
+        let retptr_local = ctx_temps_base(ctx: ctx)
+        let tmp_ptr = ctx_temps_base(ctx: ctx) + 1
+        let tmp_len = ctx_temps_base(ctx: ctx) + 2
+        // Load ptr (i32) from retptr+0
+        let %buf = push_byte(buf: %buf, byte: op_local_get)
+        let %buf = push_uleb128(buf: %buf, val: retptr_local)
+        let %buf = push_byte(buf: %buf, byte: op_i32_load)
+        let %buf = push_byte(buf: %buf, byte: 2)
+        let %buf = push_uleb128(buf: %buf, val: 0)
+        let %buf = push_byte(buf: %buf, byte: op_local_set)
+        let %buf = push_uleb128(buf: %buf, val: tmp_ptr)
+        // Load len (i32) from retptr+4
+        let %buf = push_byte(buf: %buf, byte: op_local_get)
+        let %buf = push_uleb128(buf: %buf, val: retptr_local)
+        let %buf = push_byte(buf: %buf, byte: op_i32_load)
+        let %buf = push_byte(buf: %buf, byte: 2)
+        let %buf = push_uleb128(buf: %buf, val: 4)
+        let %buf = push_byte(buf: %buf, byte: op_local_set)
+        let %buf = push_uleb128(buf: %buf, val: tmp_len)
+        // Pack: (ptr_i64 << 32) | len_i64
+        let %buf = push_byte(buf: %buf, byte: op_local_get)
+        let %buf = push_uleb128(buf: %buf, val: tmp_ptr)
+        let %buf = push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+        let %buf = push_byte(buf: %buf, byte: op_i64_const)
+        let %buf = push_sleb128(buf: %buf, val: 32)
+        let %buf = push_byte(buf: %buf, byte: op_i64_shl)
+        let %buf = push_byte(buf: %buf, byte: op_local_get)
+        let %buf = push_uleb128(buf: %buf, val: tmp_len)
+        let %buf = push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+        push_byte(buf: %buf, byte: op_i64_or)
+      else %buf end
+      return %buf
     case None ->
       raise SymbolNotFound(name: func, kind: "function", context: "external call")
       return %buf

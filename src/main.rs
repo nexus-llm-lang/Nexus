@@ -50,6 +50,7 @@ fn main() -> ExitCode {
             explain_capabilities_format,
             cli.verbose,
         ),
+        Some(Command::Compose { input, output }) => compose_command(input, output),
         None => {
             eprintln!("No command specified. Use `nexus build <file>` or `nexus --help`.");
             ExitCode::from(1)
@@ -100,6 +101,30 @@ fn build_command(
         .to_string_lossy();
     let caps = runtime::parse_nexus_capabilities(&final_wasm);
     artifact::print_build_result(&output_name, &caps, &explain, &format);
+    ExitCode::SUCCESS
+}
+
+fn compose_command(input: std::path::PathBuf, output: Option<std::path::PathBuf>) -> ExitCode {
+    let core_wasm = match fs::read(&input) {
+        Ok(wasm) => wasm,
+        Err(e) => {
+            eprintln!("Failed to read {}: {}", input.display(), e);
+            return ExitCode::from(1);
+        }
+    };
+    let composed = match nexus::compiler::compose::compose_with_stdlib(&core_wasm) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Composition Error: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+    let output_path = output.unwrap_or_else(|| std::path::PathBuf::from("composed.wasm"));
+    if let Err(e) = fs::write(&output_path, &composed) {
+        eprintln!("Failed to write {}: {}", output_path.display(), e);
+        return ExitCode::from(1);
+    }
+    eprintln!("Composed {}", output_path.display());
     ExitCode::SUCCESS
 }
 
