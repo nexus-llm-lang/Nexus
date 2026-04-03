@@ -320,31 +320,33 @@ pub(super) fn default_numeric_literals(typ: &Type) -> Type {
 }
 
 pub(super) fn select_int_type(left: &Type, right: &Type) -> Option<Type> {
-    if matches!(left, Type::I32) || matches!(right, Type::I32) {
-        return Some(Type::I32);
+    match (left, right) {
+        (Type::IntLit | Type::Var(_), Type::IntLit | Type::Var(_)) => Some(Type::I64),
+        (Type::IntLit | Type::Var(_), Type::I32) | (Type::I32, Type::IntLit | Type::Var(_)) => {
+            Some(Type::I32)
+        }
+        (Type::IntLit | Type::Var(_), Type::I64) | (Type::I64, Type::IntLit | Type::Var(_)) => {
+            Some(Type::I64)
+        }
+        (Type::I32, Type::I32) => Some(Type::I32),
+        (Type::I64, Type::I64) => Some(Type::I64),
+        _ => None,
     }
-    if matches!(left, Type::I64) || matches!(right, Type::I64) {
-        return Some(Type::I64);
-    }
-    if matches!(left, Type::IntLit | Type::Var(_)) && matches!(right, Type::IntLit | Type::Var(_)) {
-        return Some(Type::I64);
-    }
-    None
 }
 
 pub(super) fn select_float_type(left: &Type, right: &Type) -> Option<Type> {
-    if matches!(left, Type::F32) || matches!(right, Type::F32) {
-        return Some(Type::F32);
+    match (left, right) {
+        (Type::FloatLit | Type::Var(_), Type::FloatLit | Type::Var(_)) => Some(Type::F64),
+        (Type::FloatLit | Type::Var(_), Type::F32) | (Type::F32, Type::FloatLit | Type::Var(_)) => {
+            Some(Type::F32)
+        }
+        (Type::FloatLit | Type::Var(_), Type::F64) | (Type::F64, Type::FloatLit | Type::Var(_)) => {
+            Some(Type::F64)
+        }
+        (Type::F32, Type::F32) => Some(Type::F32),
+        (Type::F64, Type::F64) => Some(Type::F64),
+        _ => None,
     }
-    if matches!(left, Type::F64) || matches!(right, Type::F64) {
-        return Some(Type::F64);
-    }
-    if matches!(left, Type::FloatLit | Type::Var(_))
-        && matches!(right, Type::FloatLit | Type::Var(_))
-    {
-        return Some(Type::F64);
-    }
-    None
 }
 
 pub(super) fn is_auto_droppable(typ: &Type) -> bool {
