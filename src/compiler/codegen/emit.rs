@@ -249,6 +249,8 @@ pub(super) fn return_type_to_wasm_result(ret: &Type) -> Result<Vec<ValType>, Cod
 }
 
 pub(super) fn external_param_types(ext: &LirExternal) -> Result<Vec<ValType>, CodegenError> {
+    use super::string::string_abi_for_external;
+    let abi = string_abi_for_external(ext);
     let mut out = Vec::new();
     for param in &ext.params {
         match peel_linear(&param.typ) {
@@ -257,6 +259,7 @@ pub(super) fn external_param_types(ext: &LirExternal) -> Result<Vec<ValType>, Co
             Type::F32 => out.push(ValType::F32),
             Type::F64 => out.push(ValType::F64),
             Type::String => {
+                // Both ABIs pass strings as (ptr: i32, len: i32)
                 out.push(ValType::I32);
                 out.push(ValType::I32);
             }
@@ -275,10 +278,18 @@ pub(super) fn external_param_types(ext: &LirExternal) -> Result<Vec<ValType>, Co
             }
         }
     }
+    // Canonical ABI: string returns use a retptr as the last parameter
+    if abi == super::string::StringABI::Canonical
+        && matches!(peel_linear(&ext.ret_type), Type::String)
+    {
+        out.push(ValType::I32); // retptr
+    }
     Ok(out)
 }
 
 pub(super) fn external_return_types(ext: &LirExternal) -> Result<Vec<ValType>, CodegenError> {
+    use super::string::string_abi_for_external;
+    let abi = string_abi_for_external(ext);
     // FFI ABI boundary: only a restricted set of types can be returned from externals.
     match peel_linear(&ext.ret_type) {
         Type::Unit => Ok(vec![]),
@@ -286,7 +297,12 @@ pub(super) fn external_return_types(ext: &LirExternal) -> Result<Vec<ValType>, C
         Type::I64 => Ok(vec![ValType::I64]),
         Type::F32 => Ok(vec![ValType::F32]),
         Type::F64 => Ok(vec![ValType::F64]),
-        Type::String => Ok(vec![ValType::I64]),
+        Type::String => match abi {
+            // Packed ABI: string returned as packed i64 in a single value
+            super::string::StringABI::Packed => Ok(vec![ValType::I64]),
+            // Canonical ABI: string written to retptr, function returns void
+            super::string::StringABI::Canonical => Ok(vec![]),
+        },
         other => Err(CodegenError::UnsupportedExternalReturnType {
             typ: other.to_string(),
         }),

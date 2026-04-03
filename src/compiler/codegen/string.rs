@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use wasm_encoder::{Function, Instruction, MemArg, ValType};
 
 use crate::intern::Symbol;
-use crate::ir::lir::LirAtom;
+use crate::ir::lir::{LirAtom, LirExternal};
 use crate::types::{BinaryOp, Type};
 
 use super::emit::peel_linear;
@@ -12,8 +12,88 @@ use super::function::compile_atom;
 use super::layout::{CodegenLayout, PackedString};
 use super::{FunctionTemps, LocalInfo, OBJECT_HEAP_GLOBAL_INDEX};
 
+/// String ABI mode for cross-boundary function calls.
+///
+/// Controls how strings are passed across the component boundary:
+/// - `Packed`: Internal i64 encoding `(ptr << 32) | len`. Used for core WASM module bundling
+///   where caller and callee share the same linear memory.
+/// - `Canonical`: Component model canonical ABI. Strings passed as `(ptr: i32, len: i32)`,
+///   returns use a retptr parameter. Used for component model boundaries where each
+///   component has its own linear memory and strings are copied via canonical lift/lower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringABI {
+    /// Packed i64: `(ptr << 32) | len`. Shared linear memory.
+    Packed,
+    /// Canonical ABI: two i32s `(ptr, len)`, retptr for string returns.
+    Canonical,
+}
+
+/// Determine the string ABI for an external function based on its import module.
+///
+/// Component-model imports use WIT-style identifiers (containing `:`),
+/// e.g. `nexus:stdlib/string-ops`. File-path imports (e.g. `stdlib/stdlib.wasm`)
+/// use the packed ABI for shared-memory bundling.
+pub(super) fn string_abi_for_external(ext: &LirExternal) -> StringABI {
+    let module = ext.wasm_module.as_ref();
+    // WIT-style module names contain ':' (e.g. "nexus:stdlib/math")
+    // but exclude runtime modules that use the packed convention
+    if module.contains(':') && !module.starts_with("nexus:runtime/") {
+        StringABI::Canonical
+    } else {
+        StringABI::Packed
+    }
+}
+
+/// Check if an external function returns a string via the canonical ABI retptr convention.
+pub(super) fn external_uses_canonical_string_return(ext: &LirExternal) -> bool {
+    string_abi_for_external(ext) == StringABI::Canonical
+        && matches!(peel_linear(&ext.ret_type), Type::String)
+}
+
 pub(super) fn pack_string(s: PackedString) -> i64 {
     (((s.offset as u64) << 32) | (s.len as u64)) as i64
+}
+
+/// Emit WASM instructions for a canonical ABI string return.
+///
+/// After calling a canonical-ABI function that returns a string via retptr:
+/// 1. Load ptr (i32) from retptr+0
+/// 2. Load len (i32) from retptr+4
+/// 3. Pack into i64 for internal use
+///
+/// `retptr_local` is the i32 local holding the return pointer address.
+pub(super) fn emit_canonical_string_return_unpack(
+    out: &mut Function,
+    retptr_local: u32,
+    tmp_ptr: u32,
+    tmp_len: u32,
+) {
+    // Load ptr from retptr+0
+    out.instruction(&Instruction::LocalGet(retptr_local));
+    out.instruction(&Instruction::I32Load(MemArg {
+        offset: 0,
+        align: 2, // 4-byte aligned
+        memory_index: 0,
+    }));
+    out.instruction(&Instruction::LocalSet(tmp_ptr));
+
+    // Load len from retptr+4
+    out.instruction(&Instruction::LocalGet(retptr_local));
+    out.instruction(&Instruction::I32Load(MemArg {
+        offset: 4,
+        align: 2,
+        memory_index: 0,
+    }));
+    out.instruction(&Instruction::LocalSet(tmp_len));
+
+    // Pack into i64
+    out.instruction(&Instruction::LocalGet(tmp_ptr));
+    out.instruction(&Instruction::I64ExtendI32U);
+    out.instruction(&Instruction::I64Const(32));
+    out.instruction(&Instruction::I64Shl);
+    out.instruction(&Instruction::LocalGet(tmp_len));
+    out.instruction(&Instruction::I64ExtendI32U);
+    out.instruction(&Instruction::I64Or);
 }
 
 pub(super) fn memarg_i8() -> MemArg {

@@ -10,6 +10,7 @@ mod string;
 
 pub use error::{CodegenError, CompileError, CompileMetrics};
 pub use module::compile_lir_to_wasm;
+pub use string::StringABI;
 
 use std::borrow::Cow;
 

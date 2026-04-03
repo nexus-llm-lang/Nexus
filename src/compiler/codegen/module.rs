@@ -19,7 +19,8 @@ use super::emit::{
 };
 use super::error::CodegenError;
 use super::function::compile_function;
-use super::layout::{build_codegen_layout, program_uses_object_heap, MemoryMode};
+use super::layout::{build_codegen_layout, program_uses_object_heap, CodegenLayout, MemoryMode};
+use super::string::string_abi_for_external;
 use super::{ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, LAZY_JOIN_NAME, LAZY_MODULE, LAZY_SPAWN_NAME};
 
 /// Compiles LIR (in ANF) directly into core WASM bytes, plus debug entries for DWARF.
@@ -64,6 +65,12 @@ pub fn compile_lir_to_wasm(
     let deduped_ext_count = deduped_externals.len() as u32;
     let n_bt_imports: u32 = if needs_bt_capture { 1 } else { 0 };
     let n_lazy_imports: u32 = if needs_lazy { 2 } else { 0 }; // spawn + join
+
+    // Check if any external uses canonical ABI (component model boundaries)
+    let needs_cabi_realloc = program
+        .externals
+        .iter()
+        .any(|ext| string_abi_for_external(ext) == super::string::StringABI::Canonical);
 
     let import_count = deduped_ext_count + n_alloc_imports + n_bt_imports + n_lazy_imports;
 
@@ -214,6 +221,23 @@ pub fn compile_lir_to_wasm(
         };
         internal_type_indices.push(type_idx);
     }
+    // cabi_realloc type: (old_ptr: i32, old_size: i32, align: i32, new_size: i32) -> i32
+    let mut cabi_realloc_type_idx = 0;
+    if needs_cabi_realloc {
+        let params = vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32];
+        let results = vec![ValType::I32];
+        let key = sig_key(&params, &results);
+        cabi_realloc_type_idx = if let Some(&existing) = sig_to_type_idx.get(&key) {
+            existing
+        } else {
+            types.ty().function(params, results);
+            sig_to_type_idx.insert(key, next_type_index);
+            let idx = next_type_index;
+            next_type_index += 1;
+            idx
+        };
+    }
+
     let wasi_key = sig_key(&[], &[]);
     let wasi_cli_run_type_index = if let Some(&existing) = sig_to_type_idx.get(&wasi_key) {
         existing
@@ -314,6 +338,9 @@ pub fn compile_lir_to_wasm(
     for type_idx in internal_type_indices {
         functions.function(type_idx);
     }
+    if needs_cabi_realloc {
+        functions.function(cabi_realloc_type_idx);
+    }
     functions.function(wasi_cli_run_type_index);
     module.section(&functions);
 
@@ -376,9 +403,14 @@ pub fn compile_lir_to_wasm(
     // === Export Section ===
     let mut exports = ExportSection::new();
     exports.export(ENTRYPOINT, ExportKind::Func, main_idx);
-    let wasi_cli_run_func_idx = import_count + program.functions.len() as u32;
+    let n_cabi_realloc: u32 = if needs_cabi_realloc { 1 } else { 0 };
+    let cabi_realloc_func_idx = import_count + program.functions.len() as u32;
+    let wasi_cli_run_func_idx = cabi_realloc_func_idx + n_cabi_realloc;
     // _start: WASI P1 entry point for wasmtime core module execution
     exports.export("_start", ExportKind::Func, wasi_cli_run_func_idx);
+    if needs_cabi_realloc {
+        exports.export("cabi_realloc", ExportKind::Func, cabi_realloc_func_idx);
+    }
     if !matches!(layout.memory_mode, MemoryMode::None) {
         exports.export(MEMORY_EXPORT, ExportKind::Memory, 0);
     }
@@ -408,7 +440,9 @@ pub fn compile_lir_to_wasm(
     let mut code = CodeSection::new();
     let mut debug_entries = Vec::new();
     // The code section body starts with a LEB128 function count.
-    let total_func_count = program.functions.len() + 1; // +1 for WASI CLI run wrapper
+    // +1 for WASI CLI run wrapper, +1 for cabi_realloc if needed
+    let total_func_count =
+        program.functions.len() + (if needs_cabi_realloc { 1 } else { 0 }) + 1;
     let mut code_body_offset = uleb128_encoded_size(total_func_count as u64) as u32;
     for func in &program.functions {
         let body = compile_function(
@@ -431,6 +465,10 @@ pub fn compile_lir_to_wasm(
         });
         code_body_offset += func_encoded_size;
         code.function(&body);
+    }
+    if needs_cabi_realloc {
+        let cabi_realloc_body = compile_cabi_realloc(&layout);
+        code.function(&cabi_realloc_body);
     }
     let run_wrapper = compile_wasi_cli_run_wrapper(main_idx, &main_func.ret_type);
     code.function(&run_wrapper);
@@ -468,6 +506,11 @@ pub fn compile_lir_to_wasm(
             func_names.append(idx, func.name.as_str());
             idx += 1;
         }
+        // cabi_realloc (canonical ABI allocator)
+        if needs_cabi_realloc {
+            func_names.append(idx, "cabi_realloc");
+            idx += 1;
+        }
         // WASI P1 _start wrapper
         func_names.append(idx, "_start");
         names.functions(&func_names);
@@ -482,6 +525,43 @@ fn compile_wasi_cli_run_wrapper(main_idx: u32, main_ret_type: &Type) -> Function
     body.instruction(&Instruction::Call(main_idx));
     if !matches!(peel_linear(main_ret_type), Type::Unit) {
         body.instruction(&Instruction::Drop);
+    }
+    body.instruction(&Instruction::End);
+    body
+}
+
+/// Generate a `cabi_realloc` function for the canonical ABI.
+///
+/// Signature: `(old_ptr: i32, old_size: i32, align: i32, new_size: i32) -> i32`
+///
+/// This function is required by the component model canonical ABI to allocate
+/// memory in the callee's linear memory for incoming string/list parameters.
+/// The canonical ABI adapter calls this before invoking the component's functions.
+///
+/// Implementation: delegates to the stdlib `allocate` function if available,
+/// otherwise uses the bump heap allocator. old_ptr/old_size are currently ignored
+/// (no realloc support — always allocates fresh).
+fn compile_cabi_realloc(layout: &CodegenLayout) -> Function {
+    use super::OBJECT_HEAP_GLOBAL_INDEX;
+
+    // Locals: params are 0=old_ptr, 1=old_size, 2=align, 3=new_size
+    let mut body = Function::new(Vec::new());
+
+    // Simply allocate new_size bytes, ignoring old_ptr/old_size/align.
+    // This is sufficient for the canonical ABI's needs (it only calls realloc
+    // for fresh allocations in practice).
+    if let Some(alloc_idx) = layout.allocate_func_idx {
+        // Use stdlib allocator
+        body.instruction(&Instruction::LocalGet(3)); // new_size
+        body.instruction(&Instruction::Call(alloc_idx));
+    } else {
+        // Bump allocator: return current heap ptr, advance by new_size
+        body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+        // Advance heap pointer
+        body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+        body.instruction(&Instruction::LocalGet(3)); // new_size
+        body.instruction(&Instruction::I32Add);
+        body.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
     }
     body.instruction(&Instruction::End);
     body
