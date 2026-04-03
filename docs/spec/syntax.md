@@ -85,7 +85,7 @@ Extends the builtin `Exn` type with new constructors.
 export exception group IOError = NotFound | PermissionDenied
 ```
 
-Groups define named sets of exceptions. Catching a group name matches any member. See [Exception Groups and Lazy Evaluation](../exceptions-and-lazy).
+Groups define named sets of exceptions. Catching a group name matches any member. See [Exception Groups](../exception-groups).
 
 ## Expressions
 
@@ -353,7 +353,7 @@ catch
 end
 ```
 
-Exception group names in catch arms expand to match all members. See [Exception Groups and Lazy Evaluation](../exceptions-and-lazy).
+Exception group names in catch arms expand to match all members. See [Exception Groups](../exception-groups).
 
 ### Inject
 

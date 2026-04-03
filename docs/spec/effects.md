@@ -131,7 +131,7 @@ Rules:
 
 ## Exception Groups
 
-Exception groups let you catch multiple related exceptions with a single pattern. See [Exception Groups and Lazy Evaluation](../exceptions-and-lazy) for the full reference.
+Exception groups let you catch multiple related exceptions with a single pattern. See [Exception Groups](../exception-groups) for the full reference.
 
 ```nexus
 exception NotFound(path: string)
