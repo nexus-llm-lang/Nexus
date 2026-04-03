@@ -297,6 +297,92 @@ end
     );
 }
 
+// ---- return spreading: return if/match ----
+
+#[test]
+fn codegen_return_if_with_tail_calls_emits_return_call() {
+    // `return if cond then f(x) else g(x)` should spread into branches,
+    // enabling TCO for each branch's tail call
+    let wasm = compile(
+        r#"
+let even = fn (n: i64) -> i64 do
+    return if n == 0 then 1 else odd(n: n - 1) end
+end
+
+let odd = fn (n: i64) -> i64 do
+    return if n == 0 then 0 else even(n: n - 1) end
+end
+
+let main = fn () -> unit do
+    let _ = even(n: 10)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut return_call_count = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                if matches!(op.unwrap(), Operator::ReturnCall { .. }) {
+                    return_call_count += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        return_call_count >= 2,
+        "return spreading should enable tail calls in if branches, found {return_call_count}"
+    );
+}
+
+#[test]
+fn codegen_return_match_with_tail_calls_emits_return_call() {
+    // `return match x do ... end` should spread return into each arm
+    let wasm = compile(
+        r#"
+let step = fn (n: i64) -> i64 do
+    return n
+end
+
+let dispatch = fn (n: i64) -> i64 do
+    return match n do
+        case 0 -> 0
+        case _ -> step(n: n - 1)
+    end
+end
+
+let main = fn () -> unit do
+    let _ = dispatch(n: 5)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut has_return_call = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                if matches!(op.unwrap(), Operator::ReturnCall { .. }) {
+                    has_return_call = true;
+                }
+            }
+        }
+    }
+    assert!(
+        has_return_call,
+        "return spreading should enable tail call in match arm"
+    );
+}
+
 // ---- main(args) desugaring ----
 
 #[test]

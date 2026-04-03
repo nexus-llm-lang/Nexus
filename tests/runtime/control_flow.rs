@@ -911,6 +911,77 @@ end
     );
 }
 
+// ---- return spreading: return if/match ----
+
+#[test]
+fn return_if_produces_correct_values() {
+    exec(
+        r#"
+let pick = fn (flag: bool) -> i64 do
+    return if flag then 42 else 99 end
+end
+
+let main = fn () -> unit do
+    let a = pick(flag: true)
+    let b = pick(flag: false)
+    if a != 42 then raise RuntimeError(val: "expected 42") end
+    if b != 99 then raise RuntimeError(val: "expected 99") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn return_match_produces_correct_values() {
+    exec(
+        r#"
+type Color = Red | Green | Blue
+
+let to_num = fn (c: Color) -> i64 do
+    return match c do
+        case Red -> 1
+        case Green -> 2
+        case Blue -> 3
+    end
+end
+
+let main = fn () -> unit do
+    let r = to_num(c: Red)
+    let g = to_num(c: Green)
+    let b = to_num(c: Blue)
+    if r != 1 then raise RuntimeError(val: "expected 1") end
+    if g != 2 then raise RuntimeError(val: "expected 2") end
+    if b != 3 then raise RuntimeError(val: "expected 3") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn return_if_with_mutual_recursion_executes_correctly() {
+    exec(
+        r#"
+let even = fn (n: i64) -> i64 do
+    return if n == 0 then 1 else odd(n: n - 1) end
+end
+
+let odd = fn (n: i64) -> i64 do
+    return if n == 0 then 0 else even(n: n - 1) end
+end
+
+let main = fn () -> unit do
+    let r1 = even(n: 10)
+    let r2 = odd(n: 10)
+    if r1 != 1 then raise RuntimeError(val: "even(10) should be 1") end
+    if r2 != 0 then raise RuntimeError(val: "odd(10) should be 0") end
+    return ()
+end
+"#,
+    );
+}
+
 #[test]
 fn if_let_some_branch() {
     exec(
