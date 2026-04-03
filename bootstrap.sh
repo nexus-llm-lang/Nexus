@@ -22,9 +22,8 @@ done
 
 NEXUS="${NEXUS:-./target/release/nexus}"
 NXC_ENTRY="nxc/driver.nx"
-BUILD_DIR="bootstrap_out"
 WASMTIME="${WASMTIME:-wasmtime}"
-WASMTIME_FLAGS="-W tail-call=y,exceptions=y --dir=."
+WASMTIME_FLAGS="-W tail-call=y,exceptions=y --dir=. --dir=${TMPDIR:-/tmp}"
 NEXUS_BUILD_FLAGS=""
 
 RED='\033[0;31m'
@@ -38,14 +37,18 @@ ok()    { printf "${GREEN}[bootstrap]${RESET} %s\n" "$*"; }
 warn()  { printf "${YELLOW}[bootstrap]${RESET} %s\n" "$*"; }
 fail()  { printf "${RED}[bootstrap]${RESET} %s\n" "$*" >&2; exit 1; }
 
+# ─── Temp directory ──────────────────────────────────────────────────────
+BUILD_DIR="$(mktemp -d)"
+cleanup() { rm -rf "$BUILD_DIR"; }
+trap cleanup EXIT
+info "Build directory: $BUILD_DIR"
+
 # ─── Build the Nexus compiler (Rust) ──────────────────────────────────────
 CURRENT_COMMIT="$(git rev-parse HEAD)"
 info "Building Nexus compiler (cargo build --release)..."
 cargo build --release
 [[ -x "$NEXUS" ]] || fail "Nexus compiler not found at $NEXUS"
 info "Using Nexus compiler: $NEXUS (commit ${CURRENT_COMMIT:0:7})"
-
-mkdir -p "$BUILD_DIR"
 
 # ─── Stage 0: Rust compiler → stage0.wasm ─────────────────────────────────
 # Try to reuse `nexus nxc` auto-cache (target/nxc/nxc_driver.wasm).
@@ -145,3 +148,10 @@ else
   warn "stage1.wasm and stage2.wasm differ — not yet at fixed point."
   warn "This is expected while nxc codegen is still maturing."
 fi
+
+# ─── Install nxc_driver.wasm ─────────────────────────────────────────────
+# Copy the verified stage1 (bundled) as the repo-root nxc_driver.wasm.
+# This ensures nxc_driver.wasm always matches the current sources.
+
+cp "$STAGE1_BUNDLED" nxc_driver.wasm
+ok "Installed nxc_driver.wasm ($(wc -c < nxc_driver.wasm | tr -d ' ') bytes)"
