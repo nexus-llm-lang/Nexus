@@ -705,3 +705,106 @@ fn test_main_rejects_nonempty_throws() {
     "#,
     );
 }
+
+// ─── Exception group tests ──────────────────────────────────────────────────
+
+#[test]
+fn test_exception_group_catch_matches_any_member() {
+    should_typecheck(
+        r#"
+    exception NotFound(path: string)
+    exception PermDenied(path: string)
+    exception group IOError = NotFound | PermDenied
+
+    let main = fn () -> unit do
+      try
+        raise NotFound(path: "/tmp/x")
+      catch
+        case IOError -> return ()
+      end
+      return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_exception_group_catch_executes() {
+    crate::harness::exec(
+        r#"
+    exception NotFound(path: string)
+    exception PermDenied(path: string)
+    exception group IOError = NotFound | PermDenied
+
+    let main = fn () -> unit do
+      try
+        raise NotFound(path: "/tmp/x")
+      catch
+        case IOError -> return ()
+      end
+      return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_exception_group_catch_second_member() {
+    crate::harness::exec(
+        r#"
+    exception NotFound(path: string)
+    exception PermDenied(path: string)
+    exception group IOError = NotFound | PermDenied
+
+    let main = fn () -> unit do
+      try
+        raise PermDenied(path: "/etc/shadow")
+      catch
+        case IOError -> return ()
+      end
+      return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_exception_group_throws_allows_member_raise() {
+    // throws { GroupName } is expanded to throws { Exn } — raise of any member is accepted
+    should_typecheck(
+        r#"
+    exception NotFound(path: string)
+    exception PermDenied(path: string)
+    exception group IOError = NotFound | PermDenied
+
+    let risky = fn () -> unit throws { IOError } do
+      raise NotFound(path: "/tmp/x")
+      return ()
+    end
+
+    let main = fn () -> unit do
+      return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_exception_group_catch_with_wildcard() {
+    should_typecheck(
+        r#"
+    exception Boom(i64)
+    exception Oops(string)
+    exception group Errors = Boom | Oops
+
+    let main = fn () -> unit do
+      try
+        raise Boom(42)
+      catch
+        case Errors -> return ()
+      end
+      return ()
+    end
+    "#,
+    );
+}

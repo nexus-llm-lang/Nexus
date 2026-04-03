@@ -173,6 +173,8 @@ struct MirBuilder {
     fn_types: HashMap<String, Type>,
     /// Types of local variables in the current conversion scope (for closure capture type resolution)
     scope_var_types: HashMap<String, Type>,
+    /// Exception group name → member exception names (for catch expansion)
+    exception_groups: HashMap<String, Vec<String>>,
 }
 
 impl MirBuilder {
@@ -200,6 +202,7 @@ impl MirBuilder {
             lambda_counter: 0,
             fn_types: HashMap::new(),
             scope_var_types: HashMap::new(),
+            exception_groups: HashMap::new(),
         }
     }
 
@@ -419,7 +422,10 @@ impl MirBuilder {
                 TopLevel::Exception(ex) => {
                     self.register_exception_in_enum_defs(ex);
                 }
-                TopLevel::ExceptionGroup(_) => {}
+                TopLevel::ExceptionGroup(eg) => {
+                    self.exception_groups
+                        .insert(eg.name.clone(), eg.members.clone());
+                }
                 TopLevel::Port(port) => {
                     let port_name = self.rename(&port.name, rename_map);
                     let methods: Vec<String> =
@@ -639,6 +645,7 @@ impl MirBuilder {
                 }
                 TopLevel::TypeDef(td) if td.is_public => vec![td.name.clone()],
                 TopLevel::Exception(ex) if ex.is_public => vec![ex.name.clone()],
+                TopLevel::ExceptionGroup(eg) if eg.is_public => vec![eg.name.clone()],
                 _ => vec![],
             })
             .collect();
@@ -787,6 +794,7 @@ impl MirBuilder {
                 }
                 TopLevel::TypeDef(td) if td.is_public && td.name == item.name => true,
                 TopLevel::Exception(ex) if ex.is_public && ex.name == item.name => true,
+                TopLevel::ExceptionGroup(eg) if eg.is_public && eg.name == item.name => true,
                 _ => false,
             });
             if !found {
@@ -1075,16 +1083,31 @@ impl MirBuilder {
                     }
                 }
                 // Multi-arm or non-variable pattern: desugar to catch __exn -> match __exn do ... end
+                // Exception group expansion: if a catch pattern names a group, expand to one arm per member
                 let exn_sym = Symbol::from("__exn");
-                let mir_cases: Vec<MirMatchCase> = catch_arms
-                    .iter()
-                    .map(|arm| {
-                        Ok(MirMatchCase {
-                            pattern: self.convert_pattern(&arm.pattern.node),
-                            body: self.convert_stmts(&arm.body, rename_map, scope)?,
-                        })
-                    })
-                    .collect::<Result<_, HirBuildError>>()?;
+                let mut mir_cases: Vec<MirMatchCase> = Vec::new();
+                for arm in catch_arms {
+                    let mir_body = self.convert_stmts(&arm.body, rename_map, scope)?;
+                    if let Pattern::Constructor(name, fields) = &arm.pattern.node {
+                        if let Some(members) = self.exception_groups.get(name.as_str()) {
+                            // Group pattern: expand to one case per member
+                            for member in members.clone() {
+                                mir_cases.push(MirMatchCase {
+                                    pattern: self.convert_pattern(&Pattern::Constructor(
+                                        member,
+                                        fields.clone(),
+                                    )),
+                                    body: mir_body.clone(),
+                                });
+                            }
+                            continue;
+                        }
+                    }
+                    mir_cases.push(MirMatchCase {
+                        pattern: self.convert_pattern(&arm.pattern.node),
+                        body: mir_body,
+                    });
+                }
                 let match_expr = MirExpr::Match {
                     target: Box::new(MirExpr::Variable(exn_sym)),
                     cases: mir_cases,

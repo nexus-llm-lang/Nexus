@@ -52,6 +52,8 @@ pub struct TypeEnv {
     pub enums: HashMap<String, EnumDef>,
     pub linear_vars: HashSet<String>,
     pub modules: HashMap<String, TypeEnv>,
+    /// Exception group name → member exception names
+    pub exception_groups: HashMap<String, Vec<String>>,
 }
 
 impl TypeEnv {
@@ -63,6 +65,7 @@ impl TypeEnv {
             enums: HashMap::new(),
             linear_vars: HashSet::new(),
             modules: HashMap::new(),
+            exception_groups: HashMap::new(),
         }
     }
 
