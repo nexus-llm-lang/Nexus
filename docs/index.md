@@ -89,8 +89,7 @@ nexus check example.nx  # typecheck only
       <li><a href="spec/types">Types</a> — Type system, linear types, borrowing</li>
       <li><a href="spec/effects">Effects and Coeffects</a> — Ports, handlers, inject</li>
       <li><a href="spec/exception-groups">Exception Groups</a> — Structured exceptions, multi-arm catch</li>
-      <li><a href="spec/lazy">Lazy Evaluation</a> — Deferred computation with <code>@</code></li>
-      <li><a href="spec/concurrency">Concurrency</a> — Parallel tasks with <code>conc</code> blocks</li>
+      <li><a href="spec/lazy">Lazy Evaluation and Concurrency</a> — <code>@</code> thunks, <code>conc</code> blocks, linearity</li>
       <li><a href="spec/semantics">Semantics</a> — Evaluation model</li>
     </ul>
   </div>
