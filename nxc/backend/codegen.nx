@@ -45,7 +45,8 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          op_i32_and, op_i32_or } from "nxc/backend/wasm_defs.nx"
 import { collect_program_strings, build_string_entries, compute_last_string_end,
          program_uses_heap, choose_memory_mode, has_stdlib, align8,
-         collect_local_stmts, LocalResult, program_needs_eh } from "nxc/backend/wasm_collect.nx"
+         collect_local_stmts, LocalResult, program_needs_eh,
+         needs_cabi_realloc } from "nxc/backend/wasm_collect.nx"
 import { build_type_section, build_import_section, build_function_section,
          build_memory_section, build_global_section, build_export_section,
          build_data_section, emit_local_decls,
@@ -1511,6 +1512,47 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuff
   push_byte(buf: %body, byte: op_end)
 end
 
+/// cabi_realloc: aligned bump allocator for canonical ABI.
+/// Signature: (old_ptr: i32, old_size: i32, align: i32, new_size: i32) -> i32
+/// Ignores old_ptr/old_size, aligns heap ptr, bumps by new_size.
+let compile_cabi_realloc = fn () -> %ByteBuffer throws { Exn } do
+  let %body = empty()
+  // 1 local: aligned_ptr (i32)
+  let %body = push_uleb128(buf: %body, val: 1)
+  let %body = push_uleb128(buf: %body, val: 1)
+  let %body = push_byte(buf: %body, byte: vt_i32)
+  // aligned_ptr = (global.get 0 + local.get 2 - 1) & (0 - local.get 2)
+  // = (heap_ptr + align - 1) & mask
+  let %body = push_byte(buf: %body, byte: op_global_get)
+  let %body = push_uleb128(buf: %body, val: 0)
+  let %body = push_byte(buf: %body, byte: op_local_get)
+  let %body = push_uleb128(buf: %body, val: 2)
+  let %body = push_byte(buf: %body, byte: op_i32_add)
+  let %body = push_byte(buf: %body, byte: op_i32_const)
+  let %body = push_sleb128(buf: %body, val: 1)
+  let %body = push_byte(buf: %body, byte: op_i32_sub)
+  // mask = 0 - align
+  let %body = push_byte(buf: %body, byte: op_i32_const)
+  let %body = push_sleb128(buf: %body, val: 0)
+  let %body = push_byte(buf: %body, byte: op_local_get)
+  let %body = push_uleb128(buf: %body, val: 2)
+  let %body = push_byte(buf: %body, byte: op_i32_sub)
+  // AND → aligned_ptr
+  let %body = push_byte(buf: %body, byte: op_i32_and)
+  let %body = push_byte(buf: %body, byte: op_local_tee)
+  let %body = push_uleb128(buf: %body, val: 4)
+  // new_heap = aligned_ptr + new_size
+  let %body = push_byte(buf: %body, byte: op_local_get)
+  let %body = push_uleb128(buf: %body, val: 3)
+  let %body = push_byte(buf: %body, byte: op_i32_add)
+  let %body = push_byte(buf: %body, byte: op_global_set)
+  let %body = push_uleb128(buf: %body, val: 0)
+  // return aligned_ptr
+  let %body = push_byte(buf: %body, byte: op_local_get)
+  let %body = push_uleb128(buf: %body, val: 4)
+  return push_byte(buf: %body, byte: op_end)
+end
+
 let compile_wasi_run_wrapper = fn (main_idx: i64, main_ret_type: TypeExpr) -> %ByteBuffer throws { Exn } do
   let %body = empty()
   let %body = push_uleb128(buf: %body, val: 0)
@@ -1758,6 +1800,8 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
       let has_eh = program_needs_eh(funcs: funcs)
       let heap_enabled = program_uses_heap(funcs: funcs)
       let uses_stdlib = has_stdlib(externals: exts)
+      let has_cabi = needs_cabi_realloc(exts: exts)
+      let n_cabi = match has_cabi do case true -> 1 case false -> 0 end
       // alloc_mode: 0=none, 1=bump allocator, 2=stdlib allocate
       let alloc_mode = match heap_enabled do
         case false -> 0
@@ -1785,7 +1829,7 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
       let n_closure_types = list.length(xs: closure_arities)
       // Closure type indices start after all ext + func + wasi_run + eh_tag + alloc types
       let n_eh_types = match has_eh do case true -> 1 case false -> 0 end
-      let closure_type_base = n_exts + n_funcs + 1 + n_eh_types + n_alloc_imports
+      let closure_type_base = n_exts + n_funcs + 1 + n_eh_types + n_alloc_imports + n_cabi
 
       let main_idx = lookup_func_fast(name: "main", map_id: internal_func_map)
       let main_ret = match find_function(name: "main", funcs: funcs) do
@@ -1803,7 +1847,8 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
       let heap_base_raw = match last_end > string_data_base do case true -> last_end case false -> string_data_base end
       let heap_base = align8(v: heap_base_raw)
 
-      let wasi_run_idx = import_count + n_funcs
+      let cabi_realloc_idx = import_count + n_funcs
+      let wasi_run_idx = import_count + n_funcs + n_cabi
 
       // WASM magic + version
       let %m = empty()
@@ -1818,7 +1863,8 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
 
       // Type section (with EH tag + allocate + closure call types appended)
       let has_alloc = alloc_mode == 2
-      let %type_sec = build_type_section(program: program, has_eh: has_eh, has_alloc: has_alloc, n_closure_types: n_closure_types)
+      let %type_sec = build_type_section(program: program, has_eh: has_eh, has_alloc: has_alloc,
+                                         has_cabi_realloc: has_cabi, n_closure_types: n_closure_types)
       let %type_sec = if n_closure_types > 0 then
         emit_closure_type_entries(buf: %type_sec, arities: closure_arities)
       else %type_sec end
@@ -1834,7 +1880,7 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
       end
 
       // Function section
-      let %m = emit_section(buf: %m, id: sec_function, content: build_function_section(n_funcs: n_funcs, n_exts: n_exts))
+      let %m = emit_section(buf: %m, id: sec_function, content: build_function_section(n_funcs: n_funcs + n_cabi, n_exts: n_exts))
 
       // Table section (if closures exist)
       let %m = if n_closures > 0 then
@@ -1852,16 +1898,18 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
         emit_section(buf: %m, id: sec_tag, content: build_tag_section(exn_tag_type_idx: exn_tag_type_idx))
       else %m end
 
-      // Global section — only needed for bump allocator (alloc_mode 1).
-      // When using stdlib allocate (alloc_mode 2), stdlib owns the global heap pointer.
-      // Emitting our own global[0] conflicts with stdlib's after wasm-merge.
-      let %m = if heap_enabled && alloc_mode == 1 then
+      // Global section — needed for bump allocator (alloc_mode 1) or cabi_realloc.
+      // When using stdlib allocate (alloc_mode 2) without cabi_realloc, stdlib owns the global heap pointer.
+      let needs_global = (heap_enabled && alloc_mode == 1) || (has_cabi && alloc_mode != 2)
+      let %m = if needs_global then
         emit_section(buf: %m, id: sec_global, content: build_global_section(heap_base: heap_base))
       else %m end
 
       // Export section
       let %m = emit_section(buf: %m, id: sec_export,
                              content: build_export_section(main_idx: main_idx, wasi_run_idx: wasi_run_idx,
+                                                           cabi_realloc_idx: cabi_realloc_idx,
+                                                           has_cabi_realloc: has_cabi,
                                                            mem_mode: mem_mode))
 
       // Element section (populate funcref table)
@@ -1873,12 +1921,17 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
       // Build closure_type_indices: map arity → type section index
       let closure_type_idx_list = build_closure_type_idx_list(arities: closure_arities, base: closure_type_base)
       let %code = empty()
-      let %code = push_uleb128(buf: %code, val: n_funcs + 1)
+      let %code = push_uleb128(buf: %code, val: n_funcs + n_cabi + 1)
       let %code = emit_code_bodies(buf: %code, funcs: funcs, internal_funcs: internal_funcs,
                                     external_funcs: external_funcs, string_lits: string_entries,
                                     alloc_mode: alloc_mode, functions: funcs, externals: exts,
                                     closure_table: closure_table, closure_type_indices: closure_type_idx_list,
                                     internal_func_map: internal_func_map, external_func_map: external_func_map)
+      // cabi_realloc: aligned bump allocator for canonical ABI
+      let %code = if has_cabi then
+        let %cabi_body = compile_cabi_realloc()
+        append_body_to_buf(buf: %code, body: %cabi_body)
+      else %code end
       let %wasi_body = compile_wasi_run_wrapper(main_idx: main_idx, main_ret_type: main_ret)
       let %code = append_body_to_buf(buf: %code, body: %wasi_body)
       let %m = emit_section(buf: %m, id: sec_code, content: %code)
