@@ -367,19 +367,6 @@ end
 
 Multiple handlers: `inject h1, h2 do ... end`.
 
-### Conc
-
-```nexus
-conc do
-  task worker1 do
-    // ...
-  end
-  task worker2 do
-    // ...
-  end
-end
-```
-
 ## Patterns
 
 | Pattern | Example | Description |
@@ -422,21 +409,6 @@ let console_logger = handler Logger require { Console } do
   end
 end
 ```
-
-## Concurrency
-
-```nexus
-conc do
-  task name1 do
-    // ...
-  end
-  task name2 do
-    // ...
-  end
-end
-```
-
-Task names are identifiers. `conc` blocks wait for all tasks.
 
 ---
 
@@ -530,7 +502,6 @@ stmt        ::= let_stmt
               | match_stmt
               | try_stmt
               | inject_stmt
-              | conc_stmt
               | while_stmt
               | for_stmt
               | comment
@@ -551,9 +522,6 @@ try_stmt    ::= "try" stmt* "catch" IDENT "->" stmt* "end"
               | "try" stmt* "catch" catch_arm+ "end"
 catch_arm   ::= "case" pattern "->" stmt*
 inject_stmt ::= "inject" dotted_ident ( "," dotted_ident )* "do" stmt* "end"
-
-conc_stmt   ::= "conc" "do" task_def* "end"
-task_def    ::= "task" IDENT [ "throws" throws_type ] "do" stmt* "end"
 
 while_stmt  ::= "while" expr "do" stmt* "end"
 for_stmt    ::= "for" IDENT "=" expr "to" expr "do" stmt* "end"
