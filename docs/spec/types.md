@@ -202,13 +202,13 @@ This ensures mutation remains localized and predictable.
 
 ## Function Types
 
-Functions are first-class values with labeled parameters and optional throws/coeffect annotations:
+Functions are first-class values with labeled parameters and optional throws/capability annotations:
 
 ```nexus
 (label: T) -> R                                 // pure function
 (a: i64, b: i64) -> i64                         // multiple params
 () -> unit throws { Exn }                       // with throws
-() -> string require { Net }                    // with coeffect
+() -> string require { Net }                    // with capability
 (x: T) -> R require { C | r } throws { E | e }  // open rows
 ```
 
@@ -229,7 +229,7 @@ Closure constraints:
 
 ## Row Types
 
-Effect and coeffect annotations use row types:
+Effect and capability annotations use row types:
 
 ```nexus
 { Exn }          // single entry

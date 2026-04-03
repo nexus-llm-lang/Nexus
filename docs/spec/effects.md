@@ -1,16 +1,18 @@
 ---
 layout: default
-title: Checked Exceptions and Coeffects
+title: Checked Exceptions and Capabilities
 ---
 
-# Checked Exceptions and Coeffects
+# Checked Exceptions and Capabilities
 
-Nexus separates two concerns in function signatures: **coeffects** (what capabilities the function needs from its environment) and **checked exceptions** (what exceptions the function may throw). This distinction is central to the [design thesis](../../design#why-coeffects-not-effects) -- every dependency and side effect is declared, not implied.
+Nexus separates two concerns in function signatures: **capabilities** (what the function needs from its environment) and **checked exceptions** (what exceptions the function may throw). This distinction is central to the [design thesis](../../design#why-capabilities-not-effects) -- every dependency and side effect is declared, not implied.
+
+> **Terminology note.** The `require` clause is sometimes called a *coeffect* in the literature, as it tracks environmental requirements (the dual of effects). We use *capability* because Nexus's system — row-polymorphic, discharged by `inject`, annotations on function signatures — differs structurally from coeffect calculi (Petricek et al.), which use semiring-indexed annotations on individual variable bindings.
 
 ## Function Signature Shape
 
 ```nexus
-fn (args...) -> Ret require { Coeffects } throws { Exceptions }
+fn (args...) -> Ret require { Capabilities } throws { Exceptions }
 ```
 
 Both clauses are optional. Omitted means empty row (pure function with no requirements).
@@ -58,11 +60,11 @@ Exception declarations extend the builtin `Exn` type:
 export exception PermissionDenied(msg: string, code: i64)
 ```
 
-`raise` is an expression that immediately unwinds to the nearest `catch`. All I/O capabilities use the coeffect system, not throws.
+`raise` is an expression that immediately unwinds to the nearest `catch`. All I/O capabilities use the capability system, not throws.
 
 ## Ports
 
-A `port` defines a coeffect interface -- a set of function signatures that must be provided by the environment:
+A `port` defines a capability interface -- a set of function signatures that must be provided by the environment:
 
 ```nexus
 export port Logger do
@@ -73,7 +75,7 @@ end
 
 When a function calls `Logger.info(...)`, it must have `Logger` in its `require` row.
 
-Port methods can themselves declare throws and coeffects:
+Port methods can themselves declare throws and capabilities:
 
 ```nexus
 export port Fs do
@@ -166,11 +168,11 @@ end
 
 ## Permission Mapping
 
-Runtime permissions (`PermFs`, `PermNet`, etc.) are special coeffects that map to WASI capabilities. They serve as the bridge between the type system and the runtime sandbox. See [WASM and WASI](../../env/wasm) for the complete mapping table.
+Runtime permissions (`PermFs`, `PermNet`, etc.) are special capabilities that map to WASI capabilities. They serve as the bridge between the type system and the runtime sandbox. See [WASM and WASI](../../env/wasm) for the complete mapping table.
 
 ## Row Typing
 
-Throws and coeffect rows are checked by row unification (no subtyping). Open rows use tail variables for polymorphism:
+Throws and capability rows are checked by row unification (no subtyping). Open rows use tail variables for polymorphism:
 
 ```nexus
 // This function is polymorphic over additional requirements

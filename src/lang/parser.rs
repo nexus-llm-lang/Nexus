@@ -77,6 +77,19 @@ impl Parser {
     fn expect(&mut self, kind: &TokenKind) -> Result<&Token, ParseError> {
         if std::mem::discriminant(self.peek()) == std::mem::discriminant(kind) {
             Ok(self.advance())
+        } else if matches!(kind, TokenKind::Gt) && matches!(self.peek(), TokenKind::Shr) {
+            // Split `>>` (Shr) into two `>` (Gt) tokens.
+            // Consume the first `>` by rewriting the current token to Gt
+            // with the span of the second `>`, then advance past the original.
+            let span = self.peek_span();
+            let mid = span.start + 1;
+            // Rewrite in-place: current token becomes the second Gt
+            self.tokens[self.pos] = Token {
+                kind: TokenKind::Gt,
+                span: mid..span.end,
+            };
+            // Return a reference to the now-Gt token (the caller gets the first `>`)
+            Ok(&self.tokens[self.pos])
         } else {
             Err(ParseError {
                 message: format!("expected {:?}, got {:?}", kind, self.peek()),

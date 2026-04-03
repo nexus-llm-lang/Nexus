@@ -21,7 +21,7 @@ Nexus is built on one observation: **LLMs are strong at literal program construc
 
 The principle is simple: if a construct requires looking elsewhere to understand what happens here, replace it with something that doesn't.
 
-## Why Coeffects, Not Effects
+## Why Capabilities, Not Effects
 
 Most effect system research focuses on *algebraic effects* -- functions perform effect operations, and handlers intercept them using delimited continuations. The handler decides whether and how to resume the suspended computation. This is powerful but fundamentally *contextual*: the call site `Logger.info(msg: x)` tells you nothing about control flow. The handler could resume, abort, restart, or run the continuation multiple times.
 

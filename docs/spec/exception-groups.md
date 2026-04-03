@@ -101,4 +101,4 @@ Groups are expanded at catch sites -- there is no hierarchical nesting at runtim
 
 ---
 
-See also: [Checked Exceptions and Coeffects](../effects), [Syntax](../syntax)
+See also: [Checked Exceptions and Capabilities](../effects), [Syntax](../syntax)

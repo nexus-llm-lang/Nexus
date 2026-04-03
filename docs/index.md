@@ -11,7 +11,7 @@ Garbage collection, implicit conversions, ambient I/O, continuation-based contro
 <div class="code-showcase code-showcase-top" markdown="1">
 <div class="code-card" markdown="1">
 
-### Coeffects -- Hello world
+### Capabilities -- Hello world
 
 Capability requirements declared in function signatures. Dependency injection via ports and handlers.
 
@@ -82,7 +82,7 @@ nexus check example.nx  # typecheck only
     <ul>
       <li><a href="spec/syntax">Syntax</a> — Grammar and EBNF</li>
       <li><a href="spec/types">Types</a> — Type system, linear types, borrowing</li>
-      <li><a href="spec/effects">Effects and Coeffects</a> — Ports, handlers, inject</li>
+      <li><a href="spec/effects">Effects and Capabilities</a> — Ports, handlers, inject</li>
       <li><a href="spec/exception-groups">Exception Groups</a> — Structured exceptions, multi-arm catch</li>
       <li><a href="spec/lazy">Lazy, Concurrency, Parallelism</a> — <code>@</code> sigil, DAG parallel evaluation, linearity</li>
       <li><a href="spec/semantics">Semantics</a> — Evaluation model</li>

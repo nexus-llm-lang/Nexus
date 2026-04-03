@@ -8,5 +8,6 @@ pub mod inference;
 pub mod linear;
 pub mod modules;
 pub mod ports;
+pub mod properties;
 pub mod soundness;
 pub mod unification;
