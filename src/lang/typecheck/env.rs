@@ -154,6 +154,7 @@ impl TypeEnv {
             Type::Record(fields) => fields
                 .iter()
                 .any(|(_, field_type)| self.contains_linear_type_inner(field_type, visiting)),
+            Type::List(inner) => self.contains_linear_type_inner(inner, visiting),
             _ => false,
         }
     }
