@@ -894,31 +894,64 @@ impl<'a> LowerCtx<'a> {
                 }
             },
             MirStmt::Return(expr) => {
-                if let MirExpr::Call {
-                    func,
-                    args,
-                    ret_type,
-                } = expr
-                {
-                    let mut lir_args = Vec::new();
-                    for (label, e) in args {
-                        let atom = self.lower_expr_to_atom(e)?;
-                        lir_args.push((label.clone(), atom));
+                match expr {
+                    MirExpr::Call {
+                        func,
+                        args,
+                        ret_type,
+                    } => {
+                        let mut lir_args = Vec::new();
+                        for (label, e) in args {
+                            let atom = self.lower_expr_to_atom(e)?;
+                            lir_args.push((label.clone(), atom));
+                        }
+                        lir_args.sort_by(|(a, _), (b, _)| a.cmp(b));
+                        let typ = wasm_type(ret_type);
+                        let atom = self.bind_expr_to_temp(
+                            LirExpr::TailCall {
+                                func: func.clone(),
+                                args: lir_args,
+                                typ: typ.clone(),
+                            },
+                            typ,
+                        );
+                        Ok(Some(atom))
                     }
-                    lir_args.sort_by(|(a, _), (b, _)| a.cmp(b));
-                    let typ = wasm_type(ret_type);
-                    let atom = self.bind_expr_to_temp(
-                        LirExpr::TailCall {
-                            func: func.clone(),
-                            args: lir_args,
-                            typ: typ.clone(),
-                        },
-                        typ,
-                    );
-                    return Ok(Some(atom));
+                    // Spread return into if branches so each branch returns directly.
+                    // This enables TCO for tail calls inside branches and eliminates
+                    // unnecessary temp variables from lower_if_expr.
+                    MirExpr::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    } => {
+                        let then_spread = spread_return_into_body(then_body);
+                        let else_spread = else_body.as_ref().map(|b| spread_return_into_body(b));
+                        self.lower_if_stmt(
+                            cond,
+                            &then_spread,
+                            else_spread.as_deref(),
+                            ret_type,
+                        )?;
+                        Ok(None)
+                    }
+                    // Spread return into match branches — same benefits as if spreading.
+                    MirExpr::Match { target, cases } => {
+                        let spread_cases: Vec<MirMatchCase> = cases
+                            .iter()
+                            .map(|case| MirMatchCase {
+                                pattern: case.pattern.clone(),
+                                body: spread_return_into_body(&case.body),
+                            })
+                            .collect();
+                        self.lower_match_stmt(target, &spread_cases, ret_type)?;
+                        Ok(None)
+                    }
+                    _ => {
+                        let atom = self.lower_expr_to_atom(expr)?;
+                        Ok(Some(atom))
+                    }
                 }
-                let atom = self.lower_expr_to_atom(expr)?;
-                Ok(Some(atom))
             }
             MirStmt::Assign { target, value } => {
                 // Lower both sides to atoms
@@ -1496,34 +1529,64 @@ impl<'a> LowerCtx<'a> {
                 }
             },
             MirStmt::Return(expr) => {
-                if let MirExpr::Call {
-                    func,
-                    args,
-                    ret_type,
-                } = expr
-                {
-                    let mut lir_args = Vec::new();
-                    for (label, e) in args {
-                        let atom = self.lower_expr_to_atom(e)?;
-                        lir_args.push((label.clone(), atom));
+                match expr {
+                    MirExpr::Call {
+                        func,
+                        args,
+                        ret_type,
+                    } => {
+                        let mut lir_args = Vec::new();
+                        for (label, e) in args {
+                            let atom = self.lower_expr_to_atom(e)?;
+                            lir_args.push((label.clone(), atom));
+                        }
+                        lir_args.sort_by(|(a, _), (b, _)| a.cmp(b));
+                        let typ = wasm_type(ret_type);
+                        let atom = self.bind_expr_to_temp(
+                            LirExpr::TailCall {
+                                func: func.clone(),
+                                args: lir_args,
+                                typ: typ.clone(),
+                            },
+                            typ,
+                        );
+                        Ok(Some(atom))
                     }
-                    lir_args.sort_by(|(a, _), (b, _)| a.cmp(b));
-                    let typ = wasm_type(ret_type);
-                    let atom = self.bind_expr_to_temp(
-                        LirExpr::TailCall {
-                            func: func.clone(),
-                            args: lir_args,
-                            typ: typ.clone(),
-                        },
-                        typ,
-                    );
-                    return Ok(Some(atom));
-                }
-                let atom = self.lower_expr_to_atom(expr)?;
-                if matches!(atom.typ(), Type::Unit) {
-                    Ok(None)
-                } else {
-                    Ok(Some(atom))
+                    MirExpr::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    } => {
+                        let then_spread = spread_return_into_body(then_body);
+                        let else_spread =
+                            else_body.as_ref().map(|b| spread_return_into_body(b));
+                        self.lower_if_stmt(
+                            cond,
+                            &then_spread,
+                            else_spread.as_deref(),
+                            ret_type,
+                        )?;
+                        Ok(None)
+                    }
+                    MirExpr::Match { target, cases } => {
+                        let spread_cases: Vec<MirMatchCase> = cases
+                            .iter()
+                            .map(|case| MirMatchCase {
+                                pattern: case.pattern.clone(),
+                                body: spread_return_into_body(&case.body),
+                            })
+                            .collect();
+                        self.lower_match_stmt(target, &spread_cases, ret_type)?;
+                        Ok(None)
+                    }
+                    _ => {
+                        let atom = self.lower_expr_to_atom(expr)?;
+                        if matches!(atom.typ(), Type::Unit) {
+                            Ok(None)
+                        } else {
+                            Ok(Some(atom))
+                        }
+                    }
                 }
             }
             _ => {
@@ -2449,6 +2512,26 @@ fn default_atom_for_type(typ: &Type) -> LirAtom {
         Type::Unit => LirAtom::Unit,
         _ => LirAtom::Int(0), // heap pointer types default to 0
     }
+}
+
+/// Spread a `return` into a block body by wrapping the last expression in `Return`.
+/// Used by return spreading for `if`/`match` to enable TCO in each branch.
+fn spread_return_into_body(body: &[MirStmt]) -> Vec<MirStmt> {
+    if body.is_empty() {
+        return vec![MirStmt::Return(MirExpr::Literal(Literal::Unit))];
+    }
+    let mut new_body = body.to_vec();
+    let last_idx = new_body.len() - 1;
+    match &new_body[last_idx] {
+        MirStmt::Expr(expr) => {
+            new_body[last_idx] = MirStmt::Return(expr.clone());
+        }
+        MirStmt::Return(_) => {}
+        _ => {
+            new_body.push(MirStmt::Return(MirExpr::Literal(Literal::Unit)));
+        }
+    }
+    new_body
 }
 
 /// Build a HashMap from constructor name → ConstructorInfo for O(1) lookups.
