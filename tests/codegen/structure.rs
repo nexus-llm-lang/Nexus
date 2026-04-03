@@ -633,7 +633,7 @@ fn wasm_imports(wasm: &[u8]) -> Vec<(String, String)> {
     imports
 }
 
-/// Try/catch WITHOUT backtrace() should NOT import __nx_capture_backtrace.
+/// Try/catch WITHOUT backtrace() should NOT import capture-backtrace.
 #[test]
 fn notrace_elides_capture_backtrace_import() {
     let wasm = compile(
@@ -654,13 +654,13 @@ end
     assert!(
         !imports
             .iter()
-            .any(|(m, n)| m == "nexus:runtime/backtrace" && n == "__nx_capture_backtrace"),
-        "notrace: should NOT import __nx_capture_backtrace when backtrace() is unused, got: {:?}",
+            .any(|(m, n)| m == "nexus:runtime/backtrace" && n == "capture-backtrace"),
+        "notrace: should NOT import capture-backtrace when backtrace() is unused, got: {:?}",
         imports
     );
 }
 
-/// Try/catch WITH backtrace() SHOULD import __nx_capture_backtrace.
+/// Try/catch WITH backtrace() SHOULD import capture-backtrace.
 #[test]
 fn backtrace_usage_keeps_capture_import() {
     let wasm = compile(
@@ -684,8 +684,8 @@ end
     assert!(
         imports
             .iter()
-            .any(|(m, n)| m == "nexus:runtime/backtrace" && n == "__nx_capture_backtrace"),
-        "should import __nx_capture_backtrace when backtrace() is used, got: {:?}",
+            .any(|(m, n)| m == "nexus:runtime/backtrace" && n == "capture-backtrace"),
+        "should import capture-backtrace when backtrace() is used, got: {:?}",
         imports
     );
 }

@@ -1,37 +1,24 @@
-// Force-link all sub-crate symbols so their #[no_mangle] exports appear in the
-// final cdylib wasm module.  Each `extern crate` + `use` ensures the linker
-// pulls in the rlib and preserves its exported functions.
+// Component model build: wit-bindgen generates export adapters for all WIT interfaces.
+// The Guest trait implementations delegate to the underlying sub-crate functions.
+#[cfg(feature = "component")]
+mod component;
 
-extern crate nexus_stdio_wasm;
-extern crate nexus_string_wasm;
-extern crate nexus_net_wasm;
-extern crate nexus_core_wasm;
-extern crate nexus_math_wasm;
-extern crate nexus_fs_wasm;
-extern crate nexus_random_wasm;
-extern crate nexus_clock_wasm;
-extern crate nexus_proc_wasm;
-extern crate nexus_collection_wasm;
+// Non-component build: force-link all sub-crate symbols via extern crate.
+#[cfg(not(feature = "component"))]
+mod legacy;
 
-// Reference at least one item from each crate to prevent the linker from
-// discarding the crate entirely.  We use a single never-called function whose
-// address is taken but never invoked.
-#[used]
-static _FORCE_LINK: [fn(); 0] = [];
-
-// Single allocate / deallocate / cabi_realloc exported from the bundle.
-
-#[no_mangle]
+// Common: allocate / deallocate / cabi_realloc always available for the component.
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn allocate(size: i32) -> i32 {
     nexus_wasm_alloc::allocate(size)
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
     nexus_wasm_alloc::deallocate(ptr, size);
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub unsafe extern "C" fn cabi_realloc(
     old_ptr: i32,
     old_len: i32,

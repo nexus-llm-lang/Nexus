@@ -1,28 +1,28 @@
 use nexus_wasm_alloc::{checked_ptr_len, read_string};
 
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn allocate(size: i32) -> i32 {
     nexus_wasm_alloc::allocate(size)
 }
 
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
     nexus_wasm_alloc::deallocate(ptr, size);
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_length(s_ptr: i32, s_len: i32) -> i64 {
     read_string(s_ptr, s_len).chars().count() as i64
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_byte_length(_s_ptr: i32, s_len: i32) -> i64 {
     s_len as i64
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_contains(s_ptr: i32, s_len: i32, sub_ptr: i32, sub_len: i32) -> i32 {
     let s = read_string(s_ptr, s_len);
     let sub = read_string(sub_ptr, sub_len);
@@ -33,7 +33,7 @@ pub extern "C" fn __nx_string_contains(s_ptr: i32, s_len: i32, sub_ptr: i32, sub
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_substring(s_ptr: i32, s_len: i32, start: i64, len: i64) -> i64 {
     let s = read_string(s_ptr, s_len);
     let start = start.max(0) as usize;
@@ -42,14 +42,14 @@ pub extern "C" fn __nx_string_substring(s_ptr: i32, s_len: i32, start: i64, len:
     nexus_wasm_alloc::store_string_result(result)
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_index_of(s_ptr: i32, s_len: i32, sub_ptr: i32, sub_len: i32) -> i64 {
     let s = read_string(s_ptr, s_len);
     let sub = read_string(sub_ptr, sub_len);
     s.find(sub.as_str()).map(|i| i as i64).unwrap_or(-1)
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_starts_with(
     s_ptr: i32,
     s_len: i32,
@@ -65,7 +65,7 @@ pub extern "C" fn __nx_string_starts_with(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_ends_with(
     s_ptr: i32,
     s_len: i32,
@@ -81,22 +81,22 @@ pub extern "C" fn __nx_string_ends_with(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_trim(s_ptr: i32, s_len: i32) -> i64 {
     nexus_wasm_alloc::store_string_result(read_string(s_ptr, s_len).trim().to_string())
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_to_upper(s_ptr: i32, s_len: i32) -> i64 {
     nexus_wasm_alloc::store_string_result(read_string(s_ptr, s_len).to_uppercase())
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_to_lower(s_ptr: i32, s_len: i32) -> i64 {
     nexus_wasm_alloc::store_string_result(read_string(s_ptr, s_len).to_lowercase())
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_replace(
     s_ptr: i32,
     s_len: i32,
@@ -111,7 +111,7 @@ pub extern "C" fn __nx_string_replace(
     nexus_wasm_alloc::store_string_result(s.replace(from.as_str(), to.as_str()))
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_char_at(s_ptr: i32, s_len: i32, idx: i64) -> i32 {
     if idx < 0 {
         return 0;
@@ -123,7 +123,7 @@ pub extern "C" fn __nx_string_char_at(s_ptr: i32, s_len: i32, idx: i64) -> i32 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_from_char(c: i32) -> i64 {
     match char::from_u32(c as u32) {
         Some(ch) => nexus_wasm_alloc::store_string_result(ch.to_string()),
@@ -131,23 +131,23 @@ pub extern "C" fn __nx_string_from_char(c: i32) -> i64 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_from_i64(val: i64) -> i64 {
     nexus_wasm_alloc::store_string_result(val.to_string())
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_from_float(val: f64) -> i64 {
     nexus_wasm_alloc::store_string_result(val.to_string())
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_from_bool(val: i32) -> i64 {
     let b = val != 0;
     nexus_wasm_alloc::store_string_result(b.to_string())
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_to_i64(s_ptr: i32, s_len: i32) -> i64 {
     let s = read_string(s_ptr, s_len);
     match s.trim().parse::<i64>() {
@@ -158,14 +158,14 @@ pub extern "C" fn __nx_string_to_i64(s_ptr: i32, s_len: i32) -> i64 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_repeat(s_ptr: i32, s_len: i32, n: i64) -> i64 {
     let s = read_string(s_ptr, s_len);
     let count = n.max(0) as usize;
     nexus_wasm_alloc::store_string_result(s.repeat(count))
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_pad_left(
     s_ptr: i32,
     s_len: i32,
@@ -187,7 +187,7 @@ pub extern "C" fn __nx_string_pad_left(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_pad_right(
     s_ptr: i32,
     s_len: i32,
@@ -209,13 +209,13 @@ pub extern "C" fn __nx_string_pad_right(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_is_valid_i64(s_ptr: i32, s_len: i32) -> i32 {
     let s = read_string(s_ptr, s_len);
     if s.trim().parse::<i64>().is_ok() { 1 } else { 0 }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_char_code(s_ptr: i32, s_len: i32, idx: i64) -> i64 {
     if idx < 0 {
         return -1;
@@ -227,12 +227,12 @@ pub extern "C" fn __nx_string_char_code(s_ptr: i32, s_len: i32, idx: i64) -> i64
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_char_ord(c: i32) -> i64 {
     c as i64
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_from_char_code(code: i64) -> i64 {
     match char::from_u32(code as u32) {
         Some(c) => nexus_wasm_alloc::store_string_result(c.to_string()),
@@ -240,13 +240,13 @@ pub extern "C" fn __nx_string_from_char_code(code: i64) -> i64 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_to_f64(s_ptr: i32, s_len: i32) -> f64 {
     let s = read_string(s_ptr, s_len);
     s.trim().parse::<f64>().unwrap_or(f64::NAN)
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_is_valid_f64(s_ptr: i32, s_len: i32) -> i32 {
     let s = read_string(s_ptr, s_len);
     match s.trim().parse::<f64>() {
@@ -264,7 +264,7 @@ fn raw_bytes(s_ptr: i32, s_len: i32) -> Option<&'static [u8]> {
 
 /// Returns the raw byte value at the given byte position (0-255). O(1).
 /// Returns 0 if out of bounds.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_byte_at(s_ptr: i32, s_len: i32, idx: i64) -> i32 {
     let Some(bytes) = raw_bytes(s_ptr, s_len) else {
         return 0;
@@ -277,7 +277,7 @@ pub extern "C" fn __nx_string_byte_at(s_ptr: i32, s_len: i32, idx: i64) -> i32 {
 
 /// Scans from `start` while characters are ASCII identifier chars (a-z, A-Z, 0-9, _).
 /// Returns the byte position of the first non-ident character.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_scan_ident(s_ptr: i32, s_len: i32, start: i64) -> i64 {
     let Some(bytes) = raw_bytes(s_ptr, s_len) else {
         return start;
@@ -296,7 +296,7 @@ pub extern "C" fn __nx_string_scan_ident(s_ptr: i32, s_len: i32, start: i64) -> 
 
 /// Scans from `start` while characters are ASCII digits (0-9).
 /// Returns the byte position of the first non-digit character.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_scan_digits(s_ptr: i32, s_len: i32, start: i64) -> i64 {
     let Some(bytes) = raw_bytes(s_ptr, s_len) else {
         return start;
@@ -310,7 +310,7 @@ pub extern "C" fn __nx_string_scan_digits(s_ptr: i32, s_len: i32, start: i64) ->
 
 /// Skips ASCII whitespace (space, tab, \n, \r) from `start`.
 /// Returns the byte position of the first non-whitespace character.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_skip_ws(s_ptr: i32, s_len: i32, start: i64) -> i64 {
     let Some(bytes) = raw_bytes(s_ptr, s_len) else {
         return start;
@@ -328,7 +328,7 @@ pub extern "C" fn __nx_string_skip_ws(s_ptr: i32, s_len: i32, start: i64) -> i64
 }
 
 /// Counts the number of newline characters (\n) in the byte range [start, end).
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_count_newlines_in(s_ptr: i32, s_len: i32, start: i64, end: i64) -> i64 {
     let Some(bytes) = raw_bytes(s_ptr, s_len) else {
         return 0;
@@ -340,7 +340,7 @@ pub extern "C" fn __nx_string_count_newlines_in(s_ptr: i32, s_len: i32, start: i
 
 /// Returns the byte position of the last newline (\n) in range [start, end),
 /// or -1 if no newline is found.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_last_newline_in(s_ptr: i32, s_len: i32, start: i64, end: i64) -> i64 {
     let Some(bytes) = raw_bytes(s_ptr, s_len) else {
         return -1;
@@ -357,7 +357,7 @@ pub extern "C" fn __nx_string_last_newline_in(s_ptr: i32, s_len: i32, start: i64
 
 /// Finds the first occurrence of byte `ch` starting from `start`.
 /// Returns the byte position, or -1 if not found.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_find_byte(s_ptr: i32, s_len: i32, start: i64, ch: i32) -> i64 {
     let Some(bytes) = raw_bytes(s_ptr, s_len) else {
         return -1;
@@ -374,7 +374,7 @@ pub extern "C" fn __nx_string_find_byte(s_ptr: i32, s_len: i32, start: i64, ch: 
 
 /// Extracts a substring by byte offset and byte length. O(len).
 /// Unlike `substring` which uses character indices, this uses raw byte positions.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_byte_substring(s_ptr: i32, s_len: i32, start: i64, len: i64) -> i64 {
     let Some(bytes) = raw_bytes(s_ptr, s_len) else {
         return 0;

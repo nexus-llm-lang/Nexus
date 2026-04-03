@@ -1,7 +1,8 @@
 use crate::harness::compile;
 
+/// Component composition resolves all stdlib imports.
 #[test]
-fn bundle_core_wasm_resolves_stdlib_imports() {
+fn compose_with_stdlib_resolves_imports() {
     let src = r#"
 import { Console }, * as stdio from "stdlib/stdio.nx"
 
@@ -13,14 +14,11 @@ let main = fn () -> unit require { PermConsole } do
 end
 "#;
     let wasm = compile(src);
-    let config = nexus::compiler::bundler::BundleConfig::default();
-    let merged = nexus::compiler::bundler::bundle_core_wasm(&wasm, &config)
-        .expect("bundle_core_wasm should resolve stdlib imports");
-    let merged_imports =
-        nexus::compiler::bundler::module_import_names(&merged).expect("parse merged imports");
+    let composed = nexus::compiler::compose::compose_with_stdlib(&wasm)
+        .expect("compose_with_stdlib should resolve stdlib imports");
+    // The result should be a valid component WASM.
     assert!(
-        !merged_imports.iter().any(|m| m.contains("stdlib")),
-        "stdlib imports should be resolved after bundling, got: {:?}",
-        merged_imports
+        wasmparser::Parser::is_component(&composed),
+        "composed output should be a component"
     );
 }

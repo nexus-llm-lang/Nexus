@@ -13,20 +13,20 @@ thread_local! {
 }
 
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn allocate(size: i32) -> i32 {
     nexus_wasm_alloc::allocate(size)
 }
 
 #[cfg(not(feature = "no_alloc_export"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
     nexus_wasm_alloc::deallocate(ptr, size);
 }
 
 // ── HashMap ─────────────────────────────────────────────────────────
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_new() -> i64 {
     NEXT_MAP_ID.with(|next| {
         let id = next.get();
@@ -36,7 +36,7 @@ pub extern "C" fn __nx_hmap_new() -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_put(id: i64, key: i64, value: i64) -> i64 {
     MAPS.with(|maps| {
         if let Some(map) = maps.borrow_mut().get_mut(&id) {
@@ -46,7 +46,7 @@ pub extern "C" fn __nx_hmap_put(id: i64, key: i64, value: i64) -> i64 {
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_get(id: i64, key: i64, default_val: i64) -> i64 {
     MAPS.with(|maps| {
         maps.borrow()
@@ -56,7 +56,7 @@ pub extern "C" fn __nx_hmap_get(id: i64, key: i64, default_val: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_has(id: i64, key: i64) -> i32 {
     MAPS.with(|maps| {
         maps.borrow()
@@ -66,7 +66,7 @@ pub extern "C" fn __nx_hmap_has(id: i64, key: i64) -> i32 {
     }) as i32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_del(id: i64, key: i64) -> i32 {
     MAPS.with(|maps| {
         maps.borrow_mut()
@@ -76,7 +76,7 @@ pub extern "C" fn __nx_hmap_del(id: i64, key: i64) -> i32 {
     }) as i32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_size(id: i64) -> i64 {
     MAPS.with(|maps| {
         maps.borrow()
@@ -86,7 +86,7 @@ pub extern "C" fn __nx_hmap_size(id: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_keys(id: i64) -> i64 {
     MAPS.with(|maps| {
         let result = maps
@@ -103,7 +103,7 @@ pub extern "C" fn __nx_hmap_keys(id: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_vals(id: i64) -> i64 {
     MAPS.with(|maps| {
         let result = maps
@@ -121,7 +121,7 @@ pub extern "C" fn __nx_hmap_vals(id: i64) -> i64 {
 }
 
 /// Returns the key at the given index (iteration order). Returns 0 if out of bounds.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_key_at(id: i64, idx: i64) -> i64 {
     MAPS.with(|maps| {
         maps.borrow()
@@ -132,7 +132,7 @@ pub extern "C" fn __nx_hmap_key_at(id: i64, idx: i64) -> i64 {
 }
 
 /// Returns the value at the given index (iteration order). Returns 0 if out of bounds.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_val_at(id: i64, idx: i64) -> i64 {
     MAPS.with(|maps| {
         maps.borrow()
@@ -142,14 +142,14 @@ pub extern "C" fn __nx_hmap_val_at(id: i64, idx: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_free(id: i64) -> i32 {
     MAPS.with(|maps| maps.borrow_mut().remove(&id).is_some()) as i32
 }
 
 // ── HashSet ─────────────────────────────────────────────────────────
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hset_new() -> i64 {
     NEXT_SET_ID.with(|next| {
         let id = next.get();
@@ -159,7 +159,7 @@ pub extern "C" fn __nx_hset_new() -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hset_insert(id: i64, val: i64) -> i32 {
     SETS.with(|sets| {
         sets.borrow_mut()
@@ -169,7 +169,7 @@ pub extern "C" fn __nx_hset_insert(id: i64, val: i64) -> i32 {
     }) as i32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hset_contains(id: i64, val: i64) -> i32 {
     SETS.with(|sets| {
         sets.borrow()
@@ -179,7 +179,7 @@ pub extern "C" fn __nx_hset_contains(id: i64, val: i64) -> i32 {
     }) as i32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hset_remove(id: i64, val: i64) -> i32 {
     SETS.with(|sets| {
         sets.borrow_mut()
@@ -189,7 +189,7 @@ pub extern "C" fn __nx_hset_remove(id: i64, val: i64) -> i32 {
     }) as i32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hset_size(id: i64) -> i64 {
     SETS.with(|sets| {
         sets.borrow()
@@ -199,7 +199,7 @@ pub extern "C" fn __nx_hset_size(id: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hset_to_list(id: i64) -> i64 {
     SETS.with(|sets| {
         let result = sets
@@ -216,7 +216,7 @@ pub extern "C" fn __nx_hset_to_list(id: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hset_union(id_a: i64, id_b: i64) -> i64 {
     SETS.with(|sets| {
         NEXT_SET_ID.with(|next| {
@@ -234,7 +234,7 @@ pub extern "C" fn __nx_hset_union(id_a: i64, id_b: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hset_intersection(id_a: i64, id_b: i64) -> i64 {
     SETS.with(|sets| {
         NEXT_SET_ID.with(|next| {
@@ -252,7 +252,7 @@ pub extern "C" fn __nx_hset_intersection(id_a: i64, id_b: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hset_difference(id_a: i64, id_b: i64) -> i64 {
     SETS.with(|sets| {
         NEXT_SET_ID.with(|next| {
@@ -270,14 +270,14 @@ pub extern "C" fn __nx_hset_difference(id_a: i64, id_b: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hset_free(id: i64) -> i32 {
     SETS.with(|sets| sets.borrow_mut().remove(&id).is_some()) as i32
 }
 
 // ── StringMap (String → i64) ────────────────────────────────────────
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_new() -> i64 {
     NEXT_SMAP_ID.with(|next| {
         let id = next.get();
@@ -287,7 +287,7 @@ pub extern "C" fn __nx_smap_new() -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_put(id: i64, key_ptr: i32, key_len: i32, value: i64) -> i64 {
     let key = nexus_wasm_alloc::read_string(key_ptr, key_len);
     SMAPS.with(|maps| {
@@ -298,7 +298,7 @@ pub extern "C" fn __nx_smap_put(id: i64, key_ptr: i32, key_len: i32, value: i64)
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_get(id: i64, key_ptr: i32, key_len: i32, default_val: i64) -> i64 {
     let key = nexus_wasm_alloc::read_string(key_ptr, key_len);
     SMAPS.with(|maps| {
@@ -309,7 +309,7 @@ pub extern "C" fn __nx_smap_get(id: i64, key_ptr: i32, key_len: i32, default_val
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_has(id: i64, key_ptr: i32, key_len: i32) -> i32 {
     let key = nexus_wasm_alloc::read_string(key_ptr, key_len);
     SMAPS.with(|maps| {
@@ -320,7 +320,7 @@ pub extern "C" fn __nx_smap_has(id: i64, key_ptr: i32, key_len: i32) -> i32 {
     }) as i32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_del(id: i64, key_ptr: i32, key_len: i32) -> i32 {
     let key = nexus_wasm_alloc::read_string(key_ptr, key_len);
     SMAPS.with(|maps| {
@@ -331,7 +331,7 @@ pub extern "C" fn __nx_smap_del(id: i64, key_ptr: i32, key_len: i32) -> i32 {
     }) as i32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_size(id: i64) -> i64 {
     SMAPS.with(|maps| {
         maps.borrow()
@@ -341,7 +341,7 @@ pub extern "C" fn __nx_smap_size(id: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_keys(id: i64) -> i64 {
     SMAPS.with(|maps| {
         let result = maps
@@ -353,7 +353,7 @@ pub extern "C" fn __nx_smap_keys(id: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_vals(id: i64) -> i64 {
     SMAPS.with(|maps| {
         let result = maps
@@ -371,7 +371,7 @@ pub extern "C" fn __nx_smap_vals(id: i64) -> i64 {
 }
 
 /// Returns the number of values (== size). Used for index-based iteration.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_val_count(id: i64) -> i64 {
     SMAPS.with(|maps| {
         maps.borrow()
@@ -382,7 +382,7 @@ pub extern "C" fn __nx_smap_val_count(id: i64) -> i64 {
 }
 
 /// Returns the value at the given index (iteration order). Returns 0 if out of bounds.
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_val_at(id: i64, idx: i64) -> i64 {
     SMAPS.with(|maps| {
         maps.borrow()
@@ -392,14 +392,14 @@ pub extern "C" fn __nx_smap_val_at(id: i64, idx: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_free(id: i64) -> i32 {
     SMAPS.with(|maps| maps.borrow_mut().remove(&id).is_some()) as i32
 }
 
 // ── ByteBuffer (Vec<u8>) ────────────────────────────────────────────
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_new() -> i64 {
     NEXT_BUF_ID.with(|next| {
         let id = next.get();
@@ -409,7 +409,7 @@ pub extern "C" fn __nx_buf_new() -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_push_byte(id: i64, byte: i64) {
     BUFS.with(|bufs| {
         if let Some(buf) = bufs.borrow_mut().get_mut(&id) {
@@ -418,7 +418,7 @@ pub extern "C" fn __nx_buf_push_byte(id: i64, byte: i64) {
     });
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_push_i32_le(id: i64, val: i64) {
     BUFS.with(|bufs| {
         if let Some(buf) = bufs.borrow_mut().get_mut(&id) {
@@ -427,7 +427,7 @@ pub extern "C" fn __nx_buf_push_i32_le(id: i64, val: i64) {
     });
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_push_i64_le(id: i64, val: i64) {
     BUFS.with(|bufs| {
         if let Some(buf) = bufs.borrow_mut().get_mut(&id) {
@@ -436,7 +436,7 @@ pub extern "C" fn __nx_buf_push_i64_le(id: i64, val: i64) {
     });
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_push_f64_str_le(id: i64, s_ptr: i32, s_len: i32) {
     let s = nexus_wasm_alloc::read_string(s_ptr, s_len);
     let val: f64 = s.trim().parse().unwrap_or(0.0);
@@ -447,7 +447,7 @@ pub extern "C" fn __nx_buf_push_f64_str_le(id: i64, s_ptr: i32, s_len: i32) {
     });
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_push_leb128_u(id: i64, mut val: i64) {
     BUFS.with(|bufs| {
         if let Some(buf) = bufs.borrow_mut().get_mut(&id) {
@@ -466,7 +466,7 @@ pub extern "C" fn __nx_buf_push_leb128_u(id: i64, mut val: i64) {
     });
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_push_leb128_s(id: i64, val: i64) {
     BUFS.with(|bufs| {
         if let Some(buf) = bufs.borrow_mut().get_mut(&id) {
@@ -486,7 +486,7 @@ pub extern "C" fn __nx_buf_push_leb128_s(id: i64, val: i64) {
     });
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_push_string(id: i64, s_ptr: i32, s_len: i32) {
     let s = nexus_wasm_alloc::read_string(s_ptr, s_len);
     BUFS.with(|bufs| {
@@ -496,7 +496,7 @@ pub extern "C" fn __nx_buf_push_string(id: i64, s_ptr: i32, s_len: i32) {
     });
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_push_buf(dst_id: i64, src_id: i64) {
     BUFS.with(|bufs| {
         let borrowed = bufs.borrow();
@@ -508,7 +508,7 @@ pub extern "C" fn __nx_buf_push_buf(dst_id: i64, src_id: i64) {
     });
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_length(id: i64) -> i64 {
     BUFS.with(|bufs| {
         bufs.borrow()
@@ -518,7 +518,7 @@ pub extern "C" fn __nx_buf_length(id: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_get_byte(id: i64, idx: i64) -> i64 {
     BUFS.with(|bufs| {
         bufs.borrow()
@@ -528,7 +528,7 @@ pub extern "C" fn __nx_buf_get_byte(id: i64, idx: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_to_string(id: i64) -> i64 {
     BUFS.with(|bufs| {
         let s = bufs
@@ -540,7 +540,7 @@ pub extern "C" fn __nx_buf_to_string(id: i64) -> i64 {
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_write_file(id: i64, path_ptr: i32, path_len: i32) -> i32 {
     let path = nexus_wasm_alloc::read_string(path_ptr, path_len);
     BUFS.with(|bufs| {
@@ -552,7 +552,7 @@ pub extern "C" fn __nx_buf_write_file(id: i64, path_ptr: i32, path_len: i32) -> 
     })
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_free(id: i64) -> i32 {
     BUFS.with(|bufs| bufs.borrow_mut().remove(&id).is_some()) as i32
 }

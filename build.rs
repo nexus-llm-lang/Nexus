@@ -10,6 +10,8 @@ struct WasmModule {
     src_rel: &'static str,
     artifact_name: &'static str,
     output_name: &'static str,
+    /// Extra cargo features to pass when building (e.g. "component").
+    features: &'static str,
 }
 
 const MODULES: &[WasmModule] = &[
@@ -18,12 +20,22 @@ const MODULES: &[WasmModule] = &[
         src_rel: "src/lib/stdlib_bundle/src",
         artifact_name: "nexus_stdlib_bundle.wasm",
         output_name: "stdlib.wasm",
+        features: "",
+    },
+    // Component model build of stdlib: wit-bindgen canonical ABI exports.
+    WasmModule {
+        manifest_rel: "src/lib/stdlib_bundle/Cargo.toml",
+        src_rel: "src/lib/stdlib_bundle/src",
+        artifact_name: "nexus_stdlib_bundle.wasm",
+        output_name: "stdlib-component.wasm",
+        features: "component",
     },
     WasmModule {
         manifest_rel: "src/lib/nexus_host_bridge/Cargo.toml",
         src_rel: "src/lib/nexus_host_bridge",
         artifact_name: "nexus_nexus_host_bridge_wasm.wasm",
         output_name: "nexus-host-bridge.wasm",
+        features: "",
     },
 ];
 
@@ -65,17 +77,20 @@ fn main() {
     };
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 
-    for module in MODULES {
-        let manifest_path = repo_root.join(module.manifest_rel);
-        build_wasm_crate(&cargo, &manifest_path, &profile);
-    }
+    // Track WIT files for component model rebuilds.
+    println!("cargo:rerun-if-changed=src/lib/stdlib_bundle/wit");
 
     let out_dir = repo_root.join("nxlib/stdlib");
     fs::create_dir_all(&out_dir).expect("failed to create nxlib/stdlib");
 
+    // Build and copy each module immediately (multiple builds of the same crate
+    // with different features share the same artifact path, so we must copy
+    // before the next build overwrites it).
     for module in MODULES {
-        let manifest_parent = repo_root
-            .join(module.manifest_rel)
+        let manifest_path = repo_root.join(module.manifest_rel);
+        build_wasm_crate(&cargo, &manifest_path, &profile, module.features);
+
+        let manifest_parent = manifest_path
             .parent()
             .expect("manifest path has parent")
             .to_path_buf();
@@ -89,7 +104,7 @@ fn main() {
     }
 }
 
-fn build_wasm_crate(cargo: &str, manifest_path: &Path, profile: &str) {
+fn build_wasm_crate(cargo: &str, manifest_path: &Path, profile: &str, features: &str) {
     let mut cmd = Command::new(cargo);
     cmd.arg("build")
         .arg("--manifest-path")
@@ -99,6 +114,9 @@ fn build_wasm_crate(cargo: &str, manifest_path: &Path, profile: &str) {
         .env_remove("CARGO_TARGET_DIR");
     if profile == "release" {
         cmd.arg("--release");
+    }
+    if !features.is_empty() {
+        cmd.arg("--features").arg(features);
     }
 
     let status = cmd.status().unwrap_or_else(|e| {

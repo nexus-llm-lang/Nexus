@@ -3,12 +3,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static RNG_STATE: AtomicU64 = AtomicU64::new(0);
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_random_i64() -> i64 {
     (next_random_u64() & 0x7fff_ffff_ffff_ffff) as i64
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_random_range(min: i64, max: i64) -> i64 {
     if max <= min {
         return min;
