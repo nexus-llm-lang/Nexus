@@ -1,8 +1,12 @@
 pub mod diagnostics;
 pub mod effects;
+pub mod error_snapshots;
 pub mod exhaustiveness;
 pub mod ffi;
+pub mod fuzz;
 pub mod inference;
 pub mod linear;
 pub mod modules;
 pub mod ports;
+pub mod soundness;
+pub mod unification;
