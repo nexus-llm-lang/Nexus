@@ -680,6 +680,7 @@ fn collect_funcref_targets(program: &LirProgram) -> Vec<Symbol> {
                     scan_stmt(s, targets);
                 }
             }
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
     for func in &program.functions {
@@ -765,6 +766,7 @@ fn collect_indirect_call_types(program: &LirProgram) -> Vec<Type> {
                     scan_stmt(s, types, seen);
                 }
             }
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
     for func in &program.functions {
@@ -857,6 +859,7 @@ fn program_needs_eh(program: &LirProgram) -> bool {
                 cases.iter().any(|c| c.body.iter().any(stmt_needs_bt))
                     || default_body.iter().any(stmt_needs_bt)
             }
+            LirStmt::FieldUpdate { .. } => false,
         }
     }
     program
@@ -889,6 +892,7 @@ fn program_needs_lazy(program: &LirProgram) -> bool {
             LirStmt::TryCatch { body, catch_body, .. } => {
                 body.iter().any(stmt_has_lazy) || catch_body.iter().any(stmt_has_lazy)
             }
+            LirStmt::FieldUpdate { .. } => false,
         }
     }
     program.functions.iter().any(|f| f.body.iter().any(stmt_has_lazy))

@@ -64,7 +64,7 @@ pub(super) struct TcmcInfo {
 use super::binary::{binary_operand_type, compile_binary};
 use super::emit::{
     compile_external_arg, constructor_tag, emit_alloc_object, emit_numeric_coercion,
-    emit_pack_value_to_i64, emit_unpack_i64_to_value, memarg, record_tag, type_to_wasm_valtype,
+    emit_typed_field_load, emit_typed_field_store, memarg, record_tag, type_to_wasm_valtype,
 };
 use super::error::CodegenError;
 use super::layout::CodegenLayout;
@@ -239,10 +239,11 @@ pub(super) fn compile_function(
                 // Link last cell's rest to fallthrough value
                 out.instruction(&Instruction::LocalGet(tcmc.prev_local));
                 compile_atom(&func.ret, &mut out, &local_map, layout)?;
-                emit_pack_value_to_i64(&func.ret.typ(), &mut out)?;
-                out.instruction(&Instruction::I64Store(memarg(
+                emit_typed_field_store(
+                    &func.ret.typ(),
                     ((tcmc.rest_field_idx + 1) * 8) as u64,
-                )));
+                    &mut out,
+                )?;
                 out.instruction(&Instruction::LocalGet(tcmc.head_local));
             }
             out.instruction(&Instruction::Else);
@@ -355,6 +356,7 @@ fn collect_stmt_locals(
                 }
                 collect_stmt_locals(default_body, local_map, next_local_index, local_decls_flat)?;
             }
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
     Ok(())
@@ -534,6 +536,7 @@ fn collect_defs_nested(stmt: &LirStmt, pos: usize, def_pos: &mut HashMap<Symbol,
             }
         }
         LirStmt::Let { .. } => {}
+        LirStmt::FieldUpdate { .. } => {}
     }
 }
 
@@ -631,6 +634,10 @@ fn collect_refs_in_stmt(stmt: &LirStmt, refs: &mut HashSet<Symbol>) {
             if let Some(r) = default_ret {
                 collect_refs_in_atom(r, refs);
             }
+        }
+        LirStmt::FieldUpdate { target, value, .. } => {
+            collect_refs_in_atom(target, refs);
+            collect_refs_in_atom(value, refs);
         }
     }
 }
@@ -878,8 +885,7 @@ pub(super) fn compile_expr(
             for (idx, arg) in args.iter().enumerate() {
                 out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
                 compile_atom(arg, out, local_map, layout)?;
-                emit_pack_value_to_i64(&arg.typ(), out)?;
-                out.instruction(&Instruction::I64Store(memarg(((idx + 1) * 8) as u64)));
+                emit_typed_field_store(&arg.typ(), ((idx + 1) * 8) as u64, out)?;
             }
 
             out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
@@ -901,8 +907,7 @@ pub(super) fn compile_expr(
             for (idx, (_, value)) in fields.iter().enumerate() {
                 out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
                 compile_atom(value, out, local_map, layout)?;
-                emit_pack_value_to_i64(&value.typ(), out)?;
-                out.instruction(&Instruction::I64Store(memarg(((idx + 1) * 8) as u64)));
+                emit_typed_field_store(&value.typ(), ((idx + 1) * 8) as u64, out)?;
             }
 
             out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
@@ -924,8 +929,7 @@ pub(super) fn compile_expr(
             out.instruction(&Instruction::LocalSet(temps.object_ptr_i32));
 
             out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
-            out.instruction(&Instruction::I64Load(memarg(((index + 1) * 8) as u64)));
-            emit_unpack_i64_to_value(typ, out)?;
+            emit_typed_field_load(typ, ((index + 1) * 8) as u64, out)?;
             Ok(())
         }
         LirExpr::Raise { value, .. } => {
@@ -986,8 +990,7 @@ pub(super) fn compile_expr(
             for (i, (_, atom)) in captures.iter().enumerate() {
                 out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
                 compile_atom(atom, out, local_map, layout)?;
-                emit_pack_value_to_i64(&atom.typ(), out)?;
-                out.instruction(&Instruction::I64Store(memarg(((i + 1) * 8) as u64)));
+                emit_typed_field_store(&atom.typ(), ((i + 1) * 8) as u64, out)?;
             }
             // Return closure ptr as i64
             out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
@@ -998,9 +1001,7 @@ pub(super) fn compile_expr(
             // Load captured value from __env (first function parameter, local 0)
             out.instruction(&Instruction::LocalGet(0)); // __env: i64
             out.instruction(&Instruction::I32WrapI64); // convert to address
-            out.instruction(&Instruction::I64Load(memarg(((index + 1) * 8) as u64)));
-            // Unpack from i64 to target type
-            emit_unpack_i64_to_value(typ, out)?;
+            emit_typed_field_load(typ, ((index + 1) * 8) as u64, out)?;
             Ok(())
         }
         LirExpr::CallIndirect {
@@ -1222,8 +1223,7 @@ pub(super) fn emit_tcmc_cons_and_loop(
     for &(idx, ref atom) in &tcmc.non_rec_fields {
         out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
         compile_atom(atom, out, local_map, layout)?;
-        emit_pack_value_to_i64(&atom.typ(), out)?;
-        out.instruction(&Instruction::I64Store(memarg(((idx + 1) * 8) as u64)));
+        emit_typed_field_store(&atom.typ(), ((idx + 1) * 8) as u64, out)?;
     }
 
     // 2. Link to previous cell (or set head if first)

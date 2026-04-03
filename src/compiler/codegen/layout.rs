@@ -216,6 +216,7 @@ fn stmt_uses_object_heap(stmt: &LirStmt) -> bool {
                 .any(|c| c.body.iter().any(stmt_uses_object_heap))
                 || default_body.iter().any(stmt_uses_object_heap)
         }
+        LirStmt::FieldUpdate { .. } => true,
     }
 }
 
@@ -335,6 +336,7 @@ fn collect_strings_in_stmt(stmt: &LirStmt, out: &mut Vec<String>) {
                 collect_strings_in_atom(ret, out);
             }
         }
+        LirStmt::FieldUpdate { .. } => {}
     }
 }
 

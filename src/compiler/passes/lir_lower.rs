@@ -2750,6 +2750,7 @@ fn collect_lir_funcref_targets(functions: &[LirFunction]) -> HashSet<Symbol> {
                     scan_stmt(s, targets);
                 }
             }
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
     for func in functions {
@@ -3015,6 +3016,7 @@ fn update_funcref_targets(functions: &mut [LirFunction], old_name: Symbol, new_n
                     update_stmt(s, old, new);
                 }
             }
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
     for func in functions.iter_mut() {

@@ -7,7 +7,7 @@ use crate::intern::Symbol;
 use crate::ir::lir::{LirExpr, LirProgram, LirStmt, SwitchCase};
 use crate::types::Type;
 
-use super::emit::{emit_numeric_coercion, emit_pack_value_to_i64, memarg};
+use super::emit::{emit_numeric_coercion, emit_typed_field_store};
 use super::error::CodegenError;
 use super::function::{compile_atom, compile_expr, emit_tcmc_cons_and_loop, TcmcInfo, TcoLoop};
 use super::layout::CodegenLayout;
@@ -35,10 +35,11 @@ fn emit_return_with_tcmc(
             // Link last cell's rest to base value
             out.instruction(&Instruction::LocalGet(tcmc.prev_local));
             compile_atom(ret_val, out, local_map, layout)?;
-            emit_pack_value_to_i64(&ret_val.typ(), out)?;
-            out.instruction(&Instruction::I64Store(memarg(
+            emit_typed_field_store(
+                &ret_val.typ(),
                 ((tcmc.rest_field_idx + 1) * 8) as u64,
-            )));
+                out,
+            )?;
             // Return head of built list
             out.instruction(&Instruction::LocalGet(tcmc.head_local));
             out.instruction(&Instruction::Return);
@@ -385,6 +386,21 @@ pub(super) fn compile_stmt(
             out.instruction(&Instruction::Br(0));
             out.instruction(&Instruction::End);
             out.instruction(&Instruction::End);
+            Ok(())
+        }
+        LirStmt::FieldUpdate {
+            target,
+            byte_offset,
+            value,
+            value_typ,
+        } => {
+            // Emit in-place heap word update for linear value reuse
+            compile_atom(target, out, local_map, layout)?;
+            out.instruction(&Instruction::I32WrapI64);
+            out.instruction(&Instruction::LocalSet(temps.object_ptr_i32));
+            out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+            compile_atom(value, out, local_map, layout)?;
+            emit_typed_field_store(value_typ, *byte_offset, out)?;
             Ok(())
         }
         LirStmt::Switch {

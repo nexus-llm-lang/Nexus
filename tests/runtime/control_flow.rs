@@ -1196,3 +1196,118 @@ end
 "#,
     );
 }
+
+#[test]
+fn sra_immediate_match_eliminates_allocation() {
+    exec(
+        r#"
+type Box = Box(value: i64)
+
+let main = fn () -> unit throws { Exn } do
+    let result = match Box(value: 99) do
+        case Box(value: v) -> v
+    end
+    if result != 99 then raise RuntimeError(val: "expected 99") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn sra_multi_field_destructure() {
+    exec(
+        r#"
+type Pair = Pair(fst: i64, snd: i64)
+
+let main = fn () -> unit throws { Exn } do
+    let p = Pair(fst: 10, snd: 20)
+    let sum = match p do
+        case Pair(fst: a, snd: b) -> a + b
+    end
+    if sum != 30 then raise RuntimeError(val: "expected 30") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn linear_reuse_match_reconstruct_same_constructor() {
+    exec(
+        r#"
+type Box = Box(value: i64)
+
+let update_box = fn (b: %Box) -> Box do
+    match b do
+        case Box(value: v) -> return Box(value: v + 1)
+    end
+end
+
+let main = fn () -> unit throws { Exn } do
+    let %b = Box(value: 42)
+    let result = update_box(b: %b)
+    match result do
+        case Box(value: v) ->
+            if v != 43 then raise RuntimeError(val: "expected 43") end
+    end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn linear_reuse_multi_field_partial_update() {
+    exec(
+        r#"
+type Pair = Pair(fst: i64, snd: i64)
+
+let update_fst = fn (p: %Pair) -> Pair do
+    match p do
+        case Pair(fst: a, snd: b) -> return Pair(fst: a * 10, snd: b)
+    end
+end
+
+let main = fn () -> unit throws { Exn } do
+    let %p = Pair(fst: 3, snd: 7)
+    let result = update_fst(p: %p)
+    match result do
+        case Pair(fst: a, snd: b) ->
+            if a != 30 then raise RuntimeError(val: "fst expected 30") end
+            if b != 7 then raise RuntimeError(val: "snd expected 7") end
+    end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn linear_reuse_chained_updates() {
+    exec(
+        r#"
+type Triple = Triple(a: i64, b: i64, c: i64)
+
+let inc_a = fn (t: %Triple) -> Triple do
+    match t do
+        case Triple(a: x, b: y, c: z) -> return Triple(a: x + 1, b: y, c: z)
+    end
+end
+
+let main = fn () -> unit throws { Exn } do
+    let %t = Triple(a: 0, b: 10, c: 20)
+    let %t2 = inc_a(t: %t)
+    let %t3 = inc_a(t: %t2)
+    let result = inc_a(t: %t3)
+    match result do
+        case Triple(a: a, b: b, c: c) ->
+            if a != 3 then raise RuntimeError(val: "a expected 3") end
+            if b != 10 then raise RuntimeError(val: "b expected 10") end
+            if c != 20 then raise RuntimeError(val: "c expected 20") end
+    end
+    return ()
+end
+"#,
+    );
+}

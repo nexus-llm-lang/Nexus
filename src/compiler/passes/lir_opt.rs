@@ -10,9 +10,10 @@
 
 use std::collections::HashMap;
 
+use crate::compiler::type_tag::constructor_tag;
 use crate::intern::Symbol;
-use crate::ir::lir::{LirAtom, LirExpr, LirFunction, LirProgram, LirStmt, SwitchCase};
-use crate::types::{BinaryOp, Type};
+use crate::ir::lir::{LirAtom, LirExpr, LirFunction, LirParam, LirProgram, LirStmt, SwitchCase};
+use crate::types::{BinaryOp, Span, Type};
 
 /// Run all LIR optimization passes on the program (mutates in place).
 /// When `parallel_lazy` is true, consecutive zero-arg forces are converted to
@@ -25,6 +26,11 @@ pub fn optimize_lir(program: &mut LirProgram) {
 pub fn optimize_lir_with_opts(program: &mut LirProgram, parallel_lazy: bool) {
     // Phase 0: Program-level function inlining (before per-function passes)
     inline_small_functions(program);
+
+    // Phase 0.5: Deforestation — fuse chained list operations (map∘map, etc.)
+    //   to eliminate intermediate list allocations. Runs at program level because
+    //   it may generate new synthetic functions for composition.
+    fuse_list_operations(program);
 
     for func in &mut program.functions {
         optimize_function(func, parallel_lazy);
@@ -51,6 +57,13 @@ fn optimize_function(func: &mut LirFunction, parallel_lazy: bool) {
     let mut subst = HashMap::new();
     copy_propagate_stmts(&mut func.body, &mut subst, &multi_bound);
     subst_atom(&mut func.ret, &subst);
+    // 3.5. Scalar replacement of aggregates: eliminate Constructor allocations
+    //      when the result is only used via ObjectTag/ObjectField (never escapes).
+    scalar_replace_aggregates(&mut func.body, &func.ret);
+    // 3.6. Linear reuse: replace Constructor with in-place FieldUpdate when
+    //      the constructor args trace back to ObjectField extractions from a
+    //      provably-dead source, saving the heap allocation.
+    reuse_linear_constructors(&mut func.body);
     // 4. Dead let elimination — iterate to fixpoint because removing a dead Let
     //    may make its referenced variables dead too (cascading dead code).
     for _ in 0..8 {
@@ -131,6 +144,7 @@ fn count_let_bindings(stmts: &[LirStmt], counts: &mut HashMap<Symbol, u32>) {
                 }
                 count_let_bindings(default_body, counts);
             }
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
 }
@@ -229,6 +243,7 @@ fn recurse_switch_recognition(stmt: &mut LirStmt) {
             recognize_switches_in_stmts(default_body);
         }
         LirStmt::Let { .. } => {}
+        LirStmt::FieldUpdate { .. } => {}
     }
 }
 
@@ -419,6 +434,7 @@ fn constant_fold_stmt(stmt: &mut LirStmt) {
             }
             constant_fold_stmts(default_body);
         }
+        LirStmt::FieldUpdate { .. } => {}
     }
 }
 
@@ -587,6 +603,7 @@ fn eliminate_constant_branches(stmts: &mut Vec<LirStmt>) {
                 eliminate_constant_branches(default_body);
             }
             LirStmt::Let { .. } => {}
+            LirStmt::FieldUpdate { .. } => {}
         }
 
         // Now check if this stmt has a constant condition
@@ -716,6 +733,10 @@ fn copy_propagate_stmt(
             if let Some(ret) = default_ret {
                 subst_atom(ret, subst);
             }
+        }
+        LirStmt::FieldUpdate { target, value, .. } => {
+            subst_atom(target, subst);
+            subst_atom(value, subst);
         }
     }
 }
@@ -868,6 +889,10 @@ fn count_uses_in_stmt(stmt: &LirStmt, uses: &mut HashMap<Symbol, u32>) {
                 count_uses_in_atom(ret, uses);
             }
         }
+        LirStmt::FieldUpdate { target, value, .. } => {
+            count_uses_in_atom(target, uses);
+            count_uses_in_atom(value, uses);
+        }
     }
 }
 
@@ -967,6 +992,7 @@ fn count_dead_lets(stmts: &[LirStmt], uses: &HashMap<Symbol, u32>) -> usize {
                 }
                 count += count_dead_lets(default_body, uses);
             }
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
     count
@@ -1019,6 +1045,7 @@ fn eliminate_dead_lets(stmts: &mut Vec<LirStmt>, uses: &HashMap<Symbol, u32>) {
                 }
                 eliminate_dead_lets(default_body, uses);
             }
+            LirStmt::FieldUpdate { .. } => {}  // keep — side-effecting
         }
         true
     });
@@ -1118,6 +1145,7 @@ fn strip_unreachable_stmts(stmts: &mut Vec<LirStmt>) {
                 strip_unreachable_stmts(default_body);
             }
             LirStmt::Let { .. } => {}
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
 }
@@ -1184,6 +1212,7 @@ fn hoist_loop_invariants(stmts: &mut Vec<LirStmt>) {
                 }
             }
             LirStmt::Let { .. } => {}
+            LirStmt::FieldUpdate { .. } => {}
         }
         i += 1;
     }
@@ -1231,6 +1260,7 @@ fn collect_defined_vars(stmts: &[LirStmt], defs: &mut HashSet<Symbol>) {
                 }
                 collect_defined_vars(default_body, defs);
             }
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
 }
@@ -1432,6 +1462,7 @@ fn devirtualize_calls_in_stmts(
                 }
                 count += devirtualize_calls_in_stmts(default_body, funcref_map);
             }
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
     count
@@ -1715,6 +1746,10 @@ fn apply_subst_to_stmt(stmt: &mut LirStmt, subst: &HashMap<Symbol, LirAtom>) {
                 subst_atom(ret, subst);
             }
         }
+        LirStmt::FieldUpdate { target, value, .. } => {
+            subst_atom(target, subst);
+            subst_atom(value, subst);
+        }
     }
 }
 
@@ -1965,6 +2000,11 @@ fn hash_stmt(stmt: &LirStmt, h: &mut impl std::hash::Hasher) {
         } => {
             hash_stmts(cond_stmts, h);
             hash_stmts(body, h);
+        }
+        LirStmt::FieldUpdate { target, byte_offset, value, .. } => {
+            hash_atom_structure(target, h);
+            byte_offset.hash(h);
+            hash_atom_structure(value, h);
         }
     }
 }
@@ -2272,6 +2312,7 @@ fn redirect_calls_in_stmts(stmts: &mut [LirStmt], redirect: &HashMap<Symbol, Sym
                 }
                 redirect_calls_in_stmts(default_body, redirect);
             }
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
 }
@@ -2339,6 +2380,7 @@ fn parallelize_consecutive_forces(stmts: &mut Vec<LirStmt>) {
                 parallelize_consecutive_forces(catch_body);
             }
             LirStmt::Let { .. } => {}
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
 
@@ -2436,4 +2478,793 @@ fn parallelize_consecutive_forces(stmts: &mut Vec<LirStmt>) {
         }
     }
     *stmts = new_stmts;
+}
+
+// ─── Linear reuse: in-place Constructor update ─────────────────────────────
+
+/// Replace Constructor allocations with in-place FieldUpdate when the constructor
+/// args trace back to ObjectField extractions from a source that is dead afterward.
+///
+/// Detects patterns like:
+///   let f0 = ObjectField(src, 0)
+///   let f1 = ObjectField(src, 1)
+///   let new_val = Call(g, [f0])
+///   let result = Constructor("Cons", [new_val, f1])
+///
+/// Transforms to:
+// ─── Scalar Replacement of Aggregates (SRA) ────────────────────────────────
+
+/// Eliminate Constructor heap allocations when the result is only accessed
+/// through ObjectTag / ObjectField (never escapes to calls, returns, etc.).
+///
+///   let x = Constructor("Some", [v])   ← HEAP ALLOC
+///   let tag = ObjectTag(x)              ← tag read
+///   let field = ObjectField(x, 0)       ← field read
+///
+// ─── Deforestation: fuse chained list operations ────────────────────────────
+
+/// Fuse consecutive list operations to eliminate intermediate list allocations.
+/// Currently handles:
+///   - map∘map: `map(f, map(g, xs))` → `map(f∘g, xs)` (single traversal)
+///   - reverse∘reverse: `reverse(reverse(xs))` → `xs` (identity)
+fn fuse_list_operations(program: &mut LirProgram) {
+    // Identify stdlib list function names from externals.
+    let mut map_funcs = HashSet::new();
+    let mut reverse_funcs = HashSet::new();
+    for ext in &program.externals {
+        if ext.wasm_name.as_str() == "map" {
+            map_funcs.insert(ext.name);
+        }
+        if ext.wasm_name.as_str() == "reverse" {
+            reverse_funcs.insert(ext.name);
+        }
+    }
+
+    if map_funcs.is_empty() && reverse_funcs.is_empty() {
+        return;
+    }
+
+    // Pre-collect function signatures (name → params, ret_type) to avoid borrow conflicts.
+    let func_sigs: HashMap<Symbol, (Vec<LirParam>, Type)> = program
+        .functions
+        .iter()
+        .map(|f| (f.name, (f.params.clone(), f.ret_type.clone())))
+        .collect();
+
+    let mut new_funcs: Vec<LirFunction> = Vec::new();
+    let mut compose_counter = 0u32;
+
+    for func in &mut program.functions {
+        fuse_in_stmts(
+            &mut func.body,
+            &map_funcs,
+            &reverse_funcs,
+            &func_sigs,
+            &mut new_funcs,
+            &mut compose_counter,
+        );
+    }
+
+    program.functions.extend(new_funcs);
+}
+
+fn fuse_in_stmts(
+    stmts: &mut Vec<LirStmt>,
+    map_funcs: &HashSet<Symbol>,
+    reverse_funcs: &HashSet<Symbol>,
+    func_sigs: &HashMap<Symbol, (Vec<LirParam>, Type)>,
+    new_funcs: &mut Vec<LirFunction>,
+    counter: &mut u32,
+) {
+    // Recurse into sub-bodies first.
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            LirStmt::If { then_body, else_body, .. }
+            | LirStmt::IfReturn { then_body, else_body, .. } => {
+                fuse_in_stmts(then_body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+                fuse_in_stmts(else_body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+            }
+            LirStmt::Switch { cases, default_body, .. } => {
+                for c in cases.iter_mut() {
+                    fuse_in_stmts(&mut c.body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+                }
+                fuse_in_stmts(default_body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+            }
+            LirStmt::TryCatch { body, catch_body, .. } => {
+                fuse_in_stmts(body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+                fuse_in_stmts(catch_body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+            }
+            LirStmt::Loop { cond_stmts, body, .. } => {
+                fuse_in_stmts(cond_stmts, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+                fuse_in_stmts(body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+            }
+            _ => {}
+        }
+    }
+
+    // Build definition map: var → what it was bound to.
+    let mut var_defs: HashMap<Symbol, &LirExpr> = HashMap::new();
+    for stmt in stmts.iter() {
+        if let LirStmt::Let { name, expr, .. } = stmt {
+            var_defs.insert(*name, expr);
+        }
+    }
+
+    // Count uses of each variable.
+    let mut uses: HashMap<Symbol, u32> = HashMap::new();
+    count_uses_in_stmts(stmts, &mut uses);
+
+    // Collect transformations: (stmt_index, replacement_stmts)
+    // Each entry replaces the stmt at `index` with a sequence of new stmts.
+    let mut transforms: Vec<(usize, Vec<LirStmt>)> = Vec::new();
+
+    for (i, stmt) in stmts.iter().enumerate() {
+        let LirStmt::Let { name, typ, expr } = stmt else { continue };
+
+        // ── reverse∘reverse elimination ──
+        if let LirExpr::Call { func, args, .. } = expr {
+            if reverse_funcs.contains(func) {
+                let xs_arg = args.iter().find(|(l, _)| l.as_str() == "xs");
+                if let Some((_, LirAtom::Var { name: inner_name, .. })) = xs_arg {
+                    if uses.get(inner_name).copied().unwrap_or(0) == 1 {
+                        if let Some(LirExpr::Call { func: inner_func, args: inner_args, .. }) = var_defs.get(inner_name) {
+                            if reverse_funcs.contains(inner_func) {
+                                if let Some((_, original_xs)) = inner_args.iter().find(|(l, _)| l.as_str() == "xs") {
+                                    transforms.push((i, vec![LirStmt::Let {
+                                        name: *name,
+                                        typ: typ.clone(),
+                                        expr: LirExpr::Atom(original_xs.clone()),
+                                    }]));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── map∘map fusion ──
+        let LirExpr::Call { func: outer_map, args: outer_args, typ: call_typ, .. } = expr else { continue };
+        if !map_funcs.contains(outer_map) { continue; }
+        let Some((_, outer_xs)) = outer_args.iter().find(|(l, _)| l.as_str() == "xs") else { continue };
+        let Some((_, outer_f)) = outer_args.iter().find(|(l, _)| l.as_str() == "f") else { continue };
+
+        let LirAtom::Var { name: inner_name, .. } = outer_xs else { continue };
+        if uses.get(inner_name).copied().unwrap_or(0) != 1 { continue; }
+        let Some(LirExpr::Call { func: inner_map, args: inner_args, .. }) = var_defs.get(inner_name) else { continue };
+        if !map_funcs.contains(inner_map) { continue; }
+
+        let Some((_, inner_xs)) = inner_args.iter().find(|(l, _)| l.as_str() == "xs") else { continue };
+        let Some((_, inner_f)) = inner_args.iter().find(|(l, _)| l.as_str() == "f") else { continue };
+
+        // Both f and g must trace to FuncRef (known functions, no captures).
+        let LirAtom::Var { name: outer_f_var, .. } = outer_f else { continue };
+        let LirAtom::Var { name: inner_f_var, .. } = inner_f else { continue };
+        let Some(LirExpr::FuncRef { func: f_name, .. }) = var_defs.get(outer_f_var) else { continue };
+        let Some(LirExpr::FuncRef { func: g_name, .. }) = var_defs.get(inner_f_var) else { continue };
+
+        // Look up function signatures.
+        let Some((f_params, f_ret)) = func_sigs.get(f_name) else { continue };
+        let Some((g_params, g_ret)) = func_sigs.get(g_name) else { continue };
+        if f_params.is_empty() || g_params.is_empty() { continue; }
+
+        // Generate: fn __compose_N(val) = f(g(val))
+        let compose_name = Symbol::from(format!("__compose_{}", counter));
+        let compose_ref = Symbol::from(format!("__compose_ref_{}", counter));
+        *counter += 1;
+
+        let val_param = LirParam {
+            label: g_params[0].label,
+            name: g_params[0].name,
+            typ: g_params[0].typ.clone(),
+        };
+        let g_result = Symbol::from("__g_result");
+        let f_result = Symbol::from("__f_result");
+
+        new_funcs.push(LirFunction {
+            name: compose_name,
+            params: vec![val_param.clone()],
+            ret_type: f_ret.clone(),
+            requires: Type::Unit,
+            throws: Type::Unit,
+            body: vec![
+                LirStmt::Let {
+                    name: g_result,
+                    typ: g_ret.clone(),
+                    expr: LirExpr::Call {
+                        func: *g_name,
+                        args: vec![(g_params[0].label, LirAtom::Var { name: val_param.name, typ: val_param.typ.clone() })],
+                        typ: g_ret.clone(),
+                    },
+                },
+                LirStmt::Let {
+                    name: f_result,
+                    typ: f_ret.clone(),
+                    expr: LirExpr::Call {
+                        func: *f_name,
+                        args: vec![(f_params[0].label, LirAtom::Var { name: g_result, typ: g_ret.clone() })],
+                        typ: f_ret.clone(),
+                    },
+                },
+            ],
+            ret: LirAtom::Var { name: f_result, typ: f_ret.clone() },
+            span: Span::default(),
+            source_file: None,
+            source_line: None,
+        });
+
+        // Replace outer map with: let ref = FuncRef(compose); let result = map(ref, original_xs)
+        let f_label = outer_args.iter().find(|(l, _)| l.as_str() == "f").unwrap().0;
+        let xs_label = outer_args.iter().find(|(l, _)| l.as_str() == "xs").unwrap().0;
+        transforms.push((i, vec![
+            LirStmt::Let {
+                name: compose_ref,
+                typ: Type::I64,
+                expr: LirExpr::FuncRef { func: compose_name, typ: Type::I64 },
+            },
+            LirStmt::Let {
+                name: *name,
+                typ: typ.clone(),
+                expr: LirExpr::Call {
+                    func: *outer_map,
+                    args: vec![
+                        (f_label, LirAtom::Var { name: compose_ref, typ: Type::I64 }),
+                        (xs_label, inner_xs.clone()),
+                    ],
+                    typ: call_typ.clone(),
+                },
+            },
+        ]));
+    }
+
+    // Apply transforms in reverse order to preserve indices.
+    for (idx, replacement) in transforms.into_iter().rev() {
+        stmts.splice(idx..=idx, replacement);
+    }
+}
+
+// ─── Scalar Replacement of Aggregates (SRA) ────────────────────────────────
+
+/// Becomes (after SRA + constant folding + DCE):
+///   let tag = Atom(Int(SOME_TAG))       ← known constant
+///   let field = Atom(v)                 ← original arg
+///   (x is dead → removed by DCE)
+fn scalar_replace_aggregates(stmts: &mut Vec<LirStmt>, func_ret: &LirAtom) {
+    // Phase 1: collect Constructor definitions
+    let mut ctors: HashMap<Symbol, (i64, Vec<LirAtom>)> = HashMap::new();
+    collect_ctor_defs_in_stmts(stmts, &mut ctors);
+    if ctors.is_empty() {
+        return;
+    }
+
+    // Phase 2: mark escaped constructors (used outside ObjectTag/ObjectField)
+    let mut escaped = HashSet::new();
+    if let LirAtom::Var { name, .. } = func_ret {
+        if ctors.contains_key(name) {
+            escaped.insert(*name);
+        }
+    }
+    mark_escapes_in_stmts(stmts, &ctors, &mut escaped);
+    for e in &escaped {
+        ctors.remove(e);
+    }
+    if ctors.is_empty() {
+        return;
+    }
+
+    // Phase 3: replace ObjectTag/ObjectField with direct values
+    apply_sra_in_stmts(stmts, &ctors);
+}
+
+fn collect_ctor_defs_in_stmts(stmts: &[LirStmt], ctors: &mut HashMap<Symbol, (i64, Vec<LirAtom>)>) {
+    for stmt in stmts {
+        match stmt {
+            LirStmt::Let {
+                name,
+                expr: LirExpr::Constructor {
+                    name: ctor_name,
+                    args,
+                    ..
+                },
+                ..
+            } => {
+                let tag = constructor_tag(ctor_name.as_str(), args.len());
+                ctors.insert(*name, (tag, args.clone()));
+            }
+            LirStmt::If { then_body, else_body, .. }
+            | LirStmt::IfReturn { then_body, else_body, .. } => {
+                collect_ctor_defs_in_stmts(then_body, ctors);
+                collect_ctor_defs_in_stmts(else_body, ctors);
+            }
+            LirStmt::Switch { cases, default_body, .. } => {
+                for c in cases {
+                    collect_ctor_defs_in_stmts(&c.body, ctors);
+                }
+                collect_ctor_defs_in_stmts(default_body, ctors);
+            }
+            LirStmt::TryCatch { body, catch_body, .. } => {
+                collect_ctor_defs_in_stmts(body, ctors);
+                collect_ctor_defs_in_stmts(catch_body, ctors);
+            }
+            LirStmt::Loop { cond_stmts, body, .. } => {
+                collect_ctor_defs_in_stmts(cond_stmts, ctors);
+                collect_ctor_defs_in_stmts(body, ctors);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Mark constructors as escaped if they appear in any position other than
+/// ObjectTag.value or ObjectField.value.
+fn mark_escapes_in_stmts(
+    stmts: &[LirStmt],
+    ctors: &HashMap<Symbol, (i64, Vec<LirAtom>)>,
+    escaped: &mut HashSet<Symbol>,
+) {
+    for stmt in stmts {
+        match stmt {
+            LirStmt::Let { expr, .. } => mark_escapes_in_expr(expr, ctors, escaped),
+            LirStmt::FieldUpdate { target, value, .. } => {
+                mark_atom_escape(target, ctors, escaped);
+                mark_atom_escape(value, ctors, escaped);
+            }
+            LirStmt::If { cond, then_body, else_body, .. } => {
+                mark_atom_escape(cond, ctors, escaped);
+                mark_escapes_in_stmts(then_body, ctors, escaped);
+                mark_escapes_in_stmts(else_body, ctors, escaped);
+            }
+            LirStmt::IfReturn {
+                cond, then_body, then_ret, else_body, else_ret, ..
+            } => {
+                mark_atom_escape(cond, ctors, escaped);
+                mark_escapes_in_stmts(then_body, ctors, escaped);
+                mark_opt_atom_escape(then_ret, ctors, escaped);
+                mark_escapes_in_stmts(else_body, ctors, escaped);
+                mark_opt_atom_escape(else_ret, ctors, escaped);
+            }
+            LirStmt::Switch { tag, cases, default_body, default_ret, .. } => {
+                mark_atom_escape(tag, ctors, escaped);
+                for c in cases {
+                    mark_escapes_in_stmts(&c.body, ctors, escaped);
+                    mark_opt_atom_escape(&c.ret, ctors, escaped);
+                }
+                mark_escapes_in_stmts(default_body, ctors, escaped);
+                mark_opt_atom_escape(default_ret, ctors, escaped);
+            }
+            LirStmt::TryCatch { body, body_ret, catch_body, catch_ret, .. } => {
+                mark_escapes_in_stmts(body, ctors, escaped);
+                mark_opt_atom_escape(body_ret, ctors, escaped);
+                mark_escapes_in_stmts(catch_body, ctors, escaped);
+                mark_opt_atom_escape(catch_ret, ctors, escaped);
+            }
+            LirStmt::Loop { cond, cond_stmts, body, .. } => {
+                mark_atom_escape(cond, ctors, escaped);
+                mark_escapes_in_stmts(cond_stmts, ctors, escaped);
+                mark_escapes_in_stmts(body, ctors, escaped);
+            }
+        }
+    }
+}
+
+fn mark_escapes_in_expr(
+    expr: &LirExpr,
+    ctors: &HashMap<Symbol, (i64, Vec<LirAtom>)>,
+    escaped: &mut HashSet<Symbol>,
+) {
+    // ObjectTag/ObjectField use the ctor var safely — don't mark as escaped.
+    match expr {
+        LirExpr::ObjectTag { .. } | LirExpr::ObjectField { .. } => {}
+        LirExpr::Atom(a) => mark_atom_escape(a, ctors, escaped),
+        LirExpr::Binary { lhs, rhs, .. } => {
+            mark_atom_escape(lhs, ctors, escaped);
+            mark_atom_escape(rhs, ctors, escaped);
+        }
+        LirExpr::Call { args, .. } | LirExpr::TailCall { args, .. } => {
+            for (_, a) in args { mark_atom_escape(a, ctors, escaped); }
+        }
+        LirExpr::Constructor { args, .. } => {
+            for a in args { mark_atom_escape(a, ctors, escaped); }
+        }
+        LirExpr::Record { fields, .. } => {
+            for (_, a) in fields { mark_atom_escape(a, ctors, escaped); }
+        }
+        LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => {
+            mark_atom_escape(value, ctors, escaped);
+        }
+        LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
+        LirExpr::Closure { captures, .. } => {
+            for (_, a) in captures { mark_atom_escape(a, ctors, escaped); }
+        }
+        LirExpr::CallIndirect { callee, args, .. } => {
+            mark_atom_escape(callee, ctors, escaped);
+            for (_, a) in args { mark_atom_escape(a, ctors, escaped); }
+        }
+        LirExpr::LazySpawn { thunk, .. } => mark_atom_escape(thunk, ctors, escaped),
+        LirExpr::LazyJoin { task_id, .. } => mark_atom_escape(task_id, ctors, escaped),
+    }
+}
+
+fn mark_atom_escape(
+    atom: &LirAtom,
+    ctors: &HashMap<Symbol, (i64, Vec<LirAtom>)>,
+    escaped: &mut HashSet<Symbol>,
+) {
+    if let LirAtom::Var { name, .. } = atom {
+        if ctors.contains_key(name) {
+            escaped.insert(*name);
+        }
+    }
+}
+
+fn mark_opt_atom_escape(
+    atom: &Option<LirAtom>,
+    ctors: &HashMap<Symbol, (i64, Vec<LirAtom>)>,
+    escaped: &mut HashSet<Symbol>,
+) {
+    if let Some(a) = atom {
+        mark_atom_escape(a, ctors, escaped);
+    }
+}
+
+/// Replace ObjectTag(ctor_var) → Atom(Int(tag)) and
+/// ObjectField(ctor_var, i) → Atom(args[i]) for non-escaped constructors.
+fn apply_sra_in_stmts(stmts: &mut [LirStmt], ctors: &HashMap<Symbol, (i64, Vec<LirAtom>)>) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            LirStmt::Let { expr, .. } => apply_sra_in_expr(expr, ctors),
+            LirStmt::If { then_body, else_body, .. } => {
+                apply_sra_in_stmts(then_body, ctors);
+                apply_sra_in_stmts(else_body, ctors);
+            }
+            LirStmt::IfReturn { then_body, else_body, .. } => {
+                apply_sra_in_stmts(then_body, ctors);
+                apply_sra_in_stmts(else_body, ctors);
+            }
+            LirStmt::Switch { cases, default_body, .. } => {
+                for c in cases.iter_mut() {
+                    apply_sra_in_stmts(&mut c.body, ctors);
+                }
+                apply_sra_in_stmts(default_body, ctors);
+            }
+            LirStmt::TryCatch { body, catch_body, .. } => {
+                apply_sra_in_stmts(body, ctors);
+                apply_sra_in_stmts(catch_body, ctors);
+            }
+            LirStmt::Loop { cond_stmts, body, .. } => {
+                apply_sra_in_stmts(cond_stmts, ctors);
+                apply_sra_in_stmts(body, ctors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_sra_in_expr(expr: &mut LirExpr, ctors: &HashMap<Symbol, (i64, Vec<LirAtom>)>) {
+    match expr {
+        LirExpr::ObjectTag {
+            value: LirAtom::Var { name, .. },
+            ..
+        } => {
+            if let Some((tag, _)) = ctors.get(name) {
+                *expr = LirExpr::Atom(LirAtom::Int(*tag));
+            }
+        }
+        LirExpr::ObjectField {
+            value: LirAtom::Var { name, .. },
+            index,
+            ..
+        } => {
+            if let Some((_, args)) = ctors.get(name) {
+                if *index < args.len() {
+                    *expr = LirExpr::Atom(args[*index].clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ─── Linear reuse: in-place Constructor update ─────────────────────────────
+
+///   let f0 = ObjectField(src, 0)
+///   let f1 = ObjectField(src, 1)
+///   let new_val = Call(g, [f0])
+///   FieldUpdate(src, offset=8, new_val)   ← only changed field
+///   let result = Atom(src)                ← reuse pointer (no alloc)
+fn reuse_linear_constructors(stmts: &mut Vec<LirStmt>) {
+    reuse_in_stmts(stmts);
+}
+
+fn reuse_in_stmts(stmts: &mut Vec<LirStmt>) {
+    // First, recurse into sub-bodies so inner scopes are optimized bottom-up.
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                reuse_in_stmts(then_body);
+                reuse_in_stmts(else_body);
+            }
+            LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                reuse_in_stmts(then_body);
+                reuse_in_stmts(else_body);
+            }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for c in cases.iter_mut() {
+                    reuse_in_stmts(&mut c.body);
+                }
+                reuse_in_stmts(default_body);
+            }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                reuse_in_stmts(body);
+                reuse_in_stmts(catch_body);
+            }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                reuse_in_stmts(cond_stmts);
+                reuse_in_stmts(body);
+            }
+            _ => {}
+        }
+    }
+
+    // Now optimize the flat statement list.
+    // Phase 1: collect ObjectField definitions.
+    //   var_name → (source_atom, field_index)
+    let mut field_defs: HashMap<Symbol, (LirAtom, usize)> = HashMap::new();
+
+    // Phase 2: build the replacement list.
+    //   (stmt_index, source_atom, ctor_tag, updates, result_name, result_typ)
+    let mut replacements: Vec<(
+        usize,
+        LirAtom,
+        i64,
+        Vec<(u64, LirAtom, Type)>,
+        Symbol,
+        Type,
+    )> = Vec::new();
+
+    for (i, stmt) in stmts.iter().enumerate() {
+        match stmt {
+            LirStmt::Let {
+                name,
+                expr:
+                    LirExpr::ObjectField {
+                        value, index, ..
+                    },
+                ..
+            } => {
+                field_defs.insert(*name, (value.clone(), *index));
+            }
+            LirStmt::Let {
+                name,
+                typ,
+                expr:
+                    LirExpr::Constructor {
+                        name: ctor_name,
+                        args,
+                        ..
+                    },
+            } => {
+                if let Some(reuse) =
+                    try_find_reuse(ctor_name, args, &field_defs, stmts, i)
+                {
+                    replacements.push((
+                        i,
+                        reuse.source,
+                        reuse.tag,
+                        reuse.updates,
+                        *name,
+                        typ.clone(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Phase 3: apply replacements in reverse order to preserve indices.
+    for (idx, source, tag, updates, result_name, result_typ) in replacements.into_iter().rev() {
+        // Remove the original Constructor Let.
+        stmts.remove(idx);
+
+        // Insert: tag write + field updates + let result = Atom(source)
+        let mut insert_pos = idx;
+
+        // Write the tag (always, for safety — handles cross-constructor reuse).
+        stmts.insert(
+            insert_pos,
+            LirStmt::FieldUpdate {
+                target: source.clone(),
+                byte_offset: 0,
+                value: LirAtom::Int(tag),
+                value_typ: Type::I64,
+            },
+        );
+        insert_pos += 1;
+
+        // Write changed fields.
+        for (byte_offset, value, value_typ) in updates {
+            stmts.insert(
+                insert_pos,
+                LirStmt::FieldUpdate {
+                    target: source.clone(),
+                    byte_offset,
+                    value,
+                    value_typ,
+                },
+            );
+            insert_pos += 1;
+        }
+
+        // Reuse the source pointer.
+        stmts.insert(
+            insert_pos,
+            LirStmt::Let {
+                name: result_name,
+                typ: result_typ,
+                expr: LirExpr::Atom(source),
+            },
+        );
+    }
+}
+
+struct ReuseCandidate {
+    source: LirAtom,
+    tag: i64,
+    /// (byte_offset, new_value, value_type) for each changed field.
+    updates: Vec<(u64, LirAtom, Type)>,
+}
+
+/// Check if a Constructor can reuse memory from an existing heap object.
+fn try_find_reuse(
+    ctor_name: &Symbol,
+    args: &[LirAtom],
+    field_defs: &HashMap<Symbol, (LirAtom, usize)>,
+    stmts: &[LirStmt],
+    ctor_pos: usize,
+) -> Option<ReuseCandidate> {
+    if args.is_empty() {
+        return None; // Zero-arity constructors (Nil, None) — nothing to reuse
+    }
+
+    // Find a common source: at least one arg must trace to ObjectField(src, _).
+    let mut source: Option<LirAtom> = None;
+    let mut source_name: Option<Symbol> = None;
+    let mut max_field_idx: usize = 0;
+
+    for arg in args {
+        if let LirAtom::Var { name, .. } = arg {
+            if let Some((src_atom, _field_idx)) = field_defs.get(name) {
+                let src_sym = match src_atom {
+                    LirAtom::Var { name: s, .. } => *s,
+                    _ => continue,
+                };
+                match &source_name {
+                    None => {
+                        source = Some(src_atom.clone());
+                        source_name = Some(src_sym);
+                    }
+                    Some(existing) if *existing == src_sym => {} // same source
+                    _ => return None, // different sources — can't reuse one object
+                }
+            }
+        }
+    }
+
+    let source = source?;
+    let source_sym = source_name?;
+
+    // Verify: all ObjectField extractions from this source have consecutive indices
+    // covering [0..arity). This ensures the source has exactly `arity` fields.
+    let arity = args.len();
+    let mut covered = vec![false; arity];
+    for (src_atom, field_idx) in field_defs.values() {
+        if let LirAtom::Var { name, .. } = src_atom {
+            if *name == source_sym && *field_idx < arity {
+                covered[*field_idx] = true;
+                if *field_idx > max_field_idx {
+                    max_field_idx = *field_idx;
+                }
+            }
+        }
+    }
+    // All field indices must be covered (source has at least `arity` fields).
+    if !covered.iter().all(|c| *c) {
+        return None;
+    }
+
+    // Safety check: source must not appear in any statement after the Constructor.
+    let mut src_used_after = false;
+    for stmt in &stmts[ctor_pos + 1..] {
+        if atom_mentions_var_in_stmt(stmt, source_sym) {
+            src_used_after = true;
+            break;
+        }
+    }
+    if src_used_after {
+        return None;
+    }
+
+    // Build updates: only changed fields.
+    let tag = constructor_tag(ctor_name.as_str(), arity);
+    let mut updates = Vec::new();
+    for (idx, arg) in args.iter().enumerate() {
+        let is_unchanged = if let LirAtom::Var { name, .. } = arg {
+            field_defs
+                .get(name)
+                .map_or(false, |(src, fi)| {
+                    matches!(src, LirAtom::Var { name: s, .. } if *s == source_sym)
+                        && *fi == idx
+                })
+        } else {
+            false
+        };
+        if !is_unchanged {
+            let byte_offset = ((idx + 1) * 8) as u64;
+            updates.push((byte_offset, arg.clone(), arg.typ()));
+        }
+    }
+
+    Some(ReuseCandidate {
+        source,
+        tag,
+        updates,
+    })
+}
+
+/// Check if a statement (non-recursively into sub-bodies) mentions a variable.
+fn atom_mentions_var_in_stmt(stmt: &LirStmt, var: Symbol) -> bool {
+    let check = |atom: &LirAtom| matches!(atom, LirAtom::Var { name, .. } if *name == var);
+    match stmt {
+        LirStmt::Let { expr, .. } => atom_mentions_var_in_expr(expr, var),
+        LirStmt::FieldUpdate {
+            target, value, ..
+        } => check(target) || check(value),
+        LirStmt::If { cond, .. }
+        | LirStmt::IfReturn { cond, .. } => check(cond),
+        LirStmt::Loop { cond, .. } => check(cond),
+        LirStmt::Switch { tag, .. } => check(tag),
+        LirStmt::TryCatch { .. } => false,
+    }
+}
+
+fn atom_mentions_var_in_expr(expr: &LirExpr, var: Symbol) -> bool {
+    let check = |atom: &LirAtom| matches!(atom, LirAtom::Var { name, .. } if *name == var);
+    match expr {
+        LirExpr::Atom(a) => check(a),
+        LirExpr::Binary { lhs, rhs, .. } => check(lhs) || check(rhs),
+        LirExpr::Call { args, .. } | LirExpr::TailCall { args, .. } => {
+            args.iter().any(|(_, a)| check(a))
+        }
+        LirExpr::Constructor { args, .. } => args.iter().any(check),
+        LirExpr::Record { fields, .. } => fields.iter().any(|(_, a)| check(a)),
+        LirExpr::ObjectTag { value, .. }
+        | LirExpr::ObjectField { value, .. }
+        | LirExpr::Force { value, .. }
+        | LirExpr::Raise { value, .. } => check(value),
+        LirExpr::Closure { captures, .. } => captures.iter().any(|(_, a)| check(a)),
+        LirExpr::ClosureEnvLoad { .. } => false,
+        LirExpr::FuncRef { .. } => false,
+        LirExpr::CallIndirect { callee, args, .. } => {
+            check(callee) || args.iter().any(|(_, a)| check(a))
+        }
+        LirExpr::LazySpawn { thunk, .. } => check(thunk),
+        LirExpr::LazyJoin { task_id, .. } => check(task_id),
+    }
 }
