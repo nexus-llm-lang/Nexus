@@ -70,10 +70,11 @@ use super::error::CodegenError;
 use super::layout::CodegenLayout;
 use super::stmt::compile_stmt;
 use super::string::{
-    emit_string_compare, emit_string_concat, is_string_compare_operator, is_string_concat_operator,
-    pack_string,
+    emit_canonical_string_return_unpack, emit_string_compare, emit_string_concat,
+    external_uses_canonical_string_return, is_string_compare_operator,
+    is_string_concat_operator, pack_string,
 };
-use super::{FunctionTemps, LocalInfo};
+use super::{FunctionTemps, LocalInfo, OBJECT_HEAP_GLOBAL_INDEX};
 use crate::constants::ENTRYPOINT;
 
 pub(super) fn compile_function(
@@ -799,6 +800,27 @@ pub(super) fn compile_expr(
                     });
                 }
 
+                let canonical_string_ret = external_uses_canonical_string_return(callee);
+
+                // For canonical ABI string returns: allocate 8 bytes for retptr
+                // (2 x i32 for ptr and len) before emitting args
+                if canonical_string_ret {
+                    // Allocate 8 bytes on the heap for the return area
+                    if let Some(alloc_idx) = layout.allocate_func_idx {
+                        out.instruction(&Instruction::I32Const(8));
+                        out.instruction(&Instruction::Call(alloc_idx));
+                    } else {
+                        // Bump allocator
+                        out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+                        out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+                        out.instruction(&Instruction::I32Const(8));
+                        out.instruction(&Instruction::I32Add);
+                        out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+                    }
+                    // Save retptr to a temp local
+                    out.instruction(&Instruction::LocalSet(temps.object_ptr_i32));
+                }
+
                 // Args are sorted by label; emit in external's param order
                 for param in callee.params.iter() {
                     let atom = args
@@ -813,11 +835,29 @@ pub(super) fn compile_expr(
                     compile_external_arg(atom, &param.typ, out, local_map, layout, temps)?;
                 }
 
-                if is_tail {
+                // For canonical ABI: push retptr as the last argument
+                if canonical_string_ret {
+                    out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+                }
+
+                if is_tail && !canonical_string_ret {
+                    // Cannot use ReturnCall with canonical string returns
+                    // because we need to unpack the retptr after the call
                     out.instruction(&Instruction::ReturnCall(callee_idx));
                 } else {
                     out.instruction(&Instruction::Call(callee_idx));
                 }
+
+                // For canonical ABI: unpack retptr → packed i64
+                if canonical_string_ret {
+                    emit_canonical_string_return_unpack(
+                        out,
+                        temps.object_ptr_i32,
+                        temps.concat_lhs_ptr_i32,
+                        temps.concat_lhs_len_i32,
+                    );
+                }
+
                 return Ok(());
             }
 
