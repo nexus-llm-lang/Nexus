@@ -377,26 +377,15 @@ impl MirBuilder {
                                         if self.externals.iter().any(|e| e.name == gl.name) {
                                             continue;
                                         }
-                                        // If the module is a file path for stdlib.wasm, try to
-                                        // infer the correct WIT interface from the function name.
-                                        let effective_module = if !wasm_mod.contains(':') {
-                                            if let Some(iface) = wit_interface_from_ffi_name(wasm_name) {
-                                                iface.to_string()
-                                            } else {
-                                                wasm_mod.clone()
-                                            }
-                                        } else {
-                                            wasm_mod.clone()
-                                        };
                                         // Use WIT-canonical kebab-case names for component-model modules.
-                                        let effective_wasm_name = if effective_module.contains(':') {
+                                        let effective_wasm_name = if wasm_mod.contains(':') {
                                             wit_canonical_name(wasm_name)
                                         } else {
                                             wasm_name.to_string()
                                         };
                                         self.externals.push(MirExternal {
                                             name: Symbol::from(&gl.name),
-                                            wasm_module: Symbol::from(effective_module.as_str()),
+                                            wasm_module: Symbol::from(wasm_mod.as_str()),
                                             wasm_name: Symbol::from(effective_wasm_name.as_str()),
                                             params: params
                                                 .iter()
@@ -551,23 +540,14 @@ impl MirBuilder {
                                 if let Some(ref wasm_mod) = current_wasm_module {
                                     let name_sym = Symbol::from(&name);
                                     self.externals.retain(|e| e.name != name_sym);
-                                    let effective_module = if !wasm_mod.contains(':') {
-                                        if let Some(iface) = wit_interface_from_ffi_name(wasm_name) {
-                                            iface.to_string()
-                                        } else {
-                                            wasm_mod.clone()
-                                        }
-                                    } else {
-                                        wasm_mod.clone()
-                                    };
-                                    let effective_wasm_name = if effective_module.contains(':') {
+                                    let effective_wasm_name = if wasm_mod.contains(':') {
                                         wit_canonical_name(wasm_name)
                                     } else {
                                         wasm_name.to_string()
                                     };
                                     self.externals.push(MirExternal {
                                         name: name_sym,
-                                        wasm_module: Symbol::from(effective_module.as_str()),
+                                        wasm_module: Symbol::from(wasm_mod.as_str()),
                                         wasm_name: Symbol::from(effective_wasm_name.as_str()),
                                         params: params
                                             .iter()
@@ -1871,57 +1851,17 @@ fn collect_ast_pattern_defs(pattern: &Pattern, defined: &mut HashSet<String>) {
 /// Non-stdlib imports (e.g. `nexus:runtime/backtrace`) pass through unchanged.
 fn resolve_stdlib_wit_module(resolved: &str, wit_interface: Option<&str>) -> String {
     if resolved.ends_with("stdlib.wasm") {
-        // If we have a specific WIT interface (from a stdlib .nx file), use it.
-        // Otherwise, keep the file path as-is — the module will use packed ABI
-        // and be resolved via legacy bundling at link time.
         match wit_interface {
             Some(iface) => iface.to_string(),
             None => resolved.to_string(),
         }
+    } else if resolved.ends_with(".nx") {
+        // Import path is a .nx file (e.g. "stdlib/hashmap.nx") — use its stem for WIT mapping.
+        let path = std::path::Path::new(resolved);
+        stdlib_nx_to_wit_interface(path)
+            .unwrap_or_else(|| resolved.to_string())
     } else {
         resolved.to_string()
-    }
-}
-
-/// Infer WIT interface from an FFI function name prefix.
-/// Used for non-stdlib files that import `stdlib/stdlib.wasm` directly —
-/// the function name prefix determines which WIT interface it belongs to.
-fn wit_interface_from_ffi_name(ffi_name: &str) -> Option<&'static str> {
-    let name = ffi_name.strip_prefix("__nx_")?;
-    if name.starts_with("string_") || name.starts_with("char_") {
-        Some("nexus:stdlib/string-ops")
-    } else if name.starts_with("print") || name.starts_with("eprint") || name.starts_with("read_line") || name.starts_with("getchar") {
-        Some("nexus:stdlib/stdio")
-    } else if name.starts_with("hmap_") || name.starts_with("hset_") || name.starts_with("smap_") {
-        Some("nexus:stdlib/collections")
-    } else if name.starts_with("buf_") {
-        Some("nexus:stdlib/bytebuffer")
-    } else if name.starts_with("http_") {
-        Some("nexus:stdlib/network")
-    } else if name.starts_with("abs") || name.starts_with("max_") || name.starts_with("min_")
-        || name.starts_with("mod_") || name.starts_with("sqrt") || name.starts_with("floor")
-        || name.starts_with("ceil") || name.starts_with("pow") || name.starts_with("i64_to_float")
-        || name.starts_with("float_to_i64")
-    {
-        Some("nexus:stdlib/math")
-    } else if name.starts_with("read_to_string") || name.starts_with("write_string")
-        || name.starts_with("exists") || name.starts_with("is_file") || name.starts_with("fd_")
-        || name.starts_with("remove_file") || name.starts_with("create_dir") || name.starts_with("read_dir")
-        || name.starts_with("append_string")
-    {
-        Some("nexus:stdlib/filesystem")
-    } else if name.starts_with("exit") || name.starts_with("argv") || name.starts_with("exec") {
-        Some("nexus:stdlib/process")
-    } else if name.starts_with("get_env") || name.starts_with("set_env") {
-        Some("nexus:stdlib/environment")
-    } else if name.starts_with("sleep") || name.starts_with("now") {
-        Some("nexus:stdlib/clock")
-    } else if name.starts_with("random") {
-        Some("nexus:stdlib/random")
-    } else if name.starts_with("array_length") {
-        Some("nexus:stdlib/collections")
-    } else {
-        None
     }
 }
 

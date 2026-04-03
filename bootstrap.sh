@@ -23,7 +23,7 @@ done
 NEXUS="${NEXUS:-./target/release/nexus}"
 NXC_ENTRY="nxc/driver.nx"
 WASMTIME="${WASMTIME:-wasmtime}"
-WASMTIME_FLAGS="-W tail-call=y,exceptions=y --dir=. --dir=${TMPDIR:-/tmp}"
+WASMTIME_FLAGS="-W tail-call=y,exceptions=y,component-model=y --dir=. --dir=${TMPDIR:-/tmp}"
 NEXUS_BUILD_FLAGS=""
 
 RED='\033[0;31m'
@@ -90,30 +90,21 @@ info "Stage 1: wasmtime run $STAGE0 $NXC_ENTRY $STAGE1"
 "$WASMTIME" run $WASMTIME_FLAGS "$STAGE0" "$NXC_ENTRY" --verbose "$STAGE1"
 ok "Stage 1 complete: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
 
-# ─── Bundle stage1 with stdlib ─────────────────────────────────────────────
-# Stage1 is a core WASM that imports stdlib/stdlib.wasm.
-# Bundle it so stage2 can run without external dependencies.
+# ─── Compose stage1 with stdlib ────────────────────────────────────────────
+# Stage1 is a core WASM that imports nexus:stdlib/* interfaces.
+# Compose it with stdlib-component.wasm so wasmtime can execute it.
 
-WASM_MERGE="${NEXUS_WASM_MERGE:-wasm-merge}"
 STAGE1_BUNDLED="$BUILD_DIR/stage1_bundled.wasm"
-HOST_STUB_WAT="$(pwd)/nxlib/stdlib/nexus_host_stub.wat"
-HOST_STUB_WASM="$(pwd)/stdlib/nexus_host_stub.wasm"
-if [[ -f "$HOST_STUB_WAT" && ! -f "$HOST_STUB_WASM" ]]; then
-  if command -v wat2wasm >/dev/null 2>&1; then
-    info "Compiling nexus_host_stub.wat → .wasm"
-    wat2wasm "$HOST_STUB_WAT" -o "$HOST_STUB_WASM"
-  fi
-fi
-if command -v "$WASM_MERGE" >/dev/null 2>&1 || [[ -x "$WASM_MERGE" ]]; then
-  info "Bundling stage1 with stdlib..."
-  "$WASM_MERGE" "$STAGE1" __main \
-    "$(pwd)/stdlib/stdlib.wasm" "stdlib/stdlib.wasm" \
-    "$(pwd)/stdlib/nexus_host_stub.wasm" "nexus:cli/nexus-host" \
-    --all-features --enable-tail-call --enable-exception-handling --rename-export-conflicts \
-    -o "$STAGE1_BUNDLED"
-  ok "Bundled: $STAGE1_BUNDLED ($(wc -c < "$STAGE1_BUNDLED" | tr -d ' ') bytes)"
+STDLIB_COMPONENT="$(pwd)/nxlib/stdlib/stdlib-component.wasm"
+
+# Use the Rust compiler's compose_with_stdlib (via a quick compile-and-run test helper).
+# This reuses the same in-process ComponentEncoder + ComponentComposer pipeline
+# as `nexus build` and the test harness.
+info "Composing stage1 with stdlib component..."
+if "$NEXUS" compose "$STAGE1" -o "$STAGE1_BUNDLED"; then
+  ok "Composed: $STAGE1_BUNDLED ($(wc -c < "$STAGE1_BUNDLED" | tr -d ' ') bytes)"
 else
-  warn "wasm-merge not found — skipping bundle, stage2 may fail"
+  warn "Composition failed — copying stage1 as-is (stage2 may fail)"
   cp "$STAGE1" "$STAGE1_BUNDLED"
 fi
 

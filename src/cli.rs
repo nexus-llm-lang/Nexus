@@ -55,6 +55,15 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = ExplainCapabilitiesFormat::Text)]
         explain_capabilities_format: ExplainCapabilitiesFormat,
     },
+    /// Compose a pre-compiled core WASM module with the stdlib component.
+    /// Used by bootstrap.sh and nxc_driver for post-compilation composition.
+    Compose {
+        /// Core WASM module to compose with stdlib.
+        input: PathBuf,
+        /// Output path for the composed component (default: composed.wasm).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 pub struct LoadedSource {
