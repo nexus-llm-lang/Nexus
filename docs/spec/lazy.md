@@ -1,11 +1,14 @@
 ---
 layout: default
-title: Lazy Evaluation and Concurrency
+title: Lazy Evaluation, Concurrency, and Parallelism
 ---
 
-# Lazy Evaluation and Concurrency
+# Lazy Evaluation, Concurrency, and Parallelism
 
-Lazy thunks (`@`) and `conc` blocks share the same foundation: **deferred computation**. A lazy binding suspends an expression as a zero-argument closure; a `conc` task suspends a block of statements as a thread-spawnable closure. Both use closure conversion to capture free variables, and both are subject to linearity constraints.
+Nexus has two mechanisms for deferred computation: **lazy thunks** (`@`) for concurrency (structuring work that can be deferred) and **`conc` blocks** for parallelism (executing work simultaneously on multiple threads). Both share the same foundation — closure conversion with linearity constraints — but serve different purposes.
+
+- **Concurrency** (lazy): *structuring* independent computations. A lazy thunk defers an expression; when and whether it runs is decided by the consumer. This is concurrency in the sense of decoupling definition from execution.
+- **Parallelism** (conc): *simultaneously executing* independent computations. Each `conc` task runs on a separate OS thread. This is true data parallelism.
 
 ## Lazy Thunks (`@`)
 
@@ -50,7 +53,7 @@ The caller's argument expression is wrapped in a thunk automatically. The functi
 
 **Note**: The nxc self-hosting compiler does not yet support `@` in call-site argument labels.
 
-## Concurrency (`conc`)
+## Parallelism (`conc`)
 
 ### Syntax
 
@@ -65,7 +68,7 @@ conc do
 end
 ```
 
-All tasks run concurrently on OS-level threads. The `conc` block waits for all tasks to complete.
+Tasks execute in parallel on OS-level threads. The `conc` block joins all tasks before continuing.
 
 ### Task Semantics
 
