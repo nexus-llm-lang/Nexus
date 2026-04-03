@@ -274,9 +274,11 @@ pub(super) fn find_private_type_in_public_signature(typ: &Type, env: &TypeEnv) -
                 .or_else(|| find_private_type_in_public_signature(req, env))
                 .or_else(|| find_private_type_in_public_signature(eff, env))
         }
-        Type::Ref(inner) | Type::Linear(inner) | Type::Lazy(inner) | Type::Borrow(inner) | Type::Array(inner) => {
-            find_private_type_in_public_signature(inner, env)
-        }
+        Type::Ref(inner)
+        | Type::Linear(inner)
+        | Type::Lazy(inner)
+        | Type::Borrow(inner)
+        | Type::Array(inner) => find_private_type_in_public_signature(inner, env),
         Type::Row(effs, tail) => {
             for eff in effs {
                 if let Some(found) = find_private_type_in_public_signature(eff, env) {
@@ -632,11 +634,9 @@ fn stmt_mentions_name(stmt: &Spanned<Stmt>, target: &str) -> bool {
             body, catch_arms, ..
         } => {
             body.iter().any(|stmt| stmt_mentions_name(stmt, target))
-                || catch_arms.iter().any(|arm| {
-                    arm.body
-                        .iter()
-                        .any(|stmt| stmt_mentions_name(stmt, target))
-                })
+                || catch_arms
+                    .iter()
+                    .any(|arm| arm.body.iter().any(|stmt| stmt_mentions_name(stmt, target)))
         }
         Stmt::Inject { handlers, body } => {
             handlers

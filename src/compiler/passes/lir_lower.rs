@@ -159,10 +159,7 @@ struct LirLowerer<'a> {
 
 impl<'a> LirLowerer<'a> {
     fn new(mir: &'a MirProgram, enum_defs: &'a [EnumDef]) -> Self {
-        LirLowerer {
-            mir,
-            enum_defs,
-        }
+        LirLowerer { mir, enum_defs }
     }
 
     fn lower(&mut self) -> Result<LirProgram, LirLowerError> {

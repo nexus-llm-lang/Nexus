@@ -1030,10 +1030,9 @@ pub(super) fn compile_atom(
             }
             let local = local_map
                 .get(name)
-                .ok_or_else(|| {
-                    CodegenError::ConflictingLocalTypes {
+                .ok_or_else(|| CodegenError::ConflictingLocalTypes {
                     name: name.to_string(),
-                }})?;
+                })?;
             out.instruction(&Instruction::LocalGet(local.index));
             Ok(())
         }

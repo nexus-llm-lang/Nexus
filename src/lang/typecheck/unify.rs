@@ -230,9 +230,12 @@ pub(super) fn get_free_vars_type(typ: &Type) -> HashSet<String> {
             }
             s
         }
-        Type::Ref(i) | Type::Linear(i) | Type::Lazy(i) | Type::Borrow(i) | Type::Array(i) | Type::List(i) => {
-            get_free_vars_type(i)
-        }
+        Type::Ref(i)
+        | Type::Linear(i)
+        | Type::Lazy(i)
+        | Type::Borrow(i)
+        | Type::Array(i)
+        | Type::List(i) => get_free_vars_type(i),
         Type::Row(es, t) => {
             let mut s = HashSet::new();
             for e in es {
@@ -274,9 +277,12 @@ fn occurs_check(n: &str, t: &Type) -> bool {
                 || occurs_check(n, e)
         }
         Type::UserDefined(_, a) => a.iter().any(|x| occurs_check(n, x)),
-        Type::Ref(i) | Type::Linear(i) | Type::Lazy(i) | Type::Borrow(i) | Type::Array(i) | Type::List(i) => {
-            occurs_check(n, i)
-        }
+        Type::Ref(i)
+        | Type::Linear(i)
+        | Type::Lazy(i)
+        | Type::Borrow(i)
+        | Type::Array(i)
+        | Type::List(i) => occurs_check(n, i),
         Type::Row(es, t) => {
             es.iter().any(|x| occurs_check(n, x))
                 || t.as_ref().map_or(false, |x| occurs_check(n, x))

@@ -23,7 +23,10 @@ end
             }
         }
     }
-    assert!(has_start_export, "should export _start (WASI P1 entry point)");
+    assert!(
+        has_start_export,
+        "should export _start (WASI P1 entry point)"
+    );
 }
 
 #[test]

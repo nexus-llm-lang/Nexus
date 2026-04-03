@@ -58,7 +58,9 @@ fn collect_expr_refs(expr: &LirExpr, refs: &mut HashSet<Symbol>) {
         LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } => {
             collect_atom_refs(value, refs);
         }
-        LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => collect_atom_refs(value, refs),
+        LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => {
+            collect_atom_refs(value, refs)
+        }
         LirExpr::Closure { captures, .. } => {
             for (_, a) in captures {
                 collect_atom_refs(a, refs);

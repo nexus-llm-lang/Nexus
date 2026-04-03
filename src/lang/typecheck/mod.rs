@@ -841,17 +841,18 @@ impl TypeChecker {
                         }
                         Sigil::Borrow => {
                             let inner = match t1 {
-                                Type::Linear(t) | Type::Lazy(t) | Type::Borrow(t) | Type::Ref(t) => t,
+                                Type::Linear(t)
+                                | Type::Lazy(t)
+                                | Type::Borrow(t)
+                                | Type::Ref(t) => t,
                                 _ => Box::new(t1),
                             };
                             Type::Borrow(inner)
                         }
-                        Sigil::Lazy => {
-                            match t1 {
-                                Type::Lazy(_) => t1,
-                                _ => Type::Lazy(Box::new(t1)),
-                            }
-                        }
+                        Sigil::Lazy => match t1 {
+                            Type::Lazy(_) => t1,
+                            _ => Type::Lazy(Box::new(t1)),
+                        },
                     };
                     env.insert(key, self.generalize(env, ft));
                 }
@@ -943,10 +944,7 @@ impl TypeChecker {
                         }
                     }
                 }
-                Stmt::Try {
-                    body,
-                    catch_arms,
-                } => {
+                Stmt::Try { body, catch_arms } => {
                     let exn = Type::UserDefined("Exn".into(), vec![]);
                     let try_eff = Type::Row(vec![exn.clone()], Some(Box::new(ee.clone())));
                     let mut et = env.clone();
