@@ -167,43 +167,11 @@ impl TypeEnv {
     }
 
     /// Resolves a value binding by local name or `module.item`.
-    /// For linear references (`%name`), also tries the unsigiled name (`name`)
-    /// since `fn (x: %Type)` stores the parameter as `x`, not `%x`.
+    /// Bindings are stored with their sigil prefix (`%x`, `@x`, `~x`, `&x`)
+    /// so lookups must use the exact key — no cross-sigil fallback.
     pub fn get(&self, name: &str) -> Option<&Scheme> {
         if let Some(scheme) = self.vars.get(name) {
             return Some(scheme);
-        }
-        // %name → try name (linear param stored without sigil prefix)
-        if let Some(stripped) = name.strip_prefix('%') {
-            if let Some(scheme) = self.vars.get(stripped) {
-                if matches!(
-                    &scheme.typ,
-                    crate::types::Type::Linear(_) | crate::types::Type::Lazy(_)
-                ) {
-                    return Some(scheme);
-                }
-            }
-        }
-        // name → try %name (linear let-binding stored with sigil prefix)
-        if !name.starts_with('%') && !name.starts_with('&') && !name.starts_with('~') {
-            let linear_key = format!("%{}", name);
-            if let Some(scheme) = self.vars.get(&linear_key) {
-                if matches!(
-                    &scheme.typ,
-                    crate::types::Type::Linear(_) | crate::types::Type::Lazy(_)
-                ) {
-                    return Some(scheme);
-                }
-            }
-        }
-        // name → try @name (lazy let-binding stored with @ sigil prefix)
-        if !name.starts_with('@') && !name.starts_with('%') && !name.starts_with('&') && !name.starts_with('~') {
-            let lazy_key = format!("@{}", name);
-            if let Some(scheme) = self.vars.get(&lazy_key) {
-                if matches!(&scheme.typ, crate::types::Type::Lazy(_)) {
-                    return Some(scheme);
-                }
-            }
         }
         if let Some(pos) = name.find('.') {
             let mod_name = &name[..pos];
@@ -250,39 +218,17 @@ impl TypeEnv {
     }
 
     /// Marks a linear binding as consumed, returning an error on invalid reuse.
-    /// For `%name`, also checks unsigiled `name` (linear param stored without prefix).
+    /// Uses exact key matching — no cross-sigil fallback.
     pub fn consume(&mut self, name: &str) -> Result<(), String> {
         if self.linear_vars.remove(name) {
             return Ok(());
         }
-        // %name → try name (linear param stored without sigil prefix)
-        if let Some(stripped) = name.strip_prefix('%') {
-            if self.linear_vars.remove(stripped) {
-                return Ok(());
-            }
-        }
-        // name → try @name (lazy binding stored with @ prefix)
-        if !name.starts_with('@') && !name.starts_with('%') && !name.starts_with('&') {
-            let lazy_key = format!("@{}", name);
-            if self.linear_vars.remove(&lazy_key) {
-                return Ok(());
-            }
-        }
-        let check_name = if self.vars.contains_key(name) {
-            name.to_string()
-        } else if let Some(stripped) = name.strip_prefix('%') {
-            if self.vars.contains_key(stripped) {
-                stripped.to_string()
-            } else {
-                return Err(format!("Variable {} not found", name));
-            }
-        } else {
-            return Err(format!("Variable {} not found", name));
-        };
-        if let Some(s) = self.vars.get(&check_name) {
+        if let Some(s) = self.vars.get(name) {
             if self.contains_linear_type(&s.typ) {
                 return Err(format!("Linear variable {} already consumed", name));
             }
+        } else {
+            return Err(format!("Variable {} not found", name));
         }
         Ok(())
     }
