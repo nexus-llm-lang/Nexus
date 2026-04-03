@@ -24,10 +24,6 @@ use crate::types::Type;
 
 const STRING_DATA_BASE: u32 = 16;
 const OBJECT_HEAP_GLOBAL_INDEX: u32 = 0;
-const CONC_MODULE: &str = "nexus:runtime/conc";
-const CONC_SPAWN_NAME: &str = "__nx_conc_spawn";
-const CONC_JOIN_NAME: &str = "__nx_conc_join";
-const CONC_TASK_PREFIX: &str = "__conc_";
 const ALLOCATE_WASM_NAME: &str = "allocate";
 const BT_MODULE: &str = "nexus:runtime/backtrace";
 const BT_CAPTURE_NAME: &str = "__nx_capture_backtrace";

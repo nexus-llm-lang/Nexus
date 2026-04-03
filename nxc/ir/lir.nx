@@ -11,12 +11,12 @@
  */
 import { Span } from "nxc/common/token.nx"
 import { Sigil, BinaryOp, Literal, TypeExpr, NamedType, EnumDef, VariantDef, VariantField,
-         TyVar, TyList } from "nxc/common/ast.nx"
+         TyVar, TyList, TyLazy } from "nxc/common/ast.nx"
 import { MirProgram, MirFunction, MirExpr, MirStmt, MirParam, MirExternal,
          MirCallArg, MirMatchCase, MirPattern, MirPatternField,
          MirRecordPatField, MirNamedExpr } from "nxc/ir/mir_types.nx"
 import { LirProgram, LirFunction, LirExternal, LirParam, LirAtom, LirExpr,
-         LirStmt, LirCallArg, LirNamedAtom, ConcTask } from "nxc/ir/lir_types.nx"
+         LirStmt, LirCallArg, LirNamedAtom } from "nxc/ir/lir_types.nx"
 import { from_i64, char_code, length } from "stdlib/string.nx"
 
 // ─── Lowering Context ────────────────────────────────────────────────────────
@@ -867,24 +867,10 @@ let rev_lir_params = fn (lst: [LirParam], out: [LirParam]) -> [LirParam] do
   end
 end
 
-let rev_mir_functions = fn (lst: [MirFunction], out: [MirFunction]) -> [MirFunction] do
-  match lst do
-    case [] -> return out
-    case x :: rest -> return rev_mir_functions(lst: rest, out: x :: out)
-  end
-end
-
 let rev_enum_defs = fn (lst: [EnumDef], out: [EnumDef]) -> [EnumDef] do
   match lst do
     case [] -> return out
     case x :: rest -> return rev_enum_defs(lst: rest, out: x :: out)
-  end
-end
-
-let rev_conc_tasks = fn (lst: [ConcTask], out: [ConcTask]) -> [ConcTask] do
-  match lst do
-    case [] -> return out
-    case x :: rest -> return rev_conc_tasks(lst: rest, out: x :: out)
   end
 end
 
@@ -1577,6 +1563,17 @@ let lower_expr_to_atom = fn (expr: MirExpr, ctx: LowerCtx) -> BindResult do
         return bind_expr_to_temp(ctx: ctx2,
           expr: LirExprRaise(value: a, typ: TyUnit),
           typ: TyUnit)
+      end
+
+    case MirForce(expr: e) ->
+      match lower_expr_to_atom(expr: e, ctx: ctx) do case BindResult(ctx: ctx2, atom: a) ->
+        let inner_typ = match atom_type(atom: a) do
+          case TyLazy(inner: t) -> t
+          case other -> other
+        end
+        return bind_expr_to_temp(ctx: ctx2,
+          expr: LirExprForce(value: a, typ: inner_typ),
+          typ: inner_typ)
       end
 
     case MirIf(cond: cond, then_body: tb, else_body: eb) ->
@@ -2589,17 +2586,6 @@ let lower_stmt_inner = fn (stmt: MirStmt, ret_type: TypeExpr, ctx: LowerCtx) -> 
 
     case MirStmtTry(body: body, catch_param: cp, catch_body: cb) ->
       return lower_try_stmt(body: body, catch_param: cp, catch_body: cb, ret_type: ret_type, ctx: ctx)
-
-    case MirStmtConc(tasks: tasks) ->
-      let conc_tasks = build_conc_task_refs(tasks: tasks, ctx: ctx)
-      match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
-        let ctx2 = LowerCtx(
-          vars: v, semantic_vars: sv,
-          stmts: LirStmtConc(tasks: conc_tasks) :: s,
-          temp_counter: c, enum_defs: ed
-        )
-        return LowerStmtResult(ctx: ctx2, ret: None)
-      end
   end
 end
 
@@ -2863,318 +2849,6 @@ let lir_lower_stmts = fn (stmts: [MirStmt], ret_type: TypeExpr, ctx: LowerCtx) -
   end
 end
 
-// ─── Function Lowering ───────────────────────────────────────────────────────
-
-// ─── Free Variable Analysis (two-pass approach) ─────────────────────────────
-
-// Check if a name is in a list
-let list_contains = fn (name: string, lst: [string]) -> bool do
-  match lst do
-    case [] -> false
-    case n :: rest ->
-      if n == name then return true end
-      return list_contains(name: name, lst: rest)
-  end
-end
-
-// Pass 1: collect all variable names referenced in MIR expressions (deduped)
-let collect_expr_var_names = fn (expr: MirExpr, acc: [string]) -> [string] do
-  match expr do
-    case MirVariable(name: n) ->
-      if list_contains(name: n, lst: acc) then return acc end
-      return n :: acc
-    case MirBorrow(name: n) ->
-      if list_contains(name: n, lst: acc) then return acc end
-      return n :: acc
-    case MirBinaryOp(left: l, op: _, right: r) ->
-      collect_expr_var_names(expr: r, acc: collect_expr_var_names(expr: l, acc: acc))
-    case MirCall(func: _, args: args, ret_type: _) ->
-      collect_call_arg_var_names(args: args, acc: acc)
-    case MirConstructor(name: _, args: args) ->
-      collect_expr_list_var_names(exprs: args, acc: acc)
-    case MirRecord(fields: fields) ->
-      collect_named_expr_var_names(fields: fields, acc: acc)
-    case MirArray(elems: elems) ->
-      collect_expr_list_var_names(exprs: elems, acc: acc)
-    case MirIndex(target: t, index: i) ->
-      collect_expr_var_names(expr: i, acc: collect_expr_var_names(expr: t, acc: acc))
-    case MirFieldAccess(target: t, field: _) ->
-      collect_expr_var_names(expr: t, acc: acc)
-    case MirRaise(expr: e) ->
-      collect_expr_var_names(expr: e, acc: acc)
-    case MirIf(cond: c, then_body: tb, else_body: eb) ->
-      let acc2 = collect_stmts_var_names(stmts: tb, acc: collect_expr_var_names(expr: c, acc: acc))
-      match eb do
-        case Some(val: stmts) -> collect_stmts_var_names(stmts: stmts, acc: acc2)
-        case None -> acc2
-      end
-    case MirMatch(target: t, cases: cs) ->
-      collect_match_cases_var_names(cases: cs, acc: collect_expr_var_names(expr: t, acc: acc))
-    case MirWhile(cond: c, body: b) ->
-      collect_stmts_var_names(stmts: b, acc: collect_expr_var_names(expr: c, acc: acc))
-    case MirLiteral(lit: _) -> acc
-    case MirMakeClosure(func_name: _, captures: caps) ->
-      collect_expr_list_var_names(exprs: caps, acc: acc)
-    case MirCallClosure(closure: c, args: args, ret_type: _) ->
-      collect_call_arg_var_names(args: args, acc: collect_expr_var_names(expr: c, acc: acc))
-    case MirEnvLoad(env_var: n, index: _) ->
-      if list_contains(name: n, lst: acc) then return acc end
-      return n :: acc
-  end
-end
-
-let collect_call_arg_var_names = fn (args: [MirCallArg], acc: [string]) -> [string] do
-  match args do
-    case [] -> acc
-    case MirCallArg(label: _, value: e) :: rest ->
-      collect_call_arg_var_names(args: rest, acc: collect_expr_var_names(expr: e, acc: acc))
-  end
-end
-
-let collect_expr_list_var_names = fn (exprs: [MirExpr], acc: [string]) -> [string] do
-  match exprs do
-    case [] -> acc
-    case e :: rest ->
-      collect_expr_list_var_names(exprs: rest, acc: collect_expr_var_names(expr: e, acc: acc))
-  end
-end
-
-let collect_named_expr_var_names = fn (fields: [MirNamedExpr], acc: [string]) -> [string] do
-  match fields do
-    case [] -> acc
-    case MirNamedExpr(name: _, value: e) :: rest ->
-      collect_named_expr_var_names(fields: rest, acc: collect_expr_var_names(expr: e, acc: acc))
-  end
-end
-
-let collect_match_cases_var_names = fn (cases: [MirMatchCase], acc: [string]) -> [string] do
-  match cases do
-    case [] -> acc
-    case MirMatchCase(pattern: _, body: b) :: rest ->
-      collect_match_cases_var_names(cases: rest, acc: collect_stmts_var_names(stmts: b, acc: acc))
-  end
-end
-
-let collect_stmt_var_names = fn (stmt: MirStmt, acc: [string]) -> [string] do
-  match stmt do
-    case MirStmtLet(name: _, typ: _, expr: e) -> collect_expr_var_names(expr: e, acc: acc)
-    case MirStmtExpr(expr: e) -> collect_expr_var_names(expr: e, acc: acc)
-    case MirStmtReturn(expr: e) -> collect_expr_var_names(expr: e, acc: acc)
-    case MirStmtAssign(target: t, value: val) ->
-      collect_expr_var_names(expr: val, acc: collect_expr_var_names(expr: t, acc: acc))
-    case MirStmtConc(tasks: _) -> acc
-    case MirStmtTry(body: b, catch_param: _, catch_body: cb) ->
-      collect_stmts_var_names(stmts: cb, acc: collect_stmts_var_names(stmts: b, acc: acc))
-  end
-end
-
-let collect_stmts_var_names = fn (stmts: [MirStmt], acc: [string]) -> [string] do
-  match stmts do
-    case [] -> acc
-    case s :: rest ->
-      collect_stmts_var_names(stmts: rest, acc: collect_stmt_var_names(stmt: s, acc: acc))
-  end
-end
-
-// Pass 2: collect all let-defined variable names
-let collect_stmts_defined_names = fn (stmts: [MirStmt], acc: [string]) -> [string] do
-  match stmts do
-    case [] -> acc
-    case s :: rest ->
-      let acc2 = match s do
-        case MirStmtLet(name: n, typ: _, expr: _) -> n :: acc
-        case MirStmtTry(body: _, catch_param: cp, catch_body: _) -> cp :: acc
-        case _ -> acc
-      end
-      collect_stmts_defined_names(stmts: rest, acc: acc2)
-  end
-end
-
-// Subtract: keep only names NOT in the defined list
-let filter_defined = fn (names: [string], defined: [string]) -> [string] do
-  return filter_defined_go(names: names, defined: defined, acc: [])
-end
-
-let filter_defined_go = fn (names: [string], defined: [string], acc: [string]) -> [string] do
-  match names do
-    case [] -> return rev_strings(lst: acc, out: [])
-    case n :: rest ->
-      if list_contains(name: n, lst: defined) then return filter_defined_go(names: rest, defined: defined, acc: acc) end
-      return filter_defined_go(names: rest, defined: defined, acc: n :: acc)
-  end
-end
-
-// Compute free variables: referenced but not defined within the block
-let collect_free_vars = fn (body: [MirStmt]) -> [string] do
-  let referenced = collect_stmts_var_names(stmts: body, acc: [])
-  let defined = collect_stmts_defined_names(stmts: body, acc: [])
-  return filter_defined(names: referenced, defined: defined)
-end
-
-// ─── Conc Task Extraction (MIR → MIR pre-pass) ──────────────────────────────
-
-// Build scope from function params
-let build_scope_from_params = fn (params: [MirParam]) -> [TypeEntry] do
-  return build_scope_from_params_go(params: params, acc: [])
-end
-
-let build_scope_from_params_go = fn (params: [MirParam], acc: [TypeEntry]) -> [TypeEntry] do
-  match params do
-    case [] -> return rev_type_entries(lst: acc, out: [])
-    case MirParam(label: _, name: n, typ: t) :: rest ->
-      return build_scope_from_params_go(params: rest, acc: TypeEntry(name: n, typ: t) :: acc)
-  end
-end
-
-// Collect all let-bound variable types from MIR body (recursive)
-let collect_scope_from_stmts = fn (stmts: [MirStmt], scope: [TypeEntry]) -> [TypeEntry] do
-  match stmts do
-    case [] -> scope
-    case s :: rest ->
-      let scope2 = match s do
-        case MirStmtLet(name: n, typ: t, expr: _) ->
-          TypeEntry(name: n, typ: t) :: scope
-        case MirStmtTry(body: b, catch_param: cp, catch_body: cb) ->
-          let s1 = collect_scope_from_stmts(stmts: b, scope: scope)
-          collect_scope_from_stmts(stmts: cb,
-            scope: TypeEntry(name: cp, typ: TyString) :: s1)
-        case _ -> scope
-      end
-      collect_scope_from_stmts(stmts: rest, scope: scope2)
-  end
-end
-
-// Build MirFunction for a conc task with captured variables as params
-let build_task_mir_function = fn (tsk: MirFunction, scope: [TypeEntry]) -> MirFunction do
-  match tsk do case MirFunction(name: tname, params: _, ret_type: _, body: tbody, span: tspan) ->
-    let free_vars = collect_free_vars(body: tbody)
-    // Skip build_capture_params for now
-    return MirFunction(
-      name: "__conc_" ++ tname,
-      params: [],
-      ret_type: TyUnit,
-      body: tbody,
-      span: tspan
-    )
-  end
-end
-
-let build_capture_params = fn (names: [string], scope: [TypeEntry]) -> [MirParam] do
-  return build_capture_params_go(names: names, scope: scope, acc: [])
-end
-
-let build_capture_params_go = fn (names: [string], scope: [TypeEntry], acc: [MirParam]) -> [MirParam] do
-  match names do
-    case [] -> return rev_mir_params(lst: acc, out: [])
-    case n :: rest ->
-      let typ = match lir_lookup_type(name: n, entries: scope) do
-        case Some(val: t) -> t
-        case None -> TyI64
-      end
-      return build_capture_params_go(names: rest, scope: scope, acc: MirParam(label: n, name: n, typ: typ) :: acc)
-  end
-end
-
-// Extract conc tasks from a single function and return additional MirFunctions
-let extract_conc_from_function = fn (func: MirFunction) -> [MirFunction] do
-  match func do case MirFunction(name: _, params: ps, ret_type: _, body: body, span: _) ->
-    let scope = collect_scope_from_stmts(stmts: body,
-      scope: build_scope_from_params(params: ps))
-    extract_conc_from_stmts(stmts: body, scope: scope)
-  end
-end
-
-let extract_conc_from_stmts = fn (stmts: [MirStmt], scope: [TypeEntry]) -> [MirFunction] do
-  match stmts do
-    case [] -> []
-    case s :: rest ->
-      let tasks = match s do
-        case MirStmtConc(tasks: ts) ->
-          build_task_mir_functions(tasks: ts, scope: scope)
-        case MirStmtTry(body: b, catch_param: _, catch_body: cb) ->
-          append_funcs(
-            a: extract_conc_from_stmts(stmts: b, scope: scope),
-            b: extract_conc_from_stmts(stmts: cb, scope: scope))
-        case _ -> []
-      end
-      append_funcs(a: tasks,
-                   b: extract_conc_from_stmts(stmts: rest, scope: scope))
-  end
-end
-
-let build_task_mir_functions = fn (tasks: [MirFunction], scope: [TypeEntry]) -> [MirFunction] do
-  return build_task_mir_functions_go(tasks: tasks, scope: scope, acc: [])
-end
-
-let build_task_mir_functions_go = fn (tasks: [MirFunction], scope: [TypeEntry], acc: [MirFunction]) -> [MirFunction] do
-  match tasks do
-    case [] -> return rev_mir_functions(lst: acc, out: [])
-    case t :: rest ->
-      return build_task_mir_functions_go(tasks: rest, scope: scope, acc: build_task_mir_function(tsk: t, scope: scope) :: acc)
-  end
-end
-
-let append_funcs = fn (a: [MirFunction], b: [MirFunction]) -> [MirFunction] do
-  return append_funcs_go(a: a, b: b, acc: [])
-end
-
-let append_funcs_go = fn (a: [MirFunction], b: [MirFunction], acc: [MirFunction]) -> [MirFunction] do
-  match a do
-    case [] -> return rev_mir_functions(lst: acc, out: b)
-    case f :: rest -> return append_funcs_go(a: rest, b: b, acc: f :: acc)
-  end
-end
-
-// Extract all conc tasks from all functions in the program
-let extract_all_conc_tasks = fn (functions: [MirFunction]) -> [MirFunction] do
-  extract_all_conc_tasks_go(functions: functions)
-end
-
-let extract_all_conc_tasks_go = fn (functions: [MirFunction]) -> [MirFunction] do
-  match functions do
-    case [] -> []
-    case f :: rest ->
-      append_funcs(
-        a: extract_conc_from_function(func: f),
-        b: extract_all_conc_tasks_go(functions: rest))
-  end
-end
-
-// ─── Conc Task References (for LIR lowering) ─────────────────────────────────
-
-// Build ConcTask references from MirStmtConc tasks, using lowering context for types
-let build_conc_task_refs = fn (tasks: [MirFunction], ctx: LowerCtx) -> [ConcTask] do
-  return build_conc_task_refs_go(tasks: tasks, ctx: ctx, acc: [])
-end
-
-let build_conc_task_refs_go = fn (tasks: [MirFunction], ctx: LowerCtx, acc: [ConcTask]) -> [ConcTask] do
-  match tasks do
-    case [] -> return rev_conc_tasks(lst: acc, out: [])
-    case MirFunction(name: tname, params: _, ret_type: _, body: tbody, span: _) :: rest ->
-      let free_vars = collect_free_vars(body: tbody)
-      let args = build_conc_task_args(names: free_vars, ctx: ctx)
-      return build_conc_task_refs_go(tasks: rest, ctx: ctx, acc: ConcTask(func_name: "__conc_" ++ tname, args: args) :: acc)
-  end
-end
-
-let build_conc_task_args = fn (names: [string], ctx: LowerCtx) -> [LirNamedAtom] do
-  return build_conc_task_args_go(names: names, ctx: ctx, acc: [])
-end
-
-let build_conc_task_args_go = fn (names: [string], ctx: LowerCtx, acc: [LirNamedAtom]) -> [LirNamedAtom] do
-  match names do
-    case [] -> return rev_lir_named_atoms(lst: acc, out: [])
-    case n :: rest ->
-      match ctx do case LowerCtx(vars: v, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: _) ->
-        let typ = match lir_lookup_type(name: n, entries: v) do
-          case Some(val: t) -> t
-          case None -> TyI64
-        end
-        return build_conc_task_args_go(names: rest, ctx: ctx, acc: LirNamedAtom(name: n, value: LirAtomVar(name: n, typ: typ)) :: acc)
-      end
-  end
-end
-
 // ─── Function Lowering ──────────────────────────────────────────────────────
 
 let lir_lower_function = fn (f: MirFunction, enum_defs: [EnumDef], func_types: [TypeEntry]) -> LirFunction do
@@ -3334,12 +3008,9 @@ end
 export let lower_mir_to_lir = fn (mir: MirProgram, enum_defs: [EnumDef]) -> LirProgram do
   let all_defs = prepend_defs(xs: builtin_enum_defs(), ys: enum_defs)
   match mir do case MirProgram(functions: fs, externals: exts) ->
-    // Pre-extract conc tasks as separate MIR functions
-    let task_mir_funcs = extract_all_conc_tasks(functions: fs)
-    let all_mir_funcs = append_funcs(a: fs, b: task_mir_funcs)
-    let func_types = build_func_type_entries(funcs: all_mir_funcs)
+    let func_types = build_func_type_entries(funcs: fs)
     return LirProgram(
-      functions: lir_lower_functions(functions: all_mir_funcs, enum_defs: all_defs, func_types: func_types),
+      functions: lir_lower_functions(functions: fs, enum_defs: all_defs, func_types: func_types),
       externals: convert_externals(externals: exts)
     )
   end

@@ -12,7 +12,7 @@ import { ByteBuffer, empty, push_byte, push_uleb128, push_sleb128,
          push_string, push_buf, push_f64_str_le, free, length as buf_length } from "stdlib/bytebuffer.nx"
 import { BinaryOp, TypeExpr } from "nxc/common/ast.nx"
 import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom,
-         LirExternal, LirParam, LirCallArg, LirNamedAtom, ConcTask } from "nxc/ir/lir_types.nx"
+         LirExternal, LirParam, LirCallArg, LirNamedAtom } from "nxc/ir/lir_types.nx"
 import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          ctx_locals, ctx_internal_funcs, ctx_external_funcs, ctx_string_lits,
          ctx_alloc_mode, ctx_temps_base, ctx_func_ret_type, ctx_functions, ctx_externals, ctx_func_name,
@@ -52,7 +52,6 @@ import { build_type_section, build_import_section, build_function_section,
          build_table_section, build_element_section, emit_closure_type_entries,
          build_tag_section } from "nxc/backend/wasm_section.nx"
 import * as list from "stdlib/list.nx"
-import { starts_with } from "stdlib/string.nx"
 import { CompileError, error_no_span, PhaseCodegen } from "nxc/common/error.nx"
 
 // ─── TCMC (Tail Call Modulo Constructor) ─────────────────────────────────────
@@ -916,13 +915,6 @@ let rev_func_entries = fn (lst: [FuncEntry], out: [FuncEntry]) -> [FuncEntry] do
   end
 end
 
-let rev_lir_externals = fn (lst: [LirExternal], out: [LirExternal]) -> [LirExternal] do
-  match lst do
-    case [] -> return out
-    case x :: rest -> return rev_lir_externals(lst: rest, out: x :: out)
-  end
-end
-
 let rev_arity_type_idxs = fn (lst: [ArityTypeIdx], out: [ArityTypeIdx]) -> [ArityTypeIdx] do
   match lst do
     case [] -> return out
@@ -1177,6 +1169,10 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = push_uleb128(buf: %buf, val: 0)
       return %buf
 
+    case LirExprForce(value: v, typ: _) ->
+      // Force a lazy value: evaluate the thunk (currently identity — runtime TBD)
+      return emit_atom(atom: v, buf: %buf, ctx: ctx)
+
     case LirExprMakeClosure(func_name: fname, captures: caps, typ: _) ->
       // Allocate (1 + n_captures) words on heap
       let n_caps = list.length(xs: caps)
@@ -1397,95 +1393,6 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       end
       return push_byte(buf: %buf, byte: op_end)
 
-    case LirStmtConc(tasks: tasks) ->
-      let spawn_idx = lookup_func_fast(name: "__nx_conc_spawn", map_id: ctx_external_func_map(ctx: ctx))
-      let join_idx = lookup_func_fast(name: "__nx_conc_join", map_id: ctx_external_func_map(ctx: ctx))
-      let args_ptr_local = ctx_temps_base(ctx: ctx) + 2
-      let %buf = emit_conc_tasks(tasks: tasks, buf: %buf, ctx: ctx,
-        spawn_idx: spawn_idx, args_ptr_local: args_ptr_local)
-      // Call __nx_conc_join()
-      let %buf = push_byte(buf: %buf, byte: op_call)
-      return push_uleb128(buf: %buf, val: join_idx)
-  end
-end
-
-let emit_conc_tasks = fn (tasks: [ConcTask], buf: %ByteBuffer, ctx: CodegenCtx,
-                           spawn_idx: i64, args_ptr_local: i64) -> %ByteBuffer throws { Exn } do
-  match tasks do
-    case [] -> %buf
-    case ConcTask(func_name: fname, args: args) :: rest ->
-      let func_idx = lookup_func_fast(name: fname, map_id: ctx_internal_func_map(ctx: ctx))
-      let n_args = list.length(xs: args)
-      let conc_alloc_idx = lookup_func_fast(name: "__nx_allocate", map_id: ctx_external_func_map(ctx: ctx))
-      // Allocate heap space for args (n_args * 8 bytes)
-      match conc_alloc_idx >= 0 do
-        case true ->
-          let %buf = push_byte(buf: %buf, byte: op_i32_const)
-          let %buf = push_sleb128(buf: %buf, val: n_args * 8)
-          let %buf = push_byte(buf: %buf, byte: op_call)
-          let %buf = push_uleb128(buf: %buf, val: conc_alloc_idx)
-          let %buf = push_byte(buf: %buf, byte: op_local_set)
-          let %buf = push_uleb128(buf: %buf, val: args_ptr_local)
-        case false ->
-          let %buf = push_byte(buf: %buf, byte: op_global_get)
-          let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
-          let %buf = push_byte(buf: %buf, byte: op_local_set)
-          let %buf = push_uleb128(buf: %buf, val: args_ptr_local)
-      end
-      // Write each captured arg as i64 to heap
-      let %buf = emit_conc_args(args: args, buf: %buf, ctx: ctx,
-        args_ptr_local: args_ptr_local, offset: 0)
-      // Advance heap pointer (only for bump allocator)
-      let %buf = if conc_alloc_idx < 0 then
-        let %buf = push_byte(buf: %buf, byte: op_local_get)
-        let %buf = push_uleb128(buf: %buf, val: args_ptr_local)
-        let %buf = push_byte(buf: %buf, byte: op_i32_const)
-        let %buf = push_sleb128(buf: %buf, val: n_args * 8)
-        let %buf = push_byte(buf: %buf, byte: op_i32_add)
-        let %buf = push_byte(buf: %buf, byte: op_global_set)
-        push_uleb128(buf: %buf, val: heap_global_idx)
-      else %buf end
-      // Call __nx_conc_spawn(func_idx, args_ptr, n_args)
-      let %buf = push_byte(buf: %buf, byte: op_i32_const)
-      let %buf = push_sleb128(buf: %buf, val: func_idx)
-      let %buf = push_byte(buf: %buf, byte: op_local_get)
-      let %buf = push_uleb128(buf: %buf, val: args_ptr_local)
-      let %buf = push_byte(buf: %buf, byte: op_i32_const)
-      let %buf = push_sleb128(buf: %buf, val: n_args)
-      let %buf = push_byte(buf: %buf, byte: op_call)
-      let %buf = push_uleb128(buf: %buf, val: spawn_idx)
-      emit_conc_tasks(tasks: rest, buf: %buf, ctx: ctx,
-        spawn_idx: spawn_idx, args_ptr_local: args_ptr_local)
-  end
-end
-
-let emit_conc_args = fn (args: [LirNamedAtom], buf: %ByteBuffer, ctx: CodegenCtx,
-                          args_ptr_local: i64, offset: i64) -> %ByteBuffer throws { Exn } do
-  match args do
-    case [] -> %buf
-    case LirNamedAtom(name: _, value: atom) :: rest ->
-      // base_ptr
-      let %buf = push_byte(buf: %buf, byte: op_local_get)
-      let %buf = push_uleb128(buf: %buf, val: args_ptr_local)
-      // Load atom value
-      let %buf = emit_atom(atom: atom, buf: %buf, ctx: ctx)
-      // Widen to i64 if needed
-      let %buf = emit_widen_to_i64(typ: atom_type(atom: atom), buf: %buf)
-      // i64.store with offset
-      let %buf = push_byte(buf: %buf, byte: op_i64_store)
-      let %buf = push_uleb128(buf: %buf, val: 3)
-      let %buf = push_uleb128(buf: %buf, val: offset)
-      emit_conc_args(args: rest, buf: %buf, ctx: ctx,
-        args_ptr_local: args_ptr_local, offset: offset + 8)
-  end
-end
-
-let emit_widen_to_i64 = fn (typ: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer throws { Exn } do
-  match peel_linear(typ: typ) do
-    case TyI32 -> push_byte(buf: %buf, byte: op_i64_extend_i32_u)
-    case TyBool -> push_byte(buf: %buf, byte: op_i64_extend_i32_u)
-    case TyF64 -> push_byte(buf: %buf, byte: op_i64_reinterpret_f64)
-    case _ -> %buf
   end
 end
 
@@ -1691,65 +1598,6 @@ let build_external_func_entries_go = fn (exts: [LirExternal], idx: i64, acc: [Fu
   end
 end
 
-// ─── Conc detection helpers ──────────────────────────────────────────────────
-
-let has_conc_tasks = fn (funcs: [LirFunction]) -> bool throws { Exn } do
-  match funcs do
-    case [] -> return false
-    case LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
-      if starts_with(s: n, prefix: "__conc_") then return true
-      else return has_conc_tasks(funcs: rest)
-      end
-  end
-end
-
-let collect_conc_exports = fn (funcs: [FuncEntry]) -> [FuncEntry] throws { Exn } do
-  return collect_conc_exports_go(funcs: funcs, acc: [])
-end
-let collect_conc_exports_go = fn (funcs: [FuncEntry], acc: [FuncEntry]) -> [FuncEntry] throws { Exn } do
-  match funcs do
-    case [] -> return rev_func_entries(lst: acc, out: [])
-    case FuncEntry(name: n, index: idx) :: rest ->
-      if starts_with(s: n, prefix: "__conc_") then
-        return collect_conc_exports_go(funcs: rest, acc: FuncEntry(name: n, index: idx) :: acc)
-      else return collect_conc_exports_go(funcs: rest, acc: acc)
-      end
-  end
-end
-
-let make_conc_externals = fn () -> [LirExternal] throws { Exn } do
-  return [
-    LirExternal(
-      name: "__nx_conc_spawn",
-      wasm_module: "nexus:runtime/conc",
-      wasm_name: "__nx_conc_spawn",
-      params: [LirParam(label: "func_idx", name: "func_idx", typ: TyI32),
-               LirParam(label: "args_ptr", name: "args_ptr", typ: TyI32),
-               LirParam(label: "n_args", name: "n_args", typ: TyI32)],
-      ret_type: TyUnit,
-      throw_row: TyUnit
-    ),
-    LirExternal(
-      name: "__nx_conc_join",
-      wasm_module: "nexus:runtime/conc",
-      wasm_name: "__nx_conc_join",
-      params: [],
-      ret_type: TyUnit,
-      throw_row: TyUnit
-    )
-  ]
-end
-
-let append_externals = fn (a: [LirExternal], b: [LirExternal]) -> [LirExternal] throws { Exn } do
-  return append_externals_go(a: a, b: b, acc: [])
-end
-let append_externals_go = fn (a: [LirExternal], b: [LirExternal], acc: [LirExternal]) -> [LirExternal] throws { Exn } do
-  match a do
-    case [] -> return rev_lir_externals(lst: acc, out: b)
-    case e :: rest -> return append_externals_go(a: rest, b: b, acc: e :: acc)
-  end
-end
-
 // ─── Closure analysis helpers ───────────────────────────────────────────────
 
 /// Build closure table entries: maps table index → function index for __closure_* functions.
@@ -1867,14 +1715,7 @@ end
 
 export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws { Exn } do
   match program do
-    case LirProgram(functions: funcs, externals: orig_exts) ->
-      // Detect conc tasks and add conc imports if needed
-      let has_conc = has_conc_tasks(funcs: funcs)
-      let exts = match has_conc do
-        case true -> append_externals(a: orig_exts, b: make_conc_externals())
-        case false -> orig_exts
-      end
-      let augmented_program = LirProgram(functions: funcs, externals: exts)
+    case LirProgram(functions: funcs, externals: exts) ->
 
       let n_exts = list.length(xs: exts)
       let n_funcs = list.length(xs: funcs)
@@ -1928,12 +1769,6 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
 
       let wasi_run_idx = import_count + n_funcs
 
-      // Conc exports
-      let conc_exports = match has_conc do
-        case true -> collect_conc_exports(funcs: internal_funcs)
-        case false -> []
-      end
-
       // WASM magic + version
       let %m = empty()
       let %m = push_byte(buf: %m, byte: 0)
@@ -1947,7 +1782,7 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
 
       // Type section (with EH tag + allocate + closure call types appended)
       let has_alloc = alloc_mode == 2
-      let %type_sec = build_type_section(program: augmented_program, has_eh: has_eh, has_alloc: has_alloc, n_closure_types: n_closure_types)
+      let %type_sec = build_type_section(program: program, has_eh: has_eh, has_alloc: has_alloc, n_closure_types: n_closure_types)
       let %type_sec = if n_closure_types > 0 then
         emit_closure_type_entries(buf: %type_sec, arities: closure_arities)
       else %type_sec end
@@ -1991,7 +1826,7 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
       // Export section
       let %m = emit_section(buf: %m, id: sec_export,
                              content: build_export_section(main_idx: main_idx, wasi_run_idx: wasi_run_idx,
-                                                           mem_mode: mem_mode, conc_exports: conc_exports))
+                                                           mem_mode: mem_mode))
 
       // Element section (populate funcref table)
       let %m = if n_closures > 0 then

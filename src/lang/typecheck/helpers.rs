@@ -217,6 +217,7 @@ pub(super) fn convert_generic_user_defined_to_var(typ: &Type, vars: &HashSet<Str
         ),
         Type::Ref(i) => Type::Ref(Box::new(convert_generic_user_defined_to_var(i, vars))),
         Type::Linear(i) => Type::Linear(Box::new(convert_generic_user_defined_to_var(i, vars))),
+        Type::Lazy(i) => Type::Lazy(Box::new(convert_generic_user_defined_to_var(i, vars))),
         Type::Borrow(i) => Type::Borrow(Box::new(convert_generic_user_defined_to_var(i, vars))),
         Type::Array(i) => Type::Array(Box::new(convert_generic_user_defined_to_var(i, vars))),
         Type::List(i) => Type::List(Box::new(convert_generic_user_defined_to_var(i, vars))),
@@ -297,6 +298,7 @@ pub(super) fn default_numeric_literals(typ: &Type) -> Type {
         ),
         Type::Ref(inner) => Type::Ref(Box::new(default_numeric_literals(inner))),
         Type::Linear(inner) => Type::Linear(Box::new(default_numeric_literals(inner))),
+        Type::Lazy(inner) => Type::Lazy(Box::new(default_numeric_literals(inner))),
         Type::Borrow(inner) => Type::Borrow(Box::new(default_numeric_literals(inner))),
         Type::Array(inner) => Type::Array(Box::new(default_numeric_literals(inner))),
         Type::List(inner) => Type::List(Box::new(default_numeric_literals(inner))),
@@ -358,7 +360,7 @@ pub(super) fn is_auto_droppable(typ: &Type) -> bool {
         | Type::String
         | Type::Unit
         | Type::Array(_) => true,
-        Type::Linear(inner) | Type::Borrow(inner) | Type::Ref(inner) => is_auto_droppable(inner),
+        Type::Linear(inner) | Type::Lazy(inner) | Type::Borrow(inner) | Type::Ref(inner) => is_auto_droppable(inner),
         _ => false,
     }
 }
@@ -382,6 +384,7 @@ fn collect_external_type_vars(typ: &Type, env: &TypeEnv, out: &mut HashSet<Strin
         }
         Type::Ref(inner)
         | Type::Linear(inner)
+        | Type::Lazy(inner)
         | Type::Borrow(inner)
         | Type::Array(inner)
         | Type::List(inner) => collect_external_type_vars(inner, env, out),
@@ -427,6 +430,7 @@ fn convert_external_type_vars(typ: &Type, vars: &HashSet<String>) -> Type {
         ),
         Type::Ref(inner) => Type::Ref(Box::new(convert_external_type_vars(inner, vars))),
         Type::Linear(inner) => Type::Linear(Box::new(convert_external_type_vars(inner, vars))),
+        Type::Lazy(inner) => Type::Lazy(Box::new(convert_external_type_vars(inner, vars))),
         Type::Borrow(inner) => Type::Borrow(Box::new(convert_external_type_vars(inner, vars))),
         Type::Array(inner) => Type::Array(Box::new(convert_external_type_vars(inner, vars))),
         Type::List(inner) => Type::List(Box::new(convert_external_type_vars(inner, vars))),
@@ -543,7 +547,7 @@ pub(super) fn contains_ref(t: &Type) -> bool {
                 || contains_ref(e)
         }
         Type::UserDefined(_, a) => a.iter().any(contains_ref),
-        Type::Linear(i) | Type::Borrow(i) | Type::Array(i) => contains_ref(i),
+        Type::Linear(i) | Type::Lazy(i) | Type::Borrow(i) | Type::Array(i) => contains_ref(i),
         Type::Row(es, t) => {
             es.iter().any(contains_ref) || t.as_ref().map_or(false, |x| contains_ref(x))
         }
@@ -641,7 +645,7 @@ pub(super) fn contains_named_throws(t: &Type, effect_name: &str) -> bool {
                 || contains_named_throws(req, effect_name)
                 || contains_named_throws(eff, effect_name)
         }
-        Type::Ref(inner) | Type::Linear(inner) | Type::Borrow(inner) | Type::Array(inner) => {
+        Type::Ref(inner) | Type::Linear(inner) | Type::Lazy(inner) | Type::Borrow(inner) | Type::Array(inner) => {
             contains_named_throws(inner, effect_name)
         }
         Type::Row(effs, tail) => {

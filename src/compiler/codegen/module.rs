@@ -20,25 +20,17 @@ use super::emit::{
 use super::error::CodegenError;
 use super::function::compile_function;
 use super::layout::{build_codegen_layout, program_uses_object_heap, MemoryMode};
-use super::{
-    ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, CONC_JOIN_NAME, CONC_MODULE, CONC_SPAWN_NAME,
-    CONC_TASK_PREFIX,
-};
+use super::{ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE};
 
 /// Compiles LIR (in ANF) directly into core WASM bytes, plus debug entries for DWARF.
 pub fn compile_lir_to_wasm(
     program: &LirProgram,
 ) -> Result<(Vec<u8>, Vec<FuncDebugEntry>), CodegenError> {
-    let has_conc = program
-        .functions
-        .iter()
-        .any(|f| f.name.starts_with(CONC_TASK_PREFIX));
     let has_eh = program_needs_eh(program);
     // Only import __nx_capture_backtrace when a catch body actually uses backtrace().
     // This is the "notrace" optimization: most programs use try/catch without inspecting
     // the call stack, so we skip the expensive wasmtime stack walk at every throw.
     let needs_bt_capture = has_eh && program_uses_backtrace(program);
-    let n_conc_imports: u32 = if has_conc { 2 } else { 0 };
 
     let stdlib_alloc_module = if program_uses_object_heap(program) {
         program
@@ -71,7 +63,7 @@ pub fn compile_lir_to_wasm(
     let deduped_ext_count = deduped_externals.len() as u32;
     let n_bt_imports: u32 = if needs_bt_capture { 1 } else { 0 };
 
-    let import_count = deduped_ext_count + n_conc_imports + n_alloc_imports + n_bt_imports;
+    let import_count = deduped_ext_count + n_alloc_imports + n_bt_imports;
 
     let mut internal_function_indices = HashMap::new();
     for (idx, func) in program.functions.iter().enumerate() {
@@ -89,27 +81,18 @@ pub fn compile_lir_to_wasm(
         .find(|func| func.name == ENTRYPOINT)
         .ok_or_else(|| CodegenError::MissingMain)?;
 
-    if has_conc {
-        external_function_indices.insert(Symbol::from(CONC_SPAWN_NAME), deduped_ext_count);
-        external_function_indices.insert(Symbol::from(CONC_JOIN_NAME), deduped_ext_count + 1);
-    }
-
     // Collect funcref targets and indirect call types
     let funcref_targets = collect_funcref_targets(program);
     let indirect_call_types = collect_indirect_call_types(program);
     let has_funcref = !funcref_targets.is_empty();
 
     let mut layout = build_codegen_layout(program)?;
-    if has_conc {
-        layout.conc_spawn_idx = Some(deduped_ext_count);
-        layout.conc_join_idx = Some(deduped_ext_count + 1);
-    }
     if stdlib_alloc_module.is_some() {
-        let alloc_idx = deduped_ext_count + n_conc_imports;
+        let alloc_idx = deduped_ext_count;
         layout.allocate_func_idx = Some(alloc_idx);
     }
     if needs_bt_capture {
-        let bt_idx = deduped_ext_count + n_conc_imports + n_alloc_imports;
+        let bt_idx = deduped_ext_count + n_alloc_imports;
         layout.capture_bt_func_idx = Some(bt_idx);
     }
 
@@ -145,19 +128,6 @@ pub fn compile_lir_to_wasm(
             idx
         };
         external_type_indices.push(type_idx);
-    }
-
-    let mut conc_spawn_type_idx = 0;
-    let mut conc_join_type_idx = 0;
-    if has_conc {
-        types
-            .ty()
-            .function([ValType::I32, ValType::I32, ValType::I32], []);
-        conc_spawn_type_idx = next_type_index;
-        next_type_index += 1;
-        types.ty().function([], []);
-        conc_join_type_idx = next_type_index;
-        next_type_index += 1;
     }
 
     // Exception tag type: (i64) -> () — the exception payload is a packed i64
@@ -272,19 +242,6 @@ pub fn compile_lir_to_wasm(
         );
         has_imports = true;
     }
-    if has_conc {
-        imports.import(
-            CONC_MODULE,
-            CONC_SPAWN_NAME,
-            EntityType::Function(conc_spawn_type_idx),
-        );
-        imports.import(
-            CONC_MODULE,
-            CONC_JOIN_NAME,
-            EntityType::Function(conc_join_type_idx),
-        );
-        has_imports = true;
-    }
     if let Some(alloc_module) = &stdlib_alloc_module {
         imports.import(
             alloc_module,
@@ -378,12 +335,6 @@ pub fn compile_lir_to_wasm(
     if !matches!(layout.memory_mode, MemoryMode::None) {
         exports.export(MEMORY_EXPORT, ExportKind::Memory, 0);
     }
-    for func in &program.functions {
-        if func.name.starts_with(CONC_TASK_PREFIX) {
-            let idx = internal_function_indices[&func.name];
-            exports.export(func.name.as_str(), ExportKind::Func, idx);
-        }
-    }
     module.section(&exports);
 
     // === Element Section (funcref table) ===
@@ -461,12 +412,6 @@ pub fn compile_lir_to_wasm(
             func_names.append(idx, ext.wasm_name.as_str());
             idx += 1;
         }
-        if has_conc {
-            func_names.append(idx, CONC_SPAWN_NAME);
-            idx += 1;
-            func_names.append(idx, CONC_JOIN_NAME);
-            idx += 1;
-        }
         if stdlib_alloc_module.is_some() {
             func_names.append(idx, ALLOCATE_WASM_NAME);
             idx += 1;
@@ -536,7 +481,8 @@ fn collect_funcref_targets(program: &LirProgram) -> Vec<Symbol> {
             }
             LirExpr::ObjectTag { value, .. }
             | LirExpr::ObjectField { value, .. }
-            | LirExpr::Raise { value, .. } => {
+            | LirExpr::Raise { value, .. }
+            | LirExpr::Force { value, .. } => {
                 scan_atom(value, targets);
             }
             LirExpr::ClosureEnvLoad { .. } => {}
@@ -581,7 +527,6 @@ fn collect_funcref_targets(program: &LirProgram) -> Vec<Symbol> {
                     scan_stmt(s, targets);
                 }
             }
-            LirStmt::Conc { .. } => {}
             LirStmt::Loop {
                 cond_stmts, body, ..
             } => {
@@ -667,7 +612,6 @@ fn collect_indirect_call_types(program: &LirProgram) -> Vec<Type> {
                     scan_stmt(s, types, seen);
                 }
             }
-            LirStmt::Conc { .. } => {}
             LirStmt::Loop {
                 cond_stmts, body, ..
             } => {
@@ -766,7 +710,6 @@ fn program_needs_eh(program: &LirProgram) -> bool {
                 else_body,
                 ..
             } => then_body.iter().any(stmt_needs_bt) || else_body.iter().any(stmt_needs_bt),
-            LirStmt::Conc { .. } => false,
             LirStmt::Loop {
                 cond_stmts, body, ..
             } => cond_stmts.iter().any(stmt_needs_bt) || body.iter().any(stmt_needs_bt),

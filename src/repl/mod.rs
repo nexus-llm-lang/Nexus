@@ -18,7 +18,7 @@ use crate::lang::ast::{Expr, GlobalLet, Program, Stmt, TopLevel};
 use crate::lang::parser::{parser, stmt_parser, ParseError};
 use crate::lang::typecheck::TypeChecker;
 use crate::runtime::backtrace;
-use crate::runtime::conc::add_nexus_host_stubs;
+use crate::runtime::net_host::add_nexus_host_stubs;
 use crate::runtime::ExecutionCapabilities;
 use crate::types::{Literal, Spanned, Type};
 

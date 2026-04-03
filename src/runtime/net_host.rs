@@ -260,9 +260,51 @@ fn do_stop(server_id: i64) -> Result<(), String> {
 
 // ── Linker registration ─────────────────────────────────────────────
 
+/// Check if a module imports from a given module name.
+pub(crate) fn imports_module(wasm_bytes: &[u8], target: &str) -> bool {
+    for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
+        if let Ok(wasmparser::Payload::ImportSection(reader)) = payload {
+            for import in reader.into_iter().flatten() {
+                if import.module == target {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Returns true if the WASM bytes import from the nexus-host HTTP module.
 pub fn needs_net_host(wasm_bytes: &[u8]) -> bool {
-    crate::runtime::conc::imports_module(wasm_bytes, NEXUS_HOST_HTTP_MODULE)
+    imports_module(wasm_bytes, NEXUS_HOST_HTTP_MODULE)
+}
+
+/// Add no-op stubs for `nexus:cli/nexus-host` functions to a linker.
+/// Required when the stdlib bundle imports nexus-host but the caller doesn't use net.
+pub fn add_nexus_host_stubs<T: 'static>(linker: &mut Linker<T>) {
+    let _ = linker.func_wrap(
+        NEXUS_HOST_HTTP_MODULE,
+        "host-http-request",
+        |_: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32| {},
+    );
+    let _ = linker.func_wrap(
+        NEXUS_HOST_HTTP_MODULE,
+        "host-http-listen",
+        |_: i32, _: i32| -> i64 { -1 },
+    );
+    let _ = linker.func_wrap(
+        NEXUS_HOST_HTTP_MODULE,
+        "host-http-accept",
+        |_: i64, _: i32| {},
+    );
+    let _ = linker.func_wrap(
+        NEXUS_HOST_HTTP_MODULE,
+        "host-http-respond",
+        |_: i64, _: i64, _: i32, _: i32, _: i32, _: i32| -> i32 { 0 },
+    );
+    let _ = linker.func_wrap(NEXUS_HOST_HTTP_MODULE, "host-http-stop", |_: i64| -> i32 {
+        0
+    });
 }
 
 /// Add `nexus:cli/nexus-host` host functions to a core-wasm linker.

@@ -125,6 +125,7 @@ impl TypeChecker {
             }
             (Type::Ref(t1), Type::Ref(t2))
             | (Type::Linear(t1), Type::Linear(t2))
+            | (Type::Lazy(t1), Type::Lazy(t2))
             | (Type::Borrow(t1), Type::Borrow(t2)) => self.unify(t1, t2),
             (Type::Handler(a, req_a), Type::Handler(b, req_b)) if a == b => {
                 self.unify(req_a, req_b)
@@ -178,6 +179,7 @@ pub fn apply_subst_type(subst: &Subst, typ: &Type) -> Type {
         ),
         Type::Ref(i) => Type::Ref(Box::new(apply_subst_type(subst, i))),
         Type::Linear(i) => Type::Linear(Box::new(apply_subst_type(subst, i))),
+        Type::Lazy(i) => Type::Lazy(Box::new(apply_subst_type(subst, i))),
         Type::Borrow(i) => Type::Borrow(Box::new(apply_subst_type(subst, i))),
         Type::Array(i) => Type::Array(Box::new(apply_subst_type(subst, i))),
         Type::List(i) => Type::List(Box::new(apply_subst_type(subst, i))),
@@ -228,7 +230,7 @@ pub(super) fn get_free_vars_type(typ: &Type) -> HashSet<String> {
             }
             s
         }
-        Type::Ref(i) | Type::Linear(i) | Type::Borrow(i) | Type::Array(i) | Type::List(i) => {
+        Type::Ref(i) | Type::Linear(i) | Type::Lazy(i) | Type::Borrow(i) | Type::Array(i) | Type::List(i) => {
             get_free_vars_type(i)
         }
         Type::Row(es, t) => {
@@ -272,7 +274,7 @@ fn occurs_check(n: &str, t: &Type) -> bool {
                 || occurs_check(n, e)
         }
         Type::UserDefined(_, a) => a.iter().any(|x| occurs_check(n, x)),
-        Type::Ref(i) | Type::Linear(i) | Type::Borrow(i) | Type::Array(i) | Type::List(i) => {
+        Type::Ref(i) | Type::Linear(i) | Type::Lazy(i) | Type::Borrow(i) | Type::Array(i) | Type::List(i) => {
             occurs_check(n, i)
         }
         Type::Row(es, t) => {

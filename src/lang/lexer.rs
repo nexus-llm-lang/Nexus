@@ -21,7 +21,6 @@ pub enum TokenKind {
     Match,
     Case,
     Task,
-    Conc,
     Port,
     Type,
     Import,
@@ -43,6 +42,7 @@ pub enum TokenKind {
     Tilde,     // ~
     Percent,   // %
     Ampersand, // &
+    At,        // @
     Caret,     // ^
     Shl,       // <<
     Shr,       // >>
@@ -564,7 +564,6 @@ impl Lexer {
             "match" => TokenKind::Match,
             "case" => TokenKind::Case,
             "task" => TokenKind::Task,
-            "conc" => TokenKind::Conc,
             "port" => TokenKind::Port,
             "type" => TokenKind::Type,
             "import" => TokenKind::Import,
@@ -773,6 +772,7 @@ impl Lexer {
                 '.' => TokenKind::Dot,
                 '~' => TokenKind::Tilde,
                 '%' => TokenKind::Percent,
+                '@' => TokenKind::At,
                 '^' => TokenKind::Caret,
                 '_' => {
                     // _ or _identifier — always treated as identifier

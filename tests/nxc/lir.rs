@@ -17,8 +17,3 @@ fn dump_lir_minimal_wasm() {
     std::fs::write("/tmp/test_lir_minimal.wasm", &wasm).unwrap();
     eprintln!("Wrote {} bytes to /tmp/test_lir_minimal.wasm", wasm.len());
 }
-
-#[test]
-fn lir_conc_codegen() {
-    exec_with_stdlib(&read_fixture("nxc/test_conc_codegen.nx"));
-}

@@ -106,20 +106,3 @@ fn snapshot_hir_while_loop() {
     insta::assert_debug_snapshot!(mir);
 }
 
-#[test]
-fn snapshot_hir_conc_block() {
-    let src = r#"
-    let main = fn () -> unit do
-        let x = 1
-        conc do
-            task t1 do
-                let a = x + 1
-                return ()
-            end
-        end
-        return ()
-    end
-    "#;
-    let mir = parse_and_build_mir(src).unwrap();
-    insta::assert_debug_snapshot!(mir);
-}

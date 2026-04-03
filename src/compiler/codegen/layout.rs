@@ -35,8 +35,6 @@ pub(super) struct CodegenLayout {
     pub(super) data_segments: Vec<DataSegment>,
     pub(super) object_heap_enabled: bool,
     pub(super) heap_base: u32,
-    pub(super) conc_spawn_idx: Option<u32>,
-    pub(super) conc_join_idx: Option<u32>,
     pub(super) allocate_func_idx: Option<u32>,
     /// Exception tag index (WASM EH): defined in tag section, used by throw/try_table
     pub(super) exn_tag_idx: Option<u32>,
@@ -97,8 +95,6 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
         data_segments,
         object_heap_enabled,
         heap_base,
-        conc_spawn_idx: None,
-        conc_join_idx: None,
         allocate_func_idx: None,
         exn_tag_idx: None,
         capture_bt_func_idx: None,
@@ -177,7 +173,6 @@ fn stmt_uses_object_heap(stmt: &LirStmt) -> bool {
         LirStmt::TryCatch {
             body, catch_body, ..
         } => body.iter().any(stmt_uses_object_heap) || catch_body.iter().any(stmt_uses_object_heap),
-        LirStmt::Conc { tasks } => !tasks.is_empty(),
         LirStmt::Loop {
             cond_stmts, body, ..
         } => cond_stmts.iter().any(stmt_uses_object_heap) || body.iter().any(stmt_uses_object_heap),
@@ -274,13 +269,6 @@ fn collect_strings_in_stmt(stmt: &LirStmt, out: &mut Vec<String>) {
                 collect_strings_in_atom(ret, out);
             }
         }
-        LirStmt::Conc { tasks } => {
-            for task in tasks {
-                for (_, atom) in &task.args {
-                    collect_strings_in_atom(atom, out);
-                }
-            }
-        }
         LirStmt::Loop {
             cond_stmts,
             cond,
@@ -345,6 +333,7 @@ fn collect_strings_in_expr(expr: &LirExpr, out: &mut Vec<String>) {
         LirExpr::ObjectTag { value, .. } => collect_strings_in_atom(value, out),
         LirExpr::ObjectField { value, .. } => collect_strings_in_atom(value, out),
         LirExpr::Raise { value, .. } => collect_strings_in_atom(value, out),
+        LirExpr::Force { value, .. } => collect_strings_in_atom(value, out),
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::Closure { captures, .. } => {
             for (_, atom) in captures {

@@ -55,7 +55,6 @@ pub enum MirStmt {
         target: MirExpr,
         value: MirExpr,
     },
-    Conc(Vec<MirFunction>),
     Try {
         body: Vec<MirStmt>,
         catch_param: Symbol,
@@ -96,6 +95,7 @@ pub enum MirExpr {
     },
     Borrow(Symbol),
     Raise(Box<MirExpr>),
+    Force(Box<MirExpr>),
     /// Reference to a function as a first-class value (yields table index at runtime)
     FuncRef(Symbol),
     /// Closure: a function reference with captured free variables

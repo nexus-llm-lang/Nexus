@@ -667,6 +667,7 @@ impl TypeChecker {
             ),
             Type::Ref(i) => Type::Ref(Box::new(self.convert_user_defined_to_var(i, vars))),
             Type::Linear(i) => Type::Linear(Box::new(self.convert_user_defined_to_var(i, vars))),
+            Type::Lazy(i) => Type::Lazy(Box::new(self.convert_user_defined_to_var(i, vars))),
             Type::Borrow(i) => Type::Borrow(Box::new(self.convert_user_defined_to_var(i, vars))),
             Type::Array(i) => Type::Array(Box::new(self.convert_user_defined_to_var(i, vars))),
             Type::List(i) => Type::List(Box::new(self.convert_user_defined_to_var(i, vars))),
@@ -828,7 +829,7 @@ impl TypeChecker {
                                 });
                             }
                             match t1 {
-                                Type::Linear(_) => t1,
+                                Type::Linear(_) | Type::Lazy(_) => t1,
                                 _ => Type::Linear(Box::new(t1)),
                             }
                         }
@@ -840,10 +841,16 @@ impl TypeChecker {
                         }
                         Sigil::Borrow => {
                             let inner = match t1 {
-                                Type::Linear(t) | Type::Borrow(t) | Type::Ref(t) => t,
+                                Type::Linear(t) | Type::Lazy(t) | Type::Borrow(t) | Type::Ref(t) => t,
                                 _ => Box::new(t1),
                             };
                             Type::Borrow(inner)
+                        }
+                        Sigil::Lazy => {
+                            match t1 {
+                                Type::Lazy(_) => t1,
+                                _ => Type::Lazy(Box::new(t1)),
+                            }
                         }
                     };
                     env.insert(key, self.generalize(env, ft));
@@ -911,7 +918,7 @@ impl TypeChecker {
                             };
 
                             let t_arr_unwrapped = match t_arr {
-                                Type::Linear(inner) => *inner,
+                                Type::Linear(inner) | Type::Lazy(inner) => *inner,
                                 other => other,
                             };
 
@@ -934,11 +941,6 @@ impl TypeChecker {
                         _ => {
                             return Err(TypeError::new("Invalid assignment target", s.span.clone()))
                         }
-                    }
-                }
-                Stmt::Conc(ts) => {
-                    for t in ts {
-                        self.check_task(t, env, &s.span, eq)?;
                     }
                 }
                 Stmt::Try {
@@ -1060,51 +1062,6 @@ impl TypeChecker {
         Ok(())
     }
 
-    fn check_task(
-        &mut self,
-        t: &Function,
-        oe: &TypeEnv,
-        _span: &Span,
-        outer_eq: &Type,
-    ) -> Result<(), TypeError> {
-        let mut te = TypeEnv::new();
-        te.types = oe.types.clone();
-        te.enums = oe.enums.clone();
-        let mut captured_linear = HashSet::new();
-        for (k, s) in &oe.vars {
-            if !k.starts_with('~') {
-                te.insert(k.clone(), s.clone());
-                if te.contains_linear_type(&s.typ) {
-                    captured_linear.insert(k.clone());
-                }
-            }
-        }
-        let merged_requires = merge_type_rows(&t.requires, outer_eq);
-        self.infer_body(&t.body, &mut te, &Type::Unit, &merged_requires, &t.throws)?;
-
-        let unused_local_linear: Vec<_> = te
-            .linear_vars
-            .iter()
-            .filter(|k| !captured_linear.contains(*k))
-            .filter(|k| {
-                if let Some(sch) = te.vars.get(*k) {
-                    !is_auto_droppable(&sch.typ)
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
-
-        if !unused_local_linear.is_empty() {
-            return Err(TypeError::new(
-                format!("Unused linear in task: {:?}", unused_local_linear),
-                _span.clone(),
-            ));
-        }
-        Ok(())
-    }
-
     /// Type-checks a single REPL statement against the current checker state.
     pub fn check_repl_stmt(&mut self, s: &Spanned<Stmt>) -> Result<Type, TypeError> {
         let mut env = std::mem::replace(&mut self.env, TypeEnv::new());
@@ -1151,10 +1108,18 @@ impl TypeChecker {
                 let key = s.get_key(n);
                 if let Some(sch) = env.get(&key).cloned() {
                     let mut t = self.instantiate(&sch);
-                    if let Sigil::Mutable = s {
-                        if let Type::Ref(i) = t {
-                            t = *i;
+                    match s {
+                        Sigil::Mutable => {
+                            if let Type::Ref(i) = t {
+                                t = *i;
+                            }
                         }
+                        Sigil::Lazy => {
+                            if let Type::Lazy(i) = t {
+                                t = *i;
+                            }
+                        }
+                        _ => {}
                     }
                     if env.contains_linear_type(&t) {
                         env.consume(&key)
@@ -1342,7 +1307,7 @@ impl TypeChecker {
                 if let Some(sch) = env.get(&s.get_key(n)).cloned() {
                     let t = self.instantiate(&sch);
                     let i = match t {
-                        Type::Linear(u) | Type::Borrow(u) => *u,
+                        Type::Linear(u) | Type::Lazy(u) | Type::Borrow(u) => *u,
                         o => o,
                     };
                     Ok((HashMap::new(), Type::Borrow(Box::new(i))))
@@ -1363,7 +1328,7 @@ impl TypeChecker {
                     ));
                 };
                 let ft = match ft_raw {
-                    Type::Linear(inner) => {
+                    Type::Linear(inner) | Type::Lazy(inner) => {
                         env.consume(func)
                             .map_err(|m| TypeError::new(m, e.span.clone()))?;
                         *inner
@@ -1440,7 +1405,7 @@ impl TypeChecker {
                         Err(primary_err) => {
                             // Linearity weakening at call sites:
                             // allow passing a plain value T to a linear parameter %T.
-                            if let Type::Linear(inner) = expected {
+                            if let Type::Linear(inner) | Type::Lazy(inner) = expected {
                                 if env.contains_linear_type(&actual) {
                                     return Err(TypeError::new(primary_err, ae.span.clone()));
                                 }
@@ -1634,7 +1599,7 @@ impl TypeChecker {
 
                 let t_arr_inst = apply_subst_type(&s, &t_arr);
                 let t_arr_unwrapped = match t_arr_inst {
-                    Type::Linear(inner) => *inner,
+                    Type::Linear(inner) | Type::Lazy(inner) => *inner,
                     other => other,
                 };
 
@@ -2052,6 +2017,13 @@ impl TypeChecker {
                 s = compose_subst(&s, &s_eff);
                 Ok((s, self.new_var()))
             }
+            Expr::Force(inner) => {
+                let (s, t) = self.infer(env, inner, er, eq, ee)?;
+                match t {
+                    Type::Lazy(inner_type) => Ok((s, *inner_type)),
+                    other => Ok((s, other)),
+                }
+            }
         }
     }
 
@@ -2063,7 +2035,7 @@ impl TypeChecker {
     ) -> Result<Subst, TypeError> {
         // Unwrap Linear/Borrow wrappers to get the structural type for pattern matching.
         let tt = match tt {
-            Type::Linear(inner) | Type::Borrow(inner) => inner.as_ref(),
+            Type::Linear(inner) | Type::Lazy(inner) | Type::Borrow(inner) => inner.as_ref(),
             other => other,
         };
         match &p.node {

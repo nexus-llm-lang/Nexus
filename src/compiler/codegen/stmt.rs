@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
+use wasm_encoder::{BlockType, Function, Instruction, ValType};
 
 use crate::intern::Symbol;
 use crate::ir::lir::{LirExpr, LirProgram, LirStmt, SwitchCase};
@@ -11,7 +11,7 @@ use super::emit::{emit_numeric_coercion, emit_pack_value_to_i64, memarg};
 use super::error::CodegenError;
 use super::function::{compile_atom, compile_expr, emit_tcmc_cons_and_loop, TcmcInfo, TcoLoop};
 use super::layout::CodegenLayout;
-use super::{FunctionTemps, LocalInfo, OBJECT_HEAP_GLOBAL_INDEX};
+use super::{FunctionTemps, LocalInfo};
 
 /// Emit a return value, wrapping with TCMC conditional linking if active.
 /// When TCMC is active (prev != 0), links the last cell's rest field to the
@@ -334,72 +334,6 @@ pub(super) fn compile_stmt(
                 emit_return_with_tcmc(ret, function_ret_type, out, local_map, layout, None)?;
             }
             out.instruction(&Instruction::End); // end block $skip
-            Ok(())
-        }
-        LirStmt::Conc { tasks } => {
-            let spawn_idx = layout
-                .conc_spawn_idx
-                .expect("conc_spawn_idx must be set for conc blocks");
-            let join_idx = layout
-                .conc_join_idx
-                .expect("conc_join_idx must be set for conc blocks");
-
-            for task in tasks {
-                let func_idx = internal_indices
-                    .get(&task.func_name)
-                    .copied()
-                    .ok_or_else(|| CodegenError::CallTargetNotFound {
-                        name: task.func_name.to_string(),
-                    })?;
-                let n_args = task.args.len() as i32;
-
-                let args_ptr_local = temps.object_ptr_i32;
-                if let Some(alloc_idx) = layout.allocate_func_idx {
-                    out.instruction(&Instruction::I32Const(n_args * 8));
-                    out.instruction(&Instruction::Call(alloc_idx));
-                    out.instruction(&Instruction::LocalSet(args_ptr_local));
-                } else {
-                    out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
-                    out.instruction(&Instruction::LocalSet(args_ptr_local));
-                }
-
-                for (i, (_, arg)) in task.args.iter().enumerate() {
-                    out.instruction(&Instruction::LocalGet(args_ptr_local));
-                    compile_atom(arg, out, local_map, layout)?;
-                    match arg.typ() {
-                        Type::I32 | Type::Bool => {
-                            out.instruction(&Instruction::I64ExtendI32U);
-                        }
-                        Type::F64 => {
-                            out.instruction(&Instruction::I64ReinterpretF64);
-                        }
-                        Type::F32 => {
-                            out.instruction(&Instruction::F64PromoteF32);
-                            out.instruction(&Instruction::I64ReinterpretF64);
-                        }
-                        _ => {}
-                    }
-                    out.instruction(&Instruction::I64Store(MemArg {
-                        offset: (i * 8) as u64,
-                        align: 3,
-                        memory_index: 0,
-                    }));
-                }
-
-                if layout.allocate_func_idx.is_none() {
-                    out.instruction(&Instruction::LocalGet(args_ptr_local));
-                    out.instruction(&Instruction::I32Const(n_args * 8));
-                    out.instruction(&Instruction::I32Add);
-                    out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
-                }
-
-                out.instruction(&Instruction::I32Const(func_idx as i32));
-                out.instruction(&Instruction::LocalGet(args_ptr_local));
-                out.instruction(&Instruction::I32Const(n_args));
-                out.instruction(&Instruction::Call(spawn_idx));
-            }
-
-            out.instruction(&Instruction::Call(join_idx));
             Ok(())
         }
         LirStmt::Loop {

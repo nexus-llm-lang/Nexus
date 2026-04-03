@@ -116,27 +116,6 @@ fn collect_stmt_captures(
                     captures,
                 );
             }
-            Stmt::Conc(tasks) => {
-                for task in tasks {
-                    let mut task_bound_keys = HashSet::new();
-                    let mut task_bound_call_names = HashSet::new();
-                    for p in &task.params {
-                        register_bound_name(
-                            &mut task_bound_keys,
-                            &mut task_bound_call_names,
-                            &p.name,
-                            &p.sigil,
-                        );
-                    }
-                    collect_stmt_captures(
-                        &task.body,
-                        outer_keys,
-                        &task_bound_keys,
-                        &task_bound_call_names,
-                        captures,
-                    );
-                }
-            }
             Stmt::Try {
                 body,
                 catch_arms,
@@ -236,7 +215,7 @@ fn collect_expr_captures(
                 collect_expr_captures(value, outer_keys, bound_keys, bound_call_names, captures);
             }
         }
-        Expr::FieldAccess(receiver, _) | Expr::Raise(receiver) => {
+        Expr::FieldAccess(receiver, _) | Expr::Raise(receiver) | Expr::Force(receiver) => {
             collect_expr_captures(receiver, outer_keys, bound_keys, bound_call_names, captures);
         }
         Expr::If {

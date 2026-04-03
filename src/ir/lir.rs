@@ -71,9 +71,6 @@ pub enum LirStmt {
         catch_body: Vec<LirStmt>,
         catch_ret: Option<LirAtom>,
     },
-    Conc {
-        tasks: Vec<ConcTask>,
-    },
     /// Loop with condition check at the top.
     /// cond_stmts compute the break condition, then cond is checked.
     /// If cond is true, break. Otherwise, execute body and repeat.
@@ -96,12 +93,6 @@ pub enum LirStmt {
         /// Return type of the overall match.
         ret_type: Type,
     },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConcTask {
-    pub func_name: Symbol,
-    pub args: Vec<(Symbol, LirAtom)>,
 }
 
 /// A single case in a Switch statement (tag-based multi-way branch).
@@ -150,6 +141,10 @@ pub enum LirExpr {
         typ: Type,
     },
     Raise {
+        value: LirAtom,
+        typ: Type,
+    },
+    Force {
         value: LirAtom,
         typ: Type,
     },

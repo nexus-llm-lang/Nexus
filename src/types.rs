@@ -48,6 +48,7 @@ pub enum Type {
     Arrow(Vec<(String, Type)>, Box<Type>, Box<Type>, Box<Type>), // params, return, require, throws
     Ref(Box<Type>),
     Linear(Box<Type>),                 // %T
+    Lazy(Box<Type>),                   // @T
     Row(Vec<Type>, Option<Box<Type>>), // { E1, E2 | r }
     Record(Vec<(String, Type)>),       // { x: i64, y: string }
     Array(Box<Type>),                  // [| T |]
@@ -63,7 +64,7 @@ impl Type {
     /// All codegen paths that need this classification should use this method.
     pub fn wasm_repr(&self) -> WasmRepr {
         match self {
-            Type::Linear(inner) => inner.wasm_repr(),
+            Type::Linear(inner) | Type::Lazy(inner) => inner.wasm_repr(),
             Type::I32 | Type::Bool | Type::Char => WasmRepr::I32,
             Type::I64
             | Type::IntLit
@@ -133,6 +134,7 @@ impl std::fmt::Display for Type {
             }
             Type::Ref(t) => write!(f, "~{}", t),
             Type::Linear(t) => write!(f, "%{}", t),
+            Type::Lazy(t) => write!(f, "@{}", t),
             Type::Row(effs, tail) => {
                 write!(f, "{{")?;
                 for (i, eff) in effs.iter().enumerate() {
@@ -180,6 +182,7 @@ pub enum Sigil {
     Mutable, // ~
     Linear,  // %
     Borrow,  // &
+    Lazy,    // @
 }
 
 impl Sigil {
@@ -190,6 +193,7 @@ impl Sigil {
             Sigil::Mutable => "~",
             Sigil::Linear => "%",
             Sigil::Borrow => "&",
+            Sigil::Lazy => "@",
         }
     }
 

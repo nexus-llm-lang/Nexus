@@ -12,7 +12,6 @@ const KEYWORDS: &[&str] = &[
     "match",
     "case",
     "task",
-    "conc",
     "port",
     "type",
     "import",
@@ -398,6 +397,11 @@ impl Parser {
                 let inner = self.parse_type()?;
                 Ok(Type::Linear(Box::new(inner)))
             }
+            TokenKind::At => {
+                self.advance();
+                let inner = self.parse_type()?;
+                Ok(Type::Lazy(Box::new(inner)))
+            }
             TokenKind::LBrace => {
                 // Record type or row type
                 // Try record: { name: type, ... }
@@ -465,6 +469,10 @@ impl Parser {
             TokenKind::Ampersand => {
                 self.advance();
                 Sigil::Borrow
+            }
+            TokenKind::At => {
+                self.advance();
+                Sigil::Lazy
             }
             _ => Sigil::Immutable,
         }
@@ -994,6 +1002,30 @@ impl Parser {
                     node: Expr::Raise(Box::new(expr)),
                     span: start..end,
                 })
+            }
+
+            // @ sigil: @ident is lazy variable reference (force),
+            // @(expr) and @{...} are compound force expressions
+            TokenKind::At => {
+                self.advance();
+                match self.peek() {
+                    TokenKind::Ident(_) => {
+                        let name = self.expect_ident()?;
+                        let end = self.tokens[self.pos - 1].span.end;
+                        Ok(Spanned {
+                            node: Expr::Variable(name, Sigil::Lazy),
+                            span: start..end,
+                        })
+                    }
+                    _ => {
+                        let expr = self.parse_atom()?;
+                        let end = expr.span.end;
+                        Ok(Spanned {
+                            node: Expr::Force(Box::new(expr)),
+                            span: start..end,
+                        })
+                    }
+                }
             }
 
             // &sigil ident (borrow expression)
@@ -1527,8 +1559,6 @@ impl Parser {
 
             TokenKind::Try => self.parse_try_stmt(start),
 
-            TokenKind::Conc => self.parse_conc_block(start),
-
             TokenKind::Inject => self.parse_inject_stmt(start),
 
             _ => {
@@ -1781,56 +1811,6 @@ impl Parser {
             });
         }
         Ok(arms)
-    }
-
-    fn parse_conc_block(&mut self, start: usize) -> Result<Spanned<Stmt>, ParseError> {
-        self.advance(); // consume 'conc'
-        self.expect(&TokenKind::Do)?;
-
-        let mut tasks = Vec::new();
-        while matches!(self.peek(), TokenKind::Task) {
-            self.advance();
-            let name = self.expect_ident()?;
-
-            let throws = if self.match_keyword(&TokenKind::Throws) {
-                let effs = self.parse_throws_ident_list()?;
-                Type::Row(
-                    effs.into_iter()
-                        .map(|e| Type::UserDefined(e, vec![]))
-                        .collect(),
-                    None,
-                )
-            } else {
-                Type::Row(vec![], None)
-            };
-
-            self.expect(&TokenKind::Do)?;
-            let body = self.parse_stmt_list()?;
-            self.expect(&TokenKind::End)?;
-
-            tasks.push(Function {
-                name,
-                is_public: false,
-                params: vec![],
-                ret_type: Type::Unit,
-                requires: Type::Row(vec![], None),
-                throws,
-                body,
-                type_params: vec![],
-            });
-        }
-
-        self.expect(&TokenKind::End)?;
-        let end = self.tokens[self.pos - 1].span.end;
-
-        Ok(Spanned {
-            node: Stmt::Conc(tasks),
-            span: start..end,
-        })
-    }
-
-    fn parse_throws_ident_list(&mut self) -> Result<Vec<String>, ParseError> {
-        self.parse_delimited_list(&TokenKind::LBrace, &TokenKind::RBrace, Self::expect_ident)
     }
 
     fn parse_inject_stmt(&mut self, start: usize) -> Result<Spanned<Stmt>, ParseError> {

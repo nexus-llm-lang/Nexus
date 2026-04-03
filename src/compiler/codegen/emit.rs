@@ -225,7 +225,7 @@ fn adt_coercion_is_noop(from: &Type, to: &Type) -> bool {
 }
 
 pub(super) fn peel_linear(mut typ: &Type) -> &Type {
-    while let Type::Linear(inner) = typ {
+    while let Type::Linear(inner) | Type::Lazy(inner) = typ {
         typ = inner;
     }
     typ
@@ -311,6 +311,7 @@ pub(super) fn expr_type(expr: &LirExpr) -> Type {
         LirExpr::ObjectTag { typ, .. } => typ.clone(),
         LirExpr::ObjectField { typ, .. } => typ.clone(),
         LirExpr::Raise { typ, .. } => typ.clone(),
+        LirExpr::Force { typ, .. } => typ.clone(),
         LirExpr::FuncRef { typ, .. } => typ.clone(),
         LirExpr::Closure { typ, .. } => typ.clone(),
         LirExpr::ClosureEnvLoad { typ, .. } => typ.clone(),

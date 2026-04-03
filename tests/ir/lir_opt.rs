@@ -58,7 +58,7 @@ fn collect_expr_refs(expr: &LirExpr, refs: &mut HashSet<Symbol>) {
         LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } => {
             collect_atom_refs(value, refs);
         }
-        LirExpr::Raise { value, .. } => collect_atom_refs(value, refs),
+        LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => collect_atom_refs(value, refs),
         LirExpr::Closure { captures, .. } => {
             for (_, a) in captures {
                 collect_atom_refs(a, refs);
@@ -137,13 +137,6 @@ fn collect_stmt_refs(stmts: &[LirStmt], refs: &mut HashSet<Symbol>) {
                 collect_stmt_refs(default_body, refs);
                 collect_opt_atom_refs(default_ret, refs);
             }
-            LirStmt::Conc { tasks } => {
-                for task in tasks {
-                    for (_, a) in &task.args {
-                        collect_atom_refs(a, refs);
-                    }
-                }
-            }
         }
     }
 }
@@ -196,7 +189,6 @@ fn collect_stmt_defs(stmts: &[LirStmt], defs: &mut HashSet<Symbol>) {
                 }
                 collect_stmt_defs(default_body, defs);
             }
-            LirStmt::Conc { .. } => {}
         }
     }
 }

@@ -163,14 +163,6 @@ impl TypeChecker {
                 Stmt::LetPattern { value, .. } => {
                     self.collect_unused_local_variable_warnings_in_expr(value);
                 }
-                Stmt::Conc(tasks) => {
-                    for task in tasks {
-                        self.collect_unused_local_variable_warnings_in_function(
-                            &format!("task {}", task.name),
-                            &task.body,
-                        );
-                    }
-                }
             }
         }
     }
@@ -201,7 +193,7 @@ impl TypeChecker {
                     self.collect_unused_local_variable_warnings_in_expr(item);
                 }
             }
-            Expr::FieldAccess(target, _) | Expr::Raise(target) => {
+            Expr::FieldAccess(target, _) | Expr::Raise(target) | Expr::Force(target) => {
                 self.collect_unused_local_variable_warnings_in_expr(target);
             }
             Expr::If {
@@ -282,7 +274,7 @@ pub(super) fn find_private_type_in_public_signature(typ: &Type, env: &TypeEnv) -
                 .or_else(|| find_private_type_in_public_signature(req, env))
                 .or_else(|| find_private_type_in_public_signature(eff, env))
         }
-        Type::Ref(inner) | Type::Linear(inner) | Type::Borrow(inner) | Type::Array(inner) => {
+        Type::Ref(inner) | Type::Linear(inner) | Type::Lazy(inner) | Type::Borrow(inner) | Type::Array(inner) => {
             find_private_type_in_public_signature(inner, env)
         }
         Type::Row(effs, tail) => {
@@ -357,15 +349,6 @@ pub(super) fn collect_signature_needs_from_stmts(
                 reqs.extend(rhs_reqs);
                 effs.extend(rhs_effs);
                 unknown |= rhs_unknown;
-            }
-            Stmt::Conc(tasks) => {
-                for task in tasks {
-                    let (task_reqs, task_effs, task_unknown) =
-                        collect_signature_needs_from_stmts(&task.body, env);
-                    reqs.extend(task_reqs);
-                    effs.extend(task_effs);
-                    unknown |= task_unknown;
-                }
             }
             Stmt::Try {
                 body, catch_arms, ..
@@ -453,6 +436,7 @@ fn collect_signature_needs_from_expr(
             effs.insert(THROWS_EXN.to_string());
             (reqs, effs, unknown)
         }
+        Expr::Force(inner) => collect_signature_needs_from_expr(inner, env),
         Expr::BinaryOp(lhs, _, rhs) | Expr::Index(lhs, rhs) => {
             let (mut reqs, mut effs, mut unknown) = collect_signature_needs_from_expr(lhs, env);
             let (rhs_reqs, rhs_effs, rhs_unknown) = collect_signature_needs_from_expr(rhs, env);
@@ -587,7 +571,7 @@ fn expr_mentions_name(expr: &Spanned<Expr>, target: &str) -> bool {
         Expr::Array(items) | Expr::List(items) => {
             items.iter().any(|item| expr_mentions_name(item, target))
         }
-        Expr::FieldAccess(receiver, _) | Expr::Raise(receiver) => {
+        Expr::FieldAccess(receiver, _) | Expr::Raise(receiver) | Expr::Force(receiver) => {
             expr_mentions_name(receiver, target)
         }
         Expr::If {
@@ -644,11 +628,6 @@ fn stmt_mentions_name(stmt: &Spanned<Stmt>, target: &str) -> bool {
         Stmt::Assign { target: lhs, value } => {
             expr_mentions_name(lhs, target) || expr_mentions_name(value, target)
         }
-        Stmt::Conc(tasks) => tasks.iter().any(|task| {
-            task.body
-                .iter()
-                .any(|stmt| stmt_mentions_name(stmt, target))
-        }),
         Stmt::Try {
             body, catch_arms, ..
         } => {
@@ -678,11 +657,6 @@ fn collect_used_variable_keys_in_stmts(stmts: &[Spanned<Stmt>], out: &mut HashSe
             Stmt::Assign { target, value } => {
                 collect_used_variable_keys_in_expr(target, out);
                 collect_used_variable_keys_in_expr(value, out);
-            }
-            Stmt::Conc(tasks) => {
-                for task in tasks {
-                    collect_used_variable_keys_in_stmts(&task.body, out);
-                }
             }
             Stmt::Try {
                 body, catch_arms, ..
@@ -741,7 +715,7 @@ fn collect_used_variable_keys_in_expr(expr: &Spanned<Expr>, out: &mut HashSet<St
                 collect_used_variable_keys_in_expr(item, out);
             }
         }
-        Expr::FieldAccess(target, _) | Expr::Raise(target) => {
+        Expr::FieldAccess(target, _) | Expr::Raise(target) | Expr::Force(target) => {
             collect_used_variable_keys_in_expr(target, out);
         }
         Expr::If {
@@ -810,11 +784,6 @@ fn collect_local_let_bindings(stmts: &[Spanned<Stmt>], out: &mut Vec<(String, Si
                 }
             }
             Stmt::Inject { body, .. } => collect_local_let_bindings(body, out),
-            Stmt::Conc(tasks) => {
-                for task in tasks {
-                    collect_local_let_bindings(&task.body, out);
-                }
-            }
             Stmt::LetPattern { value, .. } => {
                 collect_local_let_bindings_in_expr(value, out);
             }
@@ -848,7 +817,7 @@ fn collect_local_let_bindings_in_expr(expr: &Spanned<Expr>, out: &mut Vec<(Strin
                 collect_local_let_bindings_in_expr(item, out);
             }
         }
-        Expr::FieldAccess(target, _) | Expr::Raise(target) => {
+        Expr::FieldAccess(target, _) | Expr::Raise(target) | Expr::Force(target) => {
             collect_local_let_bindings_in_expr(target, out);
         }
         Expr::If {
@@ -899,7 +868,7 @@ fn lookup_call_signature(
 
     let arrow = match &scheme.typ {
         Type::Arrow(_, _, req, eff) => Some((req.as_ref(), eff.as_ref())),
-        Type::Linear(inner) => match inner.as_ref() {
+        Type::Linear(inner) | Type::Lazy(inner) => match inner.as_ref() {
             Type::Arrow(_, _, req, eff) => Some((req.as_ref(), eff.as_ref())),
             _ => None,
         },

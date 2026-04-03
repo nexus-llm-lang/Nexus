@@ -41,7 +41,7 @@ impl TypeChecker {
         let rt = &types[1..];
         // Unwrap Linear/Borrow wrappers to get the underlying structural type.
         let ft = match ft_raw {
-            Type::Linear(inner) | Type::Borrow(inner) => inner.as_ref(),
+            Type::Linear(inner) | Type::Lazy(inner) | Type::Borrow(inner) => inner.as_ref(),
             other => other,
         };
         match ft {

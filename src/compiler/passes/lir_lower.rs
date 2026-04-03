@@ -155,7 +155,6 @@ fn promote_last_call_to_tail_call(
 struct LirLowerer<'a> {
     mir: &'a MirProgram,
     enum_defs: &'a [EnumDef],
-    task_functions: Vec<LirFunction>,
 }
 
 impl<'a> LirLowerer<'a> {
@@ -163,18 +162,15 @@ impl<'a> LirLowerer<'a> {
         LirLowerer {
             mir,
             enum_defs,
-            task_functions: Vec::new(),
         }
     }
 
     fn lower(&mut self) -> Result<LirProgram, LirLowerError> {
         let mut functions = Vec::new();
         for func in &self.mir.functions {
-            let (lir_func, task_fns) = lower_mir_function(func, self.enum_defs)?;
+            let lir_func = lower_mir_function(func, self.enum_defs)?;
             functions.push(lir_func);
-            self.task_functions.extend(task_fns);
         }
-        functions.append(&mut self.task_functions);
 
         let externals = self
             .mir
@@ -208,13 +204,12 @@ impl<'a> LirLowerer<'a> {
     }
 }
 
-/// Lower a single MIR function to LIR, returning the function and any task functions
-/// accumulated from conc blocks within its body.
+/// Lower a single MIR function to LIR.
 fn lower_mir_function(
     func: &MirFunction,
     enum_defs: &[EnumDef],
-) -> Result<(LirFunction, Vec<LirFunction>), LirLowerError> {
-    let mut ctx = LowerCtx::new(enum_defs, func.source_file.clone(), func.source_line);
+) -> Result<LirFunction, LirLowerError> {
+    let mut ctx = LowerCtx::new(enum_defs);
 
     // Register params in vars (both wasm and semantic types)
     for p in &func.params {
@@ -256,23 +251,18 @@ fn lower_mir_function(
         .collect();
     params.sort_by(|a, b| a.label.cmp(&b.label));
 
-    let task_functions = ctx.task_functions;
-
-    Ok((
-        LirFunction {
-            name: func.name.clone(),
-            params,
-            ret_type: func.ret_type.clone(),
-            requires: Type::Row(Vec::new(), None),
-            throws: Type::Row(Vec::new(), None),
-            body: ctx.stmts,
-            ret,
-            span: func.span.clone(),
-            source_file: func.source_file.clone(),
-            source_line: func.source_line,
-        },
-        task_functions,
-    ))
+    Ok(LirFunction {
+        name: func.name.clone(),
+        params,
+        ret_type: func.ret_type.clone(),
+        requires: Type::Row(Vec::new(), None),
+        throws: Type::Row(Vec::new(), None),
+        body: ctx.stmts,
+        ret,
+        span: func.span.clone(),
+        source_file: func.source_file.clone(),
+        source_line: func.source_line,
+    })
 }
 
 /// Pre-computed per-constructor lookup data, built once from enum_defs.
@@ -296,13 +286,9 @@ struct LowerCtx<'a> {
     temp_counter: usize,
     /// Reusable buffer for formatting temp variable names (avoids per-call allocation)
     temp_buf: String,
-    /// Task functions lifted from conc blocks
-    task_functions: Vec<LirFunction>,
     enum_defs: &'a [EnumDef],
     /// O(1) constructor lookup index: ctor_name → ConstructorInfo
     ctor_index: HashMap<String, ConstructorInfo>,
-    source_file: Option<String>,
-    source_line: Option<u32>,
 }
 
 // ── Maranget decision tree types and construction ────────────────
@@ -799,22 +785,15 @@ fn default_matrix(rows: &[PatRow], col: usize, col_ids: &[usize]) -> Vec<PatRow>
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(
-        enum_defs: &'a [EnumDef],
-        source_file: Option<String>,
-        source_line: Option<u32>,
-    ) -> Self {
+    fn new(enum_defs: &'a [EnumDef]) -> Self {
         LowerCtx {
             vars: HashMap::new(),
             semantic_vars: HashMap::new(),
             stmts: Vec::new(),
             temp_counter: 0,
             temp_buf: String::with_capacity(16),
-            task_functions: Vec::new(),
             ctor_index: build_constructor_index(enum_defs),
             enum_defs,
-            source_file,
-            source_line,
         }
     }
 
@@ -956,63 +935,6 @@ impl<'a> LowerCtx<'a> {
                         expr: LirExpr::Atom(value_atom),
                     });
                 }
-                Ok(None)
-            }
-            MirStmt::Conc(tasks) => {
-                let mut task_refs = Vec::new();
-                for task in tasks {
-                    let free_vars = collect_free_vars(&task.body);
-                    let task_name = Symbol::from(format!("__conc_{}", task.name));
-                    let capture_params: Vec<MirParam> = free_vars
-                        .iter()
-                        .map(|&name| {
-                            let typ = self.semantic_vars.get(&name).cloned().ok_or_else(|| {
-                                LirLowerError::UnresolvedType {
-                                    detail: format!(
-                                        "conc capture variable '{}' not in semantic_vars",
-                                        name
-                                    ),
-                                    span: task.span.clone(),
-                                }
-                            })?;
-                            Ok(MirParam {
-                                label: name,
-                                name,
-                                typ,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let task_mir = MirFunction {
-                        name: task_name,
-                        params: capture_params,
-                        ret_type: Type::Unit,
-                        body: task.body.clone(),
-                        span: task.span.clone(),
-                        source_file: self.source_file.clone(),
-                        source_line: self.source_line,
-                        captures: vec![],
-                    };
-                    let (lir_func, nested_tasks) = lower_mir_function(&task_mir, self.enum_defs)?;
-                    self.task_functions.push(lir_func);
-                    self.task_functions.extend(nested_tasks);
-                    let args: Vec<(Symbol, LirAtom)> = free_vars
-                        .iter()
-                        .map(|&name| {
-                            let typ = self.vars.get(&name).cloned().ok_or_else(|| {
-                                LirLowerError::UnresolvedType {
-                                    detail: format!("conc capture variable '{}' not in vars", name),
-                                    span: task.span.clone(),
-                                }
-                            })?;
-                            Ok((name, LirAtom::Var { name, typ }))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    task_refs.push(ConcTask {
-                        func_name: task_name,
-                        args,
-                    });
-                }
-                self.stmts.push(LirStmt::Conc { tasks: task_refs });
                 Ok(None)
             }
             MirStmt::Try {
@@ -2122,6 +2044,39 @@ impl<'a> LowerCtx<'a> {
                     typ,
                 ))
             }
+            MirExpr::Force(expr) => {
+                let callee_atom = self.lower_expr_to_atom(expr)?;
+                // Resolve the semantic type of the callee (should be Lazy(T) or Arrow)
+                let callee_semantic = if let MirExpr::Variable(name) = expr.as_ref() {
+                    self.semantic_vars.get(name).cloned().unwrap_or(Type::I64)
+                } else {
+                    callee_atom.typ()
+                };
+                // Determine return type: unwrap Lazy(T) or Arrow([], T, ...)
+                let ret_type = match &callee_semantic {
+                    Type::Lazy(inner) => *inner.clone(),
+                    Type::Arrow(_, ret, _, _) => *ret.clone(),
+                    other => other.clone(),
+                };
+                // Build a zero-arg Arrow type for call_indirect dispatch
+                let callee_type = Type::Arrow(
+                    vec![],
+                    Box::new(ret_type.clone()),
+                    Box::new(Type::Row(vec![], None)),
+                    Box::new(Type::Row(vec![], None)),
+                );
+                let typ = wasm_type(&ret_type);
+                Ok(self.bind_expr_to_temp_semantic(
+                    LirExpr::CallIndirect {
+                        callee: callee_atom,
+                        args: vec![],
+                        typ: typ.clone(),
+                        callee_type,
+                    },
+                    typ,
+                    ret_type,
+                ))
+            }
             MirExpr::FuncRef(name) => {
                 let typ = Type::I64; // funcref stored as i64 closure pointer
                 Ok(self.bind_expr_to_temp(
@@ -2296,6 +2251,13 @@ impl<'a> LowerCtx<'a> {
             }),
             // Raise never returns; I64 is a placeholder (no Type::Never exists)
             MirExpr::Raise(_) => Type::I64,
+            MirExpr::Force(inner) => {
+                let t = self.infer_semantic_type(inner);
+                match t {
+                    Type::Lazy(inner_type) => *inner_type,
+                    other => other,
+                }
+            }
             MirExpr::FuncRef(_) | MirExpr::Closure { .. } => Type::I64,
             MirExpr::CallIndirect { ret_type, .. } => ret_type.clone(),
         }
@@ -2474,7 +2436,7 @@ fn fallback_return_atom_from_terminal_stmt(stmts: &[LirStmt]) -> Option<LirAtom>
 
 fn strip_linear(typ: &Type) -> &Type {
     match typ {
-        Type::Linear(inner) => strip_linear(inner),
+        Type::Linear(inner) | Type::Lazy(inner) => strip_linear(inner),
         other => other,
     }
 }
@@ -2489,170 +2451,6 @@ fn default_atom_for_type(typ: &Type) -> LirAtom {
         Type::String => LirAtom::String(String::new()),
         Type::Unit => LirAtom::Unit,
         _ => LirAtom::Int(0), // heap pointer types default to 0
-    }
-}
-
-/// Collect free variables in a MIR statement block (referenced but not defined).
-/// Returns names in a stable order.
-fn collect_free_vars(body: &[MirStmt]) -> Vec<Symbol> {
-    let mut defined = HashSet::new();
-    let mut referenced = Vec::new();
-    let mut seen = HashSet::new();
-    for stmt in body {
-        collect_mir_stmt_refs(stmt, &mut defined, &mut referenced, &mut seen);
-    }
-    referenced
-        .into_iter()
-        .filter(|name| !defined.contains(name))
-        .collect()
-}
-
-fn collect_mir_stmt_refs(
-    stmt: &MirStmt,
-    defined: &mut HashSet<Symbol>,
-    referenced: &mut Vec<Symbol>,
-    seen: &mut HashSet<Symbol>,
-) {
-    match stmt {
-        MirStmt::Let { name, expr, .. } => {
-            collect_mir_expr_refs(expr, referenced, seen);
-            defined.insert(*name);
-        }
-        MirStmt::Expr(expr) | MirStmt::Return(expr) => {
-            collect_mir_expr_refs(expr, referenced, seen);
-        }
-        MirStmt::Assign { target, value } => {
-            collect_mir_expr_refs(target, referenced, seen);
-            collect_mir_expr_refs(value, referenced, seen);
-        }
-        MirStmt::Conc(tasks) => {
-            for task in tasks {
-                for s in &task.body {
-                    collect_mir_stmt_refs(s, defined, referenced, seen);
-                }
-            }
-        }
-        MirStmt::Try {
-            body,
-            catch_param,
-            catch_body,
-        } => {
-            for s in body {
-                collect_mir_stmt_refs(s, defined, referenced, seen);
-            }
-            defined.insert(*catch_param);
-            for s in catch_body {
-                collect_mir_stmt_refs(s, defined, referenced, seen);
-            }
-        }
-    }
-}
-
-fn collect_mir_expr_refs(expr: &MirExpr, referenced: &mut Vec<Symbol>, seen: &mut HashSet<Symbol>) {
-    match expr {
-        MirExpr::Variable(name) | MirExpr::Borrow(name) => {
-            if seen.insert(*name) {
-                referenced.push(*name);
-            }
-        }
-        MirExpr::BinaryOp(lhs, _, rhs) => {
-            collect_mir_expr_refs(lhs, referenced, seen);
-            collect_mir_expr_refs(rhs, referenced, seen);
-        }
-        MirExpr::Call { args, .. } => {
-            for (_, arg) in args {
-                collect_mir_expr_refs(arg, referenced, seen);
-            }
-        }
-        MirExpr::Constructor { args, .. } => {
-            for (_, arg) in args {
-                collect_mir_expr_refs(arg, referenced, seen);
-            }
-        }
-        MirExpr::Record(fields) => {
-            for (_, expr) in fields {
-                collect_mir_expr_refs(expr, referenced, seen);
-            }
-        }
-        MirExpr::Array(items) => {
-            for item in items {
-                collect_mir_expr_refs(item, referenced, seen);
-            }
-        }
-        MirExpr::Index(arr, idx) => {
-            collect_mir_expr_refs(arr, referenced, seen);
-            collect_mir_expr_refs(idx, referenced, seen);
-        }
-        MirExpr::FieldAccess(expr, _) | MirExpr::Raise(expr) => {
-            collect_mir_expr_refs(expr, referenced, seen);
-        }
-        MirExpr::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            collect_mir_expr_refs(cond, referenced, seen);
-            for s in then_body {
-                let mut defined = HashSet::new();
-                collect_mir_stmt_refs(s, &mut defined, referenced, seen);
-            }
-            if let Some(else_body) = else_body {
-                for s in else_body {
-                    let mut defined = HashSet::new();
-                    collect_mir_stmt_refs(s, &mut defined, referenced, seen);
-                }
-            }
-        }
-        MirExpr::Match { target, cases } => {
-            collect_mir_expr_refs(target, referenced, seen);
-            for case in cases {
-                collect_mir_pattern_defs(&case.pattern, seen);
-                for s in &case.body {
-                    let mut defined = HashSet::new();
-                    collect_mir_stmt_refs(s, &mut defined, referenced, seen);
-                }
-            }
-        }
-        MirExpr::While { cond, body } => {
-            collect_mir_expr_refs(cond, referenced, seen);
-            for s in body {
-                let mut defined = HashSet::new();
-                collect_mir_stmt_refs(s, &mut defined, referenced, seen);
-            }
-        }
-        MirExpr::FuncRef(_) | MirExpr::Literal(_) => {}
-        MirExpr::Closure { captures, .. } => {
-            for name in captures {
-                if seen.insert(*name) {
-                    referenced.push(*name);
-                }
-            }
-        }
-        MirExpr::CallIndirect { callee, args, .. } => {
-            collect_mir_expr_refs(callee, referenced, seen);
-            for (_, arg) in args {
-                collect_mir_expr_refs(arg, referenced, seen);
-            }
-        }
-    }
-}
-
-fn collect_mir_pattern_defs(pattern: &MirPattern, seen: &mut HashSet<Symbol>) {
-    match pattern {
-        MirPattern::Variable(name, _) => {
-            seen.insert(*name);
-        }
-        MirPattern::Constructor { fields, .. } => {
-            for (_, pat) in fields {
-                collect_mir_pattern_defs(pat, seen);
-            }
-        }
-        MirPattern::Record(fields, _) => {
-            for (_, pat) in fields {
-                collect_mir_pattern_defs(pat, seen);
-            }
-        }
-        MirPattern::Wildcard | MirPattern::Literal(_) => {}
     }
 }
 
@@ -2783,6 +2581,7 @@ fn apply_type_subst(typ: &Type, subst: &HashMap<String, Type>) -> Type {
             Box::new(apply_type_subst(eff, subst)),
         ),
         Type::Linear(inner) => Type::Linear(Box::new(apply_type_subst(inner, subst))),
+        Type::Lazy(inner) => Type::Lazy(Box::new(apply_type_subst(inner, subst))),
         Type::Row(types, rest) => Type::Row(
             types.iter().map(|t| apply_type_subst(t, subst)).collect(),
             rest.as_ref().map(|r| Box::new(apply_type_subst(r, subst))),
@@ -2847,7 +2646,6 @@ fn collect_lir_funcref_targets(functions: &[LirFunction]) -> HashSet<Symbol> {
                     scan_stmt(s, targets);
                 }
             }
-            LirStmt::Conc { .. } => {}
             LirStmt::Loop {
                 cond_stmts, body, ..
             } => {
@@ -3113,7 +2911,6 @@ fn update_funcref_targets(functions: &mut [LirFunction], old_name: Symbol, new_n
                     update_stmt(s, old, new);
                 }
             }
-            LirStmt::Conc { .. } => {}
             LirStmt::Loop {
                 cond_stmts, body, ..
             } => {
