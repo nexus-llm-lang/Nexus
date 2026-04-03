@@ -106,13 +106,12 @@ fn generic_applied_to_different_concrete_types() {
 
 #[test]
 fn nested_generic_instantiation() {
-    // Note: `Box<Box<i64> >` with space to avoid >> being parsed as Shr token
     should_typecheck(
         r#"
     type Box<T> = Box(val: T)
 
     let main = fn () -> unit do
-        let nested: Box<Box<i64> > = Box(val: Box(val: 42))
+        let nested: Box<Box<i64>> = Box(val: Box(val: 42))
         match nested do
             case Box(val: Box(val: n)) -> return ()
         end

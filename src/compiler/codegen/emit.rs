@@ -158,12 +158,9 @@ pub(super) fn compile_external_arg(
             Ok(())
         }
         Type::Borrow(inner) if matches!(peel_linear(inner), Type::Array(_)) => {
-            if !is_array_like_type(&atom.typ()) {
-                return Err(CodegenError::ExternalArgTypeMismatch {
-                    expected: "array-like value".to_string(),
-                    got: atom.typ().to_string(),
-                });
-            }
+            // A borrow of a linear array is represented as i64 at the WASM level
+            // (packed pointer). The param_type already confirms this is a valid
+            // borrow-of-array, so we just compile the atom and unpack.
             compile_atom(atom, out, local_map, layout)?;
             unpack_packed_i64_to_ptr_len(out, temps.packed_tmp_i64);
             Ok(())

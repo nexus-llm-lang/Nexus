@@ -106,7 +106,7 @@ The skill activates automatically when Claude Code works with `.nx` files.
 - **Block delimiters** -- `do ... end`, `then ... else ... end`, not braces
 - **Linear types** (`%`) -- resources consumed exactly once, compiler-enforced
 - **Borrowing** (`&`) -- immutable views without consumption
-- **Coeffect system** -- `port` → `handler` → `inject` → `require` flow
+- **Capability system** -- `port` → `handler` → `inject` → `require` flow
 - **Runtime permissions** -- `PermConsole`, `PermFs`, `PermNet`, etc.
 - **Standard library** -- correct import forms and function signatures
 

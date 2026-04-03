@@ -31,7 +31,7 @@ end
 - Generic type parameters: `fn <T>(x: T) -> T do ... end`
 - `unit`-returning functions may omit `return ()` (implicit unit return)
 
-### Coeffect/Effect Annotations
+### Capability/Effect Annotations
 
 ```nexus
 let greet = fn (name: string) -> unit require { Logger, Console } do

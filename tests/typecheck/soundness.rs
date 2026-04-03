@@ -270,11 +270,6 @@ fn soundness_exception_try_catch() {
 
 #[test]
 fn soundness_array_create_and_borrow() {
-    // NOTE: This program typechecks but codegen fails with E2016:
-    //   "external call argument type mismatch: expected array-like value, got i64"
-    // The borrow (&%arr) is correctly typed but codegen doesn't handle the
-    // borrow-of-linear-array argument passing to external stdlib functions.
-    // This is a genuine soundness gap found by this test.
     let src = r#"
     import * as array from "stdlib/array.nx"
 
@@ -287,8 +282,7 @@ fn soundness_array_create_and_borrow() {
     end
     "#;
     should_typecheck(src);
-    // exec_with_stdlib(src);
-    // TODO: Uncomment when codegen E2016 for borrowed linear arrays is fixed
+    exec_with_stdlib(src);
 }
 
 #[test]
