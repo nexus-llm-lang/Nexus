@@ -12,6 +12,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wasmparser::Payload;
 
 use crate::constants::{is_preview2_wasi_module, NEXUS_HOST_HTTP_MODULE, WASI_SNAPSHOT_MODULE};
+use crate::lang::stdlib::STDLIB_DIR;
+
+const STDLIB_WIT_PREFIX: &str = "nexus:stdlib/";
+/// The bundled stdlib WASM file path (used by wasm-merge).
+fn stdlib_wasm_path() -> String {
+    format!("{}/stdlib.wasm", STDLIB_DIR)
+}
 
 const WASM_MERGE_PATH_ENV: &str = "NEXUS_WASM_MERGE";
 pub const WASM_MERGE_MAIN_NAME: &str = "__nexus_main__";
@@ -106,8 +113,15 @@ fn file_backed_imports(
         if is_preview2_wasi_module(module_name) {
             continue;
         }
-        // Skip host-provided nexus runtime modules (e.g. "nexus:runtime/backtrace").
-        // NEXUS_HOST_HTTP_MODULE is handled above with its own conditional logic.
+        // nexus:stdlib/* imports are WIT-style but still resolved to the bundled
+        // stdlib.wasm file for wasm-merge. The WASM is rewritten before merging
+        // to replace WIT module names with the physical path.
+        if module_name.starts_with(STDLIB_WIT_PREFIX) {
+            let stdlib_path = stdlib_wasm_path();
+            out.insert(stdlib_path);
+            continue;
+        }
+        // Skip host-provided nexus runtime/CLI modules (e.g. "nexus:runtime/backtrace").
         if module_name.starts_with("nexus:") {
             continue;
         }
@@ -175,7 +189,10 @@ fn merge_dependencies_once(
     // when it encounters DWARF debug sections. They will be re-emitted post-bundle
     // if needed (currently unbundled output only).
     let stripped = strip_debug_sections(current_wasm);
-    fs::write(&current_path, &stripped)
+    // Rewrite nexus:stdlib/* WIT-style import module names to the physical
+    // stdlib.wasm path so wasm-merge can resolve them as file-backed imports.
+    let rewritten = rewrite_stdlib_wit_imports(&stripped);
+    fs::write(&current_path, &rewritten)
         .map_err(|e| format!("failed to write temporary wasm: {}", e))?;
 
     let mut command = ProcessCommand::new(wasm_merge_command);
@@ -227,6 +244,128 @@ fn merge_dependencies_once(
         fs::read(&merged_path).map_err(|e| format!("failed to read merged wasm output: {}", e))?;
     let _ = fs::remove_dir_all(&temp_dir);
     Ok(merged)
+}
+
+/// Rewrite WIT-style `nexus:stdlib/*` import module names to the physical
+/// `nxlib/stdlib/stdlib.wasm` path so that wasm-merge can resolve them.
+/// Field names (e.g. `__nx_abs_i64`) are unchanged — they match stdlib.wasm exports.
+fn rewrite_stdlib_wit_imports(wasm: &[u8]) -> Vec<u8> {
+    use wasm_encoder::{EntityType, ImportSection, Module, RawSection};
+
+    // Quick check: does the binary contain any nexus:stdlib/ imports?
+    let has_wit_imports = wasmparser::Parser::new(0)
+        .parse_all(wasm)
+        .filter_map(|p| p.ok())
+        .any(|p| {
+            if let Payload::ImportSection(section) = p {
+                section
+                    .into_iter()
+                    .any(|i| i.map_or(false, |i| i.module.starts_with(STDLIB_WIT_PREFIX)))
+            } else {
+                false
+            }
+        });
+    if !has_wit_imports {
+        return wasm.to_vec();
+    }
+
+    let stdlib_path = stdlib_wasm_path();
+    let parser = wasmparser::Parser::new(0);
+    let mut module = Module::new();
+    for payload in parser.parse_all(wasm) {
+        let payload = match payload {
+            Ok(p) => p,
+            Err(_) => return wasm.to_vec(),
+        };
+        match &payload {
+            Payload::ImportSection(section) => {
+                let mut imports = ImportSection::new();
+                for import in section.clone() {
+                    let import = match import {
+                        Ok(i) => i,
+                        Err(_) => return wasm.to_vec(),
+                    };
+                    let module_name = if import.module.starts_with(STDLIB_WIT_PREFIX) {
+                        stdlib_path.as_str()
+                    } else {
+                        import.module
+                    };
+                    let entity = match import.ty {
+                        wasmparser::TypeRef::Func(idx) => EntityType::Function(idx),
+                        wasmparser::TypeRef::Table(t) => {
+                            EntityType::Table(wasm_encoder::TableType {
+                                element_type: wasm_encoder::RefType {
+                                    nullable: t.element_type.is_nullable(),
+                                    heap_type: match t.element_type.heap_type() {
+                                        wasmparser::HeapType::Abstract { shared: _, ty } => {
+                                            match ty {
+                                                wasmparser::AbstractHeapType::Func => {
+                                                    wasm_encoder::HeapType::Abstract {
+                                                        shared: false,
+                                                        ty: wasm_encoder::AbstractHeapType::Func,
+                                                    }
+                                                }
+                                                wasmparser::AbstractHeapType::Extern => {
+                                                    wasm_encoder::HeapType::Abstract {
+                                                        shared: false,
+                                                        ty: wasm_encoder::AbstractHeapType::Extern,
+                                                    }
+                                                }
+                                                _ => return wasm.to_vec(),
+                                            }
+                                        }
+                                        _ => return wasm.to_vec(),
+                                    },
+                                },
+                                minimum: t.initial,
+                                maximum: t.maximum,
+                                table64: t.table64,
+                                shared: false,
+                            })
+                        }
+                        wasmparser::TypeRef::Memory(m) => {
+                            EntityType::Memory(wasm_encoder::MemoryType {
+                                minimum: m.initial,
+                                maximum: m.maximum,
+                                memory64: m.memory64,
+                                shared: m.shared,
+                                page_size_log2: m.page_size_log2,
+                            })
+                        }
+                        wasmparser::TypeRef::Global(g) => {
+                            let val_type = match g.content_type {
+                                wasmparser::ValType::I32 => wasm_encoder::ValType::I32,
+                                wasmparser::ValType::I64 => wasm_encoder::ValType::I64,
+                                wasmparser::ValType::F32 => wasm_encoder::ValType::F32,
+                                wasmparser::ValType::F64 => wasm_encoder::ValType::F64,
+                                _ => return wasm.to_vec(),
+                            };
+                            EntityType::Global(wasm_encoder::GlobalType {
+                                val_type,
+                                mutable: g.mutable,
+                                shared: g.shared,
+                            })
+                        }
+                        wasmparser::TypeRef::Tag(t) => EntityType::Tag(wasm_encoder::TagType {
+                            kind: wasm_encoder::TagKind::Exception,
+                            func_type_idx: t.func_type_idx,
+                        }),
+                    };
+                    imports.import(module_name, import.name, entity);
+                }
+                module.section(&imports);
+                continue;
+            }
+            _ => {}
+        }
+        if let Some((id, range)) = payload.as_section() {
+            module.section(&RawSection {
+                id,
+                data: &wasm[range],
+            });
+        }
+    }
+    module.finish()
 }
 
 /// Remove `.debug_*` custom sections from a WASM binary.

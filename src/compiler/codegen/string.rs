@@ -35,9 +35,16 @@ pub enum StringABI {
 /// use the packed ABI for shared-memory bundling.
 pub(super) fn string_abi_for_external(ext: &LirExternal) -> StringABI {
     let module = ext.wasm_module.as_ref();
-    // WIT-style module names contain ':' (e.g. "nexus:stdlib/math")
-    // but exclude runtime modules that use the packed convention
-    if module.contains(':') && !module.starts_with("nexus:runtime/") {
+    // WIT-style module names contain ':' (e.g. "nexus:stdlib/math").
+    // However, nexus:stdlib/* modules are still bundled via wasm-merge into a single
+    // shared-memory core module, so they use packed ABI — NOT canonical ABI.
+    // When stdlib becomes a separate WASM component (issue 50z), remove the
+    // nexus:stdlib/ exclusion to activate canonical ABI at that boundary.
+    // nexus:runtime/* modules are host-provided and always use packed convention.
+    if module.contains(':')
+        && !module.starts_with("nexus:runtime/")
+        && !module.starts_with("nexus:stdlib/")
+    {
         StringABI::Canonical
     } else {
         StringABI::Packed

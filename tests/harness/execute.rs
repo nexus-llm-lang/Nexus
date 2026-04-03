@@ -1,4 +1,4 @@
-use nexus::lang::stdlib::resolve_import_path;
+use nexus::lang::stdlib::resolve_import_to_file;
 use nexus::runtime::backtrace;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,12 +28,20 @@ fn cached_dep_module(module_name: &str) -> Arc<Module> {
     if let Some(m) = cache.get(module_name) {
         return Arc::clone(m);
     }
-    let resolved = resolve_import_path(module_name);
+    let resolved = resolve_import_to_file(module_name);
+    // Cache by resolved file path — multiple WIT module names
+    // (e.g. nexus:stdlib/math, nexus:stdlib/stdio) map to the same stdlib.wasm.
+    if let Some(m) = cache.get(&resolved) {
+        let m = Arc::clone(m);
+        cache.insert(module_name.to_string(), m.clone());
+        return m;
+    }
     let path = PathBuf::from(&resolved);
     let module = Arc::new(
         Module::from_file(&*SHARED_ENGINE, &path)
             .unwrap_or_else(|e| panic!("failed to load dep module {}: {}", module_name, e)),
     );
+    cache.insert(resolved, Arc::clone(&module));
     cache.insert(module_name.to_string(), Arc::clone(&module));
     module
 }
@@ -141,25 +149,7 @@ pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
     backtrace::reset();
     backtrace::add_bt_to_linker(&mut linker, &mut store)?;
 
-    let mut imported_modules = module
-        .imports()
-        .map(|i| i.module().to_string())
-        .collect::<Vec<_>>();
-    imported_modules.sort();
-    imported_modules.dedup();
-
-    for module_name in imported_modules {
-        if module_name == "wasi_snapshot_preview1"
-            || module_name == backtrace::BT_HOST_MODULE
-            || module_name == "nexus:cli/nexus-host"
-        {
-            continue;
-        }
-        let dep = cached_dep_module(&module_name);
-        linker
-            .module(&mut store, &module_name, &*dep)
-            .map_err(|e| e.to_string())?;
-    }
+    link_dep_modules(&module, &mut linker, &mut store)?;
 
     let instance = linker
         .instantiate(&mut store, &module)
@@ -192,25 +182,7 @@ pub fn run_main_with_deps_caps(
     backtrace::reset();
     backtrace::add_bt_to_linker(&mut linker, &mut store)?;
 
-    let mut imported_modules = module
-        .imports()
-        .map(|i| i.module().to_string())
-        .collect::<Vec<_>>();
-    imported_modules.sort();
-    imported_modules.dedup();
-
-    for module_name in imported_modules {
-        if module_name == "wasi_snapshot_preview1"
-            || module_name == backtrace::BT_HOST_MODULE
-            || module_name == "nexus:cli/nexus-host"
-        {
-            continue;
-        }
-        let dep = cached_dep_module(&module_name);
-        linker
-            .module(&mut store, &module_name, &*dep)
-            .map_err(|e| e.to_string())?;
-    }
+    link_dep_modules(&module, &mut linker, &mut store)?;
 
     let instance = linker
         .instantiate(&mut store, &module)
@@ -219,6 +191,56 @@ pub fn run_main_with_deps_caps(
         .get_typed_func::<(), ()>(&mut store, "main")
         .map_err(|e| e.to_string())?;
     main.call(&mut store, ()).map_err(|e| e.to_string())
+}
+
+/// Link dependency modules, deduplicating instances for modules that resolve
+/// to the same file (e.g. `nexus:stdlib/math` and `nexus:stdlib/stdio` both
+/// resolve to `nxlib/stdlib/stdlib.wasm`).
+fn link_dep_modules(
+    module: &Module,
+    linker: &mut Linker<wasmtime_wasi::p1::WasiP1Ctx>,
+    store: &mut Store<wasmtime_wasi::p1::WasiP1Ctx>,
+) -> Result<(), String> {
+    let mut imported_modules = module
+        .imports()
+        .map(|i| i.module().to_string())
+        .collect::<Vec<_>>();
+    imported_modules.sort();
+    imported_modules.dedup();
+
+    // Track which file paths have been instantiated to share a single instance
+    // across multiple WIT module names that resolve to the same file.
+    let mut instantiated_files: HashMap<String, String> = HashMap::new();
+
+    for module_name in imported_modules {
+        if module_name == "wasi_snapshot_preview1"
+            || module_name == backtrace::BT_HOST_MODULE
+            || module_name == "nexus:cli/nexus-host"
+        {
+            continue;
+        }
+        let resolved = resolve_import_to_file(&module_name);
+        if let Some(first_name) = instantiated_files.get(&resolved) {
+            // Already instantiated under a different name — alias exports
+            // from the first instance under this module name.
+            let first_name = first_name.clone();
+            let dep = cached_dep_module(&module_name);
+            for export in dep.exports() {
+                if let Some(def) = linker.get(&mut *store, &first_name, export.name()) {
+                    linker
+                        .define(&mut *store, &module_name, export.name(), def)
+                        .map_err(|e| format!("alias define error: {}", e))?;
+                }
+            }
+            continue;
+        }
+        let dep = cached_dep_module(&module_name);
+        linker
+            .module(&mut *store, &module_name, &*dep)
+            .map_err(|e| e.to_string())?;
+        instantiated_files.insert(resolved, module_name.clone());
+    }
+    Ok(())
 }
 
 /// Stub implementations for nexus-host functions (trapping).

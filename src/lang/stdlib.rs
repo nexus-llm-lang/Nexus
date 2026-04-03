@@ -17,6 +17,20 @@ pub fn resolve_import_path(path: &str) -> String {
     }
 }
 
+/// Resolves a WASM import module name to a physical file path on disk.
+///
+/// Used by the runtime and test harness to find WASM dependency files.
+/// Maps WIT-style `nexus:stdlib/*` names to the bundled `nxlib/stdlib/stdlib.wasm`.
+pub fn resolve_import_to_file(module_name: &str) -> String {
+    if module_name.starts_with(STDLIB_PREFIX) {
+        format!("nxlib/{}", module_name)
+    } else if module_name.starts_with("nexus:stdlib/") {
+        format!("{}/stdlib.wasm", STDLIB_DIR)
+    } else {
+        module_name.to_string()
+    }
+}
+
 /// Cached result of parsing all stdlib `.nx` files.
 static STDLIB_CACHE: LazyLock<Mutex<Option<Vec<(PathBuf, Program)>>>> =
     LazyLock::new(|| Mutex::new(None));
