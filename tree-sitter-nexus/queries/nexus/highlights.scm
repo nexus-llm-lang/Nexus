@@ -61,6 +61,15 @@
 (exception_def
   name: (uident) @type.definition)
 
+; Exception groups
+"group" @keyword.type
+
+(exception_group_def
+  name: (uident) @type.definition)
+
+(exception_group_def
+  member: (uident) @type)
+
 (variant_def
   name: (uident) @constructor)
 
@@ -142,6 +151,18 @@
 
 (borrow_type
   "&" @operator)
+
+; Lazy type
+(lazy_type
+  "@" @operator)
+
+; Force expression
+(force_expr
+  "@" @operator)
+
+; Catch arms
+(catch_arm
+  "case" @keyword.match.case)
 
 ; ─── Literals ───────────────────────────────────────────────────────────────
 

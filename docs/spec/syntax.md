@@ -79,6 +79,14 @@ export exception PermissionDenied(msg: string, code: i64)
 
 Extends the builtin `Exn` type with new constructors.
 
+### Exception Groups
+
+```nexus
+export exception group IOError = NotFound | PermissionDenied
+```
+
+Groups define named sets of exceptions. Catching a group name matches any member. See [Exception Groups and Lazy Evaluation](../exceptions-and-lazy).
+
 ## Expressions
 
 ### Literals
@@ -223,7 +231,7 @@ let %resource = acquire()
 let &view = ~data
 ```
 
-Sigils: (none) immutable, `~` mutable, `%` linear, `&` borrowed.
+Sigils: (none) immutable, `~` mutable, `%` linear, `&` borrowed, `@` lazy.
 
 Top-level `let` does not allow `~` or `%` sigils.
 
@@ -333,6 +341,20 @@ end
 
 Single `catch` clause binding the `Exn` value.
 
+Multi-arm catch with pattern matching:
+
+```nexus
+try
+  risky_operation()
+catch
+  case NotFound(msg: m) -> handle_not_found(m: m)
+  case PermDenied(msg: m) -> handle_perm(m: m)
+  case IOError -> handle_generic_io()
+end
+```
+
+Exception group names in catch arms expand to match all members. See [Exception Groups and Lazy Evaluation](../exceptions-and-lazy).
+
 ### Inject
 
 ```nexus
@@ -441,6 +463,7 @@ type_sum_def  ::= variant_def ( "|" variant_def )*
 variant_def   ::= UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
 variant_field ::= type | IDENT ":" type
 exception_def ::= [ "export" ] "exception" UIDENT [ "(" variant_field ( "," variant_field )* ")" ]
+exception_group_def ::= [ "export" ] "exception" "group" UIDENT "=" UIDENT ( "|" UIDENT )*
 
 import_def    ::= "import" "external" import_path
                 | "import" "{" import_item ( "," import_item )* "}" [ "," "*" "as" IDENT ] "from" import_path
@@ -459,7 +482,7 @@ external_def  ::= [ "export" ] "external" IDENT "=" STRING_LITERAL ":" [ type_pa
 type_params ::= "<" UIDENT ( "," UIDENT )* ">"
 param_list  ::= "(" [ param ( "," param )* ] ")"
 param       ::= [ sigil ] IDENT ":" type
-sigil       ::= "~" | "%" | "&"
+sigil       ::= "~" | "%" | "&" | "@"
 
 (* ── Types ──────────────────────────────────────────────────── *)
 
@@ -480,6 +503,7 @@ primitive_type ::= "i32" | "i64" | "f32" | "f64" | "float" | "bool" | "char" | "
 ref_type       ::= "ref" "(" type ")"
 borrow_type    ::= "&" type
 linear_type    ::= "%" type
+lazy_type      ::= "@" type
 
 record_type    ::= "{" IDENT ":" type ( "," IDENT ":" type )* "}"
 
@@ -524,6 +548,8 @@ match_stmt  ::= "match" expr "do" match_case* "end"
 match_case  ::= "case" pattern "->" stmt*
 
 try_stmt    ::= "try" stmt* "catch" IDENT "->" stmt* "end"
+              | "try" stmt* "catch" catch_arm+ "end"
+catch_arm   ::= "case" pattern "->" stmt*
 inject_stmt ::= "inject" dotted_ident ( "," dotted_ident )* "do" stmt* "end"
 
 conc_stmt   ::= "conc" "do" task_def* "end"

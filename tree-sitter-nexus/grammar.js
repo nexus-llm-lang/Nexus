@@ -35,10 +35,14 @@ export default grammar({
     [$.variable, $.dotted_identifier],
     // `&x` — borrow_expr starting with `&` or sigil `&` in variable/let_stmt
     [$.sigil, $.borrow_expr],
+    // `@x` — force_expr starting with `@` or sigil `@` in variable/let_stmt
+    [$.sigil, $.force_expr],
     // `match x do ...` — match_stmt (stmt body) vs match_expr (expr body) via expr_stmt
     [$.match_stmt, $.match_expr],
     // `case pat -> expr` — expr_stmt in match_case body vs match_case_expr value
     [$.expr_stmt, $.match_case_expr],
+    // `if let pat = expr then expr end` — if_let_expr vs expr_stmt in stmt body
+    [$.expr_stmt, $.if_let_expr],
   ],
 
   rules: {
@@ -68,6 +72,7 @@ export default grammar({
         $.import_def,
         $.port_def,
         $.external_def,
+        $.exception_group_def,
         $.let_def,
         $.line_comment,
         $.block_comment
@@ -109,6 +114,17 @@ export default grammar({
         "exception",
         field("name", $.uident),
         optional(seq("(", commaSep1($.variant_field), ")"))
+      ),
+
+    // [export] exception group Name = A | B | C
+    exception_group_def: ($) =>
+      seq(
+        optional("export"),
+        "exception",
+        "group",
+        field("name", $.uident),
+        "=",
+        sep1("|", field("member", $.uident))
       ),
 
     // import external "path/to/lib.wasm"
@@ -197,10 +213,12 @@ export default grammar({
       ),
 
     // [pub] let name [: type] = expr
+    // [pub] let [sigil] name [: type] = expr
     let_def: ($) =>
       seq(
         optional("export"),
         "let",
+        optional(field("sigil", $.sigil)),
         field("name", $.identifier),
         optional(seq(":", field("type", $._type))),
         "=",
@@ -222,7 +240,7 @@ export default grammar({
       ),
 
     // ~ = mutable, % = linear, & = borrow, (none) = immutable
-    sigil: (_) => choice("~", "%", "&"),
+    sigil: (_) => choice("~", "%", "&", "@"),
 
     // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -238,6 +256,7 @@ export default grammar({
         $.list_type,
         $.array_type,
         $.row_type,
+        $.lazy_type,
         alias($.uident, $.type_identifier) // type variable or user-defined monotype
       ),
 
@@ -252,6 +271,9 @@ export default grammar({
 
     // %T
     linear_type: ($) => seq("%", field("inner", $._type)),
+
+    // @T
+    lazy_type: ($) => seq("@", field("inner", $._type)),
 
     // { x: T, y: U }
     record_type: ($) => seq("{", commaSep1($.record_type_field), "}"),
@@ -425,15 +447,31 @@ export default grammar({
       ),
 
     // try stmts catch param -> stmts end
+    // try stmts catch case pat -> stmts ... end
     try_stmt: ($) =>
       seq(
         "try",
         field("body", repeat($._stmt)),
         "catch",
-        field("catch_param", $.identifier),
-        "->",
-        field("catch_body", repeat($._stmt)),
+        choice(
+          // Legacy: catch param -> body
+          seq(
+            field("catch_param", $.identifier),
+            "->",
+            field("catch_body", repeat($._stmt))
+          ),
+          // Multi-arm: catch case pat -> body ... end (no catch_param)
+          field("catch_arms", repeat1($.catch_arm))
+        ),
         "end"
+      ),
+
+    catch_arm: ($) =>
+      seq(
+        "case",
+        field("pattern", $._pattern),
+        "->",
+        field("body", repeat($._stmt))
       ),
 
     // inject handler1, mod.handler2 do stmts end
@@ -636,6 +674,7 @@ export default grammar({
         $.array_expr,
         $.linear_list_expr,
         $.list_expr,
+        $.force_expr,
         $.literal,
         $.variable
       ),
@@ -673,6 +712,9 @@ export default grammar({
       ),
 
     paren_expr: ($) => seq("(", $._expr, ")"),
+
+    // @expr or @(expr)
+    force_expr: ($) => seq("@", field("value", $._atom_expr)),
 
     // raise expr
     raise_expr: ($) => seq("raise", field("value", $._expr)),

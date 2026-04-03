@@ -129,6 +129,24 @@ Rules:
 - Multiple handlers can be injected in a single `inject` statement: `inject h1, h2 do ... end`
 - Handler requirements propagate to the enclosing scope
 
+## Exception Groups
+
+Exception groups let you catch multiple related exceptions with a single pattern. See [Exception Groups and Lazy Evaluation](../exceptions-and-lazy) for the full reference.
+
+```nexus
+exception NotFound(path: string)
+exception PermDenied(path: string)
+exception group IOError = NotFound | PermDenied
+
+let safe_read = fn (path: string) -> string require { Fs } do
+  try
+    return Fs.read_to_string(path: path)
+  catch
+    case IOError -> return ""
+  end
+end
+```
+
 ## Main Constraints
 
 The `main` function has special restrictions:
