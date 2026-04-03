@@ -346,8 +346,8 @@ fn test_lazy_double_force_is_error() {
 
 #[test]
 fn test_lazy_pass_thunk_by_bare_name() {
-    // Bare name `x` resolves to @x binding, returning @T (the thunk itself)
-    should_typecheck(
+    // Bare name `x` must NOT resolve to @x — sigils are distinct bindings
+    should_fail_typecheck(
         r#"
     let consume_thunk = fn (@t: @i64) -> unit do
         let v = @t
@@ -356,6 +356,20 @@ fn test_lazy_pass_thunk_by_bare_name() {
     let main = fn () -> unit do
         let @x = 42
         consume_thunk(t: x)
+        return ()
+    end
+    "#,
+    );
+    // Using @x explicitly works
+    should_typecheck(
+        r#"
+    let consume_thunk = fn (@t: @i64) -> unit do
+        let v = @t
+        return ()
+    end
+    let main = fn () -> unit do
+        let @x = 42
+        consume_thunk(t: @x)
         return ()
     end
     "#,
