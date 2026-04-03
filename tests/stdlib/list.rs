@@ -208,3 +208,49 @@ end
 "#,
     );
 }
+
+#[test]
+fn deforestation_map_map_fusion() {
+    exec(
+        r#"
+import * as list from "stdlib/list.nx"
+
+let double = fn (val: i64) -> i64 do return val * 2 end
+let inc = fn (val: i64) -> i64 do return val + 1 end
+
+let main = fn () -> unit do
+    let xs = [1, 2, 3]
+    // map(inc, map(double, xs)) should fuse into map(inc∘double, xs)
+    let result = list.map(xs: list.map(xs: xs, f: double), f: inc)
+    // Expected: [3, 5, 7] = [(1*2+1), (2*2+1), (3*2+1)]
+    match result do
+        case Cons(v: h, rest: _) ->
+            if h != 3 then raise RuntimeError(val: "expected 3") end
+            return ()
+        case Nil -> raise RuntimeError(val: "expected non-empty")
+    end
+end
+"#,
+    );
+}
+
+#[test]
+fn deforestation_reverse_reverse_identity() {
+    exec(
+        r#"
+import * as list from "stdlib/list.nx"
+
+let main = fn () -> unit do
+    let xs = [10, 20, 30]
+    // reverse(reverse(xs)) should collapse to xs
+    let result = list.reverse(xs: list.reverse(xs: xs))
+    match result do
+        case Cons(v: h, rest: _) ->
+            if h != 10 then raise RuntimeError(val: "expected 10") end
+            return ()
+        case Nil -> raise RuntimeError(val: "expected non-empty")
+    end
+end
+"#,
+    );
+}

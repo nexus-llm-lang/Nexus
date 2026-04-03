@@ -93,6 +93,19 @@ pub enum LirStmt {
         /// Return type of the overall match.
         ret_type: Type,
     },
+    /// In-place heap word update for linear value reuse. Instead of allocating a
+    /// new Constructor, overwrites a word in the source object's existing heap memory.
+    /// Only emitted when the source is provably dead after this point (no aliases).
+    FieldUpdate {
+        /// The heap object to update (i64 pointer).
+        target: LirAtom,
+        /// Byte offset within the heap object (0 = tag, 8 = field 0, 16 = field 1, etc.).
+        byte_offset: u64,
+        /// New value to store.
+        value: LirAtom,
+        /// Type of the value (determines the WASM store instruction).
+        value_typ: Type,
+    },
 }
 
 /// A single case in a Switch statement (tag-based multi-way branch).

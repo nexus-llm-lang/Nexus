@@ -141,6 +141,12 @@ fn collect_stmt_refs(stmts: &[LirStmt], refs: &mut HashSet<Symbol>) {
                 collect_stmt_refs(default_body, refs);
                 collect_opt_atom_refs(default_ret, refs);
             }
+            LirStmt::FieldUpdate {
+                target, value, ..
+            } => {
+                collect_atom_refs(target, refs);
+                collect_atom_refs(value, refs);
+            }
         }
     }
 }
@@ -193,6 +199,7 @@ fn collect_stmt_defs(stmts: &[LirStmt], defs: &mut HashSet<Symbol>) {
                 }
                 collect_stmt_defs(default_body, defs);
             }
+            LirStmt::FieldUpdate { .. } => {}
         }
     }
 }

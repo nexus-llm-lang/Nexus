@@ -69,50 +69,59 @@ pub(super) fn emit_alloc_object(
     Ok(())
 }
 
-pub(super) fn emit_pack_value_to_i64(typ: &Type, out: &mut Function) -> Result<(), CodegenError> {
+/// Emit a typed store to memory at the given byte offset.
+/// Stack: [addr:i32, value:<native_type>] → [].
+/// Uses the value's native WASM type for the store instruction, avoiding
+/// the pack_to_i64 round-trip (sign-extend / reinterpret / wrap).
+/// Heap slots remain 8 bytes wide; sub-64-bit types simply leave the upper bytes unused.
+pub(super) fn emit_typed_field_store(
+    typ: &Type,
+    offset: u64,
+    out: &mut Function,
+) -> Result<(), CodegenError> {
+    let ma = |align| MemArg {
+        offset,
+        align,
+        memory_index: 0,
+    };
     match typ.wasm_repr() {
-        WasmRepr::I64 => Ok(()),
-        WasmRepr::I32 => {
-            out.instruction(&Instruction::I64ExtendI32S);
-            Ok(())
-        }
-        WasmRepr::F64 => {
-            out.instruction(&Instruction::I64ReinterpretF64);
-            Ok(())
-        }
-        WasmRepr::F32 => {
-            out.instruction(&Instruction::I32ReinterpretF32);
-            out.instruction(&Instruction::I64ExtendI32U);
-            Ok(())
-        }
+        WasmRepr::I64 => out.instruction(&Instruction::I64Store(ma(3))),
+        WasmRepr::I32 => out.instruction(&Instruction::I32Store(ma(2))),
+        WasmRepr::F64 => out.instruction(&Instruction::F64Store(ma(3))),
+        WasmRepr::F32 => out.instruction(&Instruction::F32Store(ma(2))),
         WasmRepr::Unit => {
-            out.instruction(&Instruction::Drop);
-            out.instruction(&Instruction::I64Const(0));
-            Ok(())
+            // compile_atom(Unit) pushes nothing; drop the address
+            out.instruction(&Instruction::Drop)
         }
-    }
+    };
+    Ok(())
 }
 
-pub(super) fn emit_unpack_i64_to_value(typ: &Type, out: &mut Function) -> Result<(), CodegenError> {
+/// Emit a typed load from memory at the given byte offset.
+/// Stack: [addr:i32] → [value:<native_type>].
+/// Uses the field's native WASM type for the load instruction, avoiding
+/// the unpack_from_i64 round-trip.
+pub(super) fn emit_typed_field_load(
+    typ: &Type,
+    offset: u64,
+    out: &mut Function,
+) -> Result<(), CodegenError> {
+    let ma = |align| MemArg {
+        offset,
+        align,
+        memory_index: 0,
+    };
     match typ.wasm_repr() {
-        WasmRepr::I64 => Ok(()),
-        WasmRepr::I32 => {
-            out.instruction(&Instruction::I32WrapI64);
-            Ok(())
+        WasmRepr::I64 => out.instruction(&Instruction::I64Load(ma(3))),
+        WasmRepr::I32 => out.instruction(&Instruction::I32Load(ma(2))),
+        WasmRepr::F64 => out.instruction(&Instruction::F64Load(ma(3))),
+        WasmRepr::F32 => out.instruction(&Instruction::F32Load(ma(2))),
+        WasmRepr::Unit => {
+            // Drop the address; unit loads produce no value
+            out.instruction(&Instruction::Drop)
         }
-        WasmRepr::F64 => {
-            out.instruction(&Instruction::F64ReinterpretI64);
-            Ok(())
-        }
-        WasmRepr::F32 => {
-            out.instruction(&Instruction::I32WrapI64);
-            out.instruction(&Instruction::F32ReinterpretI32);
-            Ok(())
-        }
-        WasmRepr::Unit => Err(CodegenError::UnsupportedUnpack {
-            typ: "unit".to_string(),
-        }),
-    }
+    };
+    Ok(())
 }
 
 pub(super) fn compile_external_arg(

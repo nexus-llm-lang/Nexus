@@ -30,8 +30,6 @@ pub enum CodegenError {
     ConflictingLocalTypes { name: String },
     /// E2011: object heap not enabled
     ObjectHeapRequired { context: &'static str },
-    /// E2013: cannot unpack object field into type
-    UnsupportedUnpack { typ: String },
     /// E2014: external param type not supported
     UnsupportedExternalParamType { typ: String },
     /// E2015: external return type not supported
@@ -56,7 +54,6 @@ impl CodegenError {
             CodegenError::CallArityMismatch { .. } => "E2008",
             CodegenError::ConflictingLocalTypes { .. } => "E2010",
             CodegenError::ObjectHeapRequired { .. } => "E2011",
-            CodegenError::UnsupportedUnpack { .. } => "E2013",
             CodegenError::UnsupportedExternalParamType { .. } => "E2014",
             CodegenError::UnsupportedExternalReturnType { .. } => "E2015",
             CodegenError::ExternalArgTypeMismatch { .. } => "E2016",
@@ -107,9 +104,6 @@ impl std::fmt::Display for CodegenError {
             }
             CodegenError::ObjectHeapRequired { context } => {
                 format!("{} requested without object heap", context)
-            }
-            CodegenError::UnsupportedUnpack { typ } => {
-                format!("cannot unpack object field into type '{}'", typ)
             }
             CodegenError::UnsupportedExternalParamType { typ } => {
                 format!(
