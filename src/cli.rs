@@ -5,8 +5,6 @@ use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
-use nexus::runtime::ExecutionCapabilities;
-
 #[derive(Debug, Clone, clap::ValueEnum)]
 pub enum ExplainCapabilities {
     /// Show capability names (default).
@@ -25,15 +23,6 @@ pub enum ExplainCapabilitiesFormat {
     Json,
 }
 
-#[derive(Debug, Clone, Default, clap::ValueEnum)]
-pub enum CheckFormat {
-    /// Human-readable text (default).
-    #[default]
-    Text,
-    /// Structured JSON (LLM-friendly).
-    Json,
-}
-
 #[derive(Debug, Parser)]
 #[command(name = "nexus")]
 #[command(about = "Nexus language CLI")]
@@ -48,39 +37,6 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Parse, typecheck, compile, and execute Nexus source (`.nx`).
-    /// If no file is passed and stdin is piped, reads script from stdin.
-    Run {
-        /// Nexus source file path. Use '-' to read from stdin.
-        input: Option<PathBuf>,
-        /// Allow filesystem access.
-        #[arg(long)]
-        allow_fs: bool,
-        /// Allow network access.
-        #[arg(long)]
-        allow_net: bool,
-        /// Allow console I/O (print, println).
-        #[arg(long)]
-        allow_console: bool,
-        /// Allow random number generation.
-        #[arg(long)]
-        allow_random: bool,
-        /// Allow clock/time operations.
-        #[arg(long)]
-        allow_clock: bool,
-        /// Allow process operations (exit, etc.).
-        #[arg(long)]
-        allow_proc: bool,
-        /// Allow environment variable access.
-        #[arg(long)]
-        allow_env: bool,
-        /// Preopen a host directory for guest filesystem access (repeatable).
-        #[arg(long, value_name = "DIR")]
-        preopen: Vec<PathBuf>,
-        /// Arguments to pass to the guest program (after --).
-        #[arg(last = true)]
-        guest_args: Vec<String>,
-    },
     /// Parse, typecheck, and build a WASM Component artifact.
     /// If no file is passed and stdin is piped, reads script from stdin.
     Build {
@@ -98,55 +54,6 @@ pub enum Command {
         /// Output format for capability information.
         #[arg(long, value_enum, default_value_t = ExplainCapabilitiesFormat::Text)]
         explain_capabilities_format: ExplainCapabilitiesFormat,
-    },
-    /// Parse and typecheck only.
-    /// If no file is passed and stdin is piped, reads script from stdin.
-    Check {
-        /// Nexus source file path. Use '-' to read from stdin.
-        input: Option<PathBuf>,
-        /// Output format: text (default) or json (structured, LLM-friendly).
-        #[arg(long, default_value = "text")]
-        format: CheckFormat,
-    },
-    /// Start the Language Server Protocol server (stdio).
-    Lsp,
-    /// Invoke the self-hosted nxc compiler (auto-builds and caches nxc_driver.wasm).
-    Nxc {
-        /// Arguments to pass to the nxc compiler (e.g. input.nx output.wasm).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Execute a pre-compiled WASM module with the Nexus runtime.
-    Exec {
-        /// Path to a `.wasm` file.
-        input: PathBuf,
-        /// Allow filesystem access.
-        #[arg(long)]
-        allow_fs: bool,
-        /// Allow network access.
-        #[arg(long)]
-        allow_net: bool,
-        /// Allow console I/O (print, println).
-        #[arg(long)]
-        allow_console: bool,
-        /// Allow random number generation.
-        #[arg(long)]
-        allow_random: bool,
-        /// Allow clock/time operations.
-        #[arg(long)]
-        allow_clock: bool,
-        /// Allow process operations (exit, etc.).
-        #[arg(long)]
-        allow_proc: bool,
-        /// Allow environment variable access.
-        #[arg(long)]
-        allow_env: bool,
-        /// Preopen a host directory for guest filesystem access (repeatable).
-        #[arg(long, value_name = "DIR")]
-        preopen: Vec<PathBuf>,
-        /// Arguments to pass to the guest program (after --).
-        #[arg(last = true)]
-        guest_args: Vec<String>,
     },
 }
 
@@ -202,43 +109,4 @@ pub fn strip_shebang(source: String) -> String {
 
 pub fn default_wasm_output_path() -> PathBuf {
     PathBuf::from("main.wasm")
-}
-
-pub fn build_execution_capabilities(
-    allow_fs: bool,
-    allow_net: bool,
-    allow_console: bool,
-    allow_random: bool,
-    allow_clock: bool,
-    allow_proc: bool,
-    allow_env: bool,
-    preopen_dirs: Vec<PathBuf>,
-) -> Result<ExecutionCapabilities, String> {
-    let capabilities = ExecutionCapabilities {
-        allow_net,
-        allow_fs,
-        allow_console,
-        allow_random,
-        allow_clock,
-        allow_proc,
-        allow_env,
-        preopen_dirs,
-    };
-    capabilities.validate()?;
-    Ok(capabilities)
-}
-
-pub fn extract_main_requires(
-    program: &nexus::lang::ast::Program,
-) -> Option<&nexus::lang::ast::Type> {
-    program.definitions.iter().find_map(|def| {
-        if let nexus::lang::ast::TopLevel::Let(gl) = &def.node {
-            if gl.name == nexus::constants::ENTRYPOINT {
-                if let nexus::lang::ast::Expr::Lambda { requires, .. } = &gl.value.node {
-                    return Some(requires);
-                }
-            }
-        }
-        None
-    })
 }

@@ -1,23 +1,16 @@
 mod artifact;
 mod cli;
 mod driver;
-mod nxc_cache;
 
 use clap::Parser;
 use std::fs;
-use std::io::{self, IsTerminal};
-use std::path::Path;
 use std::process::ExitCode;
 
 use nexus::compiler::bundler;
-use nexus::repl;
-use nexus::runtime::{self, ExecutionCapabilities};
+use nexus::runtime;
 
-use cli::{
-    build_execution_capabilities, default_wasm_output_path, extract_main_requires, load_source,
-    strip_shebang, Cli, Command,
-};
-use driver::{compile_loaded_source_to_wasm, parse_program, typecheck_program};
+use cli::{default_wasm_output_path, load_source, Cli, Command};
+use driver::compile_loaded_source_to_wasm;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -43,36 +36,6 @@ fn main() -> ExitCode {
     }
 
     match cli.command {
-        Some(Command::Run {
-            input,
-            allow_fs,
-            allow_net,
-            allow_console,
-            allow_random,
-            allow_clock,
-            allow_proc,
-            allow_env,
-            preopen,
-            guest_args,
-        }) => {
-            let capabilities = match build_execution_capabilities(
-                allow_fs,
-                allow_net,
-                allow_console,
-                allow_random,
-                allow_clock,
-                allow_proc,
-                allow_env,
-                preopen,
-            ) {
-                Ok(capabilities) => capabilities,
-                Err(msg) => {
-                    eprintln!("Capability Error: {}", msg);
-                    return ExitCode::from(1);
-                }
-            };
-            run_command(input, capabilities, cli.verbose, guest_args)
-        }
         Some(Command::Build {
             input,
             output,
@@ -87,103 +50,11 @@ fn main() -> ExitCode {
             explain_capabilities_format,
             cli.verbose,
         ),
-        Some(Command::Nxc { args }) => nxc_command(args, cli.verbose),
-        Some(Command::Check { input, format }) => check_command(input, format),
-        Some(Command::Lsp) => lsp_command(),
-        Some(Command::Exec {
-            input,
-            allow_fs,
-            allow_net,
-            allow_console,
-            allow_random,
-            allow_clock,
-            allow_proc,
-            allow_env,
-            preopen,
-            guest_args,
-        }) => {
-            let capabilities = match build_execution_capabilities(
-                allow_fs,
-                allow_net,
-                allow_console,
-                allow_random,
-                allow_clock,
-                allow_proc,
-                allow_env,
-                preopen,
-            ) {
-                Ok(capabilities) => capabilities,
-                Err(msg) => {
-                    eprintln!("Capability Error: {}", msg);
-                    return ExitCode::from(1);
-                }
-            };
-            exec_command(input, capabilities, guest_args)
-        }
         None => {
-            if io::stdin().is_terminal() {
-                repl::start(ExecutionCapabilities::deny_all());
-                ExitCode::SUCCESS
-            } else {
-                run_command(None, ExecutionCapabilities::deny_all(), cli.verbose, vec![])
-            }
+            eprintln!("No command specified. Use `nexus build <file>` or `nexus --help`.");
+            ExitCode::from(1)
         }
     }
-}
-
-fn run_command(
-    input: Option<std::path::PathBuf>,
-    capabilities: ExecutionCapabilities,
-    verbose: bool,
-    guest_args: Vec<String>,
-) -> ExitCode {
-    if let Some(path) = input.as_deref() {
-        if path != Path::new("-") && path.extension().is_some_and(|ext| ext == "wasm") {
-            eprintln!("`nexus run` executes Nexus source only, not wasm modules.");
-            eprintln!("Hint: run wasm with `wasmtime run ... {}`", path.display());
-            return ExitCode::from(1);
-        }
-    }
-
-    if input.is_none() && io::stdin().is_terminal() {
-        repl::start(capabilities);
-        return ExitCode::SUCCESS;
-    }
-
-    let input_path = input.clone();
-    let loaded = match load_source(input) {
-        Ok(loaded) => loaded,
-        Err(msg) => {
-            eprintln!("{}", msg);
-            return ExitCode::from(1);
-        }
-    };
-
-    let src = strip_shebang(loaded.source.clone());
-    if let Some(program) = parse_program(&loaded.display_name, &src) {
-        if let Some(requires) = extract_main_requires(&program) {
-            if let Err(msg) = capabilities.validate_program_requires(requires) {
-                eprintln!("Capability Error: {}", msg);
-                return ExitCode::from(1);
-            }
-        }
-    }
-
-    // Compile and execute via wasmtime
-    let wasm_merge_command = bundler::resolve_wasm_merge_command(None);
-    let compiled = match compile_loaded_source_to_wasm(&loaded, true, &wasm_merge_command, verbose)
-    {
-        Ok(compiled) => compiled,
-        Err(code) => return code,
-    };
-
-    let module_dir = input_path.as_deref().and_then(|p| p.parent());
-    nexus::runtime::wasm_exec::run_wasm_bytes(
-        &compiled.wasm,
-        module_dir,
-        &capabilities,
-        &guest_args,
-    )
 }
 
 fn build_command(
@@ -232,94 +103,6 @@ fn build_command(
     ExitCode::SUCCESS
 }
 
-fn exec_command(
-    input: std::path::PathBuf,
-    capabilities: ExecutionCapabilities,
-    guest_args: Vec<String>,
-) -> ExitCode {
-    let wasm = match fs::read(&input) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("Failed to read {}: {}", input.display(), e);
-            return ExitCode::from(1);
-        }
-    };
-    let module_dir = input.parent();
-    runtime::wasm_exec::run_wasm_bytes(&wasm, module_dir, &capabilities, &guest_args)
-}
-
-fn nxc_command(_args: Vec<String>, verbose: bool) -> ExitCode {
-    let project_root = std::env::current_dir().unwrap_or_default();
-    match nxc_cache::ensure_nxc_driver(&project_root, verbose) {
-        Ok(path) => {
-            eprintln!("nxc: {}", path.display());
-            ExitCode::SUCCESS
-        }
-        Err(msg) => {
-            eprintln!("nxc: {}", msg);
-            ExitCode::from(1)
-        }
-    }
-}
-
-fn check_command(input: Option<std::path::PathBuf>, format: cli::CheckFormat) -> ExitCode {
-    match format {
-        cli::CheckFormat::Json => {
-            let loaded = match load_source(input) {
-                Ok(loaded) => loaded,
-                Err(msg) => {
-                    // Even errors should be valid JSON
-                    let err = serde_json::json!({
-                        "file": "<stdin>",
-                        "ok": false,
-                        "diagnostics": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "severity": "error", "message": msg}],
-                        "symbols": []
-                    });
-                    println!("{}", serde_json::to_string_pretty(&err).unwrap());
-                    return ExitCode::from(1);
-                }
-            };
-            let src = strip_shebang(loaded.source);
-            let result = nexus::lsp::analyze(&loaded.display_name, &src);
-            println!("{}", serde_json::to_string_pretty(&result.check).unwrap());
-            if result.check.ok {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
-        }
-        cli::CheckFormat::Text => {
-            let loaded = match load_source(input) {
-                Ok(loaded) => loaded,
-                Err(msg) => {
-                    eprintln!("{}", msg);
-                    return ExitCode::from(1);
-                }
-            };
-            let src = strip_shebang(loaded.source);
-            let program = match parse_program(&loaded.display_name, &src) {
-                Some(p) => p,
-                None => return ExitCode::from(1),
-            };
-            if typecheck_program(&loaded.display_name, &src, &program) {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
-        }
-    }
-}
-
-fn lsp_command() -> ExitCode {
-    match nexus::lsp::serve() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("LSP server error: {}", e);
-            ExitCode::from(1)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,94 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_build_wasm_flag_is_rejected() {
-        let err = Cli::try_parse_from(["nexus", "build", "example.nx", "--wasm"])
-            .expect_err("`--wasm` should not be accepted (component is now the only mode)");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--wasm"),
-            "error message should mention removed flag, got: {}",
-            msg
-        );
-    }
-
-    #[test]
     fn build_default_output_name_is_main_wasm() {
         assert_eq!(default_wasm_output_path(), PathBuf::from("main.wasm"));
-    }
-
-    #[test]
-    fn cli_run_capability_flags_are_supported() {
-        let cli = Cli::try_parse_from([
-            "nexus",
-            "run",
-            "example.nx",
-            "--allow-fs",
-            "--preopen",
-            "/tmp",
-        ])
-        .expect("run capability flags should be accepted");
-        match cli.command {
-            Some(Command::Run {
-                allow_fs, preopen, ..
-            }) => {
-                assert!(allow_fs);
-                assert_eq!(preopen, vec![PathBuf::from("/tmp")]);
-            }
-            other => panic!("unexpected parsed command: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn extract_main_requires_returns_none_when_no_main() {
-        let program = nexus::lang::ast::Program {
-            definitions: vec![],
-            source_file: None,
-            source_text: None,
-        };
-        assert!(extract_main_requires(&program).is_none());
-    }
-
-    #[test]
-    fn extract_main_requires_returns_requires_clause() {
-        let src = r#"
-        let main = fn () -> unit require { PermNet } do
-            return ()
-        end
-        "#;
-        let program = nexus::lang::parser::parser()
-            .parse(src)
-            .expect("parse should succeed");
-        let requires = extract_main_requires(&program).expect("should find main requires");
-        match requires {
-            nexus::lang::ast::Type::Row(items, _) => {
-                assert_eq!(items.len(), 1);
-                assert_eq!(
-                    items[0],
-                    nexus::lang::ast::Type::UserDefined("PermNet".to_string(), vec![])
-                );
-            }
-            other => panic!("expected Row, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn execution_capabilities_reject_preopen_without_allow_fs() {
-        let err = build_execution_capabilities(
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            vec![PathBuf::from("/tmp")],
-        )
-        .expect_err("preopen without --allow-fs should be rejected");
-        assert!(
-            err.contains("--preopen"),
-            "expected --preopen validation message, got: {}",
-            err
-        );
     }
 }

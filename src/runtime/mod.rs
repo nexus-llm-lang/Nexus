@@ -6,10 +6,7 @@ use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 pub mod backtrace;
-pub mod lazy;
-pub mod net_host;
 pub mod string_heap;
-pub mod wasm_exec;
 
 /// Runtime capability policy used by wasm execution paths.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
