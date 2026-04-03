@@ -15,6 +15,7 @@ use crate::lang::ast::*;
 use crate::lang::parser;
 use crate::lang::stdlib::{load_stdlib_nx_programs, resolve_import_path};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 #[derive(Debug)]
 pub enum HirBuildError {
@@ -350,12 +351,17 @@ impl MirBuilder {
         self.enum_defs.push(exn_enum_def());
 
         if let Ok(stdlib_programs) = load_stdlib_nx_programs() {
-            for (_, stdlib_program) in stdlib_programs {
+            for (path, stdlib_program) in stdlib_programs {
+                let wit_interface = stdlib_nx_to_wit_interface(&path);
                 let mut current_wasm_module: Option<String> = None;
                 for def in &stdlib_program.definitions {
                     match &def.node {
                         TopLevel::Import(import) if import.is_external => {
-                            current_wasm_module = Some(resolve_import_path(&import.path));
+                            let resolved = resolve_import_path(&import.path);
+                            current_wasm_module = Some(resolve_stdlib_wit_module(
+                                &resolved,
+                                wit_interface.as_deref(),
+                            ));
                         }
                         TopLevel::Enum(ed) => {
                             self.enum_defs.push(ed.clone());
@@ -406,11 +412,19 @@ impl MirBuilder {
         rename_map: &HashMap<String, String>,
     ) -> Result<(), HirBuildError> {
         let mut current_wasm_module: Option<String> = None;
+        let wit_interface = self
+            .current_source_file
+            .as_ref()
+            .and_then(|p| stdlib_nx_to_wit_interface(Path::new(p)));
 
         for def in &program.definitions {
             match &def.node {
                 TopLevel::Import(import) if import.is_external => {
-                    current_wasm_module = Some(resolve_import_path(&import.path));
+                    let resolved = resolve_import_path(&import.path);
+                    current_wasm_module = Some(resolve_stdlib_wit_module(
+                        &resolved,
+                        wit_interface.as_deref(),
+                    ));
                 }
                 TopLevel::Import(import) => {
                     self.process_import(import, &def.span)?;
@@ -1816,4 +1830,46 @@ fn collect_ast_pattern_defs(pattern: &Pattern, defined: &mut HashSet<String>) {
         }
         Pattern::Wildcard | Pattern::Literal(_) => {}
     }
+}
+
+/// Map a resolved import path to a WIT module name if it refers to stdlib.wasm.
+///
+/// If the source file is a known stdlib module, uses its specific WIT interface.
+/// Otherwise falls back to `nexus:stdlib/bundle` — a catch-all for non-stdlib
+/// files (e.g. nxc modules) that import from stdlib.wasm directly.
+/// Non-stdlib imports (e.g. `nexus:runtime/backtrace`) pass through unchanged.
+fn resolve_stdlib_wit_module(resolved: &str, wit_interface: Option<&str>) -> String {
+    if resolved.ends_with("stdlib.wasm") {
+        wit_interface
+            .unwrap_or("nexus:stdlib/bundle")
+            .to_string()
+    } else {
+        resolved.to_string()
+    }
+}
+
+/// Map a stdlib `.nx` source file path to its WIT interface name.
+///
+/// Externals from these files get `wasm_module` set to the WIT name
+/// instead of the raw `nxlib/stdlib/stdlib.wasm` file path. This keeps
+/// the surface language unchanged while the IR carries component-model
+/// metadata matching the WIT definitions in `wit/nexus-stdlib/`.
+fn stdlib_nx_to_wit_interface(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let wit = match stem {
+        "math" => "nexus:stdlib/math",
+        "string" => "nexus:stdlib/string-ops",
+        "stdio" => "nexus:stdlib/stdio",
+        "fs" => "nexus:stdlib/filesystem",
+        "net" => "nexus:stdlib/network",
+        "proc" => "nexus:stdlib/process",
+        "env" => "nexus:stdlib/environment",
+        "clock" => "nexus:stdlib/clock",
+        "random" => "nexus:stdlib/random",
+        "char" => "nexus:stdlib/string-ops",
+        "bytebuffer" => "nexus:stdlib/bytebuffer",
+        "hashmap" | "stringmap" | "set" | "array" => "nexus:stdlib/collections",
+        _ => return None,
+    };
+    Some(wit.to_string())
 }

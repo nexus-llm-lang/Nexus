@@ -109,15 +109,31 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
     })
 }
 
+/// Normalize module name for memory sharing: all `nexus:stdlib/*` WIT interfaces
+/// share the same underlying stdlib.wasm memory, so they count as one module.
+fn normalize_module_for_memory(module: &str) -> &str {
+    if module.starts_with("nexus:stdlib/") {
+        "nexus:stdlib/*"
+    } else {
+        module
+    }
+}
+
 fn choose_memory_mode(
     program: &LirProgram,
     has_string_literals: bool,
     object_heap_enabled: bool,
 ) -> Result<MemoryMode, CodegenError> {
     let mut modules_with_string_abi = HashSet::new();
+    // Pick the first actual module name (not normalized) for the import.
+    let mut first_stdlib_module: Option<Symbol> = None;
     for ext in &program.externals {
         if external_uses_string_abi(ext) {
-            modules_with_string_abi.insert(ext.wasm_module.clone());
+            let normalized = normalize_module_for_memory(ext.wasm_module.as_ref());
+            modules_with_string_abi.insert(normalized.to_string());
+            if first_stdlib_module.is_none() && normalized == "nexus:stdlib/*" {
+                first_stdlib_module = Some(ext.wasm_module.clone());
+            }
         }
     }
 
@@ -130,8 +146,16 @@ fn choose_memory_mode(
     }
 
     if let Some(module) = modules_with_string_abi.into_iter().next() {
+        // Use the actual WIT module name (not the normalized key) for the import.
+        let import_module = if module == "nexus:stdlib/*" {
+            first_stdlib_module
+                .map(|s| s.to_string())
+                .unwrap_or(module)
+        } else {
+            module
+        };
         return Ok(MemoryMode::Imported {
-            module: module.to_string(),
+            module: import_module,
         });
     }
 

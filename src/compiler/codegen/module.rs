@@ -38,7 +38,7 @@ pub fn compile_lir_to_wasm(
         program
             .externals
             .iter()
-            .find(|ext| ext.wasm_module.ends_with("stdlib.wasm"))
+            .find(|ext| is_stdlib_module(ext.wasm_module.as_ref()))
             .map(|ext| ext.wasm_module.to_string())
     } else {
         None
@@ -810,6 +810,13 @@ fn uleb128_encoded_size(mut val: u64) -> usize {
         }
     }
     size
+}
+
+/// Check if a WASM module name refers to the stdlib bundle.
+/// Matches both legacy file-path (`nxlib/stdlib/stdlib.wasm`) and
+/// WIT-style (`nexus:stdlib/math`, `nexus:stdlib/string-ops`, etc.) names.
+fn is_stdlib_module(module: &str) -> bool {
+    module.ends_with("stdlib.wasm") || module.starts_with("nexus:stdlib/")
 }
 
 /// Check if any catch body in the program uses the backtrace runtime
