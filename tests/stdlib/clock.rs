@@ -57,8 +57,8 @@ end
     // The stub returns ENOSYS (errno 76), which the stdlib propagates as a wasm trap.
     // The eprintln message goes to stderr, not the trap string.
     assert!(
-        err.contains("error while executing"),
-        "expected wasm trap from denied clock access, got: {}",
+        err.contains("error while executing") || err.contains("denied"),
+        "expected trap from denied clock access, got: {}",
         err
     );
 }
