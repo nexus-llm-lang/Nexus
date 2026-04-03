@@ -1,15 +1,22 @@
 use nexus::compiler::compose;
 use nexus::runtime::backtrace;
+use nexus::runtime::ExecutionCapabilities;
 use std::sync::Arc;
-use wasmtime::{Engine, Linker, Module, Store};
+use std::time::Duration;
+use wasmtime::{Engine, Linker, Module, Store, WasmBacktrace};
 use wasmtime_wasi::{DirPerms, FilePerms, ResourceTable, WasiCtxBuilder};
 
 // ---------------------------------------------------------------------------
 // Shared Engine cache
 // ---------------------------------------------------------------------------
 
+use std::cell::RefCell;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+
+thread_local! {
+    static COMPONENT_BT_FRAMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
 
 static SHARED_ENGINE: LazyLock<Engine> = LazyLock::new(|| {
     let mut config = wasmtime::Config::new();
@@ -129,29 +136,92 @@ impl wasmtime_wasi::WasiView for WasiState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Denying WASI subsystem implementations (Approach B)
+// ---------------------------------------------------------------------------
+
+/// Clock implementation that traps on any access.
+struct DenyingClock;
+impl wasmtime_wasi::HostWallClock for DenyingClock {
+    fn resolution(&self) -> Duration {
+        panic!("clock access denied by capability enforcement")
+    }
+    fn now(&self) -> Duration {
+        panic!("clock access denied by capability enforcement")
+    }
+}
+impl wasmtime_wasi::HostMonotonicClock for DenyingClock {
+    fn resolution(&self) -> u64 {
+        panic!("clock access denied by capability enforcement")
+    }
+    fn now(&self) -> u64 {
+        panic!("clock access denied by capability enforcement")
+    }
+}
+
+/// Build a WasiCtx that traps on denied capabilities.
+fn build_wasi_ctx(caps: &ExecutionCapabilities) -> wasmtime_wasi::WasiCtx {
+    let mut builder = WasiCtxBuilder::new();
+    if caps.allow_console {
+        builder.inherit_stdio();
+    }
+    if caps.allow_fs {
+        let _ = builder.preopened_dir(".", ".", DirPerms::all(), FilePerms::all());
+    }
+    if !caps.allow_clock {
+        builder.wall_clock(DenyingClock);
+        builder.monotonic_clock(DenyingClock);
+    }
+    if !caps.allow_random {
+        builder.secure_random(DenyingRandom);
+        builder.insecure_random(DenyingRandom);
+    }
+    builder.build()
+}
+
+/// RNG that traps on any access.
+struct DenyingRandom;
+impl wasmtime_wasi::RngCore for DenyingRandom {
+    fn next_u32(&mut self) -> u32 {
+        panic!("random access denied by capability enforcement")
+    }
+    fn next_u64(&mut self) -> u64 {
+        panic!("random access denied by capability enforcement")
+    }
+    fn fill_bytes(&mut self, _dest: &mut [u8]) {
+        panic!("random access denied by capability enforcement")
+    }
+    fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        panic!("random access denied by capability enforcement")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Component model execution
+// ---------------------------------------------------------------------------
+
 /// Execute main() -> () with stdlib via component model composition.
-/// The user core WASM is composed with stdlib-component into a single
-/// component, then run with wasmtime's component model runtime.
 pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
     let composed = compose::compose_with_stdlib(wasm)
         .map_err(|e| format!("composition failed: {}", e))?;
-    run_composed_component(&composed)
+    run_composed_component(&composed, &ExecutionCapabilities::allow_all())
 }
 
 /// Execute main() -> () with stdlib and custom capability enforcement.
 pub fn run_main_with_deps_caps(
     wasm: &[u8],
-    _caps: nexus::runtime::ExecutionCapabilities,
+    caps: ExecutionCapabilities,
 ) -> Result<(), String> {
-    // TODO: enforce capabilities on the component model path.
-    // For now, compose and run without enforcement.
     let composed = compose::compose_with_stdlib(wasm)
         .map_err(|e| format!("composition failed: {}", e))?;
-    run_composed_component(&composed)
+    run_composed_component(&composed, &caps)
 }
 
 /// Run a pre-composed component WASM, providing WASI imports.
-fn run_composed_component(component_wasm: &[u8]) -> Result<(), String> {
+fn run_composed_component(
+    component_wasm: &[u8],
+    caps: &ExecutionCapabilities,
+) -> Result<(), String> {
     let engine = &*SHARED_ENGINE;
     let component = wasmtime::component::Component::from_binary(engine, component_wasm)
         .map_err(|e| format!("failed to load component: {}", e))?;
@@ -161,25 +231,35 @@ fn run_composed_component(component_wasm: &[u8]) -> Result<(), String> {
     define_component_nexus_host_stubs(&mut linker)?;
     define_component_runtime_stubs(&mut linker)?;
 
-    let mut builder = WasiCtxBuilder::new();
-    builder.inherit_stdio();
-    let _ = builder.preopened_dir(".", ".", DirPerms::all(), FilePerms::all());
     let state = WasiState {
-        ctx: builder.build(),
+        ctx: build_wasi_ctx(caps),
         table: ResourceTable::new(),
     };
     let mut store = Store::new(engine, state);
 
-    let instance = linker
-        .instantiate(&mut store, &component)
-        .map_err(|e| format!("instantiation failed: {}", e))?;
-
-    // The composed component exports `main` as a top-level function.
-    let main = instance
-        .get_typed_func::<(), ()>(&mut store, "main")
-        .map_err(|e| format!("failed to get main export: {}", e))?;
-
-    main.call(&mut store, ()).map_err(|e| format!("{:#}", e))
+    // Wrap instantiation + execution in catch_unwind: denying WASI subsystems
+    // panic from host functions when denied capabilities are accessed.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let instance = linker
+            .instantiate(&mut store, &component)
+            .map_err(|e| format!("instantiation failed: {:#}", e))?;
+        let main = instance
+            .get_typed_func::<(), ()>(&mut store, "main")
+            .map_err(|e| format!("failed to get main export: {}", e))?;
+        main.call(&mut store, ()).map_err(|e| format!("{:#}", e))
+    })) {
+        Ok(result) => result,
+        Err(panic) => {
+            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic in WASM execution".to_string()
+            };
+            Err(msg)
+        }
+    }
 }
 
 /// Define stub (no-op / trapping) implementations for nexus:cli/nexus-host
@@ -233,14 +313,29 @@ fn define_component_nexus_host_stubs(
 fn define_component_runtime_stubs(
     linker: &mut wasmtime::component::Linker<WasiState>,
 ) -> Result<(), String> {
-    // Backtrace stubs — no-op capture, always 0 depth/frames.
+    // Backtrace — real stack capture via WasmBacktrace::capture.
     {
         let mut inst = linker
             .instance("nexus:runtime/backtrace")
             .map_err(|e| format!("failed to create backtrace instance: {}", e))?;
         inst.func_wrap(
             "capture-backtrace",
-            |_: wasmtime::StoreContextMut<'_, WasiState>, (): ()| -> wasmtime::Result<()> {
+            |ctx: wasmtime::StoreContextMut<'_, WasiState>, (): ()| -> wasmtime::Result<()> {
+                let bt = WasmBacktrace::capture(&ctx);
+                let frames: Vec<String> = bt
+                    .frames()
+                    .iter()
+                    .filter_map(|f| {
+                        f.func_name().map(|name| {
+                            if let Some(idx) = name.find("_.") {
+                                name[idx + 2..].to_string()
+                            } else {
+                                name.to_string()
+                            }
+                        })
+                    })
+                    .collect();
+                COMPONENT_BT_FRAMES.with(|f| *f.borrow_mut() = frames);
                 Ok(())
             },
         )
@@ -248,7 +343,7 @@ fn define_component_runtime_stubs(
         inst.func_wrap(
             "bt-depth",
             |_: wasmtime::StoreContextMut<'_, WasiState>, (): ()| -> wasmtime::Result<(i64,)> {
-                Ok((0,))
+                Ok((COMPONENT_BT_FRAMES.with(|f| f.borrow().len() as i64),))
             },
         )
         .map_err(|e| e.to_string())?;
@@ -256,7 +351,11 @@ fn define_component_runtime_stubs(
             "bt-frame",
             |_: wasmtime::StoreContextMut<'_, WasiState>,
              (_idx,): (i64,)|
-             -> wasmtime::Result<(i64,)> { Ok((0,)) },
+             -> wasmtime::Result<(i64,)> {
+                // Return 0 — frame name retrieval requires writing into WASM memory,
+                // which isn't feasible from a component host function.
+                Ok((0,))
+            },
         )
         .map_err(|e| e.to_string())?;
     }

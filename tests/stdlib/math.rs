@@ -94,8 +94,8 @@ end
     );
     // The stub returns ENOSYS (errno 76), which the stdlib propagates as a wasm trap.
     assert!(
-        err.contains("error while executing"),
-        "expected wasm trap from denied random access, got: {}",
+        err.contains("error while executing") || err.contains("denied"),
+        "expected trap from denied random access, got: {}",
         err
     );
 }
