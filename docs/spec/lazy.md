@@ -1,25 +1,22 @@
 ---
 layout: default
-title: Lazy Evaluation, Concurrency, and Parallelism
+title: Lazy Evaluation
 ---
 
-# Lazy Evaluation, Concurrency, and Parallelism
+# Lazy Evaluation (`@`)
 
-Nexus has two mechanisms for deferred computation: **lazy thunks** (`@`) for concurrency (structuring work that can be deferred) and **`conc` blocks** for parallelism (executing work simultaneously on multiple threads). Both share the same foundation — closure conversion with linearity constraints — but serve different purposes.
+The `@` sigil introduces call-by-need semantics. A lazy binding wraps its expression in a zero-argument thunk — a closure that is evaluated only when forced.
 
-- **Concurrency** (lazy): *structuring* independent computations. A lazy thunk defers an expression; when and whether it runs is decided by the consumer. This is concurrency in the sense of decoupling definition from execution.
-- **Parallelism** (conc): *simultaneously executing* independent computations. Each `conc` task runs on a separate OS thread. This is true data parallelism.
+Lazy thunks are the concurrency primitive in Nexus: they decouple *definition* of a computation from its *execution*. The thunk decides *what* to compute; the force site decides *when*.
 
-## Lazy Thunks (`@`)
-
-### Syntax
+## Syntax
 
 ```nexus
 let @x: string = expensive_computation()  // creates thunk, NOT evaluated
 let result = @x                            // forces thunk, evaluates now
 ```
 
-### Desugaring
+## Desugaring
 
 `let @x: T = expr` desugars to:
 
@@ -31,7 +28,7 @@ let x = fn () -> T do return expr end
 
 Type annotation is recommended. Without it, the thunk return type defaults to `i64`.
 
-### Lazy Type (`@T`)
+## Lazy Type (`@T`)
 
 The type `@T` represents a suspended computation producing `T` when forced:
 
@@ -39,7 +36,7 @@ The type `@T` represents a suspended computation producing `T` when forced:
 let delayed: @string = @("hello" ++ " world")
 ```
 
-### Lazy Parameters
+## Lazy Parameters
 
 Function parameters can use the `@` sigil for call-by-need argument passing:
 
@@ -53,88 +50,9 @@ The caller's argument expression is wrapped in a thunk automatically. The functi
 
 **Note**: The nxc self-hosting compiler does not yet support `@` in call-site argument labels.
 
-## Parallelism (`conc`)
+## Linearity Constraint
 
-### Syntax
-
-```nexus
-conc do
-  task fetch_data do
-    let data = Net.get(url: api_url)
-  end
-  task write_log do
-    Logger.info(msg: "fetching started")
-  end
-end
-```
-
-Tasks execute in parallel on OS-level threads. The `conc` block joins all tasks before continuing.
-
-### Task Semantics
-
-- Each task runs in its own thread with **isolated linear memory**
-- Free variables from the enclosing scope are captured and serialized to the task's heap
-- Mutable (`~`) bindings cannot be captured (gravity rule)
-- Linear (`%`) bindings transfer ownership into the task
-- Tasks share the same WASI capabilities as the parent
-
-### Variable Capture
-
-Tasks capture free variables by value. The compiler performs closure conversion to serialize captured values across thread boundaries:
-
-```nexus
-let name = "world"
-conc do
-  task greet do
-    // `name` is captured by value — copied to the task's heap
-    Console.println(val: "hello " ++ name)
-  end
-end
-```
-
-Mutable references cannot cross task boundaries because they violate thread isolation:
-
-```nexus
-let ~counter = 0
-conc do
-  task inc do
-    // ERROR: cannot capture ~counter in conc task
-    ~counter <- ~counter + 1
-  end
-end
-```
-
-### Exception Propagation
-
-Exceptions raised inside a `conc` task propagate to the join point. If multiple tasks raise, the first exception is propagated. [Exception groups](../exception-groups) work across task boundaries:
-
-```nexus
-try
-  conc do
-    task risky do
-      raise NotFound(path: "/tmp/missing")
-    end
-  end
-catch
-  case IOError ->
-    // catches NotFound from the task
-    Console.eprintln(val: "IO error in task")
-end
-```
-
-## Shared Foundation: Closures and Linearity
-
-Lazy thunks and conc tasks are both closures under the hood. The same linearity rules apply:
-
-| Constraint | Lazy thunk (`@`) | Conc task |
-|---|---|---|
-| Capture immutable | yes (by value) | yes (serialized) |
-| Capture mutable (`~`) | yes (but makes thunk linear) | no (gravity rule) |
-| Capture linear (`%`) | yes (transfers ownership) | yes (transfers ownership) |
-| Must consume | exactly once, on every path | always (join is implicit) |
-| Cross-thread sharing | no (linear closure) | n/a (each task is independent) |
-
-A lazy thunk must be forced on every execution path — conditional forcing violates linearity:
+Lazy thunks are closures. Closures that capture variables are subject to linearity rules — a thunk must be consumed (forced) on **every** execution path:
 
 ```nexus
 // OK: thunk always forced
@@ -146,17 +64,8 @@ let @msg: string = "result: " ++ from_i64(val: n)
 if verbose then Console.println(val: @msg) end
 ```
 
-Lazy thunks can be created inside task bodies for deferred initialization, but cannot be shared across task boundaries — serializing a closure would break linearity guarantees:
-
-```nexus
-conc do
-  task process do
-    let @config: string = load_config()  // OK: created inside task
-    run_with(config: @config)
-  end
-end
-```
+Lazy thunks work for unconditionally-evaluated deferred computation. For conditionally-skipped work, use plain `if/then` guards instead.
 
 ---
 
-See also: [Exception Groups](../exception-groups), [Types](../types), [Syntax](../syntax)
+See also: [Types](../types), [Syntax](../syntax)
