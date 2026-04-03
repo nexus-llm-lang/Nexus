@@ -15,19 +15,26 @@ use crate::ir::lir::{LirAtom, LirExpr, LirFunction, LirProgram, LirStmt, SwitchC
 use crate::types::{BinaryOp, Type};
 
 /// Run all LIR optimization passes on the program (mutates in place).
+/// When `parallel_lazy` is true, consecutive zero-arg forces are converted to
+/// LazySpawn/LazyJoin pairs for parallel evaluation. Set to false for targets
+/// that don't provide the `nexus:runtime/lazy` host module (e.g. component WASM).
 pub fn optimize_lir(program: &mut LirProgram) {
+    optimize_lir_with_opts(program, true);
+}
+
+pub fn optimize_lir_with_opts(program: &mut LirProgram, parallel_lazy: bool) {
     // Phase 0: Program-level function inlining (before per-function passes)
     inline_small_functions(program);
 
     for func in &mut program.functions {
-        optimize_function(func);
+        optimize_function(func, parallel_lazy);
     }
 
     // Phase 7: Identical code folding (after all per-function optimizations)
     fold_identical_functions(program);
 }
 
-fn optimize_function(func: &mut LirFunction) {
+fn optimize_function(func: &mut LirFunction, parallel_lazy: bool) {
     // 1. Recognize IfReturn chains from match lowering → Switch nodes
     recognize_switches_in_stmts(&mut func.body);
     // 1.5. Known-call devirtualization: FuncRef(f) + CallIndirect → Call(f)
@@ -60,7 +67,10 @@ fn optimize_function(func: &mut LirFunction) {
     strip_unreachable_stmts(&mut func.body);
     // 6. Lazy parallelization: convert consecutive zero-arg CallIndirect (force) into
     //    LazySpawn/LazyJoin pairs for parallel evaluation.
-    parallelize_consecutive_forces(&mut func.body);
+    //    Only enabled when the target provides nexus:runtime/lazy host functions.
+    if parallel_lazy {
+        parallelize_consecutive_forces(&mut func.body);
+    }
 }
 
 /// Collect names that are bound by Let more than once (across all nested scopes).

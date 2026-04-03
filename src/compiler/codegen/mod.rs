@@ -18,7 +18,7 @@ use wasm_encoder::{CustomSection, Module, ValType};
 
 use super::passes::hir_build::{build_hir, HirBuildError};
 use super::passes::lir_lower::{lower_mir_to_lir, LirLowerError};
-use super::passes::lir_opt::optimize_lir;
+use super::passes::lir_opt::optimize_lir_with_opts;
 use crate::constants::{Permission, ENTRYPOINT, NEXUS_CAPABILITIES_SECTION};
 use crate::lang::ast::Program;
 use crate::types::Type;
@@ -77,7 +77,7 @@ pub fn compile_program_to_wasm_with_metrics(
     let lir_lower = t.elapsed();
 
     let t = Instant::now();
-    optimize_lir(&mut lir);
+    optimize_lir_with_opts(&mut lir, false);
     let optimize = t.elapsed();
 
     let t = Instant::now();
@@ -115,7 +115,7 @@ pub fn compile_program_to_wasm_with_dwarf(program: &Program) -> Result<Vec<u8>, 
     let caps = extract_main_require_ports_from_ast(program);
     let mir = build_hir(program).map_err(CompileError::HirBuild)?;
     let mut lir = lower_mir_to_lir(&mir, &mir.enum_defs).map_err(CompileError::LirLower)?;
-    optimize_lir(&mut lir);
+    optimize_lir_with_opts(&mut lir, false);
     let (mut wasm, debug_entries) = compile_lir_to_wasm(&lir).map_err(CompileError::Codegen)?;
     if !caps.is_empty() {
         append_capabilities_section(&mut wasm, &caps);
