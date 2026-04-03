@@ -674,6 +674,8 @@ fn collect_refs_in_expr(expr: &LirExpr, refs: &mut HashSet<Symbol>) {
                 collect_refs_in_atom(a, refs);
             }
         }
+        LirExpr::LazySpawn { thunk, .. } => collect_refs_in_atom(thunk, refs),
+        LirExpr::LazyJoin { task_id, .. } => collect_refs_in_atom(task_id, refs),
     }
 }
 
@@ -1011,6 +1013,33 @@ pub(super) fn compile_expr(
                 type_index,
                 table_index: 0,
             });
+            Ok(())
+        }
+        LirExpr::LazySpawn {
+            thunk,
+            num_captures,
+            ..
+        } => {
+            // __nx_lazy_spawn(thunk_ptr: i64, num_captures: i32) -> i64
+            let spawn_idx = layout
+                .lazy_spawn_func_idx
+                .ok_or_else(|| CodegenError::CallTargetNotFound {
+                    name: "__nx_lazy_spawn".to_string(),
+                })?;
+            compile_atom(thunk, out, local_map, layout)?;
+            out.instruction(&Instruction::I32Const(*num_captures as i32));
+            out.instruction(&Instruction::Call(spawn_idx));
+            Ok(())
+        }
+        LirExpr::LazyJoin { task_id, .. } => {
+            // __nx_lazy_join(task_id: i64) -> i64
+            let join_idx = layout
+                .lazy_join_func_idx
+                .ok_or_else(|| CodegenError::CallTargetNotFound {
+                    name: "__nx_lazy_join".to_string(),
+                })?;
+            compile_atom(task_id, out, local_map, layout)?;
+            out.instruction(&Instruction::Call(join_idx));
             Ok(())
         }
     }

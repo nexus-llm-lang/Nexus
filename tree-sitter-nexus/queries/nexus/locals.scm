@@ -7,9 +7,6 @@
 (if_stmt) @local.scope
 (match_case) @local.scope
 (try_stmt) @local.scope
-(conc_stmt) @local.scope
-(task_def) @local.scope
-
 ; ─── Definitions ────────────────────────────────────────────────────────────
 
 (let_stmt

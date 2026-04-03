@@ -356,7 +356,6 @@ export default grammar({
         $.for_stmt,
         $.try_stmt,
         $.inject_stmt,
-        $.conc_stmt,
         $.line_comment,
         $.block_comment,
         $.expr_stmt
@@ -489,19 +488,6 @@ export default grammar({
       seq(
         $.identifier,
         optional(seq(".", $.identifier))
-      ),
-
-    // conc do task "name" do stmts end ... end
-    conc_stmt: ($) => seq("conc", "do", repeat($.task_def), "end"),
-
-    task_def: ($) =>
-      seq(
-        "task",
-        field("name", $.identifier),
-        optional(seq("throws", field("throws", $._effect_type))),
-        "do",
-        field("body", repeat($._stmt)),
-        "end"
       ),
 
     // let pattern = expr  (destructuring)

@@ -316,5 +316,7 @@ pub(super) fn expr_type(expr: &LirExpr) -> Type {
         LirExpr::Closure { typ, .. } => typ.clone(),
         LirExpr::ClosureEnvLoad { typ, .. } => typ.clone(),
         LirExpr::CallIndirect { typ, .. } => typ.clone(),
+        LirExpr::LazySpawn { typ, .. } => typ.clone(),
+        LirExpr::LazyJoin { typ, .. } => typ.clone(),
     }
 }

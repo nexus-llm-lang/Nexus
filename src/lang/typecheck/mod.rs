@@ -1158,6 +1158,7 @@ impl TypeChecker {
                 let key = s.get_key(n);
                 if let Some(sch) = env.get(&key).cloned() {
                     let mut t = self.instantiate(&sch);
+                    let was_lazy = matches!(t, Type::Lazy(_));
                     match s {
                         Sigil::Mutable => {
                             if let Type::Ref(i) = t {
@@ -1171,7 +1172,8 @@ impl TypeChecker {
                         }
                         _ => {}
                     }
-                    if env.contains_linear_type(&t) {
+                    // @T is always linear (one-shot continuation), consume regardless of inner type
+                    if was_lazy || env.contains_linear_type(&t) {
                         env.consume(&key)
                             .map_err(|m| TypeError::new(m, e.span.clone()))?;
                     }

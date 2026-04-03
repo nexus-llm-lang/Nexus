@@ -27,6 +27,9 @@ const OBJECT_HEAP_GLOBAL_INDEX: u32 = 0;
 const ALLOCATE_WASM_NAME: &str = "allocate";
 const BT_MODULE: &str = "nexus:runtime/backtrace";
 const BT_CAPTURE_NAME: &str = "__nx_capture_backtrace";
+const LAZY_MODULE: &str = "nexus:runtime/lazy";
+const LAZY_SPAWN_NAME: &str = "__nx_lazy_spawn";
+const LAZY_JOIN_NAME: &str = "__nx_lazy_join";
 
 #[derive(Debug, Clone, Copy)]
 struct LocalInfo {

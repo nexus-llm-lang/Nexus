@@ -44,6 +44,10 @@ pub(super) struct CodegenLayout {
     pub(super) funcref_table_indices: HashMap<Symbol, u32>,
     /// Map from WASM signature key (params+results) to type index for call_indirect
     pub(super) indirect_type_indices: HashMap<String, u32>,
+    /// Index of imported __nx_lazy_spawn function
+    pub(super) lazy_spawn_func_idx: Option<u32>,
+    /// Index of imported __nx_lazy_join function
+    pub(super) lazy_join_func_idx: Option<u32>,
 }
 
 pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout, CodegenError> {
@@ -100,6 +104,8 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
         capture_bt_func_idx: None,
         funcref_table_indices: HashMap::new(),
         indirect_type_indices: HashMap::new(),
+        lazy_spawn_func_idx: None,
+        lazy_join_func_idx: None,
     })
 }
 
@@ -346,6 +352,8 @@ fn collect_strings_in_expr(expr: &LirExpr, out: &mut Vec<String>) {
                 collect_strings_in_atom(atom, out);
             }
         }
+        LirExpr::LazySpawn { thunk, .. } => collect_strings_in_atom(thunk, out),
+        LirExpr::LazyJoin { task_id, .. } => collect_strings_in_atom(task_id, out),
     }
 }
 

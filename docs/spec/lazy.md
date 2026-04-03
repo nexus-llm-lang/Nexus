@@ -160,10 +160,15 @@ Only the `@` sigil is built into the language. Combinators are provided as stdli
 
 ## Current Implementation Status
 
-The `@` sigil is partially implemented:
-- **Implemented**: `let @x = expr` (thunk creation), `@x` (force), `@T` type, linearity checking
-- **Current desugaring**: Thunks compile to zero-argument closures (sequential `call_indirect`)
-- **Not yet implemented**: DAG parallel evaluation, runtime host functions (`__nx_lazy_race` etc.), `stdlib/lazy.nx`
+The `@` sigil is fully implemented:
+- **Thunk creation**: `let @x = expr` — desugars to zero-argument closures
+- **Force**: `@x` — evaluates and consumes the thunk (one-shot)
+- **Type system**: `@T` tracked as linear; unconsumed `@T` is a compile error (including primitives like `@i64`)
+- **Bare-name access**: `x` (without `@`) references the thunk without forcing — enables `cancel(a: x)` / `detach(a: x)`
+- **Closure linearization**: Capturing `@x` in a closure makes the closure linear
+- **DAG parallel evaluation**: Compiler detects 2+ consecutive forces and emits `LazySpawn`/`LazyJoin` for parallel execution via OS threads
+- **Runtime**: `nexus:runtime/lazy` host module with `__nx_lazy_spawn(thunk, num_captures) -> task_id` and `__nx_lazy_join(task_id) -> result`
+- **stdlib/lazy.nx**: `race`, `cancel`, `detach`, `force_all` combinators
 
 ---
 

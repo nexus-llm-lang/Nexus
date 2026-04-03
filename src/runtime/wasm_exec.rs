@@ -1,5 +1,6 @@
 use crate::constants::*;
 use crate::runtime::backtrace;
+use crate::runtime::lazy;
 use crate::runtime::net_host;
 use crate::runtime::ExecutionCapabilities;
 use std::path::{Path, PathBuf};
@@ -207,6 +208,7 @@ fn run_core_wasm_bytes_inner(
     };
 
     let has_bt = backtrace::needs_bt_runtime(wasm);
+    let has_lazy = lazy::needs_lazy_runtime(wasm);
 
     let mut linker = Linker::<wasmtime_wasi::p1::WasiP1Ctx>::new(&engine);
     if let Err(e) = wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx) {
@@ -242,6 +244,13 @@ fn run_core_wasm_bytes_inner(
             return ExitCode::from(1);
         }
     }
+    if has_lazy {
+        lazy::reset();
+        if let Err(e) = lazy::add_lazy_to_linker(&mut linker) {
+            eprintln!("Failed to add lazy runtime to linker: {}", e);
+            return ExitCode::from(1);
+        }
+    }
 
     let mut imported_modules = module
         .imports()
@@ -250,12 +259,17 @@ fn run_core_wasm_bytes_inner(
     imported_modules.sort();
     imported_modules.dedup();
 
+    let mut dep_modules_for_lazy: Vec<(String, Module)> = Vec::new();
+
     for module_name in imported_modules {
         if module_name == WASI_SNAPSHOT_MODULE {
             continue;
         }
         if module_name == backtrace::BT_HOST_MODULE {
             continue; // handled by backtrace linker
+        }
+        if module_name == lazy::LAZY_HOST_MODULE {
+            continue; // handled by lazy linker
         }
         if module_name == NEXUS_HOST_HTTP_MODULE {
             continue; // handled by net_host linker
@@ -300,6 +314,13 @@ fn run_core_wasm_bytes_inner(
             eprintln!("Failed to link dependency module '{}': {}", module_name, e);
             return ExitCode::from(1);
         }
+        if has_lazy {
+            dep_modules_for_lazy.push((module_name.clone(), dep));
+        }
+    }
+
+    if has_lazy {
+        lazy::setup_lazy_runtime(engine.clone(), module.clone(), dep_modules_for_lazy);
     }
 
     let instance = match linker.instantiate(&mut store, &module) {

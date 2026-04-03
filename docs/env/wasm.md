@@ -213,7 +213,6 @@ Return values use the same types as internal functions (strings return as packed
 | `main` | function | Always (entry point) |
 | `wasi:cli/run@0.2.6#run` | function | Always (WASI run command) |
 | `memory` | memory | If memory is defined or imported |
-| `__conc_<name>` | function | If program uses `conc` blocks |
 
 #### Imports
 
@@ -221,8 +220,8 @@ Return values use the same types as internal functions (strings return as packed
 |---|---|---|
 | `<module>.wasm` | `<wasm_name>` | Each `external` binding |
 | stdlib module | `allocate` | If objects + stdlib present |
-| `nexus:runtime/conc` | `__nx_conc_spawn`, `__nx_conc_join` | If `conc` blocks present |
-| `nexus:runtime/backtrace` | `__nx_bt_push`, `__nx_bt_pop`, `__nx_bt_freeze` | If `raise`/`try` present |
+| `nexus:runtime/backtrace` | `__nx_capture_backtrace` | If `raise`/`try` with backtrace |
+| `nexus:runtime/lazy` | `__nx_lazy_spawn`, `__nx_lazy_join` | If DAG-parallel `@` forces present |
 
 #### Custom Sections
 
