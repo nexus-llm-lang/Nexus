@@ -12,12 +12,13 @@ pub use unify::apply_subst_type;
 use capture::{collect_lambda_captures, lambda_references_name};
 use helpers::{
     check_unintroduced_type_vars, contains_exn_throws, contains_ref, contains_return,
-    default_numeric_literals, describe_ctor_field, external_scheme, extract_row_port_names,
-    get_default_alias, import_variant_by_name, is_allowed_main_require_signature,
-    is_allowed_main_throws_signature, is_auto_droppable, merge_type_rows,
-    normalize_enum_generic_params, normalize_typedef_generic_params, register_exception_variant,
-    register_nullary_variant_constructor, register_stdlib_types, select_float_type,
-    select_int_type, strip_required_port_coeffect, summarize_ctor_args, summarize_ctor_fields,
+    default_numeric_literals, describe_ctor_field, expand_exception_groups_in_throws,
+    external_scheme, extract_row_port_names, get_default_alias, import_variant_by_name,
+    is_allowed_main_require_signature, is_allowed_main_throws_signature, is_auto_droppable,
+    merge_type_rows, normalize_enum_generic_params, normalize_typedef_generic_params,
+    register_exception_variant, register_nullary_variant_constructor, register_stdlib_types,
+    select_float_type, select_int_type, strip_required_port_coeffect, summarize_ctor_args,
+    summarize_ctor_fields,
 };
 use lint::{
     collect_signature_needs_from_stmts, extract_named_row_members,
@@ -197,6 +198,15 @@ impl TypeChecker {
                                         ) {
                                             imported_any = true;
                                         }
+                                        // Import exception groups
+                                        if let Some(members) =
+                                            public_env.exception_groups.get(&item.name)
+                                        {
+                                            self.env
+                                                .exception_groups
+                                                .insert(item.name.clone(), members.clone());
+                                            imported_any = true;
+                                        }
                                         if !imported_any {
                                             return Err(TypeError::new(
                                                 format!(
@@ -288,6 +298,11 @@ impl TypeChecker {
                                 TopLevel::Exception(ex) if ex.is_public => {
                                     register_exception_variant(&mut public_env, ex, &sub_def.span)?;
                                 }
+                                TopLevel::ExceptionGroup(eg) if eg.is_public => {
+                                    public_env
+                                        .exception_groups
+                                        .insert(eg.name.clone(), eg.members.clone());
+                                }
                                 TopLevel::Let(gl) if gl.is_public => {
                                     if let Some(sch) = sub_checker.env.vars.get(&gl.name) {
                                         public_env.insert(gl.name.clone(), sch.clone());
@@ -368,6 +383,12 @@ impl TypeChecker {
                                 if import_variant_by_name(&mut self.env, &public_env, &item.name) {
                                     imported_any = true;
                                 }
+                                if let Some(members) = public_env.exception_groups.get(&item.name) {
+                                    self.env
+                                        .exception_groups
+                                        .insert(item.name.clone(), members.clone());
+                                    imported_any = true;
+                                }
                                 if !imported_any {
                                     return Err(TypeError::new(
                                         format!(
@@ -414,7 +435,27 @@ impl TypeChecker {
                 TopLevel::Exception(ex) => {
                     register_exception_variant(&mut self.env, ex, &def.span)?;
                 }
-                TopLevel::ExceptionGroup(_) => {}
+                TopLevel::ExceptionGroup(eg) => {
+                    // Validate all members are registered exception variants
+                    let exn_enum = self.env.enums.get("Exn");
+                    for member in &eg.members {
+                        let exists = exn_enum
+                            .map(|e| e.variants.iter().any(|v| v.name == *member))
+                            .unwrap_or(false);
+                        if !exists {
+                            return Err(TypeError::new(
+                                format!(
+                                    "Exception group '{}': member '{}' is not a defined exception",
+                                    eg.name, member
+                                ),
+                                def.span.clone(),
+                            ));
+                        }
+                    }
+                    self.env
+                        .exception_groups
+                        .insert(eg.name.clone(), eg.members.clone());
+                }
                 TopLevel::Port(port) => {
                     for sig in &port.functions {
                         let name = format!("{}.{}", port.name, sig.name);
@@ -483,9 +524,10 @@ impl TypeChecker {
                                         Box::new(
                                             self.convert_user_defined_to_var(requires, &vars_set),
                                         ),
-                                        Box::new(
-                                            self.convert_user_defined_to_var(throws, &vars_set),
-                                        ),
+                                        Box::new(expand_exception_groups_in_throws(
+                                            &self.convert_user_defined_to_var(throws, &vars_set),
+                                            &self.env,
+                                        )),
                                     ),
                                 },
                             );
@@ -499,6 +541,16 @@ impl TypeChecker {
                         }
                         _ => {}
                     }
+                }
+            }
+        }
+
+        // Expand exception group names in function throws annotations
+        if !self.env.exception_groups.is_empty() {
+            let group_env = self.env.clone();
+            for scheme in self.env.vars.values_mut() {
+                if let Type::Arrow(_, _, _, throws) = &mut scheme.typ {
+                    *throws = Box::new(expand_exception_groups_in_throws(throws, &group_env));
                 }
             }
         }
@@ -1862,7 +1914,8 @@ impl TypeChecker {
                     );
                 }
 
-                self.infer_body(body, &mut lambda_env, ret_type, requires, throws)?;
+                let expanded_throws = expand_exception_groups_in_throws(throws, &lambda_env);
+                self.infer_body(body, &mut lambda_env, ret_type, requires, &expanded_throws)?;
                 if !contains_return(body) && !matches!(ret_type, Type::Unit) {
                     return Err(TypeError::new(
                         "Function body has no return statement; implicit return type is Unit",
@@ -2171,6 +2224,10 @@ impl TypeChecker {
                         }
                         return Ok(subst);
                     }
+                }
+                // Check if this is an exception group name — acts as wildcard for all members
+                if env.exception_groups.contains_key(n.as_str()) {
+                    return Ok(HashMap::new());
                 }
                 Err(TypeError::new(
                     format!("Unknown ctor {}", n),

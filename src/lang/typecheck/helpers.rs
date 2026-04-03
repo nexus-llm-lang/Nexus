@@ -729,3 +729,28 @@ fn expr_contains_return(e: &Spanned<Expr>) -> bool {
         _ => false,
     }
 }
+
+/// Expand exception group names in a throws row to `Exn`.
+/// `throws { CompileError }` where CompileError is a group → `throws { Exn }`.
+pub(super) fn expand_exception_groups_in_throws(typ: &Type, env: &TypeEnv) -> Type {
+    match typ {
+        Type::Row(members, tail) => {
+            let expanded: Vec<Type> = members
+                .iter()
+                .map(|m| {
+                    if let Type::UserDefined(name, args) = m {
+                        if args.is_empty() && env.exception_groups.contains_key(name.as_str()) {
+                            Type::UserDefined("Exn".to_string(), vec![])
+                        } else {
+                            m.clone()
+                        }
+                    } else {
+                        m.clone()
+                    }
+                })
+                .collect();
+            Type::Row(expanded, tail.clone())
+        }
+        _ => typ.clone(),
+    }
+}
