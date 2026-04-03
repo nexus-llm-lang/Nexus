@@ -1,69 +1,170 @@
 ---
 layout: default
-title: Lazy Evaluation
+title: Lazy Evaluation, Concurrency, and Parallelism
 ---
 
-# Lazy Evaluation (`@`)
+# Lazy Evaluation, Concurrency, and Parallelism (`@`)
 
-The `@` sigil introduces call-by-need semantics. A lazy binding wraps its expression in a zero-argument thunk — a closure that is evaluated only when forced. Execution remains sequential; `@` controls *when* a computation runs, not *how* it's scheduled.
+The `@` sigil is Nexus's unified primitive for lazy evaluation, concurrency, and parallelism. It replaces the former `conc` block syntax with a design rooted in **one-shot delimited continuations** and **linear types**.
+
+A lazy binding `let @x = expr` suspends `expr` as an unevaluated thunk. Forcing with `@x` evaluates it. Independent thunks within a force expression are evaluated in parallel via DAG scheduling — data dependencies determine execution order, not left-to-right evaluation.
+
+## Design Rationale
+
+- **No async/await keywords**: `@` integrates into the existing sigil system (`%` linear, `&` borrow, `@` lazy) rather than adding new syntax
+- **Lazy, not eager**: Unlike JS Promises (eager evaluation, implicit error swallowing), `@` thunks are unevaluated until forced
+- **One-shot continuation**: Internally based on one-shot delimited continuations (cf. OCaml 5). Linear types guarantee single-use — no copying, no multi-shot
+- **Exception propagation**: No separate rejection channel. `raise` inside a thunk propagates via standard `try/catch` at the force site
+
+## Sigil Table
+
+| Sigil | Meaning | Evaluation | Linearity |
+|---|---|---|---|
+| (none) | Value | Eager | Non-linear |
+| `%` | Linear value | Eager | Linear |
+| `@` | Suspended computation | Lazy | Linear |
+| `&` | Borrow | — | Borrow |
 
 ## Syntax
 
 ```nexus
-let @x: string = expensive_computation()  // creates thunk, NOT evaluated
-let result = @x                            // forces thunk, evaluates now
+let @x = expensive_computation()  // creates thunk, NOT evaluated
+let result = @x                    // forces thunk, evaluates now
 ```
 
-## Desugaring
-
-`let @x: T = expr` desugars to:
-
-```nexus
-let x = fn () -> T do return expr end
-```
-
-`@x` (force) desugars to calling the thunk: `x()`.
-
-Type annotation is recommended. Without it, the thunk return type defaults to `i64`.
-
-## Lazy Type (`@T`)
-
-The type `@T` represents a suspended computation producing `T` when forced:
+`@T` is the type of a suspended computation producing `T`:
 
 ```nexus
 let delayed: @string = @("hello" ++ " world")
 ```
 
-## Lazy Parameters
+## DAG Parallel Evaluation
 
-Function parameters can use the `@` sigil for call-by-need argument passing:
+`@expr` builds a dependency DAG from the expression's AST and evaluates independent nodes in parallel:
 
 ```nexus
-let log = fn (level: i64, @msg: string) -> unit do
-  if level > 0 then Console.println(val: @msg) end
+@(f(a: x, b: y))
+//     f(a:x, b:y)    ← level 2: apply (after args resolve)
+//       / | \
+//      f   x   y      ← level 1: parallel evaluation
+```
+
+Nested calls create deeper DAGs:
+
+```nexus
+@(f(a: g(b: x)))
+//     f(a: y)         ← level 3: apply
+//       |
+//     g(b: x) → y    ← level 2: apply
+//    / |  \
+//   f   g   x         ← level 1: parallel evaluation
+```
+
+Record force `@{ a: x, b: y }` is a special case — a height-2 tree where fields are leaves evaluated in parallel. This replaces `conc` blocks:
+
+```nexus
+// Before (conc block — removed):
+conc do
+  task t1 do arr[0] <- compute1() end
+  task t2 do arr[1] <- compute2() end
+end
+
+// After (@ sigil):
+let @p1 = do arr[0] <- compute1() end
+let @p2 = do arr[1] <- compute2() end
+let _ = @{ r1: p1, r2: p2 }
+```
+
+## Linearity
+
+`@T` is inherently linear — a one-shot continuation must be consumed exactly once. Three consumption operations:
+
+| Operation | Executes? | Waits? | Use case |
+|---|---|---|---|
+| `@x` (force) | Yes | Yes | Normal evaluation |
+| `detach(a: x)` | Yes | No | Fire-and-forget |
+| `cancel(a: x)` | No | — | Discard unneeded computation |
+
+Unconsumed `@T` is a compile error. Copying is forbidden (not multi-shot).
+
+`@`'s linearity is orthogonal to the result's linearity:
+
+```nexus
+let @a = compute_string()   // @string — result is copyable
+let @b = acquire_server()   // @%Server — result is linear
+let s = @a                  // s: string (non-linear binding)
+let %srv = @b               // %srv: %Server (linear binding)
+```
+
+Capturing `@x` in a closure makes the closure itself linear:
+
+```nexus
+let @x = heavy_compute()
+let f = fn () -> i64 do @x end   // f captures @x → f is linear
+f()   // OK: consumes f
+f()   // ERROR: f already consumed
+```
+
+## Deadlock Freedom
+
+Linear types structurally prevent deadlock:
+
+1. **No forward references**: `let` bindings are sequential — a thunk cannot reference a later-defined `@` value, so simple cycles are syntactically impossible
+2. **No sharing**: `@T` is non-copyable — two thunks cannot depend on the same `@` value, so circular dependencies cannot be constructed
+3. **Acyclic DAG**: The parallel evaluation DAG is derived from the AST, which is structurally a tree (acyclic)
+
+## Data Race Freedom
+
+The existing borrow checker prevents data races during parallel force:
+
+```nexus
+let %arr = [| 0, 0 |]
+let @a = do let lock = &%arr; lock[0] <- 1 end
+let @b = do let lock = &%arr; lock[1] <- 2 end   // ERROR: %arr already borrowed
+```
+
+Shared mutable state across parallel thunks requires explicit concurrency primitives (channels, atomics).
+
+## Exception Semantics
+
+Exceptions raised inside a thunk propagate at the force site via standard `try/catch`:
+
+```nexus
+let @result = do
+  raise NotFound(path: "/missing")
+end
+
+try
+  let v = @result   // force → exception propagates here
+catch
+  case NotFound(path: p) -> handle(p: p)
 end
 ```
 
-The caller's argument expression is wrapped in a thunk automatically. The function body forces it with `@msg` only when needed.
+During parallel force (`@{ a: x, b: y }`), if one thunk raises:
+- The exception propagates at the join point
+- The other thunk's continuation is dropped (= cancelled)
+- If already running, it completes but the result is discarded
+- No resource leak — linear types guarantee cleanup
 
-**Note**: The nxc self-hosting compiler does not yet support `@` in call-site argument labels.
+## Standard Library (`stdlib/lazy.nx`)
 
-## Linearity Constraint
+Only the `@` sigil is built into the language. Combinators are provided as stdlib functions backed by runtime host functions:
 
-Lazy thunks are closures. Closures that capture variables are subject to linearity rules — a thunk must be consumed (forced) on **every** execution path:
+| Function | Signature | Description |
+|---|---|---|
+| `race` | `(a: @T, b: @T) -> T` | Returns first to complete; loser is cancelled |
+| `cancel` | `(a: @T) -> unit` | Discard without evaluating |
+| `detach` | `(a: @T) -> unit` | Start evaluation, don't wait for result |
+| `force_all` | `(tasks: [@T]) -> [T]` | Parallel force of a list |
 
-```nexus
-// OK: thunk always forced
-let @msg: string = "result: " ++ from_i64(val: n)
-Console.println(val: @msg)
+## Current Implementation Status
 
-// ERROR: thunk not consumed when verbose is false
-let @msg: string = "result: " ++ from_i64(val: n)
-if verbose then Console.println(val: @msg) end
-```
-
-Lazy thunks work for unconditionally-evaluated deferred computation. For conditionally-skipped work, use plain `if/then` guards instead.
+The `@` sigil is partially implemented:
+- **Implemented**: `let @x = expr` (thunk creation), `@x` (force), `@T` type, linearity checking
+- **Current desugaring**: Thunks compile to zero-argument closures (sequential `call_indirect`)
+- **Not yet implemented**: DAG parallel evaluation, runtime host functions (`__nx_lazy_race` etc.), `stdlib/lazy.nx`
 
 ---
 
-See also: [Types](../types), [Syntax](../syntax)
+See also: [Exception Groups](../exception-groups), [Types](../types), [Syntax](../syntax)
