@@ -99,7 +99,7 @@ impl TypeEnv {
 
     fn contains_linear_type_inner(&self, typ: &Type, visiting: &mut HashSet<String>) -> bool {
         match typ {
-            Type::Linear(_) | Type::Array(_) => true,
+            Type::Linear(_) | Type::Lazy(_) | Type::Array(_) => true,
             Type::Borrow(_) => false,
             Type::Ref(inner) => self.contains_linear_type_inner(inner, visiting),
             Type::Arrow(_, _, _, _) => false,
@@ -173,7 +173,7 @@ impl TypeEnv {
         // %name → try name (linear param stored without sigil prefix)
         if let Some(stripped) = name.strip_prefix('%') {
             if let Some(scheme) = self.vars.get(stripped) {
-                if matches!(&scheme.typ, crate::types::Type::Linear(_)) {
+                if matches!(&scheme.typ, crate::types::Type::Linear(_) | crate::types::Type::Lazy(_)) {
                     return Some(scheme);
                 }
             }
@@ -182,7 +182,7 @@ impl TypeEnv {
         if !name.starts_with('%') && !name.starts_with('&') && !name.starts_with('~') {
             let linear_key = format!("%{}", name);
             if let Some(scheme) = self.vars.get(&linear_key) {
-                if matches!(&scheme.typ, crate::types::Type::Linear(_)) {
+                if matches!(&scheme.typ, crate::types::Type::Linear(_) | crate::types::Type::Lazy(_)) {
                     return Some(scheme);
                 }
             }

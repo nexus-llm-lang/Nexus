@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use wasmtime::{Caller, Linker, Memory, MemoryType, WasmBacktrace};
 
-use super::conc::imports_module;
+use super::net_host::imports_module;
 
 pub const BT_HOST_MODULE: &str = "nexus:runtime/backtrace";
 

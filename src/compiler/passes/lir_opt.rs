@@ -118,7 +118,6 @@ fn count_let_bindings(stmts: &[LirStmt], counts: &mut HashMap<Symbol, u32>) {
                 }
                 count_let_bindings(default_body, counts);
             }
-            LirStmt::Conc { .. } => {}
         }
     }
 }
@@ -216,7 +215,7 @@ fn recurse_switch_recognition(stmt: &mut LirStmt) {
             }
             recognize_switches_in_stmts(default_body);
         }
-        LirStmt::Let { .. } | LirStmt::Conc { .. } => {}
+        LirStmt::Let { .. } => {}
     }
 }
 
@@ -407,7 +406,6 @@ fn constant_fold_stmt(stmt: &mut LirStmt) {
             }
             constant_fold_stmts(default_body);
         }
-        LirStmt::Conc { .. } => {}
     }
 }
 
@@ -575,7 +573,7 @@ fn eliminate_constant_branches(stmts: &mut Vec<LirStmt>) {
                 }
                 eliminate_constant_branches(default_body);
             }
-            LirStmt::Let { .. } | LirStmt::Conc { .. } => {}
+            LirStmt::Let { .. } => {}
         }
 
         // Now check if this stmt has a constant condition
@@ -678,13 +676,6 @@ fn copy_propagate_stmt(
                 subst_atom(ret, subst);
             }
         }
-        LirStmt::Conc { tasks } => {
-            for task in tasks {
-                for (_, arg) in &mut task.args {
-                    subst_atom(arg, subst);
-                }
-            }
-        }
         LirStmt::Loop {
             cond_stmts,
             cond,
@@ -741,7 +732,7 @@ fn subst_expr(expr: &mut LirExpr, subst: &HashMap<Symbol, LirAtom>) {
         LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } => {
             subst_atom(value, subst);
         }
-        LirExpr::Raise { value, .. } => subst_atom(value, subst),
+        LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => subst_atom(value, subst),
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::Closure { captures, .. } => {
             for (_, cap) in captures {
@@ -834,13 +825,6 @@ fn count_uses_in_stmt(stmt: &LirStmt, uses: &mut HashMap<Symbol, u32>) {
                 count_uses_in_atom(ret, uses);
             }
         }
-        LirStmt::Conc { tasks } => {
-            for task in tasks {
-                for (_, arg) in &task.args {
-                    count_uses_in_atom(arg, uses);
-                }
-            }
-        }
         LirStmt::Loop {
             cond_stmts,
             cond,
@@ -897,7 +881,9 @@ fn count_uses_in_expr(expr: &LirExpr, uses: &mut HashMap<Symbol, u32>) {
         LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } => {
             count_uses_in_atom(value, uses);
         }
-        LirExpr::Raise { value, .. } => count_uses_in_atom(value, uses),
+        LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => {
+            count_uses_in_atom(value, uses)
+        }
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::Closure { captures, .. } => {
             for (_, cap) in captures {
@@ -964,7 +950,6 @@ fn count_dead_lets(stmts: &[LirStmt], uses: &HashMap<Symbol, u32>) -> usize {
                 }
                 count += count_dead_lets(default_body, uses);
             }
-            LirStmt::Conc { .. } => {}
         }
     }
     count
@@ -1017,7 +1002,6 @@ fn eliminate_dead_lets(stmts: &mut Vec<LirStmt>, uses: &HashMap<Symbol, u32>) {
                 }
                 eliminate_dead_lets(default_body, uses);
             }
-            LirStmt::Conc { .. } => {}
         }
         true
     });
@@ -1030,6 +1014,7 @@ fn expr_has_side_effects(expr: &LirExpr) -> bool {
         LirExpr::Call { .. }
             | LirExpr::TailCall { .. }
             | LirExpr::Raise { .. }
+            | LirExpr::Force { .. }
             | LirExpr::CallIndirect { .. }
     )
 }
@@ -1115,7 +1100,7 @@ fn strip_unreachable_stmts(stmts: &mut Vec<LirStmt>) {
                 }
                 strip_unreachable_stmts(default_body);
             }
-            LirStmt::Let { .. } | LirStmt::Conc { .. } => {}
+            LirStmt::Let { .. } => {}
         }
     }
 }
@@ -1181,7 +1166,7 @@ fn hoist_loop_invariants(stmts: &mut Vec<LirStmt>) {
                     i += n; // skip past hoisted stmts to reach the Loop
                 }
             }
-            LirStmt::Let { .. } | LirStmt::Conc { .. } => {}
+            LirStmt::Let { .. } => {}
         }
         i += 1;
     }
@@ -1229,7 +1214,6 @@ fn collect_defined_vars(stmts: &[LirStmt], defs: &mut HashSet<Symbol>) {
                 }
                 collect_defined_vars(default_body, defs);
             }
-            LirStmt::Conc { .. } => {}
         }
     }
 }
@@ -1271,7 +1255,9 @@ fn expr_references_any(expr: &LirExpr, vars: &HashSet<Symbol>) -> bool {
         LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } => {
             atom_references_any(value, vars)
         }
-        LirExpr::Raise { value, .. } => atom_references_any(value, vars),
+        LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => {
+            atom_references_any(value, vars)
+        }
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => false,
         LirExpr::Closure { captures, .. } => {
             captures.iter().any(|(_, a)| atom_references_any(a, vars))
@@ -1427,7 +1413,6 @@ fn devirtualize_calls_in_stmts(
                 }
                 count += devirtualize_calls_in_stmts(default_body, funcref_map);
             }
-            LirStmt::Conc { .. } => {}
         }
     }
     count
@@ -1711,13 +1696,6 @@ fn apply_subst_to_stmt(stmt: &mut LirStmt, subst: &HashMap<Symbol, LirAtom>) {
                 subst_atom(ret, subst);
             }
         }
-        LirStmt::Conc { tasks } => {
-            for task in tasks {
-                for (_, arg) in &mut task.args {
-                    subst_atom(arg, subst);
-                }
-            }
-        }
     }
 }
 
@@ -1769,7 +1747,7 @@ fn rename_expr(expr: &mut LirExpr, map: &HashMap<Symbol, Symbol>) {
         LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } => {
             rename_atom(value, map);
         }
-        LirExpr::Raise { value, .. } => rename_atom(value, map),
+        LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => rename_atom(value, map),
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::Closure { captures, .. } => {
             for (_, cap) in captures {
@@ -1967,9 +1945,6 @@ fn hash_stmt(stmt: &LirStmt, h: &mut impl std::hash::Hasher) {
             hash_stmts(cond_stmts, h);
             hash_stmts(body, h);
         }
-        LirStmt::Conc { tasks } => {
-            tasks.len().hash(h);
-        }
     }
 }
 
@@ -2006,7 +1981,7 @@ fn hash_expr(expr: &LirExpr, h: &mut impl std::hash::Hasher) {
             index.hash(h);
             format!("{:?}", typ).hash(h);
         }
-        LirExpr::Raise { typ, .. } => format!("{:?}", typ).hash(h),
+        LirExpr::Raise { typ, .. } | LirExpr::Force { typ, .. } => format!("{:?}", typ).hash(h),
         LirExpr::FuncRef { func, .. } => func.hash(h),
         LirExpr::Closure { func, captures, .. } => {
             func.hash(h);
@@ -2271,7 +2246,6 @@ fn redirect_calls_in_stmts(stmts: &mut [LirStmt], redirect: &HashMap<Symbol, Sym
                 }
                 redirect_calls_in_stmts(default_body, redirect);
             }
-            LirStmt::Conc { .. } => {}
         }
     }
 }

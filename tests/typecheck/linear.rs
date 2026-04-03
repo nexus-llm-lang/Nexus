@@ -261,3 +261,57 @@ end
         should_fail_typecheck(&src);
     }
 }
+
+// ─── Lazy (@) type tests ────────────────────────────────────────────────────
+
+#[test]
+fn test_lazy_binding_and_force() {
+    should_typecheck(
+        r#"
+    let main = fn () -> unit do
+        let @x = 42
+        let v = @x
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_lazy_type_annotation() {
+    should_typecheck(
+        r#"
+    let main = fn () -> unit do
+        let @x : i64 = 42
+        let v = @x
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_lazy_force_on_non_lazy_via_parens() {
+    // @(expr) is Force — on non-lazy values it's identity
+    should_typecheck(
+        r#"
+    let main = fn () -> unit do
+        let x = 42
+        let v = @(x)
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_lazy_unused_is_error() {
+    should_fail_typecheck(
+        r#"
+    let main = fn () -> unit do
+        let @x = { id: 1 }
+        return ()
+    end
+    "#,
+    );
+}

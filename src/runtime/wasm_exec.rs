@@ -1,11 +1,9 @@
 use crate::constants::*;
 use crate::runtime::backtrace;
-use crate::runtime::conc;
 use crate::runtime::net_host;
 use crate::runtime::ExecutionCapabilities;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use wasmtime::{
     component::{Component, Linker as ComponentLinker, ResourceTable},
     Engine, Linker, Module, Store,
@@ -208,7 +206,6 @@ fn run_core_wasm_bytes_inner(
         }
     };
 
-    let has_conc = conc::needs_conc_runtime(wasm);
     let has_bt = backtrace::needs_bt_runtime(wasm);
 
     let mut linker = Linker::<wasmtime_wasi::p1::WasiP1Ctx>::new(&engine);
@@ -219,12 +216,6 @@ fn run_core_wasm_bytes_inner(
     if let Err(msg) = capabilities.enforce_denied_wasi_functions(&mut linker) {
         eprintln!("Failed to enforce WASI capability policy: {}", msg);
         return ExitCode::from(1);
-    }
-    if has_conc {
-        if let Err(e) = conc::add_conc_to_linker(&mut linker) {
-            eprintln!("Failed to add conc runtime to linker: {}", e);
-            return ExitCode::from(1);
-        }
     }
     // Always add net_host — dep modules (e.g. stdlib) may import from it
     // even if the main module doesn't directly.
@@ -259,9 +250,8 @@ fn run_core_wasm_bytes_inner(
     imported_modules.sort();
     imported_modules.dedup();
 
-    let mut conc_deps = Vec::new();
     for module_name in imported_modules {
-        if module_name == WASI_SNAPSHOT_MODULE || module_name == conc::CONC_HOST_MODULE {
+        if module_name == WASI_SNAPSHOT_MODULE {
             continue;
         }
         if module_name == backtrace::BT_HOST_MODULE {
@@ -310,19 +300,6 @@ fn run_core_wasm_bytes_inner(
             eprintln!("Failed to link dependency module '{}': {}", module_name, e);
             return ExitCode::from(1);
         }
-        if has_conc {
-            conc_deps.push((module_name.clone(), Arc::new(dep)));
-        }
-    }
-
-    if has_conc {
-        conc::setup_conc_runtime(
-            engine.clone(),
-            Arc::new(module.clone()),
-            wasm,
-            conc_deps,
-            capabilities.clone(),
-        );
     }
 
     let instance = match linker.instantiate(&mut store, &module) {
@@ -343,15 +320,11 @@ fn run_core_wasm_bytes_inner(
             return ExitCode::from(1);
         }
     };
-    let result = match main.call(&mut store, ()) {
+    match main.call(&mut store, ()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Runtime Error: {}", e);
             ExitCode::from(1)
         }
-    };
-    if has_conc {
-        conc::reset_conc_runtime();
     }
-    result
 }

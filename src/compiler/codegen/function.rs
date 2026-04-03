@@ -338,7 +338,6 @@ fn collect_stmt_locals(
                 collect_stmt_locals(then_body, local_map, next_local_index, local_decls_flat)?;
                 collect_stmt_locals(else_body, local_map, next_local_index, local_decls_flat)?;
             }
-            LirStmt::Conc { .. } => {}
             LirStmt::Loop {
                 cond_stmts, body, ..
             } => {
@@ -533,7 +532,7 @@ fn collect_defs_nested(stmt: &LirStmt, pos: usize, def_pos: &mut HashMap<Symbol,
                 collect_defs_nested(s, pos, def_pos);
             }
         }
-        LirStmt::Let { .. } | LirStmt::Conc { .. } => {}
+        LirStmt::Let { .. } => {}
     }
 }
 
@@ -632,13 +631,6 @@ fn collect_refs_in_stmt(stmt: &LirStmt, refs: &mut HashSet<Symbol>) {
                 collect_refs_in_atom(r, refs);
             }
         }
-        LirStmt::Conc { tasks } => {
-            for task in tasks {
-                for (_, arg) in &task.args {
-                    collect_refs_in_atom(arg, refs);
-                }
-            }
-        }
     }
 }
 
@@ -667,7 +659,9 @@ fn collect_refs_in_expr(expr: &LirExpr, refs: &mut HashSet<Symbol>) {
         LirExpr::ObjectTag { value, .. } | LirExpr::ObjectField { value, .. } => {
             collect_refs_in_atom(value, refs);
         }
-        LirExpr::Raise { value, .. } => collect_refs_in_atom(value, refs),
+        LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => {
+            collect_refs_in_atom(value, refs)
+        }
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::Closure { captures, .. } => {
             for (_, a) in captures {
@@ -908,6 +902,10 @@ pub(super) fn compile_expr(
             out.instruction(&Instruction::Throw(tag_idx));
             Ok(())
         }
+        LirExpr::Force { value, .. } => {
+            compile_atom(value, out, local_map, layout)?;
+            Ok(())
+        }
         LirExpr::FuncRef { func, .. } => {
             // Allocate closure object [table_idx] (1 word)
             let table_idx = layout
@@ -1117,7 +1115,6 @@ fn stmt_has_self_tail_call(stmt: &LirStmt, self_name: &Symbol) -> bool {
                 || stmts_have_self_tail_call(body, self_name)
         }
         // TryCatch: TCO is disabled inside try blocks, so don't look there.
-        // Conc: task bodies don't contain tail calls.
         _ => false,
     }
 }

@@ -896,11 +896,105 @@ impl MirBuilder {
     ) -> Result<Vec<MirStmt>, HirBuildError> {
         match stmt {
             Stmt::Let {
-                name, typ, value, ..
+                name, sigil, typ, value,
             } => {
                 // Track variable types for closure capture resolution
                 if let Some(t) = typ {
                     self.scope_var_types.insert(name.clone(), t.clone());
+                }
+                if matches!(sigil, Sigil::Lazy) {
+                    // Desugar lazy binding: wrap value in a zero-arg closure (thunk)
+                    let lifted_name = format!("__lambda_{}", self.lambda_counter);
+                    self.lambda_counter += 1;
+
+                    // Determine thunk return type from annotation
+                    // Default to I64 (most common heap type) when no annotation;
+                    // the actual type is resolved at LIR lowering via semantic_vars.
+                    let ret_type = match typ {
+                        Some(Type::Lazy(inner)) => *inner.clone(),
+                        Some(t) => t.clone(),
+                        None => Type::I64,
+                    };
+
+                    // Collect free variables from the value expression
+                    let param_names: HashSet<String> = HashSet::new();
+                    let mut known_names: HashSet<String> =
+                        self.fn_ret_types.keys().cloned().collect();
+                    for ext in &self.externals {
+                        known_names.insert(ext.name.to_string());
+                    }
+                    for key in self.global_constants.keys() {
+                        known_names.insert(key.clone());
+                    }
+                    for v in rename_map.values() {
+                        if self.fn_ret_types.contains_key(v)
+                            || self.global_constants.contains_key(v)
+                        {
+                            known_names.insert(v.clone());
+                        }
+                    }
+                    let thunk_body = vec![Spanned {
+                        node: Stmt::Return(value.clone()),
+                        span: value.span.clone(),
+                    }];
+                    let captures =
+                        collect_ast_free_vars(&thunk_body, &param_names, &known_names);
+
+                    // Build capture params
+                    let capture_params: Vec<MirParam> = captures
+                        .iter()
+                        .map(|cap_name| {
+                            let cap_typ = self
+                                .scope_var_types
+                                .get(cap_name)
+                                .cloned()
+                                .unwrap_or(Type::I64);
+                            MirParam {
+                                name: Symbol::from(cap_name.as_str()),
+                                label: Symbol::from(cap_name.as_str()),
+                                typ: cap_typ,
+                            }
+                        })
+                        .collect();
+
+                    let arrow_type = Type::Arrow(
+                        vec![],
+                        Box::new(ret_type.clone()),
+                        Box::new(Type::Row(vec![], None)),
+                        Box::new(Type::Row(vec![], None)),
+                    );
+                    self.fn_ret_types
+                        .insert(lifted_name.clone(), ret_type.clone());
+                    self.fn_types.insert(lifted_name.clone(), arrow_type);
+
+                    let capture_symbols: Vec<Symbol> =
+                        captures.iter().map(|n| Symbol::from(n.as_str())).collect();
+
+                    self.pending_functions.push(PendingFunction {
+                        name: lifted_name.clone(),
+                        params: capture_params,
+                        ret_type,
+                        body: thunk_body,
+                        rename_map: rename_map.clone(),
+                        source_file: self.current_source_file.clone(),
+                        source_line: self.source_line_at(&value.span),
+                        span: value.span.clone(),
+                        preamble: vec![],
+                        captures: capture_symbols.clone(),
+                    });
+
+                    // Always emit as Closure (even with no captures) because
+                    // call_indirect always passes __env as first arg.
+                    let mir_expr = MirExpr::Closure {
+                        func: Symbol::from(lifted_name),
+                        captures: capture_symbols,
+                    };
+
+                    return Ok(vec![MirStmt::Let {
+                        name: Symbol::from(name.as_str()),
+                        typ: typ.clone().unwrap_or(Type::Unit),
+                        expr: mir_expr,
+                    }]);
                 }
                 Ok(vec![MirStmt::Let {
                     name: Symbol::from(name.as_str()),
@@ -962,25 +1056,6 @@ impl MirBuilder {
                 target: self.convert_expr(target, rename_map, scope)?,
                 value: self.convert_expr(value, rename_map, scope)?,
             }]),
-            Stmt::Conc(tasks) => {
-                let mir_tasks: Vec<MirFunction> = tasks
-                    .iter()
-                    .map(|t| {
-                        let body = self.convert_stmts(&t.body, rename_map, scope)?;
-                        Ok(MirFunction {
-                            name: Symbol::from(t.name.as_str()),
-                            params: vec![],
-                            ret_type: Type::Unit,
-                            body,
-                            span: 0..0,
-                            source_file: None,
-                            source_line: None,
-                            captures: vec![],
-                        })
-                    })
-                    .collect::<Result<_, HirBuildError>>()?;
-                Ok(vec![MirStmt::Conc(mir_tasks)])
-            }
             Stmt::Try {
                 body,
                 catch_arms,
@@ -1048,7 +1123,7 @@ impl MirBuilder {
     ) -> Result<MirExpr, HirBuildError> {
         match &expr.node {
             Expr::Literal(lit) => Ok(MirExpr::Literal(lit.clone())),
-            Expr::Variable(name, _sigil) => {
+            Expr::Variable(name, sigil) => {
                 let resolved = self.rename(name, rename_map);
                 if let Some(lit) = self.global_constants.get(&resolved) {
                     Ok(MirExpr::Literal(lit.clone()))
@@ -1056,7 +1131,13 @@ impl MirBuilder {
                     // Function name used as a value → emit FuncRef
                     Ok(MirExpr::FuncRef(Symbol::from(resolved)))
                 } else {
-                    Ok(MirExpr::Variable(Symbol::from(resolved)))
+                    let var = MirExpr::Variable(Symbol::from(resolved));
+                    if matches!(sigil, Sigil::Lazy) {
+                        // @x: force the lazy thunk (call the closure)
+                        Ok(MirExpr::Force(Box::new(var)))
+                    } else {
+                        Ok(var)
+                    }
                 }
             }
             Expr::BinaryOp(lhs, op, rhs) => Ok(MirExpr::BinaryOp(
@@ -1339,6 +1420,9 @@ impl MirBuilder {
             Expr::Raise(e) => Ok(MirExpr::Raise(Box::new(
                 self.convert_expr(e, rename_map, scope)?,
             ))),
+            Expr::Force(e) => Ok(MirExpr::Force(Box::new(
+                self.convert_expr(e, rename_map, scope)?,
+            ))),
             Expr::External(sym, _tparams, _typ) => {
                 Ok(MirExpr::Variable(Symbol::from(sym.as_str())))
             }
@@ -1441,11 +1525,6 @@ fn collect_calls_in_mir_stmts(stmts: &[MirStmt], out: &mut Vec<Symbol>) {
                 collect_calls_in_mir_expr(target, out);
                 collect_calls_in_mir_expr(value, out);
             }
-            MirStmt::Conc(tasks) => {
-                for task in tasks {
-                    collect_calls_in_mir_stmts(&task.body, out);
-                }
-            }
             MirStmt::Try {
                 body, catch_body, ..
             } => {
@@ -1509,7 +1588,7 @@ fn collect_calls_in_mir_expr(expr: &MirExpr, out: &mut Vec<Symbol>) {
             collect_calls_in_mir_expr(cond, out);
             collect_calls_in_mir_stmts(body, out);
         }
-        MirExpr::Raise(expr) => collect_calls_in_mir_expr(expr, out),
+        MirExpr::Raise(expr) | MirExpr::Force(expr) => collect_calls_in_mir_expr(expr, out),
         MirExpr::FuncRef(name) => out.push(*name),
         MirExpr::Closure { func, .. } => out.push(*func),
         MirExpr::CallIndirect { callee, args, .. } => {
@@ -1562,13 +1641,6 @@ fn collect_ast_stmt_refs(
         Stmt::Assign { target, value } => {
             collect_ast_expr_refs(&target.node, defined, referenced, seen, known);
             collect_ast_expr_refs(&value.node, defined, referenced, seen, known);
-        }
-        Stmt::Conc(tasks) => {
-            for t in tasks {
-                for s in &t.body {
-                    collect_ast_stmt_refs(&s.node, defined, referenced, seen, known);
-                }
-            }
         }
         Stmt::Try {
             body,
@@ -1701,7 +1773,7 @@ fn collect_ast_expr_refs(
                 collect_ast_stmt_refs(&s.node, &mut inner_defined, referenced, seen, known);
             }
         }
-        Expr::Raise(e) => {
+        Expr::Raise(e) | Expr::Force(e) => {
             collect_ast_expr_refs(&e.node, defined, referenced, seen, known);
         }
         Expr::Literal(_) | Expr::External(_, _, _) | Expr::Handler { .. } => {}

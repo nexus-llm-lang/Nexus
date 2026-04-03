@@ -1,30 +1,4 @@
-use crate::harness::{exec, exec_with_stdlib, should_fail_typecheck, should_typecheck};
-use std::fs;
-
-#[test]
-fn test_conc_parallel_execution() {
-    // NOTE: The original test used mutable arrays (`[| ... |]`) with conc tasks,
-    // which are not supported by the WASM codegen. This test verifies that basic
-    // conc blocks with simple captures compile and execute.
-    exec(
-        r#"
-    let main = fn () -> unit do
-        let x = 1
-        conc do
-            task t1 do
-                let a = x + 1
-                return ()
-            end
-            task t2 do
-                let b = x + 2
-                return ()
-            end
-        end
-        return ()
-    end
-    "#,
-    );
-}
+use crate::harness::{exec, should_fail_typecheck, should_typecheck};
 
 #[test]
 fn test_net_effect_enforcement() {
@@ -115,22 +89,15 @@ fn test_net_request_response_status_and_body_with_request_body() {
     );
 }
 
+// ─── Lazy thunk (@) execution tests ──────────────────────────────────────────
+
 #[test]
-fn codegen_conc_block_executes_tasks_in_parallel() {
+fn test_lazy_thunk_basic_force() {
     exec(
         r#"
 let main = fn () -> unit do
-    let x = 1
-    conc do
-        task t1 do
-            let a = x + 1
-            return ()
-        end
-        task t2 do
-            let b = x + 2
-            return ()
-        end
-    end
+    let @x = 42
+    let v = @x
     return ()
 end
 "#,
@@ -138,38 +105,34 @@ end
 }
 
 #[test]
-fn codegen_conc_fs_writes_in_parallel() {
-    let src = r#"
-import { Fs }, * as fs_mod from "stdlib/fs.nx"
-
-let main = fn () -> unit require { PermFs } do
-    inject fs_mod.system_handler do
-    conc do
-        task write_a do
-            Fs.write_string(path: "nexus_conc_test_a.txt", content: "hello")
-            return ()
-        end
-        task write_b do
-            Fs.write_string(path: "nexus_conc_test_b.txt", content: "world")
-            return ()
-        end
-    end
-    end
+fn test_lazy_thunk_captures_variable() {
+    exec(
+        r#"
+let main = fn () -> unit do
+    let y = 10
+    let @x = y + 1
+    let v = @x
     return ()
 end
-"#;
-    exec_with_stdlib(src);
-
-    // Verify files were actually written by conc tasks
-    let a = fs::read_to_string("nexus_conc_test_a.txt").expect("file a should exist");
-    let b = fs::read_to_string("nexus_conc_test_b.txt").expect("file b should exist");
-    assert_eq!(a, "hello");
-    assert_eq!(b, "world");
-    let _ = fs::remove_file("nexus_conc_test_a.txt");
-    let _ = fs::remove_file("nexus_conc_test_b.txt");
+"#,
+    );
 }
 
-// NOTE: The proptest conc tests (prop_conc_independent_array_updates,
-// prop_conc_task_capture_linearity) used mutable arrays (`[| ... |]`) with
-// `&%arr` borrows and array indexing, which are not supported by the WASM
-// codegen (`__array_get` not found).
+#[test]
+fn test_lazy_thunk_with_function_call() {
+    exec(
+        r#"
+let compute = fn (a: i64, b: i64) -> i64 do
+    return a + b
+end
+
+let main = fn () -> unit do
+    let a = 3
+    let b = 4
+    let @result = compute(a: a, b: b)
+    let v = @result
+    return ()
+end
+"#,
+    );
+}

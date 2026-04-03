@@ -6,7 +6,6 @@ use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 pub mod backtrace;
-pub mod conc;
 pub mod net_host;
 pub mod string_heap;
 pub mod wasm_exec;

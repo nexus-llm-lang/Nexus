@@ -80,6 +80,7 @@ pub enum Expr {
         body: Vec<Spanned<Stmt>>,
     },
     Raise(Box<Spanned<Expr>>),           // raise "error"
+    Force(Box<Spanned<Expr>>),           // @expr (evaluate/force lazy)
     External(String, Vec<String>, Type), // external "wasm_symbol" : <T> arrow_type
     // handler Port [require { ... }] do fn ... end end — coeffect handler as expression
     Handler {
@@ -104,8 +105,6 @@ pub enum Stmt {
         target: Spanned<Expr>,
         value: Spanned<Expr>,
     },
-    // Concurrent block
-    Conc(Vec<Function>), // 'task' blocks look like functions/closures
     Try {
         body: Vec<Spanned<Stmt>>,
         catch_arms: Vec<CatchArm>,

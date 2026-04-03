@@ -106,7 +106,7 @@ fn file_backed_imports(
         if is_preview2_wasi_module(module_name) {
             continue;
         }
-        // Skip host-provided nexus runtime modules (e.g. "nexus:runtime/conc").
+        // Skip host-provided nexus runtime modules (e.g. "nexus:runtime/backtrace").
         // NEXUS_HOST_HTTP_MODULE is handled above with its own conditional logic.
         if module_name.starts_with("nexus:") {
             continue;
@@ -280,12 +280,12 @@ mod tests {
     fn file_backed_imports_skips_nexus_runtime_modules() {
         let mut imports = BTreeSet::new();
         imports.insert(WASI_SNAPSHOT_MODULE.to_string());
-        imports.insert("nexus:runtime/conc".to_string());
+        imports.insert("nexus:runtime/backtrace".to_string());
 
         let result = file_backed_imports(&imports, true).expect("should succeed");
         assert!(
             result.is_empty(),
-            "nexus:runtime/conc should be skipped, got: {:?}",
+            "nexus:runtime/backtrace should be skipped, got: {:?}",
             result
         );
     }

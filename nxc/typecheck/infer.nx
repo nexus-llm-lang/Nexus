@@ -9,7 +9,7 @@
 import { Span } from "nxc/common/token.nx"
 import {
   TypeExpr, TyI32, TyI64, TyF32, TyF64, TyBool, TyChar, TyString, TyUnit,
-  TyIntLit, TyFloatLit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear, TyBorrow,
+  TyIntLit, TyFloatLit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear, TyLazy, TyBorrow,
   TyArray, TyList, TyRecord, TyRow, TyHandler, NamedType,
   BinaryOp, OpAdd, OpSub, OpMul, OpDiv, OpMod,
   OpFAdd, OpFSub, OpFMul, OpFDiv,
@@ -18,7 +18,7 @@ import {
   OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr,
   OpAnd, OpOr, OpConcat,
   Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit,
-  Sigil, SigilImmutable, SigilMutable, SigilLinear, SigilBorrow,
+  Sigil, SigilImmutable, SigilMutable, SigilLinear, SigilLazy, SigilBorrow,
   VariantField, EnumDef, VariantDef
 } from "nxc/common/ast.nx"
 import {
@@ -97,6 +97,8 @@ export let infer_expr = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr
       return infer_lambda(state: state, params: params, ret_type: ret, body: body, span: sp)
     case Raise(expr: inner) ->
       return infer_raise(state: state, inner: inner, span: sp)
+    case Force(expr: inner) ->
+      return infer_force(state: state, inner: inner, span: sp)
     case ExternalRef(symbol: _, arg_names: _, typ: typ) ->
       return InferExprOk(state: state, subst: subst.subst_empty(), typ: typ)
     case Handler(port_name: _, functions: _) ->
@@ -149,9 +151,10 @@ let infer_borrow = fn (state: CheckState, name: string, span: Span) -> InferExpr
   match infer_variable(state: state, name: name, span: span) do
     case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
     case InferExprOk(state: st1, subst: s, typ: t) ->
-      // Strip Linear/Borrow wrapper, then wrap in Borrow
+      // Strip Linear/Lazy/Borrow wrapper, then wrap in Borrow
       let inner = match t do
         case TyLinear(inner: u) -> u
+        case TyLazy(inner: u) -> u
         case TyBorrow(inner: u) -> u
         case _ -> t
       end
@@ -834,6 +837,19 @@ let infer_raise = fn (state: CheckState, inner: HirExpr, span: Span) -> InferExp
   end
 end
 
+let infer_force = fn (state: CheckState, inner: HirExpr, span: Span) -> InferExprResult do
+  match infer_expr(state: state, expr: inner, ret_type: TyUnit) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: t) ->
+      // Unwrap TyLazy wrapper to get the forced value's type
+      let forced_type = match t do
+        case TyLazy(inner: u) -> u
+        case _ -> t
+      end
+      return InferExprOk(state: st1, subst: s1, typ: forced_type)
+  end
+end
+
 // ─── Statement inference ────────────────────────────────────────────────────
 
 export let infer_stmts = fn (state: CheckState, stmts: [HirStmt], ret_type: TypeExpr) -> InferExprResult do
@@ -871,8 +887,6 @@ let infer_stmt = fn (state: CheckState, stmt: HirStmtKind, ret_type: TypeExpr, s
     case Assign(target: _, value: value) ->
       // Simplified: just check the value expression
       return infer_expr(state: state, expr: value, ret_type: ret_type)
-    case Conc(tasks: tasks) ->
-      return infer_conc_tasks(state: state, tasks: tasks, span: span)
     case Try(body: body, catch_param: cp, catch_body: cb) ->
       return infer_try(state: state, body: body, catch_param: cp, catch_body: cb, ret_type: ret_type, span: span)
     case Inject(handlers: _, body: body) ->
@@ -936,24 +950,6 @@ let infer_return = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr, spa
   end
 end
 
-// ─── Conc inference ─────────────────────────────────────────────────────────
-
-let infer_conc_tasks = fn (state: CheckState, tasks: [HirFunction], span: Span) -> InferExprResult do
-  match tasks do
-    case [] -> return InferExprOk(state: state, subst: subst.subst_empty(), typ: TyUnit)
-    case HirFunction(name: _, type_params: _, params: _, ret_type: _, body: body, span: _) :: rest ->
-      match infer_stmts(state: state, stmts: body, ret_type: TyUnit) do
-        case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "conc task: " ++ m, span: espan)
-        case InferExprOk(state: st1, subst: s1, typ: _) ->
-          match infer_conc_tasks(state: st1, tasks: rest, span: span) do
-            case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
-            case InferExprOk(state: st2, subst: s2, typ: _) ->
-              return InferExprOk(state: st2, subst: subst.subst_compose(s1: s1, s2: s2), typ: TyUnit)
-          end
-      end
-  end
-end
-
 // ─── Try inference ──────────────────────────────────────────────────────────
 
 let infer_try = fn (state: CheckState, body: [HirStmt], catch_param: string, catch_body: [HirStmt], ret_type: TypeExpr, span: Span) -> InferExprResult do
@@ -1012,9 +1008,10 @@ let bind_constructor_pattern = fn (
   state: CheckState, variant: string,
   fields: [HirPatternField], target_type: TypeExpr
 ) -> BindResult do
-  // Strip Linear/Ref/Borrow wrapper for pattern matching (e.g., let ByteBuffer(id: id) = %buf)
+  // Strip Linear/Lazy/Ref/Borrow wrapper for pattern matching (e.g., let ByteBuffer(id: id) = %buf)
   let unwrapped = match target_type do
     case TyLinear(inner: i) -> i
+    case TyLazy(inner: i) -> i
     case TyRef(inner: i) -> i
     case TyBorrow(inner: i) -> i
     case _ -> target_type

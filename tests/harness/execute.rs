@@ -1,6 +1,5 @@
 use nexus::lang::stdlib::resolve_import_path;
 use nexus::runtime::backtrace;
-use nexus::runtime::conc;
 use std::path::PathBuf;
 use std::sync::Arc;
 use wasmtime::{Engine, Linker, Module, Store};
@@ -71,40 +70,20 @@ pub fn run_main(wasm: &[u8]) -> Result<(), String> {
     config.wasm_exceptions(true);
     let engine = Engine::new(&config).map_err(|e| e.to_string())?;
     let module = Module::from_binary(&engine, wasm).map_err(|e| e.to_string())?;
-    let has_conc = conc::needs_conc_runtime(wasm);
     let has_bt = backtrace::needs_bt_runtime(wasm);
 
-    if has_conc || has_bt {
-        let module = Arc::new(module);
-        if has_conc {
-            conc::setup_conc_runtime(
-                engine.clone(),
-                module.clone(),
-                wasm,
-                vec![],
-                nexus::runtime::ExecutionCapabilities::allow_all(),
-            );
-        }
+    if has_bt {
         let mut linker = Linker::new(&engine);
-        if has_conc {
-            conc::add_conc_to_linker(&mut linker).map_err(|e| e.to_string())?;
-        }
         let mut store = Store::new(&engine, ());
-        if has_bt {
-            backtrace::reset();
-            backtrace::add_bt_to_linker(&mut linker, &mut store)?;
-        }
+        backtrace::reset();
+        backtrace::add_bt_to_linker(&mut linker, &mut store)?;
         let instance = linker
-            .instantiate(&mut store, &*module)
+            .instantiate(&mut store, &module)
             .map_err(|e| e.to_string())?;
         let main = instance
             .get_typed_func::<(), ()>(&mut store, "main")
             .map_err(|e| e.to_string())?;
-        let result = main.call(&mut store, ()).map_err(|e| e.to_string());
-        if has_conc {
-            conc::reset_conc_runtime();
-        }
-        return result;
+        return main.call(&mut store, ()).map_err(|e| e.to_string());
     }
 
     let mut store = Store::new(&engine, ());
@@ -143,19 +122,15 @@ pub fn exec_with_stdlib_caps_should_trap(
     }
 }
 
-/// Execute main() -> () with WASI P1, stdlib dependency resolution, and conc runtime.
+/// Execute main() -> () with WASI P1, stdlib dependency resolution, and backtrace runtime.
 /// Uses cached Engine and Module instances for stdlib dependencies.
 pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
     let engine = &*SHARED_ENGINE;
     let module = Module::from_binary(engine, wasm).map_err(|e| format!("{:#}", e))?;
-    let has_conc = conc::needs_conc_runtime(wasm);
 
     let mut linker = Linker::new(engine);
     wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx).map_err(|e| e.to_string())?;
     define_nexus_host_stubs(&mut linker)?;
-    if has_conc {
-        conc::add_conc_to_linker(&mut linker)?;
-    }
 
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
@@ -173,10 +148,8 @@ pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
     imported_modules.sort();
     imported_modules.dedup();
 
-    let mut deps = Vec::new();
     for module_name in imported_modules {
         if module_name == "wasi_snapshot_preview1"
-            || module_name == conc::CONC_HOST_MODULE
             || module_name == backtrace::BT_HOST_MODULE
             || module_name == "nexus:cli/nexus-host"
         {
@@ -186,17 +159,6 @@ pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
         linker
             .module(&mut store, &module_name, &*dep)
             .map_err(|e| e.to_string())?;
-        deps.push((module_name.clone(), dep));
-    }
-
-    if has_conc {
-        conc::setup_conc_runtime(
-            engine.clone(),
-            Arc::new(module.clone()),
-            wasm,
-            deps,
-            nexus::runtime::ExecutionCapabilities::allow_all(),
-        );
     }
 
     let instance = linker
@@ -205,11 +167,7 @@ pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
     let main = instance
         .get_typed_func::<(), ()>(&mut store, "main")
         .map_err(|e| e.to_string())?;
-    let result = main.call(&mut store, ()).map_err(|e| e.to_string());
-    if has_conc {
-        conc::reset_conc_runtime();
-    }
-    result
+    main.call(&mut store, ()).map_err(|e| e.to_string())
 }
 
 /// Execute main() -> () with WASI P1, stdlib, and custom capability enforcement.
@@ -219,15 +177,11 @@ pub fn run_main_with_deps_caps(
 ) -> Result<(), String> {
     let engine = &*SHARED_ENGINE;
     let module = Module::from_binary(engine, wasm).map_err(|e| format!("{:#}", e))?;
-    let has_conc = conc::needs_conc_runtime(wasm);
 
     let mut linker = Linker::new(engine);
     wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx).map_err(|e| e.to_string())?;
     caps.enforce_denied_wasi_functions(&mut linker)?;
     define_nexus_host_stubs(&mut linker)?;
-    if has_conc {
-        conc::add_conc_to_linker(&mut linker)?;
-    }
 
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
@@ -245,10 +199,8 @@ pub fn run_main_with_deps_caps(
     imported_modules.sort();
     imported_modules.dedup();
 
-    let mut deps = Vec::new();
     for module_name in imported_modules {
         if module_name == "wasi_snapshot_preview1"
-            || module_name == conc::CONC_HOST_MODULE
             || module_name == backtrace::BT_HOST_MODULE
             || module_name == "nexus:cli/nexus-host"
         {
@@ -258,11 +210,6 @@ pub fn run_main_with_deps_caps(
         linker
             .module(&mut store, &module_name, &*dep)
             .map_err(|e| e.to_string())?;
-        deps.push((module_name.clone(), dep));
-    }
-
-    if has_conc {
-        conc::setup_conc_runtime(engine.clone(), Arc::new(module.clone()), wasm, deps, caps);
     }
 
     let instance = linker
@@ -271,11 +218,7 @@ pub fn run_main_with_deps_caps(
     let main = instance
         .get_typed_func::<(), ()>(&mut store, "main")
         .map_err(|e| e.to_string())?;
-    let result = main.call(&mut store, ()).map_err(|e| e.to_string());
-    if has_conc {
-        conc::reset_conc_runtime();
-    }
-    result
+    main.call(&mut store, ()).map_err(|e| e.to_string())
 }
 
 /// Stub implementations for nexus-host functions (trapping).

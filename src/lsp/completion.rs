@@ -32,7 +32,6 @@ const KEYWORDS: &[&str] = &[
     "while",
     "for",
     "task",
-    "conc",
     "true",
     "false",
     "borrow",
