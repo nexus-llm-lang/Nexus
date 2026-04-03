@@ -5,9 +5,7 @@ title: Lazy Evaluation
 
 # Lazy Evaluation (`@`)
 
-The `@` sigil introduces call-by-need semantics. A lazy binding wraps its expression in a zero-argument thunk — a closure that is evaluated only when forced.
-
-Lazy thunks are the concurrency primitive in Nexus: they decouple *definition* of a computation from its *execution*. The thunk decides *what* to compute; the force site decides *when*.
+The `@` sigil introduces call-by-need semantics. A lazy binding wraps its expression in a zero-argument thunk — a closure that is evaluated only when forced. Execution remains sequential; `@` controls *when* a computation runs, not *how* it's scheduled.
 
 ## Syntax
 
