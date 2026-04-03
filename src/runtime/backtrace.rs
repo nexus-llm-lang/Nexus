@@ -10,8 +10,6 @@
 use std::cell::RefCell;
 use wasmtime::{Caller, Linker, Memory, MemoryType, WasmBacktrace};
 
-use super::net_host::imports_module;
-
 pub const BT_HOST_MODULE: &str = "nexus:runtime/backtrace";
 
 thread_local! {
@@ -22,7 +20,19 @@ thread_local! {
 
 /// Check if a WASM module imports the backtrace host module.
 pub fn needs_bt_runtime(wasm_bytes: &[u8]) -> bool {
-    imports_module(wasm_bytes, BT_HOST_MODULE)
+    use wasmparser::{Parser, Payload};
+    for payload in Parser::new(0).parse_all(wasm_bytes) {
+        if let Ok(Payload::ImportSection(section)) = payload {
+            for import in section {
+                if let Ok(import) = import {
+                    if import.module == BT_HOST_MODULE {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Reset backtrace state (call before each execution).
