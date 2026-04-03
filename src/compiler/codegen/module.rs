@@ -20,7 +20,7 @@ use super::emit::{
 use super::error::CodegenError;
 use super::function::compile_function;
 use super::layout::{build_codegen_layout, program_uses_object_heap, MemoryMode};
-use super::{ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE};
+use super::{ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, LAZY_JOIN_NAME, LAZY_MODULE, LAZY_SPAWN_NAME};
 
 /// Compiles LIR (in ANF) directly into core WASM bytes, plus debug entries for DWARF.
 pub fn compile_lir_to_wasm(
@@ -31,6 +31,7 @@ pub fn compile_lir_to_wasm(
     // This is the "notrace" optimization: most programs use try/catch without inspecting
     // the call stack, so we skip the expensive wasmtime stack walk at every throw.
     let needs_bt_capture = has_eh && program_uses_backtrace(program);
+    let needs_lazy = program_needs_lazy(program);
 
     let stdlib_alloc_module = if program_uses_object_heap(program) {
         program
@@ -62,8 +63,9 @@ pub fn compile_lir_to_wasm(
     }
     let deduped_ext_count = deduped_externals.len() as u32;
     let n_bt_imports: u32 = if needs_bt_capture { 1 } else { 0 };
+    let n_lazy_imports: u32 = if needs_lazy { 2 } else { 0 }; // spawn + join
 
-    let import_count = deduped_ext_count + n_alloc_imports + n_bt_imports;
+    let import_count = deduped_ext_count + n_alloc_imports + n_bt_imports + n_lazy_imports;
 
     let mut internal_function_indices = HashMap::new();
     for (idx, func) in program.functions.iter().enumerate() {
@@ -94,6 +96,11 @@ pub fn compile_lir_to_wasm(
     if needs_bt_capture {
         let bt_idx = deduped_ext_count + n_alloc_imports;
         layout.capture_bt_func_idx = Some(bt_idx);
+    }
+    if needs_lazy {
+        let lazy_base = deduped_ext_count + n_alloc_imports + n_bt_imports;
+        layout.lazy_spawn_func_idx = Some(lazy_base);
+        layout.lazy_join_func_idx = Some(lazy_base + 1);
     }
 
     // Build funcref table indices
@@ -154,6 +161,33 @@ pub fn compile_lir_to_wasm(
         } else {
             types.ty().function([], []);
             sig_to_type_idx.insert(key, next_type_index);
+            let idx = next_type_index;
+            next_type_index += 1;
+            idx
+        };
+    }
+
+    // Lazy spawn type: (i64, i32) -> i64 — spawn a thunk for parallel evaluation
+    let mut lazy_spawn_type_idx = 0;
+    // Lazy join type: (i64) -> i64 — wait for a spawned thunk result
+    let mut lazy_join_type_idx = 0;
+    if needs_lazy {
+        let spawn_key = sig_key(&[ValType::I64, ValType::I32], &[ValType::I64]);
+        lazy_spawn_type_idx = if let Some(&existing) = sig_to_type_idx.get(&spawn_key) {
+            existing
+        } else {
+            types.ty().function([ValType::I64, ValType::I32], [ValType::I64]);
+            sig_to_type_idx.insert(spawn_key, next_type_index);
+            let idx = next_type_index;
+            next_type_index += 1;
+            idx
+        };
+        let join_key = sig_key(&[ValType::I64], &[ValType::I64]);
+        lazy_join_type_idx = if let Some(&existing) = sig_to_type_idx.get(&join_key) {
+            existing
+        } else {
+            types.ty().function([ValType::I64], [ValType::I64]);
+            sig_to_type_idx.insert(join_key, next_type_index);
             let idx = next_type_index;
             next_type_index += 1;
             idx
@@ -255,6 +289,19 @@ pub fn compile_lir_to_wasm(
             BT_MODULE,
             BT_CAPTURE_NAME,
             EntityType::Function(bt_capture_type_idx),
+        );
+        has_imports = true;
+    }
+    if needs_lazy {
+        imports.import(
+            LAZY_MODULE,
+            LAZY_SPAWN_NAME,
+            EntityType::Function(lazy_spawn_type_idx),
+        );
+        imports.import(
+            LAZY_MODULE,
+            LAZY_JOIN_NAME,
+            EntityType::Function(lazy_join_type_idx),
         );
         has_imports = true;
     }
@@ -486,6 +533,8 @@ fn collect_funcref_targets(program: &LirProgram) -> Vec<Symbol> {
                 scan_atom(value, targets);
             }
             LirExpr::ClosureEnvLoad { .. } => {}
+            LirExpr::LazySpawn { thunk, .. } => scan_atom(thunk, targets),
+            LirExpr::LazyJoin { task_id, .. } => scan_atom(task_id, targets),
             LirExpr::Atom(a) => scan_atom(a, targets),
         }
     }
@@ -727,4 +776,33 @@ fn program_needs_eh(program: &LirProgram) -> bool {
         .functions
         .iter()
         .any(|f| f.body.iter().any(stmt_needs_bt))
+}
+
+/// Check if the LIR program contains lazy spawn/join expressions.
+fn program_needs_lazy(program: &LirProgram) -> bool {
+    fn expr_has_lazy(expr: &LirExpr) -> bool {
+        matches!(expr, LirExpr::LazySpawn { .. } | LirExpr::LazyJoin { .. })
+    }
+    fn stmt_has_lazy(stmt: &LirStmt) -> bool {
+        match stmt {
+            LirStmt::Let { expr, .. } => expr_has_lazy(expr),
+            LirStmt::If { then_body, else_body, .. } => {
+                then_body.iter().any(stmt_has_lazy) || else_body.iter().any(stmt_has_lazy)
+            }
+            LirStmt::IfReturn { then_body, else_body, .. } => {
+                then_body.iter().any(stmt_has_lazy) || else_body.iter().any(stmt_has_lazy)
+            }
+            LirStmt::Loop { cond_stmts, body, .. } => {
+                cond_stmts.iter().any(stmt_has_lazy) || body.iter().any(stmt_has_lazy)
+            }
+            LirStmt::Switch { cases, default_body, .. } => {
+                cases.iter().any(|c| c.body.iter().any(stmt_has_lazy))
+                    || default_body.iter().any(stmt_has_lazy)
+            }
+            LirStmt::TryCatch { body, catch_body, .. } => {
+                body.iter().any(stmt_has_lazy) || catch_body.iter().any(stmt_has_lazy)
+            }
+        }
+    }
+    program.functions.iter().any(|f| f.body.iter().any(stmt_has_lazy))
 }

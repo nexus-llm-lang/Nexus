@@ -196,6 +196,15 @@ impl TypeEnv {
                 }
             }
         }
+        // name → try @name (lazy let-binding stored with @ sigil prefix)
+        if !name.starts_with('@') && !name.starts_with('%') && !name.starts_with('&') && !name.starts_with('~') {
+            let lazy_key = format!("@{}", name);
+            if let Some(scheme) = self.vars.get(&lazy_key) {
+                if matches!(&scheme.typ, crate::types::Type::Lazy(_)) {
+                    return Some(scheme);
+                }
+            }
+        }
         if let Some(pos) = name.find('.') {
             let mod_name = &name[..pos];
             let item_name = &name[pos + 1..];
@@ -249,6 +258,13 @@ impl TypeEnv {
         // %name → try name (linear param stored without sigil prefix)
         if let Some(stripped) = name.strip_prefix('%') {
             if self.linear_vars.remove(stripped) {
+                return Ok(());
+            }
+        }
+        // name → try @name (lazy binding stored with @ prefix)
+        if !name.starts_with('@') && !name.starts_with('%') && !name.starts_with('&') {
+            let lazy_key = format!("@{}", name);
+            if self.linear_vars.remove(&lazy_key) {
                 return Ok(());
             }
         }

@@ -172,6 +172,19 @@ pub enum LirExpr {
         typ: Type,
         callee_type: Type,
     },
+    /// Spawn a lazy thunk for parallel evaluation.
+    /// Calls __nx_lazy_spawn(thunk_ptr, num_captures) -> task_id.
+    LazySpawn {
+        thunk: LirAtom,
+        num_captures: u32,
+        typ: Type,
+    },
+    /// Join a spawned lazy thunk, blocking until the result is available.
+    /// Calls __nx_lazy_join(task_id) -> result_value.
+    LazyJoin {
+        task_id: LirAtom,
+        typ: Type,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

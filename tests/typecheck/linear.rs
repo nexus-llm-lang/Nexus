@@ -315,3 +315,65 @@ fn test_lazy_unused_is_error() {
     "#,
     );
 }
+
+#[test]
+fn test_lazy_primitive_unused_is_error() {
+    // @T is NEVER auto-droppable, even when T is a primitive
+    should_fail_typecheck(
+        r#"
+    let main = fn () -> unit do
+        let @x = 42
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_lazy_double_force_is_error() {
+    // @T is one-shot: forcing twice must fail
+    should_fail_typecheck(
+        r#"
+    let main = fn () -> unit do
+        let @x = 42
+        let a = @x
+        let b = @x
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_lazy_pass_thunk_by_bare_name() {
+    // Bare name `x` resolves to @x binding, returning @T (the thunk itself)
+    should_typecheck(
+        r#"
+    let consume_thunk = fn (@t: @i64) -> unit do
+        let v = @t
+        return ()
+    end
+    let main = fn () -> unit do
+        let @x = 42
+        consume_thunk(t: x)
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_lazy_capture_linearizes_closure() {
+    // Capturing @x in a closure makes the closure linear
+    should_fail_typecheck(
+        r#"
+    let main = fn () -> unit do
+        let @x = 42
+        let f = fn () -> i64 do return @x end
+        f()
+        f()
+        return ()
+    end
+    "#,
+    );
+}

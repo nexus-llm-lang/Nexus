@@ -26,10 +26,7 @@
 "try" @keyword.try
 "catch" @keyword.try
 
-; Concurrency
-"conc" @keyword.conc
 "do" @keyword
-"task" @keyword.task
 
 ; Type/exception definitions
 "type" @keyword.type

@@ -47,20 +47,15 @@ end
 </div>
 <div class="code-card" markdown="1">
 
-### Conc Blocks
+### Lazy Parallelism (`@`)
 
-Parallel tasks with captured variables. Compiles to WASM with WASI capabilities.
+Lazy thunks with automatic DAG-parallel evaluation. Linear types guarantee one-shot semantics.
 
 ```nexus
-let %arr = [| 0, 0 |]
-conc do
-  task t1 do
-    let r = &%arr; r[0] <- compute_a()
-  end
-  task t2 do
-    let r = &%arr; r[1] <- compute_b()
-  end
-end
+let @a = compute_a()      // suspended — not evaluated
+let @b = compute_b()      // suspended — not evaluated
+let result_a = @a          // force both in parallel
+let result_b = @b          // (compiler detects independence)
 ```
 
 </div>

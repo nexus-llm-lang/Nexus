@@ -486,6 +486,26 @@ fn digit_value(c: char) -> i64
 fn hex_digit_value(c: char) -> i64
 ```
 
+### Lazy (`lazy.nx`)
+
+Combinators for `@` thunk evaluation. Backed by `nexus:runtime/lazy` host functions.
+
+```nexus
+fn race(a: i64, b: i64) -> i64
+fn cancel(thunk: i64) -> unit
+fn detach(thunk: i64) -> unit
+fn force_all(tasks: [i64]) -> [i64]
+```
+
+| Function | Description |
+|---|---|
+| `race(a, b)` | Force two thunks in parallel, return the first to complete; loser discarded |
+| `cancel(thunk)` | Consume a thunk without evaluating (satisfies linearity) |
+| `detach(thunk)` | Fire-and-forget: start evaluation, don't wait for result |
+| `force_all(tasks)` | Spawn all thunks in parallel, join results in order |
+
+Note: functions use `i64` internally (all values are i64 at WASM level). The `@T` linearity is enforced at the call site by the typechecker.
+
 ### Core (`core.nx`)
 
 Legacy re-exports for backwards compatibility. Prefer `tuple.nx`, `list.nx`, `math.nx` for new code.

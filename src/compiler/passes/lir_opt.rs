@@ -58,6 +58,9 @@ fn optimize_function(func: &mut LirFunction) {
     }
     // 5. Unreachable code stripping (remove stmts after divergent stmts)
     strip_unreachable_stmts(&mut func.body);
+    // 6. Lazy parallelization: convert consecutive zero-arg CallIndirect (force) into
+    //    LazySpawn/LazyJoin pairs for parallel evaluation.
+    parallelize_consecutive_forces(&mut func.body);
 }
 
 /// Collect names that are bound by Let more than once (across all nested scopes).
@@ -733,6 +736,8 @@ fn subst_expr(expr: &mut LirExpr, subst: &HashMap<Symbol, LirAtom>) {
             subst_atom(value, subst);
         }
         LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => subst_atom(value, subst),
+        LirExpr::LazySpawn { thunk, .. } => subst_atom(thunk, subst),
+        LirExpr::LazyJoin { task_id, .. } => subst_atom(task_id, subst),
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::Closure { captures, .. } => {
             for (_, cap) in captures {
@@ -884,6 +889,8 @@ fn count_uses_in_expr(expr: &LirExpr, uses: &mut HashMap<Symbol, u32>) {
         LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => {
             count_uses_in_atom(value, uses)
         }
+        LirExpr::LazySpawn { thunk, .. } => count_uses_in_atom(thunk, uses),
+        LirExpr::LazyJoin { task_id, .. } => count_uses_in_atom(task_id, uses),
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::Closure { captures, .. } => {
             for (_, cap) in captures {
@@ -1258,6 +1265,8 @@ fn expr_references_any(expr: &LirExpr, vars: &HashSet<Symbol>) -> bool {
         LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => {
             atom_references_any(value, vars)
         }
+        LirExpr::LazySpawn { thunk, .. } => atom_references_any(thunk, vars),
+        LirExpr::LazyJoin { task_id, .. } => atom_references_any(task_id, vars),
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => false,
         LirExpr::Closure { captures, .. } => {
             captures.iter().any(|(_, a)| atom_references_any(a, vars))
@@ -1748,6 +1757,8 @@ fn rename_expr(expr: &mut LirExpr, map: &HashMap<Symbol, Symbol>) {
             rename_atom(value, map);
         }
         LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => rename_atom(value, map),
+        LirExpr::LazySpawn { thunk, .. } => rename_atom(thunk, map),
+        LirExpr::LazyJoin { task_id, .. } => rename_atom(task_id, map),
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::Closure { captures, .. } => {
             for (_, cap) in captures {
@@ -1982,6 +1993,11 @@ fn hash_expr(expr: &LirExpr, h: &mut impl std::hash::Hasher) {
             format!("{:?}", typ).hash(h);
         }
         LirExpr::Raise { typ, .. } | LirExpr::Force { typ, .. } => format!("{:?}", typ).hash(h),
+        LirExpr::LazySpawn { num_captures, typ, .. } => {
+            num_captures.hash(h);
+            format!("{:?}", typ).hash(h);
+        }
+        LirExpr::LazyJoin { typ, .. } => format!("{:?}", typ).hash(h),
         LirExpr::FuncRef { func, .. } => func.hash(h),
         LirExpr::Closure { func, captures, .. } => {
             func.hash(h);
@@ -2264,4 +2280,150 @@ fn redirect_calls_in_expr(expr: &mut LirExpr, redirect: &HashMap<Symbol, Symbol>
         }
         _ => {}
     }
+}
+
+// ── Lazy parallelization ────────────────────────────────────────────────────
+
+/// Detect 2+ consecutive zero-arg CallIndirect statements (lazy force) and
+/// convert them to LazySpawn/LazyJoin pairs for parallel evaluation.
+fn parallelize_consecutive_forces(stmts: &mut Vec<LirStmt>) {
+    // Recursively process nested blocks first
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                parallelize_consecutive_forces(then_body);
+                parallelize_consecutive_forces(else_body);
+            }
+            LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                parallelize_consecutive_forces(then_body);
+                parallelize_consecutive_forces(else_body);
+            }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                parallelize_consecutive_forces(cond_stmts);
+                parallelize_consecutive_forces(body);
+            }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for c in cases {
+                    parallelize_consecutive_forces(&mut c.body);
+                }
+                parallelize_consecutive_forces(default_body);
+            }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                parallelize_consecutive_forces(body);
+                parallelize_consecutive_forces(catch_body);
+            }
+            LirStmt::Let { .. } => {}
+        }
+    }
+
+    // Build a map: variable name → capture count (from Closure creation stmts)
+    let mut closure_capture_counts: HashMap<Symbol, u32> = HashMap::new();
+    for stmt in stmts.iter() {
+        if let LirStmt::Let {
+            name,
+            expr: LirExpr::Closure { captures, .. },
+            ..
+        } = stmt
+        {
+            closure_capture_counts.insert(*name, captures.len() as u32);
+        }
+        // FuncRef has zero captures
+        if let LirStmt::Let {
+            name,
+            expr: LirExpr::FuncRef { .. },
+            ..
+        } = stmt
+        {
+            closure_capture_counts.insert(*name, 0);
+        }
+    }
+
+    // Find runs of 2+ consecutive zero-arg CallIndirect (force) stmts
+    let mut new_stmts = Vec::with_capacity(stmts.len());
+    let mut i = 0;
+    while i < stmts.len() {
+        let run_start = i;
+        // Collect consecutive force calls
+        let mut force_run: Vec<(Symbol, LirAtom, Type, u32)> = Vec::new();
+        while i < stmts.len() {
+            if let LirStmt::Let {
+                name,
+                expr: LirExpr::CallIndirect { callee, args, typ, .. },
+                ..
+            } = &stmts[i]
+            {
+                if args.is_empty() {
+                    let num_captures = match callee {
+                        LirAtom::Var { name: thunk_name, .. } => {
+                            closure_capture_counts.get(thunk_name).copied().unwrap_or(0)
+                        }
+                        _ => 0,
+                    };
+                    force_run.push((*name, callee.clone(), typ.clone(), num_captures));
+                    i += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        if force_run.len() >= 2 {
+            // Emit LazySpawn for each thunk
+            let mut task_ids: Vec<(Symbol, Symbol, Type)> = Vec::new();
+            for (result_name, thunk_atom, result_type, num_captures) in &force_run {
+                let tid_name = Symbol::from(format!("__lazy_tid_{}", result_name).as_str());
+                new_stmts.push(LirStmt::Let {
+                    name: tid_name,
+                    typ: Type::I64,
+                    expr: LirExpr::LazySpawn {
+                        thunk: thunk_atom.clone(),
+                        num_captures: *num_captures,
+                        typ: Type::I64,
+                    },
+                });
+                task_ids.push((tid_name, *result_name, result_type.clone()));
+            }
+            // Emit LazyJoin for each, in order
+            for (tid_name, result_name, result_type) in task_ids {
+                new_stmts.push(LirStmt::Let {
+                    name: result_name,
+                    typ: result_type.clone(),
+                    expr: LirExpr::LazyJoin {
+                        task_id: LirAtom::Var {
+                            name: tid_name,
+                            typ: Type::I64,
+                        },
+                        typ: result_type,
+                    },
+                });
+            }
+        } else {
+            // Not a parallelizable run — emit original stmts
+            for stmt in stmts[run_start..i].iter() {
+                new_stmts.push(stmt.clone());
+            }
+            if i == run_start {
+                // No progress — push current stmt and advance
+                new_stmts.push(stmts[i].clone());
+                i += 1;
+            }
+        }
+    }
+    *stmts = new_stmts;
 }
