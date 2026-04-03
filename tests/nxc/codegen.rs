@@ -161,3 +161,13 @@ fn exn_field_order_regression() {
 fn bytebuffer_minimal() {
     exec_with_stdlib(&read_fixture("nxc/test_bytebuffer_minimal.nx"));
 }
+
+#[test]
+fn lazy_thunk_syntax() {
+    exec_with_stdlib(&read_fixture("nxc/test_lazy.nx"));
+}
+
+#[test]
+fn exception_group_catch() {
+    exec_with_stdlib(&read_fixture("nxc/test_exception_group.nx"));
+}
