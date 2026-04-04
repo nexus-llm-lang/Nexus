@@ -99,7 +99,7 @@ fn compose_with_stdlib_impl(user_core_wasm: &[u8], include_host: bool) -> Result
     }
 
     // Encode user core WASM as component.
-    let user_component = encode_user_component(user_core_wasm, &app_wit)
+    let user_component = encode_user_component(user_core_wasm, &app_wit, include_host)
         .map_err(|e| format!("{}\n  generated WIT:\n{}", e, app_wit))?;
 
     if !has_stdlib {
@@ -206,7 +206,7 @@ fn build_app_wit(all_imports: &[&str], include_host: bool) -> String {
 }
 
 /// Encode the user's core WASM as a component.
-fn encode_user_component(core_wasm: &[u8], app_wit: &str) -> Result<Vec<u8>, String> {
+fn encode_user_component(core_wasm: &[u8], app_wit: &str, command: bool) -> Result<Vec<u8>, String> {
     let mut resolve = Resolve::default();
     // Push dependency packages first so stdlib/app WIT can reference them.
     let _cli_pkg = resolve
@@ -215,17 +215,17 @@ fn encode_user_component(core_wasm: &[u8], app_wit: &str) -> Result<Vec<u8>, Str
     let _runtime_pkg = resolve
         .push_str("nexus-runtime.wit", NEXUS_RUNTIME_WIT)
         .map_err(|e| format!("failed to parse nexus-runtime WIT: {}", e))?;
-    let _wasi_cli_pkg = resolve
-        .push_str("wasi-cli.wit", WASI_CLI_WIT)
-        .map_err(|e| format!("failed to parse wasi-cli WIT: {}", e))?;
     let _stdlib_pkg = resolve
         .push_str("stdlib.wit", STDLIB_WIT)
         .map_err(|e| format!("failed to parse stdlib WIT: {}", e))?;
+    let wasi_cli_pkg = resolve
+        .push_str("wasi-cli.wit", WASI_CLI_WIT)
+        .map_err(|e| format!("failed to parse wasi-cli WIT: {}", e))?;
     let app_pkg = resolve
         .push_str("app.wit", app_wit)
         .map_err(|e| format!("failed to parse app WIT: {}", e))?;
     let world = resolve
-        .select_world(&[app_pkg], Some("nexus:app/app"))
+        .select_world(&[app_pkg, wasi_cli_pkg], Some("nexus:app/app"))
         .map_err(|e| format!("failed to resolve app world: {}", e))?;
 
     let mut embedded = core_wasm.to_vec();
@@ -237,7 +237,11 @@ fn encode_user_component(core_wasm: &[u8], app_wit: &str) -> Result<Vec<u8>, Str
         .map_err(|e| format!("failed to init component encoder: {}", e))?
         .adapter(
             WASI_SNAPSHOT_MODULE,
-            wasi_preview1_component_adapter_provider::WASI_SNAPSHOT_PREVIEW1_REACTOR_ADAPTER,
+            if command {
+                wasi_preview1_component_adapter_provider::WASI_SNAPSHOT_PREVIEW1_COMMAND_ADAPTER
+            } else {
+                wasi_preview1_component_adapter_provider::WASI_SNAPSHOT_PREVIEW1_REACTOR_ADAPTER
+            },
         )
         .map_err(|e| format!("failed to add WASI adapter: {}", e))?
         .validate(true);
@@ -512,12 +516,16 @@ fn encode_standalone_component(
     let wit_source =
         "package nexus:app;\n\nworld app {\n  export main: func();\n}\n".to_string();
 
+    // Use the same approach as the old artifact.rs: push wasi:cli first, then app.
     let mut resolve = Resolve::default();
+    let wasi_cli_pkg = resolve
+        .push_str("wasi_cli_run.wit", WASI_CLI_WIT)
+        .map_err(|e| format!("failed to parse wasi-cli WIT: {}", e))?;
     let app_pkg = resolve
         .push_str("app.wit", &wit_source)
         .map_err(|e| format!("failed to parse app WIT: {}", e))?;
     let world = resolve
-        .select_world(&[app_pkg], Some("nexus:app/app"))
+        .select_world(&[app_pkg, wasi_cli_pkg], Some("nexus:app/app"))
         .map_err(|e| format!("failed to resolve app world: {}", e))?;
 
     let mut embedded = core_wasm.to_vec();
@@ -536,7 +544,7 @@ fn encode_standalone_component(
 
     let mut result = encoder
         .encode()
-        .map_err(|e| format!("failed to encode standalone component: {}", e))?;
+        .map_err(|e| format!("failed to encode standalone component: {:#}", e))?;
 
     if !caps.is_empty() {
         append_custom_section(&mut result, caps);
