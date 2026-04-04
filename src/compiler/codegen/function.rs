@@ -684,6 +684,11 @@ fn collect_refs_in_expr(expr: &LirExpr, refs: &mut HashSet<Symbol>) {
         }
         LirExpr::LazySpawn { thunk, .. } => collect_refs_in_atom(thunk, refs),
         LirExpr::LazyJoin { task_id, .. } => collect_refs_in_atom(task_id, refs),
+        LirExpr::Intrinsic { args, .. } => {
+            for (_, a) in args {
+                collect_refs_in_atom(a, refs);
+            }
+        }
     }
 }
 
@@ -1091,6 +1096,43 @@ pub(super) fn compile_expr(
             compile_atom(task_id, out, local_map, layout)?;
             out.instruction(&Instruction::Call(join_idx));
             Ok(())
+        }
+        LirExpr::Intrinsic { kind, args, .. } => {
+            use crate::ir::lir::Intrinsic;
+            match kind {
+                Intrinsic::StringByteLength => {
+                    // packed_i64 & 0xFFFFFFFF → len as i64
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    compile_atom(s, out, local_map, layout)?;
+                    out.instruction(&Instruction::I64Const(0xFFFF_FFFF_u64 as i64));
+                    out.instruction(&Instruction::I64And);
+                    Ok(())
+                }
+                Intrinsic::StringByteAt => {
+                    // ptr = (packed >> 32) as i32; load8_u(ptr + idx as i32)
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let idx = &args.iter().find(|(l, _)| l.as_ref() == "idx").unwrap().1;
+                    compile_atom(s, out, local_map, layout)?;
+                    let packed_tmp = temps.packed_tmp_i64;
+                    out.instruction(&Instruction::LocalSet(packed_tmp));
+                    // ptr = high 32 bits
+                    out.instruction(&Instruction::LocalGet(packed_tmp));
+                    out.instruction(&Instruction::I64Const(32));
+                    out.instruction(&Instruction::I64ShrU);
+                    out.instruction(&Instruction::I32WrapI64);
+                    // idx
+                    compile_atom(idx, out, local_map, layout)?;
+                    out.instruction(&Instruction::I32WrapI64);
+                    // ptr + idx
+                    out.instruction(&Instruction::I32Add);
+                    // load byte
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    // Result is i32. The LIR type says i32 (from WIT s32).
+                    // But internally Nexus uses i64 for everything except i32-typed externals.
+                    // The caller wraps to i64 if needed via type coercion.
+                    Ok(())
+                }
+            }
         }
     }
 }

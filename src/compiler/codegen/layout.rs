@@ -374,6 +374,11 @@ fn collect_strings_in_expr(expr: &LirExpr, out: &mut Vec<String>) {
         }
         LirExpr::LazySpawn { thunk, .. } => collect_strings_in_atom(thunk, out),
         LirExpr::LazyJoin { task_id, .. } => collect_strings_in_atom(task_id, out),
+        LirExpr::Intrinsic { args, .. } => {
+            for (_, a) in args {
+                collect_strings_in_atom(a, out);
+            }
+        }
     }
 }
 

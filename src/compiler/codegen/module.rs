@@ -667,6 +667,11 @@ fn collect_funcref_targets(program: &LirProgram) -> Vec<Symbol> {
             LirExpr::ClosureEnvLoad { .. } => {}
             LirExpr::LazySpawn { thunk, .. } => scan_atom(thunk, targets),
             LirExpr::LazyJoin { task_id, .. } => scan_atom(task_id, targets),
+            LirExpr::Intrinsic { args, .. } => {
+                for (_, a) in args {
+                    scan_atom(a, targets);
+                }
+            }
             LirExpr::Atom(a) => scan_atom(a, targets),
         }
     }

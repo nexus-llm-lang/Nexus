@@ -198,6 +198,22 @@ pub enum LirExpr {
         task_id: LirAtom,
         typ: Type,
     },
+    /// Inline intrinsic — emitted as direct WASM instructions, no cross-component call.
+    Intrinsic {
+        kind: Intrinsic,
+        args: Vec<(Symbol, LirAtom)>,
+        typ: Type,
+    },
+}
+
+/// Built-in operations emitted as inline WASM instead of external calls.
+/// Recognized during LIR lowering from specific (wasm_module, wasm_name) pairs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Intrinsic {
+    /// string-byte-at(s, idx) → i32.load8_u(ptr + idx)
+    StringByteAt,
+    /// string-byte-length(s) → packed & 0xFFFFFFFF
+    StringByteLength,
 }
 
 #[derive(Debug, Clone, PartialEq)]
