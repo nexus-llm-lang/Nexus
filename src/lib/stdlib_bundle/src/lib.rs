@@ -18,7 +18,9 @@ pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
     nexus_wasm_alloc::deallocate(ptr, size);
 }
 
-#[cfg_attr(not(feature = "component"), no_mangle)]
+/// cabi_realloc for canonical ABI. Delegates to the system allocator
+/// (same as nexus_wasm_alloc). Allocations are tracked for proper dealloc.
+#[no_mangle]
 pub unsafe extern "C" fn cabi_realloc(
     old_ptr: i32,
     old_len: i32,
@@ -38,25 +40,13 @@ pub unsafe extern "C" fn cabi_realloc(
             return 0;
         };
         let ptr = alloc(layout);
-        let ptr = ptr as i32;
-        nexus_wasm_alloc::remember_allocation(ptr, new_len);
-        return ptr;
+        ptr as i32
+    } else {
+        let old_len = old_len as usize;
+        let Ok(old_layout) = Layout::from_size_align(old_len, align) else {
+            return 0;
+        };
+        let ptr = realloc(old_ptr as *mut u8, old_layout, new_len);
+        if ptr.is_null() { 0 } else { ptr as i32 }
     }
-
-    let old_len = old_len as usize;
-    if !nexus_wasm_alloc::take_allocation(old_ptr, old_len) {
-        return 0;
-    }
-    let Ok(old_layout) = Layout::from_size_align(old_len, align) else {
-        nexus_wasm_alloc::remember_allocation(old_ptr, old_len);
-        return 0;
-    };
-    let ptr = realloc(old_ptr as *mut u8, old_layout, new_len);
-    if ptr.is_null() {
-        nexus_wasm_alloc::remember_allocation(old_ptr, old_len);
-        return 0;
-    }
-    let ptr = ptr as i32;
-    nexus_wasm_alloc::remember_allocation(ptr, new_len);
-    ptr
 }
