@@ -21,6 +21,10 @@ use crate::runtime;
 const STDLIB_COMPONENT_WASM: &[u8] =
     include_bytes!("../../nxlib/stdlib/stdlib-component.wasm");
 
+/// The nexus-host bridge core module (HTTP bridge component).
+const NEXUS_HOST_BRIDGE_WASM: &[u8] =
+    include_bytes!("../../nxlib/stdlib/nexus-host-bridge.wasm");
+
 /// Full WIT source for stdlib interfaces.
 const STDLIB_WIT: &str = include_str!("../../src/lib/stdlib_bundle/wit/world.wit");
 
@@ -29,6 +33,9 @@ const NEXUS_CLI_WIT: &str =
     include_str!("../../src/lib/stdlib_bundle/wit/deps/nexus-cli.wit");
 
 /// WIT source for the nexus:runtime package (backtrace, lazy, conc).
+/// WIT source for the wasi:cli package (run interface).
+const WASI_CLI_WIT: &str = "package wasi:cli@0.2.6;\n\ninterface run {\n  run: func() -> result;\n}\n";
+
 const NEXUS_RUNTIME_WIT: &str = "\
 package nexus:runtime;\n\
 \n\
@@ -53,7 +60,19 @@ interface lazy {\n\
 /// 4. Compose them into a single component via wasm-compose
 ///
 /// Returns the composed component WASM bytes.
+/// Compose with stdlib only (nexus-host left as unresolved import).
+/// Used by test harness which provides host stubs at runtime.
 pub fn compose_with_stdlib(user_core_wasm: &[u8]) -> Result<Vec<u8>, String> {
+    compose_with_stdlib_impl(user_core_wasm, false)
+}
+
+/// Compose with stdlib + nexus-host bridge (fully self-contained).
+/// Used by `nexus build` for standalone component output.
+pub fn compose_with_stdlib_and_host(user_core_wasm: &[u8]) -> Result<Vec<u8>, String> {
+    compose_with_stdlib_impl(user_core_wasm, true)
+}
+
+fn compose_with_stdlib_impl(user_core_wasm: &[u8], include_host: bool) -> Result<Vec<u8>, String> {
     let caps = runtime::parse_nexus_capabilities(user_core_wasm);
 
     // Detect which stdlib interfaces and other modules the user imports.
@@ -71,7 +90,7 @@ pub fn compose_with_stdlib(user_core_wasm: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     // Build WIT world for the user module.
-    let app_wit = build_app_wit(&nexus_imports);
+    let app_wit = build_app_wit(&nexus_imports, include_host);
 
     // Debug: save core WASM on failure
     if std::env::var_os("NEXUS_DEBUG_COMPOSE").is_some() {
@@ -95,8 +114,12 @@ pub fn compose_with_stdlib(user_core_wasm: &[u8]) -> Result<Vec<u8>, String> {
     // Encode stdlib core WASM as component.
     let stdlib_component = encode_stdlib_component()?;
 
-    // Compose user + stdlib.
-    let composed = compose_components(&user_component, &stdlib_component)?;
+    let composed = if include_host {
+        let nexus_host_component = encode_nexus_host_component()?;
+        compose_all(&user_component, &stdlib_component, &nexus_host_component)?
+    } else {
+        compose_components(&user_component, &stdlib_component)?
+    };
 
     // Re-append capabilities section.
     let mut result = composed;
@@ -156,7 +179,7 @@ const ALL_STDLIB_INTERFACES: &[&str] = &[
 ];
 
 /// Build a WIT world source for the user app, importing the given stdlib interfaces.
-fn build_app_wit(all_imports: &[&str]) -> String {
+fn build_app_wit(all_imports: &[&str], include_host: bool) -> String {
     let mut wit = String::new();
     wit.push_str("package nexus:app;\n\n");
     wit.push_str("world app {\n");
@@ -192,6 +215,9 @@ fn encode_user_component(core_wasm: &[u8], app_wit: &str) -> Result<Vec<u8>, Str
     let _runtime_pkg = resolve
         .push_str("nexus-runtime.wit", NEXUS_RUNTIME_WIT)
         .map_err(|e| format!("failed to parse nexus-runtime WIT: {}", e))?;
+    let _wasi_cli_pkg = resolve
+        .push_str("wasi-cli.wit", WASI_CLI_WIT)
+        .map_err(|e| format!("failed to parse wasi-cli WIT: {}", e))?;
     let _stdlib_pkg = resolve
         .push_str("stdlib.wit", STDLIB_WIT)
         .map_err(|e| format!("failed to parse stdlib WIT: {}", e))?;
@@ -237,6 +263,186 @@ fn encode_stdlib_component() -> Result<Vec<u8>, String> {
     encoder
         .encode()
         .map_err(|e| format!("failed to encode stdlib component: {}", e))
+}
+
+/// Encode the nexus-host bridge core WASM as a component.
+fn encode_nexus_host_component() -> Result<Vec<u8>, String> {
+    let mut encoder = ComponentEncoder::default()
+        .module(NEXUS_HOST_BRIDGE_WASM)
+        .map_err(|e| format!("failed to init nexus-host component encoder: {}", e))?
+        .adapter(
+            WASI_SNAPSHOT_MODULE,
+            wasi_preview1_component_adapter_provider::WASI_SNAPSHOT_PREVIEW1_REACTOR_ADAPTER,
+        )
+        .map_err(|e| format!("failed to add WASI adapter to nexus-host: {}", e))?
+        .validate(true);
+
+    encoder
+        .encode()
+        .map_err(|e| format!("failed to encode nexus-host component: {}", e))
+}
+
+/// Compose user component with multiple dependency components via wasm-compose.
+fn compose_components_multi(
+    user_component: &[u8],
+    deps: &[(&str, &[u8])],
+) -> Result<Vec<u8>, String> {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "nexus-compose-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&temp_dir)
+        .map_err(|e| format!("failed to create temp compose dir: {}", e))?;
+
+    let result = (|| -> Result<Vec<u8>, String> {
+        let user_path = temp_dir.join("user.wasm");
+        fs::write(&user_path, user_component)
+            .map_err(|e| format!("failed to write user component: {}", e))?;
+
+        let mut config = ComposeConfig {
+            dir: temp_dir.clone(),
+            search_paths: vec![temp_dir.clone()],
+            disallow_imports: false,
+            ..Default::default()
+        };
+
+        // Write deps and register them for interface-based matching.
+        let user_imports = component_import_names(user_component)?;
+        for (name, bytes) in deps {
+            let dep_path = temp_dir.join(name);
+            fs::write(&dep_path, bytes)
+                .map_err(|e| format!("failed to write dep {}: {}", name, e))?;
+
+            // Register this dep for each user import it can satisfy.
+            let dep_file = PathBuf::from(*name);
+            for import_name in &user_imports {
+                if !config.dependencies.contains_key(import_name) {
+                    config.dependencies.insert(
+                        import_name.clone(),
+                        ComposeDependency { path: dep_file.clone() },
+                    );
+                }
+            }
+        }
+
+        ComponentComposer::new(&user_path, &config)
+            .compose()
+            .map_err(|e| format!("component composition failed: {e:#}"))
+    })();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
+}
+
+/// Compose two components: primary + single dependency.
+fn compose_two(primary: &[u8], dep_name: &str, dep_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "nexus-compose2-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&temp_dir)
+        .map_err(|e| format!("failed to create temp compose dir: {}", e))?;
+
+    let result = (|| -> Result<Vec<u8>, String> {
+        let primary_path = temp_dir.join("primary.wasm");
+        let dep_path = temp_dir.join(dep_name);
+        fs::write(&primary_path, primary)
+            .map_err(|e| format!("failed to write primary component: {}", e))?;
+        fs::write(&dep_path, dep_bytes)
+            .map_err(|e| format!("failed to write dep component: {}", e))?;
+
+        let dep_file = PathBuf::from(dep_name);
+        let mut config = ComposeConfig {
+            dir: temp_dir.clone(),
+            disallow_imports: false,
+            ..Default::default()
+        };
+
+        // Register the dep for all primary imports (composer matches by interface).
+        let primary_imports = component_import_names(primary)?;
+        for import_name in &primary_imports {
+            config.dependencies.insert(
+                import_name.clone(),
+                ComposeDependency { path: dep_file.clone() },
+            );
+        }
+
+        ComponentComposer::new(&primary_path, &config)
+            .compose()
+            .map_err(|e| format!("compose_two failed: {e:#}"))
+    })();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
+}
+
+/// Compose user + stdlib + nexus-host in one step.
+/// All components are placed in a temp dir and the composer auto-discovers them.
+fn compose_all(
+    user_component: &[u8],
+    stdlib_component: &[u8],
+    nexus_host_component: &[u8],
+) -> Result<Vec<u8>, String> {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "nexus-compose-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&temp_dir)
+        .map_err(|e| format!("failed to create temp compose dir: {}", e))?;
+
+    let result = (|| -> Result<Vec<u8>, String> {
+        let user_path = temp_dir.join("user.wasm");
+        fs::write(&user_path, user_component)
+            .map_err(|e| format!("failed to write user component: {}", e))?;
+        fs::write(temp_dir.join("stdlib.wasm"), stdlib_component)
+            .map_err(|e| format!("failed to write stdlib component: {}", e))?;
+        fs::write(temp_dir.join("nexus-host.wasm"), nexus_host_component)
+            .map_err(|e| format!("failed to write nexus-host component: {}", e))?;
+
+        // Register explicit deps for user's stdlib imports, plus search path for transitive deps.
+        let stdlib_file = PathBuf::from("stdlib.wasm");
+        let mut config = ComposeConfig {
+            dir: temp_dir.clone(),
+            search_paths: vec![temp_dir.clone()],
+            disallow_imports: false,
+            ..Default::default()
+        };
+
+        let nexus_host_file = PathBuf::from("nexus-host.wasm");
+        let user_imports = component_import_names(user_component)?;
+        for import_name in &user_imports {
+            if import_name.starts_with("nexus:stdlib/") {
+                config.dependencies.insert(
+                    import_name.clone(),
+                    ComposeDependency { path: stdlib_file.clone() },
+                );
+            }
+        }
+        // Satisfy stdlib's transitive nexus:cli/nexus-host import.
+        config.dependencies.insert(
+            "nexus:cli/nexus-host".to_string(),
+            ComposeDependency { path: nexus_host_file },
+        );
+
+        ComponentComposer::new(&user_path, &config)
+            .compose()
+            .map_err(|e| format!("component composition failed: {e:#}"))
+    })();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
 }
 
 /// Compose user component + stdlib component via wasm-compose.

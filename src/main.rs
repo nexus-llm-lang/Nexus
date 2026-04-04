@@ -78,7 +78,7 @@ fn build_command(
         Ok(wasm) => wasm,
         Err(code) => return code,
     };
-    let final_wasm = match nexus::compiler::compose::compose_with_stdlib(&core_wasm) {
+    let final_wasm = match nexus::compiler::compose::compose_with_stdlib_and_host(&core_wasm) {
         Ok(component_wasm) => component_wasm,
         Err(msg) => {
             eprintln!("Composition Error: {}", msg);
@@ -107,7 +107,7 @@ fn compose_command(input: std::path::PathBuf, output: Option<std::path::PathBuf>
             return ExitCode::from(1);
         }
     };
-    let composed = match nexus::compiler::compose::compose_with_stdlib(&core_wasm) {
+    let composed = match nexus::compiler::compose::compose_with_stdlib_and_host(&core_wasm) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Composition Error: {}", e);
