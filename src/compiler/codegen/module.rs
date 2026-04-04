@@ -550,45 +550,52 @@ fn compile_wasi_cli_run_wrapper(main_idx: u32, main_ret_type: &Type) -> Function
 /// Implementation: delegates to the stdlib `allocate` function if available,
 /// otherwise uses the bump heap allocator. old_ptr/old_size are currently ignored
 /// (no realloc support — always allocates fresh).
+/// Arena size for cabi_realloc: 128MB. When the bump pointer exceeds this
+/// region (heap_base + ARENA_SIZE), it wraps back to heap_base. Canonical ABI
+/// allocations are short-lived (string copies consumed immediately), so old
+/// data at the wrapped region is no longer referenced.
+const CABI_ARENA_SIZE: i32 = 128 * 1024 * 1024;
+
 fn compile_cabi_realloc(layout: &CodegenLayout) -> Function {
     use super::OBJECT_HEAP_GLOBAL_INDEX;
 
     // Locals: params are 0=old_ptr, 1=old_size, 2=align, 3=new_size
-    // One extra local for the aligned pointer
+    // Extra locals: 4=aligned_ptr
     let mut body = Function::new(vec![(1, ValType::I32)]);
     let aligned_ptr_local = 4u32;
 
     if let Some(alloc_idx) = layout.allocate_func_idx {
-        // Use stdlib allocator (handles alignment internally)
-        body.instruction(&Instruction::LocalGet(3)); // new_size
+        body.instruction(&Instruction::LocalGet(3));
         body.instruction(&Instruction::Call(alloc_idx));
     } else {
-        // Bump allocator with alignment: align heap ptr UP to required alignment,
-        // then bump by new_size.
-        //
-        // aligned_ptr = (heap_ptr + align - 1) & ~(align - 1)
-        // new_heap = aligned_ptr + new_size
-
-        // Compute aligned_ptr
+        // Arena reset: if heap_ptr > heap_base + ARENA_SIZE, wrap to heap_base.
+        let arena_limit = layout.heap_base as i32 + CABI_ARENA_SIZE;
         body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
-        body.instruction(&Instruction::LocalGet(2)); // align
+        body.instruction(&Instruction::I32Const(arena_limit));
+        body.instruction(&Instruction::I32GtU);
+        body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        body.instruction(&Instruction::I32Const(layout.heap_base as i32));
+        body.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+        body.instruction(&Instruction::End);
+
+        // Aligned bump: aligned_ptr = (heap_ptr + align - 1) & ~(align - 1)
+        body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+        body.instruction(&Instruction::LocalGet(2));
         body.instruction(&Instruction::I32Add);
         body.instruction(&Instruction::I32Const(1));
-        body.instruction(&Instruction::I32Sub); // heap_ptr + align - 1
-        // ~(align - 1) = -(align) when align is power of 2, but safer:
-        // mask = 0 - align (two's complement negation gives the AND mask)
+        body.instruction(&Instruction::I32Sub);
         body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::LocalGet(2)); // align
-        body.instruction(&Instruction::I32Sub); // 0 - align = mask
-        body.instruction(&Instruction::I32And); // (heap_ptr + align - 1) & mask
+        body.instruction(&Instruction::LocalGet(2));
+        body.instruction(&Instruction::I32Sub);
+        body.instruction(&Instruction::I32And);
         body.instruction(&Instruction::LocalSet(aligned_ptr_local));
 
         // Return aligned_ptr
         body.instruction(&Instruction::LocalGet(aligned_ptr_local));
 
-        // Advance heap pointer: new_heap = aligned_ptr + new_size
+        // Advance: new_heap = aligned_ptr + new_size
         body.instruction(&Instruction::LocalGet(aligned_ptr_local));
-        body.instruction(&Instruction::LocalGet(3)); // new_size
+        body.instruction(&Instruction::LocalGet(3));
         body.instruction(&Instruction::I32Add);
         body.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
     }
