@@ -340,5 +340,6 @@ pub(super) fn expr_type(expr: &LirExpr) -> Type {
         LirExpr::CallIndirect { typ, .. } => typ.clone(),
         LirExpr::LazySpawn { typ, .. } => typ.clone(),
         LirExpr::LazyJoin { typ, .. } => typ.clone(),
+        LirExpr::Intrinsic { typ, .. } => typ.clone(),
     }
 }

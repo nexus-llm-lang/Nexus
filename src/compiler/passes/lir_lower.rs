@@ -165,7 +165,7 @@ impl<'a> LirLowerer<'a> {
     fn lower(&mut self) -> Result<LirProgram, LirLowerError> {
         let mut functions = Vec::new();
         for func in &self.mir.functions {
-            let lir_func = lower_mir_function(func, self.enum_defs)?;
+            let lir_func = lower_mir_function(func, self.enum_defs, &self.mir.externals)?;
             functions.push(lir_func);
         }
 
@@ -205,8 +205,9 @@ impl<'a> LirLowerer<'a> {
 fn lower_mir_function(
     func: &MirFunction,
     enum_defs: &[EnumDef],
+    externals: &[crate::ir::mir::MirExternal],
 ) -> Result<LirFunction, LirLowerError> {
-    let mut ctx = LowerCtx::new(enum_defs);
+    let mut ctx = LowerCtx::new(enum_defs, externals);
 
     // Register params in vars (both wasm and semantic types)
     for p in &func.params {
@@ -286,6 +287,8 @@ struct LowerCtx<'a> {
     enum_defs: &'a [EnumDef],
     /// O(1) constructor lookup index: ctor_name → ConstructorInfo
     ctor_index: HashMap<String, ConstructorInfo>,
+    /// MIR externals for intrinsic recognition
+    externals: &'a [crate::ir::mir::MirExternal],
 }
 
 // ── Maranget decision tree types and construction ────────────────
@@ -782,7 +785,7 @@ fn default_matrix(rows: &[PatRow], col: usize, col_ids: &[usize]) -> Vec<PatRow>
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(enum_defs: &'a [EnumDef]) -> Self {
+    fn new(enum_defs: &'a [EnumDef], externals: &'a [crate::ir::mir::MirExternal]) -> Self {
         LowerCtx {
             vars: HashMap::new(),
             semantic_vars: HashMap::new(),
@@ -791,6 +794,7 @@ impl<'a> LowerCtx<'a> {
             temp_buf: String::with_capacity(16),
             ctor_index: build_constructor_index(enum_defs),
             enum_defs,
+            externals,
         }
     }
 
@@ -814,6 +818,26 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Like bind_expr_to_temp but also registers the semantic type for pattern matching.
+    /// Recognize specific external calls that can be emitted as inline WASM intrinsics.
+    fn try_intrinsify(
+        &self,
+        func: &crate::intern::Symbol,
+        _args: &[(crate::intern::Symbol, crate::ir::lir::LirAtom)],
+    ) -> Option<crate::ir::lir::Intrinsic> {
+        use crate::ir::lir::Intrinsic;
+        let ext = self.externals.iter().find(|e| e.name == *func)?;
+        let module = ext.wasm_module.as_ref();
+        let name = ext.wasm_name.as_ref();
+        if module != "nexus:stdlib/string-ops" {
+            return None;
+        }
+        match name {
+            "string-byte-at" => Some(Intrinsic::StringByteAt),
+            "string-byte-length" => Some(Intrinsic::StringByteLength),
+            _ => None,
+        }
+    }
+
     fn bind_expr_to_temp_semantic(
         &mut self,
         expr: LirExpr,
@@ -1945,6 +1969,18 @@ impl<'a> LowerCtx<'a> {
                 }
                 lir_args.sort_by(|(a, _), (b, _)| a.cmp(b));
                 let typ = wasm_type(ret_type);
+                // Try to lower as intrinsic (inline WASM, no component boundary crossing).
+                if let Some(intrinsic) = self.try_intrinsify(func, &lir_args) {
+                    return Ok(self.bind_expr_to_temp_semantic(
+                        LirExpr::Intrinsic {
+                            kind: intrinsic,
+                            args: lir_args,
+                            typ: typ.clone(),
+                        },
+                        typ,
+                        ret_type.clone(),
+                    ));
+                }
                 Ok(self.bind_expr_to_temp_semantic(
                     LirExpr::Call {
                         func: func.clone(),

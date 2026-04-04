@@ -75,6 +75,9 @@ fn collect_expr_refs(expr: &LirExpr, refs: &mut HashSet<Symbol>) {
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::LazySpawn { thunk, .. } => collect_atom_refs(thunk, refs),
         LirExpr::LazyJoin { task_id, .. } => collect_atom_refs(task_id, refs),
+        LirExpr::Intrinsic { args, .. } => {
+            for (_, a) in args { collect_atom_refs(a, refs); }
+        }
     }
 }
 

@@ -769,6 +769,11 @@ fn subst_expr(expr: &mut LirExpr, subst: &HashMap<Symbol, LirAtom>) {
         LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => subst_atom(value, subst),
         LirExpr::LazySpawn { thunk, .. } => subst_atom(thunk, subst),
         LirExpr::LazyJoin { task_id, .. } => subst_atom(task_id, subst),
+        LirExpr::Intrinsic { args, .. } => {
+            for (_, a) in args {
+                subst_atom(a, subst);
+            }
+        }
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::Closure { captures, .. } => {
             for (_, cap) in captures {
@@ -926,6 +931,11 @@ fn count_uses_in_expr(expr: &LirExpr, uses: &mut HashMap<Symbol, u32>) {
         }
         LirExpr::LazySpawn { thunk, .. } => count_uses_in_atom(thunk, uses),
         LirExpr::LazyJoin { task_id, .. } => count_uses_in_atom(task_id, uses),
+        LirExpr::Intrinsic { args, .. } => {
+            for (_, a) in args {
+                count_uses_in_atom(a, uses);
+            }
+        }
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::Closure { captures, .. } => {
             for (_, cap) in captures {
@@ -1307,6 +1317,7 @@ fn expr_references_any(expr: &LirExpr, vars: &HashSet<Symbol>) -> bool {
         }
         LirExpr::LazySpawn { thunk, .. } => atom_references_any(thunk, vars),
         LirExpr::LazyJoin { task_id, .. } => atom_references_any(task_id, vars),
+        LirExpr::Intrinsic { args, .. } => args.iter().any(|(_, a)| atom_references_any(a, vars)),
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => false,
         LirExpr::Closure { captures, .. } => {
             captures.iter().any(|(_, a)| atom_references_any(a, vars))
@@ -1804,6 +1815,11 @@ fn rename_expr(expr: &mut LirExpr, map: &HashMap<Symbol, Symbol>) {
         LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => rename_atom(value, map),
         LirExpr::LazySpawn { thunk, .. } => rename_atom(thunk, map),
         LirExpr::LazyJoin { task_id, .. } => rename_atom(task_id, map),
+        LirExpr::Intrinsic { args, .. } => {
+            for (_, a) in args {
+                rename_atom(a, map);
+            }
+        }
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::Closure { captures, .. } => {
             for (_, cap) in captures {
@@ -2048,6 +2064,9 @@ fn hash_expr(expr: &LirExpr, h: &mut impl std::hash::Hasher) {
             format!("{:?}", typ).hash(h);
         }
         LirExpr::LazyJoin { typ, .. } => format!("{:?}", typ).hash(h),
+        LirExpr::Intrinsic { kind, typ, .. } => {
+            format!("{:?}{:?}", kind, typ).hash(h);
+        }
         LirExpr::FuncRef { func, .. } => func.hash(h),
         LirExpr::Closure { func, captures, .. } => {
             func.hash(h);
@@ -2883,6 +2902,11 @@ fn mark_escapes_in_expr(
         }
         LirExpr::LazySpawn { thunk, .. } => mark_atom_escape(thunk, ctors, escaped),
         LirExpr::LazyJoin { task_id, .. } => mark_atom_escape(task_id, ctors, escaped),
+        LirExpr::Intrinsic { args, .. } => {
+            for (_, a) in args {
+                mark_atom_escape(a, ctors, escaped);
+            }
+        }
     }
 }
 
@@ -3266,5 +3290,6 @@ fn atom_mentions_var_in_expr(expr: &LirExpr, var: Symbol) -> bool {
         }
         LirExpr::LazySpawn { thunk, .. } => check(thunk),
         LirExpr::LazyJoin { task_id, .. } => check(task_id),
+        LirExpr::Intrinsic { args, .. } => args.iter().any(|(_, a)| check(a)),
     }
 }
