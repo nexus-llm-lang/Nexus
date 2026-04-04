@@ -22,7 +22,7 @@ pub struct CompiledWasm {
     pub app_needs_nexus_host: bool,
 }
 
-fn compile_loaded_source_to_core_wasm(
+pub fn compile_loaded_source_to_core_wasm(
     loaded: &LoadedSource,
     verbose: bool,
 ) -> Result<Vec<u8>, ExitCode> {

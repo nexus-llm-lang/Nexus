@@ -1163,11 +1163,21 @@ impl TypeChecker {
                         Sigil::Mutable => {
                             if let Type::Ref(i) = t {
                                 t = *i;
+                            } else {
+                                return Err(TypeError::new(
+                                    format!("Cannot dereference '~{}': type '{}' is not Ref", n, t),
+                                    e.span.clone(),
+                                ));
                             }
                         }
                         Sigil::Lazy => {
                             if let Type::Lazy(i) = t {
                                 t = *i;
+                            } else {
+                                return Err(TypeError::new(
+                                    format!("Cannot force '@{}': type '{}' is not Lazy", n, t),
+                                    e.span.clone(),
+                                ));
                             }
                         }
                         _ => {}

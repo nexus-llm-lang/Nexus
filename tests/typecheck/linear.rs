@@ -346,8 +346,9 @@ fn test_lazy_double_force_is_error() {
 
 #[test]
 fn test_lazy_pass_thunk_by_bare_name() {
-    // Bare name `x` must NOT resolve to @x — sigils are distinct bindings
-    should_fail_typecheck(
+    // Per spec §2: Γ keys are names only. `x` and `@x` refer to the same binding.
+    // `let @x = 42` binds `x` with type @i64; bare `x` resolves it.
+    should_typecheck(
         r#"
     let consume_thunk = fn (@t: @i64) -> unit do
         let v = @t
