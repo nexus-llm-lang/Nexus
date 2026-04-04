@@ -74,19 +74,14 @@ fn build_command(
         }
     };
 
-    let wasm_merge_command = bundler::resolve_wasm_merge_command(wasm_merge.as_deref());
-    let compiled = match compile_loaded_source_to_wasm(&loaded, true, &wasm_merge_command, verbose)
-    {
-        Ok(c) => c,
+    let core_wasm = match driver::compile_loaded_source_to_core_wasm(&loaded, verbose) {
+        Ok(wasm) => wasm,
         Err(code) => return code,
     };
-    let final_wasm = match artifact::encode_core_wasm_as_component(
-        &compiled.wasm,
-        compiled.app_needs_nexus_host,
-    ) {
+    let final_wasm = match nexus::compiler::compose::compose_with_stdlib(&core_wasm) {
         Ok(component_wasm) => component_wasm,
         Err(msg) => {
-            eprintln!("Component Encode Error: {}", msg);
+            eprintln!("Composition Error: {}", msg);
             return ExitCode::from(1);
         }
     };

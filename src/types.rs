@@ -198,8 +198,10 @@ impl Sigil {
     }
 
     /// Builds the canonical variable key used in environments.
+    /// Per the formal spec (§2), Γ keys are names only — the modality (sigil)
+    /// determines usage q ∈ {1, ω}, not the lookup key.
     pub fn get_key(&self, name: &str) -> String {
-        format!("{}{}", self.to_prefix(), name)
+        name.to_string()
     }
 }
 
