@@ -368,7 +368,7 @@ pub fn compile_lir_to_wasm(
     if matches!(layout.memory_mode, MemoryMode::Defined) {
         let mut memories = MemorySection::new();
         memories.memory(MemoryType {
-            minimum: 256,
+            minimum: 2304, // 144MB — enough for 128MB cabi_realloc arena + heap
             maximum: None,
             memory64: false,
             shared: false,
@@ -392,11 +392,11 @@ pub fn compile_lir_to_wasm(
     {
         // Emit bump-allocator global when object heap is active without stdlib
         // allocator, OR when cabi_realloc needs a fallback allocator.
-        let needs_globals = (layout.object_heap_enabled || needs_cabi_realloc)
+        let needs_heap_global = (layout.object_heap_enabled || needs_cabi_realloc)
             && layout.allocate_func_idx.is_none();
-        if needs_globals {
+        if needs_heap_global {
             let mut globals = GlobalSection::new();
-            // Heap pointer global (index 0 — OBJECT_HEAP_GLOBAL_INDEX)
+            // Global 0: object heap pointer (for constructors, string concat, retptr)
             globals.global(
                 GlobalType {
                     val_type: ValType::I32,
@@ -405,6 +405,19 @@ pub fn compile_lir_to_wasm(
                 },
                 &ConstExpr::i32_const(layout.heap_base as i32),
             );
+            if needs_cabi_realloc {
+                // Global 1: cabi_realloc arena pointer (separate from object heap)
+                // Starts at heap_base + 1MB to avoid overlapping with object heap
+                let cabi_arena_base = layout.heap_base as i32 + 1024 * 1024;
+                globals.global(
+                    GlobalType {
+                        val_type: ValType::I32,
+                        mutable: true,
+                        shared: false,
+                    },
+                    &ConstExpr::i32_const(cabi_arena_base),
+                );
+            }
             module.section(&globals);
         }
     }
@@ -554,10 +567,12 @@ fn compile_wasi_cli_run_wrapper(main_idx: u32, main_ret_type: &Type) -> Function
 /// region (heap_base + ARENA_SIZE), it wraps back to heap_base. Canonical ABI
 /// allocations are short-lived (string copies consumed immediately), so old
 /// data at the wrapped region is no longer referenced.
-const CABI_ARENA_SIZE: i32 = 128 * 1024 * 1024;
+/// Disabled arena reset — bump only, with memory.grow when needed.
+/// Arena reset corrupts live string references in string-heavy workloads.
+const CABI_ARENA_SIZE: i32 = i32::MAX; // effectively disabled
 
 fn compile_cabi_realloc(layout: &CodegenLayout) -> Function {
-    use super::OBJECT_HEAP_GLOBAL_INDEX;
+    const CABI_ARENA_GLOBAL: u32 = 1; // separate from object heap (global 0)
 
     // Locals: params are 0=old_ptr, 1=old_size, 2=align, 3=new_size
     // Extra locals: 4=aligned_ptr
@@ -568,18 +583,19 @@ fn compile_cabi_realloc(layout: &CodegenLayout) -> Function {
         body.instruction(&Instruction::LocalGet(3));
         body.instruction(&Instruction::Call(alloc_idx));
     } else {
-        // Arena reset: if heap_ptr > heap_base + ARENA_SIZE, wrap to heap_base.
-        let arena_limit = layout.heap_base as i32 + CABI_ARENA_SIZE;
-        body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+        // Arena reset: if cabi_ptr > arena_base + ARENA_SIZE, wrap to arena_base.
+        let cabi_arena_base = layout.heap_base as i32 + 1024 * 1024;
+        let arena_limit = cabi_arena_base + CABI_ARENA_SIZE;
+        body.instruction(&Instruction::GlobalGet(CABI_ARENA_GLOBAL));
         body.instruction(&Instruction::I32Const(arena_limit));
         body.instruction(&Instruction::I32GtU);
         body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        body.instruction(&Instruction::I32Const(layout.heap_base as i32));
-        body.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+        body.instruction(&Instruction::I32Const(cabi_arena_base));
+        body.instruction(&Instruction::GlobalSet(CABI_ARENA_GLOBAL));
         body.instruction(&Instruction::End);
 
-        // Aligned bump: aligned_ptr = (heap_ptr + align - 1) & ~(align - 1)
-        body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+        // Aligned bump on CABI arena (global 1)
+        body.instruction(&Instruction::GlobalGet(CABI_ARENA_GLOBAL));
         body.instruction(&Instruction::LocalGet(2));
         body.instruction(&Instruction::I32Add);
         body.instruction(&Instruction::I32Const(1));
@@ -593,11 +609,11 @@ fn compile_cabi_realloc(layout: &CodegenLayout) -> Function {
         // Return aligned_ptr
         body.instruction(&Instruction::LocalGet(aligned_ptr_local));
 
-        // Advance: new_heap = aligned_ptr + new_size
+        // Advance cabi arena pointer
         body.instruction(&Instruction::LocalGet(aligned_ptr_local));
         body.instruction(&Instruction::LocalGet(3));
         body.instruction(&Instruction::I32Add);
-        body.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+        body.instruction(&Instruction::GlobalSet(CABI_ARENA_GLOBAL));
     }
     body.instruction(&Instruction::End);
     body
