@@ -23,7 +23,7 @@ done
 NEXUS="${NEXUS:-./target/release/nexus}"
 NXC_ENTRY="nxc/driver.nx"
 WASMTIME="${WASMTIME:-wasmtime}"
-WASMTIME_FLAGS="-W tail-call=y,exceptions=y,component-model=y --invoke main --dir=. --dir=${TMPDIR:-/tmp}"
+WASMTIME_FLAGS="-W tail-call=y,exceptions=y,component-model=y,max-memory-size=8589934592 -S http,inherit-network --dir=. --dir=${TMPDIR:-/tmp}"
 NEXUS_BUILD_FLAGS=""
 
 RED='\033[0;31m'
