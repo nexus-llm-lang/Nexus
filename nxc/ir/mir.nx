@@ -10,6 +10,7 @@
 import { Span } from "nxc/common/token.nx"
 import { concat } from "stdlib/bytebuffer.nx"
 import { handler_func_name } from "nxc/common/naming.nx"
+import { starts_with, ends_with, length, substring } from "stdlib/string.nx"
 import { BinaryOp, Literal, TypeExpr } from "nxc/common/ast.nx"
 import * as hir from "nxc/ir/hir_types.nx"
 import { HirExprKind, HirStmtKind, HirCallArg, HirParam, HirFunction,
@@ -243,12 +244,19 @@ export let lower_hir_to_mir = fn (hir: HirProgram) -> MirProgram do
   let HirProgram(ports: ports, functions: funcs, externals: exts, handler_bindings: hbs, enum_defs: _) = hir
   let port_layouts = build_port_layouts(ports: ports)
   let handler_port_names = build_handler_port_names(bindings: hbs)
-  let global_scope = build_global_port_handlers(handler_port_names: handler_port_names)
+  // If handler_port_names is empty (ExprHandler matching failed in component model),
+  // infer from function names + port methods.
+  let inferred = infer_handler_port_names(funcs: funcs, ports: ports)
+  let effective_hpn = match handler_port_names do
+    case [] -> inferred
+    case _ -> append_name_pairs(a: handler_port_names, b: inferred)
+  end
+  let global_scope = build_global_port_handlers(handler_port_names: effective_hpn)
 
   let ctx = MirCtx(
     scope: global_scope,
     port_layouts: port_layouts,
-    handler_port_names: handler_port_names,
+    handler_port_names: effective_hpn,
     all_funcs: funcs,
     all_handlers: hbs,
     all_exts: exts,
@@ -526,6 +534,84 @@ let lower_port_call = fn (port_name: string, method_name: string, args: [HirCall
       let ret_type = lookup_ret_type(name: func_name, ctx: ctx)
       let mir_args = lower_call_args(args: args, ctx: ctx)
       return MirCall(func: func_name, args: mir_args, ret_type: ret_type)
+  end
+end
+
+/// Infer handler_binding_name → port_name from function names and port list.
+/// Scans for functions named __handler_<binding>_<method> and matches against port methods.
+let infer_handler_port_names = fn (funcs: [HirFunction], ports: [HirPort]) -> [NamePair] do
+  return infer_hpn_go(funcs: funcs, ports: ports, acc: [])
+end
+
+let infer_hpn_go = fn (funcs: [HirFunction], ports: [HirPort], acc: [NamePair]) -> [NamePair] do
+  match funcs do
+    case [] -> return acc
+    case HirFunction(name: n, type_params: _, params: _, ret_type: _, body: _, span: _) :: rest ->
+      if starts_with(s: n, prefix: "__handler_") then
+        // Extract binding_name from __handler_<binding>_<method>
+        // Find the port that has a method matching the suffix
+        match infer_port_from_handler(name: n, ports: ports) do
+          case Some(val: pair) ->
+            if name_pair_in_list(key: pair, pairs: acc) == false then
+              return infer_hpn_go(funcs: rest, ports: ports, acc: pair :: acc)
+            else
+              return infer_hpn_go(funcs: rest, ports: ports, acc: acc)
+            end
+          case None -> return infer_hpn_go(funcs: rest, ports: ports, acc: acc)
+        end
+      else
+        return infer_hpn_go(funcs: rest, ports: ports, acc: acc)
+      end
+  end
+end
+
+let name_pair_in_list = fn (key: NamePair, pairs: [NamePair]) -> bool do
+  match pairs do
+    case [] -> return false
+    case NamePair(key: k, value: _) :: rest ->
+      let NamePair(key: nk, value: _) = key
+      if k == nk then return true
+      else return name_pair_in_list(key: key, pairs: rest)
+      end
+  end
+end
+
+let infer_port_from_handler = fn (name: string, ports: [HirPort]) -> Option<NamePair> do
+  // name = __handler_<binding>_<method>
+  // Try each port: if name ends with _<method> for any method in the port,
+  // the binding_name is everything between __handler_ and _<method>
+  match ports do
+    case [] -> return None
+    case HirPort(name: pname, methods: methods) :: rest ->
+      match infer_binding_from_methods(handler_name: name, port_name: pname, methods: methods) do
+        case Some(val: binding) -> return Some(val: NamePair(key: binding, value: pname))
+        case None -> return infer_port_from_handler(name: name, ports: rest)
+      end
+  end
+end
+
+let infer_binding_from_methods = fn (handler_name: string, port_name: string, methods: [HirPortMethod]) -> Option<string> do
+  match methods do
+    case [] -> return None
+    case HirPortMethod(name: mname) :: rest ->
+      let suffix = "_" ++ mname
+      if ends_with(s: handler_name, suffix: suffix) then
+        // binding = handler_name without "__handler_" prefix and "_<method>" suffix
+        let prefix_len = 10 // length("__handler_")
+        let suffix_len = length(s: suffix)
+        let total_len = length(s: handler_name)
+        let binding = substring(s: handler_name, start: prefix_len, len: total_len - prefix_len - suffix_len)
+        return Some(val: binding)
+      else
+        return infer_binding_from_methods(handler_name: handler_name, port_name: port_name, methods: rest)
+      end
+  end
+end
+
+let append_name_pairs = fn (a: [NamePair], b: [NamePair]) -> [NamePair] do
+  match a do
+    case [] -> return b
+    case h :: t -> return h :: append_name_pairs(a: t, b: b)
   end
 end
 
