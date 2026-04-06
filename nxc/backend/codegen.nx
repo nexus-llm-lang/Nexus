@@ -42,7 +42,8 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          op_f64_add, op_f64_sub, op_f64_mul, op_f64_div,
          op_i32_wrap_i64, op_i64_extend_i32_s, op_i64_extend_i32_u,
          op_f64_reinterpret_i64, op_i64_reinterpret_f64,
-         op_i32_and, op_i32_or } from "nxc/backend/wasm_defs.nx"
+         op_i32_and, op_i32_or,
+         op_memory_size, op_memory_grow, op_i32_gt_u, op_i32_shl, op_i32_shr_u } from "nxc/backend/wasm_defs.nx"
 import { collect_program_strings, build_string_entries, compute_last_string_end,
          program_uses_heap, choose_memory_mode, has_stdlib, align8,
          collect_local_stmts, LocalResult, program_needs_eh,
@@ -55,6 +56,83 @@ import { build_type_section, build_import_section, build_function_section,
 import * as list from "stdlib/list.nx"
 import { contains, starts_with } from "stdlib/string.nx"
 import { SymbolNotFound } from "nxc/common/error.nx"
+
+// ─── Arena intrinsics (nexus:runtime/arena) ──────────────────────────────────
+// These are emitted as inline WASM (global.get/set 0), not external calls.
+// The externals are filtered out of the import section entirely.
+
+let is_arena_external = fn (ext: LirExternal) -> bool do
+  match ext do
+    case LirExternal(name: _, wasm_module: m, wasm_name: _, params: _, ret_type: _, throw_row: _) ->
+      return m == "nexus:runtime/arena"
+  end
+end
+
+let filter_arena_externals = fn (exts: [LirExternal]) -> [LirExternal] do
+  match exts do
+    case [] -> []
+    case e :: rest ->
+      if is_arena_external(ext: e) then
+        filter_arena_externals(exts: rest)
+      else
+        Cons(v: e, rest: filter_arena_externals(exts: rest))
+      end
+  end
+end
+
+/// Check if func is an arena intrinsic by looking up in the full externals list.
+/// Returns the wasm_name if it's an arena intrinsic, "" otherwise.
+let get_arena_wasm_name = fn (func: string, exts: [LirExternal]) -> string do
+  match find_external(name: func, exts: exts) do
+    case None -> ""
+    case Some(val: ext) ->
+      if is_arena_external(ext: ext) == false then return "" end
+      match ext do
+        case LirExternal(name: _, wasm_module: _, wasm_name: wn, params: _, ret_type: _, throw_row: _) -> wn
+      end
+  end
+end
+
+/// Emit inline WASM for an arena intrinsic. Dispatches on wasm_name.
+let emit_heap_mark = fn (buf: %ByteBuffer) -> %ByteBuffer do
+  // global.get 0 → i32; i64.extend_i32_u → i64
+  let %buf = push_byte(buf: %buf, byte: op_global_get)
+  let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
+  return push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+end
+
+let emit_heap_reset = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  // arg "mark" → i64; i32.wrap_i64; global.set 0; i64.const 0 (unit)
+  match args do
+    case LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_atom(atom: a, buf: %buf, ctx: ctx)
+      let %buf = push_byte(buf: %buf, byte: op_i32_wrap_i64)
+      let %buf = push_byte(buf: %buf, byte: op_global_set)
+      let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
+      let %buf = push_byte(buf: %buf, byte: op_i64_const)
+      return push_sleb128(buf: %buf, val: 0)
+    case _ ->
+      raise SymbolNotFound(name: "__nx_heap_reset", kind: "arena intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+let emit_heap_swap = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  // global.get 0 → old (i32→i64); arg → new (i64→i32); global.set 0
+  match args do
+    case LirCallArg(label: _, value: a) :: _ ->
+      let %buf = push_byte(buf: %buf, byte: op_global_get)
+      let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
+      let %buf = push_byte(buf: %buf, byte: op_i64_extend_i32_u)
+      let %buf = emit_atom(atom: a, buf: %buf, ctx: ctx)
+      let %buf = push_byte(buf: %buf, byte: op_i32_wrap_i64)
+      let %buf = push_byte(buf: %buf, byte: op_global_set)
+      return push_uleb128(buf: %buf, val: heap_global_idx)
+    case _ ->
+      raise SymbolNotFound(name: "__nx_heap_swap", kind: "arena intrinsic arg", context: "")
+      return %buf
+  end
+end
 
 // ─── TCMC (Tail Call Modulo Constructor) ─────────────────────────────────────
 
@@ -490,6 +568,75 @@ let emit_typed_field_load = fn (typ: TypeExpr, buf: %ByteBuffer, offset: i64) ->
   end
 end
 
+// ─── Memory grow check ───────────────────────────────────────────────────────
+// Emit: if (global.get 0 > memory.size * 65536) { memory.grow(needed_pages); drop }
+// This pattern matches the Rust codegen (module.rs:610-631, emit.rs:47-66).
+
+let emit_memory_grow_check = fn (buf: %ByteBuffer) -> %ByteBuffer do
+  // if (heap_ptr > current_memory_bytes)
+  let %buf = push_byte(buf: %buf, byte: op_global_get)
+  let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
+  let %buf = push_byte(buf: %buf, byte: op_memory_size)
+  let %buf = push_byte(buf: %buf, byte: 0) // mem index 0
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 16)
+  let %buf = push_byte(buf: %buf, byte: op_i32_shl) // pages * 65536
+  let %buf = push_byte(buf: %buf, byte: op_i32_gt_u)
+  let %buf = push_byte(buf: %buf, byte: op_if)
+  let %buf = push_byte(buf: %buf, byte: 64) // blocktype void
+  // pages_needed = ceil((heap_ptr - current_bytes) / 65536)
+  let %buf = push_byte(buf: %buf, byte: op_global_get)
+  let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
+  let %buf = push_byte(buf: %buf, byte: op_memory_size)
+  let %buf = push_byte(buf: %buf, byte: 0) // mem index 0
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 16)
+  let %buf = push_byte(buf: %buf, byte: op_i32_shl)
+  let %buf = push_byte(buf: %buf, byte: op_i32_sub) // overflow bytes
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 65535)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add) // round up
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 16)
+  let %buf = push_byte(buf: %buf, byte: op_i32_shr_u) // / 65536 = pages
+  let %buf = push_byte(buf: %buf, byte: op_memory_grow)
+  let %buf = push_byte(buf: %buf, byte: 0) // mem index 0
+  let %buf = push_byte(buf: %buf, byte: op_drop) // discard result (-1 on failure)
+  return push_byte(buf: %buf, byte: op_end)
+end
+
+/// Same as emit_memory_grow_check but checks global 1 (cabi arena) instead of G0.
+let emit_memory_grow_check_g1 = fn (buf: %ByteBuffer) -> %ByteBuffer do
+  let %buf = push_byte(buf: %buf, byte: op_global_get)
+  let %buf = push_uleb128(buf: %buf, val: 1) // G1
+  let %buf = push_byte(buf: %buf, byte: op_memory_size)
+  let %buf = push_byte(buf: %buf, byte: 0)
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 16)
+  let %buf = push_byte(buf: %buf, byte: op_i32_shl)
+  let %buf = push_byte(buf: %buf, byte: op_i32_gt_u)
+  let %buf = push_byte(buf: %buf, byte: op_if)
+  let %buf = push_byte(buf: %buf, byte: 64)
+  let %buf = push_byte(buf: %buf, byte: op_global_get)
+  let %buf = push_uleb128(buf: %buf, val: 1) // G1
+  let %buf = push_byte(buf: %buf, byte: op_memory_size)
+  let %buf = push_byte(buf: %buf, byte: 0)
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 16)
+  let %buf = push_byte(buf: %buf, byte: op_i32_shl)
+  let %buf = push_byte(buf: %buf, byte: op_i32_sub)
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 65535)
+  let %buf = push_byte(buf: %buf, byte: op_i32_add)
+  let %buf = push_byte(buf: %buf, byte: op_i32_const)
+  let %buf = push_sleb128(buf: %buf, val: 16)
+  let %buf = push_byte(buf: %buf, byte: op_i32_shr_u)
+  let %buf = push_byte(buf: %buf, byte: op_memory_grow)
+  let %buf = push_byte(buf: %buf, byte: 0)
+  let %buf = push_byte(buf: %buf, byte: op_drop)
+  return push_byte(buf: %buf, byte: op_end)
+end
+
 // ─── Object allocation ──────────────────────────────────────────────────────
 
 let emit_alloc_object = fn (buf: %ByteBuffer, ctx: CodegenCtx, words: i64) -> %ByteBuffer throws { Exn } do
@@ -514,7 +661,9 @@ let emit_alloc_object = fn (buf: %ByteBuffer, ctx: CodegenCtx, words: i64) -> %B
       let %buf = push_sleb128(buf: %buf, val: words * 8)
       let %buf = push_byte(buf: %buf, byte: op_i32_add)
       let %buf = push_byte(buf: %buf, byte: op_global_set)
-      return push_uleb128(buf: %buf, val: heap_global_idx)
+      let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
+      // Grow memory if heap exceeds current pages
+      return emit_memory_grow_check(buf: %buf)
   end
 end
 
@@ -635,6 +784,9 @@ end
 
 // ─── String concat ──────────────────────────────────────────────────────────
 
+// String allocations share the object heap (G0).
+let str_heap_gidx = 0
+
 let emit_string_concat = fn (lhs: LirAtom, rhs: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   let t = ctx_temps_base(ctx: ctx)
   let lhs_packed = t + 4
@@ -677,16 +829,16 @@ let emit_string_concat = fn (lhs: LirAtom, rhs: LirAtom, buf: %ByteBuffer, ctx: 
       let %buf = push_byte(buf: %buf, byte: op_local_set)
       let %buf = push_uleb128(buf: %buf, val: out_ptr)
     case false ->
-      // bump allocator
+      // bump allocator — string heap (G2), separate from object heap (G0)
       let %buf = push_byte(buf: %buf, byte: op_global_get)
-      let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
+      let %buf = push_uleb128(buf: %buf, val: str_heap_gidx)
       let %buf = push_byte(buf: %buf, byte: op_local_tee)
       let %buf = push_uleb128(buf: %buf, val: out_ptr)
       let %buf = push_byte(buf: %buf, byte: op_local_get)
       let %buf = push_uleb128(buf: %buf, val: out_len)
       let %buf = push_byte(buf: %buf, byte: op_i32_add)
       let %buf = push_byte(buf: %buf, byte: op_global_set)
-      let %buf = push_uleb128(buf: %buf, val: heap_global_idx)
+      let %buf = push_uleb128(buf: %buf, val: str_heap_gidx)
   end
 
   let %buf = emit_memcpy_loop(buf: %buf, src_ptr: lhs_ptr, dst_ptr: out_ptr, dst_offset: -1,
@@ -1115,18 +1267,28 @@ end
 
 let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
                      is_tail: bool, in_try: bool) -> %ByteBuffer throws { Exn } do
-  let int_idx = lookup_func_fast(name: func, map_id: ctx_internal_func_map(ctx: ctx))
-  if int_idx >= 0 then
-    return emit_internal_call(func: func, args: args, buf: %buf, ctx: ctx, is_tail: is_tail, in_try: in_try, int_idx: int_idx)
+  // Arena intrinsics: emit inline WASM, no function call
+  let arena_wn = get_arena_wasm_name(func: func, exts: ctx_externals(ctx: ctx))
+  if arena_wn == "__nx_heap_mark" then
+    return emit_heap_mark(buf: %buf)
+  else if arena_wn == "__nx_heap_reset" then
+    return emit_heap_reset(args: args, buf: %buf, ctx: ctx)
+  else if arena_wn == "__nx_heap_swap" then
+    return emit_heap_swap(args: args, buf: %buf, ctx: ctx)
   else
-    let ext_idx = lookup_func_fast(name: func, map_id: ctx_external_func_map(ctx: ctx))
-    if ext_idx >= 0 then
-      return emit_external_call(func: func, args: args, buf: %buf, ctx: ctx, ext_idx: ext_idx)
+    let int_idx = lookup_func_fast(name: func, map_id: ctx_internal_func_map(ctx: ctx))
+    if int_idx >= 0 then
+      return emit_internal_call(func: func, args: args, buf: %buf, ctx: ctx, is_tail: is_tail, in_try: in_try, int_idx: int_idx)
     else
-      raise SymbolNotFound(name: func, kind: "function", context: ctx_func_name(ctx: ctx))
-      return %buf
+      let ext_idx = lookup_func_fast(name: func, map_id: ctx_external_func_map(ctx: ctx))
+      if ext_idx >= 0 then
+        return emit_external_call(func: func, args: args, buf: %buf, ctx: ctx, ext_idx: ext_idx)
+      else
+        raise SymbolNotFound(name: func, kind: "function", context: ctx_func_name(ctx: ctx))
+        return %buf
+      end
     end
-  end
+  end end end
 end
 
 // ─── Closure helpers ────────────────────────────────────────────────────────
@@ -1577,34 +1739,21 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuff
   push_byte(buf: %body, byte: op_end)
 end
 
-/// cabi_realloc: aligned bump allocator for canonical ABI.
-/// Signature: (old_ptr: i32, old_size: i32, align: i32, new_size: i32) -> i32
-/// Ignores old_ptr/old_size, aligns heap ptr, bumps by new_size.
+/// cabi_realloc: aligned bump allocator for canonical ABI with memory.grow.
+/// Uses global 1 (separate from object heap G0) so region resets on G0 don't corrupt
+/// canonical ABI string data. cabi_realloc allocations are ephemeral (live only during
+/// one cross-component call).
 let compile_cabi_realloc = fn (heap_base: i64) -> %ByteBuffer throws { Exn } do
   let %body = empty()
   // 1 local: aligned_ptr (i32)
   let %body = push_uleb128(buf: %body, val: 1)
   let %body = push_uleb128(buf: %body, val: 1)
   let %body = push_byte(buf: %body, byte: vt_i32)
-  // Arena reset: if heap_ptr > heap_base + ARENA_SIZE, wrap to heap_base
-  let arena_limit = heap_base + 134217728
+  // aligned_ptr = (global.get 1 + align - 1) & (0 - align)
   let %body = push_byte(buf: %body, byte: op_global_get)
-  let %body = push_uleb128(buf: %body, val: 0)
-  let %body = push_byte(buf: %body, byte: op_i32_const)
-  let %body = push_sleb128(buf: %body, val: arena_limit)
-  let %body = push_byte(buf: %body, byte: 75) // i32.gt_u
-  let %body = push_byte(buf: %body, byte: op_if)
-  let %body = push_byte(buf: %body, byte: 64) // blocktype void
-  let %body = push_byte(buf: %body, byte: op_i32_const)
-  let %body = push_sleb128(buf: %body, val: heap_base)
-  let %body = push_byte(buf: %body, byte: op_global_set)
-  let %body = push_uleb128(buf: %body, val: 0)
-  let %body = push_byte(buf: %body, byte: op_end)
-  // aligned_ptr = (global.get 0 + local.get 2 - 1) & (0 - local.get 2)
-  let %body = push_byte(buf: %body, byte: op_global_get)
-  let %body = push_uleb128(buf: %body, val: 0)
+  let %body = push_uleb128(buf: %body, val: 1) // G1 = cabi arena
   let %body = push_byte(buf: %body, byte: op_local_get)
-  let %body = push_uleb128(buf: %body, val: 2)
+  let %body = push_uleb128(buf: %body, val: 2) // align
   let %body = push_byte(buf: %body, byte: op_i32_add)
   let %body = push_byte(buf: %body, byte: op_i32_const)
   let %body = push_sleb128(buf: %body, val: 1)
@@ -1613,7 +1762,7 @@ let compile_cabi_realloc = fn (heap_base: i64) -> %ByteBuffer throws { Exn } do
   let %body = push_byte(buf: %body, byte: op_i32_const)
   let %body = push_sleb128(buf: %body, val: 0)
   let %body = push_byte(buf: %body, byte: op_local_get)
-  let %body = push_uleb128(buf: %body, val: 2)
+  let %body = push_uleb128(buf: %body, val: 2) // align
   let %body = push_byte(buf: %body, byte: op_i32_sub)
   // AND → aligned_ptr
   let %body = push_byte(buf: %body, byte: op_i32_and)
@@ -1621,10 +1770,14 @@ let compile_cabi_realloc = fn (heap_base: i64) -> %ByteBuffer throws { Exn } do
   let %body = push_uleb128(buf: %body, val: 4)
   // new_heap = aligned_ptr + new_size
   let %body = push_byte(buf: %body, byte: op_local_get)
-  let %body = push_uleb128(buf: %body, val: 3)
+  let %body = push_uleb128(buf: %body, val: 3) // new_size
   let %body = push_byte(buf: %body, byte: op_i32_add)
   let %body = push_byte(buf: %body, byte: op_global_set)
-  let %body = push_uleb128(buf: %body, val: 0)
+  let %body = push_uleb128(buf: %body, val: 1) // G1 = cabi arena
+  // Grow memory if cabi arena exceeds current pages
+  // Note: emit_memory_grow_check uses G0, but for cabi we need G1
+  // For now, use the same check (G0 and G1 are in the same linear memory)
+  let %body = emit_memory_grow_check_g1(buf: %body)
   // return aligned_ptr
   let %body = push_byte(buf: %body, byte: op_local_get)
   let %body = push_uleb128(buf: %body, val: 4)
@@ -1871,8 +2024,11 @@ end
 
 export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws { Exn } do
   match program do
-    case LirProgram(functions: funcs, externals: exts) ->
+    case LirProgram(functions: funcs, externals: all_exts) ->
 
+      // Filter out arena intrinsics — they are emitted as inline WASM, not imported
+      let exts = filter_arena_externals(exts: all_exts)
+      let has_arena = list.length(xs: all_exts) != list.length(xs: exts)
       let n_exts = list.length(xs: exts)
       let n_funcs = list.length(xs: funcs)
       let has_eh = program_needs_eh(funcs: funcs)
@@ -1976,9 +2132,9 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
         emit_section(buf: %m, id: sec_tag, content: build_tag_section(exn_tag_type_idx: exn_tag_type_idx))
       else %m end
 
-      // Global section — needed for bump allocator (alloc_mode 1) or cabi_realloc.
-      // When using stdlib allocate (alloc_mode 2) without cabi_realloc, stdlib owns the global heap pointer.
-      let needs_global = (heap_enabled && alloc_mode == 1) || (has_cabi && alloc_mode != 2)
+      // Global section — needed for bump allocator (alloc_mode 1), cabi_realloc, or arena intrinsics.
+      // Arena intrinsics (heap_mark/heap_reset/heap_swap) always need global 0.
+      let needs_global = (heap_enabled && alloc_mode == 1) || (has_cabi && alloc_mode != 2) || has_arena
       let %m = if needs_global then
         emit_section(buf: %m, id: sec_global, content: build_global_section(heap_base: heap_base))
       else %m end
@@ -2000,9 +2156,10 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
       let closure_type_idx_list = build_closure_type_idx_list(arities: closure_arities, base: closure_type_base)
       let %code = empty()
       let %code = push_uleb128(buf: %code, val: n_funcs + n_cabi + 1)
+      // Pass all_exts (including arena) so emit_arena_intrinsic can find them via find_external
       let %code = emit_code_bodies(buf: %code, funcs: funcs, internal_funcs: internal_funcs,
                                     external_funcs: external_funcs, string_lits: string_entries,
-                                    alloc_mode: alloc_mode, functions: funcs, externals: exts,
+                                    alloc_mode: alloc_mode, functions: funcs, externals: all_exts,
                                     closure_table: closure_table, closure_type_indices: closure_type_idx_list,
                                     internal_func_map: internal_func_map, external_func_map: external_func_map)
       // cabi_realloc: aligned bump allocator for canonical ABI

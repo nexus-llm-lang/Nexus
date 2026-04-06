@@ -21,7 +21,7 @@ use super::error::CodegenError;
 use super::function::compile_function;
 use super::layout::{build_codegen_layout, program_uses_object_heap, CodegenLayout, MemoryMode};
 use super::string::string_abi_for_external;
-use super::{ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, LAZY_JOIN_NAME, LAZY_MODULE, LAZY_SPAWN_NAME};
+use super::{ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, LAZY_JOIN_NAME, LAZY_MODULE, LAZY_SPAWN_NAME, OBJECT_HEAP_GLOBAL_INDEX};
 
 /// Compiles LIR (in ANF) directly into core WASM bytes, plus debug entries for DWARF.
 pub fn compile_lir_to_wasm(
@@ -35,6 +35,13 @@ pub fn compile_lir_to_wasm(
     let needs_lazy = program_needs_lazy(program);
 
     // Only import allocate from stdlib when using shared-memory bundling (packed ABI).
+    // When arena intrinsics (heap_mark/heap_reset) are present, force bump allocator
+    // so regions can manage G0 directly. stdlib allocate bypasses G0.
+    let has_arena = program
+        .externals
+        .iter()
+        .any(|ext| ext.wasm_module.as_ref() == "nexus:runtime/arena");
+
     // With component-model (canonical ABI), each component has its own memory and
     // the user code uses an internal bump allocator for heap operations.
     let stdlib_alloc_module = if program_uses_object_heap(program) {
@@ -49,7 +56,17 @@ pub fn compile_lir_to_wasm(
     } else {
         None
     };
-    let n_alloc_imports: u32 = if stdlib_alloc_module.is_some() { 1 } else { 0 };
+    // Skip allocate import when arena intrinsics force bump allocator
+    // In component model (MemoryMode::Defined), each component has its own memory.
+    // stdlib's allocate returns pointers into STDLIB's memory, not the user module's.
+    // Only import allocate when sharing memory (wasm-merge bundling).
+    let is_component = program.externals.iter().any(|ext| {
+        super::string::string_abi_for_external(ext) == super::string::StringABI::Canonical
+    }) || program.externals.iter().any(|ext| {
+        ext.wasm_module.as_ref().contains(':') && ext.wasm_module.as_ref() != "nexus:runtime/arena"
+    });
+    let needs_alloc_import = stdlib_alloc_module.is_some() && !is_component;
+    let n_alloc_imports: u32 = if needs_alloc_import { 1 } else { 0 };
 
     // Deduplicate externals by (wasm_module, wasm_name) — multiple Nexus names
     // pointing to the same underlying WASM function share a single WASM import.
@@ -57,6 +74,10 @@ pub fn compile_lir_to_wasm(
     let mut deduped_externals: Vec<&LirExternal> = Vec::new();
     let mut external_function_indices = HashMap::new();
     for ext in &program.externals {
+        // Skip intrinsic-only modules — all functions are inlined, no import needed.
+        if ext.wasm_module.as_ref() == "nexus:runtime/arena" {
+            continue;
+        }
         let key = (ext.wasm_module, ext.wasm_name);
         if let Some(&idx) = wasm_import_dedup.get(&key) {
             // Reuse existing import index for this Nexus name
@@ -102,7 +123,7 @@ pub fn compile_lir_to_wasm(
     let has_funcref = !funcref_targets.is_empty();
 
     let mut layout = build_codegen_layout(program)?;
-    if stdlib_alloc_module.is_some() {
+    if needs_alloc_import {
         let alloc_idx = deduped_ext_count;
         layout.allocate_func_idx = Some(alloc_idx);
     }
@@ -159,7 +180,7 @@ pub fn compile_lir_to_wasm(
     }
 
     let mut allocate_type_idx = 0;
-    if stdlib_alloc_module.is_some() {
+    if needs_alloc_import {
         types.ty().function([ValType::I32], [ValType::I32]);
         allocate_type_idx = next_type_index;
         next_type_index += 1;
@@ -306,13 +327,15 @@ pub fn compile_lir_to_wasm(
         );
         has_imports = true;
     }
-    if let Some(alloc_module) = &stdlib_alloc_module {
-        imports.import(
-            alloc_module,
-            ALLOCATE_WASM_NAME,
-            EntityType::Function(allocate_type_idx),
-        );
-        has_imports = true;
+    if needs_alloc_import {
+        if let Some(alloc_module) = &stdlib_alloc_module {
+            imports.import(
+                alloc_module,
+                ALLOCATE_WASM_NAME,
+                EntityType::Function(allocate_type_idx),
+            );
+            has_imports = true;
+        }
     }
     if needs_bt_capture {
         imports.import(
@@ -368,7 +391,7 @@ pub fn compile_lir_to_wasm(
     if matches!(layout.memory_mode, MemoryMode::Defined) {
         let mut memories = MemorySection::new();
         memories.memory(MemoryType {
-            minimum: 2304, // 144MB — enough for 128MB cabi_realloc arena + heap
+            minimum: 256, // 16MB initial — grows via memory.grow as needed
             maximum: None,
             memory64: false,
             shared: false,
@@ -405,19 +428,27 @@ pub fn compile_lir_to_wasm(
                 },
                 &ConstExpr::i32_const(layout.heap_base as i32),
             );
-            if needs_cabi_realloc {
-                // Global 1: cabi_realloc arena pointer (separate from object heap)
-                // Starts at heap_base + 1MB to avoid overlapping with object heap
-                let cabi_arena_base = layout.heap_base as i32 + 1024 * 1024;
-                globals.global(
-                    GlobalType {
-                        val_type: ValType::I32,
-                        mutable: true,
-                        shared: false,
-                    },
-                    &ConstExpr::i32_const(cabi_arena_base),
-                );
-            }
+            // Global 1: cabi arena pointer (separate from object heap G0).
+            // Starts at 128MB to separate from G0 object heap.
+            let cabi_base = 128 * 1024 * 1024u32; // 128MB
+            globals.global(
+                GlobalType {
+                    val_type: ValType::I32,
+                    mutable: true,
+                    shared: false,
+                },
+                &ConstExpr::i32_const(cabi_base as i32),
+            );
+            // Global 2: placeholder (unused — string allocs now share G0).
+            // Kept for global index stability.
+            globals.global(
+                GlobalType {
+                    val_type: ValType::I32,
+                    mutable: true,
+                    shared: false,
+                },
+                &ConstExpr::i32_const(0),
+            );
             module.section(&globals);
         }
     }
@@ -519,7 +550,7 @@ pub fn compile_lir_to_wasm(
             func_names.append(idx, ext.wasm_name.as_str());
             idx += 1;
         }
-        if stdlib_alloc_module.is_some() {
+        if needs_alloc_import {
             func_names.append(idx, ALLOCATE_WASM_NAME);
             idx += 1;
         }
@@ -563,58 +594,67 @@ fn compile_wasi_cli_run_wrapper(main_idx: u32, main_ret_type: &Type) -> Function
 /// Implementation: delegates to the stdlib `allocate` function if available,
 /// otherwise uses the bump heap allocator. old_ptr/old_size are currently ignored
 /// (no realloc support — always allocates fresh).
-/// Arena size for cabi_realloc: 128MB. When the bump pointer exceeds this
-/// region (heap_base + ARENA_SIZE), it wraps back to heap_base. Canonical ABI
-/// allocations are short-lived (string copies consumed immediately), so old
-/// data at the wrapped region is no longer referenced.
-/// Disabled arena reset — bump only, with memory.grow when needed.
-/// Arena reset corrupts live string references in string-heavy workloads.
-const CABI_ARENA_SIZE: i32 = i32::MAX; // effectively disabled
-
+/// Compile `cabi_realloc` for the canonical ABI.
+///
+/// Shares global 0 (object heap) with record allocation. Both bump the same
+/// pointer, eliminating arena/heap collision. Includes memory.grow.
 fn compile_cabi_realloc(layout: &CodegenLayout) -> Function {
-    const CABI_ARENA_GLOBAL: u32 = 1; // separate from object heap (global 0)
-
     // Locals: params are 0=old_ptr, 1=old_size, 2=align, 3=new_size
     // Extra locals: 4=aligned_ptr
     let mut body = Function::new(vec![(1, ValType::I32)]);
     let aligned_ptr_local = 4u32;
+    let has_memory = matches!(layout.memory_mode, MemoryMode::Defined);
 
     if let Some(alloc_idx) = layout.allocate_func_idx {
         body.instruction(&Instruction::LocalGet(3));
         body.instruction(&Instruction::Call(alloc_idx));
     } else {
-        // Arena reset: if cabi_ptr > arena_base + ARENA_SIZE, wrap to arena_base.
-        let cabi_arena_base = layout.heap_base as i32 + 1024 * 1024;
-        let arena_limit = cabi_arena_base + CABI_ARENA_SIZE;
-        body.instruction(&Instruction::GlobalGet(CABI_ARENA_GLOBAL));
-        body.instruction(&Instruction::I32Const(arena_limit));
-        body.instruction(&Instruction::I32GtU);
-        body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        body.instruction(&Instruction::I32Const(cabi_arena_base));
-        body.instruction(&Instruction::GlobalSet(CABI_ARENA_GLOBAL));
-        body.instruction(&Instruction::End);
-
-        // Aligned bump on CABI arena (global 1)
-        body.instruction(&Instruction::GlobalGet(CABI_ARENA_GLOBAL));
-        body.instruction(&Instruction::LocalGet(2));
+        // Bump on object heap (global 0). Shared with object allocation.
+        body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+        body.instruction(&Instruction::LocalGet(2)); // align
         body.instruction(&Instruction::I32Add);
         body.instruction(&Instruction::I32Const(1));
         body.instruction(&Instruction::I32Sub);
         body.instruction(&Instruction::I32Const(0));
-        body.instruction(&Instruction::LocalGet(2));
+        body.instruction(&Instruction::LocalGet(2)); // align
         body.instruction(&Instruction::I32Sub);
         body.instruction(&Instruction::I32And);
         body.instruction(&Instruction::LocalSet(aligned_ptr_local));
 
+        // Advance heap pointer
+        body.instruction(&Instruction::LocalGet(aligned_ptr_local));
+        body.instruction(&Instruction::LocalGet(3)); // new_size
+        body.instruction(&Instruction::I32Add);
+        body.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+
+
+        if has_memory {
+            body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX)); // G1
+            body.instruction(&Instruction::MemorySize(0));
+            body.instruction(&Instruction::I32Const(16));
+            body.instruction(&Instruction::I32Shl);
+            body.instruction(&Instruction::I32GtU);
+            body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            {
+                body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX)); // G1
+                body.instruction(&Instruction::MemorySize(0));
+                body.instruction(&Instruction::I32Const(16));
+                body.instruction(&Instruction::I32Shl);
+                body.instruction(&Instruction::I32Sub);
+                body.instruction(&Instruction::I32Const(65535));
+                body.instruction(&Instruction::I32Add);
+                body.instruction(&Instruction::I32Const(16));
+                body.instruction(&Instruction::I32ShrU);
+                body.instruction(&Instruction::MemoryGrow(0));
+                body.instruction(&Instruction::Drop);
+            }
+            body.instruction(&Instruction::End);
+        }
+
         // Return aligned_ptr
         body.instruction(&Instruction::LocalGet(aligned_ptr_local));
-
-        // Advance cabi arena pointer
-        body.instruction(&Instruction::LocalGet(aligned_ptr_local));
-        body.instruction(&Instruction::LocalGet(3));
-        body.instruction(&Instruction::I32Add);
-        body.instruction(&Instruction::GlobalSet(CABI_ARENA_GLOBAL));
     }
+
     body.instruction(&Instruction::End);
     body
 }

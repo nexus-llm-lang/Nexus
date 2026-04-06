@@ -10,7 +10,7 @@ mod string;
 
 pub use error::{CodegenError, CompileError, CompileMetrics};
 pub use module::compile_lir_to_wasm;
-pub use string::StringABI;
+pub use string::{StringABI, set_force_packed_abi};
 
 use std::borrow::Cow;
 
@@ -25,6 +25,14 @@ use crate::types::Type;
 
 const STRING_DATA_BASE: u32 = 16;
 const OBJECT_HEAP_GLOBAL_INDEX: u32 = 0;
+/// cabi_realloc uses G1 (separate from object heap G0) so region resets
+/// on G0 don't corrupt canonical ABI string data.
+pub(super) const CABI_ARENA_GLOBAL_INDEX: u32 = 1;
+/// String allocations share the object heap (G0). Separate heaps caused
+/// collisions when G0 grew past the G2 offset (8MB was too small for
+/// programs with 10MB+ of constructor data). With heap_swap/heap_reset
+/// removed from the nxc driver, there's no need for separation.
+const STRING_HEAP_GLOBAL_INDEX: u32 = 0;
 const ALLOCATE_WASM_NAME: &str = "allocate";
 const BT_MODULE: &str = "nexus:runtime/backtrace";
 const BT_CAPTURE_NAME: &str = "capture-backtrace";
@@ -51,6 +59,10 @@ struct FunctionTemps {
     concat_out_ptr_i32: u32,
     concat_out_len_i32: u32,
     concat_idx_i32: u32,
+    /// Temp for loaded byte value during intrinsic scan loops
+    scan_byte_i32: u32,
+    /// Temp for end bound / target byte during intrinsic range scans
+    scan_end_i32: u32,
     /// Temp for closure pointer during call_indirect
     closure_ptr_i64: u32,
     /// Temp for table index loaded from closure during call_indirect
