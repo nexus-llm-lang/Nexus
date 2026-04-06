@@ -591,6 +591,71 @@ let resolve_non_lambda = fn (defs: [SpannedTopLevel], name: string, entries: [Re
   end
 end
 
+/// Iterative resolve: filter by reachability, resolve LazyBody, repeat.
+/// Each round discovers new reachable functions from resolved bodies.
+let iterative_resolve = fn (funcs: [HirFunction], hb: [HirHandlerBindingEntry], max_rounds: i64) -> [HirFunction] do
+  if max_rounds <= 0 then return strip_lazy(funcs: funcs) end
+  let stubs = strip_lazy(funcs: funcs)
+  let reachable = collect_reachable(functions: stubs, handler_bindings: hb)
+  let filtered = filter_reachable_functions(functions: funcs, reachable: reachable)
+  let resolved = resolve_all_lazy_via_convert(funcs: filtered)
+  // Check if any new functions became reachable
+  let new_reachable = collect_reachable(functions: resolved, handler_bindings: hb)
+  let new_filtered = filter_reachable_functions(functions: funcs, reachable: new_reachable)
+  // If the new filtered set is larger than the old, resolve new ones
+  let grew = list_longer(a: new_filtered, b: filtered)
+  if grew then
+    return iterative_resolve(funcs: merge_resolved(orig: new_filtered, resolved: resolved), hb: hb, max_rounds: max_rounds - 1)
+  else
+    return resolved
+  end
+end
+
+let list_longer = fn (a: [HirFunction], b: [HirFunction]) -> bool do
+  match a do
+    case Nil -> return false
+    case _ :: ar ->
+      match b do
+        case Nil -> return true
+        case _ :: br -> return list_longer(a: ar, b: br)
+      end
+  end
+end
+
+/// Merge: for functions in orig that are already resolved, keep the resolved version.
+/// For functions in orig that are still LazyBody, keep them for the next round.
+let merge_resolved = fn (orig: [HirFunction], resolved: [HirFunction]) -> [HirFunction] do
+  match orig do
+    case Nil -> return Nil
+    case HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: b, span: sp) :: rest ->
+      let merged_body = match b do
+        case EagerBody(stmts: _) -> b
+        case LazyBody(ast_expr: _, entries: _) ->
+          // Check if this function was resolved
+          match find_resolved(name: n, resolved: resolved) do
+            case Some(val: rb) -> rb
+            case None -> b
+          end
+      end
+      return HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: merged_body, span: sp) :: merge_resolved(orig: rest, resolved: resolved)
+  end
+end
+
+let find_resolved = fn (name: string, resolved: [HirFunction]) -> Option<HirBody> do
+  match resolved do
+    case Nil -> return None
+    case HirFunction(name: rn, type_params: _, params: _, ret_type: _, body: rb, span: _) :: rest ->
+      if rn == name then
+        match rb do
+          case EagerBody(stmts: _) -> return Some(val: rb)
+          case _ -> return find_resolved(name: name, resolved: rest)
+        end
+      else
+        return find_resolved(name: name, resolved: rest)
+      end
+  end
+end
+
 let resolve_all_lazy_via_convert = fn (funcs: [HirFunction]) -> [HirFunction] do
   match funcs do
     case Nil -> return Nil
@@ -720,11 +785,10 @@ let main = fn (args: [string]) -> unit
     let t4 = Clock.now()
     if verbose then Console.eprintln(val: "[nxc] HIR (" ++ from_i64(val: t4 - t3) ++ "ms)") end
 
-    // Resolve first 220 lazy bodies (within 4GB budget), strip remaining.
-    // TODO: demand-driven resolve hits pointer corruption (7xtp). Use sequential as workaround.
+    // Iterative resolve: filter by reachability, resolve, repeat until stable.
     let hir = match hir_raw do
       case HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed) ->
-        let resolved = resolve_all_lazy_via_convert(funcs: hf)
+        let resolved = iterative_resolve(funcs: hf, hb: hb, max_rounds: 10)
         HirProgram(ports: hp, functions: resolved, externals: he, handler_bindings: hb, enum_defs: hed)
     end
     let t4b = Clock.now()
