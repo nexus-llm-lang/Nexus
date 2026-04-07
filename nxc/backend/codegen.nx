@@ -28,6 +28,8 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          vt_i32, vt_i64, vt_f64, vt_funcref, bt_void, bt_i32, bt_i64, desc_func, desc_table, desc_memory,
          heap_global_idx, string_data_base,
          catch_kind_one,
+         comp_sec_core_module, comp_sec_core_instance, comp_sec_alias,
+         comp_sec_type, comp_sec_canon, comp_sec_export,
          op_unreachable, op_block, op_loop, op_if, op_else, op_end, op_br, op_br_if, op_return,
          op_call, op_call_indirect, op_return_call, op_drop, op_throw, op_try_table,
          op_local_get, op_local_set, op_local_tee, op_global_get, op_global_set,
@@ -988,6 +990,29 @@ end
 
 // ─── Binary operation ───────────────────────────────────────────────────────
 
+// Determine common operand type for binary ops (mirrors Rust binary_operand_type).
+// Both operands will be coerced to this type before the binary opcode.
+let binary_operand_type = fn (op: BinaryOp, lhs_type: TypeExpr, rhs_type: TypeExpr) -> TypeExpr do
+  let lt = peel_linear(typ: lhs_type)
+  let rt = peel_linear(typ: rhs_type)
+  // Logical And/Or always operate on booleans (i32)
+  match op do
+    case OpAnd -> return TyBool
+    case OpOr -> return TyBool
+    case _ -> ()
+  end
+  let lt_vt = type_to_valtype(typ: lt)
+  let rt_vt = type_to_valtype(typ: rt)
+  // If both have the same valtype, prefer the left type
+  if lt_vt == rt_vt then return lt end
+  // Mixed i32/i64: widen to i64
+  if (lt_vt == vt_i32 && rt_vt == vt_i64) || (lt_vt == vt_i64 && rt_vt == vt_i32) then
+    return TyI64
+  end
+  // Fallback: use left type
+  return lt
+end
+
 let emit_binary = fn (op: BinaryOp, operand_type: TypeExpr, buf: %ByteBuffer) -> %ByteBuffer throws { Exn } do
   let use_i32 = match peel_linear(typ: operand_type) do
     case TyBool -> true case TyI32 -> true case TyChar -> true case _ -> false
@@ -1012,7 +1037,8 @@ let emit_binary = fn (op: BinaryOp, operand_type: TypeExpr, buf: %ByteBuffer) ->
     case OpBitOr -> match use_i32 do case true -> op_i32_or case false -> op_i64_or end
     case OpBitXor -> match use_i32 do case true -> op_i32_xor case false -> op_i64_xor end
     case OpShl -> op_i64_shl case OpShr -> op_i64_shr_s
-    case OpAnd -> op_i32_and case OpOr -> op_i32_or
+    case OpAnd -> match use_i32 do case true -> op_i32_and case false -> op_i64_and end
+    case OpOr -> match use_i32 do case true -> op_i32_or case false -> op_i64_or end
     case _ -> op_i64_add
   end
   return push_byte(buf: %buf, byte: opcode)
@@ -1358,9 +1384,14 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
           match is_string_op(op: op, lhs_type: atom_type(atom: l), rhs_type: atom_type(atom: r)) do
             case true -> emit_string_compare(op: op, lhs: l, rhs: r, buf: %buf, ctx: ctx)
             case false ->
+              let lhs_type = atom_type(atom: l)
+              let rhs_type = atom_type(atom: r)
+              let op_type = binary_operand_type(op: op, lhs_type: lhs_type, rhs_type: rhs_type)
               let %buf = emit_atom(atom: l, buf: %buf, ctx: ctx)
+              let %buf = emit_coercion(from_type: lhs_type, to_type: op_type, buf: %buf)
               let %buf = emit_atom(atom: r, buf: %buf, ctx: ctx)
-              emit_binary(op: op, operand_type: atom_type(atom: l), buf: %buf)
+              let %buf = emit_coercion(from_type: rhs_type, to_type: op_type, buf: %buf)
+              emit_binary(op: op, operand_type: op_type, buf: %buf)
           end
       end
 
@@ -2030,9 +2061,11 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
   match program do
     case LirProgram(functions: funcs, externals: all_exts) ->
 
-      // Filter out arena intrinsics — they are emitted as inline WASM, not imported
+      // Filter out arena intrinsics — they are emitted as inline WASM, not imported.
+      // Use filtered_program for type section so type indices match n_exts.
       let exts = filter_arena_externals(exts: all_exts)
       let has_arena = list.length(xs: all_exts) != list.length(xs: exts)
+      let filtered_program = LirProgram(functions: funcs, externals: exts)
       let n_exts = list.length(xs: exts)
       let n_funcs = list.length(xs: funcs)
       let has_eh = program_needs_eh(funcs: funcs)
@@ -2101,7 +2134,7 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
 
       // Type section (with EH tag + allocate + closure call types appended)
       let has_alloc = alloc_mode == 2
-      let %type_sec = build_type_section(program: program, has_eh: has_eh, has_alloc: has_alloc,
+      let %type_sec = build_type_section(program: filtered_program, has_eh: has_eh, has_alloc: has_alloc,
                                          has_cabi_realloc: has_cabi, n_closure_types: n_closure_types)
       let %type_sec = if n_closure_types > 0 then
         emit_closure_type_entries(buf: %type_sec, arities: closure_arities)
@@ -2118,7 +2151,8 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
       end
 
       // Function section
-      let %m = emit_section(buf: %m, id: sec_function, content: build_function_section(n_funcs: n_funcs + n_cabi, n_exts: n_exts))
+      let cabi_type_idx = n_exts + n_funcs + 1 + n_eh_types + n_alloc_imports
+      let %m = emit_section(buf: %m, id: sec_function, content: build_function_section(n_funcs: n_funcs, n_exts: n_exts, has_cabi: has_cabi, cabi_type_idx: cabi_type_idx))
 
       // Table section (if closures exist)
       let %m = if n_closures > 0 then
@@ -2210,4 +2244,88 @@ let build_closure_type_idx_list_go = fn (arities: [i64], base: i64, acc: [ArityT
     case a :: rest ->
       return build_closure_type_idx_list_go(arities: rest, base: base + 1, acc: ArityTypeIdx(arity: a, type_idx: base) :: acc)
   end
+end
+
+// ─── Component Model wrapping ───────────────────────────────────────────────
+// Wraps a core WASM module into a minimal Component Model envelope.
+// Only for standalone modules (no external imports). The component exports
+// a single "main" function lifted from the core module's "main" export.
+//
+// Binary layout (matches wasm-tools component new + Rust ComponentEncoder):
+//   Component header  | \0asm version 13 layer 1
+//   Core module       | section 0x01, embeds the core WASM bytes
+//   Core instance     | section 0x02, instantiate module 0 with 0 args
+//   Type              | section 0x07, component func type () -> ()
+//   Alias             | section 0x06, alias core func "main" from instance 0
+//   Canon             | section 0x08, lift aliased core func to component func
+//   Export            | section 0x0B, export the lifted function as "main"
+
+export let wrap_core_in_component = fn (core_wasm: %ByteBuffer) -> %ByteBuffer do
+  let %out = empty()
+
+  // ── Component header: \0asm version=13 layer=1 ──
+  let %out = push_byte(buf: %out, byte: 0)
+  let %out = push_byte(buf: %out, byte: 97)
+  let %out = push_byte(buf: %out, byte: 115)
+  let %out = push_byte(buf: %out, byte: 109)
+  let %out = push_byte(buf: %out, byte: 13)
+  let %out = push_byte(buf: %out, byte: 0)
+  let %out = push_byte(buf: %out, byte: 1)
+  let %out = push_byte(buf: %out, byte: 0)
+
+  // ── Core module section (ID 0x01): embed core WASM ──
+  let core_len = buf_length(buf: &core_wasm)
+  let %out = push_byte(buf: %out, byte: comp_sec_core_module)
+  let %out = push_uleb128(buf: %out, val: core_len)
+  let %out = push_buf(dst: %out, src: &core_wasm)
+  free(buf: %core_wasm)
+
+  // ── Core instance section (ID 0x02): instantiate(module 0, args=[]) ──
+  let %inst = empty()
+  let %inst = push_byte(buf: %inst, byte: 1)
+  let %inst = push_byte(buf: %inst, byte: 0)
+  let %inst = push_byte(buf: %inst, byte: 0)
+  let %inst = push_byte(buf: %inst, byte: 0)
+  let %out = emit_section(buf: %out, id: comp_sec_core_instance, content: %inst)
+
+  // ── Component type section (ID 0x07): func() -> () ──
+  let %ty = empty()
+  let %ty = push_byte(buf: %ty, byte: 1)
+  let %ty = push_byte(buf: %ty, byte: 64)
+  let %ty = push_byte(buf: %ty, byte: 0)
+  let %ty = push_byte(buf: %ty, byte: 1)
+  let %ty = push_byte(buf: %ty, byte: 0)
+  let %out = emit_section(buf: %out, id: comp_sec_type, content: %ty)
+
+  // ── Alias section (ID 0x06): alias core func "main" from instance 0 ──
+  let %al = empty()
+  let %al = push_byte(buf: %al, byte: 1)
+  let %al = push_byte(buf: %al, byte: 0)
+  let %al = push_byte(buf: %al, byte: 0)
+  let %al = push_byte(buf: %al, byte: 1)
+  let %al = push_byte(buf: %al, byte: 0)
+  let %al = emit_name(buf: %al, name: "main")
+  let %out = emit_section(buf: %out, id: comp_sec_alias, content: %al)
+
+  // ── Canon section (ID 0x08): lift(core_func=0, type=0, opts=[]) ──
+  let %cn = empty()
+  let %cn = push_byte(buf: %cn, byte: 1)
+  let %cn = push_byte(buf: %cn, byte: 0)
+  let %cn = push_byte(buf: %cn, byte: 0)
+  let %cn = push_byte(buf: %cn, byte: 0)
+  let %cn = push_byte(buf: %cn, byte: 0)
+  let %cn = push_byte(buf: %cn, byte: 0)
+  let %out = emit_section(buf: %out, id: comp_sec_canon, content: %cn)
+
+  // ── Export section (ID 0x0B): export "main" as func 0 ──
+  let %ex = empty()
+  let %ex = push_byte(buf: %ex, byte: 1)
+  let %ex = push_byte(buf: %ex, byte: 0)
+  let %ex = emit_name(buf: %ex, name: "main")
+  let %ex = push_byte(buf: %ex, byte: 1)
+  let %ex = push_byte(buf: %ex, byte: 0)
+  let %ex = push_byte(buf: %ex, byte: 0)
+  let %out = emit_section(buf: %out, id: comp_sec_export, content: %ex)
+
+  return %out
 end
