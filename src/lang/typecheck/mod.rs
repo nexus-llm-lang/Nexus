@@ -13,7 +13,8 @@ use capture::{collect_lambda_captures, lambda_references_name};
 use helpers::{
     check_unintroduced_type_vars, contains_exn_throws, contains_ref, contains_return,
     default_numeric_literals, describe_ctor_field, expand_exception_groups_in_throws,
-    external_scheme, extract_row_port_names, get_default_alias, import_variant_by_name,
+    expr_always_diverges, external_scheme, extract_row_port_names, get_default_alias,
+    import_variant_by_name,
     is_allowed_main_require_signature, is_allowed_main_throws_signature, is_auto_droppable,
     merge_type_rows, normalize_enum_generic_params, normalize_typedef_generic_params,
     register_exception_variant, register_nullary_variant_constructor, register_stdlib_types,
@@ -1777,7 +1778,7 @@ impl TypeChecker {
                                 let (s_tail, t_tail) = self.infer(&mut le, expr, er, eq, ee)?;
                                 let tail = apply_subst_type(&s_tail, &t_tail);
                                 s = compose_subst(&s, &s_tail);
-                                let diverges = matches!(&expr.node, Expr::Raise(_));
+                                let diverges = expr_always_diverges(expr);
                                 if diverges {
                                     case_tail_types.push(None);
                                 } else {

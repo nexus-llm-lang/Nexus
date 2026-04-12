@@ -557,6 +557,32 @@ pub extern "C" fn __nx_buf_free(id: i64) -> i32 {
     BUFS.with(|bufs| bufs.borrow_mut().remove(&id).is_some()) as i32
 }
 
+/// Copy bytes [start..end_pos) from buffer src_id to buffer dst_id in one shot.
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_buf_copy_range(dst_id: i64, src_id: i64, start: i64, end_pos: i64) {
+    BUFS.with(|bufs| {
+        let borrowed = bufs.borrow();
+        let src_slice = borrowed
+            .get(&src_id)
+            .map(|buf| {
+                let s = start as usize;
+                let e = (end_pos as usize).min(buf.len());
+                if s < e {
+                    buf[s..e].to_vec()
+                } else {
+                    Vec::new()
+                }
+            })
+            .unwrap_or_default();
+        drop(borrowed);
+        if !src_slice.is_empty() {
+            if let Some(dst) = bufs.borrow_mut().get_mut(&dst_id) {
+                dst.extend_from_slice(&src_slice);
+            }
+        }
+    });
+}
+
 /// Read a binary file into a new ByteBuffer. Returns buf_id or -1 on error.
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_read_file(path_ptr: i32, path_len: i32) -> i64 {

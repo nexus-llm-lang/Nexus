@@ -21,12 +21,7 @@ pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
 /// cabi_realloc for canonical ABI. Delegates to the system allocator
 /// (same as nexus_wasm_alloc). Allocations are tracked for proper dealloc.
 #[no_mangle]
-pub unsafe extern "C" fn cabi_realloc(
-    old_ptr: i32,
-    old_len: i32,
-    align: i32,
-    new_len: i32,
-) -> i32 {
+pub unsafe extern "C" fn cabi_realloc(old_ptr: i32, old_len: i32, align: i32, new_len: i32) -> i32 {
     use std::alloc::{alloc, realloc, Layout};
 
     if new_len <= 0 {
@@ -47,6 +42,10 @@ pub unsafe extern "C" fn cabi_realloc(
             return 0;
         };
         let ptr = realloc(old_ptr as *mut u8, old_layout, new_len);
-        if ptr.is_null() { 0 } else { ptr as i32 }
+        if ptr.is_null() {
+            0
+        } else {
+            ptr as i32
+        }
     }
 }
