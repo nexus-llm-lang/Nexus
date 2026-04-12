@@ -22,8 +22,8 @@ use super::function::compile_function;
 use super::layout::{build_codegen_layout, program_uses_object_heap, CodegenLayout, MemoryMode};
 use super::string::string_abi_for_external;
 use super::{
-    ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, LAZY_JOIN_NAME, LAZY_MODULE,
-    LAZY_SPAWN_NAME, OBJECT_HEAP_GLOBAL_INDEX,
+    ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, LAZY_JOIN_NAME, LAZY_MODULE, LAZY_SPAWN_NAME,
+    OBJECT_HEAP_GLOBAL_INDEX,
 };
 
 /// Compiles LIR (in ANF) directly into core WASM bytes, plus debug entries for DWARF.

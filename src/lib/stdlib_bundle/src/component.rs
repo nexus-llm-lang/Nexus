@@ -104,12 +104,8 @@ impl string_ops::Guest for StdlibComponent {
         )
     }
     fn string_substring(s: String, start: i64, len: i64) -> String {
-        let packed = nexus_string_wasm::__nx_string_substring(
-            s.as_ptr() as i32,
-            s.len() as i32,
-            start,
-            len,
-        );
+        let packed =
+            nexus_string_wasm::__nx_string_substring(s.as_ptr() as i32, s.len() as i32, start, len);
         unpack_string(packed)
     }
     fn string_index_of(s: String, sub: String) -> i64 {
@@ -137,18 +133,15 @@ impl string_ops::Guest for StdlibComponent {
         )
     }
     fn string_trim(s: String) -> String {
-        let packed =
-            nexus_string_wasm::__nx_string_trim(s.as_ptr() as i32, s.len() as i32);
+        let packed = nexus_string_wasm::__nx_string_trim(s.as_ptr() as i32, s.len() as i32);
         unpack_string(packed)
     }
     fn string_to_upper(s: String) -> String {
-        let packed =
-            nexus_string_wasm::__nx_string_to_upper(s.as_ptr() as i32, s.len() as i32);
+        let packed = nexus_string_wasm::__nx_string_to_upper(s.as_ptr() as i32, s.len() as i32);
         unpack_string(packed)
     }
     fn string_to_lower(s: String) -> String {
-        let packed =
-            nexus_string_wasm::__nx_string_to_lower(s.as_ptr() as i32, s.len() as i32);
+        let packed = nexus_string_wasm::__nx_string_to_lower(s.as_ptr() as i32, s.len() as i32);
         unpack_string(packed)
     }
     fn string_replace(s: String, pattern: String, replacement: String) -> String {
@@ -181,8 +174,7 @@ impl string_ops::Guest for StdlibComponent {
         nexus_string_wasm::__nx_string_to_i64(s.as_ptr() as i32, s.len() as i32)
     }
     fn string_repeat(s: String, n: i64) -> String {
-        let packed =
-            nexus_string_wasm::__nx_string_repeat(s.as_ptr() as i32, s.len() as i32, n);
+        let packed = nexus_string_wasm::__nx_string_repeat(s.as_ptr() as i32, s.len() as i32, n);
         unpack_string(packed)
     }
     fn string_pad_left(s: String, width: i64, fill: String) -> String {
@@ -252,12 +244,7 @@ impl string_ops::Guest for StdlibComponent {
         )
     }
     fn string_find_byte(s: String, start: i64, ch: i32) -> i64 {
-        nexus_string_wasm::__nx_string_find_byte(
-            s.as_ptr() as i32,
-            s.len() as i32,
-            start,
-            ch,
-        )
+        nexus_string_wasm::__nx_string_find_byte(s.as_ptr() as i32, s.len() as i32, start, ch)
     }
     fn string_byte_substring(s: String, start: i64, len: i64) -> String {
         let packed = nexus_string_wasm::__nx_string_byte_substring(
@@ -295,10 +282,7 @@ impl stdio::Guest for StdlibComponent {
 
 impl filesystem::Guest for StdlibComponent {
     fn read_to_string(path: String) -> String {
-        let packed = nexus_fs_wasm::__nx_read_to_string(
-            path.as_ptr() as i32,
-            path.len() as i32,
-        );
+        let packed = nexus_fs_wasm::__nx_read_to_string(path.as_ptr() as i32, path.len() as i32);
         unpack_string(packed)
     }
     fn write_string(path: String, content: String) -> i32 {
@@ -330,8 +314,7 @@ impl filesystem::Guest for StdlibComponent {
         nexus_fs_wasm::__nx_create_dir_all(path.as_ptr() as i32, path.len() as i32)
     }
     fn read_dir(path: String) -> String {
-        let packed =
-            nexus_fs_wasm::__nx_read_dir(path.as_ptr() as i32, path.len() as i32);
+        let packed = nexus_fs_wasm::__nx_read_dir(path.as_ptr() as i32, path.len() as i32);
         unpack_string(packed)
     }
     fn fd_open_read(path: String) -> i64 {
@@ -363,8 +346,7 @@ impl filesystem::Guest for StdlibComponent {
 
 impl network::Guest for StdlibComponent {
     fn http_get(url: String) -> String {
-        let packed =
-            nexus_net_wasm::__nx_http_get(url.as_ptr() as i32, url.len() as i32);
+        let packed = nexus_net_wasm::__nx_http_get(url.as_ptr() as i32, url.len() as i32);
         unpack_string(packed)
     }
     fn http_request(method: String, url: String, headers: String, body: String) -> String {
@@ -440,8 +422,7 @@ impl process::Guest for StdlibComponent {
 
 impl environment::Guest for StdlibComponent {
     fn get_env(key: String) -> String {
-        let packed =
-            nexus_proc_wasm::__nx_get_env(key.as_ptr() as i32, key.len() as i32);
+        let packed = nexus_proc_wasm::__nx_get_env(key.as_ptr() as i32, key.len() as i32);
         unpack_string(packed)
     }
     fn set_env(key: String, value: String) {
@@ -555,20 +536,10 @@ impl collections::Guest for StdlibComponent {
         nexus_collection_wasm::__nx_smap_new()
     }
     fn smap_put(id: i64, key: String, value: i64) -> i64 {
-        nexus_collection_wasm::__nx_smap_put(
-            id,
-            key.as_ptr() as i32,
-            key.len() as i32,
-            value,
-        )
+        nexus_collection_wasm::__nx_smap_put(id, key.as_ptr() as i32, key.len() as i32, value)
     }
     fn smap_get(id: i64, key: String, default_val: i64) -> i64 {
-        nexus_collection_wasm::__nx_smap_get(
-            id,
-            key.as_ptr() as i32,
-            key.len() as i32,
-            default_val,
-        )
+        nexus_collection_wasm::__nx_smap_get(id, key.as_ptr() as i32, key.len() as i32, default_val)
     }
     fn smap_has(id: i64, key: String) -> i32 {
         nexus_collection_wasm::__nx_smap_has(id, key.as_ptr() as i32, key.len() as i32)
@@ -614,11 +585,7 @@ impl bytebuffer::Guest for StdlibComponent {
         nexus_collection_wasm::__nx_buf_push_i64_le(id, val);
     }
     fn buf_push_f64_str_le(id: i64, s: String) {
-        nexus_collection_wasm::__nx_buf_push_f64_str_le(
-            id,
-            s.as_ptr() as i32,
-            s.len() as i32,
-        );
+        nexus_collection_wasm::__nx_buf_push_f64_str_le(id, s.as_ptr() as i32, s.len() as i32);
     }
     fn buf_push_leb128_u(id: i64, val: i64) {
         nexus_collection_wasm::__nx_buf_push_leb128_u(id, val);
@@ -642,17 +609,16 @@ impl bytebuffer::Guest for StdlibComponent {
         unpack_string(nexus_collection_wasm::__nx_buf_to_string(id))
     }
     fn buf_write_file(id: i64, path: String) -> i32 {
-        nexus_collection_wasm::__nx_buf_write_file(
-            id,
-            path.as_ptr() as i32,
-            path.len() as i32,
-        )
+        nexus_collection_wasm::__nx_buf_write_file(id, path.as_ptr() as i32, path.len() as i32)
     }
     fn buf_free(id: i64) -> i32 {
         nexus_collection_wasm::__nx_buf_free(id)
     }
     fn buf_read_file(path: String) -> i64 {
         nexus_collection_wasm::__nx_buf_read_file(path.as_ptr() as i32, path.len() as i32)
+    }
+    fn buf_copy_range(dst_id: i64, src_id: i64, start: i64, end_pos: i64) {
+        nexus_collection_wasm::__nx_buf_copy_range(dst_id, src_id, start, end_pos);
     }
 }
 
