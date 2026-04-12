@@ -654,6 +654,9 @@ impl bytebuffer::Guest for StdlibComponent {
     fn buf_read_file(path: String) -> i64 {
         nexus_collection_wasm::__nx_buf_read_file(path.as_ptr() as i32, path.len() as i32)
     }
+    fn buf_copy_range(dst_id: i64, src_id: i64, start: i64, end_pos: i64) {
+        nexus_collection_wasm::__nx_buf_copy_range(dst_id, src_id, start, end_pos);
+    }
 }
 
 // ---------------------------------------------------------------------------
