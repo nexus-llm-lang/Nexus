@@ -214,6 +214,48 @@ pub enum Intrinsic {
     StringByteAt,
     /// string-byte-length(s) → packed & 0xFFFFFFFF
     StringByteLength,
+    /// skip-ws(s, start) → scan forward while whitespace (0x20,0x09,0x0A,0x0D)
+    SkipWs,
+    /// scan-ident(s, start) → scan forward while [a-zA-Z0-9_]
+    ScanIdent,
+    /// scan-digits(s, start) → scan forward while [0-9]
+    ScanDigits,
+    /// find-byte(s, start, ch) → first index of byte ch, or -1
+    FindByte,
+    /// byte-substring(s, start, len) → new packed string from byte range
+    ByteSubstring,
+    /// count-newlines-in(s, start, end_pos) → count of 0x0A in [start, end)
+    CountNewlinesIn,
+    /// last-newline-in(s, start, end_pos) → last index of 0x0A in [start, end), or -1
+    LastNewlineIn,
+    /// length(s) → character count (== byte count for ASCII)
+    StringLength,
+    /// char-code(s, idx) → codepoint at char index as i64 (== byte_at for ASCII)
+    CharCode,
+    /// char-at(s, idx) → char at char index as i32 (== byte_at for ASCII)
+    CharAt,
+    /// from-char-code(code) → single-char string from codepoint
+    FromCharCode,
+    /// from-char(c) → single-char string from char value
+    FromChar,
+    /// char-ord(c) → char as i64
+    CharOrd,
+    /// starts-with(s, prefix) → bool: byte-by-byte prefix comparison
+    StartsWith,
+    /// ends-with(s, suffix) → bool: byte-by-byte suffix comparison
+    EndsWith,
+    /// contains(s, sub) → bool: scan for substring
+    Contains,
+    /// index-of(s, sub) → i64: first occurrence of sub, or -1
+    IndexOf,
+    /// from-i64(val) → string: integer to decimal string representation
+    FromI64,
+    /// heap-mark() → i64: snapshot object heap pointer for later reset
+    HeapMark,
+    /// heap-reset(mark: i64) → unit: restore object heap pointer, freeing temp objects
+    HeapReset,
+    /// heap-swap(base: i64) → i64: swap object heap pointer with a new base, returns old value
+    HeapSwap,
 }
 
 #[derive(Debug, Clone, PartialEq)]

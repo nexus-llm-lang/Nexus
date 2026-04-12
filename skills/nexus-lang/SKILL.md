@@ -20,29 +20,11 @@ Nexus is a programming language designed for LLM-friendly code generation. Its p
 ## When NOT to Use This Skill
 
 - Non-Nexus programming tasks
-- Modifying the Nexus compiler itself (that's Rust code)
 
 ## Quick Reference
 
 ### File Extension
 `.nx`
-
-### CLI Commands
-```
-nexus                    # REPL
-nexus run example.nx     # compile + run via WASM
-nexus build example.nx   # compile to main.wasm
-nexus check example.nx   # typecheck only
-nexus check --format json example.nx  # structured diagnostics (JSON)
-nexus lsp                # start Language Server (stdio)
-```
-
-### Permission Flags (for run/build)
-```
---allow-console   --allow-fs    --allow-net
---allow-random    --allow-clock --allow-proc   --allow-env
---preopen DIR     # (requires --allow-fs)
-```
 
 ## Core Syntax Rules
 
@@ -52,7 +34,7 @@ nexus lsp                # start Language Server (stdio)
 add(a: 1, b: 2)
 add(b: 2, a: 1)          // equivalent
 Console.println(val: "hello")
-Cons(v: x, rest: xs)
+x :: xs
 
 // WRONG — positional arguments do not exist
 add(1, 2)
@@ -97,14 +79,21 @@ end
 ### 4. Sigils: `%` (linear), `&` (borrow), `~` (mutable ref)
 ```nexus
 let %arr = [| 1, 2, 3 |]       // linear — must be consumed exactly once
-let lock = &%arr                 // borrow — immutable view, does not consume
-lock[0] <- 42                   // mutation via borrow
+let view = &%arr                 // borrow — immutable view, does not consume
+view[0] <- 42                   // mutation via borrow
 let ~x = 10                     // mutable ref, stack-confined
 ~x <- 20                        // reassignment
 let v = ~x                      // dereference
 ```
 
-### 5. Explicit `return` required (except unit)
+### 5. Lazy evaluation with `@` (parallel execution)
+```nexus
+let @result = expensive_call(data: input)  // deferred, runs in parallel
+// ... other work ...
+let val = @result                          // force: blocks until ready
+```
+
+### 6. Explicit `return` required (except unit)
 ```nexus
 // Non-unit functions must have explicit return
 let double = fn (n: i64) -> i64 do
@@ -170,6 +159,7 @@ end
 | Generic | `Option<T>`, `Result<T, E>` | Explicit type params |
 | Linear | `%T` | Must consume exactly once |
 | Borrow | `&T` | Immutable view |
+| Lazy | `@T` | Deferred thunk, forced with `@x` (parallel) |
 | Opaque | `opaque type X = ...` | Hidden constructors |
 
 ## Common Patterns
@@ -204,11 +194,9 @@ end
 try
   let name = find_user(id: 42)
   Console.println(val: name)
-catch e ->
-  match e do
-    case NotFound(msg: m) -> Console.println(val: m)
-    case _ -> Console.println(val: "Unknown error")
-  end
+catch
+  case NotFound(msg: m) -> Console.println(val: m)
+  case _ -> Console.println(val: "Unknown error")
 end
 ```
 
@@ -218,8 +206,8 @@ import * as list from "stdlib/list.nx"
 
 let sum = fn (xs: [ i64 ]) -> i64 do
   match xs do
-    case Nil -> return 0
-    case Cons(v: v, rest: rest) -> return v + sum(xs: rest)
+    case [] -> return 0
+    case v :: rest -> return v + sum(xs: rest)
   end
 end
 
@@ -229,20 +217,6 @@ let sum2 = fn (xs: [ i64 ]) -> i64 do
     return acc + val
   end)
 end
-```
-
-### Concurrency
-```nexus
-conc do
-  task fetch_data do
-    let data = fetch(url: endpoint)
-    Logger.info(msg: "Fetched data")
-  end
-  task log_start do
-    Logger.info(msg: "Request started")
-  end
-end
-// Both tasks complete before execution continues
 ```
 
 ## Anti-Patterns to Avoid
@@ -257,31 +231,6 @@ end
 | Implicit I/O | Declare via `require { PermConsole }` + inject handler |
 | `var x = 5` | `let ~x = 5` for mutable |
 | `for x in list` | Use `match`/recursion or `list.fold_left` |
-
-## Tooling
-
-### Language Server (LSP)
-
-`nexus lsp` starts an LSP server over stdio. Supports diagnostics, hover (type info), go-to-definition, document symbols, references, rename, and completion.
-
-### Structured Diagnostics
-
-Use `nexus check --format json` as a tool call to get parse/type errors and symbol lists in machine-readable JSON:
-
-```json
-{
-  "file": "example.nx",
-  "ok": false,
-  "diagnostics": [
-    { "range": { "start": { "line": 5, "character": 9 }, "end": { "line": 5, "character": 16 } },
-      "severity": "error", "message": "Mismatch: string vs i64" }
-  ],
-  "symbols": [
-    { "name": "main", "kind": "function",
-      "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 10, "character": 3 } } }
-  ]
-}
-```
 
 ## Reference Files
 

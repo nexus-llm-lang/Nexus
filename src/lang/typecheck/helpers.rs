@@ -363,9 +363,7 @@ pub(super) fn is_auto_droppable(typ: &Type) -> bool {
         | Type::Unit
         | Type::Array(_) => true,
         Type::Lazy(_) => false, // @T is a one-shot continuation — must be explicitly consumed
-        Type::Linear(inner) | Type::Borrow(inner) | Type::Ref(inner) => {
-            is_auto_droppable(inner)
-        }
+        Type::Linear(inner) | Type::Borrow(inner) | Type::Ref(inner) => is_auto_droppable(inner),
         _ => false,
     }
 }

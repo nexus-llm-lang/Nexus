@@ -76,7 +76,9 @@ fn collect_expr_refs(expr: &LirExpr, refs: &mut HashSet<Symbol>) {
         LirExpr::LazySpawn { thunk, .. } => collect_atom_refs(thunk, refs),
         LirExpr::LazyJoin { task_id, .. } => collect_atom_refs(task_id, refs),
         LirExpr::Intrinsic { args, .. } => {
-            for (_, a) in args { collect_atom_refs(a, refs); }
+            for (_, a) in args {
+                collect_atom_refs(a, refs);
+            }
         }
     }
 }
@@ -144,9 +146,7 @@ fn collect_stmt_refs(stmts: &[LirStmt], refs: &mut HashSet<Symbol>) {
                 collect_stmt_refs(default_body, refs);
                 collect_opt_atom_refs(default_ret, refs);
             }
-            LirStmt::FieldUpdate {
-                target, value, ..
-            } => {
+            LirStmt::FieldUpdate { target, value, .. } => {
                 collect_atom_refs(target, refs);
                 collect_atom_refs(value, refs);
             }

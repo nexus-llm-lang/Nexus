@@ -10,7 +10,7 @@ use super::emit::peel_linear;
 use super::error::CodegenError;
 use super::function::compile_atom;
 use super::layout::{CodegenLayout, PackedString};
-use super::{FunctionTemps, LocalInfo, OBJECT_HEAP_GLOBAL_INDEX};
+use super::{FunctionTemps, LocalInfo, STRING_HEAP_GLOBAL_INDEX};
 
 /// String ABI mode for cross-boundary function calls.
 ///
@@ -32,13 +32,8 @@ pub enum StringABI {
 ///
 /// Component-model imports use WIT-style identifiers (containing `:`),
 /// e.g. `nexus:stdlib/string-ops`. File-path imports (e.g. `stdlib/stdlib.wasm`)
-/// use the packed ABI for shared-memory bundling.
 pub(super) fn string_abi_for_external(ext: &LirExternal) -> StringABI {
     let module = ext.wasm_module.as_ref();
-    // WIT-style module names contain ':' (e.g. "nexus:stdlib/math").
-    // nexus:stdlib/* modules use canonical ABI — each component has its own memory,
-    // and the canonical ABI handles string copy across component boundaries.
-    // nexus:runtime/* modules are host-provided and always use packed convention.
     if module.contains(':') && !module.starts_with("nexus:runtime/") {
         StringABI::Canonical
     } else {
@@ -186,11 +181,30 @@ pub(super) fn emit_string_concat(
         out.instruction(&Instruction::Call(alloc_idx));
         out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
     } else {
-        out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+        out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
         out.instruction(&Instruction::LocalTee(temps.concat_out_ptr_i32));
         out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
         out.instruction(&Instruction::I32Add);
-        out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+        out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
+        // Grow memory if string heap exceeds current size
+        out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
+        out.instruction(&Instruction::MemorySize(0));
+        out.instruction(&Instruction::I32Const(16));
+        out.instruction(&Instruction::I32Shl);
+        out.instruction(&Instruction::I32GtU);
+        out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
+        out.instruction(&Instruction::MemorySize(0));
+        out.instruction(&Instruction::I32Const(16));
+        out.instruction(&Instruction::I32Shl);
+        out.instruction(&Instruction::I32Sub);
+        out.instruction(&Instruction::I32Const(65535));
+        out.instruction(&Instruction::I32Add);
+        out.instruction(&Instruction::I32Const(16));
+        out.instruction(&Instruction::I32ShrU);
+        out.instruction(&Instruction::MemoryGrow(0));
+        out.instruction(&Instruction::Drop);
+        out.instruction(&Instruction::End);
     }
 
     // Copy lhs bytes

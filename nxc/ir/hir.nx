@@ -9,7 +9,7 @@
  * - Dead code filtering
  */
 import { Span } from "nxc/common/token.nx"
-import { concat } from "stdlib/bytebuffer.nx"
+import { buf_concat } from "stdlib/bytebuffer.nx"
 import { handler_func_name } from "nxc/common/naming.nx"
 import { Sigil, SigilImmutable, SigilLazy, SigilMutable, TypeExpr, TyI64, TyVar, TyUnit, TyArrow,
          Expr, ExprLiteral, ExprVariable, ExprBinaryOp, ExprBorrow,
@@ -652,12 +652,39 @@ let map_stdlib_to_wit = fn (ext_path: string, source_file: string) -> string do
   return ext_path
 end
 
+/// Check if ffi_name has the __nx_ prefix.
+/// Uses substring+equality instead of starts_with (starts_with triggers OOM
+/// via cascading reachability changes in the Rust bump-allocator codegen).
+let has_nx_prefix = fn (ffi_name: string) -> bool do
+  if byte_length(s: ffi_name) < 5 then return false end
+  return substring(s: ffi_name, start: 0, len: 5) == "__nx_"
+end
+
+/// Check if source_file is a stdlib path ("stdlib/" or "nxlib/stdlib/").
+/// Uses intrinsics (byte_length+substring) to avoid starts_with OOM.
+let is_stdlib_source = fn (path: string) -> bool do
+  if byte_length(s: path) >= 7 then
+    if substring(s: path, start: 0, len: 7) == "stdlib/" then return true end
+  end
+  if byte_length(s: path) >= 13 then
+    if substring(s: path, start: 0, len: 13) == "nxlib/stdlib/" then return true end
+  end
+  return false
+end
+
+/// Build WIT name from position pos to end, replacing '_' with '-'.
+let build_wit_name = fn (s: string, pos: i64, len: i64, acc: string) -> string do
+  if pos >= len then return acc end
+  let b = byte_at(s: s, idx: pos)
+  let ch = if b == '_' then "-" else substring(s: s, start: pos, len: 1) end
+  return build_wit_name(s: s, pos: pos + 1, len: len, acc: acc ++ ch)
+end
+
 /// Convert __nx_* FFI name to WIT-canonical kebab-case.
 /// "__nx_abs_i64" → "abs-i64", "allocate" → "allocate"
 let wit_canonical_name = fn (ffi_name: string) -> string do
-  if starts_with(s: ffi_name, prefix: "__nx_") then
-    let stripped = byte_substring(s: ffi_name, start: 5, len: byte_length(s: ffi_name) - 5)
-    return replace(s: stripped, from_str: "_", to_str: "-")
+  if has_nx_prefix(ffi_name: ffi_name) then
+    return build_wit_name(s: ffi_name, pos: 5, len: byte_length(s: ffi_name), acc: "")
   end
   return ffi_name
 end
@@ -690,6 +717,7 @@ let ext_list_has = fn (exts: [HirExternal], name: string) -> bool do
   end
 end
 
+
 let func_list_has = fn (funcs: [HirFunction], name: string) -> bool do
   match funcs do
     case [] -> return false
@@ -704,22 +732,33 @@ end
 let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, type_ann: Option<TypeExpr>,
     entries: [RenameEntry], span: Span, accum: HirAccum, source_file: string) -> HirAccum do
   let HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs) = accum
-  // Stdlib files (path starts with "stdlib/") may have external declarations.
-  // Use full convert_expr for stdlib files (externals are cheap to convert).
-  // Non-stdlib .nx files only have Lambda defs — use convert_expr_toplevel to skip bodies.
-  let is_stdlib = starts_with(s: source_file, prefix: "stdlib/")
-     || starts_with(s: source_file, prefix: "nxlib/stdlib/")
-  // Stdlib: full convert_expr (handlers/externals/constants are cheap).
-  // Non-stdlib: convert_expr_toplevel (skips Lambda body, returns dummy Lambda).
+  // Stdlib files: full convert_expr (handlers/externals/constants are cheap,
+  // and keeping them as EagerBody avoids cumulative OOM during lazy resolve).
+  // Non-stdlib: convert_expr_toplevel for Lambda bodies (deferred via LazyBody),
+  // but convert_expr for Handler/External (cheap and must be handled correctly).
+  let is_stdlib = is_stdlib_source(path: source_file)
+  let SpannedExpr(node: val_peek, span: _) = val
   let hir_val = if is_stdlib then convert_expr(expr: val, entries: entries)
-    else convert_expr_toplevel(expr: val, entries: entries)
+    else match val_peek do
+      case ExprHandler(coeffect_name: _, requires: _, functions: _) -> convert_expr(expr: val, entries: entries)
+      case ExprExternal(symbol: _, arg_names: _, typ: _) -> convert_expr(expr: val, entries: entries)
+      case _ -> convert_expr_toplevel(expr: val, entries: entries)
+    end
   end
   let HirExpr(node: hir_val_node, span: _) = hir_val
   match hir_val_node do
     case Lambda(type_params: tps, params: lps, ret_type: rt, body: _) ->
       // All Lambdas (including main) get LazyBody. Resolved during resolve phase.
+      // For constants (non-Lambda AST wrapped as Lambda by convert_expr_toplevel),
+      // fix ret_type: infer_ret_from_expr returns TyUnit, but constants need proper type.
+      // This is overridden during lazy body resolution (resolve_all_lazy_via_convert),
+      // but set a reasonable default so pre-resolve analysis sees the right type.
+      let effective_rt = match val_peek do
+        case ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: _) -> rt
+        case _ -> match type_ann do case Some(val: t) -> t case None -> TyI64 end
+      end
       let func = HirFunction(name: qname, type_params: tps, params: lps,
-        ret_type: rt, body: LazyBody(ast_expr: val, entries: entries), span: span)
+        ret_type: effective_rt, body: LazyBody(ast_expr: val, entries: entries), span: span)
       return HirAccum(ports: ps, functions: func :: fs,
         externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs)
     case Handler(port_name: pname, functions: handler_funcs) ->
@@ -737,9 +776,7 @@ let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, typ
     case ExternalRef(symbol: sym, arg_names: anames, typ: t) ->
       match wmod do
         case Some(val: wm) ->
-          let effective_sym = if contains(s: wm, sub: ":") then
-            wit_canonical_name(ffi_name: sym)
-          else sym end
+          let effective_sym = wit_canonical_name(ffi_name: sym)
           let ext = make_hir_external(name: qname, wasm_module: wm,
             wasm_name: effective_sym, arg_names: anames, typ: t)
           return HirAccum(ports: ps, functions: fs,
@@ -830,9 +867,7 @@ let shallow_dispatch_let = fn (qname: string, val: SpannedExpr, entries: [Rename
     case ExprExternal(symbol: sym, arg_names: anames, typ: t) ->
       match wmod do
         case Some(val: wm) ->
-          let effective_sym = if contains(s: wm, sub: ":") then
-            wit_canonical_name(ffi_name: sym)
-          else sym end
+          let effective_sym = wit_canonical_name(ffi_name: sym)
           let ext = make_hir_external(name: qname, wasm_module: wm,
             wasm_name: effective_sym, arg_names: anames, typ: t)
           return HirAccum(ports: ps, functions: fs,
@@ -927,7 +962,7 @@ let process_top_level = fn (node: TopLevel, span: Span, entries: [RenameEntry], 
 end
 
 /// Find an existing HirFunction in the accumulator whose unqualified name matches.
-/// Qualified names have format "__import_N_name" or "name" (unqualified).
+/// Qualified names have format "alias.name" or "name" (unqualified).
 /// Used to find the first import's version of a function for forwarding.
 let find_existing_function = fn (name: string, funcs: [HirFunction]) -> Option<string> do
   let dot_suffix = "." ++ name
@@ -981,33 +1016,37 @@ let process_top_level_shallow = fn (node: TopLevel, span: Span, entries: [Rename
       end
     case TLLet(def: GlobalLet(name: name, is_public: _, typ: type_ann, value: val)) ->
       let qname = rename(name: name, entries: entries)
-      // For diamond re-imports: if a function with this name already exists,
-      // create a cheap forwarding stub instead of re-converting the entire body.
-      // This avoids the 4GB OOM from convert_expr on large Lambda bodies.
-      match find_existing_function(name: name, funcs: fs) do
-        case Some(val: orig_qname) ->
-          // Extract params and return type from AST without converting body
-          let SpannedExpr(node: val_node, span: _) = val
-          let fwd = match val_node do
-            case ExprLambda(type_params: tps, params: ast_params, ret_type: rt, requires: _, throw_row: _, body: _) ->
-              let hir_params = convert_params(params: ast_params)
-              make_forwarding_function(new_name: qname, orig_name: orig_qname,
-                params: hir_params, type_params: tps, ret_type: rt, span: span)
-            case ExprExternal(symbol: sym, arg_names: anames, typ: t) ->
-              // External: register with original name, no body needed
-              // (handled below via process_top_level fallback)
-              make_forwarding_function(new_name: qname, orig_name: orig_qname,
-                params: [], type_params: [], ret_type: TyUnit, span: span)
-            case _ ->
-              // Non-function value: create zero-arg forwarding function
-              make_forwarding_function(new_name: qname, orig_name: orig_qname,
-                params: [], type_params: [], ret_type: TyUnit, span: span)
+      let SpannedExpr(node: val_node, span: _) = val
+      match val_node do
+        case ExprExternal(symbol: _, arg_names: _, typ: _) ->
+          // External: already registered in first import — skip in diamond path.
+          if ext_list_has(exts: exts, name: qname) then return accum
+          else return process_top_level(node: node, span: span, entries: entries, accum: accum, source_file: source_file)
           end
-          return HirAccum(ports: ps, functions: fwd :: fs, externals: exts,
-            handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs)
-        case None ->
-          // First time seeing this function — fall back to full processing
-          return process_top_level(node: node, span: span, entries: entries, accum: accum, source_file: source_file)
+        case _ ->
+          match find_existing_function(name: name, funcs: fs) do
+            case Some(val: orig_qname) ->
+              // Guard: if the forwarding target has the same name as the new
+              // function, skip — otherwise we create a self-recursive stub.
+              // This happens when the same bare name is re-imported in multiple
+              // diamond imports (e.g., from_i64 imported by error.nx and symtab.nx).
+              if qname == orig_qname then return accum
+              else
+                let fwd = match val_node do
+                  case ExprLambda(type_params: tps, params: ast_params, ret_type: rt, requires: _, throw_row: _, body: _) ->
+                    let hir_params = convert_params(params: ast_params)
+                    make_forwarding_function(new_name: qname, orig_name: orig_qname,
+                      params: hir_params, type_params: tps, ret_type: rt, span: span)
+                  case _ ->
+                    make_forwarding_function(new_name: qname, orig_name: orig_qname,
+                      params: [], type_params: [], ret_type: TyI64, span: span)
+                end
+                return HirAccum(ports: ps, functions: fwd :: fs, externals: exts,
+                  handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs)
+              end
+            case None ->
+              return process_top_level(node: node, span: span, entries: entries, accum: accum, source_file: source_file)
+          end
       end
     case TLPort(def: _) ->
       return process_top_level(node: node, span: span, entries: entries, accum: accum, source_file: source_file)

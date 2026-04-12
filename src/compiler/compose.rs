@@ -18,23 +18,21 @@ use crate::constants::{ENTRYPOINT, NEXUS_CAPABILITIES_SECTION, WASI_SNAPSHOT_MOD
 use crate::runtime;
 
 /// The stdlib component core module (built with `--features component`).
-const STDLIB_COMPONENT_WASM: &[u8] =
-    include_bytes!("../../nxlib/stdlib/stdlib-component.wasm");
+const STDLIB_COMPONENT_WASM: &[u8] = include_bytes!("../../nxlib/stdlib/stdlib-component.wasm");
 
 /// The nexus-host bridge core module (HTTP bridge component).
-const NEXUS_HOST_BRIDGE_WASM: &[u8] =
-    include_bytes!("../../nxlib/stdlib/nexus-host-bridge.wasm");
+const NEXUS_HOST_BRIDGE_WASM: &[u8] = include_bytes!("../../nxlib/stdlib/nexus-host-bridge.wasm");
 
 /// Full WIT source for stdlib interfaces.
 const STDLIB_WIT: &str = include_str!("../../src/lib/stdlib_bundle/wit/world.wit");
 
 /// WIT source for the nexus:cli package (imported by stdlib for net sub-crate).
-const NEXUS_CLI_WIT: &str =
-    include_str!("../../src/lib/stdlib_bundle/wit/deps/nexus-cli.wit");
+const NEXUS_CLI_WIT: &str = include_str!("../../src/lib/stdlib_bundle/wit/deps/nexus-cli.wit");
 
 /// WIT source for the nexus:runtime package (backtrace, lazy, conc).
 /// WIT source for the wasi:cli package (run interface).
-const WASI_CLI_WIT: &str = "package wasi:cli@0.2.6;\n\ninterface run {\n  run: func() -> result;\n}\n";
+const WASI_CLI_WIT: &str =
+    "package wasi:cli@0.2.6;\n\ninterface run {\n  run: func() -> result;\n}\n";
 
 const NEXUS_RUNTIME_WIT: &str = "\
 package nexus:runtime;\n\
@@ -73,13 +71,26 @@ pub fn compose_with_stdlib_and_host(user_core_wasm: &[u8]) -> Result<Vec<u8>, St
 }
 
 fn compose_with_stdlib_impl(user_core_wasm: &[u8], include_host: bool) -> Result<Vec<u8>, String> {
+    // Fix misplaced string-ops imports from older nxc compiler output.
+    // The nxc diamond-cache bug puts string-* functions under wrong modules.
+    let user_core_wasm = &normalize_string_ops_imports(user_core_wasm);
+    // Fix cabi_realloc type assignment (old nxc assigns ()→() instead of (i32,i32,i32,i32)→i32).
+    let user_core_wasm = &fix_cabi_realloc_type(user_core_wasm);
+    // Strip "wasi:cli/run@*" export from nxc-compiled core WASM.
+    // The nxc codegen exports it, but the WASI command adapter should provide it.
+    // Having both causes the ComponentEncoder to wire the entry point incorrectly.
+    let user_core_wasm = &fix_nxc_wasi_run_export(user_core_wasm);
+
     let caps = runtime::parse_nexus_capabilities(user_core_wasm);
 
     // Detect which stdlib interfaces and other modules the user imports.
     let import_modules = core_import_modules(user_core_wasm)?;
     let nexus_imports: Vec<&str> = import_modules
         .iter()
-        .filter(|m| m.starts_with("nexus:stdlib/") || m.starts_with("nexus:runtime/"))
+        .filter(|m| {
+            (m.starts_with("nexus:stdlib/") || m.starts_with("nexus:runtime/"))
+                && *m != "nexus:runtime/arena" // intrinsic-only, no runtime support needed
+        })
         .map(|s| s.as_str())
         .collect();
     let has_stdlib = nexus_imports.iter().any(|m| m.starts_with("nexus:stdlib/"));
@@ -90,7 +101,7 @@ fn compose_with_stdlib_impl(user_core_wasm: &[u8], include_host: bool) -> Result
     }
 
     // Build WIT world for the user module.
-    let app_wit = build_app_wit(&nexus_imports, include_host);
+    let app_wit = build_app_wit(&nexus_imports);
 
     // Debug: save core WASM on failure
     if std::env::var_os("NEXUS_DEBUG_COMPOSE").is_some() {
@@ -179,7 +190,7 @@ const ALL_STDLIB_INTERFACES: &[&str] = &[
 ];
 
 /// Build a WIT world source for the user app, importing the given stdlib interfaces.
-fn build_app_wit(all_imports: &[&str], include_host: bool) -> String {
+fn build_app_wit(all_imports: &[&str]) -> String {
     let mut wit = String::new();
     wit.push_str("package nexus:app;\n\n");
     wit.push_str("world app {\n");
@@ -206,7 +217,11 @@ fn build_app_wit(all_imports: &[&str], include_host: bool) -> String {
 }
 
 /// Encode the user's core WASM as a component.
-fn encode_user_component(core_wasm: &[u8], app_wit: &str, command: bool) -> Result<Vec<u8>, String> {
+fn encode_user_component(
+    core_wasm: &[u8],
+    app_wit: &str,
+    command: bool,
+) -> Result<Vec<u8>, String> {
     let mut resolve = Resolve::default();
     // Push dependency packages first so stdlib/app WIT can reference them.
     let _cli_pkg = resolve
@@ -286,108 +301,6 @@ fn encode_nexus_host_component() -> Result<Vec<u8>, String> {
         .map_err(|e| format!("failed to encode nexus-host component: {}", e))
 }
 
-/// Compose user component with multiple dependency components via wasm-compose.
-fn compose_components_multi(
-    user_component: &[u8],
-    deps: &[(&str, &[u8])],
-) -> Result<Vec<u8>, String> {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "nexus-compose-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&temp_dir)
-        .map_err(|e| format!("failed to create temp compose dir: {}", e))?;
-
-    let result = (|| -> Result<Vec<u8>, String> {
-        let user_path = temp_dir.join("user.wasm");
-        fs::write(&user_path, user_component)
-            .map_err(|e| format!("failed to write user component: {}", e))?;
-
-        let mut config = ComposeConfig {
-            dir: temp_dir.clone(),
-            search_paths: vec![temp_dir.clone()],
-            disallow_imports: false,
-            ..Default::default()
-        };
-
-        // Write deps and register them for interface-based matching.
-        let user_imports = component_import_names(user_component)?;
-        for (name, bytes) in deps {
-            let dep_path = temp_dir.join(name);
-            fs::write(&dep_path, bytes)
-                .map_err(|e| format!("failed to write dep {}: {}", name, e))?;
-
-            // Register this dep for each user import it can satisfy.
-            let dep_file = PathBuf::from(*name);
-            for import_name in &user_imports {
-                if !config.dependencies.contains_key(import_name) {
-                    config.dependencies.insert(
-                        import_name.clone(),
-                        ComposeDependency { path: dep_file.clone() },
-                    );
-                }
-            }
-        }
-
-        ComponentComposer::new(&user_path, &config)
-            .compose()
-            .map_err(|e| format!("component composition failed: {e:#}"))
-    })();
-
-    let _ = fs::remove_dir_all(&temp_dir);
-    result
-}
-
-/// Compose two components: primary + single dependency.
-fn compose_two(primary: &[u8], dep_name: &str, dep_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "nexus-compose2-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&temp_dir)
-        .map_err(|e| format!("failed to create temp compose dir: {}", e))?;
-
-    let result = (|| -> Result<Vec<u8>, String> {
-        let primary_path = temp_dir.join("primary.wasm");
-        let dep_path = temp_dir.join(dep_name);
-        fs::write(&primary_path, primary)
-            .map_err(|e| format!("failed to write primary component: {}", e))?;
-        fs::write(&dep_path, dep_bytes)
-            .map_err(|e| format!("failed to write dep component: {}", e))?;
-
-        let dep_file = PathBuf::from(dep_name);
-        let mut config = ComposeConfig {
-            dir: temp_dir.clone(),
-            disallow_imports: false,
-            ..Default::default()
-        };
-
-        // Register the dep for all primary imports (composer matches by interface).
-        let primary_imports = component_import_names(primary)?;
-        for import_name in &primary_imports {
-            config.dependencies.insert(
-                import_name.clone(),
-                ComposeDependency { path: dep_file.clone() },
-            );
-        }
-
-        ComponentComposer::new(&primary_path, &config)
-            .compose()
-            .map_err(|e| format!("compose_two failed: {e:#}"))
-    })();
-
-    let _ = fs::remove_dir_all(&temp_dir);
-    result
-}
-
 /// Compose user + stdlib + nexus-host in one step.
 /// All components are placed in a temp dir and the composer auto-discovers them.
 fn compose_all(
@@ -430,14 +343,18 @@ fn compose_all(
             if import_name.starts_with("nexus:stdlib/") {
                 config.dependencies.insert(
                     import_name.clone(),
-                    ComposeDependency { path: stdlib_file.clone() },
+                    ComposeDependency {
+                        path: stdlib_file.clone(),
+                    },
                 );
             }
         }
         // Satisfy stdlib's transitive nexus:cli/nexus-host import.
         config.dependencies.insert(
             "nexus:cli/nexus-host".to_string(),
-            ComposeDependency { path: nexus_host_file },
+            ComposeDependency {
+                path: nexus_host_file,
+            },
         );
 
         ComponentComposer::new(&user_path, &config)
@@ -450,10 +367,7 @@ fn compose_all(
 }
 
 /// Compose user component + stdlib component via wasm-compose.
-fn compose_components(
-    user_component: &[u8],
-    stdlib_component: &[u8],
-) -> Result<Vec<u8>, String> {
+fn compose_components(user_component: &[u8], stdlib_component: &[u8]) -> Result<Vec<u8>, String> {
     let temp_dir = std::env::temp_dir().join(format!(
         "nexus-compose-{}-{}",
         std::process::id(),
@@ -509,12 +423,8 @@ fn compose_components(
 }
 
 /// Encode a standalone user component (no stdlib dependencies).
-fn encode_standalone_component(
-    core_wasm: &[u8],
-    caps: &[String],
-) -> Result<Vec<u8>, String> {
-    let wit_source =
-        "package nexus:app;\n\nworld app {\n  export main: func();\n}\n".to_string();
+fn encode_standalone_component(core_wasm: &[u8], caps: &[String]) -> Result<Vec<u8>, String> {
+    let wit_source = "package nexus:app;\n\nworld app {\n  export main: func();\n}\n".to_string();
 
     // Use the same approach as the old artifact.rs: push wasi:cli first, then app.
     let mut resolve = Resolve::default();
@@ -565,4 +475,288 @@ fn append_custom_section(wasm: &mut Vec<u8>, caps: &[String]) {
     comp.section(&section);
     let encoded = comp.finish();
     wasm.extend_from_slice(&encoded[8..]);
+}
+
+/// Strip "wasi:cli/run@*" export and fix "_start" to point to the wasi_run wrapper.
+///
+/// The nxc codegen exports `wasi:cli/run@0.2.6#run` from the core module, but
+/// in the component model the WASI command adapter provides this interface.
+/// Having both confuses the ComponentEncoder. Additionally, nxc maps `_start`
+/// to `$main` directly instead of to the wasi_run wrapper that calls argv+main.
+/// We fix `_start` to point to the wasi_run wrapper (the last function, which
+/// just `call $main`).
+fn fix_nxc_wasi_run_export(wasm: &[u8]) -> Vec<u8> {
+    use wasm_encoder::{ExportKind, ExportSection, Module, RawSection};
+
+    let has_wasi_run = wasmparser::Parser::new(0)
+        .parse_all(wasm)
+        .filter_map(|p| p.ok())
+        .any(|p| {
+            if let Payload::ExportSection(section) = p {
+                section
+                    .into_iter()
+                    .any(|e| e.map_or(false, |e| e.name.contains("wasi:cli/run")))
+            } else {
+                false
+            }
+        });
+    if !has_wasi_run {
+        return wasm.to_vec();
+    }
+
+    // Find the wasi_run wrapper function index (it just calls $main).
+    // It's the function exported as "wasi:cli/run@0.2.6#run".
+    let mut wasi_run_idx: Option<u32> = None;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        let Ok(payload) = payload else { continue };
+        if let Payload::ExportSection(section) = payload {
+            for export in section {
+                let Ok(export) = export else { continue };
+                if export.name.starts_with("wasi:cli/run") {
+                    wasi_run_idx = Some(export.index);
+                }
+            }
+        }
+    }
+
+    let parser = wasmparser::Parser::new(0);
+    let mut module = Module::new();
+    for payload in parser.parse_all(wasm) {
+        let payload = match payload {
+            Ok(p) => p,
+            Err(_) => return wasm.to_vec(),
+        };
+        match &payload {
+            Payload::ExportSection(section) => {
+                let mut exports = ExportSection::new();
+                for export in section.clone() {
+                    let Ok(export) = export else {
+                        return wasm.to_vec();
+                    };
+                    // Skip all wasi:cli/run exports
+                    if export.name.contains("wasi:cli/run") {
+                        continue;
+                    }
+                    let kind = match export.kind {
+                        wasmparser::ExternalKind::Func => ExportKind::Func,
+                        wasmparser::ExternalKind::Table => ExportKind::Table,
+                        wasmparser::ExternalKind::Memory => ExportKind::Memory,
+                        wasmparser::ExternalKind::Global => ExportKind::Global,
+                        wasmparser::ExternalKind::Tag => ExportKind::Tag,
+                    };
+                    // Fix _start to point to the wasi_run wrapper
+                    let index = if export.name == "_start" {
+                        wasi_run_idx.unwrap_or(export.index)
+                    } else {
+                        export.index
+                    };
+                    exports.export(export.name, kind, index);
+                }
+                module.section(&exports);
+                continue;
+            }
+            _ => {}
+        }
+        if let Some((id, range)) = payload.as_section() {
+            module.section(&RawSection {
+                id,
+                data: &wasm[range],
+            });
+        }
+    }
+    module.finish()
+}
+
+/// Fix cabi_realloc's type assignment in the function section.
+/// Old nxc codegen assigns it the wasi_run type `()→()` instead of
+/// `(i32,i32,i32,i32)→i32`. Find the correct type index and rewrite.
+fn fix_cabi_realloc_type(wasm: &[u8]) -> Vec<u8> {
+    use wasm_encoder::{FunctionSection, Module, RawSection};
+
+    // Find the cabi_realloc type index: (i32, i32, i32, i32) -> i32
+    let mut cabi_type_idx: Option<u32> = None;
+    let mut type_idx: u32 = 0;
+    let mut n_local_funcs: u32 = 0;
+    let mut has_cabi_export = false;
+
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        let Ok(payload) = payload else { continue };
+        match payload {
+            Payload::TypeSection(section) => {
+                for rec_group in section {
+                    let Ok(rec_group) = rec_group else { continue };
+                    for sub_type in rec_group.into_types() {
+                        if let wasmparser::CompositeInnerType::Func(f) =
+                            &sub_type.composite_type.inner
+                        {
+                            let params: Vec<_> = f.params().to_vec();
+                            let results: Vec<_> = f.results().to_vec();
+                            if params == [wasmparser::ValType::I32; 4]
+                                && results == [wasmparser::ValType::I32]
+                            {
+                                cabi_type_idx = Some(type_idx);
+                            }
+                        }
+                        type_idx += 1;
+                    }
+                }
+            }
+            Payload::FunctionSection(section) => {
+                n_local_funcs = section.count();
+            }
+            Payload::ExportSection(section) => {
+                for export in section {
+                    let Ok(export) = export else { continue };
+                    if export.name == "cabi_realloc" {
+                        has_cabi_export = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let cabi_type_idx = match cabi_type_idx {
+        Some(idx) if has_cabi_export => idx,
+        _ => return wasm.to_vec(),
+    };
+    // cabi_realloc is the second-to-last local function.
+    let cabi_local_idx = n_local_funcs - 2;
+
+    let parser = wasmparser::Parser::new(0);
+    let mut module = Module::new();
+    for payload in parser.parse_all(wasm) {
+        let payload = match payload {
+            Ok(p) => p,
+            Err(_) => return wasm.to_vec(),
+        };
+        match &payload {
+            Payload::FunctionSection(section) => {
+                let mut funcs = FunctionSection::new();
+                let mut idx: u32 = 0;
+                for func_type in section.clone() {
+                    let Ok(func_type) = func_type else {
+                        return wasm.to_vec();
+                    };
+                    if idx == cabi_local_idx {
+                        funcs.function(cabi_type_idx);
+                    } else {
+                        funcs.function(func_type);
+                    }
+                    idx += 1;
+                }
+                module.section(&funcs);
+                continue;
+            }
+            _ => {}
+        }
+        if let Some((id, range)) = payload.as_section() {
+            module.section(&RawSection {
+                id,
+                data: &wasm[range],
+            });
+        }
+    }
+    module.finish()
+}
+
+/// Returns the correct WIT module for a function name, or None if it belongs
+/// to the module it's already in.
+fn correct_module_for_import(module: &str, name: &str) -> Option<&'static str> {
+    if module == "nexus:stdlib/string-ops" {
+        return None; // already correct
+    }
+    if name.starts_with("string-") || name.starts_with("char-") {
+        return Some("nexus:stdlib/string-ops");
+    }
+    None
+}
+
+/// Rewrite core WASM imports to move misplaced string-ops functions to
+/// `nexus:stdlib/string-ops`. Deduplicates by (module, name) pair.
+/// Needed for nxc compiler output where diamond-cached imports cause
+/// string functions to be registered under wrong stdlib modules.
+fn normalize_string_ops_imports(wasm: &[u8]) -> Vec<u8> {
+    use wasm_encoder::{EntityType, ImportSection, Module, RawSection};
+
+    // Quick check: any nexus:stdlib/* import with a string-* name not in string-ops?
+    let needs_fix = wasmparser::Parser::new(0)
+        .parse_all(wasm)
+        .filter_map(|p| p.ok())
+        .any(|p| {
+            if let Payload::ImportSection(section) = p {
+                section.into_iter().any(|i| {
+                    i.map_or(false, |i| {
+                        correct_module_for_import(i.module, i.name).is_some()
+                    })
+                })
+            } else {
+                false
+            }
+        });
+    if !needs_fix {
+        return wasm.to_vec();
+    }
+
+    // Remap module names without deduplicating (preserves function indices).
+    let parser = wasmparser::Parser::new(0);
+    let mut module = Module::new();
+
+    for payload in parser.parse_all(wasm) {
+        let payload = match payload {
+            Ok(p) => p,
+            Err(_) => return wasm.to_vec(),
+        };
+        match &payload {
+            Payload::ImportSection(section) => {
+                let mut imports = ImportSection::new();
+                for import in section.clone() {
+                    let import = match import {
+                        Ok(i) => i,
+                        Err(_) => return wasm.to_vec(),
+                    };
+                    let effective_module = correct_module_for_import(import.module, import.name)
+                        .unwrap_or(import.module);
+                    let entity = match import.ty {
+                        wasmparser::TypeRef::Func(idx) => EntityType::Function(idx),
+                        wasmparser::TypeRef::Memory(m) => {
+                            EntityType::Memory(wasm_encoder::MemoryType {
+                                minimum: m.initial,
+                                maximum: m.maximum,
+                                memory64: m.memory64,
+                                shared: m.shared,
+                                page_size_log2: m.page_size_log2,
+                            })
+                        }
+                        wasmparser::TypeRef::Global(g) => {
+                            let val_type = match g.content_type {
+                                wasmparser::ValType::I32 => wasm_encoder::ValType::I32,
+                                wasmparser::ValType::I64 => wasm_encoder::ValType::I64,
+                                wasmparser::ValType::F32 => wasm_encoder::ValType::F32,
+                                wasmparser::ValType::F64 => wasm_encoder::ValType::F64,
+                                _ => return wasm.to_vec(),
+                            };
+                            EntityType::Global(wasm_encoder::GlobalType {
+                                val_type,
+                                mutable: g.mutable,
+                                shared: g.shared,
+                            })
+                        }
+                        _ => return wasm.to_vec(),
+                    };
+                    imports.import(effective_module, import.name, entity);
+                }
+                module.section(&imports);
+                continue;
+            }
+            _ => {}
+        }
+        if let Some((id, range)) = payload.as_section() {
+            module.section(&RawSection {
+                id,
+                data: &wasm[range],
+            });
+        }
+    }
+    module.finish()
 }

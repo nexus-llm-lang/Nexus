@@ -71,10 +71,10 @@ use super::layout::CodegenLayout;
 use super::stmt::compile_stmt;
 use super::string::{
     emit_canonical_string_return_unpack, emit_string_compare, emit_string_concat,
-    external_uses_canonical_string_return, is_string_compare_operator,
-    is_string_concat_operator, pack_string,
+    external_uses_canonical_string_return, is_string_compare_operator, is_string_concat_operator,
+    pack_string,
 };
-use super::{FunctionTemps, LocalInfo, OBJECT_HEAP_GLOBAL_INDEX};
+use super::{FunctionTemps, LocalInfo, OBJECT_HEAP_GLOBAL_INDEX, STRING_HEAP_GLOBAL_INDEX};
 use crate::constants::ENTRYPOINT;
 
 pub(super) fn compile_function(
@@ -123,15 +123,19 @@ pub(super) fn compile_function(
         concat_out_ptr_i32: next_local_index + 8,
         concat_out_len_i32: next_local_index + 9,
         concat_idx_i32: next_local_index + 10,
-        closure_ptr_i64: next_local_index + 11,
-        closure_table_idx_i64: next_local_index + 12,
+        scan_byte_i32: next_local_index + 11,
+        scan_end_i32: next_local_index + 12,
+        closure_ptr_i64: next_local_index + 13,
+        closure_table_idx_i64: next_local_index + 14,
     };
-    // Temps: 1×i64, 1×i32, 2×i64, 7×i32, 2×i64 (closure)
+    // Temps: 1×i64, 1×i32, 2×i64, 7×i32, 2×i32(scan), 2×i64(closure)
     local_decls_flat.extend_from_slice(&[
         ValType::I64,
         ValType::I32,
         ValType::I64,
         ValType::I64,
+        ValType::I32,
+        ValType::I32,
         ValType::I32,
         ValType::I32,
         ValType::I32,
@@ -147,8 +151,8 @@ pub(super) fn compile_function(
     // TODO: TCMC disabled pending runtime bug fix (bootstrap crash)
     let tcmc_pre: Option<TcmcPreInfo> = None; // detect_tcmc(func);
     let tcmc_info = tcmc_pre.map(|pre| {
-        let head_idx = next_local_index + 13; // after FunctionTemps (13 slots)
-        let prev_idx = next_local_index + 14;
+        let head_idx = next_local_index + 15; // after FunctionTemps (15 slots)
+        let prev_idx = next_local_index + 16;
         local_decls_flat.push(ValType::I64); // __tcmc_head
         local_decls_flat.push(ValType::I32); // __tcmc_prev
         TcmcInfo {
@@ -887,23 +891,36 @@ pub(super) fn compile_expr(
             })
         }
         LirExpr::Constructor { name, args, .. } => {
-            emit_alloc_object(out, temps, 1 + args.len(), layout)?;
-
-            out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
-            out.instruction(&Instruction::I64Const(constructor_tag(
-                name.as_str(),
-                args.len(),
-            )));
-            out.instruction(&Instruction::I64Store(memarg(0)));
-
-            for (idx, arg) in args.iter().enumerate() {
-                out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
-                compile_atom(arg, out, local_map, layout)?;
-                emit_typed_field_store(&arg.typ(), ((idx + 1) * 8) as u64, out)?;
+            if args.is_empty() {
+                let tag = constructor_tag(name.as_str(), 0);
+                if let Some(&addr) = layout.nullary_ctor_addrs.get(&tag) {
+                    // Use pre-allocated static address from data section.
+                    // The match compilation can dereference this as a pointer.
+                    out.instruction(&Instruction::I32Const(addr as i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    return Ok(());
+                }
+                // Fallback: heap allocate (shouldn't happen if layout collected correctly)
             }
+            {
+                emit_alloc_object(out, temps, 1 + args.len(), layout)?;
 
-            out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
-            out.instruction(&Instruction::I64ExtendI32U);
+                out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+                out.instruction(&Instruction::I64Const(constructor_tag(
+                    name.as_str(),
+                    args.len(),
+                )));
+                out.instruction(&Instruction::I64Store(memarg(0)));
+
+                for (idx, arg) in args.iter().enumerate() {
+                    out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+                    compile_atom(arg, out, local_map, layout)?;
+                    emit_typed_field_store(&arg.typ(), ((idx + 1) * 8) as u64, out)?;
+                }
+
+                out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+                out.instruction(&Instruction::I64ExtendI32U);
+            }
             Ok(())
         }
         LirExpr::Record { fields, .. } => {
@@ -1076,11 +1093,12 @@ pub(super) fn compile_expr(
             ..
         } => {
             // __nx_lazy_spawn(thunk_ptr: i64, num_captures: i32) -> i64
-            let spawn_idx = layout
-                .lazy_spawn_func_idx
-                .ok_or_else(|| CodegenError::CallTargetNotFound {
-                    name: "__nx_lazy_spawn".to_string(),
-                })?;
+            let spawn_idx =
+                layout
+                    .lazy_spawn_func_idx
+                    .ok_or_else(|| CodegenError::CallTargetNotFound {
+                        name: "__nx_lazy_spawn".to_string(),
+                    })?;
             compile_atom(thunk, out, local_map, layout)?;
             out.instruction(&Instruction::I32Const(*num_captures as i32));
             out.instruction(&Instruction::Call(spawn_idx));
@@ -1088,11 +1106,12 @@ pub(super) fn compile_expr(
         }
         LirExpr::LazyJoin { task_id, .. } => {
             // __nx_lazy_join(task_id: i64) -> i64
-            let join_idx = layout
-                .lazy_join_func_idx
-                .ok_or_else(|| CodegenError::CallTargetNotFound {
-                    name: "__nx_lazy_join".to_string(),
-                })?;
+            let join_idx =
+                layout
+                    .lazy_join_func_idx
+                    .ok_or_else(|| CodegenError::CallTargetNotFound {
+                        name: "__nx_lazy_join".to_string(),
+                    })?;
             compile_atom(task_id, out, local_map, layout)?;
             out.instruction(&Instruction::Call(join_idx));
             Ok(())
@@ -1132,9 +1151,1094 @@ pub(super) fn compile_expr(
                     // The caller wraps to i64 if needed via type coercion.
                     Ok(())
                 }
+                Intrinsic::SkipWs => {
+                    // skip_ws(s, start) → scan forward while whitespace, return end pos as i64
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let start = &args.iter().find(|(l, _)| l.as_ref() == "start").unwrap().1;
+                    emit_intrinsic_unpack_and_clamp(s, start, out, local_map, layout, temps)?;
+                    // Loop: while idx < len && is_whitespace(byte)
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                    // if idx >= len: break
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::BrIf(1));
+                    // load byte
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::LocalSet(temps.scan_byte_i32));
+                    // is_ws = (byte==0x20) | (byte==0x09) | (byte==0x0A) | (byte==0x0D)
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(0x20));
+                    out.instruction(&Instruction::I32Eq);
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(0x09));
+                    out.instruction(&Instruction::I32Eq);
+                    out.instruction(&Instruction::I32Or);
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(0x0A));
+                    out.instruction(&Instruction::I32Eq);
+                    out.instruction(&Instruction::I32Or);
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(0x0D));
+                    out.instruction(&Instruction::I32Eq);
+                    out.instruction(&Instruction::I32Or);
+                    // if NOT whitespace: break
+                    out.instruction(&Instruction::I32Eqz);
+                    out.instruction(&Instruction::BrIf(1));
+                    // idx++
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Br(0));
+                    out.instruction(&Instruction::End); // loop
+                    out.instruction(&Instruction::End); // block
+                                                        // result: idx as i64
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    Ok(())
+                }
+                Intrinsic::ScanIdent => {
+                    // scan_ident(s, start) → scan while [a-zA-Z0-9_]
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let start = &args.iter().find(|(l, _)| l.as_ref() == "start").unwrap().1;
+                    emit_intrinsic_unpack_and_clamp(s, start, out, local_map, layout, temps)?;
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::BrIf(1));
+                    // load byte
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::LocalSet(temps.scan_byte_i32));
+                    // is_ident = (byte>='a' && byte<='z') || (byte>='A' && byte<='Z')
+                    //         || (byte>='0' && byte<='9') || byte=='_'
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(b'a' as i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(b'z' as i32));
+                    out.instruction(&Instruction::I32LeU);
+                    out.instruction(&Instruction::I32And);
+                    // || upper
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(b'A' as i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(b'Z' as i32));
+                    out.instruction(&Instruction::I32LeU);
+                    out.instruction(&Instruction::I32And);
+                    out.instruction(&Instruction::I32Or);
+                    // || digit
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(b'0' as i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(b'9' as i32));
+                    out.instruction(&Instruction::I32LeU);
+                    out.instruction(&Instruction::I32And);
+                    out.instruction(&Instruction::I32Or);
+                    // || underscore
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(b'_' as i32));
+                    out.instruction(&Instruction::I32Eq);
+                    out.instruction(&Instruction::I32Or);
+                    // if NOT ident: break
+                    out.instruction(&Instruction::I32Eqz);
+                    out.instruction(&Instruction::BrIf(1));
+                    // idx++
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Br(0));
+                    out.instruction(&Instruction::End); // loop
+                    out.instruction(&Instruction::End); // block
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    Ok(())
+                }
+                Intrinsic::ScanDigits => {
+                    // scan_digits(s, start) → scan while [0-9]
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let start = &args.iter().find(|(l, _)| l.as_ref() == "start").unwrap().1;
+                    emit_intrinsic_unpack_and_clamp(s, start, out, local_map, layout, temps)?;
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::BrIf(1));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::LocalSet(temps.scan_byte_i32));
+                    // is_digit = byte >= '0' && byte <= '9'
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(b'0' as i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Const(b'9' as i32));
+                    out.instruction(&Instruction::I32LeU);
+                    out.instruction(&Instruction::I32And);
+                    out.instruction(&Instruction::I32Eqz);
+                    out.instruction(&Instruction::BrIf(1));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Br(0));
+                    out.instruction(&Instruction::End);
+                    out.instruction(&Instruction::End);
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    Ok(())
+                }
+                Intrinsic::FindByte => {
+                    // find_byte(s, start, ch) → first index of ch, or -1
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let start = &args.iter().find(|(l, _)| l.as_ref() == "start").unwrap().1;
+                    let ch = &args.iter().find(|(l, _)| l.as_ref() == "ch").unwrap().1;
+                    emit_intrinsic_unpack_and_clamp(s, start, out, local_map, layout, temps)?;
+                    // ch → i32 (char is already i32; i64 needs wrapping)
+                    compile_atom(ch, out, local_map, layout)?;
+                    if matches!(ch.typ().wasm_repr(), crate::types::WasmRepr::I64) {
+                        out.instruction(&Instruction::I32WrapI64);
+                    }
+                    out.instruction(&Instruction::LocalSet(temps.scan_end_i32));
+                    // Loop: scan forward for matching byte
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::BrIf(1)); // not found
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::LocalGet(temps.scan_end_i32));
+                    out.instruction(&Instruction::I32Eq);
+                    out.instruction(&Instruction::BrIf(1)); // found — exit with idx valid
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Br(0));
+                    out.instruction(&Instruction::End); // loop
+                    out.instruction(&Instruction::End); // block
+                                                        // Result: idx < len ? idx as i64 : -1i64
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    out.instruction(&Instruction::I64Const(-1i64));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::I32LtU);
+                    out.instruction(&Instruction::Select);
+                    Ok(())
+                }
+                Intrinsic::CountNewlinesIn => {
+                    // count_newlines_in(s, start, end_pos) → count of '\n' in [start, end)
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let start = &args.iter().find(|(l, _)| l.as_ref() == "start").unwrap().1;
+                    let end_pos = &args
+                        .iter()
+                        .find(|(l, _)| l.as_ref() == "end_pos")
+                        .unwrap()
+                        .1;
+                    emit_intrinsic_unpack_and_clamp(s, start, out, local_map, layout, temps)?;
+                    // Clamp end_pos to [0, len]
+                    emit_intrinsic_clamp_arg(
+                        end_pos,
+                        temps.scan_end_i32,
+                        temps.concat_lhs_len_i32,
+                        out,
+                        local_map,
+                        layout,
+                        temps,
+                    )?;
+                    // count = 0
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::LocalSet(temps.scan_byte_i32)); // reuse as counter
+                                                                                  // Loop
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.scan_end_i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::BrIf(1));
+                    // count += (byte == '\n')  — branchless
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::I32Const(0x0A));
+                    out.instruction(&Instruction::I32Eq);
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.scan_byte_i32));
+                    // idx++
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Br(0));
+                    out.instruction(&Instruction::End);
+                    out.instruction(&Instruction::End);
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    Ok(())
+                }
+                Intrinsic::LastNewlineIn => {
+                    // last_newline_in(s, start, end_pos) → last '\n' pos in [start, end), or -1
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let start = &args.iter().find(|(l, _)| l.as_ref() == "start").unwrap().1;
+                    let end_pos = &args
+                        .iter()
+                        .find(|(l, _)| l.as_ref() == "end_pos")
+                        .unwrap()
+                        .1;
+                    emit_intrinsic_unpack_and_clamp(s, start, out, local_map, layout, temps)?;
+                    // scan_end_i32 = clamped start (save for final comparison)
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalSet(temps.scan_byte_i32)); // save start
+                                                                                  // Clamp end_pos, then set idx = end - 1
+                    emit_intrinsic_clamp_arg(
+                        end_pos,
+                        temps.scan_end_i32,
+                        temps.concat_lhs_len_i32,
+                        out,
+                        local_map,
+                        layout,
+                        temps,
+                    )?;
+                    out.instruction(&Instruction::LocalGet(temps.scan_end_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Sub);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    // Backward loop
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                    // if idx < start: break (not found)
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32)); // saved start
+                    out.instruction(&Instruction::I32LtS);
+                    out.instruction(&Instruction::BrIf(1));
+                    // load byte
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::I32Const(0x0A));
+                    out.instruction(&Instruction::I32Eq);
+                    out.instruction(&Instruction::BrIf(1)); // found — exit
+                                                            // idx--
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Sub);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Br(0));
+                    out.instruction(&Instruction::End); // loop
+                    out.instruction(&Instruction::End); // block
+                                                        // idx >= start ? idx as i64 : -1i64
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I64ExtendI32S);
+                    out.instruction(&Instruction::I64Const(-1i64));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32)); // saved start
+                    out.instruction(&Instruction::I32GeS);
+                    out.instruction(&Instruction::Select);
+                    Ok(())
+                }
+                Intrinsic::ByteSubstring => {
+                    // byte_substring(s, start, len) → new packed string from byte slice
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let start = &args.iter().find(|(l, _)| l.as_ref() == "start").unwrap().1;
+                    let sub_len = &args.iter().find(|(l, _)| l.as_ref() == "len").unwrap().1;
+                    emit_intrinsic_unpack_and_clamp(s, start, out, local_map, layout, temps)?;
+                    // sub_len = min(requested_len, remaining_bytes)
+                    // remaining = src_len - start_clamped
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Sub);
+                    out.instruction(&Instruction::LocalSet(temps.scan_end_i32)); // remaining
+                                                                                 // clamp sub_len to [0, remaining]
+                    compile_atom(sub_len, out, local_map, layout)?;
+                    out.instruction(&Instruction::I32WrapI64);
+                    out.instruction(&Instruction::LocalTee(temps.concat_out_len_i32));
+                    // max(sub_len, 0)
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::I32GeS);
+                    out.instruction(&Instruction::Select);
+                    out.instruction(&Instruction::LocalSet(temps.concat_out_len_i32));
+                    // min(sub_len, remaining)
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+                    out.instruction(&Instruction::LocalGet(temps.scan_end_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+                    out.instruction(&Instruction::LocalGet(temps.scan_end_i32));
+                    out.instruction(&Instruction::I32LeU);
+                    out.instruction(&Instruction::Select);
+                    out.instruction(&Instruction::LocalSet(temps.concat_out_len_i32));
+                    // Allocate output buffer
+                    if let Some(alloc_idx) = layout.allocate_func_idx {
+                        out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+                        out.instruction(&Instruction::Call(alloc_idx));
+                        out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
+                    } else {
+                        out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
+                        out.instruction(&Instruction::LocalTee(temps.concat_out_ptr_i32));
+                        out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+                        out.instruction(&Instruction::I32Add);
+                        out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
+                        emit_string_heap_grow(out);
+                    }
+                    // Copy bytes: src[start..start+sub_len] → out[0..sub_len]
+                    // Reuse concat_rhs_ptr_i32 as copy index
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::LocalSet(temps.concat_rhs_ptr_i32));
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::BrIf(1));
+                    // dst[i] = src[start + i]
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_ptr_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_ptr_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::I32Store8(super::string::memarg_i8()));
+                    // i++
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_ptr_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_rhs_ptr_i32));
+                    out.instruction(&Instruction::Br(0));
+                    out.instruction(&Instruction::End);
+                    out.instruction(&Instruction::End);
+                    // Pack result: (out_ptr << 32) | out_len
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    out.instruction(&Instruction::I64Const(32));
+                    out.instruction(&Instruction::I64Shl);
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    out.instruction(&Instruction::I64Or);
+                    Ok(())
+                }
+                Intrinsic::StringLength => {
+                    // length(s) → character count (ASCII: == byte count)
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    compile_atom(s, out, local_map, layout)?;
+                    out.instruction(&Instruction::I64Const(0xFFFF_FFFF_u64 as i64));
+                    out.instruction(&Instruction::I64And);
+                    Ok(())
+                }
+                Intrinsic::CharCode => {
+                    // char_code(s, idx) → codepoint as i64 (ASCII: byte at idx)
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let idx = &args.iter().find(|(l, _)| l.as_ref() == "idx").unwrap().1;
+                    compile_atom(s, out, local_map, layout)?;
+                    out.instruction(&Instruction::LocalSet(temps.packed_tmp_i64));
+                    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+                    out.instruction(&Instruction::I64Const(32));
+                    out.instruction(&Instruction::I64ShrU);
+                    out.instruction(&Instruction::I32WrapI64);
+                    compile_atom(idx, out, local_map, layout)?;
+                    out.instruction(&Instruction::I32WrapI64);
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    // Result as i64 (char_code returns s64 in WIT)
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    Ok(())
+                }
+                Intrinsic::CharAt => {
+                    // char_at(s, idx) → char (i32) at position (ASCII: byte_at)
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let idx = &args.iter().find(|(l, _)| l.as_ref() == "idx").unwrap().1;
+                    compile_atom(s, out, local_map, layout)?;
+                    out.instruction(&Instruction::LocalSet(temps.packed_tmp_i64));
+                    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+                    out.instruction(&Instruction::I64Const(32));
+                    out.instruction(&Instruction::I64ShrU);
+                    out.instruction(&Instruction::I32WrapI64);
+                    compile_atom(idx, out, local_map, layout)?;
+                    out.instruction(&Instruction::I32WrapI64);
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    Ok(())
+                }
+                Intrinsic::FromCharCode => {
+                    // from_char_code(code) → single-byte string (ASCII fast path)
+                    let code = &args.iter().find(|(l, _)| l.as_ref() == "code").unwrap().1;
+                    // Allocate 1 byte on heap
+                    if let Some(alloc_idx) = layout.allocate_func_idx {
+                        out.instruction(&Instruction::I32Const(1));
+                        out.instruction(&Instruction::Call(alloc_idx));
+                        out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
+                    } else {
+                        out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
+                        out.instruction(&Instruction::LocalTee(temps.concat_out_ptr_i32));
+                        out.instruction(&Instruction::I32Const(1));
+                        out.instruction(&Instruction::I32Add);
+                        out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
+                        emit_string_heap_grow(out);
+                    }
+                    // Store byte: mem[out_ptr] = code as u8
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    compile_atom(code, out, local_map, layout)?;
+                    out.instruction(&Instruction::I32WrapI64);
+                    out.instruction(&Instruction::I32Store8(super::string::memarg_i8()));
+                    // Pack result: (out_ptr << 32) | 1
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    out.instruction(&Instruction::I64Const(32));
+                    out.instruction(&Instruction::I64Shl);
+                    out.instruction(&Instruction::I64Const(1));
+                    out.instruction(&Instruction::I64Or);
+                    Ok(())
+                }
+                Intrinsic::FromChar => {
+                    // from_char(c) → single-byte string (same as FromCharCode but arg is char/i32)
+                    let c = &args.iter().find(|(l, _)| l.as_ref() == "c").unwrap().1;
+                    if let Some(alloc_idx) = layout.allocate_func_idx {
+                        out.instruction(&Instruction::I32Const(1));
+                        out.instruction(&Instruction::Call(alloc_idx));
+                        out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
+                    } else {
+                        out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
+                        out.instruction(&Instruction::LocalTee(temps.concat_out_ptr_i32));
+                        out.instruction(&Instruction::I32Const(1));
+                        out.instruction(&Instruction::I32Add);
+                        out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
+                        emit_string_heap_grow(out);
+                    }
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    compile_atom(c, out, local_map, layout)?;
+                    // c is char (i32) — no wrapping needed
+                    if matches!(c.typ().wasm_repr(), crate::types::WasmRepr::I64) {
+                        out.instruction(&Instruction::I32WrapI64);
+                    }
+                    out.instruction(&Instruction::I32Store8(super::string::memarg_i8()));
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    out.instruction(&Instruction::I64Const(32));
+                    out.instruction(&Instruction::I64Shl);
+                    out.instruction(&Instruction::I64Const(1));
+                    out.instruction(&Instruction::I64Or);
+                    Ok(())
+                }
+                Intrinsic::CharOrd => {
+                    // char_ord(c) → i64: just extend char (i32) to i64
+                    let c = &args.iter().find(|(l, _)| l.as_ref() == "c").unwrap().1;
+                    compile_atom(c, out, local_map, layout)?;
+                    if matches!(c.typ().wasm_repr(), crate::types::WasmRepr::I32) {
+                        out.instruction(&Instruction::I64ExtendI32U);
+                    }
+                    Ok(())
+                }
+                Intrinsic::StartsWith => {
+                    // starts_with(s, prefix) → bool (i32 0/1, WIT bool = i32)
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let prefix = &args.iter().find(|(l, _)| l.as_ref() == "prefix").unwrap().1;
+                    emit_intrinsic_unpack_two(s, prefix, out, local_map, layout, temps)?;
+                    // if prefix_len > s_len: return 0
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(
+                        ValType::I32,
+                    )));
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::I32GtU);
+                    out.instruction(&Instruction::BrIf(0)); // → false block
+                                                            // Compare bytes: loop i from 0 to prefix_len
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::BrIf(1)); // done → match
+                                                            // if s[i] != prefix[i]: break → false
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::I32Ne);
+                    out.instruction(&Instruction::BrIf(2)); // mismatch → false block
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Br(0));
+                    out.instruction(&Instruction::End); // loop
+                    out.instruction(&Instruction::End); // inner block
+                                                        // All matched → true
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::Br(1)); // exit result block with 1
+                    out.instruction(&Instruction::End); // false block
+                                                        // false
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::End); // result block
+                    Ok(())
+                }
+                Intrinsic::EndsWith => {
+                    // ends_with(s, suffix) → bool (i32 0/1, WIT bool = i32)
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let suffix = &args.iter().find(|(l, _)| l.as_ref() == "suffix").unwrap().1;
+                    emit_intrinsic_unpack_two(s, suffix, out, local_map, layout, temps)?;
+                    // if suffix_len > s_len: return 0
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(
+                        ValType::I32,
+                    )));
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::I32GtU);
+                    out.instruction(&Instruction::BrIf(0));
+                    // offset = s_len - suffix_len
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::I32Sub);
+                    out.instruction(&Instruction::LocalSet(temps.scan_end_i32));
+                    // Compare bytes: loop i from 0 to suffix_len
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::BrIf(1));
+                    // if s[offset + i] != suffix[i]: break
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.scan_end_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::I32Ne);
+                    out.instruction(&Instruction::BrIf(2));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Br(0));
+                    out.instruction(&Instruction::End); // loop
+                    out.instruction(&Instruction::End); // inner block
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::Br(1)); // exit result block with 1
+                    out.instruction(&Instruction::End); // false block
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::End); // result block
+                    Ok(())
+                }
+                Intrinsic::IndexOf => {
+                    // index_of(s, sub) → i64: first occurrence or -1
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let sub = &args.iter().find(|(l, _)| l.as_ref() == "sub").unwrap().1;
+                    emit_intrinsic_unpack_two(s, sub, out, local_map, layout, temps)?;
+                    // Result block returning i64
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(
+                        ValType::I64,
+                    )));
+                    // if sub_len == 0: return 0
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::I32Eqz);
+                    out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::I64Const(0));
+                    out.instruction(&Instruction::Br(1));
+                    out.instruction(&Instruction::End);
+                    // if sub_len > s_len: return -1
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::I32GtU);
+                    out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::I64Const(-1i64));
+                    out.instruction(&Instruction::Br(1));
+                    out.instruction(&Instruction::End);
+                    // scan_end = s_len - sub_len + 1 (exclusive upper bound for pos)
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::I32Sub);
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.scan_end_i32));
+                    // pos = 0
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32)); // reuse as pos
+                                                                                       // Outer loop over positions
+                                                                                       // Structure: result{ outer_block{ outer_loop{ found_wrap{ inner_block{ inner_loop } } pos++ } } -1 }
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // outer block (d1)
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // outer loop (d2)
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.scan_end_i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::BrIf(1)); // → outer block end → not found
+                                                            // found_wrapper block: mismatch branches here to skip "found"
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // found_wrap (d3)
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // inner block (d4)
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // inner loop (d5)
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::BrIf(1)); // all matched → inner block end
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::I32Ne);
+                    out.instruction(&Instruction::BrIf(2)); // mismatch → found_wrap end → pos++
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Br(0));
+                    out.instruction(&Instruction::End); // inner loop
+                    out.instruction(&Instruction::End); // inner block
+                                                        // All bytes matched → return pos
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    out.instruction(&Instruction::Br(3)); // exit result block
+                    out.instruction(&Instruction::End); // found_wrap
+                                                        // Mismatch: next pos
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::Br(0)); // → outer loop
+                    out.instruction(&Instruction::End); // outer loop
+                    out.instruction(&Instruction::End); // outer block
+                                                        // Not found
+                    out.instruction(&Instruction::I64Const(-1i64));
+                    out.instruction(&Instruction::End); // result block
+                    Ok(())
+                }
+                Intrinsic::Contains => {
+                    // contains(s, sub) → bool (i32 0/1, WIT bool = i32)
+                    let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
+                    let sub = &args.iter().find(|(l, _)| l.as_ref() == "sub").unwrap().1;
+                    emit_intrinsic_unpack_two(s, sub, out, local_map, layout, temps)?;
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(
+                        ValType::I32,
+                    )));
+                    // if sub_len == 0: return true
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::I32Eqz);
+                    out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::Br(1));
+                    out.instruction(&Instruction::End);
+                    // if sub_len > s_len: return false
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::I32GtU);
+                    out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::Br(1));
+                    out.instruction(&Instruction::End);
+                    // scan_end = s_len - sub_len + 1
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_len_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::I32Sub);
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.scan_end_i32));
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
+                    // Structure: result{ outer_block{ outer_loop{ found_wrap{ inner_block{ inner_loop } } pos++ } } 0 }
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // outer block (d1)
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // outer loop (d2)
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.scan_end_i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::BrIf(1)); // → outer block end → not found
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // found_wrap (d3)
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // inner block (d4)
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // inner loop (d5)
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_len_i32));
+                    out.instruction(&Instruction::I32GeU);
+                    out.instruction(&Instruction::BrIf(1)); // all matched → inner block end
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::LocalGet(temps.concat_rhs_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Load8U(super::string::memarg_i8()));
+                    out.instruction(&Instruction::I32Ne);
+                    out.instruction(&Instruction::BrIf(2)); // mismatch → found_wrap end → pos++
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Br(0));
+                    out.instruction(&Instruction::End); // inner loop
+                    out.instruction(&Instruction::End); // inner block
+                                                        // Found
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::Br(3)); // exit result block
+                    out.instruction(&Instruction::End); // found_wrap
+                                                        // Mismatch: next pos
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::Br(0)); // → outer loop
+                    out.instruction(&Instruction::End); // outer loop
+                    out.instruction(&Instruction::End); // outer block
+                                                        // Not found
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::End); // result block
+                    Ok(())
+                }
+                Intrinsic::FromI64 => {
+                    // from_i64(val) → string: decimal representation
+                    let val = &args.iter().find(|(l, _)| l.as_ref() == "val").unwrap().1;
+                    compile_atom(val, out, local_map, layout)?;
+                    out.instruction(&Instruction::LocalSet(temps.packed_tmp_i64)); // val
+                                                                                   // Result block
+                    out.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(
+                        ValType::I64,
+                    )));
+                    // if val == 0: allocate "0", return packed
+                    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+                    out.instruction(&Instruction::I64Eqz);
+                    out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    emit_intrinsic_alloc_store_byte(b'0', out, layout, temps);
+                    out.instruction(&Instruction::Br(1));
+                    out.instruction(&Instruction::End);
+                    // is_negative = val < 0 → scan_byte_i32
+                    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+                    out.instruction(&Instruction::I64Const(0));
+                    out.instruction(&Instruction::I64LtS);
+                    out.instruction(&Instruction::LocalSet(temps.scan_byte_i32));
+                    // if negative: val = 0 - val
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::I64Const(0));
+                    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+                    out.instruction(&Instruction::I64Sub);
+                    out.instruction(&Instruction::LocalSet(temps.packed_tmp_i64));
+                    out.instruction(&Instruction::End);
+                    // Count digits: concat_idx_i32 = digit count
+                    out.instruction(&Instruction::I32Const(0));
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+                    out.instruction(&Instruction::LocalSet(temps.concat_lhs_packed_i64)); // tmp
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_packed_i64));
+                    out.instruction(&Instruction::I64Eqz);
+                    out.instruction(&Instruction::I32Eqz);
+                    out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_packed_i64));
+                    out.instruction(&Instruction::I64Const(10));
+                    out.instruction(&Instruction::I64DivU);
+                    out.instruction(&Instruction::LocalSet(temps.concat_lhs_packed_i64));
+                    out.instruction(&Instruction::Br(1));
+                    out.instruction(&Instruction::End);
+                    out.instruction(&Instruction::End); // loop
+                                                        // total_len = digits + is_negative
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalSet(temps.concat_out_len_i32));
+                    // Allocate buffer
+                    if let Some(alloc_idx) = layout.allocate_func_idx {
+                        out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+                        out.instruction(&Instruction::Call(alloc_idx));
+                        out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
+                    } else {
+                        out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
+                        out.instruction(&Instruction::LocalTee(temps.concat_out_ptr_i32));
+                        out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+                        out.instruction(&Instruction::I32Add);
+                        out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
+                        emit_string_heap_grow(out);
+                    }
+                    // Write digits right-to-left
+                    // write_idx = total_len - 1
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Sub);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    // Restore val (abs) for digit extraction
+                    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+                    out.instruction(&Instruction::LocalSet(temps.concat_lhs_packed_i64));
+                    out.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_packed_i64));
+                    out.instruction(&Instruction::I64Eqz);
+                    out.instruction(&Instruction::I32Eqz);
+                    out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    // buf[write_idx] = '0' + (val % 10)
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_packed_i64));
+                    out.instruction(&Instruction::I64Const(10));
+                    out.instruction(&Instruction::I64RemU);
+                    out.instruction(&Instruction::I32WrapI64);
+                    out.instruction(&Instruction::I32Const(b'0' as i32));
+                    out.instruction(&Instruction::I32Add);
+                    out.instruction(&Instruction::I32Store8(super::string::memarg_i8()));
+                    // val /= 10
+                    out.instruction(&Instruction::LocalGet(temps.concat_lhs_packed_i64));
+                    out.instruction(&Instruction::I64Const(10));
+                    out.instruction(&Instruction::I64DivU);
+                    out.instruction(&Instruction::LocalSet(temps.concat_lhs_packed_i64));
+                    // write_idx--
+                    out.instruction(&Instruction::LocalGet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::I32Const(1));
+                    out.instruction(&Instruction::I32Sub);
+                    out.instruction(&Instruction::LocalSet(temps.concat_idx_i32));
+                    out.instruction(&Instruction::Br(1));
+                    out.instruction(&Instruction::End);
+                    out.instruction(&Instruction::End); // loop
+                                                        // if negative: buf[0] = '-'
+                    out.instruction(&Instruction::LocalGet(temps.scan_byte_i32));
+                    out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::I32Const(b'-' as i32));
+                    out.instruction(&Instruction::I32Store8(super::string::memarg_i8()));
+                    out.instruction(&Instruction::End);
+                    // Pack result: (out_ptr << 32) | total_len
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    out.instruction(&Instruction::I64Const(32));
+                    out.instruction(&Instruction::I64Shl);
+                    out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    out.instruction(&Instruction::I64Or);
+                    out.instruction(&Instruction::End); // result block
+                    Ok(())
+                }
+                Intrinsic::HeapMark => {
+                    // Return current object heap pointer as i64
+                    out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    Ok(())
+                }
+                Intrinsic::HeapReset => {
+                    // Restore object heap pointer from i64 arg
+                    let mark = &args.iter().find(|(l, _)| l.as_ref() == "mark").unwrap().1;
+                    compile_atom(mark, out, local_map, layout)?;
+                    out.instruction(&Instruction::I32WrapI64);
+                    out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+                    out.instruction(&Instruction::I64Const(0));
+                    Ok(())
+                }
+                Intrinsic::HeapSwap => {
+                    // Swap global 0 with new base, return old value
+                    let base = &args.iter().find(|(l, _)| l.as_ref() == "base").unwrap().1;
+                    out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+                    out.instruction(&Instruction::I64ExtendI32U);
+                    compile_atom(base, out, local_map, layout)?;
+                    out.instruction(&Instruction::I32WrapI64);
+                    out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+                    Ok(())
+                }
             }
         }
     }
+}
+
+/// Unpack two packed string i64s into ptr/len locals.
+/// s → concat_lhs_ptr_i32, concat_lhs_len_i32
+/// other → concat_rhs_ptr_i32, concat_rhs_len_i32
+fn emit_intrinsic_unpack_two(
+    s: &LirAtom,
+    other: &LirAtom,
+    out: &mut Function,
+    local_map: &HashMap<Symbol, LocalInfo>,
+    layout: &super::layout::CodegenLayout,
+    temps: &super::FunctionTemps,
+) -> Result<(), super::error::CodegenError> {
+    // Unpack s → lhs ptr, len
+    compile_atom(s, out, local_map, layout)?;
+    out.instruction(&Instruction::LocalSet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::I64Const(32));
+    out.instruction(&Instruction::I64ShrU);
+    out.instruction(&Instruction::I32WrapI64);
+    out.instruction(&Instruction::LocalSet(temps.concat_lhs_ptr_i32));
+    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::I32WrapI64);
+    out.instruction(&Instruction::LocalSet(temps.concat_lhs_len_i32));
+    // Unpack other → rhs ptr, len
+    compile_atom(other, out, local_map, layout)?;
+    out.instruction(&Instruction::LocalSet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::I64Const(32));
+    out.instruction(&Instruction::I64ShrU);
+    out.instruction(&Instruction::I32WrapI64);
+    out.instruction(&Instruction::LocalSet(temps.concat_rhs_ptr_i32));
+    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::I32WrapI64);
+    out.instruction(&Instruction::LocalSet(temps.concat_rhs_len_i32));
+    Ok(())
+}
+
+/// Allocate 1 byte, store a single byte value, and leave packed i64 on the stack.
+fn emit_intrinsic_alloc_store_byte(
+    byte: u8,
+    out: &mut Function,
+    layout: &super::layout::CodegenLayout,
+    temps: &super::FunctionTemps,
+) {
+    if let Some(alloc_idx) = layout.allocate_func_idx {
+        out.instruction(&Instruction::I32Const(1));
+        out.instruction(&Instruction::Call(alloc_idx));
+        out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
+    } else {
+        out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
+        out.instruction(&Instruction::LocalTee(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::I32Const(1));
+        out.instruction(&Instruction::I32Add);
+        out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
+        emit_string_heap_grow(out);
+    }
+    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+    out.instruction(&Instruction::I32Const(byte as i32));
+    out.instruction(&Instruction::I32Store8(super::string::memarg_i8()));
+    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+    out.instruction(&Instruction::I64ExtendI32U);
+    out.instruction(&Instruction::I64Const(32));
+    out.instruction(&Instruction::I64Shl);
+    out.instruction(&Instruction::I64Const(1));
+    out.instruction(&Instruction::I64Or);
+}
+
+/// Emit memory.grow if the string heap (global 2) exceeds current memory.
+fn emit_string_heap_grow(out: &mut Function) {
+    out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
+    out.instruction(&Instruction::MemorySize(0));
+    out.instruction(&Instruction::I32Const(16));
+    out.instruction(&Instruction::I32Shl);
+    out.instruction(&Instruction::I32GtU);
+    out.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
+    out.instruction(&Instruction::MemorySize(0));
+    out.instruction(&Instruction::I32Const(16));
+    out.instruction(&Instruction::I32Shl);
+    out.instruction(&Instruction::I32Sub);
+    out.instruction(&Instruction::I32Const(65535));
+    out.instruction(&Instruction::I32Add);
+    out.instruction(&Instruction::I32Const(16));
+    out.instruction(&Instruction::I32ShrU);
+    out.instruction(&Instruction::MemoryGrow(0));
+    out.instruction(&Instruction::Drop);
+    out.instruction(&Instruction::End);
+}
+
+/// Emit the common prefix for string scanning intrinsics:
+/// 1. Unpack packed i64 → ptr (concat_lhs_ptr_i32), len (concat_lhs_len_i32)
+/// 2. Clamp start to [0, len] → concat_idx_i32
+fn emit_intrinsic_unpack_and_clamp(
+    s: &LirAtom,
+    start: &LirAtom,
+    out: &mut Function,
+    local_map: &HashMap<Symbol, LocalInfo>,
+    layout: &super::layout::CodegenLayout,
+    temps: &super::FunctionTemps,
+) -> Result<(), super::error::CodegenError> {
+    // Unpack s → ptr, len
+    compile_atom(s, out, local_map, layout)?;
+    out.instruction(&Instruction::LocalSet(temps.packed_tmp_i64));
+    // ptr = high 32 bits
+    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::I64Const(32));
+    out.instruction(&Instruction::I64ShrU);
+    out.instruction(&Instruction::I32WrapI64);
+    out.instruction(&Instruction::LocalSet(temps.concat_lhs_ptr_i32));
+    // len = low 32 bits
+    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::I32WrapI64);
+    out.instruction(&Instruction::LocalSet(temps.concat_lhs_len_i32));
+    // Clamp start → idx in [0, len]
+    emit_intrinsic_clamp_arg(
+        start,
+        temps.concat_idx_i32,
+        temps.concat_lhs_len_i32,
+        out,
+        local_map,
+        layout,
+        temps,
+    )
+}
+
+/// Clamp an i64 argument to [0, upper_bound_local] and store into dest_local (i32).
+fn emit_intrinsic_clamp_arg(
+    arg: &LirAtom,
+    dest_local: u32,
+    upper_bound_local: u32,
+    out: &mut Function,
+    local_map: &HashMap<Symbol, LocalInfo>,
+    layout: &super::layout::CodegenLayout,
+    _temps: &super::FunctionTemps,
+) -> Result<(), super::error::CodegenError> {
+    compile_atom(arg, out, local_map, layout)?;
+    out.instruction(&Instruction::I32WrapI64);
+    out.instruction(&Instruction::LocalSet(dest_local));
+    // max(val, 0): select(val, 0, val >= 0)
+    out.instruction(&Instruction::LocalGet(dest_local));
+    out.instruction(&Instruction::I32Const(0));
+    out.instruction(&Instruction::LocalGet(dest_local));
+    out.instruction(&Instruction::I32Const(0));
+    out.instruction(&Instruction::I32GeS);
+    out.instruction(&Instruction::Select);
+    out.instruction(&Instruction::LocalSet(dest_local));
+    // min(val, upper): select(val, upper, val <= upper)
+    out.instruction(&Instruction::LocalGet(dest_local));
+    out.instruction(&Instruction::LocalGet(upper_bound_local));
+    out.instruction(&Instruction::LocalGet(dest_local));
+    out.instruction(&Instruction::LocalGet(upper_bound_local));
+    out.instruction(&Instruction::I32LeU);
+    out.instruction(&Instruction::Select);
+    out.instruction(&Instruction::LocalSet(dest_local));
+    Ok(())
 }
 
 pub(super) fn compile_atom(

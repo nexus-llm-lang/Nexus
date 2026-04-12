@@ -35,11 +35,7 @@ fn emit_return_with_tcmc(
             // Link last cell's rest to base value
             out.instruction(&Instruction::LocalGet(tcmc.prev_local));
             compile_atom(ret_val, out, local_map, layout)?;
-            emit_typed_field_store(
-                &ret_val.typ(),
-                ((tcmc.rest_field_idx + 1) * 8) as u64,
-                out,
-            )?;
+            emit_typed_field_store(&ret_val.typ(), ((tcmc.rest_field_idx + 1) * 8) as u64, out)?;
             // Return head of built list
             out.instruction(&Instruction::LocalGet(tcmc.head_local));
             out.instruction(&Instruction::Return);

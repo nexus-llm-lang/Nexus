@@ -60,10 +60,12 @@ fn optimize_function(func: &mut LirFunction, parallel_lazy: bool) {
     // 3.5. Scalar replacement of aggregates: eliminate Constructor allocations
     //      when the result is only used via ObjectTag/ObjectField (never escapes).
     scalar_replace_aggregates(&mut func.body, &func.ret);
-    // 3.6. Linear reuse: replace Constructor with in-place FieldUpdate when
-    //      the constructor args trace back to ObjectField extractions from a
-    //      provably-dead source, saving the heap allocation.
-    reuse_linear_constructors(&mut func.body);
+    // 3.6. Linear reuse: DISABLED (nexus-otja / nexus-miso)
+    //      try_find_reuse only checks local liveness, not aliasing through
+    //      heap pointers (e.g. LazyBody.ast_expr). In-place tag rewrite
+    //      corrupts shared objects → OOM via desugar_list fallthrough.
+    //      Re-enable after fixing alias analysis in nexus-miso.
+    // reuse_linear_constructors(&mut func.body);
     // 4. Dead let elimination — iterate to fixpoint because removing a dead Let
     //    may make its referenced variables dead too (cascading dead code).
     for _ in 0..8 {
@@ -1055,7 +1057,7 @@ fn eliminate_dead_lets(stmts: &mut Vec<LirStmt>, uses: &HashMap<Symbol, u32>) {
                 }
                 eliminate_dead_lets(default_body, uses);
             }
-            LirStmt::FieldUpdate { .. } => {}  // keep — side-effecting
+            LirStmt::FieldUpdate { .. } => {} // keep — side-effecting
         }
         true
     });
@@ -2017,7 +2019,12 @@ fn hash_stmt(stmt: &LirStmt, h: &mut impl std::hash::Hasher) {
             hash_stmts(cond_stmts, h);
             hash_stmts(body, h);
         }
-        LirStmt::FieldUpdate { target, byte_offset, value, .. } => {
+        LirStmt::FieldUpdate {
+            target,
+            byte_offset,
+            value,
+            ..
+        } => {
             hash_atom_structure(target, h);
             byte_offset.hash(h);
             hash_atom_structure(value, h);
@@ -2059,7 +2066,9 @@ fn hash_expr(expr: &LirExpr, h: &mut impl std::hash::Hasher) {
             format!("{:?}", typ).hash(h);
         }
         LirExpr::Raise { typ, .. } | LirExpr::Force { typ, .. } => format!("{:?}", typ).hash(h),
-        LirExpr::LazySpawn { num_captures, typ, .. } => {
+        LirExpr::LazySpawn {
+            num_captures, typ, ..
+        } => {
             num_captures.hash(h);
             format!("{:?}", typ).hash(h);
         }
@@ -2435,15 +2444,18 @@ fn parallelize_consecutive_forces(stmts: &mut Vec<LirStmt>) {
         while i < stmts.len() {
             if let LirStmt::Let {
                 name,
-                expr: LirExpr::CallIndirect { callee, args, typ, .. },
+                expr:
+                    LirExpr::CallIndirect {
+                        callee, args, typ, ..
+                    },
                 ..
             } = &stmts[i]
             {
                 if args.is_empty() {
                     let num_captures = match callee {
-                        LirAtom::Var { name: thunk_name, .. } => {
-                            closure_capture_counts.get(thunk_name).copied().unwrap_or(0)
-                        }
+                        LirAtom::Var {
+                            name: thunk_name, ..
+                        } => closure_capture_counts.get(thunk_name).copied().unwrap_or(0),
                         _ => 0,
                     };
                     force_run.push((*name, callee.clone(), typ.clone(), num_captures));
@@ -2578,24 +2590,96 @@ fn fuse_in_stmts(
     // Recurse into sub-bodies first.
     for stmt in stmts.iter_mut() {
         match stmt {
-            LirStmt::If { then_body, else_body, .. }
-            | LirStmt::IfReturn { then_body, else_body, .. } => {
-                fuse_in_stmts(then_body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
-                fuse_in_stmts(else_body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
             }
-            LirStmt::Switch { cases, default_body, .. } => {
+            | LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                fuse_in_stmts(
+                    then_body,
+                    map_funcs,
+                    reverse_funcs,
+                    func_sigs,
+                    new_funcs,
+                    counter,
+                );
+                fuse_in_stmts(
+                    else_body,
+                    map_funcs,
+                    reverse_funcs,
+                    func_sigs,
+                    new_funcs,
+                    counter,
+                );
+            }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
                 for c in cases.iter_mut() {
-                    fuse_in_stmts(&mut c.body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+                    fuse_in_stmts(
+                        &mut c.body,
+                        map_funcs,
+                        reverse_funcs,
+                        func_sigs,
+                        new_funcs,
+                        counter,
+                    );
                 }
-                fuse_in_stmts(default_body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+                fuse_in_stmts(
+                    default_body,
+                    map_funcs,
+                    reverse_funcs,
+                    func_sigs,
+                    new_funcs,
+                    counter,
+                );
             }
-            LirStmt::TryCatch { body, catch_body, .. } => {
-                fuse_in_stmts(body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
-                fuse_in_stmts(catch_body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
+                fuse_in_stmts(
+                    body,
+                    map_funcs,
+                    reverse_funcs,
+                    func_sigs,
+                    new_funcs,
+                    counter,
+                );
+                fuse_in_stmts(
+                    catch_body,
+                    map_funcs,
+                    reverse_funcs,
+                    func_sigs,
+                    new_funcs,
+                    counter,
+                );
             }
-            LirStmt::Loop { cond_stmts, body, .. } => {
-                fuse_in_stmts(cond_stmts, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
-                fuse_in_stmts(body, map_funcs, reverse_funcs, func_sigs, new_funcs, counter);
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                fuse_in_stmts(
+                    cond_stmts,
+                    map_funcs,
+                    reverse_funcs,
+                    func_sigs,
+                    new_funcs,
+                    counter,
+                );
+                fuse_in_stmts(
+                    body,
+                    map_funcs,
+                    reverse_funcs,
+                    func_sigs,
+                    new_funcs,
+                    counter,
+                );
             }
             _ => {}
         }
@@ -2618,22 +2702,40 @@ fn fuse_in_stmts(
     let mut transforms: Vec<(usize, Vec<LirStmt>)> = Vec::new();
 
     for (i, stmt) in stmts.iter().enumerate() {
-        let LirStmt::Let { name, typ, expr } = stmt else { continue };
+        let LirStmt::Let { name, typ, expr } = stmt else {
+            continue;
+        };
 
         // ── reverse∘reverse elimination ──
         if let LirExpr::Call { func, args, .. } = expr {
             if reverse_funcs.contains(func) {
                 let xs_arg = args.iter().find(|(l, _)| l.as_str() == "xs");
-                if let Some((_, LirAtom::Var { name: inner_name, .. })) = xs_arg {
+                if let Some((
+                    _,
+                    LirAtom::Var {
+                        name: inner_name, ..
+                    },
+                )) = xs_arg
+                {
                     if uses.get(inner_name).copied().unwrap_or(0) == 1 {
-                        if let Some(LirExpr::Call { func: inner_func, args: inner_args, .. }) = var_defs.get(inner_name) {
+                        if let Some(LirExpr::Call {
+                            func: inner_func,
+                            args: inner_args,
+                            ..
+                        }) = var_defs.get(inner_name)
+                        {
                             if reverse_funcs.contains(inner_func) {
-                                if let Some((_, original_xs)) = inner_args.iter().find(|(l, _)| l.as_str() == "xs") {
-                                    transforms.push((i, vec![LirStmt::Let {
-                                        name: *name,
-                                        typ: typ.clone(),
-                                        expr: LirExpr::Atom(original_xs.clone()),
-                                    }]));
+                                if let Some((_, original_xs)) =
+                                    inner_args.iter().find(|(l, _)| l.as_str() == "xs")
+                                {
+                                    transforms.push((
+                                        i,
+                                        vec![LirStmt::Let {
+                                            name: *name,
+                                            typ: typ.clone(),
+                                            expr: LirExpr::Atom(original_xs.clone()),
+                                        }],
+                                    ));
                                     continue;
                                 }
                             }
@@ -2644,29 +2746,83 @@ fn fuse_in_stmts(
         }
 
         // ── map∘map fusion ──
-        let LirExpr::Call { func: outer_map, args: outer_args, typ: call_typ, .. } = expr else { continue };
-        if !map_funcs.contains(outer_map) { continue; }
-        let Some((_, outer_xs)) = outer_args.iter().find(|(l, _)| l.as_str() == "xs") else { continue };
-        let Some((_, outer_f)) = outer_args.iter().find(|(l, _)| l.as_str() == "f") else { continue };
+        let LirExpr::Call {
+            func: outer_map,
+            args: outer_args,
+            typ: call_typ,
+            ..
+        } = expr
+        else {
+            continue;
+        };
+        if !map_funcs.contains(outer_map) {
+            continue;
+        }
+        let Some((_, outer_xs)) = outer_args.iter().find(|(l, _)| l.as_str() == "xs") else {
+            continue;
+        };
+        let Some((_, outer_f)) = outer_args.iter().find(|(l, _)| l.as_str() == "f") else {
+            continue;
+        };
 
-        let LirAtom::Var { name: inner_name, .. } = outer_xs else { continue };
-        if uses.get(inner_name).copied().unwrap_or(0) != 1 { continue; }
-        let Some(LirExpr::Call { func: inner_map, args: inner_args, .. }) = var_defs.get(inner_name) else { continue };
-        if !map_funcs.contains(inner_map) { continue; }
+        let LirAtom::Var {
+            name: inner_name, ..
+        } = outer_xs
+        else {
+            continue;
+        };
+        if uses.get(inner_name).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let Some(LirExpr::Call {
+            func: inner_map,
+            args: inner_args,
+            ..
+        }) = var_defs.get(inner_name)
+        else {
+            continue;
+        };
+        if !map_funcs.contains(inner_map) {
+            continue;
+        }
 
-        let Some((_, inner_xs)) = inner_args.iter().find(|(l, _)| l.as_str() == "xs") else { continue };
-        let Some((_, inner_f)) = inner_args.iter().find(|(l, _)| l.as_str() == "f") else { continue };
+        let Some((_, inner_xs)) = inner_args.iter().find(|(l, _)| l.as_str() == "xs") else {
+            continue;
+        };
+        let Some((_, inner_f)) = inner_args.iter().find(|(l, _)| l.as_str() == "f") else {
+            continue;
+        };
 
         // Both f and g must trace to FuncRef (known functions, no captures).
-        let LirAtom::Var { name: outer_f_var, .. } = outer_f else { continue };
-        let LirAtom::Var { name: inner_f_var, .. } = inner_f else { continue };
-        let Some(LirExpr::FuncRef { func: f_name, .. }) = var_defs.get(outer_f_var) else { continue };
-        let Some(LirExpr::FuncRef { func: g_name, .. }) = var_defs.get(inner_f_var) else { continue };
+        let LirAtom::Var {
+            name: outer_f_var, ..
+        } = outer_f
+        else {
+            continue;
+        };
+        let LirAtom::Var {
+            name: inner_f_var, ..
+        } = inner_f
+        else {
+            continue;
+        };
+        let Some(LirExpr::FuncRef { func: f_name, .. }) = var_defs.get(outer_f_var) else {
+            continue;
+        };
+        let Some(LirExpr::FuncRef { func: g_name, .. }) = var_defs.get(inner_f_var) else {
+            continue;
+        };
 
         // Look up function signatures.
-        let Some((f_params, f_ret)) = func_sigs.get(f_name) else { continue };
-        let Some((g_params, g_ret)) = func_sigs.get(g_name) else { continue };
-        if f_params.is_empty() || g_params.is_empty() { continue; }
+        let Some((f_params, f_ret)) = func_sigs.get(f_name) else {
+            continue;
+        };
+        let Some((g_params, g_ret)) = func_sigs.get(g_name) else {
+            continue;
+        };
+        if f_params.is_empty() || g_params.is_empty() {
+            continue;
+        }
 
         // Generate: fn __compose_N(val) = f(g(val))
         let compose_name = Symbol::from(format!("__compose_{}", counter));
@@ -2693,7 +2849,13 @@ fn fuse_in_stmts(
                     typ: g_ret.clone(),
                     expr: LirExpr::Call {
                         func: *g_name,
-                        args: vec![(g_params[0].label, LirAtom::Var { name: val_param.name, typ: val_param.typ.clone() })],
+                        args: vec![(
+                            g_params[0].label,
+                            LirAtom::Var {
+                                name: val_param.name,
+                                typ: val_param.typ.clone(),
+                            },
+                        )],
                         typ: g_ret.clone(),
                     },
                 },
@@ -2702,39 +2864,68 @@ fn fuse_in_stmts(
                     typ: f_ret.clone(),
                     expr: LirExpr::Call {
                         func: *f_name,
-                        args: vec![(f_params[0].label, LirAtom::Var { name: g_result, typ: g_ret.clone() })],
+                        args: vec![(
+                            f_params[0].label,
+                            LirAtom::Var {
+                                name: g_result,
+                                typ: g_ret.clone(),
+                            },
+                        )],
                         typ: f_ret.clone(),
                     },
                 },
             ],
-            ret: LirAtom::Var { name: f_result, typ: f_ret.clone() },
+            ret: LirAtom::Var {
+                name: f_result,
+                typ: f_ret.clone(),
+            },
             span: Span::default(),
             source_file: None,
             source_line: None,
         });
 
         // Replace outer map with: let ref = FuncRef(compose); let result = map(ref, original_xs)
-        let f_label = outer_args.iter().find(|(l, _)| l.as_str() == "f").unwrap().0;
-        let xs_label = outer_args.iter().find(|(l, _)| l.as_str() == "xs").unwrap().0;
-        transforms.push((i, vec![
-            LirStmt::Let {
-                name: compose_ref,
-                typ: Type::I64,
-                expr: LirExpr::FuncRef { func: compose_name, typ: Type::I64 },
-            },
-            LirStmt::Let {
-                name: *name,
-                typ: typ.clone(),
-                expr: LirExpr::Call {
-                    func: *outer_map,
-                    args: vec![
-                        (f_label, LirAtom::Var { name: compose_ref, typ: Type::I64 }),
-                        (xs_label, inner_xs.clone()),
-                    ],
-                    typ: call_typ.clone(),
+        let f_label = outer_args
+            .iter()
+            .find(|(l, _)| l.as_str() == "f")
+            .unwrap()
+            .0;
+        let xs_label = outer_args
+            .iter()
+            .find(|(l, _)| l.as_str() == "xs")
+            .unwrap()
+            .0;
+        transforms.push((
+            i,
+            vec![
+                LirStmt::Let {
+                    name: compose_ref,
+                    typ: Type::I64,
+                    expr: LirExpr::FuncRef {
+                        func: compose_name,
+                        typ: Type::I64,
+                    },
                 },
-            },
-        ]));
+                LirStmt::Let {
+                    name: *name,
+                    typ: typ.clone(),
+                    expr: LirExpr::Call {
+                        func: *outer_map,
+                        args: vec![
+                            (
+                                f_label,
+                                LirAtom::Var {
+                                    name: compose_ref,
+                                    typ: Type::I64,
+                                },
+                            ),
+                            (xs_label, inner_xs.clone()),
+                        ],
+                        typ: call_typ.clone(),
+                    },
+                },
+            ],
+        ));
     }
 
     // Apply transforms in reverse order to preserve indices.
@@ -2781,32 +2972,49 @@ fn collect_ctor_defs_in_stmts(stmts: &[LirStmt], ctors: &mut HashMap<Symbol, (i6
         match stmt {
             LirStmt::Let {
                 name,
-                expr: LirExpr::Constructor {
-                    name: ctor_name,
-                    args,
-                    ..
-                },
+                expr:
+                    LirExpr::Constructor {
+                        name: ctor_name,
+                        args,
+                        ..
+                    },
                 ..
             } => {
                 let tag = constructor_tag(ctor_name.as_str(), args.len());
                 ctors.insert(*name, (tag, args.clone()));
             }
-            LirStmt::If { then_body, else_body, .. }
-            | LirStmt::IfReturn { then_body, else_body, .. } => {
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            }
+            | LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
                 collect_ctor_defs_in_stmts(then_body, ctors);
                 collect_ctor_defs_in_stmts(else_body, ctors);
             }
-            LirStmt::Switch { cases, default_body, .. } => {
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
                 for c in cases {
                     collect_ctor_defs_in_stmts(&c.body, ctors);
                 }
                 collect_ctor_defs_in_stmts(default_body, ctors);
             }
-            LirStmt::TryCatch { body, catch_body, .. } => {
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
                 collect_ctor_defs_in_stmts(body, ctors);
                 collect_ctor_defs_in_stmts(catch_body, ctors);
             }
-            LirStmt::Loop { cond_stmts, body, .. } => {
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
                 collect_ctor_defs_in_stmts(cond_stmts, ctors);
                 collect_ctor_defs_in_stmts(body, ctors);
             }
@@ -2829,13 +3037,23 @@ fn mark_escapes_in_stmts(
                 mark_atom_escape(target, ctors, escaped);
                 mark_atom_escape(value, ctors, escaped);
             }
-            LirStmt::If { cond, then_body, else_body, .. } => {
+            LirStmt::If {
+                cond,
+                then_body,
+                else_body,
+                ..
+            } => {
                 mark_atom_escape(cond, ctors, escaped);
                 mark_escapes_in_stmts(then_body, ctors, escaped);
                 mark_escapes_in_stmts(else_body, ctors, escaped);
             }
             LirStmt::IfReturn {
-                cond, then_body, then_ret, else_body, else_ret, ..
+                cond,
+                then_body,
+                then_ret,
+                else_body,
+                else_ret,
+                ..
             } => {
                 mark_atom_escape(cond, ctors, escaped);
                 mark_escapes_in_stmts(then_body, ctors, escaped);
@@ -2843,7 +3061,13 @@ fn mark_escapes_in_stmts(
                 mark_escapes_in_stmts(else_body, ctors, escaped);
                 mark_opt_atom_escape(else_ret, ctors, escaped);
             }
-            LirStmt::Switch { tag, cases, default_body, default_ret, .. } => {
+            LirStmt::Switch {
+                tag,
+                cases,
+                default_body,
+                default_ret,
+                ..
+            } => {
                 mark_atom_escape(tag, ctors, escaped);
                 for c in cases {
                     mark_escapes_in_stmts(&c.body, ctors, escaped);
@@ -2852,13 +3076,24 @@ fn mark_escapes_in_stmts(
                 mark_escapes_in_stmts(default_body, ctors, escaped);
                 mark_opt_atom_escape(default_ret, ctors, escaped);
             }
-            LirStmt::TryCatch { body, body_ret, catch_body, catch_ret, .. } => {
+            LirStmt::TryCatch {
+                body,
+                body_ret,
+                catch_body,
+                catch_ret,
+                ..
+            } => {
                 mark_escapes_in_stmts(body, ctors, escaped);
                 mark_opt_atom_escape(body_ret, ctors, escaped);
                 mark_escapes_in_stmts(catch_body, ctors, escaped);
                 mark_opt_atom_escape(catch_ret, ctors, escaped);
             }
-            LirStmt::Loop { cond, cond_stmts, body, .. } => {
+            LirStmt::Loop {
+                cond,
+                cond_stmts,
+                body,
+                ..
+            } => {
                 mark_atom_escape(cond, ctors, escaped);
                 mark_escapes_in_stmts(cond_stmts, ctors, escaped);
                 mark_escapes_in_stmts(body, ctors, escaped);
@@ -2881,24 +3116,34 @@ fn mark_escapes_in_expr(
             mark_atom_escape(rhs, ctors, escaped);
         }
         LirExpr::Call { args, .. } | LirExpr::TailCall { args, .. } => {
-            for (_, a) in args { mark_atom_escape(a, ctors, escaped); }
+            for (_, a) in args {
+                mark_atom_escape(a, ctors, escaped);
+            }
         }
         LirExpr::Constructor { args, .. } => {
-            for a in args { mark_atom_escape(a, ctors, escaped); }
+            for a in args {
+                mark_atom_escape(a, ctors, escaped);
+            }
         }
         LirExpr::Record { fields, .. } => {
-            for (_, a) in fields { mark_atom_escape(a, ctors, escaped); }
+            for (_, a) in fields {
+                mark_atom_escape(a, ctors, escaped);
+            }
         }
         LirExpr::Raise { value, .. } | LirExpr::Force { value, .. } => {
             mark_atom_escape(value, ctors, escaped);
         }
         LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => {}
         LirExpr::Closure { captures, .. } => {
-            for (_, a) in captures { mark_atom_escape(a, ctors, escaped); }
+            for (_, a) in captures {
+                mark_atom_escape(a, ctors, escaped);
+            }
         }
         LirExpr::CallIndirect { callee, args, .. } => {
             mark_atom_escape(callee, ctors, escaped);
-            for (_, a) in args { mark_atom_escape(a, ctors, escaped); }
+            for (_, a) in args {
+                mark_atom_escape(a, ctors, escaped);
+            }
         }
         LirExpr::LazySpawn { thunk, .. } => mark_atom_escape(thunk, ctors, escaped),
         LirExpr::LazyJoin { task_id, .. } => mark_atom_escape(task_id, ctors, escaped),
@@ -2938,25 +3183,41 @@ fn apply_sra_in_stmts(stmts: &mut [LirStmt], ctors: &HashMap<Symbol, (i64, Vec<L
     for stmt in stmts.iter_mut() {
         match stmt {
             LirStmt::Let { expr, .. } => apply_sra_in_expr(expr, ctors),
-            LirStmt::If { then_body, else_body, .. } => {
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 apply_sra_in_stmts(then_body, ctors);
                 apply_sra_in_stmts(else_body, ctors);
             }
-            LirStmt::IfReturn { then_body, else_body, .. } => {
+            LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
                 apply_sra_in_stmts(then_body, ctors);
                 apply_sra_in_stmts(else_body, ctors);
             }
-            LirStmt::Switch { cases, default_body, .. } => {
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
                 for c in cases.iter_mut() {
                     apply_sra_in_stmts(&mut c.body, ctors);
                 }
                 apply_sra_in_stmts(default_body, ctors);
             }
-            LirStmt::TryCatch { body, catch_body, .. } => {
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => {
                 apply_sra_in_stmts(body, ctors);
                 apply_sra_in_stmts(catch_body, ctors);
             }
-            LirStmt::Loop { cond_stmts, body, .. } => {
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
                 apply_sra_in_stmts(cond_stmts, ctors);
                 apply_sra_in_stmts(body, ctors);
             }
@@ -2997,10 +3258,12 @@ fn apply_sra_in_expr(expr: &mut LirExpr, ctors: &HashMap<Symbol, (i64, Vec<LirAt
 ///   let new_val = Call(g, [f0])
 ///   FieldUpdate(src, offset=8, new_val)   ← only changed field
 ///   let result = Atom(src)                ← reuse pointer (no alloc)
+#[allow(dead_code)] // nexus-miso: re-enable after alias analysis fix
 fn reuse_linear_constructors(stmts: &mut Vec<LirStmt>) {
     reuse_in_stmts(stmts);
 }
 
+#[allow(dead_code)] // nexus-miso
 fn reuse_in_stmts(stmts: &mut Vec<LirStmt>) {
     // First, recurse into sub-bodies so inner scopes are optimized bottom-up.
     for stmt in stmts.iter_mut() {
@@ -3054,23 +3317,14 @@ fn reuse_in_stmts(stmts: &mut Vec<LirStmt>) {
 
     // Phase 2: build the replacement list.
     //   (stmt_index, source_atom, ctor_tag, updates, result_name, result_typ)
-    let mut replacements: Vec<(
-        usize,
-        LirAtom,
-        i64,
-        Vec<(u64, LirAtom, Type)>,
-        Symbol,
-        Type,
-    )> = Vec::new();
+    let mut replacements: Vec<(usize, LirAtom, i64, Vec<(u64, LirAtom, Type)>, Symbol, Type)> =
+        Vec::new();
 
     for (i, stmt) in stmts.iter().enumerate() {
         match stmt {
             LirStmt::Let {
                 name,
-                expr:
-                    LirExpr::ObjectField {
-                        value, index, ..
-                    },
+                expr: LirExpr::ObjectField { value, index, .. },
                 ..
             } => {
                 field_defs.insert(*name, (value.clone(), *index));
@@ -3085,9 +3339,7 @@ fn reuse_in_stmts(stmts: &mut Vec<LirStmt>) {
                         ..
                     },
             } => {
-                if let Some(reuse) =
-                    try_find_reuse(ctor_name, args, &field_defs, stmts, i)
-                {
+                if let Some(reuse) = try_find_reuse(ctor_name, args, &field_defs, stmts, i) {
                     replacements.push((
                         i,
                         reuse.source,
@@ -3148,6 +3400,7 @@ fn reuse_in_stmts(stmts: &mut Vec<LirStmt>) {
     }
 }
 
+#[allow(dead_code)] // nexus-miso
 struct ReuseCandidate {
     source: LirAtom,
     tag: i64,
@@ -3156,6 +3409,7 @@ struct ReuseCandidate {
 }
 
 /// Check if a Constructor can reuse memory from an existing heap object.
+#[allow(dead_code)] // nexus-miso
 fn try_find_reuse(
     ctor_name: &Symbol,
     args: &[LirAtom],
@@ -3230,12 +3484,9 @@ fn try_find_reuse(
     let mut updates = Vec::new();
     for (idx, arg) in args.iter().enumerate() {
         let is_unchanged = if let LirAtom::Var { name, .. } = arg {
-            field_defs
-                .get(name)
-                .map_or(false, |(src, fi)| {
-                    matches!(src, LirAtom::Var { name: s, .. } if *s == source_sym)
-                        && *fi == idx
-                })
+            field_defs.get(name).map_or(false, |(src, fi)| {
+                matches!(src, LirAtom::Var { name: s, .. } if *s == source_sym) && *fi == idx
+            })
         } else {
             false
         };
@@ -3253,21 +3504,20 @@ fn try_find_reuse(
 }
 
 /// Check if a statement (non-recursively into sub-bodies) mentions a variable.
+#[allow(dead_code)] // nexus-miso
 fn atom_mentions_var_in_stmt(stmt: &LirStmt, var: Symbol) -> bool {
     let check = |atom: &LirAtom| matches!(atom, LirAtom::Var { name, .. } if *name == var);
     match stmt {
         LirStmt::Let { expr, .. } => atom_mentions_var_in_expr(expr, var),
-        LirStmt::FieldUpdate {
-            target, value, ..
-        } => check(target) || check(value),
-        LirStmt::If { cond, .. }
-        | LirStmt::IfReturn { cond, .. } => check(cond),
+        LirStmt::FieldUpdate { target, value, .. } => check(target) || check(value),
+        LirStmt::If { cond, .. } | LirStmt::IfReturn { cond, .. } => check(cond),
         LirStmt::Loop { cond, .. } => check(cond),
         LirStmt::Switch { tag, .. } => check(tag),
         LirStmt::TryCatch { .. } => false,
     }
 }
 
+#[allow(dead_code)] // nexus-miso
 fn atom_mentions_var_in_expr(expr: &LirExpr, var: Symbol) -> bool {
     let check = |atom: &LirAtom| matches!(atom, LirAtom::Var { name, .. } if *name == var);
     match expr {

@@ -651,6 +651,9 @@ impl bytebuffer::Guest for StdlibComponent {
     fn buf_free(id: i64) -> i32 {
         nexus_collection_wasm::__nx_buf_free(id)
     }
+    fn buf_read_file(path: String) -> i64 {
+        nexus_collection_wasm::__nx_buf_read_file(path.as_ptr() as i32, path.len() as i32)
+    }
 }
 
 // ---------------------------------------------------------------------------

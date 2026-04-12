@@ -202,18 +202,15 @@ impl wasmtime_wasi::RngCore for DenyingRandom {
 
 /// Execute main() -> () with stdlib via component model composition.
 pub fn run_main_with_deps(wasm: &[u8]) -> Result<(), String> {
-    let composed = compose::compose_with_stdlib(wasm)
-        .map_err(|e| format!("composition failed: {}", e))?;
+    let composed =
+        compose::compose_with_stdlib(wasm).map_err(|e| format!("composition failed: {}", e))?;
     run_composed_component(&composed, &ExecutionCapabilities::allow_all())
 }
 
 /// Execute main() -> () with stdlib and custom capability enforcement.
-pub fn run_main_with_deps_caps(
-    wasm: &[u8],
-    caps: ExecutionCapabilities,
-) -> Result<(), String> {
-    let composed = compose::compose_with_stdlib(wasm)
-        .map_err(|e| format!("composition failed: {}", e))?;
+pub fn run_main_with_deps_caps(wasm: &[u8], caps: ExecutionCapabilities) -> Result<(), String> {
+    let composed =
+        compose::compose_with_stdlib(wasm).map_err(|e| format!("composition failed: {}", e))?;
     run_composed_component(&composed, &caps)
 }
 

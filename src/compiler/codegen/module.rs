@@ -21,7 +21,10 @@ use super::error::CodegenError;
 use super::function::compile_function;
 use super::layout::{build_codegen_layout, program_uses_object_heap, CodegenLayout, MemoryMode};
 use super::string::string_abi_for_external;
-use super::{ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, LAZY_JOIN_NAME, LAZY_MODULE, LAZY_SPAWN_NAME, OBJECT_HEAP_GLOBAL_INDEX};
+use super::{
+    ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, LAZY_JOIN_NAME, LAZY_MODULE,
+    LAZY_SPAWN_NAME, OBJECT_HEAP_GLOBAL_INDEX,
+};
 
 /// Compiles LIR (in ANF) directly into core WASM bytes, plus debug entries for DWARF.
 pub fn compile_lir_to_wasm(
@@ -33,14 +36,6 @@ pub fn compile_lir_to_wasm(
     // the call stack, so we skip the expensive wasmtime stack walk at every throw.
     let needs_bt_capture = has_eh && program_uses_backtrace(program);
     let needs_lazy = program_needs_lazy(program);
-
-    // Only import allocate from stdlib when using shared-memory bundling (packed ABI).
-    // When arena intrinsics (heap_mark/heap_reset) are present, force bump allocator
-    // so regions can manage G0 directly. stdlib allocate bypasses G0.
-    let has_arena = program
-        .externals
-        .iter()
-        .any(|ext| ext.wasm_module.as_ref() == "nexus:runtime/arena");
 
     // With component-model (canonical ABI), each component has its own memory and
     // the user code uses an internal bump allocator for heap operations.
@@ -210,7 +205,9 @@ pub fn compile_lir_to_wasm(
         lazy_spawn_type_idx = if let Some(&existing) = sig_to_type_idx.get(&spawn_key) {
             existing
         } else {
-            types.ty().function([ValType::I64, ValType::I32], [ValType::I64]);
+            types
+                .ty()
+                .function([ValType::I64, ValType::I32], [ValType::I64]);
             sig_to_type_idx.insert(spawn_key, next_type_index);
             let idx = next_type_index;
             next_type_index += 1;
@@ -429,7 +426,10 @@ pub fn compile_lir_to_wasm(
                 &ConstExpr::i32_const(layout.heap_base as i32),
             );
             // Global 1: cabi arena pointer (separate from object heap G0).
-            // Starts at 128MB to separate from G0 object heap.
+            // Starts at 128MB to separate from G0 object heap. The memory.grow
+            // in cabi_realloc will extend memory to this range on first call.
+            // WASM virtual memory is sparse (demand-paged by wasmtime), so this
+            // doesn't waste physical RAM.
             let cabi_base = 128 * 1024 * 1024u32; // 128MB
             globals.global(
                 GlobalType {
@@ -494,8 +494,7 @@ pub fn compile_lir_to_wasm(
     let mut debug_entries = Vec::new();
     // The code section body starts with a LEB128 function count.
     // +1 for WASI CLI run wrapper, +1 for cabi_realloc if needed
-    let total_func_count =
-        program.functions.len() + (if needs_cabi_realloc { 1 } else { 0 }) + 1;
+    let total_func_count = program.functions.len() + (if needs_cabi_realloc { 1 } else { 0 }) + 1;
     let mut code_body_offset = uleb128_encoded_size(total_func_count as u64) as u32;
     for func in &program.functions {
         let body = compile_function(
@@ -587,17 +586,9 @@ fn compile_wasi_cli_run_wrapper(main_idx: u32, main_ret_type: &Type) -> Function
 ///
 /// Signature: `(old_ptr: i32, old_size: i32, align: i32, new_size: i32) -> i32`
 ///
-/// This function is required by the component model canonical ABI to allocate
-/// memory in the callee's linear memory for incoming string/list parameters.
-/// The canonical ABI adapter calls this before invoking the component's functions.
-///
-/// Implementation: delegates to the stdlib `allocate` function if available,
-/// otherwise uses the bump heap allocator. old_ptr/old_size are currently ignored
-/// (no realloc support — always allocates fresh).
-/// Compile `cabi_realloc` for the canonical ABI.
-///
-/// Shares global 0 (object heap) with record allocation. Both bump the same
-/// pointer, eliminating arena/heap collision. Includes memory.grow.
+/// Delegates to stdlib `allocate` if available, otherwise bumps G0 (shared with
+/// the object heap). The shared approach is safe as long as G0 grows monotonically
+/// (no heap_reset while cabi strings are still live).
 fn compile_cabi_realloc(layout: &CodegenLayout) -> Function {
     // Locals: params are 0=old_ptr, 1=old_size, 2=align, 3=new_size
     // Extra locals: 4=aligned_ptr
@@ -609,7 +600,9 @@ fn compile_cabi_realloc(layout: &CodegenLayout) -> Function {
         body.instruction(&Instruction::LocalGet(3));
         body.instruction(&Instruction::Call(alloc_idx));
     } else {
-        // Bump on object heap (global 0). Shared with object allocation.
+        // Bump on object heap (global 0), shared with object allocation.
+        // Both advance G0 monotonically — no collision as long as heap_reset
+        // is not called while cabi strings are still live.
         body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
         body.instruction(&Instruction::LocalGet(2)); // align
         body.instruction(&Instruction::I32Add);
@@ -627,16 +620,15 @@ fn compile_cabi_realloc(layout: &CodegenLayout) -> Function {
         body.instruction(&Instruction::I32Add);
         body.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
 
-
         if has_memory {
-            body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX)); // G1
+            body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
             body.instruction(&Instruction::MemorySize(0));
             body.instruction(&Instruction::I32Const(16));
             body.instruction(&Instruction::I32Shl);
             body.instruction(&Instruction::I32GtU);
             body.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
             {
-                body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX)); // G1
+                body.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
                 body.instruction(&Instruction::MemorySize(0));
                 body.instruction(&Instruction::I32Const(16));
                 body.instruction(&Instruction::I32Shl);
@@ -973,24 +965,35 @@ fn program_needs_lazy(program: &LirProgram) -> bool {
     fn stmt_has_lazy(stmt: &LirStmt) -> bool {
         match stmt {
             LirStmt::Let { expr, .. } => expr_has_lazy(expr),
-            LirStmt::If { then_body, else_body, .. } => {
-                then_body.iter().any(stmt_has_lazy) || else_body.iter().any(stmt_has_lazy)
-            }
-            LirStmt::IfReturn { then_body, else_body, .. } => {
-                then_body.iter().any(stmt_has_lazy) || else_body.iter().any(stmt_has_lazy)
-            }
-            LirStmt::Loop { cond_stmts, body, .. } => {
-                cond_stmts.iter().any(stmt_has_lazy) || body.iter().any(stmt_has_lazy)
-            }
-            LirStmt::Switch { cases, default_body, .. } => {
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => then_body.iter().any(stmt_has_lazy) || else_body.iter().any(stmt_has_lazy),
+            LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => then_body.iter().any(stmt_has_lazy) || else_body.iter().any(stmt_has_lazy),
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => cond_stmts.iter().any(stmt_has_lazy) || body.iter().any(stmt_has_lazy),
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
                 cases.iter().any(|c| c.body.iter().any(stmt_has_lazy))
                     || default_body.iter().any(stmt_has_lazy)
             }
-            LirStmt::TryCatch { body, catch_body, .. } => {
-                body.iter().any(stmt_has_lazy) || catch_body.iter().any(stmt_has_lazy)
-            }
+            LirStmt::TryCatch {
+                body, catch_body, ..
+            } => body.iter().any(stmt_has_lazy) || catch_body.iter().any(stmt_has_lazy),
             LirStmt::FieldUpdate { .. } => false,
         }
     }
-    program.functions.iter().any(|f| f.body.iter().any(stmt_has_lazy))
+    program
+        .functions
+        .iter()
+        .any(|f| f.body.iter().any(stmt_has_lazy))
 }
