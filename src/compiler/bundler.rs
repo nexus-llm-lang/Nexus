@@ -213,7 +213,8 @@ fn merge_dependencies_once(
         .arg("--enable-multimemory")
         .arg("-o")
         .arg(&merged_path)
-        .arg("--rename-export-conflicts");
+        .arg("--rename-export-conflicts")
+        .arg("--no-validation");
 
     let output = command.output().map_err(|e| {
         format!(
@@ -290,6 +291,19 @@ fn rewrite_stdlib_wit_imports(wasm: &[u8]) -> Vec<u8> {
                     } else {
                         import.module
                     };
+                    // Reverse WIT canonicalization: "string-length" → "__nx_string_length"
+                    // so import names match stdlib.wasm exports.
+                    let field_name_owned;
+                    let field_name = if import.module.starts_with(STDLIB_WIT_PREFIX)
+                        && !import.name.starts_with("__nx_")
+                        && import.name != "allocate"
+                        && import.name != "deallocate"
+                    {
+                        field_name_owned = format!("__nx_{}", import.name.replace('-', "_"));
+                        field_name_owned.as_str()
+                    } else {
+                        import.name
+                    };
                     let entity = match import.ty {
                         wasmparser::TypeRef::Func(idx) => EntityType::Function(idx),
                         wasmparser::TypeRef::Table(t) => {
@@ -351,7 +365,7 @@ fn rewrite_stdlib_wit_imports(wasm: &[u8]) -> Vec<u8> {
                             func_type_idx: t.func_type_idx,
                         }),
                     };
-                    imports.import(module_name, import.name, entity);
+                    imports.import(module_name, field_name, entity);
                 }
                 module.section(&imports);
                 continue;
@@ -393,6 +407,123 @@ fn strip_debug_sections(wasm: &[u8]) -> Vec<u8> {
         }
     }
     module.finish()
+}
+
+/// Merge stub modules for remaining host imports after bundling.
+/// Handles nexus:cli/nexus-host (unreachable stubs) and nexus:runtime/backtrace (no-op stubs).
+pub fn merge_remaining_stubs(wasm: &[u8], wasm_merge_command: &Path) -> Result<Vec<u8>, String> {
+    let imports = module_import_names(wasm)?;
+    let mut result = wasm.to_vec();
+
+    // Merge nexus-host stubs if present
+    if imports.contains(NEXUS_HOST_HTTP_MODULE) {
+        let stub = build_stub_module(&[
+            ("host-http-request", &[I32; 9], &[]),
+            ("host-http-listen", &[I32, I32], &[I64]),
+            ("host-http-accept", &[I64, I32], &[]),
+            ("host-http-respond", &[I64, I64, I32, I32, I32, I32], &[I32]),
+            ("host-http-stop", &[I64], &[I32]),
+        ]);
+        result = merge_stub(&result, &stub, NEXUS_HOST_HTTP_MODULE, wasm_merge_command)?;
+    }
+
+    // Merge backtrace stubs if present
+    if imports.contains("nexus:runtime/backtrace") {
+        let stub = build_stub_module(&[
+            ("__nx_capture_backtrace", &[], &[]),
+            ("__nx_bt_depth", &[], &[I64]),
+            ("__nx_bt_frame", &[I64], &[I64]),
+        ]);
+        result = merge_stub(
+            &result,
+            &stub,
+            "nexus:runtime/backtrace",
+            wasm_merge_command,
+        )?;
+    }
+
+    Ok(result)
+}
+
+use wasm_encoder::ValType::{I32, I64};
+
+fn build_stub_module(
+    funcs: &[(&str, &[wasm_encoder::ValType], &[wasm_encoder::ValType])],
+) -> Vec<u8> {
+    use wasm_encoder::*;
+    let mut module = Module::new();
+    let mut types = TypeSection::new();
+    let mut functions = FunctionSection::new();
+    let mut exports = ExportSection::new();
+    let mut codes = CodeSection::new();
+    for (i, (name, params, results)) in funcs.iter().enumerate() {
+        types.ty().function(params.to_vec(), results.to_vec());
+        functions.function(i as u32);
+        exports.export(name, ExportKind::Func, i as u32);
+        let mut f = Function::new(vec![]);
+        if results.is_empty() {
+            f.instruction(&Instruction::End);
+        } else {
+            for r in *results {
+                match r {
+                    ValType::I32 => f.instruction(&Instruction::I32Const(0)),
+                    ValType::I64 => f.instruction(&Instruction::I64Const(0)),
+                    _ => f.instruction(&Instruction::I32Const(0)),
+                };
+            }
+            f.instruction(&Instruction::End);
+        }
+        codes.function(&f);
+    }
+    module.section(&types);
+    module.section(&functions);
+    module.section(&exports);
+    module.section(&codes);
+    module.finish()
+}
+
+fn merge_stub(
+    wasm: &[u8],
+    stub: &[u8],
+    module_name: &str,
+    wasm_merge_command: &Path,
+) -> Result<Vec<u8>, String> {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "nexus-stub-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&temp_dir).map_err(|e| format!("failed to create temp dir: {}", e))?;
+    let main_path = temp_dir.join("main.wasm");
+    let stub_path = temp_dir.join("stub.wasm");
+    let merged_path = temp_dir.join("merged.wasm");
+    fs::write(&main_path, wasm).map_err(|e| format!("write main: {}", e))?;
+    fs::write(&stub_path, stub).map_err(|e| format!("write stub: {}", e))?;
+    let output = ProcessCommand::new(wasm_merge_command)
+        .arg(&main_path)
+        .arg(WASM_MERGE_MAIN_NAME)
+        .arg(&stub_path)
+        .arg(module_name)
+        .arg("--all-features")
+        .arg("--enable-tail-call")
+        .arg("--enable-multimemory")
+        .arg("--no-validation")
+        .arg("--skip-export-conflicts")
+        .arg("-o")
+        .arg(&merged_path)
+        .output()
+        .map_err(|e| format!("wasm-merge stub: {}", e))?;
+    let result = if output.status.success() {
+        fs::read(&merged_path).map_err(|e| format!("read merged: {}", e))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("wasm-merge stub failed: {}", stderr.trim()))
+    };
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
 }
 
 #[cfg(test)]

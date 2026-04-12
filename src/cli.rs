@@ -55,12 +55,12 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = ExplainCapabilitiesFormat::Text)]
         explain_capabilities_format: ExplainCapabilitiesFormat,
     },
-    /// Compose a pre-compiled core WASM module with the stdlib component.
-    /// Used by bootstrap.sh and nxc_driver for post-compilation composition.
+    /// Compose a core WASM module with stdlib and nexus-host into a Component.
+    /// Temporary bootstrap command (will be removed after nxc codegen merges stdlib).
     Compose {
-        /// Core WASM module to compose with stdlib.
+        /// Core WASM file to compose.
         input: PathBuf,
-        /// Output path for the composed component (default: composed.wasm).
+        /// Output path (default: <input>.component.wasm).
         #[arg(short, long)]
         output: Option<PathBuf>,
     },

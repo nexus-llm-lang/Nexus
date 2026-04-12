@@ -556,3 +556,19 @@ pub extern "C" fn __nx_buf_write_file(id: i64, path_ptr: i32, path_len: i32) -> 
 pub extern "C" fn __nx_buf_free(id: i64) -> i32 {
     BUFS.with(|bufs| bufs.borrow_mut().remove(&id).is_some()) as i32
 }
+
+/// Read a binary file into a new ByteBuffer. Returns buf_id or -1 on error.
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_buf_read_file(path_ptr: i32, path_len: i32) -> i64 {
+    let path = nexus_wasm_alloc::read_string(path_ptr, path_len);
+    match std::fs::read(&path) {
+        Ok(data) => NEXT_BUF_ID.with(|next| {
+            let id = next.get();
+            next.set(id + 1);
+            BUFS.with(|bufs| bufs.borrow_mut().insert(id, data));
+            id
+        }),
+        Err(_) => -1,
+    }
+}
+

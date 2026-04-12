@@ -26,15 +26,25 @@ import { empty_accum, process_defs, process_defs_shallow, set_accum_wmod_for_std
 import { lower_hir_to_mir } from "nxc/ir/mir.nx"
 import { lower_mir_to_lir } from "nxc/ir/lir.nx"
 import { optimize_lir } from "nxc/ir/lir_opt.nx"
-import { compile_lir_to_wasm } from "nxc/backend/codegen.nx"
+import { compile_lir_to_wasm, wrap_core_in_component } from "nxc/backend/codegen.nx"
 import { check_program } from "nxc/typecheck/check.nx"
-import { write_file, free } from "stdlib/bytebuffer.nx"
+import { write_file, buf_free, length as buf_length } from "stdlib/bytebuffer.nx"
+import { merge_with_stdlib } from "nxc/backend/wasm_merge.nx"
 import { Fs }, * as fs_mod from "stdlib/fs.nx"
 import { Console }, * as stdio from "stdlib/stdio.nx"
 import { Clock }, * as clock_mod from "stdlib/clock.nx"
 import { from_i64, starts_with } from "stdlib/string.nx"
 import { argv, exit } from "stdlib/proc.nx"
-import * as list from "stdlib/list.nx"
+// NOTE: do NOT import `length` from stdlib/list.nx — it collides with
+// string.length imported transitively via proc.nx, causing infinite recursion
+// in the nxc-compiled compiler. Use str_list_length below instead.
+
+let str_list_length = fn (xs: [string]) -> i64 do
+  match xs do
+    case [] -> return 0
+    case _ :: rest -> return 1 + str_list_length(xs: rest)
+  end
+end
 
 // ─── Import processing ──────────────────────────────────────────────────────
 
@@ -129,7 +139,7 @@ type GraphResult = GraphResult(edges: [ImportEdge], visited: [string])
 
 let list_has_str = fn (xs: [string], s: string) -> bool do
   match xs do
-    case Nil -> return false
+    case [] -> return false
     case x :: rest ->
       if x == s then return true end
       return list_has_str(xs: rest, s: s)
@@ -138,10 +148,10 @@ end
 
 let import_items_has = fn (items: [ImportItem], name: string) -> bool do
   match items do
-    case Nil -> return false
+    case [] -> return false
     case ImportItem(name: item_name, item_alias: _) :: rest ->
-      if item_name == name then return true end
-      return import_items_has(items: rest, name: name)
+       if item_name == name then return true end
+       return import_items_has(items: rest, name: name)
   end
 end
 
@@ -149,7 +159,7 @@ type CacheLookupResult = CacheHit(defs: [SpannedTopLevel], entries: [RenameEntry
 
 let cache_lookup = fn (cache: [CacheEntry], path: string) -> CacheLookupResult do
   match cache do
-    case Nil -> return CacheMiss
+    case [] -> return CacheMiss
     case CacheEntry(path: p, defs: d, entries: e) :: rest ->
       if p == path then return CacheHit(defs: d, entries: e) end
       return cache_lookup(cache: rest, path: path)
@@ -162,27 +172,26 @@ end
 /// were registered during the first import.
 let merge_rename_entries = fn (orig: [RenameEntry], new_selective: [RenameEntry], items: [ImportItem]) -> [RenameEntry] do
   match orig do
-    case Nil -> return Nil
+    case [] -> return []
     case RenameEntry(original: name, qualified: _) :: rest ->
-      match import_items_has(items: items, name: name) do
-        case true ->
-          // Selected item — use the new selective entry
-          match find_in_entries(name: name, entries: new_selective) do
-            case Some(val: new_qual) ->
-              return Cons(v: RenameEntry(original: name, qualified: new_qual), rest: merge_rename_entries(orig: rest, new_selective: new_selective, items: items))
-            case None ->
-              return Cons(v: RenameEntry(original: name, qualified: name), rest: merge_rename_entries(orig: rest, new_selective: new_selective, items: items))
-          end
-        case false ->
-          // Non-selected — keep original entry (resolves to existing function)
-          return Cons(v: RenameEntry(original: name, qualified: find_in_entries_or(name: name, entries: orig, fallback: name)), rest: merge_rename_entries(orig: rest, new_selective: new_selective, items: items))
+      if import_items_has(items: items, name: name) then
+        // Selected item — use the new selective entry
+        match find_in_entries(name: name, entries: new_selective) do
+          case Some(val: new_qual) ->
+            return Cons(v: RenameEntry(original: name, qualified: new_qual), rest: merge_rename_entries(orig: rest, new_selective: new_selective, items: items))
+          case None ->
+            return Cons(v: RenameEntry(original: name, qualified: name), rest: merge_rename_entries(orig: rest, new_selective: new_selective, items: items))
+        end
+      else
+        // Non-selected — keep original entry (resolves to existing function)
+        return Cons(v: RenameEntry(original: name, qualified: find_in_entries_or(name: name, entries: orig, fallback: name)), rest: merge_rename_entries(orig: rest, new_selective: new_selective, items: items))
       end
   end
 end
 
 let find_in_entries = fn (name: string, entries: [RenameEntry]) -> Option<string> do
   match entries do
-    case Nil -> return None
+    case [] -> return None
     case RenameEntry(original: orig, qualified: qual) :: rest ->
       if orig == name then return Some(val: qual) end
       return find_in_entries(name: name, entries: rest)
@@ -216,7 +225,7 @@ end
 /// Keeps imports, externals, types, exceptions — everything that's cheap to re-process.
 let filter_non_function_defs = fn (defs: [SpannedTopLevel]) -> [SpannedTopLevel] do
   match defs do
-    case Nil -> return Nil
+    case [] -> return []
     case d :: rest ->
       if is_function_def(d: d) then
         return filter_non_function_defs(defs: rest)
@@ -230,7 +239,7 @@ end
 /// imported functions without duplicating enums, ports, or unrelated lets.
 let filter_defs_by_items = fn (defs: [SpannedTopLevel], items: [ImportItem]) -> [SpannedTopLevel] do
   match defs do
-    case Nil -> return Nil
+    case [] -> return []
     case d :: rest ->
       match d do
         case SpannedTopLevel(node: TLLet(def: GlobalLet(name: name, is_public: _, typ: _, value: _)), span: _) ->
@@ -250,53 +259,50 @@ end
 let process_imports = fn (imports: [ImportDef], accum: HirAccum,
     import_stack: [string], visited: [string], cache: [CacheEntry], depth: i64, verbose: bool) -> ImportResult require { Fs, Console } throws { Exn } do
   match imports do
-    case Nil -> ImportResult(accum: accum, visited: visited, cache: cache)
+    case [] -> ImportResult(accum: accum, visited: visited, cache: cache)
     case imp :: rest ->
       match imp do case ImportDef(path: path, alias: _, items: _, is_external: is_ext) ->
-        match is_ext do
-          case true ->
-            if verbose then Console.eprintln(val: "[nxc]   skip external: " ++ path) end
-            process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
-          case false ->
-            if list_has_str(xs: import_stack, s: path) then
-              raise CyclicImport(path: path)
-            end
-            if list_has_str(xs: visited, s: path) then
-              // Diamond import: reuse cached parse result instead of re-reading file
-              match imp do case ImportDef(path: _, alias: _, items: items, is_external: _) ->
-                match items do
-                  case Nil ->
-                    return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
-                  case _ :: _ ->
-                    if verbose then Console.eprintln(val: "[nxc]   diamond (cached): " ++ path) end
-                    match cache_lookup(cache: cache, path: path) do
-                      case CacheMiss ->
-                        return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
-                      case CacheHit(defs: cached_defs, entries: orig_entries) ->
-                        let new_entries = build_rename_map(imported_defs: cached_defs, import_def: imp, import_depth: depth)
-                        let merged = merge_rename_entries(orig: orig_entries, new_selective: new_entries, items: items)
-                        let accum_wm = set_accum_wmod_for_stdlib(accum: accum, source_file: path)
-                        let selected = filter_defs_by_items(defs: cached_defs, items: items)
-                        let accum2 = process_defs_shallow(defs: selected, entries: merged, accum: accum_wm, source_file: path)
-                        return process_imports(imports: rest, accum: accum2, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
-                    end
-                end
+        if is_ext then
+          if verbose then Console.eprintln(val: "[nxc]   skip external: " ++ path) end
+          process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
+        else
+          if list_has_str(xs: import_stack, s: path) then
+            raise CyclicImport(path: path)
+          end
+          if list_has_str(xs: visited, s: path) then
+            // Diamond import: reuse cached parse result instead of re-reading file
+            match imp do case ImportDef(path: _, alias: _, items: items, is_external: _) ->
+              match items do
+                case [] ->
+                  return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
+                case _ :: _ ->
+                  if verbose then Console.eprintln(val: "[nxc]   diamond (cached): " ++ path) end
+                  match cache_lookup(cache: cache, path: path) do
+                    case CacheMiss ->
+                      return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
+                    case CacheHit(defs: cached_defs, entries: orig_entries) ->
+                      let new_entries = build_rename_map(imported_defs: cached_defs, import_def: imp, import_depth: depth)
+                      let merged = merge_rename_entries(orig: orig_entries, new_selective: new_entries, items: items)
+                      let accum_wm = set_accum_wmod_for_stdlib(accum: accum, source_file: path)
+                      let selected = filter_defs_by_items(defs: cached_defs, items: items)
+                      let accum2 = process_defs_shallow(defs: selected, entries: merged, accum: accum_wm, source_file: path)
+                      return process_imports(imports: rest, accum: accum2, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
+                  end
               end
             end
-            if verbose then Console.eprintln(val: "[nxc]   import: " ++ path) end
-            let src = Fs.read_to_string(path: path)
-            let tokens = tokenize(src: src)
-            let imported_prog = parse(tokens: tokens)
-            let imported_defs = get_defs(prog: imported_prog)
-            let entries = build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
-            let sub_imports = extract_imports(defs: imported_defs)
-            let new_stack = Cons(v: path, rest: import_stack)
-            let new_cache = Cons(v: CacheEntry(path: path, defs: imported_defs, entries: entries), rest: cache)
-            let sub_result = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, visited: Cons(v: path, rest: visited), cache: new_cache, depth: depth + 1, verbose: verbose)
-            match sub_result do case ImportResult(accum: accum2, visited: visited2, cache: cache2) ->
-              let accum3 = process_defs(defs: imported_defs, entries: entries, accum: accum2, source_file: path)
-              process_imports(imports: rest, accum: accum3, import_stack: import_stack, visited: visited2, cache: cache2, depth: depth, verbose: verbose)
-            end
+          end
+          if verbose then Console.eprintln(val: "[nxc]   import: " ++ path) end
+          let tokens = tokenize(src: Fs.read_to_string(path: path))
+          let imported_defs = get_defs(prog: parse(tokens: tokens))
+          let entries = build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
+          let sub_imports = extract_imports(defs: imported_defs)
+          let new_stack = Cons(v: path, rest: import_stack)
+          let new_cache = Cons(v: CacheEntry(path: path, defs: imported_defs, entries: entries), rest: cache)
+          let sub_result = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, visited: Cons(v: path, rest: visited), cache: new_cache, depth: depth + 1, verbose: verbose)
+          match sub_result do case ImportResult(accum: accum2, visited: visited2, cache: cache2) ->
+            let accum3 = process_defs(defs: imported_defs, entries: entries, accum: accum2, source_file: path)
+            process_imports(imports: rest, accum: accum3, import_stack: import_stack, visited: visited2, cache: cache2, depth: depth, verbose: verbose)
+          end
         end
       end
   end
@@ -594,20 +600,29 @@ end
 /// Iterative resolve: filter by reachability, resolve LazyBody, repeat.
 /// Each round discovers new reachable functions from resolved bodies.
 let iterative_resolve = fn (funcs: [HirFunction], hb: [HirHandlerBindingEntry], max_rounds: i64) -> [HirFunction] do
-  if max_rounds <= 0 then return strip_lazy(funcs: funcs) end
-  let stubs = strip_lazy(funcs: funcs)
+  return iterative_resolve_go(all_funcs: funcs, current: funcs, hb: hb, max_rounds: max_rounds)
+end
+
+let iterative_resolve_go = fn (all_funcs: [HirFunction], current: [HirFunction],
+    hb: [HirHandlerBindingEntry], max_rounds: i64) -> [HirFunction] do
+  if max_rounds <= 0 then return strip_lazy(funcs: current) end
+  let stubs = strip_lazy(funcs: current)
   let reachable = collect_reachable(functions: stubs, handler_bindings: hb)
-  let filtered = filter_reachable_functions(functions: funcs, reachable: reachable)
+  // Always filter from ALL functions so deeper call chains are discovered.
+  let filtered = filter_reachable_functions(functions: all_funcs, reachable: reachable)
   let resolved = resolve_all_lazy_via_convert(funcs: filtered)
-  // Check if any new functions became reachable
   let new_reachable = collect_reachable(functions: resolved, handler_bindings: hb)
-  let new_filtered = filter_reachable_functions(functions: funcs, reachable: new_reachable)
-  // If the new filtered set is larger than the old, resolve new ones
+  let new_filtered = filter_reachable_functions(functions: all_funcs, reachable: new_reachable)
   let grew = list_longer(a: new_filtered, b: filtered)
+  let merged = merge_resolved(orig: new_filtered, resolved: resolved)
   if grew then
-    return iterative_resolve(funcs: merge_resolved(orig: new_filtered, resolved: resolved), hb: hb, max_rounds: max_rounds - 1)
+    // Update all_funcs with resolved versions so next round doesn't re-resolve
+    // already-converted functions. Without this, every round re-runs convert_expr
+    // on the same LazyBody functions, duplicating EagerBody allocations on the heap.
+    let updated_all = merge_resolved(orig: all_funcs, resolved: resolved)
+    return iterative_resolve_go(all_funcs: updated_all, current: merged, hb: hb, max_rounds: max_rounds - 1)
   else
-    return resolved
+    return merged
   end
 end
 
@@ -628,30 +643,33 @@ let merge_resolved = fn (orig: [HirFunction], resolved: [HirFunction]) -> [HirFu
   match orig do
     case Nil -> return Nil
     case HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: b, span: sp) :: rest ->
-      let merged_body = match b do
-        case EagerBody(stmts: _) -> b
+      let merged = match b do
+        case EagerBody(stmts: _) ->
+          HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: b, span: sp)
         case LazyBody(ast_expr: _, entries: _) ->
-          // Check if this function was resolved
-          match find_resolved(name: n, resolved: resolved) do
-            case Some(val: rb) -> rb
-            case None -> b
+          // Take FULL function from resolved (params/ret_type may differ from orig
+          // after desugar_main_if_needed or infer_resolve_constant_type).
+          match find_resolved_func(name: n, resolved: resolved) do
+            case Some(val: rf) -> rf
+            case None -> HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: b, span: sp)
           end
       end
-      return HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: merged_body, span: sp) :: merge_resolved(orig: rest, resolved: resolved)
+      return merged :: merge_resolved(orig: rest, resolved: resolved)
   end
 end
 
-let find_resolved = fn (name: string, resolved: [HirFunction]) -> Option<HirBody> do
+let find_resolved_func = fn (name: string, resolved: [HirFunction]) -> Option<HirFunction> do
   match resolved do
     case Nil -> return None
-    case HirFunction(name: rn, type_params: _, params: _, ret_type: _, body: rb, span: _) :: rest ->
+    case f :: rest ->
+      let HirFunction(name: rn, type_params: _, params: _, ret_type: _, body: rb, span: _) = f
       if rn == name then
         match rb do
-          case EagerBody(stmts: _) -> return Some(val: rb)
-          case _ -> return find_resolved(name: name, resolved: rest)
+          case EagerBody(stmts: _) -> return Some(val: f)
+          case _ -> return find_resolved_func(name: name, resolved: rest)
         end
       else
-        return find_resolved(name: name, resolved: rest)
+        return find_resolved_func(name: name, resolved: rest)
       end
   end
 end
@@ -661,16 +679,10 @@ let desugar_main_if_needed = fn (name: string, tps: [string], ps: [HirParam],
   if name == "main" then
     match ps do
       case HirParam(name: arg_name, label: _, typ: _) :: _ ->
-        // Strip params, prepend dummy binding for args
-        let zero = Span(offset: 0, line: 0, col: 0)
-        let dummy = HirStmt(node: Let(name: arg_name, typ: None,
-          value: HirExpr(node: Literal(lit: LitUnit), span: zero)), span: zero)
-        let new_body = match body do
-          case EagerBody(stmts: stmts) -> EagerBody(stmts: dummy :: stmts)
-          case _ -> body
-        end
-        return HirFunction(name: name, type_params: tps, params: [],
-          ret_type: rt, body: new_body, span: sp)
+        // Keep main's params — wasi_run wrapper calls argv() and passes to main.
+        // Component model exports wasi_run as func(), not main directly.
+        return HirFunction(name: name, type_params: tps, params: ps,
+          ret_type: rt, body: body, span: sp)
       case _ ->
         return HirFunction(name: name, type_params: tps, params: ps,
           ret_type: rt, body: body, span: sp)
@@ -685,20 +697,43 @@ let resolve_all_lazy_via_convert = fn (funcs: [HirFunction]) -> [HirFunction] do
   match funcs do
     case Nil -> return Nil
     case HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: b, span: sp) :: rest ->
-      let resolved = match b do
-        case EagerBody(stmts: _) -> b
+      let ResolveBodyResult(body: resolved, ret: resolved_rt) = match b do
+        case EagerBody(stmts: _) -> ResolveBodyResult(body: b, ret: rt)
         case LazyBody(ast_expr: expr, entries: entries) ->
           let hv = convert_expr(expr: expr, entries: entries)
           match hv do
-            case HirExpr(node: Lambda(type_params: _, params: lps, ret_type: _, body: body), span: _) ->
-              EagerBody(stmts: body)
+            case HirExpr(node: Lambda(type_params: _, params: lps, ret_type: lambda_rt, body: body), span: _) ->
+              ResolveBodyResult(body: EagerBody(stmts: body), ret: lambda_rt)
             case non_lambda ->
-              // Non-Lambda (constant, handler fallback) → wrap in Return
+              // Non-Lambda (constant) → wrap in Return, fix ret_type from TyUnit
+              // to actual type (convert_expr_toplevel sets TyUnit for all constants).
               let zero = Span(offset: 0, line: 0, col: 0)
-              EagerBody(stmts: [HirStmt(node: Return(expr: non_lambda), span: zero)])
+              let const_rt = infer_resolve_constant_type(expr: non_lambda)
+              ResolveBodyResult(
+                body: EagerBody(stmts: [HirStmt(node: Return(expr: non_lambda), span: zero)]),
+                ret: const_rt)
           end
       end
-      return desugar_main_if_needed(name: n, tps: tps, ps: ps, rt: rt, body: resolved, sp: sp) :: resolve_all_lazy_via_convert(funcs: rest)
+      return desugar_main_if_needed(name: n, tps: tps, ps: ps, rt: resolved_rt, body: resolved, sp: sp) :: resolve_all_lazy_via_convert(funcs: rest)
+  end
+end
+
+type ResolveBodyResult = ResolveBodyResult(body: HirBody, ret: TypeExpr)
+
+/// Infer return type for a resolved constant expression.
+let infer_resolve_constant_type = fn (expr: HirExpr) -> TypeExpr do
+  let HirExpr(node: inner, span: _) = expr
+  match inner do
+    case Literal(lit: lv) ->
+      match lv do
+        case LitInt(val: _) -> return TyI64
+        case LitFloat(val: _) -> return TyF64
+        case LitString(val: _) -> return TyString
+        case LitChar(val: _) -> return TyChar
+        case LitBool(val: _) -> return TyBool
+        case LitUnit -> return TyUnit
+      end
+    case _ -> return TyI64
   end
 end
 
@@ -759,17 +794,16 @@ end
 
 let write_and_free = fn (buf: %ByteBuffer, path: string) -> bool do
   let ok = write_file(buf: &buf, path: path)
-  free(buf: %buf)
+  buf_free(buf: %buf)
   return ok
 end
 
-let main = fn (args: [string]) -> unit
-    require { PermFs, PermConsole, PermClock } do
+let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock } do
   inject stdio.system_handler, fs_mod.system_handler, clock_mod.system_handler do
   try
     let verbose = has_verbose_flag(xs: args)
     let clean_args = strip_verbose_flag(xs: args)
-    let argc = list.length(xs: clean_args)
+    let argc = str_list_length(xs: clean_args)
     if argc < 2 then
       Console.eprintln(val: "Usage: nxc <input.nx> [output.wasm]")
       Console.eprintln(val: "       nxc --dump-imports <input.nx>")
@@ -809,14 +843,14 @@ let main = fn (args: [string]) -> unit
     if verbose then Console.eprintln(val: "[nxc] parse (" ++ from_i64(val: t3 - t2) ++ "ms)") end
 
     let hir_result = build_hir(prog: prog, source_file: input_path, verbose: verbose)
-    let HirBuildResult(program: hir_raw, import_cache: import_cache) = hir_result
+    let HirBuildResult(program: hir_raw, import_cache: _) = hir_result
     let t4 = Clock.now()
     if verbose then Console.eprintln(val: "[nxc] HIR (" ++ from_i64(val: t4 - t3) ++ "ms)") end
 
     // Iterative resolve: filter by reachability, resolve, repeat until stable.
     let hir = match hir_raw do
       case HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed) ->
-        let resolved = iterative_resolve(funcs: hf, hb: hb, max_rounds: 10)
+        let resolved = iterative_resolve(funcs: hf, hb: hb, max_rounds: 100)
         HirProgram(ports: hp, functions: resolved, externals: he, handler_bindings: hb, enum_defs: hed)
     end
     let t4b = Clock.now()
@@ -826,9 +860,7 @@ let main = fn (args: [string]) -> unit
     // This removes cross-phase references that would prevent future region resets.
     let enum_defs = get_enum_defs(hir: hir)
     let local_names = extract_function_names(defs: get_defs(prog: prog))
-    // TODO: typecheck disabled — Console.eprintln unbound (ltot).
-    // let hir_checked = check_program(hir: hir, local_names: local_names)
-    let hir_checked = hir
+    let hir_checked = check_program(hir: hir, local_names: local_names)
     let t5 = Clock.now()
     if verbose then Console.eprintln(val: "[nxc] typecheck (" ++ from_i64(val: t5 - t4) ++ "ms)") end
     // After this point: prog, hir, local_names are dead.
@@ -851,6 +883,17 @@ let main = fn (args: [string]) -> unit
     let %wasm_buf = compile_lir_to_wasm(program: lir_opt)
     let t9 = Clock.now()
     if verbose then Console.eprintln(val: "[nxc] codegen (" ++ from_i64(val: t9 - t8) ++ "ms)") end
+
+    // If program has stdlib imports, merge with stdlib.wasm to produce self-contained core WASM.
+    // If standalone (no imports), wrap in Component Model.
+    let LirProgram(functions: _, externals: lir_exts) = lir_opt
+    let %wasm_buf = match lir_exts do
+      case [] ->
+        if verbose then Console.eprintln(val: "[nxc] wrapping in component model (standalone)") end
+        wrap_core_in_component(core_wasm: %wasm_buf)
+      case _ ->
+        merge_with_stdlib(core_wasm: %wasm_buf, stdlib_path: "nxlib/stdlib/stdlib.wasm")
+    end
 
     // All IR data is now dead. ByteBuffer is host-managed (not on nexus heap).
     // Reset heap to free all compiler data structures.

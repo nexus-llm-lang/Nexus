@@ -10,7 +10,7 @@ mod string;
 
 pub use error::{CodegenError, CompileError, CompileMetrics};
 pub use module::compile_lir_to_wasm;
-pub use string::{StringABI, set_force_packed_abi};
+pub use string::StringABI;
 
 use std::borrow::Cow;
 
@@ -25,13 +25,7 @@ use crate::types::Type;
 
 const STRING_DATA_BASE: u32 = 16;
 const OBJECT_HEAP_GLOBAL_INDEX: u32 = 0;
-/// cabi_realloc uses G1 (separate from object heap G0) so region resets
-/// on G0 don't corrupt canonical ABI string data.
-pub(super) const CABI_ARENA_GLOBAL_INDEX: u32 = 1;
-/// String allocations share the object heap (G0). Separate heaps caused
-/// collisions when G0 grew past the G2 offset (8MB was too small for
-/// programs with 10MB+ of constructor data). With heap_swap/heap_reset
-/// removed from the nxc driver, there's no need for separation.
+/// String allocations share the object heap (G0).
 const STRING_HEAP_GLOBAL_INDEX: u32 = 0;
 const ALLOCATE_WASM_NAME: &str = "allocate";
 const BT_MODULE: &str = "nexus:runtime/backtrace";

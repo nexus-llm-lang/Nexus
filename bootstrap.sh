@@ -23,7 +23,9 @@ done
 NEXUS="${NEXUS:-./target/release/nexus}"
 NXC_ENTRY="nxc/driver.nx"
 WASMTIME="${WASMTIME:-wasmtime}"
-WASMTIME_FLAGS="-W tail-call=y,exceptions=y,component-model=y,max-memory-size=8589934592 -S http,inherit-network --dir=. --dir=${TMPDIR:-/tmp}"
+# Stage0 is a component (from nexus build); stage1+ are core WASM (from nxc with stdlib merge)
+WASMTIME_FLAGS_COMPONENT="-W tail-call=y,exceptions=y,component-model=y,max-memory-size=8589934592 -S http,inherit-network --dir=. --dir=${TMPDIR:-/tmp}"
+WASMTIME_FLAGS_CORE="-W tail-call=y,exceptions=y,max-memory-size=8589934592 --dir=. --dir=${TMPDIR:-/tmp}"
 NEXUS_BUILD_FLAGS=""
 
 RED='\033[0;31m'
@@ -84,35 +86,31 @@ fi
 ok "Stage 0 complete: $STAGE0 ($(wc -c < "$STAGE0" | tr -d ' ') bytes)"
 
 # ─── Stage 1: stage0.wasm compiles nxc → stage1.wasm ──────────────────────
+# Stage0 may be a stub (no merge). If stage1 is core WASM with unresolved imports,
+# compose it with stdlib. Once stage1 has the merge code, stage2+ are self-contained.
 
+STAGE1_RAW="$BUILD_DIR/stage1_raw.wasm"
 STAGE1="$BUILD_DIR/stage1.wasm"
-info "Stage 1: wasmtime run $STAGE0 $NXC_ENTRY $STAGE1"
-"$WASMTIME" run $WASMTIME_FLAGS "$STAGE0" "$NXC_ENTRY" --verbose "$STAGE1"
-ok "Stage 1 complete: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
+info "Stage 1: wasmtime run $STAGE0 $NXC_ENTRY $STAGE1_RAW"
+"$WASMTIME" run $WASMTIME_FLAGS_COMPONENT "$STAGE0" "$NXC_ENTRY" --verbose "$STAGE1_RAW"
 
-# ─── Compose stage1 with stdlib ────────────────────────────────────────────
-# Stage1 is a core WASM that imports nexus:stdlib/* interfaces.
-# Compose it with stdlib-component.wasm so wasmtime can execute it.
-
-STAGE1_BUNDLED="$BUILD_DIR/stage1_bundled.wasm"
-STDLIB_COMPONENT="$(pwd)/nxlib/stdlib/stdlib-component.wasm"
-
-# Use the Rust compiler's compose_with_stdlib (via a quick compile-and-run test helper).
-# This reuses the same in-process ComponentEncoder + ComponentComposer pipeline
-# as `nexus build` and the test harness.
-info "Composing stage1 with stdlib component..."
-if "$NEXUS" compose "$STAGE1" -o "$STAGE1_BUNDLED"; then
-  ok "Composed: $STAGE1_BUNDLED ($(wc -c < "$STAGE1_BUNDLED" | tr -d ' ') bytes)"
+# Check if stage1 is self-contained (no nexus:stdlib imports) or needs compose
+if wasm-tools print "$STAGE1_RAW" 2>/dev/null | grep -q 'import "nexus:stdlib/'; then
+  info "Stage 1 has unresolved stdlib imports — composing..."
+  "$NEXUS" compose "$STAGE1_RAW" -o "$STAGE1"
+  ok "Stage 1 composed: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
+  STAGE1_FLAGS="$WASMTIME_FLAGS_COMPONENT"
 else
-  warn "Composition failed — copying stage1 as-is (stage2 may fail)"
-  cp "$STAGE1" "$STAGE1_BUNDLED"
+  cp "$STAGE1_RAW" "$STAGE1"
+  ok "Stage 1 self-contained: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
+  STAGE1_FLAGS="$WASMTIME_FLAGS_CORE"
 fi
 
 # ─── Stage 2: stage1.wasm compiles nxc → stage2.wasm ──────────────────────
 
 STAGE2="$BUILD_DIR/stage2.wasm"
-info "Stage 2: wasmtime run $STAGE1_BUNDLED $NXC_ENTRY $STAGE2"
-if "$WASMTIME" run $WASMTIME_FLAGS "$STAGE1_BUNDLED" "$NXC_ENTRY" --verbose "$STAGE2" 2>&1; then
+info "Stage 2: wasmtime run $STAGE1 $NXC_ENTRY $STAGE2"
+if "$WASMTIME" run $STAGE1_FLAGS "$STAGE1" "$NXC_ENTRY" "$STAGE2" 2>&1; then
   ok "Stage 2 complete: $STAGE2 ($(wc -c < "$STAGE2" | tr -d ' ') bytes)"
 else
   if [[ "$CI_MODE" == true ]]; then
@@ -141,8 +139,8 @@ else
 fi
 
 # ─── Install nxc_driver.wasm ─────────────────────────────────────────────
-# Copy the verified stage1 (bundled) as the repo-root nxc_driver.wasm.
-# This ensures nxc_driver.wasm always matches the current sources.
+# Stage1 is already self-contained (stdlib merged). Install directly.
 
-cp "$STAGE1_BUNDLED" nxc_driver.wasm
+info "Installing nxc_driver.wasm..."
+cp "$STAGE1" nxc_driver.wasm
 ok "Installed nxc_driver.wasm ($(wc -c < nxc_driver.wasm | tr -d ' ') bytes)"

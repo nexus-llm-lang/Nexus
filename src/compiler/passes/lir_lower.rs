@@ -817,7 +817,6 @@ impl<'a> LowerCtx<'a> {
         LirAtom::Var { name, typ }
     }
 
-    /// Like bind_expr_to_temp but also registers the semantic type for pattern matching.
     /// Recognize specific external calls that can be emitted as inline WASM intrinsics.
     fn try_intrinsify(
         &self,
@@ -828,14 +827,71 @@ impl<'a> LowerCtx<'a> {
         let ext = self.externals.iter().find(|e| e.name == *func)?;
         let module = ext.wasm_module.as_ref();
         let name = ext.wasm_name.as_ref();
-        if module != "nexus:stdlib/string-ops" {
-            return None;
+        if module == "nexus:runtime/arena" {
+            return match name {
+                "heap-mark" => Some(Intrinsic::HeapMark),
+                "heap-reset" => Some(Intrinsic::HeapReset),
+                "heap-swap" => Some(Intrinsic::HeapSwap),
+                _ => None,
+            };
         }
-        match name {
-            "string-byte-at" => Some(Intrinsic::StringByteAt),
-            "string-byte-length" => Some(Intrinsic::StringByteLength),
-            _ => None,
+        // Match both WIT-style names (nexus:stdlib/string-ops) and
+        // file-path names (stdlib/stdlib.wasm) for intrinsic detection.
+        // File-path imports use __nx_string_* names; WIT imports use string-* names.
+        if module == "nexus:stdlib/string-ops" {
+            return match name {
+                "string-byte-at" => Some(Intrinsic::StringByteAt),
+                "string-byte-length" => Some(Intrinsic::StringByteLength),
+                "string-skip-ws" => Some(Intrinsic::SkipWs),
+                "string-scan-ident" => Some(Intrinsic::ScanIdent),
+                "string-scan-digits" => Some(Intrinsic::ScanDigits),
+                "string-find-byte" => Some(Intrinsic::FindByte),
+                "string-byte-substring" => Some(Intrinsic::ByteSubstring),
+                "string-count-newlines-in" => Some(Intrinsic::CountNewlinesIn),
+                "string-last-newline-in" => Some(Intrinsic::LastNewlineIn),
+                "string-length" => Some(Intrinsic::StringLength),
+                "string-char-code" => Some(Intrinsic::CharCode),
+                "string-char-at" => Some(Intrinsic::CharAt),
+                "string-from-char-code" => Some(Intrinsic::FromCharCode),
+                "string-from-char" => Some(Intrinsic::FromChar),
+                "char-ord" => Some(Intrinsic::CharOrd),
+                "string-starts-with" => Some(Intrinsic::StartsWith),
+                "string-ends-with" => Some(Intrinsic::EndsWith),
+                "string-contains" => Some(Intrinsic::Contains),
+                "string-index-of" => Some(Intrinsic::IndexOf),
+                "string-from-i64" => Some(Intrinsic::FromI64),
+                "string-substring" => Some(Intrinsic::ByteSubstring),
+                _ => None,
+            };
         }
+        // File-path stdlib: __nx_string_* / __nx_char_* function names.
+        if module.ends_with("stdlib.wasm") {
+            return match name {
+                "__nx_string_byte_at" => Some(Intrinsic::StringByteAt),
+                "__nx_string_byte_length" => Some(Intrinsic::StringByteLength),
+                "__nx_string_skip_ws" => Some(Intrinsic::SkipWs),
+                "__nx_string_scan_ident" => Some(Intrinsic::ScanIdent),
+                "__nx_string_scan_digits" => Some(Intrinsic::ScanDigits),
+                "__nx_string_find_byte" => Some(Intrinsic::FindByte),
+                "__nx_string_byte_substring" => Some(Intrinsic::ByteSubstring),
+                "__nx_string_count_newlines_in" => Some(Intrinsic::CountNewlinesIn),
+                "__nx_string_last_newline_in" => Some(Intrinsic::LastNewlineIn),
+                "__nx_string_length" => Some(Intrinsic::StringLength),
+                "__nx_string_char_code" | "__nx_char_code" => Some(Intrinsic::CharCode),
+                "__nx_string_char_at" | "__nx_char_at" => Some(Intrinsic::CharAt),
+                "__nx_string_from_char_code" => Some(Intrinsic::FromCharCode),
+                "__nx_string_from_char" => Some(Intrinsic::FromChar),
+                "__nx_char_ord" => Some(Intrinsic::CharOrd),
+                "__nx_string_starts_with" => Some(Intrinsic::StartsWith),
+                "__nx_string_ends_with" => Some(Intrinsic::EndsWith),
+                "__nx_string_contains" => Some(Intrinsic::Contains),
+                "__nx_string_index_of" => Some(Intrinsic::IndexOf),
+                "__nx_string_from_i64" | "__nx_i64_to_string" => Some(Intrinsic::FromI64),
+                "__nx_string_substring" => Some(Intrinsic::ByteSubstring),
+                _ => None,
+            };
+        }
+        None
     }
 
     fn bind_expr_to_temp_semantic(
@@ -951,12 +1007,7 @@ impl<'a> LowerCtx<'a> {
                     } => {
                         let then_spread = spread_return_into_body(then_body);
                         let else_spread = else_body.as_ref().map(|b| spread_return_into_body(b));
-                        self.lower_if_stmt(
-                            cond,
-                            &then_spread,
-                            else_spread.as_deref(),
-                            ret_type,
-                        )?;
+                        self.lower_if_stmt(cond, &then_spread, else_spread.as_deref(), ret_type)?;
                         Ok(None)
                     }
                     // Spread return into match branches — same benefits as if spreading.
@@ -1552,67 +1603,59 @@ impl<'a> LowerCtx<'a> {
                     }
                 }
             },
-            MirStmt::Return(expr) => {
-                match expr {
-                    MirExpr::Call {
-                        func,
-                        args,
-                        ret_type,
-                    } => {
-                        let mut lir_args = Vec::new();
-                        for (label, e) in args {
-                            let atom = self.lower_expr_to_atom(e)?;
-                            lir_args.push((label.clone(), atom));
-                        }
-                        lir_args.sort_by(|(a, _), (b, _)| a.cmp(b));
-                        let typ = wasm_type(ret_type);
-                        let atom = self.bind_expr_to_temp(
-                            LirExpr::TailCall {
-                                func: func.clone(),
-                                args: lir_args,
-                                typ: typ.clone(),
-                            },
-                            typ,
-                        );
+            MirStmt::Return(expr) => match expr {
+                MirExpr::Call {
+                    func,
+                    args,
+                    ret_type,
+                } => {
+                    let mut lir_args = Vec::new();
+                    for (label, e) in args {
+                        let atom = self.lower_expr_to_atom(e)?;
+                        lir_args.push((label.clone(), atom));
+                    }
+                    lir_args.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    let typ = wasm_type(ret_type);
+                    let atom = self.bind_expr_to_temp(
+                        LirExpr::TailCall {
+                            func: func.clone(),
+                            args: lir_args,
+                            typ: typ.clone(),
+                        },
+                        typ,
+                    );
+                    Ok(Some(atom))
+                }
+                MirExpr::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    let then_spread = spread_return_into_body(then_body);
+                    let else_spread = else_body.as_ref().map(|b| spread_return_into_body(b));
+                    self.lower_if_stmt(cond, &then_spread, else_spread.as_deref(), ret_type)?;
+                    Ok(None)
+                }
+                MirExpr::Match { target, cases } => {
+                    let spread_cases: Vec<MirMatchCase> = cases
+                        .iter()
+                        .map(|case| MirMatchCase {
+                            pattern: case.pattern.clone(),
+                            body: spread_return_into_body(&case.body),
+                        })
+                        .collect();
+                    self.lower_match_stmt(target, &spread_cases, ret_type)?;
+                    Ok(None)
+                }
+                _ => {
+                    let atom = self.lower_expr_to_atom(expr)?;
+                    if matches!(atom.typ(), Type::Unit) {
+                        Ok(None)
+                    } else {
                         Ok(Some(atom))
                     }
-                    MirExpr::If {
-                        cond,
-                        then_body,
-                        else_body,
-                    } => {
-                        let then_spread = spread_return_into_body(then_body);
-                        let else_spread =
-                            else_body.as_ref().map(|b| spread_return_into_body(b));
-                        self.lower_if_stmt(
-                            cond,
-                            &then_spread,
-                            else_spread.as_deref(),
-                            ret_type,
-                        )?;
-                        Ok(None)
-                    }
-                    MirExpr::Match { target, cases } => {
-                        let spread_cases: Vec<MirMatchCase> = cases
-                            .iter()
-                            .map(|case| MirMatchCase {
-                                pattern: case.pattern.clone(),
-                                body: spread_return_into_body(&case.body),
-                            })
-                            .collect();
-                        self.lower_match_stmt(target, &spread_cases, ret_type)?;
-                        Ok(None)
-                    }
-                    _ => {
-                        let atom = self.lower_expr_to_atom(expr)?;
-                        if matches!(atom.typ(), Type::Unit) {
-                            Ok(None)
-                        } else {
-                            Ok(Some(atom))
-                        }
-                    }
                 }
-            }
+            },
             _ => {
                 self.lower_stmt(&body[last_idx], ret_type)?;
                 Ok(None)

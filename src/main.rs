@@ -6,11 +6,9 @@ use clap::Parser;
 use std::fs;
 use std::process::ExitCode;
 
-use nexus::compiler::bundler;
 use nexus::runtime;
 
 use cli::{default_wasm_output_path, load_source, Cli, Command};
-use driver::compile_loaded_source_to_wasm;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -39,13 +37,12 @@ fn main() -> ExitCode {
         Some(Command::Build {
             input,
             output,
-            wasm_merge,
             explain_capabilities,
             explain_capabilities_format,
+            ..
         }) => build_command(
             input,
             output,
-            wasm_merge,
             explain_capabilities,
             explain_capabilities_format,
             cli.verbose,
@@ -58,10 +55,38 @@ fn main() -> ExitCode {
     }
 }
 
+fn compose_command(input: std::path::PathBuf, output: Option<std::path::PathBuf>) -> ExitCode {
+    let core_wasm = match std::fs::read(&input) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("Error: failed to read {}: {}", input.display(), e);
+            return ExitCode::from(1);
+        }
+    };
+    match nexus::compiler::compose::compose_with_stdlib_and_host(&core_wasm) {
+        Ok(component) => {
+            let out_path = output.unwrap_or_else(|| input.with_extension("component.wasm"));
+            if let Err(e) = std::fs::write(&out_path, &component) {
+                eprintln!("Error: failed to write {}: {}", out_path.display(), e);
+                return ExitCode::from(1);
+            }
+            eprintln!(
+                "Composed: {} ({} bytes)",
+                out_path.display(),
+                component.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Error: composition failed: {}", e);
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn build_command(
     input: Option<std::path::PathBuf>,
     output: Option<std::path::PathBuf>,
-    wasm_merge: Option<std::path::PathBuf>,
     explain: cli::ExplainCapabilities,
     format: cli::ExplainCapabilitiesFormat,
     verbose: bool,
@@ -79,7 +104,15 @@ fn build_command(
         Err(code) => return code,
     };
     let final_wasm = match nexus::compiler::compose::compose_with_stdlib_and_host(&core_wasm) {
-        Ok(component_wasm) => component_wasm,
+        Ok(component_wasm) => {
+            // Save component to nxc cache for bootstrap
+            if loaded.display_name.ends_with("nxc/driver.nx") {
+                let cache_dir = std::path::Path::new("target/nxc");
+                let _ = fs::create_dir_all(cache_dir);
+                let _ = fs::write(cache_dir.join("nxc_driver.wasm"), &component_wasm);
+            }
+            component_wasm
+        }
         Err(msg) => {
             eprintln!("Composition Error: {}", msg);
             return ExitCode::from(1);
@@ -96,30 +129,6 @@ fn build_command(
         .to_string_lossy();
     let caps = runtime::parse_nexus_capabilities(&final_wasm);
     artifact::print_build_result(&output_name, &caps, &explain, &format);
-    ExitCode::SUCCESS
-}
-
-fn compose_command(input: std::path::PathBuf, output: Option<std::path::PathBuf>) -> ExitCode {
-    let core_wasm = match fs::read(&input) {
-        Ok(wasm) => wasm,
-        Err(e) => {
-            eprintln!("Failed to read {}: {}", input.display(), e);
-            return ExitCode::from(1);
-        }
-    };
-    let composed = match nexus::compiler::compose::compose_with_stdlib_and_host(&core_wasm) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Composition Error: {}", e);
-            return ExitCode::from(1);
-        }
-    };
-    let output_path = output.unwrap_or_else(|| std::path::PathBuf::from("composed.wasm"));
-    if let Err(e) = fs::write(&output_path, &composed) {
-        eprintln!("Failed to write {}: {}", output_path.display(), e);
-        return ExitCode::from(1);
-    }
-    eprintln!("Composed {}", output_path.display());
     ExitCode::SUCCESS
 }
 

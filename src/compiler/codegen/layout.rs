@@ -44,6 +44,8 @@ pub(super) struct CodegenLayout {
     pub(super) funcref_table_indices: HashMap<Symbol, u32>,
     /// Map from WASM signature key (params+results) to type index for call_indirect
     pub(super) indirect_type_indices: HashMap<String, u32>,
+    /// Static addresses for nullary constructors (pre-allocated in data section).
+    pub(super) nullary_ctor_addrs: HashMap<i64, u32>,
     /// Index of imported __nx_lazy_spawn function
     pub(super) lazy_spawn_func_idx: Option<u32>,
     /// Index of imported __nx_lazy_join function
@@ -91,9 +93,29 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
         return Err(CodegenError::StringLiteralsWithoutMemory);
     }
 
+    // Collect nullary constructors and pre-allocate static slots (8 bytes each).
+    let mut nullary_ctors = HashSet::new();
+    for func in &program.functions {
+        for stmt in &func.body {
+            collect_nullary_ctors_in_stmt(stmt, &mut nullary_ctors);
+        }
+    }
+    let mut nullary_ctor_addrs = HashMap::new();
+    // Align to 8 bytes before nullary ctor slots
+    next_offset = align8(next_offset);
+    for tag in &nullary_ctors {
+        nullary_ctor_addrs.insert(*tag, next_offset);
+        data_segments.push(DataSegment {
+            offset: next_offset,
+            bytes: tag.to_le_bytes().to_vec(),
+        });
+        next_offset += 8;
+    }
+
     let heap_base = align8(next_offset.max(STRING_DATA_BASE));
 
     Ok(CodegenLayout {
+        nullary_ctor_addrs,
         memory_mode,
         string_literals: literal_map,
         data_segments,
@@ -385,5 +407,53 @@ fn collect_strings_in_expr(expr: &LirExpr, out: &mut Vec<String>) {
 fn collect_strings_in_atom(atom: &LirAtom, out: &mut Vec<String>) {
     if let LirAtom::String(s) = atom {
         out.push(s.clone());
+    }
+}
+
+use super::emit::constructor_tag;
+
+fn collect_nullary_ctors_in_stmt(stmt: &LirStmt, out: &mut HashSet<i64>) {
+    match stmt {
+        LirStmt::Let { expr, .. } => collect_nullary_ctors_in_expr(expr, out),
+        LirStmt::If {
+            then_body,
+            else_body,
+            ..
+        }
+        | LirStmt::IfReturn {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for s in then_body {
+                collect_nullary_ctors_in_stmt(s, out);
+            }
+            for s in else_body {
+                collect_nullary_ctors_in_stmt(s, out);
+            }
+        }
+        LirStmt::Switch {
+            cases,
+            default_body,
+            ..
+        } => {
+            for case in cases {
+                for s in &case.body {
+                    collect_nullary_ctors_in_stmt(s, out);
+                }
+            }
+            for s in default_body {
+                collect_nullary_ctors_in_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_nullary_ctors_in_expr(expr: &LirExpr, out: &mut HashSet<i64>) {
+    if let LirExpr::Constructor { name, args, .. } = expr {
+        if args.is_empty() {
+            out.insert(constructor_tag(name.as_str(), 0));
+        }
     }
 }

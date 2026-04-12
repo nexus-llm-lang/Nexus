@@ -1858,8 +1858,7 @@ fn resolve_stdlib_wit_module(resolved: &str, wit_interface: Option<&str>) -> Str
     } else if resolved.ends_with(".nx") {
         // Import path is a .nx file (e.g. "stdlib/hashmap.nx") — use its stem for WIT mapping.
         let path = std::path::Path::new(resolved);
-        stdlib_nx_to_wit_interface(path)
-            .unwrap_or_else(|| resolved.to_string())
+        stdlib_nx_to_wit_interface(path).unwrap_or_else(|| resolved.to_string())
     } else {
         resolved.to_string()
     }

@@ -1733,10 +1733,21 @@ impl TypeChecker {
                 if let Some(eb) = else_branch {
                     self.infer_body(eb, &mut ee_env, er, eq, ee)?;
                 }
-                if et.linear_vars != ee_env.linear_vars {
+                // Check if the then-branch diverges (ends with return/raise).
+                // If it does and there's no else branch, the linear state from
+                // the then-branch is irrelevant (that path exits the function).
+                let then_diverges = then_branch.last().map_or(false, |last| {
+                    matches!(&last.node, Stmt::Return(_))
+                        || matches!(&last.node, Stmt::Expr(e) if matches!(&e.node, Expr::Raise(_)))
+                });
+                if then_diverges && else_branch.is_none() {
+                    // Then-branch always exits; only the fall-through path matters
+                    env.linear_vars = ee_env.linear_vars;
+                } else if et.linear_vars != ee_env.linear_vars {
                     return Err(TypeError::new("Linear mismatch", e.span.clone()));
+                } else {
+                    env.linear_vars = et.linear_vars;
                 }
-                env.linear_vars = et.linear_vars;
                 Ok((s, Type::Unit))
             }
             Expr::Match { target, cases } => {

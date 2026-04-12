@@ -620,6 +620,79 @@ end
     }
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostic: Global 0 / Global 2 heap collision investigation (qfcu)
+// ---------------------------------------------------------------------------
+
+/// In bump-allocator mode (no stdlib allocate import), the codegen emits 3
+/// globals: G0 (object heap), G1 (placeholder), G2 (string heap).
+/// Both G0 and G2 are initialized to `heap_base`.  If they start at the
+/// same address, runtime constructor allocs (G0) and string concat allocs
+/// (G2) overwrite each other's data.
+///
+/// This test compiles a program that uses both constructors and string
+/// concat (triggering bump mode), then inspects the WASM globals section
+/// to verify whether G0 and G2 are initialized to the same value.
+#[test]
+fn diag_bump_mode_g0_g2_initial_values() {
+    // Both constructor and string concat must be USED to survive optimization.
+    let wasm = compile(
+        r#"
+type Val = Present(v: s64) | Absent
+
+let main = fn () -> unit do
+    let x = Present(v: 42)
+    let s = "aa" ++ "bb"
+    match x do
+        case Present(v: v) ->
+            if v != 42 then raise RuntimeError(val: "v") end
+        case Absent ->
+            raise RuntimeError(val: "tag")
+    end
+    if s == "xxxx" then raise RuntimeError(val: "s") end
+    return ()
+end
+"#,
+    );
+
+    // Parse globals section: expect 3 mutable i32 globals.
+    // Global 0 = object heap ptr, Global 2 = string heap ptr.
+    let mut global_init_values: Vec<i32> = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::GlobalSection(reader) = payload.unwrap() {
+            for global in reader {
+                let global = global.unwrap();
+                // Read the const expr init value
+                let mut reader = global.init_expr.get_operators_reader();
+                if let Ok(op) = reader.read() {
+                    if let wasmparser::Operator::I32Const { value } = op {
+                        global_init_values.push(value);
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        global_init_values.len() >= 3,
+        "bump mode should emit at least 3 globals (G0, G1, G2), got {}",
+        global_init_values.len()
+    );
+
+    let g0 = global_init_values[0]; // object heap
+    let g2 = global_init_values[2]; // string heap
+
+    // THIS IS THE BUG: both heaps start at the same address.
+    // When this test FAILS (g0 != g2), the fix has been applied.
+    // When this test PASSES, the collision is confirmed.
+    eprintln!("  G0 (object heap) init = {g0}");
+    eprintln!("  G1 (placeholder)  init = {}", global_init_values[1]);
+    eprintln!("  G2 (string heap) init = {g2}");
+
+    // G2 is a placeholder (0) — string allocs share G0 (unified heap).
+    assert_eq!(g2, 0, "G2 should be 0 (placeholder) — string allocs use G0");
+}
+
 /// Helper: collect all import (module, name) pairs from a WASM binary.
 fn wasm_imports(wasm: &[u8]) -> Vec<(String, String)> {
     let mut imports = Vec::new();
