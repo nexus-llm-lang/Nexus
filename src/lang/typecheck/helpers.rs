@@ -723,3 +723,39 @@ fn expr_contains_return(e: &Spanned<Expr>) -> bool {
         _ => false,
     }
 }
+
+/// Check whether a body always diverges (every execution path ends with
+/// return or raise). Used to detect divergence of nested if/match
+/// expressions in tail position.
+fn body_always_diverges(body: &[Spanned<Stmt>]) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    let last = &body.last().unwrap().node;
+    match last {
+        Stmt::Return(_) => true,
+        Stmt::Expr(e) => expr_always_diverges(e),
+        _ => false,
+    }
+}
+
+/// Check whether an expression always diverges (return/raise in all branches).
+pub(super) fn expr_always_diverges(e: &Spanned<Expr>) -> bool {
+    match &e.node {
+        Expr::Raise(_) => true,
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            body_always_diverges(then_branch)
+                && else_branch
+                    .as_ref()
+                    .is_some_and(|b| body_always_diverges(b))
+        }
+        Expr::Match { cases, .. } => {
+            !cases.is_empty() && cases.iter().all(|c| body_always_diverges(&c.body))
+        }
+        _ => false,
+    }
+}
