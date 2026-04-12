@@ -261,3 +261,162 @@ end
         should_fail_typecheck(&src);
     }
 }
+
+#[test]
+fn test_linear_deeply_nested_else_if_value_branches() {
+    // Regression (nexus-957p): deeply nested else-if chains (10+ levels) with
+    // linear types should typecheck correctly. Each branch produces a value of
+    // the same linear type, bound via let, then used in arithmetic.
+    should_typecheck(
+        r#"
+    type Resource = { id: i64 }
+
+    let transform = fn (%r: Resource) -> Resource do
+        return %r
+    end
+
+    let consume = fn (%r: Resource) -> i64 do
+        match %r do case { id: x } -> return x end
+    end
+
+    let process = fn (op: i64, %buf: Resource) -> i64 do
+        let %buf2 = if op == 1 then
+            transform(r: %buf)
+        else if op == 2 then
+            transform(r: %buf)
+        else if op == 3 then
+            transform(r: %buf)
+        else if op == 4 then
+            transform(r: %buf)
+        else if op == 5 then
+            transform(r: %buf)
+        else if op == 6 then
+            transform(r: %buf)
+        else if op == 7 then
+            transform(r: %buf)
+        else if op == 8 then
+            transform(r: %buf)
+        else if op == 9 then
+            transform(r: %buf)
+        else if op == 10 then
+            transform(r: %buf)
+        else if op == 11 then
+            transform(r: %buf)
+        else
+            transform(r: %buf)
+        end end end end end end end end end end end
+        let id_val = consume(r: %buf2)
+        return id_val + 1
+    end
+
+    let main = fn () -> unit do
+        let %r = { id: 1 }
+        let x = process(op: 1, buf: %r)
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_linear_deeply_nested_else_if_all_return() {
+    // Regression (nexus-957p): deeply nested else-if chains where ALL branches
+    // use `return` should be detected as fully diverging. The match expression
+    // should correctly propagate divergence through nested if-else desugaring.
+    should_typecheck(
+        r#"
+    type Resource = { id: i64 }
+
+    let consume = fn (%r: Resource) -> i64 do
+        match %r do case { id: x } -> return x end
+    end
+
+    let process = fn (op: i64, %buf: Resource) -> i64 do
+        if op == 1 then
+            return consume(r: %buf)
+        else if op == 2 then
+            return consume(r: %buf)
+        else if op == 3 then
+            return consume(r: %buf)
+        else if op == 4 then
+            return consume(r: %buf)
+        else if op == 5 then
+            return consume(r: %buf)
+        else if op == 6 then
+            return consume(r: %buf)
+        else if op == 7 then
+            return consume(r: %buf)
+        else if op == 8 then
+            return consume(r: %buf)
+        else if op == 9 then
+            return consume(r: %buf)
+        else if op == 10 then
+            return consume(r: %buf)
+        else if op == 11 then
+            return consume(r: %buf)
+        else
+            return consume(r: %buf)
+        end end end end end end end end end end end
+    end
+
+    let main = fn () -> unit do
+        let %r = { id: 1 }
+        let x = process(op: 1, buf: %r)
+        return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_linear_deeply_nested_else_if_mixed_return_and_value() {
+    // Regression (nexus-957p): deeply nested else-if where most branches use
+    // `return` but the last else returns a value. The match tail type should
+    // be the value from the last else branch (not unit from divergence).
+    should_typecheck(
+        r#"
+    type Resource = { id: i64 }
+
+    let transform = fn (%r: Resource) -> Resource do
+        return %r
+    end
+
+    let consume = fn (%r: Resource) -> i64 do
+        match %r do case { id: x } -> return x end
+    end
+
+    let process = fn (op: i64, %buf: Resource) -> i64 do
+        let %buf = if op == 1 then
+            return consume(r: %buf)
+        else if op == 2 then
+            return consume(r: %buf)
+        else if op == 3 then
+            return consume(r: %buf)
+        else if op == 4 then
+            return consume(r: %buf)
+        else if op == 5 then
+            return consume(r: %buf)
+        else if op == 6 then
+            return consume(r: %buf)
+        else if op == 7 then
+            return consume(r: %buf)
+        else if op == 8 then
+            return consume(r: %buf)
+        else if op == 9 then
+            return consume(r: %buf)
+        else if op == 10 then
+            return consume(r: %buf)
+        else
+            transform(r: %buf)
+        end end end end end end end end end end
+        return consume(r: %buf)
+    end
+
+    let main = fn () -> unit do
+        let %r = { id: 1 }
+        let x = process(op: 1, buf: %r)
+        return ()
+    end
+    "#,
+    );
+}
