@@ -351,9 +351,11 @@ let rw_instrs = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, end_pos: i64,
   set_p(ps: ps, v: pos + 1)
 
   // Classify opcode into handling groups:
-  // 0 = no operand, 1 = single ULEB, 2 = two ULEBs (call_indirect),
+  // 0 = no operand, 1 = single ULEB (no remap), 2 = call_indirect (type_off + tbl_off),
   // 3 = blocktype, 4 = sleb, 5 = f64 (8 bytes), 6 = memarg (2 ULEBs, load/store),
-  // 7 = mem index byte, 8 = br_table, 9 = try_table, 10 = 0xFC prefix
+  // 7 = mem index byte, 8 = br_table, 9 = try_table, 10 = 0xFC prefix,
+  // 11 = call/return_call (remap func idx), 12 = global.get/set (add glo_off),
+  // 13 = ref.func (remap func idx)
   let cls = if op >= 40 then
     if op <= 62 then 6
     else
@@ -367,7 +369,7 @@ let rw_instrs = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, end_pos: i64,
     else
     if op == 68 then 5
     else
-    if op == 210 then 1
+    if op == 210 then 13
     else
     if op == 252 then 10
     else 0
@@ -382,14 +384,14 @@ let rw_instrs = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, end_pos: i64,
       case 12 -> 1
       case 13 -> 1
       case 14 -> 8
-      case 16 -> 1
+      case 16 -> 11
       case 17 -> 2
-      case 18 -> 1
+      case 18 -> 11
       case 32 -> 1
       case 33 -> 1
       case 34 -> 1
-      case 35 -> 1
-      case 36 -> 1
+      case 35 -> 12
+      case 36 -> 12
       case _ -> 0
     end
   end
@@ -406,12 +408,13 @@ let rw_instrs = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, end_pos: i64,
       remap: remap, glo_off: glo_off, type_off: type_off, tbl_off: tbl_off)
   end
   if cls == 2 then
+    // call_indirect: type_idx (+ type_off), table_idx (+ tbl_off)
     let pos2 = get_p(ps: ps)
     let pk = rd_uleb(buf: src, pos: pos2)
-    let %out = bb_push_uleb128(buf: %out, val: pval(pk: pk))
+    let %out = bb_push_uleb128(buf: %out, val: pval(pk: pk) + type_off)
     let pk2 = rd_uleb(buf: src, pos: ppos(pk: pk))
     set_p(ps: ps, v: ppos(pk: pk2))
-    let %out = bb_push_uleb128(buf: %out, val: pval(pk: pk2))
+    let %out = bb_push_uleb128(buf: %out, val: pval(pk: pk2) + tbl_off)
     return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos,
       remap: remap, glo_off: glo_off, type_off: type_off, tbl_off: tbl_off)
   end
@@ -481,6 +484,37 @@ let rw_instrs = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, end_pos: i64,
     let %out = bb_push_uleb128(buf: %out, val: sub_op)
     set_p(ps: ps, v: ppos(pk: pk))
     let %out = rw_fc_prefix(ps: ps, out: %out, src: src, sub_op: sub_op)
+    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos,
+      remap: remap, glo_off: glo_off, type_off: type_off, tbl_off: tbl_off)
+  end
+  if cls == 11 then
+    // call / return_call: remap function index via smap
+    let pos2 = get_p(ps: ps)
+    let pk = rd_uleb(buf: src, pos: pos2)
+    let old_idx = pval(pk: pk)
+    set_p(ps: ps, v: ppos(pk: pk))
+    let new_idx = __nx_smap_get(id: remap, key: from_i64(val: old_idx), default_val: old_idx)
+    let %out = bb_push_uleb128(buf: %out, val: new_idx)
+    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos,
+      remap: remap, glo_off: glo_off, type_off: type_off, tbl_off: tbl_off)
+  end
+  if cls == 12 then
+    // global.get / global.set: add glo_off to index
+    let pos2 = get_p(ps: ps)
+    let pk = rd_uleb(buf: src, pos: pos2)
+    set_p(ps: ps, v: ppos(pk: pk))
+    let %out = bb_push_uleb128(buf: %out, val: pval(pk: pk) + glo_off)
+    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos,
+      remap: remap, glo_off: glo_off, type_off: type_off, tbl_off: tbl_off)
+  end
+  if cls == 13 then
+    // ref.func: remap function index via smap
+    let pos2 = get_p(ps: ps)
+    let pk = rd_uleb(buf: src, pos: pos2)
+    let old_idx = pval(pk: pk)
+    set_p(ps: ps, v: ppos(pk: pk))
+    let new_idx = __nx_smap_get(id: remap, key: from_i64(val: old_idx), default_val: old_idx)
+    let %out = bb_push_uleb128(buf: %out, val: new_idx)
     return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos,
       remap: remap, glo_off: glo_off, type_off: type_off, tbl_off: tbl_off)
   end
@@ -675,24 +709,23 @@ let copy_wasi_imports = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, pos: i6
   return copy_wasi_imports(ps: ps, out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
 end
 
+let maybe_copy_func_types = fn (buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64, off: i64) -> %ByteBuffer do
+  if sec_pk > 0 then
+    return copy_func_types_with_off(out: %buf, buf: src, sec_pk: sec_pk, off: off)
+  end
+  return %buf
+end
+
 let emit_merged_funcs = fn (out: %ByteBuffer,
-    main: &ByteBuffer, m_func_sec: i64,
-    dep: &ByteBuffer, d_func_sec: i64,
+    m_buf: &ByteBuffer, m_func_sec: i64, m_count: i64,
+    d_buf: &ByteBuffer, d_func_sec: i64, d_count: i64,
     stub_types: i64, n_stubs: i64,
     d_type_off: i64) -> %ByteBuffer do
   let %tmp = buf_empty()
-  let m_count = count_sec(buf: main, sec_pk: m_func_sec)
-  let d_count = count_sec(buf: dep, sec_pk: d_func_sec)
   let %tmp = bb_push_uleb128(buf: %tmp, val: n_stubs + d_count + m_count)
   let %tmp = emit_stub_type_indices(out: %tmp, stub_types: stub_types, i: 0, n: n_stubs)
-  if d_func_sec > 0 then
-    let %tmp = copy_func_types_with_off(out: %tmp, buf: dep, sec_pk: d_func_sec, off: d_type_off)
-  end
-  if m_func_sec > 0 then
-    let body = sec_body(buf: main, sec_pk: m_func_sec)
-    let %tmp = buf_copy_range(dst: %tmp, src: main, start: body,
-      end_pos: sec_off(pk: m_func_sec) + sec_sz(pk: m_func_sec))
-  end
+  let %tmp = maybe_copy_func_types(buf: %tmp, src: d_buf, sec_pk: d_func_sec, off: d_type_off)
+  let %tmp = copy_sec_body(buf: %tmp, src: m_buf, sec_pk: m_func_sec)
   let %out = emit_sec(out: %out, sec_id: 3, content: &tmp)
   buf_free(buf: %tmp)
   return %out
@@ -717,34 +750,28 @@ let copy_func_types_go = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remai
   return copy_func_types_go(out: %out, buf: buf, pos: ppos(pk: pk), remaining: remaining - 1, off: off)
 end
 
-let emit_merged_globals = fn (out: %ByteBuffer, main: &ByteBuffer, m_sec: i64,
-    dep: &ByteBuffer, d_sec: i64) -> %ByteBuffer do
-  let m_count = count_sec(buf: main, sec_pk: m_sec)
-  let d_count = count_sec(buf: dep, sec_pk: d_sec)
+let emit_merged_globals = fn (out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
+    d_buf: &ByteBuffer, d_sec: i64) -> %ByteBuffer do
+  let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
+  let d_count = count_sec(buf: d_buf, sec_pk: d_sec)
   if m_count + d_count == 0 then return %out end
   let %tmp = buf_empty()
   let %tmp = bb_push_uleb128(buf: %tmp, val: d_count + m_count)
-  if d_sec > 0 then
-    let body = sec_body(buf: dep, sec_pk: d_sec)
-    let %tmp = buf_copy_range(dst: %tmp, src: dep, start: body, end_pos: sec_off(pk: d_sec) + sec_sz(pk: d_sec))
-  end
-  if m_sec > 0 then
-    let body = sec_body(buf: main, sec_pk: m_sec)
-    let %tmp = buf_copy_range(dst: %tmp, src: main, start: body, end_pos: sec_off(pk: m_sec) + sec_sz(pk: m_sec))
-  end
+  let %tmp = copy_sec_body(buf: %tmp, src: d_buf, sec_pk: d_sec)
+  let %tmp = copy_sec_body(buf: %tmp, src: m_buf, sec_pk: m_sec)
   let %out = emit_sec(out: %out, sec_id: 6, content: &tmp)
   buf_free(buf: %tmp)
   return %out
 end
 
-let emit_remapped_exports = fn (ps: i64, out: %ByteBuffer, main: &ByteBuffer, m_sec: i64,
+let emit_remapped_exports = fn (ps: i64, out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
     remap: i64) -> %ByteBuffer do
   if m_sec == 0 then return %out end
   let %tmp = buf_empty()
-  let pk = rd_uleb(buf: main, pos: sec_off(pk: m_sec))
+  let pk = rd_uleb(buf: m_buf, pos: sec_off(pk: m_sec))
   let count = pval(pk: pk)
   let %tmp = bb_push_uleb128(buf: %tmp, val: count)
-  let %tmp = remap_export_entries(ps: ps, out: %tmp, buf: main, pos: ppos(pk: pk),
+  let %tmp = remap_export_entries(ps: ps, out: %tmp, buf: m_buf, pos: ppos(pk: pk),
     remaining: count, remap: remap)
   let %out = emit_sec(out: %out, sec_id: 7, content: &tmp)
   buf_free(buf: %tmp)
@@ -772,26 +799,29 @@ let remap_export_entries = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, pos:
   return remap_export_entries(ps: ps, out: %out, buf: buf, pos: pos3, remaining: remaining - 1, remap: remap)
 end
 
+let maybe_rewrite_bodies = fn (ps: i64, buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64,
+    remap: i64, glo_off: i64, type_off: i64, tbl_off: i64) -> %ByteBuffer do
+  if sec_pk > 0 then
+    return rewrite_code_bodies(ps: ps, out: %buf, src: src, sec_pk: sec_pk,
+      remap: remap, glo_off: glo_off, type_off: type_off, tbl_off: tbl_off)
+  end
+  return %buf
+end
+
 let emit_merged_code = fn (ps: i64, out: %ByteBuffer,
-    main: &ByteBuffer, m_code_sec: i64, remap_m: i64,
-    dep: &ByteBuffer, d_code_sec: i64, remap_d: i64,
-    stub_types: i64, n_stubs: i64,
+    m_buf: &ByteBuffer, m_code_sec: i64, remap_m: i64, m_count: i64,
+    d_buf: &ByteBuffer, d_code_sec: i64, remap_d: i64, d_count: i64,
+    n_stubs: i64,
     m_glo_off: i64, d_glo_off: i64,
     m_type_off: i64, d_type_off: i64,
     m_tbl_off: i64, d_tbl_off: i64) -> %ByteBuffer do
   let %tmp = buf_empty()
-  let m_count = count_sec(buf: main, sec_pk: m_code_sec)
-  let d_count = count_sec(buf: dep, sec_pk: d_code_sec)
   let %tmp = bb_push_uleb128(buf: %tmp, val: n_stubs + d_count + m_count)
   let %tmp = emit_stub_bodies(out: %tmp, i: 0, n: n_stubs)
-  if d_code_sec > 0 then
-    let %tmp = rewrite_code_bodies(ps: ps, out: %tmp, src: dep, sec_pk: d_code_sec,
-      remap: remap_d, glo_off: d_glo_off, type_off: d_type_off, tbl_off: d_tbl_off)
-  end
-  if m_code_sec > 0 then
-    let %tmp = rewrite_code_bodies(ps: ps, out: %tmp, src: main, sec_pk: m_code_sec,
-      remap: remap_m, glo_off: m_glo_off, type_off: m_type_off, tbl_off: m_tbl_off)
-  end
+  let %tmp = maybe_rewrite_bodies(ps: ps, buf: %tmp, src: d_buf, sec_pk: d_code_sec,
+    remap: remap_d, glo_off: d_glo_off, type_off: d_type_off, tbl_off: d_tbl_off)
+  let %tmp = maybe_rewrite_bodies(ps: ps, buf: %tmp, src: m_buf, sec_pk: m_code_sec,
+    remap: remap_m, glo_off: m_glo_off, type_off: m_type_off, tbl_off: m_tbl_off)
   let %out = emit_sec(out: %out, sec_id: 10, content: &tmp)
   buf_free(buf: %tmp)
   return %out
@@ -831,40 +861,37 @@ let rewrite_code_go = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, pos: i64,
     remap: remap, glo_off: glo_off, type_off: type_off, tbl_off: tbl_off)
 end
 
-let emit_merged_data = fn (out: %ByteBuffer, main: &ByteBuffer, m_sec: i64,
-    dep: &ByteBuffer, d_sec: i64) -> %ByteBuffer do
-  let m_count = count_sec(buf: main, sec_pk: m_sec)
-  let d_count = count_sec(buf: dep, sec_pk: d_sec)
+let emit_merged_data = fn (out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
+    d_buf: &ByteBuffer, d_sec: i64) -> %ByteBuffer do
+  let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
+  let d_count = count_sec(buf: d_buf, sec_pk: d_sec)
   if m_count + d_count == 0 then return %out end
   let %tmp = buf_empty()
   let %tmp = bb_push_uleb128(buf: %tmp, val: d_count + m_count)
-  if d_sec > 0 then
-    let body = sec_body(buf: dep, sec_pk: d_sec)
-    let %tmp = buf_copy_range(dst: %tmp, src: dep, start: body, end_pos: sec_off(pk: d_sec) + sec_sz(pk: d_sec))
-  end
-  if m_sec > 0 then
-    let body = sec_body(buf: main, sec_pk: m_sec)
-    let %tmp = buf_copy_range(dst: %tmp, src: main, start: body, end_pos: sec_off(pk: m_sec) + sec_sz(pk: m_sec))
-  end
+  let %tmp = copy_sec_body(buf: %tmp, src: d_buf, sec_pk: d_sec)
+  let %tmp = copy_sec_body(buf: %tmp, src: m_buf, sec_pk: m_sec)
   let %out = emit_sec(out: %out, sec_id: 11, content: &tmp)
   buf_free(buf: %tmp)
   return %out
 end
 
+let maybe_remap_elem = fn (ps: i64, buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64, remap: i64) -> %ByteBuffer do
+  if sec_pk > 0 then
+    return remap_elem_segments(ps: ps, out: %buf, buf: src, sec_pk: sec_pk, remap: remap)
+  end
+  return %buf
+end
+
 let emit_merged_elements = fn (ps: i64, out: %ByteBuffer,
-    dep: &ByteBuffer, d_sec: i64, remap_d: i64,
-    main: &ByteBuffer, m_sec: i64, remap_m: i64) -> %ByteBuffer do
-  let d_count = count_sec(buf: dep, sec_pk: d_sec)
-  let m_count = count_sec(buf: main, sec_pk: m_sec)
+    d_buf: &ByteBuffer, d_sec: i64, remap_d: i64,
+    m_buf: &ByteBuffer, m_sec: i64, remap_m: i64) -> %ByteBuffer do
+  let d_count = count_sec(buf: d_buf, sec_pk: d_sec)
+  let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
   if d_count + m_count == 0 then return %out end
   let %tmp = buf_empty()
   let %tmp = bb_push_uleb128(buf: %tmp, val: d_count + m_count)
-  if d_sec > 0 then
-    let %tmp = remap_elem_segments(ps: ps, out: %tmp, buf: dep, sec_pk: d_sec, remap: remap_d)
-  end
-  if m_sec > 0 then
-    let %tmp = remap_elem_segments(ps: ps, out: %tmp, buf: main, sec_pk: m_sec, remap: remap_m)
-  end
+  let %tmp = maybe_remap_elem(ps: ps, buf: %tmp, src: d_buf, sec_pk: d_sec, remap: remap_d)
+  let %tmp = maybe_remap_elem(ps: ps, buf: %tmp, src: m_buf, sec_pk: m_sec, remap: remap_m)
   let %out = emit_sec(out: %out, sec_id: 9, content: &tmp)
   buf_free(buf: %tmp)
   return %out
@@ -944,46 +971,25 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   let d_glo = count_sec(buf: &dep, sec_pk: get_sec(map: d_secs, sec: 6))
   let d_tbl_count = count_sec(buf: &dep, sec_pk: get_sec(map: d_secs, sec: 4))
 
-  // debug values available for caller to inspect
-
-  // Assemble output
-  let %out = buf_empty()
-  let %out = bb_push_byte(buf: %out, byte: 0)
-  let %out = bb_push_string(buf: %out, s: "asm")
-  let %out = bb_push_byte(buf: %out, byte: 1)
-  let %out = bb_push_byte(buf: %out, byte: 0)
-  let %out = bb_push_byte(buf: %out, byte: 0)
-  let %out = bb_push_byte(buf: %out, byte: 0)
-
-  // Type section — inlined to avoid function-call argument mismatch issues
-  let m_ts = get_sec(map: m_secs, sec: 1)
-  let d_ts = get_sec(map: d_secs, sec: 1)
-  let %out = emit_merged_types_inline(out: %out, m_buf: &core_wasm, m_sec: m_ts, d_buf: &dep, d_sec: d_ts)
-  let %out = emit_kept_imports(ps: ps, out: %out, dep: &dep, d_imp_sec: get_sec(map: d_secs, sec: 2))
-  let %out = emit_merged_funcs(out: %out,
-    main: &core_wasm, m_func_sec: get_sec(map: m_secs, sec: 3),
-    dep: &dep, d_func_sec: get_sec(map: d_secs, sec: 3),
+  // Assemble output — split into small phases to avoid register pressure
+  let %out = assemble_header()
+  let %out = assemble_types_imports(ps: ps, out: %out,
+    m_buf: &core_wasm, m_secs: m_secs,
+    d_buf: &dep, d_secs: d_secs)
+  let %out = assemble_funcs_tables(out: %out,
+    m_buf: &core_wasm, m_secs: m_secs,
+    d_buf: &dep, d_secs: d_secs,
     stub_types: stub_types, n_stubs: n_stubs, d_type_off: d_type_off)
-  let %out = copy_raw_sec(out: %out, src: &dep, sec_pk: get_sec(map: d_secs, sec: 4), sec_id: 4)
-  let %out = copy_raw_sec(out: %out, src: &dep, sec_pk: get_sec(map: d_secs, sec: 5), sec_id: 5)
-  // Tag section (13) goes between memory(5) and global(6) per EH proposal
-  let %out = copy_raw_sec(out: %out, src: &core_wasm, sec_pk: get_sec(map: m_secs, sec: 13), sec_id: 13)
-  let %out = emit_merged_globals(out: %out, main: &core_wasm, m_sec: get_sec(map: m_secs, sec: 6),
-    dep: &dep, d_sec: get_sec(map: d_secs, sec: 6))
-  let %out = emit_remapped_exports(ps: ps, out: %out, main: &core_wasm, m_sec: get_sec(map: m_secs, sec: 7),
-    remap: remap_m)
-  let %out = emit_merged_elements(ps: ps, out: %out,
-    dep: &dep, d_sec: get_sec(map: d_secs, sec: 9), remap_d: remap_d,
-    main: &core_wasm, m_sec: get_sec(map: m_secs, sec: 9), remap_m: remap_m)
-  let %out = emit_merged_code(ps: ps, out: %out,
-    main: &core_wasm, m_code_sec: get_sec(map: m_secs, sec: 10), remap_m: remap_m,
-    dep: &dep, d_code_sec: get_sec(map: d_secs, sec: 10), remap_d: remap_d,
-    stub_types: stub_types, n_stubs: n_stubs,
-    m_glo_off: d_glo, d_glo_off: 0,
-    m_type_off: 0, d_type_off: d_type_off,
-    m_tbl_off: d_tbl_count, d_tbl_off: 0)
-  let %out = emit_merged_data(out: %out, main: &core_wasm, m_sec: get_sec(map: m_secs, sec: 11),
-    dep: &dep, d_sec: get_sec(map: d_secs, sec: 11))
+  let %out = assemble_globals_exports_elems(ps: ps, out: %out,
+    m_buf: &core_wasm, m_secs: m_secs,
+    d_buf: &dep, d_secs: d_secs,
+    remap_m: remap_m, remap_d: remap_d)
+  let %out = assemble_code_data(ps: ps, out: %out,
+    m_buf: &core_wasm, m_secs: m_secs,
+    d_buf: &dep, d_secs: d_secs,
+    remap_m: remap_m, remap_d: remap_d,
+    n_stubs: n_stubs,
+    d_glo: d_glo, d_type_off: d_type_off, d_tbl_count: d_tbl_count)
 
   __nx_smap_free(id: ps)
   __nx_smap_free(id: m_secs)
@@ -995,5 +1001,80 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   buf_free(buf: %dep)
   buf_free(buf: %core_wasm)
 
+  return %out
+end
+
+let assemble_header = fn () -> %ByteBuffer do
+  let %out = buf_empty()
+  let %out = bb_push_byte(buf: %out, byte: 0)
+  let %out = bb_push_string(buf: %out, s: "asm")
+  let %out = bb_push_byte(buf: %out, byte: 1)
+  let %out = bb_push_byte(buf: %out, byte: 0)
+  let %out = bb_push_byte(buf: %out, byte: 0)
+  let %out = bb_push_byte(buf: %out, byte: 0)
+  return %out
+end
+
+let assemble_types_imports = fn (ps: i64, out: %ByteBuffer,
+    m_buf: &ByteBuffer, m_secs: i64,
+    d_buf: &ByteBuffer, d_secs: i64) -> %ByteBuffer do
+  let m_ts = get_sec(map: m_secs, sec: 1)
+  let d_ts = get_sec(map: d_secs, sec: 1)
+  let %out = emit_merged_types_inline(out: %out, m_buf: m_buf, m_sec: m_ts, d_buf: d_buf, d_sec: d_ts)
+  let %out = emit_kept_imports(ps: ps, out: %out, dep: d_buf, d_imp_sec: get_sec(map: d_secs, sec: 2))
+  return %out
+end
+
+let assemble_funcs_tables = fn (out: %ByteBuffer,
+    m_buf: &ByteBuffer, m_secs: i64,
+    d_buf: &ByteBuffer, d_secs: i64,
+    stub_types: i64, n_stubs: i64, d_type_off: i64) -> %ByteBuffer do
+  let m_func_pk = get_sec(map: m_secs, sec: 3)
+  let d_func_pk = get_sec(map: d_secs, sec: 3)
+  let m_func_count = count_sec(buf: m_buf, sec_pk: m_func_pk)
+  let d_func_count = count_sec(buf: d_buf, sec_pk: d_func_pk)
+  let %out = emit_merged_funcs(out: %out,
+    m_buf: m_buf, m_func_sec: m_func_pk, m_count: m_func_count,
+    d_buf: d_buf, d_func_sec: d_func_pk, d_count: d_func_count,
+    stub_types: stub_types, n_stubs: n_stubs, d_type_off: d_type_off)
+  let %out = copy_raw_sec(out: %out, src: d_buf, sec_pk: get_sec(map: d_secs, sec: 4), sec_id: 4)
+  let %out = copy_raw_sec(out: %out, src: d_buf, sec_pk: get_sec(map: d_secs, sec: 5), sec_id: 5)
+  let %out = copy_raw_sec(out: %out, src: m_buf, sec_pk: get_sec(map: m_secs, sec: 13), sec_id: 13)
+  return %out
+end
+
+let assemble_globals_exports_elems = fn (ps: i64, out: %ByteBuffer,
+    m_buf: &ByteBuffer, m_secs: i64,
+    d_buf: &ByteBuffer, d_secs: i64,
+    remap_m: i64, remap_d: i64) -> %ByteBuffer do
+  let %out = emit_merged_globals(out: %out, m_buf: m_buf, m_sec: get_sec(map: m_secs, sec: 6),
+    d_buf: d_buf, d_sec: get_sec(map: d_secs, sec: 6))
+  let %out = emit_remapped_exports(ps: ps, out: %out, m_buf: m_buf, m_sec: get_sec(map: m_secs, sec: 7),
+    remap: remap_m)
+  let %out = emit_merged_elements(ps: ps, out: %out,
+    d_buf: d_buf, d_sec: get_sec(map: d_secs, sec: 9), remap_d: remap_d,
+    m_buf: m_buf, m_sec: get_sec(map: m_secs, sec: 9), remap_m: remap_m)
+  return %out
+end
+
+let assemble_code_data = fn (ps: i64, out: %ByteBuffer,
+    m_buf: &ByteBuffer, m_secs: i64,
+    d_buf: &ByteBuffer, d_secs: i64,
+    remap_m: i64, remap_d: i64,
+    n_stubs: i64,
+    d_glo: i64, d_type_off: i64, d_tbl_count: i64) -> %ByteBuffer do
+  let m_code_pk = get_sec(map: m_secs, sec: 10)
+  let d_code_pk = get_sec(map: d_secs, sec: 10)
+  let m_code_count = count_sec(buf: m_buf, sec_pk: m_code_pk)
+  let d_code_count = count_sec(buf: d_buf, sec_pk: d_code_pk)
+  let %out = emit_merged_code(ps: ps, out: %out,
+    m_buf: m_buf, m_code_sec: m_code_pk, remap_m: remap_m, m_count: m_code_count,
+    d_buf: d_buf, d_code_sec: d_code_pk, remap_d: remap_d, d_count: d_code_count,
+    n_stubs: n_stubs,
+    m_glo_off: d_glo, d_glo_off: 0,
+    m_type_off: 0, d_type_off: d_type_off,
+    m_tbl_off: d_tbl_count, d_tbl_off: 0)
+  let %out = emit_merged_data(out: %out, m_buf: m_buf, m_sec: get_sec(map: m_secs, sec: 11),
+    d_buf: d_buf, d_sec: get_sec(map: d_secs, sec: 11))
   return %out
 end
