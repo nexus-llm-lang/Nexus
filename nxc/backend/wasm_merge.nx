@@ -204,12 +204,85 @@ let count_func_imps_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64
   return count_func_imps_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc + inc)
 end
 
+// ─── Main non-stdlib import counting ─────────────────────────────────────
+// Count ALL main imports that are NOT from nexus:stdlib/* (for import section entry count)
+let count_main_kept_imps = fn (ps: i64, buf: &ByteBuffer, sec_pk: i64) -> i64 do
+  if sec_pk == 0 then return 0 end
+  let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
+  return count_main_kept_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), acc: 0)
+end
+let count_main_kept_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64, acc: i64) -> i64 do
+  if remaining <= 0 then return acc end
+  let mod_name = rd_str(ps: ps, buf: buf, pos: pos)
+  let pos2 = get_p(ps: ps)
+  let _name = rd_str(ps: ps, buf: buf, pos: pos2)
+  let pos3 = get_p(ps: ps)
+  let pos4 = skip_imp_desc(buf: buf, pos: pos3)
+  if starts_with(s: mod_name, prefix: "nexus:stdlib/") then
+    return count_main_kept_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
+  end
+  return count_main_kept_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc + 1)
+end
+
+// Count main FUNCTION imports that are NOT from nexus:stdlib/* (for function index layout)
+let count_main_kept_func_imps = fn (ps: i64, buf: &ByteBuffer, sec_pk: i64) -> i64 do
+  if sec_pk == 0 then return 0 end
+  let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
+  return count_main_kept_func_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), acc: 0)
+end
+let count_main_kept_func_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64, acc: i64) -> i64 do
+  if remaining <= 0 then return acc end
+  let mod_name = rd_str(ps: ps, buf: buf, pos: pos)
+  let pos2 = get_p(ps: ps)
+  let _name = rd_str(ps: ps, buf: buf, pos: pos2)
+  let pos3 = get_p(ps: ps)
+  let kind = get_byte(buf: buf, idx: pos3)
+  let pos4 = skip_imp_desc(buf: buf, pos: pos3)
+  if kind == 0 then
+    if starts_with(s: mod_name, prefix: "nexus:stdlib/") then
+      return count_main_kept_func_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
+    end
+    return count_main_kept_func_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc + 1)
+  end
+  return count_main_kept_func_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
+end
+
+// ─── Main non-stdlib import copying ──────────────────────────────────────
+// Copy main's non-stdlib function imports to output (no type offset needed — main types first)
+let copy_main_kept_imps = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
+  if sec_pk == 0 then return %out end
+  let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
+  return copy_main_kept_go(ps: ps, out: %out, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk))
+end
+let copy_main_kept_go = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let start = pos
+  let mod_name = rd_str(ps: ps, buf: buf, pos: pos)
+  let pos2 = get_p(ps: ps)
+  let _name = rd_str(ps: ps, buf: buf, pos: pos2)
+  let pos3 = get_p(ps: ps)
+  let kind = get_byte(buf: buf, idx: pos3)
+  let pos4 = skip_imp_desc(buf: buf, pos: pos3)
+  // Skip all nexus:stdlib/* imports (already resolved to dep exports)
+  if starts_with(s: mod_name, prefix: "nexus:stdlib/") then
+    return copy_main_kept_go(ps: ps, out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
+  end
+  // Non-stdlib import: copy as-is (type indices correct — main types first)
+  let %out = buf_copy_range(dst: %out, src: buf, start: start, end_pos: pos4)
+  return copy_main_kept_go(ps: ps, out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
+end
+
 // ─── Main import resolution ───────────────────────────────────────────────
 // For each main function import from nexus:stdlib/*, resolve to dep export.
+// For each main function import NOT from nexus:stdlib/*, remap to its new
+// position in the merged import section (kept_fimp + kept_idx).
 // Populate remap smap: from_i64(old_main_fidx) -> new_merged_fidx.
-// Context keys in ps: "remap", "dep_exp", "kept", "stubs"
+// Context keys in ps: "remap", "dep_exp", "kept", "stubs", "m_imp_base", "m_kept_idx"
+//   "kept" = dep_fimp + m_kept (base for remap_dep_func: dep locals start here)
+//   "m_imp_base" = dep_fimp (base for non-stdlib main imports)
 let resolve_main_imports = fn (ps: i64, buf: &ByteBuffer, sec_pk: i64) -> unit do
   if sec_pk > 0 then
+    __nx_smap_put(id: ps, key: "m_kept_idx", value: 0)
     let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
     resolve_main_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), fidx: 0)
   end
@@ -224,6 +297,7 @@ let resolve_main_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64, f
     let pos4 = skip_imp_desc(buf: buf, pos: pos3)
     if kind == 0 then
       if starts_with(s: mod_name, prefix: "nexus:stdlib/") then
+        // Stdlib import: resolve to dep export
         let dep_exports = __nx_smap_get(id: ps, key: "dep_exp", default_val: 0)
         let exp_name = wit_to_export(wit_name: func_name)
         let dep_raw = __nx_smap_get(id: dep_exports, key: exp_name, default_val: 0)
@@ -231,12 +305,19 @@ let resolve_main_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64, f
           let dep_fidx = dep_raw - 1
           let kept_fimp = __nx_smap_get(id: ps, key: "kept", default_val: 0)
           let n_stubs = __nx_smap_get(id: ps, key: "stubs", default_val: 0)
-          let dep_fimp = kept_fimp + n_stubs
+          let orig_dep_fimp = __nx_smap_get(id: ps, key: "dep_fimp", default_val: 0)
           let new_idx = remap_dep_func(dep_fidx: dep_fidx, kept_fimp: kept_fimp,
-                                       n_stubs: n_stubs, dep_fimp: dep_fimp)
+                                       n_stubs: n_stubs, dep_fimp: orig_dep_fimp)
           let remap = __nx_smap_get(id: ps, key: "remap", default_val: 0)
           __nx_smap_put(id: remap, key: from_i64(val: fidx), value: new_idx)
         end
+      else
+        // Non-stdlib function import: remap to m_imp_base + m_kept_idx
+        let m_imp_base = __nx_smap_get(id: ps, key: "m_imp_base", default_val: 0)
+        let m_kept_idx = __nx_smap_get(id: ps, key: "m_kept_idx", default_val: 0)
+        let remap = __nx_smap_get(id: ps, key: "remap", default_val: 0)
+        __nx_smap_put(id: remap, key: from_i64(val: fidx), value: m_imp_base + m_kept_idx)
+        __nx_smap_put(id: ps, key: "m_kept_idx", value: m_kept_idx + 1)
       end
       resolve_main_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, fidx: fidx + 1)
     else
@@ -974,22 +1055,35 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   let m_fimp = count_func_imps(ps: ps, buf: &core_wasm, sec_pk: get_sec(map: m_secs, sec: 2))
   let m_loc = count_sec(buf: &core_wasm, sec_pk: get_sec(map: m_secs, sec: 3))
 
+  // Count main's non-stdlib imports
+  let m_imp_sec_pk = get_sec(map: m_secs, sec: 2)
+  // m_kept_all = ALL non-stdlib imports (for import section entry count)
+  let m_kept_all = count_main_kept_imps(ps: ps, buf: &core_wasm, sec_pk: m_imp_sec_pk)
+  // m_kept = non-stdlib FUNCTION imports only (for function index layout)
+  let m_kept = count_main_kept_func_imps(ps: ps, buf: &core_wasm, sec_pk: m_imp_sec_pk)
+
   // Force identity remap for dep imports (all WASI, indices unchanged)
   // scan_dep_imp_go has context reading issues that misclassify some WASI imports
   remap_range(remap: remap_d, i: 0, end_idx: dep_fimp, base: 0, origin: 0)
+  // Dep locals start after: dep WASI imports + main non-stdlib func imports + stubs
   remap_dep_locals(remap: remap_d, dep_fimp: dep_fimp, d_loc: d_loc,
-    kept_fimp: kept_fimp, n_stubs: n_stubs)
+    kept_fimp: kept_fimp + m_kept, n_stubs: n_stubs)
 
   let remap_m = __nx_smap_new()
   // Store context for resolve_main_imports
+  // "kept" = dep_fimp + m_kept (base for remap_dep_func: dep locals start after all func imports)
+  // "m_imp_base" = dep_fimp (base for non-stdlib main func imports, right after dep WASI imports)
   __nx_smap_put(id: ps, key: "remap", value: remap_m)
   __nx_smap_put(id: ps, key: "dep_exp", value: dep_exports)
-  __nx_smap_put(id: ps, key: "kept", value: kept_fimp)
+  __nx_smap_put(id: ps, key: "kept", value: kept_fimp + m_kept)
+  __nx_smap_put(id: ps, key: "m_imp_base", value: kept_fimp)
+  __nx_smap_put(id: ps, key: "dep_fimp", value: dep_fimp)
   __nx_smap_put(id: ps, key: "stubs", value: n_stubs)
-  resolve_main_imports(ps: ps, buf: &core_wasm, sec_pk: get_sec(map: m_secs, sec: 2))
+  resolve_main_imports(ps: ps, buf: &core_wasm, sec_pk: m_imp_sec_pk)
 
+  // Main locals start after: dep WASI imports + main non-stdlib func imports + stubs + dep locals
   remap_main_locals(remap: remap_m, m_fimp: m_fimp, m_loc: m_loc,
-    kept_fimp: kept_fimp, n_stubs: n_stubs, d_loc: d_loc)
+    kept_fimp: kept_fimp + m_kept, n_stubs: n_stubs, d_loc: d_loc)
 
   let d_glo = count_sec(buf: &dep, sec_pk: get_sec(map: d_secs, sec: 6))
   let d_tbl_count = count_sec(buf: &dep, sec_pk: get_sec(map: d_secs, sec: 4))
@@ -1003,11 +1097,23 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
     m_buf: &core_wasm, m_sec: get_sec(map: m_secs, sec: 1),
     d_buf: &dep, d_sec: get_sec(map: d_secs, sec: 1))
 
-  // Section 2: kept imports from dep (all WASI)
-  // Must offset type indices by d_type_off since merged types have main first, dep second
+  // Section 2: merged imports (dep WASI imports + main non-stdlib imports)
+  // Dep imports need type offset (dep types come second in merged type section)
+  // Main non-stdlib imports need no type offset (main types come first)
   let d_imp_pk = get_sec(map: d_secs, sec: 2)
-  let %out = emit_imports_with_offset(ps: ps, out: %out, dep: &dep,
-    d_imp_pk: d_imp_pk, type_off: d_type_off)
+  let dep_imp_count = count_sec(buf: &dep, sec_pk: d_imp_pk)
+  let total_imp_count = dep_imp_count + m_kept_all
+  let %tmp_i = buf_empty()
+  let %tmp_i = bb_push_uleb128(buf: %tmp_i, val: total_imp_count)
+  // Copy dep imports with type offset
+  let %tmp_i = if d_imp_pk > 0 then
+    copy_imports_with_type_off(ps: ps, out: %tmp_i, buf: &dep,
+      pos: sec_body(buf: &dep, sec_pk: d_imp_pk), remaining: dep_imp_count, type_off: d_type_off)
+  else %tmp_i end
+  // Copy main's non-stdlib imports (type indices already correct — main types first)
+  let %tmp_i = copy_main_kept_imps(ps: ps, out: %tmp_i, buf: &core_wasm, sec_pk: m_imp_sec_pk)
+  let %out = emit_sec(out: %out, sec_id: 2, content: &tmp_i)
+  buf_free(buf: %tmp_i)
 
   // Section 3: merged func types (count + dep with type offset + main)
   let d_func_sec_pk = get_sec(map: d_secs, sec: 3)
