@@ -195,11 +195,11 @@ pub(super) fn emit_numeric_coercion(
         }
     }
     match (from, to) {
-        (Type::I64, Type::I32) => {
+        (Type::I64, Type::I32) | (Type::I64, Type::Bool) => {
             out.instruction(&Instruction::I32WrapI64);
             Ok(())
         }
-        (Type::I32, Type::I64) => {
+        (Type::I32, Type::I64) | (Type::Bool, Type::I64) => {
             out.instruction(&Instruction::I64ExtendI32S);
             Ok(())
         }

@@ -73,8 +73,6 @@ if nxc_cache_valid; then
   cp "$NXC_CACHE" "$STAGE0"
 else
   info "Stage 0: nexus build $NXC_ENTRY → $STAGE0"
-  # Trigger nxc cache rebuild
-  "$NEXUS" nxc >/dev/null 2>&1 || true
   if [[ -f "$NXC_CACHE" ]]; then
     cp "$NXC_CACHE" "$STAGE0"
     mkdir -p "$(dirname "$NXC_CACHE_COMMIT")"

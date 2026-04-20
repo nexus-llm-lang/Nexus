@@ -23,7 +23,10 @@ use crate::constants::{Permission, ENTRYPOINT, NEXUS_CAPABILITIES_SECTION};
 use crate::lang::ast::Program;
 use crate::types::Type;
 
-const STRING_DATA_BASE: u32 = 16;
+/// Base offset for string literals. Always 0 — the merge code relocates data
+/// segments to dep_data_end and patches the str_base global at merge time.
+/// Must match nxc/backend/wasm_defs.nx.
+const STRING_DATA_BASE: u32 = 0;
 const OBJECT_HEAP_GLOBAL_INDEX: u32 = 0;
 /// String allocations share the object heap (G0).
 const STRING_HEAP_GLOBAL_INDEX: u32 = 0;
