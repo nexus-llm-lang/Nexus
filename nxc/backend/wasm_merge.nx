@@ -1,10 +1,10 @@
 import { ByteBuffer, buf_empty, buf_free, read_binary_file, length as buf_length,
          push_byte as bb_push_byte, push_uleb128 as bb_push_uleb128, push_sleb128 as bb_push_sleb128,
          push_string as bb_push_string, push_buf as bb_push_buf,
-         get_byte, to_string as bb_to_string, buf_copy_range, buf_truncate,
+         get_byte, to_string as bb_to_string, buf_copy_range, buf_truncate, write_file,
          __nx_buf_new, __nx_buf_push_i32_le, __nx_buf_get_byte,
          __nx_buf_free as __nx_buf_free_raw } from "stdlib/bytebuffer.nx"
-import { __nx_smap_new, __nx_smap_put, __nx_smap_get, __nx_smap_has, __nx_smap_free } from "stdlib/stringmap.nx"
+import { __nx_smap_new, __nx_smap_put, __nx_smap_get, __nx_smap_has, __nx_smap_free, __nx_smap_size } from "stdlib/stringmap.nx"
 import { from_i64, starts_with, contains as str_contains, byte_length, char_code } from "stdlib/string.nx"
 
 // ─── Dense i32 array (int→int table) ─────────────────────────────────────
@@ -230,21 +230,25 @@ let parse_dep_exports = fn (ps: i64, buf: &ByteBuffer, sec_pk: i64) -> i64 do
   if sec_pk == 0 then return map end
   let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
   let count = pval(pk: pk)
-  parse_dep_exports_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: count, map: map)
+  // Stash `map` in ps smap — keeps parse_dep_exports_go at 4 params to
+  // avoid the nxc codegen bug that hits 5-param tail-recursive functions.
+  let _r0 = __nx_smap_put(id: ps, key: "_dep_exp_map", value: map)
+  parse_dep_exports_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: count)
   return map
 end
-let parse_dep_exports_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64, map: i64) -> unit do
-  if remaining > 0 then
-    let name = rd_str(ps: ps, buf: buf, pos: pos)
-    let pos2 = get_p(ps: ps)
-    let kind = get_byte(buf: buf, idx: pos2)
-    let pk = rd_uleb(buf: buf, pos: pos2 + 1)
-    let idx = pval(pk: pk)
-    if kind == 0 then
-      __nx_smap_put(id: map, key: name, value: idx + 1)
-    end
-    parse_dep_exports_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: remaining - 1, map: map)
+let parse_dep_exports_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64) -> unit do
+  if remaining <= 0 then return () end
+  let name = rd_str(ps: ps, buf: buf, pos: pos)
+  let pos2 = get_p(ps: ps)
+  let kind = get_byte(buf: buf, idx: pos2)
+  let pk = rd_uleb(buf: buf, pos: pos2 + 1)
+  let idx = pval(pk: pk)
+  if kind == 0 then
+    let map = __nx_smap_get(id: ps, key: "_dep_exp_map", default_val: 0)
+    let _r = __nx_smap_put(id: map, key: name, value: idx + 1)
+    return parse_dep_exports_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: remaining - 1)
   end
+  return parse_dep_exports_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: remaining - 1)
 end
 
 // Count function imports in a module (kind == 0x00)
@@ -278,8 +282,15 @@ let count_main_kept_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64
   let pos2 = get_p(ps: ps)
   let _name = rd_str(ps: ps, buf: buf, pos: pos2)
   let pos3 = get_p(ps: ps)
+  let kind = get_byte(buf: buf, idx: pos3)
   let pos4 = skip_imp_desc(buf: buf, pos: pos3)
   if starts_with(s: mod_name, prefix: "nexus:stdlib/") then
+    return count_main_kept_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
+  end
+  if byte_length(s: mod_name) == 0 then
+    return count_main_kept_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
+  end
+  if kind == 2 then
     return count_main_kept_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
   end
   return count_main_kept_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc + 1)
@@ -303,6 +314,9 @@ let count_main_kept_func_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining
     if starts_with(s: mod_name, prefix: "nexus:stdlib/") then
       return count_main_kept_func_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
     end
+    if byte_length(s: mod_name) == 0 then
+      return count_main_kept_func_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
+    end
     return count_main_kept_func_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc + 1)
   end
   return count_main_kept_func_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
@@ -315,6 +329,13 @@ let copy_main_kept_imps = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, sec_p
   let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
   return copy_main_kept_go(ps: ps, out: %out, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk))
 end
+// A main import is satisfied by dep (and dropped from merged imports) if:
+//   - module is "nexus:stdlib/*" (function, resolved to dep export), OR
+//   - module is "" (anonymous .memory/.allocate bound to dep-provided ones), OR
+//   - import kind is memory (merged declares its own memory).
+// Keeping main imports intact would require shifting dep's function indices by
+// m_kept, but remap_dep_func is identity (see remap_dep_func comment), so any
+// kept main import breaks dep internal calls.
 let copy_main_kept_go = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64) -> %ByteBuffer do
   if remaining <= 0 then return %out end
   let start = pos
@@ -324,8 +345,13 @@ let copy_main_kept_go = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, pos: i6
   let pos3 = get_p(ps: ps)
   let kind = get_byte(buf: buf, idx: pos3)
   let pos4 = skip_imp_desc(buf: buf, pos: pos3)
-  // Skip all nexus:stdlib/* imports (already resolved to dep exports)
   if starts_with(s: mod_name, prefix: "nexus:stdlib/") then
+    return copy_main_kept_go(ps: ps, out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
+  end
+  if byte_length(s: mod_name) == 0 then
+    return copy_main_kept_go(ps: ps, out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
+  end
+  if kind == 2 then
     return copy_main_kept_go(ps: ps, out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
   end
   // Non-stdlib import: copy as-is (type indices correct — main types first)
@@ -356,7 +382,10 @@ let resolve_main_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64, f
     let pos4 = skip_imp_desc(buf: buf, pos: pos3)
     if kind == 0 then
       let remap = __nx_smap_get(id: ps, key: "remap", default_val: 0)
-      let new_idx = if starts_with(s: mod_name, prefix: "nexus:stdlib/") then
+      // stdlib/* and empty-module function imports resolve to dep exports.
+      let is_dep = if starts_with(s: mod_name, prefix: "nexus:stdlib/") then true
+                   else byte_length(s: mod_name) == 0 end
+      let new_idx = if is_dep then
         let dep_exports = __nx_smap_get(id: ps, key: "dep_exp", default_val: 0)
         let raw_lookup = __nx_smap_get(id: dep_exports, key: func_name, default_val: 0)
         let dep_raw = if raw_lookup > 0 then raw_lookup
@@ -1133,11 +1162,13 @@ let remap_elem_go = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, pos: i64, r
   let kind = get_byte(buf: buf, idx: pos)
   let %out = bb_push_byte(buf: %out, byte: kind)
   if kind == 0 then
-    let %out = bb_push_byte(buf: %out, byte: get_byte(buf: buf, idx: pos + 1))
-    let end2 = rd_sleb(ps: ps, buf: buf, pos: pos + 2)
-    let %out = bb_push_sleb128(buf: %out, val: get_v(ps: ps))
-    let %out = bb_push_byte(buf: %out, byte: get_byte(buf: buf, idx: end2))
-    let pk = rd_uleb(buf: buf, pos: end2 + 1)
+    // Init expression: i32.const <sleb-offset> end — no remap needed.
+    // Bulk-copy the opcode + SLEB + end byte (scan_sleb_end finds terminal).
+    let sleb_start = pos + 2
+    let sleb_end = scan_sleb_end(buf: buf, pos: sleb_start)
+    // Copy [pos+1 .. sleb_end+1) — opcode + SLEB + end byte
+    let %out = buf_copy_range(dst: %out, src: buf, start: pos + 1, end_pos: sleb_end + 1)
+    let pk = rd_uleb(buf: buf, pos: sleb_end + 1)
     let n_funcs = pval(pk: pk)
     let %out = bb_push_uleb128(buf: %out, val: n_funcs)
     set_p(ps: ps, v: ppos(pk: pk))
