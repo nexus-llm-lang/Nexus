@@ -52,6 +52,20 @@ cargo build --release
 [[ -x "$NEXUS" ]] || fail "Nexus compiler not found at $NEXUS"
 info "Using Nexus compiler: $NEXUS (commit ${CURRENT_COMMIT:0:7})"
 
+# Stub stdlib.wasm to eliminate nexus:cli/nexus-host imports so that stage1+
+# core-wasm outputs can run directly in wasmtime without -S http. cargo build
+# regenerates stdlib.wasm fresh each time, so stub after build.
+STDLIB_WASM="nxlib/stdlib/stdlib.wasm"
+set +o pipefail
+if wasm-tools print "$STDLIB_WASM" 2>/dev/null | grep -q 'nexus:cli/'; then
+  set -o pipefail
+  info "Stubbing stdlib.wasm nexus:cli imports..."
+  python3 scripts/reorder_stdlib_imports.py "$STDLIB_WASM" >/dev/null
+  mv "${STDLIB_WASM}.stubbed" "$STDLIB_WASM"
+else
+  set -o pipefail
+fi
+
 # ─── Stage 0: Rust compiler → stage0.wasm ─────────────────────────────────
 # Try to reuse `nexus nxc` auto-cache (target/nxc/nxc_driver.wasm).
 # If the cache is valid, copy it as stage0 instead of recompiling.
