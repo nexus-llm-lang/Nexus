@@ -553,6 +553,15 @@ pub extern "C" fn __nx_buf_write_file(id: i64, path_ptr: i32, path_len: i32) -> 
 }
 
 #[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_buf_truncate(id: i64, len: i64) {
+    BUFS.with(|bufs| {
+        if let Some(buf) = bufs.borrow_mut().get_mut(&id) {
+            buf.truncate(len.max(0) as usize);
+        }
+    });
+}
+
+#[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_buf_free(id: i64) -> i32 {
     BUFS.with(|bufs| bufs.borrow_mut().remove(&id).is_some()) as i32
 }

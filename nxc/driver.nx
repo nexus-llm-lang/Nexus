@@ -28,7 +28,7 @@ import { lower_mir_to_lir } from "nxc/ir/lir.nx"
 import { optimize_lir } from "nxc/ir/lir_opt.nx"
 import { compile_lir_to_wasm, wrap_core_in_component } from "nxc/backend/codegen.nx"
 import { check_program } from "nxc/typecheck/check.nx"
-import { write_file, buf_free, length as buf_length } from "stdlib/bytebuffer.nx"
+import { write_file, buf_free, length as buf_length, read_binary_file, get_byte } from "stdlib/bytebuffer.nx"
 import { merge_with_stdlib } from "nxc/backend/wasm_merge.nx"
 import { Fs }, * as fs_mod from "stdlib/fs.nx"
 import { Console }, * as stdio from "stdlib/stdio.nx"
@@ -44,6 +44,42 @@ let str_list_length = fn (xs: [string]) -> i64 do
     case [] -> return 0
     case _ :: rest -> return 1 + str_list_length(xs: rest)
   end
+end
+
+// ─── Dep memory pages reader ────────────────────────────────────────────────
+// Read initial pages from a WASM binary's memory section (section 5).
+// Simple ULEB128 reader for small values.
+let rd_uleb_simple = fn (buf: &ByteBuffer, pos: i64) -> i64 do
+  let b0 = get_byte(buf: buf, idx: pos)
+  if b0 < 128 then return b0 end
+  let b1 = get_byte(buf: buf, idx: pos + 1)
+  if b1 < 128 then return (b0 % 128) + b1 * 128 end
+  let b2 = get_byte(buf: buf, idx: pos + 2)
+  return (b0 % 128) + (b1 % 128) * 128 + b2 * 16384
+end
+let uleb_size = fn (buf: &ByteBuffer, pos: i64) -> i64 do
+  if get_byte(buf: buf, idx: pos) < 128 then return 1 end
+  if get_byte(buf: buf, idx: pos + 1) < 128 then return 2 end
+  return 3
+end
+let read_dep_pages = fn (buf: &ByteBuffer) -> i64 do
+  return scan_sections(buf: buf, pos: 8, end_pos: buf_length(buf: buf))
+end
+let scan_sections = fn (buf: &ByteBuffer, pos: i64, end_pos: i64) -> i64 do
+  if pos >= end_pos then return 0 end
+  let sec_id = get_byte(buf: buf, idx: pos)
+  let sec_size = rd_uleb_simple(buf: buf, pos: pos + 1)
+  let hdr = uleb_size(buf: buf, pos: pos + 1)
+  let next = pos + 1 + hdr + sec_size
+  if sec_id == 5 then
+    // Memory section: skip count ULEB, skip flags byte, read min pages ULEB
+    let body = pos + 1 + hdr
+    let count_sz = uleb_size(buf: buf, pos: body)
+    let flags_pos = body + count_sz
+    let min_pos = flags_pos + 1
+    return rd_uleb_simple(buf: buf, pos: min_pos)
+  end
+  return scan_sections(buf: buf, pos: next, end_pos: end_pos)
 end
 
 // ─── Import processing ──────────────────────────────────────────────────────
@@ -880,7 +916,19 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock 
     let t8 = Clock.now()
     if verbose then Console.eprintln(val: "[nxc] optimize (" ++ from_i64(val: t8 - t7) ++ "ms)") end
 
-    let %wasm_buf = compile_lir_to_wasm(program: lir_opt)
+    // Compute string_data_base from stdlib memory (dep_pages * 65536).
+    // For standalone programs (no stdlib), use 0.
+    let LirProgram(functions: _, externals: pre_exts) = lir_opt
+    let str_base = match pre_exts do
+      case [] -> 0
+      case _ ->
+        // Read dep's initial pages from stdlib.wasm memory section
+        let %dep = read_binary_file(path: "nxlib/stdlib/stdlib.wasm")
+        let dep_pages = read_dep_pages(buf: &dep)
+        buf_free(buf: %dep)
+        dep_pages * 65536
+    end
+    let %wasm_buf = compile_lir_to_wasm(program: lir_opt, string_data_base: str_base)
     let t9 = Clock.now()
     if verbose then Console.eprintln(val: "[nxc] codegen (" ++ from_i64(val: t9 - t8) ++ "ms)") end
 

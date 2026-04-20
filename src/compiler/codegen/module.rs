@@ -58,7 +58,8 @@ pub fn compile_lir_to_wasm(
     let is_component = program.externals.iter().any(|ext| {
         super::string::string_abi_for_external(ext) == super::string::StringABI::Canonical
     }) || program.externals.iter().any(|ext| {
-        ext.wasm_module.as_ref().contains(':') && ext.wasm_module.as_ref() != "nexus:runtime/arena"
+        ext.wasm_module.as_ref().contains(':')
+            && !ext.wasm_module.as_ref().starts_with("nexus:runtime/")
     });
     let needs_alloc_import = stdlib_alloc_module.is_some() && !is_component;
     let n_alloc_imports: u32 = if needs_alloc_import { 1 } else { 0 };
@@ -412,8 +413,10 @@ pub fn compile_lir_to_wasm(
     {
         // Emit bump-allocator global when object heap is active without stdlib
         // allocator, OR when cabi_realloc needs a fallback allocator.
-        let needs_heap_global = (layout.object_heap_enabled || needs_cabi_realloc)
-            && layout.allocate_func_idx.is_none();
+        // Also emit when there are string literals (G1 = str_base needed for addressing).
+        let needs_heap_global = ((layout.object_heap_enabled || needs_cabi_realloc)
+            && layout.allocate_func_idx.is_none())
+            || !layout.data_segments.is_empty();
         if needs_heap_global {
             let mut globals = GlobalSection::new();
             // Global 0: object heap pointer (for constructors, string concat, retptr)
@@ -425,22 +428,16 @@ pub fn compile_lir_to_wasm(
                 },
                 &ConstExpr::i32_const(layout.heap_base as i32),
             );
-            // Global 1: cabi arena pointer (separate from object heap G0).
-            // Starts at 128MB to separate from G0 object heap. The memory.grow
-            // in cabi_realloc will extend memory to this range on first call.
-            // WASM virtual memory is sparse (demand-paged by wasmtime), so this
-            // doesn't waste physical RAM.
-            let cabi_base = 128 * 1024 * 1024u32; // 128MB
+            // Global 1: placeholder. Kept for global index stability.
             globals.global(
                 GlobalType {
                     val_type: ValType::I32,
                     mutable: true,
                     shared: false,
                 },
-                &ConstExpr::i32_const(cabi_base as i32),
+                &ConstExpr::i32_const(0),
             );
-            // Global 2: placeholder (unused — string allocs now share G0).
-            // Kept for global index stability.
+            // Global 2: placeholder. Kept for global index stability.
             globals.global(
                 GlobalType {
                     val_type: ValType::I32,

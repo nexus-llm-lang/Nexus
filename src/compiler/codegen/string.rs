@@ -108,7 +108,6 @@ pub(super) fn unpack_packed_i64_to_ptr_len(out: &mut Function, tmp_local: u32) {
     out.instruction(&Instruction::I64Const(32));
     out.instruction(&Instruction::I64ShrU);
     out.instruction(&Instruction::I32WrapI64);
-
     out.instruction(&Instruction::LocalGet(tmp_local));
     out.instruction(&Instruction::I64Const(0xFFFF_FFFFu64 as i64));
     out.instruction(&Instruction::I64And);
@@ -294,7 +293,7 @@ pub(super) fn emit_string_compare(
     compile_atom(rhs, out, local_map, layout)?;
     out.instruction(&Instruction::LocalSet(temps.concat_rhs_packed_i64));
 
-    // lhs ptr
+    // lhs ptr (relative + str_base)
     out.instruction(&Instruction::LocalGet(temps.concat_lhs_packed_i64));
     out.instruction(&Instruction::I64Const(32));
     out.instruction(&Instruction::I64ShrU);
@@ -304,7 +303,7 @@ pub(super) fn emit_string_compare(
     out.instruction(&Instruction::LocalGet(temps.concat_lhs_packed_i64));
     out.instruction(&Instruction::I32WrapI64);
     out.instruction(&Instruction::LocalSet(temps.concat_lhs_len_i32));
-    // rhs ptr
+    // rhs ptr (relative + str_base)
     out.instruction(&Instruction::LocalGet(temps.concat_rhs_packed_i64));
     out.instruction(&Instruction::I64Const(32));
     out.instruction(&Instruction::I64ShrU);

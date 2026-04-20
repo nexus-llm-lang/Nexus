@@ -1501,7 +1501,7 @@ pub(super) fn compile_expr(
                         out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
                         out.instruction(&Instruction::I32Add);
                         out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
-                        emit_string_heap_grow(out);
+                        emit_string_heap_grow(out, layout);
                     }
                     // Copy bytes: src[start..start+sub_len] → out[0..sub_len]
                     // Reuse concat_rhs_ptr_i32 as copy index
@@ -1598,7 +1598,7 @@ pub(super) fn compile_expr(
                         out.instruction(&Instruction::I32Const(1));
                         out.instruction(&Instruction::I32Add);
                         out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
-                        emit_string_heap_grow(out);
+                        emit_string_heap_grow(out, layout);
                     }
                     // Store byte: mem[out_ptr] = code as u8
                     out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
@@ -1627,7 +1627,7 @@ pub(super) fn compile_expr(
                         out.instruction(&Instruction::I32Const(1));
                         out.instruction(&Instruction::I32Add);
                         out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
-                        emit_string_heap_grow(out);
+                        emit_string_heap_grow(out, layout);
                     }
                     out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
                     compile_atom(c, out, local_map, layout)?;
@@ -1997,7 +1997,7 @@ pub(super) fn compile_expr(
                         out.instruction(&Instruction::LocalGet(temps.concat_out_len_i32));
                         out.instruction(&Instruction::I32Add);
                         out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
-                        emit_string_heap_grow(out);
+                        emit_string_heap_grow(out, layout);
                     }
                     // Write digits right-to-left
                     // write_idx = total_len - 1
@@ -2138,7 +2138,7 @@ fn emit_intrinsic_alloc_store_byte(
         out.instruction(&Instruction::I32Const(1));
         out.instruction(&Instruction::I32Add);
         out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
-        emit_string_heap_grow(out);
+        emit_string_heap_grow(out, layout);
     }
     out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
     out.instruction(&Instruction::I32Const(byte as i32));
@@ -2151,8 +2151,12 @@ fn emit_intrinsic_alloc_store_byte(
     out.instruction(&Instruction::I64Or);
 }
 
-/// Emit memory.grow if the string heap (global 2) exceeds current memory.
-fn emit_string_heap_grow(out: &mut Function) {
+/// Emit memory.grow if the string heap (global 0) exceeds current memory.
+/// Skip when allocate_func_idx is set (stdlib manages memory).
+fn emit_string_heap_grow(out: &mut Function, layout: &CodegenLayout) {
+    if layout.allocate_func_idx.is_some() {
+        return;
+    }
     out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
     out.instruction(&Instruction::MemorySize(0));
     out.instruction(&Instruction::I32Const(16));

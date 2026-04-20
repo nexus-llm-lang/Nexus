@@ -26,7 +26,7 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          emit_name, emit_section, emit_memarg, emit_memarg_i32, emit_memarg_i64, emit_memarg_i8,
          sec_type, sec_import, sec_function, sec_table, sec_memory, sec_global, sec_export, sec_element, sec_code, sec_data, sec_custom, sec_tag,
          vt_i32, vt_i64, vt_f64, vt_funcref, bt_void, bt_i32, bt_i64, desc_func, desc_table, desc_memory,
-         heap_global_idx, string_data_base,
+         heap_global_idx,
          catch_kind_one,
          comp_sec_core_module, comp_sec_core_instance, comp_sec_alias,
          comp_sec_type, comp_sec_canon, comp_sec_export,
@@ -575,7 +575,8 @@ end
 // Emit: if (global.get 0 > memory.size * 65536) { memory.grow(needed_pages); drop }
 // This pattern matches the Rust codegen (module.rs:610-631, emit.rs:47-66).
 
-let emit_memory_grow_check = fn (buf: %ByteBuffer) -> %ByteBuffer do
+let emit_memory_grow_check = fn (buf: %ByteBuffer, skip: bool) -> %ByteBuffer do
+  if skip then return %buf end
   // if (heap_ptr > current_memory_bytes)
   let %buf = bb_push_byte(buf: %buf, byte: op_global_get)
   let %buf = bb_push_uleb128(buf: %buf, val: heap_global_idx)
@@ -634,8 +635,8 @@ let emit_alloc_object = fn (buf: %ByteBuffer, ctx: CodegenCtx, words: i64) -> %B
       let %buf = bb_push_byte(buf: %buf, byte: op_i32_add)
       let %buf = bb_push_byte(buf: %buf, byte: op_global_set)
       let %buf = bb_push_uleb128(buf: %buf, val: heap_global_idx)
-      // Grow memory if heap exceeds current pages
-      return emit_memory_grow_check(buf: %buf)
+      // Grow memory if heap exceeds current pages (skip when stdlib manages memory)
+      return emit_memory_grow_check(buf: %buf, skip: ctx_alloc_mode(ctx: ctx) == 2)
   end
 end
 
@@ -811,7 +812,7 @@ let emit_string_concat = fn (lhs: LirAtom, rhs: LirAtom, buf: %ByteBuffer, ctx: 
       let %buf = bb_push_byte(buf: %buf, byte: op_i32_add)
       let %buf = bb_push_byte(buf: %buf, byte: op_global_set)
       let %buf = bb_push_uleb128(buf: %buf, val: str_heap_gidx)
-      let %buf = emit_memory_grow_check(buf: %buf)
+      let %buf = emit_memory_grow_check(buf: %buf, skip: ctx_alloc_mode(ctx: ctx) == 2)
   end
 
   let %buf = emit_memcpy_loop(buf: %buf, src_ptr: lhs_ptr, dst_ptr: out_ptr, dst_offset: -1,
@@ -1777,8 +1778,8 @@ let compile_cabi_realloc = fn (heap_base: i64) -> %ByteBuffer throws { Exn } do
   let %body = bb_push_byte(buf: %body, byte: op_i32_add)
   let %body = bb_push_byte(buf: %body, byte: op_global_set)
   let %body = bb_push_uleb128(buf: %body, val: 0) // G0 = object heap
-  // Grow memory if needed
-  let %body = emit_memory_grow_check(buf: %body)
+  // Grow memory if needed (cabi_realloc always uses bump — alloc_mode=1)
+  let %body = emit_memory_grow_check(buf: %body, skip: false)
   // return aligned_ptr
   let %body = bb_push_byte(buf: %body, byte: op_local_get)
   let %body = bb_push_uleb128(buf: %body, val: 4)
@@ -2077,7 +2078,7 @@ end
 
 // ─── Module entry point ────────────────────────────────────────────────────
 
-export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws { Exn } do
+export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64) -> %ByteBuffer throws { Exn } do
   match program do
     case LirProgram(functions: funcs, externals: all_exts) ->
 
@@ -2096,9 +2097,11 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
       let has_cabi = needs_cabi_realloc(exts: exts)
       let n_cabi = match has_cabi do case true -> 1 case false -> 0 end
       // alloc_mode: 0=none, 1=bump allocator, 2=stdlib allocate
-      let alloc_mode = match heap_enabled do
-        case false -> 0
-        case true -> match uses_stdlib do case true -> 2 case false -> 1 end
+      // When stdlib is present, always use mode 2 — even without heap, string
+      // concat uses the bump allocator which conflicts with dep's dlmalloc.
+      let alloc_mode = match uses_stdlib do
+        case true -> 2
+        case false -> match heap_enabled do case true -> 1 case false -> 0 end
       end
       let n_alloc_imports = match alloc_mode == 2 do case true -> 1 case false -> 0 end
       let import_count = n_exts + n_alloc_imports
@@ -2200,9 +2203,9 @@ export let compile_lir_to_wasm = fn (program: LirProgram) -> %ByteBuffer throws 
         emit_section(buf: %m, id: sec_tag, content: build_tag_section(exn_tag_type_idx: exn_tag_type_idx))
       else %m end
 
-      // Global section — needed for bump allocator (alloc_mode 1), cabi_realloc, or arena intrinsics.
-      // Arena intrinsics (heap_mark/heap_reset/heap_swap) always need global 0.
-      let needs_global = (heap_enabled && alloc_mode == 1) || (has_cabi && alloc_mode != 2) || has_arena
+      // Global section — needed for bump allocator, cabi_realloc, arena, or string literals.
+      // G1 (str_base) is always needed when there are string literals.
+      let needs_global = (heap_enabled && alloc_mode == 1) || (has_cabi && alloc_mode != 2) || has_arena || has_strings
       let %m = if needs_global then
         emit_section(buf: %m, id: sec_global, content: build_global_section(heap_base: heap_base))
       else %m end
