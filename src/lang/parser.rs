@@ -384,8 +384,20 @@ impl Parser {
                         Ok(Type::Ref(Box::new(inner)))
                     }
                     _ => {
-                        // UserDefined name, possibly with generic args
-                        let name = self.expect_ident()?;
+                        // UserDefined name, possibly qualified (mod.Type) and/or with generic args.
+                        // Qualified type paths (smap.StringMap) are sugar — normalized to the
+                        // final segment since types are nominal on their unqualified name.
+                        let mut name = self.expect_ident()?;
+                        while matches!(self.peek(), TokenKind::Dot) {
+                            let dot_saved = self.pos;
+                            self.advance();
+                            if let TokenKind::Ident(_) = self.peek() {
+                                name = self.expect_ident()?;
+                            } else {
+                                self.pos = dot_saved;
+                                break;
+                            }
+                        }
                         if matches!(self.peek(), TokenKind::Lt) {
                             let args = self.parse_generic_args()?;
                             Ok(Type::UserDefined(name, args))
