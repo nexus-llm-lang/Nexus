@@ -537,7 +537,14 @@ impl MirBuilder {
                         }
                         Expr::External(wasm_name, _type_params, typ) => {
                             if let Type::Arrow(params, ret, _requires, throws) = typ {
-                                if let Some(ref wasm_mod) = current_wasm_module {
+                                let resolved_mod = current_wasm_module.clone().or_else(|| {
+                                    self.externals
+                                        .iter()
+                                        .find(|e| e.wasm_name.as_ref() == wasm_name
+                                            || wit_canonical_name(wasm_name) == e.wasm_name.as_ref())
+                                        .map(|e| e.wasm_module.as_ref().to_string())
+                                });
+                                if let Some(wasm_mod) = resolved_mod {
                                     let name_sym = Symbol::from(&name);
                                     self.externals.retain(|e| e.name != name_sym);
                                     let effective_wasm_name = if wasm_mod.contains(':') {
