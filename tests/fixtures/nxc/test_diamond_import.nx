@@ -1,0 +1,82 @@
+// Regression test for nexus-jede: diamond import name-collision.
+// process_defs_shallow must use `orig_entries` (first-import rename map)
+// to find the correct forwarder target — not a suffix match that can
+// silently pick a same-named function from a different module.
+import { tokenize } from "nxc/frontend/lexer.nx"
+import { parse } from "nxc/frontend/parser.nx"
+import { Span } from "nxc/common/token.nx"
+import { Program, SpannedTopLevel } from "nxc/common/ast.nx"
+import { RenameEntry, rename_add } from "nxc/ir/symtab.nx"
+import { HirFunction, HirExpr, HirStmt, HirBody, EagerBody, LazyBody,
+         HirStmtKind, HirExprKind, HirAccum } from "nxc/ir/hir_types.nx"
+import { process_defs, process_defs_shallow, empty_accum } from "nxc/ir/hir.nx"
+
+let assert = fn (cond: bool, msg: string) -> unit throws { Exn } do
+  if cond then return ()
+  else raise RuntimeError(val: msg)
+  end
+end
+
+let get_defs = fn (prog: Program) -> [SpannedTopLevel] do
+  match prog do case Program(definitions: defs) -> return defs end
+end
+
+let find_body = fn (name: string, funcs: [HirFunction]) -> Option<[HirStmt]> do
+  match funcs do
+    case Nil -> return None
+    case HirFunction(name: n, type_params: _, params: _, ret_type: _, body: b, span: _) :: rest ->
+      if n == name then
+        match b do
+          case EagerBody(stmts: s) -> return Some(val: s)
+          case _ -> return None
+        end
+      else return find_body(name: name, funcs: rest)
+      end
+  end
+end
+
+let main = fn () -> unit throws { Exn } do
+  // Register two functions whose qualified names both end in ".foo".
+  // list.foo is registered FIRST (tail of fs), buf.foo is registered SECOND
+  // (head of fs). This mirrors the real-world order where list.nx is imported
+  // deeply before bytebuffer.nx is imported — so the buggy suffix-match code
+  // path returns buf.foo when looking for "foo".
+  let src_pre = "let a = fn () -> i64 do return 1 end\n"
+  let prog_pre = parse(tokens: tokenize(src: src_pre))
+  let pre_defs = get_defs(prog: prog_pre)
+
+  let entries_list = rename_add(entries: Nil, original: "a", qualified: "list.foo")
+  let acc1 = process_defs(defs: pre_defs, entries: entries_list,
+    accum: empty_accum(), source_file: "")
+
+  let entries_buf = rename_add(entries: Nil, original: "a", qualified: "buf.foo")
+  let acc2 = process_defs(defs: pre_defs, entries: entries_buf,
+    accum: acc1, source_file: "")
+
+  // Now simulate diamond re-import of list.nx with `{ foo as my_foo }`.
+  // The first import registered list.foo — orig_entries reflects that.
+  // The new import maps foo -> my_foo.
+  let src_imp = "export let foo = fn () -> i64 do return 2 end\n"
+  let imp_defs = get_defs(prog: parse(tokens: tokenize(src: src_imp)))
+  let orig_entries = rename_add(entries: Nil, original: "foo", qualified: "list.foo")
+  let merged = rename_add(entries: Nil, original: "foo", qualified: "my_foo")
+
+  let acc3 = process_defs_shallow(defs: imp_defs, entries: merged,
+    orig_entries: orig_entries, accum: acc2, source_file: "")
+
+  // The forwarder my_foo() must call list.foo(), not buf.foo().
+  // Pre-fix, find_existing_function would pick buf.foo because it was the
+  // most recent ".foo" in the function list at shallow-processing time.
+  match acc3 do case HirAccum(ports: _, functions: fs, externals: _, handler_bindings: _, enum_defs: _, wasm_module: _, exception_groups: _) ->
+    match find_body(name: "my_foo", funcs: fs) do
+      case Some(val: stmts) ->
+        match stmts do
+          case HirStmt(node: Return(expr: HirExpr(node: Call(func: target, args: _), span: _)), span: _) :: _ ->
+            assert(cond: target == "list.foo",
+              msg: "forwarder must target list.foo (got: " ++ target ++ ")")
+          case _ -> raise RuntimeError(val: "forwarder body shape unexpected")
+        end
+      case None -> raise RuntimeError(val: "forwarder my_foo not registered")
+    end
+  end
+end
