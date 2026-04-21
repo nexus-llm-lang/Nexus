@@ -1135,6 +1135,32 @@ impl TypeChecker {
         res
     }
 
+    fn collect_all_enums(&self, env: &TypeEnv) -> Vec<EnumDef> {
+        let mut all_enums: Vec<EnumDef> = env.enums.values().cloned().collect();
+        let mut merge = |ed: &EnumDef| {
+            if let Some(existing) = all_enums.iter_mut().find(|e| e.name == ed.name) {
+                for v in &ed.variants {
+                    if !existing.variants.iter().any(|ev| ev.name == v.name) {
+                        existing.variants.push(v.clone());
+                    }
+                }
+            } else {
+                all_enums.push(ed.clone());
+            }
+        };
+        for cached_env in self.import_cache.values() {
+            for ed in cached_env.enums.values() {
+                merge(ed);
+            }
+        }
+        for mod_env in env.modules.values() {
+            for ed in mod_env.enums.values() {
+                merge(ed);
+            }
+        }
+        all_enums
+    }
+
     fn infer(
         &mut self,
         env: &mut TypeEnv,
@@ -1491,22 +1517,7 @@ impl TypeChecker {
                 Ok((s.clone(), apply_subst_type(&s, &rt)))
             }
             Expr::Constructor(name, args) => {
-                let mut all_enums: Vec<EnumDef> = env.enums.values().cloned().collect();
-                for cached_env in self.import_cache.values() {
-                    for ed in cached_env.enums.values() {
-                        if !all_enums.iter().any(|e| e.name == ed.name) {
-                            all_enums.push(ed.clone());
-                        }
-                    }
-                }
-                for mod_env in env.modules.values() {
-                    for ed in mod_env.enums.values() {
-                        if !all_enums.iter().any(|e| e.name == ed.name) {
-                            all_enums.push(ed.clone());
-                        }
-                    }
-                }
-                // Strip module qualifier for qualified constructors (e.g., "hir.Literal" → "Literal")
+                let all_enums = self.collect_all_enums(env);
                 let ctor_name = name
                     .rfind('.')
                     .map_or(name.as_str(), |pos| &name[pos + 1..]);
@@ -2125,22 +2136,7 @@ impl TypeChecker {
                 Ok(HashMap::new())
             }
             Pattern::Constructor(n, pats) => {
-                let mut all_enums: Vec<EnumDef> = env.enums.values().cloned().collect();
-                for cached_env in self.import_cache.values() {
-                    for ed in cached_env.enums.values() {
-                        if !all_enums.iter().any(|e| e.name == ed.name) {
-                            all_enums.push(ed.clone());
-                        }
-                    }
-                }
-                for mod_env in env.modules.values() {
-                    for ed in mod_env.enums.values() {
-                        if !all_enums.iter().any(|e| e.name == ed.name) {
-                            all_enums.push(ed.clone());
-                        }
-                    }
-                }
-                // Strip module qualifier for qualified constructors (e.g., "hir.Literal" → "Literal")
+                let all_enums = self.collect_all_enums(env);
                 let ctor_name = n.rfind('.').map_or(n.as_str(), |pos| &n[pos + 1..]);
                 for ed in all_enums {
                     if let Some(v) = ed.variants.iter().find(|x| x.name == ctor_name) {
