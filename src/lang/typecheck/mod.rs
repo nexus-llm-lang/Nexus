@@ -1705,6 +1705,21 @@ impl TypeChecker {
                 Ok((s, elem_t))
             }
             Expr::FieldAccess(rec, fnm) => {
+                // Module-qualified value access: `mod.name` where `mod` is an import alias
+                // parses as FieldAccess(Variable("mod"), "name"). If env.modules has "mod"
+                // and it exports "name", resolve as module access.
+                if let Expr::Variable(rdr, _) = &rec.node {
+                    if let RdrName::Unqual(mod_name) = rdr {
+                        if env.vars.get(mod_name).is_none() {
+                            if let Some(m) = env.modules.get(mod_name) {
+                                if let Some(sch) = m.get(fnm).cloned() {
+                                    let t = self.instantiate(&sch);
+                                    return Ok((HashMap::new(), t));
+                                }
+                            }
+                        }
+                    }
+                }
                 let (s1, tr) = self.infer(env, rec, er, eq, ee)?;
                 let tr = apply_subst_type(&s1, &tr);
                 if let Type::Record(fs) = &tr {

@@ -109,7 +109,9 @@ fn compute_importer_entries(
     let mut entries = HashMap::new();
     let canonical = |name: &str| canonical_name(source_path, name);
 
-    if import.items.is_empty() {
+    // Wildcard entries: added when the import has `* as alias` (with or without
+    // selective items) or no items at all (pure-wildcard with default-stem alias).
+    if import.alias.is_some() || import.items.is_empty() {
         let alias = import
             .alias
             .clone()
@@ -125,10 +127,9 @@ fn compute_importer_entries(
                 _ => {}
             }
         }
-        return entries;
     }
 
-    // Selective import
+    // Selective items: bind each named item directly in caller scope.
     for item in &import.items {
         let visible = item.alias.as_ref().unwrap_or(&item.name).clone();
         for def in &program.definitions {
@@ -803,7 +804,8 @@ impl MirBuilder {
         cache: &ImportCache,
         caller_rename_map: &mut HashMap<String, String>,
     ) -> Result<(), HirBuildError> {
-        if import.items.is_empty() {
+        // Wildcard entries for `* as alias` (with or without selective items).
+        if import.alias.is_some() || import.items.is_empty() {
             let alias = import
                 .alias
                 .clone()
@@ -812,7 +814,9 @@ impl MirBuilder {
             for (original_name, canonical) in &cache.name_map {
                 caller_rename_map.insert(format!("{}.{}", alias, original_name), canonical.clone());
             }
-            return Ok(());
+            if import.items.is_empty() {
+                return Ok(());
+            }
         }
 
         for item in &import.items {
@@ -1337,10 +1341,28 @@ impl MirBuilder {
                 Box::new(self.convert_expr(arr, rename_map, scope)?),
                 Box::new(self.convert_expr(idx, rename_map, scope)?),
             )),
-            Expr::FieldAccess(e, field) => Ok(MirExpr::FieldAccess(
-                Box::new(self.convert_expr(e, rename_map, scope)?),
-                Symbol::from(field.as_str()),
-            )),
+            Expr::FieldAccess(e, field) => {
+                // Module-qualified value access: `mod.name` parses as
+                // FieldAccess(Variable("mod"), "name"). If "mod.name" is in the
+                // rename_map (added for wildcard-aliased imports), resolve as a
+                // qualified variable reference rather than a struct field access.
+                if let Expr::Variable(RdrName::Unqual(mod_name), _sigil) = &e.node {
+                    let qualified = format!("{}.{}", mod_name, field);
+                    if let Some(canonical) = rename_map.get(&qualified).cloned() {
+                        if let Some(lit) = self.global_constants.get(&canonical) {
+                            return Ok(MirExpr::Literal(lit.clone()));
+                        }
+                        if self.fn_ret_types.contains_key(&canonical) {
+                            return Ok(MirExpr::FuncRef(Symbol::from(canonical)));
+                        }
+                        return Ok(MirExpr::Variable(Symbol::from(canonical)));
+                    }
+                }
+                Ok(MirExpr::FieldAccess(
+                    Box::new(self.convert_expr(e, rename_map, scope)?),
+                    Symbol::from(field.as_str()),
+                ))
+            }
             Expr::If {
                 cond,
                 then_branch,
