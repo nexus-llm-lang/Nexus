@@ -40,7 +40,7 @@ package nexus:runtime;\n\
 interface backtrace {\n\
     capture-backtrace: func();\n\
     bt-depth: func() -> s64;\n\
-    bt-frame: func(idx: s64) -> s64;\n\
+    bt-frame: func(idx: s64) -> string;\n\
 }\n\
 \n\
 interface lazy {\n\

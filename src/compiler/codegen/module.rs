@@ -550,6 +550,16 @@ pub fn compile_lir_to_wasm(
             func_names.append(idx, ALLOCATE_WASM_NAME);
             idx += 1;
         }
+        if needs_bt_capture {
+            func_names.append(idx, BT_CAPTURE_NAME);
+            idx += 1;
+        }
+        if needs_lazy {
+            func_names.append(idx, LAZY_SPAWN_NAME);
+            idx += 1;
+            func_names.append(idx, LAZY_JOIN_NAME);
+            idx += 1;
+        }
         // Internal functions (indices import_count..import_count+n_funcs)
         for func in &program.functions {
             func_names.append(idx, func.name.as_str());
