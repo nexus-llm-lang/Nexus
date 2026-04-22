@@ -1,3 +1,14 @@
+//! WASM bindings called from Nexus `external` declarations in
+//! nxlib/stdlib/net.nx. The Rust-level signatures here are the lowered form
+//! of the higher-level Nexus types — see nxlib/stdlib/net.nx for the contract
+//! and bootstrap/src/compiler/codegen/emit.rs `abi_tests` for the pin.
+//!
+//! Lowering summary:
+//!   Nexus `string` param   → Rust (ptr: i32, len: i32)
+//!   Nexus `string` return  → Rust i64 packed as (ptr as u32) << 32 | (len as u32)
+//!   Nexus `bool` return    → Rust i32 (non-zero = true)
+//!   Nexus `i64`/`i32`/etc. → same WASM value type
+
 use nexus_wasm_alloc::{checked_ptr_len, remember_allocation, take_allocation};
 use std::alloc::{Layout, alloc, realloc};
 
