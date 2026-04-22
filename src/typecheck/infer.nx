@@ -1,0 +1,1117 @@
+/**
+ * typecheck/infer: Expression and statement type inference.
+ *
+ * Hindley-Milner style inference over HirExpr/HirStmt, producing
+ * substitutions and inferred types. Threads CheckState for fresh
+ * variable generation and environment management.
+ */
+
+import { Span } from "src/common/token.nx"
+import {
+  TypeExpr, TyI32, TyI64, TyF32, TyF64, TyBool, TyChar, TyString, TyUnit,
+  TyIntLit, TyFloatLit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear, TyLazy, TyBorrow,
+  TyArray, TyList, TyRecord, TyRow, TyHandler, NamedType,
+  BinaryOp, OpAdd, OpSub, OpMul, OpDiv, OpMod,
+  OpFAdd, OpFSub, OpFMul, OpFDiv,
+  OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
+  OpFEq, OpFNe, OpFLt, OpFLe, OpFGt, OpFGe,
+  OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr,
+  OpAnd, OpOr, OpConcat,
+  Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit,
+  Sigil, SigilImmutable, SigilMutable, SigilLinear, SigilLazy, SigilBorrow,
+  VariantField, EnumDef, VariantDef
+} from "src/common/ast.nx"
+import {
+  HirExprKind, HirExpr, HirStmtKind, HirStmt,
+  HirCallArg, HirNamedExpr, HirMatchCase, HirFunction, HirParam,
+  HirPatternKind, PLit, PVar, PCtor, PRec, PWild,
+  HirPatternField, HirRecordPatField
+} from "src/ir/hir_types.nx"
+import {
+  SubstEntry, Scheme, EnvEntry, CheckState, FreshResult,
+  InferExprResult, InferExprOk, InferExprErr,
+  UnifyResult, UnifyOk, UnifyErr,
+  BindResult, BindOk, BindErr,
+  EnumVariantInfo
+}, * as tctypes from "src/typecheck/types.nx"
+import * as subst from "src/typecheck/subst.nx"
+import * as unify from "src/typecheck/unify.nx"
+import * as str from "stdlib/string.nx"
+
+let no_span = fn () -> Span do
+  return Span(offset: 0, line: 0, col: 0)
+end
+
+// ─── Expression inference ───────────────────────────────────────────────────
+
+export let infer_expr = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult do
+  let HirExpr(node: node, span: sp) = expr
+  match node do
+    case Literal(lit: lit) -> return infer_literal(state: state, lit: lit, span: sp)
+    case Variable(name: name, sigil: _) -> return infer_variable(state: state, name: name, span: sp)
+    case Borrow(name: name, sigil: _) -> return infer_borrow(state: state, name: name, span: sp)
+    case BinOp(left: left, op: op, right: right) ->
+      return infer_binop(state: state, left: left, op: op, right: right, span: sp)
+    case Call(func: func, args: args) ->
+      return infer_call(state: state, func: func, args: args, span: sp)
+    case Ctor(variant: variant, args: args) ->
+      return infer_constructor(state: state, variant: variant, args: args, span: sp)
+    case Record(fields: fields) ->
+      return infer_record(state: state, fields: fields, span: sp)
+    case Array(elems: elems) ->
+      return infer_array(state: state, elems: elems, span: sp)
+    case Index(target: target, index: index) ->
+      return infer_index(state: state, target: target, index: index, span: sp)
+    case FieldAccess(target: target, field: field) ->
+      return infer_field_access(state: state, target: target, field: field, span: sp)
+    case If(cond: cond, then_branch: then_b, else_branch: else_b) ->
+      return infer_if(state: state, cond: cond, then_b: then_b, else_b: else_b, ret_type: ret_type, span: sp)
+    case Match(target: target, cases: cases) ->
+      return infer_match(state: state, target: target, cases: cases, ret_type: ret_type, span: sp)
+    case While(cond: cond, body: body) ->
+      return infer_while(state: state, cond: cond, body: body, ret_type: ret_type, span: sp)
+    case For(var: var, start: start, end_expr: end_e, body: body) ->
+      return infer_for(state: state, var: var, start: start, end_e: end_e, body: body, ret_type: ret_type, span: sp)
+    case Lambda(type_params: _, params: params, ret_type: ret, body: body) ->
+      return infer_lambda(state: state, params: params, ret_type: ret, body: body, span: sp)
+    case Raise(expr: inner) ->
+      return infer_raise(state: state, inner: inner, span: sp)
+    case Force(expr: inner) ->
+      return infer_force(state: state, inner: inner, span: sp)
+    case ExternalRef(symbol: _, arg_names: _, typ: typ) ->
+      return InferExprOk(state: state, subst: subst.subst_empty(), typ: typ)
+    case Handler(port_name: _, functions: _) ->
+      // Handler expressions type as Unit for now
+      return InferExprOk(state: state, subst: subst.subst_empty(), typ: TyUnit)
+  end
+end
+
+// ─── Literal inference ──────────────────────────────────────────────────────
+
+let infer_literal = fn (state: CheckState, lit: Literal, span: Span) -> InferExprResult do
+  let typ = match lit do
+    case LitInt(val: _) -> TyIntLit
+    case LitFloat(val: _) -> TyFloatLit
+    case LitBool(val: _) -> TyBool
+    case LitChar(val: _) -> TyChar
+    case LitString(val: _) -> TyString
+    case LitUnit -> TyUnit
+  end
+  return InferExprOk(state: state, subst: subst.subst_empty(), typ: typ)
+end
+
+// ─── Scheme instantiation ───────────────────────────────────────────────────
+
+type InstantiateResult = InstantiateResult(state: CheckState, typ: TypeExpr)
+
+let instantiate_scheme = fn (state: CheckState, scheme: Scheme) -> InstantiateResult do
+  match scheme do
+    case Scheme(vars: [], typ: t) -> return InstantiateResult(state: state, typ: t)
+    case Scheme(vars: vs, typ: t) ->
+      let fr = freshen_type_params(state: state, params: vs)
+      let FreshenResult(state: st1, param_subst: psubst) = fr
+      return InstantiateResult(state: st1, typ: subst.subst_apply(subst: psubst, typ: t))
+  end
+end
+
+// ─── Variable inference ─────────────────────────────────────────────────────
+
+let infer_variable = fn (state: CheckState, name: string, span: Span) -> InferExprResult do
+  match tctypes.env_lookup(env: tctypes.state_env(state: state), name: name) do
+    case Some(val: sch) ->
+      let InstantiateResult(state: st1, typ: t) = instantiate_scheme(state: state, scheme: sch)
+      return InferExprOk(state: st1, subst: subst.subst_empty(), typ: t)
+    case None ->
+      return InferExprErr(message: "unbound variable: " ++ name, span: span)
+  end
+end
+
+let infer_borrow = fn (state: CheckState, name: string, span: Span) -> InferExprResult do
+  match infer_variable(state: state, name: name, span: span) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    case InferExprOk(state: st1, subst: s, typ: t) ->
+      // Strip Linear/Lazy/Borrow wrapper, then wrap in Borrow
+      let inner = match t do
+        case TyLinear(inner: u) -> u
+        case TyLazy(inner: u) -> u
+        case TyBorrow(inner: u) -> u
+        case _ -> t
+      end
+      return InferExprOk(state: st1, subst: s, typ: TyBorrow(inner: inner))
+  end
+end
+
+// ─── Binary operator inference ──────────────────────────────────────────────
+
+let infer_binop = fn (state: CheckState, left: HirExpr, op: BinaryOp, right: HirExpr, span: Span) -> InferExprResult do
+  match infer_expr(state: state, expr: left, ret_type: TyUnit) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: t1) ->
+      match infer_expr(state: st1, expr: right, ret_type: TyUnit) do
+        case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+        case InferExprOk(state: st2, subst: s2, typ: t2) ->
+          let s12 = subst.subst_compose(s1: s1, s2: s2)
+          let lt = subst.subst_apply(subst: s12, typ: t1)
+          let rt = subst.subst_apply(subst: s12, typ: t2)
+          return resolve_binop_types(state: st2, subst: s12, op: op, lt: lt, rt: rt, span: span)
+      end
+  end
+end
+
+let resolve_binop_types = fn (state: CheckState, subst: [SubstEntry], op: BinaryOp, lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult do
+  match op do
+    // Integer arithmetic -> result is integer type
+    case OpAdd -> return unify_int_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpSub -> return unify_int_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpMul -> return unify_int_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpDiv -> return unify_int_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpMod -> return unify_int_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpBitAnd -> return unify_int_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpBitOr -> return unify_int_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpBitXor -> return unify_int_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpShl -> return unify_int_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpShr -> return unify_int_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    // Float arithmetic
+    case OpFAdd -> return unify_float_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpFSub -> return unify_float_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpFMul -> return unify_float_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpFDiv -> return unify_float_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    // Integer comparisons -> bool
+    case OpEq -> return unify_cmp_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpNe -> return unify_cmp_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpLt -> return unify_cmp_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpLe -> return unify_cmp_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpGt -> return unify_cmp_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpGe -> return unify_cmp_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    // Float comparisons -> bool
+    case OpFEq -> return unify_float_cmp(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpFNe -> return unify_float_cmp(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpFLt -> return unify_float_cmp(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpFLe -> return unify_float_cmp(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpFGt -> return unify_float_cmp(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpFGe -> return unify_float_cmp(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    // Logical -> bool
+    case OpAnd ->
+      return unify_bool_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    case OpOr ->
+      return unify_bool_binop(state: state, subst: subst, lt: lt, rt: rt, span: span)
+    // String concat
+    case OpConcat ->
+      let tdefs = tctypes.state_typedefs(state: state)
+      match unify.unify(t1: lt, t2: TyString, tdefs: tdefs) do
+        case UnifyErr(message: m) -> return InferExprErr(message: "concat lhs: " ++ m, span: span)
+        case UnifyOk(subst: s1) ->
+          let s_merged = subst.subst_compose(s1: subst, s2: s1)
+          match unify.unify(t1: subst.subst_apply(subst: s_merged, typ: rt), t2: TyString, tdefs: tdefs) do
+            case UnifyErr(message: m) -> return InferExprErr(message: "concat rhs: " ++ m, span: span)
+            case UnifyOk(subst: s2) ->
+              return InferExprOk(state: state, subst: subst.subst_compose(s1: s_merged, s2: s2), typ: TyString)
+          end
+      end
+  end
+end
+
+let unify_int_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult do
+  let target = select_int_type(a: lt, b: rt)
+  let tdefs = tctypes.state_typedefs(state: state)
+  match unify.unify(t1: lt, t2: target, tdefs: tdefs) do
+    case UnifyErr(message: m) -> return InferExprErr(message: "int op lhs: " ++ m, span: span)
+    case UnifyOk(subst: s1) ->
+      let sm = subst.subst_compose(s1: subst, s2: s1)
+      match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: target, tdefs: tdefs) do
+        case UnifyErr(message: m) -> return InferExprErr(message: "int op rhs: " ++ m, span: span)
+        case UnifyOk(subst: s2) ->
+          return InferExprOk(state: state, subst: subst.subst_compose(s1: sm, s2: s2), typ: target)
+      end
+  end
+end
+
+let unify_float_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult do
+  let target = select_float_type(a: lt, b: rt)
+  let tdefs = tctypes.state_typedefs(state: state)
+  match unify.unify(t1: lt, t2: target, tdefs: tdefs) do
+    case UnifyErr(message: m) -> return InferExprErr(message: "float op lhs: " ++ m, span: span)
+    case UnifyOk(subst: s1) ->
+      let sm = subst.subst_compose(s1: subst, s2: s1)
+      match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: target, tdefs: tdefs) do
+        case UnifyErr(message: m) -> return InferExprErr(message: "float op rhs: " ++ m, span: span)
+        case UnifyOk(subst: s2) ->
+          return InferExprOk(state: state, subst: subst.subst_compose(s1: sm, s2: s2), typ: target)
+      end
+  end
+end
+
+let unify_cmp_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult do
+  let tdefs = tctypes.state_typedefs(state: state)
+  match unify.unify(t1: lt, t2: rt, tdefs: tdefs) do
+    case UnifyErr(message: m) -> return InferExprErr(message: "comparison: " ++ m, span: span)
+    case UnifyOk(subst: s1) ->
+      return InferExprOk(state: state, subst: subst.subst_compose(s1: subst, s2: s1), typ: TyBool)
+  end
+end
+
+let unify_float_cmp = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult do
+  let tdefs = tctypes.state_typedefs(state: state)
+  let target = select_float_type(a: lt, b: rt)
+  match unify.unify(t1: lt, t2: target, tdefs: tdefs) do
+    case UnifyErr(message: m) -> return InferExprErr(message: "float cmp lhs: " ++ m, span: span)
+    case UnifyOk(subst: s1) ->
+      let sm = subst.subst_compose(s1: subst, s2: s1)
+      match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: target, tdefs: tdefs) do
+        case UnifyErr(message: m) -> return InferExprErr(message: "float cmp rhs: " ++ m, span: span)
+        case UnifyOk(subst: s2) ->
+          return InferExprOk(state: state, subst: subst.subst_compose(s1: sm, s2: s2), typ: TyBool)
+      end
+  end
+end
+
+let unify_bool_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult do
+  let tdefs = tctypes.state_typedefs(state: state)
+  match unify.unify(t1: lt, t2: TyBool, tdefs: tdefs) do
+    case UnifyErr(message: m) -> return InferExprErr(message: "logical lhs: " ++ m, span: span)
+    case UnifyOk(subst: s1) ->
+      let sm = subst.subst_compose(s1: subst, s2: s1)
+      match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: TyBool, tdefs: tdefs) do
+        case UnifyErr(message: m) -> return InferExprErr(message: "logical rhs: " ++ m, span: span)
+        case UnifyOk(subst: s2) ->
+          return InferExprOk(state: state, subst: subst.subst_compose(s1: sm, s2: s2), typ: TyBool)
+      end
+  end
+end
+
+// ─── Numeric type selection ─────────────────────────────────────────────────
+
+let select_int_type = fn (a: TypeExpr, b: TypeExpr) -> TypeExpr do
+  // If either is concrete, use it. Default to i64.
+  match a do
+    case TyI32 -> return TyI32
+    case TyI64 -> return TyI64
+    case _ -> ()
+  end
+  match b do
+    case TyI32 -> return TyI32
+    case TyI64 -> return TyI64
+    case _ -> ()
+  end
+  return TyI64
+end
+
+let select_float_type = fn (a: TypeExpr, b: TypeExpr) -> TypeExpr do
+  match a do
+    case TyF32 -> return TyF32
+    case TyF64 -> return TyF64
+    case _ -> ()
+  end
+  match b do
+    case TyF32 -> return TyF32
+    case TyF64 -> return TyF64
+    case _ -> ()
+  end
+  return TyF64
+end
+
+// ─── Call inference ─────────────────────────────────────────────────────────
+
+let infer_call = fn (state: CheckState, func: string, args: [HirCallArg], span: Span) -> InferExprResult do
+  match tctypes.env_lookup(env: tctypes.state_env(state: state), name: func) do
+    case None -> return InferExprErr(message: "unbound function: " ++ func, span: span)
+    case Some(val: sch) ->
+      match instantiate_scheme(state: state, scheme: sch) do
+        case InstantiateResult(state: st1, typ: func_type) ->
+          match func_type do
+            case TyArrow(params: params, ret: ret, requires: _, throw_row: _) ->
+              return check_call_args(state: st1, params: params, args: args, ret: ret, subst: subst.subst_empty(), span: span)
+            case _ ->
+              return InferExprErr(message: func ++ " is not a function", span: span)
+          end
+      end
+  end
+end
+
+let check_call_args = fn (
+  state: CheckState, params: [NamedType], args: [HirCallArg],
+  ret: TypeExpr, subst: [SubstEntry], span: Span
+) -> InferExprResult do
+  match params do
+    case [] ->
+      match args do
+        case [] -> return InferExprOk(state: state, subst: subst, typ: subst.subst_apply(subst: subst, typ: ret))
+        case _ -> return InferExprErr(message: "too many arguments", span: span)
+      end
+    case NamedType(name: pname, typ: ptyp) :: rp ->
+      match args do
+        case [] -> return InferExprErr(message: "missing argument: " ++ pname, span: span)
+        case HirCallArg(label: _, value: val) :: ra ->
+          match infer_expr(state: state, expr: val, ret_type: TyUnit) do
+            case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span: espan)
+            case InferExprOk(state: st1, subst: s1, typ: arg_t) ->
+              let s_merged = subst.subst_compose(s1: subst, s2: s1)
+              let expected = subst.subst_apply(subst: s_merged, typ: ptyp)
+              let tdefs = tctypes.state_typedefs(state: st1)
+              match unify.unify(t1: arg_t, t2: expected, tdefs: tdefs) do
+                case UnifyErr(message: m) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span: span)
+                case UnifyOk(subst: s2) ->
+                  let s_all = subst.subst_compose(s1: s_merged, s2: s2)
+                  return check_call_args(state: st1, params: rp, args: ra, ret: ret, subst: s_all, span: span)
+              end
+          end
+      end
+  end
+end
+
+// ─── Constructor inference ──────────────────────────────────────────────────
+
+let infer_constructor = fn (state: CheckState, variant: string, args: [HirExpr], span: Span) -> InferExprResult do
+  match tctypes.find_variant(defs: tctypes.state_enums(state: state), variant: variant) do
+    case None -> return InferExprErr(message: "unknown constructor: " ++ variant, span: span)
+    case Some(val: EnumVariantInfo(enum_name: ename, type_params: tps, fields: fields)) ->
+      // Generate fresh type vars for type parameters
+      let fr = freshen_type_params(state: state, params: tps)
+      let FreshenResult(state: st1, param_subst: psubst) = fr
+      // Sort fields alphabetically to match HIR builder's arg ordering
+      let sorted_fields = sort_variant_fields(fields: fields)
+      // Check constructor args against field types
+      let enum_type = build_enum_type(name: ename, params: tps, param_subst: psubst)
+      return check_ctor_args(state: st1, fields: sorted_fields, args: args, param_subst: psubst, enum_type: enum_type, subst: subst.subst_empty(), span: span)
+  end
+end
+
+// Sort variant fields alphabetically by name to match HIR builder's arg ordering.
+// HIR builder sorts labeled ctor args alphabetically; fields must match.
+
+let variant_field_name = fn (f: VariantField) -> string do
+  match f do
+    case VariantField(name: Some(val: n), typ: _) -> n
+    case VariantField(name: None, typ: _) -> ""
+  end
+end
+
+let insert_variant_field = fn (f: VariantField, sorted: [VariantField]) -> [VariantField] do
+  return insert_variant_field_go(f: f, sorted: sorted, acc: [])
+end
+
+let insert_variant_field_go = fn (f: VariantField, sorted: [VariantField], acc: [VariantField]) -> [VariantField] do
+  match sorted do
+    case [] -> return rev_variant_fields(lst: acc, out: [f])
+    case head :: rest ->
+      if tc_str_lt(a: variant_field_name(f: f), b: variant_field_name(f: head)) then
+        return rev_variant_fields(lst: acc, out: f :: sorted)
+      else
+        return insert_variant_field_go(f: f, sorted: rest, acc: head :: acc)
+      end
+  end
+end
+
+let sort_variant_fields = fn (fields: [VariantField]) -> [VariantField] do
+  match fields do
+    case [] -> return []
+    case f :: rest -> return insert_variant_field(f: f, sorted: sort_variant_fields(fields: rest))
+  end
+end
+
+let tc_str_lt_loop = fn (a: string, b: string, idx: i64, la: i64, lb: i64) -> bool do
+  if idx >= la then return idx < lb end
+  if idx >= lb then return false end
+  let ca = str.char_at(s: a, idx: idx)
+  let cb = str.char_at(s: b, idx: idx)
+  match ca == cb do
+    case true -> return tc_str_lt_loop(a: a, b: b, idx: idx + 1, la: la, lb: lb)
+    case false -> return ca < cb
+  end
+end
+
+let tc_str_lt = fn (a: string, b: string) -> bool do
+  return tc_str_lt_loop(a: a, b: b, idx: 0, la: str.length(s: a), lb: str.length(s: b))
+end
+
+type FreshenResult = FreshenResult(state: CheckState, param_subst: [SubstEntry])
+
+let freshen_type_params = fn (state: CheckState, params: [string]) -> FreshenResult do
+  match params do
+    case [] -> return FreshenResult(state: state, param_subst: subst.subst_empty())
+    case p :: rest ->
+      let FreshResult(state: st1, typ: tv) = tctypes.tc_fresh_var(state: state)
+      let FreshenResult(state: st2, param_subst: ps) = freshen_type_params(state: st1, params: rest)
+      return FreshenResult(
+        state: st2,
+        param_subst: SubstEntry(var: p, typ: tv) :: ps
+      )
+  end
+end
+
+let build_enum_type = fn (name: string, params: [string], param_subst: [SubstEntry]) -> TypeExpr do
+  let args = build_type_args(params: params, param_subst: param_subst)
+  return TyUserDefined(name: name, args: args)
+end
+
+let build_type_args = fn (params: [string], param_subst: [SubstEntry]) -> [TypeExpr] do
+  return build_type_args_go(params: params, param_subst: param_subst, acc: [])
+end
+
+let build_type_args_go = fn (params: [string], param_subst: [SubstEntry], acc: [TypeExpr]) -> [TypeExpr] do
+  match params do
+    case [] -> return rev_type_exprs(lst: acc, out: [])
+    case p :: rest ->
+      let resolved = subst.subst_apply(subst: param_subst, typ: TyVar(name: p))
+      return build_type_args_go(params: rest, param_subst: param_subst, acc: resolved :: acc)
+  end
+end
+
+let check_ctor_args = fn (
+  state: CheckState, fields: [VariantField], args: [HirExpr],
+  param_subst: [SubstEntry], enum_type: TypeExpr, subst: [SubstEntry], span: Span
+) -> InferExprResult do
+  match fields do
+    case [] ->
+      match args do
+        case [] -> return InferExprOk(state: state, subst: subst, typ: subst.subst_apply(subst: subst, typ: enum_type))
+        case _ -> return InferExprErr(message: "too many constructor arguments", span: span)
+      end
+    case VariantField(name: _, typ: ftyp) :: rf ->
+      match args do
+        case [] -> return InferExprErr(message: "missing constructor argument", span: span)
+        case arg :: ra ->
+          match infer_expr(state: state, expr: arg, ret_type: TyUnit) do
+            case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+            case InferExprOk(state: st1, subst: s1, typ: at) ->
+              let sm = subst.subst_compose(s1: subst, s2: s1)
+              let expected = subst.subst_apply(subst: subst.subst_compose(s1: param_subst, s2: sm), typ: ftyp)
+              let tdefs = tctypes.state_typedefs(state: st1)
+              match unify.unify(t1: at, t2: expected, tdefs: tdefs) do
+                case UnifyErr(message: m) -> return InferExprErr(message: "ctor field: " ++ m, span: span)
+                case UnifyOk(subst: s2) ->
+                  return check_ctor_args(
+                    state: st1, fields: rf, args: ra,
+                    param_subst: param_subst, enum_type: enum_type,
+                    subst: subst.subst_compose(s1: sm, s2: s2), span: span
+                  )
+              end
+          end
+      end
+  end
+end
+
+// ─── Record inference ───────────────────────────────────────────────────────
+
+let infer_record = fn (state: CheckState, fields: [HirNamedExpr], span: Span) -> InferExprResult do
+  return infer_record_fields(state: state, fields: fields, subst: subst.subst_empty(), acc: [], span: span)
+end
+
+let infer_record_fields = fn (state: CheckState, fields: [HirNamedExpr], subst: [SubstEntry], acc: [NamedType], span: Span) -> InferExprResult do
+  match fields do
+    case [] ->
+      return InferExprOk(state: state, subst: subst, typ: TyRecord(fields: reverse_named_types(nts: acc, out: [])))
+    case HirNamedExpr(name: n, value: v) :: rest ->
+      match infer_expr(state: state, expr: v, ret_type: TyUnit) do
+        case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "record field " ++ n ++ ": " ++ m, span: espan)
+        case InferExprOk(state: st1, subst: s1, typ: ft) ->
+          let sm = subst.subst_compose(s1: subst, s2: s1)
+          return infer_record_fields(
+            state: st1, fields: rest, subst: sm,
+            acc: NamedType(name: n, typ: ft) :: acc, span: span
+          )
+      end
+  end
+end
+
+let reverse_named_types = fn (nts: [NamedType], out: [NamedType]) -> [NamedType] do
+  match nts do
+    case [] -> return out
+    case h :: rest ->
+      return reverse_named_types(nts: rest, out: h :: out)
+  end
+end
+
+// Fix infer_record to use the correct helper
+// (Override the earlier definition by redefining)
+
+// ─── Array inference ────────────────────────────────────────────────────────
+
+let infer_array = fn (state: CheckState, elems: [HirExpr], span: Span) -> InferExprResult do
+  match elems do
+    case [] ->
+      let FreshResult(state: st, typ: tv) = tctypes.tc_fresh_var(state: state)
+      return InferExprOk(state: st, subst: subst.subst_empty(), typ: TyArray(elem: tv))
+    case first :: rest ->
+      match infer_expr(state: state, expr: first, ret_type: TyUnit) do
+        case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+        case InferExprOk(state: st1, subst: s1, typ: t1) ->
+          return unify_array_elems(state: st1, elems: rest, subst: s1, elem_type: t1, span: span)
+      end
+  end
+end
+
+let unify_array_elems = fn (state: CheckState, elems: [HirExpr], subst: [SubstEntry], elem_type: TypeExpr, span: Span) -> InferExprResult do
+  match elems do
+    case [] -> return InferExprOk(state: state, subst: subst, typ: TyArray(elem: subst.subst_apply(subst: subst, typ: elem_type)))
+    case e :: rest ->
+      match infer_expr(state: state, expr: e, ret_type: TyUnit) do
+        case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+        case InferExprOk(state: st1, subst: s1, typ: et) ->
+          let sm = subst.subst_compose(s1: subst, s2: s1)
+          let tdefs = tctypes.state_typedefs(state: st1)
+          match unify.unify(t1: et, t2: subst.subst_apply(subst: sm, typ: elem_type), tdefs: tdefs) do
+            case UnifyErr(message: m) -> return InferExprErr(message: "array element: " ++ m, span: span)
+            case UnifyOk(subst: s2) ->
+              return unify_array_elems(state: st1, elems: rest, subst: subst.subst_compose(s1: sm, s2: s2), elem_type: elem_type, span: span)
+          end
+      end
+  end
+end
+
+// ─── Index inference ────────────────────────────────────────────────────────
+
+let infer_index = fn (state: CheckState, target: HirExpr, index: HirExpr, span: Span) -> InferExprResult do
+  match infer_expr(state: state, expr: target, ret_type: TyUnit) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: tt) ->
+      match infer_expr(state: st1, expr: index, ret_type: TyUnit) do
+        case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+        case InferExprOk(state: st2, subst: s2, typ: it) ->
+          let sm = subst.subst_compose(s1: s1, s2: s2)
+          let tdefs = tctypes.state_typedefs(state: st2)
+          match unify.unify(t1: it, t2: TyI64, tdefs: tdefs) do
+            case UnifyErr(message: m) -> return InferExprErr(message: "index must be i64: " ++ m, span: span)
+            case UnifyOk(subst: s3) ->
+              let sf = subst.subst_compose(s1: sm, s2: s3)
+              let arr_t = subst.subst_apply(subst: sf, typ: tt)
+              match arr_t do
+                case TyArray(elem: e) -> return InferExprOk(state: st2, subst: sf, typ: e)
+                case _ -> return InferExprErr(message: "cannot index non-array type", span: span)
+              end
+          end
+      end
+  end
+end
+
+// ─── Field access inference ─────────────────────────────────────────────────
+
+let infer_field_access = fn (state: CheckState, target: HirExpr, field: string, span: Span) -> InferExprResult do
+  match infer_expr(state: state, expr: target, ret_type: TyUnit) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: tt) ->
+      let resolved = subst.subst_apply(subst: s1, typ: tt)
+      match resolved do
+        case TyRecord(fields: fs) ->
+          match lookup_named_type(nts: fs, name: field) do
+            case Some(val: ft) -> return InferExprOk(state: st1, subst: s1, typ: ft)
+            case None -> return InferExprErr(message: "no field " ++ field ++ " in record", span: span)
+          end
+        case _ -> return InferExprErr(message: "field access on non-record type", span: span)
+      end
+  end
+end
+
+let lookup_named_type = fn (nts: [NamedType], name: string) -> Option<TypeExpr> do
+  match nts do
+    case [] -> return None
+    case NamedType(name: n, typ: t) :: rest ->
+      if n == name then
+        return Some(val: t)
+      end
+      return lookup_named_type(nts: rest, name: name)
+  end
+end
+
+// ─── If inference (always Unit) ─────────────────────────────────────────────
+
+let infer_if = fn (state: CheckState, cond: HirExpr, then_b: [HirStmt], else_b: Option<[HirStmt]>, ret_type: TypeExpr, span: Span) -> InferExprResult do
+  match infer_expr(state: state, expr: cond, ret_type: TyUnit) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: ct) ->
+      let tdefs = tctypes.state_typedefs(state: st1)
+      match unify.unify(t1: ct, t2: TyBool, tdefs: tdefs) do
+        case UnifyErr(message: m) -> return InferExprErr(message: "if condition must be bool: " ++ m, span: span)
+        case UnifyOk(subst: s2) ->
+          let sm = subst.subst_compose(s1: s1, s2: s2)
+          let env1 = subst.subst_apply_env(subst: sm, env: tctypes.state_env(state: st1))
+          let st2 = tctypes.state_with_env(state: st1, env: env1)
+          match infer_stmts(state: st2, stmts: then_b, ret_type: ret_type) do
+            case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "if then: " ++ m, span: espan)
+            case InferExprOk(state: st3, subst: s3, typ: _) ->
+              let sm2 = subst.subst_compose(s1: sm, s2: s3)
+              match else_b do
+                case None -> return InferExprOk(state: st3, subst: sm2, typ: TyUnit)
+                case Some(val: else_stmts) ->
+                  match infer_stmts(state: st3, stmts: else_stmts, ret_type: ret_type) do
+                    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "if else: " ++ m, span: espan)
+                    case InferExprOk(state: st4, subst: s4, typ: _) ->
+                      return InferExprOk(state: st4, subst: subst.subst_compose(s1: sm2, s2: s4), typ: TyUnit)
+                  end
+              end
+          end
+      end
+  end
+end
+
+// ─── Match inference ────────────────────────────────────────────────────────
+
+let infer_match = fn (state: CheckState, target: HirExpr, cases: [HirMatchCase], ret_type: TypeExpr, span: Span) -> InferExprResult do
+  match infer_expr(state: state, expr: target, ret_type: TyUnit) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: tt) ->
+      return infer_match_cases(state: st1, cases: cases, target_type: tt, subst: s1, ret_type: ret_type, result_type: None, span: span)
+  end
+end
+
+let infer_match_cases = fn (
+  state: CheckState, cases: [HirMatchCase],
+  target_type: TypeExpr, subst: [SubstEntry], ret_type: TypeExpr,
+  result_type: Option<TypeExpr>, span: Span
+) -> InferExprResult do
+  match cases do
+    case [] ->
+      // Return the unified result type of all cases, or Unit if no cases
+      let final_type = match result_type do
+        case Some(val: t) -> t
+        case None -> TyUnit
+      end
+      return InferExprOk(state: state, subst: subst, typ: final_type)
+    case HirMatchCase(pattern: pat, body: body) :: rest ->
+      let tt = subst.subst_apply(subst: subst, typ: target_type)
+      match bind_pattern(state: state, pattern: pat, target_type: tt) do
+        case BindErr(message: m) -> return InferExprErr(message: "match pattern: " ++ m, span: span)
+        case BindOk(state: st1, subst: ps, env: bindings) ->
+          let sm = subst.subst_compose(s1: subst, s2: ps)
+          let case_env = append_env(base: tctypes.state_env(state: st1), extra: bindings)
+          let st2 = tctypes.state_with_env(state: st1, env: subst.subst_apply_env(subst: sm, env: case_env))
+          match infer_stmts(state: st2, stmts: body, ret_type: ret_type) do
+            case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "match case: " ++ m, span: espan)
+            case InferExprOk(state: st3, subst: bs, typ: case_type) ->
+              // Unify case type with previous result type (if any)
+              let all_subst = subst.subst_compose(s1: sm, s2: bs)
+              let new_result = match result_type do
+                case None -> case_type
+                case Some(val: prev) ->
+                  let tdefs = tctypes.state_typedefs(state: st3)
+                  let applied_prev = subst.subst_apply(subst: all_subst, typ: prev)
+                  match unify.unify(t1: applied_prev, t2: case_type, tdefs: tdefs) do
+                    case UnifyOk(subst: _) -> case_type
+                    case UnifyErr(message: _) ->
+                      return InferExprErr(message: "Match case type mismatch: expected `" ++ tctypes.type_to_string(typ: applied_prev) ++ "`, found `" ++ tctypes.type_to_string(typ: case_type) ++ "`", span: span)
+                  end
+              end
+              // Restore env to pre-case state
+              let st4 = tctypes.state_with_env(state: st3, env: tctypes.state_env(state: state))
+              return infer_match_cases(
+                state: st4, cases: rest,
+                target_type: target_type, subst: all_subst,
+                ret_type: ret_type, result_type: Some(val: new_result), span: span
+              )
+          end
+      end
+  end
+end
+
+let append_env = fn (base: [EnvEntry], extra: [EnvEntry]) -> [EnvEntry] do
+  match extra do
+    case [] -> return base
+    case entry :: rest ->
+      return append_env(base: entry :: base, extra: rest)
+  end
+end
+
+// ─── While inference ────────────────────────────────────────────────────────
+
+let infer_while = fn (state: CheckState, cond: HirExpr, body: [HirStmt], ret_type: TypeExpr, span: Span) -> InferExprResult do
+  match infer_expr(state: state, expr: cond, ret_type: TyUnit) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: ct) ->
+      let tdefs = tctypes.state_typedefs(state: st1)
+      match unify.unify(t1: ct, t2: TyBool, tdefs: tdefs) do
+        case UnifyErr(message: m) -> return InferExprErr(message: "while cond must be bool: " ++ m, span: span)
+        case UnifyOk(subst: s2) ->
+          let sm = subst.subst_compose(s1: s1, s2: s2)
+          let st2 = tctypes.state_with_env(state: st1, env: subst.subst_apply_env(subst: sm, env: tctypes.state_env(state: st1)))
+          match infer_stmts(state: st2, stmts: body, ret_type: ret_type) do
+            case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "while body: " ++ m, span: espan)
+            case InferExprOk(state: st3, subst: s3, typ: _) ->
+              return InferExprOk(state: st3, subst: subst.subst_compose(s1: sm, s2: s3), typ: TyUnit)
+          end
+      end
+  end
+end
+
+// ─── For inference ──────────────────────────────────────────────────────────
+
+let infer_for = fn (state: CheckState, var: string, start: HirExpr, end_e: HirExpr, body: [HirStmt], ret_type: TypeExpr, span: Span) -> InferExprResult do
+  match infer_expr(state: state, expr: start, ret_type: TyUnit) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: st_t) ->
+      let tdefs = tctypes.state_typedefs(state: st1)
+      match unify.unify(t1: st_t, t2: TyI64, tdefs: tdefs) do
+        case UnifyErr(message: m) -> return InferExprErr(message: "for start must be i64: " ++ m, span: span)
+        case UnifyOk(subst: s2) ->
+          let sm = subst.subst_compose(s1: s1, s2: s2)
+          match infer_expr(state: st1, expr: end_e, ret_type: TyUnit) do
+            case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+            case InferExprOk(state: st2, subst: s3, typ: et_t) ->
+              let sm2 = subst.subst_compose(s1: sm, s2: s3)
+              match unify.unify(t1: et_t, t2: TyI64, tdefs: tdefs) do
+                case UnifyErr(message: m) -> return InferExprErr(message: "for end must be i64: " ++ m, span: span)
+                case UnifyOk(subst: s4) ->
+                  let sm3 = subst.subst_compose(s1: sm2, s2: s4)
+                  let body_env = tctypes.env_insert(env: subst.subst_apply_env(subst: sm3, env: tctypes.state_env(state: st2)), name: var, scheme: tctypes.mono(typ: TyI64))
+                  let st3 = tctypes.state_with_env(state: st2, env: body_env)
+                  match infer_stmts(state: st3, stmts: body, ret_type: ret_type) do
+                    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "for body: " ++ m, span: espan)
+                    case InferExprOk(state: st4, subst: s5, typ: _) ->
+                      return InferExprOk(state: st4, subst: subst.subst_compose(s1: sm3, s2: s5), typ: TyUnit)
+                  end
+              end
+          end
+      end
+  end
+end
+
+// ─── Lambda inference ───────────────────────────────────────────────────────
+
+let infer_lambda = fn (state: CheckState, params: [HirParam], ret_type: TypeExpr, body: [HirStmt], span: Span) -> InferExprResult do
+  let param_types = build_param_named_types(params: params)
+  let body_env = add_params_to_env(env: tctypes.state_env(state: state), params: params)
+  let st1 = tctypes.state_with_env(state: state, env: body_env)
+  match infer_stmts(state: st1, stmts: body, ret_type: ret_type) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "lambda body: " ++ m, span: espan)
+    case InferExprOk(state: st2, subst: s1, typ: _) ->
+      let arrow = TyArrow(
+        params: param_types,
+        ret: ret_type,
+        requires: TyRow(types: [], rest: None),
+        throw_row: TyRow(types: [], rest: None)
+      )
+      return InferExprOk(state: st2, subst: s1, typ: subst.subst_apply(subst: s1, typ: arrow))
+  end
+end
+
+let build_param_named_types = fn (params: [HirParam]) -> [NamedType] do
+  return build_param_named_types_go(params: params, acc: [])
+end
+
+let build_param_named_types_go = fn (params: [HirParam], acc: [NamedType]) -> [NamedType] do
+  match params do
+    case [] -> return reverse_named_types(nts: acc, out: [])
+    case HirParam(name: n, label: _, typ: t) :: rest ->
+      return build_param_named_types_go(params: rest, acc: NamedType(name: n, typ: t) :: acc)
+  end
+end
+
+let add_params_to_env = fn (env: [EnvEntry], params: [HirParam]) -> [EnvEntry] do
+  match params do
+    case [] -> return env
+    case HirParam(name: n, label: _, typ: t) :: rest ->
+      return add_params_to_env(env: tctypes.env_insert(env: env, name: n, scheme: tctypes.mono(typ: t)), params: rest)
+  end
+end
+
+// ─── Raise inference ────────────────────────────────────────────────────────
+
+let infer_raise = fn (state: CheckState, inner: HirExpr, span: Span) -> InferExprResult do
+  match infer_expr(state: state, expr: inner, ret_type: TyUnit) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: _) ->
+      // Raise diverges, return a fresh type variable
+      let FreshResult(state: st2, typ: tv) = tctypes.tc_fresh_var(state: st1)
+      return InferExprOk(state: st2, subst: s1, typ: tv)
+  end
+end
+
+let infer_force = fn (state: CheckState, inner: HirExpr, span: Span) -> InferExprResult do
+  match infer_expr(state: state, expr: inner, ret_type: TyUnit) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: t) ->
+      // Unwrap TyLazy wrapper to get the forced value's type
+      let forced_type = match t do
+        case TyLazy(inner: u) -> u
+        case _ -> t
+      end
+      return InferExprOk(state: st1, subst: s1, typ: forced_type)
+  end
+end
+
+// ─── Statement inference ────────────────────────────────────────────────────
+
+export let infer_stmts = fn (state: CheckState, stmts: [HirStmt], ret_type: TypeExpr) -> InferExprResult do
+  match stmts do
+    case [] -> return InferExprOk(state: state, subst: subst.subst_empty(), typ: TyUnit)
+    case HirStmt(node: s, span: sp) :: rest ->
+      match infer_stmt(state: state, stmt: s, ret_type: ret_type, span: sp) do
+        case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+        case InferExprOk(state: st1, subst: s1, typ: stmt_type) ->
+          match rest do
+            case [] ->
+              // Last statement — its type is the block's type
+              return InferExprOk(state: st1, subst: s1, typ: stmt_type)
+            case _ ->
+              let env1 = subst.subst_apply_env(subst: s1, env: tctypes.state_env(state: st1))
+              let st2 = tctypes.state_with_env(state: st1, env: env1)
+              match infer_stmts(state: st2, stmts: rest, ret_type: subst.subst_apply(subst: s1, typ: ret_type)) do
+                case InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+                case InferExprOk(state: st3, subst: s2, typ: t) ->
+                  return InferExprOk(state: st3, subst: subst.subst_compose(s1: s1, s2: s2), typ: t)
+              end
+          end
+      end
+  end
+end
+
+let infer_stmt = fn (state: CheckState, stmt: HirStmtKind, ret_type: TypeExpr, span: Span) -> InferExprResult do
+  match stmt do
+    case Let(name: name, typ: ann, value: value) ->
+      return infer_let(state: state, name: name, ann: ann, value: value, ret_type: ret_type, span: span)
+    case Expr(expr: expr) ->
+      return infer_expr(state: state, expr: expr, ret_type: ret_type)
+    case Return(expr: expr) ->
+      return infer_return(state: state, expr: expr, ret_type: ret_type, span: span)
+    case Assign(target: _, value: value) ->
+      // Simplified: just check the value expression
+      return infer_expr(state: state, expr: value, ret_type: ret_type)
+    case Try(body: body, catch_param: cp, catch_body: cb) ->
+      return infer_try(state: state, body: body, catch_param: cp, catch_body: cb, ret_type: ret_type, span: span)
+    case Inject(handlers: _, body: body) ->
+      // Simplified: just check the body
+      return infer_stmts(state: state, stmts: body, ret_type: ret_type)
+  end
+end
+
+// ─── Let statement inference ────────────────────────────────────────────────
+
+let infer_let = fn (state: CheckState, name: string, ann: Option<TypeExpr>, value: HirExpr, ret_type: TypeExpr, span: Span) -> InferExprResult do
+  // Pre-register for recursive lambdas
+  let HirExpr(node: val_node, span: _) = value
+  let st0 = if let Lambda(type_params: _, params: params, ret_type: ret, body: _) = val_node then
+    let arrow = TyArrow(
+      params: build_param_named_types(params: params),
+      ret: ret,
+      requires: TyRow(types: [], rest: None),
+      throw_row: TyRow(types: [], rest: None)
+    )
+    let env1 = tctypes.env_insert(env: tctypes.state_env(state: state), name: name, scheme: tctypes.mono(typ: arrow))
+    tctypes.state_with_env(state: state, env: env1)
+  else state end
+  match infer_expr(state: st0, expr: value, ret_type: ret_type) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "let " ++ name ++ ": " ++ m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: t1) ->
+      let final_type = match ann do
+        case Some(val: expected) ->
+          let tdefs = tctypes.state_typedefs(state: st1)
+          match unify.unify(t1: t1, t2: expected, tdefs: tdefs) do
+            case UnifyErr(message: m) ->
+              // We can't return InferExprErr from inside match-as-expression
+              // so we use the annotation type and hope for the best
+              expected
+            case UnifyOk(subst: _) ->
+              expected
+          end
+        case None -> default_numeric_literals(typ: t1)
+      end
+      let env2 = tctypes.env_insert(
+        env: subst.subst_apply_env(subst: s1, env: tctypes.state_env(state: st1)),
+        name: name, scheme: tctypes.mono(typ: final_type)
+      )
+      return InferExprOk(state: tctypes.state_with_env(state: st1, env: env2), subst: s1, typ: TyUnit)
+  end
+end
+
+// ─── Return statement inference ─────────────────────────────────────────────
+
+let infer_return = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr, span: Span) -> InferExprResult do
+  match infer_expr(state: state, expr: expr, ret_type: ret_type) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "return: " ++ m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: t1) ->
+      let expected = subst.subst_apply(subst: s1, typ: ret_type)
+      let tdefs = tctypes.state_typedefs(state: st1)
+      match unify.unify(t1: t1, t2: expected, tdefs: tdefs) do
+        case UnifyErr(message: m) -> return InferExprErr(message: "return type mismatch: " ++ m, span: span)
+        case UnifyOk(subst: s2) ->
+          return InferExprOk(state: st1, subst: subst.subst_compose(s1: s1, s2: s2), typ: TyUnit)
+      end
+  end
+end
+
+// ─── Try inference ──────────────────────────────────────────────────────────
+
+let infer_try = fn (state: CheckState, body: [HirStmt], catch_param: string, catch_body: [HirStmt], ret_type: TypeExpr, span: Span) -> InferExprResult do
+  match infer_stmts(state: state, stmts: body, ret_type: ret_type) do
+    case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "try body: " ++ m, span: espan)
+    case InferExprOk(state: st1, subst: s1, typ: _) ->
+      let catch_env = tctypes.env_insert(
+        env: tctypes.state_env(state: st1),
+        name: catch_param,
+        scheme: tctypes.mono(typ: TyUserDefined(name: "Exn", args: []))
+      )
+      let st2 = tctypes.state_with_env(state: st1, env: catch_env)
+      match infer_stmts(state: st2, stmts: catch_body, ret_type: ret_type) do
+        case InferExprErr(message: m, span: espan) -> return InferExprErr(message: "catch: " ++ m, span: espan)
+        case InferExprOk(state: st3, subst: s2, typ: _) ->
+          // Restore env to pre-try state
+          let st4 = tctypes.state_with_env(state: st3, env: tctypes.state_env(state: state))
+          return InferExprOk(state: st4, subst: subst.subst_compose(s1: s1, s2: s2), typ: TyUnit)
+      end
+  end
+end
+
+// ─── Pattern binding ────────────────────────────────────────────────────────
+
+export let bind_pattern = fn (state: CheckState, pattern: HirPatternKind, target_type: TypeExpr) -> BindResult do
+  match pattern do
+    case PWild ->
+      return BindOk(state: state, subst: subst.subst_empty(), env: [])
+    case PVar(name: name, sigil: _) ->
+      return BindOk(
+        state: state, subst: subst.subst_empty(),
+        env: [EnvEntry(name: name, scheme: tctypes.mono(typ: target_type))]
+      )
+    case PLit(lit: lit) ->
+      let lit_type = match lit do
+        case LitInt(val: _) -> TyIntLit
+        case LitFloat(val: _) -> TyFloatLit
+        case LitBool(val: _) -> TyBool
+        case LitChar(val: _) -> TyChar
+        case LitString(val: _) -> TyString
+        case LitUnit -> TyUnit
+      end
+      let tdefs = tctypes.state_typedefs(state: state)
+      match unify.unify(t1: lit_type, t2: target_type, tdefs: tdefs) do
+        case UnifyErr(message: m) -> return BindErr(message: "literal pattern: " ++ m)
+        case UnifyOk(subst: s) -> return BindOk(state: state, subst: s, env: [])
+      end
+    case PCtor(variant: variant, fields: fields) ->
+      return bind_constructor_pattern(state: state, variant: variant, fields: fields, target_type: target_type)
+    case PRec(fields: fields, is_partial: _) ->
+      return bind_record_pattern(state: state, fields: fields, target_type: target_type)
+  end
+end
+
+let bind_constructor_pattern = fn (
+  state: CheckState, variant: string,
+  fields: [HirPatternField], target_type: TypeExpr
+) -> BindResult do
+  // Strip Linear/Lazy/Ref/Borrow wrapper for pattern matching (e.g., let ByteBuffer(id: id) = %buf)
+  let unwrapped = match target_type do
+    case TyLinear(inner: i) -> i
+    case TyLazy(inner: i) -> i
+    case TyRef(inner: i) -> i
+    case TyBorrow(inner: i) -> i
+    case _ -> target_type
+  end
+  match tctypes.find_variant(defs: tctypes.state_enums(state: state), variant: variant) do
+    case None -> return BindErr(message: "unknown constructor in pattern: " ++ variant)
+    case Some(val: EnumVariantInfo(enum_name: ename, type_params: tps, fields: field_types)) ->
+      let fr = freshen_type_params(state: state, params: tps)
+      match fr do
+        case FreshenResult(state: st1, param_subst: psubst) ->
+          let enum_type = build_enum_type(name: ename, params: tps, param_subst: psubst)
+          let tdefs = tctypes.state_typedefs(state: st1)
+          match unify.unify(t1: enum_type, t2: unwrapped, tdefs: tdefs) do
+            case UnifyErr(message: m) -> return BindErr(message: "constructor pattern type: " ++ m)
+            case UnifyOk(subst: s1) ->
+              let full_subst = subst.subst_compose(s1: psubst, s2: s1)
+              return bind_ctor_fields(state: st1, fields: fields, field_types: field_types, param_subst: full_subst, subst: s1, env: [])
+          end
+      end
+  end
+end
+
+let bind_ctor_fields = fn (
+  state: CheckState, fields: [HirPatternField], field_types: [VariantField],
+  param_subst: [SubstEntry], subst: [SubstEntry], env: [EnvEntry]
+) -> BindResult do
+  match fields do
+    case [] -> return BindOk(state: state, subst: subst, env: env)
+    case HirPatternField(name: _, pattern: pat) :: rf ->
+      match field_types do
+        case [] -> return BindErr(message: "too many constructor pattern fields")
+        case VariantField(name: _, typ: ft) :: rft ->
+          let expected = subst.subst_apply(subst: param_subst, typ: ft)
+          match bind_pattern(state: state, pattern: pat, target_type: expected) do
+            case BindErr(message: m) -> return BindErr(message: m)
+            case BindOk(state: st1, subst: ps, env: new_binds) ->
+              let sm = subst.subst_compose(s1: subst, s2: ps)
+              return bind_ctor_fields(
+                state: st1, fields: rf, field_types: rft,
+                param_subst: param_subst, subst: sm,
+                env: append_env(base: env, extra: new_binds)
+              )
+          end
+      end
+  end
+end
+
+let bind_record_pattern = fn (
+  state: CheckState, fields: [HirRecordPatField], target_type: TypeExpr
+) -> BindResult do
+  return if let TyRecord(fields: rec_fields) = target_type then
+    bind_rec_pat_fields(state: state, fields: fields, rec_fields: rec_fields, subst: subst.subst_empty(), env: [])
+  else BindErr(message: "record pattern on non-record type") end
+end
+
+let bind_rec_pat_fields = fn (
+  state: CheckState, fields: [HirRecordPatField],
+  rec_fields: [NamedType], subst: [SubstEntry], env: [EnvEntry]
+) -> BindResult do
+  match fields do
+    case [] -> return BindOk(state: state, subst: subst, env: env)
+    case HirRecordPatField(name: fname, pattern: pat) :: rest ->
+      match lookup_named_type(nts: rec_fields, name: fname) do
+        case None -> return BindErr(message: "no field " ++ fname ++ " in record pattern")
+        case Some(val: ft) ->
+          match bind_pattern(state: state, pattern: pat, target_type: ft) do
+            case BindErr(message: m) -> return BindErr(message: m)
+            case BindOk(state: st1, subst: ps, env: new_binds) ->
+              let sm = subst.subst_compose(s1: subst, s2: ps)
+              return bind_rec_pat_fields(
+                state: st1, fields: rest, rec_fields: rec_fields,
+                subst: sm, env: append_env(base: env, extra: new_binds)
+              )
+          end
+      end
+  end
+end
+
+// ─── Numeric literal defaulting ─────────────────────────────────────────────
+
+export let default_numeric_literals = fn (typ: TypeExpr) -> TypeExpr do
+  match typ do
+    case TyIntLit -> return TyI64
+    case TyFloatLit -> return TyF64
+    case TyArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
+      return TyArrow(
+        params: default_named_types(nts: ps),
+        ret: default_numeric_literals(typ: r),
+        requires: req,
+        throw_row: thr
+      )
+    case TyArray(elem: e) -> return TyArray(elem: default_numeric_literals(typ: e))
+    case TyList(elem: e) -> return TyList(elem: default_numeric_literals(typ: e))
+    case TyRecord(fields: fs) -> return TyRecord(fields: default_named_types(nts: fs))
+    case _ -> return typ
+  end
+end
+
+let default_named_types = fn (nts: [NamedType]) -> [NamedType] do
+  return default_named_types_go(nts: nts, acc: [])
+end
+
+let default_named_types_go = fn (nts: [NamedType], acc: [NamedType]) -> [NamedType] do
+  match nts do
+    case [] -> return reverse_named_types(nts: acc, out: [])
+    case NamedType(name: n, typ: t) :: rest ->
+      return default_named_types_go(nts: rest, acc: NamedType(name: n, typ: default_numeric_literals(typ: t)) :: acc)
+  end
+end
+
+// ─── Monomorphic reverse helpers (list.reverse has codegen issues in nxc) ────
+
+let rev_variant_fields = fn (lst: [VariantField], out: [VariantField]) -> [VariantField] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_variant_fields(lst: rest, out: x :: out)
+  end
+end
+
+let rev_type_exprs = fn (lst: [TypeExpr], out: [TypeExpr]) -> [TypeExpr] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_type_exprs(lst: rest, out: x :: out)
+  end
+end

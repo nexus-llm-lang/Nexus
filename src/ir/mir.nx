@@ -1,0 +1,829 @@
+/**
+ * mir: Mid-level IR — static port call resolution.
+ *
+ * Transforms HIR → MIR by:
+ * 1. Resolving port.method() calls to direct handler function calls
+ * 2. Inlining inject scopes (compile-time effect, no runtime representation)
+ * 3. Desugaring for-loops to while-loops
+ * 4. Dropping lambda/handler expressions to Unit (lifted during HIR build)
+ */
+import { Span } from "src/common/token.nx"
+import * as naming from "src/common/naming.nx"
+import * as str from "stdlib/string.nx"
+import { BinaryOp, Literal, TypeExpr } from "src/common/ast.nx"
+import * as hir from "src/ir/hir_types.nx"
+import { HirExprKind, HirStmtKind, HirCallArg, HirParam, HirFunction,
+         HirMatchCase, HirPatternKind, HirPatternField, HirRecordPatField,
+         HirPort, HirPortMethod, HirExternal, HirHandlerBinding,
+         HirHandlerBindingEntry, HirProgram, HirNamedExpr,
+         HirExpr, HirStmt,
+         HirBody, EagerBody, LazyBody } from "src/ir/hir_types.nx"
+import { MirParam, MirExternal, MirFunction, MirCallArg, MirExpr,
+         MirNamedExpr, MirStmt, MirMatchCase, MirPattern,
+         MirPatternField, MirRecordPatField, MirProgram } from "src/ir/mir_types.nx"
+// (merged into import above)
+
+// ─── Internal Helper Types ──────────────────────────────────────────────────
+
+type NamePair = NamePair(key: string, value: string)
+
+type PortEntry = PortEntry(name: string, prefix: string, methods: [string])
+
+/// Bundles the 6 threading parameters into a single context record.
+type MirCtx = MirCtx(
+  scope: [NamePair],
+  port_layouts: [PortEntry],
+  handler_port_names: [NamePair],
+  all_funcs: [HirFunction],
+  all_handlers: [HirHandlerBindingEntry],
+  all_exts: [HirExternal],
+  closure_counter: i64,
+  lifted_funcs: [MirFunction]
+)
+
+// ─── Lookup helpers (list-based maps) ────────────────────────────────────────
+
+let lookup = fn (key: string, pairs: [NamePair]) -> Option<string> do
+  match pairs do
+    case [] -> return None
+    case NamePair(key: k, value: v) :: rest ->
+      if k == key then return Some(val: v)
+      else return lookup(key: key, pairs: rest)
+      end
+  end
+end
+
+let insert_or_replace = fn (key: string, value: string, pairs: [NamePair]) -> [NamePair] do
+  return NamePair(key: key, value: value) :: remove_key(key: key, pairs: pairs)
+end
+
+let remove_key = fn (key: string, pairs: [NamePair]) -> [NamePair] do
+  return remove_key_go(key: key, pairs: pairs, acc: [])
+end
+
+let remove_key_go = fn (key: string, pairs: [NamePair], acc: [NamePair]) -> [NamePair] do
+  match pairs do
+    case [] -> return rev_name_pairs(lst: acc, out: [])
+    case NamePair(key: k, value: val) :: rest ->
+      if k == key then return remove_key_go(key: key, pairs: rest, acc: acc)
+      else return remove_key_go(key: key, pairs: rest, acc: NamePair(key: k, value: val) :: acc)
+      end
+  end
+end
+
+let lookup_port = fn (name: string, ports: [PortEntry]) -> Option<[string]> do
+  match ports do
+    case [] -> return None
+    case PortEntry(name: n, prefix: _, methods: ms) :: rest ->
+      if n == name then return Some(val: ms)
+      else return lookup_port(name: name, ports: rest)
+      end
+  end
+end
+
+// ─── Port Layout Building ───────────────────────────────────────────────────
+
+let build_port_layouts = fn (ports: [HirPort]) -> [PortEntry] do
+  return build_port_layouts_go(ports: ports, acc: [])
+end
+
+let build_port_layouts_go = fn (ports: [HirPort], acc: [PortEntry]) -> [PortEntry] do
+  match ports do
+    case [] -> return rev_port_entries(lst: acc, out: [])
+    case HirPort(name: n, methods: ms) :: rest ->
+      let method_names = extract_method_names(methods: ms)
+      return build_port_layouts_go(ports: rest, acc: PortEntry(name: n, prefix: n ++ ".", methods: method_names) :: acc)
+  end
+end
+
+let extract_method_names = fn (methods: [HirPortMethod]) -> [string] do
+  return extract_method_names_go(methods: methods, acc: [])
+end
+
+let extract_method_names_go = fn (methods: [HirPortMethod], acc: [string]) -> [string] do
+  match methods do
+    case [] -> return rev_strings(lst: acc, out: [])
+    case HirPortMethod(name: n) :: rest ->
+      return extract_method_names_go(methods: rest, acc: n :: acc)
+  end
+end
+
+// ─── Handler Mapping ────────────────────────────────────────────────────────
+
+/// Build handler_binding_name → port_name mapping.
+let build_handler_port_names = fn (bindings: [HirHandlerBindingEntry]) -> [NamePair] do
+  return build_handler_port_names_go(bindings: bindings, acc: [])
+end
+
+let build_handler_port_names_go = fn (bindings: [HirHandlerBindingEntry], acc: [NamePair]) -> [NamePair] do
+  match bindings do
+    case [] -> return rev_name_pairs(lst: acc, out: [])
+    case HirHandlerBindingEntry(name: bname, binding: HirHandlerBinding(port_name: pname, functions: _)) :: rest ->
+      return build_handler_port_names_go(bindings: rest, acc: NamePair(key: bname, value: pname) :: acc)
+  end
+end
+
+/// Build global port_name → handler_binding_name mapping (last handler wins).
+let build_global_port_handlers = fn (handler_port_names: [NamePair]) -> [NamePair] do
+  return build_global_go(pairs: handler_port_names, accum: [])
+end
+
+let build_global_go = fn (pairs: [NamePair], accum: [NamePair]) -> [NamePair] do
+  match pairs do
+    case [] -> return accum
+    case NamePair(key: binding_name, value: port_name) :: rest ->
+      let new_accum = insert_or_replace(key: port_name, value: binding_name, pairs: accum)
+      return build_global_go(pairs: rest, accum: new_accum)
+  end
+end
+
+// ─── Return Type Lookup ─────────────────────────────────────────────────────
+
+let lookup_ret_type = fn (name: string, ctx: MirCtx) -> TypeExpr do
+  match ctx do
+    case MirCtx(scope: _, port_layouts: _, handler_port_names: _, all_funcs: funcs, all_handlers: handlers, all_exts: exts, closure_counter: _, lifted_funcs: _) ->
+      let from_funcs = lookup_ret_in_functions(name: name, functions: funcs)
+      match from_funcs do
+        case Some(val: t) -> return t
+        case None ->
+          let from_handlers = lookup_ret_in_handlers(name: name, bindings: handlers)
+          match from_handlers do
+            case Some(val: t) -> return t
+            case None ->
+              let from_exts = lookup_ret_in_externals(name: name, externals: exts)
+              match from_exts do
+                case Some(val: t) -> return t
+                case None -> return TyI64
+              end
+          end
+      end
+  end
+end
+
+let lookup_ret_in_functions = fn (name: string, functions: [HirFunction]) -> Option<TypeExpr> do
+  match functions do
+    case [] -> return None
+    case HirFunction(name: n, type_params: _, params: _, ret_type: rt, body: _, span: _) :: rest ->
+      if n == name then return Some(val: rt)
+      else return lookup_ret_in_functions(name: name, functions: rest)
+      end
+  end
+end
+
+let lookup_ret_in_handlers = fn (name: string, bindings: [HirHandlerBindingEntry]) -> Option<TypeExpr> do
+  match bindings do
+    case [] -> return None
+    case HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, functions: fs)) :: rest ->
+      let found = lookup_ret_in_functions(name: name, functions: fs)
+      match found do
+        case Some(val: _) -> return found
+        case None -> return lookup_ret_in_handlers(name: name, bindings: rest)
+      end
+  end
+end
+
+let lookup_ret_in_externals = fn (name: string, externals: [HirExternal]) -> Option<TypeExpr> do
+  match externals do
+    case [] -> return None
+    case HirExternal(name: n, wasm_module: _, wasm_name: _, params: _, ret_type: rt, throw_row: _) :: rest ->
+      if n == name then return Some(val: rt)
+      else return lookup_ret_in_externals(name: name, externals: rest)
+      end
+  end
+end
+
+// ─── Port Call Detection ────────────────────────────────────────────────────
+
+/// Check if a function name is a port-qualified call. Returns (port_name, method_name) if so.
+type PortCallResult = PortCallFound(port_name: string, method_name: string) | PortCallNotFound
+
+let detect_port_call = fn (func: string, port_layouts: [PortEntry]) -> PortCallResult do
+  match port_layouts do
+    case [] -> return PortCallNotFound
+    case PortEntry(name: pname, prefix: prefix, methods: _) :: rest ->
+      if str.starts_with(s: func, prefix: prefix) then
+        let plen = str.length(s: prefix)
+        let method = str.substring(s: func, start: plen, len: str.length(s: func) - plen)
+        return PortCallFound(port_name: pname, method_name: method)
+      else
+        return detect_port_call(func: func, port_layouts: rest)
+      end
+  end
+end
+
+let starts_with = fn (s: string, prefix: string) -> bool do
+  let plen = str.length(s: prefix)
+  let slen = str.length(s: s)
+  if slen < plen then return false
+  else return str.substring(s: s, start: 0, len: plen) == prefix
+  end
+end
+
+// ─── Lower HIR → MIR ───────────────────────────────────────────────────────
+
+export let lower_hir_to_mir = fn (hir: HirProgram) -> MirProgram do
+  let HirProgram(ports: ports, functions: funcs, externals: exts, handler_bindings: hbs, enum_defs: _) = hir
+  let port_layouts = build_port_layouts(ports: ports)
+  let handler_port_names = build_handler_port_names(bindings: hbs)
+  // If handler_port_names is empty (ExprHandler matching failed in component model),
+  // infer from function names + port methods.
+  let inferred = infer_handler_port_names(funcs: funcs, ports: ports)
+  let effective_hpn = match handler_port_names do
+    case [] -> inferred
+    case _ -> append_name_pairs(a: handler_port_names, b: inferred)
+  end
+  let global_scope_base = build_global_port_handlers(handler_port_names: effective_hpn)
+  // Always add known port→handler mappings as fallback
+  let global_scope = insert_or_replace(key: "Console", value: "stdio.system_handler",
+    pairs: insert_or_replace(key: "Fs", value: "fs_mod.system_handler",
+    pairs: insert_or_replace(key: "Clock", value: "clock_mod.system_handler",
+    pairs: global_scope_base)))
+
+  let ctx = MirCtx(
+    scope: global_scope,
+    port_layouts: port_layouts,
+    handler_port_names: effective_hpn,
+    all_funcs: funcs,
+    all_handlers: hbs,
+    all_exts: exts,
+    closure_counter: 0,
+    lifted_funcs: []
+  )
+
+  let mir_externals = lower_externals(exts: exts)
+  let mir_funcs = lower_functions(functions: funcs, ctx: ctx)
+  let mir_handler_funcs = lower_handler_functions(bindings: hbs, ctx: ctx)
+  let all_mir_funcs = concat_mir_funcs(a: mir_funcs, b: mir_handler_funcs)
+
+  return MirProgram(functions: all_mir_funcs, externals: mir_externals)
+end
+
+// ─── Lower Externals ────────────────────────────────────────────────────────
+
+let lower_externals = fn (exts: [HirExternal]) -> [MirExternal] do
+  return lower_externals_go(exts: exts, acc: [])
+end
+
+let lower_externals_go = fn (exts: [HirExternal], acc: [MirExternal]) -> [MirExternal] do
+  match exts do
+    case [] -> return rev_mir_externals(lst: acc, out: [])
+    case HirExternal(name: n, wasm_module: wm, wasm_name: wn, params: ps, ret_type: rt, throw_row: tr) :: rest ->
+      let mir_params = lower_hir_params(params: ps)
+      return lower_externals_go(exts: rest, acc: MirExternal(name: n, wasm_module: wm, wasm_name: wn,
+                       params: mir_params, ret_type: rt, throw_row: tr) :: acc)
+  end
+end
+
+let lower_hir_params = fn (params: [HirParam]) -> [MirParam] do
+  return lower_hir_params_go(params: params, acc: [])
+end
+
+let lower_hir_params_go = fn (params: [HirParam], acc: [MirParam]) -> [MirParam] do
+  match params do
+    case [] -> return rev_mir_params(lst: acc, out: [])
+    case HirParam(name: n, label: l, typ: t) :: rest ->
+      return lower_hir_params_go(params: rest, acc: MirParam(label: l, name: n, typ: t) :: acc)
+  end
+end
+
+// ─── Lower Functions ────────────────────────────────────────────────────────
+
+let lower_functions = fn (functions: [HirFunction], ctx: MirCtx) -> [MirFunction] do
+  return lower_functions_go(functions: functions, ctx: ctx, acc: [])
+end
+
+let lower_functions_go = fn (functions: [HirFunction], ctx: MirCtx, acc: [MirFunction]) -> [MirFunction] do
+  match functions do
+    case [] -> return rev_mir_funcs(lst: acc, out: [])
+    case f :: rest ->
+      let mir_f = lower_function(func: f, ctx: ctx)
+      return lower_functions_go(functions: rest, ctx: ctx, acc: mir_f :: acc)
+  end
+end
+
+let lower_handler_functions = fn (bindings: [HirHandlerBindingEntry], ctx: MirCtx) -> [MirFunction] do
+  match bindings do
+    case [] -> return []
+    case HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, functions: fs)) :: rest ->
+      let lowered = lower_functions(functions: fs, ctx: ctx)
+      let rest_lowered = lower_handler_functions(bindings: rest, ctx: ctx)
+      return concat_mir_funcs(a: lowered, b: rest_lowered)
+  end
+end
+
+let lower_function = fn (func: HirFunction, ctx: MirCtx) -> MirFunction do
+  let HirFunction(name: n, type_params: _, params: ps, ret_type: rt, body: hir_body, span: sp) = func
+  let body = match hir_body do case EagerBody(stmts: s) -> s case LazyBody(ast_expr: _, entries: _) -> [] end
+  let mir_params = lower_hir_params(params: ps)
+  let mir_body = lower_stmts(stmts: body, ctx: ctx)
+  return MirFunction(name: n, params: mir_params, ret_type: rt, body: mir_body, span: sp)
+end
+
+// ─── Lower Statements ───────────────────────────────────────────────────────
+
+let lower_stmts = fn (stmts: [HirStmt], ctx: MirCtx) -> [MirStmt] do
+  match stmts do
+    case [] -> return []
+    case HirStmt(node: s, span: _) :: rest ->
+      let lowered = lower_stmt(stmt: s, ctx: ctx)
+      let rest_lowered = lower_stmts(stmts: rest, ctx: ctx)
+      return concat_mir_stmts(a: lowered, b: rest_lowered)
+  end
+end
+
+/// Lower a statement, returning a list (inject/for desugar may produce multiple).
+let lower_stmt = fn (stmt: HirStmtKind, ctx: MirCtx) -> [MirStmt] do
+  match stmt do
+    case Let(name: n, typ: t, value: v) ->
+      let mir_typ = match t do
+        case Some(val: te) -> te
+        case None -> TyUnit
+      end
+      let mir_val = lower_expr(expr: v, ctx: ctx)
+      return [MirStmtLet(name: n, typ: mir_typ, expr: mir_val)]
+
+    case Expr(expr: se) ->
+      let HirExpr(node: e, span: _) = se
+      match e do
+        case For(var: var, start: s, end_expr: end_e, body: b) ->
+          return desugar_for(var: var, start_expr: s, end_expr: end_e, body: b, ctx: ctx)
+        case _ ->
+          let mir_e = lower_expr(expr: se, ctx: ctx)
+          return [MirStmtExpr(expr: mir_e)]
+      end
+
+    case Return(expr: e) ->
+      let mir_e = lower_expr(expr: e, ctx: ctx)
+      return [MirStmtReturn(expr: mir_e)]
+
+    case Assign(target: t, value: v) ->
+      let mir_t = lower_expr(expr: t, ctx: ctx)
+      let mir_v = lower_expr(expr: v, ctx: ctx)
+      return [MirStmtAssign(target: mir_t, value: mir_v)]
+
+    case Try(body: b, catch_param: cp, catch_body: cb) ->
+      let mir_b = lower_stmts(stmts: b, ctx: ctx)
+      let mir_cb = lower_stmts(stmts: cb, ctx: ctx)
+      return [MirStmtTry(body: mir_b, catch_param: cp, catch_body: mir_cb)]
+
+    case Inject(handlers: hs, body: b) ->
+      let MirCtx(scope: scope, port_layouts: pl, handler_port_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf) = ctx
+      let new_scope = activate_handlers(handler_names: hs, handler_port_names: hpn, scope: scope)
+      let new_ctx = MirCtx(scope: new_scope, port_layouts: pl, handler_port_names: hpn,
+                           all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf)
+      return lower_stmts(stmts: b, ctx: new_ctx)
+  end
+end
+
+let activate_handlers = fn (handler_names: [string], handler_port_names: [NamePair], scope: [NamePair]) -> [NamePair] do
+  match handler_names do
+    case [] -> return scope
+    case hname :: rest ->
+      let port_opt = lookup(key: hname, pairs: handler_port_names)
+      let new_scope = match port_opt do
+        case Some(val: pname) -> insert_or_replace(key: pname, value: hname, pairs: scope)
+        case None -> scope
+      end
+      return activate_handlers(handler_names: rest, handler_port_names: handler_port_names, scope: new_scope)
+  end
+end
+
+// ─── For-loop Desugaring ────────────────────────────────────────────────────
+
+let desugar_for = fn (var: string, start_expr: HirExpr, end_expr: HirExpr, body: [HirStmt], ctx: MirCtx) -> [MirStmt] do
+  let end_name = "__for_end_" ++ var
+  let mir_start = lower_expr(expr: start_expr, ctx: ctx)
+  let mir_end = lower_expr(expr: end_expr, ctx: ctx)
+  let mir_body = lower_stmts(stmts: body, ctx: ctx)
+  // Append increment: var <- var + 1
+  let incr = MirStmtAssign(
+    target: MirVariable(name: var),
+    value: MirBinaryOp(left: MirVariable(name: var), op: OpAdd, right: MirLiteral(lit: LitInt(val: 1)))
+  )
+  let full_body = concat_mir_stmts(a: mir_body, b: [incr])
+  return [
+    MirStmtLet(name: var, typ: TyI64, expr: mir_start),
+    MirStmtLet(name: end_name, typ: TyI64, expr: mir_end),
+    MirStmtExpr(expr: MirWhile(
+      cond: MirBinaryOp(left: MirVariable(name: var), op: OpLt, right: MirVariable(name: end_name)),
+      body: full_body
+    ))
+  ]
+end
+
+// ─── Lower Expressions ─────────────────────────────────────────────────────
+
+let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExpr do
+  let HirExpr(node: node, span: _) = expr
+  match node do
+    case Literal(lit: l) -> return MirLiteral(lit: l)
+    case Variable(name: n, sigil: _) -> return MirVariable(name: n)
+    case BinOp(left: l, op: op, right: r) ->
+      return MirBinaryOp(
+        left: lower_expr(expr: l, ctx: ctx),
+        op: op,
+        right: lower_expr(expr: r, ctx: ctx)
+      )
+    case Borrow(name: n, sigil: _) -> return MirBorrow(name: n)
+    case Call(func: f, args: args) ->
+      match ctx do
+        case MirCtx(scope: _, port_layouts: pl, handler_port_names: _, all_funcs: _, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: _) ->
+          let port_result = detect_port_call(func: f, port_layouts: pl)
+          match port_result do
+            case PortCallFound(port_name: pname, method_name: mname) ->
+              return lower_port_call(port_name: pname, method_name: mname, args: args, ctx: ctx)
+            case PortCallNotFound ->
+              let mir_args = lower_call_args(args: args, ctx: ctx)
+              let ret_type = lookup_ret_type(name: f, ctx: ctx)
+              return MirCall(func: f, args: mir_args, ret_type: ret_type)
+          end
+      end
+    case Ctor(variant: v, args: args) ->
+      return MirConstructor(name: v, args: lower_expr_list(exprs: args, ctx: ctx))
+    case Record(fields: fs) ->
+      return MirRecord(fields: lower_named_exprs(exprs: fs, ctx: ctx))
+    case Array(elems: es) ->
+      return MirArray(elems: lower_expr_list(exprs: es, ctx: ctx))
+    case Index(target: t, index: i) ->
+      return MirIndex(
+        target: lower_expr(expr: t, ctx: ctx),
+        index: lower_expr(expr: i, ctx: ctx)
+      )
+    case FieldAccess(target: t, field: f) ->
+      return MirFieldAccess(
+        target: lower_expr(expr: t, ctx: ctx),
+        field: f
+      )
+    case If(cond: c, then_branch: tb, else_branch: eb) ->
+      let mir_cond = lower_expr(expr: c, ctx: ctx)
+      let mir_then = lower_stmts(stmts: tb, ctx: ctx)
+      let mir_else = match eb do
+        case Some(val: stmts) -> Some(val: lower_stmts(stmts: stmts, ctx: ctx))
+        case None -> None
+      end
+      return MirIf(cond: mir_cond, then_body: mir_then, else_body: mir_else)
+    case Match(target: t, cases: cs) ->
+      let mir_target = lower_expr(expr: t, ctx: ctx)
+      let mir_cases = lower_match_cases(cases: cs, ctx: ctx)
+      return MirMatch(target: mir_target, cases: mir_cases)
+    case While(cond: c, body: b) ->
+      return MirWhile(
+        cond: lower_expr(expr: c, ctx: ctx),
+        body: lower_stmts(stmts: b, ctx: ctx)
+      )
+    case For(var: var, start: s, end_expr: e, body: b) ->
+      // For in expression position — desugar to while
+      let end_name = "__for_end_" ++ var
+      let mir_body = lower_stmts(stmts: b, ctx: ctx)
+      let incr = MirStmtAssign(
+        target: MirVariable(name: var),
+        value: MirBinaryOp(left: MirVariable(name: var), op: OpAdd, right: MirLiteral(lit: LitInt(val: 1)))
+      )
+      return MirWhile(
+        cond: MirBinaryOp(left: MirVariable(name: var), op: OpLt, right: MirVariable(name: end_name)),
+        body: concat_mir_stmts(a: mir_body, b: [incr])
+      )
+    case Lambda(type_params: _, params: _, ret_type: _, body: _) ->
+      return MirLiteral(lit: LitUnit)
+    case Raise(expr: e) ->
+      return MirRaise(expr: lower_expr(expr: e, ctx: ctx))
+    case Force(expr: e) ->
+      return MirForce(expr: lower_expr(expr: e, ctx: ctx))
+    case ExternalRef(symbol: sym, arg_names: _, typ: _) ->
+      return MirVariable(name: sym)
+    case Handler(port_name: _, functions: _) ->
+      return MirLiteral(lit: LitUnit)
+  end
+end
+
+// ─── Port Call Resolution ───────────────────────────────────────────────────
+
+let lower_port_call = fn (port_name: string, method_name: string, args: [HirCallArg], ctx: MirCtx) -> MirExpr do
+  match ctx do
+    case MirCtx(scope: scope, port_layouts: _, handler_port_names: hpn, all_funcs: _, all_handlers: all_hbs, all_exts: _, closure_counter: _, lifted_funcs: _) ->
+      // Use global_scope mapping first, then fallback chain.
+      // The global_scope is built at MIR init from handler_port_names.
+      let handler_name = match lookup(key: port_name, pairs: scope) do
+        case Some(val: h) -> h
+        case None ->
+          match reverse_lookup(value: port_name, pairs: hpn) do
+            case Some(val: bname) -> bname
+            case None ->
+              match find_handler_by_port(port_name: port_name, bindings: all_hbs) do
+                case Some(val: bname2) -> bname2
+                // Last resort: check if port_name.system_handler exists
+                case None -> port_name
+              end
+          end
+      end
+      let func_name = naming.handler_func_name(handler_name: handler_name, method_name: method_name)
+      let ret_type = lookup_ret_type(name: func_name, ctx: ctx)
+      let mir_args = lower_call_args(args: args, ctx: ctx)
+      return MirCall(func: func_name, args: mir_args, ret_type: ret_type)
+  end
+end
+
+/// Infer handler_binding_name → port_name from function names and port list.
+/// Scans for functions named __handler_<binding>_<method> and matches against port methods.
+let infer_handler_port_names = fn (funcs: [HirFunction], ports: [HirPort]) -> [NamePair] do
+  return infer_hpn_go(funcs: funcs, ports: ports, acc: [])
+end
+
+let infer_hpn_go = fn (funcs: [HirFunction], ports: [HirPort], acc: [NamePair]) -> [NamePair] do
+  match funcs do
+    case [] -> return acc
+    case HirFunction(name: n, type_params: _, params: _, ret_type: _, body: _, span: _) :: rest ->
+      if str.starts_with(s: n, prefix: "__handler_") then
+        // Extract binding_name from __handler_<binding>_<method>
+        // Find the port that has a method matching the suffix
+        match infer_port_from_handler(name: n, ports: ports) do
+          case Some(val: pair) ->
+            if name_pair_in_list(key: pair, pairs: acc) == false then
+              return infer_hpn_go(funcs: rest, ports: ports, acc: pair :: acc)
+            else
+              return infer_hpn_go(funcs: rest, ports: ports, acc: acc)
+            end
+          case None -> return infer_hpn_go(funcs: rest, ports: ports, acc: acc)
+        end
+      else
+        return infer_hpn_go(funcs: rest, ports: ports, acc: acc)
+      end
+  end
+end
+
+let name_pair_in_list = fn (key: NamePair, pairs: [NamePair]) -> bool do
+  match pairs do
+    case [] -> return false
+    case NamePair(key: k, value: _) :: rest ->
+      let NamePair(key: nk, value: _) = key
+      if k == nk then return true
+      else return name_pair_in_list(key: key, pairs: rest)
+      end
+  end
+end
+
+let infer_port_from_handler = fn (name: string, ports: [HirPort]) -> Option<NamePair> do
+  // name = __handler_<binding>_<method>
+  // Try each port: if name ends with _<method> for any method in the port,
+  // the binding_name is everything between __handler_ and _<method>
+  match ports do
+    case [] -> return None
+    case HirPort(name: pname, methods: methods) :: rest ->
+      match infer_binding_from_methods(handler_name: name, port_name: pname, methods: methods) do
+        case Some(val: binding) -> return Some(val: NamePair(key: binding, value: pname))
+        case None -> return infer_port_from_handler(name: name, ports: rest)
+      end
+  end
+end
+
+let infer_binding_from_methods = fn (handler_name: string, port_name: string, methods: [HirPortMethod]) -> Option<string> do
+  match methods do
+    case [] -> return None
+    case HirPortMethod(name: mname) :: rest ->
+      let suffix = "_" ++ mname
+      if str.ends_with(s: handler_name, suffix: suffix) then
+        // binding = handler_name without "__handler_" prefix and "_<method>" suffix
+        let prefix_len = 10 // length("__handler_")
+        let suffix_len = str.length(s: suffix)
+        let total_len = str.length(s: handler_name)
+        let binding = str.substring(s: handler_name, start: prefix_len, len: total_len - prefix_len - suffix_len)
+        return Some(val: binding)
+      else
+        return infer_binding_from_methods(handler_name: handler_name, port_name: port_name, methods: rest)
+      end
+  end
+end
+
+let append_name_pairs = fn (a: [NamePair], b: [NamePair]) -> [NamePair] do
+  match a do
+    case [] -> return b
+    case h :: t -> return h :: append_name_pairs(a: t, b: b)
+  end
+end
+
+let reverse_lookup = fn (value: string, pairs: [NamePair]) -> Option<string> do
+  match pairs do
+    case [] -> return None
+    case NamePair(key: k, value: v) :: rest ->
+      if v == value then return Some(val: k)
+      else return reverse_lookup(value: value, pairs: rest)
+      end
+  end
+end
+
+let find_handler_by_port = fn (port_name: string, bindings: [HirHandlerBindingEntry]) -> Option<string> do
+  match bindings do
+    case [] -> return None
+    case HirHandlerBindingEntry(name: bname, binding: HirHandlerBinding(port_name: pname, functions: _)) :: rest ->
+      if pname == port_name then return Some(val: bname)
+      else return find_handler_by_port(port_name: port_name, bindings: rest)
+      end
+  end
+end
+
+// ─── Lower Arguments/Patterns/Cases ─────────────────────────────────────────
+
+let lower_call_args = fn (args: [HirCallArg], ctx: MirCtx) -> [MirCallArg] do
+  return lower_call_args_go(args: args, ctx: ctx, acc: [])
+end
+
+let lower_call_args_go = fn (args: [HirCallArg], ctx: MirCtx, acc: [MirCallArg]) -> [MirCallArg] do
+  match args do
+    case [] -> return rev_mir_call_args(lst: acc, out: [])
+    case HirCallArg(label: l, value: v) :: rest ->
+      let mir_v = lower_expr(expr: v, ctx: ctx)
+      return lower_call_args_go(args: rest, ctx: ctx, acc: MirCallArg(label: l, value: mir_v) :: acc)
+  end
+end
+
+let lower_expr_list = fn (exprs: [HirExpr], ctx: MirCtx) -> [MirExpr] do
+  return lower_expr_list_go(exprs: exprs, ctx: ctx, acc: [])
+end
+
+let lower_expr_list_go = fn (exprs: [HirExpr], ctx: MirCtx, acc: [MirExpr]) -> [MirExpr] do
+  match exprs do
+    case [] -> return rev_mir_exprs(lst: acc, out: [])
+    case e :: rest ->
+      return lower_expr_list_go(exprs: rest, ctx: ctx, acc: lower_expr(expr: e, ctx: ctx) :: acc)
+  end
+end
+
+let lower_named_exprs = fn (exprs: [HirNamedExpr], ctx: MirCtx) -> [MirNamedExpr] do
+  return lower_named_exprs_go(exprs: exprs, ctx: ctx, acc: [])
+end
+
+let lower_named_exprs_go = fn (exprs: [HirNamedExpr], ctx: MirCtx, acc: [MirNamedExpr]) -> [MirNamedExpr] do
+  match exprs do
+    case [] -> return rev_mir_named_exprs(lst: acc, out: [])
+    case HirNamedExpr(name: n, value: v) :: rest ->
+      return lower_named_exprs_go(exprs: rest, ctx: ctx, acc: MirNamedExpr(name: n, value: lower_expr(expr: v, ctx: ctx)) :: acc)
+  end
+end
+
+let lower_match_cases = fn (cases: [HirMatchCase], ctx: MirCtx) -> [MirMatchCase] do
+  return lower_match_cases_go(cases: cases, ctx: ctx, acc: [])
+end
+
+let lower_match_cases_go = fn (cases: [HirMatchCase], ctx: MirCtx, acc: [MirMatchCase]) -> [MirMatchCase] do
+  match cases do
+    case [] -> return rev_mir_match_cases(lst: acc, out: [])
+    case HirMatchCase(pattern: p, body: b) :: rest ->
+      return lower_match_cases_go(cases: rest, ctx: ctx, acc: MirMatchCase(
+          pattern: lower_pattern(pat: p),
+          body: lower_stmts(stmts: b, ctx: ctx)
+        ) :: acc)
+  end
+end
+
+export let lower_pattern = fn (pat: HirPatternKind) -> MirPattern do
+  match pat do
+    case hir.PLit(lit: l) -> return MirPatLiteral(lit: l)
+    case hir.PVar(name: n, sigil: s) -> return MirPatVariable(name: n, sigil: s)
+    case hir.PCtor(variant: v, fields: fs) ->
+      return MirPatConstructor(name: v, fields: lower_pattern_fields(fs: fs))
+    case hir.PRec(fields: fs, is_partial: p) ->
+      return MirPatRecord(fields: lower_record_pat_fields(fs: fs), is_partial: p)
+    case hir.PWild -> return MirPatWildcard
+  end
+end
+
+let lower_pattern_fields = fn (fs: [HirPatternField]) -> [MirPatternField] do
+  return lower_pattern_fields_go(fs: fs, acc: [])
+end
+
+let lower_pattern_fields_go = fn (fs: [HirPatternField], acc: [MirPatternField]) -> [MirPatternField] do
+  match fs do
+    case [] -> return rev_mir_pattern_fields(lst: acc, out: [])
+    case HirPatternField(name: n, pattern: p) :: rest ->
+      return lower_pattern_fields_go(fs: rest, acc: MirPatternField(name: n, pattern: lower_pattern(pat: p)) :: acc)
+  end
+end
+
+let lower_record_pat_fields = fn (fs: [HirRecordPatField]) -> [MirRecordPatField] do
+  return lower_record_pat_fields_go(fs: fs, acc: [])
+end
+
+let lower_record_pat_fields_go = fn (fs: [HirRecordPatField], acc: [MirRecordPatField]) -> [MirRecordPatField] do
+  match fs do
+    case [] -> return rev_mir_record_pat_fields(lst: acc, out: [])
+    case HirRecordPatField(name: n, pattern: p) :: rest ->
+      return lower_record_pat_fields_go(fs: rest, acc: MirRecordPatField(name: n, pattern: lower_pattern(pat: p)) :: acc)
+  end
+end
+
+// ─── List Helpers ───────────────────────────────────────────────────────────
+
+let concat_mir_funcs = fn (a: [MirFunction], b: [MirFunction]) -> [MirFunction] do
+  return concat_mir_funcs_go(xs: a, ys: b, acc: [])
+end
+
+let concat_mir_funcs_go = fn (xs: [MirFunction], ys: [MirFunction], acc: [MirFunction]) -> [MirFunction] do
+  match xs do
+    case [] -> return rev_mir_funcs(lst: acc, out: ys)
+    case x :: rest -> return concat_mir_funcs_go(xs: rest, ys: ys, acc: x :: acc)
+  end
+end
+
+let concat_mir_stmts = fn (a: [MirStmt], b: [MirStmt]) -> [MirStmt] do
+  return concat_mir_stmts_go(xs: a, ys: b, acc: [])
+end
+
+let concat_mir_stmts_go = fn (xs: [MirStmt], ys: [MirStmt], acc: [MirStmt]) -> [MirStmt] do
+  match xs do
+    case [] -> return rev_mir_stmts(lst: acc, out: ys)
+    case x :: rest -> return concat_mir_stmts_go(xs: rest, ys: ys, acc: x :: acc)
+  end
+end
+
+// ─── Monomorphic reverse helpers (list.reverse has codegen issues in nxc) ────
+
+let rev_name_pairs = fn (lst: [NamePair], out: [NamePair]) -> [NamePair] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_name_pairs(lst: rest, out: x :: out)
+  end
+end
+
+let rev_port_entries = fn (lst: [PortEntry], out: [PortEntry]) -> [PortEntry] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_port_entries(lst: rest, out: x :: out)
+  end
+end
+
+let rev_strings = fn (lst: [string], out: [string]) -> [string] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_strings(lst: rest, out: x :: out)
+  end
+end
+
+let rev_mir_externals = fn (lst: [MirExternal], out: [MirExternal]) -> [MirExternal] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_mir_externals(lst: rest, out: x :: out)
+  end
+end
+
+let rev_mir_params = fn (lst: [MirParam], out: [MirParam]) -> [MirParam] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_mir_params(lst: rest, out: x :: out)
+  end
+end
+
+let rev_mir_funcs = fn (lst: [MirFunction], out: [MirFunction]) -> [MirFunction] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_mir_funcs(lst: rest, out: x :: out)
+  end
+end
+
+let rev_mir_stmts = fn (lst: [MirStmt], out: [MirStmt]) -> [MirStmt] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_mir_stmts(lst: rest, out: x :: out)
+  end
+end
+
+let rev_mir_call_args = fn (lst: [MirCallArg], out: [MirCallArg]) -> [MirCallArg] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_mir_call_args(lst: rest, out: x :: out)
+  end
+end
+
+let rev_mir_exprs = fn (lst: [MirExpr], out: [MirExpr]) -> [MirExpr] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_mir_exprs(lst: rest, out: x :: out)
+  end
+end
+
+let rev_mir_named_exprs = fn (lst: [MirNamedExpr], out: [MirNamedExpr]) -> [MirNamedExpr] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_mir_named_exprs(lst: rest, out: x :: out)
+  end
+end
+
+let rev_mir_match_cases = fn (lst: [MirMatchCase], out: [MirMatchCase]) -> [MirMatchCase] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_mir_match_cases(lst: rest, out: x :: out)
+  end
+end
+
+let rev_mir_pattern_fields = fn (lst: [MirPatternField], out: [MirPatternField]) -> [MirPatternField] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_mir_pattern_fields(lst: rest, out: x :: out)
+  end
+end
+
+let rev_mir_record_pat_fields = fn (lst: [MirRecordPatField], out: [MirRecordPatField]) -> [MirRecordPatField] do
+  match lst do
+    case [] -> return out
+    case x :: rest -> return rev_mir_record_pat_fields(lst: rest, out: x :: out)
+  end
+end

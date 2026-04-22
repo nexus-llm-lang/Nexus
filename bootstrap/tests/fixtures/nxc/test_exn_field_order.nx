@@ -1,0 +1,93 @@
+// Regression test for nexus-928: exception constructor field ordering in nxc codegen.
+//
+// When exception definitions were missing from enum_defs, the LIR lowering used
+// positional field indices instead of sorted (alphabetical) heap indices for
+// exception constructor pattern matching. This caused field values to be swapped
+// when the alphabetical order differed from the definition order.
+//
+// This test builds a MIR program with a multi-field constructor match where
+// fields are in non-alphabetical definition order (phase, message). The memory
+// layout sorts alphabetically: [message(0), phase(1)]. If the bug is present,
+// field extraction uses positional indices, swapping message and phase.
+
+import { Span } from "src/common/token.nx"
+import { Literal, TypeExpr, Sigil, EnumDef, VariantDef, VariantField } from "src/common/ast.nx"
+import { MirProgram, MirFunction, MirExpr, MirStmt, MirParam, MirExternal,
+         MirCallArg, MirMatchCase, MirPattern, MirPatternField } from "src/ir/mir_types.nx"
+import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom } from "src/ir/lir_types.nx"
+import { lower_mir_to_lir } from "src/ir/lir.nx"
+import { compile_lir_to_wasm } from "src/backend/codegen.nx"
+import { ByteBuffer, empty, length, free, write_file } from "stdlib/bytebuffer.nx"
+
+let sp = fn () -> Span do return Span(offset: 0, line: 0, col: 0) end
+
+// Test: exception field ordering through try/catch pattern match.
+//
+// Equivalent Nexus code:
+//   type MyExn = MyExn(phase: i64, message: i64)
+//   let main = fn () -> i64 do
+//     let obj = MyExn(10, 20)   // phase=10, message=20
+//     match obj do
+//       case MyExn(phase: p, message: m) -> return m
+//     end
+//     return 0
+//   end
+//
+// Memory layout (sorted by field name): [tag@0, message@8, phase@16]
+// If correct: m = field "message" = 20
+// If bug present (positional): m = field at def_idx 1 = offset 16 = phase = 10
+let test_exn_field_order = fn () -> unit require { PermFs } throws { Exn } do
+  // Build MIR:
+  // let obj = MyExn(10, 20)
+  // match obj do case MyExn(phase: p, message: m) -> return m end
+  // return 0
+  // Constructor args must be in ALPHABETICAL order (matching HIR sort_ctor_args).
+  // Alphabetical: message(20) before phase(10).
+  let ctor_expr = MirConstructor(name: "MyExn", args: [
+    MirLiteral(lit: LitInt(val: 20)),
+    MirLiteral(lit: LitInt(val: 10))
+  ])
+
+  let match_cases = [
+    MirMatchCase(
+      pattern: MirPatConstructor(name: "MyExn", fields: [
+        MirPatternField(name: Some(val: "phase"), pattern: MirPatVariable(name: "p", sigil: SigilNone)),
+        MirPatternField(name: Some(val: "message"), pattern: MirPatVariable(name: "m", sigil: SigilNone))
+      ]),
+      body: [MirStmtReturn(expr: MirVariable(name: "m"))]
+    )
+  ]
+
+  let body = [
+    MirStmtLet(name: "obj", typ: TyI64, expr: ctor_expr),
+    MirStmtReturn(expr: MirMatch(target: MirVariable(name: "obj"), cases: match_cases))
+  ]
+
+  let func = MirFunction(
+    name: "main", params: [], ret_type: TyI64, body: body, span: sp()
+  )
+
+  // EnumDef for MyExn with fields in NON-alphabetical order: [phase, message]
+  // Memory layout is alphabetical: [message(idx 0), phase(idx 1)]
+  let my_enum = EnumDef(name: "MyEnum", is_public: true, is_opaque: false,
+    type_params: [],
+    variants: [
+      VariantDef(name: "MyExn", fields: [
+        VariantField(name: Some(val: "phase"), typ: TyI64),
+        VariantField(name: Some(val: "message"), typ: TyI64)
+      ])
+    ])
+
+  let mir = MirProgram(functions: [func], externals: [])
+  let lir = lower_mir_to_lir(mir: mir, enum_defs: [my_enum])
+  let %wasm = compile_lir_to_wasm(program: lir, string_data_base: 0)
+  let ok = write_file(buf: &wasm, path: "/nxc_test_exn_field_order.wasm")
+  free(buf: %wasm)
+  if ok == false then raise RuntimeError(val: "failed to write exn field order test wasm") end
+  return ()
+end
+
+let main = fn () -> unit require { PermFs } throws { Exn } do
+  test_exn_field_order()
+  return ()
+end

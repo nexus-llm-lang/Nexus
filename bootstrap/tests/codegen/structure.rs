@@ -1,0 +1,765 @@
+use crate::harness::compile;
+use nexus::compiler::codegen::{
+    compile_program_to_wasm_with_dwarf, compile_program_to_wasm_with_metrics,
+};
+use wasmparser::Operator;
+
+#[test]
+fn codegen_exports_wasi_cli_run_wrapper() {
+    let wasm = compile(
+        r#"
+let main = fn () -> unit do
+    return ()
+end
+"#,
+    );
+    let mut has_start_export = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::ExportSection(reader) = payload.unwrap() {
+            for export in reader.into_iter().flatten() {
+                if export.name == "_start" {
+                    has_start_export = true;
+                }
+            }
+        }
+    }
+    assert!(
+        has_start_export,
+        "should export _start (WASI P1 entry point)"
+    );
+}
+
+#[test]
+fn compile_metrics_reports_all_pass_durations() {
+    let src = r#"
+let main = fn () -> unit do
+    return ()
+end
+"#;
+    let program = nexus::lang::parser::parser().parse(src).unwrap();
+    let (wasm, metrics) = compile_program_to_wasm_with_metrics(&program).unwrap();
+    assert!(!wasm.is_empty());
+    assert!(!metrics.hir_build.is_zero());
+    assert!(!metrics.lir_lower.is_zero());
+    assert!(!metrics.codegen.is_zero());
+}
+
+// ---- Tail call instruction tests ----
+
+#[test]
+fn codegen_tail_call_emits_return_call_instruction() {
+    // Self-tail-recursive calls should be optimized to loop+br (not return_call)
+    let wasm = compile(
+        r#"
+let sum_tail = fn (n: i64, acc: i64) -> i64 do
+    if n <= 0 then return acc end
+    return sum_tail(n: n - 1, acc: acc + n)
+end
+
+let main = fn () -> unit do
+    let _ = sum_tail(n: 10, acc: 0)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut has_loop = false;
+    let mut has_br = false;
+    let mut has_return_call = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                match op.unwrap() {
+                    Operator::Loop { .. } => has_loop = true,
+                    Operator::Br { .. } => has_br = true,
+                    Operator::ReturnCall { .. } => has_return_call = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(
+        has_loop && has_br,
+        "self-tail-recursive call should emit loop + br (TCO-to-loop)"
+    );
+    assert!(
+        !has_return_call,
+        "self-tail-recursive call should NOT emit return_call (uses loop instead)"
+    );
+}
+
+#[test]
+fn codegen_tail_call_in_if_branch_emits_loop_br() {
+    // Self-tail-call in if-else branch should be optimized to loop+br
+    let wasm = compile(
+        r#"
+let count_down = fn (n: i64) -> i64 do
+    if n <= 0 then
+        return 0
+    else
+        return count_down(n: n - 1)
+    end
+end
+
+let main = fn () -> unit do
+    let _ = count_down(n: 50)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut has_loop = false;
+    let mut has_return_call = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                match op.unwrap() {
+                    Operator::Loop { .. } => has_loop = true,
+                    Operator::ReturnCall { .. } => has_return_call = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(
+        has_loop,
+        "self-tail-call in if-else branch should emit loop+br (TCO-to-loop)"
+    );
+}
+
+#[test]
+fn codegen_non_self_tail_call_emits_return_call() {
+    // Non-self tail calls (mutual recursion) should still use return_call
+    let wasm = compile(
+        r#"
+let is_even = fn (n: i64) -> bool do
+    if n == 0 then return true end
+    return is_odd(n: n - 1)
+end
+
+let is_odd = fn (n: i64) -> bool do
+    if n == 0 then return false end
+    return is_even(n: n - 1)
+end
+
+let main = fn () -> unit do
+    let _ = is_even(n: 10)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut has_return_call = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                if matches!(op.unwrap(), Operator::ReturnCall { .. }) {
+                    has_return_call = true;
+                }
+            }
+        }
+    }
+    assert!(
+        has_return_call,
+        "non-self tail call (mutual recursion) should still use return_call"
+    );
+}
+
+#[test]
+fn codegen_non_tail_call_does_not_emit_return_call() {
+    let wasm = compile(
+        r#"
+let add_one = fn (n: i64) -> i64 do
+    return n + 1
+end
+
+let main = fn () -> unit do
+    let x = add_one(n: 41)
+    if x != 42 then raise RuntimeError(val: "expected 42") end
+    return ()
+end
+"#,
+    );
+
+    let mut has_return_call = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                if matches!(op.unwrap(), Operator::ReturnCall { .. }) {
+                    has_return_call = true;
+                }
+            }
+        }
+    }
+    assert!(
+        !has_return_call,
+        "non-tail call should not emit return_call"
+    );
+}
+
+// ---- match arm tail call TCO ----
+
+#[test]
+fn codegen_match_arm_tail_call_emits_tco() {
+    // Self-tail-call inside match arms should be optimized (loop+br for self-recursion)
+    let wasm = compile(
+        r#"
+let sum_list = fn (xs: [i64], acc: i64) -> i64 do
+    match xs do
+        case Nil -> return acc
+        case h :: t -> return sum_list(xs: t, acc: acc + h)
+    end
+end
+
+let main = fn () -> unit do
+    let _ = sum_list(xs: [1, 2, 3], acc: 0)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut has_loop = false;
+    let mut has_br = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                match op.unwrap() {
+                    Operator::Loop { .. } => has_loop = true,
+                    Operator::Br { .. } => has_br = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(
+        has_loop && has_br,
+        "self-tail-recursive call in match arm should emit loop + br (TCO-to-loop)"
+    );
+}
+
+#[test]
+fn codegen_match_arm_mutual_tail_call_emits_return_call() {
+    // Non-self tail call in match arm should emit return_call
+    let wasm = compile(
+        r#"
+let process = fn (n: i64) -> i64 do
+    return helper(n: n)
+end
+
+let helper = fn (n: i64) -> i64 do
+    match n do
+        case 0 -> return 0
+        case _ -> return process(n: n - 1)
+    end
+end
+
+let main = fn () -> unit do
+    let _ = helper(n: 5)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut has_return_call = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                if matches!(op.unwrap(), Operator::ReturnCall { .. }) {
+                    has_return_call = true;
+                }
+            }
+        }
+    }
+    assert!(
+        has_return_call,
+        "non-self tail call in match arm should emit return_call"
+    );
+}
+
+// ---- return spreading: return if/match ----
+
+#[test]
+fn codegen_return_if_with_tail_calls_emits_return_call() {
+    // `return if cond then f(x) else g(x)` should spread into branches,
+    // enabling TCO for each branch's tail call
+    let wasm = compile(
+        r#"
+let even = fn (n: i64) -> i64 do
+    return if n == 0 then 1 else odd(n: n - 1) end
+end
+
+let odd = fn (n: i64) -> i64 do
+    return if n == 0 then 0 else even(n: n - 1) end
+end
+
+let main = fn () -> unit do
+    let _ = even(n: 10)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut return_call_count = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                if matches!(op.unwrap(), Operator::ReturnCall { .. }) {
+                    return_call_count += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        return_call_count >= 2,
+        "return spreading should enable tail calls in if branches, found {return_call_count}"
+    );
+}
+
+#[test]
+fn codegen_return_match_with_tail_calls_emits_return_call() {
+    // `return match x do ... end` should spread return into each arm
+    let wasm = compile(
+        r#"
+let step = fn (n: i64) -> i64 do
+    return n
+end
+
+let dispatch = fn (n: i64) -> i64 do
+    return match n do
+        case 0 -> 0
+        case _ -> step(n: n - 1)
+    end
+end
+
+let main = fn () -> unit do
+    let _ = dispatch(n: 5)
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    let mut has_return_call = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let reader = body.get_operators_reader().unwrap();
+            for op in reader {
+                if matches!(op.unwrap(), Operator::ReturnCall { .. }) {
+                    has_return_call = true;
+                }
+            }
+        }
+    }
+    assert!(
+        has_return_call,
+        "return spreading should enable tail call in match arm"
+    );
+}
+
+// ---- main(args) desugaring ----
+
+#[test]
+fn codegen_main_with_args_desugars_to_zero_param_wasm() {
+    let wasm = compile(
+        r#"
+let main = fn (args: [string]) -> unit do
+    return ()
+end
+"#,
+    );
+    wasmparser::Validator::new()
+        .validate_all(&wasm)
+        .expect("WASM should be valid");
+
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::ExportSection(reader) = payload.unwrap() {
+            for export in reader.into_iter().flatten() {
+                if export.name == "main" {
+                    assert_eq!(
+                        export.kind,
+                        wasmparser::ExternalKind::Func,
+                        "main should be a function export"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn codegen_main_with_args_includes_proc_capability() {
+    let src = r#"
+let main = fn (args: [string]) -> unit do
+    return ()
+end
+"#;
+    let program = nexus::lang::parser::parser().parse(src).unwrap();
+    let (wasm, _) = compile_program_to_wasm_with_metrics(&program).unwrap();
+
+    let caps = nexus::runtime::parse_nexus_capabilities(&wasm);
+    assert!(
+        caps.iter().any(|c| c == "Proc"),
+        "main(args) should implicitly require PermProc, got: {:?}",
+        caps
+    );
+}
+
+// ---- stdlib WASM module validation ----
+
+#[test]
+fn stdlib_wasm_modules_are_wasi_only_or_self_contained() {
+    crate::harness::ensure_repo_root();
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use wasmparser::Payload;
+
+    fn imported_modules(path: &Path) -> BTreeSet<String> {
+        let wasm = std::fs::read(path).expect("wasm file should be readable");
+        let mut out = BTreeSet::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            let payload = payload.expect("wasm payload should parse");
+            if let Payload::ImportSection(section) = payload {
+                for import in section {
+                    let import = import.expect("wasm import should parse");
+                    out.insert(import.module.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    let stdlib_dir = Path::new("nxlib/stdlib");
+    let entries = std::fs::read_dir(stdlib_dir).expect("nxlib/stdlib should exist");
+
+    let mut checked = 0usize;
+    for entry in entries {
+        let entry = entry.expect("dir entry should be readable");
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
+            continue;
+        }
+        checked += 1;
+
+        let modules = imported_modules(&path);
+        assert!(
+            !modules.contains("nexus_host"),
+            "unexpected nexus_host import in {}",
+            path.display()
+        );
+    }
+
+    assert!(checked > 0, "at least one stdlib wasm should be checked");
+}
+
+/// Regression test for nexus-7nm: duplicate external declarations across modules
+/// that point to the same WASM function should produce a single WASM import.
+#[test]
+fn codegen_deduplicates_externals_by_wasm_identity() {
+    use nexus::compiler::codegen::compile_lir_to_wasm;
+    use nexus::intern::Symbol;
+    use nexus::ir::lir::{
+        LirAtom, LirExpr, LirExternal, LirFunction, LirParam, LirProgram, LirStmt,
+    };
+    use nexus::types::Type;
+
+    let wasm_mod = Symbol::from("stdlib/stdlib.wasm");
+    let wasm_name = Symbol::from("__nx_string_to_i64");
+    let s_label = Symbol::from("s");
+
+    // Two externals with different Nexus names but same (wasm_module, wasm_name)
+    let ext_a = LirExternal {
+        name: Symbol::from("mod_a.to_i64"),
+        wasm_module: wasm_mod,
+        wasm_name,
+        params: vec![LirParam {
+            label: s_label,
+            name: s_label,
+            typ: Type::String,
+        }],
+        ret_type: Type::I64,
+        throws: Type::Unit,
+    };
+    let ext_b = LirExternal {
+        name: Symbol::from("mod_b.to_i64"),
+        wasm_module: wasm_mod,
+        wasm_name,
+        params: vec![LirParam {
+            label: s_label,
+            name: s_label,
+            typ: Type::String,
+        }],
+        ret_type: Type::I64,
+        throws: Type::Unit,
+    };
+
+    let main_fn = LirFunction {
+        name: Symbol::from("main"),
+        params: vec![],
+        ret_type: Type::Unit,
+        requires: Type::Unit,
+        throws: Type::Unit,
+        body: vec![
+            LirStmt::Let {
+                name: Symbol::from("x"),
+                typ: Type::I64,
+                expr: LirExpr::Call {
+                    func: Symbol::from("mod_a.to_i64"),
+                    args: vec![(s_label, LirAtom::String("42".into()))],
+                    typ: Type::I64,
+                },
+            },
+            LirStmt::Let {
+                name: Symbol::from("y"),
+                typ: Type::I64,
+                expr: LirExpr::Call {
+                    func: Symbol::from("mod_b.to_i64"),
+                    args: vec![(s_label, LirAtom::String("99".into()))],
+                    typ: Type::I64,
+                },
+            },
+        ],
+        ret: LirAtom::Unit,
+        span: 0..0,
+        source_file: None,
+        source_line: None,
+    };
+
+    let program = LirProgram {
+        functions: vec![main_fn],
+        externals: vec![ext_a, ext_b],
+    };
+
+    let (wasm, _) = compile_lir_to_wasm(&program).expect("should compile without E2010");
+
+    // Count WASM imports for __nx_string_to_i64
+    let mut import_count = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+            for import in reader.into_iter().flatten() {
+                if import.name == "__nx_string_to_i64" {
+                    import_count += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        import_count, 1,
+        "duplicate externals should produce exactly one WASM import"
+    );
+}
+
+#[test]
+fn codegen_dwarf_sections_emitted() {
+    let src = r#"
+let add = fn (a: i64, b: i64) -> i64 do
+  return a + b
+end
+
+let main = fn () -> unit do
+  let r = add(a: 1, b: 2)
+  return ()
+end
+"#;
+    let mut program = nexus::lang::parser::parser().parse(src).unwrap();
+    program.source_file = Some("test.nx".to_string());
+    program.source_text = Some(src.to_string());
+    let wasm = compile_program_to_wasm_with_dwarf(&program).unwrap();
+
+    let mut sections = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let Ok(wasmparser::Payload::CustomSection(reader)) = payload {
+            sections.push(reader.name().to_string());
+        }
+    }
+    assert!(
+        sections.contains(&".debug_abbrev".to_string()),
+        "expected .debug_abbrev section, got: {:?}",
+        sections
+    );
+    assert!(
+        sections.contains(&".debug_info".to_string()),
+        "expected .debug_info section, got: {:?}",
+        sections
+    );
+    assert!(
+        sections.contains(&".debug_line".to_string()),
+        "expected .debug_line section, got: {:?}",
+        sections
+    );
+
+    // Write WASM to temp file for manual inspection with wasm-tools
+    if std::env::var("NEXUS_DUMP_DWARF").is_ok() {
+        std::fs::write("/tmp/nexus_dwarf_demo.wasm", &wasm).unwrap();
+        eprintln!("Wrote /tmp/nexus_dwarf_demo.wasm ({} bytes)", wasm.len());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic: Global 0 / Global 2 heap collision investigation (qfcu)
+// ---------------------------------------------------------------------------
+
+/// In bump-allocator mode (no stdlib allocate import), the codegen emits 3
+/// globals: G0 (object heap), G1 (placeholder), G2 (string heap).
+/// Both G0 and G2 are initialized to `heap_base`.  If they start at the
+/// same address, runtime constructor allocs (G0) and string concat allocs
+/// (G2) overwrite each other's data.
+///
+/// This test compiles a program that uses both constructors and string
+/// concat (triggering bump mode), then inspects the WASM globals section
+/// to verify whether G0 and G2 are initialized to the same value.
+#[test]
+fn diag_bump_mode_g0_g2_initial_values() {
+    // Both constructor and string concat must be USED to survive optimization.
+    let wasm = compile(
+        r#"
+type Val = Present(v: s64) | Absent
+
+let main = fn () -> unit do
+    let x = Present(v: 42)
+    let s = "aa" ++ "bb"
+    match x do
+        case Present(v: v) ->
+            if v != 42 then raise RuntimeError(val: "v") end
+        case Absent ->
+            raise RuntimeError(val: "tag")
+    end
+    if s == "xxxx" then raise RuntimeError(val: "s") end
+    return ()
+end
+"#,
+    );
+
+    // Parse globals section: expect 3 mutable i32 globals.
+    // Global 0 = object heap ptr, Global 2 = string heap ptr.
+    let mut global_init_values: Vec<i32> = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::GlobalSection(reader) = payload.unwrap() {
+            for global in reader {
+                let global = global.unwrap();
+                // Read the const expr init value
+                let mut reader = global.init_expr.get_operators_reader();
+                if let Ok(op) = reader.read() {
+                    if let wasmparser::Operator::I32Const { value } = op {
+                        global_init_values.push(value);
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        global_init_values.len() >= 3,
+        "bump mode should emit at least 3 globals (G0, G1, G2), got {}",
+        global_init_values.len()
+    );
+
+    let g0 = global_init_values[0]; // object heap
+    let g2 = global_init_values[2]; // string heap
+
+    // THIS IS THE BUG: both heaps start at the same address.
+    // When this test FAILS (g0 != g2), the fix has been applied.
+    // When this test PASSES, the collision is confirmed.
+    eprintln!("  G0 (object heap) init = {g0}");
+    eprintln!("  G1 (placeholder)  init = {}", global_init_values[1]);
+    eprintln!("  G2 (string heap) init = {g2}");
+
+    // G2 is a placeholder (0) — string allocs share G0 (unified heap).
+    assert_eq!(g2, 0, "G2 should be 0 (placeholder) — string allocs use G0");
+}
+
+/// Helper: collect all import (module, name) pairs from a WASM binary.
+fn wasm_imports(wasm: &[u8]) -> Vec<(String, String)> {
+    let mut imports = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let Ok(wasmparser::Payload::ImportSection(reader)) = payload {
+            for import in reader.into_iter().flatten() {
+                imports.push((import.module.to_string(), import.name.to_string()));
+            }
+        }
+    }
+    imports
+}
+
+/// Try/catch WITHOUT backtrace() should NOT import capture-backtrace.
+#[test]
+fn notrace_elides_capture_backtrace_import() {
+    let wasm = compile(
+        r#"
+exception Boom(i64)
+
+let main = fn () -> unit throws { Exn } do
+    try
+        raise Boom(42)
+    catch e ->
+        return ()
+    end
+    return ()
+end
+"#,
+    );
+    let imports = wasm_imports(&wasm);
+    assert!(
+        !imports
+            .iter()
+            .any(|(m, n)| m == "nexus:runtime/backtrace" && n == "capture-backtrace"),
+        "notrace: should NOT import capture-backtrace when backtrace() is unused, got: {:?}",
+        imports
+    );
+}
+
+/// Try/catch WITH backtrace() SHOULD import capture-backtrace.
+#[test]
+fn backtrace_usage_keeps_capture_import() {
+    let wasm = compile(
+        r#"
+import { backtrace } from "stdlib/exn.nx"
+
+exception Boom(i64)
+
+let main = fn () -> unit throws { Exn } do
+    try
+        raise Boom(42)
+    catch e ->
+        let frames = backtrace(exn: e)
+        return ()
+    end
+    return ()
+end
+"#,
+    );
+    let imports = wasm_imports(&wasm);
+    assert!(
+        imports
+            .iter()
+            .any(|(m, n)| m == "nexus:runtime/backtrace" && n == "capture-backtrace"),
+        "should import capture-backtrace when backtrace() is used, got: {:?}",
+        imports
+    );
+}

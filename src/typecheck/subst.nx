@@ -1,0 +1,313 @@
+/**
+ * typecheck/subst: Type substitution operations.
+ *
+ * Association-list based substitution: apply, compose, lookup.
+ * Also provides structural type equality (type_eq) since Nexus == only
+ * works on primitives.
+ */
+
+import {
+  TypeExpr, TyI32, TyI64, TyF32, TyF64, TyBool, TyChar, TyString, TyUnit,
+  TyIntLit, TyFloatLit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear, TyLazy, TyBorrow,
+  TyArray, TyList, TyRecord, TyRow, TyHandler, NamedType
+} from "src/common/ast.nx"
+import { SubstEntry, Scheme, EnvEntry } from "src/typecheck/types.nx"
+
+// ─── Substitution primitives ────────────────────────────────────────────────
+
+export let subst_empty = fn () -> [SubstEntry] do
+  return []
+end
+
+export let subst_single = fn (var: string, typ: TypeExpr) -> [SubstEntry] do
+  return [SubstEntry(var: var, typ: typ)]
+end
+
+export let subst_lookup = fn (subst: [SubstEntry], var: string) -> Option<TypeExpr> do
+  match subst do
+    case [] -> return None
+    case SubstEntry(var: v, typ: t) :: rest ->
+      if v == var then
+        return Some(val: t)
+      end
+      return subst_lookup(subst: rest, var: var)
+  end
+end
+
+// ─── Apply substitution to a type ───────────────────────────────────────────
+
+export let subst_apply = fn (subst: [SubstEntry], typ: TypeExpr) -> TypeExpr do
+  match typ do
+    case TyVar(name: n) ->
+      match subst_lookup(subst: subst, var: n) do
+        case Some(val: t) -> return t
+        case None -> return typ
+      end
+    case TyArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
+      return TyArrow(
+        params: apply_named_types(subst: subst, nts: ps),
+        ret: subst_apply(subst: subst, typ: r),
+        requires: subst_apply(subst: subst, typ: req),
+        throw_row: subst_apply(subst: subst, typ: thr)
+      )
+    case TyUserDefined(name: n, args: args) ->
+      return TyUserDefined(name: n, args: apply_type_list(subst: subst, types: args))
+    case TyRef(inner: i) -> return TyRef(inner: subst_apply(subst: subst, typ: i))
+    case TyLinear(inner: i) -> return TyLinear(inner: subst_apply(subst: subst, typ: i))
+    case TyLazy(inner: i) -> return TyLazy(inner: subst_apply(subst: subst, typ: i))
+    case TyBorrow(inner: i) -> return TyBorrow(inner: subst_apply(subst: subst, typ: i))
+    case TyArray(elem: e) -> return TyArray(elem: subst_apply(subst: subst, typ: e))
+    case TyList(elem: e) -> return TyList(elem: subst_apply(subst: subst, typ: e))
+    case TyRecord(fields: fs) ->
+      return TyRecord(fields: apply_named_types(subst: subst, nts: fs))
+    case TyRow(types: ts, rest: r) ->
+      let new_rest = match r do
+        case Some(val: t) -> Some(val: subst_apply(subst: subst, typ: t))
+        case None -> None
+      end
+      return TyRow(types: apply_type_list(subst: subst, types: ts), rest: new_rest)
+    case TyHandler(name: n, requires: req) ->
+      return TyHandler(name: n, requires: subst_apply(subst: subst, typ: req))
+    case _ -> return typ
+  end
+end
+
+let apply_named_types = fn (subst: [SubstEntry], nts: [NamedType]) -> [NamedType] do
+  return apply_named_types_go(subst: subst, nts: nts, acc: [])
+end
+let apply_named_types_go = fn (subst: [SubstEntry], nts: [NamedType], acc: [NamedType]) -> [NamedType] do
+  match nts do
+    case [] -> return rev_named_types(lst: acc, out: [])
+    case NamedType(name: n, typ: t) :: rest ->
+      return apply_named_types_go(subst: subst, nts: rest,
+        acc: NamedType(name: n, typ: subst_apply(subst: subst, typ: t)) :: acc)
+  end
+end
+let rev_named_types = fn (lst: [NamedType], out: [NamedType]) -> [NamedType] do
+  match lst do case [] -> return out case h :: t -> return rev_named_types(lst: t, out: h :: out) end
+end
+
+let apply_type_list = fn (subst: [SubstEntry], types: [TypeExpr]) -> [TypeExpr] do
+  return apply_type_list_go(subst: subst, types: types, acc: [])
+end
+let apply_type_list_go = fn (subst: [SubstEntry], types: [TypeExpr], acc: [TypeExpr]) -> [TypeExpr] do
+  match types do
+    case [] -> return rev_types(lst: acc, out: [])
+    case t :: rest ->
+      return apply_type_list_go(subst: subst, types: rest,
+        acc: subst_apply(subst: subst, typ: t) :: acc)
+  end
+end
+let rev_types = fn (lst: [TypeExpr], out: [TypeExpr]) -> [TypeExpr] do
+  match lst do case [] -> return out case h :: t -> return rev_types(lst: t, out: h :: out) end
+end
+
+// ─── Compose substitutions: s2 after s1 ─────────────────────────────────────
+
+export let subst_compose = fn (s1: [SubstEntry], s2: [SubstEntry]) -> [SubstEntry] do
+  let applied = apply_subst_to_entries(entries: s1, subst: s2)
+  return merge_entries(base: applied, extra: s2)
+end
+
+let apply_subst_to_entries = fn (entries: [SubstEntry], subst: [SubstEntry]) -> [SubstEntry] do
+  return apply_subst_to_entries_go(entries: entries, subst: subst, acc: [])
+end
+let apply_subst_to_entries_go = fn (entries: [SubstEntry], subst: [SubstEntry], acc: [SubstEntry]) -> [SubstEntry] do
+  match entries do
+    case [] -> return rev_subst_entries(lst: acc, out: [])
+    case SubstEntry(var: v, typ: t) :: rest ->
+      return apply_subst_to_entries_go(entries: rest, subst: subst,
+        acc: SubstEntry(var: v, typ: subst_apply(subst: subst, typ: t)) :: acc)
+  end
+end
+let rev_subst_entries = fn (lst: [SubstEntry], out: [SubstEntry]) -> [SubstEntry] do
+  match lst do case [] -> return out case h :: t -> return rev_subst_entries(lst: t, out: h :: out) end
+end
+
+/// Add entries from extra that are not already in base.
+let merge_entries = fn (base: [SubstEntry], extra: [SubstEntry]) -> [SubstEntry] do
+  match extra do
+    case [] -> return base
+    case SubstEntry(var: v, typ: t) :: rest ->
+      if entry_exists(entries: base, var: v) then
+        return merge_entries(base: base, extra: rest)
+      end
+      return merge_entries(
+        base: SubstEntry(var: v, typ: t) :: base,
+        extra: rest
+      )
+  end
+end
+
+let entry_exists = fn (entries: [SubstEntry], var: string) -> bool do
+  match entries do
+    case [] -> return false
+    case SubstEntry(var: v, typ: _) :: rest ->
+      if v == var then
+        return true
+      end
+      return entry_exists(entries: rest, var: var)
+  end
+end
+
+// ─── Apply substitution to environment ──────────────────────────────────────
+
+export let subst_apply_env = fn (subst: [SubstEntry], env: [EnvEntry]) -> [EnvEntry] do
+  return subst_apply_env_go(subst: subst, env: env, acc: [])
+end
+let subst_apply_env_go = fn (subst: [SubstEntry], env: [EnvEntry], acc: [EnvEntry]) -> [EnvEntry] do
+  match env do
+    case [] -> return rev_env_entries(lst: acc, out: [])
+    case EnvEntry(name: n, scheme: Scheme(vars: vs, typ: t)) :: rest ->
+      return subst_apply_env_go(subst: subst, env: rest,
+        acc: EnvEntry(name: n, scheme: Scheme(vars: vs, typ: subst_apply(subst: subst, typ: t))) :: acc)
+  end
+end
+let rev_env_entries = fn (lst: [EnvEntry], out: [EnvEntry]) -> [EnvEntry] do
+  match lst do case [] -> return out case h :: t -> return rev_env_entries(lst: t, out: h :: out) end
+end
+
+// ─── Structural type equality ───────────────────────────────────────────────
+
+export let type_eq = fn (a: TypeExpr, b: TypeExpr) -> bool do
+  match a do
+    case TyI32 -> return if let TyI32 = b then true else false end
+    case TyI64 -> return if let TyI64 = b then true else false end
+    case TyF32 -> return if let TyF32 = b then true else false end
+    case TyF64 -> return if let TyF64 = b then true else false end
+    case TyBool -> return if let TyBool = b then true else false end
+    case TyChar -> return if let TyChar = b then true else false end
+    case TyString -> return if let TyString = b then true else false end
+    case TyUnit -> return if let TyUnit = b then true else false end
+    case TyIntLit -> return if let TyIntLit = b then true else false end
+    case TyFloatLit -> return if let TyFloatLit = b then true else false end
+    case TyVar(name: n1) ->
+      return if let TyVar(name: n2) = b then n1 == n2 else false end
+    case TyUserDefined(name: n1, args: a1) ->
+      return if let TyUserDefined(name: n2, args: a2) = b then
+        if n1 == n2 then type_list_eq(a: a1, b: a2) else false end
+      else false end
+    case TyArrow(params: p1, ret: r1, requires: req1, throw_row: t1) ->
+      return if let TyArrow(params: p2, ret: r2, requires: req2, throw_row: t2) = b then
+        named_types_eq(a: p1, b: p2)
+          && type_eq(a: r1, b: r2)
+          && type_eq(a: req1, b: req2)
+          && type_eq(a: t1, b: t2)
+      else false end
+    case TyRef(inner: i1) ->
+      return if let TyRef(inner: i2) = b then type_eq(a: i1, b: i2) else false end
+    case TyLinear(inner: i1) ->
+      return if let TyLinear(inner: i2) = b then type_eq(a: i1, b: i2) else false end
+    case TyLazy(inner: i1) ->
+      return if let TyLazy(inner: i2) = b then type_eq(a: i1, b: i2) else false end
+    case TyBorrow(inner: i1) ->
+      return if let TyBorrow(inner: i2) = b then type_eq(a: i1, b: i2) else false end
+    case TyArray(elem: e1) ->
+      return if let TyArray(elem: e2) = b then type_eq(a: e1, b: e2) else false end
+    case TyList(elem: e1) ->
+      return if let TyList(elem: e2) = b then type_eq(a: e1, b: e2) else false end
+    case TyRecord(fields: f1) ->
+      return if let TyRecord(fields: f2) = b then named_types_eq(a: f1, b: f2) else false end
+    case TyRow(types: ts1, rest: r1) ->
+      return if let TyRow(types: ts2, rest: r2) = b then
+        if type_list_eq(a: ts1, b: ts2) then
+          match r1 do
+            case Some(val: t1) ->
+              if let Some(val: t2) = r2 then type_eq(a: t1, b: t2) else false end
+            case None ->
+              if let Some(_) = r2 then false else true end
+          end
+        else false end
+      else false end
+    case TyHandler(name: n1, requires: req1) ->
+      return if let TyHandler(name: n2, requires: req2) = b then
+        n1 == n2 && type_eq(a: req1, b: req2)
+      else false end
+  end
+end
+
+export let type_list_eq = fn (a: [TypeExpr], b: [TypeExpr]) -> bool do
+  match a do
+    case [] ->
+      return if let [] = b then true else false end
+    case ha :: ra ->
+      match b do
+        case [] -> return false
+        case hb :: rb ->
+          if type_eq(a: ha, b: hb) then
+            return type_list_eq(a: ra, b: rb)
+          end
+          return false
+      end
+  end
+end
+
+export let named_types_eq = fn (a: [NamedType], b: [NamedType]) -> bool do
+  match a do
+    case [] ->
+      return if let [] = b then true else false end
+    case NamedType(name: n1, typ: t1) :: ra ->
+      match b do
+        case [] -> return false
+        case NamedType(name: n2, typ: t2) :: rb ->
+          if n1 == n2 && type_eq(a: t1, b: t2) then
+            return named_types_eq(a: ra, b: rb)
+          end
+          return false
+      end
+  end
+end
+
+// ─── Occurs check ───────────────────────────────────────────────────────────
+
+export let occurs_check = fn (var: string, typ: TypeExpr) -> bool do
+  match typ do
+    case TyVar(name: n) -> return n == var
+    case TyArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
+      return occurs_in_named_types(var: var, nts: ps)
+        || occurs_check(var: var, typ: r)
+        || occurs_check(var: var, typ: req)
+        || occurs_check(var: var, typ: thr)
+    case TyUserDefined(name: _, args: args) ->
+      return occurs_in_type_list(var: var, types: args)
+    case TyRef(inner: i) -> return occurs_check(var: var, typ: i)
+    case TyLinear(inner: i) -> return occurs_check(var: var, typ: i)
+    case TyLazy(inner: i) -> return occurs_check(var: var, typ: i)
+    case TyBorrow(inner: i) -> return occurs_check(var: var, typ: i)
+    case TyArray(elem: e) -> return occurs_check(var: var, typ: e)
+    case TyList(elem: e) -> return occurs_check(var: var, typ: e)
+    case TyRecord(fields: fs) -> return occurs_in_named_types(var: var, nts: fs)
+    case TyRow(types: ts, rest: r) ->
+      if occurs_in_type_list(var: var, types: ts) then
+        return true
+      end
+      match r do
+        case Some(val: t) -> return occurs_check(var: var, typ: t)
+        case None -> return false
+      end
+    case TyHandler(name: _, requires: req) -> return occurs_check(var: var, typ: req)
+    case _ -> return false
+  end
+end
+
+let occurs_in_type_list = fn (var: string, types: [TypeExpr]) -> bool do
+  match types do
+    case [] -> return false
+    case t :: rest ->
+      if occurs_check(var: var, typ: t) then
+        return true
+      end
+      return occurs_in_type_list(var: var, types: rest)
+  end
+end
+
+let occurs_in_named_types = fn (var: string, nts: [NamedType]) -> bool do
+  match nts do
+    case [] -> return false
+    case NamedType(name: _, typ: t) :: rest ->
+      if occurs_check(var: var, typ: t) then
+        return true
+      end
+      return occurs_in_named_types(var: var, nts: rest)
+  end
+end

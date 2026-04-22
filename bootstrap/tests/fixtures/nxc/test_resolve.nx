@@ -1,0 +1,103 @@
+import { SpannedTopLevel, TopLevel, ImportDef, ImportItem, GlobalLet, EnumDef,
+         VariantDef, Port, Program } from "src/common/ast.nx"
+import { tokenize } from "src/frontend/lexer.nx"
+import { parse } from "src/frontend/parser.nx"
+import { default_alias, build_rename_map, apply_rename, make_rename_entry,
+         collect_enum_defs, extract_imports, would_cycle,
+         merge_rename_entries } from "src/ir/resolve.nx"
+
+let assert = fn (cond: bool, msg: string) -> unit throws { Exn } do
+  if cond then return ()
+  else raise RuntimeError(val: msg)
+  end
+end
+
+let get_defs = fn (prog: Program) -> [SpannedTopLevel] do
+  match prog do case Program(definitions: defs) -> return defs end
+end
+
+let main = fn () -> unit throws { Exn } do
+  // ── default_alias ───────────────────────────────────────────────────
+  assert(cond: default_alias(path: "stdlib/string.nx") == "string",
+         msg: "alias: stdlib/string.nx -> string")
+  assert(cond: default_alias(path: "src/parser.nx") == "parser",
+         msg: "alias: src/parser.nx -> parser")
+  assert(cond: default_alias(path: "foo.nx") == "foo",
+         msg: "alias: foo.nx -> foo")
+  assert(cond: default_alias(path: "a/b/c/deep.nx") == "deep",
+         msg: "alias: a/b/c/deep.nx -> deep")
+  assert(cond: default_alias(path: "noext") == "noext",
+         msg: "alias: noext -> noext")
+
+  // ── Parse a mock imported module ────────────────────────────────────
+  let imported_src = "export let greet = fn (name: string) -> string do\n  return name\nend\nexport let helper = fn () -> unit do\n  return ()\nend\ntype Color = Red | Green | Blue\nport Logger do\n  fn log(msg: string) -> unit\nend\n"
+  let imported_prog = parse(tokens: tokenize(src: imported_src))
+  let imported_defs = get_defs(prog: imported_prog)
+
+  // ── build_rename_map: internal view produces source-canonical names ─
+  // After Step 4, build_rename_map always produces canonical `source#name`
+  // for every TLLet/TLPort in the imported module's own scope, regardless
+  // of import kind (selective/wildcard/alias). Importer-view entries are
+  // produced by build_importer_entries (not tested here directly).
+  let sel_import = ImportDef(path: "mock/module.nx", alias: None, items: Cons(v: ImportItem(name: "greet", item_alias: None), rest: Nil), is_external: false)
+  let sel_entries = build_rename_map(imported_defs: imported_defs, import_def: sel_import, import_depth: 1)
+
+  assert(cond: apply_rename(name: "greet", entries: sel_entries) == "mock_module_nx#greet",
+         msg: "selective: greet -> canonical")
+  assert(cond: apply_rename(name: "helper", entries: sel_entries) == "mock_module_nx#helper",
+         msg: "selective: helper -> canonical")
+
+  let wild_import = ImportDef(path: "mock/module.nx", alias: Some(val: "mod"), items: Nil, is_external: false)
+  let wild_entries = build_rename_map(imported_defs: imported_defs, import_def: wild_import, import_depth: 0)
+
+  assert(cond: apply_rename(name: "greet", entries: wild_entries) == "mock_module_nx#greet",
+         msg: "wildcard: greet -> canonical")
+
+  let ext_import = ImportDef(path: "stdlib/stdlib.wasm", alias: None, items: Nil, is_external: true)
+  let ext_entries = build_rename_map(imported_defs: imported_defs, import_def: ext_import, import_depth: 0)
+  assert(cond: apply_rename(name: "greet", entries: ext_entries) == "greet",
+         msg: "external import: no rename entries")
+
+  // ── collect_enum_defs ───────────────────────────────────────────────
+  let enums = collect_enum_defs(defs: imported_defs)
+  match enums do
+    case ed :: Nil ->
+      match ed do case EnumDef(name: n, is_public: _, is_opaque: _, type_params: _, variants: _) ->
+        assert(cond: n == "Color", msg: "collected enum is Color")
+      end
+    case _ -> raise RuntimeError(val: "expected exactly 1 enum def")
+  end
+
+  // ── extract_imports ─────────────────────────────────────────────────
+  let main_src = "import { greet } from \"mock/module.nx\"\nimport * as io from \"stdlib/stdio.nx\"\nlet main = fn () -> unit do\n  return ()\nend\n"
+  let main_prog = parse(tokens: tokenize(src: main_src))
+  let main_defs = get_defs(prog: main_prog)
+  let imports = extract_imports(defs: main_defs)
+
+  match imports do
+    case imp1 :: imp2 :: Nil ->
+      match imp1 do case ImportDef(path: p1, alias: _, items: _, is_external: _) ->
+        assert(cond: p1 == "mock/module.nx", msg: "first import path correct")
+      end
+      match imp2 do case ImportDef(path: p2, alias: _, items: _, is_external: _) ->
+        assert(cond: p2 == "stdlib/stdio.nx", msg: "second import path correct")
+      end
+    case _ -> raise RuntimeError(val: "expected exactly 2 imports")
+  end
+
+  // ── would_cycle ─────────────────────────────────────────────────────
+  let stack = Cons(v: "a.nx", rest: Cons(v: "b.nx", rest: Nil))
+  assert(cond: would_cycle(import_stack: stack, path: "a.nx"),
+         msg: "cycle detected for a.nx")
+  assert(cond: would_cycle(import_stack: stack, path: "c.nx") == false,
+         msg: "no cycle for c.nx")
+
+  // ── merge_rename_entries ────────────────────────────────────────────
+  let e1 = make_rename_entry(original: "a", qualified: "x.a")
+  let e2 = make_rename_entry(original: "b", qualified: "y.b")
+  let merged = merge_rename_entries(src: e1, dst: e2)
+  assert(cond: apply_rename(name: "a", entries: merged) == "x.a", msg: "merged: a -> x.a")
+  assert(cond: apply_rename(name: "b", entries: merged) == "y.b", msg: "merged: b -> y.b")
+
+  return ()
+end
