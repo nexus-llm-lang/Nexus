@@ -2,6 +2,7 @@ pub mod ast;
 pub mod codegen;
 pub mod hir;
 pub mod import_after_use;
+pub mod inject_try_catch;
 pub mod lexer;
 pub mod lir;
 pub mod mir;
