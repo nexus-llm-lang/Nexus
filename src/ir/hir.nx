@@ -576,25 +576,6 @@ let register_exn_variant_go = fn (enum_defs: [EnumDef], vname: string, vfields: 
   end
 end
 
-/// Check if defs contain main(args: [string]) which needs argv import.
-/// Uses the same is_main_with_argv check from the HIR processing
-/// but operates on AST-level types.
-export let needs_argv_import = fn (defs: [SpannedTopLevel]) -> bool do
-  match defs do
-    case [] -> return false
-    case d :: rest ->
-      match d do
-        case SpannedTopLevel(node: TLLet(def: GlobalLet(name: "main", is_public: _, typ: _, value: _)), span: _) ->
-          // main found — check if is_main_with_argv would trigger during HIR processing
-          // (Heuristic: any main with exactly 1 param is assumed to be main(args))
-          return true
-        case _ -> return needs_argv_import(defs: rest)
-      end
-  end
-end
-
-/// Map a stdlib .nx source file path to its WIT interface name.
-/// Map a file stem to its WIT interface name. Returns "" if not a known stdlib stem.
 let stem_to_wit = fn (stem: string) -> string do
   if stem == "math" then return "nexus:stdlib/math" end
   if stem == "string" then return "nexus:stdlib/string-ops" end
@@ -621,19 +602,6 @@ let extract_nx_stem = fn (path: string) -> string do
   if dot_pos < 0 then return "" end
   let stem_start = find_last_slash(s: path, pos: dot_pos - 1) + 1
   return str.substring(s: path, start: stem_start, len: dot_pos - stem_start)
-end
-
-/// Returns the original path unchanged if it's not a known stdlib file.
-/// Set wasm_module on an accum for a stdlib source file.
-/// Used by diamond imports where TLImport is filtered out.
-export let set_accum_wmod_for_stdlib = fn (accum: HirAccum, source_file: string) -> HirAccum do
-  let stem = extract_nx_stem(path: source_file)
-  let wit = stem_to_wit(stem: stem)
-  if str.length(s: wit) > 0 then
-    let HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: _, exception_groups: egs) = accum
-    return HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: Some(val: wit), exception_groups: egs)
-  end
-  return accum
 end
 
 let map_stdlib_to_wit = fn (ext_path: string, source_file: string) -> string do
@@ -709,29 +677,6 @@ export let process_defs = fn (defs: [SpannedTopLevel], entries: [RenameEntry], a
   end
 end
 
-/// Lightweight variant for diamond imports: registers types, externals, and
-/// exceptions but skips function-body conversion (already done on first import).
-let ext_list_has = fn (exts: [HirExternal], name: string) -> bool do
-  match exts do
-    case [] -> return false
-    case HirExternal(name: n, wasm_module: _, wasm_name: _, params: _, ret_type: _, throw_row: _) :: rest ->
-      if n == name then return true end
-      return ext_list_has(exts: rest, name: name)
-  end
-end
-
-
-let func_list_has = fn (funcs: [HirFunction], name: string) -> bool do
-  match funcs do
-    case [] -> return false
-    case HirFunction(name: n, type_params: _, params: _, ret_type: _, body: _, span: _) :: rest ->
-      if n == name then return true end
-      return func_list_has(funcs: rest, name: name)
-  end
-end
-
-/// Process a TLLet definition. convert_expr returns Lambda with empty body
-/// (body conversion skipped). We detect Lambda and store LazyBody from original AST.
 let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, type_ann: Option<TypeExpr>,
     entries: [RenameEntry], span: Span, accum: HirAccum, source_file: string) -> HirAccum do
   let HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs) = accum
@@ -829,68 +774,6 @@ let infer_ret_from_expr = fn (expr: Expr) -> TypeExpr do
   end
 end
 
-/// Extract Lambda body stmts from a raw AST expression (ExprLambda → body, else []).
-export let infer_lambda_body = fn (expr: Expr) -> [SpannedStmt] do
-  match expr do
-    case ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: b) -> b
-    case _ -> []
-  end
-end
-
-let is_expr_lambda = fn (expr: Expr) -> bool do
-  match expr do
-    case ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: _) -> return true
-    case _ -> return false
-  end
-end
-
-let is_expr_external = fn (expr: Expr) -> bool do
-  match expr do
-    case ExprExternal(symbol: _, arg_names: _, typ: _) -> return true
-    case _ -> return false
-  end
-end
-
-let is_expr_handler = fn (expr: Expr) -> bool do
-  match expr do
-    case ExprHandler(coeffect_name: _, requires: _, functions: _) -> return true
-    case _ -> return false
-  end
-end
-
-let shallow_dispatch_let = fn (qname: string, val: SpannedExpr, entries: [RenameEntry], accum: HirAccum, wmod: Option<string>, span: Span) -> HirAccum do
-  let HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: _, exception_groups: egs) = accum
-  let SpannedExpr(node: val_node, span: _) = val
-  // Only call convert_expr for externals and handlers (cheap).
-  // Lambda bodies are skipped to avoid OOM.
-  // Always call convert_expr — ExprExternal/ExprHandler are cheap.
-  // ExprLambda with body causes OOM, so detect and skip:
-  // Dispatch on expression type inline
-  match val_node do
-    case ExprExternal(symbol: sym, arg_names: anames, typ: t) ->
-      match wmod do
-        case Some(val: wm) ->
-          let effective_sym = wit_canonical_name(ffi_name: sym)
-          let ext = make_hir_external(name: qname, wasm_module: wm,
-            wasm_name: effective_sym, arg_names: anames, typ: t)
-          return HirAccum(ports: ps, functions: fs,
-            externals: ext :: exts,
-            handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs)
-        case None ->
-          let ext = make_hir_external(name: qname, wasm_module: sym, wasm_name: sym, arg_names: anames, typ: t)
-          return HirAccum(ports: ps, functions: fs,
-            externals: ext :: exts,
-            handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs)
-      end
-    case ExprHandler(coeffect_name: pname, requires: _, functions: hfs) ->
-      let binding = synthesize_handler(binding_name: qname, port_name: symtab.rename(name: pname, entries: entries), functions: convert_functions(funcs: hfs, entries: entries))
-      return HirAccum(ports: ps, functions: fs,
-        externals: exts, handler_bindings: binding :: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs)
-    case _ -> return accum
-  end
-end
-
-/// Infer return type for a top-level constant expression.
 let infer_constant_type = fn (expr: HirExpr) -> TypeExpr do
   let HirExpr(node: inner, span: _) = expr
   match inner do
@@ -905,16 +788,6 @@ let infer_constant_type = fn (expr: HirExpr) -> TypeExpr do
       end
     case _ -> return TyI64
   end
-end
-
-/// Detect main(args: [string]) pattern and return the arg name for desugaring.
-let is_main_with_argv = fn (name: string, params: [HirParam]) -> Option<string> do
-  if name == "main" then
-    return if let [HirParam(name: arg_name, label: _, typ: TyList(elem: TyString))] = params then
-      Some(val: arg_name)
-    else None end
-  end
-  return None
 end
 
 let process_top_level = fn (node: TopLevel, span: Span, entries: [RenameEntry], accum: HirAccum, source_file: string) -> HirAccum do
@@ -1525,10 +1398,6 @@ let filter_reachable_externals_go = fn (externals: [HirExternal], reachable: [st
         return filter_reachable_externals_go(externals: rest, reachable: reachable, acc: acc)
       end
   end
-end
-
-let filter_reachable_handlers = fn (bindings: [HirHandlerBindingEntry], reachable: [string]) -> [HirHandlerBindingEntry] do
-  return filter_reachable_handlers_go(bindings: bindings, reachable: reachable, acc: [])
 end
 
 let filter_reachable_handlers_go = fn (bindings: [HirHandlerBindingEntry], reachable: [string], acc: [HirHandlerBindingEntry]) -> [HirHandlerBindingEntry] do
