@@ -43,7 +43,7 @@
         tsNexus = pkgs.tree-sitter.buildGrammar {
           language = "nexus";
           version = "0.1.0";
-          src = ./tree-sitter-nexus;
+          src = ./tree-sitter;
         };
 
         tsDeps = with pkgs; [
@@ -87,7 +87,7 @@
         };
       in
       {
-        packages.tree-sitter-nexus = tsNexus;
+        packages.tree-sitter = tsNexus;
         legacyPackages = pkgs;
         inherit formatter devShells;
       }
