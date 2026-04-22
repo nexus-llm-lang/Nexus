@@ -347,11 +347,12 @@ fn define_component_runtime_stubs(
         inst.func_wrap(
             "bt-frame",
             |_: wasmtime::StoreContextMut<'_, WasiState>,
-             (_idx,): (i64,)|
-             -> wasmtime::Result<(i64,)> {
-                // Return 0 — frame name retrieval requires writing into WASM memory,
-                // which isn't feasible from a component host function.
-                Ok((0,))
+             (idx,): (i64,)|
+             -> wasmtime::Result<(String,)> {
+                let name = COMPONENT_BT_FRAMES
+                    .with(|f| f.borrow().get(idx as usize).cloned())
+                    .unwrap_or_default();
+                Ok((name,))
             },
         )
         .map_err(|e| e.to_string())?;

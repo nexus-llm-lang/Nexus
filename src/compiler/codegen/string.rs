@@ -34,7 +34,7 @@ pub enum StringABI {
 /// e.g. `nexus:stdlib/string-ops`. File-path imports (e.g. `stdlib/stdlib.wasm`)
 pub(super) fn string_abi_for_external(ext: &LirExternal) -> StringABI {
     let module = ext.wasm_module.as_ref();
-    if module.contains(':') && !module.starts_with("nexus:runtime/") {
+    if module.contains(':') {
         StringABI::Canonical
     } else {
         StringABI::Packed
