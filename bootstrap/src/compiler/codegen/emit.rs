@@ -343,3 +343,216 @@ pub(super) fn expr_type(expr: &LirExpr) -> Type {
         LirExpr::Intrinsic { typ, .. } => typ.clone(),
     }
 }
+
+#[cfg(test)]
+mod abi_tests {
+    //! ABI contract for `external` declarations.
+    //!
+    //! Surface types in `.nx` source (Nexus-level) are intentionally higher-
+    //! level than the WASM function types they lower to. These tests pin the
+    //! lowering so a stdlib declaration such as
+    //!
+    //!   external __nx_http_respond = "..." :
+    //!     (req_id: i64, status: i64, headers: string, body: string) -> bool
+    //!
+    //! round-trips to the WASM signature the Rust binding
+    //! (bootstrap/src/lib/net/src/lib.rs) actually implements:
+    //!
+    //!   __nx_http_respond(req_id: i64, status: i64,
+    //!                     headers_ptr: i32, headers_len: i32,
+    //!                     body_ptr: i32,    body_len: i32) -> i32
+    //!
+    //! Rules exercised below:
+    //!   - `string` (param) → `(i32, i32)`  (ptr + len), both ABIs
+    //!   - `string` (return, Packed ABI)   → single `i64` (ptr<<32 | len)
+    //!   - `string` (return, Canonical ABI)→ no wasm result; retptr appended
+    //!                                        as last `i32` param
+    //!   - `bool` (return) → `i32` (non-zero is true)
+    //!   - primitives (`i32`/`i64`/`f32`/`f64`) pass through unchanged
+
+    use super::*;
+    use crate::intern::Symbol;
+    use crate::ir::lir::{LirExternal, LirParam};
+
+    fn param(name: &str, typ: Type) -> LirParam {
+        LirParam {
+            label: Symbol::from(name),
+            name: Symbol::from(name),
+            typ,
+        }
+    }
+
+    /// File-path import module → Packed string ABI (shared linear memory).
+    fn packed_external(params: Vec<LirParam>, ret_type: Type) -> LirExternal {
+        LirExternal {
+            name: Symbol::from("__nx_test"),
+            wasm_module: Symbol::from("stdlib/stdlib.wasm"),
+            wasm_name: Symbol::from("__nx_test"),
+            params,
+            ret_type,
+            throws: Type::Unit,
+        }
+    }
+
+    /// WIT-style import module (contains ':') → Canonical string ABI.
+    fn canonical_external(params: Vec<LirParam>, ret_type: Type) -> LirExternal {
+        LirExternal {
+            name: Symbol::from("__nx_test"),
+            wasm_module: Symbol::from("nexus:cli/nexus-host"),
+            wasm_name: Symbol::from("test"),
+            params,
+            ret_type,
+            throws: Type::Unit,
+        }
+    }
+
+    #[test]
+    fn http_respond_signature_lowers_to_net_lib_rs_binding() {
+        // Mirrors nxlib/stdlib/net.nx:31 declaration exactly.
+        let ext = packed_external(
+            vec![
+                param("req_id", Type::I64),
+                param("status", Type::I64),
+                param("headers", Type::String),
+                param("body", Type::String),
+            ],
+            Type::Bool,
+        );
+
+        let params = external_param_types(&ext).unwrap();
+        assert_eq!(
+            params,
+            vec![
+                ValType::I64, // req_id
+                ValType::I64, // status
+                ValType::I32, // headers_ptr
+                ValType::I32, // headers_len
+                ValType::I32, // body_ptr
+                ValType::I32, // body_len
+            ],
+            "string params must lower to (ptr, len) pairs"
+        );
+
+        let results = external_return_types(&ext).unwrap();
+        assert_eq!(
+            results,
+            vec![ValType::I32],
+            "bool return must lower to i32 (non-zero = true)"
+        );
+    }
+
+    #[test]
+    fn http_request_packed_abi_returns_i64_packed_string() {
+        // nxlib/stdlib/net.nx:28 — returns string, file-path module → Packed ABI.
+        let ext = packed_external(
+            vec![
+                param("method", Type::String),
+                param("url", Type::String),
+                param("headers", Type::String),
+                param("body", Type::String),
+            ],
+            Type::String,
+        );
+
+        let params = external_param_types(&ext).unwrap();
+        assert_eq!(params.len(), 8, "4 string params → 8 i32s (ptr/len each)");
+        assert!(params.iter().all(|t| *t == ValType::I32));
+
+        let results = external_return_types(&ext).unwrap();
+        assert_eq!(
+            results,
+            vec![ValType::I64],
+            "Packed-ABI string return is a single i64 ((ptr << 32) | len)"
+        );
+    }
+
+    #[test]
+    fn canonical_abi_string_return_uses_retptr() {
+        // Component-model external: `nexus:cli/...` module → Canonical ABI.
+        // A string return is written into a retptr passed as the last param;
+        // the function itself returns nothing.
+        let ext = canonical_external(vec![param("url", Type::String)], Type::String);
+
+        let params = external_param_types(&ext).unwrap();
+        assert_eq!(
+            params,
+            vec![
+                ValType::I32, // url_ptr
+                ValType::I32, // url_len
+                ValType::I32, // retptr
+            ],
+        );
+
+        let results = external_return_types(&ext).unwrap();
+        assert!(
+            results.is_empty(),
+            "Canonical-ABI string return is void; result goes through retptr"
+        );
+    }
+
+    #[test]
+    fn canonical_abi_non_string_return_has_no_retptr() {
+        let ext = canonical_external(vec![param("url", Type::String)], Type::I64);
+        let params = external_param_types(&ext).unwrap();
+        assert_eq!(
+            params,
+            vec![ValType::I32, ValType::I32],
+            "retptr only appears for string returns"
+        );
+    }
+
+    #[test]
+    fn primitive_params_pass_through_unchanged() {
+        let ext = packed_external(
+            vec![
+                param("a", Type::I32),
+                param("b", Type::I64),
+                param("c", Type::F32),
+                param("d", Type::F64),
+                param("e", Type::Bool),
+                param("f", Type::Char),
+            ],
+            Type::Unit,
+        );
+        let params = external_param_types(&ext).unwrap();
+        assert_eq!(
+            params,
+            vec![
+                ValType::I32, // i32
+                ValType::I64, // i64
+                ValType::F32, // f32
+                ValType::F64, // f64
+                ValType::I32, // bool
+                ValType::I32, // char
+            ]
+        );
+        let results = external_return_types(&ext).unwrap();
+        assert!(results.is_empty(), "unit return → no wasm result");
+    }
+
+    #[test]
+    fn numeric_returns_lower_to_matching_valtypes() {
+        for (ret, expected) in [
+            (Type::I32, ValType::I32),
+            (Type::I64, ValType::I64),
+            (Type::F32, ValType::F32),
+            (Type::F64, ValType::F64),
+            (Type::Char, ValType::I32),
+        ] {
+            let ext = packed_external(vec![], ret.clone());
+            let results = external_return_types(&ext).unwrap();
+            assert_eq!(results, vec![expected], "ret={:?}", ret);
+        }
+    }
+
+    #[test]
+    fn string_abi_discriminator_matches_module_identifier() {
+        use super::super::string::{string_abi_for_external, StringABI};
+
+        let file_path = packed_external(vec![], Type::Unit);
+        assert_eq!(string_abi_for_external(&file_path), StringABI::Packed);
+
+        let wit = canonical_external(vec![], Type::Unit);
+        assert_eq!(string_abi_for_external(&wit), StringABI::Canonical);
+    }
+}
