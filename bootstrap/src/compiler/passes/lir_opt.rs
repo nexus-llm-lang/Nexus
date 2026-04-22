@@ -60,12 +60,10 @@ fn optimize_function(func: &mut LirFunction, parallel_lazy: bool) {
     // 3.5. Scalar replacement of aggregates: eliminate Constructor allocations
     //      when the result is only used via ObjectTag/ObjectField (never escapes).
     scalar_replace_aggregates(&mut func.body, &func.ret);
-    // 3.6. Linear reuse: DISABLED (nexus-otja / nexus-miso)
-    //      try_find_reuse only checks local liveness, not aliasing through
-    //      heap pointers (e.g. LazyBody.ast_expr). In-place tag rewrite
-    //      corrupts shared objects → OOM via desugar_list fallthrough.
-    //      Re-enable after fixing alias analysis in nexus-miso.
-    // reuse_linear_constructors(&mut func.body);
+    // 3.6. Linear reuse: in-place Constructor update when the source object is
+    //      locally allocated and has not escaped through any heap structure.
+    //      Alias safety is enforced by try_find_reuse — see nexus-miso.
+    reuse_linear_constructors(&mut func.body);
     // 4. Dead let elimination — iterate to fixpoint because removing a dead Let
     //    may make its referenced variables dead too (cascading dead code).
     for _ in 0..8 {
@@ -3264,12 +3262,10 @@ fn apply_sra_in_expr(expr: &mut LirExpr, ctors: &HashMap<Symbol, (i64, Vec<LirAt
 ///   let new_val = Call(g, [f0])
 ///   FieldUpdate(src, offset=8, new_val)   ← only changed field
 ///   let result = Atom(src)                ← reuse pointer (no alloc)
-#[allow(dead_code)] // nexus-miso: re-enable after alias analysis fix
 fn reuse_linear_constructors(stmts: &mut Vec<LirStmt>) {
     reuse_in_stmts(stmts);
 }
 
-#[allow(dead_code)] // nexus-miso
 fn reuse_in_stmts(stmts: &mut Vec<LirStmt>) {
     // First, recurse into sub-bodies so inner scopes are optimized bottom-up.
     for stmt in stmts.iter_mut() {
@@ -3406,7 +3402,6 @@ fn reuse_in_stmts(stmts: &mut Vec<LirStmt>) {
     }
 }
 
-#[allow(dead_code)] // nexus-miso
 struct ReuseCandidate {
     source: LirAtom,
     tag: i64,
@@ -3415,7 +3410,12 @@ struct ReuseCandidate {
 }
 
 /// Check if a Constructor can reuse memory from an existing heap object.
-#[allow(dead_code)] // nexus-miso
+///
+/// Alias safety (nexus-miso): the source object must be locally allocated by a
+/// Constructor in the same flat stmts list AND must not have escaped through
+/// any heap-storing expression between its allocation and the reuse site.
+/// Without these checks, in-place rewrite corrupts aliased copies reachable
+/// through closures, lazy bodies, or caller-held parameters (see nexus-otja).
 fn try_find_reuse(
     ctor_name: &Symbol,
     args: &[LirAtom],
@@ -3453,6 +3453,19 @@ fn try_find_reuse(
 
     let source = source?;
     let source_sym = source_name?;
+
+    // Alias safety (nexus-miso):
+    //   (a) Source must be bound by a Constructor in this flat stmts list.
+    //       Params, Call results, ClosureEnvLoads, and values traced from other
+    //       objects are rejected — their identity may be aliased externally.
+    //   (b) Source must not have escaped through a heap-storing expression
+    //       between its allocation and the reuse site. An escape = stored as
+    //       a Constructor/Record/Closure/LazySpawn arg, as a FieldUpdate value,
+    //       or passed into Call/CallIndirect/Intrinsic/Raise/TailCall.
+    let src_binding_pos = find_local_ctor_binding(stmts, source_sym, ctor_pos)?;
+    if source_escapes_in_stmts(&stmts[src_binding_pos + 1..ctor_pos], source_sym) {
+        return None;
+    }
 
     // Verify: all ObjectField extractions from this source have consecutive indices
     // covering [0..arity). This ensures the source has exactly `arity` fields.
@@ -3509,21 +3522,81 @@ fn try_find_reuse(
     })
 }
 
-/// Check if a statement (non-recursively into sub-bodies) mentions a variable.
-#[allow(dead_code)] // nexus-miso
+/// Check if a statement (recursively into sub-bodies) mentions a variable.
+/// Used by try_find_reuse's src_used_after check — any mention of the source
+/// after its reuse (including inside nested If/Switch/Loop/TryCatch bodies)
+/// indicates the original heap content is still read, so reuse is unsafe.
 fn atom_mentions_var_in_stmt(stmt: &LirStmt, var: Symbol) -> bool {
     let check = |atom: &LirAtom| matches!(atom, LirAtom::Var { name, .. } if *name == var);
+    let check_opt = |a: &Option<LirAtom>| a.as_ref().is_some_and(|x| check(x));
     match stmt {
         LirStmt::Let { expr, .. } => atom_mentions_var_in_expr(expr, var),
         LirStmt::FieldUpdate { target, value, .. } => check(target) || check(value),
-        LirStmt::If { cond, .. } | LirStmt::IfReturn { cond, .. } => check(cond),
-        LirStmt::Loop { cond, .. } => check(cond),
-        LirStmt::Switch { tag, .. } => check(tag),
-        LirStmt::TryCatch { .. } => false,
+        LirStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            check(cond)
+                || atom_mentions_var_in_stmts(then_body, var)
+                || atom_mentions_var_in_stmts(else_body, var)
+        }
+        LirStmt::IfReturn {
+            cond,
+            then_body,
+            then_ret,
+            else_body,
+            else_ret,
+            ..
+        } => {
+            check(cond)
+                || check_opt(then_ret)
+                || check_opt(else_ret)
+                || atom_mentions_var_in_stmts(then_body, var)
+                || atom_mentions_var_in_stmts(else_body, var)
+        }
+        LirStmt::Loop {
+            cond_stmts,
+            cond,
+            body,
+        } => {
+            check(cond)
+                || atom_mentions_var_in_stmts(cond_stmts, var)
+                || atom_mentions_var_in_stmts(body, var)
+        }
+        LirStmt::Switch {
+            tag,
+            cases,
+            default_body,
+            default_ret,
+            ..
+        } => {
+            check(tag)
+                || check_opt(default_ret)
+                || atom_mentions_var_in_stmts(default_body, var)
+                || cases.iter().any(|c| {
+                    check_opt(&c.ret) || atom_mentions_var_in_stmts(&c.body, var)
+                })
+        }
+        LirStmt::TryCatch {
+            body,
+            body_ret,
+            catch_body,
+            catch_ret,
+            ..
+        } => {
+            check_opt(body_ret)
+                || check_opt(catch_ret)
+                || atom_mentions_var_in_stmts(body, var)
+                || atom_mentions_var_in_stmts(catch_body, var)
+        }
     }
 }
 
-#[allow(dead_code)] // nexus-miso
+fn atom_mentions_var_in_stmts(stmts: &[LirStmt], var: Symbol) -> bool {
+    stmts.iter().any(|s| atom_mentions_var_in_stmt(s, var))
+}
+
 fn atom_mentions_var_in_expr(expr: &LirExpr, var: Symbol) -> bool {
     let check = |atom: &LirAtom| matches!(atom, LirAtom::Var { name, .. } if *name == var);
     match expr {
@@ -3547,5 +3620,419 @@ fn atom_mentions_var_in_expr(expr: &LirExpr, var: Symbol) -> bool {
         LirExpr::LazySpawn { thunk, .. } => check(thunk),
         LirExpr::LazyJoin { task_id, .. } => check(task_id),
         LirExpr::Intrinsic { args, .. } => args.iter().any(|(_, a)| check(a)),
+    }
+}
+
+// ─── Alias analysis for reuse_linear_constructors (nexus-miso) ─────────────
+
+/// Search stmts[0..limit] for the unique top-level Let binding of `source`
+/// whose RHS is a Constructor. Returns the index of the binding if found.
+///
+/// Yields None when:
+///   - there is no top-level Let binding for `source` (i.e. it is a parameter
+///     or comes from an outer scope);
+///   - the unique binding's RHS is not a Constructor (Call results,
+///     ClosureEnvLoad, Atom aliases, etc. could be externally aliased);
+///   - `source` is bound more than once at the top level of this stmts list
+///     (shadowing makes "which allocation is active at the reuse site"
+///     ambiguous — be conservative).
+fn find_local_ctor_binding(stmts: &[LirStmt], source: Symbol, limit: usize) -> Option<usize> {
+    let mut found: Option<usize> = None;
+    for (i, stmt) in stmts.iter().enumerate() {
+        if i >= limit {
+            break;
+        }
+        if let LirStmt::Let { name, expr, .. } = stmt {
+            if *name == source {
+                if found.is_some() {
+                    return None;
+                }
+                if !matches!(expr, LirExpr::Constructor { .. }) {
+                    return None;
+                }
+                found = Some(i);
+            }
+        }
+    }
+    found
+}
+
+/// Returns true if `source` appears in any escape position in `stmts`,
+/// recursively into nested If/IfReturn/Switch/Loop/TryCatch bodies.
+///
+/// Safe (non-escape) uses:
+///   - ObjectField/ObjectTag value (pure read of source's layout)
+///   - FieldUpdate target (writing into source's own heap slot)
+///
+/// Everything else that references source is treated as an escape: storing
+/// source as a field of another heap object (Constructor/Record/Closure/
+/// LazySpawn/FieldUpdate value), crossing a function boundary (Call/
+/// CallIndirect/Intrinsic/Raise/TailCall), or aliasing via Atom/Binary/Force.
+fn source_escapes_in_stmts(stmts: &[LirStmt], source: Symbol) -> bool {
+    stmts.iter().any(|s| stmt_escapes_source(s, source))
+}
+
+fn stmt_escapes_source(stmt: &LirStmt, source: Symbol) -> bool {
+    let is_src = |a: &LirAtom| matches!(a, LirAtom::Var { name, .. } if *name == source);
+    let is_src_opt = |a: &Option<LirAtom>| a.as_ref().is_some_and(|x| is_src(x));
+    match stmt {
+        LirStmt::Let { expr, .. } => expr_escapes_source(expr, source),
+        LirStmt::FieldUpdate { value, .. } => is_src(value),
+        LirStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            is_src(cond)
+                || source_escapes_in_stmts(then_body, source)
+                || source_escapes_in_stmts(else_body, source)
+        }
+        LirStmt::IfReturn {
+            cond,
+            then_body,
+            then_ret,
+            else_body,
+            else_ret,
+            ..
+        } => {
+            is_src(cond)
+                || is_src_opt(then_ret)
+                || is_src_opt(else_ret)
+                || source_escapes_in_stmts(then_body, source)
+                || source_escapes_in_stmts(else_body, source)
+        }
+        LirStmt::Switch {
+            tag,
+            cases,
+            default_body,
+            default_ret,
+            ..
+        } => {
+            is_src(tag)
+                || is_src_opt(default_ret)
+                || source_escapes_in_stmts(default_body, source)
+                || cases.iter().any(|c| {
+                    is_src_opt(&c.ret) || source_escapes_in_stmts(&c.body, source)
+                })
+        }
+        LirStmt::Loop {
+            cond_stmts,
+            cond,
+            body,
+        } => {
+            is_src(cond)
+                || source_escapes_in_stmts(cond_stmts, source)
+                || source_escapes_in_stmts(body, source)
+        }
+        LirStmt::TryCatch {
+            body,
+            body_ret,
+            catch_body,
+            catch_ret,
+            ..
+        } => {
+            is_src_opt(body_ret)
+                || is_src_opt(catch_ret)
+                || source_escapes_in_stmts(body, source)
+                || source_escapes_in_stmts(catch_body, source)
+        }
+    }
+}
+
+fn expr_escapes_source(expr: &LirExpr, source: Symbol) -> bool {
+    let is_src = |a: &LirAtom| matches!(a, LirAtom::Var { name, .. } if *name == source);
+    match expr {
+        // Pure structural reads: source is accessed, not stored.
+        LirExpr::ObjectField { .. } | LirExpr::ObjectTag { .. } => false,
+        // No atom content at all.
+        LirExpr::FuncRef { .. } | LirExpr::ClosureEnvLoad { .. } => false,
+        // Aliasing / scalar reads — treat defensively as escape.
+        LirExpr::Atom(a) => is_src(a),
+        LirExpr::Binary { lhs, rhs, .. } => is_src(lhs) || is_src(rhs),
+        LirExpr::Force { value, .. } => is_src(value),
+        // Heap-storing expressions — escape.
+        LirExpr::Constructor { args, .. } => args.iter().any(is_src),
+        LirExpr::Record { fields, .. } => fields.iter().any(|(_, a)| is_src(a)),
+        LirExpr::Closure { captures, .. } => captures.iter().any(|(_, a)| is_src(a)),
+        LirExpr::LazySpawn { thunk, .. } => is_src(thunk),
+        // Cross-boundary — escape.
+        LirExpr::Call { args, .. } | LirExpr::TailCall { args, .. } => {
+            args.iter().any(|(_, a)| is_src(a))
+        }
+        LirExpr::CallIndirect { callee, args, .. } => {
+            is_src(callee) || args.iter().any(|(_, a)| is_src(a))
+        }
+        LirExpr::Intrinsic { args, .. } => args.iter().any(|(_, a)| is_src(a)),
+        LirExpr::Raise { value, .. } => is_src(value),
+        LirExpr::LazyJoin { task_id, .. } => is_src(task_id),
+    }
+}
+
+#[cfg(test)]
+mod tests_reuse_alias_safety {
+    use super::*;
+
+    fn sym(s: &str) -> Symbol {
+        Symbol::intern(s)
+    }
+
+    fn var(name: &str) -> LirAtom {
+        LirAtom::Var {
+            name: sym(name),
+            typ: Type::I64,
+        }
+    }
+
+    fn let_ctor(name: &str, ctor: &str, args: Vec<LirAtom>) -> LirStmt {
+        LirStmt::Let {
+            name: sym(name),
+            typ: Type::I64,
+            expr: LirExpr::Constructor {
+                name: sym(ctor),
+                args,
+                typ: Type::I64,
+            },
+        }
+    }
+
+    fn let_field(name: &str, src: &str, index: usize) -> LirStmt {
+        LirStmt::Let {
+            name: sym(name),
+            typ: Type::I64,
+            expr: LirExpr::ObjectField {
+                value: var(src),
+                index,
+                typ: Type::I64,
+            },
+        }
+    }
+
+    fn count_ctors(stmts: &[LirStmt]) -> usize {
+        stmts
+            .iter()
+            .filter(|s| matches!(s, LirStmt::Let { expr: LirExpr::Constructor { .. }, .. }))
+            .count()
+    }
+
+    fn count_field_updates(stmts: &[LirStmt]) -> usize {
+        stmts
+            .iter()
+            .filter(|s| matches!(s, LirStmt::FieldUpdate { .. }))
+            .count()
+    }
+
+    #[test]
+    fn reuse_applies_when_source_is_locally_allocated_and_not_escaped() {
+        // let src = Pair(1, 2); let f0 = src.0; let f1 = src.1;
+        // let new = Swapped(f1, f0)       ← should reuse src
+        let mut stmts = vec![
+            let_ctor("src", "Pair", vec![LirAtom::Int(1), LirAtom::Int(2)]),
+            let_field("f0", "src", 0),
+            let_field("f1", "src", 1),
+            let_ctor("new", "Swapped", vec![var("f1"), var("f0")]),
+        ];
+        reuse_linear_constructors(&mut stmts);
+        assert_eq!(
+            count_ctors(&stmts),
+            1,
+            "second Constructor should be rewritten to FieldUpdates + Atom(src)"
+        );
+        assert!(
+            count_field_updates(&stmts) >= 1,
+            "at least the tag FieldUpdate must be emitted"
+        );
+    }
+
+    #[test]
+    fn reuse_rejected_when_source_is_a_function_parameter() {
+        // src is NOT bound by a Constructor in this stmts list — it's a param.
+        // let f0 = src.0; let f1 = src.1;
+        // let new = Swapped(f1, f0)       ← must NOT reuse (src may be aliased externally)
+        let mut stmts = vec![
+            let_field("f0", "src", 0),
+            let_field("f1", "src", 1),
+            let_ctor("new", "Swapped", vec![var("f1"), var("f0")]),
+        ];
+        let before = stmts.clone();
+        reuse_linear_constructors(&mut stmts);
+        assert_eq!(
+            stmts, before,
+            "reuse must not touch Constructor when source is a function parameter"
+        );
+    }
+
+    #[test]
+    fn reuse_rejected_when_source_escapes_via_another_constructor() {
+        // let src = Pair(1, 2); let boxed = Box(src);   ← src escapes into Box
+        // let f0 = src.0; let f1 = src.1;
+        // let new = Swapped(f1, f0)       ← must NOT reuse (boxed still points to src)
+        let mut stmts = vec![
+            let_ctor("src", "Pair", vec![LirAtom::Int(1), LirAtom::Int(2)]),
+            let_ctor("boxed", "Box", vec![var("src")]),
+            let_field("f0", "src", 0),
+            let_field("f1", "src", 1),
+            let_ctor("new", "Swapped", vec![var("f1"), var("f0")]),
+        ];
+        let before = stmts.clone();
+        reuse_linear_constructors(&mut stmts);
+        assert_eq!(
+            stmts, before,
+            "reuse must not touch Constructor when source escaped via another Constructor"
+        );
+    }
+
+    #[test]
+    fn reuse_rejected_when_source_escapes_via_closure_capture() {
+        let mut stmts = vec![
+            let_ctor("src", "Pair", vec![LirAtom::Int(1), LirAtom::Int(2)]),
+            LirStmt::Let {
+                name: sym("c"),
+                typ: Type::I64,
+                expr: LirExpr::Closure {
+                    func: sym("f"),
+                    captures: vec![(sym("x"), var("src"))],
+                    typ: Type::I64,
+                },
+            },
+            let_field("f0", "src", 0),
+            let_field("f1", "src", 1),
+            let_ctor("new", "Swapped", vec![var("f1"), var("f0")]),
+        ];
+        let before = stmts.clone();
+        reuse_linear_constructors(&mut stmts);
+        assert_eq!(
+            stmts, before,
+            "reuse must not touch Constructor when source was captured in a closure"
+        );
+    }
+
+    #[test]
+    fn reuse_rejected_when_source_escapes_via_call_argument() {
+        let mut stmts = vec![
+            let_ctor("src", "Pair", vec![LirAtom::Int(1), LirAtom::Int(2)]),
+            LirStmt::Let {
+                name: sym("r"),
+                typ: Type::I64,
+                expr: LirExpr::Call {
+                    func: sym("side_effect"),
+                    args: vec![(sym("x"), var("src"))],
+                    typ: Type::I64,
+                },
+            },
+            let_field("f0", "src", 0),
+            let_field("f1", "src", 1),
+            let_ctor("new", "Swapped", vec![var("f1"), var("f0")]),
+        ];
+        let before = stmts.clone();
+        reuse_linear_constructors(&mut stmts);
+        assert_eq!(
+            stmts, before,
+            "reuse must not touch Constructor when source was passed to another function"
+        );
+    }
+
+    #[test]
+    fn reuse_rejected_when_source_escapes_via_fieldupdate_value() {
+        let mut stmts = vec![
+            let_ctor("src", "Pair", vec![LirAtom::Int(1), LirAtom::Int(2)]),
+            let_ctor("holder", "Holder", vec![LirAtom::Int(0)]),
+            LirStmt::FieldUpdate {
+                target: var("holder"),
+                byte_offset: 8,
+                value: var("src"),
+                value_typ: Type::I64,
+            },
+            let_field("f0", "src", 0),
+            let_field("f1", "src", 1),
+            let_ctor("new", "Swapped", vec![var("f1"), var("f0")]),
+        ];
+        let before = stmts.clone();
+        reuse_linear_constructors(&mut stmts);
+        assert_eq!(
+            stmts, before,
+            "reuse must not touch Constructor when source was stored as a field of another object"
+        );
+    }
+
+    #[test]
+    fn reuse_rejected_when_source_escapes_via_nested_if_body() {
+        // Escape inside a nested If body before the reuse site.
+        let mut stmts = vec![
+            let_ctor("src", "Pair", vec![LirAtom::Int(1), LirAtom::Int(2)]),
+            LirStmt::If {
+                cond: LirAtom::Bool(true),
+                then_body: vec![LirStmt::Let {
+                    name: sym("boxed"),
+                    typ: Type::I64,
+                    expr: LirExpr::Constructor {
+                        name: sym("Box"),
+                        args: vec![var("src")],
+                        typ: Type::I64,
+                    },
+                }],
+                else_body: vec![],
+            },
+            let_field("f0", "src", 0),
+            let_field("f1", "src", 1),
+            let_ctor("new", "Swapped", vec![var("f1"), var("f0")]),
+        ];
+        let before = stmts.clone();
+        reuse_linear_constructors(&mut stmts);
+        assert_eq!(
+            stmts, before,
+            "reuse must not touch Constructor when source escaped inside a nested If body"
+        );
+    }
+
+    #[test]
+    fn reuse_rejected_when_source_is_shadowed_with_non_ctor_binding() {
+        // let src = Constructor Pair (a, b)    ← first binding, local
+        // let src = Call ext ()                ← shadow; active src is now extern
+        // let f0 = ObjectField src 0           ← reads from the Call result
+        // let new = Swapped(f0)                ← must NOT reuse (externally owned)
+        let mut stmts = vec![
+            let_ctor("src", "Pair", vec![LirAtom::Int(1), LirAtom::Int(2)]),
+            LirStmt::Let {
+                name: sym("src"),
+                typ: Type::I64,
+                expr: LirExpr::Call {
+                    func: sym("ext"),
+                    args: vec![],
+                    typ: Type::I64,
+                },
+            },
+            let_field("f0", "src", 0),
+            let_field("f1", "src", 1),
+            let_ctor("new", "Swapped", vec![var("f1"), var("f0")]),
+        ];
+        let before = stmts.clone();
+        reuse_linear_constructors(&mut stmts);
+        assert_eq!(
+            stmts, before,
+            "shadowing with a non-Constructor binding must block reuse (active src is externally owned)"
+        );
+    }
+
+    #[test]
+    fn reuse_rejected_when_source_is_used_after_in_nested_body() {
+        // Nested read of src after reuse — the existing src_used_after check was
+        // not recursive; the fix makes atom_mentions_var_in_stmt walk sub-bodies.
+        let mut stmts = vec![
+            let_ctor("src", "Pair", vec![LirAtom::Int(1), LirAtom::Int(2)]),
+            let_field("f0", "src", 0),
+            let_field("f1", "src", 1),
+            let_ctor("new", "Swapped", vec![var("f1"), var("f0")]),
+            LirStmt::If {
+                cond: LirAtom::Bool(true),
+                then_body: vec![let_field("post", "src", 0)],
+                else_body: vec![],
+            },
+        ];
+        let before = stmts.clone();
+        reuse_linear_constructors(&mut stmts);
+        assert_eq!(
+            stmts, before,
+            "reuse must not touch Constructor when source is read in a nested body after the reuse site"
+        );
     }
 }
