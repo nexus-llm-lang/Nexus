@@ -6,60 +6,59 @@
  *   Lex → Parse → HIR → MIR → LIR → WASM
  */
 
-import { tokenize } from "nxc/frontend/lexer.nx"
-import { parse } from "nxc/frontend/parser.nx"
-import { heap_mark, heap_reset, heap_swap } from "stdlib/arena.nx"
+import * as lexer from "nxc/frontend/lexer.nx"
+import * as parser from "nxc/frontend/parser.nx"
+import * as arena from "stdlib/arena.nx"
 import { Program, SpannedTopLevel, SpannedExpr, SpannedStmt, TopLevel, ImportDef, ImportItem, EnumDef, GlobalLet, TyI64, TyString, TyUnit, TyList, Literal, TypeExpr } from "nxc/common/ast.nx"
 import { Span } from "nxc/common/token.nx"
-import { CompileError, format_error,
+import { CompileError,
          UnexpectedToken, UnexpectedEof,
          TypeMismatch, MissingMain, MainNotFunction, MainNotUnit,
          InvalidSymbolTag, EmptyScopeStack, NoActiveScope,
          SymbolNotFound,
          CyclicImport, InvalidUsage, WriteFailed,
-         LexError, MirError, LirError,
-         format_at, format_span } from "nxc/common/error.nx"
-import { RenameEntry, rename_add } from "nxc/ir/symtab.nx"
-import { default_alias, build_rename_map, build_importer_entries, extract_imports } from "nxc/ir/resolve.nx"
-import { canonical_name } from "nxc/ir/rdrname.nx"
+         LexError, MirError, LirError }, * as err from "nxc/common/error.nx"
+import { RenameEntry }, * as symtab from "nxc/ir/symtab.nx"
+import * as resolve from "nxc/ir/resolve.nx"
+import * as rdr from "nxc/ir/rdrname.nx"
 import { HirAccum, HirProgram, HirFunction, HirExternal, HirParam, HirBody, EagerBody, LazyBody, HirStmt, HirStmtKind, HirExpr, HirExprKind } from "nxc/ir/hir_types.nx"
-import { empty_accum, process_defs, set_accum_wmod_for_stdlib, accum_to_program, infer_lambda_body, collect_calls_stmts, convert_expr, collect_reachable, filter_reachable_functions, filter_reachable_externals, resolve_one_lazy } from "nxc/ir/hir.nx"
-import { lower_hir_to_mir } from "nxc/ir/mir.nx"
-import { lower_mir_to_lir } from "nxc/ir/lir.nx"
-import { optimize_lir } from "nxc/ir/lir_opt.nx"
-import { compile_lir_to_wasm, wrap_core_in_component } from "nxc/backend/codegen.nx"
-import { check_program } from "nxc/typecheck/check.nx"
-import { write_file, buf_free, length as buf_length, read_binary_file, get_byte } from "stdlib/bytebuffer.nx"
-import { merge_with_stdlib } from "nxc/backend/wasm_merge.nx"
+import * as hir from "nxc/ir/hir.nx"
+import * as mir from "nxc/ir/mir.nx"
+import * as lir from "nxc/ir/lir.nx"
+import * as lir_opt from "nxc/ir/lir_opt.nx"
+import * as codegen from "nxc/backend/codegen.nx"
+import * as tc from "nxc/typecheck/check.nx"
+import * as bb from "stdlib/bytebuffer.nx"
+import * as wmerge from "nxc/backend/wasm_merge.nx"
 import { Fs }, * as fs_mod from "stdlib/fs.nx"
 import { Console }, * as stdio from "stdlib/stdio.nx"
 import { Clock }, * as clock_mod from "stdlib/clock.nx"
-import { from_i64, starts_with } from "stdlib/string.nx"
-import { argv, exit } from "stdlib/proc.nx"
-import { length as str_list_length } from "stdlib/list.nx"
+import * as str from "stdlib/string.nx"
+import * as proc from "stdlib/proc.nx"
+import * as list from "stdlib/list.nx"
 
 // ─── Dep memory pages reader ────────────────────────────────────────────────
 // Read initial pages from a WASM binary's memory section (section 5).
 // Simple ULEB128 reader for small values.
 let rd_uleb_simple = fn (buf: &ByteBuffer, pos: i64) -> i64 do
-  let b0 = get_byte(buf: buf, idx: pos)
+  let b0 = bb.get_byte(buf: buf, idx: pos)
   if b0 < 128 then return b0 end
-  let b1 = get_byte(buf: buf, idx: pos + 1)
+  let b1 = bb.get_byte(buf: buf, idx: pos + 1)
   if b1 < 128 then return (b0 % 128) + b1 * 128 end
-  let b2 = get_byte(buf: buf, idx: pos + 2)
+  let b2 = bb.get_byte(buf: buf, idx: pos + 2)
   return (b0 % 128) + (b1 % 128) * 128 + b2 * 16384
 end
 let uleb_size = fn (buf: &ByteBuffer, pos: i64) -> i64 do
-  if get_byte(buf: buf, idx: pos) < 128 then return 1 end
-  if get_byte(buf: buf, idx: pos + 1) < 128 then return 2 end
+  if bb.get_byte(buf: buf, idx: pos) < 128 then return 1 end
+  if bb.get_byte(buf: buf, idx: pos + 1) < 128 then return 2 end
   return 3
 end
 let read_dep_pages = fn (buf: &ByteBuffer) -> i64 do
-  return scan_sections(buf: buf, pos: 8, end_pos: buf_length(buf: buf))
+  return scan_sections(buf: buf, pos: 8, end_pos: bb.length(buf: buf))
 end
 let scan_sections = fn (buf: &ByteBuffer, pos: i64, end_pos: i64) -> i64 do
   if pos >= end_pos then return 0 end
-  let sec_id = get_byte(buf: buf, idx: pos)
+  let sec_id = bb.get_byte(buf: buf, idx: pos)
   let sec_size = rd_uleb_simple(buf: buf, pos: pos + 1)
   let hdr = uleb_size(buf: buf, pos: pos + 1)
   let next = pos + 1 + hdr + sec_size
@@ -268,25 +267,25 @@ let process_imports = fn (imports: [ImportDef], accum: HirAccum,
               case CacheMiss ->
                 return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, caller_entries: caller_entries, depth: depth, verbose: verbose)
               case CacheHit(defs: cached_defs, entries: _) ->
-                let importer = build_importer_entries(imported_defs: cached_defs, import_def: imp)
+                let importer = resolve.build_importer_entries(imported_defs: cached_defs, import_def: imp)
                 let new_caller = append_entries(xs: importer, ys: caller_entries)
                 return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, caller_entries: new_caller, depth: depth, verbose: verbose)
             end
           end
           if verbose then Console.eprintln(val: "[nxc]   import: " ++ path) end
-          let tokens = tokenize(src: Fs.read_to_string(path: path))
-          let imported_defs = get_defs(prog: parse(tokens: tokens))
-          let entries = build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
-          let sub_imports = extract_imports(defs: imported_defs)
+          let tokens = lexer.tokenize(src: Fs.read_to_string(path: path))
+          let imported_defs = get_defs(prog: parser.parse(tokens: tokens))
+          let entries = resolve.build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
+          let sub_imports = resolve.extract_imports(defs: imported_defs)
           let new_stack = Cons(v: path, rest: import_stack)
           let new_cache = Cons(v: CacheEntry(path: path, defs: imported_defs, entries: entries), rest: cache)
           let sub_result = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, visited: Cons(v: path, rest: visited), cache: new_cache, caller_entries: [], depth: depth + 1, verbose: verbose)
           match sub_result do case ImportResult(accum: accum2, visited: visited2, cache: cache2, caller_entries: sub_caller) ->
             let entries_for_imported = append_entries(xs: sub_caller, ys: entries)
-            let accum3 = process_defs(defs: imported_defs, entries: entries_for_imported, accum: accum2, source_file: path)
+            let accum3 = hir.process_defs(defs: imported_defs, entries: entries_for_imported, accum: accum2, source_file: path)
             // Importer-view entries: the CALLER scope (us) needs to rename
             // its alias.foo / visible calls to canonical targets.
-            let importer = build_importer_entries(imported_defs: imported_defs, import_def: imp)
+            let importer = resolve.build_importer_entries(imported_defs: imported_defs, import_def: imp)
             let new_caller = append_entries(xs: importer, ys: caller_entries)
             return process_imports(imports: rest, accum: accum3, import_stack: import_stack, visited: visited2, cache: cache2, caller_entries: new_caller, depth: depth, verbose: verbose)
           end
@@ -325,9 +324,9 @@ let collect_import_graph = fn (imports: [ImportDef], from_path: string,
               end
             end
             let src = Fs.read_to_string(path: path)
-            let tokens = tokenize(src: src)
-            let imported_prog = parse(tokens: tokens)
-            let sub_imports = extract_imports(defs: get_defs(prog: imported_prog))
+            let tokens = lexer.tokenize(src: src)
+            let imported_prog = parser.parse(tokens: tokens)
+            let sub_imports = resolve.extract_imports(defs: get_defs(prog: imported_prog))
             let sub_r = collect_import_graph(imports: sub_imports, from_path: path, visited: Cons(v: path, rest: visited))
             match sub_r do case GraphResult(edges: se, visited: sv) ->
               let rest_r = collect_import_graph(imports: rest, from_path: from_path, visited: sv)
@@ -361,9 +360,9 @@ end
 let dump_import_graph = fn (input_path: string) -> unit
     require { Fs, Console } throws { Exn } do
   let src = Fs.read_to_string(path: input_path)
-  let tokens = tokenize(src: src)
-  let prog = parse(tokens: tokens)
-  let imports = extract_imports(defs: get_defs(prog: prog))
+  let tokens = lexer.tokenize(src: src)
+  let prog = parser.parse(tokens: tokens)
+  let imports = resolve.extract_imports(defs: get_defs(prog: prog))
   let result = collect_import_graph(imports: imports, from_path: input_path, visited: Cons(v: input_path, rest: Nil))
   match result do case GraphResult(edges: edges, visited: _) ->
     Console.println(val: "digraph imports {")
@@ -402,31 +401,31 @@ let build_entry_self_entries = fn (defs: [SpannedTopLevel], source: string, acc:
     case [] -> return acc
     case SpannedTopLevel(node: TLLet(def: GlobalLet(name: name, is_public: _, typ: _, value: _)), span: _) :: rest ->
       if name == "main" then
-        let acc2 = rename_add(entries: acc, original: name, qualified: "main")
+        let acc2 = symtab.rename_add(entries: acc, original: name, qualified: "main")
         return build_entry_self_entries(defs: rest, source: source, acc: acc2)
       end
-      let acc2 = rename_add(entries: acc, original: name, qualified: canonical_name_string(source: source, name: name))
+      let acc2 = symtab.rename_add(entries: acc, original: name, qualified: canonical_name_string(source: source, name: name))
       return build_entry_self_entries(defs: rest, source: source, acc: acc2)
     case SpannedTopLevel(node: TLPort(def: Port(name: name, is_public: _, functions: _)), span: _) :: rest ->
-      let acc2 = rename_add(entries: acc, original: name, qualified: canonical_name_string(source: source, name: name))
+      let acc2 = symtab.rename_add(entries: acc, original: name, qualified: canonical_name_string(source: source, name: name))
       return build_entry_self_entries(defs: rest, source: source, acc: acc2)
     case _ :: rest -> return build_entry_self_entries(defs: rest, source: source, acc: acc)
   end
 end
 
 let canonical_name_string = fn (source: string, name: string) -> string do
-  return canonical_name(source_path: source, name: name)
+  return rdr.canonical_name(source_path: source, name: name)
 end
 
 let build_hir = fn (prog: Program, source_file: string, verbose: bool) -> HirBuildResult require { Fs, Console } throws { Exn } do
   let defs = get_defs(prog: prog)
-  let imports = extract_imports(defs: defs)
-  let result = process_imports(imports: imports, accum: empty_accum(), import_stack: Nil, visited: Nil, cache: Nil, caller_entries: [], depth: 1, verbose: verbose)
+  let imports = resolve.extract_imports(defs: defs)
+  let result = process_imports(imports: imports, accum: hir.empty_accum(), import_stack: Nil, visited: Nil, cache: Nil, caller_entries: [], depth: 1, verbose: verbose)
   match result do case ImportResult(accum: accum, visited: _, cache: import_cache, caller_entries: caller_entries) ->
     let self_entries = build_entry_self_entries(defs: defs, source: source_file, acc: [])
     let entries = append_entries(xs: self_entries, ys: caller_entries)
-    let accum2 = process_defs(defs: defs, entries: entries, accum: accum, source_file: source_file)
-    return HirBuildResult(program: accum_to_program(accum: accum2), import_cache: import_cache)
+    let accum2 = hir.process_defs(defs: defs, entries: entries, accum: accum, source_file: source_file)
+    return HirBuildResult(program: hir.accum_to_program(accum: accum2), import_cache: import_cache)
   end
 end
 
@@ -437,7 +436,7 @@ let find_func_body_in_defs = fn (defs: [SpannedTopLevel], name: string) -> [Span
     case Nil -> return Nil
     case SpannedTopLevel(node: TLLet(def: GlobalLet(name: n, is_public: _, typ: _, value: val)), span: _) :: rest ->
       if n == name then
-        return infer_lambda_body(expr: match val do case SpannedExpr(node: nd, span: _) -> nd end)
+        return hir.infer_lambda_body(expr: match val do case SpannedExpr(node: nd, span: _) -> nd end)
       else
         return find_func_body_in_defs(defs: rest, name: name)
       end
@@ -470,7 +469,7 @@ let collect_eager_calls = fn (funcs: [HirFunction]) -> [string] do
   match funcs do
     case Nil -> return Nil
     case HirFunction(name: _, type_params: _, params: _, ret_type: _, body: EagerBody(stmts: stmts), span: _) :: rest ->
-      let calls = collect_calls_stmts(stmts: stmts)
+      let calls = hir.collect_calls_stmts(stmts: stmts)
       return append_str(xs: calls, ys: collect_eager_calls(funcs: rest))
     case _ :: rest -> return collect_eager_calls(funcs: rest)
   end
@@ -514,12 +513,12 @@ let resolve_one_pass = fn (funcs: [HirFunction], cache: [ResolveCache],
         case LazyBody(ast_expr: expr, entries: entries) ->
           if list_has_str(xs: worklist, s: n) && list_has_str(xs: visited, s: n) == false then
             // Resolve via convert_expr on stored SpannedExpr
-            let hir_val = convert_expr(expr: expr, entries: entries)
+            let hir_val = hir.convert_expr(expr: expr, entries: entries)
             let resolved_stmts = match hir_val do
               case HirExpr(node: Lambda(type_params: _, params: _, ret_type: _, body: body), span: _) -> body
               case _ -> Nil
             end
-            let calls = collect_calls_stmts(stmts: resolved_stmts)
+            let calls = hir.collect_calls_stmts(stmts: resolved_stmts)
             let func = HirFunction(name: n, type_params: tps, params: ps, ret_type: rt,
               body: EagerBody(stmts: resolved_stmts), span: sp)
             return resolve_one_pass(funcs: rest, cache: cache, worklist: worklist, visited: visited,
@@ -558,8 +557,8 @@ let build_resolve_cache = fn (files: [string]) -> [ResolveCache] require { Fs } 
     case Nil -> return Nil
     case path :: rest ->
       let src = Fs.read_to_string(path: path)
-      let tokens = tokenize(src: src)
-      let prog = parse(tokens: tokens)
+      let tokens = lexer.tokenize(src: src)
+      let prog = parser.parse(tokens: tokens)
       let defs = get_defs(prog: prog)
       return ResolveCache(path: path, defs: defs) :: build_resolve_cache(files: rest)
   end
@@ -583,7 +582,7 @@ let resolve_with_cache = fn (funcs: [HirFunction], cache: [ResolveCache], acc: [
       let resolved = match b do
         case EagerBody(stmts: _) -> b
         case LazyBody(ast_expr: expr, entries: entries) ->
-          let hv = convert_expr(expr: expr, entries: entries)
+          let hv = hir.convert_expr(expr: expr, entries: entries)
           match hv do
             case HirExpr(node: Lambda(type_params: _, params: _, ret_type: _, body: body), span: _) -> EagerBody(stmts: body)
             case _ -> EagerBody(stmts: Nil)
@@ -600,7 +599,7 @@ let resolve_non_lambda = fn (defs: [SpannedTopLevel], name: string, entries: [Re
     case Nil -> return Nil
     case SpannedTopLevel(node: TLLet(def: GlobalLet(name: n, is_public: _, typ: _, value: val)), span: sp) :: rest ->
       if n == name then
-        let hir_val = convert_expr(expr: val, entries: entries)
+        let hir_val = hir.convert_expr(expr: val, entries: entries)
         return [HirStmt(node: Return(expr: hir_val), span: sp)]
       else
         return resolve_non_lambda(defs: rest, name: name, entries: entries)
@@ -620,12 +619,12 @@ let iterative_resolve_go = fn (all_funcs: [HirFunction], current: [HirFunction],
     hb: [HirHandlerBindingEntry], max_rounds: i64) -> [HirFunction] do
   if max_rounds <= 0 then return strip_lazy(funcs: current) end
   let stubs = strip_lazy(funcs: current)
-  let reachable = collect_reachable(functions: stubs, handler_bindings: hb)
+  let reachable = hir.collect_reachable(functions: stubs, handler_bindings: hb)
   // Always filter from ALL functions so deeper call chains are discovered.
-  let filtered = filter_reachable_functions(functions: all_funcs, reachable: reachable)
+  let filtered = hir.filter_reachable_functions(functions: all_funcs, reachable: reachable)
   let resolved = resolve_all_lazy_via_convert(funcs: filtered)
-  let new_reachable = collect_reachable(functions: resolved, handler_bindings: hb)
-  let new_filtered = filter_reachable_functions(functions: all_funcs, reachable: new_reachable)
+  let new_reachable = hir.collect_reachable(functions: resolved, handler_bindings: hb)
+  let new_filtered = hir.filter_reachable_functions(functions: all_funcs, reachable: new_reachable)
   let grew = list_longer(a: new_filtered, b: filtered)
   let merged = merge_resolved(orig: new_filtered, resolved: resolved)
   if grew then
@@ -713,7 +712,7 @@ let resolve_all_lazy_via_convert = fn (funcs: [HirFunction]) -> [HirFunction] do
       let ResolveBodyResult(body: resolved, ret: resolved_rt) = match b do
         case EagerBody(stmts: _) -> ResolveBodyResult(body: b, ret: rt)
         case LazyBody(ast_expr: expr, entries: entries) ->
-          let hv = convert_expr(expr: expr, entries: entries)
+          let hv = hir.convert_expr(expr: expr, entries: entries)
           match hv do
             case HirExpr(node: Lambda(type_params: _, params: lps, ret_type: lambda_rt, body: body), span: _) ->
               ResolveBodyResult(body: EagerBody(stmts: body), ret: lambda_rt)
@@ -806,8 +805,8 @@ let get_output_path = fn (xs: [string], argc: i64) -> string do
 end
 
 let write_and_free = fn (buf: %ByteBuffer, path: string) -> bool do
-  let ok = write_file(buf: &buf, path: path)
-  buf_free(buf: %buf)
+  let ok = bb.write_file(buf: &buf, path: path)
+  bb.buf_free(buf: %buf)
   return ok
 end
 
@@ -816,7 +815,7 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock 
   try
     let verbose = has_verbose_flag(xs: args)
     let clean_args = strip_verbose_flag(xs: args)
-    let argc = str_list_length(xs: clean_args)
+    let argc = list.length(xs: clean_args)
     if argc < 2 then
       Console.eprintln(val: "Usage: nxc <input.nx> [output.wasm]")
       Console.eprintln(val: "       nxc --dump-imports <input.nx>")
@@ -841,24 +840,24 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock 
     let t0 = Clock.now()
     let src = Fs.read_to_string(path: input_path)
     let t1 = Clock.now()
-    if verbose then Console.eprintln(val: "[nxc] read source (" ++ from_i64(val: t1 - t0) ++ "ms)") end
+    if verbose then Console.eprintln(val: "[nxc] read source (" ++ str.from_i64(val: t1 - t0) ++ "ms)") end
 
     // Mark heap before compilation pipeline. All IR data allocated below
     // can be freed after codegen completes (ByteBuffer is host-managed).
-    let pipeline_mark = heap_mark()
+    let pipeline_mark = arena.heap_mark()
 
-    let tokens = tokenize(src: src)
+    let tokens = lexer.tokenize(src: src)
     let t2 = Clock.now()
-    if verbose then Console.eprintln(val: "[nxc] lex (" ++ from_i64(val: t2 - t1) ++ "ms)") end
+    if verbose then Console.eprintln(val: "[nxc] lex (" ++ str.from_i64(val: t2 - t1) ++ "ms)") end
 
-    let prog = parse(tokens: tokens)
+    let prog = parser.parse(tokens: tokens)
     let t3 = Clock.now()
-    if verbose then Console.eprintln(val: "[nxc] parse (" ++ from_i64(val: t3 - t2) ++ "ms)") end
+    if verbose then Console.eprintln(val: "[nxc] parse (" ++ str.from_i64(val: t3 - t2) ++ "ms)") end
 
     let hir_result = build_hir(prog: prog, source_file: input_path, verbose: verbose)
     let HirBuildResult(program: hir_raw, import_cache: _) = hir_result
     let t4 = Clock.now()
-    if verbose then Console.eprintln(val: "[nxc] HIR (" ++ from_i64(val: t4 - t3) ++ "ms)") end
+    if verbose then Console.eprintln(val: "[nxc] HIR (" ++ str.from_i64(val: t4 - t3) ++ "ms)") end
 
     // Iterative resolve: filter by reachability, resolve, repeat until stable.
     let hir = match hir_raw do
@@ -867,31 +866,31 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock 
         HirProgram(ports: hp, functions: resolved, externals: he, handler_bindings: hb, enum_defs: hed)
     end
     let t4b = Clock.now()
-    if verbose then Console.eprintln(val: "[nxc] resolve (" ++ from_i64(val: t4b - t4) ++ "ms)") end
+    if verbose then Console.eprintln(val: "[nxc] resolve (" ++ str.from_i64(val: t4b - t4) ++ "ms)") end
 
     // Extract enum_defs and local_names eagerly so hir/prog can die after typecheck.
     // This removes cross-phase references that would prevent future region resets.
     let enum_defs = get_enum_defs(hir: hir)
     let local_names = extract_function_names(defs: get_defs(prog: prog))
-    let hir_checked = check_program(hir: hir, local_names: local_names)
+    let hir_checked = tc.check_program(hir: hir, local_names: local_names)
     let t5 = Clock.now()
-    if verbose then Console.eprintln(val: "[nxc] typecheck (" ++ from_i64(val: t5 - t4) ++ "ms)") end
+    if verbose then Console.eprintln(val: "[nxc] typecheck (" ++ str.from_i64(val: t5 - t4) ++ "ms)") end
     // After this point: prog, hir, local_names are dead.
     // hir_checked and enum_defs are the only live compiler data.
 
-    let mir = lower_hir_to_mir(hir: hir_checked)
+    let mir = mir.lower_hir_to_mir(hir: hir_checked)
     let t6 = Clock.now()
-    if verbose then Console.eprintln(val: "[nxc] MIR (" ++ from_i64(val: t6 - t5) ++ "ms)") end
+    if verbose then Console.eprintln(val: "[nxc] MIR (" ++ str.from_i64(val: t6 - t5) ++ "ms)") end
     // hir_checked is dead; mir and enum_defs are live.
 
-    let lir = lower_mir_to_lir(mir: mir, enum_defs: enum_defs)
+    let lir = lir.lower_mir_to_lir(mir: mir, enum_defs: enum_defs)
     let t7 = Clock.now()
-    if verbose then Console.eprintln(val: "[nxc] LIR (" ++ from_i64(val: t7 - t6) ++ "ms)") end
+    if verbose then Console.eprintln(val: "[nxc] LIR (" ++ str.from_i64(val: t7 - t6) ++ "ms)") end
     // mir and enum_defs are dead; lir is live.
 
-    let lir_opt = optimize_lir(program: lir)
+    let lir_opt = lir_opt.optimize_lir(program: lir)
     let t8 = Clock.now()
-    if verbose then Console.eprintln(val: "[nxc] optimize (" ++ from_i64(val: t8 - t7) ++ "ms)") end
+    if verbose then Console.eprintln(val: "[nxc] optimize (" ++ str.from_i64(val: t8 - t7) ++ "ms)") end
 
     // Compute string_data_base from stdlib memory (dep_pages * 65536).
     // For standalone programs (no stdlib), use 0.
@@ -900,14 +899,14 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock 
       case [] -> 0
       case _ ->
         // Read dep's initial pages from stdlib.wasm memory section
-        let %dep = read_binary_file(path: "nxlib/stdlib/stdlib.wasm")
+        let %dep = bb.read_binary_file(path: "nxlib/stdlib/stdlib.wasm")
         let dep_pages = read_dep_pages(buf: &dep)
-        buf_free(buf: %dep)
+        bb.buf_free(buf: %dep)
         dep_pages * 65536
     end
-    let %wasm_buf = compile_lir_to_wasm(program: lir_opt, string_data_base: str_base)
+    let %wasm_buf = codegen.compile_lir_to_wasm(program: lir_opt, string_data_base: str_base)
     let t9 = Clock.now()
-    if verbose then Console.eprintln(val: "[nxc] codegen (" ++ from_i64(val: t9 - t8) ++ "ms)") end
+    if verbose then Console.eprintln(val: "[nxc] codegen (" ++ str.from_i64(val: t9 - t8) ++ "ms)") end
 
     // If program has stdlib imports, merge with stdlib.wasm to produce self-contained core WASM.
     // If standalone (no imports), wrap in Component Model.
@@ -915,29 +914,29 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock 
     let %wasm_buf = match lir_exts do
       case [] ->
         if verbose then Console.eprintln(val: "[nxc] wrapping in component model (standalone)") end
-        wrap_core_in_component(core_wasm: %wasm_buf)
+        codegen.wrap_core_in_component(core_wasm: %wasm_buf)
       case _ ->
-        merge_with_stdlib(core_wasm: %wasm_buf, stdlib_path: "nxlib/stdlib/stdlib.wasm")
+        wmerge.merge_with_stdlib(core_wasm: %wasm_buf, stdlib_path: "nxlib/stdlib/stdlib.wasm")
     end
 
     // All IR data is now dead. ByteBuffer is host-managed (not on nexus heap).
     // Reset heap to free all compiler data structures.
-    heap_reset(mark: pipeline_mark)
+    arena.heap_reset(mark: pipeline_mark)
 
     let ok = write_and_free(buf: %wasm_buf, path: output_path)
     let t10 = Clock.now()
 
     if ok then
       if verbose then
-        Console.eprintln(val: "[nxc] write (" ++ from_i64(val: t10 - t9) ++ "ms)")
-        Console.eprintln(val: "nxc: wrote " ++ output_path ++ " (total " ++ from_i64(val: t10 - t0) ++ "ms)")
+        Console.eprintln(val: "[nxc] write (" ++ str.from_i64(val: t10 - t9) ++ "ms)")
+        Console.eprintln(val: "nxc: wrote " ++ output_path ++ " (total " ++ str.from_i64(val: t10 - t0) ++ "ms)")
       end
     else
       raise WriteFailed(path: output_path)
     end
   catch e ->
-    Console.eprintln(val: format_error(err: e))
-    exit(status: 1)
+    Console.eprintln(val: err.format_error(err: e))
+    proc.exit(status: 1)
   end
   end
 end
