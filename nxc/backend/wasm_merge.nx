@@ -1206,6 +1206,199 @@ let offset_tag_types = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaini
   return offset_tag_types(out: %out, buf: buf, pos: ppos(pk: pk2), remaining: remaining - 1, off: off)
 end
 
+// ─── Custom section preservation ──────────────────────────────────────────
+// Scan all custom sections (id=0) in buf. Returns an smap keyed by sequential
+// index ("0", "1", …) -> pack(content_start, sec_size). The special key
+// "__count" holds the total number of custom sections discovered.
+// `scan_secs` collapses all customs onto key="0", which is why we need this.
+let scan_custom_secs = fn (buf: &ByteBuffer) -> i64 do
+  let map = __nx_smap_new()
+  let c = scan_custom_go(buf: buf, pos: 8, end_pos: bb.length(buf: buf), map: map, idx: 0)
+  __nx_smap_put(id: map, key: "__count", value: c)
+  return map
+end
+let scan_custom_go = fn (buf: &ByteBuffer, pos: i64, end_pos: i64, map: i64, idx: i64) -> i64 do
+  if pos >= end_pos then return idx end
+  let sec_id = bb.get_byte(buf: buf, idx: pos)
+  let pk = rd_uleb(buf: buf, pos: pos + 1)
+  let sec_size = pval(pk: pk)
+  let content_start = ppos(pk: pk)
+  let new_idx = if sec_id == 0 then
+      __nx_smap_put(id: map, key: str.from_i64(val: idx), value: pack(val: content_start, p: sec_size))
+      idx + 1
+    else idx end
+  return scan_custom_go(buf: buf, pos: content_start + sec_size, end_pos: end_pos, map: map, idx: new_idx)
+end
+
+// Compare the ULEB-prefixed section name at `content_start` to `target`.
+let custom_name_equals = fn (buf: &ByteBuffer, content_start: i64, target: string) -> bool do
+  let pk = rd_uleb(buf: buf, pos: content_start)
+  let len = pval(pk: pk)
+  let name_start = ppos(pk: pk)
+  let tlen = str.byte_length(s: target)
+  if len != tlen then return false end
+  return name_eq_go(buf: buf, start: name_start, target: target, i: 0, n: tlen)
+end
+let name_eq_go = fn (buf: &ByteBuffer, start: i64, target: string, i: i64, n: i64) -> bool do
+  if i >= n then return true end
+  if bb.get_byte(buf: buf, idx: start + i) != str.char_code(s: target, idx: i) then return false end
+  return name_eq_go(buf: buf, start: start, target: target, i: i + 1, n: n)
+end
+
+// Emit a custom section verbatim: id=0, ULEB(size), content bytes.
+let emit_custom_raw = fn (out: %ByteBuffer, src: &ByteBuffer, content_start: i64, sec_size: i64) -> %ByteBuffer do
+  let %out = bb.push_byte(buf: %out, byte: 0)
+  let %out = bb.push_uleb128(buf: %out, val: sec_size)
+  return bb.copy_range(dst: %out, src: src, start: content_start, end_pos: content_start + sec_size)
+end
+
+// Iterate name-section subsections; dispatch on subsec id.
+// Subsec 1 (func names) and 2 (local names) get func_idx remapped.
+// All other subsecs are pass-through.
+let emit_name_subsecs_go = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64,
+                                 end_pos: i64, remap: i64, remap_size: i64) -> %ByteBuffer do
+  if pos >= end_pos then return %out end
+  let sub_id = bb.get_byte(buf: src, idx: pos)
+  let pk = rd_uleb(buf: src, pos: pos + 1)
+  let sub_size = pval(pk: pk)
+  let sub_start = ppos(pk: pk)
+  let sub_end = sub_start + sub_size
+  let %out = if sub_id == 1 then
+      emit_name_funcsubsec(out: %out, src: src, sub_start: sub_start, remap: remap, remap_size: remap_size)
+    else
+      if sub_id == 2 then
+        emit_name_localsubsec(out: %out, src: src, sub_start: sub_start, sub_size: sub_size, remap: remap, remap_size: remap_size)
+      else
+        bb.copy_range(dst: %out, src: src, start: pos, end_pos: sub_end)
+      end
+    end
+  return emit_name_subsecs_go(out: %out, src: src, pos: sub_end, end_pos: end_pos, remap: remap, remap_size: remap_size)
+end
+
+// Re-emit subsec 1 (function names): vec<(func_idx:ULEB, name:ULEB+bytes)>.
+// Build into tmp buf so we can prefix with ULEB(payload_len).
+let emit_name_funcsubsec = fn (out: %ByteBuffer, src: &ByteBuffer, sub_start: i64,
+                                 remap: i64, remap_size: i64) -> %ByteBuffer do
+  let pk = rd_uleb(buf: src, pos: sub_start)
+  let count = pval(pk: pk)
+  let entries_start = ppos(pk: pk)
+  let %tmp = bb.empty()
+  let %tmp = bb.push_uleb128(buf: %tmp, val: count)
+  let %tmp = emit_name_func_entries(out: %tmp, src: src, pos: entries_start,
+                                      remaining: count, remap: remap, remap_size: remap_size)
+  let tmp_len = bb.length(buf: &tmp)
+  let %out = bb.push_byte(buf: %out, byte: 1)
+  let %out = bb.push_uleb128(buf: %out, val: tmp_len)
+  let %out = bb.push_buf(dst: %out, src: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+let emit_name_func_entries = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64,
+                                   remaining: i64, remap: i64, remap_size: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let pk1 = rd_uleb(buf: src, pos: pos)
+  let old_idx = pval(pk: pk1)
+  let after_idx = ppos(pk: pk1)
+  let pk2 = rd_uleb(buf: src, pos: after_idx)
+  let n_len = pval(pk: pk2)
+  let n_end = ppos(pk: pk2) + n_len
+  let new_idx = if old_idx < remap_size then intarr_get(id: remap, idx: old_idx) else old_idx end
+  let %out = bb.push_uleb128(buf: %out, val: new_idx)
+  let %out = bb.copy_range(dst: %out, src: src, start: after_idx, end_pos: n_end)
+  return emit_name_func_entries(out: %out, src: src, pos: n_end, remaining: remaining - 1, remap: remap, remap_size: remap_size)
+end
+
+// Re-emit subsec 2 (local names): vec<(func_idx:ULEB, vec<(local_idx, name)>)>.
+// Only the outer func_idx is remapped; inner local vec is copied verbatim.
+let emit_name_localsubsec = fn (out: %ByteBuffer, src: &ByteBuffer, sub_start: i64, sub_size: i64,
+                                  remap: i64, remap_size: i64) -> %ByteBuffer do
+  let pk = rd_uleb(buf: src, pos: sub_start)
+  let count = pval(pk: pk)
+  let entries_start = ppos(pk: pk)
+  let sub_end = sub_start + sub_size
+  let %tmp = bb.empty()
+  let %tmp = bb.push_uleb128(buf: %tmp, val: count)
+  let %tmp = emit_name_local_entries(out: %tmp, src: src, pos: entries_start, end_pos: sub_end,
+                                       remaining: count, remap: remap, remap_size: remap_size)
+  let tmp_len = bb.length(buf: &tmp)
+  let %out = bb.push_byte(buf: %out, byte: 2)
+  let %out = bb.push_uleb128(buf: %out, val: tmp_len)
+  let %out = bb.push_buf(dst: %out, src: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+let emit_name_local_entries = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, end_pos: i64,
+                                    remaining: i64, remap: i64, remap_size: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let pk1 = rd_uleb(buf: src, pos: pos)
+  let old_idx = pval(pk: pk1)
+  let after_idx = ppos(pk: pk1)
+  let pk2 = rd_uleb(buf: src, pos: after_idx)
+  let inner_count = pval(pk: pk2)
+  let inner_start = ppos(pk: pk2)
+  let inner_end = skip_local_inner(src: src, pos: inner_start, remaining: inner_count)
+  let new_idx = if old_idx < remap_size then intarr_get(id: remap, idx: old_idx) else old_idx end
+  let %out = bb.push_uleb128(buf: %out, val: new_idx)
+  let %out = bb.copy_range(dst: %out, src: src, start: after_idx, end_pos: inner_end)
+  return emit_name_local_entries(out: %out, src: src, pos: inner_end, end_pos: end_pos,
+                                   remaining: remaining - 1, remap: remap, remap_size: remap_size)
+end
+let skip_local_inner = fn (src: &ByteBuffer, pos: i64, remaining: i64) -> i64 do
+  if remaining <= 0 then return pos end
+  let pk1 = rd_uleb(buf: src, pos: pos)
+  let pk2 = rd_uleb(buf: src, pos: ppos(pk: pk1))
+  let name_end = ppos(pk: pk2) + pval(pk: pk2)
+  return skip_local_inner(src: src, pos: name_end, remaining: remaining - 1)
+end
+
+// Emit a "name" custom section with function indices remapped via `remap`.
+// The section-name ULEB-string is copied verbatim; subsections are walked.
+let emit_name_remapped = fn (out: %ByteBuffer, src: &ByteBuffer,
+                              content_start: i64, sec_size: i64,
+                              remap: i64, remap_size: i64) -> %ByteBuffer do
+  let sec_end = content_start + sec_size
+  let pk = rd_uleb(buf: src, pos: content_start)
+  let name_len = pval(pk: pk)
+  let name_end = ppos(pk: pk) + name_len
+  let %payload = bb.empty()
+  let %payload = bb.copy_range(dst: %payload, src: src, start: content_start, end_pos: name_end)
+  let %payload = emit_name_subsecs_go(out: %payload, src: src, pos: name_end, end_pos: sec_end,
+                                        remap: remap, remap_size: remap_size)
+  let payload_len = bb.length(buf: &payload)
+  let %out = bb.push_byte(buf: %out, byte: 0)
+  let %out = bb.push_uleb128(buf: %out, val: payload_len)
+  let %out = bb.push_buf(dst: %out, src: &payload)
+  bb.free(buf: %payload)
+  return %out
+end
+
+// Emit all preserved custom sections from `buf`:
+//   * "name"  → rewritten via `remap` (func indices remapped per merge).
+//   * others  → passed through byte-for-byte (DWARF, producers, target_features,
+//     etc.). For .debug_* this is a placeholder — PC-offset rewriting is only
+//     needed when nxc codegen starts emitting DWARF (currently it does not).
+let emit_preserved_customs = fn (out: %ByteBuffer, buf: &ByteBuffer, customs: i64,
+                                   remap: i64, remap_size: i64) -> %ByteBuffer do
+  let total = __nx_smap_get(id: customs, key: "__count", default_val: 0)
+  return emit_custom_each(out: %out, buf: buf, customs: customs, idx: 0, total: total,
+                            remap: remap, remap_size: remap_size)
+end
+let emit_custom_each = fn (out: %ByteBuffer, buf: &ByteBuffer, customs: i64, idx: i64, total: i64,
+                             remap: i64, remap_size: i64) -> %ByteBuffer do
+  if idx >= total then return %out end
+  let pk = __nx_smap_get(id: customs, key: str.from_i64(val: idx), default_val: 0)
+  let content_start = pval(pk: pk)
+  let sec_size = ppos(pk: pk)
+  let %out = if custom_name_equals(buf: buf, content_start: content_start, target: "name") then
+      emit_name_remapped(out: %out, src: buf, content_start: content_start, sec_size: sec_size,
+                          remap: remap, remap_size: remap_size)
+    else
+      emit_custom_raw(out: %out, src: buf, content_start: content_start, sec_size: sec_size)
+    end
+  return emit_custom_each(out: %out, buf: buf, customs: customs, idx: idx + 1, total: total,
+                            remap: remap, remap_size: remap_size)
+end
+
 export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) -> %ByteBuffer do
   let %dep = bb.read_binary_file(path: stdlib_path)
   let ps = __nx_smap_new()
@@ -1377,6 +1570,19 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   let %out = emit_merged_data(out: %out,
     m_buf: &core_wasm, m_sec: get_sec(map: m_secs, sec: 11),
     d_buf: &dep, d_sec: get_sec(map: d_secs, sec: 11), reloc: 0)
+
+  // Preserve custom sections from both inputs. `name` sections are rewritten
+  // with func indices remapped; other customs (producers, target_features,
+  // future .debug_*) pass through verbatim. Must run before the remap intarrs
+  // are freed.
+  let m_customs = scan_custom_secs(buf: &core_wasm)
+  let d_customs = scan_custom_secs(buf: &dep)
+  let %out = emit_preserved_customs(out: %out, buf: &core_wasm, customs: m_customs,
+                                      remap: remap_m, remap_size: m_fimp + m_loc)
+  let %out = emit_preserved_customs(out: %out, buf: &dep, customs: d_customs,
+                                      remap: remap_d, remap_size: dep_fimp + d_loc)
+  __nx_smap_free(id: m_customs)
+  __nx_smap_free(id: d_customs)
 
   __nx_smap_free(id: ps)
   __nx_smap_free(id: m_secs)
