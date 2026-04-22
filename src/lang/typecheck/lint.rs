@@ -424,7 +424,7 @@ fn collect_signature_needs_from_expr(
                 effs.extend(inner_effs);
                 unknown |= inner_unknown;
             }
-            if let Some((call_reqs, call_effs, call_unknown)) = lookup_call_signature(func, env) {
+            if let Some((call_reqs, call_effs, call_unknown)) = lookup_call_signature(&func.as_dotted(), env) {
                 reqs.extend(call_reqs);
                 effs.extend(call_effs);
                 unknown |= call_unknown;
@@ -557,9 +557,10 @@ fn collect_signature_needs_from_expr(
 
 fn expr_mentions_name(expr: &Spanned<Expr>, target: &str) -> bool {
     match &expr.node {
-        Expr::Variable(name, sigil) => matches!(sigil, Sigil::Immutable) && name == target,
+        Expr::Variable(name, sigil) => matches!(sigil, Sigil::Immutable) && name.as_dotted() == target,
         Expr::Call { func, args } => {
-            (func == target || (func.split_once('.').is_none() && func == target))
+            let f = func.as_dotted();
+            (f == target || (f.split_once('.').is_none() && f == target))
                 || args.iter().any(|(_, arg)| expr_mentions_name(arg, target))
         }
         Expr::Borrow(name, sigil) => matches!(sigil, Sigil::Immutable) && name == target,
@@ -685,12 +686,16 @@ fn collect_used_variable_keys_in_stmts(stmts: &[Spanned<Stmt>], out: &mut HashSe
 
 fn collect_used_variable_keys_in_expr(expr: &Spanned<Expr>, out: &mut HashSet<String>) {
     match &expr.node {
-        Expr::Variable(name, sigil) | Expr::Borrow(name, sigil) => {
+        Expr::Variable(name, sigil) => {
+            out.insert(sigil.get_key(&name.as_dotted()));
+        }
+        Expr::Borrow(name, sigil) => {
             out.insert(sigil.get_key(name));
         }
         Expr::Call { func, args } => {
+            let func = func.as_dotted();
             if !func.contains('.') {
-                out.insert(func.clone());
+                out.insert(func);
             }
             for (_, arg) in args {
                 collect_used_variable_keys_in_expr(arg, out);

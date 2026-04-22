@@ -208,8 +208,7 @@ impl TypeChecker {
             };
             match p.node() {
                 Pattern::Constructor(c, args) => {
-                    // Strip module qualifier for qualified constructors
-                    let bare_c = c.rfind('.').map_or(c.as_str(), |pos| &c[pos + 1..]);
+                    let bare_c = c.occ();
                     if bare_c == ctor {
                         // Ctor(_) with a single positional wildcard means "ignore all fields"
                         let is_wildcard_spread = args.len() == 1

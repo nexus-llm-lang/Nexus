@@ -19,10 +19,11 @@ import { CompileError, format_error,
          CyclicImport, InvalidUsage, WriteFailed,
          LexError, MirError, LirError,
          format_at, format_span } from "nxc/common/error.nx"
-import { RenameEntry } from "nxc/ir/symtab.nx"
-import { default_alias, build_rename_map, extract_imports } from "nxc/ir/resolve.nx"
+import { RenameEntry, rename_add } from "nxc/ir/symtab.nx"
+import { default_alias, build_rename_map, build_importer_entries, extract_imports } from "nxc/ir/resolve.nx"
+import { canonical_name } from "nxc/ir/rdrname.nx"
 import { HirAccum, HirProgram, HirFunction, HirExternal, HirParam, HirBody, EagerBody, LazyBody, HirStmt, HirStmtKind, HirExpr, HirExprKind } from "nxc/ir/hir_types.nx"
-import { empty_accum, process_defs, process_defs_shallow, set_accum_wmod_for_stdlib, accum_to_program, infer_lambda_body, collect_calls_stmts, convert_expr, collect_reachable, filter_reachable_functions, filter_reachable_externals, resolve_one_lazy } from "nxc/ir/hir.nx"
+import { empty_accum, process_defs, set_accum_wmod_for_stdlib, accum_to_program, infer_lambda_body, collect_calls_stmts, convert_expr, collect_reachable, filter_reachable_functions, filter_reachable_externals, resolve_one_lazy } from "nxc/ir/hir.nx"
 import { lower_hir_to_mir } from "nxc/ir/mir.nx"
 import { lower_mir_to_lir } from "nxc/ir/lir.nx"
 import { optimize_lir } from "nxc/ir/lir_opt.nx"
@@ -160,7 +161,7 @@ let concat_enum_defs = fn (a: [EnumDef], b: [EnumDef]) -> [EnumDef] do
 end
 
 type CacheEntry = CacheEntry(path: string, defs: [SpannedTopLevel], entries: [RenameEntry])
-type ImportResult = ImportResult(accum: HirAccum, visited: [string], cache: [CacheEntry])
+type ImportResult = ImportResult(accum: HirAccum, visited: [string], cache: [CacheEntry], caller_entries: [RenameEntry])
 type ImportEdge = ImportEdge(from_path: string, to_path: string, is_external: bool)
 type GraphResult = GraphResult(edges: [ImportEdge], visited: [string])
 
@@ -170,15 +171,6 @@ let list_has_str = fn (xs: [string], s: string) -> bool do
     case x :: rest ->
       if x == s then return true end
       return list_has_str(xs: rest, s: s)
-  end
-end
-
-let import_items_has = fn (items: [ImportItem], name: string) -> bool do
-  match items do
-    case [] -> return false
-    case ImportItem(name: item_name, item_alias: _) :: rest ->
-       if item_name == name then return true end
-       return import_items_has(items: rest, name: name)
   end
 end
 
@@ -193,29 +185,6 @@ let cache_lookup = fn (cache: [CacheEntry], path: string) -> CacheLookupResult d
   end
 end
 
-/// Merge rename entries: start with original entries, override selected items
-/// with their new names from the selective import. This ensures internal
-/// references (e.g. split calling split_go) use the original names that
-/// were registered during the first import.
-let merge_rename_entries = fn (orig: [RenameEntry], new_selective: [RenameEntry], items: [ImportItem]) -> [RenameEntry] do
-  match orig do
-    case [] -> return []
-    case RenameEntry(original: name, qualified: _) :: rest ->
-      if import_items_has(items: items, name: name) then
-        // Selected item — use the new selective entry
-        match find_in_entries(name: name, entries: new_selective) do
-          case Some(val: new_qual) ->
-            return Cons(v: RenameEntry(original: name, qualified: new_qual), rest: merge_rename_entries(orig: rest, new_selective: new_selective, items: items))
-          case None ->
-            return Cons(v: RenameEntry(original: name, qualified: name), rest: merge_rename_entries(orig: rest, new_selective: new_selective, items: items))
-        end
-      else
-        // Non-selected — keep original entry (resolves to existing function)
-        return Cons(v: RenameEntry(original: name, qualified: find_in_entries_or(name: name, entries: orig, fallback: name)), rest: merge_rename_entries(orig: rest, new_selective: new_selective, items: items))
-      end
-  end
-end
-
 let find_in_entries = fn (name: string, entries: [RenameEntry]) -> Option<string> do
   match entries do
     case [] -> return None
@@ -225,96 +194,83 @@ let find_in_entries = fn (name: string, entries: [RenameEntry]) -> Option<string
   end
 end
 
-let find_in_entries_or = fn (name: string, entries: [RenameEntry], fallback: string) -> string do
-  match find_in_entries(name: name, entries: entries) do
-    case Some(val: q) -> return q
-    case None -> return fallback
+let append_entries = fn (xs: [RenameEntry], ys: [RenameEntry]) -> [RenameEntry] do
+  match xs do
+    case [] -> return ys
+    case x :: rest -> return Cons(v: x, rest: append_entries(xs: rest, ys: ys))
   end
 end
 
-/// Filter defs to only TLLet definitions whose names are in the items list.
-let is_function_def = fn (d: SpannedTopLevel) -> bool do
-  match d do
-    case SpannedTopLevel(node: TLLet(def: GlobalLet(name: _, is_public: _, typ: _, value: val)), span: _) ->
-      match val do
-        case SpannedExpr(node: n, span: _) ->
-          match n do
-            case ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: _) -> return true
-            case ExprHandler(coeffect_name: _, requires: _, functions: _) -> return true
-            case _ -> return false
-          end
-      end
-    case _ -> return false
-  end
-end
-
-/// Filter out function bodies (Lambda/Handler) from definitions.
-/// Keeps imports, externals, types, exceptions — everything that's cheap to re-process.
-let filter_non_function_defs = fn (defs: [SpannedTopLevel]) -> [SpannedTopLevel] do
-  match defs do
-    case [] -> return []
-    case d :: rest ->
-      if is_function_def(d: d) then
-        return filter_non_function_defs(defs: rest)
-      else
-        return Cons(v: d, rest: filter_non_function_defs(defs: rest))
-      end
-  end
-end
-
-/// Used for diamond import re-processing: only re-register the selectively
-/// imported functions without duplicating enums, ports, or unrelated lets.
-let filter_defs_by_items = fn (defs: [SpannedTopLevel], items: [ImportItem]) -> [SpannedTopLevel] do
-  match defs do
-    case [] -> return []
-    case d :: rest ->
-      match d do
-        case SpannedTopLevel(node: TLLet(def: GlobalLet(name: name, is_public: _, typ: _, value: _)), span: _) ->
-          // Only keep TLLet if the name matches an imported item
-          if import_items_has(items: items, name: name) then
-            return Cons(v: d, rest: filter_defs_by_items(defs: rest, items: items))
+/// For wildcard diamond re-import: for each (bare -> new_qual) entry in new_entries,
+/// add caller entry (new_qual -> orig_qual) so main's calls to the new alias rename
+/// to the first import's registered name.
+let compute_diamond_entries = fn (new_entries: [RenameEntry], orig_entries: [RenameEntry], acc: [RenameEntry]) -> [RenameEntry] do
+  match new_entries do
+    case [] -> return acc
+    case RenameEntry(original: bare, qualified: new_qual) :: rest ->
+      match find_in_entries(name: bare, entries: orig_entries) do
+        case Some(val: orig_qual) ->
+          if new_qual == orig_qual then
+            return compute_diamond_entries(new_entries: rest, orig_entries: orig_entries, acc: acc)
           else
-            return filter_defs_by_items(defs: rest, items: items)
+            let entry = RenameEntry(original: new_qual, qualified: orig_qual)
+            return compute_diamond_entries(new_entries: rest, orig_entries: orig_entries, acc: Cons(v: entry, rest: acc))
           end
-        case _ ->
-          // Keep ALL non-TLLet defs (imports, ports, enums, exceptions, typedefs)
-          return Cons(v: d, rest: filter_defs_by_items(defs: rest, items: items))
+        case None ->
+          return compute_diamond_entries(new_entries: rest, orig_entries: orig_entries, acc: acc)
+      end
+  end
+end
+
+/// For selective diamond re-import: add caller entry (visible -> orig_qual)
+/// for each selected item.
+let compute_selective_diamond_entries = fn (items: [ImportItem], orig_entries: [RenameEntry], acc: [RenameEntry]) -> [RenameEntry] do
+  match items do
+    case [] -> return acc
+    case ImportItem(name: name, item_alias: alias_opt) :: rest ->
+      let visible = match alias_opt do
+        case Some(val: a) -> a
+        case None -> name
+      end
+      match find_in_entries(name: name, entries: orig_entries) do
+        case Some(val: orig_qual) ->
+          if visible == orig_qual then
+            return compute_selective_diamond_entries(items: rest, orig_entries: orig_entries, acc: acc)
+          else
+            let entry = RenameEntry(original: visible, qualified: orig_qual)
+            return compute_selective_diamond_entries(items: rest, orig_entries: orig_entries, acc: Cons(v: entry, rest: acc))
+          end
+        case None ->
+          return compute_selective_diamond_entries(items: rest, orig_entries: orig_entries, acc: acc)
       end
   end
 end
 
 let process_imports = fn (imports: [ImportDef], accum: HirAccum,
-    import_stack: [string], visited: [string], cache: [CacheEntry], depth: i64, verbose: bool) -> ImportResult require { Fs, Console } throws { Exn } do
+    import_stack: [string], visited: [string], cache: [CacheEntry],
+    caller_entries: [RenameEntry], depth: i64, verbose: bool) -> ImportResult require { Fs, Console } throws { Exn } do
   match imports do
-    case [] -> ImportResult(accum: accum, visited: visited, cache: cache)
+    case [] -> ImportResult(accum: accum, visited: visited, cache: cache, caller_entries: caller_entries)
     case imp :: rest ->
       match imp do case ImportDef(path: path, alias: _, items: _, is_external: is_ext) ->
         if is_ext then
           if verbose then Console.eprintln(val: "[nxc]   skip external: " ++ path) end
-          return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
+          return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, caller_entries: caller_entries, depth: depth, verbose: verbose)
         else
           if list_has_str(xs: import_stack, s: path) then
             raise CyclicImport(path: path)
           end
           if list_has_str(xs: visited, s: path) then
-            // Diamond import: reuse cached parse result instead of re-reading file
-            match imp do case ImportDef(path: _, alias: _, items: items, is_external: _) ->
-              if verbose then Console.eprintln(val: "[nxc]   diamond (cached): " ++ path) end
-              match cache_lookup(cache: cache, path: path) do
-                case CacheMiss ->
-                  return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
-                case CacheHit(defs: cached_defs, entries: orig_entries) ->
-                  let new_entries = build_rename_map(imported_defs: cached_defs, import_def: imp, import_depth: depth)
-                  let accum_wm = set_accum_wmod_for_stdlib(accum: accum, source_file: path)
-                  let accum2 = match items do
-                    case [] -> process_defs_shallow(defs: cached_defs, entries: new_entries, orig_entries: orig_entries, accum: accum_wm, source_file: path)
-                    case _ :: _ ->
-                      let merged = merge_rename_entries(orig: orig_entries, new_selective: new_entries, items: items)
-                      let selected = filter_defs_by_items(defs: cached_defs, items: items)
-                      process_defs_shallow(defs: selected, entries: merged, orig_entries: orig_entries, accum: accum_wm, source_file: path)
-                  end
-                  return process_imports(imports: rest, accum: accum2, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
-              end
+            // Diamond import: use cached parse result. Add importer-view entries
+            // (new_alias.foo -> canonical) to caller scope.
+            if verbose then Console.eprintln(val: "[nxc]   diamond (cached): " ++ path) end
+            match cache_lookup(cache: cache, path: path) do
+              case CacheMiss ->
+                return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, caller_entries: caller_entries, depth: depth, verbose: verbose)
+              case CacheHit(defs: cached_defs, entries: _) ->
+                let importer = build_importer_entries(imported_defs: cached_defs, import_def: imp)
+                let new_caller = append_entries(xs: importer, ys: caller_entries)
+                return process_imports(imports: rest, accum: accum, import_stack: import_stack, visited: visited, cache: cache, caller_entries: new_caller, depth: depth, verbose: verbose)
             end
           end
           if verbose then Console.eprintln(val: "[nxc]   import: " ++ path) end
@@ -324,10 +280,15 @@ let process_imports = fn (imports: [ImportDef], accum: HirAccum,
           let sub_imports = extract_imports(defs: imported_defs)
           let new_stack = Cons(v: path, rest: import_stack)
           let new_cache = Cons(v: CacheEntry(path: path, defs: imported_defs, entries: entries), rest: cache)
-          let sub_result = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, visited: Cons(v: path, rest: visited), cache: new_cache, depth: depth + 1, verbose: verbose)
-          match sub_result do case ImportResult(accum: accum2, visited: visited2, cache: cache2) ->
-            let accum3 = process_defs(defs: imported_defs, entries: entries, accum: accum2, source_file: path)
-            return process_imports(imports: rest, accum: accum3, import_stack: import_stack, visited: visited2, cache: cache2, depth: depth, verbose: verbose)
+          let sub_result = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, visited: Cons(v: path, rest: visited), cache: new_cache, caller_entries: [], depth: depth + 1, verbose: verbose)
+          match sub_result do case ImportResult(accum: accum2, visited: visited2, cache: cache2, caller_entries: sub_caller) ->
+            let entries_for_imported = append_entries(xs: sub_caller, ys: entries)
+            let accum3 = process_defs(defs: imported_defs, entries: entries_for_imported, accum: accum2, source_file: path)
+            // Importer-view entries: the CALLER scope (us) needs to rename
+            // its alias.foo / visible calls to canonical targets.
+            let importer = build_importer_entries(imported_defs: imported_defs, import_def: imp)
+            let new_caller = append_entries(xs: importer, ys: caller_entries)
+            return process_imports(imports: rest, accum: accum3, import_stack: import_stack, visited: visited2, cache: cache2, caller_entries: new_caller, depth: depth, verbose: verbose)
           end
         end
       end
@@ -433,12 +394,38 @@ end
 
 type HirBuildResult = HirBuildResult(program: HirProgram, import_cache: [CacheEntry])
 
+/// Add rename entries for the entry file's own top-level defs so that local
+/// calls (foo(), Console.println(...)) rename to canonical targets.
+/// The entry file's `main` function keeps its bare name so wasm export "main" works.
+let build_entry_self_entries = fn (defs: [SpannedTopLevel], source: string, acc: [RenameEntry]) -> [RenameEntry] do
+  match defs do
+    case [] -> return acc
+    case SpannedTopLevel(node: TLLet(def: GlobalLet(name: name, is_public: _, typ: _, value: _)), span: _) :: rest ->
+      if name == "main" then
+        let acc2 = rename_add(entries: acc, original: name, qualified: "main")
+        return build_entry_self_entries(defs: rest, source: source, acc: acc2)
+      end
+      let acc2 = rename_add(entries: acc, original: name, qualified: canonical_name_string(source: source, name: name))
+      return build_entry_self_entries(defs: rest, source: source, acc: acc2)
+    case SpannedTopLevel(node: TLPort(def: Port(name: name, is_public: _, functions: _)), span: _) :: rest ->
+      let acc2 = rename_add(entries: acc, original: name, qualified: canonical_name_string(source: source, name: name))
+      return build_entry_self_entries(defs: rest, source: source, acc: acc2)
+    case _ :: rest -> return build_entry_self_entries(defs: rest, source: source, acc: acc)
+  end
+end
+
+let canonical_name_string = fn (source: string, name: string) -> string do
+  return canonical_name(source_path: source, name: name)
+end
+
 let build_hir = fn (prog: Program, source_file: string, verbose: bool) -> HirBuildResult require { Fs, Console } throws { Exn } do
   let defs = get_defs(prog: prog)
   let imports = extract_imports(defs: defs)
-  let result = process_imports(imports: imports, accum: empty_accum(), import_stack: Nil, visited: Nil, cache: Nil, depth: 1, verbose: verbose)
-  match result do case ImportResult(accum: accum, visited: _, cache: import_cache) ->
-    let accum2 = process_defs(defs: defs, entries: Nil, accum: accum, source_file: source_file)
+  let result = process_imports(imports: imports, accum: empty_accum(), import_stack: Nil, visited: Nil, cache: Nil, caller_entries: [], depth: 1, verbose: verbose)
+  match result do case ImportResult(accum: accum, visited: _, cache: import_cache, caller_entries: caller_entries) ->
+    let self_entries = build_entry_self_entries(defs: defs, source: source_file, acc: [])
+    let entries = append_entries(xs: self_entries, ys: caller_entries)
+    let accum2 = process_defs(defs: defs, entries: entries, accum: accum, source_file: source_file)
     return HirBuildResult(program: accum_to_program(accum: accum2), import_cache: import_cache)
   end
 end

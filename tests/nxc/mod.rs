@@ -1,11 +1,12 @@
 pub mod ast;
 pub mod codegen;
-pub mod diamond_import;
 pub mod hir;
 pub mod lexer;
 pub mod lir;
 pub mod mir;
 pub mod parser;
+pub mod qualified_imports;
+pub mod rdrname;
 pub mod resolve;
 pub mod symtab;
 pub mod typecheck;

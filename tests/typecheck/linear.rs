@@ -24,7 +24,7 @@ fn resource_program(consume_resource: bool) -> Program {
     })];
     if consume_resource {
         body.push(sp(Stmt::Expr(sp(Expr::Match {
-            target: Box::new(sp(Expr::Variable("r".to_string(), Sigil::Linear))),
+            target: Box::new(sp(Expr::Variable(RdrName::Unqual("r".to_string()), Sigil::Linear))),
             cases: vec![MatchCase {
                 pattern: sp(Pattern::Wildcard),
                 body: vec![],

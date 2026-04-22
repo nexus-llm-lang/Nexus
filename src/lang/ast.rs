@@ -2,6 +2,44 @@
 // to work for modules that depend on both AST-specific and shared types.
 pub use crate::types::*;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RdrName {
+    Unqual(String),
+    Qual { alias: String, name: String },
+}
+
+impl RdrName {
+    pub fn from_dotted(s: &str) -> Self {
+        match s.split_once('.') {
+            None => RdrName::Unqual(s.to_string()),
+            Some((alias, rest)) => RdrName::Qual {
+                alias: alias.to_string(),
+                name: rest.to_string(),
+            },
+        }
+    }
+
+    pub fn as_dotted(&self) -> String {
+        match self {
+            RdrName::Unqual(n) => n.clone(),
+            RdrName::Qual { alias, name } => format!("{}.{}", alias, name),
+        }
+    }
+
+    pub fn occ(&self) -> &str {
+        match self {
+            RdrName::Unqual(n) => n,
+            RdrName::Qual { name, .. } => name,
+        }
+    }
+}
+
+impl std::fmt::Display for RdrName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_dotted())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
@@ -13,7 +51,7 @@ pub struct Param {
 pub enum Pattern {
     Literal(Literal),
     Variable(String, Sigil), // e.g. case Ok(%new_tx)
-    Constructor(String, Vec<(Option<String>, Spanned<Pattern>)>),
+    Constructor(RdrName, Vec<(Option<String>, Spanned<Pattern>)>),
     Record(Vec<(String, Spanned<Pattern>)>, bool), // { x: p, _ }
     Wildcard,
 }
@@ -35,16 +73,16 @@ pub struct CatchArm {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal),
-    Variable(String, Sigil),
+    Variable(RdrName, Sigil),
     // Binary operations (e.g. +, -) are allowed in expressions
     BinaryOp(Box<Spanned<Expr>>, BinaryOp, Box<Spanned<Expr>>),
     Borrow(String, Sigil), // borrow %x
     // Function calls
     Call {
-        func: String,
+        func: RdrName,
         args: Vec<(String, Spanned<Expr>)>, // label, value
     },
-    Constructor(String, Vec<(Option<String>, Spanned<Expr>)>),
+    Constructor(RdrName, Vec<(Option<String>, Spanned<Expr>)>),
     Record(Vec<(String, Spanned<Expr>)>),
     Array(Vec<Spanned<Expr>>),                     // [| 1, 2, 3 |]
     List(Vec<Spanned<Expr>>),                      // [1, 2, 3]

@@ -88,13 +88,62 @@ pub fn build_hir(program: &Program) -> Result<MirProgram, HirBuildError> {
     builder.build(program)
 }
 
-/// Strip module qualifier from a constructor name (e.g., "hir.Literal" → "Literal").
-/// Returns the name unchanged if there is no qualifier.
-fn strip_qualifier(name: &str) -> &str {
-    match name.rfind('.') {
-        Some(pos) => &name[pos + 1..],
-        None => name,
+/// Sanitize a source path to a wasm-safe identifier segment.
+fn sanitize_path(path: &str) -> String {
+    path.replace(['/', '.'], "_")
+}
+
+/// Canonical global name: "sanitized_source_path#name".
+fn canonical_name(source_path: &str, name: &str) -> String {
+    format!("{}#{}", sanitize_path(source_path), name)
+}
+
+/// Importer's view entries for an import. For wildcard `import * as a from "A"`,
+/// produces `a.foo -> canonical(A, foo)`. For selective `import { foo as bar }`,
+/// produces `bar -> canonical(A, foo)`.
+fn compute_importer_entries(
+    import: &Import,
+    program: &Program,
+    source_path: &str,
+) -> HashMap<String, String> {
+    let mut entries = HashMap::new();
+    let canonical = |name: &str| canonical_name(source_path, name);
+
+    if import.items.is_empty() {
+        let alias = import
+            .alias
+            .clone()
+            .unwrap_or_else(|| get_default_alias(&import.path));
+        for def in &program.definitions {
+            match &def.node {
+                TopLevel::Let(gl) => {
+                    entries.insert(format!("{}.{}", alias, gl.name), canonical(&gl.name));
+                }
+                TopLevel::Port(port) => {
+                    entries.insert(format!("{}.{}", alias, port.name), canonical(&port.name));
+                }
+                _ => {}
+            }
+        }
+        return entries;
     }
+
+    // Selective import
+    for item in &import.items {
+        let visible = item.alias.as_ref().unwrap_or(&item.name).clone();
+        for def in &program.definitions {
+            match &def.node {
+                TopLevel::Let(gl) if gl.is_public && gl.name == item.name => {
+                    entries.insert(visible.clone(), canonical(&gl.name));
+                }
+                TopLevel::Port(port) if port.is_public && port.name == item.name => {
+                    entries.insert(visible.clone(), canonical(&port.name));
+                }
+                _ => {}
+            }
+        }
+    }
+    entries
 }
 
 /// Convert a byte offset to a 1-based line number.
@@ -217,7 +266,8 @@ impl MirBuilder {
 
         // Pass 1: Collect all declarations (ports, handlers, externals, etc.)
         // Function bodies are stored as pending for the second pass.
-        self.collect_declarations(program, &HashMap::new())?;
+        let mut top_rename_map = HashMap::new();
+        self.collect_declarations(program, &mut top_rename_map)?;
 
         // Pass 2: Convert all pending function bodies with full handler scope.
         // Loop until no new lambda-lifted functions are generated.
@@ -415,13 +465,39 @@ impl MirBuilder {
     fn collect_declarations(
         &mut self,
         program: &Program,
-        rename_map: &HashMap<String, String>,
+        rename_map: &mut HashMap<String, String>,
     ) -> Result<(), HirBuildError> {
         let mut current_wasm_module: Option<String> = None;
         let wit_interface = self
             .current_source_file
             .as_ref()
             .and_then(|p| stdlib_nx_to_wit_interface(Path::new(p)));
+
+        // Pre-pass: canonicalize the current file's own top-level definitions.
+        // `main` in the entry file keeps its bare name so the wasm `main` export
+        // is emitted without renaming.
+        let current_src = self
+            .current_source_file
+            .clone()
+            .unwrap_or_else(|| "__entry__".to_string());
+        let is_entry = self.import_stack.is_empty();
+        for def in &program.definitions {
+            match &def.node {
+                TopLevel::Let(gl) => {
+                    if is_entry && gl.name == "main" {
+                        rename_map.insert(gl.name.clone(), "main".to_string());
+                    } else {
+                        rename_map
+                            .insert(gl.name.clone(), canonical_name(&current_src, &gl.name));
+                    }
+                }
+                TopLevel::Port(port) => {
+                    rename_map
+                        .insert(port.name.clone(), canonical_name(&current_src, &port.name));
+                }
+                _ => {}
+            }
+        }
 
         for def in &program.definitions {
             match &def.node {
@@ -433,7 +509,7 @@ impl MirBuilder {
                     ));
                 }
                 TopLevel::Import(import) => {
-                    self.process_import(import, &def.span)?;
+                    self.process_import(import, &def.span, rename_map)?;
                 }
                 TopLevel::TypeDef(_) => {}
                 TopLevel::Enum(ed) => {
@@ -477,14 +553,15 @@ impl MirBuilder {
                                     }],
                                     is_external: false,
                                 };
-                                self.process_import(&proc_import, &def.span)?;
+                                self.process_import(&proc_import, &def.span, rename_map)?;
 
                                 let arg_name = params[0].name.clone();
+                                let argv_canonical = self.rename("argv", rename_map);
                                 let preamble = vec![MirStmt::Let {
                                     name: Symbol::from(&arg_name),
                                     typ: Type::List(Box::new(Type::String)),
                                     expr: MirExpr::Call {
-                                        func: Symbol::from("argv"),
+                                        func: Symbol::from(argv_canonical),
                                         args: vec![],
                                         ret_type: Type::List(Box::new(Type::String)),
                                     },
@@ -617,7 +694,12 @@ impl MirBuilder {
         Ok(())
     }
 
-    fn process_import(&mut self, import: &Import, import_span: &Span) -> Result<(), HirBuildError> {
+    fn process_import(
+        &mut self,
+        import: &Import,
+        import_span: &Span,
+        caller_rename_map: &mut HashMap<String, String>,
+    ) -> Result<(), HirBuildError> {
         let resolved_path = resolve_import_path(&import.path);
         if self.import_stack.iter().any(|p| p == &resolved_path) {
             return Err(HirBuildError::CyclicImport {
@@ -628,7 +710,7 @@ impl MirBuilder {
 
         // Diamond import dedup
         if let Some(cache) = self.imported_modules.get(&resolved_path).cloned() {
-            return self.handle_reimport(import, import_span, &cache);
+            return self.handle_reimport(import, import_span, &cache, caller_rename_map);
         }
 
         self.import_stack.push(resolved_path.clone());
@@ -654,8 +736,16 @@ impl MirBuilder {
         self.current_source_file = Some(resolved_path.clone());
         self.current_source_text = Some(src.clone());
 
-        let rename_map = self.build_rename_map(&imported_program, import, import_span)?;
-        let result = self.collect_declarations(&imported_program, &rename_map);
+        let mut rename_map = self.build_rename_map(&imported_program, import, import_span)?;
+        let result = self.collect_declarations(&imported_program, &mut rename_map);
+
+        // Populate caller's scope with importer-view entries: the visible names
+        // (alias.foo for wildcard, or foo/bar for selective imports) -> canonical.
+        let importer_entries =
+            compute_importer_entries(import, &imported_program, &resolved_path);
+        for (k, v) in importer_entries {
+            caller_rename_map.insert(k, v);
+        }
 
         // Restore source context
         self.current_source_file = saved_source_file;
@@ -698,18 +788,16 @@ impl MirBuilder {
         import: &Import,
         import_span: &Span,
         cache: &ImportCache,
+        caller_rename_map: &mut HashMap<String, String>,
     ) -> Result<(), HirBuildError> {
         if import.items.is_empty() {
             let alias = import
                 .alias
                 .clone()
                 .unwrap_or_else(|| get_default_alias(&import.path));
-            for (original_name, registered_name) in &cache.name_map {
-                let aliased_name = format!("{}.{}", alias, original_name);
-                if aliased_name != *registered_name {
-                    self.create_function_alias(&aliased_name, registered_name);
-                    self.create_external_alias(&aliased_name, registered_name);
-                }
+            // cache.name_map values are canonical; map aliased access to canonical.
+            for (original_name, canonical) in &cache.name_map {
+                caller_rename_map.insert(format!("{}.{}", alias, original_name), canonical.clone());
             }
             return Ok(());
         }
@@ -723,62 +811,11 @@ impl MirBuilder {
                 });
             }
             let visible = item.alias.as_ref().unwrap_or(&item.name);
-            if let Some(registered_name) = cache.name_map.get(&item.name) {
-                if registered_name != visible {
-                    self.create_function_alias(visible, registered_name);
-                    self.create_external_alias(visible, registered_name);
-                }
+            if let Some(canonical) = cache.name_map.get(&item.name) {
+                caller_rename_map.insert(visible.clone(), canonical.clone());
             }
         }
         Ok(())
-    }
-
-    fn create_function_alias(&mut self, alias_name: &str, registered_name: &str) {
-        // Check already-converted functions
-        if let Some(func) = self
-            .functions
-            .iter()
-            .find(|f| f.name == registered_name)
-            .cloned()
-        {
-            self.functions.retain(|f| f.name != alias_name);
-            let mut aliased = func;
-            aliased.name = Symbol::from(alias_name);
-            self.functions.push(aliased);
-            return;
-        }
-        // Check pending functions (two-pass: bodies not yet converted)
-        if let Some(pf) = self
-            .pending_functions
-            .iter()
-            .find(|f| f.name == registered_name)
-            .cloned()
-        {
-            self.pending_functions.retain(|f| f.name != alias_name);
-            let mut aliased = pf;
-            aliased.name = alias_name.to_string();
-            if let Some(ty) = self.fn_ret_types.get(registered_name).cloned() {
-                self.fn_ret_types.insert(alias_name.to_string(), ty);
-            }
-            if let Some(ty) = self.fn_types.get(registered_name).cloned() {
-                self.fn_types.insert(alias_name.to_string(), ty);
-            }
-            self.pending_functions.push(aliased);
-        }
-    }
-
-    fn create_external_alias(&mut self, alias_name: &str, registered_name: &str) {
-        if let Some(ext) = self
-            .externals
-            .iter()
-            .find(|e| e.name == registered_name)
-            .cloned()
-        {
-            self.externals.retain(|e| e.name != alias_name);
-            let mut aliased = ext;
-            aliased.name = Symbol::from(alias_name);
-            self.externals.push(aliased);
-        }
     }
 
     fn build_rename_map(
@@ -788,19 +825,17 @@ impl MirBuilder {
         import_span: &Span,
     ) -> Result<HashMap<String, String>, HirBuildError> {
         let mut map = HashMap::new();
+        let source = resolve_import_path(&import.path);
+        let canonical = |name: &str| -> String { canonical_name(&source, name) };
 
         if import.items.is_empty() {
-            let alias = import
-                .alias
-                .clone()
-                .unwrap_or_else(|| get_default_alias(&import.path));
             for def in &program.definitions {
                 match &def.node {
                     TopLevel::Let(gl) => {
-                        map.insert(gl.name.clone(), format!("{}.{}", alias, gl.name));
+                        map.insert(gl.name.clone(), canonical(&gl.name));
                     }
                     TopLevel::Port(port) => {
-                        map.insert(port.name.clone(), format!("{}.{}", alias, port.name));
+                        map.insert(port.name.clone(), canonical(&port.name));
                     }
                     _ => {}
                 }
@@ -808,15 +843,6 @@ impl MirBuilder {
             return Ok(map);
         }
 
-        // Map original_name → visible_name (alias if provided, else original)
-        let selected: HashMap<String, String> = import
-            .items
-            .iter()
-            .map(|item| {
-                let visible = item.alias.clone().unwrap_or_else(|| item.name.clone());
-                (item.name.clone(), visible)
-            })
-            .collect();
         for item in &import.items {
             let found = program.definitions.iter().any(|def| match &def.node {
                 TopLevel::Let(gl) if gl.is_public && gl.name == item.name => true,
@@ -838,57 +864,15 @@ impl MirBuilder {
             }
         }
 
-        if let Some(alias) = &import.alias {
-            for def in &program.definitions {
-                match &def.node {
-                    TopLevel::Let(gl) => {
-                        if let Some(visible) =
-                            gl.is_public.then(|| selected.get(&gl.name)).flatten()
-                        {
-                            map.insert(gl.name.clone(), visible.clone());
-                        } else {
-                            map.insert(gl.name.clone(), format!("{}.{}", alias, gl.name));
-                        }
-                    }
-                    TopLevel::Port(port) => {
-                        if let Some(visible) =
-                            port.is_public.then(|| selected.get(&port.name)).flatten()
-                        {
-                            map.insert(port.name.clone(), visible.clone());
-                        } else {
-                            map.insert(port.name.clone(), format!("{}.{}", alias, port.name));
-                        }
-                    }
-                    _ => {}
+        for def in &program.definitions {
+            match &def.node {
+                TopLevel::Let(gl) => {
+                    map.insert(gl.name.clone(), canonical(&gl.name));
                 }
-            }
-        } else {
-            let alias_prefix = {
-                let path_hash =
-                    crate::compiler::type_tag::fnv1a_hash(&[import.path.as_bytes()]) % 10000;
-                format!("__import_{}_{}", self.import_stack.len(), path_hash)
-            };
-            for def in &program.definitions {
-                match &def.node {
-                    TopLevel::Let(gl) => {
-                        if let Some(visible) = selected.get(&gl.name) {
-                            map.insert(gl.name.clone(), visible.clone());
-                        } else {
-                            map.insert(gl.name.clone(), format!("{}_{}", alias_prefix, gl.name));
-                        }
-                    }
-                    TopLevel::Port(port) => {
-                        if let Some(visible) = selected.get(&port.name) {
-                            map.insert(port.name.clone(), visible.clone());
-                        } else {
-                            map.insert(
-                                port.name.clone(),
-                                format!("{}_{}", alias_prefix, port.name),
-                            );
-                        }
-                    }
-                    _ => {}
+                TopLevel::Port(port) => {
+                    map.insert(port.name.clone(), canonical(&port.name));
                 }
+                _ => {}
             }
         }
 
@@ -896,7 +880,23 @@ impl MirBuilder {
     }
 
     fn rename(&self, name: &str, map: &HashMap<String, String>) -> String {
-        map.get(name).cloned().unwrap_or_else(|| name.to_string())
+        if let Some(canonical) = map.get(name) {
+            return canonical.clone();
+        }
+        // Longest-prefix match on '.': `X.Y` renames to `rename(X).Y` when X is
+        // a rename-map key. Covers `Console.println`, `mod.Ctor`, etc.
+        let mut best_idx: Option<usize> = None;
+        for (i, _) in name.match_indices('.') {
+            if map.contains_key(&name[..i]) {
+                best_idx = Some(i);
+            }
+        }
+        if let Some(i) = best_idx {
+            let prefix = &name[..i];
+            let suffix = &name[i + 1..];
+            return format!("{}.{}", map[prefix], suffix);
+        }
+        name.to_string()
     }
 
     // ---- AST → MIR conversion (with port resolution & desugaring) ----
@@ -969,10 +969,13 @@ impl MirBuilder {
                     for key in self.global_constants.keys() {
                         known_names.insert(key.clone());
                     }
-                    for v in rename_map.values() {
+                    // Also include rename-map keys: if a bare name renames to a
+                    // known canonical, the bare name is NOT a free variable.
+                    for (k, v) in rename_map {
                         if self.fn_ret_types.contains_key(v)
                             || self.global_constants.contains_key(v)
                         {
+                            known_names.insert(k.clone());
                             known_names.insert(v.clone());
                         }
                     }
@@ -1121,12 +1124,12 @@ impl MirBuilder {
                 for arm in catch_arms {
                     let mir_body = self.convert_stmts(&arm.body, rename_map, scope)?;
                     if let Pattern::Constructor(name, fields) = &arm.pattern.node {
-                        if let Some(members) = self.exception_groups.get(name.as_str()) {
+                        if let Some(members) = self.exception_groups.get(name.occ()) {
                             // Group pattern: expand to one case per member
                             for member in members.clone() {
                                 mir_cases.push(MirMatchCase {
                                     pattern: self.convert_pattern(&Pattern::Constructor(
-                                        member,
+                                        RdrName::Unqual(member),
                                         fields.clone(),
                                     )),
                                     body: mir_body.clone(),
@@ -1178,7 +1181,8 @@ impl MirBuilder {
         match &expr.node {
             Expr::Literal(lit) => Ok(MirExpr::Literal(lit.clone())),
             Expr::Variable(name, sigil) => {
-                let resolved = self.rename(name, rename_map);
+                let name = name.as_dotted();
+                let resolved = self.rename(&name, rename_map);
                 if let Some(lit) = self.global_constants.get(&resolved) {
                     Ok(MirExpr::Literal(lit.clone()))
                 } else if self.fn_ret_types.contains_key(&resolved) {
@@ -1203,7 +1207,8 @@ impl MirBuilder {
                 Ok(MirExpr::Borrow(Symbol::from(self.rename(name, rename_map))))
             }
             Expr::Call { func, args } => {
-                let renamed_func = self.rename(func, rename_map);
+                let func = func.as_dotted();
+                let renamed_func = self.rename(&func, rename_map);
 
                 // Check if this is a port-qualified call (e.g., "Console.print")
                 let port_match = self.port_methods.keys().find_map(|port_name| {
@@ -1258,10 +1263,9 @@ impl MirBuilder {
                 }
             }
             Expr::Constructor(name, args) => {
-                // Strip module qualifier for qualified constructors (e.g., "hir.Literal" → "Literal")
-                let ctor_name = strip_qualifier(name);
+                let ctor_name = name.occ();
                 if args.is_empty() {
-                    let resolved = self.rename(&ctor_name, rename_map);
+                    let resolved = self.rename(ctor_name, rename_map);
                     if let Some(lit) = self.global_constants.get(&resolved) {
                         return Ok(MirExpr::Literal(lit.clone()));
                     }
@@ -1405,9 +1409,11 @@ impl MirBuilder {
                 for key in self.global_constants.keys() {
                     known_names.insert(key.clone());
                 }
-                // Also apply rename_map to see through aliases
-                for v in rename_map.values() {
+                // Also include rename-map keys: if a bare name renames to a
+                // known canonical, the bare name is NOT a free variable.
+                for (k, v) in rename_map {
                     if self.fn_ret_types.contains_key(v) || self.global_constants.contains_key(v) {
+                        known_names.insert(k.clone());
                         known_names.insert(v.clone());
                     }
                 }
@@ -1534,7 +1540,7 @@ impl MirBuilder {
                 MirPattern::Variable(Symbol::from(name.as_str()), sigil.clone())
             }
             Pattern::Constructor(name, fields) => MirPattern::Constructor {
-                name: Symbol::from(strip_qualifier(name)),
+                name: Symbol::from(name.occ()),
                 fields: fields
                     .iter()
                     .map(|(label, p)| {
@@ -1729,7 +1735,13 @@ fn collect_ast_expr_refs(
     known: &HashSet<String>,
 ) {
     match expr {
-        Expr::Variable(name, _) | Expr::Borrow(name, _) => {
+        Expr::Variable(name, _) => {
+            let name = name.as_dotted();
+            if !defined.contains(&name) && !known.contains(&name) && seen.insert(name.clone()) {
+                referenced.push(name);
+            }
+        }
+        Expr::Borrow(name, _) => {
             if !defined.contains(name) && !known.contains(name) && seen.insert(name.clone()) {
                 referenced.push(name.clone());
             }
@@ -1739,9 +1751,9 @@ fn collect_ast_expr_refs(
             collect_ast_expr_refs(&rhs.node, defined, referenced, seen, known);
         }
         Expr::Call { func, args } => {
-            // func might be a variable holding a funcref — check if it's not a known function
-            if !defined.contains(func) && !known.contains(func) && seen.insert(func.clone()) {
-                referenced.push(func.clone());
+            let func = func.as_dotted();
+            if !defined.contains(&func) && !known.contains(&func) && seen.insert(func.clone()) {
+                referenced.push(func);
             }
             for (_, arg) in args {
                 collect_ast_expr_refs(&arg.node, defined, referenced, seen, known);

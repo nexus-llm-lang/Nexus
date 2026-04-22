@@ -413,7 +413,7 @@ fn read_sleb128(data: &[u8], mut pos: usize) -> (i64, usize) {
         shift += 7;
         if b < 0x80 {
             if shift < 64 && (b & 0x40) != 0 {
-                val -= 1i64 << shift;
+                val = val.wrapping_sub(1i64.wrapping_shl(shift));
             }
             return (val, pos);
         }
