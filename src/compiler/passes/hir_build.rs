@@ -499,6 +499,21 @@ impl MirBuilder {
             }
         }
 
+        // Pre-pass B: populate rename_map from all non-external imports before
+        // the main loop captures function bodies into pending_functions. Imports
+        // may legally appear anywhere in the source (e.g. nxc/typecheck/check.nx
+        // uses `str_length` at line 257 and imports it at line 448) but pending
+        // function bodies must resolve names regardless of source ordering.
+        // External imports stay in the main loop because they set
+        // current_wasm_module for subsequent external declarations.
+        for def in &program.definitions {
+            if let TopLevel::Import(import) = &def.node {
+                if !import.is_external {
+                    self.process_import(import, &def.span, rename_map)?;
+                }
+            }
+        }
+
         for def in &program.definitions {
             match &def.node {
                 TopLevel::Import(import) if import.is_external => {
@@ -508,9 +523,7 @@ impl MirBuilder {
                         wit_interface.as_deref(),
                     ));
                 }
-                TopLevel::Import(import) => {
-                    self.process_import(import, &def.span, rename_map)?;
-                }
+                TopLevel::Import(_) => {}  // non-external processed in pre-pass B
                 TopLevel::TypeDef(_) => {}
                 TopLevel::Enum(ed) => {
                     self.enum_defs.push(ed.clone());

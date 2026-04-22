@@ -1876,10 +1876,16 @@ fn fold_identical_functions(program: &mut LirProgram) {
                     &program.functions[canon_idx],
                     &program.functions[idx],
                 ) {
-                    redirect.insert(
-                        program.functions[idx].name,
-                        program.functions[canon_idx].name,
-                    );
+                    let src = program.functions[idx].name;
+                    let dst = program.functions[canon_idx].name;
+                    if src != dst {
+                        // Only redirect when the duplicate has a distinct name.
+                        // With source-qualified canonical naming, literal
+                        // duplicate definitions in the same file share a
+                        // canonical name; adding a self-redirect here would
+                        // cause the retain step below to drop every instance.
+                        redirect.insert(src, dst);
+                    }
                     found = true;
                     break;
                 }
