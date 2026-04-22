@@ -1165,6 +1165,39 @@ end
 }
 
 #[test]
+fn codegen_selective_catch_labeled_string_fields_used_in_concat() {
+    // Regression for nexus-y91m: catch-case labeled-field bindings of `string`
+    // type must carry their semantic type into the match arm body. Previously
+    // the LIR lowerer marked the catch_param's semantic type as `String`
+    // instead of `Exn`, so resolve_constructor_field_types returned None and
+    // every bound field defaulted to `i64`. Using a bound string in `++`
+    // therefore failed codegen with E2017 "string concat expects string
+    // operands, got (string, i64)".
+    exec(
+        r#"
+exception Parse(expected: string, got: string)
+
+let run = fn () -> string throws { Exn } do
+    try
+        raise Parse(expected: "comma", got: "semicolon")
+        return ""
+    catch
+        case Parse(expected: e, got: g) -> return "expected " ++ e ++ ", got " ++ g
+        case _ -> return ""
+    end
+    return ""
+end
+
+let main = fn () -> unit throws { Exn } do
+    let msg = run()
+    if msg != "expected comma, got semicolon" then raise RuntimeError(val: "wrong msg") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
 fn codegen_selective_catch_nested_try_routes_exceptions() {
     exec(
         r#"
