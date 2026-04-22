@@ -108,33 +108,29 @@ fi
 
 STAGE2="$BUILD_DIR/stage2.wasm"
 info "Stage 2: wasmtime run $STAGE1 $NXC_ENTRY $STAGE2"
-if "$WASMTIME" run $STAGE1_FLAGS "$STAGE1" "$NXC_ENTRY" "$STAGE2" 2>&1; then
-  ok "Stage 2 complete: $STAGE2 ($(wc -c < "$STAGE2" | tr -d ' ') bytes)"
-else
-  if [[ "$CI_MODE" == true ]]; then
-    fail "Stage 2 failed — nxc-produced WASM is not self-executable."
-  fi
-  warn "Stage 2 failed — nxc-produced WASM not yet self-executable."
-  warn "Stage 1 output is still valid (compiled by the Rust-built stage0)."
-  exit 1
+if ! "$WASMTIME" run $STAGE1_FLAGS "$STAGE1" "$NXC_ENTRY" "$STAGE2" 2>&1; then
+  fail "Stage 2 failed — nxc-produced WASM is not self-executable."
 fi
+ok "Stage 2 complete: $STAGE2 ($(wc -c < "$STAGE2" | tr -d ' ') bytes)"
+
+# Validate stage2 as a well-formed wasm module. wasmtime run exit 0 only means
+# stage1 ran to completion; it does not check the bytes stage1 emitted.
+if ! wasm-tools validate "$STAGE2" 2>&1; then
+  fail "Stage 2 failed validation — nxc produced an ill-formed wasm module."
+fi
+ok "Stage 2 passes wasm-tools validate"
 
 # ─── Verify fixed point ───────────────────────────────────────────────────
 
 info "Verifying fixed point: stage1 == stage2"
-if cmp -s "$STAGE1" "$STAGE2"; then
-  ok "Fixed point reached! stage1.wasm and stage2.wasm are identical."
-  ok "The self-hosted compiler is verified."
-else
-  if [[ "$CI_MODE" == true ]]; then
-    S1_SIZE=$(wc -c < "$STAGE1" | tr -d ' ')
-    S2_SIZE=$(wc -c < "$STAGE2" | tr -d ' ')
-    info "stage1: $S1_SIZE bytes, stage2: $S2_SIZE bytes"
-    fail "Fixed point NOT reached — stage1.wasm and stage2.wasm differ."
-  fi
-  warn "stage1.wasm and stage2.wasm differ — not yet at fixed point."
-  warn "This is expected while nxc codegen is still maturing."
+if ! cmp -s "$STAGE1" "$STAGE2"; then
+  S1_SIZE=$(wc -c < "$STAGE1" | tr -d ' ')
+  S2_SIZE=$(wc -c < "$STAGE2" | tr -d ' ')
+  info "stage1: $S1_SIZE bytes, stage2: $S2_SIZE bytes"
+  fail "Fixed point NOT reached — stage1.wasm and stage2.wasm differ."
 fi
+ok "Fixed point reached! stage1.wasm and stage2.wasm are identical."
+ok "The self-hosted compiler is verified."
 
 # ─── Install nxc_driver.wasm ─────────────────────────────────────────────
 # Stage1 is already self-contained (stdlib merged). Install directly.
