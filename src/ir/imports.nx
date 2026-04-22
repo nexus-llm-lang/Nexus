@@ -12,7 +12,7 @@
  */
 
 import { Program, SpannedTopLevel, ImportDef } from "src/common/ast.nx"
-import { CyclicImport } from "src/common/error.nx"
+import { CyclicImport, InImport }, * as err from "src/common/error.nx"
 import { RenameEntry } from "src/ir/symtab.nx"
 import * as resolve from "src/ir/resolve.nx"
 import { HirAccum } from "src/ir/hir_types.nx"
@@ -64,6 +64,34 @@ end
 
 // ─── Recursive import processor ────────────────────────────────────────────
 
+// Load, parse, resolve, and HIR-process a single imported file. Any exception
+// raised during this work is wrapped with `InImport(path, ...)` so the final
+// diagnostic shows the chain of imported files leading to the failure. The
+// returned caller_entries hold ONLY the importer-view entries for this file;
+// sibling accumulation is the caller's job.
+let load_imported_file = fn (imp: ImportDef, path: string, accum: HirAccum,
+    import_stack: [string], visited: [string], cache: [CacheEntry],
+    depth: i64, verbose: bool) -> ImportResult require { Fs, Console } throws { Exn } do
+  try
+    let tokens = lexer.tokenize(src: Fs.read_to_string(path: path))
+    let imported_defs = get_defs(prog: parser.parse(tokens: tokens))
+    let entries = resolve.build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
+    let sub_imports = resolve.extract_imports(defs: imported_defs)
+    let new_stack = path :: import_stack
+    let new_cache = CacheEntry(path: path, defs: imported_defs, entries: entries) :: cache
+    let sub_result = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, visited: path :: visited, cache: new_cache, caller_entries: [], depth: depth + 1, verbose: verbose)
+    match sub_result do case ImportResult(accum: accum2, visited: visited2, cache: cache2, caller_entries: sub_caller) ->
+      let entries_for_imported = append_entries(xs: sub_caller, ys: entries)
+      let accum3 = hir.process_defs(defs: imported_defs, entries: entries_for_imported, accum: accum2, source_file: path)
+      let importer = resolve.build_importer_entries(imported_defs: imported_defs, import_def: imp)
+      return ImportResult(accum: accum3, visited: visited2, cache: cache2, caller_entries: importer)
+    end
+  catch e ->
+    let formatted = err.format_error(err: e)
+    raise InImport(path: path, detail: formatted)
+  end
+end
+
 export let process_imports = fn (imports: [ImportDef], accum: HirAccum,
     import_stack: [string], visited: [string], cache: [CacheEntry],
     caller_entries: [RenameEntry], depth: i64, verbose: bool) -> ImportResult require { Fs, Console } throws { Exn } do
@@ -92,19 +120,10 @@ export let process_imports = fn (imports: [ImportDef], accum: HirAccum,
             end
           end
           if verbose then Console.eprintln(val: "[nxc]   import: " ++ path) end
-          let tokens = lexer.tokenize(src: Fs.read_to_string(path: path))
-          let imported_defs = get_defs(prog: parser.parse(tokens: tokens))
-          let entries = resolve.build_rename_map(imported_defs: imported_defs, import_def: imp, import_depth: depth)
-          let sub_imports = resolve.extract_imports(defs: imported_defs)
-          let new_stack = path :: import_stack
-          let new_cache = CacheEntry(path: path, defs: imported_defs, entries: entries) :: cache
-          let sub_result = process_imports(imports: sub_imports, accum: accum, import_stack: new_stack, visited: path :: visited, cache: new_cache, caller_entries: [], depth: depth + 1, verbose: verbose)
-          match sub_result do case ImportResult(accum: accum2, visited: visited2, cache: cache2, caller_entries: sub_caller) ->
-            let entries_for_imported = append_entries(xs: sub_caller, ys: entries)
-            let accum3 = hir.process_defs(defs: imported_defs, entries: entries_for_imported, accum: accum2, source_file: path)
-            // Importer-view entries: the CALLER scope (us) needs to rename
-            // its alias.foo / visible calls to canonical targets.
-            let importer = resolve.build_importer_entries(imported_defs: imported_defs, import_def: imp)
+          let loaded = load_imported_file(imp: imp, path: path, accum: accum, import_stack: import_stack, visited: visited, cache: cache, depth: depth, verbose: verbose)
+          match loaded do case ImportResult(accum: accum3, visited: visited2, cache: cache2, caller_entries: importer) ->
+            // Importer-view entries: the CALLER scope (us) renames its
+            // alias.foo / visible calls to canonical targets.
             let new_caller = append_entries(xs: importer, ys: caller_entries)
             return process_imports(imports: rest, accum: accum3, import_stack: import_stack, visited: visited2, cache: cache2, caller_entries: new_caller, depth: depth, verbose: verbose)
           end
