@@ -1,0 +1,177 @@
+/**
+ * demand: Iterative lazy-body resolution for the Nexus self-hosting compiler.
+ *
+ * After HIR build, many functions carry LazyBody — the raw AST is stashed
+ * instead of converted, so unused imports don't pay the convert_expr cost.
+ * This module drives the fixed-point dance that turns reachable LazyBody
+ * functions into EagerBody:
+ *
+ *   1. strip_lazy over the current set gives stubs for reachability.
+ *   2. collect_reachable + filter_reachable_functions narrows the work set.
+ *   3. resolve_all_lazy_via_convert runs convert_expr on each LazyBody.
+ *   4. The newly resolved bodies may expose new callees — loop until the
+ *      reachable set stops growing (or max_rounds is hit).
+ *
+ * Extracted from driver.nx to sit as a dedicated pipeline stage alongside
+ * hir.nx / resolve.nx / imports.nx.
+ */
+
+import { TypeExpr, TyI64, TyF64, TyString, TyChar, TyBool, TyUnit,
+         Literal, LitInt, LitFloat, LitString, LitChar, LitBool, LitUnit } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { HirFunction, HirParam, HirBody, EagerBody, LazyBody,
+         HirStmt, HirStmtKind, HirExpr, HirExprKind,
+         HirHandlerBindingEntry } from "src/ir/hir_types.nx"
+import * as hir from "src/ir/hir.nx"
+
+/// Iterative resolve: filter by reachability, resolve LazyBody, repeat.
+/// Each round discovers new reachable functions from resolved bodies.
+export let iterative_resolve = fn (funcs: [HirFunction], hb: [HirHandlerBindingEntry], max_rounds: i64) -> [HirFunction] do
+  return iterative_resolve_go(all_funcs: funcs, current: funcs, hb: hb, max_rounds: max_rounds)
+end
+
+let iterative_resolve_go = fn (all_funcs: [HirFunction], current: [HirFunction],
+    hb: [HirHandlerBindingEntry], max_rounds: i64) -> [HirFunction] do
+  if max_rounds <= 0 then return strip_lazy(funcs: current) end
+  let stubs = strip_lazy(funcs: current)
+  let reachable = hir.collect_reachable(functions: stubs, handler_bindings: hb)
+  // Always filter from ALL functions so deeper call chains are discovered.
+  let filtered = hir.filter_reachable_functions(functions: all_funcs, reachable: reachable)
+  let resolved = resolve_all_lazy_via_convert(funcs: filtered)
+  let new_reachable = hir.collect_reachable(functions: resolved, handler_bindings: hb)
+  let new_filtered = hir.filter_reachable_functions(functions: all_funcs, reachable: new_reachable)
+  let grew = list_longer(a: new_filtered, b: filtered)
+  let merged = merge_resolved(orig: new_filtered, resolved: resolved)
+  if grew then
+    // Update all_funcs with resolved versions so next round doesn't re-resolve
+    // already-converted functions. Without this, every round re-runs convert_expr
+    // on the same LazyBody functions, duplicating EagerBody allocations on the heap.
+    let updated_all = merge_resolved(orig: all_funcs, resolved: resolved)
+    return iterative_resolve_go(all_funcs: updated_all, current: merged, hb: hb, max_rounds: max_rounds - 1)
+  else
+    return merged
+  end
+end
+
+let list_longer = fn (a: [HirFunction], b: [HirFunction]) -> bool do
+  match a do
+    case [] -> return false
+    case _ :: ar ->
+      match b do
+        case [] -> return true
+        case _ :: br -> return list_longer(a: ar, b: br)
+      end
+  end
+end
+
+/// Merge: for functions in orig that are already resolved, keep the resolved version.
+/// For functions in orig that are still LazyBody, keep them for the next round.
+let merge_resolved = fn (orig: [HirFunction], resolved: [HirFunction]) -> [HirFunction] do
+  match orig do
+    case [] -> return []
+    case HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: b, span: sp) :: rest ->
+      let merged = match b do
+        case EagerBody(stmts: _) ->
+          HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: b, span: sp)
+        case LazyBody(ast_expr: _, entries: _) ->
+          // Take FULL function from resolved (params/ret_type may differ from orig
+          // after desugar_main_if_needed or infer_resolve_constant_type).
+          match find_resolved_func(name: n, resolved: resolved) do
+            case Some(val: rf) -> rf
+            case None -> HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: b, span: sp)
+          end
+      end
+      return merged :: merge_resolved(orig: rest, resolved: resolved)
+  end
+end
+
+let find_resolved_func = fn (name: string, resolved: [HirFunction]) -> Option<HirFunction> do
+  match resolved do
+    case [] -> return None
+    case f :: rest ->
+      let HirFunction(name: rn, type_params: _, params: _, ret_type: _, body: rb, span: _) = f
+      if rn == name then
+        match rb do
+          case EagerBody(stmts: _) -> return Some(val: f)
+          case _ -> return find_resolved_func(name: name, resolved: rest)
+        end
+      else
+        return find_resolved_func(name: name, resolved: rest)
+      end
+  end
+end
+
+let desugar_main_if_needed = fn (name: string, tps: [string], ps: [HirParam],
+    rt: TypeExpr, body: HirBody, sp: Span) -> HirFunction do
+  if name == "main" then
+    match ps do
+      case HirParam(name: arg_name, label: _, typ: _) :: _ ->
+        // Keep main's params — wasi_run wrapper calls argv() and passes to main.
+        // Component model exports wasi_run as func(), not main directly.
+        return HirFunction(name: name, type_params: tps, params: ps,
+          ret_type: rt, body: body, span: sp)
+      case _ ->
+        return HirFunction(name: name, type_params: tps, params: ps,
+          ret_type: rt, body: body, span: sp)
+    end
+  else
+    return HirFunction(name: name, type_params: tps, params: ps,
+      ret_type: rt, body: body, span: sp)
+  end
+end
+
+let resolve_all_lazy_via_convert = fn (funcs: [HirFunction]) -> [HirFunction] do
+  match funcs do
+    case [] -> return []
+    case HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: b, span: sp) :: rest ->
+      let ResolveBodyResult(body: resolved, ret: resolved_rt) = match b do
+        case EagerBody(stmts: _) -> ResolveBodyResult(body: b, ret: rt)
+        case LazyBody(ast_expr: expr, entries: entries) ->
+          let hv = hir.convert_expr(expr: expr, entries: entries)
+          match hv do
+            case HirExpr(node: Lambda(type_params: _, params: lps, ret_type: lambda_rt, body: body), span: _) ->
+              ResolveBodyResult(body: EagerBody(stmts: body), ret: lambda_rt)
+            case non_lambda ->
+              // Non-Lambda (constant) → wrap in Return, fix ret_type from TyUnit
+              // to actual type (convert_expr_toplevel sets TyUnit for all constants).
+              let zero = Span(offset: 0, line: 0, col: 0)
+              let const_rt = infer_resolve_constant_type(expr: non_lambda)
+              ResolveBodyResult(
+                body: EagerBody(stmts: [HirStmt(node: Return(expr: non_lambda), span: zero)]),
+                ret: const_rt)
+          end
+      end
+      return desugar_main_if_needed(name: n, tps: tps, ps: ps, rt: resolved_rt, body: resolved, sp: sp) :: resolve_all_lazy_via_convert(funcs: rest)
+  end
+end
+
+type ResolveBodyResult = ResolveBodyResult(body: HirBody, ret: TypeExpr)
+
+/// Infer return type for a resolved constant expression.
+let infer_resolve_constant_type = fn (expr: HirExpr) -> TypeExpr do
+  let HirExpr(node: inner, span: _) = expr
+  match inner do
+    case Literal(lit: lv) ->
+      match lv do
+        case LitInt(val: _) -> return TyI64
+        case LitFloat(val: _) -> return TyF64
+        case LitString(val: _) -> return TyString
+        case LitChar(val: _) -> return TyChar
+        case LitBool(val: _) -> return TyBool
+        case LitUnit -> return TyUnit
+      end
+    case _ -> return TyI64
+  end
+end
+
+let strip_lazy = fn (funcs: [HirFunction]) -> [HirFunction] do
+  match funcs do
+    case [] -> return []
+    case HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: b, span: sp) :: rest ->
+      let nb = match b do
+        case EagerBody(stmts: _) -> b
+        case LazyBody(ast_expr: _, entries: _) -> EagerBody(stmts: [])
+      end
+      return HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, body: nb, span: sp) :: strip_lazy(funcs: rest)
+  end
+end
