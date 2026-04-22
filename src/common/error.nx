@@ -12,6 +12,7 @@
 
 import { Span } from "src/common/token.nx"
 import * as str from "stdlib/string.nx"
+import { FileNotFound } from "stdlib/fs.nx"
 
 // ─── Parse exceptions ───────────────────────────────────────────────────────
 
@@ -51,6 +52,17 @@ export exception WriteFailed(path: string)
 
 export exception group DriverError = CyclicImport | InvalidUsage | WriteFailed
 
+// ─── File-context wrappers ─────────────────────────────────────────────────
+//
+// Attach file-path context to any inner compile error. `detail` is the
+// already-formatted inner message (see format_error), so these wrappers
+// chain naturally: InTargetFile('root', InImport('b', InImport('c', '...'))).
+
+export exception InImport(path: string, detail: string)
+export exception InTargetFile(path: string, detail: string)
+
+export exception group FileContextError = InImport | InTargetFile
+
 // ─── Unused phases (no raise sites yet — kept as stubs) ─────────────────────
 
 export exception LexError(message: string, span: Option<Span>)
@@ -65,13 +77,36 @@ export exception group CompileError =
   | InvalidSymbolTag | EmptyScopeStack | NoActiveScope
   | SymbolNotFound
   | CyclicImport | InvalidUsage | WriteFailed
+  | InImport | InTargetFile
   | LexError | MirError | LirError
 
 // ─── Formatting helpers ─────────────────────────────────────────────────────
+//
+// Style mirrors the Rust bootstrap (bootstrap/src/):
+//   - numeric error codes per phase: E0xxx internal, E1xxx lex/parse,
+//     E2xxx typecheck, E3xxx codegen, E4xxx driver, E5xxx MIR, E6xxx LIR.
+//   - identifiers, paths, and signatures are single-quoted for visibility.
+//   - internal invariants include a bug-report hint so users know to file it.
+//   - spans render as "at line L, column C" for consistency with diagnostics.
+
+let ice_suffix = " (this is a bug in nxc; please report it)"
+
+let with_code = fn (body: string, c: string) -> string do
+  return body ++ " [" ++ c ++ "]"
+end
+
+let quote = fn (s: string) -> string do
+  return "'" ++ s ++ "'"
+end
+
+let main_signature_hint = fn () -> string do
+  return "; expected " ++ quote(s: "let main = fn () -> unit")
+    ++ " or " ++ quote(s: "let main = fn (args: [string]) -> unit")
+end
 
 export let format_at = fn (span: Span) -> string do
   match span do case Span(offset: _, line: l, col: c) ->
-    return " at line " ++ str.from_i64(val: l) ++ ":" ++ str.from_i64(val: c)
+    return " at line " ++ str.from_i64(val: l) ++ ", column " ++ str.from_i64(val: c)
   end
 end
 
@@ -84,33 +119,52 @@ end
 
 export let format_error = fn (err: Exn) -> string do
   match err do
-    // Parse
+    // ── Parse (E1xxx) ──
     case UnexpectedToken(expected: e, got: g, span: sp) ->
-      "parse error: expected " ++ e ++ ", got " ++ g ++ format_at(span: sp)
+      with_code(body: "parse error: expected " ++ e ++ ", got " ++ quote(s: g) ++ format_at(span: sp), c: "E1001")
     case UnexpectedEof(expected: e, span: sp) ->
-      "parse error: expected " ++ e ++ ", got eof" ++ format_at(span: sp)
-    // Typecheck
+      with_code(body: "parse error: expected " ++ e ++ ", got end of input" ++ format_at(span: sp), c: "E1002")
+    // ── Typecheck (E2xxx) ──
     case TypeMismatch(func_name: f, detail: d, span: sp) ->
-      "type error in " ++ f ++ ": " ++ d ++ format_at(span: sp)
-    case MissingMain -> "type error: no main function defined"
-    case MainNotFunction -> "type error: main is not a function"
-    case MainNotUnit -> "type error: main must return unit"
-    // HIR
+      with_code(body: "type error in " ++ quote(s: f) ++ ": " ++ d ++ format_at(span: sp), c: "E2001")
+    case MissingMain ->
+      with_code(body: "type error: no " ++ quote(s: "main") ++ " function defined" ++ main_signature_hint(), c: "E2002")
+    case MainNotFunction ->
+      with_code(body: "type error: " ++ quote(s: "main") ++ " is not a function" ++ main_signature_hint(), c: "E2003")
+    case MainNotUnit ->
+      with_code(body: "type error: " ++ quote(s: "main") ++ " must return " ++ quote(s: "unit") ++ main_signature_hint(), c: "E2004")
+    // ── HIR invariants (E0xxx) — always ICE ──
     case InvalidSymbolTag(tag: t) ->
-      "internal error: invalid symbol tag " ++ str.from_i64(val: t)
-    case EmptyScopeStack -> "internal error: scope_pop on empty stack"
-    case NoActiveScope -> "internal error: no active scope"
-    // Codegen
+      with_code(body: "internal compiler error: invalid symbol tag " ++ str.from_i64(val: t), c: "E0001") ++ ice_suffix
+    case EmptyScopeStack ->
+      with_code(body: "internal compiler error: " ++ quote(s: "scope_pop") ++ " called on empty scope stack", c: "E0002") ++ ice_suffix
+    case NoActiveScope ->
+      with_code(body: "internal compiler error: no active scope", c: "E0003") ++ ice_suffix
+    // ── Codegen (E3xxx) ──
     case SymbolNotFound(name: n, kind: k, context: c) ->
-      "codegen error: " ++ k ++ " not found: " ++ n ++ " (in " ++ c ++ ")"
-    // Driver
-    case CyclicImport(path: p) -> "error: cyclic import: " ++ p
-    case InvalidUsage(detail: d) -> "error: " ++ d
-    case WriteFailed(path: p) -> "error: failed to write " ++ p
-    // Stubs
-    case LexError(message: msg, span: sp) -> "lex error: " ++ msg ++ format_span(sp: sp)
-    case MirError(message: msg, span: sp) -> "mir error: " ++ msg ++ format_span(sp: sp)
-    case LirError(message: msg, span: sp) -> "lir error: " ++ msg ++ format_span(sp: sp)
+      with_code(body: "codegen error: " ++ k ++ " " ++ quote(s: n) ++ " not found (in " ++ c ++ ")", c: "E3001")
+    // ── Driver (E4xxx) ──
+    case CyclicImport(path: p) ->
+      with_code(body: "error: cyclic import detected: " ++ quote(s: p), c: "E4001")
+    case InvalidUsage(detail: d) ->
+      with_code(body: "error: invalid usage: " ++ d, c: "E4002")
+    case WriteFailed(path: p) ->
+      with_code(body: "error: failed to write " ++ quote(s: p), c: "E4003")
+    // ── File-context wrappers (no code; context only) ──
+    case InTargetFile(path: p, detail: d) ->
+      p ++ ": " ++ d
+    case InImport(path: p, detail: d) ->
+      "in imported module " ++ quote(s: p) ++ ": " ++ d
+    // ── Stdlib I/O exceptions passing through the compiler ──
+    case FileNotFound(path: p) ->
+      with_code(body: "error: file not found: " ++ quote(s: p), c: "E4004")
+    // ── Stub phases (kept for future raise sites) ──
+    case LexError(message: msg, span: sp) ->
+      with_code(body: "lex error: " ++ msg ++ format_span(sp: sp), c: "E1000")
+    case MirError(message: msg, span: sp) ->
+      with_code(body: "mir error: " ++ msg ++ format_span(sp: sp), c: "E5000")
+    case LirError(message: msg, span: sp) ->
+      with_code(body: "lir error: " ++ msg ++ format_span(sp: sp), c: "E6000")
     case RuntimeError(val: msg) -> msg
     case _ -> "unknown error"
   end
