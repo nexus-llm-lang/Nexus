@@ -1051,7 +1051,11 @@ impl<'a> LowerCtx<'a> {
                 let mut catch_vars = self.vars.clone();
                 catch_vars.insert(catch_param.clone(), Type::String);
                 let mut catch_sem_vars = self.semantic_vars.clone();
-                catch_sem_vars.insert(catch_param.clone(), Type::String);
+                // Wasm representation is a packed string handle, but the semantic
+                // type is Exn — needed so match arms over `catch_param` can
+                // resolve labeled-field pattern types via resolve_constructor_field_types.
+                catch_sem_vars
+                    .insert(catch_param.clone(), Type::UserDefined("Exn".into(), vec![]));
                 let (catch_stmts, catch_ret) =
                     self.lower_block_with_vars(catch_body, ret_type, catch_vars, catch_sem_vars)?;
 
