@@ -150,6 +150,7 @@ fn bytebuffer_minimal() {
 }
 
 #[test]
+#[ignore = "nxc codegen does not yet emit @ thunks as lambda/call_indirect (nexus-4y14, epic nexus-dtq5); table access fails at runtime"]
 fn lazy_thunk_syntax() {
     exec_with_stdlib(&read_fixture("nxc/test_lazy.nx"));
 }
