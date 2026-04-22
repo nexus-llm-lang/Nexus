@@ -927,7 +927,8 @@ impl TypeChecker {
                             if let Sigil::Immutable = sigil {
                                 return Err(TypeError::new("Mutating immutable", s.span.clone()));
                             }
-                            if let Some(sch) = env.get(&sigil.get_key(name)) {
+                            let name = name.as_dotted();
+                            if let Some(sch) = env.get(&sigil.get_key(&name)) {
                                 if let Type::Ref(i) = self.instantiate(sch) {
                                     self.unify(&t_v, &i)
                                         .map_err(|e| TypeError::new(e, value.span.clone()))?;
@@ -936,7 +937,7 @@ impl TypeChecker {
                                 }
                             } else {
                                 return Err(TypeError::new(
-                                    format!("Assign target not found: '{}'", sigil.get_key(name)),
+                                    format!("Assign target not found: '{}'", sigil.get_key(&name)),
                                     s.span.clone(),
                                 ));
                             }
@@ -951,7 +952,7 @@ impl TypeChecker {
                             // Typecheck array WITHOUT consuming if it's a variable
                             let t_arr = match &arr.node {
                                 Expr::Variable(n, s) => {
-                                    let key = s.get_key(n);
+                                    let key = s.get_key(&n.as_dotted());
                                     if let Some(sch) = env.get(&key) {
                                         self.instantiate(sch)
                                     } else {
@@ -1182,7 +1183,7 @@ impl TypeChecker {
                 },
             )),
             Expr::Variable(n, s) => {
-                let key = s.get_key(n);
+                let key = s.get_key(&n.as_dotted());
                 if let Some(sch) = env.get(&key).cloned() {
                     let mut t = self.instantiate(&sch);
                     let was_lazy = matches!(t, Type::Lazy(_));
@@ -1408,7 +1409,8 @@ impl TypeChecker {
                 }
             }
             Expr::Call { func, args } => {
-                let (mut s, ft_raw) = if let Some(sch) = env.get(func).cloned() {
+                let func = func.as_dotted();
+                let (mut s, ft_raw) = if let Some(sch) = env.get(&func).cloned() {
                     (HashMap::new(), self.instantiate(&sch))
                 } else {
                     return Err(TypeError::new(
@@ -1418,7 +1420,7 @@ impl TypeChecker {
                 };
                 let ft = match ft_raw {
                     Type::Linear(inner) | Type::Lazy(inner) => {
-                        env.consume(func)
+                        env.consume(&func)
                             .map_err(|m| TypeError::new(m, e.span.clone()))?;
                         *inner
                     }
@@ -1518,6 +1520,7 @@ impl TypeChecker {
             }
             Expr::Constructor(name, args) => {
                 let all_enums = self.collect_all_enums(env);
+                let name = name.as_dotted();
                 let ctor_name = name
                     .rfind('.')
                     .map_or(name.as_str(), |pos| &name[pos + 1..]);
@@ -2137,7 +2140,7 @@ impl TypeChecker {
             }
             Pattern::Constructor(n, pats) => {
                 let all_enums = self.collect_all_enums(env);
-                let ctor_name = n.rfind('.').map_or(n.as_str(), |pos| &n[pos + 1..]);
+                let ctor_name = n.occ();
                 for ed in all_enums {
                     if let Some(v) = ed.variants.iter().find(|x| x.name == ctor_name) {
                         // Ctor(_) with a single positional wildcard means "ignore all fields"
@@ -2246,7 +2249,7 @@ impl TypeChecker {
                     }
                 }
                 // Check if this is an exception group name — acts as wildcard for all members
-                if env.exception_groups.contains_key(n.as_str()) {
+                if env.exception_groups.contains_key(n.occ()) {
                     return Ok(HashMap::new());
                 }
                 Err(TypeError::new(

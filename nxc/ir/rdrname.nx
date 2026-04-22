@@ -1,0 +1,198 @@
+import { RdrName, Unqual, Qual } from "nxc/common/ast.nx"
+import { length as str_length, substring, index_of, char_code } from "stdlib/string.nx"
+
+/// Replace / and . with _ so source paths are safe as wasm identifier segments.
+let sanitize_char = fn (c: i64) -> i64 do
+  if c == 47 then return 95 end
+  if c == 46 then return 95 end
+  return c
+end
+
+let sanitize_path_go = fn (s: string, i: i64, acc: string, len: i64) -> string do
+  if i >= len then return acc end
+  let c = char_code(s: s, idx: i)
+  let sc = sanitize_char(c: c)
+  let ch = substring(s: s, start: i, len: 1)
+  let new_acc = if sc == c then acc ++ ch else acc ++ "_" end
+  return sanitize_path_go(s: s, i: i + 1, acc: new_acc, len: len)
+end
+
+export let sanitize_path = fn (path: string) -> string do
+  return sanitize_path_go(s: path, i: 0, acc: "", len: str_length(s: path))
+end
+
+/// Canonical global name: "sanitized_source_path#name".
+export let canonical_name = fn (source_path: string, name: string) -> string do
+  return sanitize_path(path: source_path) ++ "#" ++ name
+end
+
+export let rdr_from_dotted = fn (s: string) -> RdrName do
+  let dot_pos = index_of(s: s, sub: ".")
+  if dot_pos < 0 then return Unqual(name: s) end
+  let alias_part = substring(s: s, start: 0, len: dot_pos)
+  let name_part = substring(s: s, start: dot_pos + 1, len: str_length(s: s) - dot_pos - 1)
+  return Qual(alias: alias_part, name: name_part)
+end
+
+export let rdr_to_string = fn (r: RdrName) -> string do
+  match r do
+    case Unqual(name: n) -> return n
+    case Qual(alias: a, name: n) -> return a ++ "." ++ n
+  end
+end
+
+export let rdr_occ = fn (r: RdrName) -> string do
+  match r do
+    case Unqual(name: n) -> return n
+    case Qual(alias: _, name: n) -> return n
+  end
+end
+
+export type DefId = DefId(module: string, name: string)
+
+export type ImportSpec = ImportSpec(
+  source_path: string,
+  alias: Option<string>,
+  is_selective: bool
+)
+
+export type GlobalRdrElt = GlobalRdrElt(
+  defid: DefId,
+  occ: string,
+  specs: [ImportSpec]
+)
+
+export type ModuleEnv = ModuleEnv(elts: [GlobalRdrElt])
+
+export type LookupResult =
+  Resolved(val: DefId)
+  | Ambiguous(vals: [DefId])
+  | NotInScope
+
+export let defid_eq = fn (a: DefId, b: DefId) -> bool do
+  match a do case DefId(module: am, name: an) ->
+    match b do case DefId(module: bm, name: bn) ->
+      return am == bm && an == bn
+    end
+  end
+end
+
+export let mk_unqual_spec = fn (source_path: string) -> ImportSpec do
+  return ImportSpec(source_path: source_path, alias: None, is_selective: true)
+end
+
+export let mk_qual_spec = fn (source_path: string, alias: string) -> ImportSpec do
+  return ImportSpec(source_path: source_path, alias: Some(val: alias), is_selective: false)
+end
+
+export let empty_env = fn () -> ModuleEnv do
+  return ModuleEnv(elts: [])
+end
+
+export let add_def = fn (env: ModuleEnv, elt: GlobalRdrElt) -> ModuleEnv do
+  match env do case ModuleEnv(elts: elts) ->
+    return ModuleEnv(elts: elt :: elts)
+  end
+end
+
+let spec_admits_unqual = fn (spec: ImportSpec) -> bool do
+  match spec do case ImportSpec(source_path: _, alias: _, is_selective: sel) ->
+    return sel
+  end
+end
+
+let spec_admits_qual = fn (spec: ImportSpec, alias: string) -> bool do
+  match spec do case ImportSpec(source_path: _, alias: a, is_selective: _) ->
+    match a do
+      case Some(val: sa) -> return sa == alias
+      case None -> return false
+    end
+  end
+end
+
+let any_spec_admits_unqual = fn (specs: [ImportSpec]) -> bool do
+  match specs do
+    case [] -> return false
+    case s :: rest ->
+      if spec_admits_unqual(spec: s) then return true
+      else return any_spec_admits_unqual(specs: rest)
+      end
+  end
+end
+
+let any_spec_admits_qual = fn (specs: [ImportSpec], alias: string) -> bool do
+  match specs do
+    case [] -> return false
+    case s :: rest ->
+      if spec_admits_qual(spec: s, alias: alias) then return true
+      else return any_spec_admits_qual(specs: rest, alias: alias)
+      end
+  end
+end
+
+let defid_in_list = fn (d: DefId, xs: [DefId]) -> bool do
+  match xs do
+    case [] -> return false
+    case x :: rest ->
+      if defid_eq(a: d, b: x) then return true
+      else return defid_in_list(d: d, xs: rest)
+      end
+  end
+end
+
+let collect_unqual = fn (elts: [GlobalRdrElt], occ: string, acc: [DefId]) -> [DefId] do
+  match elts do
+    case [] -> return acc
+    case GlobalRdrElt(defid: d, occ: o, specs: specs) :: rest ->
+      if o == occ then
+        if any_spec_admits_unqual(specs: specs) then
+          if defid_in_list(d: d, xs: acc) then
+            return collect_unqual(elts: rest, occ: occ, acc: acc)
+          else
+            return collect_unqual(elts: rest, occ: occ, acc: d :: acc)
+          end
+        else
+          return collect_unqual(elts: rest, occ: occ, acc: acc)
+        end
+      else
+        return collect_unqual(elts: rest, occ: occ, acc: acc)
+      end
+  end
+end
+
+let collect_qual = fn (elts: [GlobalRdrElt], occ: string, alias: string, acc: [DefId]) -> [DefId] do
+  match elts do
+    case [] -> return acc
+    case GlobalRdrElt(defid: d, occ: o, specs: specs) :: rest ->
+      if o == occ then
+        if any_spec_admits_qual(specs: specs, alias: alias) then
+          if defid_in_list(d: d, xs: acc) then
+            return collect_qual(elts: rest, occ: occ, alias: alias, acc: acc)
+          else
+            return collect_qual(elts: rest, occ: occ, alias: alias, acc: d :: acc)
+          end
+        else
+          return collect_qual(elts: rest, occ: occ, alias: alias, acc: acc)
+        end
+      else
+        return collect_qual(elts: rest, occ: occ, alias: alias, acc: acc)
+      end
+  end
+end
+
+let finalize = fn (matches: [DefId]) -> LookupResult do
+  match matches do
+    case [] -> return NotInScope
+    case single :: [] -> return Resolved(val: single)
+    case _ :: _ :: _ -> return Ambiguous(vals: matches)
+  end
+end
+
+export let lookup = fn (env: ModuleEnv, name: RdrName) -> LookupResult do
+  match env do case ModuleEnv(elts: elts) ->
+    match name do
+      case Unqual(name: n) -> return finalize(matches: collect_unqual(elts: elts, occ: n, acc: []))
+      case Qual(alias: a, name: n) -> return finalize(matches: collect_qual(elts: elts, occ: n, alias: a, acc: []))
+    end
+  end
+end

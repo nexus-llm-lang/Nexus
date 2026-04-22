@@ -574,7 +574,7 @@ impl Parser {
             let span = lhs.span.start..rhs.span.end;
             Ok(Spanned {
                 node: Pattern::Constructor(
-                    "Cons".to_string(),
+                    RdrName::Unqual("Cons".to_string()),
                     vec![
                         (Some("v".to_string()), lhs),
                         (Some("rest".to_string()), rhs),
@@ -674,13 +674,13 @@ impl Parser {
                     let end = self.peek_span().end;
                     self.expect(&TokenKind::RParen)?;
                     Ok(Spanned {
-                        node: Pattern::Constructor(name, args),
+                        node: Pattern::Constructor(RdrName::Unqual(name), args),
                         span: start..end,
                     })
                 } else {
                     let end = self.tokens[self.pos - 1].span.end;
                     Ok(Spanned {
-                        node: Pattern::Constructor(name, vec![]),
+                        node: Pattern::Constructor(RdrName::Unqual(name), vec![]),
                         span: start..end,
                     })
                 }
@@ -692,7 +692,7 @@ impl Parser {
                     let end = self.peek_span().end;
                     self.advance(); // ]
                     Ok(Spanned {
-                        node: Pattern::Constructor("Nil".to_string(), vec![]),
+                        node: Pattern::Constructor(RdrName::Unqual("Nil".to_string()), vec![]),
                         span: start..end,
                     })
                 } else {
@@ -707,13 +707,13 @@ impl Parser {
                     self.expect(&TokenKind::RBracket)?;
                     // Desugar [p1, p2, ...] → Cons(v: p1, rest: Cons(v: p2, rest: ... Nil))
                     let mut result = Spanned {
-                        node: Pattern::Constructor("Nil".to_string(), vec![]),
+                        node: Pattern::Constructor(RdrName::Unqual("Nil".to_string()), vec![]),
                         span: start..end,
                     };
                     for pat in pats.into_iter().rev() {
                         result = Spanned {
                             node: Pattern::Constructor(
-                                "Cons".to_string(),
+                                RdrName::Unqual("Cons".to_string()),
                                 vec![
                                     (Some("v".to_string()), pat),
                                     (Some("rest".to_string()), result),
@@ -779,13 +779,13 @@ impl Parser {
                                 let end = self.peek_span().end;
                                 self.expect(&TokenKind::RParen)?;
                                 return Ok(Spanned {
-                                    node: Pattern::Constructor(qname, args),
+                                    node: Pattern::Constructor(RdrName::from_dotted(&qname), args),
                                     span: start..end,
                                 });
                             } else {
                                 let end = self.tokens[self.pos - 1].span.end;
                                 return Ok(Spanned {
-                                    node: Pattern::Constructor(qname, vec![]),
+                                    node: Pattern::Constructor(RdrName::from_dotted(&qname), vec![]),
                                     span: start..end,
                                 });
                             }
@@ -932,7 +932,7 @@ impl Parser {
                 let span = lhs.span.start..rhs.span.end;
                 lhs = Spanned {
                     node: Expr::Constructor(
-                        "Cons".to_string(),
+                        RdrName::Unqual("Cons".to_string()),
                         vec![
                             (Some("v".to_string()), lhs),
                             (Some("rest".to_string()), rhs),
@@ -1038,7 +1038,7 @@ impl Parser {
                         let name = self.expect_ident()?;
                         let end = self.tokens[self.pos - 1].span.end;
                         Ok(Spanned {
-                            node: Expr::Variable(name, Sigil::Lazy),
+                            node: Expr::Variable(RdrName::Unqual(name), Sigil::Lazy),
                             span: start..end,
                         })
                     }
@@ -1270,7 +1270,7 @@ impl Parser {
                 let name = self.expect_ident()?;
                 let end = self.tokens[self.pos - 1].span.end;
                 Ok(Spanned {
-                    node: Expr::Variable(name, sigil),
+                    node: Expr::Variable(RdrName::Unqual(name), sigil),
                     span: start..end,
                 })
             }
@@ -1310,7 +1310,7 @@ impl Parser {
                         let args = self.parse_ctor_args()?;
                         let end = self.tokens[self.pos - 1].span.end;
                         return Ok(Spanned {
-                            node: Expr::Constructor(path, args),
+                            node: Expr::Constructor(RdrName::from_dotted(&path), args),
                             span: start..end,
                         });
                     } else {
@@ -1319,7 +1319,7 @@ impl Parser {
                         let args = self.parse_call_args()?;
                         let end = self.tokens[self.pos - 1].span.end;
                         return Ok(Spanned {
-                            node: Expr::Call { func: path, args },
+                            node: Expr::Call { func: RdrName::from_dotted(&path), args },
                             span: start..end,
                         });
                     }
@@ -1330,14 +1330,14 @@ impl Parser {
                     // Uppercase final segment without args: Constructor (e.g., Nil or hir.Nil)
                     let end = self.tokens[self.pos - 1].span.end;
                     Ok(Spanned {
-                        node: Expr::Constructor(path, vec![]),
+                        node: Expr::Constructor(RdrName::from_dotted(&path), vec![]),
                         span: start..end,
                     })
                 } else if segments.len() == 1 {
                     // Single lowercase: Variable
                     let end = self.tokens[self.pos - 1].span.end;
                     Ok(Spanned {
-                        node: Expr::Variable(path, Sigil::Immutable),
+                        node: Expr::Variable(RdrName::Unqual(path), Sigil::Immutable),
                         span: start..end,
                     })
                 } else {
@@ -1352,7 +1352,7 @@ impl Parser {
                     self.pos -= extra_tokens;
                     let end = self.tokens[self.pos - 1].span.end;
                     Ok(Spanned {
-                        node: Expr::Variable(first_name, Sigil::Immutable),
+                        node: Expr::Variable(RdrName::Unqual(first_name), Sigil::Immutable),
                         span: start..end,
                     })
                 }

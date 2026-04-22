@@ -176,7 +176,13 @@ fn collect_expr_captures(
 ) {
     match &expr.node {
         Expr::Literal(_) => {}
-        Expr::Variable(name, sigil) | Expr::Borrow(name, sigil) => {
+        Expr::Variable(name, sigil) => {
+            let key = sigil.get_key(&name.as_dotted());
+            if outer_keys.contains(&key) && !bound_keys.contains(&key) {
+                captures.insert(key);
+            }
+        }
+        Expr::Borrow(name, sigil) => {
             let key = sigil.get_key(name);
             if outer_keys.contains(&key) && !bound_keys.contains(&key) {
                 captures.insert(key);
@@ -187,11 +193,12 @@ fn collect_expr_captures(
             collect_expr_captures(rhs, outer_keys, bound_keys, bound_call_names, captures);
         }
         Expr::Call { func, args, .. } => {
+            let func = func.as_dotted();
             if !func.contains('.')
-                && outer_keys.contains(func)
+                && outer_keys.contains(&func)
                 && !bound_call_names.contains(func.as_str())
             {
-                captures.insert(func.clone());
+                captures.insert(func);
             }
             for (_, arg) in args {
                 collect_expr_captures(arg, outer_keys, bound_keys, bound_call_names, captures);

@@ -239,7 +239,7 @@ fn parse_selective_catch_multi_arm() {
         panic!("expected try")
     };
     assert_eq!(catch_arms.len(), 2, "expected 2 catch arms");
-    assert!(matches!(&catch_arms[0].pattern.node, Pattern::Constructor(name, _) if name == "Boom"));
+    assert!(matches!(&catch_arms[0].pattern.node, Pattern::Constructor(name, _) if name.occ() == "Boom"));
     assert!(matches!(&catch_arms[1].pattern.node, Pattern::Wildcard));
 }
 

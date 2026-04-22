@@ -23,6 +23,7 @@ import { RenameEntry, rename, rename_add,
 import { from_i64, length as str_length, substring, index_of } from "stdlib/string.nx"
 import * as list from "stdlib/list.nx"
 import { StringMap } from "stdlib/stringmap.nx"
+import { canonical_name } from "nxc/ir/rdrname.nx"
 
 // ─── Path utilities ───────────────────────────────────────────────────────────
 
@@ -65,58 +66,82 @@ let find_selected = fn (name: string, items: [ImportItem]) -> Option<string> do
   end
 end
 
-let build_wildcard_rename_go = fn (defs: [SpannedTopLevel], alias: string, acc: [RenameEntry]) -> [RenameEntry] do
+/// Build internal-view rename entries for an imported module: each top-level
+/// def gets mapped to its canonical name (source#name). Produced once per
+/// import and used for the imported module's own internal calls.
+let build_internal_rename_go = fn (defs: [SpannedTopLevel], source: string, acc: [RenameEntry]) -> [RenameEntry] do
   match defs do
     case [] -> return acc
     case SpannedTopLevel(node: TLLet(def: GlobalLet(name: name, is_public: _, typ: _, value: _)), span: _) :: rest ->
-      let acc2 = rename_add(entries: acc, original: name, qualified: buf_concat(parts: [alias, ".", name]))
-      return build_wildcard_rename_go(defs: rest, alias: alias, acc: acc2)
+      let acc2 = rename_add(entries: acc, original: name, qualified: canonical_name(source_path: source, name: name))
+      return build_internal_rename_go(defs: rest, source: source, acc: acc2)
     case SpannedTopLevel(node: TLPort(def: Port(name: name, is_public: _, functions: _)), span: _) :: rest ->
-      let acc2 = rename_add(entries: acc, original: name, qualified: buf_concat(parts: [alias, ".", name]))
-      return build_wildcard_rename_go(defs: rest, alias: alias, acc: acc2)
+      let acc2 = rename_add(entries: acc, original: name, qualified: canonical_name(source_path: source, name: name))
+      return build_internal_rename_go(defs: rest, source: source, acc: acc2)
     case _ :: rest ->
-      return build_wildcard_rename_go(defs: rest, alias: alias, acc: acc)
+      return build_internal_rename_go(defs: rest, source: source, acc: acc)
   end
 end
 
-let get_prefix = fn (alias_opt: Option<string>, import_depth: i64) -> string do
-  match alias_opt do
-    case Some(val: a) -> return a
-    case None -> return "__import_" ++ from_i64(val: import_depth)
-  end
-end
-
-let build_selective_rename_go = fn (defs: [SpannedTopLevel], items: [ImportItem], prefix: string, acc: [RenameEntry]) -> [RenameEntry] do
-  match defs do
-    case [] -> return acc
-    case SpannedTopLevel(node: TLLet(def: GlobalLet(name: name, is_public: _, typ: _, value: _)), span: _) :: rest ->
-      match find_selected(name: name, items: items) do
-        case Some(val: visible) ->
-          let acc2 = rename_add(entries: acc, original: name, qualified: visible)
-          return build_selective_rename_go(defs: rest, items: items, prefix: prefix, acc: acc2)
-        case None ->
-          let acc2 = rename_add(entries: acc, original: name, qualified: buf_concat(parts: [prefix, ".", name]))
-          return build_selective_rename_go(defs: rest, items: items, prefix: prefix, acc: acc2)
-      end
-    case SpannedTopLevel(node: TLPort(def: Port(name: name, is_public: _, functions: _)), span: _) :: rest ->
-      match find_selected(name: name, items: items) do
-        case Some(val: visible) ->
-          let acc2 = rename_add(entries: acc, original: name, qualified: visible)
-          return build_selective_rename_go(defs: rest, items: items, prefix: prefix, acc: acc2)
-        case None ->
-          let acc2 = rename_add(entries: acc, original: name, qualified: buf_concat(parts: [prefix, ".", name]))
-          return build_selective_rename_go(defs: rest, items: items, prefix: prefix, acc: acc2)
-      end
-    case _ :: rest ->
-      return build_selective_rename_go(defs: rest, items: items, prefix: prefix, acc: acc)
-  end
-end
-
-/// Build a rename map for a single import.
-/// imported_defs: top-level definitions from the imported module's AST.
-/// import_def: the import statement being processed.
-/// import_depth: nesting depth (for auto-generated prefixes).
+/// Build the internal-view rename map for an imported module: entries for
+/// the module's own top-level defs, each mapped to its canonical name.
+/// Used when processing the imported module's function bodies.
 export let build_rename_map = fn (imported_defs: [SpannedTopLevel], import_def: ImportDef, import_depth: i64) -> [RenameEntry] do
+  match import_def do
+    case ImportDef(path: path, alias: _, items: _, is_external: is_ext) ->
+      if is_ext then return []
+      else
+        return build_internal_rename_go(defs: imported_defs, source: path, acc: [])
+      end
+  end
+end
+
+/// For wildcard import `import * as a from "A"`: caller sees `a.foo -> canonical(A, foo)`.
+let build_wildcard_importer_go = fn (defs: [SpannedTopLevel], source: string, alias: string, acc: [RenameEntry]) -> [RenameEntry] do
+  match defs do
+    case [] -> return acc
+    case SpannedTopLevel(node: TLLet(def: GlobalLet(name: name, is_public: _, typ: _, value: _)), span: _) :: rest ->
+      let key = alias ++ "." ++ name
+      let acc2 = rename_add(entries: acc, original: key, qualified: canonical_name(source_path: source, name: name))
+      return build_wildcard_importer_go(defs: rest, source: source, alias: alias, acc: acc2)
+    case SpannedTopLevel(node: TLPort(def: Port(name: name, is_public: _, functions: _)), span: _) :: rest ->
+      let key = alias ++ "." ++ name
+      let acc2 = rename_add(entries: acc, original: key, qualified: canonical_name(source_path: source, name: name))
+      return build_wildcard_importer_go(defs: rest, source: source, alias: alias, acc: acc2)
+    case _ :: rest ->
+      return build_wildcard_importer_go(defs: rest, source: source, alias: alias, acc: acc)
+  end
+end
+
+/// For selective import `import { foo as bar } from "A"`: caller sees `bar -> canonical(A, foo)`.
+let build_selective_importer_go = fn (defs: [SpannedTopLevel], items: [ImportItem], source: string, acc: [RenameEntry]) -> [RenameEntry] do
+  match defs do
+    case [] -> return acc
+    case SpannedTopLevel(node: TLLet(def: GlobalLet(name: name, is_public: _, typ: _, value: _)), span: _) :: rest ->
+      match find_selected(name: name, items: items) do
+        case Some(val: visible) ->
+          let acc2 = rename_add(entries: acc, original: visible, qualified: canonical_name(source_path: source, name: name))
+          return build_selective_importer_go(defs: rest, items: items, source: source, acc: acc2)
+        case None ->
+          return build_selective_importer_go(defs: rest, items: items, source: source, acc: acc)
+      end
+    case SpannedTopLevel(node: TLPort(def: Port(name: name, is_public: _, functions: _)), span: _) :: rest ->
+      match find_selected(name: name, items: items) do
+        case Some(val: visible) ->
+          let acc2 = rename_add(entries: acc, original: visible, qualified: canonical_name(source_path: source, name: name))
+          return build_selective_importer_go(defs: rest, items: items, source: source, acc: acc2)
+        case None ->
+          return build_selective_importer_go(defs: rest, items: items, source: source, acc: acc)
+      end
+    case _ :: rest ->
+      return build_selective_importer_go(defs: rest, items: items, source: source, acc: acc)
+  end
+end
+
+/// Build the importer-view rename entries for an import: the entries that
+/// the importing scope needs so its own calls (alias.foo or bare visible
+/// names from selective imports) rename to the canonical target.
+export let build_importer_entries = fn (imported_defs: [SpannedTopLevel], import_def: ImportDef) -> [RenameEntry] do
   match import_def do
     case ImportDef(path: path, alias: alias_opt, items: items, is_external: is_ext) ->
       if is_ext then return []
@@ -127,19 +152,14 @@ export let build_rename_map = fn (imported_defs: [SpannedTopLevel], import_def: 
               case Some(val: a) -> a
               case None -> default_alias(path: path)
             end
-            return build_wildcard_rename_go(defs: imported_defs, alias: alias, acc: [])
+            return build_wildcard_importer_go(defs: imported_defs, source: path, alias: alias, acc: [])
           case _ :: _ ->
-            let prefix = get_prefix(alias_opt: alias_opt, import_depth: import_depth)
-            // When both selective items and wildcard alias exist
-            // (e.g., import { Foo }, * as mod from "..."), build wildcard
-            // entries first, then selective on top. rename() returns first
-            // match, so selective entries (bare names) take priority.
-            let base = match alias_opt do
+            let selective = build_selective_importer_go(defs: imported_defs, items: items, source: path, acc: [])
+            match alias_opt do
               case Some(val: alias) ->
-                build_wildcard_rename_go(defs: imported_defs, alias: alias, acc: [])
-              case None -> []
+                return build_wildcard_importer_go(defs: imported_defs, source: path, alias: alias, acc: selective)
+              case None -> return selective
             end
-            return build_selective_rename_go(defs: imported_defs, items: items, prefix: prefix, acc: base)
         end
       end
   end
