@@ -157,13 +157,3 @@ nexus
 | `--preopen DIR` | (with `PermFs`) | Preopen a directory for filesystem access |
 
 Capability flags apply to `nexus run`. The compiled WASM binary encodes required capabilities in the `nexus:capabilities` section -- the host runtime (e.g., wasmtime) enforces them at execution time. See [WASM and WASI](../wasm).
-
-## Development
-
-Build and run from source:
-
-```bash
-cargo run -- run program.nx --allow-console
-cargo run -- build program.nx
-cargo run -- check program.nx
-```
