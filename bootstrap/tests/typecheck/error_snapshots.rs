@@ -248,10 +248,10 @@ fn snapshot_effect_leak_pure_calls_impure() {
 fn snapshot_raise_without_throws() {
     let err = should_fail_typecheck(
         r#"
-    exception Boom(i64)
+    exception Boom(code: i64)
 
     let f = fn () -> unit do
-        raise Boom(42)
+        raise Boom(code: 42)
         return ()
     end
     "#,

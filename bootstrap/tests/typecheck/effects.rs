@@ -48,10 +48,10 @@ fn test_try_catch_removes_exn() {
         r#"
     import { Console }, * as stdio from "stdlib/stdio.nx"
     import { from_i64 } from "stdlib/string_ops.nx"
-    exception Oops(string)
+    exception Oops(msg: string)
 
     let risky = fn () -> unit throws { Exn } do
-        raise Oops("oops")
+        raise Oops(msg: "oops")
         return ()
     end
 
@@ -60,9 +60,9 @@ fn test_try_catch_removes_exn() {
             try
                 risky()
             catch
-                    case Oops(msg) -> Console.print(val: msg)
-                    case RuntimeError(msg) -> Console.print(val: msg)
-                    case InvalidIndex(i) ->
+                    case Oops(msg: msg) -> Console.print(val: msg)
+                    case RuntimeError(val: msg) -> Console.print(val: msg)
+                    case InvalidIndex(val: i) ->
                         let m = from_i64(val: i)
                         Console.print(val: m)
             end
@@ -633,13 +633,13 @@ end
 fn test_selective_catch_constructor_field_binding() {
     should_typecheck(
         r#"
-    exception Boom(i64)
+    exception Boom(code: i64)
 
     let main = fn () -> unit do
       try
-        raise Boom(42)
+        raise Boom(code: 42)
       catch
-        case Boom(code) ->
+        case Boom(code: code) ->
           let x: i64 = code
           return ()
         case _ -> return ()
@@ -654,15 +654,15 @@ fn test_selective_catch_constructor_field_binding() {
 fn test_selective_catch_multiple_exceptions() {
     should_typecheck(
         r#"
-    exception Boom(i64)
-    exception Oops(string)
+    exception Boom(code: i64)
+    exception Oops(msg: string)
 
     let main = fn () -> unit do
       try
-        raise Boom(42)
+        raise Boom(code: 42)
       catch
-        case Boom(code) -> return ()
-        case Oops(msg) -> return ()
+        case Boom(code: code) -> return ()
+        case Oops(msg: msg) -> return ()
         case _ -> return ()
       end
       return ()
@@ -675,13 +675,13 @@ fn test_selective_catch_multiple_exceptions() {
 fn test_selective_catch_wrong_field_type_fails() {
     should_fail_typecheck(
         r#"
-    exception Boom(i64)
+    exception Boom(code: i64)
 
     let main = fn () -> unit do
       try
-        raise Boom(42)
+        raise Boom(code: 42)
       catch
-        case Boom(code) ->
+        case Boom(code: code) ->
           let x: string = code
           return ()
         case _ -> return ()
@@ -696,10 +696,10 @@ fn test_selective_catch_wrong_field_type_fails() {
 fn test_main_rejects_nonempty_throws() {
     should_fail_typecheck(
         r#"
-    exception Boom(i64)
+    exception Boom(code: i64)
 
     let main = fn () -> unit throws { Exn } do
-      raise Boom(42)
+      raise Boom(code: 42)
       return ()
     end
     "#,
@@ -793,13 +793,13 @@ fn test_exception_group_throws_allows_member_raise() {
 fn test_exception_group_catch_with_wildcard() {
     should_typecheck(
         r#"
-    exception Boom(i64)
-    exception Oops(string)
+    exception Boom(code: i64)
+    exception Oops(msg: string)
     exception group Errors = Boom | Oops
 
     let main = fn () -> unit do
       try
-        raise Boom(42)
+        raise Boom(code: 42)
       catch
         case Errors -> return ()
       end
