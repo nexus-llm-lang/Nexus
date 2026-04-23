@@ -3,6 +3,7 @@ use nexus::compiler::passes::lir_lower::lower_mir_to_lir;
 use nexus::lang::parser;
 
 fn build_lir(src: &str) -> nexus::ir::lir::LirProgram {
+    crate::harness::ensure_repo_root();
     let program = parser::parser().parse(src).unwrap();
     let mir = build_hir(&program).unwrap();
     lower_mir_to_lir(&mir, &mir.enum_defs).unwrap()

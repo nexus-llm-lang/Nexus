@@ -4,6 +4,7 @@ use nexus::lang::parser;
 fn parse_and_build_mir(
     src: &str,
 ) -> Result<nexus::ir::mir::MirProgram, nexus::compiler::passes::hir_build::HirBuildError> {
+    crate::harness::ensure_repo_root();
     let program = parser::parser().parse(src).unwrap();
     build_hir(&program)
 }

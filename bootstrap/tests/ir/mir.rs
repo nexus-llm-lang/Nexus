@@ -2,6 +2,7 @@ use nexus::compiler::passes::hir_build::build_hir;
 use nexus::lang::parser;
 
 fn build_mir(src: &str) -> nexus::ir::mir::MirProgram {
+    crate::harness::ensure_repo_root();
     let program = parser::parser().parse(src).unwrap();
     build_hir(&program).unwrap()
 }
