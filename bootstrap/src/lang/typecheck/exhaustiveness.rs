@@ -210,11 +210,14 @@ impl TypeChecker {
                 Pattern::Constructor(c, args) => {
                     let bare_c = c.occ();
                     if bare_c == ctor {
-                        // Ctor(_) with a single positional wildcard means "ignore all fields"
-                        let is_wildcard_spread = args.len() == 1
-                            && args[0].0.is_none()
-                            && matches!(args[0].1.node, Pattern::Wildcard)
-                            && arity != 1;
+                        // Trailing bare `_` acts as a wildcard spread: fills any
+                        // remaining unmatched fields with wildcards. Covers both
+                        // `Ctor(_)` (arity > 1) and `Ctor(label: x, _)` forms.
+                        let has_trailing_underscore = args.last().map_or(false, |(label, pat)| {
+                            label.is_none() && matches!(pat.node, Pattern::Wildcard)
+                        });
+                        let is_wildcard_spread = has_trailing_underscore
+                            && args.len() < arity;
                         if !is_wildcard_spread && args.len() != arity {
                             return Err(format!(
                                 "Arity mismatch in pattern `{}`: expected {} fields, got {}.\nProvided pattern arguments: {}",
@@ -225,9 +228,14 @@ impl TypeChecker {
                             ));
                         }
                         let mut nr: Vec<PatRef> = if is_wildcard_spread {
-                            let span = args[0].1.span.clone();
-                            (0..arity)
-                                .map(|_| PatRef::Synthetic(Pattern::Wildcard, span.clone()))
+                            let span = args.last().unwrap().1.span.clone();
+                            let keep = args.len() - 1;
+                            args[..keep]
+                                .iter()
+                                .map(|(_, a)| PatRef::Original(a))
+                                .chain((0..arity - keep).map(|_| {
+                                    PatRef::Synthetic(Pattern::Wildcard, span.clone())
+                                }))
                                 .collect()
                         } else {
                             args.iter().map(|(_, a)| PatRef::Original(a)).collect()
