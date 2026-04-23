@@ -48,6 +48,10 @@ pub enum HirBuildError {
         source_file: Option<String>,
         span: Span,
     },
+    StdlibLoadError {
+        detail: String,
+        span: Span,
+    },
 }
 
 impl std::fmt::Display for HirBuildError {
@@ -80,6 +84,9 @@ impl std::fmt::Display for HirBuildError {
                     name, loc, name
                 )
             }
+            HirBuildError::StdlibLoadError { detail, .. } => {
+                write!(f, "Failed to load stdlib: {}", detail)
+            }
         }
     }
 }
@@ -92,7 +99,8 @@ impl HirBuildError {
             | HirBuildError::CyclicImport { span, .. }
             | HirBuildError::ImportItemNotFound { span, .. }
             | HirBuildError::UnresolvedPort { span, .. }
-            | HirBuildError::UnsupportedTopLevelLet { span, .. } => span,
+            | HirBuildError::UnsupportedTopLevelLet { span, .. }
+            | HirBuildError::StdlibLoadError { span, .. } => span,
         }
     }
 }
@@ -419,60 +427,63 @@ impl MirBuilder {
         self.enum_defs.push(list_enum_def());
         self.enum_defs.push(exn_enum_def());
 
-        if let Ok(stdlib_programs) = load_stdlib_nx_programs() {
-            for (path, stdlib_program) in stdlib_programs {
-                let wit_interface = stdlib_nx_to_wit_interface(&path);
-                let mut current_wasm_module: Option<String> = None;
-                for def in &stdlib_program.definitions {
-                    match &def.node {
-                        TopLevel::Import(import) if import.is_external => {
-                            let resolved = resolve_import_path(&import.path);
-                            current_wasm_module = Some(resolve_stdlib_wit_module(
-                                &resolved,
-                                wit_interface.as_deref(),
-                            ));
-                        }
-                        TopLevel::Enum(ed) => {
-                            self.enum_defs.push(ed.clone());
-                        }
-                        TopLevel::Exception(ex) => {
-                            self.register_exception_in_enum_defs(ex);
-                        }
-                        TopLevel::Let(gl) if gl.is_public => {
-                            if let Expr::External(wasm_name, _type_params, typ) = &gl.value.node {
-                                if let Type::Arrow(params, ret, _requires, throws) = typ {
-                                    if let Some(ref wasm_mod) = current_wasm_module {
-                                        // Skip if already loaded (avoid duplicates)
-                                        if self.externals.iter().any(|e| e.name == gl.name) {
-                                            continue;
-                                        }
-                                        // Use WIT-canonical kebab-case names for component-model modules.
-                                        let effective_wasm_name = if wasm_mod.contains(':') {
-                                            wit_canonical_name(wasm_name)
-                                        } else {
-                                            wasm_name.to_string()
-                                        };
-                                        self.externals.push(MirExternal {
-                                            name: Symbol::from(&gl.name),
-                                            wasm_module: Symbol::from(wasm_mod.as_str()),
-                                            wasm_name: Symbol::from(effective_wasm_name.as_str()),
-                                            params: params
-                                                .iter()
-                                                .map(|(n, t)| MirParam {
-                                                    name: Symbol::from(n.as_str()),
-                                                    label: Symbol::from(n.as_str()),
-                                                    typ: t.clone(),
-                                                })
-                                                .collect(),
-                                            ret_type: *ret.clone(),
-                                            throws: *throws.clone(),
-                                        });
+        let stdlib_programs =
+            load_stdlib_nx_programs().map_err(|detail| HirBuildError::StdlibLoadError {
+                detail,
+                span: 0..0,
+            })?;
+        for (path, stdlib_program) in stdlib_programs {
+            let wit_interface = stdlib_nx_to_wit_interface(&path);
+            let mut current_wasm_module: Option<String> = None;
+            for def in &stdlib_program.definitions {
+                match &def.node {
+                    TopLevel::Import(import) if import.is_external => {
+                        let resolved = resolve_import_path(&import.path);
+                        current_wasm_module = Some(resolve_stdlib_wit_module(
+                            &resolved,
+                            wit_interface.as_deref(),
+                        ));
+                    }
+                    TopLevel::Enum(ed) => {
+                        self.enum_defs.push(ed.clone());
+                    }
+                    TopLevel::Exception(ex) => {
+                        self.register_exception_in_enum_defs(ex);
+                    }
+                    TopLevel::Let(gl) if gl.is_public => {
+                        if let Expr::External(wasm_name, _type_params, typ) = &gl.value.node {
+                            if let Type::Arrow(params, ret, _requires, throws) = typ {
+                                if let Some(ref wasm_mod) = current_wasm_module {
+                                    // Skip if already loaded (avoid duplicates)
+                                    if self.externals.iter().any(|e| e.name == gl.name) {
+                                        continue;
                                     }
+                                    // Use WIT-canonical kebab-case names for component-model modules.
+                                    let effective_wasm_name = if wasm_mod.contains(':') {
+                                        wit_canonical_name(wasm_name)
+                                    } else {
+                                        wasm_name.to_string()
+                                    };
+                                    self.externals.push(MirExternal {
+                                        name: Symbol::from(&gl.name),
+                                        wasm_module: Symbol::from(wasm_mod.as_str()),
+                                        wasm_name: Symbol::from(effective_wasm_name.as_str()),
+                                        params: params
+                                            .iter()
+                                            .map(|(n, t)| MirParam {
+                                                name: Symbol::from(n.as_str()),
+                                                label: Symbol::from(n.as_str()),
+                                                typ: t.clone(),
+                                            })
+                                            .collect(),
+                                        ret_type: *ret.clone(),
+                                        throws: *throws.clone(),
+                                    });
                                 }
                             }
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
         }
