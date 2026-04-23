@@ -559,7 +559,7 @@ impl MirBuilder {
                                 && params[0].typ == Type::List(Box::new(Type::String))
                             {
                                 let proc_import = Import {
-                                    path: "stdlib/proc.nx".to_string(),
+                                    path: "stdlib/process.nx".to_string(),
                                     alias: None,
                                     items: vec![ImportItem {
                                         name: "argv".to_string(),
@@ -1943,12 +1943,12 @@ fn stdlib_nx_to_wit_interface(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let wit = match stem {
         "math" => "nexus:stdlib/math",
-        "string" => "nexus:stdlib/string-ops",
+        "string_ops" => "nexus:stdlib/string-ops",
         "stdio" => "nexus:stdlib/stdio",
-        "fs" => "nexus:stdlib/filesystem",
-        "net" => "nexus:stdlib/network",
-        "proc" => "nexus:stdlib/process",
-        "env" => "nexus:stdlib/environment",
+        "filesystem" => "nexus:stdlib/filesystem",
+        "network" => "nexus:stdlib/network",
+        "process" => "nexus:stdlib/process",
+        "environment" => "nexus:stdlib/environment",
         "clock" => "nexus:stdlib/clock",
         "random" => "nexus:stdlib/random",
         "char" => "nexus:stdlib/string-ops",

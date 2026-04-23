@@ -4,7 +4,7 @@ use crate::harness::{exec_with_stdlib, should_fail_typecheck, should_typecheck};
 fn env_port_typechecks_with_perm_env() {
     should_typecheck(
         r#"
-import { Env }, * as env_mod from "stdlib/env.nx"
+import { Env }, * as env_mod from "stdlib/environment.nx"
 
 let main = fn () -> unit require { PermEnv } do
   inject env_mod.system_handler do
@@ -20,7 +20,7 @@ end
 fn env_get_requires_perm_env() {
     let err = should_fail_typecheck(
         r#"
-import { Env }, * as env_mod from "stdlib/env.nx"
+import { Env }, * as env_mod from "stdlib/environment.nx"
 
 let main = fn () -> unit do
   inject env_mod.system_handler do
@@ -37,7 +37,7 @@ end
 fn env_set_typechecks_with_perm_env() {
     should_typecheck(
         r#"
-import { Env }, * as env_mod from "stdlib/env.nx"
+import { Env }, * as env_mod from "stdlib/environment.nx"
 
 let main = fn () -> unit require { PermEnv } do
   inject env_mod.system_handler do
@@ -52,7 +52,7 @@ end
 fn env_mock_handler() {
     exec_with_stdlib(
         r#"
-import { Env } from "stdlib/env.nx"
+import { Env } from "stdlib/environment.nx"
 import { Option } from "stdlib/option.nx"
 
 let mock_env = handler Env do

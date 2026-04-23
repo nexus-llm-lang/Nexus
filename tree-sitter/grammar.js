@@ -171,7 +171,7 @@ export default grammar({
         optional(seq("as", field("alias", $.identifier)))
       ),
 
-    // Import path: quoted string (e.g. "nxlib/stdlib/fs.nx")
+    // Import path: quoted string (e.g. "nxlib/stdlib/filesystem.nx")
     import_path: ($) => $.string_literal,
 
     // [pub] port Name do fn sig ... end

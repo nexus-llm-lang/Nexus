@@ -137,7 +137,7 @@ wasmtime run -Scli -Shttp -Sinherit-network -Sallow-ip-name-lookup -Stcp main.wa
 
 ```nexus
 import { Console }, * as stdio from stdlib/stdio.nx
-import { from_i64 } from stdlib/string.nx
+import { from_i64 } from stdlib/string_ops.nx
 
 let fib = fn (n: i64) -> i64 do
   if n <= 1 then return n end

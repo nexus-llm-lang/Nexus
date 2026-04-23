@@ -449,7 +449,7 @@ fn test_anonymous_record() {
     should_typecheck(
         r#"
     import { Console }, * as stdio from "stdlib/stdio.nx"
-    import { from_i64 } from "stdlib/string.nx"
+    import { from_i64 } from "stdlib/string_ops.nx"
     let main = fn () -> unit require { PermConsole } do
         inject stdio.system_handler do
             let r = { x: 1, y: "hello" }
