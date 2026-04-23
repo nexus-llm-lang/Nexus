@@ -214,8 +214,8 @@ fn parse_selective_catch_multi_arm() {
       try
         raise Boom(42)
       catch
-        case Boom(code) -> return code
-        case _ -> return -1
+        | Boom(code) -> return code
+        | _ -> return -1
       end
       return 0
     end
@@ -245,7 +245,7 @@ fn parse_selective_catch_multi_arm() {
 }
 
 #[test]
-fn parse_legacy_catch_still_works() {
+fn parse_bare_catch_with_param_binds_exception_value() {
     let src = r#"
     exception Boom(i64)
 
@@ -279,15 +279,13 @@ fn parse_legacy_catch_still_works() {
     assert_eq!(
         catch_arms.len(),
         1,
-        "legacy catch should produce single arm"
+        "bare catch should produce single arm"
     );
     assert!(matches!(&catch_arms[0].pattern.node, Pattern::Variable(name, _) if name == "e"));
 }
 
 #[test]
-fn parse_pipe_is_not_bitor_in_expression_position() {
-    // Pipe (`|`) is reserved for pattern syntax. `a | b` in expression position
-    // must not parse as bitwise-or — it's now a parse error.
+fn parse_pipe_in_expression_position_is_a_parse_error() {
     should_fail_parse(
         r#"
     let main = fn () -> i64 do
@@ -340,45 +338,6 @@ fn parse_match_with_pipe_arm_separator() {
 }
 
 #[test]
-fn parse_match_mixed_pipe_and_case_separators() {
-    let src = r#"
-    type Color = Red | Green | Blue
-
-    let main = fn () -> i64 do
-      let c = Red
-      match c do
-        case Red -> return 1
-        | Green -> return 2
-        case Blue -> return 3
-      end
-      return 0
-    end
-    "#;
-    let program = parser::parser().parse(src).unwrap();
-    let gl = program
-        .definitions
-        .iter()
-        .find_map(|def| {
-            if let TopLevel::Let(gl) = &def.node {
-                Some(gl)
-            } else {
-                None
-            }
-        })
-        .unwrap();
-    let Expr::Lambda { body, .. } = &gl.value.node else {
-        panic!("expected lambda")
-    };
-    let Stmt::Expr(match_expr) = &body[1].node else {
-        panic!("expected match")
-    };
-    let Expr::Match { cases, .. } = &match_expr.node else {
-        panic!("expected match")
-    };
-    assert_eq!(cases.len(), 3);
-}
-
-#[test]
 fn parse_catch_with_pipe_arm_separator() {
     let src = r#"
     exception Boom(i64)
@@ -422,8 +381,8 @@ fn parse_match_or_pattern_two_alts() {
     let main = fn () -> i64 do
       let c = Red
       match c do
-        case Red | Green -> return 1
-        case Blue -> return 2
+        | Red | Green -> return 1
+        | Blue -> return 2
       end
       return 0
     end
@@ -464,7 +423,7 @@ fn parse_match_or_pattern_three_alts() {
     let main = fn () -> i64 do
       let c = Red
       match c do
-        case Red | Green | Blue -> return 1
+        | Red | Green | Blue -> return 1
       end
       return 0
     end
@@ -506,7 +465,7 @@ fn parse_catch_or_pattern() {
       try
         raise Boom(1)
       catch
-        case Boom(_) | Crash -> return 1
+        | Boom(_) | Crash -> return 1
       end
       return 0
     end

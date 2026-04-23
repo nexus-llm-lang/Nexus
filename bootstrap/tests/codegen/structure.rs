@@ -219,8 +219,8 @@ fn codegen_match_arm_tail_call_emits_tco() {
         r#"
 let sum_list = fn (xs: [i64], acc: i64) -> i64 do
     match xs do
-        case Nil -> return acc
-        case h :: t -> return sum_list(xs: t, acc: acc + h)
+        | Nil -> return acc
+        | h :: t -> return sum_list(xs: t, acc: acc + h)
     end
 end
 
@@ -265,8 +265,8 @@ end
 
 let helper = fn (n: i64) -> i64 do
     match n do
-        case 0 -> return 0
-        case _ -> return process(n: n - 1)
+        | 0 -> return 0
+        | _ -> return process(n: n - 1)
     end
 end
 
@@ -351,8 +351,8 @@ end
 
 let dispatch = fn (n: i64) -> i64 do
     return match n do
-        case 0 -> 0
-        case _ -> step(n: n - 1)
+        | 0 -> 0
+        | _ -> step(n: n - 1)
     end
 end
 
@@ -645,9 +645,9 @@ let main = fn () -> unit do
     let x = Present(v: 42)
     let s = "aa" ++ "bb"
     match x do
-        case Present(v: v) ->
+        | Present(v: v) ->
             if v != 42 then raise RuntimeError(val: "v") end
-        case Absent ->
+        | Absent ->
             raise RuntimeError(val: "tag")
     end
     if s == "xxxx" then raise RuntimeError(val: "s") end

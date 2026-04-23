@@ -95,9 +95,9 @@ fn generic_applied_to_different_concrete_types() {
         let bi: Box<i64> = Box(val: 42)
         let bs: Box<string> = Box(val: "hi")
         let bb: Box<bool> = Box(val: true)
-        match bi do case Box(val: _) -> () end
-        match bs do case Box(val: _) -> () end
-        match bb do case Box(val: _) -> () end
+        match bi do | Box(val: _) -> () end
+        match bs do | Box(val: _) -> () end
+        match bb do | Box(val: _) -> () end
         return ()
     end
     "#,
@@ -113,7 +113,7 @@ fn nested_generic_instantiation() {
     let main = fn () -> unit do
         let nested: Box<Box<i64>> = Box(val: Box(val: 42))
         match nested do
-            case Box(val: Box(val: n)) -> return ()
+            | Box(val: Box(val: n)) -> return ()
         end
     end
     "#,
@@ -296,8 +296,8 @@ fn recursive_enum_type() {
 
     let eval = fn (e: Expr) -> i64 do
         match e do
-            case Lit(n) -> return n
-            case Add(left: l, right: r) ->
+            | Lit(n) -> return n
+            | Add(left: l, right: r) ->
                 let a = eval(e: l)
                 let b = eval(e: r)
                 return a + b

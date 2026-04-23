@@ -203,13 +203,13 @@ end
         let mut src = String::from("let main = fn () -> unit do\n");
         for i in 0..depth {
             src.push_str(&format!(
-                "    let x{} = match true do\n        case true ->\n",
+                "    let x{} = match true do\n        | true ->\n",
                 i
             ));
         }
         src.push_str("            ()");
         for _ in 0..depth {
-            src.push_str("\n        case false -> ()\n    end");
+            src.push_str("\n        | false -> ()\n    end");
         }
         src.push_str("\n    return ()\nend\n");
         prop_assert!(
@@ -266,7 +266,7 @@ end
             .map(|i| format!("V{}", i))
             .collect();
         let cases: Vec<String> = (0..count)
-            .map(|i| format!("            case V{} -> return ()", i))
+            .map(|i| format!("            | V{} -> return ()", i))
             .collect();
         let src = format!(
             r#"

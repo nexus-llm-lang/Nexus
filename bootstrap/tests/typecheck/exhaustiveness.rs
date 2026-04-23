@@ -81,9 +81,9 @@ fn test_nested_result_exhaustive() {
     let main = fn () -> unit do
         let x: Result<Result<i64, i64>, i64> = Ok(val: Ok(val: 1))
         match x do
-            case Ok(val: Ok(val: v)) -> return ()
-            case Ok(val: Err(err: e)) -> return ()
-            case Err(err: e) -> return ()
+            | Ok(val: Ok(val: v)) -> return ()
+            | Ok(val: Err(err: e)) -> return ()
+            | Err(err: e) -> return ()
         end
     end
     "#,
@@ -97,9 +97,9 @@ fn test_nested_result_non_exhaustive() {
     let main = fn () -> unit do
         let x: Result<Result<i64, i64>, i64> = Ok(val: Ok(val: 1))
         match x do
-            case Ok(val: Ok(val: v)) -> return ()
+            | Ok(val: Ok(val: v)) -> return ()
             // Missing Ok(val: Err(err: _)) case
-            case Err(err: e) -> return ()
+            | Err(err: e) -> return ()
         end
     end
     "#,
@@ -113,8 +113,8 @@ fn test_bool_exhaustive() {
     let main = fn () -> unit do
         let b = true
         match b do
-            case true -> return ()
-            case false -> return ()
+            | true -> return ()
+            | false -> return ()
         end
     end
     "#,
@@ -128,7 +128,7 @@ fn test_bool_non_exhaustive() {
     let main = fn () -> unit do
         let b = true
         match b do
-            case true -> return ()
+            | true -> return ()
             // Missing false
         end
     end
@@ -143,8 +143,8 @@ fn test_wildcard_exhaustive() {
     let main = fn () -> unit do
         let i = 10
         match i do
-            case 0 -> return ()
-            case _ -> return ()
+            | 0 -> return ()
+            | _ -> return ()
         end
     end
     "#,
@@ -158,8 +158,8 @@ fn test_int_non_exhaustive() {
     let main = fn () -> unit do
         let i = 10
         match i do
-            case 0 -> return ()
-            case 1 -> return ()
+            | 0 -> return ()
+            | 1 -> return ()
             // Missing wildcard for integer
         end
     end
@@ -174,9 +174,9 @@ fn test_record_exhaustive() {
     let main = fn () -> unit do
         let r = { x: true, y: true }
         match r do
-            case { x: true, y: true } -> return ()
-            case { x: true, y: false } -> return ()
-            case { x: false, _ } -> return ()
+            | { x: true, y: true } -> return ()
+            | { x: true, y: false } -> return ()
+            | { x: false, _ } -> return ()
         end
     end
     "#,
@@ -190,7 +190,7 @@ fn test_record_non_exhaustive() {
     let main = fn () -> unit do
         let r = { x: true, y: true }
         match r do
-            case { x: true, y: true } -> return ()
+            | { x: true, y: true } -> return ()
             // Missing cases
         end
     end
@@ -222,8 +222,8 @@ fn test_or_pattern_covers_all_constructors_is_exhaustive() {
     let main = fn () -> unit do
         let c = Red
         match c do
-            case Red | Green -> return ()
-            case Blue -> return ()
+            | Red | Green -> return ()
+            | Blue -> return ()
         end
     end
     "#,
@@ -239,7 +239,7 @@ fn test_or_pattern_missing_constructor_is_non_exhaustive() {
     let main = fn () -> unit do
         let c = Red
         match c do
-            case Red | Green -> return ()
+            | Red | Green -> return ()
         end
     end
     "#,
@@ -255,7 +255,7 @@ fn test_or_pattern_alternatives_must_bind_same_variables() {
     let main = fn () -> unit do
         let e = Left(v: 1)
         match e do
-            case Left(v: v) | Right(v: w) -> return ()
+            | Left(v: v) | Right(v: w) -> return ()
         end
     end
     "#,
@@ -270,7 +270,7 @@ fn test_or_pattern_alternatives_with_same_binding_typechecks() {
 
     let extract = fn (e: Either) -> i64 do
         match e do
-            case Left(v: v) | Right(v: v) -> return v
+            | Left(v: v) | Right(v: v) -> return v
         end
         return 0
     end
@@ -316,10 +316,10 @@ proptest! {
 
         let mut cases = String::new();
         if has_true {
-            cases.push_str("            case true -> return ()\n");
+            cases.push_str("            | true -> return ()\n");
         }
         if has_false {
-            cases.push_str("            case false -> return ()\n");
+            cases.push_str("            | false -> return ()\n");
         }
         let src = format!(
             r#"

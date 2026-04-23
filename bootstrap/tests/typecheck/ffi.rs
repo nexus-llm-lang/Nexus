@@ -58,7 +58,7 @@ fn test_ffi_explicit_type_params() {
       let %a = [| 1, 2, 3 |]
       let r = &%a
       let n = array_len(arr: r)
-      match %a do case _ -> () end
+      match %a do | _ -> () end
       return ()
     end
     "#,

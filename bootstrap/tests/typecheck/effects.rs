@@ -60,9 +60,9 @@ fn test_try_catch_removes_exn() {
             try
                 risky()
             catch
-                    case Oops(msg: msg) -> Console.print(val: msg)
-                    case RuntimeError(val: msg) -> Console.print(val: msg)
-                    case InvalidIndex(val: i) ->
+                    | Oops(msg: msg) -> Console.print(val: msg)
+                    | RuntimeError(val: msg) -> Console.print(val: msg)
+                    | InvalidIndex(val: i) ->
                         let m = from_i64(val: i)
                         Console.print(val: m)
             end
@@ -431,9 +431,9 @@ let main = fn () -> unit require {{ PermConsole }} do
         try
             risky(msg: "{msg}")
         catch
-                case MsgError(val: m) -> Console.print(val: m)
-                case RuntimeError(val: m) -> Console.print(val: m)
-                case InvalidIndex(val: i) ->
+                | MsgError(val: m) -> Console.print(val: m)
+                | RuntimeError(val: m) -> Console.print(val: m)
+                | InvalidIndex(val: i) ->
                     let m = from_i64(val: i)
                     Console.print(val: m)
         end
@@ -460,7 +460,7 @@ let __test_main = fn () -> i64 do
     let %arr = [| {elems} |]
     let arr_ref = &%arr
     let n = array.length(arr: arr_ref)
-    match %arr do case _ -> () end
+    match %arr do | _ -> () end
     return n
 end
 "#
@@ -517,7 +517,7 @@ end
             r#"
 let main = fn () -> unit do
     let %x = {n}
-    match %x do case _ -> () end
+    match %x do | _ -> () end
     return ()
 end
 "#
@@ -545,8 +545,8 @@ end
             r#"
 let main = fn () -> unit do
     let %x = {n}
-    match %x do case _ -> () end
-    match %x do case _ -> () end
+    match %x do | _ -> () end
+    match %x do | _ -> () end
     return ()
 end
 "#
@@ -582,7 +582,7 @@ let __test_main = fn () -> i64 do
     let a = peek(x: x_ref1)
     let x_ref2 = &%x
     let b = peek(x: x_ref2)
-    match %x do case _ -> () end
+    match %x do | _ -> () end
     return a + b
 end
 "#
@@ -595,13 +595,13 @@ end
         let src = format!(
             r#"
 let consume = fn (x: %i64) -> i64 do
-    match x do case _ -> () end
+    match x do | _ -> () end
     return 1
 end
 
 let main = fn () -> unit do
     let y = consume(x: {n})
-    match y do case _ -> () end
+    match y do | _ -> () end
     return ()
 end
 "#
@@ -617,7 +617,7 @@ end
 let main = fn () -> unit do
     let %x = {n}
     if {cond} then
-        match %x do case _ -> () end
+        match %x do | _ -> () end
     else
         ()
     end
@@ -639,10 +639,10 @@ fn test_selective_catch_constructor_field_binding() {
       try
         raise Boom(code: 42)
       catch
-        case Boom(code: code) ->
+        | Boom(code: code) ->
           let x: i64 = code
           return ()
-        case _ -> return ()
+        | _ -> return ()
       end
       return ()
     end
@@ -661,9 +661,9 @@ fn test_selective_catch_multiple_exceptions() {
       try
         raise Boom(code: 42)
       catch
-        case Boom(code: code) -> return ()
-        case Oops(msg: msg) -> return ()
-        case _ -> return ()
+        | Boom(code: code) -> return ()
+        | Oops(msg: msg) -> return ()
+        | _ -> return ()
       end
       return ()
     end
@@ -681,10 +681,10 @@ fn test_selective_catch_wrong_field_type_fails() {
       try
         raise Boom(code: 42)
       catch
-        case Boom(code: code) ->
+        | Boom(code: code) ->
           let x: string = code
           return ()
-        case _ -> return ()
+        | _ -> return ()
       end
       return ()
     end
@@ -720,7 +720,7 @@ fn test_exception_group_catch_matches_any_member() {
       try
         raise NotFound(path: "/tmp/x")
       catch
-        case IOError -> return ()
+        | IOError -> return ()
       end
       return ()
     end
@@ -740,7 +740,7 @@ fn test_exception_group_catch_executes() {
       try
         raise NotFound(path: "/tmp/x")
       catch
-        case IOError -> return ()
+        | IOError -> return ()
       end
       return ()
     end
@@ -760,7 +760,7 @@ fn test_exception_group_catch_second_member() {
       try
         raise PermDenied(path: "/etc/shadow")
       catch
-        case IOError -> return ()
+        | IOError -> return ()
       end
       return ()
     end
@@ -801,7 +801,7 @@ fn test_exception_group_catch_with_wildcard() {
       try
         raise Boom(code: 42)
       catch
-        case Errors -> return ()
+        | Errors -> return ()
       end
       return ()
     end

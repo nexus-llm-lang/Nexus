@@ -69,8 +69,8 @@ fn snapshot_type_mismatch_match_arms() {
         r#"
     let main = fn () -> unit do
         let x: i64 = match true do
-            case true -> 1
-            case false -> "zero"
+            | true -> 1
+            | false -> "zero"
         end
         return ()
     end
@@ -194,8 +194,8 @@ fn snapshot_linear_double_consume() {
         r#"
     let main = fn () -> unit do
         let %x = { id: 1 }
-        match %x do case _ -> () end
-        match %x do case _ -> () end
+        match %x do | _ -> () end
+        match %x do | _ -> () end
         return ()
     end
     "#,
@@ -210,7 +210,7 @@ fn snapshot_linear_branch_mismatch() {
     let main = fn () -> unit do
         let %x = { id: 1 }
         if true then
-            match %x do case _ -> () end
+            match %x do | _ -> () end
         else
             ()
         end
@@ -270,7 +270,7 @@ fn snapshot_match_non_exhaustive_option() {
     let main = fn () -> unit do
         let x: Option<i64> = Some(val: 1)
         match x do
-            case Some(val: v) -> return ()
+            | Some(val: v) -> return ()
         end
     end
     "#,
@@ -285,7 +285,7 @@ fn snapshot_match_non_exhaustive_bool() {
     let main = fn () -> unit do
         let b = true
         match b do
-            case true -> return ()
+            | true -> return ()
         end
     end
     "#,
@@ -302,8 +302,8 @@ fn snapshot_match_non_exhaustive_enum() {
     let main = fn () -> unit do
         let c: Color = Red
         match c do
-            case Red -> return ()
-            case Green -> return ()
+            | Red -> return ()
+            | Green -> return ()
         end
     end
     "#,

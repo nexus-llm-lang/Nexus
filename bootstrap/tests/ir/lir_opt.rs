@@ -246,8 +246,8 @@ type Entry = Entry(name: string, val: i64)
 
 let lookup = fn (key: string, entries: [Entry]) -> i64 do
   match entries do
-    case [] -> return 0 - 1
-    case Entry(name: n, val: v) :: rest ->
+    | [] -> return 0 - 1
+    | Entry(name: n, val: v) :: rest ->
       if n == key then return v end
       return lookup(key: key, entries: rest)
   end
@@ -281,8 +281,8 @@ type SubstEntry = SubstEntry(name: string, atom: LirAtom)
 
 let opt_lookup = fn (name: string, entries: [SubstEntry]) -> Option<LirAtom> do
   match entries do
-    case [] -> return None
-    case SubstEntry(name: n, atom: a) :: rest ->
+    | [] -> return None
+    | SubstEntry(name: n, atom: a) :: rest ->
       if n == name then return Some(val: a) end
       return opt_lookup(name: name, entries: rest)
   end
@@ -291,8 +291,8 @@ end
 let main = fn () -> unit do
   let entries = [SubstEntry(name: "x", atom: AtomInt(val: 42))]
   match opt_lookup(name: "x", entries: entries) do
-    case Some(val: _) -> ()
-    case None -> ()
+    | Some(val: _) -> ()
+    | None -> ()
   end
 end
 "#;
@@ -312,8 +312,8 @@ type Pair = Pair(first: i64, second: i64)
 
 let sum_pairs = fn (pairs: [Pair]) -> i64 do
   match pairs do
-    case [] -> return 0
-    case Pair(first: a, second: b) :: rest ->
+    | [] -> return 0
+    | Pair(first: a, second: b) :: rest ->
       return a + b + sum_pairs(pairs: rest)
   end
 end
@@ -339,8 +339,8 @@ type Entry = Entry(name: string, val: i64)
 
 let lookup = fn (key: string, entries: [Entry]) -> i64 do
   match entries do
-    case [] -> return 0 - 1
-    case Entry(name: n, val: v) :: rest ->
+    | [] -> return 0 - 1
+    | Entry(name: n, val: v) :: rest ->
       if n == key then return v end
       return lookup(key: key, entries: rest)
   end
@@ -369,8 +369,8 @@ type FoldResult = FoldResult(stmts: [i64], subst: [SubstEntry])
 
 let opt_lookup = fn (name: string, entries: [SubstEntry]) -> Option<i64> do
   match entries do
-    case [] -> return None
-    case SubstEntry(name: n, atom: a) :: rest ->
+    | [] -> return None
+    | SubstEntry(name: n, atom: a) :: rest ->
       if n == name then return Some(val: a) end
       return opt_lookup(name: name, entries: rest)
   end
@@ -379,8 +379,8 @@ end
 let main = fn () -> unit do
   let entries = [SubstEntry(name: "x", atom: 42)]
   match opt_lookup(name: "x", entries: entries) do
-    case Some(val: _) -> ()
-    case None -> ()
+    | Some(val: _) -> ()
+    | None -> ()
   end
 end
 "#;
@@ -404,8 +404,8 @@ type SubstEntry = SubstEntry(name: string, atom: LirAtom)
 
 let opt_lookup = fn (name: string, entries: [SubstEntry]) -> Option<LirAtom> do
   match entries do
-    case [] -> return None
-    case SubstEntry(name: n, atom: a) :: rest ->
+    | [] -> return None
+    | SubstEntry(name: n, atom: a) :: rest ->
       if n == name then return Some(val: a) end
       return opt_lookup(name: name, entries: rest)
   end
@@ -413,8 +413,8 @@ end
 
 let opt_has_name = fn (name: string, names: [string]) -> bool do
   match names do
-    case [] -> return false
-    case nm :: rest ->
+    | [] -> return false
+    | nm :: rest ->
       if nm == name then return true end
       return opt_has_name(name: name, names: rest)
   end
@@ -423,8 +423,8 @@ end
 let main = fn () -> unit do
   let entries = [SubstEntry(name: "x", atom: LirAtomInt(val: 42))]
   match opt_lookup(name: "x", entries: entries) do
-    case Some(val: _) -> ()
-    case None -> ()
+    | Some(val: _) -> ()
+    | None -> ()
   end
 end
 "#;
@@ -448,8 +448,8 @@ type FoldResult = FoldResult(stmts: [i64], subst: [SubstEntry])
 
 let opt_lookup = fn (name: string, entries: [SubstEntry]) -> Option<LirAtom> do
   match entries do
-    case [] -> return None
-    case SubstEntry(name: n, atom: a) :: rest ->
+    | [] -> return None
+    | SubstEntry(name: n, atom: a) :: rest ->
       if n == name then return Some(val: a) end
       return opt_lookup(name: name, entries: rest)
   end
@@ -457,8 +457,8 @@ end
 
 let opt_has_name = fn (name: string, names: [string]) -> bool do
   match names do
-    case [] -> return false
-    case nm :: rest ->
+    | [] -> return false
+    | nm :: rest ->
       if nm == name then return true end
       return opt_has_name(name: name, names: rest)
   end
@@ -467,8 +467,8 @@ end
 let main = fn () -> unit do
   let entries = [SubstEntry(name: "x", atom: LirAtomInt(val: 42))]
   match opt_lookup(name: "x", entries: entries) do
-    case Some(val: _) -> ()
-    case None -> ()
+    | Some(val: _) -> ()
+    | None -> ()
   end
   let r = opt_has_name(name: "x", names: ["a", "b", "x"])
 end

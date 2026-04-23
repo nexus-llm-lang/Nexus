@@ -6,7 +6,7 @@ fn test_array_type_mismatch() {
         r#"
     let main = fn () -> unit do
         let %arr = [| 1, true |]
-        match %arr do case _ -> () end
+        match %arr do | _ -> () end
         return ()
     end
     "#,
@@ -35,7 +35,7 @@ fn test_array_assignment_mismatch() {
     let main = fn () -> unit do
         let %arr = [| 1, 2 |]
         %arr[0] <- true
-        match %arr do case _ -> () end
+        match %arr do | _ -> () end
         return ()
     end
     "#,
@@ -70,7 +70,7 @@ fn test_array_consume_with_proper_consumer_passes() {
     import * as array from "stdlib/array.nx"
 
     let consume_record = fn (%val: { id: i64 }) -> unit do
-        match %val do case { id: _ } -> () end
+        match %val do | { id: _ } -> () end
         return ()
     end
 
