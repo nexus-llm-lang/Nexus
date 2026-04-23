@@ -219,6 +219,45 @@ let sum2 = fn (xs: [ i64 ]) -> i64 do
 end
 ```
 
+## Preferred Writing Style
+
+These are style preferences beyond correctness — both forms compile, but the left-hand form is idiomatic in this codebase.
+
+### 1. `let` destructuring over single-arm `match`
+When a value has exactly one shape (a record, a single-constructor ADT, or a known-tuple), destructure with `let` instead of a trivial `match`.
+
+```nexus
+// PREFER
+let { x: x, y: y } = point
+let Some(val: v) = must_exist
+
+// AVOID — single-arm match adds noise
+match point do
+  case { x: x, y: y } -> ...
+end
+```
+
+### 2. Collapse staircase `match` — nest patterns + aggressive `_`
+Fuse nested `match` arms into a single pattern. Use a trailing bare `_` to ignore all remaining record/constructor fields rather than binding and discarding them.
+
+```nexus
+// PREFER — one arm, nested pattern, _ swallows the rest
+match res do
+  case Ok(val: Some(val: v)) -> use(x: v)
+  case _ -> fallback()
+end
+
+// AVOID — staircase of matches
+match res do
+  case Ok(val: inner) ->
+    match inner do
+      case Some(val: v) -> use(x: v)
+      case None -> fallback()
+    end
+  case Err(err: _) -> fallback()
+end
+```
+
 ## Anti-Patterns to Avoid
 
 | Avoid | Use Instead |

@@ -207,6 +207,27 @@ The patterns at work:
 
 The WASM module is responsible for managing the actual state behind the handle (e.g., an ID-keyed table). Nexus only sees the `i64` handle value.
 
+### Organizing Bindings — One Wrapper File per WASM Module
+
+**Keep every `import external "foo.wasm"` and its `external` declarations confined to a single `.nx` file** — a thin wrapper module — and have all other code depend on that wrapper instead of re-declaring the bindings.
+
+```
+stdlib/
+  array.nx          // import external "array.wasm" + external __nx_* + typed wrappers
+  string.nx         // import external "string.wasm" + external __nx_* + typed wrappers
+  ...
+app/
+  main.nx           // import * as arr from "stdlib/array.nx"  — no `external` here
+```
+
+Why this matters:
+
+- **Single source of truth for the ABI.** Parameter order, encoding, and WASM export names are fragile (see [Labeled Argument Reordering](#labeled-argument-reordering)). Declaring the same binding in two files invites them to drift.
+- **Linear/borrow discipline lives in the wrapper.** Raw `external` functions traffic in plain `i64` handles; the wrapper is where `%T` / `&T` / opaque types re-establish safety. Callers should never see the raw `__nx_*` form.
+- **`wasm-merge` inlining is per-module.** One wrapper file means one place where the `.wasm` blob is linked, avoiding duplicate symbol work at build time.
+
+Rule of thumb: if a non-wrapper `.nx` file contains the keyword `external`, that's a smell — extract the bindings into a dedicated wrapper module.
+
 ### Linking
 
 The compiler resolves `import external "mylib.wasm"` at build time via `wasm-merge`. The referenced `.wasm` file path is relative to the importing `.nx` file. After merging, the final binary has no unresolved imports — all external functions are inlined.
