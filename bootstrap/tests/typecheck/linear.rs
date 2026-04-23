@@ -130,7 +130,7 @@ fn test_linear_borrow_basic() {
     should_typecheck(
         r#"
     import { Console }, * as stdio from "stdlib/stdio.nx"
-    import { from_i64 } from "stdlib/string.nx"
+    import { from_i64 } from "stdlib/string_ops.nx"
     let peek = fn (x: &i64) -> unit require { Console } do
         let msg = from_i64(val: x)
         Console.print(val: msg)

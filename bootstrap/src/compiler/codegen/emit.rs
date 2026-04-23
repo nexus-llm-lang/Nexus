@@ -408,7 +408,7 @@ mod abi_tests {
 
     #[test]
     fn http_respond_signature_lowers_to_net_lib_rs_binding() {
-        // Mirrors nxlib/stdlib/net.nx:31 declaration exactly.
+        // Mirrors nxlib/stdlib/network.nx:31 declaration exactly.
         let ext = packed_external(
             vec![
                 param("req_id", Type::I64),
@@ -443,7 +443,7 @@ mod abi_tests {
 
     #[test]
     fn http_request_packed_abi_returns_i64_packed_string() {
-        // nxlib/stdlib/net.nx:28 — returns string, file-path module → Packed ABI.
+        // nxlib/stdlib/network.nx:28 — returns string, file-path module → Packed ABI.
         let ext = packed_external(
             vec![
                 param("method", Type::String),

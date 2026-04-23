@@ -303,7 +303,7 @@ fn soundness_list_operations() {
 #[test]
 fn soundness_string_stdlib() {
     let src = r#"
-    import { from_i64, length } from "stdlib/string.nx"
+    import { from_i64, length } from "stdlib/string_ops.nx"
 
     let main = fn () -> unit do
         let s = from_i64(val: 42)

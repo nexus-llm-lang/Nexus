@@ -7,7 +7,7 @@ fn net_server_types_check() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     should_typecheck(
         r#"
-    import { Net }, * as net_mod from "stdlib/net.nx"
+    import { Net }, * as net_mod from "stdlib/network.nx"
 
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
@@ -29,7 +29,7 @@ fn net_server_opaque_server_cannot_construct_externally() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let err = should_fail_typecheck(
         r#"
-    import { Net }, * as net_mod from "stdlib/net.nx"
+    import { Net }, * as net_mod from "stdlib/network.nx"
 
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
@@ -48,7 +48,7 @@ fn net_server_linear_leak_is_rejected() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let err = should_fail_typecheck(
         r#"
-    import { Net }, * as net_mod from "stdlib/net.nx"
+    import { Net }, * as net_mod from "stdlib/network.nx"
 
     let leak = fn () -> unit require { Net } throws { Exn } do
       let server = Net.listen(addr: "127.0.0.1:0")
@@ -75,7 +75,7 @@ fn net_requires_inject() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let err = should_fail_typecheck(
         r#"
-    import { Net } from "stdlib/net.nx"
+    import { Net } from "stdlib/network.nx"
 
     let main = fn () -> string do
       let body = Net.get(url: "https://example.com")
@@ -91,8 +91,8 @@ fn net_respond_returns_unit_effect_exn() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     should_typecheck(
         r#"
-import { Net }, * as net_mod from "stdlib/net.nx"
-import { length } from "stdlib/string.nx"
+import { Net }, * as net_mod from "stdlib/network.nx"
+import { length } from "stdlib/string_ops.nx"
 
 let main = fn () -> unit require { PermNet } do
   inject net_mod.system_handler do

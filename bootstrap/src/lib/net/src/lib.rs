@@ -1,6 +1,6 @@
 //! WASM bindings called from Nexus `external` declarations in
-//! nxlib/stdlib/net.nx. The Rust-level signatures here are the lowered form
-//! of the higher-level Nexus types — see nxlib/stdlib/net.nx for the contract
+//! nxlib/stdlib/network.nx. The Rust-level signatures here are the lowered form
+//! of the higher-level Nexus types — see nxlib/stdlib/network.nx for the contract
 //! and bootstrap/src/compiler/codegen/emit.rs `abi_tests` for the pin.
 //!
 //! Lowering summary:
