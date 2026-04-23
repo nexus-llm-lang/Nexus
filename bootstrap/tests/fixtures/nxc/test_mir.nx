@@ -4,8 +4,10 @@ import { HirExprKind, HirStmtKind, HirCallArg, HirParam, HirFunction,
          HirPort, HirPortMethod, HirExternal, HirHandlerBinding,
          HirHandlerBindingEntry, HirProgram, HirMatchCase, HirPatternKind,
          HirNamedExpr, HirExpr, HirStmt, HirBody, EagerBody } from "src/ir/hir_types.nx"
-import { MirProgram, MirFunction, MirExpr, MirStmt, MirMatchCase, MirPattern } from "src/ir/mir_types.nx"
+import { MirProgram, MirFunction, MirParam, MirExpr, MirStmt, MirMatchCase, MirPattern } from "src/ir/mir_types.nx"
 import { lower_hir_to_mir } from "src/ir/mir.nx"
+import * as str from "stdlib/string_ops.nx"
+import * as list from "stdlib/list.nx"
 
 let assert = fn (cond: bool, msg: string) -> unit throws { Exn } do
   if cond then return ()
@@ -81,10 +83,31 @@ let test_port_call = fn () -> unit throws { Exn } do
   end
 end
 
-// ─── Test 3: Lambda lowered to unit ─────────────────────────────────────────
+// ─── Test 3: Inline lambda lifted to __closure_* MIR function ────────────────
 
-let test_lambda_unit = fn () -> unit throws { Exn } do
-  // Build: let f = fn (x) -> x end (lambda should be lowered to Unit in MIR)
+/// Find the first function whose name starts with the given prefix.
+let find_func_by_prefix = fn (funcs: [MirFunction], prefix: string) -> MirFunction throws { Exn } do
+  match funcs do
+    case [] -> raise RuntimeError(val: "find_func_by_prefix: no match for " ++ prefix)
+    case f :: rest ->
+      let MirFunction(name: n, _) = f
+      if str.starts_with(s: n, prefix: prefix) then return f end
+      return find_func_by_prefix(funcs: rest, prefix: prefix)
+  end
+end
+
+/// Extract the MirMakeClosure expression from a `let <name> = MakeClosure(...)`
+/// statement, raising if it isn't shaped that way.
+let expect_make_closure = fn (stmt: MirStmt, expected_name: string) -> MirExpr throws { Exn } do
+  let MirStmtLet(name: ln, typ: _, expr: e) = stmt
+  assert(cond: ln == expected_name,
+    msg: "expect_make_closure: Let name mismatch, got " ++ ln)
+  return e
+end
+
+/// Non-capturing lambda: `let f = fn (x) -> x` should produce a
+/// MirMakeClosure expression and a new top-level lifted MirFunction.
+let test_lambda_lifted = fn () -> unit throws { Exn } do
   let lambda = Lambda(
     type_params: [],
     params: [HirParam(name: "x", label: "x", typ: TyI64)],
@@ -97,15 +120,72 @@ let test_lambda_unit = fn () -> unit throws { Exn } do
   ]
   let main_fn = HirFunction(name: "main", type_params: [], params: [], ret_type: TyUnit,
     body: EagerBody(stmts: main_body), span: dummy_span())
-  let hir = HirProgram(
-    ports: [], functions: [main_fn],
-    externals: [], handler_bindings: [], enum_defs: []
+  let hir = HirProgram(ports: [], functions: [main_fn],
+    externals: [], handler_bindings: [], enum_defs: [])
+  let MirProgram(functions: mir_funcs, externals: _) = lower_hir_to_mir(hir: hir)
+  let MirFunction(name: mname, body: main_body2, _) = list.head(xs: mir_funcs)
+  assert(cond: mname == "main", msg: "lambda: first fn must be main")
+  let closure_expr = expect_make_closure(stmt: list.head(xs: main_body2), expected_name: "f")
+  match closure_expr do
+    case MirMakeClosure(func_name: fname, captures: []) ->
+      assert(cond: str.starts_with(s: fname, prefix: "__closure_"),
+        msg: "lambda: MirMakeClosure func_name must start with __closure_")
+      let lifted = find_func_by_prefix(funcs: mir_funcs, prefix: "__closure_")
+      match lifted do
+        case MirFunction(name: ln, params: lps, ret_type: _, body: _, span: _) ->
+          assert(cond: ln == fname, msg: "lambda: lifted fn name must match closure")
+          match list.head(xs: lps) do
+            case MirParam(label: _, name: env_name, typ: _) ->
+              assert(cond: env_name == "__env", msg: "lambda: lifted fn's first param must be __env")
+          end
+      end
+    case _ -> raise RuntimeError(val: "lambda: expected MirMakeClosure with no captures")
+  end
+end
+
+/// Capturing lambda: `let y = 10; let f = fn (x) -> x + y` captures `y`.
+/// Expect MirMakeClosure with one capture, and the lifted body must start with
+/// `let y = MirEnvLoad("__env", 0)` so references to y resolve via env.
+let test_lambda_captures = fn () -> unit throws { Exn } do
+  let lambda = Lambda(
+    type_params: [],
+    params: [HirParam(name: "x", label: "x", typ: TyI64)],
+    ret_type: TyI64,
+    body: [ss(s: Return(expr: se(e: BinOp(
+      left: se(e: Variable(name: "x", sigil: SigilImmutable)),
+      op: OpAdd,
+      right: se(e: Variable(name: "y", sigil: SigilImmutable))
+    ))))]
   )
-  let mir = lower_hir_to_mir(hir: hir)
-  match mir do
-    case MirProgram(functions: MirFunction(body: MirStmtLet(name: n, expr: MirLiteral(lit: LitUnit), _) :: _, _) :: _, _) ->
-      assert(cond: n == "f", msg: "lambda: expected let f = Unit as first stmt")
-    case _ -> raise RuntimeError(val: "lambda: expected first fn body to start with `let f = Unit`")
+  let main_body = [
+    ss(s: Let(name: "y", typ: Some(val: TyI64), value: se(e: Literal(lit: LitInt(val: 10))))),
+    ss(s: Let(name: "f", typ: None, value: se(e: lambda))),
+    ss(s: Return(expr: se(e: Literal(lit: LitUnit))))
+  ]
+  let main_fn = HirFunction(name: "main", type_params: [], params: [], ret_type: TyUnit,
+    body: EagerBody(stmts: main_body), span: dummy_span())
+  let hir = HirProgram(ports: [], functions: [main_fn],
+    externals: [], handler_bindings: [], enum_defs: [])
+  let MirProgram(functions: mir_funcs, externals: _) = lower_hir_to_mir(hir: hir)
+  let MirFunction(body: main_body2, _) = list.head(xs: mir_funcs)
+  // main's 2nd stmt is `let f = ...`; inspect only its MakeClosure captures.
+  let closure_expr = expect_make_closure(
+    stmt: list.head(xs: list.tail(xs: main_body2)),
+    expected_name: "f"
+  )
+  match closure_expr do
+    case MirMakeClosure(func_name: _, captures: MirVariable(name: cap_name) :: []) ->
+      assert(cond: cap_name == "y", msg: "captures: capture must be MirVariable(y)")
+    case _ -> raise RuntimeError(val: "captures: expected MirMakeClosure with one MirVariable capture")
+  end
+  let lifted = find_func_by_prefix(funcs: mir_funcs, prefix: "__closure_")
+  let MirFunction(body: lb, _) = lifted
+  match list.head(xs: lb) do
+    case MirStmtLet(name: bind_name, typ: _, expr: MirEnvLoad(env_var: env, index: idx)) ->
+      assert(cond: bind_name == "y", msg: "captures: lifted preamble must bind y")
+      assert(cond: env == "__env", msg: "captures: env var must be __env")
+      assert(cond: idx == 0, msg: "captures: index must be 0 for first capture")
+    case _ -> raise RuntimeError(val: "captures: lifted body first stmt must be Let from MirEnvLoad")
   end
 end
 
@@ -221,7 +301,8 @@ end
 let main = fn () -> unit throws { Exn } do
   test_basic()
   test_port_call()
-  test_lambda_unit()
+  test_lambda_lifted()
+  test_lambda_captures()
   test_library_module_port_fallback()
   test_param_call_to_closure()
   test_known_function_stays_mir_call()
