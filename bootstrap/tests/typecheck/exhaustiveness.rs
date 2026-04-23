@@ -213,6 +213,76 @@ fn test_enum_non_exhaustive() {
     );
 }
 
+#[test]
+fn test_or_pattern_covers_all_constructors_is_exhaustive() {
+    should_typecheck(
+        r#"
+    type Color = Red | Green | Blue
+
+    let main = fn () -> unit do
+        let c = Red
+        match c do
+            case Red | Green -> return ()
+            case Blue -> return ()
+        end
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_or_pattern_missing_constructor_is_non_exhaustive() {
+    should_fail_typecheck(
+        r#"
+    type Color = Red | Green | Blue
+
+    let main = fn () -> unit do
+        let c = Red
+        match c do
+            case Red | Green -> return ()
+        end
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_or_pattern_alternatives_must_bind_same_variables() {
+    should_fail_typecheck(
+        r#"
+    type Either = Left(v: i64) | Right(v: i64)
+
+    let main = fn () -> unit do
+        let e = Left(v: 1)
+        match e do
+            case Left(v: v) | Right(v: w) -> return ()
+        end
+    end
+    "#,
+    );
+}
+
+#[test]
+fn test_or_pattern_alternatives_with_same_binding_typechecks() {
+    should_typecheck(
+        r#"
+    type Either = Left(v: i64) | Right(v: i64)
+
+    let extract = fn (e: Either) -> i64 do
+        match e do
+            case Left(v: v) | Right(v: v) -> return v
+        end
+        return 0
+    end
+
+    let main = fn () -> unit do
+        let _ = extract(e: Left(v: 1))
+        return ()
+    end
+    "#,
+    );
+}
+
 const COLOR_VARIANTS: [&str; 3] = ["Red", "Green", "Blue"];
 
 proptest! {

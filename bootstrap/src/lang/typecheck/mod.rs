@@ -2335,6 +2335,71 @@ impl TypeChecker {
                 }
                 Ok(sub)
             }
+            Pattern::Or(alts) => {
+                if alts.is_empty() {
+                    return Err(TypeError::new(
+                        "or-pattern must have at least one alternative",
+                        p.span.clone(),
+                    ));
+                }
+                let saved_vars = env.vars.clone();
+                let saved_linear = env.linear_vars.clone();
+                let mut acc_subst = HashMap::new();
+                let mut first_bindings: Option<Vec<(String, Scheme)>> = None;
+                for (i, alt) in alts.iter().enumerate() {
+                    env.vars = saved_vars.clone();
+                    env.linear_vars = saved_linear.clone();
+                    let s = self.bind_pattern(alt, tt, env)?;
+                    acc_subst = compose_subst(&acc_subst, &s);
+                    let mut new_bindings: Vec<(String, Scheme)> = env
+                        .vars
+                        .iter()
+                        .filter(|(k, _)| !saved_vars.contains_key(*k))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    new_bindings.sort_by(|a, b| a.0.cmp(&b.0));
+                    match &first_bindings {
+                        None => first_bindings = Some(new_bindings),
+                        Some(first) => {
+                            let first_keys: Vec<&String> =
+                                first.iter().map(|(k, _)| k).collect();
+                            let curr_keys: Vec<&String> =
+                                new_bindings.iter().map(|(k, _)| k).collect();
+                            if first_keys != curr_keys {
+                                return Err(TypeError::new(
+                                    format!(
+                                        "or-pattern alternatives bind different variables: \
+                                         alternative 0 binds {:?}, alternative {} binds {:?}",
+                                        first_keys, i, curr_keys
+                                    ),
+                                    p.span.clone(),
+                                ));
+                            }
+                            for ((name, fs), (_, cs)) in first.iter().zip(new_bindings.iter()) {
+                                let s = self.unify(&fs.typ, &cs.typ).map_err(|m| {
+                                    TypeError::new(
+                                        format!(
+                                            "or-pattern alternatives give variable `{}` \
+                                             incompatible types: {}",
+                                            name, m
+                                        ),
+                                        p.span.clone(),
+                                    )
+                                })?;
+                                acc_subst = compose_subst(&acc_subst, &s);
+                            }
+                        }
+                    }
+                }
+                env.vars = saved_vars;
+                env.linear_vars = saved_linear;
+                if let Some(bindings) = first_bindings {
+                    for (k, scheme) in bindings {
+                        env.insert(k, scheme);
+                    }
+                }
+                Ok(acc_subst)
+            }
         }
     }
 

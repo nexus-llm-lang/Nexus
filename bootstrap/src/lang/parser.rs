@@ -587,6 +587,28 @@ impl Parser {
         }
     }
 
+    /// Parse a pattern that may be an or-pattern: `p1 | p2 | ... | pn`.
+    /// Cons (`::`) binds tighter than `|`, so `1 :: rest | []` parses as
+    /// `(1 :: rest) | []`. Used in match/catch arm headers where or-patterns
+    /// are top-level. Nested or-patterns require parentheses.
+    fn parse_pattern_or(&mut self) -> Result<Spanned<Pattern>, ParseError> {
+        let first = self.parse_pattern()?;
+        if !matches!(self.peek(), TokenKind::Pipe) {
+            return Ok(first);
+        }
+        let start = first.span.start;
+        let mut alts = vec![first];
+        while matches!(self.peek(), TokenKind::Pipe) {
+            self.advance();
+            alts.push(self.parse_pattern()?);
+        }
+        let end = alts.last().unwrap().span.end;
+        Ok(Spanned {
+            node: Pattern::Or(alts),
+            span: start..end,
+        })
+    }
+
     fn parse_atom_pattern(&mut self) -> Result<Spanned<Pattern>, ParseError> {
         let start = self.peek_span().start;
 
@@ -877,7 +899,8 @@ impl Parser {
             TokenKind::StarDot => Some(BinaryOp::FMul),
             TokenKind::SlashDot => Some(BinaryOp::FDiv),
             TokenKind::Ampersand => Some(BinaryOp::BitAnd),
-            TokenKind::Pipe => Some(BinaryOp::BitOr),
+            // Pipe (`|`) is reserved for pattern syntax (or-patterns and match/catch
+            // arm separators). Bitwise-or must use the stdlib `int.bor` function.
             TokenKind::Caret => Some(BinaryOp::BitXor),
             TokenKind::Shl => Some(BinaryOp::Shl),
             TokenKind::Shr => Some(BinaryOp::Shr),
@@ -1213,6 +1236,7 @@ impl Parser {
             }
 
             // Match expression: match expr do case pat -> body ... end
+            // Or with the new arm-separator syntax: match expr do | pat -> body ... end
             TokenKind::Match => {
                 self.advance();
                 let target = self.parse_expr()?;
@@ -1221,9 +1245,9 @@ impl Parser {
                     self.advance();
                 }
                 let mut cases = Vec::new();
-                while matches!(self.peek(), TokenKind::Case) {
+                while matches!(self.peek(), TokenKind::Case | TokenKind::Pipe) {
                     self.advance();
-                    let pattern = self.parse_pattern()?;
+                    let pattern = self.parse_pattern_or()?;
                     self.expect(&TokenKind::Arrow)?;
                     let body = self.parse_stmt_list()?;
                     cases.push(MatchCase { pattern, body });
@@ -1509,12 +1533,15 @@ impl Parser {
     fn parse_stmt_list(&mut self) -> Result<Vec<Spanned<Stmt>>, ParseError> {
         let mut stmts = Vec::new();
         loop {
-            // Check for terminators
+            // Check for terminators. `Pipe` is a terminator because it starts
+            // the next match/catch arm under the new `| pat -> body` syntax,
+            // alongside the legacy `case` form.
             match self.peek() {
                 TokenKind::End
                 | TokenKind::Else
                 | TokenKind::Catch
                 | TokenKind::Case
+                | TokenKind::Pipe
                 | TokenKind::Eof => break,
                 _ => {}
             }
@@ -1718,9 +1745,9 @@ impl Parser {
         self.expect(&TokenKind::Do)?;
 
         let mut cases = Vec::new();
-        while matches!(self.peek(), TokenKind::Case) {
+        while matches!(self.peek(), TokenKind::Case | TokenKind::Pipe) {
             self.advance();
-            let pattern = self.parse_pattern()?;
+            let pattern = self.parse_pattern_or()?;
             self.expect(&TokenKind::Arrow)?;
             let body = self.parse_stmt_list()?;
             cases.push(MatchCase { pattern, body });
@@ -1792,8 +1819,9 @@ impl Parser {
         let body = self.parse_stmt_list()?;
         self.expect(&TokenKind::Catch)?;
 
-        let catch_arms = if matches!(self.peek(), TokenKind::Case) {
+        let catch_arms = if matches!(self.peek(), TokenKind::Case | TokenKind::Pipe) {
             // Selective catch: catch case Pattern -> body case Pattern -> body ...
+            // (or | Pattern -> body | Pattern -> body ...)
             self.parse_catch_arms()?
         } else {
             // Legacy catch: catch param -> body
@@ -1822,9 +1850,9 @@ impl Parser {
 
     fn parse_catch_arms(&mut self) -> Result<Vec<CatchArm>, ParseError> {
         let mut arms = Vec::new();
-        while matches!(self.peek(), TokenKind::Case) {
-            self.advance(); // consume 'case'
-            let pattern = self.parse_pattern()?;
+        while matches!(self.peek(), TokenKind::Case | TokenKind::Pipe) {
+            self.advance(); // consume 'case' or '|'
+            let pattern = self.parse_pattern_or()?;
             self.expect(&TokenKind::Arrow)?;
             let body = self.parse_stmt_list()?;
             arms.push(CatchArm { pattern, body });

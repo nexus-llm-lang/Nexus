@@ -1344,3 +1344,152 @@ end
 "#,
     );
 }
+
+#[test]
+fn codegen_match_or_pattern_literal_alternates() {
+    exec(
+        r#"
+let check = fn (x: i64) -> i64 do
+    match x do
+      case 1 | 2 | 3 -> return 100
+      case _ -> return 0
+    end
+    return -1
+end
+
+let main = fn () -> unit do
+    if check(x: 1) != 100 then raise RuntimeError(val: "expected 100 for 1") end
+    if check(x: 2) != 100 then raise RuntimeError(val: "expected 100 for 2") end
+    if check(x: 3) != 100 then raise RuntimeError(val: "expected 100 for 3") end
+    if check(x: 4) != 0 then raise RuntimeError(val: "expected 0 for 4") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_match_or_pattern_constructor_alternates() {
+    exec(
+        r#"
+type Sign = Pos | Neg | Zero
+
+let classify = fn (s: Sign) -> i64 do
+    match s do
+      case Pos | Neg -> return 1
+      case Zero -> return 0
+    end
+    return -1
+end
+
+let main = fn () -> unit do
+    if classify(s: Pos) != 1 then raise RuntimeError(val: "expected 1 for Pos") end
+    if classify(s: Neg) != 1 then raise RuntimeError(val: "expected 1 for Neg") end
+    if classify(s: Zero) != 0 then raise RuntimeError(val: "expected 0 for Zero") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_match_or_pattern_with_shared_binding() {
+    exec(
+        r#"
+type Either = Left(v: i64) | Right(v: i64)
+
+let extract = fn (e: Either) -> i64 do
+    match e do
+      case Left(v: v) | Right(v: v) -> return v
+    end
+    return -1
+end
+
+let main = fn () -> unit do
+    if extract(e: Left(v: 7)) != 7 then raise RuntimeError(val: "expected 7 for Left(7)") end
+    if extract(e: Right(v: 99)) != 99 then raise RuntimeError(val: "expected 99 for Right(99)") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_match_with_pipe_arm_separator_runs() {
+    exec(
+        r#"
+let check = fn (x: i64) -> i64 do
+    match x do
+      | 1 -> return 11
+      | 2 -> return 22
+      | _ -> return 99
+    end
+    return -1
+end
+
+let main = fn () -> unit do
+    if check(x: 1) != 11 then raise RuntimeError(val: "expected 11") end
+    if check(x: 2) != 22 then raise RuntimeError(val: "expected 22") end
+    if check(x: 5) != 99 then raise RuntimeError(val: "expected 99") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_match_pipe_arms_with_or_pattern() {
+    exec(
+        r#"
+let check = fn (x: i64) -> i64 do
+    match x do
+      | 1 | 2 | 3 -> return 100
+      | _ -> return 0
+    end
+    return -1
+end
+
+let main = fn () -> unit do
+    if check(x: 2) != 100 then raise RuntimeError(val: "expected 100") end
+    if check(x: 7) != 0 then raise RuntimeError(val: "expected 0") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_catch_or_pattern_handles_either_exception() {
+    exec(
+        r#"
+exception ErrA(i64)
+exception ErrB(i64)
+
+let throws_a = fn () -> i64 throws { Exn } do
+    raise ErrA(11)
+    return 0
+end
+
+let throws_b = fn () -> i64 throws { Exn } do
+    raise ErrB(22)
+    return 0
+end
+
+let safe = fn (which: i64) -> i64 throws { Exn } do
+    try
+      if which == 0 then return throws_a() end
+      return throws_b()
+    catch
+      case ErrA(_) | ErrB(_) -> return 555
+    end
+    return 0
+end
+
+let main = fn () -> unit throws { Exn } do
+    if safe(which: 0) != 555 then raise RuntimeError(val: "expected 555 for ErrA") end
+    if safe(which: 1) != 555 then raise RuntimeError(val: "expected 555 for ErrB") end
+    return ()
+end
+"#,
+    );
+}
