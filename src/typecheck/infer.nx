@@ -34,7 +34,7 @@ import {
 import {
   HirExprKind, HirExpr, HirStmtKind, HirStmt,
   HirCallArg, HirNamedExpr, HirMatchCase, HirFunction, HirParam,
-  HirPatternKind, PLit, PVar, PCtor, PRec, PWild,
+  HirPatternKind, PLit, PVar, PCtor, PRec, PWild, POr,
   HirPatternField, HirRecordPatField
 } from "src/ir/hir_types.nx"
 import {
@@ -47,6 +47,8 @@ import {
 import * as subst from "src/typecheck/subst.nx"
 import * as unify from "src/typecheck/unify.nx"
 import * as str from "stdlib/string_ops.nx"
+import * as list from "stdlib/list.nx"
+import { Option, Some, None } from "stdlib/option.nx"
 
 export let infer_expr = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult do
   let HirExpr(node: node, span: sp) = expr
@@ -983,6 +985,103 @@ export let bind_pattern = fn (state: CheckState, pattern: HirPatternKind, target
       return bind_constructor_pattern(state: state, variant: variant, fields: fields, target_type: target_type)
     case PRec(fields: fields, is_partial: _) ->
       return bind_record_pattern(state: state, fields: fields, target_type: target_type)
+    case POr(alts: alts) ->
+      // Or-pattern: bind every alternative against the same scrutinee type,
+      // then validate that each alternative produced the same env-key set
+      // and that types unify across alternatives.
+      match alts do
+        case [] -> return BindErr(message: "empty or-pattern")
+        case first :: rest ->
+          match bind_pattern(state: state, pattern: first, target_type: target_type) do
+            case BindErr(message: m) -> return BindErr(message: "or-pattern: " ++ m)
+            case BindOk(state: st1, subst: s1, env: ref_env) ->
+              return bind_or_alts_validate(state: st1, alts: rest, target_type: target_type, ref_env: ref_env, acc_subst: s1)
+          end
+      end
+  end
+end
+
+let bind_or_alts_validate = fn (
+  state: CheckState, alts: [HirPatternKind], target_type: TypeExpr,
+  ref_env: [EnvEntry], acc_subst: [SubstEntry]
+) -> BindResult do
+  match alts do
+    case [] -> return BindOk(state: state, subst: acc_subst, env: ref_env)
+    case alt :: rest ->
+      match bind_pattern(state: state, pattern: alt, target_type: target_type) do
+        case BindErr(message: m) -> return BindErr(message: "or-pattern alternative: " ++ m)
+        case BindOk(state: st1, subst: s1, env: alt_env) ->
+          if env_keys_match(a: ref_env, b: alt_env) then
+            match unify_or_envs(state: st1, first: ref_env, alt: alt_env, acc: subst.subst_compose(s1: acc_subst, s2: s1)) do
+              case BindErr(message: m) -> return BindErr(message: m)
+              case BindOk(state: st2, subst: s2, env: _) ->
+                return bind_or_alts_validate(state: st2, alts: rest, target_type: target_type, ref_env: ref_env, acc_subst: s2)
+            end
+          else
+            return BindErr(message: "or-pattern alternatives bind different variable sets")
+          end
+      end
+  end
+end
+
+let env_keys_match = fn (a: [EnvEntry], b: [EnvEntry]) -> bool do
+  if list.length(xs: a) != list.length(xs: b) then return false end
+  return all_keys_in(needles: a, haystack: b) && all_keys_in(needles: b, haystack: a)
+end
+
+let all_keys_in = fn (needles: [EnvEntry], haystack: [EnvEntry]) -> bool do
+  match needles do
+    case [] -> return true
+    case EnvEntry(name: n, scheme: _) :: rest ->
+      if has_env_key(name: n, env: haystack) then
+        return all_keys_in(needles: rest, haystack: haystack)
+      else
+        return false
+      end
+  end
+end
+
+let has_env_key = fn (name: string, env: [EnvEntry]) -> bool do
+  match env do
+    case [] -> return false
+    case EnvEntry(name: n, scheme: _) :: rest ->
+      if n == name then return true else return has_env_key(name: name, env: rest) end
+  end
+end
+
+let unify_or_envs = fn (
+  state: CheckState, first: [EnvEntry], alt: [EnvEntry], acc: [SubstEntry]
+) -> BindResult do
+  match first do
+    case [] -> return BindOk(state: state, subst: acc, env: [])
+    case EnvEntry(name: n, scheme: rs) :: rest_first ->
+      match find_env_entry(name: n, env: alt) do
+        case None -> return BindErr(message: "or-pattern: missing binding `" ++ n ++ "` in alternative")
+        case Some(val: as_) ->
+          let tdefs = tctypes.state_typedefs(state: state)
+          let rt = scheme_typ(s: rs)
+          let at = scheme_typ(s: as_)
+          match unify.unify(t1: rt, t2: at, tdefs: tdefs) do
+            case UnifyErr(message: m) ->
+              return BindErr(message: "or-pattern: variable `" ++ n ++ "` has incompatible types across alternatives: " ++ m)
+            case UnifyOk(subst: s) ->
+              return unify_or_envs(state: state, first: rest_first, alt: alt, acc: subst.subst_compose(s1: acc, s2: s))
+          end
+      end
+  end
+end
+
+let find_env_entry = fn (name: string, env: [EnvEntry]) -> Option<Scheme> do
+  match env do
+    case [] -> return None
+    case EnvEntry(name: n, scheme: s) :: rest ->
+      if n == name then return Some(val: s) else return find_env_entry(name: name, env: rest) end
+  end
+end
+
+let scheme_typ = fn (s: Scheme) -> TypeExpr do
+  match s do
+    case Scheme(vars: _, typ: t) -> return t
   end
 end
 
