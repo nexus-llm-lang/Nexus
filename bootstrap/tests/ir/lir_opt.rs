@@ -8,6 +8,7 @@ use nexus::ir::lir::{LirAtom, LirExpr, LirFunction, LirProgram, LirStmt};
 use nexus::lang::parser;
 
 fn build_lir(src: &str) -> LirProgram {
+    crate::harness::ensure_repo_root();
     let program = parser::parser().parse(src).unwrap();
     let mir = build_hir(&program).unwrap();
     lower_mir_to_lir(&mir, &mir.enum_defs).unwrap()
