@@ -663,14 +663,23 @@ fn copy_propagate_stmt(
                 }
             }
         }
+        // Branch/block constructs: substitutions registered inside a branch must
+        // not leak out, since source-level shadowing (`let %x = …` inside an `if`)
+        // creates a binding whose LIR temp is valid only within that branch.
+        // Without this snapshot/restore, subsequent uses of `%x` in an adjacent
+        // branch (or after the `if`) would be substituted with a temp that has a
+        // stale or uninitialized value at runtime (nexus-ra0b).
         LirStmt::If {
             cond,
             then_body,
             else_body,
         } => {
             subst_atom(cond, subst);
+            let snapshot = subst.clone();
             copy_propagate_stmts(then_body, subst, multi_bound);
+            *subst = snapshot.clone();
             copy_propagate_stmts(else_body, subst, multi_bound);
+            *subst = snapshot;
         }
         LirStmt::IfReturn {
             cond,
@@ -681,14 +690,17 @@ fn copy_propagate_stmt(
             ..
         } => {
             subst_atom(cond, subst);
+            let snapshot = subst.clone();
             copy_propagate_stmts(then_body, subst, multi_bound);
             if let Some(ret) = then_ret {
                 subst_atom(ret, subst);
             }
+            *subst = snapshot.clone();
             copy_propagate_stmts(else_body, subst, multi_bound);
             if let Some(ret) = else_ret {
                 subst_atom(ret, subst);
             }
+            *subst = snapshot;
         }
         LirStmt::TryCatch {
             body,
@@ -697,23 +709,28 @@ fn copy_propagate_stmt(
             catch_ret,
             ..
         } => {
+            let snapshot = subst.clone();
             copy_propagate_stmts(body, subst, multi_bound);
             if let Some(ret) = body_ret {
                 subst_atom(ret, subst);
             }
+            *subst = snapshot.clone();
             copy_propagate_stmts(catch_body, subst, multi_bound);
             if let Some(ret) = catch_ret {
                 subst_atom(ret, subst);
             }
+            *subst = snapshot;
         }
         LirStmt::Loop {
             cond_stmts,
             cond,
             body,
         } => {
+            let snapshot = subst.clone();
             copy_propagate_stmts(cond_stmts, subst, multi_bound);
             subst_atom(cond, subst);
             copy_propagate_stmts(body, subst, multi_bound);
+            *subst = snapshot;
         }
         LirStmt::Switch {
             tag,
@@ -723,16 +740,19 @@ fn copy_propagate_stmt(
             ..
         } => {
             subst_atom(tag, subst);
+            let snapshot = subst.clone();
             for case in cases {
                 copy_propagate_stmts(&mut case.body, subst, multi_bound);
                 if let Some(ret) = &mut case.ret {
                     subst_atom(ret, subst);
                 }
+                *subst = snapshot.clone();
             }
             copy_propagate_stmts(default_body, subst, multi_bound);
             if let Some(ret) = default_ret {
                 subst_atom(ret, subst);
             }
+            *subst = snapshot;
         }
         LirStmt::FieldUpdate { target, value, .. } => {
             subst_atom(target, subst);
