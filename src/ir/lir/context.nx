@@ -1,0 +1,166 @@
+/**
+ * context: shared lowering context for LIR emission.
+ *
+ * Owns:
+ * - LowerCtx and its auxiliary records (TypeEntry, BindResult, TempResult,
+ *   BranchBodyResult, BlockResult)
+ * - Type-lookup helpers, wasm_type / atom_type mapping, default_atom
+ * - new_temp / bind_expr_to_temp / bind_expr_to_temp_semantic /
+ *   literal_to_atom
+ *
+ * Does not own:
+ * - Expression / statement lowering bodies (see src/ir/lir.nx)
+ * - Maranget match_tree construction (see src/ir/lir/match_tree.nx)
+ *
+ * Exists so lir.nx (body lowering) and lir/match_tree.nx (emission) can share
+ * the same LowerCtx without a cyclic import.
+ */
+import { Literal, LitUnit, TypeExpr, TyI32, TyI64, TyF32, TyF64, TyBool, TyChar, TyString, TyUnit, TyIntLit, TyFloatLit, TyList, TyUserDefined, TyHandler, TyLinear, TyLazy, TyBorrow, TyRow } from "src/common/ast.nx"
+import { EnumDef } from "src/common/ast.nx"
+import { LirAtom, LirAtomVar, LirAtomInt, LirAtomFloat, LirAtomBool, LirAtomChar, LirAtomString, LirAtomUnit, LirExpr, LirExprAtom, LirStmt, LirStmtLet } from "src/ir/lir_types.nx"
+import * as str from "stdlib/string.nx"
+
+// ─── LowerCtx & Auxiliary Records ────────────────────────────────────────────
+
+export type TypeEntry = TypeEntry(name: string, typ: TypeExpr)
+
+export type LowerCtx = LowerCtx(
+  vars: [TypeEntry],
+  semantic_vars: [TypeEntry],
+  stmts: [LirStmt],
+  temp_counter: i64,
+  enum_defs: [EnumDef]
+)
+
+export type TempResult = TempResult(ctx: LowerCtx, name: string)
+export type BindResult = BindResult(ctx: LowerCtx, atom: LirAtom)
+export type BranchBodyResult = BranchBodyResult(ctx: LowerCtx, value_opt: Option<LirAtom>)
+export type BlockResult = BlockResult(ctx: LowerCtx, stmts: [LirStmt], ret: Option<LirAtom>)
+
+// ─── Type Lookup Helpers ─────────────────────────────────────────────────────
+
+export let lir_lookup_type = fn (name: string, entries: [TypeEntry]) -> Option<TypeExpr> do
+  match entries do
+    case [] -> return None
+    case TypeEntry(name: n, typ: t) :: rest ->
+      if n == name then return Some(val: t)
+      else return lir_lookup_type(name: name, entries: rest)
+      end
+  end
+end
+
+export let insert_type = fn (name: string, typ: TypeExpr, entries: [TypeEntry]) -> [TypeEntry] do
+  return TypeEntry(name: name, typ: typ) :: entries
+end
+
+// ─── WASM Type Mapping ──────────────────────────────────────────────────────
+
+export let wasm_type = fn (typ: TypeExpr) -> TypeExpr do
+  match typ do
+    case TyI32 -> return TyI32
+    case TyI64 -> return TyI64
+    case TyF32 -> return TyF32
+    case TyF64 -> return TyF64
+    case TyBool -> return TyBool
+    case TyChar -> return TyChar
+    case TyString -> return TyString
+    case TyUnit -> return TyUnit
+    case TyIntLit -> return TyI64
+    case TyFloatLit -> return TyF64
+    // Heap-allocated compound types → I64 (object pointer)
+    case TyList(_) -> return TyI64
+    case TyUserDefined(_) -> return TyI64
+    case TyHandler(_) -> return TyI64
+    case TyLinear(inner: t) -> return wasm_type(typ: t)
+    case TyLazy(inner: t) -> return wasm_type(typ: t)
+    case TyBorrow(inner: t) -> return wasm_type(typ: t)
+    case TyRow(_) -> return TyUnit
+    // All remaining compound/heap types → I64 (object pointer)
+    case _ -> return TyI64
+  end
+end
+
+// ─── Atom Type Accessor ──────────────────────────────────────────────────────
+
+export let atom_type = fn (atom: LirAtom) -> TypeExpr do
+  match atom do
+    case LirAtomVar(name: _, typ: t) -> return t
+    case LirAtomInt(_) -> return TyI64
+    case LirAtomFloat(_) -> return TyF64
+    case LirAtomBool(_) -> return TyBool
+    case LirAtomChar(_) -> return TyChar
+    case LirAtomString(_) -> return TyString
+    case LirAtomUnit -> return TyUnit
+  end
+end
+
+// ─── Default Atom for Type ───────────────────────────────────────────────────
+
+export let default_atom = fn (typ: TypeExpr) -> LirAtom do
+  match typ do
+    case TyI64 -> return LirAtomInt(val: 0)
+    case TyF64 -> return LirAtomFloat(val: "0.0")
+    case TyBool -> return LirAtomBool(val: false)
+    case TyChar -> return LirAtomChar(val: 0)
+    case TyString -> return LirAtomString(val: "")
+    case TyUnit -> return LirAtomUnit
+    case _ -> return LirAtomInt(val: 0)
+  end
+end
+
+// ─── Temp Variable Generation ────────────────────────────────────────────────
+
+export let new_temp = fn (ctx: LowerCtx) -> TempResult do
+  match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
+    let name = "__t" ++ str.from_i64(val: c)
+    return TempResult(
+      ctx: LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c + 1, enum_defs: ed),
+      name: name
+    )
+  end
+end
+
+// ─── Bind Expression to Temp ─────────────────────────────────────────────────
+
+export let bind_expr_to_temp = fn (ctx: LowerCtx, expr: LirExpr, typ: TypeExpr) -> BindResult do
+  match new_temp(ctx: ctx) do case TempResult(ctx: LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed), name: name) ->
+    let new_vars = insert_type(name: name, typ: typ, entries: v)
+    let new_stmts = LirStmtLet(name: name, typ: typ, expr: expr) :: s
+    return BindResult(
+      ctx: LowerCtx(vars: new_vars, semantic_vars: sv, stmts: new_stmts, temp_counter: c, enum_defs: ed),
+      atom: LirAtomVar(name: name, typ: typ)
+    )
+  end
+end
+
+export let bind_expr_to_temp_semantic = fn (ctx: LowerCtx, expr: LirExpr, typ: TypeExpr, semantic_type: TypeExpr) -> BindResult do
+  match new_temp(ctx: ctx) do case TempResult(ctx: LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed), name: name) ->
+    // For string-typed vars, use TyString as the atom type (not TyI64).
+    // type_to_valtype(TyString) = vt_i64, so WASM codegen is unaffected,
+    // but atom_type returns TyString enabling is_string_op detection.
+    let atom_typ = match semantic_type do
+      case TyString -> TyString
+      case _ -> typ
+    end
+    let new_vars = insert_type(name: name, typ: atom_typ, entries: v)
+    let new_sv = insert_type(name: name, typ: semantic_type, entries: sv)
+    let new_stmts = LirStmtLet(name: name, typ: atom_typ, expr: expr) :: s
+    return BindResult(
+      ctx: LowerCtx(vars: new_vars, semantic_vars: new_sv, stmts: new_stmts, temp_counter: c, enum_defs: ed),
+      atom: LirAtomVar(name: name, typ: atom_typ)
+    )
+  end
+end
+
+// ─── Literal to Atom ─────────────────────────────────────────────────────────
+
+export let literal_to_atom = fn (lit: Literal) -> LirAtom do
+  match lit do
+    case LitInt(val: vi) -> return LirAtomInt(val: vi)
+    case LitFloat(val: vf) -> return LirAtomFloat(val: vf)
+    case LitBool(val: vb) -> return LirAtomBool(val: vb)
+    case LitChar(val: vc) -> return LirAtomChar(val: vc)
+    case LitString(val: vs) -> return LirAtomString(val: vs)
+    case LitUnit -> return LirAtomUnit
+  end
+end

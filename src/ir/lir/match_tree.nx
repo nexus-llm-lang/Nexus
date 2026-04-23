@@ -1,23 +1,28 @@
 /**
- * match_tree: Maranget decision-tree construction for pattern matching.
+ * match_tree: Maranget decision-tree construction + pure emission helpers.
  *
  * Owns:
  * - Decision tree types (PatRow, DecTree, CtorBranch, LitBranch, AtomEntry, DecTreeResult)
  * - Pattern matrix → DecTree algorithm (Maranget)
  * - Specialization / default matrix / record destructure builders
  * - Bridge: MirMatchCase list → PatRow list
+ * - Pure emission helpers shared by lir.nx:
+ *   · Field-extraction for constructor + record scrutinees
+ *   · Constructor- and literal-condition builders
+ *   · Pattern-binding emission (lir_emit_bindings)
+ *   · Small utilities: lir_nth_case_body, lir_nth_string, lir_ctors_length,
+ *     lir_reverse_atoms, lir_builtin_field_mem_idx
  *
  * Does not own:
- * - LIR lowering / emission of the decision tree (stays in lir.nx)
- * - LowerCtx or any LIR codegen concerns
- *
- * Internals here are pure: given ([PatRow], col_ids, next_id, enum_defs) → DecTreeResult.
- * The facade src/ir/lir.nx consumes this module and emits the decision tree as
- * LIR statements.
+ * - Recursive decision-tree emission and leaf emission (stay in lir.nx):
+ *   those call body lowering, and the self-hosted nxc has no first-class
+ *   function calls yet (blocker for callback injection — see nexus-o7l9).
+ * - LowerCtx definition (see src/ir/lir/context.nx).
  */
-import { Literal, TypeExpr, TyUnit, VariantDef, VariantField, EnumDef } from "src/common/ast.nx"
-import { MirPattern, MirPatternField, MirRecordPatField, MirMatchCase } from "src/ir/mir_types.nx"
-import { LirAtom, LirAtomUnit } from "src/ir/lir_types.nx"
+import { BinaryOp, OpEq, Literal, TypeExpr, TyUnit, TyI64, TyBool, TyRecord, NamedType, VariantDef, VariantField, EnumDef } from "src/common/ast.nx"
+import { MirStmt, MirPattern, MirPatternField, MirRecordPatField, MirMatchCase } from "src/ir/mir_types.nx"
+import { LirAtom, LirAtomUnit, LirAtomVar, LirAtomInt, LirAtomBool, LirExpr, LirExprAtom, LirExprBinary, LirExprObjectField, LirStmt, LirStmtLet } from "src/ir/lir_types.nx"
+import { LowerCtx, BindResult, insert_type, atom_type, wasm_type, bind_expr_to_temp, bind_expr_to_temp_semantic, literal_to_atom } from "src/ir/lir/context.nx"
 import * as str from "stdlib/string.nx"
 
 // ─── Public Decision Tree Types ──────────────────────────────────────────────
@@ -954,5 +959,314 @@ let lir_cases_to_rows_go = fn (cases: [MirMatchCase], idx: i64, acc: [PatRow]) -
     case [] -> return rev_pat_rows(lst: acc, out: [])
     case MirMatchCase(pattern: p, body: _) :: rest ->
       return lir_cases_to_rows_go(cases: rest, idx: idx + 1, acc: PatRow(pats: [p], case_idx: idx, bindings: []) :: acc)
+  end
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pure emission helpers (shared with lir.nx)
+//
+// These transform decision-tree metadata into LIR statements without ever
+// calling back into lir.nx's body lowering, so they sit cleanly here without
+// a module cycle.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Emission result types (shared with lir.nx) ─────────────────────────────
+
+export type CtorCondsResult = CtorCondsResult(ctx: LowerCtx, conds: [LirAtom])
+export type LitCondsResult = LitCondsResult(ctx: LowerCtx, conds: [LirAtom])
+export type FieldExtractResult = FieldExtractResult(ctx: LowerCtx, atoms: [AtomEntry], field_stmts: [LirStmt])
+export type FieldLoopResult = FieldLoopResult(ctx: LowerCtx, atoms: [AtomEntry])
+
+// ─── Small utility helpers ──────────────────────────────────────────────────
+
+export let lir_reverse_atoms = fn (lst: [LirAtom], acc: [LirAtom]) -> [LirAtom] do
+  match lst do
+    case [] -> return acc
+    case x :: rest -> return lir_reverse_atoms(lst: rest, acc: x :: acc)
+  end
+end
+
+export let lir_ctors_length = fn (lst: [CtorBranch]) -> i64 do
+  match lst do
+    case [] -> return 0
+    case _ :: rest -> return 1 + lir_ctors_length(lst: rest)
+  end
+end
+
+export let lir_nth_case_body = fn (cases: [MirMatchCase], idx: i64) -> [MirStmt] do
+  match cases do
+    case [] -> return []
+    case MirMatchCase(pattern: _, body: b) :: rest ->
+      match idx == 0 do
+        case true -> return b
+        case false -> return lir_nth_case_body(cases: rest, idx: idx - 1)
+      end
+  end
+end
+
+let lir_nth_string = fn (lst: [string], n: i64) -> string do
+  match lst do
+    case [] -> return ""
+    case x :: rest ->
+      match n == 0 do
+        case true -> return x
+        case false -> return lir_nth_string(lst: rest, n: n - 1)
+      end
+  end
+end
+
+// Map definition-order field index to memory (sorted) index for built-in constructors.
+// Cons(v, rest): sorted [rest(0), v(1)] → def 0(v)→mem 1, def 1(rest)→mem 0.
+// Some(val): only 1 field, no reordering.
+let lir_builtin_field_mem_idx = fn (ctor_name: string, def_idx: i64) -> i64 do
+  if ctor_name == "Cons" then
+    if def_idx == 0 then return 1 else return 0 end
+  end
+  return def_idx
+end
+
+// ─── Constructor / record field type + index lookups ────────────────────────
+
+let sorted_field_index = fn (field_name: string, all_names: [string]) -> i64 do
+  match all_names do
+    case [] -> return 0
+    case n :: rest ->
+      if lir_str_less_than(a: n, b: field_name) then
+        return 1 + sorted_field_index(field_name: field_name, all_names: rest)
+      else
+        return sorted_field_index(field_name: field_name, all_names: rest)
+      end
+  end
+end
+
+let find_variant_field_type = fn (fields: [VariantField], name: string) -> TypeExpr do
+  match fields do
+    case [] -> return TyI64
+    case VariantField(name: Some(val: n), typ: t) :: rest ->
+      if n == name then return t
+      else return find_variant_field_type(fields: rest, name: name)
+      end
+    case VariantField(name: None, typ: _) :: rest ->
+      return find_variant_field_type(fields: rest, name: name)
+  end
+end
+
+let constructor_field_type = fn (field_name: string, ctor_name: string, enum_defs: [EnumDef]) -> TypeExpr do
+  match lookup_variant_def(name: ctor_name, enum_defs: enum_defs) do
+    case Some(val: VariantDef(name: _, fields: fs)) ->
+      return find_variant_field_type(fields: fs, name: field_name)
+    case None -> return TyI64
+  end
+end
+
+let constructor_field_heap_index = fn (field_name: string, ctor_name: string, enum_defs: [EnumDef]) -> i64 do
+  match lookup_variant_def(name: ctor_name, enum_defs: enum_defs) do
+    case Some(val: vd) ->
+      let all_names = get_variant_field_names(vd: vd)
+      return sorted_field_index(field_name: field_name, all_names: all_names)
+    case None -> return 0
+  end
+end
+
+let lir_record_field_type = fn (sem: TypeExpr, name: string) -> TypeExpr do
+  match sem do
+    case TyRecord(fields: fields) ->
+      return lir_find_named_type(fields: fields, name: name)
+    case _ -> return TyI64
+  end
+end
+
+let lir_find_named_type = fn (fields: [NamedType], name: string) -> TypeExpr do
+  match fields do
+    case [] -> return TyI64
+    case NamedType(name: fn_, typ: ft) :: rest ->
+      match fn_ == name do
+        case true -> return ft
+        case false -> return lir_find_named_type(fields: rest, name: name)
+      end
+  end
+end
+
+let lir_record_sorted_idx = fn (sem: TypeExpr, name: string) -> i64 do
+  match sem do
+    case TyRecord(fields: fields) ->
+      let names = lir_extract_named_type_names(fields: fields)
+      let sorted = lir_sort_strings(lst: names)
+      return lir_str_index(lst: sorted, name: name, idx: 0)
+    case _ -> return 0
+  end
+end
+
+let lir_extract_named_type_names = fn (fields: [NamedType]) -> [string] do
+  return lir_extract_named_type_names_go(fields: fields, acc: [])
+end
+
+let lir_extract_named_type_names_go = fn (fields: [NamedType], acc: [string]) -> [string] do
+  match fields do
+    case [] -> return rev_strings(lst: acc, out: [])
+    case NamedType(name: n, typ: _) :: rest -> return lir_extract_named_type_names_go(fields: rest, acc: n :: acc)
+  end
+end
+
+// ─── Pattern-binding emission ───────────────────────────────────────────────
+
+export let lir_emit_bindings = fn (bindings: [PatBinding], atoms: [AtomEntry], ctx: LowerCtx) -> LowerCtx do
+  match bindings do
+    case [] -> return ctx
+    case PatBinding(name: n, scrutinee_id: sid) :: rest ->
+      match lookup_atom_entry(id: sid, atoms: atoms) do case AtomEntry(id: _, atom: a, sem_type: st) ->
+        match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
+          let typ = atom_type(atom: a)
+          let ctx2 = LowerCtx(
+            vars: insert_type(name: n, typ: typ, entries: v),
+            semantic_vars: insert_type(name: n, typ: st, entries: sv),
+            stmts: LirStmtLet(name: n, typ: typ, expr: LirExprAtom(atom: a)) :: s,
+            temp_counter: c, enum_defs: ed
+          )
+          return lir_emit_bindings(bindings: rest, atoms: atoms, ctx: ctx2)
+        end
+      end
+  end
+end
+
+// ─── Field-extraction helpers ───────────────────────────────────────────────
+
+let reverse_stmts_local = fn (stmts: [LirStmt]) -> [LirStmt] do
+  return reverse_stmts_local_go(stmts: stmts, acc: [])
+end
+
+let reverse_stmts_local_go = fn (stmts: [LirStmt], acc: [LirStmt]) -> [LirStmt] do
+  match stmts do
+    case [] -> return acc
+    case s :: rest -> return reverse_stmts_local_go(stmts: rest, acc: s :: acc)
+  end
+end
+
+export let lir_extract_ctor_fields = fn (scr_atom: LirAtom, scr_sem: TypeExpr, ctor_name: string,
+    arity: i64, field_ids: [i64], atoms: [AtomEntry], ctx: LowerCtx) -> FieldExtractResult do
+  match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: saved, temp_counter: c, enum_defs: ed) ->
+    let work_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: [], temp_counter: c, enum_defs: ed)
+    match lir_extract_fields_loop(scr_atom: scr_atom, scr_sem: scr_sem, ctor_name: ctor_name,
+        field_ids: field_ids, idx: 0, arity: arity, atoms: atoms, ctx: work_ctx,
+        enum_defs: ed) do case FieldLoopResult(ctx: ctx2, atoms: atoms2) ->
+      match ctx2 do case LowerCtx(vars: _, semantic_vars: _, stmts: field_stmts, temp_counter: c2, enum_defs: _) ->
+        let restored = LowerCtx(vars: v, semantic_vars: sv, stmts: saved, temp_counter: c2, enum_defs: ed)
+        return FieldExtractResult(ctx: restored, atoms: atoms2, field_stmts: reverse_stmts_local(stmts: field_stmts))
+      end
+    end
+  end
+end
+
+let lir_extract_fields_loop = fn (scr_atom: LirAtom, scr_sem: TypeExpr, ctor_name: string,
+    field_ids: [i64], idx: i64, arity: i64, atoms: [AtomEntry], ctx: LowerCtx,
+    enum_defs: [EnumDef]) -> FieldLoopResult do
+  match idx >= arity do
+    case true -> return FieldLoopResult(ctx: ctx, atoms: atoms)
+    case false ->
+      let fid = lir_id_nth(lst: field_ids, n: idx)
+      match lookup_variant_def(name: ctor_name, enum_defs: enum_defs) do
+        case Some(val: vd) ->
+          let names = get_variant_field_names(vd: vd)
+          let field_name = lir_nth_string(lst: names, n: idx)
+          let heap_idx = constructor_field_heap_index(field_name: field_name, ctor_name: ctor_name, enum_defs: enum_defs)
+          let sem_ft = constructor_field_type(field_name: field_name, ctor_name: ctor_name, enum_defs: enum_defs)
+          let wasm_ft = wasm_type(typ: sem_ft)
+          match bind_expr_to_temp_semantic(ctx: ctx,
+            expr: LirExprObjectField(value: scr_atom, index: heap_idx, typ: wasm_ft),
+            typ: wasm_ft, semantic_type: sem_ft) do case BindResult(ctx: ctx2, atom: field_atom) ->
+            let new_atoms = AtomEntry(id: fid, atom: field_atom, sem_type: sem_ft) :: atoms
+            return lir_extract_fields_loop(scr_atom: scr_atom, scr_sem: scr_sem, ctor_name: ctor_name,
+              field_ids: field_ids, idx: idx + 1, arity: arity, atoms: new_atoms, ctx: ctx2,
+              enum_defs: enum_defs)
+          end
+        case None ->
+          // Built-in constructor — alphabetical field sort for memory layout.
+          let mem_idx = lir_builtin_field_mem_idx(ctor_name: ctor_name, def_idx: idx)
+          match bind_expr_to_temp(ctx: ctx,
+            expr: LirExprObjectField(value: scr_atom, index: mem_idx, typ: TyI64),
+            typ: TyI64) do case BindResult(ctx: ctx2, atom: field_atom) ->
+            let new_atoms = AtomEntry(id: fid, atom: field_atom, sem_type: TyI64) :: atoms
+            return lir_extract_fields_loop(scr_atom: scr_atom, scr_sem: scr_sem, ctor_name: ctor_name,
+              field_ids: field_ids, idx: idx + 1, arity: arity, atoms: new_atoms, ctx: ctx2,
+              enum_defs: enum_defs)
+          end
+      end
+  end
+end
+
+export let lir_extract_record_fields = fn (scr_atom: LirAtom, scr_sem: TypeExpr,
+    field_names: [string], field_ids: [i64], atoms: [AtomEntry], ctx: LowerCtx) -> FieldExtractResult do
+  match ctx do case LowerCtx(vars: v, semantic_vars: sv, stmts: saved, temp_counter: c, enum_defs: ed) ->
+    let work_ctx = LowerCtx(vars: v, semantic_vars: sv, stmts: [], temp_counter: c, enum_defs: ed)
+    match lir_extract_record_loop(scr_atom: scr_atom, scr_sem: scr_sem,
+        field_names: field_names, field_ids: field_ids, atoms: atoms, ctx: work_ctx) do case FieldLoopResult(ctx: ctx2, atoms: atoms2) ->
+      match ctx2 do case LowerCtx(vars: _, semantic_vars: _, stmts: field_stmts, temp_counter: c2, enum_defs: _) ->
+        let restored = LowerCtx(vars: v, semantic_vars: sv, stmts: saved, temp_counter: c2, enum_defs: ed)
+        return FieldExtractResult(ctx: restored, atoms: atoms2, field_stmts: reverse_stmts_local(stmts: field_stmts))
+      end
+    end
+  end
+end
+
+let lir_extract_record_loop = fn (scr_atom: LirAtom, scr_sem: TypeExpr,
+    field_names: [string], field_ids: [i64], atoms: [AtomEntry], ctx: LowerCtx) -> FieldLoopResult do
+  match field_names do
+    case [] -> return FieldLoopResult(ctx: ctx, atoms: atoms)
+    case fn_ :: rest_names ->
+      match field_ids do
+        case [] -> return FieldLoopResult(ctx: ctx, atoms: atoms)
+        case fid :: rest_ids ->
+        let field_type = lir_record_field_type(sem: scr_sem, name: fn_)
+        let sorted_idx = lir_record_sorted_idx(sem: scr_sem, name: fn_)
+        let wasm_ft = wasm_type(typ: field_type)
+        match bind_expr_to_temp_semantic(ctx: ctx,
+          expr: LirExprObjectField(value: scr_atom, index: sorted_idx, typ: wasm_ft),
+          typ: wasm_ft, semantic_type: field_type) do case BindResult(ctx: ctx2, atom: field_atom) ->
+          let new_atoms = AtomEntry(id: fid, atom: field_atom, sem_type: field_type) :: atoms
+          return lir_extract_record_loop(scr_atom: scr_atom, scr_sem: scr_sem,
+            field_names: rest_names, field_ids: rest_ids, atoms: new_atoms, ctx: ctx2)
+        end
+      end
+  end
+end
+
+// ─── Condition builders (ctor tag / literal equality) ───────────────────────
+
+export let lir_emit_ctor_conds = fn (branches: [CtorBranch], tag_atom: LirAtom, has_fb: bool, pos: i64, total: i64, ctx: LowerCtx) -> CtorCondsResult do
+  return lir_emit_ctor_conds_go(branches: branches, tag_atom: tag_atom, has_fb: has_fb, pos: pos, total: total, ctx: ctx, acc: [])
+end
+
+let lir_emit_ctor_conds_go = fn (branches: [CtorBranch], tag_atom: LirAtom, has_fb: bool, pos: i64, total: i64, ctx: LowerCtx, acc: [LirAtom]) -> CtorCondsResult do
+  match branches do
+    case [] -> return CtorCondsResult(ctx: ctx, conds: lir_reverse_atoms(lst: acc, acc: []))
+    case CtorBranch(ctor_name: _, ctor_tag: tag, arity: _, field_ids: _, subtree: _) :: rest ->
+      let is_last_no_fb = (pos == total - 1) && (has_fb == false)
+      match is_last_no_fb do
+        case true ->
+          return lir_emit_ctor_conds_go(branches: rest, tag_atom: tag_atom, has_fb: has_fb, pos: pos + 1, total: total, ctx: ctx, acc: LirAtomBool(val: true) :: acc)
+        case false ->
+          match bind_expr_to_temp(ctx: ctx,
+            expr: LirExprBinary(op: OpEq, lhs: tag_atom, rhs: LirAtomInt(val: tag), typ: TyBool),
+            typ: TyBool) do case BindResult(ctx: ctx2, atom: cond) ->
+            return lir_emit_ctor_conds_go(branches: rest, tag_atom: tag_atom, has_fb: has_fb, pos: pos + 1, total: total, ctx: ctx2, acc: cond :: acc)
+          end
+      end
+  end
+end
+
+export let lir_emit_lit_conds = fn (branches: [LitBranch], scr_atom: LirAtom, ctx: LowerCtx) -> LitCondsResult do
+  return lir_emit_lit_conds_go(branches: branches, scr_atom: scr_atom, ctx: ctx, acc: [])
+end
+
+let lir_emit_lit_conds_go = fn (branches: [LitBranch], scr_atom: LirAtom, ctx: LowerCtx, acc: [LirAtom]) -> LitCondsResult do
+  match branches do
+    case [] -> return LitCondsResult(ctx: ctx, conds: lir_reverse_atoms(lst: acc, acc: []))
+    case LitBranch(lit: l, subtree: _) :: rest ->
+      let lit_atom = literal_to_atom(lit: l)
+      match bind_expr_to_temp(ctx: ctx,
+        expr: LirExprBinary(op: OpEq, lhs: scr_atom, rhs: lit_atom, typ: TyBool),
+        typ: TyBool) do case BindResult(ctx: ctx2, atom: cond) ->
+        return lir_emit_lit_conds_go(branches: rest, scr_atom: scr_atom, ctx: ctx2, acc: cond :: acc)
+      end
   end
 end
