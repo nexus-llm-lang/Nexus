@@ -390,6 +390,14 @@ let skip_local_decls = fn (buf: &ByteBuffer, pos: i64, remaining: i64) -> i64 do
   return skip_local_decls(buf: buf, pos: ppos(pk: pk) + 1, remaining: remaining - 1)
 end
 
+// Scan forward past `n` LEB128 values, returning the position after the last.
+// `scan_sleb_end` works for both ULEB and SLEB (terminator detection is shared).
+// Used by span-copy paths that avoid re-encoding index-free operands.
+let scan_lebs = fn (buf: &ByteBuffer, pos: i64, n: i64) -> i64 do
+  if n <= 0 then return pos end
+  return scan_lebs(buf: buf, pos: scan_sleb_end(buf: buf, pos: pos), n: n - 1)
+end
+
 let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &ByteBuffer, pos: i64, end_pos: i64) -> %ByteBuffer do
   if pos >= end_pos then return %out end
   let op = bb.get_byte(buf: src, idx: pos)
@@ -447,9 +455,11 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
   let %out = bb.push_byte(buf: %out, byte: op)
 
   if cls == 1 then
-    let pk = rd_uleb(buf: src, pos: pos)
-    let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk))
-    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: ppos(pk: pk), end_pos: end_pos)
+    // Single ULEB (local.get/set/tee, br, br_if, etc.) — no remap needed.
+    // Span-copy avoids rd_uleb (recursive shl arithmetic) + push_uleb128 re-encoding.
+    let end1 = scan_sleb_end(buf: src, pos: pos)
+    let %out = bb.copy_range(dst: %out, src: src, start: pos, end_pos: end1)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: end1, end_pos: end_pos)
   end
   if cls == 2 then
     // call_indirect: type_idx (+ type_off), table_idx (+ tbl_off)
@@ -476,22 +486,23 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
     return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: pos + 8, end_pos: end_pos)
   end
   if cls == 6 then
-    let pk = rd_uleb(buf: src, pos: pos)
-    let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk))
-    let pk2 = rd_uleb(buf: src, pos: ppos(pk: pk))
-    let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2))
-    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: ppos(pk: pk2), end_pos: end_pos)
+    // Memarg (align + offset) on load/store — 2 ULEBs, no remap. Span-copy.
+    let end1 = scan_sleb_end(buf: src, pos: pos)
+    let end2 = scan_sleb_end(buf: src, pos: end1)
+    let %out = bb.copy_range(dst: %out, src: src, start: pos, end_pos: end2)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: end2, end_pos: end_pos)
   end
   if cls == 7 then
     let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
     return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: pos + 1, end_pos: end_pos)
   end
   if cls == 8 then
+    // br_table: ULEB count + (count+1) ULEB labels — no remap. Span-copy the whole run.
     let pk = rd_uleb(buf: src, pos: pos)
     let count = pval(pk: pk)
-    let %out = bb.push_uleb128(buf: %out, val: count)
-    let BufPos(buf: %out, pos: pos) = copy_br_labels(out: %out, src: src, pos: ppos(pk: pk), remaining: count + 1)
-    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: pos, end_pos: end_pos)
+    let all_end = scan_lebs(buf: src, pos: ppos(pk: pk), n: count + 1)
+    let %out = bb.copy_range(dst: %out, src: src, start: pos, end_pos: all_end)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: all_end, end_pos: end_pos)
   end
   if cls == 9 then
     let BufPos(buf: %out, pos: pos) = rw_blocktype_operand(out: %out, src: src, pos: pos, type_off: type_off)
@@ -581,13 +592,6 @@ let rw_blocktype_operand = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, typ
   // Type index as sleb
   let SlebRes(val: type_idx, pos: end2) = rd_sleb(buf: src, pos: pos)
   return BufPos(buf: bb.push_sleb128(buf: %out, val: type_idx + type_off), pos: end2)
-end
-
-let copy_br_labels = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64) -> BufPos do
-  if remaining <= 0 then return BufPos(buf: %out, pos: pos) end
-  let pk = rd_uleb(buf: src, pos: pos)
-  let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk))
-  return copy_br_labels(out: %out, src: src, pos: ppos(pk: pk), remaining: remaining - 1)
 end
 
 let copy_try_handlers = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64) -> BufPos do
