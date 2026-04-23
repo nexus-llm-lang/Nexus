@@ -1,41 +1,46 @@
 import { ByteBuffer }, * as bb from "stdlib/bytebuffer.nx"
+import { StringMap }, * as sm from "stdlib/stringmap.nx"
 import * as str from "stdlib/string.nx"
 
-external __nx_buf_new = "__nx_buf_new" : () -> i64
-external __nx_buf_push_i32_le = "__nx_buf_push_i32_le" : (id: i64, val: i64) -> unit
-external __nx_buf_get_byte = "__nx_buf_get_byte" : (id: i64, idx: i64) -> i64
-external __nx_buf_free_raw = "__nx_buf_free" : (id: i64) -> bool
-external __nx_smap_new = "__nx_smap_new" : () -> i64
-external __nx_smap_put = "__nx_smap_put" : (id: i64, key: string, value: i64) -> i64
-external __nx_smap_get = "__nx_smap_get" : (id: i64, key: string, default_val: i64) -> i64
-external __nx_smap_has = "__nx_smap_has" : (id: i64, key: string) -> bool
-external __nx_smap_free = "__nx_smap_free" : (id: i64) -> bool
-external __nx_smap_size = "__nx_smap_size" : (id: i64) -> i64
-
 // ─── Dense i32 array (int→int table) ─────────────────────────────────────
-// Backed by a raw ByteBuffer. Avoids from_i64 string allocation that occurs
-// in every smap lookup; function-index remaps happen thousands of times per
-// merge, so hot-path allocation fills dlmalloc before merge finishes.
-let intarr_new = fn () -> i64 do return __nx_buf_new() end
-let intarr_push = fn (id: i64, val: i64) -> unit do
-  __nx_buf_push_i32_le(id: id, val: val)
+// Thin wrapper over stdlib ByteBuffer — avoids the from_i64 string allocation
+// that a StringMap lookup would do on every hot-path func-index remap (happens
+// thousands of times per merge).
+// Uses push_i32_le for writes and a 4-byte little-endian reassembly for reads.
+let intarr_new = fn () -> %ByteBuffer do return bb.empty() end
+let intarr_push = fn (arr: %ByteBuffer, val: i64) -> %ByteBuffer do
+  return bb.push_i32_le(buf: %arr, val: val)
 end
-let intarr_get = fn (id: i64, idx: i64) -> i64 do
+let intarr_get = fn (arr: &ByteBuffer, idx: i64) -> i64 do
   let pos = idx * 4
-  let b0 = __nx_buf_get_byte(id: id, idx: pos)
-  let b1 = __nx_buf_get_byte(id: id, idx: pos + 1)
-  let b2 = __nx_buf_get_byte(id: id, idx: pos + 2)
-  let b3 = __nx_buf_get_byte(id: id, idx: pos + 3)
+  let b0 = bb.get_byte(buf: arr, idx: pos)
+  let b1 = bb.get_byte(buf: arr, idx: pos + 1)
+  let b2 = bb.get_byte(buf: arr, idx: pos + 2)
+  let b3 = bb.get_byte(buf: arr, idx: pos + 3)
   return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
-end
-let intarr_free = fn (id: i64) -> unit do
-  let _r = __nx_buf_free_raw(id: id)
-  return ()
 end
 
 let pack = fn (val: i64, p: i64) -> i64 do return val * 4294967296 + p end
 let pval = fn (pk: i64) -> i64 do return pk / 4294967296 end
 let ppos = fn (pk: i64) -> i64 do return pk % 4294967296 end
+
+// Multi-return records for readers that advance position.
+// StrPos: rd_str returns parsed string + position after string bytes.
+// SlebRes: rd_sleb returns decoded signed value + position after terminal byte.
+// BufPos: sub-emitters that consume src bytes return new buf + new src position.
+// RwCtx: type / table / global offsets applied during instruction rewriting.
+//        The remap intarr is passed as a separate &ByteBuffer borrow (rw_instrs
+//        only reads the remap, no linear threading needed).
+// ResolveCtx: import-resolution state. Owns the remap intarr as %ByteBuffer
+//        because resolve_main_go mutates (intarr_push) during traversal —
+//        ctx must be threaded linearly through the recursion.
+// ResolveState: dynamic counters (fidx, m_kept_idx) threaded alongside the ctx.
+type StrPos = StrPos(s: string, pos: i64)
+type SlebRes = SlebRes(val: i64, pos: i64)
+type BufPos = BufPos(buf: %ByteBuffer, pos: i64)
+type RwCtx = RwCtx(type_off: i64, tbl_off: i64, glo_off: i64)
+type ResolveCtx = ResolveCtx(remap: %ByteBuffer, kept_fimp: i64, n_stubs: i64, dep_fimp: i64, m_imp_base: i64)
+type ResolveState = ResolveState(fidx: i64, m_kept_idx: i64)
 
 let shl = fn (v: i64, n: i64) -> i64 do
   if n <= 0 then return v end
@@ -52,27 +57,19 @@ let rd_uleb_go = fn (buf: &ByteBuffer, pos: i64, r: i64, s: i64) -> i64 do
   return rd_uleb_go(buf: buf, pos: pos + 1, r: r2, s: s + 7)
 end
 
-let set_p = fn (ps: i64, v: i64) -> unit do let _r = __nx_smap_put(id: ps, key: "_", value: v) end
-let get_p = fn (ps: i64) -> i64 do return __nx_smap_get(id: ps, key: "_", default_val: 0) end
-let set_v = fn (ps: i64, v: i64) -> unit do let _r = __nx_smap_put(id: ps, key: "_v", value: v) end
-let get_v = fn (ps: i64) -> i64 do return __nx_smap_get(id: ps, key: "_v", default_val: 0) end
-
 // ─── Signed LEB128 reader ─────────────────────────────────────────────────
-// Returns new position; value stored in pos_state via set_v/get_v.
-// Packed return (val*2^32+pos) breaks for negative values because
-// negative val*2^32 makes pval/ppos give wrong results.
+// Returns SlebRes(val, pos) — packed return (val*2^32+pos) breaks for negative
+// values because negative val*2^32 makes pval/ppos give wrong results.
 // Terminal step: given accumulated r and shift s, plus the terminal byte b,
 // compute final value (sign-extended if bit 6 set) and return pos+1.
-let rd_sleb_term = fn (ps: i64, pos: i64, r: i64, s: i64, b: i64) -> i64 do
+let rd_sleb_term = fn (pos: i64, r: i64, s: i64, b: i64) -> SlebRes do
   let r2 = r + (b % 128) * shl(v: 1, n: s)
   if s + 7 < 64 then
     if b >= 64 then
-      set_v(ps: ps, v: r2 - shl(v: 1, n: s + 7))
-      return pos + 1
+      return SlebRes(val: r2 - shl(v: 1, n: s + 7), pos: pos + 1)
     end
   end
-  set_v(ps: ps, v: r2)
-  return pos + 1
+  return SlebRes(val: r2, pos: pos + 1)
 end
 
 // Scan forward from `pos` and return position after the terminal LEB128 byte
@@ -84,59 +81,59 @@ let scan_sleb_end = fn (buf: &ByteBuffer, pos: i64) -> i64 do
   return scan_sleb_end(buf: buf, pos: pos + 1)
 end
 
-let rd_sleb = fn (ps: i64, buf: &ByteBuffer, pos: i64) -> i64 do
+let rd_sleb = fn (buf: &ByteBuffer, pos: i64) -> SlebRes do
   let b0 = bb.get_byte(buf: buf, idx: pos)
-  if b0 < 128 then return rd_sleb_term(ps: ps, pos: pos, r: 0, s: 0, b: b0) end
+  if b0 < 128 then return rd_sleb_term(pos: pos, r: 0, s: 0, b: b0) end
   let r1 = b0 % 128
   let b1 = bb.get_byte(buf: buf, idx: pos + 1)
-  if b1 < 128 then return rd_sleb_term(ps: ps, pos: pos + 1, r: r1, s: 7, b: b1) end
+  if b1 < 128 then return rd_sleb_term(pos: pos + 1, r: r1, s: 7, b: b1) end
   let r2 = r1 + (b1 % 128) * 128
   let b2 = bb.get_byte(buf: buf, idx: pos + 2)
-  if b2 < 128 then return rd_sleb_term(ps: ps, pos: pos + 2, r: r2, s: 14, b: b2) end
+  if b2 < 128 then return rd_sleb_term(pos: pos + 2, r: r2, s: 14, b: b2) end
   let r3 = r2 + (b2 % 128) * 16384
   let b3 = bb.get_byte(buf: buf, idx: pos + 3)
-  if b3 < 128 then return rd_sleb_term(ps: ps, pos: pos + 3, r: r3, s: 21, b: b3) end
+  if b3 < 128 then return rd_sleb_term(pos: pos + 3, r: r3, s: 21, b: b3) end
   let r4 = r3 + (b3 % 128) * 2097152
   let b4 = bb.get_byte(buf: buf, idx: pos + 4)
-  if b4 < 128 then return rd_sleb_term(ps: ps, pos: pos + 4, r: r4, s: 28, b: b4) end
+  if b4 < 128 then return rd_sleb_term(pos: pos + 4, r: r4, s: 28, b: b4) end
   let r5 = r4 + (b4 % 128) * 268435456
   let b5 = bb.get_byte(buf: buf, idx: pos + 5)
-  if b5 < 128 then return rd_sleb_term(ps: ps, pos: pos + 5, r: r5, s: 35, b: b5) end
+  if b5 < 128 then return rd_sleb_term(pos: pos + 5, r: r5, s: 35, b: b5) end
   let r6 = r5 + (b5 % 128) * 34359738368
   let b6 = bb.get_byte(buf: buf, idx: pos + 6)
-  if b6 < 128 then return rd_sleb_term(ps: ps, pos: pos + 6, r: r6, s: 42, b: b6) end
+  if b6 < 128 then return rd_sleb_term(pos: pos + 6, r: r6, s: 42, b: b6) end
   let r7 = r6 + (b6 % 128) * 4398046511104
   let b7 = bb.get_byte(buf: buf, idx: pos + 7)
-  if b7 < 128 then return rd_sleb_term(ps: ps, pos: pos + 7, r: r7, s: 49, b: b7) end
+  if b7 < 128 then return rd_sleb_term(pos: pos + 7, r: r7, s: 49, b: b7) end
   let r8 = r7 + (b7 % 128) * 562949953421312
   let b8 = bb.get_byte(buf: buf, idx: pos + 8)
-  if b8 < 128 then return rd_sleb_term(ps: ps, pos: pos + 8, r: r8, s: 56, b: b8) end
+  if b8 < 128 then return rd_sleb_term(pos: pos + 8, r: r8, s: 56, b: b8) end
   let r9 = r8 + (b8 % 128) * 72057594037927936
   let b9 = bb.get_byte(buf: buf, idx: pos + 9)
-  return rd_sleb_term(ps: ps, pos: pos + 9, r: r9, s: 63, b: b9)
+  return rd_sleb_term(pos: pos + 9, r: r9, s: 63, b: b9)
 end
 
 // ─── Section scanning ─────────────────────────────────────────────────────
 // Scan WASM module sections into an smap: section_id -> pack(content_offset, size)
-let scan_secs = fn (buf: &ByteBuffer) -> i64 do
-  let map = __nx_smap_new()
-  scan_secs_go(buf: buf, pos: 8, end_pos: bb.length(buf: buf), map: map)
-  return map
+let scan_secs = fn (buf: &ByteBuffer) -> %StringMap do
+  let %map = sm.empty()
+  return scan_secs_go(buf: buf, pos: 8, end_pos: bb.length(buf: buf), map: %map)
 end
-let scan_secs_go = fn (buf: &ByteBuffer, pos: i64, end_pos: i64, map: i64) -> unit do
+let scan_secs_go = fn (buf: &ByteBuffer, pos: i64, end_pos: i64, map: %StringMap) -> %StringMap do
   if pos < end_pos then
     let sec_id = bb.get_byte(buf: buf, idx: pos)
     let pk = rd_uleb(buf: buf, pos: pos + 1)
     let sec_size = pval(pk: pk)
     let content_start = ppos(pk: pk)
-    __nx_smap_put(id: map, key: str.from_i64(val: sec_id), value: pack(val: content_start, p: sec_size))
-    scan_secs_go(buf: buf, pos: content_start + sec_size, end_pos: end_pos, map: map)
+    let %map = sm.put(map: %map, key: str.from_i64(val: sec_id), value: pack(val: content_start, p: sec_size))
+    return scan_secs_go(buf: buf, pos: content_start + sec_size, end_pos: end_pos, map: %map)
   end
+  return %map
 end
 
 // Get packed section info (0 if section not present)
-let get_sec = fn (map: i64, sec: i64) -> i64 do
-  return __nx_smap_get(id: map, key: str.from_i64(val: sec), default_val: 0)
+let get_sec = fn (map: &StringMap, sec: i64) -> i64 do
+  return sm.get_or(map: map, key: str.from_i64(val: sec), default: 0)
 end
 // Extract content offset from packed section info
 let sec_off = fn (pk: i64) -> i64 do return pval(pk: pk) end
@@ -156,17 +153,17 @@ let sec_body = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
 end
 
 // ─── String reading ───────────────────────────────────────────────────────
-// Read a WASM string (ULEB length + bytes). Sets pos_state to end position.
-let rd_str = fn (ps: i64, buf: &ByteBuffer, pos: i64) -> string do
+// Read a WASM string (ULEB length + bytes). Returns parsed string + position
+// immediately after the string bytes.
+let rd_str = fn (buf: &ByteBuffer, pos: i64) -> StrPos do
   let pk = rd_uleb(buf: buf, pos: pos)
   let len = pval(pk: pk)
   let start = ppos(pk: pk)
-  set_p(ps: ps, v: start + len)
   let %tmp = bb.empty()
   let %tmp = bb.copy_range(dst: %tmp, src: buf, start: start, end_pos: start + len)
   let s = bb.to_string(buf: &tmp)
   bb.free(buf: %tmp)
-  return s
+  return StrPos(s: s, pos: start + len)
 end
 
 // ─── Import descriptor skipping ───────────────────────────────────────────
@@ -223,104 +220,97 @@ end
 
 // ─── Import scanning ──────────────────────────────────────────────────────
 // Parse dep (stdlib) exports into smap: export_name -> func_idx+1 (0=not found)
-let parse_dep_exports = fn (ps: i64, buf: &ByteBuffer, sec_pk: i64) -> i64 do
-  let map = __nx_smap_new()
-  if sec_pk == 0 then return map end
+let parse_dep_exports = fn (buf: &ByteBuffer, sec_pk: i64) -> %StringMap do
+  let %map = sm.empty()
+  if sec_pk == 0 then return %map end
   let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
   let count = pval(pk: pk)
-  parse_dep_exports_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: count, map: map)
-  return map
+  return parse_dep_exports_go(buf: buf, pos: ppos(pk: pk), remaining: count, map: %map)
 end
-let parse_dep_exports_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64, map: i64) -> unit do
-  if remaining <= 0 then return () end
-  let name = rd_str(ps: ps, buf: buf, pos: pos)
-  let pos2 = get_p(ps: ps)
+let parse_dep_exports_go = fn (buf: &ByteBuffer, pos: i64, remaining: i64, map: %StringMap) -> %StringMap do
+  if remaining <= 0 then return %map end
+  let StrPos(s: name, pos: pos2) = rd_str(buf: buf, pos: pos)
   let kind = bb.get_byte(buf: buf, idx: pos2)
   let pk = rd_uleb(buf: buf, pos: pos2 + 1)
   let idx = pval(pk: pk)
   if kind == 0 then
-    let _r = __nx_smap_put(id: map, key: name, value: idx + 1)
+    let %map = sm.put(map: %map, key: name, value: idx + 1)
+    return parse_dep_exports_go(buf: buf, pos: ppos(pk: pk), remaining: remaining - 1, map: %map)
   end
-  parse_dep_exports_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: remaining - 1, map: map)
+  return parse_dep_exports_go(buf: buf, pos: ppos(pk: pk), remaining: remaining - 1, map: %map)
 end
 
 // Count function imports in a module (kind == 0x00)
-let count_func_imps = fn (ps: i64, buf: &ByteBuffer, sec_pk: i64) -> i64 do
+let count_func_imps = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
   if sec_pk == 0 then return 0 end
   let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
-  return count_func_imps_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), acc: 0)
+  return count_func_imps_go(buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), acc: 0)
 end
-let count_func_imps_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64, acc: i64) -> i64 do
+let count_func_imps_go = fn (buf: &ByteBuffer, pos: i64, remaining: i64, acc: i64) -> i64 do
   if remaining <= 0 then return acc end
-  let _mod = rd_str(ps: ps, buf: buf, pos: pos)
-  let pos2 = get_p(ps: ps)
-  let _name = rd_str(ps: ps, buf: buf, pos: pos2)
-  let pos3 = get_p(ps: ps)
+  let StrPos(s: _mod, pos: pos2) = rd_str(buf: buf, pos: pos)
+  let StrPos(s: _name, pos: pos3) = rd_str(buf: buf, pos: pos2)
   let kind = bb.get_byte(buf: buf, idx: pos3)
   let pos4 = skip_imp_desc(buf: buf, pos: pos3)
   let inc = match kind == 0 do case true -> 1 case false -> 0 end
-  return count_func_imps_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc + inc)
+  return count_func_imps_go(buf: buf, pos: pos4, remaining: remaining - 1, acc: acc + inc)
 end
 
 // ─── Main non-stdlib import counting ─────────────────────────────────────
 // Count ALL main imports that are NOT from nexus:stdlib/* (for import section entry count)
-let count_main_kept_imps = fn (ps: i64, buf: &ByteBuffer, sec_pk: i64) -> i64 do
+let count_main_kept_imps = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
   if sec_pk == 0 then return 0 end
   let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
-  return count_main_kept_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), acc: 0)
+  return count_main_kept_go(buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), acc: 0)
 end
-let count_main_kept_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64, acc: i64) -> i64 do
+let count_main_kept_go = fn (buf: &ByteBuffer, pos: i64, remaining: i64, acc: i64) -> i64 do
   if remaining <= 0 then return acc end
-  let mod_name = rd_str(ps: ps, buf: buf, pos: pos)
-  let pos2 = get_p(ps: ps)
-  let _name = rd_str(ps: ps, buf: buf, pos: pos2)
-  let pos3 = get_p(ps: ps)
+  let StrPos(s: mod_name, pos: pos2) = rd_str(buf: buf, pos: pos)
+  let StrPos(s: _name, pos: pos3) = rd_str(buf: buf, pos: pos2)
   let kind = bb.get_byte(buf: buf, idx: pos3)
   let pos4 = skip_imp_desc(buf: buf, pos: pos3)
   if str.starts_with(s: mod_name, prefix: "nexus:stdlib/") then
-    return count_main_kept_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
+    return count_main_kept_go(buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
   end
   if str.byte_length(s: mod_name) == 0 then
-    return count_main_kept_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
+    return count_main_kept_go(buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
   end
   if kind == 2 then
-    return count_main_kept_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
+    return count_main_kept_go(buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
   end
-  return count_main_kept_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc + 1)
+  return count_main_kept_go(buf: buf, pos: pos4, remaining: remaining - 1, acc: acc + 1)
 end
 
 // Count main FUNCTION imports that are NOT from nexus:stdlib/* (for function index layout)
-let count_main_kept_func_imps = fn (ps: i64, buf: &ByteBuffer, sec_pk: i64) -> i64 do
+let count_main_kept_func_imps = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
   if sec_pk == 0 then return 0 end
   let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
-  return count_main_kept_func_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), acc: 0)
+  return count_main_kept_func_go(buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), acc: 0)
 end
-let count_main_kept_func_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64, acc: i64) -> i64 do
+let count_main_kept_func_go = fn (buf: &ByteBuffer, pos: i64, remaining: i64, acc: i64) -> i64 do
   if remaining <= 0 then return acc end
-  let mod_name = rd_str(ps: ps, buf: buf, pos: pos)
-  let pos2 = get_p(ps: ps)
-  let _name = rd_str(ps: ps, buf: buf, pos: pos2)
-  let pos3 = get_p(ps: ps)
+  let StrPos(s: mod_name, pos: pos2) = rd_str(buf: buf, pos: pos)
+  let StrPos(s: _name, pos: pos3) = rd_str(buf: buf, pos: pos2)
   let kind = bb.get_byte(buf: buf, idx: pos3)
   let pos4 = skip_imp_desc(buf: buf, pos: pos3)
   if kind == 0 then
     if str.starts_with(s: mod_name, prefix: "nexus:stdlib/") then
-      return count_main_kept_func_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
+      return count_main_kept_func_go(buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
     end
     if str.byte_length(s: mod_name) == 0 then
-      return count_main_kept_func_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
+      return count_main_kept_func_go(buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
     end
-    return count_main_kept_func_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc + 1)
+    return count_main_kept_func_go(buf: buf, pos: pos4, remaining: remaining - 1, acc: acc + 1)
   end
-  return count_main_kept_func_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
+  return count_main_kept_func_go(buf: buf, pos: pos4, remaining: remaining - 1, acc: acc)
 end
 
 // ─── Main non-stdlib import copying ──────────────────────────────────────
 // Copy main's non-stdlib function imports to output (no type offset needed — main types first)
-let copy_main_kept_imps = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
+let copy_main_kept_imps = fn (out: %ByteBuffer, buf: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
   if sec_pk == 0 then return %out end
   let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
-  return copy_main_kept_go(ps: ps, out: %out, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk))
+  return copy_main_kept_go(out: %out, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk))
 end
 // A main import is satisfied by dep (and dropped from merged imports) if:
 //   - module is "nexus:stdlib/*" (function, resolved to dep export), OR
@@ -329,27 +319,25 @@ end
 // Keeping main imports intact would require shifting dep's function indices by
 // m_kept, but remap_dep_func is identity (see remap_dep_func comment), so any
 // kept main import breaks dep internal calls.
-let copy_main_kept_go = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64) -> %ByteBuffer do
+let copy_main_kept_go = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64) -> %ByteBuffer do
   if remaining <= 0 then return %out end
   let start = pos
-  let mod_name = rd_str(ps: ps, buf: buf, pos: pos)
-  let pos2 = get_p(ps: ps)
-  let _name = rd_str(ps: ps, buf: buf, pos: pos2)
-  let pos3 = get_p(ps: ps)
+  let StrPos(s: mod_name, pos: pos2) = rd_str(buf: buf, pos: pos)
+  let StrPos(s: _name, pos: pos3) = rd_str(buf: buf, pos: pos2)
   let kind = bb.get_byte(buf: buf, idx: pos3)
   let pos4 = skip_imp_desc(buf: buf, pos: pos3)
   if str.starts_with(s: mod_name, prefix: "nexus:stdlib/") then
-    return copy_main_kept_go(ps: ps, out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
+    return copy_main_kept_go(out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
   end
   if str.byte_length(s: mod_name) == 0 then
-    return copy_main_kept_go(ps: ps, out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
+    return copy_main_kept_go(out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
   end
   if kind == 2 then
-    return copy_main_kept_go(ps: ps, out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
+    return copy_main_kept_go(out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
   end
   // Non-stdlib import: copy as-is (type indices correct — main types first)
   let %out = bb.copy_range(dst: %out, src: buf, start: start, end_pos: pos4)
-  return copy_main_kept_go(ps: ps, out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
+  return copy_main_kept_go(out: %out, buf: buf, pos: pos4, remaining: remaining - 1)
 end
 
 // ─── Main import resolution ───────────────────────────────────────────────
@@ -357,55 +345,45 @@ end
 // function index for each main function import. Iterates import section
 // sequentially; fidx increments only for function-kind imports, matching
 // the array index.
-// Context keys in ps: "remap", "dep_exp", "kept", "stubs", "m_imp_base", "m_kept_idx"
-let resolve_main_imports = fn (ps: i64, buf: &ByteBuffer, sec_pk: i64) -> unit do
+let resolve_main_imports = fn (ctx: %ResolveCtx, dep_exports: &StringMap, buf: &ByteBuffer, sec_pk: i64) -> %ResolveCtx do
   if sec_pk > 0 then
-    __nx_smap_put(id: ps, key: "m_kept_idx", value: 0)
     let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
-    resolve_main_go(ps: ps, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), fidx: 0)
+    return resolve_main_go(ctx: %ctx, dep_exports: dep_exports, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), state: ResolveState(fidx: 0, m_kept_idx: 0))
   end
+  return %ctx
 end
-let resolve_main_go = fn (ps: i64, buf: &ByteBuffer, pos: i64, remaining: i64, fidx: i64) -> unit do
-  if remaining > 0 then
-    let mod_name = rd_str(ps: ps, buf: buf, pos: pos)
-    let pos2 = get_p(ps: ps)
-    let func_name = rd_str(ps: ps, buf: buf, pos: pos2)
-    let pos3 = get_p(ps: ps)
-    let kind = bb.get_byte(buf: buf, idx: pos3)
-    let pos4 = skip_imp_desc(buf: buf, pos: pos3)
-    if kind == 0 then
-      let remap = __nx_smap_get(id: ps, key: "remap", default_val: 0)
-      // stdlib/* and empty-module function imports resolve to dep exports.
-      let is_dep = if str.starts_with(s: mod_name, prefix: "nexus:stdlib/") then true
-                   else str.byte_length(s: mod_name) == 0 end
-      let new_idx = if is_dep then
-        let dep_exports = __nx_smap_get(id: ps, key: "dep_exp", default_val: 0)
-        let raw_lookup = __nx_smap_get(id: dep_exports, key: func_name, default_val: 0)
-        let dep_raw = if raw_lookup > 0 then raw_lookup
-        else
-          let exp_name = wit_to_export(wit_name: func_name)
-          __nx_smap_get(id: dep_exports, key: exp_name, default_val: 0)
-        end
-        if dep_raw > 0 then
-          let dep_fidx = dep_raw - 1
-          let kept_fimp = __nx_smap_get(id: ps, key: "kept", default_val: 0)
-          let n_stubs = __nx_smap_get(id: ps, key: "stubs", default_val: 0)
-          let orig_dep_fimp = __nx_smap_get(id: ps, key: "dep_fimp", default_val: 0)
-          remap_dep_func(dep_fidx: dep_fidx, kept_fimp: kept_fimp,
-                         n_stubs: n_stubs, dep_fimp: orig_dep_fimp)
-        else fidx end
+let resolve_main_go = fn (ctx: %ResolveCtx, dep_exports: &StringMap, buf: &ByteBuffer, pos: i64, remaining: i64, state: ResolveState) -> %ResolveCtx do
+  if remaining <= 0 then return %ctx end
+  let StrPos(s: mod_name, pos: pos2) = rd_str(buf: buf, pos: pos)
+  let StrPos(s: func_name, pos: pos3) = rd_str(buf: buf, pos: pos2)
+  let kind = bb.get_byte(buf: buf, idx: pos3)
+  let pos4 = skip_imp_desc(buf: buf, pos: pos3)
+  if kind == 0 then
+    let ResolveCtx(remap: %remap, kept_fimp: kept_fimp, n_stubs: n_stubs, dep_fimp: dep_fimp, m_imp_base: m_imp_base) = ctx
+    let ResolveState(fidx: fidx, m_kept_idx: m_kept_idx) = state
+    // stdlib/* and empty-module function imports resolve to dep exports.
+    let is_dep = if str.starts_with(s: mod_name, prefix: "nexus:stdlib/") then true
+                 else str.byte_length(s: mod_name) == 0 end
+    let new_kept_idx = if is_dep then m_kept_idx else m_kept_idx + 1 end
+    let new_idx = if is_dep then
+      let raw_lookup = sm.get_or(map: dep_exports, key: func_name, default: 0)
+      let dep_raw = if raw_lookup > 0 then raw_lookup
       else
-        let m_imp_base = __nx_smap_get(id: ps, key: "m_imp_base", default_val: 0)
-        let m_kept_idx = __nx_smap_get(id: ps, key: "m_kept_idx", default_val: 0)
-        let _r2 = __nx_smap_put(id: ps, key: "m_kept_idx", value: m_kept_idx + 1)
-        m_imp_base + m_kept_idx
+        let exp_name = wit_to_export(wit_name: func_name)
+        sm.get_or(map: dep_exports, key: exp_name, default: 0)
       end
-      intarr_push(id: remap, val: new_idx)
-      resolve_main_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, fidx: fidx + 1)
+      if dep_raw > 0 then
+        remap_dep_func(dep_fidx: dep_raw - 1, kept_fimp: kept_fimp,
+                       n_stubs: n_stubs, dep_fimp: dep_fimp)
+      else fidx end
     else
-      resolve_main_go(ps: ps, buf: buf, pos: pos4, remaining: remaining - 1, fidx: fidx)
+      m_imp_base + m_kept_idx
     end
+    let %remap = intarr_push(arr: %remap, val: new_idx)
+    let %ctx = ResolveCtx(remap: %remap, kept_fimp: kept_fimp, n_stubs: n_stubs, dep_fimp: dep_fimp, m_imp_base: m_imp_base)
+    return resolve_main_go(ctx: %ctx, dep_exports: dep_exports, buf: buf, pos: pos4, remaining: remaining - 1, state: ResolveState(fidx: fidx + 1, m_kept_idx: new_kept_idx))
   end
+  return resolve_main_go(ctx: %ctx, dep_exports: dep_exports, buf: buf, pos: pos4, remaining: remaining - 1, state: state)
 end
 
 // Map a dep function index to its new merged index
@@ -420,45 +398,45 @@ end
 // push_identity(arr, 0..n): arr[i] = i. Used for dep WASI imports (preserved).
 // push_offset(arr, n, off): arr[len..len+n] = [len+off, len+1+off, ...].
 // Arrays must be populated in order matching their index space.
-let push_identity = fn (arr: i64, i: i64, n: i64) -> unit do
+let push_identity = fn (arr: %ByteBuffer, i: i64, n: i64) -> %ByteBuffer do
   if i < n then
-    intarr_push(id: arr, val: i)
-    push_identity(arr: arr, i: i + 1, n: n)
+    let %arr = intarr_push(arr: %arr, val: i)
+    return push_identity(arr: %arr, i: i + 1, n: n)
   end
+  return %arr
 end
-let push_offset = fn (arr: i64, i: i64, n: i64, off: i64) -> unit do
+let push_offset = fn (arr: %ByteBuffer, i: i64, n: i64, off: i64) -> %ByteBuffer do
   if i < n then
-    intarr_push(id: arr, val: i + off)
-    push_offset(arr: arr, i: i + 1, n: n, off: off)
+    let %arr = intarr_push(arr: %arr, val: i + off)
+    return push_offset(arr: %arr, i: i + 1, n: n, off: off)
   end
+  return %arr
 end
 
-let remap_main_locals = fn (remap: i64, m_fimp: i64, m_loc: i64,
-    kept_fimp: i64, n_stubs: i64, d_loc: i64) -> unit do
+let remap_main_locals = fn (remap: %ByteBuffer, m_fimp: i64, m_loc: i64,
+    kept_fimp: i64, n_stubs: i64, d_loc: i64) -> %ByteBuffer do
   // Main locals sit at merged idx = (kept_fimp + n_stubs + d_loc) + (i - m_fimp).
   // Entries m_fimp..m_fimp+m_loc append after main-import entries.
-  push_offset(arr: remap, i: m_fimp, n: m_fimp + m_loc,
+  return push_offset(arr: %remap, i: m_fimp, n: m_fimp + m_loc,
     off: kept_fimp + n_stubs + d_loc - m_fimp)
 end
 
-let remap_dep_locals = fn (remap: i64, dep_fimp: i64, d_loc: i64,
-    kept_fimp: i64, n_stubs: i64) -> unit do
+let remap_dep_locals = fn (remap: %ByteBuffer, dep_fimp: i64, d_loc: i64,
+    kept_fimp: i64, n_stubs: i64) -> %ByteBuffer do
   // Dep locals sit at merged idx = (kept_fimp + n_stubs) + (i - dep_fimp).
-  push_offset(arr: remap, i: dep_fimp, n: dep_fimp + d_loc,
+  return push_offset(arr: %remap, i: dep_fimp, n: dep_fimp + d_loc,
     off: kept_fimp + n_stubs - dep_fimp)
 end
 
 // ─── Instruction rewriter ─────────────────────────────────────────────────
 
-// Context keys in ps: "remap", "glo", "typ", "tbl"
-let rw_body = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer,
+let rw_body = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &ByteBuffer,
     body_start: i64, body_end: i64) -> %ByteBuffer do
   let pk = rd_uleb(buf: src, pos: body_start)
   let n_local_groups = pval(pk: pk)
   let locals_end = skip_local_decls(buf: src, pos: ppos(pk: pk), remaining: n_local_groups)
   let %out = bb.copy_range(dst: %out, src: src, start: body_start, end_pos: locals_end)
-  set_p(ps: ps, v: locals_end)
-  return rw_instrs(ps: ps, out: %out, src: src, end_pos: body_end)
+  return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: locals_end, end_pos: body_end)
 end
 
 let skip_local_decls = fn (buf: &ByteBuffer, pos: i64, remaining: i64) -> i64 do
@@ -467,12 +445,10 @@ let skip_local_decls = fn (buf: &ByteBuffer, pos: i64, remaining: i64) -> i64 do
   return skip_local_decls(buf: buf, pos: ppos(pk: pk) + 1, remaining: remaining - 1)
 end
 
-// Context keys in ps: "remap" -> smap id, "glo" -> glo_off, "typ" -> type_off, "tbl" -> tbl_off
-let rw_instrs = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, end_pos: i64) -> %ByteBuffer do
-  let pos = get_p(ps: ps)
+let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &ByteBuffer, pos: i64, end_pos: i64) -> %ByteBuffer do
   if pos >= end_pos then return %out end
   let op = bb.get_byte(buf: src, idx: pos)
-  set_p(ps: ps, v: pos + 1)
+  let pos = pos + 1
 
   // Classify opcode into handling groups:
   // 0 = no operand, 1 = single ULEB (no remap), 2 = call_indirect (type_off + tbl_off),
@@ -520,203 +496,157 @@ let rw_instrs = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, end_pos: i64) -
     end
   end
 
+  let RwCtx(type_off: type_off, tbl_off: tbl_off, glo_off: glo_off) = ctx
+
   // Handle each class — flat if-return-end pattern for TCO + typechecker compat
   let %out = bb.push_byte(buf: %out, byte: op)
 
   if cls == 1 then
-    let pos2 = get_p(ps: ps)
-    let pk = rd_uleb(buf: src, pos: pos2)
-    set_p(ps: ps, v: ppos(pk: pk))
+    let pk = rd_uleb(buf: src, pos: pos)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk))
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: ppos(pk: pk), end_pos: end_pos)
   end
   if cls == 2 then
     // call_indirect: type_idx (+ type_off), table_idx (+ tbl_off)
-    let type_off = __nx_smap_get(id: ps, key: "typ", default_val: 0)
-    let tbl_off = __nx_smap_get(id: ps, key: "tbl", default_val: 0)
-    let pos2 = get_p(ps: ps)
-    let pk = rd_uleb(buf: src, pos: pos2)
+    let pk = rd_uleb(buf: src, pos: pos)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk) + type_off)
     let pk2 = rd_uleb(buf: src, pos: ppos(pk: pk))
-    set_p(ps: ps, v: ppos(pk: pk2))
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2) + tbl_off)
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: ppos(pk: pk2), end_pos: end_pos)
   end
   if cls == 3 then
-    let type_off = __nx_smap_get(id: ps, key: "typ", default_val: 0)
-    let %out = rw_blocktype_operand(ps: ps, out: %out, src: src, type_off: type_off)
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    let BufPos(buf: %out, pos: pos) = rw_blocktype_operand(out: %out, src: src, pos: pos, type_off: type_off)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: pos, end_pos: end_pos)
   end
   if cls == 4 then
     // SLEB operand: no remap needed, just copy bytes verbatim.
     // Find terminal byte (first byte < 128 or >= 128 flipped — i.e., high bit clear)
     // and bulk-copy. Avoids rd_sleb entirely (which was hitting a codegen quirk).
-    let pos2 = get_p(ps: ps)
-    let end_sleb = scan_sleb_end(buf: src, pos: pos2)
-    let %out = bb.copy_range(dst: %out, src: src, start: pos2, end_pos: end_sleb)
-    set_p(ps: ps, v: end_sleb)
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    let end_sleb = scan_sleb_end(buf: src, pos: pos)
+    let %out = bb.copy_range(dst: %out, src: src, start: pos, end_pos: end_sleb)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: end_sleb, end_pos: end_pos)
   end
   if cls == 5 then
-    let pos2 = get_p(ps: ps)
-    let %out = bb.copy_range(dst: %out, src: src, start: pos2, end_pos: pos2 + 8)
-    set_p(ps: ps, v: pos2 + 8)
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    let %out = bb.copy_range(dst: %out, src: src, start: pos, end_pos: pos + 8)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: pos + 8, end_pos: end_pos)
   end
   if cls == 6 then
-    let pos2 = get_p(ps: ps)
-    let pk = rd_uleb(buf: src, pos: pos2)
+    let pk = rd_uleb(buf: src, pos: pos)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk))
     let pk2 = rd_uleb(buf: src, pos: ppos(pk: pk))
-    set_p(ps: ps, v: ppos(pk: pk2))
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2))
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: ppos(pk: pk2), end_pos: end_pos)
   end
   if cls == 7 then
-    let pos2 = get_p(ps: ps)
-    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos2))
-    set_p(ps: ps, v: pos2 + 1)
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: pos + 1, end_pos: end_pos)
   end
   if cls == 8 then
-    let pos2 = get_p(ps: ps)
-    let pk = rd_uleb(buf: src, pos: pos2)
+    let pk = rd_uleb(buf: src, pos: pos)
     let count = pval(pk: pk)
     let %out = bb.push_uleb128(buf: %out, val: count)
-    set_p(ps: ps, v: ppos(pk: pk))
-    let %out = copy_br_labels(ps: ps, out: %out, src: src, remaining: count + 1)
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    let BufPos(buf: %out, pos: pos) = copy_br_labels(out: %out, src: src, pos: ppos(pk: pk), remaining: count + 1)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: pos, end_pos: end_pos)
   end
   if cls == 9 then
-    let type_off = __nx_smap_get(id: ps, key: "typ", default_val: 0)
-    let %out = rw_blocktype_operand(ps: ps, out: %out, src: src, type_off: type_off)
-    let pos2 = get_p(ps: ps)
-    let pk = rd_uleb(buf: src, pos: pos2)
+    let BufPos(buf: %out, pos: pos) = rw_blocktype_operand(out: %out, src: src, pos: pos, type_off: type_off)
+    let pk = rd_uleb(buf: src, pos: pos)
     let n_handlers = pval(pk: pk)
     let %out = bb.push_uleb128(buf: %out, val: n_handlers)
-    set_p(ps: ps, v: ppos(pk: pk))
-    let %out = copy_try_handlers(ps: ps, out: %out, src: src, remaining: n_handlers)
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    let BufPos(buf: %out, pos: pos) = copy_try_handlers(out: %out, src: src, pos: ppos(pk: pk), remaining: n_handlers)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: pos, end_pos: end_pos)
   end
   if cls == 10 then
-    let pos2 = get_p(ps: ps)
-    let pk = rd_uleb(buf: src, pos: pos2)
+    let pk = rd_uleb(buf: src, pos: pos)
     let sub_op = pval(pk: pk)
     let %out = bb.push_uleb128(buf: %out, val: sub_op)
-    set_p(ps: ps, v: ppos(pk: pk))
-    let %out = rw_fc_prefix(ps: ps, out: %out, src: src, sub_op: sub_op)
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    let BufPos(buf: %out, pos: pos) = rw_fc_prefix(out: %out, src: src, pos: ppos(pk: pk), sub_op: sub_op)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: pos, end_pos: end_pos)
   end
   if cls == 11 then
     // call / return_call: remap function index via intarr (dense i32 lookup)
-    let pos2 = get_p(ps: ps)
-    let pk = rd_uleb(buf: src, pos: pos2)
+    let pk = rd_uleb(buf: src, pos: pos)
     let old_idx = pval(pk: pk)
-    set_p(ps: ps, v: ppos(pk: pk))
-    let remap = __nx_smap_get(id: ps, key: "remap", default_val: 0)
-    let new_idx = intarr_get(id: remap, idx: old_idx)
+    let new_idx = intarr_get(arr: remap, idx: old_idx)
     let %out = bb.push_uleb128(buf: %out, val: new_idx)
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: ppos(pk: pk), end_pos: end_pos)
   end
   if cls == 12 then
     // global.get / global.set: add glo_off to index
-    let glo_off = __nx_smap_get(id: ps, key: "glo", default_val: 0)
-    let pos2 = get_p(ps: ps)
-    let pk = rd_uleb(buf: src, pos: pos2)
-    set_p(ps: ps, v: ppos(pk: pk))
+    let pk = rd_uleb(buf: src, pos: pos)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk) + glo_off)
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: ppos(pk: pk), end_pos: end_pos)
   end
   if cls == 13 then
     // ref.func: remap function index via intarr
-    let pos2 = get_p(ps: ps)
-    let pk = rd_uleb(buf: src, pos: pos2)
+    let pk = rd_uleb(buf: src, pos: pos)
     let old_idx = pval(pk: pk)
-    set_p(ps: ps, v: ppos(pk: pk))
-    let remap = __nx_smap_get(id: ps, key: "remap", default_val: 0)
-    let new_idx = intarr_get(id: remap, idx: old_idx)
+    let new_idx = intarr_get(arr: remap, idx: old_idx)
     let %out = bb.push_uleb128(buf: %out, val: new_idx)
-    return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+    return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: ppos(pk: pk), end_pos: end_pos)
   end
   // cls == 0: no operand, already pushed byte
-  return rw_instrs(ps: ps, out: %out, src: src, end_pos: end_pos)
+  return rw_instrs(ctx: ctx, remap: remap, out: %out, src: src, pos: pos, end_pos: end_pos)
 end
 
 // Handle 0xFC prefix sub-opcodes (extracted to avoid deep nesting)
-let rw_fc_prefix = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, sub_op: i64) -> %ByteBuffer do
-  if sub_op <= 7 then return %out end
+let rw_fc_prefix = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, sub_op: i64) -> BufPos do
+  if sub_op <= 7 then return BufPos(buf: %out, pos: pos) end
   if sub_op == 10 then
-    let pos3 = get_p(ps: ps)
-    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos3))
-    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos3 + 1))
-    set_p(ps: ps, v: pos3 + 2)
-    return %out
+    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
+    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos + 1))
+    return BufPos(buf: %out, pos: pos + 2)
   end
   if sub_op == 11 then
-    let pos3 = get_p(ps: ps)
-    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos3))
-    set_p(ps: ps, v: pos3 + 1)
-    return %out
+    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
+    return BufPos(buf: %out, pos: pos + 1)
   end
   if sub_op >= 8 then
-    let pos3 = get_p(ps: ps)
-    let pk2 = rd_uleb(buf: src, pos: pos3)
+    let pk2 = rd_uleb(buf: src, pos: pos)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2))
     if sub_op == 8 then
       let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: ppos(pk: pk2)))
-      set_p(ps: ps, v: ppos(pk: pk2) + 1)
-      return %out
+      return BufPos(buf: %out, pos: ppos(pk: pk2) + 1)
     end
     if sub_op == 12 then
       let pk3 = rd_uleb(buf: src, pos: ppos(pk: pk2))
       let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk3))
-      set_p(ps: ps, v: ppos(pk: pk3))
-      return %out
+      return BufPos(buf: %out, pos: ppos(pk: pk3))
     end
     if sub_op == 14 then
       let pk3 = rd_uleb(buf: src, pos: ppos(pk: pk2))
       let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk3))
-      set_p(ps: ps, v: ppos(pk: pk3))
-      return %out
+      return BufPos(buf: %out, pos: ppos(pk: pk3))
     end
-    set_p(ps: ps, v: ppos(pk: pk2))
-    return %out
+    return BufPos(buf: %out, pos: ppos(pk: pk2))
   end
-  return %out
+  return BufPos(buf: %out, pos: pos)
 end
 
 
-let rw_blocktype_operand = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, type_off: i64) -> %ByteBuffer do
-  let pos = get_p(ps: ps)
+let rw_blocktype_operand = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, type_off: i64) -> BufPos do
   let b = bb.get_byte(buf: src, idx: pos)
   // void blocktype (0x40) or valtype (>= 0x60)
   if b == 64 then
-    set_p(ps: ps, v: pos + 1)
-    return bb.push_byte(buf: %out, byte: 64)
+    return BufPos(buf: bb.push_byte(buf: %out, byte: 64), pos: pos + 1)
   end
   if b >= 96 then
-    set_p(ps: ps, v: pos + 1)
-    return bb.push_byte(buf: %out, byte: b)
+    return BufPos(buf: bb.push_byte(buf: %out, byte: b), pos: pos + 1)
   end
   // Type index as sleb
-  let end2 = rd_sleb(ps: ps, buf: src, pos: pos)
-  let type_idx = get_v(ps: ps)
-  set_p(ps: ps, v: end2)
-  return bb.push_sleb128(buf: %out, val: type_idx + type_off)
+  let SlebRes(val: type_idx, pos: end2) = rd_sleb(buf: src, pos: pos)
+  return BufPos(buf: bb.push_sleb128(buf: %out, val: type_idx + type_off), pos: end2)
 end
 
-let copy_br_labels = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, remaining: i64) -> %ByteBuffer do
-  if remaining <= 0 then return %out end
-  let pos = get_p(ps: ps)
+let copy_br_labels = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64) -> BufPos do
+  if remaining <= 0 then return BufPos(buf: %out, pos: pos) end
   let pk = rd_uleb(buf: src, pos: pos)
-  set_p(ps: ps, v: ppos(pk: pk))
   let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk))
-  return copy_br_labels(ps: ps, out: %out, src: src, remaining: remaining - 1)
+  return copy_br_labels(out: %out, src: src, pos: ppos(pk: pk), remaining: remaining - 1)
 end
 
-let copy_try_handlers = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, remaining: i64) -> %ByteBuffer do
-  if remaining <= 0 then return %out end
-  let pos = get_p(ps: ps)
+let copy_try_handlers = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64) -> BufPos do
+  if remaining <= 0 then return BufPos(buf: %out, pos: pos) end
   let catch_kind = bb.get_byte(buf: src, idx: pos)
   let %out = bb.push_byte(buf: %out, byte: catch_kind)
   if catch_kind <= 1 then
@@ -724,13 +654,11 @@ let copy_try_handlers = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, remaini
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk))
     let pk2 = rd_uleb(buf: src, pos: ppos(pk: pk))
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2))
-    set_p(ps: ps, v: ppos(pk: pk2))
-    return copy_try_handlers(ps: ps, out: %out, src: src, remaining: remaining - 1)
+    return copy_try_handlers(out: %out, src: src, pos: ppos(pk: pk2), remaining: remaining - 1)
   end
   let pk = rd_uleb(buf: src, pos: pos + 1)
   let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk))
-  set_p(ps: ps, v: ppos(pk: pk))
-  return copy_try_handlers(ps: ps, out: %out, src: src, remaining: remaining - 1)
+  return copy_try_handlers(out: %out, src: src, pos: ppos(pk: pk), remaining: remaining - 1)
 end
 
 // ─── Section emitters ─────────────────────────────────────────────────────
@@ -772,14 +700,12 @@ let emit_merged_types_inline = fn (d_buf: &ByteBuffer, d_sec: i64, m_buf: &ByteB
   return %out
 end
 
-let copy_imports_with_type_off = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer,
+let copy_imports_with_type_off = fn (out: %ByteBuffer, buf: &ByteBuffer,
     pos: i64, remaining: i64, type_off: i64) -> %ByteBuffer do
   if remaining <= 0 then return %out end
   let start = pos
-  let _mod = rd_str(ps: ps, buf: buf, pos: pos)
-  let pos2 = get_p(ps: ps)
-  let _name = rd_str(ps: ps, buf: buf, pos: pos2)
-  let pos3 = get_p(ps: ps)
+  let StrPos(s: _mod, pos: pos2) = rd_str(buf: buf, pos: pos)
+  let StrPos(s: _name, pos: pos3) = rd_str(buf: buf, pos: pos2)
   let kind = bb.get_byte(buf: buf, idx: pos3)
   if kind == 0 then
     // Function import: copy name bytes, then offset type index
@@ -787,13 +713,13 @@ let copy_imports_with_type_off = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer
     let pk = rd_uleb(buf: buf, pos: pos3 + 1)
     let type_idx = pval(pk: pk)
     let %out = bb.push_uleb128(buf: %out, val: type_idx + type_off)
-    return copy_imports_with_type_off(ps: ps, out: %out, buf: buf,
+    return copy_imports_with_type_off(out: %out, buf: buf,
       pos: ppos(pk: pk), remaining: remaining - 1, type_off: type_off)
   end
   // Non-function import: copy everything as-is
   let pos4 = skip_imp_desc(buf: buf, pos: pos3)
   let %out = bb.copy_range(dst: %out, src: buf, start: start, end_pos: pos4)
-  return copy_imports_with_type_off(ps: ps, out: %out, buf: buf,
+  return copy_imports_with_type_off(out: %out, buf: buf,
     pos: pos4, remaining: remaining - 1, type_off: type_off)
 end
 
@@ -826,26 +752,25 @@ end
 // Like emit_merged_globals but patches main G0 (heap_base += reloc) and G1 (str_base = reloc).
 // Main globals are: G0 (heap_base), G1 (str_base=0→patched), G2 (placeholder).
 // Each global: valtype(1) + mut(1) + i32.const(1) + sleb128(value) + end(1).
-let emit_remapped_exports = fn (ps: i64, out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
-    remap: i64) -> %ByteBuffer do
+let emit_remapped_exports = fn (out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
+    remap: &ByteBuffer) -> %ByteBuffer do
   if m_sec == 0 then return %out end
   let %tmp = bb.empty()
   let pk = rd_uleb(buf: m_buf, pos: sec_off(pk: m_sec))
   let count = pval(pk: pk)
   let %tmp = bb.push_uleb128(buf: %tmp, val: count)
-  let %tmp = remap_export_entries(ps: ps, out: %tmp, buf: m_buf, pos: ppos(pk: pk),
+  let %tmp = remap_export_entries(out: %tmp, buf: m_buf, pos: ppos(pk: pk),
     remaining: count, remap: remap)
   let %out = emit_sec(out: %out, sec_id: 7, content: &tmp)
   bb.free(buf: %tmp)
   return %out
 end
 
-let remap_export_entries = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, pos: i64,
-    remaining: i64, remap: i64) -> %ByteBuffer do
+let remap_export_entries = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64,
+    remaining: i64, remap: &ByteBuffer) -> %ByteBuffer do
   if remaining <= 0 then return %out end
   let name_start = pos
-  let _name = rd_str(ps: ps, buf: buf, pos: pos)
-  let pos2 = get_p(ps: ps)
+  let StrPos(s: _name, pos: pos2) = rd_str(buf: buf, pos: pos)
   let kind = bb.get_byte(buf: buf, idx: pos2)
   let pk = rd_uleb(buf: buf, pos: pos2 + 1)
   let old_idx = pval(pk: pk)
@@ -853,18 +778,17 @@ let remap_export_entries = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, pos:
   let %out = bb.copy_range(dst: %out, src: buf, start: name_start, end_pos: pos2)
   let %out = bb.push_byte(buf: %out, byte: kind)
   if kind == 0 then
-    let new_idx = intarr_get(id: remap, idx: old_idx)
+    let new_idx = intarr_get(arr: remap, idx: old_idx)
     let %out = bb.push_uleb128(buf: %out, val: new_idx)
-    return remap_export_entries(ps: ps, out: %out, buf: buf, pos: pos3, remaining: remaining - 1, remap: remap)
+    return remap_export_entries(out: %out, buf: buf, pos: pos3, remaining: remaining - 1, remap: remap)
   end
   let %out = bb.push_uleb128(buf: %out, val: old_idx)
-  return remap_export_entries(ps: ps, out: %out, buf: buf, pos: pos3, remaining: remaining - 1, remap: remap)
+  return remap_export_entries(out: %out, buf: buf, pos: pos3, remaining: remaining - 1, remap: remap)
 end
 
-// Context already set in ps: "remap", "glo", "typ", "tbl"
-let maybe_rewrite_bodies = fn (ps: i64, buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
+let maybe_rewrite_bodies = fn (ctx: RwCtx, remap: &ByteBuffer, buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
   if sec_pk > 0 then
-    return rewrite_code_bodies(ps: ps, out: %buf, src: src, sec_pk: sec_pk)
+    return rewrite_code_bodies(ctx: ctx, remap: remap, out: %buf, src: src, sec_pk: sec_pk)
   end
   return %buf
 end
@@ -878,14 +802,14 @@ let emit_stub_bodies = fn (out: %ByteBuffer, i: i64, n: i64) -> %ByteBuffer do
   return emit_stub_bodies(out: %out, i: i + 1, n: n)
 end
 
-let rewrite_code_bodies = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
+let rewrite_code_bodies = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
   let pk = rd_uleb(buf: src, pos: sec_off(pk: sec_pk))
   let count = pval(pk: pk)
   let %body_buf = bb.empty()
-  let %out = rewrite_code_go(ps: ps, out: %out, src: src, pos: ppos(pk: pk), remaining: count, body_buf: %body_buf)
+  let %out = rewrite_code_go(ctx: ctx, remap: remap, out: %out, src: src, pos: ppos(pk: pk), remaining: count, body_buf: %body_buf)
   return %out
 end
-let rewrite_code_go = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64, body_buf: %ByteBuffer) -> %ByteBuffer do
+let rewrite_code_go = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64, body_buf: %ByteBuffer) -> %ByteBuffer do
   if remaining <= 0 then
     bb.free(buf: %body_buf)
     return %out
@@ -895,11 +819,11 @@ let rewrite_code_go = fn (ps: i64, out: %ByteBuffer, src: &ByteBuffer, pos: i64,
   let body_start = ppos(pk: pk)
   let body_end = body_start + body_size
   let %body_buf = bb.truncate(buf: %body_buf, len: 0)
-  let %body_buf = rw_body(ps: ps, out: %body_buf, src: src, body_start: body_start, body_end: body_end)
+  let %body_buf = rw_body(ctx: ctx, remap: remap, out: %body_buf, src: src, body_start: body_start, body_end: body_end)
   let new_size = bb.length(buf: &body_buf)
   let %out = bb.push_uleb128(buf: %out, val: new_size)
   let %out = bb.push_buf(dst: %out, src: &body_buf)
-  return rewrite_code_go(ps: ps, out: %out, src: src, pos: body_end, remaining: remaining - 1, body_buf: %body_buf)
+  return rewrite_code_go(ctx: ctx, remap: remap, out: %out, src: src, pos: body_end, remaining: remaining - 1, body_buf: %body_buf)
 end
 
 // Find the highest data-segment end (offset + length) in a data section.
@@ -966,14 +890,14 @@ let emit_merged_data = fn (out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
   return %out
 end
 
-let maybe_remap_elem = fn (ps: i64, buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64, remap: i64) -> %ByteBuffer do
+let maybe_remap_elem = fn (buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64, remap: &ByteBuffer) -> %ByteBuffer do
   if sec_pk > 0 then
-    return remap_elem_segments(ps: ps, out: %buf, buf: src, sec_pk: sec_pk, remap: remap)
+    return remap_elem_segments(out: %buf, buf: src, sec_pk: sec_pk, remap: remap)
   end
   return %buf
 end
 
-let emit_merged_elements = fn (ps: i64, out: %ByteBuffer,
+let emit_merged_elements = fn (out: %ByteBuffer,
     d_buf: &ByteBuffer, d_sec: i64, remap_d: i64,
     m_buf: &ByteBuffer, m_sec: i64, remap_m: i64) -> %ByteBuffer do
   let d_count = count_sec(buf: d_buf, sec_pk: d_sec)
@@ -981,18 +905,18 @@ let emit_merged_elements = fn (ps: i64, out: %ByteBuffer,
   if d_count + m_count == 0 then return %out end
   let %tmp = bb.empty()
   let %tmp = bb.push_uleb128(buf: %tmp, val: d_count + m_count)
-  let %tmp = maybe_remap_elem(ps: ps, buf: %tmp, src: d_buf, sec_pk: d_sec, remap: remap_d)
-  let %tmp = maybe_remap_elem(ps: ps, buf: %tmp, src: m_buf, sec_pk: m_sec, remap: remap_m)
+  let %tmp = maybe_remap_elem(buf: %tmp, src: d_buf, sec_pk: d_sec, remap: remap_d)
+  let %tmp = maybe_remap_elem(buf: %tmp, src: m_buf, sec_pk: m_sec, remap: remap_m)
   let %out = emit_sec(out: %out, sec_id: 9, content: &tmp)
   bb.free(buf: %tmp)
   return %out
 end
 
-let remap_elem_segments = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, sec_pk: i64, remap: i64) -> %ByteBuffer do
+let remap_elem_segments = fn (out: %ByteBuffer, buf: &ByteBuffer, sec_pk: i64, remap: &ByteBuffer) -> %ByteBuffer do
   let pk = rd_uleb(buf: buf, pos: sec_off(pk: sec_pk))
-  return remap_elem_go(ps: ps, out: %out, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), remap: remap)
+  return remap_elem_go(out: %out, buf: buf, pos: ppos(pk: pk), remaining: pval(pk: pk), remap: remap)
 end
-let remap_elem_go = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64, remap: i64) -> %ByteBuffer do
+let remap_elem_go = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64, remap: &ByteBuffer) -> %ByteBuffer do
   if remaining <= 0 then return %out end
   let kind = bb.get_byte(buf: buf, idx: pos)
   let %out = bb.push_byte(buf: %out, byte: kind)
@@ -1006,22 +930,19 @@ let remap_elem_go = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, pos: i64, r
     let pk = rd_uleb(buf: buf, pos: sleb_end + 1)
     let n_funcs = pval(pk: pk)
     let %out = bb.push_uleb128(buf: %out, val: n_funcs)
-    set_p(ps: ps, v: ppos(pk: pk))
-    let %out = remap_elem_funcs(ps: ps, out: %out, buf: buf, remaining: n_funcs, remap: remap)
-    return remap_elem_go(ps: ps, out: %out, buf: buf, pos: get_p(ps: ps), remaining: remaining - 1, remap: remap)
+    let BufPos(buf: %out, pos: next_pos) = remap_elem_funcs(out: %out, buf: buf, pos: ppos(pk: pk), remaining: n_funcs, remap: remap)
+    return remap_elem_go(out: %out, buf: buf, pos: next_pos, remaining: remaining - 1, remap: remap)
   end
   return %out
 end
 
-let remap_elem_funcs = fn (ps: i64, out: %ByteBuffer, buf: &ByteBuffer, remaining: i64, remap: i64) -> %ByteBuffer do
-  if remaining <= 0 then return %out end
-  let pos = get_p(ps: ps)
+let remap_elem_funcs = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64, remap: &ByteBuffer) -> BufPos do
+  if remaining <= 0 then return BufPos(buf: %out, pos: pos) end
   let pk = rd_uleb(buf: buf, pos: pos)
   let old_idx = pval(pk: pk)
-  set_p(ps: ps, v: ppos(pk: pk))
-  let new_idx = intarr_get(id: remap, idx: old_idx)
+  let new_idx = intarr_get(arr: remap, idx: old_idx)
   let %out = bb.push_uleb128(buf: %out, val: new_idx)
-  return remap_elem_funcs(ps: ps, out: %out, buf: buf, remaining: remaining - 1, remap: remap)
+  return remap_elem_funcs(out: %out, buf: buf, pos: ppos(pk: pk), remaining: remaining - 1, remap: remap)
 end
 
 // ─── Full merge assembler ─────────────────────────────────────────────────
@@ -1049,23 +970,23 @@ end
 // index ("0", "1", …) -> pack(content_start, sec_size). The special key
 // "__count" holds the total number of custom sections discovered.
 // `scan_secs` collapses all customs onto key="0", which is why we need this.
-let scan_custom_secs = fn (buf: &ByteBuffer) -> i64 do
-  let map = __nx_smap_new()
-  let c = scan_custom_go(buf: buf, pos: 8, end_pos: bb.length(buf: buf), map: map, idx: 0)
-  __nx_smap_put(id: map, key: "__count", value: c)
-  return map
+let scan_custom_secs = fn (buf: &ByteBuffer) -> %StringMap do
+  let %map = sm.empty()
+  return scan_custom_go(buf: buf, pos: 8, end_pos: bb.length(buf: buf), map: %map, idx: 0)
 end
-let scan_custom_go = fn (buf: &ByteBuffer, pos: i64, end_pos: i64, map: i64, idx: i64) -> i64 do
-  if pos >= end_pos then return idx end
+let scan_custom_go = fn (buf: &ByteBuffer, pos: i64, end_pos: i64, map: %StringMap, idx: i64) -> %StringMap do
+  if pos >= end_pos then
+    return sm.put(map: %map, key: "__count", value: idx)
+  end
   let sec_id = bb.get_byte(buf: buf, idx: pos)
   let pk = rd_uleb(buf: buf, pos: pos + 1)
   let sec_size = pval(pk: pk)
   let content_start = ppos(pk: pk)
-  let new_idx = if sec_id == 0 then
-      __nx_smap_put(id: map, key: str.from_i64(val: idx), value: pack(val: content_start, p: sec_size))
-      idx + 1
-    else idx end
-  return scan_custom_go(buf: buf, pos: content_start + sec_size, end_pos: end_pos, map: map, idx: new_idx)
+  if sec_id == 0 then
+    let %map = sm.put(map: %map, key: str.from_i64(val: idx), value: pack(val: content_start, p: sec_size))
+    return scan_custom_go(buf: buf, pos: content_start + sec_size, end_pos: end_pos, map: %map, idx: idx + 1)
+  end
+  return scan_custom_go(buf: buf, pos: content_start + sec_size, end_pos: end_pos, map: %map, idx: idx)
 end
 
 // Compare the ULEB-prefixed section name at `content_start` to `target`.
@@ -1094,7 +1015,7 @@ end
 // Subsec 1 (func names) and 2 (local names) get func_idx remapped.
 // All other subsecs are pass-through.
 let emit_name_subsecs_go = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64,
-                                 end_pos: i64, remap: i64, remap_size: i64) -> %ByteBuffer do
+                                 end_pos: i64, remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
   if pos >= end_pos then return %out end
   let sub_id = bb.get_byte(buf: src, idx: pos)
   let pk = rd_uleb(buf: src, pos: pos + 1)
@@ -1116,7 +1037,7 @@ end
 // Re-emit subsec 1 (function names): vec<(func_idx:ULEB, name:ULEB+bytes)>.
 // Build into tmp buf so we can prefix with ULEB(payload_len).
 let emit_name_funcsubsec = fn (out: %ByteBuffer, src: &ByteBuffer, sub_start: i64,
-                                 remap: i64, remap_size: i64) -> %ByteBuffer do
+                                 remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
   let pk = rd_uleb(buf: src, pos: sub_start)
   let count = pval(pk: pk)
   let entries_start = ppos(pk: pk)
@@ -1132,7 +1053,7 @@ let emit_name_funcsubsec = fn (out: %ByteBuffer, src: &ByteBuffer, sub_start: i6
   return %out
 end
 let emit_name_func_entries = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64,
-                                   remaining: i64, remap: i64, remap_size: i64) -> %ByteBuffer do
+                                   remaining: i64, remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
   if remaining <= 0 then return %out end
   let pk1 = rd_uleb(buf: src, pos: pos)
   let old_idx = pval(pk: pk1)
@@ -1140,7 +1061,7 @@ let emit_name_func_entries = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64,
   let pk2 = rd_uleb(buf: src, pos: after_idx)
   let n_len = pval(pk: pk2)
   let n_end = ppos(pk: pk2) + n_len
-  let new_idx = if old_idx < remap_size then intarr_get(id: remap, idx: old_idx) else old_idx end
+  let new_idx = if old_idx < remap_size then intarr_get(arr: remap, idx: old_idx) else old_idx end
   let %out = bb.push_uleb128(buf: %out, val: new_idx)
   let %out = bb.copy_range(dst: %out, src: src, start: after_idx, end_pos: n_end)
   return emit_name_func_entries(out: %out, src: src, pos: n_end, remaining: remaining - 1, remap: remap, remap_size: remap_size)
@@ -1149,7 +1070,7 @@ end
 // Re-emit subsec 2 (local names): vec<(func_idx:ULEB, vec<(local_idx, name)>)>.
 // Only the outer func_idx is remapped; inner local vec is copied verbatim.
 let emit_name_localsubsec = fn (out: %ByteBuffer, src: &ByteBuffer, sub_start: i64, sub_size: i64,
-                                  remap: i64, remap_size: i64) -> %ByteBuffer do
+                                  remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
   let pk = rd_uleb(buf: src, pos: sub_start)
   let count = pval(pk: pk)
   let entries_start = ppos(pk: pk)
@@ -1166,7 +1087,7 @@ let emit_name_localsubsec = fn (out: %ByteBuffer, src: &ByteBuffer, sub_start: i
   return %out
 end
 let emit_name_local_entries = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, end_pos: i64,
-                                    remaining: i64, remap: i64, remap_size: i64) -> %ByteBuffer do
+                                    remaining: i64, remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
   if remaining <= 0 then return %out end
   let pk1 = rd_uleb(buf: src, pos: pos)
   let old_idx = pval(pk: pk1)
@@ -1175,7 +1096,7 @@ let emit_name_local_entries = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, 
   let inner_count = pval(pk: pk2)
   let inner_start = ppos(pk: pk2)
   let inner_end = skip_local_inner(src: src, pos: inner_start, remaining: inner_count)
-  let new_idx = if old_idx < remap_size then intarr_get(id: remap, idx: old_idx) else old_idx end
+  let new_idx = if old_idx < remap_size then intarr_get(arr: remap, idx: old_idx) else old_idx end
   let %out = bb.push_uleb128(buf: %out, val: new_idx)
   let %out = bb.copy_range(dst: %out, src: src, start: after_idx, end_pos: inner_end)
   return emit_name_local_entries(out: %out, src: src, pos: inner_end, end_pos: end_pos,
@@ -1193,7 +1114,7 @@ end
 // The section-name ULEB-string is copied verbatim; subsections are walked.
 let emit_name_remapped = fn (out: %ByteBuffer, src: &ByteBuffer,
                               content_start: i64, sec_size: i64,
-                              remap: i64, remap_size: i64) -> %ByteBuffer do
+                              remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
   let sec_end = content_start + sec_size
   let pk = rd_uleb(buf: src, pos: content_start)
   let name_len = pval(pk: pk)
@@ -1215,16 +1136,16 @@ end
 //   * others  → passed through byte-for-byte (DWARF, producers, target_features,
 //     etc.). For .debug_* this is a placeholder — PC-offset rewriting is only
 //     needed when nxc codegen starts emitting DWARF (currently it does not).
-let emit_preserved_customs = fn (out: %ByteBuffer, buf: &ByteBuffer, customs: i64,
-                                   remap: i64, remap_size: i64) -> %ByteBuffer do
-  let total = __nx_smap_get(id: customs, key: "__count", default_val: 0)
+let emit_preserved_customs = fn (out: %ByteBuffer, buf: &ByteBuffer, customs: &StringMap,
+                                   remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+  let total = sm.get_or(map: customs, key: "__count", default: 0)
   return emit_custom_each(out: %out, buf: buf, customs: customs, idx: 0, total: total,
                             remap: remap, remap_size: remap_size)
 end
-let emit_custom_each = fn (out: %ByteBuffer, buf: &ByteBuffer, customs: i64, idx: i64, total: i64,
-                             remap: i64, remap_size: i64) -> %ByteBuffer do
+let emit_custom_each = fn (out: %ByteBuffer, buf: &ByteBuffer, customs: &StringMap, idx: i64, total: i64,
+                             remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
   if idx >= total then return %out end
-  let pk = __nx_smap_get(id: customs, key: str.from_i64(val: idx), default_val: 0)
+  let pk = sm.get_or(map: customs, key: str.from_i64(val: idx), default: 0)
   let content_start = pval(pk: pk)
   let sec_size = ppos(pk: pk)
   let %out = if custom_name_equals(buf: buf, content_start: content_start, target: "name") then
@@ -1239,57 +1160,56 @@ end
 
 export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) -> %ByteBuffer do
   let %dep = bb.read_binary_file(path: stdlib_path)
-  let ps = __nx_smap_new()
 
-  let m_secs = scan_secs(buf: &core_wasm)
-  let d_secs = scan_secs(buf: &dep)
+  let %m_secs = scan_secs(buf: &core_wasm)
+  let %d_secs = scan_secs(buf: &dep)
 
   // Dep types first → dep type indices unchanged, main types offset by dep count
   let d_type_off = 0
-  let m_type_off = count_sec(buf: &dep, sec_pk: get_sec(map: d_secs, sec: 1))
+  let m_type_off = count_sec(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 1))
 
-  let dep_exports = parse_dep_exports(ps: ps, buf: &dep, sec_pk: get_sec(map: d_secs, sec: 7))
+  let %dep_exports = parse_dep_exports(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 7))
 
-  let dep_fimp = count_func_imps(ps: ps, buf: &dep, sec_pk: get_sec(map: d_secs, sec: 2))
+  let dep_fimp = count_func_imps(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 2))
   let kept_fimp = dep_fimp
   let n_stubs = 0
 
-  let d_loc = count_sec(buf: &dep, sec_pk: get_sec(map: d_secs, sec: 3))
-  let m_fimp = count_func_imps(ps: ps, buf: &core_wasm, sec_pk: get_sec(map: m_secs, sec: 2))
-  let m_loc = count_sec(buf: &core_wasm, sec_pk: get_sec(map: m_secs, sec: 3))
+  let d_loc = count_sec(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 3))
+  let m_fimp = count_func_imps(buf: &core_wasm, sec_pk: get_sec(map: &m_secs, sec: 2))
+  let m_loc = count_sec(buf: &core_wasm, sec_pk: get_sec(map: &m_secs, sec: 3))
 
   // Count main's non-stdlib imports
-  let m_imp_sec_pk = get_sec(map: m_secs, sec: 2)
+  let m_imp_sec_pk = get_sec(map: &m_secs, sec: 2)
   // m_kept_all = ALL non-stdlib imports (for import section entry count)
-  let m_kept_all = count_main_kept_imps(ps: ps, buf: &core_wasm, sec_pk: m_imp_sec_pk)
+  let m_kept_all = count_main_kept_imps(buf: &core_wasm, sec_pk: m_imp_sec_pk)
   // m_kept = non-stdlib FUNCTION imports only (for function index layout)
-  let m_kept = count_main_kept_func_imps(ps: ps, buf: &core_wasm, sec_pk: m_imp_sec_pk)
+  let m_kept = count_main_kept_func_imps(buf: &core_wasm, sec_pk: m_imp_sec_pk)
 
   // Dep remap intarr: identity for WASI imports, then offset for dep locals.
   // All stdlib imports are WASI (indices preserved); only used by element-segment remap.
-  let remap_d = intarr_new()
-  push_identity(arr: remap_d, i: 0, n: dep_fimp)
-  remap_dep_locals(remap: remap_d, dep_fimp: dep_fimp, d_loc: d_loc,
+  let %remap_d = intarr_new()
+  let %remap_d = push_identity(arr: %remap_d, i: 0, n: dep_fimp)
+  let %remap_d = remap_dep_locals(remap: %remap_d, dep_fimp: dep_fimp, d_loc: d_loc,
     kept_fimp: kept_fimp + m_kept, n_stubs: n_stubs)
 
-  let remap_m = intarr_new()
-  // Store context for resolve_main_imports
-  // "kept" = dep_fimp + m_kept (base for remap_dep_func: dep locals start after all func imports)
-  // "m_imp_base" = dep_fimp (base for non-stdlib main func imports, right after dep WASI imports)
-  __nx_smap_put(id: ps, key: "remap", value: remap_m)
-  __nx_smap_put(id: ps, key: "dep_exp", value: dep_exports)
-  __nx_smap_put(id: ps, key: "kept", value: kept_fimp + m_kept)
-  __nx_smap_put(id: ps, key: "m_imp_base", value: kept_fimp)
-  __nx_smap_put(id: ps, key: "dep_fimp", value: dep_fimp)
-  __nx_smap_put(id: ps, key: "stubs", value: n_stubs)
-  resolve_main_imports(ps: ps, buf: &core_wasm, sec_pk: m_imp_sec_pk)
+  let %remap_m = intarr_new()
+  // kept_fimp+m_kept = base for remap_dep_func (dep locals start after all func imports)
+  // m_imp_base = kept_fimp (base for non-stdlib main func imports, right after dep WASI imports)
+  let %resolve_ctx = ResolveCtx(
+    remap: %remap_m,
+    kept_fimp: kept_fimp + m_kept,
+    n_stubs: n_stubs,
+    dep_fimp: dep_fimp,
+    m_imp_base: kept_fimp)
+  let %resolve_ctx = resolve_main_imports(ctx: %resolve_ctx, dep_exports: &dep_exports, buf: &core_wasm, sec_pk: m_imp_sec_pk)
+  let ResolveCtx(remap: %remap_m, kept_fimp: _, n_stubs: _, dep_fimp: _, m_imp_base: _) = resolve_ctx
 
   // Main locals start after: dep WASI imports + main non-stdlib func imports + stubs + dep locals
-  remap_main_locals(remap: remap_m, m_fimp: m_fimp, m_loc: m_loc,
+  let %remap_m = remap_main_locals(remap: %remap_m, m_fimp: m_fimp, m_loc: m_loc,
     kept_fimp: kept_fimp + m_kept, n_stubs: n_stubs, d_loc: d_loc)
 
-  let d_glo = count_sec(buf: &dep, sec_pk: get_sec(map: d_secs, sec: 6))
-  let d_tbl_count = count_sec(buf: &dep, sec_pk: get_sec(map: d_secs, sec: 4))
+  let d_glo = count_sec(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 6))
+  let d_tbl_count = count_sec(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 4))
 
   // Assemble output — all section emission inlined to avoid parameter-passing bugs
   // in Nexus functions with many params (param sorting causes confusion)
@@ -1297,34 +1217,34 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
 
   // Section 1: merged types (DEP first, then main)
   let %out = emit_merged_types_inline(out: %out,
-    m_buf: &dep, m_sec: get_sec(map: d_secs, sec: 1),
-    d_buf: &core_wasm, d_sec: get_sec(map: m_secs, sec: 1))
+    m_buf: &dep, m_sec: get_sec(map: &d_secs, sec: 1),
+    d_buf: &core_wasm, d_sec: get_sec(map: &m_secs, sec: 1))
 
   // Section 2: merged imports (dep WASI imports + main non-stdlib imports)
   // Dep imports need type offset (dep types come second in merged type section)
   // Main non-stdlib imports need no type offset (main types come first)
-  let d_imp_pk = get_sec(map: d_secs, sec: 2)
+  let d_imp_pk = get_sec(map: &d_secs, sec: 2)
   let dep_imp_count = count_sec(buf: &dep, sec_pk: d_imp_pk)
   let total_imp_count = dep_imp_count + m_kept_all
   let %tmp_i = bb.empty()
   let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: total_imp_count)
   // Copy dep imports with type offset
   let %tmp_i = if d_imp_pk > 0 then
-    copy_imports_with_type_off(ps: ps, out: %tmp_i, buf: &dep,
+    copy_imports_with_type_off(out: %tmp_i, buf: &dep,
       pos: sec_body(buf: &dep, sec_pk: d_imp_pk), remaining: dep_imp_count, type_off: d_type_off)
   else %tmp_i end
   // Copy main's non-stdlib imports (type indices already correct — main types first)
-  let %tmp_i = copy_main_kept_imps(ps: ps, out: %tmp_i, buf: &core_wasm, sec_pk: m_imp_sec_pk)
+  let %tmp_i = copy_main_kept_imps(out: %tmp_i, buf: &core_wasm, sec_pk: m_imp_sec_pk)
   let %out = emit_sec(out: %out, sec_id: 2, content: &tmp_i)
   bb.free(buf: %tmp_i)
 
   // Section 3: merged func types (count + dep with type offset + main)
-  let d_func_sec_pk = get_sec(map: d_secs, sec: 3)
-  let m_func_sec_pk = get_sec(map: m_secs, sec: 3)
+  let d_func_sec_pk = get_sec(map: &d_secs, sec: 3)
+  let m_func_sec_pk = get_sec(map: &m_secs, sec: 3)
   let %tmp_f = bb.empty()
   // Use code section counts (rewrite_code_bodies determines the actual body count)
-  let d_code_cnt = count_sec(buf: &dep, sec_pk: get_sec(map: d_secs, sec: 10))
-  let m_code_cnt = count_sec(buf: &core_wasm, sec_pk: get_sec(map: m_secs, sec: 10))
+  let d_code_cnt = count_sec(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 10))
+  let m_code_cnt = count_sec(buf: &core_wasm, sec_pk: get_sec(map: &m_secs, sec: 10))
   // TODO: m_code_cnt != m_loc (23 vs 28 for simple program). Need to investigate.
   // Use d_code_cnt + m_code_cnt to match code section bodies
   let n_total_funcs = n_stubs + d_code_cnt + m_code_cnt
@@ -1339,16 +1259,16 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   bb.free(buf: %tmp_f)
 
   // Section 4: table (from dep)
-  let %out = copy_raw_sec(out: %out, src: &dep, sec_pk: get_sec(map: d_secs, sec: 4), sec_id: 4)
+  let %out = copy_raw_sec(out: %out, src: &dep, sec_pk: get_sec(map: &d_secs, sec: 4), sec_id: 4)
   // Compute relocation base: dep_initial_pages * 65536 (above dep's entire memory region)
   // This ensures main data doesn't overlap with dep's stack, data, or heap.
   // Size memory to cover both dep and main data (main already at absolute offsets)
-  let d_data_end = find_data_end(buf: &dep, sec_pk: get_sec(map: d_secs, sec: 11))
-  let m_data_end = find_data_end(buf: &core_wasm, sec_pk: get_sec(map: m_secs, sec: 11))
+  let d_data_end = find_data_end(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 11))
+  let m_data_end = find_data_end(buf: &core_wasm, sec_pk: get_sec(map: &m_secs, sec: 11))
   let max_data = if d_data_end > m_data_end then d_data_end else m_data_end end
   let min_pages = (max_data + 65535) / 65536
-  let dep_pages = if get_sec(map: d_secs, sec: 5) > 0 then
-    let pk_mem = rd_uleb(buf: &dep, pos: sec_off(pk: get_sec(map: d_secs, sec: 5)))
+  let dep_pages = if get_sec(map: &d_secs, sec: 5) > 0 then
+    let pk_mem = rd_uleb(buf: &dep, pos: sec_off(pk: get_sec(map: &d_secs, sec: 5)))
     let pk_min = rd_uleb(buf: &dep, pos: ppos(pk: pk_mem) + 1)
     pval(pk: pk_min)
   else 0 end
@@ -1365,27 +1285,27 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   let %out = emit_sec(out: %out, sec_id: 5, content: &tmp_mem)
   bb.free(buf: %tmp_mem)
   // Section 13: tag (from main, type indices offset by m_type_off)
-  let %out = emit_tag_sec_with_off(out: %out, buf: &core_wasm, sec_pk: get_sec(map: m_secs, sec: 13), off: m_type_off)
+  let %out = emit_tag_sec_with_off(out: %out, buf: &core_wasm, sec_pk: get_sec(map: &m_secs, sec: 13), off: m_type_off)
 
   // Section 6: merged globals (dep first, then main)
-  let m_glo_pk = get_sec(map: m_secs, sec: 6)
-  let d_glo_pk = get_sec(map: d_secs, sec: 6)
+  let m_glo_pk = get_sec(map: &m_secs, sec: 6)
+  let d_glo_pk = get_sec(map: &d_secs, sec: 6)
   let %out = emit_merged_globals(out: %out,
     m_buf: &core_wasm, m_sec: m_glo_pk,
     d_buf: &dep, d_sec: d_glo_pk)
 
   // Section 7: remapped exports (main exports with func idx remap)
-  let %out = emit_remapped_exports(ps: ps, out: %out,
-    m_buf: &core_wasm, m_sec: get_sec(map: m_secs, sec: 7), remap: remap_m)
+  let %out = emit_remapped_exports(out: %out,
+    m_buf: &core_wasm, m_sec: get_sec(map: &m_secs, sec: 7), remap: &remap_m)
 
   // Section 9: merged elements (dep + main, both remapped)
-  let %out = emit_merged_elements(ps: ps, out: %out,
-    d_buf: &dep, d_sec: get_sec(map: d_secs, sec: 9), remap_d: remap_d,
-    m_buf: &core_wasm, m_sec: get_sec(map: m_secs, sec: 9), remap_m: remap_m)
+  let %out = emit_merged_elements(out: %out,
+    d_buf: &dep, d_sec: get_sec(map: &d_secs, sec: 9), remap_d: &remap_d,
+    m_buf: &core_wasm, m_sec: get_sec(map: &m_secs, sec: 9), remap_m: &remap_m)
 
   // Section 10: merged code (stubs + dep bodies rewritten + main bodies rewritten) — inlined
-  let d_code_sec_pk = get_sec(map: d_secs, sec: 10)
-  let m_code_sec_pk = get_sec(map: m_secs, sec: 10)
+  let d_code_sec_pk = get_sec(map: &d_secs, sec: 10)
+  let m_code_sec_pk = get_sec(map: &m_secs, sec: 10)
   // Use actual code section counts (must match bodies written by rewrite_code_bodies)
   let d_code_count = count_sec(buf: &dep, sec_pk: d_code_sec_pk)
   let m_code_count = count_sec(buf: &core_wasm, sec_pk: m_code_sec_pk)
@@ -1396,38 +1316,34 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   let %tmp_c = copy_sec_body(buf: %tmp_c, src: &dep, sec_pk: d_code_sec_pk)
   // Main code bodies — rewrite with intarr-backed func remap (remap_m covers
   // all main fidxs: imports 0..m_fimp, locals m_fimp..m_fimp+m_loc)
-  __nx_smap_put(id: ps, key: "remap", value: remap_m)
-  __nx_smap_put(id: ps, key: "glo", value: d_glo)
-  __nx_smap_put(id: ps, key: "typ", value: m_type_off)
-  let _r = __nx_smap_put(id: ps, key: "tbl", value: d_tbl_count)
-  let %tmp_c = maybe_rewrite_bodies(ps: ps, buf: %tmp_c, src: &core_wasm, sec_pk: m_code_sec_pk)
+  let rw_ctx = RwCtx(type_off: m_type_off, tbl_off: d_tbl_count, glo_off: d_glo)
+  let %tmp_c = maybe_rewrite_bodies(ctx: rw_ctx, remap: &remap_m, buf: %tmp_c, src: &core_wasm, sec_pk: m_code_sec_pk)
   let %out = emit_sec(out: %out, sec_id: 10, content: &tmp_c)
   bb.free(buf: %tmp_c)
 
   // Section 11: merged data (dep + main, both verbatim — codegen already used correct offsets)
   let %out = emit_merged_data(out: %out,
-    m_buf: &core_wasm, m_sec: get_sec(map: m_secs, sec: 11),
-    d_buf: &dep, d_sec: get_sec(map: d_secs, sec: 11), reloc: 0)
+    m_buf: &core_wasm, m_sec: get_sec(map: &m_secs, sec: 11),
+    d_buf: &dep, d_sec: get_sec(map: &d_secs, sec: 11), reloc: 0)
 
   // Preserve custom sections from both inputs. `name` sections are rewritten
   // with func indices remapped; other customs (producers, target_features,
   // future .debug_*) pass through verbatim. Must run before the remap intarrs
   // are freed.
-  let m_customs = scan_custom_secs(buf: &core_wasm)
-  let d_customs = scan_custom_secs(buf: &dep)
-  let %out = emit_preserved_customs(out: %out, buf: &core_wasm, customs: m_customs,
-                                      remap: remap_m, remap_size: m_fimp + m_loc)
-  let %out = emit_preserved_customs(out: %out, buf: &dep, customs: d_customs,
-                                      remap: remap_d, remap_size: dep_fimp + d_loc)
-  __nx_smap_free(id: m_customs)
-  __nx_smap_free(id: d_customs)
+  let %m_customs = scan_custom_secs(buf: &core_wasm)
+  let %d_customs = scan_custom_secs(buf: &dep)
+  let %out = emit_preserved_customs(out: %out, buf: &core_wasm, customs: &m_customs,
+                                      remap: &remap_m, remap_size: m_fimp + m_loc)
+  let %out = emit_preserved_customs(out: %out, buf: &dep, customs: &d_customs,
+                                      remap: &remap_d, remap_size: dep_fimp + d_loc)
+  sm.free(map: %m_customs)
+  sm.free(map: %d_customs)
 
-  __nx_smap_free(id: ps)
-  __nx_smap_free(id: m_secs)
-  __nx_smap_free(id: d_secs)
-  __nx_smap_free(id: dep_exports)
-  intarr_free(id: remap_d)
-  intarr_free(id: remap_m)
+  sm.free(map: %m_secs)
+  sm.free(map: %d_secs)
+  sm.free(map: %dep_exports)
+  bb.free(buf: %remap_d)
+  bb.free(buf: %remap_m)
   bb.free(buf: %dep)
   bb.free(buf: %core_wasm)
 
