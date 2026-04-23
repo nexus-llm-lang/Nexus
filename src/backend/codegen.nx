@@ -54,7 +54,7 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          op_memory_size, op_memory_grow, op_i32_gt_u, op_i32_shl, op_i32_shr_u }, * as wdefs from "src/backend/wasm_defs.nx"
 import { LocalResult }, * as wcollect from "src/backend/wasm_collect.nx"
 import { HashMap }, * as hmap from "stdlib/hashmap.nx"
-import * as wsect from "src/backend/wasm_section.nx"
+import { DedupedTypes }, * as wsect from "src/backend/wasm_section.nx"
 import * as list from "stdlib/list.nx"
 import * as str from "stdlib/string_ops.nx"
 import { SymbolNotFound } from "src/common/error.nx"
@@ -2124,10 +2124,6 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
       let closure_table = build_closure_table(funcs: funcs, internal_func_map: &internal_func_map, table_idx: 0)
       let n_closures = list.length(xs: closure_table)
       let closure_arities = collect_closure_arities(funcs: funcs)
-      let n_closure_types = list.length(xs: closure_arities)
-      // Closure type indices start after all ext + func + wasi_run + eh_tag + alloc types
-      let n_eh_types = match has_eh do case true -> 1 case false -> 0 end
-      let closure_type_base = n_exts + n_funcs + 1 + n_eh_types + n_alloc_imports + n_cabi
 
       let main_idx = wdefs.lookup_func_fast(name: "main", map: &internal_func_map)
       let main_ret = match wdefs.find_function(name: "main", funcs: funcs) do
@@ -2170,27 +2166,34 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
       let %m = bb.push_byte(buf: %m, byte: 0)
       let %m = bb.push_byte(buf: %m, byte: 0)
 
-      // Type section (with EH tag + allocate + closure call types appended)
+      // Type section — deduplicated by signature; returns canonical indices per entity.
       let has_alloc = alloc_mode == 2
-      let %type_sec = wsect.build_type_section(program: filtered_program, has_eh: has_eh, has_alloc: has_alloc,
-                                         has_cabi_realloc: has_cabi, n_closure_types: n_closure_types)
-      let %type_sec = if n_closure_types > 0 then
-        wsect.emit_closure_type_entries(buf: %type_sec, arities: closure_arities)
-      else %type_sec end
+      let DedupedTypes(section: %type_sec, count: _,
+                       ext_type_idxs: ext_type_idxs,
+                       func_type_idxs: func_type_idxs,
+                       wasi_run_type_idx: wasi_run_type_idx,
+                       exn_tag_type_idx: exn_tag_type_idx,
+                       alloc_type_idx: alloc_type_idx,
+                       cabi_type_idx: cabi_type_idx,
+                       closure_type_idxs: closure_type_idxs) =
+        wsect.build_type_section_dedup(program: filtered_program, has_eh: has_eh, has_alloc: has_alloc,
+                                       has_cabi_realloc: has_cabi, closure_arities: closure_arities)
       let %m = wdefs.emit_section(buf: %m, id: sec_type, content: %type_sec)
 
       // Import section
       if n_exts > 0 || (mem_mode != "none" && mem_mode != "defined") || has_alloc then
-        let alloc_type_idx = n_exts + n_funcs + 1 + n_eh_types
         let %m = wdefs.emit_section(buf: %m, id: sec_import,
-                               content: wsect.build_import_section(exts: exts, mem_mode: mem_mode,
-                                 has_alloc: has_alloc, alloc_type_idx: alloc_type_idx,
-                                 alloc_module: mem_mode))
+                               content: wsect.build_import_section(exts: exts, ext_type_idxs: ext_type_idxs,
+                                 mem_mode: mem_mode, has_alloc: has_alloc,
+                                 alloc_type_idx: alloc_type_idx, alloc_module: mem_mode))
       end
 
       // Function section
-      let cabi_type_idx = n_exts + n_funcs + 1 + n_eh_types + n_alloc_imports
-      let %m = wdefs.emit_section(buf: %m, id: sec_function, content: wsect.build_function_section(n_funcs: n_funcs, n_exts: n_exts, has_cabi: has_cabi, cabi_type_idx: cabi_type_idx))
+      let %m = wdefs.emit_section(buf: %m, id: sec_function,
+                             content: wsect.build_function_section(func_type_idxs: func_type_idxs,
+                                                                   wasi_run_type_idx: wasi_run_type_idx,
+                                                                   has_cabi: has_cabi,
+                                                                   cabi_type_idx: cabi_type_idx))
 
       // Table section (if closures exist)
       let %m = if n_closures > 0 then
@@ -2204,7 +2207,6 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
 
       // Tag section (WASM EH) — must come after memory, before global
       let %m = if has_eh then
-        let exn_tag_type_idx = n_exts + n_funcs + 1
         wdefs.emit_section(buf: %m, id: sec_tag, content: wsect.build_tag_section(exn_tag_type_idx: exn_tag_type_idx))
       else %m end
 
@@ -2228,8 +2230,8 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
       else %m end
 
       // Code section
-      // Build closure_type_indices: map arity → type section index
-      let closure_type_idx_list = build_closure_type_idx_list(arities: closure_arities, base: closure_type_base)
+      // Build closure_type_indices: map arity → canonical (deduped) type section index
+      let closure_type_idx_list = build_closure_type_idx_list(arities: closure_arities, type_idxs: closure_type_idxs)
       let %code = bb.empty()
       let %code = bb.push_uleb128(buf: %code, val: n_funcs + n_cabi + 1)
       // Pass all_exts (including arena) so emit_arena_intrinsic can find them via find_external
@@ -2273,14 +2275,19 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
   end
 end
 
-let build_closure_type_idx_list = fn (arities: [i64], base: i64) -> [ArityTypeIdx] throws { Exn } do
-  return build_closure_type_idx_list_go(arities: arities, base: base, acc: [])
+let build_closure_type_idx_list = fn (arities: [i64], type_idxs: [i64]) -> [ArityTypeIdx] throws { Exn } do
+  return build_closure_type_idx_list_go(arities: arities, type_idxs: type_idxs, acc: [])
 end
-let build_closure_type_idx_list_go = fn (arities: [i64], base: i64, acc: [ArityTypeIdx]) -> [ArityTypeIdx] throws { Exn } do
+let build_closure_type_idx_list_go = fn (arities: [i64], type_idxs: [i64], acc: [ArityTypeIdx]) -> [ArityTypeIdx] throws { Exn } do
   match arities do
     case [] -> return rev_arity_type_idxs(lst: acc, out: [])
-    case a :: rest ->
-      return build_closure_type_idx_list_go(arities: rest, base: base + 1, acc: ArityTypeIdx(arity: a, type_idx: base) :: acc)
+    case a :: rest_a ->
+      match type_idxs do
+        case [] -> return rev_arity_type_idxs(lst: acc, out: [])
+        case ti :: rest_ti ->
+          return build_closure_type_idx_list_go(arities: rest_a, type_idxs: rest_ti,
+            acc: ArityTypeIdx(arity: a, type_idx: ti) :: acc)
+      end
   end
 end
 
