@@ -252,13 +252,13 @@ fn soundness_float_arithmetic() {
 #[test]
 fn soundness_exception_try_catch() {
     let src = r#"
-    exception Boom(i64)
+    exception Boom(code: i64)
 
     let main = fn () -> unit do
         try
-            raise Boom(42)
+            raise Boom(code: 42)
         catch
-            case Boom(code) -> return ()
+            case Boom(code: code) -> return ()
             case _ -> return ()
         end
         return ()
