@@ -43,6 +43,11 @@ pub enum HirBuildError {
         method: String,
         span: Span,
     },
+    UnsupportedTopLevelLet {
+        name: String,
+        source_file: Option<String>,
+        span: Span,
+    },
 }
 
 impl std::fmt::Display for HirBuildError {
@@ -63,6 +68,18 @@ impl std::fmt::Display for HirBuildError {
             HirBuildError::UnresolvedPort { port, method, .. } => {
                 write!(f, "Unresolved port method: {}.{}", port, method)
             }
+            HirBuildError::UnsupportedTopLevelLet { name, source_file, .. } => {
+                let loc = source_file
+                    .as_deref()
+                    .map(|p| format!(" in {}", p))
+                    .unwrap_or_default();
+                write!(
+                    f,
+                    "Top-level 'let {}'{} has an unsupported initializer: only lambdas, literals, externals, and handlers are allowed at module scope. \
+                     For a computed value, wrap it in a function (e.g. `let {} = fn () -> T do ... end`) and call it from `main` or another function.",
+                    name, loc, name
+                )
+            }
         }
     }
 }
@@ -74,7 +91,8 @@ impl HirBuildError {
             | HirBuildError::ImportParseError { span, .. }
             | HirBuildError::CyclicImport { span, .. }
             | HirBuildError::ImportItemNotFound { span, .. }
-            | HirBuildError::UnresolvedPort { span, .. } => span,
+            | HirBuildError::UnresolvedPort { span, .. }
+            | HirBuildError::UnsupportedTopLevelLet { span, .. } => span,
         }
     }
 }
@@ -700,7 +718,13 @@ impl MirBuilder {
                         Expr::Literal(lit) => {
                             self.global_constants.insert(name.clone(), lit.clone());
                         }
-                        _ => {}
+                        _ => {
+                            return Err(HirBuildError::UnsupportedTopLevelLet {
+                                name: gl.name.clone(),
+                                source_file: self.current_source_file.clone(),
+                                span: gl.value.span.clone(),
+                            });
+                        }
                     }
                 }
             }
