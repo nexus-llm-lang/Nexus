@@ -6,6 +6,7 @@
  */
 
 import { ByteBuffer }, * as bb from "stdlib/bytebuffer.nx"
+import { StringMap, Lookup, Found, Missing }, * as sm from "stdlib/stringmap.nx"
 import * as str from "stdlib/string_ops.nx"
 import { TypeExpr } from "src/common/ast.nx"
 import { LirProgram, LirFunction, LirExternal, LirParam } from "src/ir/lir_types.nx"
@@ -68,81 +69,300 @@ let ext_uses_canonical_string_return = fn (wasm_module: string, ret_type: TypeEx
   return false
 end
 
-let emit_ext_type_entries = fn (buf: %ByteBuffer, exts: [LirExternal]) -> %ByteBuffer do
+// ─── Single-entry emitters (write one type entry into a scratch buffer) ─────
+
+let emit_one_ext_type = fn (scratch: %ByteBuffer, ext: LirExternal) -> %ByteBuffer do
+  let LirExternal(name: _, wasm_module: m, wasm_name: _, params: ps, ret_type: rt, throw_row: _) = ext
+  let canonical_str_ret = ext_uses_canonical_string_return(wasm_module: m, ret_type: rt)
+  // For canonical string return: add 1 slot for retptr param
+  let extra_params = match canonical_str_ret do case true -> 1 case false -> 0 end
+  let %buf = bb.push_byte(buf: %scratch, byte: 96)
+  let %buf = bb.push_uleb128(buf: %buf, val: wcollect.count_ext_param_slots(params: ps) + extra_params)
+  let %buf = emit_ext_param_types(buf: %buf, params: ps)
+  return if canonical_str_ret then
+    // Canonical string return: retptr (i32) as last param, void return
+    let %buf = bb.push_byte(buf: %buf, byte: wdefs.vt_i32)
+    bb.push_uleb128(buf: %buf, val: 0)
+  else
+    emit_ext_return_type(buf: %buf, typ: rt)
+  end
+end
+
+let emit_one_func_type = fn (scratch: %ByteBuffer, func: LirFunction) -> %ByteBuffer do
+  let LirFunction(name: _, params: ps, ret_type: rt, body: _, ret: _, span: _) = func
+  let %buf = bb.push_byte(buf: %scratch, byte: 96)
+  let %buf = bb.push_uleb128(buf: %buf, val: list.length(xs: ps))
+  let %buf = emit_internal_param_types(buf: %buf, params: ps)
+  return emit_ext_return_type(buf: %buf, typ: rt)
+end
+
+let emit_n_i64_params = fn (buf: %ByteBuffer, count: i64) -> %ByteBuffer do
+  if count <= 0 then return %buf
+  else emit_n_i64_params(buf: bb.push_byte(buf: %buf, byte: wdefs.vt_i64), count: count - 1)
+  end
+end
+
+/// Emit a closure call type: (N+1 x i64) -> i64 (env + N args → result).
+let emit_one_closure_type = fn (scratch: %ByteBuffer, arity: i64) -> %ByteBuffer do
+  let %buf = bb.push_byte(buf: %scratch, byte: 96)
+  let %buf = bb.push_uleb128(buf: %buf, val: arity + 1)
+  let %buf = emit_n_i64_params(buf: %buf, count: arity + 1)
+  let %buf = bb.push_uleb128(buf: %buf, val: 1)
+  return bb.push_byte(buf: %buf, byte: wdefs.vt_i64)
+end
+
+// ─── Dedup builder ──────────────────────────────────────────────────────────
+// Deduplicates type entries by their raw byte signature. The section buffer
+// accumulates only first-occurrence entries; duplicates reuse an existing
+// canonical index.
+//
+// State is threaded through function calls as three parallel values
+// (section, seen, n_unique) rather than a single %TypeDedupBuilder record.
+// Reason: Nexus's typechecker does not currently preserve linearity for
+// user-type fields when destructuring records — a `%MyRecord` field
+// destructured cannot be passed back as a `%MyRecord`. Only opaque
+// primitive fields (%ByteBuffer, %StringMap) can be relinearized via a
+// round-trip through a typed identity function (launder_buf/launder_smap).
+
+let launder_buf = fn (b: %ByteBuffer) -> %ByteBuffer do return %b end
+let launder_smap = fn (m: %StringMap) -> %StringMap do return %m end
+
+// Commit-step result: primitive linear fields + canonical index.
+type CommitStep = CommitStep(section: %ByteBuffer, seen: %StringMap, n_unique: i64, idx: i64)
+// Commit-list result (for loops over exts/funcs/closures): primitives + the
+// per-entity canonical index list (in original order).
+type CommitList = CommitList(section: %ByteBuffer, seen: %StringMap, n_unique: i64, idxs: [i64])
+
+/// Encode a byte range as decimal-CSV (e.g., "96,2,127,127,1,127,"). UTF-8 safe
+/// regardless of byte values — every emitted character is ASCII digit or comma.
+let buf_range_key_go = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, end_pos: i64) -> %ByteBuffer do
+  if pos >= end_pos then return %out end
+  let b = bb.get_byte(buf: src, idx: pos)
+  let %out = bb.push_string(buf: %out, s: str.from_i64(val: b))
+  let %out = bb.push_byte(buf: %out, byte: 44)  // ','
+  return buf_range_key_go(out: %out, src: src, pos: pos + 1, end_pos: end_pos)
+end
+
+let buf_range_to_key = fn (src: &ByteBuffer, end_pos: i64) -> string do
+  let %scratch = bb.empty()
+  let %scratch = buf_range_key_go(out: %scratch, src: src, pos: 0, end_pos: end_pos)
+  let key = bb.to_string(buf: &scratch)
+  bb.free(buf: %scratch)
+  return key
+end
+
+/// Commit a scratch buffer (containing exactly one type entry starting at 0).
+/// Frees scratch. Returns updated (section, seen, n_unique) + the canonical
+/// index for the entry (existing slot if the signature was already seen, else
+/// the newly-assigned slot).
+let td_commit = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, scratch: %ByteBuffer) -> %CommitStep do
+  let slen = bb.length(buf: &scratch)
+  let key = buf_range_to_key(src: &scratch, end_pos: slen)
+  match sm.get(map: &seen, key: key) do
+    case Found(value: canonical_idx) ->
+      bb.free(buf: %scratch)
+      let %r = CommitStep(section: %section, seen: %seen, n_unique: n_unique, idx: canonical_idx)
+      return %r
+    case Missing ->
+      let %section = bb.copy_range(dst: %section, src: &scratch, start: 0, end_pos: slen)
+      bb.free(buf: %scratch)
+      let %seen = sm.put(map: %seen, key: key, value: n_unique)
+      let %r = CommitStep(section: %section, seen: %seen, n_unique: n_unique + 1, idx: n_unique)
+      return %r
+  end
+end
+
+let commit_exts_go = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, exts: [LirExternal], acc: [i64]) -> %CommitList do
   match exts do
-    case [] -> %buf
-    case LirExternal(name: _, wasm_module: m, wasm_name: _, params: ps, ret_type: rt, throw_row: _) :: rest ->
-      let canonical_str_ret = ext_uses_canonical_string_return(wasm_module: m, ret_type: rt)
-      // For canonical string return: add 1 slot for retptr param
-      let extra_params = match canonical_str_ret do case true -> 1 case false -> 0 end
-      let %buf = bb.push_byte(buf: %buf, byte: 96)
-      let %buf = bb.push_uleb128(buf: %buf, val: wcollect.count_ext_param_slots(params: ps) + extra_params)
-      let %buf = emit_ext_param_types(buf: %buf, params: ps)
-      // Canonical string return: retptr (i32) as last param, void return
-      let %buf = if canonical_str_ret then
-        let %buf = bb.push_byte(buf: %buf, byte: wdefs.vt_i32)
-        bb.push_uleb128(buf: %buf, val: 0)
-      else
-        emit_ext_return_type(buf: %buf, typ: rt)
-      end
-      emit_ext_type_entries(buf: %buf, exts: rest)
+    case [] ->
+      let %r = CommitList(section: %section, seen: %seen, n_unique: n_unique, idxs: list.reverse(xs: acc))
+      return %r
+    case e :: rest ->
+      let %scratch = bb.empty()
+      let %scratch = emit_one_ext_type(scratch: %scratch, ext: e)
+      let CommitStep(section: %section, seen: %seen, n_unique: nu, idx: ti) = td_commit(section: %section, seen: %seen, n_unique: n_unique, scratch: %scratch)
+      let %section = launder_buf(b: %section)
+      let %seen = launder_smap(m: %seen)
+      return commit_exts_go(section: %section, seen: %seen, n_unique: nu, exts: rest, acc: ti :: acc)
   end
 end
 
-let emit_func_type_entries = fn (buf: %ByteBuffer, funcs: [LirFunction]) -> %ByteBuffer do
+let commit_funcs_go = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, funcs: [LirFunction], acc: [i64]) -> %CommitList do
   match funcs do
-    case [] -> %buf
-    case LirFunction(name: _, params: ps, ret_type: rt, body: _, ret: _, span: _) :: rest ->
-      let %buf = bb.push_byte(buf: %buf, byte: 96)
-      let %buf = bb.push_uleb128(buf: %buf, val: list.length(xs: ps))
-      let %buf = emit_internal_param_types(buf: %buf, params: ps)
-      let %buf = emit_ext_return_type(buf: %buf, typ: rt)
-      emit_func_type_entries(buf: %buf, funcs: rest)
+    case [] ->
+      let %r = CommitList(section: %section, seen: %seen, n_unique: n_unique, idxs: list.reverse(xs: acc))
+      return %r
+    case f :: rest ->
+      let %scratch = bb.empty()
+      let %scratch = emit_one_func_type(scratch: %scratch, func: f)
+      let CommitStep(section: %section, seen: %seen, n_unique: nu, idx: ti) = td_commit(section: %section, seen: %seen, n_unique: n_unique, scratch: %scratch)
+      let %section = launder_buf(b: %section)
+      let %seen = launder_smap(m: %seen)
+      return commit_funcs_go(section: %section, seen: %seen, n_unique: nu, funcs: rest, acc: ti :: acc)
   end
 end
 
-export let build_type_section = fn (program: LirProgram, has_eh: bool, has_alloc: bool,
-                                    has_cabi_realloc: bool, n_closure_types: i64) -> %ByteBuffer do
+let commit_closures_go = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, arities: [i64], acc: [i64]) -> %CommitList do
+  match arities do
+    case [] ->
+      let %r = CommitList(section: %section, seen: %seen, n_unique: n_unique, idxs: list.reverse(xs: acc))
+      return %r
+    case a :: rest ->
+      let %scratch = bb.empty()
+      let %scratch = emit_one_closure_type(scratch: %scratch, arity: a)
+      let CommitStep(section: %section, seen: %seen, n_unique: nu, idx: ti) = td_commit(section: %section, seen: %seen, n_unique: n_unique, scratch: %scratch)
+      let %section = launder_buf(b: %section)
+      let %seen = launder_smap(m: %seen)
+      return commit_closures_go(section: %section, seen: %seen, n_unique: nu, arities: rest, acc: ti :: acc)
+  end
+end
+
+let emit_wasi_run_type_scratch = fn (scratch: %ByteBuffer) -> %ByteBuffer do
+  let %buf = bb.push_byte(buf: %scratch, byte: 96)
+  let %buf = bb.push_uleb128(buf: %buf, val: 0)
+  return bb.push_uleb128(buf: %buf, val: 0)
+end
+
+let emit_eh_type_scratch = fn (scratch: %ByteBuffer) -> %ByteBuffer do
+  let %buf = bb.push_byte(buf: %scratch, byte: 96)
+  let %buf = bb.push_uleb128(buf: %buf, val: 1)
+  let %buf = bb.push_byte(buf: %buf, byte: wdefs.vt_i64)
+  return bb.push_uleb128(buf: %buf, val: 0)
+end
+
+let emit_alloc_type_scratch = fn (scratch: %ByteBuffer) -> %ByteBuffer do
+  let %buf = bb.push_byte(buf: %scratch, byte: 96)
+  let %buf = bb.push_uleb128(buf: %buf, val: 1)
+  let %buf = bb.push_byte(buf: %buf, byte: wdefs.vt_i32)
+  let %buf = bb.push_uleb128(buf: %buf, val: 1)
+  return bb.push_byte(buf: %buf, byte: wdefs.vt_i32)
+end
+
+let emit_cabi_type_scratch = fn (scratch: %ByteBuffer) -> %ByteBuffer do
+  let %buf = bb.push_byte(buf: %scratch, byte: 96)
+  let %buf = bb.push_uleb128(buf: %buf, val: 4)
+  let %buf = bb.push_byte(buf: %buf, byte: wdefs.vt_i32)
+  let %buf = bb.push_byte(buf: %buf, byte: wdefs.vt_i32)
+  let %buf = bb.push_byte(buf: %buf, byte: wdefs.vt_i32)
+  let %buf = bb.push_byte(buf: %buf, byte: wdefs.vt_i32)
+  let %buf = bb.push_uleb128(buf: %buf, val: 1)
+  return bb.push_byte(buf: %buf, byte: wdefs.vt_i32)
+end
+
+/// DedupedTypes carries the built type section payload plus per-entity
+/// canonical type indices. Sentinel -1 for entries not in this module.
+export type DedupedTypes = DedupedTypes(
+  section: %ByteBuffer,
+  count: i64,
+  ext_type_idxs: [i64],
+  func_type_idxs: [i64],
+  wasi_run_type_idx: i64,
+  exn_tag_type_idx: i64,
+  alloc_type_idx: i64,
+  cabi_type_idx: i64,
+  closure_type_idxs: [i64]
+)
+
+// Helper: skip a commit (returning CommitStep with idx = -1).
+// Used to pass state through when a feature is not enabled.
+let commit_skip = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64) -> %CommitStep do
+  let %r = CommitStep(section: %section, seen: %seen, n_unique: n_unique, idx: -1)
+  return %r
+end
+
+let commit_eh_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, has_eh: bool) -> %CommitStep do
+  if has_eh then
+    let %scratch = bb.empty()
+    let %scratch = emit_eh_type_scratch(scratch: %scratch)
+    return td_commit(section: %section, seen: %seen, n_unique: n_unique, scratch: %scratch)
+  end
+  return commit_skip(section: %section, seen: %seen, n_unique: n_unique)
+end
+
+let commit_alloc_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, has_alloc: bool) -> %CommitStep do
+  if has_alloc then
+    let %scratch = bb.empty()
+    let %scratch = emit_alloc_type_scratch(scratch: %scratch)
+    return td_commit(section: %section, seen: %seen, n_unique: n_unique, scratch: %scratch)
+  end
+  return commit_skip(section: %section, seen: %seen, n_unique: n_unique)
+end
+
+let commit_cabi_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, has_cabi: bool) -> %CommitStep do
+  if has_cabi then
+    let %scratch = bb.empty()
+    let %scratch = emit_cabi_type_scratch(scratch: %scratch)
+    return td_commit(section: %section, seen: %seen, n_unique: n_unique, scratch: %scratch)
+  end
+  return commit_skip(section: %section, seen: %seen, n_unique: n_unique)
+end
+
+let commit_wasi_run_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64) -> %CommitStep do
+  let %scratch = bb.empty()
+  let %scratch = emit_wasi_run_type_scratch(scratch: %scratch)
+  return td_commit(section: %section, seen: %seen, n_unique: n_unique, scratch: %scratch)
+end
+
+/// Build the type section with duplicate-signature deduplication.
+/// Returns the vector-count-prefixed payload + per-entity canonical type indices.
+export let build_type_section_dedup = fn (program: LirProgram, has_eh: bool, has_alloc: bool,
+                                          has_cabi_realloc: bool, closure_arities: [i64]) -> %DedupedTypes do
   let LirProgram(functions: funcs, externals: exts) = program
-  let n_eh_types = match has_eh do case true -> 1 case false -> 0 end
-  let n_alloc_types = match has_alloc do case true -> 1 case false -> 0 end
-  let n_cabi_types = match has_cabi_realloc do case true -> 1 case false -> 0 end
-  let total = list.length(xs: exts) + list.length(xs: funcs) + 1 + n_eh_types + n_alloc_types + n_cabi_types + n_closure_types
-  let %sec = bb.empty()
-  let %sec = bb.push_uleb128(buf: %sec, val: total)
-  let %sec = emit_ext_type_entries(buf: %sec, exts: exts)
-  let %sec = emit_func_type_entries(buf: %sec, funcs: funcs)
-  // wasi:cli/run type (_start): () -> ()
-  let %sec = bb.push_byte(buf: %sec, byte: 96)
-  let %sec = bb.push_uleb128(buf: %sec, val: 0)
-  let %sec = bb.push_uleb128(buf: %sec, val: 0)
-  // exception tag type: (i64) -> ()
-  let %sec = if has_eh then
-    let %sec = bb.push_byte(buf: %sec, byte: 96)
-    let %sec = bb.push_uleb128(buf: %sec, val: 1)
-    let %sec = bb.push_byte(buf: %sec, byte: wdefs.vt_i64)
-    bb.push_uleb128(buf: %sec, val: 0)
-  else %sec end
-  let %sec = if has_alloc then
-    // allocate: (i32) -> i32
-    let %sec = bb.push_byte(buf: %sec, byte: 96)
-    let %sec = bb.push_uleb128(buf: %sec, val: 1)
-    let %sec = bb.push_byte(buf: %sec, byte: wdefs.vt_i32)
-    let %sec = bb.push_uleb128(buf: %sec, val: 1)
-    bb.push_byte(buf: %sec, byte: wdefs.vt_i32)
-  else %sec end
-  let %sec = if has_cabi_realloc then
-    // cabi_realloc: (i32, i32, i32, i32) -> i32
-    let %sec = bb.push_byte(buf: %sec, byte: 96)
-    let %sec = bb.push_uleb128(buf: %sec, val: 4)
-    let %sec = bb.push_byte(buf: %sec, byte: wdefs.vt_i32)
-    let %sec = bb.push_byte(buf: %sec, byte: wdefs.vt_i32)
-    let %sec = bb.push_byte(buf: %sec, byte: wdefs.vt_i32)
-    let %sec = bb.push_byte(buf: %sec, byte: wdefs.vt_i32)
-    let %sec = bb.push_uleb128(buf: %sec, val: 1)
-    bb.push_byte(buf: %sec, byte: wdefs.vt_i32)
-  else %sec end
-  return %sec
+  let %section = bb.empty()
+  let %seen = sm.empty()
+
+  let CommitList(section: %section, seen: %seen, n_unique: nu, idxs: ext_idxs) =
+    commit_exts_go(section: %section, seen: %seen, n_unique: 0, exts: exts, acc: [])
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+  let CommitList(section: %section, seen: %seen, n_unique: nu, idxs: func_idxs) =
+    commit_funcs_go(section: %section, seen: %seen, n_unique: nu, funcs: funcs, acc: [])
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+
+  let CommitStep(section: %section, seen: %seen, n_unique: nu, idx: wasi_run_idx) =
+    commit_wasi_run_type(section: %section, seen: %seen, n_unique: nu)
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+
+  let CommitStep(section: %section, seen: %seen, n_unique: nu, idx: exn_tag_idx) =
+    commit_eh_type(section: %section, seen: %seen, n_unique: nu, has_eh: has_eh)
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+
+  let CommitStep(section: %section, seen: %seen, n_unique: nu, idx: alloc_idx) =
+    commit_alloc_type(section: %section, seen: %seen, n_unique: nu, has_alloc: has_alloc)
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+
+  let CommitStep(section: %section, seen: %seen, n_unique: nu, idx: cabi_idx) =
+    commit_cabi_type(section: %section, seen: %seen, n_unique: nu, has_cabi: has_cabi_realloc)
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+
+  let CommitList(section: %section, seen: %seen, n_unique: n, idxs: closure_idxs) =
+    commit_closures_go(section: %section, seen: %seen, n_unique: nu, arities: closure_arities, acc: [])
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+  sm.free(map: %seen)
+
+  // Finalize: prepend vector-count to section bytes.
+  let %final = bb.empty()
+  let %final = bb.push_uleb128(buf: %final, val: n)
+  let %final = bb.push_buf(dst: %final, src: &section)
+  bb.free(buf: %section)
+  let %r = DedupedTypes(
+    section: %final,
+    count: n,
+    ext_type_idxs: ext_idxs,
+    func_type_idxs: func_idxs,
+    wasi_run_type_idx: wasi_run_idx,
+    exn_tag_type_idx: exn_tag_idx,
+    alloc_type_idx: alloc_idx,
+    cabi_type_idx: cabi_idx,
+    closure_type_idxs: closure_idxs
+  )
+  return %r
 end
 
 // ─── Import section ─────────────────────────────────────────────────────────
@@ -153,15 +373,19 @@ let import_module_name = fn (module: string) -> string do
   return module
 end
 
-let emit_import_entries = fn (buf: %ByteBuffer, exts: [LirExternal], type_idx: i64) -> %ByteBuffer do
+let emit_import_entries = fn (buf: %ByteBuffer, exts: [LirExternal], type_idxs: [i64]) -> %ByteBuffer do
   match exts do
     case [] -> %buf
-    case LirExternal(name: _, wasm_module: m, wasm_name: wn, params: _, ret_type: _, throw_row: _) :: rest ->
-      let %buf = wdefs.emit_name(buf: %buf, name: import_module_name(module: m))
-      let %buf = wdefs.emit_name(buf: %buf, name: wn)
-      let %buf = bb.push_byte(buf: %buf, byte: wdefs.desc_func)
-      let %buf = bb.push_uleb128(buf: %buf, val: type_idx)
-      emit_import_entries(buf: %buf, exts: rest, type_idx: type_idx + 1)
+    case LirExternal(name: _, wasm_module: m, wasm_name: wn, params: _, ret_type: _, throw_row: _) :: rest_exts ->
+      match type_idxs do
+        case [] -> %buf  // size invariant: type_idxs matches exts length
+        case ti :: rest_tis ->
+          let %buf = wdefs.emit_name(buf: %buf, name: import_module_name(module: m))
+          let %buf = wdefs.emit_name(buf: %buf, name: wn)
+          let %buf = bb.push_byte(buf: %buf, byte: wdefs.desc_func)
+          let %buf = bb.push_uleb128(buf: %buf, val: ti)
+          emit_import_entries(buf: %buf, exts: rest_exts, type_idxs: rest_tis)
+      end
   end
 end
 
@@ -177,7 +401,7 @@ let maybe_emit_mem_import = fn (sec: %ByteBuffer, has_mem_import: bool, mem_mode
   end
 end
 
-export let build_import_section = fn (exts: [LirExternal], mem_mode: string,
+export let build_import_section = fn (exts: [LirExternal], ext_type_idxs: [i64], mem_mode: string,
                                       has_alloc: bool, alloc_type_idx: i64, alloc_module: string) -> %ByteBuffer do
   let n_exts = list.length(xs: exts)
   let has_mem_import = mem_mode != "none" && mem_mode != "defined"
@@ -186,7 +410,7 @@ export let build_import_section = fn (exts: [LirExternal], mem_mode: string,
   let %sec = bb.empty()
   let %sec = bb.push_uleb128(buf: %sec, val: n_exts + mem_count + alloc_count)
   let %sec = maybe_emit_mem_import(sec: %sec, has_mem_import: has_mem_import, mem_mode: mem_mode)
-  let %sec = emit_import_entries(buf: %sec, exts: exts, type_idx: 0)
+  let %sec = emit_import_entries(buf: %sec, exts: exts, type_idxs: ext_type_idxs)
   let %sec = if has_alloc then
     let %sec = wdefs.emit_name(buf: %sec, name: import_module_name(module: alloc_module))
     let %sec = wdefs.emit_name(buf: %sec, name: "allocate")
@@ -198,20 +422,21 @@ end
 
 // ─── Function section ───────────────────────────────────────────────────────
 
-let emit_func_type_indices = fn (buf: %ByteBuffer, count: i64, start_idx: i64) -> %ByteBuffer do
-  if count <= 0 then
-    return %buf
-  else
-    return emit_func_type_indices(buf: bb.push_uleb128(buf: %buf, val: start_idx), count: count - 1, start_idx: start_idx + 1)
+let emit_func_type_indices = fn (buf: %ByteBuffer, idxs: [i64]) -> %ByteBuffer do
+  match idxs do
+    case [] -> %buf
+    case i :: rest ->
+      emit_func_type_indices(buf: bb.push_uleb128(buf: %buf, val: i), idxs: rest)
   end
 end
 
-export let build_function_section = fn (n_funcs: i64, n_exts: i64, has_cabi: bool, cabi_type_idx: i64) -> %ByteBuffer do
+export let build_function_section = fn (func_type_idxs: [i64], wasi_run_type_idx: i64,
+                                        has_cabi: bool, cabi_type_idx: i64) -> %ByteBuffer do
+  let n_funcs = list.length(xs: func_type_idxs)
   let n_cabi = match has_cabi do case true -> 1 case false -> 0 end
-  let wasi_run_type_idx = n_exts + n_funcs
   let %sec = bb.empty()
   let %sec = bb.push_uleb128(buf: %sec, val: n_funcs + n_cabi + 1)
-  let %sec = emit_func_type_indices(buf: %sec, count: n_funcs, start_idx: n_exts)
+  let %sec = emit_func_type_indices(buf: %sec, idxs: func_type_idxs)
   let %sec = if has_cabi then bb.push_uleb128(buf: %sec, val: cabi_type_idx) else %sec end
   let %sec = bb.push_uleb128(buf: %sec, val: wasi_run_type_idx)
   return %sec
@@ -409,35 +634,6 @@ export let build_element_section = fn (closure_entries: [FuncEntry]) -> %ByteBuf
   let %sec = bb.push_uleb128(buf: %sec, val: n)
   let %sec = emit_elem_func_indices(buf: %sec, entries: closure_entries)
   return %sec
-end
-
-// ─── Closure type entries ──────────────────────────────────────────────────
-
-/// Emit type entries for closure call types.
-/// Each distinct arity N gets a type: (N+1 x i64) -> i64 (env + N args → result).
-let emit_closure_type_entry = fn (buf: %ByteBuffer, arity: i64) -> %ByteBuffer do
-  let %buf = bb.push_byte(buf: %buf, byte: 96)
-  // param count = arity + 1 (env + args)
-  let %buf = bb.push_uleb128(buf: %buf, val: arity + 1)
-  let %buf = emit_n_i64_params(buf: %buf, count: arity + 1)
-  // return: 1 x i64
-  let %buf = bb.push_uleb128(buf: %buf, val: 1)
-  let %buf = bb.push_byte(buf: %buf, byte: wdefs.vt_i64)
-  return %buf
-end
-
-let emit_n_i64_params = fn (buf: %ByteBuffer, count: i64) -> %ByteBuffer do
-  if count <= 0 then return %buf
-  else emit_n_i64_params(buf: bb.push_byte(buf: %buf, byte: wdefs.vt_i64), count: count - 1)
-  end
-end
-
-export let emit_closure_type_entries = fn (buf: %ByteBuffer, arities: [i64]) -> %ByteBuffer do
-  match arities do
-    case [] -> %buf
-    case a :: rest ->
-      emit_closure_type_entries(buf: emit_closure_type_entry(buf: %buf, arity: a), arities: rest)
-  end
 end
 
 // ─── Tag section ────────────────────────────────────────────────────────────
