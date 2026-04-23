@@ -22,9 +22,9 @@ fn codegen_match_literal_statement_returns_correct_arm() {
         r#"
 let check = fn (x: i64) -> i64 do
     match x do
-      case 1 -> return 10
-      case 2 -> return 20
-      case _ -> return 30
+      | 1 -> return 10
+      | 2 -> return 20
+      | _ -> return 30
     end
     return 0
 end
@@ -44,7 +44,7 @@ fn codegen_match_variable_pattern_can_return_target_value() {
         r#"
 let check = fn (x: i64) -> i64 do
     match x do
-      case v -> return v
+      | v -> return v
     end
     return 0
 end
@@ -64,8 +64,8 @@ fn codegen_match_literal_then_variable_fallback() {
         r#"
 let check = fn (x: i64) -> i64 do
     match x do
-      case 0 -> return 0
-      case other -> return other
+      | 0 -> return 0
+      | other -> return other
     end
     return -1
 end
@@ -85,7 +85,7 @@ fn codegen_match_record_pattern_binds_fields() {
         r#"
 let check = fn (r: { x: i64, y: i64 }) -> i64 do
     match r do
-      case { x: a, y: b } -> return a + b
+      | { x: a, y: b } -> return a + b
     end
     return 0
 end
@@ -168,8 +168,8 @@ let check = fn () -> i64 throws { Exn } do
       raise Boom(42)
       return -1
     catch
-      case Boom(_) -> return 1
-      case _ -> return 2
+      | Boom(_) -> return 1
+      | _ -> return 2
     end
     return 0
 end
@@ -194,8 +194,8 @@ let check = fn () -> i64 throws { Exn } do
       raise Boom(42)
       return -1
     catch
-      case Boom(code) -> return code
-      case _ -> return -2
+      | Boom(code) -> return code
+      | _ -> return -2
     end
     return 0
 end
@@ -227,10 +227,10 @@ let main = fn () -> unit throws { Exn } do
         thrower()
         raise RuntimeError(val: "should not reach here")
     catch
-          case Boom(code) ->
+          | Boom(code) ->
             if code != 42 then raise RuntimeError(val: "expected 42") end
             return ()
-          case _ -> raise RuntimeError(val: "unexpected exception")
+          | _ -> raise RuntimeError(val: "unexpected exception")
     end
     return ()
 end
@@ -254,10 +254,10 @@ let main = fn () -> unit throws { Exn } do
         let _ = thrower()
         raise RuntimeError(val: "should not reach here")
     catch
-          case Boom(code) ->
+          | Boom(code) ->
             if code != 99 then raise RuntimeError(val: "expected 99") end
             return ()
-          case _ -> raise RuntimeError(val: "unexpected exception")
+          | _ -> raise RuntimeError(val: "unexpected exception")
     end
     return ()
 end
@@ -286,10 +286,10 @@ let main = fn () -> unit throws { Exn } do
         middle()
         raise RuntimeError(val: "should not reach here")
     catch
-          case Boom(code) ->
+          | Boom(code) ->
             if code != 7 then raise RuntimeError(val: "expected 7") end
             return ()
-          case _ -> raise RuntimeError(val: "unexpected exception")
+          | _ -> raise RuntimeError(val: "unexpected exception")
     end
     return ()
 end
@@ -305,9 +305,9 @@ fn codegen_match_expr_literal_cases() {
         r#"
 let classify = fn (x: i64) -> i64 do
     let result = match x do
-      case 1 -> 10
-      case 2 -> 20
-      case _ -> 30
+      | 1 -> 10
+      | 2 -> 20
+      | _ -> 30
     end
     return result
 end
@@ -331,7 +331,7 @@ fn codegen_match_expr_variable_binding() {
         r#"
 let double = fn (x: i64) -> i64 do
     let result = match x do
-      case v -> v + v
+      | v -> v + v
     end
     return result
 end
@@ -351,7 +351,7 @@ fn codegen_match_expr_record_pattern() {
         r#"
 let sum_fields = fn (r: { x: i64, y: i64 }) -> i64 do
     let result = match r do
-      case { x: a, y: b } -> a + b
+      | { x: a, y: b } -> a + b
     end
     return result
 end
@@ -375,8 +375,8 @@ end
 
 let compute = fn (x: i64) -> i64 do
     let result = match x do
-      case 0 -> 0
-      case n -> add(a: n, b: 100)
+      | 0 -> 0
+      | n -> add(a: n, b: 100)
     end
     return result
 end
@@ -396,8 +396,8 @@ fn codegen_match_expr_bool_cases() {
         r#"
 let to_int = fn (b: bool) -> i64 do
     let result = match b do
-      case true -> 1
-      case false -> 0
+      | true -> 1
+      | false -> 0
     end
     return result
 end
@@ -421,9 +421,9 @@ type Color = Red | Green | Blue
 
 let to_code = fn (c: Color) -> i64 do
     let result = match c do
-      case Red -> 1
-      case Green -> 2
-      case Blue -> 3
+      | Red -> 1
+      | Green -> 2
+      | Blue -> 3
     end
     return result
 end
@@ -443,8 +443,8 @@ fn codegen_match_expr_nested_in_binop() {
         r#"
 let f = fn (x: i64) -> i64 do
     let a = match x do
-      case 1 -> 10
-      case _ -> 20
+      | 1 -> 10
+      | _ -> 20
     end
     return a + 5
 end
@@ -554,9 +554,9 @@ fn codegen_if_expr_inside_match_expr_as_let_value() {
         r#"
 let pick = fn (flag: bool, a: i64, b: i64) -> i64 do
     let result = match flag do
-      case true ->
+      | true ->
         if a > b then a else b end
-      case false -> 0
+      | false -> 0
     end
     return result
 end
@@ -583,11 +583,11 @@ type Outer = OuterA(inner: Wrapper) | OuterB
 
 let classify = fn (x: Outer, threshold: i64) -> i64 do
     let result = match x do
-      case OuterA(inner: w) ->
-        match w do case Wrapper(val: v) ->
+      | OuterA(inner: w) ->
+        match w do | Wrapper(val: v) ->
           if v > threshold then v else threshold end
         end
-      case OuterB -> 0
+      | OuterB -> 0
     end
     return result
 end
@@ -618,11 +618,11 @@ end
 
 let compute = fn (x: Outer, flag: bool) -> i64 do
     let result = match x do
-      case OuterA(inner: w) ->
-        match w do case Wrapper(val: v) ->
+      | OuterA(inner: w) ->
+        match w do | Wrapper(val: v) ->
           if flag then add10(x: v) else v end
         end
-      case OuterB -> 0
+      | OuterB -> 0
     end
     return result
 end
@@ -647,11 +647,11 @@ type Outer = OuterA(inner: Wrapper) | OuterB
 
 let classify = fn (x: Outer, flag: bool) -> [string] do
     let result = match x do
-      case OuterA(inner: w) ->
-        match w do case Wrapper(name: n) ->
+      | OuterA(inner: w) ->
+        match w do | Wrapper(name: n) ->
           if flag then Cons(v: n, rest: Nil) else Nil end
         end
-      case OuterB -> Nil
+      | OuterB -> Nil
     end
     return result
 end
@@ -659,14 +659,14 @@ end
 let main = fn () -> unit do
     let r1 = classify(x: OuterA(inner: Wrapper(name: "hello")), flag: true)
     match r1 do
-      case Cons(v: s, rest: Nil) ->
+      | Cons(v: s, rest: Nil) ->
         if s != "hello" then raise RuntimeError(val: "expected hello") end
-      case _ -> raise RuntimeError(val: "expected Cons")
+      | _ -> raise RuntimeError(val: "expected Cons")
     end
     let r2 = classify(x: OuterA(inner: Wrapper(name: "hello")), flag: false)
     match r2 do
-      case Nil -> return ()
-      case _ -> raise RuntimeError(val: "expected Nil")
+      | Nil -> return ()
+      | _ -> raise RuntimeError(val: "expected Nil")
     end
     return ()
 end
@@ -699,11 +699,11 @@ end
 
 let classify = fn (x: Outer, flag: bool) -> string do
     let result = match x do
-      case OuterA(inner: w) ->
-        match w do case Inner(name: n) ->
+      | OuterA(inner: w) ->
+        match w do | Inner(name: n) ->
           if flag then identity(s: n) else prepend(s: n, prefix: "pfx.") end
         end
-      case OuterB -> "none"
+      | OuterB -> "none"
     end
     return result
 end
@@ -761,14 +761,14 @@ type Shape = Circle | Square
 let describe = fn (c: Color, s: Shape) -> i64 do
     let x = 0
     match c do
-      case Red ->
+      | Red ->
         match s do
-          case Circle -> let x = 1
-          case Square -> let x = 2
+          | Circle -> let x = 1
+          | Square -> let x = 2
         end
-      case Green ->
+      | Green ->
         let x = 10
-      case Blue ->
+      | Blue ->
         let x = 20
     end
     let after = 100
@@ -792,12 +792,12 @@ type Color = Red | Green | Blue
 
 let count = fn (xs: [Color], acc: i64) -> i64 do
     match xs do
-      case Nil -> return acc
-      case Cons(v: c, rest: rest) ->
+      | Nil -> return acc
+      | Cons(v: c, rest: rest) ->
         let inc = match c do
-          case Red -> 1
-          case Green -> 2
-          case Blue -> 3
+          | Red -> 1
+          | Green -> 2
+          | Blue -> 3
         end
         let next = acc + inc
         return count(xs: rest, acc: next)
@@ -940,9 +940,9 @@ type Color = Red | Green | Blue
 
 let to_num = fn (c: Color) -> i64 do
     return match c do
-        case Red -> 1
-        case Green -> 2
-        case Blue -> 3
+        | Red -> 1
+        | Green -> 2
+        | Blue -> 3
     end
 end
 
@@ -1069,9 +1069,9 @@ let check = fn () -> i64 throws { Exn } do
         raise Boom(42)
         return -1
     catch
-        case Boom(code) -> return code
-        case Oops(n) -> return n + 100
-        case _ -> return -2
+        | Boom(code) -> return code
+        | Oops(n) -> return n + 100
+        | _ -> return -2
     end
     return -3
 end
@@ -1097,8 +1097,8 @@ let check = fn () -> i64 throws { Exn } do
         raise Oops(99)
         return -1
     catch
-        case Boom(code) -> return code
-        case _ -> return 77
+        | Boom(code) -> return code
+        | _ -> return 77
     end
     return -3
 end
@@ -1123,8 +1123,8 @@ let check = fn () -> i64 throws { Exn } do
         raise DbError(code: 404, msg: "not found")
         return -1
     catch
-        case DbError(code: c, msg: _) -> return c
-        case _ -> return -2
+        | DbError(code: c, msg: _) -> return c
+        | _ -> return -2
     end
     return -3
 end
@@ -1149,8 +1149,8 @@ let check = fn () -> i64 throws { Exn } do
         raise Boom(55)
         return -1
     catch
-        case Boom(code) -> return code
-        case _ -> return -2
+        | Boom(code) -> return code
+        | _ -> return -2
     end
     return -3
 end
@@ -1182,8 +1182,8 @@ let run = fn () -> string throws { Exn } do
         raise Parse(expected: "comma", got: "semicolon")
         return ""
     catch
-        case Parse(expected: e, got: g) -> return "expected " ++ e ++ ", got " ++ g
-        case _ -> return ""
+        | Parse(expected: e, got: g) -> return "expected " ++ e ++ ", got " ++ g
+        | _ -> return ""
     end
     return ""
 end
@@ -1210,13 +1210,13 @@ let check = fn () -> i64 throws { Exn } do
             raise Oops(10)
             return -1
         catch
-            case Boom(code) -> return code
-            case _ -> raise RuntimeError(val: "inner fallthrough")
+            | Boom(code) -> return code
+            | _ -> raise RuntimeError(val: "inner fallthrough")
         end
         return -2
     catch
-        case RuntimeError(_) -> return 77
-        case _ -> return -3
+        | RuntimeError(_) -> return 77
+        | _ -> return -3
     end
     return -4
 end
@@ -1238,7 +1238,7 @@ type Box = Box(value: i64)
 
 let main = fn () -> unit throws { Exn } do
     let result = match Box(value: 99) do
-        case Box(value: v) -> v
+        | Box(value: v) -> v
     end
     if result != 99 then raise RuntimeError(val: "expected 99") end
     return ()
@@ -1256,7 +1256,7 @@ type Pair = Pair(fst: i64, snd: i64)
 let main = fn () -> unit throws { Exn } do
     let p = Pair(fst: 10, snd: 20)
     let sum = match p do
-        case Pair(fst: a, snd: b) -> a + b
+        | Pair(fst: a, snd: b) -> a + b
     end
     if sum != 30 then raise RuntimeError(val: "expected 30") end
     return ()
@@ -1273,7 +1273,7 @@ type Box = Box(value: i64)
 
 let update_box = fn (b: %Box) -> Box do
     match b do
-        case Box(value: v) -> return Box(value: v + 1)
+        | Box(value: v) -> return Box(value: v + 1)
     end
 end
 
@@ -1281,7 +1281,7 @@ let main = fn () -> unit throws { Exn } do
     let %b = Box(value: 42)
     let result = update_box(b: %b)
     match result do
-        case Box(value: v) ->
+        | Box(value: v) ->
             if v != 43 then raise RuntimeError(val: "expected 43") end
     end
     return ()
@@ -1298,7 +1298,7 @@ type Pair = Pair(fst: i64, snd: i64)
 
 let update_fst = fn (p: %Pair) -> Pair do
     match p do
-        case Pair(fst: a, snd: b) -> return Pair(fst: a * 10, snd: b)
+        | Pair(fst: a, snd: b) -> return Pair(fst: a * 10, snd: b)
     end
 end
 
@@ -1306,7 +1306,7 @@ let main = fn () -> unit throws { Exn } do
     let %p = Pair(fst: 3, snd: 7)
     let result = update_fst(p: %p)
     match result do
-        case Pair(fst: a, snd: b) ->
+        | Pair(fst: a, snd: b) ->
             if a != 30 then raise RuntimeError(val: "fst expected 30") end
             if b != 7 then raise RuntimeError(val: "snd expected 7") end
     end
@@ -1324,7 +1324,7 @@ type Triple = Triple(a: i64, b: i64, c: i64)
 
 let inc_a = fn (t: %Triple) -> Triple do
     match t do
-        case Triple(a: x, b: y, c: z) -> return Triple(a: x + 1, b: y, c: z)
+        | Triple(a: x, b: y, c: z) -> return Triple(a: x + 1, b: y, c: z)
     end
 end
 
@@ -1334,7 +1334,7 @@ let main = fn () -> unit throws { Exn } do
     let %t3 = inc_a(t: %t2)
     let result = inc_a(t: %t3)
     match result do
-        case Triple(a: a, b: b, c: c) ->
+        | Triple(a: a, b: b, c: c) ->
             if a != 3 then raise RuntimeError(val: "a expected 3") end
             if b != 10 then raise RuntimeError(val: "b expected 10") end
             if c != 20 then raise RuntimeError(val: "c expected 20") end
@@ -1351,8 +1351,8 @@ fn codegen_match_or_pattern_literal_alternates() {
         r#"
 let check = fn (x: i64) -> i64 do
     match x do
-      case 1 | 2 | 3 -> return 100
-      case _ -> return 0
+      | 1 | 2 | 3 -> return 100
+      | _ -> return 0
     end
     return -1
 end
@@ -1376,8 +1376,8 @@ type Sign = Pos | Neg | Zero
 
 let classify = fn (s: Sign) -> i64 do
     match s do
-      case Pos | Neg -> return 1
-      case Zero -> return 0
+      | Pos | Neg -> return 1
+      | Zero -> return 0
     end
     return -1
 end
@@ -1400,7 +1400,7 @@ type Either = Left(v: i64) | Right(v: i64)
 
 let extract = fn (e: Either) -> i64 do
     match e do
-      case Left(v: v) | Right(v: v) -> return v
+      | Left(v: v) | Right(v: v) -> return v
     end
     return -1
 end
@@ -1480,7 +1480,7 @@ let safe = fn (which: i64) -> i64 throws { Exn } do
       if which == 0 then return throws_a() end
       return throws_b()
     catch
-      case ErrA(_) | ErrB(_) -> return 555
+      | ErrA(_) | ErrB(_) -> return 555
     end
     return 0
 end

@@ -93,9 +93,9 @@ fn char_match() {
 let main = fn () -> unit do
     let c = 'x'
     match c do
-        case 'a' -> raise RuntimeError("should not match 'a'")
-        case 'x' -> ()
-        case _ -> raise RuntimeError("should not match wildcard")
+        | 'a' -> raise RuntimeError("should not match 'a'")
+        | 'x' -> ()
+        | _ -> raise RuntimeError("should not match wildcard")
     end
     return ()
 end

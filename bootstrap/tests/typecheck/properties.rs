@@ -221,8 +221,8 @@ let main = fn () -> unit do
     let x: Option<i64> = Some(val: {n})
     let y: Option<i64> = None
     match x do
-        case Some(val: v) -> return ()
-        case None -> return ()
+        | Some(val: v) -> return ()
+        | None -> return ()
     end
 end
 "#);
@@ -485,7 +485,7 @@ proptest! {
         let src = format!(r#"
 let main = fn () -> unit do
     let %x = {{ id: {n} }}
-    match %x do case _ -> () end
+    match %x do | _ -> () end
     return ()
 end
 "#);
@@ -499,8 +499,8 @@ end
         let src = format!(r#"
 let main = fn () -> unit do
     let %x = {{ id: {n} }}
-    match %x do case _ -> () end
-    match %x do case _ -> () end
+    match %x do | _ -> () end
+    match %x do | _ -> () end
     return ()
 end
 "#);
@@ -548,7 +548,7 @@ proptest! {
     fn prop_linear_weakening_accepted(n in any::<i64>()) {
         let src = format!(r#"
 let consume = fn (x: %i64) -> i64 do
-    match x do case _ -> () end
+    match x do | _ -> () end
     return 1
 end
 let main = fn () -> unit do
@@ -573,7 +573,7 @@ proptest! {
 let main = fn () -> unit do
     let %x = {{ id: {n} }}
     if {cond} then
-        match %x do case _ -> () end
+        match %x do | _ -> () end
     else
         ()
     end
@@ -590,9 +590,9 @@ end
 let main = fn () -> unit do
     let %x = {{ id: {n} }}
     if {cond} then
-        match %x do case _ -> () end
+        match %x do | _ -> () end
     else
-        match %x do case _ -> () end
+        match %x do | _ -> () end
     end
     return ()
 end
@@ -615,7 +615,7 @@ proptest! {
 let test = fn () -> i64 do
     let %x = {n}
     let f = fn () -> i64 do
-        match %x do case _ -> () end
+        match %x do | _ -> () end
         return 1
     end
     return f()
@@ -631,7 +631,7 @@ end
 let test = fn () -> i64 do
     let %x = {n}
     let f = fn () -> i64 do
-        match %x do case _ -> () end
+        match %x do | _ -> () end
         return 1
     end
     let _a = f()
@@ -726,8 +726,8 @@ let main = fn () -> unit do
     try
         risky()
     catch
-        case TestError(val: m) -> ()
-        case _ -> ()
+        | TestError(val: m) -> ()
+        | _ -> ()
     end
     return ()
 end
@@ -931,7 +931,7 @@ let main = fn () -> unit do
     let %r = {n}
     let ref = &%r
     let v: i64 = peek(x: ref)
-    match %r do case _ -> () end
+    match %r do | _ -> () end
     return ()
 end
 "#);
@@ -997,8 +997,8 @@ proptest! {
 let main = fn () -> unit do
     let x = {b}
     match x do
-        case true -> return ()
-        case false -> return ()
+        | true -> return ()
+        | false -> return ()
     end
 end
 "#);
@@ -1013,7 +1013,7 @@ end
 let main = fn () -> unit do
     let x = {b}
     match x do
-        case true -> return ()
+        | true -> return ()
     end
 end
 "#);
@@ -1031,7 +1031,7 @@ fn prop_exhaustive_option_requires_both_cases() {
 let main = fn () -> unit do
     let x: Option<i64> = Some(val: 1)
     match x do
-        case Some(val: v) -> return ()
+        | Some(val: v) -> return ()
     end
 end
 "#,
@@ -1043,8 +1043,8 @@ end
 let main = fn () -> unit do
     let x: Option<i64> = Some(val: 1)
     match x do
-        case Some(val: v) -> return ()
-        case None -> return ()
+        | Some(val: v) -> return ()
+        | None -> return ()
     end
 end
 "#,
@@ -1059,9 +1059,9 @@ fn prop_exhaustive_nested_result_option() {
 let main = fn () -> unit do
     let x: Result<Option<i64>, string> = Ok(val: Some(val: 1))
     match x do
-        case Ok(val: Some(val: v)) -> return ()
-        case Ok(val: None) -> return ()
-        case Err(err: e) -> return ()
+        | Ok(val: Some(val: v)) -> return ()
+        | Ok(val: None) -> return ()
+        | Err(err: e) -> return ()
     end
 end
 "#,
@@ -1073,8 +1073,8 @@ end
 let main = fn () -> unit do
     let x: Result<Option<i64>, string> = Ok(val: Some(val: 1))
     match x do
-        case Ok(val: Some(val: v)) -> return ()
-        case Err(err: e) -> return ()
+        | Ok(val: Some(val: v)) -> return ()
+        | Err(err: e) -> return ()
     end
 end
 "#,
@@ -1098,8 +1098,8 @@ proptest! {
         let src = format!(r#"
 let sum = fn (xs: [i64]) -> i64 do
     match xs do
-        case Nil -> return 0
-        case Cons(v: h, rest: t) ->
+        | Nil -> return 0
+        | Cons(v: h, rest: t) ->
             let rest_sum = sum(xs: t)
             return h + rest_sum
     end
@@ -1123,7 +1123,7 @@ type Pair<A, B> = Pair(fst: A, snd: B)
 
 let fst = fn <A, B>(p: Pair<A, B>) -> A do
     match p do
-        case Pair(fst: a, snd: _) -> return a
+        | Pair(fst: a, snd: _) -> return a
     end
 end
 

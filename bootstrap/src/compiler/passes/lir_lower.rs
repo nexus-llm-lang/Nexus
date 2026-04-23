@@ -354,14 +354,8 @@ enum MatchEmitMode {
     },
 }
 
-/// Expand or-patterns at the top level of each row into multiple rows that
-/// share the same case_idx. The Maranget algorithm has no native or-pattern
-/// support; expansion preserves correctness because each alternative becomes
-/// a distinct row that maps to the same body.
-///
-/// Or-patterns at the row's top level (one per match arm) are handled here.
-/// Nested or-patterns are not produced by the parser, so this single-level
-/// pass suffices.
+/// Expand top-level or-patterns into one row per alternative, all sharing
+/// the same `case_idx` so they jump to the same body label.
 fn expand_or_patterns(rows: Vec<PatRow>) -> Vec<PatRow> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {

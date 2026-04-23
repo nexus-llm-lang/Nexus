@@ -111,8 +111,8 @@ fn test_poly_variants() {
         let r2 = Ok(val: true)
         // Check match on poly variants
         match r1 do
-            case Ok(val: v) -> let x = v + 1
-            case Err(err: e) -> ()
+            | Ok(val: v) -> let x = v + 1
+            | Err(err: e) -> ()
         end
         return ()
     end
@@ -245,7 +245,7 @@ fn test_linear_capture_makes_lambda_linear_and_single_use() {
     let test_fn = fn () -> i64 do
         let %x = 7
         let f = fn () -> i64 do
-            match %x do case _ -> () end
+            match %x do | _ -> () end
             return 1
         end
         let y = f()
@@ -262,7 +262,7 @@ fn test_linear_capturing_lambda_cannot_be_called_twice() {
     let test_fn = fn () -> i64 do
         let %x = 7
         let f = fn () -> i64 do
-            match %x do case _ -> () end
+            match %x do | _ -> () end
             return 1
         end
         let _a = f()
@@ -308,7 +308,7 @@ fn test_constructor_pattern_arity_error_is_llm_friendly() {
     let test_fn = fn () -> i64 do
         let p: Pair = Pair(left: 1, right: 2)
         match p do
-            case Pair(left: x) -> return x
+            | Pair(left: x) -> return x
         end
     end
     "#,
@@ -603,8 +603,8 @@ fn test_match_expr_same_type_cases_typechecks() {
         r#"
 let f = fn (x: i64) -> i64 do
     let result: i64 = match x do
-      case 1 -> 10
-      case _ -> 20
+      | 1 -> 10
+      | _ -> 20
     end
     return result
 end
@@ -618,8 +618,8 @@ fn test_match_expr_type_mismatch_fails() {
         r#"
 let f = fn (x: i64) -> i64 do
     let result: i64 = match x do
-      case 1 -> 10
-      case _ -> true
+      | 1 -> 10
+      | _ -> true
     end
     return result
 end
@@ -635,8 +635,8 @@ fn test_match_expr_with_return_cases_diverge() {
         r#"
 let f = fn (x: i64) -> i64 do
     let result = match x do
-      case 0 -> return 999
-      case _ -> 42
+      | 0 -> return 999
+      | _ -> 42
     end
     return result
 end
@@ -785,8 +785,8 @@ fn test_return_in_match_counts_as_return() {
         r#"
     let f = fn (x: bool) -> i64 do
         match x do
-        case true -> return 1
-        case false -> return 0
+        | true -> return 1
+        | false -> return 0
         end
     end
     "#,

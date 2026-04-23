@@ -37,7 +37,7 @@ fn soundness_generic_pair() {
     let main = fn () -> unit do
         let p = Pair(fst: 1, snd: true)
         match p do
-            case Pair(fst: a, snd: b) -> return ()
+            | Pair(fst: a, snd: b) -> return ()
         end
     end
     "#;
@@ -52,8 +52,8 @@ fn soundness_option_some_none() {
         let x: Option<i64> = Some(val: 42)
         let y: Option<i64> = None
         match x do
-            case Some(val: v) -> return ()
-            case None -> return ()
+            | Some(val: v) -> return ()
+            | None -> return ()
         end
     end
     "#;
@@ -68,8 +68,8 @@ fn soundness_result_ok_err() {
         let x: Result<i64, string> = Ok(val: 42)
         let y: Result<i64, string> = Err(err: "oops")
         match x do
-            case Ok(val: v) -> return ()
-            case Err(err: e) -> return ()
+            | Ok(val: v) -> return ()
+            | Err(err: e) -> return ()
         end
     end
     "#;
@@ -83,9 +83,9 @@ fn soundness_nested_match() {
     let main = fn () -> unit do
         let x: Result<Option<i64>, string> = Ok(val: Some(val: 10))
         match x do
-            case Ok(val: Some(val: v)) -> return ()
-            case Ok(val: None) -> return ()
-            case Err(err: e) -> return ()
+            | Ok(val: Some(val: v)) -> return ()
+            | Ok(val: None) -> return ()
+            | Err(err: e) -> return ()
         end
     end
     "#;
@@ -149,8 +149,8 @@ fn soundness_recursive_list() {
     let main = fn () -> unit do
         let xs = Cons(v: 1, rest: Cons(v: 2, rest: Cons(v: 3, rest: Nil)))
         match xs do
-            case Cons(v: h, rest: t) -> return ()
-            case Nil -> return ()
+            | Cons(v: h, rest: t) -> return ()
+            | Nil -> return ()
         end
     end
     "#;
@@ -211,7 +211,7 @@ fn soundness_linear_resource_borrow_and_consume() {
         let %r = 42
         let r_ref = &%r
         let v = peek(x: r_ref)
-        match %r do case _ -> () end
+        match %r do | _ -> () end
         return ()
     end
     "#;
@@ -258,8 +258,8 @@ fn soundness_exception_try_catch() {
         try
             raise Boom(code: 42)
         catch
-            case Boom(code: code) -> return ()
-            case _ -> return ()
+            | Boom(code: code) -> return ()
+            | _ -> return ()
         end
         return ()
     end
@@ -277,7 +277,7 @@ fn soundness_array_create_and_borrow() {
         let %arr = [| 1, 2, 3 |]
         let arr_ref = &%arr
         let n = array.length(arr: arr_ref)
-        match %arr do case _ -> () end
+        match %arr do | _ -> () end
         return ()
     end
     "#;
@@ -335,8 +335,8 @@ fn soundness_match_all_return_diverge() {
     let src = r#"
     let f = fn (x: i64) -> i64 do
         match x do
-            case 0 -> return 100
-            case _ -> return 200
+            | 0 -> return 100
+            | _ -> return 200
         end
     end
 
@@ -403,8 +403,8 @@ end
 let main = fn () -> unit do
     let b = {}
     match b do
-        case true -> return ()
-        case false -> return ()
+        | true -> return ()
+        | false -> return ()
     end
 end
 "#, val);
@@ -417,8 +417,8 @@ end
         let src = format!(r#"
 let extract = fn (opt: Option<i64>) -> i64 do
     match opt do
-        case Some(val: v) -> return v
-        case None -> return 0
+        | Some(val: v) -> return v
+        | None -> return 0
     end
 end
 

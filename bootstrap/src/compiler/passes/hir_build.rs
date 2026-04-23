@@ -1932,9 +1932,6 @@ fn collect_ast_pattern_defs(pattern: &Pattern, defined: &mut HashSet<String>) {
             }
         }
         Pattern::Or(alts) => {
-            // All alternatives bind the same variable set (validated in typecheck);
-            // walking the first is sufficient. Walk all defensively in case
-            // typecheck has not yet flagged a mismatch.
             for alt in alts {
                 collect_ast_pattern_defs(&alt.node, defined);
             }

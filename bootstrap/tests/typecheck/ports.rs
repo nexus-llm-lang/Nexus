@@ -108,28 +108,28 @@ fn test_handler_require_mock_needs_nothing() {
         return %lh
       end
       fn read(handle: %Handle) -> { content: string, handle: %Handle } do
-        match handle do case Handle(id: id) ->
+        match handle do | Handle(id: id) ->
           let h = Handle(id: id)
           let %lh = h
           return { content: "", handle: %lh }
         end
       end
       fn write(handle: %Handle, content: string) -> { ok: bool, handle: %Handle } do
-        match handle do case Handle(id: id) ->
+        match handle do | Handle(id: id) ->
           let h = Handle(id: id)
           let %lh = h
           return { ok: true, handle: %lh }
         end
       end
       fn handle_path(handle: %Handle) -> { path: string, handle: %Handle } do
-        match handle do case Handle(id: id) ->
+        match handle do | Handle(id: id) ->
           let h = Handle(id: id)
           let %lh = h
           return { path: "", handle: %lh }
         end
       end
       fn close(handle: %Handle) -> unit do
-        match handle do case Handle(id: _) -> return () end
+        match handle do | Handle(id: _) -> return () end
       end
     end
 

@@ -68,10 +68,10 @@ let main = fn () -> unit do
   inject mock_env do
     let result = Env.get(key: "MOCK_VAR")
     match result do
-      case Some(val: v) ->
+      | Some(val: v) ->
         if v != "mock_value" then raise RuntimeError(val: "expected mock_value") end
         return ()
-      case None -> raise RuntimeError(val: "expected Some")
+      | None -> raise RuntimeError(val: "expected Some")
     end
   end
 end

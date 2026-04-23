@@ -19,8 +19,8 @@ let main = fn () -> unit throws { Exn } do
   catch e ->
     let frames = backtrace(exn: e)
     match frames do
-      case Cons(v: name, rest: _) -> return ()
-      case Nil -> raise RuntimeError(val: "expected at least 1 frame")
+      | Cons(v: name, rest: _) -> return ()
+      | Nil -> raise RuntimeError(val: "expected at least 1 frame")
     end
   end
   return ()
@@ -54,8 +54,8 @@ let main = fn () -> unit throws { Exn } do
     let frames = backtrace(exn: e)
     // Should have at least deep's frame
     match frames do
-      case Cons(v: _, rest: _) -> return ()
-      case Nil -> raise RuntimeError(val: "expected frames from cross-function raise")
+      | Cons(v: _, rest: _) -> return ()
+      | Nil -> raise RuntimeError(val: "expected frames from cross-function raise")
     end
   end
   return ()

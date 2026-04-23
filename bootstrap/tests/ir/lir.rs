@@ -68,8 +68,8 @@ fn snapshot_lir_match_expression() {
     let src = r#"
     let f = fn (x: i64) -> i64 do
         let result = match x do
-          case 0 -> 10
-          case _ -> 20
+          | 0 -> 10
+          | _ -> 20
         end
         return result
     end

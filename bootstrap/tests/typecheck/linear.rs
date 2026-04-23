@@ -118,7 +118,7 @@ fn test_linear_primitive_match_wildcard_pass() {
     let main = fn () -> unit do
         let %x = 10
         match %x do
-            case _ -> return () // Allowed for primitives
+            | _ -> return () // Allowed for primitives
         end
     end
     "#,
@@ -218,8 +218,8 @@ fn test_adt_with_linear_arg_consumed_once_passes() {
         let %r = { id: 1 }
         let w = Wrap(val: %r)
         match w do
-            case Wrap(val: inner) ->
-                match inner do case { id: _ } -> () end
+            | Wrap(val: inner) ->
+                match inner do | { id: _ } -> () end
         end
         return ()
     end
@@ -239,7 +239,7 @@ proptest! {
         let src = format!("
 let test_fn = fn () -> i64 do
     let %a = {}
-    match %a do case _ -> () end
+    match %a do | _ -> () end
     return 1
 end
 ", x);
@@ -253,8 +253,8 @@ end
 let test_fn = fn () -> i64 do
     let %a = {}
     let %a = {}
-    match %a do case _ -> () end
-    match %a do case _ -> () end
+    match %a do | _ -> () end
+    match %a do | _ -> () end
     return 1
 end
 ", val, val);
@@ -407,7 +407,7 @@ fn test_linear_deeply_nested_else_if_value_branches() {
     end
 
     let consume = fn (%r: Resource) -> i64 do
-        match %r do case { id: x } -> return x end
+        match %r do | { id: x } -> return x end
     end
 
     let process = fn (op: i64, %buf: Resource) -> i64 do
@@ -459,7 +459,7 @@ fn test_linear_deeply_nested_else_if_all_return() {
     type Resource = { id: i64 }
 
     let consume = fn (%r: Resource) -> i64 do
-        match %r do case { id: x } -> return x end
+        match %r do | { id: x } -> return x end
     end
 
     let process = fn (op: i64, %buf: Resource) -> i64 do
@@ -513,7 +513,7 @@ fn test_linear_deeply_nested_else_if_mixed_return_and_value() {
     end
 
     let consume = fn (%r: Resource) -> i64 do
-        match %r do case { id: x } -> return x end
+        match %r do | { id: x } -> return x end
     end
 
     let process = fn (op: i64, %buf: Resource) -> i64 do

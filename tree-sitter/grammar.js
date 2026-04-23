@@ -39,7 +39,7 @@ export default grammar({
     [$.sigil, $.force_expr],
     // `match x do ...` — match_stmt (stmt body) vs match_expr (expr body) via expr_stmt
     [$.match_stmt, $.match_expr],
-    // `case pat -> expr` — expr_stmt in match_case body vs match_case_expr value
+    // arm body in match_case (stmts) vs match_case_expr (expr)
     [$.expr_stmt, $.match_case_expr],
     // `if let pat = expr then expr end` — if_let_expr vs expr_stmt in stmt body
     [$.expr_stmt, $.if_let_expr],
@@ -403,7 +403,7 @@ export default grammar({
         "end"
       ),
 
-    // match expr do case pat -> stmts ... end
+    // match expr do | pat -> stmts ... end
     match_stmt: ($) =>
       seq(
         "match",
@@ -415,8 +415,8 @@ export default grammar({
 
     match_case: ($) =>
       seq(
-        "case",
-        field("pattern", $._pattern),
+        "|",
+        field("pattern", $._pattern_or),
         "->",
         field("body", repeat($._stmt))
       ),
@@ -446,20 +446,20 @@ export default grammar({
       ),
 
     // try stmts catch param -> stmts end
-    // try stmts catch case pat -> stmts ... end
+    // try stmts catch | pat -> stmts ... end
     try_stmt: ($) =>
       seq(
         "try",
         field("body", repeat($._stmt)),
         "catch",
         choice(
-          // Legacy: catch param -> body
+          // Bare: catch param -> body
           seq(
             field("catch_param", $.identifier),
             "->",
             field("catch_body", repeat($._stmt))
           ),
-          // Multi-arm: catch case pat -> body ... end (no catch_param)
+          // Multi-arm: catch | pat -> body ... end
           field("catch_arms", repeat1($.catch_arm))
         ),
         "end"
@@ -467,8 +467,8 @@ export default grammar({
 
     catch_arm: ($) =>
       seq(
-        "case",
-        field("pattern", $._pattern),
+        "|",
+        field("pattern", $._pattern_or),
         "->",
         field("body", repeat($._stmt))
       ),
@@ -590,12 +590,12 @@ export default grammar({
             field("right", $._expr)
           )
         ),
-        // Bitwise OR / XOR (same precedence as additive)
+        // Bitwise XOR (same precedence as additive)
         prec.left(
           4,
           seq(
             field("left", $._expr),
-            field("operator", choice("|", "^")),
+            field("operator", "^"),
             field("right", $._expr)
           )
         ),
@@ -679,7 +679,7 @@ export default grammar({
         "end"
       ),
 
-    // match expr do case pat -> expr ... end  (expression position)
+    // match expr do | pat -> expr ... end  (expression position)
     match_expr: ($) =>
       seq(
         "match",
@@ -691,8 +691,8 @@ export default grammar({
 
     match_case_expr: ($) =>
       seq(
-        "case",
-        field("pattern", $._pattern),
+        "|",
+        field("pattern", $._pattern_or),
         "->",
         field("value", $._expr)
       ),
@@ -891,6 +891,22 @@ export default grammar({
         $.record_pattern,
         $.wildcard_pattern,
         $.variable_pattern
+      ),
+
+    // p1 | p2 | ... | pn  — used at top of match/catch arms; cons binds tighter
+    _pattern_or: ($) =>
+      choice(
+        $._pattern,
+        $.or_pattern
+      ),
+
+    or_pattern: ($) =>
+      prec.left(
+        2,
+        seq(
+          field("alt", $._pattern),
+          repeat1(seq("|", field("alt", $._pattern)))
+        )
       ),
 
     // p1 :: p2  — right-associative cons pattern, desugars to Cons(v: p1, rest: p2)

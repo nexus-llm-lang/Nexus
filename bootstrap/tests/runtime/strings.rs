@@ -154,11 +154,11 @@ let main = fn () -> unit do
     let s = "aa" ++ "bb"
     use_string(s: s)
     match x do
-        case Present(v: v) ->
+        | Present(v: v) ->
             if v != 42 then
                 raise RuntimeError(val: "COLLISION: field value corrupted")
             end
-        case Absent ->
+        | Absent ->
             raise RuntimeError(val: "COLLISION: tag flipped to Absent")
     end
     return ()
@@ -187,10 +187,10 @@ let main = fn () -> unit do
     let s = "aaaa" ++ "bbbb"
     use_string(s: s)
     match t do
-        case Alpha(x: v) ->
+        | Alpha(x: v) ->
             if v != 42 then raise RuntimeError(val: "Alpha.x corrupted") end
-        case Beta(x: _) -> raise RuntimeError(val: "tag became Beta")
-        case Gamma(x: _) -> raise RuntimeError(val: "tag became Gamma")
+        | Beta(x: _) -> raise RuntimeError(val: "tag became Beta")
+        | Gamma(x: _) -> raise RuntimeError(val: "tag became Gamma")
     end
     return ()
 end
@@ -217,7 +217,7 @@ let main = fn () -> unit do
     let w = Wrap(a: 11, b: 22, c: 33)
     let s = build_long(s: "", n: 100)
     match w do
-        case Wrap(a: a, b: b, c: c) ->
+        | Wrap(a: a, b: b, c: c) ->
             if a != 11 then raise RuntimeError(val: "a") end
             if b != 22 then raise RuntimeError(val: "b") end
             if c != 33 then raise RuntimeError(val: "c") end

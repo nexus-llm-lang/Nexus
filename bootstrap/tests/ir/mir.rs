@@ -40,8 +40,8 @@ fn snapshot_mir_match_statement() {
     let main = fn () -> unit do
         let x = 42
         match x do
-          case 0 -> return ()
-          case _ -> return ()
+          | 0 -> return ()
+          | _ -> return ()
         end
     end
     "#;

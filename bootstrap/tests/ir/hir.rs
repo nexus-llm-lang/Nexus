@@ -40,9 +40,9 @@ fn snapshot_hir_match_with_constructors() {
     let main = fn () -> unit do
         let c = Red
         match c do
-          case Red -> return ()
-          case Green -> return ()
-          case Blue -> return ()
+          | Red -> return ()
+          | Green -> return ()
+          | Blue -> return ()
         end
     end
     "#;

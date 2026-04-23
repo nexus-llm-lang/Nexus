@@ -138,12 +138,12 @@ let main = fn () -> unit require { PermConsole } do
   catch e ->
     let bt = backtrace(exn: e)
     match bt do
-      case Cons(v: first, rest: _) ->
+      | Cons(v: first, rest: _) ->
         if first != "main" then
           Console.println(val: "expected frame 'main', got '" ++ first ++ "'")
           raise RuntimeError(val: "wrong frame")
         end
-      case Nil ->
+      | Nil ->
         raise RuntimeError(val: "expected non-empty backtrace")
     end
   end

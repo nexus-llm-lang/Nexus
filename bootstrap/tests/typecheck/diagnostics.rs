@@ -23,7 +23,7 @@ fn test_linear_record_does_not_emit_unnecessary_warning() {
         r#"
     let main = fn () -> unit do
         let %r = { id: 1 }
-        match %r do case _ -> () end
+        match %r do | _ -> () end
         return ()
     end
 "#,

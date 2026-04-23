@@ -191,7 +191,7 @@ type Pair = MkPair(fst: i64, snd: i64)
 let main = fn () -> unit do
     let p = MkPair(snd: 10, fst: 32)
     match p do
-      case MkPair(fst: a, snd: b) ->
+      | MkPair(fst: a, snd: b) ->
         if a + b != 42 then raise RuntimeError(val: "expected 42") end
     end
     return ()
@@ -210,9 +210,9 @@ let main = fn () -> unit do
     let p1 = MkPair(fst: 1, snd: 2)
     let p2 = MkPair(snd: 2, fst: 1)
     match p1 do
-      case MkPair(fst: a1, snd: b1) ->
+      | MkPair(fst: a1, snd: b1) ->
         match p2 do
-          case MkPair(fst: a2, snd: b2) ->
+          | MkPair(fst: a2, snd: b2) ->
             if a1 != a2 then raise RuntimeError(val: "fst mismatch") end
             if b1 != b2 then raise RuntimeError(val: "snd mismatch") end
         end
@@ -398,16 +398,16 @@ type IntList = Nil | Cons(v: i64, rest: IntList)
 
 let map_double = fn (xs: IntList) -> IntList do
     match xs do
-        case Nil -> return Nil
-        case Cons(v: v, rest: rest) ->
+        | Nil -> return Nil
+        | Cons(v: v, rest: rest) ->
             return Cons(v: v * 2, rest: map_double(xs: rest))
     end
 end
 
 let sum = fn (xs: IntList, acc: i64) -> i64 do
     match xs do
-        case Nil -> return acc
-        case Cons(v: v, rest: rest) -> return sum(xs: rest, acc: acc + v)
+        | Nil -> return acc
+        | Cons(v: v, rest: rest) -> return sum(xs: rest, acc: acc + v)
     end
 end
 
@@ -437,15 +437,15 @@ end
 
 let head = fn (xs: IntList) -> i64 do
     match xs do
-        case Nil -> return 0
-        case Cons(v: v, rest: _) -> return v
+        | Nil -> return 0
+        | Cons(v: v, rest: _) -> return v
     end
 end
 
 let length_acc = fn (xs: IntList, acc: i64) -> i64 do
     match xs do
-        case Nil -> return acc
-        case Cons(v: _, rest: rest) -> return length_acc(xs: rest, acc: acc + 1)
+        | Nil -> return acc
+        | Cons(v: _, rest: rest) -> return length_acc(xs: rest, acc: acc + 1)
     end
 end
 
