@@ -1,0 +1,123 @@
+/**
+ * wasm_read: WASM binary reader primitives.
+ *
+ * Owns:
+ * - ULEB128 / SLEB128 decoders (rd_uleb / rd_sleb)
+ * - Packed (val, pos) return encoding (pack / pval / ppos)
+ * - SLEB end-scanner for bulk-copy of SLEB-encoded operands
+ *
+ * Does not own:
+ * - ByteBuffer writes (stdlib/bytebuffer.nx owns push_uleb128 etc.)
+ * - Section scanning / smap construction (caller-specific; wasm_merge.nx owns scan_secs)
+ * - Memory-section reading for dep_pages (driver.nx owns scan_sections + read_dep_pages)
+ *
+ * Consolidated from duplicated copies that previously lived in:
+ * - src/driver.nx (simple 3-byte ULEB)
+ * - src/backend/wasm_merge.nx (full ULEB/SLEB)
+ */
+import { ByteBuffer }, * as bb from "stdlib/bytebuffer.nx"
+
+// ─── Packed (val, pos) Return Encoding ───────────────────────────────────────
+// A ULEB reader returns BOTH the decoded value AND the position after the last
+// byte. Packing both into a single i64 (val * 2^32 + pos) avoids allocating a
+// record per call, which is hot on the WASM module-rewrite path.
+//
+// Only valid when val fits in 32 bits unsigned AND pos fits in 32 bits.
+// For signed values or wider positions, use SlebRes.
+
+export let pack = fn (val: i64, p: i64) -> i64 do return val * 4294967296 + p end
+export let pval = fn (pk: i64) -> i64 do return pk / 4294967296 end
+export let ppos = fn (pk: i64) -> i64 do return pk % 4294967296 end
+
+// ─── Shift-Left Helper ───────────────────────────────────────────────────────
+// Naive doubling-based left shift — used only by LEB decoders. Not exported for
+// general use; callers should prefer arithmetic powers-of-two when possible.
+
+let shl = fn (v: i64, n: i64) -> i64 do
+  if n <= 0 then return v end
+  return shl(v: v + v, n: n - 1)
+end
+
+// ─── Unsigned LEB128 ─────────────────────────────────────────────────────────
+// rd_uleb returns pack(val, pos+1): the decoded unsigned value and the position
+// just past the terminal byte. Use pval/ppos to unpack.
+
+export let rd_uleb = fn (buf: &ByteBuffer, pos: i64) -> i64 do
+  return rd_uleb_go(buf: buf, pos: pos, r: 0, s: 0)
+end
+
+let rd_uleb_go = fn (buf: &ByteBuffer, pos: i64, r: i64, s: i64) -> i64 do
+  let b = bb.get_byte(buf: buf, idx: pos)
+  let r2 = r + (b % 128) * shl(v: 1, n: s)
+  if b < 128 then return pack(val: r2, p: pos + 1) end
+  return rd_uleb_go(buf: buf, pos: pos + 1, r: r2, s: s + 7)
+end
+
+// Size in bytes of the ULEB128 at `pos` (scans until first byte < 128).
+export let uleb_size = fn (buf: &ByteBuffer, pos: i64) -> i64 do
+  return uleb_size_go(buf: buf, pos: pos, acc: 1)
+end
+
+let uleb_size_go = fn (buf: &ByteBuffer, pos: i64, acc: i64) -> i64 do
+  if bb.get_byte(buf: buf, idx: pos) < 128 then return acc end
+  return uleb_size_go(buf: buf, pos: pos + 1, acc: acc + 1)
+end
+
+// ─── Signed LEB128 ───────────────────────────────────────────────────────────
+// rd_sleb returns SlebRes(val, pos): packed-return is unsafe for negative values
+// because negative val*2^32 produces wrong pval/ppos.
+// Terminal step: given accumulated r and shift s, plus the terminal byte b,
+// compute the final value (sign-extended if bit 6 set) and return pos+1.
+
+export type SlebRes = SlebRes(val: i64, pos: i64)
+
+let rd_sleb_term = fn (pos: i64, r: i64, s: i64, b: i64) -> SlebRes do
+  let r2 = r + (b % 128) * shl(v: 1, n: s)
+  if s + 7 < 64 then
+    if b >= 64 then
+      return SlebRes(val: r2 - shl(v: 1, n: s + 7), pos: pos + 1)
+    end
+  end
+  return SlebRes(val: r2, pos: pos + 1)
+end
+
+// Scan forward from `pos` and return the position after the terminal LEB128
+// byte (first byte with high bit cleared). Used for bulk-copying SLEB-encoded
+// operands without re-encoding.
+export let scan_sleb_end = fn (buf: &ByteBuffer, pos: i64) -> i64 do
+  let b = bb.get_byte(buf: buf, idx: pos)
+  if b < 128 then return pos + 1 end
+  return scan_sleb_end(buf: buf, pos: pos + 1)
+end
+
+export let rd_sleb = fn (buf: &ByteBuffer, pos: i64) -> SlebRes do
+  let b0 = bb.get_byte(buf: buf, idx: pos)
+  if b0 < 128 then return rd_sleb_term(pos: pos, r: 0, s: 0, b: b0) end
+  let r1 = b0 % 128
+  let b1 = bb.get_byte(buf: buf, idx: pos + 1)
+  if b1 < 128 then return rd_sleb_term(pos: pos + 1, r: r1, s: 7, b: b1) end
+  let r2 = r1 + (b1 % 128) * 128
+  let b2 = bb.get_byte(buf: buf, idx: pos + 2)
+  if b2 < 128 then return rd_sleb_term(pos: pos + 2, r: r2, s: 14, b: b2) end
+  let r3 = r2 + (b2 % 128) * 16384
+  let b3 = bb.get_byte(buf: buf, idx: pos + 3)
+  if b3 < 128 then return rd_sleb_term(pos: pos + 3, r: r3, s: 21, b: b3) end
+  let r4 = r3 + (b3 % 128) * 2097152
+  let b4 = bb.get_byte(buf: buf, idx: pos + 4)
+  if b4 < 128 then return rd_sleb_term(pos: pos + 4, r: r4, s: 28, b: b4) end
+  let r5 = r4 + (b4 % 128) * 268435456
+  let b5 = bb.get_byte(buf: buf, idx: pos + 5)
+  if b5 < 128 then return rd_sleb_term(pos: pos + 5, r: r5, s: 35, b: b5) end
+  let r6 = r5 + (b5 % 128) * 34359738368
+  let b6 = bb.get_byte(buf: buf, idx: pos + 6)
+  if b6 < 128 then return rd_sleb_term(pos: pos + 6, r: r6, s: 42, b: b6) end
+  let r7 = r6 + (b6 % 128) * 4398046511104
+  let b7 = bb.get_byte(buf: buf, idx: pos + 7)
+  if b7 < 128 then return rd_sleb_term(pos: pos + 7, r: r7, s: 49, b: b7) end
+  let r8 = r7 + (b7 % 128) * 562949953421312
+  let b8 = bb.get_byte(buf: buf, idx: pos + 8)
+  if b8 < 128 then return rd_sleb_term(pos: pos + 8, r: r8, s: 56, b: b8) end
+  let r9 = r8 + (b8 % 128) * 72057594037927936
+  let b9 = bb.get_byte(buf: buf, idx: pos + 9)
+  return rd_sleb_term(pos: pos + 9, r: r9, s: 63, b: b9)
+end

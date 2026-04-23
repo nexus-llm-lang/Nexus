@@ -1,6 +1,27 @@
+/**
+ * wasm_merge: stdlib-merge phase — links the compiler-emitted core WASM with
+ * the precompiled stdlib.wasm and the runtime layer to produce a self-contained
+ * module.
+ *
+ * Owns:
+ * - Section scanning + extraction (scan_secs, intarr-based indexing)
+ * - Function/type/table/global/memory import resolution
+ * - Instruction rewriting (rw_instrs) for remapped indices
+ * - Active data/element segment copy with offset relocation
+ * - Resolve → emit loop that walks the compiled core and the dep module in
+ *   parallel to produce one merged output
+ *
+ * Does not own:
+ * - Generic WASM binary decode (ULEB/SLEB) — see src/backend/wasm_read.nx
+ * - Section-layout constants / opcodes — see src/backend/wasm_defs.nx
+ * - Individual section emission primitives — see src/backend/wasm_section.nx
+ *
+ * Consumers: src/driver.nx calls merge_with_stdlib at the end of the pipeline.
+ */
 import { ByteBuffer }, * as bb from "stdlib/bytebuffer.nx"
 import { StringMap }, * as sm from "stdlib/stringmap.nx"
 import * as str from "stdlib/string.nx"
+import { SlebRes, pack, pval, ppos, rd_uleb, rd_sleb, scan_sleb_end, uleb_size } from "src/backend/wasm_read.nx"
 
 // ─── Dense i32 array (int→int table) ─────────────────────────────────────
 // Thin wrapper over stdlib ByteBuffer — avoids the from_i64 string allocation
@@ -20,13 +41,9 @@ let intarr_get = fn (arr: &ByteBuffer, idx: i64) -> i64 do
   return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
 end
 
-let pack = fn (val: i64, p: i64) -> i64 do return val * 4294967296 + p end
-let pval = fn (pk: i64) -> i64 do return pk / 4294967296 end
-let ppos = fn (pk: i64) -> i64 do return pk % 4294967296 end
-
 // Multi-return records for readers that advance position.
 // StrPos: rd_str returns parsed string + position after string bytes.
-// SlebRes: rd_sleb returns decoded signed value + position after terminal byte.
+// SlebRes (imported from wasm_read.nx): rd_sleb returns decoded signed value + position after terminal byte.
 // BufPos: sub-emitters that consume src bytes return new buf + new src position.
 // RwCtx: type / table / global offsets applied during instruction rewriting.
 //        The remap intarr is passed as a separate &ByteBuffer borrow (rw_instrs
@@ -36,82 +53,10 @@ let ppos = fn (pk: i64) -> i64 do return pk % 4294967296 end
 //        ctx must be threaded linearly through the recursion.
 // ResolveState: dynamic counters (fidx, m_kept_idx) threaded alongside the ctx.
 type StrPos = StrPos(s: string, pos: i64)
-type SlebRes = SlebRes(val: i64, pos: i64)
 type BufPos = BufPos(buf: %ByteBuffer, pos: i64)
 type RwCtx = RwCtx(type_off: i64, tbl_off: i64, glo_off: i64)
 type ResolveCtx = ResolveCtx(remap: %ByteBuffer, kept_fimp: i64, n_stubs: i64, dep_fimp: i64, m_imp_base: i64)
 type ResolveState = ResolveState(fidx: i64, m_kept_idx: i64)
-
-let shl = fn (v: i64, n: i64) -> i64 do
-  if n <= 0 then return v end
-  return shl(v: v + v, n: n - 1)
-end
-
-let rd_uleb = fn (buf: &ByteBuffer, pos: i64) -> i64 do
-  return rd_uleb_go(buf: buf, pos: pos, r: 0, s: 0)
-end
-let rd_uleb_go = fn (buf: &ByteBuffer, pos: i64, r: i64, s: i64) -> i64 do
-  let b = bb.get_byte(buf: buf, idx: pos)
-  let r2 = r + (b % 128) * shl(v: 1, n: s)
-  if b < 128 then return pack(val: r2, p: pos + 1) end
-  return rd_uleb_go(buf: buf, pos: pos + 1, r: r2, s: s + 7)
-end
-
-// ─── Signed LEB128 reader ─────────────────────────────────────────────────
-// Returns SlebRes(val, pos) — packed return (val*2^32+pos) breaks for negative
-// values because negative val*2^32 makes pval/ppos give wrong results.
-// Terminal step: given accumulated r and shift s, plus the terminal byte b,
-// compute final value (sign-extended if bit 6 set) and return pos+1.
-let rd_sleb_term = fn (pos: i64, r: i64, s: i64, b: i64) -> SlebRes do
-  let r2 = r + (b % 128) * shl(v: 1, n: s)
-  if s + 7 < 64 then
-    if b >= 64 then
-      return SlebRes(val: r2 - shl(v: 1, n: s + 7), pos: pos + 1)
-    end
-  end
-  return SlebRes(val: r2, pos: pos + 1)
-end
-
-// Scan forward from `pos` and return position after the terminal LEB128 byte
-// (first byte with high bit cleared). Used for bulk-copying SLEB-encoded
-// operands without re-encoding.
-let scan_sleb_end = fn (buf: &ByteBuffer, pos: i64) -> i64 do
-  let b = bb.get_byte(buf: buf, idx: pos)
-  if b < 128 then return pos + 1 end
-  return scan_sleb_end(buf: buf, pos: pos + 1)
-end
-
-let rd_sleb = fn (buf: &ByteBuffer, pos: i64) -> SlebRes do
-  let b0 = bb.get_byte(buf: buf, idx: pos)
-  if b0 < 128 then return rd_sleb_term(pos: pos, r: 0, s: 0, b: b0) end
-  let r1 = b0 % 128
-  let b1 = bb.get_byte(buf: buf, idx: pos + 1)
-  if b1 < 128 then return rd_sleb_term(pos: pos + 1, r: r1, s: 7, b: b1) end
-  let r2 = r1 + (b1 % 128) * 128
-  let b2 = bb.get_byte(buf: buf, idx: pos + 2)
-  if b2 < 128 then return rd_sleb_term(pos: pos + 2, r: r2, s: 14, b: b2) end
-  let r3 = r2 + (b2 % 128) * 16384
-  let b3 = bb.get_byte(buf: buf, idx: pos + 3)
-  if b3 < 128 then return rd_sleb_term(pos: pos + 3, r: r3, s: 21, b: b3) end
-  let r4 = r3 + (b3 % 128) * 2097152
-  let b4 = bb.get_byte(buf: buf, idx: pos + 4)
-  if b4 < 128 then return rd_sleb_term(pos: pos + 4, r: r4, s: 28, b: b4) end
-  let r5 = r4 + (b4 % 128) * 268435456
-  let b5 = bb.get_byte(buf: buf, idx: pos + 5)
-  if b5 < 128 then return rd_sleb_term(pos: pos + 5, r: r5, s: 35, b: b5) end
-  let r6 = r5 + (b5 % 128) * 34359738368
-  let b6 = bb.get_byte(buf: buf, idx: pos + 6)
-  if b6 < 128 then return rd_sleb_term(pos: pos + 6, r: r6, s: 42, b: b6) end
-  let r7 = r6 + (b6 % 128) * 4398046511104
-  let b7 = bb.get_byte(buf: buf, idx: pos + 7)
-  if b7 < 128 then return rd_sleb_term(pos: pos + 7, r: r7, s: 49, b: b7) end
-  let r8 = r7 + (b7 % 128) * 562949953421312
-  let b8 = bb.get_byte(buf: buf, idx: pos + 8)
-  if b8 < 128 then return rd_sleb_term(pos: pos + 8, r: r8, s: 56, b: b8) end
-  let r9 = r8 + (b8 % 128) * 72057594037927936
-  let b9 = bb.get_byte(buf: buf, idx: pos + 9)
-  return rd_sleb_term(pos: pos + 9, r: r9, s: 63, b: b9)
-end
 
 // ─── Section scanning ─────────────────────────────────────────────────────
 // Scan WASM module sections into an smap: section_id -> pack(content_offset, size)
