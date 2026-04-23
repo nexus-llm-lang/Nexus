@@ -59,6 +59,13 @@ fn bind_pattern_names(
                 bind_pattern_names(pat, bound_keys, bound_call_names);
             }
         }
+        Pattern::Or(alts) => {
+            // Or-pattern alternatives bind the same name set (typecheck enforces this);
+            // recurse into the first to register them.
+            if let Some(first) = alts.first() {
+                bind_pattern_names(first, bound_keys, bound_call_names);
+            }
+        }
         Pattern::Literal(_) | Pattern::Wildcard => {}
     }
 }

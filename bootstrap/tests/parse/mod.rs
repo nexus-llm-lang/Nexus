@@ -285,6 +285,258 @@ fn parse_legacy_catch_still_works() {
 }
 
 #[test]
+fn parse_pipe_is_not_bitor_in_expression_position() {
+    // Pipe (`|`) is reserved for pattern syntax. `a | b` in expression position
+    // must not parse as bitwise-or — it's now a parse error.
+    should_fail_parse(
+        r#"
+    let main = fn () -> i64 do
+      let a = 1
+      let b = 2
+      let c = a | b
+      return c
+    end
+    "#,
+    );
+}
+
+#[test]
+fn parse_match_with_pipe_arm_separator() {
+    let src = r#"
+    type Color = Red | Green | Blue
+
+    let main = fn () -> i64 do
+      let c = Red
+      match c do
+        | Red -> return 1
+        | Green -> return 2
+        | Blue -> return 3
+      end
+      return 0
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let gl = program
+        .definitions
+        .iter()
+        .find_map(|def| {
+            if let TopLevel::Let(gl) = &def.node {
+                Some(gl)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let Expr::Lambda { body, .. } = &gl.value.node else {
+        panic!("expected lambda")
+    };
+    let Stmt::Expr(match_expr) = &body[1].node else {
+        panic!("expected match")
+    };
+    let Expr::Match { cases, .. } = &match_expr.node else {
+        panic!("expected match")
+    };
+    assert_eq!(cases.len(), 3, "expected 3 arms separated by |");
+}
+
+#[test]
+fn parse_match_mixed_pipe_and_case_separators() {
+    let src = r#"
+    type Color = Red | Green | Blue
+
+    let main = fn () -> i64 do
+      let c = Red
+      match c do
+        case Red -> return 1
+        | Green -> return 2
+        case Blue -> return 3
+      end
+      return 0
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let gl = program
+        .definitions
+        .iter()
+        .find_map(|def| {
+            if let TopLevel::Let(gl) = &def.node {
+                Some(gl)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let Expr::Lambda { body, .. } = &gl.value.node else {
+        panic!("expected lambda")
+    };
+    let Stmt::Expr(match_expr) = &body[1].node else {
+        panic!("expected match")
+    };
+    let Expr::Match { cases, .. } = &match_expr.node else {
+        panic!("expected match")
+    };
+    assert_eq!(cases.len(), 3);
+}
+
+#[test]
+fn parse_catch_with_pipe_arm_separator() {
+    let src = r#"
+    exception Boom(i64)
+
+    let main = fn () -> i64 do
+      try
+        raise Boom(42)
+      catch
+        | Boom(code) -> return code
+        | _ -> return -1
+      end
+      return 0
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let gl = program
+        .definitions
+        .iter()
+        .find_map(|def| {
+            if let TopLevel::Let(gl) = &def.node {
+                Some(gl)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let Expr::Lambda { body, .. } = &gl.value.node else {
+        panic!("expected lambda")
+    };
+    let Stmt::Try { catch_arms, .. } = &body[0].node else {
+        panic!("expected try")
+    };
+    assert_eq!(catch_arms.len(), 2);
+}
+
+#[test]
+fn parse_match_or_pattern_two_alts() {
+    let src = r#"
+    type Color = Red | Green | Blue
+
+    let main = fn () -> i64 do
+      let c = Red
+      match c do
+        case Red | Green -> return 1
+        case Blue -> return 2
+      end
+      return 0
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let gl = program
+        .definitions
+        .iter()
+        .find_map(|def| {
+            if let TopLevel::Let(gl) = &def.node {
+                Some(gl)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let Expr::Lambda { body, .. } = &gl.value.node else {
+        panic!("expected lambda")
+    };
+    let Stmt::Expr(match_expr) = &body[1].node else {
+        panic!("expected match expression at body[1]")
+    };
+    let Expr::Match { cases, .. } = &match_expr.node else {
+        panic!("expected match")
+    };
+    assert_eq!(cases.len(), 2, "expected 2 match arms");
+    let Pattern::Or(alts) = &cases[0].pattern.node else {
+        panic!("expected or-pattern in first arm, got {:?}", cases[0].pattern.node)
+    };
+    assert_eq!(alts.len(), 2, "first arm should have 2 alternatives");
+}
+
+#[test]
+fn parse_match_or_pattern_three_alts() {
+    let src = r#"
+    type Color = Red | Green | Blue
+
+    let main = fn () -> i64 do
+      let c = Red
+      match c do
+        case Red | Green | Blue -> return 1
+      end
+      return 0
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let gl = program
+        .definitions
+        .iter()
+        .find_map(|def| {
+            if let TopLevel::Let(gl) = &def.node {
+                Some(gl)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let Expr::Lambda { body, .. } = &gl.value.node else {
+        panic!("expected lambda")
+    };
+    let Stmt::Expr(match_expr) = &body[1].node else {
+        panic!("expected match")
+    };
+    let Expr::Match { cases, .. } = &match_expr.node else {
+        panic!("expected match")
+    };
+    let Pattern::Or(alts) = &cases[0].pattern.node else {
+        panic!("expected or-pattern")
+    };
+    assert_eq!(alts.len(), 3, "should collect 3 alternatives");
+}
+
+#[test]
+fn parse_catch_or_pattern() {
+    let src = r#"
+    exception Boom(i64)
+    exception Crash
+
+    let main = fn () -> i64 do
+      try
+        raise Boom(1)
+      catch
+        case Boom(_) | Crash -> return 1
+      end
+      return 0
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let gl = program
+        .definitions
+        .iter()
+        .find_map(|def| {
+            if let TopLevel::Let(gl) = &def.node {
+                Some(gl)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let Expr::Lambda { body, .. } = &gl.value.node else {
+        panic!("expected lambda")
+    };
+    let Stmt::Try { catch_arms, .. } = &body[0].node else {
+        panic!("expected try")
+    };
+    assert_eq!(catch_arms.len(), 1, "single arm with or-pattern");
+    let Pattern::Or(alts) = &catch_arms[0].pattern.node else {
+        panic!("expected or-pattern, got {:?}", catch_arms[0].pattern.node)
+    };
+    assert_eq!(alts.len(), 2);
+}
+
+#[test]
 fn parse_exception_group_def() {
     let src = r#"
     exception NotFound

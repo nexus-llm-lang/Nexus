@@ -12,9 +12,15 @@ impl TypeChecker {
         tt: &Type,
         cases: &[MatchCase],
     ) -> Result<(), String> {
+        // Expand top-level or-patterns into separate matrix rows so that
+        // `case A | B -> body` covers both A and B for exhaustiveness purposes.
         let matrix: Vec<Vec<PatRef>> = cases
             .iter()
-            .map(|c| vec![PatRef::Original(&c.pattern)])
+            .flat_map(|c| {
+                expand_or_top(&c.pattern)
+                    .into_iter()
+                    .map(|p| vec![PatRef::Original(p)])
+            })
             .collect();
         self.check_matrix(env, &matrix, &[tt])
     }
@@ -267,6 +273,16 @@ impl TypeChecker {
         }
         self.check_matrix(env, &nm, &nt)
             .map_err(|_| format!("Non-exhaustive match: missing constructor `{}`.", ctor))
+    }
+}
+
+/// Recursively flatten a top-level or-pattern into its leaf alternatives.
+/// Non-or patterns return as a single-element vector. Nested ors (only
+/// possible from synthetic AST construction) are also flattened.
+fn expand_or_top(p: &Spanned<Pattern>) -> Vec<&Spanned<Pattern>> {
+    match &p.node {
+        Pattern::Or(alts) => alts.iter().flat_map(expand_or_top).collect(),
+        _ => vec![p],
     }
 }
 

@@ -54,6 +54,9 @@ pub enum Pattern {
     Constructor(RdrName, Vec<(Option<String>, Spanned<Pattern>)>),
     Record(Vec<(String, Spanned<Pattern>)>, bool), // { x: p, _ }
     Wildcard,
+    /// Or-pattern: `p1 | p2 | ...` — matches if any alternative matches.
+    /// All alternatives must bind the same variable names with compatible types.
+    Or(Vec<Spanned<Pattern>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -128,4 +128,7 @@ pub enum MirPattern {
     },
     Record(Vec<(Symbol, MirPattern)>, bool),
     Wildcard,
+    /// Or-pattern: matches if any alternative matches.
+    /// Expanded to multiple rows during decision-tree construction.
+    Or(Vec<MirPattern>),
 }
