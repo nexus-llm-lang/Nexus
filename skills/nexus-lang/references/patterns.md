@@ -118,8 +118,8 @@ let load_or_die = fn (path: string) -> Config require { Fs } throws { Exn } do
   let raw = Fs.read_to_string(path: path)
   let res = parse_config(raw: raw)
   match res do
-    case Ok(val: c) -> return c
-    case Err(err: msg) -> raise ConfigError(msg: msg)
+    | Ok(val: c) -> return c
+    | Err(err: msg) -> raise ConfigError(msg: msg)
   end
 end
 
@@ -130,8 +130,8 @@ let main = fn () -> unit require { PermFs, PermConsole } do
       let cfg = load_or_die(path: "config.txt")
       Console.println(val: "Config loaded")
     catch
-      case ConfigError(msg: m) -> Console.println(val: "Config error: " ++ m)
-      case _ -> Console.println(val: "Unknown error")
+      | ConfigError(msg: m) -> Console.println(val: "Config error: " ++ m)
+      | _ -> Console.println(val: "Unknown error")
     end
   end
 end

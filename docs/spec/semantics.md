@@ -70,8 +70,8 @@ try
 catch e ->
   // e : Exn
   match e do
-    case NotFound(msg: m) -> ()
-    case _ -> ()
+    | NotFound(msg: m) -> ()
+    | _ -> ()
   end
 end
 ```
@@ -113,17 +113,17 @@ end
 
 ## Match as Expression
 
-Match can appear in expression position. Each case body produces a value:
+Match can appear in expression position. Each arm body produces a value:
 
 ```nexus
 let result = match x do
-  case 1 -> 10
-  case 2 -> 20
-  case _ -> 30
+  | 1 -> 10
+  | 2 -> 20
+  | _ -> 30
 end
 ```
 
-All non-diverging case bodies must produce the same type. Cases containing a `return` statement diverge and do not contribute to the unified result type.
+All non-diverging arm bodies must produce the same type. Arms containing a `return` statement diverge and do not contribute to the unified result type.
 
 ## Concurrency Model
 

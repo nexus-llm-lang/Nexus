@@ -39,7 +39,7 @@ Resources consumed exactly once. No GC — the compiler tracks every allocation.
 let %h = Fs.open_read(path: "data.txt")
 let %r = Fs.read(handle: %h)
 match %r do
-  case { content: text, handle: %h2 } ->
+  | { content: text, handle: %h2 } ->
         Fs.close(handle: %h2)
 end
 ```

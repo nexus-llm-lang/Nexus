@@ -137,7 +137,7 @@ end
 try
   let v = @result   // force → exception propagates here
 catch
-  case NotFound(path: p) -> handle(p: p)
+  | NotFound(path: p) -> handle(p: p)
 end
 ```
 
