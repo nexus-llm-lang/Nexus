@@ -77,7 +77,11 @@ pub fn run_main(wasm: &[u8]) -> Result<(), String> {
             backtrace::add_bt_to_linker(&mut linker, &mut store)?;
         }
         if has_lazy {
-            lazy::add_lazy_to_linker(&mut linker)?;
+            // Real threaded runtime — worker threads get their own
+            // Store+Instance of the same Module. Zero-capture thunks run
+            // on workers; captures fall back to inline on the caller.
+            let runtime = lazy::LazyRuntime::new(engine.clone(), module.clone());
+            runtime.register(&mut linker)?;
         }
         let instance = linker
             .instantiate(&mut store, &module)
