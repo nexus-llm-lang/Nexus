@@ -247,6 +247,49 @@ end
 }
 
 #[test]
+fn join_tail_recursive_deep() {
+    exec_with_stdlib(
+        r#"
+import { join, length } from "stdlib/string_ops.nx"
+
+let make_strs = fn (n: i64, acc: [ string ]) -> [ string ] do
+  if n == 0 then return acc end
+  return make_strs(n: n - 1, acc: "x" :: acc)
+end
+
+let main = fn () -> unit do
+  // 5k strings joined with ',' must not overflow. Smaller N than split (50k)
+  // because join is O(N²) on string length — 50k would be too slow.
+  let xs = make_strs(n: 5000, acc: [])
+  let result = join(xs: xs, sep: ",")
+  // expected byte length: 5000 * 1 + 4999 separators = 9999.
+  if length(s: result) != 9999 then raise RuntimeError(val: "join produced wrong length") end
+  return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn split_tail_recursive_deep() {
+    exec_with_stdlib(
+        r#"
+import { split, repeat, length } from "stdlib/string_ops.nx"
+import * as list from "stdlib/list.nx"
+
+let main = fn () -> unit do
+  // 50k repeats of "a," → split on "," → 50001 segments. Must not overflow.
+  let s = repeat(s: "a,", n: 50000)
+  let segs = split(s: s, sep: ",")
+  let n = list.length(xs: segs)
+  if n != 50001 then raise RuntimeError(val: "expected 50001 segments from split") end
+  return ()
+end
+"#,
+    );
+}
+
+#[test]
 fn console_read_line_with_mock_handler() {
     exec_with_stdlib(
         r#"
