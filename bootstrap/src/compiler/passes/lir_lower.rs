@@ -208,6 +208,7 @@ fn lower_mir_function(
     externals: &[crate::ir::mir::MirExternal],
 ) -> Result<LirFunction, LirLowerError> {
     let mut ctx = LowerCtx::new(enum_defs, externals);
+    ctx.func_ret_type = wasm_type(&func.ret_type);
 
     // Register params in vars (both wasm and semantic types)
     for p in &func.params {
@@ -289,6 +290,11 @@ struct LowerCtx<'a> {
     ctor_index: HashMap<String, ConstructorInfo>,
     /// MIR externals for intrinsic recognition
     externals: &'a [crate::ir::mir::MirExternal],
+    /// The enclosing function's return type (set by lower_mir_function before
+    /// body lowering). Needed by value-extraction paths (if/match expressions)
+    /// when a branch contains `return`, so they can emit a function-level
+    /// IfReturn with the correct ret_type.
+    func_ret_type: Type,
 }
 
 // ── Maranget decision tree types and construction ────────────────
@@ -817,6 +823,7 @@ impl<'a> LowerCtx<'a> {
             ctor_index: build_constructor_index(enum_defs),
             enum_defs,
             externals,
+            func_ret_type: Type::Unit,
         }
     }
 
@@ -1212,24 +1219,40 @@ impl<'a> LowerCtx<'a> {
 
         if !body.is_empty() {
             let last_idx = body.len() - 1;
+            // Scan for `return` in non-last position — it diverges and the
+            // remainder is dead code, so emit the return and stop.
+            let mut diverged = false;
             for stmt in &body[..last_idx] {
+                if let MirStmt::Return(expr) = stmt {
+                    self.emit_diverging_return(expr)?;
+                    diverged = true;
+                    break;
+                }
                 self.lower_stmt(stmt, &Type::Unit)?;
             }
-            // Extract the value from the last statement
-            let value = match &body[last_idx] {
-                MirStmt::Expr(expr) => Some(self.lower_expr_to_atom(expr)?),
-                MirStmt::Return(expr) => Some(self.lower_expr_to_atom(expr)?),
-                _ => {
-                    self.lower_stmt(&body[last_idx], &Type::Unit)?;
-                    None
+            if !diverged {
+                // Extract the value from the last statement
+                let value = match &body[last_idx] {
+                    MirStmt::Expr(expr) => Some(self.lower_expr_to_atom(expr)?),
+                    MirStmt::Return(expr) => {
+                        // Per spec (semantics.md:126): `return` in a match/if arm
+                        // diverges — emit a function-level return, don't produce a
+                        // value for the enclosing expression.
+                        self.emit_diverging_return(expr)?;
+                        None
+                    }
+                    _ => {
+                        self.lower_stmt(&body[last_idx], &Type::Unit)?;
+                        None
+                    }
+                };
+                if let Some(val) = value {
+                    self.stmts.push(LirStmt::Let {
+                        name: result_name,
+                        typ: result_type.clone(),
+                        expr: LirExpr::Atom(val),
+                    });
                 }
-            };
-            if let Some(val) = value {
-                self.stmts.push(LirStmt::Let {
-                    name: result_name,
-                    typ: result_type.clone(),
-                    expr: LirExpr::Atom(val),
-                });
             }
         }
 
@@ -1572,14 +1595,16 @@ impl<'a> LowerCtx<'a> {
                 result_name,
                 result_type,
             } => {
-                // Lower body for value extraction
-                let value = self.lower_case_body_expr(&case.body)?;
-                // Assign value to result
-                self.stmts.push(LirStmt::Let {
-                    name: *result_name,
-                    typ: result_type.clone(),
-                    expr: LirExpr::Atom(value),
-                });
+                // Lower body for value extraction. Diverging branches (with
+                // `return`) return None — we skip the result assignment since
+                // the emitted function-level return makes it unreachable.
+                if let Some(value) = self.lower_case_body_expr(&case.body)? {
+                    self.stmts.push(LirStmt::Let {
+                        name: *result_name,
+                        typ: result_type.clone(),
+                        expr: LirExpr::Atom(value),
+                    });
+                }
 
                 let leaf_stmts = std::mem::replace(&mut self.stmts, saved_stmts);
                 self.vars = saved_vars;
@@ -1692,21 +1717,78 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Lower a case body in expression position.
-    /// Returns the value atom.
-    fn lower_case_body_expr(&mut self, body: &[MirStmt]) -> Result<LirAtom, LirLowerError> {
+    /// Returns `Some(atom)` with the branch value, or `None` if the branch
+    /// diverges via `return` — the emitted function-level IfReturn makes the
+    /// caller's assignment to result_name unreachable, so the caller skips it
+    /// entirely (matches the nxc self-hosted compiler's behavior for stage1
+    /// == stage2 fixed-point equivalence).
+    fn lower_case_body_expr(
+        &mut self,
+        body: &[MirStmt],
+    ) -> Result<Option<LirAtom>, LirLowerError> {
         if body.is_empty() {
-            return Ok(LirAtom::Unit);
+            return Ok(Some(LirAtom::Unit));
         }
         let last_idx = body.len() - 1;
         for stmt in &body[..last_idx] {
+            if let MirStmt::Return(expr) = stmt {
+                self.emit_diverging_return(expr)?;
+                return Ok(None);
+            }
             self.lower_stmt(stmt, &Type::Unit)?;
         }
         match &body[last_idx] {
-            MirStmt::Expr(expr) => self.lower_expr_to_atom(expr),
-            MirStmt::Return(expr) => self.lower_expr_to_atom(expr),
+            MirStmt::Expr(expr) => Ok(Some(self.lower_expr_to_atom(expr)?)),
+            MirStmt::Return(expr) => {
+                self.emit_diverging_return(expr)?;
+                Ok(None)
+            }
             _ => {
                 self.lower_stmt(&body[last_idx], &Type::Unit)?;
-                Ok(LirAtom::Unit)
+                Ok(Some(LirAtom::Unit))
+            }
+        }
+    }
+
+    /// Emit statements realizing `return expr` as a function-level divergence.
+    /// For `return f(args)`, emit a TailCall (codegen's return_call self-terminates).
+    /// Otherwise, emit the atom and wrap in an unconditional IfReturn (op_return).
+    fn emit_diverging_return(&mut self, expr: &MirExpr) -> Result<(), LirLowerError> {
+        match expr {
+            MirExpr::Call {
+                func,
+                args,
+                ret_type,
+            } => {
+                let mut lir_args = Vec::new();
+                for (label, e) in args {
+                    let atom = self.lower_expr_to_atom(e)?;
+                    lir_args.push((label.clone(), atom));
+                }
+                lir_args.sort_by(|(a, _), (b, _)| a.cmp(b));
+                let typ = wasm_type(ret_type);
+                self.bind_expr_to_temp(
+                    LirExpr::TailCall {
+                        func: *func,
+                        args: lir_args,
+                        typ: typ.clone(),
+                    },
+                    typ,
+                );
+                Ok(())
+            }
+            _ => {
+                let atom = self.lower_expr_to_atom(expr)?;
+                let ret_type = self.func_ret_type.clone();
+                self.stmts.push(LirStmt::IfReturn {
+                    cond: LirAtom::Bool(true),
+                    then_body: vec![],
+                    then_ret: Some(atom),
+                    else_body: vec![],
+                    else_ret: None,
+                    ret_type,
+                });
+                Ok(())
             }
         }
     }

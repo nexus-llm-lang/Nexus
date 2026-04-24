@@ -1459,6 +1459,83 @@ end
 }
 
 #[test]
+fn return_in_match_expr_branch_diverges_not_produces_value() {
+    // Per semantics.md:126, arms containing `return` diverge and do not
+    // contribute to the match's unified result. Regression for nexus-tuln:
+    // previously `lower_branch_body` / `lower_case_body_expr` treated
+    // MirStmt::Return(e) the same as MirStmt::Expr(e) in value-extraction
+    // context, so `return` was silently converted to "branch value" and
+    // code after the match ran.
+    exec(
+        r#"
+let test = fn (flag: i64) -> i64 do
+    let x = match flag do
+      | 1 -> return 99
+      | _ -> 0
+    end
+    // `return` above must diverge — this line must be unreachable when flag == 1.
+    return x + 1000
+end
+
+let main = fn () -> unit do
+    if test(flag: 1) != 99 then raise RuntimeError(val: "expected early return = 99") end
+    // flag=0 takes the `_` branch (no return), so x=0 and function returns 1000.
+    if test(flag: 0) != 1000 then raise RuntimeError(val: "expected fallthrough = 1000") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn return_in_if_expr_branch_diverges_not_produces_value() {
+    // Same bug as match-expression, but via if-expression lowered through
+    // lower_branch_for_value.
+    exec(
+        r#"
+let test = fn (flag: i64) -> i64 do
+    let x = if flag == 1 then return 77 else 0 end
+    return x + 500
+end
+
+let main = fn () -> unit do
+    if test(flag: 1) != 77 then raise RuntimeError(val: "expected early return = 77") end
+    if test(flag: 0) != 500 then raise RuntimeError(val: "expected fallthrough = 500") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn return_call_in_match_expr_branch_is_tail_call() {
+    // return f() in a match-expr branch must emit a proper tail call that
+    // terminates the enclosing function, NOT a regular call whose result
+    // feeds into the match value.
+    exec(
+        r#"
+let helper = fn (n: i64) -> i64 do
+    return n * 3
+end
+
+let test = fn (flag: i64) -> i64 do
+    let x = match flag do
+      | 1 -> return helper(n: 10)
+      | _ -> 0
+    end
+    return x + 7777
+end
+
+let main = fn () -> unit do
+    if test(flag: 1) != 30 then raise RuntimeError(val: "expected tail-call return = 30") end
+    if test(flag: 0) != 7777 then raise RuntimeError(val: "expected fallthrough = 7777") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
 fn codegen_catch_or_pattern_handles_either_exception() {
     exec(
         r#"

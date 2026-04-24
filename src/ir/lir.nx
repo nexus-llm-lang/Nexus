@@ -718,28 +718,77 @@ end
 
 type BranchBodyResult = BranchBodyResult(ctx: LowerCtx, value_opt: Option<LirAtom>)
 
+// Look up the enclosing function's wasm return type. `lir_lower_function`
+// stores it under the sentinel name "#FN_RET#" in semantic_vars at function
+// entry — `#` is not a valid identifier character so there is no collision
+// with user names.
+let lir_get_fn_ret_type = fn (ctx: LowerCtx) -> TypeExpr do
+  match ctx do | LowerCtx(vars: _, semantic_vars: sv, stmts: _, temp_counter: _, enum_defs: _) ->
+    match lir_lookup_type(name: "#FN_RET#", entries: sv) do
+      | Some(val: t) -> return t
+      | None -> return TyUnit
+    end
+  end
+end
+
+// Emit a function-level return for `return e` inside a match-as-expression
+// branch. Per spec (semantics.md:126): arms containing `return` diverge and
+// do not contribute to the unified match result — so value_opt is None.
+//
+// For `return f(args)`, produce a LirExprTailCall whose codegen emits
+// `return_call` (self-terminating). For any other expression, emit the atom
+// and wrap in LirStmtIfReturn(cond: true, ...) which codegens as an
+// unconditional op_return.
+let emit_diverging_return = fn (expr: MirExpr, ctx: LowerCtx) -> BranchBodyResult do
+  let ret_type = lir_get_fn_ret_type(ctx: ctx)
+  match expr do
+    | MirCall(func: f, args: args, ret_type: rt) ->
+      match lir_lower_call_args(args: args, ctx: ctx) do | LowerCallArgsResult(ctx: ctx2, lir_args: la) ->
+        let wt = wasm_type(typ: rt)
+        match bind_expr_to_temp(ctx: ctx2, expr: LirExprTailCall(func: f, args: la, typ: wt), typ: wt) do | BindResult(ctx: ctx3, atom: _) ->
+          return BranchBodyResult(ctx: ctx3, value_opt: None)
+        end
+      end
+    | _ ->
+      match lower_expr_to_atom(expr: expr, ctx: ctx) do | BindResult(ctx: ctx2, atom: a) ->
+        match ctx2 do | LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) ->
+          let ret_stmt = LirStmtIfReturn(
+            cond: LirAtomBool(val: true),
+            then_body: [], then_ret: a,
+            else_body: [], else_ret: None,
+            ret_type: ret_type
+          )
+          let ctx3 = LowerCtx(vars: v, semantic_vars: sv, stmts: ret_stmt :: s, temp_counter: c, enum_defs: ed)
+          return BranchBodyResult(ctx: ctx3, value_opt: None)
+        end
+      end
+  end
+end
+
 let lower_branch_body = fn (body: [MirStmt], result_name: string, result_type: TypeExpr, ctx: LowerCtx) -> BranchBodyResult do
   match body do
     | [] -> return BranchBodyResult(ctx: ctx, value_opt: None)
     | [last] ->
-      // Last statement — extract value
       match last do
         | MirStmtExpr(expr: e) ->
           match lower_expr_to_atom(expr: e, ctx: ctx) do | BindResult(ctx: ctx2, atom: a) ->
             return BranchBodyResult(ctx: ctx2, value_opt: Some(val: a))
           end
         | MirStmtReturn(expr: e) ->
-          match lower_expr_to_atom(expr: e, ctx: ctx) do | BindResult(ctx: ctx2, atom: a) ->
-            return BranchBodyResult(ctx: ctx2, value_opt: Some(val: a))
-          end
+          return emit_diverging_return(expr: e, ctx: ctx)
         | _ ->
           match lower_stmt_inner(stmt: last, ret_type: TyUnit, ctx: ctx) do | LowerStmtResult(ctx: ctx2, ret: _) ->
             return BranchBodyResult(ctx: ctx2, value_opt: None)
           end
       end
     | s :: rest ->
-      match lower_stmt_inner(stmt: s, ret_type: TyUnit, ctx: ctx) do | LowerStmtResult(ctx: ctx2, ret: _) ->
-        return lower_branch_body(body: rest, result_name: result_name, result_type: result_type, ctx: ctx2)
+      match s do
+        | MirStmtReturn(expr: e) ->
+          return emit_diverging_return(expr: e, ctx: ctx)
+        | _ ->
+          match lower_stmt_inner(stmt: s, ret_type: TyUnit, ctx: ctx) do | LowerStmtResult(ctx: ctx2, ret: _) ->
+            return lower_branch_body(body: rest, result_name: result_name, result_type: result_type, ctx: ctx2)
+          end
       end
   end
 end
@@ -1585,12 +1634,17 @@ let lir_lower_function = fn (f: MirFunction, enum_defs: [EnumDef], func_types: [
     let params = sort_mir_params(params: raw_params)
     let wasm_ret = wasm_type(typ: rt)
     // Build initial context with params
-    // Prepend param_vars before func_types so params shadow any same-named functions
+    // Prepend param_vars before func_types so params shadow any same-named functions.
+    // Store wasm_ret under the sentinel name "#FN_RET#" so nested lowering paths
+    // (match-as-expression branches with `return`) can recover the function's
+    // return type for emitting LirStmtIfReturn without threading ret_type
+    // through ~25 call sites of lower_expr_to_atom.
     let param_vars = build_param_vars(params: params)
     let param_sem_vars = build_param_semantic_vars(params: params)
+    let sem_vars_with_fn_ret = insert_type(name: "#FN_RET#", typ: wasm_ret, entries: param_sem_vars)
     let ctx = LowerCtx(
       vars: prepend_type_entries(xs: param_vars, ys: func_types),
-      semantic_vars: param_sem_vars,
+      semantic_vars: sem_vars_with_fn_ret,
       stmts: [],
       temp_counter: 0,
       enum_defs: enum_defs
