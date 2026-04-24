@@ -193,7 +193,7 @@ pub(super) fn import_variant_by_name(
     true
 }
 
-pub(super) fn convert_generic_user_defined_to_var(typ: &Type, vars: &HashSet<String>) -> Type {
+pub fn convert_generic_user_defined_to_var(typ: &Type, vars: &HashSet<String>) -> Type {
     match typ {
         Type::UserDefined(n, args) => {
             if args.is_empty() && vars.contains(n) {

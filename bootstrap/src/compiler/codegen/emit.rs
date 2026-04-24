@@ -264,6 +264,11 @@ pub(super) fn external_param_types(ext: &LirExternal) -> Result<Vec<ValType>, Co
             Type::I64 => out.push(ValType::I64),
             Type::F32 => out.push(ValType::F32),
             Type::F64 => out.push(ValType::F64),
+            // Generic type parameters (unresolved at the FFI boundary): all
+            // nexus values are i64 at WASM level, so erase the type var to i64.
+            // Enables `external foo : <T>(x: @T, ...) -> T` where callers of
+            // different instantiations all share one i64 ABI.
+            Type::Var(_) => out.push(ValType::I64),
             Type::String => {
                 // Both ABIs pass strings as (ptr: i32, len: i32)
                 out.push(ValType::I32);
@@ -303,6 +308,9 @@ pub(super) fn external_return_types(ext: &LirExternal) -> Result<Vec<ValType>, C
         Type::I64 => Ok(vec![ValType::I64]),
         Type::F32 => Ok(vec![ValType::F32]),
         Type::F64 => Ok(vec![ValType::F64]),
+        // Generic type variable at the FFI boundary erases to i64 — all
+        // nexus values are i64 in WASM, so the host returns an untyped i64.
+        Type::Var(_) => Ok(vec![ValType::I64]),
         Type::String => match abi {
             // Packed ABI: string returned as packed i64 in a single value
             super::string::StringABI::Packed => Ok(vec![ValType::I64]),
