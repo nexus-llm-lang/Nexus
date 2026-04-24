@@ -44,6 +44,23 @@ pub extern "C" fn __nx_get_env(key_ptr: i32, key_len: i32) -> i64 {
     }
 }
 
+// Companion predicate to __nx_get_env. Required because the packed-string FFI
+// collapses empty strings to 0 (see store_string_result), which would otherwise
+// make "FOO=\"\"" indistinguishable from an unset variable. Returns 1 if set,
+// 0 if unset or key is invalid.
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_has_env(key_ptr: i32, key_len: i32) -> i32 {
+    let Some((offset, len)) = checked_ptr_len(key_ptr, key_len) else {
+        return 0;
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(offset as *const u8, len) };
+    let key = String::from_utf8_lossy(bytes);
+    match std::env::var(key.as_ref()) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+}
+
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_set_env(
     key_ptr: i32,

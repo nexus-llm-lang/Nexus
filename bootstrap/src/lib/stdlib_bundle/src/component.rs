@@ -425,6 +425,9 @@ impl environment::Guest for StdlibComponent {
         let packed = nexus_proc_wasm::__nx_get_env(key.as_ptr() as i32, key.len() as i32);
         unpack_string(packed)
     }
+    fn has_env(key: String) -> i32 {
+        nexus_proc_wasm::__nx_has_env(key.as_ptr() as i32, key.len() as i32)
+    }
     fn set_env(key: String, value: String) {
         nexus_proc_wasm::__nx_set_env(
             key.as_ptr() as i32,

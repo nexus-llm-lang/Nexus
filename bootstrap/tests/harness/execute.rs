@@ -117,6 +117,14 @@ pub fn exec_with_stdlib_caps_should_trap(
     }
 }
 
+/// Compile and execute main() with stdlib and the given WASI env vars injected.
+/// Allows tests to observe deterministic env state without mutating the host
+/// process env (which would race under cargo's parallel test runner).
+pub fn exec_with_stdlib_envs(src: &str, envs: &[(&str, &str)]) {
+    let wasm = super::compile::compile(src);
+    run_main_with_deps_envs(&wasm, envs).unwrap_or_else(|e| panic!("execution failed: {}", e));
+}
+
 // ---------------------------------------------------------------------------
 // Component model execution
 // ---------------------------------------------------------------------------
@@ -161,6 +169,13 @@ impl wasmtime_wasi::HostMonotonicClock for DenyingClock {
 
 /// Build a WasiCtx that traps on denied capabilities.
 fn build_wasi_ctx(caps: &ExecutionCapabilities) -> wasmtime_wasi::WasiCtx {
+    build_wasi_ctx_with_envs(caps, &[])
+}
+
+fn build_wasi_ctx_with_envs(
+    caps: &ExecutionCapabilities,
+    envs: &[(&str, &str)],
+) -> wasmtime_wasi::WasiCtx {
     let mut builder = WasiCtxBuilder::new();
     if caps.allow_console {
         builder.inherit_stdio();
@@ -175,6 +190,9 @@ fn build_wasi_ctx(caps: &ExecutionCapabilities) -> wasmtime_wasi::WasiCtx {
     if !caps.allow_random {
         builder.secure_random(DenyingRandom);
         builder.insecure_random(DenyingRandom);
+    }
+    for (k, v) in envs {
+        builder.env(k, v);
     }
     builder.build()
 }
@@ -214,10 +232,25 @@ pub fn run_main_with_deps_caps(wasm: &[u8], caps: ExecutionCapabilities) -> Resu
     run_composed_component(&composed, &caps)
 }
 
+/// Execute main() with stdlib and a custom WASI env set.
+pub fn run_main_with_deps_envs(wasm: &[u8], envs: &[(&str, &str)]) -> Result<(), String> {
+    let composed =
+        compose::compose_with_stdlib(wasm).map_err(|e| format!("composition failed: {}", e))?;
+    run_composed_component_with_envs(&composed, &ExecutionCapabilities::allow_all(), envs)
+}
+
 /// Run a pre-composed component WASM, providing WASI imports.
 fn run_composed_component(
     component_wasm: &[u8],
     caps: &ExecutionCapabilities,
+) -> Result<(), String> {
+    run_composed_component_with_envs(component_wasm, caps, &[])
+}
+
+fn run_composed_component_with_envs(
+    component_wasm: &[u8],
+    caps: &ExecutionCapabilities,
+    envs: &[(&str, &str)],
 ) -> Result<(), String> {
     let engine = &*SHARED_ENGINE;
     let component = wasmtime::component::Component::from_binary(engine, component_wasm)
@@ -229,7 +262,7 @@ fn run_composed_component(
     define_component_runtime_stubs(&mut linker)?;
 
     let state = WasiState {
-        ctx: build_wasi_ctx(caps),
+        ctx: build_wasi_ctx_with_envs(caps, envs),
         table: ResourceTable::new(),
     };
     let mut store = Store::new(engine, state);
