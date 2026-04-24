@@ -9,7 +9,7 @@ pub use builder::TestRunner;
 pub use compile::{compile, try_compile};
 pub use execute::{
     exec, exec_should_trap, exec_with_stdlib, exec_with_stdlib_caps,
-    exec_with_stdlib_caps_should_trap, exec_with_stdlib_should_trap,
+    exec_with_stdlib_caps_should_trap, exec_with_stdlib_envs, exec_with_stdlib_should_trap,
 };
 pub use fixture::{read_fixture, TempDir};
 pub use typecheck::{

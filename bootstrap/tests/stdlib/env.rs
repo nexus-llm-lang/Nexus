@@ -1,4 +1,6 @@
-use crate::harness::{exec_with_stdlib, should_fail_typecheck, should_typecheck};
+use crate::harness::{
+    exec_with_stdlib, exec_with_stdlib_envs, should_fail_typecheck, should_typecheck,
+};
 
 #[test]
 fn env_port_typechecks_with_perm_env() {
@@ -45,6 +47,74 @@ let main = fn () -> unit require { PermEnv } do
   end
 end
 "#,
+    );
+}
+
+// Regression: an env var deliberately set to "" must round-trip as Some("")
+// rather than being collapsed to None (nexus-9lp4.25).
+#[test]
+fn env_get_set_to_empty_returns_some_empty() {
+    exec_with_stdlib_envs(
+        r#"
+import { Env }, * as env_mod from "stdlib/environment.nx"
+import { Option } from "stdlib/option.nx"
+
+let main = fn () -> unit require { PermEnv } do
+  inject env_mod.system_handler do
+    match Env.get(key: "NX_EMPTY_TEST") do
+      | Some(val: v) ->
+        if v != "" then raise RuntimeError(val: "expected empty string") end
+        return ()
+      | None -> raise RuntimeError(val: "expected Some(\"\") but got None")
+    end
+  end
+end
+"#,
+        &[("NX_EMPTY_TEST", "")],
+    );
+}
+
+// Baseline: an unset env var resolves to None.
+#[test]
+fn env_get_unset_returns_none() {
+    exec_with_stdlib_envs(
+        r#"
+import { Env }, * as env_mod from "stdlib/environment.nx"
+import { Option } from "stdlib/option.nx"
+
+let main = fn () -> unit require { PermEnv } do
+  inject env_mod.system_handler do
+    match Env.get(key: "NX_NEVER_DEFINED_VAR") do
+      | Some(val: _) -> raise RuntimeError(val: "expected None for unset var")
+      | None -> return ()
+    end
+  end
+end
+"#,
+        &[],
+    );
+}
+
+// Baseline: a non-empty set var round-trips through Env.get.
+#[test]
+fn env_get_set_to_value_returns_some_value() {
+    exec_with_stdlib_envs(
+        r#"
+import { Env }, * as env_mod from "stdlib/environment.nx"
+import { Option } from "stdlib/option.nx"
+
+let main = fn () -> unit require { PermEnv } do
+  inject env_mod.system_handler do
+    match Env.get(key: "NX_SET_VAR") do
+      | Some(val: v) ->
+        if v != "hello" then raise RuntimeError(val: "expected hello") end
+        return ()
+      | None -> raise RuntimeError(val: "expected Some")
+    end
+  end
+end
+"#,
+        &[("NX_SET_VAR", "hello")],
     );
 }
 
