@@ -1,4 +1,4 @@
-use crate::harness::{exec_with_stdlib, read_fixture};
+use crate::harness::{exec, exec_with_stdlib, read_fixture};
 
 #[test]
 fn codegen_minimal_wasm_output() {
@@ -162,6 +162,14 @@ fn lazy_stdlib_combinators() {
 #[test]
 fn lazy_host_force() {
     exec_with_stdlib(&read_fixture("nxc/test_lazy_host_force.nx"));
+}
+
+#[test]
+fn lazy_runtime_raw() {
+    // Exercises the Rust runtime's __nx_lazy_spawn directly on nxc-compiled
+    // core WASM (no stdlib / component composition). Validates invoke_thunk
+    // against real thunks the compiler produced.
+    exec(&read_fixture("nxc/test_lazy_runtime_raw.nx"));
 }
 
 #[test]

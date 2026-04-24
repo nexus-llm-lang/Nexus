@@ -95,26 +95,33 @@ fn invoke_thunk<T>(caller: &mut Caller<'_, T>, thunk_ptr: i64) -> Result<i64, Er
         .map_err(|e| Error::msg(format!("lazy_spawn: thunk trapped: {e}")))
 }
 
-/// Register `__nx_lazy_spawn` and `__nx_lazy_join` with the linker.
+/// Register lazy-spawn and lazy-join with the linker, under both the
+/// WIT-canonical kebab-case names (what the compiler emits for imports
+/// from `nexus:runtime/lazy`) and the `__nx_`-prefixed underscored names
+/// (back-compat if future code declares the raw module name).
 pub fn add_lazy_to_linker<T: Send + 'static>(linker: &mut Linker<T>) -> Result<(), String> {
-    linker
-        .func_wrap(
-            LAZY_HOST_MODULE,
-            "__nx_lazy_spawn",
-            |mut caller: Caller<'_, T>,
-             thunk_ptr: i64,
-             _num_captures: i32|
-             -> Result<i64, Error> { invoke_thunk(&mut caller, thunk_ptr) },
-        )
-        .map_err(|e| e.to_string())?;
+    for name in ["lazy-spawn", "__nx_lazy_spawn"] {
+        linker
+            .func_wrap(
+                LAZY_HOST_MODULE,
+                name,
+                |mut caller: Caller<'_, T>,
+                 thunk_ptr: i64,
+                 _num_captures: i32|
+                 -> Result<i64, Error> { invoke_thunk(&mut caller, thunk_ptr) },
+            )
+            .map_err(|e| e.to_string())?;
+    }
 
-    linker
-        .func_wrap(
-            LAZY_HOST_MODULE,
-            "__nx_lazy_join",
-            |_caller: Caller<'_, T>, task_id: i64| -> i64 { task_id },
-        )
-        .map_err(|e| e.to_string())?;
+    for name in ["lazy-join", "__nx_lazy_join"] {
+        linker
+            .func_wrap(
+                LAZY_HOST_MODULE,
+                name,
+                |_caller: Caller<'_, T>, task_id: i64| -> i64 { task_id },
+            )
+            .map_err(|e| e.to_string())?;
+    }
 
     Ok(())
 }

@@ -464,6 +464,11 @@ pub fn compile_lir_to_wasm(
     if !matches!(layout.memory_mode, MemoryMode::None) {
         exports.export(MEMORY_EXPORT, ExportKind::Memory, 0);
     }
+    // Export the indirect function table when present so host runtime
+    // functions (__nx_lazy_spawn and friends) can call_indirect thunks.
+    if has_funcref {
+        exports.export("__indirect_function_table", ExportKind::Table, 0);
+    }
     module.section(&exports);
 
     // === Element Section (funcref table) ===
