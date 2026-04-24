@@ -52,10 +52,10 @@ fn test_stdio_defines_console_port_and_system_handler() {
     let has_console_port = program
         .definitions
         .iter()
-        .any(|d| matches!(&d.node, nexus::lang::ast::TopLevel::Port(p) if p.name == "Console"));
+        .any(|d| matches!(&d.node, nexus::lang::ast::TopLevel::Cap(p) if p.name == "Console"));
     assert!(
         has_console_port,
-        "Console port should be defined in stdio.nx"
+        "Console cap should be defined in stdio.nx"
     );
 
     let let_names: Vec<String> = program

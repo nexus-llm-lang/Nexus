@@ -106,13 +106,13 @@ let greet = fn (name: string) -> unit require { Console } do
 end
 ```
 
-## Effect System (Ports & Handlers)
+## Effect System (Caps & Handlers)
 
 Nexus uses coeffects for dependency injection, NOT algebraic effects. See https://nymphium.github.io/Nexus/latest/spec/effects for details.
 
 ```nexus
-// 1. Define a port (interface)
-port Logger do
+// 1. Define a cap (interface)
+cap Logger do
   fn info(msg: string) -> unit
   fn error(msg: string) -> unit
 end
@@ -129,7 +129,7 @@ let console_logger = handler Logger require { Console } do
   end
 end
 
-// 3. Require port in functions
+// 3. Require cap in functions
 let greet = fn (name: string) -> unit require { Logger } do
   Logger.info(msg: "Hello, " ++ name)
   return ()
@@ -293,7 +293,7 @@ end
 
 - https://nymphium.github.io/Nexus/latest/spec/syntax — Syntax and EBNF grammar
 - https://nymphium.github.io/Nexus/latest/spec/types — Type system, linear types, borrowing
-- https://nymphium.github.io/Nexus/latest/spec/effects — Ports, handlers, inject, permissions
+- https://nymphium.github.io/Nexus/latest/spec/effects — Caps, handlers, inject, permissions
 - https://nymphium.github.io/Nexus/latest/env/stdlib — Standard library API reference
 - `./references/patterns.md` — Idiomatic code patterns with examples
 - `./templates/` — Starter templates for common program structures

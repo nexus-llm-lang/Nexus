@@ -15,7 +15,7 @@ fn test_port_basic() {
         r#"
     import { Console }, * as stdio from "stdlib/stdio.nx"
 
-    port Logger do
+    cap Logger do
       fn log(msg: string) -> unit
     end
 
@@ -45,7 +45,7 @@ fn test_port_redefinition_wins() {
     import { Console }, * as stdio from "stdlib/stdio.nx"
     import { from_i64 } from "stdlib/string_ops.nx"
 
-    port Adder do
+    cap Adder do
       fn add_one(n: i64) -> i64
     end
 
@@ -170,11 +170,11 @@ fn test_handler_require_real_propagates_perm() {
 fn test_handler_require_propagates_through_nested_inject() {
     should_typecheck(
         r#"
-    port Inner do
+    cap Inner do
       fn value() -> i64
     end
 
-    port Outer do
+    cap Outer do
       fn compute() -> i64
     end
 
@@ -208,11 +208,11 @@ fn test_handler_require_propagates_through_nested_inject() {
 fn test_handler_require_multiple_merged() {
     should_typecheck(
         r#"
-    port A do
+    cap A do
       fn a_val() -> i64
     end
 
-    port B do
+    cap B do
       fn b_val() -> i64
     end
 
@@ -244,7 +244,7 @@ fn test_handler_require_multiple_merged() {
 fn test_handler_require_syntax_parses() {
     should_typecheck(
         r#"
-    port P do
+    cap P do
       fn op() -> i64
     end
 

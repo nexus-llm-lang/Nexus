@@ -139,7 +139,7 @@ fn test_main_require_known_perm_is_accepted() {
 fn test_main_require_unknown_port_is_rejected() {
     should_fail_typecheck(
         r#"
-    port Custom do
+    cap Custom do
       fn foo() -> unit
     end
     let main = fn () -> unit require { Custom } do

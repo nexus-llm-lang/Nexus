@@ -13,7 +13,6 @@
 "then" @keyword.if
 "else" @keyword.if
 "match" @keyword.match
-"case" @keyword.match.case
 "return" @keyword.return
 "raise" @keyword.raise
 
@@ -37,8 +36,8 @@
 "from" @keyword.import
 "as" @keyword.import
 
-; Port/handler
-"port" @keyword.port
+; Cap/handler
+"cap" @keyword.cap
 "handler" @keyword.handler
 
 "let" @keyword.let
@@ -157,10 +156,6 @@
 (force_expr
   "@" @operator)
 
-; Catch arms
-(catch_arm
-  "case" @keyword.match.case)
-
 ; ─── Literals ───────────────────────────────────────────────────────────────
 
 (integer_literal) @number
@@ -209,13 +204,13 @@
 "." @punctuation.delimiter
 "|" @punctuation.delimiter
 
-; ─── Handler & Port ─────────────────────────────────────────────────────────
+; ─── Handler & Cap ──────────────────────────────────────────────────────────
 
-(port_def
+(cap_def
   name: (uident) @type)
 
 (handler_expr
-  port_name: (uident) @type)
+  cap_name: (uident) @type)
 
 (inject_stmt
   handler: (inject_handler

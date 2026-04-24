@@ -309,7 +309,7 @@ impl TypeChecker {
                                         public_env.insert(gl.name.clone(), sch.clone());
                                     }
                                 }
-                                TopLevel::Port(port) if port.is_public => {
+                                TopLevel::Cap(port) if port.is_public => {
                                     // Export all port operation signatures (e.g. Net.get, Net.listen)
                                     let prefix = format!("{}.", port.name);
                                     for (name, sch) in &sub_checker.env.vars {
@@ -457,7 +457,7 @@ impl TypeChecker {
                         .exception_groups
                         .insert(eg.name.clone(), eg.members.clone());
                 }
-                TopLevel::Port(port) => {
+                TopLevel::Cap(port) => {
                     for sig in &port.functions {
                         let name = format!("{}.{}", port.name, sig.name);
                         let ptypes: Vec<(String, Type)> = sig

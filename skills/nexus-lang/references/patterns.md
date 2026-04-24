@@ -34,7 +34,7 @@ end
 ## Import Patterns
 
 ```nexus
-// Import port + module alias (most common for I/O)
+// Import cap + module alias (most common for I/O)
 import { Console }, * as stdio from "stdlib/stdio.nx"
 
 // Import specific items
@@ -50,19 +50,19 @@ import * as math from "stdlib/math.nx"
 import { Net, Request, Response }, * as net_mod from "stdlib/network.nx"
 ```
 
-## Custom Port + Handler (Dependency Injection)
+## Custom Cap + Handler (Dependency Injection)
 
 ```nexus
 // 1. Define domain types
 type User = { id: i64, name: string, email: string }
 
-// 2. Define port (interface)
-port UserRepository do
+// 2. Define cap (interface)
+cap UserRepository do
   fn find_by_id(id: i64) -> Option<User>
   fn save(user: User) -> Result<unit, string>
 end
 
-// 3. Business logic depends on port
+// 3. Business logic depends on cap
 let register = fn (name: string, email: string) -> Result<unit, string> require { UserRepository, Logger } do
   let user = { id: 0, name: name, email: email }
   Logger.info(msg: "Registering: " ++ email)

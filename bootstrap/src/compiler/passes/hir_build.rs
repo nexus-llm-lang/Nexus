@@ -147,7 +147,7 @@ fn compute_importer_entries(
                 TopLevel::Let(gl) => {
                     entries.insert(format!("{}.{}", alias, gl.name), canonical(&gl.name));
                 }
-                TopLevel::Port(port) => {
+                TopLevel::Cap(port) => {
                     entries.insert(format!("{}.{}", alias, port.name), canonical(&port.name));
                 }
                 _ => {}
@@ -163,7 +163,7 @@ fn compute_importer_entries(
                 TopLevel::Let(gl) if gl.is_public && gl.name == item.name => {
                     entries.insert(visible.clone(), canonical(&gl.name));
                 }
-                TopLevel::Port(port) if port.is_public && port.name == item.name => {
+                TopLevel::Cap(port) if port.is_public && port.name == item.name => {
                     entries.insert(visible.clone(), canonical(&port.name));
                 }
                 _ => {}
@@ -521,7 +521,7 @@ impl MirBuilder {
                             .insert(gl.name.clone(), canonical_name(&current_src, &gl.name));
                     }
                 }
-                TopLevel::Port(port) => {
+                TopLevel::Cap(port) => {
                     rename_map
                         .insert(port.name.clone(), canonical_name(&current_src, &port.name));
                 }
@@ -565,7 +565,7 @@ impl MirBuilder {
                     self.exception_groups
                         .insert(eg.name.clone(), eg.members.clone());
                 }
-                TopLevel::Port(port) => {
+                TopLevel::Cap(port) => {
                     let port_name = self.rename(&port.name, rename_map);
                     let methods: Vec<String> =
                         port.functions.iter().map(|f| f.name.clone()).collect();
@@ -806,7 +806,7 @@ impl MirBuilder {
             .iter()
             .flat_map(|def| match &def.node {
                 TopLevel::Let(gl) if gl.is_public => vec![gl.name.clone()],
-                TopLevel::Port(port) if port.is_public => vec![port.name.clone()],
+                TopLevel::Cap(port) if port.is_public => vec![port.name.clone()],
                 TopLevel::Enum(ed) if ed.is_public => {
                     let mut names = vec![ed.name.clone()];
                     for v in &ed.variants {
@@ -886,7 +886,7 @@ impl MirBuilder {
                     TopLevel::Let(gl) => {
                         map.insert(gl.name.clone(), canonical(&gl.name));
                     }
-                    TopLevel::Port(port) => {
+                    TopLevel::Cap(port) => {
                         map.insert(port.name.clone(), canonical(&port.name));
                     }
                     _ => {}
@@ -898,7 +898,7 @@ impl MirBuilder {
         for item in &import.items {
             let found = program.definitions.iter().any(|def| match &def.node {
                 TopLevel::Let(gl) if gl.is_public && gl.name == item.name => true,
-                TopLevel::Port(port) if port.is_public && port.name == item.name => true,
+                TopLevel::Cap(port) if port.is_public && port.name == item.name => true,
                 TopLevel::Enum(ed) if ed.is_public => {
                     ed.name == item.name || ed.variants.iter().any(|v| v.name == item.name)
                 }
@@ -921,7 +921,7 @@ impl MirBuilder {
                 TopLevel::Let(gl) => {
                     map.insert(gl.name.clone(), canonical(&gl.name));
                 }
-                TopLevel::Port(port) => {
+                TopLevel::Cap(port) => {
                     map.insert(port.name.clone(), canonical(&port.name));
                 }
                 _ => {}

@@ -43,6 +43,9 @@ export default grammar({
     [$.expr_stmt, $.match_case_expr],
     // `if let pat = expr then expr end` — if_let_expr vs expr_stmt in stmt body
     [$.expr_stmt, $.if_let_expr],
+    // `else if ...` — chain (nested if as else_branch) vs block (if as first of stmt list)
+    [$.if_stmt, $._stmt],
+    [$.if_let_stmt, $._stmt],
   ],
 
   rules: {
@@ -70,7 +73,7 @@ export default grammar({
         $.type_def,
         $.exception_def,
         $.import_def,
-        $.port_def,
+        $.cap_def,
         $.external_def,
         $.exception_group_def,
         $.let_def,
@@ -174,11 +177,11 @@ export default grammar({
     // Import path: quoted string (e.g. "nxlib/stdlib/filesystem.nx")
     import_path: ($) => $.string_literal,
 
-    // [pub] port Name do fn sig ... end
-    port_def: ($) =>
+    // [export] cap Name do fn sig ... end
+    cap_def: ($) =>
       seq(
         optional("export"),
-        "port",
+        "cap",
         field("name", $.uident),
         "do",
         repeat($.fn_signature),
@@ -378,18 +381,23 @@ export default grammar({
     assign_stmt: ($) =>
       seq(field("target", $._expr), "<-", field("value", $._expr)),
 
-    // if cond then stmts [else stmts] end
+    // if cond then stmts [else stmts | else if...] end
+    // `else if` is a chain: the inner `if` consumes the trailing `end`, so the
+    // outer form has a single terminal `end` (no nested `end end`).
     if_stmt: ($) =>
       seq(
         "if",
         field("cond", $._expr),
         "then",
         field("then_branch", repeat($._stmt)),
-        optional(seq("else", field("else_branch", repeat($._stmt)))),
-        "end"
+        choice(
+          seq("else", field("else_branch", $.if_stmt)),
+          seq("else", field("else_branch", repeat($._stmt)), "end"),
+          "end"
+        )
       ),
 
-    // if let pattern = expr then stmts [else stmts] end
+    // if let pattern = expr then stmts [else stmts | else if...] end
     if_let_stmt: ($) =>
       seq(
         "if",
@@ -399,8 +407,12 @@ export default grammar({
         field("target", $._expr),
         "then",
         field("then_branch", repeat($._stmt)),
-        optional(seq("else", field("else_branch", repeat($._stmt)))),
-        "end"
+        choice(
+          seq("else", field("else_branch", $.if_stmt)),
+          seq("else", field("else_branch", $.if_let_stmt)),
+          seq("else", field("else_branch", repeat($._stmt)), "end"),
+          "end"
+        )
       ),
 
     // match expr do | pat -> stmts ... end
@@ -747,7 +759,7 @@ export default grammar({
     handler_expr: ($) =>
       seq(
         "handler",
-        field("port_name", $.uident),
+        field("cap_name", $.uident),
         optional(seq("require", field("requires", $._effect_type))),
         "do",
         repeat($.handler_fn),
