@@ -118,3 +118,78 @@ pub fn add_lazy_to_linker<T: Send + 'static>(linker: &mut Linker<T>) -> Result<(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasmtime::{Engine, Linker, Module, Store};
+
+    /// End-to-end test: hand-crafted core WASM that imports __nx_lazy_spawn,
+    /// places a thunk-shaped closure at mem[16] (header table_idx=0 → function 0),
+    /// calls __nx_lazy_spawn(16, 0), and re-exports the result.
+    ///
+    /// Thunk function at table[0] ignores its env param and returns 42.
+    /// After spawn, main returns the forced value; we assert it equals 42.
+    #[test]
+    fn spawn_forces_thunk_via_indirect_table() {
+        let wat = r#"
+            (module
+              (import "nexus:runtime/lazy" "__nx_lazy_spawn"
+                (func $lazy_spawn (param i64 i32) (result i64)))
+              (memory (export "memory") 1)
+              (table (export "__indirect_function_table") 1 funcref)
+              (func $thunk (param i64) (result i64)
+                i64.const 42)
+              (elem (i32.const 0) $thunk)
+              (func (export "main") (result i64)
+                ;; write table_idx (i64 = 0) into mem[16..24] as the thunk header
+                i32.const 16
+                i64.const 0
+                i64.store
+                ;; call __nx_lazy_spawn(thunk_ptr = 16, num_captures = 0)
+                i64.const 16
+                i32.const 0
+                call $lazy_spawn))
+        "#;
+        let bytes = wat::parse_str(wat).expect("WAT parse");
+
+        let engine = Engine::default();
+        let module = Module::from_binary(&engine, &bytes).expect("module load");
+        let mut linker = Linker::<()>::new(&engine);
+        add_lazy_to_linker(&mut linker).expect("linker");
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let main = instance
+            .get_typed_func::<(), i64>(&mut store, "main")
+            .expect("main export");
+        let result = main.call(&mut store, ()).expect("main trap");
+        assert_eq!(result, 42, "thunk must have been forced to 42 by host spawn");
+    }
+
+    /// __nx_lazy_join is identity — the task_id IS the forced value under
+    /// sequential semantics. Verify it returns the input unchanged.
+    #[test]
+    fn join_is_identity() {
+        let wat = r#"
+            (module
+              (import "nexus:runtime/lazy" "__nx_lazy_join"
+                (func $lazy_join (param i64) (result i64)))
+              (func (export "main") (param i64) (result i64)
+                local.get 0
+                call $lazy_join))
+        "#;
+        let bytes = wat::parse_str(wat).expect("WAT parse");
+
+        let engine = Engine::default();
+        let module = Module::from_binary(&engine, &bytes).expect("module load");
+        let mut linker = Linker::<()>::new(&engine);
+        add_lazy_to_linker(&mut linker).expect("linker");
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let main = instance
+            .get_typed_func::<i64, i64>(&mut store, "main")
+            .expect("main export");
+        assert_eq!(main.call(&mut store, 12345).expect("main trap"), 12345);
+        assert_eq!(main.call(&mut store, -7).expect("main trap"), -7);
+    }
+}
