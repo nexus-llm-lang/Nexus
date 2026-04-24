@@ -7,7 +7,7 @@ description: "Write Nexus (.nx) programs — an LLM-friendly language with linea
 
 Nexus is a programming language designed for LLM-friendly code generation. Its premise: **"LLMs are strong at literal program constructs but weak at contextual ones."** Every construct is syntactically explicit — no implicit resource cleanup, no hidden aliasing, no ambient I/O.
 
-**Documentation**: https://nymphium.github.io/Nexus/latest/
+**Documentation**: https://nexus-llm-lang.github.io/Nexus/latest/
 
 ## When to Use This Skill
 
@@ -108,7 +108,7 @@ end
 
 ## Effect System (Caps & Handlers)
 
-Nexus uses coeffects for dependency injection, NOT algebraic effects. See https://nymphium.github.io/Nexus/latest/spec/effects for details.
+Nexus uses coeffects for dependency injection, NOT algebraic effects. See https://nexus-llm-lang.github.io/Nexus/latest/spec/effects for details.
 
 ```nexus
 // 1. Define a cap (interface)
@@ -291,9 +291,9 @@ end
 
 ## Reference Files
 
-- https://nymphium.github.io/Nexus/latest/spec/syntax — Syntax and EBNF grammar
-- https://nymphium.github.io/Nexus/latest/spec/types — Type system, linear types, borrowing
-- https://nymphium.github.io/Nexus/latest/spec/effects — Caps, handlers, inject, permissions
-- https://nymphium.github.io/Nexus/latest/env/stdlib — Standard library API reference
+- https://nexus-llm-lang.github.io/Nexus/latest/spec/syntax — Syntax and EBNF grammar
+- https://nexus-llm-lang.github.io/Nexus/latest/spec/types — Type system, linear types, borrowing
+- https://nexus-llm-lang.github.io/Nexus/latest/spec/effects — Caps, handlers, inject, permissions
+- https://nexus-llm-lang.github.io/Nexus/latest/env/stdlib — Standard library API reference
 - `./references/patterns.md` — Idiomatic code patterns with examples
 - `./templates/` — Starter templates for common program structures

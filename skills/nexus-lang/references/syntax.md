@@ -1,3 +1,3 @@
 # Nexus Syntax Reference
 
-See https://nymphium.github.io/Nexus/latest/spec/syntax
+See https://nexus-llm-lang.github.io/Nexus/latest/spec/syntax
