@@ -175,6 +175,16 @@ fn lazy_runtime_raw() {
 }
 
 #[test]
+fn lazy_parallel_consecutive_forces() {
+    // Exercises the lir_opt parallelize_consecutive_forces pass via natural
+    // Nexus syntax: `let v1 = @a; let v2 = @b` produces two adjacent
+    // CallIndirect ops which the pass rewrites to spawn+spawn+join+join.
+    // Run via the core-wasm exec path so worker threads actually run; the
+    // fixture traps on a wrong sum.
+    exec(&read_fixture("nxc/test_lazy_parallel.nx"));
+}
+
+#[test]
 fn exception_group_catch() {
     exec_with_stdlib(&read_fixture("nxc/test_exception_group.nx"));
 }

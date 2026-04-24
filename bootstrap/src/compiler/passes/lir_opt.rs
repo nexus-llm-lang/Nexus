@@ -2476,11 +2476,18 @@ fn parallelize_consecutive_forces(stmts: &mut Vec<LirStmt>) {
             } = &stmts[i]
             {
                 if args.is_empty() {
+                    // num_captures = 0 → runtime threads the thunk on a worker.
+                    // num_captures > 0 → runtime uses inline fallback (no threading).
+                    // For thunks whose origin we can't see (function parameters,
+                    // results of arbitrary expressions), we don't know the capture
+                    // count, so default to 1 — that routes through LazySpawn/LazyJoin
+                    // but keeps the inline fallback. Threading is then opt-in: we
+                    // only thread thunks whose closure binding the pass can see.
                     let num_captures = match callee {
                         LirAtom::Var {
                             name: thunk_name, ..
-                        } => closure_capture_counts.get(thunk_name).copied().unwrap_or(0),
-                        _ => 0,
+                        } => closure_capture_counts.get(thunk_name).copied().unwrap_or(1),
+                        _ => 1,
                     };
                     force_run.push((*name, callee.clone(), typ.clone(), num_captures));
                     i += 1;
@@ -4053,6 +4060,203 @@ mod tests_reuse_alias_safety {
         assert_eq!(
             stmts, before,
             "reuse must not touch Constructor when source is read in a nested body after the reuse site"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_parallelize_lazy_forces {
+    use super::*;
+
+    fn sym(s: &str) -> Symbol {
+        Symbol::intern(s)
+    }
+
+    fn var(name: &str) -> LirAtom {
+        LirAtom::Var {
+            name: sym(name),
+            typ: Type::I64,
+        }
+    }
+
+    fn let_force(result: &str, thunk: &str) -> LirStmt {
+        LirStmt::Let {
+            name: sym(result),
+            typ: Type::I64,
+            expr: LirExpr::CallIndirect {
+                callee: var(thunk),
+                args: vec![],
+                typ: Type::I64,
+                callee_type: Type::I64,
+            },
+        }
+    }
+
+    fn let_funcref(name: &str) -> LirStmt {
+        LirStmt::Let {
+            name: sym(name),
+            typ: Type::I64,
+            expr: LirExpr::FuncRef {
+                func: sym(name),
+                typ: Type::I64,
+            },
+        }
+    }
+
+    fn count_spawns(stmts: &[LirStmt]) -> usize {
+        stmts
+            .iter()
+            .filter(|s| matches!(s, LirStmt::Let { expr: LirExpr::LazySpawn { .. }, .. }))
+            .count()
+    }
+
+    fn count_joins(stmts: &[LirStmt]) -> usize {
+        stmts
+            .iter()
+            .filter(|s| matches!(s, LirStmt::Let { expr: LirExpr::LazyJoin { .. }, .. }))
+            .count()
+    }
+
+    fn count_call_indirects(stmts: &[LirStmt]) -> usize {
+        stmts
+            .iter()
+            .filter(|s| matches!(s, LirStmt::Let { expr: LirExpr::CallIndirect { .. }, .. }))
+            .count()
+    }
+
+    #[test]
+    fn two_adjacent_forces_become_spawn_spawn_join_join() {
+        let mut stmts = vec![
+            let_funcref("a"),
+            let_funcref("b"),
+            let_force("v1", "a"),
+            let_force("v2", "b"),
+        ];
+        parallelize_consecutive_forces(&mut stmts);
+        assert_eq!(
+            count_call_indirects(&stmts),
+            0,
+            "all CallIndirect forces must be replaced"
+        );
+        assert_eq!(count_spawns(&stmts), 2, "must emit one LazySpawn per force");
+        assert_eq!(count_joins(&stmts), 2, "must emit one LazyJoin per force");
+        // Order: spawns first, joins second — required so workers run in parallel.
+        let positions: Vec<&'static str> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                LirStmt::Let {
+                    expr: LirExpr::LazySpawn { .. },
+                    ..
+                } => Some("spawn"),
+                LirStmt::Let {
+                    expr: LirExpr::LazyJoin { .. },
+                    ..
+                } => Some("join"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(positions, vec!["spawn", "spawn", "join", "join"]);
+    }
+
+    #[test]
+    fn single_force_is_left_alone() {
+        // Need 2+ adjacent forces to parallelize — a singleton stays as CallIndirect.
+        let mut stmts = vec![let_funcref("a"), let_force("v1", "a")];
+        let before = stmts.clone();
+        parallelize_consecutive_forces(&mut stmts);
+        assert_eq!(
+            stmts, before,
+            "singleton force must not be wrapped in spawn/join"
+        );
+    }
+
+    #[test]
+    fn forces_separated_by_intermediate_stmt_are_not_parallelized() {
+        let mut stmts = vec![
+            let_funcref("a"),
+            let_funcref("b"),
+            let_force("v1", "a"),
+            // Intermediate stmt with a side effect — breaks the run.
+            LirStmt::Let {
+                name: sym("dummy"),
+                typ: Type::I64,
+                expr: LirExpr::Constructor {
+                    name: sym("X"),
+                    args: vec![],
+                    typ: Type::I64,
+                },
+            },
+            let_force("v2", "b"),
+        ];
+        let before = stmts.clone();
+        parallelize_consecutive_forces(&mut stmts);
+        assert_eq!(
+            stmts, before,
+            "forces separated by an intermediate stmt must not coalesce — would change side-effect order"
+        );
+    }
+
+    #[test]
+    fn capture_count_is_propagated_to_spawn() {
+        // FuncRef has zero captures; Closure with N captures has N. The pass
+        // must thread that count through to LazySpawn.num_captures so the
+        // runtime can decide threaded-vs-inline.
+        let mut stmts = vec![
+            LirStmt::Let {
+                name: sym("a"),
+                typ: Type::I64,
+                expr: LirExpr::Closure {
+                    func: sym("thunk_a"),
+                    captures: vec![(sym("env_x"), LirAtom::Int(1))],
+                    typ: Type::I64,
+                },
+            },
+            let_funcref("b"),
+            let_force("v1", "a"),
+            let_force("v2", "b"),
+        ];
+        parallelize_consecutive_forces(&mut stmts);
+        let captures: Vec<u32> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                LirStmt::Let {
+                    expr: LirExpr::LazySpawn { num_captures, .. },
+                    ..
+                } => Some(*num_captures),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            captures,
+            vec![1, 0],
+            "spawn for `a` (closure with 1 capture) → 1; spawn for `b` (FuncRef) → 0"
+        );
+    }
+
+    #[test]
+    fn unknown_callee_defaults_to_one_capture_for_safety() {
+        // When the callee isn't a locally-bound Closure/FuncRef (e.g. a function
+        // parameter `@T`), the pass can't see its capture count. We default to 1
+        // so the runtime takes the inline fallback path (preserves sequential
+        // semantics) instead of the threaded path (which would pass env=0 to a
+        // thunk that may legitimately need its captures).
+        // Here `a` and `b` are not bound locally — they look like function params.
+        let mut stmts = vec![let_force("v1", "a"), let_force("v2", "b")];
+        parallelize_consecutive_forces(&mut stmts);
+        let captures: Vec<u32> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                LirStmt::Let {
+                    expr: LirExpr::LazySpawn { num_captures, .. },
+                    ..
+                } => Some(*num_captures),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            captures,
+            vec![1, 1],
+            "unknown-origin thunks must default to num_captures=1 (inline fallback)"
         );
     }
 }
