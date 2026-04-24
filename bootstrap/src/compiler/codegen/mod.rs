@@ -86,7 +86,7 @@ pub fn compile_program_to_wasm_with_metrics(
     let lir_lower = t.elapsed();
 
     let t = Instant::now();
-    optimize_lir_with_opts(&mut lir, false);
+    optimize_lir_with_opts(&mut lir, true);
     let optimize = t.elapsed();
 
     let t = Instant::now();
@@ -124,7 +124,7 @@ pub fn compile_program_to_wasm_with_dwarf(program: &Program) -> Result<Vec<u8>, 
     let caps = extract_main_require_ports_from_ast(program);
     let mir = build_hir(program).map_err(CompileError::HirBuild)?;
     let mut lir = lower_mir_to_lir(&mir, &mir.enum_defs).map_err(CompileError::LirLower)?;
-    optimize_lir_with_opts(&mut lir, false);
+    optimize_lir_with_opts(&mut lir, true);
     let (mut wasm, debug_entries) = compile_lir_to_wasm(&lir).map_err(CompileError::Codegen)?;
     if !caps.is_empty() {
         append_capabilities_section(&mut wasm, &caps);
