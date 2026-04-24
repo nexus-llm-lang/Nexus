@@ -1,5 +1,6 @@
 use nexus::compiler::compose;
 use nexus::runtime::backtrace;
+use nexus::runtime::lazy;
 use nexus::runtime::ExecutionCapabilities;
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,12 +67,18 @@ pub fn run_main(wasm: &[u8]) -> Result<(), String> {
     let engine = Engine::new(&config).map_err(|e| e.to_string())?;
     let module = Module::from_binary(&engine, wasm).map_err(|e| e.to_string())?;
     let has_bt = backtrace::needs_bt_runtime(wasm);
+    let has_lazy = lazy::needs_lazy_runtime(wasm);
 
-    if has_bt {
+    if has_bt || has_lazy {
         let mut linker = Linker::new(&engine);
         let mut store = Store::new(&engine, ());
-        backtrace::reset();
-        backtrace::add_bt_to_linker(&mut linker, &mut store)?;
+        if has_bt {
+            backtrace::reset();
+            backtrace::add_bt_to_linker(&mut linker, &mut store)?;
+        }
+        if has_lazy {
+            lazy::add_lazy_to_linker(&mut linker)?;
+        }
         let instance = linker
             .instantiate(&mut store, &module)
             .map_err(|e| e.to_string())?;
