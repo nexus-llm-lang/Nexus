@@ -1,0 +1,275 @@
+/**
+ * linearity: @T (lazy) binding linearity check.
+ *
+ * Each `let @x = expr` binding must be referenced exactly once in its scope.
+ * Zero uses raise LazyBindingUnused; two or more raise LazyBindingDoubleUse.
+ *
+ * Structural HIR pass — walks each function body once. References are counted
+ * syntactically: Variable/Borrow sites whose name matches the @-binder. Nested
+ * scopes (If, Match, While, For, Try, Inject, Lambda) are descended into so
+ * that uses inside them count toward the outer binding.
+ *
+ * Not tracked in this pass:
+ * - Function parameters with @T type (no sigil field on HirParam; needs the
+ *   type-annotation path, left to infer.nx after this lands).
+ * - Shadowing by a later `let x = ...` at the same level is stopped, but
+ *   branch-exclusive shadowing is not analyzed — a single reference in one
+ *   if-branch is counted, even when the other branch rebinds.
+ */
+
+import { Span } from "src/common/token.nx"
+import { HirProgram, HirFunction, HirBody, EagerBody, LazyBody, HirStmt, HirStmtKind, HirExpr, HirExprKind, HirCallArg, HirNamedExpr, HirMatchCase, HirHandlerBinding, HirHandlerBindingEntry } from "src/ir/hir_types.nx"
+import { LazyBindingUnused, LazyBindingDoubleUse } from "src/common/error.nx"
+
+// ─── Entry point ────────────────────────────────────────────────────────────
+
+export let check_program = fn (prog: HirProgram) -> unit throws { Exn } do
+  match prog do | HirProgram(ports: _, functions: fs, externals: _, handler_bindings: hbs, enum_defs: _) ->
+    check_functions(funcs: fs)
+    return check_handler_bindings(bindings: hbs)
+  end
+end
+
+let check_functions = fn (funcs: [HirFunction]) -> unit throws { Exn } do
+  match funcs do
+    | [] -> return ()
+    | f :: rest ->
+      check_function(func: f)
+      return check_functions(funcs: rest)
+  end
+end
+
+let check_handler_bindings = fn (bindings: [HirHandlerBindingEntry]) -> unit throws { Exn } do
+  match bindings do
+    | [] -> return ()
+    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, functions: fs)) :: rest ->
+      check_functions(funcs: fs)
+      return check_handler_bindings(bindings: rest)
+  end
+end
+
+let check_function = fn (func: HirFunction) -> unit throws { Exn } do
+  match func do | HirFunction(name: _, type_params: _, params: _, ret_type: _, body: b, span: _) ->
+    match b do
+      | EagerBody(stmts: stmts) -> return check_stmts(stmts: stmts)
+      | LazyBody(_) -> return ()
+    end
+  end
+end
+
+// ─── Linearity check per scope ─────────────────────────────────────────────
+
+let check_stmts = fn (stmts: [HirStmt]) -> unit throws { Exn } do
+  match stmts do
+    | [] -> return ()
+    | HirStmt(node: Let(name: n, typ: _, value: v), span: sp) :: rest ->
+      // Descend into the value first so nested @-bindings inside it are checked.
+      check_expr(expr: v)
+      let HirExpr(node: vnode, span: _) = v
+      match vnode do
+        | Thunk(_) ->
+          let ref_count = count_refs_stmts(target: n, stmts: rest)
+          if ref_count == 0 then raise LazyBindingUnused(name: n, span: sp) end
+          if ref_count >= 2 then raise LazyBindingDoubleUse(name: n, span: sp) end
+          return check_stmts(stmts: rest)
+        | _ ->
+          return check_stmts(stmts: rest)
+      end
+    | HirStmt(node: s, span: _) :: rest ->
+      check_stmt_kind(stmt: s)
+      return check_stmts(stmts: rest)
+  end
+end
+
+let check_stmt_kind = fn (stmt: HirStmtKind) -> unit throws { Exn } do
+  match stmt do
+    | Let(name: _, typ: _, value: v) -> return check_expr(expr: v)
+    | Expr(expr: e) -> return check_expr(expr: e)
+    | Return(expr: e) -> return check_expr(expr: e)
+    | Assign(target: t, value: v) ->
+      check_expr(expr: t)
+      return check_expr(expr: v)
+    | Try(body: b, catch_param: _, catch_body: cb) ->
+      check_stmts(stmts: b)
+      return check_stmts(stmts: cb)
+    | Inject(handlers: _, body: b) -> return check_stmts(stmts: b)
+  end
+end
+
+let check_expr = fn (expr: HirExpr) -> unit throws { Exn } do
+  let HirExpr(node: inner, span: _) = expr
+  return check_expr_kind(expr: inner)
+end
+
+let check_expr_kind = fn (expr: HirExprKind) -> unit throws { Exn } do
+  match expr do
+    | Literal(_) -> return ()
+    | Variable(_) -> return ()
+    | Borrow(_) -> return ()
+    | BinOp(left: l, op: _, right: r) ->
+      check_expr(expr: l)
+      return check_expr(expr: r)
+    | Call(func: _, args: args) -> return check_call_args(args: args)
+    | Ctor(variant: _, args: args) -> return check_exprs(exprs: args)
+    | Record(fields: fs) -> return check_named_exprs(exprs: fs)
+    | Array(elems: es) -> return check_exprs(exprs: es)
+    | Index(target: t, index: i) ->
+      check_expr(expr: t)
+      return check_expr(expr: i)
+    | FieldAccess(target: t, field: _) -> return check_expr(expr: t)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      check_expr(expr: c)
+      check_stmts(stmts: tb)
+      match eb do
+        | Some(val: stmts) -> return check_stmts(stmts: stmts)
+        | None -> return ()
+      end
+    | Match(target: t, cases: cs) ->
+      check_expr(expr: t)
+      return check_match_cases(cases: cs)
+    | While(cond: c, body: b) ->
+      check_expr(expr: c)
+      return check_stmts(stmts: b)
+    | For(var: _, start: s, end_expr: e, body: b) ->
+      check_expr(expr: s)
+      check_expr(expr: e)
+      return check_stmts(stmts: b)
+    | Lambda(type_params: _, params: _, ret_type: _, body: b) -> return check_stmts(stmts: b)
+    | Raise(expr: e) -> return check_expr(expr: e)
+    | Force(expr: e) -> return check_expr(expr: e)
+    | Thunk(body: b) -> return check_expr(expr: b)
+    | ExternalRef(_) -> return ()
+    | Handler(port_name: _, functions: fs) -> return check_functions(funcs: fs)
+  end
+end
+
+let check_exprs = fn (exprs: [HirExpr]) -> unit throws { Exn } do
+  match exprs do
+    | [] -> return ()
+    | e :: rest ->
+      check_expr(expr: e)
+      return check_exprs(exprs: rest)
+  end
+end
+
+let check_call_args = fn (args: [HirCallArg]) -> unit throws { Exn } do
+  match args do
+    | [] -> return ()
+    | HirCallArg(label: _, value: v) :: rest ->
+      check_expr(expr: v)
+      return check_call_args(args: rest)
+  end
+end
+
+let check_named_exprs = fn (exprs: [HirNamedExpr]) -> unit throws { Exn } do
+  match exprs do
+    | [] -> return ()
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      check_expr(expr: v)
+      return check_named_exprs(exprs: rest)
+  end
+end
+
+let check_match_cases = fn (cases: [HirMatchCase]) -> unit throws { Exn } do
+  match cases do
+    | [] -> return ()
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      check_stmts(stmts: b)
+      return check_match_cases(cases: rest)
+  end
+end
+
+// ─── Reference counting ─────────────────────────────────────────────────────
+
+let count_refs_stmts = fn (target: string, stmts: [HirStmt]) -> i64 do
+  return count_refs_stmts_go(target: target, stmts: stmts, acc: 0)
+end
+
+let count_refs_stmts_go = fn (target: string, stmts: [HirStmt], acc: i64) -> i64 do
+  match stmts do
+    | [] -> return acc
+    | HirStmt(node: Let(name: n, typ: _, value: v), span: _) :: rest ->
+      let in_value = count_refs_expr(target: target, expr: v)
+      if n == target then return acc + in_value end
+      return count_refs_stmts_go(target: target, stmts: rest, acc: acc + in_value)
+    | HirStmt(node: s, span: _) :: rest ->
+      let in_stmt = count_refs_stmt_kind(target: target, stmt: s)
+      return count_refs_stmts_go(target: target, stmts: rest, acc: acc + in_stmt)
+  end
+end
+
+let count_refs_stmt_kind = fn (target: string, stmt: HirStmtKind) -> i64 do
+  match stmt do
+    | Let(name: _, typ: _, value: v) -> return count_refs_expr(target: target, expr: v)
+    | Expr(expr: e) -> return count_refs_expr(target: target, expr: e)
+    | Return(expr: e) -> return count_refs_expr(target: target, expr: e)
+    | Assign(target: t, value: v) -> return count_refs_expr(target: target, expr: t) + count_refs_expr(target: target, expr: v)
+    | Try(body: b, catch_param: _, catch_body: cb) ->
+      return count_refs_stmts(target: target, stmts: b) + count_refs_stmts(target: target, stmts: cb)
+    | Inject(handlers: _, body: b) -> return count_refs_stmts(target: target, stmts: b)
+  end
+end
+
+let count_refs_expr = fn (target: string, expr: HirExpr) -> i64 do
+  let HirExpr(node: inner, span: _) = expr
+  return count_refs_expr_kind(target: target, expr: inner)
+end
+
+let count_refs_expr_kind = fn (target: string, expr: HirExprKind) -> i64 do
+  match expr do
+    | Literal(_) -> return 0
+    | Variable(name: n, sigil: _) -> if n == target then return 1 else return 0 end
+    | Borrow(name: n, sigil: _) -> if n == target then return 1 else return 0 end
+    | BinOp(left: l, op: _, right: r) -> return count_refs_expr(target: target, expr: l) + count_refs_expr(target: target, expr: r)
+    | Call(func: _, args: args) -> return count_refs_args(target: target, args: args)
+    | Ctor(variant: _, args: args) -> return count_refs_exprs(target: target, exprs: args)
+    | Record(fields: fs) -> return count_refs_named_exprs(target: target, exprs: fs)
+    | Array(elems: es) -> return count_refs_exprs(target: target, exprs: es)
+    | Index(target: t, index: i) -> return count_refs_expr(target: target, expr: t) + count_refs_expr(target: target, expr: i)
+    | FieldAccess(target: t, field: _) -> return count_refs_expr(target: target, expr: t)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      let base = count_refs_expr(target: target, expr: c) + count_refs_stmts(target: target, stmts: tb)
+      match eb do
+        | Some(val: stmts) -> return base + count_refs_stmts(target: target, stmts: stmts)
+        | None -> return base
+      end
+    | Match(target: t, cases: cs) -> return count_refs_expr(target: target, expr: t) + count_refs_cases(target: target, cases: cs)
+    | While(cond: c, body: b) -> return count_refs_expr(target: target, expr: c) + count_refs_stmts(target: target, stmts: b)
+    | For(var: _, start: s, end_expr: e, body: b) ->
+      return count_refs_expr(target: target, expr: s) + count_refs_expr(target: target, expr: e) + count_refs_stmts(target: target, stmts: b)
+    | Lambda(type_params: _, params: _, ret_type: _, body: b) -> return count_refs_stmts(target: target, stmts: b)
+    | Raise(expr: e) -> return count_refs_expr(target: target, expr: e)
+    | Force(expr: e) -> return count_refs_expr(target: target, expr: e)
+    | Thunk(body: b) -> return count_refs_expr(target: target, expr: b)
+    | ExternalRef(_) -> return 0
+    | Handler(_) -> return 0
+  end
+end
+
+let count_refs_args = fn (target: string, args: [HirCallArg]) -> i64 do
+  match args do
+    | [] -> return 0
+    | HirCallArg(label: _, value: v) :: rest -> return count_refs_expr(target: target, expr: v) + count_refs_args(target: target, args: rest)
+  end
+end
+
+let count_refs_exprs = fn (target: string, exprs: [HirExpr]) -> i64 do
+  match exprs do
+    | [] -> return 0
+    | e :: rest -> return count_refs_expr(target: target, expr: e) + count_refs_exprs(target: target, exprs: rest)
+  end
+end
+
+let count_refs_named_exprs = fn (target: string, exprs: [HirNamedExpr]) -> i64 do
+  match exprs do
+    | [] -> return 0
+    | HirNamedExpr(name: _, value: v) :: rest -> return count_refs_expr(target: target, expr: v) + count_refs_named_exprs(target: target, exprs: rest)
+  end
+end
+
+let count_refs_cases = fn (target: string, cases: [HirMatchCase]) -> i64 do
+  match cases do
+    | [] -> return 0
+    | HirMatchCase(pattern: _, body: b) :: rest -> return count_refs_stmts(target: target, stmts: b) + count_refs_cases(target: target, cases: rest)
+  end
+end
