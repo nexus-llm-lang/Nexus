@@ -132,7 +132,7 @@ Binary operators with standard precedence (multiplicative binds tighter than add
 |---|---|
 | `<<` `>>` | Bit shift (highest) |
 | `*` `/` `%` `*.` `/.` `&` | Multiplicative / modulo / bitwise AND |
-| `+` `-` `+.` `-.` `++` `::` `\|` `^` | Additive / string concat / cons / bitwise OR, XOR |
+| `+` `-` `+.` `-.` `++` `::` `^` | Additive / string concat / cons / bitwise XOR |
 | `==` `!=` `<` `>` `<=` `>=` | Integer / generic comparison |
 | `==.` `!=.` `<.` `>.` `<=.` `>=.` | Float comparison |
 | `&&` | Logical AND |
@@ -171,17 +171,17 @@ end
 
 ### Match Expression
 
-Match can be used in expression position. Each case body produces a value:
+Match can be used in expression position. Each arm body produces a value:
 
 ```nexus
 let code = match color do
-  case Red -> 1
-  case Green -> 2
-  case Blue -> 3
+  | Red -> 1
+  | Green -> 2
+  | Blue -> 3
 end
 ```
 
-All case bodies must produce the same type. Cases with `return` statements diverge and do not contribute to the unified type.
+All arm bodies must produce the same type. Arms with `return` statements diverge and do not contribute to the unified type.
 
 ### Record and Constructor Expressions
 
@@ -242,7 +242,7 @@ let { x: x, y: y } = point
 let Ok(val: v) = result
 ```
 
-Destructures a value directly in a `let` binding. Desugared to a single-case `match` during compilation.
+Destructures a value directly in a `let` binding. Desugared to a single-arm `match` during compilation.
 
 ### Assignment
 
@@ -286,8 +286,8 @@ Desugars to a `match` with the given pattern and a wildcard fallback. The `else`
 
 ```nexus
 match result do
-  case Ok(val: v) -> process(v: v)
-  case Err(err: e) -> handle_error(e: e)
+  | Ok(val: v) -> process(v: v)
+  | Err(err: e) -> handle_error(e: e)
 end
 ```
 
@@ -333,8 +333,8 @@ try
   risky_operation()
 catch err ->
   match err do
-    case NotFound(msg: m) -> ()
-    case _ -> ()
+    | NotFound(msg: m) -> ()
+    | _ -> ()
   end
 end
 ```
@@ -347,9 +347,9 @@ Multi-arm catch with pattern matching:
 try
   risky_operation()
 catch
-  case NotFound(msg: m) -> handle_not_found(m: m)
-  case PermDenied(msg: m) -> handle_perm(m: m)
-  case IOError -> handle_generic_io()
+  | NotFound(msg: m) -> handle_not_found(m: m)
+  | PermDenied(msg: m) -> handle_perm(m: m)
+  | IOError -> handle_generic_io()
 end
 ```
 
@@ -379,6 +379,16 @@ Multiple handlers: `inject h1, h2 do ... end`.
 | Record (exact) | `{ x: p1, y: p2 }` | All fields must match |
 | Record (partial) | `{ x: p1, _ }` | `_` must be last; remaining fields ignored |
 | Wildcard | `_` | Matches anything, no binding |
+| Or | `Red \| Green`, `1 \| 2 \| 3` | Matches if any alternative matches; alternatives must bind the same variables with compatible types |
+
+Or-patterns are valid at the top of a match/catch arm:
+
+```nexus
+match color do
+  | Red | Green -> "warm"
+  | Blue -> "cool"
+end
+```
 
 ## Imports
 
@@ -516,11 +526,13 @@ if_stmt     ::= "if" expr "then" stmt* [ "else" stmt* ] "end"
 if_let_stmt ::= "if" "let" pattern "=" expr "then" stmt* [ "else" stmt* ] "end"
 
 match_stmt  ::= "match" expr "do" match_case* "end"
-match_case  ::= "case" pattern "->" stmt*
+match_case  ::= "|" or_pattern "->" stmt*
 
 try_stmt    ::= "try" stmt* "catch" IDENT "->" stmt* "end"
               | "try" stmt* "catch" catch_arm+ "end"
-catch_arm   ::= "case" pattern "->" stmt*
+catch_arm   ::= "|" or_pattern "->" stmt*
+
+or_pattern  ::= pattern ( "|" pattern )*
 inject_stmt ::= "inject" dotted_ident ( "," dotted_ident )* "do" stmt* "end"
 
 while_stmt  ::= "while" expr "do" stmt* "end"
@@ -550,7 +562,7 @@ postfix_expr     ::= postfix_expr "." IDENT        (* field access *)
 
 if_let_expr      ::= "if" "let" pattern "=" expr "then" expr [ "else" expr ] "end"
 match_expr       ::= "match" expr "do" match_case_expr* "end"
-match_case_expr  ::= "case" pattern "->" expr
+match_case_expr  ::= "|" or_pattern "->" expr
 
 atom_expr        ::= "(" expr ")"
                    | raise_expr

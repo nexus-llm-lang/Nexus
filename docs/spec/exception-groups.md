@@ -39,13 +39,13 @@ Catching a group name expands to match every member:
 try
   parse(tokens: tokens)
 catch
-  case ParseError ->
+  | ParseError ->
     // catches both UnexpectedToken and MissingMain
     Console.eprintln(val: "parse failed")
 end
 ```
 
-This is syntactic sugar -- the compiler expands `case ParseError ->` into one case per member.
+This is syntactic sugar -- the compiler expands `| ParseError ->` into one arm per member.
 
 ## Catching Specific Exceptions
 
@@ -55,11 +55,11 @@ For precise handling, match individual exception types and destructure their fie
 try
   compile(src: src)
 catch
-  case UnexpectedToken(expected: e, got: g, span: sp) ->
+  | UnexpectedToken(expected: e, got: g, span: sp) ->
     Console.eprintln(val: "expected " ++ e ++ ", got " ++ g)
-  case TypeMismatch(func_name: f, detail: d, span: sp) ->
+  | TypeMismatch(func_name: f, detail: d, span: sp) ->
     Console.eprintln(val: "in " ++ f ++ ": " ++ d)
-  case MissingMain ->
+  | MissingMain ->
     Console.eprintln(val: "no main function")
 end
 ```
@@ -78,9 +78,9 @@ try body catch e -> handle(e: e) end
 try
   body
 catch
-  case NotFound(msg: m) -> handle_missing(m: m)
-  case PermDenied(msg: m) -> handle_perm(m: m)
-  case IOError -> handle_generic()
+  | NotFound(msg: m) -> handle_missing(m: m)
+  | PermDenied(msg: m) -> handle_perm(m: m)
+  | IOError -> handle_generic()
 end
 ```
 

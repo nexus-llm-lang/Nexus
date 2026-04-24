@@ -46,8 +46,8 @@ let main = fn () -> unit do
     let _ = search(key: "missing")
   catch e ->
     match e do
-      case NotFound(msg: m) -> ()
-      case _ -> ()
+      | NotFound(msg: m) -> ()
+      | _ -> ()
     end
   end
   return ()
@@ -144,7 +144,7 @@ let safe_read = fn (path: string) -> string require { Fs } do
   try
     return Fs.read_to_string(path: path)
   catch
-    case IOError -> return ""
+    | IOError -> return ""
   end
 end
 ```

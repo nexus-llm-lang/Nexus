@@ -50,8 +50,8 @@ else
 end
 
 match opt do
-  case Some(val: v) -> return v
-  case None -> return 0
+  | Some(val: v) -> return v
+  | None -> return 0
 end
 
 while running do
@@ -68,10 +68,10 @@ end
 // With generics
 export let map = fn <T, U>(opt: Option<T>, f: (val: T) -> U) -> Option<U> do
   match opt do
-    case Some(val: v) ->
+    | Some(val: v) ->
       let mapped = f(val: v)
       return Some(val: mapped)
-    case None -> return None
+    | None -> return None
   end
 end
 ```
@@ -195,8 +195,8 @@ try
   let name = find_user(id: 42)
   Console.println(val: name)
 catch
-  case NotFound(msg: m) -> Console.println(val: m)
-  case _ -> Console.println(val: "Unknown error")
+  | NotFound(msg: m) -> Console.println(val: m)
+  | _ -> Console.println(val: "Unknown error")
 end
 ```
 
@@ -206,8 +206,8 @@ import * as list from "stdlib/list.nx"
 
 let sum = fn (xs: [ i64 ]) -> i64 do
   match xs do
-    case [] -> return 0
-    case v :: rest -> return v + sum(xs: rest)
+    | [] -> return 0
+    | v :: rest -> return v + sum(xs: rest)
   end
 end
 
@@ -233,7 +233,7 @@ let Some(val: v) = must_exist
 
 // AVOID — single-arm match adds noise
 match point do
-  case { x: x, y: y } -> ...
+  | { x: x, y: y } -> ...
 end
 ```
 
@@ -243,18 +243,36 @@ Fuse nested `match` arms into a single pattern. Use a trailing bare `_` to ignor
 ```nexus
 // PREFER — one arm, nested pattern, _ swallows the rest
 match res do
-  case Ok(val: Some(val: v)) -> use(x: v)
-  case _ -> fallback()
+  | Ok(val: Some(val: v)) -> use(x: v)
+  | _ -> fallback()
 end
 
 // AVOID — staircase of matches
 match res do
-  case Ok(val: inner) ->
+  | Ok(val: inner) ->
     match inner do
-      case Some(val: v) -> use(x: v)
-      case None -> fallback()
+      | Some(val: v) -> use(x: v)
+      | None -> fallback()
     end
-  case Err(err: _) -> fallback()
+  | Err(err: _) -> fallback()
+end
+```
+
+### 3. Or-patterns to share an arm body across alternatives
+When two arms run the same body, fuse them with `|` instead of duplicating. All alternatives must bind the same variable names with compatible types.
+
+```nexus
+// PREFER — one arm, two ctors share the body
+match sign do
+  | Pos | Neg -> 1
+  | Zero -> 0
+end
+
+// AVOID — duplicated body
+match sign do
+  | Pos -> 1
+  | Neg -> 1
+  | Zero -> 0
 end
 ```
 

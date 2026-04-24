@@ -101,7 +101,7 @@ The fd operations use a **consume-and-return** pattern: the linear handle is con
 let %h = Fs.open_read(path: "data.txt")
 let %r = Fs.read(handle: %h)
 match %r do
-  case { content: c, handle: %h2 } ->
+  | { content: c, handle: %h2 } ->
     Fs.close(handle: %h2)
 end
 ```

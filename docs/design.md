@@ -62,7 +62,7 @@ Garbage collectors and finalizers are contextual -- resources disappear "sometim
 let %h = Fs.open_read(path: path)   // acquire
 let %r = Fs.read(handle: %h)    // consume %h, get new handle back
 match %r do
-  case { content: c, handle: %h2 } ->
+  | { content: c, handle: %h2 } ->
     Fs.close(handle: %h2)     // release
 end
 ```
