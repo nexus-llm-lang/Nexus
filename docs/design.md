@@ -27,13 +27,13 @@ Most effect system research focuses on *algebraic effects* -- functions perform 
 
 Nexus rejects continuations entirely. Instead:
 
-- **Ports** define stateless interfaces (like traits or interfaces in other languages).
-- **Handlers** are ordinary values that implement a port's methods.
+- **Caps** define stateless interfaces (like traits or interfaces in other languages).
+- **Handlers** are ordinary values that implement a cap's methods.
 - **`inject`** supplies a handler to a lexical scope -- dependency injection, not algebraic effect handling.
-- **Port calls** are direct, statically resolved function calls. `Logger.info(msg: x)` calls a function. It returns. No implicit control transfer.
+- **Cap calls** are direct, statically resolved function calls. `Logger.info(msg: x)` calls a function. It returns. No implicit control transfer.
 
 ```nexus
-port Logger do
+cap Logger do
   fn info(msg: string) -> unit
 end
 

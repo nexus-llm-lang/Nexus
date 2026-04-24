@@ -34,7 +34,7 @@ Nexus deliberately rejects this model. Continuations are the quintessential *con
 Instead, Nexus uses **coeffects** -- the `require { ... }` clause declares what capabilities a function *needs from its environment*, not what it *does to* the environment:
 
 ```nexus
-port Logger do
+cap Logger do
   fn info(msg: string) -> unit
 end
 

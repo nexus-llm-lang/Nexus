@@ -12,7 +12,7 @@ const KEYWORDS: &[&str] = &[
     "match",
     "case",
     "task",
-    "port",
+    "cap",
     "type",
     "import",
     "from",
@@ -1180,55 +1180,7 @@ impl Parser {
             // `if c then A end` (no else) → Expr::If (statement, returns unit)
             TokenKind::If => {
                 self.advance();
-                // if let <pattern> = <expr> then ... [else ...] end
-                if matches!(self.peek(), TokenKind::Let) {
-                    self.advance();
-                    return self.parse_if_let_expr(start);
-                }
-                let cond = self.parse_expr()?;
-                self.expect_contextual("then")?;
-                let then_branch = self.parse_stmt_list()?;
-                let else_branch = if self.match_keyword(&TokenKind::Else) {
-                    Some(self.parse_stmt_list()?)
-                } else {
-                    None
-                };
-                self.expect(&TokenKind::End)?;
-                let end = self.tokens[self.pos - 1].span.end;
-                if let Some(eb) = else_branch {
-                    // Desugar to match bool — gets proper expression type inference
-                    Ok(Spanned {
-                        node: Expr::Match {
-                            target: Box::new(cond),
-                            cases: vec![
-                                MatchCase {
-                                    pattern: Spanned {
-                                        node: Pattern::Literal(Literal::Bool(true)),
-                                        span: start..end,
-                                    },
-                                    body: then_branch,
-                                },
-                                MatchCase {
-                                    pattern: Spanned {
-                                        node: Pattern::Literal(Literal::Bool(false)),
-                                        span: start..end,
-                                    },
-                                    body: eb,
-                                },
-                            ],
-                        },
-                        span: start..end,
-                    })
-                } else {
-                    Ok(Spanned {
-                        node: Expr::If {
-                            cond: Box::new(cond),
-                            then_branch,
-                            else_branch: None,
-                        },
-                        span: start..end,
-                    })
-                }
+                self.parse_if_body(start)
             }
 
             // Match expression: match expr do | pat -> body ... end
@@ -1636,19 +1588,20 @@ impl Parser {
     /// Parse `if let <pattern> = <expr> then <body> [else <body>] end`
     /// Desugars to `match <expr> do case <pattern> -> <then> case _ -> <else> end`
     /// Caller must have already consumed `if` and `let`.
+    /// When `else` is followed by `if`, the nested if consumes its own `end`,
+    /// so the outer form has a single trailing `end` (else-if chain sugar).
     fn parse_if_let_expr(&mut self, start: usize) -> Result<Spanned<Expr>, ParseError> {
         let pattern = self.parse_pattern()?;
         self.expect(&TokenKind::Eq)?;
         let target = self.parse_expr()?;
         self.expect_contextual("then")?;
         let then_branch = self.parse_stmt_list()?;
-        let else_branch = if self.match_keyword(&TokenKind::Else) {
-            self.parse_stmt_list()?
+        let (else_branch, end) = if self.match_keyword(&TokenKind::Else) {
+            self.parse_else_tail()?
         } else {
-            vec![]
+            self.expect(&TokenKind::End)?;
+            (vec![], self.tokens[self.pos - 1].span.end)
         };
-        self.expect(&TokenKind::End)?;
-        let end = self.tokens[self.pos - 1].span.end;
         Ok(Spanned {
             node: Expr::Match {
                 target: Box::new(target),
@@ -1670,31 +1623,25 @@ impl Parser {
         })
     }
 
-    fn parse_if_stmt(&mut self, start: usize) -> Result<Spanned<Stmt>, ParseError> {
-        self.advance(); // consume 'if'
-                        // if let <pattern> = <expr> then ... [else ...] end
+    /// Parse the body of an `if` after the `if` keyword has been consumed.
+    /// Dispatches to `if let`, or handles the plain `if cond then ... [else ...] end` form.
+    fn parse_if_body(&mut self, start: usize) -> Result<Spanned<Expr>, ParseError> {
         if matches!(self.peek(), TokenKind::Let) {
             self.advance();
-            let expr = self.parse_if_let_expr(start)?;
-            return Ok(Spanned {
-                span: expr.span.clone(),
-                node: Stmt::Expr(expr),
-            });
+            return self.parse_if_let_expr(start);
         }
         let cond = self.parse_expr()?;
         self.expect_contextual("then")?;
         let then_branch = self.parse_stmt_list()?;
-        let else_branch = if self.match_keyword(&TokenKind::Else) {
-            Some(self.parse_stmt_list()?)
+        let (else_branch, end) = if self.match_keyword(&TokenKind::Else) {
+            let (body, end) = self.parse_else_tail()?;
+            (Some(body), end)
         } else {
-            None
+            self.expect(&TokenKind::End)?;
+            (None, self.tokens[self.pos - 1].span.end)
         };
-        self.expect(&TokenKind::End)?;
-        let end = self.tokens[self.pos - 1].span.end;
-
-        // Desugar if-else to match on bool (same as expression form)
-        let expr = if let Some(eb) = else_branch {
-            Spanned {
+        if let Some(eb) = else_branch {
+            Ok(Spanned {
                 node: Expr::Match {
                     target: Box::new(cond),
                     cases: vec![
@@ -1715,20 +1662,49 @@ impl Parser {
                     ],
                 },
                 span: start..end,
-            }
+            })
         } else {
-            Spanned {
+            Ok(Spanned {
                 node: Expr::If {
                     cond: Box::new(cond),
                     then_branch,
                     else_branch: None,
                 },
                 span: start..end,
-            }
-        };
+            })
+        }
+    }
+
+    /// After `else` has been consumed, parse either the else-if chain
+    /// (inner `if` consumes its own `end`) or a normal stmt-list terminated by `end`.
+    fn parse_else_tail(&mut self) -> Result<(Vec<Spanned<Stmt>>, usize), ParseError> {
+        if matches!(self.peek(), TokenKind::If) {
+            let inner_start = self.peek_span().start;
+            self.advance();
+            let inner = self.parse_if_body(inner_start)?;
+            let end = inner.span.end;
+            let span = inner.span.clone();
+            Ok((
+                vec![Spanned {
+                    span,
+                    node: Stmt::Expr(inner),
+                }],
+                end,
+            ))
+        } else {
+            let body = self.parse_stmt_list()?;
+            self.expect(&TokenKind::End)?;
+            let end = self.tokens[self.pos - 1].span.end;
+            Ok((body, end))
+        }
+    }
+
+    fn parse_if_stmt(&mut self, start: usize) -> Result<Spanned<Stmt>, ParseError> {
+        self.advance(); // consume 'if'
+        let expr = self.parse_if_body(start)?;
         Ok(Spanned {
+            span: expr.span.clone(),
             node: Stmt::Expr(expr),
-            span: start..end,
         })
     }
 
@@ -1922,7 +1898,7 @@ impl Parser {
             TokenKind::Type => self.parse_type_def(false, false),
             TokenKind::Exception => self.parse_exception_def(false),
             TokenKind::Import => self.parse_import_def(),
-            TokenKind::Port => self.parse_port_def(false),
+            TokenKind::Cap => self.parse_cap_def(false),
             TokenKind::External => self.parse_external_def(false),
             TokenKind::Let => self.parse_global_let(false),
             _ => Err(ParseError {
@@ -1940,7 +1916,7 @@ impl Parser {
             }
             TokenKind::Type => self.parse_type_def(is_public, false),
             TokenKind::Exception => self.parse_exception_def(is_public),
-            TokenKind::Port => self.parse_port_def(is_public),
+            TokenKind::Cap => self.parse_cap_def(is_public),
             TokenKind::External => self.parse_external_def(is_public),
             TokenKind::Let => self.parse_global_let(is_public),
             _ => Err(ParseError {
@@ -2170,8 +2146,9 @@ impl Parser {
         }
     }
 
-    fn parse_port_def(&mut self, is_public: bool) -> Result<TopLevel, ParseError> {
-        self.expect(&TokenKind::Port)?;
+    /// Parse `cap Name do fn sig1 fn sig2 ... end`
+    fn parse_cap_def(&mut self, is_public: bool) -> Result<TopLevel, ParseError> {
+        self.expect(&TokenKind::Cap)?;
         let name = self.expect_ident()?;
         self.expect(&TokenKind::Do)?;
 
@@ -2196,7 +2173,7 @@ impl Parser {
 
         self.expect(&TokenKind::End)?;
 
-        Ok(TopLevel::Port(Port {
+        Ok(TopLevel::Cap(Cap {
             name,
             is_public,
             functions,

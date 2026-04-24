@@ -214,7 +214,7 @@ pub struct Import {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Port {
+pub struct Cap {
     pub name: String,
     pub is_public: bool,
     pub functions: Vec<FunctionSignature>,
@@ -244,7 +244,7 @@ pub enum TopLevel {
     Exception(ExceptionDef),
     ExceptionGroup(ExceptionGroupDef),
     Import(Import),
-    Port(Port),
+    Cap(Cap),
     Let(GlobalLet),
 }
 

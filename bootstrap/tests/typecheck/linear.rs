@@ -435,7 +435,7 @@ fn test_linear_deeply_nested_else_if_value_branches() {
             transform(r: %buf)
         else
             transform(r: %buf)
-        end end end end end end end end end end end
+        end
         let id_val = consume(r: %buf2)
         return id_val + 1
     end
@@ -487,7 +487,7 @@ fn test_linear_deeply_nested_else_if_all_return() {
             return consume(r: %buf)
         else
             return consume(r: %buf)
-        end end end end end end end end end end end
+        end
     end
 
     let main = fn () -> unit do
@@ -539,7 +539,7 @@ fn test_linear_deeply_nested_else_if_mixed_return_and_value() {
             return consume(r: %buf)
         else
             transform(r: %buf)
-        end end end end end end end end end end
+        end
         return consume(r: %buf)
     end
 

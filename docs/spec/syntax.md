@@ -400,10 +400,10 @@ import { add, sub }, * as math from "path/to/math.nx"  // named + namespace
 import external "path/to/lib.wasm"                     // Wasm module
 ```
 
-## Ports and Handlers
+## Caps and Handlers
 
 ```nexus
-export port Logger do
+export cap Logger do
   fn info(msg: string) -> unit
   fn warn(msg: string) -> unit
 end

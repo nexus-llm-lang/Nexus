@@ -62,12 +62,12 @@ export exception PermissionDenied(msg: string, code: i64)
 
 `raise` is an expression that immediately unwinds to the nearest `catch`. All I/O capabilities use the capability system, not throws.
 
-## Ports
+## Capabilities
 
-A `port` defines a capability interface -- a set of function signatures that must be provided by the environment:
+A `cap` defines a capability interface -- a set of function signatures that must be provided by the environment:
 
 ```nexus
-export port Logger do
+export cap Logger do
   fn info(msg: string) -> unit
   fn warn(msg: string) -> unit
 end
@@ -75,10 +75,10 @@ end
 
 When a function calls `Logger.info(...)`, it must have `Logger` in its `require` row.
 
-Port methods can themselves declare throws and capabilities:
+Cap methods can themselves declare throws and capabilities:
 
 ```nexus
-export port Fs do
+export cap Fs do
   fn open_read(path: string) -> %Handle throws { Exn }
   fn read(handle: %Handle) -> { content: string, handle: %Handle }
   fn close(handle: %Handle) -> unit
@@ -87,7 +87,7 @@ end
 
 ## Handlers
 
-A handler is a value that implements all methods of a port:
+A handler is a value that implements all methods of a cap:
 
 ```nexus
 let console_logger = handler Logger require { Console } do
@@ -110,8 +110,8 @@ end
 Handler `require { ... }` propagates: injecting `console_logger` adds `Console` to the caller's requirements.
 
 The type checker enforces:
-- Handler methods must match port signatures exactly
-- All port methods must be implemented (exhaustive)
+- Handler methods must match cap signatures exactly
+- All cap methods must be implemented (exhaustive)
 - Handler method bodies inherit the handler's `require` clause
 
 ## Inject

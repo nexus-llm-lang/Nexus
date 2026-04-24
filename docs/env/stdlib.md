@@ -11,16 +11,16 @@ Import stdlib modules from `stdlib/`:
 import { Console }, * as stdio from "stdlib/stdio.nx"
 ```
 
-## I/O Ports
+## I/O Caps
 
-I/O is capability-gated via ports. Each port has a `system_handler` that declares `require { PermX }`, propagating the permission to the caller when injected. Mock handlers without `require` need no runtime permissions.
+I/O is capability-gated via caps. Each cap has a `system_handler` that declares `require { PermX }`, propagating the permission to the caller when injected. Mock handlers without `require` need no runtime permissions.
 
 ### Console (`stdio.nx`)
 
 Requires `PermConsole`. CLI flag: `--allow-console`.
 
 ```nexus
-port Console do
+cap Console do
   fn print(val: string) -> unit
   fn println(val: string) -> unit
   fn eprint(val: string) -> unit
@@ -72,7 +72,7 @@ fn close(handle: %Handle) -> unit require { PermFs }
 **Port methods** (for DI / testing):
 
 ```nexus
-port Fs do
+cap Fs do
   // Query
   fn exists(path: string) -> bool
   fn read_to_string(path: string) -> string throws { Exn }
@@ -139,7 +139,7 @@ fn stop(server: %Server) -> unit require { PermNet }
 **Port methods** (for DI / testing):
 
 ```nexus
-port Net do
+cap Net do
   // HTTP client (all raise on failure)
   fn get(url: string) -> string throws { Exn }
   fn request(method: string, url: string, headers: [ Header ], body: string) -> Response throws { Exn }
@@ -170,7 +170,7 @@ fn request_body(req: &Request) -> string
 Requires `PermRandom`. CLI flag: `--allow-random`.
 
 ```nexus
-port Random do
+cap Random do
   fn next_i64() -> i64
   fn range(min: i64, max: i64) -> i64
   fn next_bool() -> bool
@@ -182,7 +182,7 @@ end
 Requires `PermClock`. CLI flag: `--allow-clock`.
 
 ```nexus
-port Clock do
+cap Clock do
   fn sleep(ms: i64) -> unit
   fn now() -> i64
 end
@@ -207,7 +207,7 @@ fn argv() -> [ string ] require { PermProc }
 **Port methods:**
 
 ```nexus
-port Proc do
+cap Proc do
   fn exit(status: i64) -> unit
   fn argv() -> [ string ]
   fn exec(cmd: string, args: [ string ]) -> ExecResult
@@ -219,7 +219,7 @@ end
 Requires `PermEnv`. CLI flag: `--allow-env`.
 
 ```nexus
-port Env do
+cap Env do
   fn get(key: string) -> Option<string>
   fn set(key: string, value: string) -> unit
 end

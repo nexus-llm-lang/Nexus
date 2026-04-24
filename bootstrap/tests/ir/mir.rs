@@ -52,7 +52,7 @@ fn snapshot_mir_match_statement() {
 #[test]
 fn snapshot_mir_port_handler_inject() {
     let src = r#"
-    port Logger do fn log(msg: string) -> unit end
+    cap Logger do fn log(msg: string) -> unit end
     let my_handler = handler Logger do
         fn log(msg: string) -> unit do return () end
     end
