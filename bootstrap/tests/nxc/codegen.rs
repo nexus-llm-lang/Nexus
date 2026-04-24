@@ -155,6 +155,11 @@ fn lazy_thunk_syntax() {
 }
 
 #[test]
+fn lazy_stdlib_combinators() {
+    exec_with_stdlib(&read_fixture("nxc/test_lazy_stdlib.nx"));
+}
+
+#[test]
 fn exception_group_catch() {
     exec_with_stdlib(&read_fixture("nxc/test_exception_group.nx"));
 }
