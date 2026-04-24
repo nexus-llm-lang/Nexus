@@ -1,5 +1,6 @@
 /// Property-based tests derived from the formal typing rules in
-/// docs/spec/type-system-formal.md.
+/// https://nexus-llm-lang.github.io/latest/spec/type-system-formal/
+/// (source: nexus-llm-lang/nexus-llm-lang.github.io).
 ///
 /// Each proptest block corresponds to a section of the formal spec and tests
 /// the key properties (conjectures P1-P8) empirically.

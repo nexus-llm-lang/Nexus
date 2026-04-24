@@ -1,7 +1,7 @@
 # Nexus
 
 <center>
-  <img src="docs/assets/img/logo/default.png" alt="Nexus Logo" width="80%"/>
+  <img src="https://raw.githubusercontent.com/nexus-llm-lang/nexus-llm-lang.github.io/main/assets/img/logo/default.png" alt="Nexus Logo" width="80%"/>
 </center>
 
 
@@ -165,18 +165,20 @@ Once installed, Claude Code automatically activates the skill when writing or re
 
 ## Documentation
 
+Rendered site: **https://nexus-llm-lang.github.io/** (source: [`nexus-llm-lang/nexus-llm-lang.github.io`](https://github.com/nexus-llm-lang/nexus-llm-lang.github.io))
+
 | Document | Description |
 |---|---|
-| [Design](docs/design.md) | Design thesis: literal vs contextual |
-| [Syntax](docs/spec/syntax.md) | Grammar and EBNF |
-| [Types](docs/spec/types.md) | Type system, linear types, borrowing |
-| [Effects](docs/spec/effects.md) | Coeffect system, ports, handlers |
-| [Semantics](docs/spec/semantics.md) | Evaluation model, entrypoint |
-| [CLI](docs/env/cli.md) | Command-line interface |
-| [WASM](docs/env/wasm.md) | WASM compilation and WASI capabilities |
-| [FFI](docs/env/ffi.md) | Wasm interop |
-| [Stdlib](docs/env/stdlib.md) | Standard library |
-| [Tools](docs/env/tools.md) | LSP server, CLI diagnostics, AI coding agent skill |
+| [Design](https://nexus-llm-lang.github.io/latest/design/) | Design thesis: literal vs contextual |
+| [Syntax](https://nexus-llm-lang.github.io/latest/spec/syntax/) | Grammar and EBNF |
+| [Types](https://nexus-llm-lang.github.io/latest/spec/types/) | Type system, linear types, borrowing |
+| [Effects](https://nexus-llm-lang.github.io/latest/spec/effects/) | Coeffect system, ports, handlers |
+| [Semantics](https://nexus-llm-lang.github.io/latest/spec/semantics/) | Evaluation model, entrypoint |
+| [CLI](https://nexus-llm-lang.github.io/latest/env/cli/) | Command-line interface |
+| [WASM](https://nexus-llm-lang.github.io/latest/env/wasm/) | WASM compilation and WASI capabilities |
+| [FFI](https://nexus-llm-lang.github.io/latest/env/ffi/) | Wasm interop |
+| [Stdlib](https://nexus-llm-lang.github.io/latest/env/stdlib/) | Standard library |
+| [Tools](https://nexus-llm-lang.github.io/latest/env/tools/) | LSP server, CLI diagnostics, AI coding agent skill |
 
 ## License
 

@@ -3,10 +3,6 @@
     nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/*";
     flake-utils.url = "github:numtide/flake-utils";
 
-    gitignore = {
-      url = "github:hercules-ci/gitignore.nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -19,7 +15,6 @@
       nixpkgs,
       flake-utils,
       rust-overlay,
-      gitignore,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -58,16 +53,6 @@
               pkgs.nil
               formatter
             ];
-        };
-
-        devShells.docs = pkgs.mkShellNoCC {
-          packages = with pkgs.rubyPackages; [
-            pkgs.ruby
-            jekyll
-            jekyll-theme-slate
-            jekyll-seo-tag
-            kramdown-parser-gfm
-          ];
         };
       in
       {
