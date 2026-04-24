@@ -1,3 +1,3 @@
 # Nexus Standard Library Reference
 
-See https://nymphium.github.io/Nexus/latest/env/stdlib
+See https://nexus-llm-lang.github.io/Nexus/latest/env/stdlib
