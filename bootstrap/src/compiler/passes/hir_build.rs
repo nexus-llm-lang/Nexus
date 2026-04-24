@@ -655,7 +655,7 @@ impl MirBuilder {
                                 });
                             }
                         }
-                        Expr::External(wasm_name, _type_params, typ) => {
+                        Expr::External(wasm_name, type_params, typ) => {
                             if let Type::Arrow(params, ret, _requires, throws) = typ {
                                 let resolved_mod = current_wasm_module.clone().or_else(|| {
                                     self.externals
@@ -672,6 +672,8 @@ impl MirBuilder {
                                     } else {
                                         wasm_name.to_string()
                                     };
+                                    let vars_set: std::collections::HashSet<String> =
+                                        type_params.iter().cloned().collect();
                                     self.externals.push(MirExternal {
                                         name: name_sym,
                                         wasm_module: Symbol::from(wasm_mod.as_str()),
@@ -681,10 +683,10 @@ impl MirBuilder {
                                             .map(|(n, t)| MirParam {
                                                 name: Symbol::from(n.as_str()),
                                                 label: Symbol::from(n.as_str()),
-                                                typ: t.clone(),
+                                                typ: crate::lang::typecheck::convert_generic_user_defined_to_var(t, &vars_set),
                                             })
                                             .collect(),
-                                        ret_type: *ret.clone(),
+                                        ret_type: crate::lang::typecheck::convert_generic_user_defined_to_var(ret, &vars_set),
                                         throws: *throws.clone(),
                                     });
                                 }

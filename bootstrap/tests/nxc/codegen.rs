@@ -160,6 +160,11 @@ fn lazy_stdlib_combinators() {
 }
 
 #[test]
+fn lazy_host_force() {
+    exec_with_stdlib(&read_fixture("nxc/test_lazy_host_force.nx"));
+}
+
+#[test]
 fn exception_group_catch() {
     exec_with_stdlib(&read_fixture("nxc/test_exception_group.nx"));
 }

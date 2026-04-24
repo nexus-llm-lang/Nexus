@@ -6,7 +6,7 @@ mod lint;
 mod unify;
 
 pub use env::{Scheme, TypeEnv, TypeError, TypeWarning};
-pub use helpers::{exn_enum_def, list_enum_def};
+pub use helpers::{convert_generic_user_defined_to_var, exn_enum_def, list_enum_def};
 pub use unify::apply_subst_type;
 
 use capture::{collect_lambda_captures, lambda_references_name};
