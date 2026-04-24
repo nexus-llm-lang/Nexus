@@ -166,9 +166,11 @@ fn lazy_host_force() {
 
 #[test]
 fn lazy_runtime_raw() {
-    // Exercises the Rust runtime's __nx_lazy_spawn directly on nxc-compiled
-    // core WASM (no stdlib / component composition). Validates invoke_thunk
-    // against real thunks the compiler produced.
+    // Exercises __nx_lazy_spawn + __nx_lazy_join end-to-end on nxc-compiled
+    // core WASM (no stdlib / component composition). The fixture self-asserts
+    // by trapping (i64.div_s by zero) when the forced value differs from 42 —
+    // prevents a regression where spawn's encoded task_id leaks back as the
+    // "value".
     exec(&read_fixture("nxc/test_lazy_runtime_raw.nx"));
 }
 
