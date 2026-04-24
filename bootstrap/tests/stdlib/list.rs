@@ -235,6 +235,79 @@ end
 }
 
 #[test]
+fn concat_tail_recursive_deep() {
+    exec(
+        r#"
+import * as list from "stdlib/list.nx"
+
+let make_list = fn (n: i64, acc: [ i64 ]) -> [ i64 ] do
+  if n == 0 then return acc end
+  return make_list(n: n - 1, acc: n :: acc)
+end
+
+let main = fn () -> unit do
+    // concat must be tail-safe: 50k prefix ++ 3-element suffix should not overflow.
+    let xs = make_list(n: 50000, acc: [])
+    let ys = make_list(n: 3, acc: [])
+    let zs = list.concat(xs: xs, ys: ys)
+    // Head of result should be 1 (preserved order).
+    match zs do
+        | Cons(v: h, rest: _) ->
+            if h != 1 then raise RuntimeError(val: "expected 1 at head of concat") end
+            return ()
+        | Nil -> raise RuntimeError(val: "expected non-empty concat result")
+    end
+end
+"#,
+    );
+}
+
+#[test]
+fn length_tail_recursive_deep() {
+    exec(
+        r#"
+import * as list from "stdlib/list.nx"
+
+let make_list = fn (n: i64, acc: [ i64 ]) -> [ i64 ] do
+  if n == 0 then return acc end
+  return make_list(n: n - 1, acc: n :: acc)
+end
+
+let main = fn () -> unit do
+    // length must be tail-safe at 50k elements.
+    let xs = make_list(n: 50000, acc: [])
+    let n = list.length(xs: xs)
+    if n != 50000 then raise RuntimeError(val: "expected length 50000") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn take_tail_recursive_deep() {
+    exec(
+        r#"
+import * as list from "stdlib/list.nx"
+
+let make_list = fn (n: i64, acc: [ i64 ]) -> [ i64 ] do
+  if n == 0 then return acc end
+  return make_list(n: n - 1, acc: n :: acc)
+end
+
+let main = fn () -> unit do
+    // take must be tail-safe: taking 50k elements from a 60k list.
+    let xs = make_list(n: 60000, acc: [])
+    let ys = list.take(xs: xs, n: 50000)
+    let n = list.length(xs: ys)
+    if n != 50000 then raise RuntimeError(val: "expected length 50000 after take") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
 fn deforestation_reverse_reverse_identity() {
     exec(
         r#"
