@@ -40,16 +40,6 @@
           pkgs.rust-bin.stable.latest.rust-analyzer
         ];
 
-        tsNexus = pkgs.tree-sitter.buildGrammar {
-          language = "nexus";
-          version = "0.1.0";
-          src = ./tree-sitter;
-        };
-
-        tsDeps = with pkgs; [
-          nodejs
-          tree-sitter
-        ];
         runtimeDeps = with pkgs; [
           wasmtime
           wabt
@@ -59,10 +49,8 @@
         formatter = pkgs.nixfmt-tree;
 
         devShells.default = pkgs.mkShellNoCC {
-          inputsFrom = [ tsNexus ];
           packages =
             rustPackages
-            ++ tsDeps
             ++ runtimeDeps
             ++ [
               pkgs.wasm-tools
@@ -73,21 +61,16 @@
         };
 
         devShells.docs = pkgs.mkShellNoCC {
-          inputsFrom = [ tsNexus ];
-          packages =
-            with pkgs.rubyPackages;
-            [
-              pkgs.ruby
-              jekyll
-              jekyll-theme-slate
-              jekyll-seo-tag
-              kramdown-parser-gfm
-            ]
-            ++ tsDeps;
+          packages = with pkgs.rubyPackages; [
+            pkgs.ruby
+            jekyll
+            jekyll-theme-slate
+            jekyll-seo-tag
+            kramdown-parser-gfm
+          ];
         };
       in
       {
-        packages.tree-sitter = tsNexus;
         legacyPackages = pkgs;
         inherit formatter devShells;
       }
