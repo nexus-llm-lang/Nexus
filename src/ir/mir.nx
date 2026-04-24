@@ -16,6 +16,8 @@
  *   handler-port name inference (see src/ir/mir/port.nx)
  * - Generic reverse helpers (see src/common/mono_reverse.nx)
  */
+import { MirPortHandlerNotFound } from "src/common/error.nx"
+import { None } from "stdlib/option.nx"
 import * as naming from "src/common/naming.nx"
 import * as str from "stdlib/string_ops.nx"
 import * as list from "stdlib/list.nx"
@@ -27,7 +29,7 @@ import { build_port_layouts, lookup_port, infer_handler_port_names, find_handler
 
 // ─── Lookup helpers (list-based maps) ────────────────────────────────────────
 
-let lookup = fn (key: string, pairs: [NamePair]) -> Option<string> do
+let lookup = fn (key: string, pairs: [NamePair]) -> Option<string> throws { Exn } do
   match pairs do
     | [] -> return None
     | NamePair(key: k, value: v) :: rest ->
@@ -37,15 +39,24 @@ let lookup = fn (key: string, pairs: [NamePair]) -> Option<string> do
   end
 end
 
-let insert_or_replace = fn (key: string, value: string, pairs: [NamePair]) -> [NamePair] do
+let insert_or_replace = fn (key: string, value: string, pairs: [NamePair]) -> [NamePair] throws { Exn } do
   return NamePair(key: key, value: value) :: remove_key(key: key, pairs: pairs)
 end
 
-let remove_key = fn (key: string, pairs: [NamePair]) -> [NamePair] do
+/// Insert (key, value) only if `key` is not already present — user bindings
+/// take precedence over compiler-intrinsic defaults.
+let insert_if_absent = fn (key: string, value: string, pairs: [NamePair]) -> [NamePair] throws { Exn } do
+  match lookup(key: key, pairs: pairs) do
+    | Some(_) -> return pairs
+    | None -> return NamePair(key: key, value: value) :: pairs
+  end
+end
+
+let remove_key = fn (key: string, pairs: [NamePair]) -> [NamePair] throws { Exn } do
   return remove_key_go(key: key, pairs: pairs, acc: [])
 end
 
-let remove_key_go = fn (key: string, pairs: [NamePair], acc: [NamePair]) -> [NamePair] do
+let remove_key_go = fn (key: string, pairs: [NamePair], acc: [NamePair]) -> [NamePair] throws { Exn } do
   match pairs do
     | [] -> return rev_name_pairs(lst: acc, out: [])
     | NamePair(key: k, value: val) :: rest ->
@@ -59,11 +70,11 @@ end
 // ─── Handler Mapping ────────────────────────────────────────────────────────
 
 /// Build handler_binding_name → port_name mapping.
-let build_handler_port_names = fn (bindings: [HirHandlerBindingEntry]) -> [NamePair] do
+let build_handler_port_names = fn (bindings: [HirHandlerBindingEntry]) -> [NamePair] throws { Exn } do
   return build_handler_port_names_go(bindings: bindings, acc: [])
 end
 
-let build_handler_port_names_go = fn (bindings: [HirHandlerBindingEntry], acc: [NamePair]) -> [NamePair] do
+let build_handler_port_names_go = fn (bindings: [HirHandlerBindingEntry], acc: [NamePair]) -> [NamePair] throws { Exn } do
   match bindings do
     | [] -> return rev_name_pairs(lst: acc, out: [])
     | HirHandlerBindingEntry(name: bname, binding: HirHandlerBinding(port_name: pname, functions: _)) :: rest ->
@@ -72,11 +83,11 @@ let build_handler_port_names_go = fn (bindings: [HirHandlerBindingEntry], acc: [
 end
 
 /// Build global port_name → handler_binding_name mapping (last handler wins).
-let build_global_port_handlers = fn (handler_port_names: [NamePair]) -> [NamePair] do
+let build_global_port_handlers = fn (handler_port_names: [NamePair]) -> [NamePair] throws { Exn } do
   return build_global_go(pairs: handler_port_names, accum: [])
 end
 
-let build_global_go = fn (pairs: [NamePair], accum: [NamePair]) -> [NamePair] do
+let build_global_go = fn (pairs: [NamePair], accum: [NamePair]) -> [NamePair] throws { Exn } do
   match pairs do
     | [] -> return accum
     | NamePair(key: binding_name, value: port_name) :: rest ->
@@ -88,7 +99,7 @@ end
 
 // ─── Lower HIR → MIR ───────────────────────────────────────────────────────
 
-export let lower_hir_to_mir = fn (hir: HirProgram) -> MirProgram do
+export let lower_hir_to_mir = fn (hir: HirProgram) -> MirProgram throws { Exn } do
   let HirProgram(ports: ports, functions: funcs, externals: exts, handler_bindings: hbs, enum_defs: _) = hir
   let port_layouts = build_port_layouts(ports: ports)
   let handler_port_names = build_handler_port_names(bindings: hbs)
@@ -100,10 +111,15 @@ export let lower_hir_to_mir = fn (hir: HirProgram) -> MirProgram do
     | _ -> append_name_pairs(a: handler_port_names, b: inferred)
   end
   let global_scope_base = build_global_port_handlers(handler_port_names: effective_hpn)
-  // Always add known port→handler mappings as fallback
-  let global_scope = insert_or_replace(key: "Console", value: "stdio.system_handler",
-    pairs: insert_or_replace(key: "Fs", value: "fs_mod.system_handler",
-    pairs: insert_or_replace(key: "Clock", value: "clock_mod.system_handler",
+  // Add Console/Fs/Clock → system_handler ONLY if the user hasn't already
+  // bound them. Previously used insert_or_replace, which overrode user
+  // bindings silently — see nexus-9lp4.29. insert_if_absent preserves any
+  // user-supplied handler for these standard ports while still providing the
+  // implicit default so code like `Console.println("hi")` works without an
+  // explicit `inject stdio.system_handler do ... end`.
+  let global_scope = insert_if_absent(key: "Console", value: "stdio.system_handler",
+    pairs: insert_if_absent(key: "Fs", value: "fs_mod.system_handler",
+    pairs: insert_if_absent(key: "Clock", value: "clock_mod.system_handler",
     pairs: global_scope_base)))
 
   let ctx = MirCtx(
@@ -134,11 +150,11 @@ end
 
 // ─── Lower Externals ────────────────────────────────────────────────────────
 
-let lower_externals = fn (exts: [HirExternal]) -> [MirExternal] do
+let lower_externals = fn (exts: [HirExternal]) -> [MirExternal] throws { Exn } do
   return lower_externals_go(exts: exts, acc: [])
 end
 
-let lower_externals_go = fn (exts: [HirExternal], acc: [MirExternal]) -> [MirExternal] do
+let lower_externals_go = fn (exts: [HirExternal], acc: [MirExternal]) -> [MirExternal] throws { Exn } do
   match exts do
     | [] -> return rev_mir_externals(lst: acc, out: [])
     | HirExternal(name: n, wasm_module: wm, wasm_name: wn, params: ps, ret_type: rt, throw_row: tr) :: rest ->
@@ -148,11 +164,11 @@ let lower_externals_go = fn (exts: [HirExternal], acc: [MirExternal]) -> [MirExt
   end
 end
 
-let lower_hir_params = fn (params: [HirParam]) -> [MirParam] do
+let lower_hir_params = fn (params: [HirParam]) -> [MirParam] throws { Exn } do
   return lower_hir_params_go(params: params, acc: [])
 end
 
-let lower_hir_params_go = fn (params: [HirParam], acc: [MirParam]) -> [MirParam] do
+let lower_hir_params_go = fn (params: [HirParam], acc: [MirParam]) -> [MirParam] throws { Exn } do
   match params do
     | [] -> return rev_mir_params(lst: acc, out: [])
     | HirParam(name: n, label: l, typ: t) :: rest ->
@@ -162,11 +178,11 @@ end
 
 // ─── Lower Functions ────────────────────────────────────────────────────────
 
-let lower_functions = fn (functions: [HirFunction], ctx: MirCtx) -> LowerFunctionsResult do
+let lower_functions = fn (functions: [HirFunction], ctx: MirCtx) -> LowerFunctionsResult throws { Exn } do
   return lower_functions_go(functions: functions, ctx: ctx, acc: [])
 end
 
-let lower_functions_go = fn (functions: [HirFunction], ctx: MirCtx, acc: [MirFunction]) -> LowerFunctionsResult do
+let lower_functions_go = fn (functions: [HirFunction], ctx: MirCtx, acc: [MirFunction]) -> LowerFunctionsResult throws { Exn } do
   match functions do
     | [] -> return LowerFunctionsResult(ctx: ctx, funcs: rev_mir_funcs(lst: acc, out: []))
     | f :: rest ->
@@ -176,11 +192,11 @@ let lower_functions_go = fn (functions: [HirFunction], ctx: MirCtx, acc: [MirFun
   end
 end
 
-let lower_handler_functions = fn (bindings: [HirHandlerBindingEntry], ctx: MirCtx) -> LowerFunctionsResult do
+let lower_handler_functions = fn (bindings: [HirHandlerBindingEntry], ctx: MirCtx) -> LowerFunctionsResult throws { Exn } do
   return lower_handler_functions_go(bindings: bindings, ctx: ctx, acc: [])
 end
 
-let lower_handler_functions_go = fn (bindings: [HirHandlerBindingEntry], ctx: MirCtx, acc: [MirFunction]) -> LowerFunctionsResult do
+let lower_handler_functions_go = fn (bindings: [HirHandlerBindingEntry], ctx: MirCtx, acc: [MirFunction]) -> LowerFunctionsResult throws { Exn } do
   match bindings do
     | [] -> return LowerFunctionsResult(ctx: ctx, funcs: rev_mir_funcs(lst: acc, out: []))
     | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, functions: fs)) :: rest ->
@@ -193,14 +209,14 @@ end
 
 /// Push each element of `src` (in order) onto `dst`, reversing it. The outer
 /// caller's final rev_mir_funcs restores original order.
-let prepend_reversed = fn (src: [MirFunction], dst: [MirFunction]) -> [MirFunction] do
+let prepend_reversed = fn (src: [MirFunction], dst: [MirFunction]) -> [MirFunction] throws { Exn } do
   match src do
     | [] -> return dst
     | x :: rest -> return prepend_reversed(src: rest, dst: x :: dst)
   end
 end
 
-let lower_function = fn (func: HirFunction, ctx: MirCtx) -> LowerFunctionResult do
+let lower_function = fn (func: HirFunction, ctx: MirCtx) -> LowerFunctionResult throws { Exn } do
   let HirFunction(name: n, type_params: _, params: ps, ret_type: rt, body: hir_body, span: sp) = func
   let body = match hir_body do | EagerBody(stmts: s) -> s | LazyBody(_) -> [] end
   let mir_params = lower_hir_params(params: ps)
@@ -211,11 +227,11 @@ end
 
 // ─── Lower Statements ───────────────────────────────────────────────────────
 
-let lower_stmts = fn (stmts: [HirStmt], ctx: MirCtx) -> MirStmtsResult do
+let lower_stmts = fn (stmts: [HirStmt], ctx: MirCtx) -> MirStmtsResult throws { Exn } do
   return lower_stmts_go(stmts: stmts, ctx: ctx, acc: [])
 end
 
-let lower_stmts_go = fn (stmts: [HirStmt], ctx: MirCtx, acc: [MirStmt]) -> MirStmtsResult do
+let lower_stmts_go = fn (stmts: [HirStmt], ctx: MirCtx, acc: [MirStmt]) -> MirStmtsResult throws { Exn } do
   match stmts do
     | [] -> return MirStmtsResult(ctx: ctx, stmts: rev_mir_stmts(lst: acc, out: []))
     | HirStmt(node: s, span: _) :: rest ->
@@ -226,7 +242,7 @@ let lower_stmts_go = fn (stmts: [HirStmt], ctx: MirCtx, acc: [MirStmt]) -> MirSt
   end
 end
 
-let prepend_stmts_reversed = fn (src: [MirStmt], dst: [MirStmt]) -> [MirStmt] do
+let prepend_stmts_reversed = fn (src: [MirStmt], dst: [MirStmt]) -> [MirStmt] throws { Exn } do
   match src do
     | [] -> return dst
     | x :: rest -> return prepend_stmts_reversed(src: rest, dst: x :: dst)
@@ -235,9 +251,17 @@ end
 
 /// Lower a statement. Inject/for desugar may produce multiple MIR stmts;
 /// the ctx also carries forward any `__closure_*` lifts from lambdas inside.
-let lower_stmt = fn (stmt: HirStmtKind, ctx: MirCtx) -> MirStmtsResult do
+let lower_stmt = fn (stmt: HirStmtKind, ctx: MirCtx) -> MirStmtsResult throws { Exn } do
   match stmt do
     | Let(name: n, typ: t, value: v) ->
+      // HIR Let.typ is None when the user omits the annotation and typecheck
+      // has not back-patched it — the HIR is not rewritten after typecheck.
+      // LIR lowering recovers the real type via atom_type / semantic_vars
+      // tables (see src/ir/lir/context.nx), so the TyUnit placeholder here
+      // is only observed by passes that walk MirStmtLet without consulting
+      // the atom table (e.g. dump utilities). Pipe work that depends on
+      // accurate MIR types is blocked on propagating typecheck's subst into
+      // HIR; tracked as nexus-9lp4.19.
       let mir_typ = match t do
         | Some(val: te) -> te
         | None -> TyUnit
@@ -292,7 +316,7 @@ let lower_stmt = fn (stmt: HirStmtKind, ctx: MirCtx) -> MirStmtsResult do
   end
 end
 
-let activate_handlers = fn (handler_names: [string], handler_port_names: [NamePair], scope: [NamePair]) -> [NamePair] do
+let activate_handlers = fn (handler_names: [string], handler_port_names: [NamePair], scope: [NamePair]) -> [NamePair] throws { Exn } do
   match handler_names do
     | [] -> return scope
     | hname :: rest ->
@@ -307,7 +331,7 @@ end
 
 // ─── For-loop Desugaring ────────────────────────────────────────────────────
 
-let desugar_for = fn (var: string, start_expr: HirExpr, end_expr: HirExpr, body: [HirStmt], ctx: MirCtx) -> MirStmtsResult do
+let desugar_for = fn (var: string, start_expr: HirExpr, end_expr: HirExpr, body: [HirStmt], ctx: MirCtx) -> MirStmtsResult throws { Exn } do
   let end_name = "__for_end_" ++ var
   match lower_expr(expr: start_expr, ctx: ctx) do | MirExprResult(ctx: ctx1, expr: mir_start) ->
     match lower_expr(expr: end_expr, ctx: ctx1) do | MirExprResult(ctx: ctx2, expr: mir_end) ->
@@ -333,7 +357,7 @@ end
 
 // ─── Lower Expressions ─────────────────────────────────────────────────────
 
-let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExprResult do
+let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExprResult throws { Exn } do
   let HirExpr(node: node, span: _) = expr
   match node do
     | Literal(lit: l) -> return MirExprResult(ctx: ctx, expr: MirLiteral(lit: l))
@@ -443,7 +467,7 @@ end
 
 // ─── Port Call Resolution ───────────────────────────────────────────────────
 
-let lower_port_call = fn (port_name: string, method_name: string, args: [HirCallArg], ctx: MirCtx) -> MirExprResult do
+let lower_port_call = fn (port_name: string, method_name: string, args: [HirCallArg], ctx: MirCtx) -> MirExprResult throws { Exn } do
   let MirCtx(scope: scope, port_layouts: _, handler_port_names: hpn, all_funcs: _, all_handlers: all_hbs, all_exts: _, closure_counter: _, lifted_funcs: _) = ctx
   let handler_name = match lookup(key: port_name, pairs: scope) do
     | Some(val: h) -> h
@@ -453,8 +477,7 @@ let lower_port_call = fn (port_name: string, method_name: string, args: [HirCall
         | None ->
           match find_handler_by_port(port_name: port_name, bindings: all_hbs) do
             | Some(val: bname2) -> bname2
-            // Last resort: check if port_name.system_handler exists
-            | None -> port_name
+            | None -> raise MirPortHandlerNotFound(port_name: port_name, method_name: method_name, span: None)
           end
       end
   end
@@ -468,7 +491,7 @@ end
 /// Infer handler_binding_name → port_name from function names and port list.
 /// Scans for functions named __handler_<binding>_<method> and matches against port methods.
 
-let append_name_pairs = fn (a: [NamePair], b: [NamePair]) -> [NamePair] do
+let append_name_pairs = fn (a: [NamePair], b: [NamePair]) -> [NamePair] throws { Exn } do
   match a do
     | [] -> return b
     | h :: t -> return h :: append_name_pairs(a: t, b: b)
@@ -478,11 +501,11 @@ end
 
 // ─── Lower Arguments/Patterns/Cases ─────────────────────────────────────────
 
-let lower_call_args = fn (args: [HirCallArg], ctx: MirCtx) -> MirCallArgsResult do
+let lower_call_args = fn (args: [HirCallArg], ctx: MirCtx) -> MirCallArgsResult throws { Exn } do
   return lower_call_args_go(args: args, ctx: ctx, acc: [])
 end
 
-let lower_call_args_go = fn (args: [HirCallArg], ctx: MirCtx, acc: [MirCallArg]) -> MirCallArgsResult do
+let lower_call_args_go = fn (args: [HirCallArg], ctx: MirCtx, acc: [MirCallArg]) -> MirCallArgsResult throws { Exn } do
   match args do
     | [] -> return MirCallArgsResult(ctx: ctx, args: rev_mir_call_args(lst: acc, out: []))
     | HirCallArg(label: l, value: v) :: rest ->
@@ -492,11 +515,11 @@ let lower_call_args_go = fn (args: [HirCallArg], ctx: MirCtx, acc: [MirCallArg])
   end
 end
 
-let lower_expr_list = fn (exprs: [HirExpr], ctx: MirCtx) -> MirExprListResult do
+let lower_expr_list = fn (exprs: [HirExpr], ctx: MirCtx) -> MirExprListResult throws { Exn } do
   return lower_expr_list_go(exprs: exprs, ctx: ctx, acc: [])
 end
 
-let lower_expr_list_go = fn (exprs: [HirExpr], ctx: MirCtx, acc: [MirExpr]) -> MirExprListResult do
+let lower_expr_list_go = fn (exprs: [HirExpr], ctx: MirCtx, acc: [MirExpr]) -> MirExprListResult throws { Exn } do
   match exprs do
     | [] -> return MirExprListResult(ctx: ctx, exprs: rev_mir_exprs(lst: acc, out: []))
     | e :: rest ->
@@ -506,11 +529,11 @@ let lower_expr_list_go = fn (exprs: [HirExpr], ctx: MirCtx, acc: [MirExpr]) -> M
   end
 end
 
-let lower_named_exprs = fn (exprs: [HirNamedExpr], ctx: MirCtx) -> MirNamedExprsResult do
+let lower_named_exprs = fn (exprs: [HirNamedExpr], ctx: MirCtx) -> MirNamedExprsResult throws { Exn } do
   return lower_named_exprs_go(exprs: exprs, ctx: ctx, acc: [])
 end
 
-let lower_named_exprs_go = fn (exprs: [HirNamedExpr], ctx: MirCtx, acc: [MirNamedExpr]) -> MirNamedExprsResult do
+let lower_named_exprs_go = fn (exprs: [HirNamedExpr], ctx: MirCtx, acc: [MirNamedExpr]) -> MirNamedExprsResult throws { Exn } do
   match exprs do
     | [] -> return MirNamedExprsResult(ctx: ctx, exprs: rev_mir_named_exprs(lst: acc, out: []))
     | HirNamedExpr(name: n, value: v) :: rest ->
@@ -520,11 +543,11 @@ let lower_named_exprs_go = fn (exprs: [HirNamedExpr], ctx: MirCtx, acc: [MirName
   end
 end
 
-let lower_match_cases = fn (cases: [HirMatchCase], ctx: MirCtx) -> MirMatchCasesResult do
+let lower_match_cases = fn (cases: [HirMatchCase], ctx: MirCtx) -> MirMatchCasesResult throws { Exn } do
   return lower_match_cases_go(cases: cases, ctx: ctx, acc: [])
 end
 
-let lower_match_cases_go = fn (cases: [HirMatchCase], ctx: MirCtx, acc: [MirMatchCase]) -> MirMatchCasesResult do
+let lower_match_cases_go = fn (cases: [HirMatchCase], ctx: MirCtx, acc: [MirMatchCase]) -> MirMatchCasesResult throws { Exn } do
   match cases do
     | [] -> return MirMatchCasesResult(ctx: ctx, cases: rev_mir_match_cases(lst: acc, out: []))
     | HirMatchCase(pattern: p, body: b) :: rest ->
@@ -544,7 +567,7 @@ end
 /// callsite is replaced with `MirMakeClosure(func_name, captures)` so the
 /// existing LIR/codegen closure machinery (`__closure_` prefix auto-registers
 /// into the WASM closure table) picks it up.
-let lift_lambda = fn (params: [HirParam], ret_type: TypeExpr, body: [HirStmt], span: HirExpr, ctx: MirCtx) -> MirExprResult do
+let lift_lambda = fn (params: [HirParam], ret_type: TypeExpr, body: [HirStmt], span: HirExpr, ctx: MirCtx) -> MirExprResult throws { Exn } do
   let MirCtx(scope: sc, port_layouts: pl, handler_port_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: n, lifted_funcs: lf) = ctx
   let lifted_name = "__closure_" ++ i64_to_str(n: n)
   let ctx_after_name = MirCtx(scope: sc, port_layouts: pl, handler_port_names: hpn,
@@ -590,11 +613,11 @@ end
 
 /// Coerce arrow-typed lambda params to i64 (closure pointer). Non-arrow
 /// param types (i64, string, records) pass through unchanged.
-let lower_lambda_params = fn (params: [HirParam]) -> [MirParam] do
+let lower_lambda_params = fn (params: [HirParam]) -> [MirParam] throws { Exn } do
   return lower_lambda_params_go(params: params, acc: [])
 end
 
-let lower_lambda_params_go = fn (params: [HirParam], acc: [MirParam]) -> [MirParam] do
+let lower_lambda_params_go = fn (params: [HirParam], acc: [MirParam]) -> [MirParam] throws { Exn } do
   match params do
     | [] -> return rev_mir_params(lst: acc, out: [])
     | HirParam(name: n, label: l, typ: t) :: rest ->
@@ -603,11 +626,11 @@ let lower_lambda_params_go = fn (params: [HirParam], acc: [MirParam]) -> [MirPar
 end
 
 /// If the lambda's return type is an arrow, coerce to i64 for closure return.
-let lower_lambda_ret_type = fn (t: TypeExpr) -> TypeExpr do
+let lower_lambda_ret_type = fn (t: TypeExpr) -> TypeExpr throws { Exn } do
   return coerce_arrow_to_i64(t: t)
 end
 
-let coerce_arrow_to_i64 = fn (t: TypeExpr) -> TypeExpr do
+let coerce_arrow_to_i64 = fn (t: TypeExpr) -> TypeExpr throws { Exn } do
   match t do
     | TyArrow(_) -> return TyI64
     | _ -> return t
@@ -617,7 +640,7 @@ end
 /// Emit `let <cap_i> = MirEnvLoad("__env", i)` for each capture in order,
 /// starting at `index`. Captures are loaded as i64; a later sigil-aware
 /// pass (not yet implemented) may refine their semantic types.
-let build_env_load_preamble = fn (captures: [string], index: i64) -> [MirStmt] do
+let build_env_load_preamble = fn (captures: [string], index: i64) -> [MirStmt] throws { Exn } do
   match captures do
     | [] -> return []
     | capture :: rest ->
@@ -626,18 +649,18 @@ let build_env_load_preamble = fn (captures: [string], index: i64) -> [MirStmt] d
   end
 end
 
-let captures_to_mir_exprs = fn (caps: [string], acc: [MirExpr]) -> [MirExpr] do
+let captures_to_mir_exprs = fn (caps: [string], acc: [MirExpr]) -> [MirExpr] throws { Exn } do
   match caps do
     | [] -> return rev_mir_exprs(lst: acc, out: [])
     | c :: rest -> return captures_to_mir_exprs(caps: rest, acc: MirVariable(name: c) :: acc)
   end
 end
 
-let param_names_of = fn (params: [HirParam]) -> [string] do
+let param_names_of = fn (params: [HirParam]) -> [string] throws { Exn } do
   return param_names_of_go(params: params, acc: [])
 end
 
-let param_names_of_go = fn (params: [HirParam], acc: [string]) -> [string] do
+let param_names_of_go = fn (params: [HirParam], acc: [string]) -> [string] throws { Exn } do
   match params do
     | [] -> return rev_strings(lst: acc, out: [])
     | HirParam(name: n, label: _, typ: _) :: rest -> return param_names_of_go(params: rest, acc: n :: acc)
@@ -647,7 +670,7 @@ end
 /// Names that are statically resolvable at the lambda's callsite and must
 /// NOT be treated as free variables: top-level function names, externals,
 /// and handler-method names.
-let build_known_names = fn (ctx: MirCtx) -> [string] do
+let build_known_names = fn (ctx: MirCtx) -> [string] throws { Exn } do
   let MirCtx(scope: _, port_layouts: _, handler_port_names: _, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: _, lifted_funcs: _) = ctx
   let from_funcs = fn_names_of(funcs: af, acc: [])
   let from_exts = ext_names_of(exts: ae, acc: [])
@@ -656,7 +679,7 @@ let build_known_names = fn (ctx: MirCtx) -> [string] do
   return concat_strings(a: a, b: from_handlers)
 end
 
-let fn_names_of = fn (funcs: [HirFunction], acc: [string]) -> [string] do
+let fn_names_of = fn (funcs: [HirFunction], acc: [string]) -> [string] throws { Exn } do
   match funcs do
     | [] -> return rev_strings(lst: acc, out: [])
     | HirFunction(name: n, type_params: _, params: _, ret_type: _, body: _, span: _) :: rest ->
@@ -664,7 +687,7 @@ let fn_names_of = fn (funcs: [HirFunction], acc: [string]) -> [string] do
   end
 end
 
-let ext_names_of = fn (exts: [HirExternal], acc: [string]) -> [string] do
+let ext_names_of = fn (exts: [HirExternal], acc: [string]) -> [string] throws { Exn } do
   match exts do
     | [] -> return rev_strings(lst: acc, out: [])
     | HirExternal(name: n, wasm_module: _, wasm_name: _, params: _, ret_type: _, throw_row: _) :: rest ->
@@ -672,7 +695,7 @@ let ext_names_of = fn (exts: [HirExternal], acc: [string]) -> [string] do
   end
 end
 
-let handler_fn_names_of = fn (bindings: [HirHandlerBindingEntry], acc: [string]) -> [string] do
+let handler_fn_names_of = fn (bindings: [HirHandlerBindingEntry], acc: [string]) -> [string] throws { Exn } do
   match bindings do
     | [] -> return rev_strings(lst: acc, out: [])
     | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, functions: fs)) :: rest ->
@@ -680,7 +703,7 @@ let handler_fn_names_of = fn (bindings: [HirHandlerBindingEntry], acc: [string])
   end
 end
 
-let prepend_fn_names = fn (funcs: [HirFunction], acc: [string]) -> [string] do
+let prepend_fn_names = fn (funcs: [HirFunction], acc: [string]) -> [string] throws { Exn } do
   match funcs do
     | [] -> return acc
     | HirFunction(name: n, type_params: _, params: _, ret_type: _, body: _, span: _) :: rest ->
@@ -688,7 +711,7 @@ let prepend_fn_names = fn (funcs: [HirFunction], acc: [string]) -> [string] do
   end
 end
 
-let concat_strings = fn (a: [string], b: [string]) -> [string] do
+let concat_strings = fn (a: [string], b: [string]) -> [string] throws { Exn } do
   match a do
     | [] -> return b
     | x :: rest -> return x :: concat_strings(a: rest, b: b)
@@ -700,7 +723,7 @@ end
 /// Walk HIR stmts, returning the names referenced but not locally bound
 /// and not in `known` (top-level functions, externals, handler methods).
 /// Preserves first-reference order and deduplicates.
-let collect_hir_free_vars = fn (body: [HirStmt], params: [string], known: [string]) -> [string] do
+let collect_hir_free_vars = fn (body: [HirStmt], params: [string], known: [string]) -> [string] throws { Exn } do
   let defined = params
   let seen = []
   let refs = []
@@ -712,7 +735,7 @@ end
 /// Accumulator threaded through the HIR free-var walk.
 type WalkResult = WalkResult(defined: [string], seen: [string], refs: [string])
 
-let walk_stmts = fn (stmts: [HirStmt], defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult do
+let walk_stmts = fn (stmts: [HirStmt], defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult throws { Exn } do
   match stmts do
     | [] -> return WalkResult(defined: defined, seen: seen, refs: refs)
     | HirStmt(node: s, span: _) :: rest ->
@@ -723,7 +746,7 @@ let walk_stmts = fn (stmts: [HirStmt], defined: [string], known: [string], seen:
   end
 end
 
-let walk_stmt = fn (stmt: HirStmtKind, defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult do
+let walk_stmt = fn (stmt: HirStmtKind, defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult throws { Exn } do
   match stmt do
     | Let(name: n, typ: _, value: v) ->
       match walk_expr(expr: v, defined: defined, known: known, seen: seen, refs: refs) do
@@ -752,7 +775,7 @@ let walk_stmt = fn (stmt: HirStmtKind, defined: [string], known: [string], seen:
   end
 end
 
-let walk_expr = fn (expr: HirExpr, defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult do
+let walk_expr = fn (expr: HirExpr, defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult throws { Exn } do
   let HirExpr(node: node, span: _) = expr
   match node do
     | Literal(_) -> return WalkResult(defined: defined, seen: seen, refs: refs)
@@ -825,14 +848,14 @@ let walk_expr = fn (expr: HirExpr, defined: [string], known: [string], seen: [st
 end
 
 /// If `name` isn't already defined or known and wasn't seen yet, record it.
-let record_ref = fn (name: string, defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult do
+let record_ref = fn (name: string, defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult throws { Exn } do
   if string_mem(x: name, xs: defined) then return WalkResult(defined: defined, seen: seen, refs: refs) end
   if string_mem(x: name, xs: known) then return WalkResult(defined: defined, seen: seen, refs: refs) end
   if string_mem(x: name, xs: seen) then return WalkResult(defined: defined, seen: seen, refs: refs) end
   return WalkResult(defined: defined, seen: name :: seen, refs: name :: refs)
 end
 
-let string_mem = fn (x: string, xs: [string]) -> bool do
+let string_mem = fn (x: string, xs: [string]) -> bool throws { Exn } do
   match xs do
     | [] -> return false
     | y :: rest ->
@@ -841,7 +864,7 @@ let string_mem = fn (x: string, xs: [string]) -> bool do
   end
 end
 
-let walk_expr_list = fn (exprs: [HirExpr], defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult do
+let walk_expr_list = fn (exprs: [HirExpr], defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult throws { Exn } do
   match exprs do
     | [] -> return WalkResult(defined: defined, seen: seen, refs: refs)
     | e :: rest ->
@@ -852,7 +875,7 @@ let walk_expr_list = fn (exprs: [HirExpr], defined: [string], known: [string], s
   end
 end
 
-let walk_call_args = fn (args: [HirCallArg], defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult do
+let walk_call_args = fn (args: [HirCallArg], defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult throws { Exn } do
   match args do
     | [] -> return WalkResult(defined: defined, seen: seen, refs: refs)
     | HirCallArg(label: _, value: v) :: rest ->
@@ -863,7 +886,7 @@ let walk_call_args = fn (args: [HirCallArg], defined: [string], known: [string],
   end
 end
 
-let walk_named_exprs = fn (exprs: [HirNamedExpr], defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult do
+let walk_named_exprs = fn (exprs: [HirNamedExpr], defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult throws { Exn } do
   match exprs do
     | [] -> return WalkResult(defined: defined, seen: seen, refs: refs)
     | HirNamedExpr(name: _, value: v) :: rest ->
@@ -874,7 +897,7 @@ let walk_named_exprs = fn (exprs: [HirNamedExpr], defined: [string], known: [str
   end
 end
 
-let walk_match_cases = fn (cases: [HirMatchCase], defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult do
+let walk_match_cases = fn (cases: [HirMatchCase], defined: [string], known: [string], seen: [string], refs: [string]) -> WalkResult throws { Exn } do
   match cases do
     | [] -> return WalkResult(defined: defined, seen: seen, refs: refs)
     | HirMatchCase(pattern: p, body: b) :: rest ->
@@ -886,7 +909,7 @@ let walk_match_cases = fn (cases: [HirMatchCase], defined: [string], known: [str
   end
 end
 
-let pattern_bindings = fn (pat: HirPatternKind, acc: [string]) -> [string] do
+let pattern_bindings = fn (pat: HirPatternKind, acc: [string]) -> [string] throws { Exn } do
   match pat do
     | hir.PLit(_) -> return acc
     | hir.PVar(name: n, sigil: _) -> return n :: acc
@@ -903,14 +926,14 @@ let pattern_bindings = fn (pat: HirPatternKind, acc: [string]) -> [string] do
   end
 end
 
-let pattern_field_bindings = fn (fs: [HirPatternField], acc: [string]) -> [string] do
+let pattern_field_bindings = fn (fs: [HirPatternField], acc: [string]) -> [string] throws { Exn } do
   match fs do
     | [] -> return acc
     | HirPatternField(name: _, pattern: p) :: rest -> return pattern_field_bindings(fs: rest, acc: pattern_bindings(pat: p, acc: acc))
   end
 end
 
-let record_pattern_field_bindings = fn (fs: [HirRecordPatField], acc: [string]) -> [string] do
+let record_pattern_field_bindings = fn (fs: [HirRecordPatField], acc: [string]) -> [string] throws { Exn } do
   match fs do
     | [] -> return acc
     | HirRecordPatField(name: _, pattern: p) :: rest -> return record_pattern_field_bindings(fs: rest, acc: pattern_bindings(pat: p, acc: acc))
@@ -919,7 +942,7 @@ end
 
 // ─── Integer → string (tiny) ─────────────────────────────────────────────────
 
-let i64_to_str = fn (n: i64) -> string do
+let i64_to_str = fn (n: i64) -> string throws { Exn } do
   if n == 0 then return "0"
   end
   if n < 0 then return "-" ++ i64_to_str_pos(n: 0 - n, acc: "")
@@ -927,7 +950,7 @@ let i64_to_str = fn (n: i64) -> string do
   return i64_to_str_pos(n: n, acc: "")
 end
 
-let i64_to_str_pos = fn (n: i64, acc: string) -> string do
+let i64_to_str_pos = fn (n: i64, acc: string) -> string throws { Exn } do
   if n == 0 then return acc
   end
   let digit = n % 10
@@ -936,7 +959,7 @@ let i64_to_str_pos = fn (n: i64, acc: string) -> string do
   return i64_to_str_pos(n: next_n, acc: ch ++ acc)
 end
 
-let digit_to_char = fn (d: i64) -> string do
+let digit_to_char = fn (d: i64) -> string throws { Exn } do
   if d == 0 then return "0" end
   if d == 1 then return "1" end
   if d == 2 then return "2" end
@@ -949,14 +972,14 @@ let digit_to_char = fn (d: i64) -> string do
   return "9"
 end
 
-let append_mir_funcs = fn (a: [MirFunction], b: [MirFunction]) -> [MirFunction] do
+let append_mir_funcs = fn (a: [MirFunction], b: [MirFunction]) -> [MirFunction] throws { Exn } do
   match a do
     | [] -> return b
     | x :: rest -> return x :: append_mir_funcs(a: rest, b: b)
   end
 end
 
-export let lower_pattern = fn (pat: HirPatternKind) -> MirPattern do
+export let lower_pattern = fn (pat: HirPatternKind) -> MirPattern throws { Exn } do
   match pat do
     | hir.PLit(lit: l) -> return MirPatLiteral(lit: l)
     | hir.PVar(name: n, sigil: s) -> return MirPatVariable(name: n, sigil: s)
@@ -970,18 +993,18 @@ export let lower_pattern = fn (pat: HirPatternKind) -> MirPattern do
   end
 end
 
-let lower_or_alts = fn (alts: [HirPatternKind], acc: [MirPattern]) -> [MirPattern] do
+let lower_or_alts = fn (alts: [HirPatternKind], acc: [MirPattern]) -> [MirPattern] throws { Exn } do
   match alts do
     | [] -> return list.reverse(xs: acc)
     | a :: rest -> return lower_or_alts(alts: rest, acc: lower_pattern(pat: a) :: acc)
   end
 end
 
-let lower_pattern_fields = fn (fs: [HirPatternField]) -> [MirPatternField] do
+let lower_pattern_fields = fn (fs: [HirPatternField]) -> [MirPatternField] throws { Exn } do
   return lower_pattern_fields_go(fs: fs, acc: [])
 end
 
-let lower_pattern_fields_go = fn (fs: [HirPatternField], acc: [MirPatternField]) -> [MirPatternField] do
+let lower_pattern_fields_go = fn (fs: [HirPatternField], acc: [MirPatternField]) -> [MirPatternField] throws { Exn } do
   match fs do
     | [] -> return rev_mir_pattern_fields(lst: acc, out: [])
     | HirPatternField(name: n, pattern: p) :: rest ->
@@ -989,11 +1012,11 @@ let lower_pattern_fields_go = fn (fs: [HirPatternField], acc: [MirPatternField])
   end
 end
 
-let lower_record_pat_fields = fn (fs: [HirRecordPatField]) -> [MirRecordPatField] do
+let lower_record_pat_fields = fn (fs: [HirRecordPatField]) -> [MirRecordPatField] throws { Exn } do
   return lower_record_pat_fields_go(fs: fs, acc: [])
 end
 
-let lower_record_pat_fields_go = fn (fs: [HirRecordPatField], acc: [MirRecordPatField]) -> [MirRecordPatField] do
+let lower_record_pat_fields_go = fn (fs: [HirRecordPatField], acc: [MirRecordPatField]) -> [MirRecordPatField] throws { Exn } do
   match fs do
     | [] -> return rev_mir_record_pat_fields(lst: acc, out: [])
     | HirRecordPatField(name: n, pattern: p) :: rest ->
@@ -1003,22 +1026,22 @@ end
 
 // ─── List Helpers ───────────────────────────────────────────────────────────
 
-let concat_mir_funcs = fn (a: [MirFunction], b: [MirFunction]) -> [MirFunction] do
+let concat_mir_funcs = fn (a: [MirFunction], b: [MirFunction]) -> [MirFunction] throws { Exn } do
   return concat_mir_funcs_go(xs: a, ys: b, acc: [])
 end
 
-let concat_mir_funcs_go = fn (xs: [MirFunction], ys: [MirFunction], acc: [MirFunction]) -> [MirFunction] do
+let concat_mir_funcs_go = fn (xs: [MirFunction], ys: [MirFunction], acc: [MirFunction]) -> [MirFunction] throws { Exn } do
   match xs do
     | [] -> return rev_mir_funcs(lst: acc, out: ys)
     | x :: rest -> return concat_mir_funcs_go(xs: rest, ys: ys, acc: x :: acc)
   end
 end
 
-let concat_mir_stmts = fn (a: [MirStmt], b: [MirStmt]) -> [MirStmt] do
+let concat_mir_stmts = fn (a: [MirStmt], b: [MirStmt]) -> [MirStmt] throws { Exn } do
   return concat_mir_stmts_go(xs: a, ys: b, acc: [])
 end
 
-let concat_mir_stmts_go = fn (xs: [MirStmt], ys: [MirStmt], acc: [MirStmt]) -> [MirStmt] do
+let concat_mir_stmts_go = fn (xs: [MirStmt], ys: [MirStmt], acc: [MirStmt]) -> [MirStmt] throws { Exn } do
   match xs do
     | [] -> return rev_mir_stmts(lst: acc, out: ys)
     | x :: rest -> return concat_mir_stmts_go(xs: rest, ys: ys, acc: x :: acc)
@@ -1027,84 +1050,84 @@ end
 
 // ─── Local type-specific reverses (see src/common/mono_reverse.nx) ─────────────
 
-let rev_name_pairs = fn (lst: [NamePair], out: [NamePair]) -> [NamePair] do
+let rev_name_pairs = fn (lst: [NamePair], out: [NamePair]) -> [NamePair] throws { Exn } do
   match lst do
     | [] -> return out
     | x :: rest -> return rev_name_pairs(lst: rest, out: x :: out)
   end
 end
 
-let rev_strings = fn (lst: [string], out: [string]) -> [string] do
+let rev_strings = fn (lst: [string], out: [string]) -> [string] throws { Exn } do
   match lst do
     | [] -> return out
     | x :: rest -> return rev_strings(lst: rest, out: x :: out)
   end
 end
 
-let rev_mir_externals = fn (lst: [MirExternal], out: [MirExternal]) -> [MirExternal] do
+let rev_mir_externals = fn (lst: [MirExternal], out: [MirExternal]) -> [MirExternal] throws { Exn } do
   match lst do
     | [] -> return out
     | x :: rest -> return rev_mir_externals(lst: rest, out: x :: out)
   end
 end
 
-let rev_mir_params = fn (lst: [MirParam], out: [MirParam]) -> [MirParam] do
+let rev_mir_params = fn (lst: [MirParam], out: [MirParam]) -> [MirParam] throws { Exn } do
   match lst do
     | [] -> return out
     | x :: rest -> return rev_mir_params(lst: rest, out: x :: out)
   end
 end
 
-let rev_mir_funcs = fn (lst: [MirFunction], out: [MirFunction]) -> [MirFunction] do
+let rev_mir_funcs = fn (lst: [MirFunction], out: [MirFunction]) -> [MirFunction] throws { Exn } do
   match lst do
     | [] -> return out
     | x :: rest -> return rev_mir_funcs(lst: rest, out: x :: out)
   end
 end
 
-let rev_mir_stmts = fn (lst: [MirStmt], out: [MirStmt]) -> [MirStmt] do
+let rev_mir_stmts = fn (lst: [MirStmt], out: [MirStmt]) -> [MirStmt] throws { Exn } do
   match lst do
     | [] -> return out
     | x :: rest -> return rev_mir_stmts(lst: rest, out: x :: out)
   end
 end
 
-let rev_mir_call_args = fn (lst: [MirCallArg], out: [MirCallArg]) -> [MirCallArg] do
+let rev_mir_call_args = fn (lst: [MirCallArg], out: [MirCallArg]) -> [MirCallArg] throws { Exn } do
   match lst do
     | [] -> return out
     | x :: rest -> return rev_mir_call_args(lst: rest, out: x :: out)
   end
 end
 
-let rev_mir_exprs = fn (lst: [MirExpr], out: [MirExpr]) -> [MirExpr] do
+let rev_mir_exprs = fn (lst: [MirExpr], out: [MirExpr]) -> [MirExpr] throws { Exn } do
   match lst do
     | [] -> return out
     | x :: rest -> return rev_mir_exprs(lst: rest, out: x :: out)
   end
 end
 
-let rev_mir_named_exprs = fn (lst: [MirNamedExpr], out: [MirNamedExpr]) -> [MirNamedExpr] do
+let rev_mir_named_exprs = fn (lst: [MirNamedExpr], out: [MirNamedExpr]) -> [MirNamedExpr] throws { Exn } do
   match lst do
     | [] -> return out
     | x :: rest -> return rev_mir_named_exprs(lst: rest, out: x :: out)
   end
 end
 
-let rev_mir_match_cases = fn (lst: [MirMatchCase], out: [MirMatchCase]) -> [MirMatchCase] do
+let rev_mir_match_cases = fn (lst: [MirMatchCase], out: [MirMatchCase]) -> [MirMatchCase] throws { Exn } do
   match lst do
     | [] -> return out
     | x :: rest -> return rev_mir_match_cases(lst: rest, out: x :: out)
   end
 end
 
-let rev_mir_pattern_fields = fn (lst: [MirPatternField], out: [MirPatternField]) -> [MirPatternField] do
+let rev_mir_pattern_fields = fn (lst: [MirPatternField], out: [MirPatternField]) -> [MirPatternField] throws { Exn } do
   match lst do
     | [] -> return out
     | x :: rest -> return rev_mir_pattern_fields(lst: rest, out: x :: out)
   end
 end
 
-let rev_mir_record_pat_fields = fn (lst: [MirRecordPatField], out: [MirRecordPatField]) -> [MirRecordPatField] do
+let rev_mir_record_pat_fields = fn (lst: [MirRecordPatField], out: [MirRecordPatField]) -> [MirRecordPatField] throws { Exn } do
   match lst do
     | [] -> return out
     | x :: rest -> return rev_mir_record_pat_fields(lst: rest, out: x :: out)
