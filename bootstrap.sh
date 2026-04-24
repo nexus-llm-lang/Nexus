@@ -53,18 +53,23 @@ cargo build --release --manifest-path bootstrap/Cargo.toml
 info "Using Nexus compiler: $NEXUS (commit ${CURRENT_COMMIT:0:7})"
 
 # ─── Stage 0: Rust compiler → stage0.wasm ─────────────────────────────────
-# Try to reuse `nexus build` auto-cache (target/nexus/nexus.wasm).
-# If the cache is valid, copy it as stage0 instead of recompiling.
+# Reuse `nexus build` auto-cache (target/nexus/nexus.wasm) only when both:
+#   (a) .commit stamp matches HEAD, and
+#   (b) the working tree has no uncommitted changes in src/ or stdlib/.
+# A plain commit match is unsafe: `nexus build` reads the working tree, so
+# any uncommitted edit poisons the cache and subsequent matching-commit
+# runs silently reuse the wrong stage0 (stale cache-by-wrong-key bug).
+# When the cache is suspect, rebuild from the Rust compiler directly.
 
 STAGE0="$BUILD_DIR/stage0.wasm"
 NEXUS_CACHE="target/nexus/nexus.wasm"
 NEXUS_CACHE_COMMIT="target/nexus/.commit"
 
-# Reuse cache only if it was built from the current commit.
 nexus_cache_valid() {
   [[ -f "$NEXUS_CACHE" ]] || return 1
   [[ -f "$NEXUS_CACHE_COMMIT" ]] || return 1
   [[ "$(cat "$NEXUS_CACHE_COMMIT")" == "$CURRENT_COMMIT" ]] || return 1
+  git diff --quiet HEAD -- src/ stdlib/ nxlib/ 2>/dev/null || return 1
   return 0
 }
 
@@ -73,12 +78,12 @@ if nexus_cache_valid; then
   cp "$NEXUS_CACHE" "$STAGE0"
 else
   info "Stage 0: nexus build $NEXUS_ENTRY → $STAGE0"
-  if [[ -f "$NEXUS_CACHE" ]]; then
-    cp "$NEXUS_CACHE" "$STAGE0"
-    mkdir -p "$(dirname "$NEXUS_CACHE_COMMIT")"
+  "$NEXUS" build $NEXUS_BUILD_FLAGS "$NEXUS_ENTRY" -o "$STAGE0"
+  mkdir -p "$(dirname "$NEXUS_CACHE_COMMIT")"
+  if git diff --quiet HEAD -- src/ stdlib/ nxlib/ 2>/dev/null; then
     echo "$CURRENT_COMMIT" > "$NEXUS_CACHE_COMMIT"
   else
-    "$NEXUS" build $NEXUS_BUILD_FLAGS "$NEXUS_ENTRY" -o "$STAGE0"
+    rm -f "$NEXUS_CACHE_COMMIT"
   fi
 fi
 ok "Stage 0 complete: $STAGE0 ($(wc -c < "$STAGE0" | tr -d ' ') bytes)"
