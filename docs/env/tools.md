@@ -83,7 +83,7 @@ Nexus is designed to be written by LLMs. To help coding agents produce correct N
 ### Installation
 
 ```bash
-npx skills add Nymphium/Nexus --skill nexus-lang
+npx skills add nexus-llm-lang/Nexus --skill nexus-lang
 ```
 
 The skill activates automatically when Claude Code works with `.nx` files.

@@ -158,7 +158,7 @@ end
 Nexus ships a [Claude Code skill](https://docs.anthropic.com/en/docs/claude-code/skills) that teaches coding agents the language syntax, type system, effect system, and standard library.
 
 ```bash
-npx skills add Nymphium/Nexus --skill nexus-lang
+npx skills add nexus-llm-lang/Nexus --skill nexus-lang
 ```
 
 Once installed, Claude Code automatically activates the skill when writing or reviewing `.nx` files.
