@@ -22,7 +22,8 @@ use super::function::compile_function;
 use super::layout::{build_codegen_layout, program_uses_object_heap, CodegenLayout, MemoryMode};
 use super::string::string_abi_for_external;
 use super::{
-    ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, LAZY_JOIN_NAME, LAZY_MODULE, LAZY_SPAWN_NAME,
+    ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, LAZY_ALLOC_NAME, LAZY_JOIN_NAME, LAZY_MODULE,
+    LAZY_SPAWN_NAME,
     OBJECT_HEAP_GLOBAL_INDEX,
 };
 
@@ -30,25 +31,32 @@ use super::{
 pub fn compile_lir_to_wasm(
     program: &LirProgram,
 ) -> Result<(Vec<u8>, Vec<FuncDebugEntry>), CodegenError> {
-    compile_lir_to_wasm_inner(program, false)
+    let (wasm, debug, _heap_base) = compile_lir_to_wasm_inner(program, false)?;
+    Ok((wasm, debug))
 }
 
 /// Threaded variant — emits `(import "env" "memory" (memory N M shared))` in
 /// place of a locally defined memory, for use with `LazyRuntime::with_shared_memory`.
-/// Internal to the runtime/test path; production callers should use
-/// `compile_lir_to_wasm` and rely on the runtime's inline fallback for
-/// capture-bearing thunks until codegen-side allocator changes (nexus-hqjy)
-/// land.
+/// Internal to the runtime/test path.
 pub fn compile_lir_to_wasm_threaded(
     program: &LirProgram,
 ) -> Result<(Vec<u8>, Vec<FuncDebugEntry>), CodegenError> {
+    let (wasm, debug, _heap_base) = compile_lir_to_wasm_inner(program, true)?;
+    Ok((wasm, debug))
+}
+
+/// Threaded variant that also surfaces the program's `heap_base` so callers
+/// can seed `LazyRuntime`'s atomic bump allocator. Test-only.
+pub fn compile_lir_to_wasm_threaded_with_heap_base(
+    program: &LirProgram,
+) -> Result<(Vec<u8>, Vec<FuncDebugEntry>, i32), CodegenError> {
     compile_lir_to_wasm_inner(program, true)
 }
 
 fn compile_lir_to_wasm_inner(
     program: &LirProgram,
     memory_shared: bool,
-) -> Result<(Vec<u8>, Vec<FuncDebugEntry>), CodegenError> {
+) -> Result<(Vec<u8>, Vec<FuncDebugEntry>, i32), CodegenError> {
     let has_eh = program_needs_eh(program);
     // Only import __nx_capture_backtrace when a catch body actually uses backtrace().
     // This is the "notrace" optimization: most programs use try/catch without inspecting
@@ -106,7 +114,17 @@ fn compile_lir_to_wasm_inner(
     }
     let deduped_ext_count = deduped_externals.len() as u32;
     let n_bt_imports: u32 = if needs_bt_capture { 1 } else { 0 };
-    let n_lazy_imports: u32 = if needs_lazy { 2 } else { 0 }; // spawn + join
+    // spawn + join, plus an alloc import in shared-memory mode (host-side
+    // atomic bump allocator — see LazyRuntime::with_shared_memory).
+    let n_lazy_imports: u32 = if needs_lazy {
+        if memory_shared {
+            3
+        } else {
+            2
+        }
+    } else {
+        0
+    };
 
     // Check if any external uses canonical ABI (component model boundaries)
     let needs_cabi_realloc = program
@@ -151,6 +169,15 @@ fn compile_lir_to_wasm_inner(
         let lazy_base = deduped_ext_count + n_alloc_imports + n_bt_imports;
         layout.lazy_spawn_func_idx = Some(lazy_base);
         layout.lazy_join_func_idx = Some(lazy_base + 1);
+        if memory_shared {
+            // Host-side atomic bump allocator. Set allocate_func_idx so
+            // every existing `if let Some(alloc_idx) = layout.allocate_func_idx`
+            // alloc site routes through it instead of inline GlobalGet/GlobalSet
+            // — concurrent allocations from worker thunks then atomically
+            // advance a single shared heap pointer instead of racing on
+            // per-instance globals.
+            layout.allocate_func_idx = Some(lazy_base + 2);
+        }
     }
 
     // Build funcref table indices
@@ -221,6 +248,8 @@ fn compile_lir_to_wasm_inner(
     let mut lazy_spawn_type_idx = 0;
     // Lazy join type: (i64) -> i64 — wait for a spawned thunk result
     let mut lazy_join_type_idx = 0;
+    // Lazy alloc type: (i32) -> i32 — atomic bump allocator (shared-memory mode).
+    let mut lazy_alloc_type_idx = 0;
     if needs_lazy {
         let spawn_key = sig_key(&[ValType::I64, ValType::I32], &[ValType::I64]);
         lazy_spawn_type_idx = if let Some(&existing) = sig_to_type_idx.get(&spawn_key) {
@@ -244,6 +273,18 @@ fn compile_lir_to_wasm_inner(
             next_type_index += 1;
             idx
         };
+        if memory_shared {
+            let alloc_key = sig_key(&[ValType::I32], &[ValType::I32]);
+            lazy_alloc_type_idx = if let Some(&existing) = sig_to_type_idx.get(&alloc_key) {
+                existing
+            } else {
+                types.ty().function([ValType::I32], [ValType::I32]);
+                sig_to_type_idx.insert(alloc_key, next_type_index);
+                let idx = next_type_index;
+                next_type_index += 1;
+                idx
+            };
+        }
     }
 
     let mut internal_type_indices = Vec::with_capacity(program.functions.len());
@@ -391,6 +432,17 @@ fn compile_lir_to_wasm_inner(
             LAZY_JOIN_NAME,
             EntityType::Function(lazy_join_type_idx),
         );
+        if memory_shared {
+            // Atomic bump allocator (host-side AtomicI32) — see
+            // LazyRuntime::with_shared_memory. Order matters: this is the
+            // 3rd lazy import so its function index is `lazy_base + 2`,
+            // matching `layout.allocate_func_idx`.
+            imports.import(
+                LAZY_MODULE,
+                LAZY_ALLOC_NAME,
+                EntityType::Function(lazy_alloc_type_idx),
+            );
+        }
         has_imports = true;
     }
     if has_imports {
@@ -620,7 +672,7 @@ fn compile_lir_to_wasm_inner(
         module.section(&names);
     }
 
-    Ok((module.finish(), debug_entries))
+    Ok((module.finish(), debug_entries, layout.heap_base as i32))
 }
 
 fn compile_wasi_cli_run_wrapper(main_idx: u32, main_ret_type: &Type) -> Function {

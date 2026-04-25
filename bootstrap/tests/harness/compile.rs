@@ -12,7 +12,9 @@ pub fn compile(src: &str) -> Vec<u8> {
 
 /// Parse + compile via the threaded codegen path (host-imported shared memory).
 /// Used by `exec_threaded` to drive the LazyRuntime::with_shared_memory mode.
-pub fn compile_threaded(src: &str) -> Vec<u8> {
+/// Returns `(wasm_bytes, heap_base)` — the harness uses heap_base to seed the
+/// runtime's atomic bump allocator so worker thunks share the caller's heap.
+pub fn compile_threaded(src: &str) -> (Vec<u8>, i32) {
     super::ensure_repo_root();
     let program = parser::parser()
         .parse(src)
