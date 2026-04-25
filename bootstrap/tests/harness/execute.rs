@@ -4,7 +4,7 @@ use nexus::runtime::lazy;
 use nexus::runtime::ExecutionCapabilities;
 use std::sync::Arc;
 use std::time::Duration;
-use wasmtime::{Engine, Linker, Module, Store, WasmBacktrace};
+use wasmtime::{Engine, Linker, MemoryType, Module, SharedMemory, Store, WasmBacktrace};
 use wasmtime_wasi::{DirPerms, FilePerms, ResourceTable, WasiCtxBuilder};
 
 // ---------------------------------------------------------------------------
@@ -57,6 +57,58 @@ pub fn exec_should_trap(src: &str) -> String {
         Ok(()) => panic!("expected trap but main returned successfully"),
         Err(msg) => msg,
     }
+}
+
+/// Compile and execute via the threaded core-wasm path: program is compiled
+/// with `compile_program_to_wasm_threaded` (which emits
+/// `(import "env" "memory" (memory N M shared))`), and the harness wires up a
+/// host-owned `wasmtime::SharedMemory` plus a `LazyRuntime::with_shared_memory`
+/// so that any capture-bearing thunks the LIR pass parallelizes actually
+/// dispatch to worker threads instead of taking the inline fallback. Test-only
+/// path for nexus-tb6p slice 2.
+pub fn exec_threaded(src: &str) {
+    let wasm = super::compile::compile_threaded(src);
+    run_main_threaded(&wasm).unwrap_or_else(|e| panic!("threaded execution failed: {}", e));
+}
+
+fn run_main_threaded(wasm: &[u8]) -> Result<(), String> {
+    let mut config = wasmtime::Config::new();
+    config.wasm_tail_call(true);
+    config.wasm_exceptions(true);
+    config.wasm_threads(true);
+    config.shared_memory(true);
+    let engine = Engine::new(&config).map_err(|e| e.to_string())?;
+    let module = Module::from_binary(&engine, wasm).map_err(|e| e.to_string())?;
+
+    // Build a SharedMemory with the same shape the codegen emits in
+    // `compile_lir_to_wasm_threaded`. The host side keeps an Arc-clone so it
+    // survives across the caller's Store and every worker's Store.
+    let mem_type = MemoryType::shared(1, 65536);
+    let shared_mem = SharedMemory::new(&engine, mem_type).map_err(|e| e.to_string())?;
+
+    let runtime = lazy::LazyRuntime::with_shared_memory(
+        engine.clone(),
+        module.clone(),
+        shared_mem.clone(),
+    );
+    let mut linker = Linker::new(&engine);
+    runtime.register(&mut linker)?;
+    let mut store = Store::new(&engine, ());
+    linker
+        .define(
+            &mut store,
+            lazy::SHARED_MEMORY_MODULE,
+            lazy::SHARED_MEMORY_FIELD,
+            shared_mem.clone(),
+        )
+        .map_err(|e| format!("define shared memory: {e}"))?;
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(|e| e.to_string())?;
+    let main = instance
+        .get_typed_func::<(), ()>(&mut store, "main")
+        .map_err(|e| e.to_string())?;
+    main.call(&mut store, ()).map_err(|e| e.to_string())
 }
 
 /// Execute main() -> () on raw WASM bytes (no WASI, no stdlib).

@@ -1,4 +1,4 @@
-use nexus::compiler::codegen::compile_program_to_wasm;
+use nexus::compiler::codegen::{compile_program_to_wasm, compile_program_to_wasm_threaded};
 use nexus::lang::parser;
 
 /// Parse + compile to core WASM bytes. Panics on failure.
@@ -8,6 +8,17 @@ pub fn compile(src: &str) -> Vec<u8> {
         .parse(src)
         .unwrap_or_else(|e| panic!("parse failed: {:?}", e));
     compile_program_to_wasm(&program).unwrap_or_else(|e| panic!("compile failed: {}", e))
+}
+
+/// Parse + compile via the threaded codegen path (host-imported shared memory).
+/// Used by `exec_threaded` to drive the LazyRuntime::with_shared_memory mode.
+pub fn compile_threaded(src: &str) -> Vec<u8> {
+    super::ensure_repo_root();
+    let program = parser::parser()
+        .parse(src)
+        .unwrap_or_else(|e| panic!("parse failed: {:?}", e));
+    compile_program_to_wasm_threaded(&program)
+        .unwrap_or_else(|e| panic!("threaded compile failed: {}", e))
 }
 
 /// Parse + compile to core WASM bytes. Returns error on failure.

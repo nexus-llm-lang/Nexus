@@ -1,4 +1,4 @@
-use crate::harness::{exec, exec_with_stdlib, read_fixture};
+use crate::harness::{exec, exec_threaded, exec_with_stdlib, read_fixture};
 
 #[test]
 fn codegen_minimal_wasm_output() {
@@ -182,6 +182,18 @@ fn lazy_parallel_consecutive_forces() {
     // Run via the core-wasm exec path so worker threads actually run; the
     // fixture traps on a wrong sum.
     exec(&read_fixture("nxc/test_lazy_parallel.nx"));
+}
+
+#[test]
+fn lazy_threaded_capture_bearing_forces() {
+    // End-to-end test for nexus-tb6p slice 2: a fixture with capture-bearing
+    // thunks (`let @z = y`, `let @w = y + 11`) compiled via the threaded
+    // codegen path (host-imported shared memory) and run with
+    // LazyRuntime::with_shared_memory. The parallel pass emits
+    // spawn(num_captures=1)+spawn(num_captures=1)+join+join; without the
+    // shared-memory mode those would take the inline fallback at runtime,
+    // never threading capture-bearing thunks.
+    exec_threaded(&read_fixture("nxc/test_lazy_threaded_captures.nx"));
 }
 
 #[test]
