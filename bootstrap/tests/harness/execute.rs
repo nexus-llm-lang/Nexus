@@ -1,3 +1,4 @@
+use nexus::compiler::bundler;
 use nexus::compiler::compose;
 use nexus::runtime::backtrace;
 use nexus::runtime::lazy;
@@ -5,6 +6,7 @@ use nexus::runtime::ExecutionCapabilities;
 use std::sync::Arc;
 use std::time::Duration;
 use wasmtime::{Engine, Linker, MemoryType, Module, SharedMemory, Store, WasmBacktrace};
+use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::{DirPerms, FilePerms, ResourceTable, WasiCtxBuilder};
 
 // ---------------------------------------------------------------------------
@@ -111,6 +113,86 @@ fn run_main_threaded(wasm: &[u8], heap_base: i32) -> Result<(), String> {
         .get_typed_func::<(), ()>(&mut store, "main")
         .map_err(|e| e.to_string())?;
     main.call(&mut store, ()).map_err(|e| e.to_string())
+}
+
+/// Compile and execute via the core-wasm + WASI preview1 path.
+///
+/// Routes the program through `wasmtime_wasi::p1::add_to_linker_sync` instead
+/// of the component model, so `nexus:runtime/lazy` resolves to the real
+/// `LazyRuntime` (which can read user memory and call indirectly through
+/// `__indirect_function_table`) rather than the component-model stub that
+/// returns `(0,)`. Lets fixtures that depend on actual thunk invocation —
+/// e.g. the LIR `parallelize_consecutive_forces` pass output, or
+/// `lazy.host_force` calls — assert real forced values end-to-end.
+///
+/// Skips stdlib bundling when the program has no `nexus:stdlib/*` imports
+/// (the binaryen `wasm-merge` path is unfit for stdlib-using programs
+/// because it leaves stdlib's data section in a separate memory from the
+/// caller's; covered in the implementation comment).
+pub fn exec_with_stdlib_core(src: &str) {
+    let wasm = super::compile::compile(src);
+    run_main_with_deps_core(&wasm).unwrap_or_else(|e| panic!("core execution failed: {}", e));
+}
+
+fn run_main_with_deps_core(wasm: &[u8]) -> Result<(), String> {
+    // `bundle_core_wasm` (binaryen `wasm-merge`) keeps each module's memory
+    // separate (`--enable-multimemory`), so stdlib's `__nx_print` reads bytes
+    // from stdlib's memory while the caller wrote them into the user's
+    // memory. The Nexus self-hosted `wasm_merge.nx` reconciles this by
+    // relocating user data above stdlib's region in a single shared memory;
+    // reproducing that here is out of scope. Skip bundling when the user
+    // wasm has no stdlib imports — programs that only touch
+    // `nexus:runtime/*` (lazy, backtrace) and WASI run cleanly as-is.
+    let imports = bundler::module_import_names(wasm)?;
+    let needs_stdlib_bundle = imports.iter().any(|m| m.starts_with("nexus:stdlib/"));
+    let bundled = if needs_stdlib_bundle {
+        let cfg = bundler::BundleConfig::default();
+        let merged = bundler::bundle_core_wasm(wasm, &cfg)?;
+        bundler::merge_remaining_stubs(&merged, &cfg.wasm_merge_command)?
+    } else {
+        wasm.to_vec()
+    };
+
+    let mut config = wasmtime::Config::new();
+    config.wasm_tail_call(true);
+    config.wasm_exceptions(true);
+    let engine = Engine::new(&config).map_err(|e| e.to_string())?;
+    let module = Module::from_binary(&engine, &bundled).map_err(|e| e.to_string())?;
+
+    let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s: &mut WasiP1Ctx| s)
+        .map_err(|e| format!("p1 linker: {e}"))?;
+
+    if lazy::needs_lazy_runtime(&bundled) {
+        let runtime = lazy::LazyRuntime::new(engine.clone(), module.clone());
+        runtime.register(&mut linker)?;
+    }
+
+    let mut builder = WasiCtxBuilder::new();
+    builder.inherit_stdio();
+    let _ = builder.preopened_dir(".", ".", DirPerms::all(), FilePerms::all());
+    let p1_ctx = builder.build_p1();
+    let mut store = Store::new(&engine, p1_ctx);
+
+    if backtrace::needs_bt_runtime(&bundled) {
+        backtrace::reset();
+        backtrace::add_bt_to_linker(&mut linker, &mut store)?;
+    }
+
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(|e| format!("instantiate: {e:#}"))?;
+
+    // WASI command modules are entered via `_start`; fall back to `main` for
+    // hand-crafted modules that only export `main`.
+    let entry = if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+        start
+    } else {
+        instance
+            .get_typed_func::<(), ()>(&mut store, "main")
+            .map_err(|e| format!("get main export: {e}"))?
+    };
+    entry.call(&mut store, ()).map_err(|e| format!("{e:#}"))
 }
 
 /// Execute main() -> () on raw WASM bytes (no WASI, no stdlib).
