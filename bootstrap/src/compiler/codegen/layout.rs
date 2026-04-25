@@ -50,6 +50,14 @@ pub(super) struct CodegenLayout {
     pub(super) lazy_spawn_func_idx: Option<u32>,
     /// Index of imported __nx_lazy_join function
     pub(super) lazy_join_func_idx: Option<u32>,
+    /// When true, emit memory as `shared` so the host can hand a
+    /// `wasmtime::SharedMemory` to the caller and to every `LazyRuntime`
+    /// worker — capture-bearing thunks then read their captures across
+    /// threads. Switches the program's memory from a `MemoryMode::Defined`
+    /// (or legacy `Imported`) to a host-imported shared memory under
+    /// `(import "env" "memory" (memory N M shared))`. Off by default;
+    /// enabled only via the test-only `compile_lir_to_wasm_threaded` path.
+    pub(super) memory_shared: bool,
 }
 
 pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout, CodegenError> {
@@ -128,6 +136,7 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
         indirect_type_indices: HashMap::new(),
         lazy_spawn_func_idx: None,
         lazy_join_func_idx: None,
+        memory_shared: false,
     })
 }
 

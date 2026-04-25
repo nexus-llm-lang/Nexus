@@ -9,7 +9,7 @@ mod stmt;
 mod string;
 
 pub use error::{CodegenError, CompileError, CompileMetrics};
-pub use module::compile_lir_to_wasm;
+pub use module::{compile_lir_to_wasm, compile_lir_to_wasm_threaded};
 pub use string::StringABI;
 
 use std::borrow::Cow;
@@ -130,6 +130,26 @@ pub fn compile_program_to_wasm_with_dwarf(program: &Program) -> Result<Vec<u8>, 
         append_capabilities_section(&mut wasm, &caps);
     }
     dwarf::append_dwarf_sections(&mut wasm, &debug_entries);
+    Ok(wasm)
+}
+
+/// Threaded variant of `compile_program_to_wasm` — emits
+/// `(import "env" "memory" (memory N M shared))` so the host can hand a
+/// `wasmtime::SharedMemory` to caller and worker linkers alike. Pair with
+/// `LazyRuntime::with_shared_memory` at the harness layer. Test-only path
+/// for nexus-tb6p; production callers continue to use the non-threaded
+/// entry points until the codegen-side allocator changes (nexus-hqjy) land.
+pub fn compile_program_to_wasm_threaded(program: &Program) -> Result<Vec<u8>, CompileError> {
+    validate_main_returns_unit(program)?;
+    let caps = extract_main_require_ports_from_ast(program);
+    let mir = build_hir(program).map_err(CompileError::HirBuild)?;
+    let mut lir = lower_mir_to_lir(&mir, &mir.enum_defs).map_err(CompileError::LirLower)?;
+    optimize_lir_with_opts(&mut lir, true);
+    let (mut wasm, _debug_entries) =
+        compile_lir_to_wasm_threaded(&lir).map_err(CompileError::Codegen)?;
+    if !caps.is_empty() {
+        append_capabilities_section(&mut wasm, &caps);
+    }
     Ok(wasm)
 }
 

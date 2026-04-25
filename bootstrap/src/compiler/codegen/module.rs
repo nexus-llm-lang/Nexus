@@ -30,6 +30,25 @@ use super::{
 pub fn compile_lir_to_wasm(
     program: &LirProgram,
 ) -> Result<(Vec<u8>, Vec<FuncDebugEntry>), CodegenError> {
+    compile_lir_to_wasm_inner(program, false)
+}
+
+/// Threaded variant — emits `(import "env" "memory" (memory N M shared))` in
+/// place of a locally defined memory, for use with `LazyRuntime::with_shared_memory`.
+/// Internal to the runtime/test path; production callers should use
+/// `compile_lir_to_wasm` and rely on the runtime's inline fallback for
+/// capture-bearing thunks until codegen-side allocator changes (nexus-hqjy)
+/// land.
+pub fn compile_lir_to_wasm_threaded(
+    program: &LirProgram,
+) -> Result<(Vec<u8>, Vec<FuncDebugEntry>), CodegenError> {
+    compile_lir_to_wasm_inner(program, true)
+}
+
+fn compile_lir_to_wasm_inner(
+    program: &LirProgram,
+    memory_shared: bool,
+) -> Result<(Vec<u8>, Vec<FuncDebugEntry>), CodegenError> {
     let has_eh = program_needs_eh(program);
     // Only import __nx_capture_backtrace when a catch body actually uses backtrace().
     // This is the "notrace" optimization: most programs use try/catch without inspecting
@@ -119,6 +138,7 @@ pub fn compile_lir_to_wasm(
     let has_funcref = !funcref_targets.is_empty();
 
     let mut layout = build_codegen_layout(program)?;
+    layout.memory_shared = memory_shared;
     if needs_alloc_import {
         let alloc_idx = deduped_ext_count;
         layout.allocate_func_idx = Some(alloc_idx);
@@ -303,7 +323,24 @@ pub fn compile_lir_to_wasm(
     // === Import Section ===
     let mut imports = ImportSection::new();
     let mut has_imports = false;
-    if let MemoryMode::Imported { module: mem_module } = &layout.memory_mode {
+    if layout.memory_shared {
+        // Threaded mode (nexus-tb6p slice 2): host provides a wasmtime::SharedMemory
+        // under ("env", "memory"). The lazy runtime's `with_shared_memory`
+        // constructor binds the same SharedMemory in worker linkers, so the
+        // user wasm and every worker share a single linear memory.
+        imports.import(
+            "env",
+            MEMORY_EXPORT,
+            EntityType::Memory(MemoryType {
+                minimum: 1,
+                maximum: Some(65536),
+                memory64: false,
+                shared: true,
+                page_size_log2: None,
+            }),
+        );
+        has_imports = true;
+    } else if let MemoryMode::Imported { module: mem_module } = &layout.memory_mode {
         imports.import(
             mem_module,
             MEMORY_EXPORT,
@@ -386,7 +423,9 @@ pub fn compile_lir_to_wasm(
     }
 
     // === Memory Section ===
-    if matches!(layout.memory_mode, MemoryMode::Defined) {
+    // In threaded mode the memory is host-provided via the import section
+    // above; emitting a local memory section too would cause two memories.
+    if matches!(layout.memory_mode, MemoryMode::Defined) && !layout.memory_shared {
         let mut memories = MemorySection::new();
         memories.memory(MemoryType {
             minimum: 256, // 16MB initial — grows via memory.grow as needed
