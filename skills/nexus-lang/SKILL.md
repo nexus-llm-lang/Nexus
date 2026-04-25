@@ -276,6 +276,30 @@ match sign do
 end
 ```
 
+### 4. Punning — drop the label when it matches the local name
+When a function call, constructor call, or constructor pattern passes/binds a variable whose name equals the field label, omit `label:`. The parser desugars `f(x)` to `f(x: x)` and `| Ok(v)` to `| Ok(v: v)`. Applies to function-call args, constructor-call args, and constructor patterns — **not** to record literals or record patterns, which still require `name: value`.
+
+```nexus
+// PREFER — pun when names coincide
+let val = 42
+return Mk(val)              // desugars to Mk(val: val)
+f(x)                        // desugars to f(x: x)
+match w do
+  | Mk(val) -> return val   // desugars to | Mk(val: val)
+end
+
+// AVOID — redundant `name: name`
+return Mk(val: val)
+f(x: x)
+match w do
+  | Mk(val: val) -> return val
+end
+
+// Cannot pun — names differ, or value is not a bare variable
+return Some(val: name)
+greet(name: "Bob")
+```
+
 ## Anti-Patterns to Avoid
 
 | Avoid | Use Instead |
