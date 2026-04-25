@@ -67,11 +67,12 @@ pub fn exec_should_trap(src: &str) -> String {
 /// dispatch to worker threads instead of taking the inline fallback. Test-only
 /// path for nexus-tb6p slice 2.
 pub fn exec_threaded(src: &str) {
-    let wasm = super::compile::compile_threaded(src);
-    run_main_threaded(&wasm).unwrap_or_else(|e| panic!("threaded execution failed: {}", e));
+    let (wasm, heap_base) = super::compile::compile_threaded(src);
+    run_main_threaded(&wasm, heap_base)
+        .unwrap_or_else(|e| panic!("threaded execution failed: {}", e));
 }
 
-fn run_main_threaded(wasm: &[u8]) -> Result<(), String> {
+fn run_main_threaded(wasm: &[u8], heap_base: i32) -> Result<(), String> {
     let mut config = wasmtime::Config::new();
     config.wasm_tail_call(true);
     config.wasm_exceptions(true);
@@ -90,6 +91,7 @@ fn run_main_threaded(wasm: &[u8]) -> Result<(), String> {
         engine.clone(),
         module.clone(),
         shared_mem.clone(),
+        heap_base,
     );
     let mut linker = Linker::new(&engine);
     runtime.register(&mut linker)?;

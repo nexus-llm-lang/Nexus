@@ -36,6 +36,7 @@ const BT_CAPTURE_NAME: &str = "capture-backtrace";
 const LAZY_MODULE: &str = "nexus:runtime/lazy";
 const LAZY_SPAWN_NAME: &str = "lazy-spawn";
 const LAZY_JOIN_NAME: &str = "lazy-join";
+const LAZY_ALLOC_NAME: &str = "alloc";
 
 #[derive(Debug, Clone, Copy)]
 struct LocalInfo {
@@ -136,21 +137,23 @@ pub fn compile_program_to_wasm_with_dwarf(program: &Program) -> Result<Vec<u8>, 
 /// Threaded variant of `compile_program_to_wasm` — emits
 /// `(import "env" "memory" (memory N M shared))` so the host can hand a
 /// `wasmtime::SharedMemory` to caller and worker linkers alike. Pair with
-/// `LazyRuntime::with_shared_memory` at the harness layer. Test-only path
-/// for nexus-tb6p; production callers continue to use the non-threaded
-/// entry points until the codegen-side allocator changes (nexus-hqjy) land.
-pub fn compile_program_to_wasm_threaded(program: &Program) -> Result<Vec<u8>, CompileError> {
+/// `LazyRuntime::with_shared_memory` at the harness layer. Returns the
+/// program's `heap_base` alongside the wasm bytes so the harness can seed
+/// the runtime's atomic allocator. Test-only path for nexus-tb6p.
+pub fn compile_program_to_wasm_threaded(
+    program: &Program,
+) -> Result<(Vec<u8>, i32), CompileError> {
     validate_main_returns_unit(program)?;
     let caps = extract_main_require_ports_from_ast(program);
     let mir = build_hir(program).map_err(CompileError::HirBuild)?;
     let mut lir = lower_mir_to_lir(&mir, &mir.enum_defs).map_err(CompileError::LirLower)?;
     optimize_lir_with_opts(&mut lir, true);
-    let (mut wasm, _debug_entries) =
-        compile_lir_to_wasm_threaded(&lir).map_err(CompileError::Codegen)?;
+    let (mut wasm, _debug_entries, heap_base) =
+        module::compile_lir_to_wasm_threaded_with_heap_base(&lir).map_err(CompileError::Codegen)?;
     if !caps.is_empty() {
         append_capabilities_section(&mut wasm, &caps);
     }
-    Ok(wasm)
+    Ok((wasm, heap_base))
 }
 
 fn perm_to_capability(name: &str) -> Option<&'static str> {

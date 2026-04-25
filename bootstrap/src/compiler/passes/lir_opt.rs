@@ -1082,14 +1082,30 @@ fn eliminate_dead_lets(stmts: &mut Vec<LirStmt>, uses: &HashMap<Symbol, u32>) {
 }
 
 /// Returns true if the expression has observable side effects and must not be eliminated.
+///
+/// Div / Mod count as side-effecting because their wasm lowering (I64DivS,
+/// I64RemS, I32DivS, I32RemS) traps on a zero divisor — observable behaviour
+/// that DCE must preserve. Without this guard a `let _ = 1 / runtime_zero`
+/// assertion shape would silently disappear, taking the trap with it; tests
+/// that rely on the trap as their failure signal would then pass regardless
+/// of correctness.
 fn expr_has_side_effects(expr: &LirExpr) -> bool {
-    matches!(
+    if matches!(
         expr,
         LirExpr::Call { .. }
             | LirExpr::TailCall { .. }
             | LirExpr::Raise { .. }
             | LirExpr::Force { .. }
             | LirExpr::CallIndirect { .. }
+    ) {
+        return true;
+    }
+    matches!(
+        expr,
+        LirExpr::Binary {
+            op: BinaryOp::Div | BinaryOp::Mod,
+            ..
+        }
     )
 }
 
