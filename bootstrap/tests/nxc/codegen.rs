@@ -1,4 +1,6 @@
-use crate::harness::{exec, exec_should_trap, exec_threaded, exec_with_stdlib, read_fixture};
+use crate::harness::{
+    exec, exec_should_trap, exec_threaded, exec_with_stdlib, exec_with_stdlib_core, read_fixture,
+};
 
 #[test]
 fn codegen_minimal_wasm_output() {
@@ -157,6 +159,29 @@ fn lazy_thunk_syntax() {
 #[test]
 fn lazy_stdlib_combinators() {
     exec_with_stdlib(&read_fixture("nxc/test_lazy_stdlib.nx"));
+}
+
+#[test]
+fn lazy_host_force_core() {
+    // Acceptance test for nexus-ug96: `host_force` invokes the real
+    // `LazyRuntime` via core-wasm + WASI preview1, instead of going through
+    // the component-model lazy stub (which returns (0,) and would make the
+    // fixture's trap-on-mismatch fire). The fixture has no stdlib imports,
+    // so `exec_with_stdlib_core` skips bundling and runs the core wasm
+    // directly with `LazyRuntime::register` satisfying the lazy host
+    // imports.
+    exec_with_stdlib_core(&read_fixture("nxc/test_lazy_host_force_core.nx"));
+}
+
+#[test]
+fn lazy_parallel_consecutive_forces_via_stdlib_path() {
+    // Acceptance test for nexus-ug96: routes the LIR parallelize pass
+    // fixture through `exec_with_stdlib_core` (the core-wasm + WASI
+    // preview1 replacement for `exec_with_stdlib`). Confirms that a
+    // *parallelized forced value* — `let v1 = @a; let v2 = @b` rewritten
+    // by the pass into spawn+spawn+join+join — round-trips correctly
+    // through the harness path that previously stubbed lazy to (0,).
+    exec_with_stdlib_core(&read_fixture("nxc/test_lazy_parallel.nx"));
 }
 
 #[test]
