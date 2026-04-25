@@ -26,9 +26,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use wasmtime::{Caller, Engine, Error, Linker, Module, Ref, Store, TypedFunc};
+use wasmtime::{Caller, Engine, Error, Linker, Module, Ref, SharedMemory, Store, TypedFunc};
 
 pub const LAZY_HOST_MODULE: &str = "nexus:runtime/lazy";
+
+/// Module name and field used to import a host-provided shared linear memory
+/// when the lazy runtime operates in shared-memory mode.
+pub const SHARED_MEMORY_MODULE: &str = "env";
+pub const SHARED_MEMORY_FIELD: &str = "memory";
 
 /// Check if a WASM module imports the lazy host module.
 pub fn needs_lazy_runtime(wasm_bytes: &[u8]) -> bool {
@@ -51,6 +56,12 @@ pub fn needs_lazy_runtime(wasm_bytes: &[u8]) -> bool {
 struct SharedRuntime {
     engine: Engine,
     module: Module,
+    /// When `Some`, workers import this memory under
+    /// `SHARED_MEMORY_MODULE.SHARED_MEMORY_FIELD` and the spawn path always
+    /// threads (capture-bearing thunks read their captures from this
+    /// memory just like the caller). When `None`, capture-bearing thunks
+    /// fall back to inline on the caller thread (the legacy behaviour).
+    shared_memory: Option<SharedMemory>,
     tasks: Mutex<HashMap<i64, JoinHandle<Result<i64, String>>>>,
     next_task_id: AtomicI64,
 }
@@ -67,6 +78,22 @@ impl LazyRuntime {
         LazyRuntime(Arc::new(SharedRuntime {
             engine,
             module,
+            shared_memory: None,
+            tasks: Mutex::new(HashMap::new()),
+            next_task_id: AtomicI64::new(1),
+        }))
+    }
+
+    /// Construct a runtime that runs all thunks on worker threads, including
+    /// capture-bearing ones, by sharing a single linear memory between the
+    /// caller and every worker. The provided `SharedMemory` must already be
+    /// declared shared in the module (via `(import "env" "memory" (memory N M shared))`)
+    /// and the host's `wasmtime::Config` must have `wasm_threads(true)`.
+    pub fn with_shared_memory(engine: Engine, module: Module, shared_memory: SharedMemory) -> Self {
+        LazyRuntime(Arc::new(SharedRuntime {
+            engine,
+            module,
+            shared_memory: Some(shared_memory),
             tasks: Mutex::new(HashMap::new()),
             next_task_id: AtomicI64::new(1),
         }))
@@ -75,6 +102,12 @@ impl LazyRuntime {
     /// Register `lazy-spawn` / `lazy-join` (and the `__nx_`-prefixed
     /// aliases for forward compat) under `LAZY_HOST_MODULE`. Generic
     /// over the Store state type so this composes with any Linker.
+    ///
+    /// Note: when the runtime is in shared-memory mode, the *caller* is
+    /// responsible for binding the shared memory itself via
+    /// `linker.define(&mut store, SHARED_MEMORY_MODULE, SHARED_MEMORY_FIELD, mem)`
+    /// before instantiating — `Linker::define` requires a Store context that
+    /// `register` doesn't have. Workers do it themselves inside `spawn_impl`.
     pub fn register<T: Send + 'static>(&self, linker: &mut Linker<T>) -> Result<(), String> {
         for name in ["lazy-spawn", "__nx_lazy_spawn"] {
             let rt = Arc::clone(&self.0);
@@ -149,17 +182,42 @@ fn spawn_impl<T>(
     // Read the 8-byte table_idx header from the closure pointer. Both paths
     // (threaded + inline) need this value; reading it here avoids duplicating
     // the memory access.
-    let memory = caller
-        .get_export("memory")
-        .and_then(|e| e.into_memory())
-        .ok_or_else(|| Error::msg("lazy-spawn: no `memory` export"))?;
-    let mut header = [0u8; 8];
-    memory
-        .read(&mut *caller, thunk_ptr as usize, &mut header)
-        .map_err(|e| Error::msg(format!("lazy-spawn: read thunk header: {e}")))?;
-    let table_idx = i64::from_le_bytes(header);
+    let table_idx = if let Some(shared_mem) = rt.shared_memory.as_ref() {
+        // Shared-memory mode: read directly from the host-held SharedMemory.
+        // The caller's `memory` export is the same shared memory; this avoids
+        // a Caller-mediated read that would borrow the Store mutably.
+        let data = shared_mem.data();
+        if (thunk_ptr as usize) + 8 > data.len() {
+            return Err(Error::msg(format!(
+                "lazy-spawn: thunk_ptr {thunk_ptr} out of bounds for shared memory of size {}",
+                data.len()
+            )));
+        }
+        let mut header = [0u8; 8];
+        for (i, slot) in header.iter_mut().enumerate() {
+            // SAFETY: SharedMemory cells permit unsynchronised reads from the
+            // host; the value we are reading was written by the user wasm
+            // before it called lazy-spawn (call serializes the write).
+            *slot = unsafe { *data[thunk_ptr as usize + i].get() };
+        }
+        i64::from_le_bytes(header)
+    } else {
+        let memory = caller
+            .get_export("memory")
+            .and_then(|e| e.into_memory())
+            .ok_or_else(|| Error::msg("lazy-spawn: no `memory` export"))?;
+        let mut header = [0u8; 8];
+        memory
+            .read(&mut *caller, thunk_ptr as usize, &mut header)
+            .map_err(|e| Error::msg(format!("lazy-spawn: read thunk header: {e}")))?;
+        i64::from_le_bytes(header)
+    };
 
-    if num_captures > 0 {
+    // In shared-memory mode every thunk threads — captures live in the same
+    // SharedMemory the worker imports, so the worker reads them through its
+    // own Store with identical addresses.
+    let force_thread = rt.shared_memory.is_some();
+    if !force_thread && num_captures > 0 {
         // Captures live in caller's Store-local memory. Without SharedMemory
         // (module must declare `(memory ... shared)`; codegen doesn't yet),
         // the worker cannot read them. Execute inline as a pragma — the
@@ -171,9 +229,12 @@ fn spawn_impl<T>(
         return invoke_thunk_on_store(&mut *caller, &table, table_idx, thunk_ptr);
     }
 
-    // Zero-capture thunk: real threading. Worker gets its own Store+Instance
-    // from the same Module; thunk body doesn't read its env, so passing 0 as
-    // env is safe.
+    // Threaded path. Worker gets its own Store+Instance from the same Module.
+    // env passed to the thunk:
+    //   - shared-memory mode: thunk_ptr (the closure record itself, captures
+    //     readable via shared memory).
+    //   - legacy zero-capture: 0 (thunk body doesn't read env).
+    let env_for_worker: i64 = if force_thread { thunk_ptr } else { 0 };
     let task_id = rt.next_task_id.fetch_add(1, Ordering::SeqCst);
     let engine = rt.engine.clone();
     let module = rt.module.clone();
@@ -190,13 +251,27 @@ fn spawn_impl<T>(
             .register(&mut linker)
             .map_err(|e| format!("lazy worker: register: {e}"))?;
         let mut store = Store::new(&engine, ());
+        if let Some(mem) = worker_rt.0.shared_memory.as_ref() {
+            // Shared-memory mode: bind the shared memory under the agreed
+            // import name so the worker's Module instance gets the same view
+            // the caller has.
+            linker
+                .define(
+                    &mut store,
+                    SHARED_MEMORY_MODULE,
+                    SHARED_MEMORY_FIELD,
+                    mem.clone(),
+                )
+                .map_err(|e| format!("lazy worker: define shared memory: {e}"))?;
+        }
         let instance = linker
             .instantiate(&mut store, &module)
             .map_err(|e| format!("lazy worker: instantiate: {e}"))?;
         let table = instance
             .get_table(&mut store, "__indirect_function_table")
             .ok_or_else(|| "lazy worker: no `__indirect_function_table` export".to_string())?;
-        invoke_thunk_on_store(&mut store, &table, table_idx, 0).map_err(|e| e.to_string())
+        invoke_thunk_on_store(&mut store, &table, table_idx, env_for_worker)
+            .map_err(|e| e.to_string())
     });
 
     rt.tasks.lock().unwrap().insert(task_id, handle);
@@ -382,5 +457,88 @@ mod tests {
             .expect("main export");
         let result = main.call(&mut store, ()).expect("main trap");
         assert_eq!(result, 77, "worker thread must force the thunk to 77");
+    }
+
+    /// Shared-memory threaded capture-bearing thunk: caller writes a capture
+    /// value into a host-provided `SharedMemory` at the closure's `env+8`
+    /// offset; spawn dispatches to a worker thread that reads the same shared
+    /// memory at the same offset and adds 100. Proves the runtime substrate
+    /// works end-to-end; codegen + atomic allocator are independent follow-ups
+    /// inside nexus-tb6p.
+    #[test]
+    fn shared_memory_threaded_capture_bearing_thunk() {
+        // Module imports a shared memory under "env"."memory", lays out a
+        // closure record at byte 16, writes capture[0]=37 at byte 24, then
+        // calls __nx_lazy_spawn with num_captures=1. The thunk reads env+8
+        // (the capture value) and returns it + 100. spawn should THREAD it
+        // (not fall back to inline) because the runtime is in shared-memory
+        // mode; the worker reads the same shared memory the caller wrote.
+        let wat = r#"
+            (module
+              (import "env" "memory" (memory $mem 1 65536 shared))
+              (import "nexus:runtime/lazy" "__nx_lazy_spawn"
+                (func $lazy_spawn (param i64 i32) (result i64)))
+              (import "nexus:runtime/lazy" "__nx_lazy_join"
+                (func $lazy_join (param i64) (result i64)))
+              (table (export "__indirect_function_table") 1 funcref)
+              (func $thunk (param $env i64) (result i64)
+                ;; capture[0] sits at env+8
+                local.get $env
+                i32.wrap_i64
+                i32.const 8
+                i32.add
+                i64.load
+                i64.const 100
+                i64.add)
+              (elem (i32.const 0) $thunk)
+              (func (export "main") (result i64)
+                ;; closure record at mem[16]: table_idx=0
+                i32.const 16
+                i64.const 0
+                i64.store
+                ;; capture[0] at mem[24]: value 37
+                i32.const 24
+                i64.const 37
+                i64.store
+                ;; spawn with num_captures=1; in shared-memory mode the runtime
+                ;; threads regardless and passes thunk_ptr as env.
+                i64.const 16
+                i32.const 1
+                call $lazy_spawn
+                call $lazy_join))
+        "#;
+        let bytes = wat::parse_str(wat).expect("WAT parse");
+
+        let mut config = wasmtime::Config::new();
+        config.wasm_threads(true);
+        config.shared_memory(true);
+        let engine = Engine::new(&config).expect("engine");
+        let module = Module::from_binary(&engine, &bytes).expect("module load");
+
+        let mem_type = wasmtime::MemoryType::shared(1, 65536);
+        let shared_mem = SharedMemory::new(&engine, mem_type).expect("shared memory");
+
+        let runtime =
+            LazyRuntime::with_shared_memory(engine.clone(), module.clone(), shared_mem.clone());
+        let mut linker = Linker::<()>::new(&engine);
+        runtime.register(&mut linker).expect("register");
+        let mut store = Store::new(&engine, ());
+        linker
+            .define(
+                &mut store,
+                SHARED_MEMORY_MODULE,
+                SHARED_MEMORY_FIELD,
+                shared_mem.clone(),
+            )
+            .expect("define shared memory");
+        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let main = instance
+            .get_typed_func::<(), i64>(&mut store, "main")
+            .expect("main export");
+        let result = main.call(&mut store, ()).expect("main trap");
+        assert_eq!(
+            result, 137,
+            "shared-memory worker must read capture (37) and add 100 → 137"
+        );
     }
 }
