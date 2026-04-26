@@ -97,8 +97,8 @@ STAGE1="$BUILD_DIR/stage1.wasm"
 info "Stage 1: wasmtime run $STAGE0 $NEXUS_ENTRY $STAGE1_RAW"
 "$WASMTIME" run $WASMTIME_FLAGS_COMPONENT "$STAGE0" "$NEXUS_ENTRY" --verbose "$STAGE1_RAW"
 
-# Check if stage1 is self-contained (no nexus:stdlib imports) or needs compose
-if wasm-tools print "$STAGE1_RAW" 2>/dev/null | grep -q 'import "nexus:stdlib/'; then
+# Check if stage1 is self-contained (no nexus:std imports) or needs compose
+if wasm-tools print "$STAGE1_RAW" 2>/dev/null | grep -q 'import "nexus:std/'; then
   info "Stage 1 has unresolved stdlib imports — composing..."
   "$NEXUS" compose "$STAGE1_RAW" -o "$STAGE1"
   ok "Stage 1 composed: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"

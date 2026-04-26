@@ -47,7 +47,7 @@ fn test_array_assignment_mismatch() {
 fn test_array_consume_nonlinear_consumer_is_rejected() {
     let err = should_fail_typecheck(
         r#"
-    import * as array from "stdlib/array.nx"
+    import * as array from "std:array"
 
     let ignore_record = fn (val: { id: i64 }) -> unit do
         return ()
@@ -67,7 +67,7 @@ fn test_array_consume_nonlinear_consumer_is_rejected() {
 fn test_array_consume_with_proper_consumer_passes() {
     should_typecheck(
         r#"
-    import * as array from "stdlib/array.nx"
+    import * as array from "std:array"
 
     let consume_record = fn (%val: { id: i64 }) -> unit do
         match %val do | { id: _ } -> () end

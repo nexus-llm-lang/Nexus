@@ -144,7 +144,7 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
 /// Component-model modules (containing ':') each own their memory — not shared.
 /// Only file-path imports (shared-memory bundling) share memory across modules.
 fn normalize_module_for_memory(module: &str) -> &str {
-    // Component-model modules (nexus:stdlib/*, nexus:cli/*, etc.) are separate
+    // Component-model modules (nexus:std/*, nexus:cli/*, etc.) are separate
     // components with their own linear memory. They don't share memory.
     // Only non-WIT file-path imports (legacy shared-memory bundling) share.
     module

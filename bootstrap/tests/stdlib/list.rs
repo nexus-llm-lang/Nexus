@@ -191,7 +191,7 @@ fn test_cons_operator_typechecks() {
 fn partition_type_in_list_module() {
     exec(
         r#"
-import { Partition } from "stdlib/list.nx"
+import { Partition } from "std:list"
 
 let main = fn () -> unit do
   let p = Partition(matched: Cons(v: 1, rest: Nil), rest: Nil)
@@ -213,7 +213,7 @@ end
 fn deforestation_map_map_fusion() {
     exec(
         r#"
-import * as list from "stdlib/list.nx"
+import * as list from "std:list"
 
 let double = fn (val: i64) -> i64 do return val * 2 end
 let inc = fn (val: i64) -> i64 do return val + 1 end
@@ -238,7 +238,7 @@ end
 fn concat_tail_recursive_deep() {
     exec(
         r#"
-import * as list from "stdlib/list.nx"
+import * as list from "std:list"
 
 let make_list = fn (n: i64, acc: [ i64 ]) -> [ i64 ] do
   if n == 0 then return acc end
@@ -266,7 +266,7 @@ end
 fn length_tail_recursive_deep() {
     exec(
         r#"
-import * as list from "stdlib/list.nx"
+import * as list from "std:list"
 
 let make_list = fn (n: i64, acc: [ i64 ]) -> [ i64 ] do
   if n == 0 then return acc end
@@ -288,7 +288,7 @@ end
 fn take_tail_recursive_deep() {
     exec(
         r#"
-import * as list from "stdlib/list.nx"
+import * as list from "std:list"
 
 let make_list = fn (n: i64, acc: [ i64 ]) -> [ i64 ] do
   if n == 0 then return acc end
@@ -311,7 +311,7 @@ end
 fn deforestation_reverse_reverse_identity() {
     exec(
         r#"
-import * as list from "stdlib/list.nx"
+import * as list from "std:list"
 
 let main = fn () -> unit do
     let xs = [10, 20, 30]

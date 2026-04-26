@@ -57,7 +57,7 @@ fn codegen_utf8_in_data_segment() {
     // Use a program where the string is actually used (not optimized away)
     let wasm = compile(
         r#"
-import { Console, system_handler } from "stdlib/stdio.nx"
+import { Console, system_handler } from "std:stdio"
 let main = fn () -> unit require { PermConsole } do
     inject system_handler do
     Console.println(val: "👽️ こんにちは, world!")
@@ -82,7 +82,7 @@ end
 fn codegen_utf8_survives_bundling() {
     let wasm = compile(
         r#"
-import { Console, system_handler } from "stdlib/stdio.nx"
+import { Console, system_handler } from "std:stdio"
 let main = fn () -> unit require { PermConsole } do
     inject system_handler do
     Console.println(val: "👽️ こんにちは, world!")

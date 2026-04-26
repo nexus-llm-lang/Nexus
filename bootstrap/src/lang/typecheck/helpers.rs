@@ -1,7 +1,7 @@
 use super::env::{Scheme, TypeEnv, TypeError};
 use crate::constants::Permission;
 use crate::lang::ast::*;
-use crate::lang::stdlib::load_stdlib_nx_programs;
+use crate::lang::stdlib::load_package_programs;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -497,7 +497,7 @@ pub(super) fn check_unintroduced_type_vars(
 /// This makes core types like List<T> available without explicit import,
 /// while functions (print, from_i64, etc.) require explicit import.
 pub(super) fn register_stdlib_types(env: &mut TypeEnv) {
-    let Ok(programs) = load_stdlib_nx_programs() else {
+    let Ok(programs) = load_package_programs() else {
         return;
     };
 

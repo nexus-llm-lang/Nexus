@@ -13,9 +13,8 @@ use crate::intern::Symbol;
 use crate::ir::mir::*;
 use crate::lang::ast::*;
 use crate::lang::parser;
-use crate::lang::stdlib::{load_stdlib_nx_programs, resolve_import_path};
+use crate::lang::stdlib::{resolve_external_wit_module, resolve_import_path};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 #[derive(Debug)]
 pub enum HirBuildError {
@@ -284,8 +283,12 @@ impl MirBuilder {
     }
 
     fn build(&mut self, program: &Program) -> Result<MirProgram, HirBuildError> {
-        // Load stdlib definitions (enums, exceptions, externals)
-        self.load_stdlib()?;
+        // Seed builtin enums (List, Exn) and pre-load registered packages so
+        // their public enums/exceptions/externals are visible to user code
+        // without per-file imports. The set of packages is data-driven via
+        // the global PackageResolver — no hardcoded "stdlib" anywhere.
+        self.seed_builtin_enums();
+        self.preload_registered_packages()?;
 
         // Set source context for the entry file
         self.current_source_file = program.source_file.clone();
@@ -421,73 +424,100 @@ impl MirBuilder {
         }
     }
 
-    fn load_stdlib(&mut self) -> Result<(), HirBuildError> {
-        // Seed with builtin enum defs (List, Exn)
+    fn seed_builtin_enums(&mut self) {
         use crate::lang::typecheck::{exn_enum_def, list_enum_def};
         self.enum_defs.push(list_enum_def());
         self.enum_defs.push(exn_enum_def());
+    }
 
-        let stdlib_programs =
-            load_stdlib_nx_programs().map_err(|detail| HirBuildError::StdlibLoadError {
-                detail,
-                span: 0..0,
+    /// Walk every package registered with the default [`PackageResolver`] and
+    /// pre-load its public enums, exceptions, and externals. Replaces the
+    /// previous stdlib-hardcoded `load_stdlib` path.
+    fn preload_registered_packages(&mut self) -> Result<(), HirBuildError> {
+        for (_pkg_name, root) in crate::lang::stdlib::default_resolver().iter_packages() {
+            self.preload_package_directory(&root.root)?;
+        }
+        Ok(())
+    }
+
+    fn preload_package_directory(
+        &mut self,
+        root: &std::path::Path,
+    ) -> Result<(), HirBuildError> {
+        let entries = std::fs::read_dir(root).map_err(|e| HirBuildError::StdlibLoadError {
+            detail: format!("Failed to read package root {}: {}", root.display(), e),
+            span: 0..0,
+        })?;
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nx"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let src = std::fs::read_to_string(&path).map_err(|e| {
+                HirBuildError::StdlibLoadError {
+                    detail: format!("Failed to read {}: {}", path.display(), e),
+                    span: 0..0,
+                }
             })?;
-        for (path, stdlib_program) in stdlib_programs {
-            let wit_interface = stdlib_nx_to_wit_interface(&path);
-            let mut current_wasm_module: Option<String> = None;
-            for def in &stdlib_program.definitions {
-                match &def.node {
-                    TopLevel::Import(import) if import.is_external => {
-                        let resolved = resolve_import_path(&import.path);
-                        current_wasm_module = Some(resolve_stdlib_wit_module(
-                            &resolved,
-                            wit_interface.as_deref(),
-                        ));
-                    }
-                    TopLevel::Enum(ed) => {
-                        self.enum_defs.push(ed.clone());
-                    }
-                    TopLevel::Exception(ex) => {
-                        self.register_exception_in_enum_defs(ex);
-                    }
-                    TopLevel::Let(gl) if gl.is_public => {
-                        if let Expr::External(wasm_name, _type_params, typ) = &gl.value.node {
-                            if let Type::Arrow(params, ret, _requires, throws) = typ {
-                                if let Some(ref wasm_mod) = current_wasm_module {
-                                    // Skip if already loaded (avoid duplicates)
-                                    if self.externals.iter().any(|e| e.name == gl.name) {
-                                        continue;
-                                    }
-                                    // Use WIT-canonical kebab-case names for component-model modules.
-                                    let effective_wasm_name = if wasm_mod.contains(':') {
-                                        wit_canonical_name(wasm_name)
-                                    } else {
-                                        wasm_name.to_string()
-                                    };
-                                    self.externals.push(MirExternal {
-                                        name: Symbol::from(&gl.name),
-                                        wasm_module: Symbol::from(wasm_mod.as_str()),
-                                        wasm_name: Symbol::from(effective_wasm_name.as_str()),
-                                        params: params
-                                            .iter()
-                                            .map(|(n, t)| MirParam {
-                                                name: Symbol::from(n.as_str()),
-                                                label: Symbol::from(n.as_str()),
-                                                typ: t.clone(),
-                                            })
-                                            .collect(),
-                                        ret_type: *ret.clone(),
-                                        throws: *throws.clone(),
-                                    });
+            let program = crate::lang::parser::parser().parse(&src).map_err(|e| {
+                HirBuildError::StdlibLoadError {
+                    detail: format!("Failed to parse {}: {:?}", path.display(), e),
+                    span: 0..0,
+                }
+            })?;
+            self.preload_program(&program);
+        }
+        Ok(())
+    }
+
+    fn preload_program(&mut self, program: &Program) {
+        let mut current_wasm_module: Option<String> = None;
+        for def in &program.definitions {
+            match &def.node {
+                TopLevel::Import(import) if import.is_external => {
+                    current_wasm_module = Some(resolve_external_wit_module(&import.path));
+                }
+                TopLevel::Enum(ed) => {
+                    self.enum_defs.push(ed.clone());
+                }
+                TopLevel::Exception(ex) => {
+                    self.register_exception_in_enum_defs(ex);
+                }
+                TopLevel::Let(gl) if gl.is_public => {
+                    if let Expr::External(wasm_name, _type_params, typ) = &gl.value.node {
+                        if let Type::Arrow(params, ret, _requires, throws) = typ {
+                            if let Some(ref wasm_mod) = current_wasm_module {
+                                if self.externals.iter().any(|e| e.name == gl.name) {
+                                    continue;
                                 }
+                                let effective_wasm_name = if wasm_mod.contains(':') {
+                                    wit_canonical_name(wasm_name)
+                                } else {
+                                    wasm_name.to_string()
+                                };
+                                self.externals.push(MirExternal {
+                                    name: Symbol::from(&gl.name),
+                                    wasm_module: Symbol::from(wasm_mod.as_str()),
+                                    wasm_name: Symbol::from(effective_wasm_name.as_str()),
+                                    params: params
+                                        .iter()
+                                        .map(|(n, t)| MirParam {
+                                            name: Symbol::from(n.as_str()),
+                                            label: Symbol::from(n.as_str()),
+                                            typ: t.clone(),
+                                        })
+                                        .collect(),
+                                    ret_type: *ret.clone(),
+                                    throws: *throws.clone(),
+                                });
                             }
                         }
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
-        Ok(())
     }
 
     /// Pass 1: Collect all declarations without converting function bodies.
@@ -498,10 +528,6 @@ impl MirBuilder {
         rename_map: &mut HashMap<String, String>,
     ) -> Result<(), HirBuildError> {
         let mut current_wasm_module: Option<String> = None;
-        let wit_interface = self
-            .current_source_file
-            .as_ref()
-            .and_then(|p| stdlib_nx_to_wit_interface(Path::new(p)));
 
         // Pre-pass: canonicalize the current file's own top-level definitions.
         // `main` in the entry file keeps its bare name so the wasm `main` export
@@ -547,11 +573,8 @@ impl MirBuilder {
         for def in &program.definitions {
             match &def.node {
                 TopLevel::Import(import) if import.is_external => {
-                    let resolved = resolve_import_path(&import.path);
-                    current_wasm_module = Some(resolve_stdlib_wit_module(
-                        &resolved,
-                        wit_interface.as_deref(),
-                    ));
+                    current_wasm_module =
+                        Some(resolve_external_wit_module(&import.path));
                 }
                 TopLevel::Import(_) => {}  // non-external processed in pre-pass B
                 TopLevel::TypeDef(_) => {}
@@ -1942,33 +1965,6 @@ fn collect_ast_pattern_defs(pattern: &Pattern, defined: &mut HashSet<String>) {
     }
 }
 
-/// Map a resolved import path to a WIT module name if it refers to stdlib.wasm.
-///
-/// If the source file is a known stdlib module, uses its specific WIT interface.
-/// Otherwise falls back to `nexus:stdlib/bundle` — a catch-all for non-stdlib
-/// files (e.g. nxc modules) that import from stdlib.wasm directly.
-/// Non-stdlib imports (e.g. `nexus:runtime/backtrace`) pass through unchanged.
-fn resolve_stdlib_wit_module(resolved: &str, wit_interface: Option<&str>) -> String {
-    if resolved.ends_with("stdlib.wasm") {
-        match wit_interface {
-            Some(iface) => iface.to_string(),
-            None => resolved.to_string(),
-        }
-    } else if resolved.ends_with(".nx") {
-        // Import path is a .nx file (e.g. "stdlib/hashmap.nx") — use its stem for WIT mapping.
-        let path = std::path::Path::new(resolved);
-        stdlib_nx_to_wit_interface(path).unwrap_or_else(|| resolved.to_string())
-    } else {
-        resolved.to_string()
-    }
-}
-
-/// Map a stdlib `.nx` source file path to its WIT interface name.
-///
-/// Externals from these files get `wasm_module` set to the WIT name
-/// instead of the raw `nxlib/stdlib/stdlib.wasm` file path. This keeps
-/// the surface language unchanged while the IR carries component-model
-/// metadata matching the WIT definitions in `wit/nexus-stdlib/`.
 /// Convert an `__nx_*` FFI function name to its WIT-canonical kebab-case form.
 ///
 /// `__nx_abs_i64`   → `abs-i64`
@@ -1982,25 +1978,4 @@ fn wit_canonical_name(ffi_name: &str) -> String {
     } else {
         ffi_name.to_string()
     }
-}
-
-fn stdlib_nx_to_wit_interface(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    let wit = match stem {
-        "math" => "nexus:stdlib/math",
-        "string_ops" => "nexus:stdlib/string-ops",
-        "stdio" => "nexus:stdlib/stdio",
-        "filesystem" => "nexus:stdlib/filesystem",
-        "network" => "nexus:stdlib/network",
-        "process" => "nexus:stdlib/process",
-        "environment" => "nexus:stdlib/environment",
-        "clock" => "nexus:stdlib/clock",
-        "random" => "nexus:stdlib/random",
-        "char" => "nexus:stdlib/string-ops",
-        "bytebuffer" => "nexus:stdlib/bytebuffer",
-        "hashmap" | "stringmap" | "set" | "array" => "nexus:stdlib/collections",
-        "core" => "nexus:stdlib/core",
-        _ => return None,
-    };
-    Some(wit.to_string())
 }

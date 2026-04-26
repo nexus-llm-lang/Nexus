@@ -12,7 +12,7 @@ mod bindings {
     });
 }
 
-use bindings::exports::nexus::stdlib::{
+use bindings::exports::nexus::r#std::{
     bytebuffer, clock, collections, core as nx_core, environment, filesystem, math, network,
     process, random, stdio, string_ops,
 };

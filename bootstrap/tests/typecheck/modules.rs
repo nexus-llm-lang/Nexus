@@ -1,6 +1,6 @@
 use crate::harness::{should_fail_typecheck, should_typecheck};
 use nexus::lang::parser;
-use nexus::lang::stdlib::list_stdlib_nx_paths;
+use nexus::lang::stdlib::{default_resolver, list_nx_paths};
 use nexus::lang::typecheck::TypeChecker;
 use std::fs;
 
@@ -35,8 +35,12 @@ fn test_typechecker_does_not_register_drop_function() {
 #[test]
 fn test_stdlib_loader_uses_nx_only() {
     crate::harness::ensure_repo_root();
-    let paths = list_stdlib_nx_paths().expect("failed to list stdlib paths");
-    assert!(!paths.is_empty(), "stdlib .nx files should exist");
+    let std_root = &default_resolver()
+        .package_root("std")
+        .expect("std package must be registered")
+        .root;
+    let paths = list_nx_paths(std_root).expect("failed to list std package paths");
+    assert!(!paths.is_empty(), "std package .nx files should exist");
     for p in paths {
         assert_eq!(p.extension().and_then(|s| s.to_str()), Some("nx"));
     }

@@ -4,7 +4,7 @@ use crate::harness::exec_with_stdlib;
 fn backtrace_depth_nonzero_on_raise() {
     exec_with_stdlib(
         r#"
-import { backtrace } from "stdlib/exn.nx"
+import { backtrace } from "std:exn"
 
 exception Boom(i64)
 
@@ -33,7 +33,7 @@ end
 fn backtrace_cross_function_has_frames() {
     exec_with_stdlib(
         r#"
-import { backtrace } from "stdlib/exn.nx"
+import { backtrace } from "std:exn"
 
 exception Boom(string)
 

@@ -6,6 +6,7 @@
 
 pub mod ast;
 pub mod lexer;
+pub mod package;
 pub mod parser;
 pub mod stdlib;
 pub mod typecheck;

@@ -2133,14 +2133,17 @@ impl Parser {
     }
 
     fn parse_import_path(&mut self) -> Result<String, ParseError> {
-        // Import path must be a quoted string, e.g. "stdlib/stdio.nx"
+        // Import path must be a quoted string. Three forms are accepted:
+        //   "std:stdio"         — package-qualified (resolved via PackageResolver)
+        //   "pkg:path/module"   — third-party package (resolved via PackageResolver)
+        //   "examples/foo.nx"   — bare relative path
         match self.peek().clone() {
             TokenKind::StringLit(s) => {
                 self.advance();
                 Ok(s)
             }
             _ => Err(ParseError {
-                message: "expected quoted import path (e.g. \"stdlib/foo.nx\")".to_string(),
+                message: "expected quoted import path (e.g. \"std:stdio\" or \"examples/foo.nx\")".to_string(),
                 span: self.peek_span(),
             }),
         }

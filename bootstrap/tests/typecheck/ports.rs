@@ -13,7 +13,7 @@ fn test_port_basic() {
     // the handler to be statically visible in the same compilation unit.
     should_typecheck(
         r#"
-    import { Console }, * as stdio from "stdlib/stdio.nx"
+    import { Console }, * as stdio from "std:stdio"
 
     cap Logger do
       fn log(msg: string) -> unit
@@ -42,8 +42,8 @@ fn test_port_basic() {
 fn test_port_redefinition_wins() {
     should_typecheck(
         r#"
-    import { Console }, * as stdio from "stdlib/stdio.nx"
-    import { from_i64 } from "stdlib/string_ops.nx"
+    import { Console }, * as stdio from "std:stdio"
+    import { from_i64 } from "std:string_ops"
 
     cap Adder do
       fn add_one(n: i64) -> i64
@@ -78,7 +78,7 @@ fn test_handler_require_mock_needs_nothing() {
     // Mock handler (no require) -> main needs nothing
     should_typecheck(
         r#"
-    import { Fs, Handle } from "stdlib/filesystem.nx"
+    import { Fs, Handle } from "std:filesystem"
 
     let mock_fs = handler Fs do
       fn exists(path: string) -> bool do return false end
@@ -150,7 +150,7 @@ fn test_handler_require_real_propagates_perm() {
     // `main must return unit` constraint of the new typecheck helper.
     should_typecheck(
         r#"
-    import { Fs }, * as fs_mod from "stdlib/filesystem.nx"
+    import { Fs }, * as fs_mod from "std:filesystem"
 
     let check_exists = fn () -> bool require { PermFs } do
       inject fs_mod.system_handler do
@@ -270,7 +270,7 @@ fn test_handler_require_syntax_parses() {
 fn test_handler_require_missing_is_rejected() {
     let err = should_fail_typecheck(
         r#"
-    import { Fs }, * as fs_mod from "stdlib/filesystem.nx"
+    import { Fs }, * as fs_mod from "std:filesystem"
 
     let check_exists = fn () -> bool do
       inject fs_mod.system_handler do

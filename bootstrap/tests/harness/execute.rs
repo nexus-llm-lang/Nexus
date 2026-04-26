@@ -125,7 +125,7 @@ fn run_main_threaded(wasm: &[u8], heap_base: i32) -> Result<(), String> {
 /// e.g. the LIR `parallelize_consecutive_forces` pass output, or
 /// `lazy.host_force` calls — assert real forced values end-to-end.
 ///
-/// Skips stdlib bundling when the program has no `nexus:stdlib/*` imports
+/// Skips stdlib bundling when the program has no `nexus:std/*` imports
 /// (the binaryen `wasm-merge` path is unfit for stdlib-using programs
 /// because it leaves stdlib's data section in a separate memory from the
 /// caller's; covered in the implementation comment).
@@ -144,7 +144,9 @@ fn run_main_with_deps_core(wasm: &[u8]) -> Result<(), String> {
     // wasm has no stdlib imports — programs that only touch
     // `nexus:runtime/*` (lazy, backtrace) and WASI run cleanly as-is.
     let imports = bundler::module_import_names(wasm)?;
-    let needs_stdlib_bundle = imports.iter().any(|m| m.starts_with("nexus:stdlib/"));
+    let needs_stdlib_bundle = imports
+        .iter()
+        .any(|m| nexus::lang::stdlib::is_package_wit_module(m));
     let bundled = if needs_stdlib_bundle {
         let cfg = bundler::BundleConfig::default();
         let merged = bundler::bundle_core_wasm(wasm, &cfg)?;

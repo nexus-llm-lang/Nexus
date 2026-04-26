@@ -271,7 +271,7 @@ fn soundness_exception_try_catch() {
 #[test]
 fn soundness_array_create_and_borrow() {
     let src = r#"
-    import * as array from "stdlib/array.nx"
+    import * as array from "std:array"
 
     let main = fn () -> unit do
         let %arr = [| 1, 2, 3 |]
@@ -288,7 +288,7 @@ fn soundness_array_create_and_borrow() {
 #[test]
 fn soundness_list_operations() {
     let src = r#"
-    import * as list from "stdlib/list.nx"
+    import * as list from "std:list"
 
     let main = fn () -> unit do
         let xs = [1, 2, 3]
@@ -303,7 +303,7 @@ fn soundness_list_operations() {
 #[test]
 fn soundness_string_stdlib() {
     let src = r#"
-    import { from_i64, length } from "stdlib/string_ops.nx"
+    import { from_i64, length } from "std:string_ops"
 
     let main = fn () -> unit do
         let s = from_i64(val: 42)

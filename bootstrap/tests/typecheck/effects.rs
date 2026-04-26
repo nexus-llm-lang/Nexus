@@ -46,8 +46,8 @@ fn test_call_pure_from_impure() {
 fn test_try_catch_removes_exn() {
     should_typecheck(
         r#"
-    import { Console }, * as stdio from "stdlib/stdio.nx"
-    import { from_i64 } from "stdlib/string_ops.nx"
+    import { Console }, * as stdio from "std:stdio"
+    import { from_i64 } from "std:string_ops"
     exception Oops(msg: string)
 
     let risky = fn () -> unit throws { Exn } do
@@ -417,8 +417,8 @@ end
     fn prop_try_catch_with_io_handler_typechecks(msg in "[a-zA-Z0-9_]{1,16}") {
         let src = format!(
             r#"
-import {{ Console }}, * as stdio from "stdlib/stdio.nx"
-import {{ from_i64 }} from "stdlib/string_ops.nx"
+import {{ Console }}, * as stdio from "std:stdio"
+import {{ from_i64 }} from "std:string_ops"
 exception MsgError(val: string)
 
 let risky = fn (msg: string) -> unit throws {{ Exn }} do
@@ -454,7 +454,7 @@ end
             .join(", ");
         let src = format!(
             r#"
-import * as array from "stdlib/array.nx"
+import * as array from "std:array"
 
 let __test_main = fn () -> i64 do
     let %arr = [| {elems} |]

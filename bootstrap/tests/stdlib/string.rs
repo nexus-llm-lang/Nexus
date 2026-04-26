@@ -4,7 +4,7 @@ use crate::harness::exec_with_stdlib;
 fn string_repeat_basic() {
     exec_with_stdlib(
         r#"
-import { repeat, length } from "stdlib/string_ops.nx"
+import { repeat, length } from "std:string_ops"
 
 let main = fn () -> unit do
   let result = repeat(s: "ab", n: 3)
@@ -19,7 +19,7 @@ end
 fn string_pad_left_basic() {
     exec_with_stdlib(
         r#"
-import { pad_left, length } from "stdlib/string_ops.nx"
+import { pad_left, length } from "std:string_ops"
 
 let main = fn () -> unit do
   let result = pad_left(s: "42", width: 5, fill: "0")
@@ -34,7 +34,7 @@ end
 fn string_pad_right_basic() {
     exec_with_stdlib(
         r#"
-import { pad_right, length } from "stdlib/string_ops.nx"
+import { pad_right, length } from "std:string_ops"
 
 let main = fn () -> unit do
   let result = pad_right(s: "hi", width: 5, fill: ".")
@@ -49,7 +49,7 @@ end
 fn string_concat_basic() {
     exec_with_stdlib(
         r#"
-import { concat, length } from "stdlib/string_ops.nx"
+import { concat, length } from "std:string_ops"
 
 let main = fn () -> unit do
   let result = concat(a: "hello", b: " world")
@@ -64,8 +64,8 @@ end
 fn string_parse_i64_valid() {
     exec_with_stdlib(
         r#"
-import { parse_i64 } from "stdlib/string_ops.nx"
-import { Option, unwrap_or } from "stdlib/option.nx"
+import { parse_i64 } from "std:string_ops"
+import { Option, unwrap_or } from "std:option"
 
 let main = fn () -> unit do
   let result = unwrap_or(opt: parse_i64(s: "42"), default: 0)
@@ -80,8 +80,8 @@ end
 fn string_parse_i64_invalid() {
     exec_with_stdlib(
         r#"
-import { parse_i64 } from "stdlib/string_ops.nx"
-import { Option, is_none } from "stdlib/option.nx"
+import { parse_i64 } from "std:string_ops"
+import { Option, is_none } from "std:option"
 
 let main = fn () -> unit do
   let result = is_none(opt: parse_i64(s: "not_a_number"))
@@ -96,7 +96,7 @@ end
 fn test_to_string_runtime_error() {
     exec_with_stdlib(
         r#"
-import { to_string } from "stdlib/exn.nx"
+import { to_string } from "std:exn"
 
 let main = fn () -> unit do
   let e: Exn = RuntimeError(val: "boom")
@@ -112,7 +112,7 @@ end
 fn test_to_string_invalid_index() {
     exec_with_stdlib(
         r#"
-import { to_string } from "stdlib/exn.nx"
+import { to_string } from "std:exn"
 
 let main = fn () -> unit do
   let e: Exn = InvalidIndex(val: 42)
@@ -128,8 +128,8 @@ end
 fn test_backtrace_captures_call_stack() {
     exec_with_stdlib(
         r#"
-import { backtrace } from "stdlib/exn.nx"
-import { Console }, * as stdio from "stdlib/stdio.nx"
+import { backtrace } from "std:exn"
+import { Console }, * as stdio from "std:stdio"
 
 let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do
@@ -185,7 +185,7 @@ end
 fn console_read_line_requires_perm_console() {
     let err = crate::harness::should_fail_typecheck(
         r#"
-import { Console }, * as stdio from "stdlib/stdio.nx"
+import { Console }, * as stdio from "std:stdio"
 
 let main = fn () -> unit do
   inject stdio.system_handler do
@@ -202,7 +202,7 @@ end
 fn console_read_line_typechecks_with_perm_console() {
     crate::harness::should_typecheck(
         r#"
-import { Console }, * as stdio from "stdlib/stdio.nx"
+import { Console }, * as stdio from "std:stdio"
 
 let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do
@@ -218,7 +218,7 @@ end
 fn console_getchar_with_mock_handler() {
     exec_with_stdlib(
         r#"
-import { Console } from "stdlib/stdio.nx"
+import { Console } from "std:stdio"
 
 let mock_console = handler Console do
   fn print(val: string) -> unit do
@@ -250,7 +250,7 @@ end
 fn join_tail_recursive_deep() {
     exec_with_stdlib(
         r#"
-import { join, length } from "stdlib/string_ops.nx"
+import { join, length } from "std:string_ops"
 
 let make_strs = fn (n: i64, acc: [ string ]) -> [ string ] do
   if n == 0 then return acc end
@@ -274,8 +274,8 @@ end
 fn split_tail_recursive_deep() {
     exec_with_stdlib(
         r#"
-import { split, repeat, length } from "stdlib/string_ops.nx"
-import * as list from "stdlib/list.nx"
+import { split, repeat, length } from "std:string_ops"
+import * as list from "std:list"
 
 let main = fn () -> unit do
   // 50k repeats of "a," → split on "," → 50001 segments. Must not overflow.
@@ -293,7 +293,7 @@ end
 fn console_read_line_with_mock_handler() {
     exec_with_stdlib(
         r#"
-import { Console } from "stdlib/stdio.nx"
+import { Console } from "std:stdio"
 
 let mock_console = handler Console do
   fn print(val: string) -> unit do

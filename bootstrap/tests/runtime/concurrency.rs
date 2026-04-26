@@ -20,7 +20,7 @@ fn test_net_request_method_and_headers_runtime() {
     // Converted to a typecheck-only test to verify the source is well-typed.
     should_typecheck(
         r#"
-    import { Net, header, response_body }, * as net_mod from "stdlib/network.nx"
+    import { Net, header, response_body }, * as net_mod from "std:network"
 
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
@@ -45,7 +45,7 @@ fn test_net_request_https_url_is_accepted() {
     // Converted to a typecheck-only test.
     should_typecheck(
         r#"
-    import { Net, response_body }, * as net_mod from "stdlib/network.nx"
+    import { Net, response_body }, * as net_mod from "std:network"
 
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
@@ -69,8 +69,8 @@ fn test_net_request_response_status_and_body_with_request_body() {
     // Converted to a typecheck-only test.
     should_typecheck(
         r#"
-    import { Net, header, response_status, response_body }, * as net_mod from "stdlib/network.nx"
-    import { from_i64 } from "stdlib/string_ops.nx"
+    import { Net, header, response_status, response_body }, * as net_mod from "std:network"
+    import { from_i64 } from "std:string_ops"
 
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do
