@@ -292,11 +292,11 @@ fn type_alias_literal_is_also_rejected() {
 fn recursive_enum_type() {
     should_typecheck(
         r#"
-    type Expr = Lit(i64) | Add(left: Expr, right: Expr)
+    type Expr = Lit(val: i64) | Add(left: Expr, right: Expr)
 
     let eval = fn (e: Expr) -> i64 do
         match e do
-            | Lit(n) -> return n
+            | Lit(val: n) -> return n
             | Add(left: l, right: r) ->
                 let a = eval(e: l)
                 let b = eval(e: r)
@@ -305,7 +305,7 @@ fn recursive_enum_type() {
     end
 
     let main = fn () -> unit do
-        let e = Add(left: Lit(1), right: Add(left: Lit(2), right: Lit(3)))
+        let e = Add(left: Lit(val: 1), right: Add(left: Lit(val: 2), right: Lit(val: 3)))
         let result = eval(e: e)
         return ()
     end

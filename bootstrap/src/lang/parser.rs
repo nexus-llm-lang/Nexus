@@ -825,7 +825,67 @@ impl Parser {
     }
 
     fn parse_ctor_pat_arg(&mut self) -> Result<(Option<String>, Spanned<Pattern>), ParseError> {
+        if let Some((n, p)) = self.try_parse_pun_pat_arg()? {
+            return Ok((Some(n), p));
+        }
         self.parse_optional_labeled(Self::parse_pattern)
+    }
+
+    /// Punning lookahead for ctor patterns. Matches:
+    ///   `ident`, `% ident`, `~ ident`, `@ ident`, `& ident`
+    /// when followed by `,` or `)`. Returns `(label, PatVariable(name, sigil))`.
+    fn try_parse_pun_pat_arg(
+        &mut self,
+    ) -> Result<Option<(String, Spanned<Pattern>)>, ParseError> {
+        let start = self.peek_span().start;
+
+        if let TokenKind::Ident(name) = self.peek().clone() {
+            if !Self::is_uppercase_ident(&name)
+                && name != "_"
+                && matches!(
+                    self.peek_at_offset(1),
+                    Some(TokenKind::Comma) | Some(TokenKind::RParen)
+                )
+            {
+                self.advance();
+                let end = self.tokens[self.pos - 1].span.end;
+                let pat = Spanned {
+                    node: Pattern::Variable(name.clone(), Sigil::Immutable),
+                    span: start..end,
+                };
+                return Ok(Some((name, pat)));
+            }
+            return Ok(None);
+        }
+
+        let leading = match self.peek() {
+            TokenKind::Percent => Some(Sigil::Linear),
+            TokenKind::Tilde => Some(Sigil::Mutable),
+            TokenKind::At => Some(Sigil::Lazy),
+            TokenKind::Ampersand => Some(Sigil::Borrow),
+            _ => None,
+        };
+        if let Some(sig) = leading {
+            if let Some(TokenKind::Ident(name)) = self.peek_at_offset(1).cloned() {
+                if !Self::is_uppercase_ident(&name)
+                    && name != "_"
+                    && matches!(
+                        self.peek_at_offset(2),
+                        Some(TokenKind::Comma) | Some(TokenKind::RParen)
+                    )
+                {
+                    self.advance(); // sigil token
+                    self.advance(); // ident
+                    let end = self.tokens[self.pos - 1].span.end;
+                    let pat = Spanned {
+                        node: Pattern::Variable(name.clone(), sig),
+                        span: start..end,
+                    };
+                    return Ok(Some((name, pat)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     // ---- Param parsing ----
@@ -1359,6 +1419,9 @@ impl Parser {
     }
 
     fn parse_call_arg(&mut self) -> Result<(String, Spanned<Expr>), ParseError> {
+        if let Some(p) = self.try_parse_pun_arg()? {
+            return Ok(p);
+        }
         // label : expr
         let name = self.expect_ident()?;
         self.expect(&TokenKind::Colon)?;
@@ -1375,7 +1438,98 @@ impl Parser {
     }
 
     fn parse_ctor_arg(&mut self) -> Result<(Option<String>, Spanned<Expr>), ParseError> {
+        if let Some((n, v)) = self.try_parse_pun_arg()? {
+            return Ok((Some(n), v));
+        }
         self.parse_optional_labeled(Self::parse_expr)
+    }
+
+    /// Punning lookahead for call/ctor args. Matches:
+    ///   `ident`               → ExprVariable(name, Immutable), label=name
+    ///   `% ident` / `~ ident` / `@ ident` → ExprVariable with sigil
+    ///   `& ident` / `& % ident` / `& ~ ident` / `& @ ident` → ExprBorrow
+    /// when the variable is followed by `,` or `)`. Anything else (sigil
+    /// before a non-bare-ident, uppercase ident, dotted/method form) does
+    /// not pun and the caller falls back to `name : expr`.
+    fn try_parse_pun_arg(&mut self) -> Result<Option<(String, Spanned<Expr>)>, ParseError> {
+        let start = self.peek_span().start;
+
+        if let TokenKind::Ident(name) = self.peek().clone() {
+            if !Self::is_uppercase_ident(&name)
+                && matches!(
+                    self.peek_at_offset(1),
+                    Some(TokenKind::Comma) | Some(TokenKind::RParen)
+                )
+            {
+                self.advance();
+                let end = self.tokens[self.pos - 1].span.end;
+                let expr = Spanned {
+                    node: Expr::Variable(RdrName::Unqual(name.clone()), Sigil::Immutable),
+                    span: start..end,
+                };
+                return Ok(Some((name, expr)));
+            }
+            return Ok(None);
+        }
+
+        let leading = match self.peek() {
+            TokenKind::Percent => Some(Sigil::Linear),
+            TokenKind::Tilde => Some(Sigil::Mutable),
+            TokenKind::At => Some(Sigil::Lazy),
+            _ => None,
+        };
+        if let Some(sig) = leading {
+            if let Some(TokenKind::Ident(name)) = self.peek_at_offset(1).cloned() {
+                if !Self::is_uppercase_ident(&name)
+                    && matches!(
+                        self.peek_at_offset(2),
+                        Some(TokenKind::Comma) | Some(TokenKind::RParen)
+                    )
+                {
+                    self.advance(); // sigil
+                    self.advance(); // ident
+                    let end = self.tokens[self.pos - 1].span.end;
+                    let expr = Spanned {
+                        node: Expr::Variable(RdrName::Unqual(name.clone()), sig),
+                        span: start..end,
+                    };
+                    return Ok(Some((name, expr)));
+                }
+            }
+            return Ok(None);
+        }
+
+        if matches!(self.peek(), TokenKind::Ampersand) {
+            let (inner_off, inner_sig) = match self.peek_at_offset(1) {
+                Some(TokenKind::Percent) => (1, Sigil::Linear),
+                Some(TokenKind::Tilde) => (1, Sigil::Mutable),
+                Some(TokenKind::At) => (1, Sigil::Lazy),
+                _ => (0, Sigil::Immutable),
+            };
+            let id_off = 1 + inner_off;
+            if let Some(TokenKind::Ident(name)) = self.peek_at_offset(id_off).cloned() {
+                if !Self::is_uppercase_ident(&name)
+                    && matches!(
+                        self.peek_at_offset(id_off + 1),
+                        Some(TokenKind::Comma) | Some(TokenKind::RParen)
+                    )
+                {
+                    self.advance(); // &
+                    if inner_off > 0 {
+                        self.advance(); // inner sigil
+                    }
+                    self.advance(); // ident
+                    let end = self.tokens[self.pos - 1].span.end;
+                    let expr = Spanned {
+                        node: Expr::Borrow(name.clone(), inner_sig),
+                        span: start..end,
+                    };
+                    return Ok(Some((name, expr)));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     fn parse_lambda(&mut self, start: usize) -> Result<Spanned<Expr>, ParseError> {
