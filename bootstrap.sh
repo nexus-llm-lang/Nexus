@@ -12,10 +12,9 @@
 #
 set -euo pipefail
 
-CI_MODE=false
 for arg in "$@"; do
   case "$arg" in
-    --ci) CI_MODE=true ;;
+    --ci) ;;
     *) echo "Unknown argument: $arg" >&2; exit 1 ;;
   esac
 done
@@ -23,10 +22,17 @@ done
 NEXUS="${NEXUS:-./bootstrap/target/release/nexus}"
 NEXUS_ENTRY="src/driver.nx"
 WASMTIME="${WASMTIME:-wasmtime}"
-# Stage0 is a component (from nexus build); stage1+ are core WASM (from src/ with stdlib merge)
-WASMTIME_FLAGS_COMPONENT="-W tail-call=y,exceptions=y,component-model=y,max-memory-size=8589934592 -S http,inherit-network --dir=. --dir=${TMPDIR:-/tmp}"
-WASMTIME_FLAGS_CORE="-W tail-call=y,exceptions=y,max-memory-size=8589934592 --dir=. --dir=${TMPDIR:-/tmp}"
-NEXUS_BUILD_FLAGS=""
+# shellcheck disable=SC2054  # commas inside -W and -S are wasmtime delimiters, not array separators
+WASMTIME_FLAGS_COMPONENT=(
+  -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,component-model=y,max-memory-size=8589934592
+  -S http,inherit-network
+  --dir=. --dir="${TMPDIR:-/tmp}"
+)
+# shellcheck disable=SC2054
+WASMTIME_FLAGS_CORE=(
+  -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,max-memory-size=8589934592
+  --dir=. --dir="${TMPDIR:-/tmp}"
+)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -78,7 +84,7 @@ if nexus_cache_valid; then
   cp "$NEXUS_CACHE" "$STAGE0"
 else
   info "Stage 0: nexus build $NEXUS_ENTRY → $STAGE0"
-  "$NEXUS" build $NEXUS_BUILD_FLAGS "$NEXUS_ENTRY" -o "$STAGE0"
+  "$NEXUS" build "$NEXUS_ENTRY" -o "$STAGE0"
   mkdir -p "$(dirname "$NEXUS_CACHE_COMMIT")"
   if git diff --quiet HEAD -- src/ stdlib/ nxlib/ 2>/dev/null; then
     echo "$CURRENT_COMMIT" > "$NEXUS_CACHE_COMMIT"
@@ -95,25 +101,25 @@ ok "Stage 0 complete: $STAGE0 ($(wc -c < "$STAGE0" | tr -d ' ') bytes)"
 STAGE1_RAW="$BUILD_DIR/stage1_raw.wasm"
 STAGE1="$BUILD_DIR/stage1.wasm"
 info "Stage 1: wasmtime run $STAGE0 $NEXUS_ENTRY $STAGE1_RAW"
-"$WASMTIME" run $WASMTIME_FLAGS_COMPONENT "$STAGE0" "$NEXUS_ENTRY" --verbose "$STAGE1_RAW"
+"$WASMTIME" run "${WASMTIME_FLAGS_COMPONENT[@]}" "$STAGE0" "$NEXUS_ENTRY" --verbose "$STAGE1_RAW"
 
 # Check if stage1 is self-contained (no nexus:std imports) or needs compose
 if wasm-tools print "$STAGE1_RAW" 2>/dev/null | grep -q 'import "nexus:std/'; then
   info "Stage 1 has unresolved stdlib imports — composing..."
   "$NEXUS" compose "$STAGE1_RAW" -o "$STAGE1"
   ok "Stage 1 composed: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
-  STAGE1_FLAGS="$WASMTIME_FLAGS_COMPONENT"
+  STAGE1_FLAGS=("${WASMTIME_FLAGS_COMPONENT[@]}")
 else
   cp "$STAGE1_RAW" "$STAGE1"
   ok "Stage 1 self-contained: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
-  STAGE1_FLAGS="$WASMTIME_FLAGS_CORE"
+  STAGE1_FLAGS=("${WASMTIME_FLAGS_CORE[@]}")
 fi
 
 # ─── Stage 2: stage1.wasm compiles src → stage2.wasm ──────────────────────
 
 STAGE2="$BUILD_DIR/stage2.wasm"
 info "Stage 2: wasmtime run $STAGE1 $NEXUS_ENTRY $STAGE2"
-if ! "$WASMTIME" run $STAGE1_FLAGS "$STAGE1" "$NEXUS_ENTRY" "$STAGE2" 2>&1; then
+if ! "$WASMTIME" run "${STAGE1_FLAGS[@]}" "$STAGE1" "$NEXUS_ENTRY" "$STAGE2" 2>&1; then
   fail "Stage 2 failed — src-produced WASM is not self-executable."
 fi
 ok "Stage 2 complete: $STAGE2 ($(wc -c < "$STAGE2" | tr -d ' ') bytes)"
@@ -137,9 +143,13 @@ fi
 ok "Fixed point reached! stage1.wasm and stage2.wasm are identical."
 ok "The self-hosted compiler is verified."
 
-# ─── Install nexus.wasm ──────────────────────────────────────────────────
-# Stage1 is already self-contained (stdlib merged). Install directly.
+# ─── Install nexus.wasm and build polyglot launcher ──────────────────────
 
 info "Installing nexus.wasm..."
 cp "$STAGE1" nexus.wasm
 ok "Installed nexus.wasm ($(wc -c < nexus.wasm | tr -d ' ') bytes)"
+
+info "Building polyglot launcher: header.sh + nexus.wasm → nexus"
+cat header.sh nexus.wasm > nexus
+chmod +x nexus
+ok "Installed nexus polyglot ($(wc -c < nexus | tr -d ' ') bytes)"
