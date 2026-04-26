@@ -115,6 +115,80 @@ fn parse_list_expr_is_builtin() {
 }
 
 #[test]
+fn parse_import_qualified_std_path() {
+    let src = r#"
+    import * as io from "std:stdio"
+    let main = fn () -> unit do
+        return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let import = program
+        .definitions
+        .iter()
+        .find_map(|def| {
+            if let TopLevel::Import(imp) = &def.node {
+                Some(imp)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(import.path, "std:stdio");
+    assert_eq!(import.alias.as_deref(), Some("io"));
+    assert!(!import.is_external);
+}
+
+#[test]
+fn parse_import_external_qualified() {
+    let src = r#"
+    import external "std:bundle"
+    let main = fn () -> unit do
+        return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let import = program
+        .definitions
+        .iter()
+        .find_map(|def| {
+            if let TopLevel::Import(imp) = &def.node {
+                Some(imp)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(import.path, "std:bundle");
+    assert!(import.is_external);
+}
+
+#[test]
+fn parse_import_third_party_package() {
+    let src = r#"
+    import { foo } from "mypkg:sub/foo"
+    let main = fn () -> unit do
+        return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let import = program
+        .definitions
+        .iter()
+        .find_map(|def| {
+            if let TopLevel::Import(imp) = &def.node {
+                Some(imp)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(import.path, "mypkg:sub/foo");
+    assert_eq!(import.items.len(), 1);
+    assert_eq!(import.items[0].name, "foo");
+}
+
+#[test]
 fn parse_import_as_alias() {
     let src = r#"
     import { foo as bar, baz } from "examples/math.nx"

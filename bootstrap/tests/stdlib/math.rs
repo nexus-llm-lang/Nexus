@@ -5,7 +5,7 @@ use nexus::runtime::ExecutionCapabilities;
 fn negate_in_math_module() {
     exec_with_stdlib(
         r#"
-import { negate } from "stdlib/math.nx"
+import { negate } from "std:math"
 
 let main = fn () -> unit do
   let result = negate(val: false)
@@ -20,7 +20,7 @@ end
 fn core_id_returns_argument() {
     exec_with_stdlib(
         r#"
-import { id } from "stdlib/core.nx"
+import { id } from "std:core"
 
 let main = fn () -> unit do
   let result = id(val: 42)
@@ -35,7 +35,7 @@ end
 fn random_range_returns_in_bounds_value() {
     exec_with_stdlib(
         r#"
-import { Random }, * as rng from "stdlib/random.nx"
+import { Random }, * as rng from "std:random"
 
 let main = fn () -> unit require { PermRandom } do
   inject rng.system_handler do
@@ -59,7 +59,7 @@ end
 fn random_range_requires_perform() {
     let err = crate::harness::should_fail_typecheck(
         r#"
-import { Random }, * as rng from "stdlib/random.nx"
+import { Random }, * as rng from "std:random"
 
 let main = fn () -> i64 do
   inject rng.system_handler do
@@ -81,7 +81,7 @@ fn random_denied_at_wasi_level_without_allow_random() {
     };
     let err = exec_with_stdlib_caps_should_trap(
         r#"
-import { Random }, * as rng from "stdlib/random.nx"
+import { Random }, * as rng from "std:random"
 
 let main = fn () -> unit require { PermRandom } do
   inject rng.system_handler do

@@ -739,7 +739,7 @@ end
 fn backtrace_usage_keeps_capture_import() {
     let wasm = compile(
         r#"
-import { backtrace } from "stdlib/exn.nx"
+import { backtrace } from "std:exn"
 
 exception Boom(i64)
 

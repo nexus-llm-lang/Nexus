@@ -4,7 +4,7 @@ use crate::harness::compile;
 #[test]
 fn compose_with_stdlib_resolves_imports() {
     let src = r#"
-import { Console }, * as stdio from "stdlib/stdio.nx"
+import { Console }, * as stdio from "std:stdio"
 
 let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do

@@ -15,6 +15,7 @@ use wit_component::{embed_component_metadata, ComponentEncoder, StringEncoding};
 use wit_parser::Resolve;
 
 use crate::constants::{ENTRYPOINT, NEXUS_CAPABILITIES_SECTION, WASI_SNAPSHOT_MODULE};
+use crate::lang::stdlib::is_package_wit_module;
 use crate::runtime;
 
 /// The stdlib component core module (built with `--features component`).
@@ -84,17 +85,17 @@ fn compose_with_stdlib_impl(user_core_wasm: &[u8], include_host: bool) -> Result
 
     let caps = runtime::parse_nexus_capabilities(user_core_wasm);
 
-    // Detect which stdlib interfaces and other modules the user imports.
+    // Detect which package interfaces and runtime modules the user imports.
     let import_modules = core_import_modules(user_core_wasm)?;
     let nexus_imports: Vec<&str> = import_modules
         .iter()
         .filter(|m| {
-            (m.starts_with("nexus:stdlib/") || m.starts_with("nexus:runtime/"))
+            (is_package_wit_module(m) || m.starts_with("nexus:runtime/"))
                 && *m != "nexus:runtime/arena" // intrinsic-only, no runtime support needed
         })
         .map(|s| s.as_str())
         .collect();
-    let has_stdlib = nexus_imports.iter().any(|m| m.starts_with("nexus:stdlib/"));
+    let has_stdlib = nexus_imports.iter().any(|m| is_package_wit_module(m));
 
     if nexus_imports.is_empty() {
         // No nexus imports — just encode as component directly.
@@ -174,41 +175,18 @@ fn component_import_names(wasm: &[u8]) -> Result<BTreeSet<String>, String> {
     Ok(out)
 }
 
-/// All known stdlib WIT interfaces.
-const ALL_STDLIB_INTERFACES: &[&str] = &[
-    "nexus:stdlib/math",
-    "nexus:stdlib/string-ops",
-    "nexus:stdlib/stdio",
-    "nexus:stdlib/filesystem",
-    "nexus:stdlib/network",
-    "nexus:stdlib/process",
-    "nexus:stdlib/environment",
-    "nexus:stdlib/clock",
-    "nexus:stdlib/random",
-    "nexus:stdlib/collections",
-    "nexus:stdlib/bytebuffer",
-    "nexus:stdlib/core",
-];
-
-/// Build a WIT world source for the user app, importing the given stdlib interfaces.
+/// Build a WIT world source for the user app, importing the given package interfaces.
 fn build_app_wit(all_imports: &[&str]) -> String {
     let mut wit = String::new();
     wit.push_str("package nexus:app;\n\n");
     wit.push_str("world app {\n");
     let mut seen = std::collections::HashSet::new();
     for iface in all_imports {
-        // Include nexus:stdlib/* and nexus:runtime/* imports.
-        if !iface.starts_with("nexus:stdlib/") && !iface.starts_with("nexus:runtime/") {
+        // Include package WIT-module imports and nexus:runtime/* imports.
+        if !is_package_wit_module(iface) && !iface.starts_with("nexus:runtime/") {
             continue;
         }
-        // "nexus:stdlib/bundle" is a catch-all — expand to all interfaces.
-        if *iface == "nexus:stdlib/bundle" {
-            for &all in ALL_STDLIB_INTERFACES {
-                if seen.insert(all) {
-                    wit.push_str(&format!("    import {};\n", all));
-                }
-            }
-        } else if seen.insert(iface) {
+        if seen.insert(iface) {
             wit.push_str(&format!("    import {};\n", iface));
         }
     }
@@ -341,7 +319,7 @@ fn compose_all(
         let nexus_host_file = PathBuf::from("nexus-host.wasm");
         let user_imports = component_import_names(user_component)?;
         for import_name in &user_imports {
-            if import_name.starts_with("nexus:stdlib/") {
+            if is_package_wit_module(import_name) {
                 config.dependencies.insert(
                     import_name.clone(),
                     ComposeDependency {
@@ -389,8 +367,8 @@ fn compose_components(user_component: &[u8], stdlib_component: &[u8]) -> Result<
         fs::write(&stdlib_path, stdlib_component)
             .map_err(|e| format!("failed to write stdlib component: {}", e))?;
 
-        // Register the stdlib component as the provider for all nexus:stdlib/*
-        // imports. Each interface name (e.g. "nexus:stdlib/math") must be a
+        // Register the stdlib component as the provider for all nexus:std/*
+        // imports. Each interface name (e.g. "nexus:std/math") must be a
         // separate dependency entry pointing to the same stdlib component file.
         let stdlib_file = PathBuf::from("stdlib.wasm");
         let mut config = ComposeConfig {
@@ -404,7 +382,7 @@ fn compose_components(user_component: &[u8], stdlib_component: &[u8]) -> Result<
         // the same module names as core imports for our encoding.
         let user_imports = component_import_names(user_component)?;
         for import_name in &user_imports {
-            if import_name.starts_with("nexus:stdlib/") {
+            if is_package_wit_module(import_name) {
                 config.dependencies.insert(
                     import_name.clone(),
                     ComposeDependency {
@@ -664,23 +642,23 @@ fn fix_cabi_realloc_type(wasm: &[u8]) -> Vec<u8> {
 /// Returns the correct WIT module for a function name, or None if it belongs
 /// to the module it's already in.
 fn correct_module_for_import(module: &str, name: &str) -> Option<&'static str> {
-    if module == "nexus:stdlib/string-ops" {
+    if module == "nexus:std/string-ops" {
         return None; // already correct
     }
     if name.starts_with("string-") || name.starts_with("char-") {
-        return Some("nexus:stdlib/string-ops");
+        return Some("nexus:std/string-ops");
     }
     None
 }
 
 /// Rewrite core WASM imports to move misplaced string-ops functions to
-/// `nexus:stdlib/string-ops`. Deduplicates by (module, name) pair.
+/// `nexus:std/string-ops`. Deduplicates by (module, name) pair.
 /// Needed for nxc compiler output where diamond-cached imports cause
 /// string functions to be registered under wrong stdlib modules.
 fn normalize_string_ops_imports(wasm: &[u8]) -> Vec<u8> {
     use wasm_encoder::{EntityType, ImportSection, Module, RawSection};
 
-    // Quick check: any nexus:stdlib/* import with a string-* name not in string-ops?
+    // Quick check: any nexus:std/* import with a string-* name not in string-ops?
     let needs_fix = wasmparser::Parser::new(0)
         .parse_all(wasm)
         .filter_map(|p| p.ok())

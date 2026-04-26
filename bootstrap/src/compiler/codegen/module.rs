@@ -1006,11 +1006,11 @@ fn uleb128_encoded_size(mut val: u64) -> usize {
     size
 }
 
-/// Check if a WASM module name refers to the stdlib bundle.
+/// Check if a WASM module name refers to a registered package's interface.
 /// Matches both legacy file-path (`nxlib/stdlib/stdlib.wasm`) and
-/// WIT-style (`nexus:stdlib/math`, `nexus:stdlib/string-ops`, etc.) names.
+/// WIT-style (`nexus:<pkg>/<iface>`) names.
 fn is_stdlib_module(module: &str) -> bool {
-    module.ends_with("stdlib.wasm") || module.starts_with("nexus:stdlib/")
+    module.ends_with("stdlib.wasm") || crate::lang::stdlib::is_package_wit_module(module)
 }
 
 /// Check if any catch body in the program uses the backtrace runtime

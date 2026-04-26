@@ -11,7 +11,7 @@ let main = fn () -> unit do
 end
 
 // With I/O
-import { Console }, * as stdio from "stdlib/stdio.nx"
+import { Console }, * as stdio from "std:stdio"
 
 let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do
@@ -21,7 +21,7 @@ let main = fn () -> unit require { PermConsole } do
 end
 
 // Implicit return unit
-import { Console }, * as stdio from "stdlib/stdio.nx"
+import { Console }, * as stdio from "std:stdio"
 
 let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do
@@ -35,19 +35,19 @@ end
 
 ```nexus
 // Import cap + module alias (most common for I/O)
-import { Console }, * as stdio from "stdlib/stdio.nx"
+import { Console }, * as stdio from "std:stdio"
 
 // Import specific items
-import { Option, Some, None } from "stdlib/option.nx"
-import { Result, Ok, Err } from "stdlib/result.nx"
+import { Option, Some, None } from "std:option"
+import { Result, Ok, Err } from "std:result"
 
 // Import as module alias (for utility functions)
-import * as list from "stdlib/list.nx"
-import * as str from "stdlib/string_ops.nx"
-import * as math from "stdlib/math.nx"
+import * as list from "std:list"
+import * as str from "std:string_ops"
+import * as math from "std:math"
 
 // Combine both
-import { Net, Request, Response }, * as net_mod from "stdlib/network.nx"
+import { Net, Request, Response }, * as net_mod from "std:network"
 ```
 
 ## Custom Cap + Handler (Dependency Injection)
@@ -97,7 +97,7 @@ end
 ### Result-based (prefer for recoverable errors)
 
 ```nexus
-import { Result, Ok, Err } from "stdlib/result.nx"
+import { Result, Ok, Err } from "std:result"
 
 let parse_config = fn (raw: string) -> Result<Config, string> do
   if str.length(s: raw) == 0 then

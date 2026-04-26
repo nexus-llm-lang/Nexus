@@ -6,7 +6,7 @@ use crate::harness::{
 fn env_port_typechecks_with_perm_env() {
     should_typecheck(
         r#"
-import { Env }, * as env_mod from "stdlib/environment.nx"
+import { Env }, * as env_mod from "std:environment"
 
 let main = fn () -> unit require { PermEnv } do
   inject env_mod.system_handler do
@@ -22,7 +22,7 @@ end
 fn env_get_requires_perm_env() {
     let err = should_fail_typecheck(
         r#"
-import { Env }, * as env_mod from "stdlib/environment.nx"
+import { Env }, * as env_mod from "std:environment"
 
 let main = fn () -> unit do
   inject env_mod.system_handler do
@@ -39,7 +39,7 @@ end
 fn env_set_typechecks_with_perm_env() {
     should_typecheck(
         r#"
-import { Env }, * as env_mod from "stdlib/environment.nx"
+import { Env }, * as env_mod from "std:environment"
 
 let main = fn () -> unit require { PermEnv } do
   inject env_mod.system_handler do
@@ -56,8 +56,8 @@ end
 fn env_get_set_to_empty_returns_some_empty() {
     exec_with_stdlib_envs(
         r#"
-import { Env }, * as env_mod from "stdlib/environment.nx"
-import { Option } from "stdlib/option.nx"
+import { Env }, * as env_mod from "std:environment"
+import { Option } from "std:option"
 
 let main = fn () -> unit require { PermEnv } do
   inject env_mod.system_handler do
@@ -79,8 +79,8 @@ end
 fn env_get_unset_returns_none() {
     exec_with_stdlib_envs(
         r#"
-import { Env }, * as env_mod from "stdlib/environment.nx"
-import { Option } from "stdlib/option.nx"
+import { Env }, * as env_mod from "std:environment"
+import { Option } from "std:option"
 
 let main = fn () -> unit require { PermEnv } do
   inject env_mod.system_handler do
@@ -100,8 +100,8 @@ end
 fn env_get_set_to_value_returns_some_value() {
     exec_with_stdlib_envs(
         r#"
-import { Env }, * as env_mod from "stdlib/environment.nx"
-import { Option } from "stdlib/option.nx"
+import { Env }, * as env_mod from "std:environment"
+import { Option } from "std:option"
 
 let main = fn () -> unit require { PermEnv } do
   inject env_mod.system_handler do
@@ -122,8 +122,8 @@ end
 fn env_mock_handler() {
     exec_with_stdlib(
         r#"
-import { Env } from "stdlib/environment.nx"
-import { Option } from "stdlib/option.nx"
+import { Env } from "std:environment"
+import { Option } from "std:option"
 
 let mock_env = handler Env do
   fn get(key: string) -> Option<string> do

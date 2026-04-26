@@ -49,7 +49,7 @@ fn codegen_fixture_network_access_compiles() {
 fn codegen_print_works_via_external_stdio_module() {
     exec_with_stdlib(
         r#"
-import { Console }, * as stdio from "stdlib/stdio.nx"
+import { Console }, * as stdio from "std:stdio"
 
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do
@@ -65,8 +65,8 @@ end
 fn codegen_print_after_from_i64_works_via_single_string_abi_module() {
     exec_with_stdlib(
         r#"
-import { Console }, * as stdio from "stdlib/stdio.nx"
-import { from_i64 } from "stdlib/string_ops.nx"
+import { Console }, * as stdio from "std:stdio"
+import { from_i64 } from "std:string_ops"
 
 let main = fn () -> unit require { PermConsole } do
     let s = from_i64(val: 42)
@@ -83,7 +83,7 @@ end
 fn codegen_handler_reachability_resolves_port_call() {
     exec_with_stdlib(
         r#"
-import { Console }, * as stdio from "stdlib/stdio.nx"
+import { Console }, * as stdio from "std:stdio"
 
 let main = fn () -> unit require { PermConsole } do
     inject stdio.system_handler do

@@ -106,6 +106,32 @@ let greet = fn (name: string) -> unit require { Console } do
 end
 ```
 
+### 7. Imports: `pkg:path` for packages, bare paths for local files
+
+```nexus
+// Standard library — std is the package name; module name follows the colon
+import { Console }, * as stdio from "std:stdio"
+import * as list from "std:list"
+import { Result, Ok, Err } from "std:result"
+
+// Local files — bare relative paths (no colon)
+import { MyType } from "src/common/foo.nx"
+
+// FFI binding — declares the WIT interface for subsequent `external` decls
+import external "std:string-ops"
+external __nx_string_length = "__nx_string_length" : (s: string) -> i64
+```
+
+Path forms:
+| Form | Resolves to | Use |
+|------|-------------|-----|
+| `"std:stdio"` | `nxlib/stdlib/stdio.nx`, WIT `nexus:std/stdio` | Standard library module |
+| `"pkg:path/module"` | `<pkg-root>/path/module.nx` | Third-party package module |
+| `"src/foo.nx"` | Relative file path | Project-local module |
+| `import external "std:<iface>"` | WIT interface `nexus:std/<iface>` | Pin FFI imports to a WIT interface |
+
+The `std` package always maps to `nxlib/stdlib/`. Underscore in the file stem stays in the import path (`std:string_ops`), but the WIT interface uses kebab-case (`nexus:std/string-ops`) — convert `_` to `-` for `import external` declarations.
+
 ## Effect System (Caps & Handlers)
 
 Nexus uses coeffects for dependency injection, NOT algebraic effects. See https://nexus-llm-lang.github.io/Nexus/latest/spec/effects for details.
@@ -166,7 +192,7 @@ end
 
 ### Hello World
 ```nexus
-import { Console }, * as stdio from "stdlib/stdio.nx"
+import { Console }, * as stdio from "std:stdio"
 
 let main = fn () -> unit require { PermConsole } do
   inject stdio.system_handler do
@@ -178,7 +204,7 @@ end
 
 ### Error Handling
 ```nexus
-import { Result, Ok, Err } from "stdlib/result.nx"
+import { Result, Ok, Err } from "std:result"
 
 exception NotFound(msg: string)
 
@@ -202,7 +228,7 @@ end
 
 ### List Recursion
 ```nexus
-import * as list from "stdlib/list.nx"
+import * as list from "std:list"
 
 let sum = fn (xs: [ i64 ]) -> i64 do
   match xs do
@@ -319,5 +345,6 @@ greet(name: "Bob")
 - https://nexus-llm-lang.github.io/Nexus/latest/spec/types — Type system, linear types, borrowing
 - https://nexus-llm-lang.github.io/Nexus/latest/spec/effects — Caps, handlers, inject, permissions
 - https://nexus-llm-lang.github.io/Nexus/latest/env/stdlib — Standard library API reference
+- `./references/stdlib.md` — `std` package module index, capability permissions, WIT naming
 - `./references/patterns.md` — Idiomatic code patterns with examples
 - `./templates/` — Starter templates for common program structures

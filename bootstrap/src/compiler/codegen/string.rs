@@ -31,7 +31,7 @@ pub enum StringABI {
 /// Determine the string ABI for an external function based on its import module.
 ///
 /// Component-model imports use WIT-style identifiers (containing `:`),
-/// e.g. `nexus:stdlib/string-ops`. File-path imports (e.g. `stdlib/stdlib.wasm`)
+/// e.g. `nexus:std/string-ops`. File-path imports (e.g. `stdlib/stdlib.wasm`)
 pub(super) fn string_abi_for_external(ext: &LirExternal) -> StringABI {
     let module = ext.wasm_module.as_ref();
     if module.contains(':') {

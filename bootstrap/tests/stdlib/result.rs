@@ -4,7 +4,7 @@ use crate::harness::exec_with_stdlib;
 fn result_from_exn_builds_err() {
     exec_with_stdlib(
         r#"
-import * as result from "stdlib/result.nx"
+import * as result from "std:result"
 
 let main = fn () -> unit do
   let exn = RuntimeError(val: "boom")
