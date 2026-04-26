@@ -263,7 +263,32 @@ match point do
 end
 ```
 
-### 2. Collapse staircase `match` — nest patterns + aggressive `_`
+### 2. `if let` over two-arm `match` (one constructor + wildcard)
+When a `match` has exactly two arms — one constructor pattern with bindings and a wildcard fallback — rewrite as `if let PAT = EXPR then ... else ... end`. Both statement-form and expression-form are supported. This applies recursively: a nested `match X do | F(b) -> A | _ -> B end` inside another arm should also become `if let`.
+
+Skip the rewrite when the constructor arm has **no bindings** (e.g. `TkColon -> true | _ -> false`) — `if let` adds syntax without payoff there. The point is to lift a meaningful destructure out of `match` noise.
+
+```nexus
+// PREFER — if let surfaces the destructure as the primary control choice
+if let TkString(val: s) = peek_token(toks: toks) then
+  return ParsedIdent(name: s, rest: skip(toks: toks))
+else
+  raise UnexpectedToken(expected: "string literal", ...)
+end
+
+// Expression form
+let arr_elem = if let TyArray(elem: e) = arr_t then e else TyI64 end
+
+// AVOID — two-arm match on a single binding constructor
+match peek_token(toks: toks) do
+  | TkString(val: s) -> return ParsedIdent(name: s, rest: skip(toks: toks))
+  | _ -> raise UnexpectedToken(expected: "string literal", ...)
+end
+```
+
+Combine with rule #1: if the `else` branch is unreachable (single-constructor type), prefer `let PAT = EXPR` instead of `if let ... else`.
+
+### 3. Collapse staircase `match` — nest patterns + aggressive `_`
 Fuse nested `match` arms into a single pattern. Use a trailing bare `_` to ignore all remaining record/constructor fields rather than binding and discarding them.
 
 ```nexus
@@ -284,7 +309,7 @@ match res do
 end
 ```
 
-### 3. Or-patterns to share an arm body across alternatives
+### 4. Or-patterns to share an arm body across alternatives
 When two arms run the same body, fuse them with `|` instead of duplicating. All alternatives must bind the same variable names with compatible types.
 
 ```nexus
@@ -302,7 +327,7 @@ match sign do
 end
 ```
 
-### 4. Punning — drop the label when it matches the local name
+### 5. Punning — drop the label when it matches the local name
 When a function call, constructor call, or constructor pattern passes/binds a variable whose name equals the field label, omit `label:`. The parser desugars `f(x)` to `f(x: x)` and `| Ok(v)` to `| Ok(v: v)`. Applies to function-call args, constructor-call args, and constructor patterns — **not** to record literals or record patterns, which still require `name: value`.
 
 ```nexus
