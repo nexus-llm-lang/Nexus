@@ -116,6 +116,22 @@ end
 
 The `require { PermNet, PermConsole }` clause is checked at compile time and enforced at the WASI runtime level. A function cannot perform network I/O unless it declares `PermNet` and a handler is injected.
 
+## Building
+
+The compiler is shipped as a self-extracting POSIX sh + wasm polyglot. Build it locally:
+
+```bash
+./bootstrap.sh        # produces ./nexus (polyglot launcher) and ./nexus.wasm
+cp nexus ~/.local/bin/   # or anywhere on PATH
+```
+
+[wasmtime](https://wasmtime.dev/) must be installed and on `PATH`. Override the wasm runtime via environment:
+
+```bash
+NEXUS_MAX_WASM_STACK=134217728 nexus foo.nx out.wasm   # 128 MiB stack
+NEXUS_WASMTIME_ARGS="-S http,inherit-network" nexus foo.nx out.wasm
+```
+
 ## Usage
 
 ```bash
@@ -127,6 +143,8 @@ nexus check example.nx      # typecheck only
 nexus check --format json example.nx  # structured diagnostics (LLM-friendly)
 nexus lsp            # start Language Server (stdio)
 ```
+
+Compiled programs run under wasmtime with the capabilities they declare:
 
 ```bash
 wasmtime run -Scli main.wasm
