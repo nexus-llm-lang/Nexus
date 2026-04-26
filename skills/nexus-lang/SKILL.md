@@ -328,27 +328,30 @@ end
 ```
 
 ### 5. Punning — drop the label when it matches the local name
-When a function call, constructor call, or constructor pattern passes/binds a variable whose name equals the field label, omit `label:`. The parser desugars `f(x)` to `f(x: x)` and `| Ok(v)` to `| Ok(v: v)`. Applies to function-call args, constructor-call args, and constructor patterns — **not** to record literals or record patterns, which still require `name: value`.
+When a function call, constructor call, or constructor pattern passes/binds a variable whose name equals the field label, omit `label:`. The parser desugars `f(x)` to `f(x: x)` and `| Ok(v)` to `| Ok(v: v)`. Sigils ride along: `f(%v)`, `f(&v)`, `f(~v)`, `f(@v)`, `f(&%v)` all pun to `f(v: ...)`. Applies to function-call args, constructor-call args, and constructor patterns — **not** to record literals or record patterns, which still require `name: value`.
 
 ```nexus
 // PREFER — pun when names coincide
 let val = 42
 return Mk(val)              // desugars to Mk(val: val)
 f(x)                        // desugars to f(x: x)
+graph.add(%node)            // desugars to graph.add(node: %node)
+ctx.lookup(&env)            // desugars to ctx.lookup(env: &env)
 match w do
   | Mk(val) -> return val   // desugars to | Mk(val: val)
+  | Box(%inner) -> ...      // desugars to | Box(inner: %inner)
 end
 
-// AVOID — redundant `name: name`
+// AVOID — redundant `name: name` / `name: %name`
 return Mk(val: val)
 f(x: x)
-match w do
-  | Mk(val: val) -> return val
-end
+graph.add(node: %node)
 
-// Cannot pun — names differ, or value is not a bare variable
+// Cannot pun — sigil applied to a non-bare-ident value, or names differ
 return Some(val: name)
 greet(name: "Bob")
+f(arg: g(x))               // value is a call, not a bare variable
+f(arg: %x.field)           // value is a field access, not a bare variable
 ```
 
 ## Anti-Patterns to Avoid
