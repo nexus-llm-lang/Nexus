@@ -7,9 +7,16 @@
 //!   Recv removes the cell entry, so the id becomes invalid afterward.
 //!
 //! Linearity at the Nexus surface (stdlib `chan.nx`) makes the "consumed
-//! exactly once" invariant a compile-time guarantee. The runtime traps are
-//! a defence-in-depth check for ABI misuse only — well-typed user code
-//! cannot reach them.
+//! exactly once" invariant a compile-time guarantee on the *success path*.
+//! The runtime traps are a defence-in-depth check for ABI misuse only —
+//! well-typed user code cannot reach them on a non-trapping run.
+//!
+//! Linearity does NOT guarantee "consumed even on trap": a wasm trap
+//! (assertion fail, OOB index, explicit raise, FFI panic) between
+//! `oneshot` and the matching `recv` leaves the cell entry in the host
+//! `cells` map. `teardown` drains the map and must be called at wasm
+//! instance teardown so a trap-leaked cell does not survive across
+//! instance lifetimes when the same `ChanRuntime` is reused.
 //!
 //! Phase 3's blocking semantics (recv waits for a sender via the scheduler)
 //! will replace `recv-on-empty trap` with a yield to the scheduler. The
@@ -123,6 +130,19 @@ impl ChanRuntime {
         }
 
         Ok(())
+    }
+
+    /// Drain every live cell. Call at wasm-instance teardown so a trap
+    /// between `oneshot` and `recv` does not leak the cell beyond the
+    /// instance lifetime. Idempotent.
+    pub fn teardown(&self) {
+        self.0.cells.lock().unwrap().clear();
+    }
+
+    /// Number of live cells. Exposed for teardown verification and host-side
+    /// observability (e.g. asserting no leak after a trap fixture).
+    pub fn cells_len(&self) -> usize {
+        self.0.cells.lock().unwrap().len()
     }
 }
 
@@ -259,6 +279,50 @@ mod tests {
             format!("{err:#}").contains("unknown channel id"),
             "wrong error: {err:#}"
         );
+    }
+
+    /// Regression for nexus-ygxg: a wasm trap between `oneshot` and the
+    /// matching `recv` leaks the cell entry; `teardown` must drain it so the
+    /// host HashMap is empty after instance teardown.
+    #[test]
+    fn trap_between_oneshot_and_recv_drained_by_teardown() {
+        let wat = r#"
+            (module
+              (import "nexus:runtime/chan" "chan-oneshot" (func $oneshot (result i64)))
+              (func (export "main")
+                (local $id i64)
+                (local.set $id (call $oneshot))
+                unreachable))
+        "#;
+        let engine = Engine::default();
+        let module = Module::new(&engine, wat).unwrap();
+        let mut linker = Linker::<()>::new(&engine);
+        let runtime = ChanRuntime::new();
+        runtime.register(&mut linker).unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = linker.instantiate(&mut store, &module).unwrap();
+        let main = inst.get_typed_func::<(), ()>(&mut store, "main").unwrap();
+        let _err = main.call(&mut store, ()).expect_err("must trap");
+
+        assert_eq!(
+            runtime.cells_len(),
+            1,
+            "oneshot-then-trap must leave one cell live (proves the leak the hook addresses)"
+        );
+        runtime.teardown();
+        assert_eq!(
+            runtime.cells_len(),
+            0,
+            "teardown must drain trap-leaked cells"
+        );
+    }
+
+    #[test]
+    fn teardown_is_idempotent_on_empty_runtime() {
+        let runtime = ChanRuntime::new();
+        runtime.teardown();
+        runtime.teardown();
+        assert_eq!(runtime.cells_len(), 0);
     }
 
     #[test]

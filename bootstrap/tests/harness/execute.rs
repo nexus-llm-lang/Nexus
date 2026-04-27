@@ -190,9 +190,13 @@ fn run_main_with_deps_core_capture(wasm: &[u8]) -> Result<String, String> {
         let runtime = lazy::LazyRuntime::new(engine.clone(), module.clone());
         runtime.register(&mut linker)?;
     }
-    if chan::needs_chan_runtime(&bundled) {
-        chan::ChanRuntime::new().register(&mut linker)?;
-    }
+    let chan_runtime = if chan::needs_chan_runtime(&bundled) {
+        let rt = chan::ChanRuntime::new();
+        rt.register(&mut linker)?;
+        Some(rt)
+    } else {
+        None
+    };
     if sched::needs_sched_runtime(&bundled) {
         sched::SchedRuntime::new().register(&mut linker)?;
     }
@@ -223,7 +227,15 @@ fn run_main_with_deps_core_capture(wasm: &[u8]) -> Result<String, String> {
             .get_typed_func::<(), ()>(&mut store, "main")
             .map_err(|e| format!("get main export: {e}"))?
     };
-    entry.call(&mut store, ()).map_err(|e| format!("{e:#}"))?;
+    let call_result = entry.call(&mut store, ());
+
+    // nexus-ygxg: drain chan cells unconditionally so a trap between
+    // oneshot and recv does not leak a cell past instance teardown.
+    if let Some(rt) = &chan_runtime {
+        rt.teardown();
+    }
+
+    call_result.map_err(|e| format!("{e:#}"))?;
 
     // Drop the store first so any buffered stdout is flushed via the
     // MemoryOutputPipe clone we kept around.
@@ -280,9 +292,13 @@ fn run_main_with_deps_core(wasm: &[u8]) -> Result<(), String> {
         runtime.register(&mut linker)?;
     }
 
-    if chan::needs_chan_runtime(&bundled) {
-        chan::ChanRuntime::new().register(&mut linker)?;
-    }
+    let chan_runtime = if chan::needs_chan_runtime(&bundled) {
+        let rt = chan::ChanRuntime::new();
+        rt.register(&mut linker)?;
+        Some(rt)
+    } else {
+        None
+    };
 
     if sched::needs_sched_runtime(&bundled) {
         sched::SchedRuntime::new().register(&mut linker)?;
@@ -312,7 +328,15 @@ fn run_main_with_deps_core(wasm: &[u8]) -> Result<(), String> {
             .get_typed_func::<(), ()>(&mut store, "main")
             .map_err(|e| format!("get main export: {e}"))?
     };
-    entry.call(&mut store, ()).map_err(|e| format!("{e:#}"))
+    let call_result = entry.call(&mut store, ()).map_err(|e| format!("{e:#}"));
+
+    // nexus-ygxg: drain chan cells unconditionally so a trap between
+    // oneshot and recv does not leak past instance teardown.
+    if let Some(rt) = &chan_runtime {
+        rt.teardown();
+    }
+
+    call_result
 }
 
 /// Execute main() -> () on raw WASM bytes (no WASI, no stdlib).
@@ -343,9 +367,13 @@ pub fn run_main(wasm: &[u8]) -> Result<(), String> {
             let runtime = lazy::LazyRuntime::new(engine.clone(), module.clone());
             runtime.register(&mut linker)?;
         }
-        if has_chan {
-            chan::ChanRuntime::new().register(&mut linker)?;
-        }
+        let chan_runtime = if has_chan {
+            let rt = chan::ChanRuntime::new();
+            rt.register(&mut linker)?;
+            Some(rt)
+        } else {
+            None
+        };
         if has_sched {
             sched::SchedRuntime::new().register(&mut linker)?;
         }
@@ -355,7 +383,13 @@ pub fn run_main(wasm: &[u8]) -> Result<(), String> {
         let main = instance
             .get_typed_func::<(), ()>(&mut store, "main")
             .map_err(|e| e.to_string())?;
-        return main.call(&mut store, ()).map_err(|e| e.to_string());
+        let call_result = main.call(&mut store, ()).map_err(|e| e.to_string());
+        // nexus-ygxg: drain chan cells unconditionally so a trap between
+        // oneshot and recv does not leak past instance teardown.
+        if let Some(rt) = &chan_runtime {
+            rt.teardown();
+        }
+        return call_result;
     }
 
     let mut store = Store::new(&engine, ());
