@@ -57,12 +57,8 @@ impl PackageResolver {
     }
 
     pub fn register(&mut self, name: &str, root: impl Into<PathBuf>) {
-        self.packages.insert(
-            name.to_string(),
-            PackageRoot {
-                root: root.into(),
-            },
-        );
+        self.packages
+            .insert(name.to_string(), PackageRoot { root: root.into() });
     }
 
     pub fn package_root(&self, name: &str) -> Option<&PackageRoot> {
@@ -82,8 +78,12 @@ impl PackageResolver {
     /// Resolves a `pkg:path` import to a `ResolvedImport`.
     /// Returns `Err` for unqualified paths or unknown packages.
     pub fn resolve_qualified(&self, import_path: &str) -> Result<ResolvedImport, String> {
-        let (pkg, module_path) = Self::split_qualified(import_path)
-            .ok_or_else(|| format!("import '{}' is not package-qualified (expected 'pkg:path')", import_path))?;
+        let (pkg, module_path) = Self::split_qualified(import_path).ok_or_else(|| {
+            format!(
+                "import '{}' is not package-qualified (expected 'pkg:path')",
+                import_path
+            )
+        })?;
         let root = self
             .package_root(pkg)
             .ok_or_else(|| format!("unknown package '{}' in import '{}'", pkg, import_path))?;
@@ -193,7 +193,10 @@ mod tests {
     #[test]
     fn resolve_import_path_passthrough_for_bare_paths() {
         let r = PackageResolver::default();
-        assert_eq!(r.resolve_import_path("examples/hello.nx"), "examples/hello.nx");
+        assert_eq!(
+            r.resolve_import_path("examples/hello.nx"),
+            "examples/hello.nx"
+        );
     }
 
     #[test]

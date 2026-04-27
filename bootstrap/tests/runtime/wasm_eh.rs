@@ -266,7 +266,9 @@ fn eh_engine() -> Engine {
     let mut config = Config::new();
     config.wasm_exceptions(true);
     config.wasm_tail_call(true);
-    Engine::new(&config).expect("engine with EH + tail_call")
+    config.wasm_function_references(true);
+    config.wasm_stack_switching(true);
+    Engine::new(&config).expect("engine with EH + tail_call + stack_switching")
 }
 
 fn run_wasm(engine: &Engine, wasm: &[u8]) -> Result<(), String> {

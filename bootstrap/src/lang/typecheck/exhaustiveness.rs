@@ -222,8 +222,7 @@ impl TypeChecker {
                         let has_trailing_underscore = args.last().map_or(false, |(label, pat)| {
                             label.is_none() && matches!(pat.node, Pattern::Wildcard)
                         });
-                        let is_wildcard_spread = has_trailing_underscore
-                            && args.len() < arity;
+                        let is_wildcard_spread = has_trailing_underscore && args.len() < arity;
                         if !is_wildcard_spread && args.len() != arity {
                             return Err(format!(
                                 "Arity mismatch in pattern `{}`: expected {} fields, got {}.\nProvided pattern arguments: {}",
@@ -233,19 +232,20 @@ impl TypeChecker {
                                 summarize_ctor_args(args)
                             ));
                         }
-                        let mut nr: Vec<PatRef> = if is_wildcard_spread {
-                            let span = args.last().unwrap().1.span.clone();
-                            let keep = args.len() - 1;
-                            args[..keep]
-                                .iter()
-                                .map(|(_, a)| PatRef::Original(a))
-                                .chain((0..arity - keep).map(|_| {
-                                    PatRef::Synthetic(Pattern::Wildcard, span.clone())
-                                }))
-                                .collect()
-                        } else {
-                            args.iter().map(|(_, a)| PatRef::Original(a)).collect()
-                        };
+                        let mut nr: Vec<PatRef> =
+                            if is_wildcard_spread {
+                                let span = args.last().unwrap().1.span.clone();
+                                let keep = args.len() - 1;
+                                args[..keep]
+                                    .iter()
+                                    .map(|(_, a)| PatRef::Original(a))
+                                    .chain((0..arity - keep).map(|_| {
+                                        PatRef::Synthetic(Pattern::Wildcard, span.clone())
+                                    }))
+                                    .collect()
+                            } else {
+                                args.iter().map(|(_, a)| PatRef::Original(a)).collect()
+                            };
                         nr.extend_from_slice(rest);
                         nm.push(nr);
                     }

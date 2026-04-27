@@ -15,7 +15,7 @@
  * import the public API directly (collect_reachable, filter_reachable_functions,
  * filter_reachable_externals, collect_calls_stmts).
  */
-import { HirStmt, HirStmtKind, HirExpr, HirExprKind, HirCallArg, HirNamedExpr, HirMatchCase, HirFunction, HirExternal, HirHandlerBinding, HirHandlerBindingEntry, EagerBody, LazyBody } from "src/ir/hir_types.nx"
+import { HirStmt, HirStmtKind, HirExpr, HirExprKind, HirCallArg, HirNamedExpr, HirMatchCase, HirFunction, HirHandlerArm, HirExternal, HirHandlerBinding, HirHandlerBindingEntry, EagerBody, LazyBody } from "src/ir/hir_types.nx"
 import * as str from "std:string_ops"
 
 // ─── Local type-specific reverses (see src/common/mono_reverse.nx) ─────────────
@@ -135,7 +135,7 @@ let collect_calls_expr_kind = fn (expr: HirExprKind) -> [string] do
     | Force(expr: e) -> return collect_calls_expr(expr: e)
     | Thunk(body: b) -> return collect_calls_expr(expr: b)
     | ExternalRef(_) -> return []
-    | Handler(port_name: _, functions: fs) -> return collect_calls_functions(funcs: fs)
+    | Handler(port_name: _, arms: arms) -> return collect_calls_functions(funcs: arms_to_funcs(arms))
   end
 end
 
@@ -206,17 +206,54 @@ end
 /// Worklist reachability: starting from "main", collect all transitively called functions.
 export let collect_reachable = fn (functions: [HirFunction], handler_bindings: [HirHandlerBindingEntry]) -> [string] do
   let handler_seeds = collect_handler_seeds(bindings: handler_bindings, acc: [])
-  let worklist = concat_str_lists(a: ["main"], b: handler_seeds)
+  let intrinsic_seeds = collect_intrinsic_seeds(functions, acc: [])
+  let worklist = concat_str_lists(a: ["main"], b: concat_str_lists(a: handler_seeds, b: intrinsic_seeds))
   return reachable_go(worklist, visited: [], functions, handler_bindings)
+end
+
+/// Extra reachability roots: functions that are referenced indirectly by codegen
+/// intrinsics rather than by an explicit call in user code. The sched-spawn
+/// intrinsic emits `ref.func $__nx_sched_trampoline_body` to seed cont.new for
+/// each spawned fiber; without anchoring it as a root the dead-function pass
+/// would prune it before codegen ever asks for the funcref.
+let collect_intrinsic_seeds = fn (functions: [HirFunction], acc: [string]) -> [string] do
+  match functions do
+    | [] -> return acc
+    | HirFunction(name: n, type_params: _, params: _, ret_type: _, body: _, span: _) :: rest ->
+      if str_ends_with_trampoline_body(s: n) then
+        return collect_intrinsic_seeds(functions: rest, acc: n :: acc)
+      end
+      return collect_intrinsic_seeds(functions: rest, acc)
+  end
+end
+
+let str_ends_with_trampoline_body = fn (s: string) -> bool do
+  let suffix = "__nx_sched_trampoline_body"
+  let slen = str.length(s: s)
+  let suflen = str.length(s: suffix)
+  if slen < suflen then return false end
+  return str.substring(s: s, start: slen - suflen, len: suflen) == suffix
 end
 
 let collect_handler_seeds = fn (bindings: [HirHandlerBindingEntry], acc: [string]) -> [string] do
   match bindings do
     | [] -> return acc
-    | HirHandlerBindingEntry(name: bname, binding: HirHandlerBinding(port_name: _, functions: fs)) :: rest ->
+    | HirHandlerBindingEntry(name: bname, binding: HirHandlerBinding(port_name: _, arms: arms)) :: rest ->
+      let fs = arms_to_funcs(arms)
       let calls = collect_calls_functions(funcs: fs)
       let func_names = collect_handler_func_names(funcs: fs)
       return collect_handler_seeds(bindings: rest, acc: concat_str_lists(a: bname :: concat_str_lists(a: func_names, b: calls), b: acc))
+  end
+end
+
+/// Strip cont_binder wrappers from a handler-arm list, yielding plain
+/// HirFunctions for the existing reachability traversal. The cont_binder
+/// itself does not affect call-graph reachability — it's a binder
+/// resolved at codegen, not a function reference.
+let arms_to_funcs = fn (arms: [HirHandlerArm]) -> [HirFunction] do
+  match arms do
+    | [] -> return []
+    | HirHandlerArm(arm: f, cont_binder: _) :: rest -> return f :: arms_to_funcs(arms: rest)
   end
 end
 
@@ -269,7 +306,8 @@ end
 let find_calls_in_handlers = fn (name: string, bindings: [HirHandlerBindingEntry]) -> [string] do
   match bindings do
     | [] -> return []
-    | HirHandlerBindingEntry(name: bname, binding: HirHandlerBinding(port_name: _, functions: fs)) :: rest ->
+    | HirHandlerBindingEntry(name: bname, binding: HirHandlerBinding(port_name: _, arms: arms)) :: rest ->
+      let fs = arms_to_funcs(arms)
       if bname == name then
         return collect_calls_functions(funcs: fs)
       else
@@ -314,7 +352,7 @@ let filter_reachable_externals_go = fn (externals: [HirExternal], reachable: [st
   match externals do
     | [] -> return rev_hir_external(lst: acc, out: [])
     | ext :: rest ->
-      let HirExternal(name: n, wasm_module: _, wasm_name: _, params: _, ret_type: _, throw_row: _) = ext
+      let HirExternal(name: n, wasm_module: _, wasm_name: _, type_params: _, params: _, ret_type: _, throw_row: _) = ext
       if str_in_list(s: n, xs: reachable) then
         return filter_reachable_externals_go(externals: rest, reachable, acc: ext :: acc)
       else

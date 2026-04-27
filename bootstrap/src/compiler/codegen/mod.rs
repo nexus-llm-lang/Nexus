@@ -140,9 +140,7 @@ pub fn compile_program_to_wasm_with_dwarf(program: &Program) -> Result<Vec<u8>, 
 /// `LazyRuntime::with_shared_memory` at the harness layer. Returns the
 /// program's `heap_base` alongside the wasm bytes so the harness can seed
 /// the runtime's atomic allocator. Test-only path for nexus-tb6p.
-pub fn compile_program_to_wasm_threaded(
-    program: &Program,
-) -> Result<(Vec<u8>, i32), CompileError> {
+pub fn compile_program_to_wasm_threaded(program: &Program) -> Result<(Vec<u8>, i32), CompileError> {
     validate_main_returns_unit(program)?;
     let caps = extract_main_require_ports_from_ast(program);
     let mir = build_hir(program).map_err(CompileError::HirBuild)?;

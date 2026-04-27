@@ -3617,9 +3617,9 @@ fn atom_mentions_var_in_stmt(stmt: &LirStmt, var: Symbol) -> bool {
             check(tag)
                 || check_opt(default_ret)
                 || atom_mentions_var_in_stmts(default_body, var)
-                || cases.iter().any(|c| {
-                    check_opt(&c.ret) || atom_mentions_var_in_stmts(&c.body, var)
-                })
+                || cases
+                    .iter()
+                    .any(|c| check_opt(&c.ret) || atom_mentions_var_in_stmts(&c.body, var))
         }
         LirStmt::TryCatch {
             body,
@@ -3754,9 +3754,9 @@ fn stmt_escapes_source(stmt: &LirStmt, source: Symbol) -> bool {
             is_src(tag)
                 || is_src_opt(default_ret)
                 || source_escapes_in_stmts(default_body, source)
-                || cases.iter().any(|c| {
-                    is_src_opt(&c.ret) || source_escapes_in_stmts(&c.body, source)
-                })
+                || cases
+                    .iter()
+                    .any(|c| is_src_opt(&c.ret) || source_escapes_in_stmts(&c.body, source))
         }
         LirStmt::Loop {
             cond_stmts,
@@ -3853,7 +3853,15 @@ mod tests_reuse_alias_safety {
     fn count_ctors(stmts: &[LirStmt]) -> usize {
         stmts
             .iter()
-            .filter(|s| matches!(s, LirStmt::Let { expr: LirExpr::Constructor { .. }, .. }))
+            .filter(|s| {
+                matches!(
+                    s,
+                    LirStmt::Let {
+                        expr: LirExpr::Constructor { .. },
+                        ..
+                    }
+                )
+            })
             .count()
     }
 
@@ -4122,21 +4130,45 @@ mod tests_parallelize_lazy_forces {
     fn count_spawns(stmts: &[LirStmt]) -> usize {
         stmts
             .iter()
-            .filter(|s| matches!(s, LirStmt::Let { expr: LirExpr::LazySpawn { .. }, .. }))
+            .filter(|s| {
+                matches!(
+                    s,
+                    LirStmt::Let {
+                        expr: LirExpr::LazySpawn { .. },
+                        ..
+                    }
+                )
+            })
             .count()
     }
 
     fn count_joins(stmts: &[LirStmt]) -> usize {
         stmts
             .iter()
-            .filter(|s| matches!(s, LirStmt::Let { expr: LirExpr::LazyJoin { .. }, .. }))
+            .filter(|s| {
+                matches!(
+                    s,
+                    LirStmt::Let {
+                        expr: LirExpr::LazyJoin { .. },
+                        ..
+                    }
+                )
+            })
             .count()
     }
 
     fn count_call_indirects(stmts: &[LirStmt]) -> usize {
         stmts
             .iter()
-            .filter(|s| matches!(s, LirStmt::Let { expr: LirExpr::CallIndirect { .. }, .. }))
+            .filter(|s| {
+                matches!(
+                    s,
+                    LirStmt::Let {
+                        expr: LirExpr::CallIndirect { .. },
+                        ..
+                    }
+                )
+            })
             .count()
     }
 

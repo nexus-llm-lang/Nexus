@@ -1,5 +1,7 @@
+use crate::harness::compile::compile_fixture_via_nxc_should_fail;
 use crate::harness::{
-    exec, exec_should_trap, exec_threaded, exec_with_stdlib, exec_with_stdlib_core, read_fixture,
+    exec, exec_nxc_core, exec_nxc_core_capture_stdout, exec_should_trap, exec_threaded,
+    exec_with_stdlib, exec_with_stdlib_core, exec_with_stdlib_core_should_trap, read_fixture,
 };
 
 #[test]
@@ -32,6 +34,8 @@ fn codegen_validate_wasm_output() {
         let mut config = wasmtime::Config::new();
         config.wasm_tail_call(true);
         config.wasm_exceptions(true);
+        config.wasm_function_references(true);
+        config.wasm_stack_switching(true);
         wasmtime::Engine::new(&config).unwrap()
     };
 
@@ -130,6 +134,8 @@ fn exn_field_order_regression() {
         let mut config = wasmtime::Config::new();
         config.wasm_tail_call(true);
         config.wasm_exceptions(true);
+        config.wasm_function_references(true);
+        config.wasm_stack_switching(true);
         wasmtime::Engine::new(&config).unwrap()
     };
 
@@ -193,6 +199,32 @@ fn lazy_host_force() {
 }
 
 #[test]
+fn chan_recv_before_send_traps() {
+    // Phase 1 of nexus-lim: in single-threaded execution, `recv` on an
+    // empty cell traps (Phase 3 will replace this with a yield to the
+    // scheduler). The fixture calls `recv` before `send` and the trap
+    // message must mention "empty" so the failure mode is identifiable.
+    let msg =
+        exec_with_stdlib_core_should_trap(&read_fixture("nxc/test_chan_recv_before_send_traps.nx"));
+    assert!(
+        msg.contains("empty"),
+        "expected runtime trap to mention 'empty', got: {msg}"
+    );
+}
+
+#[test]
+fn chan_oneshot_roundtrip() {
+    // Acceptance test for nexus-lim (Phase 1 of the concurrency epic):
+    // one-shot linear channels via `nexus:runtime/chan` host functions.
+    // The fixture allocates a Pair(tx, rx), sends 42, recvs it back, and
+    // traps via i64.div_s when the value differs. Routed through
+    // `exec_with_stdlib_core` because the chan runtime imports are
+    // satisfied by `ChanRuntime::register` (test harness only — same
+    // wiring scope as the lazy runtime).
+    exec_with_stdlib_core(&read_fixture("nxc/test_chan_oneshot.nx"));
+}
+
+#[test]
 fn lazy_runtime_raw() {
     // Exercises __nx_lazy_spawn + __nx_lazy_join end-to-end on nxc-compiled
     // core WASM (no stdlib / component composition). The fixture self-asserts
@@ -235,9 +267,7 @@ fn trap_probe_div_by_zero_actually_traps() {
     // Wasmtime may not surface the specific trap kind in the message —
     // just confirm a wasm trap actually fired (i.e., the wasm backtrace).
     assert!(
-        trap_msg.contains("wasm")
-            || trap_msg.contains("trap")
-            || trap_msg.contains("divide"),
+        trap_msg.contains("wasm") || trap_msg.contains("trap") || trap_msg.contains("divide"),
         "expected a wasm trap, got: {trap_msg}"
     );
 }
@@ -258,4 +288,108 @@ fn lazy_threaded_atomic_alloc() {
 #[test]
 fn exception_group_catch() {
     exec_with_stdlib(&read_fixture("nxc/test_exception_group.nx"));
+}
+
+#[test]
+fn handler_with_kont_resume() {
+    exec_nxc_core("bootstrap/tests/fixtures/nxc/test_handler_with_kont_resume.nx");
+}
+
+#[test]
+fn handler_kont_forget_is_linearity_error() {
+    let err = compile_fixture_via_nxc_should_fail(
+        "bootstrap/tests/fixtures/nxc/test_handler_kont_forget.nx",
+    );
+    assert!(
+        err.contains("E2005"),
+        "expected E2005 linearity error, got: {err}"
+    );
+}
+
+#[test]
+fn handler_kont_double_force_is_linearity_error() {
+    let err = compile_fixture_via_nxc_should_fail(
+        "bootstrap/tests/fixtures/nxc/test_handler_kont_double_force.nx",
+    );
+    assert!(
+        err.contains("E2006"),
+        "expected E2006 linearity error, got: {err}"
+    );
+}
+
+#[test]
+fn handler_kont_type_mismatch() {
+    let err = compile_fixture_via_nxc_should_fail(
+        "bootstrap/tests/fixtures/nxc/test_handler_kont_type_mismatch.nx",
+    );
+    assert!(
+        err.contains("E2001"),
+        "expected E2001 type mismatch, got: {err}"
+    );
+}
+
+#[test]
+fn sched_yield_roundtrip() {
+    exec_nxc_core("bootstrap/tests/fixtures/nxc/test_sched_yield.nx");
+}
+
+#[test]
+fn sched_producer_consumer() {
+    // Acceptance for nexus-bes5 #5b: producer-consumer using Phase 1 channels
+    // + scheduler. Producer yields once then `send`s; consumer yields once
+    // then `recv`s and `Console.println`s. Expected stdout: a single line "42".
+    let out = exec_nxc_core_capture_stdout(
+        "bootstrap/tests/fixtures/nxc/test_sched_producer_consumer.nx",
+    );
+    let trimmed = out.trim();
+    assert_eq!(
+        trimmed, "42",
+        "expected single line `42`, got — full stdout:\n{}",
+        out
+    );
+}
+
+#[test]
+fn sched_multi_fiber_spawn() {
+    // Acceptance for nexus-bes5 #5a: spawn 3 fibers each yielding 2 times,
+    // observe round-robin interleaving via Console.println. Empty stdout =
+    // fibers never ran (the queue-based scheduler silently dropped them).
+    let out = exec_nxc_core_capture_stdout("bootstrap/tests/fixtures/nxc/test_sched_multi_fiber.nx");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines.len(),
+        9,
+        "expected 9 lines (3 fibers x 3 prints), got {} — full stdout:\n{}",
+        lines.len(),
+        out
+    );
+    // Each fiber must print all 3 of its phases.
+    for fiber in &["f1", "f2", "f3"] {
+        for phase in &["a", "b", "c"] {
+            let needle = format!("{}.{}", fiber, phase);
+            assert!(
+                lines.iter().any(|l| l.trim() == needle),
+                "missing line {:?} in stdout — full:\n{}",
+                needle,
+                out
+            );
+        }
+    }
+    // Round-robin interleaving: the first occurrence of f1.a, f2.a, f3.a
+    // must precede the first occurrence of any *.b. (Cooperative single-step
+    // scheduling implies all 3 fibers print phase `a` before any prints `b`.)
+    let pos = |needle: &str| lines.iter().position(|l| l.trim() == needle).unwrap();
+    let first_b = [pos("f1.b"), pos("f2.b"), pos("f3.b")]
+        .iter()
+        .copied()
+        .min()
+        .unwrap();
+    for fiber in &["f1", "f2", "f3"] {
+        let a = pos(&format!("{}.a", fiber));
+        assert!(
+            a < first_b,
+            "fiber {}.a (line {}) ran after the first .b (line {}) — scheduler isn't round-robin yielding\nfull:\n{}",
+            fiber, a, first_b, out
+        );
+    }
 }

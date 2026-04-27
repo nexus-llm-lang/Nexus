@@ -8,7 +8,7 @@
 import * as bb from "std:bytebuffer"
 import * as naming from "src/common/naming.nx"
 import { TypeExpr, TyUnit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyHandler, NamedType, EnumDef, VariantDef, VariantField } from "src/common/ast.nx"
-import { HirProgram, HirFunction, HirParam, HirExternal, HirPort, HirHandlerBindingEntry, HirHandlerBinding, EagerBody, LazyBody } from "src/ir/hir_types.nx"
+import { HirProgram, HirFunction, HirHandlerArm, HirParam, HirExternal, HirPort, HirHandlerBindingEntry, HirHandlerBinding, EagerBody, LazyBody } from "src/ir/hir_types.nx"
 import { TypeMismatch, MissingMain, MainNotFunction, MainNotUnit } from "src/common/error.nx"
 import { CheckState, Scheme, EnvEntry, EnumEntry, InferExprOk, InferExprErr }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
@@ -32,8 +32,17 @@ export let check_program = fn (hir: HirProgram, local_names: [string]) -> HirPro
   let st4 = register_handler_bindings(state: st3, hbs)
   let st5 = register_enum_constructors(state: st4, defs: edefs)
 
+  // Build cont_binder map for arm functions: synthesised arm fn name → binder name.
+  let cont_binder_map = build_cont_binder_map(hbs)
+
   // Pass 2: Check only local (main module) function bodies
-  check_all_functions(state: st5, funcs, local_names)
+  check_all_functions(state: st5, funcs, local_names, cont_map: cont_binder_map)
+
+  // Pass 2b: Check handler arm bodies (synthesised function names aren't in
+  // local_names, so they're missed by check_all_functions). With-kont arms
+  // need their body re-checked with the cont binder bound in env so that
+  // forcing @k at the wrong type is a TypeMismatch.
+  check_handler_arm_bodies(state: st5, hbs)
 
   // Validate main exists and has correct signature
   validate_main(state: st5)
@@ -87,7 +96,52 @@ let build_enum_entries_go = fn (defs: [EnumDef], acc: [EnumEntry]) -> [EnumEntry
   match defs do
     | [] -> return rev_enum_entries(lst: acc, out: [])
     | EnumDef(name: n, is_public: p, is_opaque: o, type_params: tps, variants: vs) :: rest ->
-      return build_enum_entries_go(defs: rest, acc: EnumEntry(name: n, def: EnumDef(name: n, is_public: p, is_opaque: o, type_params: tps, variants: vs)) :: acc)
+      // Convert TyUserDefined("T",[]) → TyVar("T") in variant field types so
+      // that infer_constructor's freshen+subst_apply pipeline can rename T to
+      // a fresh metavar. Without this, T survives as a frozen UD inside the
+      // EnumVariantInfo and downstream unification fails to instantiate it.
+      let converted_vs = convert_variants(variants: vs, vars: tps)
+      return build_enum_entries_go(defs: rest, acc: EnumEntry(name: n, def: EnumDef(name: n, is_public: p, is_opaque: o, type_params: tps, variants: converted_vs)) :: acc)
+  end
+end
+
+let convert_variants = fn (variants: [VariantDef], vars: [string]) -> [VariantDef] do
+  return convert_variants_go(variants, vars, acc: [])
+end
+
+let convert_variants_go = fn (variants: [VariantDef], vars: [string], acc: [VariantDef]) -> [VariantDef] do
+  match variants do
+    | [] -> return rev_variant_defs(lst: acc, out: [])
+    | VariantDef(name: vn, fields: fs) :: rest ->
+      let cf = convert_variant_fields(fields: fs, vars)
+      return convert_variants_go(variants: rest, vars, acc: VariantDef(name: vn, fields: cf) :: acc)
+  end
+end
+
+let convert_variant_fields = fn (fields: [VariantField], vars: [string]) -> [VariantField] do
+  return convert_variant_fields_go(fields, vars, acc: [])
+end
+
+let convert_variant_fields_go = fn (fields: [VariantField], vars: [string], acc: [VariantField]) -> [VariantField] do
+  match fields do
+    | [] -> return rev_variant_fields(lst: acc, out: [])
+    | VariantField(name: mn, typ: t) :: rest ->
+      return convert_variant_fields_go(fields: rest, vars,
+        acc: VariantField(name: mn, typ: convert_ud_to_var(typ: t, vars)) :: acc)
+  end
+end
+
+let rev_variant_defs = fn (lst: [VariantDef], out: [VariantDef]) -> [VariantDef] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_variant_defs(lst: rest, out: x :: out)
+  end
+end
+
+let rev_variant_fields = fn (lst: [VariantField], out: [VariantField]) -> [VariantField] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_variant_fields(lst: rest, out: x :: out)
   end
 end
 
@@ -96,14 +150,19 @@ end
 let register_externals = fn (state: CheckState, exts: [HirExternal]) -> CheckState do
   match exts do
     | [] -> return state
-    | HirExternal(name: n, wasm_module: _, wasm_name: _, params, ret_type: ret, throw_row: thr) :: rest ->
+    | HirExternal(name: n, wasm_module: _, wasm_name: _, type_params: tps, params, ret_type: ret, throw_row: thr) :: rest ->
       let param_types = hir_params_to_named_types(params)
+      // Convert TyUserDefined("T",[]) → TyVar("T") for declared type params,
+      // then register as a polymorphic Scheme so each call site instantiates
+      // T to a fresh metavar. Without this `external f: <T>(val: T) -> unit`
+      // freezes T as a frozen non-int type and rejects int-literal callers.
       let arrow = TyArrow(
-        params: param_types, ret,
+        params: convert_named_types(nts: param_types, vars: tps),
+        ret: convert_ud_to_var(typ: ret, vars: tps),
         requires: TyRow(types: [], rest: None),
-        throw_row: thr
+        throw_row: convert_ud_to_var(typ: thr, vars: tps)
       )
-      let env = tctypes.env_insert(env: tctypes.state_env(state), name: n, scheme: tctypes.mono(typ: arrow))
+      let env = tctypes.env_insert(env: tctypes.state_env(state), name: n, scheme: Scheme(vars: tps, typ: arrow))
       return register_externals(state: tctypes.state_with_env(state, env), exts: rest)
   end
 end
@@ -224,31 +283,42 @@ end
 let register_handler_bindings = fn (state: CheckState, hbs: [HirHandlerBindingEntry]) -> CheckState do
   match hbs do
     | [] -> return state
-    | HirHandlerBindingEntry(name: n, binding: HirHandlerBinding(port_name: pname, functions: funcs)) :: rest ->
+    | HirHandlerBindingEntry(name: n, binding: HirHandlerBinding(port_name: pname, arms: arms)) :: rest ->
       let handler_type = TyHandler(name: pname, requires: TyRow(types: [], rest: None))
       let env1 = tctypes.env_insert(env: tctypes.state_env(state), name: n, scheme: tctypes.mono(typ: handler_type))
-      // Also register individual methods as port_name.method_name
       let prefix_len = naming.handler_prefix_len(handler_name: n)
-      let env2 = register_handler_methods(env: env1, port_name: pname, prefix_len, funcs)
+      let env2 = register_handler_methods(env: env1, port_name: pname, prefix_len, arms)
       let st1 = tctypes.state_with_env(state, env: env2)
       return register_handler_bindings(state: st1, hbs: rest)
   end
 end
 
-let register_handler_methods = fn (env: [EnvEntry], port_name: string, prefix_len: i64, funcs: [HirFunction]) -> [EnvEntry] do
-  match funcs do
+let register_handler_methods = fn (env: [EnvEntry], port_name: string, prefix_len: i64, arms: [HirHandlerArm]) -> [EnvEntry] do
+  match arms do
     | [] -> return env
-    | HirFunction(name: n, type_params: _, params, ret_type: ret, body: _, span: _) :: rest ->
+    | HirHandlerArm(arm: HirFunction(name: n, type_params: _, params, ret_type: ret, _), cont_binder: kb) :: rest ->
       let original_name = str.substring(s: n, start: prefix_len, len: str.length(s: n) - prefix_len)
       let method_name = bb.concat(parts: [port_name, ".", original_name])
-      let param_types = hir_params_to_named_types(params)
+      let user_params = match kb do
+        | Some(_) -> list_init(xs: params)
+        | None -> params
+      end
+      let param_types = hir_params_to_named_types(params: user_params)
       let arrow = TyArrow(
         params: param_types, ret,
         requires: TyRow(types: [], rest: None),
         throw_row: TyRow(types: [], rest: None)
       )
       let env1 = tctypes.env_insert(env, name: method_name, scheme: tctypes.mono(typ: arrow))
-      return register_handler_methods(env: env1, port_name, prefix_len, funcs: rest)
+      return register_handler_methods(env: env1, port_name, prefix_len, arms: rest)
+  end
+end
+
+let list_init = fn (xs: [HirParam]) -> [HirParam] do
+  match xs do
+    | [] -> return []
+    | _ :: [] -> return []
+    | x :: rest -> return x :: list_init(xs: rest)
   end
 end
 
@@ -329,19 +399,101 @@ let is_local = fn (name: string, local_names: [string]) -> bool do
   end
 end
 
-let check_all_functions = fn (state: CheckState, funcs: [HirFunction], local_names: [string]) -> unit throws { Exn } do
+/// Map from synthesised arm function name (e.g. `__handler_scheduler_yield`)
+/// to the `with @k` binder name. Empty for arms without cont_binder.
+type ContBinderMap = ContBinderMap(entries: [ContBinderEntry])
+type ContBinderEntry = ContBinderEntry(arm_fn_name: string, binder: string)
+
+let build_cont_binder_map = fn (hbs: [HirHandlerBindingEntry]) -> ContBinderMap throws { Exn } do
+  return ContBinderMap(entries: build_cont_binder_entries(hbs, acc: []))
+end
+
+let build_cont_binder_entries = fn (hbs: [HirHandlerBindingEntry], acc: [ContBinderEntry]) -> [ContBinderEntry] throws { Exn } do
+  match hbs do
+    | [] -> return acc
+    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, arms)) :: rest ->
+      let acc2 = collect_arm_binders(arms, acc)
+      return build_cont_binder_entries(hbs: rest, acc: acc2)
+  end
+end
+
+let collect_arm_binders = fn (arms: [HirHandlerArm], acc: [ContBinderEntry]) -> [ContBinderEntry] throws { Exn } do
+  match arms do
+    | [] -> return acc
+    | HirHandlerArm(arm: HirFunction(name: fname, type_params: _, params: _, ret_type: _, body: _, span: _), cont_binder: Some(val: k)) :: rest ->
+      return collect_arm_binders(arms: rest, acc: ContBinderEntry(arm_fn_name: fname, binder: k) :: acc)
+    | _ :: rest -> return collect_arm_binders(arms: rest, acc)
+  end
+end
+
+let lookup_cont_binder = fn (fname: string, map: ContBinderMap) -> Option<string> throws { Exn } do
+  match map do | ContBinderMap(entries) -> return lookup_cont_binder_in(fname, entries) end
+end
+
+let lookup_cont_binder_in = fn (fname: string, entries: [ContBinderEntry]) -> Option<string> throws { Exn } do
+  match entries do
+    | [] -> return None
+    | ContBinderEntry(arm_fn_name: an, binder: b) :: rest ->
+      if an == fname then return Some(val: b) end
+      return lookup_cont_binder_in(fname, entries: rest)
+  end
+end
+
+let check_all_functions = fn (state: CheckState, funcs: [HirFunction], local_names: [string], cont_map: ContBinderMap) -> unit throws { Exn } do
   match funcs do
     | [] -> return ()
     | func :: rest ->
       let HirFunction(name, type_params: _, params: _, ret_type: _, body: _, span: _) = func
       if is_local(name, local_names) then
-        check_function(state, func)
+        check_function(state, func, cont_map)
       end
-      return check_all_functions(state, funcs: rest, local_names)
+      return check_all_functions(state, funcs: rest, local_names, cont_map)
   end
 end
 
-let check_function = fn (state: CheckState, func: HirFunction) -> unit throws { Exn } do
+let check_handler_arm_bodies = fn (state: CheckState, hbs: [HirHandlerBindingEntry]) -> unit throws { Exn } do
+  match hbs do
+    | [] -> return ()
+    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, arms)) :: rest ->
+      check_arm_bodies(state, arms)
+      return check_handler_arm_bodies(state, hbs: rest)
+  end
+end
+
+let check_arm_bodies = fn (state: CheckState, arms: [HirHandlerArm]) -> unit throws { Exn } do
+  match arms do
+    | [] -> return ()
+    | HirHandlerArm(arm: f, cont_binder: Some(val: k)) :: rest ->
+      // Only with-kont arms re-checked here so we can bind @k in env;
+      // non-kont arms are picked up via the normal function pass.
+      check_arm_body(state, func: f, cont_binder: Some(val: k))
+      return check_arm_bodies(state, arms: rest)
+    | _ :: rest -> return check_arm_bodies(state, arms: rest)
+  end
+end
+
+let check_arm_body = fn (state: CheckState, func: HirFunction, cont_binder: Option<string>) -> unit throws { Exn } do
+  let HirFunction(name, type_params: tps, params, ret_type: ret, body: hir_body, span: _) = func
+  let body = match hir_body do | EagerBody(stmts: s) -> s | LazyBody(_) -> [] end
+  let conv_params = convert_hir_params(params, vars: tps)
+  let conv_ret = convert_ud_to_var(typ: ret, vars: tps)
+  let body_env = add_func_params(env: tctypes.state_env(state), params: conv_params)
+  // If the arm has `with @k`, bind k in env as @ret_type. Standard inference
+  // then catches type mismatches when the arm body forces k at a wrong type.
+  let body_env2 = match cont_binder do
+    | Some(val: k) -> tctypes.env_insert(env: body_env, name: k, scheme: tctypes.mono(typ: TyLazy(inner: conv_ret)))
+    | None -> body_env
+  end
+  let body_state = tctypes.state_with_env(state, env: body_env2)
+  match infer.infer_stmts(state: body_state, stmts: body, ret_type: conv_ret) do
+    | InferExprErr(message: m, span: err_span) ->
+      raise TypeMismatch(func_name: name, detail: m, span: err_span)
+    | InferExprOk(_) ->
+      return ()
+  end
+end
+
+let check_function = fn (state: CheckState, func: HirFunction, cont_map: ContBinderMap) -> unit throws { Exn } do
   let HirFunction(name, type_params: tps, params, ret_type: ret, body: hir_body, span) = func
   let body = match hir_body do | EagerBody(stmts: s) -> s | LazyBody(_) -> [] end
   // Convert UserDefined type params to TyVar in param types and return type
@@ -349,7 +501,16 @@ let check_function = fn (state: CheckState, func: HirFunction) -> unit throws { 
   let conv_ret = convert_ud_to_var(typ: ret, vars: tps)
   // Build local env with function params
   let body_env = add_func_params(env: tctypes.state_env(state), params: conv_params)
-  let body_state = tctypes.state_with_env(state, env: body_env)
+  // If this function is a handler arm with `with @k`, bind k as @ret in the
+  // body env. Forcing k yields the arm's return type; using it at any other
+  // type is a TypeMismatch (acceptance (d) for nexus-x7w).
+  // If this function is a handler arm with `with @k`, bind k as @ret in the
+  // body env. Standard inference catches force-at-wrong-type mismatches.
+  let body_env2 = match lookup_cont_binder(fname: name, map: cont_map) do
+    | Some(val: k) -> tctypes.env_insert(env: body_env, name: k, scheme: tctypes.mono(typ: TyLazy(inner: conv_ret)))
+    | None -> body_env
+  end
+  let body_state = tctypes.state_with_env(state, env: body_env2)
   match infer.infer_stmts(state: body_state, stmts: body, ret_type: conv_ret) do
     | InferExprErr(message: m, span: err_span) ->
       raise TypeMismatch(func_name: name, detail: m, span: err_span)

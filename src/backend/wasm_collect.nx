@@ -64,6 +64,11 @@ let collect_expr_strings = fn (expr: LirExpr, acc: [string]) -> [string] do
     | LirExprMakeClosure(func_name: _, captures: caps, typ: _) -> collect_atom_list_strings(atoms: caps, acc)
     | LirExprCallClosure(closure: c, args, typ: _) ->
       collect_call_arg_strings(args, acc: collect_atom_strings(atom: c, acc))
+    | LirExprSuspend(tag_name: _, payload: p, typ: _) -> collect_atom_strings(atom: p, acc)
+    | LirExprResume(cont: c, value: v, typ: _) ->
+      collect_atom_strings(atom: v, acc: collect_atom_strings(atom: c, acc))
+    | LirExprContNew(func_ref: _, typ: _) -> acc
+    | LirExprInjectResume(body_fn: _, arm_fns: _, arm_tags: _, typ: _) -> acc
   end
 end
 
@@ -292,6 +297,154 @@ export let program_needs_eh = fn (funcs: [LirFunction]) -> bool do
     | LirFunction(name: _, params: _, ret_type: _, body: b, ret: _, span: _) :: rest ->
       if stmts_need_eh(stmts: b) then return true end
       return program_needs_eh(funcs: rest)
+  end
+end
+
+// ─── Stack-switching detection ──────────────────────────────────────────────
+
+let expr_needs_ss = fn (expr: LirExpr) -> bool do
+  match expr do
+    | LirExprSuspend(_) -> true
+    | LirExprResume(_) -> true
+    | LirExprContNew(_) -> true
+    | LirExprInjectResume(_) -> true
+    | _ -> false
+  end
+end
+
+let stmt_needs_ss = fn (stmt: LirStmt) -> bool do
+  match stmt do
+    | LirStmtLet(name: _, typ: _, expr: e) -> expr_needs_ss(expr: e)
+    | LirStmtIf(cond: _, then_body: tb, else_body: eb) ->
+      stmts_need_ss(stmts: tb) || stmts_need_ss(stmts: eb)
+    | LirStmtIfReturn(cond: _, then_body: tb, then_ret: _, else_body: eb, else_ret: _, ret_type: _) ->
+      stmts_need_ss(stmts: tb) || stmts_need_ss(stmts: eb)
+    | LirStmtLoop(cond_stmts: cs, cond: _, body: b) ->
+      stmts_need_ss(stmts: cs) || stmts_need_ss(stmts: b)
+    | LirStmtTryCatch(body: b, body_ret: _, catch_param: _, catch_param_typ: _, catch_body: cb, catch_ret: _) ->
+      stmts_need_ss(stmts: b) || stmts_need_ss(stmts: cb)
+  end
+end
+
+let stmts_need_ss = fn (stmts: [LirStmt]) -> bool do
+  match stmts do
+    | [] -> false
+    | s :: rest ->
+      if stmt_needs_ss(stmt: s) then return true end
+      return stmts_need_ss(stmts: rest)
+  end
+end
+
+export let program_needs_stack_switching = fn (funcs: [LirFunction]) -> bool do
+  match funcs do
+    | [] -> false
+    | LirFunction(name: _, params: _, ret_type: _, body: b, ret: _, span: _) :: rest ->
+      if stmts_need_ss(stmts: b) then return true end
+      return program_needs_stack_switching(funcs: rest)
+  end
+end
+
+// ─── Stack-switching tag-name collection ────────────────────────────────────
+//
+// Each `MirSuspend(tag_name)` and `LirExprInjectResume.arm_tags` entry in the
+// program identifies a `<port>::<method>` cap method. Phase-2's earlier
+// implementation conflated them all onto a single wasm tag, which made
+// multi-cap-method handlers impossible to dispatch (every suspend routed to
+// `afs[0]`). We now allocate one wasm tag per distinct cap method and use
+// `on tag_i → label_i` clauses on the `resume` instruction so the dispatcher
+// can branch directly to the matching arm.
+
+// ALL match arms below use explicit `return`. Mixed return / non-return arms
+// triggered an apparent infinite loop on bootstrap-self-compile previously
+// (root cause not nailed; defensive uniformity).
+
+let str_list_contains = fn (xs: [string], target: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == target then return true end
+      return str_list_contains(xs: rest, target)
+  end
+end
+
+let collect_expr_tag_names = fn (expr: LirExpr, acc: [string]) -> [string] do
+  match expr do
+    | LirExprSuspend(tag_name: tn, payload: _, typ: _) ->
+      if str_list_contains(xs: acc, target: tn) then return acc end
+      return tn :: acc
+    | LirExprInjectResume(body_fn: _, arm_fns: _, arm_tags: ats, typ: _) ->
+      // Include arm declarations even if no suspend uses them. A handler may
+      // declare arms (yield, spawn) but a particular fixture only uses one;
+      // the dispatcher still emits on-clauses for all, so all need a tag.
+      return merge_tag_list(xs: ats, acc)
+    | _ -> return acc
+  end
+end
+
+/// Append unique entries from `xs` to `acc`. Linear in |xs| × |acc|; both
+/// lists are tiny in practice (≤ a handful of cap-method tags).
+let merge_tag_list = fn (xs: [string], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | x :: rest ->
+      if str_list_contains(xs: acc, target: x) then
+        return merge_tag_list(xs: rest, acc)
+      end
+      return merge_tag_list(xs: rest, acc: x :: acc)
+  end
+end
+
+let collect_stmt_tag_names = fn (stmt: LirStmt, acc: [string]) -> [string] do
+  match stmt do
+    | LirStmtLet(name: _, typ: _, expr: e) -> return collect_expr_tag_names(expr: e, acc)
+    | LirStmtIf(cond: _, then_body: tb, else_body: eb) ->
+      let acc1 = collect_stmts_tag_names(stmts: tb, acc)
+      return collect_stmts_tag_names(stmts: eb, acc: acc1)
+    | LirStmtIfReturn(cond: _, then_body: tb, then_ret: _, else_body: eb, else_ret: _, ret_type: _) ->
+      let acc1 = collect_stmts_tag_names(stmts: tb, acc)
+      return collect_stmts_tag_names(stmts: eb, acc: acc1)
+    | LirStmtLoop(cond_stmts: cs, cond: _, body: b) ->
+      let acc1 = collect_stmts_tag_names(stmts: cs, acc)
+      return collect_stmts_tag_names(stmts: b, acc: acc1)
+    | LirStmtTryCatch(body: b, body_ret: _, catch_param: _, catch_param_typ: _, catch_body: cb, catch_ret: _) ->
+      let acc1 = collect_stmts_tag_names(stmts: b, acc)
+      return collect_stmts_tag_names(stmts: cb, acc: acc1)
+  end
+end
+
+let collect_stmts_tag_names = fn (stmts: [LirStmt], acc: [string]) -> [string] do
+  match stmts do
+    | [] -> return acc
+    | s :: rest ->
+      let acc1 = collect_stmt_tag_names(stmt: s, acc)
+      return collect_stmts_tag_names(stmts: rest, acc: acc1)
+  end
+end
+
+export let collect_program_tag_names = fn (funcs: [LirFunction]) -> [string] do
+  return collect_program_tag_names_go(funcs, acc: [])
+end
+
+let collect_program_tag_names_go = fn (funcs: [LirFunction], acc: [string]) -> [string] do
+  match funcs do
+    | [] -> return acc
+    | LirFunction(name: _, params: _, ret_type: _, body: b, ret: _, span: _) :: rest ->
+      let acc1 = collect_stmts_tag_names(stmts: b, acc)
+      return collect_program_tag_names_go(funcs: rest, acc: acc1)
+  end
+end
+
+/// Linear lookup: tag_name → index in `tag_names`. Returns -1 if absent.
+export let lookup_tag_idx = fn (tag_name: string, tag_names: [string]) -> i64 do
+  return lookup_tag_idx_go(tag_name, tag_names, idx: 0)
+end
+
+let lookup_tag_idx_go = fn (tag_name: string, tag_names: [string], idx: i64) -> i64 do
+  match tag_names do
+    | [] -> return 0 - 1
+    | x :: rest ->
+      if x == tag_name then return idx end
+      return lookup_tag_idx_go(tag_name, tag_names: rest, idx: idx + 1)
   end
 end
 

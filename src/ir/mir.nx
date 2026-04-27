@@ -22,10 +22,30 @@ import * as naming from "src/common/naming.nx"
 import * as str from "std:string_ops"
 import * as list from "std:list"
 import { Literal, TypeExpr } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
 import * as hir from "src/ir/hir_types.nx"
-import { HirStmtKind, HirCallArg, HirParam, HirFunction, HirMatchCase, HirPatternKind, HirPatternField, HirRecordPatField, HirPort, HirPortMethod, HirExternal, HirHandlerBinding, HirHandlerBindingEntry, HirProgram, HirNamedExpr, HirExpr, HirStmt, EagerBody, LazyBody } from "src/ir/hir_types.nx"
+import { HirStmtKind, HirCallArg, HirParam, HirFunction, HirHandlerArm, HirMatchCase, HirPatternKind, HirPatternField, HirRecordPatField, HirPort, HirPortMethod, HirExternal, HirHandlerBinding, HirHandlerBindingEntry, HirProgram, HirNamedExpr, HirExpr, HirStmt, EagerBody, LazyBody } from "src/ir/hir_types.nx"
 import { MirParam, MirExternal, MirFunction, MirCallArg, MirExpr, MirNamedExpr, MirStmt, MirMatchCase, MirPattern, MirPatternField, MirRecordPatField, MirProgram, NamePair, PortEntry, PortCallResult, PortCallFound, PortCallNotFound, MirCtx, MirExprResult, MirStmtsResult, MirCallArgsResult, MirExprListResult, MirNamedExprsResult, MirMatchCasesResult, LowerFunctionsResult, LowerFunctionResult } from "src/ir/mir_types.nx"
 import { build_port_layouts, lookup_port, infer_handler_port_names, find_handler_by_port, reverse_lookup, lookup_ret_type, lookup_known_ret_type, detect_port_call } from "src/ir/mir/port.nx"
+
+// ─── Cont-binder helpers ────────────────────────────────────────────────────
+
+let ctx_cont_binders = fn (ctx: MirCtx) -> [string] do
+  match ctx do | MirCtx(scope: _, port_layouts: _, handler_port_names: _, all_funcs: _, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: _, cont_binders: cb) -> return cb end
+end
+
+let cb_has_any = fn (cb: [string]) -> bool do
+  match cb do | [] -> return false | _ -> return true end
+end
+
+let list_has = fn (name: string, names: [string]) -> bool do
+  match names do
+    | [] -> return false
+    | h :: rest ->
+      if h == name then return true end
+      return list_has(name, names: rest)
+  end
+end
 
 // ─── Lookup helpers (list-based maps) ────────────────────────────────────────
 
@@ -77,8 +97,15 @@ end
 let build_handler_port_names_go = fn (bindings: [HirHandlerBindingEntry], acc: [NamePair]) -> [NamePair] throws { Exn } do
   match bindings do
     | [] -> return rev_name_pairs(lst: acc, out: [])
-    | HirHandlerBindingEntry(name: bname, binding: HirHandlerBinding(port_name: pname, functions: _)) :: rest ->
+    | HirHandlerBindingEntry(name: bname, binding: HirHandlerBinding(port_name: pname, arms: _)) :: rest ->
       return build_handler_port_names_go(bindings: rest, acc: NamePair(key: bname, value: pname) :: acc)
+  end
+end
+
+let arms_to_funcs = fn (arms: [HirHandlerArm]) -> [HirFunction] do
+  match arms do
+    | [] -> return []
+    | HirHandlerArm(arm: f, cont_binder: _) :: rest -> return f :: arms_to_funcs(arms: rest)
   end
 end
 
@@ -130,7 +157,8 @@ export let lower_hir_to_mir = fn (hir: HirProgram) -> MirProgram throws { Exn } 
     all_handlers: hbs,
     all_exts: exts,
     closure_counter: 0,
-    lifted_funcs: []
+    lifted_funcs: [],
+    cont_binders: []
   )
 
   let mir_externals = lower_externals(exts)
@@ -140,7 +168,7 @@ export let lower_hir_to_mir = fn (hir: HirProgram) -> MirProgram throws { Exn } 
   match funcs_r do | LowerFunctionsResult(ctx: ctx1, funcs: mir_funcs) ->
     let hfuncs_r = lower_handler_functions(bindings: hbs, ctx: ctx1)
     match hfuncs_r do | LowerFunctionsResult(ctx: ctx2, funcs: mir_handler_funcs) ->
-      let MirCtx(scope: _, port_layouts: _, handler_port_names: _, all_funcs: _, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: lifted) = ctx2
+      let MirCtx(scope: _, port_layouts: _, handler_port_names: _, all_funcs: _, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: lifted, cont_binders: _) = ctx2
       let user_plus_handlers = concat_mir_funcs(a: mir_funcs, b: mir_handler_funcs)
       let all_mir_funcs = concat_mir_funcs(a: user_plus_handlers, b: lifted)
       return MirProgram(functions: all_mir_funcs, externals: mir_externals)
@@ -157,7 +185,7 @@ end
 let lower_externals_go = fn (exts: [HirExternal], acc: [MirExternal]) -> [MirExternal] throws { Exn } do
   match exts do
     | [] -> return rev_mir_externals(lst: acc, out: [])
-    | HirExternal(name: n, wasm_module: wm, wasm_name: wn, params: ps, ret_type: rt, throw_row: tr) :: rest ->
+    | HirExternal(name: n, wasm_module: wm, wasm_name: wn, type_params: _, params: ps, ret_type: rt, throw_row: tr) :: rest ->
       let mir_params = lower_hir_params(params: ps)
       return lower_externals_go(exts: rest, acc: MirExternal(name: n, wasm_module: wm, wasm_name: wn,
                        params: mir_params, ret_type: rt, throw_row: tr) :: acc)
@@ -199,11 +227,38 @@ end
 let lower_handler_functions_go = fn (bindings: [HirHandlerBindingEntry], ctx: MirCtx, acc: [MirFunction]) -> LowerFunctionsResult throws { Exn } do
   match bindings do
     | [] -> return LowerFunctionsResult(ctx, funcs: rev_mir_funcs(lst: acc, out: []))
-    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, functions: fs)) :: rest ->
-      match lower_functions(functions: fs, ctx) do | LowerFunctionsResult(ctx: ctx2, funcs: lowered) ->
+    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, arms: arms)) :: rest ->
+      // Lower each arm with its cont_binder (if any) installed in ctx so
+      // that `force k` inside the arm body resolves to MirResume.
+      match lower_arms_with_konts(arms, ctx) do | LowerFunctionsResult(ctx: ctx2, funcs: lowered) ->
         let new_acc = prepend_reversed(src: lowered, dst: acc)
         return lower_handler_functions_go(bindings: rest, ctx: ctx2, acc: new_acc)
       end
+  end
+end
+
+let lower_arms_with_konts = fn (arms: [HirHandlerArm], ctx: MirCtx) -> LowerFunctionsResult throws { Exn } do
+  return lower_arms_with_konts_go(arms, ctx, acc: [])
+end
+
+let lower_arms_with_konts_go = fn (arms: [HirHandlerArm], ctx: MirCtx, acc: [MirFunction]) -> LowerFunctionsResult throws { Exn } do
+  match arms do
+    | [] -> return LowerFunctionsResult(ctx, funcs: rev_mir_funcs(lst: acc, out: []))
+    | HirHandlerArm(arm: f, cont_binder: kb) :: rest ->
+      let arm_ctx = match kb do
+        | Some(val: k) -> ctx_with_cont_binders(ctx, binders: [k])
+        | None -> ctx
+      end
+      match lower_function(func: f, ctx: arm_ctx) do | LowerFunctionResult(ctx: ctx2, func: mf) ->
+        let restored = ctx_with_cont_binders(ctx: ctx2, binders: ctx_cont_binders(ctx))
+        return lower_arms_with_konts_go(arms: rest, ctx: restored, acc: mf :: acc)
+      end
+  end
+end
+
+let ctx_with_cont_binders = fn (ctx: MirCtx, binders: [string]) -> MirCtx do
+  match ctx do | MirCtx(scope: sc, port_layouts: pl, handler_port_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf, cont_binders: _) ->
+    return MirCtx(scope: sc, port_layouts: pl, handler_port_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf, cont_binders: binders)
   end
 end
 
@@ -301,19 +356,168 @@ let lower_stmt = fn (stmt: HirStmtKind, ctx: MirCtx) -> MirStmtsResult throws { 
       end
 
     | Inject(handlers: hs, body: b) ->
-      let MirCtx(scope, port_layouts: pl, handler_port_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf) = ctx
+      let MirCtx(scope, port_layouts: pl, handler_port_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf, cont_binders: cb) = ctx
       let new_scope = activate_handlers(handler_names: hs, handler_port_names: hpn, scope)
       let new_ctx = MirCtx(scope: new_scope, port_layouts: pl, handler_port_names: hpn,
-                           all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf)
-      // lower body under injected scope; restore caller's scope but keep ctx's
-      // updated closure_counter/lifted_funcs.
+                           all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf, cont_binders: cb)
+      // If any handler in this inject has any arm capturing a continuation,
+      // route the body through a stack-switching resume frame: lift the body
+      // to a fresh MirFunction and replace the inject site with a single
+      // MirStmtInjectResume statement that codegen will expand to
+      // ref.func + cont.new + resume + on-clauses.
+      if any_handler_has_kont(handler_names: hs, bindings: ah) then
+        match lift_inject_body(stmts: b, ctx: new_ctx) do | LiftInjectResult(ctx: ctx2, body_fn: bfn) ->
+          let arm_fns = collect_with_kont_arm_fns(handler_names: hs, bindings: ah)
+          let arm_tags = collect_with_kont_arm_tags(handler_names: hs, bindings: ah)
+          let MirCtx(scope: _, port_layouts: pl2, handler_port_names: hpn2, all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2, cont_binders: cb2) = ctx2
+          let restored = MirCtx(scope, port_layouts: pl2, handler_port_names: hpn2,
+                                all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2, cont_binders: cb2)
+          return MirStmtsResult(ctx: restored, stmts: [MirStmtInjectResume(body_fn: bfn, handler_arm_fns: arm_fns, handler_arm_tags: arm_tags)])
+        end
+      end
+      // No with-kont arms: existing behaviour — inline body under injected scope.
       match lower_stmts(stmts: b, ctx: new_ctx) do | MirStmtsResult(ctx: ctx2, stmts: lowered) ->
-        let MirCtx(scope: _, port_layouts: pl2, handler_port_names: hpn2, all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2) = ctx2
+        let MirCtx(scope: _, port_layouts: pl2, handler_port_names: hpn2, all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2, cont_binders: cb2) = ctx2
         let restored = MirCtx(scope, port_layouts: pl2, handler_port_names: hpn2,
-                              all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2)
+                              all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2, cont_binders: cb2)
         return MirStmtsResult(ctx: restored, stmts: lowered)
       end
   end
+end
+
+type LiftInjectResult = LiftInjectResult(ctx: MirCtx, body_fn: string)
+
+/// Lift an inject body to a fresh top-level MirFunction. Naming convention:
+/// `__inject_<n>` shares the closure_counter so codegen's table-registration
+/// machinery picks it up alongside `__closure_*` lifts.
+let lift_inject_body = fn (stmts: [HirStmt], ctx: MirCtx) -> LiftInjectResult throws { Exn } do
+  let MirCtx(scope: sc, port_layouts: pl, handler_port_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: n, lifted_funcs: lf, cont_binders: cb) = ctx
+  let lifted_name = "__inject_" ++ i64_to_str(n)
+  let ctx_after_name = MirCtx(scope: sc, port_layouts: pl, handler_port_names: hpn,
+                              all_funcs: af, all_handlers: ah, all_exts: ae,
+                              closure_counter: n + 1, lifted_funcs: lf, cont_binders: cb)
+  match lower_stmts(stmts, ctx: ctx_after_name) do | MirStmtsResult(ctx: ctx_body, stmts: mir_body) ->
+    let MirCtx(scope: sc2, port_layouts: pl2, handler_port_names: hpn2, all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: n2, lifted_funcs: lf2, cont_binders: cb2) = ctx_body
+    let lifted_fn = MirFunction(name: lifted_name, params: [], ret_type: TyUnit,
+                                body: mir_body, span: Span(offset: 0, line: 0, col: 0))
+    let new_lf = append_mir_funcs(a: lf2, b: [lifted_fn])
+    let ctx_final = MirCtx(scope: sc2, port_layouts: pl2, handler_port_names: hpn2,
+                           all_funcs: af2, all_handlers: ah2, all_exts: ae2,
+                           closure_counter: n2, lifted_funcs: new_lf, cont_binders: cb2)
+    return LiftInjectResult(ctx: ctx_final, body_fn: lifted_name)
+  end
+end
+
+let any_handler_has_kont = fn (handler_names: [string], bindings: [HirHandlerBindingEntry]) -> bool throws { Exn } do
+  match handler_names do
+    | [] -> return false
+    | h :: rest ->
+      if handler_has_any_kont(handler_name: h, bindings) then return true end
+      return any_handler_has_kont(handler_names: rest, bindings)
+  end
+end
+
+let handler_has_any_kont = fn (handler_name: string, bindings: [HirHandlerBindingEntry]) -> bool throws { Exn } do
+  match bindings do
+    | [] -> return false
+    | HirHandlerBindingEntry(name: bn, binding: HirHandlerBinding(port_name: _, arms)) :: rest ->
+      if bn == handler_name then return arms_have_any_kont(arms) end
+      return handler_has_any_kont(handler_name, bindings: rest)
+  end
+end
+
+let arms_have_any_kont = fn (arms: [HirHandlerArm]) -> bool throws { Exn } do
+  match arms do
+    | [] -> return false
+    | HirHandlerArm(arm: _, cont_binder: Some(_)) :: _ -> return true
+    | _ :: rest -> return arms_have_any_kont(arms: rest)
+  end
+end
+
+let collect_with_kont_arm_fns = fn (handler_names: [string], bindings: [HirHandlerBindingEntry]) -> [string] throws { Exn } do
+  return collect_with_kont_arm_fns_go(handler_names, bindings, acc: [])
+end
+
+let collect_with_kont_arm_fns_go = fn (handler_names: [string], bindings: [HirHandlerBindingEntry], acc: [string]) -> [string] throws { Exn } do
+  match handler_names do
+    | [] -> return acc
+    | h :: rest ->
+      let new_acc = arm_fns_for_handler(handler_name: h, bindings, acc)
+      return collect_with_kont_arm_fns_go(handler_names: rest, bindings, acc: new_acc)
+  end
+end
+
+let arm_fns_for_handler = fn (handler_name: string, bindings: [HirHandlerBindingEntry], acc: [string]) -> [string] throws { Exn } do
+  match bindings do
+    | [] -> return acc
+    | HirHandlerBindingEntry(name: bn, binding: HirHandlerBinding(port_name: _, arms)) :: rest ->
+      if bn == handler_name then return arm_fns_collect(arms, acc) end
+      return arm_fns_for_handler(handler_name, bindings: rest, acc)
+  end
+end
+
+let arm_fns_collect = fn (arms: [HirHandlerArm], acc: [string]) -> [string] throws { Exn } do
+  match arms do
+    | [] -> return acc
+    | HirHandlerArm(arm: HirFunction(name: fname, type_params: _, params: _, ret_type: _, body: _, span: _), cont_binder: Some(_)) :: rest ->
+      return arm_fns_collect(arms: rest, acc: fname :: acc)
+    | _ :: rest -> return arm_fns_collect(arms: rest, acc)
+  end
+end
+
+/// Parallel collector to `collect_with_kont_arm_fns`: returns the per-arm
+/// suspend-tag name (`<port>::<method>`), in lockstep order with the arm-fn
+/// list, so the InjectResume codegen can wire each `on tag → label` clause
+/// directly to its matching arm without a runtime dispatch table.
+let collect_with_kont_arm_tags = fn (handler_names: [string], bindings: [HirHandlerBindingEntry]) -> [string] throws { Exn } do
+  return collect_with_kont_arm_tags_go(handler_names, bindings, acc: [])
+end
+
+let collect_with_kont_arm_tags_go = fn (handler_names: [string], bindings: [HirHandlerBindingEntry], acc: [string]) -> [string] throws { Exn } do
+  match handler_names do
+    | [] -> return acc
+    | h :: rest ->
+      let new_acc = arm_tags_for_handler(handler_name: h, bindings, acc)
+      return collect_with_kont_arm_tags_go(handler_names: rest, bindings, acc: new_acc)
+  end
+end
+
+let arm_tags_for_handler = fn (handler_name: string, bindings: [HirHandlerBindingEntry], acc: [string]) -> [string] throws { Exn } do
+  match bindings do
+    | [] -> return acc
+    | HirHandlerBindingEntry(name: bn, binding: HirHandlerBinding(port_name: pn, arms)) :: rest ->
+      if bn == handler_name then return arm_tags_collect(port_name: pn, arms, acc) end
+      return arm_tags_for_handler(handler_name, bindings: rest, acc)
+  end
+end
+
+let arm_tags_collect = fn (port_name: string, arms: [HirHandlerArm], acc: [string]) -> [string] throws { Exn } do
+  match arms do
+    | [] -> return acc
+    | HirHandlerArm(arm: HirFunction(name: fname, type_params: _, params: _, ret_type: _, body: _, span: _), cont_binder: Some(_)) :: rest ->
+      let method_name = strip_handler_arm_prefix(fname)
+      let tag = port_name ++ "::" ++ method_name
+      return arm_tags_collect(port_name, arms: rest, acc: tag :: acc)
+    | _ :: rest -> return arm_tags_collect(port_name, arms: rest, acc)
+  end
+end
+
+/// Recover the source-level method name from a synthesised handler arm
+/// function name. `synthesize_handler_arms` (hir.nx) names arms via
+/// `naming.handler_func_name(handler_name, method_name)`, which produces
+/// `__handler_<binding_module>#<binding_name>_<method>` — the method tail
+/// after the last underscore.
+let strip_handler_arm_prefix = fn (fname: string) -> string throws { Exn } do
+  let last_underscore = last_underscore_idx(s: fname, idx: str.length(s: fname) - 1)
+  if last_underscore < 0 then return fname end
+  let after = last_underscore + 1
+  return str.substring(s: fname, start: after, len: str.length(s: fname) - after)
+end
+
+let last_underscore_idx = fn (s: string, idx: i64) -> i64 throws { Exn } do
+  if idx < 0 then return 0 - 1 end
+  if str.char_code(s, idx) == 95 then return idx end
+  return last_underscore_idx(s, idx: idx - 1)
 end
 
 let activate_handlers = fn (handler_names: [string], handler_port_names: [NamePair], scope: [NamePair]) -> [NamePair] throws { Exn } do
@@ -370,7 +574,7 @@ let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExprResult throws { Exn }
       end
     | Borrow(name: n, sigil: _) -> return MirExprResult(ctx, expr: MirBorrow(name: n))
     | Call(func: f, args) ->
-      let MirCtx(scope: _, port_layouts: pl, handler_port_names: _, all_funcs: _, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: _) = ctx
+      let MirCtx(scope: _, port_layouts: pl, handler_port_names: _, all_funcs: _, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: _, cont_binders: _) = ctx
       match detect_port_call(func: f, port_layouts: pl) do
         | PortCallFound(port_name: pname, method_name: mname) ->
           return lower_port_call(port_name: pname, method_name: mname, args, ctx)
@@ -455,8 +659,26 @@ let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExprResult throws { Exn }
         return MirExprResult(ctx: ctx1, expr: MirRaise(expr: mir_e))
       end
     | Force(expr: e) ->
-      match lower_expr(expr: e, ctx) do | MirExprResult(ctx: ctx1, expr: mir_e) ->
-        return MirExprResult(ctx: ctx1, expr: MirForce(expr: mir_e))
+      // Force on a cont_binder name in the enclosing arm scope lowers to
+      // MirResume — codegen emits op_resume to transfer control back to the
+      // suspended caller. Other Force forms remain regular MirForce (lazy
+      // thunk invocation).
+      let HirExpr(node: inner_node, span: _) = e
+      match inner_node do
+        | Variable(name: vn, sigil: _) ->
+          // PROBE: emit Resume if cont_binders is non-empty (any cont binder set).
+          let cb = ctx_cont_binders(ctx)
+          if cb_has_any(cb) then
+            return MirExprResult(ctx,
+              expr: MirResume(cont_var: vn, value: MirLiteral(lit: LitUnit), ret_type: TyUnit))
+          end
+          match lower_expr(expr: e, ctx) do | MirExprResult(ctx: ctx1, expr: mir_e) ->
+            return MirExprResult(ctx: ctx1, expr: MirForce(expr: mir_e))
+          end
+        | _ ->
+          match lower_expr(expr: e, ctx) do | MirExprResult(ctx: ctx1, expr: mir_e) ->
+            return MirExprResult(ctx: ctx1, expr: MirForce(expr: mir_e))
+          end
       end
     | Thunk(body: b) ->
       let HirExpr(node: _, span: sp) = expr
@@ -466,7 +688,7 @@ let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExprResult throws { Exn }
         body: [HirStmt(node: Return(expr: b), span: sp)],
         span: expr,
         ctx)
-    | ExternalRef(symbol: sym, arg_names: _, typ: _) ->
+    | ExternalRef(symbol: sym, type_params: _, arg_names: _, typ: _) ->
       return MirExprResult(ctx, expr: MirVariable(name: sym))
     | Handler(_) ->
       return MirExprResult(ctx, expr: MirLiteral(lit: LitUnit))
@@ -476,7 +698,7 @@ end
 // ─── Port Call Resolution ───────────────────────────────────────────────────
 
 let lower_port_call = fn (port_name: string, method_name: string, args: [HirCallArg], ctx: MirCtx) -> MirExprResult throws { Exn } do
-  let MirCtx(scope, port_layouts: _, handler_port_names: hpn, all_funcs: _, all_handlers: all_hbs, all_exts: _, closure_counter: _, lifted_funcs: _) = ctx
+  let MirCtx(scope, port_layouts: _, handler_port_names: hpn, all_funcs: _, all_handlers: all_hbs, all_exts: _, closure_counter: _, lifted_funcs: _, cont_binders: _) = ctx
   let handler_name = match lookup(key: port_name, pairs: scope) do
     | Some(val: h) -> h
     | None ->
@@ -492,7 +714,42 @@ let lower_port_call = fn (port_name: string, method_name: string, args: [HirCall
   let func_name = naming.handler_func_name(handler_name, method_name)
   let ret_type = lookup_ret_type(name: func_name, ctx)
   match lower_call_args(args, ctx) do | MirCallArgsResult(ctx: ctx1, args: mir_args) ->
-    return MirExprResult(ctx: ctx1, expr: MirCall(func: func_name, args: mir_args, ret_type))
+    match arm_cont_binder(handler_name, method_name, bindings: all_hbs) do
+      | Some(_) ->
+        let tag = port_name ++ "::" ++ method_name
+        let payload = match mir_args do
+          | MirCallArg(label: _, value: v) :: _ -> v
+          | [] -> MirLiteral(lit: LitUnit)
+        end
+        return MirExprResult(ctx: ctx1,
+          expr: MirSuspend(tag_name: tag, payload, ret_type))
+      | None ->
+        return MirExprResult(ctx: ctx1, expr: MirCall(func: func_name, args: mir_args, ret_type))
+    end
+  end
+end
+
+/// Find the arm matching `method_name` inside the handler binding named
+/// `handler_name`, and return its cont_binder (Some(k) for `with @k`,
+/// None for plain arms / unknown binding).
+let arm_cont_binder = fn (handler_name: string, method_name: string, bindings: [HirHandlerBindingEntry]) -> Option<string> throws { Exn } do
+  match bindings do
+    | [] -> return None
+    | HirHandlerBindingEntry(name: bn, binding: HirHandlerBinding(port_name: _, arms)) :: rest ->
+      if bn == handler_name then
+        let synth_name = naming.handler_func_name(handler_name, method_name)
+        return arm_cont_binder_in_arms(synth_name, arms)
+      end
+      return arm_cont_binder(handler_name, method_name, bindings: rest)
+  end
+end
+
+let arm_cont_binder_in_arms = fn (synth_name: string, arms: [HirHandlerArm]) -> Option<string> throws { Exn } do
+  match arms do
+    | [] -> return None
+    | HirHandlerArm(arm: HirFunction(name: fname, type_params: _, params: _, ret_type: _, body: _, span: _), cont_binder: kb) :: rest ->
+      if fname == synth_name then return kb end
+      return arm_cont_binder_in_arms(synth_name, arms: rest)
   end
 end
 
@@ -576,11 +833,11 @@ end
 /// existing LIR/codegen closure machinery (`__closure_` prefix auto-registers
 /// into the WASM closure table) picks it up.
 let lift_lambda = fn (params: [HirParam], ret_type: TypeExpr, body: [HirStmt], span: HirExpr, ctx: MirCtx) -> MirExprResult throws { Exn } do
-  let MirCtx(scope: sc, port_layouts: pl, handler_port_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: n, lifted_funcs: lf) = ctx
+  let MirCtx(scope: sc, port_layouts: pl, handler_port_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: n, lifted_funcs: lf, cont_binders: cb) = ctx
   let lifted_name = "__closure_" ++ i64_to_str(n)
   let ctx_after_name = MirCtx(scope: sc, port_layouts: pl, handler_port_names: hpn,
                               all_funcs: af, all_handlers: ah, all_exts: ae,
-                              closure_counter: n + 1, lifted_funcs: lf)
+                              closure_counter: n + 1, lifted_funcs: lf, cont_binders: cb)
 
   // Free variables: referenced in body but not bound by params or known at
   // top level (functions, externals, handler methods).
@@ -608,11 +865,11 @@ let lift_lambda = fn (params: [HirParam], ret_type: TypeExpr, body: [HirStmt], s
 
     // Append lifted fn to ctx.lifted_funcs (preserves creation order so
     // nested lambdas are emitted outer-last — matches Rust side).
-    let MirCtx(scope: sc2, port_layouts: pl2, handler_port_names: hpn2, all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: n2, lifted_funcs: lf2) = ctx_body
+    let MirCtx(scope: sc2, port_layouts: pl2, handler_port_names: hpn2, all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: n2, lifted_funcs: lf2, cont_binders: cb2) = ctx_body
     let new_lf = append_mir_funcs(a: lf2, b: [lifted_fn])
     let ctx_final = MirCtx(scope: sc2, port_layouts: pl2, handler_port_names: hpn2,
                            all_funcs: af2, all_handlers: ah2, all_exts: ae2,
-                           closure_counter: n2, lifted_funcs: new_lf)
+                           closure_counter: n2, lifted_funcs: new_lf, cont_binders: cb2)
 
     let capture_exprs = captures_to_mir_exprs(caps: captures, acc: [])
     return MirExprResult(ctx: ctx_final, expr: MirMakeClosure(func_name: lifted_name, captures: capture_exprs))
@@ -679,7 +936,7 @@ end
 /// NOT be treated as free variables: top-level function names, externals,
 /// and handler-method names.
 let build_known_names = fn (ctx: MirCtx) -> [string] throws { Exn } do
-  let MirCtx(scope: _, port_layouts: _, handler_port_names: _, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: _, lifted_funcs: _) = ctx
+  let MirCtx(scope: _, port_layouts: _, handler_port_names: _, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: _, lifted_funcs: _, cont_binders: _) = ctx
   let from_funcs = fn_names_of(funcs: af, acc: [])
   let from_exts = ext_names_of(exts: ae, acc: [])
   let from_handlers = handler_fn_names_of(bindings: ah, acc: [])
@@ -698,7 +955,7 @@ end
 let ext_names_of = fn (exts: [HirExternal], acc: [string]) -> [string] throws { Exn } do
   match exts do
     | [] -> return rev_strings(lst: acc, out: [])
-    | HirExternal(name: n, wasm_module: _, wasm_name: _, params: _, ret_type: _, throw_row: _) :: rest ->
+    | HirExternal(name: n, wasm_module: _, wasm_name: _, type_params: _, params: _, ret_type: _, throw_row: _) :: rest ->
       return ext_names_of(exts: rest, acc: n :: acc)
   end
 end
@@ -706,8 +963,8 @@ end
 let handler_fn_names_of = fn (bindings: [HirHandlerBindingEntry], acc: [string]) -> [string] throws { Exn } do
   match bindings do
     | [] -> return rev_strings(lst: acc, out: [])
-    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, functions: fs)) :: rest ->
-      return handler_fn_names_of(bindings: rest, acc: prepend_fn_names(funcs: fs, acc))
+    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, arms: arms)) :: rest ->
+      return handler_fn_names_of(bindings: rest, acc: prepend_fn_names(funcs: arms_to_funcs(arms), acc))
   end
 end
 
@@ -851,7 +1108,7 @@ let walk_expr = fn (expr: HirExpr, defined: [string], known: [string], seen: [st
     | Raise(expr: e) -> return walk_expr(expr: e, defined, known, seen, refs)
     | Force(expr: e) -> return walk_expr(expr: e, defined, known, seen, refs)
     | Thunk(body: b) -> return walk_expr(expr: b, defined, known, seen, refs)
-    | ExternalRef(symbol: _, arg_names: _, typ: _) -> return WalkResult(defined, seen, refs)
+    | ExternalRef(symbol: _, type_params: _, arg_names: _, typ: _) -> return WalkResult(defined, seen, refs)
     | Handler(_) -> return WalkResult(defined, seen, refs)
   end
 end

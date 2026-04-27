@@ -217,9 +217,9 @@ fn invoke_thunk_on_store<S: wasmtime::AsContextMut>(
     table_idx: i64,
     env: i64,
 ) -> Result<i64, Error> {
-    let func_ref = table.get(&mut store, table_idx as u64).ok_or_else(|| {
-        Error::msg(format!("lazy: table index {table_idx} out of bounds"))
-    })?;
+    let func_ref = table
+        .get(&mut store, table_idx as u64)
+        .ok_or_else(|| Error::msg(format!("lazy: table index {table_idx} out of bounds")))?;
     let func = match func_ref {
         Ref::Func(Some(f)) => f,
         Ref::Func(None) => {
@@ -297,7 +297,10 @@ fn spawn_impl<T>(
             .ok_or_else(|| Error::msg("lazy-spawn: no `__indirect_function_table` export"))?;
         let value = invoke_thunk_on_store(&mut *caller, &table, table_idx, thunk_ptr)?;
         let task_id = rt.next_task_id.fetch_add(1, Ordering::SeqCst);
-        rt.tasks.lock().unwrap().insert(task_id, Task::Inline(value));
+        rt.tasks
+            .lock()
+            .unwrap()
+            .insert(task_id, Task::Inline(value));
         return Ok(-(task_id + 1));
     }
 
@@ -346,7 +349,10 @@ fn spawn_impl<T>(
             .map_err(|e| e.to_string())
     });
 
-    rt.tasks.lock().unwrap().insert(task_id, Task::Threaded(handle));
+    rt.tasks
+        .lock()
+        .unwrap()
+        .insert(task_id, Task::Threaded(handle));
     // Encoding: returned id = -(task_id + 1), so task_id 1 → -2, 2 → -3, ...
     // (Avoid -0 / 0 collision.) Both inline and threaded paths share this
     // encoding; join_impl always consults the tasks map.
@@ -397,9 +403,7 @@ pub fn add_lazy_to_linker<T: Send + 'static>(linker: &mut Linker<T>) -> Result<(
                     let mut header = [0u8; 8];
                     memory
                         .read(&mut caller, thunk_ptr as usize, &mut header)
-                        .map_err(|e| {
-                            Error::msg(format!("lazy-spawn: read thunk header: {e}"))
-                        })?;
+                        .map_err(|e| Error::msg(format!("lazy-spawn: read thunk header: {e}")))?;
                     let table_idx = i64::from_le_bytes(header);
                     let table = caller
                         .get_export("__indirect_function_table")
@@ -458,7 +462,9 @@ mod tests {
         let mut linker = Linker::<()>::new(&engine);
         add_lazy_to_linker(&mut linker).expect("linker");
         let mut store = Store::new(&engine, ());
-        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
         let main = instance
             .get_typed_func::<(), i64>(&mut store, "main")
             .expect("main export");
@@ -483,7 +489,9 @@ mod tests {
         let mut linker = Linker::<()>::new(&engine);
         add_lazy_to_linker(&mut linker).expect("linker");
         let mut store = Store::new(&engine, ());
-        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
         let main = instance
             .get_typed_func::<i64, i64>(&mut store, "main")
             .expect("main export");
@@ -526,7 +534,9 @@ mod tests {
         let mut linker = Linker::<()>::new(&engine);
         runtime.register(&mut linker).expect("register");
         let mut store = Store::new(&engine, ());
-        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
         let main = instance
             .get_typed_func::<(), i64>(&mut store, "main")
             .expect("main export");
@@ -569,7 +579,9 @@ mod tests {
         let mut linker = Linker::<()>::new(&engine);
         runtime.register(&mut linker).expect("register");
         let mut store = Store::new(&engine, ());
-        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
         let alloc1 = instance
             .get_typed_func::<i32, i32>(&mut store, "alloc1")
             .expect("alloc1 export");
@@ -665,7 +677,9 @@ mod tests {
                 shared_mem.clone(),
             )
             .expect("define shared memory");
-        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
         let main = instance
             .get_typed_func::<(), i64>(&mut store, "main")
             .expect("main export");
@@ -713,11 +727,16 @@ mod tests {
         let mut linker = Linker::<()>::new(&engine);
         runtime.register(&mut linker).expect("register");
         let mut store = Store::new(&engine, ());
-        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
         let main = instance
             .get_typed_func::<(), i64>(&mut store, "main")
             .expect("main export");
         let result = main.call(&mut store, ()).expect("main trap");
-        assert_eq!(result, -5, "inline-fallback must preserve negative i64 thunk results");
+        assert_eq!(
+            result, -5,
+            "inline-fallback must preserve negative i64 thunk results"
+        );
     }
 }

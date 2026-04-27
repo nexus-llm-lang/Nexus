@@ -14,12 +14,11 @@ use helpers::{
     check_unintroduced_type_vars, contains_exn_throws, contains_ref, contains_return,
     default_numeric_literals, describe_ctor_field, expand_exception_groups_in_throws,
     expr_always_diverges, external_scheme, extract_row_port_names, get_default_alias,
-    import_variant_by_name,
-    is_allowed_main_require_signature, is_allowed_main_throws_signature, is_auto_droppable,
-    merge_type_rows, normalize_enum_generic_params, normalize_typedef_generic_params,
-    register_exception_variant, register_nullary_variant_constructor, register_stdlib_types,
-    select_float_type, select_int_type, strip_required_port_coeffect, summarize_ctor_args,
-    summarize_ctor_fields,
+    import_variant_by_name, is_allowed_main_require_signature, is_allowed_main_throws_signature,
+    is_auto_droppable, merge_type_rows, normalize_enum_generic_params,
+    normalize_typedef_generic_params, register_exception_variant,
+    register_nullary_variant_constructor, register_stdlib_types, select_float_type,
+    select_int_type, strip_required_port_coeffect, summarize_ctor_args, summarize_ctor_fields,
 };
 use lint::{
     collect_signature_needs_from_stmts, extract_named_row_members,
@@ -2164,8 +2163,8 @@ impl TypeChecker {
                         let has_trailing_underscore = pats.last().map_or(false, |(label, pat)| {
                             label.is_none() && matches!(pat.node, Pattern::Wildcard)
                         });
-                        let is_wildcard_spread = has_trailing_underscore
-                            && pats.len() < v.fields.len();
+                        let is_wildcard_spread =
+                            has_trailing_underscore && pats.len() < v.fields.len();
                         let expanded_pats: Vec<(Option<String>, Spanned<Pattern>)>;
                         let pats = if is_wildcard_spread {
                             let span = pats.last().unwrap().1.span.clone();
@@ -2173,10 +2172,15 @@ impl TypeChecker {
                             expanded_pats = pats[..keep]
                                 .iter()
                                 .cloned()
-                                .chain((0..v.fields.len() - keep).map(|_| (
-                                    None,
-                                    Spanned { node: Pattern::Wildcard, span: span.clone() },
-                                )))
+                                .chain((0..v.fields.len() - keep).map(|_| {
+                                    (
+                                        None,
+                                        Spanned {
+                                            node: Pattern::Wildcard,
+                                            span: span.clone(),
+                                        },
+                                    )
+                                }))
                                 .collect();
                             &expanded_pats
                         } else {
@@ -2361,8 +2365,7 @@ impl TypeChecker {
                     match &first_bindings {
                         None => first_bindings = Some(new_bindings),
                         Some(first) => {
-                            let first_keys: Vec<&String> =
-                                first.iter().map(|(k, _)| k).collect();
+                            let first_keys: Vec<&String> = first.iter().map(|(k, _)| k).collect();
                             let curr_keys: Vec<&String> =
                                 new_bindings.iter().map(|(k, _)| k).collect();
                             if first_keys != curr_keys {

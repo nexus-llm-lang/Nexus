@@ -1083,8 +1083,7 @@ impl<'a> LowerCtx<'a> {
                 // Wasm representation is a packed string handle, but the semantic
                 // type is Exn — needed so match arms over `catch_param` can
                 // resolve labeled-field pattern types via resolve_constructor_field_types.
-                catch_sem_vars
-                    .insert(catch_param.clone(), Type::UserDefined("Exn".into(), vec![]));
+                catch_sem_vars.insert(catch_param.clone(), Type::UserDefined("Exn".into(), vec![]));
                 let (catch_stmts, catch_ret) =
                     self.lower_block_with_vars(catch_body, ret_type, catch_vars, catch_sem_vars)?;
 
@@ -1722,10 +1721,7 @@ impl<'a> LowerCtx<'a> {
     /// caller's assignment to result_name unreachable, so the caller skips it
     /// entirely (matches the nxc self-hosted compiler's behavior for stage1
     /// == stage2 fixed-point equivalence).
-    fn lower_case_body_expr(
-        &mut self,
-        body: &[MirStmt],
-    ) -> Result<Option<LirAtom>, LirLowerError> {
+    fn lower_case_body_expr(&mut self, body: &[MirStmt]) -> Result<Option<LirAtom>, LirLowerError> {
         if body.is_empty() {
             return Ok(Some(LirAtom::Unit));
         }

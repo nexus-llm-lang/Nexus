@@ -1,7 +1,9 @@
 use nexus::compiler::bundler;
 use nexus::compiler::compose;
 use nexus::runtime::backtrace;
+use nexus::runtime::chan;
 use nexus::runtime::lazy;
+use nexus::runtime::sched;
 use nexus::runtime::ExecutionCapabilities;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +27,8 @@ static SHARED_ENGINE: LazyLock<Engine> = LazyLock::new(|| {
     let mut config = wasmtime::Config::new();
     config.wasm_tail_call(true);
     config.wasm_exceptions(true);
+    config.wasm_function_references(true);
+    config.wasm_stack_switching(true);
     config.wasm_component_model(true);
     Engine::new(&config).expect("failed to create shared engine")
 });
@@ -78,6 +82,8 @@ fn run_main_threaded(wasm: &[u8], heap_base: i32) -> Result<(), String> {
     let mut config = wasmtime::Config::new();
     config.wasm_tail_call(true);
     config.wasm_exceptions(true);
+    config.wasm_function_references(true);
+    config.wasm_stack_switching(true);
     config.wasm_threads(true);
     config.shared_memory(true);
     let engine = Engine::new(&config).map_err(|e| e.to_string())?;
@@ -134,6 +140,108 @@ pub fn exec_with_stdlib_core(src: &str) {
     run_main_with_deps_core(&wasm).unwrap_or_else(|e| panic!("core execution failed: {}", e));
 }
 
+/// Compile a fixture file via the self-hosted compiler (nexus.wasm) and
+/// execute via the core-wasm WASI path. Use this for features that only the
+/// self-hosted compiler supports (e.g. `with @k` handler arms).
+pub fn exec_nxc_core(fixture_relpath: &str) {
+    let wasm = super::compile::compile_fixture_via_nxc(fixture_relpath);
+    run_main_with_deps_core(&wasm).unwrap_or_else(|e| panic!("nxc core execution failed: {}", e));
+}
+
+/// Compile + run via the self-hosted compiler core path AND capture stdout
+/// into a String. Use this when the test must verify *what* the program
+/// printed, not merely that it didn't trap. The default `exec_nxc_core`
+/// inherits stdio, so a wasm that exits cleanly with empty stdout passes
+/// silently — that's exactly the "4th virtual close" failure mode the
+/// scheduler tests need to avoid (a multi-fiber fixture with empty stdout
+/// is *not* "working", it's "fibers never ran").
+pub fn exec_nxc_core_capture_stdout(fixture_relpath: &str) -> String {
+    let wasm = super::compile::compile_fixture_via_nxc(fixture_relpath);
+    run_main_with_deps_core_capture(&wasm)
+        .unwrap_or_else(|e| panic!("nxc core execution failed: {}", e))
+}
+
+fn run_main_with_deps_core_capture(wasm: &[u8]) -> Result<String, String> {
+    let imports = bundler::module_import_names(wasm)?;
+    let needs_stdlib_bundle = imports
+        .iter()
+        .any(|m| nexus::lang::stdlib::is_package_wit_module(m));
+    let bundled = if needs_stdlib_bundle {
+        let cfg = bundler::BundleConfig::default();
+        let merged = bundler::bundle_core_wasm(wasm, &cfg)?;
+        bundler::merge_remaining_stubs(&merged, &cfg.wasm_merge_command)?
+    } else {
+        wasm.to_vec()
+    };
+
+    let mut config = wasmtime::Config::new();
+    config.wasm_tail_call(true);
+    config.wasm_exceptions(true);
+    config.wasm_function_references(true);
+    config.wasm_stack_switching(true);
+    let engine = Engine::new(&config).map_err(|e| e.to_string())?;
+    let module = Module::from_binary(&engine, &bundled).map_err(|e| e.to_string())?;
+
+    let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s: &mut WasiP1Ctx| s)
+        .map_err(|e| format!("p1 linker: {e}"))?;
+
+    if lazy::needs_lazy_runtime(&bundled) {
+        let runtime = lazy::LazyRuntime::new(engine.clone(), module.clone());
+        runtime.register(&mut linker)?;
+    }
+    if chan::needs_chan_runtime(&bundled) {
+        chan::ChanRuntime::new().register(&mut linker)?;
+    }
+    if sched::needs_sched_runtime(&bundled) {
+        sched::SchedRuntime::new().register(&mut linker)?;
+    }
+
+    // 64KB stdout buffer — overkill for fixtures but cheap. Returned-as-String
+    // means assertions can compare against a golden output line-by-line.
+    let stdout_pipe = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(64 * 1024);
+
+    let mut builder = WasiCtxBuilder::new();
+    builder.stdout(stdout_pipe.clone());
+    builder.inherit_stderr();
+    let _ = builder.preopened_dir(".", ".", DirPerms::all(), FilePerms::all());
+    let p1_ctx = builder.build_p1();
+    let mut store = Store::new(&engine, p1_ctx);
+
+    if backtrace::needs_bt_runtime(&bundled) {
+        backtrace::reset();
+        backtrace::add_bt_to_linker(&mut linker, &mut store)?;
+    }
+
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(|e| format!("instantiate: {e:#}"))?;
+    let entry = if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+        start
+    } else {
+        instance
+            .get_typed_func::<(), ()>(&mut store, "main")
+            .map_err(|e| format!("get main export: {e}"))?
+    };
+    entry.call(&mut store, ()).map_err(|e| format!("{e:#}"))?;
+
+    // Drop the store first so any buffered stdout is flushed via the
+    // MemoryOutputPipe clone we kept around.
+    drop(store);
+    let bytes = stdout_pipe.contents();
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Same as `exec_with_stdlib_core` but expects a runtime trap. Returns the
+/// trap message so the caller can pattern-match on it.
+pub fn exec_with_stdlib_core_should_trap(src: &str) -> String {
+    let wasm = super::compile::compile(src);
+    match run_main_with_deps_core(&wasm) {
+        Ok(()) => panic!("expected trap but main returned successfully"),
+        Err(msg) => msg,
+    }
+}
+
 fn run_main_with_deps_core(wasm: &[u8]) -> Result<(), String> {
     // `bundle_core_wasm` (binaryen `wasm-merge`) keeps each module's memory
     // separate (`--enable-multimemory`), so stdlib's `__nx_print` reads bytes
@@ -158,6 +266,8 @@ fn run_main_with_deps_core(wasm: &[u8]) -> Result<(), String> {
     let mut config = wasmtime::Config::new();
     config.wasm_tail_call(true);
     config.wasm_exceptions(true);
+    config.wasm_function_references(true);
+    config.wasm_stack_switching(true);
     let engine = Engine::new(&config).map_err(|e| e.to_string())?;
     let module = Module::from_binary(&engine, &bundled).map_err(|e| e.to_string())?;
 
@@ -168,6 +278,14 @@ fn run_main_with_deps_core(wasm: &[u8]) -> Result<(), String> {
     if lazy::needs_lazy_runtime(&bundled) {
         let runtime = lazy::LazyRuntime::new(engine.clone(), module.clone());
         runtime.register(&mut linker)?;
+    }
+
+    if chan::needs_chan_runtime(&bundled) {
+        chan::ChanRuntime::new().register(&mut linker)?;
+    }
+
+    if sched::needs_sched_runtime(&bundled) {
+        sched::SchedRuntime::new().register(&mut linker)?;
     }
 
     let mut builder = WasiCtxBuilder::new();
@@ -202,12 +320,16 @@ pub fn run_main(wasm: &[u8]) -> Result<(), String> {
     let mut config = wasmtime::Config::new();
     config.wasm_tail_call(true);
     config.wasm_exceptions(true);
+    config.wasm_function_references(true);
+    config.wasm_stack_switching(true);
     let engine = Engine::new(&config).map_err(|e| e.to_string())?;
     let module = Module::from_binary(&engine, wasm).map_err(|e| e.to_string())?;
     let has_bt = backtrace::needs_bt_runtime(wasm);
     let has_lazy = lazy::needs_lazy_runtime(wasm);
+    let has_chan = chan::needs_chan_runtime(wasm);
+    let has_sched = sched::needs_sched_runtime(wasm);
 
-    if has_bt || has_lazy {
+    if has_bt || has_lazy || has_chan || has_sched {
         let mut linker = Linker::new(&engine);
         let mut store = Store::new(&engine, ());
         if has_bt {
@@ -220,6 +342,12 @@ pub fn run_main(wasm: &[u8]) -> Result<(), String> {
             // on workers; captures fall back to inline on the caller.
             let runtime = lazy::LazyRuntime::new(engine.clone(), module.clone());
             runtime.register(&mut linker)?;
+        }
+        if has_chan {
+            chan::ChanRuntime::new().register(&mut linker)?;
+        }
+        if has_sched {
+            sched::SchedRuntime::new().register(&mut linker)?;
         }
         let instance = linker
             .instantiate(&mut store, &module)

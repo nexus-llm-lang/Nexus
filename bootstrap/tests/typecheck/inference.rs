@@ -511,8 +511,10 @@ fn test_ref_creation_and_type() {
 #[test]
 fn test_gravity_rule_immutable_holds_value() {
     crate::harness::ensure_repo_root();
-    let src = std::fs::read_to_string("bootstrap/tests/fixtures/test_gravity_rule_immutable_holds_value.nx")
-        .expect("fixture should exist");
+    let src = std::fs::read_to_string(
+        "bootstrap/tests/fixtures/test_gravity_rule_immutable_holds_value.nx",
+    )
+    .expect("fixture should exist");
     should_typecheck(&src);
 }
 
