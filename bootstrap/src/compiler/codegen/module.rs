@@ -22,8 +22,8 @@ use super::function::compile_function;
 use super::layout::{build_codegen_layout, program_uses_object_heap, CodegenLayout, MemoryMode};
 use super::string::string_abi_for_external;
 use super::{
-    ALLOCATE_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE, LAZY_ALLOC_NAME, LAZY_JOIN_NAME, LAZY_MODULE,
-    LAZY_SPAWN_NAME, OBJECT_HEAP_GLOBAL_INDEX,
+    ALLOCATE_WASM_NAME, ALLOC_MARK_WASM_NAME, ALLOC_RESET_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE,
+    LAZY_ALLOC_NAME, LAZY_JOIN_NAME, LAZY_MODULE, LAZY_SPAWN_NAME, OBJECT_HEAP_GLOBAL_INDEX,
 };
 
 /// Compiles LIR (in ANF) directly into core WASM bytes, plus debug entries for DWARF.
@@ -88,7 +88,11 @@ fn compile_lir_to_wasm_inner(
             && !ext.wasm_module.as_ref().starts_with("nexus:runtime/")
     });
     let needs_alloc_import = stdlib_alloc_module.is_some() && !is_component;
-    let n_alloc_imports: u32 = if needs_alloc_import { 1 } else { 0 };
+    // 3 imports when alloc is needed: allocate, __nx_alloc_mark, __nx_alloc_reset.
+    // mark/reset wire up `arena.heap_reset` so it reclaims stdlib-routed string
+    // and object allocations alongside the G0 bump pointer (otherwise long-lived
+    // programs leak every concat / format / substring through `Call(allocate)`).
+    let n_alloc_imports: u32 = if needs_alloc_import { 3 } else { 0 };
 
     // Deduplicate externals by (wasm_module, wasm_name) — multiple Nexus names
     // pointing to the same underlying WASM function share a single WASM import.
@@ -159,6 +163,8 @@ fn compile_lir_to_wasm_inner(
     if needs_alloc_import {
         let alloc_idx = deduped_ext_count;
         layout.allocate_func_idx = Some(alloc_idx);
+        layout.alloc_mark_func_idx = Some(alloc_idx + 1);
+        layout.alloc_reset_func_idx = Some(alloc_idx + 2);
     }
     if needs_bt_capture {
         let bt_idx = deduped_ext_count + n_alloc_imports;
@@ -176,6 +182,12 @@ fn compile_lir_to_wasm_inner(
             // advance a single shared heap pointer instead of racing on
             // per-instance globals.
             layout.allocate_func_idx = Some(lazy_base + 2);
+            // Lazy host bump allocator does not expose mark/reset and is
+            // disjoint from the stdlib-side allocator's bookkeeping. Clearing
+            // these keeps `arena.heap_reset` from calling stdlib `__nx_alloc_reset`
+            // on a counter that never advanced for these allocations.
+            layout.alloc_mark_func_idx = None;
+            layout.alloc_reset_func_idx = None;
         }
     }
 
@@ -222,10 +234,34 @@ fn compile_lir_to_wasm_inner(
     }
 
     let mut allocate_type_idx = 0;
+    let mut alloc_mark_type_idx = 0;
+    let mut alloc_reset_type_idx = 0;
     if needs_alloc_import {
         types.ty().function([ValType::I32], [ValType::I32]);
         allocate_type_idx = next_type_index;
         next_type_index += 1;
+        // __nx_alloc_mark: () -> i32
+        let mark_key = sig_key(&[], &[ValType::I32]);
+        alloc_mark_type_idx = if let Some(&existing) = sig_to_type_idx.get(&mark_key) {
+            existing
+        } else {
+            types.ty().function([], [ValType::I32]);
+            sig_to_type_idx.insert(mark_key, next_type_index);
+            let idx = next_type_index;
+            next_type_index += 1;
+            idx
+        };
+        // __nx_alloc_reset: (i32) -> ()
+        let reset_key = sig_key(&[ValType::I32], &[]);
+        alloc_reset_type_idx = if let Some(&existing) = sig_to_type_idx.get(&reset_key) {
+            existing
+        } else {
+            types.ty().function([ValType::I32], []);
+            sig_to_type_idx.insert(reset_key, next_type_index);
+            let idx = next_type_index;
+            next_type_index += 1;
+            idx
+        };
     }
 
     // Backtrace capture type: () -> () — called before throw (only when backtrace is used)
@@ -408,6 +444,16 @@ fn compile_lir_to_wasm_inner(
                 alloc_module,
                 ALLOCATE_WASM_NAME,
                 EntityType::Function(allocate_type_idx),
+            );
+            imports.import(
+                alloc_module,
+                ALLOC_MARK_WASM_NAME,
+                EntityType::Function(alloc_mark_type_idx),
+            );
+            imports.import(
+                alloc_module,
+                ALLOC_RESET_WASM_NAME,
+                EntityType::Function(alloc_reset_type_idx),
             );
             has_imports = true;
         }
@@ -643,6 +689,10 @@ fn compile_lir_to_wasm_inner(
         }
         if needs_alloc_import {
             func_names.append(idx, ALLOCATE_WASM_NAME);
+            idx += 1;
+            func_names.append(idx, ALLOC_MARK_WASM_NAME);
+            idx += 1;
+            func_names.append(idx, ALLOC_RESET_WASM_NAME);
             idx += 1;
         }
         if needs_bt_capture {

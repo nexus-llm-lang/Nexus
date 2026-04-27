@@ -26,6 +26,18 @@ pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
     nexus_wasm_alloc::deallocate(ptr, size);
 }
 
+#[cfg(not(feature = "no_alloc_export"))]
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_alloc_mark() -> i32 {
+    nexus_wasm_alloc::mark()
+}
+
+#[cfg(not(feature = "no_alloc_export"))]
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_alloc_reset(mark: i32) {
+    nexus_wasm_alloc::reset_to(mark);
+}
+
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_exit(status: i64) {
     std::process::exit(status as i32);

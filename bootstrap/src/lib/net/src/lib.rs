@@ -72,6 +72,18 @@ pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
     nexus_wasm_alloc::deallocate(ptr, size);
 }
 
+#[cfg(not(feature = "no_alloc_export"))]
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_alloc_mark() -> i32 {
+    nexus_wasm_alloc::mark()
+}
+
+#[cfg(not(feature = "no_alloc_export"))]
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_alloc_reset(mark: i32) {
+    nexus_wasm_alloc::reset_to(mark);
+}
+
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_http_get(url_ptr: i32, url_len: i32) -> i64 {
     const GET: &[u8] = b"GET";

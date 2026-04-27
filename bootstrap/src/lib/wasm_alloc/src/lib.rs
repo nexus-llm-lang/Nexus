@@ -1,32 +1,108 @@
+use std::alloc::{alloc as raw_alloc, dealloc as raw_dealloc, Layout};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
-static ALLOCATIONS: OnceLock<Mutex<BTreeMap<i32, usize>>> = OnceLock::new();
+/// Allocate-time and free-time layouts must match exactly for
+/// `std::alloc::dealloc` — host allocators that over-allocate (e.g.
+/// macOS system_malloc) abort if the dealloc layout differs from the
+/// alloc layout.
+fn byte_layout(size: usize) -> Option<Layout> {
+    Layout::array::<u8>(size).ok()
+}
 
-fn allocations() -> &'static Mutex<BTreeMap<i32, usize>> {
-    ALLOCATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+#[derive(Default)]
+struct AllocState {
+    sizes: BTreeMap<i32, usize>,
+    order: Vec<i32>,
+}
+
+static ALLOCATIONS: OnceLock<Mutex<AllocState>> = OnceLock::new();
+
+fn allocations() -> &'static Mutex<AllocState> {
+    ALLOCATIONS.get_or_init(|| Mutex::new(AllocState::default()))
 }
 
 pub fn remember_allocation(ptr: i32, size: usize) {
     if ptr == 0 || size == 0 {
         return;
     }
-    if let Ok(mut allocations) = allocations().lock() {
-        allocations.insert(ptr, size);
+    if let Ok(mut state) = allocations().lock() {
+        if state.sizes.insert(ptr, size).is_none() {
+            state.order.push(ptr);
+        }
     }
 }
 
 pub fn take_allocation(ptr: i32, size: usize) -> bool {
-    let Ok(mut allocations) = allocations().lock() else {
+    let Ok(mut state) = allocations().lock() else {
         return false;
     };
-    match allocations.get(&ptr).copied() {
+    match state.sizes.get(&ptr).copied() {
         Some(expected) if expected == size => {
-            allocations.remove(&ptr);
+            state.sizes.remove(&ptr);
+            if let Some(pos) = state.order.iter().rposition(|&p| p == ptr) {
+                state.order.remove(pos);
+            }
             true
         }
         _ => false,
     }
+}
+
+/// Snapshot the count of currently-tracked allocations. Pair with [`reset_to`]
+/// to bulk-free everything allocated after the mark.
+pub fn mark() -> i32 {
+    let Ok(state) = allocations().lock() else {
+        return 0;
+    };
+    state.order.len() as i32
+}
+
+/// Free every tracked allocation past `mark`, in LIFO order. Pointers freed
+/// here become invalid; callers must hold no live references into them.
+pub fn reset_to(mark: i32) {
+    let mark = mark.max(0) as usize;
+    loop {
+        let Ok(mut state) = allocations().lock() else {
+            return;
+        };
+        if state.order.len() <= mark {
+            return;
+        }
+        let Some(ptr) = state.order.pop() else {
+            return;
+        };
+        let Some(size) = state.sizes.remove(&ptr) else {
+            continue;
+        };
+        drop(state);
+        let Ok(size_i32) = i32::try_from(size) else {
+            continue;
+        };
+        unsafe { drop_raw(ptr, size_i32) };
+    }
+}
+
+/// Number of allocations currently outstanding. Test-only observability —
+/// production code should not rely on this.
+pub fn outstanding() -> i32 {
+    let Ok(state) = allocations().lock() else {
+        return 0;
+    };
+    state.order.len() as i32
+}
+
+/// # Safety
+/// Caller must pass a pointer and size previously returned by [`allocate`]
+/// whose bookkeeping was already removed from `ALLOCATIONS`.
+unsafe fn drop_raw(ptr: i32, size: i32) {
+    let Some((offset, size)) = checked_ptr_len(ptr, size) else {
+        return;
+    };
+    let Some(layout) = byte_layout(size) else {
+        return;
+    };
+    raw_dealloc(offset as *mut u8, layout);
 }
 
 pub fn memory_end_is_valid(end: usize) -> bool {
@@ -116,16 +192,21 @@ pub fn allocate(size: i32) -> i32 {
         return 0;
     }
     let size = size as usize;
-    let mut buf = Vec::<u8>::with_capacity(size);
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    let ptr = ptr as i32;
+    let Some(layout) = byte_layout(size) else {
+        return 0;
+    };
+    // SAFETY: layout has nonzero size — `size > 0` guard above.
+    let raw = unsafe { raw_alloc(layout) };
+    if raw.is_null() {
+        return 0;
+    }
+    let ptr = raw as usize as i32;
     remember_allocation(ptr, size);
     ptr
 }
 
 /// # Safety
-/// Caller must pass a pointer and capacity previously returned by [`allocate`].
+/// Caller must pass a pointer and size previously returned by [`allocate`].
 pub unsafe fn deallocate(ptr: i32, size: i32) {
     let Some((offset, size)) = checked_ptr_len(ptr, size) else {
         return;
@@ -133,5 +214,79 @@ pub unsafe fn deallocate(ptr: i32, size: i32) {
     if !take_allocation(ptr, size) {
         return;
     }
-    let _ = Vec::from_raw_parts(offset as *mut u8, 0, size);
+    let Some(layout) = byte_layout(size) else {
+        return;
+    };
+    raw_dealloc(offset as *mut u8, layout);
+}
+
+// Bookkeeping-only tests exercise the mark/reset/deallocate state machine
+// without touching `allocate` / `raw_dealloc` (which require wasm32 pointer
+// width — the host process truncates 64-bit pointers when stuffing them into
+// `i32` and aborts in dealloc). For end-to-end coverage that DOES exercise
+// the allocator, see the wasm-integration regression test
+// `bootstrap/tests/runtime/strings.rs::heap_reset_reclaims_string_allocations`.
+#[cfg(test)]
+mod bookkeeping_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    static SERIAL: StdMutex<()> = StdMutex::new(());
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn mark_reset_pops_in_lifo_order() {
+        let _g = lock();
+        let m = mark();
+        remember_allocation(0x1000, 64);
+        remember_allocation(0x2000, 128);
+        remember_allocation(0x3000, 256);
+        assert_eq!(outstanding(), m + 3);
+        reset_to_bookkeeping(m);
+        assert_eq!(outstanding(), m);
+    }
+
+    #[test]
+    fn take_allocation_removes_from_order() {
+        let _g = lock();
+        let m = mark();
+        remember_allocation(0x4000, 48);
+        assert!(take_allocation(0x4000, 48));
+        reset_to_bookkeeping(m);
+        assert_eq!(outstanding(), m);
+    }
+
+    #[test]
+    fn reset_keeps_pre_mark_entries() {
+        let _g = lock();
+        let pre = outstanding();
+        remember_allocation(0x5000, 16);
+        let m = mark();
+        remember_allocation(0x6000, 32);
+        remember_allocation(0x7000, 64);
+        assert_eq!(outstanding(), m + 2);
+        reset_to_bookkeeping(m);
+        assert_eq!(outstanding(), pre + 1);
+        // Manual cleanup — these synthetic pointers must not leak into other
+        // tests' baselines.
+        assert!(take_allocation(0x5000, 16));
+    }
+
+    /// Variant of `reset_to` that walks the bookkeeping vec without invoking
+    /// the host allocator. The synthetic pointers used in these tests are not
+    /// real heap pointers, so calling `raw_dealloc` on them would abort.
+    fn reset_to_bookkeeping(mark_value: i32) {
+        let mark = mark_value.max(0) as usize;
+        let Ok(mut state) = allocations().lock() else {
+            return;
+        };
+        while state.order.len() > mark {
+            if let Some(ptr) = state.order.pop() {
+                state.sizes.remove(&ptr);
+            }
+        }
+    }
 }
