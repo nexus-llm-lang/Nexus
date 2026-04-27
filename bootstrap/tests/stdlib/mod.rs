@@ -5,6 +5,7 @@ pub mod collections;
 pub mod env;
 pub mod exn;
 pub mod fs;
+pub mod lazy;
 pub mod list;
 pub mod math;
 pub mod net;
