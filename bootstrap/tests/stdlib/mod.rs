@@ -11,4 +11,5 @@ pub mod net;
 pub mod option;
 pub mod proc;
 pub mod result;
+pub mod stdio;
 pub mod string;

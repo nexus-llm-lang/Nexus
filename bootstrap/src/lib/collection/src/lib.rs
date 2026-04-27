@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 
 thread_local! {
     static MAPS: RefCell<HashMap<i64, HashMap<i64, i64>>> = RefCell::new(HashMap::new());
@@ -604,6 +605,102 @@ pub extern "C" fn __nx_buf_read_file(path_ptr: i32, path_len: i32) -> i64 {
             id
         }),
         Err(_) => -1,
+    }
+}
+
+// ── Stdin → ByteBuffer ───────────────────────────────────────────────
+// Logically a `stdio` op (exposed as `Console.read_bytes`), but the impl
+// lives here because BUFS does. Returns the new buf id; on EOF before n
+// bytes the buffer contains whatever was read — caller checks `length`.
+
+fn read_into_new_buf<R: Read>(reader: &mut R, n: i64) -> i64 {
+    let cap = if n <= 0 { 0 } else { n as usize };
+    let mut data = vec![0u8; cap];
+    let mut filled = 0usize;
+    while filled < cap {
+        match reader.read(&mut data[filled..]) {
+            Ok(0) => break,
+            Ok(k) => filled += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    data.truncate(filled);
+    NEXT_BUF_ID.with(|next| {
+        let id = next.get();
+        next.set(id + 1);
+        BUFS.with(|bufs| bufs.borrow_mut().insert(id, data));
+        id
+    })
+}
+
+/// Read up to `n` bytes from stdin into a new ByteBuffer. Blocks until `n`
+/// bytes are read or stdin closes; on EOF before `n`, returns a buffer
+/// shorter than `n` (caller inspects `length`). Binary-clean: bytes are
+/// preserved verbatim, no encoding interpretation.
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_read_bytes(n: i64) -> i64 {
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    read_into_new_buf(&mut handle, n)
+}
+
+#[cfg(test)]
+mod read_bytes_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn full_read_returns_exact_bytes() {
+        let payload: &[u8] = b"hello, world";
+        let mut cur = Cursor::new(payload.to_vec());
+        let id = read_into_new_buf(&mut cur, payload.len() as i64);
+        let got = BUFS.with(|b| b.borrow().get(&id).cloned()).unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn eof_before_n_yields_short_buffer() {
+        let payload: &[u8] = b"abc";
+        let mut cur = Cursor::new(payload.to_vec());
+        let id = read_into_new_buf(&mut cur, 16);
+        let got = BUFS.with(|b| b.borrow().get(&id).cloned()).unwrap();
+        assert_eq!(got, payload);
+        assert!(got.len() < 16);
+    }
+
+    #[test]
+    fn binary_clean_roundtrip_with_nul_and_high_bytes() {
+        let payload: Vec<u8> = (0u8..=255).collect();
+        let mut cur = Cursor::new(payload.clone());
+        let id = read_into_new_buf(&mut cur, payload.len() as i64);
+        let got = BUFS.with(|b| b.borrow().get(&id).cloned()).unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn multibyte_utf8_preserved_byte_for_byte() {
+        let payload = "こんにちは🌍\nLSP body".as_bytes().to_vec();
+        let mut cur = Cursor::new(payload.clone());
+        let id = read_into_new_buf(&mut cur, payload.len() as i64);
+        let got = BUFS.with(|b| b.borrow().get(&id).cloned()).unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn n_zero_returns_empty_buffer() {
+        let mut cur = Cursor::new(b"unused".to_vec());
+        let id = read_into_new_buf(&mut cur, 0);
+        let got = BUFS.with(|b| b.borrow().get(&id).cloned()).unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn n_negative_returns_empty_buffer() {
+        let mut cur = Cursor::new(b"unused".to_vec());
+        let id = read_into_new_buf(&mut cur, -5);
+        let got = BUFS.with(|b| b.borrow().get(&id).cloned()).unwrap();
+        assert!(got.is_empty());
     }
 }
 
