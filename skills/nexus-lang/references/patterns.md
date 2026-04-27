@@ -137,6 +137,60 @@ let main = fn () -> unit require { PermFs, PermConsole } do
 end
 ```
 
+## Bool Dispatch vs ADT Destructuring
+
+**`if` is for bool dispatch. `match` is for ADT destructuring.**
+Reading `match` should signal "destructuring an algebraic data type" — when every
+reader can rely on that, large pattern-match trees scan faster.
+
+### Good
+
+```nexus
+// bool: use if/else
+if is_empty then
+  return Err(err: "empty")
+else
+  return Ok(val: parse(input: raw))
+end
+
+// ADT: use match (the value carries variants/payloads)
+match res do
+  | Ok(val: c)  -> return c
+  | Err(err: m) -> raise ConfigError(msg: m)
+end
+```
+
+### Bad
+
+```nexus
+// Bool dispatch dressed up as ADT destructuring.
+// The reader has to scan two arms to discover this is just `if flag`.
+match flag do
+  | true  -> do_a()
+  | false -> do_b()
+end
+```
+
+### Exception: guard-style single arm
+
+When you genuinely want "do this only when one shape matches, otherwise fall
+through / raise", a single-arm `match` (or `match` + wildcard) reads cleaner
+than nested `if`. Keep these.
+
+```nexus
+// OK: one meaningful arm + wildcard
+match parse(input: raw) do
+  | Ok(val: c) -> use(config: c)
+  | _          -> ()
+end
+```
+
+### Why
+
+- `match X do | true -> A | false -> B end` is 4 lines for what `if X then A else B end` says in 1.
+- `match` is the language's most expensive read — every site costs the reader a "destructuring or just dispatch?" check. Reserving it for ADTs makes that check trivial.
+- The pattern compiler emits extra match-tree code where a plain branch would suffice.
+
 ## Linear Resource Management
 
 Nexus linear types (`%`) enforce exactly-once consumption at compile time.
