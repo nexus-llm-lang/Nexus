@@ -9,7 +9,7 @@
 //!   Nexus `bool` return    → Rust i32 (non-zero = true)
 //!   Nexus `i64`/`i32`/etc. → same WASM value type
 
-use nexus_wasm_alloc::{checked_ptr_len, remember_allocation, take_allocation};
+use nexus_wasm_alloc::{checked_ptr_len, remember_allocation, report_failure, take_allocation};
 use std::alloc::{Layout, alloc, realloc};
 
 const HOST_HTTP_MODULE: &str = "nexus:cli/nexus-host";
@@ -220,11 +220,23 @@ pub unsafe extern "C" fn cabi_realloc(
         return 0;
     }
     let Ok(old_layout) = Layout::from_size_align(old_len, align) else {
+        report_failure(
+            "cabi_realloc",
+            &format!(
+                "layout error after take_allocation: ptr=0x{old_ptr:08x} old_len={old_len} align={align}"
+            ),
+        );
         remember_allocation(old_ptr, old_len);
         return 0;
     };
     let ptr = realloc(old_ptr as *mut u8, old_layout, new_len);
     if ptr.is_null() {
+        report_failure(
+            "cabi_realloc",
+            &format!(
+                "realloc returned null: ptr=0x{old_ptr:08x} old_len={old_len} new_len={new_len}"
+            ),
+        );
         remember_allocation(old_ptr, old_len);
         return 0;
     }
