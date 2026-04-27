@@ -1,5 +1,6 @@
 use std::alloc::{alloc as raw_alloc, dealloc as raw_dealloc, Layout};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Allocate-time and free-time layouts must match exactly for
@@ -35,6 +36,10 @@ pub fn remember_allocation(ptr: i32, size: usize) {
 
 pub fn take_allocation(ptr: i32, size: usize) -> bool {
     let Ok(mut state) = allocations().lock() else {
+        report_failure(
+            "take_allocation",
+            &format!("allocations mutex poisoned: ptr=0x{ptr:08x} size={size}"),
+        );
         return false;
     };
     match state.sizes.get(&ptr).copied() {
@@ -45,8 +50,52 @@ pub fn take_allocation(ptr: i32, size: usize) -> bool {
             }
             true
         }
-        _ => false,
+        Some(expected) => {
+            drop(state);
+            report_misuse("take_allocation", ptr, Some(expected), size);
+            false
+        }
+        None => {
+            drop(state);
+            report_misuse("take_allocation", ptr, None, size);
+            false
+        }
     }
+}
+
+/// Counter incremented every time `wasm_alloc` detects caller misuse
+/// (size mismatch / unknown ptr in `take_allocation`) or an internal
+/// failure (e.g. layout error, OOM). Test-only observability — production
+/// code should not gate logic on this value.
+static FAILURE_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn observed_failure_count() -> u64 {
+    FAILURE_EVENTS.load(Ordering::Relaxed)
+}
+
+/// Caller-bug observation: panics in debug builds (caller passed wrong
+/// size or an untracked pointer — almost certainly a programmer error)
+/// and emits a `eprintln` + counter bump in release builds so the misuse
+/// is at least visible in logs instead of silently leaking memory.
+pub fn report_misuse(context: &str, ptr: i32, expected: Option<usize>, actual: usize) {
+    FAILURE_EVENTS.fetch_add(1, Ordering::Relaxed);
+    let detail = match expected {
+        Some(exp) => format!(
+            "ptr=0x{ptr:08x} size mismatch (tracked={exp}, caller-passed={actual})"
+        ),
+        None => format!(
+            "ptr=0x{ptr:08x} not tracked (caller-passed size={actual})"
+        ),
+    };
+    eprintln!("wasm_alloc misuse: {context}: {detail}");
+    debug_assert!(false, "wasm_alloc misuse: {context}: {detail}");
+}
+
+/// System-failure observation (OOM, layout error). Never traps — these
+/// are not caller bugs. Counter + eprintln so the failure is visible.
+pub fn report_failure(context: &str, detail: &str) {
+    FAILURE_EVENTS.fetch_add(1, Ordering::Relaxed);
+    eprintln!("wasm_alloc failure: {context}: {detail}");
 }
 
 /// Snapshot the count of currently-tracked allocations. Pair with [`reset_to`]
@@ -257,6 +306,44 @@ mod bookkeeping_tests {
         assert!(take_allocation(0x4000, 48));
         reset_to_bookkeeping(m);
         assert_eq!(outstanding(), m);
+    }
+
+    #[test]
+    fn take_allocation_size_mismatch_reports_misuse() {
+        let _g = lock();
+        remember_allocation(0x8000, 64);
+        let before = observed_failure_count();
+        assert!(!take_allocation(0x8000, 32));
+        assert!(observed_failure_count() > before);
+        // Bookkeeping for 0x8000 is untouched on mismatch — clean up with
+        // the correct size so the entry doesn't leak into other tests.
+        assert!(take_allocation(0x8000, 64));
+    }
+
+    #[test]
+    fn take_allocation_unknown_ptr_reports_misuse() {
+        let _g = lock();
+        let before = observed_failure_count();
+        assert!(!take_allocation(0x9000, 16));
+        assert!(observed_failure_count() > before);
+    }
+
+    /// `deallocate` is the public misuse surface — verify the mismatched-size
+    /// path goes through `take_allocation` and bumps the counter without
+    /// invoking `raw_dealloc` on the (synthetic) pointer.
+    #[test]
+    fn deallocate_size_mismatch_reports_misuse() {
+        let _g = lock();
+        remember_allocation(0xC000, 64);
+        let before = observed_failure_count();
+        unsafe { deallocate(0xC000, 32) };
+        assert!(observed_failure_count() > before);
+        assert_eq!(outstanding_for(0xC000), Some(64));
+        assert!(take_allocation(0xC000, 64));
+    }
+
+    fn outstanding_for(ptr: i32) -> Option<usize> {
+        allocations().lock().ok()?.sizes.get(&ptr).copied()
     }
 
     #[test]
