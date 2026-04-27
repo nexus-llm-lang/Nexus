@@ -2056,22 +2056,51 @@ pub(super) fn compile_expr(
                     Ok(())
                 }
                 Intrinsic::HeapMark => {
-                    // Return current object heap pointer as i64
-                    out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
-                    out.instruction(&Instruction::I64ExtendI32U);
+                    // Pack the stdlib allocator's mark count (upper 32 bits)
+                    // alongside G0 (lower 32 bits) so heap_reset can free both.
+                    // When no stdlib allocator is wired (object_heap_enabled = false
+                    // or shared-memory lazy), the upper 32 bits stay zero — heap_reset
+                    // skips the stdlib branch.
+                    if let Some(mark_idx) = layout.alloc_mark_func_idx {
+                        out.instruction(&Instruction::Call(mark_idx));
+                        out.instruction(&Instruction::I64ExtendI32U);
+                        out.instruction(&Instruction::I64Const(32));
+                        out.instruction(&Instruction::I64Shl);
+                        out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+                        out.instruction(&Instruction::I64ExtendI32U);
+                        out.instruction(&Instruction::I64Or);
+                    } else {
+                        out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
+                        out.instruction(&Instruction::I64ExtendI32U);
+                    }
                     Ok(())
                 }
                 Intrinsic::HeapReset => {
-                    // Restore object heap pointer from i64 arg
                     let mark = &args.iter().find(|(l, _)| l.as_ref() == "mark").unwrap().1;
-                    compile_atom(mark, out, local_map, layout)?;
-                    out.instruction(&Instruction::I32WrapI64);
-                    out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+                    if let Some(reset_idx) = layout.alloc_reset_func_idx {
+                        // Stdlib alloc reset takes the high 32 bits as i32.
+                        compile_atom(mark, out, local_map, layout)?;
+                        out.instruction(&Instruction::I64Const(32));
+                        out.instruction(&Instruction::I64ShrU);
+                        out.instruction(&Instruction::I32WrapI64);
+                        out.instruction(&Instruction::Call(reset_idx));
+                        // Then restore G0 from the low 32 bits.
+                        compile_atom(mark, out, local_map, layout)?;
+                        out.instruction(&Instruction::I32WrapI64);
+                        out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+                    } else {
+                        compile_atom(mark, out, local_map, layout)?;
+                        out.instruction(&Instruction::I32WrapI64);
+                        out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
+                    }
                     out.instruction(&Instruction::I64Const(0));
                     Ok(())
                 }
                 Intrinsic::HeapSwap => {
-                    // Swap global 0 with new base, return old value
+                    // Swap G0 with new base, return old value. Out of scope for
+                    // stdlib mark/reset — heap_swap is a region-pivot primitive
+                    // that operates only on the bump pointer, leaving stdlib
+                    // allocations under the live mark.
                     let base = &args.iter().find(|(l, _)| l.as_ref() == "base").unwrap().1;
                     out.instruction(&Instruction::GlobalGet(OBJECT_HEAP_GLOBAL_INDEX));
                     out.instruction(&Instruction::I64ExtendI32U);

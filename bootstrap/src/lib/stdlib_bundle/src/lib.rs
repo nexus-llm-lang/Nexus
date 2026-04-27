@@ -18,6 +18,16 @@ pub unsafe extern "C" fn deallocate(ptr: i32, size: i32) {
     nexus_wasm_alloc::deallocate(ptr, size);
 }
 
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_alloc_mark() -> i32 {
+    nexus_wasm_alloc::mark()
+}
+
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_alloc_reset(mark: i32) {
+    nexus_wasm_alloc::reset_to(mark);
+}
+
 /// cabi_realloc for canonical ABI. Delegates to the system allocator
 /// (same as nexus_wasm_alloc). Allocations are tracked for proper dealloc.
 #[no_mangle]

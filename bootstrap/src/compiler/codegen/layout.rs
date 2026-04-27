@@ -36,6 +36,15 @@ pub(super) struct CodegenLayout {
     pub(super) object_heap_enabled: bool,
     pub(super) heap_base: u32,
     pub(super) allocate_func_idx: Option<u32>,
+    /// Index of imported `__nx_alloc_mark` (paired with `allocate`).
+    /// Returns the snapshot of outstanding allocations, packed into the upper
+    /// 32 bits of `arena.heap_mark`'s i64 return so `heap_reset` can free them
+    /// together with the G0 bump. Set whenever `allocate_func_idx` is set —
+    /// otherwise heap_reset would silently leak strings from the stdlib path.
+    pub(super) alloc_mark_func_idx: Option<u32>,
+    /// Index of imported `__nx_alloc_reset(mark)`. LIFO-frees every
+    /// allocation made after `mark`. Called from `arena.heap_reset`.
+    pub(super) alloc_reset_func_idx: Option<u32>,
     /// Exception tag index (WASM EH): defined in tag section, used by throw/try_table
     pub(super) exn_tag_idx: Option<u32>,
     /// Index of imported __nx_capture_backtrace function (called before throw)
@@ -130,6 +139,8 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
         object_heap_enabled,
         heap_base,
         allocate_func_idx: None,
+        alloc_mark_func_idx: None,
+        alloc_reset_func_idx: None,
         exn_tag_idx: None,
         capture_bt_func_idx: None,
         funcref_table_indices: HashMap::new(),

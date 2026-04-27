@@ -1,4 +1,4 @@
-use crate::harness::{compile, exec};
+use crate::harness::{compile, exec, exec_with_stdlib};
 
 #[test]
 fn codegen_string_return_is_supported() {
@@ -191,6 +191,39 @@ let main = fn () -> unit do
             if v != 42 then raise RuntimeError(val: "Alpha.x corrupted") end
         | Beta(x: _) -> raise RuntimeError(val: "tag became Beta")
         | Gamma(x: _) -> raise RuntimeError(val: "tag became Gamma")
+    end
+    return ()
+end
+"#,
+    );
+}
+
+/// Loop a string-allocating sequence wrapped in `arena.heap_mark` /
+/// `arena.heap_reset`. Without the reset, every iteration's intermediate
+/// concat / format / substring would accumulate on the routed allocator and
+/// the program would balloon linearly. With reset, both G0 and the stdlib
+/// allocator's bookkeeping rewind to the mark, so the working set stays
+/// bounded across iterations and the program completes cleanly.
+#[test]
+fn heap_reset_reclaims_string_allocations_in_loop() {
+    exec_with_stdlib(
+        r#"
+import { heap_mark, heap_reset } from "std:arena"
+import { length, substring, concat, repeat } from "std:string_ops"
+
+let main = fn () -> unit do
+    let ~i = 0
+    while ~i < 200 do
+        let mark = heap_mark()
+        let base = repeat(s: "ab", n: 16)
+        let prefixed = concat(a: "n=", b: base)
+        let middle = substring(s: prefixed, start: 0, len: 10)
+        let combined = concat(a: middle, b: prefixed) ++ "!"
+        if length(s: combined) <= length(s: base) then
+            raise RuntimeError(val: "expected combined to grow")
+        end
+        heap_reset(mark: mark)
+        ~i <- ~i + 1
     end
     return ()
 end

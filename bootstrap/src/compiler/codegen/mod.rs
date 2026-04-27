@@ -31,6 +31,8 @@ const OBJECT_HEAP_GLOBAL_INDEX: u32 = 0;
 /// String allocations share the object heap (G0).
 const STRING_HEAP_GLOBAL_INDEX: u32 = 0;
 const ALLOCATE_WASM_NAME: &str = "allocate";
+const ALLOC_MARK_WASM_NAME: &str = "__nx_alloc_mark";
+const ALLOC_RESET_WASM_NAME: &str = "__nx_alloc_reset";
 const BT_MODULE: &str = "nexus:runtime/backtrace";
 const BT_CAPTURE_NAME: &str = "capture-backtrace";
 const LAZY_MODULE: &str = "nexus:runtime/lazy";
