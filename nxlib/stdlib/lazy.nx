@@ -11,18 +11,25 @@
 /// Sequential semantics only — both thunks always run to completion.
 /// A parallel reimplementation would cancel the loser after the winner
 /// resolves, but under sequential execution there is no loser to cancel.
+///
+/// Operates on @T (lazy bindings), not %Task<T> handles — orthogonal to
+/// host_spawn / host_join. A task-handle race would require a runtime-side
+/// "first-of" primitive and is not yet provided.
 export let race = fn <T>(a: @T, b: @T) -> T do
   let result = @a
   let _ = @b
   return result
 end
 
-/// cancel(a): Consume a thunk without forcing it.
-/// Explicit `let _ = a` drop to satisfy the callee-side linearity rule
-/// (each @T parameter must be referenced exactly once in the function body —
-/// `let _ = a` is the "drop without force" form).
+/// cancel(a): Discharge a thunk's linearity by forcing it and discarding
+/// the result. Despite the name, the only way to consume a linear @T in
+/// this calculus is to force it — there is no "drop without force" form
+/// (a statement-level `let _ = a` rebinds the linear obligation to the
+/// name `_` instead of releasing it). For sequential semantics this is
+/// indistinguishable from `detach`; the name survives for symmetry with
+/// future parallel runtimes that may add a true cancellation primitive.
 export let cancel = fn <T>(a: @T) -> unit do
-  let _ = a
+  let _ = @a
   return ()
 end
 
@@ -39,20 +46,29 @@ end
 // Two-step protocol against the nexus:runtime/lazy host interface
 // (Rust __nx_lazy_spawn / __nx_lazy_join):
 //
-//   host_spawn : <T>(@T) -> i64      // consumes thunk, returns task handle
-//   host_join  : <T>(i64) -> T       // waits on handle, returns forced value
+//   host_spawn : <T>(@T) -> %Task<T>    // consumes thunk, returns linear handle
+//   host_join  : <T>(%Task<T>) -> T     // waits on handle, returns forced value
+//
+// Task<T> is an opaque linear wrapper around the runtime's raw i64 task id.
+// The linearity checker statically rejects spawn-without-join (the entry in
+// the runtime's tasks map and, for threaded thunks, the Rust JoinHandle would
+// otherwise leak for the lifetime of the wasm instance).
 //
 // Zero-capture thunks run on a worker thread; non-zero-capture thunks fall
-// back to inline on the caller thread and the "task handle" encodes the
-// inline result directly. The encoding is private to the runtime — callers
-// must always pair spawn with join.
+// back to inline on the caller thread and the "task id" encodes the inline
+// result directly. The encoding is private to the runtime — callers must
+// always pair spawn with join.
 import external "nexus:runtime/lazy"
 external __nx_lazy_spawn = "__nx_lazy_spawn" : <T>(thunk: @T, num_captures: i32) -> i64
 external __nx_lazy_join = "__nx_lazy_join" : <T>(task_id: i64) -> T
 
-/// host_spawn(a): Dispatch a thunk to the runtime. The @T is consumed;
-/// the returned i64 is an opaque task handle that must be passed to
-/// host_join to retrieve the forced value.
+/// A handle to a spawned thunk. Linear — must be consumed by `host_join`.
+/// Phantom T threads the thunk's element type from host_spawn to host_join
+/// so the FFI's type-erased i64 channel cannot be misused across the pair.
+export opaque type Task<T> = Task(id: i64)
+
+/// host_spawn(a): Dispatch a thunk to the runtime. The @T is consumed and
+/// a linear %Task<T> is returned that must be drained by host_join.
 ///
 /// num_captures is conservatively set to 1 so the runtime always takes the
 /// inline-fallback path. Without compiler support to thread the actual
@@ -60,21 +76,26 @@ external __nx_lazy_join = "__nx_lazy_join" : <T>(task_id: i64) -> T
 /// thunks to a worker thread whose Store has zero-initialised memory and
 /// silently produce wrong values. host_force already documents sequential
 /// semantics, so the inline path is a correctness-preserving choice.
-export let host_spawn = fn <T>(a: @T) -> i64 do
-  return __nx_lazy_spawn(thunk: a, num_captures: 1)
+export let host_spawn = fn <T>(a: @T) -> %Task<T> do
+  let id = __nx_lazy_spawn(thunk: a, num_captures: 1)
+  let t = Task(id)
+  let %lt = t
+  return %lt
 end
 
-/// host_join(task_id): Await a previously spawned thunk and return its
-/// forced value. The T must match the element type of the thunk handed
-/// to host_spawn; the runtime erases types at the FFI boundary so this
-/// is the caller's obligation.
-export let host_join = fn <T>(task_id: i64) -> T do
-  return __nx_lazy_join(task_id)
+/// host_join(handle): Await a previously spawned thunk and return its
+/// forced value. Consumes the linear handle.
+///
+/// Parameter is named `handle` (not `task`) because `task` is a reserved
+/// keyword in Nexus.
+export let host_join = fn <T>(handle: %Task<T>) -> T do
+  let Task(id) = handle
+  return __nx_lazy_join(task_id: id)
 end
 
 /// host_force(a): Convenience composition of spawn + join. Semantically
 /// equivalent to `@a`, but routes the evaluation through the runtime so
 /// any future cross-thunk parallelism surfaces here.
 export let host_force = fn <T>(a: @T) -> T do
-  return host_join(task_id: host_spawn(a))
+  return host_join(handle: host_spawn(a))
 end
