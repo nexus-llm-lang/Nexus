@@ -1,11 +1,20 @@
-use crate::harness::{exec, should_fail_parse, should_fail_typecheck, should_typecheck};
+use crate::harness::{exec, should_fail_typecheck, should_typecheck};
 
-/// nexus-giyg (Phase 2c of nexus-x7w): the `with @k` clause is parsed as
-/// a syntactic extension of handler arms but the rest of the pipeline is
-/// not yet implemented. The Rust bootstrap parser must reject the clause
-/// with a clear message rather than silently mis-parsing.
+/// nexus-x7w Phase 2 + nexus-bes5 Phase 3 shipped, so the parser must
+/// accept the `with @k` continuation-binder syntax — production stdlib
+/// (nxlib/stdlib/sched.nx) relies on it, and stdlib preload eagerly
+/// parses every .nx file.
+///
+/// The Rust bootstrap pipeline only parses the clause (storing it in
+/// `Function.cont_binder`); the typechecker doesn't bind `k` into scope,
+/// and `hir_build` raises `HandlerKontNotSupported` if anything tries to
+/// lower an arm with `cont_binder = Some(_)`. End-to-end semantics live
+/// in the self-hosted compiler — covered by
+/// `nxc::codegen::handler_with_kont_resume`. This test pins the parser's
+/// "accept and store, defer to nxc" stance.
 #[test]
-fn handler_with_kont_clause_rejected_until_phase_2() {
+fn handler_with_kont_clause_parses() {
+    use nexus::lang::parser;
     let src = r#"
     cap Sched do
       fn yield() -> unit
@@ -21,7 +30,9 @@ fn handler_with_kont_clause_rejected_until_phase_2() {
       return ()
     end
     "#;
-    should_fail_parse(src);
+    parser::parser()
+        .parse(src)
+        .expect("`with @k` clause must parse — required by stdlib preload (sched.nx)");
 }
 
 #[test]

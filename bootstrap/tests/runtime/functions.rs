@@ -24,9 +24,9 @@ fn codegen_fixture_fib_works_in_wasm() {
 }
 
 #[test]
-fn codegen_fixture_di_port_compiles() {
+fn codegen_fixture_di_cap_compiles() {
     crate::harness::ensure_repo_root();
-    let src = fs::read_to_string("examples/di_port.nx").expect("fixture should exist");
+    let src = fs::read_to_string("examples/di_cap.nx").expect("fixture should exist");
     exec_with_stdlib(&src);
 }
 
