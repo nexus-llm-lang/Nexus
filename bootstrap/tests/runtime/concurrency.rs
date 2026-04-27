@@ -1,4 +1,28 @@
-use crate::harness::{exec, should_fail_typecheck, should_typecheck};
+use crate::harness::{exec, should_fail_parse, should_fail_typecheck, should_typecheck};
+
+/// nexus-giyg (Phase 2c of nexus-x7w): the `with @k` clause is parsed as
+/// a syntactic extension of handler arms but the rest of the pipeline is
+/// not yet implemented. The Rust bootstrap parser must reject the clause
+/// with a clear message rather than silently mis-parsing.
+#[test]
+fn handler_with_kont_clause_rejected_until_phase_2() {
+    let src = r#"
+    cap Sched do
+      fn yield() -> unit
+    end
+
+    let scheduler = handler Sched do
+      fn yield() -> unit with @k do
+        return ()
+      end
+    end
+
+    let main = fn () -> unit do
+      return ()
+    end
+    "#;
+    should_fail_parse(src);
+}
 
 #[test]
 fn test_net_effect_enforcement() {

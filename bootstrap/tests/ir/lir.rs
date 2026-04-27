@@ -130,8 +130,16 @@ fn mutual_recursion_produces_tail_call_in_lir() {
     end
     "#;
     let lir = build_lir(src);
-    let is_even_fn = lir.functions.iter().find(|f| f.name.as_str().ends_with("#is_even")).unwrap();
-    let is_odd_fn = lir.functions.iter().find(|f| f.name.as_str().ends_with("#is_odd")).unwrap();
+    let is_even_fn = lir
+        .functions
+        .iter()
+        .find(|f| f.name.as_str().ends_with("#is_even"))
+        .unwrap();
+    let is_odd_fn = lir
+        .functions
+        .iter()
+        .find(|f| f.name.as_str().ends_with("#is_odd"))
+        .unwrap();
     let even_body = format!("{:?}", is_even_fn.body);
     let odd_body = format!("{:?}", is_odd_fn.body);
     assert!(
@@ -160,7 +168,11 @@ fn tail_call_in_if_else_branches() {
     end
     "#;
     let lir = build_lir(src);
-    let count_fn = lir.functions.iter().find(|f| f.name.as_str().ends_with("#count")).unwrap();
+    let count_fn = lir
+        .functions
+        .iter()
+        .find(|f| f.name.as_str().ends_with("#count"))
+        .unwrap();
     let body_str = format!("{:?}", count_fn.body);
     assert!(
         body_str.contains("TailCall"),

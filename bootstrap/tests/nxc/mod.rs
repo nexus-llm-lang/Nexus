@@ -10,6 +10,6 @@ pub mod parser;
 pub mod qualified_imports;
 pub mod rdrname;
 pub mod resolve;
-pub mod transitive_wrapper;
 pub mod symtab;
+pub mod transitive_wrapper;
 pub mod typecheck;

@@ -171,7 +171,9 @@ fn stub_nexus_cli_imports(path: &Path) {
         .expect("no import section (id=2) in stdlib.wasm");
     let imports = parse_imports(&data, imp_off);
 
-    let has_cli = imports.iter().any(|imp| imp.module.starts_with("nexus:cli"));
+    let has_cli = imports
+        .iter()
+        .any(|imp| imp.module.starts_with("nexus:cli"));
     if !has_cli {
         return;
     }
@@ -214,8 +216,7 @@ fn stub_nexus_cli_imports(path: &Path) {
 
     // Locals shift: old local N at idx (num_old_func_imports + N), new at
     // (num_wasi_func + num_cli_func + N).
-    let local_shift: i64 =
-        (num_wasi_func + num_cli_func) as i64 - num_old_func_imports as i64;
+    let local_shift: i64 = (num_wasi_func + num_cli_func) as i64 - num_old_func_imports as i64;
 
     // Collect CLI function type indices for stub function types.
     let cli_func_types: Vec<u32> = cli_idxs
@@ -267,8 +268,14 @@ fn stub_nexus_cli_imports(path: &Path) {
     for _ in 0..code_count {
         let (body_size, body_start) = read_uleb128(&data, cpos);
         let body_end = body_start + body_size as usize;
-        let new_body =
-            rewrite_body(&data, body_start, body_end, &func_remap, num_old_func_imports as u32, local_shift);
+        let new_body = rewrite_body(
+            &data,
+            body_start,
+            body_end,
+            &func_remap,
+            num_old_func_imports as u32,
+            local_shift,
+        );
         write_uleb128(&mut new_code, new_body.len() as u64);
         new_code.extend_from_slice(&new_body);
         cpos = body_end;

@@ -120,6 +120,29 @@ let skip_limits = fn (buf: &ByteBuffer, pos: i64) -> i64 do
   return ppos(pk: rd_uleb(buf, pos: ppos(pk)))
 end
 
+let skip_table_entry = fn (buf: &ByteBuffer, pos: i64) -> i64 do
+  let rt = bb.get_byte(buf, idx: pos)
+  if rt == 112 || rt == 111 then return skip_limits(buf, pos: pos + 1) end
+  let SlebRes(val: _, pos: after_tidx) = rd_sleb(buf, pos: pos + 1)
+  return skip_limits(buf, pos: after_tidx)
+end
+
+let copy_table_entries_with_type_off = fn (buf: %ByteBuffer, src: &ByteBuffer, pos: i64, end_pos: i64, off: i64) -> %ByteBuffer do
+  if pos >= end_pos then return %buf end
+  let rt = bb.get_byte(buf: src, idx: pos)
+  let %buf = bb.push_byte(%buf, byte: rt)
+  if rt == 112 || rt == 111 then
+    let lim_end = skip_limits(buf: src, pos: pos + 1)
+    let %buf = bb.copy_range(dst: %buf, src, start: pos + 1, end_pos: lim_end)
+    return copy_table_entries_with_type_off(%buf, src, pos: lim_end, end_pos, off)
+  end
+  let SlebRes(val: tidx, pos: after_tidx) = rd_sleb(buf: src, pos: pos + 1)
+  let %buf = bb.push_sleb128(%buf, val: tidx + off)
+  let lim_end = skip_limits(buf: src, pos: after_tidx)
+  let %buf = bb.copy_range(dst: %buf, src, start: after_tidx, end_pos: lim_end)
+  return copy_table_entries_with_type_off(%buf, src, pos: lim_end, end_pos, off)
+end
+
 // Skip an import descriptor; returns position after it
 let skip_imp_desc = fn (buf: &ByteBuffer, pos: i64) -> i64 do
   let kind = bb.get_byte(buf, idx: pos)
@@ -252,10 +275,10 @@ end
 
 // ─── Main non-stdlib import copying ──────────────────────────────────────
 // Copy main's non-stdlib function imports to output (no type offset needed — main types first)
-let copy_main_kept_imps = fn (out: %ByteBuffer, buf: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
+let copy_main_kept_imps = fn (out: %ByteBuffer, buf: &ByteBuffer, sec_pk: i64, type_off: i64) -> %ByteBuffer do
   if sec_pk == 0 then return %out end
   let pk = rd_uleb(buf, pos: sec_off(pk: sec_pk))
-  return copy_main_kept_go(%out, buf, pos: ppos(pk), remaining: pval(pk))
+  return copy_main_kept_go(%out, buf, pos: ppos(pk), remaining: pval(pk), type_off)
 end
 // A main import is satisfied by dep (and dropped from merged imports) if:
 //   - module is "nexus:std/*" (function, resolved to dep export), OR
@@ -264,7 +287,7 @@ end
 // Keeping main imports intact would require shifting dep's function indices by
 // m_kept, but remap_dep_func is identity (see remap_dep_func comment), so any
 // kept main import breaks dep internal calls.
-let copy_main_kept_go = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64) -> %ByteBuffer do
+let copy_main_kept_go = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64, type_off: i64) -> %ByteBuffer do
   if remaining <= 0 then return %out end
   let start = pos
   let StrPos(s: mod_name, pos: pos2) = rd_str(buf, pos)
@@ -272,17 +295,22 @@ let copy_main_kept_go = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remain
   let kind = bb.get_byte(buf, idx: pos3)
   let pos4 = skip_imp_desc(buf, pos: pos3)
   if str.starts_with(s: mod_name, prefix: "nexus:std/") then
-    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1)
+    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off)
   end
   if str.byte_length(s: mod_name) == 0 then
-    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1)
+    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off)
   end
   if kind == 2 then
-    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1)
+    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off)
   end
-  // Non-stdlib import: copy as-is (type indices correct — main types first)
+  if kind == 0 then
+    let %out = bb.copy_range(dst: %out, src: buf, start, end_pos: pos3 + 1)
+    let pk = rd_uleb(buf, pos: pos3 + 1)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk) + type_off)
+    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off)
+  end
   let %out = bb.copy_range(dst: %out, src: buf, start, end_pos: pos4)
-  return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1)
+  return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off)
 end
 
 // ─── Main import resolution ───────────────────────────────────────────────
@@ -331,11 +359,9 @@ let resolve_main_go = fn (ctx: %ResolveCtx, dep_exports: &StringMap, buf: &ByteB
   return resolve_main_go(%ctx, dep_exports, buf, pos: pos4, remaining: remaining - 1, state)
 end
 
-// Map a dep function index to its new merged index
 let remap_dep_func = fn (dep_fidx: i64, kept_fimp: i64, n_stubs: i64, dep_fimp: i64) -> i64 do
-  // With stubbed stdlib (stubs replace CLI imports), dep function indices are
-  // preserved verbatim in the merged output. Identity remap.
-  return dep_fidx
+  if dep_fidx < dep_fimp then return dep_fidx end
+  return dep_fidx + kept_fimp + n_stubs - dep_fimp
 end
 
 // ─── Populate remap intarrs ──────────────────────────────────────────────
@@ -408,7 +434,7 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
   // 3 = blocktype, 4 = sleb, 5 = f64 (8 bytes), 6 = memarg (2 ULEBs, load/store),
   // 7 = mem index byte, 8 = br_table, 9 = try_table, 10 = 0xFC prefix,
   // 11 = call/return_call (remap func idx), 12 = global.get/set (add glo_off),
-  // 13 = ref.func (remap func idx)
+  // 13 = ref.func (remap func idx), 17 = table.get/set (add tbl_off)
   let cls = if op >= 40 then
     if op <= 62 then 6
     else if op == 63 then 7
@@ -417,6 +443,10 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
     else if op == 66 then 4
     else if op == 68 then 5
     else if op == 210 then 13
+    else if op == 224 then 14
+    else if op == 225 then 15
+    else if op == 226 then 1
+    else if op == 227 then 16
     else if op == 252 then 10
     else 0
     end
@@ -438,6 +468,8 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
       | 34 -> 1
       | 35 -> 12
       | 36 -> 12
+      | 37 -> 17
+      | 38 -> 17
       | _ -> 0
     end
   end
@@ -534,6 +566,35 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
     let %out = bb.push_uleb128(buf: %out, val: new_idx)
     return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
   end
+  if cls == 14 then
+    // cont.new / cont.bind-single: type index + type_off
+    let pk = rd_uleb(buf: src, pos)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk) + type_off)
+    return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
+  end
+  if cls == 15 then
+    // cont.bind: two type indices, both + type_off
+    let pk1 = rd_uleb(buf: src, pos)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk1) + type_off)
+    let pk2 = rd_uleb(buf: src, pos: ppos(pk: pk1))
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2) + type_off)
+    return rw_instrs(ctx, remap, %out, src, pos: ppos(pk: pk2), end_pos)
+  end
+  if cls == 16 then
+    // resume: cont type index + type_off, then handler table (pass-through)
+    let pk = rd_uleb(buf: src, pos)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk) + type_off)
+    let pk2 = rd_uleb(buf: src, pos: ppos(pk))
+    let n_ht = pval(pk: pk2)
+    let %out = bb.push_uleb128(buf: %out, val: n_ht)
+    let BufPos(buf: %out, pos: after_ht) = copy_resume_handlers(%out, src, pos: ppos(pk: pk2), remaining: n_ht)
+    return rw_instrs(ctx, remap, %out, src, pos: after_ht, end_pos)
+  end
+  if cls == 17 then
+    let pk = rd_uleb(buf: src, pos)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk) + tbl_off)
+    return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
+  end
   // cls == 0: no operand, already pushed byte
   return rw_instrs(ctx, remap, %out, src, pos, end_pos)
 end
@@ -603,12 +664,26 @@ let copy_try_handlers = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remain
   return copy_try_handlers(%out, src, pos: ppos(pk), remaining: remaining - 1)
 end
 
+let copy_resume_handlers = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64) -> BufPos do
+  if remaining <= 0 then return BufPos(buf: %out, pos) end
+  let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
+  let end2 = scan_lebs(buf: src, pos: pos + 1, n: 2)
+  let %out = bb.copy_range(dst: %out, src, start: pos + 1, end_pos: end2)
+  return copy_resume_handlers(%out, src, pos: end2, remaining: remaining - 1)
+end
+
 // ─── Section emitters ─────────────────────────────────────────────────────
 
 let emit_sec = fn (out: %ByteBuffer, sec_id: i64, content: &ByteBuffer) -> %ByteBuffer do
   let %out = bb.push_byte(buf: %out, byte: sec_id)
   let %out = bb.push_uleb128(buf: %out, val: bb.length(buf: content))
   return bb.push_buf(dst: %out, src: content)
+end
+
+let emit_sec_and_free = fn (out: %ByteBuffer, sec_id: i64, tmp: %ByteBuffer) -> %ByteBuffer do
+  let %out = emit_sec(%out, sec_id, content: &tmp)
+  bb.free(buf: %tmp)
+  return %out
 end
 
 let copy_raw_sec = fn (out: %ByteBuffer, src: &ByteBuffer, sec_pk: i64, sec_id: i64) -> %ByteBuffer do
@@ -630,13 +705,82 @@ let copy_sec_body = fn (buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64) -> %Byt
   return %buf
 end
 
+let skip_n_valtypes = fn (src: &ByteBuffer, pos: i64, remaining: i64) -> i64 do
+  if remaining <= 0 then return pos end
+  let b = bb.get_byte(buf: src, idx: pos)
+  if b == 99 then return skip_n_valtypes(src, pos: scan_sleb_end(buf: src, pos: pos + 1), remaining: remaining - 1) end
+  if b == 100 then return skip_n_valtypes(src, pos: scan_sleb_end(buf: src, pos: pos + 1), remaining: remaining - 1) end
+  return skip_n_valtypes(src, pos: pos + 1, remaining: remaining - 1)
+end
+
+let emit_valtypes_off = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64, off: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let b = bb.get_byte(buf: src, idx: pos)
+  if b == 99 then
+    let %out = bb.push_byte(buf: %out, byte: 99)
+    let SlebRes(val: heap_idx, pos: next) = rd_sleb(buf: src, pos: pos + 1)
+    let %out = bb.push_sleb128(buf: %out, val: heap_idx + off)
+    return emit_valtypes_off(%out, src, pos: next, remaining: remaining - 1, off)
+  end
+  if b == 100 then
+    let %out = bb.push_byte(buf: %out, byte: 100)
+    let SlebRes(val: heap_idx, pos: next) = rd_sleb(buf: src, pos: pos + 1)
+    let %out = bb.push_sleb128(buf: %out, val: heap_idx + off)
+    return emit_valtypes_off(%out, src, pos: next, remaining: remaining - 1, off)
+  end
+  let %out = bb.push_byte(buf: %out, byte: b)
+  return emit_valtypes_off(%out, src, pos: pos + 1, remaining: remaining - 1, off)
+end
+
+let skip_one_type_entry = fn (src: &ByteBuffer, pos: i64) -> i64 do
+  let form = bb.get_byte(buf: src, idx: pos)
+  if form == 93 then
+    let SlebRes(val: _, pos: next) = rd_sleb(buf: src, pos: pos + 1)
+    return next
+  end
+  let pk_p = rd_uleb(buf: src, pos: pos + 1)
+  let after_p = skip_n_valtypes(src, pos: ppos(pk: pk_p), remaining: pval(pk: pk_p))
+  let pk_r = rd_uleb(buf: src, pos: after_p)
+  return skip_n_valtypes(src, pos: ppos(pk: pk_r), remaining: pval(pk: pk_r))
+end
+
+let copy_one_type_entry_off = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, off: i64) -> %ByteBuffer do
+  let form = bb.get_byte(buf: src, idx: pos)
+  if form == 93 then
+    let %out = bb.push_byte(buf: %out, byte: 93)
+    let SlebRes(val: tidx, pos: _) = rd_sleb(buf: src, pos: pos + 1)
+    return bb.push_sleb128(buf: %out, val: tidx + off)
+  end
+  let %out = bb.push_byte(buf: %out, byte: form)
+  let pk_p = rd_uleb(buf: src, pos: pos + 1)
+  let n_params = pval(pk: pk_p)
+  let params_start = ppos(pk: pk_p)
+  let %out = bb.push_uleb128(buf: %out, val: n_params)
+  let %out = emit_valtypes_off(%out, src, pos: params_start, remaining: n_params, off)
+  let after_p = skip_n_valtypes(src, pos: params_start, remaining: n_params)
+  let pk_r = rd_uleb(buf: src, pos: after_p)
+  let n_results = pval(pk: pk_r)
+  let results_start = ppos(pk: pk_r)
+  let %out = bb.push_uleb128(buf: %out, val: n_results)
+  return emit_valtypes_off(%out, src, pos: results_start, remaining: n_results, off)
+end
+
+let copy_type_entries_with_off = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64, off: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let next = skip_one_type_entry(src, pos)
+  let %out = copy_one_type_entry_off(%out, src, pos, off)
+  return copy_type_entries_with_off(%out, src, pos: next, remaining: remaining - 1, off)
+end
+
 let emit_merged_types_inline = fn (d_buf: &ByteBuffer, d_sec: i64, m_buf: &ByteBuffer, m_sec: i64, out: %ByteBuffer) -> %ByteBuffer do
   let %tmp = bb.empty()
   let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
   let d_count = count_sec(buf: d_buf, sec_pk: d_sec)
   let %tmp = bb.push_uleb128(buf: %tmp, val: m_count + d_count)
   let %tmp = copy_sec_body(buf: %tmp, src: m_buf, sec_pk: m_sec)
-  let %tmp = copy_sec_body(buf: %tmp, src: d_buf, sec_pk: d_sec)
+  let %tmp = if d_sec > 0 then
+    copy_type_entries_with_off(out: %tmp, src: d_buf, pos: sec_body(buf: d_buf, sec_pk: d_sec), remaining: d_count, off: m_count)
+  else %tmp end
   let %out = emit_sec(%out, sec_id: 1, content: &tmp)
   bb.free(buf: %tmp)
   return %out
@@ -678,17 +822,54 @@ let copy_func_types_go = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remai
 end
 
 let emit_merged_globals = fn (out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
-    d_buf: &ByteBuffer, d_sec: i64) -> %ByteBuffer do
+    d_buf: &ByteBuffer, d_sec: i64, type_off: i64) -> %ByteBuffer do
   let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
   let d_count = count_sec(buf: d_buf, sec_pk: d_sec)
   if m_count + d_count == 0 then return %out end
   let %tmp = bb.empty()
   let %tmp = bb.push_uleb128(buf: %tmp, val: d_count + m_count)
   let %tmp = copy_sec_body(buf: %tmp, src: d_buf, sec_pk: d_sec)
-  let %tmp = copy_sec_body(buf: %tmp, src: m_buf, sec_pk: m_sec)
+  let %tmp = copy_globals_with_type_off(out: %tmp, buf: m_buf, pos: sec_body(buf: m_buf, sec_pk: m_sec), remaining: m_count, off: type_off)
   let %out = emit_sec(%out, sec_id: 6, content: &tmp)
   bb.free(buf: %tmp)
   return %out
+end
+
+let copy_globals_with_type_off = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64, off: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let vt = bb.get_byte(buf, idx: pos)
+  if vt == 99 || vt == 100 then
+    let %out = bb.push_byte(buf: %out, byte: vt)
+    let SlebRes(val: tv, pos: tp) = rd_sleb(buf, pos: pos + 1)
+    let %out = bb.push_sleb128(buf: %out, val: tv + off)
+    let mut_byte = bb.get_byte(buf, idx: tp)
+    let %out = bb.push_byte(buf: %out, byte: mut_byte)
+    let init_start = tp + 1
+    let init_op = bb.get_byte(buf, idx: init_start)
+    if init_op == 208 then
+      let %out = bb.push_byte(buf: %out, byte: 208)
+      let SlebRes(val: tv2, pos: tp2) = rd_sleb(buf, pos: init_start + 1)
+      let %out = bb.push_sleb128(buf: %out, val: tv2 + off)
+      let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf, idx: tp2))
+      return copy_globals_with_type_off(out: %out, buf, pos: tp2 + 1, remaining: remaining - 1, off)
+    end
+    let end2 = scan_to_end(buf, pos: init_start)
+    let %out = bb.copy_range(dst: %out, src: buf, start: init_start, end_pos: end2)
+    return copy_globals_with_type_off(out: %out, buf, pos: end2, remaining: remaining - 1, off)
+  end
+  let %out = bb.push_byte(buf: %out, byte: vt)
+  let mut_byte = bb.get_byte(buf, idx: pos + 1)
+  let %out = bb.push_byte(buf: %out, byte: mut_byte)
+  let init_start = pos + 2
+  let end2 = scan_to_end(buf, pos: init_start)
+  let %out = bb.copy_range(dst: %out, src: buf, start: init_start, end_pos: end2)
+  return copy_globals_with_type_off(out: %out, buf, pos: end2, remaining: remaining - 1, off)
+end
+
+let scan_to_end = fn (buf: &ByteBuffer, pos: i64) -> i64 do
+  let b = bb.get_byte(buf, idx: pos)
+  if b == 11 then return pos + 1 end
+  return scan_to_end(buf, pos: pos + 1)
 end
 
 // Like emit_merged_globals but patches main G0 (heap_base += reloc) and G1 (str_base = reloc).
@@ -1161,8 +1342,6 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
     d_buf: &core_wasm, d_sec: get_sec(map: &m_secs, sec: 1))
 
   // Section 2: merged imports (dep WASI imports + main non-stdlib imports)
-  // Dep imports need type offset (dep types come second in merged type section)
-  // Main non-stdlib imports need no type offset (main types come first)
   let d_imp_pk = get_sec(map: &d_secs, sec: 2)
   let dep_imp_count = count_sec(buf: &dep, sec_pk: d_imp_pk)
   let total_imp_count = dep_imp_count + m_kept_all
@@ -1173,8 +1352,7 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
     copy_imports_with_type_off(out: %tmp_i, buf: &dep,
       pos: sec_body(buf: &dep, sec_pk: d_imp_pk), remaining: dep_imp_count, type_off: d_type_off)
   else %tmp_i end
-  // Copy main's non-stdlib imports (type indices already correct — main types first)
-  let %tmp_i = copy_main_kept_imps(out: %tmp_i, buf: &core_wasm, sec_pk: m_imp_sec_pk)
+  let %tmp_i = copy_main_kept_imps(out: %tmp_i, buf: &core_wasm, sec_pk: m_imp_sec_pk, type_off: m_type_off)
   let %out = emit_sec(%out, sec_id: 2, content: &tmp_i)
   bb.free(buf: %tmp_i)
 
@@ -1198,8 +1376,28 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   let %out = emit_sec(%out, sec_id: 3, content: &tmp_f)
   bb.free(buf: %tmp_f)
 
-  // Section 4: table (from dep)
-  let %out = copy_raw_sec(%out, src: &dep, sec_pk: get_sec(map: &d_secs, sec: 4), sec_id: 4)
+  // Section 4: table (dep tables + main's extra tables if any)
+  let d_tbl_pk = get_sec(map: &d_secs, sec: 4)
+  let m_tbl_pk = get_sec(map: &m_secs, sec: 4)
+  let m_tbl_total = count_sec(buf: &core_wasm, sec_pk: m_tbl_pk)
+  let %out = if m_tbl_total > 1 then
+    let %tmp_t = bb.empty()
+    let %tmp_t = bb.push_uleb128(buf: %tmp_t, val: d_tbl_count + m_tbl_total - 1)
+    let %tmp_t = if d_tbl_pk > 0 then
+      let d_off = sec_off(pk: d_tbl_pk)
+      let d_sz = sec_sz(pk: d_tbl_pk)
+      let d_cnt_pk = rd_uleb(buf: &dep, pos: d_off)
+      bb.copy_range(dst: %tmp_t, src: &dep, start: ppos(pk: d_cnt_pk), end_pos: d_off + d_sz)
+    else %tmp_t end
+    let m_off = sec_off(pk: m_tbl_pk)
+    let m_sz = sec_sz(pk: m_tbl_pk)
+    let m_cnt_pk = rd_uleb(buf: &core_wasm, pos: m_off)
+    let after_first = skip_table_entry(buf: &core_wasm, pos: ppos(pk: m_cnt_pk))
+    let %tmp_t = copy_table_entries_with_type_off(buf: %tmp_t, src: &core_wasm, pos: after_first, end_pos: m_off + m_sz, off: m_type_off)
+    emit_sec_and_free(%out, sec_id: 4, tmp: %tmp_t)
+  else
+    copy_raw_sec(%out, src: &dep, sec_pk: d_tbl_pk, sec_id: 4)
+  end
   // Compute relocation base: dep_initial_pages * 65536 (above dep's entire memory region)
   // This ensures main data doesn't overlap with dep's stack, data, or heap.
   // Size memory to cover both dep and main data (main already at absolute offsets)
@@ -1232,7 +1430,7 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   let d_glo_pk = get_sec(map: &d_secs, sec: 6)
   let %out = emit_merged_globals(%out,
     m_buf: &core_wasm, m_sec: m_glo_pk,
-    d_buf: &dep, d_sec: d_glo_pk)
+    d_buf: &dep, d_sec: d_glo_pk, type_off: m_type_off)
 
   // Section 7: remapped exports (main exports with func idx remap)
   let %out = emit_remapped_exports(%out,
@@ -1252,11 +1450,11 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   let %tmp_c = bb.empty()
   let %tmp_c = bb.push_uleb128(buf: %tmp_c, val: d_code_count + m_code_count)
   let %tmp_c = emit_stub_bodies(out: %tmp_c, i: 0, n: n_stubs)
-  // Dep code: COPY VERBATIM (identity remap + dep types first = no rewriting needed)
-  let %tmp_c = copy_sec_body(buf: %tmp_c, src: &dep, sec_pk: d_code_sec_pk)
+  let dep_rw_ctx = RwCtx(type_off: 0, tbl_off: 0, glo_off: 0)
+  let %tmp_c = maybe_rewrite_bodies(ctx: dep_rw_ctx, remap: &remap_d, buf: %tmp_c, src: &dep, sec_pk: d_code_sec_pk)
   // Main code bodies — rewrite with intarr-backed func remap (remap_m covers
   // all main fidxs: imports 0..m_fimp, locals m_fimp..m_fimp+m_loc)
-  let rw_ctx = RwCtx(type_off: m_type_off, tbl_off: d_tbl_count, glo_off: d_glo)
+  let rw_ctx = RwCtx(type_off: m_type_off, tbl_off: d_tbl_count - 1, glo_off: d_glo)
   let %tmp_c = maybe_rewrite_bodies(ctx: rw_ctx, remap: &remap_m, buf: %tmp_c, src: &core_wasm, sec_pk: m_code_sec_pk)
   let %out = emit_sec(%out, sec_id: 10, content: &tmp_c)
   bb.free(buf: %tmp_c)

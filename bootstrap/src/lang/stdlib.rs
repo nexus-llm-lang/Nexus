@@ -68,8 +68,7 @@ pub fn list_nx_paths(dir: &Path) -> Result<Vec<PathBuf>, String> {
         fs::read_dir(dir).map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?;
     let mut paths = Vec::new();
     for entry in entries {
-        let entry =
-            entry.map_err(|e| format!("Failed to read {} entry: {}", dir.display(), e))?;
+        let entry = entry.map_err(|e| format!("Failed to read {} entry: {}", dir.display(), e))?;
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("nx") {
             paths.push(path);

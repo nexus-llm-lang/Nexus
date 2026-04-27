@@ -208,7 +208,8 @@ import { Result, Ok, Err } from "std:result"
 
 exception NotFound(msg: string)
 
-let find_user = fn (id: i64) -> string throws { Exn } do
+// Narrow `throws` row — list exactly what may escape, not the catch-all `Exn`
+let find_user = fn (id: i64) -> string throws { NotFound } do
   if id == 1 then
     return "Alice"
   else
@@ -223,6 +224,18 @@ try
 catch
   | NotFound(msg: m) -> Console.println(val: m)
   | _ -> Console.println(val: "Unknown error")
+end
+```
+
+For multi-exception phases, declare an `exception group` and use the group name in the row:
+
+```nexus
+exception UnexpectedToken(span: Span)
+exception UnexpectedEof(span: Span)
+exception group ParseError = UnexpectedToken | UnexpectedEof
+
+let parse_top = fn (toks: [Token]) -> Decl throws { ParseError } do
+  // raises either UnexpectedToken or UnexpectedEof
 end
 ```
 
@@ -328,7 +341,7 @@ end
 ```
 
 ### 5. Punning — drop the label when it matches the local name
-When a function call, constructor call, or constructor pattern passes/binds a variable whose name equals the field label, omit `label:`. The parser desugars `f(x)` to `f(x: x)` and `| Ok(v)` to `| Ok(v: v)`. Sigils ride along: `f(%v)`, `f(&v)`, `f(~v)`, `f(@v)`, `f(&%v)` all pun to `f(v: ...)`. Applies to function-call args, constructor-call args, and constructor patterns — **not** to record literals or record patterns, which still require `name: value`.
+When a function call, constructor call, constructor pattern, record literal, or record pattern passes/binds a variable whose name equals the field label, omit `label:`. The parser desugars `f(x)` to `f(x: x)`, `| Ok(v)` to `| Ok(v: v)`, `{name, age}` to `{name: name, age: age}`, and `let {x} = r` to `let {x: x} = r`. Sigils ride along: `f(%v)`, `f(&v)`, `f(~v)`, `f(@v)`, `f(&%v)` all pun to `f(v: ...)`; the same shapes work inside `{ … }`.
 
 ```nexus
 // PREFER — pun when names coincide
@@ -337,21 +350,107 @@ return Mk(val)              // desugars to Mk(val: val)
 f(x)                        // desugars to f(x: x)
 graph.add(%node)            // desugars to graph.add(node: %node)
 ctx.lookup(&env)            // desugars to ctx.lookup(env: &env)
+let user = {name, age}      // desugars to {name: name, age: age}
+let {name, age} = user      // desugars to {name: name, age: age}
+let ctx = {%cap, &env}      // desugars to {cap: %cap, env: &env}
 match w do
   | Mk(val) -> return val   // desugars to | Mk(val: val)
   | Box(%inner) -> ...      // desugars to | Box(inner: %inner)
+end
+match user do
+  | {name, age: a} -> ...   // desugars to {name: name, age: a} — mixed
 end
 
 // AVOID — redundant `name: name` / `name: %name`
 return Mk(val: val)
 f(x: x)
 graph.add(node: %node)
+let user = {name: name, age: age}
 
 // Cannot pun — sigil applied to a non-bare-ident value, or names differ
 return Some(val: name)
 greet(name: "Bob")
 f(arg: g(x))               // value is a call, not a bare variable
 f(arg: %x.field)           // value is a field access, not a bare variable
+let user = {name: caller.name}     // RHS is field access, keep explicit
+```
+
+Record patterns: trailing `_` (alone, no comma RHS) is still the open-rest marker — `{name, age, _} = user` punning two fields and ignoring the rest works as expected.
+
+### 6. Shadowing — reuse the binder when each step replaces the previous value
+When a sequence of `let`s threads a value through transformations and each intermediate is consumed exactly once by the next line, **reuse the same name** instead of inventing `r1` / `r2` / `r3` / `%buf2` / `%out2`. Shadowing makes "this is the current value" the obvious reading; numeric suffixes invite the question "is `r2` still alive after this?" that the reader then has to answer by scanning ahead.
+
+Apply only when **every intermediate is dead at the next binding**. If you need two values at once (e.g. 1- vs 2-character lookahead, before/after diff, ring-buffer pairs), keep distinct names.
+
+```nexus
+// PREFER — reuse `r` since each step discards the previous one
+let r = pcore.skip(toks)
+let r = pcore.expect(toks: r, expected: "(")
+let ParsedType(typ: inner, rest: r) = parse_type(toks: r)
+let r = pcore.expect(toks: r, expected: ")")
+return ParsedType(typ: TyRef(inner), rest: r)
+
+// AVOID — numeric-suffix chain when intermediates are never reused
+let r = pcore.skip(toks)
+let r2 = pcore.expect(toks: r, expected: "(")
+let ParsedType(typ: inner, rest: r3) = parse_type(toks: r2)
+let r4 = pcore.expect(toks: r3, expected: ")")
+return ParsedType(typ: TyRef(inner), rest: r4)
+
+// KEEP DISTINCT — both `c` and `c2` are read in the same expression
+let c = peek(st)
+let c2 = peek_at(st, offset: 1)
+if c == 47 && c2 == 47 then ... end
+```
+
+### 7. Narrow `throws` rows — list what actually escapes, not `Exn`
+A `throws` row declares the *set of exceptions that may escape this function*. Writing `throws { Exn }` widens to "anything at all" and erases the catch-side type information that makes precise `catch` arms meaningful. Reserve `throws { Exn }` for true boundary functions — top-level error formatters, generic test harnesses, REPL drivers — where the row really is unbounded.
+
+For everything else, name the specific exceptions or an already-declared `exception group`:
+
+```nexus
+// PREFER — row enumerates exactly what escapes
+let parse_top = fn (toks: [Token]) -> Decl throws { ParseError } do
+  raise UnexpectedToken(span: ...)
+end
+
+let load_config = fn (path: string) -> Config require { Fs } throws { FileNotFound, ParseError } do
+  ...
+end
+
+// AVOID — Exn admits any exception, including ones the caller can't reasonably catch
+let parse_top = fn (toks: [Token]) -> Decl throws { Exn } do
+  raise UnexpectedToken(span: ...)
+end
+```
+
+When a phase grows several distinct exceptions, declare a group and reference it instead of repeating the alternatives at every call site:
+
+```nexus
+exception group HirError = InvalidSymbolTag | EmptyScopeStack | NoActiveScope
+
+let lower_to_hir = fn (...) -> HirProgram throws { HirError } do ...
+```
+
+Partial functions (operations defined only on a subset of inputs — `head`, `tail`, `unwrap`, `to_i64`) **must raise a domain-specific exception**, not `RuntimeError(val: "...")`. Catch-all error strings discard the structured information callers need to recover. Declare a real `exception` per failure mode:
+
+```nexus
+// PREFER
+exception EmptyList(op: string)
+let head = fn <T>(xs: [T]) -> T throws { EmptyList } do
+  match xs do
+    | [] -> raise EmptyList(op: "head")
+    | v :: _ -> return v
+  end
+end
+
+// AVOID — RuntimeError is the dumping ground; callers can't pattern-match on intent
+let head = fn <T>(xs: [T]) -> T throws { Exn } do
+  match xs do
+    | [] -> raise RuntimeError(val: "head: empty list")
+    | v :: _ -> return v
+  end
+end
 ```
 
 ## Anti-Patterns to Avoid
@@ -366,6 +465,9 @@ f(arg: %x.field)           // value is a field access, not a bare variable
 | Implicit I/O | Declare via `require { PermConsole }` + inject handler |
 | `var x = 5` | `let ~x = 5` for mutable |
 | `for x in list` | Use `match`/recursion or `list.fold_left` |
+| `throws { Exn }` for a function with a known exception set | List the actual exceptions or an `exception group` (see rule #7) |
+| `raise RuntimeError(val: "...")` from a partial function | Declare a domain-specific `exception` and raise that |
+| `let r = ...; let r2 = ...; let r3 = ...` when intermediates are dead | Shadow: reuse `r` (see rule #6) |
 
 ## Reference Files
 

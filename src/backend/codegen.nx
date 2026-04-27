@@ -39,6 +39,7 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          catch_kind_one,
          op_unreachable, op_block, op_loop, op_if, op_else, op_end, op_br, op_br_if, op_return,
          op_call, op_call_indirect, op_return_call, op_drop, op_throw, op_try_table,
+         op_suspend, op_resume, op_cont_new, op_table_get, op_table_set,
          op_local_get, op_local_set, op_local_tee, op_global_get, op_global_set,
          op_i32_load, op_i64_load, op_f64_load, op_i32_load8_u, op_i32_store, op_i64_store, op_f64_store, op_i32_store8,
          op_i32_const, op_i64_const, op_f64_const,
@@ -61,7 +62,7 @@ import { HashMap }, * as hmap from "std:hashmap"
 import { DedupedTypes }, * as wsect from "src/backend/wasm_section.nx"
 import * as list from "std:list"
 import * as str from "std:string_ops"
-import { SymbolNotFound } from "src/common/error.nx"
+import { SymbolNotFound, StackSwitchingNotImplemented } from "src/common/error.nx"
 
 // ─── Arena intrinsics (nexus:runtime/arena) ──────────────────────────────────
 // These are emitted as inline WASM (global.get/set 0), not external calls.
@@ -74,15 +75,190 @@ let is_arena_external = fn (ext: LirExternal) -> bool do
   end
 end
 
+/// True when name corresponds to a lifted lambda (`__closure_N`). Matches both
+/// the bare form and the canonical-path form (`<sanitized-path>#__closure_N`)
+/// because `lift_lambda` (mir.nx) names lambdas `__closure_N` but downstream
+/// passes may prepend the source-file path to disambiguate cross-module
+/// imports. Distinct from `is_closure_func`, which also matches inject bodies
+/// and the sched trampoline — those need a function-table elem entry for
+/// ref.func but follow their own (non-canonical-closure) signature.
+let is_closure_lift = fn (name: string) -> bool do
+  let nlen = str.length(s: name)
+  let bare = "__closure_"
+  let blen = str.length(s: bare)
+  if nlen >= blen then
+    if str.substring(s: name, start: 0, len: blen) == bare then return true end
+  end
+  let infix = "#__closure_"
+  let ilen = str.length(s: infix)
+  return nlen >= ilen && str.contains(s: name, sub: infix)
+end
+
+/// `__nx_sched_set_next(k)` is a compiler intrinsic that compiles to inline
+/// `global.set ss_resume_slot_global_idx`. Routing it through a host call
+/// trips wasmtime's CallThreadState chain when invoked inside a continuation
+/// arm body (after suspend, before resume); inline emission sidesteps the
+/// host-side trap-handler bookkeeping entirely.
+let is_sched_set_next = fn (func: string, exts: [LirExternal]) -> bool do
+  match wdefs.find_external(name: func, exts) do
+    | None -> false
+    | Some(val: LirExternal(name: _, wasm_module: m, wasm_name: wn, params: _, ret_type: _, throw_row: _)) ->
+      return m == "nexus:runtime/sched" && wn == "sched-set-next"
+  end
+end
+
+let emit_sched_set_next = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_global_set)
+      return bb.push_uleb128(%buf, val: wdefs.ss_resume_slot_global_idx)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_sched_set_next", kind: "sched intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+/// `__nx_sched_spawn(thunk)` is a compiler intrinsic that turns a `@unit` thunk
+/// into a fresh fiber: pushes the thunk onto the host's pending-thunk FIFO,
+/// allocates a new cont_table slot, cont.new's the trampoline body for that
+/// slot, and enqueues the slot in the run queue. The spawned fiber actually
+/// starts running when the dispatcher dequeues the slot, resumes the cont,
+/// and the trampoline pops the matching thunk and forces it.
+let is_sched_spawn = fn (func: string, exts: [LirExternal]) -> bool do
+  match wdefs.find_external(name: func, exts) do
+    | None -> false
+    | Some(val: LirExternal(name: _, wasm_module: m, wasm_name: wn, params: _, ret_type: _, throw_row: _)) ->
+      return m == "nexus:runtime/sched" && wn == "sched-spawn"
+  end
+end
+
+/// Look up a function by suffix match. Used to locate the sched trampoline
+/// regardless of which package path (nxlib/stdlib/sched.nx vs an alias) the
+/// stdlib was imported from.
+let find_func_idx_by_suffix = fn (suffix: string, funcs: [LirFunction], internal_func_map: &HashMap) -> i64 throws { Exn } do
+  match funcs do
+    | [] -> return 0 - 1
+    | LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
+      let slen = str.length(s: n)
+      let suflen = str.length(s: suffix)
+      if slen >= suflen then
+        if str.substring(s: n, start: slen - suflen, len: suflen) == suffix then
+          return wdefs.lookup_func_fast(name: n, map: internal_func_map)
+        end
+      end
+      return find_func_idx_by_suffix(suffix, funcs: rest, internal_func_map)
+  end
+end
+
+/// Find the import index for a sched runtime function by its wasm_name. Uses
+/// linear scan over the externals list because hash lookup by Nexus FFI name
+/// is fragile when several `nexus:runtime/sched` imports share a prefix.
+/// Skips arena and intrinsic-sched externals to mirror `filter_arena_externals`
+/// — those entries are inlined and thus excluded from the wasm import section,
+/// so they do not occupy index slots in the codegen's pre-merge function space.
+let find_sched_import_idx = fn (wn: string, exts: [LirExternal], idx: i64) -> i64 throws { Exn } do
+  match exts do
+    | [] -> return 0 - 1
+    | e :: rest ->
+      if is_arena_external(ext: e) || is_intrinsic_sched_external(ext: e) then
+        return find_sched_import_idx(wn, exts: rest, idx)
+      end
+      match e do | LirExternal(name: _, wasm_module: m, wasm_name: w, params: _, ret_type: _, throw_row: _) ->
+        if m == "nexus:runtime/sched" && w == wn then return idx end
+        return find_sched_import_idx(wn, exts: rest, idx: idx + 1)
+      end
+  end
+end
+
+let emit_sched_spawn = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let exts = wdefs.ctx_externals(ctx)
+      // Push thunk to host pending-thunk queue
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let push_idx = find_sched_import_idx(wn: "sched-push-pending", exts, idx: 0)
+      if push_idx < 0 then
+        raise SymbolNotFound(name: "sched-push-pending", kind: "sched intrinsic", context: "spawn requires push_pending external")
+      end
+      let %buf = bb.push_byte(%buf, byte: op_call)
+      let %buf = bb.push_uleb128(%buf, val: push_idx)
+
+      // slot = next_alloc + 1 (skip past the captured-cont slot the surrounding
+      // InjectResume dispatcher just claimed for its own arm-call bookkeeping);
+      // next_alloc = slot + 1 so the dispatcher's post-arm `++` advances to a
+      // fresh free slot instead of overwriting our trampoline cont.
+      let slot_local = wdefs.ctx_temps_base(ctx) + 4
+      let %buf = bb.push_byte(%buf, byte: op_global_get)
+      let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 1)
+      let %buf = bb.push_byte(%buf, byte: op_i64_add)
+      let %buf = bb.push_byte(%buf, byte: op_local_tee)
+      let %buf = bb.push_uleb128(%buf, val: slot_local)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 1)
+      let %buf = bb.push_byte(%buf, byte: op_i64_add)
+      let %buf = bb.push_byte(%buf, byte: op_global_set)
+      let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+
+      // cont_table[slot] = cont.new(ref.func $trampoline)
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: slot_local)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let tramp_idx = find_func_idx_by_suffix(
+        suffix: "__nx_sched_trampoline_body",
+        funcs: wdefs.ctx_functions(ctx),
+        internal_func_map: wdefs.ctx_internal_func_map(ctx))
+      if tramp_idx < 0 then
+        raise SymbolNotFound(name: "__nx_sched_trampoline_body", kind: "sched intrinsic", context: "spawn requires sched.nx import")
+      end
+      let %buf = bb.push_byte(%buf, byte: 210)
+      let %buf = bb.push_uleb128(%buf, val: tramp_idx)
+      let %buf = bb.push_byte(%buf, byte: op_cont_new)
+      let cont_t_idx = wdefs.ctx_ss_cont_type_idx(ctx)
+      let %buf = bb.push_uleb128(%buf, val: cont_t_idx)
+      let %buf = bb.push_byte(%buf, byte: op_table_set)
+      let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_table_idx)
+
+      // enqueue(slot)
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: slot_local)
+      let enqueue_idx = find_sched_import_idx(wn: "sched-enqueue", exts, idx: 0)
+      if enqueue_idx < 0 then
+        raise SymbolNotFound(name: "sched-enqueue", kind: "sched intrinsic", context: "spawn requires enqueue external")
+      end
+      let %buf = bb.push_byte(%buf, byte: op_call)
+      let %buf = bb.push_uleb128(%buf, val: enqueue_idx)
+      return %buf
+    | _ ->
+      raise SymbolNotFound(name: "__nx_sched_spawn", kind: "sched intrinsic arg", context: "")
+      return %buf
+  end
+end
+
 let filter_arena_externals = fn (exts: [LirExternal]) -> [LirExternal] do
   match exts do
     | [] -> return []
     | e :: rest ->
-      if is_arena_external(ext: e) then
+      if is_arena_external(ext: e) || is_intrinsic_sched_external(ext: e) then
         return filter_arena_externals(exts: rest)
       else
         return e :: filter_arena_externals(exts: rest)
       end
+  end
+end
+
+/// True if this `nexus:runtime/sched` external is fulfilled inline by a
+/// compiler intrinsic, so the import entry must be elided from the final
+/// import section. `sched-set-next` and `sched-spawn` qualify; the others
+/// (enqueue, dequeue, push/pop_pending, queue-size) still go through the
+/// host linker.
+let is_intrinsic_sched_external = fn (ext: LirExternal) -> bool do
+  match ext do
+    | LirExternal(name: _, wasm_module: m, wasm_name: wn, params: _, ret_type: _, throw_row: _) ->
+      if m != "nexus:runtime/sched" then return false end
+      return wn == "sched-set-next" || wn == "sched-spawn"
   end
 end
 
@@ -356,9 +532,15 @@ end
 let emit_internal_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
                               is_tail: bool, in_try: bool, int_idx: i64) -> %ByteBuffer throws { Exn } do
   match wdefs.find_function(name: func, funcs: wdefs.ctx_functions(ctx)) do
-    | Some(val: LirFunction(name: _, params, ret_type: _, body: _, ret: _, span: _)) ->
+    | Some(val: LirFunction(name: _, params, ret_type: callee_rt, body: _, ret: _, span: _)) ->
       let %buf = emit_internal_call_args(%buf, args, params, ctx)
-      let use_tail = is_tail && (in_try == false)
+      let caller_rt = wdefs.ctx_func_ret_type(ctx)
+      // return_call requires callee return type ≡ caller return type. When a
+      // unit-returning fn is tail-called from a non-unit-returning wrapper
+      // (e.g. closure body wrapping `let @t = unit_returning_fn()`), fall
+      // back to a regular call so emit_return_value can supply the placeholder.
+      let types_match = wdefs.is_unit(typ: callee_rt) == wdefs.is_unit(typ: caller_rt)
+      let use_tail = is_tail && (in_try == false) && types_match
       let call_op = match use_tail do | true -> op_return_call | false -> op_call end
       let %buf = bb.push_byte(%buf, byte: call_op)
       bb.push_uleb128(%buf, val: int_idx)
@@ -453,6 +635,10 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
     return emit_heap_reset(args, %buf, ctx)
   else if arena_wn == "heap-swap" then
     return emit_heap_swap(args, %buf, ctx)
+  else if is_sched_set_next(func, exts: wdefs.ctx_externals(ctx)) then
+    return emit_sched_set_next(args, %buf, ctx)
+  else if is_sched_spawn(func, exts: wdefs.ctx_externals(ctx)) then
+    return emit_sched_spawn(args, %buf, ctx)
   else
     let int_idx = wdefs.lookup_func_fast(name: func, map: wdefs.ctx_internal_func_map(ctx))
     if int_idx >= 0 then
@@ -673,7 +859,254 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = bb.push_uleb128(%buf, val: type_idx)
       let %buf = bb.push_uleb128(%buf, val: heap_global_idx)
       return %buf
+
+    | LirExprSuspend(tag_name: tn, payload: p, typ: t) ->
+      let %buf = emit_atom(atom: p, %buf, ctx)
+      let %buf = if wdefs.is_unit(typ: wdefs.atom_type(atom: p)) then
+        let %b = bb.push_byte(%buf, byte: op_i64_const)
+        bb.push_sleb128(buf: %b, val: 0)
+      else %buf end
+      let %buf = bb.push_byte(%buf, byte: op_suspend)
+      // Multi-arm dispatch: each `<port>::<method>` gets its own wasm tag.
+      // ss_base = the wasm tag index of the FIRST stack-switching tag (after
+      // the optional EH tag); offset = position of `tn` in `ss_tag_names`.
+      let ss_base = wdefs.ctx_ss_tag_idx(ctx)
+      let tag_offset = wcollect.lookup_tag_idx(tag_name: tn, tag_names: wdefs.ctx_ss_tag_names(ctx))
+      if tag_offset < 0 then
+        raise SymbolNotFound(name: tn, kind: "suspend tag", context: "LirExprSuspend tag missing in ss_tag_names")
+      end
+      let ss_idx = ss_base + tag_offset
+      let %buf = bb.push_uleb128(%buf, val: ss_idx)
+      // suspend's tag has no result types; if the expression's wasm type is
+      // unit, leave the value-stack alone. Otherwise push an i64 0 placeholder
+      // — replaced by the resume-site's value when LirExprResume codegen lands.
+      if wdefs.is_unit(typ: t) then return %buf end
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 0)
+      return %buf
+    | LirExprResume(cont: c, value: _, typ: _) ->
+      let %buf = emit_atom(atom: c, %buf, ctx)
+      let %buf = bb.push_byte(buf: %buf, byte: op_global_set)
+      let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_resume_slot_global_idx)
+      return %buf
+    | LirExprContNew(_) -> raise StackSwitchingNotImplemented(node: "cont.new")
+    | LirExprInjectResume(body_fn: bfn, arm_fns: afs, arm_tags: ats, typ: _) ->
+      return emit_inject_resume_multi(buf: %buf, body_fn: bfn, arm_fns: afs, arm_tags: ats, ctx)
   end
+end
+
+/// Multi-arm InjectResume frame.
+///
+/// Layout for N=2 arms (innermost = arm 0):
+///
+///   block @outer
+///     setup body cont; resume_slot = next_alloc; next_alloc++
+///     loop @loop
+///       block @arm_1 (type dispatch_t_idx)
+///         block @arm_0 (type dispatch_t_idx)
+///           resume cont_t (on tag_0 @arm_0) (on tag_1 @arm_1)
+///           br 3       ;; resume returned normally → exit @outer (depth N+1)
+///         end
+///         ;; tag_0 caught: dispatch arm 0 with [payload, contref]
+///         br 1         ;; back to @loop (depth N - 0 - 1 = 1)
+///       end
+///       ;; tag_1 caught
+///       br 0           ;; back to @loop (depth N - 1 - 1 = 0)
+///     end
+///   end
+///
+/// Every match arm uses explicit `return` (defensive against an earlier
+/// bootstrap-self-compile hang whose root cause was never nailed; uniform
+/// returns sidestep whatever Nexus runtime pattern was responsible).
+let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm_fns: [string],
+                                    arm_tags: [string], ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  let body_idx = wdefs.lookup_func_fast(name: body_fn, map: wdefs.ctx_internal_func_map(ctx))
+  let cont_t_idx = wdefs.ctx_ss_cont_type_idx(ctx)
+  let dispatch_t_idx = wdefs.ctx_ss_dispatch_block_type_idx(ctx)
+  let ss_base = wdefs.ctx_ss_tag_idx(ctx)
+  let tag_names = wdefs.ctx_ss_tag_names(ctx)
+  let n_arms_raw = list.length(xs: arm_fns)
+  // Phase-2 fallback: arm_tags may be empty (legacy MIR path). Force a
+  // single-on-clause shape so the dispatcher remains valid; first arm gets
+  // tag 0. arm_fns must have at least one entry (InjectResume is only
+  // constructed when at least one with-kont arm exists).
+  let n_arms = if n_arms_raw == 0 then 1 else n_arms_raw end
+
+  // @outer
+  let %buf = bb.push_byte(buf: %buf, byte: op_block)
+  let %buf = bb.push_byte(buf: %buf, byte: bt_void)
+
+  // Body cont setup
+  let %buf = bb.push_byte(buf: %buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_i32_wrap_i64)
+  let %buf = bb.push_byte(buf: %buf, byte: 210)
+  let %buf = bb.push_uleb128(buf: %buf, val: body_idx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_cont_new)
+  let %buf = bb.push_uleb128(buf: %buf, val: cont_t_idx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_table_set)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_cont_table_idx)
+
+  let %buf = bb.push_byte(buf: %buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_global_set)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_resume_slot_global_idx)
+
+  let %buf = bb.push_byte(buf: %buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_i64_const)
+  let %buf = bb.push_sleb128(buf: %buf, val: 1)
+  let %buf = bb.push_byte(buf: %buf, byte: op_i64_add)
+  let %buf = bb.push_byte(buf: %buf, byte: op_global_set)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_next_alloc_global_idx)
+
+  // @loop
+  let %buf = bb.push_byte(buf: %buf, byte: op_loop)
+  let %buf = bb.push_byte(buf: %buf, byte: bt_void)
+
+  // N nested arm blocks (outermost first)
+  let %buf = open_nested_arm_blocks(buf: %buf, dispatch_t_idx, n: n_arms)
+
+  // resume + on-clauses
+  let %buf = bb.push_byte(buf: %buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_resume_slot_global_idx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_i32_wrap_i64)
+  let %buf = bb.push_byte(buf: %buf, byte: op_table_get)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_cont_table_idx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_resume)
+  let %buf = bb.push_uleb128(buf: %buf, val: cont_t_idx)
+  let %buf = bb.push_uleb128(buf: %buf, val: n_arms)
+  let %buf = emit_arm_on_clauses(buf: %buf, arm_tags, ss_base, tag_names, n_arms, idx: 0)
+
+  // Normal-return path. The naive `br N+1` (exit dispatcher) prematurely
+  // strands queued fibers when the spawner cont (main's body) finishes
+  // first — bes5 Q3 termination. Instead: dequeue the next runnable; if
+  // queue empty (sched-dequeue returns -1), THEN exit. Otherwise set
+  // resume_slot and br back to @loop so the fibers drain.
+  let dequeue_idx = find_sched_import_idx(wn: "sched-dequeue", exts: wdefs.ctx_externals(ctx), idx: 0)
+  let %buf = if dequeue_idx >= 0 then
+    let tmp_local = wdefs.ctx_temps_base(ctx) + 5
+    let %b = bb.push_byte(buf: %buf, byte: op_call)
+    let %b = bb.push_uleb128(buf: %b, val: dequeue_idx)
+    let %b = bb.push_byte(buf: %b, byte: op_local_tee)
+    let %b = bb.push_uleb128(buf: %b, val: tmp_local)
+    let %b = bb.push_byte(buf: %b, byte: op_i64_const)
+    let %b = bb.push_sleb128(buf: %b, val: 0)
+    let %b = bb.push_byte(buf: %b, byte: op_i64_lt_s)
+    let %b = bb.push_byte(buf: %b, byte: op_br_if)
+    let %b = bb.push_uleb128(buf: %b, val: n_arms + 1)
+    let %b = bb.push_byte(buf: %b, byte: op_local_get)
+    let %b = bb.push_uleb128(buf: %b, val: tmp_local)
+    let %b = bb.push_byte(buf: %b, byte: op_global_set)
+    let %b = bb.push_uleb128(buf: %b, val: wdefs.ss_resume_slot_global_idx)
+    let %b = bb.push_byte(buf: %b, byte: op_br)
+    bb.push_uleb128(buf: %b, val: n_arms)
+  else
+    // No sched runtime imported (e.g., handler_with_kont_resume which uses
+    // a hand-rolled handler with no global queue). Fall back to the simple
+    // exit-on-normal-return path.
+    let %b = bb.push_byte(buf: %buf, byte: op_br)
+    bb.push_uleb128(buf: %b, val: n_arms + 1)
+  end
+
+  // Close arm blocks innermost first; emit per-arm dispatch + br to @loop
+  let %buf = close_and_dispatch_arms(buf: %buf, arm_fns, n_arms, ctx, idx: 0)
+
+  let %buf = bb.push_byte(buf: %buf, byte: op_end)  // close @loop
+  return bb.push_byte(buf: %buf, byte: op_end)      // close @outer
+end
+
+let open_nested_arm_blocks = fn (buf: %ByteBuffer, dispatch_t_idx: i64, n: i64) -> %ByteBuffer throws { Exn } do
+  if n <= 0 then return %buf end
+  let %buf = bb.push_byte(buf: %buf, byte: op_block)
+  let %buf = bb.push_sleb128(buf: %buf, val: dispatch_t_idx)
+  return open_nested_arm_blocks(buf: %buf, dispatch_t_idx, n: n - 1)
+end
+
+/// Emit one `(on tag → label)` per arm. Arm `i` targets label depth `i`
+/// (innermost arm = depth 0). When arm_tags is empty (legacy single-arm
+/// path), fall through to ss_base for the only on-clause.
+let emit_arm_on_clauses = fn (buf: %ByteBuffer, arm_tags: [string],
+                              ss_base: i64, tag_names: [string], n_arms: i64, idx: i64) -> %ByteBuffer throws { Exn } do
+  if idx >= n_arms then return %buf end
+  let tag_idx = match arm_tags do
+    | [] -> ss_base
+    | _ -> ss_base + arm_tag_offset_at(arm_tags, idx, tag_names)
+  end
+  let %buf = bb.push_byte(buf: %buf, byte: 0)
+  let %buf = bb.push_uleb128(buf: %buf, val: tag_idx)
+  let %buf = bb.push_uleb128(buf: %buf, val: idx)
+  return emit_arm_on_clauses(buf: %buf, arm_tags, ss_base, tag_names, n_arms, idx: idx + 1)
+end
+
+let arm_tag_offset_at = fn (arm_tags: [string], idx: i64, tag_names: [string]) -> i64 throws { Exn } do
+  let tn = nth_string(xs: arm_tags, idx)
+  let off = wcollect.lookup_tag_idx(tag_name: tn, tag_names)
+  if off < 0 then
+    raise SymbolNotFound(name: tn, kind: "arm tag", context: "arm_tag_offset_at: tag missing in ss_tag_names")
+  end
+  return off
+end
+
+let nth_string = fn (xs: [string], idx: i64) -> string throws { Exn } do
+  match xs do
+    | [] -> raise SymbolNotFound(name: "<arm_tag>", kind: "arm tag index", context: "nth_string out of range")
+    | x :: rest ->
+      if idx <= 0 then return x end
+      return nth_string(xs: rest, idx: idx - 1)
+  end
+end
+
+let close_and_dispatch_arms = fn (buf: %ByteBuffer, arm_fns: [string], n_arms: i64,
+                                   ctx: CodegenCtx, idx: i64) -> %ByteBuffer throws { Exn } do
+  if idx >= n_arms then return %buf end
+  let %buf = bb.push_byte(buf: %buf, byte: op_end)  // close arm `idx`'s block
+  let arm_fn = nth_string(xs: arm_fns, idx)
+  let %buf = emit_arm_dispatch(buf: %buf, arm_fn, ctx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_br)
+  let %buf = bb.push_uleb128(buf: %buf, val: n_arms - idx - 1)
+  return close_and_dispatch_arms(buf: %buf, arm_fns, n_arms, ctx, idx: idx + 1)
+end
+
+let emit_arm_dispatch = fn (buf: %ByteBuffer, arm_fn: string, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  let arm_idx = wdefs.lookup_func_fast(name: arm_fn, map: wdefs.ctx_internal_func_map(ctx))
+  if arm_idx < 0 then
+    raise SymbolNotFound(name: arm_fn, kind: "arm function", context: "emit_arm_dispatch")
+  end
+  let arm_param_count = match wdefs.find_function(name: arm_fn, funcs: wdefs.ctx_functions(ctx)) do
+    | Some(val: LirFunction(name: _, params: ps, ret_type: _, body: _, ret: _, span: _)) -> list.length(xs: ps)
+    | None -> 2
+  end
+  let temp_idx = wdefs.ctx_temps_base(ctx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_global_set)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_cont_global_idx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(buf: %buf, val: temp_idx)
+
+  let %buf = bb.push_byte(buf: %buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_i32_wrap_i64)
+  let %buf = bb.push_byte(buf: %buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_cont_global_idx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_table_set)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_cont_table_idx)
+
+  let %buf = bb.push_byte(buf: %buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = if arm_param_count >= 2 then
+    let %bb = bb.push_byte(buf: %buf, byte: op_local_get)
+    bb.push_uleb128(buf: %bb, val: temp_idx)
+  else %buf end
+  let %buf = bb.push_byte(buf: %buf, byte: op_call)
+  let %buf = bb.push_uleb128(buf: %buf, val: arm_idx)
+
+  let %buf = bb.push_byte(buf: %buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(buf: %buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_i64_const)
+  let %buf = bb.push_sleb128(buf: %buf, val: 1)
+  let %buf = bb.push_byte(buf: %buf, byte: op_i64_add)
+  let %buf = bb.push_byte(buf: %buf, byte: op_global_set)
+  return bb.push_uleb128(buf: %buf, val: wdefs.ss_next_alloc_global_idx)
 end
 
 let emit_if_return_unconditional = fn (buf: %ByteBuffer, then_body: [LirStmt], then_ret: LirAtom,
@@ -899,7 +1332,16 @@ let emit_return_value = fn (body: %ByteBuffer, rt: TypeExpr, r: LirAtom, ctx: Co
 end
 
 let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
-  let LirFunction(name: fname, params: ps, ret_type: rt, body: b, ret: r, span: _) = func
+  let LirFunction(name: fname, params: ps, ret_type: raw_rt, body: b, ret: r, span: _) = func
+  // Lifted lambdas (`__closure_N`) get a canonical (env+args of i64) -> i64
+  // wasm signature regardless of the underlying lambda's return type. When
+  // the body's implicit return is unit (e.g. wrapping `fiber1()` where
+  // fiber1 returns unit), the body still has to push an i64 placeholder
+  // before `end`. Inject bodies (`__inject_N`) and the sched trampoline
+  // both go through the function-table elem segment for ref.func eligibility
+  // but keep their source `() -> ()` signature, so this coercion does not
+  // apply to them.
+  let rt = if is_closure_lift(name: fname) && wdefs.is_unit(typ: raw_rt) then TyI64 else raw_rt end
   let %body = bb.empty()
   let %body = wsect.emit_local_decls(buf: %body, locals: wdefs.ctx_locals(ctx), param_count: list.length(xs: ps))
 
@@ -1027,7 +1469,11 @@ let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
                           closure_table: [FuncEntry],
                           closure_type_indices: [ArityTypeIdx],
                           internal_func_map: &HashMap,
-                          external_func_map: &HashMap) -> CodegenCtx throws { Exn } do
+                          external_func_map: &HashMap,
+                          ss_tag_idx: i64,
+                          ss_cont_type_idx: i64,
+                          ss_dispatch_block_type_idx: i64,
+                          ss_tag_names: [string]) -> CodegenCtx throws { Exn } do
   let LirFunction(name: fname, params: ps, ret_type: rt, body: b, ret: _, span: _) = func
   let param_locals = build_param_locals(params: ps, idx: 0)
   let param_count = list.length(xs: ps)
@@ -1040,7 +1486,11 @@ let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
     func_ret_type: rt, functions, externals,
     closure_table, closure_type_indices,
     internal_func_map, external_func_map,
-    func_name: fname
+    func_name: fname,
+    ss_tag_idx: ss_tag_idx,
+    ss_cont_type_idx: ss_cont_type_idx,
+    ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
+    ss_tag_names: ss_tag_names
   )
   end
 end
@@ -1060,12 +1510,20 @@ let emit_one_body = fn (buf: %ByteBuffer, f: LirFunction,
                          closure_table: [FuncEntry],
                          closure_type_indices: [ArityTypeIdx],
                          internal_func_map: &HashMap,
-                         external_func_map: &HashMap) -> %ByteBuffer throws { Exn } do
+                         external_func_map: &HashMap,
+                         ss_tag_idx: i64,
+                         ss_cont_type_idx: i64,
+                         ss_dispatch_block_type_idx: i64,
+                         ss_tag_names: [string]) -> %ByteBuffer throws { Exn } do
   let ctx = build_func_ctx(func: f, internal_funcs,
                             external_funcs, string_lits,
                             alloc_mode, functions, externals,
                             closure_table, closure_type_indices,
-                            internal_func_map, external_func_map)
+                            internal_func_map, external_func_map,
+                            ss_tag_idx: ss_tag_idx,
+                            ss_cont_type_idx: ss_cont_type_idx,
+                            ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
+                            ss_tag_names: ss_tag_names)
   let %body = compile_function_body(func: f, ctx)
   return append_body_to_buf(%buf, %body)
 end
@@ -1077,7 +1535,11 @@ let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
                             closure_table: [FuncEntry],
                             closure_type_indices: [ArityTypeIdx],
                             internal_func_map: &HashMap,
-                            external_func_map: &HashMap) -> %ByteBuffer throws { Exn } do
+                            external_func_map: &HashMap,
+                            ss_tag_idx: i64,
+                            ss_cont_type_idx: i64,
+                            ss_dispatch_block_type_idx: i64,
+                            ss_tag_names: [string]) -> %ByteBuffer throws { Exn } do
   match funcs do
     | [] -> return %buf
     | f :: rest ->
@@ -1085,12 +1547,20 @@ let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
                                 external_funcs, string_lits,
                                 alloc_mode, functions, externals,
                                 closure_table, closure_type_indices,
-                                internal_func_map, external_func_map)
+                                internal_func_map, external_func_map,
+                                ss_tag_idx: ss_tag_idx,
+                                ss_cont_type_idx: ss_cont_type_idx,
+                                ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
+                                ss_tag_names: ss_tag_names)
       return emit_code_bodies(%buf, funcs: rest, internal_funcs,
                         external_funcs, string_lits,
                         alloc_mode, functions, externals,
                         closure_table, closure_type_indices,
-                        internal_func_map, external_func_map)
+                        internal_func_map, external_func_map,
+                        ss_tag_idx: ss_tag_idx,
+                        ss_cont_type_idx: ss_cont_type_idx,
+                        ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
+                        ss_tag_names: ss_tag_names)
   end
 end
 
@@ -1215,6 +1685,16 @@ let collect_closure_arities_acc = fn (funcs: [LirFunction], acc: [i64]) -> [i64]
   match funcs do
     | [] -> acc
     | LirFunction(name: n, params: ps, ret_type: _, body: _, ret: _, span: _) :: rest ->
+      // Only `__closure_*` and `__inject_*` carry the canonical
+      // (env: i64, arg0..argN-1) -> i64 closure-call signature whose arity
+      // must be registered in the type section. The sched trampoline is
+      // `() -> ()` and uses a regular call_indirect against the existing
+      // arity-0 closure type — its presence in the elem segment for ref.func
+      // does not add a new arity entry, but its body forces arity 0 to be
+      // present in the type table.
+      if wdefs.is_sched_trampoline_func(name: n) then
+        return collect_closure_arities_acc(funcs: rest, acc: insert_sorted_i64(val: 0, xs: acc))
+      end
       if wdefs.is_closure_func(name: n) then
         let arity = list.length(xs: ps) - 1
         return collect_closure_arities_acc(funcs: rest, acc: insert_sorted_i64(val: arity, xs: acc))
@@ -1295,6 +1775,7 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
       let n_exts = list.length(xs: exts)
       let n_funcs = list.length(xs: funcs)
       let has_eh = wcollect.program_needs_eh(funcs)
+      let has_ss = wcollect.program_needs_stack_switching(funcs)
       let heap_enabled = wcollect.program_uses_heap(funcs)
       let uses_stdlib = wcollect.has_stdlib(externals: exts)
       let has_cabi = wcollect.needs_cabi_realloc(exts)
@@ -1372,15 +1853,20 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
       // Type section — deduplicated by signature; returns canonical indices per entity.
       let has_alloc = alloc_mode == 2
       let DedupedTypes(section: %type_sec, count: _,
-                       ext_type_idxs,
-                       func_type_idxs,
-                       wasi_run_type_idx,
-                       exn_tag_type_idx,
-                       alloc_type_idx,
-                       cabi_type_idx,
-                       closure_type_idxs) =
-        wsect.build_type_section_dedup(program: filtered_program, has_eh, has_alloc,
+                       ext_type_idxs: ext_type_idxs,
+                       func_type_idxs: func_type_idxs,
+                       wasi_run_type_idx: wasi_run_type_idx,
+                       exn_tag_type_idx: exn_tag_type_idx,
+                       ss_tag_type_idx: ss_tag_type_idx,
+                       alloc_type_idx: alloc_type_idx,
+                       cabi_type_idx: cabi_type_idx,
+                       closure_type_idxs: closure_type_idxs,
+                       ss_cont_type_idx: my_cont_idx,
+                       ss_dispatch_block_type_idx: my_dispatch_idx) =
+        wsect.build_type_section_dedup(program: filtered_program, has_eh, has_ss, has_alloc,
                                        has_cabi_realloc: has_cabi, closure_arities)
+      let ss_cont_type_idx = my_cont_idx
+      let ss_dispatch_block_type_idx = my_dispatch_idx
       let %m = wdefs.emit_section(buf: %m, id: sec_type, content: %type_sec)
 
       // Import section
@@ -1398,9 +1884,9 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
                                                                    has_cabi,
                                                                    cabi_type_idx))
 
-      // Table section (if closures exist)
-      let %m = if n_closures > 0 then
-        wdefs.emit_section(buf: %m, id: sec_table, content: wsect.build_table_section(n_closures))
+      // Table section (closures and/or cont ref table for stack-switching)
+      let %m = if n_closures > 0 || has_ss then
+        wdefs.emit_section(buf: %m, id: sec_table, content: wsect.build_table_section(n_closures, has_ss, ss_cont_type_idx))
       else %m end
 
       // Memory section
@@ -1408,16 +1894,23 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
         wdefs.emit_section(buf: %m, id: sec_memory, content: wsect.build_memory_section())
       else %m end
 
-      // Tag section (WASM EH) — must come after memory, before global
-      let %m = if has_eh then
-        wdefs.emit_section(buf: %m, id: sec_tag, content: wsect.build_tag_section(exn_tag_type_idx))
+      // Tag section — emits the EH tag and the stack-switching tag if either
+      // is in use. Must come after memory, before global.
+      // Phase-3 multi-arm dispatch: one wasm tag per distinct cap method
+      // (`<port>::<method>`) collected at codegen time. Computed here (early
+      // enough for the tag section emission) and re-used downstream by
+      // emit_code_bodies via ctx.ss_tag_names.
+      let ss_tag_names_for_tags = wcollect.collect_program_tag_names(funcs)
+      let n_ss_tags = if has_ss then list.length(xs: ss_tag_names_for_tags) else 0 end
+      let %m = if has_eh || has_ss then
+        wdefs.emit_section(buf: %m, id: sec_tag, content: wsect.build_tag_section(exn_tag_type_idx, ss_tag_type_idx, has_eh, n_ss_tags))
       else %m end
 
       // Global section — needed for bump allocator, cabi_realloc, arena, or string literals.
       // G1 (str_base) is always needed when there are string literals.
-      let needs_global = (heap_enabled && alloc_mode == 1) || (has_cabi && alloc_mode != 2) || has_arena || has_strings
+      let needs_global = (heap_enabled && alloc_mode == 1) || (has_cabi && alloc_mode != 2) || has_arena || has_strings || has_ss
       let %m = if needs_global then
-        wdefs.emit_section(buf: %m, id: sec_global, content: wsect.build_global_section(heap_base))
+        wdefs.emit_section(buf: %m, id: sec_global, content: wsect.build_global_section(heap_base, has_ss, ss_cont_type_idx))
       else %m end
 
       // Export section
@@ -1426,7 +1919,8 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
                                                            cabi_realloc_idx,
                                                            has_cabi_realloc: has_cabi,
                                                            mem_mode,
-                                                           has_table: n_closures > 0))
+                                                           has_table: n_closures > 0,
+                                                           has_ss))
 
       // Element section (populate funcref table)
       let %m = if n_closures > 0 then
@@ -1439,11 +1933,21 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
       let %code = bb.empty()
       let %code = bb.push_uleb128(buf: %code, val: n_funcs + n_cabi + 1)
       // Pass all_exts (including arena) so emit_arena_intrinsic can find them via find_external
+      // ss_tag_idx is the tag-section ordinal of the stack-switching tag:
+      // 1 if EH is also enabled (EH tag at 0), 0 if SS-only, -1 if absent.
+      let ss_tag_idx = if has_ss then (if has_eh then 1 else 0 end) else -1 end
+      // Reuse the list computed earlier for the tag section so we don't
+      // re-walk the LIR program.
+      let ss_tag_names = ss_tag_names_for_tags
       let %code = emit_code_bodies(buf: %code, funcs, internal_funcs,
                                     external_funcs, string_lits: string_entries,
                                     alloc_mode, functions: funcs, externals: all_exts,
                                     closure_table, closure_type_indices: closure_type_idx_list,
-                                    &internal_func_map, &external_func_map)
+                                    &internal_func_map, &external_func_map,
+                                    ss_tag_idx: ss_tag_idx,
+                                    ss_cont_type_idx: my_cont_idx,
+                                    ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
+                                    ss_tag_names: ss_tag_names)
       // cabi_realloc: aligned bump allocator for canonical ABI
       let %code = if has_cabi then
         let %cabi_body = compile_cabi_realloc(heap_base)

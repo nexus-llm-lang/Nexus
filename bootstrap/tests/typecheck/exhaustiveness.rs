@@ -16,7 +16,10 @@ fn color_program_with_cases(case_ctors: &[&str]) -> Program {
     let cases = case_ctors
         .iter()
         .map(|ctor| MatchCase {
-            pattern: sp(Pattern::Constructor(RdrName::Unqual((*ctor).to_string()), vec![])),
+            pattern: sp(Pattern::Constructor(
+                RdrName::Unqual((*ctor).to_string()),
+                vec![],
+            )),
             body: vec![sp(Stmt::Return(sp(Expr::Literal(Literal::Unit))))],
         })
         .collect();
@@ -60,10 +63,16 @@ fn color_program_with_cases(case_ctors: &[&str]) -> Program {
                             name: "c".to_string(),
                             sigil: Sigil::Immutable,
                             typ: None,
-                            value: sp(Expr::Constructor(RdrName::Unqual("Red".to_string()), vec![])),
+                            value: sp(Expr::Constructor(
+                                RdrName::Unqual("Red".to_string()),
+                                vec![],
+                            )),
                         }),
                         sp(Stmt::Expr(sp(Expr::Match {
-                            target: Box::new(sp(Expr::Variable(RdrName::Unqual("c".to_string()), Sigil::Immutable))),
+                            target: Box::new(sp(Expr::Variable(
+                                RdrName::Unqual("c".to_string()),
+                                Sigil::Immutable,
+                            ))),
                             cases,
                         }))),
                         sp(Stmt::Return(sp(Expr::Literal(Literal::Unit)))),

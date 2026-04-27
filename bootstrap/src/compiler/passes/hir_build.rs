@@ -51,6 +51,11 @@ pub enum HirBuildError {
         detail: String,
         span: Span,
     },
+    HandlerKontNotSupported {
+        binding: String,
+        arm: String,
+        span: Span,
+    },
 }
 
 impl std::fmt::Display for HirBuildError {
@@ -71,7 +76,9 @@ impl std::fmt::Display for HirBuildError {
             HirBuildError::UnresolvedPort { port, method, .. } => {
                 write!(f, "Unresolved port method: {}.{}", port, method)
             }
-            HirBuildError::UnsupportedTopLevelLet { name, source_file, .. } => {
+            HirBuildError::UnsupportedTopLevelLet {
+                name, source_file, ..
+            } => {
                 let loc = source_file
                     .as_deref()
                     .map(|p| format!(" in {}", p))
@@ -86,6 +93,16 @@ impl std::fmt::Display for HirBuildError {
             HirBuildError::StdlibLoadError { detail, .. } => {
                 write!(f, "Failed to load stdlib: {}", detail)
             }
+            HirBuildError::HandlerKontNotSupported { binding, arm, .. } => {
+                write!(
+                    f,
+                    "Handler binding '{}' arm '{}' uses 'with @k' continuation capture, \
+                     which is Phase 2 of nexus-x7w and is implemented only by the \
+                     self-hosted compiler. Compile this program with `nexus.wasm` \
+                     (the self-hosted nxc) instead of the Rust bootstrap.",
+                    binding, arm
+                )
+            }
         }
     }
 }
@@ -99,7 +116,8 @@ impl HirBuildError {
             | HirBuildError::ImportItemNotFound { span, .. }
             | HirBuildError::UnresolvedPort { span, .. }
             | HirBuildError::UnsupportedTopLevelLet { span, .. }
-            | HirBuildError::StdlibLoadError { span, .. } => span,
+            | HirBuildError::StdlibLoadError { span, .. }
+            | HirBuildError::HandlerKontNotSupported { span, .. } => span,
         }
     }
 }
@@ -440,10 +458,7 @@ impl MirBuilder {
         Ok(())
     }
 
-    fn preload_package_directory(
-        &mut self,
-        root: &std::path::Path,
-    ) -> Result<(), HirBuildError> {
+    fn preload_package_directory(&mut self, root: &std::path::Path) -> Result<(), HirBuildError> {
         let entries = std::fs::read_dir(root).map_err(|e| HirBuildError::StdlibLoadError {
             detail: format!("Failed to read package root {}: {}", root.display(), e),
             span: 0..0,
@@ -454,12 +469,11 @@ impl MirBuilder {
             .collect();
         paths.sort();
         for path in paths {
-            let src = std::fs::read_to_string(&path).map_err(|e| {
-                HirBuildError::StdlibLoadError {
+            let src =
+                std::fs::read_to_string(&path).map_err(|e| HirBuildError::StdlibLoadError {
                     detail: format!("Failed to read {}: {}", path.display(), e),
                     span: 0..0,
-                }
-            })?;
+                })?;
             let program = crate::lang::parser::parser().parse(&src).map_err(|e| {
                 HirBuildError::StdlibLoadError {
                     detail: format!("Failed to parse {}: {:?}", path.display(), e),
@@ -543,13 +557,11 @@ impl MirBuilder {
                     if is_entry && gl.name == "main" {
                         rename_map.insert(gl.name.clone(), "main".to_string());
                     } else {
-                        rename_map
-                            .insert(gl.name.clone(), canonical_name(&current_src, &gl.name));
+                        rename_map.insert(gl.name.clone(), canonical_name(&current_src, &gl.name));
                     }
                 }
                 TopLevel::Cap(port) => {
-                    rename_map
-                        .insert(port.name.clone(), canonical_name(&current_src, &port.name));
+                    rename_map.insert(port.name.clone(), canonical_name(&current_src, &port.name));
                 }
                 _ => {}
             }
@@ -573,10 +585,9 @@ impl MirBuilder {
         for def in &program.definitions {
             match &def.node {
                 TopLevel::Import(import) if import.is_external => {
-                    current_wasm_module =
-                        Some(resolve_external_wit_module(&import.path));
+                    current_wasm_module = Some(resolve_external_wit_module(&import.path));
                 }
-                TopLevel::Import(_) => {}  // non-external processed in pre-pass B
+                TopLevel::Import(_) => {} // non-external processed in pre-pass B
                 TopLevel::TypeDef(_) => {}
                 TopLevel::Enum(ed) => {
                     self.enum_defs.push(ed.clone());
@@ -683,8 +694,11 @@ impl MirBuilder {
                                 let resolved_mod = current_wasm_module.clone().or_else(|| {
                                     self.externals
                                         .iter()
-                                        .find(|e| e.wasm_name.as_ref() == wasm_name
-                                            || wit_canonical_name(wasm_name) == e.wasm_name.as_ref())
+                                        .find(|e| {
+                                            e.wasm_name.as_ref() == wasm_name
+                                                || wit_canonical_name(wasm_name)
+                                                    == e.wasm_name.as_ref()
+                                        })
                                         .map(|e| e.wasm_module.as_ref().to_string())
                                 });
                                 if let Some(wasm_mod) = resolved_mod {
@@ -722,6 +736,13 @@ impl MirBuilder {
                         } => {
                             let port_name = self.rename(coeffect_name, rename_map);
                             for hf in handler_fns {
+                                if hf.cont_binder.is_some() {
+                                    return Err(HirBuildError::HandlerKontNotSupported {
+                                        binding: name.to_string(),
+                                        arm: hf.name.clone(),
+                                        span: def.span.clone(),
+                                    });
+                                }
                                 let synth_name = handler_func_name(&name, &hf.name);
                                 self.fn_ret_types
                                     .insert(synth_name.clone(), hf.ret_type.clone());
@@ -815,8 +836,7 @@ impl MirBuilder {
 
         // Populate caller's scope with importer-view entries: the visible names
         // (alias.foo for wildcard, or foo/bar for selective imports) -> canonical.
-        let importer_entries =
-            compute_importer_entries(import, &imported_program, &resolved_path);
+        let importer_entries = compute_importer_entries(import, &imported_program, &resolved_path);
         for (k, v) in importer_entries {
             caller_rename_map.insert(k, v);
         }

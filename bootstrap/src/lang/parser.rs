@@ -612,7 +612,9 @@ impl Parser {
 
         match self.peek().clone() {
             TokenKind::LBrace => {
-                // Record pattern
+                // Record pattern — punning: `{name}` ≡ `{name: name}`,
+                // `{%cap, &env}` ≡ `{cap: %cap, env: &env}`. `_` (no comma)
+                // is still the open-rest marker.
                 self.advance();
                 let mut fields = Vec::new();
                 let mut open = false;
@@ -634,10 +636,16 @@ impl Parser {
                                     span: start..self.peek_span().end,
                                 });
                             }
-                            let name = self.expect_ident()?;
-                            self.expect(&TokenKind::Colon)?;
-                            let pat = self.parse_pattern()?;
-                            fields.push((name, pat));
+                            if let Some((name, pat)) =
+                                self.try_parse_pun_pat_arg(&TokenKind::RBrace)?
+                            {
+                                fields.push((name, pat));
+                            } else {
+                                let name = self.expect_ident()?;
+                                self.expect(&TokenKind::Colon)?;
+                                let pat = self.parse_pattern()?;
+                                fields.push((name, pat));
+                            }
                         }
                         if !self.match_token(&TokenKind::Comma) {
                             break;
@@ -805,7 +813,10 @@ impl Parser {
                             } else {
                                 let end = self.tokens[self.pos - 1].span.end;
                                 return Ok(Spanned {
-                                    node: Pattern::Constructor(RdrName::from_dotted(&qname), vec![]),
+                                    node: Pattern::Constructor(
+                                        RdrName::from_dotted(&qname),
+                                        vec![],
+                                    ),
                                     span: start..end,
                                 });
                             }
@@ -825,27 +836,28 @@ impl Parser {
     }
 
     fn parse_ctor_pat_arg(&mut self) -> Result<(Option<String>, Spanned<Pattern>), ParseError> {
-        if let Some((n, p)) = self.try_parse_pun_pat_arg()? {
+        if let Some((n, p)) = self.try_parse_pun_pat_arg(&TokenKind::RParen)? {
             return Ok((Some(n), p));
         }
         self.parse_optional_labeled(Self::parse_pattern)
     }
 
-    /// Punning lookahead for ctor patterns. Matches:
+    /// Punning lookahead for ctor / record patterns. Matches:
     ///   `ident`, `% ident`, `~ ident`, `@ ident`, `& ident`
-    /// when followed by `,` or `)`. Returns `(label, PatVariable(name, sigil))`.
+    /// when followed by `,` or `closer`. Returns `(label, PatVariable(name, sigil))`.
     fn try_parse_pun_pat_arg(
         &mut self,
+        closer: &TokenKind,
     ) -> Result<Option<(String, Spanned<Pattern>)>, ParseError> {
         let start = self.peek_span().start;
+        let is_term = |t: Option<&TokenKind>| -> bool {
+            matches!(t, Some(TokenKind::Comma)) || t == Some(closer)
+        };
 
         if let TokenKind::Ident(name) = self.peek().clone() {
             if !Self::is_uppercase_ident(&name)
                 && name != "_"
-                && matches!(
-                    self.peek_at_offset(1),
-                    Some(TokenKind::Comma) | Some(TokenKind::RParen)
-                )
+                && is_term(self.peek_at_offset(1))
             {
                 self.advance();
                 let end = self.tokens[self.pos - 1].span.end;
@@ -869,10 +881,7 @@ impl Parser {
             if let Some(TokenKind::Ident(name)) = self.peek_at_offset(1).cloned() {
                 if !Self::is_uppercase_ident(&name)
                     && name != "_"
-                    && matches!(
-                        self.peek_at_offset(2),
-                        Some(TokenKind::Comma) | Some(TokenKind::RParen)
-                    )
+                    && is_term(self.peek_at_offset(2))
                 {
                     self.advance(); // sigil token
                     self.advance(); // ident
@@ -1193,22 +1202,20 @@ impl Parser {
                 })
             }
 
-            // Record literal { name: expr, ... }
+            // Record literal { name: expr, ... }  — punning: `{x}` ≡ `{x: x}`,
+            // `{%cap, &env}` ≡ `{cap: %cap, env: &env}`. Anything else (rename,
+            // computed RHS) keeps the explicit `name : expr` form.
             TokenKind::LBrace => {
                 self.advance();
                 let mut fields = Vec::new();
                 if !matches!(self.peek(), TokenKind::RBrace) {
-                    let name = self.expect_ident()?;
-                    self.expect(&TokenKind::Colon)?;
-                    let val = self.parse_expr()?;
+                    let (name, val) = self.parse_record_lit_field()?;
                     fields.push((name, val));
                     while self.match_token(&TokenKind::Comma) {
                         if matches!(self.peek(), TokenKind::RBrace) {
                             break;
                         }
-                        let name = self.expect_ident()?;
-                        self.expect(&TokenKind::Colon)?;
-                        let val = self.parse_expr()?;
+                        let (name, val) = self.parse_record_lit_field()?;
                         fields.push((name, val));
                     }
                 }
@@ -1350,7 +1357,10 @@ impl Parser {
                         let args = self.parse_call_args()?;
                         let end = self.tokens[self.pos - 1].span.end;
                         return Ok(Spanned {
-                            node: Expr::Call { func: RdrName::from_dotted(&path), args },
+                            node: Expr::Call {
+                                func: RdrName::from_dotted(&path),
+                                args,
+                            },
                             span: start..end,
                         });
                     }
@@ -1419,7 +1429,7 @@ impl Parser {
     }
 
     fn parse_call_arg(&mut self) -> Result<(String, Spanned<Expr>), ParseError> {
-        if let Some(p) = self.try_parse_pun_arg()? {
+        if let Some(p) = self.try_parse_pun_arg(&TokenKind::RParen)? {
             return Ok(p);
         }
         // label : expr
@@ -1438,29 +1448,40 @@ impl Parser {
     }
 
     fn parse_ctor_arg(&mut self) -> Result<(Option<String>, Spanned<Expr>), ParseError> {
-        if let Some((n, v)) = self.try_parse_pun_arg()? {
+        if let Some((n, v)) = self.try_parse_pun_arg(&TokenKind::RParen)? {
             return Ok((Some(n), v));
         }
         self.parse_optional_labeled(Self::parse_expr)
     }
 
-    /// Punning lookahead for call/ctor args. Matches:
+    fn parse_record_lit_field(&mut self) -> Result<(String, Spanned<Expr>), ParseError> {
+        if let Some((n, v)) = self.try_parse_pun_arg(&TokenKind::RBrace)? {
+            return Ok((n, v));
+        }
+        let name = self.expect_ident()?;
+        self.expect(&TokenKind::Colon)?;
+        let val = self.parse_expr()?;
+        Ok((name, val))
+    }
+
+    /// Punning lookahead for call / ctor / record-literal args. Matches:
     ///   `ident`               → ExprVariable(name, Immutable), label=name
     ///   `% ident` / `~ ident` / `@ ident` → ExprVariable with sigil
     ///   `& ident` / `& % ident` / `& ~ ident` / `& @ ident` → ExprBorrow
-    /// when the variable is followed by `,` or `)`. Anything else (sigil
-    /// before a non-bare-ident, uppercase ident, dotted/method form) does
-    /// not pun and the caller falls back to `name : expr`.
-    fn try_parse_pun_arg(&mut self) -> Result<Option<(String, Spanned<Expr>)>, ParseError> {
+    /// when the variable is followed by `,` or `closer`. Anything else
+    /// (sigil before a non-bare-ident, uppercase ident, dotted/method form)
+    /// does not pun and the caller falls back to `name : expr`.
+    fn try_parse_pun_arg(
+        &mut self,
+        closer: &TokenKind,
+    ) -> Result<Option<(String, Spanned<Expr>)>, ParseError> {
         let start = self.peek_span().start;
+        let is_term = |t: Option<&TokenKind>| -> bool {
+            matches!(t, Some(TokenKind::Comma)) || t == Some(closer)
+        };
 
         if let TokenKind::Ident(name) = self.peek().clone() {
-            if !Self::is_uppercase_ident(&name)
-                && matches!(
-                    self.peek_at_offset(1),
-                    Some(TokenKind::Comma) | Some(TokenKind::RParen)
-                )
-            {
+            if !Self::is_uppercase_ident(&name) && is_term(self.peek_at_offset(1)) {
                 self.advance();
                 let end = self.tokens[self.pos - 1].span.end;
                 let expr = Spanned {
@@ -1480,12 +1501,7 @@ impl Parser {
         };
         if let Some(sig) = leading {
             if let Some(TokenKind::Ident(name)) = self.peek_at_offset(1).cloned() {
-                if !Self::is_uppercase_ident(&name)
-                    && matches!(
-                        self.peek_at_offset(2),
-                        Some(TokenKind::Comma) | Some(TokenKind::RParen)
-                    )
-                {
+                if !Self::is_uppercase_ident(&name) && is_term(self.peek_at_offset(2)) {
                     self.advance(); // sigil
                     self.advance(); // ident
                     let end = self.tokens[self.pos - 1].span.end;
@@ -1509,10 +1525,7 @@ impl Parser {
             let id_off = 1 + inner_off;
             if let Some(TokenKind::Ident(name)) = self.peek_at_offset(id_off).cloned() {
                 if !Self::is_uppercase_ident(&name)
-                    && matches!(
-                        self.peek_at_offset(id_off + 1),
-                        Some(TokenKind::Comma) | Some(TokenKind::RParen)
-                    )
+                    && is_term(self.peek_at_offset(id_off + 1))
                 {
                     self.advance(); // &
                     if inner_off > 0 {
@@ -1607,6 +1620,18 @@ impl Parser {
         let ret_type = self.parse_type()?;
         let requires = self.parse_require_clause()?;
         let throws = self.parse_throws_clause()?;
+        // Phase 2 of nexus-x7w: optional `with @k` continuation binder. Captured
+        // into `cont_binder` so stdlib preload (which eagerly parses every nxlib/
+        // file) succeeds even though the Rust pipeline can't lower @k yet —
+        // self-hosted nxc handles the actual semantics. The Rust HIR builder
+        // raises if a program tries to use such an arm.
+        let cont_binder = if matches!(self.peek(), TokenKind::With) {
+            self.advance();
+            self.expect(&TokenKind::At)?;
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
         self.expect(&TokenKind::Do)?;
         let body = self.parse_stmt_list()?;
         if body.is_empty() {
@@ -1626,6 +1651,7 @@ impl Parser {
             requires,
             throws,
             body,
+            cont_binder,
         })
     }
 
@@ -2297,7 +2323,8 @@ impl Parser {
                 Ok(s)
             }
             _ => Err(ParseError {
-                message: "expected quoted import path (e.g. \"std:stdio\" or \"examples/foo.nx\")".to_string(),
+                message: "expected quoted import path (e.g. \"std:stdio\" or \"examples/foo.nx\")"
+                    .to_string(),
                 span: self.peek_span(),
             }),
         }

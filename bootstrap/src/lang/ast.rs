@@ -173,6 +173,14 @@ pub struct Function {
     pub requires: Type,
     pub throws: Type,
     pub body: Vec<Spanned<Stmt>>,
+    /// Continuation binder for `with @k` handler arms (Phase 2 of nexus-x7w).
+    /// Set when a handler arm captures its continuation. The Rust pipeline
+    /// only parses this — actual semantics live in the self-hosted compiler.
+    /// HIR builder raises if a Rust-path program tries to lower an arm with
+    /// `cont_binder = Some(_)`. Preserved here so stdlib preload doesn't
+    /// barf on `nxlib/stdlib/sched.nx`'s `with @k` syntax for unrelated
+    /// tests that just bundle the whole stdlib.
+    pub cont_binder: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

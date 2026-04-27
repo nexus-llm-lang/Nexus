@@ -32,6 +32,7 @@ pub enum TokenKind {
     Catch,
     Handler,
     Inject,
+    With,
     Exception,
     External,
     While,
@@ -580,6 +581,7 @@ impl Lexer {
             "for" => TokenKind::For,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
+            "with" => TokenKind::With,
             // "then", "as", "opaque", "ref", "borrow" are contextual —
             // they can be used as identifiers, so they stay as Ident
             _ => TokenKind::Ident(s),

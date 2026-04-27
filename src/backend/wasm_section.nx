@@ -258,9 +258,12 @@ export type DedupedTypes = DedupedTypes(
   func_type_idxs: [i64],
   wasi_run_type_idx: i64,
   exn_tag_type_idx: i64,
+  ss_tag_type_idx: i64,
   alloc_type_idx: i64,
   cabi_type_idx: i64,
-  closure_type_idxs: [i64]
+  closure_type_idxs: [i64],
+  ss_cont_type_idx: i64,
+  ss_dispatch_block_type_idx: i64
 )
 
 // Helper: skip a commit (returning CommitStep with idx = -1).
@@ -277,6 +280,76 @@ let commit_eh_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, 
     return td_commit(%section, %seen, n_unique, %scratch)
   end
   return commit_skip(%section, %seen, n_unique)
+end
+
+/// Commit the (i64) -> () func type used by stack-switching tags. If the
+/// program also has EH, this reuses the EH tag type via dedup.
+let commit_i64_to_void_type_for_ss = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, has_ss: bool) -> %CommitStep do
+  if has_ss then
+    let %scratch = bb.empty()
+    let %scratch = emit_eh_type_scratch(%scratch)
+    return td_commit(%section, %seen, n_unique, %scratch)
+  end
+  return commit_skip(%section, %seen, n_unique)
+end
+
+/// `(cont $body_func_type)` form: byte 0x5d (form_cont = 93), then LEB
+/// of the body's func-type index.
+let emit_cont_type_scratch = fn (scratch: %ByteBuffer, body_func_type_idx: i64) -> %ByteBuffer do
+  let %buf = bb.push_byte(buf: %scratch, byte: 93)
+  return bb.push_sleb128(%buf, val: body_func_type_idx)
+end
+
+/// Commit a fresh () -> () func type for the cont's body, bypassing dedup.
+/// Reusing wasi_run_idx is unreliable because the dedup map's behaviour for
+/// shared signatures is inconsistent for our use-case.
+let commit_ss_body_fn_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, has_ss: bool) -> %CommitStep do
+  // PROBE: ALWAYS commit, ignore has_ss
+  let %scratch = bb.empty()
+  let %scratch = emit_wasi_run_type_scratch(%scratch)
+  let slen = bb.length(buf: &scratch)
+  let %section = bb.copy_range(dst: %section, src: &scratch, start: 0, end_pos: slen)
+  bb.free(buf: %scratch)
+  let %r = CommitStep(%section, %seen, n_unique: n_unique + 1, idx: n_unique)
+  return %r
+end
+
+let commit_ss_cont_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, has_ss: bool, body_func_type_idx: i64) -> %CommitStep do
+  if has_ss == false then return commit_skip(%section, %seen, n_unique) end
+  if body_func_type_idx < 0 then return commit_skip(%section, %seen, n_unique) end
+  let %scratch = bb.empty()
+  let %scratch = emit_cont_type_scratch(%scratch, body_func_type_idx)
+  let slen = bb.length(buf: &scratch)
+  let %section = bb.copy_range(dst: %section, src: &scratch, start: 0, end_pos: slen)
+  bb.free(buf: %scratch)
+  let %r = CommitStep(%section, %seen, n_unique: n_unique + 1, idx: n_unique)
+  return %r
+end
+
+/// On-clause block type: returns (i64, ref null $cont_t). When `resume`'s
+/// on-clause fires, control transfers to the labeled block's end, pushing
+/// (payload, new-cont) onto the block's result stack.
+/// Encoding: 0x60 (func form) + 0 params + 2 results + i64 (0x7e) + ref-null
+/// heap (0x63 + signed-LEB cont_type_idx).
+let emit_ss_dispatch_block_type_scratch = fn (scratch: %ByteBuffer, cont_type_idx: i64) -> %ByteBuffer do
+  let %buf = bb.push_byte(buf: %scratch, byte: 96)
+  let %buf = bb.push_uleb128(%buf, val: 0)
+  let %buf = bb.push_uleb128(%buf, val: 2)
+  let %buf = bb.push_byte(%buf, byte: wdefs.vt_i64)
+  let %buf = bb.push_byte(%buf, byte: 99)
+  return bb.push_sleb128(%buf, val: cont_type_idx)
+end
+
+let commit_ss_dispatch_block_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, has_ss: bool, cont_type_idx: i64) -> %CommitStep do
+  if has_ss == false then return commit_skip(%section, %seen, n_unique) end
+  if cont_type_idx < 0 then return commit_skip(%section, %seen, n_unique) end
+  let %scratch = bb.empty()
+  let %scratch = emit_ss_dispatch_block_type_scratch(%scratch, cont_type_idx)
+  let slen = bb.length(buf: &scratch)
+  let %section = bb.copy_range(dst: %section, src: &scratch, start: 0, end_pos: slen)
+  bb.free(buf: %scratch)
+  let %r = CommitStep(%section, %seen, n_unique: n_unique + 1, idx: n_unique)
+  return %r
 end
 
 let commit_alloc_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, has_alloc: bool) -> %CommitStep do
@@ -305,33 +378,43 @@ end
 
 /// Build the type section with duplicate-signature deduplication.
 /// Returns the vector-count-prefixed payload + per-entity canonical type indices.
-export let build_type_section_dedup = fn (program: LirProgram, has_eh: bool, has_alloc: bool,
+/// The cont-type wrapping the lifted inject body reuses wasi_run_type's
+/// `() -> ()` signature today (all lifted bodies are unit-returning at MVP);
+/// extension to varied signatures is future work.
+export let build_type_section_dedup = fn (program: LirProgram, has_eh: bool, has_ss: bool,
+                                          has_alloc: bool,
                                           has_cabi_realloc: bool, closure_arities: [i64]) -> %DedupedTypes do
   let LirProgram(functions: funcs, externals: exts) = program
   let %section = bb.empty()
   let %seen = sm.empty()
 
-  let CommitList(%section, %seen, n_unique: nu, idxs: ext_idxs) =
+  let CommitList(%section, %seen, n_unique: nu_a, idxs: ext_idxs) =
     commit_exts_go(%section, %seen, n_unique: 0, exts, acc: [])
   let %section = launder_buf(b: %section)
   let %seen = launder_smap(m: %seen)
-  let CommitList(%section, %seen, n_unique: nu, idxs: func_idxs) =
-    commit_funcs_go(%section, %seen, n_unique: nu, funcs, acc: [])
+  let CommitList(%section, %seen, n_unique: nu_b, idxs: func_idxs) =
+    commit_funcs_go(%section, %seen, n_unique: nu_a, funcs, acc: [])
   let %section = launder_buf(b: %section)
   let %seen = launder_smap(m: %seen)
 
-  let CommitStep(%section, %seen, n_unique: nu, idx: wasi_run_idx) =
-    commit_wasi_run_type(%section, %seen, n_unique: nu)
+  let CommitStep(%section, %seen, n_unique: nu_c, idx: wasi_run_idx_raw) =
+    commit_wasi_run_type(%section, %seen, n_unique: nu_b)
+  let wasi_run_idx = wasi_run_idx_raw
   let %section = launder_buf(b: %section)
   let %seen = launder_smap(m: %seen)
 
-  let CommitStep(%section, %seen, n_unique: nu, idx: exn_tag_idx) =
-    commit_eh_type(%section, %seen, n_unique: nu, has_eh)
+  let CommitStep(%section, %seen, n_unique: nu_d, idx: exn_tag_idx) =
+    commit_eh_type(%section, %seen, n_unique: nu_c, has_eh)
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+
+  let CommitStep(%section, %seen, n_unique: nu_e, idx: ss_tag_idx) =
+    commit_i64_to_void_type_for_ss(%section, %seen, n_unique: nu_d, has_ss)
   let %section = launder_buf(b: %section)
   let %seen = launder_smap(m: %seen)
 
   let CommitStep(%section, %seen, n_unique: nu, idx: alloc_idx) =
-    commit_alloc_type(%section, %seen, n_unique: nu, has_alloc)
+    commit_alloc_type(%section, %seen, n_unique: nu_e, has_alloc)
   let %section = launder_buf(b: %section)
   let %seen = launder_smap(m: %seen)
 
@@ -340,8 +423,25 @@ export let build_type_section_dedup = fn (program: LirProgram, has_eh: bool, has
   let %section = launder_buf(b: %section)
   let %seen = launder_smap(m: %seen)
 
-  let CommitList(%section, %seen, n_unique: n, idxs: closure_idxs) =
+  let CommitList(section: %section, seen: %seen, n_unique: n_after_closures, idxs: closure_idxs) =
     commit_closures_go(%section, %seen, n_unique: nu, arities: closure_arities, acc: [])
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+
+  // Stack-switching types committed AT THE END so their slot indices match
+  // n_unique-after-closures. body_fn, cont, dispatch in that order.
+  let CommitStep(section: %section, seen: %seen, n_unique: n_after_body_fn, idx: ss_body_fn_idx) =
+    commit_ss_body_fn_type(%section, %seen, n_unique: n_after_closures, has_ss)
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+
+  let CommitStep(%section, %seen, n_unique: n_after_cont, idx: ss_cont_idx) =
+    commit_ss_cont_type(%section, %seen, n_unique: n_after_body_fn, has_ss, body_func_type_idx: ss_body_fn_idx)
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+
+  let CommitStep(%section, %seen, n_unique: n, idx: ss_dispatch_idx) =
+    commit_ss_dispatch_block_type(%section, %seen, n_unique: n_after_cont, has_ss, cont_type_idx: ss_cont_idx)
   let %section = launder_buf(b: %section)
   let %seen = launder_smap(m: %seen)
   sm.free(map: %seen)
@@ -358,9 +458,12 @@ export let build_type_section_dedup = fn (program: LirProgram, has_eh: bool, has
     func_type_idxs: func_idxs,
     wasi_run_type_idx: wasi_run_idx,
     exn_tag_type_idx: exn_tag_idx,
+    ss_tag_type_idx: ss_tag_idx,
     alloc_type_idx: alloc_idx,
     cabi_type_idx: cabi_idx,
-    closure_type_idxs: closure_idxs
+    closure_type_idxs: closure_idxs,
+    ss_cont_type_idx: ss_cont_idx,
+    ss_dispatch_block_type_idx: ss_dispatch_idx
   )
   return %r
 end
@@ -454,29 +557,47 @@ end
 
 // ─── Global section ─────────────────────────────────────────────────────────
 
-export let build_global_section = fn (heap_base: i64) -> %ByteBuffer do
+export let build_global_section = fn (heap_base: i64, has_ss: bool, ss_cont_type_idx: i64) -> %ByteBuffer do
   let %sec = bb.empty()
-  // 3 globals: G0 (object heap), G1 (str_data_base), G2 (placeholder)
-  let %sec = bb.push_uleb128(buf: %sec, val: 3)
-  // global 0: object heap pointer (i32, mutable)
+  let n_globals = 3 + (if has_ss then 3 else 0 end)
+  let %sec = bb.push_uleb128(buf: %sec, val: n_globals)
   let %sec = bb.push_byte(buf: %sec, byte: wdefs.vt_i32)
   let %sec = bb.push_byte(buf: %sec, byte: 1)
   let %sec = bb.push_byte(buf: %sec, byte: wdefs.op_i32_const)
   let %sec = bb.push_sleb128(buf: %sec, val: heap_base)
   let %sec = bb.push_byte(buf: %sec, byte: wdefs.op_end)
-  // global 1: string data base address (i32, mutable)
-  // Initialized to 0 (relative addressing). Merge patches to dep_data_end.
   let %sec = bb.push_byte(buf: %sec, byte: wdefs.vt_i32)
   let %sec = bb.push_byte(buf: %sec, byte: 1)
   let %sec = bb.push_byte(buf: %sec, byte: wdefs.op_i32_const)
   let %sec = bb.push_sleb128(buf: %sec, val: 0)
   let %sec = bb.push_byte(buf: %sec, byte: wdefs.op_end)
-  // global 2: placeholder
   let %sec = bb.push_byte(buf: %sec, byte: wdefs.vt_i32)
   let %sec = bb.push_byte(buf: %sec, byte: 1)
   let %sec = bb.push_byte(buf: %sec, byte: wdefs.op_i32_const)
   let %sec = bb.push_sleb128(buf: %sec, val: 0)
   let %sec = bb.push_byte(buf: %sec, byte: wdefs.op_end)
+  if has_ss then
+    // global 3: (ref null (cont $type)) — current cont ref
+    let %sec = bb.push_byte(buf: %sec, byte: 99)
+    let %sec = bb.push_sleb128(buf: %sec, val: ss_cont_type_idx)
+    let %sec = bb.push_byte(buf: %sec, byte: 1)
+    let %sec = bb.push_byte(buf: %sec, byte: wdefs.op_ref_null)
+    let %sec = bb.push_sleb128(buf: %sec, val: ss_cont_type_idx)
+    let %sec = bb.push_byte(buf: %sec, byte: wdefs.op_end)
+    // global 4: i64 (ss_resume_slot) — which cont table slot to resume next
+    let %sec = bb.push_byte(buf: %sec, byte: wdefs.vt_i64)
+    let %sec = bb.push_byte(buf: %sec, byte: 1)
+    let %sec = bb.push_byte(buf: %sec, byte: wdefs.op_i64_const)
+    let %sec = bb.push_sleb128(buf: %sec, val: 0)
+    let %sec = bb.push_byte(buf: %sec, byte: wdefs.op_end)
+    // global 5: i64 (ss_next_alloc) — next free cont table slot
+    let %sec = bb.push_byte(buf: %sec, byte: wdefs.vt_i64)
+    let %sec = bb.push_byte(buf: %sec, byte: 1)
+    let %sec = bb.push_byte(buf: %sec, byte: wdefs.op_i64_const)
+    let %sec = bb.push_sleb128(buf: %sec, val: 1)
+    let %sec = bb.push_byte(buf: %sec, byte: wdefs.op_end)
+    return %sec
+  end
   return %sec
 end
 
@@ -491,13 +612,14 @@ end
 
 export let build_export_section = fn (main_idx: i64, wasi_run_idx: i64,
                                       cabi_realloc_idx: i64, has_cabi_realloc: bool,
-                                      mem_mode: string, has_table: bool) -> %ByteBuffer do
+                                      mem_mode: string, has_table: bool, has_ss: bool) -> %ByteBuffer do
   let has_mem_export = mem_mode != "none"
   let mem_count = match has_mem_export do | true -> 1 | false -> 0 end
   let cabi_count = match has_cabi_realloc do | true -> 1 | false -> 0 end
   let table_count = match has_table do | true -> 1 | false -> 0 end
+  let ss_count = match has_ss do | true -> 1 | false -> 0 end
   let %sec = bb.empty()
-  let %sec = bb.push_uleb128(buf: %sec, val: 3 + mem_count + cabi_count + table_count)
+  let %sec = bb.push_uleb128(buf: %sec, val: 3 + mem_count + cabi_count + table_count + ss_count)
   // Export "main" and "_start" as wasi_run wrapper (func() -> ()).
   // ComponentEncoder expects "main" to be func() for WIT world export.
   // The wasi_run wrapper calls argv() → main(args) internally.
@@ -522,6 +644,11 @@ export let build_export_section = fn (main_idx: i64, wasi_run_idx: i64,
     let %sec = wdefs.emit_name(buf: %sec, name: "__indirect_function_table")
     let %sec = bb.push_byte(buf: %sec, byte: wdefs.desc_table)
     bb.push_uleb128(buf: %sec, val: 0)
+  else %sec end
+  let %sec = if has_ss then
+    let %sec = wdefs.emit_name(buf: %sec, name: "__nx_sched_resume_slot")
+    let %sec = bb.push_byte(buf: %sec, byte: wdefs.desc_global)
+    bb.push_uleb128(buf: %sec, val: wdefs.ss_resume_slot_global_idx)
   else %sec end
   return %sec
 end
@@ -602,15 +729,25 @@ end
 
 // ─── Table section ─────────────────────────────────────────────────────────
 
-/// Build table section: 1 funcref table with min = n_closures.
-export let build_table_section = fn (n_closures: i64) -> %ByteBuffer do
+/// Build table section. Table 0: funcref for closures. Table 1 (when has_ss):
+/// nullable cont ref for stack-switching scheduler.
+export let build_table_section = fn (n_closures: i64, has_ss: bool, ss_cont_type_idx: i64) -> %ByteBuffer do
+  let n_tables = 1 + (if has_ss then 1 else 0 end)
   let %sec = bb.empty()
-  let %sec = bb.push_uleb128(buf: %sec, val: 1)
-  // funcref type
+  let %sec = bb.push_uleb128(buf: %sec, val: n_tables)
+  // table 0: funcref, limits min=n_closures
   let %sec = bb.push_byte(buf: %sec, byte: wdefs.vt_funcref)
-  // limits: has_max=0, min=n_closures
   let %sec = bb.push_byte(buf: %sec, byte: 0)
   let %sec = bb.push_uleb128(buf: %sec, val: n_closures)
+  if has_ss then
+    // table 1: (ref null (cont $type)), limits min=64 max=64
+    let %sec = bb.push_byte(buf: %sec, byte: 99)
+    let %sec = bb.push_sleb128(buf: %sec, val: ss_cont_type_idx)
+    let %sec = bb.push_byte(buf: %sec, byte: 1)
+    let %sec = bb.push_uleb128(buf: %sec, val: 64)
+    let %sec = bb.push_uleb128(buf: %sec, val: 64)
+    return %sec
+  end
   return %sec
 end
 
@@ -644,10 +781,24 @@ end
 
 // ─── Tag section ────────────────────────────────────────────────────────────
 
-export let build_tag_section = fn (exn_tag_type_idx: i64) -> %ByteBuffer do
+/// Emit the tag section. The exception tag (when has_eh) is at tag-idx 0;
+/// the stack-switching tag (when has_ss) is appended at tag-idx (has_eh ? 1 : 0).
+/// Both share the (i64) -> () func-type signature today.
+export let build_tag_section = fn (exn_tag_type_idx: i64, ss_tag_type_idx: i64,
+                                    has_eh: bool, n_ss_tags: i64) -> %ByteBuffer do
+  let n = (if has_eh then 1 else 0 end) + n_ss_tags
   let %sec = bb.empty()
-  let %sec = bb.push_uleb128(buf: %sec, val: 1)
-  let %sec = bb.push_byte(buf: %sec, byte: 0)  // tag_kind_exception = 0
-  let %sec = bb.push_uleb128(buf: %sec, val: exn_tag_type_idx)
-  return %sec
+  let %sec = bb.push_uleb128(buf: %sec, val: n)
+  let %sec = if has_eh then
+    let %s = bb.push_byte(buf: %sec, byte: 0)
+    bb.push_uleb128(buf: %s, val: exn_tag_type_idx)
+  else %sec end
+  return emit_n_ss_tags(buf: %sec, ss_tag_type_idx, n: n_ss_tags)
+end
+
+let emit_n_ss_tags = fn (buf: %ByteBuffer, ss_tag_type_idx: i64, n: i64) -> %ByteBuffer do
+  if n <= 0 then return %buf end
+  let %buf = bb.push_byte(buf: %buf, byte: 0)
+  let %buf = bb.push_uleb128(buf: %buf, val: ss_tag_type_idx)
+  return emit_n_ss_tags(buf: %buf, ss_tag_type_idx, n: n - 1)
 end

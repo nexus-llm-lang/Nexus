@@ -424,7 +424,9 @@ fn collect_signature_needs_from_expr(
                 effs.extend(inner_effs);
                 unknown |= inner_unknown;
             }
-            if let Some((call_reqs, call_effs, call_unknown)) = lookup_call_signature(&func.as_dotted(), env) {
+            if let Some((call_reqs, call_effs, call_unknown)) =
+                lookup_call_signature(&func.as_dotted(), env)
+            {
                 reqs.extend(call_reqs);
                 effs.extend(call_effs);
                 unknown |= call_unknown;
@@ -557,7 +559,9 @@ fn collect_signature_needs_from_expr(
 
 fn expr_mentions_name(expr: &Spanned<Expr>, target: &str) -> bool {
     match &expr.node {
-        Expr::Variable(name, sigil) => matches!(sigil, Sigil::Immutable) && name.as_dotted() == target,
+        Expr::Variable(name, sigil) => {
+            matches!(sigil, Sigil::Immutable) && name.as_dotted() == target
+        }
         Expr::Call { func, args } => {
             let f = func.as_dotted();
             (f == target || (f.split_once('.').is_none() && f == target))
