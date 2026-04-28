@@ -509,6 +509,64 @@ fn do_respond(req_id: i64, status: i64, headers: &str, body: &str) -> Result<(),
     write_result
 }
 
+/// Streaming response start: write status line + headers + chunked-encoding
+/// marker; leave the CONNS entry alive so further chunks can be appended.
+fn do_respond_chunk_start(req_id: i64, status: i64, headers: &str) -> Result<(), String> {
+    let mut prelude = format!(
+        "HTTP/1.1 {} {}\r\n",
+        status,
+        url_guard::status_reason(status)
+    );
+    prelude.push_str("Transfer-Encoding: chunked\r\n");
+    prelude.push_str(&headers_codec::canonical_to_wire(headers));
+    prelude.push_str("Connection: close\r\n");
+    prelude.push_str("\r\n");
+
+    CONNS.with(|conns| {
+        let conns = conns.borrow();
+        let entry = conns
+            .get(&req_id)
+            .ok_or_else(|| "invalid request id".to_string())?;
+        entry
+            .output
+            .blocking_write_and_flush(prelude.as_bytes())
+            .map_err(|_| "failed to write response prelude".to_string())
+    })
+}
+
+fn do_respond_chunk_write(req_id: i64, chunk: &str) -> Result<(), String> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    // Chunked transfer-encoding frame: "<hex-len>\r\n<bytes>\r\n".
+    let frame = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
+    CONNS.with(|conns| {
+        let conns = conns.borrow();
+        let entry = conns
+            .get(&req_id)
+            .ok_or_else(|| "invalid request id".to_string())?;
+        entry
+            .output
+            .blocking_write_and_flush(frame.as_bytes())
+            .map_err(|_| "failed to write chunk".to_string())
+    })
+}
+
+fn do_respond_chunk_finish(req_id: i64) -> Result<(), String> {
+    let entry = CONNS.with(|conns| {
+        conns
+            .borrow_mut()
+            .remove(&req_id)
+            .ok_or_else(|| "invalid request id".to_string())
+    })?;
+    let write_result = entry
+        .output
+        .blocking_write_and_flush(b"0\r\n\r\n")
+        .map_err(|_| "failed to write terminating chunk".to_string());
+    drop(entry);
+    write_result
+}
+
 fn do_stop(server_id: i64) -> Result<(), String> {
     SERVERS.with(|servers| {
         servers
@@ -588,6 +646,27 @@ impl bindings::exports::nexus::cli::nexus_host::Guest for Guest {
 
     fn host_bridge_finalize() -> i64 {
         do_bridge_finalize()
+    }
+
+    fn host_http_respond_chunk_start(req_id: i64, status: i64, headers: String) -> i32 {
+        match do_respond_chunk_start(req_id, status, &headers) {
+            Ok(()) => 1,
+            Err(_) => 0,
+        }
+    }
+
+    fn host_http_respond_chunk_write(req_id: i64, body_chunk: String) -> i32 {
+        match do_respond_chunk_write(req_id, &body_chunk) {
+            Ok(()) => 1,
+            Err(_) => 0,
+        }
+    }
+
+    fn host_http_respond_chunk_finish(req_id: i64) -> i32 {
+        match do_respond_chunk_finish(req_id) {
+            Ok(()) => 1,
+            Err(_) => 0,
+        }
     }
 }
 

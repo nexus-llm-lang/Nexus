@@ -25,6 +25,12 @@ export opaque type Server = Server(id: i64)
 /// An incoming HTTP request (linear — must be answered with respond).
 export opaque type Request = Request(method: string, path: string, headers: string, body: string, req_id: i64)
 
+/// A streaming response in progress (linear — must be terminated with
+/// `respond_streaming_finish` after one or more `respond_streaming_write`
+/// calls). Created by `respond_streaming_start`, which consumes the linear
+/// `Request`.
+export opaque type RespondStream = RespondStream(req_id: i64)
+
 // FFI ABI contract for the externals below.
 // Pinned by tests in bootstrap/src/compiler/codegen/emit.rs (abi_tests).
 //   string (param)  → WASM (i32 ptr, i32 len)
@@ -38,6 +44,9 @@ external __nx_http_listen = "__nx_http_listen" : (addr: string) -> i64
 external __nx_http_accept = "__nx_http_accept" : (server_id: i64) -> string
 external __nx_http_respond = "__nx_http_respond" : (req_id: i64, status: i64, headers: string, body: string) -> bool
 external __nx_http_stop = "__nx_http_stop" : (server_id: i64) -> bool
+external __nx_http_respond_chunk_start = "__nx_http_respond_chunk_start" : (req_id: i64, status: i64, headers: string) -> bool
+external __nx_http_respond_chunk_write = "__nx_http_respond_chunk_write" : (req_id: i64, body_chunk: string) -> bool
+external __nx_http_respond_chunk_finish = "__nx_http_respond_chunk_finish" : (req_id: i64) -> bool
 
 /// Create a Header.
 export let header = fn (name: string, value: string) -> Header do
@@ -244,6 +253,42 @@ let stop = fn (server: %Server) -> unit do
   return ()
 end
 
+/// Streaming response: open a chunked response on the wire and return a
+/// linear `RespondStream` handle. Consumes the linear `Request`. Use
+/// `respond_streaming_write` to append chunks (any number of times), then
+/// `respond_streaming_finish` to terminate. Raises on failure.
+let respond_streaming_start = fn (req: %Request, status: i64, headers: [ Header ]) -> %RespondStream throws { Exn } do
+  let Request(method: _, path: _, headers: _, body: _, req_id: rid) = req
+  let encoded = encode_headers(headers)
+  let ok = __nx_http_respond_chunk_start(req_id: rid, status, headers: encoded)
+  if ok then
+    let s = RespondStream(req_id: rid)
+    let %ls = s
+    return %ls
+  else
+    raise ResponseError(msg: "failed to start streaming response")
+  end
+end
+
+/// Append a chunk to a streaming response (borrows the handle). Returns true
+/// on success.
+let respond_streaming_write = fn (stream: &RespondStream, chunk: string) -> bool do
+  let RespondStream(req_id: rid) = stream
+  return __nx_http_respond_chunk_write(req_id: rid, body_chunk: chunk)
+end
+
+/// Terminate a streaming response. Consumes the linear `RespondStream`.
+/// Raises on failure.
+let respond_streaming_finish = fn (stream: %RespondStream) -> unit throws { Exn } do
+  let RespondStream(req_id: rid) = stream
+  let ok = __nx_http_respond_chunk_finish(req_id: rid)
+  if ok then
+    return ()
+  else
+    raise ResponseError(msg: "failed to finish streaming response")
+  end
+end
+
 export cap Net do
   fn get(url: string) -> string throws { Exn }
   fn request(method: string, url: string, headers: [ Header ], body: string) -> Response throws { Exn }
@@ -252,6 +297,9 @@ export cap Net do
   fn respond(req: %Request, status: i64, body: string) -> unit throws { Exn }
   fn respond_with_headers(req: %Request, status: i64, headers: [ Header ], body: string) -> unit throws { Exn }
   fn stop(server: %Server) -> unit
+  fn respond_streaming_start(req: %Request, status: i64, headers: [ Header ]) -> %RespondStream throws { Exn }
+  fn respond_streaming_write(stream: &RespondStream, chunk: string) -> bool
+  fn respond_streaming_finish(stream: %RespondStream) -> unit throws { Exn }
 end
 
 /// Default Net handler — delegates to direct-call API.
@@ -276,5 +324,14 @@ export let system_handler = handler Net require { PermNet } do
   end
   fn stop(server: %Server) -> unit do
     return stop(server)
+  end
+  fn respond_streaming_start(req: %Request, status: i64, headers: [ Header ]) -> %RespondStream throws { Exn } do
+    return respond_streaming_start(req, status, headers)
+  end
+  fn respond_streaming_write(stream: &RespondStream, chunk: string) -> bool do
+    return respond_streaming_write(stream, chunk)
+  end
+  fn respond_streaming_finish(stream: %RespondStream) -> unit throws { Exn } do
+    return respond_streaming_finish(stream)
   end
 end

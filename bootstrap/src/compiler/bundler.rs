@@ -469,6 +469,13 @@ pub const HOST_HTTP_STUB_SIGNATURES: &[(
     // Trap-resilience finalize: drains thread_local SERVERS/CONNS, releasing
     // wasi sockets that were leaked by an in-flight trap. Returns drop count.
     ("host-bridge-finalize", &[], &[I64]),
+    // Streaming response API (nexus-upzz.6).
+    // chunk-start(req_id, status, headers ptr+len) -> bool
+    ("host-http-respond-chunk-start", &[I64, I64, I32, I32], &[I32]),
+    // chunk-write(req_id, body_chunk ptr+len) -> bool
+    ("host-http-respond-chunk-write", &[I64, I32, I32], &[I32]),
+    // chunk-finish(req_id) -> bool
+    ("host-http-respond-chunk-finish", &[I64], &[I32]),
 ];
 
 fn build_stub_module(
@@ -631,5 +638,18 @@ mod tests {
         let (fin_params, fin_results) = by_name["host-bridge-finalize"];
         assert_eq!(fin_params, &[] as &[wasm_encoder::ValType], "host-bridge-finalize takes no args");
         assert_eq!(fin_results, &[I64], "host-bridge-finalize returns i64 drop count");
+
+        // Streaming response API (nexus-upzz.6): bool result = i32.
+        let (start_params, start_results) = by_name["host-http-respond-chunk-start"];
+        assert_eq!(start_params, &[I64, I64, I32, I32], "chunk-start params (req_id, status, headers ptr+len)");
+        assert_eq!(start_results, &[I32], "chunk-start returns i32 bool");
+
+        let (write_params, write_results) = by_name["host-http-respond-chunk-write"];
+        assert_eq!(write_params, &[I64, I32, I32], "chunk-write params (req_id, chunk ptr+len)");
+        assert_eq!(write_results, &[I32], "chunk-write returns i32 bool");
+
+        let (finish_params, finish_results) = by_name["host-http-respond-chunk-finish"];
+        assert_eq!(finish_params, &[I64], "chunk-finish params (req_id)");
+        assert_eq!(finish_results, &[I32], "chunk-finish returns i32 bool");
     }
 }

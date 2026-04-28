@@ -169,6 +169,66 @@ fn net_request_double_respond_is_rejected() {
 }
 
 #[test]
+fn net_streaming_response_typechecks() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // nexus-upzz.6 streaming API: respond_streaming_start consumes the linear
+    // Request and returns a linear RespondStream, write() borrows the stream,
+    // finish() consumes the stream. The full happy path must typecheck.
+    should_typecheck(
+        r#"
+    import { Net }, * as net_mod from "std:network"
+
+    let main = fn () -> unit require { PermNet } do
+      inject net_mod.system_handler do
+        try
+          let server = Net.listen(addr: "127.0.0.1:0")
+          let req = Net.accept(server: &server)
+          Net.stop(server: server)
+          let stream = Net.respond_streaming_start(req: req, status: 200, headers: [])
+          let _ = Net.respond_streaming_write(stream: &stream, chunk: "hello")
+          let _ = Net.respond_streaming_write(stream: &stream, chunk: " world")
+          Net.respond_streaming_finish(stream: stream)
+        catch e ->
+          return ()
+        end
+      end
+      return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn net_streaming_finish_required_to_release_linear_stream() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // nexus-upzz.6: a RespondStream that is started but never finished must
+    // be rejected by linearity. Drop the linear stream without calling
+    // respond_streaming_finish — typecheck must fail.
+    let err = should_fail_typecheck(
+        r#"
+    import { Net }, * as net_mod from "std:network"
+
+    let main = fn () -> unit require { PermNet } do
+      inject net_mod.system_handler do
+        try
+          let server = Net.listen(addr: "127.0.0.1:0")
+          let req = Net.accept(server: &server)
+          Net.stop(server: server)
+          let stream = Net.respond_streaming_start(req: req, status: 200, headers: [])
+          let _ = Net.respond_streaming_write(stream: &stream, chunk: "hello")
+          return ()
+        catch e ->
+          return ()
+        end
+      end
+      return ()
+    end
+    "#,
+    );
+    insta::assert_snapshot!(err);
+}
+
+#[test]
 fn net_respond_returns_unit_effect_exn() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     should_typecheck(

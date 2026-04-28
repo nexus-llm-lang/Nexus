@@ -28,4 +28,18 @@
   ;; returning 0 dropped entries (NOT unreachable).
   (func (export "host-bridge-finalize") (result i64)
     i64.const 0)
+
+  ;; host-http-respond-chunk-start(req_id: i64, status: i64,
+  ;;   headers_ptr: i32, headers_len: i32) -> i32
+  (func (export "host-http-respond-chunk-start") (param i64 i64 i32 i32) (result i32)
+    unreachable)
+
+  ;; host-http-respond-chunk-write(req_id: i64,
+  ;;   body_chunk_ptr: i32, body_chunk_len: i32) -> i32
+  (func (export "host-http-respond-chunk-write") (param i64 i32 i32) (result i32)
+    unreachable)
+
+  ;; host-http-respond-chunk-finish(req_id: i64) -> i32
+  (func (export "host-http-respond-chunk-finish") (param i64) (result i32)
+    unreachable)
 )
