@@ -1198,6 +1198,40 @@ end
 }
 
 #[test]
+fn codegen_if_let_else_string_fn_call_result_concat() {
+    // Regression for nexus-ssy2: an `if let Some(val: o) = opt then o else <fn>() end`
+    // expression returning a string was lowered with the match-result temp typed
+    // as I64 because `infer_semantic_type` on the bound variable `o` fell back
+    // to I64 (the binding wasn't yet in `semantic_vars` at the time the result
+    // type was computed in `lower_match_expr`). Subsequent `++` on the path
+    // failed codegen with E2017 "string concat expects string operands, got
+    // (string, i64)". The fix pre-populates pattern-bound semantic types
+    // before inferring the match-expression result type.
+    exec(
+        r#"
+type Option<a> = Some(val: a) | None
+
+let get_default = fn () -> string do
+    return "default"
+end
+
+let resolve = fn (opt: Option<string>) -> string do
+    let path = if let Some(val: o) = opt then o else get_default() end
+    return "got: " ++ path
+end
+
+let main = fn () -> unit throws { Exn } do
+    let none_msg = resolve(opt: None)
+    if none_msg != "got: default" then raise RuntimeError(val: "expected got: default") end
+    let some_msg = resolve(opt: Some(val: "explicit"))
+    if some_msg != "got: explicit" then raise RuntimeError(val: "expected got: explicit") end
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
 fn codegen_selective_catch_nested_try_routes_exceptions() {
     exec(
         r#"
