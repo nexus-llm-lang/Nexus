@@ -39,6 +39,14 @@ const LAZY_MODULE: &str = "nexus:runtime/lazy";
 const LAZY_SPAWN_NAME: &str = "lazy-spawn";
 const LAZY_JOIN_NAME: &str = "lazy-join";
 const LAZY_ALLOC_NAME: &str = "alloc";
+/// Pair of host functions exported by `LazyRuntime` (see
+/// `bootstrap/src/runtime/lazy.rs`) that snapshot / restore the host-side
+/// AtomicI32 bump pointer in shared-memory threading mode. Imported only
+/// when codegen routes object allocations through the lazy host allocator
+/// so `arena.heap_reset` actually reclaims worker-thread allocations
+/// instead of silently leaking them.
+const LAZY_ALLOC_MARK_NAME: &str = "alloc-mark";
+const LAZY_ALLOC_RESET_NAME: &str = "alloc-reset";
 
 #[derive(Debug, Clone, Copy)]
 struct LocalInfo {

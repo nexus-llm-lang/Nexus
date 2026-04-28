@@ -67,6 +67,17 @@ pub(super) struct CodegenLayout {
     /// `(import "env" "memory" (memory N M shared))`. Off by default;
     /// enabled only via the test-only `compile_lir_to_wasm_threaded` path.
     pub(super) memory_shared: bool,
+    /// True when `alloc_mark_func_idx` / `alloc_reset_func_idx` point at
+    /// `nexus:runtime/lazy::alloc-mark` / `alloc-reset` (the host-side
+    /// AtomicI32 region hooks) rather than at the stdlib's
+    /// `__nx_alloc_mark` / `__nx_alloc_reset`. The two pairs have different
+    /// signatures and semantics: stdlib mark returns an outstanding
+    /// allocation count packed into the upper 32 bits of `arena.heap_mark`
+    /// alongside G0; lazy mark returns the bump pointer directly because
+    /// shared-memory mode has no separate G0 to coordinate with. Codegen
+    /// of `Intrinsic::HeapMark` / `Intrinsic::HeapReset` consults this
+    /// flag to pick the correct packing.
+    pub(super) lazy_host_arena: bool,
 }
 
 pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout, CodegenError> {
@@ -148,6 +159,7 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
         lazy_spawn_func_idx: None,
         lazy_join_func_idx: None,
         memory_shared: false,
+        lazy_host_arena: false,
     })
 }
 

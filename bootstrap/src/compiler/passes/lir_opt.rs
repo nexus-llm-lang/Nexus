@@ -1089,6 +1089,12 @@ fn eliminate_dead_lets(stmts: &mut Vec<LirStmt>, uses: &HashMap<Symbol, u32>) {
 /// assertion shape would silently disappear, taking the trap with it; tests
 /// that rely on the trap as their failure signal would then pass regardless
 /// of correctness.
+///
+/// `Intrinsic::HeapReset` and `Intrinsic::HeapSwap` mutate the bump pointer
+/// (and the lazy host alloc_ptr in shared-memory mode); eliminating an
+/// unused `let _ = heap_reset(...)` would silently turn region-based
+/// reclamation into a no-op. The other arena intrinsic, `HeapMark`, is
+/// pure (just reads a counter) and is allowed to be folded.
 fn expr_has_side_effects(expr: &LirExpr) -> bool {
     if matches!(
         expr,
@@ -1099,6 +1105,10 @@ fn expr_has_side_effects(expr: &LirExpr) -> bool {
             | LirExpr::CallIndirect { .. }
     ) {
         return true;
+    }
+    if let LirExpr::Intrinsic { kind, .. } = expr {
+        use crate::ir::lir::Intrinsic;
+        return matches!(kind, Intrinsic::HeapReset | Intrinsic::HeapSwap);
     }
     matches!(
         expr,

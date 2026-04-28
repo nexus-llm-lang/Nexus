@@ -23,7 +23,8 @@ use super::layout::{build_codegen_layout, program_uses_object_heap, CodegenLayou
 use super::string::string_abi_for_external;
 use super::{
     ALLOCATE_WASM_NAME, ALLOC_MARK_WASM_NAME, ALLOC_RESET_WASM_NAME, BT_CAPTURE_NAME, BT_MODULE,
-    LAZY_ALLOC_NAME, LAZY_JOIN_NAME, LAZY_MODULE, LAZY_SPAWN_NAME, OBJECT_HEAP_GLOBAL_INDEX,
+    LAZY_ALLOC_MARK_NAME, LAZY_ALLOC_NAME, LAZY_ALLOC_RESET_NAME, LAZY_JOIN_NAME, LAZY_MODULE,
+    LAZY_SPAWN_NAME, OBJECT_HEAP_GLOBAL_INDEX,
 };
 
 /// Compiles LIR (in ANF) directly into core WASM bytes, plus debug entries for DWARF.
@@ -117,11 +118,12 @@ fn compile_lir_to_wasm_inner(
     }
     let deduped_ext_count = deduped_externals.len() as u32;
     let n_bt_imports: u32 = if needs_bt_capture { 1 } else { 0 };
-    // spawn + join, plus an alloc import in shared-memory mode (host-side
-    // atomic bump allocator — see LazyRuntime::with_shared_memory).
+    // spawn + join, plus alloc / alloc-mark / alloc-reset in shared-memory
+    // mode (host-side atomic bump allocator + region-reset hooks — see
+    // LazyRuntime::with_shared_memory and LazyRuntime::register).
     let n_lazy_imports: u32 = if needs_lazy {
         if memory_shared {
-            3
+            5
         } else {
             2
         }
@@ -182,12 +184,18 @@ fn compile_lir_to_wasm_inner(
             // advance a single shared heap pointer instead of racing on
             // per-instance globals.
             layout.allocate_func_idx = Some(lazy_base + 2);
-            // Lazy host bump allocator does not expose mark/reset and is
-            // disjoint from the stdlib-side allocator's bookkeeping. Clearing
-            // these keeps `arena.heap_reset` from calling stdlib `__nx_alloc_reset`
-            // on a counter that never advanced for these allocations.
-            layout.alloc_mark_func_idx = None;
-            layout.alloc_reset_func_idx = None;
+            // Region reset support: the lazy host allocator exposes its own
+            // (mark, reset) pair operating directly on the AtomicI32 bump
+            // pointer. Wiring them through `arena.heap_reset` means caller
+            // and worker allocations alike rewind together — without these,
+            // `heap_reset` would silently leak every worker-side allocation
+            // (the stdlib mark/reset path tracks a different counter).
+            // The packed-i64 dual-tracking that legacy mode uses for stdlib
+            // mark/reset is unnecessary here: shared-memory mode has no
+            // separate G0 to coordinate with, only the host-side alloc_ptr.
+            layout.alloc_mark_func_idx = Some(lazy_base + 3);
+            layout.alloc_reset_func_idx = Some(lazy_base + 4);
+            layout.lazy_host_arena = true;
         }
     }
 
@@ -285,6 +293,10 @@ fn compile_lir_to_wasm_inner(
     let mut lazy_join_type_idx = 0;
     // Lazy alloc type: (i32) -> i32 — atomic bump allocator (shared-memory mode).
     let mut lazy_alloc_type_idx = 0;
+    // Lazy alloc-mark type: () -> i32 — snapshot host-side bump pointer.
+    let mut lazy_alloc_mark_type_idx = 0;
+    // Lazy alloc-reset type: (i32) -> () — restore host-side bump pointer.
+    let mut lazy_alloc_reset_type_idx = 0;
     if needs_lazy {
         let spawn_key = sig_key(&[ValType::I64, ValType::I32], &[ValType::I64]);
         lazy_spawn_type_idx = if let Some(&existing) = sig_to_type_idx.get(&spawn_key) {
@@ -315,6 +327,28 @@ fn compile_lir_to_wasm_inner(
             } else {
                 types.ty().function([ValType::I32], [ValType::I32]);
                 sig_to_type_idx.insert(alloc_key, next_type_index);
+                let idx = next_type_index;
+                next_type_index += 1;
+                idx
+            };
+            // alloc-mark: () -> i32
+            let mark_key = sig_key(&[], &[ValType::I32]);
+            lazy_alloc_mark_type_idx = if let Some(&existing) = sig_to_type_idx.get(&mark_key) {
+                existing
+            } else {
+                types.ty().function([], [ValType::I32]);
+                sig_to_type_idx.insert(mark_key, next_type_index);
+                let idx = next_type_index;
+                next_type_index += 1;
+                idx
+            };
+            // alloc-reset: (i32) -> ()
+            let reset_key = sig_key(&[ValType::I32], &[]);
+            lazy_alloc_reset_type_idx = if let Some(&existing) = sig_to_type_idx.get(&reset_key) {
+                existing
+            } else {
+                types.ty().function([ValType::I32], []);
+                sig_to_type_idx.insert(reset_key, next_type_index);
                 let idx = next_type_index;
                 next_type_index += 1;
                 idx
@@ -479,13 +513,24 @@ fn compile_lir_to_wasm_inner(
         );
         if memory_shared {
             // Atomic bump allocator (host-side AtomicI32) — see
-            // LazyRuntime::with_shared_memory. Order matters: this is the
-            // 3rd lazy import so its function index is `lazy_base + 2`,
-            // matching `layout.allocate_func_idx`.
+            // LazyRuntime::with_shared_memory. Order matters: 3rd / 4th /
+            // 5th lazy imports so their function indices are
+            // `lazy_base + 2..=4`, matching `layout.allocate_func_idx`,
+            // `alloc_mark_func_idx`, `alloc_reset_func_idx` set above.
             imports.import(
                 LAZY_MODULE,
                 LAZY_ALLOC_NAME,
                 EntityType::Function(lazy_alloc_type_idx),
+            );
+            imports.import(
+                LAZY_MODULE,
+                LAZY_ALLOC_MARK_NAME,
+                EntityType::Function(lazy_alloc_mark_type_idx),
+            );
+            imports.import(
+                LAZY_MODULE,
+                LAZY_ALLOC_RESET_NAME,
+                EntityType::Function(lazy_alloc_reset_type_idx),
             );
         }
         has_imports = true;
@@ -704,6 +749,14 @@ fn compile_lir_to_wasm_inner(
             idx += 1;
             func_names.append(idx, LAZY_JOIN_NAME);
             idx += 1;
+            if memory_shared {
+                func_names.append(idx, LAZY_ALLOC_NAME);
+                idx += 1;
+                func_names.append(idx, LAZY_ALLOC_MARK_NAME);
+                idx += 1;
+                func_names.append(idx, LAZY_ALLOC_RESET_NAME);
+                idx += 1;
+            }
         }
         // Internal functions (indices import_count..import_count+n_funcs)
         for func in &program.functions {
