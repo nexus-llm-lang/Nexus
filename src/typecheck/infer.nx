@@ -36,7 +36,8 @@ import {
   HirExprKind, HirExpr, HirStmtKind, HirStmt,
   HirCallArg, HirNamedExpr, HirMatchCase, HirFunction, HirParam,
   HirPatternKind, PLit, PVar, PCtor, PRec, PWild, POr,
-  HirPatternField, HirRecordPatField
+  HirPatternField, HirRecordPatField,
+  ExceptionGroupEntry
 } from "src/ir/hir_types.nx"
 import {
   SubstEntry, Scheme, EnvEntry, CheckState, FreshResult,
@@ -49,6 +50,7 @@ import * as subst from "src/typecheck/subst.nx"
 import * as unify from "src/typecheck/unify.nx"
 import * as capture from "src/typecheck/capture.nx"
 import * as exhaustive from "src/typecheck/exhaustive.nx"
+import { TypeMismatch } from "src/common/error.nx"
 import * as str from "std:str"
 import * as list from "std:list"
 import { Option, Some, None } from "std:option"
@@ -874,9 +876,111 @@ let infer_raise = fn (state: CheckState, inner: HirExpr, span: Span) -> InferExp
   match infer_expr(state, expr: inner, ret_type: TyUnit) do
     | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
     | InferExprOk(state: st1, subst: s1, typ: _) ->
-      // Raise diverges, return a fresh type variable
+      // T-Raise: the raised value's exception identity must be admitted by
+      // the active throws-row ρ_q. Rows containing TyUserDefined("Exn", _)
+      // accept any Exn variant (preserving back-compat with `throws { Exn }`).
+      // Narrow rows like `throws { LirError }` accept only declared members.
+      let row = subst.subst_apply(subst: s1, typ: tctypes.state_throw_row(state: st1))
+      let groups = tctypes.state_exception_groups(state: st1)
+      let exn_name_opt = exception_name_of_raised(expr: inner)
+      match check_raise_admitted(name_opt: exn_name_opt, row, groups) do
+        | RaiseOk -> ()
+        | RaiseRejected(message: m) -> return InferExprErr(message: m, span)
+      end
+      // Raise diverges; the result type is unconstrained (fresh tyvar so the
+      // surrounding context can pick whatever it needs).
       let FreshResult(state: st2, typ: tv) = tctypes.tc_fresh_var(state: st1)
       return InferExprOk(state: st2, subst: s1, typ: tv)
+  end
+end
+
+type RaiseAdmissionResult =
+  RaiseOk
+  | RaiseRejected(message: string)
+
+/// Decide whether raising `name_opt` is admitted by row `row`.
+/// `name_opt = None` means the raised value is not a syntactic exception
+/// constructor (e.g. `raise some_var`); we accept conservatively in that
+/// case because the value's runtime variant can't be inspected statically.
+///
+/// Functions in src/ that declare no `throws` clause currently parse to
+/// `TyRow([], None)` (closed empty). That predates row-typed enforcement,
+/// so we treat that exact shape as "unspecified throws" and accept any
+/// raise — narrow enforcement requires an explicit `throws { ... }`. Once
+/// the codebase declares throws on every raising function, this branch
+/// becomes the only place to delete to flip src/-wide enforcement on
+/// (mqin.1.2 tracks that migration).
+let check_raise_admitted = fn (
+  name_opt: Option<string>, row: TypeExpr, groups: [ExceptionGroupEntry]
+) -> RaiseAdmissionResult throws { Exn } do
+  match row do
+    | TyRow(types: [], rest: None) -> return RaiseOk
+    | TyRow(types: row_types, rest: Some(_)) -> return RaiseOk
+    | TyRow(types: row_types, rest: None) ->
+      match name_opt do
+        | None -> return RaiseOk
+        | Some(val: name) ->
+          if row_admits_exception(name, row_types, groups) then
+            return RaiseOk
+          else
+            return RaiseRejected(
+              message: "raise " ++ name ++ ": exception not in throws row"
+            )
+          end
+      end
+    | _ -> return RaiseOk
+  end
+end
+
+/// True when the row's head literally contains `name`, contains "Exn"
+/// (universal), or contains an exception group whose members include `name`.
+let row_admits_exception = fn (
+  name: string, row_types: [TypeExpr], groups: [ExceptionGroupEntry]
+) -> bool throws { Exn } do
+  match row_types do
+    | [] -> return false
+    | t :: rest ->
+      match t do
+        | TyUserDefined(name: n, args: _) ->
+          if n == "Exn" then return true end
+          if n == name then return true end
+          if group_contains(group_name: n, member: name, groups) then return true end
+          return row_admits_exception(name, row_types: rest, groups)
+        | _ -> return row_admits_exception(name, row_types: rest, groups)
+      end
+  end
+end
+
+let group_contains = fn (
+  group_name: string, member: string, groups: [ExceptionGroupEntry]
+) -> bool throws { Exn } do
+  match groups do
+    | [] -> return false
+    | ExceptionGroupEntry(name: gn, members) :: rest ->
+      if gn == group_name then
+        return member_in_strings(needle: member, haystack: members)
+      end
+      return group_contains(group_name, member, groups: rest)
+  end
+end
+
+let member_in_strings = fn (needle: string, haystack: [string]) -> bool throws { Exn } do
+  match haystack do
+    | [] -> return false
+    | h :: rest ->
+      if h == needle then return true end
+      return member_in_strings(needle, haystack: rest)
+  end
+end
+
+/// Recover the syntactic exception name from a raise's payload, if any.
+/// `raise Foo(...)` ⇒ Some("Foo"); `raise x` (variable) ⇒ None.
+let exception_name_of_raised = fn (expr: HirExpr) -> Option<string> throws { Exn } do
+  let HirExpr(node, span: _) = expr
+  return if let Ctor(variant, args: _) = node then
+    Some(val: variant)
+  else
+    None
   end
 end
 
@@ -1042,10 +1146,21 @@ let infer_try = fn (state: CheckState, body: [HirStmt], catch_param: string, cat
   match infer_stmts(state, stmts: body, ret_type) do
     | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "try body: " ++ m, span: espan)
     | InferExprOk(state: st1, subst: s1, typ: _) ->
+      // T-TryCatch: derive the catch parameter's type from the active
+      // throws-row, projecting whatever the body could raise. Every Nexus
+      // exception is a variant of the built-in `Exn` enum, so when the row
+      // is `{Exn}`, an exception group like `{LirError}`, or specific named
+      // exceptions, the catch parameter ends up bound to the same `Exn`
+      // enum type — but we read the name out of the row instead of hard-
+      // coding the string literal "Exn". The desugared `match catch_param`
+      // (built by hir.nx for multi-arm catch) then drives per-arm dispatch
+      // through bind_constructor_pattern unchanged.
+      let row = subst.subst_apply(subst: s1, typ: tctypes.state_throw_row(state: st1))
+      let param_ty = catch_param_type_from_row(row)
       let catch_env = tctypes.env_insert(
         env: tctypes.state_env(state: st1),
         name: catch_param,
-        scheme: tctypes.mono(typ: TyUserDefined(name: "Exn", args: []))
+        scheme: tctypes.mono(typ: param_ty)
       )
       let st2 = tctypes.state_with_env(state: st1, env: catch_env)
       match infer_stmts(state: st2, stmts: catch_body, ret_type) do
@@ -1055,6 +1170,56 @@ let infer_try = fn (state: CheckState, body: [HirStmt], catch_param: string, cat
           let st4 = tctypes.state_with_env(state: st3, env: tctypes.state_env(state))
           return InferExprOk(state: st4, subst: subst.subst_compose(s1, s2), typ: TyUnit)
       end
+  end
+end
+
+/// Project the active throws-row onto the type bound to a catch parameter.
+/// Every declared exception variant is registered as a member of the
+/// built-in `Exn` enum, so the universal shape (`Exn` itself), exception
+/// groups (`LirError`), and individual variants all resolve to the `Exn`
+/// enum type. The catch param is therefore typed by walking the row rather
+/// than splicing in the literal `TyUserDefined("Exn", [])`; once row
+/// entries gain a non-Exn-rooted vocabulary the per-entry walk here will
+/// surface that as a TypeMismatch caller-side instead of silently flowing
+/// through (see feedback_no_silent_defaults).
+let catch_param_type_from_row = fn (row: TypeExpr) -> TypeExpr throws { Exn } do
+  match row do
+    | TyRow(types: ts, rest: r) -> return project_exn_from_row_types(ts, has_tail: r)
+    | TyVar(name: _) ->
+      // The whole row was unified to a tail variable (effect-polymorphic).
+      // Catch param falls back to the universal Exn type.
+      return TyUserDefined(name: "Exn", args: [])
+    | _ ->
+      // Throws-row that isn't TyRow / TyVar means a typecheck invariant
+      // was already broken upstream; report through the caller's error
+      // path instead of silently substituting Exn.
+      raise TypeMismatch(
+        func_name: "<catch>",
+        detail: "throws row must be TyRow or TyVar, got " ++ tctypes.type_to_string(typ: row),
+        span: Span(offset: 0, line: 0, col: 0)
+      )
+  end
+end
+
+/// Walk row entries, asserting each names an Exn-rooted shape. Closed
+/// empty rows project to `Exn` so a `catch` body inside a function with
+/// `throws {}` still type-checks (the body is statically unreachable but
+/// pattern inference still runs).
+let project_exn_from_row_types = fn (
+  ts: [TypeExpr], has_tail: Option<TypeExpr>
+) -> TypeExpr throws { Exn } do
+  match ts do
+    | [] -> return TyUserDefined(name: "Exn", args: [])
+    | TyUserDefined(name: _, args: _) :: rest ->
+      return project_exn_from_row_types(ts: rest, has_tail)
+    | TyVar(name: _) :: rest ->
+      return project_exn_from_row_types(ts: rest, has_tail)
+    | other :: _ ->
+      raise TypeMismatch(
+        func_name: "<catch>",
+        detail: "throws row entry must be a named exception or row variable, got " ++ tctypes.type_to_string(typ: other),
+        span: Span(offset: 0, line: 0, col: 0)
+      )
   end
 end
 
