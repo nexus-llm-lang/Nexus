@@ -274,7 +274,16 @@ fn perform_request(
             }
             drop(stream);
         }
-        let _ = bindings::wasi::http::types::IncomingBody::finish(in_body);
+        // wasi-http delivers trailers as a `future-trailers` resource that
+        // some implementations bookkeeping until polled to completion. We
+        // don't surface trailers via the bridge ABI, but we still must drive
+        // the future to a terminal state — `subscribe().block()` then `get()`
+        // — so the host can release any deferred state before we drop the
+        // resource. Discarded results are intentional. (nexus-upzz.10)
+        let trailers_future = bindings::wasi::http::types::IncomingBody::finish(in_body);
+        trailers_future.subscribe().block();
+        let _ = trailers_future.get();
+        drop(trailers_future);
     }
 
     Ok((status, response_headers, response_body))
