@@ -647,6 +647,12 @@ fn define_component_nexus_host_stubs(
          -> wasmtime::Result<(i32,)> { Ok((0,)) },
     )
     .map_err(|e| e.to_string())?;
+    inst.func_wrap(
+        "host-bridge-finalize",
+        |_: wasmtime::StoreContextMut<'_, WasiState>, (): ()|
+         -> wasmtime::Result<(i64,)> { Ok((0,)) },
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

@@ -466,6 +466,9 @@ pub const HOST_HTTP_STUB_SIGNATURES: &[(
     ("host-http-accept", &[I64, I32], &[]),
     ("host-http-respond", &[I64, I64, I32, I32, I32, I32], &[I32]),
     ("host-http-stop", &[I64], &[I32]),
+    // Trap-resilience finalize: drains thread_local SERVERS/CONNS, releasing
+    // wasi sockets that were leaked by an in-flight trap. Returns drop count.
+    ("host-bridge-finalize", &[], &[I64]),
 ];
 
 fn build_stub_module(
@@ -623,5 +626,10 @@ mod tests {
         let (stop_params, stop_results) = by_name["host-http-stop"];
         assert_eq!(stop_params, &[I64], "host-http-stop params (handle)");
         assert_eq!(stop_results, &[I32], "host-http-stop returns i32 bool");
+
+        // host-bridge-finalize: drain count return = i64. (nexus-upzz.9)
+        let (fin_params, fin_results) = by_name["host-bridge-finalize"];
+        assert_eq!(fin_params, &[] as &[wasm_encoder::ValType], "host-bridge-finalize takes no args");
+        assert_eq!(fin_results, &[I64], "host-bridge-finalize returns i64 drop count");
     }
 }

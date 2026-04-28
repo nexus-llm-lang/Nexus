@@ -511,6 +511,23 @@ fn do_stop(server_id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// Drain SERVERS and CONNS, dropping all held wasi resources (TCP sockets,
+/// streams). Idempotent: safe to call when the maps are empty. Returns the
+/// total number of (server + connection) entries dropped.
+///
+/// Linearity proves consumed-once for the well-behaved path (listen → stop,
+/// accept → respond). It does *not* intervene on wasm trap / unwind /
+/// wasi-trap: a trap leaves the thread_local maps populated until thread
+/// exit, and the wasi resource handles those entries hold are released only
+/// when the wasm Store is dropped. This export lets an embedder reset the
+/// bridge's bookkeeping (and close the underlying sockets) without rebuilding
+/// the Store.
+fn do_bridge_finalize() -> i64 {
+    let n_servers = SERVERS.with(|servers| super::trap_drain::drain(&mut servers.borrow_mut()));
+    let n_conns = CONNS.with(|conns| super::trap_drain::drain(&mut conns.borrow_mut()));
+    (n_servers + n_conns) as i64
+}
+
 // ---------------------------------------------------------------------------
 // Guest implementation
 // ---------------------------------------------------------------------------
@@ -558,6 +575,10 @@ impl bindings::exports::nexus::cli::nexus_host::Guest for Guest {
             Ok(()) => 1,
             Err(_) => 0,
         }
+    }
+
+    fn host_bridge_finalize() -> i64 {
+        do_bridge_finalize()
     }
 }
 
