@@ -8,6 +8,7 @@ pub mod from_char_code_utf8;
 pub mod fs;
 pub mod json;
 pub mod lazy;
+pub mod lsp_protocol;
 pub mod list;
 pub mod math;
 pub mod net;
