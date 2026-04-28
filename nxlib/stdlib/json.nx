@@ -1,0 +1,693 @@
+/**
+ * json: RFC 8259 JSON parser and serializer.
+ *
+ * Pure Nexus implementation, sufficient for LSP message payloads.
+ *
+ * Algebra:
+ *   JsonNull
+ *   JsonBool(val: bool)
+ *   JsonInt(val: i64)               // integer literal w/o '.', 'e', 'E'
+ *   JsonFloat(val: f64)             // any literal with fractional or exponent part
+ *   JsonString(val: string)
+ *   JsonArray(items: [JsonValue])
+ *   JsonObject(fields: [JsonField]) // insertion-ordered association list
+ *
+ * NaN and ±Infinity are not part of JSON; the serializer raises JsonError on
+ * such inputs rather than silently emitting invalid JSON.
+ *
+ * Out of scope: schema validation, JSON Pointer, comments, trailing commas.
+ */
+
+import * as str from "std:str"
+import * as char from "std:char"
+import * as bb from "std:bytebuffer"
+import { Option, Some, None } from "std:option"
+
+/// Parser/serializer error. `pos` is the byte offset (or -1 for serializer
+/// errors that aren't tied to an input position).
+export exception JsonError(msg: string, pos: i64)
+
+/// One key/value pair inside a JSON object. Stored as a plain list to
+/// preserve insertion order — duplicate keys are kept verbatim, callers that
+/// need uniqueness should normalize after parsing.
+export type JsonField = JsonField(key: string, value: JsonValue)
+
+/// JSON value algebra. Recursive via [JsonValue] / [JsonField].
+export type JsonValue =
+    JsonNull
+  | JsonBool(val: bool)
+  | JsonInt(val: i64)
+  | JsonFloat(val: f64)
+  | JsonString(val: string)
+  | JsonArray(items: [JsonValue])
+  | JsonObject(fields: [JsonField])
+
+// ─── Builders ────────────────────────────────────────────────────────────────
+
+/// JSON null.
+export let null = fn () -> JsonValue do
+  return JsonNull
+end
+
+/// JSON boolean.
+export let bool = fn (val: bool) -> JsonValue do
+  return JsonBool(val)
+end
+
+/// JSON integer (i64 lane).
+export let int = fn (val: i64) -> JsonValue do
+  return JsonInt(val)
+end
+
+/// JSON floating-point (f64 lane).
+export let float = fn (val: f64) -> JsonValue do
+  return JsonFloat(val)
+end
+
+/// JSON string.
+export let string_val = fn (val: string) -> JsonValue do
+  return JsonString(val)
+end
+
+/// JSON array.
+export let array_val = fn (items: [JsonValue]) -> JsonValue do
+  return JsonArray(items)
+end
+
+/// JSON object built from a list of key/value pairs.
+export let object_val = fn (fields: [JsonField]) -> JsonValue do
+  return JsonObject(fields)
+end
+
+// ─── Object lookup helpers ───────────────────────────────────────────────────
+
+let field_lookup = fn (fields: [JsonField], key: string) -> Option<JsonValue> do
+  match fields do
+    | [] -> return None
+    | JsonField(key: k, value: v) :: rest ->
+      if k == key then
+        return Some(val: v)
+      else
+        return field_lookup(fields: rest, key)
+      end
+  end
+end
+
+/// Looks up a key in a JSON object. Returns None if `obj` is not a JsonObject
+/// or the key is absent.
+export let get_field = fn (obj: JsonValue, key: string) -> Option<JsonValue> do
+  match obj do
+    | JsonObject(fields: fs) -> return field_lookup(fields: fs, key)
+    | _ -> return None
+  end
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Parser
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Byte-indexed recursive-descent parser. The state is a (source, position)
+// pair threaded through every step. We return a Step record carrying the
+// produced value plus the new position so each combinator stays pure.
+
+type ParseStep = ParseStep(value: JsonValue, pos: i64)
+type StringStep = StringStep(value: string, pos: i64)
+type IntStep = IntStep(end_pos: i64)
+
+let ch_dquote = '"'
+let ch_backslash = '\\'
+let ch_slash = '/'
+let ch_lbrace = '{'
+let ch_rbrace = '}'
+let ch_lbracket = '['
+let ch_rbracket = ']'
+let ch_comma = ','
+let ch_colon = ':'
+let ch_minus = '-'
+let ch_plus = '+'
+let ch_dot = '.'
+let ch_zero = '0'
+let ch_lower_e = 'e'
+let ch_upper_e = 'E'
+let ch_eof = '\0'
+
+let len_of = fn (s: string) -> i64 do
+  return str.byte_length(s)
+end
+
+let peek_byte = fn (s: string, p: i64) -> char do
+  if p >= len_of(s) then return ch_eof end
+  return str.byte_at(s, idx: p)
+end
+
+let skip_ws = fn (s: string, p: i64) -> i64 do
+  if p >= len_of(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ' ' || c == '\t' || c == '\n' || c == '\r' then
+    return skip_ws(s, p: p + 1)
+  end
+  return p
+end
+
+let starts_with_at = fn (s: string, p: i64, lit: string) -> bool do
+  let n = str.byte_length(s: lit)
+  if p + n > len_of(s) then return false end
+  return str.byte_substring(s, start: p, len: n) == lit
+end
+
+// ─── String literal parsing ──────────────────────────────────────────────────
+
+// Convert a 4-hex-digit code starting at `p` into (code, end_pos).
+type HexResult = HexOk(code: i64, end_pos: i64) | HexBad(pos: i64)
+
+let parse_hex4 = fn (s: string, p: i64) -> HexResult do
+  if p + 4 > len_of(s) then return HexBad(pos: p) end
+  let h1 = char.hex_digit_value(c: str.byte_at(s, idx: p))
+  let h2 = char.hex_digit_value(c: str.byte_at(s, idx: p + 1))
+  let h3 = char.hex_digit_value(c: str.byte_at(s, idx: p + 2))
+  let h4 = char.hex_digit_value(c: str.byte_at(s, idx: p + 3))
+  if h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0 then
+    return HexBad(pos: p)
+  end
+  return HexOk(code: h1 * 4096 + h2 * 256 + h3 * 16 + h4, end_pos: p + 4)
+end
+
+// Combine a leading high surrogate (0xD800-0xDBFF) with a trailing low
+// surrogate (0xDC00-0xDFFF) into a single Unicode code point.
+let combine_surrogates = fn (high: i64, low: i64) -> i64 do
+  return ((high - 55296) * 1024) + (low - 56320) + 65536
+end
+
+let is_high_surrogate = fn (code: i64) -> bool do
+  return code >= 55296 && code <= 56319
+end
+
+let is_low_surrogate = fn (code: i64) -> bool do
+  return code >= 56320 && code <= 57343
+end
+
+// Flush the byte range [start, end) onto the accumulator without
+// re-encoding — this is the only way to preserve raw UTF-8 sequences from
+// the source string (a char-by-char loop would mis-handle 4-byte forms).
+let flush_range = fn (s: string, start: i64, end_pos: i64, acc: string) -> string do
+  if end_pos <= start then return acc end
+  return acc ++ str.byte_substring(s, start, len: end_pos - start)
+end
+
+// Parse the body of a string literal. `p` is positioned just after the
+// opening '"'. Returns StringStep where pos is just after the closing '"'.
+let parse_string_body = fn (s: string, p: i64, run_start: i64, acc: string) -> StringStep throws { Exn } do
+  if p >= len_of(s) then
+    raise JsonError(msg: "unterminated string literal", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_dquote then
+    let acc2 = flush_range(s, start: run_start, end_pos: p, acc)
+    return StringStep(value: acc2, pos: p + 1)
+  end
+  if c == ch_backslash then
+    let acc2 = flush_range(s, start: run_start, end_pos: p, acc)
+    return parse_string_escape(s, p: p + 1, acc: acc2)
+  end
+  // Reject unescaped control characters per RFC 8259 §7.
+  let code = char.ord(c)
+  if code >= 0 && code < 32 then
+    raise JsonError(msg: "unescaped control character in string", pos: p)
+  end
+  return parse_string_body(s, p: p + 1, run_start, acc)
+end
+
+let parse_string_escape = fn (s: string, p: i64, acc: string) -> StringStep throws { Exn } do
+  if p >= len_of(s) then
+    raise JsonError(msg: "unterminated string escape", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_dquote      then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ "\"") end
+  if c == ch_backslash   then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ "\\") end
+  if c == ch_slash       then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ "/") end
+  if c == 'b'            then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ str.from_char_code(code: 8)) end
+  if c == 'f'            then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ str.from_char_code(code: 12)) end
+  if c == 'n'            then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ "\n") end
+  if c == 'r'            then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ "\r") end
+  if c == 't'            then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ "\t") end
+  if c == 'u' then
+    return parse_string_unicode(s, p: p + 1, acc)
+  end
+  raise JsonError(msg: "invalid escape sequence", pos: p - 1)
+end
+
+// Encode a Unicode scalar value to its UTF-8 byte sequence as a Nexus string.
+// Uses a bytebuffer because the codegen intrinsic for str.from_char_code is
+// limited to single-byte ASCII (it stores `code as u8` and packs len = 1
+// regardless of the input magnitude); going through __nx_buf_to_string lifts
+// the raw byte vector through a host-side String, preserving multi-byte
+// UTF-8 round-trips.
+// Pre-compute the UTF-8 byte sequence for a Unicode scalar as an i64 list, then
+// dispatch to a single bytebuffer fill. Going through __nx_buf_to_string is
+// the only way to get a multi-byte string out at runtime; the codegen
+// intrinsic for str.from_char_code is hard-coded to produce a one-byte
+// payload regardless of the input value.
+let utf8_bytes_of = fn (code: i64) -> [i64] do
+  if code < 128 then
+    return [code]
+  end
+  if code < 2048 then
+    let b1 = 192 + (code / 64)
+    let b2 = 128 + (code - (code / 64) * 64)
+    return [b1, b2]
+  end
+  if code < 65536 then
+    let b1 = 224 + (code / 4096)
+    let mid = code / 64
+    let b2 = 128 + (mid - (mid / 64) * 64)
+    let b3 = 128 + (code - mid * 64)
+    return [b1, b2, b3]
+  end
+  if code < 1114112 then
+    let b1 = 240 + (code / 262144)
+    let mid_hi = code / 4096
+    let b2 = 128 + (mid_hi - (mid_hi / 64) * 64)
+    let mid_lo = code / 64
+    let b3 = 128 + (mid_lo - (mid_lo / 64) * 64)
+    let b4 = 128 + (code - mid_lo * 64)
+    return [b1, b2, b3, b4]
+  end
+  return []
+end
+
+let codepoint_to_utf8 = fn (code: i64) -> string do
+  if code < 0 then return "" end
+  let bytes = utf8_bytes_of(code)
+  match bytes do
+    | [] -> return ""
+    | _ :: _ ->
+      let %buf = bb.empty()
+      let %buf = bb.push_bytes(%buf, bytes)
+      let result = bb.to_string(&buf)
+      bb.free(%buf)
+      return result
+  end
+end
+
+let parse_string_unicode = fn (s: string, p: i64, acc: string) -> StringStep throws { Exn } do
+  match parse_hex4(s, p) do
+    | HexBad(pos: q) -> raise JsonError(msg: "invalid \\u escape (need 4 hex digits)", pos: q)
+    | HexOk(code: high, end_pos: q1) ->
+      if is_high_surrogate(code: high) then
+        // Expect a low-surrogate \uXXXX immediately after.
+        if q1 + 2 > len_of(s) then
+          raise JsonError(msg: "lone high surrogate at end of input", pos: p)
+        end
+        let b0 = str.byte_at(s, idx: q1)
+        let b1 = str.byte_at(s, idx: q1 + 1)
+        if b0 != ch_backslash || b1 != 'u' then
+          raise JsonError(msg: "high surrogate not followed by \\u low surrogate", pos: q1)
+        end
+        match parse_hex4(s, p: q1 + 2) do
+          | HexBad(pos: q2) -> raise JsonError(msg: "invalid \\u escape after high surrogate", pos: q2)
+          | HexOk(code: low, end_pos: q3) ->
+            if is_low_surrogate(code: low) then
+              let combined = combine_surrogates(high, low)
+              let encoded = codepoint_to_utf8(code: combined)
+              if str.byte_length(s: encoded) == 0 then
+                raise JsonError(msg: "surrogate pair encodes invalid Unicode scalar", pos: p)
+              end
+              return parse_string_body(s, p: q3, run_start: q3, acc: acc ++ encoded)
+            else
+              raise JsonError(msg: "high surrogate followed by non-low-surrogate \\u escape", pos: q1 + 2)
+            end
+        end
+      else if is_low_surrogate(code: high) then
+        raise JsonError(msg: "lone low surrogate \\u escape", pos: p)
+      else
+        let encoded = codepoint_to_utf8(code: high)
+        if str.byte_length(s: encoded) == 0 then
+          raise JsonError(msg: "\\u escape encodes invalid Unicode scalar", pos: p)
+        end
+        return parse_string_body(s, p: q1, run_start: q1, acc: acc ++ encoded)
+      end
+  end
+end
+
+let parse_json_string = fn (s: string, p: i64) -> StringStep throws { Exn } do
+  if peek_byte(s, p) != ch_dquote then
+    raise JsonError(msg: "expected string", pos: p)
+  end
+  return parse_string_body(s, p: p + 1, run_start: p + 1, acc: "")
+end
+
+// ─── Number parsing ──────────────────────────────────────────────────────────
+//
+// JSON number grammar (RFC 8259 §6):
+//   number = [ minus ] int [ frac ] [ exp ]
+//   int    = zero | (digit1-9 *digit)
+//   frac   = . *digit
+//   exp    = (e | E) [ + | - ] *digit
+// We scan the full literal first, then dispatch on whether '.', 'e', or 'E'
+// appeared to choose i64 vs f64.
+
+let scan_digits = fn (s: string, p: i64) -> i64 do
+  if p >= len_of(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c >= '0' && c <= '9' then
+    return scan_digits(s, p: p + 1)
+  end
+  return p
+end
+
+type NumberShape = NumberShape(end_pos: i64, is_float: bool)
+
+let scan_number = fn (s: string, p: i64) -> NumberShape throws { Exn } do
+  let start = p
+  // Optional minus.
+  let after_sign = if peek_byte(s, p) == ch_minus then p + 1 else p end
+  // Integer part.
+  let first = peek_byte(s, p: after_sign)
+  if first == ch_eof then
+    raise JsonError(msg: "expected number", pos: start)
+  end
+  if !(first >= '0' && first <= '9') then
+    raise JsonError(msg: "expected digit in number", pos: after_sign)
+  end
+  let after_int =
+    if first == ch_zero then
+      after_sign + 1
+    else
+      scan_digits(s, p: after_sign + 1)
+    end
+  // Reject leading zero followed by another digit (e.g. "01").
+  if first == ch_zero then
+    let next = peek_byte(s, p: after_int)
+    if next >= '0' && next <= '9' then
+      raise JsonError(msg: "leading zeros are not allowed", pos: after_sign)
+    end
+  end
+  // Optional fractional part.
+  let mut_pos = after_int
+  let mut_is_float = false
+  let after_frac = if peek_byte(s, p: mut_pos) == ch_dot then mut_pos + 1 else mut_pos end
+  let frac_is_float = after_frac != mut_pos
+  let after_frac_digits =
+    if frac_is_float then
+      let q = scan_digits(s, p: after_frac)
+      if q == after_frac then
+        raise JsonError(msg: "expected digit after '.'", pos: after_frac)
+      end
+      q
+    else
+      after_frac
+    end
+  // Optional exponent part.
+  let after_e = peek_byte(s, p: after_frac_digits)
+  let exp_is_float = after_e == ch_lower_e || after_e == ch_upper_e
+  let after_exp_marker = if exp_is_float then after_frac_digits + 1 else after_frac_digits end
+  let after_exp_sign =
+    if exp_is_float then
+      let c = peek_byte(s, p: after_exp_marker)
+      if c == ch_plus || c == ch_minus then after_exp_marker + 1 else after_exp_marker end
+    else
+      after_exp_marker
+    end
+  let final_pos =
+    if exp_is_float then
+      let q = scan_digits(s, p: after_exp_sign)
+      if q == after_exp_sign then
+        raise JsonError(msg: "expected digit in exponent", pos: after_exp_sign)
+      end
+      q
+    else
+      after_exp_sign
+    end
+  return NumberShape(end_pos: final_pos, is_float: frac_is_float || exp_is_float)
+end
+
+let parse_number = fn (s: string, p: i64) -> ParseStep throws { Exn } do
+  let NumberShape(end_pos, is_float) = scan_number(s, p)
+  let lit = str.byte_substring(s, start: p, len: end_pos - p)
+  if is_float then
+    match str.parse_f64_checked(s: lit) do
+      | Some(val: f) -> return ParseStep(value: JsonFloat(val: f), pos: end_pos)
+      | None -> raise JsonError(msg: "malformed float literal '" ++ lit ++ "'", pos: p)
+    end
+  else
+    match str.parse_i64(s: lit) do
+      | Some(val: i) -> return ParseStep(value: JsonInt(val: i), pos: end_pos)
+      | None ->
+        // Out-of-range integer (e.g. > i64::MAX): widen to f64 rather than
+        // truncating. JSON spec permits unbounded integers; downstream LSP
+        // payloads stay readable.
+        match str.parse_f64_checked(s: lit) do
+          | Some(val: f) -> return ParseStep(value: JsonFloat(val: f), pos: end_pos)
+          | None -> raise JsonError(msg: "integer literal out of i64 range and not a valid f64: '" ++ lit ++ "'", pos: p)
+        end
+    end
+  end
+end
+
+// ─── Composite parsing (array, object, value dispatch) ──────────────────────
+
+let parse_value = fn (s: string, p: i64) -> ParseStep throws { Exn } do
+  let p1 = skip_ws(s, p)
+  if p1 >= len_of(s) then
+    raise JsonError(msg: "unexpected end of input", pos: p1)
+  end
+  let c = str.byte_at(s, idx: p1)
+  if c == ch_dquote then
+    let StringStep(value: v, pos: p2) = parse_json_string(s, p: p1)
+    return ParseStep(value: JsonString(val: v), pos: p2)
+  end
+  if c == ch_lbrace then
+    return parse_object(s, p: p1)
+  end
+  if c == ch_lbracket then
+    return parse_array(s, p: p1)
+  end
+  if c == 't' then
+    if starts_with_at(s, p: p1, lit: "true") then
+      return ParseStep(value: JsonBool(val: true), pos: p1 + 4)
+    end
+    raise JsonError(msg: "expected 'true'", pos: p1)
+  end
+  if c == 'f' then
+    if starts_with_at(s, p: p1, lit: "false") then
+      return ParseStep(value: JsonBool(val: false), pos: p1 + 5)
+    end
+    raise JsonError(msg: "expected 'false'", pos: p1)
+  end
+  if c == 'n' then
+    if starts_with_at(s, p: p1, lit: "null") then
+      return ParseStep(value: JsonNull, pos: p1 + 4)
+    end
+    raise JsonError(msg: "expected 'null'", pos: p1)
+  end
+  if c == ch_minus || (c >= '0' && c <= '9') then
+    return parse_number(s, p: p1)
+  end
+  raise JsonError(msg: "unexpected character", pos: p1)
+end
+
+let parse_array_items = fn (s: string, p: i64, acc: [JsonValue]) -> ParseStep throws { Exn } do
+  let p1 = skip_ws(s, p)
+  if peek_byte(s, p: p1) == ch_rbracket then
+    return ParseStep(value: JsonArray(items: reverse_values(xs: acc, acc: [])), pos: p1 + 1)
+  end
+  let ParseStep(value: v, pos: p2) = parse_value(s, p: p1)
+  let p3 = skip_ws(s, p: p2)
+  let next = peek_byte(s, p: p3)
+  if next == ch_comma then
+    return parse_array_items(s, p: p3 + 1, acc: v :: acc)
+  end
+  if next == ch_rbracket then
+    return ParseStep(value: JsonArray(items: reverse_values(xs: v :: acc, acc: [])), pos: p3 + 1)
+  end
+  raise JsonError(msg: "expected ',' or ']' in array", pos: p3)
+end
+
+let reverse_values = fn (xs: [JsonValue], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | v :: rest -> return reverse_values(xs: rest, acc: v :: acc)
+  end
+end
+
+let reverse_fields = fn (xs: [JsonField], acc: [JsonField]) -> [JsonField] do
+  match xs do
+    | [] -> return acc
+    | v :: rest -> return reverse_fields(xs: rest, acc: v :: acc)
+  end
+end
+
+let parse_array = fn (s: string, p: i64) -> ParseStep throws { Exn } do
+  // p is at '['.
+  return parse_array_items(s, p: p + 1, acc: [])
+end
+
+let parse_object_fields = fn (s: string, p: i64, acc: [JsonField]) -> ParseStep throws { Exn } do
+  let p1 = skip_ws(s, p)
+  if peek_byte(s, p: p1) == ch_rbrace then
+    return ParseStep(value: JsonObject(fields: reverse_fields(xs: acc, acc: [])), pos: p1 + 1)
+  end
+  if peek_byte(s, p: p1) != ch_dquote then
+    raise JsonError(msg: "expected string key in object", pos: p1)
+  end
+  let StringStep(value: key, pos: p2) = parse_json_string(s, p: p1)
+  let p3 = skip_ws(s, p: p2)
+  if peek_byte(s, p: p3) != ch_colon then
+    raise JsonError(msg: "expected ':' after object key", pos: p3)
+  end
+  let ParseStep(value: v, pos: p4) = parse_value(s, p: p3 + 1)
+  let entry = JsonField(key, value: v)
+  let p5 = skip_ws(s, p: p4)
+  let next = peek_byte(s, p: p5)
+  if next == ch_comma then
+    return parse_object_fields(s, p: p5 + 1, acc: entry :: acc)
+  end
+  if next == ch_rbrace then
+    return ParseStep(value: JsonObject(fields: reverse_fields(xs: entry :: acc, acc: [])), pos: p5 + 1)
+  end
+  raise JsonError(msg: "expected ',' or '}' in object", pos: p5)
+end
+
+let parse_object = fn (s: string, p: i64) -> ParseStep throws { Exn } do
+  // p is at '{'.
+  return parse_object_fields(s, p: p + 1, acc: [])
+end
+
+/// Parses a complete JSON document. Trailing whitespace is allowed; trailing
+/// non-whitespace bytes raise JsonError.
+export let parse = fn (s: string) -> JsonValue throws { Exn } do
+  let ParseStep(value: v, pos: p) = parse_value(s, p: 0)
+  let p2 = skip_ws(s, p)
+  if p2 < len_of(s) then
+    raise JsonError(msg: "trailing data after JSON value", pos: p2)
+  end
+  return v
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Serializer
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Builds an output string by recursive descent. Strings escape per RFC 8259:
+// the required-escape set is " \ and U+0000..U+001F. Forward slashes and
+// non-ASCII code points are emitted as-is (the spec permits this for any
+// UTF-8 producer).
+
+let hex_digit = fn (n: i64) -> string do
+  if n < 10 then
+    return str.from_char_code(code: n + 48)  // '0'
+  end
+  return str.from_char_code(code: n + 87)  // 'a' - 10
+end
+
+let unicode_escape = fn (code: i64) -> string do
+  let d3 = code / 4096
+  let d2 = (code / 256) - d3 * 16
+  let d1 = (code / 16) - (code / 256) * 16
+  let d0 = code - (code / 16) * 16
+  return "\\u" ++ hex_digit(n: d3) ++ hex_digit(n: d2) ++ hex_digit(n: d1) ++ hex_digit(n: d0)
+end
+
+// Emit string payload between quotes. Walks bytes; escapes the seven named
+// forms plus \uXXXX for U+0000..U+001F. Non-control bytes flow through
+// untouched, preserving multi-byte UTF-8 sequences.
+let escape_string_at = fn (s: string, p: i64, run_start: i64, acc: string) -> string do
+  let n = len_of(s)
+  if p >= n then
+    return flush_range(s, start: run_start, end_pos: p, acc)
+  end
+  let c = str.byte_at(s, idx: p)
+  let code = char.ord(c)
+  if c == ch_dquote then
+    let acc2 = flush_range(s, start: run_start, end_pos: p, acc)
+    return escape_string_at(s, p: p + 1, run_start: p + 1, acc: acc2 ++ "\\\"")
+  end
+  if c == ch_backslash then
+    let acc2 = flush_range(s, start: run_start, end_pos: p, acc)
+    return escape_string_at(s, p: p + 1, run_start: p + 1, acc: acc2 ++ "\\\\")
+  end
+  if code >= 0 && code < 32 then
+    let acc2 = flush_range(s, start: run_start, end_pos: p, acc)
+    let esc =
+      if code == 8 then
+        "\\b"
+      else if code == 9 then
+        "\\t"
+      else if code == 10 then
+        "\\n"
+      else if code == 12 then
+        "\\f"
+      else if code == 13 then
+        "\\r"
+      else
+        unicode_escape(code)
+      end
+    return escape_string_at(s, p: p + 1, run_start: p + 1, acc: acc2 ++ esc)
+  end
+  return escape_string_at(s, p: p + 1, run_start, acc)
+end
+
+let serialize_string = fn (s: string) -> string do
+  return "\"" ++ escape_string_at(s, p: 0, run_start: 0, acc: "") ++ "\""
+end
+
+// Ensure a finite f64 round-trips through the JSON grammar. Rust's
+// `f64::to_string` returns "NaN" / "inf" / "-inf" for non-finite values —
+// these are rejected upstream by `is_valid_f64` (see std:str), but checking
+// the rendered text again here keeps the contract explicit.
+let serialize_float = fn (val: f64) -> string throws { Exn } do
+  // NaN is the only value that compares unequal to itself (IEEE-754).
+  if val !=. val then
+    raise JsonError(msg: "JSON does not permit NaN", pos: -1)
+  end
+  let rendered = str.from_float(val)
+  if rendered == "inf" || rendered == "-inf" then
+    raise JsonError(msg: "JSON does not permit Infinity", pos: -1)
+  end
+  // Rust's Display omits a trailing ".0" for whole f64s ("1" not "1.0"). The
+  // JSON grammar accepts either form, but consumers that distinguish int from
+  // float by syntax (e.g. JS Number vs BigInt heuristics) will be happier
+  // with an explicit decimal point.
+  if str.contains(s: rendered, sub: ".") || str.contains(s: rendered, sub: "e") || str.contains(s: rendered, sub: "E") then
+    return rendered
+  end
+  return rendered ++ ".0"
+end
+
+let serialize_array_items = fn (items: [JsonValue], first: bool, acc: string) -> string throws { Exn } do
+  match items do
+    | [] -> return acc
+    | v :: rest ->
+      let sep = if first then "" else "," end
+      let chunk = serialize_value(v)
+      return serialize_array_items(items: rest, first: false, acc: acc ++ sep ++ chunk)
+  end
+end
+
+let serialize_object_fields = fn (fields: [JsonField], first: bool, acc: string) -> string throws { Exn } do
+  match fields do
+    | [] -> return acc
+    | JsonField(key: k, value: v) :: rest ->
+      let sep = if first then "" else "," end
+      let chunk = serialize_string(s: k) ++ ":" ++ serialize_value(v)
+      return serialize_object_fields(fields: rest, first: false, acc: acc ++ sep ++ chunk)
+  end
+end
+
+let serialize_value = fn (v: JsonValue) -> string throws { Exn } do
+  match v do
+    | JsonNull -> return "null"
+    | JsonBool(val: b) -> return str.from_bool(val: b)
+    | JsonInt(val: i) -> return str.from_i64(val: i)
+    | JsonFloat(val: f) -> return serialize_float(val: f)
+    | JsonString(val: s) -> return serialize_string(s)
+    | JsonArray(items: xs) -> return "[" ++ serialize_array_items(items: xs, first: true, acc: "") ++ "]"
+    | JsonObject(fields: fs) -> return "{" ++ serialize_object_fields(fields: fs, first: true, acc: "") ++ "}"
+  end
+end
+
+/// Serializes a JSON value into a compact, parser-acceptable string. Raises
+/// JsonError if any contained f64 is NaN or ±Infinity.
+export let serialize = fn (v: JsonValue) -> string throws { Exn } do
+  return serialize_value(v)
+end
