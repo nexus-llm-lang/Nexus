@@ -1002,10 +1002,17 @@ impl TypeChecker {
                     let try_eff = Type::Row(vec![exn.clone()], Some(Box::new(ee.clone())));
                     let mut et = env.clone();
                     self.infer_body(body, &mut et, er, eq, &try_eff)?;
+                    // Strategy A (issue nexus-7eex.1): a catch arm is reached via
+                    // `raise` from an arbitrary point inside the try body, so its
+                    // inherited linear set is whatever was live *before* the try
+                    // body started — not the post-success state. Linears that
+                    // were created inside the try body and could still be alive
+                    // when a throw fires are intentionally invisible to the
+                    // catch arm here; hole 2 (separate issue) rejects creating
+                    // such linears across throwable calls in the first place.
                     let mut last_linear = et.linear_vars.clone();
                     for arm in catch_arms {
                         let mut ec = env.clone();
-                        ec.linear_vars = et.linear_vars.clone();
                         self.bind_pattern(&arm.pattern, &exn, &mut ec)?;
                         self.infer_body(&arm.body, &mut ec, er, eq, ee)?;
                         if last_linear != ec.linear_vars {
