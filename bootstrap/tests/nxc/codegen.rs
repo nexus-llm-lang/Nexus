@@ -552,3 +552,16 @@ fn runtime_mem_math_intrinsics_dispatch() {
         );
     }
 }
+
+/// nexus-dvr6.9.4 acceptance: math.nx integer ops (abs/max/min/mod_i64) compile
+/// and execute end-to-end without going through the host `__nx_*_i64` FFI
+/// (they are pure-Nexus implementations using only language primitives), and
+/// `mod_i64` raises a specific RuntimeError on division by zero rather than
+/// silently returning `i64::MIN` like the prior Rust impl. The fixture also
+/// exercises sqrt/floor/ceil/abs_float so the runtime_math intrinsic dispatch
+/// (already covered by `runtime_mem_math_intrinsics_dispatch`) keeps working
+/// when called via the higher-level math.nx wrappers.
+#[test]
+fn math_pure_nexus_integer_ops_acceptance() {
+    exec_nxc_core("bootstrap/tests/fixtures/nxc/test_math_pure_nexus_integer_ops.nx");
+}
