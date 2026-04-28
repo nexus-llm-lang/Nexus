@@ -1,4 +1,4 @@
-use crate::harness::compile::compile_fixture_via_nxc_should_fail;
+use crate::harness::compile::{compile_fixture_via_nxc, compile_fixture_via_nxc_should_fail};
 use crate::harness::{
     exec, exec_nxc_core, exec_nxc_core_capture_stdout, exec_should_trap, exec_threaded,
     exec_with_stdlib, exec_with_stdlib_core, exec_with_stdlib_core_should_trap, read_fixture,
@@ -359,6 +359,71 @@ fn sched_producer_consumer() {
         "expected single line `42`, got — full stdout:\n{}",
         out
     );
+}
+
+/// Regression test for nexus-gyj6: `compile_fixture_via_nxc` previously
+/// derived its output path from `std::process::id()` alone, so all parallel
+/// test threads inside the same `cargo test` process shared the *same*
+/// `/tmp/nxc_test_<pid>.wasm` and overwrote each other's compiled fixture.
+/// This test compiles three distinct fixtures concurrently from N worker
+/// threads — if path-uniquing per call is broken, at least one thread reads
+/// back wasm bytes a sibling wrote (different stdout when executed) and the
+/// `assert_eq!` fails.
+#[test]
+fn compile_fixture_via_nxc_is_thread_safe() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::thread;
+
+    // Pre-resolve fixture bytes serially once so we have a baseline to
+    // compare each thread's parallel compile against. Parallel runs that
+    // disagree with the serial baseline = path collision.
+    let fixtures = [
+        "bootstrap/tests/fixtures/nxc/test_sched_yield.nx",
+        "bootstrap/tests/fixtures/nxc/test_sched_producer_consumer.nx",
+        "bootstrap/tests/fixtures/nxc/test_sched_multi_fiber.nx",
+    ];
+    // Force chdir-to-repo-root via an upfront serial compile (also seeds
+    // the `Once` inside `ensure_repo_root` before threads race on it).
+    let baselines: HashMap<&str, Vec<u8>> = fixtures
+        .iter()
+        .map(|f| (*f, compile_fixture_via_nxc(f)))
+        .collect();
+    let baselines = Arc::new(baselines);
+
+    // 4 rounds × 3 fixtures = 12 concurrent compiles. Empirically enough
+    // to expose the shared-path race on a 10-core M-series machine when
+    // the bug is reintroduced; the correct fix passes deterministically.
+    const ROUNDS: usize = 4;
+    let mut handles = Vec::new();
+    for round in 0..ROUNDS {
+        for (i, fixture) in fixtures.iter().enumerate() {
+            let baselines = Arc::clone(&baselines);
+            let fixture = *fixture;
+            handles.push(thread::spawn(move || {
+                let bytes = compile_fixture_via_nxc(fixture);
+                let expected = baselines.get(fixture).unwrap();
+                assert_eq!(
+                    bytes.len(),
+                    expected.len(),
+                    "round={round} idx={i} fixture={fixture}: \
+                     parallel compile produced wasm of length {} but serial \
+                     baseline was {} — likely path-collision overwrite by \
+                     another thread",
+                    bytes.len(),
+                    expected.len()
+                );
+                assert_eq!(
+                    bytes, *expected,
+                    "round={round} idx={i} fixture={fixture}: parallel \
+                     compile produced different bytes than serial baseline"
+                );
+            }));
+        }
+    }
+    for h in handles {
+        h.join().expect("worker thread panicked");
+    }
 }
 
 #[test]
