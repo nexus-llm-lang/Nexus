@@ -87,6 +87,80 @@ fn net_requires_inject() {
 }
 
 #[test]
+fn net_accept_without_respond_is_rejected() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let err = should_fail_typecheck(
+        r#"
+    import { Net }, * as net_mod from "std:network"
+
+    let main = fn () -> unit require { PermNet } do
+      inject net_mod.system_handler do
+        try
+          let server = Net.listen(addr: "127.0.0.1:0")
+          let req = Net.accept(server: &server)
+          Net.stop(server: server)
+        catch e ->
+          return ()
+        end
+      end
+      return ()
+    end
+    "#,
+    );
+    insta::assert_snapshot!(err);
+}
+
+#[test]
+fn net_respond_consumes_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    should_typecheck(
+        r#"
+    import { Net }, * as net_mod from "std:network"
+
+    let main = fn () -> unit require { PermNet } do
+      inject net_mod.system_handler do
+        try
+          let server = Net.listen(addr: "127.0.0.1:0")
+          let req = Net.accept(server: &server)
+          Net.respond(req: req, status: 200, body: "ok")
+          Net.stop(server: server)
+        catch e ->
+          return ()
+        end
+      end
+      return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn net_request_double_respond_is_rejected() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let err = should_fail_typecheck(
+        r#"
+    import { Net }, * as net_mod from "std:network"
+
+    let main = fn () -> unit require { PermNet } do
+      inject net_mod.system_handler do
+        try
+          let server = Net.listen(addr: "127.0.0.1:0")
+          let req = Net.accept(server: &server)
+          Net.respond(req: req, status: 200, body: "ok")
+          Net.respond(req: req, status: 200, body: "ok")
+          Net.stop(server: server)
+        catch e ->
+          return ()
+        end
+      end
+      return ()
+    end
+    "#,
+    );
+    insta::assert_snapshot!(err);
+}
+
+#[test]
 fn net_respond_returns_unit_effect_exn() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     should_typecheck(

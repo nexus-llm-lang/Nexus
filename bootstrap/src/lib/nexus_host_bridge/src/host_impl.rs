@@ -430,13 +430,10 @@ fn read_http_request(
 }
 
 fn do_respond(req_id: i64, status: i64, headers: &str, body: &str) -> Result<(), String> {
-    let entry = CONNS.with(|conns| {
-        conns
-            .borrow_mut()
-            .remove(&req_id)
-            .ok_or_else(|| "invalid request id".to_string())
-    })?;
-
+    // Build the wire response before touching CONNS so allocation errors
+    // cannot orphan the entry. Once removed, the entry is owned locally and
+    // unconditionally dropped on every exit path — including write failure —
+    // closing the streams and client socket.
     let mut response = format!(
         "HTTP/1.1 {} {}\r\n",
         status,
@@ -460,14 +457,21 @@ fn do_respond(req_id: i64, status: i64, headers: &str, body: &str) -> Result<(),
     response.push_str("\r\n");
     response.push_str(body);
 
-    entry
+    let entry = CONNS.with(|conns| {
+        conns
+            .borrow_mut()
+            .remove(&req_id)
+            .ok_or_else(|| "invalid request id".to_string())
+    })?;
+
+    let write_result = entry
         .output
         .blocking_write_and_flush(response.as_bytes())
-        .map_err(|_| "failed to write response".to_string())?;
+        .map_err(|_| "failed to write response".to_string());
 
-    // Dropping entry closes streams and client socket
+    // Dropping entry closes streams and client socket regardless of write outcome.
     drop(entry);
-    Ok(())
+    write_result
 }
 
 fn do_stop(server_id: i64) -> Result<(), String> {
