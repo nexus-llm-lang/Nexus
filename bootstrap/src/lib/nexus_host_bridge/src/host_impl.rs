@@ -21,6 +21,22 @@
 //! the same way as `s32` 1/0, but explicit `s32` keeps the WIT signature stable
 //! for both component-model and core-WASM (stub) callers (see `bundler.rs`
 //! `merge_remaining_stubs`, `nxlib/stdlib/nexus_host_stub.wat`).
+//!
+//! ## Canonical headers wire format
+//!
+//! Headers cross the bridge boundary as a single `string` argument with the
+//! canonical line-format
+//!
+//! ```text
+//!     name:value\n
+//! ```
+//!
+//! one header per line, no space after the colon, single-`\n` terminator
+//! (no `\r`), no trailing blank line. The HTTP/1.1 wire form (`name: value\r\n`,
+//! ASCII space, CRLF) is produced/consumed by this module at the socket
+//! boundary only — see `do_respond` (write) and `read_http_request`,
+//! `perform_request` (read). Stdlib (`nxlib/stdlib/network.nx::encode_headers`)
+//! and harness stubs must emit / accept the canonical form.
 
 mod bindings {
     wit_bindgen::generate!({
@@ -30,7 +46,7 @@ mod bindings {
     });
 }
 
-use super::url_guard;
+use super::{headers_codec, url_guard};
 use bindings::wasi::http::outgoing_handler;
 use bindings::wasi::http::types::{Fields, Method, OutgoingBody, OutgoingRequest, Scheme};
 use bindings::wasi::sockets::instance_network::instance_network;
@@ -148,6 +164,7 @@ fn parse_url(url: &str) -> Result<(Scheme, String, String), String> {
     Ok((scheme, authority, path))
 }
 
+/// Lift canonical 'name:value\n' into wasi-http `Fields` (see module doc).
 fn parse_http_headers(headers: &str, authority: &str) -> Fields {
     let mut has_host = false;
     let fields = Fields::new();
@@ -226,6 +243,7 @@ fn perform_request(
     };
     let status = incoming.status();
 
+    // wasi-http Fields → canonical 'name:value\n' (see module doc).
     let mut response_headers = String::new();
     for (name, value) in &incoming.headers().entries() {
         response_headers.push_str(name);
@@ -404,7 +422,7 @@ fn read_http_request(
     let method = parts.next().unwrap_or("GET").to_string();
     let path = parts.next().unwrap_or("/").to_string();
 
-    // Collect headers as "name:value\n" pairs
+    // Wire (HTTP/1.1) → canonical 'name:value\n' (see module doc).
     let mut headers_out = String::new();
     let mut content_length: usize = 0;
     for line in lines {
@@ -459,18 +477,8 @@ fn do_respond(req_id: i64, status: i64, headers: &str, body: &str) -> Result<(),
     );
     response.push_str(&format!("Content-Length: {}\r\n", body.len()));
 
-    for line in headers.lines() {
-        let line = line.trim();
-        if !line.is_empty() {
-            // Convert "name:value" to "name: value\r\n"
-            if let Some((name, value)) = line.split_once(':') {
-                response.push_str(name.trim());
-                response.push_str(": ");
-                response.push_str(value.trim());
-                response.push_str("\r\n");
-            }
-        }
-    }
+    // Canonical 'name:value\n' → wire 'name: value\r\n' (see headers_codec).
+    response.push_str(&headers_codec::canonical_to_wire(headers));
     response.push_str("Connection: close\r\n");
     response.push_str("\r\n");
     response.push_str(body);
