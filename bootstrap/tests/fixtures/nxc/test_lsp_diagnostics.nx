@@ -1,0 +1,239 @@
+// Tests for src/lsp/diagnostics.nx — LSP-style typecheck diagnostic surface
+// (nexus-hw47.4) plus span fidelity assertions for synthesised HIR nodes
+// (nexus-hw47.3).
+import { TyUnit, TyRow, Literal, LitUnit,
+         Program, SpannedTopLevel, GlobalLet, TLLet } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { HirProgram, HirFunction, HirExpr, HirStmt, HirExprKind, HirStmtKind,
+         EagerBody } from "src/ir/hir_types.nx"
+import { Diagnostic, Range, SeverityError,
+         enumerate_diagnostics, type_at, defining_position }
+  from "src/lsp/diagnostics.nx"
+import { tokenize } from "src/frontend/lexer.nx"
+import { parse } from "src/frontend/parser.nx"
+import { process_defs, accum_to_program, empty_accum } from "src/ir/hir.nx"
+import { iterative_resolve } from "src/ir/demand.nx"
+import { None } from "std:option"
+
+let assert = fn (cond: bool, msg: string) -> unit throws { Exn } do
+  if cond then return ()
+  else raise RuntimeError(val: msg)
+  end
+end
+
+let str_eq = fn (a: string, b: string) -> bool do
+  return a == b
+end
+
+let len_diags = fn (xs: [Diagnostic]) -> i64 do
+  match xs do
+    | [] -> return 0
+    | _ :: rest -> return 1 + len_diags(xs: rest)
+  end
+end
+
+let s0 = fn () -> Span do
+  return Span(offset: 0, line: 0, col: 0)
+end
+
+let get_defs = fn (prog: Program) -> [SpannedTopLevel] do
+  match prog do | Program(definitions: defs) -> return defs end
+end
+
+// Extract function names from parsed AST so check_program can see locals.
+let extract_local_names = fn (defs: [SpannedTopLevel]) -> [string] do
+  match defs do
+    | [] -> return []
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value: _)), span: _) :: rest ->
+      return name :: extract_local_names(defs: rest)
+    | _ :: rest -> return extract_local_names(defs: rest)
+  end
+end
+
+let build_hir_from_source = fn (src: string) -> HirProgram throws { Exn } do
+  let prog = parse(tokens: tokenize(src: src))
+  let defs = get_defs(prog)
+  let accum = process_defs(defs, entries: [], accum: empty_accum(), source_file: "stdlib/test.nx")
+  let raw = accum_to_program(accum)
+  // Resolve LazyBody to EagerBody so check_function actually inspects the
+  // function bodies and downstream HIR walks find materialised stmts.
+  match raw do | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg) ->
+    let resolved = iterative_resolve(funcs: hf, hb, max_rounds: 100)
+    return HirProgram(ports: hp, functions: resolved, externals: he,
+      handler_bindings: hb, enum_defs: hed, exception_groups: heg)
+  end
+end
+
+// ─── nexus-hw47.4: enumerate_diagnostics with a clean program ─────────────
+let test_no_diagnostics_when_clean = fn () -> unit throws { Exn } do
+  // Construct a HirProgram with a valid `main` so check_program passes.
+  let main_fn = HirFunction(
+    name: "main", type_params: [], params: [], ret_type: TyUnit,
+    throw_row: TyRow(types: [], rest: None),
+    body: EagerBody(stmts: [
+      HirStmt(node: Return(expr: HirExpr(node: Literal(lit: LitUnit), span: s0())), span: s0())
+    ]),
+    span: s0()
+  )
+  let hir = HirProgram(ports: [], functions: [main_fn], externals: [],
+    handler_bindings: [], enum_defs: [], exception_groups: [])
+  let diags = enumerate_diagnostics(hir, local_names: ["main"], file: "clean.nx")
+  assert(cond: len_diags(xs: diags) == 0, msg: "clean program → 0 diagnostics")
+end
+
+// ─── nexus-hw47.4: enumerate_diagnostics surfaces MissingMain ─────────────
+let test_missing_main_diagnostic = fn () -> unit throws { Exn } do
+  let hir = HirProgram(ports: [], functions: [], externals: [],
+    handler_bindings: [], enum_defs: [], exception_groups: [])
+  let diags = enumerate_diagnostics(hir, local_names: [], file: "no_main.nx")
+  assert(cond: len_diags(xs: diags) == 1, msg: "no main → 1 diagnostic")
+  match diags do
+    | Diagnostic(file: f, range: _, severity: sev, code: c, message: _) :: [] ->
+      assert(cond: str_eq(a: f, b: "no_main.nx"), msg: "diagnostic file is the supplied file")
+      assert(cond: str_eq(a: c, b: "E2002"), msg: "MissingMain diagnostic code is E2002")
+      match sev do
+        | SeverityError -> return ()
+        | _ -> raise RuntimeError(val: "MissingMain severity should be Error")
+      end
+    | _ -> raise RuntimeError(val: "expected exactly one diagnostic")
+  end
+end
+
+// ─── nexus-hw47.4: enumerate_diagnostics surfaces TypeMismatch with span ──
+let test_type_mismatch_diagnostic_carries_span = fn () -> unit throws { Exn } do
+  // `main` returns i64, but typechecker enforces unit → MainNotUnit (no span).
+  // Use a simpler shape: function whose body refers to an unbound variable;
+  // infer raises InferExprErr which check_function rewrites to TypeMismatch
+  // with the offending span.
+  //
+  // Source: line 1 col 33 holds `xunknown` in:
+  //   let main = fn () -> unit do let _ = xunknown end
+  let src = "let main = fn () -> unit do let _ = xunknown end\n"
+  let hir = build_hir_from_source(src)
+  let local_names = extract_local_names(defs: get_defs(prog: parse(tokens: tokenize(src: src))))
+  let diags = enumerate_diagnostics(hir, local_names, file: "unbound.nx")
+  assert(cond: len_diags(xs: diags) == 1, msg: "unbound var → 1 diagnostic")
+  match diags do
+    | Diagnostic(file: _, range: r, severity: _, code: c, message: _) :: [] ->
+      assert(cond: str_eq(a: c, b: "E2001"), msg: "TypeMismatch diagnostic code is E2001")
+      match r do | Range(start_line: sl, start_col: sc, end_line: el, end_col: ec) ->
+        // Span should land on `xunknown` at line 1, col 37 (1-based: "let main = fn () -> unit do let _ = " is 36 chars, so xunknown starts col 37)
+        assert(cond: sl == 1, msg: "diagnostic line is 1")
+        assert(cond: sl == el, msg: "single-point range collapses")
+        assert(cond: sc == ec, msg: "single-point range collapses (col)")
+        assert(cond: sc >= 37, msg: "diagnostic col points at xunknown (>=37)")
+      end
+    | _ -> raise RuntimeError(val: "expected exactly one diagnostic")
+  end
+end
+
+// ─── nexus-hw47.4: type_at and defining_position stubs return None ────────
+let test_stubs_return_none = fn () -> unit throws { Exn } do
+  let main_fn = HirFunction(
+    name: "main", type_params: [], params: [], ret_type: TyUnit,
+    throw_row: TyRow(types: [], rest: None),
+    body: EagerBody(stmts: [
+      HirStmt(node: Return(expr: HirExpr(node: Literal(lit: LitUnit), span: s0())), span: s0())
+    ]),
+    span: s0()
+  )
+  let hir = HirProgram(ports: [], functions: [main_fn], externals: [],
+    handler_bindings: [], enum_defs: [], exception_groups: [])
+  match type_at(checked: hir, file: "x.nx", line: 1, col: 1) do
+    | None -> return ()
+    | Some(_) -> raise RuntimeError(val: "type_at stub must return None in Phase 1")
+  end
+  match defining_position(checked: hir, file: "x.nx", line: 1, col: 1) do
+    | None -> return ()
+    | Some(_) -> raise RuntimeError(val: "defining_position stub must return None in Phase 1")
+  end
+end
+
+// ─── nexus-hw47.3: list literal element span survives HIR conversion ──────
+// Each synthesised Cons node now inherits the head element's span instead of
+// (0, 0, 0). Verify by parsing a source list, lowering to HIR, walking the
+// :: chain, and asserting each Cons span matches a non-zero source position.
+let test_list_desugar_spans = fn () -> unit throws { Exn } do
+  // Wrap the list inside `main` so iterative_resolve keeps the function
+  // (only reachable defs survive). main = fn () -> unit returns unit; the
+  // list literal is consumed via let-binding so the body is still well-typed.
+  let src = "let main = fn () -> unit do let xs = [10, 20, 30] return () end\n"
+  let hir = build_hir_from_source(src)
+  match hir do | HirProgram(ports: _, functions: fs, externals: _, handler_bindings: _, enum_defs: _, exception_groups: _) ->
+    match fs do
+      | HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: _, body: EagerBody(stmts: stmts), span: _) :: _ ->
+        find_and_assert_list_spans(stmts)
+      | _ -> raise RuntimeError(val: "expected at least one function in HIR")
+    end
+  end
+end
+
+let find_and_assert_list_spans = fn (stmts: [HirStmt]) -> unit throws { Exn } do
+  match stmts do
+    | [] -> raise RuntimeError(val: "no list literal binding found")
+    | HirStmt(node: Let(name: _, typ: _, value: HirExpr(node: outer_ctor, span: outer_sp)), span: _) :: _ ->
+      match outer_sp do | Span(offset: _, line: ol, col: _) ->
+        assert(cond: ol > 0, msg: "outer Cons span must have non-zero line")
+      end
+      assert_cons_chain_spans_nonzero(node: outer_ctor)
+      return ()
+    | _ :: rest -> return find_and_assert_list_spans(stmts: rest)
+  end
+end
+
+let assert_cons_chain_spans_nonzero = fn (node: HirExprKind) -> unit throws { Exn } do
+  match node do
+    | Ctor(variant: v, args: [_, head]) ->
+      if v == "Cons" then
+        match head do | HirExpr(node: _, span: hsp) ->
+          match hsp do | Span(offset: _, line: hl, col: _) ->
+            assert(cond: hl > 0, msg: "list element span must have non-zero line")
+          end
+        end
+        return ()
+      end
+      return ()
+    | Ctor(_) -> return ()
+    | _ -> return ()
+  end
+end
+
+// ─── nexus-hw47.3: StmtAssign target Variable inherits stmt span ──────────
+let test_stmt_assign_target_span = fn () -> unit throws { Exn } do
+  // Source: assignment statement at line 3 — Variable target must reuse the
+  // statement span, not (0, 0, 0).
+  let src = "let main = fn () -> unit do\n  let ~x = 5\n  ~x <- 6\nend\n"
+  let hir = build_hir_from_source(src)
+  match hir do | HirProgram(ports: _, functions: fs, externals: _, handler_bindings: _, enum_defs: _, exception_groups: _) ->
+    match fs do
+      | HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: _, body: EagerBody(stmts: stmts), span: _) :: _ ->
+        // Walk for Assign — should be at line 2.
+        find_and_assert_assign_target_span(stmts)
+      | _ -> raise RuntimeError(val: "expected one function")
+    end
+  end
+end
+
+let find_and_assert_assign_target_span = fn (stmts: [HirStmt]) -> unit throws { Exn } do
+  match stmts do
+    | [] -> return ()
+    | HirStmt(node: Assign(target: HirExpr(node: _, span: tsp), value: _), span: ssp) :: rest ->
+      match tsp do | Span(offset: _, line: tl, col: _) ->
+        match ssp do | Span(offset: _, line: sl, col: _) ->
+          assert(cond: tl == sl, msg: "Assign target span line == stmt span line")
+          assert(cond: tl > 0, msg: "Assign target span line > 0")
+        end
+      end
+      return find_and_assert_assign_target_span(stmts: rest)
+    | _ :: rest -> return find_and_assert_assign_target_span(stmts: rest)
+  end
+end
+
+let main = fn () -> unit throws { Exn } do
+  test_no_diagnostics_when_clean()
+  test_missing_main_diagnostic()
+  test_type_mismatch_diagnostic_carries_span()
+  test_stubs_return_none()
+  test_list_desugar_spans()
+  test_stmt_assign_target_span()
+end

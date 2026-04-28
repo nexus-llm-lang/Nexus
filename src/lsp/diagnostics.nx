@@ -1,0 +1,204 @@
+/**
+ * lsp/diagnostics: Position-keyed query surface for LSP-style consumers.
+ *
+ * Exposes three Phase 1/1.5 entry points layered over `src/typecheck/check.nx`:
+ *
+ *   enumerate_diagnostics(hir, local_names, file)
+ *       -> [Diagnostic]    — non-raising; collects typecheck failures with
+ *                            file/line/col ranges and severity.
+ *   type_at(checked, file, line, col)
+ *       -> Option<TypeExpr>  (Phase 1.5 stub; shape locked here.)
+ *   defining_position(checked, file, line, col)
+ *       -> Option<DefiningPosition>  (Phase 1.5 stub; shape locked here.)
+ *
+ * Existing typecheck callers (driver.nx) stay on `tc.check_program` and are
+ * unaffected — `enumerate_diagnostics` runs the same checker inside a
+ * try/catch and converts the first raised CompileError into a Diagnostic.
+ *
+ * Multi-error accumulation per file is Phase 2; this Phase 1 surface emits at
+ * most one Diagnostic per call (the first checker failure). See the parent
+ * epic nexus-hw47 for follow-ups on per-function continuation and richer
+ * range derivation.
+ */
+
+import { TypeExpr } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { HirProgram } from "src/ir/hir_types.nx"
+import {
+  TypeMismatch, MissingMain, MainNotFunction, MainNotUnit,
+  LazyBindingUnused, LazyBindingDoubleUse,
+  UnexpectedToken, UnexpectedEof, LexError,
+  format_error
+} from "src/common/error.nx"
+import * as tc from "src/typecheck/check.nx"
+import { Option, Some, None } from "std:option"
+
+// ─── Severity ────────────────────────────────────────────────────────────────
+
+export type Severity =
+  SeverityError
+  | SeverityWarning
+  | SeverityInformation
+  | SeverityHint
+
+// ─── Range ───────────────────────────────────────────────────────────────────
+
+/// A 1-based (line, column) range within a single file. Both endpoints are
+/// inclusive. `start` and `end` collapse to the same span point until the
+/// Phase 2 widening pass derives true end-of-token offsets — single-point
+/// ranges are still actionable for LSP clients (highlighting a caret point).
+export type Range = Range(
+  start_line: i64,
+  start_col: i64,
+  end_line: i64,
+  end_col: i64
+)
+
+// ─── Diagnostic ──────────────────────────────────────────────────────────────
+
+export type Diagnostic = Diagnostic(
+  file: string,
+  range: Range,
+  severity: Severity,
+  /// Numeric error code (e.g. `E2001`) when known, otherwise empty string.
+  code: string,
+  message: string
+)
+
+// ─── DefiningPosition (textDocument/definition) ──────────────────────────────
+
+export type DefiningPosition = DefiningPosition(
+  file: string,
+  range: Range
+)
+
+// ─── Public entry point: enumerate_diagnostics ───────────────────────────────
+
+/// Run the typechecker, capturing the first CompileError as a Diagnostic.
+/// Returns an empty list when typecheck succeeds.
+///
+/// `file` is the source path that the caller associates with `hir`. Spans
+/// inside `hir` carry only (offset, line, col) — no file identity — so the
+/// diagnostic file is supplied by the caller. When typecheck reports an error
+/// in a function whose origin is an imported module, the returned diagnostic
+/// still carries `file` (the entry file); cross-file association is a Phase 2
+/// concern (would require threading source_file through the HIR per node).
+export let enumerate_diagnostics = fn (
+  hir: HirProgram,
+  local_names: [string],
+  file: string
+) -> [Diagnostic] do
+  try
+    let _ = tc.check_program(hir, local_names)
+    return []
+  catch err -> return [diagnostic_from_error(err, file)]
+  end
+end
+
+// ─── Public entry point: type_at (Phase 1.5 stub) ────────────────────────────
+
+/// Return the inferred type of the AST node whose source span contains
+/// (line, col), if any. Phase 1.5 returns `None` unconditionally — the
+/// position-indexed type table is built in nexus-hw47.5 and consumed here
+/// without changing this signature.
+///
+/// Coordinates are 1-based (line, col), matching `Span` / LSP text positions.
+export let type_at = fn (
+  checked: HirProgram,
+  file: string,
+  line: i64,
+  col: i64
+) -> Option<TypeExpr> do
+  let _ = checked
+  let _ = file
+  let _ = line
+  let _ = col
+  return None
+end
+
+// ─── Public entry point: defining_position (Phase 1.5 stub) ──────────────────
+
+/// Return the source range that defines the symbol referenced at
+/// (file, line, col). Phase 1.5 returns `None` unconditionally — the
+/// definition-site index is built in nexus-hw47.6 and consumed here without
+/// changing this signature.
+export let defining_position = fn (
+  checked: HirProgram,
+  file: string,
+  line: i64,
+  col: i64
+) -> Option<DefiningPosition> do
+  let _ = checked
+  let _ = file
+  let _ = line
+  let _ = col
+  return None
+end
+
+// ─── Internal: error → Diagnostic ────────────────────────────────────────────
+
+/// Map each CompileError variant whose span is known to a Diagnostic. Other
+/// variants (MissingMain, MainNotFunction, MainNotUnit) lack a source span;
+/// they collapse onto (1, 1) since they are file-level invariants rather than
+/// pointing at specific syntax. `format_error` provides the user-visible
+/// message; `code` mirrors the bracketed error code in that message.
+let diagnostic_from_error = fn (err: Exn, file: string) -> Diagnostic do
+  match err do
+    | TypeMismatch(func_name: _, detail: _, span: sp) ->
+      return Diagnostic(file, range: range_from_span(sp),
+        severity: SeverityError, code: "E2001", message: format_error(err))
+    | LazyBindingUnused(name: _, span: sp) ->
+      return Diagnostic(file, range: range_from_span(sp),
+        severity: SeverityError, code: "E2005", message: format_error(err))
+    | LazyBindingDoubleUse(name: _, span: sp) ->
+      return Diagnostic(file, range: range_from_span(sp),
+        severity: SeverityError, code: "E2006", message: format_error(err))
+    | UnexpectedToken(expected: _, got: _, span: sp) ->
+      return Diagnostic(file, range: range_from_span(sp),
+        severity: SeverityError, code: "E1001", message: format_error(err))
+    | UnexpectedEof(expected: _, span: sp) ->
+      return Diagnostic(file, range: range_from_span(sp),
+        severity: SeverityError, code: "E1002", message: format_error(err))
+    | LexError(message: _, span: opt_sp) ->
+      return Diagnostic(file, range: range_from_optional_span(osp: opt_sp),
+        severity: SeverityError, code: "E1000", message: format_error(err))
+    | MissingMain ->
+      return Diagnostic(file, range: file_origin_range(),
+        severity: SeverityError, code: "E2002", message: format_error(err))
+    | MainNotFunction ->
+      return Diagnostic(file, range: file_origin_range(),
+        severity: SeverityError, code: "E2003", message: format_error(err))
+    | MainNotUnit ->
+      return Diagnostic(file, range: file_origin_range(),
+        severity: SeverityError, code: "E2004", message: format_error(err))
+    | _ ->
+      // Any other CompileError variant (Hir/MIR/LIR/Codegen/Driver) reaches
+      // here. Use format_error for the message and a file-origin range — the
+      // diagnostic remains actionable even though phase-specific spans are
+      // not surfaced yet.
+      return Diagnostic(file, range: file_origin_range(),
+        severity: SeverityError, code: "", message: format_error(err))
+  end
+end
+
+// ─── Span helpers ────────────────────────────────────────────────────────────
+
+let range_from_span = fn (sp: Span) -> Range do
+  match sp do | Span(offset: _, line: l, col: c) ->
+    return Range(start_line: l, start_col: c, end_line: l, end_col: c)
+  end
+end
+
+let range_from_optional_span = fn (osp: Option<Span>) -> Range do
+  match osp do
+    | Some(val: s) -> return range_from_span(sp: s)
+    | None -> return file_origin_range()
+  end
+end
+
+/// Sentinel range for diagnostics whose underlying error has no source span
+/// (e.g. MissingMain). Picks (1, 1) — the file's first character — so LSP
+/// clients render the marker on line 1 instead of a phantom line 0.
+let file_origin_range = fn () -> Range do
+  return Range(start_line: 1, start_col: 1, end_line: 1, end_col: 1)
+end
