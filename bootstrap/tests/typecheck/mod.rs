@@ -6,6 +6,7 @@ pub mod ffi;
 pub mod fuzz;
 pub mod inference;
 pub mod linear;
+pub mod linearity;
 pub mod modules;
 pub mod ports;
 pub mod properties;
