@@ -4,7 +4,7 @@ use crate::harness::{should_fail_typecheck, should_typecheck};
 fn proc_exit_typechecks_with_perm_proc() {
     should_typecheck(
         r#"
-import { Proc }, * as proc_mod from "std:process"
+import { Proc }, * as proc_mod from "std:proc"
 
 let main = fn () -> unit require { PermProc } do
   inject proc_mod.system_handler do
@@ -19,7 +19,7 @@ end
 fn proc_exit_requires_perm_proc() {
     let err = should_fail_typecheck(
         r#"
-import { Proc }, * as proc_mod from "std:process"
+import { Proc }, * as proc_mod from "std:proc"
 
 let main = fn () -> unit do
   inject proc_mod.system_handler do
@@ -35,7 +35,7 @@ end
 fn proc_port_with_mock_handler() {
     should_typecheck(
         r#"
-import { Proc, ExecResult } from "std:process"
+import { Proc, ExecResult } from "std:proc"
 
 let mock_proc = handler Proc do
   fn exit(status: i64) -> unit do

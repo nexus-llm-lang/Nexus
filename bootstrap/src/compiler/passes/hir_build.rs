@@ -622,7 +622,7 @@ impl MirBuilder {
                                 && params[0].typ == Type::List(Box::new(Type::String))
                             {
                                 let proc_import = Import {
-                                    path: "stdlib/process.nx".to_string(),
+                                    path: "stdlib/proc.nx".to_string(),
                                     alias: None,
                                     items: vec![ImportItem {
                                         name: "argv".to_string(),

@@ -13,8 +13,8 @@ mod bindings {
 }
 
 use bindings::exports::nexus::r#std::{
-    bytebuffer, clock, collections, core as nx_core, environment, filesystem, math, network,
-    process, random, stdio, string_ops,
+    bytebuffer, clock, collections, core as nx_core, env, fs, math, network,
+    proc, rand, stdio, str,
 };
 
 // ---------------------------------------------------------------------------
@@ -85,10 +85,10 @@ impl math::Guest for StdlibComponent {
 }
 
 // ---------------------------------------------------------------------------
-// String Ops
+// Str
 // ---------------------------------------------------------------------------
 
-impl string_ops::Guest for StdlibComponent {
+impl str::Guest for StdlibComponent {
     fn string_length(s: String) -> i64 {
         nexus_string_wasm::__nx_string_length(s.as_ptr() as i32, s.len() as i32)
     }
@@ -280,7 +280,7 @@ impl stdio::Guest for StdlibComponent {
 // Filesystem
 // ---------------------------------------------------------------------------
 
-impl filesystem::Guest for StdlibComponent {
+impl fs::Guest for StdlibComponent {
     fn read_to_string(path: String) -> String {
         let packed = nexus_fs_wasm::__nx_read_to_string(path.as_ptr() as i32, path.len() as i32);
         unpack_string(packed)
@@ -387,7 +387,7 @@ impl network::Guest for StdlibComponent {
 // Process
 // ---------------------------------------------------------------------------
 
-impl process::Guest for StdlibComponent {
+impl proc::Guest for StdlibComponent {
     fn exit(status: i64) {
         nexus_proc_wasm::__nx_exit(status);
     }
@@ -420,7 +420,7 @@ impl process::Guest for StdlibComponent {
 // Environment
 // ---------------------------------------------------------------------------
 
-impl environment::Guest for StdlibComponent {
+impl env::Guest for StdlibComponent {
     fn get_env(key: String) -> String {
         let packed = nexus_proc_wasm::__nx_get_env(key.as_ptr() as i32, key.len() as i32);
         unpack_string(packed)
@@ -455,7 +455,7 @@ impl clock::Guest for StdlibComponent {
 // Random
 // ---------------------------------------------------------------------------
 
-impl random::Guest for StdlibComponent {
+impl rand::Guest for StdlibComponent {
     fn random_i64() -> i64 {
         nexus_random_wasm::__nx_random_i64()
     }

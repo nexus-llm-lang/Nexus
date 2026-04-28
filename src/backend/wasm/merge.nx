@@ -1,5 +1,5 @@
 /**
- * wasm_merge: stdlib-merge phase — links the compiler-emitted core WASM with
+ * wasm/merge: stdlib-merge phase — links the compiler-emitted core WASM with
  * the precompiled stdlib.wasm and the runtime layer to produce a self-contained
  * module.
  *
@@ -12,16 +12,51 @@
  *   parallel to produce one merged output
  *
  * Does not own:
- * - Generic WASM binary decode (ULEB/SLEB) — see src/backend/wasm_read.nx
- * - Section-layout constants / opcodes — see src/backend/wasm_defs.nx
- * - Individual section emission primitives — see src/backend/wasm_section.nx
+ * - Generic WASM binary decode (ULEB/SLEB) — see src/backend/wasm/read.nx
+ * - Section-layout constants / opcodes — see src/backend/wasm/defs.nx
+ * - Individual section emission primitives — see src/backend/wasm/section.nx
  *
  * Consumers: src/driver.nx calls merge_with_stdlib at the end of the pipeline.
  */
 import { ByteBuffer }, * as bb from "std:bytebuffer"
 import { StringMap }, * as sm from "std:stringmap"
-import * as str from "std:string_ops"
-import { SlebRes, pack, pval, ppos, rd_uleb, rd_sleb, scan_sleb_end, uleb_size } from "src/backend/wasm_read.nx"
+import * as str from "std:str"
+import { SlebRes, pack, pval, ppos, rd_uleb, rd_sleb, scan_sleb_end, uleb_size } from "src/backend/wasm/read.nx"
+import { op_block, op_loop, op_if, op_legacy_try, op_throw, op_br, op_br_if, op_br_table,
+         op_call, op_call_indirect, op_return_call, op_drop,
+         op_local_get, op_local_set, op_local_tee,
+         op_global_get, op_global_set, op_table_get, op_table_set,
+         op_memory_size, op_memory_grow,
+         op_i32_const, op_i64_const, op_f64_const,
+         op_i32_load, op_i64_store32,
+         op_ref_null, op_ref_func, op_fc_prefix,
+         op_cont_new, op_cont_bind, op_suspend, op_resume,
+         op_end, bt_void, wasm_form_func, form_cont,
+         op_fc_memory_init, op_fc_memory_copy, op_fc_memory_fill,
+         op_fc_table_init, op_fc_table_copy,
+         vt_ref_null_ht, vt_ref_ht } from "src/backend/wasm/defs.nx"
+
+// ─── Operand-decode classes (rw_instrs) ──────────────────────────────────
+// Each opcode maps to one of these classes; the class then drives how
+// rw_instrs reads/copies the operand bytes after the opcode byte.
+let cls_no_operand   = 0   // already-pushed opcode byte; no operand to copy
+let cls_uleb         = 1   // single ULEB (no remap needed)
+let cls_call_indirect = 2   // type_idx (+ type_off), table_idx (+ tbl_off)
+let cls_blocktype    = 3   // blocktype byte or sleb heaptype
+let cls_sleb         = 4   // single SLEB128 (i32/i64 const)
+let cls_f64          = 5   // 8 raw bytes (f64.const)
+let cls_memarg       = 6   // 2 ULEBs (load/store: align, offset)
+let cls_mem_idx_byte = 7   // single byte (memory.size/grow memory index)
+let cls_br_table     = 8   // ULEB count + (count+1) ULEB labels
+let cls_legacy_try   = 9   // blocktype + ULEB count + (ULEB,ULEB) handlers
+let cls_fc_prefix    = 10  // 0xFC sub-opcode dispatch
+let cls_call         = 11  // call/return_call (remap func idx)
+let cls_global       = 12  // global.get/set (add glo_off)
+let cls_ref_func     = 13  // ref.func (remap func idx)
+let cls_cont_new     = 14
+let cls_cont_bind    = 15
+let cls_resume       = 16
+let cls_table        = 17  // table.get/set (add tbl_off)
 
 // ─── Dense i32 array (int→int table) ─────────────────────────────────────
 // Thin wrapper over stdlib ByteBuffer — avoids the from_i64 string allocation
@@ -43,7 +78,7 @@ end
 
 // Multi-return records for readers that advance position.
 // StrPos: rd_str returns parsed string + position after string bytes.
-// SlebRes (imported from wasm_read.nx): rd_sleb returns decoded signed value + position after terminal byte.
+// SlebRes (imported from wasm/read.nx): rd_sleb returns decoded signed value + position after terminal byte.
 // BufPos: sub-emitters that consume src bytes return new buf + new src position.
 // RwCtx: type / table / global offsets applied during instruction rewriting.
 //        The remap intarr is passed as a separate &ByteBuffer borrow (rw_instrs
@@ -429,76 +464,67 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
   let op = bb.get_byte(buf: src, idx: pos)
   let pos = pos + 1
 
-  // Classify opcode into handling groups:
-  // 0 = no operand, 1 = single ULEB (no remap), 2 = call_indirect (type_off + tbl_off),
-  // 3 = blocktype, 4 = sleb, 5 = f64 (8 bytes), 6 = memarg (2 ULEBs, load/store),
-  // 7 = mem index byte, 8 = br_table, 9 = try_table, 10 = 0xFC prefix,
-  // 11 = call/return_call (remap func idx), 12 = global.get/set (add glo_off),
-  // 13 = ref.func (remap func idx), 17 = table.get/set (add tbl_off)
-  let cls = if op >= 40 then
-    if op <= 62 then 6
-    else if op == 63 then 7
-    else if op == 64 then 7
-    else if op == 65 then 4
-    else if op == 66 then 4
-    else if op == 68 then 5
-    else if op == 210 then 13
-    else if op == 224 then 14
-    else if op == 225 then 15
-    else if op == 226 then 1
-    else if op == 227 then 16
-    else if op == 252 then 10
-    else 0
+  // Classify opcode into one of cls_* handling groups (see definitions above).
+  // Single flat else-if chain: Nexus's parser collapses `else if` into one
+  // chain, so two separate if-trees stitched with an outer `else (newline) if`
+  // double-nest beyond what the chain-collapsing logic can close. Keep flat.
+  let cls = if op_i32_load <= op && op <= op_i64_store32 then cls_memarg
+    else if op == op_memory_size then cls_mem_idx_byte
+    else if op == op_memory_grow then cls_mem_idx_byte
+    else if op == op_i32_const then cls_sleb
+    else if op == op_i64_const then cls_sleb
+    else if op == op_f64_const then cls_f64
+    else if op == op_ref_func then cls_ref_func
+    else if op == op_cont_new then cls_cont_new
+    else if op == op_cont_bind then cls_cont_bind
+    else if op == op_suspend then cls_uleb
+    else if op == op_resume then cls_resume
+    else if op == op_fc_prefix then cls_fc_prefix
+    else if op == op_block then cls_blocktype
+    else if op == op_loop then cls_blocktype
+    else if op == op_if then cls_blocktype
+    else if op == op_legacy_try then cls_legacy_try
+    else if op == op_throw then cls_uleb
+    else if op == op_br then cls_uleb
+    else if op == op_br_if then cls_uleb
+    else if op == op_br_table then cls_br_table
+    else if op == op_call then cls_call
+    else if op == op_call_indirect then cls_call_indirect
+    else if op == op_return_call then cls_call
+    else if op == op_local_get then cls_uleb
+    else if op == op_local_set then cls_uleb
+    else if op == op_local_tee then cls_uleb
+    else if op == op_global_get then cls_global
+    else if op == op_global_set then cls_global
+    else if op == op_table_get then cls_table
+    else if op == op_table_set then cls_table
+    else cls_no_operand
     end
-  else
-    match op do
-      | 2 -> 3
-      | 3 -> 3
-      | 4 -> 3
-      | 6 -> 9
-      | 8 -> 1
-      | 12 -> 1
-      | 13 -> 1
-      | 14 -> 8
-      | 16 -> 11
-      | 17 -> 2
-      | 18 -> 11
-      | 32 -> 1
-      | 33 -> 1
-      | 34 -> 1
-      | 35 -> 12
-      | 36 -> 12
-      | 37 -> 17
-      | 38 -> 17
-      | _ -> 0
-    end
-  end
 
   let RwCtx(type_off, tbl_off, glo_off) = ctx
 
   // Handle each class — flat if-return-end pattern for TCO + typechecker compat
   let %out = bb.push_byte(buf: %out, byte: op)
 
-  if cls == 1 then
+  if cls == cls_uleb then
     // Single ULEB (local.get/set/tee, br, br_if, etc.) — no remap needed.
     // Span-copy avoids rd_uleb (recursive shl arithmetic) + push_uleb128 re-encoding.
     let end1 = scan_sleb_end(buf: src, pos)
     let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: end1)
     return rw_instrs(ctx, remap, %out, src, pos: end1, end_pos)
   end
-  if cls == 2 then
-    // call_indirect: type_idx (+ type_off), table_idx (+ tbl_off)
+  if cls == cls_call_indirect then
     let pk = rd_uleb(buf: src, pos)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk) + type_off)
     let pk2 = rd_uleb(buf: src, pos: ppos(pk))
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2) + tbl_off)
     return rw_instrs(ctx, remap, %out, src, pos: ppos(pk: pk2), end_pos)
   end
-  if cls == 3 then
+  if cls == cls_blocktype then
     let BufPos(buf: %out, pos) = rw_blocktype_operand(%out, src, pos, type_off)
     return rw_instrs(ctx, remap, %out, src, pos, end_pos)
   end
-  if cls == 4 then
+  if cls == cls_sleb then
     // SLEB operand: no remap needed, just copy bytes verbatim.
     // Find terminal byte (first byte < 128 or >= 128 flipped — i.e., high bit clear)
     // and bulk-copy. Avoids rd_sleb entirely (which was hitting a codegen quirk).
@@ -506,22 +532,22 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
     let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: end_sleb)
     return rw_instrs(ctx, remap, %out, src, pos: end_sleb, end_pos)
   end
-  if cls == 5 then
+  if cls == cls_f64 then
     let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: pos + 8)
     return rw_instrs(ctx, remap, %out, src, pos: pos + 8, end_pos)
   end
-  if cls == 6 then
+  if cls == cls_memarg then
     // Memarg (align + offset) on load/store — 2 ULEBs, no remap. Span-copy.
     let end1 = scan_sleb_end(buf: src, pos)
     let end2 = scan_sleb_end(buf: src, pos: end1)
     let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: end2)
     return rw_instrs(ctx, remap, %out, src, pos: end2, end_pos)
   end
-  if cls == 7 then
+  if cls == cls_mem_idx_byte then
     let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
     return rw_instrs(ctx, remap, %out, src, pos: pos + 1, end_pos)
   end
-  if cls == 8 then
+  if cls == cls_br_table then
     // br_table: ULEB count + (count+1) ULEB labels — no remap. Span-copy the whole run.
     let pk = rd_uleb(buf: src, pos)
     let count = pval(pk)
@@ -529,7 +555,7 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
     let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: all_end)
     return rw_instrs(ctx, remap, %out, src, pos: all_end, end_pos)
   end
-  if cls == 9 then
+  if cls == cls_legacy_try then
     let BufPos(buf: %out, pos) = rw_blocktype_operand(%out, src, pos, type_off)
     let pk = rd_uleb(buf: src, pos)
     let n_handlers = pval(pk)
@@ -537,14 +563,14 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
     let BufPos(buf: %out, pos) = copy_try_handlers(%out, src, pos: ppos(pk), remaining: n_handlers)
     return rw_instrs(ctx, remap, %out, src, pos, end_pos)
   end
-  if cls == 10 then
+  if cls == cls_fc_prefix then
     let pk = rd_uleb(buf: src, pos)
     let sub_op = pval(pk)
     let %out = bb.push_uleb128(buf: %out, val: sub_op)
     let BufPos(buf: %out, pos) = rw_fc_prefix(%out, src, pos: ppos(pk), sub_op)
     return rw_instrs(ctx, remap, %out, src, pos, end_pos)
   end
-  if cls == 11 then
+  if cls == cls_call then
     // call / return_call: remap function index via intarr (dense i32 lookup)
     let pk = rd_uleb(buf: src, pos)
     let old_idx = pval(pk)
@@ -552,13 +578,13 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
     let %out = bb.push_uleb128(buf: %out, val: new_idx)
     return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
   end
-  if cls == 12 then
+  if cls == cls_global then
     // global.get / global.set: add glo_off to index
     let pk = rd_uleb(buf: src, pos)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk) + glo_off)
     return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
   end
-  if cls == 13 then
+  if cls == cls_ref_func then
     // ref.func: remap function index via intarr
     let pk = rd_uleb(buf: src, pos)
     let old_idx = pval(pk)
@@ -566,13 +592,13 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
     let %out = bb.push_uleb128(buf: %out, val: new_idx)
     return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
   end
-  if cls == 14 then
+  if cls == cls_cont_new then
     // cont.new / cont.bind-single: type index + type_off
     let pk = rd_uleb(buf: src, pos)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk) + type_off)
     return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
   end
-  if cls == 15 then
+  if cls == cls_cont_bind then
     // cont.bind: two type indices, both + type_off
     let pk1 = rd_uleb(buf: src, pos)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk1) + type_off)
@@ -580,7 +606,7 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2) + type_off)
     return rw_instrs(ctx, remap, %out, src, pos: ppos(pk: pk2), end_pos)
   end
-  if cls == 16 then
+  if cls == cls_resume then
     // resume: cont type index + type_off, then handler table (pass-through)
     let pk = rd_uleb(buf: src, pos)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk) + type_off)
@@ -590,40 +616,40 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
     let BufPos(buf: %out, pos: after_ht) = copy_resume_handlers(%out, src, pos: ppos(pk: pk2), remaining: n_ht)
     return rw_instrs(ctx, remap, %out, src, pos: after_ht, end_pos)
   end
-  if cls == 17 then
+  if cls == cls_table then
     let pk = rd_uleb(buf: src, pos)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk) + tbl_off)
     return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
   end
-  // cls == 0: no operand, already pushed byte
+  // cls_no_operand: no operand, already pushed byte
   return rw_instrs(ctx, remap, %out, src, pos, end_pos)
 end
 
 // Handle 0xFC prefix sub-opcodes (extracted to avoid deep nesting)
 let rw_fc_prefix = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, sub_op: i64) -> BufPos do
   if sub_op <= 7 then return BufPos(buf: %out, pos) end
-  if sub_op == 10 then
+  if sub_op == op_fc_memory_copy then
     let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
     let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos + 1))
     return BufPos(buf: %out, pos: pos + 2)
   end
-  if sub_op == 11 then
+  if sub_op == op_fc_memory_fill then
     let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
     return BufPos(buf: %out, pos: pos + 1)
   end
-  if sub_op >= 8 then
+  if sub_op >= op_fc_memory_init then
     let pk2 = rd_uleb(buf: src, pos)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2))
-    if sub_op == 8 then
+    if sub_op == op_fc_memory_init then
       let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: ppos(pk: pk2)))
       return BufPos(buf: %out, pos: ppos(pk: pk2) + 1)
     end
-    if sub_op == 12 then
+    if sub_op == op_fc_table_init then
       let pk3 = rd_uleb(buf: src, pos: ppos(pk: pk2))
       let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk3))
       return BufPos(buf: %out, pos: ppos(pk: pk3))
     end
-    if sub_op == 14 then
+    if sub_op == op_fc_table_copy then
       let pk3 = rd_uleb(buf: src, pos: ppos(pk: pk2))
       let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk3))
       return BufPos(buf: %out, pos: ppos(pk: pk3))
@@ -637,10 +663,11 @@ end
 let rw_blocktype_operand = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, type_off: i64) -> BufPos do
   let b = bb.get_byte(buf: src, idx: pos)
   // void blocktype (0x40) or valtype (>= 0x60)
-  if b == 64 then
-    return BufPos(buf: bb.push_byte(buf: %out, byte: 64), pos: pos + 1)
+  if b == bt_void then
+    return BufPos(buf: bb.push_byte(buf: %out, byte: bt_void), pos: pos + 1)
   end
-  if b >= 96 then
+  // Blocktype encoded as a single valtype byte (0x60+ — covers vt_* and ref-tags).
+  if b >= wasm_form_func then
     return BufPos(buf: bb.push_byte(buf: %out, byte: b), pos: pos + 1)
   end
   // Type index as sleb
@@ -708,22 +735,22 @@ end
 let skip_n_valtypes = fn (src: &ByteBuffer, pos: i64, remaining: i64) -> i64 do
   if remaining <= 0 then return pos end
   let b = bb.get_byte(buf: src, idx: pos)
-  if b == 99 then return skip_n_valtypes(src, pos: scan_sleb_end(buf: src, pos: pos + 1), remaining: remaining - 1) end
-  if b == 100 then return skip_n_valtypes(src, pos: scan_sleb_end(buf: src, pos: pos + 1), remaining: remaining - 1) end
+  if b == vt_ref_null_ht then return skip_n_valtypes(src, pos: scan_sleb_end(buf: src, pos: pos + 1), remaining: remaining - 1) end
+  if b == vt_ref_ht then return skip_n_valtypes(src, pos: scan_sleb_end(buf: src, pos: pos + 1), remaining: remaining - 1) end
   return skip_n_valtypes(src, pos: pos + 1, remaining: remaining - 1)
 end
 
 let emit_valtypes_off = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64, off: i64) -> %ByteBuffer do
   if remaining <= 0 then return %out end
   let b = bb.get_byte(buf: src, idx: pos)
-  if b == 99 then
-    let %out = bb.push_byte(buf: %out, byte: 99)
+  if b == vt_ref_null_ht then
+    let %out = bb.push_byte(buf: %out, byte: vt_ref_null_ht)
     let SlebRes(val: heap_idx, pos: next) = rd_sleb(buf: src, pos: pos + 1)
     let %out = bb.push_sleb128(buf: %out, val: heap_idx + off)
     return emit_valtypes_off(%out, src, pos: next, remaining: remaining - 1, off)
   end
-  if b == 100 then
-    let %out = bb.push_byte(buf: %out, byte: 100)
+  if b == vt_ref_ht then
+    let %out = bb.push_byte(buf: %out, byte: vt_ref_ht)
     let SlebRes(val: heap_idx, pos: next) = rd_sleb(buf: src, pos: pos + 1)
     let %out = bb.push_sleb128(buf: %out, val: heap_idx + off)
     return emit_valtypes_off(%out, src, pos: next, remaining: remaining - 1, off)
@@ -734,7 +761,7 @@ end
 
 let skip_one_type_entry = fn (src: &ByteBuffer, pos: i64) -> i64 do
   let form = bb.get_byte(buf: src, idx: pos)
-  if form == 93 then
+  if form == form_cont then
     let SlebRes(val: _, pos: next) = rd_sleb(buf: src, pos: pos + 1)
     return next
   end
@@ -746,8 +773,8 @@ end
 
 let copy_one_type_entry_off = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, off: i64) -> %ByteBuffer do
   let form = bb.get_byte(buf: src, idx: pos)
-  if form == 93 then
-    let %out = bb.push_byte(buf: %out, byte: 93)
+  if form == form_cont then
+    let %out = bb.push_byte(buf: %out, byte: form_cont)
     let SlebRes(val: tidx, pos: _) = rd_sleb(buf: src, pos: pos + 1)
     return bb.push_sleb128(buf: %out, val: tidx + off)
   end
@@ -838,7 +865,7 @@ end
 let copy_globals_with_type_off = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64, off: i64) -> %ByteBuffer do
   if remaining <= 0 then return %out end
   let vt = bb.get_byte(buf, idx: pos)
-  if vt == 99 || vt == 100 then
+  if vt == vt_ref_null_ht || vt == vt_ref_ht then
     let %out = bb.push_byte(buf: %out, byte: vt)
     let SlebRes(val: tv, pos: tp) = rd_sleb(buf, pos: pos + 1)
     let %out = bb.push_sleb128(buf: %out, val: tv + off)
@@ -846,8 +873,8 @@ let copy_globals_with_type_off = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i6
     let %out = bb.push_byte(buf: %out, byte: mut_byte)
     let init_start = tp + 1
     let init_op = bb.get_byte(buf, idx: init_start)
-    if init_op == 208 then
-      let %out = bb.push_byte(buf: %out, byte: 208)
+    if init_op == op_ref_null then
+      let %out = bb.push_byte(buf: %out, byte: op_ref_null)
       let SlebRes(val: tv2, pos: tp2) = rd_sleb(buf, pos: init_start + 1)
       let %out = bb.push_sleb128(buf: %out, val: tv2 + off)
       let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf, idx: tp2))
@@ -868,7 +895,7 @@ end
 
 let scan_to_end = fn (buf: &ByteBuffer, pos: i64) -> i64 do
   let b = bb.get_byte(buf, idx: pos)
-  if b == 11 then return pos + 1 end
+  if b == op_end then return pos + 1 end
   return scan_to_end(buf, pos: pos + 1)
 end
 
@@ -921,7 +948,7 @@ let emit_stub_bodies = fn (out: %ByteBuffer, i: i64, n: i64) -> %ByteBuffer do
   let %out = bb.push_uleb128(buf: %out, val: 3)
   let %out = bb.push_byte(buf: %out, byte: 0)
   let %out = bb.push_byte(buf: %out, byte: 0)
-  let %out = bb.push_byte(buf: %out, byte: 11)
+  let %out = bb.push_byte(buf: %out, byte: op_end)
   return emit_stub_bodies(%out, i: i + 1, n)
 end
 

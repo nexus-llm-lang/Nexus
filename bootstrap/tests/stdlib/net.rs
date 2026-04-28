@@ -92,7 +92,7 @@ fn net_respond_returns_unit_effect_exn() {
     should_typecheck(
         r#"
 import { Net }, * as net_mod from "std:network"
-import { length } from "std:string_ops"
+import { length } from "std:str"
 
 let main = fn () -> unit require { PermNet } do
   inject net_mod.system_handler do

@@ -39,7 +39,7 @@ pub fn resolve_import_to_file(module_name: &str) -> String {
 /// Resolves an `import external "<path>"` directive to the WIT module name
 /// that subsequent `external` declarations should bind to.
 ///
-/// - `pkg:iface` (e.g. `std:string-ops`)         → `nexus:pkg/iface`
+/// - `pkg:iface` (e.g. `std:string`)             → `nexus:pkg/iface`
 /// - `nexus:foo/bar` (already a WIT name)        → returned unchanged
 /// - any other path                              → returned unchanged (legacy)
 pub fn resolve_external_wit_module(path: &str) -> String {

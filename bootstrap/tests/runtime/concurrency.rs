@@ -105,7 +105,7 @@ fn test_net_request_response_status_and_body_with_request_body() {
     should_typecheck(
         r#"
     import { Net, header, response_status, response_body }, * as net_mod from "std:network"
-    import { from_i64 } from "std:string_ops"
+    import { from_i64 } from "std:str"
 
     let main = fn () -> unit require { PermNet } do
       inject net_mod.system_handler do

@@ -43,7 +43,7 @@ import { Result, Ok, Err } from "std:result"
 
 // Import as module alias (for utility functions)
 import * as list from "std:list"
-import * as str from "std:string_ops"
+import * as str from "std:str"
 import * as math from "std:math"
 
 // Combine both
