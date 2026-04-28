@@ -118,7 +118,7 @@ import { Result, Ok, Err } from "std:result"
 import { MyType } from "src/common/foo.nx"
 
 // FFI binding — declares the WIT interface for subsequent `external` decls
-import external "std:string-ops"
+import external "std:str"
 external __nx_string_length = "__nx_string_length" : (s: string) -> i64
 ```
 
@@ -130,7 +130,7 @@ Path forms:
 | `"src/foo.nx"` | Relative file path | Project-local module |
 | `import external "std:<iface>"` | WIT interface `nexus:std/<iface>` | Pin FFI imports to a WIT interface |
 
-The `std` package always maps to `nxlib/stdlib/`. Underscore in the file stem stays in the import path (`std:string_ops`), but the WIT interface uses kebab-case (`nexus:std/string-ops`) — convert `_` to `-` for `import external` declarations.
+The `std` package always maps to `nxlib/stdlib/`. The WIT interface name matches the file stem (`std:string` → `nexus:std/str`); kebab-case applies only when an interface name has multiple words.
 
 ## Effect System (Caps & Handlers)
 

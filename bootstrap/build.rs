@@ -154,7 +154,7 @@ fn copy_wasm(src: &Path, dst: &Path) {
 }
 
 // Replace `nexus:cli/*` function imports in stdlib.wasm with local
-// `unreachable` stubs. The wasm_merge self-hosting path bundles stdlib into a
+// `unreachable` stubs. The wasm/merge self-hosting path bundles stdlib into a
 // core WASM run by plain wasmtime, which can't resolve host imports — stubbing
 // makes the merged output self-contained. The component build
 // (stdlib-component.wasm) is not stubbed; it's composed with nexus-host.

@@ -220,8 +220,8 @@ mod tests {
     fn wit_name_for_qualified() {
         let r = PackageResolver::default();
         assert_eq!(
-            r.wit_name_for("std:string-ops"),
-            Some("nexus:std/string-ops".to_string())
+            r.wit_name_for("std:str"),
+            Some("nexus:std/str".to_string())
         );
         assert_eq!(r.wit_name_for("stdlib/foo.nx"), None);
     }

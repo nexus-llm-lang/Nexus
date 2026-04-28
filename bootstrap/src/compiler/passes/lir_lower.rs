@@ -864,10 +864,10 @@ impl<'a> LowerCtx<'a> {
                 _ => None,
             };
         }
-        // Match both WIT-style names (nexus:std/string-ops) and
+        // Match both WIT-style names (nexus:std/str) and
         // file-path names (stdlib/stdlib.wasm) for intrinsic detection.
         // File-path imports use __nx_string_* names; WIT imports use string-* names.
-        if module == "nexus:std/string-ops" {
+        if module == "nexus:std/str" {
             return match name {
                 "string-byte-at" => Some(Intrinsic::StringByteAt),
                 "string-byte-length" => Some(Intrinsic::StringByteLength),

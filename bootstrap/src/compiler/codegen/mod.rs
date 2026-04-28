@@ -25,7 +25,7 @@ use crate::types::Type;
 
 /// Base offset for string literals. Always 0 — the merge code relocates data
 /// segments to dep_data_end and patches the str_base global at merge time.
-/// Must match src/backend/wasm_defs.nx.
+/// Must match src/backend/wasm/defs.nx.
 const STRING_DATA_BASE: u32 = 0;
 const OBJECT_HEAP_GLOBAL_INDEX: u32 = 0;
 /// String allocations share the object heap (G0).

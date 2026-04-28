@@ -351,7 +351,7 @@ fn snapshot_ref_type_mismatch_on_assign() {
 fn snapshot_missing_permission() {
     let err = should_fail_typecheck(
         r#"
-    import { Fs }, * as fs_mod from "std:filesystem"
+    import { Fs }, * as fs_mod from "std:fs"
 
     let main = fn () -> unit do
         inject fs_mod.system_handler do

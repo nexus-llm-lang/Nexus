@@ -47,7 +47,7 @@ fn test_try_catch_removes_exn() {
     should_typecheck(
         r#"
     import { Console }, * as stdio from "std:stdio"
-    import { from_i64 } from "std:string_ops"
+    import { from_i64 } from "std:str"
     exception Oops(msg: string)
 
     let risky = fn () -> unit throws { Exn } do
@@ -418,7 +418,7 @@ end
         let src = format!(
             r#"
 import {{ Console }}, * as stdio from "std:stdio"
-import {{ from_i64 }} from "std:string_ops"
+import {{ from_i64 }} from "std:str"
 exception MsgError(val: string)
 
 let risky = fn (msg: string) -> unit throws {{ Exn }} do

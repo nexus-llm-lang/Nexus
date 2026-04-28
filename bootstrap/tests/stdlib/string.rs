@@ -4,7 +4,7 @@ use crate::harness::exec_with_stdlib;
 fn string_repeat_basic() {
     exec_with_stdlib(
         r#"
-import { repeat, length } from "std:string_ops"
+import { repeat, length } from "std:str"
 
 let main = fn () -> unit do
   let result = repeat(s: "ab", n: 3)
@@ -19,7 +19,7 @@ end
 fn string_pad_left_basic() {
     exec_with_stdlib(
         r#"
-import { pad_left, length } from "std:string_ops"
+import { pad_left, length } from "std:str"
 
 let main = fn () -> unit do
   let result = pad_left(s: "42", width: 5, fill: "0")
@@ -34,7 +34,7 @@ end
 fn string_pad_right_basic() {
     exec_with_stdlib(
         r#"
-import { pad_right, length } from "std:string_ops"
+import { pad_right, length } from "std:str"
 
 let main = fn () -> unit do
   let result = pad_right(s: "hi", width: 5, fill: ".")
@@ -49,7 +49,7 @@ end
 fn string_concat_basic() {
     exec_with_stdlib(
         r#"
-import { concat, length } from "std:string_ops"
+import { concat, length } from "std:str"
 
 let main = fn () -> unit do
   let result = concat(a: "hello", b: " world")
@@ -64,7 +64,7 @@ end
 fn string_parse_i64_valid() {
     exec_with_stdlib(
         r#"
-import { parse_i64 } from "std:string_ops"
+import { parse_i64 } from "std:str"
 import { Option, unwrap_or } from "std:option"
 
 let main = fn () -> unit do
@@ -80,7 +80,7 @@ end
 fn string_parse_i64_invalid() {
     exec_with_stdlib(
         r#"
-import { parse_i64 } from "std:string_ops"
+import { parse_i64 } from "std:str"
 import { Option, is_none } from "std:option"
 
 let main = fn () -> unit do
@@ -166,7 +166,7 @@ proptest! {
     #[test]
     fn prop_string_length_concat(s1 in "[a-zA-Z0-9]{0,20}", s2 in "[a-zA-Z0-9]{0,20}") {
         let src = format!("
-import {{ length }} from \"stdlib/string_ops.nx\"
+import {{ length }} from \"stdlib/str.nx\"
 let main = fn () -> unit do
     let s1 = [=[{}]=]
     let s2 = [=[{}]=]
@@ -250,7 +250,7 @@ end
 fn join_tail_recursive_deep() {
     exec_with_stdlib(
         r#"
-import { join, length } from "std:string_ops"
+import { join, length } from "std:str"
 
 let make_strs = fn (n: i64, acc: [ string ]) -> [ string ] do
   if n == 0 then return acc end
@@ -274,7 +274,7 @@ end
 fn split_tail_recursive_deep() {
     exec_with_stdlib(
         r#"
-import { split, repeat, length } from "std:string_ops"
+import { split, repeat, length } from "std:str"
 import * as list from "std:list"
 
 let main = fn () -> unit do

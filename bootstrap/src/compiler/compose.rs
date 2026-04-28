@@ -73,9 +73,9 @@ pub fn compose_with_stdlib_and_host(user_core_wasm: &[u8]) -> Result<Vec<u8>, St
 }
 
 fn compose_with_stdlib_impl(user_core_wasm: &[u8], include_host: bool) -> Result<Vec<u8>, String> {
-    // Fix misplaced string-ops imports from older nxc compiler output.
+    // Fix misplaced string imports from older nxc compiler output.
     // The nxc diamond-cache bug puts string-* functions under wrong modules.
-    let user_core_wasm = &normalize_string_ops_imports(user_core_wasm);
+    let user_core_wasm = &normalize_string_imports(user_core_wasm);
     // Fix cabi_realloc type assignment (old nxc assigns ()→() instead of (i32,i32,i32,i32)→i32).
     let user_core_wasm = &fix_cabi_realloc_type(user_core_wasm);
     // Strip "wasi:cli/run@*" export from nxc-compiled core WASM.
@@ -642,23 +642,23 @@ fn fix_cabi_realloc_type(wasm: &[u8]) -> Vec<u8> {
 /// Returns the correct WIT module for a function name, or None if it belongs
 /// to the module it's already in.
 fn correct_module_for_import(module: &str, name: &str) -> Option<&'static str> {
-    if module == "nexus:std/string-ops" {
+    if module == "nexus:std/str" {
         return None; // already correct
     }
     if name.starts_with("string-") || name.starts_with("char-") {
-        return Some("nexus:std/string-ops");
+        return Some("nexus:std/str");
     }
     None
 }
 
-/// Rewrite core WASM imports to move misplaced string-ops functions to
-/// `nexus:std/string-ops`. Deduplicates by (module, name) pair.
+/// Rewrite core WASM imports to move misplaced string functions to
+/// `nexus:std/str`. Deduplicates by (module, name) pair.
 /// Needed for nxc compiler output where diamond-cached imports cause
 /// string functions to be registered under wrong stdlib modules.
-fn normalize_string_ops_imports(wasm: &[u8]) -> Vec<u8> {
+fn normalize_string_imports(wasm: &[u8]) -> Vec<u8> {
     use wasm_encoder::{EntityType, ImportSection, Module, RawSection};
 
-    // Quick check: any nexus:std/* import with a string-* name not in string-ops?
+    // Quick check: any nexus:std/* import with a string-* name not in string?
     let needs_fix = wasmparser::Parser::new(0)
         .parse_all(wasm)
         .filter_map(|p| p.ok())

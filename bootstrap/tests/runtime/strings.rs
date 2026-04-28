@@ -209,7 +209,7 @@ fn heap_reset_reclaims_string_allocations_in_loop() {
     exec_with_stdlib(
         r#"
 import { heap_mark, heap_reset } from "std:arena"
-import { length, substring, concat, repeat } from "std:string_ops"
+import { length, substring, concat, repeat } from "std:str"
 
 let main = fn () -> unit do
     let ~i = 0

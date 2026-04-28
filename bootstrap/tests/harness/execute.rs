@@ -258,7 +258,7 @@ fn run_main_with_deps_core(wasm: &[u8]) -> Result<(), String> {
     // `bundle_core_wasm` (binaryen `wasm-merge`) keeps each module's memory
     // separate (`--enable-multimemory`), so stdlib's `__nx_print` reads bytes
     // from stdlib's memory while the caller wrote them into the user's
-    // memory. The Nexus self-hosted `wasm_merge.nx` reconciles this by
+    // memory. The Nexus self-hosted `wasm/merge.nx` reconciles this by
     // relocating user data above stdlib's region in a single shared memory;
     // reproducing that here is out of scope. Skip bundling when the user
     // wasm has no stdlib imports — programs that only touch

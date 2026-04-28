@@ -63,7 +63,7 @@ fn codegen_f64_literal_and_arithmetic() {
     exec_with_stdlib(
         r#"
 import { abs_float } from "std:math"
-import { from_float } from "std:string_ops"
+import { from_float } from "std:str"
 
 let check_f64 = fn (actual: f64, expected: f64, label: string) -> unit throws { Exn } do
   let diff = actual -. expected
