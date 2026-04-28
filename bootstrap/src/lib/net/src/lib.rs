@@ -89,6 +89,23 @@ extern "C" {
 
     #[link_name = "host-http-respond-chunk-finish"]
     fn host_http_respond_chunk_finish(req_id: i64) -> i32;
+
+    #[link_name = "host-http-request-with-options"]
+    fn host_http_request_with_options(
+        method_ptr: i32,
+        method_len: i32,
+        url_ptr: i32,
+        url_len: i32,
+        headers_ptr: i32,
+        headers_len: i32,
+        body_ptr: i32,
+        body_len: i32,
+        timeout_ms: i64,
+        ret_ptr: i32,
+    );
+
+    #[link_name = "host-http-cancel-accept"]
+    fn host_http_cancel_accept(server_id: i64) -> i32;
 }
 
 #[cfg(not(feature = "no_alloc_export"))]
@@ -245,6 +262,57 @@ pub extern "C" fn __nx_http_respond_chunk_write(
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_http_respond_chunk_finish(req_id: i64) -> i32 {
     unsafe { host_http_respond_chunk_finish(req_id) }
+}
+
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_http_request_with_options(
+    method_ptr: i32,
+    method_len: i32,
+    url_ptr: i32,
+    url_len: i32,
+    headers_ptr: i32,
+    headers_len: i32,
+    body_ptr: i32,
+    body_len: i32,
+    timeout_ms: i64,
+) -> i64 {
+    if checked_ptr_len(method_ptr, method_len).is_none() {
+        return 0;
+    }
+    if checked_ptr_len(url_ptr, url_len).is_none() {
+        return 0;
+    }
+    if !has_valid_optional_region(headers_ptr, headers_len) {
+        return 0;
+    }
+    if !has_valid_optional_region(body_ptr, body_len) {
+        return 0;
+    }
+
+    let mut ret = [0_i32; 2];
+    unsafe {
+        host_http_request_with_options(
+            method_ptr,
+            method_len,
+            url_ptr,
+            url_len,
+            headers_ptr,
+            headers_len,
+            body_ptr,
+            body_len,
+            timeout_ms,
+            ret.as_mut_ptr() as i32,
+        );
+    }
+    if !has_valid_optional_region(ret[0], ret[1]) {
+        return 0;
+    }
+    pack_ptr_len(ret[0], ret[1])
+}
+
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_http_cancel_accept(server_id: i64) -> i32 {
+    unsafe { host_http_cancel_accept(server_id) }
 }
 
 fn pack_ptr_len(ptr: i32, len: i32) -> i64 {

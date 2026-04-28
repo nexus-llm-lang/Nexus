@@ -42,4 +42,14 @@
   ;; host-http-respond-chunk-finish(req_id: i64) -> i32
   (func (export "host-http-respond-chunk-finish") (param i64) (result i32)
     unreachable)
+
+  ;; host-http-request-with-options(method/url/headers/body ptr+len ×4,
+  ;;   timeout_ms: i64, ret_ptr: i32)
+  (func (export "host-http-request-with-options")
+        (param i32 i32 i32 i32 i32 i32 i32 i32 i64 i32)
+    unreachable)
+
+  ;; host-http-cancel-accept(server_id: i64) -> i32
+  (func (export "host-http-cancel-accept") (param i64) (result i32)
+    unreachable)
 )

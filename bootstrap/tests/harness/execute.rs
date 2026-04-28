@@ -674,6 +674,20 @@ fn define_component_nexus_host_stubs(
          -> wasmtime::Result<(i32,)> { Ok((0,)) },
     )
     .map_err(|e| e.to_string())?;
+    inst.func_wrap(
+        "host-http-request-with-options",
+        |_: wasmtime::StoreContextMut<'_, WasiState>,
+         (_method, _url, _headers, _body, _timeout): (String, String, String, String, i64)|
+         -> wasmtime::Result<(String,)> { Ok((String::new(),)) },
+    )
+    .map_err(|e| e.to_string())?;
+    inst.func_wrap(
+        "host-http-cancel-accept",
+        |_: wasmtime::StoreContextMut<'_, WasiState>,
+         (_server_id,): (i64,)|
+         -> wasmtime::Result<(i32,)> { Ok((0,)) },
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
