@@ -1,0 +1,761 @@
+/**
+ * lsp/server: Generic LSP server scaffold, language-agnostic.
+ *
+ * Layered on top of:
+ *   nxlib/jsonrpc.nx          — Content-Length framing + dispatch_loop
+ *   nxlib/lsp/protocol.nx     — wire-format types + JSON codecs
+ *
+ * Two public surfaces:
+ *
+ *   Pure layer — operates on `(ServerState, IncomingMessage, Handlers)` and
+ *     yields `(ServerState, DispatchOutcome)`. No I/O capabilities; testable
+ *     directly from a test harness without driving a mock Console.
+ *       empty_state()      -> ServerState
+ *       empty_handlers()   -> Handlers
+ *       dispatch_message(state, msg, handlers) -> StepResult
+ *       drive_messages(state, msgs, handlers)  -> DriveResult
+ *
+ *   I/O layer — wraps `nxlib/jsonrpc.dispatch_loop` to read JSON-RPC frames
+ *     off stdin, drive them through `dispatch_message`, and write responses
+ *     back. Requires Console capability.
+ *       run_server(initial_state, handlers, max_iters) -> ServerState
+ *
+ * The handler vtable is a record of fn-typed fields. Every handler takes
+ * `(ServerState, JsonValue)` (params) and returns `HandlerResult` carrying
+ * the new state plus the response body or notification effect. Handlers are
+ * pure: they do not perform I/O directly. Outbound notifications (e.g.
+ * `publishDiagnostics`) are returned from the handler in the
+ * `notifications` list and emitted by the I/O layer.
+ *
+ * This module knows nothing about Nexus syntax — the language-specific
+ * server (`src/lsp/main.nx`) supplies typed handlers; this scaffold owns
+ * lifecycle (initialize / shutdown / exit), per-document buffer state,
+ * method-name → handler routing, and JSON-RPC error mapping.
+ *
+ * Lifecycle invariants (LSP base spec §`Lifecycle Messages`):
+ *   - `initialize` is the first request; subsequent requests prior to
+ *     `initialize` get a JSON-RPC error with code -32002 (server not
+ *     initialized). We surface that via `ServerNotInitialized` outcome.
+ *   - `shutdown` flips a flag; further requests after shutdown return
+ *     `InvalidRequest`.
+ *   - `exit` returns `Exit` from the dispatch step; the I/O loop observes
+ *     it and stops reading.
+ *
+ * Document buffer state is full-content sync only (TextDocumentSyncKind = 1).
+ * Incremental sync is post-MVP — `did_change` with a `ContentChangeIncremental`
+ * variant raises `LspProtocolError` so the gap is visible rather than
+ * silently dropped.
+ */
+
+import { JsonValue, JsonNull, JsonInt, JsonString,
+         JsonArray, JsonObject, JsonField, get_field }
+  from "std:json"
+import { Option, Some, None } from "std:option"
+import { Console } from "std:stdio"
+import { IncomingMessage, Request, Notification, Malformed,
+         JsonRpcFrameError,
+         response_ok, response_error,
+         method_not_found, invalid_request, invalid_params, internal_error,
+         classify, read_message, write_message }
+  from "nxlib/jsonrpc.nx"
+import { LspProtocolError,
+         initialize_params_from_json,
+         InitializeResult, initialize_result_to_json,
+         ServerCapabilities, TdsFull,
+         TextDocumentItem, text_document_item_from_json,
+         VersionedTextDocumentIdentifier, versioned_text_document_identifier_from_json,
+         ContentChangeFull, ContentChangeIncremental,
+         content_change_event_from_json,
+         PublishDiagnosticsParams, publish_diagnostics_params_to_json }
+  from "nxlib/lsp/protocol.nx"
+
+// ─── Server-not-initialized error code (LSP spec §3.6) ───────────────────────
+
+export let server_not_initialized = fn () -> i64 do return -32002 end
+
+// ─── Document buffer state ───────────────────────────────────────────────────
+//
+// LSP servers track open documents keyed by `uri`. Full-content sync stores
+// the latest text + version; the version is the integer the client last
+// sent in `didOpen` / `didChange`. A list-based assoc structure is fine for
+// MVP — typical editors keep tens of files open, and lookup/update is
+// linear in that count. A future swap to nxlib/stdlib/stringmap is purely
+// additive (StringMap stores only i64 values so we'd have to widen to a
+// side table; not worth it for MVP).
+
+export type DocumentRecord = DocumentRecord(
+  uri: string,
+  text: string,
+  version: i64
+)
+
+export type DocumentStore = DocumentStore(records: [DocumentRecord])
+
+export let documents_empty = fn () -> DocumentStore do
+  return DocumentStore(records: [])
+end
+
+let docs_lookup_go = fn (xs: [DocumentRecord], uri: string) -> Option<DocumentRecord> do
+  match xs do
+    | [] -> return None
+    | r :: rest ->
+      match r do | DocumentRecord(uri: u, text: _, version: _) ->
+        if u == uri then return Some(val: r) end
+        return docs_lookup_go(xs: rest, uri)
+      end
+  end
+end
+
+/// Look up the latest record for `uri`. Returns `None` if no document with
+/// this URI is open.
+export let documents_lookup = fn (store: DocumentStore, uri: string) -> Option<DocumentRecord> do
+  match store do | DocumentStore(records) ->
+    return docs_lookup_go(xs: records, uri)
+  end
+end
+
+let docs_remove_go = fn (xs: [DocumentRecord], uri: string, acc: [DocumentRecord]) -> [DocumentRecord] do
+  match xs do
+    | [] -> return reverse_records(xs: acc, acc: [])
+    | r :: rest ->
+      match r do | DocumentRecord(uri: u, text: _, version: _) ->
+        if u == uri then
+          return reverse_records_then_append(xs: acc, tail: rest)
+        end
+        return docs_remove_go(xs: rest, uri, acc: r :: acc)
+      end
+  end
+end
+
+let reverse_records = fn (xs: [DocumentRecord], acc: [DocumentRecord]) -> [DocumentRecord] do
+  match xs do
+    | [] -> return acc
+    | r :: rest -> return reverse_records(xs: rest, acc: r :: acc)
+  end
+end
+
+let reverse_records_then_append = fn (xs: [DocumentRecord], tail: [DocumentRecord]) -> [DocumentRecord] do
+  match xs do
+    | [] -> return tail
+    | r :: rest -> return reverse_records_then_append(xs: rest, tail: r :: tail)
+  end
+end
+
+/// Insert or replace the record for `uri`. Existing entries with the same
+/// URI are removed first so each URI maps to at most one record.
+export let documents_put = fn (store: DocumentStore, rec: DocumentRecord) -> DocumentStore do
+  match store do | DocumentStore(records) ->
+    match rec do | DocumentRecord(uri, text: _, version: _) ->
+      let pruned = docs_remove_go(xs: records, uri, acc: [])
+      return DocumentStore(records: rec :: pruned)
+    end
+  end
+end
+
+/// Remove the record for `uri` (no-op if absent).
+export let documents_remove = fn (store: DocumentStore, uri: string) -> DocumentStore do
+  match store do | DocumentStore(records) ->
+    return DocumentStore(records: docs_remove_go(xs: records, uri, acc: []))
+  end
+end
+
+/// Number of open documents — for tests asserting buffer state survival.
+export let documents_size = fn (store: DocumentStore) -> i64 do
+  match store do | DocumentStore(records) ->
+    return list_len(xs: records, acc: 0)
+  end
+end
+
+let list_len = fn (xs: [DocumentRecord], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return list_len(xs: rest, acc: acc + 1)
+  end
+end
+
+// ─── Server state ────────────────────────────────────────────────────────────
+//
+// Tracks lifecycle phase and the document store. `user_data` is an opaque
+// JsonValue slot the language-specific server uses to carry typed state
+// (e.g. cached HIR programs); JsonValue keeps this module ignorant of the
+// concrete shape.
+
+export type Lifecycle =
+    LifecycleUninitialized
+  | LifecycleRunning
+  | LifecycleShutdown
+
+export type ServerState = ServerState(
+  lifecycle: Lifecycle,
+  documents: DocumentStore,
+  user_data: JsonValue
+)
+
+export let empty_state = fn () -> ServerState do
+  return ServerState(
+    lifecycle: LifecycleUninitialized,
+    documents: documents_empty(),
+    user_data: JsonNull
+  )
+end
+
+// ─── Handler vtable ──────────────────────────────────────────────────────────
+//
+// Every handler is `(ServerState, JsonValue) -> HandlerResult`. The first
+// argument carries the language server's accumulated state (documents,
+// user_data); the JsonValue is the parsed-but-untyped `params` field of
+// the JSON-RPC message. Handlers decode params via the protocol codecs and
+// return both an updated state and either a response (for requests) or a
+// notification list (for notifications and event-driven outputs like
+// `publishDiagnostics`).
+
+export type HandlerResult = HandlerResult(
+  state: ServerState,
+  /// Some(value) for request handlers; None for notification handlers.
+  /// The dispatch step routes the value as the `result` field of a
+  /// JSON-RPC success response.
+  response: Option<JsonValue>,
+  /// Outbound notifications the handler wants to send (e.g.
+  /// `publishDiagnostics` after a `didChange`). The dispatch step writes
+  /// each one as a separate JSON-RPC notification frame.
+  notifications: [JsonValue]
+)
+
+export type Handlers = Handlers(
+  on_initialize: (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn },
+  on_initialized: (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn },
+  on_did_open: (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn },
+  on_did_change: (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn },
+  on_did_close: (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn },
+  on_did_save: (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn },
+  on_shutdown: (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn },
+  /// Unknown-method fallback. Invoked when the inbound method name is not
+  /// matched by any of the lifecycle / document-sync handlers above.
+  /// Default returns `MethodNotFound`; language servers wire textDocument/
+  /// hover, definition, documentSymbol, etc. through this hook.
+  on_other: (state: ServerState, method: string, params: JsonValue) -> HandlerResult throws { Exn }
+)
+
+// ─── Default handlers ────────────────────────────────────────────────────────
+//
+// Each default handler manages the lifecycle / document state correctly and
+// returns the minimum viable response for that method. Language servers
+// override the entries they need (`on_did_change` to enqueue a typecheck,
+// `on_other` to handle textDocument/documentSymbol, etc.).
+
+let default_initialize = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
+  // Decode the params solely to validate shape; we don't read any field for
+  // the default response. This surfaces malformed input as LspProtocolError
+  // up to dispatch_message, which routes it as InvalidParams.
+  let _ = initialize_params_from_json(v: params)
+  let caps = ServerCapabilities(
+    text_document_sync: Some(val: TdsFull),
+    document_symbol_provider: None,
+    hover_provider: None,
+    definition_provider: None,
+    references_provider: None
+  )
+  let result = InitializeResult(capabilities: caps, server_info: None)
+  let new_state = match state do | ServerState(lifecycle: _, documents, user_data) ->
+    ServerState(lifecycle: LifecycleRunning, documents, user_data)
+  end
+  return HandlerResult(
+    state: new_state,
+    response: Some(val: initialize_result_to_json(r: result)),
+    notifications: []
+  )
+end
+
+let default_initialized = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
+  let _ = params
+  return HandlerResult(state, response: None, notifications: [])
+end
+
+// Pull a required field as JsonValue out of an object, raising
+// LspProtocolError if absent. Match the protocol.nx convention.
+let require_object_field = fn (obj: JsonValue, key: string, ctx: string) -> JsonValue throws { Exn } do
+  match get_field(obj, key) do
+    | Some(val: v) -> return v
+    | None -> raise LspProtocolError(msg: ctx ++ ": missing '" ++ key ++ "'")
+  end
+end
+
+let require_array_value = fn (v: JsonValue, ctx: string) -> [JsonValue] throws { Exn } do
+  match v do
+    | JsonArray(items: xs) -> return xs
+    | _ -> raise LspProtocolError(msg: ctx ++ ": expected array")
+  end
+end
+
+let default_did_open = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
+  let td_v = require_object_field(obj: params, key: "textDocument", ctx: "DidOpenTextDocumentParams")
+  let td = text_document_item_from_json(v: td_v)
+  match td do | TextDocumentItem(uri, language_id: _, version, text) ->
+    let new_docs = documents_put(
+      store: state_documents(state),
+      rec: DocumentRecord(uri, text, version)
+    )
+    return HandlerResult(
+      state: with_documents(state, docs: new_docs),
+      response: None,
+      notifications: []
+    )
+  end
+end
+
+let default_did_change = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
+  let td_v = require_object_field(obj: params, key: "textDocument", ctx: "DidChangeTextDocumentParams")
+  let id = versioned_text_document_identifier_from_json(v: td_v)
+  let changes = require_object_field(obj: params, key: "contentChanges", ctx: "DidChangeTextDocumentParams")
+  let arr = require_array_value(v: changes, ctx: "DidChangeTextDocumentParams.contentChanges")
+  // Full-content sync: pick the last ContentChangeFull in the array (LSP
+  // spec: client may batch multiple changes; full-sync collapses them to
+  // the final state). An empty array is a protocol violation; an
+  // incremental variant in this stream is also a violation because we
+  // advertise TextDocumentSyncKind.Full.
+  let new_text = pick_full_replacement_text(items: arr)
+  match id do | VersionedTextDocumentIdentifier(uri, version) ->
+    let new_docs = documents_put(
+      store: state_documents(state),
+      rec: DocumentRecord(uri, text: new_text, version)
+    )
+    return HandlerResult(
+      state: with_documents(state, docs: new_docs),
+      response: None,
+      notifications: []
+    )
+  end
+end
+
+// Walk the contentChanges array, returning the text from the final
+// ContentChangeFull. Raises LspProtocolError on (a) any incremental
+// variant or (b) an empty list — both are protocol violations under
+// TextDocumentSyncKind.Full advertisement.
+let pick_full_replacement_text = fn (items: [JsonValue]) -> string throws { Exn } do
+  return pick_full_replacement_text_go(items, current: None)
+end
+
+let pick_full_replacement_text_go = fn (items: [JsonValue], current: Option<string>) -> string throws { Exn } do
+  match items do
+    | [] ->
+      match current do
+        | Some(val: t) -> return t
+        | None ->
+          raise LspProtocolError(msg: "DidChangeTextDocumentParams.contentChanges: empty array")
+      end
+    | v :: rest ->
+      let ev = content_change_event_from_json(v)
+      match ev do
+        | ContentChangeFull(text) ->
+          return pick_full_replacement_text_go(items: rest, current: Some(val: text))
+        | ContentChangeIncremental(range: _, range_length: _, text: _) ->
+          raise LspProtocolError(
+            msg: "incremental contentChanges not supported (server advertises TextDocumentSyncKind.Full)"
+          )
+      end
+  end
+end
+
+let extract_text_document_uri = fn (params: JsonValue, ctx: string) -> string throws { Exn } do
+  match get_field(obj: params, key: "textDocument") do
+    | None -> raise LspProtocolError(msg: ctx ++ ": missing 'textDocument'")
+    | Some(val: v) ->
+      match get_field(obj: v, key: "uri") do
+        | None -> raise LspProtocolError(msg: ctx ++ ".textDocument: missing 'uri'")
+        | Some(val: u) ->
+          match u do
+            | JsonString(val: s) -> return s
+            | _ -> raise LspProtocolError(msg: ctx ++ ".textDocument.uri: expected string")
+          end
+      end
+  end
+end
+
+let default_did_close = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
+  let uri = extract_text_document_uri(params, ctx: "DidCloseTextDocumentParams")
+  let new_docs = documents_remove(store: state_documents(state), uri)
+  return HandlerResult(
+    state: with_documents(state, docs: new_docs),
+    response: None,
+    notifications: []
+  )
+end
+
+let default_did_save = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
+  let _ = params
+  return HandlerResult(state, response: None, notifications: [])
+end
+
+let default_shutdown = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
+  let _ = params
+  let new_state = match state do | ServerState(lifecycle: _, documents, user_data) ->
+    ServerState(lifecycle: LifecycleShutdown, documents, user_data)
+  end
+  return HandlerResult(
+    state: new_state,
+    response: Some(val: JsonNull),
+    notifications: []
+  )
+end
+
+let default_other = fn (state: ServerState, method: string, params: JsonValue) -> HandlerResult throws { Exn } do
+  let _ = method
+  let _ = params
+  // Sentinel: a None response on a request maps to MethodNotFound; on a
+  // notification the empty notification list is the no-op. dispatch_message
+  // observes the sentinel by inspecting the original IncomingMessage.
+  return HandlerResult(state, response: None, notifications: [])
+end
+
+/// Construct a Handlers vtable populated with reasonable defaults: the
+/// lifecycle handlers maintain `Lifecycle` correctly and the document-sync
+/// handlers update the buffer store with full-content semantics. Language
+/// servers compose this with `with_*` helpers (TBD per call site) or pass
+/// a freshly-built record.
+export let empty_handlers = fn () -> Handlers do
+  return Handlers(
+    on_initialize: default_initialize,
+    on_initialized: default_initialized,
+    on_did_open: default_did_open,
+    on_did_change: default_did_change,
+    on_did_close: default_did_close,
+    on_did_save: default_did_save,
+    on_shutdown: default_shutdown,
+    on_other: default_other
+  )
+end
+
+// ─── Per-step dispatch ───────────────────────────────────────────────────────
+//
+// Outcome of routing a single inbound message. `Continue` advances the
+// loop with possibly-updated state and an optional response/notifications;
+// `Exit` stops the loop (received on the LSP `exit` notification).
+
+export type StepOutcome =
+    StepContinue(
+      state: ServerState,
+      /// Some when the inbound was a Request and the handler produced a
+      /// reply (or an error response); None for notifications.
+      response: Option<JsonValue>,
+      /// Outbound notifications the handler emitted (e.g. publishDiagnostics).
+      notifications: [JsonValue]
+    )
+  | StepExit(state: ServerState)
+
+let lifecycle_is_uninitialized = fn (state: ServerState) -> bool do
+  match state do | ServerState(lifecycle, documents: _, user_data: _) ->
+    match lifecycle do
+      | LifecycleUninitialized -> return true
+      | _ -> return false
+    end
+  end
+end
+
+let lifecycle_is_shutdown = fn (state: ServerState) -> bool do
+  match state do | ServerState(lifecycle, documents: _, user_data: _) ->
+    match lifecycle do
+      | LifecycleShutdown -> return true
+      | _ -> return false
+    end
+  end
+end
+
+let state_documents = fn (state: ServerState) -> DocumentStore do
+  match state do | ServerState(lifecycle: _, documents, user_data: _) ->
+    return documents
+  end
+end
+
+let with_documents = fn (state: ServerState, docs: DocumentStore) -> ServerState do
+  match state do | ServerState(lifecycle, documents: _, user_data) ->
+    return ServerState(lifecycle, documents: docs, user_data)
+  end
+end
+
+// Map a method name to the matching handler invocation. `params` is the raw
+// JsonValue from the JSON-RPC envelope. Uninitialized/post-shutdown state
+// short-circuits before reaching the handler.
+let invoke_handler = fn (
+  state: ServerState,
+  handlers: Handlers,
+  method: string,
+  params: JsonValue
+) -> HandlerResult throws { Exn } do
+  match handlers do | Handlers(on_initialize, on_initialized, on_did_open, on_did_change,
+                                on_did_close, on_did_save, on_shutdown, on_other) ->
+    if method == "initialize" then return on_initialize(state, params) end
+    if method == "initialized" then return on_initialized(state, params) end
+    if method == "textDocument/didOpen" then return on_did_open(state, params) end
+    if method == "textDocument/didChange" then return on_did_change(state, params) end
+    if method == "textDocument/didClose" then return on_did_close(state, params) end
+    if method == "textDocument/didSave" then return on_did_save(state, params) end
+    if method == "shutdown" then return on_shutdown(state, params) end
+    return on_other(state, method, params)
+  end
+end
+
+// Build a JSON-RPC notification frame `{"jsonrpc":"2.0","method":m,"params":p}`.
+let notification_frame = fn (method: string, params: JsonValue) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "jsonrpc", value: JsonString(val: "2.0")),
+    JsonField(key: "method", value: JsonString(val: method)),
+    JsonField(key: "params", value: params)
+  ])
+end
+
+/// Build a `textDocument/publishDiagnostics` notification frame from
+/// `params`. Useful for handlers that want to emit diagnostics; the
+/// returned JsonValue can be appended to `HandlerResult.notifications`.
+export let make_publish_diagnostics_notification = fn (
+  params: PublishDiagnosticsParams
+) -> JsonValue do
+  return notification_frame(
+    method: "textDocument/publishDiagnostics",
+    params: publish_diagnostics_params_to_json(p: params)
+  )
+end
+
+/// Pure single-message dispatch. Routes `msg` through `handlers` while
+/// enforcing LSP lifecycle invariants. Returns a StepOutcome the I/O loop
+/// (or a test driver) consumes.
+export let dispatch_message = fn (
+  state: ServerState,
+  msg: IncomingMessage,
+  handlers: Handlers
+) -> StepOutcome throws { Exn } do
+  match msg do
+    | Request(id, method, params) ->
+      // Pre-initialize gate: only `initialize` is permitted before the
+      // client has handshaken.
+      if lifecycle_is_uninitialized(state) && method != "initialize" then
+        let err = response_error(id,
+          code: server_not_initialized(),
+          message: "server not initialized")
+        return StepContinue(state, response: Some(val: err), notifications: [])
+      end
+      // Post-shutdown gate: any request other than `exit` (which is a
+      // notification) is rejected per spec.
+      if lifecycle_is_shutdown(state) then
+        let err = response_error(id,
+          code: invalid_request(),
+          message: "server has shut down")
+        return StepContinue(state, response: Some(val: err), notifications: [])
+      end
+      try
+        let result = invoke_handler(state, handlers, method, params)
+        match result do | HandlerResult(state: new_state, response, notifications) ->
+          let response_envelope = match response do
+            | Some(val: r) -> Some(val: response_ok(id, result: r))
+            | None ->
+              // Request reached a notification-style handler or fell through
+              // on_other → MethodNotFound.
+              Some(val: response_error(id,
+                code: method_not_found(),
+                message: "method not found: " ++ method))
+          end
+          return StepContinue(state: new_state, response: response_envelope, notifications)
+        end
+      catch err ->
+        let err_response = match err do
+          | LspProtocolError(msg) ->
+            response_error(id, code: invalid_params(), message: msg)
+          | _ ->
+            response_error(id,
+              code: internal_error(),
+              message: "internal error in handler")
+        end
+        return StepContinue(state, response: Some(val: err_response), notifications: [])
+      end
+    | Notification(method, params) ->
+      // `exit` short-circuits. Per spec, the server must exit even if no
+      // shutdown was received; the I/O loop converts StepExit into a
+      // graceful loop termination.
+      if method == "exit" then
+        return StepExit(state)
+      end
+      // Pre-initialize gate for notifications: spec drops them silently
+      // except `exit` (handled above) and `$/cancelRequest` (allowed but
+      // not handled here). We forward to the user's on_other for
+      // observability, but discard the response slot.
+      if lifecycle_is_uninitialized(state) && method != "initialized" then
+        return StepContinue(state, response: None, notifications: [])
+      end
+      try
+        let result = invoke_handler(state, handlers, method, params)
+        match result do | HandlerResult(state: new_state, response: _, notifications) ->
+          return StepContinue(state: new_state, response: None, notifications)
+        end
+      catch err ->
+        // Notifications have no reply channel; per LSP spec the server
+        // logs and continues. We catch LspProtocolError (malformed
+        // params) here and discharge as a no-op state transition — the
+        // I/O layer doesn't observe the error, but the caller sees the
+        // unchanged state which proves the handler did not commit a
+        // partial update. Other exceptions propagate so genuine
+        // invariant violations surface at the entry point.
+        match err do
+          | LspProtocolError(_) -> return StepContinue(state, response: None, notifications: [])
+          | _ -> raise err
+        end
+      end
+    | Malformed(reason) ->
+      // Already-classified malformed input (no `method` or non-string method).
+      // We surface it as a JSON-RPC error with null id, matching jsonrpc.dispatch_step.
+      return StepContinue(
+        state,
+        response: Some(val: response_error(
+          id: JsonNull,
+          code: invalid_request(),
+          message: reason
+        )),
+        notifications: []
+      )
+  end
+end
+
+// ─── Multi-step driver (pure) ────────────────────────────────────────────────
+//
+// `drive_messages` repeatedly applies dispatch_message to a list of inbound
+// messages, accumulating the responses and notifications in order. It
+// stops at StepExit. Used by the minimal end-to-end test that exercises
+// initialize → did_open → did_change → did_close → shutdown → exit on a
+// single state value without any I/O.
+
+export type DriveResult = DriveResult(
+  state: ServerState,
+  responses: [JsonValue],
+  notifications: [JsonValue],
+  exited: bool
+)
+
+let drive_messages_go = fn (
+  state: ServerState,
+  msgs: [IncomingMessage],
+  handlers: Handlers,
+  responses_acc: [JsonValue],
+  notifications_acc: [JsonValue]
+) -> DriveResult throws { Exn } do
+  match msgs do
+    | [] ->
+      return DriveResult(
+        state,
+        responses: list_reverse(xs: responses_acc, acc: []),
+        notifications: list_reverse(xs: notifications_acc, acc: []),
+        exited: false
+      )
+    | m :: rest ->
+      match dispatch_message(state, msg: m, handlers) do
+        | StepExit(state: new_state) ->
+          return DriveResult(
+            state: new_state,
+            responses: list_reverse(xs: responses_acc, acc: []),
+            notifications: list_reverse(xs: notifications_acc, acc: []),
+            exited: true
+          )
+        | StepContinue(state: new_state, response, notifications) ->
+          let r2 = match response do
+            | Some(val: r) -> r :: responses_acc
+            | None -> responses_acc
+          end
+          let n2 = prepend_all(xs: notifications, acc: notifications_acc)
+          return drive_messages_go(state: new_state, msgs: rest, handlers,
+            responses_acc: r2, notifications_acc: n2)
+      end
+  end
+end
+
+let prepend_all = fn (xs: [JsonValue], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | v :: rest -> return prepend_all(xs: rest, acc: v :: acc)
+  end
+end
+
+let list_reverse = fn (xs: [JsonValue], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | v :: rest -> return list_reverse(xs: rest, acc: v :: acc)
+  end
+end
+
+/// Drive a fixed sequence of pre-classified inbound messages through the
+/// state machine. Returns the final state, all responses (in order), all
+/// outbound notifications (in order), and whether the run terminated
+/// because of an `exit` notification.
+export let drive_messages = fn (
+  state: ServerState,
+  msgs: [IncomingMessage],
+  handlers: Handlers
+) -> DriveResult throws { Exn } do
+  return drive_messages_go(state, msgs, handlers, responses_acc: [], notifications_acc: [])
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// I/O layer
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `run_server` ties the pure dispatch to stdin/stdout via
+// jsonrpc.dispatch_loop. The loop is hand-rolled (rather than calling
+// jr.dispatch_loop) because we need to thread `ServerState` through each
+// step and observe StepExit — both of which the generic dispatch_loop
+// can't carry through its closure-based API.
+
+let write_notifications = fn (xs: [JsonValue]) -> unit require { Console } throws { Exn } do
+  match xs do
+    | [] -> return ()
+    | n :: rest ->
+      write_message(value: n)
+      return write_notifications(xs: rest)
+  end
+end
+
+let run_server_go = fn (
+  state: ServerState,
+  handlers: Handlers,
+  remaining: i64
+) -> ServerState require { Console } throws { Exn } do
+  if remaining == 0 then return state end
+  try
+    match read_message() do
+      | None -> return state
+      | Some(val: value) ->
+        let classified = classify(value)
+        match dispatch_message(state, msg: classified, handlers) do
+          | StepExit(state: new_state) -> return new_state
+          | StepContinue(state: new_state, response, notifications) ->
+            match response do
+              | Some(val: r) -> write_message(value: r)
+              | None -> ()
+            end
+            write_notifications(xs: notifications)
+            let next_remaining = if remaining < 0 then -1 else remaining - 1 end
+            return run_server_go(state: new_state, handlers, remaining: next_remaining)
+        end
+    end
+  catch err ->
+    // Frame and JSON parse errors mirror jsonrpc.dispatch_loop's policy:
+    // log to stderr and continue. Other exceptions propagate.
+    match err do
+      | JsonRpcFrameError(msg) ->
+        Console.eprintln(val: "[lsp/server] frame error: " ++ msg)
+        let next_remaining = if remaining < 0 then -1 else remaining - 1 end
+        return run_server_go(state, handlers, remaining: next_remaining)
+      | _ -> raise err
+    end
+  end
+end
+
+/// Read JSON-RPC frames off stdin, dispatch each through `handlers` while
+/// threading `state`, and write responses + notifications back to stdout.
+/// Returns the final ServerState when the loop terminates (EOF, `exit`
+/// notification, or `max_iters` reached).
+///
+/// `max_iters < 0` is unbounded (production setting); tests pass a small
+/// bound to drive a finite synthetic stream.
+export let run_server = fn (
+  initial_state: ServerState,
+  handlers: Handlers,
+  max_iters: i64
+) -> ServerState require { Console } throws { Exn } do
+  return run_server_go(state: initial_state, handlers, remaining: max_iters)
+end
