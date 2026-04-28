@@ -85,6 +85,33 @@ pub struct TypeChecker {
     /// Persistent copy of type definitions for use in `unify`,
     /// which runs while `self.env` is temporarily taken.
     type_defs: HashMap<String, TypeDef>,
+    /// Stack of `linear_vars` snapshots taken at each enclosing frame
+    /// boundary — function-body entry (lambda or top-level / handler
+    /// function) and `try`-body entry. The throwable-call leak check
+    /// (issue nexus-7eex.2) treats the top of this stack as "covered":
+    ///
+    /// * For a `try` boundary, the catch arm inherits the pre-try snapshot
+    ///   (Strategy A from issue nexus-7eex.1), so those linears are the
+    ///   arm's cleanup responsibility on `raise`.
+    /// * For a function boundary, linears that were already live at body
+    ///   entry are exclusively the callee's owned linear parameters. The
+    ///   caller already moved them in (consumed at the call site) and a
+    ///   raise propagates the loss to the call's contract — i.e., the
+    ///   caller decided to call a throwable function with linears it
+    ///   handed off. The intra-function check is concerned with linears
+    ///   *introduced* inside the body (let-bound or pattern-bound), which
+    ///   would silently leak if a throwable call fires in their scope.
+    linear_frame_stack: Vec<HashSet<String>>,
+    /// One-shot "next `infer` is at Stmt level" flag, set by
+    /// `infer_stmt_level` and cleared at the top of `infer`. Only the
+    /// root Expr::Call of a `Stmt::Expr` runs the throwable-call leak
+    /// check (issue nexus-7eex.2 — "throwable call を Stmt として実行する
+    /// 直前"). Calls in let-RHS, return values, or nested inside larger
+    /// expressions (if/match arms, binary operands, lambda bodies, call
+    /// arguments) consume their inputs along the way and either bind the
+    /// result or fold it into a surrounding expression — the leak window
+    /// closes at that point.
+    pending_stmt_level: bool,
 }
 
 impl TypeChecker {
@@ -108,6 +135,8 @@ impl TypeChecker {
             visited_paths: HashSet::new(),
             import_cache: HashMap::new(),
             warnings: Vec::new(),
+            linear_frame_stack: Vec::new(),
+            pending_stmt_level: false,
         }
     }
 
@@ -743,6 +772,66 @@ impl TypeChecker {
         p.sigil.get_key(&p.name)
     }
 
+    /// Reject linears that would leak through `raise` if a throwable call
+    /// fires on this site (issue nexus-7eex.2 — "linear cannot live across
+    /// throwable call"). The "covered" set is the top of `linear_frame_stack`,
+    /// which holds the linear snapshot at the most recent enclosing frame
+    /// boundary (function-body entry or `try`-body entry). Linears that
+    /// already existed at the frame boundary are someone else's
+    /// responsibility on a raise — either an enclosing catch arm
+    /// (Strategy A from issue nexus-7eex.1) or the function-call contract
+    /// at the call site. Linears introduced *inside* the current frame
+    /// after the boundary are not covered and would leak on raise.
+    ///
+    /// `eff_row` is the post-substitution effect/throws row of the callee.
+    /// A row with at least one resolved effect element makes the call
+    /// throwable. An empty row (`{}` or just a tail var) is pure with
+    /// respect to throws and skips the check entirely.
+    fn check_throwable_call_does_not_leak_linear(
+        &self,
+        func_name: &str,
+        eff_row: &Type,
+        env: &TypeEnv,
+        span: &Span,
+    ) -> Result<(), TypeError> {
+        let throws_something = match eff_row {
+            Type::Row(effs, _) => !effs.is_empty(),
+            // A bare type variable means the caller has not yet committed to
+            // a concrete throws row. Treat as non-throwable here — if it
+            // resolves to a non-empty row later, the caller-side annotation
+            // surfaces the issue at its own throwable-call check.
+            Type::Var(_) | Type::Unit => false,
+            _ => false,
+        };
+        if !throws_something {
+            return Ok(());
+        }
+        let covered = self.linear_frame_stack.last();
+        let leaked: Vec<String> = env
+            .linear_vars
+            .iter()
+            .filter(|name| covered.map_or(true, |c| !c.contains(*name)))
+            .filter(|name| match env.vars.get(*name) {
+                Some(sch) => !is_auto_droppable(&sch.typ),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        if leaked.is_empty() {
+            return Ok(());
+        }
+        let mut sorted = leaked;
+        sorted.sort();
+        Err(TypeError::new(
+            format!(
+                "linear value cannot live across throwable call to '{}': \
+                 {:?} would leak if the call raises [E0540]",
+                func_name, sorted
+            ),
+            span.clone(),
+        ))
+    }
+
     /// Check a function body. `extra_requires` is merged into the function's
     /// declared requires -- used for handler method bodies so that the
     /// handler-level `require` clause is visible inside each method.
@@ -767,13 +856,23 @@ impl TypeChecker {
             return Err(TypeError::new("Cannot return Ref", span.clone()));
         }
         let merged_requires = merge_type_rows(&func.requires, extra_requires);
-        self.infer_body(
+        // A function body is its own linear frame: catch arms from the
+        // caller cannot span it, and any linear *parameter* the function
+        // received is the call-site contract's responsibility on a raise,
+        // not the body's. The boundary snapshot captures those param
+        // linears so the throwable-call check inside this body excludes
+        // them and only flags linears introduced after entry.
+        let outer_stack = std::mem::take(&mut self.linear_frame_stack);
+        self.linear_frame_stack.push(env.linear_vars.clone());
+        let body_result = self.infer_body(
             &func.body,
             &mut env,
             &func.ret_type,
             &merged_requires,
             &func.throws,
-        )?;
+        );
+        self.linear_frame_stack = outer_stack;
+        body_result?;
         if !contains_return(&func.body) && !matches!(func.ret_type, Type::Unit) {
             return Err(TypeError::new(
                 "Function body has no return statement; implicit return type is Unit",
@@ -916,7 +1015,7 @@ impl TypeChecker {
                         .map_err(|err| TypeError::new(err, e.span.clone()))?;
                 }
                 Stmt::Expr(e) => {
-                    self.infer(env, e, er, eq, ee)?;
+                    self.infer_stmt_level(env, e, er, eq, ee)?;
                 }
                 Stmt::Assign { target, value } => {
                     let (s_v, t_v) = self.infer(env, value, er, eq, ee)?;
@@ -1001,7 +1100,16 @@ impl TypeChecker {
                     let exn = Type::UserDefined("Exn".into(), vec![]);
                     let try_eff = Type::Row(vec![exn.clone()], Some(Box::new(ee.clone())));
                     let mut et = env.clone();
-                    self.infer_body(body, &mut et, er, eq, &try_eff)?;
+                    // Pre-try snapshot used by hole-2 (issue nexus-7eex.2):
+                    // any linear that already exists when the try begins is
+                    // the catch arm's responsibility on a raise (per hole-1
+                    // Strategy A), so a throwable call inside the body may
+                    // leave such linears live without leaking. Linears
+                    // *created* inside the body are not covered.
+                    self.linear_frame_stack.push(et.linear_vars.clone());
+                    let try_result = self.infer_body(body, &mut et, er, eq, &try_eff);
+                    self.linear_frame_stack.pop();
+                    try_result?;
                     // Strategy A (issue nexus-7eex.1): a catch arm is reached via
                     // `raise` from an arbitrary point inside the try body, so its
                     // inherited linear set is whatever was live *before* the try
@@ -1168,6 +1276,27 @@ impl TypeChecker {
         all_enums
     }
 
+    /// Infer the type of `e` while flagging it as the root expression of a
+    /// statement. The Expr::Call branch of `infer` consumes this flag once
+    /// (so recursion into args/sub-expressions is *not* at Stmt-level) and
+    /// runs the throwable-call leak check (issue nexus-7eex.2) only when
+    /// the flag was set.
+    fn infer_stmt_level(
+        &mut self,
+        env: &mut TypeEnv,
+        e: &Spanned<Expr>,
+        er: &Type,
+        eq: &Type,
+        ee: &Type,
+    ) -> Result<(Subst, Type), TypeError> {
+        self.pending_stmt_level = true;
+        let result = self.infer(env, e, er, eq, ee);
+        // `infer` always clears the flag at entry, but reset here too for
+        // any early-return path that did not reach the consumer.
+        self.pending_stmt_level = false;
+        result
+    }
+
     fn infer(
         &mut self,
         env: &mut TypeEnv,
@@ -1176,6 +1305,9 @@ impl TypeChecker {
         eq: &Type,
         ee: &Type,
     ) -> Result<(Subst, Type), TypeError> {
+        // Consume the one-shot Stmt-level flag at the very top so any
+        // recursive `infer` call below sees a fresh non-Stmt context.
+        let at_stmt_level = std::mem::replace(&mut self.pending_stmt_level, false);
         match &e.node {
             Expr::Literal(l) => Ok((
                 HashMap::new(),
@@ -1551,6 +1683,14 @@ impl TypeChecker {
                         }
                     };
                     s = compose_subst(&s, &su);
+                }
+                if at_stmt_level {
+                    self.check_throwable_call_does_not_leak_linear(
+                        &func,
+                        &apply_subst_type(&s, &ec),
+                        env,
+                        &e.span,
+                    )?;
                 }
                 Ok((s.clone(), apply_subst_type(&s, &rt)))
             }
@@ -2004,7 +2144,24 @@ impl TypeChecker {
                 }
 
                 let expanded_throws = expand_exception_groups_in_throws(throws, &lambda_env);
-                self.infer_body(body, &mut lambda_env, ret_type, requires, &expanded_throws)?;
+                // A lambda body is its own linear frame (see
+                // `check_function` for the rationale): catch arms from the
+                // outer scope cannot span the lambda, and the linear params
+                // bound just above are the call-site contract's
+                // responsibility on a raise, not the body's. Capture them
+                // in the boundary snapshot so the throwable-call check
+                // excludes them.
+                let outer_stack = std::mem::take(&mut self.linear_frame_stack);
+                self.linear_frame_stack.push(lambda_env.linear_vars.clone());
+                let lambda_result = self.infer_body(
+                    body,
+                    &mut lambda_env,
+                    ret_type,
+                    requires,
+                    &expanded_throws,
+                );
+                self.linear_frame_stack = outer_stack;
+                lambda_result?;
                 if !contains_return(body) && !matches!(ret_type, Type::Unit) {
                     return Err(TypeError::new(
                         "Function body has no return statement; implicit return type is Unit",

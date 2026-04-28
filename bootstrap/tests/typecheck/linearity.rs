@@ -72,3 +72,209 @@ fn test_try_catch_arm_consumes_pre_try_linear_pass() {
     "#,
     );
 }
+
+/// Hole-2 (throwable call across linear, issue nexus-7eex.2):
+///
+/// The minimal example from the issue: a linear is bound, then a throwable
+/// call fires while the linear is still live. If the call raises, the
+/// linear is dropped without ever being consumed. With Strategy A from the
+/// issue, the typechecker rejects the program at the throwable-call site
+/// with `linear value cannot live across throwable call`. Pre-fix this
+/// program PASSed because `Expr::Raise` left `linear_vars` untouched and
+/// `Expr::Call` did not look at the callee's throw row.
+#[test]
+fn test_linear_across_throwable_call_outside_try_rejects() {
+    let err = should_fail_typecheck(
+        r#"
+    exception Oops(msg: string)
+    type FileToken = { id: i64 }
+
+    let open_file = fn () -> %FileToken do
+        let h: FileToken = { id: 1 }
+        let %lh = h
+        return %lh
+    end
+
+    let may_throw = fn () -> unit throws { Exn } do
+        raise Oops(msg: "boom")
+        return ()
+    end
+
+    let close = fn (h: %FileToken) -> unit do
+        match h do | { id: _ } -> () end
+        return ()
+    end
+
+    let main = fn () -> unit throws { Exn } do
+        let %x = open_file()
+        may_throw()
+        close(h: %x)
+        return ()
+    end
+    "#,
+    );
+    let lower = err.to_lowercase();
+    assert!(
+        lower.contains("linear value cannot live across throwable call"),
+        "expected linear-across-throwable-call error, got: {}",
+        err
+    );
+    assert!(
+        err.contains("E0540"),
+        "expected error code E0540 in message, got: {}",
+        err
+    );
+}
+
+/// Companion positive test: consume the linear *before* the throwable
+/// call. No linear is live at the call site, so the program typechecks.
+#[test]
+fn test_linear_consumed_before_throwable_call_passes() {
+    should_typecheck(
+        r#"
+    exception Oops(msg: string)
+    type FileToken = { id: i64 }
+
+    let open_file = fn () -> %FileToken do
+        let h: FileToken = { id: 1 }
+        let %lh = h
+        return %lh
+    end
+
+    let may_throw = fn () -> unit throws { Exn } do
+        raise Oops(msg: "boom")
+        return ()
+    end
+
+    let close = fn (h: %FileToken) -> unit do
+        match h do | { id: _ } -> () end
+        return ()
+    end
+
+    let main = fn () -> unit do
+        let %x = open_file()
+        close(h: %x)
+        try
+            may_throw()
+        catch _ -> ()
+        end
+        return ()
+    end
+    "#,
+    );
+}
+
+/// Negative-control: a *non*-throwable (`throws { }`) call may safely be
+/// invoked while a linear is live — the linear cannot be lost via raise
+/// because there is no raise. Guards against rejecting all calls.
+#[test]
+fn test_linear_across_pure_call_passes() {
+    should_typecheck(
+        r#"
+    type FileToken = { id: i64 }
+
+    let open_file = fn () -> %FileToken do
+        let h: FileToken = { id: 1 }
+        let %lh = h
+        return %lh
+    end
+
+    let pure_call = fn () -> unit do
+        return ()
+    end
+
+    let close = fn (h: %FileToken) -> unit do
+        match h do | { id: _ } -> () end
+        return ()
+    end
+
+    let main = fn () -> unit do
+        let %x = open_file()
+        pure_call()
+        close(h: %x)
+        return ()
+    end
+    "#,
+    );
+}
+
+/// Inside a `try` body, a linear that already existed *before* the try is
+/// the catch arm's responsibility (Strategy A from issue nexus-7eex.1). A
+/// throwable call inside the try body, with that pre-try linear still
+/// live, is therefore allowed: the catch arm — which inherits the pre-try
+/// snapshot — must consume it on the raise path.
+#[test]
+fn test_linear_across_throwable_call_inside_try_with_catch_consume_passes() {
+    should_typecheck(
+        r#"
+    exception Oops(msg: string)
+    type FileToken = { id: i64 }
+
+    let may_throw = fn () -> unit throws { Exn } do
+        raise Oops(msg: "boom")
+        return ()
+    end
+
+    let close = fn (h: %FileToken) -> unit do
+        match h do | { id: _ } -> () end
+        return ()
+    end
+
+    let main = fn () -> unit do
+        let h: FileToken = { id: 1 }
+        let %x = h
+        try
+            may_throw()
+            close(h: %x)
+        catch _ ->
+            close(h: %x)
+        end
+        return ()
+    end
+    "#,
+    );
+}
+
+/// A linear *created inside* the try body, before a throwable call, is not
+/// covered by the catch arm (the arm only sees the pre-try snapshot). This
+/// is still a leak on raise and must be rejected.
+#[test]
+fn test_linear_created_inside_try_across_throwable_call_rejects() {
+    let err = should_fail_typecheck(
+        r#"
+    exception Oops(msg: string)
+    type FileToken = { id: i64 }
+
+    let open_file = fn () -> %FileToken do
+        let h: FileToken = { id: 1 }
+        let %lh = h
+        return %lh
+    end
+
+    let may_throw = fn () -> unit throws { Exn } do
+        raise Oops(msg: "boom")
+        return ()
+    end
+
+    let close = fn (h: %FileToken) -> unit do
+        match h do | { id: _ } -> () end
+        return ()
+    end
+
+    let main = fn () -> unit do
+        try
+            let %x = open_file()
+            may_throw()
+            close(h: %x)
+        catch _ -> ()
+        end
+        return ()
+    end
+    "#,
+    );
+    assert!(
+        err.to_lowercase().contains("linear value cannot live across throwable call"),
+        "expected linear-across-throwable-call error, got: {}",
+        err
+    );
+}
