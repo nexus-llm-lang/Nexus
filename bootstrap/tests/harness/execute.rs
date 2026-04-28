@@ -762,5 +762,109 @@ fn define_component_runtime_stubs(
         )
         .map_err(|e| e.to_string())?;
     }
+    // Math intrinsics — pure f64 unary ops. The self-hosted (nxc) codegen
+    // inlines these as wasm `f64.{sqrt,floor,ceil,abs}` opcodes, but the
+    // Rust bootstrap codegen still emits them as host imports. Wire them to
+    // their libm equivalents so composed components instantiate.
+    {
+        let mut inst = linker
+            .instance("nexus:runtime/math")
+            .map_err(|e| format!("failed to create math instance: {}", e))?;
+        inst.func_wrap(
+            "f64-sqrt",
+            |_: wasmtime::StoreContextMut<'_, WasiState>,
+             (val,): (f64,)|
+             -> wasmtime::Result<(f64,)> { Ok((val.sqrt(),)) },
+        )
+        .map_err(|e| e.to_string())?;
+        inst.func_wrap(
+            "f64-floor",
+            |_: wasmtime::StoreContextMut<'_, WasiState>,
+             (val,): (f64,)|
+             -> wasmtime::Result<(f64,)> { Ok((val.floor(),)) },
+        )
+        .map_err(|e| e.to_string())?;
+        inst.func_wrap(
+            "f64-ceil",
+            |_: wasmtime::StoreContextMut<'_, WasiState>,
+             (val,): (f64,)|
+             -> wasmtime::Result<(f64,)> { Ok((val.ceil(),)) },
+        )
+        .map_err(|e| e.to_string())?;
+        inst.func_wrap(
+            "f64-abs",
+            |_: wasmtime::StoreContextMut<'_, WasiState>,
+             (val,): (f64,)|
+             -> wasmtime::Result<(f64,)> { Ok((val.abs(),)) },
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // Memory intrinsics — load/store/size/grow over linear memory. Component
+    // model host functions cannot reach guest memory, so these always trap.
+    // The nxc codegen inlines them as wasm load/store/memory.size/memory.grow
+    // ops; user programs reaching this path through the Rust bootstrap codegen
+    // will trap rather than silently corrupt state.
+    {
+        let mut inst = linker
+            .instance("nexus:runtime/memory")
+            .map_err(|e| format!("failed to create memory instance: {}", e))?;
+        let trap_msg = "nexus:runtime/memory ops are not provisionable from a component-model host; recompile via the self-hosted (nxc) codegen which inlines them as wasm memory ops";
+        inst.func_wrap(
+            "mem-load-i32",
+            move |_: wasmtime::StoreContextMut<'_, WasiState>,
+                  (_addr,): (i64,)|
+                  -> wasmtime::Result<(i64,)> { Err(wasmtime::Error::msg(trap_msg)) },
+        )
+        .map_err(|e| e.to_string())?;
+        inst.func_wrap(
+            "mem-store-i32",
+            move |_: wasmtime::StoreContextMut<'_, WasiState>,
+                  (_addr, _val): (i64, i64)|
+                  -> wasmtime::Result<()> { Err(wasmtime::Error::msg(trap_msg)) },
+        )
+        .map_err(|e| e.to_string())?;
+        inst.func_wrap(
+            "mem-load-u8",
+            move |_: wasmtime::StoreContextMut<'_, WasiState>,
+                  (_addr,): (i64,)|
+                  -> wasmtime::Result<(i64,)> { Err(wasmtime::Error::msg(trap_msg)) },
+        )
+        .map_err(|e| e.to_string())?;
+        inst.func_wrap(
+            "mem-store-u8",
+            move |_: wasmtime::StoreContextMut<'_, WasiState>,
+                  (_addr, _val): (i64, i64)|
+                  -> wasmtime::Result<()> { Err(wasmtime::Error::msg(trap_msg)) },
+        )
+        .map_err(|e| e.to_string())?;
+        inst.func_wrap(
+            "mem-load-i64",
+            move |_: wasmtime::StoreContextMut<'_, WasiState>,
+                  (_addr,): (i64,)|
+                  -> wasmtime::Result<(i64,)> { Err(wasmtime::Error::msg(trap_msg)) },
+        )
+        .map_err(|e| e.to_string())?;
+        inst.func_wrap(
+            "mem-store-i64",
+            move |_: wasmtime::StoreContextMut<'_, WasiState>,
+                  (_addr, _val): (i64, i64)|
+                  -> wasmtime::Result<()> { Err(wasmtime::Error::msg(trap_msg)) },
+        )
+        .map_err(|e| e.to_string())?;
+        inst.func_wrap(
+            "mem-size",
+            move |_: wasmtime::StoreContextMut<'_, WasiState>,
+                  (): ()|
+                  -> wasmtime::Result<(i64,)> { Err(wasmtime::Error::msg(trap_msg)) },
+        )
+        .map_err(|e| e.to_string())?;
+        inst.func_wrap(
+            "mem-grow",
+            move |_: wasmtime::StoreContextMut<'_, WasiState>,
+                  (_delta,): (i64,)|
+                  -> wasmtime::Result<(i64,)> { Err(wasmtime::Error::msg(trap_msg)) },
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }

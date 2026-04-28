@@ -49,6 +49,24 @@ interface lazy {\n\
     lazy-spawn: func(thunk: s64, env-size: s32) -> s64;\n\
     lazy-join: func(task-id: s64) -> s64;\n\
 }\n\
+\n\
+interface math {\n\
+    f64-sqrt: func(val: f64) -> f64;\n\
+    f64-floor: func(val: f64) -> f64;\n\
+    f64-ceil: func(val: f64) -> f64;\n\
+    f64-abs: func(val: f64) -> f64;\n\
+}\n\
+\n\
+interface memory {\n\
+    mem-load-i32: func(addr: s64) -> s64;\n\
+    mem-store-i32: func(addr: s64, val: s64);\n\
+    mem-load-u8: func(addr: s64) -> s64;\n\
+    mem-store-u8: func(addr: s64, val: s64);\n\
+    mem-load-i64: func(addr: s64) -> s64;\n\
+    mem-store-i64: func(addr: s64, val: s64);\n\
+    mem-size: func() -> s64;\n\
+    mem-grow: func(delta: s64) -> s64;\n\
+}\n\
 ";
 
 /// Compose a user core WASM module with the stdlib component.
