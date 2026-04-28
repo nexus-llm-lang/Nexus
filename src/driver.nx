@@ -9,7 +9,7 @@
 import * as lexer from "src/frontend/lexer.nx"
 import * as parser from "src/frontend/parser.nx"
 import * as arena from "std:arena"
-import { Program, SpannedTopLevel, EnumDef, GlobalLet } from "src/common/ast.nx"
+import { Program, SpannedTopLevel, EnumDef, GlobalLet, SpannedExpr, ExprLambda, TypeExpr, TyRow, TyUserDefined } from "src/common/ast.nx"
 import { InvalidUsage, WriteFailed, InTargetFile }, * as err from "src/common/error.nx"
 import { RenameEntry }, * as symtab from "src/ir/symtab.nx"
 import * as resolve from "src/ir/resolve.nx"
@@ -34,6 +34,7 @@ import { Clock }, * as clock_mod from "std:clock"
 import * as str from "std:string_ops"
 import * as proc from "std:process"
 import { IndexOutOfBounds }, * as list from "std:list"
+import { Option, Some, None } from "std:option"
 
 // ─── Dep memory pages reader ────────────────────────────────────────────────
 // Read initial pages from a WASM binary's memory section (section 5).
@@ -161,16 +162,197 @@ let write_and_free = fn (buf: %ByteBuffer, path: string) -> bool do
   return ok
 end
 
+// ─── Capability reporting (--explain-capabilities) ──────────────────────────
+// Mirrors bootstrap/src/artifact.rs. Extracts the entry's `require { Perm… }`
+// row from the parsed AST, maps `PermX` → `X`, and prints either text or JSON
+// describing the capabilities (and, in `wasmtime` mode, a ready-to-run command).
+
+type ExplainCaps = ExplainYes | ExplainNone | ExplainWasmtime
+
+type ExplainFormat = FormatText | FormatJson
+
+type ParsedExplainArgs = ParsedExplainArgs(remaining: [string], explain: ExplainCaps, format: ExplainFormat)
+
+let parse_explain_caps_value = fn (s: string) -> Option<ExplainCaps> do
+  if s == "yes" then return Some(val: ExplainYes) end
+  if s == "none" then return Some(val: ExplainNone) end
+  if s == "wasmtime" then return Some(val: ExplainWasmtime) end
+  return None
+end
+
+let parse_explain_format_value = fn (s: string) -> Option<ExplainFormat> do
+  if s == "text" then return Some(val: FormatText) end
+  if s == "json" then return Some(val: FormatJson) end
+  return None
+end
+
+let perm_to_cap_name = fn (perm: string) -> Option<string> do
+  if perm == "PermFs" then return Some(val: "Fs") end
+  if perm == "PermNet" then return Some(val: "Net") end
+  if perm == "PermConsole" then return Some(val: "Console") end
+  if perm == "PermRandom" then return Some(val: "Random") end
+  if perm == "PermClock" then return Some(val: "Clock") end
+  if perm == "PermProc" then return Some(val: "Proc") end
+  if perm == "PermEnv" then return Some(val: "Env") end
+  return None
+end
+
+let collect_cap_names = fn (xs: [TypeExpr]) -> [string] do
+  match xs do
+    | [] -> return []
+    | TyUserDefined(name, args: []) :: rest ->
+      if let Some(val: c) = perm_to_cap_name(perm: name) then
+        return c :: collect_cap_names(xs: rest)
+      end
+      return collect_cap_names(xs: rest)
+    | _ :: rest -> return collect_cap_names(xs: rest)
+  end
+end
+
+let extract_caps_from_row = fn (row: TypeExpr) -> [string] do
+  if let TyRow(types, rest: _) = row then
+    return collect_cap_names(xs: types)
+  end
+  return []
+end
+
+/// Walk top-level defs; for `let main = fn (...) require { Perm… }`, return
+/// the capability names. Adds `Proc` when `main` takes `args` so argv can
+/// be read at runtime (matches bootstrap behavior).
+let find_main_caps = fn (defs: [SpannedTopLevel]) -> [string] do
+  match defs do
+    | [] -> return []
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value: SpannedExpr(node: ExprLambda(type_params: _, params, ret_type: _, requires, throw_row: _, body: _), span: _))), span: _) :: rest ->
+      if name == "main" then
+        let caps = extract_caps_from_row(row: requires)
+        if list.length(xs: params) > 0 then
+          if list_has_str(xs: caps, s: "Proc") then return caps end
+          return list.concat(xs: caps, ys: ["Proc"])
+        end
+        return caps
+      end
+      return find_main_caps(defs: rest)
+    | _ :: rest -> return find_main_caps(defs: rest)
+  end
+end
+
+/// Strip `--explain-capabilities VALUE` and `--explain-capabilities-format VALUE`
+/// pairs from `xs`. Other args are preserved in order.
+let strip_explain_flags = fn (xs: [string], explain: ExplainCaps, format: ExplainFormat) -> ParsedExplainArgs throws { Exn } do
+  match xs do
+    | [] -> return ParsedExplainArgs(remaining: [], explain, format)
+    | flag :: rest ->
+      if flag == "--explain-capabilities" then
+        match rest do
+          | [] -> raise InvalidUsage(detail: "--explain-capabilities requires a value (yes|none|wasmtime)")
+          | value :: rest2 ->
+            if let Some(val: e) = parse_explain_caps_value(s: value) then
+              return strip_explain_flags(xs: rest2, explain: e, format)
+            end
+            raise InvalidUsage(detail: "invalid --explain-capabilities value: " ++ value)
+        end
+      end
+      if flag == "--explain-capabilities-format" then
+        match rest do
+          | [] -> raise InvalidUsage(detail: "--explain-capabilities-format requires a value (text|json)")
+          | value :: rest2 ->
+            if let Some(val: f) = parse_explain_format_value(s: value) then
+              return strip_explain_flags(xs: rest2, explain, format: f)
+            end
+            raise InvalidUsage(detail: "invalid --explain-capabilities-format value: " ++ value)
+        end
+      end
+      let ParsedExplainArgs(remaining: rest_args, explain: e2, format: f2) = strip_explain_flags(xs: rest, explain, format)
+      return ParsedExplainArgs(remaining: flag :: rest_args, explain: e2, format: f2)
+  end
+end
+
+let cap_wasmtime_flags = fn (name: string) -> [string] do
+  if name == "Net" then return ["--wasi", "http", "--wasi", "inherit-network"] end
+  if name == "Fs" then return ["--dir", "."] end
+  return []
+end
+
+let collect_all_wasmtime_flags = fn (caps: [string]) -> [string] do
+  match caps do
+    | [] -> return []
+    | c :: rest -> return list.concat(xs: cap_wasmtime_flags(name: c), ys: collect_all_wasmtime_flags(caps: rest))
+  end
+end
+
+/// Wasm proposals required at runtime. The bundled stdlib uses every one of
+/// these (TCO, raise/throws, closures, handlers), so emit all four whenever
+/// wasmtime mode is selected — detection on the user's AST alone would
+/// underreport because stdlib brings them in regardless.
+let wasmtime_feature_flags = fn () -> [string] do
+  return ["-W", "tail-call=y", "-W", "exceptions=y", "-W", "function-references=y", "-W", "stack-switching=y"]
+end
+
+let quote_strings = fn (xs: [string]) -> [string] do
+  match xs do
+    | [] -> return []
+    | v :: rest -> return ("\"" ++ v ++ "\"") :: quote_strings(xs: rest)
+  end
+end
+
+let build_run_cmd = fn (output_name: string, caps: [string]) -> string do
+  let feat_flags = wasmtime_feature_flags()
+  let cap_flags = collect_all_wasmtime_flags(caps)
+  let argv = list.concat(xs: feat_flags, ys: list.concat(xs: cap_flags, ys: [output_name]))
+  return "wasmtime run " ++ str.join(xs: argv, sep: " ")
+end
+
+let print_build_result_text = fn (output_name: string, caps: [string], explain: ExplainCaps) -> unit require { Console } do
+  Console.eprintln(val: "Built " ++ output_name)
+  match explain do
+    | ExplainNone -> return ()
+    | ExplainYes ->
+      if list.length(xs: caps) > 0 then
+        Console.eprintln(val: "Capabilities: " ++ str.join(xs: caps, sep: ", "))
+      end
+    | ExplainWasmtime ->
+      if list.length(xs: caps) > 0 then
+        Console.eprintln(val: "Capabilities: " ++ str.join(xs: caps, sep: ", "))
+      end
+      Console.eprintln(val: "Run: " ++ build_run_cmd(output_name, caps))
+  end
+end
+
+let print_build_result_json = fn (output_name: string, caps: [string], explain: ExplainCaps) -> unit require { Console } do
+  match explain do
+    | ExplainNone ->
+      Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\"}")
+    | ExplainYes ->
+      let caps_quoted = quote_strings(xs: caps)
+      Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\",\"capabilities\":[" ++ str.join(xs: caps_quoted, sep: ",") ++ "]}")
+    | ExplainWasmtime ->
+      let caps_quoted = quote_strings(xs: caps)
+      let all_flags = list.concat(xs: wasmtime_feature_flags(), ys: collect_all_wasmtime_flags(caps))
+      let flags_quoted = quote_strings(xs: all_flags)
+      let cmd = build_run_cmd(output_name, caps)
+      Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\",\"capabilities\":[" ++ str.join(xs: caps_quoted, sep: ",") ++ "],\"wasmtime\":{\"command\":\"" ++ cmd ++ "\",\"flags\":[" ++ str.join(xs: flags_quoted, sep: ",") ++ "]}}")
+  end
+end
+
+let print_build_result = fn (output_name: string, caps: [string], explain: ExplainCaps, format: ExplainFormat) -> unit require { Console } do
+  match format do
+    | FormatText -> print_build_result_text(output_name, caps, explain)
+    | FormatJson -> print_build_result_json(output_name, caps, explain)
+  end
+end
+
 let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock } do
   inject stdio.system_handler, fs_mod.system_handler, clock_mod.system_handler do
   try
     let verbose = has_verbose_flag(xs: args)
-    let clean_args = strip_verbose_flag(xs: args)
+    let args_after_verbose = strip_verbose_flag(xs: args)
+    let ParsedExplainArgs(remaining: clean_args, explain, format) = strip_explain_flags(xs: args_after_verbose, explain: ExplainYes, format: FormatText)
     let argc = list.length(xs: clean_args)
     if argc < 2 then
       Console.eprintln(val: "Usage: nxc <input.nx> [output.wasm]")
       Console.eprintln(val: "       nxc --dump-imports <input.nx>")
       Console.eprintln(val: "       nxc --verbose <input.nx> [output.wasm]")
+      Console.eprintln(val: "       nxc [--explain-capabilities yes|none|wasmtime] [--explain-capabilities-format text|json] <input.nx> [output.wasm]")
       raise InvalidUsage(detail: "missing input file argument")
     end
 
@@ -262,10 +444,6 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock 
 
     let %wasm_buf = wmerge.merge_with_stdlib(core_wasm: %wasm_buf, stdlib_path: std_wasm_path)
 
-    // All IR data is now dead. ByteBuffer is host-managed (not on nexus heap).
-    // Reset heap to free all compiler data structures.
-    arena.heap_reset(mark: pipeline_mark)
-
     let ok = write_and_free(buf: %wasm_buf, path: output_path)
     let t10 = Clock.now()
 
@@ -274,9 +452,17 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock 
         Console.eprintln(val: "[nxc] write (" ++ str.from_i64(val: t10 - t9) ++ "ms)")
         Console.eprintln(val: "nxc: wrote " ++ output_path ++ " (total " ++ str.from_i64(val: t10 - t0) ++ "ms)")
       end
+      // Extract capabilities from the entry program's `main` requires-row
+      // before resetting the arena (the AST lives in the marked region).
+      let caps = find_main_caps(defs: get_defs(prog))
+      print_build_result(output_name: output_path, caps, explain, format)
     else
       raise WriteFailed(path: output_path)
     end
+
+    // All IR data is now dead. ByteBuffer is host-managed (not on nexus heap).
+    // Reset heap to free all compiler data structures.
+    arena.heap_reset(mark: pipeline_mark)
     catch inner ->
       raise InTargetFile(path: input_path, detail: err.format_error(err: inner))
     end
