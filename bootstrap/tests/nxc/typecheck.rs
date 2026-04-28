@@ -19,3 +19,8 @@ fn lambda_capture_linearity() {
 fn handler_first_class() {
     exec_with_stdlib(&read_fixture("nxc/test_handler_first_class.nx"));
 }
+
+#[test]
+fn match_exhaustiveness() {
+    exec_with_stdlib(&read_fixture("nxc/test_match_exhaustiveness.nx"));
+}
