@@ -22,4 +22,10 @@
   ;; host-http-stop(server_id: i64) -> i32
   (func (export "host-http-stop") (param i64) (result i32)
     unreachable)
+
+  ;; host-bridge-finalize() -> i64 — drain SERVERS/CONNS thread_locals; the
+  ;; standalone path holds no host state, so this stub is a safe no-op
+  ;; returning 0 dropped entries (NOT unreachable).
+  (func (export "host-bridge-finalize") (result i64)
+    i64.const 0)
 )
