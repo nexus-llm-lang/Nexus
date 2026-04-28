@@ -9,6 +9,7 @@ pub mod fs;
 pub mod json;
 pub mod jsonrpc;
 pub mod lazy;
+pub mod lsp_main;
 pub mod lsp_protocol;
 pub mod lsp_server;
 pub mod list;

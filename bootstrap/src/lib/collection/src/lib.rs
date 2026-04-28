@@ -651,7 +651,7 @@ fn read_into_new_buf<R: Read>(reader: &mut R, n: i64) -> i64 {
 /// shorter than `n` (caller inspects `length`). Binary-clean: bytes are
 /// preserved verbatim, no encoding interpretation.
 #[cfg_attr(not(feature = "component"), no_mangle)]
-pub extern "C" fn __nx_read_bytes(n: i64) -> i64 {
+pub extern "C" fn __nx_buf_read_stdin(n: i64) -> i64 {
     let stdin = std::io::stdin();
     let mut handle = stdin.lock();
     read_into_new_buf(&mut handle, n)
