@@ -739,3 +739,52 @@ fn normalize_string_imports(wasm: &[u8]) -> Vec<u8> {
     }
     module.finish()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collect_imports(wasm: &[u8]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(wasm).flatten() {
+            if let Payload::ImportSection(reader) = payload {
+                for imp in reader.into_iter().flatten() {
+                    out.push((imp.module.to_string(), imp.name.to_string()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Acceptance for nexus-upzz.10: the bridge guest must drive the
+    /// FutureTrailers resource through `subscribe().block()` then `get()`
+    /// before dropping it, so wasi-http hosts that defer trailer delivery
+    /// can release any deferred bookkeeping. Pin the resulting wasi-http
+    /// import shape against the compiled bridge module so a regression
+    /// (dropping the future without polling) is caught at unit-test time.
+    #[test]
+    fn bridge_polls_future_trailers_before_drop() {
+        let imports = collect_imports(NEXUS_HOST_BRIDGE_WASM);
+        let trailers_imports: Vec<&(String, String)> = imports
+            .iter()
+            .filter(|(_, n)| n.contains("future-trailers"))
+            .collect();
+        let names: Vec<&str> = trailers_imports.iter().map(|(_, n)| n.as_str()).collect();
+
+        assert!(
+            names.iter().any(|n| n.contains("future-trailers.subscribe")),
+            "bridge must subscribe() the FutureTrailers (got {:?})",
+            names
+        );
+        assert!(
+            names.iter().any(|n| n.contains("future-trailers.get")),
+            "bridge must get() the FutureTrailers after block (got {:?})",
+            names
+        );
+        assert!(
+            names.iter().any(|n| n.contains("[resource-drop]future-trailers")),
+            "bridge must drop the FutureTrailers (got {:?})",
+            names
+        );
+    }
+}
