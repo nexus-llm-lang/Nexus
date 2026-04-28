@@ -1,0 +1,251 @@
+/**
+ * typecheck/capture: closure-capture classification for T-Lambda.
+ *
+ * Walks a lambda body to determine whether captured outer bindings make the
+ * resulting closure type linear, and rejects captures of mutable-ref bindings.
+ *
+ * Spec (docs/spec/type-system-formal.md, T-Lambda):
+ *   Γ_cap = { x:^1 S ∈ Γ | x ∈ fv(s) }
+ *   ∀ x ∈ fv(s) ∩ dom(Γ).  Γ(x) ≠ ~σ
+ *   if Γ_cap ≠ ∅ then τ_→ becomes %τ_→
+ *
+ * The walk threads a `bound: [string]` of names introduced by inner binders
+ * (lambda params, body lets, for-loop vars, try catch params, match-pattern
+ * bindings, nested lambdas) so that body-local shadowing is honoured.
+ */
+
+import { Span } from "src/common/token.nx"
+import {
+  TypeExpr, TyLinear, TyLazy, TyArray, TyRef
+} from "src/common/ast.nx"
+import {
+  HirStmt, HirStmtKind, HirExpr, HirExprKind,
+  HirCallArg, HirNamedExpr, HirMatchCase, HirParam,
+  HirPatternKind, PLit, PVar, PCtor, PRec, PWild, POr,
+  HirPatternField, HirRecordPatField
+} from "src/ir/hir_types.nx"
+import { EnvEntry, Scheme, env_lookup } from "src/typecheck/types.nx"
+import { Option, Some, None } from "std:option"
+
+export type RefCaptureHit = RefCaptureHit(name: string, span: Span)
+
+export type CaptureScan = CaptureScan(linear: bool, ref_hit: Option<RefCaptureHit>)
+
+export let empty_scan = fn () -> CaptureScan do
+  return CaptureScan(linear: false, ref_hit: None)
+end
+
+/// Scan a lambda body for captures from `outer_env`.
+///
+/// `outer_env` is the environment as visible BEFORE the lambda's params are
+/// added (i.e. the enclosing scope). Param names are added to the local
+/// shadow set so they do not look like captures of an outer binding of the
+/// same name.
+export let scan_lambda_captures = fn (
+  body: [HirStmt],
+  outer_env: [EnvEntry],
+  params: [HirParam]
+) -> CaptureScan throws { Exn } do
+  let bound = collect_param_names(params, acc: [])
+  return scan_stmts(stmts: body, outer_env, bound, acc: empty_scan())
+end
+
+let collect_param_names = fn (params: [HirParam], acc: [string]) -> [string] do
+  match params do
+    | [] -> return acc
+    | HirParam(name: n, label: _, typ: _) :: rest ->
+      return collect_param_names(params: rest, acc: n :: acc)
+  end
+end
+
+let str_member = fn (xs: [string], target: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == target then return true end
+      return str_member(xs: rest, target)
+  end
+end
+
+let visit_var = fn (
+  name: string, span: Span,
+  outer_env: [EnvEntry], bound: [string], acc: CaptureScan
+) -> CaptureScan do
+  if str_member(xs: bound, target: name) then return acc end
+  match env_lookup(env: outer_env, name) do
+    | None -> return acc
+    | Some(val: Scheme(vars: _, typ: t)) ->
+      let CaptureScan(linear: lin, ref_hit: rh) = acc
+      match t do
+        | TyLinear(_) -> return CaptureScan(linear: true, ref_hit: rh)
+        | TyLazy(_) -> return CaptureScan(linear: true, ref_hit: rh)
+        | TyArray(_) -> return CaptureScan(linear: true, ref_hit: rh)
+        | TyRef(_) ->
+          match rh do
+            | Some(_) -> return acc
+            | None -> return CaptureScan(linear: lin, ref_hit: Some(val: RefCaptureHit(name, span)))
+          end
+        | _ -> return acc
+      end
+  end
+end
+
+let scan_stmts = fn (
+  stmts: [HirStmt], outer_env: [EnvEntry], bound: [string], acc: CaptureScan
+) -> CaptureScan throws { Exn } do
+  match stmts do
+    | [] -> return acc
+    | HirStmt(node: nd, span: _) :: rest ->
+      match nd do
+        | Let(name: n, typ: _, value: v) ->
+          let acc1 = scan_expr(expr: v, outer_env, bound, acc)
+          return scan_stmts(stmts: rest, outer_env, bound: n :: bound, acc: acc1)
+        | Expr(expr: e) ->
+          let acc1 = scan_expr(expr: e, outer_env, bound, acc)
+          return scan_stmts(stmts: rest, outer_env, bound, acc: acc1)
+        | Return(expr: e) ->
+          let acc1 = scan_expr(expr: e, outer_env, bound, acc)
+          return scan_stmts(stmts: rest, outer_env, bound, acc: acc1)
+        | Assign(target: t, value: v) ->
+          let acc1 = scan_expr(expr: t, outer_env, bound, acc)
+          let acc2 = scan_expr(expr: v, outer_env, bound, acc: acc1)
+          return scan_stmts(stmts: rest, outer_env, bound, acc: acc2)
+        | Try(body: b, catch_param: cp, catch_body: cb) ->
+          let acc1 = scan_stmts(stmts: b, outer_env, bound, acc)
+          let acc2 = scan_stmts(stmts: cb, outer_env, bound: cp :: bound, acc: acc1)
+          return scan_stmts(stmts: rest, outer_env, bound, acc: acc2)
+        | Inject(handlers: _, body: b) ->
+          let acc1 = scan_stmts(stmts: b, outer_env, bound, acc)
+          return scan_stmts(stmts: rest, outer_env, bound, acc: acc1)
+      end
+  end
+end
+
+let scan_expr = fn (
+  expr: HirExpr, outer_env: [EnvEntry], bound: [string], acc: CaptureScan
+) -> CaptureScan throws { Exn } do
+  let HirExpr(node: nd, span: sp) = expr
+  match nd do
+    | Literal(_) -> return acc
+    | Variable(name: n, sigil: _) -> return visit_var(name: n, span: sp, outer_env, bound, acc)
+    | Borrow(name: n, sigil: _) -> return visit_var(name: n, span: sp, outer_env, bound, acc)
+    | BinOp(left: l, op: _, right: r) ->
+      let acc1 = scan_expr(expr: l, outer_env, bound, acc)
+      return scan_expr(expr: r, outer_env, bound, acc: acc1)
+    | Call(func: f, args) ->
+      let acc1 = visit_var(name: f, span: sp, outer_env, bound, acc)
+      return scan_call_args(args, outer_env, bound, acc: acc1)
+    | Ctor(variant: _, args) -> return scan_exprs(exprs: args, outer_env, bound, acc)
+    | Record(fields: fs) -> return scan_named_exprs(exprs: fs, outer_env, bound, acc)
+    | Array(elems: es) -> return scan_exprs(exprs: es, outer_env, bound, acc)
+    | Index(target: t, index: i) ->
+      let acc1 = scan_expr(expr: t, outer_env, bound, acc)
+      return scan_expr(expr: i, outer_env, bound, acc: acc1)
+    | FieldAccess(target: t, field: _) -> return scan_expr(expr: t, outer_env, bound, acc)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      let acc1 = scan_expr(expr: c, outer_env, bound, acc)
+      let acc2 = scan_stmts(stmts: tb, outer_env, bound, acc: acc1)
+      match eb do
+        | Some(val: stmts) -> return scan_stmts(stmts, outer_env, bound, acc: acc2)
+        | None -> return acc2
+      end
+    | Match(target: t, cases: cs) ->
+      let acc1 = scan_expr(expr: t, outer_env, bound, acc)
+      return scan_match_cases(cases: cs, outer_env, bound, acc: acc1)
+    | While(cond: c, body: b) ->
+      let acc1 = scan_expr(expr: c, outer_env, bound, acc)
+      return scan_stmts(stmts: b, outer_env, bound, acc: acc1)
+    | For(var: v, start: s, end_expr: e, body: b) ->
+      let acc1 = scan_expr(expr: s, outer_env, bound, acc)
+      let acc2 = scan_expr(expr: e, outer_env, bound, acc: acc1)
+      return scan_stmts(stmts: b, outer_env, bound: v :: bound, acc: acc2)
+    | Lambda(type_params: _, params: ps, ret_type: _, body: b) ->
+      let inner_bound = collect_param_names(params: ps, acc: bound)
+      return scan_stmts(stmts: b, outer_env, bound: inner_bound, acc)
+    | Raise(expr: e) -> return scan_expr(expr: e, outer_env, bound, acc)
+    | Force(expr: e) -> return scan_expr(expr: e, outer_env, bound, acc)
+    | Thunk(body: b) -> return scan_expr(expr: b, outer_env, bound, acc)
+    | ExternalRef(_) -> return acc
+    | Handler(_) -> return acc
+  end
+end
+
+let scan_exprs = fn (
+  exprs: [HirExpr], outer_env: [EnvEntry], bound: [string], acc: CaptureScan
+) -> CaptureScan throws { Exn } do
+  match exprs do
+    | [] -> return acc
+    | e :: rest ->
+      let acc1 = scan_expr(expr: e, outer_env, bound, acc)
+      return scan_exprs(exprs: rest, outer_env, bound, acc: acc1)
+  end
+end
+
+let scan_call_args = fn (
+  args: [HirCallArg], outer_env: [EnvEntry], bound: [string], acc: CaptureScan
+) -> CaptureScan throws { Exn } do
+  match args do
+    | [] -> return acc
+    | HirCallArg(label: _, value: v) :: rest ->
+      let acc1 = scan_expr(expr: v, outer_env, bound, acc)
+      return scan_call_args(args: rest, outer_env, bound, acc: acc1)
+  end
+end
+
+let scan_named_exprs = fn (
+  exprs: [HirNamedExpr], outer_env: [EnvEntry], bound: [string], acc: CaptureScan
+) -> CaptureScan throws { Exn } do
+  match exprs do
+    | [] -> return acc
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      let acc1 = scan_expr(expr: v, outer_env, bound, acc)
+      return scan_named_exprs(exprs: rest, outer_env, bound, acc: acc1)
+  end
+end
+
+let scan_match_cases = fn (
+  cases: [HirMatchCase], outer_env: [EnvEntry], bound: [string], acc: CaptureScan
+) -> CaptureScan throws { Exn } do
+  match cases do
+    | [] -> return acc
+    | HirMatchCase(pattern: p, body: b) :: rest ->
+      let case_bound = pat_binders(pat: p, acc: bound)
+      let acc1 = scan_stmts(stmts: b, outer_env, bound: case_bound, acc)
+      return scan_match_cases(cases: rest, outer_env, bound, acc: acc1)
+  end
+end
+
+let pat_binders = fn (pat: HirPatternKind, acc: [string]) -> [string] throws { Exn } do
+  match pat do
+    | PLit(_) -> return acc
+    | PWild -> return acc
+    | PVar(name: n, sigil: _) -> return n :: acc
+    | PCtor(variant: _, fields: fs) -> return pat_field_binders(fields: fs, acc)
+    | PRec(fields: fs, is_partial: _) -> return pat_recfield_binders(fields: fs, acc)
+    | POr(alts) ->
+      // Or-patterns require all alternatives to bind the same name set.
+      // Descend into the first alt to collect binders.
+      match alts do
+        | [] -> return acc
+        | a :: _ -> return pat_binders(pat: a, acc)
+      end
+  end
+end
+
+let pat_field_binders = fn (fields: [HirPatternField], acc: [string]) -> [string] throws { Exn } do
+  match fields do
+    | [] -> return acc
+    | HirPatternField(name: _, pattern: p) :: rest ->
+      let acc2 = pat_binders(pat: p, acc)
+      return pat_field_binders(fields: rest, acc: acc2)
+  end
+end
+
+let pat_recfield_binders = fn (fields: [HirRecordPatField], acc: [string]) -> [string] throws { Exn } do
+  match fields do
+    | [] -> return acc
+    | HirRecordPatField(name: _, pattern: p) :: rest ->
+      let acc2 = pat_binders(pat: p, acc)
+      return pat_recfield_binders(fields: rest, acc: acc2)
+  end
+end
