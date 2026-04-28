@@ -2056,12 +2056,23 @@ pub(super) fn compile_expr(
                     Ok(())
                 }
                 Intrinsic::HeapMark => {
-                    // Pack the stdlib allocator's mark count (upper 32 bits)
-                    // alongside G0 (lower 32 bits) so heap_reset can free both.
-                    // When no stdlib allocator is wired (object_heap_enabled = false
-                    // or shared-memory lazy), the upper 32 bits stay zero — heap_reset
-                    // skips the stdlib branch.
-                    if let Some(mark_idx) = layout.alloc_mark_func_idx {
+                    // Three modes:
+                    // - lazy host arena (shared-memory threading): the host-side
+                    //   AtomicI32 bump pointer is the *only* allocator. mark
+                    //   returns the current pointer extended to i64; G0 is
+                    //   not in play.
+                    // - stdlib mark/reset: pack stdlib outstanding count
+                    //   (upper 32 bits) alongside G0 (lower 32 bits) so
+                    //   heap_reset can free both.
+                    // - no allocator hook: just snapshot G0.
+                    if layout.lazy_host_arena {
+                        let mark_idx = layout.alloc_mark_func_idx.expect(
+                            "lazy_host_arena set without alloc_mark_func_idx — \
+                             codegen invariant violation",
+                        );
+                        out.instruction(&Instruction::Call(mark_idx));
+                        out.instruction(&Instruction::I64ExtendI32U);
+                    } else if let Some(mark_idx) = layout.alloc_mark_func_idx {
                         out.instruction(&Instruction::Call(mark_idx));
                         out.instruction(&Instruction::I64ExtendI32U);
                         out.instruction(&Instruction::I64Const(32));
@@ -2077,7 +2088,18 @@ pub(super) fn compile_expr(
                 }
                 Intrinsic::HeapReset => {
                     let mark = &args.iter().find(|(l, _)| l.as_ref() == "mark").unwrap().1;
-                    if let Some(reset_idx) = layout.alloc_reset_func_idx {
+                    if layout.lazy_host_arena {
+                        // Lazy host arena: mark is the saved alloc_ptr; pass
+                        // its low 32 bits straight to alloc-reset. No G0 to
+                        // touch.
+                        let reset_idx = layout.alloc_reset_func_idx.expect(
+                            "lazy_host_arena set without alloc_reset_func_idx — \
+                             codegen invariant violation",
+                        );
+                        compile_atom(mark, out, local_map, layout)?;
+                        out.instruction(&Instruction::I32WrapI64);
+                        out.instruction(&Instruction::Call(reset_idx));
+                    } else if let Some(reset_idx) = layout.alloc_reset_func_idx {
                         // Stdlib alloc reset takes the high 32 bits as i32.
                         compile_atom(mark, out, local_map, layout)?;
                         out.instruction(&Instruction::I64Const(32));
@@ -2093,7 +2115,11 @@ pub(super) fn compile_expr(
                         out.instruction(&Instruction::I32WrapI64);
                         out.instruction(&Instruction::GlobalSet(OBJECT_HEAP_GLOBAL_INDEX));
                     }
-                    out.instruction(&Instruction::I64Const(0));
+                    // HeapReset's Nexus type is `unit`, whose WASM result is
+                    // empty. Pushing a sentinel i64 here would mismatch the
+                    // surrounding stmt's expected stack (it sees expr_type =
+                    // Unit and emits no compensating Drop), so we leave the
+                    // stack as the body left it.
                     Ok(())
                 }
                 Intrinsic::HeapSwap => {

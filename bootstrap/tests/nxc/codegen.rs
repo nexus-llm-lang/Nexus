@@ -286,6 +286,18 @@ fn lazy_threaded_atomic_alloc() {
 }
 
 #[test]
+fn lazy_threaded_heap_reset_reclaims_worker_allocations() {
+    // nexus-unf1: arena.heap_reset must rewind the host-side AtomicI32 bump
+    // pointer in shared-memory mode, not silently no-op on the (unused) G0
+    // global. Fixture allocates inside main + inside two threaded thunks,
+    // joins both, calls heap_reset(mark0), then takes a fresh mark and
+    // traps via i64.div_s if the second mark != mark0 — proving the host
+    // pointer was actually wound back instead of leaking the worker
+    // allocations.
+    exec_threaded(&read_fixture("nxc/test_lazy_threaded_heap_reset.nx"));
+}
+
+#[test]
 fn exception_group_catch() {
     exec_with_stdlib(&read_fixture("nxc/test_exception_group.nx"));
 }

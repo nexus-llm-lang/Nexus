@@ -44,6 +44,21 @@ pub const SHARED_MEMORY_FIELD: &str = "memory";
 /// atomically advances by `size`. Sizes should be 8-aligned at the call site.
 pub const ALLOC_NAME: &str = "alloc";
 
+/// Snapshot the host-side bump pointer; pair with `ALLOC_RESET_NAME` to free
+/// every allocation made between mark and reset. Region-based reclamation
+/// connects `arena.heap_mark` / `arena.heap_reset` to the host-side
+/// `alloc_ptr` so user-visible reclamation semantics apply equally to
+/// caller-thread and worker-thread allocations in shared-memory mode.
+pub const ALLOC_MARK_NAME: &str = "alloc-mark";
+
+/// Restore the host-side bump pointer to a previously taken mark, freeing
+/// every allocation made after that mark in LIFO order. Pair with
+/// `ALLOC_MARK_NAME`. Caller is responsible for not invoking this while
+/// concurrent workers are still allocating against the same range — the
+/// reset stores a single i32 atomically but downstream addresses become
+/// reusable, so a still-running worker would race.
+pub const ALLOC_RESET_NAME: &str = "alloc-reset";
+
 /// Check if a WASM module imports the lazy host module.
 pub fn needs_lazy_runtime(wasm_bytes: &[u8]) -> bool {
     use wasmparser::{Parser, Payload};
@@ -191,6 +206,41 @@ impl LazyRuntime {
                         // small fields (e.g., string-byte allocators emit size=1).
                         let size_aligned = (size + 7) & !7;
                         rt.alloc_ptr.fetch_add(size_aligned, Ordering::SeqCst)
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+        }
+
+        // alloc-mark: snapshot the current bump pointer. Returns the value
+        // that `arena.heap_reset(mark)` later passes back to alloc-reset to
+        // wind the pointer back. Without this, host-side allocations made
+        // between mark and reset would never be reclaimed even though the
+        // user's program asks for region-style cleanup.
+        for name in [ALLOC_MARK_NAME, "__nx_lazy_alloc_mark"] {
+            let rt = Arc::clone(&self.0);
+            linker
+                .func_wrap(
+                    LAZY_HOST_MODULE,
+                    name,
+                    move |_: Caller<'_, T>| -> i32 { rt.alloc_ptr.load(Ordering::SeqCst) },
+                )
+                .map_err(|e| e.to_string())?;
+        }
+
+        // alloc-reset: store back a previously taken mark, reclaiming
+        // everything allocated after it. Atomic store — concurrent workers
+        // observe the new pointer immediately and any subsequent
+        // fetch_add starts from the reset value. The user is responsible
+        // for ordering reset after every join (i.e., no live worker is
+        // still using addresses past the mark when reset runs).
+        for name in [ALLOC_RESET_NAME, "__nx_lazy_alloc_reset"] {
+            let rt = Arc::clone(&self.0);
+            linker
+                .func_wrap(
+                    LAZY_HOST_MODULE,
+                    name,
+                    move |_: Caller<'_, T>, mark: i32| {
+                        rt.alloc_ptr.store(mark, Ordering::SeqCst);
                     },
                 )
                 .map_err(|e| e.to_string())?;
@@ -542,6 +592,80 @@ mod tests {
             .expect("main export");
         let result = main.call(&mut store, ()).expect("main trap");
         assert_eq!(result, 77, "worker thread must force the thunk to 77");
+    }
+
+    /// nexus-unf1: alloc-mark snapshots the bump pointer; alloc-reset stores
+    /// it back so a later allocation reuses the freed range. Without this
+    /// pair, heap_reset on the user side silently leaks every host-side
+    /// allocation made between mark and reset (the host pointer bump-only).
+    #[test]
+    fn alloc_mark_and_reset_round_trip_the_bump_pointer() {
+        let wat = r#"
+            (module
+              (import "nexus:runtime/lazy" "alloc"
+                (func $alloc (param i32) (result i32)))
+              (import "nexus:runtime/lazy" "alloc-mark"
+                (func $alloc_mark (result i32)))
+              (import "nexus:runtime/lazy" "alloc-reset"
+                (func $alloc_reset (param i32)))
+              (memory (export "memory") 1)
+              (func (export "do_alloc") (param i32) (result i32)
+                local.get 0
+                call $alloc)
+              (func (export "do_mark") (result i32) call $alloc_mark)
+              (func (export "do_reset") (param i32) local.get 0 call $alloc_reset))
+        "#;
+        let bytes = wat::parse_str(wat).expect("WAT parse");
+
+        let mut config = wasmtime::Config::new();
+        config.wasm_threads(true);
+        config.shared_memory(true);
+        let engine = Engine::new(&config).expect("engine");
+        let module = Module::from_binary(&engine, &bytes).expect("module load");
+
+        let mem_type = wasmtime::MemoryType::shared(1, 65536);
+        let shared_mem = SharedMemory::new(&engine, mem_type).expect("shared memory");
+
+        let runtime =
+            LazyRuntime::with_shared_memory(engine.clone(), module.clone(), shared_mem, 64);
+        let mut linker = Linker::<()>::new(&engine);
+        runtime.register(&mut linker).expect("register");
+        let mut store = Store::new(&engine, ());
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
+        let do_alloc = instance
+            .get_typed_func::<i32, i32>(&mut store, "do_alloc")
+            .expect("do_alloc");
+        let do_mark = instance
+            .get_typed_func::<(), i32>(&mut store, "do_mark")
+            .expect("do_mark");
+        let do_reset = instance
+            .get_typed_func::<i32, ()>(&mut store, "do_reset")
+            .expect("do_reset");
+
+        // mark0 == initial heap_base.
+        let mark0 = do_mark.call(&mut store, ()).expect("mark0");
+        assert_eq!(mark0, 64);
+
+        // Two allocations advance the pointer.
+        assert_eq!(do_alloc.call(&mut store, 16).expect("alloc 16"), 64);
+        assert_eq!(do_alloc.call(&mut store, 24).expect("alloc 24"), 80);
+        assert_eq!(runtime.current_alloc_ptr(), 104);
+
+        // Reset rewinds; a fresh mark equals mark0 again.
+        do_reset.call(&mut store, mark0).expect("reset");
+        assert_eq!(runtime.current_alloc_ptr(), 64);
+        let mark1 = do_mark.call(&mut store, ()).expect("mark1");
+        assert_eq!(
+            mark1, mark0,
+            "alloc-reset must rewind the host-side bump pointer so a later \
+             alloc-mark observes the same address — without this, arena.heap_reset \
+             silently leaks every worker-side allocation in shared-memory mode"
+        );
+
+        // A subsequent allocation reuses the reclaimed range.
+        assert_eq!(do_alloc.call(&mut store, 8).expect("post-reset alloc"), 64);
     }
 
     /// Direct unit test of `__nx_alloc`: invoking it with a sequence of sizes
