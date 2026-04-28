@@ -1,0 +1,791 @@
+/**
+ * lsp/protocol: LSP wire-format type algebra and JSON codecs.
+ *
+ * MVP subset of the Language Server Protocol type system, sufficient to
+ * exchange `initialize`, `textDocument/didChange`, `textDocument/didOpen`,
+ * `textDocument/documentSymbol`, and `textDocument/publishDiagnostics`
+ * payloads. Each type pairs with `*_from_json` / `*_to_json` over the
+ * `nxlib/stdlib/json` value algebra.
+ *
+ * Layering vs `src/lsp/diagnostics.nx`:
+ *   src/lsp/diagnostics.nx — server-internal types (1-based line/col, span
+ *     mapping, Severity tag). Used inside the typecheck pipeline.
+ *   nxlib/lsp/protocol.nx (this file) — wire-spec types (0-based line/char,
+ *     numeric DiagnosticSeverity codes 1..4 per spec). Used at the
+ *     stdin/stdout boundary.
+ *
+ * The two layers are deliberately disjoint. Adapter helpers that translate
+ * between them live in the LSP server entry point (out of scope here);
+ * cross-cutting them risks tying the wire types to in-tree compile error
+ * shapes, which would break compatibility when the spec evolves.
+ *
+ * Decoding raises `LspProtocolError` on a missing required field, a wrong
+ * value kind, or a numeric severity outside 1..4. Encoding never fails for
+ * structurally-correct values (it can still raise `JsonError` from the
+ * underlying serializer if a contained f64 is NaN/Infinity, but no LSP
+ * field uses f64 in this MVP).
+ *
+ * Out of scope for MVP (deferred without API churn — add a new exported
+ * type alongside the existing ones):
+ *   - WorkspaceEdit / TextEdit / DocumentChanges
+ *   - Hover / SignatureHelp / CompletionItem (hw47 follow-ups)
+ *   - References / DefinitionLink / CodeAction
+ *   - Configuration / Workspace folders
+ */
+
+import { JsonValue, JsonField, JsonNull, JsonBool, JsonInt, JsonString,
+         JsonArray, JsonObject, JsonError, get_field } from "std:json"
+import { Option, Some, None } from "std:option"
+
+// ─── Error type ──────────────────────────────────────────────────────────────
+
+/// Raised by every `*_from_json` decoder when the input violates the LSP
+/// schema (missing required key, wrong value kind, out-of-range enum). Carries
+/// a human-readable message; callers route this back as a JSON-RPC
+/// `InvalidParams` error.
+export exception LspProtocolError(msg: string)
+
+// ─── JSON decoding helpers ───────────────────────────────────────────────────
+//
+// These walk the json.nx algebra and raise LspProtocolError on the first
+// schema violation. They are not exported — the wire types are the public
+// surface — but their shape is consistent so adding new types follows the
+// same pattern.
+
+let require_field = fn (obj: JsonValue, key: string) -> JsonValue throws { Exn } do
+  match get_field(obj, key) do
+    | Some(val: v) -> return v
+    | None -> raise LspProtocolError(msg: "missing required field '" ++ key ++ "'")
+  end
+end
+
+let optional_field = fn (obj: JsonValue, key: string) -> Option<JsonValue> do
+  return get_field(obj, key)
+end
+
+let as_string = fn (v: JsonValue, ctx: string) -> string throws { Exn } do
+  match v do
+    | JsonString(val: s) -> return s
+    | _ -> raise LspProtocolError(msg: ctx ++ ": expected string")
+  end
+end
+
+let as_i64 = fn (v: JsonValue, ctx: string) -> i64 throws { Exn } do
+  match v do
+    | JsonInt(val: i) -> return i
+    | _ -> raise LspProtocolError(msg: ctx ++ ": expected integer")
+  end
+end
+
+let as_bool = fn (v: JsonValue, ctx: string) -> bool throws { Exn } do
+  match v do
+    | JsonBool(val: b) -> return b
+    | _ -> raise LspProtocolError(msg: ctx ++ ": expected boolean")
+  end
+end
+
+let as_array = fn (v: JsonValue, ctx: string) -> [JsonValue] throws { Exn } do
+  match v do
+    | JsonArray(items: xs) -> return xs
+    | _ -> raise LspProtocolError(msg: ctx ++ ": expected array")
+  end
+end
+
+// ─── Position ────────────────────────────────────────────────────────────────
+//
+// Spec: zero-based `line` and `character`. Both are uinteger; we model with
+// i64 to share the JsonInt lane and surface negative inputs as decode errors
+// up the stack (the spec rejects them).
+
+export type Position = Position(line: i64, character: i64)
+
+export let position_to_json = fn (p: Position) -> JsonValue do
+  match p do | Position(line, character) ->
+    return JsonObject(fields: [
+      JsonField(key: "line", value: JsonInt(val: line)),
+      JsonField(key: "character", value: JsonInt(val: character))
+    ])
+  end
+end
+
+export let position_from_json = fn (v: JsonValue) -> Position throws { Exn } do
+  let line = as_i64(v: require_field(obj: v, key: "line"), ctx: "Position.line")
+  let character = as_i64(v: require_field(obj: v, key: "character"), ctx: "Position.character")
+  return Position(line, character)
+end
+
+// ─── Range ───────────────────────────────────────────────────────────────────
+
+export type Range = Range(start: Position, end_: Position)
+
+export let range_to_json = fn (r: Range) -> JsonValue do
+  match r do | Range(start, end_) ->
+    return JsonObject(fields: [
+      JsonField(key: "start", value: position_to_json(p: start)),
+      JsonField(key: "end", value: position_to_json(p: end_))
+    ])
+  end
+end
+
+export let range_from_json = fn (v: JsonValue) -> Range throws { Exn } do
+  let start = position_from_json(v: require_field(obj: v, key: "start"))
+  let end_ = position_from_json(v: require_field(obj: v, key: "end"))
+  return Range(start, end_)
+end
+
+// ─── Location ────────────────────────────────────────────────────────────────
+
+export type Location = Location(uri: string, range: Range)
+
+export let location_to_json = fn (loc: Location) -> JsonValue do
+  match loc do | Location(uri, range) ->
+    return JsonObject(fields: [
+      JsonField(key: "uri", value: JsonString(val: uri)),
+      JsonField(key: "range", value: range_to_json(r: range))
+    ])
+  end
+end
+
+export let location_from_json = fn (v: JsonValue) -> Location throws { Exn } do
+  let uri = as_string(v: require_field(obj: v, key: "uri"), ctx: "Location.uri")
+  let range = range_from_json(v: require_field(obj: v, key: "range"))
+  return Location(uri, range)
+end
+
+// ─── DiagnosticSeverity ──────────────────────────────────────────────────────
+//
+// Spec uses integer codes 1..4. Modeling as a closed sum forces every site
+// that consumes severity to handle all four cases at compile time, while the
+// integer mapping is centralised in the encode/decode pair.
+
+export type DiagnosticSeverity =
+    DiagSevError
+  | DiagSevWarning
+  | DiagSevInformation
+  | DiagSevHint
+
+export let severity_to_int = fn (s: DiagnosticSeverity) -> i64 do
+  match s do
+    | DiagSevError -> return 1
+    | DiagSevWarning -> return 2
+    | DiagSevInformation -> return 3
+    | DiagSevHint -> return 4
+  end
+end
+
+export let severity_from_int = fn (n: i64) -> DiagnosticSeverity throws { Exn } do
+  if n == 1 then return DiagSevError end
+  if n == 2 then return DiagSevWarning end
+  if n == 3 then return DiagSevInformation end
+  if n == 4 then return DiagSevHint end
+  raise LspProtocolError(msg: "DiagnosticSeverity out of range (1..4)")
+end
+
+// ─── Diagnostic (wire) ───────────────────────────────────────────────────────
+//
+// Wire layout per LSP spec §`Diagnostic`. `severity`, `code`, and `source`
+// are optional; we always emit `severity` and `message` (the only fields LSP
+// clients reliably render) and elide the rest when absent.
+
+export type Diagnostic = Diagnostic(
+  range: Range,
+  severity: Option<DiagnosticSeverity>,
+  /// Spec allows integer or string; we standardise on string to match the
+  /// internal `Diagnostic.code` carried by `src/lsp/diagnostics.nx`.
+  code: Option<string>,
+  source: Option<string>,
+  message: string
+)
+
+// Build the field list back-to-front and reverse — matches json.nx
+// `serialize_object_fields` ordering, which serialises in input order.
+let reverse_fields = fn (xs: [JsonField], acc: [JsonField]) -> [JsonField] do
+  match xs do
+    | [] -> return acc
+    | f :: rest -> return reverse_fields(xs: rest, acc: f :: acc)
+  end
+end
+
+export let diagnostic_to_json = fn (d: Diagnostic) -> JsonValue do
+  match d do | Diagnostic(range, severity, code, source, message) ->
+    let fields = [JsonField(key: "range", value: range_to_json(r: range))]
+    let fields = match severity do
+      | None -> fields
+      | Some(val: s) ->
+        JsonField(key: "severity", value: JsonInt(val: severity_to_int(s))) :: fields
+    end
+    let fields = match code do
+      | None -> fields
+      | Some(val: c) -> JsonField(key: "code", value: JsonString(val: c)) :: fields
+    end
+    let fields = match source do
+      | None -> fields
+      | Some(val: src) -> JsonField(key: "source", value: JsonString(val: src)) :: fields
+    end
+    let fields = JsonField(key: "message", value: JsonString(val: message)) :: fields
+    return JsonObject(fields: reverse_fields(xs: fields, acc: []))
+  end
+end
+
+let optional_string = fn (obj: JsonValue, key: string, ctx: string) -> Option<string> throws { Exn } do
+  match optional_field(obj, key) do
+    | None -> return None
+    | Some(val: v) ->
+      match v do
+        | JsonNull -> return None
+        | _ -> return Some(val: as_string(v, ctx))
+      end
+  end
+end
+
+let optional_severity = fn (obj: JsonValue) -> Option<DiagnosticSeverity> throws { Exn } do
+  match optional_field(obj, key: "severity") do
+    | None -> return None
+    | Some(val: v) ->
+      match v do
+        | JsonNull -> return None
+        | _ -> return Some(val: severity_from_int(n: as_i64(v, ctx: "Diagnostic.severity")))
+      end
+  end
+end
+
+let optional_code_string = fn (obj: JsonValue) -> Option<string> throws { Exn } do
+  // Spec also permits integer; we coerce JsonInt → its decimal text since the
+  // internal Diagnostic surface stores `code` as string.
+  match optional_field(obj, key: "code") do
+    | None -> return None
+    | Some(val: v) ->
+      match v do
+        | JsonNull -> return None
+        | JsonString(val: s) -> return Some(val: s)
+        | JsonInt(val: i) ->
+          let _ = i
+          raise LspProtocolError(msg: "Diagnostic.code as integer not supported (use string form)")
+        | _ -> raise LspProtocolError(msg: "Diagnostic.code: expected string")
+      end
+  end
+end
+
+export let diagnostic_from_json = fn (v: JsonValue) -> Diagnostic throws { Exn } do
+  let range = range_from_json(v: require_field(obj: v, key: "range"))
+  let severity = optional_severity(obj: v)
+  let code = optional_code_string(obj: v)
+  let source = optional_string(obj: v, key: "source", ctx: "Diagnostic.source")
+  let message = as_string(v: require_field(obj: v, key: "message"), ctx: "Diagnostic.message")
+  return Diagnostic(range, severity, code, source, message)
+end
+
+// ─── PublishDiagnosticsParams ────────────────────────────────────────────────
+
+export type PublishDiagnosticsParams = PublishDiagnosticsParams(
+  uri: string,
+  /// Optional per spec; we allow None to round-trip explicit absence.
+  version: Option<i64>,
+  diagnostics: [Diagnostic]
+)
+
+let diagnostics_to_json_items = fn (xs: [Diagnostic], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | d :: rest -> return diagnostics_to_json_items(xs: rest, acc: diagnostic_to_json(d) :: acc)
+  end
+end
+
+let reverse_values = fn (xs: [JsonValue], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | v :: rest -> return reverse_values(xs: rest, acc: v :: acc)
+  end
+end
+
+export let publish_diagnostics_params_to_json = fn (p: PublishDiagnosticsParams) -> JsonValue do
+  match p do | PublishDiagnosticsParams(uri, version, diagnostics) ->
+    let items_rev = diagnostics_to_json_items(xs: diagnostics, acc: [])
+    let items = reverse_values(xs: items_rev, acc: [])
+    let fields = [
+      JsonField(key: "uri", value: JsonString(val: uri))
+    ]
+    let fields = match version do
+      | None -> fields
+      | Some(val: n) -> JsonField(key: "version", value: JsonInt(val: n)) :: fields
+    end
+    let fields = JsonField(key: "diagnostics", value: JsonArray(items)) :: fields
+    return JsonObject(fields: reverse_fields(xs: fields, acc: []))
+  end
+end
+
+let diagnostics_from_json_items = fn (xs: [JsonValue], acc: [Diagnostic]) -> [Diagnostic] throws { Exn } do
+  match xs do
+    | [] -> return acc
+    | v :: rest ->
+      let d = diagnostic_from_json(v)
+      return diagnostics_from_json_items(xs: rest, acc: d :: acc)
+  end
+end
+
+let reverse_diagnostics = fn (xs: [Diagnostic], acc: [Diagnostic]) -> [Diagnostic] do
+  match xs do
+    | [] -> return acc
+    | d :: rest -> return reverse_diagnostics(xs: rest, acc: d :: acc)
+  end
+end
+
+let optional_int = fn (obj: JsonValue, key: string, ctx: string) -> Option<i64> throws { Exn } do
+  match optional_field(obj, key) do
+    | None -> return None
+    | Some(val: v) ->
+      match v do
+        | JsonNull -> return None
+        | _ -> return Some(val: as_i64(v, ctx))
+      end
+  end
+end
+
+export let publish_diagnostics_params_from_json = fn (v: JsonValue) -> PublishDiagnosticsParams throws { Exn } do
+  let uri = as_string(v: require_field(obj: v, key: "uri"), ctx: "PublishDiagnosticsParams.uri")
+  let version = optional_int(obj: v, key: "version", ctx: "PublishDiagnosticsParams.version")
+  let arr = as_array(v: require_field(obj: v, key: "diagnostics"), ctx: "PublishDiagnosticsParams.diagnostics")
+  let collected = diagnostics_from_json_items(xs: arr, acc: [])
+  return PublishDiagnosticsParams(uri, version, diagnostics: reverse_diagnostics(xs: collected, acc: []))
+end
+
+// ─── TextDocumentItem ────────────────────────────────────────────────────────
+
+export type TextDocumentItem = TextDocumentItem(
+  uri: string,
+  language_id: string,
+  version: i64,
+  text: string
+)
+
+export let text_document_item_to_json = fn (it: TextDocumentItem) -> JsonValue do
+  match it do | TextDocumentItem(uri, language_id, version, text) ->
+    return JsonObject(fields: [
+      JsonField(key: "uri", value: JsonString(val: uri)),
+      JsonField(key: "languageId", value: JsonString(val: language_id)),
+      JsonField(key: "version", value: JsonInt(val: version)),
+      JsonField(key: "text", value: JsonString(val: text))
+    ])
+  end
+end
+
+export let text_document_item_from_json = fn (v: JsonValue) -> TextDocumentItem throws { Exn } do
+  let uri = as_string(v: require_field(obj: v, key: "uri"), ctx: "TextDocumentItem.uri")
+  let language_id = as_string(v: require_field(obj: v, key: "languageId"), ctx: "TextDocumentItem.languageId")
+  let version = as_i64(v: require_field(obj: v, key: "version"), ctx: "TextDocumentItem.version")
+  let text = as_string(v: require_field(obj: v, key: "text"), ctx: "TextDocumentItem.text")
+  return TextDocumentItem(uri, language_id, version, text)
+end
+
+// ─── VersionedTextDocumentIdentifier ─────────────────────────────────────────
+
+export type VersionedTextDocumentIdentifier = VersionedTextDocumentIdentifier(
+  uri: string,
+  version: i64
+)
+
+export let versioned_text_document_identifier_to_json = fn (id: VersionedTextDocumentIdentifier) -> JsonValue do
+  match id do | VersionedTextDocumentIdentifier(uri, version) ->
+    return JsonObject(fields: [
+      JsonField(key: "uri", value: JsonString(val: uri)),
+      JsonField(key: "version", value: JsonInt(val: version))
+    ])
+  end
+end
+
+export let versioned_text_document_identifier_from_json = fn (v: JsonValue) -> VersionedTextDocumentIdentifier throws { Exn } do
+  let uri = as_string(v: require_field(obj: v, key: "uri"), ctx: "VersionedTextDocumentIdentifier.uri")
+  let version = as_i64(v: require_field(obj: v, key: "version"), ctx: "VersionedTextDocumentIdentifier.version")
+  return VersionedTextDocumentIdentifier(uri, version)
+end
+
+// ─── TextDocumentContentChangeEvent ──────────────────────────────────────────
+//
+// LSP specifies a union: full-content change `{ text }` versus incremental
+// change `{ range, rangeLength?, text }`. We model it as a sum so handlers
+// dispatch with exhaustive matching; `range_length` follows the spec by being
+// optional even on the incremental side (clients are not required to send it).
+
+export type TextDocumentContentChangeEvent =
+    ContentChangeFull(text: string)
+  | ContentChangeIncremental(range: Range, range_length: Option<i64>, text: string)
+
+export let content_change_event_to_json = fn (ev: TextDocumentContentChangeEvent) -> JsonValue do
+  match ev do
+    | ContentChangeFull(text) ->
+      return JsonObject(fields: [JsonField(key: "text", value: JsonString(val: text))])
+    | ContentChangeIncremental(range, range_length, text) ->
+      let fields = [
+        JsonField(key: "range", value: range_to_json(r: range))
+      ]
+      let fields = match range_length do
+        | None -> fields
+        | Some(val: n) -> JsonField(key: "rangeLength", value: JsonInt(val: n)) :: fields
+      end
+      let fields = JsonField(key: "text", value: JsonString(val: text)) :: fields
+      return JsonObject(fields: reverse_fields(xs: fields, acc: []))
+  end
+end
+
+export let content_change_event_from_json = fn (v: JsonValue) -> TextDocumentContentChangeEvent throws { Exn } do
+  let text = as_string(v: require_field(obj: v, key: "text"), ctx: "TextDocumentContentChangeEvent.text")
+  match optional_field(obj: v, key: "range") do
+    | None -> return ContentChangeFull(text)
+    | Some(val: range_v) ->
+      let range = range_from_json(v: range_v)
+      let range_length = optional_int(obj: v, key: "rangeLength", ctx: "TextDocumentContentChangeEvent.rangeLength")
+      return ContentChangeIncremental(range, range_length, text)
+  end
+end
+
+// ─── SymbolKind ──────────────────────────────────────────────────────────────
+//
+// Spec enum 1..26. We only model the kinds the Nexus LSP server emits in MVP
+// (Module, Function, Variable, Class, Method, Constant, Constructor); the
+// rest pass through as `SymbolKindRaw(code)` to keep the codec total without
+// committing to translating every spec entry today. Adding a named variant
+// later is purely additive — existing matches that handle SymbolKindRaw stay
+// valid because the new variant ships with its own integer.
+
+export type SymbolKind =
+    SymbolKindModule
+  | SymbolKindFunction
+  | SymbolKindVariable
+  | SymbolKindClass
+  | SymbolKindMethod
+  | SymbolKindConstant
+  | SymbolKindConstructor
+  | SymbolKindRaw(code: i64)
+
+export let symbol_kind_to_int = fn (k: SymbolKind) -> i64 do
+  match k do
+    | SymbolKindFunction -> return 12
+    | SymbolKindVariable -> return 13
+    | SymbolKindConstant -> return 14
+    | SymbolKindClass -> return 5
+    | SymbolKindMethod -> return 6
+    | SymbolKindConstructor -> return 9
+    | SymbolKindModule -> return 2
+    | SymbolKindRaw(code) -> return code
+  end
+end
+
+export let symbol_kind_from_int = fn (n: i64) -> SymbolKind do
+  if n == 2 then return SymbolKindModule end
+  if n == 5 then return SymbolKindClass end
+  if n == 6 then return SymbolKindMethod end
+  if n == 9 then return SymbolKindConstructor end
+  if n == 12 then return SymbolKindFunction end
+  if n == 13 then return SymbolKindVariable end
+  if n == 14 then return SymbolKindConstant end
+  return SymbolKindRaw(code: n)
+end
+
+// ─── DocumentSymbol ──────────────────────────────────────────────────────────
+//
+// Tree-shaped: each symbol may carry children. The wire payload is
+// "DocumentSymbol[]" returned from textDocument/documentSymbol.
+
+export type DocumentSymbol = DocumentSymbol(
+  name: string,
+  detail: Option<string>,
+  kind: SymbolKind,
+  range: Range,
+  selection_range: Range,
+  children: [DocumentSymbol]
+)
+
+let symbols_to_json_items = fn (xs: [DocumentSymbol], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | s :: rest -> return symbols_to_json_items(xs: rest, acc: document_symbol_to_json(s) :: acc)
+  end
+end
+
+export let document_symbol_to_json = fn (s: DocumentSymbol) -> JsonValue do
+  match s do | DocumentSymbol(name, detail, kind, range, selection_range, children) ->
+    let kids_rev = symbols_to_json_items(xs: children, acc: [])
+    let kids = reverse_values(xs: kids_rev, acc: [])
+    let fields = [
+      JsonField(key: "name", value: JsonString(val: name))
+    ]
+    let fields = match detail do
+      | None -> fields
+      | Some(val: d) -> JsonField(key: "detail", value: JsonString(val: d)) :: fields
+    end
+    let fields = JsonField(key: "kind", value: JsonInt(val: symbol_kind_to_int(k: kind))) :: fields
+    let fields = JsonField(key: "range", value: range_to_json(r: range)) :: fields
+    let fields = JsonField(key: "selectionRange", value: range_to_json(r: selection_range)) :: fields
+    let fields = JsonField(key: "children", value: JsonArray(items: kids)) :: fields
+    return JsonObject(fields: reverse_fields(xs: fields, acc: []))
+  end
+end
+
+let symbols_from_json_items = fn (xs: [JsonValue], acc: [DocumentSymbol]) -> [DocumentSymbol] throws { Exn } do
+  match xs do
+    | [] -> return acc
+    | v :: rest ->
+      let s = document_symbol_from_json(v)
+      return symbols_from_json_items(xs: rest, acc: s :: acc)
+  end
+end
+
+let reverse_symbols = fn (xs: [DocumentSymbol], acc: [DocumentSymbol]) -> [DocumentSymbol] do
+  match xs do
+    | [] -> return acc
+    | s :: rest -> return reverse_symbols(xs: rest, acc: s :: acc)
+  end
+end
+
+export let document_symbol_from_json = fn (v: JsonValue) -> DocumentSymbol throws { Exn } do
+  let name = as_string(v: require_field(obj: v, key: "name"), ctx: "DocumentSymbol.name")
+  let detail = optional_string(obj: v, key: "detail", ctx: "DocumentSymbol.detail")
+  let kind = symbol_kind_from_int(n: as_i64(v: require_field(obj: v, key: "kind"), ctx: "DocumentSymbol.kind"))
+  let range = range_from_json(v: require_field(obj: v, key: "range"))
+  let selection_range = range_from_json(v: require_field(obj: v, key: "selectionRange"))
+  let children_rev = match optional_field(obj: v, key: "children") do
+    | None -> []
+    | Some(val: jv) ->
+      match jv do
+        | JsonNull -> []
+        | _ ->
+          let arr = as_array(v: jv, ctx: "DocumentSymbol.children")
+          symbols_from_json_items(xs: arr, acc: [])
+      end
+  end
+  let children = reverse_symbols(xs: children_rev, acc: [])
+  return DocumentSymbol(name, detail, kind, range, selection_range, children)
+end
+
+// ─── ServerCapabilities ──────────────────────────────────────────────────────
+//
+// Only `textDocumentSync` (numeric kind) and `documentSymbolProvider` are
+// surfaced for MVP; the spec defines dozens more. We keep the type extensible
+// by storing a `raw_extra` JsonValue containing the untouched original input
+// (or JsonObject(fields: []) when fresh-built). This lets future additions
+// (hoverProvider, definitionProvider, ...) flow through without breaking
+// callers that already constructed a ServerCapabilities — the to_json merge
+// preserves their extra fields.
+
+export type TextDocumentSyncKind =
+    TdsNone
+  | TdsFull
+  | TdsIncremental
+
+export let text_document_sync_kind_to_int = fn (k: TextDocumentSyncKind) -> i64 do
+  match k do
+    | TdsNone -> return 0
+    | TdsFull -> return 1
+    | TdsIncremental -> return 2
+  end
+end
+
+export let text_document_sync_kind_from_int = fn (n: i64) -> TextDocumentSyncKind throws { Exn } do
+  if n == 0 then return TdsNone end
+  if n == 1 then return TdsFull end
+  if n == 2 then return TdsIncremental end
+  raise LspProtocolError(msg: "TextDocumentSyncKind out of range (0..2)")
+end
+
+export type ServerCapabilities = ServerCapabilities(
+  text_document_sync: Option<TextDocumentSyncKind>,
+  document_symbol_provider: Option<bool>,
+  hover_provider: Option<bool>,
+  definition_provider: Option<bool>,
+  references_provider: Option<bool>
+)
+
+export let server_capabilities_to_json = fn (caps: ServerCapabilities) -> JsonValue do
+  match caps do | ServerCapabilities(text_document_sync, document_symbol_provider,
+                                     hover_provider, definition_provider, references_provider) ->
+    let fields: [JsonField] = []
+    let fields = match text_document_sync do
+      | None -> fields
+      | Some(val: k) ->
+        JsonField(key: "textDocumentSync", value: JsonInt(val: text_document_sync_kind_to_int(k))) :: fields
+    end
+    let fields = match document_symbol_provider do
+      | None -> fields
+      | Some(val: b) -> JsonField(key: "documentSymbolProvider", value: JsonBool(val: b)) :: fields
+    end
+    let fields = match hover_provider do
+      | None -> fields
+      | Some(val: b) -> JsonField(key: "hoverProvider", value: JsonBool(val: b)) :: fields
+    end
+    let fields = match definition_provider do
+      | None -> fields
+      | Some(val: b) -> JsonField(key: "definitionProvider", value: JsonBool(val: b)) :: fields
+    end
+    let fields = match references_provider do
+      | None -> fields
+      | Some(val: b) -> JsonField(key: "referencesProvider", value: JsonBool(val: b)) :: fields
+    end
+    return JsonObject(fields: reverse_fields(xs: fields, acc: []))
+  end
+end
+
+let optional_bool = fn (obj: JsonValue, key: string, ctx: string) -> Option<bool> throws { Exn } do
+  match optional_field(obj, key) do
+    | None -> return None
+    | Some(val: v) ->
+      match v do
+        | JsonNull -> return None
+        | _ -> return Some(val: as_bool(v, ctx))
+      end
+  end
+end
+
+let optional_text_document_sync_kind = fn (obj: JsonValue) -> Option<TextDocumentSyncKind> throws { Exn } do
+  match optional_field(obj, key: "textDocumentSync") do
+    | None -> return None
+    | Some(val: v) ->
+      match v do
+        | JsonNull -> return None
+        | _ ->
+          let n = as_i64(v, ctx: "ServerCapabilities.textDocumentSync")
+          return Some(val: text_document_sync_kind_from_int(n))
+      end
+  end
+end
+
+export let server_capabilities_from_json = fn (v: JsonValue) -> ServerCapabilities throws { Exn } do
+  let tds = optional_text_document_sync_kind(obj: v)
+  let dsp = optional_bool(obj: v, key: "documentSymbolProvider", ctx: "ServerCapabilities.documentSymbolProvider")
+  let hov = optional_bool(obj: v, key: "hoverProvider", ctx: "ServerCapabilities.hoverProvider")
+  let def = optional_bool(obj: v, key: "definitionProvider", ctx: "ServerCapabilities.definitionProvider")
+  let refs = optional_bool(obj: v, key: "referencesProvider", ctx: "ServerCapabilities.referencesProvider")
+  return ServerCapabilities(
+    text_document_sync: tds,
+    document_symbol_provider: dsp,
+    hover_provider: hov,
+    definition_provider: def,
+    references_provider: refs
+  )
+end
+
+// ─── InitializeParams ────────────────────────────────────────────────────────
+//
+// `process_id` is `integer | null`; the spec also permits clients to omit the
+// field entirely (older protocol versions). We accept all three and surface
+// the absence as None.
+// `client_capabilities` is intentionally typed as JsonValue: the spec defines
+// hundreds of nested optional fields, none of which the MVP server reads.
+// Storing the raw payload is an explicit pass-through — a future server
+// upgrade adds a typed `ClientCapabilities` field next to this one rather
+// than rebuilding the InitializeParams shape.
+
+export type InitializeParams = InitializeParams(
+  process_id: Option<i64>,
+  root_uri: Option<string>,
+  client_capabilities: JsonValue,
+  trace: Option<string>
+)
+
+export let initialize_params_to_json = fn (p: InitializeParams) -> JsonValue do
+  match p do | InitializeParams(process_id, root_uri, client_capabilities, trace) ->
+    let pid_value = match process_id do
+      | None -> JsonNull
+      | Some(val: n) -> JsonInt(val: n)
+    end
+    let root_value = match root_uri do
+      | None -> JsonNull
+      | Some(val: s) -> JsonString(val: s)
+    end
+    let fields = [
+      JsonField(key: "processId", value: pid_value),
+      JsonField(key: "rootUri", value: root_value),
+      JsonField(key: "capabilities", value: client_capabilities)
+    ]
+    let fields = reverse_fields(xs: fields, acc: [])
+    let fields = match trace do
+      | None -> fields
+      | Some(val: t) -> JsonField(key: "trace", value: JsonString(val: t)) :: fields
+    end
+    return JsonObject(fields: reverse_fields(xs: fields, acc: []))
+  end
+end
+
+let optional_pid = fn (obj: JsonValue) -> Option<i64> throws { Exn } do
+  match optional_field(obj, key: "processId") do
+    | None -> return None
+    | Some(val: v) ->
+      match v do
+        | JsonNull -> return None
+        | _ -> return Some(val: as_i64(v, ctx: "InitializeParams.processId"))
+      end
+  end
+end
+
+let optional_root_uri = fn (obj: JsonValue) -> Option<string> throws { Exn } do
+  match optional_field(obj, key: "rootUri") do
+    | None -> return None
+    | Some(val: v) ->
+      match v do
+        | JsonNull -> return None
+        | _ -> return Some(val: as_string(v, ctx: "InitializeParams.rootUri"))
+      end
+  end
+end
+
+export let initialize_params_from_json = fn (v: JsonValue) -> InitializeParams throws { Exn } do
+  let process_id = optional_pid(obj: v)
+  let root_uri = optional_root_uri(obj: v)
+  let client_capabilities = match optional_field(obj: v, key: "capabilities") do
+    | None -> JsonObject(fields: [])
+    | Some(val: c) -> c
+  end
+  let trace = optional_string(obj: v, key: "trace", ctx: "InitializeParams.trace")
+  return InitializeParams(process_id, root_uri, client_capabilities, trace)
+end
+
+// ─── InitializeResult ────────────────────────────────────────────────────────
+
+export type ServerInfo = ServerInfo(name: string, version: Option<string>)
+
+export let server_info_to_json = fn (info: ServerInfo) -> JsonValue do
+  match info do | ServerInfo(name, version) ->
+    let fields = [JsonField(key: "name", value: JsonString(val: name))]
+    let fields = match version do
+      | None -> fields
+      | Some(val: vstr) -> JsonField(key: "version", value: JsonString(val: vstr)) :: fields
+    end
+    return JsonObject(fields: reverse_fields(xs: fields, acc: []))
+  end
+end
+
+export let server_info_from_json = fn (v: JsonValue) -> ServerInfo throws { Exn } do
+  let name = as_string(v: require_field(obj: v, key: "name"), ctx: "ServerInfo.name")
+  let version = optional_string(obj: v, key: "version", ctx: "ServerInfo.version")
+  return ServerInfo(name, version)
+end
+
+export type InitializeResult = InitializeResult(
+  capabilities: ServerCapabilities,
+  server_info: Option<ServerInfo>
+)
+
+export let initialize_result_to_json = fn (r: InitializeResult) -> JsonValue do
+  match r do | InitializeResult(capabilities, server_info) ->
+    let fields = [
+      JsonField(key: "capabilities", value: server_capabilities_to_json(caps: capabilities))
+    ]
+    let fields = match server_info do
+      | None -> fields
+      | Some(val: info) -> JsonField(key: "serverInfo", value: server_info_to_json(info)) :: fields
+    end
+    return JsonObject(fields: reverse_fields(xs: fields, acc: []))
+  end
+end
+
+export let initialize_result_from_json = fn (v: JsonValue) -> InitializeResult throws { Exn } do
+  let capabilities = server_capabilities_from_json(v: require_field(obj: v, key: "capabilities"))
+  let server_info = match optional_field(obj: v, key: "serverInfo") do
+    | None -> None
+    | Some(val: info_v) ->
+      match info_v do
+        | JsonNull -> None
+        | _ -> Some(val: server_info_from_json(v: info_v))
+      end
+  end
+  return InitializeResult(capabilities, server_info)
+end
