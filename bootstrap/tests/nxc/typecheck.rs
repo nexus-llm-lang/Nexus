@@ -29,3 +29,11 @@ fn match_exhaustiveness() {
 fn throws_row_narrowing() {
     exec_with_stdlib(&read_fixture("nxc/test_throws_row_narrowing.nx"));
 }
+
+/// Covers nexus-hw47.3 (HIR span fidelity for synthesised Cons / Assign-target
+/// nodes) and nexus-hw47.4 (LSP-style enumerate_diagnostics + type_at /
+/// defining_position stubs).
+#[test]
+fn lsp_diagnostics_and_span_fidelity() {
+    exec_with_stdlib(&read_fixture("nxc/test_lsp_diagnostics.nx"));
+}
