@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use wasm_compose::composer::ComponentComposer;
 use wasm_compose::config::{Config as ComposeConfig, Dependency as ComposeDependency};
@@ -280,6 +280,29 @@ fn encode_nexus_host_component() -> Result<Vec<u8>, String> {
         .map_err(|e| format!("failed to encode nexus-host component: {}", e))
 }
 
+/// Monotonically-increasing counter combined with PID + ThreadId to produce a
+/// unique staging directory per `compose_*` invocation. Without this, two
+/// threads inside the same process that mint the same `SystemTime` nanos value
+/// (well within possibility on M-series machines under `--test-threads=N>1`)
+/// race-overwrite each other's `user.wasm` / `stdlib.wasm` staging files and
+/// the loser reads back a sibling's bytes. Same idiom as
+/// `bootstrap/tests/harness/compile.rs::nxc_output_path` (nexus-gyj6).
+static COMPOSE_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn compose_staging_dir(prefix: &str) -> PathBuf {
+    let seq = COMPOSE_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tid = format!("{:?}", std::thread::current().id());
+    // ThreadId Debug fmt is e.g. "ThreadId(7)"; strip the wrapper to keep the
+    // directory name short and POSIX-portable.
+    let tid_digits: String = tid.chars().filter(|c| c.is_ascii_digit()).collect();
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}-{}",
+        std::process::id(),
+        tid_digits,
+        seq
+    ))
+}
+
 /// Compose user + stdlib + nexus-host in one step.
 /// All components are placed in a temp dir and the composer auto-discovers them.
 fn compose_all(
@@ -287,14 +310,7 @@ fn compose_all(
     stdlib_component: &[u8],
     nexus_host_component: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "nexus-compose-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let temp_dir = compose_staging_dir("nexus-compose-all");
     fs::create_dir_all(&temp_dir)
         .map_err(|e| format!("failed to create temp compose dir: {}", e))?;
 
@@ -347,14 +363,7 @@ fn compose_all(
 
 /// Compose user component + stdlib component via wasm-compose.
 fn compose_components(user_component: &[u8], stdlib_component: &[u8]) -> Result<Vec<u8>, String> {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "nexus-compose-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let temp_dir = compose_staging_dir("nexus-compose");
     fs::create_dir_all(&temp_dir)
         .map_err(|e| format!("failed to create temp compose dir: {}", e))?;
 
