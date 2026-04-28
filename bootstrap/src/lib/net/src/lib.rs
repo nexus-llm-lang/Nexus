@@ -71,6 +71,24 @@ extern "C" {
 
     #[link_name = "host-http-stop"]
     fn host_http_stop(server_id: i64) -> i32;
+
+    #[link_name = "host-http-respond-chunk-start"]
+    fn host_http_respond_chunk_start(
+        req_id: i64,
+        status: i64,
+        headers_ptr: i32,
+        headers_len: i32,
+    ) -> i32;
+
+    #[link_name = "host-http-respond-chunk-write"]
+    fn host_http_respond_chunk_write(
+        req_id: i64,
+        body_chunk_ptr: i32,
+        body_chunk_len: i32,
+    ) -> i32;
+
+    #[link_name = "host-http-respond-chunk-finish"]
+    fn host_http_respond_chunk_finish(req_id: i64) -> i32;
 }
 
 #[cfg(not(feature = "no_alloc_export"))]
@@ -197,6 +215,36 @@ pub extern "C" fn __nx_http_respond(
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_http_stop(server_id: i64) -> i32 {
     unsafe { host_http_stop(server_id) }
+}
+
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_http_respond_chunk_start(
+    req_id: i64,
+    status: i64,
+    headers_ptr: i32,
+    headers_len: i32,
+) -> i32 {
+    if !has_valid_optional_region(headers_ptr, headers_len) {
+        return 0;
+    }
+    unsafe { host_http_respond_chunk_start(req_id, status, headers_ptr, headers_len) }
+}
+
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_http_respond_chunk_write(
+    req_id: i64,
+    body_chunk_ptr: i32,
+    body_chunk_len: i32,
+) -> i32 {
+    if checked_ptr_len(body_chunk_ptr, body_chunk_len).is_none() {
+        return 0;
+    }
+    unsafe { host_http_respond_chunk_write(req_id, body_chunk_ptr, body_chunk_len) }
+}
+
+#[cfg_attr(not(feature = "component"), no_mangle)]
+pub extern "C" fn __nx_http_respond_chunk_finish(req_id: i64) -> i32 {
+    unsafe { host_http_respond_chunk_finish(req_id) }
 }
 
 fn pack_ptr_len(ptr: i32, len: i32) -> i64 {

@@ -653,6 +653,27 @@ fn define_component_nexus_host_stubs(
          -> wasmtime::Result<(i64,)> { Ok((0,)) },
     )
     .map_err(|e| e.to_string())?;
+    inst.func_wrap(
+        "host-http-respond-chunk-start",
+        |_: wasmtime::StoreContextMut<'_, WasiState>,
+         (_req_id, _status, _headers): (i64, i64, String)|
+         -> wasmtime::Result<(i32,)> { Ok((0,)) },
+    )
+    .map_err(|e| e.to_string())?;
+    inst.func_wrap(
+        "host-http-respond-chunk-write",
+        |_: wasmtime::StoreContextMut<'_, WasiState>,
+         (_req_id, _chunk): (i64, String)|
+         -> wasmtime::Result<(i32,)> { Ok((0,)) },
+    )
+    .map_err(|e| e.to_string())?;
+    inst.func_wrap(
+        "host-http-respond-chunk-finish",
+        |_: wasmtime::StoreContextMut<'_, WasiState>,
+         (_req_id,): (i64,)|
+         -> wasmtime::Result<(i32,)> { Ok((0,)) },
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
