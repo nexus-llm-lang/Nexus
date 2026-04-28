@@ -86,6 +86,13 @@ pub fn exn_enum_def() -> EnumDef {
                 name: "InvalidIndex".to_string(),
                 fields: vec![(Some("val".to_string()), Type::I64)],
             },
+            // Raised by str.from_char_code / str.from_char when the input
+            // is not a valid Unicode scalar value (negative, >0x10FFFF,
+            // or in the surrogate range 0xD800-0xDFFF).
+            VariantDef {
+                name: "InvalidUnicode".to_string(),
+                fields: vec![(Some("code".to_string()), Type::I64)],
+            },
         ],
     }
 }

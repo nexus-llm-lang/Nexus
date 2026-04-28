@@ -4,6 +4,7 @@ pub mod clock;
 pub mod collections;
 pub mod env;
 pub mod exn;
+pub mod from_char_code_utf8;
 pub mod fs;
 pub mod json;
 pub mod lazy;

@@ -878,9 +878,14 @@ impl<'a> LowerCtx<'a> {
                 "string-byte-substring" => Some(Intrinsic::ByteSubstring),
                 "string-count-newlines-in" => Some(Intrinsic::CountNewlinesIn),
                 "string-last-newline-in" => Some(Intrinsic::LastNewlineIn),
-                "string-length" => Some(Intrinsic::StringLength),
-                "string-char-code" => Some(Intrinsic::CharCode),
-                "string-char-at" => Some(Intrinsic::CharAt),
+                // string-length / string-char-code / string-char-at are
+                // intentionally NOT intrinsified: their codegen Intrinsic is
+                // byte-indexed (ASCII-only) while the WIT contract is
+                // character-indexed (per `s.chars()` in the runtime extern).
+                // Routing through the regular external call keeps multi-byte
+                // UTF-8 strings correct. Re-intrinsifying requires a real
+                // UTF-8 walk, not a load8_u shortcut. Tracked alongside
+                // nexus-9gsv (audit acceptance #5).
                 "string-from-char-code" => Some(Intrinsic::FromCharCode),
                 "string-from-char" => Some(Intrinsic::FromChar),
                 "char-ord" => Some(Intrinsic::CharOrd),
@@ -905,9 +910,9 @@ impl<'a> LowerCtx<'a> {
                 "__nx_string_byte_substring" => Some(Intrinsic::ByteSubstring),
                 "__nx_string_count_newlines_in" => Some(Intrinsic::CountNewlinesIn),
                 "__nx_string_last_newline_in" => Some(Intrinsic::LastNewlineIn),
-                "__nx_string_length" => Some(Intrinsic::StringLength),
-                "__nx_string_char_code" | "__nx_char_code" => Some(Intrinsic::CharCode),
-                "__nx_string_char_at" | "__nx_char_at" => Some(Intrinsic::CharAt),
+                // See WIT branch above: byte-indexed Intrinsics differ from
+                // the char-indexed runtime contract; route through the
+                // external call instead until a UTF-8-aware Intrinsic exists.
                 "__nx_string_from_char_code" => Some(Intrinsic::FromCharCode),
                 "__nx_string_from_char" => Some(Intrinsic::FromChar),
                 "__nx_char_ord" => Some(Intrinsic::CharOrd),

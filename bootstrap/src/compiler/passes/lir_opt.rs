@@ -1108,7 +1108,17 @@ fn expr_has_side_effects(expr: &LirExpr) -> bool {
     }
     if let LirExpr::Intrinsic { kind, .. } = expr {
         use crate::ir::lir::Intrinsic;
-        return matches!(kind, Intrinsic::HeapReset | Intrinsic::HeapSwap);
+        // FromCharCode / FromChar raise Exn::InvalidUnicode on invalid input;
+        // eliminating an unused `let _ = from_char_code(bad)` would swallow
+        // the exception and turn a partial function into a silent fallback
+        // (memory feedback_no_silent_defaults).
+        return matches!(
+            kind,
+            Intrinsic::HeapReset
+                | Intrinsic::HeapSwap
+                | Intrinsic::FromCharCode
+                | Intrinsic::FromChar
+        );
     }
     matches!(
         expr,

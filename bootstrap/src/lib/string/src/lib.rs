@@ -139,7 +139,7 @@ pub extern "C" fn __nx_string_char_at(s_ptr: i32, s_len: i32, idx: i64) -> i32 {
 pub extern "C" fn __nx_string_from_char(c: i32) -> i64 {
     match char::from_u32(c as u32) {
         Some(ch) => nexus_wasm_alloc::store_string_result(ch.to_string()),
-        None => 0,
+        None => panic!("from_char: invalid Unicode scalar value 0x{:X}", c as u32),
     }
 }
 
@@ -246,9 +246,12 @@ pub extern "C" fn __nx_char_ord(c: i32) -> i64 {
 
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_string_from_char_code(code: i64) -> i64 {
+    if code < 0 || code > 0x10FFFF {
+        panic!("from_char_code: codepoint out of range: {}", code);
+    }
     match char::from_u32(code as u32) {
         Some(c) => nexus_wasm_alloc::store_string_result(c.to_string()),
-        None => 0,
+        None => panic!("from_char_code: invalid Unicode scalar value (surrogate?): 0x{:X}", code),
     }
 }
 
