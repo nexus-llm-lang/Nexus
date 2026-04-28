@@ -1,0 +1,960 @@
+/**
+ * typecheck/linearity: %T linear-binding lint pass for self-host.
+ *
+ * Mirrors the bootstrap (Rust) typechecker's interleaved linearity discipline,
+ * but runs as a standalone post-typecheck HIR pass. Walks each function body
+ * once, threading a `LinState` that tracks:
+ *
+ *   - `vars`: currently-live linear bindings (names) in the active frame.
+ *   - `frame_stack`: snapshots of `vars` taken at each enclosing frame
+ *     boundary (function-body entry or `try`-body entry). Linears that
+ *     existed at the most recent boundary are excluded from the
+ *     throwable-call leak check — they are the catch arm's responsibility
+ *     (Strategy A, nexus-7eex.1) or the call-site contract's responsibility
+ *     for function-param linears (nexus-7eex.2).
+ *
+ * Lints implemented (issue nexus-7eex.3):
+ *   1. let-bound %T use-once: a linear binding must be referenced exactly
+ *      once in its scope. Zero refs → LinearUnused; second ref → LinearReuse.
+ *   5. Function-param %T use-once: a parameter typed `%T` must be consumed
+ *      exactly once in the body. Same Unused/Reuse signaling.
+ *   3. if/match branch consistency: every non-diverging arm must end with
+ *      the same `vars` set.
+ *   6. Throwable-call leak: a `Call` at statement level whose callee has a
+ *      non-empty throws row must not leave any uncovered linear live (issue
+ *      nexus-7eex.2). The Strategy A try/catch interaction (nexus-7eex.1)
+ *      flows naturally from the frame_stack push at try-body entry.
+ *
+ * Lints deferred (follow-up nexus-7eex.4 candidate):
+ *   2. Lambda-capture linearization: already present in `src/typecheck/
+ *      capture.nx` (T-Lambda's CaptureScan). The closure-typing form there
+ *      already wraps the lambda type in TyLinear when a capture is linear,
+ *      which is the bootstrap's behaviour. This pass does not duplicate that.
+ *   4. Array-element move-out rejection: requires per-Index typing in
+ *      infer.nx (the structural HIR walk here cannot recover the element
+ *      type without re-inferring). Tracked separately.
+ *
+ * Linearity detection on bindings:
+ *   - `let %x = ...` — sigil is SigilLinear (HirStmt.Let now carries the
+ *     sigil; previously dropped during HIR conversion).
+ *   - `let x: %T = ...` — type annotation is TyLinear / TyLazy / TyArray.
+ *   - `let x = call_returning_linear()` — sig-map lookup of the callee's
+ *     return type recovers the linear classification when no annotation
+ *     was provided.
+ *   - Function param `(x: %T)` — same classifier on the param type.
+ *   - Pattern bindings under match — `%v` patterns and patterns whose
+ *     binders draw from a linear scrutinee are handled by `bind_pattern`.
+ */
+
+import { Span } from "src/common/token.nx"
+import {
+  TypeExpr, TyLinear, TyLazy, TyArray, TyBorrow, TyRef, TyUserDefined,
+  TyArrow, TyRow, TyVar, TyRecord, TyList,
+  Sigil, SigilLinear, SigilLazy, SigilImmutable, SigilMutable, SigilBorrow,
+  EnumDef, VariantDef, VariantField, NamedType
+} from "src/common/ast.nx"
+import {
+  HirProgram, HirFunction, HirHandlerArm, HirHandlerBindingEntry,
+  HirHandlerBinding, HirBody, EagerBody, LazyBody, HirStmt, HirStmtKind,
+  HirExpr, HirExprKind, HirCallArg, HirNamedExpr, HirMatchCase, HirParam,
+  HirExternal, HirPatternKind, HirPatternField, HirRecordPatField
+} from "src/ir/hir_types.nx"
+import {
+  LinearUnused, LinearReuse, LinearMismatch, LinearLeakAcrossThrowableCall,
+  CannotMoveLinearOutOfArray
+} from "src/common/error.nx"
+import { Option, Some, None } from "std:option"
+
+// ─── Sig-map: name → callable signature ──────────────────────────────────────
+
+export type SigEntry = SigEntry(
+  name: string,
+  param_types: [TypeExpr],
+  ret_type: TypeExpr,
+  throw_row: TypeExpr
+)
+
+let build_sig_map = fn (prog: HirProgram) -> [SigEntry] do
+  match prog do
+    | HirProgram(ports: _, functions: fs, externals: exs, handler_bindings: hbs, enum_defs: _, exception_groups: _) ->
+      let sigs = sigs_from_functions(funcs: fs, acc: [])
+      let sigs2 = sigs_from_externals(exts: exs, acc: sigs)
+      return sigs_from_handler_bindings(bindings: hbs, acc: sigs2)
+  end
+end
+
+let sigs_from_functions = fn (funcs: [HirFunction], acc: [SigEntry]) -> [SigEntry] do
+  match funcs do
+    | [] -> return acc
+    | HirFunction(name: n, type_params: _, params: ps, ret_type: rt, throw_row: tw, body: _, span: _) :: rest ->
+      let pts = param_types(params: ps, acc: [])
+      return sigs_from_functions(funcs: rest, acc: SigEntry(name: n, param_types: pts, ret_type: rt, throw_row: tw) :: acc)
+  end
+end
+
+let sigs_from_externals = fn (exts: [HirExternal], acc: [SigEntry]) -> [SigEntry] do
+  match exts do
+    | [] -> return acc
+    | HirExternal(name: n, wasm_module: _, wasm_name: _, type_params: _, params: ps, ret_type: rt, throw_row: tw) :: rest ->
+      let pts = param_types(params: ps, acc: [])
+      return sigs_from_externals(exts: rest, acc: SigEntry(name: n, param_types: pts, ret_type: rt, throw_row: tw) :: acc)
+  end
+end
+
+let sigs_from_handler_bindings = fn (bindings: [HirHandlerBindingEntry], acc: [SigEntry]) -> [SigEntry] do
+  match bindings do
+    | [] -> return acc
+    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, arms: arms)) :: rest ->
+      let acc2 = sigs_from_handler_arms(arms, acc)
+      return sigs_from_handler_bindings(bindings: rest, acc: acc2)
+  end
+end
+
+let sigs_from_handler_arms = fn (arms: [HirHandlerArm], acc: [SigEntry]) -> [SigEntry] do
+  match arms do
+    | [] -> return acc
+    | HirHandlerArm(arm: HirFunction(name: n, type_params: _, params: ps, ret_type: rt, throw_row: tw, body: _, span: _), cont_binder: _) :: rest ->
+      let pts = param_types(params: ps, acc: [])
+      return sigs_from_handler_arms(arms: rest, acc: SigEntry(name: n, param_types: pts, ret_type: rt, throw_row: tw) :: acc)
+  end
+end
+
+let param_types = fn (params: [HirParam], acc: [TypeExpr]) -> [TypeExpr] do
+  match params do
+    | [] -> return rev_type_list(lst: acc, out: [])
+    | HirParam(name: _, label: _, typ: t) :: rest -> return param_types(params: rest, acc: t :: acc)
+  end
+end
+
+let rev_type_list = fn (lst: [TypeExpr], out: [TypeExpr]) -> [TypeExpr] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_type_list(lst: rest, out: x :: out)
+  end
+end
+
+let sig_lookup = fn (sigs: [SigEntry], name: string) -> Option<SigEntry> do
+  match sigs do
+    | [] -> return None
+    | SigEntry(name: n, param_types: pts, ret_type: rt, throw_row: tw) :: rest ->
+      if n == name then return Some(val: SigEntry(name: n, param_types: pts, ret_type: rt, throw_row: tw)) end
+      return sig_lookup(sigs: rest, name)
+  end
+end
+
+// ─── Linearity classification on TypeExpr ────────────────────────────────────
+
+/// True when `t` is "auto-droppable" — bootstrap's `is_auto_droppable`. Such
+/// types do not require explicit consumption: primitives, string, unit,
+/// arrays of plain values, and Linear/Borrow/Ref wrappers around the same.
+let is_auto_droppable = fn (t: TypeExpr) -> bool do
+  match t do
+    | TyI32 -> return true
+    | TyI64 -> return true
+    | TyF32 -> return true
+    | TyF64 -> return true
+    | TyIntLit -> return true
+    | TyFloatLit -> return true
+    | TyBool -> return true
+    | TyChar -> return true
+    | TyString -> return true
+    | TyUnit -> return true
+    | TyArray(_) -> return true
+    | TyLazy(_) -> return false
+    | TyLinear(inner: i) -> return is_auto_droppable(t: i)
+    | TyBorrow(inner: i) -> return is_auto_droppable(t: i)
+    | TyRef(inner: i) -> return is_auto_droppable(t: i)
+    | _ -> return false
+  end
+end
+
+/// True when `t` carries linearity that must be tracked: `%T` (Linear), `@T`
+/// (Lazy — one-shot continuation). Bootstrap also flags Array as linear-
+/// containing for `contains_linear_type`, but for the per-binding lint we
+/// only want bindings the user explicitly declared linear; arrays of plain
+/// values are auto-droppable per the Rust check.
+let is_linear_binding_type = fn (t: TypeExpr) -> bool do
+  match t do
+    | TyLinear(inner: _) -> return true
+    | TyLazy(inner: _) -> return true
+    | _ -> return false
+  end
+end
+
+// ─── Linearity state ─────────────────────────────────────────────────────────
+
+/// One snapshot of `vars` at a frame boundary. Wraps a `[string]` so the
+/// surrounding LinState can carry a list of these without nesting list-of-
+/// list type syntax (Nexus requires a nominal type for nested generics).
+export type LinFrame = LinFrame(vars: [string])
+
+/// Live linear bindings + enclosing frame snapshots. `frame_stack` is a
+/// stack of `vars` snapshots at function-body entry and `try`-body entry.
+/// The top is the "covered" set for the throwable-call leak check.
+export type LinState = LinState(vars: [string], frame_stack: [LinFrame])
+
+let lin_empty = fn () -> LinState do
+  return LinState(vars: [], frame_stack: [])
+end
+
+let lin_add = fn (st: LinState, name: string) -> LinState do
+  let LinState(vars: vs, frame_stack: fs) = st
+  return LinState(vars: name :: vs, frame_stack: fs)
+end
+
+let lin_remove = fn (st: LinState, name: string) -> LinState do
+  let LinState(vars: vs, frame_stack: fs) = st
+  return LinState(vars: remove_one(xs: vs, target: name), frame_stack: fs)
+end
+
+let remove_one = fn (xs: [string], target: string) -> [string] do
+  match xs do
+    | [] -> return []
+    | x :: rest ->
+      if x == target then return rest end
+      return x :: remove_one(xs: rest, target)
+  end
+end
+
+let lin_member = fn (st: LinState, name: string) -> bool do
+  let LinState(vars: vs, frame_stack: _) = st
+  return str_member(xs: vs, target: name)
+end
+
+let str_member = fn (xs: [string], target: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == target then return true end
+      return str_member(xs: rest, target)
+  end
+end
+
+/// Set equality of two linear-var sets — order-insensitive.
+let vars_equal = fn (a: [string], b: [string]) -> bool do
+  if length(xs: a) != length(xs: b) then return false end
+  return all_in(needles: a, haystack: b) && all_in(needles: b, haystack: a)
+end
+
+let length = fn (xs: [string]) -> i64 do
+  match xs do
+    | [] -> return 0
+    | _ :: rest -> return 1 + length(xs: rest)
+  end
+end
+
+let all_in = fn (needles: [string], haystack: [string]) -> bool do
+  match needles do
+    | [] -> return true
+    | n :: rest ->
+      if !str_member(xs: haystack, target: n) then return false end
+      return all_in(needles: rest, haystack)
+  end
+end
+
+let lin_push_frame = fn (st: LinState) -> LinState do
+  let LinState(vars: vs, frame_stack: fs) = st
+  return LinState(vars: vs, frame_stack: LinFrame(vars: copy(xs: vs)) :: fs)
+end
+
+let lin_pop_frame = fn (st: LinState) -> LinState do
+  let LinState(vars: vs, frame_stack: fs) = st
+  match fs do
+    | [] -> return st
+    | _ :: rest -> return LinState(vars: vs, frame_stack: rest)
+  end
+end
+
+let lin_top_frame = fn (st: LinState) -> Option<[string]> do
+  let LinState(vars: _, frame_stack: fs) = st
+  match fs do
+    | [] -> return None
+    | LinFrame(vars: top) :: _ -> return Some(val: top)
+  end
+end
+
+let copy = fn (xs: [string]) -> [string] do
+  match xs do
+    | [] -> return []
+    | x :: rest -> return x :: copy(xs: rest)
+  end
+end
+
+let join_simple = fn (xs: [string]) -> string do
+  match xs do
+    | [] -> return "{}"
+    | x :: [] -> return "{" ++ x ++ "}"
+    | x :: rest -> return "{" ++ x ++ "," ++ join_inner(xs: rest) ++ "}"
+  end
+end
+
+let join_inner = fn (xs: [string]) -> string do
+  match xs do
+    | [] -> return ""
+    | x :: [] -> return x
+    | x :: rest -> return x ++ "," ++ join_inner(xs: rest)
+  end
+end
+
+let sigil_kind = fn (s: Sigil) -> string do
+  match s do
+    | SigilImmutable -> return "immutable"
+    | SigilMutable -> return "mutable"
+    | SigilLinear -> return "linear"
+    | SigilLazy -> return "lazy"
+    | SigilBorrow -> return "borrow"
+  end
+end
+
+let ann_kind = fn (ann: Option<TypeExpr>) -> string do
+  match ann do
+    | None -> return "none"
+    | Some(val: t) -> return type_kind(t: t)
+  end
+end
+
+let type_kind = fn (t: TypeExpr) -> string do
+  match t do
+    | TyLinear(_) -> return "linear"
+    | TyLazy(_) -> return "lazy"
+    | TyArray(_) -> return "array"
+    | TyList(_) -> return "list"
+    | TyUserDefined(name: n, args: _) -> return "ud:" ++ n
+    | TyVar(name: n) -> return "var:" ++ n
+    | TyString -> return "string"
+    | TyI64 -> return "i64"
+    | _ -> return "other"
+  end
+end
+
+let val_kind = fn (v: HirExpr, sigs: [SigEntry]) -> string do
+  let HirExpr(node: nd, span: _) = v
+  match nd do
+    | Call(func: f, args: _) ->
+      match sig_lookup(sigs, name: f) do
+        | None -> return "call(" ++ f ++ ":no-sig)"
+        | Some(val: SigEntry(name: _, param_types: _, ret_type: rt, throw_row: _)) ->
+          return "call(" ++ f ++ ":" ++ type_kind(t: rt) ++ ")"
+      end
+    | _ -> return "non-call"
+  end
+end
+
+let lin_set_vars = fn (st: LinState, vs: [string]) -> LinState do
+  let LinState(vars: _, frame_stack: fs) = st
+  return LinState(vars: vs, frame_stack: fs)
+end
+
+// ─── Sig-map-aware linearity classification ──────────────────────────────────
+
+/// Determine whether the value-RHS of a `let x = expr` would yield a linear
+/// binding. Classification, in priority order:
+///   1. Sigil annotation on the let (`%`/`@`) → linear.
+///   2. Type annotation on the let (`x: %T` / `x: @T`) → linear.
+///   3. Otherwise inspect the value expression: a Call to a function whose
+///      return type is `%T` / `@T` produces a linear binding even when the
+///      user wrote `let x = …` without a sigil. Bootstrap recovers this
+///      via the inferred Type::Linear wrapper.
+let let_binds_linear = fn (
+  sigil: Sigil, ann: Option<TypeExpr>, value: HirExpr, sigs: [SigEntry]
+) -> bool do
+  match sigil do
+    | SigilLinear -> return true
+    | SigilLazy -> return true
+    | _ ->
+      match ann do
+        | Some(val: t) -> if is_linear_binding_type(t) then return true end
+        | None -> ()
+      end
+      let HirExpr(node: vnode, span: _) = value
+      match vnode do
+        | Call(func: f, args: _) ->
+          match sig_lookup(sigs, name: f) do
+            | Some(val: SigEntry(name: _, param_types: _, ret_type: rt, throw_row: _)) ->
+              return is_linear_binding_type(t: rt)
+            | None -> return false
+          end
+        | _ -> return false
+      end
+  end
+end
+
+// ─── Throwability classification ────────────────────────────────────────────
+
+/// True when `eff_row` is a non-empty throws row (i.e., the call may raise).
+/// A bare type variable / Unit row is treated as non-throwable: the caller
+/// has not committed to a concrete throws set yet, so the per-call check
+/// at the binder site of an as-yet-unresolved arrow does not fire.
+let row_is_throwable = fn (eff_row: TypeExpr) -> bool do
+  match eff_row do
+    | TyRow(types: ts, rest: _) ->
+      match ts do
+        | [] -> return false
+        | _ :: _ -> return true
+      end
+    | TyUnit -> return false
+    | TyVar(_) -> return false
+    | _ -> return false
+  end
+end
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
+export let check_program = fn (prog: HirProgram) -> unit throws { Exn } do
+  let sigs = build_sig_map(prog)
+  match prog do | HirProgram(ports: _, functions: fs, externals: _, handler_bindings: hbs, enum_defs: _, exception_groups: _) ->
+    check_functions(funcs: fs, sigs)
+    return check_handler_bindings(bindings: hbs, sigs)
+  end
+end
+
+let check_functions = fn (funcs: [HirFunction], sigs: [SigEntry]) -> unit throws { Exn } do
+  match funcs do
+    | [] -> return ()
+    | f :: rest ->
+      check_function(func: f, sigs)
+      return check_functions(funcs: rest, sigs)
+  end
+end
+
+let check_handler_bindings = fn (
+  bindings: [HirHandlerBindingEntry], sigs: [SigEntry]
+) -> unit throws { Exn } do
+  match bindings do
+    | [] -> return ()
+    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, arms: arms)) :: rest ->
+      check_handler_arms(arms, sigs)
+      return check_handler_bindings(bindings: rest, sigs)
+  end
+end
+
+let check_handler_arms = fn (arms: [HirHandlerArm], sigs: [SigEntry]) -> unit throws { Exn } do
+  match arms do
+    | [] -> return ()
+    | HirHandlerArm(arm: f, cont_binder: _) :: rest ->
+      check_function(func: f, sigs)
+      return check_handler_arms(arms: rest, sigs)
+  end
+end
+
+let check_function = fn (func: HirFunction, sigs: [SigEntry]) -> unit throws { Exn } do
+  match func do | HirFunction(name: _, type_params: _, params: ps, ret_type: _, throw_row: _, body: b, span: sp) ->
+    match b do
+      | EagerBody(stmts) ->
+        // Seed live set with linear params; push frame snapshot so the
+        // body's throwable-call check excludes them (call-site contract).
+        let initial_vars = collect_linear_params(params: ps, acc: [])
+        let st0 = lin_set_vars(st: lin_empty(), vs: initial_vars)
+        let st1 = lin_push_frame(st: st0)
+        let st2 = check_stmts(stmts, st: st1, sigs)
+        // Function-end consumption check: any linear param or local left
+        // live raises Unused.
+        return require_empty_or_droppable(
+          vars: lin_state_vars(st: st2),
+          params: ps,
+          span: sp
+        )
+      | LazyBody(_) -> return ()
+    end
+  end
+end
+
+let lin_state_vars = fn (st: LinState) -> [string] do
+  let LinState(vars: vs, frame_stack: _) = st
+  return vs
+end
+
+let collect_linear_params = fn (params: [HirParam], acc: [string]) -> [string] do
+  match params do
+    | [] -> return acc
+    | HirParam(name: n, label: _, typ: t) :: rest ->
+      if is_linear_binding_type(t) then
+        return collect_linear_params(params: rest, acc: n :: acc)
+      end
+      return collect_linear_params(params: rest, acc)
+  end
+end
+
+let require_empty_or_droppable = fn (
+  vars: [string], params: [HirParam], span: Span
+) -> unit throws { Exn } do
+  match vars do
+    | [] -> return ()
+    | n :: rest ->
+      // A linear param of an auto-droppable inner (e.g., %i64) was added
+      // for symmetry but doesn't need consumption — bootstrap warns instead
+      // of erring. Skip those silently here; the warning belongs to a
+      // separate diagnostics pass.
+      if param_inner_is_auto_droppable(params, name: n) then
+        return require_empty_or_droppable(vars: rest, params, span)
+      end
+      raise LinearUnused(name: n, span)
+  end
+end
+
+let param_inner_is_auto_droppable = fn (params: [HirParam], name: string) -> bool do
+  match params do
+    | [] -> return false
+    | HirParam(name: pn, label: _, typ: t) :: rest ->
+      if pn == name then
+        match t do
+          | TyLinear(inner: i) -> return is_auto_droppable(t: i)
+          | _ -> return false
+        end
+      end
+      return param_inner_is_auto_droppable(params: rest, name)
+  end
+end
+
+// ─── Statement walk ──────────────────────────────────────────────────────────
+
+let check_stmts = fn (
+  stmts: [HirStmt], st: LinState, sigs: [SigEntry]
+) -> LinState throws { Exn } do
+  match stmts do
+    | [] -> return st
+    | HirStmt(node: nd, span: sp) :: rest ->
+      let st1 = check_stmt(stmt: nd, st, sigs, span: sp, at_stmt_level: true)
+      return check_stmts(stmts: rest, st: st1, sigs)
+  end
+end
+
+let check_stmt = fn (
+  stmt: HirStmtKind, st: LinState, sigs: [SigEntry], span: Span, at_stmt_level: bool
+) -> LinState throws { Exn } do
+  match stmt do
+    | Let(name: n, sigil: sig, typ: ann, value: v) ->
+      // Walk RHS first so any linear use inside it is consumed before the
+      // new binding is added.
+      let st1 = check_expr(expr: v, st, sigs, at_stmt_level: false)
+      if let_binds_linear(sigil: sig, ann, value: v, sigs) then
+        return lin_add(st: st1, name: n)
+      end
+      return st1
+    | Expr(expr: e) ->
+      // Top-of-Stmt expression: a root Call here triggers the throwable-
+      // call leak check (issue nexus-7eex.2). Nested calls inside larger
+      // expressions are not at stmt level — they consume their inputs and
+      // close the leak window via the surrounding consumer.
+      return check_expr(expr: e, st, sigs, at_stmt_level)
+    | Return(expr: e) ->
+      // After return, the function exits; the unused-linear check fires at
+      // function level. We still walk e to consume linears used in it.
+      return check_expr(expr: e, st, sigs, at_stmt_level: false)
+    | Assign(target: t, value: v) ->
+      let st1 = check_expr(expr: t, st, sigs, at_stmt_level: false)
+      return check_expr(expr: v, st: st1, sigs, at_stmt_level: false)
+    | Try(body: b, catch_param: _, catch_body: cb) ->
+      // Push pre-try snapshot for Strategy A: anything alive at this point
+      // is the catch arm's responsibility on raise. Throwable-call check
+      // inside the body excludes those vars from "leaked".
+      let pre_try_vars = lin_state_vars(st)
+      let st_try = lin_push_frame(st)
+      let st_after_try = check_stmts(stmts: b, st: st_try, sigs)
+      let st_after_try2 = lin_pop_frame(st: st_after_try)
+      // Catch arm starts from pre-try snapshot (Strategy A, nexus-7eex.1),
+      // not from the post-success state. The catch arm must finish with
+      // the same linear-var set as the post-success state (per-arm
+      // consistency — bootstrap "Linear mismatch across catch arms").
+      let st_catch_in = lin_set_vars(st: st_after_try2, vs: pre_try_vars)
+      let st_catch_out = check_stmts(stmts: cb, st: st_catch_in, sigs)
+      let post_catch_vars = lin_state_vars(st: st_catch_out)
+      let post_try_vars = lin_state_vars(st: st_after_try2)
+      if !vars_equal(a: post_try_vars, b: post_catch_vars) then
+        raise LinearMismatch(detail: "try/catch arms diverge on linear set", span)
+      end
+      return lin_set_vars(st: st_after_try2, vs: post_try_vars)
+    | Inject(handlers: _, body: b) -> return check_stmts(stmts: b, st, sigs)
+  end
+end
+
+// ─── Expression walk ─────────────────────────────────────────────────────────
+
+let check_expr = fn (
+  expr: HirExpr, st: LinState, sigs: [SigEntry], at_stmt_level: bool
+) -> LinState throws { Exn } do
+  let HirExpr(node: nd, span: sp) = expr
+  return check_expr_kind(expr: nd, st, sigs, span: sp, at_stmt_level)
+end
+
+let check_expr_kind = fn (
+  expr: HirExprKind, st: LinState, sigs: [SigEntry], span: Span, at_stmt_level: bool
+) -> LinState throws { Exn } do
+  match expr do
+    | Literal(_) -> return st
+    | Variable(name: n, sigil: _) ->
+      // Reference to a tracked linear binding consumes it.
+      if lin_member(st, name: n) then return lin_remove(st, name: n) end
+      return st
+    | Borrow(name: _, sigil: _) ->
+      // `&x` does not consume x.
+      return st
+    | BinOp(left: l, op: _, right: r) ->
+      let st1 = check_expr(expr: l, st, sigs, at_stmt_level: false)
+      return check_expr(expr: r, st: st1, sigs, at_stmt_level: false)
+    | UnOp(op: _, operand: o) ->
+      return check_expr(expr: o, st, sigs, at_stmt_level: false)
+    | Call(func: f, args: cargs) ->
+      // Walk arguments left-to-right; a Variable inside an arg consumes it.
+      let st1 = check_call_args(args: cargs, st, sigs)
+      // If `f` itself is a linear-bound variable (let %g = …), consuming it
+      // happens here too — bootstrap consumes the function name when its
+      // type is Linear/Lazy.
+      let st2 = if lin_member(st: st1, name: f) then lin_remove(st: st1, name: f) else st1 end
+      // Throwable-call leak check — only at stmt level (nexus-7eex.2).
+      if at_stmt_level then
+        check_throwable_leak(func: f, st: st2, sigs, span)
+      end
+      return st2
+    | Ctor(variant: _, args: cargs) ->
+      return check_exprs(exprs: cargs, st, sigs)
+    | Record(fields: fs) ->
+      return check_named_exprs(fields: fs, st, sigs)
+    | Array(elems: es) ->
+      return check_exprs(exprs: es, st, sigs)
+    | Index(target: t, index: i) ->
+      // Move-out rejection: indexing a linear-element array would move the
+      // element out. Implementing this requires per-Index typing; left to
+      // a future linearity follow-up. The structural walk still recurses.
+      let st1 = check_expr(expr: t, st, sigs, at_stmt_level: false)
+      return check_expr(expr: i, st: st1, sigs, at_stmt_level: false)
+    | FieldAccess(target: t, field: _) ->
+      return check_expr(expr: t, st, sigs, at_stmt_level: false)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      let st1 = check_expr(expr: c, st, sigs, at_stmt_level: false)
+      let then_diverges = stmts_diverge(stmts: tb)
+      let st_then = check_stmts(stmts: tb, st: st1, sigs)
+      match eb do
+        | None ->
+          if then_diverges then
+            // Then-branch always exits; only the fall-through path matters.
+            return st1
+          end
+          // Without an else, the linear set must be the same on both paths
+          // (the no-else path is just `st1`).
+          let v1 = lin_state_vars(st: st1)
+          let vt = lin_state_vars(st: st_then)
+          if !vars_equal(a: v1, b: vt) then
+            raise LinearMismatch(detail: "if-without-else branches diverge on linear set: pre=" ++ join_simple(xs: v1) ++ " then=" ++ join_simple(xs: vt), span)
+          end
+          return st1
+        | Some(val: ebs) ->
+          let else_diverges = stmts_diverge(stmts: ebs)
+          let st_else = check_stmts(stmts: ebs, st: st1, sigs)
+          if then_diverges && else_diverges then
+            return lin_set_vars(st: st1, vs: [])
+          end
+          if then_diverges then return st_else end
+          if else_diverges then return st_then end
+          if !vars_equal(a: lin_state_vars(st: st_then), b: lin_state_vars(st: st_else)) then
+            raise LinearMismatch(detail: "if/else branches diverge on linear set: then=" ++ join_simple(xs: lin_state_vars(st: st_then)) ++ " else=" ++ join_simple(xs: lin_state_vars(st: st_else)), span)
+          end
+          return st_then
+      end
+    | Match(target: t, cases: cs) ->
+      let st1 = check_expr(expr: t, st, sigs, at_stmt_level: false)
+      return check_match_cases(cases: cs, st: st1, sigs, span)
+    | While(cond: c, body: b) ->
+      let st1 = check_expr(expr: c, st, sigs, at_stmt_level: false)
+      let st_body = check_stmts(stmts: b, st: st1, sigs)
+      // While body must preserve linear set (it may run zero times).
+      if !vars_equal(a: lin_state_vars(st: st1), b: lin_state_vars(st: st_body)) then
+        raise LinearMismatch(detail: "while body diverges on linear set", span)
+      end
+      return st1
+    | For(var: _, start: s, end_expr: e, body: b) ->
+      let st1 = check_expr(expr: s, st, sigs, at_stmt_level: false)
+      let st2 = check_expr(expr: e, st: st1, sigs, at_stmt_level: false)
+      let st_body = check_stmts(stmts: b, st: st2, sigs)
+      if !vars_equal(a: lin_state_vars(st: st2), b: lin_state_vars(st: st_body)) then
+        raise LinearMismatch(detail: "for body diverges on linear set", span)
+      end
+      return st2
+    | Lambda(type_params: _, params: ps, ret_type: _, body: b) ->
+      // Lambda body is its own frame; outer linears captured by the lambda
+      // are tracked via `src/typecheck/capture.nx`. Walk the body in a
+      // fresh state seeded only with the lambda's own linear params.
+      let lparams = collect_linear_params(params: ps, acc: [])
+      let lst0 = lin_set_vars(st: lin_empty(), vs: lparams)
+      let lst1 = lin_push_frame(st: lst0)
+      let lst2 = check_stmts(stmts: b, st: lst1, sigs)
+      // A lambda body that leaves linear params unconsumed is a type error
+      // at construction time. The bootstrap also runs the check_unused
+      // check for lambda bodies.
+      require_empty_or_droppable(vars: lin_state_vars(st: lst2), params: ps, span)
+      return st
+    | Raise(expr: e) ->
+      // After raise, control transfers to the catch arm; remaining stmts
+      // are unreachable. Walk the raised value to consume any linears in it
+      // (rare, but the value can reference linear bindings).
+      return check_expr(expr: e, st, sigs, at_stmt_level: false)
+    | Force(expr: e) ->
+      // `force(@x)` consumes the lazy. The inner Variable visit handles
+      // consumption.
+      return check_expr(expr: e, st, sigs, at_stmt_level: false)
+    | Thunk(body: b) ->
+      // The thunk body runs deferred; we don't track linears across the
+      // deferral here (the @T binder check in src/ir/linearity.nx covers
+      // the lazy-binding-specific case).
+      return check_expr(expr: b, st, sigs, at_stmt_level: false)
+    | ExternalRef(_) -> return st
+    | Handler(_) -> return st
+  end
+end
+
+let check_exprs = fn (
+  exprs: [HirExpr], st: LinState, sigs: [SigEntry]
+) -> LinState throws { Exn } do
+  match exprs do
+    | [] -> return st
+    | e :: rest ->
+      let st1 = check_expr(expr: e, st, sigs, at_stmt_level: false)
+      return check_exprs(exprs: rest, st: st1, sigs)
+  end
+end
+
+let check_call_args = fn (
+  args: [HirCallArg], st: LinState, sigs: [SigEntry]
+) -> LinState throws { Exn } do
+  match args do
+    | [] -> return st
+    | HirCallArg(label: _, value: v) :: rest ->
+      let st1 = check_expr(expr: v, st, sigs, at_stmt_level: false)
+      return check_call_args(args: rest, st: st1, sigs)
+  end
+end
+
+let check_named_exprs = fn (
+  fields: [HirNamedExpr], st: LinState, sigs: [SigEntry]
+) -> LinState throws { Exn } do
+  match fields do
+    | [] -> return st
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      let st1 = check_expr(expr: v, st, sigs, at_stmt_level: false)
+      return check_named_exprs(fields: rest, st: st1, sigs)
+  end
+end
+
+// ─── Match-case branch consistency ───────────────────────────────────────────
+
+let check_match_cases = fn (
+  cases: [HirMatchCase], st: LinState, sigs: [SigEntry], span: Span
+) -> LinState throws { Exn } do
+  return check_match_cases_go(cases, st, sigs, span, ref_set: None)
+end
+
+let check_match_cases_go = fn (
+  cases: [HirMatchCase], st: LinState, sigs: [SigEntry], span: Span,
+  ref_set: Option<[string]>
+) -> LinState throws { Exn } do
+  match cases do
+    | [] ->
+      match ref_set do
+        | None -> return lin_set_vars(st, vs: [])
+        | Some(val: vs) -> return lin_set_vars(st, vs)
+      end
+    | HirMatchCase(pattern: p, body: b) :: rest ->
+      // Pattern binders that introduce linear vars (`%v` patterns) are
+      // added before walking the body. Other binders (immutable) do not
+      // become linear bindings.
+      let case_state = lin_set_vars(st, vs: lin_state_vars(st: st))
+      let case_state2 = bind_pattern_linear(pat: p, st: case_state)
+      let case_diverges = stmts_diverge(stmts: b)
+      let case_out = check_stmts(stmts: b, st: case_state2, sigs)
+      if case_diverges then
+        return check_match_cases_go(cases: rest, st, sigs, span, ref_set)
+      end
+      let case_vars = lin_state_vars(st: case_out)
+      match ref_set do
+        | None ->
+          return check_match_cases_go(cases: rest, st, sigs, span, ref_set: Some(val: case_vars))
+        | Some(val: rv) ->
+          if !vars_equal(a: rv, b: case_vars) then
+            raise LinearMismatch(detail: "match arms diverge on linear set", span)
+          end
+          return check_match_cases_go(cases: rest, st, sigs, span, ref_set)
+      end
+  end
+end
+
+let bind_pattern_linear = fn (pat: HirPatternKind, st: LinState) -> LinState throws { Exn } do
+  match pat do
+    | PLit(_) -> return st
+    | PWild -> return st
+    | PVar(name: n, sigil: s) ->
+      match s do
+        | SigilLinear -> return lin_add(st, name: n)
+        | SigilLazy -> return lin_add(st, name: n)
+        | _ -> return st
+      end
+    | PCtor(variant: _, fields: fs) -> return bind_pattern_fields(fields: fs, st)
+    | PRec(fields: fs, is_partial: _) -> return bind_pattern_rec_fields(fields: fs, st)
+    | POr(alts) -> return bind_pattern_or(alts, st)
+  end
+end
+
+let bind_pattern_fields = fn (
+  fields: [HirPatternField], st: LinState
+) -> LinState throws { Exn } do
+  match fields do
+    | [] -> return st
+    | HirPatternField(name: _, pattern: p) :: rest ->
+      let st1 = bind_pattern_linear(pat: p, st)
+      return bind_pattern_fields(fields: rest, st: st1)
+  end
+end
+
+let bind_pattern_rec_fields = fn (
+  fields: [HirRecordPatField], st: LinState
+) -> LinState throws { Exn } do
+  match fields do
+    | [] -> return st
+    | HirRecordPatField(name: _, pattern: p) :: rest ->
+      let st1 = bind_pattern_linear(pat: p, st)
+      return bind_pattern_rec_fields(fields: rest, st: st1)
+  end
+end
+
+let bind_pattern_or = fn (
+  alts: [HirPatternKind], st: LinState
+) -> LinState throws { Exn } do
+  // Or-patterns require all alternatives to bind the same linear-name set.
+  // Use the first alt as the canonical binder set.
+  match alts do
+    | [] -> return st
+    | a :: _ -> return bind_pattern_linear(pat: a, st)
+  end
+end
+
+// ─── Throwable-call leak check ───────────────────────────────────────────────
+
+/// At a stmt-level Call to `func`, any linear in `st.vars` that is *not*
+/// covered by the top frame snapshot would leak if the call raises. Raise
+/// `LinearLeakAcrossThrowableCall` listing the offending linears.
+let check_throwable_leak = fn (
+  func: string, st: LinState, sigs: [SigEntry], span: Span
+) -> unit throws { Exn } do
+  match sig_lookup(sigs, name: func) do
+    | None -> return ()
+    | Some(val: SigEntry(name: _, param_types: _, ret_type: _, throw_row: tw)) ->
+      if !row_is_throwable(eff_row: tw) then return () end
+      let leaked = uncovered_linears(st)
+      match leaked do
+        | [] -> return ()
+        | _ :: _ -> raise LinearLeakAcrossThrowableCall(callee: func, leaked, span)
+      end
+  end
+end
+
+let uncovered_linears = fn (st: LinState) -> [string] do
+  let vs = lin_state_vars(st)
+  match lin_top_frame(st) do
+    | None -> return vs
+    | Some(val: covered) -> return filter_not_in(xs: vs, exclude: covered, acc: [])
+  end
+end
+
+let filter_not_in = fn (
+  xs: [string], exclude: [string], acc: [string]
+) -> [string] do
+  match xs do
+    | [] -> return acc
+    | x :: rest ->
+      if str_member(xs: exclude, target: x) then
+        return filter_not_in(xs: rest, exclude, acc)
+      end
+      return filter_not_in(xs: rest, exclude, acc: x :: acc)
+  end
+end
+
+// ─── Divergence detection ────────────────────────────────────────────────────
+
+/// True when `stmts` ends with a control-flow exit (return / raise). Used
+/// to skip linear-set reconciliation on branches that never reach the join.
+///
+/// Recurses into:
+///   - `StmtLetPattern` desugar form `Stmt::Expr(Match(scrutinee, [case]))`
+///     where the single case body is the remainder of the original block —
+///     so divergence of the desugared body is divergence of the wrapping
+///     match's first case body.
+///   - `if X then ... return ... else ... return ... end` lifted to an
+///     expression: each branch must diverge.
+///
+/// Uses HIR depth as the recursion bound to keep the structural walk
+/// terminating; the inlined helper is `stmts_diverge_depth` and the public
+/// surface (`stmts_diverge`) seeds depth=64 — enough for typical desugar
+/// nesting and a hard ceiling against pathological cycles.
+let stmts_diverge = fn (stmts: [HirStmt]) -> bool do
+  return stmts_diverge_depth(stmts, depth: 64)
+end
+
+let stmts_diverge_depth = fn (stmts: [HirStmt], depth: i64) -> bool do
+  if depth <= 0 then return false end
+  match last_stmt(stmts) do
+    | None -> return false
+    | Some(val: HirStmt(node: nd, span: _)) ->
+      match nd do
+        | Return(_) -> return true
+        | Expr(expr: HirExpr(node: en, span: _)) ->
+          match en do
+            | Raise(_) -> return true
+            | Match(target: _, cases: cs) -> return all_cases_diverge_depth(cases: cs, depth: depth - 1)
+            | If(cond: _, then_branch: tb, else_branch: eb) ->
+              match eb do
+                | None -> return false
+                | Some(val: ebs) -> return stmts_diverge_depth(stmts: tb, depth: depth - 1) && stmts_diverge_depth(stmts: ebs, depth: depth - 1)
+              end
+            | _ -> return false
+          end
+        | _ -> return false
+      end
+  end
+end
+
+let all_cases_diverge_depth = fn (cases: [HirMatchCase], depth: i64) -> bool do
+  match cases do
+    | [] -> return true
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      if !stmts_diverge_depth(stmts: b, depth) then return false end
+      return all_cases_diverge_depth(cases: rest, depth)
+  end
+end
+
+let cases_kinds = fn (cases: [HirMatchCase]) -> string do
+  match cases do
+    | [] -> return ""
+    | HirMatchCase(pattern: _, body: b) :: [] -> return last_stmt_kind(stmts: b)
+    | HirMatchCase(pattern: _, body: b) :: rest -> return last_stmt_kind(stmts: b) ++ "," ++ cases_kinds(cases: rest)
+  end
+end
+
+let last_stmt = fn (stmts: [HirStmt]) -> Option<HirStmt> do
+  match stmts do
+    | [] -> return None
+    | s :: [] -> return Some(val: s)
+    | _ :: rest -> return last_stmt(stmts: rest)
+  end
+end
+
+let last_stmt_kind = fn (stmts: [HirStmt]) -> string do
+  match last_stmt(stmts) do
+    | None -> return "empty"
+    | Some(val: HirStmt(node: nd, span: _)) ->
+      match nd do
+        | Let(_) -> return "Let"
+        | Expr(expr: HirExpr(node: en, span: _)) ->
+          match en do
+            | Raise(_) -> return "Expr(Raise)"
+            | Call(func: f, args: _) -> return "Expr(Call:" ++ f ++ ")"
+            | Match(target: _, cases: cs) ->
+              return "Expr(Match-cases=" ++ cases_kinds(cases: cs) ++ ")"
+            | If(_) -> return "Expr(If)"
+            | _ -> return "Expr(other)"
+          end
+        | Return(_) -> return "Return"
+        | Assign(_) -> return "Assign"
+        | Try(_) -> return "Try"
+        | Inject(_) -> return "Inject"
+      end
+  end
+end
