@@ -24,3 +24,8 @@ fn handler_first_class() {
 fn match_exhaustiveness() {
     exec_with_stdlib(&read_fixture("nxc/test_match_exhaustiveness.nx"));
 }
+
+#[test]
+fn throws_row_narrowing() {
+    exec_with_stdlib(&read_fixture("nxc/test_throws_row_narrowing.nx"));
+}

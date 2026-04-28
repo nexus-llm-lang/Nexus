@@ -17,13 +17,13 @@ import * as infer from "src/typecheck/infer.nx"
 // ─── Public entry point ─────────────────────────────────────────────────────
 
 export let check_program = fn (hir: HirProgram, local_names: [string]) -> HirProgram throws { Exn } do
-  let HirProgram(ports, functions: funcs, externals: exts, handler_bindings: hbs, enum_defs: edefs) = hir
+  let HirProgram(ports, functions: funcs, externals: exts, handler_bindings: hbs, enum_defs: edefs, exception_groups: egs) = hir
   // Build enum entries
   let enum_entries = build_enum_entries(defs: edefs)
   // Add built-in Exn and List
   let enum_entries2 = add_builtins(entries: enum_entries)
   // Build initial state
-  let state = tctypes.tc_new_state(enum_defs: enum_entries2, type_defs: [])
+  let state = tctypes.tc_new_state(enum_defs: enum_entries2, type_defs: [], exception_groups: egs)
 
   // Pass 1: Register all signatures
   let st1 = register_externals(state, exts)
@@ -254,13 +254,13 @@ end
 let register_functions = fn (state: CheckState, funcs: [HirFunction]) -> CheckState do
   match funcs do
     | [] -> return state
-    | HirFunction(name: n, type_params: tps, params, ret_type: ret, body: _, span: _) :: rest ->
+    | HirFunction(name: n, type_params: tps, params, ret_type: ret, throw_row: tw, _) :: rest ->
       let param_types = hir_params_to_named_types(params)
       let arrow = TyArrow(
         params: convert_named_types(nts: param_types, vars: tps),
         ret: convert_ud_to_var(typ: ret, vars: tps),
         requires: TyRow(types: [], rest: None),
-        throw_row: TyRow(types: [], rest: None)
+        throw_row: convert_ud_to_var(typ: tw, vars: tps)
       )
       let env = tctypes.env_insert(env: tctypes.state_env(state), name: n, scheme: Scheme(vars: tps, typ: arrow))
       return register_functions(state: tctypes.state_with_env(state, env), funcs: rest)
@@ -296,7 +296,7 @@ end
 let register_handler_methods = fn (env: [EnvEntry], port_name: string, prefix_len: i64, arms: [HirHandlerArm]) -> [EnvEntry] do
   match arms do
     | [] -> return env
-    | HirHandlerArm(arm: HirFunction(name: n, type_params: _, params, ret_type: ret, _), cont_binder: kb) :: rest ->
+    | HirHandlerArm(arm: HirFunction(name: n, type_params: _, params, ret_type: ret, throw_row: tw, _), cont_binder: kb) :: rest ->
       let original_name = str.substring(s: n, start: prefix_len, len: str.length(s: n) - prefix_len)
       let method_name = bb.concat(parts: [port_name, ".", original_name])
       let user_params = match kb do
@@ -307,7 +307,7 @@ let register_handler_methods = fn (env: [EnvEntry], port_name: string, prefix_le
       let arrow = TyArrow(
         params: param_types, ret,
         requires: TyRow(types: [], rest: None),
-        throw_row: TyRow(types: [], rest: None)
+        throw_row: tw
       )
       let env1 = tctypes.env_insert(env, name: method_name, scheme: tctypes.mono(typ: arrow))
       return register_handler_methods(env: env1, port_name, prefix_len, arms: rest)
@@ -420,7 +420,7 @@ end
 let collect_arm_binders = fn (arms: [HirHandlerArm], acc: [ContBinderEntry]) -> [ContBinderEntry] throws { Exn } do
   match arms do
     | [] -> return acc
-    | HirHandlerArm(arm: HirFunction(name: fname, type_params: _, params: _, ret_type: _, body: _, span: _), cont_binder: Some(val: k)) :: rest ->
+    | HirHandlerArm(arm: HirFunction(name: fname, type_params: _, params: _, ret_type: _, _), cont_binder: Some(val: k)) :: rest ->
       return collect_arm_binders(arms: rest, acc: ContBinderEntry(arm_fn_name: fname, binder: k) :: acc)
     | _ :: rest -> return collect_arm_binders(arms: rest, acc)
   end
@@ -443,7 +443,7 @@ let check_all_functions = fn (state: CheckState, funcs: [HirFunction], local_nam
   match funcs do
     | [] -> return ()
     | func :: rest ->
-      let HirFunction(name, type_params: _, params: _, ret_type: _, body: _, span: _) = func
+      let HirFunction(name, type_params: _, params: _, ret_type: _, _) = func
       if is_local(name, local_names) then
         check_function(state, func, cont_map)
       end
@@ -473,10 +473,11 @@ let check_arm_bodies = fn (state: CheckState, arms: [HirHandlerArm]) -> unit thr
 end
 
 let check_arm_body = fn (state: CheckState, func: HirFunction, cont_binder: Option<string>) -> unit throws { Exn } do
-  let HirFunction(name, type_params: tps, params, ret_type: ret, body: hir_body, span: _) = func
+  let HirFunction(name, type_params: tps, params, ret_type: ret, throw_row: tw, body: hir_body, span: _) = func
   let body = match hir_body do | EagerBody(stmts: s) -> s | LazyBody(_) -> [] end
   let conv_params = convert_hir_params(params, vars: tps)
   let conv_ret = convert_ud_to_var(typ: ret, vars: tps)
+  let conv_tw = convert_ud_to_var(typ: tw, vars: tps)
   let body_env = add_func_params(env: tctypes.state_env(state), params: conv_params)
   // If the arm has `with @k`, bind k in env as @ret_type. Standard inference
   // then catches type mismatches when the arm body forces k at a wrong type.
@@ -485,7 +486,8 @@ let check_arm_body = fn (state: CheckState, func: HirFunction, cont_binder: Opti
     | None -> body_env
   end
   let body_state = tctypes.state_with_env(state, env: body_env2)
-  match infer.infer_stmts(state: body_state, stmts: body, ret_type: conv_ret) do
+  let body_state2 = tctypes.state_with_throw_row(state: body_state, throw_row: conv_tw)
+  match infer.infer_stmts(state: body_state2, stmts: body, ret_type: conv_ret) do
     | InferExprErr(message: m, span: err_span) ->
       raise TypeMismatch(func_name: name, detail: m, span: err_span)
     | InferExprOk(_) ->
@@ -494,11 +496,12 @@ let check_arm_body = fn (state: CheckState, func: HirFunction, cont_binder: Opti
 end
 
 let check_function = fn (state: CheckState, func: HirFunction, cont_map: ContBinderMap) -> unit throws { Exn } do
-  let HirFunction(name, type_params: tps, params, ret_type: ret, body: hir_body, span) = func
+  let HirFunction(name, type_params: tps, params, ret_type: ret, throw_row: tw, body: hir_body, span) = func
   let body = match hir_body do | EagerBody(stmts: s) -> s | LazyBody(_) -> [] end
   // Convert UserDefined type params to TyVar in param types and return type
   let conv_params = convert_hir_params(params, vars: tps)
   let conv_ret = convert_ud_to_var(typ: ret, vars: tps)
+  let conv_tw = convert_ud_to_var(typ: tw, vars: tps)
   // Build local env with function params
   let body_env = add_func_params(env: tctypes.state_env(state), params: conv_params)
   // If this function is a handler arm with `with @k`, bind k as @ret in the
@@ -511,7 +514,8 @@ let check_function = fn (state: CheckState, func: HirFunction, cont_map: ContBin
     | None -> body_env
   end
   let body_state = tctypes.state_with_env(state, env: body_env2)
-  match infer.infer_stmts(state: body_state, stmts: body, ret_type: conv_ret) do
+  let body_state2 = tctypes.state_with_throw_row(state: body_state, throw_row: conv_tw)
+  match infer.infer_stmts(state: body_state2, stmts: body, ret_type: conv_ret) do
     | InferExprErr(message: m, span: err_span) ->
       raise TypeMismatch(func_name: name, detail: m, span: err_span)
     | InferExprOk(_) ->

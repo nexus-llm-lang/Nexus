@@ -1,0 +1,127 @@
+// Tests for src/typecheck/infer — narrow throws-row enforcement (nexus-mqin.1.1).
+// `infer_raise` admits a raised exception only when its variant name is
+// allowed by the active throws-row: literally listed, member of an
+// exception group entry, or `Exn` (universal). `throws { Exn }` keeps
+// accepting all variants for backward compatibility.
+
+import { TypeExpr, TyUnit, TyUserDefined, TyRow, EnumDef, VariantDef, VariantField } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { HirExpr, HirStmt, HirExprKind, Raise, Ctor, Literal, Expr } from "src/ir/hir_types.nx"
+import { ExceptionGroupEntry } from "src/ir/hir_types.nx"
+import {
+  InferExprOk, InferExprErr,
+  EnumEntry, tc_new_state, state_with_throw_row
+}, * as tctypes from "src/typecheck/types.nx"
+import { infer_expr } from "src/typecheck/infer.nx"
+import { LitUnit } from "src/common/ast.nx"
+import { Some, None } from "std:option"
+
+let assert = fn (cond: bool, msg: string) -> unit throws { Exn } do
+  if cond then return ()
+  else raise RuntimeError(val: msg)
+  end
+end
+
+/// Build a minimal Exn enum with two variants for testing.
+let build_exn_enum = fn () -> EnumEntry throws { Exn } do
+  let exn_def = EnumDef(
+    name: "Exn",
+    is_public: true,
+    is_opaque: false,
+    type_params: [],
+    variants: [
+      VariantDef(name: "RuntimeError", fields: [VariantField(name: Some(val: "val"), typ: TyUserDefined(name: "string", args: []))]),
+      VariantDef(name: "LirFieldOnNonVariable", fields: []),
+      VariantDef(name: "LirFieldOnNonRecord", fields: []),
+      VariantDef(name: "OutOfBounds", fields: [])
+    ]
+  )
+  return EnumEntry(name: "Exn", def: exn_def)
+end
+
+/// `raise Foo()` shaped HIR.
+let mk_raise = fn (variant: string, sp: Span) -> HirExpr throws { Exn } do
+  let inner = HirExpr(node: Ctor(variant, args: []), span: sp)
+  return HirExpr(node: Raise(expr: inner), span: sp)
+end
+
+let main = fn () -> unit throws { Exn } do
+  let sp = Span(offset: 0, line: 1, col: 1)
+  let exn_entry = build_exn_enum()
+  let lir_group = ExceptionGroupEntry(
+    name: "LirError",
+    members: ["LirFieldOnNonVariable", "LirFieldOnNonRecord"]
+  )
+
+  // ── Acceptance #3: throws { Exn } accepts any variant (backward compat) ──
+  let st_exn = tc_new_state(
+    enum_defs: [exn_entry], type_defs: [],
+    exception_groups: [lir_group]
+  )
+  let st_exn_row = state_with_throw_row(
+    state: st_exn,
+    throw_row: TyRow(types: [TyUserDefined(name: "Exn", args: [])], rest: None)
+  )
+  match infer_expr(state: st_exn_row, expr: mk_raise(variant: "OutOfBounds", sp), ret_type: TyUnit) do
+    | InferExprErr(message: m, span: _) ->
+      raise RuntimeError(val: "throws { Exn } should accept any variant, got error: " ++ m)
+    | InferExprOk(_) ->
+      assert(cond: true, msg: "throws { Exn } accepts OutOfBounds")
+  end
+
+  // ── Acceptance #4 (narrow row, allowed): throws { LirError } accepts members ──
+  let st_lir = tc_new_state(
+    enum_defs: [exn_entry], type_defs: [],
+    exception_groups: [lir_group]
+  )
+  let st_lir_row = state_with_throw_row(
+    state: st_lir,
+    throw_row: TyRow(types: [TyUserDefined(name: "LirError", args: [])], rest: None)
+  )
+  match infer_expr(state: st_lir_row, expr: mk_raise(variant: "LirFieldOnNonVariable", sp), ret_type: TyUnit) do
+    | InferExprErr(message: m, span: _) ->
+      raise RuntimeError(val: "throws { LirError } should accept LirFieldOnNonVariable, got error: " ++ m)
+    | InferExprOk(_) ->
+      assert(cond: true, msg: "throws { LirError } accepts LirFieldOnNonVariable")
+  end
+
+  // ── Acceptance #4 (narrow row, rejected): unrelated exception is rejected ──
+  match infer_expr(state: st_lir_row, expr: mk_raise(variant: "OutOfBounds", sp), ret_type: TyUnit) do
+    | InferExprOk(_) ->
+      raise RuntimeError(val: "throws { LirError } must reject OutOfBounds (not a LirError member)")
+    | InferExprErr(message: _, span: _) ->
+      assert(cond: true, msg: "throws { LirError } rejects OutOfBounds")
+  end
+
+  // ── Acceptance #1 (literal narrow): single-variant row accepts only that variant ──
+  let st_outof = state_with_throw_row(
+    state: st_lir,
+    throw_row: TyRow(types: [TyUserDefined(name: "OutOfBounds", args: [])], rest: None)
+  )
+  match infer_expr(state: st_outof, expr: mk_raise(variant: "OutOfBounds", sp), ret_type: TyUnit) do
+    | InferExprErr(message: m, span: _) ->
+      raise RuntimeError(val: "throws { OutOfBounds } should accept OutOfBounds, got error: " ++ m)
+    | InferExprOk(_) ->
+      assert(cond: true, msg: "throws { OutOfBounds } accepts OutOfBounds")
+  end
+  match infer_expr(state: st_outof, expr: mk_raise(variant: "LirFieldOnNonVariable", sp), ret_type: TyUnit) do
+    | InferExprOk(_) ->
+      raise RuntimeError(val: "throws { OutOfBounds } must reject LirFieldOnNonVariable")
+    | InferExprErr(_) ->
+      assert(cond: true, msg: "throws { OutOfBounds } rejects LirFieldOnNonVariable")
+  end
+
+  // ── Open row (rest = Some(_)): always admits, effect-polymorphic ──
+  let st_open = state_with_throw_row(
+    state: st_lir,
+    throw_row: TyRow(types: [], rest: Some(val: TyUserDefined(name: "ρ", args: [])))
+  )
+  match infer_expr(state: st_open, expr: mk_raise(variant: "OutOfBounds", sp), ret_type: TyUnit) do
+    | InferExprErr(message: m, span: _) ->
+      raise RuntimeError(val: "open row must admit any raise, got error: " ++ m)
+    | InferExprOk(_) ->
+      assert(cond: true, msg: "open row admits any raise (effect-polymorphic)")
+  end
+
+  return ()
+end
