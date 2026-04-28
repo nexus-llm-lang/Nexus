@@ -7,6 +7,8 @@
  * - Call and closure-call emission
  * - Constructor / record field emission and argument glue
  * - Arena intrinsics (heap mark / reset / swap)
+ * - Memory intrinsics (load/store i32/i64/u8, memory.size/grow)
+ * - Math intrinsics (f64 unary: sqrt / floor / ceil / abs)
  * - Function-body compilation and module assembly
  * - Component-model wrapping + name section + external dedup
  * - The top-level compile_lir_to_wasm entry
@@ -50,6 +52,7 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          op_i64_and, op_i64_or, op_i64_xor, op_i64_shl, op_i64_shr_s, op_i64_shr_u,
          op_f64_eq, op_f64_ne, op_f64_lt, op_f64_le, op_f64_gt, op_f64_ge,
          op_f64_add, op_f64_sub, op_f64_mul, op_f64_div,
+         op_f64_sqrt, op_f64_floor, op_f64_ceil, op_f64_abs,
          op_i32_wrap_i64, op_i64_extend_i32_s, op_i64_extend_i32_u,
          op_f64_reinterpret_i64, op_i64_reinterpret_f64,
          op_i32_and, op_i32_or,
@@ -64,14 +67,30 @@ import * as list from "std:list"
 import * as str from "std:str"
 import { SymbolNotFound, StackSwitchingNotImplemented } from "src/common/error.nx"
 
-// ─── Arena intrinsics (nexus:runtime/arena) ──────────────────────────────────
-// These are emitted as inline WASM (global.get/set 0), not external calls.
-// The externals are filtered out of the import section entirely.
+// ─── Inline-emitted runtime intrinsics ──────────────────────────────────────
+// `nexus:runtime/arena`, `nexus:runtime/memory`, and `nexus:runtime/math`
+// externals are emitted as inline WASM (global.get/set, load/store, unary
+// f64 ops), not as external host calls. Their externals are filtered out of
+// the import section entirely (`filter_inline_externals`).
 
 let is_arena_external = fn (ext: LirExternal) -> bool do
   match ext do
     | LirExternal(name: _, wasm_module: m, wasm_name: _, params: _, ret_type: _, throw_row: _) ->
       return m == "nexus:runtime/arena"
+  end
+end
+
+let is_memory_external = fn (ext: LirExternal) -> bool do
+  match ext do
+    | LirExternal(name: _, wasm_module: m, wasm_name: _, params: _, ret_type: _, throw_row: _) ->
+      return m == "nexus:runtime/memory"
+  end
+end
+
+let is_math_external = fn (ext: LirExternal) -> bool do
+  match ext do
+    | LirExternal(name: _, wasm_module: m, wasm_name: _, params: _, ret_type: _, throw_row: _) ->
+      return m == "nexus:runtime/math"
   end
 end
 
@@ -161,7 +180,7 @@ let find_sched_import_idx = fn (wn: string, exts: [LirExternal], idx: i64) -> i6
   match exts do
     | [] -> return -1
     | e :: rest ->
-      if is_arena_external(ext: e) || is_intrinsic_sched_external(ext: e) then
+      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_intrinsic_sched_external(ext: e) then
         return find_sched_import_idx(wn, exts: rest, idx)
       end
       match e do | LirExternal(name: _, wasm_module: m, wasm_name: w, params: _, ret_type: _, throw_row: _) ->
@@ -241,7 +260,7 @@ let filter_arena_externals = fn (exts: [LirExternal]) -> [LirExternal] do
   match exts do
     | [] -> return []
     | e :: rest ->
-      if is_arena_external(ext: e) || is_intrinsic_sched_external(ext: e) then
+      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_intrinsic_sched_external(ext: e) then
         return filter_arena_externals(exts: rest)
       else
         return e :: filter_arena_externals(exts: rest)
@@ -309,6 +328,163 @@ let emit_heap_swap = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) 
       return bb.push_uleb128(%buf, val: heap_global_idx)
     | _ ->
       raise SymbolNotFound(name: "__nx_heap_swap", kind: "arena intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+// ─── Memory intrinsics (nexus:runtime/memory) ───────────────────────────────
+// Inline-emit raw load/store and memory.size/grow ops. Argument policy
+// (kebab-canonical, all i64 across the FFI boundary):
+//   mem-load-i32(addr)        : i32.wrap addr → i32.load{align=2,offset=0} → i64.extend_i32_s
+//   mem-store-i32(addr, val)  : i32.wrap addr; i32.wrap val; i32.store{align=2,offset=0}
+//   mem-load-u8(addr)         : i32.wrap addr → i32.load8_u{align=0,offset=0} → i64.extend_i32_u
+//   mem-store-u8(addr, val)   : i32.wrap addr; i32.wrap val; i32.store8{align=0,offset=0}
+//   mem-load-i64(addr)        : i32.wrap addr → i64.load{align=3,offset=0}
+//   mem-store-i64(addr, val)  : i32.wrap addr; val (already i64); i64.store{align=3,offset=0}
+//   mem-size()                : memory.size(mem 0) → i64.extend_i32_u   (returns pages)
+//   mem-grow(delta)           : i32.wrap delta → memory.grow(mem 0) → i64.extend_i32_s
+//                               (sign-extend so the wasm `-1` failure sentinel surfaces as `-1`)
+
+let get_memory_wasm_name = fn (func: string, exts: [LirExternal]) -> string do
+  match wdefs.find_external(name: func, exts) do
+    | None -> ""
+    | Some(val: ext) ->
+      if !is_memory_external(ext) then return "" end
+      match ext do
+        | LirExternal(name: _, wasm_module: _, wasm_name: wn, params: _, ret_type: _, throw_row: _) -> wn
+      end
+  end
+end
+
+let emit_addr_arg = fn (atom: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  // Nexus i64 → wasm i32 address (truncating wrap).
+  let %buf = emit_atom(atom, %buf, ctx)
+  return bb.push_byte(%buf, byte: op_i32_wrap_i64)
+end
+
+let emit_mem_load_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_load)
+      let %buf = wdefs.emit_memarg_i32(%buf, offset: 0)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_s)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_load_i32", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+let emit_mem_store_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = bb.push_byte(%buf, byte: op_i32_store)
+      return wdefs.emit_memarg_i32(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_store_i32", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+let emit_mem_load_u8 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_load8_u)
+      let %buf = wdefs.emit_memarg_i8(%buf)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_load_u8", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+let emit_mem_store_u8 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = bb.push_byte(%buf, byte: op_i32_store8)
+      return wdefs.emit_memarg_i8(%buf)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_store_u8", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+let emit_mem_load_i64 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_load)
+      return wdefs.emit_memarg_i64(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_load_i64", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+let emit_mem_store_i64 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_store)
+      return wdefs.emit_memarg_i64(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_store_i64", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+let emit_mem_size = fn (buf: %ByteBuffer) -> %ByteBuffer do
+  // memory.size mem_idx=0 → i32 pages → extend_u to i64
+  let %buf = bb.push_byte(%buf, byte: op_memory_size)
+  let %buf = bb.push_byte(%buf, byte: 0)
+  return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+end
+
+let emit_mem_grow = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = bb.push_byte(%buf, byte: op_memory_grow)
+      let %buf = bb.push_byte(%buf, byte: 0)
+      // Sign-extend so the wasm `-1` failure sentinel surfaces unchanged at i64.
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_s)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_grow", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+// ─── Math intrinsics (nexus:runtime/math) ───────────────────────────────────
+// Inline-emit f64 unary ops. Each takes a single `val: float` and pushes the
+// f64 result; no coercion needed since the FFI types are already f64.
+
+let get_math_wasm_name = fn (func: string, exts: [LirExternal]) -> string do
+  match wdefs.find_external(name: func, exts) do
+    | None -> ""
+    | Some(val: ext) ->
+      if !is_math_external(ext) then return "" end
+      match ext do
+        | LirExternal(name: _, wasm_module: _, wasm_name: wn, params: _, ret_type: _, throw_row: _) -> wn
+      end
+  end
+end
+
+let emit_f64_unary = fn (opcode: i64, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx, name: string) -> %ByteBuffer throws { Exn } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      return bb.push_byte(%buf, byte: opcode)
+    | _ ->
+      raise SymbolNotFound(name, kind: "math intrinsic arg", context: "f64 unary requires one argument")
       return %buf
   end
 end
@@ -625,20 +801,34 @@ end
 
 let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx,
                      is_tail: bool, in_try: bool) -> %ByteBuffer throws { Exn } do
-  // Arena intrinsics: emit inline WASM, no function call.
+  // Arena / memory / math intrinsics: emit inline WASM, no function call.
   // wasm_name uses WIT canonical form (wit_canonical_name strips __nx_ prefix
-  // and converts underscores to hyphens).
-  let arena_wn = get_arena_wasm_name(func, exts: wdefs.ctx_externals(ctx))
-  if arena_wn == "heap-mark" then
-    return emit_heap_mark(%buf)
-  else if arena_wn == "heap-reset" then
-    return emit_heap_reset(args, %buf, ctx)
-  else if arena_wn == "heap-swap" then
-    return emit_heap_swap(args, %buf, ctx)
-  else if is_sched_set_next(func, exts: wdefs.ctx_externals(ctx)) then
-    return emit_sched_set_next(args, %buf, ctx)
-  else if is_sched_spawn(func, exts: wdefs.ctx_externals(ctx)) then
-    return emit_sched_spawn(args, %buf, ctx)
+  // and converts underscores to hyphens). Pre-resolve all three buckets and
+  // dispatch through one flat else-if chain — the Nexus parser collapses
+  // `else if` only inside a single chain, so any nested `let / if` inside a
+  // branch double-nests beyond what chain-collapsing can close (see merge.nx
+  // rw_instrs comment at line ~467 for the same constraint).
+  let exts = wdefs.ctx_externals(ctx)
+  let arena_wn = get_arena_wasm_name(func, exts)
+  let mem_wn = get_memory_wasm_name(func, exts)
+  let math_wn = get_math_wasm_name(func, exts)
+  if arena_wn == "heap-mark" then return emit_heap_mark(%buf)
+  else if arena_wn == "heap-reset" then return emit_heap_reset(args, %buf, ctx)
+  else if arena_wn == "heap-swap" then return emit_heap_swap(args, %buf, ctx)
+  else if is_sched_set_next(func, exts) then return emit_sched_set_next(args, %buf, ctx)
+  else if is_sched_spawn(func, exts) then return emit_sched_spawn(args, %buf, ctx)
+  else if mem_wn == "mem-load-i32" then return emit_mem_load_i32(args, %buf, ctx)
+  else if mem_wn == "mem-store-i32" then return emit_mem_store_i32(args, %buf, ctx)
+  else if mem_wn == "mem-load-u8" then return emit_mem_load_u8(args, %buf, ctx)
+  else if mem_wn == "mem-store-u8" then return emit_mem_store_u8(args, %buf, ctx)
+  else if mem_wn == "mem-load-i64" then return emit_mem_load_i64(args, %buf, ctx)
+  else if mem_wn == "mem-store-i64" then return emit_mem_store_i64(args, %buf, ctx)
+  else if mem_wn == "mem-size" then return emit_mem_size(%buf)
+  else if mem_wn == "mem-grow" then return emit_mem_grow(args, %buf, ctx)
+  else if math_wn == "f64-sqrt" then return emit_f64_unary(opcode: op_f64_sqrt, args, %buf, ctx, name: "__nx_f64_sqrt")
+  else if math_wn == "f64-floor" then return emit_f64_unary(opcode: op_f64_floor, args, %buf, ctx, name: "__nx_f64_floor")
+  else if math_wn == "f64-ceil" then return emit_f64_unary(opcode: op_f64_ceil, args, %buf, ctx, name: "__nx_f64_ceil")
+  else if math_wn == "f64-abs" then return emit_f64_unary(opcode: op_f64_abs, args, %buf, ctx, name: "__nx_f64_abs")
   else
     let int_idx = wdefs.lookup_func_fast(name: func, map: wdefs.ctx_internal_func_map(ctx))
     if int_idx >= 0 then

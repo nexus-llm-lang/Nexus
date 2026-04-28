@@ -470,3 +470,85 @@ fn sched_multi_fiber_spawn() {
         );
     }
 }
+
+/// nexus-dvr6.9.1: safe_* mem wrappers must raise the catchable
+/// MemoryOutOfBounds exception (op, addr, access_size) instead of trapping
+/// or surfacing a generic RuntimeError. Verifies the partial-function
+/// exception contract for the runtime/memory FFI surface.
+#[test]
+fn runtime_mem_safe_oob_raises_specific_exception() {
+    let out =
+        exec_nxc_core_capture_stdout("bootstrap/tests/fixtures/nxc/test_runtime_mem_safe_oob_exn.nx");
+    let lines: Vec<&str> = out.lines().map(|l| l.trim()).collect();
+    // Caller catches MemoryOutOfBounds → prints op name, addr, access_size for
+    // the load case, and op + access_size for the store case.
+    assert!(
+        lines.iter().any(|l| *l == "load: safe_load_i32"),
+        "missing load exception line — full stdout:\n{}",
+        out
+    );
+    assert!(
+        lines.iter().any(|l| *l == "store: safe_store_i64"),
+        "missing store exception line — full stdout:\n{}",
+        out
+    );
+    assert!(
+        lines.iter().any(|l| *l == "4"),
+        "missing access_size=4 line for load i32 — full stdout:\n{}",
+        out
+    );
+    assert!(
+        lines.iter().any(|l| *l == "8"),
+        "missing access_size=8 line for store i64 — full stdout:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("BUG: "),
+        "safe_* wrapper returned without raising — full stdout:\n{}",
+        out
+    );
+}
+
+/// nexus-dvr6.9.1: generalized intrinsic dispatch — codegen.nx now inline-emits
+/// `nexus:runtime/memory` (8 ops) and `nexus:runtime/math` (4 f64 unary ops)
+/// in addition to the existing arena externals. Acceptance:
+///   - mem-load-i64 + mem-store-i64 round-trip with explicit address
+///   - mem-size = N → mem-grow(1) → mem-size = N+1
+///   - f64-sqrt(4.0) = 2.0, f64-floor(2.7) = 2.0, f64-ceil(2.3) = 3.0,
+///     f64-abs(-3.5) = 3.5, f64-abs(-30.0) = 30.0
+///   - i32 / u8 round-trips and mem-grow return path also exercised
+/// Stdout-interleave assertion (assert_stdout-style) catches both value
+/// drift and any silently-dropped intrinsic dispatch (a missing print
+/// fails the line-count check, not a quiet PASS).
+#[test]
+fn runtime_mem_math_intrinsics_dispatch() {
+    let out =
+        exec_nxc_core_capture_stdout("bootstrap/tests/fixtures/nxc/test_runtime_mem_math_intrinsics.nx");
+    let lines: Vec<&str> = out.lines().map(|l| l.trim()).collect();
+    let expected = [
+        "305419896", // (1) mem-load-i32 round-trip
+        "171",       // (2) mem-load-u8 round-trip
+        "9223372036854775000", // (3) mem-load-i64 round-trip
+        "1",         // (4) mem-size delta after grow(1)
+        "2",         // f64-sqrt(4.0)
+        "2",         // f64-floor(2.7)
+        "3",         // f64-ceil(2.3)
+        "3",         // f64-abs(-3.5) → 3 after truncating to i64
+        "30",        // f64-abs(-30.0)
+    ];
+    assert_eq!(
+        lines.len(),
+        expected.len(),
+        "expected {} lines, got {} — full stdout:\n{}",
+        expected.len(),
+        lines.len(),
+        out
+    );
+    for (i, want) in expected.iter().enumerate() {
+        assert_eq!(
+            lines[i], *want,
+            "line {} mismatch: want {:?}, got {:?} — full stdout:\n{}",
+            i, want, lines[i], out
+        );
+    }
+}
