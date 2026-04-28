@@ -14,3 +14,8 @@ fn parser_parse_minimal() {
 fn parser_tokenize_only() {
     exec_with_stdlib(&read_fixture("nxc/test_parser_tokenize_only.nx"));
 }
+
+#[test]
+fn parser_handler_arm_span() {
+    exec_with_stdlib(&read_fixture("nxc/test_handler_arm_span.nx"));
+}
