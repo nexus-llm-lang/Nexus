@@ -1,0 +1,294 @@
+/**
+ * typecheck/exhaustive: top-column exhaustiveness check for match arms.
+ *
+ * Implements predicate P6 from docs/spec/type-system-formal.md. Inspects the
+ * arm patterns of a match against the scrutinee type and reports whether the
+ * combined arms cover every value of that type.
+ *
+ * Scope (v1): only the scrutinee column. Nested-constructor exhaustiveness
+ * (e.g. `match opt do | Some(val: 1) -> ... | None -> ... end` missing
+ * Some(other-int)) is not checked here — tracked separately.
+ *
+ * Coverage:
+ *   - bool — both `true` and `false` literal arms required (or a wildcard).
+ *   - ADT (TyUserDefined) — every constructor of the enum required (or a
+ *     wildcard / variable pattern).
+ *   - list (TyList, UserDefined("List", _)) — both `[]` (Nil) and `_::_`
+ *     (Cons) required (or a wildcard).
+ *   - other types (numerics, strings, records, etc.) — any wildcard /
+ *     variable pattern alone is exhaustive; otherwise non-exhaustive.
+ *
+ * The check returns `Exhaustive` or `NonExhaustive(witness)` where `witness`
+ * is a short description of an uncovered shape (e.g. `"true"`, `"Some"`,
+ * `"[]"`, `"_"`).
+ */
+
+import {
+  TypeExpr, TyBool, TyUserDefined, TyList, TyArray, TyRecord, TyLinear, TyLazy, TyBorrow,
+  EnumDef, VariantDef
+} from "src/common/ast.nx"
+import {
+  HirMatchCase, HirPatternKind, PLit, PVar, PCtor, PRec, PWild, POr
+} from "src/ir/hir_types.nx"
+import { LitBool } from "src/common/ast.nx"
+import { EnumEntry } from "src/typecheck/types.nx"
+import { Some, None } from "std:option"
+
+export type ExhaustiveResult =
+  Exhaustive
+  | NonExhaustive(witness: string)
+
+// Strip outer modality wrappers so exhaustiveness sees the underlying type.
+let strip_mod = fn (typ: TypeExpr) -> TypeExpr do
+  match typ do
+    | TyLinear(inner: t) -> return strip_mod(typ: t)
+    | TyLazy(inner: t) -> return strip_mod(typ: t)
+    | TyBorrow(inner: t) -> return strip_mod(typ: t)
+    | _ -> return typ
+  end
+end
+
+export let check_match_exhaustive = fn (
+  cases: [HirMatchCase],
+  scrutinee_type: TypeExpr,
+  enum_defs: [EnumEntry]
+) -> ExhaustiveResult throws { Exn } do
+  let pats = collect_top_patterns(cases, acc: [])
+  if has_unconditional(pats) then return Exhaustive end
+  let st = strip_mod(typ: scrutinee_type)
+  match st do
+    | TyBool -> return check_bool(pats)
+    | TyList(_) -> return check_list(pats)
+    | TyArray(_) ->
+      // Arrays have no surface destructuring patterns; only wildcard / variable
+      // can match. has_unconditional already returned, so any non-trivial arm
+      // is non-exhaustive.
+      return NonExhaustive(witness: "_")
+    | TyUserDefined(name: enm, args: _) ->
+      match find_enum(defs: enum_defs, name: enm) do
+        | Some(val: edef) -> return check_enum(pats, def: edef)
+        | None ->
+          // Built-in named alias (e.g. `List<T>` may be re-encoded as
+          // UserDefined("List", _)) — fall back to list when name matches.
+          if enm == "List" then return check_list(pats) end
+          return NonExhaustive(witness: "_")
+      end
+    | _ ->
+      // Numerics, strings, chars, records (no constructor coverage), tuples:
+      // only a wildcard / variable arm makes the match exhaustive.
+      return NonExhaustive(witness: "_")
+  end
+end
+
+let collect_top_patterns = fn (cases: [HirMatchCase], acc: [HirPatternKind]) -> [HirPatternKind] do
+  match cases do
+    | [] -> return reverse_pats(xs: acc, out: [])
+    | HirMatchCase(pattern: p, body: _) :: rest ->
+      return collect_top_patterns(cases: rest, acc: p :: acc)
+  end
+end
+
+let reverse_pats = fn (xs: [HirPatternKind], out: [HirPatternKind]) -> [HirPatternKind] do
+  match xs do
+    | [] -> return out
+    | h :: r -> return reverse_pats(xs: r, out: h :: out)
+  end
+end
+
+// `has_unconditional` is true when any arm matches every value of the
+// scrutinee type — wildcards, plain variable bindings, or or-patterns whose
+// every alternative is unconditional.
+let has_unconditional = fn (pats: [HirPatternKind]) -> bool do
+  match pats do
+    | [] -> return false
+    | p :: rest ->
+      if pat_is_unconditional(p) then return true end
+      return has_unconditional(pats: rest)
+  end
+end
+
+let pat_is_unconditional = fn (p: HirPatternKind) -> bool do
+  match p do
+    | PWild -> return true
+    | PVar(_) -> return true
+    | POr(alts) -> return all_unconditional(pats: alts)
+    | _ -> return false
+  end
+end
+
+let all_unconditional = fn (pats: [HirPatternKind]) -> bool do
+  match pats do
+    | [] -> return true
+    | p :: rest ->
+      if pat_is_unconditional(p) then return all_unconditional(pats: rest) end
+      return false
+  end
+end
+
+// ─── bool exhaustiveness ────────────────────────────────────────────────────
+
+let check_bool = fn (pats: [HirPatternKind]) -> ExhaustiveResult do
+  let cov = bool_coverage(pats, t: false, f: false)
+  let BoolCov(t: ct, f: cf) = cov
+  if ct then
+    if cf then return Exhaustive end
+    return NonExhaustive(witness: "false")
+  end
+  if cf then return NonExhaustive(witness: "true") end
+  return NonExhaustive(witness: "true")
+end
+
+type BoolCov = BoolCov(t: bool, f: bool)
+
+let bool_coverage = fn (pats: [HirPatternKind], t: bool, f: bool) -> BoolCov do
+  match pats do
+    | [] -> return BoolCov(t, f)
+    | p :: rest -> return bool_coverage(pats: rest, t: t || covers_true(p), f: f || covers_false(p))
+  end
+end
+
+let covers_true = fn (p: HirPatternKind) -> bool do
+  match p do
+    | PLit(lit: LitBool(val: true)) -> return true
+    | POr(alts) -> return any_covers_true(pats: alts)
+    | _ -> return false
+  end
+end
+
+let covers_false = fn (p: HirPatternKind) -> bool do
+  match p do
+    | PLit(lit: LitBool(val: false)) -> return true
+    | POr(alts) -> return any_covers_false(pats: alts)
+    | _ -> return false
+  end
+end
+
+let any_covers_true = fn (pats: [HirPatternKind]) -> bool do
+  match pats do
+    | [] -> return false
+    | p :: rest ->
+      if covers_true(p) then return true end
+      return any_covers_true(pats: rest)
+  end
+end
+
+let any_covers_false = fn (pats: [HirPatternKind]) -> bool do
+  match pats do
+    | [] -> return false
+    | p :: rest ->
+      if covers_false(p) then return true end
+      return any_covers_false(pats: rest)
+  end
+end
+
+// ─── list exhaustiveness ────────────────────────────────────────────────────
+
+let check_list = fn (pats: [HirPatternKind]) -> ExhaustiveResult do
+  let cov = list_coverage(pats, nil: false, cons: false)
+  let ListCov(nil: cn, cons: cc) = cov
+  if cn then
+    if cc then return Exhaustive end
+    return NonExhaustive(witness: "_::_")
+  end
+  if cc then return NonExhaustive(witness: "[]") end
+  return NonExhaustive(witness: "[]")
+end
+
+type ListCov = ListCov(nil: bool, cons: bool)
+
+let list_coverage = fn (pats: [HirPatternKind], nil: bool, cons: bool) -> ListCov do
+  match pats do
+    | [] -> return ListCov(nil, cons)
+    | p :: rest ->
+      let n = nil || covers_nil(p)
+      let c = cons || covers_cons(p)
+      return list_coverage(pats: rest, nil: n, cons: c)
+  end
+end
+
+let covers_nil = fn (p: HirPatternKind) -> bool do
+  match p do
+    | PCtor(variant: v, fields: _) -> return v == "Nil"
+    | POr(alts) -> return any_covers_nil(pats: alts)
+    | _ -> return false
+  end
+end
+
+let covers_cons = fn (p: HirPatternKind) -> bool do
+  match p do
+    | PCtor(variant: v, fields: _) -> return v == "Cons"
+    | POr(alts) -> return any_covers_cons(pats: alts)
+    | _ -> return false
+  end
+end
+
+let any_covers_nil = fn (pats: [HirPatternKind]) -> bool do
+  match pats do
+    | [] -> return false
+    | p :: rest ->
+      if covers_nil(p) then return true end
+      return any_covers_nil(pats: rest)
+  end
+end
+
+let any_covers_cons = fn (pats: [HirPatternKind]) -> bool do
+  match pats do
+    | [] -> return false
+    | p :: rest ->
+      if covers_cons(p) then return true end
+      return any_covers_cons(pats: rest)
+  end
+end
+
+// ─── enum exhaustiveness ────────────────────────────────────────────────────
+
+let find_enum = fn (defs: [EnumEntry], name: string) -> Option<EnumDef> do
+  match defs do
+    | [] -> return None
+    | EnumEntry(name: n, def: d) :: rest ->
+      if n == name then return Some(val: d) end
+      return find_enum(defs: rest, name)
+  end
+end
+
+let check_enum = fn (pats: [HirPatternKind], def: EnumDef) -> ExhaustiveResult do
+  let EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) = def
+  return check_variants_covered(variants: vs, pats)
+end
+
+let check_variants_covered = fn (variants: [VariantDef], pats: [HirPatternKind]) -> ExhaustiveResult do
+  match variants do
+    | [] -> return Exhaustive
+    | VariantDef(name: vn, fields: _) :: rest ->
+      if any_covers_variant(pats, name: vn) then
+        return check_variants_covered(variants: rest, pats)
+      end
+      return NonExhaustive(witness: vn)
+  end
+end
+
+let any_covers_variant = fn (pats: [HirPatternKind], name: string) -> bool do
+  match pats do
+    | [] -> return false
+    | p :: rest ->
+      if covers_variant(p, name) then return true end
+      return any_covers_variant(pats: rest, name)
+  end
+end
+
+let covers_variant = fn (p: HirPatternKind, name: string) -> bool do
+  match p do
+    | PCtor(variant: v, fields: _) -> return v == name
+    | POr(alts) -> return any_alt_covers_variant(alts, name)
+    | _ -> return false
+  end
+end
+
+let any_alt_covers_variant = fn (alts: [HirPatternKind], name: string) -> bool do
+  match alts do
+    | [] -> return false
+    | p :: rest ->
+      if covers_variant(p, name) then return true end
+      return any_alt_covers_variant(alts: rest, name)
+  end
+end
