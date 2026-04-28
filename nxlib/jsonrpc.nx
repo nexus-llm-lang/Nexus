@@ -1,0 +1,440 @@
+/**
+ * jsonrpc: JSON-RPC 2.0 transport with LSP-style Content-Length framing.
+ *
+ * Wire format per LSP base protocol:
+ *
+ *   Content-Length: <n>\r\n
+ *   [Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n]
+ *   \r\n
+ *   <n bytes of UTF-8 JSON body>
+ *
+ * Two layers are exported:
+ *
+ *   Pure layer — operates on strings, no I/O. Used for unit tests and for
+ *   embedding the framing in alternative transports (e.g. socket bytes).
+ *     frame_message(value) -> string
+ *     unframe_one(input)   -> UnframedStep
+ *
+ *   I/O layer — operates inside the `Console` capability. The wrapping
+ *   server runs `inject stdio.system_handler do dispatch_loop(...) end`.
+ *     read_message()       -> Option<JsonValue>           (None on EOF)
+ *     write_message(value) -> unit
+ *     dispatch_loop(dispatch_fn, max_iters) -> i64       (returns frame count)
+ *
+ * Dispatch model: synchronous, single-threaded. Per LSP spec the server
+ * reads one message, computes a response (for requests) or runs the side
+ * effect (for notifications), writes the response, and loops. No
+ * concurrency; cancellation is observed only at message boundaries (the
+ * `$/cancelRequest` notification protocol is layered on top by the user).
+ *
+ * Error semantics:
+ *   - A malformed Content-Length header raises `JsonRpcFrameError`. The
+ *     dispatch loop catches it, logs to stderr, and continues with the
+ *     next read attempt — a single garbled frame must not bring down the
+ *     server.
+ *   - A body that fails to parse as JSON propagates as `JsonError` from
+ *     `nxlib/stdlib/json`. The dispatch loop catches it and routes a
+ *     ParseError JSON-RPC response back to the client when the failed
+ *     message had an id, otherwise logs and continues.
+ *   - The handler closure may raise; the loop wraps any exception into an
+ *     InternalError response (request) or logs it (notification).
+ */
+
+import { JsonValue, JsonField, JsonNull, JsonBool, JsonInt, JsonString,
+         JsonArray, JsonObject, JsonError,
+         parse, serialize, get_field } from "std:json"
+import { Option, Some, None } from "std:option"
+import { Console } from "std:stdio"
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import * as str from "std:str"
+import * as char from "std:char"
+
+// ─── Exceptions ──────────────────────────────────────────────────────────────
+
+/// Wire-level framing failure: missing or non-numeric Content-Length, header
+/// without trailing CRLF CRLF, body shorter than the declared length, etc.
+export exception JsonRpcFrameError(msg: string)
+
+/// Internal: signaled when the input stream reaches EOF before a complete
+/// header block has been read. The dispatch loop treats this as a graceful
+/// shutdown rather than an error.
+export exception JsonRpcEof
+
+// ─── JSON-RPC error codes (per spec §5.1) ────────────────────────────────────
+
+export let parse_error = fn () -> i64 do return -32700 end
+export let invalid_request = fn () -> i64 do return -32600 end
+export let method_not_found = fn () -> i64 do return -32601 end
+export let invalid_params = fn () -> i64 do return -32602 end
+export let internal_error = fn () -> i64 do return -32603 end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pure framing layer
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Encode `value` into a complete LSP-framed JSON-RPC message. The output is
+/// a Nexus string; UTF-8 bytes flow through `serialize` unchanged. The body
+/// length advertised in the header is the byte length of the JSON
+/// serialisation, so multi-byte characters in payload strings count
+/// correctly.
+export let frame_message = fn (value: JsonValue) -> string throws { Exn } do
+  let body = serialize(v: value)
+  let n = str.byte_length(s: body)
+  let header = "Content-Length: " ++ str.from_i64(val: n) ++ "\r\n\r\n"
+  return header ++ body
+end
+
+/// Outcome of pulling one message off the front of an input buffer.
+///   `UnframedOk(value, rest)` — message parsed, `rest` is the unconsumed
+///     suffix (next read can re-enter `unframe_one` against it).
+///   `UnframedNeedMore` — input ends mid-frame; caller reads more bytes
+///     and retries with the concatenated buffer.
+export type UnframedStep =
+    UnframedOk(value: JsonValue, rest: string)
+  | UnframedNeedMore
+
+let ch_cr = '\r'
+let ch_lf = '\n'
+let ch_colon = ':'
+let ch_space = ' '
+let ch_tab = '\t'
+
+let byte_length_of = fn (s: string) -> i64 do
+  return str.byte_length(s)
+end
+
+// Walk the input looking for the CRLF CRLF that terminates the header block.
+// Returns the offset just past the empty line, or -1 if not found.
+let find_header_end = fn (s: string, p: i64) -> i64 do
+  let n = byte_length_of(s)
+  if p + 3 >= n then return -1 end
+  let b0 = str.byte_at(s, idx: p)
+  let b1 = str.byte_at(s, idx: p + 1)
+  let b2 = str.byte_at(s, idx: p + 2)
+  let b3 = str.byte_at(s, idx: p + 3)
+  if b0 == ch_cr && b1 == ch_lf && b2 == ch_cr && b3 == ch_lf then
+    return p + 4
+  end
+  return find_header_end(s, p: p + 1)
+end
+
+// Locate the next CRLF starting at `p`. Returns the offset of the CR, or -1.
+let find_crlf = fn (s: string, p: i64) -> i64 do
+  let n = byte_length_of(s)
+  if p + 1 >= n then return -1 end
+  let b0 = str.byte_at(s, idx: p)
+  let b1 = str.byte_at(s, idx: p + 1)
+  if b0 == ch_cr && b1 == ch_lf then return p end
+  return find_crlf(s, p: p + 1)
+end
+
+let trim_leading_ws = fn (s: string, p: i64, end_pos: i64) -> i64 do
+  if p >= end_pos then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_space || c == ch_tab then
+    return trim_leading_ws(s, p: p + 1, end_pos)
+  end
+  return p
+end
+
+let trim_trailing_ws = fn (s: string, start: i64, p: i64) -> i64 do
+  if p <= start then return p end
+  let c = str.byte_at(s, idx: p - 1)
+  if c == ch_space || c == ch_tab then
+    return trim_trailing_ws(s, start, p: p - 1)
+  end
+  return p
+end
+
+let lower_code = fn (code: i64) -> i64 do
+  if code >= 65 && code <= 90 then return code + 32 end
+  return code
+end
+
+// Header field-name compare is case-insensitive per RFC 7230. We only need
+// to recognise "Content-Length", so a byte-by-byte ASCII lower-case compare
+// against a constant lowered-once string is enough. Compare via char codes
+// (i64) so we don't depend on `char` arithmetic.
+let bytes_equal_ci_at = fn (s: string, p: i64, lit_lower: string, idx: i64, lit_len: i64) -> bool do
+  if idx >= lit_len then return true end
+  let bs = lower_code(code: char.ord(c: str.byte_at(s, idx: p + idx)))
+  let bl = char.ord(c: str.byte_at(s: lit_lower, idx))
+  if bs != bl then return false end
+  return bytes_equal_ci_at(s, p, lit_lower, idx: idx + 1, lit_len)
+end
+
+let header_starts_with_ci = fn (s: string, p: i64, lit_lower: string) -> bool do
+  let lit_len = str.byte_length(s: lit_lower)
+  let n = byte_length_of(s)
+  if p + lit_len > n then return false end
+  return bytes_equal_ci_at(s, p, lit_lower, idx: 0, lit_len)
+end
+
+// Walk the header block (between `p` and `header_end`) and pull out the
+// integer value of the `Content-Length` line. Raises JsonRpcFrameError on
+// malformed input. The lookup is line-by-line so we don't depend on header
+// ordering. `header_end` points just past the empty CRLF that closes the
+// block; `header_end - 2` is the offset of the empty line's CR byte.
+let scan_content_length = fn (s: string, p: i64, header_end: i64) -> i64 throws { Exn } do
+  let empty_line = header_end - 2
+  if p >= empty_line then
+    // Walked through every header without finding Content-Length.
+    raise JsonRpcFrameError(msg: "missing Content-Length header")
+  end
+  let line_end = find_crlf(s, p)
+  if line_end < 0 || line_end > empty_line then
+    raise JsonRpcFrameError(msg: "malformed header line")
+  end
+  if header_starts_with_ci(s, p, lit_lower: "content-length:") then
+    let after_colon = p + str.byte_length(s: "content-length:")
+    let value_start = trim_leading_ws(s, p: after_colon, end_pos: line_end)
+    let value_end = trim_trailing_ws(s, start: value_start, p: line_end)
+    let lit = str.byte_substring(s, start: value_start, len: value_end - value_start)
+    match str.parse_i64(s: lit) do
+      | Some(val: n) ->
+        if n < 0 then
+          raise JsonRpcFrameError(msg: "negative Content-Length")
+        end
+        return n
+      | None ->
+        raise JsonRpcFrameError(msg: "Content-Length is not a non-negative integer")
+    end
+  end
+  // Skip this header line and continue scanning. `line_end + 2` skips CRLF.
+  return scan_content_length(s, p: line_end + 2, header_end)
+end
+
+/// Pull at most one framed message off the front of `input`. Returns
+/// `UnframedNeedMore` when the buffer ends mid-frame (no header terminator,
+/// or body shorter than `Content-Length`). Raises JsonRpcFrameError on a
+/// header that is structurally present but invalid (non-numeric length,
+/// missing Content-Length, etc.).
+export let unframe_one = fn (input: string) -> UnframedStep throws { Exn } do
+  let n = byte_length_of(s: input)
+  if n == 0 then return UnframedNeedMore end
+  let header_end = find_header_end(s: input, p: 0)
+  if header_end < 0 then return UnframedNeedMore end
+  let content_length = scan_content_length(s: input, p: 0, header_end)
+  if header_end + content_length > n then
+    return UnframedNeedMore
+  end
+  let body = str.byte_substring(s: input, start: header_end, len: content_length)
+  let value = parse(s: body)
+  let rest_start = header_end + content_length
+  let rest = str.byte_substring(s: input, start: rest_start, len: n - rest_start)
+  return UnframedOk(value, rest)
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// I/O layer (Console capability)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Reads bytes one chunk at a time via `Console.read_bytes`, accumulating
+// into a string until enough has arrived to satisfy `unframe_one`. The
+// chunk size is small (64 bytes) — LSP traffic is bursty and headers are
+// tiny, so a streaming approach avoids over-reading into the next message.
+
+let read_chunk_size = fn () -> i64 do return 64 end
+
+// Append a freshly-read ByteBuffer's bytes onto a string and free it. The
+// buffer's `to_string` view is UTF-8: header bytes are pure ASCII and body
+// bytes are RFC-8259 UTF-8 — both round-trip through `to_string`.
+let consume_buf = fn (buf: %ByteBuffer) -> string do
+  let s = bb.to_string(&buf)
+  bb.free(%buf)
+  return s
+end
+
+// Try to extract a frame from `acc`. If we need more bytes, read one chunk
+// and recurse. Raises JsonRpcEof when stdin closes mid-frame.
+let drain_until_frame = fn (acc: string) -> UnframedStep require { Console } throws { Exn } do
+  match unframe_one(input: acc) do
+    | UnframedOk(value, rest) -> return UnframedOk(value, rest)
+    | UnframedNeedMore ->
+      let %buf = Console.read_bytes(n: read_chunk_size())
+      let chunk = consume_buf(%buf)
+      if str.byte_length(s: chunk) == 0 then
+        // EOF on stdin. If `acc` is empty, this is a clean shutdown; if we
+        // had partial header/body bytes, the stream was truncated.
+        if str.byte_length(s: acc) == 0 then
+          raise JsonRpcEof
+        end
+        raise JsonRpcFrameError(msg: "unexpected EOF mid-frame")
+      end
+      return drain_until_frame(acc: acc ++ chunk)
+  end
+end
+
+/// Read one complete JSON-RPC message from the Console. Returns `None` on a
+/// clean EOF (no bytes pending), `Some(value)` on a successful frame. Raises
+/// `JsonRpcFrameError` when the wire bytes form a structurally invalid frame
+/// — the dispatch loop catches it and routes to the configured error path.
+///
+/// Surplus bytes after the parsed message are dropped, matching the LSP
+/// reference clients which never pipeline two requests into a single read.
+/// Pipelining support would re-enter `drain_until_frame` with the leftover
+/// `rest` field; not needed for MVP.
+export let read_message = fn () -> Option<JsonValue> require { Console } throws { Exn } do
+  try
+    match drain_until_frame(acc: "") do
+      | UnframedOk(value, rest: _) -> return Some(val: value)
+      | UnframedNeedMore -> raise JsonRpcFrameError(msg: "unframe stalled despite EOF guard")
+    end
+  catch err ->
+    match err do
+      | JsonRpcEof -> return None
+      | _ -> raise err
+    end
+  end
+end
+
+/// Write one framed JSON-RPC message to the Console. Always flushes a
+/// complete header + body in a single `Console.print` call so partial frames
+/// never leak even if the host runtime line-buffers stdout.
+export let write_message = fn (value: JsonValue) -> unit require { Console } throws { Exn } do
+  let framed = frame_message(value)
+  Console.print(val: framed)
+  return ()
+end
+
+// ─── Response helpers ────────────────────────────────────────────────────────
+
+/// Build a JSON-RPC 2.0 success response.
+export let response_ok = fn (id: JsonValue, result: JsonValue) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "jsonrpc", value: JsonString(val: "2.0")),
+    JsonField(key: "id", value: id),
+    JsonField(key: "result", value: result)
+  ])
+end
+
+/// Build a JSON-RPC 2.0 error response.
+export let response_error = fn (id: JsonValue, code: i64, message: string) -> JsonValue do
+  let err = JsonObject(fields: [
+    JsonField(key: "code", value: JsonInt(val: code)),
+    JsonField(key: "message", value: JsonString(val: message))
+  ])
+  return JsonObject(fields: [
+    JsonField(key: "jsonrpc", value: JsonString(val: "2.0")),
+    JsonField(key: "id", value: id),
+    JsonField(key: "error", value: err)
+  ])
+end
+
+// ─── Message classification ──────────────────────────────────────────────────
+
+/// Classification of an inbound JSON-RPC message. The dispatch loop matches
+/// on this to decide whether to invoke the request branch (and write back a
+/// response) or the notification branch (and discard the return value).
+export type IncomingMessage =
+    Request(id: JsonValue, method: string, params: JsonValue)
+  | Notification(method: string, params: JsonValue)
+  | Malformed(reason: string)
+
+/// Inspect `value` and tag it as Request / Notification / Malformed. A message
+/// is a Request iff it has both `method` and `id`; a Notification has `method`
+/// but no `id`; anything else is Malformed.
+export let classify = fn (value: JsonValue) -> IncomingMessage do
+  let method_v = get_field(obj: value, key: "method")
+  match method_v do
+    | None -> return Malformed(reason: "missing 'method' field")
+    | Some(val: m_v) ->
+      match m_v do
+        | JsonString(val: m) ->
+          let params = match get_field(obj: value, key: "params") do
+            | None -> JsonNull
+            | Some(val: p) -> p
+          end
+          match get_field(obj: value, key: "id") do
+            | None -> return Notification(method: m, params)
+            | Some(val: id_v) -> return Request(id: id_v, method: m, params)
+          end
+        | _ -> return Malformed(reason: "'method' is not a string")
+      end
+  end
+end
+
+// ─── Dispatch loop ───────────────────────────────────────────────────────────
+//
+// The `dispatch_fn` parameter is a function taking `(IncomingMessage)` and
+// returning `Option<JsonValue>`:
+//   - Request → Some(response_value) gets written; None is treated as
+//     InternalError and an error response is sent back.
+//   - Notification → return value is ignored (always None in well-behaved
+//     callers; non-None is silently dropped, matching server convention
+//     that notifications have no reply).
+//
+// `max_iters` bounds the loop for tests that supply a finite stream;
+// production code passes -1 for unbounded. The loop returns the number of
+// successfully processed frames.
+
+/// Single-step dispatch: read one message, classify, invoke dispatch_fn, emit
+/// response if appropriate. Returns true if a message was processed, false
+/// on clean EOF.
+export let dispatch_step = fn (
+  dispatch_fn: (msg: IncomingMessage) -> Option<JsonValue>
+) -> bool require { Console } throws { Exn } do
+  match read_message() do
+    | None -> return false
+    | Some(val: value) ->
+      let classified = classify(value)
+      match classified do
+        | Request(id, method: _, params: _) ->
+          let reply = dispatch_fn(msg: classified)
+          let response_value = match reply do
+            | Some(val: r) -> r
+            | None -> response_error(id, code: internal_error(),
+                        message: "handler returned no response")
+          end
+          write_message(value: response_value)
+          return true
+        | Notification(method: _, params: _) ->
+          let _ = dispatch_fn(msg: classified)
+          return true
+        | Malformed(reason) ->
+          // Malformed inbound — write back a parse-error response with null
+          // id (LSP spec §3.1) and continue. Surplus state on `value` is
+          // discarded.
+          write_message(value: response_error(id: JsonNull,
+            code: invalid_request(), message: reason))
+          return true
+      end
+  end
+end
+
+/// Run `dispatch_step` until EOF or `max_iters` reached. `max_iters < 0` is
+/// unbounded. Returns the count of frames processed. Frame errors mid-loop
+/// are caught: the loop logs the message via stderr and continues, matching
+/// the spec note that a single bad frame must not terminate the server.
+export let dispatch_loop = fn (
+  dispatch_fn: (msg: IncomingMessage) -> Option<JsonValue>,
+  max_iters: i64
+) -> i64 require { Console } throws { Exn } do
+  return dispatch_loop_go(dispatch_fn, remaining: max_iters, count: 0)
+end
+
+let dispatch_loop_go = fn (
+  dispatch_fn: (msg: IncomingMessage) -> Option<JsonValue>,
+  remaining: i64,
+  count: i64
+) -> i64 require { Console } throws { Exn } do
+  if remaining == 0 then return count end
+  try
+    let cont = dispatch_step(dispatch_fn)
+    if !cont then return count end
+    let next_remaining = if remaining < 0 then -1 else remaining - 1 end
+    return dispatch_loop_go(dispatch_fn, remaining: next_remaining, count: count + 1)
+  catch err ->
+    match err do
+      | JsonRpcFrameError(msg) ->
+        Console.eprintln(val: "[jsonrpc] frame error: " ++ msg)
+        let next_remaining = if remaining < 0 then -1 else remaining - 1 end
+        return dispatch_loop_go(dispatch_fn, remaining: next_remaining, count)
+      | JsonError(msg, pos: _) ->
+        Console.eprintln(val: "[jsonrpc] body parse error: " ++ msg)
+        let next_remaining = if remaining < 0 then -1 else remaining - 1 end
+        return dispatch_loop_go(dispatch_fn, remaining: next_remaining, count)
+      | _ -> raise err
+    end
+  end
+end
