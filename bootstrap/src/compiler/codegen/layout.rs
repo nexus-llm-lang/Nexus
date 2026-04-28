@@ -269,7 +269,7 @@ fn stmt_uses_object_heap(stmt: &LirStmt) -> bool {
 }
 
 fn expr_uses_object_heap(expr: &LirExpr) -> bool {
-    matches!(
+    if matches!(
         expr,
         LirExpr::Constructor { .. }
             | LirExpr::Record { .. }
@@ -277,10 +277,23 @@ fn expr_uses_object_heap(expr: &LirExpr) -> bool {
             | LirExpr::ObjectField { .. }
             | LirExpr::FuncRef { .. }
             | LirExpr::Closure { .. }
-    ) || matches!(
+    ) {
+        return true;
+    }
+    if matches!(
         expr,
         LirExpr::Binary { op, typ, .. } if is_string_concat_operator(*op, typ)
-    )
+    ) {
+        return true;
+    }
+    // FromCharCode / FromChar may construct an `Exn::InvalidUnicode` heap
+    // object on the throw path, so they pull in the object heap regardless
+    // of whether the user code constructs anything else directly.
+    if let LirExpr::Intrinsic { kind, .. } = expr {
+        use crate::ir::lir::Intrinsic;
+        return matches!(kind, Intrinsic::FromCharCode | Intrinsic::FromChar);
+    }
+    false
 }
 
 fn external_uses_string_abi(ext: &LirExternal) -> bool {

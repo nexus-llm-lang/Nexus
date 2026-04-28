@@ -1543,7 +1543,12 @@ pub(super) fn compile_expr(
                     Ok(())
                 }
                 Intrinsic::StringLength => {
-                    // length(s) → character count (ASCII: == byte count)
+                    // length(s) → character count.
+                    // BYTE-COUNT shortcut: this lowering only matches the
+                    // contract for ASCII input. Currently unreachable —
+                    // `lir_lower::try_intrinsify` skips StringLength so the
+                    // call routes to the UTF-8-aware runtime extern. Kept
+                    // as a placeholder for a future UTF-8 lead-byte counter.
                     let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
                     compile_atom(s, out, local_map, layout)?;
                     out.instruction(&Instruction::I64Const(0xFFFF_FFFF_u64 as i64));
@@ -1551,7 +1556,9 @@ pub(super) fn compile_expr(
                     Ok(())
                 }
                 Intrinsic::CharCode => {
-                    // char_code(s, idx) → codepoint as i64 (ASCII: byte at idx)
+                    // char_code(s, idx) → codepoint at character index as i64.
+                    // BYTE-INDEX shortcut (ASCII only). Currently unreachable —
+                    // see the StringLength comment above.
                     let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
                     let idx = &args.iter().find(|(l, _)| l.as_ref() == "idx").unwrap().1;
                     compile_atom(s, out, local_map, layout)?;
@@ -1569,7 +1576,9 @@ pub(super) fn compile_expr(
                     Ok(())
                 }
                 Intrinsic::CharAt => {
-                    // char_at(s, idx) → char (i32) at position (ASCII: byte_at)
+                    // char_at(s, idx) → char (i32) at character index.
+                    // BYTE-INDEX shortcut (ASCII only). Currently unreachable —
+                    // see the StringLength comment above.
                     let s = &args.iter().find(|(l, _)| l.as_ref() == "s").unwrap().1;
                     let idx = &args.iter().find(|(l, _)| l.as_ref() == "idx").unwrap().1;
                     compile_atom(s, out, local_map, layout)?;
@@ -1585,63 +1594,28 @@ pub(super) fn compile_expr(
                     Ok(())
                 }
                 Intrinsic::FromCharCode => {
-                    // from_char_code(code) → single-byte string (ASCII fast path)
+                    // from_char_code(code: i64) → UTF-8 encoded string.
+                    // Validates that `code` is a valid Unicode scalar value
+                    // (0..=0x10FFFF, excluding surrogates 0xD800..=0xDFFF) and
+                    // raises Exn::InvalidUnicode otherwise.
                     let code = &args.iter().find(|(l, _)| l.as_ref() == "code").unwrap().1;
-                    // Allocate 1 byte on heap
-                    if let Some(alloc_idx) = layout.allocate_func_idx {
-                        out.instruction(&Instruction::I32Const(1));
-                        out.instruction(&Instruction::Call(alloc_idx));
-                        out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
-                    } else {
-                        out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
-                        out.instruction(&Instruction::LocalTee(temps.concat_out_ptr_i32));
-                        out.instruction(&Instruction::I32Const(1));
-                        out.instruction(&Instruction::I32Add);
-                        out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
-                        emit_string_heap_grow(out, layout);
-                    }
-                    // Store byte: mem[out_ptr] = code as u8
-                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
                     compile_atom(code, out, local_map, layout)?;
-                    out.instruction(&Instruction::I32WrapI64);
-                    out.instruction(&Instruction::I32Store8(super::string::memarg_i8()));
-                    // Pack result: (out_ptr << 32) | 1
-                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
-                    out.instruction(&Instruction::I64ExtendI32U);
-                    out.instruction(&Instruction::I64Const(32));
-                    out.instruction(&Instruction::I64Shl);
-                    out.instruction(&Instruction::I64Const(1));
-                    out.instruction(&Instruction::I64Or);
+                    // Stack: code:i64
+                    out.instruction(&Instruction::LocalSet(temps.packed_tmp_i64));
+                    emit_from_codepoint_utf8(out, layout, temps)?;
                     Ok(())
                 }
                 Intrinsic::FromChar => {
-                    // from_char(c) → single-byte string (same as FromCharCode but arg is char/i32)
+                    // from_char(c: char) → UTF-8 encoded string.
+                    // Same validation/encoding contract as FromCharCode; the
+                    // input is widened from i32 to i64 before validation.
                     let c = &args.iter().find(|(l, _)| l.as_ref() == "c").unwrap().1;
-                    if let Some(alloc_idx) = layout.allocate_func_idx {
-                        out.instruction(&Instruction::I32Const(1));
-                        out.instruction(&Instruction::Call(alloc_idx));
-                        out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
-                    } else {
-                        out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
-                        out.instruction(&Instruction::LocalTee(temps.concat_out_ptr_i32));
-                        out.instruction(&Instruction::I32Const(1));
-                        out.instruction(&Instruction::I32Add);
-                        out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
-                        emit_string_heap_grow(out, layout);
-                    }
-                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
                     compile_atom(c, out, local_map, layout)?;
-                    // c is char (i32) — no wrapping needed
-                    if matches!(c.typ().wasm_repr(), crate::types::WasmRepr::I64) {
-                        out.instruction(&Instruction::I32WrapI64);
+                    if matches!(c.typ().wasm_repr(), crate::types::WasmRepr::I32) {
+                        out.instruction(&Instruction::I64ExtendI32U);
                     }
-                    out.instruction(&Instruction::I32Store8(super::string::memarg_i8()));
-                    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
-                    out.instruction(&Instruction::I64ExtendI32U);
-                    out.instruction(&Instruction::I64Const(32));
-                    out.instruction(&Instruction::I64Shl);
-                    out.instruction(&Instruction::I64Const(1));
-                    out.instruction(&Instruction::I64Or);
+                    out.instruction(&Instruction::LocalSet(temps.packed_tmp_i64));
+                    emit_from_codepoint_utf8(out, layout, temps)?;
                     Ok(())
                 }
                 Intrinsic::CharOrd => {
@@ -2203,6 +2177,265 @@ fn emit_intrinsic_alloc_store_byte(
     out.instruction(&Instruction::I64Const(32));
     out.instruction(&Instruction::I64Shl);
     out.instruction(&Instruction::I64Const(1));
+    out.instruction(&Instruction::I64Or);
+}
+
+/// Emit codegen for `from_char_code(code) → string` and `from_char(c) → string`.
+///
+/// Precondition: the candidate codepoint has been written to
+/// `temps.packed_tmp_i64` (as a sign-extended i64).
+///
+/// Validates that the codepoint is a valid Unicode scalar value
+/// (0..=0x10FFFF, excluding surrogates 0xD800..=0xDFFF) and raises
+/// `Exn::InvalidUnicode(code)` on violation. On success, allocates a
+/// 1-4 byte buffer on the string heap, writes the UTF-8 encoding, and
+/// leaves the packed (ptr<<32 | len) i64 on the stack.
+fn emit_from_codepoint_utf8(
+    out: &mut Function,
+    layout: &CodegenLayout,
+    temps: &super::FunctionTemps,
+) -> Result<(), CodegenError> {
+    let exn_tag_idx = layout.exn_tag_idx.ok_or(CodegenError::ObjectHeapRequired {
+        context: "from_char_code requires Exn tag (is the program raise-aware?)",
+    })?;
+    let invalid_unicode_tag = constructor_tag("InvalidUnicode", 1);
+    let memarg_i8 = super::string::memarg_i8();
+
+    // Result block returns the packed string (i64). Both the validation
+    // failure path and the four UTF-8 length cases produce one i64 each.
+    out.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
+
+    // ── Validation ─────────────────────────────────────────────────
+    // Compute is_invalid = (code < 0) | (code > 0x10FFFF) | (0xD800 <= code <= 0xDFFF)
+    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::I64Const(0));
+    out.instruction(&Instruction::I64LtS);
+    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::I64Const(0x10FFFF));
+    out.instruction(&Instruction::I64GtS);
+    out.instruction(&Instruction::I32Or);
+    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::I64Const(0xD800));
+    out.instruction(&Instruction::I64GeS);
+    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::I64Const(0xDFFF));
+    out.instruction(&Instruction::I64LeS);
+    out.instruction(&Instruction::I32And);
+    out.instruction(&Instruction::I32Or);
+    // if !is_invalid → branch into the encoding path
+    out.instruction(&Instruction::I32Eqz);
+    out.instruction(&Instruction::If(BlockType::Empty));
+    {
+        // ── Valid path ─────────────────────────────────────────────
+        // Branch on byte length:
+        //   code < 0x80    → 1 byte
+        //   code < 0x800   → 2 bytes
+        //   code < 0x10000 → 3 bytes
+        //   else           → 4 bytes (code <= 0x10FFFF guaranteed by validation)
+        out.instruction(&Instruction::Block(BlockType::Empty)); // four_block
+        out.instruction(&Instruction::Block(BlockType::Empty)); // three_block
+        out.instruction(&Instruction::Block(BlockType::Empty)); // two_block
+        out.instruction(&Instruction::Block(BlockType::Empty)); // one_block
+
+        // br_table by byte-class: depth 0=one,1=two,2=three,3=four
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I64Const(0x80));
+        out.instruction(&Instruction::I64LtU);
+        out.instruction(&Instruction::BrIf(0)); // → one_block
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I64Const(0x800));
+        out.instruction(&Instruction::I64LtU);
+        out.instruction(&Instruction::BrIf(1)); // → two_block
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I64Const(0x10000));
+        out.instruction(&Instruction::I64LtU);
+        out.instruction(&Instruction::BrIf(2)); // → three_block
+        out.instruction(&Instruction::Br(3)); // → four_block
+
+        // ── 1-byte path ────────────────────────────────────────────
+        out.instruction(&Instruction::End); // close one_block
+        emit_alloc_string_buf(out, layout, temps, 1);
+        out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I32WrapI64);
+        out.instruction(&Instruction::I32Store8(memarg_i8));
+        emit_pack_string_result(out, temps, 1);
+        out.instruction(&Instruction::Br(4)); // exit the result block
+
+        // ── 2-byte path ────────────────────────────────────────────
+        out.instruction(&Instruction::End); // close two_block
+        emit_alloc_string_buf(out, layout, temps, 2);
+        // byte0 = 0xC0 | (code >> 6)
+        out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I64Const(6));
+        out.instruction(&Instruction::I64ShrU);
+        out.instruction(&Instruction::I32WrapI64);
+        out.instruction(&Instruction::I32Const(0xC0));
+        out.instruction(&Instruction::I32Or);
+        out.instruction(&Instruction::I32Store8(memarg_i8));
+        // byte1 = 0x80 | (code & 0x3F)
+        out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::I32Const(1));
+        out.instruction(&Instruction::I32Add);
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I32WrapI64);
+        out.instruction(&Instruction::I32Const(0x3F));
+        out.instruction(&Instruction::I32And);
+        out.instruction(&Instruction::I32Const(0x80));
+        out.instruction(&Instruction::I32Or);
+        out.instruction(&Instruction::I32Store8(memarg_i8));
+        emit_pack_string_result(out, temps, 2);
+        out.instruction(&Instruction::Br(3));
+
+        // ── 3-byte path ────────────────────────────────────────────
+        out.instruction(&Instruction::End); // close three_block
+        emit_alloc_string_buf(out, layout, temps, 3);
+        // byte0 = 0xE0 | (code >> 12)
+        out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I64Const(12));
+        out.instruction(&Instruction::I64ShrU);
+        out.instruction(&Instruction::I32WrapI64);
+        out.instruction(&Instruction::I32Const(0xE0));
+        out.instruction(&Instruction::I32Or);
+        out.instruction(&Instruction::I32Store8(memarg_i8));
+        // byte1 = 0x80 | ((code >> 6) & 0x3F)
+        out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::I32Const(1));
+        out.instruction(&Instruction::I32Add);
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I64Const(6));
+        out.instruction(&Instruction::I64ShrU);
+        out.instruction(&Instruction::I32WrapI64);
+        out.instruction(&Instruction::I32Const(0x3F));
+        out.instruction(&Instruction::I32And);
+        out.instruction(&Instruction::I32Const(0x80));
+        out.instruction(&Instruction::I32Or);
+        out.instruction(&Instruction::I32Store8(memarg_i8));
+        // byte2 = 0x80 | (code & 0x3F)
+        out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::I32Const(2));
+        out.instruction(&Instruction::I32Add);
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I32WrapI64);
+        out.instruction(&Instruction::I32Const(0x3F));
+        out.instruction(&Instruction::I32And);
+        out.instruction(&Instruction::I32Const(0x80));
+        out.instruction(&Instruction::I32Or);
+        out.instruction(&Instruction::I32Store8(memarg_i8));
+        emit_pack_string_result(out, temps, 3);
+        out.instruction(&Instruction::Br(2));
+
+        // ── 4-byte path ────────────────────────────────────────────
+        out.instruction(&Instruction::End); // close four_block
+        emit_alloc_string_buf(out, layout, temps, 4);
+        // byte0 = 0xF0 | (code >> 18)
+        out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I64Const(18));
+        out.instruction(&Instruction::I64ShrU);
+        out.instruction(&Instruction::I32WrapI64);
+        out.instruction(&Instruction::I32Const(0xF0));
+        out.instruction(&Instruction::I32Or);
+        out.instruction(&Instruction::I32Store8(memarg_i8));
+        // byte1 = 0x80 | ((code >> 12) & 0x3F)
+        out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::I32Const(1));
+        out.instruction(&Instruction::I32Add);
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I64Const(12));
+        out.instruction(&Instruction::I64ShrU);
+        out.instruction(&Instruction::I32WrapI64);
+        out.instruction(&Instruction::I32Const(0x3F));
+        out.instruction(&Instruction::I32And);
+        out.instruction(&Instruction::I32Const(0x80));
+        out.instruction(&Instruction::I32Or);
+        out.instruction(&Instruction::I32Store8(memarg_i8));
+        // byte2 = 0x80 | ((code >> 6) & 0x3F)
+        out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::I32Const(2));
+        out.instruction(&Instruction::I32Add);
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I64Const(6));
+        out.instruction(&Instruction::I64ShrU);
+        out.instruction(&Instruction::I32WrapI64);
+        out.instruction(&Instruction::I32Const(0x3F));
+        out.instruction(&Instruction::I32And);
+        out.instruction(&Instruction::I32Const(0x80));
+        out.instruction(&Instruction::I32Or);
+        out.instruction(&Instruction::I32Store8(memarg_i8));
+        // byte3 = 0x80 | (code & 0x3F)
+        out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::I32Const(3));
+        out.instruction(&Instruction::I32Add);
+        out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+        out.instruction(&Instruction::I32WrapI64);
+        out.instruction(&Instruction::I32Const(0x3F));
+        out.instruction(&Instruction::I32And);
+        out.instruction(&Instruction::I32Const(0x80));
+        out.instruction(&Instruction::I32Or);
+        out.instruction(&Instruction::I32Store8(memarg_i8));
+        emit_pack_string_result(out, temps, 4);
+        out.instruction(&Instruction::Br(1));
+    }
+    out.instruction(&Instruction::End); // close validation if
+
+    // ── Invalid path ────────────────────────────────────────────────
+    // Capture backtrace, build Exn::InvalidUnicode(code), throw.
+    if let Some(bt_idx) = layout.capture_bt_func_idx {
+        out.instruction(&Instruction::Call(bt_idx));
+    }
+    emit_alloc_object(out, temps, 2, layout)?;
+    // tag at offset 0
+    out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+    out.instruction(&Instruction::I64Const(invalid_unicode_tag));
+    out.instruction(&Instruction::I64Store(memarg(0)));
+    // code at offset 8
+    out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+    out.instruction(&Instruction::LocalGet(temps.packed_tmp_i64));
+    out.instruction(&Instruction::I64Store(memarg(8)));
+    // Push payload (object ptr as i64) and throw
+    out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
+    out.instruction(&Instruction::I64ExtendI32U);
+    out.instruction(&Instruction::Throw(exn_tag_idx));
+    // Throw is a control-flow terminator; the result block needs an
+    // i64 type, so we never fall through here. Wasm validation requires
+    // a reachable continuation though — `unreachable` is the correct
+    // terminator for the rest of the block.
+    out.instruction(&Instruction::End); // close result block
+    Ok(())
+}
+
+/// Allocate `len` bytes on the string heap, leaving the buffer pointer
+/// in `temps.concat_out_ptr_i32`. Used by the UTF-8 emit helpers.
+fn emit_alloc_string_buf(
+    out: &mut Function,
+    layout: &CodegenLayout,
+    temps: &super::FunctionTemps,
+    len: i32,
+) {
+    if let Some(alloc_idx) = layout.allocate_func_idx {
+        out.instruction(&Instruction::I32Const(len));
+        out.instruction(&Instruction::Call(alloc_idx));
+        out.instruction(&Instruction::LocalSet(temps.concat_out_ptr_i32));
+    } else {
+        out.instruction(&Instruction::GlobalGet(STRING_HEAP_GLOBAL_INDEX));
+        out.instruction(&Instruction::LocalTee(temps.concat_out_ptr_i32));
+        out.instruction(&Instruction::I32Const(len));
+        out.instruction(&Instruction::I32Add);
+        out.instruction(&Instruction::GlobalSet(STRING_HEAP_GLOBAL_INDEX));
+        emit_string_heap_grow(out, layout);
+    }
+}
+
+/// Emit `(out_ptr << 32) | len` on the WASM stack as a packed string i64.
+fn emit_pack_string_result(out: &mut Function, temps: &super::FunctionTemps, len: i64) {
+    out.instruction(&Instruction::LocalGet(temps.concat_out_ptr_i32));
+    out.instruction(&Instruction::I64ExtendI32U);
+    out.instruction(&Instruction::I64Const(32));
+    out.instruction(&Instruction::I64Shl);
+    out.instruction(&Instruction::I64Const(len));
     out.instruction(&Instruction::I64Or);
 }
 

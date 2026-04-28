@@ -1128,9 +1128,22 @@ fn program_uses_backtrace(program: &LirProgram) -> bool {
 
 /// Check if the LIR program needs exception handling (throw/catch).
 fn program_needs_eh(program: &LirProgram) -> bool {
+    fn expr_needs_eh(expr: &LirExpr) -> bool {
+        if matches!(expr, LirExpr::Raise { .. }) {
+            return true;
+        }
+        // FromCharCode / FromChar throw Exn::InvalidUnicode on invalid
+        // codepoints, so they require the EH tag to be wired in even when
+        // the user code has no explicit `raise` site.
+        if let LirExpr::Intrinsic { kind, .. } = expr {
+            use crate::ir::lir::Intrinsic;
+            return matches!(kind, Intrinsic::FromCharCode | Intrinsic::FromChar);
+        }
+        false
+    }
     fn stmt_needs_bt(stmt: &LirStmt) -> bool {
         match stmt {
-            LirStmt::Let { expr, .. } => matches!(expr, LirExpr::Raise { .. }),
+            LirStmt::Let { expr, .. } => expr_needs_eh(expr),
             LirStmt::TryCatch { .. } => true,
             LirStmt::If {
                 then_body,

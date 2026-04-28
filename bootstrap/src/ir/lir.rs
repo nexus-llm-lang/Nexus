@@ -228,15 +228,29 @@ pub enum Intrinsic {
     CountNewlinesIn,
     /// last-newline-in(s, start, end_pos) → last index of 0x0A in [start, end), or -1
     LastNewlineIn,
-    /// length(s) → character count (== byte count for ASCII)
+    /// length(s) → character count.
+    /// The existing codegen emits a byte-count shortcut and is currently
+    /// unreachable: `lir_lower::try_intrinsify` does not register this
+    /// kind, so the call routes to the runtime extern, which walks
+    /// `s.chars()`. A re-intrinsification must walk UTF-8 lead bytes
+    /// to preserve the character-count contract for multi-byte input.
     StringLength,
-    /// char-code(s, idx) → codepoint at char index as i64 (== byte_at for ASCII)
+    /// char-code(s, idx) → codepoint at the given character index as i64.
+    /// As with `StringLength`, the byte-indexed codegen is not wired up
+    /// in `try_intrinsify`; the call routes to the UTF-8-aware runtime
+    /// extern.
     CharCode,
-    /// char-at(s, idx) → char at char index as i32 (== byte_at for ASCII)
+    /// char-at(s, idx) → char at the given character index as i32.
+    /// As with `StringLength`, the byte-indexed codegen is not wired up
+    /// in `try_intrinsify`; the call routes to the UTF-8-aware runtime
+    /// extern.
     CharAt,
-    /// from-char-code(code) → single-char string from codepoint
+    /// from-char-code(code) → UTF-8 encoded string for the codepoint;
+    /// raises Exn::InvalidUnicode for invalid scalar values
+    /// (negative, >0x10FFFF, or surrogate 0xD800..=0xDFFF).
     FromCharCode,
-    /// from-char(c) → single-char string from char value
+    /// from-char(c) → UTF-8 encoded string for the char value;
+    /// raises Exn::InvalidUnicode for invalid scalar values.
     FromChar,
     /// char-ord(c) → char as i64
     CharOrd,
