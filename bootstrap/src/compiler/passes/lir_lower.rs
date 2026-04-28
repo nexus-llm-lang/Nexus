@@ -1379,22 +1379,46 @@ impl<'a> LowerCtx<'a> {
             _ => target_atom.typ(),
         };
 
-        // Infer result type from case bodies
-        let semantic_result_type = cases
-            .iter()
-            .find_map(|case| {
-                if let Some(last) = case.body.last() {
-                    let t = self.infer_stmt_type(last);
-                    if matches!(t, Type::Unit) {
-                        None
-                    } else {
-                        Some(t)
+        // Infer result type from case bodies. Pattern-bound variables
+        // (e.g. `o` in `Some(val: o) -> o`) need their semantic types
+        // primed before inference, otherwise `infer_semantic_type` falls
+        // back to I64 for the binding and the result type is mis-typed
+        // (causing E2017 "string concat expects (string, i64)" downstream
+        // when the match value participates in `++`).
+        let mut semantic_result_type = Type::Unit;
+        for case in cases {
+            let Some(last) = case.body.last() else { continue };
+            let mut bindings: Vec<(Symbol, Type)> = Vec::new();
+            collect_pattern_binding_types(
+                &case.pattern,
+                &target_sem_type,
+                &self.ctor_index,
+                self.enum_defs,
+                &mut bindings,
+            );
+            let saved: Vec<(Symbol, Option<Type>)> = bindings
+                .iter()
+                .map(|(n, _)| (*n, self.semantic_vars.get(n).cloned()))
+                .collect();
+            for (n, t) in &bindings {
+                self.semantic_vars.insert(*n, t.clone());
+            }
+            let t = self.infer_stmt_type(last);
+            for (n, prev) in saved {
+                match prev {
+                    Some(p) => {
+                        self.semantic_vars.insert(n, p);
                     }
-                } else {
-                    None
+                    None => {
+                        self.semantic_vars.remove(&n);
+                    }
                 }
-            })
-            .unwrap_or(Type::Unit);
+            }
+            if !matches!(t, Type::Unit) {
+                semantic_result_type = t;
+                break;
+            }
+        }
         let result_type = wasm_type(&semantic_result_type);
 
         let result_name = self.new_temp();
@@ -2764,6 +2788,75 @@ fn build_constructor_index(enum_defs: &[EnumDef]) -> HashMap<String, Constructor
         }
     }
     index
+}
+
+/// Collect (binding name, semantic type) pairs introduced by a pattern matched
+/// against a scrutinee whose semantic type is `scr_sem_type`.
+///
+/// Used to pre-populate semantic-type information for pattern-bound variables
+/// before a case body is inspected by inference (e.g. to determine the result
+/// type of a match expression). Without this, expressions like
+/// `if let Some(val: o) = opt then o else ... end` would default `o`'s
+/// semantic type to `I64` because the bindings are added later, during
+/// decision-tree emission.
+fn collect_pattern_binding_types(
+    pat: &MirPattern,
+    scr_sem_type: &Type,
+    ctor_index: &HashMap<String, ConstructorInfo>,
+    enum_defs: &[EnumDef],
+    out: &mut Vec<(Symbol, Type)>,
+) {
+    match pat {
+        MirPattern::Variable(name, _) => {
+            out.push((*name, scr_sem_type.clone()));
+        }
+        MirPattern::Constructor { name, fields } => {
+            let resolved = resolve_constructor_field_types(
+                name.as_str(),
+                scr_sem_type,
+                ctor_index,
+                enum_defs,
+            );
+            let info = ctor_index.get(name.as_str());
+            for (pat_idx, (label, sub_pat)) in fields.iter().enumerate() {
+                let def_idx = match (label, info) {
+                    (Some(lbl), Some(ci)) => ci
+                        .field_labels
+                        .iter()
+                        .position(|l| l.as_ref() == Some(lbl))
+                        .unwrap_or(pat_idx),
+                    _ => pat_idx,
+                };
+                let field_ty = resolved
+                    .as_ref()
+                    .and_then(|fts| fts.get(def_idx))
+                    .cloned()
+                    .unwrap_or(Type::I64);
+                collect_pattern_binding_types(sub_pat, &field_ty, ctor_index, enum_defs, out);
+            }
+        }
+        MirPattern::Record(fields, _) => {
+            // Field semantic types come from the scrutinee's record type.
+            if let Type::Record(rt_fields) = strip_linear(scr_sem_type) {
+                for (fname, sub_pat) in fields {
+                    let field_ty = rt_fields
+                        .iter()
+                        .find(|(n, _)| n.as_str() == fname.as_str())
+                        .map(|(_, t)| t.clone())
+                        .unwrap_or(Type::I64);
+                    collect_pattern_binding_types(sub_pat, &field_ty, ctor_index, enum_defs, out);
+                }
+            }
+        }
+        MirPattern::Or(alts) => {
+            // Or-patterns must bind the same names with the same types in each alt;
+            // walking the first is sufficient to recover semantic types.
+            if let Some(first) = alts.first() {
+                collect_pattern_binding_types(first, scr_sem_type, ctor_index, enum_defs, out);
+            }
+        }
+        MirPattern::Literal(_) | MirPattern::Wildcard => {}
+    }
 }
 
 /// Resolve the concrete field types for a constructor variant, applying type parameter
