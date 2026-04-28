@@ -8,6 +8,19 @@
 //!   Nexus `string` return  → Rust i64 packed as (ptr as u32) << 32 | (len as u32)
 //!   Nexus `bool` return    → Rust i32 (non-zero = true)
 //!   Nexus `i64`/`i32`/etc. → same WASM value type
+//!
+//! ## host-http return-value ABI policy
+//!
+//! - bool (success/failure)  → i32 (1 = ok, 0 = failure). `__nx_http_respond`,
+//!   `__nx_http_stop`.
+//! - handle (server id)      → i64. `-1` is the failure sentinel because valid
+//!   ids start at 1. `__nx_http_listen`.
+//! - status / handle param   → i64.
+//! - multi-value string      → packed-i64 (ptr<<32 | len). `__nx_http_request`,
+//!   `__nx_http_accept`. Failure is encoded inside the string payload.
+//!
+//! See `bootstrap/src/lib/nexus_host_bridge/src/host_impl.rs` for the matching
+//! host-side policy.
 
 use nexus_wasm_alloc::{checked_ptr_len, remember_allocation, report_failure, take_allocation};
 use std::alloc::{Layout, alloc, realloc};

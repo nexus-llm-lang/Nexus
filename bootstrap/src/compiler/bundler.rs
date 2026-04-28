@@ -419,13 +419,7 @@ pub fn merge_remaining_stubs(wasm: &[u8], wasm_merge_command: &Path) -> Result<V
 
     // Merge nexus-host stubs if present
     if imports.contains(NEXUS_HOST_HTTP_MODULE) {
-        let stub = build_stub_module(&[
-            ("host-http-request", &[I32; 9], &[]),
-            ("host-http-listen", &[I32, I32], &[I64]),
-            ("host-http-accept", &[I64, I32], &[]),
-            ("host-http-respond", &[I64, I64, I32, I32, I32, I32], &[I32]),
-            ("host-http-stop", &[I64], &[I32]),
-        ]);
+        let stub = build_stub_module(HOST_HTTP_STUB_SIGNATURES);
         result = merge_stub(&result, &stub, NEXUS_HOST_HTTP_MODULE, wasm_merge_command)?;
     }
 
@@ -448,6 +442,31 @@ pub fn merge_remaining_stubs(wasm: &[u8], wasm_merge_command: &Path) -> Result<V
 }
 
 use wasm_encoder::ValType::{I32, I64};
+
+/// Pinned WIT signatures for `nexus:cli/nexus-host` host-http imports.
+///
+/// ABI policy (see `bootstrap/src/lib/nexus_host_bridge/src/host_impl.rs` doc):
+/// - bool result          → i32 (1/0)
+/// - handle (server id)   → i64, -1 = failure sentinel
+/// - status / handle param → i64
+/// - multi-value string   → i32 ptr+len with retptr (i32) for canonical lowering
+///
+/// This array is the single source of truth for the stub-merge path. The same
+/// signatures appear in `nxlib/stdlib/nexus_host_stub.wat` (handwritten WAT
+/// stub) and `bootstrap/src/lib/nexus_host_bridge/wit/world.wit` (component
+/// build); a regression in any of those files is caught by
+/// `host_http_abi_pinned_signatures` in this module's tests.
+pub const HOST_HTTP_STUB_SIGNATURES: &[(
+    &str,
+    &[wasm_encoder::ValType],
+    &[wasm_encoder::ValType],
+)] = &[
+    ("host-http-request", &[I32; 9], &[]),
+    ("host-http-listen", &[I32, I32], &[I64]),
+    ("host-http-accept", &[I64, I32], &[]),
+    ("host-http-respond", &[I64, I64, I32, I32, I32, I32], &[I32]),
+    ("host-http-stop", &[I64], &[I32]),
+];
 
 fn build_stub_module(
     funcs: &[(&str, &[wasm_encoder::ValType], &[wasm_encoder::ValType])],
@@ -560,5 +579,49 @@ mod tests {
             "nexus:runtime/backtrace should be skipped, got: {:?}",
             result
         );
+    }
+
+    /// Locks the host-http return-value ABI policy: bool returns are i32,
+    /// handle returns are i64, multi-value returns use a string-via-retptr
+    /// path with no direct return value. (nexus-upzz.4)
+    #[test]
+    fn host_http_abi_pinned_signatures() {
+        use wasm_encoder::ValType::{I32, I64};
+
+        // Convenience: name → (params, results).
+        let by_name: std::collections::HashMap<&str, (&[wasm_encoder::ValType], &[wasm_encoder::ValType])> =
+            HOST_HTTP_STUB_SIGNATURES
+                .iter()
+                .map(|(n, p, r)| (*n, (*p, *r)))
+                .collect();
+
+        // host-http-request: 8×string params + retptr; multi-value via retptr.
+        let (req_params, req_results) = by_name["host-http-request"];
+        assert_eq!(req_params, &[I32; 9], "host-http-request params");
+        assert_eq!(req_results, &[] as &[wasm_encoder::ValType], "host-http-request returns void (retptr)");
+
+        // host-http-listen: handle return.
+        let (listen_params, listen_results) = by_name["host-http-listen"];
+        assert_eq!(listen_params, &[I32, I32], "host-http-listen params (string)");
+        assert_eq!(listen_results, &[I64], "host-http-listen returns i64 handle");
+
+        // host-http-accept: multi-value string via retptr.
+        let (accept_params, accept_results) = by_name["host-http-accept"];
+        assert_eq!(accept_params, &[I64, I32], "host-http-accept params (handle, retptr)");
+        assert_eq!(accept_results, &[] as &[wasm_encoder::ValType], "host-http-accept returns void (retptr)");
+
+        // host-http-respond: bool return = i32.
+        let (resp_params, resp_results) = by_name["host-http-respond"];
+        assert_eq!(
+            resp_params,
+            &[I64, I64, I32, I32, I32, I32],
+            "host-http-respond params (req_id, status, headers ptr+len, body ptr+len)"
+        );
+        assert_eq!(resp_results, &[I32], "host-http-respond returns i32 bool");
+
+        // host-http-stop: bool return = i32.
+        let (stop_params, stop_results) = by_name["host-http-stop"];
+        assert_eq!(stop_params, &[I64], "host-http-stop params (handle)");
+        assert_eq!(stop_results, &[I32], "host-http-stop returns i32 bool");
     }
 }
