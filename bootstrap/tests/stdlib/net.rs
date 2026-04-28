@@ -229,6 +229,63 @@ fn net_streaming_finish_required_to_release_linear_stream() {
 }
 
 #[test]
+fn net_request_with_timeout_typechecks() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // nexus-upzz.7: per-call timeout on outbound request.
+    should_typecheck(
+        r#"
+    import { Net }, * as net_mod from "std:network"
+    import { length } from "std:str"
+
+    let main = fn () -> unit require { PermNet } do
+      inject net_mod.system_handler do
+        try
+          let res = Net.request_with_timeout(
+            method: "GET",
+            url: "http://example.com",
+            headers: [],
+            body: "",
+            timeout_ms: 5000
+          )
+          let _ = length(s: net_mod.response_body(res))
+          return ()
+        catch e ->
+          return ()
+        end
+      end
+      return ()
+    end
+    "#,
+    );
+}
+
+#[test]
+fn net_cancel_accept_borrows_server_typechecks() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // nexus-upzz.7: cancel_accept borrows the server (does not consume it);
+    // the linear `Server` must still be released by `stop`. This test asserts
+    // the borrow shape compiles and the linear discipline is preserved.
+    should_typecheck(
+        r#"
+    import { Net }, * as net_mod from "std:network"
+
+    let main = fn () -> unit require { PermNet } do
+      inject net_mod.system_handler do
+        try
+          let server = Net.listen(addr: "127.0.0.1:0")
+          let _ = Net.cancel_accept(server: &server)
+          Net.stop(server: server)
+        catch e ->
+          return ()
+        end
+      end
+      return ()
+    end
+    "#,
+    );
+}
+
+#[test]
 fn net_respond_returns_unit_effect_exn() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     should_typecheck(

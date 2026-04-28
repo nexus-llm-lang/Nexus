@@ -476,6 +476,12 @@ pub const HOST_HTTP_STUB_SIGNATURES: &[(
     ("host-http-respond-chunk-write", &[I64, I32, I32], &[I32]),
     // chunk-finish(req_id) -> bool
     ("host-http-respond-chunk-finish", &[I64], &[I32]),
+    // Timeout / cancel (nexus-upzz.7).
+    // request-with-options(method/url/headers/body ptr+len ×4, timeout_ms,
+    // ret_ptr) — string return via retptr; multi-value-string lowering.
+    ("host-http-request-with-options", &[I32, I32, I32, I32, I32, I32, I32, I32, I64, I32], &[]),
+    // cancel-accept(server_id) -> bool
+    ("host-http-cancel-accept", &[I64], &[I32]),
 ];
 
 fn build_stub_module(
@@ -651,5 +657,18 @@ mod tests {
         let (finish_params, finish_results) = by_name["host-http-respond-chunk-finish"];
         assert_eq!(finish_params, &[I64], "chunk-finish params (req_id)");
         assert_eq!(finish_results, &[I32], "chunk-finish returns i32 bool");
+
+        // Timeout / cancel (nexus-upzz.7).
+        let (rwo_params, rwo_results) = by_name["host-http-request-with-options"];
+        assert_eq!(
+            rwo_params,
+            &[I32, I32, I32, I32, I32, I32, I32, I32, I64, I32],
+            "request-with-options params (4×string ptr+len, timeout_ms i64, retptr)"
+        );
+        assert_eq!(rwo_results, &[] as &[wasm_encoder::ValType], "request-with-options returns void (retptr)");
+
+        let (ca_params, ca_results) = by_name["host-http-cancel-accept"];
+        assert_eq!(ca_params, &[I64], "cancel-accept params (server_id)");
+        assert_eq!(ca_results, &[I32], "cancel-accept returns i32 bool");
     }
 }

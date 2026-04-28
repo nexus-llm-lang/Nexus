@@ -81,6 +81,11 @@ thread_local! {
     static SERVERS: RefCell<HashMap<i64, ServerEntry>> = RefCell::new(HashMap::new());
     static CONNS: RefCell<HashMap<i64, ConnEntry>> = RefCell::new(HashMap::new());
     static NEXT_ID: RefCell<i64> = RefCell::new(1);
+    /// Set of server-ids whose blocking accept loop should bail on the next
+    /// poll iteration. Cleared by `do_stop` and `do_cancel_accept` once
+    /// honoured. (nexus-upzz.7)
+    static CANCEL_ACCEPT: RefCell<std::collections::HashSet<i64>> =
+        RefCell::new(std::collections::HashSet::new());
 }
 
 fn next_id() -> i64 {
@@ -199,6 +204,7 @@ fn perform_request(
     url: &str,
     headers: &str,
     body: &str,
+    timeout_ms: i64,
 ) -> Result<(u16, String, String), String> {
     validate_bridge_limits(url, headers, body)?;
     let (scheme, authority, path) = parse_url(url)?;
@@ -231,7 +237,20 @@ fn perform_request(
     OutgoingBody::finish(out_body, None)
         .map_err(|_| "failed to finalize request body".to_string())?;
 
-    let future = outgoing_handler::handle(request, None).map_err(|e| format!("{:?}", e))?;
+    // timeout_ms == 0 ⇒ no per-call deadline (legacy behaviour). Otherwise
+    // apply the same value to connect and first-byte timeouts; chunk-level
+    // (between-bytes) timeout is left default for now since the bulk request
+    // path drains the body in one read loop. (nexus-upzz.7)
+    let options = if timeout_ms > 0 {
+        let opts = bindings::wasi::http::types::RequestOptions::new();
+        let nanos = (timeout_ms as u64).saturating_mul(1_000_000);
+        let _ = opts.set_connect_timeout(Some(nanos));
+        let _ = opts.set_first_byte_timeout(Some(nanos));
+        Some(opts)
+    } else {
+        None
+    };
+    let future = outgoing_handler::handle(request, options).map_err(|e| format!("{:?}", e))?;
     let pollable = future.subscribe();
     pollable.block();
 
@@ -349,14 +368,18 @@ fn do_listen(addr: &str) -> Result<i64, String> {
 
 fn do_accept(server_id: i64) -> Result<String, String> {
     // Block until a connection is available, then accept it.
+    // (nexus-upzz.7): each iteration first checks the cancel flag so a host
+    // call to `host-http-cancel-accept` interrupts the loop deterministically.
     let (client_socket, input, output) = SERVERS.with(|servers| {
         let servers = servers.borrow();
         let entry = servers
             .get(&server_id)
             .ok_or_else(|| "invalid server id".to_string())?;
 
-        // Poll until accept succeeds
         loop {
+            if check_and_clear_cancel(server_id) {
+                return Err("cancelled".to_string());
+            }
             match entry.socket.accept() {
                 Ok(result) => return Ok(result),
                 Err(bindings::wasi::sockets::network::ErrorCode::WouldBlock) => {
@@ -575,6 +598,25 @@ fn do_stop(server_id: i64) -> Result<(), String> {
             .ok_or_else(|| "invalid server id".to_string())
     })?;
     // Dropping the ServerEntry closes the TCP listener socket
+    CANCEL_ACCEPT.with(|c| {
+        c.borrow_mut().remove(&server_id);
+    });
+    Ok(())
+}
+
+/// Returns true if a cancel was pending for this server, clearing the flag.
+fn check_and_clear_cancel(server_id: i64) -> bool {
+    CANCEL_ACCEPT.with(|c| c.borrow_mut().remove(&server_id))
+}
+
+fn do_cancel_accept(server_id: i64) -> Result<(), String> {
+    let exists = SERVERS.with(|s| s.borrow().contains_key(&server_id));
+    if !exists {
+        return Err("invalid server id".to_string());
+    }
+    CANCEL_ACCEPT.with(|c| {
+        c.borrow_mut().insert(server_id);
+    });
     Ok(())
 }
 
@@ -592,6 +634,7 @@ fn do_stop(server_id: i64) -> Result<(), String> {
 fn do_bridge_finalize() -> i64 {
     let n_servers = SERVERS.with(|servers| super::trap_drain::drain(&mut servers.borrow_mut()));
     let n_conns = CONNS.with(|conns| super::trap_drain::drain(&mut conns.borrow_mut()));
+    CANCEL_ACCEPT.with(|c| c.borrow_mut().clear());
     (n_servers + n_conns) as i64
 }
 
@@ -603,12 +646,35 @@ struct Guest;
 
 impl bindings::exports::nexus::cli::nexus_host::Guest for Guest {
     fn host_http_request(method: String, url: String, headers: String, body: String) -> String {
-        match perform_request(&method, &url, &headers, &body) {
+        match perform_request(&method, &url, &headers, &body, 0) {
             Ok((status, response_headers, response_body)) => {
                 let hlen = response_headers.len();
                 format!("{}\n{}\n{}{}", status, hlen, response_headers, response_body)
             }
             Err(err) => format!("0\n0\nhttp request failed: {}", err),
+        }
+    }
+
+    fn host_http_request_with_options(
+        method: String,
+        url: String,
+        headers: String,
+        body: String,
+        timeout_ms: i64,
+    ) -> String {
+        match perform_request(&method, &url, &headers, &body, timeout_ms) {
+            Ok((status, response_headers, response_body)) => {
+                let hlen = response_headers.len();
+                format!("{}\n{}\n{}{}", status, hlen, response_headers, response_body)
+            }
+            Err(err) => format!("0\n0\nhttp request failed: {}", err),
+        }
+    }
+
+    fn host_http_cancel_accept(server_id: i64) -> i32 {
+        match do_cancel_accept(server_id) {
+            Ok(()) => 1,
+            Err(_) => 0,
         }
     }
 
