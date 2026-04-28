@@ -3,6 +3,24 @@
 //! Compiles only when `target_family = "wasm"`. All outgoing HTTP goes
 //! through `perform_request`, which delegates to `super::url_guard` for
 //! SSRF screening before any WASI call.
+//!
+//! ## Return-value ABI policy (host-http-*)
+//!
+//! - **bool result** (success/failure flag): `s32`, `1` = success, `0` = failure.
+//!   Used by `host-http-respond`, `host-http-stop`.
+//! - **handle**: `s64`. `-1` = failure sentinel (no valid handle has that value
+//!   because `next_id()` starts at 1 and only increments). Used by
+//!   `host-http-listen`.
+//! - **status/handle parameter**: `s64` (HTTP status code or opaque handle id).
+//! - **structured response**: `string` whose first line encodes a leading
+//!   sentinel (e.g. `host-http-accept` returns `"-1\n\n\n\n{err}"` on failure,
+//!   `host-http-request` returns `"0\n0\n…"`). The string carrier is required
+//!   because more than one value must cross the FFI boundary.
+//!
+//! Mixing `s32` boolean and `s64` handle is intentional: WIT `bool` would lower
+//! the same way as `s32` 1/0, but explicit `s32` keeps the WIT signature stable
+//! for both component-model and core-WASM (stub) callers (see `bundler.rs`
+//! `merge_remaining_stubs`, `nxlib/stdlib/nexus_host_stub.wat`).
 
 mod bindings {
     wit_bindgen::generate!({
