@@ -113,6 +113,11 @@ fn net_accept_without_respond_is_rejected() {
 #[test]
 fn net_respond_consumes_request() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // Hole-2 (issue nexus-7eex.2): a throwable call (`Net.respond`) cannot
+    // be invoked while a linear other than its own argument is live —
+    // otherwise that linear would leak on raise. To verify that
+    // `Net.respond` consumes its `req` argument without tripping that
+    // safety check, we close `server` before the throwable call.
     should_typecheck(
         r#"
     import { Net }, * as net_mod from "std:network"
@@ -122,8 +127,8 @@ fn net_respond_consumes_request() {
         try
           let server = Net.listen(addr: "127.0.0.1:0")
           let req = Net.accept(server: &server)
-          Net.respond(req: req, status: 200, body: "ok")
           Net.stop(server: server)
+          Net.respond(req: req, status: 200, body: "ok")
         catch e ->
           return ()
         end
@@ -137,6 +142,9 @@ fn net_respond_consumes_request() {
 #[test]
 fn net_request_double_respond_is_rejected() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // Hole-2 (issue nexus-7eex.2): server must be closed before the first
+    // throwable `Net.respond` call to avoid the cross-throwable leak. The
+    // double-respond on the linear `req` is then the dominant error.
     let err = should_fail_typecheck(
         r#"
     import { Net }, * as net_mod from "std:network"
@@ -146,9 +154,9 @@ fn net_request_double_respond_is_rejected() {
         try
           let server = Net.listen(addr: "127.0.0.1:0")
           let req = Net.accept(server: &server)
-          Net.respond(req: req, status: 200, body: "ok")
-          Net.respond(req: req, status: 200, body: "ok")
           Net.stop(server: server)
+          Net.respond(req: req, status: 200, body: "ok")
+          Net.respond(req: req, status: 200, body: "ok")
         catch e ->
           return ()
         end
