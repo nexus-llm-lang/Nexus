@@ -80,6 +80,7 @@ pub enum TokenKind {
     // Boolean
     AndAnd, // &&
     OrOr,   // ||
+    Bang,   // !  (prefix not)
 
     // Assignment
     Assign, // <-
@@ -702,11 +703,7 @@ impl Lexer {
                             TokenKind::Ne
                         }
                     } else {
-                        self.errors.push(LexError {
-                            message: format!("unexpected character '!'"),
-                            span: start..self.pos,
-                        });
-                        continue;
+                        TokenKind::Bang
                     }
                 }
                 '<' => {

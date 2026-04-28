@@ -173,6 +173,9 @@ impl TypeChecker {
                 self.collect_unused_local_variable_warnings_in_expr(lhs);
                 self.collect_unused_local_variable_warnings_in_expr(rhs);
             }
+            Expr::UnaryOp(_, operand) => {
+                self.collect_unused_local_variable_warnings_in_expr(operand);
+            }
             Expr::Call { args, .. } => {
                 for (_, arg) in args {
                     self.collect_unused_local_variable_warnings_in_expr(arg);
@@ -449,6 +452,7 @@ fn collect_signature_needs_from_expr(
             unknown |= rhs_unknown;
             (reqs, effs, unknown)
         }
+        Expr::UnaryOp(_, operand) => collect_signature_needs_from_expr(operand, env),
         Expr::Constructor(_, args) => {
             let mut reqs = HashSet::new();
             let mut effs = HashSet::new();
@@ -571,6 +575,7 @@ fn expr_mentions_name(expr: &Spanned<Expr>, target: &str) -> bool {
         Expr::BinaryOp(lhs, _, rhs) | Expr::Index(lhs, rhs) => {
             expr_mentions_name(lhs, target) || expr_mentions_name(rhs, target)
         }
+        Expr::UnaryOp(_, operand) => expr_mentions_name(operand, target),
         Expr::Constructor(_, args) => args.iter().any(|(_, arg)| expr_mentions_name(arg, target)),
         Expr::Record(fields) => fields
             .iter()
@@ -709,6 +714,7 @@ fn collect_used_variable_keys_in_expr(expr: &Spanned<Expr>, out: &mut HashSet<St
             collect_used_variable_keys_in_expr(lhs, out);
             collect_used_variable_keys_in_expr(rhs, out);
         }
+        Expr::UnaryOp(_, operand) => collect_used_variable_keys_in_expr(operand, out),
         Expr::Constructor(_, args) => {
             for (_, arg) in args {
                 collect_used_variable_keys_in_expr(arg, out);
@@ -806,6 +812,7 @@ fn collect_local_let_bindings_in_expr(expr: &Spanned<Expr>, out: &mut Vec<(Strin
             collect_local_let_bindings_in_expr(lhs, out);
             collect_local_let_bindings_in_expr(rhs, out);
         }
+        Expr::UnaryOp(_, operand) => collect_local_let_bindings_in_expr(operand, out),
         Expr::Call { args, .. } => {
             for (_, arg) in args {
                 collect_local_let_bindings_in_expr(arg, out);

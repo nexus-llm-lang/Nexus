@@ -1010,7 +1010,7 @@ impl Parser {
     const CONS_PREC: u8 = 4;
 
     fn parse_prec_expr(&mut self, min_prec: u8) -> Result<Spanned<Expr>, ParseError> {
-        let mut lhs = self.parse_postfix_expr()?;
+        let mut lhs = self.parse_unary_expr()?;
 
         loop {
             // :: (cons) — right-associative, desugars to Cons(v: lhs, rest: rhs)
@@ -1046,6 +1046,28 @@ impl Parser {
         }
 
         Ok(lhs)
+    }
+
+    /// Prefix unary: `-`, `-.`, `!`. Right-associative; binds tighter than
+    /// every infix binary operator and looser than postfix `.field` / `[idx]`.
+    fn parse_unary_expr(&mut self) -> Result<Spanned<Expr>, ParseError> {
+        let start = self.peek_span().start;
+        let op = match self.peek() {
+            TokenKind::Minus => Some(UnaryOp::Neg),
+            TokenKind::MinusDot => Some(UnaryOp::FNeg),
+            TokenKind::Bang => Some(UnaryOp::Not),
+            _ => None,
+        };
+        if let Some(op) = op {
+            self.advance();
+            let operand = self.parse_unary_expr()?;
+            let end = operand.span.end;
+            return Ok(Spanned {
+                node: Expr::UnaryOp(op, Box::new(operand)),
+                span: start..end,
+            });
+        }
+        self.parse_postfix_expr()
     }
 
     fn parse_postfix_expr(&mut self) -> Result<Spanned<Expr>, ParseError> {
@@ -1397,16 +1419,6 @@ impl Parser {
                         span: start..end,
                     })
                 }
-            }
-
-            // Negative number as atom (when preceded by minus as prefix, not binary)
-            TokenKind::Minus => {
-                let lit = self.parse_literal()?;
-                let end = self.tokens[self.pos - 1].span.end;
-                Ok(Spanned {
-                    node: Expr::Literal(lit),
-                    span: start..end,
-                })
             }
 
             _ => Err(ParseError {

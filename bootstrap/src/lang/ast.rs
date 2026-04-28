@@ -79,6 +79,8 @@ pub enum Expr {
     Variable(RdrName, Sigil),
     // Binary operations (e.g. +, -) are allowed in expressions
     BinaryOp(Box<Spanned<Expr>>, BinaryOp, Box<Spanned<Expr>>),
+    // Prefix unary operations: -, -., !
+    UnaryOp(UnaryOp, Box<Spanned<Expr>>),
     Borrow(String, Sigil), // borrow %x
     // Function calls
     Call {

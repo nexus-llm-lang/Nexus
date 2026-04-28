@@ -1,5 +1,7 @@
 use crate::harness::{should_fail_parse, should_typecheck};
-use nexus::lang::ast::{CatchArm, Expr, Pattern, RdrName, Sigil, Stmt, TopLevel, Type};
+use nexus::lang::ast::{
+    BinaryOp, CatchArm, Expr, Literal, Pattern, RdrName, Sigil, Stmt, TopLevel, Type, UnaryOp,
+};
 use nexus::lang::parser;
 use std::fs;
 
@@ -897,4 +899,157 @@ fn parse_exception_group_def() {
         .unwrap();
     assert_eq!(eg.name, "IOError");
     assert_eq!(eg.members, vec!["NotFound", "PermDenied"]);
+}
+
+// ─── Unary operator parsing (nexus-4f42) ────────────────────────────────────
+
+/// Pull the value expression of `let main = ... let x = <EXPR>` from a parsed
+/// program. Used by the unary-precedence tests below.
+fn first_let_init<'a>(program: &'a nexus::lang::ast::Program) -> &'a Expr {
+    for def in &program.definitions {
+        let TopLevel::Let(gl) = &def.node else { continue };
+        let Expr::Lambda { body, .. } = &gl.value.node else { continue };
+        for stmt in body {
+            if let Stmt::Let { value, .. } = &stmt.node {
+                return &value.node;
+            }
+        }
+    }
+    panic!("no `let x = …` in main")
+}
+
+#[test]
+fn parse_unary_neg_var() {
+    let src = r#"
+    let main = fn () -> unit do
+        let y = 5
+        let x = -y
+        return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    // First let init is `5`; second is `-y`. Walk to the second.
+    let main_def = program
+        .definitions
+        .iter()
+        .find_map(|d| {
+            if let TopLevel::Let(gl) = &d.node {
+                Some(gl)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let Expr::Lambda { body, .. } = &main_def.value.node else {
+        panic!("main not lambda");
+    };
+    let second = match &body[1].node {
+        Stmt::Let { value, .. } => &value.node,
+        _ => panic!(),
+    };
+    let Expr::UnaryOp(op, inner) = second else {
+        panic!("expected UnaryOp, got {:?}", second);
+    };
+    assert_eq!(*op, UnaryOp::Neg);
+    assert!(matches!(
+        inner.node,
+        Expr::Variable(RdrName::Unqual(ref n), _) if n == "y"
+    ));
+}
+
+#[test]
+fn parse_unary_neg_binds_tighter_than_mul() {
+    // `-x * y` must parse as `(-x) * y`, i.e. BinaryOp(UnaryOp(Neg, x), Mul, y).
+    let src = r#"
+    let main = fn () -> unit do
+        let x = 0
+        let y = 0
+        let r = -x * y
+        return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let main_def = program
+        .definitions
+        .iter()
+        .find_map(|d| {
+            if let TopLevel::Let(gl) = &d.node {
+                Some(gl)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let Expr::Lambda { body, .. } = &main_def.value.node else {
+        panic!()
+    };
+    let third = match &body[2].node {
+        Stmt::Let { value, .. } => &value.node,
+        _ => panic!(),
+    };
+    let Expr::BinaryOp(lhs, op, _rhs) = third else {
+        panic!("expected BinaryOp at the top, got {:?}", third)
+    };
+    assert_eq!(*op, BinaryOp::Mul);
+    assert!(matches!(lhs.node, Expr::UnaryOp(UnaryOp::Neg, _)));
+}
+
+#[test]
+fn parse_unary_not_binds_tighter_than_andand() {
+    // `!a && b` must parse as `(!a) && b`.
+    let src = r#"
+    let main = fn () -> unit do
+        let a = true
+        let b = false
+        let r = !a && b
+        return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let v = first_let_init(&program);
+    // Walk past the first two lets to find `r`.
+    let main_def = program
+        .definitions
+        .iter()
+        .find_map(|d| {
+            if let TopLevel::Let(gl) = &d.node {
+                Some(gl)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let Expr::Lambda { body, .. } = &main_def.value.node else {
+        panic!()
+    };
+    let third = match &body[2].node {
+        Stmt::Let { value, .. } => &value.node,
+        _ => panic!(),
+    };
+    let Expr::BinaryOp(lhs, op, _rhs) = third else {
+        panic!("expected BinaryOp at the top")
+    };
+    assert_eq!(*op, BinaryOp::And);
+    assert!(matches!(lhs.node, Expr::UnaryOp(UnaryOp::Not, _)));
+    let _ = v; // silence unused
+}
+
+#[test]
+fn parse_unary_neg_int_literal() {
+    // `let x = -1` must parse as UnaryOp(Neg, Literal(1)). The literal stays
+    // positive in the AST; constant folding to a negative literal happens in
+    // lir_opt later. (Was previously a parser-level fold via parse_neg_literal.)
+    let src = r#"
+    let main = fn () -> unit do
+        let x = -1
+        return ()
+    end
+    "#;
+    let program = parser::parser().parse(src).unwrap();
+    let v = first_let_init(&program);
+    let Expr::UnaryOp(op, inner) = v else {
+        panic!("expected UnaryOp, got {:?}", v);
+    };
+    assert_eq!(*op, UnaryOp::Neg);
+    assert!(matches!(inner.node, Expr::Literal(Literal::Int(1))));
 }
