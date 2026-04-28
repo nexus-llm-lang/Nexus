@@ -197,6 +197,9 @@ fn collect_expr_captures(
             collect_expr_captures(lhs, outer_keys, bound_keys, bound_call_names, captures);
             collect_expr_captures(rhs, outer_keys, bound_keys, bound_call_names, captures);
         }
+        Expr::UnaryOp(_, operand) => {
+            collect_expr_captures(operand, outer_keys, bound_keys, bound_call_names, captures);
+        }
         Expr::Call { func, args, .. } => {
             let func = func.as_dotted();
             if !func.contains('.')

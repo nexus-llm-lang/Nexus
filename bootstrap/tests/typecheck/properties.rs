@@ -32,7 +32,14 @@ proptest! {
         // Avoid NaN/Inf which have non-standard display
         n in -1e10f64..1e10f64
     ) {
+        // Per the unary-operator spec (nexus-4f42): `-` is i64 negation,
+        // `-.` is f64 negation. So a negative float literal must be
+        // emitted as `-.N.M`, not `-N.M`.
         let s = format!("{:.6}", n);
+        let s = match s.strip_prefix('-') {
+            Some(rest) => format!("-.{}", rest),
+            None => s,
+        };
         let src = format!("let main = fn () -> unit do\n    let x: f64 = {s}\n    return ()\nend\n");
         should_typecheck(&src);
         exec(&src);

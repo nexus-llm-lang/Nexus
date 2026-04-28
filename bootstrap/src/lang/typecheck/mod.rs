@@ -1392,6 +1392,36 @@ impl TypeChecker {
                     }
                 }
             }
+            Expr::UnaryOp(op, operand) => {
+                let (s1, t) = self.infer(env, operand, er, eq, ee)?;
+                let mut s = s1;
+                let target = match op {
+                    UnaryOp::Neg => {
+                        let lt = apply_subst_type(&s, &t);
+                        select_int_type(&lt, &lt).ok_or_else(|| {
+                            TypeError::new(
+                                format!("'-' expects i32/i64, got {}", lt),
+                                e.span.clone(),
+                            )
+                        })?
+                    }
+                    UnaryOp::FNeg => {
+                        let lt = apply_subst_type(&s, &t);
+                        select_float_type(&lt, &lt).ok_or_else(|| {
+                            TypeError::new(
+                                format!("'-.' expects f32/f64, got {}", lt),
+                                e.span.clone(),
+                            )
+                        })?
+                    }
+                    UnaryOp::Not => Type::Bool,
+                };
+                let s2 = self
+                    .unify(&apply_subst_type(&s, &t), &target)
+                    .map_err(|m| TypeError::new(m, operand.span.clone()))?;
+                s = compose_subst(&s, &s2);
+                Ok((s, target))
+            }
             Expr::Borrow(n, s) => {
                 if let Some(sch) = env.get(&s.get_key(n)).cloned() {
                     let t = self.instantiate(&sch);

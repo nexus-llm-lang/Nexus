@@ -775,6 +775,29 @@ impl MirBuilder {
                         Expr::Literal(lit) => {
                             self.global_constants.insert(name.clone(), lit.clone());
                         }
+                        // Unary on a literal at top scope is constant-foldable
+                        // (`let X = -1` / `let Y = -.3.14` / `let B = !true`).
+                        // Fold here so existing top-level negative-int / negated-bool
+                        // constants keep working after parse_neg_literal removal.
+                        Expr::UnaryOp(op, operand) => {
+                            if let Expr::Literal(lit) = &operand.node {
+                                let folded = match (op, lit) {
+                                    (UnaryOp::Neg, Literal::Int(n)) => Some(Literal::Int(-n)),
+                                    (UnaryOp::FNeg, Literal::Float(f)) => Some(Literal::Float(-f)),
+                                    (UnaryOp::Not, Literal::Bool(b)) => Some(Literal::Bool(!b)),
+                                    _ => None,
+                                };
+                                if let Some(folded) = folded {
+                                    self.global_constants.insert(name.clone(), folded);
+                                    continue;
+                                }
+                            }
+                            return Err(HirBuildError::UnsupportedTopLevelLet {
+                                name: gl.name.clone(),
+                                source_file: self.current_source_file.clone(),
+                                span: gl.value.span.clone(),
+                            });
+                        }
                         _ => {
                             return Err(HirBuildError::UnsupportedTopLevelLet {
                                 name: gl.name.clone(),
@@ -1300,6 +1323,29 @@ impl MirBuilder {
                 *op,
                 Box::new(self.convert_expr(rhs, rename_map, scope)?),
             )),
+            Expr::UnaryOp(op, operand) => {
+                // Desugar at AST→MIR boundary: codegen / LIR opt see only
+                // BinaryOp. Mirrors src/ir/mir.nx.
+                let inner = self.convert_expr(operand, rename_map, scope)?;
+                let lowered = match op {
+                    UnaryOp::Neg => MirExpr::BinaryOp(
+                        Box::new(MirExpr::Literal(Literal::Int(0))),
+                        BinaryOp::Sub,
+                        Box::new(inner),
+                    ),
+                    UnaryOp::FNeg => MirExpr::BinaryOp(
+                        Box::new(MirExpr::Literal(Literal::Float(0.0))),
+                        BinaryOp::FSub,
+                        Box::new(inner),
+                    ),
+                    UnaryOp::Not => MirExpr::BinaryOp(
+                        Box::new(inner),
+                        BinaryOp::Eq,
+                        Box::new(MirExpr::Literal(Literal::Bool(false))),
+                    ),
+                };
+                Ok(lowered)
+            }
             Expr::Borrow(name, _sigil) => {
                 Ok(MirExpr::Borrow(Symbol::from(self.rename(name, rename_map))))
             }
@@ -1867,6 +1913,9 @@ fn collect_ast_expr_refs(
         Expr::BinaryOp(lhs, _, rhs) => {
             collect_ast_expr_refs(&lhs.node, defined, referenced, seen, known);
             collect_ast_expr_refs(&rhs.node, defined, referenced, seen, known);
+        }
+        Expr::UnaryOp(_, operand) => {
+            collect_ast_expr_refs(&operand.node, defined, referenced, seen, known);
         }
         Expr::Call { func, args } => {
             let func = func.as_dotted();

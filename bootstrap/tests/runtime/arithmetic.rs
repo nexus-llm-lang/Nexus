@@ -89,6 +89,85 @@ end
     );
 }
 
+#[test]
+fn codegen_prefix_unary_neg_i64() {
+    // Cover all spec acceptance shapes: -INT literal, -var, -(expr), -call().
+    exec(
+        r#"
+let one = fn () -> i64 do return 1 end
+
+let main = fn () -> unit do
+    let lit = -1
+    if lit != 0 - 1 then raise RuntimeError(val: "neg literal") end
+
+    let y = 5
+    let nv = -y
+    if nv != 0 - 5 then raise RuntimeError(val: "neg var") end
+
+    let z = -(y + 2)
+    if z != 0 - 7 then raise RuntimeError(val: "neg parens") end
+
+    let c = -one()
+    if c != 0 - 1 then raise RuntimeError(val: "neg call") end
+
+    // Precedence: -x * y must be (-x) * y, not -(x * y).
+    let prec = -y * 2
+    if prec != 0 - 10 then raise RuntimeError(val: "unary prec vs *") end
+
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_prefix_unary_fneg_f64() {
+    exec_with_stdlib(
+        r#"
+import { abs_float } from "std:math"
+
+let close = fn (a: f64, b: f64) -> bool do
+    let d = a -. b
+    return abs_float(val: d) <. 0.0001
+end
+
+let main = fn () -> unit do
+    let x = 3.5
+    let y = -.x
+    if !close(a: y, b: 0.0 -. 3.5) then raise RuntimeError(val: "fneg var") end
+
+    let lit = -.1.5
+    if !close(a: lit, b: 0.0 -. 1.5) then raise RuntimeError(val: "fneg lit") end
+
+    let parens = -.(x +. 1.0)
+    if !close(a: parens, b: 0.0 -. 4.5) then raise RuntimeError(val: "fneg parens") end
+
+    return ()
+end
+"#,
+    );
+}
+
+#[test]
+fn codegen_prefix_unary_not_bool() {
+    exec(
+        r#"
+let main = fn () -> unit do
+    let t = true
+    if !t then raise RuntimeError(val: "!true should be false") end
+
+    let f = false
+    if !!f then raise RuntimeError(val: "!!false should be false") end
+
+    // Precedence: !a && b must be (!a) && b.
+    if !t && true then raise RuntimeError(val: "(!true) && true should be false") end
+
+    return ()
+end
+"#,
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 64,

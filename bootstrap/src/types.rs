@@ -292,6 +292,28 @@ impl std::fmt::Display for BinaryOp {
     }
 }
 
+/// Prefix unary operators. Mirrors `UnaryOp` in src/common/ast.nx.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaryOp {
+    /// `-x` — i64 negation.
+    Neg,
+    /// `-.x` — f64 negation.
+    FNeg,
+    /// `!x` — bool not.
+    Not,
+}
+
+impl std::fmt::Display for UnaryOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            UnaryOp::Neg => "-",
+            UnaryOp::FNeg => "-.",
+            UnaryOp::Not => "!",
+        };
+        write!(f, "{}", s)
+    }
+}
+
 impl BinaryOp {
     pub fn is_comparison(self) -> bool {
         matches!(
