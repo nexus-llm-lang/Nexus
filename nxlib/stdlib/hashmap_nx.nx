@@ -1,0 +1,142 @@
+/**
+ * hashmap_nx: pure-Nexus i64→i64 HashMapNx, parallel impl to `std:hashmap`.
+ *
+ * Same surface (insert / get / remove / size / iter / free / linear
+ * handle threading) as the FFI-backed `std:hashmap`, but the storage
+ * lives entirely in linear memory: opaque handle is the address of an
+ * open-addressed table header allocated via `std:wasm_alloc`.  See
+ * `std:collection_table` for the table layout and probing strategy.
+ *
+ * ── Co-existence with std:hashmap ─────────────────────────────────────
+ * The Rust-backed `std:hashmap` (FFI thread_local pool) is intentionally
+ * kept on the bootstrap path; this module is the self-host path's
+ * pure-Nexus alternative.  Both expose the same opaque-linear-handle
+ * discipline so client code can switch by changing one import line.
+ *
+ * ── Linear-handle invariant ───────────────────────────────────────────
+ * `HashMapNx` is opaque + linear: every public function either returns a
+ * %HashMapNx (transferring ownership) or borrows &HashMapNx.  Callers must
+ * thread the handle through their pipeline and end with `free`, which
+ * consumes it.  This mirrors `nxlib/stdlib/hashmap.nx` exactly.
+ */
+import * as ct from "std:collection_table"
+
+/// An opaque hash map handle (linear — must be freed).
+export opaque type HashMapNx = HashMapNx(addr: i64)
+
+/// Result of a key lookup: Found with a value, or Missing.
+export type IntLookup = IntFound(value: i64) | IntMissing
+
+/// Raised by `get_unchecked` when the queried key is not in the map.
+/// Distinct from `stringmap_nx.StrKeyNotFound` so a `try ... catch`
+/// can disambiguate which module raised.
+export exception IntKeyNotFound(op: string, key: i64)
+
+// ─── Public API ───────────────────────────────────────────────────────
+
+/// Creates an empty hash map.
+export let empty = fn () -> %HashMapNx throws { Exn } do
+  let addr = ct.new_table(kind: ct.kind_int())
+  let m = HashMapNx(addr)
+  let %lm = m
+  return %lm
+end
+
+/// Inserts or updates a key-value pair. Consumes and returns the map.
+export let put = fn (map: %HashMapNx, key: i64, value: i64) -> %HashMapNx throws { Exn } do
+  let HashMapNx(addr) = map
+  let _ = ct.put_int(h: addr, key, val: value)
+  let m = HashMapNx(addr)
+  let %lm = m
+  return %lm
+end
+
+/// Looks up a key, returning IntFound(value) or IntMissing.
+export let get = fn (map: &HashMapNx, key: i64) -> IntLookup throws { Exn } do
+  let HashMapNx(addr) = map
+  if ct.has_int(h: addr, key) then
+    let v = ct.get_int_or(h: addr, key, default_val: 0)
+    return IntFound(value: v)
+  end
+  return IntMissing
+end
+
+/// Looks up a key, returning the value or `default` if missing.
+export let get_or = fn (map: &HashMapNx, key: i64, default: i64) -> i64 throws { Exn } do
+  let HashMapNx(addr) = map
+  return ct.get_int_or(h: addr, key, default_val: default)
+end
+
+/// Partial: looks up `key`, raising `IntKeyNotFound` when absent.  Use the
+/// safe `get`/`get_or` paths unless the caller has a domain-specific
+/// reason to surface a specific exception (acceptance criterion 3).
+export let get_unchecked = fn (map: &HashMapNx, key: i64) -> i64 throws { Exn } do
+  let HashMapNx(addr) = map
+  if ct.has_int(h: addr, key) then
+    return ct.get_int_or(h: addr, key, default_val: 0)
+  end
+  raise IntKeyNotFound(op: "hashmap_nx.get_unchecked", key)
+end
+
+/// Returns true if the map contains the given key.
+export let contains_key = fn (map: &HashMapNx, key: i64) -> bool throws { Exn } do
+  let HashMapNx(addr) = map
+  return ct.has_int(h: addr, key)
+end
+
+/// Removes a key. Consumes and returns the map.  Removing a missing
+/// key is a no-op.
+export let remove = fn (map: %HashMapNx, key: i64) -> %HashMapNx throws { Exn } do
+  let HashMapNx(addr) = map
+  let _ = ct.remove_int(h: addr, key)
+  let m = HashMapNx(addr)
+  let %lm = m
+  return %lm
+end
+
+/// Returns the number of entries in the map.
+export let size = fn (map: &HashMapNx) -> i64 do
+  let HashMapNx(addr) = map
+  return ct.table_size(h: addr)
+end
+
+// ─── Iteration ────────────────────────────────────────────────────────
+
+let collect_keys_go = fn (addr: i64, slot_idx: i64, acc: [ i64 ]) -> [ i64 ] do
+  let capv = ct.table_cap(h: addr)
+  let next = ct.iter_next(h: addr, slot_idx)
+  if next >= capv then return acc end
+  let k = ct.iter_key_int(h: addr, slot_idx: next)
+  return collect_keys_go(addr, slot_idx: next + 1, acc: k :: acc)
+end
+
+let collect_vals_go = fn (addr: i64, slot_idx: i64, acc: [ i64 ]) -> [ i64 ] do
+  let capv = ct.table_cap(h: addr)
+  let next = ct.iter_next(h: addr, slot_idx)
+  if next >= capv then return acc end
+  let v = ct.iter_val(h: addr, slot_idx: next)
+  return collect_vals_go(addr, slot_idx: next + 1, acc: v :: acc)
+end
+
+/// Returns a list of all keys (no defined order).
+export let keys = fn (map: &HashMapNx) -> [ i64 ] do
+  let HashMapNx(addr) = map
+  return collect_keys_go(addr, slot_idx: 0, acc: [])
+end
+
+/// Returns a list of all values (no defined order; same iteration order
+/// as `keys` so positional pairs are correlated).
+export let values = fn (map: &HashMapNx) -> [ i64 ] do
+  let HashMapNx(addr) = map
+  return collect_vals_go(addr, slot_idx: 0, acc: [])
+end
+
+/// Frees the map. Consumes the linear handle.  Note: the bump
+/// allocator backing the table has no per-block free, so the storage
+/// is not reclaimed individually — use `wasm_alloc.mark`/`reset` at
+/// program scope for region-style reclamation.
+export let free = fn (map: %HashMapNx) -> unit do
+  let HashMapNx(addr) = map
+  let _ = addr
+  return ()
+end

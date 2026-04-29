@@ -1,0 +1,203 @@
+/**
+ * bytebuffer_nx: pure-Nexus mutable byte buffer, parallel impl to `std:bytebuffer`.
+ *
+ * Storage is a contiguous run of bytes in linear memory, allocated
+ * through `std:wasm_alloc` and accessed via `std:runtime_mem`
+ * load_u8 / store_u8.  Surface covers the core read/write subset of
+ * `std:bytebuffer` (push_byte / push_bytes / push_string / length /
+ * get_byte / to_string / free); host-bound operations (write_file,
+ * read_stdin, push_buf-from-FFI-id) live exclusively on the FFI side.
+ *
+ * ── Memory layout ─────────────────────────────────────────────────────
+ * Header (24 bytes) at the address wrapped by ByteBufferNx:
+ *   +0  capv      (i64) — current data buffer capacity in bytes
+ *   +8  len      (i64) — used byte count (0 ≤ len ≤ capv)
+ *   +16 data_ptr (i64) — base address of the data buffer
+ *
+ * ── Growth policy ─────────────────────────────────────────────────────
+ * Initial capv = 16.  When `len + delta > capv`, allocate a new buffer of
+ * size `max(2 * capv, len + delta)`, copy bytes [0..len), update
+ * `data_ptr` and `capv`.  The old data buffer is leaked (bump alloc has
+ * no per-block free); program-scope reclamation flows through
+ * `wasm_alloc.mark/reset`.
+ *
+ * ── Linear-handle invariant ───────────────────────────────────────────
+ * Every consuming op returns %ByteBufferNx; reads borrow &ByteBufferNx.
+ * Mirrors `std:bytebuffer`'s linear handle threading pattern.
+ */
+import * as alloc from "std:wasm_alloc"
+import * as mem from "std:runtime_mem"
+import { byte_at, byte_length } from "std:str"
+import { ord } from "std:char"
+
+/// An opaque byte buffer handle (linear — must be freed).
+export opaque type ByteBufferNx = ByteBufferNx(addr: i64)
+
+/// Raised by `get_byte_unchecked` when `idx` is outside `[0, len)`.
+/// `get_byte` itself returns -1 on OOB (parity with the FFI impl).
+/// Named distinct from `list.IndexOutOfBounds` to avoid catch-arm
+/// ambiguity.
+export exception BufferIndexOutOfBounds(op: string, index: i64, length: i64)
+
+let header_bytes = fn () -> i64 do return 24 end
+let initial_cap = fn () -> i64 do return 16 end
+
+let load_cap = fn (h: i64) -> i64 do return mem.load_i64(addr: h) end
+let store_cap = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h, val: v) end
+
+let load_len = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 8) end
+let store_len = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 8, val: v) end
+
+let load_data = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 16) end
+let store_data = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 16, val: v) end
+
+let copy_bytes_go = fn (src: i64, dst: i64, n: i64, i: i64) -> unit do
+  if i >= n then return () end
+  let b = mem.load_u8(addr: src + i)
+  let _ = mem.store_u8(addr: dst + i, val: b)
+  return copy_bytes_go(src, dst, n, i: i + 1)
+end
+
+let max_i64 = fn (a: i64, b: i64) -> i64 do
+  if a > b then return a end
+  return b
+end
+
+let ensure_capacity = fn (h: i64, need: i64) -> unit throws { Exn } do
+  let capv = load_cap(h)
+  if need <= capv then return () end
+  let len = load_len(h)
+  let new_cap = max_i64(a: capv * 2, b: need)
+  let new_data = alloc.allocate(size: new_cap)
+  let old_data = load_data(h)
+  let _ = copy_bytes_go(src: old_data, dst: new_data, n: len, i: 0)
+  let _ = store_cap(h, v: new_cap)
+  let _ = store_data(h, v: new_data)
+  return ()
+end
+
+// ─── Public API ───────────────────────────────────────────────────────
+
+/// Creates an empty buffer (capv = 16, len = 0).
+export let empty = fn () -> %ByteBufferNx throws { Exn } do
+  let h = alloc.allocate(size: header_bytes())
+  let capv = initial_cap()
+  let data = alloc.allocate(size: capv)
+  let _ = store_cap(h, v: capv)
+  let _ = store_len(h, v: 0)
+  let _ = store_data(h, v: data)
+  let b = ByteBufferNx(addr: h)
+  let %lb = b
+  return %lb
+end
+
+/// Appends a single byte (0-255). Consumes and returns the buffer.
+export let push_byte = fn (buf: %ByteBufferNx, byte: i64) -> %ByteBufferNx throws { Exn } do
+  let ByteBufferNx(addr) = buf
+  let len = load_len(h: addr)
+  let _ = ensure_capacity(h: addr, need: len + 1)
+  let data = load_data(h: addr)
+  let _ = mem.store_u8(addr: data + len, val: byte)
+  let _ = store_len(h: addr, v: len + 1)
+  let b = ByteBufferNx(addr)
+  let %lb = b
+  return %lb
+end
+
+/// Appends a list of bytes in order. Consumes and returns the buffer.
+export let push_bytes = fn (buf: %ByteBufferNx, bytes: [ i64 ]) -> %ByteBufferNx throws { Exn } do
+  match bytes do
+    | [] -> return buf
+    | b :: rest ->
+      let %buf2 = push_byte(%buf, byte: b)
+      return push_bytes(buf: %buf2, bytes: rest)
+  end
+end
+
+let push_string_go = fn (addr: i64, s: string, n: i64, i: i64) -> unit throws { Exn } do
+  if i >= n then return () end
+  let len = load_len(h: addr)
+  let _ = ensure_capacity(h: addr, need: len + 1)
+  let data = load_data(h: addr)
+  let c = byte_at(s, idx: i)
+  let b = ord(c)
+  let _ = mem.store_u8(addr: data + len, val: b)
+  let _ = store_len(h: addr, v: len + 1)
+  return push_string_go(addr, s, n, i: i + 1)
+end
+
+/// Appends raw UTF-8 bytes of `s`.  Consumes and returns the buffer.
+export let push_string = fn (buf: %ByteBufferNx, s: string) -> %ByteBufferNx throws { Exn } do
+  let ByteBufferNx(addr) = buf
+  let n = byte_length(s)
+  let _ = ensure_capacity(h: addr, need: load_len(h: addr) + n)
+  let _ = push_string_go(addr, s, n, i: 0)
+  let b = ByteBufferNx(addr)
+  let %lb = b
+  return %lb
+end
+
+/// Returns the number of bytes in the buffer.
+export let length = fn (buf: &ByteBufferNx) -> i64 do
+  let ByteBufferNx(addr) = buf
+  return load_len(h: addr)
+end
+
+/// Returns the byte at `idx`, or -1 when out of bounds.  Mirrors the
+/// FFI impl's "missing returns -1" convention — callers wanting an
+/// exception use `get_byte_unchecked`.
+export let get_byte = fn (buf: &ByteBufferNx, idx: i64) -> i64 do
+  let ByteBufferNx(addr) = buf
+  let len = load_len(h: addr)
+  if idx < 0 then return -1 end
+  if idx >= len then return -1 end
+  let data = load_data(h: addr)
+  return mem.load_u8(addr: data + idx)
+end
+
+/// Partial: returns the byte at `idx`, raising `IndexOutOfBounds`
+/// when outside [0, len) (acceptance criterion 3).
+export let get_byte_unchecked = fn (buf: &ByteBufferNx, idx: i64) -> i64 throws { Exn } do
+  let ByteBufferNx(addr) = buf
+  let len = load_len(h: addr)
+  if idx < 0 || idx >= len then
+    raise BufferIndexOutOfBounds(op: "bytebuffer_nx.get_byte_unchecked", index: idx, length: len)
+  end
+  let data = load_data(h: addr)
+  return mem.load_u8(addr: data + idx)
+end
+
+/// Interprets buffer contents as a UTF-8 string.  Allocates a fresh
+/// Nexus string by reading bytes through `wasm_alloc.read_string`
+/// (which goes through `runtime_mem.load_u8`).
+export let to_string = fn (buf: &ByteBufferNx) -> string throws { Exn } do
+  let ByteBufferNx(addr) = buf
+  let len = load_len(h: addr)
+  if len == 0 then return "" end
+  let data = load_data(h: addr)
+  return alloc.read_string(ptr: data, len)
+end
+
+/// Truncates to `new_len` bytes.  No-op if `new_len >= length`.  Negative
+/// `new_len` raises IndexOutOfBounds (matches the partial-function policy).
+export let truncate = fn (buf: %ByteBufferNx, new_len: i64) -> %ByteBufferNx throws { Exn } do
+  let ByteBufferNx(addr) = buf
+  if new_len < 0 then
+    raise BufferIndexOutOfBounds(op: "bytebuffer_nx.truncate", index: new_len, length: load_len(h: addr))
+  end
+  let cur = load_len(h: addr)
+  if new_len < cur then
+    let _ = store_len(h: addr, v: new_len)
+  end
+  let b = ByteBufferNx(addr)
+  let %lb = b
+  return %lb
+end
+
+/// Frees the buffer. Consumes the linear handle.  See the module
+/// docstring for the bump-alloc reclamation note.
+export let free = fn (buf: %ByteBufferNx) -> unit do
+  let ByteBufferNx(addr) = buf
+  let _ = addr
+  return ()
+end

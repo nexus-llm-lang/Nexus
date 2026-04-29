@@ -744,3 +744,47 @@ fn string_pure_nexus_acceptance() {
         );
     }
 }
+
+/// nexus-dvr6.9.5 acceptance: pure-Nexus collection rewrites
+/// (`hashmap_nx`, `set_nx`, `stringmap_nx`, `bytebuffer_nx`) backed by
+/// the open-addressed `collection_table` over `wasm_alloc` +
+/// `runtime_mem`.  Ten cases drive insert/get/remove, growth across
+/// the load-factor threshold, set algebra, partial-function exception
+/// discipline (KeyNotFound / IndexOutOfBounds — never RuntimeError),
+/// and ByteBuffer push/grow/get round-trips.  Stdout is checked
+/// line-by-line to catch silently-dropped `nexus:runtime/memory`
+/// dispatch (same failure mode dvr6.9.2 protects against).
+#[test]
+fn collection_nx_parity_acceptance() {
+    let out = exec_nxc_core_capture_stdout(
+        "bootstrap/tests/fixtures/nxc/test_collection_nx_parity.nx",
+    );
+    let lines: Vec<&str> = out.lines().map(|l| l.trim()).collect();
+    let expected = [
+        "ok-hashmap-basic",
+        "ok-hashmap-grow",
+        "ok-hashmap-unchecked",
+        "ok-set-basic",
+        "ok-set-algebra",
+        "ok-stringmap-basic",
+        "ok-stringmap-grow",
+        "ok-bytebuffer-basic",
+        "ok-bytebuffer-grow",
+        "ok-bytebuffer-unchecked",
+    ];
+    assert_eq!(
+        lines.len(),
+        expected.len(),
+        "expected {} lines, got {} — full stdout:\n{}",
+        expected.len(),
+        lines.len(),
+        out
+    );
+    for (i, want) in expected.iter().enumerate() {
+        assert_eq!(
+            lines[i], *want,
+            "line {} mismatch: want {:?}, got {:?} — full stdout:\n{}",
+            i, want, lines[i], out
+        );
+    }
+}

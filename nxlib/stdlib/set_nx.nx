@@ -1,0 +1,167 @@
+/**
+ * set_nx: pure-Nexus i64 hash set, parallel impl to `std:set`.
+ *
+ * Backed by the open-addressed `std:collection_table` (KIND_INT) — sets
+ * are hash maps that ignore the value field; `insert(v)` puts `(v, 0)`.
+ * Surface mirrors `std:set`: insert / remove / contains / size /
+ * to_list / from_list / union / intersection / difference / free.
+ *
+ * Linear-handle discipline matches `std:set`: every consuming op
+ * returns a %SetNx, every read borrows &SetNx.  Set-algebra operations
+ * (union / intersection / difference) allocate fresh tables.
+ */
+import * as ct from "std:collection_table"
+
+/// An opaque hash set handle (linear — must be freed).
+export opaque type SetNx = SetNx(addr: i64)
+
+// ─── Public API ───────────────────────────────────────────────────────
+
+/// Creates an empty set.
+export let empty = fn () -> %SetNx throws { Exn } do
+  let addr = ct.new_table(kind: ct.kind_int())
+  let s = SetNx(addr)
+  let %ls = s
+  return %ls
+end
+
+/// Inserts a value. Consumes and returns the set.  Re-inserting an
+/// existing value is a no-op (size unchanged).
+export let insert = fn (set: %SetNx, val: i64) -> %SetNx throws { Exn } do
+  let SetNx(addr) = set
+  let _ = ct.put_int(h: addr, key: val, val: 0)
+  let s = SetNx(addr)
+  let %ls = s
+  return %ls
+end
+
+/// Returns true if `val` is in the set.
+export let contains = fn (set: &SetNx, val: i64) -> bool throws { Exn } do
+  let SetNx(addr) = set
+  return ct.has_int(h: addr, key: val)
+end
+
+/// Removes a value. Consumes and returns the set.  Removing absent
+/// value is a no-op.
+export let remove = fn (set: %SetNx, val: i64) -> %SetNx throws { Exn } do
+  let SetNx(addr) = set
+  let _ = ct.remove_int(h: addr, key: val)
+  let s = SetNx(addr)
+  let %ls = s
+  return %ls
+end
+
+/// Returns the number of elements.
+export let size = fn (set: &SetNx) -> i64 do
+  let SetNx(addr) = set
+  return ct.table_size(h: addr)
+end
+
+// ─── Iteration ────────────────────────────────────────────────────────
+
+let collect_go = fn (addr: i64, slot_idx: i64, acc: [ i64 ]) -> [ i64 ] do
+  let capv = ct.table_cap(h: addr)
+  let next = ct.iter_next(h: addr, slot_idx)
+  if next >= capv then return acc end
+  let v = ct.iter_key_int(h: addr, slot_idx: next)
+  return collect_go(addr, slot_idx: next + 1, acc: v :: acc)
+end
+
+/// Returns a list of all elements (iteration order undefined).
+export let to_list = fn (set: &SetNx) -> [ i64 ] do
+  let SetNx(addr) = set
+  return collect_go(addr, slot_idx: 0, acc: [])
+end
+
+let insert_list_go = fn (addr: i64, xs: [ i64 ]) -> unit throws { Exn } do
+  match xs do
+    | [] -> return ()
+    | v :: rest ->
+      let _ = ct.put_int(h: addr, key: v, val: 0)
+      return insert_list_go(addr, xs: rest)
+  end
+end
+
+/// Builds a fresh set from a list of values.  Duplicates collapse.
+export let from_list = fn (xs: [ i64 ]) -> %SetNx throws { Exn } do
+  let addr = ct.new_table(kind: ct.kind_int())
+  let _ = insert_list_go(addr, xs)
+  let s = SetNx(addr)
+  let %ls = s
+  return %ls
+end
+
+// ─── SetNx algebra ──────────────────────────────────────────────────────
+
+/// Copy every FILLED element of `src` (slot scan) into `dst`.
+let copy_into_go = fn (src_addr: i64, dst_addr: i64, slot_idx: i64) -> unit throws { Exn } do
+  let capv = ct.table_cap(h: src_addr)
+  let next = ct.iter_next(h: src_addr, slot_idx)
+  if next >= capv then return () end
+  let v = ct.iter_key_int(h: src_addr, slot_idx: next)
+  let _ = ct.put_int(h: dst_addr, key: v, val: 0)
+  return copy_into_go(src_addr, dst_addr, slot_idx: next + 1)
+end
+
+let intersect_into_go = fn (src_addr: i64, filter_addr: i64, dst_addr: i64, slot_idx: i64) -> unit throws { Exn } do
+  let capv = ct.table_cap(h: src_addr)
+  let next = ct.iter_next(h: src_addr, slot_idx)
+  if next >= capv then return () end
+  let v = ct.iter_key_int(h: src_addr, slot_idx: next)
+  if ct.has_int(h: filter_addr, key: v) then
+    let _ = ct.put_int(h: dst_addr, key: v, val: 0)
+  end
+  return intersect_into_go(src_addr, filter_addr, dst_addr, slot_idx: next + 1)
+end
+
+let diff_into_go = fn (src_addr: i64, filter_addr: i64, dst_addr: i64, slot_idx: i64) -> unit throws { Exn } do
+  let capv = ct.table_cap(h: src_addr)
+  let next = ct.iter_next(h: src_addr, slot_idx)
+  if next >= capv then return () end
+  let v = ct.iter_key_int(h: src_addr, slot_idx: next)
+  if !ct.has_int(h: filter_addr, key: v) then
+    let _ = ct.put_int(h: dst_addr, key: v, val: 0)
+  end
+  return diff_into_go(src_addr, filter_addr, dst_addr, slot_idx: next + 1)
+end
+
+/// Returns a fresh set containing every element in either operand.
+export let union = fn (left: &SetNx, right: &SetNx) -> %SetNx throws { Exn } do
+  let SetNx(addr: la) = left
+  let SetNx(addr: ra) = right
+  let dst = ct.new_table(kind: ct.kind_int())
+  let _ = copy_into_go(src_addr: la, dst_addr: dst, slot_idx: 0)
+  let _ = copy_into_go(src_addr: ra, dst_addr: dst, slot_idx: 0)
+  let s = SetNx(addr: dst)
+  let %ls = s
+  return %ls
+end
+
+/// Returns a fresh set with every element present in BOTH operands.
+export let intersection = fn (left: &SetNx, right: &SetNx) -> %SetNx throws { Exn } do
+  let SetNx(addr: la) = left
+  let SetNx(addr: ra) = right
+  let dst = ct.new_table(kind: ct.kind_int())
+  let _ = intersect_into_go(src_addr: la, filter_addr: ra, dst_addr: dst, slot_idx: 0)
+  let s = SetNx(addr: dst)
+  let %ls = s
+  return %ls
+end
+
+/// Returns elements of `left` not present in `right`.
+export let difference = fn (left: &SetNx, right: &SetNx) -> %SetNx throws { Exn } do
+  let SetNx(addr: la) = left
+  let SetNx(addr: ra) = right
+  let dst = ct.new_table(kind: ct.kind_int())
+  let _ = diff_into_go(src_addr: la, filter_addr: ra, dst_addr: dst, slot_idx: 0)
+  let s = SetNx(addr: dst)
+  let %ls = s
+  return %ls
+end
+
+/// Frees the set. Consumes the linear handle.
+export let free = fn (set: %SetNx) -> unit do
+  let SetNx(addr) = set
+  let _ = addr
+  return ()
+end

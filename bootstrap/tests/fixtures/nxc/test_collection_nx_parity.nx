@@ -1,0 +1,271 @@
+/**
+ * test_collection_nx_parity: covers nexus-dvr6.9.5 — pure-Nexus
+ * `hashmap_nx`, `set_nx`, `stringmap_nx`, `bytebuffer_nx` modules over
+ * `wasm_alloc` + open-addressed table backbone.
+ *
+ * Each acceptance assertion prints a literal `ok-<name>` token; the
+ * harness pins the line count and content interleave so a silently
+ * broken intrinsic dispatch (allocate / load_u8 / store_u8) does NOT
+ * sneak past as a quiet PASS.  This is the same shape as
+ * test_wasm_alloc_pure_nexus.nx (dvr6.9.2) — see that file's doc for
+ * the failure mode.
+ */
+import { Console }, * as stdio from "std:stdio"
+import { HashMapNx, IntKeyNotFound }, * as hm from "std:hashmap_nx"
+import { SetNx }, * as set from "std:set_nx"
+import { StringMapNx }, * as sm from "std:stringmap_nx"
+import { ByteBufferNx, BufferIndexOutOfBounds }, * as bb from "std:bytebuffer_nx"
+import { from_i64 } from "std:str"
+
+/// (1) HashMap insert / get / size / remove round-trip.
+let case_hashmap_basic = fn () -> unit throws { Exn } do
+  let m0 = hm.empty()
+  let m1 = hm.put(map: %m0, key: 1, value: 10)
+  let m2 = hm.put(map: %m1, key: 2, value: 20)
+  let m3 = hm.put(map: %m2, key: 3, value: 30)
+  let v2 = hm.get_or(map: &m3, key: 2, default: -1)
+  let sz_pre = hm.size(map: &m3)
+  let m4 = hm.remove(map: %m3, key: 2)
+  let sz_post = hm.size(map: &m4)
+  let missing = hm.get_or(map: &m4, key: 2, default: 999)
+  hm.free(map: %m4)
+  if v2 == 20 && sz_pre == 3 && sz_post == 2 && missing == 999 then
+    Console.println(val: "ok-hashmap-basic")
+  else
+    Console.println(val: "fail-hashmap-basic")
+  end
+  return ()
+end
+
+/// (2) HashMap grow trigger: insert past the initial cap=8 → load
+/// factor 0.5 forces rehash.  We probe key 7 (filled before grow) and
+/// key 9 (filled after) to confirm the rehash preserved entries.
+let put_range_go = fn (m: %HashMapNx, i: i64, n: i64) -> %HashMapNx throws { Exn } do
+  if i >= n then return m end
+  let %m2 = hm.put(map: %m, key: i, value: i * 100)
+  return put_range_go(m: %m2, i: i + 1, n)
+end
+
+let case_hashmap_grow = fn () -> unit throws { Exn } do
+  let m0 = hm.empty()
+  let m1 = put_range_go(m: %m0, i: 0, n: 32)
+  let v7 = hm.get_or(map: &m1, key: 7, default: -1)
+  let v9 = hm.get_or(map: &m1, key: 9, default: -1)
+  let v31 = hm.get_or(map: &m1, key: 31, default: -1)
+  let sz = hm.size(map: &m1)
+  hm.free(map: %m1)
+  if v7 == 700 && v9 == 900 && v31 == 3100 && sz == 32 then
+    Console.println(val: "ok-hashmap-grow")
+  else
+    Console.println(val: "fail-hashmap-grow")
+  end
+  return ()
+end
+
+/// (3) HashMap.get_unchecked raises IntKeyNotFound on missing key —
+/// acceptance criterion 3 (specific Exn variant, not RuntimeError).
+let probe_hm_unchecked_throws = fn (m: &HashMapNx) -> bool throws { Exn } do
+  try
+    let _ = hm.get_unchecked(map: m, key: 99)
+    return false
+  catch
+    | IntKeyNotFound(op: _, key: _) -> return true
+    | _ -> return false
+  end
+end
+
+let case_hashmap_unchecked = fn () -> unit throws { Exn } do
+  let m0 = hm.empty()
+  let m1 = hm.put(map: %m0, key: 42, value: 4242)
+  let hit = hm.get_unchecked(map: &m1, key: 42)
+  let raised = probe_hm_unchecked_throws(m: &m1)
+  hm.free(map: %m1)
+  if hit == 4242 && raised then
+    Console.println(val: "ok-hashmap-unchecked")
+  else
+    Console.println(val: "fail-hashmap-unchecked")
+  end
+  return ()
+end
+
+/// (4) Set insert / contains / size / remove round-trip.
+let case_set_basic = fn () -> unit throws { Exn } do
+  let s0 = set.empty()
+  let s1 = set.insert(set: %s0, val: 5)
+  let s2 = set.insert(set: %s1, val: 7)
+  let s3 = set.insert(set: %s2, val: 5)  // duplicate → no-op
+  let has5 = set.contains(set: &s3, val: 5)
+  let has8 = set.contains(set: &s3, val: 8)
+  let sz_pre = set.size(set: &s3)
+  let s4 = set.remove(set: %s3, val: 5)
+  let has5_post = set.contains(set: &s4, val: 5)
+  let sz_post = set.size(set: &s4)
+  set.free(set: %s4)
+  if has5 && !has8 && sz_pre == 2 && !has5_post && sz_post == 1 then
+    Console.println(val: "ok-set-basic")
+  else
+    Console.println(val: "fail-set-basic")
+  end
+  return ()
+end
+
+/// (5) Set algebra: union / intersection / difference produce fresh
+/// sets with the expected sizes.
+let case_set_algebra = fn () -> unit throws { Exn } do
+  let a = set.from_list(xs: 1 :: 2 :: 3 :: 4 :: [])
+  let b = set.from_list(xs: 3 :: 4 :: 5 :: 6 :: [])
+  let u = set.union(left: &a, right: &b)
+  let i = set.intersection(left: &a, right: &b)
+  let d = set.difference(left: &a, right: &b)
+  let u_sz = set.size(set: &u)
+  let i_sz = set.size(set: &i)
+  let d_sz = set.size(set: &d)
+  let i_has3 = set.contains(set: &i, val: 3)
+  let d_has1 = set.contains(set: &d, val: 1)
+  let d_has5 = set.contains(set: &d, val: 5)
+  set.free(set: %u)
+  set.free(set: %i)
+  set.free(set: %d)
+  set.free(set: %a)
+  set.free(set: %b)
+  if u_sz == 6 && i_sz == 2 && d_sz == 2 && i_has3 && d_has1 && !d_has5 then
+    Console.println(val: "ok-set-algebra")
+  else
+    Console.println(val: "fail-set-algebra")
+  end
+  return ()
+end
+
+/// (6) StringMap insert / get / contains / remove round-trip.
+let case_stringmap_basic = fn () -> unit throws { Exn } do
+  let m0 = sm.empty()
+  let m1 = sm.put(map: %m0, key: "alpha", value: 1)
+  let m2 = sm.put(map: %m1, key: "beta", value: 2)
+  let m3 = sm.put(map: %m2, key: "gamma", value: 3)
+  let m4 = sm.put(map: %m3, key: "alpha", value: 100)  // overwrite
+  let v_alpha = sm.get_or(map: &m4, key: "alpha", default: -1)
+  let v_beta = sm.get_or(map: &m4, key: "beta", default: -1)
+  let has_delta = sm.contains_key(map: &m4, key: "delta")
+  let sz_pre = sm.size(map: &m4)
+  let m5 = sm.remove(map: %m4, key: "beta")
+  let sz_post = sm.size(map: &m5)
+  let v_beta_post = sm.get_or(map: &m5, key: "beta", default: 555)
+  sm.free(map: %m5)
+  if v_alpha == 100 && v_beta == 2 && !has_delta && sz_pre == 3 && sz_post == 2 && v_beta_post == 555 then
+    Console.println(val: "ok-stringmap-basic")
+  else
+    Console.println(val: "fail-stringmap-basic")
+  end
+  return ()
+end
+
+/// (7) StringMap grow + lookup over many keys.  Forces rehash by
+/// inserting more than initial cap (8) string-keyed entries.
+let put_strmap_range_go = fn (m: %StringMapNx, i: i64, n: i64) -> %StringMapNx throws { Exn } do
+  if i >= n then return m end
+  let key = "k" ++ from_i64(val: i)
+  let %m2 = sm.put(map: %m, key, value: i * 10)
+  return put_strmap_range_go(m: %m2, i: i + 1, n)
+end
+
+let case_stringmap_grow = fn () -> unit throws { Exn } do
+  let m0 = sm.empty()
+  let m1 = put_strmap_range_go(m: %m0, i: 0, n: 20)
+  let v7 = sm.get_or(map: &m1, key: "k7", default: -1)
+  let v15 = sm.get_or(map: &m1, key: "k15", default: -1)
+  let sz = sm.size(map: &m1)
+  let missing = sm.get_or(map: &m1, key: "k99", default: -777)
+  sm.free(map: %m1)
+  if v7 == 70 && v15 == 150 && sz == 20 && missing == -777 then
+    Console.println(val: "ok-stringmap-grow")
+  else
+    Console.println(val: "fail-stringmap-grow")
+  end
+  return ()
+end
+
+/// (8) ByteBuffer push_byte / push_bytes / length / get_byte / to_string.
+let case_bytebuffer_basic = fn () -> unit throws { Exn } do
+  let b0 = bb.empty()
+  let b1 = bb.push_byte(buf: %b0, byte: 72)   // 'H'
+  let b2 = bb.push_byte(buf: %b1, byte: 105)  // 'i'
+  let b3 = bb.push_bytes(buf: %b2, bytes: 33 :: [])  // '!'
+  let len = bb.length(buf: &b3)
+  let g0 = bb.get_byte(buf: &b3, idx: 0)
+  let g_oob = bb.get_byte(buf: &b3, idx: 99)
+  let s = bb.to_string(buf: &b3)
+  bb.free(buf: %b3)
+  if len == 3 && g0 == 72 && g_oob == -1 && s == "Hi!" then
+    Console.println(val: "ok-bytebuffer-basic")
+  else
+    Console.println(val: "fail-bytebuffer-basic")
+  end
+  return ()
+end
+
+/// (9) ByteBuffer growth: push enough bytes to force multiple buffer
+/// reallocations.  Initial cap is 16 → push 100 bytes triggers 3
+/// doublings (16 → 32 → 64 → 128), copying preserved bytes each time.
+let push_n_go = fn (buf: %ByteBufferNx, i: i64, n: i64) -> %ByteBufferNx throws { Exn } do
+  if i >= n then return buf end
+  let %b2 = bb.push_byte(%buf, byte: i & 255)
+  return push_n_go(buf: %b2, i: i + 1, n)
+end
+
+let case_bytebuffer_grow = fn () -> unit throws { Exn } do
+  let b0 = bb.empty()
+  let b1 = push_n_go(buf: %b0, i: 0, n: 100)
+  let len = bb.length(buf: &b1)
+  let b0_byte = bb.get_byte(buf: &b1, idx: 0)
+  let b50_byte = bb.get_byte(buf: &b1, idx: 50)
+  let b99_byte = bb.get_byte(buf: &b1, idx: 99)
+  bb.free(buf: %b1)
+  if len == 100 && b0_byte == 0 && b50_byte == 50 && b99_byte == 99 then
+    Console.println(val: "ok-bytebuffer-grow")
+  else
+    Console.println(val: "fail-bytebuffer-grow")
+  end
+  return ()
+end
+
+/// (10) ByteBuffer.get_byte_unchecked raises ByteBufferOOB — partial
+/// function discipline (acceptance criterion 3).
+let probe_bb_oob_throws = fn (b: &ByteBufferNx) -> bool throws { Exn } do
+  try
+    let _ = bb.get_byte_unchecked(buf: b, idx: 5)
+    return false
+  catch
+    | BufferIndexOutOfBounds(op: _, index: _, length: _) -> return true
+    | _ -> return false
+  end
+end
+
+let case_bytebuffer_unchecked = fn () -> unit throws { Exn } do
+  let b0 = bb.empty()
+  let b1 = bb.push_byte(buf: %b0, byte: 65)
+  let hit = bb.get_byte_unchecked(buf: &b1, idx: 0)
+  let raised = probe_bb_oob_throws(b: &b1)
+  bb.free(buf: %b1)
+  if hit == 65 && raised then
+    Console.println(val: "ok-bytebuffer-unchecked")
+  else
+    Console.println(val: "fail-bytebuffer-unchecked")
+  end
+  return ()
+end
+
+let main = fn () -> unit require { PermConsole } throws { Exn } do
+  inject stdio.system_handler do
+    let _ = case_hashmap_basic()
+    let _ = case_hashmap_grow()
+    let _ = case_hashmap_unchecked()
+    let _ = case_set_basic()
+    let _ = case_set_algebra()
+    let _ = case_stringmap_basic()
+    let _ = case_stringmap_grow()
+    let _ = case_bytebuffer_basic()
+    let _ = case_bytebuffer_grow()
+    let _ = case_bytebuffer_unchecked()
+  end
+  return ()
+end

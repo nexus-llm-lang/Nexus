@@ -1,0 +1,578 @@
+/**
+ * collection_table: open-addressed hash table backbone over wasm_alloc.
+ *
+ * Shared by the pure-Nexus `hashmap_nx`, `set_nx`, and `stringmap_nx`
+ * modules. The table is parameterised over a `kind` value (KIND_INT,
+ * KIND_STR) that selects how key bytes are hashed and compared:
+ *
+ *   - KIND_INT keys are i64 values stored verbatim in the slot's key
+ *     field.  The hash is a Wang-style 64-bit mixer.
+ *   - KIND_STR keys are heap-resident UTF-8 strings; the slot's key
+ *     field stores a `pack(ptr,len)` pointing into the bump-allocated
+ *     copy made at `put` time.  The hash is FNV-1a 64-bit.
+ *
+ * ── Memory layout ─────────────────────────────────────────────────────
+ * Header (40 bytes, stored at the address returned to the wrapper):
+ *   +0  capv         (i64) — slot count, always a power of 2 (>=8)
+ *   +8  n_used      (i64) — currently-occupied (non-tombstone) slots
+ *   +16 n_tomb      (i64) — tombstone count
+ *   +24 kind        (i64) — KIND_INT or KIND_STR
+ *   +32 entries_ptr (i64) — address of the slot array
+ *
+ * Slot (24 bytes):
+ *   +0  state (i64) — STATE_EMPTY | STATE_FILLED | STATE_TOMB
+ *   +8  key   (i64) — raw i64, or pack(str_ptr, str_len)
+ *   +16 val   (i64) — value (sets ignore this field)
+ *
+ * ── Growth policy ─────────────────────────────────────────────────────
+ * Trigger when `(n_used + n_tomb) * 2 >= capv` (load factor 0.5).  New
+ * capacity is `2 * capv`.  Growth allocates a fresh slot array, rehashes
+ * all FILLED slots (TOMB are dropped), updates `entries_ptr`, and
+ * resets `n_tomb` to 0.  The old slot block is leaked (bump alloc has
+ * no per-block free); program-level reclamation flows through
+ * `wasm_alloc.mark`/`reset` at the surface.
+ *
+ * ── Invariants ────────────────────────────────────────────────────────
+ *   - `capv` is always a power of 2 (probing uses `idx & (capv - 1)`)
+ *   - probing scans from `hash & (capv - 1)` linearly forward, modulo capv
+ *   - on lookup: STATE_EMPTY ends the probe; STATE_TOMB skips
+ *   - on insert: first STATE_TOMB or STATE_EMPTY hit is the target
+ *   - n_used + n_tomb < capv is maintained by the growth policy (never
+ *     fills 100%); guarantees probe termination.
+ *
+ * ── Why bump-alloc backing ────────────────────────────────────────────
+ * `wasm_alloc.allocate` is a 16-byte-aligned bump pointer with no
+ * deallocate.  Each `grow` allocates a new slot block; the old one
+ * remains live in linear memory until the surrounding `mark`/`reset`
+ * pair (or program exit).  Acceptable trade-off: hash tables in the
+ * self-host compiler path are short-lived per-pass and the wasm_alloc
+ * docstring already calls this out as the reclamation pattern.
+ */
+import * as alloc from "std:wasm_alloc"
+import * as mem from "std:runtime_mem"
+import { byte_at, byte_length } from "std:str"
+import { ord } from "std:char"
+
+/// Raised by `lookup_unchecked` when the key is absent.  `op` carries
+/// the call site name so the caller can build a domain-specific
+/// message; `key_repr` is the i64 representation of the queried key
+/// (for KIND_STR this is the pack(ptr,len), informational only).
+export exception KeyNotFound(op: string, key_repr: i64)
+
+/// Raised when a probe walk runs past `capv` slots without finding an
+/// EMPTY/FILLED/TOMB outcome — only possible if invariants are broken
+/// (e.g. caller created a 0-capv table by hand).  Catchable but should
+/// never trigger on healthy tables.
+export exception TableInvariantBroken(op: string, capv: i64, probes: i64)
+
+// ─── Constants ────────────────────────────────────────────────────────
+
+export let kind_int = fn () -> i64 do return 0 end
+export let kind_str = fn () -> i64 do return 1 end
+
+let state_empty = fn () -> i64 do return 0 end
+let state_filled = fn () -> i64 do return 1 end
+let state_tomb = fn () -> i64 do return 2 end
+
+let header_bytes = fn () -> i64 do return 40 end
+let slot_bytes = fn () -> i64 do return 24 end
+let initial_cap = fn () -> i64 do return 8 end
+
+// ─── Header field accessors ───────────────────────────────────────────
+
+let load_cap = fn (h: i64) -> i64 do return mem.load_i64(addr: h) end
+let store_cap = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h, val: v) end
+
+let load_used = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 8) end
+let store_used = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 8, val: v) end
+
+let load_tomb = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 16) end
+let store_tomb = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 16, val: v) end
+
+let load_kind = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 24) end
+let store_kind = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 24, val: v) end
+
+let load_entries = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 32) end
+let store_entries = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 32, val: v) end
+
+// ─── Slot accessors ───────────────────────────────────────────────────
+
+let slot_addr = fn (entries: i64, idx: i64) -> i64 do
+  return entries + idx * slot_bytes()
+end
+
+let load_state = fn (s: i64) -> i64 do return mem.load_i64(addr: s) end
+let store_state = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s, val: v) end
+
+let load_key = fn (s: i64) -> i64 do return mem.load_i64(addr: s + 8) end
+let store_key = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s + 8, val: v) end
+
+let load_val = fn (s: i64) -> i64 do return mem.load_i64(addr: s + 16) end
+let store_val = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s + 16, val: v) end
+
+// ─── Hash functions ───────────────────────────────────────────────────
+
+/// 64-bit Wang-style mix.  Spreads sequential int keys evenly across
+/// the slot space so the probe cluster size stays bounded under
+/// realistic workloads.
+let mix64 = fn (x: i64) -> i64 do
+  let a = x ^ (x / 8589934592)  // x ^ (x >> 33), expressed via division
+  let b = a * 7046029254386353131
+  let c = b ^ (b / 8589934592)
+  let d = c * 7046029254386353131
+  return d ^ (d / 8589934592)
+end
+
+let hash_int = fn (k: i64) -> i64 do
+  let m = mix64(k)
+  // Force non-negative before modding.  Top bit cleared via low-63 mask.
+  return m & 9223372036854775807
+end
+
+/// FNV-1a 64-bit over the UTF-8 byte sequence.  Plain enough that the
+/// pure-Nexus emit path stays compact while still mixing well for
+/// English-locale identifier keys (the dominant StringMap use case).
+let fnv_offset = fn () -> i64 do return -3750763034362895579 end  // 0xcbf29ce484222325 as signed i64
+let fnv_prime  = fn () -> i64 do return 1099511628211 end
+
+let hash_str_go = fn (s: string, len: i64, i: i64, h: i64) -> i64 do
+  if i >= len then return h end
+  let c = byte_at(s, idx: i)
+  let b = ord(c)
+  let h2 = (h ^ b) * fnv_prime()
+  return hash_str_go(s, len, i: i + 1, h: h2)
+end
+
+let hash_str = fn (s: string) -> i64 do
+  let len = byte_length(s)
+  let h = hash_str_go(s, len, i: 0, h: fnv_offset())
+  return h & 9223372036854775807
+end
+
+// ─── pack/unpack for string keys ──────────────────────────────────────
+
+let pack_ptr_len = fn (ptr: i64, len: i64) -> i64 do
+  let ptr_lo = ptr & 4294967295
+  let len_lo = len & 4294967295
+  return (ptr_lo * 4294967296) + len_lo
+end
+
+let unpack_ptr = fn (packed: i64) -> i64 do
+  return (packed / 4294967296) & 4294967295
+end
+
+let unpack_len = fn (packed: i64) -> i64 do
+  return packed & 4294967295
+end
+
+// ─── String copy + read ───────────────────────────────────────────────
+
+/// Copy `len` bytes from a Nexus string into linear memory at `ptr`.
+let copy_str_bytes_go = fn (s: string, ptr: i64, len: i64, i: i64) -> unit do
+  if i >= len then return () end
+  let c = byte_at(s, idx: i)
+  let b = ord(c)
+  let _ = mem.store_u8(addr: ptr + i, val: b)
+  return copy_str_bytes_go(s, ptr, len, i: i + 1)
+end
+
+let intern_str = fn (s: string) -> i64 throws { Exn } do
+  let len = byte_length(s)
+  if len == 0 then
+    return pack_ptr_len(ptr: 0, len: 0)
+  end
+  let ptr = alloc.allocate(size: len)
+  let _ = copy_str_bytes_go(s, ptr, len, i: 0)
+  return pack_ptr_len(ptr, len)
+end
+
+/// Compare two stored string keys (each pack(ptr,len)) byte-for-byte.
+let str_eq_bytes_go = fn (a: i64, b: i64, n: i64, i: i64) -> bool do
+  if i >= n then return true end
+  let ba = mem.load_u8(addr: a + i)
+  let bb_v = mem.load_u8(addr: b + i)
+  if ba != bb_v then return false end
+  return str_eq_bytes_go(a, b, n, i: i + 1)
+end
+
+let stored_str_eq = fn (packed_a: i64, packed_b: i64) -> bool do
+  let la = unpack_len(packed: packed_a)
+  let lb = unpack_len(packed: packed_b)
+  if la != lb then return false end
+  if la == 0 then return true end
+  let pa = unpack_ptr(packed: packed_a)
+  let pb = unpack_ptr(packed: packed_b)
+  return str_eq_bytes_go(a: pa, b: pb, n: la, i: 0)
+end
+
+/// Compare a stored string key against a fresh Nexus string (avoids
+/// allocating a second copy for transient lookup keys).
+let cmp_stored_with_str_go = fn (sptr: i64, s: string, len: i64, i: i64) -> bool do
+  if i >= len then return true end
+  let stored_b = mem.load_u8(addr: sptr + i)
+  let c = byte_at(s, idx: i)
+  let live_b = ord(c)
+  if stored_b != live_b then return false end
+  return cmp_stored_with_str_go(sptr, s, len, i: i + 1)
+end
+
+let stored_eq_str = fn (packed: i64, s: string) -> bool do
+  let stored_len = unpack_len(packed)
+  let live_len = byte_length(s)
+  if stored_len != live_len then return false end
+  if stored_len == 0 then return true end
+  let stored_ptr = unpack_ptr(packed)
+  return cmp_stored_with_str_go(sptr: stored_ptr, s, len: stored_len, i: 0)
+end
+
+// ─── Slot-array allocation ────────────────────────────────────────────
+
+let zero_slots_go = fn (entries: i64, capv: i64, i: i64) -> unit do
+  if i >= capv then return () end
+  let s = slot_addr(entries, idx: i)
+  let _ = store_state(s, v: state_empty())
+  return zero_slots_go(entries, capv, i: i + 1)
+end
+
+let alloc_slots = fn (capv: i64) -> i64 throws { Exn } do
+  let bytes = capv * slot_bytes()
+  let entries = alloc.allocate(size: bytes)
+  let _ = zero_slots_go(entries, capv, i: 0)
+  return entries
+end
+
+// ─── Probe ────────────────────────────────────────────────────────────
+
+/// Internal probe outcome for int keys.
+/// kind=0 EMPTY (free slot, ready for insert), 1 FILLED-match (key
+/// already present), 2 TOMB (insert here unless a later EMPTY/match
+/// supersedes it).
+///
+/// Walk linearly modulo capv; on EMPTY return the EARLIEST tomb if one
+/// was seen, else the EMPTY itself.  On FILLED-match return the slot.
+let probe_int_go = fn (entries: i64, capv: i64, key: i64, idx: i64, first_tomb: i64, probes: i64) -> i64 throws { Exn } do
+  if probes >= capv then
+    raise TableInvariantBroken(op: "probe_int", capv, probes)
+  end
+  let s = slot_addr(entries, idx)
+  let st = load_state(s)
+  if st == state_empty() then
+    if first_tomb >= 0 then return first_tomb end
+    return idx
+  end
+  if st == state_filled() then
+    let k = load_key(s)
+    if k == key then return idx end
+    let next = (idx + 1) & (capv - 1)
+    return probe_int_go(entries, capv, key, idx: next, first_tomb, probes: probes + 1)
+  end
+  // tomb
+  let new_tomb = if first_tomb < 0 then idx else first_tomb end
+  let next = (idx + 1) & (capv - 1)
+  return probe_int_go(entries, capv, key, idx: next, first_tomb: new_tomb, probes: probes + 1)
+end
+
+let probe_int = fn (entries: i64, capv: i64, key: i64) -> i64 throws { Exn } do
+  let h = hash_int(k: key)
+  let start = h & (capv - 1)
+  return probe_int_go(entries, capv, key, idx: start, first_tomb: -1, probes: 0)
+end
+
+let probe_str_go = fn (entries: i64, capv: i64, s: string, idx: i64, first_tomb: i64, probes: i64) -> i64 throws { Exn } do
+  if probes >= capv then
+    raise TableInvariantBroken(op: "probe_str", capv, probes)
+  end
+  let slot = slot_addr(entries, idx)
+  let st = load_state(slot)
+  if st == state_empty() then
+    if first_tomb >= 0 then return first_tomb end
+    return idx
+  end
+  if st == state_filled() then
+    let stored = load_key(slot)
+    if stored_eq_str(packed: stored, s) then return idx end
+    let next = (idx + 1) & (capv - 1)
+    return probe_str_go(entries, capv, s, idx: next, first_tomb, probes: probes + 1)
+  end
+  let new_tomb = if first_tomb < 0 then idx else first_tomb end
+  let next = (idx + 1) & (capv - 1)
+  return probe_str_go(entries, capv, s, idx: next, first_tomb: new_tomb, probes: probes + 1)
+end
+
+let probe_str = fn (entries: i64, capv: i64, s: string) -> i64 throws { Exn } do
+  let h = hash_str(s)
+  let start = h & (capv - 1)
+  return probe_str_go(entries, capv, s, idx: start, first_tomb: -1, probes: 0)
+end
+
+// ─── Public table API ─────────────────────────────────────────────────
+
+/// Allocate and zero a fresh table of the given kind.  Returns the
+/// header address, which the wrapper modules wrap in their opaque type.
+export let new_table = fn (kind: i64) -> i64 throws { Exn } do
+  let h = alloc.allocate(size: header_bytes())
+  let capv = initial_cap()
+  let entries = alloc_slots(capv)
+  let _ = store_cap(h, v: capv)
+  let _ = store_used(h, v: 0)
+  let _ = store_tomb(h, v: 0)
+  let _ = store_kind(h, v: kind)
+  let _ = store_entries(h, v: entries)
+  return h
+end
+
+export let table_size = fn (h: i64) -> i64 do
+  return load_used(h)
+end
+
+export let table_cap = fn (h: i64) -> i64 do
+  return load_cap(h)
+end
+
+// ─── Resize ───────────────────────────────────────────────────────────
+
+let rehash_int_go = fn (old_entries: i64, old_cap: i64, new_entries: i64, new_cap: i64, i: i64) -> unit throws { Exn } do
+  if i >= old_cap then return () end
+  let s = slot_addr(entries: old_entries, idx: i)
+  if load_state(s) == state_filled() then
+    let k = load_key(s)
+    let v = load_val(s)
+    let target = probe_int(entries: new_entries, capv: new_cap, key: k)
+    let ts = slot_addr(entries: new_entries, idx: target)
+    let _ = store_state(ts, v: state_filled())
+    let _ = store_key(ts, v: k)
+    let _ = store_val(ts, v)
+  end
+  return rehash_int_go(old_entries, old_cap, new_entries, new_cap, i: i + 1)
+end
+
+/// Reconstruct a Nexus string from the slot's stored byte range.
+/// Allocates a fresh Nexus string (the bump-allocated key bytes stay
+/// reachable through the slot's pack(ptr,len)) so the rehash can flow
+/// through the same `probe_str` path used at insert time.
+let key_to_string = fn (packed: i64) -> string throws { Exn } do
+  let ptr = unpack_ptr(packed)
+  let len = unpack_len(packed)
+  return alloc.read_string(ptr, len)
+end
+
+let rehash_str_go = fn (old_entries: i64, old_cap: i64, new_entries: i64, new_cap: i64, i: i64) -> unit throws { Exn } do
+  if i >= old_cap then return () end
+  let s = slot_addr(entries: old_entries, idx: i)
+  if load_state(s) == state_filled() then
+    let packed = load_key(s)
+    let v = load_val(s)
+    let key_str = key_to_string(packed)
+    let target = probe_str(entries: new_entries, capv: new_cap, s: key_str)
+    let ts = slot_addr(entries: new_entries, idx: target)
+    let _ = store_state(ts, v: state_filled())
+    let _ = store_key(ts, v: packed)
+    let _ = store_val(ts, v)
+  end
+  return rehash_str_go(old_entries, old_cap, new_entries, new_cap, i: i + 1)
+end
+
+let grow_table = fn (h: i64) -> unit throws { Exn } do
+  let old_cap = load_cap(h)
+  let old_entries = load_entries(h)
+  let new_cap = old_cap * 2
+  let new_entries = alloc_slots(capv: new_cap)
+  let kind = load_kind(h)
+  if kind == kind_int() then
+    let _ = rehash_int_go(old_entries, old_cap, new_entries, new_cap, i: 0)
+  else
+    let _ = rehash_str_go(old_entries, old_cap, new_entries, new_cap, i: 0)
+  end
+  let _ = store_cap(h, v: new_cap)
+  let _ = store_entries(h, v: new_entries)
+  let _ = store_tomb(h, v: 0)
+  return ()
+end
+
+let maybe_grow = fn (h: i64) -> unit throws { Exn } do
+  let capv = load_cap(h)
+  let used = load_used(h)
+  let tomb = load_tomb(h)
+  if (used + tomb) * 2 >= capv then
+    return grow_table(h)
+  end
+  return ()
+end
+
+// ─── Operations: int kind ─────────────────────────────────────────────
+
+export let put_int = fn (h: i64, key: i64, val: i64) -> unit throws { Exn } do
+  let _ = maybe_grow(h)
+  let entries = load_entries(h)
+  let capv = load_cap(h)
+  let idx = probe_int(entries, capv, key)
+  let s = slot_addr(entries, idx)
+  let st = load_state(s)
+  if st == state_filled() then
+    let _ = store_val(s, v: val)
+    return ()
+  end
+  if st == state_tomb() then
+    let _ = store_tomb(h, v: load_tomb(h) - 1)
+  end
+  let _ = store_state(s, v: state_filled())
+  let _ = store_key(s, v: key)
+  let _ = store_val(s, v: val)
+  let _ = store_used(h, v: load_used(h) + 1)
+  return ()
+end
+
+/// Lookup by int key.  Returns (-1, 0) when absent; otherwise (1, val).
+/// Callers that want a domain-specific exception use `get_int_unchecked`.
+export let get_int_or = fn (h: i64, key: i64, default_val: i64) -> i64 throws { Exn } do
+  let entries = load_entries(h)
+  let capv = load_cap(h)
+  let idx = probe_int(entries, capv, key)
+  let s = slot_addr(entries, idx)
+  if load_state(s) == state_filled() then
+    return load_val(s)
+  end
+  return default_val
+end
+
+export let has_int = fn (h: i64, key: i64) -> bool throws { Exn } do
+  let entries = load_entries(h)
+  let capv = load_cap(h)
+  let idx = probe_int(entries, capv, key)
+  let s = slot_addr(entries, idx)
+  return load_state(s) == state_filled()
+end
+
+/// Partial: raises `KeyNotFound` when the key is absent.  Mirrors the
+/// stdlib `head`/`tail` partial-function discipline: never settle for
+/// a catch-all and never silently return a default.
+export let get_int_unchecked = fn (h: i64, key: i64) -> i64 throws { Exn } do
+  let entries = load_entries(h)
+  let capv = load_cap(h)
+  let idx = probe_int(entries, capv, key)
+  let s = slot_addr(entries, idx)
+  if load_state(s) == state_filled() then
+    return load_val(s)
+  end
+  raise KeyNotFound(op: "get_int_unchecked", key_repr: key)
+end
+
+export let remove_int = fn (h: i64, key: i64) -> bool throws { Exn } do
+  let entries = load_entries(h)
+  let capv = load_cap(h)
+  let idx = probe_int(entries, capv, key)
+  let s = slot_addr(entries, idx)
+  if load_state(s) != state_filled() then
+    return false
+  end
+  let _ = store_state(s, v: state_tomb())
+  let _ = store_used(h, v: load_used(h) - 1)
+  let _ = store_tomb(h, v: load_tomb(h) + 1)
+  return true
+end
+
+// ─── Operations: str kind ─────────────────────────────────────────────
+
+export let put_str = fn (h: i64, key: string, val: i64) -> unit throws { Exn } do
+  let _ = maybe_grow(h)
+  let entries = load_entries(h)
+  let capv = load_cap(h)
+  let idx = probe_str(entries, capv, s: key)
+  let s = slot_addr(entries, idx)
+  let st = load_state(s)
+  if st == state_filled() then
+    let _ = store_val(s, v: val)
+    return ()
+  end
+  if st == state_tomb() then
+    let _ = store_tomb(h, v: load_tomb(h) - 1)
+  end
+  let packed = intern_str(s: key)
+  let _ = store_state(s, v: state_filled())
+  let _ = store_key(s, v: packed)
+  let _ = store_val(s, v: val)
+  let _ = store_used(h, v: load_used(h) + 1)
+  return ()
+end
+
+export let get_str_or = fn (h: i64, key: string, default_val: i64) -> i64 throws { Exn } do
+  let entries = load_entries(h)
+  let capv = load_cap(h)
+  let idx = probe_str(entries, capv, s: key)
+  let s = slot_addr(entries, idx)
+  if load_state(s) == state_filled() then
+    return load_val(s)
+  end
+  return default_val
+end
+
+export let has_str = fn (h: i64, key: string) -> bool throws { Exn } do
+  let entries = load_entries(h)
+  let capv = load_cap(h)
+  let idx = probe_str(entries, capv, s: key)
+  let s = slot_addr(entries, idx)
+  return load_state(s) == state_filled()
+end
+
+export let get_str_unchecked = fn (h: i64, key: string) -> i64 throws { Exn } do
+  let entries = load_entries(h)
+  let capv = load_cap(h)
+  let idx = probe_str(entries, capv, s: key)
+  let s = slot_addr(entries, idx)
+  if load_state(s) == state_filled() then
+    return load_val(s)
+  end
+  raise KeyNotFound(op: "get_str_unchecked", key_repr: 0)
+end
+
+export let remove_str = fn (h: i64, key: string) -> bool throws { Exn } do
+  let entries = load_entries(h)
+  let capv = load_cap(h)
+  let idx = probe_str(entries, capv, s: key)
+  let s = slot_addr(entries, idx)
+  if load_state(s) != state_filled() then
+    return false
+  end
+  let _ = store_state(s, v: state_tomb())
+  let _ = store_used(h, v: load_used(h) - 1)
+  let _ = store_tomb(h, v: load_tomb(h) + 1)
+  return true
+end
+
+// ─── Iteration ────────────────────────────────────────────────────────
+
+/// Stateless iteration: callers pass `slot_idx` from 0 upward and keep
+/// calling `iter_next_int` until it returns `capv`.  Each call returns
+/// the next FILLED slot index >= start, or `capv` when none remains.
+/// Keeping iteration external avoids a closure-per-step allocation.
+export let iter_next = fn (h: i64, slot_idx: i64) -> i64 do
+  let capv = load_cap(h)
+  return iter_next_go(entries: load_entries(h), capv, idx: slot_idx)
+end
+
+let iter_next_go = fn (entries: i64, capv: i64, idx: i64) -> i64 do
+  if idx >= capv then return capv end
+  let s = slot_addr(entries, idx)
+  if load_state(s) == state_filled() then return idx end
+  return iter_next_go(entries, capv, idx: idx + 1)
+end
+
+export let iter_key_int = fn (h: i64, slot_idx: i64) -> i64 do
+  let s = slot_addr(entries: load_entries(h), idx: slot_idx)
+  return load_key(s)
+end
+
+export let iter_val = fn (h: i64, slot_idx: i64) -> i64 do
+  let s = slot_addr(entries: load_entries(h), idx: slot_idx)
+  return load_val(s)
+end
+
+/// Materialise a string key out of a slot (used for stringmap.keys()).
+/// Allocates a fresh Nexus string from the stored byte range.
+export let iter_key_str = fn (h: i64, slot_idx: i64) -> string throws { Exn } do
+  let s = slot_addr(entries: load_entries(h), idx: slot_idx)
+  let packed = load_key(s)
+  let ptr = unpack_ptr(packed)
+  let len = unpack_len(packed)
+  return alloc.read_string(ptr, len)
+end
