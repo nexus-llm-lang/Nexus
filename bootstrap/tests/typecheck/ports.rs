@@ -131,6 +131,8 @@ fn test_handler_require_mock_needs_nothing() {
       fn close(handle: %Handle) -> unit do
         match handle do | Handle(id: _) -> return () end
       end
+      fn is_file(path: string) -> bool do return false end
+      fn list_dir(path: string) -> [ string ] throws { Exn } do return [] end
     end
 
     let main = fn () -> unit do
