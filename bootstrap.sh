@@ -153,18 +153,19 @@ ok "Installed nexus.wasm ($(wc -c < nexus.wasm | tr -d ' ') bytes)"
 #
 # `src/lsp/main.nx` wires the LSP scaffold to the Nexus pipeline; running
 # it produces a standalone wasm that speaks JSON-RPC on stdio. We compile
-# it through the Rust-built `$NEXUS` binary (the same binary that produced
-# stage 0). The self-hosted `nexus.wasm` cannot currently compile
-# `src/lsp/main.nx`: the codegen pass raises E3001 "closure arity '2' not
-# found" on the handler-vtable record, an issue tracked separately from
-# this hw47 epic. Once that codegen path is fixed, this can switch to
-# `wasmtime run "${STAGE1_FLAGS[@]}" nexus.wasm src/lsp/main.nx ...` for
-# full self-hosting parity.
+# it through the self-hosted `nexus.wasm` produced by Stage 1, mirroring
+# the Stage 1/2 self-host invocation. The handler-vtable record literal
+# in `nxlib/lsp/server.nx` stores arity-2 top-level fns as record fields;
+# the MIR pass lifts each into a `__closure_wrap_<target>` thunk so the
+# closure machinery (closure_table + arity-N type dedup) carries them.
+#
+# `nexus compose` still runs through the Rust binary because the
+# self-hosted compose path is out of scope here.
 
 LSP_RAW="$BUILD_DIR/lsp_raw.wasm"
 LSP_OUT="$BUILD_DIR/lsp.wasm"
-info "Stage L: $NEXUS build src/lsp/main.nx → $LSP_RAW"
-"$NEXUS" build src/lsp/main.nx -o "$LSP_RAW"
+info "Stage L: wasmtime run nexus.wasm src/lsp/main.nx → $LSP_RAW"
+"$WASMTIME" run "${STAGE1_FLAGS[@]}" nexus.wasm src/lsp/main.nx "$LSP_RAW"
 
 if wasm-tools print "$LSP_RAW" 2>/dev/null | grep -q 'import "nexus:std/'; then
   info "lsp.wasm has unresolved stdlib imports — composing..."
