@@ -565,3 +565,29 @@ fn runtime_mem_math_intrinsics_dispatch() {
 fn math_pure_nexus_integer_ops_acceptance() {
     exec_nxc_core("bootstrap/tests/fixtures/nxc/test_math_pure_nexus_integer_ops.nx");
 }
+
+/// Regression for nexus-pt8g: arity-N (N >= 1) top-level fn references
+/// stored as record fields (handler-vtable shape) used to trip
+/// `lookup_closure_type_idx_pairs` with E3001 because
+/// `collect_closure_arities` walks only `__closure_*` definitions and
+/// never registered the call_indirect type for the field-load → call
+/// shape. Post-fix, the MIR pass lifts each value-position reference
+/// to a known top-level fn into a `__closure_wrap_<target>` thunk
+/// (mirroring bootstrap/src/compiler/passes/lir_lower.rs::closure_convert),
+/// so the closure machinery (closure_table population, arity-N type
+/// dedup) carries the wrapper and the call_indirect resolves.
+///
+/// `exec_nxc_core_capture_stdout` exercises the nxc codegen path so the
+/// regression covers compilation **and** runtime semantics
+/// (`add=7 mul=12` proves the wrapper forwards the call to the right
+/// target, not just that the wasm builds).
+#[test]
+fn funcref_arity2_handler_vtable_via_nxc() {
+    let out = exec_nxc_core_capture_stdout(
+        "bootstrap/tests/fixtures/nxc/test_funcref_arity2_handler_vtable.nx",
+    );
+    assert!(
+        out.contains("add=7 mul=12"),
+        "expected 'add=7 mul=12' (wrapper forwards through Vt2 vtable) but got: {out}"
+    );
+}

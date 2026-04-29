@@ -16,7 +16,7 @@
  *   handler-port name inference (see src/ir/mir/port.nx)
  * - Generic reverse helpers (see src/common/mono_reverse.nx)
  */
-import { MirPortHandlerNotFound } from "src/common/error.nx"
+import { MirPortHandlerNotFound, SymbolNotFound } from "src/common/error.nx"
 import { None } from "std:option"
 import * as naming from "src/common/naming.nx"
 import * as str from "std:str"
@@ -565,7 +565,17 @@ let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExprResult throws { Exn }
   let HirExpr(node, span: _) = expr
   match node do
     | Literal(lit: l) -> return MirExprResult(ctx, expr: MirLiteral(lit: l))
-    | Variable(name: n, sigil: _) -> return MirExprResult(ctx, expr: MirVariable(name: n))
+    | Variable(name: n, sigil: _) ->
+      let hf_opt = lookup_top_level_fn(name: n, ctx)
+      match hf_opt do
+        | Some(val: hf) ->
+          if hir_func_arity(hf) >= 1 then
+            return wrap_top_level_fn(name: n, hf, ctx)
+          else
+            return MirExprResult(ctx, expr: MirVariable(name: n))
+          end
+        | None -> return MirExprResult(ctx, expr: MirVariable(name: n))
+      end
     | BinOp(left: l, op, right: r) ->
       match lower_expr(expr: l, ctx) do | MirExprResult(ctx: ctx1, expr: le) ->
         match lower_expr(expr: r, ctx: ctx1) do | MirExprResult(ctx: ctx2, expr: re) ->
@@ -911,6 +921,123 @@ let coerce_arrow_to_i64 = fn (t: TypeExpr) -> TypeExpr throws { Exn } do
   match t do
     | TyArrow(_) -> return TyI64
     | _ -> return t
+  end
+end
+
+// ─── First-class top-level fn references ───────────────────────────────────
+//
+// Named top-level functions referenced in value position (record field,
+// argument, let-binding) are wrapped into a `__closure_wrap_<target>` lifted
+// MirFunction. The wrapper has the canonical closure-call signature
+// `(__env: i64, args...) -> ret`, body is a single `MirCall(target, args)`
+// that forwards to the named target. Returning `MirMakeClosure(wrapper, [])`
+// hands the value off to the existing closure machinery — the closure table
+// auto-includes any `__closure_*` name and `collect_closure_arities` reads
+// the wrapper's param count to register the matching call_indirect type.
+//
+// Mirrors bootstrap/src/compiler/passes/lir_lower.rs::closure_convert.
+
+let lookup_top_level_fn = fn (name: string, ctx: MirCtx) -> Option<HirFunction> throws { Exn } do
+  match ctx do
+    | MirCtx(scope: _, port_layouts: _, handler_port_names: _, all_funcs: af, all_handlers: ah, all_exts: _, closure_counter: _, lifted_funcs: _, cont_binders: _) ->
+      match find_hir_func_by_name(name, funcs: af) do
+        | Some(val: f) -> return Some(val: f)
+        | None -> return find_hir_func_in_handlers(name, bindings: ah)
+      end
+  end
+end
+
+let find_hir_func_by_name = fn (name: string, funcs: [HirFunction]) -> Option<HirFunction> throws { Exn } do
+  match funcs do
+    | [] -> return None
+    | HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, throw_row: tw, body: bd, span: sp) :: rest ->
+      if n == name then
+        return Some(val: HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, throw_row: tw, body: bd, span: sp))
+      end
+      return find_hir_func_by_name(name, funcs: rest)
+  end
+end
+
+let find_hir_func_in_handlers = fn (name: string, bindings: [HirHandlerBindingEntry]) -> Option<HirFunction> throws { Exn } do
+  match bindings do
+    | [] -> return None
+    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, arms)) :: rest ->
+      match find_hir_func_by_name(name, funcs: arms_to_funcs(arms)) do
+        | Some(val: f) -> return Some(val: f)
+        | None -> return find_hir_func_in_handlers(name, bindings: rest)
+      end
+  end
+end
+
+let funcref_wrapper_name = fn (target: string) -> string do
+  return "__closure_wrap_" ++ target
+end
+
+let mir_func_named = fn (name: string, funcs: [MirFunction]) -> bool do
+  match funcs do
+    | [] -> return false
+    | MirFunction(name: n, params: _, ret_type: _, body: _, span: _) :: rest ->
+      if n == name then return true
+      else return mir_func_named(name, funcs: rest)
+      end
+  end
+end
+
+let hir_params_to_call_args = fn (params: [HirParam]) -> [MirCallArg] throws { Exn } do
+  return hir_params_to_call_args_go(params, acc: [])
+end
+
+let hir_params_to_call_args_go = fn (params: [HirParam], acc: [MirCallArg]) -> [MirCallArg] throws { Exn } do
+  match params do
+    | [] -> return rev_mir_call_args(lst: acc, out: [])
+    | HirParam(name: n, label: l, typ: _) :: rest ->
+      return hir_params_to_call_args_go(params: rest,
+        acc: MirCallArg(label: l, value: MirVariable(name: n)) :: acc)
+  end
+end
+
+let rev_mir_call_args = fn (lst: [MirCallArg], out: [MirCallArg]) -> [MirCallArg] throws { Exn } do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_mir_call_args(lst: rest, out: x :: out)
+  end
+end
+
+/// Build a `__closure_wrap_<target>` MirFunction that forwards a closure call
+/// to a named top-level function. Generated lazily — `wrap_top_level_fn`
+/// dedupes by checking `lifted_funcs` for an existing wrapper before
+/// appending.
+let build_funcref_wrapper = fn (target: string, hf: HirFunction) -> MirFunction throws { Exn } do
+  let HirFunction(name: _, type_params: _, params: ps, ret_type: rt, throw_row: _, body: _, span: sp) = hf
+  let env_param = MirParam(label: "__env", name: "__env", typ: TyI64)
+  let orig_params = lower_lambda_params(params: ps)
+  let all_params = env_param :: orig_params
+  let call_args = hir_params_to_call_args(params: ps)
+  let body = [MirStmtReturn(expr: MirCall(func: target, args: call_args, ret_type: rt))]
+  return MirFunction(name: funcref_wrapper_name(target),
+                     params: all_params,
+                     ret_type: lower_lambda_ret_type(t: rt),
+                     body, span: sp)
+end
+
+let hir_func_arity = fn (hf: HirFunction) -> i64 throws { Exn } do
+  let HirFunction(name: _, type_params: _, params: ps, ret_type: _, throw_row: _, body: _, span: _) = hf
+  return list.length(xs: ps)
+end
+
+let wrap_top_level_fn = fn (name: string, hf: HirFunction, ctx: MirCtx) -> MirExprResult throws { Exn } do
+  let wrapper_name = funcref_wrapper_name(target: name)
+  match ctx do
+    | MirCtx(scope: sc, port_layouts: pl, handler_port_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf, cont_binders: cb) ->
+      if mir_func_named(name: wrapper_name, funcs: lf) then
+        return MirExprResult(ctx, expr: MirMakeClosure(func_name: wrapper_name, captures: []))
+      end
+      let wrapper = build_funcref_wrapper(target: name, hf)
+      let new_lf = append_mir_funcs(a: lf, b: [wrapper])
+      let ctx2 = MirCtx(scope: sc, port_layouts: pl, handler_port_names: hpn,
+                        all_funcs: af, all_handlers: ah, all_exts: ae,
+                        closure_counter: cc, lifted_funcs: new_lf, cont_binders: cb)
+      return MirExprResult(ctx: ctx2, expr: MirMakeClosure(func_name: wrapper_name, captures: []))
   end
 end
 
