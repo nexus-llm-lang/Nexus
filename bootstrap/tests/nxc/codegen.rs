@@ -372,13 +372,12 @@ fn main_throws_unwrappable_rejected_by_self_host() {
 ///   - iterates `__nx_bt_depth()` entries calling `__nx_bt_frame` for each
 ///   - calls `__nx_exit(1)` (surfaces as WASI `proc_exit(1)`)
 ///
-/// The backtrace iteration loop is exercised, but the bundled self-host
-/// codegen does not (yet) emit `__nx_capture_backtrace` at raise sites
-/// (urf5's scope explicitly forbids touching codegen — case (iii)). When
-/// the runtime's `BT_FRAMES` is empty, depth = 0 and the loop emits no
-/// `  at` lines. This test asserts the wrapper plumbing *up to* exit, and
-/// captures the depth-0 case so a future codegen change emitting
-/// `__nx_capture_backtrace` flips it positive without rewriting the test.
+/// Self-host codegen now emits `call __nx_main_wrap_bt_capture` immediately
+/// before each `op_throw` (issue nexus-55x0). The capture is gated
+/// per-function on `EffectMap.can_throw`, so functions that cannot
+/// transitively throw skip the call. With capture wired up, the runtime's
+/// `BT_FRAMES` is populated and the wrapper's iteration loop emits at
+/// least one `  at` line (the throwing user function frame).
 #[test]
 fn main_throws_wrap_emits_variant_and_exits() {
     let (stderr, exit_code) = exec_nxc_core_capture_stderr_expecting_exit(
@@ -394,14 +393,13 @@ fn main_throws_wrap_emits_variant_and_exits() {
         "expected stderr to mention the variant tag `Boom`, got:\n{}",
         stderr
     );
-    // Self-host codegen does not emit `__nx_capture_backtrace`; bt-depth
-    // returns 0 and the loop emits no frame lines. Document the gap so a
-    // follow-up codegen change can flip this assertion positive.
+    // After nexus-55x0 the self-host emits `__nx_capture_backtrace` at raise
+    // sites, so the wrapper's loop produces at least one `  at` line.
     let frame_lines = stderr.lines().filter(|l| l.starts_with("  at ")).count();
-    assert_eq!(
-        frame_lines, 0,
-        "self-host codegen does not emit __nx_capture_backtrace yet — \
-         expected zero `  at` lines until that lands; got {}: {}",
+    assert!(
+        frame_lines >= 1,
+        "expected at least one `  at` frame line after capture-backtrace \
+         landed (issue nexus-55x0); got {}: {}",
         frame_lines, stderr
     );
 }

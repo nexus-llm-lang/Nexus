@@ -1,0 +1,175 @@
+// Acceptance test for issue nexus-55x0 (Exception-aware backtrace elision).
+//
+// Exercises `resolve_bt_capture_for_func` (src/backend/codegen.nx), the gate
+// codegen consults for every `LirExprRaise` site to decide whether to emit a
+// `call __nx_main_wrap_bt_capture` before `op_throw`. The rule is:
+//
+//   * `bt_capture_idx_global == -1` (capture import absent) → always -1.
+//   * `EffectSummary.can_throw == false` for the enclosing function → -1
+//     (elide); pure / non-throwing functions never need the snapshot.
+//   * `EffectSummary.can_throw == true` → return the import slot.
+//   * Function missing from EffectMap → fall back to the global slot
+//     (conservative; preserves backtrace fidelity for synthesised bodies).
+//
+// The hand-rolled LirProgram mirrors the structure used by the
+// effect_analysis acceptance test: a pure leaf, a directly throwing leaf,
+// and a transitive caller. analyze_effects supplies the EffectMap; the
+// gate then maps each function name to its expected emission decision.
+import * as test_assert from "std:test/assert"
+import { TyI64, TyUnit } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { LirProgram, LirFunction, LirAtomInt, LirAtomUnit, LirExprAtom, LirExprCall, LirExprRaise, LirStmtLet } from "src/ir/lir_types.nx"
+import { analyze_effects } from "src/backend/effect_analysis.nx"
+import { resolve_bt_capture_for_func } from "src/backend/codegen.nx"
+
+let dummy_span = fn () -> Span do return Span(offset: 0, line: 1, col: 1) end
+
+let make_pure_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyI64, expr: LirExprAtom(atom: LirAtomInt(val: 42)))
+  ]
+  return LirFunction(name: "pure_fn", params: [], ret_type: TyI64,
+                      body: stmts, ret: LirAtomInt(val: 42), span: dummy_span())
+end
+
+let make_throws_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyUnit,
+                expr: LirExprRaise(value: LirAtomInt(val: 0), typ: TyUnit))
+  ]
+  return LirFunction(name: "throws_fn", params: [], ret_type: TyUnit,
+                      body: stmts, ret: LirAtomUnit, span: dummy_span())
+end
+
+// chain_a → chain_b → chain_c → raise. chain_a's can_throw should be true
+// after the fixed point even though chain_a itself contains no raise stmt;
+// the gate must therefore emit capture for any of them. (chain_a/b only have
+// LirExprCall sites; the per-site emission only runs for raise, so this
+// part of the test verifies the *summary* propagation rather than a call
+// site count.)
+let make_chain_a = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyUnit,
+                expr: LirExprCall(func: "chain_b", args: [], typ: TyUnit))
+  ]
+  return LirFunction(name: "chain_a", params: [], ret_type: TyUnit,
+                      body: stmts, ret: LirAtomUnit, span: dummy_span())
+end
+
+let make_chain_b = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyUnit,
+                expr: LirExprCall(func: "chain_c", args: [], typ: TyUnit))
+  ]
+  return LirFunction(name: "chain_b", params: [], ret_type: TyUnit,
+                      body: stmts, ret: LirAtomUnit, span: dummy_span())
+end
+
+let make_chain_c = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyUnit,
+                expr: LirExprRaise(value: LirAtomInt(val: 0), typ: TyUnit))
+  ]
+  return LirFunction(name: "chain_c", params: [], ret_type: TyUnit,
+                      body: stmts, ret: LirAtomUnit, span: dummy_span())
+end
+
+let body = fn () -> unit throws { Exn } do
+  let prog = LirProgram(
+    functions: [make_pure_fn(), make_throws_fn(), make_chain_a(), make_chain_b(), make_chain_c()],
+    externals: []
+  )
+  let em = analyze_effects(program: prog)
+
+  // Choose a non-trivial sentinel so an off-by-one in the gate is visible
+  // in the failure label rather than silently aliasing to 0/-1.
+  let global_idx = 17
+
+  // pure_fn: can_throw=false → must elide regardless of global_idx.
+  test_assert.assert_eq_i64(
+    actual: resolve_bt_capture_for_func(func_name: "pure_fn", effect_map: em,
+                                          bt_capture_idx_global: global_idx),
+    expected: -1,
+    label: "pure_fn elides bt_capture call"
+  )
+
+  // throws_fn: direct raise, can_throw=true → emit at the global slot.
+  test_assert.assert_eq_i64(
+    actual: resolve_bt_capture_for_func(func_name: "throws_fn", effect_map: em,
+                                          bt_capture_idx_global: global_idx),
+    expected: global_idx,
+    label: "throws_fn emits bt_capture call"
+  )
+
+  // chain_c is the direct raiser, so emission is required.
+  test_assert.assert_eq_i64(
+    actual: resolve_bt_capture_for_func(func_name: "chain_c", effect_map: em,
+                                          bt_capture_idx_global: global_idx),
+    expected: global_idx,
+    label: "chain_c emits bt_capture call (direct raise)"
+  )
+
+  // chain_b/chain_a only call into the chain — they have no raise sites of
+  // their own, but the fixed-point propagates can_throw upward. The gate
+  // therefore reports the global slot for them; codegen will only consult
+  // it at LirExprRaise expansion which never fires for these functions, so
+  // the resulting wasm still contains zero capture calls in their bodies.
+  test_assert.assert_eq_i64(
+    actual: resolve_bt_capture_for_func(func_name: "chain_b", effect_map: em,
+                                          bt_capture_idx_global: global_idx),
+    expected: global_idx,
+    label: "chain_b enables bt_capture call (transitive throw)"
+  )
+  test_assert.assert_eq_i64(
+    actual: resolve_bt_capture_for_func(func_name: "chain_a", effect_map: em,
+                                          bt_capture_idx_global: global_idx),
+    expected: global_idx,
+    label: "chain_a enables bt_capture call (transitive throw)"
+  )
+
+  // Whole-program elision: when the capture import was never resolved
+  // (i.e. main_wrap did not fire because main has empty throw_row), the
+  // gate must return -1 for every function regardless of can_throw.
+  test_assert.assert_eq_i64(
+    actual: resolve_bt_capture_for_func(func_name: "throws_fn", effect_map: em,
+                                          bt_capture_idx_global: -1),
+    expected: -1,
+    label: "throws_fn elides when no capture import (program-wide off)"
+  )
+  test_assert.assert_eq_i64(
+    actual: resolve_bt_capture_for_func(func_name: "pure_fn", effect_map: em,
+                                          bt_capture_idx_global: -1),
+    expected: -1,
+    label: "pure_fn elides when no capture import (program-wide off)"
+  )
+
+  // Conservative fall-through: a function not present in the EffectMap
+  // (e.g. a synthesised wrapper inserted after analyze_effects) must keep
+  // capture enabled. The lookup name here intentionally does not match
+  // any function constructed above.
+  test_assert.assert_eq_i64(
+    actual: resolve_bt_capture_for_func(func_name: "__synth_unknown",
+                                          effect_map: em,
+                                          bt_capture_idx_global: global_idx),
+    expected: global_idx,
+    label: "unknown function falls back to global slot (conservative)"
+  )
+
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  // Trap on failure so the runtime test runner reports FAIL via non-zero exit.
+  let _ = 1 / ok
+  return ()
+end

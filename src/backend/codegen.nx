@@ -66,6 +66,9 @@ import { DedupedTypes }, * as wsect from "src/backend/wasm/section.nx"
 import * as list from "std:list"
 import * as str from "std:str"
 import { SymbolNotFound, StackSwitchingNotImplemented } from "src/common/error.nx"
+import { EffectMap, EffectSummary, lookup_summary } from "src/backend/effect_analysis.nx"
+import { Some, None } from "std:option"
+import { bt_capture_symbol_name } from "src/ir/main_wrap.nx"
 
 // ─── Inline-emitted runtime intrinsics ──────────────────────────────────────
 // `nexus:runtime/arena`, `nexus:runtime/memory`, and `nexus:runtime/math`
@@ -1011,6 +1014,17 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       return emit_typed_field_load(typ: ftyp, %buf, offset: (idx + 1) * 8)
 
     | LirExprRaise(value: v, typ: _) ->
+      // Per-function backtrace capture (issue nexus-55x0). Emit a `call`
+      // to the imported `__nx_main_wrap_bt_capture` immediately before
+      // `op_throw` so the host can snapshot the wasm call stack before
+      // unwinding. ctx_bt_capture_idx returns -1 when the enclosing
+      // function's EffectMap entry has can_throw=false or when the
+      // capture import was never resolved (no main_wrap fired).
+      let bt_capture_idx = wdefs.ctx_bt_capture_idx(ctx)
+      let %buf = if bt_capture_idx >= 0 then
+        let %b = bb.push_byte(%buf, byte: op_call)
+        bb.push_uleb128(buf: %b, val: bt_capture_idx)
+      else %buf end
       let %buf = emit_atom(atom: v, %buf, ctx)
       // Unit-typed raise: push i64(0) as payload
       let %buf = if wdefs.is_unit(typ: wdefs.atom_type(atom: v)) then
@@ -1686,7 +1700,8 @@ let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
                           ss_tag_idx: i64,
                           ss_cont_type_idx: i64,
                           ss_dispatch_block_type_idx: i64,
-                          ss_tag_names: [string]) -> CodegenCtx throws { Exn } do
+                          ss_tag_names: [string],
+                          bt_capture_idx: i64) -> CodegenCtx throws { Exn } do
   let LirFunction(name: fname, params: ps, ret_type: rt, body: b, ret: _, span: _) = func
   let param_locals = build_param_locals(params: ps, idx: 0)
   let param_count = list.length(xs: ps)
@@ -1703,7 +1718,8 @@ let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
     ss_tag_idx: ss_tag_idx,
     ss_cont_type_idx: ss_cont_type_idx,
     ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
-    ss_tag_names: ss_tag_names
+    ss_tag_names: ss_tag_names,
+    bt_capture_idx: bt_capture_idx
   )
   end
 end
@@ -1714,6 +1730,30 @@ let append_body_to_buf = fn (buf: %ByteBuffer, body: %ByteBuffer) -> %ByteBuffer
   let %buf = bb.push_buf(dst: %buf, src: &body)
   bb.free(buf: %body)
   return %buf
+end
+
+/// Per-function backtrace-capture index for `func_name`.
+/// Returns -1 (= elide) when `bt_capture_idx_global == -1` (capture import
+/// absent from the program) or when the function's EffectMap entry says
+/// `can_throw == false` (issue nexus-55x0). Otherwise returns the import slot
+/// of `__nx_main_wrap_bt_capture` so emit_expr/LirExprRaise can call it.
+/// Exported so tests can exercise the elision rule directly without
+/// bringing up the full codegen pipeline.
+export let resolve_bt_capture_for_func = fn (func_name: string, effect_map: EffectMap,
+                                        bt_capture_idx_global: i64) -> i64 do
+  if bt_capture_idx_global < 0 then return -1 end
+  match lookup_summary(em: effect_map, name: func_name) do
+    | Some(val: EffectSummary(capabilities_used: _, can_throw: ct, is_pure: _)) ->
+      if ct then return bt_capture_idx_global end
+      return -1
+    | None ->
+      // Function not in EffectMap (synthesised wrapper, etc.) — keep capture
+      // emission enabled to preserve backtrace fidelity. EffectMap covers
+      // every LirFunction in the program by construction, so a miss means
+      // either a pre-LIR synthesised body or a stale lookup; both cases
+      // sound on the conservative side.
+      return bt_capture_idx_global
+  end
 end
 
 let emit_one_body = fn (buf: %ByteBuffer, f: LirFunction,
@@ -1727,7 +1767,12 @@ let emit_one_body = fn (buf: %ByteBuffer, f: LirFunction,
                          ss_tag_idx: i64,
                          ss_cont_type_idx: i64,
                          ss_dispatch_block_type_idx: i64,
-                         ss_tag_names: [string]) -> %ByteBuffer throws { Exn } do
+                         ss_tag_names: [string],
+                         effect_map: EffectMap,
+                         bt_capture_idx_global: i64) -> %ByteBuffer throws { Exn } do
+  let LirFunction(name: fname, _) = f
+  let bt_capture_idx = resolve_bt_capture_for_func(func_name: fname, effect_map,
+                                                     bt_capture_idx_global)
   let ctx = build_func_ctx(func: f, internal_funcs,
                             external_funcs, string_lits,
                             alloc_mode, functions, externals,
@@ -1736,7 +1781,8 @@ let emit_one_body = fn (buf: %ByteBuffer, f: LirFunction,
                             ss_tag_idx: ss_tag_idx,
                             ss_cont_type_idx: ss_cont_type_idx,
                             ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
-                            ss_tag_names: ss_tag_names)
+                            ss_tag_names: ss_tag_names,
+                            bt_capture_idx: bt_capture_idx)
   let %body = compile_function_body(func: f, ctx)
   return append_body_to_buf(%buf, %body)
 end
@@ -1752,7 +1798,9 @@ let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
                             ss_tag_idx: i64,
                             ss_cont_type_idx: i64,
                             ss_dispatch_block_type_idx: i64,
-                            ss_tag_names: [string]) -> %ByteBuffer throws { Exn } do
+                            ss_tag_names: [string],
+                            effect_map: EffectMap,
+                            bt_capture_idx_global: i64) -> %ByteBuffer throws { Exn } do
   match funcs do
     | [] -> return %buf
     | f :: rest ->
@@ -1764,7 +1812,9 @@ let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
                                 ss_tag_idx: ss_tag_idx,
                                 ss_cont_type_idx: ss_cont_type_idx,
                                 ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
-                                ss_tag_names: ss_tag_names)
+                                ss_tag_names: ss_tag_names,
+                                effect_map: effect_map,
+                                bt_capture_idx_global: bt_capture_idx_global)
       return emit_code_bodies(%buf, funcs: rest, internal_funcs,
                         external_funcs, string_lits,
                         alloc_mode, functions, externals,
@@ -1773,7 +1823,9 @@ let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
                         ss_tag_idx: ss_tag_idx,
                         ss_cont_type_idx: ss_cont_type_idx,
                         ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
-                        ss_tag_names: ss_tag_names)
+                        ss_tag_names: ss_tag_names,
+                        effect_map: effect_map,
+                        bt_capture_idx_global: bt_capture_idx_global)
   end
 end
 
@@ -1798,6 +1850,23 @@ let build_external_func_entries_go = fn (exts: [LirExternal], idx: i64, acc: [Fu
     | [] -> return rev_func_entries(lst: acc, out: [])
     | LirExternal(name: n, wasm_module: _, wasm_name: _, params: _, ret_type: _, throw_row: _) :: rest ->
       return build_external_func_entries_go(exts: rest, idx: idx + 1, acc: FuncEntry(name: n, index: idx) :: acc)
+  end
+end
+
+/// Locate the import slot for the backtrace-capture host function. Returns
+/// -1 when the symbol is absent (e.g. the program has no main_wrap-injected
+/// catch handler). The match is by Nexus-side symbol name so codegen does
+/// not need to know the WIT-canonical wasm_name.
+let find_bt_capture_idx = fn (exts: [LirExternal]) -> i64 do
+  return find_bt_capture_idx_go(exts, idx: 0)
+end
+
+let find_bt_capture_idx_go = fn (exts: [LirExternal], idx: i64) -> i64 do
+  match exts do
+    | [] -> return -1
+    | LirExternal(name: n, _) :: rest ->
+      if n == bt_capture_symbol_name() then return idx end
+      return find_bt_capture_idx_go(exts: rest, idx: idx + 1)
   end
 end
 
@@ -1977,7 +2046,8 @@ end
 
 // ─── Module entry point ────────────────────────────────────────────────────
 
-export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64) -> %ByteBuffer throws { Exn } do
+export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
+                                       effect_map: EffectMap) -> %ByteBuffer throws { Exn } do
   match program do
     | LirProgram(functions: funcs, externals: all_exts) ->
 
@@ -1990,6 +2060,13 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
       let filtered_program = LirProgram(functions: funcs, externals: exts)
       let n_exts = list.length(xs: exts)
       let n_funcs = list.length(xs: funcs)
+      // Resolve the program-wide import index of the backtrace-capture host
+      // function. main_wrap synthesises this external whenever it wraps a
+      // throwing main; it is absent for programs without a wrapped main.
+      // emit_one_body refines this per-function via EffectMap.can_throw
+      // (issue nexus-55x0): functions that cannot transitively throw skip
+      // the call entirely, while functions that may throw retain it.
+      let bt_capture_idx_global = find_bt_capture_idx(exts)
       let has_eh = wcollect.program_needs_eh(funcs)
       let has_ss = wcollect.program_needs_stack_switching(funcs)
       let heap_enabled = wcollect.program_uses_heap(funcs)
@@ -2177,7 +2254,9 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
                                     ss_tag_idx: ss_tag_idx,
                                     ss_cont_type_idx: my_cont_idx,
                                     ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
-                                    ss_tag_names: ss_tag_names)
+                                    ss_tag_names: ss_tag_names,
+                                    effect_map: effect_map,
+                                    bt_capture_idx_global: bt_capture_idx_global)
       // cabi_realloc: aligned bump allocator for canonical ABI
       let %code = if has_cabi then
         let %cabi_body = compile_cabi_realloc(heap_base)
