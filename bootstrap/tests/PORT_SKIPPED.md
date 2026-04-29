@@ -32,3 +32,10 @@ semantics. Tracked for the dvr6.1 ADR.
   bundled stdio capability is what makes these compile under `cargo test`.
 - `codegen_main_with_args_runs_with_stdlib` — verifies that
   `main(args: [string])` compiles. Signature-only test with no behavior.
+
+## chars.rs
+
+- `char_unicode` — original asserts `'\u{1F600}'` (emoji codepoint 0x1F600)
+  parses. Nexus chars are ASCII-only (0x00-0x7F), so the multibyte case is
+  not portable. The hex-escape syntax itself (`'\u{NN}'`) is exercised by
+  `tests/runtime/chars_unicode_escape_test.nx` against ASCII codepoints.
