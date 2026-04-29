@@ -370,11 +370,89 @@ let infer_call = fn (state: CheckState, func: string, args: [HirCallArg], span: 
       match instantiate_scheme(state, scheme: sch) do
         | InstantiateResult(state: st1, typ: func_type) ->
           match func_type do
-            | TyArrow(params, ret, requires: _, throw_row: _) ->
-              return check_call_args(state: st1, params, args, ret, subst: subst.subst_empty(), span)
+            | TyArrow(params, ret, requires: _, throw_row: callee_thr) ->
+              match check_call_args(state: st1, params, args, ret, subst: subst.subst_empty(), span) do
+                | InferExprErr(message: m, span: esp) -> return InferExprErr(message: m, span: esp)
+                | InferExprOk(state: st2, subst: s_all, typ: rt) ->
+                  // T-App effect side-condition: every concrete exception
+                  // raisable by the callee must be admitted by the caller's
+                  // active throws-row. Without this the typechecker tracks
+                  // throw_row but never enforces it for calls — narrowing
+                  // a function to `throws { LirError }` then calling a
+                  // `throws { Exn }` callee would type-check while violating
+                  // the narrow contract. Mirrors the row-subsumption logic
+                  // used for direct raises (see check_raise_admitted).
+                  let callee_row = subst.subst_apply(subst: s_all, typ: callee_thr)
+                  let caller_row = subst.subst_apply(subst: s_all, typ: tctypes.state_throw_row(state: st2))
+                  let groups = tctypes.state_exception_groups(state: st2)
+                  match check_call_throw_row_admitted(callee_row, caller_row, groups, func) do
+                    | RaiseOk -> return InferExprOk(state: st2, subst: s_all, typ: rt)
+                    | RaiseRejected(message: m) -> return InferExprErr(message: m, span)
+                  end
+              end
             | _ ->
               return InferExprErr(message: func ++ " is not a function", span)
           end
+      end
+  end
+end
+
+/// Decide whether calling a function whose declared throws-row is `callee_row`
+/// is admitted by the caller's active `caller_row`. Row-subsumption: every
+/// concrete exception listed in the callee row must appear in the caller row
+/// (literally, as a member of an exception group, or via the universal `Exn`).
+///
+/// Backward-compatibility carve-outs (parallel to check_raise_admitted):
+///   - Callee row = closed empty `TyRow([], None)`: the callee declared no
+///     throws; treat as "unspecified" and admit. Functions in src/ that omit
+///     the throws clause currently parse to this shape; flipping enforcement
+///     on uncalled-row callees is out of scope for this issue.
+///   - Callee row open (rest = Some(_)): effect-polymorphic; admit.
+///   - Caller row open (rest = Some(_)): admits anything.
+///   - Caller row = closed empty `TyRow([], None)`: caller declared no
+///     throws; admit (mirrors raise-side back-compat — narrow enforcement
+///     activates only when caller declares an explicit row).
+///   - Either side reduced to a TyVar / non-row shape: admit conservatively.
+let check_call_throw_row_admitted = fn (
+  callee_row: TypeExpr, caller_row: TypeExpr,
+  groups: [ExceptionGroupEntry], func: string
+) -> RaiseAdmissionResult throws { Exn } do
+  match callee_row do
+    | TyRow(types: [], rest: None) -> return RaiseOk
+    | TyRow(types: _, rest: Some(_)) -> return RaiseOk
+    | TyRow(types: callee_types, rest: None) ->
+      match caller_row do
+        | TyRow(types: [], rest: None) -> return RaiseOk
+        | TyRow(types: _, rest: Some(_)) -> return RaiseOk
+        | TyRow(types: caller_types, rest: None) ->
+          return check_each_callee_member_admitted(callee_types, caller_types, groups, func)
+        | _ -> return RaiseOk
+      end
+    | _ -> return RaiseOk
+  end
+end
+
+/// Verify each TyUserDefined entry in `callee_types` is admitted by
+/// `caller_types`. Non-TyUserDefined entries (e.g. TyVar arising from
+/// freshly instantiated polymorphic effect parameters) skip — those are
+/// resolved by surrounding unification, not by this row-subsumption check.
+let check_each_callee_member_admitted = fn (
+  callee_types: [TypeExpr], caller_types: [TypeExpr],
+  groups: [ExceptionGroupEntry], func: string
+) -> RaiseAdmissionResult throws { Exn } do
+  match callee_types do
+    | [] -> return RaiseOk
+    | t :: rest ->
+      match t do
+        | TyUserDefined(name: n, args: _) ->
+          if row_admits_exception(name: n, row_types: caller_types, groups) then
+            return check_each_callee_member_admitted(callee_types: rest, caller_types, groups, func)
+          else
+            return RaiseRejected(
+              message: "call " ++ func ++ ": exception " ++ n ++ " raised by callee not admitted by caller's throws row"
+            )
+          end
+        | _ -> return check_each_callee_member_admitted(callee_types: rest, caller_types, groups, func)
       end
   end
 end

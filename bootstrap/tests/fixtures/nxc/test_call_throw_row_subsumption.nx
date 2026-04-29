@@ -1,0 +1,195 @@
+// Tests for src/typecheck/infer.nx::infer_call — callee throw_row must be
+// admitted by caller's active throws-row (nexus-mqin.1.2.6). Without this,
+// narrowing a function to `throws { LirError }` does not stop it from calling
+// a `throws { Exn }` callee — the contract is a lie at the type level.
+//
+// Mirrors the row-subsumption logic in check_raise_admitted (mqin.1.1):
+//   - callee row open / unspecified empty → admit (back-compat carve-out)
+//   - caller row open / unspecified empty → admit
+//   - both rows closed → every callee TyUserDefined member must be admitted
+//     by caller (literal match, exception-group membership, or universal Exn)
+
+import { TypeExpr, TyUnit, TyUserDefined, TyArrow, TyRow, NamedType, EnumDef, VariantDef, VariantField } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { HirExpr, HirStmt, HirExprKind, Call, HirCallArg } from "src/ir/hir_types.nx"
+import { ExceptionGroupEntry } from "src/ir/hir_types.nx"
+import {
+  InferExprOk, InferExprErr,
+  EnumEntry, Scheme, EnvEntry,
+  tc_new_state, state_with_throw_row, state_with_env, env_insert, state_env
+}, * as tctypes from "src/typecheck/types.nx"
+import { infer_expr } from "src/typecheck/infer.nx"
+import { Some, None } from "std:option"
+
+let assert = fn (cond: bool, msg: string) -> unit throws { Exn } do
+  if cond then return ()
+  else raise RuntimeError(val: msg)
+  end
+end
+
+/// Build a minimal Exn enum carrying two unrelated variants and one
+/// member of an exception group (LirError).
+let build_exn_enum = fn () -> EnumEntry throws { Exn } do
+  let exn_def = EnumDef(
+    name: "Exn",
+    is_public: true,
+    is_opaque: false,
+    type_params: [],
+    variants: [
+      VariantDef(name: "RuntimeError", fields: [VariantField(name: Some(val: "val"), typ: TyUserDefined(name: "string", args: []))]),
+      VariantDef(name: "LirFieldOnNonVariable", fields: []),
+      VariantDef(name: "OutOfBounds", fields: [])
+    ]
+  )
+  return EnumEntry(name: "Exn", def: exn_def)
+end
+
+/// Register a zero-arg function `f` whose declared throws-row is `thr`.
+/// Caller-side checks then attempt a `Call("f", [])` and inspect the result.
+let install_callee = fn (state: tctypes.CheckState, thr: TypeExpr) -> tctypes.CheckState throws { Exn } do
+  let arrow = TyArrow(
+    params: [],
+    ret: TyUnit,
+    requires: TyRow(types: [], rest: None),
+    throw_row: thr
+  )
+  let env1 = env_insert(env: state_env(state), name: "f", scheme: Scheme(vars: [], typ: arrow))
+  return state_with_env(state, env: env1)
+end
+
+let mk_call = fn (sp: Span) -> HirExpr throws { Exn } do
+  return HirExpr(node: Call(func: "f", args: []), span: sp)
+end
+
+let main = fn () -> unit throws { Exn } do
+  let sp = Span(offset: 0, line: 1, col: 1)
+  let exn_entry = build_exn_enum()
+  let lir_group = ExceptionGroupEntry(
+    name: "LirError",
+    members: ["LirFieldOnNonVariable"]
+  )
+
+  // ── Acceptance #1 (positive, narrow ⊆ wide):
+  //    callee throws { LirError }, caller throws { Exn } — accept.
+  let st0 = tc_new_state(
+    enum_defs: [exn_entry], type_defs: [],
+    exception_groups: [lir_group]
+  )
+  let st_lir_callee = install_callee(
+    state: st0,
+    thr: TyRow(types: [TyUserDefined(name: "LirError", args: [])], rest: None)
+  )
+  let st_exn_caller = state_with_throw_row(
+    state: st_lir_callee,
+    throw_row: TyRow(types: [TyUserDefined(name: "Exn", args: [])], rest: None)
+  )
+  match infer_expr(state: st_exn_caller, expr: mk_call(sp), ret_type: TyUnit) do
+    | InferExprErr(message: m, span: _) ->
+      raise RuntimeError(val: "callee throws { LirError } under caller throws { Exn } should pass: " ++ m)
+    | InferExprOk(_) ->
+      assert(cond: true, msg: "throws { LirError } ⊆ throws { Exn } admitted")
+  end
+
+  // ── Acceptance #2 (negative, wide ⊄ narrow):
+  //    callee throws { Exn }, caller throws { LirError } — reject.
+  let st_exn_callee = install_callee(
+    state: st0,
+    thr: TyRow(types: [TyUserDefined(name: "Exn", args: [])], rest: None)
+  )
+  let st_lir_caller = state_with_throw_row(
+    state: st_exn_callee,
+    throw_row: TyRow(types: [TyUserDefined(name: "LirError", args: [])], rest: None)
+  )
+  match infer_expr(state: st_lir_caller, expr: mk_call(sp), ret_type: TyUnit) do
+    | InferExprOk(_) ->
+      raise RuntimeError(val: "callee throws { Exn } under caller throws { LirError } must be rejected")
+    | InferExprErr(message: _, span: _) ->
+      assert(cond: true, msg: "throws { Exn } ⊄ throws { LirError } rejected")
+  end
+
+  // ── Acceptance #2 (negative, unrelated singletons):
+  //    callee throws { OutOfBounds }, caller throws { LirError } — reject.
+  let st_out_callee = install_callee(
+    state: st0,
+    thr: TyRow(types: [TyUserDefined(name: "OutOfBounds", args: [])], rest: None)
+  )
+  let st_out_under_lir = state_with_throw_row(
+    state: st_out_callee,
+    throw_row: TyRow(types: [TyUserDefined(name: "LirError", args: [])], rest: None)
+  )
+  match infer_expr(state: st_out_under_lir, expr: mk_call(sp), ret_type: TyUnit) do
+    | InferExprOk(_) ->
+      raise RuntimeError(val: "callee throws { OutOfBounds } under caller throws { LirError } must be rejected")
+    | InferExprErr(message: _, span: _) ->
+      assert(cond: true, msg: "throws { OutOfBounds } ⊄ throws { LirError } rejected")
+  end
+
+  // ── Acceptance #1 (positive, group membership):
+  //    callee throws { LirFieldOnNonVariable }, caller throws { LirError } — accept
+  //    (LirError group includes LirFieldOnNonVariable).
+  let st_member_callee = install_callee(
+    state: st0,
+    thr: TyRow(types: [TyUserDefined(name: "LirFieldOnNonVariable", args: [])], rest: None)
+  )
+  let st_member_under_group = state_with_throw_row(
+    state: st_member_callee,
+    throw_row: TyRow(types: [TyUserDefined(name: "LirError", args: [])], rest: None)
+  )
+  match infer_expr(state: st_member_under_group, expr: mk_call(sp), ret_type: TyUnit) do
+    | InferExprErr(message: m, span: _) ->
+      raise RuntimeError(val: "group-member callee under group-name caller should pass: " ++ m)
+    | InferExprOk(_) ->
+      assert(cond: true, msg: "group member admitted by group name")
+  end
+
+  // ── Back-compat: callee row = closed empty (`throws {}` or unspecified) admits
+  //    under any caller row (mirrors check_raise_admitted carve-out).
+  let st_empty_callee = install_callee(
+    state: st0,
+    thr: TyRow(types: [], rest: None)
+  )
+  let st_empty_under_lir = state_with_throw_row(
+    state: st_empty_callee,
+    throw_row: TyRow(types: [TyUserDefined(name: "LirError", args: [])], rest: None)
+  )
+  match infer_expr(state: st_empty_under_lir, expr: mk_call(sp), ret_type: TyUnit) do
+    | InferExprErr(message: m, span: _) ->
+      raise RuntimeError(val: "unspecified-throws callee should admit under narrow caller (back-compat): " ++ m)
+    | InferExprOk(_) ->
+      assert(cond: true, msg: "unspecified callee row admitted under narrow caller")
+  end
+
+  // ── Open caller row admits any callee (effect-polymorphic).
+  let st_exn_callee_2 = install_callee(
+    state: st0,
+    thr: TyRow(types: [TyUserDefined(name: "Exn", args: [])], rest: None)
+  )
+  let st_open_caller = state_with_throw_row(
+    state: st_exn_callee_2,
+    throw_row: TyRow(types: [], rest: Some(val: TyUserDefined(name: "ρ", args: [])))
+  )
+  match infer_expr(state: st_open_caller, expr: mk_call(sp), ret_type: TyUnit) do
+    | InferExprErr(message: m, span: _) ->
+      raise RuntimeError(val: "open caller row should admit any callee: " ++ m)
+    | InferExprOk(_) ->
+      assert(cond: true, msg: "open caller row admits Exn-throwing callee")
+  end
+
+  // ── Open callee row (effect-polymorphic) admits under any caller.
+  let st_open_callee = install_callee(
+    state: st0,
+    thr: TyRow(types: [], rest: Some(val: TyUserDefined(name: "ρ", args: [])))
+  )
+  let st_open_callee_under_lir = state_with_throw_row(
+    state: st_open_callee,
+    throw_row: TyRow(types: [TyUserDefined(name: "LirError", args: [])], rest: None)
+  )
+  match infer_expr(state: st_open_callee_under_lir, expr: mk_call(sp), ret_type: TyUnit) do
+    | InferExprErr(message: m, span: _) ->
+      raise RuntimeError(val: "open callee row should admit under any caller: " ++ m)
+    | InferExprOk(_) ->
+      assert(cond: true, msg: "open callee row admitted under narrow caller")
+  end
+
+  return ()
+end
