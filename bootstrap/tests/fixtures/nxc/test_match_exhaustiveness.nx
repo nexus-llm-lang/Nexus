@@ -1,5 +1,6 @@
-// Tests for src/typecheck/exhaustive: top-column match exhaustiveness
-// (nexus-mqin.3). Drives check_match_exhaustive directly to avoid the
+// Tests for src/typecheck/exhaustive: match exhaustiveness + redundancy +
+// nested-pattern coverage (nexus-mqin.3 + nexus-j6mr). Drives
+// check_match_exhaustive / check_match_redundancy directly to avoid the
 // constructor-registration plumbing that infer_expr relies on.
 
 import {
@@ -14,7 +15,8 @@ import {
 import { Span } from "src/common/token.nx"
 import { EnumEntry } from "src/typecheck/types.nx"
 import {
-  ExhaustiveResult, Exhaustive, NonExhaustive, check_match_exhaustive
+  ExhaustiveResult, Exhaustive, NonExhaustive, check_match_exhaustive,
+  RedundancyResult, NoRedundant, Redundant, check_match_redundancy
 } from "src/typecheck/exhaustive.nx"
 import { SigilImmutable } from "src/common/ast.nx"
 import { Some, None } from "std:option"
@@ -36,6 +38,31 @@ let is_non_exhaustive = fn (r: ExhaustiveResult) -> bool do
   match r do
     | Exhaustive -> return false
     | NonExhaustive(_) -> return true
+  end
+end
+
+let is_no_redundant = fn (r: RedundancyResult) -> bool do
+  match r do
+    | NoRedundant -> return true
+    | Redundant(_) -> return false
+  end
+end
+
+let redundant_index = fn (r: RedundancyResult) -> i64 do
+  match r do
+    | NoRedundant -> return -1
+    | Redundant(arm_index: i, witness: _) -> return i
+  end
+end
+
+let str_eq = fn (a: string, b: string) -> bool do
+  return a == b
+end
+
+let witness_text = fn (r: ExhaustiveResult) -> string do
+  match r do
+    | Exhaustive -> return ""
+    | NonExhaustive(witness: w) -> return w
   end
 end
 
@@ -153,6 +180,212 @@ let main = fn () -> unit throws { Exn } do
   assert(
     cond: is_non_exhaustive(r: check_match_exhaustive(cases: cases11, scrutinee_type: TyI64, enum_defs: enums)),
     msg: "i64 with only 0 is non-exhaustive"
+  )
+
+  // ─── Redundancy detection (nexus-j6mr §1) ────────────────────────────────
+
+  // Test R1: arm 1 redundant after arm 0 wildcard.
+  let cases_red1 = [
+    HirMatchCase(pattern: PWild, body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "Red", fields: []), body: body_unit)
+  ]
+  let red1 = check_match_redundancy(cases: cases_red1, scrutinee_type: color_ty, enum_defs: enums)
+  assert(
+    cond: redundant_index(r: red1) == 1,
+    msg: "arm 1 (Red) is redundant after a wildcard arm 0"
+  )
+
+  // Test R2: distinct concrete arms — none redundant.
+  let cases_red2 = [
+    HirMatchCase(pattern: PCtor(variant: "Red", fields: []), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "Green", fields: []), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "Blue", fields: []), body: body_unit)
+  ]
+  assert(
+    cond: is_no_redundant(r: check_match_redundancy(cases: cases_red2, scrutinee_type: color_ty, enum_defs: enums)),
+    msg: "Red+Green+Blue has no redundant arms"
+  )
+
+  // Test R3: bool true after true is redundant.
+  let cases_red3 = [
+    HirMatchCase(pattern: PLit(lit: LitBool(val: true)), body: body_unit),
+    HirMatchCase(pattern: PLit(lit: LitBool(val: true)), body: body_unit),
+    HirMatchCase(pattern: PLit(lit: LitBool(val: false)), body: body_unit)
+  ]
+  assert(
+    cond: redundant_index(r: check_match_redundancy(cases: cases_red3, scrutinee_type: TyBool, enum_defs: enums)) == 1,
+    msg: "second `true` arm is redundant"
+  )
+
+  // Test R4: i64 same literal twice — second is redundant.
+  let cases_red4 = [
+    HirMatchCase(pattern: PLit(lit: LitInt(val: 7)), body: body_unit),
+    HirMatchCase(pattern: PLit(lit: LitInt(val: 7)), body: body_unit),
+    HirMatchCase(pattern: PWild, body: body_unit)
+  ]
+  assert(
+    cond: redundant_index(r: check_match_redundancy(cases: cases_red4, scrutinee_type: TyI64, enum_defs: enums)) == 1,
+    msg: "i64 second `7` arm is redundant"
+  )
+
+  // ─── Nested-pattern coverage (nexus-j6mr §2) ─────────────────────────────
+  //
+  // Build an `IntOpt` enum equivalent to `Option<i64>` so nested patterns
+  // don't depend on type-parameter substitution surfacing the inner i64.
+
+  let intopt_def = EnumDef(
+    name: "IntOpt",
+    is_public: true,
+    is_opaque: false,
+    type_params: [],
+    variants: [
+      VariantDef(name: "ISome", fields: [VariantField(name: Some(val: "val"), typ: TyI64)]),
+      VariantDef(name: "INone", fields: [])
+    ]
+  )
+  let intopt_enums = [EnumEntry(name: "IntOpt", def: intopt_def)]
+  let intopt_ty = TyUserDefined(name: "IntOpt", args: [])
+
+  // Test N1: `ISome(_) | INone` — exhaustive.
+  let cases_n1 = [
+    HirMatchCase(pattern: PCtor(variant: "ISome", fields: [HirPatternField(name: None, pattern: PWild)]), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "INone", fields: []), body: body_unit)
+  ]
+  assert(
+    cond: is_exhaustive(r: check_match_exhaustive(cases: cases_n1, scrutinee_type: intopt_ty, enum_defs: intopt_enums)),
+    msg: "ISome(_) + INone is exhaustive"
+  )
+
+  // Test N2: `ISome(1) | INone` — non-exhaustive (other ISome integers
+  // uncovered). Witness must mention ISome.
+  let cases_n2 = [
+    HirMatchCase(pattern: PCtor(variant: "ISome", fields: [HirPatternField(name: None, pattern: PLit(lit: LitInt(val: 1)))]), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "INone", fields: []), body: body_unit)
+  ]
+  let r_n2 = check_match_exhaustive(cases: cases_n2, scrutinee_type: intopt_ty, enum_defs: intopt_enums)
+  assert(
+    cond: is_non_exhaustive(r: r_n2),
+    msg: "ISome(1) + INone is non-exhaustive (other ints in ISome)"
+  )
+  assert(
+    cond: str_eq(a: witness_text(r: r_n2), b: "ISome(_)"),
+    msg: "ISome(1) + INone witness reports ISome(_)"
+  )
+
+  // Test N3: `ISome(1) | ISome(_) | INone` — redundancy: arm 1 covers
+  // ISome(0) but arm 0 covers only ISome(1); arm 1 is NOT redundant — it
+  // catches everything else. So no redundant arm.
+  let cases_n3 = [
+    HirMatchCase(pattern: PCtor(variant: "ISome", fields: [HirPatternField(name: None, pattern: PLit(lit: LitInt(val: 1)))]), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "ISome", fields: [HirPatternField(name: None, pattern: PWild)]), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "INone", fields: []), body: body_unit)
+  ]
+  assert(
+    cond: is_exhaustive(r: check_match_exhaustive(cases: cases_n3, scrutinee_type: intopt_ty, enum_defs: intopt_enums)),
+    msg: "ISome(1) + ISome(_) + INone is exhaustive"
+  )
+  assert(
+    cond: is_no_redundant(r: check_match_redundancy(cases: cases_n3, scrutinee_type: intopt_ty, enum_defs: intopt_enums)),
+    msg: "ISome(1) + ISome(_) + INone has no redundant arms"
+  )
+
+  // Test N4: redundancy via wildcard inside ctor — `ISome(_)` then
+  // `ISome(2)` shadows the second.
+  let cases_n4 = [
+    HirMatchCase(pattern: PCtor(variant: "ISome", fields: [HirPatternField(name: None, pattern: PWild)]), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "ISome", fields: [HirPatternField(name: None, pattern: PLit(lit: LitInt(val: 2)))]), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "INone", fields: []), body: body_unit)
+  ]
+  assert(
+    cond: redundant_index(r: check_match_redundancy(cases: cases_n4, scrutinee_type: intopt_ty, enum_defs: intopt_enums)) == 1,
+    msg: "ISome(2) is redundant after ISome(_)"
+  )
+
+  // Test N5: nested ctor inside ctor. Build a manual `IntList = INil |
+  // ICons(head: i64, tail: IntList)` recursive enum. Cover with
+  // `ICons(0, INil) | INil` — non-exhaustive (other ints, longer lists).
+  let intlist_ty = TyUserDefined(name: "IntList", args: [])
+  let intlist_def = EnumDef(
+    name: "IntList",
+    is_public: true,
+    is_opaque: false,
+    type_params: [],
+    variants: [
+      VariantDef(name: "INil", fields: []),
+      VariantDef(name: "ICons", fields: [
+        VariantField(name: Some(val: "head"), typ: TyI64),
+        VariantField(name: Some(val: "tail"), typ: intlist_ty)
+      ])
+    ]
+  )
+  let intlist_enums = [EnumEntry(name: "IntList", def: intlist_def)]
+
+  let cases_n5 = [
+    HirMatchCase(pattern: PCtor(variant: "ICons", fields: [
+      HirPatternField(name: None, pattern: PLit(lit: LitInt(val: 0))),
+      HirPatternField(name: None, pattern: PCtor(variant: "INil", fields: []))
+    ]), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "INil", fields: []), body: body_unit)
+  ]
+  assert(
+    cond: is_non_exhaustive(r: check_match_exhaustive(cases: cases_n5, scrutinee_type: intlist_ty, enum_defs: intlist_enums)),
+    msg: "ICons(0, INil) + INil is non-exhaustive (other heads / tails)"
+  )
+
+  // Test N6: nested ctor exhaustive — `ICons(_, _) | INil`.
+  let cases_n6 = [
+    HirMatchCase(pattern: PCtor(variant: "ICons", fields: [
+      HirPatternField(name: None, pattern: PWild),
+      HirPatternField(name: None, pattern: PWild)
+    ]), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "INil", fields: []), body: body_unit)
+  ]
+  assert(
+    cond: is_exhaustive(r: check_match_exhaustive(cases: cases_n6, scrutinee_type: intlist_ty, enum_defs: intlist_enums)),
+    msg: "ICons(_, _) + INil is exhaustive over IntList"
+  )
+
+  // Test N7: nested in nested — `ICons(_, ICons(_, _)) | ICons(_, INil) |
+  // INil`. Should be exhaustive (every IntList shape matched).
+  let cases_n7 = [
+    HirMatchCase(pattern: PCtor(variant: "ICons", fields: [
+      HirPatternField(name: None, pattern: PWild),
+      HirPatternField(name: None, pattern: PCtor(variant: "ICons", fields: [
+        HirPatternField(name: None, pattern: PWild),
+        HirPatternField(name: None, pattern: PWild)
+      ]))
+    ]), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "ICons", fields: [
+      HirPatternField(name: None, pattern: PWild),
+      HirPatternField(name: None, pattern: PCtor(variant: "INil", fields: []))
+    ]), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "INil", fields: []), body: body_unit)
+  ]
+  assert(
+    cond: is_exhaustive(r: check_match_exhaustive(cases: cases_n7, scrutinee_type: intlist_ty, enum_defs: intlist_enums)),
+    msg: "nested ICons split by tail kind + INil is exhaustive"
+  )
+
+  // Test N8: nested non-exhaustive at depth 2 — `ICons(_, ICons(_, INil))
+  // | ICons(_, INil) | INil` misses ICons(_, ICons(_, ICons(...))). Witness
+  // should reflect the missing nested shape.
+  let cases_n8 = [
+    HirMatchCase(pattern: PCtor(variant: "ICons", fields: [
+      HirPatternField(name: None, pattern: PWild),
+      HirPatternField(name: None, pattern: PCtor(variant: "ICons", fields: [
+        HirPatternField(name: None, pattern: PWild),
+        HirPatternField(name: None, pattern: PCtor(variant: "INil", fields: []))
+      ]))
+    ]), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "ICons", fields: [
+      HirPatternField(name: None, pattern: PWild),
+      HirPatternField(name: None, pattern: PCtor(variant: "INil", fields: []))
+    ]), body: body_unit),
+    HirMatchCase(pattern: PCtor(variant: "INil", fields: []), body: body_unit)
+  ]
+  assert(
+    cond: is_non_exhaustive(r: check_match_exhaustive(cases: cases_n8, scrutinee_type: intlist_ty, enum_defs: intlist_enums)),
+    msg: "missing ICons(_, ICons(_, ICons(_, _))) is non-exhaustive"
   )
 
   return ()
