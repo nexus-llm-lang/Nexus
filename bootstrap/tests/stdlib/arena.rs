@@ -48,7 +48,7 @@
 //! boundaries and lands in user memory, where `heap_reset` reclaims it.
 
 use crate::harness::compile::compile_fixture_via_nxc;
-use crate::harness::{exec_with_stdlib, TempDir};
+use crate::harness::{exec_nxc_core_capture_stdout, exec_with_stdlib, TempDir};
 
 /// Acceptance #1 — echo-server fixture (listen / accept / respond /
 /// heap_mark+heap_reset wrapping) typechecks and codegens via the
@@ -332,4 +332,35 @@ end
 "#
     ));
     exec_with_stdlib(&src);
+}
+
+/// Acceptance #2 + delta-pages observation for nexus-a7ai — the routed
+/// allocator's LIFO bookkeeping must be reclaimed via the **nxc codegen
+/// path**, not just the Rust bootstrap path. Pre-fix, `emit_heap_reset`
+/// only rewound G0; every iteration's `from_i64` / concat / substring
+/// allocations accumulated in `nexus_wasm_alloc::ALLOCATIONS` and the
+/// underlying `memory.size` grew monotonically. Post-fix, `emit_heap_mark`
+/// snapshots the routed-allocator count into the upper 32 bits of `mark`
+/// and `emit_heap_reset` calls `__nx_alloc_reset(upper)` to LIFO-pop
+/// every routed allocation past the mark — at parity with
+/// bootstrap/src/compiler/codegen/function.rs::Intrinsic::HeapReset.
+///
+/// The fixture self-asserts (trap-on-mismatch via `1 / ~zero`) that
+/// post-loop `memory.size` equals pre-loop. Pre-fix observation was
+/// `delta_pages=998` for the same workload; post-fix is exactly 0
+/// (whole-page reclamation is exact when the per-iter footprint stays
+/// within already-grown pages and the mark/reset bracket is symmetric).
+#[test]
+fn arena_100k_echo_workload_alloc_lifo_reset_via_nxc() {
+    let stdout = exec_nxc_core_capture_stdout(
+        "bootstrap/tests/fixtures/nxc/test_arena_alloc_reset_smoke.nx",
+    );
+    assert!(
+        stdout.contains("delta_pages=0"),
+        "expected delta_pages=0 (routed allocator LIFO reclaimed) but got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("FAIL:"),
+        "fixture asserted leak detected: {stdout}"
+    );
 }
