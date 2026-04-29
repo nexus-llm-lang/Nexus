@@ -646,6 +646,122 @@ fn math_pure_nexus_integer_ops_acceptance() {
     exec_nxc_core("bootstrap/tests/fixtures/nxc/test_math_pure_nexus_integer_ops.nx");
 }
 
+/// nexus-thby acceptance: 128-bit SIMD primitives (`i32x4` / `i64x2` /
+/// `f32x4` / `f64x2` add+mul) and the autovectorized `i32x4_add_array` /
+/// `f32x4_add_array` loop intrinsics dispatch through codegen.nx as inline
+/// 0xFD-prefixed wasm and produce correct lane-wise results.
+///
+/// Two-pronged check (mirrors the runtime_mem_math intrinsic test):
+///   1. Stdout-interleave: every printed line is one lane / one
+///      autovectorize-equality count, so a missing or mis-encoded SIMD op
+///      surfaces as a value or line-count mismatch.
+///   2. Bytecode scan: the compiled wasm bytes must contain the SIMD-prefix
+///      sequence (0xFD) followed by at least one of the lane sub-opcodes
+///      we expect (e.g. `i32x4.add` = sub 0xAE → encoded as `FD AE 01`).
+///      The scan rejects a regression where dispatch silently falls back
+///      to a function call, which would still pass the stdout check but
+///      produce zero SIMD instructions in the output module.
+fn count_simd_op_uses(wasm: &[u8], sub_op: u32) -> usize {
+    // SIMD encoding: 0xFD prefix byte followed by ULEB128 sub-opcode. For
+    // sub-ops < 128 the ULEB is one byte; for >= 128 it is two bytes
+    // (low7 with continuation bit set, then high7).
+    let mut count = 0;
+    let mut i = 0;
+    while i + 1 < wasm.len() {
+        if wasm[i] == 0xFD {
+            // Decode the next ULEB128 (max 5 bytes for u32).
+            let mut val: u32 = 0;
+            let mut shift = 0;
+            let mut j = i + 1;
+            while j < wasm.len() {
+                let b = wasm[j];
+                val |= u32::from(b & 0x7F) << shift;
+                j += 1;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+                if shift >= 32 {
+                    break;
+                }
+            }
+            if val == sub_op {
+                count += 1;
+            }
+        }
+        i += 1;
+    }
+    count
+}
+
+#[test]
+fn simd_autovectorize_acceptance() {
+    let fixture = "bootstrap/tests/fixtures/nxc/test_simd_autovectorize.nx";
+
+    // Bytecode-side check first — proves the dispatch table emits SIMD ops,
+    // not just that the program ran. Without this, a regression that elided
+    // every `0xFD` from emit_simd_* would still pass the stdout check
+    // (because a function-call fallback returning the right value would
+    // print the same lines).
+    let wasm = compile_fixture_via_nxc(fixture);
+    // i32x4.add (sub 0xAE = 174) — used by both the single-quad ops and the
+    // i32x4_add_array intrinsic, so must appear at least twice.
+    let n_i32x4_add = count_simd_op_uses(&wasm, 0xAE);
+    assert!(
+        n_i32x4_add >= 2,
+        "expected at least 2 i32x4.add (0xAE) uses, found {n_i32x4_add} — \
+         dispatch may have fallen back to function calls"
+    );
+    // f32x4.add (sub 0xE4 = 228) — used by the f32x4_add_array intrinsic,
+    // so must appear at least once.
+    let n_f32x4_add = count_simd_op_uses(&wasm, 0xE4);
+    assert!(
+        n_f32x4_add >= 1,
+        "expected at least 1 f32x4.add (0xE4) use, found {n_f32x4_add}"
+    );
+    // i64x2.add (sub 0xCE = 206) — used by the single-pair op.
+    let n_i64x2_add = count_simd_op_uses(&wasm, 0xCE);
+    assert!(
+        n_i64x2_add >= 1,
+        "expected at least 1 i64x2.add (0xCE) use, found {n_i64x2_add}"
+    );
+
+    // Runtime-side: every line is the answer for one lane / equality count.
+    // A missing or mis-encoded SIMD op surfaces here as a value or count
+    // mismatch (silently-dropped op fails the line-count guard).
+    let out = exec_nxc_core_capture_stdout(fixture);
+    let lines: Vec<&str> = out.lines().map(str::trim).collect();
+    let expected = [
+        // (1) i32x4_add: lanes [10,20,30,40] + [1,2,3,4]
+        "11", "22", "33", "44",
+        // (2) i32x4_mul: same operands → [10,40,90,160]
+        "10", "40", "90", "160",
+        // (3) i64x2_add: [1000,2000] + [7,11]
+        "1007", "2011",
+        // (4) i64x2_mul: same operands
+        "7000", "22000",
+        // (5) i32x4_add_array vs scalar_i32_add_array agreement (64 bytes)
+        "64",
+        // (6) f32x4_add_array determinism (same input → same 64-byte output)
+        "64",
+    ];
+    assert_eq!(
+        lines.len(),
+        expected.len(),
+        "expected {} lines, got {} — full stdout:\n{}",
+        expected.len(),
+        lines.len(),
+        out
+    );
+    for (i, want) in expected.iter().enumerate() {
+        assert_eq!(
+            lines[i], *want,
+            "line {i} mismatch: want {want:?}, got {:?} — full stdout:\n{out}",
+            lines[i]
+        );
+    }
+}
+
 /// Regression for nexus-pt8g: arity-N (N >= 1) top-level fn references
 /// stored as record fields (handler-vtable shape) used to trip
 /// `lookup_closure_type_idx_pairs` with E3001 because

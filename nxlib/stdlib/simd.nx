@@ -1,0 +1,120 @@
+/**
+ * simd: 128-bit fixed-width SIMD primitives + an autovectorized array-add.
+ *
+ * The compiler (codegen.nx) recognises `nexus:runtime/simd` externals and
+ * inline-emits the corresponding WASM SIMD op sequence (v128.load → lane-op →
+ * v128.store), so these declarations carry no import-section overhead.
+ *
+ * Lane shapes covered: `f32x4` (four 32-bit floats per quad), `f64x2` (two
+ * 64-bit floats), `i32x4` (four 32-bit ints), `i64x2` (two 64-bit ints).
+ * Each `_add` / `_mul` primitive operates on one quad at a time and writes
+ * 16 bytes to `dst_addr`. Pointers are i64 across the FFI boundary, truncated
+ * to i32 inside the intrinsic.
+ *
+ * Autovectorize: `f32x4_add_array(a, b, dst, n)` expands to a SIMD loop that
+ * processes `n` quads of 4 floats each — the vectorized form of the scalar
+ * loop `for i in 0..(n*4): dst[i] = a[i] + b[i]`. Use this primitive in place
+ * of a hand-written scalar loop when the source/dest are 16-byte aligned and
+ * the element count is a multiple of 4.
+ *
+ * Alignment: `v128.load` / `v128.store` accept any address but emit align=4
+ * (16-byte). Mis-aligned access is well-defined per the SIMD spec but may
+ * be slower on engines that fast-path aligned cases.
+ *
+ * Target gating: WebAssembly SIMD is part of the WebAssembly 2.0 baseline
+ * and is enabled by default in wasmtime 13+. Engines lacking simd128 will
+ * reject the produced module at validation time — there is no runtime
+ * feature probe. For environments without simd128, use `scalar_i32_add_array`
+ * below as the explicit non-SIMD fallback for the integer lane shape (no
+ * inline-WASM dispatch; runs as an ordinary Nexus loop through `runtime_mem`).
+ */
+import external "nexus:runtime/simd"
+import * as mem from "std:runtime_mem"
+
+// ─── 1-quad lane-wise primitives ────────────────────────────────────────────
+// Each takes three i64 addresses and writes 16 bytes to `dst_addr`. Reads of
+// `a_addr` / `b_addr` are 16 bytes each. Returns unit; the side-effect is the
+// store to `dst_addr`.
+
+/// Lane-wise f32 add over four 32-bit floats: dst[0..16] = a[0..16] + b[0..16]
+/// interpreted as four f32 lanes.
+export external f32x4_add = "__nx_simd_f32x4_add"
+  : (a_addr: i64, b_addr: i64, dst_addr: i64) -> unit
+
+/// Lane-wise f32 mul over four 32-bit floats.
+export external f32x4_mul = "__nx_simd_f32x4_mul"
+  : (a_addr: i64, b_addr: i64, dst_addr: i64) -> unit
+
+/// Lane-wise f64 add over two 64-bit floats.
+export external f64x2_add = "__nx_simd_f64x2_add"
+  : (a_addr: i64, b_addr: i64, dst_addr: i64) -> unit
+
+/// Lane-wise f64 mul over two 64-bit floats.
+export external f64x2_mul = "__nx_simd_f64x2_mul"
+  : (a_addr: i64, b_addr: i64, dst_addr: i64) -> unit
+
+/// Lane-wise i32 add over four 32-bit integers (wrapping arithmetic).
+export external i32x4_add = "__nx_simd_i32x4_add"
+  : (a_addr: i64, b_addr: i64, dst_addr: i64) -> unit
+
+/// Lane-wise i32 mul over four 32-bit integers (wrapping arithmetic).
+export external i32x4_mul = "__nx_simd_i32x4_mul"
+  : (a_addr: i64, b_addr: i64, dst_addr: i64) -> unit
+
+/// Lane-wise i64 add over two 64-bit integers (wrapping arithmetic).
+export external i64x2_add = "__nx_simd_i64x2_add"
+  : (a_addr: i64, b_addr: i64, dst_addr: i64) -> unit
+
+/// Lane-wise i64 mul over two 64-bit integers (wrapping arithmetic).
+export external i64x2_mul = "__nx_simd_i64x2_mul"
+  : (a_addr: i64, b_addr: i64, dst_addr: i64) -> unit
+
+// ─── Autovectorized array primitive ─────────────────────────────────────────
+
+/// Autovectorized element-wise float-add: process `n_quads` × 4 floats from
+/// `a_addr` and `b_addr`, writing `n_quads` × 16 bytes to `dst_addr`. The
+/// inline-emitted body is a wasm loop that iterates one quad per turn with a
+/// `f32x4.add` lane-op — equivalent to the scalar loop
+///   for i in 0..(n_quads * 4): dst[i] = a[i] + b[i]
+/// but emits a single SIMD instruction per four-float chunk.
+export external f32x4_add_array = "__nx_simd_f32x4_add_array"
+  : (a_addr: i64, b_addr: i64, dst_addr: i64, n_quads: i64) -> unit
+
+/// Autovectorized element-wise i32 add over `n_quads` × 4 lanes — same loop
+/// shape as `f32x4_add_array`, but the lane-op is `i32x4.add` (wrapping
+/// integer arithmetic). Use this with `scalar_i32_add_array` as the
+/// reference implementation when bit-comparing SIMD output to the scalar
+/// fallback.
+export external i32x4_add_array = "__nx_simd_i32x4_add_array"
+  : (a_addr: i64, b_addr: i64, dst_addr: i64, n_quads: i64) -> unit
+
+// ─── Scalar fallback ────────────────────────────────────────────────────────
+// When the target engine lacks simd128 support, use `scalar_i32_add_array`
+// as the explicit non-SIMD path for the integer lane shape. This is a regular
+// Nexus loop over `runtime_mem.load_i32` / `runtime_mem.store_i32` — it never
+// compiles to a 0xFD-prefixed instruction. Choose this manually when the
+// deployment target is known to predate WebAssembly 2.0; there is no runtime
+// probe (an unsupported simd128 module fails at validate time, not at run
+// time, so feature-detection at the Nexus level would be cosmetic anyway).
+//
+// No bitwise-identical f32 fallback is provided here because exposing a
+// scalar f32 add would require an f32 arithmetic primitive that this layer
+// does not own. Callers needing f32 fallback can either route through
+// `std:math` (host-side f64) or stay on the SIMD path and let the engine
+// reject the module if simd128 is missing.
+
+let scalar_i32_add_step = fn (a_addr: i64, b_addr: i64, d_addr: i64, count: i64) -> unit do
+  if count <= 0 then return () end
+  let av = mem.load_i32(addr: a_addr)
+  let bv = mem.load_i32(addr: b_addr)
+  let _ = mem.store_i32(addr: d_addr, val: av + bv)
+  return scalar_i32_add_step(a_addr: a_addr + 4, b_addr: b_addr + 4, d_addr: d_addr + 4, count: count - 1)
+end
+
+/// Scalar (non-SIMD) fallback for `i32x4_add` over an array. Walks
+/// `n_quads * 4` 32-bit ints via plain `runtime_mem` ops; never emits
+/// 0xFD-prefixed bytes. Caller is responsible for choosing this over the
+/// SIMD primitive when the engine lacks simd128.
+export let scalar_i32_add_array = fn (a_addr: i64, b_addr: i64, dst_addr: i64, n_quads: i64) -> unit do
+  return scalar_i32_add_step(a_addr, b_addr, d_addr: dst_addr, count: n_quads * 4)
+end
