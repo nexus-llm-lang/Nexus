@@ -591,3 +591,49 @@ fn funcref_arity2_handler_vtable_via_nxc() {
         "expected 'add=7 mul=12' (wrapper forwards through Vt2 vtable) but got: {out}"
     );
 }
+
+/// nexus-dvr6.9.2 acceptance: pure-Nexus `nxlib/stdlib/wasm_alloc.nx` bump
+/// allocator compiles + runs end-to-end via the self-hosted compiler.
+/// The fixture covers all four acceptance assertions in one stdout-interleave
+/// check so a silently-dropped intrinsic dispatch fails the line count, not
+/// a quiet PASS:
+///   1. allocate alignment (two consecutive 24-byte allocations are 32 bytes apart)
+///   2. memory.grow trigger when the request would exceed the state-cell address
+///   3. mark + reset round-trip leaves the bump pointer at the saved mark
+///   4. 1000-iteration alloc + reset workload keeps the bump pointer bounded
+///      (RSS-bounded — the same shape as the gv2u arena workloads, but
+///      driven through the new pure-Nexus allocator instead of routed-stdlib)
+///   5. store_string_result + read_string round-trip recovers the original
+///      string via raw byte access through `runtime_mem` load_u8 / store_u8.
+/// Path X (pure bump, no per-allocation tracking) per the issue body's
+/// "deallocate can be no-op for bump alloc" — full audit in the commit
+/// body and in `bd note nexus-dvr6.9.2`.
+#[test]
+fn wasm_alloc_pure_nexus_acceptance() {
+    let out = exec_nxc_core_capture_stdout(
+        "bootstrap/tests/fixtures/nxc/test_wasm_alloc_pure_nexus.nx",
+    );
+    let lines: Vec<&str> = out.lines().map(|l| l.trim()).collect();
+    let expected = [
+        "ok-align",
+        "ok-grow",
+        "ok-reset",
+        "ok-bounded",
+        "ok-string",
+    ];
+    assert_eq!(
+        lines.len(),
+        expected.len(),
+        "expected {} lines, got {} — full stdout:\n{}",
+        expected.len(),
+        lines.len(),
+        out
+    );
+    for (i, want) in expected.iter().enumerate() {
+        assert_eq!(
+            lines[i], *want,
+            "line {} mismatch: want {:?}, got {:?} — full stdout:\n{}",
+            i, want, lines[i], out
+        );
+    }
+}
