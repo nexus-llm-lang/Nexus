@@ -46,9 +46,11 @@ import {
   empty_state, drive_messages, DriveResult,
   Handlers
 } from "nxlib/lsp/server.nx"
-import { nexus_handlers } from "src/lsp/handlers.nx"
+import { nexus_handlers, compute_diagnostics_for_buffer } from "src/lsp/handlers.nx"
+import { DiagEntry, diagnostic_file } from "src/lsp/diagnostics.nx"
 import { Fs }, * as fs_mod from "std:fs"
 import { Console }, * as stdio from "std:stdio"
+import * as str from "std:str"
 
 let assert = fn (cond: bool, msg: string) -> unit throws { Exn } do
   if cond then return ()
@@ -324,12 +326,70 @@ let test_version_bump_invalidates_cache_after_import_fix = fn () -> unit require
   end
 end
 
+// ─── nexus-qgfh: DiagEntry carries originating file identity ───────────────
+//
+// Issue contract: HIR functions tag their source-file path during HIR build
+// (`HirFunction.file`); when typecheck raises a TypeMismatch inside an
+// imported function, `compute_diagnostics_for_buffer` consults that field
+// instead of the editor-supplied entry-file path. This test bypasses the
+// LSP wire layer to assert the internal `DiagEntry.file` directly — the
+// publishDiagnostics frame's `params.uri` is per-frame, so it can't show
+// per-diagnostic file granularity without a routing layer that splits the
+// diagnostic stream into one frame per file (a follow-on; see issue body).
+
+let any_diagnostic_for_imported = fn (diags: [DiagEntry], imported: string) -> bool do
+  match diags do
+    | [] -> return false
+    | d :: rest ->
+      let f = diagnostic_file(d)
+      // Match either exact path equality or suffix (parser may have
+      // sanitised separators when canonicalising; `physical` is the
+      // un-sanitised form).
+      if f == imported then return true end
+      if str.length(s: f) >= str.length(s: imported) then
+        let tail_start = str.length(s: f) - str.length(s: imported)
+        if str.substring(s: f, start: tail_start, len: str.length(s: imported)) == imported then
+          return true
+        end
+      end
+      return any_diagnostic_for_imported(diags: rest, imported)
+  end
+end
+
+let test_diag_entry_carries_imported_file_path = fn () -> unit require { Fs, Console } throws { Exn } do
+  // The importer buffer is well-typed in isolation. The TypeMismatch lives
+  // in lib.nx — `bar`'s body returns "not an int" at i64. After HIR build,
+  // the `bar` HirFunction has file = "tmp_avdp_lsp/lib.nx". The diagnostic
+  // emitted by enumerate_diagnostics must reflect that path, NOT the
+  // entry-file URI passed to compute_diagnostics_for_buffer.
+  let entry_uri = "file:///workspace/importer.nx"
+  let diags = compute_diagnostics_for_buffer(text: importer_text(), file: entry_uri)
+  assert(cond: len_diags(xs: diags) >= 1,
+    msg: "expected at least one diagnostic from imported lib")
+  // The imported file's diagnostic must report the imported path — not the
+  // entry URI. The actual stored value is whatever `process_imports` resolved
+  // (`tmp_avdp_lsp/lib.nx` in the test fixture).
+  let imported = imported_path()
+  assert(cond: any_diagnostic_for_imported(diags, imported),
+    msg: "DiagEntry.file must carry the imported file's path, not the entry URI")
+end
+
+let len_diags = fn (xs: [DiagEntry]) -> i64 do
+  match xs do
+    | [] -> return 0
+    | _ :: rest -> return 1 + len_diags(xs: rest)
+  end
+end
+
 let main = fn () -> unit require { PermFs, PermConsole } do
   inject fs_mod.system_handler, stdio.system_handler do
     try
       setup_workspace()
       test_importer_diagnostic_reflects_imported_error()
       test_same_version_diagnostics_are_cached()
+      // The cross-file file-identity check shares the same buggy lib.nx
+      // fixture; run it before the version-bump test rewrites lib.nx clean.
+      test_diag_entry_carries_imported_file_path()
       // Reset the imported file before the version-bump test, which mutates it.
       setup_workspace()
       test_version_bump_invalidates_cache_after_import_fix()

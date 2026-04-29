@@ -23,7 +23,7 @@
 
 import { TypeExpr } from "src/common/ast.nx"
 import { Span } from "src/common/token.nx"
-import { HirProgram } from "src/ir/hir_types.nx"
+import { HirProgram, HirFunction } from "src/ir/hir_types.nx"
 import {
   TypeMismatch, MissingMain, MainNotFunction, MainNotUnit, MainThrowsTooBroad,
   LazyBindingUnused, LazyBindingDoubleUse,
@@ -157,12 +157,12 @@ end
 /// Run the typechecker, capturing the first CompileError as a DiagEntry.
 /// Returns an empty list when typecheck succeeds.
 ///
-/// `file` is the source path that the caller associates with `hir`. Spans
-/// inside `hir` carry only (offset, line, col) — no file identity — so the
-/// diagnostic file is supplied by the caller. When typecheck reports an error
-/// in a function whose origin is an imported module, the returned diagnostic
-/// still carries `file` (the entry file); cross-file association is a Phase 2
-/// concern (would require threading source_file through the HIR per node).
+/// `file` is the *fallback* source path the caller associates with `hir`.
+/// HIR functions carry their originating `file` field (issue nexus-qgfh,
+/// design choice ii) — when a typecheck error names a function, the
+/// emitter prefers that function's file over the fallback. The fallback
+/// is used for span-less errors (MissingMain) or errors whose function
+/// is not in the HIR table (lex/parse failures, exception groups).
 export let enumerate_diagnostics = fn (
   hir: HirProgram,
   local_names: [string],
@@ -171,7 +171,34 @@ export let enumerate_diagnostics = fn (
   try
     let _ = tc.check_program(hir, local_names)
     return []
-  catch err -> return [diagnostic_from_error(err, file)]
+  catch err -> return [diagnostic_from_error(err, hir, fallback_file: file)]
+  end
+end
+
+// ─── HIR function-name → file lookup ─────────────────────────────────────────
+//
+// TypeMismatch / linearity errors carry the offending function's *qualified*
+// name. The HirFunction list owns the (name, file) pair set during HIR
+// build (`process_tl_let` reads the threaded `source_file`); reverse-look
+// the function to recover its file. Returns the fallback when no match —
+// this happens for synthesised handler-arm names whose binding came from
+// a different table, plus span-less errors that have no function context.
+
+let lookup_func_file = fn (funcs: [HirFunction], name: string, fallback: string) -> string do
+  match funcs do
+    | [] -> return fallback
+    | HirFunction(name: n, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span: _, file: fp) :: rest ->
+      if n == name then
+        if fp == "" then return fallback end
+        return fp
+      end
+      return lookup_func_file(funcs: rest, name, fallback)
+  end
+end
+
+let resolve_func_file = fn (hir: HirProgram, name: string, fallback: string) -> string do
+  match hir do | HirProgram(ports: _, functions, externals: _, handler_bindings: _, enum_defs: _, exception_groups: _) ->
+    return lookup_func_file(funcs: functions, name, fallback)
   end
 end
 
@@ -222,34 +249,40 @@ end
 /// they collapse onto (1, 1) since they are file-level invariants rather than
 /// pointing at specific syntax. `format_error` provides the user-visible
 /// message; `code` mirrors the bracketed error code in that message.
-let diagnostic_from_error = fn (err: Exn, file: string) -> DiagEntry do
+///
+/// `hir` is consulted for the per-function file lookup (issue nexus-qgfh):
+/// errors that carry a function name pick that function's `file` field
+/// (set during HIR build from `source_file`); span-less errors fall back
+/// to the caller-supplied `fallback_file`.
+let diagnostic_from_error = fn (err: Exn, hir: HirProgram, fallback_file: string) -> DiagEntry do
   match err do
-    | TypeMismatch(func_name: _, detail: _, span: sp) ->
+    | TypeMismatch(func_name: fname, detail: _, span: sp) ->
+      let file = resolve_func_file(hir, name: fname, fallback: fallback_file)
       return DiagEntry(file, range: range_from_span(sp),
         severity: SeverityError, code: "E2001", message: format_error(err))
     | LazyBindingUnused(name: _, span: sp) ->
-      return DiagEntry(file, range: range_from_span(sp),
+      return DiagEntry(file: fallback_file, range: range_from_span(sp),
         severity: SeverityError, code: "E2005", message: format_error(err))
     | LazyBindingDoubleUse(name: _, span: sp) ->
-      return DiagEntry(file, range: range_from_span(sp),
+      return DiagEntry(file: fallback_file, range: range_from_span(sp),
         severity: SeverityError, code: "E2006", message: format_error(err))
     | UnexpectedToken(expected: _, got: _, span: sp) ->
-      return DiagEntry(file, range: range_from_span(sp),
+      return DiagEntry(file: fallback_file, range: range_from_span(sp),
         severity: SeverityError, code: "E1001", message: format_error(err))
     | UnexpectedEof(expected: _, span: sp) ->
-      return DiagEntry(file, range: range_from_span(sp),
+      return DiagEntry(file: fallback_file, range: range_from_span(sp),
         severity: SeverityError, code: "E1002", message: format_error(err))
     | LexError(message: _, span: opt_sp) ->
-      return DiagEntry(file, range: range_from_optional_span(osp: opt_sp),
+      return DiagEntry(file: fallback_file, range: range_from_optional_span(osp: opt_sp),
         severity: SeverityError, code: "E1000", message: format_error(err))
     | MissingMain ->
-      return DiagEntry(file, range: file_origin_range(),
+      return DiagEntry(file: fallback_file, range: file_origin_range(),
         severity: SeverityError, code: "E2002", message: format_error(err))
     | MainNotFunction ->
-      return DiagEntry(file, range: file_origin_range(),
+      return DiagEntry(file: fallback_file, range: file_origin_range(),
         severity: SeverityError, code: "E2003", message: format_error(err))
     | MainNotUnit ->
-      return DiagEntry(file, range: file_origin_range(),
+      return DiagEntry(file: fallback_file, range: file_origin_range(),
         severity: SeverityError, code: "E2004", message: format_error(err))
     | MainThrowsTooBroad(detail: _) ->
       return DiagEntry(file, range: file_origin_range(),
@@ -259,7 +292,7 @@ let diagnostic_from_error = fn (err: Exn, file: string) -> DiagEntry do
       // here. Use format_error for the message and a file-origin range — the
       // diagnostic remains actionable even though phase-specific spans are
       // not surfaced yet.
-      return DiagEntry(file, range: file_origin_range(),
+      return DiagEntry(file: fallback_file, range: file_origin_range(),
         severity: SeverityError, code: "", message: format_error(err))
   end
 end
