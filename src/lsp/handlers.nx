@@ -20,16 +20,43 @@
  *   src/lsp/symbols.nx         - parsed AST -> DocumentSymbol tree
  *   src/lsp/handlers.nx (here) - method-name -> handler glue
  *   src/lsp/main.nx            - entry point (capability injection only)
+ *
+ * Multi-file diagnostics:
+ *   `compute_diagnostics_for_buffer` parses the buffer's `import` statements,
+ *   walks each (non-external) reference through `src/ir/imports.process_imports`
+ *   to read + parse imported `.nx` files via the `Fs` cap, then runs the
+ *   typechecker on the combined HIR. Cross-file errors (a type mismatch in
+ *   an imported function whose signature the importer relies on) surface as
+ *   diagnostics on the importer.
+ *
+ * Per-URI cache:
+ *   The handler vtable is purely functional; the cache lives in
+ *   `ServerState.user_data` as a JSON-encoded `(uri -> {version, diagnostics})`
+ *   map. A `didChange` whose version matches the cached entry returns the
+ *   stored wire-format diagnostics array verbatim — same buffer text plus
+ *   identical imports means identical diagnostics. Any version bump (the
+ *   client's contract for "buffer changed") invalidates the entry and
+ *   triggers a fresh typecheck. Cross-file invalidation (an imported file
+ *   changing on disk while the importing file's version stays put) is not
+ *   modelled here and is post-MVP per the issue's scope note; the editor
+ *   triggering a `didChange` on the importer (e.g. via "Reload Window")
+ *   re-bumps the version and clears the cache.
  */
 
-import { JsonValue, JsonArray, JsonString, get_field } from "std:json"
+import { JsonValue, JsonNull, JsonInt, JsonString, JsonArray, JsonObject, JsonField, get_field } from "std:json"
 import { Option, Some, None } from "std:option"
 import * as lexer from "src/frontend/lexer.nx"
 import * as parser from "src/frontend/parser.nx"
-import { Program, SpannedTopLevel, GlobalLet, TLLet } from "src/common/ast.nx"
-import { HirProgram } from "src/ir/hir_types.nx"
-import { process_defs, accum_to_program, empty_accum } from "src/ir/hir.nx"
-import { iterative_resolve } from "src/ir/demand.nx"
+import { Program, SpannedTopLevel, GlobalLet, TLLet, Cap, TLCap } from "src/common/ast.nx"
+import { HirProgram, HirFunction } from "src/ir/hir_types.nx"
+import * as hir from "src/ir/hir.nx"
+import * as resolve from "src/ir/resolve.nx"
+import { ImportResult, process_imports, append_entries } from "src/ir/imports.nx"
+import { resolve_all_lazy_no_filter } from "src/ir/demand.nx"
+import { RenameEntry }, * as symtab from "src/ir/symtab.nx"
+import * as rdr from "src/ir/rdrname.nx"
+import { Fs } from "std:fs"
+import { Console } from "std:stdio"
 import {
   DiagEntry, DiagRange, Severity,
   SeverityError, SeverityWarning, SeverityInformation, SeverityHint,
@@ -48,7 +75,7 @@ import {
   versioned_text_document_identifier_from_json,
   ContentChangeFull, ContentChangeIncremental,
   content_change_event_from_json,
-  PublishDiagnosticsParams,
+  PublishDiagnosticsParams, publish_diagnostics_params_to_json,
   Position, Range, Diagnostic, DocumentSymbol,
   document_symbol_to_json,
   DiagSevError, DiagSevWarning, DiagSevInformation, DiagSevHint,
@@ -70,9 +97,21 @@ let state_documents = fn (state: ServerState) -> DocumentStore do
   end
 end
 
+let state_user_data = fn (state: ServerState) -> JsonValue do
+  match state do | ServerState(lifecycle: _, documents: _, user_data) ->
+    return user_data
+  end
+end
+
 let with_documents = fn (state: ServerState, docs: DocumentStore) -> ServerState do
   match state do | ServerState(lifecycle, documents: _, user_data) ->
     return ServerState(lifecycle, documents: docs, user_data)
+  end
+end
+
+let with_user_data = fn (state: ServerState, user_data: JsonValue) -> ServerState do
+  match state do | ServerState(lifecycle, documents, user_data: _) ->
+    return ServerState(lifecycle, documents, user_data)
   end
 end
 
@@ -146,62 +185,197 @@ let to_wire_diagnostics = fn (xs: [DiagEntry]) -> [Diagnostic] do
   return reverse_wire_diags(xs: reversed, acc: [])
 end
 
-// ─── HIR build (no imports) ──────────────────────────────────────────────────
+// ─── HIR build (with imports) ────────────────────────────────────────────────
 //
-// In-buffer pipeline only: lex -> parse -> process_defs -> iterative_resolve.
-// That covers `enumerate_diagnostics` for the buffer's own contents; cross-file
-// errors require the import resolver, which needs Fs and a workspace root and
-// runs through `src/ir/imports.process_imports` (the same path the driver
-// uses). The `Fs`-capable variant is post-MVP because the `Handlers` vtable
-// in `nxlib/lsp/server.nx` does not yet thread `Fs` through handler calls.
+// `build_hir_with_imports` runs the same import-resolution pipeline as the
+// main driver: extract `import` statements, recursively read and parse
+// referenced `.nx` files via Fs, and feed the combined defs through HIR
+// accumulation + lazy-binding resolution. The typechecker then sees the
+// importer's own functions plus the imported ones, so a type error in an
+// imported function (called from the importer) surfaces as a diagnostic.
 
 let get_defs = fn (prog: Program) -> [SpannedTopLevel] do
   match prog do | Program(definitions: defs) -> return defs end
 end
 
-let extract_function_names = fn (defs: [SpannedTopLevel]) -> [string] do
+// Entry-file self-rename entries. Mirrors `driver.build_entry_self_entries`:
+// `main` keeps its bare name (so wasm export "main" works); every other
+// top-level def maps to its canonical `source#name` form so internal
+// calls inside the importer's body resolve through the same rdr layer
+// the imported modules use.
+let build_entry_self_entries = fn (defs: [SpannedTopLevel], source: string, acc: [RenameEntry]) -> [RenameEntry] do
   match defs do
-    | [] -> return []
+    | [] -> return acc
     | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value: _)), span: _) :: rest ->
-      return name :: extract_function_names(defs: rest)
-    | _ :: rest -> return extract_function_names(defs: rest)
+      if name == "main" then
+        let acc2 = symtab.rename_add(entries: acc, original: name, qualified: "main")
+        return build_entry_self_entries(defs: rest, source, acc: acc2)
+      end
+      let acc2 = symtab.rename_add(entries: acc, original: name,
+        qualified: rdr.canonical_name(source_path: source, name))
+      return build_entry_self_entries(defs: rest, source, acc: acc2)
+    | SpannedTopLevel(node: TLCap(def: Cap(name, is_public: _, functions: _)), span: _) :: rest ->
+      let acc2 = symtab.rename_add(entries: acc, original: name,
+        qualified: rdr.canonical_name(source_path: source, name))
+      return build_entry_self_entries(defs: rest, source, acc: acc2)
+    | _ :: rest -> return build_entry_self_entries(defs: rest, source, acc)
   end
 end
 
-let build_hir_from_prog = fn (prog: Program, source_file: string) -> HirProgram throws { Exn } do
+let build_hir_with_imports = fn (prog: Program, source_file: string) -> HirProgram require { Fs, Console } throws { Exn } do
   let defs = get_defs(prog)
-  let accum = process_defs(defs, entries: [], accum: empty_accum(), source_file)
-  let raw = accum_to_program(accum)
-  match raw do | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg) ->
-    let resolved = iterative_resolve(funcs: hf, hb, max_rounds: 100)
-    return HirProgram(ports: hp, functions: resolved, externals: he,
-      handler_bindings: hb, enum_defs: hed, exception_groups: heg)
+  let imports = resolve.extract_imports(defs)
+  let result = process_imports(imports, accum: hir.empty_accum(),
+    import_stack: [], visited: [], cache: [], caller_entries: [],
+    depth: 1, verbose: false)
+  match result do | ImportResult(accum, visited: _, cache: _, caller_entries) ->
+    let self_entries = build_entry_self_entries(defs, source: source_file, acc: [])
+    let entries = append_entries(xs: self_entries, ys: caller_entries)
+    let accum2 = hir.process_defs(defs, entries, accum, source_file)
+    let raw = hir.accum_to_program(accum: accum2)
+    match raw do | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg) ->
+      // LSP-mode resolve: convert every LazyBody but skip reachability
+      // filtering. The LSP wants typecheck coverage for *all* loaded defs
+      // (including imported `bar` that the importer never calls) so the
+      // editor surfaces every reachable error in the workspace, not just
+      // those on the codegen path.
+      let resolved = resolve_all_lazy_no_filter(funcs: hf)
+      return HirProgram(ports: hp, functions: resolved, externals: he,
+        handler_bindings: hb, enum_defs: hed, exception_groups: heg)
+    end
   end
 end
 
 // ─── Diagnostics for a buffer ────────────────────────────────────────────────
 //
-// Wraps the lex/parse/resolve/typecheck pipeline in a try-catch so that any
-// pre-typecheck phase failure (lex / parse) becomes a single DiagEntry at
-// the file origin. After a successful HIR build, hand off to
-// `enumerate_diagnostics`, which already converts CompileError variants to
-// span-keyed DiagEntry values.
+// Pipeline: lex -> parse -> import-aware HIR build -> typecheck. Each phase
+// boundary is wrapped so a failure surfaces as a single file-origin
+// DiagEntry instead of crashing the LSP loop. The typechecker itself
+// returns either an empty list (clean) or one DiagEntry per CompileError.
 
-let compute_diagnostics_for_buffer = fn (text: string, file: string) -> [DiagEntry] do
+let extract_hir_function_names = fn (funcs: [HirFunction], acc: [string]) -> [string] do
+  match funcs do
+    | [] -> return reverse_strings(xs: acc, acc: [])
+    | f :: rest ->
+      let HirFunction(name, type_params: _, params: _, ret_type: _, _) = f
+      return extract_hir_function_names(funcs: rest, acc: name :: acc)
+  end
+end
+
+let reverse_strings = fn (xs: [string], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | s :: rest -> return reverse_strings(xs: rest, acc: s :: acc)
+  end
+end
+
+let compute_diagnostics_for_buffer = fn (text: string, file: string) -> [DiagEntry] require { Fs, Console } throws { Exn } do
   try
     let prog = parser.parse(tokens: lexer.tokenize(src: text))
-    let local_names = extract_function_names(defs: get_defs(prog))
-    let hir = build_hir_from_prog(prog, source_file: file)
-    return enumerate_diagnostics(hir, local_names, file)
+    try
+      let hir_prog = build_hir_with_imports(prog, source_file: file)
+      // Pass *all* HIR function names as `local_names` so the typechecker
+      // also walks imported function bodies. Driver-side typecheck restricts
+      // to the entry file's own funcs because each imported file is
+      // independently checked by its own pipeline; the LSP scope is
+      // editor-as-single-driver — surface every reachable error.
+      let HirProgram(ports: _, functions: funcs, externals: _, handler_bindings: _, enum_defs: _, _) = hir_prog
+      let all_names = extract_hir_function_names(funcs, acc: [])
+      return enumerate_diagnostics(hir: hir_prog, local_names: all_names, file)
+    catch import_err ->
+      // Import resolution failure (missing file, parse error in an imported
+      // module, cycle): surface as a single origin-anchored diagnostic. The
+      // raw exception carries the offending path; we render it via the
+      // generic format_error path inside `make_origin_error_diagnostic`.
+      let _ = import_err
+      return [make_origin_error_diagnostic(file, message: "lsp: import resolution failed")]
+    end
   catch err ->
     let _ = err
     return [make_origin_error_diagnostic(file, message: "lsp: failed to lex or parse source")]
   end
 end
 
+// ─── Per-URI version cache ──────────────────────────────────────────────────
+//
+// Cache shape: `JsonObject { fields: [JsonField(uri, {version, diagnostics})...] }`
+// where the inner `diagnostics` is a `JsonArray` of wire-format Diagnostic
+// objects (the exact value we'd publish). Lookup is linear in URIs open;
+// LSP sessions rarely keep more than a few dozen, and a list-shaped cache
+// avoids dragging in a hashmap for MVP.
+//
+// Invalidation: a `didChange` carries a fresh integer version. If the
+// cached version equals the incoming one we reuse `diagnostics`; otherwise
+// we typecheck and overwrite the entry. Closing the buffer drops the
+// cache row (the on_did_close handler removes the URI from `documents`,
+// and the cache key is dead weight thereafter — a future cleanup pass can
+// prune by walking documents \ cache, but it doesn't impact correctness).
+
+let cache_lookup_diagnostics = fn (user_data: JsonValue, uri: string, version: i64) -> Option<[JsonValue]> throws { Exn } do
+  match get_field(obj: user_data, key: uri) do
+    | None -> return None
+    | Some(val: entry) ->
+      match get_field(obj: entry, key: "version") do
+        | None -> return None
+        | Some(val: v) ->
+          match v do
+            | JsonInt(val: cached_version) ->
+              if cached_version != version then return None end
+              match get_field(obj: entry, key: "diagnostics") do
+                | None -> return None
+                | Some(val: diags) ->
+                  match diags do
+                    | JsonArray(items) -> return Some(val: items)
+                    | _ -> return None
+                  end
+              end
+            | _ -> return None
+          end
+      end
+  end
+end
+
+// Replace (or insert) the cache row for `uri`. Other URIs' rows stay
+// untouched. The final layout is a JsonObject with the URI as the field
+// key — JSON keys are strings, which matches LSP URI semantics.
+
+let drop_field_with_key = fn (fields: [JsonField], key: string, acc: [JsonField]) -> [JsonField] do
+  match fields do
+    | [] -> return reverse_fields(xs: acc, acc: [])
+    | JsonField(key: k, value: v) :: rest ->
+      if k == key then
+        return drop_field_with_key(fields: rest, key, acc)
+      end
+      return drop_field_with_key(fields: rest, key, acc: JsonField(key: k, value: v) :: acc)
+  end
+end
+
+let reverse_fields = fn (xs: [JsonField], acc: [JsonField]) -> [JsonField] do
+  match xs do
+    | [] -> return acc
+    | f :: rest -> return reverse_fields(xs: rest, acc: f :: acc)
+  end
+end
+
+let user_data_fields = fn (user_data: JsonValue) -> [JsonField] do
+  match user_data do
+    | JsonObject(fields) -> return fields
+    | _ -> return []
+  end
+end
+
+let cache_put = fn (user_data: JsonValue, uri: string, version: i64, diagnostics: [JsonValue]) -> JsonValue do
+  let pruned = drop_field_with_key(fields: user_data_fields(user_data), key: uri, acc: [])
+  let entry = JsonObject(fields: [
+    JsonField(key: "version", value: JsonInt(val: version)),
+    JsonField(key: "diagnostics", value: JsonArray(items: diagnostics))
+  ])
+  return JsonObject(fields: JsonField(key: uri, value: entry) :: pruned)
+end
+
 // ─── Handler: on_initialize ──────────────────────────────────────────────────
 
-let nexus_on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
+let nexus_on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   // Validate input shape; we don't read fields beyond what the protocol
   // codec checks. Errors propagate as LspProtocolError -> InvalidParams.
   let _ = initialize_params_from_json(v: params)
@@ -217,44 +391,112 @@ let nexus_on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerR
   )
   let info = ServerInfo(name: "nexus-lsp", version: Some(val: "0.1.0"))
   let result = InitializeResult(capabilities: caps, server_info: Some(val: info))
+  // Seed user_data with an empty cache object so subsequent didOpen /
+  // didChange handlers can `get_field` without first checking shape.
+  let seeded = with_user_data(state: with_lifecycle_running(state),
+    user_data: JsonObject(fields: []))
   return HandlerResult(
-    state: with_lifecycle_running(state),
+    state: seeded,
     response: Some(val: initialize_result_to_json(r: result)),
     notifications: []
   )
 end
 
+// ─── Helpers: wire-format Diagnostic JSON ───────────────────────────────────
+
+let wire_diagnostics_to_json_items = fn (xs: [Diagnostic]) -> [JsonValue] throws { Exn } do
+  // Round-trip the wire-format Diagnostic[] through the protocol codec so
+  // the cache stores values byte-identical to what we'd publish on a fresh
+  // typecheck. Wrap into a synthetic PublishDiagnosticsParams and extract
+  // the resulting JsonArray's items.
+  let wrapped = PublishDiagnosticsParams(uri: "", version: None, diagnostics: xs)
+  let wrapped_json = publish_diagnostics_params_to_json(p: wrapped)
+  match get_field(obj: wrapped_json, key: "diagnostics") do
+    | None -> raise RuntimeError(val: "publish_diagnostics_params_to_json missing 'diagnostics' field")
+    | Some(val: arr) ->
+      match arr do
+        | JsonArray(items) -> return items
+        | _ -> raise RuntimeError(val: "publish_diagnostics_params_to_json 'diagnostics' is not an array")
+      end
+  end
+end
+
+let reverse_jsonvals = fn (xs: [JsonValue], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | v :: rest -> return reverse_jsonvals(xs: rest, acc: v :: acc)
+  end
+end
+
+// Build a publishDiagnostics frame from raw JSON-encoded diagnostic items
+// (as stored in the cache). Avoids a wire-internal -> internal -> wire
+// roundtrip when the cache hits.
+let make_publish_frame_from_json = fn (uri: string, version: i64, diagnostics: [JsonValue]) -> JsonValue do
+  let params = JsonObject(fields: [
+    JsonField(key: "uri", value: JsonString(val: uri)),
+    JsonField(key: "version", value: JsonInt(val: version)),
+    JsonField(key: "diagnostics", value: JsonArray(items: diagnostics))
+  ])
+  return JsonObject(fields: [
+    JsonField(key: "jsonrpc", value: JsonString(val: "2.0")),
+    JsonField(key: "method", value: JsonString(val: "textDocument/publishDiagnostics")),
+    JsonField(key: "params", value: params)
+  ])
+end
+
 // ─── Buffer update + diagnostics emission ────────────────────────────────────
 //
 // Shared between on_did_open and on_did_change. Updates the document
-// store, runs the typecheck pipeline, and produces a publishDiagnostics
-// notification. The internal DiagEntry stream may be empty (clean
-// program); we still publish an empty array because LSP clients use
-// that signal to clear stale markers.
+// store, consults the per-URI version cache, and produces a
+// publishDiagnostics notification. The internal DiagEntry stream may be
+// empty (clean program); we still publish an empty array because LSP
+// clients use that signal to clear stale markers.
 
 let publish_for_buffer = fn (
   state: ServerState,
   uri: string,
   text: string,
   version: i64
-) -> HandlerResult do
+) -> HandlerResult require { Fs, Console } throws { Exn } do
   let new_docs = documents_put(
     store: state_documents(state),
     rec: DocumentRecord(uri, text, version)
   )
-  let internal = compute_diagnostics_for_buffer(text, file: uri)
-  let wire = to_wire_diagnostics(xs: internal)
-  let params = PublishDiagnosticsParams(
-    uri,
-    version: Some(val: version),
-    diagnostics: wire
-  )
-  let frame = make_publish_diagnostics_notification(params)
-  return HandlerResult(
-    state: with_documents(state, docs: new_docs),
-    response: None,
-    notifications: [frame]
-  )
+  let cache = state_user_data(state)
+  let cached = cache_lookup_diagnostics(user_data: cache, uri, version)
+  match cached do
+    | Some(val: cached_items) ->
+      // Cache hit: same (uri, version) -> reuse stored wire diagnostics.
+      // Document text is already cached, but we still update `documents`
+      // because a new client session may put a fresh DocumentRecord with
+      // identical version that we want to track.
+      let frame = make_publish_frame_from_json(uri, version, diagnostics: cached_items)
+      return HandlerResult(
+        state: with_documents(state, docs: new_docs),
+        response: None,
+        notifications: [frame]
+      )
+    | None ->
+      let internal = compute_diagnostics_for_buffer(text, file: uri)
+      let wire = to_wire_diagnostics(xs: internal)
+      let wire_items = wire_diagnostics_to_json_items(xs: wire)
+      let new_cache = cache_put(user_data: cache, uri, version, diagnostics: wire_items)
+      let params = PublishDiagnosticsParams(
+        uri,
+        version: Some(val: version),
+        diagnostics: wire
+      )
+      let frame = make_publish_diagnostics_notification(params)
+      let updated = with_user_data(
+        state: with_documents(state, docs: new_docs),
+        user_data: new_cache
+      )
+      return HandlerResult(
+        state: updated,
+        response: None,
+        notifications: [frame]
+      )
+  end
 end
 
 // ─── Handler: on_did_open ────────────────────────────────────────────────────
@@ -266,7 +508,7 @@ let require_object_field = fn (obj: JsonValue, key: string, ctx: string) -> Json
   end
 end
 
-let nexus_on_did_open = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
+let nexus_on_did_open = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   let td_v = require_object_field(obj: params, key: "textDocument",
     ctx: "DidOpenTextDocumentParams")
   let td = text_document_item_from_json(v: td_v)
@@ -315,7 +557,7 @@ let json_array_items = fn (v: JsonValue) -> [JsonValue] throws { Exn } do
   end
 end
 
-let nexus_on_did_change = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
+let nexus_on_did_change = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   let td_v = require_object_field(obj: params, key: "textDocument",
     ctx: "DidChangeTextDocumentParams")
   let id = versioned_text_document_identifier_from_json(v: td_v)
@@ -340,13 +582,6 @@ let symbols_to_json_items_go = fn (xs: [DocumentSymbol], acc: [JsonValue]) -> [J
   match xs do
     | [] -> return reverse_jsonvals(xs: acc, acc: [])
     | s :: rest -> return symbols_to_json_items_go(xs: rest, acc: document_symbol_to_json(s) :: acc)
-  end
-end
-
-let reverse_jsonvals = fn (xs: [JsonValue], acc: [JsonValue]) -> [JsonValue] do
-  match xs do
-    | [] -> return acc
-    | v :: rest -> return reverse_jsonvals(xs: rest, acc: v :: acc)
   end
 end
 
@@ -378,7 +613,7 @@ let compute_document_symbols = fn (doc_opt: Option<DocumentRecord>) -> [Document
   end
 end
 
-let nexus_on_document_symbol = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
+let nexus_on_document_symbol = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   let td_v = require_object_field(obj: params, key: "textDocument",
     ctx: "DocumentSymbolParams")
   let uri_v = require_object_field(obj: td_v, key: "uri",
@@ -396,7 +631,7 @@ let nexus_on_document_symbol = fn (state: ServerState, params: JsonValue) -> Han
   )
 end
 
-let nexus_on_other = fn (state: ServerState, method: string, params: JsonValue) -> HandlerResult throws { Exn } do
+let nexus_on_other = fn (state: ServerState, method: string, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   if method == "textDocument/documentSymbol" then
     return nexus_on_document_symbol(state, params)
   end
