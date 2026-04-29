@@ -22,3 +22,4 @@ pub mod rand;
 pub mod result;
 pub mod stdio;
 pub mod string;
+pub mod test_lib;
