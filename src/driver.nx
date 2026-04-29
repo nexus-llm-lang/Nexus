@@ -22,7 +22,7 @@ import * as hir from "src/ir/hir.nx"
 import * as mir from "src/ir/mir.nx"
 import * as lir from "src/ir/lir.nx"
 import * as lir_opt from "src/ir/lir_opt.nx"
-import * as effect_analysis from "src/backend/effect_analysis.nx"
+import { EffectClassCounts, RaiseSiteCounts }, * as effect_analysis from "src/backend/effect_analysis.nx"
 import * as memo_plan from "src/backend/memo_plan.nx"
 import * as codegen from "src/backend/codegen.nx"
 import * as tc from "src/typecheck/check.nx"
@@ -48,6 +48,14 @@ import { run_test_subcommand, strip_test_subcommand, ParsedTestSubcommand } from
 // Uses the shared ULEB reader from src/backend/wasm/read.nx.
 let read_dep_pages = fn (buf: &ByteBuffer) -> i64 do
   return scan_sections(buf, pos: 8, end_pos: bb.length(buf))
+end
+
+// Backtrace-elision percentage (issue nexus-kyf8): integer percent of raise
+// sites where codegen elides the bt-capture call. Guards against division
+// by zero (programs with no raise sites) by returning 0.
+let compute_elision_pct = fn (skip: i64, total: i64) -> i64 do
+  if total == 0 then return 0 end
+  return (skip * 100) / total
 end
 let scan_sections = fn (buf: &ByteBuffer, pos: i64, end_pos: i64) -> i64 do
   if pos >= end_pos then return 0 end
@@ -657,11 +665,34 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock,
       Console.eprintln(val: "[nxc] effect-analysis ("
         ++ str.from_i64(val: t7b - t7) ++ "ms, "
         ++ str.from_i64(val: effect_analysis.effect_map_size(em: effect_map)) ++ " functions)")
+      // Per-class breakdown (issue nexus-kyf8): partitions every function
+      // summary into pure / can_throw / impure-no-throw so the elision
+      // measurement below has a denominator.
+      let EffectClassCounts(pure, can_throw, impure_no_throw, total) = effect_analysis.classify_effect_map(em: effect_map)
+      Console.eprintln(val: "[nxc] effect-summary: "
+        ++ str.from_i64(val: pure) ++ " pure, "
+        ++ str.from_i64(val: can_throw) ++ " throw, "
+        ++ str.from_i64(val: impure_no_throw) ++ " impure ("
+        ++ str.from_i64(val: total) ++ " total)")
     end
 
     let lir_opt = lir_opt.optimize_lir_with_effects(program: lir, effects: effect_map)
     let t8 = Clock.now()
     if verbose then Console.eprintln(val: "[nxc] optimize (" ++ str.from_i64(val: t8 - t7b) ++ "ms)") end
+
+    // Backtrace-elision metric (issue nexus-kyf8): walk lir_opt (the
+    // program codegen actually consumes) and count LirExprRaise sites,
+    // mirroring codegen.resolve_bt_capture_for_func to classify each as
+    // emitted (enclosing function may throw) or elided (cannot throw).
+    if verbose then
+      let RaiseSiteCounts(emitted: bt_emit, elided: bt_skip, total: bt_total) =
+        effect_analysis.count_raise_sites(program: lir_opt, em: effect_map)
+      let pct = compute_elision_pct(skip: bt_skip, total: bt_total)
+      Console.eprintln(val: "[nxc] backtrace: "
+        ++ str.from_i64(val: bt_emit) ++ " capture-call sites emitted, "
+        ++ str.from_i64(val: bt_skip) ++ " skipped ("
+        ++ str.from_i64(val: pct) ++ "% elision)")
+    end
 
     // Memoisation eligibility plan (issue nexus-e6uh): identify pure
     // functions whose call sites are eligible for argument-keyed result

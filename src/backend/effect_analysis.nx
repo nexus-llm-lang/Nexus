@@ -570,3 +570,139 @@ let effect_map_size_go = fn (entries: [EffectEntry]) -> i64 do
     | _ :: rest -> return 1 + effect_map_size_go(entries: rest)
   end
 end
+
+// ─── Classification Counts (issue nexus-kyf8) ────────────────────────────────
+//
+// Aggregate the EffectMap into a coarse per-class population:
+//   * pure            — is_pure == true (no caps, no throw, no side effect)
+//   * can_throw       — can_throw == true
+//   * impure_no_throw — !is_pure AND !can_throw (caps used or non-throwing
+//                       side effect, e.g. a Console.println-only function)
+// The three classes partition the EffectMap exactly: every function lands in
+// one and only one bucket. `total` is provided redundantly so callers can
+// sanity-check without re-summing.
+
+export type EffectClassCounts = EffectClassCounts(
+  pure: i64,
+  can_throw: i64,
+  impure_no_throw: i64,
+  total: i64
+)
+
+export let classify_effect_map = fn (em: EffectMap) -> EffectClassCounts do
+  let EffectMap(entries) = em
+  return classify_effect_map_go(entries, pure: 0, can_throw: 0, impure: 0, total: 0)
+end
+
+let classify_effect_map_go = fn (
+  entries: [EffectEntry],
+  pure: i64,
+  can_throw: i64,
+  impure: i64,
+  total: i64
+) -> EffectClassCounts do
+  match entries do
+    | [] -> return EffectClassCounts(pure, can_throw, impure_no_throw: impure, total)
+    | EffectEntry(name: _, summary) :: rest ->
+      let EffectSummary(capabilities_used: _, can_throw: ct, is_pure: ip) = summary
+      let new_pure = if ip then pure + 1 else pure end
+      let new_throw = if ct then can_throw + 1 else can_throw end
+      let new_impure = if ip then impure
+        else if ct then impure
+        else impure + 1
+        end
+      return classify_effect_map_go(entries: rest,
+        pure: new_pure, can_throw: new_throw, impure: new_impure, total: total + 1)
+  end
+end
+
+// ─── Raise-Site Counting (issue nexus-kyf8) ──────────────────────────────────
+//
+// Walk every LirFunction body in `program` and count LirExprRaise sites,
+// partitioning them into "emitted" (the enclosing function's EffectMap entry
+// has can_throw = true, so codegen will emit a __nx_main_wrap_bt_capture
+// call before op_throw) and "elided" (can_throw = false or the function is
+// absent from the EffectMap, in which case codegen.resolve_bt_capture_for_func
+// would return -1 only on the can_throw=false path; the absent-from-map path
+// keeps emission per the conservative fallback). Mirrors the rule in
+// codegen.nx::resolve_bt_capture_for_func to keep the metric truthful.
+//
+// Reported sites count the raise expressions in the source LIR — they are
+// the population that codegen would walk during emission. The metric does
+// not depend on whether the bt-capture import is actually present in the
+// program; that's a binary global property reported separately by the
+// driver if relevant.
+
+export type RaiseSiteCounts = RaiseSiteCounts(
+  emitted: i64,
+  elided: i64,
+  total: i64
+)
+
+export let count_raise_sites = fn (program: LirProgram, em: EffectMap) -> RaiseSiteCounts do
+  let LirProgram(functions, externals: _) = program
+  return count_raise_sites_funcs(funcs: functions, em, emitted: 0, elided: 0)
+end
+
+let count_raise_sites_funcs = fn (
+  funcs: [LirFunction],
+  em: EffectMap,
+  emitted: i64,
+  elided: i64
+) -> RaiseSiteCounts do
+  match funcs do
+    | [] -> return RaiseSiteCounts(emitted, elided, total: emitted + elided)
+    | f :: rest ->
+      let LirFunction(name, params: _, ret_type: _, body, ret: _, span: _) = f
+      let n_raises = count_raises_in_stmts(stmts: body, acc: 0)
+      let func_emits = func_emits_capture(name, em)
+      let new_emitted = if func_emits then emitted + n_raises else emitted end
+      let new_elided = if func_emits then elided else elided + n_raises end
+      return count_raise_sites_funcs(funcs: rest, em,
+        emitted: new_emitted, elided: new_elided)
+  end
+end
+
+/// Mirror codegen.resolve_bt_capture_for_func: a function emits the
+/// capture call when its EffectMap entry has can_throw=true OR when the
+/// function is absent from the map (conservative fallback). Functions
+/// whose entry has can_throw=false are the only ones that elide.
+let func_emits_capture = fn (name: string, em: EffectMap) -> bool do
+  match lookup_summary(em, name) do
+    | Some(val: EffectSummary(capabilities_used: _, can_throw: ct, is_pure: _)) ->
+      return ct
+    | None -> return true
+  end
+end
+
+let count_raises_in_stmts = fn (stmts: [LirStmt], acc: i64) -> i64 do
+  match stmts do
+    | [] -> return acc
+    | s :: rest -> return count_raises_in_stmts(stmts: rest, acc: count_raises_in_stmt(stmt: s, acc))
+  end
+end
+
+let count_raises_in_stmt = fn (stmt: LirStmt, acc: i64) -> i64 do
+  match stmt do
+    | LirStmtLet(name: _, typ: _, expr: e) -> return count_raises_in_expr(expr: e, acc)
+    | LirStmtIf(cond: _, then_body: tb, else_body: eb) ->
+      let acc1 = count_raises_in_stmts(stmts: tb, acc)
+      return count_raises_in_stmts(stmts: eb, acc: acc1)
+    | LirStmtIfReturn(cond: _, then_body: tb, then_ret: _, else_body: eb, else_ret: _, ret_type: _) ->
+      let acc1 = count_raises_in_stmts(stmts: tb, acc)
+      return count_raises_in_stmts(stmts: eb, acc: acc1)
+    | LirStmtLoop(cond_stmts: cs, cond: _, body: b) ->
+      let acc1 = count_raises_in_stmts(stmts: cs, acc)
+      return count_raises_in_stmts(stmts: b, acc: acc1)
+    | LirStmtTryCatch(body: b, body_ret: _, catch_param: _, catch_param_typ: _, catch_body: cb, catch_ret: _) ->
+      let acc1 = count_raises_in_stmts(stmts: b, acc)
+      return count_raises_in_stmts(stmts: cb, acc: acc1)
+  end
+end
+
+let count_raises_in_expr = fn (expr: LirExpr, acc: i64) -> i64 do
+  match expr do
+    | LirExprRaise(value: _, typ: _) -> return acc + 1
+    | _ -> return acc
+  end
+end
