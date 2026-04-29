@@ -9,7 +9,7 @@ import * as bb from "std:bytebuffer"
 import * as naming from "src/common/naming.nx"
 import { TypeExpr, TyUnit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyHandler, NamedType, EnumDef, VariantDef, VariantField } from "src/common/ast.nx"
 import { HirProgram, HirFunction, HirHandlerArm, HirParam, HirExternal, HirPort, HirHandlerBindingEntry, HirHandlerBinding, EagerBody, LazyBody } from "src/ir/hir_types.nx"
-import { TypeMismatch, MissingMain, MainNotFunction, MainNotUnit } from "src/common/error.nx"
+import { TypeMismatch, MissingMain, MainNotFunction, MainNotUnit, MainThrowsTooBroad } from "src/common/error.nx"
 import { CheckState, Scheme, EnvEntry, EnumEntry, InferExprOk, InferExprErr }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
 import * as infer from "src/typecheck/infer.nx"
@@ -533,21 +533,76 @@ end
 
 // ─── Validate main function ────────────────────────────────────────────────
 
+/// Validates that `main` exists, is a `() -> unit` (or `[string] -> unit`)
+/// arrow, and that its declared throws-row is one the runtime can wrap.
+///
+/// The HIR main-wrap pass (`src/ir/main_wrap.nx`) replaces a wrappable
+/// non-empty main with a synthesised wrapper whose throws are `{}`, so by
+/// the time validate_main runs the row is normally either empty (nothing
+/// to wrap) or post-wrap empty. The wrap pass intentionally leaves
+/// unwrappable rows intact — open rows, rows with a free type variable,
+/// or rows containing non-exception entries — and validate_main rejects
+/// them here as `MainThrowsTooBroad`. The previous wildcard check accepted
+/// *any* row and masked these mis-narrowings.
 let validate_main = fn (state: CheckState) -> unit throws { Exn } do
   match tctypes.env_lookup(env: tctypes.state_env(state), name: "main") do
     | None ->
       raise MissingMain
     | Some(val: Scheme(vars: _, typ: main_type)) ->
       match main_type do
-        | TyArrow(params, ret, requires: _, throw_row: _) ->
+        | TyArrow(params: _, ret, requires: _, throw_row: tw) ->
           // Check return type is Unit
           if subst.type_eq(a: ret, b: TyUnit) then
-            return ()
+            return validate_main_throw_row(throw_row: tw)
           end
           raise MainNotUnit
         | _ ->
           raise MainNotFunction
       end
+  end
+end
+
+/// Reject throws-rows the main-wrap pass cannot handle: open rows, rows
+/// whose entries are not named exception (group) variants, or rows that
+/// have collapsed to a free type variable. Empty rows and closed rows of
+/// named entries (concrete exceptions, exception groups, or the universal
+/// `Exn`) are accepted — the wrap pass routes them through a match-on-Exn
+/// with a wildcard arm.
+let validate_main_throw_row = fn (throw_row: TypeExpr) -> unit throws { Exn } do
+  match throw_row do
+    | TyRow(types: ts, rest: r) ->
+      match r do
+        | Some(_) -> raise MainThrowsTooBroad(detail: "open row (rest tail) is not permitted")
+        | None -> return validate_main_throw_row_entries(entries: ts)
+      end
+    | TyUnit -> return ()
+    | _ -> raise MainThrowsTooBroad(detail: "throws-row must be a closed row, got non-row type")
+  end
+end
+
+let validate_main_throw_row_entries = fn (entries: [TypeExpr]) -> unit throws { Exn } do
+  match entries do
+    | [] -> return ()
+    | t :: rest ->
+      validate_main_throw_row_entry(entry: t)
+      return validate_main_throw_row_entries(entries: rest)
+  end
+end
+
+let validate_main_throw_row_entry = fn (entry: TypeExpr) -> unit throws { Exn } do
+  match entry do
+    | TyUserDefined(name: _, args: _) ->
+      // Concrete exceptions, exception groups, and the universal `Exn` are
+      // all admitted: the main-wrap pass synthesises a match-on-Exn with a
+      // wildcard arm that handles any variant. Note that the pass *replaces*
+      // the user's main with a `throws {}` wrapper, so this entry is only
+      // reached for `__nx_user_main` (which validate_main does not visit) or
+      // for the unwrappable cases left intact below.
+      return ()
+    | TyVar(name: _) ->
+      raise MainThrowsTooBroad(detail: "throws-row contains a free type variable; resolve before reaching main")
+    | _ ->
+      raise MainThrowsTooBroad(detail: "throws-row entry is not a named exception or group")
   end
 end
 
