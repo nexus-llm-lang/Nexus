@@ -99,9 +99,24 @@ TMP=$(mktemp) || exit 1
 # Extract: skip OFFSET bytes from the head of $0, then take SIZE bytes.
 tail -c +$((OFFSET + 1)) "$0" | head -c "$SIZE" > "$TMP"
 
-# shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS is intentionally word-split.
+# Compose the wasmtime feature flag set. The compiler payload is core
+# WASM (preview1 imports satisfied by --dir mounts). The lsp payload is
+# a WASI Preview2 component that pulls in wasi:http/* via the stdlib
+# bundle even when network isn't used at runtime, so the component-model
+# host needs to be available; we declare component-model and pass
+# `-S http,inherit-network` to satisfy the http instance imports.
+W_FLAGS="max-wasm-stack=${NEXUS_MAX_WASM_STACK:-67108864},tail-call=y,exceptions=y,function-references=y,stack-switching=y"
+if [ "$PAYLOAD_NAME" = "lsp" ]; then
+  W_FLAGS="$W_FLAGS,component-model=y,max-memory-size=8589934592"
+  S_FLAGS="-S http,inherit-network"
+else
+  S_FLAGS=""
+fi
+
+# shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS / S_FLAGS are intentionally word-split.
 exec wasmtime run \
-  -W "max-wasm-stack=${NEXUS_MAX_WASM_STACK:-67108864},tail-call=y,exceptions=y,function-references=y,stack-switching=y" \
+  -W "$W_FLAGS" \
+  $S_FLAGS \
   --dir=. --dir="${TMPDIR:-/tmp}" \
   ${NEXUS_WASMTIME_ARGS:-} \
   "$TMP" "$@"
