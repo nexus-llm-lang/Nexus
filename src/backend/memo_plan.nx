@@ -1,0 +1,218 @@
+/**
+ * memo_plan: Pure function call-site memoization eligibility planner.
+ *
+ * Given an EffectMap (from effect_analysis.nx) and a LirProgram, produces a
+ * MemoizationPlan listing functions whose call sites are eligible for
+ * argument-keyed result caching.
+ *
+ * Eligibility (conjunction):
+ *   1. EffectSummary.is_pure == true  — same input MUST yield same output and
+ *      have no observable side effect, so a cache hit is semantically equal
+ *      to the recomputation.
+ *   2. Every parameter has a hashable scalar type:
+ *        i32 / i64 / f32 / f64 / bool / char / string
+ *      Closures (TyArrow), records (TyRecord), variants (TyUserDefined),
+ *      lists (TyList), arrays (TyArray), references (TyRef / TyBorrow), and
+ *      handler-typed values are excluded — their identity-vs-structural
+ *      equality semantics make a single-slot key compare unsound.
+ *   3. The function has at least one parameter. Zero-arg pure functions
+ *      can be memoised trivially (one-shot evaluation), but they don't fit
+ *      the argument-keyed cache shape; tracked separately if needed.
+ *
+ * Returned plan is a value (no mutation, no globals). Codegen consumes it
+ * to decide whether to emit the lookup-or-compute prologue at the callee
+ * (planned: nexus-e6uh follow-up). Decoupling the analysis from codegen
+ * keeps this pass testable in isolation.
+ *
+ * Stand-alone for now — the driver pipes EffectMap + Program here, prints
+ * eligible-count under verbose, and discards the plan until the codegen
+ * consumer lands. No existing pass changes behaviour based on the result.
+ */
+
+import { TypeExpr, TyI32, TyI64, TyF32, TyF64, TyBool, TyChar, TyString } from "src/common/ast.nx"
+import { LirProgram, LirFunction, LirParam } from "src/ir/lir_types.nx"
+import { EffectMap, EffectSummary, lookup_summary } from "src/backend/effect_analysis.nx"
+import { Option, Some, None } from "std:option"
+
+// ─── Public Types ────────────────────────────────────────────────────────────
+
+/// One eligible function. Records the surface needed by a codegen consumer
+/// to plant a memo cache: name (lookup key in the function map), arity
+/// (cache-row width), parameter type list (for hash-encoding), return type
+/// (for stored-result encoding).
+export type MemoEntry = MemoEntry(
+  name: string,
+  arity: i64,
+  param_types: [TypeExpr],
+  ret_type: TypeExpr
+)
+
+/// Plan: list of eligible callees. Order matches LirProgram.functions order
+/// so iteration is deterministic; consumers should not assume sortedness by
+/// name (LirProgram order is the source of truth elsewhere in the pipeline).
+export type MemoPlan = MemoPlan(entries: [MemoEntry])
+
+// ─── Hashability ─────────────────────────────────────────────────────────────
+//
+// Every parameter type must be one of the scalar / string set listed in the
+// issue body. Anything else (closure, record, variant, list, array, ref,
+// borrow, handler, lazy, linear, row, user-defined, type variable, literal)
+// fails the check and skips the function from the plan. This is the
+// conservative direction: false-negative (skip) is sound; false-positive
+// (memo a non-pure or unhashable call) is not.
+
+let is_hashable_param_type = fn (t: TypeExpr) -> bool do
+  match t do
+    | TyI32 -> return true
+    | TyI64 -> return true
+    | TyF32 -> return true
+    | TyF64 -> return true
+    | TyBool -> return true
+    | TyChar -> return true
+    | TyString -> return true
+    | _ -> return false
+  end
+end
+
+let all_params_hashable = fn (ps: [LirParam]) -> bool do
+  match ps do
+    | [] -> return true
+    | LirParam(label: _, name: _, typ: t) :: rest ->
+      if is_hashable_param_type(t) then
+        return all_params_hashable(ps: rest)
+      end
+      return false
+  end
+end
+
+let extract_param_types = fn (ps: [LirParam]) -> [TypeExpr] do
+  return extract_param_types_go(ps, acc: [])
+end
+
+let extract_param_types_go = fn (ps: [LirParam], acc: [TypeExpr]) -> [TypeExpr] do
+  match ps do
+    | [] -> return reverse_types(lst: acc, out: [])
+    | LirParam(label: _, name: _, typ: t) :: rest ->
+      return extract_param_types_go(ps: rest, acc: t :: acc)
+  end
+end
+
+let reverse_types = fn (lst: [TypeExpr], out: [TypeExpr]) -> [TypeExpr] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_types(lst: rest, out: x :: out)
+  end
+end
+
+let list_length_lp = fn (xs: [LirParam]) -> i64 do
+  match xs do
+    | [] -> return 0
+    | _ :: rest -> return 1 + list_length_lp(xs: rest)
+  end
+end
+
+// ─── Eligibility Per Function ────────────────────────────────────────────────
+
+/// True iff `func` is memoisable under EffectMap `em`. Returns false on any
+/// of: missing summary, non-pure summary, zero-arg, non-hashable param.
+/// The ordering of the checks places the cheap structural rejections first
+/// so the EffectMap lookup (linear) only runs once we know the parameter
+/// shape is admissible.
+let is_eligible = fn (func: LirFunction, em: EffectMap) -> bool do
+  let LirFunction(name, params, ret_type: _, body: _, ret: _, span: _) = func
+  if list_length_lp(xs: params) == 0 then return false end
+  if all_params_hashable(ps: params) then
+    match lookup_summary(em, name) do
+      | Some(val: s) ->
+        let EffectSummary(capabilities_used: _, can_throw: _, is_pure: p) = s
+        return p
+      | None ->
+        // Function present in LIR but absent from EffectMap: unexpected
+        // (analyze_effects emits one entry per function). Conservatively
+        // treat as ineligible rather than guess; mismatched maps are a
+        // pipeline bug we'd rather surface than mask.
+        return false
+    end
+  end
+  return false
+end
+
+// ─── Plan Construction ───────────────────────────────────────────────────────
+
+let build_entry = fn (func: LirFunction) -> MemoEntry do
+  let LirFunction(name, params, ret_type, body: _, ret: _, span: _) = func
+  return MemoEntry(
+    name,
+    arity: list_length_lp(xs: params),
+    param_types: extract_param_types(ps: params),
+    ret_type
+  )
+end
+
+let build_entries_go = fn (funcs: [LirFunction], em: EffectMap, acc: [MemoEntry]) -> [MemoEntry] do
+  match funcs do
+    | [] -> return reverse_entries(lst: acc, out: [])
+    | f :: rest ->
+      if is_eligible(func: f, em) then
+        return build_entries_go(funcs: rest, em, acc: build_entry(func: f) :: acc)
+      end
+      return build_entries_go(funcs: rest, em, acc)
+  end
+end
+
+let reverse_entries = fn (lst: [MemoEntry], out: [MemoEntry]) -> [MemoEntry] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_entries(lst: rest, out: x :: out)
+  end
+end
+
+// ─── Public Entry Point ──────────────────────────────────────────────────────
+
+/// Compute the memoisation plan for `program` given precomputed `em`.
+/// The two inputs are taken separately (rather than re-running effect
+/// analysis here) so the driver can share one EffectMap between consumers.
+export let plan_memoization = fn (program: LirProgram, em: EffectMap) -> MemoPlan do
+  let LirProgram(functions, externals: _) = program
+  return MemoPlan(entries: build_entries_go(funcs: functions, em, acc: []))
+end
+
+// ─── Plan Queries ────────────────────────────────────────────────────────────
+
+/// Number of eligible functions in the plan.
+export let memo_plan_size = fn (plan: MemoPlan) -> i64 do
+  let MemoPlan(entries) = plan
+  return memo_plan_size_go(entries)
+end
+
+let memo_plan_size_go = fn (entries: [MemoEntry]) -> i64 do
+  match entries do
+    | [] -> return 0
+    | _ :: rest -> return 1 + memo_plan_size_go(entries: rest)
+  end
+end
+
+/// Lookup a single entry by function name. None if not eligible.
+export let lookup_memo_entry = fn (plan: MemoPlan, name: string) -> Option<MemoEntry> do
+  let MemoPlan(entries) = plan
+  return lookup_memo_entry_go(entries, name)
+end
+
+let lookup_memo_entry_go = fn (entries: [MemoEntry], name: string) -> Option<MemoEntry> do
+  match entries do
+    | [] -> return None
+    | e :: rest ->
+      let MemoEntry(name: en, arity: _, param_types: _, ret_type: _) = e
+      if en == name then return Some(val: e) end
+      return lookup_memo_entry_go(entries: rest, name)
+  end
+end
+
+/// True iff `name` has a memo entry — convenience for codegen call-site
+/// dispatch where the entry payload itself isn't needed.
+export let is_memoizable = fn (plan: MemoPlan, name: string) -> bool do
+  match lookup_memo_entry(plan, name) do
+    | Some(_) -> return true
+    | None -> return false
+  end
+end

@@ -1,0 +1,188 @@
+// Acceptance test for src/backend/memo_plan.nx (issue nexus-e6uh, MVP).
+//
+// Builds hand-rolled LirPrograms feeding analyze_effects → plan_memoization
+// and asserts that:
+//   1. Pure fns with hashable scalar args (i64, bool, char, string, f64,
+//      i32, f32) are flagged eligible.
+//   2. Pure fns with non-hashable arg types (record, list, user-defined,
+//      arrow/closure) are skipped.
+//   3. Side-effecting / throwing fns are skipped even when arg types are
+//      otherwise hashable (purity gate dominates).
+//   4. Zero-arg pure fns are skipped (argument-keyed cache requires args).
+//
+// This file mirrors effect_analysis_test.nx in framing — we don't compile
+// real Nexus source to LIR; we hand-roll LirProgram values so the unit of
+// work under test is exactly the planner. End-to-end "cache hit observable
+// at runtime" coverage is explicitly out of scope until codegen call-site
+// emission lands; tracked as the next milestone in nexus-e6uh.
+import * as test_assert from "std:test/assert"
+import { TypeExpr, TyI64, TyF64, TyBool, TyChar, TyString, TyUnit, TyRow, TyRecord, TyList, TyUserDefined, TyArrow, NamedType } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { LirProgram, LirFunction, LirParam, LirAtom, LirAtomInt, LirAtomUnit, LirAtomVar, LirExpr, LirExprAtom, LirExprRaise, LirStmt, LirStmtLet } from "src/ir/lir_types.nx"
+import { EffectMap, analyze_effects } from "src/backend/effect_analysis.nx"
+import { MemoPlan, MemoEntry, plan_memoization, memo_plan_size, lookup_memo_entry, is_memoizable } from "src/backend/memo_plan.nx"
+import { Option, Some, None } from "std:option"
+
+let dummy_span = fn () -> Span do
+  return Span(offset: 0, line: 1, col: 1)
+end
+
+// Trivial body shared by every fixture that doesn't need a side effect.
+// `let r = 42 in r` keeps the LIR walk identical across all hashable-typed
+// fixtures, isolating the planner's eligibility decisions to the parameter
+// types (the only axis that varies between fixtures).
+let trivial_body = fn () -> [LirStmt] do
+  return [LirStmtLet(name: "r", typ: TyI64, expr: LirExprAtom(atom: LirAtomInt(val: 42)))]
+end
+
+let trivial_ret = fn () -> LirAtom do
+  return LirAtomVar(name: "r", typ: TyI64)
+end
+
+let mk_fn = fn (name: string, params: [LirParam], ret_type: TypeExpr) -> LirFunction do
+  return LirFunction(
+    name: name,
+    params: params,
+    ret_type: ret_type,
+    body: trivial_body(),
+    ret: trivial_ret(),
+    span: dummy_span()
+  )
+end
+
+// ─── Pure / hashable fixtures (expected eligible) ────────────────────────────
+
+let make_pure_int_fn = fn () -> LirFunction do
+  return mk_fn(name: "pure_int", params: [LirParam(label: "x", name: "x", typ: TyI64)], ret_type: TyI64)
+end
+let make_pure_bool_fn = fn () -> LirFunction do
+  return mk_fn(name: "pure_bool", params: [LirParam(label: "b", name: "b", typ: TyBool)], ret_type: TyI64)
+end
+let make_pure_char_fn = fn () -> LirFunction do
+  return mk_fn(name: "pure_char", params: [LirParam(label: "c", name: "c", typ: TyChar)], ret_type: TyI64)
+end
+let make_pure_string_fn = fn () -> LirFunction do
+  return mk_fn(name: "pure_string", params: [LirParam(label: "s", name: "s", typ: TyString)], ret_type: TyI64)
+end
+let make_pure_float_fn = fn () -> LirFunction do
+  return mk_fn(name: "pure_float", params: [LirParam(label: "f", name: "f", typ: TyF64)], ret_type: TyI64)
+end
+// Multi-arg, all hashable: still eligible.
+let make_pure_multi_fn = fn () -> LirFunction do
+  return mk_fn(name: "pure_multi", params: [
+    LirParam(label: "x", name: "x", typ: TyI64),
+    LirParam(label: "s", name: "s", typ: TyString)
+  ], ret_type: TyI64)
+end
+
+// ─── Pure / non-hashable fixtures (expected skipped) ─────────────────────────
+
+let make_pure_record_fn = fn () -> LirFunction do
+  let rec_ty = TyRecord(fields: [NamedType(name: "x", typ: TyI64)])
+  return mk_fn(name: "pure_record", params: [LirParam(label: "r", name: "r", typ: rec_ty)], ret_type: TyI64)
+end
+let make_pure_list_fn = fn () -> LirFunction do
+  return mk_fn(name: "pure_list", params: [LirParam(label: "xs", name: "xs", typ: TyList(elem: TyI64))], ret_type: TyI64)
+end
+let make_pure_userdef_fn = fn () -> LirFunction do
+  return mk_fn(name: "pure_userdef", params: [LirParam(label: "v", name: "v", typ: TyUserDefined(name: "MyType", args: []))], ret_type: TyI64)
+end
+let make_pure_arrow_fn = fn () -> LirFunction do
+  let arrow_ty = TyArrow(
+    params: [NamedType(name: "x", typ: TyI64)],
+    ret: TyI64,
+    requires: TyRow(types: [], rest: None),
+    throw_row: TyRow(types: [], rest: None)
+  )
+  return mk_fn(name: "pure_arrow", params: [LirParam(label: "f", name: "f", typ: arrow_ty)], ret_type: TyI64)
+end
+
+// ─── Non-pure fixture (expected skipped regardless of arg shape) ─────────────
+
+let make_throwing_fn = fn () -> LirFunction do
+  return LirFunction(
+    name: "throwing_fn",
+    params: [LirParam(label: "x", name: "x", typ: TyI64)],
+    ret_type: TyUnit,
+    body: [LirStmtLet(name: "r", typ: TyUnit, expr: LirExprRaise(value: LirAtomInt(val: 0), typ: TyUnit))],
+    ret: LirAtomUnit,
+    span: dummy_span()
+  )
+end
+
+// ─── Zero-arg pure fixture (skipped: argument-keyed cache needs args) ────────
+
+let make_zero_arg_fn = fn () -> LirFunction do
+  return mk_fn(name: "zero_arg", params: [], ret_type: TyI64)
+end
+
+exception MissingEntry(name: string)
+
+let body = fn () -> unit throws { Exn } do
+  let prog = LirProgram(functions: [
+    make_pure_int_fn(), make_pure_bool_fn(), make_pure_char_fn(),
+    make_pure_string_fn(), make_pure_float_fn(), make_pure_multi_fn(),
+    make_pure_record_fn(), make_pure_list_fn(), make_pure_userdef_fn(),
+    make_pure_arrow_fn(), make_throwing_fn(), make_zero_arg_fn()
+  ], externals: [])
+
+  let em = analyze_effects(program: prog)
+  let plan = plan_memoization(program: prog, em)
+
+  // Six eligible: pure_int, pure_bool, pure_char, pure_string, pure_float,
+  // pure_multi.
+  test_assert.assert_eq_i64(
+    actual: memo_plan_size(plan),
+    expected: 6,
+    label: "memo_plan size (6 eligible)"
+  )
+
+  // Hashable-scalar pure fns: all eligible.
+  test_assert.assert_true(cond: is_memoizable(plan, name: "pure_int"),    label: "pure_int eligible")
+  test_assert.assert_true(cond: is_memoizable(plan, name: "pure_bool"),   label: "pure_bool eligible")
+  test_assert.assert_true(cond: is_memoizable(plan, name: "pure_char"),   label: "pure_char eligible")
+  test_assert.assert_true(cond: is_memoizable(plan, name: "pure_string"), label: "pure_string eligible")
+  test_assert.assert_true(cond: is_memoizable(plan, name: "pure_float"),  label: "pure_float eligible")
+  test_assert.assert_true(cond: is_memoizable(plan, name: "pure_multi"),  label: "pure_multi eligible (all hashable)")
+
+  // Non-hashable arg types: skipped.
+  test_assert.assert_false(cond: is_memoizable(plan, name: "pure_record"),  label: "pure_record skipped (record)")
+  test_assert.assert_false(cond: is_memoizable(plan, name: "pure_list"),    label: "pure_list skipped (list)")
+  test_assert.assert_false(cond: is_memoizable(plan, name: "pure_userdef"), label: "pure_userdef skipped (user-defined)")
+  test_assert.assert_false(cond: is_memoizable(plan, name: "pure_arrow"),   label: "pure_arrow skipped (closure)")
+
+  // Non-pure: skipped.
+  test_assert.assert_false(cond: is_memoizable(plan, name: "throwing_fn"), label: "throwing_fn skipped (impure)")
+
+  // Zero-arg: skipped.
+  test_assert.assert_false(cond: is_memoizable(plan, name: "zero_arg"), label: "zero_arg skipped (no args)")
+
+  // Spot-check entry payload for one eligible fn — arity, name round-trip.
+  match lookup_memo_entry(plan, name: "pure_multi") do
+    | Some(val: e) ->
+      let MemoEntry(name: en, arity, param_types: _, ret_type: _) = e
+      test_assert.assert_true(cond: en == "pure_multi", label: "pure_multi.name preserved")
+      test_assert.assert_eq_i64(actual: arity, expected: 2, label: "pure_multi.arity == 2")
+    | None -> raise MissingEntry(name: "pure_multi")
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  // Trap on failure so the runtime test runner reports FAIL via non-zero
+  // exit. Mirrors the divide-by-zero idiom used by every fixture in this
+  // directory.
+  let _ = 1 / ok
+  return ()
+end
