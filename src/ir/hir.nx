@@ -520,6 +520,12 @@ end
 /// Lowers an AST `Function` into a `HirFunction`. The `span` field threads
 /// the source position (e.g. the `fn` keyword for handler arms) through to
 /// HIR so LSP hover/definition queries land on byte-accurate offsets.
+///
+/// `file` is left empty here — only handler arms reach this entry, and
+/// `synthesize_handler` rewrites every arm with the binding's `source_file`
+/// before the arm is exposed via `extract_handler_functions`. Direct
+/// consumers of the unmangled arm function would see the empty sentinel
+/// (issue nexus-qgfh design choice ii).
 let convert_one_function = fn (func: Function, entries: [RenameEntry]) -> HirFunction throws { Exn } do
   let Function(name: n, is_public: _, type_params: tps, params: ps, ret_type: rt, requires: _, throw_row: tw, body: b, span: sp) = func
   return HirFunction(
@@ -529,7 +535,8 @@ let convert_one_function = fn (func: Function, entries: [RenameEntry]) -> HirFun
     ret_type: rt,
     throw_row: tw,
     body: EagerBody(stmts: convert_stmts(stmts: b, entries)),
-    span: sp
+    span: sp,
+    file: ""
   )
 end
 
@@ -726,12 +733,12 @@ let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, typ
         | _ -> TyRow(types: [], rest: None)
       end
       let func = HirFunction(name: qname, type_params: tps, params: lps,
-        ret_type: effective_rt, throw_row: lambda_throw_row, body: LazyBody(ast_expr: val, entries), span)
+        ret_type: effective_rt, throw_row: lambda_throw_row, body: LazyBody(ast_expr: val, entries), span, file: source_file)
       return HirAccum(ports: ps, functions: func :: fs,
         externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs)
     | Handler(port_name: pname, arms: handler_arms) ->
       let binding = synthesize_handler(
-        binding_name: qname, port_name: pname, arms: handler_arms)
+        binding_name: qname, port_name: pname, arms: handler_arms, source_file)
       return HirAccum(ports: ps, functions: fs, externals: exts,
         handler_bindings: binding :: hbs,
         enum_defs: eds, wasm_module: wmod, exception_groups: egs)
@@ -763,7 +770,8 @@ let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, typ
         name: debug_name, type_params: [], params: [], ret_type: rt,
         throw_row: TyRow(types: [], rest: None),
         body: EagerBody(stmts: [HirStmt(node: Return(expr: hir_val), span)]),
-        span)
+        span,
+        file: source_file)
       return HirAccum(ports: ps, functions: func :: fs,
         externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs)
   end
@@ -894,22 +902,26 @@ let convert_port_sigs_go = fn (sigs: [FunctionSig], acc: [HirPortMethod]) -> [Hi
 end
 
 /// Synthesize handler binding: create named arm entries for each method.
-let synthesize_handler = fn (binding_name: string, port_name: string, arms: [HirHandlerArm]) -> HirHandlerBindingEntry throws { Exn } do
-  let synth_arms = synthesize_handler_arms(binding_name, arms)
+/// `source_file` is the path of the file declaring the handler binding —
+/// every synthesised arm function is tagged with it so cross-file LSP
+/// diagnostics can attribute typecheck failures inside the arm body to
+/// the right file (issue nexus-qgfh).
+let synthesize_handler = fn (binding_name: string, port_name: string, arms: [HirHandlerArm], source_file: string) -> HirHandlerBindingEntry throws { Exn } do
+  let synth_arms = synthesize_handler_arms(binding_name, arms, source_file)
   return HirHandlerBindingEntry(
     name: binding_name,
     binding: HirHandlerBinding(port_name, arms: synth_arms)
   )
 end
 
-let synthesize_handler_arms = fn (binding_name: string, arms: [HirHandlerArm]) -> [HirHandlerArm] throws { Exn } do
-  return synthesize_handler_arms_go(binding_name, arms, acc: [])
+let synthesize_handler_arms = fn (binding_name: string, arms: [HirHandlerArm], source_file: string) -> [HirHandlerArm] throws { Exn } do
+  return synthesize_handler_arms_go(binding_name, arms, source_file, acc: [])
 end
 
-let synthesize_handler_arms_go = fn (binding_name: string, arms: [HirHandlerArm], acc: [HirHandlerArm]) -> [HirHandlerArm] throws { Exn } do
+let synthesize_handler_arms_go = fn (binding_name: string, arms: [HirHandlerArm], source_file: string, acc: [HirHandlerArm]) -> [HirHandlerArm] throws { Exn } do
   match arms do
     | [] -> return list.reverse(xs: acc)
-    | HirHandlerArm(arm: HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, throw_row: tw, body: b, span: sp), cont_binder: kb) :: rest ->
+    | HirHandlerArm(arm: HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, throw_row: tw, body: b, span: sp, file: _), cont_binder: kb) :: rest ->
       let synth_name = naming.handler_func_name(handler_name: binding_name, method_name: n)
       let synth_params = match kb do
         | Some(val: k) ->
@@ -917,8 +929,8 @@ let synthesize_handler_arms_go = fn (binding_name: string, arms: [HirHandlerArm]
           list.concat(xs: ps, ys: [k_p])
         | None -> ps
       end
-      let synth_arm = HirHandlerArm(arm: HirFunction(name: synth_name, type_params: tps, params: synth_params, ret_type: rt, throw_row: tw, body: b, span: sp), cont_binder: kb)
-      return synthesize_handler_arms_go(binding_name, arms: rest, acc: synth_arm :: acc)
+      let synth_arm = HirHandlerArm(arm: HirFunction(name: synth_name, type_params: tps, params: synth_params, ret_type: rt, throw_row: tw, body: b, span: sp, file: source_file), cont_binder: kb)
+      return synthesize_handler_arms_go(binding_name, arms: rest, source_file, acc: synth_arm :: acc)
   end
 end
 
@@ -1158,14 +1170,14 @@ end
 let expand_groups_in_hir_functions_go = fn (funcs: [HirFunction], groups: [ExceptionGroupEntry], acc: [HirFunction]) -> [HirFunction] throws { Exn } do
   match funcs do
     | [] -> return rev_hir_function(lst: acc, out: [])
-    | HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, throw_row: tw, body: EagerBody(stmts: b), span: sp) :: rest ->
+    | HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, throw_row: tw, body: EagerBody(stmts: b), span: sp, file: fp) :: rest ->
       return expand_groups_in_hir_functions_go(funcs: rest, groups,
         acc: HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, throw_row: tw,
-          body: EagerBody(stmts: expand_groups_in_stmts(stmts: b, groups)), span: sp) :: acc)
-    | HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, throw_row: tw, body: b, span: sp) :: rest ->
+          body: EagerBody(stmts: expand_groups_in_stmts(stmts: b, groups)), span: sp, file: fp) :: acc)
+    | HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, throw_row: tw, body: b, span: sp, file: fp) :: rest ->
       // LazyBody: no stmts to expand, preserve as-is
       return expand_groups_in_hir_functions_go(funcs: rest, groups,
-        acc: HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, throw_row: tw, body: b, span: sp) :: acc)
+        acc: HirFunction(name: n, type_params: tps, params: ps, ret_type: rt, throw_row: tw, body: b, span: sp, file: fp) :: acc)
   end
 end
 
