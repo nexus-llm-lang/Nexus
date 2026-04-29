@@ -238,6 +238,24 @@ let emit_alloc_type_scratch = fn (scratch: %ByteBuffer) -> %ByteBuffer do
   return bb.push_byte(%buf, byte: wdefs.vt_i32)
 end
 
+/// `() -> i32` for `__nx_alloc_mark` — snapshots the routed allocator's
+/// LIFO bookkeeping count (see bootstrap/src/lib/wasm_alloc::mark).
+let emit_alloc_mark_type_scratch = fn (scratch: %ByteBuffer) -> %ByteBuffer do
+  let %buf = bb.push_byte(buf: %scratch, byte: wdefs.wasm_form_func)
+  let %buf = bb.push_uleb128(%buf, val: 0)
+  let %buf = bb.push_uleb128(%buf, val: 1)
+  return bb.push_byte(%buf, byte: wdefs.vt_i32)
+end
+
+/// `(i32) -> ()` for `__nx_alloc_reset(mark)` — pops every routed allocation
+/// past `mark` in LIFO order (see bootstrap/src/lib/wasm_alloc::reset_to).
+let emit_alloc_reset_type_scratch = fn (scratch: %ByteBuffer) -> %ByteBuffer do
+  let %buf = bb.push_byte(buf: %scratch, byte: wdefs.wasm_form_func)
+  let %buf = bb.push_uleb128(%buf, val: 1)
+  let %buf = bb.push_byte(%buf, byte: wdefs.vt_i32)
+  return bb.push_uleb128(%buf, val: 0)
+end
+
 let emit_cabi_type_scratch = fn (scratch: %ByteBuffer) -> %ByteBuffer do
   let %buf = bb.push_byte(buf: %scratch, byte: wdefs.wasm_form_func)
   let %buf = bb.push_uleb128(%buf, val: 4)
@@ -251,6 +269,8 @@ end
 
 /// DedupedTypes carries the built type section payload plus per-entity
 /// canonical type indices. Sentinel -1 for entries not in this module.
+/// `alloc_mark_type_idx` / `alloc_reset_type_idx` index the `() -> i32` and
+/// `(i32) -> ()` shapes used by the routed allocator's mark/reset hooks.
 export type DedupedTypes = DedupedTypes(
   section: %ByteBuffer,
   count: i64,
@@ -260,6 +280,8 @@ export type DedupedTypes = DedupedTypes(
   exn_tag_type_idx: i64,
   ss_tag_type_idx: i64,
   alloc_type_idx: i64,
+  alloc_mark_type_idx: i64,
+  alloc_reset_type_idx: i64,
   cabi_type_idx: i64,
   closure_type_idxs: [i64],
   ss_cont_type_idx: i64,
@@ -361,6 +383,24 @@ let commit_alloc_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i6
   return commit_skip(%section, %seen, n_unique)
 end
 
+let commit_alloc_mark_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, has_alloc: bool) -> %CommitStep do
+  if has_alloc then
+    let %scratch = bb.empty()
+    let %scratch = emit_alloc_mark_type_scratch(%scratch)
+    return td_commit(%section, %seen, n_unique, %scratch)
+  end
+  return commit_skip(%section, %seen, n_unique)
+end
+
+let commit_alloc_reset_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, has_alloc: bool) -> %CommitStep do
+  if has_alloc then
+    let %scratch = bb.empty()
+    let %scratch = emit_alloc_reset_type_scratch(%scratch)
+    return td_commit(%section, %seen, n_unique, %scratch)
+  end
+  return commit_skip(%section, %seen, n_unique)
+end
+
 let commit_cabi_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, has_cabi: bool) -> %CommitStep do
   if has_cabi then
     let %scratch = bb.empty()
@@ -418,6 +458,16 @@ export let build_type_section_dedup = fn (program: LirProgram, has_eh: bool, has
   let %section = launder_buf(b: %section)
   let %seen = launder_smap(m: %seen)
 
+  let CommitStep(%section, %seen, n_unique: nu, idx: alloc_mark_idx) =
+    commit_alloc_mark_type(%section, %seen, n_unique: nu, has_alloc)
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+
+  let CommitStep(%section, %seen, n_unique: nu, idx: alloc_reset_idx) =
+    commit_alloc_reset_type(%section, %seen, n_unique: nu, has_alloc)
+  let %section = launder_buf(b: %section)
+  let %seen = launder_smap(m: %seen)
+
   let CommitStep(%section, %seen, n_unique: nu, idx: cabi_idx) =
     commit_cabi_type(%section, %seen, n_unique: nu, has_cabi: has_cabi_realloc)
   let %section = launder_buf(b: %section)
@@ -460,6 +510,8 @@ export let build_type_section_dedup = fn (program: LirProgram, has_eh: bool, has
     exn_tag_type_idx: exn_tag_idx,
     ss_tag_type_idx: ss_tag_idx,
     alloc_type_idx: alloc_idx,
+    alloc_mark_type_idx: alloc_mark_idx,
+    alloc_reset_type_idx: alloc_reset_idx,
     cabi_type_idx: cabi_idx,
     closure_type_idxs: closure_idxs,
     ss_cont_type_idx: ss_cont_idx,
@@ -502,11 +554,17 @@ let maybe_emit_mem_import = fn (sec: %ByteBuffer, has_mem_import: bool, mem_mode
 end
 
 export let build_import_section = fn (exts: [LirExternal], ext_type_idxs: [i64], mem_mode: string,
-                                      has_alloc: bool, alloc_type_idx: i64, alloc_module: string) -> %ByteBuffer do
+                                      has_alloc: bool, alloc_type_idx: i64,
+                                      alloc_mark_type_idx: i64, alloc_reset_type_idx: i64,
+                                      alloc_module: string) -> %ByteBuffer do
   let n_exts = list.length(xs: exts)
   let has_mem_import = mem_mode != "none" && mem_mode != "defined"
   let mem_count = if has_mem_import then 1 else 0 end
-  let alloc_count = if has_alloc then 1 else 0 end
+  // 3 alloc imports when stdlib allocator is in use: allocate, alloc_mark,
+  // alloc_reset. mark/reset wire `arena.heap_reset` through to the routed
+  // allocator's LIFO bookkeeping so reset reclaims string concat / format /
+  // substring / object allocations alongside the G0 bump pointer.
+  let alloc_count = if has_alloc then 3 else 0 end
   let %sec = bb.empty()
   let %sec = bb.push_uleb128(buf: %sec, val: n_exts + mem_count + alloc_count)
   let %sec = maybe_emit_mem_import(%sec, has_mem_import, mem_mode)
@@ -515,7 +573,15 @@ export let build_import_section = fn (exts: [LirExternal], ext_type_idxs: [i64],
     let %sec = wdefs.emit_name(buf: %sec, name: import_module_name(module: alloc_module))
     let %sec = wdefs.emit_name(buf: %sec, name: "allocate")
     let %sec = bb.push_byte(buf: %sec, byte: wdefs.desc_func)
-    bb.push_uleb128(buf: %sec, val: alloc_type_idx)
+    let %sec = bb.push_uleb128(buf: %sec, val: alloc_type_idx)
+    let %sec = wdefs.emit_name(buf: %sec, name: import_module_name(module: alloc_module))
+    let %sec = wdefs.emit_name(buf: %sec, name: "__nx_alloc_mark")
+    let %sec = bb.push_byte(buf: %sec, byte: wdefs.desc_func)
+    let %sec = bb.push_uleb128(buf: %sec, val: alloc_mark_type_idx)
+    let %sec = wdefs.emit_name(buf: %sec, name: import_module_name(module: alloc_module))
+    let %sec = wdefs.emit_name(buf: %sec, name: "__nx_alloc_reset")
+    let %sec = bb.push_byte(buf: %sec, byte: wdefs.desc_func)
+    bb.push_uleb128(buf: %sec, val: alloc_reset_type_idx)
   else %sec end
   return %sec
 end

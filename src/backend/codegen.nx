@@ -295,21 +295,57 @@ let get_arena_wasm_name = fn (func: string, exts: [LirExternal]) -> string do
 end
 
 /// Emit inline WASM for an arena intrinsic. Dispatches on wasm_name.
-let emit_heap_mark = fn (buf: %ByteBuffer) -> %ByteBuffer do
-  // global.get 0 → i32; i64.extend_i32_u → i64
+///
+/// `heap_mark` packs the routed allocator's outstanding-count snapshot
+/// (upper 32 bits) alongside the G0 bump pointer (lower 32 bits) so that
+/// `heap_reset` can free both. When the routed allocator is unavailable
+/// (alloc_mode != 2 → no `__nx_alloc_mark` import) the upper 32 bits are
+/// zero and `heap_reset` rewinds G0 only. Mirrors
+/// bootstrap/src/compiler/codegen/function.rs::Intrinsic::HeapMark.
+let emit_heap_mark = fn (buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
+  let mark_idx = wdefs.lookup_func_fast(name: "__nx_alloc_mark", map: wdefs.ctx_external_func_map(ctx))
+  if mark_idx >= 0 then
+    // call __nx_alloc_mark → i32; extend_u → i64; shl 32; OR (G0 extended u)
+    let %buf = bb.push_byte(%buf, byte: op_call)
+    let %buf = bb.push_uleb128(%buf, val: mark_idx)
+    let %buf = bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    let %buf = bb.push_byte(%buf, byte: op_i64_const)
+    let %buf = bb.push_sleb128(%buf, val: 32)
+    let %buf = bb.push_byte(%buf, byte: op_i64_shl)
+    let %buf = bb.push_byte(%buf, byte: op_global_get)
+    let %buf = bb.push_uleb128(%buf, val: heap_global_idx)
+    let %buf = bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    return bb.push_byte(%buf, byte: op_i64_or)
+  end
+  // No routed allocator — snapshot G0 only.
   let %buf = bb.push_byte(%buf, byte: op_global_get)
   let %buf = bb.push_uleb128(%buf, val: heap_global_idx)
   return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
 end
 
+/// `heap_reset` mirror of HeapMark: when the routed allocator is wired,
+/// shift the upper 32 bits of `mark` into i32 and call `__nx_alloc_reset`
+/// to LIFO-pop every routed allocation past that count, then rewind G0
+/// from the lower 32 bits. Returns void (unit-typed — no value pushed).
+/// Mirrors bootstrap/src/compiler/codegen/function.rs::Intrinsic::HeapReset.
 let emit_heap_reset = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
-  // arg "mark" → i64; i32.wrap_i64; global.set 0
-  // Returns void (unit-typed — no value pushed on stack).
   match args do
     | LirCallArg(label: _, value: a) :: _ ->
-      let %buf = emit_atom(atom: a, %buf, ctx)
-      let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_global_set])
-      return bb.push_uleb128(%buf, val: heap_global_idx)
+      let reset_idx = wdefs.lookup_func_fast(name: "__nx_alloc_reset", map: wdefs.ctx_external_func_map(ctx))
+      let %buf = if reset_idx >= 0 then
+        // mark (i64) → upper 32 → i32; call __nx_alloc_reset(i32)
+        let %b = emit_atom(atom: a, buf: %buf, ctx)
+        let %b = bb.push_byte(buf: %b, byte: op_i64_const)
+        let %b = bb.push_sleb128(buf: %b, val: 32)
+        let %b = bb.push_byte(buf: %b, byte: op_i64_shr_u)
+        let %b = bb.push_byte(buf: %b, byte: op_i32_wrap_i64)
+        let %b = bb.push_byte(buf: %b, byte: op_call)
+        bb.push_uleb128(buf: %b, val: reset_idx)
+      else %buf end
+      // Restore G0 from low 32 bits.
+      let %buf = emit_atom(atom: a, buf: %buf, ctx)
+      let %buf = bb.push_bytes(buf: %buf, bytes: [op_i32_wrap_i64, op_global_set])
+      return bb.push_uleb128(buf: %buf, val: heap_global_idx)
     | _ ->
       raise SymbolNotFound(name: "__nx_heap_reset", kind: "arena intrinsic arg", context: "")
       return %buf
@@ -812,7 +848,7 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
   let arena_wn = get_arena_wasm_name(func, exts)
   let mem_wn = get_memory_wasm_name(func, exts)
   let math_wn = get_math_wasm_name(func, exts)
-  if arena_wn == "heap-mark" then return emit_heap_mark(%buf)
+  if arena_wn == "heap-mark" then return emit_heap_mark(%buf, ctx)
   else if arena_wn == "heap-reset" then return emit_heap_reset(args, %buf, ctx)
   else if arena_wn == "heap-swap" then return emit_heap_swap(args, %buf, ctx)
   else if is_sched_set_next(func, exts) then return emit_sched_set_next(args, %buf, ctx)
@@ -1913,7 +1949,11 @@ let build_name_section = fn (exts: [LirExternal], funcs: [LirFunction],
   let %entries = emit_external_name_entries(buf: %entries, exts, idx: 0)
   let %entries = if has_alloc then
     let %entries = bb.push_uleb128(buf: %entries, val: n_exts)
-    wdefs.emit_name(buf: %entries, name: "allocate")
+    let %entries = wdefs.emit_name(buf: %entries, name: "allocate")
+    let %entries = bb.push_uleb128(buf: %entries, val: n_exts + 1)
+    let %entries = wdefs.emit_name(buf: %entries, name: "__nx_alloc_mark")
+    let %entries = bb.push_uleb128(buf: %entries, val: n_exts + 2)
+    wdefs.emit_name(buf: %entries, name: "__nx_alloc_reset")
   else %entries end
   let internal_start = n_exts + n_alloc_imports
   let %entries = emit_internal_name_entries(buf: %entries, funcs, idx: internal_start)
@@ -1963,16 +2003,25 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
         else if heap_enabled then 1
         else 0
         end
-      let n_alloc_imports = if alloc_mode == 2 then 1 else 0 end
+      // 3 alloc imports when stdlib allocator is in use: allocate (slot
+      // n_exts), __nx_alloc_mark (n_exts+1), __nx_alloc_reset (n_exts+2).
+      // mark/reset are wired into emit_heap_mark/emit_heap_reset to reclaim
+      // routed allocations alongside the G0 bump pointer.
+      let n_alloc_imports = if alloc_mode == 2 then 3 else 0 end
       let import_count = n_exts + n_alloc_imports
 
       let internal_funcs = build_internal_func_entries(funcs, import_count, idx: 0)
       let base_external_funcs = build_external_func_entries(exts, idx: 0)
       // Add remap entries for deduplicated externals (duplicate names → original index)
       let ext_funcs_with_remaps = append_func_entries(a: ext_remaps, b: base_external_funcs)
-      // Add allocate import to external_funcs for lookup
+      // Add allocate / alloc_mark / alloc_reset imports to external_funcs
+      // for lookup. Slot order matches the import section's emission order
+      // so call sites can use ctx_external_func_map to resolve indices.
       let external_funcs = if alloc_mode == 2 then
-        FuncEntry(name: "__nx_allocate", index: n_exts) :: ext_funcs_with_remaps
+        FuncEntry(name: "__nx_alloc_reset", index: n_exts + 2) ::
+          FuncEntry(name: "__nx_alloc_mark", index: n_exts + 1) ::
+          FuncEntry(name: "__nx_allocate", index: n_exts) ::
+          ext_funcs_with_remaps
       else
         ext_funcs_with_remaps
       end
@@ -2036,6 +2085,8 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
                        exn_tag_type_idx: exn_tag_type_idx,
                        ss_tag_type_idx: ss_tag_type_idx,
                        alloc_type_idx: alloc_type_idx,
+                       alloc_mark_type_idx: alloc_mark_type_idx,
+                       alloc_reset_type_idx: alloc_reset_type_idx,
                        cabi_type_idx: cabi_type_idx,
                        closure_type_idxs: closure_type_idxs,
                        ss_cont_type_idx: my_cont_idx,
@@ -2051,7 +2102,9 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64)
         let %m = wdefs.emit_section(buf: %m, id: sec_import,
                                content: wsect.build_import_section(exts, ext_type_idxs,
                                  mem_mode, has_alloc,
-                                 alloc_type_idx, alloc_module: mem_mode))
+                                 alloc_type_idx,
+                                 alloc_mark_type_idx, alloc_reset_type_idx,
+                                 alloc_module: mem_mode))
       end
 
       // Function section
