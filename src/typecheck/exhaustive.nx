@@ -1,42 +1,97 @@
 /**
- * typecheck/exhaustive: top-column exhaustiveness check for match arms.
+ * typecheck/exhaustive: match exhaustiveness + redundancy via Maranget's
+ * pattern-matrix usefulness algorithm.
  *
- * Implements predicate P6 from docs/spec/type-system-formal.md. Inspects the
- * arm patterns of a match against the scrutinee type and reports whether the
- * combined arms cover every value of that type.
+ * Implements predicate P6 from the type-system spec. Two checks are exposed:
  *
- * Scope (v1): only the scrutinee column. Nested-constructor exhaustiveness
- * (e.g. `match opt do | Some(val: 1) -> ... | None -> ... end` missing
- * Some(other-int)) is not checked here — tracked separately.
+ * - `check_match_exhaustive(cases, scrutinee_type, enum_defs)` — reports
+ *   `Exhaustive` or `NonExhaustive(witness)` where `witness` is a printed
+ *   representation of an uncovered value (e.g. `"true"`, `"Some(_)"`,
+ *   `"Some(Cons(_, _))"`, `"_"`).
  *
- * Coverage:
- *   - bool — both `true` and `false` literal arms required (or a wildcard).
- *   - ADT (TyUserDefined) — every constructor of the enum required (or a
- *     wildcard / variable pattern).
- *   - list (TyList, UserDefined("List", _)) — both `[]` (Nil) and `_::_`
- *     (Cons) required (or a wildcard).
- *   - other types (numerics, strings, records, etc.) — any wildcard /
- *     variable pattern alone is exhaustive; otherwise non-exhaustive.
+ * - `check_match_redundancy(cases, scrutinee_type, enum_defs)` — reports
+ *   the index of the first arm whose pattern is fully shadowed by
+ *   strictly earlier arms, or `NoRedundant` when every arm is reachable.
  *
- * The check returns `Exhaustive` or `NonExhaustive(witness)` where `witness`
- * is a short description of an uncovered shape (e.g. `"true"`, `"Some"`,
- * `"[]"`, `"_"`).
+ * Algorithm (Maranget, "Warnings for pattern matching"):
+ *
+ *   useful(M, v) holds iff value vector `v` matches some shape that no
+ *   row of matrix `M` already matches. With this primitive both checks
+ *   reduce to:
+ *     - exhaustive  ≡  ¬ useful(M, [_, _, …, _])
+ *     - reachable_i ≡  useful(rows[0..i-1], rows[i])
+ *
+ * Specialization on a constructor `c` (`spec(M, c)`) drops rows whose head
+ * mismatches `c` and unfolds matching rows by replacing the head pattern
+ * with its `c.arity` field patterns (or `c.arity` wildcards for a row whose
+ * head was a wildcard / variable). The default matrix `default(M)` keeps
+ * only rows whose head accepts every value (wildcard / variable / or-of-
+ * such) and drops the head column entirely.
+ *
+ * Coverage of the head column:
+ *   - bool — finite signature {true, false}.
+ *   - list / TyUserDefined("List", _) — finite signature {Nil, Cons}.
+ *   - TyUserDefined(name, _) registered in `enum_defs` — finite signature
+ *     equal to the enum variants.
+ *   - everything else (numerics, strings, chars, records, arrays, tuples,
+ *     uninhabited type variables) — treated as having an "open" signature;
+ *     only a wildcard (or all literal alternatives, none of which are
+ *     finite for these types) makes the column exhaustive.
+ *
+ * Witness printing reflects the nested pattern structure so users see the
+ * full uncovered shape, not just the top-level constructor.
  */
 
 import {
-  TypeExpr, TyBool, TyUserDefined, TyList, TyArray, TyRecord, TyLinear, TyLazy, TyBorrow,
-  EnumDef, VariantDef
+  TypeExpr, TyBool, TyUserDefined, TyList, TyArray, TyRecord, TyVar,
+  TyLinear, TyLazy, TyBorrow,
+  EnumDef, VariantDef, VariantField, NamedType,
+  Literal, LitInt, LitBool, LitChar, LitString, LitFloat, LitUnit
 } from "src/common/ast.nx"
 import {
-  HirMatchCase, HirPatternKind, PLit, PVar, PCtor, PRec, PWild, POr
+  HirMatchCase, HirPatternKind, HirPatternField, HirRecordPatField,
+  PLit, PVar, PCtor, PRec, PWild, POr
 } from "src/ir/hir_types.nx"
-import { LitBool } from "src/common/ast.nx"
 import { EnumEntry } from "src/typecheck/types.nx"
 import { Some, None } from "std:option"
+import * as list from "std:list"
+import * as str from "std:str"
 
 export type ExhaustiveResult =
   Exhaustive
   | NonExhaustive(witness: string)
+
+export type RedundancyResult =
+  NoRedundant
+  | Redundant(arm_index: i64, witness: string)
+
+// ─── Public entry points ────────────────────────────────────────────────────
+
+export let check_match_exhaustive = fn (
+  cases: [HirMatchCase],
+  scrutinee_type: TypeExpr,
+  enum_defs: [EnumEntry]
+) -> ExhaustiveResult throws { Exn } do
+  let stripped = strip_mod(typ: scrutinee_type)
+  let rows = build_rows_from_cases(cases)
+  let probe = [PWild]
+  let cols = [stripped]
+  match useful_witness(matrix: rows, vec: probe, cols, enum_defs) do
+    | Some(val: w) -> return NonExhaustive(witness: render_witness(ws: w))
+    | None -> return Exhaustive
+  end
+end
+
+export let check_match_redundancy = fn (
+  cases: [HirMatchCase],
+  scrutinee_type: TypeExpr,
+  enum_defs: [EnumEntry]
+) -> RedundancyResult throws { Exn } do
+  let stripped = strip_mod(typ: scrutinee_type)
+  let rows = build_rows_from_cases(cases)
+  let cols = [stripped]
+  return scan_redundant(rows, prev: [], idx: 0, cols, enum_defs)
+end
 
 // Strip outer modality wrappers so exhaustiveness sees the underlying type.
 let strip_mod = fn (typ: TypeExpr) -> TypeExpr do
@@ -48,199 +103,749 @@ let strip_mod = fn (typ: TypeExpr) -> TypeExpr do
   end
 end
 
-export let check_match_exhaustive = fn (
-  cases: [HirMatchCase],
-  scrutinee_type: TypeExpr,
-  enum_defs: [EnumEntry]
-) -> ExhaustiveResult throws { Exn } do
-  let pats = collect_top_patterns(cases, acc: [])
-  if has_unconditional(pats) then return Exhaustive end
-  let st = strip_mod(typ: scrutinee_type)
-  match st do
-    | TyBool -> return check_bool(pats)
-    | TyList(_) -> return check_list(pats)
-    | TyArray(_) ->
-      // Arrays have no surface destructuring patterns; only wildcard / variable
-      // can match. has_unconditional already returned, so any non-trivial arm
-      // is non-exhaustive.
-      return NonExhaustive(witness: "_")
-    | TyUserDefined(name: enm, args: _) ->
-      match find_enum(defs: enum_defs, name: enm) do
-        | Some(val: edef) -> return check_enum(pats, def: edef)
+let build_rows_from_cases = fn (cases: [HirMatchCase]) -> [ [ HirPatternKind ] ] do
+  match cases do
+    | [] -> return []
+    | HirMatchCase(pattern: p, body: _) :: rest ->
+      return [p] :: build_rows_from_cases(cases: rest)
+  end
+end
+
+let scan_redundant = fn (
+  rows: [ [ HirPatternKind ] ], prev: [ [ HirPatternKind ] ], idx: i64,
+  cols: [TypeExpr], enum_defs: [EnumEntry]
+) -> RedundancyResult throws { Exn } do
+  match rows do
+    | [] -> return NoRedundant
+    | r :: rest ->
+      match useful_witness(matrix: prev, vec: r, cols, enum_defs) do
         | None ->
-          // Built-in named alias (e.g. `List<T>` may be re-encoded as
-          // UserDefined("List", _)) — fall back to list when name matches.
-          if enm == "List" then return check_list(pats) end
-          return NonExhaustive(witness: "_")
+          // No new value reaches arm idx — strictly shadowed by earlier arms.
+          return Redundant(arm_index: idx, witness: render_pattern_row(row: r))
+        | Some(_) ->
+          let new_prev = append_row(rows: prev, r)
+          return scan_redundant(rows: rest, prev: new_prev, idx: idx + 1, cols, enum_defs)
+      end
+  end
+end
+
+let append_row = fn (rows: [ [ HirPatternKind ] ], r: [HirPatternKind]) -> [ [ HirPatternKind ] ] do
+  match rows do
+    | [] -> return [r]
+    | h :: rest -> return h :: append_row(rows: rest, r)
+  end
+end
+
+// ─── Witness representation ─────────────────────────────────────────────────
+//
+// A `Witness` is a stack of pattern fragments (parallel to the column types)
+// that describes one concrete value uncovered by the matrix. The stack is
+// built outermost-first while specializing; constructor witnesses are
+// reassembled when the recursion returns.
+
+type Witness =
+  WCtor(name: string, args: [Witness])
+  | WLit(text: string)
+  | WAny
+
+// ─── useful: does `vec` reach a value no row of `matrix` matches? ───────────
+
+let useful_witness = fn (
+  matrix: [ [ HirPatternKind ] ], vec: [HirPatternKind], cols: [TypeExpr],
+  enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  // Base case — no columns left. If matrix has any row, that row matches the
+  // empty vector (every prior arm is at least as general); otherwise the
+  // empty vector is itself uncovered.
+  match cols do
+    | [] ->
+      if list.length(xs: matrix) == 0 then return Some(val: []) end
+      return None
+    | t :: tcols ->
+      let v_head = match vec do
+        | [] -> raise RuntimeError(val: "useful_witness: vector shorter than columns")
+        | h :: _ -> h
+      end
+      let v_tail = match vec do
+        | [] -> raise RuntimeError(val: "useful_witness: vector shorter than columns")
+        | _ :: r -> r
+      end
+      return useful_with_head(matrix, v_head, v_tail, t, tcols, enum_defs)
+  end
+end
+
+let useful_with_head = fn (
+  matrix: [ [ HirPatternKind ] ], v_head: HirPatternKind, v_tail: [HirPatternKind],
+  t: TypeExpr, tcols: [TypeExpr], enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  match v_head do
+    | POr(alts) -> return useful_or(matrix, alts, v_tail, t, tcols, enum_defs)
+    | PCtor(variant: vn, fields: fs) ->
+      return useful_ctor(matrix, ctor_name: vn, ctor_fields: fs, v_tail, t, tcols, enum_defs)
+    | PLit(lit: l) ->
+      return useful_lit(matrix, lit: l, v_tail, t, tcols, enum_defs)
+    | PRec(fields: rf, is_partial: ip) ->
+      return useful_record(matrix, pat_fields: rf, is_partial: ip, v_tail, t, tcols, enum_defs)
+    | PWild -> return useful_wild(matrix, v_tail, t, tcols, enum_defs)
+    | PVar(_) -> return useful_wild(matrix, v_tail, t, tcols, enum_defs)
+  end
+end
+
+let useful_or = fn (
+  matrix: [ [ HirPatternKind ] ], alts: [HirPatternKind], v_tail: [HirPatternKind],
+  t: TypeExpr, tcols: [TypeExpr], enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  match alts do
+    | [] -> return None
+    | a :: rest ->
+      match useful_with_head(matrix, v_head: a, v_tail, t, tcols, enum_defs) do
+        | Some(val: w) -> return Some(val: w)
+        | None -> return useful_or(matrix, alts: rest, v_tail, t, tcols, enum_defs)
+      end
+  end
+end
+
+// ─── Specialization on a constructor head ───────────────────────────────────
+
+let useful_ctor = fn (
+  matrix: [ [ HirPatternKind ] ], ctor_name: string, ctor_fields: [HirPatternField],
+  v_tail: [HirPatternKind], t: TypeExpr, tcols: [TypeExpr], enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  let arity = list.length(xs: ctor_fields)
+  let field_types = ctor_field_types(t, ctor_name, arity, enum_defs)
+  let spec_matrix = specialize_ctor(matrix, ctor_name, arity)
+  let new_vec = append_pat(a: extract_field_pats(fs: ctor_fields), b: v_tail)
+  let new_cols = append_typ(a: field_types, b: tcols)
+  match useful_witness(matrix: spec_matrix, vec: new_vec, cols: new_cols, enum_defs) do
+    | None -> return None
+    | Some(val: ws) ->
+      // ws starts with `arity` witnesses for the ctor's fields, then one
+      // witness per remaining column.
+      let WitnessSplit(head: head_ws, tail: tail_ws) = take_split(ws, n: arity)
+      return Some(val: WCtor(name: ctor_name, args: head_ws) :: tail_ws)
+  end
+end
+
+let extract_field_pats = fn (fs: [HirPatternField]) -> [HirPatternKind] do
+  match fs do
+    | [] -> return []
+    | HirPatternField(name: _, pattern: p) :: rest ->
+      return p :: extract_field_pats(fs: rest)
+  end
+end
+
+// Recover the field types of constructor `ctor_name` when the head column
+// has type `t`. Falls back to `arity` wildcards (TyBool placeholders) when
+// the type is opaque to us — that keeps the open-signature default path
+// honest because we never inspect those types beyond consulting their head
+// signature, which will be SigOpen.
+let ctor_field_types = fn (
+  t: TypeExpr, ctor_name: string, arity: i64, enum_defs: [EnumEntry]
+) -> [TypeExpr] do
+  match strip_mod(typ: t) do
+    | TyList(elem: e) ->
+      if ctor_name == "Cons" then return [e, TyList(elem: e)] end
+      return []
+    | TyUserDefined(name: tn, args: targs) ->
+      match find_enum(defs: enum_defs, name: tn) do
+        | Some(val: EnumDef(name: _, is_public: _, is_opaque: _, type_params: tps, variants: vs)) ->
+          let raw = lookup_variant_field_types(variants: vs, ctor_name)
+          return subst_types(types: raw, subst: zip_params(names: tps, types: targs))
+        | None ->
+          if tn == "List" then
+            if ctor_name == "Cons" then
+              let elem = match targs do
+                | [] -> TyVar(name: "_")
+                | a :: _ -> a
+              end
+              return [elem, TyList(elem)]
+            end
+            return []
+          end
+          return repeat_open(n: arity)
+      end
+    | _ -> return repeat_open(n: arity)
+  end
+end
+
+let lookup_variant_field_types = fn (
+  variants: [VariantDef], ctor_name: string
+) -> [TypeExpr] do
+  match variants do
+    | [] -> return []
+    | VariantDef(name: vn, fields: fs) :: rest ->
+      if vn == ctor_name then return variant_field_types(vfs: fs) end
+      return lookup_variant_field_types(variants: rest, ctor_name)
+  end
+end
+
+let repeat_open = fn (n: i64) -> [TypeExpr] do
+  if n <= 0 then return [] end
+  // TyVar placeholder lands in SigOpen — the unfolded fields are then driven
+  // through the default-matrix path, which is the safe choice when we can't
+  // recover the constructor's true field types.
+  return TyVar(name: "_") :: repeat_open(n: n - 1)
+end
+
+type WitnessSplit = WitnessSplit(head: [Witness], tail: [Witness])
+
+let take_split = fn (ws: [Witness], n: i64) -> WitnessSplit do
+  if n <= 0 then return WitnessSplit(head: [], tail: ws) end
+  match ws do
+    | [] -> return WitnessSplit(head: [], tail: [])
+    | h :: rest ->
+      let WitnessSplit(head: hs, tail: ts) = take_split(ws: rest, n: n - 1)
+      return WitnessSplit(head: h :: hs, tail: ts)
+  end
+end
+
+let specialize_ctor = fn (
+  matrix: [ [ HirPatternKind ] ], ctor_name: string, arity: i64
+) -> [ [ HirPatternKind ] ] do
+  match matrix do
+    | [] -> return []
+    | row :: rest ->
+      let head = match row do
+        | [] -> raise_internal(reason: "specialize_ctor on empty row")
+        | h :: _ -> h
+      end
+      let tail = match row do
+        | [] -> raise_internal(reason: "specialize_ctor on empty row")
+        | _ :: r -> r
+      end
+      let new_rows = specialize_row_ctor(head, tail, ctor_name, arity)
+      return append_rows(a: new_rows, b: specialize_ctor(matrix: rest, ctor_name, arity))
+  end
+end
+
+let raise_internal = fn (reason: string) -> HirPatternKind throws { Exn } do
+  raise RuntimeError(val: "exhaustive: " ++ reason)
+end
+
+let specialize_row_ctor = fn (
+  head: HirPatternKind, tail: [HirPatternKind], ctor_name: string, arity: i64
+) -> [ [ HirPatternKind ] ] do
+  match head do
+    | PCtor(variant: vn, fields: fs) ->
+      if vn == ctor_name then
+        return [append_pat(a: extract_field_pats(fs), b: tail)]
+      end
+      return []
+    | PLit(_) -> return []
+    | PRec(_) -> return []
+    | PWild -> return [append_pat(a: wildcards(n: arity), b: tail)]
+    | PVar(_) -> return [append_pat(a: wildcards(n: arity), b: tail)]
+    | POr(alts) ->
+      return specialize_or_ctor(alts, tail, ctor_name, arity)
+  end
+end
+
+let specialize_or_ctor = fn (
+  alts: [HirPatternKind], tail: [HirPatternKind], ctor_name: string, arity: i64
+) -> [ [ HirPatternKind ] ] do
+  match alts do
+    | [] -> return []
+    | a :: rest ->
+      let here = specialize_row_ctor(head: a, tail, ctor_name, arity)
+      return append_rows(a: here, b: specialize_or_ctor(alts: rest, tail, ctor_name, arity))
+  end
+end
+
+let append_rows = fn (a: [ [ HirPatternKind ] ], b: [ [ HirPatternKind ] ]) -> [ [ HirPatternKind ] ] do
+  match a do
+    | [] -> return b
+    | h :: rest -> return h :: append_rows(a: rest, b)
+  end
+end
+
+let append_pat = fn (a: [HirPatternKind], b: [HirPatternKind]) -> [HirPatternKind] do
+  match a do
+    | [] -> return b
+    | h :: rest -> return h :: append_pat(a: rest, b)
+  end
+end
+
+let append_typ = fn (a: [TypeExpr], b: [TypeExpr]) -> [TypeExpr] do
+  match a do
+    | [] -> return b
+    | h :: rest -> return h :: append_typ(a: rest, b)
+  end
+end
+
+let wildcards = fn (n: i64) -> [HirPatternKind] do
+  if n <= 0 then return [] end
+  return PWild :: wildcards(n: n - 1)
+end
+
+// ─── Specialization on a literal head ───────────────────────────────────────
+
+let useful_lit = fn (
+  matrix: [ [ HirPatternKind ] ], lit: Literal, v_tail: [HirPatternKind],
+  t: TypeExpr, tcols: [TypeExpr], enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  let spec_matrix = specialize_lit(matrix, lit)
+  match useful_witness(matrix: spec_matrix, vec: v_tail, cols: tcols, enum_defs) do
+    | None -> return None
+    | Some(val: ws) ->
+      return Some(val: WLit(text: render_literal(lit)) :: ws)
+  end
+end
+
+let specialize_lit = fn (matrix: [ [ HirPatternKind ] ], lit: Literal) -> [ [ HirPatternKind ] ] do
+  match matrix do
+    | [] -> return []
+    | row :: rest ->
+      let head = match row do
+        | [] -> raise_internal(reason: "specialize_lit on empty row")
+        | h :: _ -> h
+      end
+      let tail = match row do
+        | [] -> raise_internal(reason: "specialize_lit on empty row")
+        | _ :: r -> r
+      end
+      let new_rows = specialize_row_lit(head, tail, lit)
+      return append_rows(a: new_rows, b: specialize_lit(matrix: rest, lit))
+  end
+end
+
+let specialize_row_lit = fn (
+  head: HirPatternKind, tail: [HirPatternKind], lit: Literal
+) -> [ [ HirPatternKind ] ] do
+  match head do
+    | PLit(lit: l2) ->
+      if literal_eq(a: lit, b: l2) then return [tail] end
+      return []
+    | PCtor(_) -> return []
+    | PRec(_) -> return []
+    | PWild -> return [tail]
+    | PVar(_) -> return [tail]
+    | POr(alts) -> return specialize_or_lit(alts, tail, lit)
+  end
+end
+
+let specialize_or_lit = fn (
+  alts: [HirPatternKind], tail: [HirPatternKind], lit: Literal
+) -> [ [ HirPatternKind ] ] do
+  match alts do
+    | [] -> return []
+    | a :: rest ->
+      let here = specialize_row_lit(head: a, tail, lit)
+      return append_rows(a: here, b: specialize_or_lit(alts: rest, tail, lit))
+  end
+end
+
+let literal_eq = fn (a: Literal, b: Literal) -> bool do
+  match a do
+    | LitInt(val: ai) ->
+      match b do
+        | LitInt(val: bi) -> return ai == bi
+        | _ -> return false
+      end
+    | LitBool(val: ab) ->
+      match b do
+        | LitBool(val: bb) -> return ab == bb
+        | _ -> return false
+      end
+    | LitChar(val: ac) ->
+      match b do
+        | LitChar(val: bc) -> return ac == bc
+        | _ -> return false
+      end
+    | LitString(val: as_) ->
+      match b do
+        | LitString(val: bs) -> return as_ == bs
+        | _ -> return false
+      end
+    | LitFloat(val: af) ->
+      match b do
+        | LitFloat(val: bf) -> return af == bf
+        | _ -> return false
+      end
+    | LitUnit ->
+      match b do
+        | LitUnit -> return true
+        | _ -> return false
+      end
+  end
+end
+
+// ─── Record specialization ──────────────────────────────────────────────────
+//
+// Records have a single "constructor" — the record itself. Specialization
+// unfolds the record's fields in declaration order, substituting wildcards
+// for any field omitted by a partial pattern.
+
+let useful_record = fn (
+  matrix: [ [ HirPatternKind ] ], pat_fields: [HirRecordPatField], is_partial: bool,
+  v_tail: [HirPatternKind], t: TypeExpr, tcols: [TypeExpr], enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  match strip_mod(typ: t) do
+    | TyRecord(fields: rf) ->
+      let arity = list.length(xs: rf)
+      let inner = align_record_fields(rec_fields: rf, pat_fields)
+      let inner_types = record_field_types(rf)
+      let spec_matrix = specialize_record(matrix, rec_fields: rf)
+      let new_vec = append_pat(a: inner, b: v_tail)
+      let new_cols = append_typ(a: inner_types, b: tcols)
+      match useful_witness(matrix: spec_matrix, vec: new_vec, cols: new_cols, enum_defs) do
+        | None -> return None
+        | Some(val: ws) ->
+          let WitnessSplit(head: head_ws, tail: tail_ws) = take_split(ws, n: arity)
+          return Some(val: WCtor(name: "{}", args: head_ws) :: tail_ws)
       end
     | _ ->
-      // Numerics, strings, chars, records (no constructor coverage), tuples:
-      // only a wildcard / variable arm makes the match exhaustive.
-      return NonExhaustive(witness: "_")
+      // Record pattern on a non-record type means the pattern is uninhabited
+      // here; treat as wildcard fallback so we don't crash.
+      return useful_wild(matrix, v_tail, t, tcols, enum_defs)
   end
 end
 
-let collect_top_patterns = fn (cases: [HirMatchCase], acc: [HirPatternKind]) -> [HirPatternKind] do
-  match cases do
-    | [] -> return reverse_pats(xs: acc, out: [])
-    | HirMatchCase(pattern: p, body: _) :: rest ->
-      return collect_top_patterns(cases: rest, acc: p :: acc)
+let align_record_fields = fn (
+  rec_fields: [NamedType], pat_fields: [HirRecordPatField]
+) -> [HirPatternKind] do
+  match rec_fields do
+    | [] -> return []
+    | NamedType(name: n, typ: _) :: rest ->
+      let p = lookup_record_pat(fs: pat_fields, name: n)
+      return p :: align_record_fields(rec_fields: rest, pat_fields)
   end
 end
 
-let reverse_pats = fn (xs: [HirPatternKind], out: [HirPatternKind]) -> [HirPatternKind] do
-  match xs do
-    | [] -> return out
-    | h :: r -> return reverse_pats(xs: r, out: h :: out)
+let lookup_record_pat = fn (fs: [HirRecordPatField], name: string) -> HirPatternKind do
+  match fs do
+    | [] -> return PWild
+    | HirRecordPatField(name: n, pattern: p) :: rest ->
+      if n == name then return p end
+      return lookup_record_pat(fs: rest, name)
   end
 end
 
-// `has_unconditional` is true when any arm matches every value of the
-// scrutinee type — wildcards, plain variable bindings, or or-patterns whose
-// every alternative is unconditional.
-let has_unconditional = fn (pats: [HirPatternKind]) -> bool do
-  match pats do
+let record_field_types = fn (rf: [NamedType]) -> [TypeExpr] do
+  match rf do
+    | [] -> return []
+    | NamedType(name: _, typ: t) :: rest ->
+      return t :: record_field_types(rf: rest)
+  end
+end
+
+let specialize_record = fn (
+  matrix: [ [ HirPatternKind ] ], rec_fields: [NamedType]
+) -> [ [ HirPatternKind ] ] do
+  match matrix do
+    | [] -> return []
+    | row :: rest ->
+      let head = match row do
+        | [] -> raise_internal(reason: "specialize_record on empty row")
+        | h :: _ -> h
+      end
+      let tail = match row do
+        | [] -> raise_internal(reason: "specialize_record on empty row")
+        | _ :: r -> r
+      end
+      let new_rows = specialize_row_record(head, tail, rec_fields)
+      return append_rows(a: new_rows, b: specialize_record(matrix: rest, rec_fields))
+  end
+end
+
+let specialize_row_record = fn (
+  head: HirPatternKind, tail: [HirPatternKind], rec_fields: [NamedType]
+) -> [ [ HirPatternKind ] ] do
+  let arity = list.length(xs: rec_fields)
+  match head do
+    | PRec(fields: rf, is_partial: _) ->
+      let aligned = align_record_fields(rec_fields, pat_fields: rf)
+      return [append_pat(a: aligned, b: tail)]
+    | PCtor(_) -> return []
+    | PLit(_) -> return []
+    | PWild -> return [append_pat(a: wildcards(n: arity), b: tail)]
+    | PVar(_) -> return [append_pat(a: wildcards(n: arity), b: tail)]
+    | POr(alts) -> return specialize_or_record(alts, tail, rec_fields)
+  end
+end
+
+let specialize_or_record = fn (
+  alts: [HirPatternKind], tail: [HirPatternKind], rec_fields: [NamedType]
+) -> [ [ HirPatternKind ] ] do
+  match alts do
+    | [] -> return []
+    | a :: rest ->
+      let here = specialize_row_record(head: a, tail, rec_fields)
+      return append_rows(a: here, b: specialize_or_record(alts: rest, tail, rec_fields))
+  end
+end
+
+// ─── Wildcard head — drive the head signature ──────────────────────────────
+//
+// When v_head is `_`, we look at how the matrix's head column covers the
+// type's signature:
+//   - finite signature, fully covered  → recurse into each constructor
+//   - finite signature, partially cov. → use default matrix; the missing
+//     constructor itself is the witness.
+//   - infinite signature (i64, string, …) → use default matrix.
+// The "partially covered" branch is what guarantees termination on recursive
+// types (e.g. lists with only wildcard rows).
+
+let useful_wild = fn (
+  matrix: [ [ HirPatternKind ] ], v_tail: [HirPatternKind],
+  t: TypeExpr, tcols: [TypeExpr], enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  let stripped = strip_mod(typ: t)
+  let sig = head_signature(t: stripped, enum_defs)
+  match sig do
+    | SigBool ->
+      let cov = bool_coverage_of(matrix)
+      let BoolCov(t: ct, f: cf) = cov
+      if ct then
+        if cf then return useful_wild_bool_full(matrix, v_tail, tcols, enum_defs) end
+        return useful_wild_default_with(matrix, v_tail, tcols, enum_defs, missing: WLit(text: "false"))
+      end
+      if cf then
+        return useful_wild_default_with(matrix, v_tail, tcols, enum_defs, missing: WLit(text: "true"))
+      end
+      // Neither true nor false in matrix — default and report the missing
+      // value as `_` (no specific bool needed).
+      return useful_wild_default_with(matrix, v_tail, tcols, enum_defs, missing: WAny)
+    | SigList(elem: et) ->
+      let lc = list_coverage_of(matrix)
+      let ListCov(nil: cn, cons: cc) = lc
+      if cn then
+        if cc then
+          return useful_wild_list_full(matrix, v_tail, et, tcols, enum_defs)
+        end
+        let cons_w = WCtor(name: "Cons", args: [WAny, WAny])
+        return useful_wild_default_with(matrix, v_tail, tcols, enum_defs, missing: cons_w)
+      end
+      if cc then
+        return useful_wild_default_with(matrix, v_tail, tcols, enum_defs, missing: WCtor(name: "Nil", args: []))
+      end
+      return useful_wild_default_with(matrix, v_tail, tcols, enum_defs, missing: WAny)
+    | SigEnum(variants: vs) ->
+      let psubst = build_param_subst(t, enum_defs)
+      let missing = first_missing_variant(matrix, variants: vs)
+      match missing do
+        | None ->
+          // Every variant covered — recurse into each.
+          return useful_wild_enum_full(matrix, v_tail, variants: vs, psubst, tcols, enum_defs)
+        | Some(val: vd) ->
+          let VariantDef(name: vn, fields: vfs) = vd
+          let arity = list.length(xs: vfs)
+          let w = WCtor(name: vn, args: any_args(n: arity))
+          return useful_wild_default_with(matrix, v_tail, tcols, enum_defs, missing: w)
+      end
+    | SigRecord(fields: rf) ->
+      if any_row_head_is_record(matrix) then
+        return useful_wild_record(matrix, v_tail, rec_fields: rf, t, tcols, enum_defs)
+      end
+      // No row destructures the record — default with a wildcard witness.
+      return useful_wild_default_with(matrix, v_tail, tcols, enum_defs, missing: WAny)
+    | SigOpen ->
+      return useful_wild_default_with(matrix, v_tail, tcols, enum_defs, missing: WAny)
+  end
+end
+
+let any_row_head_is_record = fn (matrix: [ [ HirPatternKind ] ]) -> bool do
+  match matrix do
     | [] -> return false
-    | p :: rest ->
-      if pat_is_unconditional(p) then return true end
-      return has_unconditional(pats: rest)
+    | row :: rest ->
+      let h = match row do
+        | [] -> PWild
+        | p :: _ -> p
+      end
+      if pat_head_is_record(p: h) then return true end
+      return any_row_head_is_record(matrix: rest)
   end
 end
 
-let pat_is_unconditional = fn (p: HirPatternKind) -> bool do
+let pat_head_is_record = fn (p: HirPatternKind) -> bool do
   match p do
-    | PWild -> return true
-    | PVar(_) -> return true
-    | POr(alts) -> return all_unconditional(pats: alts)
+    | PRec(_) -> return true
+    | POr(alts) -> return alts_any_record(alts)
     | _ -> return false
   end
 end
 
-let all_unconditional = fn (pats: [HirPatternKind]) -> bool do
-  match pats do
-    | [] -> return true
-    | p :: rest ->
-      if pat_is_unconditional(p) then return all_unconditional(pats: rest) end
-      return false
+let alts_any_record = fn (alts: [HirPatternKind]) -> bool do
+  match alts do
+    | [] -> return false
+    | a :: rest ->
+      if pat_head_is_record(p: a) then return true end
+      return alts_any_record(alts: rest)
   end
 end
 
-// ─── bool exhaustiveness ────────────────────────────────────────────────────
-
-let check_bool = fn (pats: [HirPatternKind]) -> ExhaustiveResult do
-  let cov = bool_coverage(pats, t: false, f: false)
-  let BoolCov(t: ct, f: cf) = cov
-  if ct then
-    if cf then return Exhaustive end
-    return NonExhaustive(witness: "false")
-  end
-  if cf then return NonExhaustive(witness: "true") end
-  return NonExhaustive(witness: "true")
+let any_args = fn (n: i64) -> [Witness] do
+  if n <= 0 then return [] end
+  return WAny :: any_args(n: n - 1)
 end
+
+let useful_wild_default_with = fn (
+  matrix: [ [ HirPatternKind ] ], v_tail: [HirPatternKind], tcols: [TypeExpr],
+  enum_defs: [EnumEntry], missing: Witness
+) -> Option<[Witness]> throws { Exn } do
+  let def_matrix = default_matrix(matrix)
+  match useful_witness(matrix: def_matrix, vec: v_tail, cols: tcols, enum_defs) do
+    | None -> return None
+    | Some(val: ws) -> return Some(val: missing :: ws)
+  end
+end
+
+// ─── Coverage analysis on the head column ──────────────────────────────────
 
 type BoolCov = BoolCov(t: bool, f: bool)
-
-let bool_coverage = fn (pats: [HirPatternKind], t: bool, f: bool) -> BoolCov do
-  match pats do
-    | [] -> return BoolCov(t, f)
-    | p :: rest -> return bool_coverage(pats: rest, t: t || covers_true(p), f: f || covers_false(p))
-  end
-end
-
-let covers_true = fn (p: HirPatternKind) -> bool do
-  match p do
-    | PLit(lit: LitBool(val: true)) -> return true
-    | POr(alts) -> return any_covers_true(pats: alts)
-    | _ -> return false
-  end
-end
-
-let covers_false = fn (p: HirPatternKind) -> bool do
-  match p do
-    | PLit(lit: LitBool(val: false)) -> return true
-    | POr(alts) -> return any_covers_false(pats: alts)
-    | _ -> return false
-  end
-end
-
-let any_covers_true = fn (pats: [HirPatternKind]) -> bool do
-  match pats do
-    | [] -> return false
-    | p :: rest ->
-      if covers_true(p) then return true end
-      return any_covers_true(pats: rest)
-  end
-end
-
-let any_covers_false = fn (pats: [HirPatternKind]) -> bool do
-  match pats do
-    | [] -> return false
-    | p :: rest ->
-      if covers_false(p) then return true end
-      return any_covers_false(pats: rest)
-  end
-end
-
-// ─── list exhaustiveness ────────────────────────────────────────────────────
-
-let check_list = fn (pats: [HirPatternKind]) -> ExhaustiveResult do
-  let cov = list_coverage(pats, nil: false, cons: false)
-  let ListCov(nil: cn, cons: cc) = cov
-  if cn then
-    if cc then return Exhaustive end
-    return NonExhaustive(witness: "_::_")
-  end
-  if cc then return NonExhaustive(witness: "[]") end
-  return NonExhaustive(witness: "[]")
-end
-
 type ListCov = ListCov(nil: bool, cons: bool)
 
-let list_coverage = fn (pats: [HirPatternKind], nil: bool, cons: bool) -> ListCov do
-  match pats do
-    | [] -> return ListCov(nil, cons)
-    | p :: rest ->
-      let n = nil || covers_nil(p)
-      let c = cons || covers_cons(p)
-      return list_coverage(pats: rest, nil: n, cons: c)
+let bool_coverage_of = fn (matrix: [ [ HirPatternKind ] ]) -> BoolCov do
+  match matrix do
+    | [] -> return BoolCov(t: false, f: false)
+    | row :: rest ->
+      let here = row_head_bool(row)
+      let BoolCov(t: rt, f: rf) = bool_coverage_of(matrix: rest)
+      let BoolCov(t: ht, f: hf) = here
+      return BoolCov(t: ht || rt, f: hf || rf)
   end
 end
 
-let covers_nil = fn (p: HirPatternKind) -> bool do
+let row_head_bool = fn (row: [HirPatternKind]) -> BoolCov do
+  match row do
+    | [] -> return BoolCov(t: false, f: false)
+    | p :: _ -> return pat_head_bool(p)
+  end
+end
+
+let pat_head_bool = fn (p: HirPatternKind) -> BoolCov do
   match p do
-    | PCtor(variant: v, fields: _) -> return v == "Nil"
-    | POr(alts) -> return any_covers_nil(pats: alts)
+    | PLit(lit: LitBool(val: true)) -> return BoolCov(t: true, f: false)
+    | PLit(lit: LitBool(val: false)) -> return BoolCov(t: false, f: true)
+    | POr(alts) -> return alts_head_bool(alts)
+    | _ -> return BoolCov(t: false, f: false)
+  end
+end
+
+let alts_head_bool = fn (alts: [HirPatternKind]) -> BoolCov do
+  match alts do
+    | [] -> return BoolCov(t: false, f: false)
+    | a :: rest ->
+      let BoolCov(t: ht, f: hf) = pat_head_bool(p: a)
+      let BoolCov(t: rt, f: rf) = alts_head_bool(alts: rest)
+      return BoolCov(t: ht || rt, f: hf || rf)
+  end
+end
+
+let list_coverage_of = fn (matrix: [ [ HirPatternKind ] ]) -> ListCov do
+  match matrix do
+    | [] -> return ListCov(nil: false, cons: false)
+    | row :: rest ->
+      let here = row_head_list(row)
+      let ListCov(nil: rn, cons: rc) = list_coverage_of(matrix: rest)
+      let ListCov(nil: hn, cons: hc) = here
+      return ListCov(nil: hn || rn, cons: hc || rc)
+  end
+end
+
+let row_head_list = fn (row: [HirPatternKind]) -> ListCov do
+  match row do
+    | [] -> return ListCov(nil: false, cons: false)
+    | p :: _ -> return pat_head_list(p)
+  end
+end
+
+let pat_head_list = fn (p: HirPatternKind) -> ListCov do
+  match p do
+    | PCtor(variant: "Nil", fields: _) -> return ListCov(nil: true, cons: false)
+    | PCtor(variant: "Cons", fields: _) -> return ListCov(nil: false, cons: true)
+    | POr(alts) -> return alts_head_list(alts)
+    | _ -> return ListCov(nil: false, cons: false)
+  end
+end
+
+let alts_head_list = fn (alts: [HirPatternKind]) -> ListCov do
+  match alts do
+    | [] -> return ListCov(nil: false, cons: false)
+    | a :: rest ->
+      let ListCov(nil: hn, cons: hc) = pat_head_list(p: a)
+      let ListCov(nil: rn, cons: rc) = alts_head_list(alts: rest)
+      return ListCov(nil: hn || rn, cons: hc || rc)
+  end
+end
+
+let first_missing_variant = fn (
+  matrix: [ [ HirPatternKind ] ], variants: [VariantDef]
+) -> Option<VariantDef> do
+  match variants do
+    | [] -> return None
+    | v :: rest ->
+      let VariantDef(name: vn, fields: _) = v
+      if any_row_covers_variant(matrix: matrix, name: vn) then
+        return first_missing_variant(matrix: matrix, variants: rest)
+      end
+      return Some(val: v)
+  end
+end
+
+let any_row_covers_variant = fn (
+  matrix: [ [ HirPatternKind ] ], name: string
+) -> bool do
+  match matrix do
+    | [] -> return false
+    | row :: rest ->
+      if row_head_covers_variant(row: row, name: name) then return true end
+      return any_row_covers_variant(matrix: rest, name: name)
+  end
+end
+
+let row_head_covers_variant = fn (row: [HirPatternKind], name: string) -> bool do
+  match row do
+    | [] -> return false
+    | p :: _ -> return pat_head_covers_variant(p: p, name: name)
+  end
+end
+
+let pat_head_covers_variant = fn (p: HirPatternKind, name: string) -> bool do
+  match p do
+    | PCtor(variant: vn, fields: _) -> return vn == name
+    | POr(alts) -> return alts_head_covers_variant(alts: alts, name: name)
     | _ -> return false
   end
 end
 
-let covers_cons = fn (p: HirPatternKind) -> bool do
-  match p do
-    | PCtor(variant: v, fields: _) -> return v == "Cons"
-    | POr(alts) -> return any_covers_cons(pats: alts)
-    | _ -> return false
-  end
-end
-
-let any_covers_nil = fn (pats: [HirPatternKind]) -> bool do
-  match pats do
+let alts_head_covers_variant = fn (alts: [HirPatternKind], name: string) -> bool do
+  match alts do
     | [] -> return false
-    | p :: rest ->
-      if covers_nil(p) then return true end
-      return any_covers_nil(pats: rest)
+    | a :: rest ->
+      if pat_head_covers_variant(p: a, name: name) then return true end
+      return alts_head_covers_variant(alts: rest, name: name)
   end
 end
 
-let any_covers_cons = fn (pats: [HirPatternKind]) -> bool do
-  match pats do
-    | [] -> return false
-    | p :: rest ->
-      if covers_cons(p) then return true end
-      return any_covers_cons(pats: rest)
+type Signature =
+  SigBool
+  | SigList(elem: TypeExpr)
+  | SigEnum(variants: [VariantDef])
+  | SigRecord(fields: [NamedType])
+  | SigOpen
+
+let head_signature = fn (t: TypeExpr, enum_defs: [EnumEntry]) -> Signature do
+  match t do
+    | TyBool -> return SigBool
+    | TyList(elem: e) -> return SigList(elem: e)
+    | TyRecord(fields: fs) -> return SigRecord(fields: fs)
+    | TyUserDefined(name: nm, args: targs) ->
+      match find_enum(defs: enum_defs, name: nm) do
+        | Some(val: EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs)) ->
+          return SigEnum(variants: vs)
+        | None ->
+          if nm == "List" then
+            let elem = match targs do
+              | [] -> TyVar(name: "_")
+              | a :: _ -> a
+            end
+            return SigList(elem)
+          end
+          return SigOpen
+      end
+    | _ -> return SigOpen
   end
 end
-
-// ─── enum exhaustiveness ────────────────────────────────────────────────────
 
 let find_enum = fn (defs: [EnumEntry], name: string) -> Option<EnumDef> do
   match defs do
@@ -251,44 +856,291 @@ let find_enum = fn (defs: [EnumEntry], name: string) -> Option<EnumDef> do
   end
 end
 
-let check_enum = fn (pats: [HirPatternKind], def: EnumDef) -> ExhaustiveResult do
-  let EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) = def
-  return check_variants_covered(variants: vs, pats)
-end
-
-let check_variants_covered = fn (variants: [VariantDef], pats: [HirPatternKind]) -> ExhaustiveResult do
-  match variants do
-    | [] -> return Exhaustive
-    | VariantDef(name: vn, fields: _) :: rest ->
-      if any_covers_variant(pats, name: vn) then
-        return check_variants_covered(variants: rest, pats)
+// Bool — both literals appear in the matrix; recurse into each branch.
+let useful_wild_bool_full = fn (
+  matrix: [ [ HirPatternKind ] ], v_tail: [HirPatternKind],
+  tcols: [TypeExpr], enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  match try_lit(matrix, lit: LitBool(val: true), v_tail, tcols, enum_defs) do
+    | Some(val: w) -> return Some(val: w)
+    | None ->
+      match try_lit(matrix, lit: LitBool(val: false), v_tail, tcols, enum_defs) do
+        | Some(val: w) -> return Some(val: w)
+        | None -> return None
       end
-      return NonExhaustive(witness: vn)
   end
 end
 
-let any_covers_variant = fn (pats: [HirPatternKind], name: string) -> bool do
-  match pats do
-    | [] -> return false
-    | p :: rest ->
-      if covers_variant(p, name) then return true end
-      return any_covers_variant(pats: rest, name)
+let try_lit = fn (
+  matrix: [ [ HirPatternKind ] ], lit: Literal, v_tail: [HirPatternKind],
+  tcols: [TypeExpr], enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  let spec_matrix = specialize_lit(matrix, lit)
+  match useful_witness(matrix: spec_matrix, vec: v_tail, cols: tcols, enum_defs) do
+    | None -> return None
+    | Some(val: ws) -> return Some(val: WLit(text: render_literal(lit)) :: ws)
   end
 end
 
-let covers_variant = fn (p: HirPatternKind, name: string) -> bool do
+// List — both Nil and Cons appear in the matrix; recurse into each branch.
+let useful_wild_list_full = fn (
+  matrix: [ [ HirPatternKind ] ], v_tail: [HirPatternKind], et: TypeExpr,
+  tcols: [TypeExpr], enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  match try_ctor(matrix, ctor_name: "Nil", arity: 0, field_types: [], v_tail, tcols, enum_defs) do
+    | Some(val: w) -> return Some(val: w)
+    | None ->
+      let cons_field_types = [et, TyList(elem: et)]
+      match try_ctor(matrix, ctor_name: "Cons", arity: 2, field_types: cons_field_types, v_tail, tcols, enum_defs) do
+        | Some(val: w) -> return Some(val: w)
+        | None -> return None
+      end
+  end
+end
+
+let try_ctor = fn (
+  matrix: [ [ HirPatternKind ] ], ctor_name: string, arity: i64, field_types: [TypeExpr],
+  v_tail: [HirPatternKind], tcols: [TypeExpr], enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  let spec_matrix = specialize_ctor(matrix, ctor_name, arity)
+  let new_vec = append_pat(a: wildcards(n: arity), b: v_tail)
+  let new_cols = append_typ(a: field_types, b: tcols)
+  match useful_witness(matrix: spec_matrix, vec: new_vec, cols: new_cols, enum_defs) do
+    | None -> return None
+    | Some(val: ws) ->
+      let WitnessSplit(head: head_ws, tail: tail_ws) = take_split(ws, n: arity)
+      return Some(val: WCtor(name: ctor_name, args: head_ws) :: tail_ws)
+  end
+end
+
+// Enum — every variant appears in the matrix; recurse into each.
+let useful_wild_enum_full = fn (
+  matrix: [ [ HirPatternKind ] ], v_tail: [HirPatternKind], variants: [VariantDef],
+  psubst: [TyParamBinding], tcols: [TypeExpr], enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  match variants do
+    | [] -> return None
+    | VariantDef(name: vn, fields: vfs) :: rest ->
+      let raw = variant_field_types(vfs)
+      let fts = subst_types(types: raw, subst: psubst)
+      let arity = list.length(xs: vfs)
+      match try_ctor(matrix, ctor_name: vn, arity, field_types: fts, v_tail, tcols, enum_defs) do
+        | Some(val: w) -> return Some(val: w)
+        | None -> return useful_wild_enum_full(matrix, v_tail, variants: rest, psubst, tcols, enum_defs)
+      end
+  end
+end
+
+type TyParamBinding = TyParamBinding(name: string, typ: TypeExpr)
+
+let build_param_subst = fn (t: TypeExpr, enum_defs: [EnumEntry]) -> [TyParamBinding] do
+  match strip_mod(typ: t) do
+    | TyUserDefined(name: nm, args: targs) ->
+      match find_enum(defs: enum_defs, name: nm) do
+        | Some(val: EnumDef(name: _, is_public: _, is_opaque: _, type_params: tps, variants: _)) ->
+          return zip_params(names: tps, types: targs)
+        | None -> return []
+      end
+    | _ -> return []
+  end
+end
+
+let zip_params = fn (names: [string], types: [TypeExpr]) -> [TyParamBinding] do
+  match names do
+    | [] -> return []
+    | n :: rest_names ->
+      match types do
+        | [] -> return []
+        | t :: rest_types ->
+          return TyParamBinding(name: n, typ: t) :: zip_params(names: rest_names, types: rest_types)
+      end
+  end
+end
+
+let subst_types = fn (types: [TypeExpr], subst: [TyParamBinding]) -> [TypeExpr] do
+  match types do
+    | [] -> return []
+    | t :: rest -> return subst_one(typ: t, subst) :: subst_types(types: rest, subst)
+  end
+end
+
+let subst_one = fn (typ: TypeExpr, subst: [TyParamBinding]) -> TypeExpr do
+  match typ do
+    | TyVar(name: n) ->
+      match lookup_param(subst, name: n) do
+        | Some(val: tt) -> return tt
+        | None -> return typ
+      end
+    | TyList(elem: e) -> return TyList(elem: subst_one(typ: e, subst))
+    | TyArray(elem: e) -> return TyArray(elem: subst_one(typ: e, subst))
+    | TyLinear(inner: i) -> return TyLinear(inner: subst_one(typ: i, subst))
+    | TyLazy(inner: i) -> return TyLazy(inner: subst_one(typ: i, subst))
+    | TyBorrow(inner: i) -> return TyBorrow(inner: subst_one(typ: i, subst))
+    | TyUserDefined(name: n, args: targs) ->
+      return TyUserDefined(name: n, args: subst_types(types: targs, subst))
+    | _ -> return typ
+  end
+end
+
+let lookup_param = fn (subst: [TyParamBinding], name: string) -> Option<TypeExpr> do
+  match subst do
+    | [] -> return None
+    | TyParamBinding(name: n, typ: t) :: rest ->
+      if n == name then return Some(val: t) end
+      return lookup_param(subst: rest, name)
+  end
+end
+
+let variant_field_types = fn (vfs: [VariantField]) -> [TypeExpr] do
+  match vfs do
+    | [] -> return []
+    | VariantField(name: _, typ: t) :: rest ->
+      return t :: variant_field_types(vfs: rest)
+  end
+end
+
+let useful_wild_record = fn (
+  matrix: [ [ HirPatternKind ] ], v_tail: [HirPatternKind], rec_fields: [NamedType],
+  t: TypeExpr, tcols: [TypeExpr], enum_defs: [EnumEntry]
+) -> Option<[Witness]> throws { Exn } do
+  let arity = list.length(xs: rec_fields)
+  let inner_types = record_field_types(rf: rec_fields)
+  let spec_matrix = specialize_record(matrix, rec_fields)
+  let new_vec = append_pat(a: wildcards(n: arity), b: v_tail)
+  let new_cols = append_typ(a: inner_types, b: tcols)
+  match useful_witness(matrix: spec_matrix, vec: new_vec, cols: new_cols, enum_defs) do
+    | None -> return None
+    | Some(val: ws) ->
+      let WitnessSplit(head: head_ws, tail: tail_ws) = take_split(ws, n: arity)
+      return Some(val: WCtor(name: "{}", args: head_ws) :: tail_ws)
+  end
+end
+
+let default_matrix = fn (matrix: [ [ HirPatternKind ] ]) -> [ [ HirPatternKind ] ] do
+  match matrix do
+    | [] -> return []
+    | row :: rest ->
+      let head = match row do
+        | [] -> raise_internal(reason: "default_matrix on empty row")
+        | h :: _ -> h
+      end
+      let tail = match row do
+        | [] -> raise_internal(reason: "default_matrix on empty row")
+        | _ :: r -> r
+      end
+      if head_is_wild(p: head) then
+        return tail :: default_matrix(matrix: rest)
+      end
+      return default_matrix(matrix: rest)
+  end
+end
+
+let head_is_wild = fn (p: HirPatternKind) -> bool do
   match p do
-    | PCtor(variant: v, fields: _) -> return v == name
-    | POr(alts) -> return any_alt_covers_variant(alts, name)
+    | PWild -> return true
+    | PVar(_) -> return true
+    | POr(alts) -> return all_wild(alts)
     | _ -> return false
   end
 end
 
-let any_alt_covers_variant = fn (alts: [HirPatternKind], name: string) -> bool do
+let all_wild = fn (alts: [HirPatternKind]) -> bool do
   match alts do
-    | [] -> return false
-    | p :: rest ->
-      if covers_variant(p, name) then return true end
-      return any_alt_covers_variant(alts: rest, name)
+    | [] -> return true
+    | a :: rest ->
+      if head_is_wild(p: a) then return all_wild(alts: rest) end
+      return false
+  end
+end
+
+// ─── Witness rendering ──────────────────────────────────────────────────────
+
+let render_witness = fn (ws: [Witness]) -> string do
+  match ws do
+    | [] -> return "_"
+    | w :: _ -> return render_one(w)
+  end
+end
+
+let render_one = fn (w: Witness) -> string do
+  match w do
+    | WAny -> return "_"
+    | WLit(text: t) -> return t
+    | WCtor(name: n, args: ws) ->
+      if n == "{}" then return "{ " ++ render_args(ws, sep: ", ") ++ " }" end
+      if list.length(xs: ws) == 0 then return n end
+      return n ++ "(" ++ render_args(ws, sep: ", ") ++ ")"
+  end
+end
+
+let render_args = fn (ws: [Witness], sep: string) -> string do
+  match ws do
+    | [] -> return ""
+    | w :: rest ->
+      if list.length(xs: rest) == 0 then return render_one(w: w) end
+      return render_one(w: w) ++ sep ++ render_args(ws: rest, sep)
+  end
+end
+
+let render_literal = fn (lit: Literal) -> string do
+  match lit do
+    | LitBool(val: true) -> return "true"
+    | LitBool(val: false) -> return "false"
+    | LitInt(val: n) -> return str.from_i64(val: n)
+    | LitChar(val: n) -> return "'\\u{" ++ str.from_i64(val: n) ++ "}'"
+    | LitString(val: s) -> return "\"" ++ s ++ "\""
+    | LitFloat(val: s) -> return s
+    | LitUnit -> return "()"
+  end
+end
+
+// ─── Pattern rendering (for redundancy diagnostics) ─────────────────────────
+
+let render_pattern_row = fn (row: [HirPatternKind]) -> string do
+  match row do
+    | [] -> return "_"
+    | p :: _ -> return render_pattern(p)
+  end
+end
+
+let render_pattern = fn (p: HirPatternKind) -> string do
+  match p do
+    | PWild -> return "_"
+    | PVar(name: n, sigil: _) -> return n
+    | PLit(lit: l) -> return render_literal(lit: l)
+    | PCtor(variant: vn, fields: fs) ->
+      if list.length(xs: fs) == 0 then return vn end
+      return vn ++ "(" ++ render_pat_fields(fs, sep: ", ") ++ ")"
+    | PRec(fields: fs, is_partial: _) ->
+      return "{ " ++ render_rec_pat_fields(fs, sep: ", ") ++ " }"
+    | POr(alts) -> return render_or_pats(alts, sep: " | ")
+  end
+end
+
+let render_pat_fields = fn (fs: [HirPatternField], sep: string) -> string do
+  match fs do
+    | [] -> return ""
+    | HirPatternField(name: _, pattern: p) :: rest ->
+      if list.length(xs: rest) == 0 then return render_pattern(p) end
+      return render_pattern(p) ++ sep ++ render_pat_fields(fs: rest, sep)
+  end
+end
+
+let render_rec_pat_fields = fn (fs: [HirRecordPatField], sep: string) -> string do
+  match fs do
+    | [] -> return ""
+    | HirRecordPatField(name: n, pattern: p) :: rest ->
+      let one = n ++ ": " ++ render_pattern(p)
+      if list.length(xs: rest) == 0 then return one end
+      return one ++ sep ++ render_rec_pat_fields(fs: rest, sep)
+  end
+end
+
+let render_or_pats = fn (alts: [HirPatternKind], sep: string) -> string do
+  match alts do
+    | [] -> return ""
+    | a :: rest ->
+      if list.length(xs: rest) == 0 then return render_pattern(p: a) end
+      return render_pattern(p: a) ++ sep ++ render_or_pats(alts: rest, sep)
   end
 end
