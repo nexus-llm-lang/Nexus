@@ -1,0 +1,248 @@
+/**
+ * polyglot: build a single-file POSIX-sh + wasm self-extracting launcher.
+ *
+ * The launcher is a shell script whose tail is the compiled wasm payload.
+ * Running `chmod +x foo && ./foo arg...` extracts the wasm to a tempfile and
+ * `exec`s wasmtime with the pre-determined feature/cap flag set, so the
+ * end user never has to remember the long `-W tail-call=y,...` invocation.
+ *
+ * Two layouts:
+ *   1. minimal (default): `<header>\n#__NEXUS_PAYLOAD_BEGIN__\n<wasm bytes>`
+ *   2. manifest (`--remain-manifest`): adds a `#__NEXUS_PAYLOAD_MANIFEST__`
+ *      block with a single `app:<size>` entry. Single-payload for now but
+ *      format-compatible with future multi-payload extensions.
+ *
+ * Determinism: caps are sorted into a canonical order before being mapped to
+ * wasmtime flags. The header text contains no timestamps, hostnames, or
+ * env-var contents; the payload offset is discovered at runtime via awk so
+ * no build-time backpatching is needed. Two builds of the same source yield
+ * byte-identical output.
+ *
+ * Independence: this module does NOT touch the existing repo-root `header.sh`
+ * (used by `bootstrap.sh` for the dual-payload compiler/lsp launcher). The
+ * polyglot launcher emitted here is a self-contained sh script whose layout
+ * and runtime behavior are owned entirely by `pack_polyglot`.
+ */
+
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import * as str from "std:str"
+
+// ─── Canonical cap ordering (determinism) ───────────────────────────────────
+// Caps come from a fixed finite set (`Clock`, `Console`, `Env`, `Fs`, `Net`,
+// `Proc`, `Random`). To make the launcher byte-deterministic regardless of
+// AST row layout or hash-map iteration order, we walk a fixed canonical
+// order and emit each cap that appears in the input.
+
+let list_has_str = fn (xs: [string], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == s then return true end
+      return list_has_str(xs: rest, s)
+  end
+end
+
+/// Canonical ordering: walk known caps in rank order and emit each one that
+/// appears in the input list. Unknown caps are appended in input order to
+/// keep behavior deterministic even when ranks collide.
+let known_cap_order = fn () -> [string] do
+  return ["Clock", "Console", "Env", "Fs", "Net", "Proc", "Random"]
+end
+
+let pick_known_in_order = fn (known: [string], present: [string]) -> [string] do
+  match known do
+    | [] -> return []
+    | k :: rest ->
+      if list_has_str(xs: present, s: k) then
+        return k :: pick_known_in_order(known: rest, present)
+      end
+      return pick_known_in_order(known: rest, present)
+  end
+end
+
+let pick_unknown = fn (input: [string], known: [string]) -> [string] do
+  match input do
+    | [] -> return []
+    | x :: rest ->
+      if list_has_str(xs: known, s: x) then
+        return pick_unknown(input: rest, known)
+      end
+      return x :: pick_unknown(input: rest, known)
+  end
+end
+
+export let sort_caps = fn (caps: [string]) -> [string] do
+  let known = known_cap_order()
+  let in_known = pick_known_in_order(known, present: caps)
+  let unknown = pick_unknown(input: caps, known)
+  return list_concat_str(xs: in_known, ys: unknown)
+end
+
+let list_concat_str = fn (xs: [string], ys: [string]) -> [string] do
+  match xs do
+    | [] -> return ys
+    | x :: rest -> return x :: list_concat_str(xs: rest, ys)
+  end
+end
+
+// ─── Cap → wasmtime flag fragments ──────────────────────────────────────────
+// The wasmtime invocation in the launcher is:
+//   wasmtime run -W <wflags> <sflags> --dir=. --dir="${TMPDIR:-/tmp}" \
+//            ${NEXUS_WASMTIME_ARGS:-} "$T" "$@"
+// where:
+//   <wflags>: comma-separated `-W` proposal toggles (always emitted; stdlib
+//             pulls in tail-call/exceptions/function-references/stack-switching
+//             unconditionally)
+//   <sflags>: any wasi-instance flags required by the cap set, e.g.
+//             `-S http,inherit-network` for Net.
+
+/// The fixed set of wasm proposal toggles required by stdlib runtime code.
+/// These are emitted unconditionally — detecting them per-program would
+/// underreport because stdlib uses every one regardless of the entry point.
+let baseline_wflag_str = fn () -> string do
+  return "tail-call=y,exceptions=y,function-references=y,stack-switching=y"
+end
+
+/// Map a single cap name to its `-S` instance flags, joined as one string
+/// argument. Empty string means "no -S required for this cap".
+let cap_sflag_string = fn (name: string) -> string do
+  if name == "Net" then return "http,inherit-network" end
+  return ""
+end
+
+let collect_sflag_parts = fn (caps: [string]) -> [string] do
+  match caps do
+    | [] -> return []
+    | c :: rest ->
+      let s = cap_sflag_string(name: c)
+      if s == "" then return collect_sflag_parts(caps: rest) end
+      return s :: collect_sflag_parts(caps: rest)
+  end
+end
+
+/// Build the `-S <value>` fragment of the launcher's exec line, or "" when
+/// no caps need wasi-instance flags. Multiple `-S` fragments are emitted as
+/// repeated `-S a -S b` so wasmtime parses them as separate enables.
+let build_sflags = fn (caps: [string]) -> string do
+  let parts = collect_sflag_parts(caps)
+  return prefix_each_s(parts)
+end
+
+let prefix_each_s = fn (parts: [string]) -> string do
+  match parts do
+    | [] -> return ""
+    | p :: [] -> return "-S " ++ p
+    | p :: rest -> return "-S " ++ p ++ " " ++ prefix_each_s(parts: rest)
+  end
+end
+
+// ─── Header rendering ───────────────────────────────────────────────────────
+//
+// The launcher header is plain POSIX sh. It locates the payload by scanning
+// `$0` for `#__NEXUS_PAYLOAD_BEGIN__`, computes the byte offset of the
+// next line via `head -n N | wc -c`, then `tail -c +OFF` to a tempfile.
+// Both layouts share the runtime preamble; they differ only in:
+//   - whether the `head -c SIZE` truncation step is applied (manifest only,
+//     because non-manifest single-payload reads through EOF)
+//   - whether a `#__NEXUS_PAYLOAD_MANIFEST__` block is appended
+
+let preamble = fn () -> string do
+  return "#!/bin/sh\n"
+      ++ "# nexus polyglot launcher (generated by `nexus build --polyglot`)\n"
+      ++ "set -eu\n"
+      ++ "T=$(mktemp); trap 'rm -f \"$T\"' EXIT INT TERM HUP\n"
+      ++ "WASMTIME_BIN=\"${NEXUS_WASMTIME:-wasmtime}\"\n"
+      ++ "command -v \"$WASMTIME_BIN\" >/dev/null 2>&1 || {\n"
+      ++ "  echo \"polyglot: wasmtime not found (set NEXUS_WASMTIME or install wasmtime)\" >&2\n"
+      ++ "  exit 127\n"
+      ++ "}\n"
+      ++ "BEGIN_LINE=$(awk '/^#__NEXUS_PAYLOAD_BEGIN__$/ { print NR; exit }' \"$0\")\n"
+      ++ "if [ -z \"${BEGIN_LINE:-}\" ]; then\n"
+      ++ "  echo \"polyglot: launcher payload marker missing (corrupt build)\" >&2\n"
+      ++ "  exit 2\n"
+      ++ "fi\n"
+      ++ "HEAD_BYTES=$(head -n \"$BEGIN_LINE\" \"$0\" | wc -c | tr -d ' ')\n"
+end
+
+/// Build the exec line. `sflags_str` is the already-rendered `-S a -S b`
+/// fragment (possibly empty). `wflags_str` is the comma-separated `-W`
+/// proposal toggle string (no `-W ` prefix; the caller adds it).
+let build_exec_line = fn (wflags_str: string, sflags_str: string) -> string do
+  let s_part = if sflags_str == "" then "" else sflags_str ++ " " end
+  return "exec \"$WASMTIME_BIN\" run -W " ++ wflags_str ++ " "
+      ++ s_part
+      ++ "--dir=. --dir=\"${TMPDIR:-/tmp}\" "
+      ++ "${NEXUS_WASMTIME_ARGS:-} \"$T\" \"$@\"\n"
+end
+
+let render_minimal_header = fn (caps: [string]) -> string do
+  let wflags = baseline_wflag_str()
+  let sflags = build_sflags(caps)
+  return preamble()
+      ++ "tail -c +$((HEAD_BYTES + 1)) \"$0\" > \"$T\"\n"
+      ++ build_exec_line(wflags_str: wflags, sflags_str: sflags)
+      ++ "#__NEXUS_PAYLOAD_BEGIN__\n"
+end
+
+let render_manifest_header = fn (caps: [string], payload_size: i64) -> string do
+  let wflags = baseline_wflag_str()
+  let sflags = build_sflags(caps)
+  // Manifest format: between `#__NEXUS_PAYLOAD_MANIFEST__` and
+  // `#__NEXUS_PAYLOAD_BEGIN__` lives one or more `name:size\n` entries.
+  // For now we emit a single `app` entry; the launcher always extracts it.
+  return preamble()
+      ++ "MANIFEST_LINE=$(awk '/^#__NEXUS_PAYLOAD_BEGIN__$/ { exit } in_m && /^app:/ { sub(/^app:/, \"\"); print; exit } /^#__NEXUS_PAYLOAD_MANIFEST__$/ { in_m = 1 }' \"$0\")\n"
+      ++ "if [ -z \"${MANIFEST_LINE:-}\" ]; then\n"
+      ++ "  echo \"polyglot: manifest entry 'app' missing (corrupt build)\" >&2\n"
+      ++ "  exit 2\n"
+      ++ "fi\n"
+      ++ "tail -c +$((HEAD_BYTES + 1)) \"$0\" | head -c \"$MANIFEST_LINE\" > \"$T\"\n"
+      ++ build_exec_line(wflags_str: wflags, sflags_str: sflags)
+      ++ "#__NEXUS_PAYLOAD_MANIFEST__\n"
+      ++ "app:" ++ str.from_i64(val: payload_size) ++ "\n"
+      ++ "#__NEXUS_PAYLOAD_BEGIN__\n"
+end
+
+// ─── Public entry point ─────────────────────────────────────────────────────
+
+/// Pack a wasm payload + capability set into a self-extracting POSIX-sh
+/// launcher. The result is byte-deterministic for a fixed (wasm, caps,
+/// manifest) input — no timestamps, env, or unsorted iteration.
+///
+/// Pure data transform: takes a borrowed wasm buffer and returns a fresh
+/// owning ByteBuffer. The caller still owns the input wasm.
+export let pack_polyglot = fn (wasm: &ByteBuffer, caps: [string], manifest: bool) -> %ByteBuffer do
+  let sorted = sort_caps(caps)
+  let payload_size = bb.length(buf: wasm)
+  let header = if manifest then
+    render_manifest_header(caps: sorted, payload_size)
+  else
+    render_minimal_header(caps: sorted)
+  end
+  let %out = bb.empty()
+  let %out = bb.push_string(buf: %out, s: header)
+  let %out = bb.push_buf(dst: %out, src: wasm)
+  return %out
+end
+
+/// Length of the rendered header for a given caps + manifest mode. Exposed
+/// for verbose logging (`launcher = header(N) + payload(M) = total(N+M)`).
+export let header_size = fn (caps: [string], manifest: bool, payload_size: i64) -> i64 do
+  let sorted = sort_caps(caps)
+  let s = if manifest then
+    render_manifest_header(caps: sorted, payload_size)
+  else
+    render_minimal_header(caps: sorted)
+  end
+  return string_byte_length(s)
+end
+
+// String byte length without exposing a stdlib char API: round-trip through
+// a ByteBuffer and read its length.
+let string_byte_length = fn (s: string) -> i64 do
+  let %buf = bb.empty()
+  let %buf = bb.push_string(%buf, s)
+  let n = bb.length(buf: &buf)
+  bb.free(%buf)
+  return n
+end
