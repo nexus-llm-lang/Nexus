@@ -31,6 +31,7 @@ import * as tc_linearity from "src/typecheck/linearity.nx"
 import * as repl_mod from "src/repl.nx"
 import * as bb from "std:bytebuffer"
 import * as wmerge from "src/backend/wasm/merge.nx"
+import * as polyglot from "src/backend/polyglot.nx"
 import * as pkg from "src/ir/package.nx"
 import { rd_uleb, pval, uleb_size } from "src/backend/wasm/read.nx"
 import { Fs }, * as fs_mod from "std:fs"
@@ -190,6 +191,28 @@ let strip_output_flag = fn (xs: [string], output: Option<string>) -> ParsedOutpu
   end
 end
 
+type ParsedPolyglotFlags = ParsedPolyglotFlags(remaining: [string], polyglot: bool, remain_manifest: bool)
+
+/// Strip `--polyglot` and `--remain-manifest` from `xs`. `--polyglot` selects
+/// the self-extracting POSIX-sh + wasm launcher emit path. `--remain-manifest`
+/// is opt-in and only meaningful with `--polyglot`; it switches the launcher
+/// to the manifest-bearing layout (single `app:<size>` entry, format-extensible
+/// for future multi-payload bundles).
+let strip_polyglot_flags = fn (xs: [string], polyglot: bool, remain_manifest: bool) -> ParsedPolyglotFlags do
+  match xs do
+    | [] -> return ParsedPolyglotFlags(remaining: [], polyglot, remain_manifest)
+    | flag :: rest ->
+      if flag == "--polyglot" then
+        return strip_polyglot_flags(xs: rest, polyglot: true, remain_manifest)
+      end
+      if flag == "--remain-manifest" then
+        return strip_polyglot_flags(xs: rest, polyglot, remain_manifest: true)
+      end
+      let ParsedPolyglotFlags(remaining: rest_args, polyglot: p2, remain_manifest: m2) = strip_polyglot_flags(xs: rest, polyglot, remain_manifest)
+      return ParsedPolyglotFlags(remaining: flag :: rest_args, polyglot: p2, remain_manifest: m2)
+  end
+end
+
 /// Skip a leading `build` subcommand so `nexus build foo.nx` works the same
 /// way as the Rust bootstrap. `args[0]` is the program name; `args[1]` is the
 /// first user-supplied token.
@@ -254,6 +277,26 @@ let write_and_free = fn (buf: %ByteBuffer, path: string) -> bool do
   let ok = bb.write_file(&buf, path)
   bb.free(%buf)
   return ok
+end
+
+/// Emit either the raw merged wasm or, when `polyglot_mode` is set, the
+/// self-extracting launcher. Both paths consume `wasm_buf` and free it; the
+/// boolean return matches `write_and_free`.
+let write_emit = fn (wasm_buf: %ByteBuffer, output_path: string, caps: [string], polyglot_mode: bool, remain_manifest: bool, verbose: bool) -> bool require { Console } do
+  if polyglot_mode then
+    let payload_size = bb.length(buf: &wasm_buf)
+    let %launcher = polyglot.pack_polyglot(wasm: &wasm_buf, caps, manifest: remain_manifest)
+    bb.free(buf: %wasm_buf)
+    if verbose then
+      let header_n = polyglot.header_size(caps, manifest: remain_manifest, payload_size)
+      let total_n = bb.length(buf: &launcher)
+      Console.eprintln(val: "[nxc] polyglot launcher = header(" ++ str.from_i64(val: header_n)
+        ++ ") + payload(" ++ str.from_i64(val: payload_size)
+        ++ ") = total(" ++ str.from_i64(val: total_n) ++ ")")
+    end
+    return write_and_free(buf: %launcher, path: output_path)
+  end
+  return write_and_free(buf: %wasm_buf, path: output_path)
 end
 
 // ─── Capability reporting (--explain-capabilities) ──────────────────────────
@@ -396,7 +439,7 @@ let build_run_cmd = fn (output_name: string, caps: [string]) -> string do
   return "wasmtime run " ++ str.join(xs: argv, sep: " ")
 end
 
-let print_build_result_text = fn (output_name: string, caps: [string], explain: ExplainCaps) -> unit require { Console } do
+let print_build_result_text = fn (output_name: string, caps: [string], explain: ExplainCaps, polyglot_mode: bool) -> unit require { Console } do
   Console.eprintln(val: "Built " ++ output_name)
   match explain do
     | ExplainNone -> return ()
@@ -408,11 +451,18 @@ let print_build_result_text = fn (output_name: string, caps: [string], explain: 
       if list.length(xs: caps) > 0 then
         Console.eprintln(val: "Capabilities: " ++ str.join(xs: caps, sep: ", "))
       end
-      Console.eprintln(val: "Run: " ++ build_run_cmd(output_name, caps))
+      // Polyglot launchers are run via `chmod +x && ./<launcher>`; the
+      // wasmtime command is embedded inside the launcher itself, so the
+      // user-facing run hint switches to the chmod form.
+      if polyglot_mode then
+        Console.eprintln(val: "Run: chmod +x " ++ output_name ++ " && ./" ++ output_name)
+      else
+        Console.eprintln(val: "Run: " ++ build_run_cmd(output_name, caps))
+      end
   end
 end
 
-let print_build_result_json = fn (output_name: string, caps: [string], explain: ExplainCaps) -> unit require { Console } do
+let print_build_result_json = fn (output_name: string, caps: [string], explain: ExplainCaps, polyglot_mode: bool) -> unit require { Console } do
   match explain do
     | ExplainNone ->
       Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\"}")
@@ -421,17 +471,22 @@ let print_build_result_json = fn (output_name: string, caps: [string], explain: 
       Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\",\"capabilities\":[" ++ str.join(xs: caps_quoted, sep: ",") ++ "]}")
     | ExplainWasmtime ->
       let caps_quoted = quote_strings(xs: caps)
-      let all_flags = list.concat(xs: wasmtime_feature_flags(), ys: collect_all_wasmtime_flags(caps))
-      let flags_quoted = quote_strings(xs: all_flags)
-      let cmd = build_run_cmd(output_name, caps)
-      Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\",\"capabilities\":[" ++ str.join(xs: caps_quoted, sep: ",") ++ "],\"wasmtime\":{\"command\":\"" ++ cmd ++ "\",\"flags\":[" ++ str.join(xs: flags_quoted, sep: ",") ++ "]}}")
+      if polyglot_mode then
+        let cmd = "chmod +x " ++ output_name ++ " && ./" ++ output_name
+        Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\",\"capabilities\":[" ++ str.join(xs: caps_quoted, sep: ",") ++ "],\"polyglot\":{\"command\":\"" ++ cmd ++ "\"}}")
+      else
+        let all_flags = list.concat(xs: wasmtime_feature_flags(), ys: collect_all_wasmtime_flags(caps))
+        let flags_quoted = quote_strings(xs: all_flags)
+        let cmd = build_run_cmd(output_name, caps)
+        Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\",\"capabilities\":[" ++ str.join(xs: caps_quoted, sep: ",") ++ "],\"wasmtime\":{\"command\":\"" ++ cmd ++ "\",\"flags\":[" ++ str.join(xs: flags_quoted, sep: ",") ++ "]}}")
+      end
   end
 end
 
-let print_build_result = fn (output_name: string, caps: [string], explain: ExplainCaps, format: ExplainFormat) -> unit require { Console } do
+let print_build_result = fn (output_name: string, caps: [string], explain: ExplainCaps, format: ExplainFormat, polyglot_mode: bool) -> unit require { Console } do
   match format do
-    | FormatText -> print_build_result_text(output_name, caps, explain)
-    | FormatJson -> print_build_result_json(output_name, caps, explain)
+    | FormatText -> print_build_result_text(output_name, caps, explain, polyglot_mode)
+    | FormatJson -> print_build_result_json(output_name, caps, explain, polyglot_mode)
   end
 end
 
@@ -465,7 +520,14 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock,
       proc.exit(status: exit_code)
     end
     let ParsedTypecheckSubcommand(remaining: args_after_tc, typecheck_only) = strip_typecheck_subcommand(xs: args_after_output)
-    let clean_args = strip_build_subcommand(xs: args_after_tc)
+    let ParsedPolyglotFlags(remaining: args_after_polyglot, polyglot: polyglot_mode, remain_manifest) = strip_polyglot_flags(xs: args_after_tc, polyglot: false, remain_manifest: false)
+    if remain_manifest && !polyglot_mode then
+      raise InvalidUsage(detail: "--remain-manifest requires --polyglot")
+    end
+    if polyglot_mode && typecheck_only then
+      raise InvalidUsage(detail: "--polyglot is incompatible with `typecheck`")
+    end
+    let clean_args = strip_build_subcommand(xs: args_after_polyglot)
     let argc = list.length(xs: clean_args)
     if argc < 2 then
       Console.eprintln(val: "Usage: nexus [build] <input.nx> [output.wasm]")
@@ -476,6 +538,7 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock,
       Console.eprintln(val: "       nexus --dump-imports <input.nx>")
       Console.eprintln(val: "       nexus --verbose [build] <input.nx> [output.wasm]")
       Console.eprintln(val: "       nexus [--explain-capabilities yes|none|wasmtime] [--explain-capabilities-format text|json] [build] <input.nx> [output.wasm]")
+      Console.eprintln(val: "       nexus build --polyglot [--remain-manifest] <input.nx> -o <launcher>")
       raise InvalidUsage(detail: "missing input file argument")
     end
 
@@ -626,7 +689,12 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock,
 
     let %wasm_buf = wmerge.merge_with_stdlib(core_wasm: %wasm_buf, stdlib_path: std_wasm_path)
 
-    let ok = write_and_free(buf: %wasm_buf, path: output_path)
+    // Capabilities must be extracted before the arena reset; for the polyglot
+    // emit path they are also baked into the launcher header, so the extract
+    // happens here regardless of `explain` mode.
+    let caps = find_main_caps(defs: get_defs(prog))
+
+    let ok = write_emit(wasm_buf: %wasm_buf, output_path, caps, polyglot_mode, remain_manifest, verbose)
     let t10 = Clock.now()
 
     if ok then
@@ -634,10 +702,7 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock,
         Console.eprintln(val: "[nxc] write (" ++ str.from_i64(val: t10 - t9) ++ "ms)")
         Console.eprintln(val: "nxc: wrote " ++ output_path ++ " (total " ++ str.from_i64(val: t10 - t0) ++ "ms)")
       end
-      // Extract capabilities from the entry program's `main` requires-row
-      // before resetting the arena (the AST lives in the marked region).
-      let caps = find_main_caps(defs: get_defs(prog))
-      print_build_result(output_name: output_path, caps, explain, format)
+      print_build_result(output_name: output_path, caps, explain, format, polyglot_mode)
     else
       raise WriteFailed(path: output_path)
     end
