@@ -1,0 +1,251 @@
+// Acceptance test for src/backend/effect_analysis.nx (issue nexus-j5zi).
+//
+// Builds hand-rolled LirPrograms exercising:
+//   * a pure function (no caps, no throw, no externs) — expect is_pure=true
+//   * a function that raises directly — expect can_throw=true
+//   * an external-using function (Console.print) — expect capabilities_used
+//     contains "Console" and is_pure=false
+//   * a transitive call chain a -> b -> c (where c throws) — expect a's
+//     can_throw=true via fixed-point propagation.
+import * as test_assert from "std:test/assert"
+import { TypeExpr, TyI64, TyUnit, TyRow } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { LirProgram, LirFunction, LirExternal, LirParam, LirAtom, LirAtomInt, LirAtomUnit, LirAtomVar, LirExpr, LirExprAtom, LirExprCall, LirExprRaise, LirCallArg, LirStmt, LirStmtLet } from "src/ir/lir_types.nx"
+import { EffectMap, EffectEntry, EffectSummary, analyze_effects, lookup_summary, effect_map_size } from "src/backend/effect_analysis.nx"
+import { Option, Some, None } from "std:option"
+
+let dummy_span = fn () -> Span do
+  return Span(offset: 0, line: 1, col: 1)
+end
+
+// Empty throw row (no effects, no rest) — non-throwing externals.
+let empty_throw_row = fn () -> TypeExpr do
+  return TyRow(types: [], rest: None)
+end
+
+// Pure function: `let pure_fn = fn () -> i64 do return 42 end`
+let make_pure_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyI64, expr: LirExprAtom(atom: LirAtomInt(val: 42)))
+  ]
+  return LirFunction(
+    name: "pure_fn",
+    params: [],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "r", typ: TyI64),
+    span: dummy_span()
+  )
+end
+
+// Raise function — direct LirExprRaise.
+let make_throws_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(
+      name: "r",
+      typ: TyUnit,
+      expr: LirExprRaise(value: LirAtomInt(val: 0), typ: TyUnit)
+    )
+  ]
+  return LirFunction(
+    name: "throws_fn",
+    params: [],
+    ret_type: TyUnit,
+    body: stmts,
+    ret: LirAtomUnit,
+    span: dummy_span()
+  )
+end
+
+// Cap-using function — call __nx_print (Console capability via nexus:std/stdio).
+let make_cap_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(
+      name: "r",
+      typ: TyUnit,
+      expr: LirExprCall(
+        func: "__nx_print",
+        args: [LirCallArg(label: "msg", value: LirAtomInt(val: 0))],
+        typ: TyUnit
+      )
+    )
+  ]
+  return LirFunction(
+    name: "cap_fn",
+    params: [],
+    ret_type: TyUnit,
+    body: stmts,
+    ret: LirAtomUnit,
+    span: dummy_span()
+  )
+end
+
+// Chain a -> b -> c (c raises). Verifies transitive can_throw propagation.
+let make_a_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(
+      name: "r",
+      typ: TyUnit,
+      expr: LirExprCall(func: "chain_b", args: [], typ: TyUnit)
+    )
+  ]
+  return LirFunction(
+    name: "chain_a",
+    params: [],
+    ret_type: TyUnit,
+    body: stmts,
+    ret: LirAtomUnit,
+    span: dummy_span()
+  )
+end
+
+let make_b_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(
+      name: "r",
+      typ: TyUnit,
+      expr: LirExprCall(func: "chain_c", args: [], typ: TyUnit)
+    )
+  ]
+  return LirFunction(
+    name: "chain_b",
+    params: [],
+    ret_type: TyUnit,
+    body: stmts,
+    ret: LirAtomUnit,
+    span: dummy_span()
+  )
+end
+
+let make_c_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(
+      name: "r",
+      typ: TyUnit,
+      expr: LirExprRaise(value: LirAtomInt(val: 0), typ: TyUnit)
+    )
+  ]
+  return LirFunction(
+    name: "chain_c",
+    params: [],
+    ret_type: TyUnit,
+    body: stmts,
+    ret: LirAtomUnit,
+    span: dummy_span()
+  )
+end
+
+// External: __nx_print wired to nexus:std/stdio (Console capability).
+let make_print_external = fn () -> LirExternal do
+  return LirExternal(
+    name: "__nx_print",
+    wasm_module: "nexus:std/stdio",
+    wasm_name: "print",
+    params: [LirParam(label: "msg", name: "msg", typ: TyI64)],
+    ret_type: TyUnit,
+    throw_row: empty_throw_row()
+  )
+end
+
+exception NoSuchSummary(name: string)
+
+let summary_or_fail = fn (em: EffectMap, name: string) -> EffectSummary throws { Exn } do
+  match lookup_summary(em, name) do
+    | Some(val: s) -> return s
+    | None -> raise NoSuchSummary(name)
+  end
+end
+
+let caps_len = fn (xs: [string]) -> i64 do
+  match xs do
+    | [] -> return 0
+    | _ :: rest -> return 1 + caps_len(xs: rest)
+  end
+end
+
+let caps_contains = fn (xs: [string], target: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == target then return true end
+      return caps_contains(xs: rest, target)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  let prog = LirProgram(
+    functions: [
+      make_pure_fn(),
+      make_throws_fn(),
+      make_cap_fn(),
+      make_a_fn(),
+      make_b_fn(),
+      make_c_fn()
+    ],
+    externals: [make_print_external()]
+  )
+
+  let em = analyze_effects(program: prog)
+
+  test_assert.assert_eq_i64(actual: effect_map_size(em), expected: 6, label: "size")
+
+  // Test 1: pure function.
+  let pure_sum = summary_or_fail(em, name: "pure_fn")
+  match pure_sum do | EffectSummary(capabilities_used: pc, can_throw: pt, is_pure: pp) ->
+    test_assert.assert_false(cond: pt, label: "pure_fn.can_throw")
+    test_assert.assert_true(cond: pp, label: "pure_fn.is_pure")
+    test_assert.assert_eq_i64(actual: caps_len(xs: pc), expected: 0, label: "pure_fn.caps.len")
+  end
+
+  // Test 2: throwing function.
+  let thr = summary_or_fail(em, name: "throws_fn")
+  match thr do | EffectSummary(capabilities_used: tc, can_throw: tt, is_pure: tp) ->
+    test_assert.assert_true(cond: tt, label: "throws_fn.can_throw")
+    test_assert.assert_false(cond: tp, label: "throws_fn.is_pure (must not be pure)")
+    test_assert.assert_eq_i64(actual: caps_len(xs: tc), expected: 0, label: "throws_fn.caps.len")
+  end
+
+  // Test 3: cap-using function (Console).
+  let cap_sum = summary_or_fail(em, name: "cap_fn")
+  match cap_sum do | EffectSummary(capabilities_used: cc, can_throw: ct, is_pure: cp) ->
+    test_assert.assert_false(cond: cp, label: "cap_fn.is_pure (uses cap)")
+    test_assert.assert_false(cond: ct, label: "cap_fn.can_throw (print is non-throwing)")
+    test_assert.assert_true(cond: caps_contains(xs: cc, target: "Console"), label: "cap_fn.caps contains Console")
+    test_assert.assert_eq_i64(actual: caps_len(xs: cc), expected: 1, label: "cap_fn.caps.len")
+  end
+
+  // Test 4: transitive throw propagation a -> b -> c (raises).
+  let chain_c = summary_or_fail(em, name: "chain_c")
+  match chain_c do | EffectSummary(capabilities_used: _, can_throw: cct, is_pure: _) ->
+    test_assert.assert_true(cond: cct, label: "chain_c.can_throw (direct)")
+  end
+  let chain_b = summary_or_fail(em, name: "chain_b")
+  match chain_b do | EffectSummary(capabilities_used: _, can_throw: cbt, is_pure: _) ->
+    test_assert.assert_true(cond: cbt, label: "chain_b.can_throw (transitive via c)")
+  end
+  let chain_a = summary_or_fail(em, name: "chain_a")
+  match chain_a do | EffectSummary(capabilities_used: _, can_throw: cat, is_pure: cap_pure) ->
+    test_assert.assert_true(cond: cat, label: "chain_a.can_throw (transitive via b -> c)")
+    test_assert.assert_false(cond: cap_pure, label: "chain_a.is_pure (must not be pure when transitively throws)")
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  // Trap on failure so the runtime test runner reports FAIL via non-zero
+  // exit. Mirrors the divide-by-zero idiom used by every fixture in this
+  // directory.
+  let _ = 1 / ok
+  return ()
+end

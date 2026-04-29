@@ -1,0 +1,572 @@
+/**
+ * effect_analysis: Per-function effect summary inference over LIR.
+ *
+ * Produces an EffectMap keyed by function name that records, for every
+ * LirFunction in the program:
+ *   - capabilities_used: capability names this function transitively reaches
+ *     via stdlib externals (e.g. "Fs", "Console", "Clock").
+ *   - can_throw: true when the function (or any transitive callee) executes
+ *     a LirExprRaise, calls a closure (dynamic dispatch is conservatively
+ *     assumed throwing), or calls an external whose throw_row is non-empty.
+ *   - is_pure: true iff capabilities_used is empty, can_throw is false, and
+ *     the function never reaches a side-effecting external.
+ *
+ * Algorithm (two phases):
+ *   1. Direct pass — walk each function body once to collect:
+ *        * direct callees (LirExprCall / LirExprTailCall / LirExprMakeClosure
+ *          target / LirExprContNew func_ref / LirExprInjectResume body and
+ *          arm fns)
+ *        * direct caps (external calls mapped via wasm_module → capability)
+ *        * direct throws (LirExprRaise, LirExprCallClosure, throwing externs)
+ *        * direct side-effect (any non-pure external call, any closure call)
+ *   2. Fixed-point — propagate caps / throws / side-effect over the static
+ *      call graph until no entry changes. Termination: each summary lattice
+ *      is monotone (caps grow, can_throw / has_side_effect can only flip
+ *      false→true) and the set is bounded, so the loop converges in at
+ *      most |functions| iterations of any single edge.
+ *
+ * is_pure is a derived flag, recomputed after the fixed point converges.
+ *
+ * Stand-alone: this pass produces an EffectMap value. Driver wires it into
+ * the pipeline (see src/driver.nx) so consumers can request the summary via
+ * `analyze_effects`. No existing pass mutates anything based on the result;
+ * effect-directed optimisations are tracked separately (issues 55x0 / e6uh).
+ */
+
+import { TypeExpr, TyRow } from "src/common/ast.nx"
+import { LirProgram, LirFunction, LirExternal, LirParam, LirAtom, LirExpr, LirStmt, LirCallArg, LirNamedAtom } from "src/ir/lir_types.nx"
+
+// ─── Public Types ────────────────────────────────────────────────────────────
+
+/// Per-function effect summary. Field semantics:
+/// * `capabilities_used` — capability names (e.g. "Fs", "Console") that any
+///   transitive callee reaches. Names match the `perm_to_cap_name` mapping
+///   in driver.nx so they line up with `--explain-capabilities`.
+/// * `can_throw` — at least one transitive callee may raise (LirExprRaise,
+///   throwing external, or dynamic closure call which is conservatively
+///   assumed throwing).
+/// * `is_pure` — capabilities_used == [] AND can_throw == false AND no
+///   transitive call reaches a side-effecting external. Derived field.
+export type EffectSummary = EffectSummary(
+  capabilities_used: [string],
+  can_throw: bool,
+  is_pure: bool
+)
+
+/// Map from function name to its effect summary. Implemented as an
+/// association list because the LIR pipeline lacks a hashed key/value
+/// container in the self-host stdlib slice; lookup is linear but the
+/// number of functions per program is bounded by call-graph reachability.
+export type EffectEntry = EffectEntry(name: string, summary: EffectSummary)
+export type EffectMap = EffectMap(entries: [EffectEntry])
+
+// ─── Capability Mapping ──────────────────────────────────────────────────────
+//
+// Externals carry their wasm_module string (e.g. "nexus:std/fs"). Each
+// host-port module maps 1:1 to a capability surface; the mapping mirrors
+// `perm_to_cap_name` in driver.nx so downstream consumers compare names
+// against the same vocabulary used by `--explain-capabilities`.
+
+let module_to_capability = fn (wasm_module: string) -> [string] do
+  if wasm_module == "nexus:std/fs" then return ["Fs"] end
+  if wasm_module == "nexus:std/network" then return ["Net"] end
+  if wasm_module == "nexus:std/stdio" then return ["Console"] end
+  if wasm_module == "nexus:std/rand" then return ["Random"] end
+  if wasm_module == "nexus:std/clock" then return ["Clock"] end
+  if wasm_module == "nexus:std/proc" then return ["Proc"] end
+  if wasm_module == "nexus:std/env" then return ["Env"] end
+  return []
+end
+
+/// True for externals whose wasm_module is statically known to be pure
+/// (compute-only, no host I/O, no observable side effect). Conservative:
+/// when in doubt, return false so is_pure stays sound.
+///
+/// `nexus:runtime/math` is codegen-inlined to single wasm ops (f64.sqrt
+/// etc.) and never escapes the engine; its calls are equivalent to
+/// LirExprBinary on the side-effect axis.
+let is_pure_external_module = fn (wasm_module: string) -> bool do
+  if wasm_module == "nexus:runtime/math" then return true end
+  return false
+end
+
+// ─── Type-Row Helpers ────────────────────────────────────────────────────────
+//
+// LirExternal stores its throw_row as a TypeExpr. An empty row (no types,
+// no rest variable) means the external is non-throwing. Anything else is
+// treated as throwing — even if the row is just a polymorphic tail, since
+// at LIR time we cannot prove the row instantiates to empty.
+
+let throw_row_is_throwing = fn (row: TypeExpr) -> bool do
+  if let TyRow(types, rest: r) = row then
+    match types do
+      | [] ->
+        match r do
+          | None -> return false
+          | _ -> return true
+        end
+      | _ -> return true
+    end
+  end
+  // Non-row type in throw_row position is unexpected; treat as throwing
+  // rather than silently swallowing (no silent fallbacks per project
+  // policy — a foreign throw_row shape is signalled as can_throw rather
+  // than dropped to false).
+  return true
+end
+
+// ─── Externals Lookup ────────────────────────────────────────────────────────
+
+let lookup_external = fn (name: string, exts: [LirExternal]) -> Option<LirExternal> do
+  match exts do
+    | [] -> return None
+    | e :: rest ->
+      let LirExternal(name: en, wasm_module: _, wasm_name: _, params: _, ret_type: _, throw_row: _) = e
+      if en == name then return Some(val: e) end
+      return lookup_external(name, exts: rest)
+  end
+end
+
+// ─── Direct-Effect Accumulator ───────────────────────────────────────────────
+//
+// DirectInfo carries the single-function direct walk: callees, externals
+// touched, raises, dynamic closure calls. After the direct walk we project
+// these into the per-function EffectSummary skeleton, then iterate the
+// fixed point over the callee edges.
+
+type DirectInfo = DirectInfo(
+  callees: [string],          // statically known callee function names
+  capabilities: [string],     // caps observed directly via externals
+  has_side_effect: bool,      // direct: non-pure external or closure call
+  can_throw: bool             // direct: raise / throwing external / closure
+)
+
+let empty_direct = fn () -> DirectInfo do
+  return DirectInfo(callees: [], capabilities: [], has_side_effect: false, can_throw: false)
+end
+
+// ─── String-set helpers (assoc-list style) ──────────────────────────────────
+
+let string_member = fn (s: string, xs: [string]) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == s then return true end
+      return string_member(s, xs: rest)
+  end
+end
+
+let union_strings = fn (xs: [string], ys: [string]) -> [string] do
+  // Append every element of ys not already in xs, preserving the order of
+  // xs followed by the unique elements of ys (in order). This keeps caps
+  // lists deterministic across pipeline runs even though set semantics
+  // would tolerate reordering.
+  return union_strings_go(xs, ys, acc: reverse_strings_ea(lst: xs, out: []))
+end
+
+let union_strings_go = fn (xs: [string], ys: [string], acc: [string]) -> [string] do
+  match ys do
+    | [] -> return reverse_strings_ea(lst: acc, out: [])
+    | y :: rest ->
+      if string_member(s: y, xs) then
+        return union_strings_go(xs, ys: rest, acc)
+      end
+      return union_strings_go(xs: y :: xs, ys: rest, acc: y :: acc)
+  end
+end
+
+let reverse_strings_ea = fn (lst: [string], out: [string]) -> [string] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_strings_ea(lst: rest, out: x :: out)
+  end
+end
+
+// ─── Direct Walk over LIR ────────────────────────────────────────────────────
+
+let walk_call_target = fn (
+  func: string,
+  exts: [LirExternal],
+  acc: DirectInfo
+) -> DirectInfo do
+  let DirectInfo(callees, capabilities, has_side_effect, can_throw) = acc
+  match lookup_external(name: func, exts) do
+    | Some(val: ext) ->
+      let LirExternal(name: _, wasm_module: m, wasm_name: _, params: _, ret_type: _, throw_row: tr) = ext
+      let new_caps = union_strings(xs: capabilities, ys: module_to_capability(wasm_module: m))
+      let pure_mod = is_pure_external_module(wasm_module: m)
+      let new_se = if pure_mod then has_side_effect else true end
+      let new_throw = if throw_row_is_throwing(row: tr) then true else can_throw end
+      return DirectInfo(callees, capabilities: new_caps, has_side_effect: new_se, can_throw: new_throw)
+    | None ->
+      // Static call to another LIR function: defer to the fixed point.
+      // Record the edge but don't pre-stamp side-effect / throw bits;
+      // they propagate transitively in phase 2.
+      if string_member(s: func, xs: callees) then
+        return acc
+      end
+      return DirectInfo(callees: func :: callees, capabilities, has_side_effect, can_throw)
+  end
+end
+
+let walk_expr = fn (expr: LirExpr, exts: [LirExternal], acc: DirectInfo) -> DirectInfo do
+  match expr do
+    | LirExprAtom(_) -> return acc
+    | LirExprBinary(_) -> return acc
+    | LirExprCall(func, args: _, typ: _) ->
+      return walk_call_target(func, exts, acc)
+    | LirExprTailCall(func, args: _, typ: _) ->
+      return walk_call_target(func, exts, acc)
+    | LirExprConstructor(_) -> return acc
+    | LirExprRecord(_) -> return acc
+    | LirExprObjectTag(_) -> return acc
+    | LirExprObjectField(_) -> return acc
+    | LirExprRaise(value: _, typ: _) ->
+      let DirectInfo(callees, capabilities, has_side_effect, can_throw: _) = acc
+      return DirectInfo(callees, capabilities, has_side_effect, can_throw: true)
+    | LirExprForce(_) ->
+      // Lazy force evaluates the thunk body, which can perform any effect
+      // its closure captures. Mark side-effect / throw as conservative.
+      let DirectInfo(callees, capabilities, has_side_effect: _, can_throw: _) = acc
+      return DirectInfo(callees, capabilities, has_side_effect: true, can_throw: true)
+    | LirExprMakeClosure(func_name, captures: _, typ: _) ->
+      // Allocating a closure value is itself pure; the function it points
+      // at participates in the call graph because any later CallClosure
+      // could invoke it. Treat it as a static callee edge so the fixed
+      // point folds the closure body's effects into us if we ever invoke
+      // it directly. (If the closure escapes via a record or argument we
+      // remain conservative through the closure-call path.)
+      return walk_call_target(func: func_name, exts, acc)
+    | LirExprCallClosure(_) ->
+      // Indirect dispatch: the target is a runtime value. Conservatively
+      // assume it can throw and has side effects.
+      let DirectInfo(callees, capabilities, has_side_effect: _, can_throw: _) = acc
+      return DirectInfo(callees, capabilities, has_side_effect: true, can_throw: true)
+    | LirExprSuspend(_) ->
+      let DirectInfo(callees, capabilities, has_side_effect: _, can_throw) = acc
+      return DirectInfo(callees, capabilities, has_side_effect: true, can_throw)
+    | LirExprResume(_) ->
+      let DirectInfo(callees, capabilities, has_side_effect: _, can_throw: _) = acc
+      return DirectInfo(callees, capabilities, has_side_effect: true, can_throw: true)
+    | LirExprContNew(func_ref, typ: _) ->
+      // Continuation allocation references a function but does not call it;
+      // record the edge so a future resume folds its effects into us.
+      return walk_call_target(func: func_ref, exts, acc)
+    | LirExprInjectResume(body_fn, arm_fns, arm_tags: _, typ: _) ->
+      let acc1 = walk_call_target(func: body_fn, exts, acc)
+      return walk_arm_fns(xs: arm_fns, exts, acc: acc1)
+  end
+end
+
+let walk_arm_fns = fn (xs: [string], exts: [LirExternal], acc: DirectInfo) -> DirectInfo do
+  match xs do
+    | [] -> return acc
+    | n :: rest ->
+      return walk_arm_fns(xs: rest, exts, acc: walk_call_target(func: n, exts, acc))
+  end
+end
+
+let walk_stmt = fn (stmt: LirStmt, exts: [LirExternal], acc: DirectInfo) -> DirectInfo do
+  match stmt do
+    | LirStmtLet(name: _, typ: _, expr: e) ->
+      return walk_expr(expr: e, exts: exts, acc: acc)
+    | LirStmtIf(cond: _, then_body: tb, else_body: eb) ->
+      let acc1 = walk_stmts(stmts: tb, exts: exts, acc: acc)
+      return walk_stmts(stmts: eb, exts: exts, acc: acc1)
+    | LirStmtIfReturn(cond: _, then_body: tb, then_ret: _, else_body: eb, else_ret: _, ret_type: _) ->
+      let acc1 = walk_stmts(stmts: tb, exts: exts, acc: acc)
+      return walk_stmts(stmts: eb, exts: exts, acc: acc1)
+    | LirStmtLoop(cond_stmts: cs, cond: _, body: b) ->
+      let acc1 = walk_stmts(stmts: cs, exts: exts, acc: acc)
+      return walk_stmts(stmts: b, exts: exts, acc: acc1)
+    | LirStmtTryCatch(body: b, body_ret: _, catch_param: _, catch_param_typ: _, catch_body: cb, catch_ret: _) ->
+      // try-catch suppresses thrown exceptions in the body, but the catch
+      // body itself may throw. Accept the union of both as a conservative
+      // direct-effect model — a precise analysis (caught vs. uncaught)
+      // would require row-typed tracking which the LIR has discarded.
+      let acc1 = walk_stmts(stmts: b, exts: exts, acc: acc)
+      return walk_stmts(stmts: cb, exts: exts, acc: acc1)
+  end
+end
+
+let walk_stmts = fn (stmts: [LirStmt], exts: [LirExternal], acc: DirectInfo) -> DirectInfo do
+  match stmts do
+    | [] -> return acc
+    | s :: rest ->
+      let acc1 = walk_stmt(stmt: s, exts: exts, acc: acc)
+      return walk_stmts(stmts: rest, exts: exts, acc: acc1)
+  end
+end
+
+// ─── Initial Direct Map ──────────────────────────────────────────────────────
+
+type DirectEntry = DirectEntry(name: string, info: DirectInfo)
+
+let build_direct_entries = fn (funcs: [LirFunction], exts: [LirExternal]) -> [DirectEntry] do
+  return build_direct_entries_go(funcs, exts, acc: [])
+end
+
+let build_direct_entries_go = fn (funcs: [LirFunction], exts: [LirExternal], acc: [DirectEntry]) -> [DirectEntry] do
+  match funcs do
+    | [] -> return reverse_direct_entries(lst: acc, out: [])
+    | f :: rest ->
+      let LirFunction(name, params: _, ret_type: _, body, ret: _, span: _) = f
+      let info = walk_stmts(stmts: body, exts, acc: empty_direct())
+      return build_direct_entries_go(funcs: rest, exts, acc: DirectEntry(name, info) :: acc)
+  end
+end
+
+let reverse_direct_entries = fn (lst: [DirectEntry], out: [DirectEntry]) -> [DirectEntry] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_direct_entries(lst: rest, out: x :: out)
+  end
+end
+
+// ─── Fixed-Point Propagation ─────────────────────────────────────────────────
+//
+// The summary lattice for one function is (caps: ⊆-monotone string set,
+// can_throw: bool ascending false→true, has_side_effect: bool ascending).
+// One iteration scans every direct entry, looks up each callee's current
+// summary, and merges those bits into the caller. We loop until no entry
+// changes; convergence is guaranteed by monotonicity over a finite domain.
+
+type WorkingEntry = WorkingEntry(
+  name: string,
+  capabilities: [string],
+  can_throw: bool,
+  has_side_effect: bool,
+  callees: [string]
+)
+
+let direct_to_working = fn (entries: [DirectEntry]) -> [WorkingEntry] do
+  return direct_to_working_go(entries, acc: [])
+end
+
+let direct_to_working_go = fn (entries: [DirectEntry], acc: [WorkingEntry]) -> [WorkingEntry] do
+  match entries do
+    | [] -> return reverse_working_entries(lst: acc, out: [])
+    | DirectEntry(name, info) :: rest ->
+      let DirectInfo(callees, capabilities, has_side_effect, can_throw) = info
+      let entry = WorkingEntry(name, capabilities, can_throw, has_side_effect, callees)
+      return direct_to_working_go(entries: rest, acc: entry :: acc)
+  end
+end
+
+let reverse_working_entries = fn (lst: [WorkingEntry], out: [WorkingEntry]) -> [WorkingEntry] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_working_entries(lst: rest, out: x :: out)
+  end
+end
+
+let lookup_working = fn (name: string, entries: [WorkingEntry]) -> Option<WorkingEntry> do
+  match entries do
+    | [] -> return None
+    | e :: rest ->
+      let WorkingEntry(name: en, capabilities: _, can_throw: _, has_side_effect: _, callees: _) = e
+      if en == name then return Some(val: e) end
+      return lookup_working(name, entries: rest)
+  end
+end
+
+// One propagation step over a single entry: merge each callee's current
+// summary into the caller's. Returns the updated entry plus a flag
+// indicating whether anything actually changed.
+
+type StepResult = StepResult(entry: WorkingEntry, changed: bool)
+
+let merge_callees = fn (
+  callees: [string],
+  caps: [string],
+  can_throw: bool,
+  has_side_effect: bool,
+  entries: [WorkingEntry]
+) -> WorkingEntry do
+  match callees do
+    | [] ->
+      // Caller has no edges to merge; return unchanged shell. The caller
+      // name and edge list are filled in by step_entry below.
+      return WorkingEntry(name: "", capabilities: caps, can_throw, has_side_effect, callees: [])
+    | c :: rest ->
+      match lookup_working(name: c, entries) do
+        | Some(val: callee) ->
+          let WorkingEntry(name: _, capabilities: cc, can_throw: ct, has_side_effect: cs, callees: _) = callee
+          let new_caps = union_strings(xs: caps, ys: cc)
+          let new_throw = if ct then true else can_throw end
+          let new_se = if cs then true else has_side_effect end
+          return merge_callees(callees: rest, caps: new_caps, can_throw: new_throw, has_side_effect: new_se, entries)
+        | None ->
+          // Edge to a name with no working entry — should not normally
+          // happen for static LIR calls. Skip rather than corrupt the
+          // summary; this preserves the property that absent callees
+          // contribute zero effects (they are externals already merged
+          // during the direct walk, or stale references).
+          return merge_callees(callees: rest, caps, can_throw, has_side_effect, entries)
+      end
+  end
+end
+
+let step_entry = fn (entry: WorkingEntry, all: [WorkingEntry]) -> StepResult do
+  let WorkingEntry(name, capabilities, can_throw, has_side_effect, callees) = entry
+  let merged = merge_callees(callees, caps: capabilities, can_throw, has_side_effect, entries: all)
+  let WorkingEntry(name: _, capabilities: new_caps, can_throw: new_throw, has_side_effect: new_se, callees: _) = merged
+  let changed = entry_changed(
+    old_caps: capabilities, new_caps,
+    old_throw: can_throw, new_throw,
+    old_se: has_side_effect, new_se
+  )
+  let next = WorkingEntry(name, capabilities: new_caps, can_throw: new_throw, has_side_effect: new_se, callees)
+  return StepResult(entry: next, changed)
+end
+
+let entry_changed = fn (
+  old_caps: [string], new_caps: [string],
+  old_throw: bool, new_throw: bool,
+  old_se: bool, new_se: bool
+) -> bool do
+  if old_throw != new_throw then return true end
+  if old_se != new_se then return true end
+  return caps_changed(old_caps, new_caps)
+end
+
+let caps_changed = fn (old_caps: [string], new_caps: [string]) -> bool do
+  // Lattice is monotone: new_caps ⊇ old_caps always, so the size
+  // comparison is sufficient. No need to walk pairwise.
+  return list_length_str(xs: old_caps) != list_length_str(xs: new_caps)
+end
+
+let list_length_str = fn (xs: [string]) -> i64 do
+  match xs do
+    | [] -> return 0
+    | _ :: rest -> return 1 + list_length_str(xs: rest)
+  end
+end
+
+// One full iteration: step every entry, accumulating a new list and a
+// global "changed" flag.
+
+type IterResult = IterResult(entries: [WorkingEntry], changed: bool)
+
+let one_iteration = fn (entries: [WorkingEntry]) -> IterResult do
+  return one_iteration_go(remaining: entries, all: entries, acc: [], changed: false)
+end
+
+let one_iteration_go = fn (
+  remaining: [WorkingEntry],
+  all: [WorkingEntry],
+  acc: [WorkingEntry],
+  changed: bool
+) -> IterResult do
+  match remaining do
+    | [] -> return IterResult(entries: reverse_working_entries(lst: acc, out: []), changed)
+    | e :: rest ->
+      let StepResult(entry: stepped, changed: ec) = step_entry(entry: e, all)
+      let new_changed = if ec then true else changed end
+      return one_iteration_go(remaining: rest, all, acc: stepped :: acc, changed: new_changed)
+  end
+end
+
+// Drive the fixed point. `fuel` bounds the iteration count; each function
+// summary can change at most |functions| + |caps| times so a generous
+// linear bound (4× function count) is sufficient and acts as a safety net
+// against unexpected non-monotone behaviour.
+
+let propagate = fn (entries: [WorkingEntry]) -> [WorkingEntry] do
+  let n = list_length_we(xs: entries)
+  return propagate_go(entries, fuel: 4 * n + 4)
+end
+
+let propagate_go = fn (entries: [WorkingEntry], fuel: i64) -> [WorkingEntry] do
+  if fuel <= 0 then return entries end
+  let IterResult(entries: next, changed) = one_iteration(entries)
+  if changed then
+    return propagate_go(entries: next, fuel: fuel - 1)
+  end
+  return next
+end
+
+let list_length_we = fn (xs: [WorkingEntry]) -> i64 do
+  match xs do
+    | [] -> return 0
+    | _ :: rest -> return 1 + list_length_we(xs: rest)
+  end
+end
+
+// ─── Finalisation ────────────────────────────────────────────────────────────
+
+let finalise = fn (entries: [WorkingEntry]) -> EffectMap do
+  return EffectMap(entries: finalise_go(entries, acc: []))
+end
+
+let finalise_go = fn (entries: [WorkingEntry], acc: [EffectEntry]) -> [EffectEntry] do
+  match entries do
+    | [] -> return reverse_effect_entries(lst: acc, out: [])
+    | e :: rest ->
+      let WorkingEntry(name, capabilities, can_throw, has_side_effect, callees: _) = e
+      let pure = compute_purity(caps: capabilities, can_throw, has_side_effect)
+      let summary = EffectSummary(capabilities_used: capabilities, can_throw, is_pure: pure)
+      return finalise_go(entries: rest, acc: EffectEntry(name, summary) :: acc)
+  end
+end
+
+let compute_purity = fn (caps: [string], can_throw: bool, has_side_effect: bool) -> bool do
+  if can_throw then return false end
+  if has_side_effect then return false end
+  match caps do
+    | [] -> return true
+    | _ -> return false
+  end
+end
+
+let reverse_effect_entries = fn (lst: [EffectEntry], out: [EffectEntry]) -> [EffectEntry] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_effect_entries(lst: rest, out: x :: out)
+  end
+end
+
+// ─── Public Entry Point ──────────────────────────────────────────────────────
+
+/// Compute the per-function effect map for `program`. The returned map
+/// contains one entry per LirFunction; consumers look up by function name
+/// (matching `LirFunction.name`).
+export let analyze_effects = fn (program: LirProgram) -> EffectMap do
+  let LirProgram(functions, externals) = program
+  let direct = build_direct_entries(funcs: functions, exts: externals)
+  let working = direct_to_working(entries: direct)
+  let propagated = propagate(entries: working)
+  return finalise(entries: propagated)
+end
+
+// ─── Lookup helpers (consumer convenience) ───────────────────────────────────
+
+/// Lookup a function's summary by name. Returns None if `name` is not in
+/// the map (e.g. caller mistyped the function name or the function was
+/// added after analysis ran).
+export let lookup_summary = fn (em: EffectMap, name: string) -> Option<EffectSummary> do
+  let EffectMap(entries) = em
+  return lookup_summary_go(entries, name)
+end
+
+let lookup_summary_go = fn (entries: [EffectEntry], name: string) -> Option<EffectSummary> do
+  match entries do
+    | [] -> return None
+    | EffectEntry(name: en, summary) :: rest ->
+      if en == name then return Some(val: summary) end
+      return lookup_summary_go(entries: rest, name)
+  end
+end
+
+/// Convenience: total number of summarised functions.
+export let effect_map_size = fn (em: EffectMap) -> i64 do
+  let EffectMap(entries) = em
+  return effect_map_size_go(entries)
+end
+
+let effect_map_size_go = fn (entries: [EffectEntry]) -> i64 do
+  match entries do
+    | [] -> return 0
+    | _ :: rest -> return 1 + effect_map_size_go(entries: rest)
+  end
+end
