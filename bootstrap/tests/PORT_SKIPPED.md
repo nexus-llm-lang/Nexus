@@ -255,6 +255,23 @@ porting of `array.get` / `array.set` / `array.fold_left` / `array.any` /
 Tracked separately; the basic test only exercises `array.length`
 (resolved through the `__nx_array_length` external) and `array.is_empty`.
 
+Additional follow-up — `array.length` returns a heap-pointer-shaped
+garbage value in standalone codegen (see `tests/runtime/u8w7_repro_test.nx`
+for the bisected diagnosis). The host implementation
+(`bootstrap/src/lib/core/src/core.rs::__nx_array_length`) is an identity
+function on its second arg (`len: i32`); the codegen for `TyArray`
+external args (`src/backend/codegen.nx::emit_external_arg`, ~line 821)
+unpacks the array's i64 atom as a packed `(ptr<<32 | len)` value the
+same way it does for strings. Strings are stored that way on the wire,
+but Nexus arrays are heap-allocated records (the i64 atom is just the
+heap pointer with the upper 32 bits zero), so `len` ends up being the
+heap-pointer's lower 32 bits. The committed array test "passes" only
+because `1 / (n - 2)` for n in the 60000-range yields 0 via integer
+truncation rather than trapping. Originally filed as
+"`assert_eq_i64` traps inside `try`" (nexus-u8w7) — that diagnosis was
+a misattribution; assert_eq_i64 raises `AssertionFailed` correctly
+because n != expected. Tracked under the re-scoped follow-up filing.
+
 ## char.rs
 
 Ported as a runtime fixture:
