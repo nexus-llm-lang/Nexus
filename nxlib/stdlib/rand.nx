@@ -1,13 +1,128 @@
 /**
- * random: Pseudo-random number generation.
+ * rand: Pseudo-random number generation.
  *
  * Provides Random port with next_i64, range, and next_bool operations.
  * Requires PermRandom capability.
+ *
+ * ── Algorithm ────────────────────────────────────────────────────────────
+ * Linear congruential generator (PCG / Lehmer family) with the same
+ * step constants as the previous Rust implementation
+ * (`bootstrap/src/lib/random/src/lib.rs`):
+ *
+ *   state' = state * 6364136223846793005 + 1442695040888963407   (mod 2^64)
+ *
+ * The output is `state' & 0x7FFFFFFFFFFFFFFF` (top bit cleared) so the
+ * returned i64 is always non-negative — matching the Rust impl byte-for-byte
+ * given the same internal state. There is no XSH-RR output permutation:
+ * raw new state is the output. This is intentionally a low-grade PRNG and
+ * NOT suitable for cryptography, sampling, or anything where correlation
+ * between successive outputs matters.
+ *
+ * ── State cell layout ────────────────────────────────────────────────────
+ * 16 bytes reserved at fixed offset RAND_STATE_OFFSET = 983040
+ * (= 15 * 65536, start of page 15 of linear memory).
+ *
+ *   offset + 0..7   : i64 state (PCG internal)
+ *   offset + 8..15  : i64 init flag (0 = uninitialized, 1 = seeded)
+ *
+ * Why page 15 specifically: the bundled stdlib.wasm dep places its data
+ * segment at page 16 (offset 1048576) and the bump heap grows from a
+ * heap_base above the user data section (typically ≥ page 18). Pages 0..15
+ * are zero-initialised empty real estate that no other allocator touches,
+ * which is required for the lazy-init flag to be observable as 0 on the
+ * very first call regardless of program. Page 15 is the topmost free page
+ * — easy to reason about as "just below stdlib data".
+ *
+ * ── Lazy-init protocol ───────────────────────────────────────────────────
+ * On first `next_i64()`/`range()`/`next_bool()` call:
+ *   1. Load init flag at offset+8.
+ *   2. If 0: derive a fresh seed by mixing __nx_now() (millisecond clock)
+ *      with a fixed mixer constant; store at offset+0; set init flag = 1.
+ *   3. If non-zero: state already valid, skip seed step.
+ *
+ * Seed source is the host time import (`__nx_now`), which for the
+ * standalone path is `SystemTime::now().duration_since(UNIX_EPOCH)` in
+ * milliseconds. NOTE: the previous Rust impl used nanosecond resolution;
+ * we use ms here because that is what the existing host import exposes.
+ * Sequences from independent program runs that happen to launch within
+ * the same wall-clock millisecond will share a seed — acceptable for the
+ * "low-grade PRNG" contract above.
+ *
+ * Determinism contract: given the same internal state at offset+0 and the
+ * same init flag value at offset+8, calls to `next_i64()` produce
+ * identical byte sequences across runs. Tests in
+ * `bootstrap/tests/stdlib/rand.rs` cover both directions (same seed →
+ * identical sequence, different seeds → divergent sequences).
  */
 import external "std:rand"
+import external "std:clock"
+import * as mem from "std:runtime_mem"
 
-external __nx_random_i64 = "__nx_random_i64" : () -> i64
-external __nx_random_range = "__nx_random_range" : (min: i64, max: i64) -> i64
+/// Host import for wall-clock milliseconds. Re-declared here (rather than
+/// pulled in via std:clock) so the seed path does not require a Clock cap
+/// handler to be installed; only the underlying wasm import needs to be
+/// resolvable.
+external __nx_now = "__nx_now" : () -> i64
+
+// ─── State cell layout (constants) ──────────────────────────────────────────
+
+/// Byte offset of the 16-byte state cell. See module docstring for rationale.
+let rand_state_offset = fn () -> i64 do return 983040 end
+
+/// Offset of the i64 state word.
+let state_addr = fn () -> i64 do return 983040 end
+
+/// Offset of the i64 init-flag word (0 = needs seed, 1 = ready).
+let flag_addr = fn () -> i64 do return 983048 end
+
+// ─── PCG step constants (must match bootstrap/src/lib/random/src/lib.rs) ────
+
+let pcg_multiplier = fn () -> i64 do return 6364136223846793005 end
+let pcg_increment = fn () -> i64 do return 1442695040888963407 end
+
+// ─── Seed-mix constants ─────────────────────────────────────────────────────
+//
+// Both fit in signed i64 (< 2^63). The fallback-seed value is used when
+// __nx_now() XOR mixer collapses to 0; that should be extremely rare under
+// real wall-clock input but we still guard against it so the LCG is never
+// stuck at 0 (state=0 is a fixed point: 0 * MUL + 0 = 0).
+let seed_mixer = fn () -> i64 do return 2305843009213693951 end
+let fallback_seed = fn () -> i64 do return 1234567890123456789 end
+
+// ─── PCG step ───────────────────────────────────────────────────────────────
+
+/// Advance the PCG state by one step.
+/// `state * MUL + INC` wraps mod 2^64 via wasm's i64.mul/add semantics.
+let pcg_step = fn (state: i64) -> i64 do
+  return state * pcg_multiplier() + pcg_increment()
+end
+
+// ─── Lazy seed init ─────────────────────────────────────────────────────────
+
+/// First-call seed install. No-op if the init flag is already set.
+/// Seeds with `__nx_now() XOR seed_mixer`, falling back to a fixed nonzero
+/// constant when the mix collapses to 0.
+let ensure_seeded = fn () -> unit do
+  let flag = mem.load_i64(addr: flag_addr())
+  if flag != 0 then return () end
+  let now = __nx_now()
+  let mixed = now ^ seed_mixer()
+  let seed = if mixed == 0 then fallback_seed() else mixed end
+  let _ = mem.store_i64(addr: state_addr(), val: seed)
+  let _ = mem.store_i64(addr: flag_addr(), val: 1)
+  return ()
+end
+
+/// Advance the state cell by one PCG step and return the new state.
+let advance = fn () -> i64 do
+  let _ = ensure_seeded()
+  let cur = mem.load_i64(addr: state_addr())
+  let nxt = pcg_step(state: cur)
+  let _ = mem.store_i64(addr: state_addr(), val: nxt)
+  return nxt
+end
+
+// ─── Public Random cap ──────────────────────────────────────────────────────
 
 export cap Random do
   fn next_i64() -> i64
@@ -15,14 +130,62 @@ export cap Random do
   fn next_bool() -> bool
 end
 
+/// Produce a non-negative i64. Top bit cleared so the result is in
+/// [0, 2^63 - 1]. Matches the Rust impl mask byte-for-byte for the same
+/// internal state.
+let next_i64_raw = fn () -> i64 do
+  let n = advance()
+  return n & 9223372036854775807
+end
+
+/// Bounded range [min, max). Returns `min` for empty/inverted intervals
+/// rather than raising — preserves the Rust impl's safe-fallback contract.
+let range_raw = fn (min: i64, max: i64) -> i64 do
+  if max <= min then return min end
+  let span = max - min
+  let n = next_i64_raw()
+  return min + (n % span)
+end
+
 export let system_handler = handler Random require { PermRandom } do
   fn next_i64() -> i64 do
-    return __nx_random_i64()
+    return next_i64_raw()
   end
   fn range(min: i64, max: i64) -> i64 do
-    return __nx_random_range(min, max)
+    return range_raw(min, max)
   end
   fn next_bool() -> bool do
-    return __nx_random_range(min: 0, max: 2) == 1
+    return range_raw(min: 0, max: 2) == 1
   end
+end
+
+// ─── Test/diagnostic surface ────────────────────────────────────────────────
+//
+// `seed_with` and `peek_state` are escape hatches for the determinism
+// tests in `bootstrap/tests/stdlib/rand.rs`. They bypass the lazy-init
+// path so a test can install a known seed and observe a byte-equal output
+// sequence on every run. Production code should never call these — using
+// them defeats the cap-based isolation that `system_handler` provides.
+
+/// Install an explicit seed and mark the state cell initialised. Used by
+/// determinism tests that need byte-equal sequences across runs.
+export let seed_with = fn (seed: i64) -> unit do
+  let actual = if seed == 0 then fallback_seed() else seed end
+  let _ = mem.store_i64(addr: state_addr(), val: actual)
+  let _ = mem.store_i64(addr: flag_addr(), val: 1)
+  return ()
+end
+
+/// Read the current i64 state without advancing. Used by tests.
+export let peek_state = fn () -> i64 do
+  return mem.load_i64(addr: state_addr())
+end
+
+/// Reset the init flag so the next `next_i64()` call re-runs lazy seeding.
+/// Used by tests that need a clean slate between cases within a single
+/// wasm instance.
+export let reset = fn () -> unit do
+  let _ = mem.store_i64(addr: state_addr(), val: 0)
+  let _ = mem.store_i64(addr: flag_addr(), val: 0)
+  return ()
 end
