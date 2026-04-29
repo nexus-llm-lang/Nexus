@@ -1,0 +1,318 @@
+/**
+ * wasm_alloc: Pure-Nexus bump allocator over linear memory.
+ *
+ * Co-existing parallel implementation alongside `bootstrap/src/lib/wasm_alloc/`
+ * (the Rust host-side allocator that backs Stage-0 FFI components). This
+ * module implements the same logical surface — `allocate / deallocate /
+ * mark / reset / read_string / store_string_result` — entirely in Nexus,
+ * built on `runtime_mem` load/store and `memory.size / memory.grow`.
+ *
+ * Design (Path X — pure bump, no per-allocation tracking):
+ *   1. State cell occupies the last 16 bytes of the program's currently-mapped
+ *      memory: bytes [S, S+8) hold the bump pointer (i64), bytes [S+8, S+16)
+ *      hold a magic sentinel.  S = mem.size() * 65536 - 16 every time we
+ *      consult it, so when memory grows the cell migrates with the new top.
+ *   2. Lazy init via sentinel: on every entry we load magic from S+8.
+ *      Mismatch ⇒ first call: grow one page, install bump_ptr at the start
+ *      of the freshly-grown page (16 bytes after S of pre-grow memory; the
+ *      new state cell sits at the new top).  Match ⇒ resume.
+ *   3. `allocate(size)` is a 16-byte-aligned bump; if the new bump would
+ *      reach the state cell, we grow more pages (migrating the state cell
+ *      to the new top) and retry.
+ *   4. `deallocate(ptr, size)` is a no-op — the issue body explicitly says
+ *      "can be no-op for bump alloc", and there is no per-allocation
+ *      bookkeeping to reclaim.  Use `mark / reset` for region-style
+ *      reclamation.
+ *   5. `mark()` returns the current bump_ptr; `reset(mark)` writes it
+ *      back, freeing every allocation made since the mark.  Memory pages
+ *      themselves remain mapped (wasm has no shrink primitive).
+ *
+ * Why the state cell migrates: the only reliable anchor that survives
+ * across calls without module-init machinery is `mem.size()` itself.
+ * Choosing the start of the first claimed page would freeze a number we
+ * cannot recover later (subsequent calls do not know which page was
+ * "first").  Choosing the last 16 bytes lets every call independently
+ * compute the cell's address from `mem.size()`.  Migration on grow is
+ * O(1) (read 16 bytes, grow, write 16 bytes at the new top).
+ *
+ * Constraints:
+ *   - Uses ONLY `nexus:runtime/memory` primitives (load/store/size/grow).
+ *     No new intrinsic.
+ *   - Caller is responsible for not interleaving `allocate` with the
+ *     codegen's G0 bump (object/string heap) growing past the state
+ *     cell.  In practice the state cell sits well above the user's
+ *     heap watermark for any non-pathological workload.
+ *
+ * This module is intended for the self-hosted compiler path
+ * (`nexus:runtime/memory` is recognised by `src/backend/codegen.nx`).
+ * Bootstrap-compiled programs continue to use the Rust `wasm_alloc`.
+ */
+import * as mem from "std:runtime_mem"
+import * as bb from "std:bytebuffer"
+import { ByteBuffer } from "std:bytebuffer"
+import { byte_at, byte_length } from "std:str"
+import { ord } from "std:char"
+
+/// Raised by `allocate` when a non-positive size is requested.
+export exception InvalidSize(op: string, size: i64)
+
+/// Raised by `allocate` when `memory.grow` cannot satisfy the request
+/// (host refused additional pages — typically OOM at the embedder layer).
+export exception OutOfMemory(op: string, requested_pages: i64)
+
+/// Raised by `reset` when the supplied mark is not within the allocator's
+/// current bump-pointer range (negative, or > current bump).  A stale mark
+/// from a previous reset round is the usual cause.
+export exception InvalidMark(op: string, mark: i64, current_bump: i64)
+
+/// Raised by `read_string` / `store_string_result` when the byte range
+/// extends past the current memory or when the requested length is
+/// negative.  Distinct from `runtime_mem.MemoryOutOfBounds` so callers
+/// can match on it without depending on the exact lower-level wrapper.
+export exception InvalidByteRange(op: string, ptr: i64, len: i64)
+
+/// Magic sentinel stored at S+8 to distinguish initialised state from
+/// freshly-zeroed memory.  Chosen non-zero with no plausible collision
+/// with user data ("NXALLOC!" as ASCII little-endian 64-bit).
+let magic_value = fn () -> i64 do
+  return 5642815862488920353
+end
+
+let page_bytes = fn () -> i64 do
+  return 65536
+end
+
+/// 16-byte alignment matches the canonical-ABI realloc lowering and is
+/// large enough for every Nexus value layout we currently emit.
+let alloc_align = fn () -> i64 do
+  return 16
+end
+
+/// State-cell footprint at the top of memory: bump_ptr (i64) + magic (i64).
+let state_size = fn () -> i64 do
+  return 16
+end
+
+/// Tentative address for the state cell: the last 16 bytes of currently-
+/// mapped memory.  This is where `ensure_initialized` *plants* the cell on
+/// the very first call.  After that, codegen-driven `memory.grow` (string
+/// concat, object allocation) can extend memory past us, leaving the cell
+/// stranded mid-memory; `find_state_addr` scans backward through page tops
+/// to relocate it without loss.
+let top_addr = fn () -> i64 do
+  return mem.size() * page_bytes() - state_size()
+end
+
+/// Scan page tops from the current memory top downward for the magic
+/// sentinel at offset +8.  Returns the cell address on hit, or -1 if no
+/// initialized state cell exists yet.  The cell is always planted at a
+/// (page * 65536) - 16 boundary by `ensure_initialized`, so we only
+/// probe those addresses; this bounds the scan at one comparison per page.
+let scan_state_addr = fn (probe: i64) -> i64 do
+  if probe < 0 then return -1 end
+  if mem.load_i64(addr: probe + 8) == magic_value() then
+    return probe
+  end
+  return scan_state_addr(probe: probe - page_bytes())
+end
+
+/// Locate the state cell.  The fast path (cell still at current top)
+/// covers programs that don't interleave string concat / object alloc.
+/// The slow path covers the case where codegen grew memory between our
+/// calls, leaving the cell mid-memory.  Returns -1 when the cell has
+/// never been planted.
+let find_state_addr = fn () -> i64 do
+  let t = top_addr()
+  if mem.load_i64(addr: t + 8) == magic_value() then
+    return t
+  end
+  return scan_state_addr(probe: t - page_bytes())
+end
+
+/// 16-byte align upward.  Inputs are non-negative offsets / sizes; the
+/// expression is plain arithmetic so the compiler emits no intrinsic call.
+let align_up = fn (x: i64) -> i64 do
+  let a = alloc_align()
+  return (x + (a - 1)) / a * a
+end
+
+/// Lazily install the state cell when none exists.  Called on every
+/// public entry; the mismatch branch fires exactly once per program
+/// lifetime.  Returns the address of the located (or newly planted)
+/// cell so callers avoid a second scan.
+let ensure_initialized = fn () -> i64 throws { Exn } do
+  let existing = find_state_addr()
+  if existing >= 0 then
+    return existing
+  end
+
+  // First call.  After grow(1) succeeds, prev_pages is the page index
+  // of the new page; allocations begin at prev_pages * page_bytes
+  // (the bottom of the freshly-claimed range), and the new state cell
+  // sits at the very top of memory.
+  let prev_pages = mem.grow(delta: 1)
+  if prev_pages < 0 then
+    raise OutOfMemory(op: "wasm_alloc.init", requested_pages: 1)
+  end
+
+  let new_state = top_addr()
+  let initial_bump = prev_pages * page_bytes()
+  mem.store_i64(addr: new_state, val: initial_bump)
+  mem.store_i64(addr: new_state + 8, val: magic_value())
+  return new_state
+end
+
+/// Read the bump pointer.  Caller must have already called `ensure_initialized`.
+let load_bump = fn (s: i64) -> i64 do
+  return mem.load_i64(addr: s)
+end
+
+let store_bump = fn (s: i64, val: i64) -> unit do
+  return mem.store_i64(addr: s, val)
+end
+
+/// Grow memory by enough pages to cover `extra` bytes past the current
+/// top, MIGRATE the state cell from `old_s` to the new top, and return
+/// the new state address.  Migration is required because the scan in
+/// `find_state_addr` matches the FIRST magic-bearing cell from the top
+/// downward — leaving the old cell live would shadow the new one.
+let grow_for = fn (old_s: i64, extra: i64) -> i64 throws { Exn } do
+  let pb = page_bytes()
+  let pages_needed = (extra + pb - 1) / pb
+  let bump_snapshot = load_bump(s: old_s)
+
+  let prev_pages = mem.grow(delta: pages_needed)
+  if prev_pages < 0 then
+    raise OutOfMemory(op: "wasm_alloc.grow", requested_pages: pages_needed)
+  end
+
+  // Invalidate the old cell so a future scan never picks it up.  Zero
+  // satisfies "magic absent" — the natural empty state on freshly-grown
+  // pages — without touching unrelated user data above old_s.
+  mem.store_i64(addr: old_s + 8, val: 0)
+
+  let new_s = top_addr()
+  store_bump(s: new_s, val: bump_snapshot)
+  mem.store_i64(addr: new_s + 8, val: magic_value())
+  return new_s
+end
+
+/// Allocate `size` bytes (16-byte aligned) and return the base address.
+/// Raises InvalidSize on size <= 0; raises OutOfMemory if the host
+/// refuses additional pages.
+export let allocate = fn (size: i64) -> i64 throws { Exn } do
+  if size <= 0 then
+    raise InvalidSize(op: "allocate", size)
+  end
+
+  let s = ensure_initialized()
+  let aligned = align_up(x: size)
+  let bump = load_bump(s)
+  let new_bump = bump + aligned
+
+  if new_bump > s then
+    let extra = new_bump - s
+    let s2 = grow_for(old_s: s, extra)
+    let bump2 = load_bump(s: s2)
+    let new_bump2 = bump2 + aligned
+    store_bump(s: s2, val: new_bump2)
+    return bump2
+  end
+
+  store_bump(s, val: new_bump)
+  return bump
+end
+
+/// Bump allocators do not free per-allocation; this is a no-op.  Use
+/// `mark` + `reset` for region-style reclamation.  Kept for surface
+/// parity with `bootstrap/src/lib/wasm_alloc/src/lib.rs::deallocate`.
+export let deallocate = fn (ptr: i64, size: i64) -> unit do
+  let _ = ptr
+  let _ = size
+  return ()
+end
+
+/// Snapshot the bump pointer.  Pair with `reset` to bulk-free everything
+/// allocated after the mark.  Initialises the state cell on first call.
+export let mark = fn () -> i64 throws { Exn } do
+  let s = ensure_initialized()
+  return load_bump(s)
+end
+
+/// Rewind the bump pointer to a previously-returned `mark` value.  All
+/// pointers handed out after the mark become invalid; the caller must
+/// hold no live references into them.  Memory pages remain mapped (wasm
+/// has no shrink primitive).
+export let reset = fn (m: i64) -> unit throws { Exn } do
+  let s = ensure_initialized()
+  let current = load_bump(s)
+  if m < 0 then
+    raise InvalidMark(op: "reset", mark: m, current_bump: current)
+  end
+  if m > current then
+    raise InvalidMark(op: "reset", mark: m, current_bump: current)
+  end
+  return store_bump(s, val: m)
+end
+
+let read_string_go = fn (buf: %ByteBuffer, ptr: i64, len: i64, i: i64) -> %ByteBuffer do
+  if i >= len then return buf end
+  let byte_val = mem.load_u8(addr: ptr + i)
+  let %buf2 = bb.push_byte(%buf, byte: byte_val)
+  return read_string_go(buf: %buf2, ptr, len, i: i + 1)
+end
+
+/// Read `len` bytes from linear memory starting at `ptr` and decode as
+/// UTF-8 into a Nexus string.  Raises InvalidByteRange on negative len
+/// or when [ptr, ptr+len) extends past current memory.
+export let read_string = fn (ptr: i64, len: i64) -> string throws { Exn } do
+  if ptr < 0 || len < 0 then
+    raise InvalidByteRange(op: "read_string", ptr, len)
+  end
+  if ptr + len > mem.size() * page_bytes() then
+    raise InvalidByteRange(op: "read_string", ptr, len)
+  end
+  if len == 0 then
+    return ""
+  end
+
+  let buf = bb.empty()
+  let %buf2 = read_string_go(buf: %buf, ptr, len, i: 0)
+  let result = bb.to_string(&buf2)
+  bb.free(%buf2)
+  return result
+end
+
+/// Pack (ptr, len) into the canonical i64 result-of-string layout used
+/// across the FFI boundary: high 32 bits = ptr, low 32 bits = len.
+/// Mirrors `bootstrap/src/lib/wasm_alloc/src/lib.rs::pack_ptr_len`.
+let pack_ptr_len = fn (ptr: i64, len: i64) -> i64 do
+  let ptr_lo = ptr & 4294967295
+  let len_lo = len & 4294967295
+  return (ptr_lo * 4294967296) + len_lo
+end
+
+/// Get the byte at index `i` of a Nexus string as an i64 (0-255).  The
+/// stdlib's `__nx_string_byte_at` returns a `char`; we round-trip through
+/// `from_char_code`'s inverse path via direct length-checked iteration.
+let store_chars_loop = fn (s: string, ptr: i64, len: i64, i: i64) -> unit do
+  if i >= len then return () end
+  let c = byte_at(s, idx: i)
+  let code = ord(c)
+  let _ = mem.store_u8(addr: ptr + i, val: code)
+  return store_chars_loop(s, ptr, len, i: i + 1)
+end
+
+/// Allocate space for `s`'s UTF-8 bytes, copy them into linear memory,
+/// and return `pack_ptr_len(ptr, byte_len)`.  Returns `0` for the empty
+/// string (matching the Rust impl's empty-string sentinel).  Raises
+/// `OutOfMemory` if the underlying allocate fails.
+export let store_string_result = fn (s: string) -> i64 throws { Exn } do
+  let len = byte_length(s)
+  if len == 0 then
+    return 0
+  end
+  let ptr = allocate(size: len)
+  let _ = store_chars_loop(s, ptr, len, i: 0)
+  return pack_ptr_len(ptr, len)
+end
