@@ -39,16 +39,17 @@ export exception SnapshotMismatch(name: string, diff: string)
 /// Raised on malformed `.snap` files (missing leading `---` etc.).
 export exception SnapshotMalformed(path: string, reason: string)
 
-/// Header metadata of a snapshot file. `source` and `expression` are the
-/// two fields produced by insta when the snapshot is recorded; additional
-/// keys are kept verbatim in `extras` so round-tripping doesn't lose data.
+/// One key/value pair from the snapshot header. Anything that isn't
+/// `source` or `expression` is stored verbatim in `extras` so
+/// round-tripping doesn't drop fields the writer added.
+export type HeaderEntry = HeaderEntry(key: string, value: string)
+
+/// Header metadata of a snapshot file.
 export type SnapshotHeader = SnapshotHeader(
   source: Option<string>,
   expression: Option<string>,
   extras: [ HeaderEntry ],
 )
-
-export type HeaderEntry = HeaderEntry(key: string, value: string)
 
 export type Snapshot = Snapshot(header: SnapshotHeader, body: string)
 
@@ -58,31 +59,47 @@ end
 
 // ─── Header serialisation ────────────────────────────────────────────────────
 
-let render_header_lines = fn (header: SnapshotHeader, acc: [ string ]) -> [ string ] do
-  let with_source = match header do
-    | SnapshotHeader(source: Some(val: s), expression, extras) ->
+let push_source_line = fn (header: SnapshotHeader, acc: [ string ]) -> [ string ] do
+  let SnapshotHeader(source, expression: _, extras: _) = header
+  match source do
+    | None -> return acc
+    | Some(val: s) ->
       let line = "source: " ++ s
       return line :: acc
-    | SnapshotHeader(source: None, _) -> return acc
   end
-  let with_expr = match header do
-    | SnapshotHeader(expression: Some(val: e), _) ->
-      let line = "expression: " ++ e
-      return line :: with_source
-    | SnapshotHeader(expression: None, _) -> return with_source
+end
+
+let push_expression_line = fn (header: SnapshotHeader, acc: [ string ]) -> [ string ] do
+  let SnapshotHeader(source: _, expression, extras: _) = header
+  match expression do
+    | None -> return acc
+    | Some(val: ex) ->
+      let line = "expression: " ++ ex
+      return line :: acc
   end
-  let SnapshotHeader(extras: extras) = header
-  return fold_left(xs: extras, init: with_expr, f: fn (acc: [ string ], val: HeaderEntry) -> [ string ] do
+end
+
+let push_extra_lines = fn (extras: [ HeaderEntry ], acc: [ string ]) -> [ string ] do
+  return fold_left(xs: extras, init: acc, f: fn (acc: [ string ], val: HeaderEntry) -> [ string ] do
     let HeaderEntry(key, value) = val
     let line = key ++ ": " ++ value
     return line :: acc
   end)
 end
 
+let render_header_lines = fn (header: SnapshotHeader) -> [ string ] do
+  let SnapshotHeader(source: _, expression: _, extras) = header
+  let acc0: [ string ] = []
+  let acc1 = push_source_line(header: header, acc: acc0)
+  let acc2 = push_expression_line(header: header, acc: acc1)
+  let acc3 = push_extra_lines(extras: extras, acc: acc2)
+  return reverse(xs: acc3)
+end
+
 /// Render a Snapshot back to the on-disk `.snap` text.
 export let format_snapshot = fn (snap: Snapshot) -> string do
   let Snapshot(header, body) = snap
-  let header_lines = reverse(xs: render_header_lines(header, acc: []))
+  let header_lines = render_header_lines(header: header)
   let header_text = join(xs: header_lines, sep: "\n")
   return "---\n" ++ header_text ++ "\n---\n" ++ body
 end
@@ -96,35 +113,60 @@ let parse_header_field = fn (line: string) -> Option<HeaderEntry> do
     | _ :: [] -> return None
     | k :: rest ->
       let value = join(xs: rest, sep: ": ")
-      return Some(val: HeaderEntry(key: k, value))
+      return Some(val: HeaderEntry(key: k, value: value))
   end
 end
 
-let collect_header = fn (lines: [ string ], acc_extras: [ HeaderEntry ], acc_source: Option<string>, acc_expr: Option<string>) -> { header: SnapshotHeader, rest: [ string ] } do
+type ParseAcc = ParseAcc(
+  extras: [ HeaderEntry ],
+  source: Option<string>,
+  expression: Option<string>,
+)
+
+let absorb_field = fn (acc: ParseAcc, entry: HeaderEntry) -> ParseAcc do
+  let HeaderEntry(key, value) = entry
+  let ParseAcc(extras, source, expression) = acc
+  if key == "source" then
+    return ParseAcc(extras: extras, source: Some(val: value), expression: expression)
+  else if key == "expression" then
+    return ParseAcc(extras: extras, source: source, expression: Some(val: value))
+  else
+    return ParseAcc(extras: entry :: extras, source: source, expression: expression)
+  end
+end
+
+let collect_header = fn (lines: [ string ], acc: ParseAcc) -> { header: SnapshotHeader, rest: [ string ] } do
   match lines do
     | [] ->
-      let header = SnapshotHeader(source: acc_source, expression: acc_expr, extras: reverse(xs: acc_extras))
+      let ParseAcc(extras, source, expression) = acc
+      let header = SnapshotHeader(source: source, expression: expression, extras: reverse(xs: extras))
       return { header: header, rest: [] }
     | line :: rest ->
       if line == "---" then
-        let header = SnapshotHeader(source: acc_source, expression: acc_expr, extras: reverse(xs: acc_extras))
+        let ParseAcc(extras, source, expression) = acc
+        let header = SnapshotHeader(source: source, expression: expression, extras: reverse(xs: extras))
         return { header: header, rest: rest }
       else
-        match parse_header_field(line) do
+        match parse_header_field(line: line) do
           | None ->
-            return collect_header(lines: rest, acc_extras, acc_source, acc_expr)
-          | Some(val: HeaderEntry(key, value)) ->
-            if key == "source" then
-              return collect_header(lines: rest, acc_extras, acc_source: Some(val: value), acc_expr)
-            else
-              if key == "expression" then
-                return collect_header(lines: rest, acc_extras, acc_source, acc_expr: Some(val: value))
-              else
-                let entry = HeaderEntry(key, value)
-                return collect_header(lines: rest, acc_extras: entry :: acc_extras, acc_source, acc_expr)
-              end
-            end
+            return collect_header(lines: rest, acc: acc)
+          | Some(val: entry) ->
+            return collect_header(lines: rest, acc: absorb_field(acc: acc, entry: entry))
         end
+      end
+  end
+end
+
+let strip_trailing_newline = fn (s: string) -> string do
+  let lines = split(s: s, sep: "\n")
+  let rev = reverse(xs: lines)
+  match rev do
+    | [] -> return s
+    | last :: rest ->
+      if last == "" then
+        return join(xs: reverse(xs: rest), sep: "\n")
+      else
+        return s
       end
   end
 end
@@ -133,31 +175,17 @@ end
 export let parse_snapshot = fn (path: string, text: string) -> Snapshot throws { Exn } do
   let all_lines = split(s: text, sep: "\n")
   match all_lines do
+    | [] -> raise SnapshotMalformed(path: path, reason: "empty file")
     | first :: rest ->
       if first == "---" then
-        let collected = collect_header(lines: rest, acc_extras: [], acc_source: None, acc_expr: None)
+        let acc0 = ParseAcc(extras: [], source: None, expression: None)
+        let collected = collect_header(lines: rest, acc: acc0)
         let body = join(xs: collected.rest, sep: "\n")
-        let trimmed_body = strip_trailing_newline(body)
+        let trimmed_body = strip_trailing_newline(s: body)
         return Snapshot(header: collected.header, body: trimmed_body)
       else
-        raise SnapshotMalformed(path, reason: "missing leading '---' header")
+        raise SnapshotMalformed(path: path, reason: "missing leading '---' header")
       end
-    | [] ->
-      raise SnapshotMalformed(path, reason: "empty file")
-  end
-end
-
-let strip_trailing_newline = fn (s: string) -> string do
-  let lines = split(s, sep: "\n")
-  let rev = reverse(xs: lines)
-  match rev do
-    | last :: rest ->
-      if last == "" then
-        return join(xs: reverse(xs: rest), sep: "\n")
-      else
-        return s
-      end
-    | [] -> return s
   end
 end
 
@@ -181,14 +209,14 @@ end
 /// matches insta's environment variable semantics.
 let update_mode = fn () -> bool require { Env } do
   match Env.get(key: "NEXUS_SNAPSHOT_UPDATE") do
-    | Some(val: v) -> return v == "always"
     | None -> return false
+    | Some(val: v) -> return v == "always"
   end
 end
 
 let make_snapshot = fn (name: string, body: string) -> Snapshot do
   let header = SnapshotHeader(source: None, expression: Some(val: name), extras: [])
-  return Snapshot(header, body)
+  return Snapshot(header: header, body: body)
 end
 
 /// Ensure `dir` exists. Creates intermediate directories.
@@ -200,13 +228,6 @@ let ensure_dir = fn (dir: string) -> unit require { Fs } throws { Exn } do
   end
 end
 
-/// Compare two snapshot bodies; returns a human-readable diff.
-let render_body_diff = fn (actual: string, expected: string) -> string do
-  let alines = split(s: actual, sep: "\n")
-  let elines = split(s: expected, sep: "\n")
-  return diff_lines(actual_lines: alines, expected_lines: elines, idx: 0, acc: [])
-end
-
 let diff_lines = fn (actual_lines: [ string ], expected_lines: [ string ], idx: i64, acc: [ string ]) -> string do
   match actual_lines do
     | [] ->
@@ -214,16 +235,16 @@ let diff_lines = fn (actual_lines: [ string ], expected_lines: [ string ], idx: 
         | [] -> return join(xs: reverse(xs: acc), sep: "\n")
         | e :: erest ->
           let line = "  - " ++ e
-          return diff_lines(actual_lines, expected_lines: erest, idx: idx + 1, acc: line :: acc)
+          return diff_lines(actual_lines: actual_lines, expected_lines: erest, idx: idx + 1, acc: line :: acc)
       end
     | a :: arest ->
       match expected_lines do
         | [] ->
           let line = "  + " ++ a
-          return diff_lines(actual_lines: arest, expected_lines, idx: idx + 1, acc: line :: acc)
+          return diff_lines(actual_lines: arest, expected_lines: expected_lines, idx: idx + 1, acc: line :: acc)
         | e :: erest ->
           if a == e then
-            return diff_lines(actual_lines: arest, expected_lines: erest, idx: idx + 1, acc)
+            return diff_lines(actual_lines: arest, expected_lines: erest, idx: idx + 1, acc: acc)
           else
             let minus = "  - " ++ e
             let plus = "  + " ++ a
@@ -233,21 +254,37 @@ let diff_lines = fn (actual_lines: [ string ], expected_lines: [ string ], idx: 
   end
 end
 
+/// Compare two snapshot bodies; returns a human-readable diff.
+let render_body_diff = fn (actual: string, expected: string) -> string do
+  let alines = split(s: actual, sep: "\n")
+  let elines = split(s: expected, sep: "\n")
+  return diff_lines(actual_lines: alines, expected_lines: elines, idx: 0, acc: [])
+end
+
 /// Write the pending snapshot file (`.snap.new`) for human review.
 let write_pending = fn (dir: string, name: string, body: string) -> unit require { Fs } throws { Exn } do
-  let snap = make_snapshot(name, body)
-  let text = format_snapshot(snap)
-  let path = pending_path(dir, name)
-  return Fs.write_string(path, content: text)
+  let snap = make_snapshot(name: name, body: body)
+  let text = format_snapshot(snap: snap)
+  let path = pending_path(dir: dir, name: name)
+  return Fs.write_string(path: path, content: text)
 end
 
 /// Accept a snapshot unconditionally — writes `.snap`, removes `.snap.new`.
 let accept_snapshot = fn (dir: string, name: string, body: string) -> unit require { Fs } throws { Exn } do
-  let snap = make_snapshot(name, body)
-  let text = format_snapshot(snap)
-  let path = snapshot_path(dir, name)
-  let pending = pending_path(dir, name)
-  let _ = Fs.write_string(path, content: text)
+  let snap = make_snapshot(name: name, body: body)
+  let text = format_snapshot(snap: snap)
+  let path = snapshot_path(dir: dir, name: name)
+  let pending = pending_path(dir: dir, name: name)
+  let _ = Fs.write_string(path: path, content: text)
+  if Fs.exists(path: pending) then
+    return Fs.remove_file(path: pending)
+  else
+    return ()
+  end
+end
+
+let cleanup_pending = fn (dir: string, name: string) -> unit require { Fs } throws { Exn } do
+  let pending = pending_path(dir: dir, name: name)
   if Fs.exists(path: pending) then
     return Fs.remove_file(path: pending)
   else
@@ -260,36 +297,31 @@ end
 /// or SnapshotMismatch (baseline disagrees). On NEXUS_SNAPSHOT_UPDATE=always
 /// the body is accepted unconditionally and the function returns ok.
 export let assert_snapshot_in = fn (dir: string, name: string, body: string) -> unit require { Fs, Env } throws { Exn } do
-  let _ = ensure_dir(dir)
+  let _ = ensure_dir(dir: dir)
 
   if update_mode() then
-    return accept_snapshot(dir, name, body)
+    return accept_snapshot(dir: dir, name: name, body: body)
   else
-    let path = snapshot_path(dir, name)
-    if Fs.exists(path) then
-      let raw = Fs.read_to_string(path)
-      let snap = parse_snapshot(path, text: raw)
-      let Snapshot(header, body: stored) = snap
+    let path = snapshot_path(dir: dir, name: name)
+    if Fs.exists(path: path) then
+      let raw = Fs.read_to_string(path: path)
+      let snap = parse_snapshot(path: path, text: raw)
+      let Snapshot(_, body: stored) = snap
       if stored == body then
-        let pending = pending_path(dir, name)
-        if Fs.exists(path: pending) then
-          return Fs.remove_file(path: pending)
-        else
-          return ()
-        end
+        return cleanup_pending(dir: dir, name: name)
       else
-        let _ = write_pending(dir, name, body)
+        let _ = write_pending(dir: dir, name: name, body: body)
         let diff = render_body_diff(actual: body, expected: stored)
-        raise SnapshotMismatch(name, diff)
+        raise SnapshotMismatch(name: name, diff: diff)
       end
     else
-      let _ = write_pending(dir, name, body)
-      raise SnapshotPending(name, path: pending_path(dir, name))
+      let _ = write_pending(dir: dir, name: name, body: body)
+      raise SnapshotPending(name: name, path: pending_path(dir: dir, name: name))
     end
   end
 end
 
 /// Convenience wrapper using `default_snapshot_dir()`.
 export let assert_snapshot = fn (name: string, body: string) -> unit require { Fs, Env } throws { Exn } do
-  return assert_snapshot_in(dir: default_snapshot_dir(), name, body)
+  return assert_snapshot_in(dir: default_snapshot_dir(), name: name, body: body)
 end

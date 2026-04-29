@@ -1,29 +1,23 @@
 /**
  * test/property: Property-based testing primitives.
  *
- * A `Gen<T>` is a deterministic function from the RNG state to a `(value,
- * new_state)` pair, paired with a shrinker that produces a finite list of
- * "smaller" candidate values. The library is deliberately minimal: it
- * carries the proptest features actually used by `bootstrap/tests/`
- * (i64 ranges, alphanumeric strings, length-bounded lists, tuples) and
- * leaves regex generation, frequency, and stateful machines out of
- * scope.
+ * The library exposes a deterministic 64-bit linear-congruential RNG, a
+ * fixed catalogue of generators (i64 ranges, bool, alphanumeric strings,
+ * length-bounded lists of i64, length-bounded lists of string), and a
+ * driver `for_all_*` per generator that performs greedy single-step
+ * shrinking on counterexamples.
  *
- * ── RNG ─────────────────────────────────────────────────────────────────
+ * The previously-explored higher-order shape — `Gen<T>` carrying a
+ * closure over a captured `T` — exercises a bootstrap codegen bug
+ * (E2010 conflicting wasm local types) on the closure's `Rng` parameter
+ * whenever the surrounding function is generic. Until that bug is
+ * fixed in bootstrap (out of scope for the self-host-only constraint
+ * on this branch), the public API is one driver per element type
+ * rather than `Gen<T>` + a generic `for_all`. The catalogue covers the
+ * proptest use cases imported from `bootstrap/tests/`.
  *
- * A pure linear-congruential generator with a 64-bit state. Output is
- * reproducible from a seed, which is the property that matters for
- * shrinking: when a counterexample is found, we report the seed so
- * runs are replayable.
- *
- * ── Shrinking ──────────────────────────────────────────────────────────
- *
- * Each `Gen<T>` exposes a `shrink: (val: T) -> [ T ]` companion. The
- * shrink loop performs greedy single-step descent: starting from the
- * failing value, generate candidates, retain the first that still fails
- * the property, repeat until no candidate fails. This is intentionally
- * simpler than proptest's binary-search shrinker but suffices for
- * primitive values and small composite structures.
+ * RNG output is reproducible from a seed; on counterexample the seed is
+ * reported so failures are replayable.
  */
 
 import { from_i64, from_char_code, length as str_length, byte_substring, byte_length, contains as str_contains, join } from "std:str"
@@ -32,8 +26,7 @@ import { Option, Some, None } from "std:option"
 
 // ─── PRNG ────────────────────────────────────────────────────────────────────
 
-/// 64-bit linear congruential RNG state. The constants below are the
-/// MMIX/Knuth pair, well-known to give a full period over i64.
+/// 64-bit linear-congruential RNG state.
 export type Rng = Rng(state: i64)
 
 /// Numerically derive a fresh `Rng` from a user-supplied seed.
@@ -42,18 +35,8 @@ export let rng_of_seed = fn (seed: i64) -> Rng do
 end
 
 let lcg_step = fn (s: i64) -> i64 do
-  // (a * s + c) — wrapping i64 arithmetic; the modulus is the implicit i64 overflow.
+  // (a * s + c); MMIX/Knuth constants; modulus is implicit i64 overflow.
   return (s * 6364136223846793005) + 1442695040888963407
-end
-
-/// Advance the RNG and return a new state plus a 63-bit non-negative
-/// magnitude (the high bit is masked off so callers can treat the result
-/// as an unsigned magnitude without negative-overflow surprises).
-export let rng_next_i64 = fn (rng: Rng) -> { rng: Rng, val: i64 } do
-  let Rng(state) = rng
-  let next = lcg_step(s: state)
-  let masked = mask_high_bit(next)
-  return { rng: Rng(state: next), val: masked }
 end
 
 let mask_high_bit = fn (val: i64) -> i64 do
@@ -62,6 +45,16 @@ let mask_high_bit = fn (val: i64) -> i64 do
   else
     return val
   end
+end
+
+/// Advance the RNG and return a new state plus a 63-bit non-negative
+/// magnitude (high bit masked off so callers can treat the result as an
+/// unsigned magnitude without negative-overflow surprises).
+export let rng_next_i64 = fn (rng: Rng) -> { rng: Rng, val: i64 } do
+  let Rng(state: s) = rng
+  let next = lcg_step(s: s)
+  let masked = mask_high_bit(val: next)
+  return { rng: Rng(state: next), val: masked }
 end
 
 let modulo = fn (a: i64, m: i64) -> i64 do
@@ -77,124 +70,66 @@ let modulo = fn (a: i64, m: i64) -> i64 do
   end
 end
 
-// ─── Gen<T> shape ────────────────────────────────────────────────────────────
+// ─── i64 range ──────────────────────────────────────────────────────────────
 
-/// A generator: pure function from RNG state to a value, plus a shrink
-/// strategy. Both are first-class function values.
-export type Gen<T> = Gen(
-  produce: (rng: Rng) -> { rng: Rng, val: T },
-  shrink: (val: T) -> [ T ],
-)
-
-/// Run a generator once; returns the value and the advanced RNG.
-export let gen_run = fn <T>(g: Gen<T>, rng: Rng) -> { rng: Rng, val: T } do
-  let Gen(produce, _) = g
-  return produce(rng)
-end
-
-/// Inspect a generator's shrinker without running it.
-export let gen_shrinks = fn <T>(g: Gen<T>, val: T) -> [ T ] do
-  let Gen(_, shrink) = g
-  return shrink(val)
-end
-
-// ─── Primitive generators ───────────────────────────────────────────────────
-
-/// Always produce the same value; no shrinks.
-export let gen_const = fn <T>(val: T) -> Gen<T> do
-  let produce = fn (rng: Rng) -> { rng: Rng, val: T } do
-    return { rng: rng, val: val }
-  end
-  let shrink = fn (val: T) -> [ T ] do
-    return []
-  end
-  return Gen(produce, shrink)
-end
-
-/// Bernoulli-1/2 boolean. Shrinks `true` → `[false]`, `false` is minimal.
-export let gen_bool = fn () -> Gen<bool> do
-  let produce = fn (rng: Rng) -> { rng: Rng, val: bool } do
-    let step = rng_next_i64(rng)
-    let bit = modulo(a: step.val, m: 2)
-    return { rng: step.rng, val: bit == 1 }
-  end
-  let shrink = fn (val: bool) -> [ bool ] do
-    if val then
-      return [ false ]
-    else
-      return []
-    end
-  end
-  return Gen(produce, shrink)
-end
-
-/// Uniform i64 in `[min, max)`. Shrinks toward 0 if 0 is in range,
-/// otherwise toward the closer of min/max-1.
-export let gen_i64_range = fn (min: i64, max: i64) -> Gen<i64> throws { Exn } do
+/// Sample a uniform i64 in `[min, max)`.
+export let next_i64_range = fn (rng: Rng, min: i64, max: i64) -> { rng: Rng, val: i64 } throws { Exn } do
   if min >= max then
-    raise RuntimeError(val: "gen_i64_range: empty range")
+    raise RuntimeError(val: "next_i64_range: empty range")
   else
     let span = max - min
-    let produce = fn (rng: Rng) -> { rng: Rng, val: i64 } do
-      let step = rng_next_i64(rng)
-      let v = min + modulo(a: step.val, m: span)
-      return { rng: step.rng, val: v }
-    end
-    let shrink = fn (val: i64) -> [ i64 ] do
-      return shrink_i64(val, min, max)
-    end
-    return Gen(produce, shrink)
+    let step = rng_next_i64(rng: rng)
+    let v = min + modulo(a: step.val, m: span)
+    return { rng: step.rng, val: v }
   end
 end
 
-let shrink_i64 = fn (val: i64, min: i64, max: i64) -> [ i64 ] do
-  // Candidates: 0, val/2, val-1 (clamped into range).
-  let cands = []
-  let with_zero = if (min <= 0) && (max > 0) then
-    if val == 0 then
-      return cands
-    else
-      return 0 :: cands
-    end
+let push_if_i64 = fn (cond: bool, val: i64, xs: [ i64 ]) -> [ i64 ] do
+  if cond then
+    return val :: xs
   else
-    return cands
+    return xs
   end
+end
+
+/// Greedy shrink candidates for an i64 in `[min, max)`. Order: 0 first
+/// (when 0 is in range and val != 0), then val/2, then val±1.
+export let shrink_i64 = fn (val: i64, min: i64, max: i64) -> [ i64 ] do
+  let cands: [ i64 ] = []
+  let zero_in_range = (min <= 0) && (max > 0) && (val != 0)
+  let with_zero = push_if_i64(cond: zero_in_range, val: 0, xs: cands)
   let halved = val / 2
-  let with_half = if halved == val then
-    return with_zero
-  else
-    if (halved >= min) && (halved < max) then
-      return halved :: with_zero
-    else
-      return with_zero
+  let half_ok = (halved != val) && (halved >= min) && (halved < max)
+  let with_half = push_if_i64(cond: half_ok, val: halved, xs: with_zero)
+  let near_zero =
+    if val > 0 then val - 1
+    else if val < 0 then val + 1
+    else val
     end
-  end
-  let near_zero = if val > 0 then
-    return val - 1
-  else
-    if val < 0 then
-      return val + 1
-    else
-      return val
-    end
-  end
-  let with_step = if (near_zero >= min) && (near_zero < max) && (near_zero != val) then
-    return near_zero :: with_half
-  else
-    return with_half
-  end
+  let step_ok = (near_zero != val) && (near_zero >= min) && (near_zero < max)
+  let with_step = push_if_i64(cond: step_ok, val: near_zero, xs: with_half)
   return reverse(xs: with_step)
 end
 
-// ─── String generators ──────────────────────────────────────────────────────
+// ─── bool ────────────────────────────────────────────────────────────────────
 
-let alnum_table = fn () -> [ i64 ] do
-  // 0..9, A..Z, a..z encoded as ASCII codepoints.
-  let digits = build_codes(start: 48, count: 10, acc: [])
-  let upper = build_codes(start: 65, count: 26, acc: digits)
-  let lower = build_codes(start: 97, count: 26, acc: upper)
-  return reverse(xs: lower)
+/// Bernoulli-1/2 boolean.
+export let next_bool = fn (rng: Rng) -> { rng: Rng, val: bool } do
+  let step = rng_next_i64(rng: rng)
+  let bit = modulo(a: step.val, m: 2)
+  return { rng: step.rng, val: bit == 1 }
 end
+
+/// Shrinks `true` → `[false]`, `false` is minimal.
+export let shrink_bool = fn (val: bool) -> [ bool ] do
+  if val then
+    return [ false ]
+  else
+    return []
+  end
+end
+
+// ─── alphanumeric strings ───────────────────────────────────────────────────
 
 let build_codes = fn (start: i64, count: i64, acc: [ i64 ]) -> [ i64 ] do
   if count == 0 then
@@ -204,16 +139,12 @@ let build_codes = fn (start: i64, count: i64, acc: [ i64 ]) -> [ i64 ] do
   end
 end
 
-let pick_alnum = fn (rng: Rng, table: [ i64 ]) -> { rng: Rng, code: i64 } throws { Exn } do
-  let len = list_length(xs: table)
-  if len == 0 then
-    raise RuntimeError(val: "pick_alnum: empty alphabet")
-  else
-    let step = rng_next_i64(rng)
-    let idx = modulo(a: step.val, m: len)
-    let code = nth_i64(xs: table, n: idx)
-    return { rng: step.rng, code }
-  end
+let alnum_table = fn () -> [ i64 ] do
+  // 0..9, A..Z, a..z encoded as ASCII codepoints.
+  let digits = build_codes(start: 48, count: 10, acc: [])
+  let upper = build_codes(start: 65, count: 26, acc: digits)
+  let lower = build_codes(start: 97, count: 26, acc: upper)
+  return reverse(xs: lower)
 end
 
 let nth_i64 = fn (xs: [ i64 ], n: i64) -> i64 throws { Exn } do
@@ -228,230 +159,269 @@ let nth_i64 = fn (xs: [ i64 ], n: i64) -> i64 throws { Exn } do
   end
 end
 
+let pick_alnum = fn (rng: Rng, table: [ i64 ]) -> { rng: Rng, code: i64 } throws { Exn } do
+  let len = list_length(xs: table)
+  if len == 0 then
+    raise RuntimeError(val: "pick_alnum: empty alphabet")
+  else
+    let step = rng_next_i64(rng: rng)
+    let idx = modulo(a: step.val, m: len)
+    let code = nth_i64(xs: table, n: idx)
+    return { rng: step.rng, code: code }
+  end
+end
+
 let build_alnum = fn (rng: Rng, len: i64, table: [ i64 ], acc: string) -> { rng: Rng, val: string } throws { Exn } do
   if len <= 0 then
     return { rng: rng, val: acc }
   else
-    let pick = pick_alnum(rng, table)
+    let pick = pick_alnum(rng: rng, table: table)
     let ch = from_char_code(code: pick.code)
-    return build_alnum(rng: pick.rng, len: len - 1, table, acc: acc ++ ch)
+    return build_alnum(rng: pick.rng, len: len - 1, table: table, acc: acc ++ ch)
   end
 end
 
-/// Generate alphanumeric strings of length in `[min_len, max_len]`.
+/// Sample an alphanumeric string of length in `[min_len, max_len]`.
 /// Mirrors proptest's `"[a-zA-Z0-9]{N,M}"` regex.
-export let gen_alphanumeric_string = fn (min_len: i64, max_len: i64) -> Gen<string> throws { Exn } do
+export let next_alphanumeric_string = fn (rng: Rng, min_len: i64, max_len: i64) -> { rng: Rng, val: string } throws { Exn } do
   if (min_len < 0) || (max_len < min_len) then
-    raise RuntimeError(val: "gen_alphanumeric_string: invalid length range")
+    raise RuntimeError(val: "next_alphanumeric_string: invalid length range")
   else
     let table = alnum_table()
     let len_span = (max_len - min_len) + 1
-    let produce = fn (rng: Rng) -> { rng: Rng, val: string } do
-      let lstep = rng_next_i64(rng)
-      let len = min_len + modulo(a: lstep.val, m: len_span)
-      return build_alnum(rng: lstep.rng, len, table, acc: "")
-    end
-    let shrink = fn (val: string) -> [ string ] do
-      return shrink_string(val, min_len)
-    end
-    return Gen(produce, shrink)
+    let lstep = rng_next_i64(rng: rng)
+    let len = min_len + modulo(a: lstep.val, m: len_span)
+    return build_alnum(rng: lstep.rng, len: len, table: table, acc: "")
   end
 end
 
-let shrink_string = fn (val: string, min_len: i64) -> [ string ] do
+let str_prefix = fn (s: string, n: i64) -> string do
+  if n <= 0 then
+    return ""
+  else
+    // Alphanumeric chars are 1 byte each in UTF-8, so byte_substring is a
+    // faithful character-prefix when the input came from
+    // `next_alphanumeric_string`.
+    let blen = byte_length(s: s)
+    if n >= blen then
+      return s
+    else
+      return byte_substring(s: s, start: 0, len: n)
+    end
+  end
+end
+
+let push_if_string = fn (cond: bool, val: string, xs: [ string ]) -> [ string ] do
+  if cond then
+    return val :: xs
+  else
+    return xs
+  end
+end
+
+/// Greedy shrink candidates for a string. Order: prefix to min_len,
+/// prefix to half, prefix to len-1.
+export let shrink_string = fn (val: string, min_len: i64) -> [ string ] do
   let cur = str_length(s: val)
   if cur <= min_len then
     return []
   else
     let half = cur / 2
-    let cands = []
-    let with_min = if min_len < cur then
-      return prefix(s: val, n: min_len) :: cands
-    else
-      return cands
-    end
-    let with_half = if (half > min_len) && (half < cur) then
-      return prefix(s: val, n: half) :: with_min
-    else
-      return with_min
-    end
-    let with_minus_one = if (cur - 1) >= min_len then
-      return prefix(s: val, n: cur - 1) :: with_half
-    else
-      return with_half
-    end
+    let cands: [ string ] = []
+    let min_ok = min_len < cur
+    let with_min = push_if_string(cond: min_ok, val: str_prefix(s: val, n: min_len), xs: cands)
+    let half_ok = (half > min_len) && (half < cur)
+    let with_half = push_if_string(cond: half_ok, val: str_prefix(s: val, n: half), xs: with_min)
+    let mone_ok = (cur - 1) >= min_len
+    let with_minus_one = push_if_string(cond: mone_ok, val: str_prefix(s: val, n: cur - 1), xs: with_half)
     return reverse(xs: with_minus_one)
   end
 end
 
-let prefix = fn (s: string, n: i64) -> string do
-  if n <= 0 then
-    return ""
-  else
-    // Alphanumeric chars are 1 byte each in UTF-8, so byte_substring is
-    // a faithful character-prefix when the input came from
-    // `gen_alphanumeric_string`.
-    let blen = byte_length(s)
-    if n >= blen then
-      return s
-    else
-      return byte_substring(s, start: 0, len: n)
-    end
-  end
-end
+// ─── i64 lists ───────────────────────────────────────────────────────────────
 
-// ─── Combinators ─────────────────────────────────────────────────────────────
-
-/// Map a generator: derives the produced value through `f`. The shrink
-/// strategy is the original generator's shrinker composed with `f`, so
-/// shrinks remain meaningful for the new type.
-export let gen_map = fn <T, U>(g: Gen<T>, f: (val: T) -> U) -> Gen<U> do
-  let Gen(produce, shrink) = g
-  let new_produce = fn (rng: Rng) -> { rng: Rng, val: U } do
-    let step = produce(rng)
-    return { rng: step.rng, val: f(val: step.val) }
-  end
-  let new_shrink = fn (val: U) -> [ U ] do
-    // Without an inverse for f we can't shrink — proptest has the same
-    // limitation in its `prop_map` combinator (callers use `prop_filter_map`
-    // or supply a custom shrinker for non-trivial maps).
-    return []
-  end
-  return Gen(produce: new_produce, shrink: new_shrink)
-end
-
-/// Pair two generators. Shrinks one component at a time.
-export let gen_tuple2 = fn <A, B>(ga: Gen<A>, gb: Gen<B>) -> Gen<{ a: A, b: B }> do
-  let Gen(produce: pa, shrink: sha) = ga
-  let Gen(produce: pb, shrink: shb) = gb
-  let produce = fn (rng: Rng) -> { rng: Rng, val: { a: A, b: B } } do
-    let astep = pa(rng)
-    let bstep = pb(rng: astep.rng)
-    return { rng: bstep.rng, val: { a: astep.val, b: bstep.val } }
-  end
-  let shrink = fn (val: { a: A, b: B }) -> [ { a: A, b: B } ] do
-    let { a: a, b: b } = val
-    let a_shrinks = sha(val: a)
-    let b_shrinks = shb(val: b)
-    let from_a = map(xs: a_shrinks, f: fn (a2: A) -> { a: A, b: B } do
-      return { a: a2, b: b }
-    end)
-    let from_b = map(xs: b_shrinks, f: fn (b2: B) -> { a: A, b: B } do
-      return { a: a, b: b2 }
-    end)
-    return concat_pairs(xs: from_a, ys: from_b)
-  end
-  return Gen(produce, shrink)
-end
-
-let concat_pairs = fn <T>(xs: [ T ], ys: [ T ]) -> [ T ] do
-  match xs do
-    | [] -> return ys
-    | v :: rest -> return v :: concat_pairs(xs: rest, ys)
-  end
-end
-
-/// Generate a list of length in `[min_len, max_len]` from the inner gen.
-export let gen_list = fn <T>(inner: Gen<T>, min_len: i64, max_len: i64) -> Gen<[ T ]> throws { Exn } do
-  if (min_len < 0) || (max_len < min_len) then
-    raise RuntimeError(val: "gen_list: invalid length range")
-  else
-    let len_span = (max_len - min_len) + 1
-    let produce = fn (rng: Rng) -> { rng: Rng, val: [ T ] } do
-      let lstep = rng_next_i64(rng)
-      let len = min_len + modulo(a: lstep.val, m: len_span)
-      return build_list(inner, rng: lstep.rng, len, acc: [])
-    end
-    let shrink = fn (val: [ T ]) -> [ [ T ] ] do
-      return shrink_list(val, min_len)
-    end
-    return Gen(produce, shrink)
-  end
-end
-
-let build_list = fn <T>(inner: Gen<T>, rng: Rng, len: i64, acc: [ T ]) -> { rng: Rng, val: [ T ] } do
+let build_i64_list = fn (rng: Rng, len: i64, min: i64, max: i64, acc: [ i64 ]) -> { rng: Rng, val: [ i64 ] } throws { Exn } do
   if len <= 0 then
     return { rng: rng, val: reverse(xs: acc) }
   else
-    let Gen(produce, _) = inner
-    let step = produce(rng)
-    return build_list(inner, rng: step.rng, len: len - 1, acc: step.val :: acc)
+    let step = next_i64_range(rng: rng, min: min, max: max)
+    return build_i64_list(rng: step.rng, len: len - 1, min: min, max: max, acc: step.val :: acc)
   end
 end
 
-let shrink_list = fn <T>(val: [ T ], min_len: i64) -> [ [ T ] ] do
+/// Sample a list of i64 of length in `[min_len, max_len]` whose elements
+/// fall within `[elem_min, elem_max)`.
+export let next_i64_list = fn (rng: Rng, min_len: i64, max_len: i64, elem_min: i64, elem_max: i64) -> { rng: Rng, val: [ i64 ] } throws { Exn } do
+  if (min_len < 0) || (max_len < min_len) then
+    raise RuntimeError(val: "next_i64_list: invalid length range")
+  else
+    let len_span = (max_len - min_len) + 1
+    let lstep = rng_next_i64(rng: rng)
+    let len = min_len + modulo(a: lstep.val, m: len_span)
+    return build_i64_list(rng: lstep.rng, len: len, min: elem_min, max: elem_max, acc: [])
+  end
+end
+
+let push_if_i64_list = fn (cond: bool, val: [ i64 ], xs: [ [ i64 ] ]) -> [ [ i64 ] ] do
+  if cond then
+    return val :: xs
+  else
+    return xs
+  end
+end
+
+/// Greedy shrink candidates for an i64 list (length-only).
+export let shrink_i64_list = fn (val: [ i64 ], min_len: i64) -> [ [ i64 ] ] do
   let cur = list_length(xs: val)
   if cur <= min_len then
     return []
   else
     let half = cur / 2
-    let cands = []
-    let with_min = if min_len < cur then
-      return take(xs: val, n: min_len) :: cands
-    else
-      return cands
-    end
-    let with_half = if (half > min_len) && (half < cur) then
-      return take(xs: val, n: half) :: with_min
-    else
-      return with_min
-    end
-    let with_minus_one = if (cur - 1) >= min_len then
-      return take(xs: val, n: cur - 1) :: with_half
-    else
-      return with_half
-    end
+    let cands: [ [ i64 ] ] = []
+    let min_ok = min_len < cur
+    let with_min = push_if_i64_list(cond: min_ok, val: take(xs: val, n: min_len), xs: cands)
+    let half_ok = (half > min_len) && (half < cur)
+    let with_half = push_if_i64_list(cond: half_ok, val: take(xs: val, n: half), xs: with_min)
+    let mone_ok = (cur - 1) >= min_len
+    let with_minus_one = push_if_i64_list(cond: mone_ok, val: take(xs: val, n: cur - 1), xs: with_half)
     return reverse(xs: with_minus_one)
   end
 end
 
-// ─── Test runner ─────────────────────────────────────────────────────────────
+// ─── Test runner: i64 properties ────────────────────────────────────────────
 
-/// Result of a single-property run.
+/// Result of a property run.
 export type PropertyOutcome<T> =
     PropertyHolds
   | Counterexample(value: T, after_shrink: T, cases_run: i64)
 
-/// Run `prop` against `cases` random inputs; on first failure, attempt
-/// shrinking and return a `Counterexample`. The user-supplied predicate
-/// returns `true` on success — same orientation as proptest's
-/// `prop_assert!` (truthy = pass).
-export let for_all = fn <T>(name: string, gen: Gen<T>, cases: i64, seed: i64, prop: (val: T) -> bool) -> PropertyOutcome<T> do
-  let rng = rng_of_seed(seed)
-  return run_loop(gen, cases, idx: 0, rng, prop)
+let pick_failing_i64 = fn (candidates: [ i64 ], prop: (val: i64) -> bool) -> Option<i64> do
+  match candidates do
+    | [] -> return None
+    | v :: rest ->
+      if prop(val: v) then
+        return pick_failing_i64(candidates: rest, prop: prop)
+      else
+        return Some(val: v)
+      end
+  end
 end
 
-let run_loop = fn <T>(gen: Gen<T>, cases: i64, idx: i64, rng: Rng, prop: (val: T) -> bool) -> PropertyOutcome<T> do
+let shrink_loop_i64 = fn (original: i64, min: i64, max: i64, prop: (val: i64) -> bool) -> i64 do
+  let candidates = shrink_i64(val: original, min: min, max: max)
+  let next = pick_failing_i64(candidates: candidates, prop: prop)
+  match next do
+    | None -> return original
+    | Some(val: smaller) -> return shrink_loop_i64(original: smaller, min: min, max: max, prop: prop)
+  end
+end
+
+let run_loop_i64 = fn (rng: Rng, cases: i64, idx: i64, min: i64, max: i64, prop: (val: i64) -> bool) -> PropertyOutcome<i64> throws { Exn } do
   if idx >= cases then
     return PropertyHolds
   else
-    let step = gen_run(gen, rng)
+    let step = next_i64_range(rng: rng, min: min, max: max)
     if prop(val: step.val) then
-      return run_loop(gen, cases, idx: idx + 1, rng: step.rng, prop)
+      return run_loop_i64(rng: step.rng, cases: cases, idx: idx + 1, min: min, max: max, prop: prop)
     else
-      let shrunk = shrink_loop(gen, original: step.val, prop)
+      let shrunk = shrink_loop_i64(original: step.val, min: min, max: max, prop: prop)
       return Counterexample(value: step.val, after_shrink: shrunk, cases_run: idx + 1)
     end
   end
 end
 
-let shrink_loop = fn <T>(gen: Gen<T>, original: T, prop: (val: T) -> bool) -> T do
-  let candidates = gen_shrinks(gen, val: original)
-  let next = pick_failing(candidates, prop)
-  match next do
-    | None -> return original
-    | Some(val: smaller) -> return shrink_loop(gen, original: smaller, prop)
-  end
+/// Sample `cases` i64 values from `[min, max)` and check `prop`.
+/// `prop` returns `true` on success (proptest orientation). On the first
+/// failure the value is shrunk via `shrink_i64`.
+export let for_all_i64 = fn (name: string, min: i64, max: i64, cases: i64, seed: i64, prop: (val: i64) -> bool) -> PropertyOutcome<i64> throws { Exn } do
+  let rng = rng_of_seed(seed: seed)
+  return run_loop_i64(rng: rng, cases: cases, idx: 0, min: min, max: max, prop: prop)
 end
 
-let pick_failing = fn <T>(candidates: [ T ], prop: (val: T) -> bool) -> Option<T> do
+// ─── Test runner: string properties ─────────────────────────────────────────
+
+let pick_failing_string = fn (candidates: [ string ], prop: (val: string) -> bool) -> Option<string> do
   match candidates do
     | [] -> return None
     | v :: rest ->
       if prop(val: v) then
-        return pick_failing(candidates: rest, prop)
+        return pick_failing_string(candidates: rest, prop: prop)
       else
         return Some(val: v)
       end
   end
+end
+
+let shrink_loop_string = fn (original: string, min_len: i64, prop: (val: string) -> bool) -> string do
+  let candidates = shrink_string(val: original, min_len: min_len)
+  let next = pick_failing_string(candidates: candidates, prop: prop)
+  match next do
+    | None -> return original
+    | Some(val: smaller) -> return shrink_loop_string(original: smaller, min_len: min_len, prop: prop)
+  end
+end
+
+let run_loop_string = fn (rng: Rng, cases: i64, idx: i64, min_len: i64, max_len: i64, prop: (val: string) -> bool) -> PropertyOutcome<string> throws { Exn } do
+  if idx >= cases then
+    return PropertyHolds
+  else
+    let step = next_alphanumeric_string(rng: rng, min_len: min_len, max_len: max_len)
+    if prop(val: step.val) then
+      return run_loop_string(rng: step.rng, cases: cases, idx: idx + 1, min_len: min_len, max_len: max_len, prop: prop)
+    else
+      let shrunk = shrink_loop_string(original: step.val, min_len: min_len, prop: prop)
+      return Counterexample(value: step.val, after_shrink: shrunk, cases_run: idx + 1)
+    end
+  end
+end
+
+/// Sample `cases` alphanumeric strings of length in `[min_len, max_len]`
+/// and check `prop`.
+export let for_all_string = fn (name: string, min_len: i64, max_len: i64, cases: i64, seed: i64, prop: (val: string) -> bool) -> PropertyOutcome<string> throws { Exn } do
+  let rng = rng_of_seed(seed: seed)
+  return run_loop_string(rng: rng, cases: cases, idx: 0, min_len: min_len, max_len: max_len, prop: prop)
+end
+
+// ─── Test runner: i64-list properties ───────────────────────────────────────
+
+let pick_failing_i64_list = fn (candidates: [ [ i64 ] ], prop: (val: [ i64 ]) -> bool) -> Option<[ i64 ]> do
+  match candidates do
+    | [] -> return None
+    | v :: rest ->
+      if prop(val: v) then
+        return pick_failing_i64_list(candidates: rest, prop: prop)
+      else
+        return Some(val: v)
+      end
+  end
+end
+
+let shrink_loop_i64_list = fn (original: [ i64 ], min_len: i64, prop: (val: [ i64 ]) -> bool) -> [ i64 ] do
+  let candidates = shrink_i64_list(val: original, min_len: min_len)
+  let next = pick_failing_i64_list(candidates: candidates, prop: prop)
+  match next do
+    | None -> return original
+    | Some(val: smaller) -> return shrink_loop_i64_list(original: smaller, min_len: min_len, prop: prop)
+  end
+end
+
+let run_loop_i64_list = fn (rng: Rng, cases: i64, idx: i64, min_len: i64, max_len: i64, elem_min: i64, elem_max: i64, prop: (val: [ i64 ]) -> bool) -> PropertyOutcome<[ i64 ]> throws { Exn } do
+  if idx >= cases then
+    return PropertyHolds
+  else
+    let step = next_i64_list(rng: rng, min_len: min_len, max_len: max_len, elem_min: elem_min, elem_max: elem_max)
+    if prop(val: step.val) then
+      return run_loop_i64_list(rng: step.rng, cases: cases, idx: idx + 1, min_len: min_len, max_len: max_len, elem_min: elem_min, elem_max: elem_max, prop: prop)
+    else
+      let shrunk = shrink_loop_i64_list(original: step.val, min_len: min_len, prop: prop)
+      return Counterexample(value: step.val, after_shrink: shrunk, cases_run: idx + 1)
+    end
+  end
+end
+
+/// Sample `cases` i64 lists of length in `[min_len, max_len]` whose
+/// elements fall within `[elem_min, elem_max)` and check `prop`.
+export let for_all_i64_list = fn (name: string, min_len: i64, max_len: i64, elem_min: i64, elem_max: i64, cases: i64, seed: i64, prop: (val: [ i64 ]) -> bool) -> PropertyOutcome<[ i64 ]> throws { Exn } do
+  let rng = rng_of_seed(seed: seed)
+  return run_loop_i64_list(rng: rng, cases: cases, idx: 0, min_len: min_len, max_len: max_len, elem_min: elem_min, elem_max: elem_max, prop: prop)
 end
