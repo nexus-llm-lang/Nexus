@@ -1,8 +1,11 @@
-use crate::harness::compile::{compile_fixture_via_nxc, compile_fixture_via_nxc_should_fail};
+use crate::harness::compile::{
+    compile_fixture_via_nxc, compile_fixture_via_nxc_should_fail,
+};
 use crate::harness::{
     exec, exec_nxc_core, exec_nxc_core_capture_stderr_expecting_exit,
     exec_nxc_core_capture_stdout, exec_should_trap, exec_threaded,
     exec_with_stdlib, exec_with_stdlib_core, exec_with_stdlib_core_should_trap, read_fixture,
+    should_fail_typecheck,
 };
 
 #[test]
@@ -848,4 +851,36 @@ fn collection_nx_parity_acceptance() {
             i, want, lines[i], out
         );
     }
+}
+
+/// Regression test for nexus-fnzs: `op_block`, `op_call`, etc. in
+/// `src/backend/wasm/defs.nx` are zero-arg functions returning a fresh
+/// `Opcode` value built from the opaque type's private constructor. From
+/// any consumer module the `Opcode` type is abstract, so binary `+`
+/// applied to two `Opcode` values cannot unify with `TyI64` and the
+/// typechecker rejects the program. The fixture imports `op_block` /
+/// `op_call` and writes `op_block() + op_call()`; this test runs it
+/// through `should_fail_typecheck` and asserts the rejection so a future
+/// regression (e.g. dropping the `opaque` keyword, re-exposing the
+/// integer representation, or adding an `Opcode + Opcode` overload)
+/// breaks loudly.
+///
+/// `try_compile` is *not* used here because the bootstrap's
+/// `compile_program_to_wasm` skips the standalone typechecker entirely
+/// (the codegen path performs its own simpler arrow-unification, which
+/// happens to accept the bad source). Running the dedicated
+/// `TypeChecker::check_program` is what surfaces the opaque-arithmetic
+/// rejection, mirroring the production `nexus build` driver pipeline.
+#[test]
+fn opcode_arithmetic_rejected_by_typecheck() {
+    // `should_fail_typecheck` calls `ensure_repo_root` which chdirs to the
+    // workspace root, so the fixture path is rooted there (other tests in
+    // this file follow the same `bootstrap/tests/fixtures/...` convention).
+    let src = read_fixture("nxc/test_opcode_arithmetic_rejected.nx");
+    let err = should_fail_typecheck(&src);
+    assert!(
+        err.contains("Opcode") || err.contains("Integer op"),
+        "expected an opcode-arithmetic typecheck error mentioning `Opcode` \
+         or the integer-op rejection, got: {err}"
+    );
 }
