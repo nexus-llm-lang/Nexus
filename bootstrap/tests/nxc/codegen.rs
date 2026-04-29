@@ -762,6 +762,121 @@ fn simd_autovectorize_acceptance() {
     }
 }
 
+/// nexus-iesh: extended lane-op coverage for the autovectorized SIMD
+/// array intrinsics (`mul`/`sub` for all four lane shapes plus `div` for
+/// the two float shapes). Same two-pronged check as the autovectorize
+/// MVP test:
+///   1. Bytecode scan: each new sub-opcode (i32x4.sub = 0xB1, i64x2.sub
+///      = 0xD1, f32x4.sub/div = 0xE5/0xE7, f64x2.sub/div = 0xF1/0xF3)
+///      must appear at least once in the compiled wasm. Catches a
+///      regression where dispatch silently falls back to a function
+///      call — the runtime check would still pass for the `f*` ops
+///      (determinism gate) but no 0xFD-prefixed instruction would be
+///      emitted.
+///   2. Runtime: each printed line is a 64-byte agreement count between
+///      the SIMD path and either a scalar reference (i32/i64) or a
+///      second SIMD pass on the same input (f32/f64 — no scalar f-arith
+///      reference at this layer). 64 means perfect byte-for-byte match.
+///
+/// Per-lane integer division does not exist in the WebAssembly SIMD
+/// proposal, so `i32x4_div_array` / `i64x2_div_array` are intentionally
+/// absent from both the stdlib surface and this test.
+#[test]
+fn simd_lane_op_coverage_acceptance() {
+    let fixture = "bootstrap/tests/fixtures/nxc/test_simd_lane_op_coverage.nx";
+
+    // Bytecode-side: each new sub-opcode must be present in the compiled
+    // module. Existing mul opcodes (0xB5, 0xD5, 0xE6, 0xF2) are also
+    // re-checked here because the new `_mul_array` autovectorize variants
+    // are the first call sites for f64x2.mul / i64x2.mul outside of the
+    // single-quad MVP path.
+    let wasm = compile_fixture_via_nxc(fixture);
+
+    // (i32x4.mul = sub 0xB5) — used by i32x4_mul_array.
+    let n_i32x4_mul = count_simd_op_uses(&wasm, 0xB5);
+    assert!(
+        n_i32x4_mul >= 1,
+        "expected >= 1 i32x4.mul (0xB5) use, found {n_i32x4_mul}"
+    );
+    // (i64x2.mul = sub 0xD5) — used by i64x2_mul_array.
+    let n_i64x2_mul = count_simd_op_uses(&wasm, 0xD5);
+    assert!(
+        n_i64x2_mul >= 1,
+        "expected >= 1 i64x2.mul (0xD5) use, found {n_i64x2_mul}"
+    );
+    // (f32x4.mul = sub 0xE6) — used by f32x4_mul_array.
+    let n_f32x4_mul = count_simd_op_uses(&wasm, 0xE6);
+    assert!(
+        n_f32x4_mul >= 1,
+        "expected >= 1 f32x4.mul (0xE6) use, found {n_f32x4_mul}"
+    );
+    // (f64x2.mul = sub 0xF2) — used by f64x2_mul_array.
+    let n_f64x2_mul = count_simd_op_uses(&wasm, 0xF2);
+    assert!(
+        n_f64x2_mul >= 1,
+        "expected >= 1 f64x2.mul (0xF2) use, found {n_f64x2_mul}"
+    );
+    // (i32x4.sub = sub 0xB1) — new in iesh.
+    let n_i32x4_sub = count_simd_op_uses(&wasm, 0xB1);
+    assert!(
+        n_i32x4_sub >= 1,
+        "expected >= 1 i32x4.sub (0xB1) use, found {n_i32x4_sub} \
+         — dispatch may have fallen back to a function call"
+    );
+    // (i64x2.sub = sub 0xD1) — new in iesh.
+    let n_i64x2_sub = count_simd_op_uses(&wasm, 0xD1);
+    assert!(
+        n_i64x2_sub >= 1,
+        "expected >= 1 i64x2.sub (0xD1) use, found {n_i64x2_sub}"
+    );
+    // (f32x4.sub = sub 0xE5) — new in iesh.
+    let n_f32x4_sub = count_simd_op_uses(&wasm, 0xE5);
+    assert!(
+        n_f32x4_sub >= 1,
+        "expected >= 1 f32x4.sub (0xE5) use, found {n_f32x4_sub}"
+    );
+    // (f32x4.div = sub 0xE7) — new in iesh.
+    let n_f32x4_div = count_simd_op_uses(&wasm, 0xE7);
+    assert!(
+        n_f32x4_div >= 1,
+        "expected >= 1 f32x4.div (0xE7) use, found {n_f32x4_div}"
+    );
+    // (f64x2.sub = sub 0xF1) — new in iesh.
+    let n_f64x2_sub = count_simd_op_uses(&wasm, 0xF1);
+    assert!(
+        n_f64x2_sub >= 1,
+        "expected >= 1 f64x2.sub (0xF1) use, found {n_f64x2_sub}"
+    );
+    // (f64x2.div = sub 0xF3) — new in iesh.
+    let n_f64x2_div = count_simd_op_uses(&wasm, 0xF3);
+    assert!(
+        n_f64x2_div >= 1,
+        "expected >= 1 f64x2.div (0xF3) use, found {n_f64x2_div}"
+    );
+
+    // Runtime: 10 lines, each an agreement count of 64 bytes — one per
+    // array intrinsic exercised in the fixture. Order matches the fixture
+    // (i32 mul, i32 sub, i64 mul, i64 sub, f32 mul/sub/div, f64 mul/sub/div).
+    let out = exec_nxc_core_capture_stdout(fixture);
+    let lines: Vec<&str> = out.lines().map(str::trim).collect();
+    let expected = ["64"; 10];
+    assert_eq!(
+        lines.len(),
+        expected.len(),
+        "expected {} lines, got {} — full stdout:\n{}",
+        expected.len(),
+        lines.len(),
+        out
+    );
+    for (i, want) in expected.iter().enumerate() {
+        assert_eq!(
+            lines[i], *want,
+            "line {i} mismatch: want {want:?}, got {:?} — full stdout:\n{out}",
+            lines[i]
+        );
+    }
+}
+
 /// Regression for nexus-pt8g: arity-N (N >= 1) top-level fn references
 /// stored as record fields (handler-vtable shape) used to trip
 /// `lookup_closure_type_idx_pairs` with E3001 because

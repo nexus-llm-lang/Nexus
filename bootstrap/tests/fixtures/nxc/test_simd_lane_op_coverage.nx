@@ -1,0 +1,243 @@
+/**
+ * test_simd_lane_op_coverage: covers nexus-iesh — extended lane-op coverage
+ * for the autovectorized array intrinsics.
+ *
+ * Scope (10 array intrinsics): mul/sub for all four lane shapes
+ * (`f32x4`, `f64x2`, `i32x4`, `i64x2`), plus `div` for the two float shapes.
+ * Per-lane integer division does not exist in WebAssembly SIMD, so
+ * `i32x4_div_array` / `i64x2_div_array` are intentionally absent.
+ *
+ * Strategy mirrors `test_simd_autovectorize.nx`:
+ *   - Reserve a fresh wasm page for scratch so SIMD load/store cannot collide
+ *     with compiler globals or arena allocations.
+ *   - For each integer op, run the SIMD-array intrinsic and a hand-written
+ *     scalar reference loop on the same input region into disjoint output
+ *     regions, then byte-compare the two outputs. A 64-byte agreement count
+ *     means every i32 / i64 element matched exactly.
+ *   - For each float op, run the SIMD-array intrinsic twice on identical
+ *     inputs (into disjoint output regions) and assert the two outputs are
+ *     bitwise identical (determinism gate — no scalar f32 reference exists
+ *     at this layer).
+ *
+ * Bytecode-side acceptance (the "0xFD-prefixed instruction emitted" check)
+ * lives in the Rust harness (`bootstrap/tests/nxc/codegen.rs`); it scans the
+ * compiled wasm bytes for each of the new lane-op sub-opcodes
+ * (i32x4.sub = 0xB1, i64x2.sub = 0xD1, f32x4.sub = 0xE5, f32x4.div = 0xE7,
+ * f64x2.sub = 0xF1, f64x2.div = 0xF3, plus the existing mul opcodes).
+ */
+
+import { Console }, * as stdio from "std:stdio"
+import * as mem from "std:runtime_mem"
+import * as simd from "std:simd"
+import { from_i64 } from "std:str"
+
+// Compare two memory regions byte-for-byte; return the number of equal bytes.
+let cmp_bytes = fn (a: i64, b: i64, n: i64) -> i64 do
+  return cmp_bytes_go(a, b, n, idx: 0, eq: 0)
+end
+
+let cmp_bytes_go = fn (a: i64, b: i64, n: i64, idx: i64, eq: i64) -> i64 do
+  if idx >= n then return eq end
+  let av = mem.load_u8(addr: a + idx)
+  let bv = mem.load_u8(addr: b + idx)
+  let inc = if av == bv then 1 else 0 end
+  return cmp_bytes_go(a, b, n, idx: idx + 1, eq: eq + inc)
+end
+
+// Initialise an i32 array of length n with values 1..=n. Use 1-based values
+// so that the sub reference (a - b) and div reference (a / b) never produce
+// a zero divisor or trivial subtraction artefacts that mask drift.
+let init_i32_seq = fn (base: i64, n: i64) -> unit do
+  return init_i32_seq_go(base, n, idx: 0)
+end
+
+let init_i32_seq_go = fn (base: i64, n: i64, idx: i64) -> unit do
+  if idx >= n then return () end
+  let _ = mem.store_i32(addr: base + idx * 4, val: idx + 1)
+  return init_i32_seq_go(base, n, idx: idx + 1)
+end
+
+// Same shape, but write i64 elements stride-8 — used by i64x2 inputs.
+let init_i64_seq = fn (base: i64, n: i64) -> unit do
+  return init_i64_seq_go(base, n, idx: 0)
+end
+
+let init_i64_seq_go = fn (base: i64, n: i64, idx: i64) -> unit do
+  if idx >= n then return () end
+  let _ = mem.store_i64(addr: base + idx * 8, val: idx + 1)
+  return init_i64_seq_go(base, n, idx: idx + 1)
+end
+
+// Zero an n-byte region (n must be a multiple of 8).
+let zero_region = fn (base: i64, n: i64) -> unit do
+  return zero_region_go(base, n, idx: 0)
+end
+
+let zero_region_go = fn (base: i64, n: i64, idx: i64) -> unit do
+  if idx >= n then return () end
+  let _ = mem.store_i64(addr: base + idx, val: 0)
+  return zero_region_go(base, n, idx: idx + 8)
+end
+
+// Scalar reference: dst[i] = a[i] - b[i] for `count` i32 elements.
+let scalar_i32_sub = fn (a: i64, b: i64, d: i64, count: i64) -> unit do
+  if count <= 0 then return () end
+  let av = mem.load_i32(addr: a)
+  let bv = mem.load_i32(addr: b)
+  let _ = mem.store_i32(addr: d, val: av - bv)
+  return scalar_i32_sub(a: a + 4, b: b + 4, d: d + 4, count: count - 1)
+end
+
+// Scalar reference: dst[i] = a[i] * b[i] for `count` i32 elements.
+let scalar_i32_mul = fn (a: i64, b: i64, d: i64, count: i64) -> unit do
+  if count <= 0 then return () end
+  let av = mem.load_i32(addr: a)
+  let bv = mem.load_i32(addr: b)
+  let _ = mem.store_i32(addr: d, val: av * bv)
+  return scalar_i32_mul(a: a + 4, b: b + 4, d: d + 4, count: count - 1)
+end
+
+// Scalar reference: dst[i] = a[i] - b[i] for `count` i64 elements.
+let scalar_i64_sub = fn (a: i64, b: i64, d: i64, count: i64) -> unit do
+  if count <= 0 then return () end
+  let av = mem.load_i64(addr: a)
+  let bv = mem.load_i64(addr: b)
+  let _ = mem.store_i64(addr: d, val: av - bv)
+  return scalar_i64_sub(a: a + 8, b: b + 8, d: d + 8, count: count - 1)
+end
+
+// Scalar reference: dst[i] = a[i] * b[i] for `count` i64 elements.
+let scalar_i64_mul = fn (a: i64, b: i64, d: i64, count: i64) -> unit do
+  if count <= 0 then return () end
+  let av = mem.load_i64(addr: a)
+  let bv = mem.load_i64(addr: b)
+  let _ = mem.store_i64(addr: d, val: av * bv)
+  return scalar_i64_mul(a: a + 8, b: b + 8, d: d + 8, count: count - 1)
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    // Reserve a fresh page for scratch — base = (prev pages) * 65536.
+    let prev_pages = mem.grow(delta: 1)
+    let base = prev_pages * 65536
+
+    // Region layout (each region is 64 bytes):
+    //   a:    base + 0     // input 1
+    //   b:    base + 64    // input 2
+    //   simd: base + 128   // SIMD-path output
+    //   scal: base + 192   // scalar-path output (or second SIMD pass for floats)
+    let a_addr = base
+    let b_addr = base + 64
+    let simd_addr = base + 128
+    let scal_addr = base + 192
+    // 64 bytes / 16 = 4 quads of f32x4 / i32x4; 64 / 16 = 4 quads of f64x2 /
+    // i64x2 (two lanes per quad → 8 elements). The autovectorize loop body
+    // is identical across lane shapes; only the lane-op opcode differs.
+    let n_quads = 4
+
+    // ─── i32x4_mul_array vs scalar_i32_mul ──────────────────────────────────
+    init_i32_seq(base: a_addr, n: 16)
+    init_i32_seq(base: b_addr, n: 16)
+    zero_region(base: simd_addr, n: 64)
+    zero_region(base: scal_addr, n: 64)
+    let _ = simd.i32x4_mul_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+    scalar_i32_mul(a: a_addr, b: b_addr, d: scal_addr, count: 16)
+    Console.println(val: from_i64(val: cmp_bytes(a: simd_addr, b: scal_addr, n: 64))) // 64
+
+    // ─── i32x4_sub_array vs scalar_i32_sub ──────────────────────────────────
+    // Use distinct inputs so a - b is non-trivial (not all zeros).
+    init_i32_seq(base: a_addr, n: 16)            // 1..16
+    init_i32_seq(base: b_addr, n: 16)            // 1..16 — override with offset
+    // shift b by +100 so a - b is uniformly negative — exercises wrap.
+    let _ = mem.store_i32(addr: b_addr, val: 101)
+    let _ = mem.store_i32(addr: b_addr + 4, val: 102)
+    let _ = mem.store_i32(addr: b_addr + 8, val: 103)
+    let _ = mem.store_i32(addr: b_addr + 12, val: 104)
+    let _ = mem.store_i32(addr: b_addr + 16, val: 105)
+    let _ = mem.store_i32(addr: b_addr + 20, val: 106)
+    let _ = mem.store_i32(addr: b_addr + 24, val: 107)
+    let _ = mem.store_i32(addr: b_addr + 28, val: 108)
+    let _ = mem.store_i32(addr: b_addr + 32, val: 109)
+    let _ = mem.store_i32(addr: b_addr + 36, val: 110)
+    let _ = mem.store_i32(addr: b_addr + 40, val: 111)
+    let _ = mem.store_i32(addr: b_addr + 44, val: 112)
+    let _ = mem.store_i32(addr: b_addr + 48, val: 113)
+    let _ = mem.store_i32(addr: b_addr + 52, val: 114)
+    let _ = mem.store_i32(addr: b_addr + 56, val: 115)
+    let _ = mem.store_i32(addr: b_addr + 60, val: 116)
+    zero_region(base: simd_addr, n: 64)
+    zero_region(base: scal_addr, n: 64)
+    let _ = simd.i32x4_sub_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+    scalar_i32_sub(a: a_addr, b: b_addr, d: scal_addr, count: 16)
+    Console.println(val: from_i64(val: cmp_bytes(a: simd_addr, b: scal_addr, n: 64))) // 64
+
+    // ─── i64x2_mul_array vs scalar_i64_mul ──────────────────────────────────
+    // 8 i64 elements per region (n_quads * 2 lanes).
+    init_i64_seq(base: a_addr, n: 8)
+    init_i64_seq(base: b_addr, n: 8)
+    zero_region(base: simd_addr, n: 64)
+    zero_region(base: scal_addr, n: 64)
+    let _ = simd.i64x2_mul_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+    scalar_i64_mul(a: a_addr, b: b_addr, d: scal_addr, count: 8)
+    Console.println(val: from_i64(val: cmp_bytes(a: simd_addr, b: scal_addr, n: 64))) // 64
+
+    // ─── i64x2_sub_array vs scalar_i64_sub ──────────────────────────────────
+    init_i64_seq(base: a_addr, n: 8)
+    // b: 100 + index → a - b uniformly negative
+    let _ = mem.store_i64(addr: b_addr, val: 101)
+    let _ = mem.store_i64(addr: b_addr + 8, val: 102)
+    let _ = mem.store_i64(addr: b_addr + 16, val: 103)
+    let _ = mem.store_i64(addr: b_addr + 24, val: 104)
+    let _ = mem.store_i64(addr: b_addr + 32, val: 105)
+    let _ = mem.store_i64(addr: b_addr + 40, val: 106)
+    let _ = mem.store_i64(addr: b_addr + 48, val: 107)
+    let _ = mem.store_i64(addr: b_addr + 56, val: 108)
+    zero_region(base: simd_addr, n: 64)
+    zero_region(base: scal_addr, n: 64)
+    let _ = simd.i64x2_sub_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+    scalar_i64_sub(a: a_addr, b: b_addr, d: scal_addr, count: 8)
+    Console.println(val: from_i64(val: cmp_bytes(a: simd_addr, b: scal_addr, n: 64))) // 64
+
+    // ─── f32x4_mul_array determinism ────────────────────────────────────────
+    // No scalar f32 reference at this layer (no f32-arith primitive), so we
+    // run the SIMD intrinsic twice on identical inputs and require bitwise
+    // agreement — drift here would mean the lane-op is non-deterministic or
+    // mis-encoded. Inputs are reused i32 sequences interpreted as f32 lanes.
+    init_i32_seq(base: a_addr, n: 16)
+    init_i32_seq(base: b_addr, n: 16)
+    zero_region(base: simd_addr, n: 64)
+    zero_region(base: scal_addr, n: 64)
+    let _ = simd.f32x4_mul_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+    let _ = simd.f32x4_mul_array(a_addr, b_addr, dst_addr: scal_addr, n_quads)
+    Console.println(val: from_i64(val: cmp_bytes(a: simd_addr, b: scal_addr, n: 64))) // 64
+
+    // ─── f32x4_sub_array determinism ────────────────────────────────────────
+    let _ = simd.f32x4_sub_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+    let _ = simd.f32x4_sub_array(a_addr, b_addr, dst_addr: scal_addr, n_quads)
+    Console.println(val: from_i64(val: cmp_bytes(a: simd_addr, b: scal_addr, n: 64))) // 64
+
+    // ─── f32x4_div_array determinism ────────────────────────────────────────
+    let _ = simd.f32x4_div_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+    let _ = simd.f32x4_div_array(a_addr, b_addr, dst_addr: scal_addr, n_quads)
+    Console.println(val: from_i64(val: cmp_bytes(a: simd_addr, b: scal_addr, n: 64))) // 64
+
+    // ─── f64x2_mul_array determinism ────────────────────────────────────────
+    init_i64_seq(base: a_addr, n: 8)
+    init_i64_seq(base: b_addr, n: 8)
+    zero_region(base: simd_addr, n: 64)
+    zero_region(base: scal_addr, n: 64)
+    let _ = simd.f64x2_mul_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+    let _ = simd.f64x2_mul_array(a_addr, b_addr, dst_addr: scal_addr, n_quads)
+    Console.println(val: from_i64(val: cmp_bytes(a: simd_addr, b: scal_addr, n: 64))) // 64
+
+    // ─── f64x2_sub_array determinism ────────────────────────────────────────
+    let _ = simd.f64x2_sub_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+    let _ = simd.f64x2_sub_array(a_addr, b_addr, dst_addr: scal_addr, n_quads)
+    Console.println(val: from_i64(val: cmp_bytes(a: simd_addr, b: scal_addr, n: 64))) // 64
+
+    // ─── f64x2_div_array determinism ────────────────────────────────────────
+    let _ = simd.f64x2_div_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+    let _ = simd.f64x2_div_array(a_addr, b_addr, dst_addr: scal_addr, n_quads)
+    Console.println(val: from_i64(val: cmp_bytes(a: simd_addr, b: scal_addr, n: 64))) // 64
+  end
+end
