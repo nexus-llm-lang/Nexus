@@ -39,3 +39,24 @@ semantics. Tracked for the dvr6.1 ADR.
   parses. Nexus chars are ASCII-only (0x00-0x7F), so the multibyte case is
   not portable. The hex-escape syntax itself (`'\u{NN}'`) is exercised by
   `tests/runtime/chars_unicode_escape_test.nx` against ASCII codepoints.
+
+## concurrency.rs
+
+- `handler_with_kont_clause_parses` — calls
+  `nexus::lang::parser::parser().parse(src)` directly, asserting that the
+  bootstrap parser accepts the `with @k` continuation-binder syntax used in
+  `nxlib/stdlib/sched.nx`. No Nexus-language surface for "the bootstrap
+  parser parsed this" — the corresponding self-hosted check lives in
+  `nxc::codegen::handler_with_kont_resume`.
+- `test_net_effect_enforcement` — calls `should_fail_typecheck` and matches
+  via `insta::assert_snapshot!`. Typecheck-error snapshots depend on the
+  Rust harness driving the typechecker library; deferred to dvr6.6.K
+  (Bucket C — typecheck/* needs `nexus typecheck --emit-json` or stdlib
+  typechecker API).
+- `test_net_request_method_and_headers_runtime`,
+  `test_net_request_https_url_is_accepted`,
+  `test_net_request_response_status_and_body_with_request_body` — already
+  downgraded to `should_typecheck` in the Rust source ("List types
+  ([Header]) and HTTP requests are not yet supported in WASM codegen").
+  Pure typecheck-only checks belong in Bucket C alongside
+  `test_net_effect_enforcement`.
