@@ -60,3 +60,47 @@ semantics. Tracked for the dvr6.1 ADR.
   ([Header]) and HTTP requests are not yet supported in WASM codegen").
   Pure typecheck-only checks belong in Bucket C alongside
   `test_net_effect_enforcement`.
+
+## wasm_eh.rs
+
+The wasm_eh suite is intrinsically a wasmtime-API integration test: each
+case builds raw WASM modules via `wasm_encoder` and calls
+`wasmtime::Module::from_binary` / `Instance::new` / typed-func APIs to
+verify the WASM Exception-Handling proposal is supported by the engine.
+There is no Nexus-language surface for "wasmtime accepted these bytes" —
+the language-level analogues (raise/try/catch payload roundtrip,
+cross-function unwind, catch-all wildcard) are ported to
+`tests/runtime/wasm_eh_*_test.nx` instead.
+
+- `wasm_eh_engine_config_compiles` — purely instantiates a
+  `wasmtime::Config { wasm_exceptions, wasm_tail_call,
+  wasm_function_references, wasm_stack_switching }`. Engine-flag config is
+  Rust-API only.
+- `wasm_eh_throw_catch_roundtrip` — replaced by
+  `wasm_eh_throw_catch_test.nx` (language-level raise/catch with i64
+  payload). The raw-bytes flavor stays Rust-only.
+- `wasm_eh_uncaught_traps` — asserts wasmtime's error message contains one
+  of `"uncaught" | "exception" | "unhandled" | "wasm trap"`. Trap-message
+  shape is wasmtime-internal; the language-level "uncaught raise traps"
+  behavior is verified implicitly by every other test's `safe_run`
+  divide-by-zero scaffold (an uncaught raise inside `body()` flips `ok=0`
+  and `1/ok` traps).
+- `wasm_eh_catch_all` — replaced by the `catch _` arm in
+  `wasm_eh_throw_catch_test.nx`.
+- `wasm_eh_cross_function_unwind` — replaced by
+  `wasm_eh_cross_function_unwind_test.nx`.
+
+### Note on backtrace capture (nexus-55x0)
+
+A language-level acceptance test for the post-nexus-55x0 capture-backtrace
+path (calling `std:exn::backtrace`) was scoped but not landed: the
+bundler currently registers the `nexus:runtime/backtrace` host stub with
+`__nx_bt_frame: (i64) -> i64` (returning a string handle), while the WIT
+package declared in `bootstrap/src/compiler/compose.rs` types it as
+`bt-frame: func(idx: s64) -> string`. wasmtime rejects the resulting
+component with `instance export 'capture-backtrace' has the wrong type`,
+so end-to-end through `nexus build` + standalone `wasmtime`
+(component-model on) cannot observe the captured frames. The unit-level
+gate is still covered by `tests/runtime/backtrace_elision_test.nx`
+(already in main), which exercises the codegen decision without invoking
+the host import.
