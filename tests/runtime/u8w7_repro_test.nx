@@ -1,0 +1,99 @@
+// Reduced reproducer + diagnosis for nexus-u8w7:
+//   "[bug] std:test/assert::assert_eq_i64 inside try{...} traps even on
+//    equality match"
+//
+// ─── Diagnosis: u8w7 is a misattribution ─────────────────────────────────────
+//
+// The original report (nexus-dvr6.6 batch5, stdlib/array port) observed
+// that wrapping `assert_eq_i64(n, 3, ...)` inside a `try { body() } catch _`
+// scaffold traps even though `n` came from `array.length(&[| 10, 20, 30 |])`
+// and was expected to equal 3. The agent concluded "assert_eq_i64 inside
+// try traps even on equality match" and switched the array test to a direct
+// `1 / (n - 2)` divide-by-zero scaffold as a workaround.
+//
+// Bisection in this fixture (and supporting isolations during diagnosis)
+// shows:
+//
+//   1. `try { assert_eq_i64(2, 2, ...) }` works correctly
+//      (passing_test.nx, control_flow_try_catch_test.nx,
+//       stdlib_arena_heap_reset_bounded_test.nx all use this pattern).
+//   2. The bug ONLY appears when the actual value comes from
+//      `array.length(arr: &a)`.
+//   3. Catching the exception with `catch e -> match e do
+//      | AssertionFailed(msg: m) -> ...` reveals the captured message:
+//          AssertionFailed: assert_eq_i64 failed: array.length == 3
+//            expected: 3
+//            actual:   65680
+//      i.e. `array.length` returned 65680 (a heap-pointer-shaped i32),
+//      not 3. assert_eq_i64 raised AssertionFailed because n != expected,
+//      which is the CORRECT behavior. The catch arm fires legitimately.
+//
+// Root cause is in `array.length` itself, not in test_assert / try:
+//   * `nxlib/stdlib/array.nx` declares `__nx_array_length` with signature
+//     `<T>(arr: &[| T |]) -> i64`.
+//   * The host (`bootstrap/src/lib/core/src/core.rs`) implements it as
+//     `(_ptr: i32, len: i32) -> i64 { len as i64 }` — an identity function
+//     on its second arg.
+//   * Codegen for `TyArray` external args (src/backend/codegen.nx::
+//     emit_external_arg, around line 821) unpacks the array atom as a
+//     packed `(ptr<<32 | len)` i64 — same code path as TyString. This
+//     works for strings (which ARE stored as packed i64 on the wire)
+//     but NOT for arrays (which are heap-allocated records — the i64
+//     atom is just the heap pointer, with the upper 32 bits zero).
+//   * Result: the call passes `(ptr=0, len=heap_ptr_truncated_i32)` and
+//     receives `heap_ptr_truncated_i32` back as the "length".
+//
+// The committed `tests/stdlib/stdlib_array_basic_test.nx` "passes" only by
+// coincidence: `1 / (n - 2)` for n in the 60000+ range yields 0 via
+// integer truncation, so the trap never fires. The test does not actually
+// verify length == 3.
+//
+// ─── This regression probe ───────────────────────────────────────────────────
+//
+// This fixture turns the bug into a guardrail by asserting the OBSERVED
+// (broken) behavior:
+//   - `array.length(&a)` returns a pointer-shaped value, not 3
+//   - `assert_eq_i64(actual, 3, ...)` raises AssertionFailed correctly
+//   - The catch arm fires and `safe_run` returns 0
+//   - main accepts 0 here as success (the bug is reproduced)
+//
+// Once `array.length` is fixed (e.g. by reading the length from the
+// array record header instead of expecting it as a pre-packed i32 in the
+// caller-supplied second arg), this fixture should be flipped: change
+// the body to assert `n == 3`, drop the "expect failure" wrapping, and
+// use the standard `1 / ok` trap to enforce success.
+import * as test_assert from "std:test/assert"
+import * as array from "std:array"
+
+// "body" is the exact shape from stdlib_array_basic_test.nx that hit the
+// reported "u8w7" symptom — but with the assertion wired through
+// test_assert (not bypassed via a divide-by-zero trick).
+let body = fn () -> unit throws { Exn } do
+  let a = [| 10, 20, 30 |]
+  let a_ref = &a
+  let n = array.length(arr: a_ref)
+  test_assert.assert_eq_i64(actual: n, expected: 3, label: "array.length == 3")
+  return ()
+end
+
+// Exit code: 1 if body returned cleanly (i.e., array.length is fixed
+// AND the assertion passes), 0 if AssertionFailed was caught (current
+// state — the bug is reproduced).
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  // Currently expect ok == 0 (assertion fails because array.length is
+  // broken). Trap if ok != 0 — i.e., trap if array.length unexpectedly
+  // started returning the right value, signalling that this regression
+  // probe needs to be flipped to the positive form.
+  let _ = 1 / (1 - ok)
+  return ()
+end
