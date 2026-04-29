@@ -50,3 +50,11 @@ fn lsp_diagnostics_and_span_fidelity() {
 fn lsp_publish_diagnostics_wire_format() {
     exec_with_stdlib(&read_fixture("nxc/test_lsp_publish_diagnostics.nx"));
 }
+
+/// Covers nexus-hw47.10 (DocumentSymbol tree): exercises the AST →
+/// DocumentSymbol[] walker plus the textDocument/documentSymbol handler
+/// dispatched through the LSP scaffold.
+#[test]
+fn lsp_document_symbols() {
+    exec_with_stdlib(&read_fixture("nxc/test_lsp_document_symbols.nx"));
+}

@@ -1,0 +1,251 @@
+/**
+ * lsp/symbols: AST → LSP DocumentSymbol tree.
+ *
+ * Walks a parsed `Program` (the top-level definition list produced by
+ * `src/frontend/parser.parse`) and emits a flat `[DocumentSymbol]` list
+ * suitable for the JSON-RPC `textDocument/documentSymbol` reply.
+ *
+ * SymbolKind mapping (LSP spec integer codes via
+ * `nxlib/lsp/protocol.SymbolKind`):
+ *   TLLet (lambda value)         -> Function
+ *   TLLet (non-lambda value)     -> Variable
+ *   TLEnum                       -> Class       (LSP has no SymbolKindEnum
+ *                                  in our protocol surface; Class is the
+ *                                  closest container kind. Variants nest
+ *                                  as Constructor children.)
+ *   TLEnum.variants              -> Constructor (nested)
+ *   TLCap                        -> Class       (LSP has no Interface kind
+ *                                  in our protocol surface; Class is the
+ *                                  closest container kind. Methods nest
+ *                                  as Method children.)
+ *   TLCap.functions              -> Method (nested)
+ *   TLTypeDef (record)           -> Class
+ *   TLException                  -> Constructor
+ *   TLExceptionGroup             -> Module
+ *   TLImport                     -> omitted from outline (LSP convention)
+ *
+ * Range / selectionRange:
+ *   range          - the span carried by `SpannedTopLevel` (the keyword
+ *                    position) widened by the identifier name length on the
+ *                    same line. End-of-form span is not in the AST yet, so
+ *                    range collapses to a single-line region anchored at
+ *                    the start point. This keeps "click -> jump" accurate
+ *                    while leaving room for a full end-position pass later.
+ *   selectionRange - same value as range. The Span only carries the start
+ *                    point; widening by name length is the most precise
+ *                    selection target the AST currently affords.
+ *
+ * Coordinate translation:
+ *   AST `Span` is 1-based (line, col); LSP `Position` is 0-based. The
+ *   `span_to_position` helper does the saturating clamp here once so
+ *   callers do not need to re-clamp.
+ */
+
+import { Option, Some, None } from "std:option"
+import {
+  Program, SpannedTopLevel,
+  TLLet, TLEnum, TLCap, TLTypeDef, TLException, TLExceptionGroup, TLImport,
+  GlobalLet, EnumDef, VariantDef, Cap, FunctionSig,
+  RecordDef, ExceptionDef, ExceptionGroupDef,
+  ExprLambda, SpannedExpr
+} from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import {
+  Position, Range,
+  DocumentSymbol,
+  SymbolKind,
+  SymbolKindFunction, SymbolKindVariable, SymbolKindClass,
+  SymbolKindMethod, SymbolKindConstructor, SymbolKindModule
+} from "nxlib/lsp/protocol.nx"
+import { length as str_length } from "std:str"
+
+// ─── Coordinate translation ──────────────────────────────────────────────────
+
+let saturating_pred = fn (n: i64) -> i64 do
+  if n <= 0 then return 0 end
+  return n - 1
+end
+
+let span_to_position = fn (sp: Span) -> Position do
+  match sp do | Span(offset: _, line, col) ->
+    return Position(
+      line: saturating_pred(n: line),
+      character: saturating_pred(n: col)
+    )
+  end
+end
+
+// Build a single-line range starting at `sp` and extending by `name_len`
+// characters. Used both for `range` (full identifier) and `selectionRange`
+// (just the identifier - same value here because the Span only carries the
+// start position; widening end is the best the AST currently affords).
+let single_line_range = fn (sp: Span, name_len: i64) -> Range do
+  let start = span_to_position(sp)
+  match start do | Position(line: l, character: c) ->
+    let end_pos = Position(line: l, character: c + name_len)
+    return Range(start, end_: end_pos)
+  end
+end
+
+// ─── Lambda detection ────────────────────────────────────────────────────────
+//
+// A `let name = fn (...) ...` binds a lambda; the value's outermost
+// expression is `ExprLambda`. Distinguishing lambda-let from value-let
+// drives the SymbolKind choice (Function vs Variable).
+
+let is_lambda_value = fn (value: SpannedExpr) -> bool do
+  match value do | SpannedExpr(node, span: _) ->
+    match node do
+      | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: _) ->
+        return true
+      | _ -> return false
+    end
+  end
+end
+
+// ─── Symbol builders ─────────────────────────────────────────────────────────
+
+let make_doc_symbol = fn (
+  name: string,
+  kind: SymbolKind,
+  span: Span,
+  children: [DocumentSymbol]
+) -> DocumentSymbol do
+  let nlen = str_length(s: name)
+  let r = single_line_range(sp: span, name_len: nlen)
+  return DocumentSymbol(
+    name,
+    detail: None,
+    kind,
+    range: r,
+    selection_range: r,
+    children
+  )
+end
+
+// Build a child symbol for an enum variant. The variant has no own span on
+// the AST node, so we anchor it to the parent enum's span; the LSP outline
+// still groups variants under their enum correctly, and clicking a variant
+// scrolls to the enum keyword (the closest available approximation until
+// the parser threads variant spans).
+let variant_to_doc_symbol = fn (parent_span: Span, v: VariantDef) -> DocumentSymbol do
+  match v do | VariantDef(name, fields: _) ->
+    return make_doc_symbol(
+      name,
+      kind: SymbolKindConstructor,
+      span: parent_span,
+      children: []
+    )
+  end
+end
+
+let variants_to_doc_symbols_go = fn (
+  parent_span: Span, vs: [VariantDef], acc: [DocumentSymbol]
+) -> [DocumentSymbol] do
+  match vs do
+    | [] -> return reverse_symbols(xs: acc, acc: [])
+    | v :: rest ->
+      let s = variant_to_doc_symbol(parent_span, v)
+      return variants_to_doc_symbols_go(parent_span, vs: rest, acc: s :: acc)
+  end
+end
+
+let variants_to_doc_symbols = fn (parent_span: Span, vs: [VariantDef]) -> [DocumentSymbol] do
+  return variants_to_doc_symbols_go(parent_span, vs, acc: [])
+end
+
+// Build a child symbol for a Cap method (FunctionSig has no own span;
+// reuse the cap's span as a positional anchor).
+let method_to_doc_symbol = fn (parent_span: Span, sig: FunctionSig) -> DocumentSymbol do
+  match sig do | FunctionSig(name, params: _, ret_type: _, requires: _, throw_row: _) ->
+    return make_doc_symbol(
+      name,
+      kind: SymbolKindMethod,
+      span: parent_span,
+      children: []
+    )
+  end
+end
+
+let methods_to_doc_symbols_go = fn (
+  parent_span: Span, sigs: [FunctionSig], acc: [DocumentSymbol]
+) -> [DocumentSymbol] do
+  match sigs do
+    | [] -> return reverse_symbols(xs: acc, acc: [])
+    | s :: rest ->
+      let m = method_to_doc_symbol(parent_span, sig: s)
+      return methods_to_doc_symbols_go(parent_span, sigs: rest, acc: m :: acc)
+  end
+end
+
+let methods_to_doc_symbols = fn (parent_span: Span, sigs: [FunctionSig]) -> [DocumentSymbol] do
+  return methods_to_doc_symbols_go(parent_span, sigs, acc: [])
+end
+
+let reverse_symbols = fn (xs: [DocumentSymbol], acc: [DocumentSymbol]) -> [DocumentSymbol] do
+  match xs do
+    | [] -> return acc
+    | s :: rest -> return reverse_symbols(xs: rest, acc: s :: acc)
+  end
+end
+
+// ─── Top-level dispatch ──────────────────────────────────────────────────────
+
+/// Build an Option<DocumentSymbol> for a single top-level definition.
+/// Returns None for definitions we deliberately omit (TLImport).
+let top_level_to_doc_symbol = fn (st: SpannedTopLevel) -> Option<DocumentSymbol> do
+  match st do | SpannedTopLevel(node, span) ->
+    match node do
+      | TLLet(def) ->
+        match def do | GlobalLet(name, is_public: _, typ: _, value) ->
+          let kind = if is_lambda_value(value) then SymbolKindFunction else SymbolKindVariable end
+          return Some(val: make_doc_symbol(name, kind, span, children: []))
+        end
+      | TLEnum(def) ->
+        match def do | EnumDef(name, is_public: _, is_opaque: _, type_params: _, variants) ->
+          let kids = variants_to_doc_symbols(parent_span: span, vs: variants)
+          return Some(val: make_doc_symbol(name, kind: SymbolKindClass, span, children: kids))
+        end
+      | TLCap(def) ->
+        match def do | Cap(name, is_public: _, functions) ->
+          let kids = methods_to_doc_symbols(parent_span: span, sigs: functions)
+          return Some(val: make_doc_symbol(name, kind: SymbolKindClass, span, children: kids))
+        end
+      | TLTypeDef(def) ->
+        match def do | RecordDef(name, is_public: _, type_params: _, fields: _) ->
+          return Some(val: make_doc_symbol(name, kind: SymbolKindClass, span, children: []))
+        end
+      | TLException(def) ->
+        match def do | ExceptionDef(name, is_public: _, fields: _) ->
+          return Some(val: make_doc_symbol(name, kind: SymbolKindConstructor, span, children: []))
+        end
+      | TLExceptionGroup(def) ->
+        match def do | ExceptionGroupDef(name, is_public: _, members: _) ->
+          return Some(val: make_doc_symbol(name, kind: SymbolKindModule, span, children: []))
+        end
+      | TLImport(def: _) -> return None
+    end
+  end
+end
+
+let collect_doc_symbols_go = fn (
+  defs: [SpannedTopLevel], acc: [DocumentSymbol]
+) -> [DocumentSymbol] do
+  match defs do
+    | [] -> return reverse_symbols(xs: acc, acc: [])
+    | d :: rest ->
+      match top_level_to_doc_symbol(st: d) do
+        | None -> return collect_doc_symbols_go(defs: rest, acc)
+        | Some(val: s) -> return collect_doc_symbols_go(defs: rest, acc: s :: acc)
+      end
+  end
+end
+
+/// Walk the program's top-level definitions and produce a flat list of
+/// `DocumentSymbol` entries (each may carry nested children for variants /
+/// methods). Order matches the source order.
+export let document_symbols_for_program = fn (prog: Program) -> [DocumentSymbol] do
+  match prog do | Program(definitions) ->
+    return collect_doc_symbols_go(defs: definitions, acc: [])
+  end
+end

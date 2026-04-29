@@ -1,0 +1,298 @@
+/**
+ * Test for nexus-hw47.10: AST → DocumentSymbol tree.
+ *
+ * Two layers of coverage:
+ *
+ *   1. Pure AST walker: parse a fixture program, hand it to
+ *      `document_symbols_for_program`, and assert the structural shape
+ *      (top-level entries, nested children for enum variants and cap
+ *      methods, SymbolKind integer encoding).
+ *
+ *   2. End-to-end JSON-RPC: drive the LSP scaffold with an
+ *      `initialize → didOpen → textDocument/documentSymbol → exit`
+ *      sequence and verify the response payload is a JsonArray of
+ *      DocumentSymbol-shaped objects with the expected names and kinds.
+ *
+ * The fixture exercises every TopLevel variant the symbols module
+ * recognises (let/lambda, let/value, enum, cap, type record).
+ */
+
+import {
+  JsonValue, JsonNull, JsonInt, JsonString, JsonArray, JsonObject, JsonField,
+  get_field
+} from "std:json"
+import { Option, Some, None } from "std:option"
+import { tokenize } from "src/frontend/lexer.nx"
+import { parse } from "src/frontend/parser.nx"
+import { Program, SpannedTopLevel } from "src/common/ast.nx"
+import {
+  Position, Range, DocumentSymbol,
+  SymbolKind, SymbolKindFunction, SymbolKindVariable, SymbolKindClass,
+  SymbolKindMethod, SymbolKindConstructor,
+  symbol_kind_to_int
+} from "nxlib/lsp/protocol.nx"
+import { document_symbols_for_program } from "src/lsp/symbols.nx"
+import { Request, Notification }, * as jr from "nxlib/jsonrpc.nx"
+import {
+  empty_state, drive_messages, DriveResult
+} from "nxlib/lsp/server.nx"
+import { nexus_handlers } from "src/lsp/handlers.nx"
+
+let assert = fn (cond: bool, msg: string) -> unit throws { Exn } do
+  if cond then return ()
+  else raise RuntimeError(val: msg)
+  end
+end
+
+let str_eq = fn (a: string, b: string) -> bool do
+  return a == b
+end
+
+let len_syms = fn (xs: [DocumentSymbol]) -> i64 do
+  match xs do
+    | [] -> return 0
+    | _ :: rest -> return 1 + len_syms(xs: rest)
+  end
+end
+
+let len_jv = fn (xs: [JsonValue]) -> i64 do
+  match xs do
+    | [] -> return 0
+    | _ :: rest -> return 1 + len_jv(xs: rest)
+  end
+end
+
+// Source covering let/lambda, let/value, enum (single-variant + multi-variant),
+// and cap. Records are exercised in a separate fixture below.
+let fixture_source = fn () -> string do
+  return "type Point = Point(x: i64, y: i64)\n" ++
+         "type Color = Red | Green | Blue\n" ++
+         "cap Logger do fn log(msg: string) -> unit end\n" ++
+         "let count = 42\n" ++
+         "let main = fn () -> unit do return () end\n"
+end
+
+// ─── Layer 1: pure walker ──────────────────────────────────────────────────
+
+let test_walker_top_level_count = fn () -> unit throws { Exn } do
+  let prog = parse(tokens: tokenize(src: fixture_source()))
+  let syms = document_symbols_for_program(prog)
+  // 5 top-level definitions, none are imports → all surface.
+  assert(cond: len_syms(xs: syms) == 5,
+    msg: "expected 5 top-level symbols (record, enum, cap, value, fn)")
+end
+
+let test_walker_assigns_kinds = fn () -> unit throws { Exn } do
+  let prog = parse(tokens: tokenize(src: fixture_source()))
+  let syms = document_symbols_for_program(prog)
+  // Walk the list and assert kinds in source order:
+  //   Point  → Class (single-variant enum)
+  //   Color  → Class (multi-variant enum)
+  //   Logger → Class (cap)
+  //   count  → Variable
+  //   main   → Function
+  match syms do
+    | s1 :: s2 :: s3 :: s4 :: s5 :: [] ->
+      assert_kind_named(s: s1, expected_name: "Point", expected_kind_int: 5)
+      assert_kind_named(s: s2, expected_name: "Color", expected_kind_int: 5)
+      assert_kind_named(s: s3, expected_name: "Logger", expected_kind_int: 5)
+      assert_kind_named(s: s4, expected_name: "count", expected_kind_int: 13)
+      assert_kind_named(s: s5, expected_name: "main", expected_kind_int: 12)
+    | _ -> raise RuntimeError(val: "unexpected symbol list shape")
+  end
+end
+
+let assert_kind_named = fn (s: DocumentSymbol, expected_name: string, expected_kind_int: i64) -> unit throws { Exn } do
+  match s do | DocumentSymbol(name, detail: _, kind, range: _, selection_range: _, children: _) ->
+    assert(cond: str_eq(a: name, b: expected_name),
+      msg: "symbol name mismatch: " ++ name ++ " vs " ++ expected_name)
+    let k = symbol_kind_to_int(k: kind)
+    assert(cond: k == expected_kind_int,
+      msg: "symbol kind mismatch for " ++ name)
+  end
+end
+
+let test_walker_nests_enum_variants = fn () -> unit throws { Exn } do
+  let prog = parse(tokens: tokenize(src: fixture_source()))
+  let syms = document_symbols_for_program(prog)
+  // Color is the second entry (multi-variant enum). Variants must nest.
+  match syms do
+    | _ :: s_enum :: _ ->
+      match s_enum do | DocumentSymbol(name, detail: _, kind: _, range: _, selection_range: _, children) ->
+        assert(cond: str_eq(a: name, b: "Color"), msg: "expected Color enum at index 1")
+        assert(cond: len_syms(xs: children) == 3,
+          msg: "Color enum must nest its 3 variants")
+        // Each child is a Constructor (kind = 9).
+        assert_all_constructor_kind(xs: children)
+      end
+    | _ -> raise RuntimeError(val: "unexpected symbol list shape")
+  end
+end
+
+let assert_all_constructor_kind = fn (xs: [DocumentSymbol]) -> unit throws { Exn } do
+  match xs do
+    | [] -> return ()
+    | s :: rest ->
+      match s do | DocumentSymbol(name: _, detail: _, kind, range: _, selection_range: _, children: _) ->
+        let k = symbol_kind_to_int(k: kind)
+        assert(cond: k == 9, msg: "variant child must be Constructor (kind 9)")
+        return assert_all_constructor_kind(xs: rest)
+      end
+  end
+end
+
+let test_walker_nests_cap_methods = fn () -> unit throws { Exn } do
+  let prog = parse(tokens: tokenize(src: fixture_source()))
+  let syms = document_symbols_for_program(prog)
+  // Cap is the third entry.
+  match syms do
+    | _ :: _ :: s_cap :: _ ->
+      match s_cap do | DocumentSymbol(name, detail: _, kind: _, range: _, selection_range: _, children) ->
+        assert(cond: str_eq(a: name, b: "Logger"), msg: "expected Logger cap at index 2")
+        assert(cond: len_syms(xs: children) == 1,
+          msg: "Logger cap must nest its single method")
+        match children do
+          | child :: [] ->
+            match child do | DocumentSymbol(name: cname, detail: _, kind, range: _, selection_range: _, children: _) ->
+              assert(cond: str_eq(a: cname, b: "log"),
+                msg: "expected method name 'log'")
+              let k = symbol_kind_to_int(k: kind)
+              assert(cond: k == 6, msg: "method child must be Method (kind 6)")
+            end
+          | _ -> raise RuntimeError(val: "expected exactly one method child")
+        end
+      end
+    | _ -> raise RuntimeError(val: "unexpected symbol list shape")
+  end
+end
+
+let test_walker_omits_imports = fn () -> unit throws { Exn } do
+  let src = "import { x } from \"std:option\"\n" ++
+            "let count = 1\n"
+  let prog = parse(tokens: tokenize(src))
+  let syms = document_symbols_for_program(prog)
+  // Import omitted; only `count` surfaces.
+  assert(cond: len_syms(xs: syms) == 1,
+    msg: "import must be omitted from outline")
+  match syms do
+    | s :: [] ->
+      match s do | DocumentSymbol(name, detail: _, kind: _, range: _, selection_range: _, children: _) ->
+        assert(cond: str_eq(a: name, b: "count"), msg: "remaining symbol must be 'count'")
+      end
+    | _ -> raise RuntimeError(val: "unexpected symbol list shape after import filter")
+  end
+end
+
+let test_walker_range_uses_source_position = fn () -> unit throws { Exn } do
+  // Single line, count starts at column 1 (1-based) = LSP column 0.
+  let src = "let count = 1\n"
+  let prog = parse(tokens: tokenize(src))
+  let syms = document_symbols_for_program(prog)
+  match syms do
+    | s :: [] ->
+      match s do | DocumentSymbol(name: _, detail: _, kind: _, range: r, selection_range: _, children: _) ->
+        match r do | Range(start, end_) ->
+          match start do | Position(line: sl, character: sc) ->
+            assert(cond: sl == 0, msg: "single-line let must be on line 0 (LSP)")
+            assert(cond: sc == 0, msg: "let column should saturate to 0 in LSP coords")
+          end
+          match end_ do | Position(line: el, character: ec) ->
+            assert(cond: el == 0, msg: "end position on same line")
+            // Range widened by name length (5 = "count")
+            assert(cond: ec == 5, msg: "end column should be name-length wider than start")
+          end
+        end
+      end
+    | _ -> raise RuntimeError(val: "expected single symbol")
+  end
+end
+
+// ─── Layer 2: end-to-end JSON-RPC ─────────────────────────────────────────
+
+let initialize_request = fn () -> jr.IncomingMessage do
+  let params = JsonObject(fields: [
+    JsonField(key: "processId", value: JsonNull),
+    JsonField(key: "rootUri", value: JsonNull),
+    JsonField(key: "capabilities", value: JsonObject(fields: []))
+  ])
+  return Request(id: JsonInt(val: 1), method: "initialize", params)
+end
+
+let did_open_notification = fn (uri: string, text: string, version: i64) -> jr.IncomingMessage do
+  let td = JsonObject(fields: [
+    JsonField(key: "uri", value: JsonString(val: uri)),
+    JsonField(key: "languageId", value: JsonString(val: "nexus")),
+    JsonField(key: "version", value: JsonInt(val: version)),
+    JsonField(key: "text", value: JsonString(val: text))
+  ])
+  let params = JsonObject(fields: [
+    JsonField(key: "textDocument", value: td)
+  ])
+  return Notification(method: "textDocument/didOpen", params)
+end
+
+let document_symbol_request = fn (uri: string, request_id: i64) -> jr.IncomingMessage do
+  let params = JsonObject(fields: [
+    JsonField(key: "textDocument", value: JsonObject(fields: [
+      JsonField(key: "uri", value: JsonString(val: uri))
+    ]))
+  ])
+  return Request(id: JsonInt(val: request_id), method: "textDocument/documentSymbol", params)
+end
+
+let exit_notification = fn () -> jr.IncomingMessage do
+  return Notification(method: "exit", params: JsonNull)
+end
+
+let get_field_or_raise = fn (obj: JsonValue, key: string) -> JsonValue throws { Exn } do
+  match get_field(obj, key) do
+    | Some(val: v) -> return v
+    | None -> raise RuntimeError(val: "missing field: " ++ key)
+  end
+end
+
+let test_endtoend_document_symbol_response = fn () -> unit throws { Exn } do
+  let uri = "file:///workspace/test_outline.nx"
+  let msgs = [
+    initialize_request(),
+    did_open_notification(uri, text: fixture_source(), version: 1),
+    document_symbol_request(uri, request_id: 7),
+    exit_notification()
+  ]
+  let result = drive_messages(state: empty_state(), msgs, handlers: nexus_handlers())
+  match result do | DriveResult(state: _, responses: resps, notifications: _, exited) ->
+    assert(cond: exited, msg: "drive must terminate via exit")
+    // Two responses: initialize + documentSymbol.
+    assert(cond: len_jv(xs: resps) == 2,
+      msg: "expected 2 responses (initialize + documentSymbol)")
+    // Last response (documentSymbol). drive_messages preserves dispatch order
+    // so the second element is the documentSymbol reply.
+    match resps do
+      | _ :: r2 :: [] ->
+        // The result envelope: { jsonrpc, id, result: [DocumentSymbol] }
+        let id_v = get_field_or_raise(obj: r2, key: "id")
+        match id_v do
+          | JsonInt(val: i) -> assert(cond: i == 7, msg: "response id must echo request 7")
+          | _ -> raise RuntimeError(val: "response id not int")
+        end
+        let result_v = get_field_or_raise(obj: r2, key: "result")
+        match result_v do
+          | JsonArray(items) ->
+            assert(cond: len_jv(xs: items) == 5,
+              msg: "documentSymbol result must list 5 top-levels")
+          | _ -> raise RuntimeError(val: "documentSymbol result must be JsonArray")
+        end
+      | _ -> raise RuntimeError(val: "unexpected response shape")
+    end
+  end
+end
+
+let main = fn () -> unit throws { Exn } do
+  test_walker_top_level_count()
+  test_walker_assigns_kinds()
+  test_walker_nests_enum_variants()
+  test_walker_nests_cap_methods()
+  test_walker_omits_imports()
+  test_walker_range_uses_source_position()
+  test_endtoend_document_symbol_response()
+end

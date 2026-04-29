@@ -2,9 +2,9 @@
  * lsp/handlers: Nexus-specific LSP method handlers.
  *
  * Bundles the pipeline-specific handler functions (initialize, didOpen,
- * didChange, ...) and exposes a single entry point - `nexus_handlers()` -
- * that returns a populated `Handlers` vtable for the scaffold's
- * `dispatch_message` / `run_server`.
+ * didChange, documentSymbol, ...) and exposes a single entry point —
+ * `nexus_handlers()` — that returns a populated `Handlers` vtable for the
+ * scaffold's `dispatch_message` / `run_server`.
  *
  * Splitting these handlers out of `src/lsp/main.nx` lets test fixtures
  * import the vtable without dragging the entry-point `main` (which is
@@ -17,11 +17,12 @@
  *   nxlib/lsp/protocol.nx      - wire types + JSON codecs
  *   nxlib/lsp/server.nx        - generic dispatch loop + state machine
  *   src/lsp/diagnostics.nx     - typecheck -> internal Diagnostic stream
+ *   src/lsp/symbols.nx         - parsed AST -> DocumentSymbol tree
  *   src/lsp/handlers.nx (here) - method-name -> handler glue
  *   src/lsp/main.nx            - entry point (capability injection only)
  */
 
-import { JsonValue, JsonArray, get_field } from "std:json"
+import { JsonValue, JsonArray, JsonString, get_field } from "std:json"
 import { Option, Some, None } from "std:option"
 import * as lexer from "src/frontend/lexer.nx"
 import * as parser from "src/frontend/parser.nx"
@@ -36,6 +37,9 @@ import {
   make_origin_error_diagnostic
 } from "src/lsp/diagnostics.nx"
 import {
+  document_symbols_for_program
+} from "src/lsp/symbols.nx"
+import {
   ServerCapabilities, TdsFull,
   InitializeResult, ServerInfo,
   initialize_params_from_json, initialize_result_to_json,
@@ -45,7 +49,8 @@ import {
   ContentChangeFull, ContentChangeIncremental,
   content_change_event_from_json,
   PublishDiagnosticsParams,
-  Position, Range, Diagnostic,
+  Position, Range, Diagnostic, DocumentSymbol,
+  document_symbol_to_json,
   DiagSevError, DiagSevWarning, DiagSevInformation, DiagSevHint,
   LspProtocolError
 } from "nxlib/lsp/protocol.nx"
@@ -53,7 +58,7 @@ import {
   ServerState, DocumentRecord, DocumentStore, LifecycleRunning,
   Handlers, HandlerResult,
   empty_handlers,
-  documents_put,
+  documents_put, documents_lookup,
   make_publish_diagnostics_notification
 } from "nxlib/lsp/server.nx"
 
@@ -202,13 +207,10 @@ let nexus_on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerR
   let _ = initialize_params_from_json(v: params)
   let caps = ServerCapabilities(
     text_document_sync: Some(val: TdsFull),
-    /// documentSymbolProvider stays None while no concrete handler is
-    /// wired through `on_other`. Advertising it without a backing
-    /// implementation would invite clients to send
-    /// `textDocument/documentSymbol`, which the scaffold's `on_other`
-    /// would answer with MethodNotFound -- a worse failure than not
-    /// advertising the capability at all.
-    document_symbol_provider: None,
+    /// `nexus_on_other` routes textDocument/documentSymbol through the
+    /// `src/lsp/symbols.document_symbols_for_program` walker; advertise
+    /// the capability so clients populate the outline view.
+    document_symbol_provider: Some(val: true),
     hover_provider: None,
     definition_provider: None,
     references_provider: None
@@ -326,12 +328,90 @@ let nexus_on_did_change = fn (state: ServerState, params: JsonValue) -> HandlerR
   end
 end
 
+// ─── Handler: textDocument/documentSymbol (via on_other) ─────────────────────
+//
+// Outline view: parse the buffer text we cached on didOpen / didChange and
+// hand the resulting Program to `src/lsp/symbols.document_symbols_for_program`
+// for the AST -> DocumentSymbol[] conversion. The wire reply is the array
+// itself (not wrapped in an object); LSP clients accept either flat
+// SymbolInformation[] or DocumentSymbol[] as the response shape.
+
+let symbols_to_json_items_go = fn (xs: [DocumentSymbol], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return reverse_jsonvals(xs: acc, acc: [])
+    | s :: rest -> return symbols_to_json_items_go(xs: rest, acc: document_symbol_to_json(s) :: acc)
+  end
+end
+
+let reverse_jsonvals = fn (xs: [JsonValue], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | v :: rest -> return reverse_jsonvals(xs: rest, acc: v :: acc)
+  end
+end
+
+let document_symbols_to_json = fn (xs: [DocumentSymbol]) -> JsonValue do
+  return JsonArray(items: symbols_to_json_items_go(xs, acc: []))
+end
+
+let compute_document_symbols = fn (doc_opt: Option<DocumentRecord>) -> [DocumentSymbol] do
+  match doc_opt do
+    | None ->
+      // No buffer cached for this URI -- return an empty outline rather
+      // than InvalidParams. Some clients query documentSymbol before
+      // didOpen completes; an empty list is the LSP-friendly response.
+      return []
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text, version: _) ->
+        try
+          let prog = parser.parse(tokens: lexer.tokenize(src: text))
+          return document_symbols_for_program(prog)
+        catch err ->
+          // Lex/parse failure: outline is empty for the broken buffer.
+          // The client already sees publishDiagnostics with the parse
+          // error (pushed by didOpen / didChange), so flooding the
+          // outline with a synthetic symbol would be redundant.
+          let _ = err
+          return []
+        end
+      end
+  end
+end
+
+let nexus_on_document_symbol = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
+  let td_v = require_object_field(obj: params, key: "textDocument",
+    ctx: "DocumentSymbolParams")
+  let uri_v = require_object_field(obj: td_v, key: "uri",
+    ctx: "DocumentSymbolParams.textDocument")
+  let uri = match uri_v do
+    | JsonString(val: s) -> s
+    | _ -> raise LspProtocolError(msg: "DocumentSymbolParams.textDocument.uri: expected string")
+  end
+  let doc_opt = documents_lookup(store: state_documents(state), uri)
+  let symbols = compute_document_symbols(doc_opt)
+  return HandlerResult(
+    state,
+    response: Some(val: document_symbols_to_json(xs: symbols)),
+    notifications: []
+  )
+end
+
+let nexus_on_other = fn (state: ServerState, method: string, params: JsonValue) -> HandlerResult throws { Exn } do
+  if method == "textDocument/documentSymbol" then
+    return nexus_on_document_symbol(state, params)
+  end
+  // Fall back to MethodNotFound (None response signals it to dispatch_message).
+  let _ = params
+  let _ = method
+  return HandlerResult(state, response: None, notifications: [])
+end
+
 // ─── Build the handler vtable ────────────────────────────────────────────────
 
 export let nexus_handlers = fn () -> Handlers do
   match empty_handlers() do
     | Handlers(on_initialize: _, on_initialized, on_did_open: _, on_did_change: _,
-               on_did_close, on_did_save, on_shutdown, on_other) ->
+               on_did_close, on_did_save, on_shutdown, on_other: _) ->
       return Handlers(
         on_initialize: nexus_on_initialize,
         on_initialized,
@@ -340,7 +420,7 @@ export let nexus_handlers = fn () -> Handlers do
         on_did_close,
         on_did_save,
         on_shutdown,
-        on_other
+        on_other: nexus_on_other
       )
   end
 end
