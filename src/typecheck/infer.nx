@@ -59,7 +59,7 @@ export let infer_expr = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr
   let HirExpr(node, span: sp) = expr
   match node do
     | Literal(lit) -> return infer_literal(state, lit, span: sp)
-    | Variable(name, sigil: _) -> return infer_variable(state, name, span: sp)
+    | Variable(name, sigil) -> return infer_variable(state, name, sigil, span: sp)
     | Borrow(name, sigil: _) -> return infer_borrow(state, name, span: sp)
     | BinOp(left, op, right) ->
       return infer_binop(state, left, op, right, span: sp)
@@ -139,10 +139,19 @@ end
 
 // ─── Variable inference ─────────────────────────────────────────────────────
 
-let infer_variable = fn (state: CheckState, name: string, span: Span) -> InferExprResult throws { Exn } do
+let infer_variable = fn (state: CheckState, name: string, sigil: Sigil, span: Span) -> InferExprResult throws { Exn } do
   match tctypes.env_lookup(env: tctypes.state_env(state), name) do
     | Some(val: sch) ->
       let InstantiateResult(state: st1, typ: t) = instantiate_scheme(state, scheme: sch)
+      // T-DerefRef (nexus-mqin.8): `~x` at use site reads through the mutable
+      // cell, yielding the inner value type. A `~`-sigil applied to a non-Ref
+      // binding is a modality mismatch.
+      if let SigilMutable = sigil then
+        match t do
+          | TyRef(inner: i) -> return InferExprOk(state: st1, subst: subst.subst_empty(), typ: i)
+          | _ -> return InferExprErr(message: "cannot dereference '~" ++ name ++ "': binding is not a mutable ref", span)
+        end
+      end
       return InferExprOk(state: st1, subst: subst.subst_empty(), typ: t)
     | None ->
       return InferExprErr(message: "unbound variable: " ++ name, span)
@@ -150,7 +159,9 @@ let infer_variable = fn (state: CheckState, name: string, span: Span) -> InferEx
 end
 
 let infer_borrow = fn (state: CheckState, name: string, span: Span) -> InferExprResult throws { Exn } do
-  match infer_variable(state, name, span) do
+  // Borrow walks the env directly (without sigil dereference) — `&x` may
+  // borrow Linear/Lazy/Borrow bindings the same way as plain Immutable ones.
+  match infer_variable(state, name, sigil: SigilImmutable, span) do
     | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
     | InferExprOk(state: st1, subst: s, typ: t) ->
       // Strip Linear/Lazy/Borrow wrapper, then wrap in Borrow
@@ -1122,8 +1133,8 @@ end
 
 let infer_stmt = fn (state: CheckState, stmt: HirStmtKind, ret_type: TypeExpr, span: Span) -> InferExprResult throws { Exn } do
   match stmt do
-    | Let(name, sigil: _, typ: ann, value) ->
-      return infer_let(state, name, ann, value, ret_type, span)
+    | Let(name, sigil, typ: ann, value) ->
+      return infer_let(state, name, sigil, ann, value, ret_type, span)
     | Expr(expr) ->
       return infer_expr(state, expr, ret_type)
     | Return(expr) ->
@@ -1132,16 +1143,24 @@ let infer_stmt = fn (state: CheckState, stmt: HirStmtKind, ret_type: TypeExpr, s
       let HirExpr(node: target_node, span: _) = target
       match target_node do
         | Variable(name: n, sigil: _) ->
+          // T-Assign (nexus-mqin.8): the LHS must have type `~τ` (TyRef) per
+          // the modality rule. We look up the env type directly rather than
+          // routing through infer_expr — the lowering hardcodes the target's
+          // sigil to SigilMutable, so the auto-deref in infer_variable would
+          // strip the wrapper before the assign site can verify it.
           match tctypes.env_lookup(env: tctypes.state_env(state), name: n) do
             | None -> return InferExprErr(message: "assign: unbound variable '" ++ n ++ "'", span)
             | Some(val: sch) ->
               match instantiate_scheme(state, scheme: sch) do
                 | InstantiateResult(state: st0, typ: target_type) ->
+                  let inner_t = if let TyRef(inner: i) = target_type then i else
+                    return InferExprErr(message: "assign '" ++ n ++ "': target is not a mutable ref (`~τ` required)", span)
+                  end
                   match infer_expr(state: st0, expr: value, ret_type) do
                     | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "assign: " ++ m, span: espan)
                     | InferExprOk(state: st1, subst: s1, typ: t_value) ->
                       let tdefs = tctypes.state_typedefs(state: st1)
-                      match unify.unify(t1: t_value, t2: subst.subst_apply(subst: s1, typ: target_type), tdefs) do
+                      match unify.unify(t1: t_value, t2: subst.subst_apply(subst: s1, typ: inner_t), tdefs) do
                         | UnifyErr(message: m) -> return InferExprErr(message: "assign '" ++ n ++ "': " ++ m, span)
                         | UnifyOk(subst: s2) -> return InferExprOk(state: st1, subst: subst.subst_compose(s1, s2), typ: TyUnit)
                       end
@@ -1167,7 +1186,7 @@ end
 
 // ─── Let statement inference ────────────────────────────────────────────────
 
-let infer_let = fn (state: CheckState, name: string, ann: Option<TypeExpr>, value: HirExpr, ret_type: TypeExpr, span: Span) -> InferExprResult throws { Exn } do
+let infer_let = fn (state: CheckState, name: string, sigil: Sigil, ann: Option<TypeExpr>, value: HirExpr, ret_type: TypeExpr, span: Span) -> InferExprResult throws { Exn } do
   // Pre-register for recursive lambdas
   let HirExpr(node: val_node, span: _) = value
   let st0 = if let Lambda(type_params: _, params, ret_type: ret, body: _) = val_node then
@@ -1183,7 +1202,7 @@ let infer_let = fn (state: CheckState, name: string, ann: Option<TypeExpr>, valu
   match infer_expr(state: st0, expr: value, ret_type) do
     | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "let " ++ name ++ ": " ++ m, span: espan)
     | InferExprOk(state: st1, subst: s1, typ: t1) ->
-      let final_type = match ann do
+      let inferred_type = match ann do
         | Some(val: expected) ->
           let tdefs = tctypes.state_typedefs(state: st1)
           match unify.unify(t1, t2: expected, tdefs) do
@@ -1194,11 +1213,27 @@ let infer_let = fn (state: CheckState, name: string, ann: Option<TypeExpr>, valu
           end
         | None -> default_numeric_literals(typ: t1)
       end
+      // T-Let-Mutable (nexus-mqin.8): a `let ~x = v` binding stores its value
+      // in a mutable cell. The env type is `~τ` (TyRef) so that T-Assign can
+      // verify the LHS modality and use-site `~x` reads can auto-deref.
+      let final_type = if let SigilMutable = sigil then wrap_ref(typ: inferred_type) else inferred_type end
       let env2 = tctypes.env_insert(
         env: subst.subst_apply_env(subst: s1, env: tctypes.state_env(state: st1)),
         name, scheme: tctypes.mono(typ: final_type)
       )
       return InferExprOk(state: tctypes.state_with_env(state: st1, env: env2), subst: s1, typ: TyUnit)
+  end
+end
+
+/// Wrap a binding type in TyRef for `~`-sigil lets unless the value is
+/// already a Ref/Linear/Lazy/Borrow (mirrors bootstrap's special cases).
+let wrap_ref = fn (typ: TypeExpr) -> TypeExpr do
+  match typ do
+    | TyRef(_) -> return typ
+    | TyLinear(_) -> return typ
+    | TyLazy(_) -> return typ
+    | TyBorrow(_) -> return typ
+    | _ -> return TyRef(inner: typ)
   end
 end
 
