@@ -1,4 +1,4 @@
-use crate::harness::{exec_with_stdlib, exec_with_stdlib_caps_should_trap};
+use crate::harness::{exec_nxc_core_capture_stdout, exec_with_stdlib, exec_with_stdlib_caps_should_trap};
 use nexus::runtime::ExecutionCapabilities;
 
 #[test]
@@ -33,25 +33,21 @@ end
 
 #[test]
 fn random_range_returns_in_bounds_value() {
-    exec_with_stdlib(
-        r#"
-import { Random }, * as rng from "std:rand"
-
-let main = fn () -> unit require { PermRandom } do
-  inject rng.system_handler do
-    let n = Random.range(min: 10, max: 20)
-    if n >= 10 then
-      if n < 20 then
-        return ()
-      else
-        raise RuntimeError(val: "n >= 20")
-      end
-    else
-      raise RuntimeError(val: "n < 10")
-    end
-  end
-end
-"#,
+    // Routed through the self-hosted (nxc) compile path because the
+    // pure-Nexus PRNG (nexus-dvr6.9.6) reads/writes a 16-byte state cell
+    // via `nexus:runtime/memory` ops. Those ops are inlined as wasm
+    // memory instructions by the nxc codegen but trap as
+    // "not provisionable" when sourced through the Rust-built component
+    // path (`exec_with_stdlib`).
+    let out = exec_nxc_core_capture_stdout(
+        "bootstrap/tests/fixtures/nxc/test_rand_range_in_bounds.nx",
+    );
+    let lines: Vec<&str> = out.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        ["ok-lazy-seed", "ok-explicit-seed"],
+        "unexpected stdout: {:?}",
+        out
     );
 }
 
@@ -73,10 +69,30 @@ end
 }
 
 #[test]
-fn random_denied_at_wasi_level_without_allow_random() {
+fn random_traps_on_rust_compiler_path_without_memory_intrinsics() {
+    // The pure-Nexus PRNG installed by nexus-dvr6.9.6 reads/writes a
+    // 16-byte state cell at offset 983040 via the
+    // `nexus:runtime/memory` intrinsics. Those ops are inlined by the
+    // self-hosted (nxc) codegen but trap as "not provisionable" when
+    // sourced through the Rust-built component path, regardless of
+    // capability flags.
+    //
+    // This test pins the architectural fact that `exec_with_stdlib`
+    // (Rust compiler + component-model linker) cannot exercise the new
+    // Random handler. Functional Random tests must route through the
+    // nxc fixture path (see `random_range_returns_in_bounds_value` and
+    // `stdlib::rand::rand_determinism_pcg_step_byte_equal_across_runs`).
+    //
+    // The previous incarnation of this test asserted the WASI-level
+    // `random_get` deny path. After dvr6.9.6 the PRNG no longer touches
+    // `random_get`; the equivalent runtime-side gate is now Clock denial
+    // (the seed source is `__nx_now`/`clock_time_get`), which is covered
+    // by the analogous test in `stdlib/clock.rs`.
     let caps = ExecutionCapabilities {
         allow_console: true,
         allow_fs: true,
+        allow_clock: true,
+        allow_random: true,
         ..ExecutionCapabilities::deny_all()
     };
     let err = exec_with_stdlib_caps_should_trap(
@@ -92,10 +108,10 @@ end
 "#,
         caps,
     );
-    // The stub returns ENOSYS (errno 76), which the stdlib propagates as a wasm trap.
     assert!(
-        err.contains("error while executing") || err.contains("denied"),
-        "expected trap from denied random access, got: {}",
+        err.contains("not provisionable")
+            || err.contains("error while executing"),
+        "expected runtime/memory provisioning trap on Rust compiler path, got: {}",
         err
     );
 }
