@@ -637,3 +637,110 @@ fn wasm_alloc_pure_nexus_acceptance() {
         );
     }
 }
+
+/// nexus-dvr6.9.3 acceptance: pure-Nexus `nxlib/stdlib/string.nx` covers the
+/// 30+ ops formerly served by `bootstrap/src/lib/string/src/lib.rs` —
+/// length, contains, substring, index_of, starts_with, ends_with,
+/// replace, repeat, pad_left, pad_right, split, join, trim, to_upper,
+/// to_lower, from_i64, to_i64, is_valid_i64, from_bool, to_f64,
+/// is_valid_f64, char_at_strict — across ASCII / 2-byte / 3-byte /
+/// 4-byte UTF-8 boundaries plus parity-vs-Rust on representative
+/// inputs. The fixture also asserts the partial-functions raise
+/// specific Exn variants (InvalidIndex on OOB char_at, RuntimeError on
+/// to_i64 of non-digits) per memory `feedback_partial_functions_raise`.
+///
+/// Full stdout interleave is asserted (line count + content), matching
+/// the wasm_alloc_pure_nexus_acceptance idiom — a silently-dropped
+/// intrinsic dispatch fails the line count, not a quiet PASS.
+#[test]
+fn string_pure_nexus_acceptance() {
+    let out = exec_nxc_core_capture_stdout(
+        "bootstrap/tests/fixtures/nxc/test_string_pure_nexus.nx",
+    );
+    let lines: Vec<&str> = out.lines().map(|l| l.trim()).collect();
+    let expected = [
+        // case_length
+        "ok len-ascii",
+        "ok len-latin1",
+        "ok len-cjk",
+        "ok len-emoji",
+        "ok len-mixed",
+        // case_predicates
+        "ok contains-yes",
+        "ok contains-no",
+        "ok starts-yes",
+        "ok starts-no",
+        "ok ends-yes",
+        "ok ends-no",
+        "ok indexof-found",
+        "ok indexof-missing",
+        // case_substring
+        "ok substr-ascii",
+        "ok substr-cjk",
+        "ok substr-emoji",
+        // case_transform
+        "ok upper-ascii",
+        "ok lower-ascii",
+        "ok upper-cjk-preserves",
+        "ok trim-ws",
+        "ok trim-mixed-ws",
+        "ok replace-multi",
+        "ok repeat-3",
+        "ok repeat-0",
+        "ok pad-left",
+        "ok pad-right",
+        // case_split_join
+        "ok split-3",
+        "ok split-no-match",
+        "ok join-3",
+        "ok join-empty",
+        // case_conversions
+        "ok i64-zero",
+        "ok i64-pos",
+        "ok i64-neg",
+        "ok i64-big",
+        "ok to_i64-pos",
+        "ok to_i64-neg",
+        "ok to_i64-trim",
+        "ok valid-i64-yes",
+        "ok valid-i64-no",
+        "ok bool-true",
+        "ok bool-false",
+        "ok to_f64-frac",
+        "ok to_f64-exp",
+        "ok to_f64-neg",
+        "ok valid-f64-yes",
+        "ok valid-f64-no",
+        // case_parity_vs_rust (10+ cases comparing pure-Nexus vs Rust FFI)
+        "ok parity-length",
+        "ok parity-contains",
+        "ok parity-index_of",
+        "ok parity-substring",
+        "ok parity-starts_with",
+        "ok parity-ends_with",
+        "ok parity-to_upper",
+        "ok parity-to_lower",
+        "ok parity-replace",
+        "ok parity-from_i64-pos",
+        "ok parity-from_i64-neg",
+        "ok parity-from_bool",
+        // partial-function raises
+        "ok char_at_strict-oob",
+        "ok to_i64-raises",
+    ];
+    assert_eq!(
+        lines.len(),
+        expected.len(),
+        "expected {} lines, got {} — full stdout:\n{}",
+        expected.len(),
+        lines.len(),
+        out
+    );
+    for (i, want) in expected.iter().enumerate() {
+        assert_eq!(
+            lines[i], *want,
+            "line {} mismatch: want {:?}, got {:?} — full stdout:\n{}",
+            i, want, lines[i], out
+        );
+    }
+}

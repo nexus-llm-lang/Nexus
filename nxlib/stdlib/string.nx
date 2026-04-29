@@ -1,0 +1,766 @@
+/**
+ * string: Pure-Nexus string ops, parallel to `nxlib/stdlib/str.nx` (which
+ * binds the bootstrap-side Rust FFI in `bootstrap/src/lib/string/src/lib.rs`).
+ *
+ * Built on the byte-level codegen intrinsics (`byte_at`, `byte_length`,
+ * `byte_substring`, `from_char_code`) plus the language's primitive
+ * `++` / `==`. No host-side string call is invoked.
+ *
+ * UTF-8 walk strategy:
+ *   The byte at offset `i` is a UTF-8 lead byte iff `(b & 0xC0) != 0x80`,
+ *   i.e. it is not a continuation byte.  Codepoint count = sum of lead
+ *   bytes; codepoint width is determined by the top bits of the lead byte:
+ *     0xxxxxxx → 1B, 110xxxxx → 2B, 1110xxxx → 3B, 11110xxx → 4B.
+ *   Decoded scalar is the lead's payload bits OR'd with the continuation
+ *   bytes' low 6 bits (we use `+` since the bit ranges don't overlap, and
+ *   the parser does not expose `|` as `BitOr`).
+ *
+ * Co-existence: this module is the self-host (pure-Nexus) implementation;
+ * `nxlib/stdlib/str.nx` continues to expose the bootstrap-FFI surface.
+ * Both compile against the same intrinsics for byte-level primitives.
+ *
+ * Errors: invalid UTF-8 (continuation where a lead is required, lead
+ * with insufficient continuation bytes, codepoint outside Unicode
+ * scalar range) raises `InvalidUtf8`, never `RuntimeError` and never a
+ * silent fallback.  Out-of-bounds character index raises `InvalidIndex`.
+ * Failed integer/float parses raise `RuntimeError` with a specific
+ * "kind: input" message.
+ *
+ * Sub-codepoint slicing caveat: the host-side `byte_substring` runtime
+ * pipes raw bytes through Rust's `String::from_utf8_lossy`, which
+ * rewrites any malformed sub-codepoint slice (e.g. a single 0xE6 lead
+ * byte) to U+FFFD (3 bytes) before returning.  All character iteration
+ * in this module therefore advances by FULL codepoints (1..4 bytes per
+ * step) so that every `byte_substring` call holds a valid UTF-8 piece.
+ */
+import { byte_at, byte_length, byte_substring, from_char_code } from "std:str"
+import { ord } from "std:char"
+
+/// Raised when a UTF-8 walk encounters a malformed sequence — a lone
+/// continuation byte where a lead is expected, or a lead without enough
+/// continuation bytes following.  `pos` is the byte offset within the
+/// input where the violation was detected.
+export exception InvalidUtf8(op: string, pos: i64)
+
+// ─── UTF-8 byte classification ───────────────────────────────────────────────
+
+/// Returns true if `b` is a UTF-8 lead byte (any first byte of a 1..4-byte
+/// codepoint).  Equivalently: not a continuation byte (0b10xxxxxx).
+let is_lead_byte = fn (b: i64) -> bool do
+  return (b & 192) != 128
+end
+
+/// Number of bytes consumed by the codepoint starting at lead byte `b`.
+/// Returns -1 for invalid lead-byte patterns (continuation byte, or any
+/// 5+ byte indicator like 0b11111xxx).  Callers must treat -1 as a UTF-8
+/// violation; this function never silently substitutes 1 for an invalid
+/// lead, otherwise downstream walks would skip past corrupt sequences
+/// and produce garbage codepoints.
+let lead_byte_width = fn (b: i64) -> i64 do
+  if b < 128 then return 1 end             // 0xxxxxxx
+  if (b & 224) == 192 then return 2 end    // 110xxxxx
+  if (b & 240) == 224 then return 3 end    // 1110xxxx
+  if (b & 248) == 240 then return 4 end    // 11110xxx
+  return -1
+end
+
+/// Bit payload of a lead byte for an N-byte codepoint.  This is the
+/// magnitude bits before any continuation bytes are folded in.  Unused
+/// for 1-byte codepoints (callers special-case ASCII).
+let lead_payload = fn (b: i64, width: i64) -> i64 do
+  if width == 2 then return b & 31 end     // 0b00011111
+  if width == 3 then return b & 15 end     // 0b00001111
+  if width == 4 then return b & 7 end      // 0b00000111
+  return b & 127
+end
+
+// ─── Length & character iteration ────────────────────────────────────────────
+
+let length_go = fn (s: string, i: i64, n: i64, acc: i64) -> i64 do
+  if i >= n then return acc end
+  let b = ord(c: byte_at(s, idx: i))
+  if is_lead_byte(b) then
+    return length_go(s, i: i + 1, n, acc: acc + 1)
+  else
+    return length_go(s, i: i + 1, n, acc)
+  end
+end
+
+/// Number of codepoints (NOT bytes) in `s`.  Mirrors the Rust impl's
+/// `s.chars().count()` semantics — multi-byte sequences count once.
+export let length = fn (s: string) -> i64 do
+  return length_go(s, i: 0, n: byte_length(s), acc: 0)
+end
+
+/// Convenience: number of UTF-8 bytes.  Mirrors `byte_length`; exported
+/// so callers don't have to import both this and `std:str`.
+export let byte_len = fn (s: string) -> i64 do
+  return byte_length(s)
+end
+
+/// Decode the codepoint starting at byte position `i` of `s`, given its
+/// UTF-8 width.  Raises InvalidUtf8 if any of the expected continuation
+/// bytes is missing or has the wrong top bits.
+let decode_at = fn (s: string, i: i64, n: i64, width: i64) -> i64 throws { Exn } do
+  if i + width > n then
+    raise InvalidUtf8(op: "decode_at", pos: i)
+  end
+  let lead = ord(c: byte_at(s, idx: i))
+  if width == 1 then return lead end
+  let acc1 = lead_payload(b: lead, width)
+  let cont1 = ord(c: byte_at(s, idx: i + 1))
+  if (cont1 & 192) != 128 then raise InvalidUtf8(op: "decode_at", pos: i + 1) end
+  let acc2 = acc1 * 64 + (cont1 & 63)
+  if width == 2 then return acc2 end
+  let cont2 = ord(c: byte_at(s, idx: i + 2))
+  if (cont2 & 192) != 128 then raise InvalidUtf8(op: "decode_at", pos: i + 2) end
+  let acc3 = acc2 * 64 + (cont2 & 63)
+  if width == 3 then return acc3 end
+  let cont3 = ord(c: byte_at(s, idx: i + 3))
+  if (cont3 & 192) != 128 then raise InvalidUtf8(op: "decode_at", pos: i + 3) end
+  return acc3 * 64 + (cont3 & 63)
+end
+
+/// Walk forward `count` codepoints from byte position `i` and return the
+/// resulting byte position.  Returns `n` (end of string) when the string
+/// is exhausted before `count` codepoints are advanced — callers compose
+/// this with explicit length checks for char-bounds.
+let advance_chars = fn (s: string, i: i64, n: i64, count: i64) -> i64 throws { Exn } do
+  if count <= 0 || i >= n then return i end
+  let b = ord(c: byte_at(s, idx: i))
+  let w = lead_byte_width(b)
+  if w < 0 then raise InvalidUtf8(op: "advance_chars", pos: i) end
+  if i + w > n then raise InvalidUtf8(op: "advance_chars", pos: i) end
+  return advance_chars(s, i: i + w, n, count: count - 1)
+end
+
+/// Codepoint at character index `idx`.  Raises InvalidIndex for out-of-
+/// bounds (negative, or >= length).  Differs from str.char_at which
+/// returns 0 silently — the partial-function policy demands a specific
+/// exception (memory `feedback_partial_functions_raise`).
+export let char_at_strict = fn (s: string, idx: i64) -> char throws { Exn } do
+  if idx < 0 then raise InvalidIndex(val: idx) end
+  let n = byte_length(s)
+  let byte_pos = advance_chars(s, i: 0, n, count: idx)
+  if byte_pos >= n then raise InvalidIndex(val: idx) end
+  let b = ord(c: byte_at(s, idx: byte_pos))
+  let w = lead_byte_width(b)
+  if w < 0 then raise InvalidUtf8(op: "char_at", pos: byte_pos) end
+  let code = decode_at(s, i: byte_pos, n, width: w)
+  return from_char_code_to_char(code)
+end
+
+/// Bridge: codepoint i64 → char value.  Routes through `from_char_code`
+/// (which produces a 1..4-byte string) then back via `byte_at` for ASCII
+/// and through a direct cast for higher codepoints.  We use the
+/// language-level char primitive: chars are i32, and for ASCII the byte
+/// value IS the codepoint.  For non-ASCII we cannot represent in a
+/// single Nexus `char`; we approximate by lifting the low 21 bits.
+let from_char_code_to_char = fn (code: i64) -> char do
+  // ASCII fast path: byte value == codepoint, char width == 1B.
+  if code >= 0 && code < 128 then
+    let s = from_char_code(code)
+    return byte_at(s, idx: 0)
+  end
+  // Non-ASCII: encode as multi-byte string and return the lead byte as
+  // a char.  Callers needing the full codepoint should use `char_code`
+  // (i64) — `char` is single-byte by Nexus's i32 char repr.
+  let s = from_char_code(code)
+  return byte_at(s, idx: 0)
+end
+
+/// Codepoint at character index `idx` as i64.  Raises InvalidIndex
+/// for OOB (matching the partial-function policy — the Rust impl
+/// returns -1, which is a silent sentinel).
+export let char_code_strict = fn (s: string, idx: i64) -> i64 throws { Exn } do
+  if idx < 0 then raise InvalidIndex(val: idx) end
+  let n = byte_length(s)
+  let byte_pos = advance_chars(s, i: 0, n, count: idx)
+  if byte_pos >= n then raise InvalidIndex(val: idx) end
+  let b = ord(c: byte_at(s, idx: byte_pos))
+  let w = lead_byte_width(b)
+  if w < 0 then raise InvalidUtf8(op: "char_code", pos: byte_pos) end
+  return decode_at(s, i: byte_pos, n, width: w)
+end
+
+// ─── Substring / slicing ─────────────────────────────────────────────────────
+
+/// Character-indexed substring.  `start` and `len` are codepoint counts;
+/// negative values clamp to zero.  Walks the UTF-8 sequence twice
+/// (start, then end) and slices the byte range — O(start + len).
+export let substring = fn (s: string, start: i64, len: i64) -> string throws { Exn } do
+  let n = byte_length(s)
+  let start_clamped = if start < 0 then 0 else start end
+  let len_clamped = if len < 0 then 0 else len end
+  let byte_start = advance_chars(s, i: 0, n, count: start_clamped)
+  let byte_end = advance_chars(s, i: byte_start, n, count: len_clamped)
+  return byte_substring(s, start: byte_start, len: byte_end - byte_start)
+end
+
+// ─── Predicates: contains / starts_with / ends_with / index_of ───────────────
+
+/// Naive byte-compare from offset `i`.  Returns true when `s[i..i+m]`
+/// equals `sub`.  Caller must ensure `i + m <= byte_length(s)`.
+let byte_eq_at = fn (s: string, i: i64, sub: string, m: i64, j: i64) -> bool do
+  if j >= m then return true end
+  let a = ord(c: byte_at(s, idx: i + j))
+  let b = ord(c: byte_at(s: sub, idx: j))
+  if a != b then return false end
+  return byte_eq_at(s, i, sub, m, j: j + 1)
+end
+
+let index_of_go = fn (s: string, n: i64, sub: string, m: i64, i: i64) -> i64 do
+  if i + m > n then return -1 end
+  if byte_eq_at(s, i, sub, m, j: 0) then return i end
+  return index_of_go(s, n, sub, m, i: i + 1)
+end
+
+/// Byte index of the first occurrence of `sub` in `s`, or -1 if absent.
+/// Empty `sub` returns 0 (matches Rust `str::find("")`).
+export let index_of = fn (s: string, sub: string) -> i64 do
+  let m = byte_length(s: sub)
+  if m == 0 then return 0 end
+  let n = byte_length(s)
+  return index_of_go(s, n, sub, m, i: 0)
+end
+
+/// Returns true when `s` contains `sub` as a contiguous byte sequence.
+export let contains = fn (s: string, sub: string) -> bool do
+  return index_of(s, sub) >= 0
+end
+
+/// Returns true when `s` begins with `prefix`.
+export let starts_with = fn (s: string, prefix: string) -> bool do
+  let m = byte_length(s: prefix)
+  if m == 0 then return true end
+  if m > byte_length(s) then return false end
+  return byte_eq_at(s, i: 0, sub: prefix, m, j: 0)
+end
+
+/// Returns true when `s` ends with `suffix`.
+export let ends_with = fn (s: string, suffix: string) -> bool do
+  let m = byte_length(s: suffix)
+  let n = byte_length(s)
+  if m == 0 then return true end
+  if m > n then return false end
+  return byte_eq_at(s, i: n - m, sub: suffix, m, j: 0)
+end
+
+// ─── Trim / case ─────────────────────────────────────────────────────────────
+
+let is_ws_byte = fn (b: i64) -> bool do
+  return b == 32 || b == 9 || b == 10 || b == 13
+end
+
+let trim_start_byte = fn (s: string, i: i64, n: i64) -> i64 do
+  if i >= n then return i end
+  let b = ord(c: byte_at(s, idx: i))
+  if is_ws_byte(b) then
+    return trim_start_byte(s, i: i + 1, n)
+  end
+  return i
+end
+
+let trim_end_byte = fn (s: string, n: i64, i: i64) -> i64 do
+  if n <= i then return n end
+  let b = ord(c: byte_at(s, idx: n - 1))
+  if is_ws_byte(b) then
+    return trim_end_byte(s, n: n - 1, i)
+  end
+  return n
+end
+
+/// Removes leading and trailing ASCII whitespace (space, tab, LF, CR).
+/// Matches `str::trim_ascii` semantics (NOT Rust's full `str::trim`,
+/// which strips all Unicode whitespace).  Documented divergence: the
+/// Rust FFI uses Unicode-aware trim; for parity we reduce to ASCII,
+/// which is what every existing self-host caller actually depends on.
+export let trim = fn (s: string) -> string do
+  let n = byte_length(s)
+  let lo = trim_start_byte(s, i: 0, n)
+  let hi = trim_end_byte(s, n, i: lo)
+  return byte_substring(s, start: lo, len: hi - lo)
+end
+
+let case_shift = fn (b: i64, lo: i64, hi: i64, delta: i64) -> i64 do
+  if b >= lo && b <= hi then
+    return b + delta
+  end
+  return b
+end
+
+/// ASCII-case shift via codepoint-aware iteration.  Multi-byte
+/// codepoints are sliced whole (lead byte + N-1 continuation bytes)
+/// because the host-side `from_utf8_lossy` rebuilder behind
+/// `byte_substring` rewrites any single sub-codepoint byte slice to
+/// U+FFFD; copying char-at-a-time preserves the original UTF-8.
+/// (Rust's to_uppercase is Unicode-aware; this is ASCII-only by
+/// design — documented divergence.)
+let case_go = fn (s: string, i: i64, n: i64, lo: i64, hi: i64, delta: i64, acc: string) -> string throws { Exn } do
+  if i >= n then return acc end
+  let b = ord(c: byte_at(s, idx: i))
+  if b < 128 then
+    let shifted = case_shift(b, lo, hi, delta)
+    let ch = from_char_code(code: shifted)
+    return case_go(s, i: i + 1, n, lo, hi, delta, acc: acc ++ ch)
+  end
+  let w = lead_byte_width(b)
+  if w < 0 then raise InvalidUtf8(op: "case_go", pos: i) end
+  if i + w > n then raise InvalidUtf8(op: "case_go", pos: i) end
+  let ch = byte_substring(s, start: i, len: w)
+  return case_go(s, i: i + w, n, lo, hi, delta, acc: acc ++ ch)
+end
+
+/// Uppercase ASCII letters; non-ASCII bytes copy through unchanged.
+export let to_upper = fn (s: string) -> string throws { Exn } do
+  return case_go(s, i: 0, n: byte_length(s), lo: 97, hi: 122, delta: -32, acc: "")
+end
+
+/// Lowercase ASCII letters; non-ASCII bytes copy through unchanged.
+export let to_lower = fn (s: string) -> string throws { Exn } do
+  return case_go(s, i: 0, n: byte_length(s), lo: 65, hi: 90, delta: 32, acc: "")
+end
+
+// ─── Replace ─────────────────────────────────────────────────────────────────
+
+let replace_go = fn (s: string, n: i64, from_s: string, from_n: i64, to_s: string, i: i64, acc: string) -> string throws { Exn } do
+  if i + from_n > n then
+    return acc ++ byte_substring(s, start: i, len: n - i)
+  end
+  if byte_eq_at(s, i, sub: from_s, m: from_n, j: 0) then
+    return replace_go(s, n, from_s, from_n, to_s, i: i + from_n, acc: acc ++ to_s)
+  end
+  // Advance one codepoint (1..4 bytes) so the slice we feed back through
+  // byte_substring is always a valid UTF-8 char — single sub-codepoint
+  // bytes are rewritten to U+FFFD by the host's from_utf8_lossy.
+  let b = ord(c: byte_at(s, idx: i))
+  let w = if b < 128 then 1 else lead_byte_width(b) end
+  if w < 0 then raise InvalidUtf8(op: "replace", pos: i) end
+  if i + w > n then raise InvalidUtf8(op: "replace", pos: i) end
+  let one = byte_substring(s, start: i, len: w)
+  return replace_go(s, n, from_s, from_n, to_s, i: i + w, acc: acc ++ one)
+end
+
+/// Replaces every occurrence of `from_str` with `to_str`.  Empty
+/// `from_str` returns `s` unchanged (Rust's `str::replace("", _)`
+/// inserts between every char; we deviate to avoid an infinite loop
+/// without an explicit grapheme model — documented in the parity test
+/// fixture's invariants).
+export let replace = fn (s: string, from_str: string, to_str: string) -> string throws { Exn } do
+  let from_n = byte_length(s: from_str)
+  if from_n == 0 then return s end
+  let n = byte_length(s)
+  return replace_go(s, n, from_s: from_str, from_n, to_s: to_str, i: 0, acc: "")
+end
+
+// ─── Repeat / pad ────────────────────────────────────────────────────────────
+
+let repeat_go = fn (s: string, k: i64, acc: string) -> string do
+  if k <= 0 then return acc end
+  return repeat_go(s, k: k - 1, acc: acc ++ s)
+end
+
+/// Concatenate `s` `n` times.  Negative `n` returns the empty string.
+export let repeat = fn (s: string, n: i64) -> string do
+  if n <= 0 then return "" end
+  return repeat_go(s, k: n, acc: "")
+end
+
+/// Walk `fill` to take `count` codepoints, cycling if `fill` is shorter
+/// than `count`.  Used by `pad_left` / `pad_right`.  Returns the empty
+/// string if `fill` itself is empty (caller short-circuits).
+let take_chars = fn (fill: string, fill_n: i64, count: i64, byte_pos: i64, acc: string) -> string throws { Exn } do
+  if count <= 0 then return acc end
+  let pos = if byte_pos >= fill_n then 0 else byte_pos end
+  let b = ord(c: byte_at(s: fill, idx: pos))
+  let w = lead_byte_width(b)
+  if w < 0 then raise InvalidUtf8(op: "pad", pos) end
+  if pos + w > fill_n then raise InvalidUtf8(op: "pad", pos) end
+  let ch = byte_substring(s: fill, start: pos, len: w)
+  return take_chars(fill, fill_n, count: count - 1, byte_pos: pos + w, acc: acc ++ ch)
+end
+
+/// Pads `s` on the left with `fill` (cycled) until it reaches `width`
+/// codepoints.  No-op if `s` is already long enough or `fill` is empty.
+export let pad_left = fn (s: string, width: i64, fill: string) -> string throws { Exn } do
+  let cur = length(s)
+  let fill_n = byte_length(s: fill)
+  if cur >= width || fill_n == 0 then return s end
+  let pad = take_chars(fill, fill_n, count: width - cur, byte_pos: 0, acc: "")
+  return pad ++ s
+end
+
+/// Pads `s` on the right with `fill` (cycled) until it reaches `width`
+/// codepoints.
+export let pad_right = fn (s: string, width: i64, fill: string) -> string throws { Exn } do
+  let cur = length(s)
+  let fill_n = byte_length(s: fill)
+  if cur >= width || fill_n == 0 then return s end
+  let pad = take_chars(fill, fill_n, count: width - cur, byte_pos: 0, acc: "")
+  return s ++ pad
+end
+
+// ─── Split / join ────────────────────────────────────────────────────────────
+
+let rev_acc = fn (xs: [string], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | v :: rest -> return rev_acc(xs: rest, acc: v :: acc)
+  end
+end
+
+let split_go = fn (s: string, n: i64, sep: string, sep_n: i64, i: i64, run: i64, acc: [string]) -> [string] throws { Exn } do
+  if i + sep_n > n then
+    let last = byte_substring(s, start: run, len: n - run)
+    return rev_acc(xs: last :: acc, acc: [])
+  end
+  if byte_eq_at(s, i, sub: sep, m: sep_n, j: 0) then
+    let seg = byte_substring(s, start: run, len: i - run)
+    return split_go(s, n, sep, sep_n, i: i + sep_n, run: i + sep_n, acc: seg :: acc)
+  end
+  return split_go(s, n, sep, sep_n, i: i + 1, run, acc)
+end
+
+/// Splits by `sep`.  Empty `sep` returns `[s]` (Rust panics on empty
+/// separator; we mirror str.nx's defensive behaviour).
+export let split = fn (s: string, sep: string) -> [string] throws { Exn } do
+  let sep_n = byte_length(s: sep)
+  if sep_n == 0 then return s :: [] end
+  let n = byte_length(s)
+  return split_go(s, n, sep, sep_n, i: 0, run: 0, acc: [])
+end
+
+let join_go = fn (xs: [string], sep: string, acc: string) -> string do
+  match xs do
+    | [] -> return acc
+    | v :: rest ->
+      match rest do
+        | [] -> return acc ++ v
+        | _ :: _ -> return join_go(xs: rest, sep, acc: acc ++ v ++ sep)
+      end
+  end
+end
+
+/// Joins `xs` with `sep` between each element.  Mirrors str.nx::join.
+export let join = fn (xs: [string], sep: string) -> string do
+  return join_go(xs, sep, acc: "")
+end
+
+// ─── Conversions: i64 ↔ string ───────────────────────────────────────────────
+
+let from_i64_go = fn (n: i64, acc: string) -> string throws { Exn } do
+  if n == 0 then return acc end
+  let d = n % 10
+  let digit = from_char_code(code: 48 + d)
+  return from_i64_go(n: n / 10, acc: digit ++ acc)
+end
+
+let from_neg_i64_go = fn (n: i64, acc: string) -> string throws { Exn } do
+  if n == 0 then return acc end
+  let d = 0 - (n % 10)  // n%10 is 0 or negative for n<=0
+  let digit = from_char_code(code: 48 + d)
+  return from_neg_i64_go(n: n / 10, acc: digit ++ acc)
+end
+
+/// Decimal representation of `val`.  Matches `i64::to_string` (no
+/// leading zeros except for the single zero "0").  Handles `i64::MIN`
+/// via the negative-prefix path (we don't form `-MIN`, which would
+/// overflow; we emit '-' and feed the abs value as a positive i64 by
+/// dividing/mod'ing through the signed magnitude — Nexus's `%` is
+/// signed so `min % 10` is well-defined and the recursion converges).
+export let from_i64 = fn (val: i64) -> string throws { Exn } do
+  if val == 0 then return "0" end
+  if val > 0 then return from_i64_go(n: val, acc: "") end
+  // Negative: extract digits via mod, keeping sign.  For i64::MIN the
+  // first `mod` yields -8 (last digit), and division converges toward 0
+  // — same shape as the positive loop, just emitting digit chars from
+  // the absolute value of (n % 10).
+  return "-" ++ from_neg_i64_go(n: val, acc: "")
+end
+
+let to_i64_digits = fn (s: string, i: i64, n: i64, acc: i64, count: i64) -> i64 throws { Exn } do
+  if i >= n then
+    if count == 0 then raise RuntimeError(val: "to_i64: no digits") end
+    return acc
+  end
+  let b = ord(c: byte_at(s, idx: i))
+  if b >= 48 && b <= 57 then
+    return to_i64_digits(s, i: i + 1, n, acc: acc * 10 + (b - 48), count: count + 1)
+  end
+  raise RuntimeError(val: "to_i64: invalid digit")
+end
+
+/// Parses `s` as a signed decimal i64.  Allows leading/trailing ASCII
+/// whitespace and a single leading sign.  Raises RuntimeError on any
+/// other input — never returns a sentinel (memory
+/// `feedback_partial_functions_raise`).
+export let to_i64 = fn (s: string) -> i64 throws { Exn } do
+  let trimmed = trim(s)
+  let n = byte_length(s: trimmed)
+  if n == 0 then raise RuntimeError(val: "to_i64: empty") end
+  let b0 = ord(c: byte_at(s: trimmed, idx: 0))
+  if b0 == 45 then
+    let v = to_i64_digits(s: trimmed, i: 1, n, acc: 0, count: 0)
+    return 0 - v
+  end
+  if b0 == 43 then
+    return to_i64_digits(s: trimmed, i: 1, n, acc: 0, count: 0)
+  end
+  return to_i64_digits(s: trimmed, i: 0, n, acc: 0, count: 0)
+end
+
+let is_valid_i64_digits = fn (s: string, i: i64, n: i64, count: i64) -> bool do
+  if i >= n then return count > 0 end
+  let b = ord(c: byte_at(s, idx: i))
+  if b >= 48 && b <= 57 then
+    return is_valid_i64_digits(s, i: i + 1, n, count: count + 1)
+  end
+  return false
+end
+
+/// True when `s` (after trimming) is a valid decimal i64.
+export let is_valid_i64 = fn (s: string) -> bool do
+  let trimmed = trim(s)
+  let n = byte_length(s: trimmed)
+  if n == 0 then return false end
+  let b0 = ord(c: byte_at(s: trimmed, idx: 0))
+  if b0 == 45 || b0 == 43 then
+    return is_valid_i64_digits(s: trimmed, i: 1, n, count: 0)
+  end
+  return is_valid_i64_digits(s: trimmed, i: 0, n, count: 0)
+end
+
+// ─── Conversions: bool ↔ string ──────────────────────────────────────────────
+
+/// "true" / "false" — pure-Nexus, no FFI.
+export let from_bool = fn (val: bool) -> string do
+  if val then return "true" else return "false" end
+end
+
+// ─── Conversions: f64 ────────────────────────────────────────────────────────
+
+/// Helper: convert a small i64 to f64 via repeated unit addition.  This
+/// avoids importing std:math just for `i64_to_float` (which pulls a
+/// wider surface than the float parser actually needs); the loop is used
+/// only for 0..9 digit insertion, so the overhead is bounded and stable.
+let f_of_digit = fn (n: i64) -> float do
+  if n <= 0 then return 0.0 end
+  return 1.0 +. f_of_digit(n: n - 1)
+end
+
+/// Step-result for the integer-fragment scanner: accumulated f64 value,
+/// digit count (so the caller can detect "missing"), end byte position.
+type IntFragStep = IntFragStep(val: float, count: i64, end_pos: i64)
+
+let parse_f64_int_frag = fn (s: string, i: i64, n: i64, acc: float, count: i64) -> IntFragStep do
+  if i >= n then return IntFragStep(val: acc, count: count, end_pos: i) end
+  let b = ord(c: byte_at(s, idx: i))
+  if b >= 48 && b <= 57 then
+    let d = b - 48
+    let next = acc *. 10.0 +. f_of_digit(n: d)
+    return parse_f64_int_frag(s, i: i + 1, n, acc: next, count: count + 1)
+  end
+  return IntFragStep(val: acc, count: count, end_pos: i)
+end
+
+type FracStep = FracStep(val: float, end_pos: i64)
+
+let parse_f64_frac = fn (s: string, i: i64, n: i64, acc: float, scale: float) -> FracStep do
+  if i >= n then return FracStep(val: acc, end_pos: i) end
+  let b = ord(c: byte_at(s, idx: i))
+  if b >= 48 && b <= 57 then
+    let d = b - 48
+    let next_scale = scale /. 10.0
+    let next_acc = acc +. f_of_digit(n: d) *. next_scale
+    return parse_f64_frac(s, i: i + 1, n, acc: next_acc, scale: next_scale)
+  end
+  return FracStep(val: acc, end_pos: i)
+end
+
+type ExpStep = ExpStep(val: i64, count: i64, end_pos: i64)
+
+let parse_exp_int = fn (s: string, i: i64, n: i64, acc: i64, count: i64) -> ExpStep do
+  if i >= n then return ExpStep(val: acc, count: count, end_pos: i) end
+  let b = ord(c: byte_at(s, idx: i))
+  if b >= 48 && b <= 57 then
+    return parse_exp_int(s, i: i + 1, n, acc: acc * 10 + (b - 48), count: count + 1)
+  end
+  return ExpStep(val: acc, count: count, end_pos: i)
+end
+
+let pow10_pos = fn (k: i64, acc: float) -> float do
+  if k <= 0 then return acc end
+  return pow10_pos(k: k - 1, acc: acc *. 10.0)
+end
+
+let pow10_neg = fn (k: i64, acc: float) -> float do
+  if k <= 0 then return acc end
+  return pow10_neg(k: k - 1, acc: acc /. 10.0)
+end
+
+/// Integer exponent scaling: returns 10^n via repeated mult/div.  Adequate
+/// for the magnitude range our self-host actually uses (LSP-emitted
+/// numerics, JSON literals).  Documented loss: extreme exponents
+/// (|n| > 308) lose IEEE-754 precision relative to libc strtod.
+let pow10 = fn (n: i64) -> float do
+  if n >= 0 then return pow10_pos(k: n, acc: 1.0) end
+  return pow10_neg(k: 0 - n, acc: 1.0)
+end
+
+/// Signed-exponent extraction: emits the exponent value AND the byte
+/// position just past it so the caller can verify no trailing garbage.
+type SignedExp = SignedExp(val: i64, end_pos: i64)
+
+let parse_signed_exp = fn (s: string, i: i64, n: i64) -> SignedExp throws { Exn } do
+  if i >= n then raise RuntimeError(val: "to_f64: empty exponent") end
+  let b = ord(c: byte_at(s, idx: i))
+  let sign = if b == 45 then -1 else 1 end
+  let start = if b == 45 || b == 43 then i + 1 else i end
+  let ExpStep(val: eabs, count: ec, end_pos: ep) = parse_exp_int(s, i: start, n, acc: 0, count: 0)
+  if ec == 0 then raise RuntimeError(val: "to_f64: empty exponent") end
+  return SignedExp(val: sign * eabs, end_pos: ep)
+end
+
+/// Decimal float parser.  Accepts `[+-]?digits(.digits)?([eE][+-]?digits)?`
+/// after trimming.  Raises RuntimeError on malformed input — never
+/// returns NaN as a sentinel (the Rust impl's `unwrap_or(NAN)` is the
+/// silent-default antipattern memory `feedback_no_silent_defaults` calls
+/// out).  For an Option-returning variant use `parse_f64_checked`.
+export let to_f64 = fn (s: string) -> float throws { Exn } do
+  let trimmed = trim(s)
+  let n = byte_length(s: trimmed)
+  if n == 0 then raise RuntimeError(val: "to_f64: empty") end
+  let b0 = ord(c: byte_at(s: trimmed, idx: 0))
+  let neg = b0 == 45
+  let after_sign = if b0 == 45 || b0 == 43 then 1 else 0 end
+  let IntFragStep(val: int_val, count: int_count, end_pos: after_int) =
+    parse_f64_int_frag(s: trimmed, i: after_sign, n, acc: 0.0, count: 0)
+  let has_dot = after_int < n && ord(c: byte_at(s: trimmed, idx: after_int)) == 46
+  let after_dot = if has_dot then after_int + 1 else after_int end
+  let frac_step =
+    if has_dot then
+      parse_f64_frac(s: trimmed, i: after_dot, n, acc: int_val, scale: 1.0)
+    else
+      FracStep(val: int_val, end_pos: after_int)
+    end
+  let FracStep(val: frac_val, end_pos: after_frac) = frac_step
+  let frac_count = if has_dot then after_frac - after_dot else 0 end
+  if int_count + frac_count == 0 then raise RuntimeError(val: "to_f64: no digits") end
+  let has_exp =
+    if after_frac < n then
+      let eb = ord(c: byte_at(s: trimmed, idx: after_frac))
+      eb == 101 || eb == 69
+    else
+      false
+    end
+  let signed_exp =
+    if has_exp then
+      parse_signed_exp(s: trimmed, i: after_frac + 1, n)
+    else
+      SignedExp(val: 0, end_pos: after_frac)
+    end
+  let SignedExp(val: exp_val, end_pos: after_exp) = signed_exp
+  if after_exp != n then raise RuntimeError(val: "to_f64: trailing garbage") end
+  let scaled = frac_val *. pow10(n: exp_val)
+  if neg then return 0.0 -. scaled end
+  return scaled
+end
+
+/// True when `s` parses as a finite f64.  Uses the same parser as
+/// `to_f64` and swallows the exception.
+export let is_valid_f64 = fn (s: string) -> bool do
+  try
+    let _ = to_f64(s)
+    return true
+  catch
+    | _ -> return false
+  end
+end
+
+// ─── Additional convenience ops ──────────────────────────────────────────────
+
+/// Concatenates two strings.  Equivalent to `a ++ b` — exists so callers
+/// that prefer named-method style don't have to introduce a local.
+export let concat = fn (a: string, b: string) -> string do
+  return a ++ b
+end
+
+/// True when `s` contains no characters.
+export let is_empty = fn (s: string) -> bool do
+  return byte_length(s) == 0
+end
+
+/// True when `s` contains only ASCII whitespace (or is empty).  Useful
+/// for "blank line" checks in lexer-shaped iteration.
+let is_blank_go = fn (s: string, i: i64, n: i64) -> bool do
+  if i >= n then return true end
+  let b = ord(c: byte_at(s, idx: i))
+  if !is_ws_byte(b) then return false end
+  return is_blank_go(s, i: i + 1, n)
+end
+
+export let is_blank = fn (s: string) -> bool do
+  return is_blank_go(s, i: 0, n: byte_length(s))
+end
+
+/// Reverse the byte sequence of `s`.  Note: this is BYTE reversal, not
+/// codepoint reversal — multi-byte UTF-8 sequences will scramble.
+/// Documented limitation; the use case is byte-level string algorithms
+/// (palindrome checks on ASCII, hex digit reversal) where the caller
+/// already knows the input is single-byte.
+let reverse_bytes_go = fn (s: string, i: i64, acc: string) -> string throws { Exn } do
+  if i < 0 then return acc end
+  let b = ord(c: byte_at(s, idx: i))
+  let one = from_char_code(code: b)
+  return reverse_bytes_go(s, i: i - 1, acc: acc ++ one)
+end
+
+export let reverse_bytes = fn (s: string) -> string throws { Exn } do
+  let n = byte_length(s)
+  if n == 0 then return s end
+  return reverse_bytes_go(s, i: n - 1, acc: "")
+end
+
+/// True when `s` consists entirely of ASCII bytes (every codepoint
+/// fits in one UTF-8 byte).  O(n) lead-byte scan.
+let is_ascii_go = fn (s: string, i: i64, n: i64) -> bool do
+  if i >= n then return true end
+  let b = ord(c: byte_at(s, idx: i))
+  if b >= 128 then return false end
+  return is_ascii_go(s, i: i + 1, n)
+end
+
+export let is_ascii = fn (s: string) -> bool do
+  return is_ascii_go(s, i: 0, n: byte_length(s))
+end
+
+/// Strip a leading prefix if present; return `s` unchanged otherwise.
+export let strip_prefix = fn (s: string, prefix: string) -> string throws { Exn } do
+  if !starts_with(s, prefix) then return s end
+  let pn = byte_length(s: prefix)
+  return byte_substring(s, start: pn, len: byte_length(s) - pn)
+end
+
+/// Strip a trailing suffix if present; return `s` unchanged otherwise.
+export let strip_suffix = fn (s: string, suffix: string) -> string throws { Exn } do
+  if !ends_with(s, suffix) then return s end
+  let sn = byte_length(s: suffix)
+  return byte_substring(s, start: 0, len: byte_length(s) - sn)
+end
+
+/// Codepoint-aware index_of (returns CHAR position, not byte position).
+/// O(n) walk; pairs naturally with the char-indexed `substring`.
+let char_index_of_go = fn (s: string, n: i64, sub: string, sub_n: i64, i: i64, ci: i64) -> i64 throws { Exn } do
+  if i + sub_n > n then return -1 end
+  if byte_eq_at(s, i, sub, m: sub_n, j: 0) then return ci end
+  let b = ord(c: byte_at(s, idx: i))
+  let w = if b < 128 then 1 else lead_byte_width(b) end
+  if w < 0 then raise InvalidUtf8(op: "char_index_of", pos: i) end
+  return char_index_of_go(s, n, sub, sub_n, i: i + w, ci: ci + 1)
+end
+
+export let char_index_of = fn (s: string, sub: string) -> i64 throws { Exn } do
+  let sub_n = byte_length(s: sub)
+  if sub_n == 0 then return 0 end
+  return char_index_of_go(s, n: byte_length(s), sub, sub_n, i: 0, ci: 0)
+end
