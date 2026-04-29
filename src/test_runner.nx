@@ -1,0 +1,426 @@
+/**
+ * test_runner: Implementation of `nexus test [path]` subcommand.
+ *
+ * Discovers `*_test.nx` fixture files under a path (default `tests/`),
+ * compiles each via `nexus build`, runs the resulting wasm via `wasmtime`,
+ * and reports per-test results: PASS / FAIL with exit code, stderr tail,
+ * and wall-clock duration.
+ *
+ * Output:
+ *   - Human-readable summary on stderr (PASS/FAIL/total + per-test lines).
+ *   - Optional JUnit XML when `--junit FILE` is supplied; one
+ *     `<testsuite>`/`<testcase>` document covering the whole run.
+ *
+ * Exit code: 0 if every discovered test passes, 1 if any fails or the
+ * discovery turns up zero files (an empty test run is treated as user
+ * error — silent passes hide CI misconfiguration).
+ *
+ * Parallelism: `--jobs N` is accepted on the CLI for forward compatibility
+ * but the current MVP runs tests sequentially. `Proc.exec` is a blocking
+ * host call and Nexus's fiber scheduler is single-threaded cooperative,
+ * so spawning multiple fibers cannot overlap subprocess execution.
+ * Surfacing a stub flag now keeps the CI invocation stable when a future
+ * runtime adds a non-blocking exec primitive.
+ */
+
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import { Clock } from "std:clock"
+import { Proc, ExecResult } from "std:proc"
+import * as str from "std:str"
+import { Option, Some, None } from "std:option"
+import * as list from "std:list"
+import { InvalidUsage } from "src/common/error.nx"
+
+/// Per-test outcome captured by the runner. `wall_ms` is the elapsed
+/// time around the wasmtime run only (compile time is excluded so a slow
+/// codegen does not pollute the per-test budget).
+export type TestOutcome =
+  | TestPass(file: string, wall_ms: i64)
+  | TestFail(file: string, wall_ms: i64, exit_code: i64, stderr_tail: string, stage: string)
+
+/// Parsed CLI options for the `test` subcommand.
+export type TestOptions = TestOptions(
+  path: string,
+  jobs: i64,
+  junit_path: Option<string>,
+  nexus_bin: string,
+  wasmtime_bin: string,
+)
+
+// ─── Argument parsing ─────────────────────────────────────────────────────
+
+export type ParsedTestSubcommand = ParsedTestSubcommand(remaining: [string], is_test: bool)
+
+/// Detect a leading `test` subcommand. Mirrors `strip_typecheck_subcommand`
+/// in driver.nx: peel the program-name token, then check the next arg.
+export let strip_test_subcommand = fn (xs: [string]) -> ParsedTestSubcommand do
+  match xs do
+    | [] -> return ParsedTestSubcommand(remaining: [], is_test: false)
+    | prog :: rest ->
+      match rest do
+        | [] -> return ParsedTestSubcommand(remaining: xs, is_test: false)
+        | second :: rest2 ->
+          if second == "test" then
+            return ParsedTestSubcommand(remaining: prog :: rest2, is_test: true)
+          end
+          return ParsedTestSubcommand(remaining: xs, is_test: false)
+      end
+  end
+end
+
+type FlagPair = FlagPair(remaining: [string], jobs: i64, junit: Option<string>, nexus_bin: string, wasmtime_bin: string)
+
+/// Strip `--jobs N`, `--junit FILE`, `--nexus-bin PATH`, `--wasmtime-bin PATH`
+/// pairs from `xs`, preserving the order of any unrecognised tokens. The
+/// `--nexus-bin` / `--wasmtime-bin` flags exist so the runner stays
+/// host-agnostic: stage1 wasm has no way to discover a working `nexus`
+/// binary on its own, and the CI harness needs to point at a checked-out
+/// `bootstrap/target/release/nexus`.
+let parse_flags = fn (xs: [string], acc_remaining: [string], jobs: i64, junit: Option<string>, nexus_bin: string, wasmtime_bin: string) -> FlagPair throws { Exn } do
+  match xs do
+    | [] -> return FlagPair(remaining: list.reverse(xs: acc_remaining), jobs, junit, nexus_bin, wasmtime_bin)
+    | flag :: rest ->
+      if flag == "--jobs" then
+        match rest do
+          | [] -> raise InvalidUsage(detail: "--jobs requires an integer")
+          | value :: rest2 ->
+            match str.parse_i64(value) do
+              | Some(val: n) ->
+                if n < 1 then raise InvalidUsage(detail: "--jobs must be >= 1") end
+                return parse_flags(xs: rest2, acc_remaining, jobs: n, junit, nexus_bin, wasmtime_bin)
+              | None -> raise InvalidUsage(detail: "--jobs value must be an integer: " ++ value)
+            end
+        end
+      end
+      if flag == "--junit" then
+        match rest do
+          | [] -> raise InvalidUsage(detail: "--junit requires a path")
+          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, jobs, junit: Some(val: value), nexus_bin, wasmtime_bin)
+        end
+      end
+      if flag == "--nexus-bin" then
+        match rest do
+          | [] -> raise InvalidUsage(detail: "--nexus-bin requires a path")
+          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, jobs, junit, nexus_bin: value, wasmtime_bin)
+        end
+      end
+      if flag == "--wasmtime-bin" then
+        match rest do
+          | [] -> raise InvalidUsage(detail: "--wasmtime-bin requires a path")
+          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, jobs, junit, nexus_bin, wasmtime_bin: value)
+        end
+      end
+      return parse_flags(xs: rest, acc_remaining: flag :: acc_remaining, jobs, junit, nexus_bin, wasmtime_bin)
+  end
+end
+
+/// Build a TestOptions from the post-`test`-subcommand argv tail. The first
+/// positional arg (if any) is the discovery path; default is `tests/`.
+export let parse_test_options = fn (args: [string]) -> TestOptions throws { Exn } do
+  let FlagPair(remaining, jobs, junit, nexus_bin, wasmtime_bin) =
+    parse_flags(xs: args, acc_remaining: [], jobs: 1, junit: None, nexus_bin: "nexus", wasmtime_bin: "wasmtime")
+  let path = match remaining do
+    | [] -> "tests/"
+    | p :: _ -> p
+  end
+  return TestOptions(path, jobs, junit_path: junit, nexus_bin, wasmtime_bin)
+end
+
+// ─── Discovery ────────────────────────────────────────────────────────────
+
+/// Recursively walk `path`, returning every regular file whose name ends
+/// with `_test.nx`. When `path` is a single file, return it iff it matches
+/// the pattern. Walk order is deterministic because `Fs.list_dir` sorts
+/// names at the host layer.
+export let discover_tests = fn (path: string) -> [string] require { Fs } throws { Exn } do
+  if Fs.exists(path) == false then
+    raise InvalidUsage(detail: "test path does not exist: " ++ path)
+  end
+  // Single-file mode: a path that already names a *_test.nx file is
+  // returned as-is. Caller decides whether zero is a hard error; an
+  // empty list still surfaces "no tests".
+  if Fs.is_file(path) then
+    if is_test_filename(name: path) then
+      return [path]
+    end
+    return []
+  end
+  return list.reverse(xs: walk_dir(path: strip_trailing_slash(s: path), acc: []))
+end
+
+let strip_trailing_slash = fn (s: string) -> string do
+  let n = str.length(s)
+  if n == 0 then return s end
+  if str.ends_with(s, suffix: "/") then
+    return str.substring(s, start: 0, len: n - 1)
+  end
+  return s
+end
+
+let is_test_filename = fn (name: string) -> bool do
+  return str.ends_with(s: name, suffix: "_test.nx")
+end
+
+let walk_dir = fn (path: string, acc: [string]) -> [string] require { Fs } throws { Exn } do
+  let names = Fs.list_dir(path)
+  return walk_entries(names, dir: path, acc)
+end
+
+let walk_entries = fn (names: [string], dir: string, acc: [string]) -> [string] require { Fs } throws { Exn } do
+  match names do
+    | [] -> return acc
+    | name :: rest ->
+      let full = dir ++ "/" ++ name
+      let acc2 = visit_entry(path: full, name, acc)
+      return walk_entries(names: rest, dir, acc: acc2)
+  end
+end
+
+let visit_entry = fn (path: string, name: string, acc: [string]) -> [string] require { Fs } throws { Exn } do
+  // Hidden / dot-prefixed entries are skipped to keep parity with bd-style
+  // walkers that ignore .git, .cache, etc.
+  if str.starts_with(s: name, prefix: ".") then return acc end
+  if Fs.is_file(path) then
+    if is_test_filename(name) then
+      return path :: acc
+    end
+    return acc
+  end
+  // Anything not a regular file is treated as a directory and walked.
+  // `Fs.exists && !is_file` covers both real dirs and odd inodes; the
+  // recursive list_dir call surfaces I/O errors via Exn for the caller.
+  return walk_dir(path, acc)
+end
+
+// ─── Execution ────────────────────────────────────────────────────────────
+
+/// Compile + run a single test fixture. Returns a TestOutcome describing
+/// the result. Failures distinguish compile (`stage = "compile"`) from
+/// runtime (`stage = "run"`) so the JUnit / human reports can hint at the
+/// right log to inspect.
+export let run_one_test = fn (file: string, opts: TestOptions, tmp_wasm: string) -> TestOutcome require { Proc, Clock, Console } do
+  // Compile phase: invoke the host nexus binary. Every failure here is
+  // surfaced as a TestFail so a single broken fixture cannot silently skip.
+  let compile_args = ["build", file, "-o", tmp_wasm, "--explain-capabilities", "none"]
+  let compile_t0 = Clock.now()
+  let compile = Proc.exec(cmd: opts.nexus_bin, args: compile_args)
+  let compile_t1 = Clock.now()
+  let compile_ms = compile_t1 - compile_t0
+  match compile do | ExecResult(exit_code: ce, stdout: _, stderr: cerr) ->
+    if ce != 0 then
+      return TestFail(file, wall_ms: compile_ms, exit_code: ce, stderr_tail: tail_lines(s: cerr, n: 8), stage: "compile")
+    end
+  end
+  // Run phase: invoke wasmtime against the produced wasm with the
+  // capability flags every fixture needs (matches bootstrap.sh's CORE
+  // flag set; we omit -S http because test fixtures don't yet exercise
+  // network ports).
+  let run_args = wasmtime_flags(tmp_wasm)
+  let run_t0 = Clock.now()
+  let run = Proc.exec(cmd: opts.wasmtime_bin, args: run_args)
+  let run_t1 = Clock.now()
+  let run_ms = run_t1 - run_t0
+  match run do | ExecResult(exit_code: re, stdout: _, stderr: rerr) ->
+    if re == 0 then
+      return TestPass(file, wall_ms: run_ms)
+    end
+    return TestFail(file, wall_ms: run_ms, exit_code: re, stderr_tail: tail_lines(s: rerr, n: 16), stage: "run")
+  end
+end
+
+/// Default wasmtime invocation for a compiled test wasm. Matches the
+/// CORE-flag set from bootstrap.sh so every wasm proposal the stdlib
+/// uses (TCO, exceptions, function-references, stack-switching) is
+/// enabled. `--dir=.` lets fixtures read repo-relative inputs;
+/// `--dir=$TMPDIR` is added so JUnit-style scratch files work.
+let wasmtime_flags = fn (wasm_path: string) -> [string] do
+  return [
+    "run",
+    "-W", "tail-call=y,exceptions=y,function-references=y,stack-switching=y,max-memory-size=8589934592",
+    "--dir=.",
+    wasm_path,
+  ]
+end
+
+let tail_lines = fn (s: string, n: i64) -> string do
+  let lines = str.split(s, sep: "\n")
+  let total = list.length(xs: lines)
+  if total <= n then return s end
+  let dropped = list.drop_n(xs: lines, n: total - n)
+  return str.join(xs: dropped, sep: "\n")
+end
+
+// ─── Reporting ────────────────────────────────────────────────────────────
+
+/// Aggregate counts produced by `summarize`.
+export type RunSummary = RunSummary(total: i64, passed: i64, failed: i64, total_ms: i64)
+
+let count_outcomes = fn (outcomes: [TestOutcome], passed: i64, failed: i64, total_ms: i64) -> RunSummary do
+  match outcomes do
+    | [] -> return RunSummary(total: passed + failed, passed, failed, total_ms)
+    | TestPass(file: _, wall_ms) :: rest ->
+      return count_outcomes(outcomes: rest, passed: passed + 1, failed, total_ms: total_ms + wall_ms)
+    | TestFail(file: _, wall_ms, _) :: rest ->
+      return count_outcomes(outcomes: rest, passed, failed: failed + 1, total_ms: total_ms + wall_ms)
+  end
+end
+
+/// Print one line per outcome plus a final aggregate line. Returns the
+/// summary so callers can decide on exit code and JUnit output.
+export let report = fn (outcomes: [TestOutcome]) -> RunSummary require { Console } do
+  print_outcomes(outcomes)
+  let summary = count_outcomes(outcomes, passed: 0, failed: 0, total_ms: 0)
+  match summary do | RunSummary(total, passed, failed, total_ms) ->
+    Console.eprintln(val: "")
+    Console.eprintln(val: "test summary: " ++ str.from_i64(val: passed) ++ " passed, "
+      ++ str.from_i64(val: failed) ++ " failed, "
+      ++ str.from_i64(val: total) ++ " total ("
+      ++ str.from_i64(val: total_ms) ++ "ms)")
+  end
+  return summary
+end
+
+let print_outcomes = fn (outcomes: [TestOutcome]) -> unit require { Console } do
+  match outcomes do
+    | [] -> return ()
+    | TestPass(file, wall_ms) :: rest ->
+      Console.eprintln(val: "PASS  " ++ file ++ "  (" ++ str.from_i64(val: wall_ms) ++ "ms)")
+      return print_outcomes(outcomes: rest)
+    | TestFail(file, wall_ms, exit_code, stderr_tail, stage) :: rest ->
+      Console.eprintln(val: "FAIL  " ++ file ++ "  (" ++ str.from_i64(val: wall_ms) ++ "ms, "
+        ++ stage ++ " exit=" ++ str.from_i64(val: exit_code) ++ ")")
+      if str.length(s: stderr_tail) > 0 then
+        Console.eprintln(val: indent(s: stderr_tail, prefix: "      "))
+      end
+      return print_outcomes(outcomes: rest)
+  end
+end
+
+let indent = fn (s: string, prefix: string) -> string do
+  let lines = str.split(s, sep: "\n")
+  let prefixed = list.map(xs: lines, f: fn (val: string) -> string do
+    return prefix ++ val
+  end)
+  return str.join(xs: prefixed, sep: "\n")
+end
+
+// ─── JUnit XML output ─────────────────────────────────────────────────────
+
+/// Serialise outcomes as a minimal but valid JUnit XML document. Schema:
+///   <testsuites>
+///     <testsuite name="nexus" tests=N failures=F time=S>
+///       <testcase name=... classname=... time=...>
+///         (optional) <failure message=... type="exit-NN">…stderr…</failure>
+///       </testcase>...
+///     </testsuite>
+///   </testsuites>
+/// Times are reported in seconds with millisecond precision (JUnit's
+/// expected unit).
+export let render_junit_xml = fn (outcomes: [TestOutcome], summary: RunSummary) -> string do
+  match summary do | RunSummary(total, passed: _, failed, total_ms) ->
+    let header = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      ++ "<testsuites>\n"
+      ++ "  <testsuite name=\"nexus\" tests=\"" ++ str.from_i64(val: total) ++ "\""
+      ++ " failures=\"" ++ str.from_i64(val: failed) ++ "\""
+      ++ " time=\"" ++ ms_to_seconds(ms: total_ms) ++ "\">\n"
+    let body = render_cases(outcomes, acc: "")
+    let footer = "  </testsuite>\n</testsuites>\n"
+    return header ++ body ++ footer
+  end
+end
+
+let render_cases = fn (outcomes: [TestOutcome], acc: string) -> string do
+  match outcomes do
+    | [] -> return acc
+    | TestPass(file, wall_ms) :: rest ->
+      let line = "    <testcase classname=\"nexus\" name=\"" ++ xml_escape(s: file) ++ "\""
+        ++ " time=\"" ++ ms_to_seconds(ms: wall_ms) ++ "\"/>\n"
+      return render_cases(outcomes: rest, acc: acc ++ line)
+    | TestFail(file, wall_ms, exit_code, stderr_tail, stage) :: rest ->
+      let open_tag = "    <testcase classname=\"nexus\" name=\"" ++ xml_escape(s: file) ++ "\""
+        ++ " time=\"" ++ ms_to_seconds(ms: wall_ms) ++ "\">\n"
+      let fail_msg = stage ++ " failed (exit " ++ str.from_i64(val: exit_code) ++ ")"
+      let fail_tag = "      <failure message=\"" ++ xml_escape(s: fail_msg) ++ "\""
+        ++ " type=\"exit-" ++ str.from_i64(val: exit_code) ++ "\">"
+        ++ xml_escape(s: stderr_tail)
+        ++ "</failure>\n"
+      let close_tag = "    </testcase>\n"
+      return render_cases(outcomes: rest, acc: acc ++ open_tag ++ fail_tag ++ close_tag)
+  end
+end
+
+let xml_escape = fn (s: string) -> string do
+  let s1 = str.replace(s, from_str: "&", to_str: "&amp;")
+  let s2 = str.replace(s: s1, from_str: "<", to_str: "&lt;")
+  let s3 = str.replace(s: s2, from_str: ">", to_str: "&gt;")
+  let s4 = str.replace(s: s3, from_str: "\"", to_str: "&quot;")
+  return str.replace(s: s4, from_str: "'", to_str: "&apos;")
+end
+
+let ms_to_seconds = fn (ms: i64) -> string do
+  // Render as `S.MMM` to a millisecond resolution. Avoid floats so the
+  // self-host doesn't depend on f64 codegen quirks.
+  let whole = ms / 1000
+  let frac = ms - whole * 1000
+  let frac_str = pad3(n: frac)
+  return str.from_i64(val: whole) ++ "." ++ frac_str
+end
+
+let pad3 = fn (n: i64) -> string do
+  if n < 10 then return "00" ++ str.from_i64(val: n) end
+  if n < 100 then return "0" ++ str.from_i64(val: n) end
+  return str.from_i64(val: n)
+end
+
+// ─── Top-level entry ──────────────────────────────────────────────────────
+
+/// Run every discovered test sequentially, render the report, optionally
+/// dump a JUnit XML file, and return the unix exit code (0 = green, 1 =
+/// any failure or empty discovery).
+export let run_test_subcommand = fn (args: [string]) -> i64 require { Fs, Proc, Clock, Console } throws { Exn } do
+  let opts = parse_test_options(args)
+  match opts do | TestOptions(path, jobs, junit_path, nexus_bin: _, wasmtime_bin: _) ->
+    if jobs > 1 then
+      Console.eprintln(val: "nexus test: --jobs " ++ str.from_i64(val: jobs)
+        ++ " requested; current MVP runs sequentially (Proc.exec is blocking)")
+    end
+    let files = discover_tests(path)
+    let n = list.length(xs: files)
+    if n == 0 then
+      Console.eprintln(val: "nexus test: no *_test.nx files found under " ++ path)
+      return 1
+    end
+    Console.eprintln(val: "nexus test: discovered " ++ str.from_i64(val: n) ++ " file(s) under " ++ path)
+    let outcomes = run_all(files, opts, idx: 0)
+    let summary = report(outcomes)
+    match junit_path do
+      | None -> ()
+      | Some(val: jpath) ->
+        let xml = render_junit_xml(outcomes, summary)
+        Fs.write_string(path: jpath, content: xml)
+        Console.eprintln(val: "nexus test: wrote JUnit XML to " ++ jpath)
+    end
+    match summary do | RunSummary(total: _, passed: _, failed, total_ms: _) ->
+      if failed == 0 then return 0 end
+      return 1
+    end
+  end
+end
+
+let run_all = fn (files: [string], opts: TestOptions, idx: i64) -> [TestOutcome] require { Proc, Clock, Console } do
+  match files do
+    | [] -> return []
+    | f :: rest ->
+      let tmp = tmp_wasm_path(idx)
+      let outcome = run_one_test(file: f, opts, tmp_wasm: tmp)
+      return outcome :: run_all(files: rest, opts, idx: idx + 1)
+  end
+end
+
+let tmp_wasm_path = fn (idx: i64) -> string do
+  // Use a per-test scratch path so a failing compile in one test does
+  // not poison the next. `/tmp` is mounted by bootstrap.sh's wasmtime
+  // invocation; CI sets TMPDIR via the workflow env.
+  return "/tmp/nexus_test_" ++ str.from_i64(val: idx) ++ ".wasm"
+end
