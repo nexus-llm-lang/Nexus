@@ -149,7 +149,57 @@ info "Installing nexus.wasm..."
 cp "$STAGE1" nexus.wasm
 ok "Installed nexus.wasm ($(wc -c < nexus.wasm | tr -d ' ') bytes)"
 
-info "Building polyglot launcher: header.sh + nexus.wasm → nexus"
-cat header.sh nexus.wasm > nexus
+# ─── Stage L: build lsp.wasm ─────────────────────────────────────────────
+#
+# `src/lsp/main.nx` wires the LSP scaffold to the Nexus pipeline; running
+# it produces a standalone wasm that speaks JSON-RPC on stdio. We compile
+# it through the Rust-built `$NEXUS` binary (the same binary that produced
+# stage 0). The self-hosted `nexus.wasm` cannot currently compile
+# `src/lsp/main.nx`: the codegen pass raises E3001 "closure arity '2' not
+# found" on the handler-vtable record, an issue tracked separately from
+# this hw47 epic. Once that codegen path is fixed, this can switch to
+# `wasmtime run "${STAGE1_FLAGS[@]}" nexus.wasm src/lsp/main.nx ...` for
+# full self-hosting parity.
+
+LSP_RAW="$BUILD_DIR/lsp_raw.wasm"
+LSP_OUT="$BUILD_DIR/lsp.wasm"
+info "Stage L: $NEXUS build src/lsp/main.nx → $LSP_RAW"
+"$NEXUS" build src/lsp/main.nx -o "$LSP_RAW"
+
+if wasm-tools print "$LSP_RAW" 2>/dev/null | grep -q 'import "nexus:std/'; then
+  info "lsp.wasm has unresolved stdlib imports — composing..."
+  "$NEXUS" compose "$LSP_RAW" -o "$LSP_OUT"
+  ok "lsp.wasm composed: $LSP_OUT ($(wc -c < "$LSP_OUT" | tr -d ' ') bytes)"
+else
+  cp "$LSP_RAW" "$LSP_OUT"
+  ok "lsp.wasm self-contained: $LSP_OUT ($(wc -c < "$LSP_OUT" | tr -d ' ') bytes)"
+fi
+
+info "Installing lsp.wasm..."
+cp "$LSP_OUT" lsp.wasm
+ok "Installed lsp.wasm ($(wc -c < lsp.wasm | tr -d ' ') bytes)"
+
+# ─── Build polyglot launcher with both payloads embedded ────────────────
+#
+# The launcher format is:
+#
+#     header.sh + manifest line(s) + #__NEXUS_PAYLOAD_BEGIN__\n + payload bytes
+#
+# Manifest entries are `name:size`, one per line, between the
+# `#__NEXUS_PAYLOAD_MANIFEST__` marker (last line of header.sh) and the
+# `#__NEXUS_PAYLOAD_BEGIN__` marker. Payload bytes are concatenated in the
+# manifest order: compiler first, then lsp.
+
+info "Building polyglot launcher: header.sh + nexus.wasm + lsp.wasm → nexus"
+COMPILER_SIZE=$(wc -c < nexus.wasm | tr -d ' ')
+LSP_SIZE=$(wc -c < lsp.wasm | tr -d ' ')
+{
+  cat header.sh
+  printf 'compiler:%s\n' "$COMPILER_SIZE"
+  printf 'lsp:%s\n' "$LSP_SIZE"
+  printf '#__NEXUS_PAYLOAD_BEGIN__\n'
+  cat nexus.wasm
+  cat lsp.wasm
+} > nexus
 chmod +x nexus
-ok "Installed nexus polyglot ($(wc -c < nexus | tr -d ' ') bytes)"
+ok "Installed nexus polyglot ($(wc -c < nexus | tr -d ' ') bytes; compiler=$COMPILER_SIZE, lsp=$LSP_SIZE)"
