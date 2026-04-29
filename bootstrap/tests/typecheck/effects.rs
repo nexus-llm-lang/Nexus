@@ -88,6 +88,14 @@ fn test_raise_requires_exn() {
     );
 }
 
+/// Bootstrap (Rust) typechecker rejects `main throws { Exn }`. This is the
+/// Rust-side gate; the **self-host** compiler relaxes this via the
+/// `wrap_main_if_needed` HIR pass (issue nexus-urf5), which renames the
+/// user main and synthesises a top-level catch-all wrapper. The bootstrap
+/// gate is intentionally left in place — bootstrap is being decommissioned
+/// in nexus-dvr6, so dragging the relaxation through Rust as well would be
+/// throwaway work. Self-host coverage of the relaxed path lives in
+/// `bootstrap/tests/nxc/codegen.rs::main_throws_wrap_emits_variant_and_exits`.
 #[test]
 fn test_main_cannot_declare_exn_throws() {
     should_fail_typecheck(
@@ -111,6 +119,9 @@ fn test_main_must_return_unit() {
     insta::assert_snapshot!(err);
 }
 
+/// Bootstrap-side gate (see test_main_cannot_declare_exn_throws). Self-host
+/// accepts `throws { <NarrowGroup> }` and routes the synthesised wrapper
+/// through `validate_main_throw_row` in `src/typecheck/check.nx`.
 #[test]
 fn test_main_throws_net_only_is_rejected() {
     let err = should_fail_typecheck(
@@ -692,6 +703,10 @@ fn test_selective_catch_wrong_field_type_fails() {
     );
 }
 
+/// Bootstrap-side gate (see test_main_cannot_declare_exn_throws). The
+/// self-host main-wrap pass (issue nexus-urf5) accepts an analogous program
+/// when the throws-row is a narrow exception group — the executable
+/// counterpart lives in `nxc::codegen::main_throws_wrap_emits_variant_and_exits`.
 #[test]
 fn test_main_rejects_nonempty_throws() {
     should_fail_typecheck(

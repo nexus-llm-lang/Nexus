@@ -8,7 +8,9 @@ pub mod typecheck;
 pub use builder::TestRunner;
 pub use compile::{compile, try_compile};
 pub use execute::{
-    exec, exec_nxc_core, exec_nxc_core_capture_stdout, exec_should_trap, exec_threaded, exec_with_stdlib, exec_with_stdlib_caps,
+    exec, exec_nxc_core, exec_nxc_core_capture_stderr_expecting_exit,
+    exec_nxc_core_capture_stdout, exec_should_trap, exec_threaded,
+    exec_with_stdlib, exec_with_stdlib_caps,
     exec_with_stdlib_caps_should_trap, exec_with_stdlib_core, exec_with_stdlib_core_should_trap,
     exec_with_stdlib_envs, exec_with_stdlib_should_trap,
 };

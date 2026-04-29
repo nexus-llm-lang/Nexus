@@ -1,0 +1,441 @@
+/**
+ * main_wrap: HIR pass that lifts the `main function throws must be {}`
+ * restriction by synthesising a top-level catch-all wrapper.
+ *
+ * If the user's `main` declares a non-empty throws-row, this pass:
+ *   1. Renames the original `main` to `__nx_user_main` (preserving its row)
+ *   2. Synthesises a fresh `main` whose body is
+ *        try
+ *          __nx_user_main()
+ *        catch e ->
+ *          __nx_eprint(<variant name>(...))
+ *          for i in 0..__nx_bt_depth() do
+ *            __nx_eprint("  at " ++ __nx_bt_frame(i) ++ "\n")
+ *          end
+ *          __nx_exit(1)
+ *        end
+ *   3. Adds the externals the wrapper needs (eprint/exit/bt-depth/bt-frame).
+ *
+ * The wrapper's throws-row is `{}`, so post-pass `validate_main` accepts
+ * even programs whose `main` declared a narrow exception group.
+ *
+ * The pass is a no-op when `main` already has an empty throws-row.
+ */
+
+import { Span } from "src/common/token.nx"
+import {
+  TypeExpr, TyI64, TyString, TyUnit, TyRow, TyUserDefined, TyArrow, NamedType,
+  Literal, LitString, LitInt, LitUnit,
+  BinaryOp, OpConcat,
+  SigilImmutable,
+  EnumDef, VariantDef, VariantField
+} from "src/common/ast.nx"
+import {
+  HirProgram, HirFunction, HirParam, HirExternal, HirExpr, HirStmt,
+  HirExprKind, HirStmtKind, HirCallArg, HirMatchCase, HirPatternKind, HirPatternField,
+  EagerBody, LazyBody,
+  HirPort, HirHandlerBindingEntry, ExceptionGroupEntry
+} from "src/ir/hir_types.nx"
+import { Option, Some, None } from "std:option"
+
+let zero_span = fn () -> Span do return Span(offset: 0, line: 0, col: 0) end
+
+let empty_row = fn () -> TypeExpr do return TyRow(types: [], rest: None) end
+
+/// Returns true when the given throws-row is structurally empty (closed row
+/// with no entries). Anything else is treated as "needs wrapping".
+let throws_row_is_empty = fn (row: TypeExpr) -> bool do
+  match row do
+    | TyRow(types: ts, rest: r) ->
+      match r do
+        | Some(_) -> return false
+        | None ->
+          match ts do
+            | [] -> return true
+            | _ :: _ -> return false
+          end
+      end
+    | TyUnit -> return true
+    | _ -> return false
+  end
+end
+
+/// Returns true when the throws-row is *wrappable*: a closed row whose
+/// entries are all named exception groups / variants (or the universal
+/// `Exn`). Open rows (rest = Some) and rows containing a free type
+/// variable are *not* wrappable — they fall through to validate_main and
+/// surface as `MainThrowsTooBroad`. `Exn` itself is admitted: the
+/// synthesised match dispatches every Exn variant via the wildcard arm and
+/// most fixtures declare `throws { Exn }` to mean "may raise anything".
+let throws_row_is_wrappable = fn (row: TypeExpr) -> bool do
+  match row do
+    | TyRow(types: ts, rest: r) ->
+      match r do
+        | Some(_) -> return false
+        | None -> return throws_row_entries_are_named(entries: ts)
+      end
+    | _ -> return false
+  end
+end
+
+let throws_row_entries_are_named = fn (entries: [TypeExpr]) -> bool do
+  match entries do
+    | [] -> return true
+    | t :: rest ->
+      match t do
+        | TyUserDefined(name: _, args: _) ->
+          return throws_row_entries_are_named(entries: rest)
+        | _ -> return false
+      end
+  end
+end
+
+// ─── External host module ────────────────────────────────────────────────────
+
+let host_stdio = fn () -> string do return "nexus:std/stdio" end
+let host_proc  = fn () -> string do return "nexus:std/proc" end
+let host_bt    = fn () -> string do return "nexus:runtime/backtrace" end
+
+// Internal HIR-level names for the externals the wrapper imports. Distinct
+// from any name a user file would resolve through `external X = ...` so the
+// pass can blindly add them without colliding with existing imports.
+let sym_eprint   = fn () -> string do return "__nx_main_wrap_eprint"   end
+let sym_exit     = fn () -> string do return "__nx_main_wrap_exit"     end
+let sym_bt_depth = fn () -> string do return "__nx_main_wrap_bt_depth" end
+let sym_bt_frame = fn () -> string do return "__nx_main_wrap_bt_frame" end
+
+let synth_externals = fn () -> [HirExternal] do
+  // wasm_name uses the WIT-canonical kebab form for component-model modules
+  // (see src/ir/hir.nx::wit_canonical_name): `__nx_eprint` → `eprint`,
+  // `__nx_exit` → `exit`, `__nx_bt_depth` → `bt-depth`,
+  // `__nx_bt_frame` → `bt-frame`.
+  let e_eprint = HirExternal(
+    name: sym_eprint(),
+    wasm_module: host_stdio(),
+    wasm_name: "eprint",
+    type_params: [],
+    params: [HirParam(name: "val", label: "val", typ: TyString)],
+    ret_type: TyUnit,
+    throw_row: empty_row()
+  )
+  let e_exit = HirExternal(
+    name: sym_exit(),
+    wasm_module: host_proc(),
+    wasm_name: "exit",
+    type_params: [],
+    params: [HirParam(name: "status", label: "status", typ: TyI64)],
+    ret_type: TyUnit,
+    throw_row: empty_row()
+  )
+  let e_bt_depth = HirExternal(
+    name: sym_bt_depth(),
+    wasm_module: host_bt(),
+    wasm_name: "bt-depth",
+    type_params: [],
+    params: [],
+    ret_type: TyI64,
+    throw_row: empty_row()
+  )
+  // bt-frame: returns the frame name as a packed string (`(offset << 32) | len`).
+  // The compiler unpacks string returns automatically when ret_type is TyString
+  // — see stdlib/exn.nx:8 for the canonical user-side declaration.
+  let e_bt_frame = HirExternal(
+    name: sym_bt_frame(),
+    wasm_module: host_bt(),
+    wasm_name: "bt-frame",
+    type_params: [],
+    params: [HirParam(name: "idx", label: "idx", typ: TyI64)],
+    ret_type: TyString,
+    throw_row: empty_row()
+  )
+  return [e_eprint, e_exit, e_bt_depth, e_bt_frame]
+end
+
+// ─── HIR construction helpers ────────────────────────────────────────────────
+
+let lit_str = fn (s: string, sp: Span) -> HirExpr do
+  return HirExpr(node: Literal(lit: LitString(val: s)), span: sp)
+end
+
+let lit_i64 = fn (n: i64, sp: Span) -> HirExpr do
+  return HirExpr(node: Literal(lit: LitInt(val: n)), span: sp)
+end
+
+let var_ref = fn (name: string, sp: Span) -> HirExpr do
+  return HirExpr(node: Variable(name, sigil: SigilImmutable), span: sp)
+end
+
+let call0 = fn (fname: string, sp: Span) -> HirExpr do
+  return HirExpr(node: Call(func: fname, args: []), span: sp)
+end
+
+let call1 = fn (fname: string, label: string, arg: HirExpr, sp: Span) -> HirExpr do
+  return HirExpr(node: Call(func: fname, args: [HirCallArg(label, value: arg)]), span: sp)
+end
+
+let concat = fn (left: HirExpr, right: HirExpr, sp: Span) -> HirExpr do
+  return HirExpr(node: BinOp(left, op: OpConcat, right), span: sp)
+end
+
+let stmt_expr = fn (e: HirExpr, sp: Span) -> HirStmt do
+  return HirStmt(node: Expr(expr: e), span: sp)
+end
+
+let stmt_let = fn (name: string, value: HirExpr, sp: Span) -> HirStmt do
+  return HirStmt(node: Let(name, sigil: SigilImmutable, typ: None, value), span: sp)
+end
+
+// ─── Synthesis: catch body ───────────────────────────────────────────────────
+
+/// Build the catch body: print the variant name (matched against every
+/// known Exn variant), iterate `__nx_bt_depth` frames printing each, then
+/// call `__nx_exit(1)`.
+let synth_catch_body = fn (catch_var: string, exn_variants: [VariantDef], sp: Span) -> [HirStmt] do
+  let exn_var = var_ref(name: catch_var, sp)
+  let print_variant = stmt_expr(e: call1(
+    fname: sym_eprint(),
+    label: "val",
+    arg: HirExpr(
+      node: Match(target: exn_var, cases: build_variant_cases(variants: exn_variants, sp)),
+      span: sp
+    ),
+    sp
+  ), sp)
+  let depth_let = stmt_let(name: "__nx_bt_depth_n", value: call0(fname: sym_bt_depth(), sp), sp)
+  // for i in 0..__nx_bt_depth_n do
+  //   __nx_eprint("  at " ++ __nx_bt_frame(idx: i) ++ "\n")
+  // end
+  let i_var = var_ref(name: "__nx_bt_iter", sp)
+  let frame_str = call1(fname: sym_bt_frame(), label: "idx", arg: i_var, sp)
+  let line = concat(
+    left: lit_str(s: "  at ", sp),
+    right: concat(left: frame_str, right: lit_str(s: "\n", sp), sp),
+    sp
+  )
+  let print_frame = stmt_expr(e: call1(fname: sym_eprint(), label: "val", arg: line, sp), sp)
+  let bt_loop = HirStmt(
+    node: Expr(expr: HirExpr(
+      node: For(
+        var: "__nx_bt_iter",
+        start: lit_i64(n: 0, sp),
+        end_expr: var_ref(name: "__nx_bt_depth_n", sp),
+        body: [print_frame]
+      ),
+      span: sp
+    )),
+    span: sp
+  )
+  let exit_call = stmt_expr(
+    e: call1(fname: sym_exit(), label: "status", arg: lit_i64(n: 1, sp), sp),
+    sp
+  )
+  return [print_variant, depth_let, bt_loop, exit_call]
+end
+
+let build_variant_cases = fn (variants: [VariantDef], sp: Span) -> [HirMatchCase] do
+  return build_variant_cases_go(variants, sp, acc: [])
+end
+
+let build_variant_cases_go = fn (variants: [VariantDef], sp: Span, acc: [HirMatchCase]) -> [HirMatchCase] do
+  match variants do
+    | [] ->
+      // Fall-through arm so the match is exhaustive even if a host-internal
+      // exception variant is missing from the seeded enum table. Body is a
+      // single stmt-expr Literal — `lower_match_expr` reads the trailing
+      // expression as the case's value, so a `Return` here would erroneously
+      // bail out of the wrapper main itself.
+      let fallback = HirMatchCase(
+        pattern: PWild,
+        body: [stmt_expr(e: lit_str(s: "<exception>\n", sp), sp)]
+      )
+      return rev_match_cases(lst: fallback :: acc, out: [])
+    | VariantDef(name: vn, fields: fs) :: rest ->
+      let pat = PCtor(variant: vn, fields: variant_field_pats(fields: fs))
+      let label = format_variant_label(name: vn, fields: fs)
+      let arm = HirMatchCase(
+        pattern: pat,
+        body: [stmt_expr(e: lit_str(s: label, sp), sp)]
+      )
+      return build_variant_cases_go(variants: rest, sp, acc: arm :: acc)
+  end
+end
+
+/// Pattern fields that bind every field name to a wildcard, so the variant
+/// destructures cleanly even though we never use the values.
+let variant_field_pats = fn (fields: [VariantField]) -> [HirPatternField] do
+  return variant_field_pats_go(fields, acc: [])
+end
+
+let variant_field_pats_go = fn (fields: [VariantField], acc: [HirPatternField]) -> [HirPatternField] do
+  match fields do
+    | [] -> return rev_pat_fields(lst: acc, out: [])
+    | VariantField(name: nm, typ: _) :: rest ->
+      let pf = HirPatternField(name: nm, pattern: PWild)
+      return variant_field_pats_go(fields: rest, acc: pf :: acc)
+  end
+end
+
+/// Format a variant label for stderr output: `Name(...)\n` when the variant
+/// has fields, `Name\n` for niladic variants. Field values are not reflected
+/// (the runtime currently exposes no generic value→string projection); the
+/// `(...)` tag is informative enough to disambiguate where the failure came
+/// from while keeping the wrapper free of per-type formatting code.
+let format_variant_label = fn (name: string, fields: [VariantField]) -> string do
+  match fields do
+    | [] -> return name ++ "\n"
+    | _ :: _ -> return name ++ "(...)\n"
+  end
+end
+
+// ─── Synthesis: main wrapper ─────────────────────────────────────────────────
+
+let user_main_name = fn () -> string do return "__nx_user_main" end
+
+let make_wrapper_main = fn (orig_main: HirFunction, exn_variants: [VariantDef]) -> HirFunction do
+  let HirFunction(name: _, type_params: _, params: ps, ret_type: rt, throw_row: _, body: _, span: sp) = orig_main
+  // The wrapper accepts the same params as the original main (e.g. `args:
+  // [string]`), forwards them, returns unit, and declares no throws.
+  let forward_args = forward_call_args(params: ps)
+  let try_body = [HirStmt(
+    node: Expr(expr: HirExpr(node: Call(func: user_main_name(), args: forward_args), span: sp)),
+    span: sp
+  )]
+  let catch_body = synth_catch_body(catch_var: "__nx_main_caught", exn_variants, sp)
+  let try_stmt = HirStmt(
+    node: Try(body: try_body, catch_param: "__nx_main_caught", catch_body),
+    span: sp
+  )
+  return HirFunction(
+    name: "main",
+    type_params: [],
+    params: ps,
+    ret_type: rt,
+    throw_row: empty_row(),
+    body: EagerBody(stmts: [try_stmt]),
+    span: sp
+  )
+end
+
+let forward_call_args = fn (params: [HirParam]) -> [HirCallArg] do
+  return forward_call_args_go(params, acc: [])
+end
+
+let forward_call_args_go = fn (params: [HirParam], acc: [HirCallArg]) -> [HirCallArg] do
+  match params do
+    | [] -> return rev_call_args(lst: acc, out: [])
+    | HirParam(name: n, label: l, typ: _) :: rest ->
+      let arg_expr = HirExpr(node: Variable(name: n, sigil: SigilImmutable), span: zero_span())
+      let arg = HirCallArg(label: l, value: arg_expr)
+      return forward_call_args_go(params: rest, acc: arg :: acc)
+  end
+end
+
+let rename_main_to_user = fn (f: HirFunction) -> HirFunction do
+  let HirFunction(name: _, type_params: tps, params: ps, ret_type: rt, throw_row: tw, body: b, span: sp) = f
+  return HirFunction(name: user_main_name(), type_params: tps, params: ps, ret_type: rt, throw_row: tw, body: b, span: sp)
+end
+
+// ─── Top-level entry ─────────────────────────────────────────────────────────
+
+/// Apply the wrap pass to a HirProgram. Must run after lazy-body resolution
+/// so the original `main` is in EagerBody form (the wrapper splices the
+/// original body via a call rather than an inline expansion, so LazyBody
+/// would also be tolerable, but keeping the precondition uniform avoids
+/// surprises for downstream consumers like linearity).
+export let wrap_main_if_needed = fn (prog: HirProgram) -> HirProgram throws { Exn } do
+  let HirProgram(ports, functions: funcs, externals, handler_bindings, enum_defs, exception_groups) = prog
+  match find_main_split(funcs, acc: []) do
+    | None -> return prog
+    | Some(val: MainSplit(main_fn: m, others: rest_funcs)) ->
+      let HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: tw, body: _, span: _) = m
+      if throws_row_is_empty(row: tw) then
+        return prog
+      end
+      // Too-broad rows (`{Exn}`, open rows, non-named entries) deliberately
+      // fall through unchanged so `validate_main` can surface
+      // `MainThrowsTooBroad`. Wrapping them would silently widen the
+      // catch-all and hide the user's mis-narrowed signature.
+      if !throws_row_is_wrappable(row: tw) then
+        return prog
+      end
+      let exn_variants = lookup_exn_variants(defs: enum_defs)
+      let renamed_user = rename_main_to_user(f: m)
+      let wrapper = make_wrapper_main(orig_main: m, exn_variants)
+      let new_funcs = wrapper :: renamed_user :: rest_funcs
+      let new_exts = append_exts(a: synth_externals(), b: externals)
+      return HirProgram(
+        ports,
+        functions: new_funcs,
+        externals: new_exts,
+        handler_bindings,
+        enum_defs,
+        exception_groups
+      )
+  end
+end
+
+type MainSplit = MainSplit(main_fn: HirFunction, others: [HirFunction])
+
+/// Locate `main` in the function list. Returns the function plus the list of
+/// the *other* functions in the original order. `None` when no `main`
+/// exists — `validate_main` will raise `MissingMain` later.
+let find_main_split = fn (funcs: [HirFunction], acc: [HirFunction]) -> Option<MainSplit> do
+  match funcs do
+    | [] -> return None
+    | f :: rest ->
+      let HirFunction(name: n, _) = f
+      if n == "main" then
+        let others = list_concat_rev(rev_first: acc, tail: rest)
+        return Some(val: MainSplit(main_fn: f, others))
+      end
+      return find_main_split(funcs: rest, acc: f :: acc)
+  end
+end
+
+let list_concat_rev = fn (rev_first: [HirFunction], tail: [HirFunction]) -> [HirFunction] do
+  match rev_first do
+    | [] -> return tail
+    | f :: rest -> return list_concat_rev(rev_first: rest, tail: f :: tail)
+  end
+end
+
+let lookup_exn_variants = fn (defs: [EnumDef]) -> [VariantDef] do
+  match defs do
+    | [] -> return []
+    | EnumDef(name: n, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      if n == "Exn" then
+        return vs
+      end
+      return lookup_exn_variants(defs: rest)
+  end
+end
+
+let append_exts = fn (a: [HirExternal], b: [HirExternal]) -> [HirExternal] do
+  match a do
+    | [] -> return b
+    | x :: rest -> return x :: append_exts(a: rest, b)
+  end
+end
+
+// ─── Local list reverses ─────────────────────────────────────────────────────
+
+let rev_match_cases = fn (lst: [HirMatchCase], out: [HirMatchCase]) -> [HirMatchCase] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_match_cases(lst: rest, out: x :: out)
+  end
+end
+
+let rev_pat_fields = fn (lst: [HirPatternField], out: [HirPatternField]) -> [HirPatternField] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_pat_fields(lst: rest, out: x :: out)
+  end
+end
+
+let rev_call_args = fn (lst: [HirCallArg], out: [HirCallArg]) -> [HirCallArg] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_call_args(lst: rest, out: x :: out)
+  end
+end

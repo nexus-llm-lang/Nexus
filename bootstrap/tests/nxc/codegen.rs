@@ -1,6 +1,7 @@
 use crate::harness::compile::{compile_fixture_via_nxc, compile_fixture_via_nxc_should_fail};
 use crate::harness::{
-    exec, exec_nxc_core, exec_nxc_core_capture_stdout, exec_should_trap, exec_threaded,
+    exec, exec_nxc_core, exec_nxc_core_capture_stderr_expecting_exit,
+    exec_nxc_core_capture_stdout, exec_should_trap, exec_threaded,
     exec_with_stdlib, exec_with_stdlib_core, exec_with_stdlib_core_should_trap, read_fixture,
 };
 
@@ -343,6 +344,66 @@ fn handler_kont_type_mismatch() {
 #[test]
 fn sched_yield_roundtrip() {
     exec_nxc_core("bootstrap/tests/fixtures/nxc/test_sched_yield.nx");
+}
+
+/// Issue nexus-urf5: the self-host narrowed `validate_main` rejects rows
+/// whose entries are not named exception (group) types (E2007
+/// `MainThrowsTooBroad`). The wrap pass leaves unwrappable rows intact so
+/// the typecheck rejection surfaces.
+#[test]
+fn main_throws_unwrappable_rejected_by_self_host() {
+    let err = compile_fixture_via_nxc_should_fail(
+        "bootstrap/tests/fixtures/nxc/test_main_throws_exn_rejected.nx",
+    );
+    assert!(
+        err.contains("E2007"),
+        "expected E2007 (MainThrowsTooBroad), got: {err}"
+    );
+}
+
+/// Issue nexus-urf5: the self-host HIR `wrap_main_if_needed` pass synthesises
+/// a top-level catch-all when `main` declares non-empty throws, so an
+/// uncaught raise prints the variant tag + backtrace to stderr and exits
+/// non-zero rather than aborting the wasm with an uncaught throw.
+///
+/// The fixture's `main` declares `throws { BoomGroup }` and raises
+/// `Boom(code: 42)`. After the wrap pass, the synthesised wrapper:
+///   - eprints `Boom(...)\n` (the variant tag)
+///   - iterates `__nx_bt_depth()` entries calling `__nx_bt_frame` for each
+///   - calls `__nx_exit(1)` (surfaces as WASI `proc_exit(1)`)
+///
+/// The backtrace iteration loop is exercised, but the bundled self-host
+/// codegen does not (yet) emit `__nx_capture_backtrace` at raise sites
+/// (urf5's scope explicitly forbids touching codegen — case (iii)). When
+/// the runtime's `BT_FRAMES` is empty, depth = 0 and the loop emits no
+/// `  at` lines. This test asserts the wrapper plumbing *up to* exit, and
+/// captures the depth-0 case so a future codegen change emitting
+/// `__nx_capture_backtrace` flips it positive without rewriting the test.
+#[test]
+fn main_throws_wrap_emits_variant_and_exits() {
+    let (stderr, exit_code) = exec_nxc_core_capture_stderr_expecting_exit(
+        "bootstrap/tests/fixtures/nxc/test_main_throws_wrap.nx",
+    );
+    assert_eq!(
+        exit_code, 1,
+        "expected non-zero exit from synthesised wrapper, full stderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("Boom"),
+        "expected stderr to mention the variant tag `Boom`, got:\n{}",
+        stderr
+    );
+    // Self-host codegen does not emit `__nx_capture_backtrace`; bt-depth
+    // returns 0 and the loop emits no frame lines. Document the gap so a
+    // follow-up codegen change can flip this assertion positive.
+    let frame_lines = stderr.lines().filter(|l| l.starts_with("  at ")).count();
+    assert_eq!(
+        frame_lines, 0,
+        "self-host codegen does not emit __nx_capture_backtrace yet — \
+         expected zero `  at` lines until that lands; got {}: {}",
+        frame_lines, stderr
+    );
 }
 
 #[test]
