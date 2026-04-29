@@ -201,6 +201,28 @@ let strip_build_subcommand = fn (xs: [string]) -> [string] do
   end
 end
 
+type ParsedTypecheckSubcommand = ParsedTypecheckSubcommand(remaining: [string], typecheck_only: bool)
+
+/// Detect a leading `typecheck` subcommand. When present, strip it and signal
+/// that the driver should run the front-end pipeline only (parse → HIR →
+/// resolve → linearity → typecheck → tc-linearity) and skip MIR/LIR/codegen.
+/// The form is `nexus typecheck <input.nx>`; positional output is rejected
+/// because typecheck-only never writes a wasm artifact.
+let strip_typecheck_subcommand = fn (xs: [string]) -> ParsedTypecheckSubcommand do
+  match xs do
+    | [] -> return ParsedTypecheckSubcommand(remaining: [], typecheck_only: false)
+    | prog :: rest ->
+      match rest do
+        | [] -> return ParsedTypecheckSubcommand(remaining: xs, typecheck_only: false)
+        | second :: rest2 ->
+          if second == "typecheck" then
+            return ParsedTypecheckSubcommand(remaining: prog :: rest2, typecheck_only: true)
+          end
+          return ParsedTypecheckSubcommand(remaining: xs, typecheck_only: false)
+      end
+  end
+end
+
 let write_and_free = fn (buf: %ByteBuffer, path: string) -> bool do
   let ok = bb.write_file(&buf, path)
   bb.free(%buf)
@@ -393,11 +415,13 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock 
     let args_after_verbose = strip_verbose_flag(xs: args)
     let ParsedExplainArgs(remaining: args_after_explain, explain, format) = strip_explain_flags(xs: args_after_verbose, explain: ExplainYes, format: FormatText)
     let ParsedOutputFlag(remaining: args_after_output, output: opt_output) = strip_output_flag(xs: args_after_explain, output: None)
-    let clean_args = strip_build_subcommand(xs: args_after_output)
+    let ParsedTypecheckSubcommand(remaining: args_after_tc, typecheck_only) = strip_typecheck_subcommand(xs: args_after_output)
+    let clean_args = strip_build_subcommand(xs: args_after_tc)
     let argc = list.length(xs: clean_args)
     if argc < 2 then
       Console.eprintln(val: "Usage: nexus [build] <input.nx> [output.wasm]")
       Console.eprintln(val: "       nexus [build] [-o output.wasm] <input.nx>")
+      Console.eprintln(val: "       nexus typecheck <input.nx>")
       Console.eprintln(val: "       nexus --dump-imports <input.nx>")
       Console.eprintln(val: "       nexus --verbose [build] <input.nx> [output.wasm]")
       Console.eprintln(val: "       nexus [--explain-capabilities yes|none|wasmtime] [--explain-capabilities-format text|json] [build] <input.nx> [output.wasm]")
@@ -416,7 +440,13 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock 
     let input_path = first_arg
     let output_path = resolve_output_path(opt_output, xs: clean_args, argc)
 
-    if verbose then Console.eprintln(val: "nxc: compiling " ++ input_path ++ " -> " ++ output_path) end
+    if verbose then
+      if typecheck_only then
+        Console.eprintln(val: "nxc: typechecking " ++ input_path)
+      else
+        Console.eprintln(val: "nxc: compiling " ++ input_path ++ " -> " ++ output_path)
+      end
+    end
 
     // Nested try wraps pipeline errors with the target file name so the final
     // diagnostic reads "<root>: in imported module '<x>': <error>".
@@ -474,6 +504,17 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock 
     if verbose then Console.eprintln(val: "[nxc] tc-linearity (" ++ str.from_i64(val: t5b - t5) ++ "ms)") end
     // After this point: prog, hir, local_names are dead.
     // hir_checked and enum_defs are the only live compiler data.
+
+    // typecheck-only mode: skip MIR/LIR/codegen/write entirely. The full
+    // typecheck (including tc-linearity) has already run and any error has
+    // raised through the catch handlers below.
+    if typecheck_only then
+      if verbose then
+        Console.eprintln(val: "nxc: typecheck-only " ++ input_path ++ " (total " ++ str.from_i64(val: t5b - t0) ++ "ms)")
+      end
+      arena.heap_reset(mark: pipeline_mark)
+      return ()
+    end
 
     let mir = mir.lower_hir_to_mir(hir: hir_checked)
     let t6 = Clock.now()
