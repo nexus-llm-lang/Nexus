@@ -1,0 +1,756 @@
+/**
+ * repl: Interactive read-eval-print loop for Nexus expressions.
+ *
+ * Scope (issue nexus-eq7e MVP):
+ *   - integer / boolean / string / unit literals
+ *   - identifiers bound by `let NAME = EXPR`
+ *   - binary operators: +  -  *  /  ==  !=  <  <=  >  >=  &&  ||  ++  (string concat)
+ *   - unary `-` (negation), unary `!` (boolean not)
+ *   - parenthesised sub-expressions
+ *   - meta commands: `:quit` / `:q`, `:type EXPR`, `:env`, `:help`
+ *
+ * Out of scope (post-MVP):
+ *   - function definitions / lambdas / closures
+ *   - `if` / `match` / `while` / `for`
+ *   - records / arrays / lists / linear or borrowed values
+ *   - capabilities, `try` / `catch`, `raise`
+ *
+ * Bindings persist across input lines in `ReplCtx`. A binding's value AND
+ * type live in the host (this module) — there is no separate wasm runtime
+ * to keep alive, so "context" here is a Nexus list of (name, type, value).
+ *
+ * Design choice — interpreter, not codegen-per-line:
+ *   The issue body suggests "small WASM snippet を codegen + wasmtime で
+ *   run". From inside a self-host wasm process there is no portable way
+ *   to dynamically codegen and execute new wasm — the host wasmtime is
+ *   not reachable as a callable surface. The MVP therefore tree-walks
+ *   the parsed AST directly. The persistence guarantee (Acceptance #3)
+ *   is satisfied by `ReplCtx` rather than by a long-lived wasmtime store.
+ *   The codegen-per-line story remains open in a follow-up issue.
+ */
+
+import * as lexer from "src/frontend/lexer.nx"
+import { Token, Span, SpannedToken } from "src/common/token.nx"
+import { UnexpectedToken, UnexpectedEof, format_error }, * as err from "src/common/error.nx"
+import { Console } from "std:stdio"
+import * as str from "std:str"
+import { Option, Some, None } from "std:option"
+import * as list from "std:list"
+
+// ─── Value & type representations ───────────────────────────────────────────
+
+/// Runtime values handled by the REPL evaluator.
+export type ReplValue =
+    ValInt(val: i64)
+  | ValBool(val: bool)
+  | ValStr(val: string)
+  | ValUnit
+
+/// Static types tracked alongside values; used by `:type EXPR`.
+export type ReplType =
+    TInt
+  | TBool
+  | TStr
+  | TUnit
+
+// ─── Binding context ────────────────────────────────────────────────────────
+
+/// One persistent binding produced by `let NAME = EXPR`.
+export type Binding = Binding(name: string, typ: ReplType, value: ReplValue)
+
+/// REPL state. Bindings are stored newest-first; lookup walks left-to-right
+/// so a re-binding of an existing name shadows the previous one.
+export type ReplCtx = ReplCtx(bindings: [Binding])
+
+export let empty_ctx = fn () -> ReplCtx do
+  return ReplCtx(bindings: [])
+end
+
+// ─── Mini AST (REPL-internal) ───────────────────────────────────────────────
+//
+// We do not reuse `src/common/ast.SpannedExpr` because the REPL only handles a
+// tiny subset of Nexus expressions and adopting the full AST would force a
+// full rename / resolve / typecheck round-trip per line. Keeping a small
+// dedicated AST keeps the interpreter focussed and avoids ambiguity about
+// which Nexus constructs are actually supported.
+
+export type ReplExpr =
+    EInt(val: i64, span: Span)
+  | EBool(val: bool, span: Span)
+  | EStr(val: string, span: Span)
+  | EUnit(span: Span)
+  | EVar(name: string, span: Span)
+  | EBin(op: ReplBinOp, left: ReplExpr, right: ReplExpr, span: Span)
+  | ENeg(operand: ReplExpr, span: Span)
+  | ENot(operand: ReplExpr, span: Span)
+
+export type ReplBinOp =
+    OpAdd | OpSub | OpMul | OpDiv | OpConcat
+  | OpEq | OpNe | OpLt | OpLe | OpGt | OpGe
+  | OpAnd | OpOr
+
+/// Top-level form parsed from a single input line. `LineLet(name, expr)`
+/// appends a binding; `LineExpr(expr)` evaluates and prints the result.
+export type ReplLine =
+    LineLet(name: string, expr: ReplExpr)
+  | LineExpr(expr: ReplExpr)
+
+// ─── Token stream helpers ───────────────────────────────────────────────────
+
+let head_token = fn (toks: [SpannedToken]) -> Token do
+  match toks do
+    | [] -> return TkEof
+    | SpannedToken(token: t, span: _) :: _ -> return t
+  end
+end
+
+let head_span = fn (toks: [SpannedToken]) -> Span do
+  match toks do
+    | [] -> return Span(offset: 0, line: 1, col: 1)
+    | SpannedToken(token: _, span: sp) :: _ -> return sp
+  end
+end
+
+let pop = fn (toks: [SpannedToken]) -> [SpannedToken] do
+  match toks do
+    | [] -> return []
+    | _ :: rest -> return rest
+  end
+end
+
+// ─── Parser ──────────────────────────────────────────────────────────────────
+//
+// Recursive-descent over the token stream produced by `lexer.tokenize`.
+// Precedence (low → high):
+//   1. ||
+//   2. &&
+//   3. == !=
+//   4. < <= > >=
+//   5. + - ++
+//   6. * /
+//   7. unary  - !
+//   8. atoms (literal / ident / paren)
+
+type ParsedExpr = ParsedExpr(expr: ReplExpr, rest: [SpannedToken])
+
+let token_describe = fn (t: Token) -> string do
+  match t do
+    | TkEof -> return "<eof>"
+    | TkInt(val: _) -> return "integer literal"
+    | TkString(val: _) -> return "string literal"
+    | TkIdent(name: n) -> return "identifier '" ++ n ++ "'"
+    | TkUident(name: n) -> return "constructor '" ++ n ++ "'"
+    | _ -> return "token"
+  end
+end
+
+let parse_expr = fn (toks: [SpannedToken]) -> ParsedExpr throws { Exn } do
+  return parse_or(toks)
+end
+
+let parse_or = fn (toks: [SpannedToken]) -> ParsedExpr throws { Exn } do
+  let ParsedExpr(expr: lhs, rest: r0) = parse_and(toks)
+  return parse_or_loop(toks: r0, left: lhs)
+end
+
+let parse_or_loop = fn (toks: [SpannedToken], left: ReplExpr) -> ParsedExpr throws { Exn } do
+  match head_token(toks) do
+    | TkPipePipe ->
+      let sp = head_span(toks)
+      let ParsedExpr(expr: rhs, rest: r) = parse_and(toks: pop(toks))
+      return parse_or_loop(toks: r, left: EBin(op: OpOr, left, right: rhs, span: sp))
+    | _ -> return ParsedExpr(expr: left, rest: toks)
+  end
+end
+
+let parse_and = fn (toks: [SpannedToken]) -> ParsedExpr throws { Exn } do
+  let ParsedExpr(expr: lhs, rest: r0) = parse_eq(toks)
+  return parse_and_loop(toks: r0, left: lhs)
+end
+
+let parse_and_loop = fn (toks: [SpannedToken], left: ReplExpr) -> ParsedExpr throws { Exn } do
+  match head_token(toks) do
+    | TkAndAnd ->
+      let sp = head_span(toks)
+      let ParsedExpr(expr: rhs, rest: r) = parse_eq(toks: pop(toks))
+      return parse_and_loop(toks: r, left: EBin(op: OpAnd, left, right: rhs, span: sp))
+    | _ -> return ParsedExpr(expr: left, rest: toks)
+  end
+end
+
+let parse_eq = fn (toks: [SpannedToken]) -> ParsedExpr throws { Exn } do
+  let ParsedExpr(expr: lhs, rest: r0) = parse_cmp(toks)
+  return parse_eq_loop(toks: r0, left: lhs)
+end
+
+let parse_eq_loop = fn (toks: [SpannedToken], left: ReplExpr) -> ParsedExpr throws { Exn } do
+  let t = head_token(toks)
+  if let TkEqEq = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: rhs, rest: r) = parse_cmp(toks: pop(toks))
+    return parse_eq_loop(toks: r, left: EBin(op: OpEq, left, right: rhs, span: sp))
+  end
+  if let TkBangEq = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: rhs, rest: r) = parse_cmp(toks: pop(toks))
+    return parse_eq_loop(toks: r, left: EBin(op: OpNe, left, right: rhs, span: sp))
+  end
+  return ParsedExpr(expr: left, rest: toks)
+end
+
+let parse_cmp = fn (toks: [SpannedToken]) -> ParsedExpr throws { Exn } do
+  let ParsedExpr(expr: lhs, rest: r0) = parse_add(toks)
+  return parse_cmp_loop(toks: r0, left: lhs)
+end
+
+let parse_cmp_loop = fn (toks: [SpannedToken], left: ReplExpr) -> ParsedExpr throws { Exn } do
+  let t = head_token(toks)
+  if let TkLt = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: rhs, rest: r) = parse_add(toks: pop(toks))
+    return parse_cmp_loop(toks: r, left: EBin(op: OpLt, left, right: rhs, span: sp))
+  end
+  if let TkLe = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: rhs, rest: r) = parse_add(toks: pop(toks))
+    return parse_cmp_loop(toks: r, left: EBin(op: OpLe, left, right: rhs, span: sp))
+  end
+  if let TkGt = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: rhs, rest: r) = parse_add(toks: pop(toks))
+    return parse_cmp_loop(toks: r, left: EBin(op: OpGt, left, right: rhs, span: sp))
+  end
+  if let TkGe = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: rhs, rest: r) = parse_add(toks: pop(toks))
+    return parse_cmp_loop(toks: r, left: EBin(op: OpGe, left, right: rhs, span: sp))
+  end
+  return ParsedExpr(expr: left, rest: toks)
+end
+
+let parse_add = fn (toks: [SpannedToken]) -> ParsedExpr throws { Exn } do
+  let ParsedExpr(expr: lhs, rest: r0) = parse_mul(toks)
+  return parse_add_loop(toks: r0, left: lhs)
+end
+
+let parse_add_loop = fn (toks: [SpannedToken], left: ReplExpr) -> ParsedExpr throws { Exn } do
+  let t = head_token(toks)
+  if let TkPlus = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: rhs, rest: r) = parse_mul(toks: pop(toks))
+    return parse_add_loop(toks: r, left: EBin(op: OpAdd, left, right: rhs, span: sp))
+  end
+  if let TkMinus = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: rhs, rest: r) = parse_mul(toks: pop(toks))
+    return parse_add_loop(toks: r, left: EBin(op: OpSub, left, right: rhs, span: sp))
+  end
+  if let TkPlusPlus = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: rhs, rest: r) = parse_mul(toks: pop(toks))
+    return parse_add_loop(toks: r, left: EBin(op: OpConcat, left, right: rhs, span: sp))
+  end
+  return ParsedExpr(expr: left, rest: toks)
+end
+
+let parse_mul = fn (toks: [SpannedToken]) -> ParsedExpr throws { Exn } do
+  let ParsedExpr(expr: lhs, rest: r0) = parse_unary(toks)
+  return parse_mul_loop(toks: r0, left: lhs)
+end
+
+let parse_mul_loop = fn (toks: [SpannedToken], left: ReplExpr) -> ParsedExpr throws { Exn } do
+  let t = head_token(toks)
+  if let TkStar = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: rhs, rest: r) = parse_unary(toks: pop(toks))
+    return parse_mul_loop(toks: r, left: EBin(op: OpMul, left, right: rhs, span: sp))
+  end
+  if let TkSlash = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: rhs, rest: r) = parse_unary(toks: pop(toks))
+    return parse_mul_loop(toks: r, left: EBin(op: OpDiv, left, right: rhs, span: sp))
+  end
+  return ParsedExpr(expr: left, rest: toks)
+end
+
+let parse_unary = fn (toks: [SpannedToken]) -> ParsedExpr throws { Exn } do
+  let t = head_token(toks)
+  if let TkMinus = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: inner, rest: r) = parse_unary(toks: pop(toks))
+    return ParsedExpr(expr: ENeg(operand: inner, span: sp), rest: r)
+  end
+  if let TkBang = t then
+    let sp = head_span(toks)
+    let ParsedExpr(expr: inner, rest: r) = parse_unary(toks: pop(toks))
+    return ParsedExpr(expr: ENot(operand: inner, span: sp), rest: r)
+  end
+  return parse_atom(toks)
+end
+
+let parse_atom = fn (toks: [SpannedToken]) -> ParsedExpr throws { Exn } do
+  let sp = head_span(toks)
+  let t = head_token(toks)
+  if let TkInt(val: v) = t then
+    return ParsedExpr(expr: EInt(val: v, span: sp), rest: pop(toks))
+  end
+  if let TkString(val: s) = t then
+    return ParsedExpr(expr: EStr(val: s, span: sp), rest: pop(toks))
+  end
+  if let TkTrue = t then
+    return ParsedExpr(expr: EBool(val: true, span: sp), rest: pop(toks))
+  end
+  if let TkFalse = t then
+    return ParsedExpr(expr: EBool(val: false, span: sp), rest: pop(toks))
+  end
+  if let TkIdent(name: n) = t then
+    return ParsedExpr(expr: EVar(name: n, span: sp), rest: pop(toks))
+  end
+  if let TkLParen = t then
+    let r0 = pop(toks)
+    if let TkRParen = head_token(toks: r0) then
+      return ParsedExpr(expr: EUnit(span: sp), rest: pop(toks: r0))
+    end
+    let ParsedExpr(expr: inner, rest: r1) = parse_expr(toks: r0)
+    if let TkRParen = head_token(toks: r1) then
+      return ParsedExpr(expr: inner, rest: pop(toks: r1))
+    end
+    raise UnexpectedToken(expected: "')'", got: token_describe(t: head_token(toks: r1)), span: head_span(toks: r1))
+  end
+  if let TkEof = t then
+    raise UnexpectedEof(expected: "expression", span: sp)
+  end
+  raise UnexpectedToken(expected: "expression", got: token_describe(t), span: sp)
+end
+
+// ─── Line parser ────────────────────────────────────────────────────────────
+
+/// Parse a full input line into either a `LineLet` or a `LineExpr`. The
+/// caller is expected to have stripped meta-command prefixes (`:type ...`,
+/// `:quit`, etc.) before calling here.
+export let parse_line = fn (src: string) -> ReplLine throws { Exn } do
+  let toks = lexer.tokenize(src)
+  let t = head_token(toks)
+  if let TkLet = t then
+    return parse_let_line(toks: pop(toks))
+  end
+  let ParsedExpr(expr: e, rest: r) = parse_expr(toks)
+  expect_eof(toks: r)
+  return LineExpr(expr: e)
+end
+
+let parse_let_line = fn (toks: [SpannedToken]) -> ReplLine throws { Exn } do
+  let t = head_token(toks)
+  if let TkIdent(name: n) = t then
+    let r0 = pop(toks)
+    let teq = head_token(toks: r0)
+    if let TkEq = teq then
+      let ParsedExpr(expr: e, rest: r1) = parse_expr(toks: pop(toks: r0))
+      expect_eof(toks: r1)
+      return LineLet(name: n, expr: e)
+    end
+    raise UnexpectedToken(expected: "'='", got: token_describe(t: teq), span: head_span(toks: r0))
+  end
+  raise UnexpectedToken(expected: "binding name", got: token_describe(t), span: head_span(toks))
+end
+
+let expect_eof = fn (toks: [SpannedToken]) -> unit throws { Exn } do
+  match head_token(toks) do
+    | TkEof -> return ()
+    | other ->
+      raise UnexpectedToken(expected: "end of input", got: token_describe(t: other), span: head_span(toks))
+  end
+end
+
+// ─── Type & value helpers ───────────────────────────────────────────────────
+
+export let type_to_string = fn (t: ReplType) -> string do
+  match t do
+    | TInt -> return "i64"
+    | TBool -> return "bool"
+    | TStr -> return "string"
+    | TUnit -> return "unit"
+  end
+end
+
+export let value_to_string = fn (v: ReplValue) -> string do
+  match v do
+    | ValInt(val: n) -> return str.from_i64(val: n)
+    | ValBool(val: b) -> return str.from_bool(val: b)
+    | ValStr(val: s) -> return "\"" ++ s ++ "\""
+    | ValUnit -> return "()"
+  end
+end
+
+let type_of_value = fn (v: ReplValue) -> ReplType do
+  match v do
+    | ValInt(val: _) -> return TInt
+    | ValBool(val: _) -> return TBool
+    | ValStr(val: _) -> return TStr
+    | ValUnit -> return TUnit
+  end
+end
+
+// ─── Environment lookup ─────────────────────────────────────────────────────
+
+let lookup = fn (bindings: [Binding], name: string) -> Option<Binding> do
+  match bindings do
+    | [] -> return None
+    | b :: rest ->
+      let Binding(name: n, typ: _, value: _) = b
+      if n == name then return Some(val: b) end
+      return lookup(bindings: rest, name)
+  end
+end
+
+// ─── Type inference (expression-level) ──────────────────────────────────────
+
+/// Infer the static type of an expression under the current bindings. Errors
+/// raise `TypeMismatch` so the diagnostic threads through `format_error` and
+/// stays LSP-compatible (issue Acceptance #5). Inference is deliberately
+/// lightweight: every expression has a uniquely determined REPL type.
+let infer = fn (e: ReplExpr, bindings: [Binding]) -> ReplType throws { Exn } do
+  match e do
+    | EInt(val: _, span: _) -> return TInt
+    | EBool(val: _, span: _) -> return TBool
+    | EStr(val: _, span: _) -> return TStr
+    | EUnit(span: _) -> return TUnit
+    | EVar(name: n, span: sp) ->
+      match lookup(bindings, name: n) do
+        | Some(val: Binding(name: _, typ: t, value: _)) -> return t
+        | None ->
+          raise err.TypeMismatch(func_name: "<repl>", detail: "unbound variable '" ++ n ++ "'", span: sp)
+      end
+    | ENeg(operand: inner, span: sp) ->
+      let t = infer(e: inner, bindings)
+      if is_tint(t) then return TInt end
+      raise err.TypeMismatch(func_name: "<repl>", detail: "unary '-' expects i64, got " ++ type_to_string(t), span: sp)
+    | ENot(operand: inner, span: sp) ->
+      let t = infer(e: inner, bindings)
+      if is_tbool(t) then return TBool end
+      raise err.TypeMismatch(func_name: "<repl>", detail: "unary '!' expects bool, got " ++ type_to_string(t), span: sp)
+    | EBin(op, left, right, span: sp) ->
+      let lt = infer(e: left, bindings)
+      let rt = infer(e: right, bindings)
+      return infer_bin(op, lt, rt, span: sp)
+  end
+end
+
+let infer_bin = fn (op: ReplBinOp, lt: ReplType, rt: ReplType, span: Span) -> ReplType throws { Exn } do
+  match op do
+    | OpAdd -> return require_int_int(op: "+", lt, rt, span, ret: TInt)
+    | OpSub -> return require_int_int(op: "-", lt, rt, span, ret: TInt)
+    | OpMul -> return require_int_int(op: "*", lt, rt, span, ret: TInt)
+    | OpDiv -> return require_int_int(op: "/", lt, rt, span, ret: TInt)
+    | OpLt -> return require_int_int(op: "<", lt, rt, span, ret: TBool)
+    | OpLe -> return require_int_int(op: "<=", lt, rt, span, ret: TBool)
+    | OpGt -> return require_int_int(op: ">", lt, rt, span, ret: TBool)
+    | OpGe -> return require_int_int(op: ">=", lt, rt, span, ret: TBool)
+    | OpAnd -> return require_bool_bool(op: "&&", lt, rt, span)
+    | OpOr -> return require_bool_bool(op: "||", lt, rt, span)
+    | OpConcat ->
+      if is_tstr(t: lt) && is_tstr(t: rt) then return TStr end
+      raise err.TypeMismatch(func_name: "<repl>", detail: "'++' expects string ++ string, got " ++ type_to_string(t: lt) ++ " ++ " ++ type_to_string(t: rt), span)
+    | OpEq -> return require_eq_compat(op: "==", lt, rt, span)
+    | OpNe -> return require_eq_compat(op: "!=", lt, rt, span)
+  end
+end
+
+let is_tint = fn (t: ReplType) -> bool do
+  match t do
+    | TInt -> return true
+    | _ -> return false
+  end
+end
+
+let is_tbool = fn (t: ReplType) -> bool do
+  match t do
+    | TBool -> return true
+    | _ -> return false
+  end
+end
+
+let is_tstr = fn (t: ReplType) -> bool do
+  match t do
+    | TStr -> return true
+    | _ -> return false
+  end
+end
+
+let require_int_int = fn (op: string, lt: ReplType, rt: ReplType, span: Span, ret: ReplType) -> ReplType throws { Exn } do
+  if is_tint(t: lt) && is_tint(t: rt) then return ret end
+  raise err.TypeMismatch(func_name: "<repl>", detail: "'" ++ op ++ "' expects i64, got " ++ type_to_string(t: lt) ++ " " ++ op ++ " " ++ type_to_string(t: rt), span)
+end
+
+let require_bool_bool = fn (op: string, lt: ReplType, rt: ReplType, span: Span) -> ReplType throws { Exn } do
+  if is_tbool(t: lt) && is_tbool(t: rt) then return TBool end
+  raise err.TypeMismatch(func_name: "<repl>", detail: "'" ++ op ++ "' expects bool, got " ++ type_to_string(t: lt) ++ " " ++ op ++ " " ++ type_to_string(t: rt), span)
+end
+
+let types_equal = fn (a: ReplType, b: ReplType) -> bool do
+  match a do
+    | TInt -> return is_tint(t: b)
+    | TBool -> return is_tbool(t: b)
+    | TStr -> return is_tstr(t: b)
+    | TUnit ->
+      match b do
+        | TUnit -> return true
+        | _ -> return false
+      end
+  end
+end
+
+let require_eq_compat = fn (op: string, lt: ReplType, rt: ReplType, span: Span) -> ReplType throws { Exn } do
+  if types_equal(a: lt, b: rt) then return TBool end
+  raise err.TypeMismatch(func_name: "<repl>", detail: "'" ++ op ++ "' requires matching operand types, got " ++ type_to_string(t: lt) ++ " " ++ op ++ " " ++ type_to_string(t: rt), span)
+end
+
+// ─── Evaluator ──────────────────────────────────────────────────────────────
+
+/// Evaluate `e` under `bindings`. Pre-condition: `infer` has already
+/// succeeded for `e`, so this function never sees a type-incompatible
+/// operator pair. The remaining runtime hazard is integer division by
+/// zero, which surfaces as a `TypeMismatch` (kept on the type-error
+/// channel for Acceptance #5 LSP compatibility — a dedicated
+/// `DivByZero` variant could be added in a follow-up issue).
+export let eval = fn (e: ReplExpr, bindings: [Binding]) -> ReplValue throws { Exn } do
+  match e do
+    | EInt(val: n, span: _) -> return ValInt(val: n)
+    | EBool(val: b, span: _) -> return ValBool(val: b)
+    | EStr(val: s, span: _) -> return ValStr(val: s)
+    | EUnit(span: _) -> return ValUnit
+    | EVar(name: n, span: sp) ->
+      match lookup(bindings, name: n) do
+        | Some(val: Binding(name: _, typ: _, value: v)) -> return v
+        | None -> raise err.TypeMismatch(func_name: "<repl>", detail: "unbound variable '" ++ n ++ "'", span: sp)
+      end
+    | ENeg(operand: inner, span: _) ->
+      let v = eval(e: inner, bindings)
+      match v do
+        | ValInt(val: n) -> return ValInt(val: 0 - n)
+        | _ -> raise err.TypeMismatch(func_name: "<repl>", detail: "internal: ENeg on non-int after infer", span: head_expr_span(e))
+      end
+    | ENot(operand: inner, span: _) ->
+      let v = eval(e: inner, bindings)
+      match v do
+        | ValBool(val: b) -> if b then return ValBool(val: false) else return ValBool(val: true) end
+        | _ -> raise err.TypeMismatch(func_name: "<repl>", detail: "internal: ENot on non-bool after infer", span: head_expr_span(e))
+      end
+    | EBin(op, left, right, span: sp) ->
+      let lv = eval(e: left, bindings)
+      let rv = eval(e: right, bindings)
+      return eval_bin(op, lv, rv, span: sp)
+  end
+end
+
+let eval_bin = fn (op: ReplBinOp, lv: ReplValue, rv: ReplValue, span: Span) -> ReplValue throws { Exn } do
+  match op do
+    | OpAdd -> return ValInt(val: int_of(v: lv) + int_of(v: rv))
+    | OpSub -> return ValInt(val: int_of(v: lv) - int_of(v: rv))
+    | OpMul -> return ValInt(val: int_of(v: lv) * int_of(v: rv))
+    | OpDiv ->
+      let r = int_of(v: rv)
+      if r == 0 then
+        raise err.TypeMismatch(func_name: "<repl>", detail: "division by zero", span)
+      end
+      return ValInt(val: int_of(v: lv) / r)
+    | OpLt -> return ValBool(val: int_of(v: lv) < int_of(v: rv))
+    | OpLe -> return ValBool(val: int_of(v: lv) <= int_of(v: rv))
+    | OpGt -> return ValBool(val: int_of(v: lv) > int_of(v: rv))
+    | OpGe -> return ValBool(val: int_of(v: lv) >= int_of(v: rv))
+    | OpAnd ->
+      if bool_of(v: lv) then return ValBool(val: bool_of(v: rv)) end
+      return ValBool(val: false)
+    | OpOr ->
+      if bool_of(v: lv) then return ValBool(val: true) end
+      return ValBool(val: bool_of(v: rv))
+    | OpConcat -> return ValStr(val: str_of(v: lv) ++ str_of(v: rv))
+    | OpEq -> return ValBool(val: values_equal(a: lv, b: rv))
+    | OpNe -> return ValBool(val: ! values_equal(a: lv, b: rv))
+  end
+end
+
+let int_of = fn (v: ReplValue) -> i64 do
+  match v do
+    | ValInt(val: n) -> return n
+    | _ -> return 0
+  end
+end
+
+let bool_of = fn (v: ReplValue) -> bool do
+  match v do
+    | ValBool(val: b) -> return b
+    | _ -> return false
+  end
+end
+
+let str_of = fn (v: ReplValue) -> string do
+  match v do
+    | ValStr(val: s) -> return s
+    | _ -> return ""
+  end
+end
+
+let values_equal = fn (a: ReplValue, b: ReplValue) -> bool do
+  match a do
+    | ValInt(val: ai) ->
+      match b do | ValInt(val: bi) -> return ai == bi | _ -> return false end
+    | ValBool(val: ab) ->
+      match b do | ValBool(val: bb) -> return ab == bb | _ -> return false end
+    | ValStr(val: as_) ->
+      match b do | ValStr(val: bs) -> return as_ == bs | _ -> return false end
+    | ValUnit ->
+      match b do | ValUnit -> return true | _ -> return false end
+  end
+end
+
+let head_expr_span = fn (e: ReplExpr) -> Span do
+  match e do
+    | EInt(val: _, span) -> return span
+    | EBool(val: _, span) -> return span
+    | EStr(val: _, span) -> return span
+    | EUnit(span) -> return span
+    | EVar(name: _, span) -> return span
+    | EBin(op: _, left: _, right: _, span) -> return span
+    | ENeg(operand: _, span) -> return span
+    | ENot(operand: _, span) -> return span
+  end
+end
+
+// ─── Step driver ────────────────────────────────────────────────────────────
+
+/// Outcome of a single REPL line.
+export type StepOutcome =
+    StepContinue(ctx: ReplCtx)
+  | StepQuit
+
+/// Process a single (already-trimmed) input line. Side effects (println /
+/// eprintln) are routed through the `Console` cap. The returned outcome
+/// dictates whether the read loop continues.
+export let step_line = fn (line: string, ctx: ReplCtx) -> StepOutcome require { Console } do
+  if line == "" then return StepContinue(ctx) end
+  if line == ":quit" then return StepQuit end
+  if line == ":q" then return StepQuit end
+  if line == ":help" then
+    print_help()
+    return StepContinue(ctx)
+  end
+  if line == ":env" then
+    print_env(ctx)
+    return StepContinue(ctx)
+  end
+  if str.starts_with(s: line, prefix: ":type ") then
+    let rest = str.byte_substring(s: line, start: 6, len: str.byte_length(s: line) - 6)
+    return handle_type_command(src: rest, ctx)
+  end
+  if line == ":type" then
+    Console.eprintln(val: "<repl>: error: ':type' requires an expression argument [E4002]")
+    return StepContinue(ctx)
+  end
+  if str.starts_with(s: line, prefix: ":") then
+    Console.eprintln(val: "<repl>: error: unknown meta command '" ++ line ++ "' (try ':help') [E4002]")
+    return StepContinue(ctx)
+  end
+  return handle_eval(src: line, ctx)
+end
+
+let handle_type_command = fn (src: string, ctx: ReplCtx) -> StepOutcome require { Console } do
+  try
+    let line_form = parse_line(src)
+    match line_form do
+      | LineLet(name: _, expr: _) ->
+        Console.eprintln(val: "<repl>: error: ':type' expects an expression, got a 'let' binding [E4002]")
+        return StepContinue(ctx)
+      | LineExpr(expr: e) ->
+        match ctx do | ReplCtx(bindings) ->
+          let t = infer(e, bindings)
+          Console.println(val: type_to_string(t))
+          return StepContinue(ctx)
+        end
+    end
+  catch err ->
+    Console.eprintln(val: "<repl>: " ++ format_error(err))
+    return StepContinue(ctx)
+  end
+end
+
+let handle_eval = fn (src: string, ctx: ReplCtx) -> StepOutcome require { Console } do
+  try
+    let line_form = parse_line(src)
+    match line_form do
+      | LineLet(name, expr: e) ->
+        match ctx do | ReplCtx(bindings) ->
+          let _ = infer(e, bindings)
+          let v = eval(e, bindings)
+          let t = type_of_value(v)
+          let next = ReplCtx(bindings: Binding(name, typ: t, value: v) :: bindings)
+          // `let` bindings produce no value — match Acceptance #3 where
+          // `> let x = 10` shows nothing on stdout; `> x` then prints `10`.
+          return StepContinue(ctx: next)
+        end
+      | LineExpr(expr: e) ->
+        match ctx do | ReplCtx(bindings) ->
+          let _ = infer(e, bindings)
+          let v = eval(e, bindings)
+          Console.println(val: value_to_string(v))
+          return StepContinue(ctx)
+        end
+    end
+  catch err ->
+    Console.eprintln(val: "<repl>: " ++ format_error(err))
+    return StepContinue(ctx)
+  end
+end
+
+let print_help = fn () -> unit require { Console } do
+  Console.println(val: "Nexus REPL — supported forms:")
+  Console.println(val: "  EXPR              — evaluate and print")
+  Console.println(val: "  let NAME = EXPR   — bind a value")
+  Console.println(val: "  :type EXPR        — print the type of EXPR")
+  Console.println(val: "  :env              — list current bindings")
+  Console.println(val: "  :help             — this message")
+  Console.println(val: "  :quit / :q / EOF  — exit")
+  return ()
+end
+
+let print_env = fn (ctx: ReplCtx) -> unit require { Console } do
+  match ctx do | ReplCtx(bindings) ->
+    print_env_loop(bindings: list.reverse(xs: bindings))
+  end
+end
+
+let print_env_loop = fn (bindings: [Binding]) -> unit require { Console } do
+  match bindings do
+    | [] -> return ()
+    | Binding(name, typ, value) :: rest ->
+      Console.println(val: name ++ " : " ++ type_to_string(t: typ) ++ " = " ++ value_to_string(v: value))
+      return print_env_loop(bindings: rest)
+  end
+end
+
+// ─── Read loop ──────────────────────────────────────────────────────────────
+
+/// Drive the REPL until `:quit` or EOF. `max_iters` caps the loop length so
+/// a runaway input source cannot wedge a CI runner; `-1` means unlimited.
+export let run = fn (max_iters: i64) -> unit require { Console } do
+  Console.println(val: "Nexus REPL (type ':help' for commands, ':quit' to exit)")
+  loop(ctx: empty_ctx(), iters_left: max_iters)
+end
+
+let loop = fn (ctx: ReplCtx, iters_left: i64) -> unit require { Console } do
+  if iters_left == 0 then return () end
+  Console.print(val: "> ")
+  let line = Console.read_line()
+  // Empty string from `__nx_read_line` collapses two cases — EOF and a
+  // user pressing Enter on an empty prompt — into one signal. The MVP
+  // treats both as "exit cleanly" so test runners feeding stdin without
+  // an explicit `:quit` still produce exit code 0 (Acceptance #6).
+  if line == "" then return () end
+  let trimmed = str.trim(s: line)
+  match step_line(line: trimmed, ctx) do
+    | StepQuit -> return ()
+    | StepContinue(ctx: next) ->
+      let next_iters = if iters_left < 0 then -1 else iters_left - 1 end
+      return loop(ctx: next, iters_left: next_iters)
+  end
+end
