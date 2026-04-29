@@ -1,0 +1,313 @@
+// Acceptance test for list build/foldr stream fusion (issue nexus-00lw).
+//
+// Builds hand-rolled LirPrograms exercising the local pattern
+//
+//     let g_clos = MakeClosure(g_fn, [])
+//     let k_clos = MakeClosure(k_fn, [])
+//     let z      = LirAtomInt 0
+//     let built  = Call("...#build", [g_clos])
+//     let result = Call("...#foldr", [xs=built, init=z, f=k_clos])
+//
+// and asserts that:
+//   * pure k_fn -> the foldr Let is rewritten to CallClosure(g, [k, z]);
+//     the build call's single use disappears (post-DCE removes the
+//     intermediate let).
+//   * impure k_fn (raises) -> the foldr Let is preserved unchanged.
+//
+// This is a unit-style test: it constructs LIR directly rather than
+// driving the full compiler, so the assertions are independent of any
+// frontend / mono / linker behaviour.
+import * as test_assert from "std:test/assert"
+import { TyI64 } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { LirProgram, LirFunction, LirParam, LirAtomInt, LirAtomVar, LirExpr, LirExprAtom, LirExprCall, LirExprCallClosure, LirExprMakeClosure, LirExprRaise, LirCallArg, LirStmt, LirStmtLet } from "src/ir/lir_types.nx"
+import { analyze_effects } from "src/backend/effect_analysis.nx"
+import { optimize_lir_with_effects } from "src/ir/lir_opt.nx"
+import { Option, Some, None } from "std:option"
+
+let dummy_span = fn () -> Span do
+  return Span(offset: 0, line: 1, col: 1)
+end
+
+// Pure combining function: `let k_pure = fn (val: i64, acc: i64) -> i64 do return val + acc end`
+// Body computes a binary op and returns the result. Effect analysis sees
+// only LirExprBinary / LirExprAtom, so is_pure = true.
+let make_pure_k = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyI64, expr: LirExprAtom(atom: LirAtomInt(val: 0)))
+  ]
+  return LirFunction(
+    name: "k_pure_fn",
+    params: [
+      LirParam(label: "val", name: "val", typ: TyI64),
+      LirParam(label: "acc", name: "acc", typ: TyI64)
+    ],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "r", typ: TyI64),
+    span: dummy_span()
+  )
+end
+
+// Impure combining function: directly raises. Effect analysis flags
+// can_throw = true so is_pure = false. Fusion must NOT fire.
+let make_impure_k = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(
+      name: "r",
+      typ: TyI64,
+      expr: LirExprRaise(value: LirAtomInt(val: 0), typ: TyI64)
+    )
+  ]
+  return LirFunction(
+    name: "k_throw_fn",
+    params: [
+      LirParam(label: "val", name: "val", typ: TyI64),
+      LirParam(label: "acc", name: "acc", typ: TyI64)
+    ],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "r", typ: TyI64),
+    span: dummy_span()
+  )
+end
+
+// Generator function for build: would consume cons/nil. Body is opaque
+// from the test's POV — what matters is that the rewrite synthesises
+// CallClosure on the original g closure.
+let make_g_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyI64, expr: LirExprAtom(atom: LirAtomInt(val: 0)))
+  ]
+  return LirFunction(
+    name: "g_fn",
+    params: [
+      LirParam(label: "cons", name: "cons", typ: TyI64),
+      LirParam(label: "nil", name: "nil", typ: TyI64)
+    ],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "r", typ: TyI64),
+    span: dummy_span()
+  )
+end
+
+// Stub bodies for foldr / build so they appear in program.functions and
+// effect_analysis can resolve their names. The fusion pass identifies
+// foldr / build by full qualified name, not by body content, so empty
+// bodies are sufficient for the rewrite test.
+let make_foldr_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyI64, expr: LirExprAtom(atom: LirAtomInt(val: 0)))
+  ]
+  return LirFunction(
+    name: "nxlib_stdlib_list_nx#foldr",
+    params: [
+      LirParam(label: "xs", name: "xs", typ: TyI64),
+      LirParam(label: "init", name: "init", typ: TyI64),
+      LirParam(label: "f", name: "f", typ: TyI64)
+    ],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "r", typ: TyI64),
+    span: dummy_span()
+  )
+end
+
+let make_build_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyI64, expr: LirExprAtom(atom: LirAtomInt(val: 0)))
+  ]
+  return LirFunction(
+    name: "nxlib_stdlib_list_nx#build",
+    params: [LirParam(label: "g", name: "g", typ: TyI64)],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "r", typ: TyI64),
+    span: dummy_span()
+  )
+end
+
+// Construct a "main" function whose body matches the fusion pattern:
+//
+//   let g_clos = MakeClosure(g_fn, [])
+//   let k_clos = MakeClosure(k_fn, [])
+//   let z      = LirAtomInt 0
+//   let built  = Call("...#build", [g=g_clos])
+//   let result = Call("...#foldr", [xs=built, init=z, f=k_clos])
+//
+// `k_fn_name` selects pure or impure k.
+let make_main_fn = fn (k_fn_name: string) -> LirFunction do
+  let stmts = [
+    LirStmtLet(
+      name: "g_clos",
+      typ: TyI64,
+      expr: LirExprMakeClosure(func_name: "g_fn", captures: [], typ: TyI64)
+    ),
+    LirStmtLet(
+      name: "k_clos",
+      typ: TyI64,
+      expr: LirExprMakeClosure(func_name: k_fn_name, captures: [], typ: TyI64)
+    ),
+    LirStmtLet(
+      name: "z",
+      typ: TyI64,
+      expr: LirExprAtom(atom: LirAtomInt(val: 0))
+    ),
+    LirStmtLet(
+      name: "built",
+      typ: TyI64,
+      expr: LirExprCall(
+        func: "nxlib_stdlib_list_nx#build",
+        args: [LirCallArg(label: "g", value: LirAtomVar(name: "g_clos", typ: TyI64))],
+        typ: TyI64
+      )
+    ),
+    LirStmtLet(
+      name: "result",
+      typ: TyI64,
+      expr: LirExprCall(
+        func: "nxlib_stdlib_list_nx#foldr",
+        args: [
+          LirCallArg(label: "xs", value: LirAtomVar(name: "built", typ: TyI64)),
+          LirCallArg(label: "init", value: LirAtomVar(name: "z", typ: TyI64)),
+          LirCallArg(label: "f", value: LirAtomVar(name: "k_clos", typ: TyI64))
+        ],
+        typ: TyI64
+      )
+    )
+  ]
+  return LirFunction(
+    name: "main_fn",
+    params: [],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "result", typ: TyI64),
+    span: dummy_span()
+  )
+end
+
+exception TestFailure(reason: string)
+
+// Locate the result statement (Let "result") in main's body and inspect
+// its expression. After fusion the expression becomes LirExprCallClosure;
+// without fusion it remains LirExprCall.
+let find_result_expr = fn (body: [LirStmt]) -> Option<LirExpr> do
+  match body do
+    | [] -> return None
+    | LirStmtLet(name: n, typ: _, expr: e) :: rest ->
+      if n == "result" then return Some(val: e) end
+      return find_result_expr(body: rest)
+    | _ :: rest -> return find_result_expr(body: rest)
+  end
+end
+
+let find_main_fn = fn (funcs: [LirFunction]) -> Option<LirFunction> do
+  match funcs do
+    | [] -> return None
+    | f :: rest ->
+      let LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) = f
+      if n == "main_fn" then return Some(val: f) end
+      return find_main_fn(funcs: rest)
+  end
+end
+
+let is_call_closure = fn (e: LirExpr) -> bool do
+  if let LirExprCallClosure(_) = e then return true end
+  return false
+end
+
+let is_call_to = fn (e: LirExpr, target: string) -> bool do
+  if let LirExprCall(func: f, args: _, typ: _) = e then
+    if f == target then return true end
+  end
+  return false
+end
+
+let body = fn () -> unit throws { Exn } do
+  // ─── Pure case: fusion fires ───────────────────────────────────────────
+  let prog_pure = LirProgram(
+    functions: [
+      make_pure_k(),
+      make_g_fn(),
+      make_foldr_fn(),
+      make_build_fn(),
+      make_main_fn(k_fn_name: "k_pure_fn")
+    ],
+    externals: []
+  )
+
+  let em_pure = analyze_effects(program: prog_pure)
+  let opt_pure = optimize_lir_with_effects(program: prog_pure, effects: em_pure)
+  let LirProgram(functions: pure_funcs, externals: _) = opt_pure
+  let main_pure_opt = find_main_fn(funcs: pure_funcs)
+
+  match main_pure_opt do
+    | None -> raise TestFailure(reason: "main_fn missing after optimisation (pure)")
+    | Some(val: f) ->
+      let LirFunction(name: _, params: _, ret_type: _, body: b, ret: _, span: _) = f
+      match find_result_expr(body: b) do
+        | None -> raise TestFailure(reason: "result let missing (pure)")
+        | Some(val: e) ->
+          test_assert.assert_true(
+            cond: is_call_closure(e),
+            label: "pure k: result expr is CallClosure (fusion fired)"
+          )
+      end
+  end
+
+  // ─── Impure case: fusion skipped ───────────────────────────────────────
+  let prog_imp = LirProgram(
+    functions: [
+      make_impure_k(),
+      make_g_fn(),
+      make_foldr_fn(),
+      make_build_fn(),
+      make_main_fn(k_fn_name: "k_throw_fn")
+    ],
+    externals: []
+  )
+
+  let em_imp = analyze_effects(program: prog_imp)
+  let opt_imp = optimize_lir_with_effects(program: prog_imp, effects: em_imp)
+  let LirProgram(functions: imp_funcs, externals: _) = opt_imp
+  let main_imp_opt = find_main_fn(funcs: imp_funcs)
+
+  match main_imp_opt do
+    | None -> raise TestFailure(reason: "main_fn missing after optimisation (impure)")
+    | Some(val: f) ->
+      let LirFunction(name: _, params: _, ret_type: _, body: b, ret: _, span: _) = f
+      match find_result_expr(body: b) do
+        | None -> raise TestFailure(reason: "result let missing (impure)")
+        | Some(val: e) ->
+          test_assert.assert_true(
+            cond: is_call_to(e, target: "nxlib_stdlib_list_nx#foldr"),
+            label: "impure k: result expr is unchanged Call(...#foldr) (fusion skipped)"
+          )
+          test_assert.assert_false(
+            cond: is_call_closure(e),
+            label: "impure k: result expr is NOT CallClosure"
+          )
+      end
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  // Trap on failure so the runtime test runner reports FAIL via non-zero
+  // exit. Mirrors the divide-by-zero idiom used by every fixture in this
+  // directory.
+  let _ = 1 / ok
+  return ()
+end

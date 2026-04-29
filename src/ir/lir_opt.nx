@@ -1,8 +1,12 @@
 /**
  * lir_opt: LIR optimization passes for the self-hosting compiler.
  *
- * Chains two passes: fold+propagate → DCE
+ * Chains the following passes:
  *
+ * 0. Stream fusion (build/foldr): rewrites `foldr(k, z, build(g))` to
+ *    `g(k, z)` when k is pure per the supplied EffectMap. Eliminates the
+ *    intermediate list created by `build`. Entry point:
+ *    `optimize_lir_with_effects`.
  * 1. Constant folding: evaluates binary ops on literal atoms at compile time
  * 2. Constant propagation + copy propagation: substitutes known bindings into
  *    use sites (literal constants AND variable-to-variable copies)
@@ -12,6 +16,10 @@
  *
  * Passes 1-3 are combined in a single forward walk (opt_fp_stmts).
  * Pass 4 runs separately afterward (opt_dce_stmts).
+ *
+ * `optimize_lir(program)` runs passes 1-4 with no fusion (effect map empty);
+ * `optimize_lir_with_effects(program, effects)` adds pass 0 in front so
+ * fusion sees the precomputed per-function effect summaries.
  */
 
 // ─── Backtrace Stability Contract ───────────────────────────────────────────
@@ -38,9 +46,10 @@
 // DCE explicitly checks for side effects before removing any binding.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { BinaryOp } from "src/common/ast.nx"
+import { BinaryOp, TypeExpr } from "src/common/ast.nx"
 import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom,
          LirCallArg, LirNamedAtom } from "src/ir/lir_types.nx"
+import { EffectMap, lookup_summary, EffectSummary } from "src/backend/effect_analysis.nx"
 
 // ─── Helper Types ───────────────────────────────────────────────────────────
 
@@ -792,4 +801,425 @@ end
 export let optimize_lir = fn (program: LirProgram) -> LirProgram do
   let LirProgram(functions: funcs, externals: exts) = program
   LirProgram(functions: opt_functions(funcs), externals: exts)
+end
+
+// ─── Stream Fusion (build/foldr) ────────────────────────────────────────────
+//
+// Implements the GHC-style shortcut deforestation rule
+//
+//     foldr(k, z, build(g)) ≡ g(k, z)
+//
+// where `list.build` and `list.foldr` are the conventions defined in
+// nxlib/stdlib/list.nx. Concretely the rewriter looks for the local
+// 2-statement pattern
+//
+//     let built  = Call(list_build, [g_clos])
+//     let result = Call(list_foldr, [xs=built, init=z, f=k_clos])
+//
+// where `built` is used exactly once (so removing it is safe), `g_clos` is
+// a MakeClosure on a top-level lifted lambda, and `k_clos` is also a
+// MakeClosure whose target function the EffectMap reports as `is_pure`.
+// Pure-only is the safety gate (see issue body): if the combining function
+// could throw, capture, or perform I/O, fusion would change the
+// observable order/duplication of effects relative to the unfused walk
+// and is therefore disabled.
+//
+// The rewrite drops the build call and replaces the foldr call with a
+// direct closure invocation `CallClosure(g_clos, [k_clos, z])`. The build
+// statement is left in place; downstream DCE removes it because its sole
+// use just disappeared. We do not relocate `g_clos` or `k_clos`
+// definitions: they must dominate the foldr statement (which they do
+// since they were already arguments to `Call`s preceding it).
+
+// Canonical names of the stdlib build/foldr functions. Defined as
+// zero-arg functions because Nexus does not currently allow top-level
+// `let` bindings for non-function values; calling them at the
+// pattern-match site is a one-call no-op.
+let foldr_fn_name = fn () -> string do return "nxlib_stdlib_list_nx#foldr" end
+let build_fn_name = fn () -> string do return "nxlib_stdlib_list_nx#build" end
+
+type FusionVarDef = FusionVarDef(name: string, expr: LirExpr)
+type FusionUseEntry = FusionUseEntry(name: string, count: i64)
+type FusionCtx = FusionCtx(
+  defs: [FusionVarDef],
+  uses: [FusionUseEntry],
+  effects: EffectMap
+)
+
+let fus_lookup_def = fn (name: string, defs: [FusionVarDef]) -> Option<LirExpr> do
+  match defs do
+    | [] -> return None
+    | FusionVarDef(name: n, expr: e) :: rest ->
+      if n == name then return Some(val: e) end
+      return fus_lookup_def(name, defs: rest)
+  end
+end
+
+// Sum the count field of every entry whose name equals the queried one.
+// Combined with the now O(1) bump, this gives a true linear-pass use map.
+let fus_lookup_use = fn (name: string, uses: [FusionUseEntry]) -> i64 do
+  return fus_lookup_use_go(name: name, uses: uses, total: 0)
+end
+
+let fus_lookup_use_go = fn (name: string, uses: [FusionUseEntry], total: i64) -> i64 do
+  match uses do
+    | [] -> return total
+    | FusionUseEntry(name: n, count: c) :: rest ->
+      if n == name then
+        return fus_lookup_use_go(name: name, uses: rest, total: total + c)
+      end
+      return fus_lookup_use_go(name: name, uses: rest, total: total)
+  end
+end
+
+// Single-use check: returns true iff `name` is referenced exactly once in
+// the surrounding statement list. Multi-use disables fusion because the
+// build call's result would otherwise be observed under cons/nil semantics
+// elsewhere, where the rewritten direct invocation is no longer a list.
+let fus_single_use = fn (name: string, ctx: FusionCtx) -> bool do
+  let FusionCtx(defs: _, uses, effects: _) = ctx
+  return fus_lookup_use(name, uses) == 1
+end
+
+// Record one occurrence of `name`. Implementation is O(1) amortised:
+// every use is prepended as a fresh entry, and `fus_lookup_use` later
+// counts occurrences in a single pass. The earlier amortised-association
+// scheme was O(uses^2) per function; on a 2000-function compiler that
+// drove stage-1 OOM during self-host bootstrap.
+let fus_bump_use = fn (name: string, uses: [FusionUseEntry]) -> [FusionUseEntry] do
+  return FusionUseEntry(name: name, count: 1) :: uses
+end
+
+let reverse_use_entries = fn (lst: [FusionUseEntry], out: [FusionUseEntry]) -> [FusionUseEntry] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_use_entries(lst: rest, out: x :: out)
+  end
+end
+
+let reverse_var_defs = fn (lst: [FusionVarDef], out: [FusionVarDef]) -> [FusionVarDef] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_var_defs(lst: rest, out: x :: out)
+  end
+end
+
+// Count uses across one statement (atom + nested-statement walk).
+let fus_count_uses_atom = fn (atom: LirAtom, uses: [FusionUseEntry]) -> [FusionUseEntry] do
+  if let LirAtomVar(name: n, typ: _) = atom then
+    return fus_bump_use(name: n, uses)
+  end
+  return uses
+end
+
+let fus_count_uses_opt_atom = fn (opt: Option<LirAtom>, uses: [FusionUseEntry]) -> [FusionUseEntry] do
+  match opt do
+    | Some(val: a) -> return fus_count_uses_atom(atom: a, uses)
+    | None -> return uses
+  end
+end
+
+let fus_count_uses_atoms = fn (xs: [LirAtom], uses: [FusionUseEntry]) -> [FusionUseEntry] do
+  match xs do
+    | [] -> return uses
+    | a :: rest -> return fus_count_uses_atoms(xs: rest, uses: fus_count_uses_atom(atom: a, uses))
+  end
+end
+
+let fus_count_uses_call_args = fn (args: [LirCallArg], uses: [FusionUseEntry]) -> [FusionUseEntry] do
+  match args do
+    | [] -> return uses
+    | LirCallArg(label: _, value: v) :: rest ->
+      return fus_count_uses_call_args(args: rest, uses: fus_count_uses_atom(atom: v, uses))
+  end
+end
+
+let fus_count_uses_named = fn (fs: [LirNamedAtom], uses: [FusionUseEntry]) -> [FusionUseEntry] do
+  match fs do
+    | [] -> return uses
+    | LirNamedAtom(name: _, value: v) :: rest ->
+      return fus_count_uses_named(fs: rest, uses: fus_count_uses_atom(atom: v, uses))
+  end
+end
+
+let fus_count_uses_expr = fn (expr: LirExpr, uses: [FusionUseEntry]) -> [FusionUseEntry] do
+  match expr do
+    | LirExprAtom(atom: a) -> return fus_count_uses_atom(atom: a, uses)
+    | LirExprBinary(op: _, lhs: l, rhs: r, typ: _) ->
+      return fus_count_uses_atom(atom: r, uses: fus_count_uses_atom(atom: l, uses))
+    | LirExprCall(func: _, args, typ: _) -> return fus_count_uses_call_args(args, uses)
+    | LirExprTailCall(func: _, args, typ: _) -> return fus_count_uses_call_args(args, uses)
+    | LirExprConstructor(name: _, args, typ: _) -> return fus_count_uses_atoms(xs: args, uses)
+    | LirExprRecord(fields: fs, typ: _) -> return fus_count_uses_named(fs, uses)
+    | LirExprObjectTag(value: v, typ: _) -> return fus_count_uses_atom(atom: v, uses)
+    | LirExprObjectField(value: v, index: _, typ: _) -> return fus_count_uses_atom(atom: v, uses)
+    | LirExprRaise(value: v, typ: _) -> return fus_count_uses_atom(atom: v, uses)
+    | LirExprForce(value: v, typ: _) -> return fus_count_uses_atom(atom: v, uses)
+    | LirExprMakeClosure(func_name: _, captures: cs, typ: _) -> return fus_count_uses_atoms(xs: cs, uses)
+    | LirExprCallClosure(closure: c, args, typ: _) ->
+      return fus_count_uses_call_args(args, uses: fus_count_uses_atom(atom: c, uses))
+    | LirExprSuspend(tag_name: _, payload: p, typ: _) -> return fus_count_uses_atom(atom: p, uses)
+    | LirExprResume(cont: c, value: v, typ: _) ->
+      return fus_count_uses_atom(atom: v, uses: fus_count_uses_atom(atom: c, uses))
+    | LirExprContNew(_) -> return uses
+    | LirExprInjectResume(_) -> return uses
+  end
+end
+
+let fus_count_uses_stmt = fn (stmt: LirStmt, uses: [FusionUseEntry]) -> [FusionUseEntry] do
+  match stmt do
+    | LirStmtLet(name: _, typ: _, expr: e) -> return fus_count_uses_expr(expr: e, uses)
+    | LirStmtIf(cond: c, then_body: tb, else_body: eb) ->
+      let u1 = fus_count_uses_atom(atom: c, uses)
+      let u2 = fus_count_uses_stmts(stmts: tb, uses: u1)
+      return fus_count_uses_stmts(stmts: eb, uses: u2)
+    | LirStmtIfReturn(cond: c, then_body: tb, then_ret: tr,
+                      else_body: eb, else_ret: er, ret_type: _) ->
+      let u1 = fus_count_uses_atom(atom: c, uses)
+      let u2 = fus_count_uses_stmts(stmts: tb, uses: u1)
+      let u3 = fus_count_uses_atom(atom: tr, uses: u2)
+      let u4 = fus_count_uses_stmts(stmts: eb, uses: u3)
+      return fus_count_uses_opt_atom(opt: er, uses: u4)
+    | LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
+      let u1 = fus_count_uses_stmts(stmts: cs, uses)
+      let u2 = fus_count_uses_atom(atom: c, uses: u1)
+      return fus_count_uses_stmts(stmts: b, uses: u2)
+    | LirStmtTryCatch(body: b, body_ret: br, catch_param: _, catch_param_typ: _,
+                      catch_body: cb, catch_ret: cr) ->
+      let u1 = fus_count_uses_stmts(stmts: b, uses)
+      let u2 = fus_count_uses_opt_atom(opt: br, uses: u1)
+      let u3 = fus_count_uses_stmts(stmts: cb, uses: u2)
+      return fus_count_uses_opt_atom(opt: cr, uses: u3)
+  end
+end
+
+let fus_count_uses_stmts = fn (stmts: [LirStmt], uses: [FusionUseEntry]) -> [FusionUseEntry] do
+  match stmts do
+    | [] -> return uses
+    | s :: rest -> return fus_count_uses_stmts(stmts: rest, uses: fus_count_uses_stmt(stmt: s, uses))
+  end
+end
+
+// Build the local def map: every Let in this scope contributes name → expr.
+let fus_collect_defs_stmts = fn (stmts: [LirStmt], acc: [FusionVarDef]) -> [FusionVarDef] do
+  match stmts do
+    | [] -> return reverse_var_defs(lst: acc, out: [])
+    | LirStmtLet(name: n, typ: _, expr: e) :: rest ->
+      return fus_collect_defs_stmts(stmts: rest, acc: FusionVarDef(name: n, expr: e) :: acc)
+    | _ :: rest -> return fus_collect_defs_stmts(stmts: rest, acc)
+  end
+end
+
+// Locate a labelled call argument; returns None if missing. Labels in
+// LirCallArg are positional names, so e.g. foldr's args carry "xs",
+// "init", "f".
+let fus_find_arg = fn (label: string, args: [LirCallArg]) -> Option<LirAtom> do
+  match args do
+    | [] -> return None
+    | LirCallArg(label: l, value: v) :: rest ->
+      if l == label then return Some(val: v) end
+      return fus_find_arg(label, args: rest)
+  end
+end
+
+// Effect gate: return true iff the closure's underlying function is pure
+// per the EffectMap. Treat missing summaries as impure (fail closed) so a
+// missing entry never silently enables fusion.
+let fus_is_closure_pure = fn (clos_expr: LirExpr, effects: EffectMap) -> bool do
+  if let LirExprMakeClosure(func_name: fn_name, captures: _, typ: _) = clos_expr then
+    match lookup_summary(em: effects, name: fn_name) do
+      | Some(val: s) ->
+        let EffectSummary(capabilities_used: _, can_throw: _, is_pure: pure) = s
+        return pure
+      | None -> return false
+    end
+  end
+  return false
+end
+
+// Resolve an atom to a closure expression in the local def map. Fusion
+// requires both g and k to be MakeClosure; FuncRef-via-atom is not yet
+// supported.
+let fus_resolve_closure = fn (atom: LirAtom, defs: [FusionVarDef]) -> Option<LirExpr> do
+  if let LirAtomVar(name: n, typ: _) = atom then
+    return fus_lookup_def(name: n, defs)
+  end
+  return None
+end
+
+// Helper: resolve the inner build call from xs's atom. Returns the `g`
+// closure atom from `Call(build, g=...)` if the chain matches; None
+// otherwise (xs not a variable, multi-use, not a build call, missing g).
+let fus_unfold_build = fn (xs_atom: LirAtom, ctx: FusionCtx) -> Option<LirAtom> do
+  let FusionCtx(defs, uses: _, effects: _) = ctx
+  if let LirAtomVar(name: xs_name, typ: _) = xs_atom then
+    if !fus_single_use(name: xs_name, ctx) then return None end
+    match fus_lookup_def(name: xs_name, defs) do
+      | None -> return None
+      | Some(val: xs_expr) ->
+        if let LirExprCall(func: build_fn, args: build_args, typ: _) = xs_expr then
+          if build_fn != build_fn_name() then return None end
+          return fus_find_arg(label: "g", args: build_args)
+        end
+        return None
+    end
+  end
+  return None
+end
+
+// Helper: verify a foldr argument atom resolves to a MakeClosure. Returns
+// the closure expression on success; None if it is anything else (literal,
+// param-only var, FuncRef-style atom, …) — fusion is conservative and
+// only fires when both g and k are explicit MakeClosure values that
+// effect_analysis can index.
+let fus_require_closure = fn (atom: LirAtom, defs: [FusionVarDef]) -> Option<LirExpr> do
+  match fus_resolve_closure(atom, defs) do
+    | None -> return None
+    | Some(val: e) ->
+      if let LirExprMakeClosure(_) = e then return Some(val: e) end
+      return None
+  end
+end
+
+// The core rewrite: given a foldr Let, decide whether it fuses with a
+// preceding build, and produce the replacement statement(s).
+//
+// Returns Some(new_stmt) when fusion fires; None otherwise. The build
+// Let is not rewritten in place — we leave it as-is so the surrounding
+// pipeline (already-running DCE) collects it once its single use has
+// vanished. This keeps the rewrite local and avoids stmt-list surgery.
+let fus_try_fuse_foldr = fn (
+  let_name: string,
+  let_typ: TypeExpr,
+  args: [LirCallArg],
+  ctx: FusionCtx
+) -> Option<LirStmt> do
+  let FusionCtx(defs, uses: _, effects) = ctx
+  match fus_find_arg(label: "xs", args) do
+    | None -> return None
+    | Some(val: xs_atom) ->
+      match fus_find_arg(label: "init", args) do
+        | None -> return None
+        | Some(val: init_atom) ->
+          match fus_find_arg(label: "f", args) do
+            | None -> return None
+            | Some(val: f_atom) ->
+              match fus_unfold_build(xs_atom, ctx) do
+                | None -> return None
+                | Some(val: g_atom) ->
+                  match fus_require_closure(atom: g_atom, defs) do
+                    | None -> return None
+                    | Some(_) ->
+                      match fus_require_closure(atom: f_atom, defs) do
+                        | None -> return None
+                        | Some(val: k_expr) ->
+                          if !fus_is_closure_pure(clos_expr: k_expr, effects) then
+                            return None
+                          end
+                          // Synthesise the direct closure call:
+                          //   CallClosure(g, [cons=k, nil=z])
+                          let new_args = [
+                            LirCallArg(label: "cons", value: f_atom),
+                            LirCallArg(label: "nil", value: init_atom)
+                          ]
+                          let new_expr = LirExprCallClosure(
+                            closure: g_atom,
+                            args: new_args,
+                            typ: let_typ
+                          )
+                          return Some(val: LirStmtLet(name: let_name, typ: let_typ, expr: new_expr))
+                      end
+                  end
+              end
+          end
+      end
+  end
+end
+
+// Rewrite a single statement in-place if it is the foldr we want to fuse.
+let fus_rewrite_stmt = fn (stmt: LirStmt, ctx: FusionCtx) -> LirStmt do
+  match stmt do
+    | LirStmtLet(name: n, typ: t, expr: e) ->
+      if let LirExprCall(func: fname, args: a, typ: _) = e then
+        if fname == foldr_fn_name() then
+          match fus_try_fuse_foldr(let_name: n, let_typ: t, args: a, ctx) do
+            | Some(val: new_stmt) -> return new_stmt
+            | None -> return stmt
+          end
+        end
+      end
+      return stmt
+    | LirStmtIf(cond: c, then_body: tb, else_body: eb) ->
+      return LirStmtIf(cond: c,
+                       then_body: fus_rewrite_stmts_in(stmts: tb, effects: fus_effects(ctx)),
+                       else_body: fus_rewrite_stmts_in(stmts: eb, effects: fus_effects(ctx)))
+    | LirStmtIfReturn(cond: c, then_body: tb, then_ret: tr,
+                      else_body: eb, else_ret: er, ret_type: rt) ->
+      return LirStmtIfReturn(cond: c,
+                             then_body: fus_rewrite_stmts_in(stmts: tb, effects: fus_effects(ctx)),
+                             then_ret: tr,
+                             else_body: fus_rewrite_stmts_in(stmts: eb, effects: fus_effects(ctx)),
+                             else_ret: er, ret_type: rt)
+    | LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
+      return LirStmtLoop(cond_stmts: fus_rewrite_stmts_in(stmts: cs, effects: fus_effects(ctx)),
+                         cond: c,
+                         body: fus_rewrite_stmts_in(stmts: b, effects: fus_effects(ctx)))
+    | LirStmtTryCatch(body: b, body_ret: br, catch_param: cp,
+                      catch_param_typ: cpt, catch_body: cb, catch_ret: cr) ->
+      return LirStmtTryCatch(body: fus_rewrite_stmts_in(stmts: b, effects: fus_effects(ctx)),
+                             body_ret: br, catch_param: cp, catch_param_typ: cpt,
+                             catch_body: fus_rewrite_stmts_in(stmts: cb, effects: fus_effects(ctx)),
+                             catch_ret: cr)
+  end
+end
+
+let fus_effects = fn (ctx: FusionCtx) -> EffectMap do
+  let FusionCtx(defs: _, uses: _, effects) = ctx
+  return effects
+end
+
+// Iterate over a stmt list with a freshly built ctx for that scope.
+let fus_rewrite_stmts_in = fn (stmts: [LirStmt], effects: EffectMap) -> [LirStmt] do
+  let defs = fus_collect_defs_stmts(stmts: stmts, acc: [])
+  let uses = fus_count_uses_stmts(stmts: stmts, uses: [])
+  let ctx = FusionCtx(defs: defs, uses: uses, effects: effects)
+  return fus_rewrite_stmts_go(stmts: stmts, ctx: ctx, acc: [])
+end
+
+let fus_rewrite_stmts_go = fn (stmts: [LirStmt], ctx: FusionCtx, acc: [LirStmt]) -> [LirStmt] do
+  match stmts do
+    | [] -> return reverse_stmts_opt(lst: acc, out: [])
+    | s :: rest ->
+      let new_s = fus_rewrite_stmt(stmt: s, ctx: ctx)
+      return fus_rewrite_stmts_go(stmts: rest, ctx: ctx, acc: new_s :: acc)
+  end
+end
+
+let fus_rewrite_function = fn (func: LirFunction, effects: EffectMap) -> LirFunction do
+  let LirFunction(name: n, params: p, ret_type: rt, body: bd, ret: rv, span: sp) = func
+  let new_body = fus_rewrite_stmts_in(stmts: bd, effects: effects)
+  return LirFunction(name: n, params: p, ret_type: rt, body: new_body, ret: rv, span: sp)
+end
+
+let fus_rewrite_functions = fn (funcs: [LirFunction], effects: EffectMap) -> [LirFunction] do
+  return fus_rewrite_functions_go(funcs: funcs, effects: effects, acc: [])
+end
+
+let fus_rewrite_functions_go = fn (funcs: [LirFunction], effects: EffectMap, acc: [LirFunction]) -> [LirFunction] do
+  match funcs do
+    | [] -> return reverse_funcs(lst: acc, out: [])
+    | f :: rest ->
+      return fus_rewrite_functions_go(funcs: rest, effects: effects,
+                                      acc: fus_rewrite_function(func: f, effects: effects) :: acc)
+  end
+end
+
+// Public entry: run stream fusion over a program using the provided
+// EffectMap, then run the existing fold/propagate/DCE pipeline on the
+// result so the now-dead build call is collected.
+export let optimize_lir_with_effects = fn (program: LirProgram, effects: EffectMap) -> LirProgram do
+  let LirProgram(functions: funcs, externals: exts) = program
+  let fused = fus_rewrite_functions(funcs: funcs, effects: effects)
+  let optimised = opt_functions(funcs: fused)
+  return LirProgram(functions: optimised, externals: exts)
 end
