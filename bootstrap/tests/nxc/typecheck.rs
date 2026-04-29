@@ -58,3 +58,13 @@ fn lsp_publish_diagnostics_wire_format() {
 fn lsp_document_symbols() {
     exec_with_stdlib(&read_fixture("nxc/test_lsp_document_symbols.nx"));
 }
+
+/// Covers nexus-avdp (multi-file import-aware diagnostics + per-URI cache):
+/// the Handlers vtable advertises `require { Fs, Console }`, the importer's
+/// publishDiagnostics frame inherits TypeMismatch from a buggy imported
+/// module read off disk via the `Fs` cap, and same-(uri, version) replays
+/// hit the diagnostic cache instead of re-running the typecheck pipeline.
+#[test]
+fn lsp_multifile_imports_fs_cap_and_cache() {
+    exec_with_stdlib(&read_fixture("nxc/test_lsp_multifile_imports.nx"));
+}

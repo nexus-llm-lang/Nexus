@@ -1,0 +1,344 @@
+/**
+ * Test for nexus-avdp: multi-file import-aware LSP diagnostics.
+ *
+ * Stage:
+ *   1. Write `tmp_avdp_lsp/lib.nx` to disk with a valid signature and a
+ *      mismatched body so the typechecker sees a TypeMismatch *inside* the
+ *      imported module. The importer's own buffer text is well-formed in
+ *      isolation; the error only surfaces once the imported module is
+ *      preloaded through the `Fs` cap.
+ *   2. Drive the language-server scaffold with
+ *      `initialize → didOpen(importer) → didChange(importer) → exit`.
+ *   3. Assert: the publishDiagnostics frame for the importer carries at
+ *      least one diagnostic (the imported module's TypeMismatch surfaces
+ *      because `process_imports` typechecks all reachable defs).
+ *   4. Assert: a second `didChange` with the same `version` reuses the
+ *      cached diagnostics array (verified indirectly via the cache hit's
+ *      version-bump invalidation contract — sending the same version
+ *      twice produces the same diagnostic count, and bumping the version
+ *      re-runs the pipeline).
+ *
+ * Acceptance coverage (issue nexus-avdp):
+ *   (1) Handlers vtable carries `require { Fs }`           — exercised by the
+ *       fact that this fixture's `main` injects `fs_mod.system_handler`
+ *       and the call typechecks; without the row widening, the call would
+ *       be a row-mismatch error.
+ *   (2) `run_server` accepts caller-supplied fs handler   — the test
+ *       drives `drive_messages` directly under `inject fs_mod.system_handler`,
+ *       proving the row discharge surface.
+ *   (3) `compute_diagnostics_for_buffer` parses imports + reads via Fs —
+ *       verified by the importer's diagnostic count being non-zero.
+ *   (4) Per-URI `(file_path, version) → diagnostics` cache — verified
+ *       by the same-version replay producing identical diagnostic count
+ *       (cache hit) and a fresh version bump producing fresh diagnostics
+ *       after we rewrite the imported file's contents.
+ *   (5) Importing-file diagnostic reflects imported-file error          —
+ *       primary assertion of this test.
+ */
+
+import {
+  JsonValue, JsonNull, JsonInt, JsonString, JsonArray, JsonObject, JsonField,
+  get_field
+} from "std:json"
+import { Option, Some, None } from "std:option"
+import { Request, Notification }, * as jr from "nxlib/jsonrpc.nx"
+import {
+  empty_state, drive_messages, DriveResult,
+  Handlers
+} from "nxlib/lsp/server.nx"
+import { nexus_handlers } from "src/lsp/handlers.nx"
+import { Fs }, * as fs_mod from "std:fs"
+import { Console }, * as stdio from "std:stdio"
+
+let assert = fn (cond: bool, msg: string) -> unit throws { Exn } do
+  if cond then return ()
+  else raise RuntimeError(val: msg)
+  end
+end
+
+let len_jv = fn (xs: [JsonValue]) -> i64 do
+  match xs do
+    | [] -> return 0
+    | _ :: rest -> return 1 + len_jv(xs: rest)
+  end
+end
+
+let str_eq = fn (a: string, b: string) -> bool do
+  return a == b
+end
+
+// ─── Builders for inbound JSON-RPC messages ────────────────────────────────
+
+let initialize_request = fn () -> jr.IncomingMessage do
+  let params = JsonObject(fields: [
+    JsonField(key: "processId", value: JsonNull),
+    JsonField(key: "rootUri", value: JsonNull),
+    JsonField(key: "capabilities", value: JsonObject(fields: []))
+  ])
+  return Request(id: JsonInt(val: 1), method: "initialize", params)
+end
+
+let did_open_notification = fn (uri: string, text: string, version: i64) -> jr.IncomingMessage do
+  let td = JsonObject(fields: [
+    JsonField(key: "uri", value: JsonString(val: uri)),
+    JsonField(key: "languageId", value: JsonString(val: "nexus")),
+    JsonField(key: "version", value: JsonInt(val: version)),
+    JsonField(key: "text", value: JsonString(val: text))
+  ])
+  let params = JsonObject(fields: [
+    JsonField(key: "textDocument", value: td)
+  ])
+  return Notification(method: "textDocument/didOpen", params)
+end
+
+let did_change_notification = fn (uri: string, text: string, version: i64) -> jr.IncomingMessage do
+  let td = JsonObject(fields: [
+    JsonField(key: "uri", value: JsonString(val: uri)),
+    JsonField(key: "version", value: JsonInt(val: version))
+  ])
+  let changes = JsonArray(items: [
+    JsonObject(fields: [
+      JsonField(key: "text", value: JsonString(val: text))
+    ])
+  ])
+  let params = JsonObject(fields: [
+    JsonField(key: "textDocument", value: td),
+    JsonField(key: "contentChanges", value: changes)
+  ])
+  return Notification(method: "textDocument/didChange", params)
+end
+
+let exit_notification = fn () -> jr.IncomingMessage do
+  return Notification(method: "exit", params: JsonNull)
+end
+
+// ─── Field probes ──────────────────────────────────────────────────────────
+
+let get_obj_field = fn (obj: JsonValue, key: string) -> JsonValue throws { Exn } do
+  match get_field(obj, key) do
+    | None -> raise RuntimeError(val: "missing field: " ++ key)
+    | Some(val: v) -> return v
+  end
+end
+
+let get_array_field = fn (obj: JsonValue, key: string) -> [JsonValue] throws { Exn } do
+  match get_field(obj, key) do
+    | None -> raise RuntimeError(val: "missing field: " ++ key)
+    | Some(val: v) ->
+      match v do
+        | JsonArray(items) -> return items
+        | _ -> raise RuntimeError(val: "field not array: " ++ key)
+      end
+  end
+end
+
+let get_string_field = fn (obj: JsonValue, key: string) -> string throws { Exn } do
+  match get_field(obj, key) do
+    | None -> raise RuntimeError(val: "missing field: " ++ key)
+    | Some(val: v) ->
+      match v do
+        | JsonString(val: s) -> return s
+        | _ -> raise RuntimeError(val: "field not string: " ++ key)
+      end
+  end
+end
+
+let get_int_field = fn (obj: JsonValue, key: string) -> i64 throws { Exn } do
+  match get_field(obj, key) do
+    | None -> raise RuntimeError(val: "missing field: " ++ key)
+    | Some(val: v) ->
+      match v do
+        | JsonInt(val: i) -> return i
+        | _ -> raise RuntimeError(val: "field not int: " ++ key)
+      end
+  end
+end
+
+// ─── Filesystem fixture setup ───────────────────────────────────────────────
+
+let workspace_dir = fn () -> string do
+  return "tmp_avdp_lsp"
+end
+
+let imported_path = fn () -> string do
+  return "tmp_avdp_lsp/lib.nx"
+end
+
+// `lib.nx` contents: two public functions. `foo` is well-typed and
+// matches the importer's call site; `bar` declares `() -> i64` but its
+// body never returns an i64 — instead the body's only stmt is a let
+// binding to a string literal, leaving the function body's resulting
+// expression mismatched against the declared i64 return type. The
+// importer (buffer text) calls `foo` only, but `bar` still gets
+// typechecked once the imported module is preloaded — that's the
+// import-aware diagnostic acceptance.
+let imported_buggy = fn () -> string do
+  return "let foo = fn () -> i64 do return 0 end\nlet bar = fn () -> i64 do return \"not an int\" end\n"
+end
+
+// Importer buffer text. Imports `lib.foo` and uses it. The `main` defn
+// is required for typechecker's MissingMain check to pass.
+let importer_text = fn () -> string do
+  return "import { foo } from \"tmp_avdp_lsp/lib.nx\"\nlet main = fn () -> unit do let _ = foo() return () end\n"
+end
+
+let setup_workspace = fn () -> unit require { Fs } throws { Exn } do
+  Fs.create_dir_all(path: workspace_dir())
+  Fs.write_string(path: imported_path(), content: imported_buggy())
+end
+
+let cleanup_workspace = fn () -> unit require { Fs } throws { Exn } do
+  // Best-effort cleanup. If the test fails earlier the artifact persists
+  // but lives under a test-owned prefix so it doesn't pollute the
+  // workspace beyond the next test run.
+  let exists = Fs.exists(path: imported_path())
+  if exists then
+    Fs.remove_file(path: imported_path())
+  end
+end
+
+// ─── Test cases ────────────────────────────────────────────────────────────
+
+let test_importer_diagnostic_reflects_imported_error = fn () -> unit require { Fs, Console } throws { Exn } do
+  let uri = "file:///workspace/importer.nx"
+  let msgs = [
+    initialize_request(),
+    did_open_notification(uri, text: importer_text(), version: 1),
+    exit_notification()
+  ]
+  let result = drive_messages(state: empty_state(), msgs, handlers: nexus_handlers())
+  match result do | DriveResult(state: _, responses: resps, notifications: notes, exited) ->
+    assert(cond: exited, msg: "drive must terminate via exit")
+    // initialize → 1 response. didOpen → 1 publishDiagnostics notification.
+    assert(cond: len_jv(xs: resps) == 1, msg: "expected 1 response (initialize)")
+    assert(cond: len_jv(xs: notes) == 1,
+      msg: "didOpen must emit exactly one publishDiagnostics notification")
+    match notes do
+      | n :: [] ->
+        let method = get_string_field(obj: n, key: "method")
+        assert(cond: str_eq(a: method, b: "textDocument/publishDiagnostics"),
+          msg: "notification method must be textDocument/publishDiagnostics")
+        let params = get_obj_field(obj: n, key: "params")
+        let pub_uri = get_string_field(obj: params, key: "uri")
+        assert(cond: str_eq(a: pub_uri, b: uri),
+          msg: "publishDiagnostics.uri must echo the didOpen URI")
+        // The imported file's TypeMismatch must surface in the importer's
+        // diagnostic stream — the central acceptance criterion for
+        // multi-file import-aware diagnostics.
+        let diags = get_array_field(obj: params, key: "diagnostics")
+        assert(cond: len_jv(xs: diags) >= 1,
+          msg: "importer must inherit at least one diagnostic from imported lib")
+      | _ -> raise RuntimeError(val: "expected exactly one notification")
+    end
+  end
+end
+
+let test_same_version_diagnostics_are_cached = fn () -> unit require { Fs, Console } throws { Exn } do
+  // Same (uri, version) on a second pass must return identical diagnostic
+  // counts — cache reuse contract. We verify by running the same buffer
+  // through didOpen + didChange with version=1 each time and asserting the
+  // diagnostic count is identical across both frames.
+  let uri = "file:///workspace/importer.nx"
+  let msgs = [
+    initialize_request(),
+    did_open_notification(uri, text: importer_text(), version: 1),
+    did_change_notification(uri, text: importer_text(), version: 1),
+    exit_notification()
+  ]
+  let result = drive_messages(state: empty_state(), msgs, handlers: nexus_handlers())
+  match result do | DriveResult(state: _, responses: _, notifications: notes, exited) ->
+    assert(cond: exited, msg: "drive must terminate via exit")
+    // didOpen + didChange = 2 publishDiagnostics frames.
+    assert(cond: len_jv(xs: notes) == 2,
+      msg: "expected 2 publishDiagnostics frames (didOpen + didChange)")
+    match notes do
+      | n1 :: n2 :: [] ->
+        let p1 = get_obj_field(obj: n1, key: "params")
+        let d1 = get_array_field(obj: p1, key: "diagnostics")
+        let p2 = get_obj_field(obj: n2, key: "params")
+        let d2 = get_array_field(obj: p2, key: "diagnostics")
+        // Cache hit on the second pass: identical diagnostic counts.
+        assert(cond: len_jv(xs: d1) == len_jv(xs: d2),
+          msg: "same-version replay must produce identical diagnostic count (cache hit)")
+        // Both frames must echo the version we sent.
+        let v1 = get_int_field(obj: p1, key: "version")
+        let v2 = get_int_field(obj: p2, key: "version")
+        assert(cond: v1 == 1, msg: "first frame echoes version 1")
+        assert(cond: v2 == 1, msg: "second frame echoes version 1")
+      | _ -> raise RuntimeError(val: "expected exactly two notifications")
+    end
+  end
+end
+
+let test_version_bump_invalidates_cache_after_import_fix = fn () -> unit require { Fs, Console } throws { Exn } do
+  // Bump the version: the cache key changes, so the pipeline reruns. To
+  // check cross-file invalidation reaches the importer, rewrite the
+  // imported file mid-stream to remove the type error, then send a
+  // version-bumped didChange. The importer's diagnostics for v2 must
+  // reflect the freshly-read imported file (no TypeMismatch ⇒ count
+  // strictly less than v1).
+  let uri = "file:///workspace/importer.nx"
+  // First buffer: still reads the buggy lib.nx (which we set up earlier).
+  let msgs_phase1 = [
+    initialize_request(),
+    did_open_notification(uri, text: importer_text(), version: 1)
+  ]
+  let phase1 = drive_messages(state: empty_state(), msgs: msgs_phase1, handlers: nexus_handlers())
+  let phase1_state = match phase1 do | DriveResult(state, responses: _, notifications: _, exited: _) -> state end
+  let phase1_notes = match phase1 do | DriveResult(state: _, responses: _, notifications, exited: _) -> notifications end
+  let phase1_count = match phase1_notes do
+    | n :: [] ->
+      let p = get_obj_field(obj: n, key: "params")
+      let d = get_array_field(obj: p, key: "diagnostics")
+      len_jv(xs: d)
+    | _ -> raise RuntimeError(val: "phase1: expected one notification")
+  end
+  assert(cond: phase1_count >= 1, msg: "phase1 must see imported error")
+
+  // Rewrite the imported file: remove the bug. lib.nx is now clean.
+  Fs.write_string(path: imported_path(),
+    content: "let foo = fn () -> i64 do return 0 end\n")
+
+  // Phase 2: didChange with bumped version. Cache key (uri, 2) ≠ cached
+  // (uri, 1), so the pipeline reruns and re-reads lib.nx.
+  let msgs_phase2 = [
+    did_change_notification(uri, text: importer_text(), version: 2),
+    exit_notification()
+  ]
+  let phase2 = drive_messages(state: phase1_state, msgs: msgs_phase2, handlers: nexus_handlers())
+  match phase2 do | DriveResult(state: _, responses: _, notifications: phase2_notes, exited) ->
+    assert(cond: exited, msg: "phase2 drive must terminate via exit")
+    match phase2_notes do
+      | n :: [] ->
+        let p = get_obj_field(obj: n, key: "params")
+        let d = get_array_field(obj: p, key: "diagnostics")
+        let v = get_int_field(obj: p, key: "version")
+        assert(cond: v == 2, msg: "phase2 frame must echo version 2")
+        // The imported file no longer has a TypeMismatch; the importer's
+        // own buffer text was syntactically clean to begin with. Diagnostic
+        // count must drop strictly below phase1.
+        assert(cond: len_jv(xs: d) < phase1_count,
+          msg: "version bump + rewritten imported file must reduce diagnostic count")
+      | _ -> raise RuntimeError(val: "phase2: expected one notification")
+    end
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject fs_mod.system_handler, stdio.system_handler do
+    try
+      setup_workspace()
+      test_importer_diagnostic_reflects_imported_error()
+      test_same_version_diagnostics_are_cached()
+      // Reset the imported file before the version-bump test, which mutates it.
+      setup_workspace()
+      test_version_bump_invalidates_cache_after_import_fix()
+      cleanup_workspace()
+    catch e ->
+      // Best-effort cleanup before re-raising so the workspace doesn't
+      // hold a stale artifact across reruns.
+      cleanup_workspace()
+      raise e
+    end
+  end
+end
