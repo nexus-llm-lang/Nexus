@@ -104,3 +104,86 @@ so end-to-end through `nexus build` + standalone `wasmtime`
 gate is still covered by `tests/runtime/backtrace_elision_test.nx`
 (already in main), which exercises the codegen decision without invoking
 the host import.
+
+# Skipped ports — bootstrap/tests/codegen → tests/codegen
+
+Codegen tests are highly Rust-implementation-detail oriented: most inspect
+raw WASM bytes via `wasmparser`, call internal Rust APIs, or hold `insta`
+snapshots. Only the small subset that asserts Nexus-observable behavior
+(raise compiles + traps, main signature rejection) is portable.
+
+## bundler.rs
+
+- `compose_with_stdlib_resolves_imports` — calls
+  `nexus::compiler::compose::compose_with_stdlib` directly (Rust API)
+  and inspects the resulting bytes via `wasmparser::Parser::is_component`.
+  No Nexus-language surface for "the composer produced a component."
+- `compose_with_stdlib_is_thread_safe` — concurrency regression for the
+  staging temp_dir race; spawns Rust threads, calls `compose_with_stdlib`
+  per source, and byte-compares results across threads. Multi-threaded
+  Rust harness with no Nexus-level analogue.
+
+## errors.rs
+
+- `snapshot_codegen_error_unsupported_external` — uses
+  `insta::assert_snapshot!` to capture the codegen error string verbatim.
+  Snapshot infra is Rust-only; the underlying assertion (external imports
+  reject `wasm` extension) is better expressed as a future
+  `bootstrap/tests/fixtures/codegen/` negative fixture if needed.
+
+## structure.rs
+
+All thirteen tests in `structure.rs` skipped — every one walks the WASM
+binary via `wasmparser::Parser::new(0).parse_all(&wasm)` to assert on
+specific opcodes / sections / imports / globals, which is not observable
+from inside Nexus:
+
+- `codegen_exports_wasi_cli_run_wrapper` — checks `_start` is in the
+  export section.
+- `compile_metrics_reports_all_pass_durations` — calls
+  `compile_program_to_wasm_with_metrics` and asserts each pass duration
+  is non-zero. Pure Rust API.
+- `codegen_tail_call_emits_return_call_instruction`,
+  `codegen_tail_call_in_if_branch_emits_loop_br`,
+  `codegen_non_self_tail_call_emits_return_call`,
+  `codegen_non_tail_call_does_not_emit_return_call`,
+  `codegen_match_arm_tail_call_emits_tco`,
+  `codegen_match_arm_mutual_tail_call_emits_return_call`,
+  `codegen_return_if_with_tail_calls_emits_return_call`,
+  `codegen_return_match_with_tail_calls_emits_return_call` — TCO opcode
+  inspection (`Operator::Loop`, `Br`, `ReturnCall`). The optimization is
+  internal; programs run correctly with or without TCO at the Nexus level
+  (modulo stack-overflow regressions, which would need a deep-recursion
+  fixture if regressions emerge).
+- `codegen_main_with_args_desugars_to_zero_param_wasm` — checks WASM
+  export kind for `main`.
+- `codegen_main_with_args_includes_proc_capability` — uses
+  `nexus::runtime::parse_nexus_capabilities` (Rust API).
+- `stdlib_wasm_modules_are_wasi_only_or_self_contained` — walks files
+  under `nxlib/stdlib/*.wasm` and inspects each import section. Build-
+  artifact inspection, not Nexus semantics.
+- `codegen_deduplicates_externals_by_wasm_identity` — constructs an
+  `LirProgram` directly (in-memory IR), calls `compile_lir_to_wasm`, and
+  counts WASM imports. Pure compiler-internal regression that has no
+  Nexus surface (you cannot author two externals pointing at the same
+  WASM symbol from `.nx` in a way that survives the parser).
+- `codegen_dwarf_sections_emitted` — asserts custom WASM sections
+  `.debug_abbrev`, `.debug_info`, `.debug_line` exist. Toolchain-detail.
+- `diag_bump_mode_g0_g2_initial_values` — heap-collision diagnostic
+  reading raw WASM globals init values.
+- `notrace_elides_capture_backtrace_import`,
+  `backtrace_usage_keeps_capture_import` — inspect the WASM import
+  section for `nexus:runtime/backtrace::capture-backtrace`. Tree-shake
+  observability test, no Nexus surface.
+
+## errors.rs (ported)
+
+The remaining errors.rs tests are ported (or fixturized):
+
+- `codegen_main_non_unit_return_is_rejected` →
+  `bootstrap/tests/fixtures/codegen/main_non_unit_return.nx` +
+  `.expected_error.txt`. Standalone fixture for a future runner.
+- `codegen_raise_compiles_and_traps` →
+  `tests/codegen/codegen_errors_raise_compiles_test.nx`.
+- `codegen_exn_constructor_lowering` →
+  `tests/codegen/codegen_errors_runtime_error_test.nx`.
