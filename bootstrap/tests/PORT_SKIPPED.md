@@ -187,3 +187,119 @@ The remaining errors.rs tests are ported (or fixturized):
   `tests/codegen/codegen_errors_raise_compiles_test.nx`.
 - `codegen_exn_constructor_lowering` →
   `tests/codegen/codegen_errors_runtime_error_test.nx`.
+
+# Skipped ports — bootstrap/tests/stdlib (batch 5)
+
+Batch 5 covers the simpler stdlib subdirectories: `arena`, `array`, `char`,
+`clock`, `exn`. Two of those (`array`, `exn`) lean almost entirely on the
+Rust harness — see notes per file below — while the others ported as
+runtime fixtures under `tests/stdlib/`.
+
+## arena.rs
+
+Ported (runtime fixtures under `tests/stdlib/`):
+
+- `arena_100k_echo_workload_g0_bounded_with_reset` →
+  `stdlib_arena_heap_reset_bounded_test.nx`. Drops the
+  `Console.println` status line so `main` is `() -> unit` (the safe_run
+  scaffold cannot wrap a capability-bearing main); the trap-on-mismatch
+  invariant is preserved through `assert_eq_i64` on the masked G0.
+- `arena_echo_workload_g0_grows_without_reset` →
+  `stdlib_arena_heap_grows_without_reset_test.nx`. Same shape; the
+  `g0_after > g0_before + 1000` invariant is the leak signal.
+
+Skipped:
+
+- `net_echo_server_fixture_compiles` — `compile_fixture_via_nxc` is a
+  Rust-only harness API (drives the self-hosted nxc compiler entry point).
+  No Nexus-language surface for "this fixture compiles via the
+  self-hosted nxc."
+- `arena_cross_crate_fs_string_workload_bounded_with_reset`,
+  `arena_cross_crate_fs_string_workload_grows_without_reset` — both
+  `main`s declare `require { PermConsole, PermFs }` and use a Rust-side
+  `TempDir` to seed the input file. The PermFs/PermConsole capability
+  combo can't be expressed without a capability-bearing main, and the
+  TempDir lifetime / path interpolation is harness-side. Bucket: cap+fs
+  fixtures, deferred to a follow-up that introduces a fixture runner
+  capable of provisioning a temp dir.
+- `arena_100k_echo_workload_alloc_lifo_reset_via_nxc` — uses
+  `exec_nxc_core_capture_stdout` to read `delta_pages=...` from the
+  fixture's stdout (the Rust harness drives the self-hosted nxc + an
+  in-process executor). No Nexus-level surface for "stdout of the
+  fixture under the self-hosted compiler."
+
+## array.rs
+
+All five tests skipped — typecheck-only `should_typecheck` /
+`should_fail_typecheck` cases:
+
+- `test_array_type_mismatch`,
+  `test_array_indexing_non_array`,
+  `test_array_assignment_mismatch`,
+  `test_array_consume_nonlinear_consumer_is_rejected` — every one is
+  `should_fail_typecheck` + `insta::assert_snapshot!`. Snapshot infra is
+  Rust-only (Bucket C — typecheck/* needs `nexus typecheck --emit-json`
+  or stdlib typechecker API).
+- `test_array_consume_with_proper_consumer_passes` — pure
+  `should_typecheck` call, no runtime exercise. Substituted with a real
+  runtime exerciser in `stdlib_array_basic_test.nx` (length, is_empty)
+  rather than ported as a typecheck-only check.
+
+Note on the `tests/stdlib/stdlib_array_basic_test.nx` runtime gap: any
+call that goes through `arr[idx]` (which lowers to a `__array_get`
+pseudo-call in `bootstrap/src/compiler/passes/lir_lower.rs`) currently
+ICEs in standalone codegen with `internal compiler error: call target
+'__array_get' not found in lowered symbols [E2007]`. That blocks runtime
+porting of `array.get` / `array.set` / `array.fold_left` / `array.any` /
+`array.all` / `array.find_index` / `array.map_in_place` / `array.consume`.
+Tracked separately; the basic test only exercises `array.length`
+(resolved through the `__nx_array_length` external) and `array.is_empty`.
+
+## char.rs
+
+Ported as a runtime fixture:
+
+- `char_classification` →
+  `stdlib_char_classification_test.nx`. Inlines
+  `bootstrap/tests/fixtures/test_char_classification.nx` into the
+  `safe_run` scaffold; uses `std:test/assert` directly because the body
+  is exception-free apart from the assertion path.
+
+## clock.rs
+
+Ported as a runtime fixture:
+
+- `clock_now_returns_positive_value` + `clock_sleep_does_not_crash` →
+  `stdlib_clock_basic_test.nx` (combined into one fixture; both
+  exercised under `inject clk.system_handler`). `main` carries
+  `require { PermClock }`; the safe_run scaffold passes the requirement
+  through unchanged.
+
+Skipped:
+
+- `clock_denied_at_wasi_level_without_allow_clock` — uses
+  `exec_with_stdlib_caps_should_trap` with a hand-built
+  `ExecutionCapabilities` that denies `allow_clock`, then asserts the
+  resulting wasmtime trap message contains "denied". The capability
+  matrix is a Rust-runtime configuration; standalone wasmtime takes
+  capabilities from CLI flags, not from a programmatic
+  `ExecutionCapabilities`.
+- `clock_requires_perm_clock` — `should_fail_typecheck` +
+  `insta::assert_snapshot!`. Bucket C (typecheck-error snapshot).
+
+## exn.rs
+
+All tests skipped:
+
+- `backtrace_depth_nonzero_on_raise`,
+  `backtrace_cross_function_has_frames` — both call
+  `std:exn::backtrace(exn: e)`, which depends on the
+  `nexus:runtime/backtrace` host import. Per the existing note in this
+  file ("Note on backtrace capture (nexus-55x0)"), the bundler's host
+  stub registers `__nx_bt_frame: (i64) -> i64` while the WIT package
+  declares it as `bt-frame: func(idx: s64) -> string`; standalone
+  `wasmtime run --component-model` rejects the resulting component with
+  `instance export 'capture-backtrace' has the wrong type`. End-to-end
+  observation of `backtrace(exn:)` is therefore blocked at the standalone
+  runner. Reinstate once that WIT-vs-stub mismatch is fixed (epic
+  nexus-55x0 follow-up).
