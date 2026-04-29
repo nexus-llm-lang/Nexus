@@ -1,3 +1,4 @@
+pub mod arena;
 pub mod array;
 pub mod char;
 pub mod clock;
