@@ -56,7 +56,15 @@ import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx,
          op_i32_wrap_i64, op_i64_extend_i32_s, op_i64_extend_i32_u,
          op_f64_reinterpret_i64, op_i64_reinterpret_f64,
          op_i32_and, op_i32_or,
-         op_memory_size, op_memory_grow, op_i32_gt_u, op_i32_shl, op_i32_shr_u }, * as wdefs from "src/backend/wasm/defs.nx"
+         op_memory_size, op_memory_grow, op_i32_gt_u, op_i32_shl, op_i32_shr_u,
+         op_simd_prefix,
+         op_simd_v128_load, op_simd_v128_store,
+         op_simd_i32x4_splat, op_simd_i64x2_splat,
+         op_simd_f32x4_splat, op_simd_f64x2_splat,
+         op_simd_i32x4_add, op_simd_i32x4_mul,
+         op_simd_i64x2_add, op_simd_i64x2_mul,
+         op_simd_f32x4_add, op_simd_f32x4_mul,
+         op_simd_f64x2_add, op_simd_f64x2_mul }, * as wdefs from "src/backend/wasm/defs.nx"
 import { emit_atom, emit_atom_var, emit_coercion, emit_pack_to_i64, emit_typed_field_store, emit_typed_field_load, emit_memory_grow_check, emit_alloc_object, emit_unpack_string, emit_memcpy_loop, emit_memcpy_loop_offset } from "src/backend/codegen/atom.nx"
 import { emit_string_concat, emit_string_compare, is_string_type, is_string_op, is_string_concat_op } from "src/backend/codegen/string.nx"
 import { TcmcCtx, NoTcmc, TcmcActive, tcmc_deeper, detect_tcmc, emit_tcmc_init, emit_tcmc_cons_and_loop, emit_return_with_tcmc } from "src/backend/codegen/tcmc.nx"
@@ -94,6 +102,13 @@ let is_math_external = fn (ext: LirExternal) -> bool do
   match ext do
     | LirExternal(name: _, wasm_module: m, wasm_name: _, params: _, ret_type: _, throw_row: _) ->
       return m == "nexus:runtime/math"
+  end
+end
+
+let is_simd_external = fn (ext: LirExternal) -> bool do
+  match ext do
+    | LirExternal(name: _, wasm_module: m, wasm_name: _, params: _, ret_type: _, throw_row: _) ->
+      return m == "nexus:runtime/simd"
   end
 end
 
@@ -183,7 +198,7 @@ let find_sched_import_idx = fn (wn: string, exts: [LirExternal], idx: i64) -> i6
   match exts do
     | [] -> return -1
     | e :: rest ->
-      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_intrinsic_sched_external(ext: e) then
+      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_simd_external(ext: e) || is_intrinsic_sched_external(ext: e) then
         return find_sched_import_idx(wn, exts: rest, idx)
       end
       match e do | LirExternal(name: _, wasm_module: m, wasm_name: w, params: _, ret_type: _, throw_row: _) ->
@@ -263,7 +278,7 @@ let filter_arena_externals = fn (exts: [LirExternal]) -> [LirExternal] do
   match exts do
     | [] -> return []
     | e :: rest ->
-      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_intrinsic_sched_external(ext: e) then
+      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_simd_external(ext: e) || is_intrinsic_sched_external(ext: e) then
         return filter_arena_externals(exts: rest)
       else
         return e :: filter_arena_externals(exts: rest)
@@ -524,6 +539,202 @@ let emit_f64_unary = fn (opcode: i64, args: [LirCallArg], buf: %ByteBuffer, ctx:
       return bb.push_byte(%buf, byte: opcode)
     | _ ->
       raise SymbolNotFound(name, kind: "math intrinsic arg", context: "f64 unary requires one argument")
+      return %buf
+  end
+end
+
+// ─── SIMD intrinsics (nexus:runtime/simd) ───────────────────────────────────
+// 128-bit fixed-width SIMD primitives — `simd-{lane}x{count}-{op}` for the
+// f32x4 / f64x2 / i32x4 / i64x2 lane shapes and add / mul lane-wise ops, plus
+// `simd-f32x4-add-array` which expands to a SIMD loop over a contiguous
+// quad-aligned region (the autovectorized form of an element-wise scalar
+// `dst[i] = a[i] + b[i]` loop).
+//
+// Argument policy: addresses are i64 across the FFI boundary, truncating to
+// i32 for wasm load/store. Lane width is implicit in the wasm_name. A v128
+// never escapes a single intrinsic emission — load → op → store stays inside
+// one instruction sequence so v128 never becomes a Nexus-visible local type
+// (which would require widening type_to_valtype + bootstrap regen).
+//
+// Verified opcodes (see wasm/defs.nx for the full table):
+//   v128.load (sub 0x00) / v128.store (sub 0x0B): memarg align=4 offset=0
+//   {i32x4,i64x2,f32x4,f64x2}.add / .mul: no further operand bytes
+//
+// SIMD extension is part of the WebAssembly 2.0 baseline and is enabled by
+// default in wasmtime 13+; bootstrap.sh's launch flags inherit that default
+// (no explicit -W simd toggle is required).
+
+let get_simd_wasm_name = fn (func: string, exts: [LirExternal]) -> string do
+  match wdefs.find_external(name: func, exts) do
+    | None -> ""
+    | Some(val: ext) ->
+      if !is_simd_external(ext) then return "" end
+      match ext do
+        | LirExternal(name: _, wasm_module: _, wasm_name: wn, params: _, ret_type: _, throw_row: _) -> wn
+      end
+  end
+end
+
+/// Emit a single v128 lane-wise binary op: load 16 bytes from each input
+/// address, run the lane-op, store 16 bytes to dst. Address args are in
+/// LirCallArg order `(a_addr, b_addr, dst_addr)`. Caller passes the SIMD
+/// sub-opcode (e.g. `op_simd_f32x4_add`) for the lane operation.
+let emit_simd_binop_one = fn (sub_op: i64, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx, name: string) -> %ByteBuffer throws { Exn } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: b) :: LirCallArg(label: _, value: d) :: _ ->
+      // dst_addr (for the final store) — push first so the store's base addr
+      // is below the v128 result on the wasm operand stack.
+      let %buf = emit_addr_arg(atom: d, %buf, ctx)
+      // v128.load a_addr
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: op_simd_v128_load)
+      let %buf = wdefs.emit_memarg_v128(%buf, offset: 0)
+      // v128.load b_addr
+      let %buf = emit_addr_arg(atom: b, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: op_simd_v128_load)
+      let %buf = wdefs.emit_memarg_v128(%buf, offset: 0)
+      // lane-op
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: sub_op)
+      // v128.store
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: op_simd_v128_store)
+      return wdefs.emit_memarg_v128(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name, kind: "simd intrinsic arg", context: "simd lane binop requires (a_addr, b_addr, dst_addr)")
+      return %buf
+  end
+end
+
+/// Emit an autovectorized SIMD loop: for each of `n` quads (16-byte chunks),
+/// load v128 from a, load v128 from b, lane-op, v128.store to dst, advance
+/// each pointer by 16. This is the autovectorized form of:
+///   for i in 0..(n*4): dst[i] = a[i] + b[i]   (when sub_op = f32x4.add)
+///
+/// Arg policy: `(a_addr: i64, b_addr: i64, dst_addr: i64, n_quads: i64)`.
+/// Local-slot layout (drawn from the reserved-temps range that
+/// section.nx::emit_local_decls declares — 2x i64, 2x i32, 2x i64, 7x i32,
+/// then the tcmc pair):
+///   counter at temps_base+0   (i64 slot — quad-remaining countdown)
+///   a_ptr   at temps_base+2   (i32 slot — wasm address)
+///   b_ptr   at temps_base+3   (i32 slot — wasm address; also used by
+///                             emit_alloc_object as obj_ptr, but that helper
+///                             sets+uses+is-done before any caller, so the
+///                             slot is dead when the SIMD intrinsic body runs)
+///   d_ptr   at temps_base+6   (i32 slot — wasm address; shared with the
+///                             throw-path retptr which is similarly dead)
+/// Mismatched-type local.set/get would fail wasm validation; the slot
+/// assignments above honour the reserved-type bands.
+///
+/// Loop shape (mirrors emit_memcpy_loop in codegen/atom.nx):
+///   block
+///     loop
+///       local.get counter ; i64.eqz ; br_if 1   ; exit when 0
+///       <SIMD body: load a_ptr; load b_ptr; lane-op; store d_ptr>
+///       a_ptr += 16; b_ptr += 16; d_ptr += 16
+///       counter -= 1
+///       br 0
+///     end
+///   end
+let emit_simd_binop_array = fn (sub_op: i64, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx, name: string) -> %ByteBuffer throws { Exn } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: b) :: LirCallArg(label: _, value: d) :: LirCallArg(label: _, value: n) :: _ ->
+      let temps = wdefs.ctx_temps_base(ctx)
+      let counter = temps        // i64 slot
+      let a_ptr = temps + 2      // i32 slot
+      let b_ptr = temps + 3      // i32 slot
+      let d_ptr = temps + 6      // i32 slot
+      // Initialize pointer locals from the i64 address args (truncate to i32).
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_local_set)
+      let %buf = bb.push_uleb128(%buf, val: a_ptr)
+      let %buf = emit_addr_arg(atom: b, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_local_set)
+      let %buf = bb.push_uleb128(%buf, val: b_ptr)
+      let %buf = emit_addr_arg(atom: d, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_local_set)
+      let %buf = bb.push_uleb128(%buf, val: d_ptr)
+      // counter (i64) ← n
+      let %buf = emit_atom(atom: n, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_local_set)
+      let %buf = bb.push_uleb128(%buf, val: counter)
+      // block ; loop
+      let %buf = bb.push_byte(%buf, byte: op_block)
+      let %buf = bb.push_byte(%buf, byte: bt_void)
+      let %buf = bb.push_byte(%buf, byte: op_loop)
+      let %buf = bb.push_byte(%buf, byte: bt_void)
+      // counter == 0 → break out (br 1 → exits the outer block)
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: counter)
+      let %buf = bb.push_byte(%buf, byte: 80)   // i64.eqz
+      let %buf = bb.push_byte(%buf, byte: op_br_if)
+      let %buf = bb.push_uleb128(%buf, val: 1)
+      // SIMD body: emit equivalent of one-shot binop using the i32 pointer locals.
+      // dst pointer first so the store's base sits below v128 on the stack.
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: d_ptr)
+      // load a
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: a_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: op_simd_v128_load)
+      let %buf = wdefs.emit_memarg_v128(%buf, offset: 0)
+      // load b
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: b_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: op_simd_v128_load)
+      let %buf = wdefs.emit_memarg_v128(%buf, offset: 0)
+      // lane-op
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: sub_op)
+      // store dst
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: op_simd_v128_store)
+      let %buf = wdefs.emit_memarg_v128(%buf, offset: 0)
+      // a_ptr += 16
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: a_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: 16)
+      let %buf = bb.push_byte(%buf, byte: op_i32_add)
+      let %buf = bb.push_byte(%buf, byte: op_local_set)
+      let %buf = bb.push_uleb128(%buf, val: a_ptr)
+      // b_ptr += 16
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: b_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: 16)
+      let %buf = bb.push_byte(%buf, byte: op_i32_add)
+      let %buf = bb.push_byte(%buf, byte: op_local_set)
+      let %buf = bb.push_uleb128(%buf, val: b_ptr)
+      // d_ptr += 16
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: d_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: 16)
+      let %buf = bb.push_byte(%buf, byte: op_i32_add)
+      let %buf = bb.push_byte(%buf, byte: op_local_set)
+      let %buf = bb.push_uleb128(%buf, val: d_ptr)
+      // counter -= 1
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: counter)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 1)
+      let %buf = bb.push_byte(%buf, byte: op_i64_sub)
+      let %buf = bb.push_byte(%buf, byte: op_local_set)
+      let %buf = bb.push_uleb128(%buf, val: counter)
+      // br 0 (loop back)
+      let %buf = bb.push_byte(%buf, byte: op_br)
+      let %buf = bb.push_uleb128(%buf, val: 0)
+      // end loop ; end block
+      let %buf = bb.push_byte(%buf, byte: op_end)
+      let %buf = bb.push_byte(%buf, byte: op_end)
+      return %buf
+    | _ ->
+      raise SymbolNotFound(name, kind: "simd intrinsic arg", context: "simd array binop requires (a_addr, b_addr, dst_addr, n_quads)")
       return %buf
   end
 end
@@ -851,6 +1062,7 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
   let arena_wn = get_arena_wasm_name(func, exts)
   let mem_wn = get_memory_wasm_name(func, exts)
   let math_wn = get_math_wasm_name(func, exts)
+  let simd_wn = get_simd_wasm_name(func, exts)
   if arena_wn == "heap-mark" then return emit_heap_mark(%buf, ctx)
   else if arena_wn == "heap-reset" then return emit_heap_reset(args, %buf, ctx)
   else if arena_wn == "heap-swap" then return emit_heap_swap(args, %buf, ctx)
@@ -868,6 +1080,16 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
   else if math_wn == "f64-floor" then return emit_f64_unary(opcode: op_f64_floor, args, %buf, ctx, name: "__nx_f64_floor")
   else if math_wn == "f64-ceil" then return emit_f64_unary(opcode: op_f64_ceil, args, %buf, ctx, name: "__nx_f64_ceil")
   else if math_wn == "f64-abs" then return emit_f64_unary(opcode: op_f64_abs, args, %buf, ctx, name: "__nx_f64_abs")
+  else if simd_wn == "simd-f32x4-add" then return emit_simd_binop_one(sub_op: op_simd_f32x4_add, args, %buf, ctx, name: "__nx_simd_f32x4_add")
+  else if simd_wn == "simd-f32x4-mul" then return emit_simd_binop_one(sub_op: op_simd_f32x4_mul, args, %buf, ctx, name: "__nx_simd_f32x4_mul")
+  else if simd_wn == "simd-f64x2-add" then return emit_simd_binop_one(sub_op: op_simd_f64x2_add, args, %buf, ctx, name: "__nx_simd_f64x2_add")
+  else if simd_wn == "simd-f64x2-mul" then return emit_simd_binop_one(sub_op: op_simd_f64x2_mul, args, %buf, ctx, name: "__nx_simd_f64x2_mul")
+  else if simd_wn == "simd-i32x4-add" then return emit_simd_binop_one(sub_op: op_simd_i32x4_add, args, %buf, ctx, name: "__nx_simd_i32x4_add")
+  else if simd_wn == "simd-i32x4-mul" then return emit_simd_binop_one(sub_op: op_simd_i32x4_mul, args, %buf, ctx, name: "__nx_simd_i32x4_mul")
+  else if simd_wn == "simd-i64x2-add" then return emit_simd_binop_one(sub_op: op_simd_i64x2_add, args, %buf, ctx, name: "__nx_simd_i64x2_add")
+  else if simd_wn == "simd-i64x2-mul" then return emit_simd_binop_one(sub_op: op_simd_i64x2_mul, args, %buf, ctx, name: "__nx_simd_i64x2_mul")
+  else if simd_wn == "simd-f32x4-add-array" then return emit_simd_binop_array(sub_op: op_simd_f32x4_add, args, %buf, ctx, name: "__nx_simd_f32x4_add_array")
+  else if simd_wn == "simd-i32x4-add-array" then return emit_simd_binop_array(sub_op: op_simd_i32x4_add, args, %buf, ctx, name: "__nx_simd_i32x4_add_array")
   else
     let int_idx = wdefs.lookup_func_fast(name: func, map: wdefs.ctx_internal_func_map(ctx))
     if int_idx >= 0 then

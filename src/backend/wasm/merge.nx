@@ -22,7 +22,8 @@ import { ByteBuffer }, * as bb from "std:bytebuffer"
 import { StringMap }, * as sm from "std:stringmap"
 import * as str from "std:str"
 import { SlebRes, pack, pval, ppos, rd_uleb, rd_sleb, scan_sleb_end, uleb_size } from "src/backend/wasm/read.nx"
-import { op_block, op_loop, op_if, op_legacy_try, op_throw, op_br, op_br_if, op_br_table,
+import { op_unreachable,
+         op_block, op_loop, op_if, op_legacy_try, op_throw, op_br, op_br_if, op_br_table,
          op_call, op_call_indirect, op_return_call, op_drop,
          op_local_get, op_local_set, op_local_tee,
          op_global_get, op_global_set, op_table_get, op_table_set,
@@ -34,6 +35,14 @@ import { op_block, op_loop, op_if, op_legacy_try, op_throw, op_br, op_br_if, op_
          op_end, bt_void, wasm_form_func, form_cont,
          op_fc_memory_init, op_fc_memory_copy, op_fc_memory_fill,
          op_fc_table_init, op_fc_table_copy,
+         op_simd_prefix,
+         op_simd_v128_load, op_simd_v128_store,
+         op_simd_i32x4_splat, op_simd_i64x2_splat,
+         op_simd_f32x4_splat, op_simd_f64x2_splat,
+         op_simd_i32x4_add, op_simd_i32x4_mul,
+         op_simd_i64x2_add, op_simd_i64x2_mul,
+         op_simd_f32x4_add, op_simd_f32x4_mul,
+         op_simd_f64x2_add, op_simd_f64x2_mul,
          vt_ref_null_ht, vt_ref_ht } from "src/backend/wasm/defs.nx"
 
 // ─── Operand-decode classes (rw_instrs) ──────────────────────────────────
@@ -57,6 +66,7 @@ let cls_cont_new     = 14
 let cls_cont_bind    = 15
 let cls_resume       = 16
 let cls_table        = 17  // table.get/set (add tbl_off)
+let cls_simd_prefix  = 18  // 0xFD sub-opcode dispatch (no func/type/global remap)
 
 // ─── Dense i32 array (int→int table) ─────────────────────────────────────
 // Thin wrapper over stdlib ByteBuffer — avoids the from_i64 string allocation
@@ -480,6 +490,7 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
     else if op == op_suspend then cls_uleb
     else if op == op_resume then cls_resume
     else if op == op_fc_prefix then cls_fc_prefix
+    else if op == op_simd_prefix then cls_simd_prefix
     else if op == op_block then cls_blocktype
     else if op == op_loop then cls_blocktype
     else if op == op_if then cls_blocktype
@@ -570,6 +581,13 @@ let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &Byte
     let BufPos(buf: %out, pos) = rw_fc_prefix(%out, src, pos: ppos(pk), sub_op)
     return rw_instrs(ctx, remap, %out, src, pos, end_pos)
   end
+  if cls == cls_simd_prefix then
+    let pk = rd_uleb(buf: src, pos)
+    let sub_op = pval(pk)
+    let %out = bb.push_uleb128(buf: %out, val: sub_op)
+    let BufPos(buf: %out, pos) = rw_simd_prefix(%out, src, pos: ppos(pk), sub_op)
+    return rw_instrs(ctx, remap, %out, src, pos, end_pos)
+  end
   if cls == cls_call then
     // call / return_call: remap function index via intarr (dense i32 lookup)
     let pk = rd_uleb(buf: src, pos)
@@ -656,6 +674,40 @@ let rw_fc_prefix = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, sub_op: i64
     end
     return BufPos(buf: %out, pos: ppos(pk: pk2))
   end
+  return BufPos(buf: %out, pos)
+end
+
+// Handle 0xFD prefix sub-opcodes (SIMD / fixed-width 128-bit). Subset coverage
+// matches the SIMD ops emitted by codegen.nx — load/store carry a memarg
+// (two ULEBs, no remap), splat / lane-arithmetic carry no further operands.
+// SIMD instructions never embed a func/type/global index, so no remap path
+// is exercised here.
+let rw_simd_prefix = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, sub_op: i64) -> BufPos do
+  if sub_op == op_simd_v128_load || sub_op == op_simd_v128_store then
+    // memarg: 2 ULEBs (align, offset). Span-copy verbatim.
+    let end1 = scan_sleb_end(buf: src, pos)
+    let end2 = scan_sleb_end(buf: src, pos: end1)
+    let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: end2)
+    return BufPos(buf: %out, pos: end2)
+  end
+  if sub_op == op_simd_i32x4_splat || sub_op == op_simd_i64x2_splat
+      || sub_op == op_simd_f32x4_splat || sub_op == op_simd_f64x2_splat
+      || sub_op == op_simd_i32x4_add || sub_op == op_simd_i32x4_mul
+      || sub_op == op_simd_i64x2_add || sub_op == op_simd_i64x2_mul
+      || sub_op == op_simd_f32x4_add || sub_op == op_simd_f32x4_mul
+      || sub_op == op_simd_f64x2_add || sub_op == op_simd_f64x2_mul then
+    // No further operand bytes.
+    return BufPos(buf: %out, pos)
+  end
+  // Unhandled SIMD sub-opcode. Emission is gated by codegen.nx's emit_simd_*
+  // dispatch — only sub-ops listed above can appear in well-formed input.
+  // Reaching here means a new emit_simd_* path was added without a matching
+  // operand-decode case here. Splice an `unreachable` byte into the output so
+  // wasmtime traps at runtime instead of returning misdecoded SIMD as garbage,
+  // and hold `pos` steady so the next byte gets re-classified by rw_instrs's
+  // top-level dispatch — yielding a malformed wasm that the validator rejects
+  // at the outer merge_with_stdlib boundary, not silent corruption.
+  let %out = bb.push_byte(buf: %out, byte: op_unreachable)
   return BufPos(buf: %out, pos)
 end
 
