@@ -2,7 +2,8 @@
  * lsp/main: Nexus language-server entry point.
  *
  * Wires `nxlib/lsp/server` (generic LSP scaffold) to Nexus-specific
- * compile-pipeline handlers. This file is the build target for `lsp.wasm`:
+ * compile-pipeline handlers (defined in `src/lsp/handlers.nx`). This
+ * file is the build target for `lsp.wasm`:
  *
  *   nexus build src/lsp/main.nx -o lsp.wasm
  *
@@ -14,371 +15,38 @@
  *
  * Capability flags (must be applied by any launcher that runs lsp.wasm):
  *
- *   PermFs       — wasmtime: --dir=<workspace-root>
+ *   PermFs       - wasmtime: --dir=<workspace-root>
  *                  the import-aware diagnostics path resolves cross-file
  *                  references via the standard driver helpers, which read
  *                  source files off disk. The in-buffer-only diagnostics
  *                  path doesn't touch Fs, but the capability stays in the
  *                  required set so a launcher that mounts the workspace
  *                  is the steady-state expectation.
- *   PermConsole  — wasmtime: (always inherited; stdio is the LSP transport)
+ *   PermConsole  - wasmtime: (always inherited; stdio is the LSP transport)
  *                  read JSON-RPC frames from stdin and write
  *                  responses + publishDiagnostics back on stdout. Errors
  *                  from the framing layer go to stderr.
- *   PermClock    — wasmtime: (no extra flag; clocks are on by default)
+ *   PermClock    - wasmtime: (no extra flag; clocks are on by default)
  *                  reserved for the debounce timer in front of the
- *                  on_did_change typecheck. With debounce active, a
- *                  burst of edits collapses into a single typecheck
- *                  invocation; without a clock the server would either
- *                  typecheck on every keystroke or skip debounce
- *                  entirely. The capability is declared up front so
- *                  swapping in the debounced path is a pure
- *                  implementation change.
+ *                  on_did_change typecheck.
  *
- * Diagnostic translation:
- *   `src/lsp/diagnostics.DiagRange` reports 1-based (line, col); the LSP
- *   wire `Range` uses 0-based (line, character). `to_wire_diag` performs
- *   the conversion in one place. The `DiagRange` / `DiagEntry`
- *   ctor names are deliberately distinct from the protocol module's
- *   `Range` / `Diagnostic` so both type families live side by side
- *   without colliding in the constructor namespace.
+ * Method coverage:
+ *   initialize, initialized, shutdown, exit
+ *   textDocument/didOpen, didChange, didClose, didSave
+ *   textDocument/documentSymbol
+ *   (others: MethodNotFound via the scaffold default)
  */
 
-import { JsonValue, JsonArray, get_field } from "std:json"
-import { Option, Some, None } from "std:option"
 import { Console }, * as stdio from "std:stdio"
-import * as lexer from "src/frontend/lexer.nx"
-import * as parser from "src/frontend/parser.nx"
-import { Program, SpannedTopLevel, GlobalLet, TLLet } from "src/common/ast.nx"
-import { HirProgram } from "src/ir/hir_types.nx"
-import { process_defs, accum_to_program, empty_accum } from "src/ir/hir.nx"
-import { iterative_resolve } from "src/ir/demand.nx"
-import {
-  DiagEntry, DiagRange, Severity,
-  SeverityError, SeverityWarning, SeverityInformation, SeverityHint,
-  enumerate_diagnostics,
-  make_origin_error_diagnostic
-} from "src/lsp/diagnostics.nx"
-import {
-  ServerCapabilities, TdsFull,
-  InitializeResult, ServerInfo,
-  initialize_params_from_json, initialize_result_to_json,
-  TextDocumentItem, text_document_item_from_json,
-  VersionedTextDocumentIdentifier,
-  versioned_text_document_identifier_from_json,
-  ContentChangeFull, ContentChangeIncremental,
-  content_change_event_from_json,
-  PublishDiagnosticsParams,
-  Position, Range, Diagnostic,
-  DiagSevError, DiagSevWarning, DiagSevInformation, DiagSevHint,
-  LspProtocolError
-} from "nxlib/lsp/protocol.nx"
-import {
-  ServerState, DocumentRecord, DocumentStore, LifecycleRunning,
-  Handlers, HandlerResult,
-  empty_state, empty_handlers, run_server,
-  documents_put,
-  make_publish_diagnostics_notification
-} from "nxlib/lsp/server.nx"
-
-// ─── State accessors ─────────────────────────────────────────────────────────
-//
-// Tiny pattern-match helpers; the scaffold's lifecycle is private so we
-// duplicate the projections here rather than re-export them.
-
-let state_documents = fn (state: ServerState) -> DocumentStore do
-  match state do | ServerState(lifecycle: _, documents, user_data: _) ->
-    return documents
-  end
-end
-
-let with_documents = fn (state: ServerState, docs: DocumentStore) -> ServerState do
-  match state do | ServerState(lifecycle, documents: _, user_data) ->
-    return ServerState(lifecycle, documents: docs, user_data)
-  end
-end
-
-let with_lifecycle_running = fn (state: ServerState) -> ServerState do
-  match state do | ServerState(lifecycle: _, documents, user_data) ->
-    return ServerState(lifecycle: LifecycleRunning, documents, user_data)
-  end
-end
-
-// ─── Range translation: 1-based (Span) → 0-based (LSP wire) ──────────────────
-//
-// Saturating clamp: a bogus 0 in the input becomes wire 0 (the closest
-// valid LSP coordinate) rather than -1 which the spec rejects.
-
-let saturating_pred = fn (n: i64) -> i64 do
-  if n <= 0 then return 0 end
-  return n - 1
-end
-
-let to_wire_range = fn (r: DiagRange) -> Range do
-  match r do | DiagRange(start_line, start_col, end_line, end_col) ->
-    let start_pos = Position(
-      line: saturating_pred(n: start_line),
-      character: saturating_pred(n: start_col)
-    )
-    let end_pos = Position(
-      line: saturating_pred(n: end_line),
-      character: saturating_pred(n: end_col)
-    )
-    return Range(start: start_pos, end_: end_pos)
-  end
-end
-
-// ─── Diagnostic translation: internal → wire ─────────────────────────────────
-
-let to_wire_diagnostic = fn (d: DiagEntry) -> Diagnostic do
-  match d do | DiagEntry(file: _, range, severity, code, message) ->
-    let wire_sev = match severity do
-      | SeverityError -> Some(val: DiagSevError)
-      | SeverityWarning -> Some(val: DiagSevWarning)
-      | SeverityInformation -> Some(val: DiagSevInformation)
-      | SeverityHint -> Some(val: DiagSevHint)
-    end
-    let wire_code = if code == "" then None else Some(val: code) end
-    return Diagnostic(
-      range: to_wire_range(r: range),
-      severity: wire_sev,
-      code: wire_code,
-      source: Some(val: "nexus"),
-      message
-    )
-  end
-end
-
-let translate_diagnostics_go = fn (xs: [DiagEntry], acc: [Diagnostic]) -> [Diagnostic] do
-  match xs do
-    | [] -> return acc
-    | d :: rest -> return translate_diagnostics_go(xs: rest, acc: to_wire_diagnostic(d: d) :: acc)
-  end
-end
-
-let reverse_wire_diags = fn (xs: [Diagnostic], acc: [Diagnostic]) -> [Diagnostic] do
-  match xs do
-    | [] -> return acc
-    | d :: rest -> return reverse_wire_diags(xs: rest, acc: d :: acc)
-  end
-end
-
-let to_wire_diagnostics = fn (xs: [DiagEntry]) -> [Diagnostic] do
-  let reversed = translate_diagnostics_go(xs, acc: [])
-  return reverse_wire_diags(xs: reversed, acc: [])
-end
-
-// ─── HIR build (no imports) ──────────────────────────────────────────────────
-//
-// In-buffer pipeline only: lex → parse → process_defs → iterative_resolve.
-// That covers `enumerate_diagnostics` for the buffer's own contents —
-// typecheck failures inside the entry file itself surface; cross-file
-// errors require the import resolver, which needs Fs and a workspace root
-// and runs through `src/ir/imports.process_imports` (the same path the
-// driver uses).
-
-let get_defs = fn (prog: Program) -> [SpannedTopLevel] do
-  match prog do | Program(definitions: defs) -> return defs end
-end
-
-let extract_function_names = fn (defs: [SpannedTopLevel]) -> [string] do
-  match defs do
-    | [] -> return []
-    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value: _)), span: _) :: rest ->
-      return name :: extract_function_names(defs: rest)
-    | _ :: rest -> return extract_function_names(defs: rest)
-  end
-end
-
-let build_hir_from_prog = fn (prog: Program, source_file: string) -> HirProgram throws { Exn } do
-  let defs = get_defs(prog)
-  let accum = process_defs(defs, entries: [], accum: empty_accum(), source_file)
-  let raw = accum_to_program(accum)
-  match raw do | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg) ->
-    let resolved = iterative_resolve(funcs: hf, hb, max_rounds: 100)
-    return HirProgram(ports: hp, functions: resolved, externals: he,
-      handler_bindings: hb, enum_defs: hed, exception_groups: heg)
-  end
-end
-
-// ─── Diagnostics for a buffer ────────────────────────────────────────────────
-//
-// Wraps the lex/parse/resolve/typecheck pipeline in a try-catch so that any
-// pre-typecheck phase failure (lex / parse) becomes a single DiagEntry at
-// the file origin. After a successful HIR build, hand off to
-// `enumerate_diagnostics`, which already converts CompileError variants to
-// span-keyed DiagEntry values.
-
-let compute_diagnostics_for_buffer = fn (text: string, file: string) -> [DiagEntry] do
-  try
-    let prog = parser.parse(tokens: lexer.tokenize(src: text))
-    let local_names = extract_function_names(defs: get_defs(prog))
-    let hir = build_hir_from_prog(prog, source_file: file)
-    return enumerate_diagnostics(hir, local_names, file)
-  catch err ->
-    let _ = err
-    return [make_origin_error_diagnostic(file, message: "lsp: failed to lex or parse source")]
-  end
-end
-
-// ─── Handler: on_initialize ──────────────────────────────────────────────────
-
-let nexus_on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
-  // Validate input shape; we don't read fields beyond what the protocol
-  // codec checks. Errors propagate as LspProtocolError → InvalidParams.
-  let _ = initialize_params_from_json(v: params)
-  let caps = ServerCapabilities(
-    text_document_sync: Some(val: TdsFull),
-    /// documentSymbolProvider stays None while no concrete handler is
-    /// wired through `on_other`. Advertising it without a backing
-    /// implementation would invite clients to send
-    /// `textDocument/documentSymbol`, which the scaffold's `on_other`
-    /// would answer with MethodNotFound — a worse failure than not
-    /// advertising the capability at all.
-    document_symbol_provider: None,
-    hover_provider: None,
-    definition_provider: None,
-    references_provider: None
-  )
-  let info = ServerInfo(name: "nexus-lsp", version: Some(val: "0.1.0"))
-  let result = InitializeResult(capabilities: caps, server_info: Some(val: info))
-  return HandlerResult(
-    state: with_lifecycle_running(state),
-    response: Some(val: initialize_result_to_json(r: result)),
-    notifications: []
-  )
-end
-
-// ─── Buffer update + diagnostics emission ────────────────────────────────────
-//
-// Shared between on_did_open and on_did_change. Updates the document
-// store, runs the typecheck pipeline, and produces a publishDiagnostics
-// notification. The internal DiagEntry stream may be empty (clean
-// program); we still publish an empty array because LSP clients use
-// that signal to clear stale markers.
-
-let publish_for_buffer = fn (
-  state: ServerState,
-  uri: string,
-  text: string,
-  version: i64
-) -> HandlerResult do
-  let new_docs = documents_put(
-    store: state_documents(state),
-    rec: DocumentRecord(uri, text, version)
-  )
-  let internal = compute_diagnostics_for_buffer(text, file: uri)
-  let wire = to_wire_diagnostics(xs: internal)
-  let params = PublishDiagnosticsParams(
-    uri,
-    version: Some(val: version),
-    diagnostics: wire
-  )
-  let frame = make_publish_diagnostics_notification(params)
-  return HandlerResult(
-    state: with_documents(state, docs: new_docs),
-    response: None,
-    notifications: [frame]
-  )
-end
-
-// ─── Handler: on_did_open ────────────────────────────────────────────────────
-
-let require_object_field = fn (obj: JsonValue, key: string, ctx: string) -> JsonValue throws { Exn } do
-  match get_field(obj, key) do
-    | Some(val: v) -> return v
-    | None -> raise LspProtocolError(msg: ctx ++ ": missing '" ++ key ++ "'")
-  end
-end
-
-let nexus_on_did_open = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
-  let td_v = require_object_field(obj: params, key: "textDocument",
-    ctx: "DidOpenTextDocumentParams")
-  let td = text_document_item_from_json(v: td_v)
-  match td do | TextDocumentItem(uri, language_id: _, version, text) ->
-    return publish_for_buffer(state, uri, text, version)
-  end
-end
-
-// ─── Handler: on_did_change ──────────────────────────────────────────────────
-//
-// Full-content sync: pick the trailing ContentChangeFull from the
-// contentChanges array. An incremental change in this stream is a protocol
-// violation per our advertised TextDocumentSyncKind.Full — surface as
-// LspProtocolError so the dispatch layer routes InvalidParams (for
-// requests; notifications log + drop, matching the scaffold default).
-
-let pick_full_text = fn (items: [JsonValue], current: Option<string>) -> string throws { Exn } do
-  match items do
-    | [] ->
-      match current do
-        | Some(val: t) -> return t
-        | None ->
-          raise LspProtocolError(
-            msg: "DidChangeTextDocumentParams.contentChanges: empty array"
-          )
-      end
-    | v :: rest ->
-      let ev = content_change_event_from_json(v)
-      match ev do
-        | ContentChangeFull(text) ->
-          return pick_full_text(items: rest, current: Some(val: text))
-        | ContentChangeIncremental(range: _, range_length: _, text: _) ->
-          raise LspProtocolError(
-            msg: "incremental contentChanges not supported (server advertises TextDocumentSyncKind.Full)"
-          )
-      end
-  end
-end
-
-let json_array_items = fn (v: JsonValue) -> [JsonValue] throws { Exn } do
-  match v do
-    | JsonArray(items) -> return items
-    | _ -> raise LspProtocolError(
-        msg: "DidChangeTextDocumentParams.contentChanges: expected array"
-      )
-  end
-end
-
-let nexus_on_did_change = fn (state: ServerState, params: JsonValue) -> HandlerResult throws { Exn } do
-  let td_v = require_object_field(obj: params, key: "textDocument",
-    ctx: "DidChangeTextDocumentParams")
-  let id = versioned_text_document_identifier_from_json(v: td_v)
-  let changes_v = require_object_field(obj: params, key: "contentChanges",
-    ctx: "DidChangeTextDocumentParams")
-  let arr = json_array_items(v: changes_v)
-  let new_text = pick_full_text(items: arr, current: None)
-  match id do | VersionedTextDocumentIdentifier(uri, version) ->
-    return publish_for_buffer(state, uri, text: new_text, version)
-  end
-end
-
-// ─── Build the handler vtable ────────────────────────────────────────────────
-
-export let nexus_handlers = fn () -> Handlers do
-  match empty_handlers() do
-    | Handlers(on_initialize: _, on_initialized, on_did_open: _, on_did_change: _,
-               on_did_close, on_did_save, on_shutdown, on_other) ->
-      return Handlers(
-        on_initialize: nexus_on_initialize,
-        on_initialized,
-        on_did_open: nexus_on_did_open,
-        on_did_change: nexus_on_did_change,
-        on_did_close,
-        on_did_save,
-        on_shutdown,
-        on_other
-      )
-  end
-end
-
-// ─── Entry ───────────────────────────────────────────────────────────────────
+import { LspProtocolError } from "nxlib/lsp/protocol.nx"
+import { empty_state, run_server } from "nxlib/lsp/server.nx"
+import { nexus_handlers } from "src/lsp/handlers.nx"
 
 // Capability discipline:
-//   - `inject stdio.system_handler do …` discharges the Console
+//   - `inject stdio.system_handler do ...` discharges the Console
 //     requirement that `run_server` carries (via jsonrpc.read_message /
 //     write_message). PermConsole is the underlying primitive perm.
-//   - PermFs / PermClock are NOT yet declared on the entry-point row —
+//   - PermFs / PermClock are NOT yet declared on the entry-point row -
 //     the in-buffer pipeline used here doesn't reach Fs or Clock. The
 //     module-level doc comment lists them under "Capability flags" as
 //     the steady-state expectation; the row will be widened (and

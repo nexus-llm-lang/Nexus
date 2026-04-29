@@ -42,3 +42,11 @@ fn call_throw_row_subsumption() {
 fn lsp_diagnostics_and_span_fidelity() {
     exec_with_stdlib(&read_fixture("nxc/test_lsp_diagnostics.nx"));
 }
+
+/// Covers nexus-hw47.9 (typecheck → publishDiagnostics): drives the LSP
+/// scaffold via `drive_messages` and asserts the wire-format
+/// publishDiagnostics frames produced from didOpen/didChange.
+#[test]
+fn lsp_publish_diagnostics_wire_format() {
+    exec_with_stdlib(&read_fixture("nxc/test_lsp_publish_diagnostics.nx"));
+}
