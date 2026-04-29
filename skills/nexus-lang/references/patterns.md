@@ -92,6 +92,56 @@ let mock_repo = handler UserRepository do
 end
 ```
 
+## Multi-Handler Injection (single `inject`, comma-separated)
+
+When a program needs more than one handler in scope, use the comma form
+`inject h1, h2, h3 do BODY end` — not nested `inject h1 do inject h2 do ... end end`.
+
+### Bad
+
+```nexus
+inject stdio.system_handler do
+  inject console_logger do
+    inject mock_repo do
+      register_user(name: "Bob", email: "bob@example.com")
+    end
+  end
+end
+```
+
+### Good
+
+```nexus
+inject stdio.system_handler, console_logger, mock_repo do
+  register_user(name: "Bob", email: "bob@example.com")
+end
+```
+
+### Why
+
+- The parser accepts a comma-separated list of handler expressions in one
+  `inject` (`src/frontend/parser.nx:754-775`); order is not significant
+  between independent handlers.
+- The comma form keeps `BODY`'s indentation flat. Nested `inject` walls add an
+  indentation level per handler with no extra meaning.
+- Production code already favours this form: `src/driver.nx:502` injects four
+  system handlers in a single statement.
+
+### One handler depending on another's effects
+
+A handler like `console_logger` that calls `Console.println` inside its arm
+body does not need to be nested under `stdio.system_handler` — within a single
+`inject` both handlers are in scope when `BODY` (and any handler arm body)
+runs, so `Console.println` from inside `console_logger.info` resolves to
+`stdio.system_handler` correctly.
+
+### Exception: scope-shrinking
+
+The only legitimate reason to nest is to keep one handler's scope narrower
+than another's — e.g. injecting a mock repo only around a specific test step
+while keeping logging available throughout. If both handlers want the same
+scope, write one `inject`.
+
 ## Error Handling Patterns
 
 ### Result-based (prefer for recoverable errors)
@@ -190,6 +240,65 @@ end
 - `match X do | true -> A | false -> B end` is 4 lines for what `if X then A else B end` says in 1.
 - `match` is the language's most expensive read — every site costs the reader a "destructuring or just dispatch?" check. Reserving it for ADTs makes that check trivial.
 - The pattern compiler emits extra match-tree code where a plain branch would suffice.
+
+## List Pattern Flattening (prefer nested cons over staircase `match`)
+
+When a `match` arm immediately re-`match`es the tail it just bound, collapse the
+two `match`es into one outer arm with a nested cons pattern. `::` chains in
+patterns just like it does in expressions.
+
+### Bad
+
+```nexus
+match xs do
+  | [] -> handle_empty()
+  | prog :: rest ->
+    match rest do
+      | [] -> handle_one(p: prog)
+      | second :: rest2 -> handle_two(p: prog, s: second, t: rest2)
+    end
+end
+```
+
+### Good
+
+```nexus
+match xs do
+  | [] -> handle_empty()
+  | [prog] -> handle_one(p: prog)
+  | prog :: second :: rest2 -> handle_two(p: prog, s: second, t: rest2)
+end
+```
+
+The flattened form makes the arity each arm expects (zero / one / two-or-more
+elements) visible at a glance instead of buried in a second `match`. The
+single-element case uses the literal `[x]` pattern; longer prefixes use
+`a :: b :: rest` (and so on) — `::` is right-associative in patterns just like
+in expressions.
+
+### Why
+
+- The staircase form forces the reader to walk two indentation levels and
+  reconstruct the prefix in their head. The flat form names the shape directly.
+- The pattern compiler emits the same decision tree either way; this is a pure
+  legibility win.
+- It composes with the broader "aggressively flatten nested matches" rule: a
+  `case Outer(...) :: rest -> match rest do case Inner(...) :: _ -> ...` should
+  collapse to `case Outer(...) :: Inner(...) :: _ -> ...`.
+
+### Confirmed in-tree
+
+- `src/ir/rdrname.nx:198` uses `_ :: _ :: _ -> return Ambiguous(...)` to assert
+  "two or more matches" — exactly the chained-cons form.
+- `stdlib/test/snapshot.nx:251` builds `plus :: minus :: acc` in an expression,
+  matching the same `::`-chains-right shape.
+
+### Exception: independent lists in lockstep
+
+If the inner `match` is on a *different* list (zip-style traversal), there is
+no nested cons pattern that captures both lists' shapes in a single arm. Leave
+the staircase or restructure into a helper. Tuple-pattern matching is not used
+in the current codebase; do not introduce it speculatively.
 
 ## Linear Resource Management
 
