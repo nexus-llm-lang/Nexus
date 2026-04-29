@@ -422,6 +422,27 @@ fn sched_producer_consumer() {
     );
 }
 
+/// Regression test for nexus-w9ne: bare `if FLOAT_LIT >. FLOAT_LIT then ... end`
+/// at main entry. The self-host LIR `infer_binary_type` returned `lhs_type`
+/// (TyF64) for OpFGt instead of TyBool, so the temp holding the comparison
+/// result was allocated as f64 and the `local.set` of the i32 produced by
+/// `f64.gt` into an f64 local failed wasmtime validation with a 'type
+/// mismatch' at the function's entry block. Running the fixture exercises
+/// every f64 relational operator (`>.`, `<.`, `>=.`, `<=.`, `==.`, `!=.`).
+#[test]
+fn nxc_f64_compare_in_main_entry_if() {
+    let out = exec_nxc_core_capture_stdout(
+        "bootstrap/tests/fixtures/nxc/test_codegen_f64_cmp_if.nx",
+    );
+    let lines: Vec<&str> = out.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        ["gt", "lt", "ge", "le", "eq", "ne"],
+        "unexpected stdout — {:?}",
+        out
+    );
+}
+
 /// Regression test for nexus-gyj6: `compile_fixture_via_nxc` previously
 /// derived its output path from `std::process::id()` alone, so all parallel
 /// test threads inside the same `cargo test` process shared the *same*
