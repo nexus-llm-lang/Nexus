@@ -320,3 +320,41 @@ All tests skipped:
   observation of `backtrace(exn:)` is therefore blocked at the standalone
   runner. Reinstate once that WIT-vs-stub mismatch is fixed (epic
   nexus-55x0 follow-up).
+
+## env.rs
+
+Ported as runtime fixtures:
+
+- `env_mock_handler` → `stdlib_env_mock_handler_test.nx`. Exercises
+  user-defined handler short-circuit; no PermEnv required.
+- `env_get_unset_returns_none` → `stdlib_env_unset_returns_none_test.nx`.
+  Uses `system_handler` with `require { PermEnv }`; relies on the
+  parent shell not exporting `NX_NEVER_DEFINED_VAR_DVR66` (chosen for
+  uniqueness rather than relying on a Rust-driven empty env).
+
+Skipped:
+
+- `env_port_typechecks_with_perm_env`,
+  `env_set_typechecks_with_perm_env` — pure `should_typecheck` calls
+  with no runtime exercise; not worth a `.nx` mirror given the matching
+  inject + Env.set is already exercised structurally by mock_handler
+  + system_handler tests.
+- `env_get_requires_perm_env` — `should_fail_typecheck` +
+  `insta::assert_snapshot!`. Bucket C (typecheck-error snapshot).
+- `env_get_set_to_empty_returns_some_empty` — the original verifies
+  that an env var deliberately set to "" round-trips as Some("") (not
+  None — regression for nexus-9lp4.25). Reproducing this as a runtime
+  fixture would require either pre-setting the env in the parent shell
+  (fragile against parallel test runs) or routing through `Env.set`,
+  which mutates the live process env in standalone wasmtime — but the
+  empty-string-vs-unset distinction depends on the host's
+  `__nx_has_env` returning true, and there is no portable guarantee
+  that `Env.set("X", "")` causes `__nx_has_env` to flip to true on
+  every wasi runtime. Deferred to a fixture runner that can set
+  explicit envs around the wasm invocation.
+
+`env_get_set_to_value_returns_some_value` is reframed as
+`stdlib_env_set_then_get_test.nx`: it does Env.set("X","hello") then
+Env.get("X"), validating the same round-trip invariant without relying
+on the Rust harness's pre-set env wiring.
+
