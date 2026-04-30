@@ -520,17 +520,22 @@ end
 // ─── Array intrinsic (__array_get) ──────────────────────────────────────────
 // MirIndex (`arr[idx]`) lowers to LirExprCall("__array_get", arr, idx). Arrays
 // are heap records `[tag(i64) | e0(i64) | e1(i64) | ...]` (see MirArray in
-// src/ir/lir.nx). The array atom is the heap pointer zero-extended to i64
-// (low 32 bits = ptr, upper 32 bits = 0), matching the result of every
-// LirExprRecord allocation. `__array_get` is never registered as a real wasm
-// import; emit_call detects the symbol and inlines a `(ptr + (idx + 1) * 8)
-// → i64.load` sequence here.
+// src/ir/lir.nx). The array atom is the canonical packed `(ptr<<32) | len`
+// form — pointer in the upper 32 bits, length in the lower 32 bits — so the
+// host stub `__nx_array_length(ptr: i32, len: i32) -> i64` and any other
+// extern receiving `&[| T |]` can read both fields after a single packed-i64
+// argument. `__array_get` is never registered as a real wasm import; emit_call
+// detects the symbol and inlines a `(ptr + (idx + 1) * 8) -> i64.load`
+// sequence below, extracting `ptr` via `(arr_atom >> 32)`.
 
 let emit_array_get = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
   match args do
     | LirCallArg(label: _, value: arr_atom) :: LirCallArg(label: _, value: idx_atom) :: _ ->
-      // Push base ptr: i32_wrap_i64(arr_atom)
+      // Push base ptr: extract upper 32 bits of arr_atom -> i32
       let %buf = emit_atom(atom: arr_atom, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 32)
+      let %buf = bb.push_byte(%buf, byte: op_i64_shr_u)
       let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
       // Push offset: i32_wrap_i64(idx) * 8 + 8
       let %buf = emit_atom(atom: idx_atom, %buf, ctx)
@@ -951,6 +956,31 @@ let extract_field_names_go = fn (fields: [LirNamedAtom], acc: [string]) -> [stri
   end
 end
 
+// Array literals (`[| e0, e1, ... |]`) lower to `LirExprRecord` with field
+// names `"0", "1", ..., "n-1"` (see lower_expr_to_atom MirArray case in
+// src/ir/lir.nx). Detect that shape so the record codegen can emit the
+// packed `(ptr<<32) | len` atom layout that `emit_external_arg(TyArray)`
+// expects, instead of the `i64.extend_i32_u(ptr)` form used by real
+// records. Real records always have alphabetic field names — there is no
+// source syntax that produces a record whose field is literally `"0"`.
+// Empty fields are ambiguous (both `{}` and `[||]` lower to no-fields), so
+// they keep the legacy zero-extended-pointer form to avoid corrupting
+// downstream record field-access of `{}` — `[||]` length stays as the
+// pre-existing corner case.
+let is_array_record = fn (fields: [LirNamedAtom]) -> bool throws { Exn } do
+  return is_array_record_go(fields, idx: 0)
+end
+let is_array_record_go = fn (fields: [LirNamedAtom], idx: i64) -> bool throws { Exn } do
+  match fields do
+    | [] -> return idx > 0
+    | LirNamedAtom(name: n, value: _) :: rest ->
+      if n == str.from_i64(val: idx) then
+        return is_array_record_go(fields: rest, idx: idx + 1)
+      else return false
+      end
+  end
+end
+
 // ─── Call emission ──────────────────────────────────────────────────────────
 
 let emit_internal_call_args = fn (buf: %ByteBuffer, args: [LirCallArg], params: [LirParam], ctx: CodegenCtx) -> %ByteBuffer throws { Exn } do
@@ -1260,7 +1290,20 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = emit_record_fields(%buf, fields, ctx, obj_ptr, field_idx: 1)
       let %buf = bb.push_byte(%buf, byte: op_local_get)
       let %buf = bb.push_uleb128(%buf, val: obj_ptr)
-      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+      // Array shape (numeric field names "0".."n-1"): emit packed
+      // `(ptr<<32) | len` matching emit_external_arg(TyArray)'s unpack.
+      // Plain records: zero-extend ptr to i64 (upper 32 = 0).
+      if is_array_record(fields) then
+        let %buf = bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+        let %buf = bb.push_byte(%buf, byte: op_i64_const)
+        let %buf = bb.push_sleb128(%buf, val: 32)
+        let %buf = bb.push_byte(%buf, byte: op_i64_shl)
+        let %buf = bb.push_byte(%buf, byte: op_i64_const)
+        let %buf = bb.push_sleb128(%buf, val: n_fields)
+        return bb.push_byte(%buf, byte: op_i64_or)
+      else
+        return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+      end
 
     | LirExprObjectTag(value: v, typ: _) ->
       let obj_ptr = wdefs.ctx_temps_base(ctx) + 3

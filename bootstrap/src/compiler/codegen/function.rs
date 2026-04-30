@@ -702,6 +702,25 @@ fn collect_refs_in_atom(atom: &LirAtom, refs: &mut HashSet<Symbol>) {
     }
 }
 
+/// Array literals lower to `LirExpr::Record` with field names "0".."n-1"
+/// (see lir_lower.rs MirExpr::Array). Plain records always have alphabetic
+/// field names, so this sequence-of-decimals shape uniquely identifies an
+/// array — letting the record codegen finish with `(ptr<<32) | len` packing
+/// instead of the zero-extended pointer used for ordinary records.
+///
+/// Zero-field records (both `{}` and `[||]` lower to no-fields) keep the
+/// legacy form: packing them as length-0 arrays would corrupt later record
+/// field access of `{}` (low 32 bits of the atom must remain the pointer).
+/// `[||]`'s length is therefore still subject to the old layout — preserved
+/// as a pre-existing corner case rather than introducing new behavior here.
+fn is_sequential_numeric_field_names(fields: &[(Symbol, LirAtom)]) -> bool {
+    !fields.is_empty()
+        && fields
+            .iter()
+            .enumerate()
+            .all(|(idx, (name, _))| name.to_string() == idx.to_string())
+}
+
 pub(super) fn compile_expr(
     expr: &LirExpr,
     out: &mut Function,
@@ -943,6 +962,18 @@ pub(super) fn compile_expr(
 
             out.instruction(&Instruction::LocalGet(temps.object_ptr_i32));
             out.instruction(&Instruction::I64ExtendI32U);
+            // Array literals (`[| e0, ..., e_{n-1} |]`) lower to LirExpr::Record
+            // with field names "0".."n-1" (lir_lower.rs MirExpr::Array). For that
+            // shape, finish with packed `(ptr<<32) | len` so externs that take
+            // `&[| T |]` (e.g. __nx_array_length) see the canonical (ptr, len)
+            // pair after `unpack_packed_i64_to_ptr_len`. Plain records keep the
+            // zero-extended pointer (high 32 bits = 0).
+            if is_sequential_numeric_field_names(fields) {
+                out.instruction(&Instruction::I64Const(32));
+                out.instruction(&Instruction::I64Shl);
+                out.instruction(&Instruction::I64Const(fields.len() as i64));
+                out.instruction(&Instruction::I64Or);
+            }
             Ok(())
         }
         LirExpr::ObjectTag { value, .. } => {
