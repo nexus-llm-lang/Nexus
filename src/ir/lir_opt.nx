@@ -12,14 +12,20 @@
  *    use sites (literal constants AND variable-to-variable copies)
  * 3. Dead branch elimination: inlines the live branch of if-statements with
  *    constant conditions
- * 4. Dead code elimination: removes unused pure let bindings
+ * 4. Dead code elimination: removes unused pure let bindings. The
+ *    effect-aware variant additionally drops `LirExprCall(callee, ...)`
+ *    bindings whose result is unused when the EffectMap reports the
+ *    callee as is_pure (e.g. orphaned `build` calls left behind by the
+ *    fusion rewrite). Externals are excluded — they are host-capability
+ *    calls and never DCE candidates.
  *
  * Passes 1-3 are combined in a single forward walk (opt_fp_stmts).
- * Pass 4 runs separately afterward (opt_dce_stmts).
+ * Pass 4 runs separately afterward (opt_dce_stmts / opt_dce_stmts_eff).
  *
  * `optimize_lir(program)` runs passes 1-4 with no fusion (effect map empty);
- * `optimize_lir_with_effects(program, effects)` adds pass 0 in front so
- * fusion sees the precomputed per-function effect summaries.
+ * `optimize_lir_with_effects(program, effects)` adds pass 0 in front and
+ * routes pass 4 through the effect-aware DCE, so fusion's orphaned build
+ * call vanishes alongside any other unused-result pure call.
  */
 
 // ─── Backtrace Stability Contract ───────────────────────────────────────────
@@ -47,7 +53,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { BinaryOp, TypeExpr } from "src/common/ast.nx"
-import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom,
+import { LirProgram, LirFunction, LirExternal, LirStmt, LirExpr, LirAtom,
          LirCallArg, LirNamedAtom } from "src/ir/lir_types.nx"
 import { EffectMap, lookup_summary, EffectSummary } from "src/backend/effect_analysis.nx"
 
@@ -726,6 +732,152 @@ let opt_dce_one = fn (stmt: LirStmt, used: [string]) -> Option<LirStmt> do
   end
 end
 
+// ─── Effect-Aware Dead Code Elimination ────────────────────────────────────
+//
+// Refines the DCE check using the EffectMap so result-unused calls to a
+// pure callee can be dropped. Pre-q0th DCE conservatively kept every
+// `LirExprCall` because it assumed calls have side effects; with the
+// per-function effect summary we can drop calls whose callee is
+// transitively pure (no caps, no throw, no I/O).
+//
+// The orphan `build` calls left behind by stream fusion (issue 00lw)
+// would superficially seem to belong here, but the EffectMap reports
+// `build` as impure (its body `g(default_cons, [])` performs a closure
+// dispatch, which the static analysis flags as side-effecting). The
+// fusion pass owns that drop directly: when it rewrites
+// `foldr(k, z, build(g))` to `CallClosure(g, [k, z])`, it now also
+// removes the corresponding `let built = Call(build, [g])` from the
+// scope. So this DCE focuses on first-order pure callees.
+//
+// Safety gates (fail-closed):
+//   * Callee MUST appear in the EffectMap with `is_pure = true`.
+//     Missing summary → keep.
+//   * Callee MUST NOT name an LIR external. Externals model host
+//     capabilities (mem.*, sched.*, ...); even if their effect summary
+//     somehow reports pure they are observable host calls, never DCE
+//     candidates.
+//   * Result MUST be unused (the caller just classified it that way at
+//     the LirStmtLet level).
+//   * LirExprTailCall is NEVER dropped — it terminates the function via
+//     return_call and codegen pairs it with bt_pop(); removing it would
+//     break the backtrace contract documented at the top of this file.
+//
+// Only LirExprCall expressions go through this gate; LirExprCallClosure
+// (indirect dispatch) and LirExprForce remain conservative because the
+// callee identity is a runtime value and the EffectMap cannot index it.
+
+let opt_is_external_name = fn (name: string, exts: [LirExternal]) -> bool do
+  match exts do
+    | [] -> return false
+    | e :: rest ->
+      let LirExternal(name: en, wasm_module: _, wasm_name: _, params: _, ret_type: _, throw_row: _) = e
+      if en == name then return true end
+      return opt_is_external_name(name, exts: rest)
+  end
+end
+
+let opt_callee_is_pure = fn (
+  callee: string,
+  effects: EffectMap,
+  exts: [LirExternal]
+) -> bool do
+  // Externals: host capability calls — never drop, even if a summary
+  // claims purity (the existing analysis maps non-pure modules at
+  // module level, but the externals list is the authoritative gate).
+  if opt_is_external_name(name: callee, exts) then return false end
+  match lookup_summary(em: effects, name: callee) do
+    | Some(val: s) ->
+      let EffectSummary(capabilities_used: _, can_throw: _, is_pure: pure) = s
+      return pure
+    | None -> return false
+  end
+end
+
+let opt_expr_is_droppable = fn (
+  expr: LirExpr,
+  effects: EffectMap,
+  exts: [LirExternal]
+) -> bool do
+  // Pure-by-construction expressions: defer to the existing predicate.
+  // The existing rule already covers atoms, binary, constructors,
+  // records, object accessors, MakeClosure, Force.
+  if opt_is_pure(expr) then return true end
+  // Effect-aware extension: static calls whose callee summary is pure.
+  // Tail calls are deliberately excluded — see the section header.
+  if let LirExprCall(func: f, args: _, typ: _) = expr then
+    return opt_callee_is_pure(callee: f, effects, exts)
+  end
+  return false
+end
+
+let opt_dce_stmts_eff = fn (
+  stmts: [LirStmt],
+  used: [string],
+  effects: EffectMap,
+  exts: [LirExternal]
+) -> [LirStmt] do
+  return opt_dce_stmts_eff_go(stmts, used, effects, exts, acc: [])
+end
+
+let opt_dce_stmts_eff_go = fn (
+  stmts: [LirStmt],
+  used: [string],
+  effects: EffectMap,
+  exts: [LirExternal],
+  acc: [LirStmt]
+) -> [LirStmt] do
+  match stmts do
+    | [] -> return reverse_stmts_opt(lst: acc, out: [])
+    | s :: rest ->
+      match opt_dce_one_eff(stmt: s, used, effects, exts) do
+        | Some(val: stmt) ->
+          return opt_dce_stmts_eff_go(stmts: rest, used, effects, exts, acc: stmt :: acc)
+        | None ->
+          return opt_dce_stmts_eff_go(stmts: rest, used, effects, exts, acc)
+      end
+  end
+end
+
+let opt_dce_one_eff = fn (
+  stmt: LirStmt,
+  used: [string],
+  effects: EffectMap,
+  exts: [LirExternal]
+) -> Option<LirStmt> do
+  match stmt do
+    | LirStmtLet(name: n, typ: t, expr: e) ->
+      if opt_has_name(name: n, names: used) then
+        return Some(val: LirStmtLet(name: n, typ: t, expr: e))
+      end
+      if opt_expr_is_droppable(expr: e, effects, exts) then
+        return None
+      end
+      return Some(val: LirStmtLet(name: n, typ: t, expr: e))
+    | LirStmtIf(cond: c, then_body: tb, else_body: eb) ->
+      return Some(val: LirStmtIf(cond: c,
+                         then_body: opt_dce_stmts_eff(stmts: tb, used, effects, exts),
+                         else_body: opt_dce_stmts_eff(stmts: eb, used, effects, exts)))
+    | LirStmtIfReturn(cond: c, then_body: tb, then_ret: tr,
+                          else_body: eb, else_ret: er, ret_type: rt) ->
+      return Some(val: LirStmtIfReturn(cond: c,
+                               then_body: opt_dce_stmts_eff(stmts: tb, used, effects, exts),
+                               then_ret: tr,
+                               else_body: opt_dce_stmts_eff(stmts: eb, used, effects, exts),
+                               else_ret: er, ret_type: rt))
+    | LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
+      return Some(val: LirStmtLoop(cond_stmts: opt_dce_stmts_eff(stmts: cs, used, effects, exts),
+                           cond: c,
+                           body: opt_dce_stmts_eff(stmts: b, used, effects, exts)))
+    | LirStmtTryCatch(body: b, body_ret: br, catch_param: cp,
+                          catch_param_typ: cpt, catch_body: cb, catch_ret: cr) ->
+      return Some(val: LirStmtTryCatch(body: opt_dce_stmts_eff(stmts: b, used, effects, exts),
+                               body_ret: br, catch_param: cp,
+                               catch_param_typ: cpt,
+                               catch_body: opt_dce_stmts_eff(stmts: cb, used, effects, exts),
+                               catch_ret: cr))
+  end
+end
+
 // ─── Entry Points ───────────────────────────────────────────────────────────
 
 let opt_function = fn (func: LirFunction) -> LirFunction do
@@ -742,6 +894,27 @@ let opt_function = fn (func: LirFunction) -> LirFunction do
               body: dce_body, ret: fp_ret, span: sp)
 end
 
+// Effect-aware variant: same fold/propagate front, plus EffectMap-driven
+// DCE that drops unused-result pure calls. Used when the driver supplies
+// a precomputed EffectMap (path that runs after stream fusion).
+let opt_function_with_effects = fn (
+  func: LirFunction,
+  effects: EffectMap,
+  exts: [LirExternal]
+) -> LirFunction do
+  let LirFunction(name: n, params: p, ret_type: rt,
+                  body, ret, span: sp) = func
+  let multi = opt_find_multi(names: opt_let_names_stmts(stmts: body))
+  let fp_result = opt_fp_stmts(stmts: body, subst: [], multi)
+  let FoldResult(stmts: fp_body, subst: final_subst) = fp_result
+  let fp_ret = opt_subst_atom(atom: ret, subst: final_subst)
+  let used = opt_collect_stmts(stmts: fp_body,
+                               used: opt_collect_atom(atom: fp_ret, used: []))
+  let dce_body = opt_dce_stmts_eff(stmts: fp_body, used, effects, exts)
+  LirFunction(name: n, params: p, ret_type: rt,
+              body: dce_body, ret: fp_ret, span: sp)
+end
+
 let opt_functions = fn (funcs: [LirFunction]) -> [LirFunction] do
   return opt_functions_go(funcs, acc: [])
 end
@@ -751,6 +924,30 @@ let opt_functions_go = fn (funcs: [LirFunction], acc: [LirFunction]) -> [LirFunc
     | [] -> return reverse_funcs(lst: acc, out: [])
     | f :: rest ->
       return opt_functions_go(funcs: rest, acc: opt_function(func: f) :: acc)
+  end
+end
+
+let opt_functions_with_effects = fn (
+  funcs: [LirFunction],
+  effects: EffectMap,
+  exts: [LirExternal]
+) -> [LirFunction] do
+  return opt_functions_with_effects_go(funcs, effects, exts, acc: [])
+end
+
+let opt_functions_with_effects_go = fn (
+  funcs: [LirFunction],
+  effects: EffectMap,
+  exts: [LirExternal],
+  acc: [LirFunction]
+) -> [LirFunction] do
+  match funcs do
+    | [] -> return reverse_funcs(lst: acc, out: [])
+    | f :: rest ->
+      return opt_functions_with_effects_go(
+        funcs: rest, effects, exts,
+        acc: opt_function_with_effects(func: f, effects, exts) :: acc
+      )
   end
 end
 
@@ -1081,19 +1278,27 @@ let fus_require_closure = fn (atom: LirAtom, defs: [FusionVarDef]) -> Option<Lir
   end
 end
 
+// FuseResult: outcome of trying to fuse a single foldr Let.
+//   * stmt: the replacement statement (foldr → CallClosure form).
+//   * orphan_xs_name: the build Let's bound name, now dead; the
+//     surrounding pipeline must drop that statement to keep `g` from
+//     being invoked twice (once by the orphan build, once by the
+//     fused CallClosure). The pre-q0th implementation deferred the
+//     drop to DCE, but DCE lacks the higher-order purity reasoning
+//     required to prove `build(g)` discardable in general; carrying
+//     the name out of fusion records the proof inline.
+type FuseResult = FuseResult(stmt: LirStmt, orphan_xs_name: string)
+
 // The core rewrite: given a foldr Let, decide whether it fuses with a
-// preceding build, and produce the replacement statement(s).
-//
-// Returns Some(new_stmt) when fusion fires; None otherwise. The build
-// Let is not rewritten in place — we leave it as-is so the surrounding
-// pipeline (already-running DCE) collects it once its single use has
-// vanished. This keeps the rewrite local and avoids stmt-list surgery.
+// preceding build, and produce the replacement statement plus the
+// orphan build's let-name. Returns None when the local pattern does
+// not match.
 let fus_try_fuse_foldr = fn (
   let_name: string,
   let_typ: TypeExpr,
   args: [LirCallArg],
   ctx: FusionCtx
-) -> Option<LirStmt> do
+) -> Option<FuseResult> do
   let FusionCtx(defs, uses: _, effects) = ctx
   match fus_find_arg(label: "xs", args) do
     | None -> return None
@@ -1127,7 +1332,18 @@ let fus_try_fuse_foldr = fn (
                             args: new_args,
                             typ: let_typ
                           )
-                          return Some(val: LirStmtLet(name: let_name, typ: let_typ, expr: new_expr))
+                          // xs_atom must be a LirAtomVar at this point
+                          // (fus_unfold_build only returns Some when
+                          // xs_atom is a Var resolving to a build call).
+                          // Re-extract the name; on the unreachable
+                          // None branch we abort the rewrite rather
+                          // than fabricate a bogus orphan name.
+                          match fus_xs_name_of(atom: xs_atom) do
+                            | None -> return None
+                            | Some(val: xs_name) ->
+                              let new_let = LirStmtLet(name: let_name, typ: let_typ, expr: new_expr)
+                              return Some(val: FuseResult(stmt: new_let, orphan_xs_name: xs_name))
+                          end
                       end
                   end
               end
@@ -1136,40 +1352,77 @@ let fus_try_fuse_foldr = fn (
   end
 end
 
-// Rewrite a single statement in-place if it is the foldr we want to fuse.
-let fus_rewrite_stmt = fn (stmt: LirStmt, ctx: FusionCtx) -> LirStmt do
+// Helper: extract the variable name from a `LirAtomVar` xs-atom. The
+// caller has already checked (via `fus_unfold_build`) that xs_atom is
+// a Var; we still surface the option here rather than raising so the
+// enclosing fusion logic remains pure (no `throws { Exn }` plumbing).
+// Callers that observe `None` treat the rewrite as inapplicable.
+let fus_xs_name_of = fn (atom: LirAtom) -> Option<string> do
+  if let LirAtomVar(name: n, typ: _) = atom then return Some(val: n) end
+  return None
+end
+
+// String-set helpers for the orphan-name pool. Orphan-name lists stay
+// short (≤ # foldr fusions per scope) so a linear assoc-list fits the
+// existing pass posture.
+let fus_orphan_member = fn (name: string, xs: [string]) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == name then return true end
+      return fus_orphan_member(name, xs: rest)
+  end
+end
+
+// StmtRewrite: outcome of rewriting a single statement.
+//   * stmt: the rewritten statement (or unchanged input).
+//   * orphan: Some(name) if fusion fired and `name` is the build-Let
+//     bound name that the surrounding scope must drop; None otherwise.
+type StmtRewrite = StmtRewrite(stmt: LirStmt, orphan: Option<string>)
+
+// Rewrite a single statement in-place if it is the foldr we want to
+// fuse. The unchanged-stmt cases reconstruct the same shape rather
+// than reusing the scrutinee variable; that keeps the pattern style
+// consistent with the rest of this file.
+let fus_rewrite_stmt = fn (stmt: LirStmt, ctx: FusionCtx) -> StmtRewrite do
   match stmt do
     | LirStmtLet(name: n, typ: t, expr: e) ->
       if let LirExprCall(func: fname, args: a, typ: _) = e then
         if fname == foldr_fn_name() then
           match fus_try_fuse_foldr(let_name: n, let_typ: t, args: a, ctx) do
-            | Some(val: new_stmt) -> return new_stmt
-            | None -> return stmt
+            | Some(val: FuseResult(stmt: new_stmt, orphan_xs_name)) ->
+              return StmtRewrite(stmt: new_stmt, orphan: Some(val: orphan_xs_name))
+            | None ->
+              return StmtRewrite(stmt: LirStmtLet(name: n, typ: t, expr: e), orphan: None)
           end
         end
       end
-      return stmt
+      return StmtRewrite(stmt: LirStmtLet(name: n, typ: t, expr: e), orphan: None)
     | LirStmtIf(cond: c, then_body: tb, else_body: eb) ->
-      return LirStmtIf(cond: c,
+      let new_stmt = LirStmtIf(cond: c,
                        then_body: fus_rewrite_stmts_in(stmts: tb, effects: fus_effects(ctx)),
                        else_body: fus_rewrite_stmts_in(stmts: eb, effects: fus_effects(ctx)))
+      return StmtRewrite(stmt: new_stmt, orphan: None)
     | LirStmtIfReturn(cond: c, then_body: tb, then_ret: tr,
                       else_body: eb, else_ret: er, ret_type: rt) ->
-      return LirStmtIfReturn(cond: c,
+      let new_stmt = LirStmtIfReturn(cond: c,
                              then_body: fus_rewrite_stmts_in(stmts: tb, effects: fus_effects(ctx)),
                              then_ret: tr,
                              else_body: fus_rewrite_stmts_in(stmts: eb, effects: fus_effects(ctx)),
                              else_ret: er, ret_type: rt)
+      return StmtRewrite(stmt: new_stmt, orphan: None)
     | LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
-      return LirStmtLoop(cond_stmts: fus_rewrite_stmts_in(stmts: cs, effects: fus_effects(ctx)),
+      let new_stmt = LirStmtLoop(cond_stmts: fus_rewrite_stmts_in(stmts: cs, effects: fus_effects(ctx)),
                          cond: c,
                          body: fus_rewrite_stmts_in(stmts: b, effects: fus_effects(ctx)))
+      return StmtRewrite(stmt: new_stmt, orphan: None)
     | LirStmtTryCatch(body: b, body_ret: br, catch_param: cp,
                       catch_param_typ: cpt, catch_body: cb, catch_ret: cr) ->
-      return LirStmtTryCatch(body: fus_rewrite_stmts_in(stmts: b, effects: fus_effects(ctx)),
+      let new_stmt = LirStmtTryCatch(body: fus_rewrite_stmts_in(stmts: b, effects: fus_effects(ctx)),
                              body_ret: br, catch_param: cp, catch_param_typ: cpt,
                              catch_body: fus_rewrite_stmts_in(stmts: cb, effects: fus_effects(ctx)),
                              catch_ret: cr)
+      return StmtRewrite(stmt: new_stmt, orphan: None)
   end
 end
 
@@ -1179,19 +1432,56 @@ let fus_effects = fn (ctx: FusionCtx) -> EffectMap do
 end
 
 // Iterate over a stmt list with a freshly built ctx for that scope.
+// Two-step: (1) rewrite each statement, recording orphan-build let-names
+// from successful fusions; (2) filter the rewritten list, dropping the
+// LirStmtLets whose name appears in the orphan set. Step (2) is the
+// "stmt-list surgery" that the q0th issue requires — fusion has proven
+// the build call's effects are subsumed by the rewritten CallClosure,
+// so the orphan can be erased without leaning on a higher-order purity
+// summary.
 let fus_rewrite_stmts_in = fn (stmts: [LirStmt], effects: EffectMap) -> [LirStmt] do
   let defs = fus_collect_defs_stmts(stmts: stmts, acc: [])
   let uses = fus_count_uses_stmts(stmts: stmts, uses: [])
   let ctx = FusionCtx(defs: defs, uses: uses, effects: effects)
-  return fus_rewrite_stmts_go(stmts: stmts, ctx: ctx, acc: [])
+  let rewritten = fus_rewrite_stmts_go(stmts: stmts, ctx: ctx, acc: [], orphans: [])
+  match rewritten do | RewriteResult(stmts: new_stmts, orphans) ->
+    return fus_drop_orphans(stmts: new_stmts, orphans, acc: [])
+  end
 end
 
-let fus_rewrite_stmts_go = fn (stmts: [LirStmt], ctx: FusionCtx, acc: [LirStmt]) -> [LirStmt] do
+type RewriteResult = RewriteResult(stmts: [LirStmt], orphans: [string])
+
+let fus_rewrite_stmts_go = fn (stmts: [LirStmt], ctx: FusionCtx, acc: [LirStmt], orphans: [string]) -> RewriteResult do
+  match stmts do
+    | [] -> return RewriteResult(stmts: reverse_stmts_opt(lst: acc, out: []), orphans)
+    | s :: rest ->
+      match fus_rewrite_stmt(stmt: s, ctx: ctx) do
+        | StmtRewrite(stmt: new_s, orphan: o) ->
+          let new_orphans = match o do
+            | Some(val: name) ->
+              if fus_orphan_member(name, xs: orphans) then orphans
+              else name :: orphans
+              end
+            | None -> orphans
+          end
+          return fus_rewrite_stmts_go(stmts: rest, ctx, acc: new_s :: acc, orphans: new_orphans)
+      end
+  end
+end
+
+let fus_drop_orphans = fn (stmts: [LirStmt], orphans: [string], acc: [LirStmt]) -> [LirStmt] do
   match stmts do
     | [] -> return reverse_stmts_opt(lst: acc, out: [])
     | s :: rest ->
-      let new_s = fus_rewrite_stmt(stmt: s, ctx: ctx)
-      return fus_rewrite_stmts_go(stmts: rest, ctx: ctx, acc: new_s :: acc)
+      match s do
+        | LirStmtLet(name: n, typ: _, expr: _) ->
+          if fus_orphan_member(name: n, xs: orphans) then
+            return fus_drop_orphans(stmts: rest, orphans, acc)
+          end
+          return fus_drop_orphans(stmts: rest, orphans, acc: s :: acc)
+        | _ ->
+          return fus_drop_orphans(stmts: rest, orphans, acc: s :: acc)
+      end
   end
 end
 
@@ -1215,11 +1505,14 @@ let fus_rewrite_functions_go = fn (funcs: [LirFunction], effects: EffectMap, acc
 end
 
 // Public entry: run stream fusion over a program using the provided
-// EffectMap, then run the existing fold/propagate/DCE pipeline on the
-// result so the now-dead build call is collected.
+// EffectMap, then run the fold/propagate/DCE pipeline with effect-aware
+// DCE so the now-dead build call (and any other unused-result call to a
+// pure callee) is collected. The EffectMap is computed pre-fusion; the
+// fusion rewrite never introduces new statically-named callers, so the
+// summary remains conservative for the post-fusion program.
 export let optimize_lir_with_effects = fn (program: LirProgram, effects: EffectMap) -> LirProgram do
   let LirProgram(functions: funcs, externals: exts) = program
   let fused = fus_rewrite_functions(funcs: funcs, effects: effects)
-  let optimised = opt_functions(funcs: fused)
+  let optimised = opt_functions_with_effects(funcs: fused, effects, exts)
   return LirProgram(functions: optimised, externals: exts)
 end
