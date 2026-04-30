@@ -525,3 +525,61 @@ itself only exposes "compile failed with error" via `nexus build`'s
 exit code and stderr. Until `nexus typecheck --emit-json` lands, these
 remain Bucket C.
 
+## typecheck/linear.rs
+
+Ported as positive `*_test.nx` fixtures:
+
+- `test_linear_basic_pass`,
+  `test_linear_param_accepts_plain_value_via_weakening`,
+  `test_linear_primitive_auto_drop_pass`,
+  `test_linear_primitive_wildcard_pass`,
+  `test_linear_primitive_match_wildcard_pass` →
+  `typecheck_linear_basic_pass_test.nx`.
+- `test_linear_borrow_basic` → `typecheck_linear_borrow_basic_test.nx`
+  (the original used `Console.print`; here we observe the borrow via
+  a pure `&i64 -> i64` accumulator, dropping the stdio channel).
+- `test_generic_drop_accepts_non_linear_primitives` →
+  `typecheck_linear_generic_drop_primitives_test.nx`.
+- `test_adt_with_linear_arg_consumed_once_passes` (combined with
+  the inference-side `test_linear_capture_makes_lambda_linear_and_single_use`)
+  → `typecheck_linear_capture_lambda_test.nx`.
+- `test_lazy_binding_and_force`, `test_lazy_type_annotation`,
+  `test_lazy_force_on_non_lazy_via_parens`,
+  `test_lazy_pass_thunk_by_bare_name` →
+  `typecheck_linear_lazy_basic_test.nx`.
+- `test_linear_deeply_nested_else_if_value_branches`,
+  `test_linear_deeply_nested_else_if_all_return`,
+  `test_linear_deeply_nested_else_if_mixed_return_and_value` →
+  `typecheck_linear_deeply_nested_else_if_test.nx`.
+- `prop_linear_primitive_drops` (proptest) →
+  `typecheck_linear_primitive_drops_test.nx` (one representative
+  case; the original used `let %a = {}` (empty record). Here we
+  use `let %a = 42` because empty-record `{}` is unusual surface
+  syntax and the test name calls out *primitives*).
+
+Negative `should_fail_typecheck` (no insta) ported as fixtures:
+
+- `test_generic_drop_user_defined_linear_consumes_once` →
+  `linear_user_defined_unconsumed.nx`.
+- `test_adt_with_linear_arg_is_promoted_to_linear` →
+  `linear_adt_promoted_unconsumed.nx`.
+- `test_lazy_unused_is_error` → `linear_lazy_unused.nx`.
+- `test_lazy_primitive_unused_is_error` → `linear_lazy_primitive_unused.nx`.
+- `test_lazy_double_force_is_error` → `linear_lazy_double_force.nx`.
+- `test_lazy_capture_linearizes_closure` →
+  `linear_lazy_capture_closure_double_call.nx`.
+- `prop_linear_shadowing_requires_consumption` →
+  `linear_shadowed_unconsumed.nx` (one representative case; we use
+  `{ id: N }` payloads because empty-record `{}` is unusual surface).
+
+Skipped (Bucket C — programmatic AST construction):
+
+- `test_enum_constructor_with_linear_arg_requires_consumption`,
+- `test_enum_constructor_with_linear_arg_can_be_consumed_once`.
+
+Both build a `Program` AST in Rust via `Stmt::Let { sigil: Linear, .. }`
+and call `TypeChecker::check_program` directly — no Nexus surface
+syntax at all. Skipped permanently (not even `--emit-json` would
+help; the semantics are *whether the AST node shape passes
+typecheck*, which is implementation-detail-by-construction).
+
