@@ -112,18 +112,23 @@ export let convert_expr = fn (expr: SpannedExpr, entries: [RenameEntry]) -> HirE
         body: convert_stmts(stmts: b, entries)
       )
     | ExprFor(var: v, start: s, end_expr: e, body: b) ->
+      let body_entries = symtab.rename_drop(entries, name: v)
       For(
         var: v,
         start: convert_expr(expr: s, entries),
         end_expr: convert_expr(expr: e, entries),
-        body: convert_stmts(stmts: b, entries)
+        body: convert_stmts(stmts: b, entries: body_entries)
       )
     | ExprLambda(type_params: tps, params: ps, ret_type: rt, requires: _, throw_row: _, body: b) ->
+      // Lexical shadowing: drop rename entries whose `original` matches a
+      // parameter name so references inside the body resolve to the local
+      // (parameter) at codegen instead of any toplevel of the same name.
+      let inner_entries = symtab.rename_drop_many(entries, names: param_names_of_params(params: ps))
       Lambda(
         type_params: tps,
         params: convert_params(params: ps),
         ret_type: rt,
-        body: convert_stmts(stmts: b, entries)
+        body: convert_stmts(stmts: b, entries: inner_entries)
       )
     | ExprRaise(value: e) ->
       Raise(expr: convert_expr(expr: e, entries))
@@ -306,10 +311,17 @@ let convert_stmts_go = fn (stmts: [SpannedStmt], entries: [RenameEntry], acc: [H
         | _ ->
           convert_expr(expr: v, entries)
       end
-      return convert_stmts_go(stmts: rest, entries, acc: HirStmt(node: Let(name: n, sigil: sig, typ: t, value: hir_val), span: sp) :: acc)
+      // Lexical shadowing: subsequent statements see entries with `n` dropped
+      // so references resolve to the local binding, not any toplevel of the
+      // same name. The RHS itself is converted with the outer entries.
+      let inner_entries = symtab.rename_drop(entries, name: n)
+      return convert_stmts_go(stmts: rest, entries: inner_entries, acc: HirStmt(node: Let(name: n, sigil: sig, typ: t, value: hir_val), span: sp) :: acc)
     | SpannedStmt(node: StmtLetPattern(pattern: pat, value: v), span: sp) :: rest ->
       // Desugar: let Pattern = expr; rest → match expr do case Pattern -> rest end
-      let case_body = convert_stmts(stmts: rest, entries)
+      // The remaining stmts form the case body and must see entries with every
+      // pattern-bound variable dropped (lexical shadowing).
+      let body_entries = symtab.rename_drop_many(entries, names: pattern_binders(pat))
+      let case_body = convert_stmts(stmts: rest, entries: body_entries)
       let match_case = HirMatchCase(
         pattern: convert_pattern(pat, entries),
         body: case_body
@@ -342,10 +354,11 @@ let convert_stmts_go = fn (stmts: [SpannedStmt], entries: [RenameEntry], acc: [H
         ), span: sp) :: acc)
     | SpannedStmt(node: StmtTry(body: b, catch_arms: CatchArm(pattern: SpannedPattern(node: PatVariable(name: n, sigil: _), span: _), body: cb) :: []), span: sp) :: rest ->
       // Legacy single-arm variable catch: catch param -> body
+      let cb_entries = symtab.rename_drop(entries, name: n)
       return convert_stmts_go(stmts: rest, entries, acc: HirStmt(node: Try(
           body: convert_stmts(stmts: b, entries),
           catch_param: n,
-          catch_body: convert_stmts(stmts: cb, entries)
+          catch_body: convert_stmts(stmts: cb, entries: cb_entries)
         ), span: sp) :: acc)
     | SpannedStmt(node: StmtTry(body: b, catch_arms: arms), span: sp) :: rest ->
       // Multi-arm or non-variable: desugar to catch __exn -> match __exn do ... end
@@ -419,9 +432,13 @@ let convert_match_cases_go = fn (cases: [MatchCase], entries: [RenameEntry], acc
   match cases do
     | [] -> return rev_hir_match_case(lst: acc, out: [])
     | MatchCase(pattern: p, body: b) :: rest ->
+      // Lexical shadowing: the case body sees rename entries with every
+      // pattern-bound variable name dropped, so PatVariable bindings shadow
+      // any toplevel of the same name within the arm.
+      let body_entries = symtab.rename_drop_many(entries, names: pattern_binders(pat: p))
       return convert_match_cases_go(cases: rest, entries, acc: HirMatchCase(
           pattern: convert_pattern(pat: p, entries),
-          body: convert_stmts(stmts: b, entries)
+          body: convert_stmts(stmts: b, entries: body_entries)
         ) :: acc)
   end
 end
@@ -459,6 +476,49 @@ let convert_or_alts = fn (alts: [SpannedPattern], entries: [RenameEntry], acc: [
   end
 end
 
+/// Collect every variable name introduced by a pattern (for shadowing).
+/// Recurses through nested ctor / record / or patterns. Does not collect
+/// constructor / type / field names — only PatVariable identifiers.
+let pattern_binders = fn (pat: SpannedPattern) -> [string] throws { Exn } do
+  return pattern_binders_go(pat, acc: [])
+end
+
+let pattern_binders_go = fn (pat: SpannedPattern, acc: [string]) -> [string] throws { Exn } do
+  let SpannedPattern(node, span: _) = pat
+  match node do
+    | PatLiteral(_) -> return acc
+    | PatVariable(name: n, sigil: _) -> return n :: acc
+    | PatWildcard -> return acc
+    | PatConstructorWildcard(name: _) -> return acc
+    | PatConstructor(name: _, fields: fs) -> return pattern_binders_fields(fs, acc)
+    | PatRecord(fields: fs, has_wildcard: _) -> return pattern_binders_record_fields(fs, acc)
+    | PatOr(alts) -> return pattern_binders_alts(alts, acc)
+  end
+end
+
+let pattern_binders_fields = fn (fs: [CtorPatternField], acc: [string]) -> [string] throws { Exn } do
+  match fs do
+    | [] -> return acc
+    | CtorPatternField(name: _, pattern: p) :: rest ->
+      return pattern_binders_fields(fs: rest, acc: pattern_binders_go(pat: p, acc))
+  end
+end
+
+let pattern_binders_record_fields = fn (fs: [RecordPatField], acc: [string]) -> [string] throws { Exn } do
+  match fs do
+    | [] -> return acc
+    | RecordPatField(name: _, pattern: p) :: rest ->
+      return pattern_binders_record_fields(fs: rest, acc: pattern_binders_go(pat: p, acc))
+  end
+end
+
+let pattern_binders_alts = fn (alts: [SpannedPattern], acc: [string]) -> [string] throws { Exn } do
+  match alts do
+    | [] -> return acc
+    | a :: rest -> return pattern_binders_alts(alts: rest, acc: pattern_binders_go(pat: a, acc))
+  end
+end
+
 let convert_catch_arms_to_match_cases = fn (arms: [CatchArm], entries: [RenameEntry]) -> [HirMatchCase] throws { Exn } do
   return convert_catch_arms_go(arms, entries, acc: [])
 end
@@ -467,7 +527,8 @@ let convert_catch_arms_go = fn (arms: [CatchArm], entries: [RenameEntry], acc: [
   match arms do
     | [] -> return rev_hir_match_case(lst: acc, out: [])
     | CatchArm(pattern: p, body: b) :: rest ->
-      let mc = HirMatchCase(pattern: convert_pattern(pat: p, entries), body: convert_stmts(stmts: b, entries))
+      let body_entries = symtab.rename_drop_many(entries, names: pattern_binders(pat: p))
+      let mc = HirMatchCase(pattern: convert_pattern(pat: p, entries), body: convert_stmts(stmts: b, entries: body_entries))
       return convert_catch_arms_go(arms: rest, entries, acc: mc :: acc)
   end
 end
@@ -511,6 +572,19 @@ let convert_params_go = fn (params: [Param], acc: [HirParam]) -> [HirParam] thro
   end
 end
 
+/// Extract bare parameter names (used for lexical-shadowing rename filtering).
+let param_names_of_params = fn (params: [Param]) -> [string] do
+  return param_names_of_params_go(params, acc: [])
+end
+
+let param_names_of_params_go = fn (params: [Param], acc: [string]) -> [string] do
+  match params do
+    | [] -> return acc
+    | Param(name: n, sigil: _, typ: _) :: rest ->
+      return param_names_of_params_go(params: rest, acc: n :: acc)
+  end
+end
+
 /// Convert a handler's HandlerArm list to HIR handler arms. Each arm's
 /// inner Function is converted via convert_one_function; the cont_binder
 /// (if any) propagates through to MIR/codegen for lowering to wasm
@@ -539,13 +613,15 @@ end
 /// (issue nexus-qgfh design choice ii).
 let convert_one_function = fn (func: Function, entries: [RenameEntry]) -> HirFunction throws { Exn } do
   let Function(name: n, is_public: _, type_params: tps, params: ps, ret_type: rt, requires: _, throw_row: tw, body: b, span: sp) = func
+  // Lexical shadowing: parameter names hide any toplevel rename inside the body.
+  let inner_entries = symtab.rename_drop_many(entries, names: param_names_of_params(params: ps))
   return HirFunction(
     name: n,
     type_params: tps,
     params: convert_params(params: ps),
     ret_type: rt,
     throw_row: tw,
-    body: EagerBody(stmts: convert_stmts(stmts: b, entries)),
+    body: EagerBody(stmts: convert_stmts(stmts: b, entries: inner_entries)),
     span: sp,
     file: ""
   )
