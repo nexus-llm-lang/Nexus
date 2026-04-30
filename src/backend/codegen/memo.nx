@@ -1,0 +1,199 @@
+/**
+ * codegen/memo: Call-site memoization emission (nexus-e6uh phase 2a).
+ *
+ * Phase 2a scope (deliberately minimal for first rollout):
+ *   - 1-arg fns
+ *   - Single i64 parameter
+ *   - i64 return type (after pack_to_i64)
+ *
+ * For each eligible call site, we emit a single-slot last-call cache:
+ *
+ *   <emit arg>                   ;; stack: [arg:i64]
+ *   local.set MEMO_KEY_LOCAL     ;; capture
+ *   global.get $valid_N          ;; valid flag (i32)
+ *   local.get MEMO_KEY_LOCAL
+ *   global.get $key_N            ;; cached key (i64)
+ *   i64.eq                       ;; key match (i32)
+ *   i32.and                      ;; valid && key_match
+ *   if (result i64)
+ *     global.get $val_N          ;; HIT — replay cached return
+ *   else
+ *     local.get MEMO_KEY_LOCAL
+ *     call $f                    ;; MISS — invoke fn
+ *     local.tee MEMO_VAL_LOCAL
+ *     global.set $val_N
+ *     local.get MEMO_KEY_LOCAL
+ *     global.set $key_N
+ *     i32.const 1
+ *     global.set $valid_N
+ *     local.get MEMO_VAL_LOCAL
+ *   end
+ *
+ * The cache lives in WASM globals, three per eligible function:
+ *   slot 0: valid:i32   (init 0)
+ *   slot 1: key:i64     (init 0)
+ *   slot 2: val:i64     (init 0)
+ *
+ * Tail-call sites (LirExprTailCall) and call sites inside a try_table catch
+ * region (in_try=true) are skipped — their stack invariants don't compose
+ * with the if/else result discipline, and tail calls don't need caching to
+ * avoid recomputation (they don't recompute the same call multiple times in
+ * a single dynamic chain).
+ *
+ * Emission gates on `[string]` of eligible target names threaded through the
+ * codegen context. The target list is computed once per program in
+ * `compile_lir_to_wasm` from the MemoPlan filtered by parameter shape.
+ */
+
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { TypeExpr, TyI64, TyIntLit } from "src/common/ast.nx"
+import { MemoPlan, MemoEntry } from "src/backend/memo_plan.nx"
+import * as wdefs from "src/backend/wasm/defs.nx"
+import * as list from "std:list"
+
+// ─── Public types ────────────────────────────────────────────────────────────
+
+/// Lightweight summary of a memo-eligible function. The slot index identifies
+/// the function's reserved global block; the cache occupies globals
+/// (memo_global_base + 3*slot + 0/1/2).
+export type MemoTarget = MemoTarget(name: string, slot: i64)
+
+// ─── Eligibility filtering ────────────────────────────────────────────────────
+//
+// Phase 2a admits only fns with one parameter whose hashable type packs into
+// an i64 key without external storage. That is i64, bool, char (i32 widened),
+// f64 (reinterpret as i64), and i32 (zero-extend). Strings, f32, and multi-arg
+// fns are deferred to Phase 2b sub-issues — they need either a >1-word key
+// (compound hash) or string-pointer interning before they fit a single-slot
+// last-call cache.
+
+// Phase 2a is intentionally narrowed to i64 (and TyIntLit) parameters only.
+// Bool/char/i32/f64 keys would fit a single i64 word with widening but trip
+// the unpack-on-miss path: the callee's wasm signature expects the original
+// type, so we'd need a reverse-coercion before `call`. Deferring to a Phase 2b
+// sub-issue keeps the rollout to one stack-discipline pattern at a time and
+// dodges bootstrap-incompatibility risk seen in nexus-fnzs / nexus-j6mr.
+let is_single_word_key_type = fn (t: TypeExpr) -> bool do
+  match wdefs.peel_linear(typ: t) do
+    | TyI64 -> return true
+    | TyIntLit -> return true
+    | _ -> return false
+  end
+end
+
+/// Filter a MemoPlan down to the Phase 2a-eligible subset. Each entry that
+/// passes is paired with a sequential slot index (0..n-1) used to address its
+/// cache globals.
+///
+/// Phase 2a admits only fns whose param AND return type both fit a single
+/// i64 word. Mixing return types into the cache slot would either need a
+/// per-return-type local set or a packed i64 storage with reverse-coercion
+/// on the hit path; both are out of scope for the MVP.
+export let build_memo_targets = fn (plan: MemoPlan) -> [MemoTarget] do
+  let MemoPlan(entries: entries) = plan
+  return build_memo_targets_go(entries: entries, slot: 0, acc: [])
+end
+
+let build_memo_targets_go = fn (entries: [MemoEntry], slot: i64, acc: [MemoTarget]) -> [MemoTarget] do
+  match entries do
+    | [] -> return reverse_targets(lst: acc, out: [])
+    | e :: rest ->
+      let MemoEntry(name: name, arity: arity, param_types: param_types, ret_type: ret_type) = e
+      if arity == 1 && is_i64_word_type(t: ret_type) then
+        match param_types do
+          | t :: _ ->
+            if is_single_word_key_type(t: t) then
+              return build_memo_targets_go(entries: rest, slot: slot + 1,
+                acc: MemoTarget(name: name, slot: slot) :: acc)
+            end
+            return build_memo_targets_go(entries: rest, slot, acc)
+          | [] ->
+            return build_memo_targets_go(entries: rest, slot, acc)
+        end
+      end
+      return build_memo_targets_go(entries: rest, slot, acc)
+  end
+end
+
+/// True iff `t` is i64 (or IntLit, the polymorphic numeric literal alias).
+/// Phase 2a deliberately admits no other return types — see build_memo_targets
+/// docstring. peel_linear strips TyLinear/TyLazy/TyBorrow wrappers (a returned
+/// %i64 still satisfies the cache shape).
+let is_i64_word_type = fn (t: TypeExpr) -> bool do
+  match wdefs.peel_linear(typ: t) do
+    | TyI64 -> return true
+    | TyIntLit -> return true
+    | _ -> return false
+  end
+end
+
+let reverse_targets = fn (lst: [MemoTarget], out: [MemoTarget]) -> [MemoTarget] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_targets(lst: rest, out: x :: out)
+  end
+end
+
+// ─── Queries ─────────────────────────────────────────────────────────────────
+
+/// Slot index for a function name, or -1 if not eligible. Walks two parallel
+/// lists (names + slots) — the lists live in CodegenCtx already split for
+/// per-call lookup. Linear scan; the list is small in Phase 2a (≤ a few
+/// hundred names) so no hash map yet.
+export let lookup_memo_slot = fn (name: string, targets_names: [string], targets_slots: [i64]) -> i64 do
+  match targets_slots do
+    | [] -> return -1
+    | head_slot :: rest_slots ->
+      match targets_names do
+        | [] -> return -1
+        | head_name :: rest_names ->
+          if head_name == name then return head_slot end
+          return lookup_memo_slot(name: name, targets_names: rest_names, targets_slots: rest_slots)
+      end
+  end
+end
+
+export let memo_target_count = fn (targets: [MemoTarget]) -> i64 do
+  return list.length(xs: targets)
+end
+
+// ─── Call-site emission ──────────────────────────────────────────────────────
+//
+// The emit_memoized_call helper assumes the caller has already verified the
+// gate (is_tail==false, in_try==false, slot >= 0, single i64 arg). It owns
+// the value-stack discipline: arg gets emitted/captured, condition gets
+// computed, if/else dispatches, both arms produce exactly one i64.
+
+/// Reserved local indices (added to temps_base) for memo bookkeeping. Two
+/// fresh i64 slots are appended to the standard temp-local block by
+/// `emit_local_decls`; codegen.nx must keep these offsets in sync.
+export let memo_key_local_offset = 15
+export let memo_val_local_offset = 16
+
+/// Compute the global indices for a slot. The base is the global section's
+/// first memo global, which the caller passes in. With three globals per slot:
+///   slot s → valid_idx = base + 3*s
+///            key_idx   = base + 3*s + 1
+///            val_idx   = base + 3*s + 2
+export let memo_valid_global_idx = fn (base: i64, slot: i64) -> i64 do
+  return base + 3 * slot
+end
+
+export let memo_key_global_idx = fn (base: i64, slot: i64) -> i64 do
+  return base + 3 * slot + 1
+end
+
+export let memo_val_global_idx = fn (base: i64, slot: i64) -> i64 do
+  return base + 3 * slot + 2
+end
+
+/// Identity for Phase 2a since only i64/IntLit pass the eligibility filter,
+/// retained as a seam where Phase 2b will plug in widening for other key
+/// types (i32/bool/char/f64) once the unpack-on-miss path is in.
+export let emit_pack_arg_to_key = fn (buf: %ByteBuffer, arg_type: TypeExpr) -> %ByteBuffer do
+  match wdefs.peel_linear(typ: arg_type) do
+    | TyI64 -> return %buf
+    | TyIntLit -> return %buf
+    | _ -> return %buf
+  end
+end

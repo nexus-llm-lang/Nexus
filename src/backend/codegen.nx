@@ -73,12 +73,52 @@ import { TcmcCtx, NoTcmc, TcmcActive, tcmc_deeper, detect_tcmc, emit_tcmc_init, 
 import { LocalResult }, * as wcollect from "src/backend/wasm/collect.nx"
 import { HashMap }, * as hmap from "std:hashmap"
 import { DedupedTypes }, * as wsect from "src/backend/wasm/section.nx"
+import { MemoTarget, build_memo_targets, lookup_memo_slot, memo_target_count }, * as memo from "src/backend/codegen/memo.nx"
+import { TyI64, TyIntLit } from "src/common/ast.nx"
+import * as effect_analysis from "src/backend/effect_analysis.nx"
+import * as memo_plan from "src/backend/memo_plan.nx"
 import * as list from "std:list"
 import * as str from "std:str"
 import { SymbolNotFound, StackSwitchingNotImplemented } from "src/common/error.nx"
 import { EffectMap, EffectSummary, lookup_summary } from "src/backend/effect_analysis.nx"
 import { Some, None } from "std:option"
 import { bt_capture_symbol_name } from "src/ir/main_wrap.nx"
+
+// ─── Memo target list extractors (nexus-e6uh phase 2a) ─────────────────────
+// CodegenCtx stores name/slot lists in parallel rather than the structured
+// MemoTarget type so the per-call lookup stays a tight string compare without
+// re-deconstructing a record on every call site. These extractors split the
+// MemoTarget list once at module-assembly time.
+
+let extract_memo_names = fn (targets: [MemoTarget], acc: [string]) -> [string] do
+  match targets do
+    | [] -> return reverse_str_list(lst: acc, out: [])
+    | MemoTarget(name: n, slot: _) :: rest ->
+      return extract_memo_names(targets: rest, acc: n :: acc)
+  end
+end
+
+let extract_memo_slots = fn (targets: [MemoTarget], acc: [i64]) -> [i64] do
+  match targets do
+    | [] -> return reverse_i64_list(lst: acc, out: [])
+    | MemoTarget(name: _, slot: s) :: rest ->
+      return extract_memo_slots(targets: rest, acc: s :: acc)
+  end
+end
+
+let reverse_str_list = fn (lst: [string], out: [string]) -> [string] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_str_list(lst: rest, out: x :: out)
+  end
+end
+
+let reverse_i64_list = fn (lst: [i64], out: [i64]) -> [i64] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_i64_list(lst: rest, out: x :: out)
+  end
+end
 
 // ─── Inline-emitted runtime intrinsics ──────────────────────────────────────
 // `nexus:runtime/arena`, `nexus:runtime/memory`, and `nexus:runtime/math`
@@ -1067,7 +1107,6 @@ let emit_internal_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer,
                               is_tail: bool, in_try: bool, int_idx: i64) -> %ByteBuffer throws { Exn } do
   match wdefs.find_function(name: func, funcs: wdefs.ctx_functions(ctx)) do
     | Some(val: LirFunction(name: _, params, ret_type: callee_rt, body: _, ret: _, span: _)) ->
-      let %buf = emit_internal_call_args(%buf, args, params, ctx)
       let caller_rt = wdefs.ctx_func_ret_type(ctx)
       // return_call requires callee return type ≡ caller return type. When a
       // unit-returning fn is tail-called from a non-unit-returning wrapper
@@ -1075,12 +1114,110 @@ let emit_internal_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer,
       // back to a regular call so emit_return_value can supply the placeholder.
       let types_match = wdefs.is_unit(typ: callee_rt) == wdefs.is_unit(typ: caller_rt)
       let use_tail = is_tail && !in_try && types_match
+
+      // Memoization (nexus-e6uh phase 2a): single-slot last-call cache for
+      // 1-arg single-word-key pure fns, gated on slot-table membership and a
+      // non-tail / non-try call site so the if/else result discipline holds.
+      let memo_slot = lookup_memo_slot(name: func, targets_names: wdefs.ctx_memo_target_names(ctx),
+                                          targets_slots: wdefs.ctx_memo_target_slots(ctx))
+      if !use_tail && !in_try && memo_slot >= 0 then
+        return emit_memoized_internal_call(func: func, args, params, callee_rt: callee_rt,
+                                            buf: %buf, ctx: ctx,
+                                            int_idx: int_idx, slot: memo_slot)
+      end
+
+      let %buf = emit_internal_call_args(%buf, args, params, ctx)
       let call_op = match use_tail do | true -> op_return_call | false -> op_call end
       let %buf = bb.push_byte(%buf, byte: call_op)
       bb.push_uleb128(%buf, val: int_idx)
     | None ->
       raise SymbolNotFound(name: func, kind: "function", context: "internal call")
       return %buf
+  end
+end
+
+/// Emit a memoized call sequence for a 1-arg single-word-key pure function.
+/// Pre-condition (caller-enforced): slot is valid, args.length == 1,
+/// param_types[0] is a single-word-key type per memo.is_single_word_key_type,
+/// !is_tail, !in_try.
+let emit_memoized_internal_call = fn (func: string, args: [LirCallArg], params: [LirParam],
+                                         callee_rt: TypeExpr,
+                                         buf: %ByteBuffer, ctx: CodegenCtx,
+                                         int_idx: i64, slot: i64) -> %ByteBuffer throws { Exn } do
+  let memo_base = wdefs.ctx_memo_globals_base(ctx)
+  let valid_idx = memo.memo_valid_global_idx(base: memo_base, slot)
+  let key_idx = memo.memo_key_global_idx(base: memo_base, slot)
+  let val_idx = memo.memo_val_global_idx(base: memo_base, slot)
+  let key_local = wdefs.ctx_temps_base(ctx) + memo.memo_key_local_offset
+  let val_local = wdefs.ctx_temps_base(ctx) + memo.memo_val_local_offset
+
+  // Step 1 — emit and capture the single argument as i64 cache key.
+  let %buf = emit_internal_call_args(%buf, args, params, ctx)
+  // emit_internal_call_args coerces the arg to the param type (already i64
+  // for our single-word-key admission). pack_arg_to_key widens i32-flavoured
+  // values and reinterprets f64. Stack: [key:i64].
+  let arg_type = match params do
+    | LirParam(label: _, name: _, typ: t) :: _ -> t
+    | [] -> callee_rt
+  end
+  let %buf = memo.emit_pack_arg_to_key(buf: %buf, arg_type: arg_type)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: key_local)
+
+  // Step 2 — compute hit condition: valid && key == cached_key.
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: valid_idx)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: key_local)
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: key_idx)
+  let %buf = bb.push_byte(%buf, byte: op_i64_eq)
+  let %buf = bb.push_byte(%buf, byte: op_i32_and)
+
+  // Step 3 — if (result i64): hit branch returns cached val.
+  let %buf = bb.push_byte(%buf, byte: op_if)
+  let %buf = bb.push_byte(%buf, byte: bt_i64)
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: val_idx)
+
+  // Step 4 — else: miss branch invokes the callee, writes the cache.
+  let %buf = bb.push_byte(%buf, byte: op_else)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: key_local)
+  // The callee expects its declared param type, which we pre-coerced into
+  // the i64 key above. Reverse-coerce when the param type isn't already i64
+  // so we hand the call exactly the type wasm needs.
+  let %buf = unpack_key_to_param(buf: %buf, param_type: arg_type)
+  // Note: param_type intentionally aliases arg_type — the call's argument
+  // type IS the callee's param type after emit_internal_call_args coercion.
+  let %buf = bb.push_byte(%buf, byte: op_call)
+  let %buf = bb.push_uleb128(%buf, val: int_idx)
+  let %buf = bb.push_byte(%buf, byte: op_local_tee)
+  let %buf = bb.push_uleb128(%buf, val: val_local)
+  let %buf = bb.push_byte(%buf, byte: op_global_set)
+  let %buf = bb.push_uleb128(%buf, val: val_idx)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: key_local)
+  let %buf = bb.push_byte(%buf, byte: op_global_set)
+  let %buf = bb.push_uleb128(%buf, val: key_idx)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 1)
+  let %buf = bb.push_byte(%buf, byte: op_global_set)
+  let %buf = bb.push_uleb128(%buf, val: valid_idx)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: val_local)
+
+  // end of if
+  return bb.push_byte(%buf, byte: op_end)
+end
+
+/// Identity for Phase 2a (only i64/IntLit pass eligibility). Kept as a seam
+/// for Phase 2b widening + reverse-coerce when other key types open up.
+let unpack_key_to_param = fn (buf: %ByteBuffer, param_type: TypeExpr) -> %ByteBuffer do
+  match wdefs.peel_linear(typ: param_type) do
+    | TyI64 -> return %buf
+    | TyIntLit -> return %buf
+    | _ -> return %buf
   end
 end
 
@@ -2056,7 +2193,10 @@ let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
                           ss_cont_type_idx: i64,
                           ss_dispatch_block_type_idx: i64,
                           ss_tag_names: [string],
-                          bt_capture_idx: i64) -> CodegenCtx throws { Exn } do
+                          bt_capture_idx: i64,
+                          memo_target_names: [string],
+                          memo_target_slots: [i64],
+                          memo_globals_base: i64) -> CodegenCtx throws { Exn } do
   let LirFunction(name: fname, params: ps, ret_type: rt, body: b, ret: _, span: _) = func
   let param_locals = build_param_locals(params: ps, idx: 0)
   let param_count = list.length(xs: ps)
@@ -2074,7 +2214,10 @@ let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
     ss_cont_type_idx: ss_cont_type_idx,
     ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
     ss_tag_names: ss_tag_names,
-    bt_capture_idx: bt_capture_idx
+    bt_capture_idx: bt_capture_idx,
+    memo_target_names,
+    memo_target_slots,
+    memo_globals_base
   )
   end
 end
@@ -2124,7 +2267,10 @@ let emit_one_body = fn (buf: %ByteBuffer, f: LirFunction,
                          ss_dispatch_block_type_idx: i64,
                          ss_tag_names: [string],
                          effect_map: EffectMap,
-                         bt_capture_idx_global: i64) -> %ByteBuffer throws { Exn } do
+                         bt_capture_idx_global: i64,
+                         memo_target_names: [string],
+                         memo_target_slots: [i64],
+                         memo_globals_base: i64) -> %ByteBuffer throws { Exn } do
   let LirFunction(name: fname, _) = f
   let bt_capture_idx = resolve_bt_capture_for_func(func_name: fname, effect_map,
                                                      bt_capture_idx_global)
@@ -2137,7 +2283,10 @@ let emit_one_body = fn (buf: %ByteBuffer, f: LirFunction,
                             ss_cont_type_idx: ss_cont_type_idx,
                             ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
                             ss_tag_names: ss_tag_names,
-                            bt_capture_idx: bt_capture_idx)
+                            bt_capture_idx: bt_capture_idx,
+                            memo_target_names,
+                            memo_target_slots,
+                            memo_globals_base)
   let %body = compile_function_body(func: f, ctx)
   return append_body_to_buf(%buf, %body)
 end
@@ -2155,7 +2304,10 @@ let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
                             ss_dispatch_block_type_idx: i64,
                             ss_tag_names: [string],
                             effect_map: EffectMap,
-                            bt_capture_idx_global: i64) -> %ByteBuffer throws { Exn } do
+                            bt_capture_idx_global: i64,
+                            memo_target_names: [string],
+                            memo_target_slots: [i64],
+                            memo_globals_base: i64) -> %ByteBuffer throws { Exn } do
   match funcs do
     | [] -> return %buf
     | f :: rest ->
@@ -2169,7 +2321,10 @@ let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
                                 ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
                                 ss_tag_names: ss_tag_names,
                                 effect_map: effect_map,
-                                bt_capture_idx_global: bt_capture_idx_global)
+                                bt_capture_idx_global: bt_capture_idx_global,
+                                memo_target_names,
+                                memo_target_slots,
+                                memo_globals_base)
       return emit_code_bodies(%buf, funcs: rest, internal_funcs,
                         external_funcs, string_lits,
                         alloc_mode, functions, externals,
@@ -2180,7 +2335,10 @@ let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
                         ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
                         ss_tag_names: ss_tag_names,
                         effect_map: effect_map,
-                        bt_capture_idx_global: bt_capture_idx_global)
+                        bt_capture_idx_global: bt_capture_idx_global,
+                        memo_target_names,
+                        memo_target_slots,
+                        memo_globals_base)
   end
 end
 
@@ -2568,11 +2726,33 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
         wdefs.emit_section(buf: %m, id: sec_tag, content: wsect.build_tag_section(exn_tag_type_idx, ss_tag_type_idx, has_eh, n_ss_tags))
       else %m end
 
-      // Global section — needed for bump allocator, cabi_realloc, arena, or string literals.
-      // G1 (str_base) is always needed when there are string literals.
-      let needs_global = (heap_enabled && alloc_mode == 1) || (has_cabi && alloc_mode != 2) || has_arena || has_strings || has_ss
+      // Memo cache plan (nexus-e6uh phase 2a). Re-runs effect analysis +
+      // memo_plan inside codegen so the driver doesn't have to thread the
+      // plan through compile_lir_to_wasm; the cost is one extra LIR walk per
+      // build, which is negligible next to wasm assembly.
+      // Effect analysis must see all externals (incl. mem.* / sched.*) — the
+      // arena-filtered set hides runtime effects, so functions calling
+      // mem.load_i64 etc. would appear pure and get incorrectly memoised
+      // (nexus-bavy soundness fix).
+      let unfiltered_program = LirProgram(functions: funcs, externals: all_exts)
+      let memo_em = effect_analysis.analyze_effects(program: unfiltered_program)
+      let memo_plan_full = memo_plan.plan_memoization(program: unfiltered_program, em: memo_em)
+      let memo_targets = build_memo_targets(plan: memo_plan_full)
+      let n_memo_targets = memo_target_count(targets: memo_targets)
+      let memo_target_names = extract_memo_names(targets: memo_targets, acc: [])
+      let memo_target_slots = extract_memo_slots(targets: memo_targets, acc: [])
+      // memo_globals_base is the index of the FIRST memo global in the main
+      // module's local global namespace. wmerge later applies a glo_off to
+      // these instructions when concatenating with the dep stdlib.
+      let memo_globals_base = 3 + (if has_ss then 3 else 0 end)
+
+      // Global section — needed for bump allocator, cabi_realloc, arena, string
+      // literals, or any memo-cache target. G1 (str_base) is always needed
+      // when there are string literals; memo cache globals demand a global
+      // section even when none of the prior conditions apply.
+      let needs_global = (heap_enabled && alloc_mode == 1) || (has_cabi && alloc_mode != 2) || has_arena || has_strings || has_ss || n_memo_targets > 0
       let %m = if needs_global then
-        wdefs.emit_section(buf: %m, id: sec_global, content: wsect.build_global_section(heap_base, has_ss, ss_cont_type_idx))
+        wdefs.emit_section(buf: %m, id: sec_global, content: wsect.build_global_section(heap_base, has_ss, ss_cont_type_idx, memo_cache_count: n_memo_targets))
       else %m end
 
       // Export section
@@ -2611,7 +2791,10 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
                                     ss_dispatch_block_type_idx: ss_dispatch_block_type_idx,
                                     ss_tag_names: ss_tag_names,
                                     effect_map: effect_map,
-                                    bt_capture_idx_global: bt_capture_idx_global)
+                                    bt_capture_idx_global: bt_capture_idx_global,
+                                    memo_target_names,
+                                    memo_target_slots,
+                                    memo_globals_base)
       // cabi_realloc: aligned bump allocator for canonical ABI
       let %code = if has_cabi then
         let %cabi_body = compile_cabi_realloc(heap_base)
