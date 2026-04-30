@@ -434,3 +434,94 @@ in a structured form. Both tests stay deferred until
 `nexus typecheck --emit-json` (Bucket C) ships and exposes warnings
 through a port-stable interface. Tracked in dvr6.1 ADR.
 
+## typecheck/inference.rs
+
+Ported as positive `*_test.nx` fixtures under `tests/typecheck/`:
+
+- `test_basic_poly`, `test_nested_calls`, `test_two_generics`,
+  `test_let_poly_binding`, `test_complex_poly_logic` →
+  `typecheck_inference_basic_poly_test.nx`.
+- `test_record_access` → `typecheck_inference_record_access_test.nx`.
+- `test_poly_variants` → `typecheck_inference_poly_variants_test.nx`.
+- `test_int_literal_defaults_to_i64`,
+  `test_int_literal_annotation_can_select_i32` →
+  `typecheck_inference_int_literal_default_test.nx` (the i32 path is
+  observed via i32-equality → bool, since there is no `as` cast and
+  no `assert_eq_i32` helper).
+- `test_float_literal_annotation_can_select_f32`,
+  `test_float_arithmetic`, `test_float_compare`,
+  `test_float_literal_type`, `test_f32_and_f64_keywords` →
+  `typecheck_inference_float_literal_test.nx`.
+- `test_named_function_can_be_used_as_value`,
+  `test_inline_lambda_literal_typechecks` →
+  `typecheck_inference_named_function_as_value_test.nx`.
+- `test_binary_op_in_call_arg`, `test_string_concat_in_call_arg` →
+  `typecheck_inference_call_arg_exprs_test.nx`.
+- `test_anonymous_record`, `test_record_unification` →
+  `typecheck_inference_record_unification_test.nx` (the original
+  `test_anonymous_record` used Console.print; here we drop the
+  side-effect channel and observe field-access typing directly).
+- `test_ref_creation_and_type`, `test_cannot_return_ref`,
+  `test_ref_assignment`, `test_ref_read` →
+  `typecheck_inference_ref_basic_test.nx`.
+- `test_match_expr_same_type_cases_typechecks`,
+  `test_match_expr_with_return_cases_diverge` →
+  `typecheck_inference_match_expr_test.nx`.
+- `test_main_with_args_typechecks` →
+  `typecheck_inference_main_with_args_test.nx`.
+- `test_let_destructure_record`, `test_let_destructure_nested_record` →
+  `typecheck_inference_let_destructure_test.nx`.
+- `test_no_return_unit_is_ok`, `test_implicit_unit_return_with_side_effect`,
+  `test_return_in_if_branch_counts_as_return`,
+  `test_return_in_match_counts_as_return` →
+  `typecheck_inference_implicit_unit_return_test.nx`.
+- `if_else_expr_infers_i64`, `if_else_expr_infers_string`,
+  `if_else_expr_as_return_value`, `if_else_expr_nested` →
+  `typecheck_inference_if_else_expr_test.nx`.
+- `prop_typecheck_nested_arithmetic` (proptest) →
+  `typecheck_inference_nested_arithmetic_test.nx` (3 representative
+  shapes: positive, mixed-sign, with-zero).
+
+Negative `should_fail_typecheck` tests **without** `insta::assert_snapshot!`
+are ported as standalone fixtures under
+`bootstrap/tests/fixtures/typecheck/<name>.nx` plus
+`<name>.expected_error.txt`:
+
+- `test_arg_mismatch` → `inference_arg_mismatch.nx`.
+- `test_int_literal_is_not_i32_without_annotation` →
+  `inference_int_literal_not_i32.nx`.
+- `test_float_int_mismatch` → `inference_float_int_mismatch.nx`.
+- `test_record_fail` → `inference_record_missing_field.nx`.
+- `if_else_expr_type_mismatch_fails` (and
+  `prop_typecheck_if_else_branches_must_match`) →
+  `inference_if_else_branch_mismatch.nx`.
+
+Tests reading existing fixtures already in `bootstrap/tests/fixtures/`
+need no additional port (the fixture is already its own
+self-typechecking program):
+
+- `test_type_sum_definition_with_labeled_variant_fields`,
+- `test_recursive_lambda_with_annotation_typechecks`,
+- `test_gravity_rule_immutable_holds_value`,
+- `test_ref_generic`.
+
+Skipped (Bucket C — typecheck-error snapshot via `insta::assert_snapshot!`):
+
+- `test_lambda_cannot_capture_ref`,
+- `test_linear_capturing_lambda_cannot_be_called_twice`,
+- `test_constructor_arity_error_is_llm_friendly`,
+- `test_constructor_pattern_arity_error_is_llm_friendly`,
+- `test_function_arity_mismatch_shows_expected`,
+- `test_function_arity_mismatch_too_many_args`,
+- `test_match_expr_type_mismatch_fails`,
+- `test_main_with_wrong_arg_type_fails`,
+- `test_main_with_too_many_args_fails`,
+- `test_let_destructure_non_exhaustive_fails`,
+- `test_no_return_non_unit_is_type_error`.
+
+These all assert the *exact* typecheck error message via insta
+snapshots. The error-string contract is a Rust-API observation — Nexus
+itself only exposes "compile failed with error" via `nexus build`'s
+exit code and stderr. Until `nexus typecheck --emit-json` lands, these
+remain Bucket C.
+
