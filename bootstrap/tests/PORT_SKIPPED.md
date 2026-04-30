@@ -358,3 +358,24 @@ Skipped:
 Env.get("X"), validating the same round-trip invariant without relying
 on the Rust harness's pre-set env wiring.
 
+## fs.rs
+
+Ported as runtime fixtures, using fixed paths under `/tmp/nx_dvr66_*`
+(bootstrap.sh's wasmtime invocation mounts `/tmp` via `--dir` so the
+host can read/write there). Tests are not parallel-safe with each
+other on the same path prefix; each test uses a distinct subdir name:
+
+- `fs_create_dir_and_exists_work` →
+  `stdlib_fs_create_dir_and_exists_test.nx`.
+- `fs_append_and_read_roundtrip` →
+  `stdlib_fs_append_and_read_roundtrip_test.nx`.
+- `fs_remove_file_updates_exists` →
+  `stdlib_fs_remove_file_test.nx`.
+
+Skipped:
+
+- `fs_linear_file_requires_close`,
+  `fs_linear_file_double_close_is_rejected`,
+  `fs_read_requires_fs_coeffect` — all `should_fail_typecheck` +
+  `insta::assert_snapshot!`. Bucket C (typecheck-error snapshot).
+
