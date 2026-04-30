@@ -583,3 +583,48 @@ syntax at all. Skipped permanently (not even `--emit-json` would
 help; the semantics are *whether the AST node shape passes
 typecheck*, which is implementation-detail-by-construction).
 
+## stdlib/string.rs (batch 9)
+
+- `console_read_line_requires_perm_console` — uses
+  `should_fail_typecheck` with `insta::assert_snapshot!`. Snapshot
+  tests are Rust-harness-bound; capability-denial diagnostics are
+  exercised by `tests/typecheck/*` via positive `should_typecheck`
+  rather than snapshot diff.
+- `console_read_line_typechecks_with_perm_console` — typecheck-only
+  positive that does not exec. Already covered by other Console
+  tests that exec under PermConsole; standalone .nx port adds no
+  signal beyond "does it compile", which is implicit in any port.
+- `test_backtrace_captures_call_stack` — first-frame contract
+  ("expected 'main'") is brittle under the safe_run scaffold (the
+  raise lives inside `body`, not `main`, so the top frame becomes
+  `body`). Restructuring without safe_run would require a
+  PermConsole-bearing `main` (the original `Console.println` on
+  failure path), which the .nx scaffold can't host.
+- `console_getchar_with_mock_handler`,
+  `console_read_line_with_mock_handler` — the current `Console`
+  port has additional methods (`eprint`, `eprintln`, `read_bytes`)
+  beyond what the original Rust mock provided. The strict missing-
+  method check forces a full implementation. `read_bytes` returns
+  `%ByteBuffer`, whose constructor is opaque outside the
+  `std:bytebuffer` module — and calling `bytebuffer.empty()` from a
+  handler clause body fails the cap-row unification ("requires
+  {}"), since handler clauses do not propagate the surrounding
+  `require` context. No clean way to write a stub handler in
+  surface .nx; the original Rust harness predates the strict check.
+
+## stdlib/rand.rs (batch 9)
+
+The original `rand_determinism_pcg_step_byte_equal_across_runs`
+uses `exec_nxc_core_capture_stdout` to compare stdout line-by-line
+against an offline reference; the fixture
+`bootstrap/tests/fixtures/nxc/test_rand_determinism.nx` declares
+`main` with `require { PermConsole, PermRandom }` and calls
+`Console.println(from_i64(...))` for each step.
+
+Ported as `tests/stdlib/stdlib_rand_determinism_pcg_test.nx` with
+the same reference values, but checked inline via direct
+comparison against the Random.next_i64() return values (no
+PermConsole, no stdout capture). Same contract — divergence on any
+of the eleven outputs (10 from seed=1 + 1 from seed=2) catches
+PCG-step regressions and state-cell layout corruption.
+
