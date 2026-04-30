@@ -105,6 +105,18 @@ gate is still covered by `tests/runtime/backtrace_elision_test.nx`
 (already in main), which exercises the codegen decision without invoking
 the host import.
 
+## unit/driver_*.rs, unit/launcher.rs
+
+- `driver_typecheck.rs`, `driver_repl.rs`, `driver_polyglot.rs`, `launcher.rs` —
+  these tests exercise the Nexus CLI subcommands by spawning the `nexus`
+  binary as a subprocess via the Rust `std::process::Command` API. While
+  Nexus provides a `Proc.exec` wrapper, the underlying WASI environment
+  used by `wasmtime run` does not currently support the `spawn` primitive,
+  resulting in "operation not supported on this platform" errors.
+  End-to-end integration testing of the compiler-as-a-binary must remain
+  in the Rust bootstrap or move to a native (non-WASM) test runner.
+
+
 # Skipped ports — bootstrap/tests/codegen → tests/codegen
 
 Codegen tests are highly Rust-implementation-detail oriented: most inspect
