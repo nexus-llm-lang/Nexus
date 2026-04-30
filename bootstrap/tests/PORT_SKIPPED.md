@@ -417,3 +417,20 @@ one `.nx` fixture under the standard `safe_run` scaffold:
 
 No json.rs tests skipped.
 
+## typecheck/diagnostics.rs
+
+Entire file (2 tests) is **Bucket C — typecheck-warning observation**.
+Both tests use `typecheck_warnings()` (the harness wrapper around
+`TypeChecker::take_warnings()`) and inspect raw warning-string content:
+
+- `test_linear_primitive_emits_unnecessary_warning` — asserts a warning
+  string containing the literal "unnecessary".
+- `test_linear_record_does_not_emit_unnecessary_warning` — asserts the
+  *absence* of such a warning.
+
+Nexus has no surface for "did the typechecker emit a warning for this
+program" — `nexus build` only reports errors, not warnings, on stdout
+in a structured form. Both tests stay deferred until
+`nexus typecheck --emit-json` (Bucket C) ships and exposes warnings
+through a port-stable interface. Tracked in dvr6.1 ADR.
+
