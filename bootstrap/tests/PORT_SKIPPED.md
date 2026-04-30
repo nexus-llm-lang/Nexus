@@ -379,3 +379,41 @@ Skipped:
   `fs_read_requires_fs_coeffect` — all `should_fail_typecheck` +
   `insta::assert_snapshot!`. Bucket C (typecheck-error snapshot).
 
+## json.rs
+
+JSON has direct Nexus analogues for every value kind, so the runtime
+suite is the most portable in this batch. Each Rust `#[test]` becomes
+one `.nx` fixture under the standard `safe_run` scaffold:
+
+- `json_roundtrip_null_true_false` → `stdlib_json_atom_roundtrip_test.nx`
+- `json_number_boundaries` → `stdlib_json_number_boundaries_test.nx`
+- `json_serialize_preserves_int_vs_float` →
+  `stdlib_json_int_vs_float_serialize_test.nx`
+- `json_rejects_leading_zero` →
+  `stdlib_json_leading_zero_rejected_test.nx`
+- `json_string_named_escapes_roundtrip` →
+  `stdlib_json_string_named_escapes_test.nx`
+- `json_unicode_basic_bmp_escape` →
+  `stdlib_json_unicode_bmp_escape_test.nx`
+- `json_unicode_surrogate_pair_above_bmp` →
+  `stdlib_json_unicode_surrogate_pair_test.nx`
+- `json_string_rejects_lone_surrogate` →
+  `stdlib_json_lone_surrogate_rejected_test.nx`
+- `json_whitespace_around_tokens` → `stdlib_json_whitespace_test.nx`
+- `json_array_nested_roundtrip` →
+  `stdlib_json_array_nested_roundtrip_test.nx`
+- `json_object_lookup_and_roundtrip` → `stdlib_json_object_lookup_test.nx`
+- `json_lsp_initialize_request_roundtrip` →
+  `stdlib_json_lsp_initialize_request_test.nx`
+- `json_lsp_publish_diagnostics_roundtrip` →
+  `stdlib_json_lsp_publish_diagnostics_test.nx`
+- `json_lsp_did_change_roundtrip` → `stdlib_json_lsp_did_change_test.nx`
+- `json_trailing_comma_rejected` →
+  `stdlib_json_trailing_comma_rejected_test.nx`
+- `json_trailing_data_rejected` →
+  `stdlib_json_trailing_data_rejected_test.nx`
+- `json_serialize_rejects_nan` →
+  `stdlib_json_serialize_rejects_nan_test.nx`
+
+No json.rs tests skipped.
+
