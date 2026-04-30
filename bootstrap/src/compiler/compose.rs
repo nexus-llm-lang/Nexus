@@ -429,7 +429,21 @@ fn compose_components(user_component: &[u8], stdlib_component: &[u8]) -> Result<
 }
 
 /// Encode a standalone user component (no stdlib dependencies).
+///
+/// The component is encoded with the WASI command adapter so it exports
+/// `wasi:cli/run@0.2.6` and is runnable via `wasmtime run`, regardless of
+/// whether the user program reaches any `__nx_*` external. Without this,
+/// programs whose `main` only uses language constructs silently produce a
+/// component with no `run()` entry point. See nexus-xaui — the gate must be
+/// "main returns unit", not "any external is reached".
+///
+/// The command adapter requires the user module to export memory, but the
+/// no-external codegen path emits `mem_mode: "none"` (no memory section).
+/// Inject a tiny `(memory 0)` and a `memory` export before encoding so the
+/// adapter has something to bind to.
 fn encode_standalone_component(core_wasm: &[u8], caps: &[String]) -> Result<Vec<u8>, String> {
+    let core_wasm = ensure_memory_export(core_wasm);
+
     let wit_source = "package nexus:app;\n\nworld app {\n  export main: func();\n}\n".to_string();
 
     // Use the same approach as the old artifact.rs: push wasi:cli first, then app.
@@ -444,7 +458,7 @@ fn encode_standalone_component(core_wasm: &[u8], caps: &[String]) -> Result<Vec<
         .select_world(&[app_pkg, wasi_cli_pkg], Some("nexus:app/app"))
         .map_err(|e| format!("failed to resolve app world: {}", e))?;
 
-    let mut embedded = core_wasm.to_vec();
+    let mut embedded = core_wasm.clone();
     embed_component_metadata(&mut embedded, &resolve, world, StringEncoding::UTF8)
         .map_err(|e| format!("failed to embed component metadata: {}", e))?;
 
@@ -453,7 +467,7 @@ fn encode_standalone_component(core_wasm: &[u8], caps: &[String]) -> Result<Vec<
         .map_err(|e| format!("failed to init component encoder: {}", e))?
         .adapter(
             WASI_SNAPSHOT_MODULE,
-            wasi_preview1_component_adapter_provider::WASI_SNAPSHOT_PREVIEW1_REACTOR_ADAPTER,
+            wasi_preview1_component_adapter_provider::WASI_SNAPSHOT_PREVIEW1_COMMAND_ADAPTER,
         )
         .map_err(|e| format!("failed to add WASI adapter: {}", e))?
         .validate(true);
@@ -467,6 +481,109 @@ fn encode_standalone_component(core_wasm: &[u8], caps: &[String]) -> Result<Vec<
     }
 
     Ok(result)
+}
+
+/// Ensure the core module declares and exports a memory. Used by the
+/// standalone path so the WASI command adapter has a memory to bind to.
+/// If the module already has a memory section or a `memory` export, the
+/// input is returned unchanged.
+fn ensure_memory_export(wasm: &[u8]) -> Vec<u8> {
+    use wasm_encoder::{
+        ExportKind, ExportSection, MemorySection, MemoryType, Module, RawSection,
+    };
+
+    let mut has_memory_section = false;
+    let mut has_memory_export = false;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        let Ok(payload) = payload else { continue };
+        match payload {
+            Payload::MemorySection(_) => has_memory_section = true,
+            Payload::ExportSection(section) => {
+                for export in section {
+                    let Ok(export) = export else { continue };
+                    if matches!(export.kind, wasmparser::ExternalKind::Memory) {
+                        has_memory_export = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if has_memory_section && has_memory_export {
+        return wasm.to_vec();
+    }
+
+    // WASM section IDs: type=1, import=2, function=3, table=4, memory=5,
+    // global=6, export=7, start=8, element=9, code=10, data=11, datacount=12,
+    // tag=13. We need to insert the memory section at id=5 (between table=4
+    // and global=6) so the resulting module is well-ordered.
+    const MEMORY_SECTION_ID: u8 = 5;
+
+    let parser = wasmparser::Parser::new(0);
+    let mut module = Module::new();
+    let mut memory_inserted = false;
+    let mut export_section_seen = false;
+    for payload in parser.parse_all(wasm) {
+        let payload = match payload {
+            Ok(p) => p,
+            Err(_) => return wasm.to_vec(),
+        };
+        // Insert the synthesized memory section before the first section
+        // whose id is greater than 5 (memories come at id 5).
+        if !memory_inserted && !has_memory_section {
+            if let Some((id, _)) = payload.as_section() {
+                if id > MEMORY_SECTION_ID {
+                    let mut mems = MemorySection::new();
+                    mems.memory(MemoryType {
+                        minimum: 1,
+                        maximum: None,
+                        memory64: false,
+                        shared: false,
+                        page_size_log2: None,
+                    });
+                    module.section(&mems);
+                    memory_inserted = true;
+                }
+            }
+        }
+        match &payload {
+            Payload::ExportSection(section) => {
+                let mut exports = ExportSection::new();
+                for export in section.clone() {
+                    let Ok(export) = export else {
+                        return wasm.to_vec();
+                    };
+                    let kind = match export.kind {
+                        wasmparser::ExternalKind::Func => ExportKind::Func,
+                        wasmparser::ExternalKind::Table => ExportKind::Table,
+                        wasmparser::ExternalKind::Memory => ExportKind::Memory,
+                        wasmparser::ExternalKind::Global => ExportKind::Global,
+                        wasmparser::ExternalKind::Tag => ExportKind::Tag,
+                    };
+                    exports.export(export.name, kind, export.index);
+                }
+                if !has_memory_export {
+                    exports.export("memory", ExportKind::Memory, 0);
+                }
+                module.section(&exports);
+                export_section_seen = true;
+                continue;
+            }
+            _ => {}
+        }
+        if let Some((id, range)) = payload.as_section() {
+            module.section(&RawSection {
+                id,
+                data: &wasm[range],
+            });
+        }
+    }
+    if !export_section_seen {
+        // No export section at all — extremely unlikely (codegen always emits
+        // `main` and `_start`), but fall back to leaving the module alone.
+        return wasm.to_vec();
+    }
+    module.finish()
 }
 
 fn append_custom_section(wasm: &mut Vec<u8>, caps: &[String]) {
