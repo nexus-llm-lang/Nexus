@@ -222,10 +222,8 @@ end
  * stack proportional to list length. The combiner f is applied on the way
  * back out of the recursion, so the call frames cannot be reused. An
  * accumulator-style rewrite (reverse + fold_left + arg-swapped combiner)
- * would bound the stack but currently triggers the indirect-call type
- * mismatch trap noted in tests/runtime/list_fusion_b_ops_test.nx (closure
- * capturing a function-typed parameter inside a foldr accumulator), so the
- * straightforward recursive form is retained.
+ * would bound the stack at the cost of an extra traversal; the
+ * straightforward recursive form is retained for clarity.
  *
  * GUIDANCE:
  *   * For lists with n > ~2048 elements, prefer fold_left (tail-recursive)
@@ -268,6 +266,23 @@ export let build = fn <T>(g: (cons: (val: T, rest: [ T ]) -> [ T ], nil: [ T ]) 
 end
 
 /**
+ * build_k: build/foldr alternative entry whose generator uses non-shadowing
+ * label names `k` (cons combiner) and `z` (nil seed). Used by stdlib's
+ * `_b` helpers (filter_b/take_b/concat_b/map_b) which would otherwise
+ * collide with the toplevel `cons` defined in this module: the resolver
+ * picks the toplevel `cons` over a parameter named `cons`, so generators
+ * cannot reach the abstract cons-combiner supplied by build. Renaming
+ * the labels avoids that collision while remaining a thin wrapper over
+ * `build`. The fusion rewriter keys off `build` only (see lir_opt.nx),
+ * so callers of `build_k` do not benefit from deforestation; the fusion
+ * rule must be extended to cover `build_k` separately if/when the inner
+ * resolver bug is fixed and `build_k` is removed.
+ */
+export let build_k = fn <T>(g: (k: (val: T, rest: [ T ]) -> [ T ], z: [ T ]) -> [ T ]) -> [ T ] do
+  return g(k: fn (val: T, rest: [ T ]) -> [ T ] do return val :: rest end, z: [])
+end
+
+/**
  * map_b: build/foldr-form of `map`. Equivalent to `map` but expressed as
  * build over a foldr-style generator, making the deforestation rule fire
  * when the result is consumed by another foldr in the same scope.
@@ -280,9 +295,9 @@ end
  * The intermediate `[U]` allocation that ordinary `map` produces is gone.
  */
 export let map_b = fn <T, U>(xs: [ T ], f: (val: T) -> U) -> [ U ] do
-  return build(g: fn (cons: (val: U, rest: [ U ]) -> [ U ], nil: [ U ]) -> [ U ] do
-    return foldr(xs, init: nil, f: fn (val: T, acc: [ U ]) -> [ U ] do
-      return cons(val: f(val), rest: acc)
+  return build_k(g: fn (k: (val: U, rest: [ U ]) -> [ U ], z: [ U ]) -> [ U ] do
+    return foldr(xs, init: z, f: fn (val: T, acc: [ U ]) -> [ U ] do
+      return k(val: f(val), rest: acc)
     end)
   end)
 end
@@ -299,13 +314,61 @@ end
  * Stack depth is O(|xs| + |ys|) — foldr itself is non-tail-recursive.
  */
 export let concat_b = fn <T>(xs: [ T ], ys: [ T ]) -> [ T ] do
-  return build(g: fn (cons: (val: T, rest: [ T ]) -> [ T ], nil: [ T ]) -> [ T ] do
-    let seeded = foldr(xs: ys, init: nil, f: fn (val: T, acc: [ T ]) -> [ T ] do
-      return cons(val: val, rest: acc)
+  return build_k(g: fn (k: (val: T, rest: [ T ]) -> [ T ], z: [ T ]) -> [ T ] do
+    let seeded = foldr(xs: ys, init: z, f: fn (val: T, acc: [ T ]) -> [ T ] do
+      return k(val: val, rest: acc)
     end)
     return foldr(xs, init: seeded, f: fn (val: T, acc: [ T ]) -> [ T ] do
-      return cons(val: val, rest: acc)
+      return k(val: val, rest: acc)
     end)
+  end)
+end
+
+/**
+ * filter_b: build/foldr-form of `filter`. Threads the predicate `p`
+ * through a foldr that conses elements for which `p(val)` is true and
+ * skips others. As a build/foldr expression, fuses with a consuming
+ * foldr per the `foldr(k, z, build(g)) ≡ g(k, z)` rule.
+ *
+ *   foldr(k, z, filter_b(xs, p))
+ *     ≡ foldr(xs, z, fn (v, acc) -> if p(v) then k(v, acc) else acc)
+ */
+export let filter_b = fn <T>(xs: [ T ], p: (val: T) -> bool) -> [ T ] do
+  return build_k(g: fn (k: (val: T, rest: [ T ]) -> [ T ], z: [ T ]) -> [ T ] do
+    return foldr(xs, init: z, f: fn (val: T, acc: [ T ]) -> [ T ] do
+      if p(val) then
+        return k(val: val, rest: acc)
+      else
+        return acc
+      end
+    end)
+  end)
+end
+
+/**
+ * take_b: build/foldr-form of `take`. Uses a CPS-threaded function-typed
+ * accumulator `(m: i64) -> [T]`: each step constructs a continuation that,
+ * given the remaining count `m`, either stops (m <= 0) or conses the
+ * current element and recurses on `m - 1`. The outer fold builds the full
+ * continuation, which is then applied to `n`.
+ *
+ *   foldr(k, z, take_b(xs, n))
+ *     ≡ <continuation-eta>            [build/foldr fusion via build's g]
+ */
+export let take_b = fn <T>(xs: [ T ], n: i64) -> [ T ] do
+  return build_k(g: fn (k: (val: T, rest: [ T ]) -> [ T ], z: [ T ]) -> [ T ] do
+    let base = fn (m: i64) -> [ T ] do return z end
+    let step = fn (val: T, acc: (m: i64) -> [ T ]) -> (m: i64) -> [ T ] do
+      return fn (m: i64) -> [ T ] do
+        if m <= 0 then
+          return z
+        else
+          return k(val: val, rest: acc(m: m - 1))
+        end
+      end
+    end
+    let cont = foldr(xs, init: base, f: step)
+    return cont(m: n)
   end)
 end
 
