@@ -1255,6 +1255,25 @@ end
 let infer_let = fn (state: CheckState, name: string, sigil: Sigil, ann: Option<TypeExpr>, value: HirExpr, ret_type: TypeExpr, span: Span) -> InferExprResult throws { Exn } do
   // Pre-register for recursive lambdas
   let HirExpr(node: val_node, span: _) = value
+  // Variable-aliasing carve-out for let-polymorphism (nexus-hfmw).
+  //   let f = id   // id : Scheme(["T"], T -> T)
+  // Without this carve-out, infer_expr looks up `id`, instantiates it to
+  // a fresh `?a -> ?a`, and infer_let binds `f` *monomorphically* to
+  // that `?a -> ?a`. Subsequent uses `f(x: 10)` would constrain `?a`
+  // to i64, and `f(x: true)` would then fail to unify bool with int.
+  // By copying the source scheme directly when the RHS is a plain
+  // (non-mutable, unannotated) variable reference to a polymorphic
+  // binding, every call site of `f` re-instantiates exactly as if it
+  // had referenced `id` directly. This matches bootstrap/src/lang/
+  // typecheck/unify.rs (HM-style `generalize` at let), restricted to
+  // the syntactic-value case where the RHS is itself a variable.
+  // Lambdas and other RHS expressions remain monomorphic-bound to keep
+  // linearity / value-restriction invariants intact.
+  match alias_poly_scheme(state, name, sigil, ann, val_node) do
+    | Some(val: aliased_state) ->
+      return InferExprOk(state: aliased_state, subst: subst.subst_empty(), typ: TyUnit)
+    | None -> ()
+  end
   let st0 = if let Lambda(type_params: _, params, ret_type: ret, body: _) = val_node then
     let arrow = TyArrow(
       params: build_param_named_types(params),
@@ -1288,6 +1307,49 @@ let infer_let = fn (state: CheckState, name: string, sigil: Sigil, ann: Option<T
         name, scheme: tctypes.mono(typ: final_type)
       )
       return InferExprOk(state: tctypes.state_with_env(state: st1, env: env2), subst: s1, typ: TyUnit)
+  end
+end
+
+let poly_scheme = fn (vars: [string]) -> bool do
+  match vars do
+    | [] -> return false
+    | _ -> return true
+  end
+end
+
+/// Variable-aliasing carve-out helper for nexus-hfmw. Returns
+/// `Some(state')` when the let RHS is a plain immutable, unannotated
+/// reference to a polymorphic binding — in which case `state'` already
+/// has `name` bound to a copy of that scheme. Returns `None` for every
+/// other shape so `infer_let` falls through to the standard path.
+let alias_poly_scheme = fn (
+  state: CheckState, name: string, sigil: Sigil,
+  ann: Option<TypeExpr>, val_node: HirExprKind
+) -> Option<CheckState> do
+  match sigil do
+    | SigilImmutable -> ()
+    | _ -> return None
+  end
+  match ann do
+    | None -> ()
+    | Some(_) -> return None
+  end
+  match val_node do
+    | Variable(name: src_name, sigil: SigilImmutable) ->
+      match tctypes.env_lookup(env: tctypes.state_env(state), name: src_name) do
+        | None -> return None
+        | Some(val: Scheme(vars: src_vars, typ: src_typ)) ->
+          if poly_scheme(vars: src_vars) then
+            let env_aliased = tctypes.env_insert(
+              env: tctypes.state_env(state),
+              name,
+              scheme: Scheme(vars: src_vars, typ: src_typ)
+            )
+            return Some(val: tctypes.state_with_env(state, env: env_aliased))
+          end
+          return None
+      end
+    | _ -> return None
   end
 end
 
