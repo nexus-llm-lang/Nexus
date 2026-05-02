@@ -15,12 +15,11 @@
  * discovery turns up zero files (an empty test run is treated as user
  * error — silent passes hide CI misconfiguration).
  *
- * Parallelism: `--jobs N` is accepted on the CLI for forward compatibility
- * but the current MVP runs tests sequentially. `Proc.exec` is a blocking
- * host call and Nexus's fiber scheduler is single-threaded cooperative,
- * so spawning multiple fibers cannot overlap subprocess execution.
- * Surfacing a stub flag now keeps the CI invocation stable when a future
- * runtime adds a non-blocking exec primitive.
+ * Parallelism: tests run sequentially. `Proc.exec` is a blocking host
+ * call (`std::process::Command::output` on the host side), so fanning
+ * out via the cooperative fiber scheduler cannot overlap subprocess
+ * execution. Real parallelism would require an async exec primitive on
+ * the host; until that exists the runner takes no concurrency flag.
  */
 
 import { Console } from "std:stdio"
@@ -42,7 +41,6 @@ export type TestOutcome =
 /// Parsed CLI options for the `test` subcommand.
 export type TestOptions = TestOptions(
   path: string,
-  jobs: i64,
   junit_path: Option<string>,
   nexus_bin: string,
   wasmtime_bin: string
@@ -69,62 +67,50 @@ export let strip_test_subcommand = fn (xs: [string]) -> ParsedTestSubcommand do
   end
 end
 
-type FlagPair = FlagPair(remaining: [string], jobs: i64, junit: Option<string>, nexus_bin: string, wasmtime_bin: string)
+type FlagPair = FlagPair(remaining: [string], junit: Option<string>, nexus_bin: string, wasmtime_bin: string)
 
-/// Strip `--jobs N`, `--junit FILE`, `--nexus-bin PATH`, `--wasmtime-bin PATH`
-/// pairs from `xs`, preserving the order of any unrecognised tokens. The
+/// Strip `--junit FILE`, `--nexus-bin PATH`, `--wasmtime-bin PATH` pairs
+/// from `xs`, preserving the order of any unrecognised tokens. The
 /// `--nexus-bin` / `--wasmtime-bin` flags exist so the runner stays
 /// host-agnostic: stage1 wasm has no way to discover a working `nexus`
 /// binary on its own, and the CI harness needs to point at a checked-out
 /// `bootstrap/target/release/nexus`.
-let parse_flags = fn (xs: [string], acc_remaining: [string], jobs: i64, junit: Option<string>, nexus_bin: string, wasmtime_bin: string) -> FlagPair throws { Exn } do
+let parse_flags = fn (xs: [string], acc_remaining: [string], junit: Option<string>, nexus_bin: string, wasmtime_bin: string) -> FlagPair throws { Exn } do
   match xs do
-    | [] -> return FlagPair(remaining: list.reverse(xs: acc_remaining), jobs, junit, nexus_bin, wasmtime_bin)
+    | [] -> return FlagPair(remaining: list.reverse(xs: acc_remaining), junit, nexus_bin, wasmtime_bin)
     | flag :: rest ->
-      if flag == "--jobs" then
-        match rest do
-          | [] -> raise InvalidUsage(detail: "--jobs requires an integer")
-          | value :: rest2 ->
-            match str.parse_i64(s: value) do
-              | Some(val: n) ->
-                if n < 1 then raise InvalidUsage(detail: "--jobs must be >= 1") end
-                return parse_flags(xs: rest2, acc_remaining, jobs: n, junit, nexus_bin, wasmtime_bin)
-              | None -> raise InvalidUsage(detail: "--jobs value must be an integer: " ++ value)
-            end
-        end
-      end
       if flag == "--junit" then
         match rest do
           | [] -> raise InvalidUsage(detail: "--junit requires a path")
-          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, jobs, junit: Some(val: value), nexus_bin, wasmtime_bin)
+          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, junit: Some(val: value), nexus_bin, wasmtime_bin)
         end
       end
       if flag == "--nexus-bin" then
         match rest do
           | [] -> raise InvalidUsage(detail: "--nexus-bin requires a path")
-          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, jobs, junit, nexus_bin: value, wasmtime_bin)
+          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, junit, nexus_bin: value, wasmtime_bin)
         end
       end
       if flag == "--wasmtime-bin" then
         match rest do
           | [] -> raise InvalidUsage(detail: "--wasmtime-bin requires a path")
-          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, jobs, junit, nexus_bin, wasmtime_bin: value)
+          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, junit, nexus_bin, wasmtime_bin: value)
         end
       end
-      return parse_flags(xs: rest, acc_remaining: flag :: acc_remaining, jobs, junit, nexus_bin, wasmtime_bin)
+      return parse_flags(xs: rest, acc_remaining: flag :: acc_remaining, junit, nexus_bin, wasmtime_bin)
   end
 end
 
 /// Build a TestOptions from the post-`test`-subcommand argv tail. The first
 /// positional arg (if any) is the discovery path; default is `tests/`.
 export let parse_test_options = fn (args: [string]) -> TestOptions throws { Exn } do
-  let FlagPair(remaining, jobs, junit, nexus_bin, wasmtime_bin) =
-    parse_flags(xs: args, acc_remaining: [], jobs: 1, junit: None, nexus_bin: "nexus", wasmtime_bin: "wasmtime")
+  let FlagPair(remaining, junit, nexus_bin, wasmtime_bin) =
+    parse_flags(xs: args, acc_remaining: [], junit: None, nexus_bin: "nexus", wasmtime_bin: "wasmtime")
   let path = match remaining do
     | [] -> "tests/"
     | p :: _ -> p
   end
-  return TestOptions(path, jobs, junit_path: junit, nexus_bin, wasmtime_bin)
+  return TestOptions(path, junit_path: junit, nexus_bin, wasmtime_bin)
 end
 
 // ─── Discovery ────────────────────────────────────────────────────────────
@@ -200,7 +186,7 @@ end
 /// runtime (`stage = "run"`) so the JUnit / human reports can hint at the
 /// right log to inspect.
 export let run_one_test = fn (file: string, opts: TestOptions, tmp_wasm: string) -> TestOutcome require { Proc, Clock, Console } do
-  let TestOptions(path: _, jobs: _, junit_path: _, nexus_bin, wasmtime_bin) = opts
+  let TestOptions(path: _, junit_path: _, nexus_bin, wasmtime_bin) = opts
   // Compile phase: invoke the host nexus binary. Every failure here is
   // surfaced as a TestFail so a single broken fixture cannot silently skip.
   let compile_args = ["build", file, "-o", tmp_wasm, "--explain-capabilities", "none"]
@@ -381,11 +367,7 @@ end
 /// any failure or empty discovery).
 export let run_test_subcommand = fn (args: [string]) -> i64 require { Fs, Proc, Clock, Console } throws { Exn } do
   let opts = parse_test_options(args)
-  match opts do | TestOptions(path, jobs, junit_path, nexus_bin: _, wasmtime_bin: _) ->
-    if jobs > 1 then
-      Console.eprintln(val: "nexus test: --jobs " ++ str.from_i64(val: jobs)
-        ++ " requested; current MVP runs sequentially (Proc.exec is blocking)")
-    end
+  match opts do | TestOptions(path, junit_path, nexus_bin: _, wasmtime_bin: _) ->
     let files = discover_tests(path)
     let n = list.length(xs: files)
     if n == 0 then

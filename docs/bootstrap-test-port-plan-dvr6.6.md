@@ -62,7 +62,7 @@ introspection-API work that is outside dvr6's "decommission" scope.
 | --- | --- | --- | --- |
 | R-1 | `tests/.../*_test.nx` runner does not capture stdout for assertion | `src/test_runner.nx:222` (`Proc.exec` returns combined `stderr` only used for failure tail) | Tests that need to verify "what was printed" (scheduler interleave, REPL output) fail silently — equivalent to `feedback_verify_actual_output.md` warning. Sub-issue blocker for nxc/ category. |
 | R-2 | `wasmtime_flags` missing `component-model=y` and `-S http,inherit-network` | `src/test_runner.nx:238` | Bootstrap-emitted components fail to instantiate (`no exported instance named wasi:cli/run` or `wasi:http/types` missing). Affects every fixture that goes through `nexus build` + bundle path. |
-| R-3 | `Proc.exec` is blocking → `--jobs N` is a stub | `src/test_runner.nx:24-25` | Sequential runs are 10-20× slower than the Rust `cargo test` parallel runner. Acceptable for MVP; sub-issue file under dvr6.x. |
+| R-3 | `Proc.exec` is blocking → no parallelism in test_runner | `src/test_runner.nx` `run_all` (sequential recursion) | Sequential runs are 10-20× slower than the Rust `cargo test` parallel runner. Real parallelism requires an async exec primitive on the host (tracked separately under nexus-u8cm). |
 | R-4 | f64 arithmetic via `std:math::abs_float` lowers to `nexus:runtime/math::f64-abs` host import that wasmtime CLI does not stub | bootstrap codegen (no host-stub binding); self-host nxc inlines the op | Until bootstrap is decommissioned (or dvr6.6's runner switches to nxc by default), tests must inline `abs_f64` instead of importing. Pilot tests follow this convention. |
 | R-5 | Bundler skips stdlib link when zero `nexus:std/*` imports remain after dead-code-elim, producing a "thin" component without `wasi:cli/run` | bundler logic; surfaces when only `assert_true` (no string-conversion) is used | Workaround: ensure each `*_test.nx` uses at least one assert variant that calls `from_i64`/`from_bool` (transitively pulls `std:str`). Pilot tests follow this convention. |
 
@@ -145,7 +145,7 @@ conventions §2 applied + per-file `nexus build` + standalone wasmtime PASS.
 | dvr6.6.G | nxc/ fixture wrappers | 16 .rs files; the 69 .nx fixtures already exist under bootstrap/tests/fixtures/nxc/ — relocate them to tests/nxc/ + add scaffolding | R-1 (several fixtures rely on captured stdout, e.g. test_chan_oneshot) |
 | dvr6.6.H | runner R-1 fix | `run_one_test` must capture stdout into `TestOutcome` and expose it for assertion-style fixtures | self-contained |
 | dvr6.6.I | runner R-2 fix | `wasmtime_flags`: add `component-model=y` and `-S http,inherit-network` (guarded by capability detection) | self-contained |
-| dvr6.6.J | runner R-3 (parallel `--jobs`) | Requires non-blocking exec or thread pool | wasi runtime work |
+| dvr6.6.J | runner R-3 (parallel test execution) | Requires non-blocking exec or thread pool | wasi runtime work |
 | dvr6.6.K | typecheck/* port (Bucket C) | depends on self-host exposing `nexus typecheck --emit-json` or equivalent | new self-host CLI surface |
 | dvr6.6.L | parse/ + ir/ + codegen/ + capabilities/ port (Bucket D) | depends on self-host introspection APIs | epic-scale; defer until decommission timeline finalised |
 
