@@ -640,3 +640,23 @@ PermConsole, no stdout capture). Same contract — divergence on any
 of the eleven outputs (10 from seed=1 + 1 from seed=2) catches
 PCG-step regressions and state-cell layout corruption.
 
+## typecheck/linearity.rs (batch 10)
+
+All four positives ported; all three negatives deposited as fixtures.
+
+- `test_try_catch_arm_consumes_pre_try_linear_pass` →
+  `typecheck_linearity_try_catch_pre_try_consume_test.nx`.
+- `test_linear_consumed_before_throwable_call_passes`,
+  `test_linear_across_pure_call_passes`,
+  `test_linear_across_throwable_call_inside_try_with_catch_consume_passes`
+  → `typecheck_linearity_consumed_before_throwable_call_test.nx`.
+
+Negative `should_fail_typecheck` (no insta) ported as fixtures:
+
+- `test_try_catch_arm_starts_from_pre_try_linear_set` →
+  `linearity_try_catch_pre_try_unconsumed.nx`.
+- `test_linear_across_throwable_call_outside_try_rejects` →
+  `linearity_across_throwable_call_outside_try.nx`.
+- `test_linear_created_inside_try_across_throwable_call_rejects` →
+  `linearity_created_inside_try_across_throwable_call.nx`.
+
