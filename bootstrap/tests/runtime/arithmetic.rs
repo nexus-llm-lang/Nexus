@@ -42,7 +42,7 @@ end
 fn codegen_negate_function() {
     exec(
         r#"
-import { negate } from "std:core"
+import { negate } from "std:math"
 
 let main = fn () -> unit do
     let t = negate(val: true)

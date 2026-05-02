@@ -29,8 +29,28 @@ The standard library is the `std` package, rooted at `nxlib/stdlib/`. Every modu
 | `"std:tuple"` | pure | `Pair<A, B>(left, right)`, `fst`, `snd` |
 | `"std:exn"` | pure | Exception helpers, `backtrace()` |
 | `"std:lazy"` | pure | `Lazy<T>`, host-side lazy force |
-| `"std:arena"` | pure | `heap_mark`, `heap_reset` (compiler-internal) |
-| `"std:core"` | FFI | Compiler intrinsics (`array-length`) |
+| `"std:core"` | pure | `id` (polymorphic identity) |
+
+### Runtime intrinsics (compiler-internal)
+
+These modules live under `nxlib/stdlib/runtime/` and bind low-level wasm
+operations or codegen-recognised externs.  User code should not import
+these directly unless writing compiler internals or runtime tests.
+
+| Import path | Purpose |
+|-------------|---------|
+| `"std:runtime/math"` | `__nx_f64_*` math intrinsics (`sqrt`, `floor`, ...) |
+| `"std:runtime/mem"` | Bounds-checked load/store, `MemoryOutOfBounds` |
+| `"std:runtime/alloc"` | Bump allocator state used by `runtime/table` |
+| `"std:runtime/arena"` | `heap_mark`, `heap_reset` (compiler arena reset) |
+| `"std:runtime/table"` | Open-addressed hash table substrate for `*_nx` collections |
+
+### Source-only directories
+
+- `nxlib/stdlib/internal/` — handwritten WAT shims (`nexus_host_stub.wat`).
+  Source for the stub-merge build path; not a stdlib module.
+- `nxlib/stdlib/test/` — test framework modules (`assert`, `property`,
+  `snapshot`).  Imported as `std:test/<name>`.
 
 ## Capability Permissions
 
