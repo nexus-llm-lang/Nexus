@@ -904,3 +904,98 @@ runtime does not provide. proptest generators are also Rust-only.
   `fuzz_enum_many_variants_no_panic` — all skipped as proptest +
   catch_unwind Bucket C.
 
+# Skipped ports — bootstrap/tests/nxc (batch 11)
+
+## nxc/*.rs (67 tests)
+
+The nxc/ tests run via the Rust harness in two modes:
+
+1. `exec_with_stdlib(read_fixture("nxc/test_X.nx"))` — runs a fixture
+   `.nx` file that exercises the **bootstrap (self-host) compiler in
+   Nexus**. The vast majority of these fixtures `import "src/..."`
+   modules (typecheck/types, frontend/parser, ir/hir_types, etc.) and
+   construct in-language IR values to drive specific compiler passes.
+   They are testing the bootstrap compiler the same way `ir/*.rs` tests
+   the Rust compiler — Bucket C in spirit, since reproducing them under
+   `tests/` would couple `tests/` to the bootstrap's source tree
+   organization.
+2. `compile_fixture_via_nxc{_should_fail}` — drives the bootstrap
+   `nexus.wasm` binary from Rust and observes its stdout/stderr/exit
+   code. Pure harness.
+3. Some run via `exec_threaded` / `exec_with_stdlib_core` /
+   `exec_nxc_core_capture_stdout` — additional Rust-side harnessing for
+   shared-memory threading, core-wasm bypass of stdlib composition, and
+   stdout capture, none of which has a `tests/`-runner analogue.
+
+Ported (user-language regressions that don't import `src/`):
+
+- `nxc/import_after_use::import_after_use_resolves` →
+  `tests/nxc/nxc_import_after_use_resolves_test.nx`. Asserts canonical
+  naming resolves a `str_length` reference in a function body even when
+  the `import { length as str_length } from "std:str"` declaration
+  appears below the use site.
+- `nxc/transitive_wrapper::transitive_wrapper_resolves` →
+  `tests/nxc/nxc_transitive_wrapper_resolves_test.nx`. Asserts
+  Nexus-level wrapper functions (`bytebuffer.copy_range` over
+  `__nx_copy_range`) survive reachability filtering and emit with their
+  canonical name when called through a qualified import alias.
+- `nxc/qualified_imports::qualified_imports_diamond_and_mixed` →
+  `tests/nxc/nxc_qualified_imports_diamond_test.nx`. Asserts diamond
+  imports of `std:list` / `std:str` resolve to a single registered
+  function each (no forwarder stubs) when reachable through both direct
+  use and transitive stdlib internal use.
+
+Skipped:
+
+- All fixtures importing `src/...`: `test_typecheck.nx`,
+  `test_lambda_capture_linearity.nx`, `test_handler_first_class.nx`,
+  `test_match_exhaustiveness.nx`, `test_throws_row_narrowing.nx`,
+  `test_call_throw_row_subsumption.nx`, `test_lsp_diagnostics.nx`,
+  `test_lsp_publish_diagnostics.nx`, `test_lsp_document_symbols.nx`,
+  `test_lsp_multifile_imports.nx`, `test_infer_let_annotation.nx`,
+  `test_codegen_minimal.nx`, `test_codegen_validate.nx`, `test_lir.nx`,
+  `test_lir_minimal.nx`, `test_mir.nx`, `test_mir_minimal.nx`,
+  `test_hir.nx`, `test_ast.nx`, `test_lexer.nx`, `test_parser.nx`,
+  `test_parser_minimal.nx`, `test_parser_tokenize_only.nx`,
+  `test_handler_arm_span.nx`, `test_rdrname.nx`, `test_resolve.nx`,
+  `test_symtab.nx`. Bucket C — these fixtures load bootstrap compiler
+  internal modules and exercise them as Nexus libraries; they are the
+  self-host compiler's own test corpus and depend on the `src/` layout.
+- `compile_fixture_via_nxc{_should_fail}` driven cases: every test in
+  `nxc/codegen.rs` that reads back a `nxc_test_*.wasm` artifact and
+  validates it via `wasmparser` / runs it via `wasmtime::Module`
+  (`codegen_validate_wasm_output`, `exn_field_order_regression`,
+  `funcref_arity2_handler_vtable_via_nxc`, `simd_autovectorize_acceptance`,
+  `simd_lane_op_coverage_acceptance`, `wasm_alloc_pure_nexus_acceptance`,
+  `string_pure_nexus_acceptance`, `collection_nx_parity_acceptance`,
+  `runtime_mem_safe_oob_raises_specific_exception`,
+  `runtime_mem_math_intrinsics_dispatch`,
+  `math_pure_nexus_integer_ops_acceptance`,
+  `compile_fixture_via_nxc_is_thread_safe`,
+  `main_throws_unwrappable_rejected_by_self_host`,
+  `main_throws_wrap_emits_variant_and_exits`,
+  `nxc_f64_compare_in_main_entry_if`). The contract these tests verify
+  is "the self-host bootstrap binary compiles this fixture and produces
+  WASM with property X" — observable only through the Rust harness's
+  subprocess + wasmparser inspection path.
+- `exec_threaded` cases: `lazy_threaded_atomic_alloc`,
+  `lazy_threaded_capture_bearing_forces`,
+  `lazy_threaded_heap_reset_reclaims_worker_allocations`. The threaded
+  exec harness wires up a host-imported shared memory + per-instance
+  `LazyRuntime::with_shared_memory`; the standalone `nexus build`
+  runtime does not provide this mode.
+- `exec_with_stdlib_core_should_trap` cases: `chan_recv_before_send_traps`
+  asserts the trap message contains "empty" — substring match on a trap
+  reason is a Rust-side observation; the standalone runtime surfaces
+  trap-vs-exit only.
+- Capability-bearing-main fixtures (`require { Console }` /
+  `require { PermConsole }`): `lazy_thunk_syntax`, `lazy_stdlib_combinators`
+  exercise `std:lazy` combinators, `inject_try_catch_compiles` exercises
+  `inject ... do try ... catch end end`, `nxc_f64_compare_in_main_entry_if`
+  uses `Console.println` to surface 6 arms. The `safe_run` scaffold under
+  `tests/` cannot wrap a capability-bearing main cleanly (same constraint
+  documented under runtime/functions.rs and runtime/strings.rs in earlier
+  batches).
+- Snapshot tests: `dump_lir_minimal_wasm` writes WASM bytes to `/tmp` and
+  prints byte counts — diagnostic-only, no assertion.
+
