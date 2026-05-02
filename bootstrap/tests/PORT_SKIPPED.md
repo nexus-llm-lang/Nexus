@@ -904,6 +904,97 @@ runtime does not provide. proptest generators are also Rust-only.
   `fuzz_enum_many_variants_no_panic` — all skipped as proptest +
   catch_unwind Bucket C.
 
+# Skipped ports — bootstrap/tests/parse (batch 11)
+
+## parse/mod.rs (35 tests)
+
+All Bucket C. parse/mod.rs imports `nexus::lang::ast` (RdrName, Expr,
+Pattern, Sigil, Stmt, TopLevel, Type, UnaryOp, BinaryOp, etc.) and walks
+the parsed `Program` to assert specific node shapes — there is no
+Nexus-language surface for "the AST has a `Type::List` for the `[i64]`
+syntax" or "this `match` arm has a `Pattern::Or` with three alternatives".
+Negative `should_fail_parse` cases (parse-level rejection of `enum`,
+`pub import`, empty fn body, expression-position pipe) cannot use the
+`tests/fixtures/typecheck/<name>.nx` runner shape because that fixture
+runner expects parsing to succeed and typechecking to fail; a
+parse-error fixture runner doesn't exist yet.
+
+- AST-introspection (Bucket C — Rust API):
+  `parse_list_type_is_builtin`, `parse_list_expr_is_builtin`,
+  `parse_import_qualified_std_path`, `parse_import_external_qualified`,
+  `parse_import_third_party_package`, `parse_import_as_alias`,
+  `parse_linear_list_literal`, `parse_empty_linear_list_literal`,
+  `parse_selective_catch_multi_arm`,
+  `parse_bare_catch_with_param_binds_exception_value`,
+  `parse_match_with_pipe_arm_separator`,
+  `parse_catch_with_pipe_arm_separator`,
+  `parse_match_or_pattern_two_alts`,
+  `parse_match_or_pattern_three_alts`, `parse_catch_or_pattern`,
+  `parse_record_literal_punning_bare_ident`,
+  `parse_record_pattern_punning_bare_ident`,
+  `parse_record_literal_punning_sigil`,
+  `parse_record_literal_punning_borrow`,
+  `parse_record_literal_mixed_pun_rename_and_sigil`,
+  `parse_record_literal_mixed_pun_and_rename`,
+  `parse_record_pattern_punning_with_open_rest`,
+  `parse_record_literal_explicit_form_still_works`,
+  `parse_record_literal_computed_rhs_does_not_pun`,
+  `parse_exception_group_def`, `parse_unary_neg_var`,
+  `parse_unary_neg_binds_tighter_than_mul`,
+  `parse_unary_not_binds_tighter_than_andand`,
+  `parse_unary_neg_int_literal`.
+- Parse-level negatives (Bucket C — no parse-error fixture runner):
+  `parse_enum_declaration_syntax_is_rejected`,
+  `parse_empty_fn_body_is_error`,
+  `parse_pub_import_syntax_is_rejected`,
+  `parse_pipe_in_expression_position_is_a_parse_error`.
+- Meta-tests (Bucket C — disk walks of repo files):
+  `parse_all_examples` (parses every `.nx` under `examples/`),
+  `parse_frontend_parser_files_with_pun_extensions` (loads
+  `bootstrap/tests/fixtures/parser/*.nx` and asserts they parse).
+
+# Skipped ports — bootstrap/tests/harness (batch 11)
+
+## harness/{builder,compile,execute,fixture,mod,typecheck}.rs (0 tests)
+
+Bucket C by definition — these files contain no `#[test]` items. They are
+the integration-test infrastructure (`compile`, `try_compile`, `exec`,
+`exec_with_stdlib`, `read_fixture`, `should_typecheck`, `TestRunner`,
+etc.) that every other test under `bootstrap/tests/` depends on. There
+is nothing to port; the equivalent in `tests/` is the implicit `nexus
+build` + standalone runtime path.
+
+# Skipped ports — bootstrap/tests/unit (batch 11)
+
+## unit/{driver_polyglot,driver_repl,driver_typecheck,launcher,string_heap,mod}.rs (13 tests)
+
+All Bucket C. The unit/* tests fall into two families:
+
+1. **Subprocess drivers** (`driver_polyglot`, `driver_repl`,
+   `driver_typecheck`, `launcher`): build a self-hosted compiler binary,
+   spawn it as a child process via `std::process::Command`, write to its
+   stdin, and assert on exit status / stdout / stderr. The launcher
+   tests additionally synthesise polyglot launcher binaries by
+   concatenating header + payload bytes and `chmod +x`-ing them. This is
+   inherently a process-driver harness — Nexus has no `Process`
+   capability that lets a fixture spawn a sibling and observe its output.
+2. **Rust-API state inspection** (`string_heap`): calls
+   `nexus::runtime::string_heap::{retain, release, concat, ...}` directly
+   and asserts on internal refcounts, freed-slot reuse, and UTF-8 /
+   handle validation error variants. No Nexus-language way to observe
+   the runtime's internal string-table state.
+
+The driver_*/launcher tests were noted earlier in this file (under "##
+unit/driver_*.rs, unit/launcher.rs"); this section adds `string_heap.rs`
+to the same bucket:
+
+- `string_heap_retain_and_release_updates_refcount_and_frees_slot`,
+  `string_heap_concat_produces_new_string_handle`,
+  `string_heap_freed_slot_is_reused`,
+  `string_heap_invalid_utf8_is_reported`,
+  `string_heap_unknown_handle_is_rejected` — Rust API on the host-side
+  string heap.
+
 # Skipped ports — bootstrap/tests/ir (batch 11)
 
 ## ir/{hir,mir,lir,lir_opt}.rs (30 tests)
