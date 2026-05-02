@@ -660,3 +660,55 @@ Negative `should_fail_typecheck` (no insta) ported as fixtures:
 - `test_linear_created_inside_try_across_throwable_call_rejects` →
   `linearity_created_inside_try_across_throwable_call.nx`.
 
+## typecheck/exhaustiveness.rs (batch 10)
+
+Positive `should_typecheck` tests ported as runnable .nx (one file per
+logical group). Negative `should_fail_typecheck` tests deposited as
+fixture pairs for the future driver harness.
+
+- `test_nested_result_exhaustive` →
+  `typecheck_exhaustiveness_nested_result_test.nx`.
+- `test_bool_exhaustive` → `typecheck_exhaustiveness_bool_test.nx`.
+- `test_wildcard_exhaustive` →
+  `typecheck_exhaustiveness_wildcard_test.nx`.
+- `test_record_exhaustive` →
+  `typecheck_exhaustiveness_record_test.nx`.
+- `test_or_pattern_covers_all_constructors_is_exhaustive`,
+  `test_or_pattern_alternatives_with_same_binding_typechecks` (combined
+  with the implicit positive of `test_enum_exhaustive`) →
+  `typecheck_exhaustiveness_enum_or_pattern_test.nx`.
+
+Negative `should_fail_typecheck` ported as fixtures:
+
+- `test_nested_result_non_exhaustive` →
+  `exhaustiveness_nested_result_non_exhaustive.nx`.
+- `test_bool_non_exhaustive` →
+  `exhaustiveness_bool_non_exhaustive.nx`.
+- `test_int_non_exhaustive` → `exhaustiveness_int_non_exhaustive.nx`.
+- `test_record_non_exhaustive` →
+  `exhaustiveness_record_non_exhaustive.nx`.
+- `test_or_pattern_missing_constructor_is_non_exhaustive` →
+  `exhaustiveness_or_pattern_missing_constructor.nx`.
+- `test_or_pattern_alternatives_must_bind_same_variables` →
+  `exhaustiveness_or_pattern_diff_bindings.nx`.
+
+Skipped (Bucket C — programmatic AST construction):
+
+- `test_enum_exhaustive`, `test_enum_non_exhaustive` — both build a
+  `Program` with `EnumDef`/`MatchCase` AST nodes in Rust via
+  `color_program_with_cases` and call `TypeChecker::check_program`
+  directly. The positive case is folded into
+  `typecheck_exhaustiveness_enum_or_pattern_test.nx` via concrete
+  `type Color = Red | Green | Blue` surface syntax; the negative
+  `Red`-only case is subsumed by the existing
+  `exhaustiveness_or_pattern_missing_constructor.nx` fixture.
+
+Skipped (Bucket C — proptest):
+
+- `prop_enum_any_proper_subset_is_non_exhaustive`,
+  `prop_bool_exhaustiveness` — proptest harness drives random subsets
+  through the same Rust-AST builder. The deterministic positive cases
+  are already covered by the surface-level ports above; the
+  proptest's "every proper subset is non-exhaustive" coverage cannot
+  be expressed without `--emit-json` for typecheck diagnostics.
+
