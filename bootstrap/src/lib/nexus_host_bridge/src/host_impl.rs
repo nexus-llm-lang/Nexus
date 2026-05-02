@@ -20,7 +20,7 @@
 //! Mixing `s32` boolean and `s64` handle is intentional: WIT `bool` would lower
 //! the same way as `s32` 1/0, but explicit `s32` keeps the WIT signature stable
 //! for both component-model and core-WASM (stub) callers (see `bundler.rs`
-//! `merge_remaining_stubs`, `nxlib/stdlib/nexus_host_stub.wat`).
+//! `merge_remaining_stubs`, `nxlib/stdlib/internal/nexus_host_stub.wat`).
 //!
 //! ## Canonical headers wire format
 //!

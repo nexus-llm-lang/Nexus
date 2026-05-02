@@ -452,7 +452,7 @@ use wasm_encoder::ValType::{I32, I64};
 /// - multi-value string   → i32 ptr+len with retptr (i32) for canonical lowering
 ///
 /// This array is the single source of truth for the stub-merge path. The same
-/// signatures appear in `nxlib/stdlib/nexus_host_stub.wat` (handwritten WAT
+/// signatures appear in `nxlib/stdlib/internal/nexus_host_stub.wat` (handwritten WAT
 /// stub) and `bootstrap/src/lib/nexus_host_bridge/wit/world.wit` (component
 /// build); a regression in any of those files is caught by
 /// `host_http_abi_pinned_signatures` in this module's tests.
