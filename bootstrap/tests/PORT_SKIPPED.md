@@ -803,3 +803,104 @@ Skipped (Bucket C — proptest):
   examples in batch-7/8 inference and linear ports plus the new
   `typecheck_effects_*` files above.
 
+## capabilities/permissions.rs (batch 10)
+
+Bucket C in full. Every test calls `ExecutionCapabilities::deny_all()`
+and `caps.validate_program_requires(...)` — capability validation is a
+runtime API, not a Nexus-language surface. The .nx companion would have
+to be driven from Rust to set deny/allow flags before exec; the
+self-host equivalent will need to come through `nexus exec
+--allow-net` / `--deny-net` flag wiring, which is currently absent
+from the standalone harness.
+
+- `static_capability_check_rejects_missing_net`,
+  `static_capability_check_passes_when_net_allowed`,
+  `static_capability_check_rejects_multiple_missing`,
+  `no_requires_clause_passes_with_deny_all` — all four call
+  `validate_program_requires` against an `ExecutionCapabilities` value
+  constructed in Rust. No surface syntax. Skipped permanently.
+
+## typecheck/ffi.rs (batch 10)
+
+Bucket C in full. Every positive `should_typecheck` test references a
+fictitious `import external "math.wasm"` / `"time.wasm"` /
+`"core.wasm"` that has no resolvable WASM linkage target — the test is
+implicitly typecheck-only by design. The single negative
+(`test_ffi_unintroduced_type_var_errors`) is `insta::assert_snapshot!`.
+Real FFI is exercised end-to-end via `import external "std:collections"`
+in `tests/stdlib/stdlib_array_basic_test.nx`.
+
+- `test_ffi_declaration`, `test_ffi_effectful`,
+  `test_ffi_explicit_type_params`,
+  `test_ffi_concrete_types_no_type_params_needed` — typecheck-only
+  against fictitious extern WASM modules; no runtime exercise possible
+  in standalone .nx form.
+- `test_ffi_mismatch` — `should_fail_typecheck` without insta but the
+  surface contract (mismatched arg type to extern) is the same as
+  `inference_arg_mismatch.nx` already covered by batch 7.
+- `test_ffi_unintroduced_type_var_errors` — `insta::assert_snapshot!`,
+  Bucket C.
+
+## typecheck/error_snapshots.rs (batch 10)
+
+Bucket C in full (>95%). Every test in this file is structured as
+`should_fail_typecheck` + `insta::assert_snapshot!(err)`. The whole
+purpose of the file is to lock the diagnostic *text* via insta — by
+definition that is Rust-harness-bound and not a Nexus-language
+surface. The underlying error-shape contracts (type mismatch on
+return / let / arg, undefined identifier, arity, linear-misuse, effect
+leak, exhaustiveness, ref/mutability, capability missing, constructor
+shape, implicit non-unit return) are all already covered by
+deterministic fixture pairs scattered across batches 7/8 and the new
+`typecheck_effects_*` / `typecheck_exhaustiveness_*` / `linearity_*`
+fixtures above. The 18 snapshot tests provide no signal that the
+fixture pairs do not.
+
+- `snapshot_type_mismatch_return`,
+  `snapshot_type_mismatch_let_annotation`,
+  `snapshot_type_mismatch_function_arg`,
+  `snapshot_type_mismatch_if_branches`,
+  `snapshot_type_mismatch_match_arms`,
+  `snapshot_undefined_variable`,
+  `snapshot_undefined_function`,
+  `snapshot_undefined_type`,
+  `snapshot_too_few_args`,
+  `snapshot_too_many_args`,
+  `snapshot_wrong_arg_label`,
+  `snapshot_linear_unconsumed`,
+  `snapshot_linear_double_consume`,
+  `snapshot_linear_branch_mismatch`,
+  `snapshot_effect_leak_pure_calls_impure`,
+  `snapshot_raise_without_throws`,
+  `snapshot_match_non_exhaustive_option`,
+  `snapshot_match_non_exhaustive_bool`,
+  `snapshot_match_non_exhaustive_enum`,
+  `snapshot_assign_to_immutable`,
+  `snapshot_ref_type_mismatch_on_assign`,
+  `snapshot_missing_permission`,
+  `snapshot_unknown_constructor`,
+  `snapshot_constructor_wrong_field_count`,
+  `snapshot_non_unit_function_without_return` — all skipped as
+  `insta::assert_snapshot!` Bucket C.
+
+## typecheck/fuzz.rs (batch 10)
+
+Bucket C in full. Every test wraps `parser::parser().parse(src)` +
+`TypeChecker::check_program` inside `std::panic::catch_unwind` and
+proptest-generates random ASCII / keyword soup / structurally-valid
+fragments to assert the typechecker never panics. The contract is
+"the Rust process did not abort" — there is no Nexus-language way to
+observe a panic short of a deny-all wrap that the standalone
+runtime does not provide. proptest generators are also Rust-only.
+
+- `fuzz_random_ascii_no_panic`,
+  `fuzz_random_keyword_soup_no_panic`,
+  `fuzz_valid_let_binding_no_panic`,
+  `fuzz_valid_function_def_no_panic`,
+  `fuzz_deeply_nested_if_no_panic`,
+  `fuzz_deeply_nested_match_no_panic`,
+  `fuzz_many_params_no_panic`,
+  `fuzz_many_type_params_no_panic`,
+  `fuzz_enum_many_variants_no_panic` — all skipped as proptest +
+  catch_unwind Bucket C.
+
