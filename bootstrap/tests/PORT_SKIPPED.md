@@ -137,11 +137,11 @@ snapshots. Only the small subset that asserts Nexus-observable behavior
 
 ## errors.rs
 
-- `snapshot_codegen_error_unsupported_external` — uses
-  `insta::assert_snapshot!` to capture the codegen error string verbatim.
-  Snapshot infra is Rust-only; the underlying assertion (external imports
-  reject `wasm` extension) is better expressed as a future
-  `bootstrap/tests/fixtures/codegen/` negative fixture if needed.
+- `snapshot_codegen_error_unsupported_external` — the `insta` snapshot is
+  Bucket C (Rust-only), but the underlying assertion is now expressed as a
+  standalone fixture: `bootstrap/tests/fixtures/codegen/external_record_return_unsupported.nx`
+  + `.expected_error.txt` (substring match for "external return type").
+  The snapshot test still pins the exact error string at the Rust layer.
 
 ## structure.rs
 
@@ -903,6 +903,36 @@ runtime does not provide. proptest generators are also Rust-only.
   `fuzz_many_type_params_no_panic`,
   `fuzz_enum_many_variants_no_panic` — all skipped as proptest +
   catch_unwind Bucket C.
+
+# Skipped ports — bootstrap/tests/ir (batch 11)
+
+## ir/{hir,mir,lir,lir_opt}.rs (30 tests)
+
+Bucket C in full (with one fixturized exception, see below). `ir/*.rs`
+either:
+
+- Calls `nexus::ir::*::lower_*` directly and runs `insta::assert_snapshot!`
+  on the resulting IR pretty-print (`snapshot_hir_*`, `snapshot_mir_*`,
+  `snapshot_lir_*`) — IR shape and snapshot infra are Rust-only.
+- Walks the LIR pre/post the optimizer pass to assert that pattern-binding
+  references are preserved (`opt_preserves_pattern_binding_refs_*`,
+  `opt_preserves_refs_in_*`, `opt_full_compile_*`) — these reach into
+  `LirAtom`, `LirExpr`, `LirStmt`, `LirFunction` types directly to traverse
+  refs/defs sets. No Nexus-language surface for "every Symbol referenced
+  after optimization is also defined."
+- Asserts mutual / branch tail-call lowering produces specific
+  `LirExpr::TailCall` nodes (`mutual_recursion_produces_tail_call_in_lir`,
+  `tail_call_in_if_else_branches`, `snapshot_lir_tail_call`) — IR
+  introspection.
+
+Fixturized:
+
+- `ir/hir.rs::top_level_let_with_call_initializer_is_rejected` →
+  `bootstrap/tests/fixtures/ir/top_level_let_with_call_initializer_rejected.nx`
+  + `.expected_error.txt`. The Rust test pattern-matches
+  `HirBuildError::UnsupportedTopLevelLet` directly; the fixture's
+  `.expected_error.txt` substring-matches the offending binding name
+  (`start_time`) which the error message must contain.
 
 # Skipped ports — bootstrap/tests/nxc (batch 11)
 
