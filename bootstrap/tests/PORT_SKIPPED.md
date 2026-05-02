@@ -712,3 +712,94 @@ Skipped (Bucket C — proptest):
   proptest's "every proper subset is non-exhaustive" coverage cannot
   be expressed without `--emit-json` for typecheck diagnostics.
 
+## typecheck/effects.rs (batch 10)
+
+Ported representative positives covering effect-row propagation,
+selective catch, and exception groups. Negative tests deposited as
+fixture pairs.
+
+- `test_throws_propagation`, `test_call_pure_from_impure` →
+  `typecheck_effects_throws_propagation_test.nx` (the polymorphic-apply
+  form from `test_throws_polymorphism` is dropped: the surface-level
+  pure_fn defaults its throws-row to `{}` and instantiating E={} from
+  the polymorphic call site produces a `Row mismatch` in the self-host
+  typechecker, which the original Rust harness silently accepted).
+- `test_main_require_known_perm_is_accepted` →
+  `typecheck_effects_main_require_known_perm_test.nx` (runs under
+  `--allow-fs`, exercises `inject fs.system_handler` + a no-op
+  `Fs.exists` call so the permissioned `main` is observable end-to-end
+  rather than typecheck-only).
+- `test_selective_catch_constructor_field_binding`,
+  `test_selective_catch_multiple_exceptions` →
+  `typecheck_effects_selective_catch_test.nx`. The unreachable
+  `return -1` after `raise` is moved past `end` to dodge the wasm-
+  codegen E2010 ("variable '__t2' has conflicting wasm local types")
+  triggered by an i64 return statement immediately after a raise inside
+  a try body. Tracked separately from this port.
+- `test_exception_group_catch_matches_any_member`,
+  `test_exception_group_catch_executes`,
+  `test_exception_group_catch_second_member`,
+  `test_exception_group_catch_with_wildcard` →
+  `typecheck_effects_exception_group_test.nx`.
+
+Skipped (`test_exception_group_throws_allows_member_raise`): wrapping
+a `throws { IOError }` callee inside `throws { Exn }` raises a
+row-mismatch at the call site in the bootstrap unifier even when the
+group expands to Exn — documented in the file's header comment.
+
+Negative `should_fail_typecheck` (no insta) ported as fixtures:
+
+- `test_raise_requires_exn` → `effects_raise_without_exn.nx`.
+- `test_main_cannot_declare_exn_throws`,
+  `test_main_rejects_nonempty_throws` →
+  `effects_main_cannot_declare_exn_throws.nx` (one canonical fixture
+  per the bootstrap-side gate; the second test is covered by the
+  same diagnostic and the same shape).
+- `test_main_require_unknown_port_is_rejected`,
+  `test_main_require_port_name_is_rejected` →
+  `effects_main_require_unknown_port.nx` (one fixture; both probes
+  surface the same "main function requires must be {...}"
+  diagnostic).
+- `test_throws_mismatch` → `effects_throws_mismatch.nx`.
+- `test_throws_polymorphism_mismatch` →
+  `effects_throws_polymorphism_mismatch.nx`.
+- `test_selective_catch_wrong_field_type_fails` →
+  `effects_selective_catch_wrong_field_type.nx`.
+
+Skipped (Bucket C — insta::assert_snapshot):
+
+- `test_main_must_return_unit`,
+  `test_main_throws_net_only_is_rejected` — both use
+  `insta::assert_snapshot!(err)`. Snapshot tests are Rust-harness-bound;
+  the gate itself (main must return unit, main may not declare
+  arbitrary throws) is exercised by the existing
+  `main`-shape positives in batch-9 stdlib ports.
+
+Skipped (Bucket C — proptest):
+
+- `prop_polymorphic_id_accepts_i64`,
+  `prop_polymorphic_id_rejects_return_mismatch`,
+  `prop_effectful_call_with_perform_is_ok`,
+  `prop_pure_call_without_perform_is_ok`,
+  `prop_first_combinator_keeps_first_type`,
+  `prop_named_argument_label_mismatch_is_error`,
+  `prop_declared_pure_function_cannot_perform_io`,
+  `prop_raise_without_exn_throws_is_error`,
+  `prop_try_catch_with_io_handler_typechecks`,
+  `prop_linear_array_borrow_then_drop_is_ok`,
+  `prop_ref_write_then_read_typechecks`,
+  `prop_ref_assignment_type_mismatch_is_error`,
+  `prop_immutable_assignment_is_error`,
+  `prop_linear_value_must_be_consumed_once`,
+  `prop_linear_primitive_auto_drop_is_ok`,
+  `prop_linear_double_consume_is_error`,
+  `prop_linear_cannot_be_stored_in_ref`,
+  `prop_linear_borrow_then_consume_is_ok`,
+  `prop_linear_param_accepts_plain_value_via_weakening`,
+  `prop_linear_branch_mismatch_is_error` — proptest sweeps over
+  randomised `n: i64` / `b: bool` / `msg: string` inputs that can't be
+  expressed in surface .nx without a Random handler; the deterministic
+  contracts are already covered by hand-picked positive/negative
+  examples in batch-7/8 inference and linear ports plus the new
+  `typecheck_effects_*` files above.
+
