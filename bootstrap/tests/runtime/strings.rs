@@ -208,7 +208,7 @@ end
 fn heap_reset_reclaims_string_allocations_in_loop() {
     exec_with_stdlib(
         r#"
-import { heap_mark, heap_reset } from "std:arena"
+import { heap_mark, heap_reset } from "std:runtime/arena"
 import { length, substring, concat, repeat } from "std:str"
 
 let main = fn () -> unit do

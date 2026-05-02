@@ -903,7 +903,7 @@ fn funcref_arity2_handler_vtable_via_nxc() {
     );
 }
 
-/// nexus-dvr6.9.2 acceptance: pure-Nexus `nxlib/stdlib/wasm_alloc.nx` bump
+/// nexus-dvr6.9.2 acceptance: pure-Nexus `nxlib/stdlib/runtime/alloc.nx` bump
 /// allocator compiles + runs end-to-end via the self-hosted compiler.
 /// The fixture covers all four acceptance assertions in one stdout-interleave
 /// check so a silently-dropped intrinsic dispatch fails the line count, not

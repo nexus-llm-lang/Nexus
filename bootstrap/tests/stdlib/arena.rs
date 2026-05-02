@@ -98,7 +98,7 @@ fn arena_100k_echo_workload_g0_bounded_with_reset() {
     let mut src = String::from(
         r#"
 import { Console }, * as stdio from "std:stdio"
-import { heap_mark, heap_reset } from "std:arena"
+import { heap_mark, heap_reset } from "std:runtime/arena"
 import { length, from_i64, substring } from "std:str"
 
 let simulate_echo_handler = fn (i: i64) -> i64 do
@@ -160,7 +160,7 @@ fn arena_echo_workload_g0_grows_without_reset() {
     let mut src = String::from(
         r#"
 import { Console }, * as stdio from "std:stdio"
-import { heap_mark } from "std:arena"
+import { heap_mark } from "std:runtime/arena"
 import { length, from_i64, substring } from "std:str"
 
 let simulate_echo_handler = fn (i: i64) -> i64 do
@@ -229,7 +229,7 @@ fn arena_cross_crate_fs_string_workload_bounded_with_reset() {
         r#"
 import { Console }, * as stdio from "std:stdio"
 import { Fs }, * as fs_mod from "std:fs"
-import { heap_mark, heap_reset } from "std:arena"
+import { heap_mark, heap_reset } from "std:runtime/arena"
 import { length, from_i64, substring } from "std:str"
 "#,
     );
@@ -292,7 +292,7 @@ fn arena_cross_crate_fs_string_workload_grows_without_reset() {
         r#"
 import { Console }, * as stdio from "std:stdio"
 import { Fs }, * as fs_mod from "std:fs"
-import { heap_mark } from "std:arena"
+import { heap_mark } from "std:runtime/arena"
 import { length, from_i64, substring } from "std:str"
 "#,
     );

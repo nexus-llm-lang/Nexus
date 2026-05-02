@@ -61,21 +61,36 @@ pub fn is_package_wit_module(module_name: &str) -> bool {
 static PACKAGE_PROGRAMS_CACHE: LazyLock<Mutex<Option<Vec<(PathBuf, Program)>>>> =
     LazyLock::new(|| Mutex::new(None));
 
-/// List `.nx` files in `dir` in lexical order. Used to enumerate a package's
-/// modules for typecheck/HIR pre-loading.
+/// List `.nx` files under `dir` recursively, in lexical order. Used to
+/// enumerate a package's modules for typecheck/HIR pre-loading.
+///
+/// Recursion is required because some packages organise modules into
+/// subdirectories (e.g. `std:runtime/mem` -> `nxlib/stdlib/runtime/mem.nx`)
+/// and pre-registered types/exceptions exported from those nested modules
+/// must be visible to the type checker.
 pub fn list_nx_paths(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    collect_nx_paths(dir, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_nx_paths(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries =
         fs::read_dir(dir).map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?;
-    let mut paths = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read {} entry: {}", dir.display(), e))?;
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("nx") {
-            paths.push(path);
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to stat {}: {}", path.display(), e))?;
+        if file_type.is_dir() {
+            collect_nx_paths(&path, out)?;
+        } else if path.extension().and_then(|s| s.to_str()) == Some("nx") {
+            out.push(path);
         }
     }
-    paths.sort();
-    Ok(paths)
+    Ok(())
 }
 
 /// Parses every `.nx` file in every registered package and returns
