@@ -877,6 +877,61 @@ fn simd_lane_op_coverage_acceptance() {
     }
 }
 
+/// nexus-s60w: wires `i64x2_add_array` and `f64x2_add_array` into the
+/// codegen SIMD dispatch table. Two-pronged check matching the iesh
+/// pattern:
+///   1. Bytecode scan: i64x2.add (sub 0xCE) and f64x2.add (sub 0xF0)
+///      must each appear at least once in the compiled wasm. Catches a
+///      regression where dispatch silently falls back to a function
+///      call — the runtime check would still pass for f64x2.add
+///      (determinism gate) but no 0xFD-prefixed instruction would be
+///      emitted.
+///   2. Runtime: each printed line is a 64-byte agreement count between
+///      the SIMD path and either a scalar reference (i64) or a second
+///      SIMD pass on the same input (f64 — no scalar f-arith reference
+///      at this layer). 64 means perfect byte-for-byte match.
+#[test]
+fn simd_add_array_acceptance() {
+    let fixture = "bootstrap/tests/fixtures/nxc/test_simd_add_array.nx";
+
+    let wasm = compile_fixture_via_nxc(fixture);
+
+    // (i64x2.add = sub 0xCE) — used by i64x2_add_array.
+    let n_i64x2_add = count_simd_op_uses(&wasm, 0xCE);
+    assert!(
+        n_i64x2_add >= 1,
+        "expected >= 1 i64x2.add (0xCE) use, found {n_i64x2_add} \
+         — dispatch may have fallen back to a function call"
+    );
+    // (f64x2.add = sub 0xF0) — used by f64x2_add_array. Twice (two
+    // determinism passes), so require >= 2 to also catch a regression
+    // where only one of the two intrinsic calls inlines.
+    let n_f64x2_add = count_simd_op_uses(&wasm, 0xF0);
+    assert!(
+        n_f64x2_add >= 2,
+        "expected >= 2 f64x2.add (0xF0) uses, found {n_f64x2_add}"
+    );
+
+    let out = exec_nxc_core_capture_stdout(fixture);
+    let lines: Vec<&str> = out.lines().map(str::trim).collect();
+    let expected = ["64", "64"];
+    assert_eq!(
+        lines.len(),
+        expected.len(),
+        "expected {} lines, got {} — full stdout:\n{}",
+        expected.len(),
+        lines.len(),
+        out
+    );
+    for (i, want) in expected.iter().enumerate() {
+        assert_eq!(
+            lines[i], *want,
+            "line {i} mismatch: want {want:?}, got {:?} — full stdout:\n{out}",
+            lines[i]
+        );
+    }
+}
+
 /// Regression for nexus-pt8g: arity-N (N >= 1) top-level fn references
 /// stored as record fields (handler-vtable shape) used to trip
 /// `lookup_closure_type_idx_pairs` with E3001 because
