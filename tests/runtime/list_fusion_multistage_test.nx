@@ -1,0 +1,318 @@
+// Acceptance test for multi-stage build/foldr fusion (issue nexus-qzl0).
+//
+// Stream fusion rewrites `foldr(k, z, build(g))` to `g(k, z)`. The
+// per-scope sweep runs in a fixed-point loop: re-run sweep+orphan-drop
+// until a pass produces zero orphans, so multi-stage chains in the same
+// scope all collapse.
+//
+// LIR shape exercised here (one main_fn, two independent build/foldr
+// pairs side by side):
+//
+//   let g1 = MakeClosure(g_a_fn, [])
+//   let g2 = MakeClosure(g_b_fn, [])
+//   let k1 = MakeClosure(k_pure_fn, [])
+//   let k2 = MakeClosure(k_pure_fn, [])
+//   let z1 = 0
+//   let z2 = 0
+//   let xs1 = Call("...#build", [g=g1])
+//   let xs2 = Call("...#build", [g=g2])
+//   let r1  = Call("...#foldr", [xs=xs1, init=z1, f=k1])
+//   let r2  = Call("...#foldr", [xs=xs2, init=z2, f=k2])
+//   let s   = r1 + r2
+//
+// After the optimisation pipeline:
+//   * Both r1 and r2 are LirExprCallClosure (fusion fired on each pair).
+//   * Both `xs1 = build(...)` and `xs2 = build(...)` Lets are gone (the
+//     orphan-drop step dropped them, and there are zero residual build
+//     calls — i.e. the LIR is allocation-free for these chains).
+//
+// This shape captures the most common multi-stage pattern arising from
+// the build/foldr-form stdlib helpers (`map_b`, `filter_b`, etc.) after
+// monomorphisation flattens them into a single scope. The independent-
+// pair case fires in one sweep; the fixed-point driver also catches
+// chains where one orphan-drop unblocks another fusion site by removing
+// a multi-use reference, which a single sweep would silently miss.
+import * as test_assert from "std:test/assert"
+import { TyI64, OpAdd } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { LirProgram, LirFunction, LirParam, LirAtomInt, LirAtomVar, LirExpr, LirExprAtom, LirExprBinary, LirExprCall, LirExprCallClosure, LirExprMakeClosure, LirCallArg, LirStmt, LirStmtLet } from "src/ir/lir_types.nx"
+import { analyze_effects } from "src/backend/effect_analysis.nx"
+import { optimize_lir_with_effects } from "src/ir/lir_opt.nx"
+import { Option, Some, None } from "std:option"
+
+let dummy_span = fn () -> Span do
+  return Span(offset: 0, line: 1, col: 1)
+end
+
+// Pure k: returns val + acc. Effect analysis sees only LirExprBinary so
+// is_pure = true (matching list_fusion_test.nx's pure-k contract).
+let make_pure_k = fn (name: string) -> LirFunction do
+  let stmts = [
+    LirStmtLet(
+      name: "r",
+      typ: TyI64,
+      expr: LirExprBinary(
+        op: OpAdd,
+        lhs: LirAtomVar(name: "val", typ: TyI64),
+        rhs: LirAtomVar(name: "acc", typ: TyI64),
+        typ: TyI64
+      )
+    )
+  ]
+  return LirFunction(
+    name: name,
+    params: [
+      LirParam(label: "val", name: "val", typ: TyI64),
+      LirParam(label: "acc", name: "acc", typ: TyI64)
+    ],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "r", typ: TyI64),
+    span: dummy_span()
+  )
+end
+
+// Generator function for build. Body is opaque from the test's POV.
+let make_g_fn = fn (name: string) -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyI64, expr: LirExprAtom(atom: LirAtomInt(val: 0)))
+  ]
+  return LirFunction(
+    name: name,
+    params: [
+      LirParam(label: "cons", name: "cons", typ: TyI64),
+      LirParam(label: "nil", name: "nil", typ: TyI64)
+    ],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "r", typ: TyI64),
+    span: dummy_span()
+  )
+end
+
+// Stub bodies for foldr / build so they appear in program.functions and
+// effect_analysis can resolve their names.
+let make_foldr_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyI64, expr: LirExprAtom(atom: LirAtomInt(val: 0)))
+  ]
+  return LirFunction(
+    name: "nxlib_stdlib_list_nx#foldr",
+    params: [
+      LirParam(label: "xs", name: "xs", typ: TyI64),
+      LirParam(label: "init", name: "init", typ: TyI64),
+      LirParam(label: "f", name: "f", typ: TyI64)
+    ],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "r", typ: TyI64),
+    span: dummy_span()
+  )
+end
+
+let make_build_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "r", typ: TyI64, expr: LirExprAtom(atom: LirAtomInt(val: 0)))
+  ]
+  return LirFunction(
+    name: "nxlib_stdlib_list_nx#build",
+    params: [LirParam(label: "g", name: "g", typ: TyI64)],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "r", typ: TyI64),
+    span: dummy_span()
+  )
+end
+
+// Construct a "main" function whose body chains TWO independent
+// build/foldr pairs. Each pair is structurally identical to the
+// single-stage test, just emitted side by side in the same scope.
+//
+//   let g1 = MakeClosure(g_a_fn, [])
+//   let g2 = MakeClosure(g_b_fn, [])
+//   let k1 = MakeClosure(k_pure_fn, [])
+//   let k2 = MakeClosure(k_pure_fn, [])
+//   let z1 = 0
+//   let z2 = 0
+//   let xs1 = Call("...#build", [g=g1])
+//   let xs2 = Call("...#build", [g=g2])
+//   let r1  = Call("...#foldr", [xs=xs1, init=z1, f=k1])
+//   let r2  = Call("...#foldr", [xs=xs2, init=z2, f=k2])
+//   let s   = r1 + r2
+let make_main_fn = fn () -> LirFunction do
+  let stmts = [
+    LirStmtLet(name: "g1", typ: TyI64,
+      expr: LirExprMakeClosure(func_name: "g_a_fn", captures: [], typ: TyI64)),
+    LirStmtLet(name: "g2", typ: TyI64,
+      expr: LirExprMakeClosure(func_name: "g_b_fn", captures: [], typ: TyI64)),
+    LirStmtLet(name: "k1", typ: TyI64,
+      expr: LirExprMakeClosure(func_name: "k_pure_fn", captures: [], typ: TyI64)),
+    LirStmtLet(name: "k2", typ: TyI64,
+      expr: LirExprMakeClosure(func_name: "k_pure_fn", captures: [], typ: TyI64)),
+    LirStmtLet(name: "z1", typ: TyI64, expr: LirExprAtom(atom: LirAtomInt(val: 0))),
+    LirStmtLet(name: "z2", typ: TyI64, expr: LirExprAtom(atom: LirAtomInt(val: 0))),
+    LirStmtLet(name: "xs1", typ: TyI64,
+      expr: LirExprCall(
+        func: "nxlib_stdlib_list_nx#build",
+        args: [LirCallArg(label: "g", value: LirAtomVar(name: "g1", typ: TyI64))],
+        typ: TyI64
+      )),
+    LirStmtLet(name: "xs2", typ: TyI64,
+      expr: LirExprCall(
+        func: "nxlib_stdlib_list_nx#build",
+        args: [LirCallArg(label: "g", value: LirAtomVar(name: "g2", typ: TyI64))],
+        typ: TyI64
+      )),
+    LirStmtLet(name: "r1", typ: TyI64,
+      expr: LirExprCall(
+        func: "nxlib_stdlib_list_nx#foldr",
+        args: [
+          LirCallArg(label: "xs", value: LirAtomVar(name: "xs1", typ: TyI64)),
+          LirCallArg(label: "init", value: LirAtomVar(name: "z1", typ: TyI64)),
+          LirCallArg(label: "f", value: LirAtomVar(name: "k1", typ: TyI64))
+        ],
+        typ: TyI64
+      )),
+    LirStmtLet(name: "r2", typ: TyI64,
+      expr: LirExprCall(
+        func: "nxlib_stdlib_list_nx#foldr",
+        args: [
+          LirCallArg(label: "xs", value: LirAtomVar(name: "xs2", typ: TyI64)),
+          LirCallArg(label: "init", value: LirAtomVar(name: "z2", typ: TyI64)),
+          LirCallArg(label: "f", value: LirAtomVar(name: "k2", typ: TyI64))
+        ],
+        typ: TyI64
+      )),
+    LirStmtLet(name: "s", typ: TyI64,
+      expr: LirExprBinary(
+        op: OpAdd,
+        lhs: LirAtomVar(name: "r1", typ: TyI64),
+        rhs: LirAtomVar(name: "r2", typ: TyI64),
+        typ: TyI64
+      ))
+  ]
+  return LirFunction(
+    name: "main_fn",
+    params: [],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "s", typ: TyI64),
+    span: dummy_span()
+  )
+end
+
+exception TestFailure(reason: string)
+
+// Locate a Let binding by name and return its expression.
+let find_let_expr = fn (body: [LirStmt], target: string) -> Option<LirExpr> do
+  match body do
+    | [] -> return None
+    | LirStmtLet(name: n, typ: _, expr: e) :: rest ->
+      if n == target then return Some(val: e) end
+      return find_let_expr(body: rest, target)
+    | _ :: rest -> return find_let_expr(body: rest, target)
+  end
+end
+
+let find_main_fn = fn (funcs: [LirFunction]) -> Option<LirFunction> do
+  match funcs do
+    | [] -> return None
+    | f :: rest ->
+      let LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) = f
+      if n == "main_fn" then return Some(val: f) end
+      return find_main_fn(funcs: rest)
+  end
+end
+
+let is_call_closure = fn (e: LirExpr) -> bool do
+  if let LirExprCallClosure(_) = e then return true end
+  return false
+end
+
+// Count remaining `Call("...#build", ...)` Lets in the body. After
+// fusion fires on every build/foldr pair the count must be 0.
+let count_build_lets = fn (body: [LirStmt]) -> i64 do
+  return count_build_lets_go(body, n: 0)
+end
+
+let count_build_lets_go = fn (body: [LirStmt], n: i64) -> i64 do
+  match body do
+    | [] -> return n
+    | LirStmtLet(name: _, typ: _, expr: e) :: rest ->
+      if let LirExprCall(func: f, args: _, typ: _) = e then
+        if f == "nxlib_stdlib_list_nx#build" then
+          return count_build_lets_go(body: rest, n: n + 1)
+        end
+      end
+      return count_build_lets_go(body: rest, n)
+    | _ :: rest -> return count_build_lets_go(body: rest, n)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  let prog = LirProgram(
+    functions: [
+      make_pure_k(name: "k_pure_fn"),
+      make_g_fn(name: "g_a_fn"),
+      make_g_fn(name: "g_b_fn"),
+      make_foldr_fn(),
+      make_build_fn(),
+      make_main_fn()
+    ],
+    externals: []
+  )
+
+  let em = analyze_effects(program: prog)
+  let opt = optimize_lir_with_effects(program: prog, effects: em)
+  let LirProgram(functions: funcs, externals: _) = opt
+
+  match find_main_fn(funcs) do
+    | None -> raise TestFailure(reason: "main_fn missing after optimisation")
+    | Some(val: f) ->
+      let LirFunction(name: _, params: _, ret_type: _, body: b, ret: _, span: _) = f
+
+      // Both pairs must have fired: r1 and r2 are CallClosure.
+      match find_let_expr(body: b, target: "r1") do
+        | None -> raise TestFailure(reason: "r1 let missing")
+        | Some(val: e) ->
+          test_assert.assert_true(
+            cond: is_call_closure(e),
+            label: "stage 1 (r1) fused: CallClosure"
+          )
+      end
+
+      match find_let_expr(body: b, target: "r2") do
+        | None -> raise TestFailure(reason: "r2 let missing")
+        | Some(val: e) ->
+          test_assert.assert_true(
+            cond: is_call_closure(e),
+            label: "stage 2 (r2) fused: CallClosure"
+          )
+      end
+
+      // Every orphan build was DCE-dropped: zero residual build calls.
+      // Pre-fusion count was 2; post-fusion + orphan-drop must be 0.
+      test_assert.assert_true(
+        cond: count_build_lets(body: b) == 0,
+        label: "all orphan build lets dropped (allocation-free post-fusion)"
+      )
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  // Trap on failure — non-zero exit signals FAIL to the runtime test runner.
+  let _ = 1 / ok
+  return ()
+end
