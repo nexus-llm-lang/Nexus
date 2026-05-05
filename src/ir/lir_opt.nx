@@ -5,8 +5,10 @@
  *
  * 0. Stream fusion (build/foldr): rewrites `foldr(k, z, build(g))` to
  *    `g(k, z)` when k is pure per the supplied EffectMap. Eliminates the
- *    intermediate list created by `build`. Entry point:
- *    `optimize_lir_with_effects`.
+ *    intermediate list created by `build`. Re-sweeps each scope to a
+ *    fixed point so multi-stage chains (e.g. map_b . filter_b . map_b)
+ *    collapse stage-by-stage as orphan-build drops unblock new fusion
+ *    sites. Entry point: `optimize_lir_with_effects`.
  * 1. Constant folding: evaluates binary ops on literal atoms at compile time
  * 2. Constant propagation + copy propagation: substitutes known bindings into
  *    use sites (literal constants AND variable-to-variable copies)
@@ -1440,13 +1442,57 @@ end
 // the build call's effects are subsumed by the rewritten CallClosure,
 // so the orphan can be erased without leaning on a higher-order purity
 // summary.
-let fus_rewrite_stmts_in = fn (stmts: [LirStmt], effects: EffectMap) -> [LirStmt] do
+//
+// One sweep collects orphans and drops them, but the act of dropping a
+// `let xs = build(g)` removes uses of `g` and of every variable g
+// captured. A previously multi-use variable can flip to single-use after
+// that drop, unblocking another foldr/build pair in the same scope. The
+// driver (`fus_rewrite_stmts_in`) therefore re-runs sweep+drop until the
+// pass produces zero orphans (multi-stage fixed point, issue qzl0).
+let fus_rewrite_stmts_one = fn (stmts: [LirStmt], effects: EffectMap) -> RewriteOnce do
   let defs = fus_collect_defs_stmts(stmts: stmts, acc: [])
   let uses = fus_count_uses_stmts(stmts: stmts, uses: [])
   let ctx = FusionCtx(defs: defs, uses: uses, effects: effects)
   let rewritten = fus_rewrite_stmts_go(stmts: stmts, ctx: ctx, acc: [], orphans: [])
   match rewritten do | RewriteResult(stmts: new_stmts, orphans) ->
-    return fus_drop_orphans(stmts: new_stmts, orphans, acc: [])
+    let dropped = fus_drop_orphans(stmts: new_stmts, orphans, acc: [])
+    return RewriteOnce(stmts: dropped, orphan_count: fus_orphan_count(orphans))
+  end
+end
+
+let fus_orphan_count = fn (orphans: [string]) -> i64 do
+  match orphans do
+    | [] -> return 0
+    | _ :: rest -> return 1 + fus_orphan_count(orphans: rest)
+  end
+end
+
+// One iteration's outcome: rewritten statement list plus how many distinct
+// orphan build-Lets the sweep dropped. Zero means no fusion fired this
+// round, which is the fixed-point signal.
+type RewriteOnce = RewriteOnce(stmts: [LirStmt], orphan_count: i64)
+
+// Multi-stage driver: keep sweeping until a pass produces zero orphans.
+// Each successful sweep strictly decreases the number of foldr/build
+// pairs in the scope (every orphan drop removes one build call), so the
+// loop terminates in at most `original-build-count` rounds.
+let fus_rewrite_stmts_in = fn (stmts: [LirStmt], effects: EffectMap) -> [LirStmt] do
+  return fus_rewrite_stmts_fixedpoint(stmts, effects, iterations: 0)
+end
+
+// Hard upper bound on iterations as a defence-in-depth: the strict
+// decrease argument above already guarantees termination, but a runaway
+// pass would be much harder to diagnose than a clean abort. The bound is
+// generous; real chains observed in self-host bootstrap top out at 3-4
+// stages per scope.
+let fus_max_iterations = fn () -> i64 do return 32 end
+
+let fus_rewrite_stmts_fixedpoint = fn (stmts: [LirStmt], effects: EffectMap, iterations: i64) -> [LirStmt] do
+  if iterations >= fus_max_iterations() then return stmts end
+  match fus_rewrite_stmts_one(stmts, effects) do
+    | RewriteOnce(stmts: new_stmts, orphan_count: n) ->
+      if n == 0 then return new_stmts end
+      return fus_rewrite_stmts_fixedpoint(stmts: new_stmts, effects, iterations: iterations + 1)
   end
 end
 
