@@ -2306,16 +2306,35 @@ impl TypeChecker {
             }
             Expr::Raise(ex) => {
                 let (s, t) = self.infer(env, ex, er, eq, ee)?;
+                // Capture the concrete variant name BEFORE unifying with Exn
+                // (unify may upcast t to Exn). Used to require the function's
+                // throws-row admit this specific variant rather than blanket Exn.
+                // (nexus-wm4w: prior behaviour required `Row([Exn], var)` literally,
+                // rejecting `throws { IndexOutOfBounds }` even when raising
+                // IndexOutOfBounds. Self-host check_call_throw_row_admitted handles
+                // subsumption correctly; this brings Stage 0 to parity.)
+                let raised_variant_name: Option<String> = match &t {
+                    Type::UserDefined(name, _) if name != "Exn" => Some(name.clone()),
+                    _ => None,
+                };
                 let exn_value_type = Type::UserDefined("Exn".into(), vec![]);
                 let ss = self
                     .unify(&t, &exn_value_type)
                     .map_err(|m| TypeError::new(m, ex.span.clone()))?;
                 let mut s = compose_subst(&s, &ss);
-                let exn_type = Type::UserDefined("Exn".into(), vec![]);
-                let required_eff = Type::Row(vec![exn_type], Some(Box::new(self.new_var())));
+                let required_name = raised_variant_name
+                    .clone()
+                    .unwrap_or_else(|| "Exn".to_string());
+                let required_member = Type::UserDefined(required_name.clone(), vec![]);
+                let required_eff = Type::Row(vec![required_member], Some(Box::new(self.new_var())));
                 let s_eff = self
                     .unify(&apply_subst_type(&s, ee), &required_eff)
-                    .map_err(|_| TypeError::new("raise requires 'Exn'", e.span.clone()))?;
+                    .map_err(|_| {
+                        TypeError::new(
+                            format!("raise requires '{}' in throws row", required_name),
+                            e.span.clone(),
+                        )
+                    })?;
                 s = compose_subst(&s, &s_eff);
                 Ok((s, self.new_var()))
             }
