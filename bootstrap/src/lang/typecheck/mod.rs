@@ -2212,7 +2212,12 @@ impl TypeChecker {
                         .collect(),
                     Box::new(self.convert_user_defined_to_var(ret_type, &vars_set)),
                     Box::new(self.convert_user_defined_to_var(requires, &vars_set)),
-                    Box::new(self.convert_user_defined_to_var(throws, &vars_set)),
+                    // Use expanded_throws (computed at line ~2146 with group expansion)
+                    // rather than the raw `throws` annotation, so the lambda's stored
+                    // scheme has groups expanded — matching Pass 1 behaviour at line 556.
+                    // Without this, narrow→narrow with group names tripped Row mismatch
+                    // because Pass 2's scheme retained the unexpanded form. (nexus-xhhq)
+                    Box::new(self.convert_user_defined_to_var(&expanded_throws, &vars_set)),
                 );
 
                 Ok((
