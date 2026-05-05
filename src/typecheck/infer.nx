@@ -379,7 +379,16 @@ let infer_call = fn (state: CheckState, func: string, args: [HirCallArg], span: 
     | None -> return InferExprErr(message: "unbound function: " ++ func, span)
     | Some(val: sch) ->
       match instantiate_scheme(state, scheme: sch) do
-        | InstantiateResult(state: st1, typ: func_type) ->
+        | InstantiateResult(state: st1, typ: func_type_raw) ->
+          // Peel `%`/`@` modality wrappers introduced by linear-capture or
+          // lazy-capture lambdas: `let f = mk_capture(b: b)` gives
+          // `f : %(z: i64) -> i64`, but calling `f(z: 0)` should still
+          // resolve the inner arrow shape.
+          let func_type = match func_type_raw do
+            | TyLinear(inner: u) -> u
+            | TyLazy(inner: u) -> u
+            | _ -> func_type_raw
+          end
           match func_type do
             | TyArrow(params, ret, requires: _, throw_row: callee_thr) ->
               match check_call_args(state: st1, params, args, ret, subst: subst.subst_empty(), span) do
@@ -489,10 +498,33 @@ let check_call_args = fn (
               let expected = subst.subst_apply(subst: s_merged, typ: ptyp)
               let tdefs = tctypes.state_typedefs(state: st1)
               match unify.unify(t1: arg_t, t2: expected, tdefs) do
-                | UnifyErr(message: m) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
                 | UnifyOk(subst: s2) ->
                   let s_all = subst.subst_compose(s1: s_merged, s2)
                   return check_call_args(state: st1, params: rp, args: ra, ret, subst: s_all, span)
+                | UnifyErr(message: m) ->
+                  // Linearity-weakening at call sites (parity with Rust
+                  // front-end): permit passing a plain value `T` where the
+                  // parameter is `%T` or `@T` by re-unifying against the
+                  // inner type. The wrapper is reintroduced lexically by
+                  // the param sigil; the value's modality is preserved by
+                  // the linear-capture / lazy-capture machinery downstream.
+                  match expected do
+                    | TyLinear(inner: pinner) ->
+                      match unify.unify(t1: arg_t, t2: pinner, tdefs) do
+                        | UnifyOk(subst: s2) ->
+                          let s_all = subst.subst_compose(s1: s_merged, s2)
+                          return check_call_args(state: st1, params: rp, args: ra, ret, subst: s_all, span)
+                        | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
+                      end
+                    | TyLazy(inner: pinner) ->
+                      match unify.unify(t1: arg_t, t2: pinner, tdefs) do
+                        | UnifyOk(subst: s2) ->
+                          let s_all = subst.subst_compose(s1: s_merged, s2)
+                          return check_call_args(state: st1, params: rp, args: ra, ret, subst: s_all, span)
+                        | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
+                      end
+                    | _ -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
+                  end
               end
           end
       end

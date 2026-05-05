@@ -346,6 +346,201 @@ let lin_set_vars = fn (st: LinState, vs: [string]) -> LinState do
   return LinState(vars: vs, frame_stack: fs)
 end
 
+// ─── Lambda-capture consumption ──────────────────────────────────────────────
+
+let collect_param_names = fn (params: [HirParam], acc: [string]) -> [string] do
+  match params do
+    | [] -> return acc
+    | HirParam(name: n, label: _, typ: _) :: rest ->
+      return collect_param_names(params: rest, acc: n :: acc)
+  end
+end
+
+let consume_all = fn (st: LinState, names: [string]) -> LinState do
+  match names do
+    | [] -> return st
+    | n :: rest ->
+      let st1 = if lin_member(st, name: n) then lin_remove(st, name: n) else st end
+      return consume_all(st: st1, names: rest)
+  end
+end
+
+/// Walk a lambda body (statements) and collect every outer-linear name
+/// referenced as a free variable inside it. `bound` is the running set of
+/// names introduced by inner binders (lambda params, lets, match patterns,
+/// for/try-catch binders) — references shadowed by these are not captures.
+let collect_captured_linears = fn (
+  body: [HirStmt], outer_linears: [string], bound: [string], acc: [string]
+) -> [string] do
+  return cap_scan_stmts(stmts: body, outer: outer_linears, bound, acc)
+end
+
+let cap_add_unique = fn (xs: [string], n: string) -> [string] do
+  if str_member(xs, target: n) then return xs end
+  return n :: xs
+end
+
+let cap_scan_stmts = fn (
+  stmts: [HirStmt], outer: [string], bound: [string], acc: [string]
+) -> [string] do
+  match stmts do
+    | [] -> return acc
+    | HirStmt(node: nd, span: _) :: rest ->
+      match nd do
+        | Let(name: n, sigil: _, typ: _, value: v) ->
+          let acc1 = cap_scan_expr(expr: v, outer, bound, acc)
+          return cap_scan_stmts(stmts: rest, outer, bound: n :: bound, acc: acc1)
+        | Expr(expr: e) ->
+          return cap_scan_stmts(stmts: rest, outer, bound, acc: cap_scan_expr(expr: e, outer, bound, acc))
+        | Return(expr: e) ->
+          return cap_scan_stmts(stmts: rest, outer, bound, acc: cap_scan_expr(expr: e, outer, bound, acc))
+        | Assign(target: t, value: v) ->
+          let acc1 = cap_scan_expr(expr: t, outer, bound, acc)
+          let acc2 = cap_scan_expr(expr: v, outer, bound, acc: acc1)
+          return cap_scan_stmts(stmts: rest, outer, bound, acc: acc2)
+        | Try(body: b, catch_param: cp, catch_body: cb) ->
+          let acc1 = cap_scan_stmts(stmts: b, outer, bound, acc)
+          let acc2 = cap_scan_stmts(stmts: cb, outer, bound: cp :: bound, acc: acc1)
+          return cap_scan_stmts(stmts: rest, outer, bound, acc: acc2)
+        | Inject(handlers: _, body: b) ->
+          return cap_scan_stmts(stmts: rest, outer, bound, acc: cap_scan_stmts(stmts: b, outer, bound, acc))
+      end
+  end
+end
+
+let cap_scan_expr = fn (
+  expr: HirExpr, outer: [string], bound: [string], acc: [string]
+) -> [string] do
+  let HirExpr(node: nd, span: _) = expr
+  match nd do
+    | Literal(_) -> return acc
+    | Variable(name: n, sigil: _) ->
+      if str_member(xs: bound, target: n) then return acc end
+      if str_member(xs: outer, target: n) then return cap_add_unique(xs: acc, n) end
+      return acc
+    | Borrow(name: n, sigil: _) ->
+      // Borrow does not consume the binding, so ignore for capture-consumption.
+      let _ = n
+      return acc
+    | BinOp(left: l, op: _, right: r) ->
+      let acc1 = cap_scan_expr(expr: l, outer, bound, acc)
+      return cap_scan_expr(expr: r, outer, bound, acc: acc1)
+    | UnOp(op: _, operand: o) -> return cap_scan_expr(expr: o, outer, bound, acc)
+    | Call(func: f, args: cargs) ->
+      let acc0 = if str_member(xs: bound, target: f) then acc
+        else if str_member(xs: outer, target: f) then cap_add_unique(xs: acc, n: f)
+        else acc end
+      return cap_scan_call_args(args: cargs, outer, bound, acc: acc0)
+    | Ctor(variant: _, args: cargs) -> return cap_scan_exprs(exprs: cargs, outer, bound, acc)
+    | Record(fields: fs) -> return cap_scan_named(fields: fs, outer, bound, acc)
+    | Array(elems: es) -> return cap_scan_exprs(exprs: es, outer, bound, acc)
+    | Index(target: t, index: i) ->
+      let acc1 = cap_scan_expr(expr: t, outer, bound, acc)
+      return cap_scan_expr(expr: i, outer, bound, acc: acc1)
+    | FieldAccess(target: t, field: _) -> return cap_scan_expr(expr: t, outer, bound, acc)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      let acc1 = cap_scan_expr(expr: c, outer, bound, acc)
+      let acc2 = cap_scan_stmts(stmts: tb, outer, bound, acc: acc1)
+      match eb do
+        | None -> return acc2
+        | Some(val: ebs) -> return cap_scan_stmts(stmts: ebs, outer, bound, acc: acc2)
+      end
+    | Match(target: t, cases: cs) ->
+      let acc1 = cap_scan_expr(expr: t, outer, bound, acc)
+      return cap_scan_match_cases(cases: cs, outer, bound, acc: acc1)
+    | While(cond: c, body: b) ->
+      let acc1 = cap_scan_expr(expr: c, outer, bound, acc)
+      return cap_scan_stmts(stmts: b, outer, bound, acc: acc1)
+    | For(var: v, start: s, end_expr: e, body: b) ->
+      let acc1 = cap_scan_expr(expr: s, outer, bound, acc)
+      let acc2 = cap_scan_expr(expr: e, outer, bound, acc: acc1)
+      return cap_scan_stmts(stmts: b, outer, bound: v :: bound, acc: acc2)
+    | Lambda(type_params: _, params: ps, ret_type: _, body: b) ->
+      // Inner lambda: its own params shadow within its body, but free
+      // references to outer linears still capture-consume.
+      let inner_bound = collect_param_names(params: ps, acc: bound)
+      return cap_scan_stmts(stmts: b, outer, bound: inner_bound, acc)
+    | Raise(expr: e) -> return cap_scan_expr(expr: e, outer, bound, acc)
+    | Force(expr: e) -> return cap_scan_expr(expr: e, outer, bound, acc)
+    | Thunk(body: b) -> return cap_scan_expr(expr: b, outer, bound, acc)
+    | ExternalRef(_) -> return acc
+    | Handler(_) -> return acc
+  end
+end
+
+let cap_scan_exprs = fn (
+  exprs: [HirExpr], outer: [string], bound: [string], acc: [string]
+) -> [string] do
+  match exprs do
+    | [] -> return acc
+    | e :: rest ->
+      return cap_scan_exprs(exprs: rest, outer, bound, acc: cap_scan_expr(expr: e, outer, bound, acc))
+  end
+end
+
+let cap_scan_call_args = fn (
+  args: [HirCallArg], outer: [string], bound: [string], acc: [string]
+) -> [string] do
+  match args do
+    | [] -> return acc
+    | HirCallArg(label: _, value: v) :: rest ->
+      return cap_scan_call_args(args: rest, outer, bound, acc: cap_scan_expr(expr: v, outer, bound, acc))
+  end
+end
+
+let cap_scan_named = fn (
+  fields: [HirNamedExpr], outer: [string], bound: [string], acc: [string]
+) -> [string] do
+  match fields do
+    | [] -> return acc
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      return cap_scan_named(fields: rest, outer, bound, acc: cap_scan_expr(expr: v, outer, bound, acc))
+  end
+end
+
+let cap_scan_match_cases = fn (
+  cases: [HirMatchCase], outer: [string], bound: [string], acc: [string]
+) -> [string] do
+  match cases do
+    | [] -> return acc
+    | HirMatchCase(pattern: p, body: bs) :: rest ->
+      let pat_bound = cap_pattern_binders(pat: p, acc: bound)
+      let acc1 = cap_scan_stmts(stmts: bs, outer, bound: pat_bound, acc)
+      return cap_scan_match_cases(cases: rest, outer, bound, acc: acc1)
+  end
+end
+
+let cap_pattern_binders = fn (pat: HirPatternKind, acc: [string]) -> [string] do
+  match pat do
+    | PLit(_) -> return acc
+    | PWild -> return acc
+    | PVar(name: n, sigil: _) -> return n :: acc
+    | PCtor(variant: _, fields: fs) -> return cap_pattern_field_binders(fields: fs, acc)
+    | PRec(fields: fs, is_partial: _) -> return cap_pattern_record_binders(fields: fs, acc)
+    | POr(alts: _) -> return acc
+  end
+end
+
+let cap_pattern_field_binders = fn (
+  fields: [HirPatternField], acc: [string]
+) -> [string] do
+  match fields do
+    | [] -> return acc
+    | HirPatternField(name: _, pattern: p) :: rest ->
+      return cap_pattern_field_binders(fields: rest, acc: cap_pattern_binders(pat: p, acc))
+  end
+end
+
+let cap_pattern_record_binders = fn (
+  fields: [HirRecordPatField], acc: [string]
+) -> [string] do
+  match fields do
+    | [] -> return acc
+    | HirRecordPatField(name: _, pattern: p) :: rest ->
+      return cap_pattern_record_binders(fields: rest, acc: cap_pattern_binders(pat: p, acc))
+  end
+end
+
 // ─── Sig-map-aware linearity classification ──────────────────────────────────
 
 /// Determine whether the value-RHS of a `let x = expr` would yield a linear
@@ -683,7 +878,16 @@ let check_expr_kind = fn (
       // at construction time. The bootstrap also runs the check_unused
       // check for lambda bodies.
       require_empty_or_droppable(vars: lin_state_vars(st: lst2), params: ps, span)
-      return st
+      // Outer linear bindings referenced (free) inside the body are
+      // consumed by the closure capture. Mirrors the bootstrap (Rust)
+      // path that calls `env.consume(&key)` for every captured linear
+      // when the lambda's type is wrapped in `%`.
+      let pnames = collect_param_names(params: ps, acc: [])
+      let outer_linears = lin_state_vars(st)
+      let captured = collect_captured_linears(
+        body: b, outer_linears, bound: pnames, acc: []
+      )
+      return consume_all(st, names: captured)
     | Raise(expr: e) ->
       // After raise, control transfers to the catch arm; remaining stmts
       // are unreachable. Walk the raised value to consume any linears in it
