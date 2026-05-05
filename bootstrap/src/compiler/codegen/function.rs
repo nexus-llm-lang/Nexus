@@ -421,7 +421,11 @@ fn coalesce_wasm_locals(
     if intervals.len() < 2 {
         return; // nothing to coalesce
     }
-    intervals.sort_by_key(|&(_, dp, _, _, _)| dp);
+    // Stable secondary key (Symbol) so iteration order of `local_map` (a HashMap
+    // with randomized hash seed) cannot leak into the sort. Without this,
+    // identical source produces non-identical wasm and intermittently miscompiles
+    // fall-through paths reading stale local slots.
+    intervals.sort_by_key(|&(name, dp, _, _, _)| (dp, name));
 
     // 3. Linear scan: greedily assign to reusable slots.
     //    A slot is reusable when its current occupant's last_use < new variable's def_pos.

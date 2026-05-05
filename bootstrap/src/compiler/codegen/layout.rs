@@ -131,7 +131,12 @@ pub(super) fn build_codegen_layout(program: &LirProgram) -> Result<CodegenLayout
     let mut nullary_ctor_addrs = HashMap::new();
     // Align to 8 bytes before nullary ctor slots
     next_offset = align8(next_offset);
-    for tag in &nullary_ctors {
+    // Sort tags so data-segment addresses (and the i32 consts that reference
+    // them in emitted code) are independent of HashSet iteration order, which
+    // is hash-randomized per process in Rust.
+    let mut sorted_ctors: Vec<i64> = nullary_ctors.iter().copied().collect();
+    sorted_ctors.sort();
+    for tag in &sorted_ctors {
         nullary_ctor_addrs.insert(*tag, next_offset);
         data_segments.push(DataSegment {
             offset: next_offset,
