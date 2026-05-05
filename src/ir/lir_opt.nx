@@ -1505,158 +1505,221 @@ let fus_rewrite_functions_go = fn (funcs: [LirFunction], effects: EffectMap, acc
   end
 end
 
-// ─── Autovectorize (i32 lane add) ───────────────────────────────────────────
+// ─── Autovectorize (call-target substitution table) ────────────────────────
 //
-// Pattern: detect direct calls to a scalar `dst[i] = a[i] + b[i]` array-add
-// helper and rewrite them to call the `i32x4_add_array` SIMD intrinsic. The
-// canonical scalar reference (`scalar_i32_add_array` in `nxlib/stdlib/simd.nx`)
-// has the documented contract:
+// Pattern: detect direct calls to a `scalar_<lane>_<op>_array` reference
+// helper (defined in `nxlib/stdlib/simd.nx`) and rewrite them to call the
+// matching `<lane>x<n>_<op>_array` SIMD intrinsic. Each scalar reference has
+// a documented contract of the form
 //
-//   scalar_i32_add_array(a, b, dst, n_quads) processes n_quads * 4 i32 lanes,
-//   computing dst[i] = a[i] + b[i] for each lane via plain mem.load_i32 /
-//   mem.store_i32.
+//   scalar_<lane>_<op>_array(a, b, dst, n_quads)
+//     processes n_quads * lanes_per_quad lanes, computing
+//     dst[i] = a[i] OP b[i] via plain `mem.load_*` / `mem.store_*`.
 //
-// The SIMD primitive `i32x4_add_array` has the SAME signature and the SAME
-// observable result (modulo per-lane wrapping arithmetic, which matches),
-// but emits 0xFD-prefixed wasm SIMD bytes per quad. The rewrite is therefore
-// a pure call-target swap with no parameter reshaping required.
+// The matching SIMD primitive has the SAME signature and the SAME observable
+// per-lane result (modulo wrapping arithmetic, which matches), but emits
+// 0xFD-prefixed wasm SIMD bytes per quad. Each rewrite is therefore a pure
+// call-target swap with no parameter reshaping required.
 //
 // Detection criterion (deliberately narrow to avoid the inliner-style
-// regression noted in nexus-v1vn): the LirExprCall.func ends with
-// "#scalar_i32_add_array" AND the program declares the SIMD external
-// (canonical name suffix "#i32x4_add_array"). The suffix match catches the
-// stdlib reference regardless of the package path the caller imported it
-// through (e.g., "std:simd" vs "nxlib/stdlib/simd.nx").
+// regression noted in nexus-v1vn): for each (scalar_suffix, simd_suffix)
+// entry, rewrite a `LirExprCall.func` that ends with the scalar suffix to
+// the canonical name of the SIMD external in the program — but only when
+// that SIMD external is actually present. Suffix matching catches the stdlib
+// reference regardless of the package path the caller imported it through.
 //
 // Why a function-name suffix gate rather than full LIR loop-shape detection:
 // the prior optimizer epic (v1vn inliner) showed that complex LIR-level
 // rewrites can perturb stage1==stage2 byte-equality and break the bootstrap
 // fixed-point. Targeted call-target substitution with byte-identical
-// signatures is the conservative MVP — it ships the SIMD-byte emission for
-// the canonical scalar shape that callers actually use, without risking
+// signatures is the conservative shape — it ships the SIMD-byte emission
+// for canonical scalar shapes that callers actually use, without risking
 // codegen-shape drift in unrelated functions.
 
-let av_scalar_suffix = fn () -> string do return "#scalar_i32_add_array" end
-let av_simd_suffix = fn () -> string do return "#i32x4_add_array" end
+// (scalar_suffix, simd_suffix) pair for each rewrite the pass knows about.
+// Suffixes start with "#" so they bind to the per-module decoration the
+// LIR mangler appends; this keeps the match anchored to the stdlib
+// definition regardless of import alias.
+type AvPair = AvPair(scalar_suffix: string, simd_suffix: string)
 
-// Scan externals; return Some(canonical_name) for the first external whose
-// name ends with the SIMD suffix. None means the program does not import the
-// SIMD intrinsic at all, so the autovectorize rewrite must be a no-op.
-let av_find_simd_ext = fn (exts: [LirExternal]) -> Option<string> do
+// Resolved pair: scalar_suffix paired with the *full* canonical name of the
+// SIMD external as it appears in the program's external table. Only entries
+// whose SIMD external is in scope are emitted by `av_resolve_table`, so a
+// program that imports only a subset of SIMD primitives gets only those
+// rewrites enabled.
+type AvResolved = AvResolved(scalar_suffix: string, simd_name: string)
+
+let av_pair_table = fn () -> [AvPair] do
+  return [
+    AvPair(scalar_suffix: "#scalar_i32_add_array", simd_suffix: "#i32x4_add_array"),
+    AvPair(scalar_suffix: "#scalar_i32_mul_array", simd_suffix: "#i32x4_mul_array"),
+    AvPair(scalar_suffix: "#scalar_i32_sub_array", simd_suffix: "#i32x4_sub_array"),
+    AvPair(scalar_suffix: "#scalar_i64_mul_array", simd_suffix: "#i64x2_mul_array"),
+    AvPair(scalar_suffix: "#scalar_i64_sub_array", simd_suffix: "#i64x2_sub_array")
+  ]
+end
+
+// Scan externals for the first whose name ends with `simd_suffix`. None
+// means the program does not import that SIMD intrinsic at all.
+let av_find_ext_by_suffix = fn (exts: [LirExternal], simd_suffix: string) -> Option<string> do
   match exts do
     | [] -> return None
     | LirExternal(name: n, _) :: rest ->
-      if str.ends_with(s: n, suffix: av_simd_suffix()) then
+      if str.ends_with(s: n, suffix: simd_suffix) then
         return Some(val: n)
       end
-      return av_find_simd_ext(exts: rest)
+      return av_find_ext_by_suffix(exts: rest, simd_suffix)
   end
 end
 
-// Per-callsite rewrite. If `func` ends with the scalar suffix, swap to the
-// SIMD canonical name. Otherwise leave the call unchanged.
-let av_rewrite_call_func = fn (func: string, simd_name: string) -> string do
-  if str.ends_with(s: func, suffix: av_scalar_suffix()) then
-    return simd_name
-  end
-  return func
+let av_resolve_table = fn (exts: [LirExternal]) -> [AvResolved] do
+  return av_resolve_table_go(pairs: av_pair_table(), exts, acc: [])
 end
 
-let av_rewrite_expr = fn (expr: LirExpr, simd_name: string) -> LirExpr do
+let av_resolve_table_go = fn (pairs: [AvPair], exts: [LirExternal], acc: [AvResolved]) -> [AvResolved] do
+  match pairs do
+    | [] -> return reverse_resolved(lst: acc, out: [])
+    | AvPair(scalar_suffix: ss, simd_suffix: ms) :: rest ->
+      match av_find_ext_by_suffix(exts, simd_suffix: ms) do
+        | None -> return av_resolve_table_go(pairs: rest, exts, acc)
+        | Some(val: simd_name) ->
+          let entry = AvResolved(scalar_suffix: ss, simd_name)
+          return av_resolve_table_go(pairs: rest, exts, acc: entry :: acc)
+      end
+  end
+end
+
+let reverse_resolved = fn (lst: [AvResolved], out: [AvResolved]) -> [AvResolved] do
+  match lst do
+    | [] -> return out
+    | h :: t -> return reverse_resolved(lst: t, out: h :: out)
+  end
+end
+
+// Per-callsite rewrite. If `func` ends with any scalar suffix in the
+// resolved table, swap to that entry's SIMD canonical name. Otherwise leave
+// the call unchanged. First match wins (suffixes are unique per pair).
+let av_lookup_target = fn (func: string, table: [AvResolved]) -> Option<string> do
+  match table do
+    | [] -> return None
+    | AvResolved(scalar_suffix: ss, simd_name: sn) :: rest ->
+      if str.ends_with(s: func, suffix: ss) then
+        return Some(val: sn)
+      end
+      return av_lookup_target(func, table: rest)
+  end
+end
+
+let av_rewrite_call_func = fn (func: string, table: [AvResolved]) -> string do
+  match av_lookup_target(func, table) do
+    | None -> return func
+    | Some(val: sn) -> return sn
+  end
+end
+
+let av_rewrite_expr = fn (expr: LirExpr, table: [AvResolved]) -> LirExpr do
   match expr do
     | LirExprCall(func: f, args: a, typ: t) ->
-      return LirExprCall(func: av_rewrite_call_func(func: f, simd_name),
+      return LirExprCall(func: av_rewrite_call_func(func: f, table),
                          args: a, typ: t)
     | LirExprTailCall(func: f, args: a, typ: t) ->
-      return LirExprTailCall(func: av_rewrite_call_func(func: f, simd_name),
+      return LirExprTailCall(func: av_rewrite_call_func(func: f, table),
                              args: a, typ: t)
     | _ -> return expr
   end
 end
 
-let av_rewrite_stmt = fn (stmt: LirStmt, simd_name: string) -> LirStmt do
+let av_rewrite_stmt = fn (stmt: LirStmt, table: [AvResolved]) -> LirStmt do
   match stmt do
     | LirStmtLet(name: n, typ: t, expr: e) ->
-      return LirStmtLet(name: n, typ: t, expr: av_rewrite_expr(expr: e, simd_name))
+      return LirStmtLet(name: n, typ: t, expr: av_rewrite_expr(expr: e, table))
     | LirStmtIf(cond: c, then_body: tb, else_body: eb) ->
       return LirStmtIf(cond: c,
-                       then_body: av_rewrite_stmts(stmts: tb, simd_name),
-                       else_body: av_rewrite_stmts(stmts: eb, simd_name))
+                       then_body: av_rewrite_stmts(stmts: tb, table),
+                       else_body: av_rewrite_stmts(stmts: eb, table))
     | LirStmtIfReturn(cond: c, then_body: tb, then_ret: tr,
                       else_body: eb, else_ret: er, ret_type: rt) ->
       return LirStmtIfReturn(cond: c,
-                             then_body: av_rewrite_stmts(stmts: tb, simd_name),
+                             then_body: av_rewrite_stmts(stmts: tb, table),
                              then_ret: tr,
-                             else_body: av_rewrite_stmts(stmts: eb, simd_name),
+                             else_body: av_rewrite_stmts(stmts: eb, table),
                              else_ret: er, ret_type: rt)
     | LirStmtLoop(cond_stmts: cs, cond: c, body: bd) ->
-      return LirStmtLoop(cond_stmts: av_rewrite_stmts(stmts: cs, simd_name),
+      return LirStmtLoop(cond_stmts: av_rewrite_stmts(stmts: cs, table),
                          cond: c,
-                         body: av_rewrite_stmts(stmts: bd, simd_name))
+                         body: av_rewrite_stmts(stmts: bd, table))
     | LirStmtTryCatch(body: bd, body_ret: br, catch_param: cp,
                       catch_param_typ: cpt, catch_body: cb, catch_ret: cr) ->
-      return LirStmtTryCatch(body: av_rewrite_stmts(stmts: bd, simd_name),
+      return LirStmtTryCatch(body: av_rewrite_stmts(stmts: bd, table),
                              body_ret: br, catch_param: cp,
                              catch_param_typ: cpt,
-                             catch_body: av_rewrite_stmts(stmts: cb, simd_name),
+                             catch_body: av_rewrite_stmts(stmts: cb, table),
                              catch_ret: cr)
   end
 end
 
-let av_rewrite_stmts = fn (stmts: [LirStmt], simd_name: string) -> [LirStmt] do
-  return av_rewrite_stmts_go(stmts, simd_name, acc: [])
+let av_rewrite_stmts = fn (stmts: [LirStmt], table: [AvResolved]) -> [LirStmt] do
+  return av_rewrite_stmts_go(stmts, table, acc: [])
 end
 
-let av_rewrite_stmts_go = fn (stmts: [LirStmt], simd_name: string, acc: [LirStmt]) -> [LirStmt] do
+let av_rewrite_stmts_go = fn (stmts: [LirStmt], table: [AvResolved], acc: [LirStmt]) -> [LirStmt] do
   match stmts do
     | [] -> return reverse_stmts_opt(lst: acc, out: [])
     | s :: rest ->
-      return av_rewrite_stmts_go(stmts: rest, simd_name,
-                                 acc: av_rewrite_stmt(stmt: s, simd_name) :: acc)
+      return av_rewrite_stmts_go(stmts: rest, table,
+                                 acc: av_rewrite_stmt(stmt: s, table) :: acc)
   end
 end
 
-// Skip rewriting inside the scalar helper itself: that body IS the loop we
+// Skip rewriting inside any scalar helper itself: that body IS the loop we
 // fall back to. Rewriting calls inside it would produce an infinite SIMD
-// recursion (i32x4_add_array calls itself).
-let av_is_scalar_helper = fn (func_name: string) -> bool do
-  return str.ends_with(s: func_name, suffix: av_scalar_suffix())
+// recursion (e.g. scalar_i32_add_array would tail-call itself, which then
+// gets rewritten to i32x4_add_array, eliminating the actual scalar code path
+// the helper is supposed to provide as a fallback).
+let av_is_scalar_helper = fn (func_name: string, table: [AvResolved]) -> bool do
+  match table do
+    | [] -> return false
+    | AvResolved(scalar_suffix: ss, _) :: rest ->
+      if str.ends_with(s: func_name, suffix: ss) then return true end
+      return av_is_scalar_helper(func_name, table: rest)
+  end
 end
 
-let av_rewrite_function = fn (func: LirFunction, simd_name: string) -> LirFunction do
+let av_rewrite_function = fn (func: LirFunction, table: [AvResolved]) -> LirFunction do
   let LirFunction(name: fn_name, params: p, ret_type: rt,
                   body, ret, span: sp) = func
-  if av_is_scalar_helper(func_name: fn_name) then
+  if av_is_scalar_helper(func_name: fn_name, table) then
     return func
   end
-  let new_body = av_rewrite_stmts(stmts: body, simd_name)
+  let new_body = av_rewrite_stmts(stmts: body, table)
   return LirFunction(name: fn_name, params: p, ret_type: rt,
                      body: new_body, ret, span: sp)
 end
 
-let av_rewrite_functions = fn (funcs: [LirFunction], simd_name: string) -> [LirFunction] do
-  return av_rewrite_functions_go(funcs, simd_name, acc: [])
+let av_rewrite_functions = fn (funcs: [LirFunction], table: [AvResolved]) -> [LirFunction] do
+  return av_rewrite_functions_go(funcs, table, acc: [])
 end
 
-let av_rewrite_functions_go = fn (funcs: [LirFunction], simd_name: string,
+let av_rewrite_functions_go = fn (funcs: [LirFunction], table: [AvResolved],
                                   acc: [LirFunction]) -> [LirFunction] do
   match funcs do
     | [] -> return reverse_funcs(lst: acc, out: [])
     | f :: rest ->
-      return av_rewrite_functions_go(funcs: rest, simd_name,
-                                     acc: av_rewrite_function(func: f, simd_name) :: acc)
+      return av_rewrite_functions_go(funcs: rest, table,
+                                     acc: av_rewrite_function(func: f, table) :: acc)
   end
 end
 
-// Top-level driver. No-op when the SIMD intrinsic external is absent (the
-// program never imported `std:simd`); otherwise swap every scalar-helper
-// call to the SIMD intrinsic.
+// Top-level driver. No-op when no SIMD intrinsic external in `av_pair_table`
+// is present (the program never imported `std:simd`); otherwise swap every
+// scalar-helper call whose SIMD twin is in scope.
 let opt_autovectorize = fn (program: LirProgram) -> LirProgram do
   let LirProgram(functions: funcs, externals: exts) = program
-  match av_find_simd_ext(exts) do
-    | None -> return program
-    | Some(val: simd_name) ->
-      let new_funcs = av_rewrite_functions(funcs, simd_name)
+  let table = av_resolve_table(exts)
+  match table do
+    | [] -> return program
+    | _ ->
+      let new_funcs = av_rewrite_functions(funcs, table)
       return LirProgram(functions: new_funcs, externals: exts)
   end
 end

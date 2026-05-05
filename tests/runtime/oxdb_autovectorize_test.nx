@@ -1,21 +1,30 @@
-// Regression for nexus-oxdb: LIR autovectorize pass swaps calls to the
-// scalar `dst[i] = a[i] + b[i]` reference loop (`scalar_i32_add_array`,
-// from nxlib/stdlib/simd.nx) for the SIMD intrinsic `i32x4_add_array`.
+// Regression for nexus-oxdb + nexus-v0j9: LIR autovectorize pass swaps
+// calls to scalar `dst[i] = a[i] OP b[i]` reference loops (defined in
+// `nxlib/stdlib/simd.nx`) for the matching SIMD intrinsic.
 //
 // The pass runs in `optimize_lir_with_effects` (src/ir/lir_opt.nx) after
 // fusion+DCE. Detection is suffix-matched on the canonical LIR call
-// target (`#scalar_i32_add_array`) and gated on the SIMD external being
-// present in the program — both conditions are satisfied here because we
-// import `std:simd` and call `simd.scalar_i32_add_array` directly.
+// targets and gated on the matching SIMD external being present in the
+// program; both conditions are satisfied here because we import
+// `std:simd` and call each `simd.scalar_*_array` directly.
 //
 // Numeric correctness gate: rewriting a scalar-helper call to its SIMD
-// equivalent must preserve every i32 lane bit-for-bit (both routines
-// implement `dst[i] = a[i] + b[i]` over n_quads * 4 lanes with identical
-// 32-bit wraparound semantics). The byte-equality of the two output
-// regions (post-rewrite "scalar" call vs post-rewrite "SIMD" call —
-// both end up calling `i32x4_add_array`) is asserted here; the
-// 0xFD-prefixed bytecode emission for the SIMD call is verified by the
-// build/scan harness alongside the existing simd autovectorize coverage.
+// equivalent must preserve every lane bit-for-bit (both routines
+// implement `dst[i] = a[i] OP b[i]` over `n_quads * lanes_per_quad`
+// lanes with identical wraparound semantics). The byte-equality of the
+// two output regions (post-rewrite "scalar" call — which after the pass
+// IS the SIMD call — vs explicit SIMD call) is asserted here.
+//
+// Coverage (one assertion pair per autovectorize-table entry):
+//   1. scalar_i32_add_array → i32x4_add_array  (oxdb baseline)
+//   2. scalar_i32_mul_array → i32x4_mul_array
+//   3. scalar_i32_sub_array → i32x4_sub_array
+//   4. scalar_i64_mul_array → i64x2_mul_array
+//   5. scalar_i64_sub_array → i64x2_sub_array
+//
+// The 0xFD-prefixed bytecode emission for the rewritten SIMD calls is
+// verified by the build/scan harness alongside the existing simd
+// autovectorize coverage.
 //
 // The test exits 0 on success (via `1 / ok`) and traps on any mismatch.
 
@@ -45,6 +54,16 @@ let init_i32_seq_go = fn (base: i64, n: i64, idx: i64) -> unit do
   return init_i32_seq_go(base, n, idx: idx + 1)
 end
 
+let init_i64_seq = fn (base: i64, n: i64) -> unit do
+  return init_i64_seq_go(base, n, idx: 0)
+end
+
+let init_i64_seq_go = fn (base: i64, n: i64, idx: i64) -> unit do
+  if idx >= n then return () end
+  let _ = mem.store_i64(addr: base + idx * 8, val: idx + 1)
+  return init_i64_seq_go(base, n, idx: idx + 1)
+end
+
 let zero_region = fn (base: i64, n: i64) -> unit do
   return zero_region_go(base, n, idx: 0)
 end
@@ -66,34 +85,91 @@ let body = fn () -> unit throws { Exn } do
   let simd_addr = base + 192
   let n_quads = 4
 
-  // Initialise inputs: a[i] = i+1, b[i] = i+1 (16 i32 elements per region).
+  // ── 1. i32 add: scalar_i32_add_array → i32x4_add_array ─────────────────
   init_i32_seq(base: a_addr, n: 16)
   init_i32_seq(base: b_addr, n: 16)
   zero_region(base: scal_addr, n: 64)
   zero_region(base: simd_addr, n: 64)
 
-  // Call site #1: scalar reference. Post-autovectorize, the LIR call
-  // target swaps to `i32x4_add_array`, emitting 0xFD-prefixed SIMD bytes.
   let _ = simd.scalar_i32_add_array(a_addr, b_addr, dst_addr: scal_addr, n_quads)
-
-  // Call site #2: explicit SIMD. Always emits 0xFD bytes regardless of
-  // the autovectorize pass.
   let _ = simd.i32x4_add_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
 
-  // Both regions must be byte-equal: 64 bytes / region, all matching.
-  let eq_count = cmp_bytes(a: scal_addr, b: simd_addr, n: 64)
-  test_assert.assert_eq_i64(actual: eq_count, expected: 64,
-    label: "oxdb scalar-rewrite vs explicit SIMD byte-equality")
+  test_assert.assert_eq_i64(actual: cmp_bytes(a: scal_addr, b: simd_addr, n: 64),
+    expected: 64, label: "i32 add: scalar-rewrite vs explicit SIMD byte-equality")
+  // Spot-check lanes: a[i] + b[i] with a[i]=b[i]=i+1.
+  test_assert.assert_eq_i64(actual: mem.load_i32(addr: scal_addr),
+    expected: 2, label: "i32 add lane 0 == 2")
+  test_assert.assert_eq_i64(actual: mem.load_i32(addr: scal_addr + 60),
+    expected: 32, label: "i32 add lane 15 == 32")
 
-  // Spot-check lane 0: a[0] + b[0] = 1 + 1 = 2.
-  let lane0 = mem.load_i32(addr: scal_addr)
-  test_assert.assert_eq_i64(actual: lane0, expected: 2,
-    label: "oxdb lane 0 == 2")
+  // ── 2. i32 mul: scalar_i32_mul_array → i32x4_mul_array ─────────────────
+  init_i32_seq(base: a_addr, n: 16)
+  init_i32_seq(base: b_addr, n: 16)
+  zero_region(base: scal_addr, n: 64)
+  zero_region(base: simd_addr, n: 64)
 
-  // Spot-check lane 15: a[15] + b[15] = 16 + 16 = 32.
-  let lane15 = mem.load_i32(addr: scal_addr + 60)
-  test_assert.assert_eq_i64(actual: lane15, expected: 32,
-    label: "oxdb lane 15 == 32")
+  let _ = simd.scalar_i32_mul_array(a_addr, b_addr, dst_addr: scal_addr, n_quads)
+  let _ = simd.i32x4_mul_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+
+  test_assert.assert_eq_i64(actual: cmp_bytes(a: scal_addr, b: simd_addr, n: 64),
+    expected: 64, label: "i32 mul: scalar-rewrite vs explicit SIMD byte-equality")
+  // a[0]*b[0] = 1*1 = 1; a[15]*b[15] = 16*16 = 256.
+  test_assert.assert_eq_i64(actual: mem.load_i32(addr: scal_addr),
+    expected: 1, label: "i32 mul lane 0 == 1")
+  test_assert.assert_eq_i64(actual: mem.load_i32(addr: scal_addr + 60),
+    expected: 256, label: "i32 mul lane 15 == 256")
+
+  // ── 3. i32 sub: scalar_i32_sub_array → i32x4_sub_array ─────────────────
+  init_i32_seq(base: a_addr, n: 16)
+  init_i32_seq(base: b_addr, n: 16)
+  zero_region(base: scal_addr, n: 64)
+  zero_region(base: simd_addr, n: 64)
+
+  let _ = simd.scalar_i32_sub_array(a_addr, b_addr, dst_addr: scal_addr, n_quads)
+  let _ = simd.i32x4_sub_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+
+  test_assert.assert_eq_i64(actual: cmp_bytes(a: scal_addr, b: simd_addr, n: 64),
+    expected: 64, label: "i32 sub: scalar-rewrite vs explicit SIMD byte-equality")
+  // a[i]-b[i] = 0 for every lane (a==b).
+  test_assert.assert_eq_i64(actual: mem.load_i32(addr: scal_addr),
+    expected: 0, label: "i32 sub lane 0 == 0")
+  test_assert.assert_eq_i64(actual: mem.load_i32(addr: scal_addr + 60),
+    expected: 0, label: "i32 sub lane 15 == 0")
+
+  // ── 4. i64 mul: scalar_i64_mul_array → i64x2_mul_array ─────────────────
+  // i64x2 has 2 lanes per quad, so n_quads=4 → 8 i64 lanes (64 bytes).
+  init_i64_seq(base: a_addr, n: 8)
+  init_i64_seq(base: b_addr, n: 8)
+  zero_region(base: scal_addr, n: 64)
+  zero_region(base: simd_addr, n: 64)
+
+  let _ = simd.scalar_i64_mul_array(a_addr, b_addr, dst_addr: scal_addr, n_quads)
+  let _ = simd.i64x2_mul_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+
+  test_assert.assert_eq_i64(actual: cmp_bytes(a: scal_addr, b: simd_addr, n: 64),
+    expected: 64, label: "i64 mul: scalar-rewrite vs explicit SIMD byte-equality")
+  // a[0]*b[0] = 1*1 = 1; a[7]*b[7] = 8*8 = 64.
+  test_assert.assert_eq_i64(actual: mem.load_i64(addr: scal_addr),
+    expected: 1, label: "i64 mul lane 0 == 1")
+  test_assert.assert_eq_i64(actual: mem.load_i64(addr: scal_addr + 56),
+    expected: 64, label: "i64 mul lane 7 == 64")
+
+  // ── 5. i64 sub: scalar_i64_sub_array → i64x2_sub_array ─────────────────
+  init_i64_seq(base: a_addr, n: 8)
+  init_i64_seq(base: b_addr, n: 8)
+  zero_region(base: scal_addr, n: 64)
+  zero_region(base: simd_addr, n: 64)
+
+  let _ = simd.scalar_i64_sub_array(a_addr, b_addr, dst_addr: scal_addr, n_quads)
+  let _ = simd.i64x2_sub_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+
+  test_assert.assert_eq_i64(actual: cmp_bytes(a: scal_addr, b: simd_addr, n: 64),
+    expected: 64, label: "i64 sub: scalar-rewrite vs explicit SIMD byte-equality")
+  // a[i]-b[i] = 0 for every lane.
+  test_assert.assert_eq_i64(actual: mem.load_i64(addr: scal_addr),
+    expected: 0, label: "i64 sub lane 0 == 0")
+  test_assert.assert_eq_i64(actual: mem.load_i64(addr: scal_addr + 56),
+    expected: 0, label: "i64 sub lane 7 == 0")
 
   return ()
 end
