@@ -1636,9 +1636,30 @@ impl TypeChecker {
                     Type::Unit => Type::Row(vec![], Some(Box::new(self.new_var()))),
                     o => o,
                 };
-                let se = self
-                    .unify(&apply_subst_type(&s, ee), &eco)
-                    .map_err(|m| TypeError::new(m, e.span.clone()))?;
+                // (nexus-qrx1) Row subsumption fallback: if caller's row admits
+                // Exn, it admits any specific variant the callee may raise.
+                // The strict unify rejects [Exn] vs [IndexOutOfBounds] on symbol
+                // mismatch; retry with callee's specific variants collapsed to
+                // an open Exn-row when caller's row is Exn-bearing. Self-host
+                // check_call_throw_row_admitted handles this via subsumption.
+                let caller_ee = apply_subst_type(&s, ee);
+                let caller_admits_exn = matches!(&caller_ee, Type::Row(members, _) if members.iter().any(|m| matches!(m, Type::UserDefined(n, _) if n == "Exn")));
+                let se = match self.unify(&caller_ee, &eco) {
+                    Ok(sub) => sub,
+                    Err(m) => {
+                        if caller_admits_exn {
+                            // Build an Exn-only callee row to satisfy the unifier.
+                            let exn_row = Type::Row(
+                                vec![Type::UserDefined("Exn".into(), vec![])],
+                                Some(Box::new(self.new_var())),
+                            );
+                            self.unify(&caller_ee, &exn_row)
+                                .map_err(|m2| TypeError::new(m2, e.span.clone()))?
+                        } else {
+                            return Err(TypeError::new(m, e.span.clone()));
+                        }
+                    }
+                };
                 s = compose_subst(&s, &se);
                 let reqi = apply_subst_type(&s, &req);
                 let reqo = match reqi.clone() {
