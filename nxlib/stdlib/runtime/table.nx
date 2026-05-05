@@ -48,7 +48,7 @@
  * self-host compiler path are short-lived per-pass and the wasm_alloc
  * docstring already calls this out as the reclamation pattern.
  */
-import * as alloc from "std:runtime/alloc"
+import { AllocError }, * as alloc from "std:runtime/alloc"
 import * as mem from "std:runtime/mem"
 import { byte_at, byte_length } from "std:str"
 import { ord } from "std:char"
@@ -64,6 +64,12 @@ export exception KeyNotFound(op: string, key_repr: i64)
 /// (e.g. caller created a 0-capv table by hand).  Catchable but should
 /// never trigger on healthy tables.
 export exception TableInvariantBroken(op: string, capv: i64, probes: i64)
+
+/// Group covering every exception raised by table operations: the table's
+/// own KeyNotFound and TableInvariantBroken, plus the alloc.AllocError
+/// chain that allocate / grow_table propagate up.
+export exception group TableError =
+  KeyNotFound | TableInvariantBroken | AllocError
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -176,7 +182,7 @@ let copy_str_bytes_go = fn (s: string, ptr: i64, len: i64, i: i64) -> unit do
   return copy_str_bytes_go(s, ptr, len, i: i + 1)
 end
 
-let intern_str = fn (s: string) -> i64 throws { Exn } do
+let intern_str = fn (s: string) -> i64 throws { TableError } do
   let len = byte_length(s)
   if len == 0 then
     return pack_ptr_len(ptr: 0, len: 0)
@@ -234,7 +240,7 @@ let zero_slots_go = fn (entries: i64, capv: i64, i: i64) -> unit do
   return zero_slots_go(entries, capv, i: i + 1)
 end
 
-let alloc_slots = fn (capv: i64) -> i64 throws { Exn } do
+let alloc_slots = fn (capv: i64) -> i64 throws { TableError } do
   let bytes = capv * slot_bytes()
   let entries = alloc.allocate(size: bytes)
   let _ = zero_slots_go(entries, capv, i: 0)
@@ -250,7 +256,7 @@ end
 ///
 /// Walk linearly modulo capv; on EMPTY return the EARLIEST tomb if one
 /// was seen, else the EMPTY itself.  On FILLED-match return the slot.
-let probe_int_go = fn (entries: i64, capv: i64, key: i64, idx: i64, first_tomb: i64, probes: i64) -> i64 throws { Exn } do
+let probe_int_go = fn (entries: i64, capv: i64, key: i64, idx: i64, first_tomb: i64, probes: i64) -> i64 throws { TableError } do
   if probes >= capv then
     raise TableInvariantBroken(op: "probe_int", capv, probes)
   end
@@ -272,13 +278,13 @@ let probe_int_go = fn (entries: i64, capv: i64, key: i64, idx: i64, first_tomb: 
   return probe_int_go(entries, capv, key, idx: next, first_tomb: new_tomb, probes: probes + 1)
 end
 
-let probe_int = fn (entries: i64, capv: i64, key: i64) -> i64 throws { Exn } do
+let probe_int = fn (entries: i64, capv: i64, key: i64) -> i64 throws { TableError } do
   let h = hash_int(k: key)
   let start = h & (capv - 1)
   return probe_int_go(entries, capv, key, idx: start, first_tomb: -1, probes: 0)
 end
 
-let probe_str_go = fn (entries: i64, capv: i64, s: string, idx: i64, first_tomb: i64, probes: i64) -> i64 throws { Exn } do
+let probe_str_go = fn (entries: i64, capv: i64, s: string, idx: i64, first_tomb: i64, probes: i64) -> i64 throws { TableError } do
   if probes >= capv then
     raise TableInvariantBroken(op: "probe_str", capv, probes)
   end
@@ -299,7 +305,7 @@ let probe_str_go = fn (entries: i64, capv: i64, s: string, idx: i64, first_tomb:
   return probe_str_go(entries, capv, s, idx: next, first_tomb: new_tomb, probes: probes + 1)
 end
 
-let probe_str = fn (entries: i64, capv: i64, s: string) -> i64 throws { Exn } do
+let probe_str = fn (entries: i64, capv: i64, s: string) -> i64 throws { TableError } do
   let h = hash_str(s)
   let start = h & (capv - 1)
   return probe_str_go(entries, capv, s, idx: start, first_tomb: -1, probes: 0)
@@ -309,7 +315,7 @@ end
 
 /// Allocate and zero a fresh table of the given kind.  Returns the
 /// header address, which the wrapper modules wrap in their opaque type.
-export let new_table = fn (kind: i64) -> i64 throws { Exn } do
+export let new_table = fn (kind: i64) -> i64 throws { TableError } do
   let h = alloc.allocate(size: header_bytes())
   let capv = initial_cap()
   let entries = alloc_slots(capv)
@@ -331,7 +337,7 @@ end
 
 // ─── Resize ───────────────────────────────────────────────────────────
 
-let rehash_int_go = fn (old_entries: i64, old_cap: i64, new_entries: i64, new_cap: i64, i: i64) -> unit throws { Exn } do
+let rehash_int_go = fn (old_entries: i64, old_cap: i64, new_entries: i64, new_cap: i64, i: i64) -> unit throws { TableError } do
   if i >= old_cap then return () end
   let s = slot_addr(entries: old_entries, idx: i)
   if load_state(s) == state_filled() then
@@ -350,13 +356,13 @@ end
 /// Allocates a fresh Nexus string (the bump-allocated key bytes stay
 /// reachable through the slot's pack(ptr,len)) so the rehash can flow
 /// through the same `probe_str` path used at insert time.
-let key_to_string = fn (packed: i64) -> string throws { Exn } do
+let key_to_string = fn (packed: i64) -> string throws { TableError } do
   let ptr = unpack_ptr(packed)
   let len = unpack_len(packed)
   return alloc.read_string(ptr, len)
 end
 
-let rehash_str_go = fn (old_entries: i64, old_cap: i64, new_entries: i64, new_cap: i64, i: i64) -> unit throws { Exn } do
+let rehash_str_go = fn (old_entries: i64, old_cap: i64, new_entries: i64, new_cap: i64, i: i64) -> unit throws { TableError } do
   if i >= old_cap then return () end
   let s = slot_addr(entries: old_entries, idx: i)
   if load_state(s) == state_filled() then
@@ -372,7 +378,7 @@ let rehash_str_go = fn (old_entries: i64, old_cap: i64, new_entries: i64, new_ca
   return rehash_str_go(old_entries, old_cap, new_entries, new_cap, i: i + 1)
 end
 
-let grow_table = fn (h: i64) -> unit throws { Exn } do
+let grow_table = fn (h: i64) -> unit throws { TableError } do
   let old_cap = load_cap(h)
   let old_entries = load_entries(h)
   let new_cap = old_cap * 2
@@ -389,7 +395,7 @@ let grow_table = fn (h: i64) -> unit throws { Exn } do
   return ()
 end
 
-let maybe_grow = fn (h: i64) -> unit throws { Exn } do
+let maybe_grow = fn (h: i64) -> unit throws { TableError } do
   let capv = load_cap(h)
   let used = load_used(h)
   let tomb = load_tomb(h)
@@ -401,7 +407,7 @@ end
 
 // ─── Operations: int kind ─────────────────────────────────────────────
 
-export let put_int = fn (h: i64, key: i64, val: i64) -> unit throws { Exn } do
+export let put_int = fn (h: i64, key: i64, val: i64) -> unit throws { TableError } do
   let _ = maybe_grow(h)
   let entries = load_entries(h)
   let capv = load_cap(h)
@@ -424,7 +430,7 @@ end
 
 /// Lookup by int key.  Returns (-1, 0) when absent; otherwise (1, val).
 /// Callers that want a domain-specific exception use `get_int_unchecked`.
-export let get_int_or = fn (h: i64, key: i64, default_val: i64) -> i64 throws { Exn } do
+export let get_int_or = fn (h: i64, key: i64, default_val: i64) -> i64 throws { TableError } do
   let entries = load_entries(h)
   let capv = load_cap(h)
   let idx = probe_int(entries, capv, key)
@@ -435,7 +441,7 @@ export let get_int_or = fn (h: i64, key: i64, default_val: i64) -> i64 throws { 
   return default_val
 end
 
-export let has_int = fn (h: i64, key: i64) -> bool throws { Exn } do
+export let has_int = fn (h: i64, key: i64) -> bool throws { TableError } do
   let entries = load_entries(h)
   let capv = load_cap(h)
   let idx = probe_int(entries, capv, key)
@@ -446,7 +452,7 @@ end
 /// Partial: raises `KeyNotFound` when the key is absent.  Mirrors the
 /// stdlib `head`/`tail` partial-function discipline: never settle for
 /// a catch-all and never silently return a default.
-export let get_int_unchecked = fn (h: i64, key: i64) -> i64 throws { Exn } do
+export let get_int_unchecked = fn (h: i64, key: i64) -> i64 throws { TableError } do
   let entries = load_entries(h)
   let capv = load_cap(h)
   let idx = probe_int(entries, capv, key)
@@ -457,7 +463,7 @@ export let get_int_unchecked = fn (h: i64, key: i64) -> i64 throws { Exn } do
   raise KeyNotFound(op: "get_int_unchecked", key_repr: key)
 end
 
-export let remove_int = fn (h: i64, key: i64) -> bool throws { Exn } do
+export let remove_int = fn (h: i64, key: i64) -> bool throws { TableError } do
   let entries = load_entries(h)
   let capv = load_cap(h)
   let idx = probe_int(entries, capv, key)
@@ -473,7 +479,7 @@ end
 
 // ─── Operations: str kind ─────────────────────────────────────────────
 
-export let put_str = fn (h: i64, key: string, val: i64) -> unit throws { Exn } do
+export let put_str = fn (h: i64, key: string, val: i64) -> unit throws { TableError } do
   let _ = maybe_grow(h)
   let entries = load_entries(h)
   let capv = load_cap(h)
@@ -495,7 +501,7 @@ export let put_str = fn (h: i64, key: string, val: i64) -> unit throws { Exn } d
   return ()
 end
 
-export let get_str_or = fn (h: i64, key: string, default_val: i64) -> i64 throws { Exn } do
+export let get_str_or = fn (h: i64, key: string, default_val: i64) -> i64 throws { TableError } do
   let entries = load_entries(h)
   let capv = load_cap(h)
   let idx = probe_str(entries, capv, s: key)
@@ -506,7 +512,7 @@ export let get_str_or = fn (h: i64, key: string, default_val: i64) -> i64 throws
   return default_val
 end
 
-export let has_str = fn (h: i64, key: string) -> bool throws { Exn } do
+export let has_str = fn (h: i64, key: string) -> bool throws { TableError } do
   let entries = load_entries(h)
   let capv = load_cap(h)
   let idx = probe_str(entries, capv, s: key)
@@ -514,7 +520,7 @@ export let has_str = fn (h: i64, key: string) -> bool throws { Exn } do
   return load_state(s) == state_filled()
 end
 
-export let get_str_unchecked = fn (h: i64, key: string) -> i64 throws { Exn } do
+export let get_str_unchecked = fn (h: i64, key: string) -> i64 throws { TableError } do
   let entries = load_entries(h)
   let capv = load_cap(h)
   let idx = probe_str(entries, capv, s: key)
@@ -525,7 +531,7 @@ export let get_str_unchecked = fn (h: i64, key: string) -> i64 throws { Exn } do
   raise KeyNotFound(op: "get_str_unchecked", key_repr: 0)
 end
 
-export let remove_str = fn (h: i64, key: string) -> bool throws { Exn } do
+export let remove_str = fn (h: i64, key: string) -> bool throws { TableError } do
   let entries = load_entries(h)
   let capv = load_cap(h)
   let idx = probe_str(entries, capv, s: key)
@@ -569,7 +575,7 @@ end
 
 /// Materialise a string key out of a slot (used for stringmap.keys()).
 /// Allocates a fresh Nexus string from the stored byte range.
-export let iter_key_str = fn (h: i64, slot_idx: i64) -> string throws { Exn } do
+export let iter_key_str = fn (h: i64, slot_idx: i64) -> string throws { TableError } do
   let s = slot_addr(entries: load_entries(h), idx: slot_idx)
   let packed = load_key(s)
   let ptr = unpack_ptr(packed)
