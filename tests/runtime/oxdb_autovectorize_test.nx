@@ -1,0 +1,114 @@
+// Regression for nexus-oxdb: LIR autovectorize pass swaps calls to the
+// scalar `dst[i] = a[i] + b[i]` reference loop (`scalar_i32_add_array`,
+// from nxlib/stdlib/simd.nx) for the SIMD intrinsic `i32x4_add_array`.
+//
+// The pass runs in `optimize_lir_with_effects` (src/ir/lir_opt.nx) after
+// fusion+DCE. Detection is suffix-matched on the canonical LIR call
+// target (`#scalar_i32_add_array`) and gated on the SIMD external being
+// present in the program — both conditions are satisfied here because we
+// import `std:simd` and call `simd.scalar_i32_add_array` directly.
+//
+// Numeric correctness gate: rewriting a scalar-helper call to its SIMD
+// equivalent must preserve every i32 lane bit-for-bit (both routines
+// implement `dst[i] = a[i] + b[i]` over n_quads * 4 lanes with identical
+// 32-bit wraparound semantics). The byte-equality of the two output
+// regions (post-rewrite "scalar" call vs post-rewrite "SIMD" call —
+// both end up calling `i32x4_add_array`) is asserted here; the
+// 0xFD-prefixed bytecode emission for the SIMD call is verified by the
+// build/scan harness alongside the existing simd autovectorize coverage.
+//
+// The test exits 0 on success (via `1 / ok`) and traps on any mismatch.
+
+import * as mem from "std:runtime/mem"
+import * as simd from "std:simd"
+import * as test_assert from "std:test/assert"
+
+let cmp_bytes = fn (a: i64, b: i64, n: i64) -> i64 do
+  return cmp_bytes_go(a, b, n, idx: 0, eq: 0)
+end
+
+let cmp_bytes_go = fn (a: i64, b: i64, n: i64, idx: i64, eq: i64) -> i64 do
+  if idx >= n then return eq end
+  let av = mem.load_u8(addr: a + idx)
+  let bv = mem.load_u8(addr: b + idx)
+  let inc = if av == bv then 1 else 0 end
+  return cmp_bytes_go(a, b, n, idx: idx + 1, eq: eq + inc)
+end
+
+let init_i32_seq = fn (base: i64, n: i64) -> unit do
+  return init_i32_seq_go(base, n, idx: 0)
+end
+
+let init_i32_seq_go = fn (base: i64, n: i64, idx: i64) -> unit do
+  if idx >= n then return () end
+  let _ = mem.store_i32(addr: base + idx * 4, val: idx + 1)
+  return init_i32_seq_go(base, n, idx: idx + 1)
+end
+
+let zero_region = fn (base: i64, n: i64) -> unit do
+  return zero_region_go(base, n, idx: 0)
+end
+
+let zero_region_go = fn (base: i64, n: i64, idx: i64) -> unit do
+  if idx >= n then return () end
+  let _ = mem.store_i64(addr: base + idx, val: 0)
+  return zero_region_go(base, n, idx: idx + 8)
+end
+
+let body = fn () -> unit throws { Exn } do
+  // Reserve a fresh wasm page for scratch memory.
+  let prev_pages = mem.grow(delta: 1)
+  let base = prev_pages * 65536
+
+  let a_addr = base
+  let b_addr = base + 64
+  let scal_addr = base + 128
+  let simd_addr = base + 192
+  let n_quads = 4
+
+  // Initialise inputs: a[i] = i+1, b[i] = i+1 (16 i32 elements per region).
+  init_i32_seq(base: a_addr, n: 16)
+  init_i32_seq(base: b_addr, n: 16)
+  zero_region(base: scal_addr, n: 64)
+  zero_region(base: simd_addr, n: 64)
+
+  // Call site #1: scalar reference. Post-autovectorize, the LIR call
+  // target swaps to `i32x4_add_array`, emitting 0xFD-prefixed SIMD bytes.
+  let _ = simd.scalar_i32_add_array(a_addr, b_addr, dst_addr: scal_addr, n_quads)
+
+  // Call site #2: explicit SIMD. Always emits 0xFD bytes regardless of
+  // the autovectorize pass.
+  let _ = simd.i32x4_add_array(a_addr, b_addr, dst_addr: simd_addr, n_quads)
+
+  // Both regions must be byte-equal: 64 bytes / region, all matching.
+  let eq_count = cmp_bytes(a: scal_addr, b: simd_addr, n: 64)
+  test_assert.assert_eq_i64(actual: eq_count, expected: 64,
+    label: "oxdb scalar-rewrite vs explicit SIMD byte-equality")
+
+  // Spot-check lane 0: a[0] + b[0] = 1 + 1 = 2.
+  let lane0 = mem.load_i32(addr: scal_addr)
+  test_assert.assert_eq_i64(actual: lane0, expected: 2,
+    label: "oxdb lane 0 == 2")
+
+  // Spot-check lane 15: a[15] + b[15] = 16 + 16 = 32.
+  let lane15 = mem.load_i32(addr: scal_addr + 60)
+  test_assert.assert_eq_i64(actual: lane15, expected: 32,
+    label: "oxdb lane 15 == 32")
+
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end
