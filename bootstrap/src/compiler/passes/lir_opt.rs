@@ -76,13 +76,98 @@ fn optimize_function(func: &mut LirFunction, parallel_lazy: bool) {
         }
         eliminate_dead_lets(&mut func.body, &uses);
     }
-    // 5. Unreachable code stripping (remove stmts after divergent stmts)
+    // 5. Unreachable code stripping (remove stmts after divergent stmts).
+    //    `body_ret`/`then_ret`/etc. inside a divergent block are cleared by
+    //    strip_unreachable_stmts itself; the function-level `func.ret` is
+    //    repaired here in case it still points at a Let that was stripped
+    //    (e.g. `try { raise; return -1 } catch { ... }` — `return -1`
+    //    desugars to `__t2 = 0 - 1` whose Let follows the divergent Raise
+    //    and gets dropped, leaving `func.ret = Var(__t2)` dangling and
+    //    crashing register_local at codegen time as E2010).
     strip_unreachable_stmts(&mut func.body);
+    // After truncation, `func.ret` may reference a stripped Let. The
+    // function-level fall-through path is unreachable in that case (the
+    // truncated tail is reached only on divergent paths that exit via
+    // raise / return-call), so substituting a typed default is
+    // semantics-preserving and avoids `local.get`-against-missing-local
+    // at codegen (the canonical nexus-4ues failure mode).
+    if let LirAtom::Var { name, .. } = &func.ret {
+        let mut defined: HashSet<Symbol> = func.params.iter().map(|p| p.name).collect();
+        collect_defined_names_in_stmts(&func.body, &mut defined);
+        if !defined.contains(name) {
+            func.ret = default_atom_for_type(&func.ret_type);
+        }
+    }
     // 6. Lazy parallelization: convert consecutive zero-arg CallIndirect (force) into
     //    LazySpawn/LazyJoin pairs for parallel evaluation.
     //    Only enabled when the target provides nexus:runtime/lazy host functions.
     if parallel_lazy {
         parallelize_consecutive_forces(&mut func.body);
+    }
+}
+
+fn default_atom_for_type(typ: &Type) -> LirAtom {
+    match typ {
+        Type::I32 | Type::I64 => LirAtom::Int(0),
+        Type::F32 | Type::F64 => LirAtom::Float(0.0),
+        Type::Bool => LirAtom::Bool(false),
+        Type::Char => LirAtom::Char('\0'),
+        Type::String => LirAtom::String(String::new()),
+        Type::Unit => LirAtom::Unit,
+        _ => LirAtom::Int(0), // heap pointer / object types default to 0
+    }
+}
+
+fn collect_defined_names_in_stmts(stmts: &[LirStmt], out: &mut HashSet<Symbol>) {
+    for stmt in stmts {
+        match stmt {
+            LirStmt::Let { name, .. } => {
+                out.insert(*name);
+            }
+            LirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_defined_names_in_stmts(then_body, out);
+                collect_defined_names_in_stmts(else_body, out);
+            }
+            LirStmt::IfReturn {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_defined_names_in_stmts(then_body, out);
+                collect_defined_names_in_stmts(else_body, out);
+            }
+            LirStmt::TryCatch {
+                body,
+                catch_param,
+                catch_body,
+                ..
+            } => {
+                out.insert(*catch_param);
+                collect_defined_names_in_stmts(body, out);
+                collect_defined_names_in_stmts(catch_body, out);
+            }
+            LirStmt::Loop {
+                cond_stmts, body, ..
+            } => {
+                collect_defined_names_in_stmts(cond_stmts, out);
+                collect_defined_names_in_stmts(body, out);
+            }
+            LirStmt::Switch {
+                cases,
+                default_body,
+                ..
+            } => {
+                for case in cases {
+                    collect_defined_names_in_stmts(&case.body, out);
+                }
+                collect_defined_names_in_stmts(default_body, out);
+            }
+            LirStmt::FieldUpdate { .. } => {}
+        }
     }
 }
 
@@ -1154,7 +1239,36 @@ fn stmt_diverges(stmt: &LirStmt) -> bool {
     }
 }
 
+/// Returns true if the atom references a `Let`-bound name that is no
+/// longer present anywhere in `defined`. References to params or to
+/// names still defined inside `stmts` are considered live.
+fn atom_dangles(atom: &LirAtom, defined: &HashSet<Symbol>) -> bool {
+    matches!(atom, LirAtom::Var { name, .. } if !defined.contains(name))
+}
+
+/// Drop a `Some(atom)` if its var-reference is dangling (definition was
+/// stripped). Returns true when the option was cleared. Atoms that don't
+/// reference a name (literals) are never dropped.
+fn clear_if_dangling(opt: &mut Option<LirAtom>, defined: &HashSet<Symbol>) -> bool {
+    if matches!(opt.as_ref(), Some(a) if atom_dangles(a, defined)) {
+        *opt = None;
+        true
+    } else {
+        false
+    }
+}
+
 /// Remove statements that follow a divergent statement in the same block.
+/// Also patch up `TryCatch::body_ret` / `TryCatch::catch_ret` whose Var
+/// atom got orphaned when its defining `Let` was truncated as
+/// unreachable. Concretely: `try { raise; return -1 } catch ...` lowers
+/// to `[Let __t0=Ctor; Let __t1=Raise; Let __t2=Binary(Sub,0,1)]` with
+/// `body_ret = Var(__t2)`. The `Let __t1=Raise` is divergent so
+/// truncation drops `Let __t2`, but `body_ret` still pointed at __t2 —
+/// codegen then issues `local.get __t2` against a name that was never
+/// registered in `local_map`, surfacing as E2010 (nexus-4ues). The
+/// trailing value atom is unreachable when the sub-block diverges, so
+/// dropping the dangling reference is semantics-preserving.
 /// Recurse into nested blocks.
 fn strip_unreachable_stmts(stmts: &mut Vec<LirStmt>) {
     // Find first divergent statement
@@ -1169,7 +1283,7 @@ fn strip_unreachable_stmts(stmts: &mut Vec<LirStmt>) {
         stmts.truncate(at);
     }
 
-    // Recurse into nested blocks
+    // Recurse into nested blocks.
     for stmt in stmts.iter_mut() {
         match stmt {
             LirStmt::If {
@@ -1187,12 +1301,34 @@ fn strip_unreachable_stmts(stmts: &mut Vec<LirStmt>) {
             } => {
                 strip_unreachable_stmts(then_body);
                 strip_unreachable_stmts(else_body);
+                // Note: IfReturn::then_ret / else_ret are *not* let-bound
+                // values in the body — they're separate atoms emitted as
+                // function-level returns by codegen. They cannot reference
+                // a Let that was truncated from the body, because LIR
+                // lowering emits the `return` value's binding in the
+                // *enclosing* block, not the body. Leaving them alone here
+                // also keeps `stmt_diverges`'s view of this IfReturn
+                // stable, so outer-scope unreachable stripping behaves
+                // the same way (nexus-4ues only manifests on TryCatch,
+                // where body_ret *is* an atom whose Let lives in `body`).
             }
             LirStmt::TryCatch {
-                body, catch_body, ..
+                body,
+                body_ret,
+                catch_param,
+                catch_body,
+                catch_ret,
+                ..
             } => {
                 strip_unreachable_stmts(body);
                 strip_unreachable_stmts(catch_body);
+                let mut body_defined = HashSet::new();
+                collect_defined_names_in_stmts(body, &mut body_defined);
+                clear_if_dangling(body_ret, &body_defined);
+                let mut catch_defined = HashSet::new();
+                catch_defined.insert(*catch_param);
+                collect_defined_names_in_stmts(catch_body, &mut catch_defined);
+                clear_if_dangling(catch_ret, &catch_defined);
             }
             LirStmt::Loop {
                 cond_stmts, body, ..
@@ -1209,6 +1345,9 @@ fn strip_unreachable_stmts(stmts: &mut Vec<LirStmt>) {
                     strip_unreachable_stmts(&mut case.body);
                 }
                 strip_unreachable_stmts(default_body);
+                // Same rationale as IfReturn: case.ret and default_ret are
+                // function-level return atoms, not let-bound values
+                // inside the case body.
             }
             LirStmt::Let { .. } => {}
             LirStmt::FieldUpdate { .. } => {}
