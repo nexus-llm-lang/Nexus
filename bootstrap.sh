@@ -79,9 +79,9 @@ run_seed_compile() {
   local kind
   kind="$(wasmtime_flags_for "$NEXUS_SEED")"
   if [[ "$kind" == "component" ]]; then
-    "$WASMTIME" run "${WASMTIME_FLAGS_COMPONENT[@]}" "$NEXUS_SEED" "$input" "$output"
+    "$WASMTIME" run "${WASMTIME_FLAGS_COMPONENT[@]}" "$NEXUS_SEED" build "$input" "$output"
   else
-    "$WASMTIME" run "${WASMTIME_FLAGS_CORE[@]}" "$NEXUS_SEED" "$input" "$output"
+    "$WASMTIME" run "${WASMTIME_FLAGS_CORE[@]}" "$NEXUS_SEED" build "$input" "$output"
   fi
 }
 
@@ -104,7 +104,7 @@ if [[ "$(wasmtime_flags_for "$STAGE0")" == "component" ]]; then
 else
   STAGE0_FLAGS=("${WASMTIME_FLAGS_CORE[@]}")
 fi
-"$WASMTIME" run "${STAGE0_FLAGS[@]}" "$STAGE0" "$NEXUS_ENTRY" "$STAGE1_RAW"
+"$WASMTIME" run "${STAGE0_FLAGS[@]}" "$STAGE0" build "$NEXUS_ENTRY" "$STAGE1_RAW"
 
 # The committed seed produces self-contained core wasm; stage1 must too.
 if wasm-tools print "$STAGE1_RAW" 2>/dev/null | grep -q 'import "nexus:std/'; then
@@ -118,7 +118,7 @@ STAGE1_FLAGS=("${WASMTIME_FLAGS_CORE[@]}")
 
 STAGE2="$BUILD_DIR/stage2.wasm"
 info "Stage 2: wasmtime run $STAGE1 $NEXUS_ENTRY $STAGE2"
-if ! "$WASMTIME" run "${STAGE1_FLAGS[@]}" "$STAGE1" "$NEXUS_ENTRY" "$STAGE2" 2>&1; then
+if ! "$WASMTIME" run "${STAGE1_FLAGS[@]}" "$STAGE1" build "$NEXUS_ENTRY" "$STAGE2" 2>&1; then
   fail "Stage 2 failed — src-produced WASM is not self-executable."
 fi
 ok "Stage 2 complete: $STAGE2 ($(wc -c < "$STAGE2" | tr -d ' ') bytes)"
@@ -161,7 +161,7 @@ ok "Installed nexus.wasm ($(wc -c < nexus.wasm | tr -d ' ') bytes)"
 LSP_RAW="$BUILD_DIR/lsp_raw.wasm"
 LSP_OUT="$BUILD_DIR/lsp.wasm"
 info "Stage L: wasmtime run nexus.wasm src/lsp/main.nx → $LSP_RAW"
-"$WASMTIME" run "${STAGE1_FLAGS[@]}" nexus.wasm src/lsp/main.nx "$LSP_RAW"
+"$WASMTIME" run "${STAGE1_FLAGS[@]}" nexus.wasm build src/lsp/main.nx "$LSP_RAW"
 
 if wasm-tools print "$LSP_RAW" 2>/dev/null | grep -q 'import "nexus:std/'; then
   fail "lsp.wasm emitted unresolved nexus:std imports. Self-hosted compose is not wired (see ADR 0001)."
