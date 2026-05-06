@@ -86,6 +86,7 @@ pub fn compile_fixture_via_nxc(fixture_relpath: &str) -> Vec<u8> {
             &format!("--dir={}", std::env::temp_dir().display()),
         ])
         .arg(nexus_wasm.to_str().unwrap())
+        .arg("build")
         .arg(fixture_relpath)
         .arg(&output_path)
         .output()
@@ -126,6 +127,7 @@ pub fn compile_fixture_via_nxc_should_fail(fixture_relpath: &str) -> String {
             &format!("--dir={}", std::env::temp_dir().display()),
         ])
         .arg(nexus_wasm.to_str().unwrap())
+        .arg("build")
         .arg(fixture_relpath)
         .arg(&output_path)
         .output()
