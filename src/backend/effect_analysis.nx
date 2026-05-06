@@ -35,6 +35,8 @@
 
 import { TypeExpr, TyRow } from "src/common/ast.nx"
 import { LirProgram, LirFunction, LirExternal, LirParam, LirAtom, LirExpr, LirStmt, LirCallArg, LirNamedAtom } from "src/ir/lir_types.nx"
+import { StringMap } from "std:stringmap"
+import * as smap from "std:stringmap"
 
 // ─── Public Types ────────────────────────────────────────────────────────────
 
@@ -53,12 +55,54 @@ export type EffectSummary = EffectSummary(
   is_pure: bool
 )
 
-/// Map from function name to its effect summary. Implemented as an
-/// association list because the LIR pipeline lacks a hashed key/value
-/// container in the self-host stdlib slice; lookup is linear but the
-/// number of functions per program is bounded by call-graph reachability.
+/// Map from function name to its effect summary.
+///
+/// Storage layout:
+/// * `entries` — ordered list of `EffectEntry` (one per LirFunction). Used
+///   by metric passes (classify, count_raise_sites) and tests that walk
+///   the full per-function record.
+/// * `lookup` — linear `%StringMap` keyed by function name; values are
+///   packed i64s holding `(can_throw << 2) | (is_pure << 1) | 1`. Bit 0
+///   is the presence flag so `get_or(default: 0)` distinguishes "not in
+///   map" from "present with both bits clear". This collapses the hot
+///   `lookup_summary` path from O(N) list scan to O(1) FFI lookup, which
+///   is the difference between an O(N²) and O(N) consumer pipeline at
+///   self-host scale (issue nexus-0i54).
+///
+/// Linear: each EffectMap owns its StringMap and must be freed via
+/// `free_effect_map`. Read-only consumers take `&EffectMap` so the
+/// underlying handle is borrowed, not consumed, on each lookup.
 export type EffectEntry = EffectEntry(name: string, summary: EffectSummary)
-export type EffectMap = EffectMap(entries: [EffectEntry])
+export opaque type EffectMap = EffectMap(entries: [EffectEntry], lookup: %StringMap)
+
+// Bitwise OR helper. The bootstrap rust parser does not (yet) accept `|`
+// as a binop in expression position, but the self-host parser does — so
+// we keep all bit-or-ish merges through this single function so the same
+// source compiles under both. When `a` and `b` are bit-disjoint this
+// reduces to `a + b`; when they overlap, `(a + b) - (a & b)` counts the
+// shared bits once. Used for both packed-summary assembly and cap
+// bitmask union during fixed-point propagation.
+let bit_or = fn (a: i64, b: i64) -> i64 do
+  return (a + b) - (a & b)
+end
+
+let pack_summary = fn (can_throw: bool, is_pure: bool) -> i64 do
+  let ct_bit = if can_throw then 4 else 0 end
+  let ip_bit = if is_pure then 2 else 0 end
+  return bit_or(a: bit_or(a: ct_bit, b: ip_bit), b: 1)
+end
+
+let packed_present = fn (packed: i64) -> bool do
+  return (packed & 1) != 0
+end
+
+let packed_can_throw = fn (packed: i64) -> bool do
+  return (packed & 4) != 0
+end
+
+let packed_is_pure = fn (packed: i64) -> bool do
+  return (packed & 2) != 0
+end
 
 // ─── Capability Mapping ──────────────────────────────────────────────────────
 //
@@ -76,6 +120,80 @@ let module_to_capability = fn (wasm_module: string) -> [string] do
   if wasm_module == "nexus:std/proc" then return ["Proc"] end
   if wasm_module == "nexus:std/env" then return ["Env"] end
   return []
+end
+
+// Capability bitmask layout (issue nexus-0i54). The capability vocabulary is
+// a fixed 7-element set (Fs, Net, Console, Random, Clock, Proc, Env) that
+// tracks the `--explain-capabilities` mapping. Encoding caps as a 7-bit
+// integer collapses union from O(|xs|+|ys|) list-allocation to O(1) bitwise
+// or, which is the difference between O(N²) and O(N) propagation memory at
+// self-host scale. Bit constants are exposed as nullary fns because the
+// Nexus self-host slice does not parse top-level scalar `let` bindings.
+let cap_bit_fs = fn () -> i64 do return 1 end
+let cap_bit_net = fn () -> i64 do return 2 end
+let cap_bit_console = fn () -> i64 do return 4 end
+let cap_bit_random = fn () -> i64 do return 8 end
+let cap_bit_clock = fn () -> i64 do return 16 end
+let cap_bit_proc = fn () -> i64 do return 32 end
+let cap_bit_env = fn () -> i64 do return 64 end
+
+let module_to_cap_bits = fn (wasm_module: string) -> i64 do
+  if wasm_module == "nexus:std/fs" then return cap_bit_fs() end
+  if wasm_module == "nexus:std/network" then return cap_bit_net() end
+  if wasm_module == "nexus:std/stdio" then return cap_bit_console() end
+  if wasm_module == "nexus:std/rand" then return cap_bit_random() end
+  if wasm_module == "nexus:std/clock" then return cap_bit_clock() end
+  if wasm_module == "nexus:std/proc" then return cap_bit_proc() end
+  if wasm_module == "nexus:std/env" then return cap_bit_env() end
+  return 0
+end
+
+// Convert a cap bitmask back to the `[string]` form expected by the public
+// EffectSummary surface. Order matches the original `module_to_capability`
+// ordering when an external is observed in source order — bit positions are
+// fixed so the same input set yields the same output list each run.
+let cap_bits_to_strings = fn (bits: i64) -> [string] do
+  let acc = []
+  let acc = if (bits & cap_bit_env()) != 0 then "Env" :: acc else acc end
+  let acc = if (bits & cap_bit_proc()) != 0 then "Proc" :: acc else acc end
+  let acc = if (bits & cap_bit_clock()) != 0 then "Clock" :: acc else acc end
+  let acc = if (bits & cap_bit_random()) != 0 then "Random" :: acc else acc end
+  let acc = if (bits & cap_bit_console()) != 0 then "Console" :: acc else acc end
+  let acc = if (bits & cap_bit_net()) != 0 then "Net" :: acc else acc end
+  let acc = if (bits & cap_bit_fs()) != 0 then "Fs" :: acc else acc end
+  return acc
+end
+
+// Working-state packed encoding (per-function during fixed point):
+//   bits 0..6  — capabilities bitmask (see cap_bit_* above)
+//   bit  7     — can_throw
+//   bit  8     — has_side_effect
+//   bit  9     — present (so StringMap.get_or(default: 0) means "no entry")
+let ws_caps_mask = fn () -> i64 do return 127 end
+let ws_throw_bit = fn () -> i64 do return 128 end
+let ws_se_bit = fn () -> i64 do return 256 end
+let ws_present_bit = fn () -> i64 do return 512 end
+
+let ws_pack = fn (caps: i64, can_throw: bool, has_side_effect: bool) -> i64 do
+  let ct = if can_throw then ws_throw_bit() else 0 end
+  let se = if has_side_effect then ws_se_bit() else 0 end
+  // bits (caps_mask), throw_bit, se_bit, present_bit are all disjoint so
+  // bit_or reduces to addition, but we keep the helper to make the
+  // structural intent (set assembly) explicit.
+  let masked = caps & ws_caps_mask()
+  return bit_or(a: bit_or(a: bit_or(a: masked, b: ct), b: se), b: ws_present_bit())
+end
+
+let ws_caps = fn (packed: i64) -> i64 do
+  return packed & ws_caps_mask()
+end
+
+let ws_can_throw = fn (packed: i64) -> bool do
+  return (packed & ws_throw_bit()) != 0
+end
+
+let ws_has_side_effect = fn (packed: i64) -> bool do
+  return (packed & ws_se_bit()) != 0
 end
 
 /// True for externals whose wasm_module is statically known to be pure
@@ -131,18 +249,23 @@ end
 //
 // DirectInfo carries the single-function direct walk: callees, externals
 // touched, raises, dynamic closure calls. After the direct walk we project
-// these into the per-function EffectSummary skeleton, then iterate the
+// these into the per-function packed working state, then iterate the
 // fixed point over the callee edges.
+//
+// `capabilities` is a bitmask (see cap_bit_* and module_to_cap_bits) so the
+// per-merge union collapses to a bitwise OR — issue nexus-0i54 traced the
+// self-host OOM cliff to the per-iteration list allocation in the prior
+// `[string]` representation.
 
 type DirectInfo = DirectInfo(
   callees: [string],          // statically known callee function names
-  capabilities: [string],     // caps observed directly via externals
+  capabilities: i64,          // caps bitmask observed directly via externals
   has_side_effect: bool,      // direct: non-pure external or closure call
   can_throw: bool             // direct: raise / throwing external / closure
 )
 
 let empty_direct = fn () -> DirectInfo do
-  return DirectInfo(callees: [], capabilities: [], has_side_effect: false, can_throw: false)
+  return DirectInfo(callees: [], capabilities: 0, has_side_effect: false, can_throw: false)
 end
 
 // ─── String-set helpers (assoc-list style) ──────────────────────────────────
@@ -153,32 +276,6 @@ let string_member = fn (s: string, xs: [string]) -> bool do
     | x :: rest ->
       if x == s then return true end
       return string_member(s, xs: rest)
-  end
-end
-
-let union_strings = fn (xs: [string], ys: [string]) -> [string] do
-  // Append every element of ys not already in xs, preserving the order of
-  // xs followed by the unique elements of ys (in order). This keeps caps
-  // lists deterministic across pipeline runs even though set semantics
-  // would tolerate reordering.
-  return union_strings_go(xs, ys, acc: reverse_strings_ea(lst: xs, out: []))
-end
-
-let union_strings_go = fn (xs: [string], ys: [string], acc: [string]) -> [string] do
-  match ys do
-    | [] -> return reverse_strings_ea(lst: acc, out: [])
-    | y :: rest ->
-      if string_member(s: y, xs) then
-        return union_strings_go(xs, ys: rest, acc)
-      end
-      return union_strings_go(xs: y :: xs, ys: rest, acc: y :: acc)
-  end
-end
-
-let reverse_strings_ea = fn (lst: [string], out: [string]) -> [string] do
-  match lst do
-    | [] -> return out
-    | x :: rest -> return reverse_strings_ea(lst: rest, out: x :: out)
   end
 end
 
@@ -193,7 +290,7 @@ let walk_call_target = fn (
   match lookup_external(name: func, exts) do
     | Some(val: ext) ->
       let LirExternal(name: _, wasm_module: m, wasm_name: _, params: _, ret_type: _, throw_row: tr) = ext
-      let new_caps = union_strings(xs: capabilities, ys: module_to_capability(wasm_module: m))
+      let new_caps = bit_or(a: capabilities, b: module_to_cap_bits(wasm_module: m))
       let pure_mod = is_pure_external_module(wasm_module: m)
       let new_se = if pure_mod then has_side_effect else true end
       let new_throw = if throw_row_is_throwing(row: tr) then true else can_throw end
@@ -325,145 +422,115 @@ end
 
 // ─── Fixed-Point Propagation ─────────────────────────────────────────────────
 //
-// The summary lattice for one function is (caps: ⊆-monotone string set,
-// can_throw: bool ascending false→true, has_side_effect: bool ascending).
-// One iteration scans every direct entry, looks up each callee's current
-// summary, and merges those bits into the caller. We loop until no entry
-// changes; convergence is guaranteed by monotonicity over a finite domain.
+// The summary lattice for one function is (caps: bitmask, can_throw: bool
+// ascending false→true, has_side_effect: bool ascending). Per-function
+// state is encoded as a single packed i64 (see ws_pack) and stored in a
+// linear `%StringMap` keyed by function name. One iteration walks every
+// callee list, looks up each callee's current packed state via O(1)
+// StringMap.get_or, ORs the bits into the caller's accumulator, and writes
+// back if anything changed. We loop until no entry changes; convergence is
+// guaranteed by monotonicity over a finite domain.
+//
+// The earlier list-based propagation (issue nexus-0i54) was O(N²) per
+// iteration: each callee triggered a linear scan of the working-entries
+// list, and `union_strings` allocated a fresh list per merge. At self-host
+// scale (~2173 functions) that drove the host's WASM memory allocator
+// off a cliff. The StringMap-backed encoding folds both costs into a
+// single packed i64 plus an FFI lookup; capability sets become bitwise OR
+// (cap_bit_*), eliminating per-merge list allocation entirely.
 
-type WorkingEntry = WorkingEntry(
-  name: string,
-  capabilities: [string],
-  can_throw: bool,
-  has_side_effect: bool,
-  callees: [string]
-)
+// CalleeEntry: function name + its static callees. Built from DirectInfo
+// and held in a list for the per-iteration sweep order. Callees themselves
+// are still a list since their count per caller is small (typically <10).
+type CalleeEntry = CalleeEntry(name: string, callees: [string])
 
-let direct_to_working = fn (entries: [DirectEntry]) -> [WorkingEntry] do
-  return direct_to_working_go(entries, acc: [])
+let direct_to_callee_entries = fn (entries: [DirectEntry]) -> [CalleeEntry] do
+  return direct_to_callee_entries_go(entries, acc: [])
 end
 
-let direct_to_working_go = fn (entries: [DirectEntry], acc: [WorkingEntry]) -> [WorkingEntry] do
+let direct_to_callee_entries_go = fn (entries: [DirectEntry], acc: [CalleeEntry]) -> [CalleeEntry] do
   match entries do
-    | [] -> return reverse_working_entries(lst: acc, out: [])
+    | [] -> return reverse_callee_entries(lst: acc, out: [])
     | DirectEntry(name, info) :: rest ->
-      let DirectInfo(callees, capabilities, has_side_effect, can_throw) = info
-      let entry = WorkingEntry(name, capabilities, can_throw, has_side_effect, callees)
-      return direct_to_working_go(entries: rest, acc: entry :: acc)
+      let DirectInfo(callees, capabilities: _, has_side_effect: _, can_throw: _) = info
+      return direct_to_callee_entries_go(entries: rest, acc: CalleeEntry(name, callees) :: acc)
   end
 end
 
-let reverse_working_entries = fn (lst: [WorkingEntry], out: [WorkingEntry]) -> [WorkingEntry] do
+let reverse_callee_entries = fn (lst: [CalleeEntry], out: [CalleeEntry]) -> [CalleeEntry] do
   match lst do
     | [] -> return out
-    | x :: rest -> return reverse_working_entries(lst: rest, out: x :: out)
+    | x :: rest -> return reverse_callee_entries(lst: rest, out: x :: out)
   end
 end
 
-let lookup_working = fn (name: string, entries: [WorkingEntry]) -> Option<WorkingEntry> do
+// Build the initial working state: name → packed direct DirectInfo bits.
+// Keys are function names; values are ws_pack(caps, can_throw, has_side_effect).
+let build_initial_state = fn (entries: [DirectEntry], map: %StringMap) -> %StringMap do
   match entries do
-    | [] -> return None
-    | e :: rest ->
-      let WorkingEntry(name: en, capabilities: _, can_throw: _, has_side_effect: _, callees: _) = e
-      if en == name then return Some(val: e) end
-      return lookup_working(name, entries: rest)
+    | [] -> return %map
+    | DirectEntry(name, info) :: rest ->
+      let DirectInfo(callees: _, capabilities, has_side_effect, can_throw) = info
+      let packed = ws_pack(caps: capabilities, can_throw, has_side_effect)
+      let %map = smap.put(map: %map, key: name, value: packed)
+      return build_initial_state(entries: rest, map: %map)
   end
 end
 
-// One propagation step over a single entry: merge each callee's current
-// summary into the caller's. Returns the updated entry plus a flag
-// indicating whether anything actually changed.
+// Merge one callee's bits into the running accumulator. Looks up the
+// callee's current packed state from the working StringMap; absent callees
+// (externals already merged during the direct walk, or stale references)
+// contribute zero effects.
+let merge_one_callee = fn (callee: string, caps: i64, can_throw: bool, has_side_effect: bool,
+                            state: &StringMap) -> i64 do
+  // Returns the merged packed state (without the present bit, just the
+  // accumulator). The caller wraps this back into ws_pack.
+  let cur = smap.get_or(map: state, key: callee, default: 0)
+  if (cur & ws_present_bit()) == 0 then
+    // Absent: contribute nothing.
+    return ws_pack(caps: caps, can_throw: can_throw, has_side_effect: has_side_effect)
+  end
+  let new_caps = bit_or(a: caps, b: ws_caps(packed: cur))
+  let new_throw = if ws_can_throw(packed: cur) then true else can_throw end
+  let new_se = if ws_has_side_effect(packed: cur) then true else has_side_effect end
+  return ws_pack(caps: new_caps, can_throw: new_throw, has_side_effect: new_se)
+end
 
-type StepResult = StepResult(entry: WorkingEntry, changed: bool)
-
-let merge_callees = fn (
-  callees: [string],
-  caps: [string],
-  can_throw: bool,
-  has_side_effect: bool,
-  entries: [WorkingEntry]
-) -> WorkingEntry do
+let merge_callees_packed = fn (callees: [string], packed: i64, state: &StringMap) -> i64 do
   match callees do
-    | [] ->
-      // Caller has no edges to merge; return unchanged shell. The caller
-      // name and edge list are filled in by step_entry below.
-      return WorkingEntry(name: "", capabilities: caps, can_throw, has_side_effect, callees: [])
+    | [] -> return packed
     | c :: rest ->
-      match lookup_working(name: c, entries) do
-        | Some(val: callee) ->
-          let WorkingEntry(name: _, capabilities: cc, can_throw: ct, has_side_effect: cs, callees: _) = callee
-          let new_caps = union_strings(xs: caps, ys: cc)
-          let new_throw = if ct then true else can_throw end
-          let new_se = if cs then true else has_side_effect end
-          return merge_callees(callees: rest, caps: new_caps, can_throw: new_throw, has_side_effect: new_se, entries)
-        | None ->
-          // Edge to a name with no working entry — should not normally
-          // happen for static LIR calls. Skip rather than corrupt the
-          // summary; this preserves the property that absent callees
-          // contribute zero effects (they are externals already merged
-          // during the direct walk, or stale references).
-          return merge_callees(callees: rest, caps, can_throw, has_side_effect, entries)
-      end
+      let next_packed = merge_one_callee(callee: c, caps: ws_caps(packed: packed),
+                                          can_throw: ws_can_throw(packed: packed),
+                                          has_side_effect: ws_has_side_effect(packed: packed),
+                                          state: state)
+      return merge_callees_packed(callees: rest, packed: next_packed, state: state)
   end
 end
 
-let step_entry = fn (entry: WorkingEntry, all: [WorkingEntry]) -> StepResult do
-  let WorkingEntry(name, capabilities, can_throw, has_side_effect, callees) = entry
-  let merged = merge_callees(callees, caps: capabilities, can_throw, has_side_effect, entries: all)
-  let WorkingEntry(name: _, capabilities: new_caps, can_throw: new_throw, has_side_effect: new_se, callees: _) = merged
-  let changed = entry_changed(
-    old_caps: capabilities, new_caps,
-    old_throw: can_throw, new_throw,
-    old_se: has_side_effect, new_se
-  )
-  let next = WorkingEntry(name, capabilities: new_caps, can_throw: new_throw, has_side_effect: new_se, callees)
-  return StepResult(entry: next, changed)
+// One full iteration: step every entry in `callee_entries`, threading the
+// `%StringMap` linearly. Returns the updated map and a `changed` flag.
+type IterResult = IterResult(state: %StringMap, changed: bool)
+
+let one_iteration_smap = fn (callee_entries: [CalleeEntry], state: %StringMap) -> IterResult do
+  return one_iteration_smap_go(remaining: callee_entries, state: %state, changed: false)
 end
 
-let entry_changed = fn (
-  old_caps: [string], new_caps: [string],
-  old_throw: bool, new_throw: bool,
-  old_se: bool, new_se: bool
-) -> bool do
-  if old_throw != new_throw then return true end
-  if old_se != new_se then return true end
-  return caps_changed(old_caps, new_caps)
-end
-
-let caps_changed = fn (old_caps: [string], new_caps: [string]) -> bool do
-  // Lattice is monotone: new_caps ⊇ old_caps always, so the size
-  // comparison is sufficient. No need to walk pairwise.
-  return list_length_str(xs: old_caps) != list_length_str(xs: new_caps)
-end
-
-let list_length_str = fn (xs: [string]) -> i64 do
-  match xs do
-    | [] -> return 0
-    | _ :: rest -> return 1 + list_length_str(xs: rest)
-  end
-end
-
-// One full iteration: step every entry, accumulating a new list and a
-// global "changed" flag.
-
-type IterResult = IterResult(entries: [WorkingEntry], changed: bool)
-
-let one_iteration = fn (entries: [WorkingEntry]) -> IterResult do
-  return one_iteration_go(remaining: entries, all: entries, acc: [], changed: false)
-end
-
-let one_iteration_go = fn (
-  remaining: [WorkingEntry],
-  all: [WorkingEntry],
-  acc: [WorkingEntry],
+let one_iteration_smap_go = fn (
+  remaining: [CalleeEntry],
+  state: %StringMap,
   changed: bool
 ) -> IterResult do
   match remaining do
-    | [] -> return IterResult(entries: reverse_working_entries(lst: acc, out: []), changed)
-    | e :: rest ->
-      let StepResult(entry: stepped, changed: ec) = step_entry(entry: e, all)
-      let new_changed = if ec then true else changed end
-      return one_iteration_go(remaining: rest, all, acc: stepped :: acc, changed: new_changed)
+    | [] -> return IterResult(state: %state, changed)
+    | CalleeEntry(name, callees) :: rest ->
+      let cur = smap.get_or(map: &state, key: name, default: 0)
+      let merged = merge_callees_packed(callees: callees, packed: cur, state: &state)
+      let now_changed = if cur != merged then true else changed end
+      let %state = if cur != merged then
+        smap.put(map: %state, key: name, value: merged)
+      else %state end
+      return one_iteration_smap_go(remaining: rest, state: %state, changed: now_changed)
   end
 end
 
@@ -472,51 +539,72 @@ end
 // linear bound (4× function count) is sufficient and acts as a safety net
 // against unexpected non-monotone behaviour.
 
-let propagate = fn (entries: [WorkingEntry]) -> [WorkingEntry] do
-  let n = list_length_we(xs: entries)
-  return propagate_go(entries, fuel: 4 * n + 4)
+let propagate_smap = fn (callee_entries: [CalleeEntry], state: %StringMap) -> %StringMap do
+  let n = list_length_ce(xs: callee_entries)
+  return propagate_smap_go(callee_entries: callee_entries, state: %state, fuel: 4 * n + 4)
 end
 
-let propagate_go = fn (entries: [WorkingEntry], fuel: i64) -> [WorkingEntry] do
-  if fuel <= 0 then return entries end
-  let IterResult(entries: next, changed) = one_iteration(entries)
+let propagate_smap_go = fn (callee_entries: [CalleeEntry], state: %StringMap, fuel: i64) -> %StringMap do
+  if fuel <= 0 then return %state end
+  let IterResult(state, changed) = one_iteration_smap(callee_entries: callee_entries, state: %state)
+  let %next = state
   if changed then
-    return propagate_go(entries: next, fuel: fuel - 1)
+    return propagate_smap_go(callee_entries: callee_entries, state: %next, fuel: fuel - 1)
   end
-  return next
+  return %next
 end
 
-let list_length_we = fn (xs: [WorkingEntry]) -> i64 do
+let list_length_ce = fn (xs: [CalleeEntry]) -> i64 do
   match xs do
     | [] -> return 0
-    | _ :: rest -> return 1 + list_length_we(xs: rest)
+    | _ :: rest -> return 1 + list_length_ce(xs: rest)
   end
 end
 
 // ─── Finalisation ────────────────────────────────────────────────────────────
 
-let finalise = fn (entries: [WorkingEntry]) -> EffectMap do
-  return EffectMap(entries: finalise_go(entries, acc: []))
+// finalise: walk the function order (preserved via the DirectEntry list)
+// and read each function's converged state from the working StringMap.
+// Builds the public-facing entries list (with [string] caps for tests/UI)
+// and the consumer-facing lookup StringMap (packed (can_throw, is_pure)
+// only). The two views are constructed in a single pass so they share the
+// allocation.
+type FinaliseResult = FinaliseResult(entries: [EffectEntry], lookup: %StringMap)
+
+let finalise_smap = fn (direct: [DirectEntry], state: %StringMap) -> %EffectMap do
+  let %lookup = smap.empty()
+  let FinaliseResult(entries: rev, lookup) =
+    finalise_smap_go(direct: direct, state: &state, lookup: %lookup, acc: [])
+  let %final_lookup = lookup
+  let entries = reverse_effect_entries(lst: rev, out: [])
+  smap.free(map: %state)
+  let em = EffectMap(entries: entries, lookup: %final_lookup)
+  let %em = em
+  return %em
 end
 
-let finalise_go = fn (entries: [WorkingEntry], acc: [EffectEntry]) -> [EffectEntry] do
-  match entries do
-    | [] -> return reverse_effect_entries(lst: acc, out: [])
-    | e :: rest ->
-      let WorkingEntry(name, capabilities, can_throw, has_side_effect, callees: _) = e
-      let pure = compute_purity(caps: capabilities, can_throw, has_side_effect)
-      let summary = EffectSummary(capabilities_used: capabilities, can_throw, is_pure: pure)
-      return finalise_go(entries: rest, acc: EffectEntry(name, summary) :: acc)
+let finalise_smap_go = fn (direct: [DirectEntry], state: &StringMap,
+                            lookup: %StringMap, acc: [EffectEntry]) -> FinaliseResult do
+  match direct do
+    | [] -> return FinaliseResult(entries: acc, lookup: %lookup)
+    | DirectEntry(name, info: _) :: rest ->
+      let packed = smap.get_or(map: state, key: name, default: 0)
+      let caps_bits = ws_caps(packed: packed)
+      let ct = ws_can_throw(packed: packed)
+      let se = ws_has_side_effect(packed: packed)
+      let pure_b = compute_purity_bits(caps: caps_bits, can_throw: ct, has_side_effect: se)
+      let caps_list = cap_bits_to_strings(bits: caps_bits)
+      let summary = EffectSummary(capabilities_used: caps_list, can_throw: ct, is_pure: pure_b)
+      let %lookup = smap.put(map: %lookup, key: name, value: pack_summary(can_throw: ct, is_pure: pure_b))
+      return finalise_smap_go(direct: rest, state, %lookup,
+                              acc: EffectEntry(name, summary) :: acc)
   end
 end
 
-let compute_purity = fn (caps: [string], can_throw: bool, has_side_effect: bool) -> bool do
+let compute_purity_bits = fn (caps: i64, can_throw: bool, has_side_effect: bool) -> bool do
   if can_throw then return false end
   if has_side_effect then return false end
-  match caps do
-    | [] -> return true
-    | _ -> return false
-  end
+  return caps == 0
 end
 
 let reverse_effect_entries = fn (lst: [EffectEntry], out: [EffectEntry]) -> [EffectEntry] do
@@ -530,22 +618,48 @@ end
 
 /// Compute the per-function effect map for `program`. The returned map
 /// contains one entry per LirFunction; consumers look up by function name
-/// (matching `LirFunction.name`).
-export let analyze_effects = fn (program: LirProgram) -> EffectMap do
+/// (matching `LirFunction.name`). Linear: caller must `free_effect_map`
+/// once consumers are done with it.
+export let analyze_effects = fn (program: LirProgram) -> %EffectMap do
   let LirProgram(functions, externals) = program
   let direct = build_direct_entries(funcs: functions, exts: externals)
-  let working = direct_to_working(entries: direct)
-  let propagated = propagate(entries: working)
-  return finalise(entries: propagated)
+  let callee_entries = direct_to_callee_entries(entries: direct)
+  let %state = smap.empty()
+  let %state = build_initial_state(entries: direct, map: %state)
+  let %state = propagate_smap(callee_entries: callee_entries, state: %state)
+  return finalise_smap(direct: direct, state: %state)
+end
+
+/// Releases the EffectMap's StringMap handle. Consumes the linear value.
+export let free_effect_map = fn (em: %EffectMap) -> unit do
+  let EffectMap(entries: _, lookup) = em
+  smap.free(map: %lookup)
+  return ()
 end
 
 // ─── Lookup helpers (consumer convenience) ───────────────────────────────────
 
-/// Lookup a function's summary by name. Returns None if `name` is not in
-/// the map (e.g. caller mistyped the function name or the function was
-/// added after analysis ran).
-export let lookup_summary = fn (em: EffectMap, name: string) -> Option<EffectSummary> do
-  let EffectMap(entries) = em
+/// Lookup the (can_throw, is_pure) bits for `name`. Returns None if the
+/// name is not in the map. This is the hot path used by codegen / lir_opt
+/// / memo_plan; capabilities_used is intentionally not surfaced here
+/// because no consumer reads it. Backed by O(1) StringMap lookup.
+export type EffectBits = EffectBits(can_throw: bool, is_pure: bool)
+
+export let lookup_bits = fn (em: &EffectMap, name: string) -> Option<EffectBits> do
+  let EffectMap(entries: _, lookup) = em
+  let packed = smap.get_or(map: &lookup, key: name, default: 0)
+  if packed_present(packed: packed) then
+    return Some(val: EffectBits(can_throw: packed_can_throw(packed: packed), is_pure: packed_is_pure(packed: packed)))
+  end
+  return None
+end
+
+/// Lookup a function's full summary by name. Returns None if `name` is not
+/// in the map (e.g. caller mistyped the function name or the function was
+/// added after analysis ran). Used by tests; production consumers prefer
+/// `lookup_bits` for the O(1) packed-bits path.
+export let lookup_summary = fn (em: &EffectMap, name: string) -> Option<EffectSummary> do
+  let EffectMap(entries, lookup: _) = em
   return lookup_summary_go(entries, name)
 end
 
@@ -559,8 +673,8 @@ let lookup_summary_go = fn (entries: [EffectEntry], name: string) -> Option<Effe
 end
 
 /// Convenience: total number of summarised functions.
-export let effect_map_size = fn (em: EffectMap) -> i64 do
-  let EffectMap(entries) = em
+export let effect_map_size = fn (em: &EffectMap) -> i64 do
+  let EffectMap(entries, lookup: _) = em
   return effect_map_size_go(entries)
 end
 
@@ -589,8 +703,8 @@ export type EffectClassCounts = EffectClassCounts(
   total: i64
 )
 
-export let classify_effect_map = fn (em: EffectMap) -> EffectClassCounts do
-  let EffectMap(entries) = em
+export let classify_effect_map = fn (em: &EffectMap) -> EffectClassCounts do
+  let EffectMap(entries, lookup: _) = em
   return classify_effect_map_go(entries, pure: 0, can_throw: 0, impure: 0, total: 0)
 end
 
@@ -639,14 +753,14 @@ export type RaiseSiteCounts = RaiseSiteCounts(
   total: i64
 )
 
-export let count_raise_sites = fn (program: LirProgram, em: EffectMap) -> RaiseSiteCounts do
+export let count_raise_sites = fn (program: LirProgram, em: &EffectMap) -> RaiseSiteCounts do
   let LirProgram(functions, externals: _) = program
   return count_raise_sites_funcs(funcs: functions, em, emitted: 0, elided: 0)
 end
 
 let count_raise_sites_funcs = fn (
   funcs: [LirFunction],
-  em: EffectMap,
+  em: &EffectMap,
   emitted: i64,
   elided: i64
 ) -> RaiseSiteCounts do
@@ -667,10 +781,9 @@ end
 /// capture call when its EffectMap entry has can_throw=true OR when the
 /// function is absent from the map (conservative fallback). Functions
 /// whose entry has can_throw=false are the only ones that elide.
-let func_emits_capture = fn (name: string, em: EffectMap) -> bool do
-  match lookup_summary(em, name) do
-    | Some(val: EffectSummary(capabilities_used: _, can_throw: ct, is_pure: _)) ->
-      return ct
+let func_emits_capture = fn (name: string, em: &EffectMap) -> bool do
+  match lookup_bits(em, name) do
+    | Some(val: EffectBits(can_throw: ct, is_pure: _)) -> return ct
     | None -> return true
   end
 end
