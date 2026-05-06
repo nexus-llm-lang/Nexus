@@ -1063,16 +1063,49 @@ impl<'a> LowerCtx<'a> {
                 }
             }
             MirStmt::Assign { target, value } => {
-                // Lower both sides to atoms
-                let target_atom = self.lower_expr_to_atom(target)?;
-                let value_atom = self.lower_expr_to_atom(value)?;
-                // Emit as a let re-binding (ANF doesn't have mutation)
-                if let LirAtom::Var { name, typ } = target_atom {
-                    self.stmts.push(LirStmt::Let {
-                        name,
-                        typ,
-                        expr: LirExpr::Atom(value_atom),
-                    });
+                // Dispatch on the target shape — variable rebinding for plain
+                // identifiers, `__array_set` intrinsic call for `arr[idx] <- v`.
+                // Mirrors src/ir/lir.nx::MirStmtAssign (nexus-gel8). Lowering the
+                // target through lower_expr_to_atom unconditionally would emit a
+                // dead `__array_get` for indexed targets and silently drop the write.
+                match target {
+                    MirExpr::Variable(_) => {
+                        let target_atom = self.lower_expr_to_atom(target)?;
+                        let value_atom = self.lower_expr_to_atom(value)?;
+                        if let LirAtom::Var { name, typ } = target_atom {
+                            self.stmts.push(LirStmt::Let {
+                                name,
+                                typ,
+                                expr: LirExpr::Atom(value_atom),
+                            });
+                        }
+                    }
+                    MirExpr::Index(arr, idx) => {
+                        let arr_atom = self.lower_expr_to_atom(arr)?;
+                        let idx_atom = self.lower_expr_to_atom(idx)?;
+                        let value_atom = self.lower_expr_to_atom(value)?;
+                        // Args sorted by label to match emit_call's external-arg order.
+                        let mut args = vec![
+                            (Symbol::from("arr"), arr_atom),
+                            (Symbol::from("idx"), idx_atom),
+                            (Symbol::from("val"), value_atom),
+                        ];
+                        args.sort_by(|(a, _), (b, _)| a.cmp(b));
+                        let typ = Type::Unit;
+                        let _ = self.bind_expr_to_temp(
+                            LirExpr::Call {
+                                func: Symbol::from("__array_set"),
+                                args,
+                                typ: typ.clone(),
+                            },
+                            typ,
+                        );
+                    }
+                    _ => {
+                        // Non-variable, non-index target: still evaluate `value`
+                        // for side effects to mirror src/ir/lir.nx fallthrough.
+                        let _ = self.lower_expr_to_atom(value)?;
+                    }
                 }
                 Ok(None)
             }

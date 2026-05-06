@@ -1,4 +1,5 @@
 pub mod arithmetic;
+pub mod arrays;
 pub mod chars;
 pub mod concurrency;
 pub mod control_flow;

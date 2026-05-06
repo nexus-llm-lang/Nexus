@@ -758,6 +758,21 @@ pub(super) fn compile_expr(
         LirExpr::Call { func, args, .. } | LirExpr::TailCall { func, args, .. } => {
             let is_tail = matches!(expr, LirExpr::TailCall { .. }) && !in_try;
 
+            // Array index intrinsics (nexus-gel8): `arr[idx]` lowers to a
+            // synthetic `__array_get` call, `arr[idx] <- v` to `__array_set`.
+            // Neither is registered as an internal/external symbol, so dispatch
+            // here. Arrays are heap-allocated records packed into i64 as
+            // `(ptr<<32) | len` (see is_sequential_numeric_field_names below);
+            // element addr is `ptr + (idx+1)*8`.
+            if func.as_str() == "__array_get" {
+                emit_array_get(args, out, local_map, layout)?;
+                return Ok(());
+            }
+            if func.as_str() == "__array_set" {
+                emit_array_set(args, out, local_map, layout)?;
+                return Ok(());
+            }
+
             // Self-recursion-to-loop: self-tail-call → param reassignment + br
             if is_tail {
                 if let Some(tco) = tco_loop {
@@ -2565,6 +2580,94 @@ fn emit_intrinsic_clamp_arg(
     out.instruction(&Instruction::I32LeU);
     out.instruction(&Instruction::Select);
     out.instruction(&Instruction::LocalSet(dest_local));
+    Ok(())
+}
+
+/// Emit `__array_get(arr, idx) -> i64`: pushes element at offset (idx+1)*8 from
+/// the heap pointer encoded in the upper 32 bits of `arr` (see Record codegen
+/// where sequential-numeric-name records pack as `(ptr<<32) | len`).
+fn emit_array_get(
+    args: &[(Symbol, LirAtom)],
+    out: &mut Function,
+    local_map: &HashMap<Symbol, LocalInfo>,
+    layout: &CodegenLayout,
+) -> Result<(), CodegenError> {
+    let arr = args
+        .iter()
+        .find(|(l, _)| l.as_str() == "arr")
+        .map(|(_, a)| a)
+        .ok_or_else(|| CodegenError::CallTargetNotFound {
+            name: "__array_get(arr,idx) missing 'arr'".into(),
+        })?;
+    let idx = args
+        .iter()
+        .find(|(l, _)| l.as_str() == "idx")
+        .map(|(_, a)| a)
+        .ok_or_else(|| CodegenError::CallTargetNotFound {
+            name: "__array_get(arr,idx) missing 'idx'".into(),
+        })?;
+    // base ptr = (arr >> 32) as i32
+    compile_atom(arr, out, local_map, layout)?;
+    out.instruction(&Instruction::I64Const(32));
+    out.instruction(&Instruction::I64ShrU);
+    out.instruction(&Instruction::I32WrapI64);
+    // offset = (idx as i32) * 8 + 8
+    compile_atom(idx, out, local_map, layout)?;
+    out.instruction(&Instruction::I32WrapI64);
+    out.instruction(&Instruction::I32Const(8));
+    out.instruction(&Instruction::I32Mul);
+    out.instruction(&Instruction::I32Const(8));
+    out.instruction(&Instruction::I32Add);
+    out.instruction(&Instruction::I32Add);
+    out.instruction(&Instruction::I64Load(memarg(0)));
+    Ok(())
+}
+
+/// Emit `__array_set(arr, idx, val) -> unit`: stores `val` (i64) at the same
+/// element address `__array_get` reads from. Leaves no value on the stack
+/// (matches the unit return type — compile_stmt won't emit a Drop).
+fn emit_array_set(
+    args: &[(Symbol, LirAtom)],
+    out: &mut Function,
+    local_map: &HashMap<Symbol, LocalInfo>,
+    layout: &CodegenLayout,
+) -> Result<(), CodegenError> {
+    let arr = args
+        .iter()
+        .find(|(l, _)| l.as_str() == "arr")
+        .map(|(_, a)| a)
+        .ok_or_else(|| CodegenError::CallTargetNotFound {
+            name: "__array_set(arr,idx,val) missing 'arr'".into(),
+        })?;
+    let idx = args
+        .iter()
+        .find(|(l, _)| l.as_str() == "idx")
+        .map(|(_, a)| a)
+        .ok_or_else(|| CodegenError::CallTargetNotFound {
+            name: "__array_set(arr,idx,val) missing 'idx'".into(),
+        })?;
+    let val = args
+        .iter()
+        .find(|(l, _)| l.as_str() == "val")
+        .map(|(_, a)| a)
+        .ok_or_else(|| CodegenError::CallTargetNotFound {
+            name: "__array_set(arr,idx,val) missing 'val'".into(),
+        })?;
+    // address = ((arr >> 32) as i32) + (idx as i32) * 8 + 8
+    compile_atom(arr, out, local_map, layout)?;
+    out.instruction(&Instruction::I64Const(32));
+    out.instruction(&Instruction::I64ShrU);
+    out.instruction(&Instruction::I32WrapI64);
+    compile_atom(idx, out, local_map, layout)?;
+    out.instruction(&Instruction::I32WrapI64);
+    out.instruction(&Instruction::I32Const(8));
+    out.instruction(&Instruction::I32Mul);
+    out.instruction(&Instruction::I32Const(8));
+    out.instruction(&Instruction::I32Add);
+    out.instruction(&Instruction::I32Add);
+    // value (i64)
+    compile_atom(val, out, local_map, layout)?;
+    out.instruction(&Instruction::I64Store(memarg(0)));
     Ok(())
 }
 
