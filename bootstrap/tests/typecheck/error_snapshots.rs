@@ -244,6 +244,30 @@ fn snapshot_effect_leak_pure_calls_impure() {
     insta::assert_snapshot!(err);
 }
 
+/// Regression for nexus-wk6i: row-mismatch diagnostics must surface the
+/// surplus labels and the row kind (throws / requires), not a bare
+/// "Row mismatch" string. A pure caller invoking a `throws { Exn }`
+/// callee names `{ Exn }` as the offender.
+#[test]
+fn snapshot_row_mismatch_throws_exn_vs_pure() {
+    let err = should_fail_typecheck(
+        r#"
+    exception Boom(code: i64)
+
+    let raiser = fn () -> unit throws { Exn } do
+        raise Boom(code: 1)
+    end
+
+    let pure_caller = fn () -> unit throws {} do
+        raiser()
+    end
+
+    let main = fn () -> unit do return () end
+    "#,
+    );
+    insta::assert_snapshot!(err);
+}
+
 #[test]
 fn snapshot_raise_without_throws() {
     let err = should_fail_typecheck(

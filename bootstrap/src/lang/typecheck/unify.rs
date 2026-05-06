@@ -3,6 +3,40 @@ use super::{Subst, TypeChecker};
 use crate::lang::ast::*;
 use std::collections::{HashMap, HashSet};
 
+/// Origin of a row being unified — feeds the diagnostic so callers see
+/// `throws row mismatch: ...` instead of an undirected `Row mismatch`.
+/// Deeper recursive sites that lack the surrounding source context fall
+/// back to `Anonymous`; only top-level callers (and the Arrow arm, which
+/// knows which sub-row is the throws-row vs requires-row) supply richer
+/// kinds.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Record/Port are reserved for future row-context plumbing.
+pub(super) enum RowContext {
+    Throws,
+    Requires,
+    Record,
+    Port,
+    Anonymous,
+}
+
+impl RowContext {
+    fn prefix(self) -> &'static str {
+        match self {
+            RowContext::Throws => "throws row mismatch",
+            RowContext::Requires => "requires row mismatch",
+            RowContext::Record => "record row mismatch",
+            RowContext::Port => "port row mismatch",
+            RowContext::Anonymous => "row mismatch",
+        }
+    }
+}
+
+fn format_labels(labels: &[Type]) -> String {
+    let mut names: Vec<String> = labels.iter().map(|t| format!("{}", t)).collect();
+    names.sort();
+    format!("{{ {} }}", names.join(", "))
+}
+
 impl TypeChecker {
     pub(super) fn generalize(&self, env: &TypeEnv, typ: Type) -> Scheme {
         let evs = get_free_vars_env(env);
@@ -12,6 +46,15 @@ impl TypeChecker {
     }
 
     pub(super) fn unify(&mut self, t1: &Type, t2: &Type) -> Result<Subst, String> {
+        self.unify_with_ctx(t1, t2, RowContext::Anonymous)
+    }
+
+    pub(super) fn unify_with_ctx(
+        &mut self,
+        t1: &Type,
+        t2: &Type,
+        ctx: RowContext,
+    ) -> Result<Subst, String> {
         match (t1, t2) {
             (t1, t2) if t1 == t2 => Ok(HashMap::new()),
             (Type::IntLit, Type::I32)
@@ -47,9 +90,17 @@ impl TypeChecker {
                 }
                 let sr = self.unify(&apply_subst_type(&s, r1), &apply_subst_type(&s, r2))?;
                 s = compose_subst(&s, &sr);
-                let sreq = self.unify(&apply_subst_type(&s, req1), &apply_subst_type(&s, req2))?;
+                let sreq = self.unify_with_ctx(
+                    &apply_subst_type(&s, req1),
+                    &apply_subst_type(&s, req2),
+                    RowContext::Requires,
+                )?;
                 s = compose_subst(&s, &sreq);
-                let se = self.unify(&apply_subst_type(&s, e1), &apply_subst_type(&s, e2))?;
+                let se = self.unify_with_ctx(
+                    &apply_subst_type(&s, e1),
+                    &apply_subst_type(&s, e2),
+                    RowContext::Throws,
+                )?;
                 s = compose_subst(&s, &se);
                 Ok(s)
             }
@@ -75,14 +126,22 @@ impl TypeChecker {
                     let sn = self.unify(&apply_subst_type(&s, i), &row)?;
                     s = compose_subst(&s, &sn);
                 } else if !e2r.is_empty() {
-                    return Err("Row mismatch".into());
+                    return Err(format!(
+                        "{}: callee row has extra label(s) {} not admitted by caller",
+                        ctx.prefix(),
+                        format_labels(&e2r)
+                    ));
                 }
                 if let Some(i) = t2 {
                     let row = Type::Row(e1r, ft);
                     let sn = self.unify(&apply_subst_type(&s, i), &row)?;
                     s = compose_subst(&s, &sn);
                 } else if !e1r.is_empty() {
-                    return Err("Row mismatch".into());
+                    return Err(format!(
+                        "{}: caller row has extra label(s) {} not admitted by callee",
+                        ctx.prefix(),
+                        format_labels(&e1r)
+                    ));
                 }
                 Ok(s)
             }

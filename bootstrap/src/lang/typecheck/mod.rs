@@ -25,6 +25,7 @@ use lint::{
     find_private_type_in_public_signature,
 };
 use unify::compose_subst;
+use unify::RowContext;
 
 use super::ast::*;
 use super::parser;
@@ -1644,7 +1645,7 @@ impl TypeChecker {
                 // check_call_throw_row_admitted handles this via subsumption.
                 let caller_ee = apply_subst_type(&s, ee);
                 let caller_admits_exn = matches!(&caller_ee, Type::Row(members, _) if members.iter().any(|m| matches!(m, Type::UserDefined(n, _) if n == "Exn")));
-                let se = match self.unify(&caller_ee, &eco) {
+                let se = match self.unify_with_ctx(&caller_ee, &eco, RowContext::Throws) {
                     Ok(sub) => sub,
                     Err(m) => {
                         if caller_admits_exn {
@@ -1653,7 +1654,7 @@ impl TypeChecker {
                                 vec![Type::UserDefined("Exn".into(), vec![])],
                                 Some(Box::new(self.new_var())),
                             );
-                            self.unify(&caller_ee, &exn_row)
+                            self.unify_with_ctx(&caller_ee, &exn_row, RowContext::Throws)
                                 .map_err(|m2| TypeError::new(m2, e.span.clone()))?
                         } else {
                             return Err(TypeError::new(m, e.span.clone()));
@@ -1667,12 +1668,14 @@ impl TypeChecker {
                     Type::Unit => Type::Row(vec![], Some(Box::new(self.new_var()))),
                     other => other,
                 };
-                let sr = self.unify(&apply_subst_type(&s, eq), &reqo).map_err(|_| {
-                    TypeError::new(
-                        format!("Call to '{}' requires {}", func, reqi),
-                        e.span.clone(),
-                    )
-                })?;
+                let sr = self
+                    .unify_with_ctx(&apply_subst_type(&s, eq), &reqo, RowContext::Requires)
+                    .map_err(|_| {
+                        TypeError::new(
+                            format!("Call to '{}' requires {}", func, reqi),
+                            e.span.clone(),
+                        )
+                    })?;
                 s = compose_subst(&s, &sr);
 
                 for ((_, pt), (_, ae)) in pts.iter().zip(args) {

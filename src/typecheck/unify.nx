@@ -199,11 +199,11 @@ let unify_arrow = fn (
         | UnifyErr(message: m) -> return UnifyErr(message: m)
         | UnifyOk(subst: s2) ->
           let s12 = subst.subst_compose(s1, s2)
-          match unify(t1: subst.subst_apply(subst: s12, typ: req1), t2: subst.subst_apply(subst: s12, typ: req2), tdefs) do
+          match unify_with_kind(t1: subst.subst_apply(subst: s12, typ: req1), t2: subst.subst_apply(subst: s12, typ: req2), tdefs, kind: "requires") do
             | UnifyErr(message: m) -> return UnifyErr(message: m)
             | UnifyOk(subst: s3) ->
               let s123 = subst.subst_compose(s1: s12, s2: s3)
-              match unify(t1: subst.subst_apply(subst: s123, typ: thr1), t2: subst.subst_apply(subst: s123, typ: thr2), tdefs) do
+              match unify_with_kind(t1: subst.subst_apply(subst: s123, typ: thr1), t2: subst.subst_apply(subst: s123, typ: thr2), tdefs, kind: "throws") do
                 | UnifyErr(message: m) -> return UnifyErr(message: m)
                 | UnifyOk(subst: s4) ->
                   return UnifyOk(subst: subst.subst_compose(s1: s123, s2: s4))
@@ -211,6 +211,17 @@ let unify_arrow = fn (
           end
       end
   end
+end
+
+// Unify when the caller knows which row kind (throws/requires) is on the
+// surface; falls through to plain unify when either side isn't a TyRow.
+let unify_with_kind = fn (t1: TypeExpr, t2: TypeExpr, tdefs: [TypeDefEntry], kind: string) -> UnifyResult do
+  if let TyRow(types: ts1, rest: r1) = t1 then
+    if let TyRow(types: ts2, rest: r2) = t2 then
+      return unify_rows_kind(ts1, r1, ts2, r2, tdefs, kind)
+    end
+  end
+  return unify(t1, t2, tdefs)
 end
 
 // ─── Named type list unification (params, record fields) ────────────────────
@@ -287,29 +298,111 @@ let apply_subst_type_list = fn (subst: [SubstEntry], types: [TypeExpr]) -> [Type
   end
 end
 
-// ─── Row unification (simplified) ───────────────────────────────────────────
+// ─── Row unification ────────────────────────────────────────────────────────
+// Mirrors bootstrap/src/lang/typecheck/unify.rs: compute surplus-label
+// vectors (e1r/e2r) and surface them in mismatch diagnostics so users see
+// which labels broke unification, not a content-free "row: type mismatch".
+
+// Drop the first occurrence of `target` from `xs` using structural type
+// equality. Returns `(removed?, rest)`.
+let row_remove_label = fn (xs: [TypeExpr], target: TypeExpr) -> (bool, [TypeExpr]) do
+  match xs do
+    | [] -> return (false, [])
+    | h :: rest ->
+      if subst.type_eq(a: h, b: target) then
+        return (true, rest)
+      end
+      let (found, tail) = row_remove_label(xs: rest, target)
+      return (found, h :: tail)
+  end
+end
+
+let row_split_surplus = fn (e1: [TypeExpr], e2: [TypeExpr]) -> ([TypeExpr], [TypeExpr]) do
+  match e1 do
+    | [] -> return ([], e2)
+    | h :: rest ->
+      let (matched, e2_after) = row_remove_label(xs: e2, target: h)
+      let (e1r, e2r) = row_split_surplus(e1: rest, e2: e2_after)
+      if matched then
+        return (e1r, e2r)
+      end
+      return (h :: e1r, e2r)
+  end
+end
+
+let format_row_labels = fn (labels: [TypeExpr]) -> string do
+  match labels do
+    | [] -> return "{ }"
+    | _ -> return "{ " ++ join_label_names(labels) ++ " }"
+  end
+end
+
+let join_label_names = fn (labels: [TypeExpr]) -> string do
+  match labels do
+    | [] -> return ""
+    | [t] -> return tctypes.type_to_string(typ: t)
+    | t :: rest -> return tctypes.type_to_string(typ: t) ++ ", " ++ join_label_names(labels: rest)
+  end
+end
+
+let row_kind_prefix = fn (kind: string) -> string do
+  if kind == "throws" then return "throws row mismatch" end
+  if kind == "requires" then return "requires row mismatch" end
+  if kind == "record" then return "record row mismatch" end
+  if kind == "port" then return "port row mismatch" end
+  return "row mismatch"
+end
 
 let unify_rows = fn (
   ts1: [TypeExpr], r1: Option<TypeExpr>,
   ts2: [TypeExpr], r2: Option<TypeExpr>,
   tdefs: [TypeDefEntry]
 ) -> UnifyResult do
-  // Simplified: just unify the heads pairwise, then tails
-  match unify_type_lists(ts1, ts2, tdefs) do
-    | UnifyErr(message: m) -> return UnifyErr(message: "row: " ++ m)
-    | UnifyOk(subst: s1) ->
-      match r1 do
-        | Some(val: tail1) ->
-          match r2 do
-            | Some(val: tail2) ->
-              match unify(t1: subst.subst_apply(subst: s1, typ: tail1), t2: subst.subst_apply(subst: s1, typ: tail2), tdefs) do
-                | UnifyErr(message: m) -> return UnifyErr(message: "row tail: " ++ m)
-                | UnifyOk(subst: s2) -> return UnifyOk(subst: subst.subst_compose(s1, s2))
-              end
-            | None -> return UnifyOk(subst: s1)
-          end
-        | None -> return UnifyOk(subst: s1)
+  return unify_rows_kind(ts1, r1, ts2, r2, tdefs, kind: "")
+end
+
+let unify_rows_kind = fn (
+  ts1: [TypeExpr], r1: Option<TypeExpr>,
+  ts2: [TypeExpr], r2: Option<TypeExpr>,
+  tdefs: [TypeDefEntry],
+  kind: string
+) -> UnifyResult do
+  let (e1r, e2r) = row_split_surplus(e1: ts1, e2: ts2)
+  let prefix = row_kind_prefix(kind)
+
+  // Open-row absorption when the partner row has a tail variable.
+  match r1 do
+    | Some(val: _) -> ()
+    | None ->
+      match e2r do
+        | [] -> ()
+        | _ ->
+          return UnifyErr(message: prefix ++ ": callee row has extra label(s) "
+            ++ format_row_labels(labels: e2r) ++ " not admitted by caller")
       end
+  end
+  match r2 do
+    | Some(val: _) -> ()
+    | None ->
+      match e1r do
+        | [] -> ()
+        | _ ->
+          return UnifyErr(message: prefix ++ ": caller row has extra label(s) "
+            ++ format_row_labels(labels: e1r) ++ " not admitted by callee")
+      end
+  end
+
+  match r1 do
+    | Some(val: tail1) ->
+      match r2 do
+        | Some(val: tail2) ->
+          match unify(t1: tail1, t2: tail2, tdefs) do
+            | UnifyErr(message: m) -> return UnifyErr(message: prefix ++ " (tail): " ++ m)
+            | UnifyOk(subst: s) -> return UnifyOk(subst: s)
+          end
+        | None -> return UnifyOk(subst: subst.subst_empty())
+      end
+    | None -> return UnifyOk(subst: subst.subst_empty())
   end
 end
 
