@@ -2,10 +2,14 @@
 #
 # bootstrap.sh — Multi-stage bootstrap for the Nexus self-hosted compiler (src/)
 #
-# Stage 0: Rust compiler (nexus build) compiles src/driver.nx → stage0.wasm
-# Stage 1: Run stage0.wasm (nexus exec) to compile src/driver.nx → stage1.wasm
-# Stage 2: Run stage1.wasm (nexus exec) to compile src/driver.nx → stage2.wasm
+# Stage 0: Run committed ./nexus.wasm (seed) to compile src/driver.nx → stage0.wasm
+# Stage 1: Run stage0.wasm to compile src/driver.nx → stage1.wasm
+# Stage 2: Run stage1.wasm to compile src/driver.nx → stage2.wasm
 # Verify:  stage1.wasm == stage2.wasm (fixed point)
+#
+# The committed ./nexus.wasm is the Stage 0 source of truth (see
+# docs/adr/0001-seed-policy.md); this script no longer rebuilds the seed
+# from Rust.
 #
 # Usage: ./bootstrap.sh [--ci]
 #   --ci    Strict mode for CI: fail on stage2 failure or non-identical output
@@ -19,18 +23,18 @@ for arg in "$@"; do
   esac
 done
 
-NEXUS="${NEXUS:-./bootstrap/target/release/nexus}"
+NEXUS_SEED="${NEXUS_SEED:-./nexus.wasm}"
 NEXUS_ENTRY="src/driver.nx"
 WASMTIME="${WASMTIME:-wasmtime}"
 # shellcheck disable=SC2054  # commas inside -W and -S are wasmtime delimiters, not array separators
 WASMTIME_FLAGS_COMPONENT=(
-  -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,component-model=y,max-memory-size=8589934592
+  -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,component-model=y,max-memory-size=8589934592,max-wasm-stack=33554432
   -S http,inherit-network
   --dir=. --dir="${TMPDIR:-/tmp}"
 )
 # shellcheck disable=SC2054
 WASMTIME_FLAGS_CORE=(
-  -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,max-memory-size=8589934592
+  -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,max-memory-size=8589934592,max-wasm-stack=33554432
   --dir=. --dir="${TMPDIR:-/tmp}"
 )
 
@@ -45,53 +49,47 @@ ok()    { printf "${GREEN}[bootstrap]${RESET} %s\n" "$*"; }
 warn()  { printf "${YELLOW}[bootstrap]${RESET} %s\n" "$*"; }
 fail()  { printf "${RED}[bootstrap]${RESET} %s\n" "$*" >&2; exit 1; }
 
+# ─── Verify Stage 0 seed exists ──────────────────────────────────────────
+[[ -f "$NEXUS_SEED" ]] || fail "Stage0 seed $NEXUS_SEED not found at repo root. See docs/adr/0001-seed-policy.md."
+
 # ─── Temp directory ──────────────────────────────────────────────────────
 BUILD_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$BUILD_DIR"; }
 trap cleanup EXIT
 info "Build directory: $BUILD_DIR"
 
-# ─── Build the Nexus compiler (Rust) ──────────────────────────────────────
 CURRENT_COMMIT="$(git rev-parse HEAD)"
-info "Building Nexus compiler (cargo build --release --manifest-path bootstrap/Cargo.toml)..."
-cargo build --release --manifest-path bootstrap/Cargo.toml
-[[ -x "$NEXUS" ]] || fail "Nexus compiler not found at $NEXUS"
-info "Using Nexus compiler: $NEXUS (commit ${CURRENT_COMMIT:0:7})"
+info "Using Stage 0 seed: $NEXUS_SEED (commit ${CURRENT_COMMIT:0:7})"
 
-# ─── Stage 0: Rust compiler → stage0.wasm ─────────────────────────────────
-# Reuse `nexus build` auto-cache (target/nexus/nexus.wasm) only when both:
-#   (a) .commit stamp matches HEAD, and
-#   (b) the working tree has no uncommitted changes in src/ or stdlib/.
-# A plain commit match is unsafe: `nexus build` reads the working tree, so
-# any uncommitted edit poisons the cache and subsequent matching-commit
-# runs silently reuse the wrong stage0 (stale cache-by-wrong-key bug).
-# When the cache is suspect, rebuild from the Rust compiler directly.
-
-STAGE0="$BUILD_DIR/stage0.wasm"
-NEXUS_CACHE="target/nexus/nexus.wasm"
-NEXUS_CACHE_COMMIT="target/nexus/.commit"
-
-nexus_cache_valid() {
-  [[ -f "$NEXUS_CACHE" ]] || return 1
-  [[ -f "$NEXUS_CACHE_COMMIT" ]] || return 1
-  [[ "$(cat "$NEXUS_CACHE_COMMIT")" == "$CURRENT_COMMIT" ]] || return 1
-  git diff --quiet HEAD -- src/ stdlib/ nxlib/ 2>/dev/null || return 1
-  return 0
+# Pick wasmtime flags based on whether a wasm has unresolved nexus:std imports
+# (component path) or is self-contained core wasm.
+wasmtime_flags_for() {
+  local wasm="$1"
+  if wasm-tools print "$wasm" 2>/dev/null | grep -q 'import "nexus:std/'; then
+    printf 'component\n'
+  else
+    printf 'core\n'
+  fi
 }
 
-if nexus_cache_valid; then
-  info "Stage 0: reusing cached nexus.wasm (commit ${CURRENT_COMMIT:0:7})"
-  cp "$NEXUS_CACHE" "$STAGE0"
-else
-  info "Stage 0: nexus build $NEXUS_ENTRY → $STAGE0"
-  "$NEXUS" build "$NEXUS_ENTRY" -o "$STAGE0"
-  mkdir -p "$(dirname "$NEXUS_CACHE_COMMIT")"
-  if git diff --quiet HEAD -- src/ stdlib/ nxlib/ 2>/dev/null; then
-    echo "$CURRENT_COMMIT" > "$NEXUS_CACHE_COMMIT"
+run_seed_compile() {
+  # Run the committed Stage 0 seed to compile <input.nx> → <output.wasm>.
+  local input="$1"
+  local output="$2"
+  local kind
+  kind="$(wasmtime_flags_for "$NEXUS_SEED")"
+  if [[ "$kind" == "component" ]]; then
+    "$WASMTIME" run "${WASMTIME_FLAGS_COMPONENT[@]}" "$NEXUS_SEED" "$input" "$output"
   else
-    rm -f "$NEXUS_CACHE_COMMIT"
+    "$WASMTIME" run "${WASMTIME_FLAGS_CORE[@]}" "$NEXUS_SEED" "$input" "$output"
   fi
-fi
+}
+
+# ─── Stage 0: committed seed → stage0.wasm ───────────────────────────────
+
+STAGE0="$BUILD_DIR/stage0.wasm"
+info "Stage 0: wasmtime run $NEXUS_SEED $NEXUS_ENTRY → $STAGE0"
+run_seed_compile "$NEXUS_ENTRY" "$STAGE0"
 ok "Stage 0 complete: $STAGE0 ($(wc -c < "$STAGE0" | tr -d ' ') bytes)"
 
 # ─── Stage 1: stage0.wasm compiles src → stage1.wasm ──────────────────────
@@ -101,19 +99,20 @@ ok "Stage 0 complete: $STAGE0 ($(wc -c < "$STAGE0" | tr -d ' ') bytes)"
 STAGE1_RAW="$BUILD_DIR/stage1_raw.wasm"
 STAGE1="$BUILD_DIR/stage1.wasm"
 info "Stage 1: wasmtime run $STAGE0 $NEXUS_ENTRY $STAGE1_RAW"
-"$WASMTIME" run "${WASMTIME_FLAGS_COMPONENT[@]}" "$STAGE0" "$NEXUS_ENTRY" --verbose "$STAGE1_RAW"
-
-# Check if stage1 is self-contained (no nexus:std imports) or needs compose
-if wasm-tools print "$STAGE1_RAW" 2>/dev/null | grep -q 'import "nexus:std/'; then
-  info "Stage 1 has unresolved stdlib imports — composing..."
-  "$NEXUS" compose "$STAGE1_RAW" -o "$STAGE1"
-  ok "Stage 1 composed: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
-  STAGE1_FLAGS=("${WASMTIME_FLAGS_COMPONENT[@]}")
+if [[ "$(wasmtime_flags_for "$STAGE0")" == "component" ]]; then
+  STAGE0_FLAGS=("${WASMTIME_FLAGS_COMPONENT[@]}")
 else
-  cp "$STAGE1_RAW" "$STAGE1"
-  ok "Stage 1 self-contained: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
-  STAGE1_FLAGS=("${WASMTIME_FLAGS_CORE[@]}")
+  STAGE0_FLAGS=("${WASMTIME_FLAGS_CORE[@]}")
 fi
+"$WASMTIME" run "${STAGE0_FLAGS[@]}" "$STAGE0" "$NEXUS_ENTRY" "$STAGE1_RAW"
+
+# The committed seed produces self-contained core wasm; stage1 must too.
+if wasm-tools print "$STAGE1_RAW" 2>/dev/null | grep -q 'import "nexus:std/'; then
+  fail "Stage 1 emitted unresolved nexus:std imports. Self-hosted compose is not wired (see ADR 0001)."
+fi
+cp "$STAGE1_RAW" "$STAGE1"
+ok "Stage 1 self-contained: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
+STAGE1_FLAGS=("${WASMTIME_FLAGS_CORE[@]}")
 
 # ─── Stage 2: stage1.wasm compiles src → stage2.wasm ──────────────────────
 
@@ -158,9 +157,6 @@ ok "Installed nexus.wasm ($(wc -c < nexus.wasm | tr -d ' ') bytes)"
 # in `nxlib/lsp/server.nx` stores arity-2 top-level fns as record fields;
 # the MIR pass lifts each into a `__closure_wrap_<target>` thunk so the
 # closure machinery (closure_table + arity-N type dedup) carries them.
-#
-# `nexus compose` still runs through the Rust binary because the
-# self-hosted compose path is out of scope here.
 
 LSP_RAW="$BUILD_DIR/lsp_raw.wasm"
 LSP_OUT="$BUILD_DIR/lsp.wasm"
@@ -168,13 +164,10 @@ info "Stage L: wasmtime run nexus.wasm src/lsp/main.nx → $LSP_RAW"
 "$WASMTIME" run "${STAGE1_FLAGS[@]}" nexus.wasm src/lsp/main.nx "$LSP_RAW"
 
 if wasm-tools print "$LSP_RAW" 2>/dev/null | grep -q 'import "nexus:std/'; then
-  info "lsp.wasm has unresolved stdlib imports — composing..."
-  "$NEXUS" compose "$LSP_RAW" -o "$LSP_OUT"
-  ok "lsp.wasm composed: $LSP_OUT ($(wc -c < "$LSP_OUT" | tr -d ' ') bytes)"
-else
-  cp "$LSP_RAW" "$LSP_OUT"
-  ok "lsp.wasm self-contained: $LSP_OUT ($(wc -c < "$LSP_OUT" | tr -d ' ') bytes)"
+  fail "lsp.wasm emitted unresolved nexus:std imports. Self-hosted compose is not wired (see ADR 0001)."
 fi
+cp "$LSP_RAW" "$LSP_OUT"
+ok "lsp.wasm self-contained: $LSP_OUT ($(wc -c < "$LSP_OUT" | tr -d ' ') bytes)"
 
 info "Installing lsp.wasm..."
 cp "$LSP_OUT" lsp.wasm
