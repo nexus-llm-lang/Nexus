@@ -16,9 +16,10 @@
 #
 set -euo pipefail
 
+CI_MODE=0
 for arg in "$@"; do
   case "$arg" in
-    --ci) ;;
+    --ci) CI_MODE=1 ;;
     *) echo "Unknown argument: $arg" >&2; exit 1 ;;
   esac
 done
@@ -141,6 +142,30 @@ if ! cmp -s "$STAGE1" "$STAGE2"; then
 fi
 ok "Fixed point reached! stage1.wasm and stage2.wasm are identical."
 ok "The self-hosted compiler is verified."
+
+# ─── CI-only: committed seed must match freshly-built stage1.wasm ────────
+# Enforces ADR 0001: any src/** or nxlib/** change must come with a regenerated
+# nexus.wasm. Skipped for local dev so editing src/ doesn't immediately error.
+if [[ "$CI_MODE" -eq 1 ]]; then
+  # ADR 0001 governs the committed ./nexus.wasm specifically, regardless of
+  # what $NEXUS_SEED is overridden to (e.g. negative tests pointing elsewhere).
+  info "Verifying committed seed: ./nexus.wasm == stage1.wasm"
+  if [[ ! -f ./nexus.wasm ]]; then
+    fail "./nexus.wasm not present at repo root; cannot verify ADR 0001 seed match."
+  fi
+  if ! cmp -s ./nexus.wasm "$STAGE1"; then
+    SEED_SIZE=$(wc -c < ./nexus.wasm | tr -d ' ')
+    S1_SIZE=$(wc -c < "$STAGE1" | tr -d ' ')
+    info "./nexus.wasm: $SEED_SIZE bytes, stage1.wasm: $S1_SIZE bytes"
+    fail "Seed mismatch: ./nexus.wasm differs from stage1.wasm.
+[bootstrap] The committed seed is stale. Regenerate it:
+[bootstrap]   ./bootstrap.sh && cp <build_dir>/stage1.wasm nexus.wasm
+[bootstrap] (the bootstrap installs nexus.wasm for you on success — just commit it)
+[bootstrap] Then commit nexus.wasm alongside the source change.
+[bootstrap] See docs/adr/0001-seed-policy.md."
+  fi
+  ok "Committed seed matches stage1.wasm — ADR 0001 satisfied."
+fi
 
 # ─── Install nexus.wasm and build polyglot launcher ──────────────────────
 
