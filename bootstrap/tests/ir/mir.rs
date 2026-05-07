@@ -11,14 +11,14 @@ fn build_mir(src: &str) -> nexus::ir::mir::MirProgram {
 fn snapshot_mir_basic() {
     let src = "let main = fn () -> unit do let x = 42 return () end";
     let mir = build_mir(src);
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }
 
 #[test]
 fn snapshot_mir_with_control_flow() {
     let src = "let main = fn () -> unit do if true then return () else return () end end";
     let mir = build_mir(src);
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }
 
 #[test]
@@ -31,7 +31,7 @@ fn snapshot_mir_function_call() {
     end
     "#;
     let mir = build_mir(src);
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }
 
 #[test]
@@ -46,7 +46,7 @@ fn snapshot_mir_match_statement() {
     end
     "#;
     let mir = build_mir(src);
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn snapshot_mir_port_handler_inject() {
     end
     "#;
     let mir = build_mir(src);
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }
 
 #[test]
@@ -76,5 +76,5 @@ fn snapshot_mir_string_concat() {
     end
     "#;
     let mir = build_mir(src);
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }

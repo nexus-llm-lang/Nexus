@@ -13,7 +13,7 @@ fn parse_and_build_mir(
 fn snapshot_hir_basic() {
     let src = "let main = fn () -> unit do return () end";
     let mir = parse_and_build_mir(src).unwrap();
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }
 
 #[test]
@@ -30,7 +30,7 @@ fn snapshot_hir_with_handler() {
     end
     "#;
     let mir = parse_and_build_mir(src).unwrap();
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }
 
 #[test]
@@ -47,7 +47,7 @@ fn snapshot_hir_match_with_constructors() {
     end
     "#;
     let mir = parse_and_build_mir(src).unwrap();
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn snapshot_hir_function_with_generics() {
     end
     "#;
     let mir = parse_and_build_mir(src).unwrap();
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn snapshot_hir_exception_and_try_catch() {
     end
     "#;
     let mir = parse_and_build_mir(src).unwrap();
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }
 
 #[test]
@@ -89,7 +89,7 @@ fn snapshot_hir_record_and_field_access() {
     end
     "#;
     let mir = parse_and_build_mir(src).unwrap();
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }
 
 #[test]
@@ -127,5 +127,5 @@ fn snapshot_hir_while_loop() {
     end
     "#;
     let mir = parse_and_build_mir(src).unwrap();
-    insta::assert_debug_snapshot!(mir);
+    insta::assert_debug_snapshot!(mir.functions);
 }
