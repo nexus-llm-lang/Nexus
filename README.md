@@ -132,7 +132,7 @@ NEXUS_MAX_WASM_STACK=134217728 nexus build foo.nx -o out.wasm   # 128 MiB stack
 NEXUS_WASMTIME_ARGS="-S http,inherit-network" nexus build foo.nx -o out.wasm
 ```
 
-The committed `nexus.wasm` at the repo root is the Stage0 seed of the self-host. Any change under `src/**` or `nxlib/**` must regenerate it; see [`docs/adr/0001-seed-policy.md`](docs/adr/0001-seed-policy.md) for the policy and the 2-step protocol for syntax/IR additions.
+The committed `nexus.wasm` at the repo root is the Stage0 seed of the self-host. Any change under `src/**` or `nxlib/**` must regenerate it via `./bootstrap.sh` and the resulting `nexus.wasm` must be committed alongside the source change; CI enforces `nexus.wasm == stage1.wasm`.
 
 ## Usage
 

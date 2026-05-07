@@ -7,9 +7,8 @@
 # Stage 2: Run stage1.wasm to compile src/driver.nx → stage2.wasm
 # Verify:  stage1.wasm == stage2.wasm (fixed point)
 #
-# The committed ./nexus.wasm is the Stage 0 source of truth (see
-# docs/adr/0001-seed-policy.md); this script no longer rebuilds the seed
-# from Rust.
+# The committed ./nexus.wasm is the Stage 0 source of truth; this script
+# no longer rebuilds the seed from Rust.
 #
 # Usage: ./bootstrap.sh [--ci]
 #   --ci    Strict mode for CI: fail on stage2 failure or non-identical output
@@ -45,7 +44,7 @@ warn()  { printf "${YELLOW}[bootstrap]${RESET} %s\n" "$*"; }
 fail()  { printf "${RED}[bootstrap]${RESET} %s\n" "$*" >&2; exit 1; }
 
 # ─── Verify Stage 0 seed exists ──────────────────────────────────────────
-[[ -f "$NEXUS_SEED" ]] || fail "Stage0 seed $NEXUS_SEED not found at repo root. See docs/adr/0001-seed-policy.md."
+[[ -f "$NEXUS_SEED" ]] || fail "Stage0 seed $NEXUS_SEED not found at repo root."
 
 # ─── Temp directory ──────────────────────────────────────────────────────
 BUILD_DIR="$(mktemp -d)"
@@ -81,7 +80,7 @@ info "Stage 1: wasmtime run $STAGE0 $NEXUS_ENTRY $STAGE1_RAW"
 
 # The committed seed produces self-contained core wasm; stage1 must too.
 if wasm-tools print "$STAGE1_RAW" 2>/dev/null | grep -q 'import "nexus:std/'; then
-  fail "Stage 1 emitted unresolved nexus:std imports. Self-hosted compose is not wired (see ADR 0001)."
+  fail "Stage 1 emitted unresolved nexus:std imports. Self-hosted compose is not wired."
 fi
 cp "$STAGE1_RAW" "$STAGE1"
 ok "Stage 1 self-contained: $STAGE1 ($(wc -c < "$STAGE1" | tr -d ' ') bytes)"
@@ -115,14 +114,15 @@ ok "Fixed point reached! stage1.wasm and stage2.wasm are identical."
 ok "The self-hosted compiler is verified."
 
 # ─── CI-only: committed seed must match freshly-built stage1.wasm ────────
-# Enforces ADR 0001: any src/** or nxlib/** change must come with a regenerated
-# nexus.wasm. Skipped for local dev so editing src/ doesn't immediately error.
+# Enforces the seed-policy: any src/** or nxlib/** change must come with a
+# regenerated nexus.wasm. Skipped for local dev so editing src/ doesn't
+# immediately error.
 if [[ "$CI_MODE" -eq 1 ]]; then
-  # ADR 0001 governs the committed ./nexus.wasm specifically, regardless of
+  # The committed ./nexus.wasm is the artifact under policy, regardless of
   # what $NEXUS_SEED is overridden to (e.g. negative tests pointing elsewhere).
   info "Verifying committed seed: ./nexus.wasm == stage1.wasm"
   if [[ ! -f ./nexus.wasm ]]; then
-    fail "./nexus.wasm not present at repo root; cannot verify ADR 0001 seed match."
+    fail "./nexus.wasm not present at repo root; cannot verify seed match."
   fi
   if ! cmp -s ./nexus.wasm "$STAGE1"; then
     SEED_SIZE=$(wc -c < ./nexus.wasm | tr -d ' ')
@@ -132,10 +132,9 @@ if [[ "$CI_MODE" -eq 1 ]]; then
 [bootstrap] The committed seed is stale. Regenerate it:
 [bootstrap]   ./bootstrap.sh && cp <build_dir>/stage1.wasm nexus.wasm
 [bootstrap] (the bootstrap installs nexus.wasm for you on success — just commit it)
-[bootstrap] Then commit nexus.wasm alongside the source change.
-[bootstrap] See docs/adr/0001-seed-policy.md."
+[bootstrap] Then commit nexus.wasm alongside the source change."
   fi
-  ok "Committed seed matches stage1.wasm — ADR 0001 satisfied."
+  ok "Committed seed matches stage1.wasm."
 fi
 
 # ─── Install nexus.wasm and build polyglot launcher ──────────────────────
@@ -160,7 +159,7 @@ info "Stage L: wasmtime run nexus.wasm src/lsp/main.nx → $LSP_RAW"
 "$WASMTIME" run "${WASMTIME_FLAGS_CORE[@]}" nexus.wasm build src/lsp/main.nx -o "$LSP_RAW"
 
 if wasm-tools print "$LSP_RAW" 2>/dev/null | grep -q 'import "nexus:std/'; then
-  fail "lsp.wasm emitted unresolved nexus:std imports. Self-hosted compose is not wired (see ADR 0001)."
+  fail "lsp.wasm emitted unresolved nexus:std imports. Self-hosted compose is not wired."
 fi
 cp "$LSP_RAW" "$LSP_OUT"
 ok "lsp.wasm self-contained: $LSP_OUT ($(wc -c < "$LSP_OUT" | tr -d ' ') bytes)"
