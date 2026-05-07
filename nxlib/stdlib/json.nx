@@ -187,53 +187,86 @@ let is_low_surrogate = fn (code: i64) -> bool do
   return code >= 56320 && code <= 57343
 end
 
-// Flush the byte range [start, end) onto the accumulator without
+// Flush the byte range [start, end) onto a bytebuffer accumulator without
 // re-encoding — this is the only way to preserve raw UTF-8 sequences from
 // the source string (a char-by-char loop would mis-handle 4-byte forms).
-let flush_range = fn (s: string, start: i64, end_pos: i64, acc: string) -> string do
-  if end_pos <= start then return acc end
-  return acc ++ str.byte_substring(s, start, len: end_pos - start)
+// Pushing into a ByteBuffer keeps each step amortized O(|chunk|); the
+// previous string-acc form copied the growing accumulator on every escape
+// boundary, producing the O(N^2) cliff captured by the xcp6 regression.
+let flush_range_into = fn (buf: %bb.ByteBuffer, s: string, start: i64, end_pos: i64) -> %bb.ByteBuffer do
+  if end_pos <= start then return buf end
+  return bb.push_string(%buf, s: str.byte_substring(s, start, len: end_pos - start))
 end
 
 // Parse the body of a string literal. `p` is positioned just after the
 // opening '"'. Returns StringStep where pos is just after the closing '"'.
-let parse_string_body = fn (s: string, p: i64, run_start: i64, acc: string) -> StringStep throws { JsonThrow } do
+let parse_string_body = fn (s: string, p: i64, run_start: i64, buf: %bb.ByteBuffer) -> StringStep throws { JsonThrow } do
   if p >= len_of(s) then
+    bb.free(%buf)
     raise JsonError(msg: "unterminated string literal", pos: p)
   end
   let c = str.byte_at(s, idx: p)
   if c == ch_dquote then
-    let acc2 = flush_range(s, start: run_start, end_pos: p, acc)
-    return StringStep(value: acc2, pos: p + 1)
+    let %buf2 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    let result = bb.to_string(&buf2)
+    bb.free(%buf2)
+    return StringStep(value: result, pos: p + 1)
   end
   if c == ch_backslash then
-    let acc2 = flush_range(s, start: run_start, end_pos: p, acc)
-    return parse_string_escape(s, p: p + 1, acc: acc2)
+    let %buf2 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    return parse_string_escape(s, p: p + 1, buf: %buf2)
   end
   // Reject unescaped control characters per RFC 8259 §7.
   let code = char.ord(c)
   if code >= 0 && code < 32 then
+    bb.free(%buf)
     raise JsonError(msg: "unescaped control character in string", pos: p)
   end
-  return parse_string_body(s, p: p + 1, run_start, acc)
+  return parse_string_body(s, p: p + 1, run_start, buf: %buf)
 end
 
-let parse_string_escape = fn (s: string, p: i64, acc: string) -> StringStep throws { JsonThrow } do
+let parse_string_escape = fn (s: string, p: i64, buf: %bb.ByteBuffer) -> StringStep throws { JsonThrow } do
   if p >= len_of(s) then
+    bb.free(%buf)
     raise JsonError(msg: "unterminated string escape", pos: p)
   end
   let c = str.byte_at(s, idx: p)
-  if c == ch_dquote      then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ "\"") end
-  if c == ch_backslash   then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ "\\") end
-  if c == ch_slash       then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ "/") end
-  if c == 'b'            then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ str.from_char_code(code: 8)) end
-  if c == 'f'            then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ str.from_char_code(code: 12)) end
-  if c == 'n'            then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ "\n") end
-  if c == 'r'            then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ "\r") end
-  if c == 't'            then return parse_string_body(s, p: p + 1, run_start: p + 1, acc: acc ++ "\t") end
-  if c == 'u' then
-    return parse_string_unicode(s, p: p + 1, acc)
+  if c == ch_dquote then
+    let %buf2 = bb.push_string(%buf, s: "\"")
+    return parse_string_body(s, p: p + 1, run_start: p + 1, buf: %buf2)
   end
+  if c == ch_backslash then
+    let %buf2 = bb.push_string(%buf, s: "\\")
+    return parse_string_body(s, p: p + 1, run_start: p + 1, buf: %buf2)
+  end
+  if c == ch_slash then
+    let %buf2 = bb.push_string(%buf, s: "/")
+    return parse_string_body(s, p: p + 1, run_start: p + 1, buf: %buf2)
+  end
+  if c == 'b' then
+    let %buf2 = bb.push_byte(%buf, byte: 8)
+    return parse_string_body(s, p: p + 1, run_start: p + 1, buf: %buf2)
+  end
+  if c == 'f' then
+    let %buf2 = bb.push_byte(%buf, byte: 12)
+    return parse_string_body(s, p: p + 1, run_start: p + 1, buf: %buf2)
+  end
+  if c == 'n' then
+    let %buf2 = bb.push_string(%buf, s: "\n")
+    return parse_string_body(s, p: p + 1, run_start: p + 1, buf: %buf2)
+  end
+  if c == 'r' then
+    let %buf2 = bb.push_string(%buf, s: "\r")
+    return parse_string_body(s, p: p + 1, run_start: p + 1, buf: %buf2)
+  end
+  if c == 't' then
+    let %buf2 = bb.push_string(%buf, s: "\t")
+    return parse_string_body(s, p: p + 1, run_start: p + 1, buf: %buf2)
+  end
+  if c == 'u' then
+    return parse_string_unicode(s, p: p + 1, buf: %buf)
+  end
+  bb.free(%buf)
   raise JsonError(msg: "invalid escape sequence", pos: p - 1)
 end
 
@@ -290,42 +323,54 @@ let codepoint_to_utf8 = fn (code: i64) -> string do
   end
 end
 
-let parse_string_unicode = fn (s: string, p: i64, acc: string) -> StringStep throws { JsonThrow } do
+let parse_string_unicode = fn (s: string, p: i64, buf: %bb.ByteBuffer) -> StringStep throws { JsonThrow } do
   match parse_hex4(s, p) do
-    | HexBad(pos: q) -> raise JsonError(msg: "invalid \\u escape (need 4 hex digits)", pos: q)
+    | HexBad(pos: q) ->
+      bb.free(%buf)
+      raise JsonError(msg: "invalid \\u escape (need 4 hex digits)", pos: q)
     | HexOk(code: high, end_pos: q1) ->
       if is_high_surrogate(code: high) then
         // Expect a low-surrogate \uXXXX immediately after.
         if q1 + 2 > len_of(s) then
+          bb.free(%buf)
           raise JsonError(msg: "lone high surrogate at end of input", pos: p)
         end
         let b0 = str.byte_at(s, idx: q1)
         let b1 = str.byte_at(s, idx: q1 + 1)
         if b0 != ch_backslash || b1 != 'u' then
+          bb.free(%buf)
           raise JsonError(msg: "high surrogate not followed by \\u low surrogate", pos: q1)
         end
         match parse_hex4(s, p: q1 + 2) do
-          | HexBad(pos: q2) -> raise JsonError(msg: "invalid \\u escape after high surrogate", pos: q2)
+          | HexBad(pos: q2) ->
+            bb.free(%buf)
+            raise JsonError(msg: "invalid \\u escape after high surrogate", pos: q2)
           | HexOk(code: low, end_pos: q3) ->
             if is_low_surrogate(code: low) then
               let combined = combine_surrogates(high, low)
               let encoded = codepoint_to_utf8(code: combined)
               if str.byte_length(s: encoded) == 0 then
+                bb.free(%buf)
                 raise JsonError(msg: "surrogate pair encodes invalid Unicode scalar", pos: p)
               end
-              return parse_string_body(s, p: q3, run_start: q3, acc: acc ++ encoded)
+              let %buf2 = bb.push_string(%buf, s: encoded)
+              return parse_string_body(s, p: q3, run_start: q3, buf: %buf2)
             else
+              bb.free(%buf)
               raise JsonError(msg: "high surrogate followed by non-low-surrogate \\u escape", pos: q1 + 2)
             end
         end
       else if is_low_surrogate(code: high) then
+        bb.free(%buf)
         raise JsonError(msg: "lone low surrogate \\u escape", pos: p)
       else
         let encoded = codepoint_to_utf8(code: high)
         if str.byte_length(s: encoded) == 0 then
+          bb.free(%buf)
           raise JsonError(msg: "\\u escape encodes invalid Unicode scalar", pos: p)
         end
-        return parse_string_body(s, p: q1, run_start: q1, acc: acc ++ encoded)
+        let %buf2 = bb.push_string(%buf, s: encoded)
+        return parse_string_body(s, p: q1, run_start: q1, buf: %buf2)
       end
   end
 end
@@ -334,7 +379,8 @@ let parse_json_string = fn (s: string, p: i64) -> StringStep throws { JsonThrow 
   if peek_byte(s, p) != ch_dquote then
     raise JsonError(msg: "expected string", pos: p)
   end
-  return parse_string_body(s, p: p + 1, run_start: p + 1, acc: "")
+  let buf = bb.empty()
+  return parse_string_body(s, p: p + 1, run_start: p + 1, buf: %buf)
 end
 
 // ─── Number parsing ──────────────────────────────────────────────────────────
@@ -592,23 +638,30 @@ end
 // Emit string payload between quotes. Walks bytes; escapes the seven named
 // forms plus \uXXXX for U+0000..U+001F. Non-control bytes flow through
 // untouched, preserving multi-byte UTF-8 sequences.
-let escape_string_at = fn (s: string, p: i64, run_start: i64, acc: string) -> string do
+//
+// Threads a ByteBuffer accumulator instead of a string acc so the per-step
+// cost stays amortized O(|chunk|); the previous form copied a growing
+// string on every escape boundary, producing the O(N^2) cliff captured by
+// the xcp6 regression.
+let escape_string_into = fn (buf: %bb.ByteBuffer, s: string, p: i64, run_start: i64) -> %bb.ByteBuffer do
   let n = len_of(s)
   if p >= n then
-    return flush_range(s, start: run_start, end_pos: p, acc)
+    return flush_range_into(%buf, s, start: run_start, end_pos: p)
   end
   let c = str.byte_at(s, idx: p)
   let code = char.ord(c)
   if c == ch_dquote then
-    let acc2 = flush_range(s, start: run_start, end_pos: p, acc)
-    return escape_string_at(s, p: p + 1, run_start: p + 1, acc: acc2 ++ "\\\"")
+    let %buf1 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    let %buf2 = bb.push_string(%buf1, s: "\\\"")
+    return escape_string_into(buf: %buf2, s, p: p + 1, run_start: p + 1)
   end
   if c == ch_backslash then
-    let acc2 = flush_range(s, start: run_start, end_pos: p, acc)
-    return escape_string_at(s, p: p + 1, run_start: p + 1, acc: acc2 ++ "\\\\")
+    let %buf1 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    let %buf2 = bb.push_string(%buf1, s: "\\\\")
+    return escape_string_into(buf: %buf2, s, p: p + 1, run_start: p + 1)
   end
   if code >= 0 && code < 32 then
-    let acc2 = flush_range(s, start: run_start, end_pos: p, acc)
+    let %buf1 = flush_range_into(%buf, s, start: run_start, end_pos: p)
     let esc =
       if code == 8 then
         "\\b"
@@ -623,13 +676,20 @@ let escape_string_at = fn (s: string, p: i64, run_start: i64, acc: string) -> st
       else
         unicode_escape(code)
       end
-    return escape_string_at(s, p: p + 1, run_start: p + 1, acc: acc2 ++ esc)
+    let %buf2 = bb.push_string(%buf1, s: esc)
+    return escape_string_into(buf: %buf2, s, p: p + 1, run_start: p + 1)
   end
-  return escape_string_at(s, p: p + 1, run_start, acc)
+  return escape_string_into(buf: %buf, s, p: p + 1, run_start)
 end
 
 let serialize_string = fn (s: string) -> string do
-  return "\"" ++ escape_string_at(s, p: 0, run_start: 0, acc: "") ++ "\""
+  let buf = bb.empty()
+  let %buf1 = bb.push_string(%buf, s: "\"")
+  let %buf2 = escape_string_into(buf: %buf1, s, p: 0, run_start: 0)
+  let %buf3 = bb.push_string(%buf2, s: "\"")
+  let result = bb.to_string(&buf3)
+  bb.free(%buf3)
+  return result
 end
 
 // Ensure a finite f64 round-trips through the JSON grammar. Rust's
