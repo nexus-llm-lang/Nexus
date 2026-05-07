@@ -1,6 +1,7 @@
 pub mod arithmetic;
 pub mod arrays;
 pub mod chars;
+pub mod cliff_scaling;
 pub mod concurrency;
 pub mod control_flow;
 pub mod functions;
