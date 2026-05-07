@@ -51,8 +51,7 @@ fn test_net_effect_enforcement() {
 
 #[test]
 fn test_net_request_method_and_headers_runtime() {
-    // TODO: List types ([Header]) and HTTP requests are not yet supported in WASM codegen.
-    // Converted to a typecheck-only test to verify the source is well-typed.
+    // Bucket-C should_typecheck per bootstrap/tests/PORT_SKIPPED.md.
     should_typecheck(
         r#"
     import { Net, header, response_body }, * as net_mod from "std:network"
@@ -76,8 +75,7 @@ fn test_net_request_method_and_headers_runtime() {
 
 #[test]
 fn test_net_request_https_url_is_accepted() {
-    // TODO: List types ([Header]) and HTTP requests are not supported in WASM codegen.
-    // Converted to a typecheck-only test.
+    // Bucket-C should_typecheck per bootstrap/tests/PORT_SKIPPED.md.
     should_typecheck(
         r#"
     import { Net, response_body }, * as net_mod from "std:network"
@@ -100,8 +98,7 @@ fn test_net_request_https_url_is_accepted() {
 
 #[test]
 fn test_net_request_response_status_and_body_with_request_body() {
-    // TODO: List types ([Header]) and HTTP requests are not supported in WASM codegen.
-    // Converted to a typecheck-only test.
+    // Bucket-C should_typecheck per bootstrap/tests/PORT_SKIPPED.md.
     should_typecheck(
         r#"
     import { Net, header, response_status, response_body }, * as net_mod from "std:network"
