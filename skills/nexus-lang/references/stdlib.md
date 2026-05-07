@@ -1,6 +1,6 @@
 # Nexus Standard Library Reference
 
-Full API: https://nexus-llm-lang.github.io/Nexus/latest/env/stdlib
+Full API: https://nexus-llm-lang.github.io/latest/env/stdlib
 
 The standard library is the `std` package, rooted at `nxlib/stdlib/`. Every module is imported with the form `"std:<name>"`.
 
@@ -83,4 +83,4 @@ Use this form in `import external "std:<iface>"` declarations inside FFI-binding
 ## See Also
 
 - `./patterns.md` — Idiomatic Nexus patterns
-- https://nexus-llm-lang.github.io/Nexus/latest/env/stdlib — Full API reference
+- https://nexus-llm-lang.github.io/latest/env/stdlib — Full API reference

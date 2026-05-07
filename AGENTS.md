@@ -5,7 +5,7 @@ Nexus is a self-hosting language and compiler designed for LLM-friendly developm
 ## Nexus Language Skill
 
 ```bash
-npx skills add Nymphium/Nexus --skill nexus-lang
+npx skills add nexus-llm-lang/Nexus --skill nexus-lang
 ```
 
 ## Nix-managed Repository
