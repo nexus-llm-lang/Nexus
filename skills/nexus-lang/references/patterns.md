@@ -120,12 +120,14 @@ end
 ### Why
 
 - The parser accepts a comma-separated list of handler expressions in one
-  `inject` (`src/frontend/parser.nx:754-775`); order is not significant
-  between independent handlers.
+  `inject` (see `parse_inject_stmt` / `parse_inject_handlers` in
+  `src/frontend/parser.nx`); order is not significant between independent
+  handlers.
 - The comma form keeps `BODY`'s indentation flat. Nested `inject` walls add an
   indentation level per handler with no extra meaning.
-- Production code already favours this form: `src/driver.nx:502` injects four
-  system handlers in a single statement.
+- Production code already favours this form: `main` in `src/driver.nx` injects
+  four system handlers (`stdio`, `fs_mod`, `clock_mod`, `proc`) in a single
+  statement.
 
 ### One handler depending on another's effects
 
@@ -288,10 +290,11 @@ in expressions.
 
 ### Confirmed in-tree
 
-- `src/ir/rdrname.nx:198` uses `_ :: _ :: _ -> return Ambiguous(...)` to assert
-  "two or more matches" — exactly the chained-cons form.
-- `stdlib/test/snapshot.nx:251` builds `plus :: minus :: acc` in an expression,
-  matching the same `::`-chains-right shape.
+- `finalize` in `src/ir/rdrname.nx` uses
+  `_ :: _ :: _ -> return Ambiguous(...)` to assert "two or more matches" —
+  exactly the chained-cons form.
+- `diff_lines` in `stdlib/test/snapshot.nx` builds `plus :: minus :: acc` in an
+  expression, matching the same `::`-chains-right shape.
 
 ### Exception: independent lists in lockstep
 
