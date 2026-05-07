@@ -175,7 +175,7 @@ let load_or_die = fn (path: string) -> Config require { Fs } throws { Exn } do
   end
 end
 
-// Selective catch in main
+// Selective catch in main — pattern-match on exception constructors
 let main = fn () -> unit require { PermFs, PermConsole } do
   inject fs_mod.system_handler, stdio.system_handler do
     try
@@ -187,7 +187,24 @@ let main = fn () -> unit require { PermFs, PermConsole } do
     end
   end
 end
+
+// Bare catch — single identifier binds the whole exception
+let run_or_log = fn () -> unit require { Console } do
+  try
+    do_work()
+  catch err ->
+    Console.eprintln(val: "<task>: " ++ format_error(err))
+  end
+end
 ```
+
+### Catch form: bare vs selective
+
+**Bare `catch <ident> -> body end`** binds the caught exception to one identifier and runs a single body — no `|` arms, no destructuring. Use when every escaping exception is handled the same way (log, rethrow, fall back to a default). `catch _ -> ...` is the same form with the value discarded. This is the dominant form in the in-tree codebase.
+
+**Selective `catch | Pat -> ... | Pat -> ... end`** uses pipe-separated arms to pattern-match on exception constructors and payload fields. Use when arms need to branch on the exception variant or extract fields.
+
+The two forms are mutually exclusive in a single `try` — pick one based on whether the handler discriminates on the exception or not.
 
 ## Bool Dispatch vs ADT Destructuring
 

@@ -217,7 +217,7 @@ let find_user = fn (id: i64) -> string throws { NotFound } do
   end
 end
 
-// Catching exceptions
+// Selective catch — pattern-match the exception with `|` arms
 try
   let name = find_user(id: 42)
   Console.println(val: name)
@@ -225,7 +225,19 @@ catch
   | NotFound(msg: m) -> Console.println(val: m)
   | _ -> Console.println(val: "Unknown error")
 end
+
+// Bare catch — single binder, no destructuring (the dominant form in this codebase)
+try
+  let name = find_user(id: 42)
+  Console.println(val: name)
+catch err ->
+  Console.eprintln(val: format_error(err))
+end
 ```
+
+**When to use which form:**
+- **Bare `catch <ident> -> body end`** — one identifier binds the whole exception value. Use when the handler treats every escaping exception uniformly (log, rethrow, return a default). `catch _ -> ...` is the same shape with the value discarded.
+- **Selective `catch | Pat -> ... | Pat -> ... end`** — pipe-separated arms pattern-match on exception constructors. Use when arms need to inspect payload fields or branch on the exception variant.
 
 For multi-exception phases, declare an `exception group` and use the group name in the row:
 
