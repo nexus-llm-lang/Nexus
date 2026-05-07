@@ -642,7 +642,8 @@ export let empty_accum = fn () -> HirAccum do
         VariantDef(name: "RuntimeError", fields: [VariantField(name: Some(val: "val"), typ: TyString)]),
         VariantDef(name: "InvalidIndex", fields: [VariantField(name: Some(val: "val"), typ: TyI64)])])],
     wasm_module: None,
-    exception_groups: []
+    exception_groups: [],
+    value_binding_names: []
   )
 end
 
@@ -785,7 +786,7 @@ end
 
 let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, type_ann: Option<TypeExpr>,
     entries: [RenameEntry], span: Span, accum: HirAccum, source_file: string) -> HirAccum throws { HirError } do
-  let HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs) = accum
+  let HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns) = accum
   // Stdlib files: full convert_expr (handlers/externals/constants are cheap,
   // and keeping them as EagerBody avoids cumulative OOM during lazy resolve).
   // Non-stdlib: convert_expr_toplevel for Lambda bodies (deferred via LazyBody),
@@ -819,16 +820,21 @@ let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, typ
         | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: tw, body: _) -> tw
         | _ -> TyRow(types: [], rest: None)
       end
+      // nexus-tt5a: track constants wrapped as Lambda by convert_expr_toplevel.
+      let new_vbns = match val_peek do
+        | ExprLambda(_) -> vbns
+        | _ -> qname :: vbns
+      end
       let func = HirFunction(name: qname, type_params: tps, params: lps,
         ret_type: effective_rt, throw_row: lambda_throw_row, body: LazyBody(ast_expr: val, entries), span, file: source_file)
       return HirAccum(ports: ps, functions: func :: fs,
-        externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs)
+        externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: new_vbns)
     | Handler(port_name: pname, arms: handler_arms) ->
       let binding = synthesize_handler(
         binding_name: qname, port_name: pname, arms: handler_arms, source_file)
       return HirAccum(ports: ps, functions: fs, externals: exts,
         handler_bindings: binding :: hbs,
-        enum_defs: eds, wasm_module: wmod, exception_groups: egs)
+        enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns)
     | ExternalRef(symbol: sym, type_params: tps, arg_names: anames, typ: t) ->
       match wmod do
         | Some(val: wm) ->
@@ -844,7 +850,7 @@ let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, typ
             wasm_name: effective_sym, type_params: tps, arg_names: anames, typ: t)
           return HirAccum(ports: ps, functions: fs,
             externals: ext :: exts,
-            handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs)
+            handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns)
         | None -> raise SymbolNotFound(name: qname, kind: "external", context: "hir.convert_global: external declaration requires a preceding 'import external \"path/to.wasm\"' — none found in this file")
       end
     | _ ->
@@ -860,7 +866,7 @@ let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, typ
         span,
         file: source_file)
       return HirAccum(ports: ps, functions: func :: fs,
-        externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs)
+        externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: qname :: vbns)
   end
 end
 
@@ -915,13 +921,13 @@ let infer_constant_type = fn (expr: HirExpr) -> TypeExpr do
 end
 
 let process_top_level = fn (node: TopLevel, span: Span, entries: [RenameEntry], accum: HirAccum, source_file: string) -> HirAccum throws { HirError } do
-  let HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs) = accum
+  let HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns) = accum
   match node do
     | TLImport(def: ImportDef(path, alias: _, items: _, is_external: is_ext)) ->
       if is_ext then
         let mapped = map_stdlib_to_wit(ext_path: path, source_file)
         return HirAccum(ports: ps, functions: fs, externals: exts,
-          handler_bindings: hbs, enum_defs: eds, wasm_module: Some(val: mapped), exception_groups: egs)
+          handler_bindings: hbs, enum_defs: eds, wasm_module: Some(val: mapped), exception_groups: egs, value_binding_names: vbns)
       else
         return accum
       end
@@ -933,22 +939,20 @@ let process_top_level = fn (node: TopLevel, span: Span, entries: [RenameEntry], 
       let qname = symtab.rename(name: pname, entries)
       let hir_port = HirPort(name: qname, methods: convert_port_sigs(sigs))
       return HirAccum(ports: hir_port :: ps, functions: fs,
-        externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs)
+        externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns)
     | TLEnum(def: ed) ->
       return HirAccum(ports: ps, functions: fs, externals: exts,
         handler_bindings: hbs,
-        enum_defs: ed :: eds, wasm_module: wmod, exception_groups: egs)
+        enum_defs: ed :: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns)
     | TLTypeDef(_) -> return accum
     | TLException(def: ExceptionDef(name: ename, is_public: _, fields: efields)) ->
-      // Register exception as a variant of the Exn enum (matching Rust compiler's approach).
-      // This ensures LIR lowering can resolve field names for sorted heap layout.
       let updated_eds = register_exn_variant(enum_defs: eds, vname: ename, vfields: efields)
       return HirAccum(ports: ps, functions: fs, externals: exts,
-        handler_bindings: hbs, enum_defs: updated_eds, wasm_module: wmod, exception_groups: egs)
+        handler_bindings: hbs, enum_defs: updated_eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns)
     | TLExceptionGroup(def: ExceptionGroupDef(name: gname, is_public: _, members: gmembers)) ->
       return HirAccum(ports: ps, functions: fs, externals: exts,
         handler_bindings: hbs, enum_defs: eds, wasm_module: wmod,
-        exception_groups: ExceptionGroupEntry(name: gname, members: gmembers) :: egs)
+        exception_groups: ExceptionGroupEntry(name: gname, members: gmembers) :: egs, value_binding_names: vbns)
   end
 end
 
@@ -1329,7 +1333,7 @@ end
 
 /// Assemble a HirProgram from an accumulator with reachability filtering.
 export let accum_to_program = fn (accum: HirAccum) -> HirProgram throws { HirError } do
-  let HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: _, exception_groups: egs) = accum
+  let HirAccum(ports: ps, functions: fs, externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: _, exception_groups: egs, value_binding_names: vbns) = accum
   // Expand exception group patterns in catch arms before reachability filtering.
   let expanded_fs = expand_groups_in_functions(funcs: fs, groups: egs)
   let expanded_hbs = expand_groups_in_handler_bindings(bindings: hbs, groups: egs)
@@ -1348,7 +1352,8 @@ export let accum_to_program = fn (accum: HirAccum) -> HirProgram throws { HirErr
     externals: filtered_exts,
     handler_bindings: expanded_hbs,
     enum_defs: eds,
-    exception_groups: egs
+    exception_groups: egs,
+    value_binding_names: vbns
   )
 end
 
