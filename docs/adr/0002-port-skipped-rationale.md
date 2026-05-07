@@ -1,14 +1,17 @@
 # ADR 0002 — Rationale for un-ported `bootstrap/tests` cases
 
-- Status: Accepted (2026-05-08)
-- Scope: any contributor evaluating whether a Rust-side test under
-  `bootstrap/tests/**` should also exist as a `.nx` fixture under
-  `tests/**`.
+- Status: Accepted (2026-05-08); historical scope after `nexus-dvr6.8`
+  (the `bootstrap/` Rust tree, including `bootstrap/tests/PORT_SKIPPED.md`,
+  was deleted).
+- Scope: a categorical record of why a subset of the original Rust-side
+  test suite did not port to `.nx` fixtures during the dvr6 epic. New
+  port-skip questions no longer arise — the source tests no longer
+  exist — so this ADR is preserved as historical justification, not as
+  active reviewer guidance.
 - Owners: compiler maintainers.
-- Related: epic `nexus-dvr6.6` (port catalog).
-- Detailed catalog: `bootstrap/tests/PORT_SKIPPED.md` (per-test entries
-  grouped by source file). This ADR is the categorical rollup; the
-  catalog stays as the line-itemized companion.
+- Related: epic `nexus-dvr6.6` (port catalog), epic `nexus-dvr6.8`
+  (bootstrap/ deletion). Pre-deletion line-item catalog is recoverable
+  via tag `v-last-rust-bootstrap` if forensic needed.
 
 ## Context
 

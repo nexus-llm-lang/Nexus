@@ -8,9 +8,9 @@
 ## Context
 
 Nexus is self-hosted: the compiler in `src/**` and the standard library in
-`nxlib/**` are written in Nexus and compile themselves. The only piece of
-the toolchain not written in Nexus is the small Rust shim under
-`bootstrap/` that knows how to host a wasm component.
+`nxlib/**` are written in Nexus and compile themselves. There is no
+non-Nexus piece of the toolchain — the runtime host is `wasmtime`, the
+seed is the committed `nexus.wasm`.
 
 The committed binary `nexus.wasm` at the repo root is the **Stage0 seed** of
 the bootstrap. It is *not* a build artifact in the usual sense: it is a
@@ -22,9 +22,9 @@ build itself.
 `bootstrap.sh` makes this concrete:
 
 1. Stage 0: runs the committed `nexus.wasm` seed under `wasmtime` to compile
-   `src/driver.nx` → `stage0.wasm`.
-2. Stage 1: runs `stage0.wasm` to compile `src/driver.nx` → `stage1.wasm`.
-3. Stage 2: runs `stage1.wasm` to compile `src/driver.nx` → `stage2.wasm`.
+   `src/driver.nx` -> `stage0.wasm`.
+2. Stage 1: runs `stage0.wasm` to compile `src/driver.nx` -> `stage1.wasm`.
+3. Stage 2: runs `stage1.wasm` to compile `src/driver.nx` -> `stage2.wasm`.
 4. Verifies `stage1.wasm == stage2.wasm`. The success log line is
    `Fixed point reached! stage1.wasm and stage2.wasm are identical.`
 5. Installs `stage1.wasm` as the new `nexus.wasm`, builds `lsp.wasm`, and
