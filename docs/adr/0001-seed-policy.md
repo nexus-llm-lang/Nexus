@@ -21,18 +21,17 @@ build itself.
 
 `bootstrap.sh` makes this concrete:
 
-1. Builds the Rust host (`bootstrap/target/release/nexus`).
-2. Stage 0: produces `stage0.wasm` from `src/driver.nx` (using either the
-   cached `nexus.wasm` or `nexus build` from the Rust binary).
-3. Stage 1: runs `stage0.wasm` to compile `src/driver.nx` → `stage1.wasm`.
-4. Stage 2: runs `stage1.wasm` to compile `src/driver.nx` → `stage2.wasm`.
-5. Verifies `stage1.wasm == stage2.wasm`. The success log line is
+1. Stage 0: runs the committed `nexus.wasm` seed under `wasmtime` to compile
+   `src/driver.nx` → `stage0.wasm`.
+2. Stage 1: runs `stage0.wasm` to compile `src/driver.nx` → `stage1.wasm`.
+3. Stage 2: runs `stage1.wasm` to compile `src/driver.nx` → `stage2.wasm`.
+4. Verifies `stage1.wasm == stage2.wasm`. The success log line is
    `Fixed point reached! stage1.wasm and stage2.wasm are identical.`
-   (`bootstrap.sh:143`).
-6. Installs `stage1.wasm` as the new `nexus.wasm`.
+5. Installs `stage1.wasm` as the new `nexus.wasm`, builds `lsp.wasm`, and
+   packs them into the `./nexus` polyglot launcher.
 
 CI runs `./bootstrap.sh --ci` on every push and pull request
-(`.github/workflows/ci.yml`, job `bootstrap-verify`). A non-fixed point or
+(`.github/workflows/ci.yml`, job `bootstrap-and-seed-verify`). A non-fixed point or
 an ill-formed `stage2.wasm` fails the job.
 
 The implication: if a PR changes `src/**` or `nxlib/**` without also
@@ -100,7 +99,7 @@ For reviewers:
 
 For CI:
 
-- `bootstrap-verify` is the load-bearing gate. If it goes flaky, treat the
+- `bootstrap-and-seed-verify` is the load-bearing gate. If it goes flaky, treat the
   flake as a P0: silent seed/source drift is the failure mode.
 
 ## Forward-compat protocol (2-step) for syntax / IR additions

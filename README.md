@@ -128,8 +128,8 @@ cp nexus ~/.local/bin/   # or anywhere on PATH
 [wasmtime](https://wasmtime.dev/) must be installed and on `PATH`. Override the wasm runtime via environment:
 
 ```bash
-NEXUS_MAX_WASM_STACK=134217728 nexus foo.nx out.wasm   # 128 MiB stack
-NEXUS_WASMTIME_ARGS="-S http,inherit-network" nexus foo.nx out.wasm
+NEXUS_MAX_WASM_STACK=134217728 nexus build foo.nx -o out.wasm   # 128 MiB stack
+NEXUS_WASMTIME_ARGS="-S http,inherit-network" nexus build foo.nx -o out.wasm
 ```
 
 The committed `nexus.wasm` at the repo root is the Stage0 seed of the self-host. Any change under `src/**` or `nxlib/**` must regenerate it; see [`docs/adr/0001-seed-policy.md`](docs/adr/0001-seed-policy.md) for the policy and the 2-step protocol for syntax/IR additions.
@@ -137,13 +137,13 @@ The committed `nexus.wasm` at the repo root is the Stage0 seed of the self-host.
 ## Usage
 
 ```bash
-nexus               # REPL
-nexus run example.nx        # interpret
-nexus build example.nx      # compile to main.wasm
-nexus build example.nx -o out.wasm
-nexus check example.nx      # typecheck only
-nexus check --format json example.nx  # structured diagnostics (LLM-friendly)
-nexus lsp            # start Language Server (stdio)
+nexus repl                          # interactive REPL
+nexus build example.nx              # compile to out.wasm
+nexus build example.nx -o main.wasm
+nexus typecheck example.nx          # typecheck only
+nexus test [path]                   # run the test runner
+nexus lsp                           # start Language Server (stdio)
+nexus help                          # full subcommand listing
 ```
 
 Compiled programs run under wasmtime with the capabilities they declare:
@@ -156,8 +156,8 @@ wasmtime run -Scli -Shttp -Sinherit-network -Sallow-ip-name-lookup -Stcp main.wa
 ## Example
 
 ```nexus
-import { Console }, * as stdio from stdlib/stdio.nx
-import { from_i64 } from stdlib/str.nx
+import { Console }, * as stdio from "std:stdio"
+import { from_i64 } from "std:str"
 
 let fib = fn (n: i64) -> i64 do
   if n <= 1 then return n end
