@@ -192,11 +192,8 @@ fn lazy_parallel_consecutive_forces_via_stdlib_path() {
 }
 
 #[test]
-#[ignore = "blocked on nexus-ug96 — fixture's trap-on-mismatch correctly fires \
-            because the component-model lazy stub returns (0,) instead of \
-            invoking the thunk; un-ignore when the stub or the test path is fixed."]
 fn lazy_host_force() {
-    exec_with_stdlib(&read_fixture("nxc/test_lazy_host_force.nx"));
+    exec_with_stdlib_core(&read_fixture("nxc/test_lazy_host_force.nx"));
 }
 
 #[test]
