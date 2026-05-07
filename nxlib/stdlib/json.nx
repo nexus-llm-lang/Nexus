@@ -21,6 +21,7 @@
 import * as str from "std:str"
 import * as char from "std:char"
 import * as bb from "std:bytebuffer"
+import { ByteBuffer } from "std:bytebuffer"
 import { Option, Some, None } from "std:option"
 
 /// Parser/serializer error. `pos` is the byte offset (or -1 for serializer
@@ -655,24 +656,74 @@ let serialize_float = fn (val: f64) -> string throws { JsonThrow } do
   return rendered ++ ".0"
 end
 
-let serialize_array_items = fn (items: [JsonValue], first: bool, acc: string) -> string throws { JsonThrow } do
+// Accumulate array items into a bytebuffer instead of building up a string
+// via repeated `acc ++ sep ++ chunk`. The original O(N^2) variant copied the
+// growing accumulator on every step; ByteBuffer.push_string is amortized
+// O(|chunk|) and bypasses the cfy4 string-concat cliff. Each call site
+// allocates one buffer and frees it after `to_string` — nested arrays/objects
+// recurse via `serialize_value`, which gets a fresh sub-buffer.
+// Tail of an array: prepend "," then push the next item, recurse.
+let serialize_array_items_tail = fn (buf: %ByteBuffer, items: [JsonValue]) -> %ByteBuffer throws { JsonThrow } do
   match items do
-    | [] -> return acc
+    | [] -> return buf
     | v :: rest ->
-      let sep = if first then "" else "," end
+      let %buf1 = bb.push_string(%buf, ",")
       let chunk = serialize_value(v)
-      return serialize_array_items(items: rest, first: false, acc: acc ++ sep ++ chunk)
+      let %buf2 = bb.push_string(%buf1, chunk)
+      return serialize_array_items_tail(buf: %buf2, items: rest)
   end
 end
 
-let serialize_object_fields = fn (fields: [JsonField], first: bool, acc: string) -> string throws { JsonThrow } do
-  match fields do
-    | [] -> return acc
-    | JsonField(key: k, value: v) :: rest ->
-      let sep = if first then "" else "," end
-      let chunk = serialize_string(s: k) ++ ":" ++ serialize_value(v)
-      return serialize_object_fields(fields: rest, first: false, acc: acc ++ sep ++ chunk)
+// First element (no separator) followed by the tail.
+let serialize_array_items_into = fn (buf: %ByteBuffer, items: [JsonValue]) -> %ByteBuffer throws { JsonThrow } do
+  match items do
+    | [] -> return buf
+    | v :: rest ->
+      let chunk = serialize_value(v)
+      let %buf1 = bb.push_string(%buf, chunk)
+      return serialize_array_items_tail(buf: %buf1, items: rest)
   end
+end
+
+let serialize_array_items = fn (items: [JsonValue]) -> string throws { JsonThrow } do
+  let buf = bb.empty()
+  let %buf2 = serialize_array_items_into(buf: %buf, items: items)
+  let result = bb.to_string(&buf2)
+  bb.free(%buf2)
+  return result
+end
+
+let serialize_object_fields_tail = fn (buf: %ByteBuffer, fields: [JsonField]) -> %ByteBuffer throws { JsonThrow } do
+  match fields do
+    | [] -> return buf
+    | JsonField(key: k, value: v) :: rest ->
+      let %buf1 = bb.push_string(%buf, ",")
+      let %buf2 = bb.push_string(%buf1, serialize_string(s: k))
+      let %buf3 = bb.push_string(%buf2, ":")
+      let chunk = serialize_value(v)
+      let %buf4 = bb.push_string(%buf3, chunk)
+      return serialize_object_fields_tail(buf: %buf4, fields: rest)
+  end
+end
+
+let serialize_object_fields_into = fn (buf: %ByteBuffer, fields: [JsonField]) -> %ByteBuffer throws { JsonThrow } do
+  match fields do
+    | [] -> return buf
+    | JsonField(key: k, value: v) :: rest ->
+      let %buf1 = bb.push_string(%buf, serialize_string(s: k))
+      let %buf2 = bb.push_string(%buf1, ":")
+      let chunk = serialize_value(v)
+      let %buf3 = bb.push_string(%buf2, chunk)
+      return serialize_object_fields_tail(buf: %buf3, fields: rest)
+  end
+end
+
+let serialize_object_fields = fn (fields: [JsonField]) -> string throws { JsonThrow } do
+  let buf = bb.empty()
+  let %buf2 = serialize_object_fields_into(buf: %buf, fields: fields)
+  let result = bb.to_string(&buf2)
+  bb.free(%buf2)
+  return result
 end
 
 let serialize_value = fn (v: JsonValue) -> string throws { JsonThrow } do
@@ -682,8 +733,8 @@ let serialize_value = fn (v: JsonValue) -> string throws { JsonThrow } do
     | JsonInt(val: i) -> return str.from_i64(val: i)
     | JsonFloat(val: f) -> return serialize_float(val: f)
     | JsonString(val: s) -> return serialize_string(s)
-    | JsonArray(items: xs) -> return "[" ++ serialize_array_items(items: xs, first: true, acc: "") ++ "]"
-    | JsonObject(fields: fs) -> return "{" ++ serialize_object_fields(fields: fs, first: true, acc: "") ++ "}"
+    | JsonArray(items: xs) -> return "[" ++ serialize_array_items(items: xs) ++ "]"
+    | JsonObject(fields: fs) -> return "{" ++ serialize_object_fields(fields: fs) ++ "}"
   end
 end
 
