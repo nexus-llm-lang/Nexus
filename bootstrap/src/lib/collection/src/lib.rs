@@ -11,6 +11,12 @@ thread_local! {
     static NEXT_SET_ID: Cell<i64> = Cell::new(1);
     static NEXT_SMAP_ID: Cell<i64> = Cell::new(1);
     static NEXT_BUF_ID: Cell<i64> = Cell::new(1);
+
+    // Index-order caches for O(1) random access by index.
+    // Lazily populated on first __nx_*_at call after any mutation; invalidated
+    // (entry removed) on put/del/free. Avoids the O(idx) cost of HashMap::iter().nth(idx).
+    static MAP_KV_CACHE: RefCell<HashMap<i64, Vec<(i64, i64)>>> = RefCell::new(HashMap::new());
+    static SMAP_V_CACHE: RefCell<HashMap<i64, Vec<i64>>> = RefCell::new(HashMap::new());
 }
 
 #[cfg(not(feature = "no_alloc_export"))]
@@ -56,6 +62,7 @@ pub extern "C" fn __nx_hmap_put(id: i64, key: i64, value: i64) -> i64 {
             map.insert(key, value);
         }
     });
+    MAP_KV_CACHE.with(|c| c.borrow_mut().remove(&id));
     0
 }
 
@@ -81,12 +88,16 @@ pub extern "C" fn __nx_hmap_has(id: i64, key: i64) -> i32 {
 
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_del(id: i64, key: i64) -> i32 {
-    MAPS.with(|maps| {
+    let removed = MAPS.with(|maps| {
         maps.borrow_mut()
             .get_mut(&id)
             .map(|map| map.remove(&key).is_some())
             .unwrap_or(false)
-    }) as i32
+    });
+    if removed {
+        MAP_KV_CACHE.with(|c| c.borrow_mut().remove(&id));
+    }
+    removed as i32
 }
 
 #[cfg_attr(not(feature = "component"), no_mangle)]
@@ -133,30 +144,44 @@ pub extern "C" fn __nx_hmap_vals(id: i64) -> i64 {
     })
 }
 
+/// Build (or refresh) the (key, value) snapshot for a HashMap and return the
+/// requested index in O(1). Subsequent `_at` calls hit the cache directly.
+fn hmap_kv_at(id: i64, idx: i64) -> Option<(i64, i64)> {
+    if idx < 0 {
+        return None;
+    }
+    MAP_KV_CACHE.with(|cache| {
+        let mut cache_mut = cache.borrow_mut();
+        if !cache_mut.contains_key(&id) {
+            let snapshot: Vec<(i64, i64)> = MAPS.with(|maps| {
+                maps.borrow()
+                    .get(&id)
+                    .map(|map| map.iter().map(|(&k, &v)| (k, v)).collect())
+                    .unwrap_or_default()
+            });
+            cache_mut.insert(id, snapshot);
+        }
+        cache_mut
+            .get(&id)
+            .and_then(|v| v.get(idx as usize).copied())
+    })
+}
+
 /// Returns the key at the given index (iteration order). Returns 0 if out of bounds.
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_key_at(id: i64, idx: i64) -> i64 {
-    MAPS.with(|maps| {
-        maps.borrow()
-            .get(&id)
-            .and_then(|map| map.keys().nth(idx as usize).copied())
-            .unwrap_or(0)
-    })
+    hmap_kv_at(id, idx).map(|(k, _)| k).unwrap_or(0)
 }
 
 /// Returns the value at the given index (iteration order). Returns 0 if out of bounds.
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_val_at(id: i64, idx: i64) -> i64 {
-    MAPS.with(|maps| {
-        maps.borrow()
-            .get(&id)
-            .and_then(|map| map.values().nth(idx as usize).copied())
-            .unwrap_or(0)
-    })
+    hmap_kv_at(id, idx).map(|(_, v)| v).unwrap_or(0)
 }
 
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_hmap_free(id: i64) -> i32 {
+    MAP_KV_CACHE.with(|c| c.borrow_mut().remove(&id));
     MAPS.with(|maps| maps.borrow_mut().remove(&id).is_some()) as i32
 }
 
@@ -308,6 +333,7 @@ pub extern "C" fn __nx_smap_put(id: i64, key_ptr: i32, key_len: i32, value: i64)
             map.insert(key, value);
         }
     });
+    SMAP_V_CACHE.with(|c| c.borrow_mut().remove(&id));
     0
 }
 
@@ -336,12 +362,16 @@ pub extern "C" fn __nx_smap_has(id: i64, key_ptr: i32, key_len: i32) -> i32 {
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_del(id: i64, key_ptr: i32, key_len: i32) -> i32 {
     let key = nexus_wasm_alloc::read_string(key_ptr, key_len);
-    SMAPS.with(|maps| {
+    let removed = SMAPS.with(|maps| {
         maps.borrow_mut()
             .get_mut(&id)
             .map(|map| map.remove(&key).is_some())
             .unwrap_or(false)
-    }) as i32
+    });
+    if removed {
+        SMAP_V_CACHE.with(|c| c.borrow_mut().remove(&id));
+    }
+    removed as i32
 }
 
 #[cfg_attr(not(feature = "component"), no_mangle)]
@@ -395,18 +425,36 @@ pub extern "C" fn __nx_smap_val_count(id: i64) -> i64 {
 }
 
 /// Returns the value at the given index (iteration order). Returns 0 if out of bounds.
+///
+/// Builds (or refreshes) a side-cache of the value list on first access, so
+/// repeated `_at` calls across an enumeration are O(1) per call rather than
+/// O(idx) (the cost of HashMap::values().nth(idx)).
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_val_at(id: i64, idx: i64) -> i64 {
-    SMAPS.with(|maps| {
-        maps.borrow()
+    if idx < 0 {
+        return 0;
+    }
+    SMAP_V_CACHE.with(|cache| {
+        let mut cache_mut = cache.borrow_mut();
+        if !cache_mut.contains_key(&id) {
+            let snapshot: Vec<i64> = SMAPS.with(|maps| {
+                maps.borrow()
+                    .get(&id)
+                    .map(|map| map.values().copied().collect())
+                    .unwrap_or_default()
+            });
+            cache_mut.insert(id, snapshot);
+        }
+        cache_mut
             .get(&id)
-            .and_then(|map| map.values().nth(idx as usize).copied())
+            .and_then(|v| v.get(idx as usize).copied())
             .unwrap_or(0)
     })
 }
 
 #[cfg_attr(not(feature = "component"), no_mangle)]
 pub extern "C" fn __nx_smap_free(id: i64) -> i32 {
+    SMAP_V_CACHE.with(|c| c.borrow_mut().remove(&id));
     SMAPS.with(|maps| maps.borrow_mut().remove(&id).is_some()) as i32
 }
 
@@ -713,6 +761,123 @@ mod read_bytes_tests {
         let id = read_into_new_buf(&mut cur, -5);
         let got = BUFS.with(|b| b.borrow().get(&id).cloned()).unwrap();
         assert!(got.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod index_cache_tests {
+    use super::*;
+
+    /// Iterating every index of a freshly-populated map must visit every
+    /// (key, value) pair exactly once, regardless of HashMap iteration order.
+    #[test]
+    fn hmap_full_enumeration_via_index_at_visits_each_entry_once() {
+        let id = __nx_hmap_new();
+        let pairs: Vec<(i64, i64)> = (0..50).map(|i| (i, i * 1000 + 7)).collect();
+        for &(k, v) in &pairs {
+            __nx_hmap_put(id, k, v);
+        }
+        let n = __nx_hmap_size(id);
+        let mut seen: Vec<(i64, i64)> = (0..n)
+            .map(|i| (__nx_hmap_key_at(id, i), __nx_hmap_val_at(id, i)))
+            .collect();
+        seen.sort();
+        let mut expected = pairs.clone();
+        expected.sort();
+        assert_eq!(seen, expected);
+        __nx_hmap_free(id);
+    }
+
+    /// After put-invalidation the cache must rebuild — values must reflect the new entry.
+    #[test]
+    fn hmap_put_invalidates_index_cache() {
+        let id = __nx_hmap_new();
+        __nx_hmap_put(id, 1, 100);
+        __nx_hmap_put(id, 2, 200);
+        // Touch _at to populate the cache.
+        let _ = __nx_hmap_val_at(id, 0);
+        let _ = __nx_hmap_val_at(id, 1);
+        // Mutate.
+        __nx_hmap_put(id, 3, 300);
+        let n = __nx_hmap_size(id);
+        assert_eq!(n, 3);
+        let mut vs: Vec<i64> = (0..n).map(|i| __nx_hmap_val_at(id, i)).collect();
+        vs.sort();
+        assert_eq!(vs, vec![100, 200, 300]);
+        __nx_hmap_free(id);
+    }
+
+    /// After del-invalidation the cache must rebuild — index 0 must not return the deleted value.
+    #[test]
+    fn hmap_del_invalidates_index_cache() {
+        let id = __nx_hmap_new();
+        __nx_hmap_put(id, 1, 100);
+        __nx_hmap_put(id, 2, 200);
+        __nx_hmap_put(id, 3, 300);
+        // Populate.
+        for i in 0..3 {
+            let _ = __nx_hmap_val_at(id, i);
+        }
+        // Remove key=2.
+        let removed = __nx_hmap_del(id, 2);
+        assert_eq!(removed, 1);
+        let n = __nx_hmap_size(id);
+        assert_eq!(n, 2);
+        let mut vs: Vec<i64> = (0..n).map(|i| __nx_hmap_val_at(id, i)).collect();
+        vs.sort();
+        assert_eq!(vs, vec![100, 300]);
+        __nx_hmap_free(id);
+    }
+
+    /// Out-of-bounds and negative indices return 0 without panicking.
+    #[test]
+    fn hmap_at_out_of_bounds_returns_zero() {
+        let id = __nx_hmap_new();
+        __nx_hmap_put(id, 42, 99);
+        assert_eq!(__nx_hmap_val_at(id, -1), 0);
+        assert_eq!(__nx_hmap_val_at(id, 1), 0);
+        assert_eq!(__nx_hmap_val_at(id, 999_999), 0);
+        __nx_hmap_free(id);
+    }
+
+    /// SMAP equivalent: enumeration via index must visit every value exactly once.
+    #[test]
+    fn smap_full_enumeration_via_index_at_visits_each_value_once() {
+        let id = __nx_smap_new();
+        let pairs: Vec<(String, i64)> =
+            (0..30).map(|i| (format!("k{}", i), i * 11)).collect();
+        for (k, v) in &pairs {
+            __nx_smap_put(id, k.as_ptr() as i32, k.len() as i32, *v);
+        }
+        let n = __nx_smap_val_count(id);
+        let mut seen: Vec<i64> = (0..n).map(|i| __nx_smap_val_at(id, i)).collect();
+        seen.sort();
+        let mut expected: Vec<i64> = pairs.iter().map(|(_, v)| *v).collect();
+        expected.sort();
+        assert_eq!(seen, expected);
+        __nx_smap_free(id);
+    }
+
+    /// After put on smap the cache must reflect the new value.
+    #[test]
+    fn smap_put_invalidates_index_cache() {
+        let id = __nx_smap_new();
+        let k1 = "a".to_string();
+        let k2 = "b".to_string();
+        __nx_smap_put(id, k1.as_ptr() as i32, k1.len() as i32, 1);
+        __nx_smap_put(id, k2.as_ptr() as i32, k2.len() as i32, 2);
+        // Populate cache.
+        let _ = __nx_smap_val_at(id, 0);
+        let _ = __nx_smap_val_at(id, 1);
+        // Insert new key.
+        let k3 = "c".to_string();
+        __nx_smap_put(id, k3.as_ptr() as i32, k3.len() as i32, 3);
+        let n = __nx_smap_val_count(id);
+        assert_eq!(n, 3);
+        let mut vs: Vec<i64> = (0..n).map(|i| __nx_smap_val_at(id, i)).collect();
+        vs.sort();
+        assert_eq!(vs, vec![1, 2, 3]);
+        __nx_smap_free(id);
     }
 }
 
