@@ -341,8 +341,8 @@ view[2] <- 30
 let first = view[0]
 let len = array.length(arr: &%arr)
 
-// Iterate via borrow
-array.for_each(arr: &%arr, f: fn (val: i64) -> unit do
+// Iterate via borrow — fold_left is the borrow-side iterator
+let _ = array.fold_left(arr: &%arr, init: (), f: fn (acc: unit, val: i64) -> unit do
   Console.println(val: str.from_i64(val: val))
 end)
 
