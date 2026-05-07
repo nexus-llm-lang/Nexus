@@ -17,7 +17,7 @@ The standard library is the `std` package, rooted at `nxlib/stdlib/`. Every modu
 | `"std:rand"` | FFI | `Random` cap (`random_i64`, `random_range`) |
 | `"std:math"` | FFI | `abs_i64`, `sqrt`, `floor`, `pow`, `i64_to_float`, ... |
 | `"std:str"` | FFI | `length`, `substring`, `index_of`, `starts_with`, `from_i64`, ... |
-| `"std:char"` | FFI | Char/byte helpers (shares the `string` WIT interface) |
+| `"std:char"` | FFI | Char/byte helpers (shares the `string` host module) |
 | `"std:bytebuffer"` | FFI | `ByteBuffer` opaque type, push/get/write helpers |
 | `"std:hashmap"` | FFI | `HashMap` (i64→i64) opaque type |
 | `"std:set"` | FFI | `HashSet` opaque type |
@@ -67,18 +67,6 @@ end
 ```
 
 Permissions: `PermConsole`, `PermFs`, `PermNet`, `PermProc`, `PermClock`, `PermRandom`. Pure modules (list, option, result, tuple, exn, lazy) need none.
-
-## WIT Interface Naming
-
-For each `std:<module>`, the WIT module name (used by codegen and component composition) is `nexus:std/<module>`, with underscores converted to hyphens:
-
-| Import path | WIT interface |
-|-------------|---------------|
-| `std:stdio` | `nexus:std/stdio` |
-| `std:string` | `nexus:std/str` |
-| `std:bytebuffer` | `nexus:std/bytebuffer` |
-
-Use this form in `import external "std:<iface>"` declarations inside FFI-binding files (the WIT interface name uses hyphens regardless of the underscore-friendly import path).
 
 ## See Also
 

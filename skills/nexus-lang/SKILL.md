@@ -117,7 +117,7 @@ import { Result, Ok, Err } from "std:result"
 // Local files — bare relative paths (no colon)
 import { MyType } from "src/common/foo.nx"
 
-// FFI binding — declares the WIT interface for subsequent `external` decls
+// FFI binding — declares the host module for subsequent `external` decls
 import external "std:str"
 external __nx_string_length = "__nx_string_length" : (s: string) -> i64
 ```
@@ -125,12 +125,12 @@ external __nx_string_length = "__nx_string_length" : (s: string) -> i64
 Path forms:
 | Form | Resolves to | Use |
 |------|-------------|-----|
-| `"std:stdio"` | `nxlib/stdlib/stdio.nx`, WIT `nexus:std/stdio` | Standard library module |
+| `"std:stdio"` | `nxlib/stdlib/stdio.nx` | Standard library module |
 | `"pkg:path/module"` | `<pkg-root>/path/module.nx` | Third-party package module |
 | `"src/foo.nx"` | Relative file path | Project-local module |
-| `import external "std:<iface>"` | WIT interface `nexus:std/<iface>` | Pin FFI imports to a WIT interface |
+| `import external "std:<mod>"` | Host module providing `<mod>` | Pin FFI imports to a host module |
 
-The `std` package always maps to `nxlib/stdlib/`. The WIT interface name matches the file stem (`std:string` → `nexus:std/str`); kebab-case applies only when an interface name has multiple words.
+The `std` package always maps to `nxlib/stdlib/`.
 
 ## Effect System (Caps & Handlers)
 
@@ -487,6 +487,6 @@ end
 - https://nexus-llm-lang.github.io/latest/spec/types — Type system, linear types, borrowing
 - https://nexus-llm-lang.github.io/latest/spec/effects — Caps, handlers, inject, permissions
 - https://nexus-llm-lang.github.io/latest/env/stdlib — Standard library API reference
-- `./references/stdlib.md` — `std` package module index, capability permissions, WIT naming
+- `./references/stdlib.md` — `std` package module index, capability permissions
 - `./references/patterns.md` — Idiomatic code patterns with examples
 - `./templates/` — Starter templates for common program structures
