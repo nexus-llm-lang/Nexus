@@ -15,11 +15,21 @@
  * discovery turns up zero files (an empty test run is treated as user
  * error — silent passes hide CI misconfiguration).
  *
- * Parallelism: tests run sequentially. `Proc.exec` is a blocking host
- * call (`std::process::Command::output` on the host side), so fanning
- * out via the cooperative fiber scheduler cannot overlap subprocess
- * execution. Real parallelism would require an async exec primitive on
- * the host; until that exists the runner takes no concurrency flag.
+ * Parallelism: per-test execution is structured around `@` lazy
+ * bindings. Each fixture is bound as an `@TestOutcome` thunk inside
+ * `run_all`, then forced before the recursion produces the rest of the
+ * outcome list. A worker-pool runtime that overlaps thunk forcing
+ * across threads (the future role of `lazy.host_spawn` / `host_join`)
+ * gets parallel test execution by walking this same shape — no further
+ * source surgery in this module. `Proc.exec` is a blocking host call,
+ * so the runtime path that ultimately overlaps subprocess execution has
+ * to dispatch each `@TestOutcome` to a real worker thread; the binding
+ * form here is the contract that hands off cleanly to that runtime.
+ *
+ * The `--sequential` flag forces an inline-only path that never
+ * introduces an `@`-binding around the per-test call. Use it for
+ * fixtures whose semantics depend on serial subprocess ordering, or as
+ * a control path when bisecting a suspected lazy-thunk regression.
  */
 
 import { Console } from "std:stdio"
@@ -39,11 +49,17 @@ export type TestOutcome =
   | TestFail(file: string, wall_ms: i64, exit_code: i64, stderr_tail: string, stage: string)
 
 /// Parsed CLI options for the `test` subcommand.
+///
+/// `sequential` toggles off the `@`-lazy per-test binding form. Default
+/// is the lazy path. The flag exists for fixtures whose subprocess
+/// behaviour relies on strict serial ordering and as a bisect aid when
+/// the lazy-thunk lowering is suspected of a regression.
 export type TestOptions = TestOptions(
   path: string,
   junit_path: Option<string>,
   nexus_bin: string,
-  wasmtime_bin: string
+  wasmtime_bin: string,
+  sequential: bool
 )
 
 // ─── Argument parsing ─────────────────────────────────────────────────────
@@ -67,50 +83,61 @@ export let strip_test_subcommand = fn (xs: [string]) -> ParsedTestSubcommand do
   end
 end
 
-type FlagPair = FlagPair(remaining: [string], junit: Option<string>, nexus_bin: string, wasmtime_bin: string)
+type FlagPair = FlagPair(
+  remaining: [string],
+  junit: Option<string>,
+  nexus_bin: string,
+  wasmtime_bin: string,
+  sequential: bool
+)
 
-/// Strip `--junit FILE`, `--nexus-bin PATH`, `--wasmtime-bin PATH` pairs
-/// from `xs`, preserving the order of any unrecognised tokens. The
-/// `--nexus-bin` / `--wasmtime-bin` flags exist so the runner stays
-/// host-agnostic: stage1 wasm has no way to discover a working `nexus`
-/// binary on its own, and the CI harness needs to point at a checked-out
-/// `bootstrap/target/release/nexus`.
-let parse_flags = fn (xs: [string], acc_remaining: [string], junit: Option<string>, nexus_bin: string, wasmtime_bin: string) -> FlagPair throws { Exn } do
+/// Strip `--junit FILE`, `--nexus-bin PATH`, `--wasmtime-bin PATH`,
+/// `--sequential` from `xs`, preserving the order of any unrecognised
+/// tokens. The `--nexus-bin` / `--wasmtime-bin` flags exist so the
+/// runner stays host-agnostic: stage1 wasm has no way to discover a
+/// working `nexus` binary on its own, and the CI harness needs to point
+/// at a checked-out `bootstrap/target/release/nexus`. `--sequential`
+/// opts out of the `@`-lazy per-test binding form (see module
+/// docstring).
+let parse_flags = fn (xs: [string], acc_remaining: [string], junit: Option<string>, nexus_bin: string, wasmtime_bin: string, sequential: bool) -> FlagPair throws { Exn } do
   match xs do
-    | [] -> return FlagPair(remaining: list.reverse(xs: acc_remaining), junit, nexus_bin, wasmtime_bin)
+    | [] -> return FlagPair(remaining: list.reverse(xs: acc_remaining), junit, nexus_bin, wasmtime_bin, sequential)
     | flag :: rest ->
       if flag == "--junit" then
         match rest do
           | [] -> raise InvalidUsage(detail: "--junit requires a path")
-          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, junit: Some(val: value), nexus_bin, wasmtime_bin)
+          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, junit: Some(val: value), nexus_bin, wasmtime_bin, sequential)
         end
       end
       if flag == "--nexus-bin" then
         match rest do
           | [] -> raise InvalidUsage(detail: "--nexus-bin requires a path")
-          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, junit, nexus_bin: value, wasmtime_bin)
+          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, junit, nexus_bin: value, wasmtime_bin, sequential)
         end
       end
       if flag == "--wasmtime-bin" then
         match rest do
           | [] -> raise InvalidUsage(detail: "--wasmtime-bin requires a path")
-          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, junit, nexus_bin, wasmtime_bin: value)
+          | value :: rest2 -> return parse_flags(xs: rest2, acc_remaining, junit, nexus_bin, wasmtime_bin: value, sequential)
         end
       end
-      return parse_flags(xs: rest, acc_remaining: flag :: acc_remaining, junit, nexus_bin, wasmtime_bin)
+      if flag == "--sequential" then
+        return parse_flags(xs: rest, acc_remaining, junit, nexus_bin, wasmtime_bin, sequential: true)
+      end
+      return parse_flags(xs: rest, acc_remaining: flag :: acc_remaining, junit, nexus_bin, wasmtime_bin, sequential)
   end
 end
 
 /// Build a TestOptions from the post-`test`-subcommand argv tail. The first
 /// positional arg (if any) is the discovery path; default is `tests/`.
 export let parse_test_options = fn (args: [string]) -> TestOptions throws { Exn } do
-  let FlagPair(remaining, junit, nexus_bin, wasmtime_bin) =
-    parse_flags(xs: args, acc_remaining: [], junit: None, nexus_bin: "nexus", wasmtime_bin: "wasmtime")
+  let FlagPair(remaining, junit, nexus_bin, wasmtime_bin, sequential) =
+    parse_flags(xs: args, acc_remaining: [], junit: None, nexus_bin: "nexus", wasmtime_bin: "wasmtime", sequential: false)
   let path = match remaining do
     | [] -> "tests/"
     | p :: _ -> p
   end
-  return TestOptions(path, junit_path: junit, nexus_bin, wasmtime_bin)
+  return TestOptions(path, junit_path: junit, nexus_bin, wasmtime_bin, sequential)
 end
 
 // ─── Discovery ────────────────────────────────────────────────────────────
@@ -186,7 +213,7 @@ end
 /// runtime (`stage = "run"`) so the JUnit / human reports can hint at the
 /// right log to inspect.
 export let run_one_test = fn (file: string, opts: TestOptions, tmp_wasm: string) -> TestOutcome require { Proc, Clock, Console } do
-  let TestOptions(path: _, junit_path: _, nexus_bin, wasmtime_bin) = opts
+  let TestOptions(nexus_bin, wasmtime_bin, _) = opts
   // Compile phase: invoke the host nexus binary. Every failure here is
   // surfaced as a TestFail so a single broken fixture cannot silently skip.
   let compile_args = ["build", file, "-o", tmp_wasm, "--explain-capabilities", "none"]
@@ -362,41 +389,70 @@ end
 
 // ─── Top-level entry ──────────────────────────────────────────────────────
 
-/// Run every discovered test sequentially, render the report, optionally
-/// dump a JUnit XML file, and return the unix exit code (0 = green, 1 =
-/// any failure or empty discovery).
+/// Run every discovered test, render the report, optionally dump a
+/// JUnit XML file, and return the unix exit code (0 = green, 1 = any
+/// failure or empty discovery). The dispatch picks `run_all` (the
+/// `@`-lazy form) by default and `run_all_sequential` under
+/// `--sequential`.
 export let run_test_subcommand = fn (args: [string]) -> i64 require { Fs, Proc, Clock, Console } throws { Exn } do
   let opts = parse_test_options(args)
-  match opts do | TestOptions(path, junit_path, nexus_bin: _, wasmtime_bin: _) ->
-    let files = discover_tests(path)
-    let n = list.length(xs: files)
-    if n == 0 then
-      Console.eprintln(val: "nexus test: no *_test.nx files found under " ++ path)
-      return 1
-    end
-    Console.eprintln(val: "nexus test: discovered " ++ str.from_i64(val: n) ++ " file(s) under " ++ path)
-    let outcomes = run_all(files, opts, idx: 0)
-    let summary = report(outcomes)
-    match junit_path do
-      | None -> ()
-      | Some(val: jpath) ->
-        let xml = render_junit_xml(outcomes, summary)
-        Fs.write_string(path: jpath, content: xml)
-        Console.eprintln(val: "nexus test: wrote JUnit XML to " ++ jpath)
-    end
-    match summary do | RunSummary(total: _, passed: _, failed, total_ms: _) ->
-      if failed == 0 then return 0 end
-      return 1
-    end
+  let TestOptions(path, junit_path, sequential, _) = opts
+  let files = discover_tests(path)
+  let n = list.length(xs: files)
+  if n == 0 then
+    Console.eprintln(val: "nexus test: no *_test.nx files found under " ++ path)
+    return 1
   end
+  let mode_label = if sequential then "sequential" else "@-lazy" end
+  Console.eprintln(val: "nexus test: discovered " ++ str.from_i64(val: n)
+    ++ " file(s) under " ++ path ++ " [" ++ mode_label ++ "]")
+  let outcomes = if sequential then
+    run_all_sequential(files, opts, idx: 0)
+  else
+    run_all(files, opts, idx: 0)
+  end
+  let summary = report(outcomes)
+  match junit_path do
+    | None -> ()
+    | Some(val: jpath) ->
+      let xml = render_junit_xml(outcomes, summary)
+      Fs.write_string(path: jpath, content: xml)
+      Console.eprintln(val: "nexus test: wrote JUnit XML to " ++ jpath)
+  end
+  let RunSummary(failed, _) = summary
+  if failed == 0 then return 0 end
+  return 1
 end
 
-let run_all = fn (files: [string], opts: TestOptions, idx: i64) -> [TestOutcome] require { Proc, Clock, Console } do
+/// Inline-only fallback: forces `run_one_test` directly and recurses on
+/// the tail. No `@`-binding around the per-test call. Used by
+/// `--sequential` for fixtures whose subprocess effects must not
+/// interleave (and as a control path for bisecting the lazy-thunk
+/// codegen).
+let run_all_sequential = fn (files: [string], opts: TestOptions, idx: i64) -> [TestOutcome] require { Proc, Clock, Console } do
   match files do
     | [] -> return []
     | f :: rest ->
       let tmp = tmp_wasm_path(idx)
       let outcome = run_one_test(file: f, opts, tmp_wasm: tmp)
+      return outcome :: run_all_sequential(files: rest, opts, idx: idx + 1)
+  end
+end
+
+/// Walk the discovered fixtures, binding each test's invocation as an
+/// `@TestOutcome` thunk and forcing it before recursing on the tail.
+/// Per-test execution sites are explicit lazy bindings — the data
+/// structure a parallel runner would hand to a worker-pool spawn / join
+/// pair. Force order matches the discovery order, so PASS/FAIL stderr
+/// lines emit in fixture order regardless of how the underlying runtime
+/// schedules thunk evaluation.
+let run_all = fn (files: [string], opts: TestOptions, idx: i64) -> [TestOutcome] require { Proc, Clock, Console } do
+  match files do
+    | [] -> return []
+    | f :: rest ->
+      let tmp = tmp_wasm_path(idx)
+      let @t = run_one_test(file: f, opts, tmp_wasm: tmp)
+      let outcome = @t
       return outcome :: run_all(files: rest, opts, idx: idx + 1)
   end
 end
