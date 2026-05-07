@@ -35,6 +35,7 @@
  */
 import { byte_at, byte_length, byte_substring, from_char_code } from "std:str"
 import { ord } from "std:char"
+import * as bb from "std:bytebuffer"
 
 /// Raised when a UTF-8 walk encounters a malformed sequence — a lone
 /// continuation byte where a lead is expected, or a lead without enough
@@ -282,39 +283,51 @@ end
 /// U+FFFD; copying char-at-a-time preserves the original UTF-8.
 /// (Rust's to_uppercase is Unicode-aware; this is ASCII-only by
 /// design — documented divergence.)
-let case_go = fn (s: string, i: i64, n: i64, lo: i64, hi: i64, delta: i64, acc: string) -> string throws { Exn } do
-  if i >= n then return acc end
+let case_go = fn (buf: %bb.ByteBuffer, s: string, i: i64, n: i64, lo: i64, hi: i64, delta: i64) -> %bb.ByteBuffer throws { Exn } do
+  if i >= n then return buf end
   let b = ord(c: byte_at(s, idx: i))
   if b < 128 then
     let shifted = case_shift(b, lo, hi, delta)
-    let ch = from_char_code(code: shifted)
-    return case_go(s, i: i + 1, n, lo, hi, delta, acc: acc ++ ch)
+    let %buf2 = bb.push_byte(%buf, byte: shifted)
+    return case_go(buf: %buf2, s, i: i + 1, n, lo, hi, delta)
   end
   let w = lead_byte_width(b)
   if w < 0 then raise InvalidUtf8(op: "case_go", pos: i) end
   if i + w > n then raise InvalidUtf8(op: "case_go", pos: i) end
   let ch = byte_substring(s, start: i, len: w)
-  return case_go(s, i: i + w, n, lo, hi, delta, acc: acc ++ ch)
+  let %buf2 = bb.push_string(%buf, s: ch)
+  return case_go(buf: %buf2, s, i: i + w, n, lo, hi, delta)
+end
+
+let do_case = fn (s: string, lo: i64, hi: i64, delta: i64) -> string throws { Exn } do
+  let %buf = bb.empty()
+  let %buf = case_go(buf: %buf, s, i: 0, n: byte_length(s), lo, hi, delta)
+  let result = bb.to_string(&buf)
+  bb.free(%buf)
+  return result
 end
 
 /// Uppercase ASCII letters; non-ASCII bytes copy through unchanged.
 export let to_upper = fn (s: string) -> string throws { Exn } do
-  return case_go(s, i: 0, n: byte_length(s), lo: 97, hi: 122, delta: -32, acc: "")
+  return do_case(s, lo: 97, hi: 122, delta: -32)
 end
 
 /// Lowercase ASCII letters; non-ASCII bytes copy through unchanged.
 export let to_lower = fn (s: string) -> string throws { Exn } do
-  return case_go(s, i: 0, n: byte_length(s), lo: 65, hi: 90, delta: 32, acc: "")
+  return do_case(s, lo: 65, hi: 90, delta: 32)
 end
 
 // ─── Replace ─────────────────────────────────────────────────────────────────
 
-let replace_go = fn (s: string, n: i64, from_s: string, from_n: i64, to_s: string, i: i64, acc: string) -> string throws { Exn } do
+let replace_go = fn (buf: %bb.ByteBuffer, s: string, n: i64, from_s: string, from_n: i64, to_s: string, i: i64) -> %bb.ByteBuffer throws { Exn } do
   if i + from_n > n then
-    return acc ++ byte_substring(s, start: i, len: n - i)
+    let tail = byte_substring(s, start: i, len: n - i)
+    let %buf2 = bb.push_string(%buf, s: tail)
+    return %buf2
   end
   if byte_eq_at(s, i, sub: from_s, m: from_n, j: 0) then
-    return replace_go(s, n, from_s, from_n, to_s, i: i + from_n, acc: acc ++ to_s)
+    let %buf2 = bb.push_string(%buf, s: to_s)
+    return replace_go(buf: %buf2, s, n, from_s, from_n, to_s, i: i + from_n)
   end
   // Advance one codepoint (1..4 bytes) so the slice we feed back through
   // byte_substring is always a valid UTF-8 char — single sub-codepoint
@@ -324,7 +337,8 @@ let replace_go = fn (s: string, n: i64, from_s: string, from_n: i64, to_s: strin
   if w < 0 then raise InvalidUtf8(op: "replace", pos: i) end
   if i + w > n then raise InvalidUtf8(op: "replace", pos: i) end
   let one = byte_substring(s, start: i, len: w)
-  return replace_go(s, n, from_s, from_n, to_s, i: i + w, acc: acc ++ one)
+  let %buf2 = bb.push_string(%buf, s: one)
+  return replace_go(buf: %buf2, s, n, from_s, from_n, to_s, i: i + w)
 end
 
 /// Replaces every occurrence of `from_str` with `to_str`.  Empty
@@ -336,34 +350,52 @@ export let replace = fn (s: string, from_str: string, to_str: string) -> string 
   let from_n = byte_length(s: from_str)
   if from_n == 0 then return s end
   let n = byte_length(s)
-  return replace_go(s, n, from_s: from_str, from_n, to_s: to_str, i: 0, acc: "")
+  let %buf = bb.empty()
+  let %buf = replace_go(buf: %buf, s, n, from_s: from_str, from_n, to_s: to_str, i: 0)
+  let result = bb.to_string(&buf)
+  bb.free(%buf)
+  return result
 end
 
 // ─── Repeat / pad ────────────────────────────────────────────────────────────
 
-let repeat_go = fn (s: string, k: i64, acc: string) -> string do
-  if k <= 0 then return acc end
-  return repeat_go(s, k: k - 1, acc: acc ++ s)
+let repeat_go = fn (buf: %bb.ByteBuffer, s: string, k: i64) -> %bb.ByteBuffer do
+  if k <= 0 then return buf end
+  let %buf2 = bb.push_string(%buf, s)
+  return repeat_go(buf: %buf2, s, k: k - 1)
 end
 
 /// Concatenate `s` `n` times.  Negative `n` returns the empty string.
 export let repeat = fn (s: string, n: i64) -> string do
   if n <= 0 then return "" end
-  return repeat_go(s, k: n, acc: "")
+  let %buf = bb.empty()
+  let %buf = repeat_go(buf: %buf, s, k: n)
+  let result = bb.to_string(&buf)
+  bb.free(%buf)
+  return result
 end
 
 /// Walk `fill` to take `count` codepoints, cycling if `fill` is shorter
 /// than `count`.  Used by `pad_left` / `pad_right`.  Returns the empty
 /// string if `fill` itself is empty (caller short-circuits).
-let take_chars = fn (fill: string, fill_n: i64, count: i64, byte_pos: i64, acc: string) -> string throws { Exn } do
-  if count <= 0 then return acc end
+let take_chars = fn (buf: %bb.ByteBuffer, fill: string, fill_n: i64, count: i64, byte_pos: i64) -> %bb.ByteBuffer throws { Exn } do
+  if count <= 0 then return buf end
   let pos = if byte_pos >= fill_n then 0 else byte_pos end
   let b = ord(c: byte_at(s: fill, idx: pos))
   let w = lead_byte_width(b)
   if w < 0 then raise InvalidUtf8(op: "pad", pos) end
   if pos + w > fill_n then raise InvalidUtf8(op: "pad", pos) end
   let ch = byte_substring(s: fill, start: pos, len: w)
-  return take_chars(fill, fill_n, count: count - 1, byte_pos: pos + w, acc: acc ++ ch)
+  let %buf2 = bb.push_string(%buf, s: ch)
+  return take_chars(buf: %buf2, fill, fill_n, count: count - 1, byte_pos: pos + w)
+end
+
+let build_pad = fn (fill: string, fill_n: i64, count: i64) -> string throws { Exn } do
+  let %buf = bb.empty()
+  let %buf = take_chars(buf: %buf, fill, fill_n, count, byte_pos: 0)
+  let result = bb.to_string(&buf)
+  bb.free(%buf)
+  return result
 end
 
 /// Pads `s` on the left with `fill` (cycled) until it reaches `width`
@@ -372,7 +404,7 @@ export let pad_left = fn (s: string, width: i64, fill: string) -> string throws 
   let cur = length(s)
   let fill_n = byte_length(s: fill)
   if cur >= width || fill_n == 0 then return s end
-  let pad = take_chars(fill, fill_n, count: width - cur, byte_pos: 0, acc: "")
+  let pad = build_pad(fill, fill_n, count: width - cur)
   return pad ++ s
 end
 
@@ -382,7 +414,7 @@ export let pad_right = fn (s: string, width: i64, fill: string) -> string throws
   let cur = length(s)
   let fill_n = byte_length(s: fill)
   if cur >= width || fill_n == 0 then return s end
-  let pad = take_chars(fill, fill_n, count: width - cur, byte_pos: 0, acc: "")
+  let pad = build_pad(fill, fill_n, count: width - cur)
   return s ++ pad
 end
 
@@ -416,20 +448,29 @@ export let split = fn (s: string, sep: string) -> [string] do
   return split_go(s, n, sep, sep_n, i: 0, run: 0, acc: [])
 end
 
-let join_go = fn (xs: [string], sep: string, acc: string) -> string do
+let join_go = fn (buf: %bb.ByteBuffer, xs: [string], sep: string) -> %bb.ByteBuffer do
   match xs do
-    | [] -> return acc
+    | [] -> return buf
     | v :: rest ->
       match rest do
-        | [] -> return acc ++ v
-        | _ :: _ -> return join_go(xs: rest, sep, acc: acc ++ v ++ sep)
+        | [] ->
+          let %buf2 = bb.push_string(%buf, s: v)
+          return %buf2
+        | _ :: _ ->
+          let %buf2 = bb.push_string(%buf, s: v)
+          let %buf3 = bb.push_string(%buf2, s: sep)
+          return join_go(buf: %buf3, xs: rest, sep)
       end
   end
 end
 
 /// Joins `xs` with `sep` between each element.  Mirrors str.nx::join.
 export let join = fn (xs: [string], sep: string) -> string do
-  return join_go(xs, sep, acc: "")
+  let %buf = bb.empty()
+  let %buf = join_go(buf: %buf, xs, sep)
+  let result = bb.to_string(&buf)
+  bb.free(%buf)
+  return result
 end
 
 // ─── Conversions: i64 ↔ string ───────────────────────────────────────────────
@@ -681,17 +722,21 @@ end
 /// Documented limitation; the use case is byte-level string algorithms
 /// (palindrome checks on ASCII, hex digit reversal) where the caller
 /// already knows the input is single-byte.
-let reverse_bytes_go = fn (s: string, i: i64, acc: string) -> string do
-  if i < 0 then return acc end
+let reverse_bytes_go = fn (buf: %bb.ByteBuffer, s: string, i: i64) -> %bb.ByteBuffer do
+  if i < 0 then return buf end
   let b = ord(c: byte_at(s, idx: i))
-  let one = from_char_code(code: b)
-  return reverse_bytes_go(s, i: i - 1, acc: acc ++ one)
+  let %buf2 = bb.push_byte(%buf, byte: b)
+  return reverse_bytes_go(buf: %buf2, s, i: i - 1)
 end
 
 export let reverse_bytes = fn (s: string) -> string do
   let n = byte_length(s)
   if n == 0 then return s end
-  return reverse_bytes_go(s, i: n - 1, acc: "")
+  let %buf = bb.empty()
+  let %buf = reverse_bytes_go(buf: %buf, s, i: n - 1)
+  let result = bb.to_string(&buf)
+  bb.free(%buf)
+  return result
 end
 
 /// True when `s` consists entirely of ASCII bytes (every codepoint
