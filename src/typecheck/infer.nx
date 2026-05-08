@@ -768,6 +768,14 @@ let infer_index = fn (state: CheckState, target: HirExpr, index: HirExpr, span: 
 end
 
 // ─── Field access inference ─────────────────────────────────────────────────
+//
+// T-Proj premise `¬linear(τ)` (spec docs/spec/type-system-formal.md): a
+// record whose any field carries a linear type is itself structurally
+// linear. Projection on such a record would consume `r` via the sub-
+// derivation while exposing only one field — silently dropping the
+// other linear obligations. Reject at projection so the linear field
+// must be decomposed via record-pattern destructuring (P-Record's `⨄`
+// binds every linear field).
 
 let infer_field_access = fn (state: CheckState, target: HirExpr, field: string, span: Span) -> InferExprResult throws { TypeError } do
   match infer_expr(state, expr: target, ret_type: TyUnit) do
@@ -777,11 +785,61 @@ let infer_field_access = fn (state: CheckState, target: HirExpr, field: string, 
       match resolved do
         | TyRecord(fields: fs) ->
           match lookup_named_type(nts: fs, name: field) do
-            | Some(val: ft) -> return InferExprOk(state: st1, subst: s1, typ: ft)
+            | Some(val: ft) ->
+              match find_linear_field(fields: fs, tdefs: tctypes.state_typedefs(state: st1), depth: 8) do
+                | Some(val: leaker) ->
+                  return InferExprErr(
+                    message: "T-Proj: cannot project field `" ++ field ++ "` on structurally-linear record (linear field `" ++ leaker ++ "` would be silently dropped); destructure via record pattern instead",
+                    span
+                  )
+                | None -> return InferExprOk(state: st1, subst: s1, typ: ft)
+              end
             | None -> return InferExprErr(message: "no field " ++ field ++ " in record", span)
           end
         | _ -> return InferExprErr(message: "field access on non-record type", span)
       end
+  end
+end
+
+// Walk record fields; report the name of the first field that carries a
+// linear type (TyLinear / TyLazy), looking through anonymous TyRecord
+// nesting and named-type aliases (RecordDef). `depth` caps recursion in
+// case a typedef has a cycle.
+let find_linear_field = fn (
+  fields: [NamedType], tdefs: [tctypes.TypeDefEntry], depth: i64
+) -> Option<string> throws { TypeError } do
+  match fields do
+    | [] -> return None
+    | NamedType(name: fname, typ: ft) :: rest ->
+      if type_carries_linear(typ: ft, tdefs, depth) then
+        return Some(val: fname)
+      end
+      return find_linear_field(fields: rest, tdefs, depth)
+  end
+end
+
+let type_carries_linear = fn (
+  typ: TypeExpr, tdefs: [tctypes.TypeDefEntry], depth: i64
+) -> bool throws { TypeError } do
+  if depth <= 0 then return false end
+  match typ do
+    | TyLinear(_) -> return true
+    | TyLazy(_) -> return true
+    | TyRecord(fields: fs) ->
+      match find_linear_field(fields: fs, tdefs, depth: depth - 1) do
+        | Some(_) -> return true
+        | None -> return false
+      end
+    | TyUserDefined(name: n, args: _) ->
+      match tctypes.typedef_lookup(defs: tdefs, name: n) do
+        | Some(val: RecordDef(name: _, is_public: _, type_params: _, fields: rec_fields)) ->
+          match find_linear_field(fields: rec_fields, tdefs, depth: depth - 1) do
+            | Some(_) -> return true
+            | None -> return false
+          end
+        | None -> return false
+      end
+    | _ -> return false
   end
 end
 
