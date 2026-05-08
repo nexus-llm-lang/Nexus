@@ -1,0 +1,574 @@
+/**
+ * lsp/completion: resolve textDocument/completion requests.
+ *
+ * MVP scope (issue nexus-x49o Phase 1):
+ *   - Always include the Nexus keyword set (let / fn / match / do / end /
+ *     return / raise / try / catch / inject / handle / require / throws /
+ *     type / cap / port / external / import / export).
+ *   - Include every top-level binding visible at the cursor: the entry-file's
+ *     own `let` / `cap` / `type` / `enum` / `exception` defs plus every name
+ *     reachable through the importer-view rename map (`all_entries` from
+ *     `lsp/program_state`). Imports surface under the alias / item name the
+ *     editor wrote, not the canonical `source#name` form.
+ *   - Include local `let` bindings declared lexically before the cursor, when
+ *     the cursor is inside a top-level `GlobalLet` whose value is a lambda.
+ *
+ * Out of scope (deferred):
+ *   - record field completion after `.`
+ *   - qualified completion after `module.`
+ *   - sortText / filterText / insertText / textEdit
+ *   - `documentation` field — wired up in a follow-up after nexus-ws77.
+ *
+ * Failure mode: any lex / parse / import-resolution failure collapses to the
+ * keyword-only baseline (the editor still sees structural completions even on
+ * a half-typed file). The handler never crashes.
+ */
+
+import { Option, Some, None } from "std:option"
+import * as lexer from "src/frontend/lexer.nx"
+import * as parser from "src/frontend/parser.nx"
+import {
+  Program, SpannedTopLevel,
+  GlobalLet, TLLet, Cap, TLCap,
+  TLEnum, TLException, TLExceptionGroup, TLTypeDef,
+  EnumDef, RecordDef, ExceptionDef, ExceptionGroupDef,
+  VariantDef, NamedType, Param, Function,
+  Stmt, StmtLet, StmtLetPattern, StmtExpr, StmtReturn,
+  StmtAssign, StmtIndexAssign, StmtTry, StmtInject,
+  SpannedStmt, SpannedExpr, Expr, ExprLambda, ExprIf, ExprMatch,
+  ExprWhile, ExprFor, ExprBinaryOp, ExprUnaryOp, ExprCall,
+  ExprConstructor, ExprArray, ExprList, ExprRecord, ExprIndex,
+  ExprFieldAccess, ExprRaise, ExprForce, ExprHandler,
+  Pattern, SpannedPattern, PatVariable, PatConstructor,
+  PatRecord, PatOr, MatchCase, CatchArm, NamedExpr,
+  CallArg, CtorArg, CtorPatternField, RecordPatField,
+  HandlerArm, ImportDef, ImportItem
+} from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { RenameEntry }, * as symtab from "src/ir/symtab.nx"
+import {
+  ProgramState, build_program_state
+} from "src/lsp/program_state.nx"
+import * as resolve from "src/ir/resolve.nx"
+import {
+  CompletionItem, CompletionList,
+  CompletionItemKind,
+  CikFunction, CikVariable, CikKeyword, CikModule,
+  CikClass, CikEnum, CikEnumMember, CikConstructor, CikField
+} from "nxlib/lsp/protocol.nx"
+import { Fs } from "std:fs"
+import { Console } from "std:stdio"
+
+// ─── Keyword baseline ────────────────────────────────────────────────────────
+//
+// Always present in the candidate list. The set mirrors the issue's
+// acceptance check; the lexer's `keyword_lookup` table is the source of truth
+// for what the parser actually recognises.
+
+let nexus_keywords = fn () -> [string] do
+  return [
+    "let", "fn", "match", "do", "end", "return", "raise",
+    "try", "catch", "inject", "handle", "require", "throws",
+    "type", "cap", "port", "external", "import", "export",
+    "if", "then", "else", "while", "for"
+  ]
+end
+
+let make_keyword_item = fn (kw: string) -> CompletionItem do
+  return CompletionItem(
+    label: kw,
+    kind: Some(val: CikKeyword),
+    detail: Some(val: "keyword"),
+    documentation: None
+  )
+end
+
+let keyword_items_go = fn (xs: [string], acc: [CompletionItem]) -> [CompletionItem] do
+  match xs do
+    | [] -> return acc
+    | k :: rest -> return keyword_items_go(xs: rest, acc: make_keyword_item(kw: k) :: acc)
+  end
+end
+
+// ─── Top-level def collection ────────────────────────────────────────────────
+//
+// Walk the parsed Program for the entry buffer, harvesting names that should
+// surface in completion: every `let` / `cap` / type / enum / variant /
+// exception / exception-group declared in the entry file. Items are emitted
+// with kinds that match LSP CompletionItemKind so the editor can show
+// distinct icons.
+
+let make_item = fn (label: string, kind: CompletionItemKind, detail: string) -> CompletionItem do
+  return CompletionItem(
+    label,
+    kind: Some(val: kind),
+    detail: Some(val: detail),
+    documentation: None
+  )
+end
+
+let collect_variant_items = fn (variants: [VariantDef], acc: [CompletionItem]) -> [CompletionItem] do
+  match variants do
+    | [] -> return acc
+    | VariantDef(name, fields: _) :: rest ->
+      let acc2 = make_item(label: name, kind: CikEnumMember, detail: "variant") :: acc
+      return collect_variant_items(variants: rest, acc: acc2)
+  end
+end
+
+let collect_top_level_items = fn (defs: [SpannedTopLevel], acc: [CompletionItem]) -> [CompletionItem] do
+  match defs do
+    | [] -> return acc
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value: _)), span: _) :: rest ->
+      // We can't tell from the AST whether the value is a lambda or a plain
+      // expression without recursing into `value.node`; surface every
+      // top-level let as a Function for now (the dominant pattern in this
+      // codebase) — refining the kind by inspecting `ExprLambda` is a
+      // post-MVP polish item.
+      let acc2 = make_item(label: name, kind: CikFunction, detail: "top-level let") :: acc
+      return collect_top_level_items(defs: rest, acc: acc2)
+    | SpannedTopLevel(node: TLCap(def: Cap(name, is_public: _, functions: _)), span: _) :: rest ->
+      let acc2 = make_item(label: name, kind: CikModule, detail: "cap") :: acc
+      return collect_top_level_items(defs: rest, acc: acc2)
+    | SpannedTopLevel(node: TLTypeDef(def: RecordDef(name, is_public: _, type_params: _, fields: _)), span: _) :: rest ->
+      let acc2 = make_item(label: name, kind: CikClass, detail: "record type") :: acc
+      return collect_top_level_items(defs: rest, acc: acc2)
+    | SpannedTopLevel(node: TLEnum(def: EnumDef(name, is_public: _, is_opaque: _, type_params: _, variants)), span: _) :: rest ->
+      let acc2 = make_item(label: name, kind: CikEnum, detail: "enum") :: acc
+      let acc3 = collect_variant_items(variants, acc: acc2)
+      return collect_top_level_items(defs: rest, acc: acc3)
+    | SpannedTopLevel(node: TLException(def: ExceptionDef(name, is_public: _, fields: _)), span: _) :: rest ->
+      let acc2 = make_item(label: name, kind: CikConstructor, detail: "exception") :: acc
+      return collect_top_level_items(defs: rest, acc: acc2)
+    | SpannedTopLevel(node: TLExceptionGroup(def: ExceptionGroupDef(name, is_public: _, _)), span: _) :: rest ->
+      let acc2 = make_item(label: name, kind: CikClass, detail: "exception group") :: acc
+      return collect_top_level_items(defs: rest, acc: acc2)
+    | _ :: rest -> return collect_top_level_items(defs: rest, acc)
+  end
+end
+
+// ─── Imported-name collection ────────────────────────────────────────────────
+//
+// `all_entries` from ProgramState is `(self_entries ++ caller_entries)` — the
+// entry-file's own renames plus every imported name in importer-view shape.
+// For completion we want only the imported view (the entry-file names already
+// come from the AST walk above), so we read just `caller_entries` and emit
+// the `original` field, which is the surface name the editor sees.
+
+let item_label_present = fn (label: string, items: [CompletionItem]) -> bool do
+  match items do
+    | [] -> return false
+    | CompletionItem(label: l, kind: _, detail: _, documentation: _) :: rest ->
+      if l == label then return true end
+      return item_label_present(label, items: rest)
+  end
+end
+
+let collect_caller_items = fn (entries: [RenameEntry], existing: [CompletionItem], acc: [CompletionItem]) -> [CompletionItem] do
+  match entries do
+    | [] -> return acc
+    | RenameEntry(original, qualified: _) :: rest ->
+      // Skip duplicates: an imported name already collected as a top-level
+      // def (e.g. when the entry file re-exports it under the same surface
+      // name) shouldn't appear twice.
+      if item_label_present(label: original, items: existing) then
+        return collect_caller_items(entries: rest, existing, acc)
+      end
+      if item_label_present(label: original, items: acc) then
+        return collect_caller_items(entries: rest, existing, acc)
+      end
+      let acc2 = make_item(label: original, kind: CikFunction, detail: "imported") :: acc
+      return collect_caller_items(entries: rest, existing, acc: acc2)
+  end
+end
+
+// Also collect each `import * as alias` alias name — these don't appear in
+// the rename map (they prefix qualified accesses, not bare references) but
+// the editor still wants them as completion candidates so the user can type
+// `alias.` to drill into the imported module.
+
+let collect_import_alias_items = fn (imports: [ImportDef], acc: [CompletionItem]) -> [CompletionItem] do
+  match imports do
+    | [] -> return acc
+    | ImportDef(path: _, alias, items: _, is_external: _) :: rest ->
+      match alias do
+        | None -> return collect_import_alias_items(imports: rest, acc)
+        | Some(val: a) ->
+          let acc2 = make_item(label: a, kind: CikModule, detail: "import alias") :: acc
+          return collect_import_alias_items(imports: rest, acc: acc2)
+      end
+  end
+end
+
+// ─── Local `let` collection (lexical scope before cursor) ────────────────────
+//
+// Walk the body of the function whose lexical extent (start of GlobalLet to
+// the start of the next top-level def) brackets the cursor's 1-based line.
+// Inside that body we recurse into every block-bearing construct and emit a
+// CompletionItem for each `StmtLet` / `StmtLetPattern` whose span precedes
+// the cursor.
+
+let span_before_cursor = fn (sp: Span, cur_line: i64, cur_col: i64) -> bool do
+  match sp do | Span(offset: _, line, col) ->
+    if line < cur_line then return true end
+    if line > cur_line then return false end
+    return col < cur_col
+  end
+end
+
+let collect_pattern_binders_go = fn (
+  pat: Pattern, acc: [CompletionItem]
+) -> [CompletionItem] do
+  match pat do
+    | PatVariable(name, sigil: _) ->
+      return make_item(label: name, kind: CikVariable, detail: "local") :: acc
+    | PatConstructor(name: _, fields) -> return collect_ctor_pat_field_binders(fields, acc)
+    | PatRecord(fields, has_wildcard: _) -> return collect_record_pat_field_binders(fields, acc)
+    | PatOr(alts) -> return collect_alt_pat_binders(alts, acc)
+    | _ -> return acc
+  end
+end
+
+let collect_ctor_pat_field_binders = fn (
+  fields: [CtorPatternField], acc: [CompletionItem]
+) -> [CompletionItem] do
+  match fields do
+    | [] -> return acc
+    | CtorPatternField(name: _, pattern: SpannedPattern(node, span: _)) :: rest ->
+      let acc2 = collect_pattern_binders_go(pat: node, acc)
+      return collect_ctor_pat_field_binders(fields: rest, acc: acc2)
+  end
+end
+
+let collect_record_pat_field_binders = fn (
+  fields: [RecordPatField], acc: [CompletionItem]
+) -> [CompletionItem] do
+  match fields do
+    | [] -> return acc
+    | RecordPatField(name: _, pattern: SpannedPattern(node, span: _)) :: rest ->
+      let acc2 = collect_pattern_binders_go(pat: node, acc)
+      return collect_record_pat_field_binders(fields: rest, acc: acc2)
+  end
+end
+
+let collect_alt_pat_binders = fn (
+  alts: [SpannedPattern], acc: [CompletionItem]
+) -> [CompletionItem] do
+  match alts do
+    | [] -> return acc
+    | SpannedPattern(node, span: _) :: rest ->
+      let acc2 = collect_pattern_binders_go(pat: node, acc)
+      return collect_alt_pat_binders(alts: rest, acc: acc2)
+  end
+end
+
+let collect_locals_in_stmts = fn (
+  stmts: [SpannedStmt],
+  cur_line: i64, cur_col: i64,
+  acc: [CompletionItem]
+) -> [CompletionItem] do
+  match stmts do
+    | [] -> return acc
+    | SpannedStmt(node, span) :: rest ->
+      // Stop walking once we pass the cursor — the statements after it are
+      // out of lexical scope for an inserted reference at the cursor.
+      if !span_before_cursor(sp: span, cur_line, cur_col) then return acc end
+      let acc2 = collect_locals_in_stmt(node, cur_line, cur_col, acc)
+      return collect_locals_in_stmts(stmts: rest, cur_line, cur_col, acc: acc2)
+  end
+end
+
+let collect_locals_in_stmt = fn (
+  node: Stmt,
+  cur_line: i64, cur_col: i64,
+  acc: [CompletionItem]
+) -> [CompletionItem] do
+  match node do
+    | StmtLet(name, sigil: _, typ: _, value: SpannedExpr(node: vexp, span: _)) ->
+      let acc2 = make_item(label: name, kind: CikVariable, detail: "local") :: acc
+      return collect_locals_in_expr(node: vexp, cur_line, cur_col, acc: acc2)
+    | StmtLetPattern(pattern: SpannedPattern(node: pat, span: _), value: SpannedExpr(node: vexp, span: _)) ->
+      let acc2 = collect_pattern_binders_go(pat, acc)
+      return collect_locals_in_expr(node: vexp, cur_line, cur_col, acc: acc2)
+    | StmtExpr(expr: SpannedExpr(node: e, span: _)) ->
+      return collect_locals_in_expr(node: e, cur_line, cur_col, acc)
+    | StmtReturn(value: SpannedExpr(node: e, span: _)) ->
+      return collect_locals_in_expr(node: e, cur_line, cur_col, acc)
+    | StmtAssign(target: _, value: SpannedExpr(node: e, span: _)) ->
+      return collect_locals_in_expr(node: e, cur_line, cur_col, acc)
+    | StmtIndexAssign(target: SpannedExpr(node: t, span: _), index: SpannedExpr(node: i, span: _), value: SpannedExpr(node: v, span: _)) ->
+      let acc2 = collect_locals_in_expr(node: t, cur_line, cur_col, acc)
+      let acc3 = collect_locals_in_expr(node: i, cur_line, cur_col, acc: acc2)
+      return collect_locals_in_expr(node: v, cur_line, cur_col, acc: acc3)
+    | StmtTry(body, catch_arms) ->
+      let acc2 = collect_locals_in_stmts(stmts: body, cur_line, cur_col, acc)
+      return collect_locals_in_catch_arms(catch_arms, cur_line, cur_col, acc: acc2)
+    | StmtInject(handlers, body) ->
+      let acc2 = collect_locals_in_exprs(handlers, cur_line, cur_col, acc)
+      return collect_locals_in_stmts(stmts: body, cur_line, cur_col, acc: acc2)
+  end
+end
+
+let collect_locals_in_catch_arms = fn (
+  arms: [CatchArm],
+  cur_line: i64, cur_col: i64,
+  acc: [CompletionItem]
+) -> [CompletionItem] do
+  match arms do
+    | [] -> return acc
+    | CatchArm(pattern: SpannedPattern(node: pat, span: _), body) :: rest ->
+      let acc2 = collect_pattern_binders_go(pat, acc)
+      let acc3 = collect_locals_in_stmts(stmts: body, cur_line, cur_col, acc: acc2)
+      return collect_locals_in_catch_arms(arms: rest, cur_line, cur_col, acc: acc3)
+  end
+end
+
+let collect_locals_in_match_cases = fn (
+  cases: [MatchCase],
+  cur_line: i64, cur_col: i64,
+  acc: [CompletionItem]
+) -> [CompletionItem] do
+  match cases do
+    | [] -> return acc
+    | MatchCase(pattern: SpannedPattern(node: pat, span: _), body) :: rest ->
+      let acc2 = collect_pattern_binders_go(pat, acc)
+      let acc3 = collect_locals_in_stmts(stmts: body, cur_line, cur_col, acc: acc2)
+      return collect_locals_in_match_cases(cases: rest, cur_line, cur_col, acc: acc3)
+  end
+end
+
+let collect_locals_in_exprs = fn (
+  xs: [SpannedExpr],
+  cur_line: i64, cur_col: i64,
+  acc: [CompletionItem]
+) -> [CompletionItem] do
+  match xs do
+    | [] -> return acc
+    | SpannedExpr(node, span: _) :: rest ->
+      let acc2 = collect_locals_in_expr(node, cur_line, cur_col, acc)
+      return collect_locals_in_exprs(xs: rest, cur_line, cur_col, acc: acc2)
+  end
+end
+
+let collect_locals_in_call_args = fn (
+  args: [CallArg],
+  cur_line: i64, cur_col: i64,
+  acc: [CompletionItem]
+) -> [CompletionItem] do
+  match args do
+    | [] -> return acc
+    | CallArg(name: _, value: SpannedExpr(node, span: _)) :: rest ->
+      let acc2 = collect_locals_in_expr(node, cur_line, cur_col, acc)
+      return collect_locals_in_call_args(args: rest, cur_line, cur_col, acc: acc2)
+  end
+end
+
+let collect_locals_in_ctor_args = fn (
+  args: [CtorArg],
+  cur_line: i64, cur_col: i64,
+  acc: [CompletionItem]
+) -> [CompletionItem] do
+  match args do
+    | [] -> return acc
+    | CtorArg(name: _, value: SpannedExpr(node, span: _)) :: rest ->
+      let acc2 = collect_locals_in_expr(node, cur_line, cur_col, acc)
+      return collect_locals_in_ctor_args(args: rest, cur_line, cur_col, acc: acc2)
+  end
+end
+
+let collect_locals_in_named_exprs = fn (
+  fields: [NamedExpr],
+  cur_line: i64, cur_col: i64,
+  acc: [CompletionItem]
+) -> [CompletionItem] do
+  match fields do
+    | [] -> return acc
+    | NamedExpr(name: _, value: SpannedExpr(node, span: _)) :: rest ->
+      let acc2 = collect_locals_in_expr(node, cur_line, cur_col, acc)
+      return collect_locals_in_named_exprs(fields: rest, cur_line, cur_col, acc: acc2)
+  end
+end
+
+let collect_locals_in_handler_arms = fn (
+  arms: [HandlerArm],
+  cur_line: i64, cur_col: i64,
+  acc: [CompletionItem]
+) -> [CompletionItem] do
+  match arms do
+    | [] -> return acc
+    | HandlerArm(arm: Function(name: _, is_public: _, type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body, span: _), cont_binder: _, span: _) :: rest ->
+      let acc2 = collect_locals_in_stmts(stmts: body, cur_line, cur_col, acc)
+      return collect_locals_in_handler_arms(arms: rest, cur_line, cur_col, acc: acc2)
+  end
+end
+
+let collect_locals_in_expr = fn (
+  node: Expr,
+  cur_line: i64, cur_col: i64,
+  acc: [CompletionItem]
+) -> [CompletionItem] do
+  match node do
+    | ExprBinaryOp(left: SpannedExpr(node: l, span: _), op: _, right: SpannedExpr(node: r, span: _)) ->
+      let acc2 = collect_locals_in_expr(node: l, cur_line, cur_col, acc)
+      return collect_locals_in_expr(node: r, cur_line, cur_col, acc: acc2)
+    | ExprUnaryOp(op: _, operand: SpannedExpr(node: o, span: _)) ->
+      return collect_locals_in_expr(node: o, cur_line, cur_col, acc)
+    | ExprCall(func: _, args) ->
+      return collect_locals_in_call_args(args, cur_line, cur_col, acc)
+    | ExprConstructor(name: _, args) ->
+      return collect_locals_in_ctor_args(args, cur_line, cur_col, acc)
+    | ExprArray(elements) ->
+      return collect_locals_in_exprs(xs: elements, cur_line, cur_col, acc)
+    | ExprList(elements) ->
+      return collect_locals_in_exprs(xs: elements, cur_line, cur_col, acc)
+    | ExprRecord(fields) ->
+      return collect_locals_in_named_exprs(fields, cur_line, cur_col, acc)
+    | ExprIndex(target: SpannedExpr(node: t, span: _), index: SpannedExpr(node: i, span: _)) ->
+      let acc2 = collect_locals_in_expr(node: t, cur_line, cur_col, acc)
+      return collect_locals_in_expr(node: i, cur_line, cur_col, acc: acc2)
+    | ExprFieldAccess(target: SpannedExpr(node: t, span: _), field: _) ->
+      return collect_locals_in_expr(node: t, cur_line, cur_col, acc)
+    | ExprIf(cond: SpannedExpr(node: c, span: _), then_branch, else_branch) ->
+      let acc2 = collect_locals_in_expr(node: c, cur_line, cur_col, acc)
+      let acc3 = collect_locals_in_stmts(stmts: then_branch, cur_line, cur_col, acc: acc2)
+      return collect_locals_in_stmts(stmts: else_branch, cur_line, cur_col, acc: acc3)
+    | ExprMatch(target: SpannedExpr(node: t, span: _), cases) ->
+      let acc2 = collect_locals_in_expr(node: t, cur_line, cur_col, acc)
+      return collect_locals_in_match_cases(cases, cur_line, cur_col, acc: acc2)
+    | ExprWhile(cond: SpannedExpr(node: c, span: _), body) ->
+      let acc2 = collect_locals_in_expr(node: c, cur_line, cur_col, acc)
+      return collect_locals_in_stmts(stmts: body, cur_line, cur_col, acc: acc2)
+    | ExprFor(var: vname, start: SpannedExpr(node: s, span: _), end_expr: SpannedExpr(node: e, span: _), body) ->
+      let acc2 = make_item(label: vname, kind: CikVariable, detail: "for-loop var") :: acc
+      let acc3 = collect_locals_in_expr(node: s, cur_line, cur_col, acc: acc2)
+      let acc4 = collect_locals_in_expr(node: e, cur_line, cur_col, acc: acc3)
+      return collect_locals_in_stmts(stmts: body, cur_line, cur_col, acc: acc4)
+    | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body) ->
+      // A lambda introduces its own scope; for the cursor-inside-this-lambda
+      // case, we walk the body. Param names are not added because the cursor
+      // may be inside a sibling lambda where they aren't in scope; the
+      // function-scope walker (`collect_locals_for_function`) handles param
+      // binders for the enclosing top-level let separately.
+      return collect_locals_in_stmts(stmts: body, cur_line, cur_col, acc)
+    | ExprRaise(value: SpannedExpr(node: v, span: _)) ->
+      return collect_locals_in_expr(node: v, cur_line, cur_col, acc)
+    | ExprForce(value: SpannedExpr(node: v, span: _)) ->
+      return collect_locals_in_expr(node: v, cur_line, cur_col, acc)
+    | ExprHandler(coeffect_name: _, requires: _, arms) ->
+      return collect_locals_in_handler_arms(arms, cur_line, cur_col, acc)
+    | _ -> return acc
+  end
+end
+
+// Walk the parameter list of the enclosing top-level lambda to surface param
+// names as locals.
+let collect_param_items = fn (params: [Param], acc: [CompletionItem]) -> [CompletionItem] do
+  match params do
+    | [] -> return acc
+    | Param(name, sigil: _, typ: _) :: rest ->
+      let acc2 = make_item(label: name, kind: CikVariable, detail: "param") :: acc
+      return collect_param_items(params: rest, acc: acc2)
+  end
+end
+
+// Determine the cursor's enclosing top-level GlobalLet. We use start lines:
+// the cursor sits inside def `i` if `defs[i].span.line <= cur_line < defs[i+1].span.line`
+// (or it's the last def and `cur_line >= defs[i].span.line`). Returns the
+// enclosing def's value-expression node (the lambda body root), or None.
+
+let pick_enclosing_globlet = fn (
+  defs: [SpannedTopLevel],
+  cur_line: i64,
+  current: Option<SpannedTopLevel>
+) -> Option<SpannedTopLevel> do
+  match defs do
+    | [] -> return current
+    | SpannedTopLevel(node, span: Span(offset: _, line, col: _)) :: rest ->
+      if line > cur_line then return current end
+      let next = SpannedTopLevel(node, span: Span(offset: 0, line, col: 0))
+      return pick_enclosing_globlet(defs: rest, cur_line, current: Some(val: next))
+  end
+end
+
+let collect_locals_for_cursor = fn (
+  defs: [SpannedTopLevel],
+  cur_line: i64, cur_col: i64,
+  acc: [CompletionItem]
+) -> [CompletionItem] do
+  match pick_enclosing_globlet(defs, cur_line, current: None) do
+    | None -> return acc
+    | Some(val: SpannedTopLevel(node, span: _)) ->
+      match node do
+        | TLLet(def: GlobalLet(name: _, is_public: _, typ: _, value: SpannedExpr(node: ExprLambda(type_params: _, params, ret_type: _, requires: _, throw_row: _, body), span: _))) ->
+          let acc2 = collect_param_items(params, acc)
+          return collect_locals_in_stmts(stmts: body, cur_line, cur_col, acc: acc2)
+        | _ -> return acc
+      end
+  end
+end
+
+// ─── Driver ──────────────────────────────────────────────────────────────────
+
+/// Resolve completion candidates at the cursor.
+///
+/// `text` is the editor's current buffer; `file_uri` mirrors what diagnostics
+/// uses (the buffer URI). `line` / `character` are 0-based LSP coordinates.
+///
+/// On any internal failure (lex / parse / import resolution) we fall back to
+/// the keyword-only baseline so the editor still gets *something*. The handler
+/// boundary translates this into a CompletionList; the LSP loop never crashes
+/// on a half-typed buffer.
+export let resolve_completion = fn (
+  text: string,
+  file_uri: string,
+  line: i64,
+  character: i64
+) -> CompletionList require { Fs, Console } do
+  try
+    return resolve_completion_unsafe(text, file_uri, line, character)
+  catch err ->
+    let _ = err
+    let kw_items_rev = keyword_items_go(xs: nexus_keywords(), acc: [])
+    let kw_items = reverse_items(xs: kw_items_rev, acc: [])
+    return CompletionList(is_incomplete: false, items: kw_items)
+  end
+end
+
+let reverse_items = fn (xs: [CompletionItem], acc: [CompletionItem]) -> [CompletionItem] do
+  match xs do
+    | [] -> return acc
+    | i :: rest -> return reverse_items(xs: rest, acc: i :: acc)
+  end
+end
+
+let resolve_completion_unsafe = fn (
+  text: string,
+  file_uri: string,
+  line: i64,
+  character: i64
+) -> CompletionList require { Fs, Console } throws { Exn } do
+  let ProgramState(prog: Program(definitions: defs, module_doc: _), defs: _, cache: _, accum: _, self_entries: _, caller_entries, _) =
+    build_program_state(text, file: file_uri)
+  let imports = resolve.extract_imports(defs)
+  // Build the candidate list back-to-front (acc-prepend) then reverse once.
+  // Order: keywords first (most predictable for tests), then top-level defs,
+  // then imported items, then import aliases, then locals.
+  let kw_items = keyword_items_go(xs: nexus_keywords(), acc: [])
+  let with_top = collect_top_level_items(defs, acc: kw_items)
+  let with_caller = collect_caller_items(entries: caller_entries, existing: with_top, acc: with_top)
+  let with_aliases = collect_import_alias_items(imports, acc: with_caller)
+  // Cursor-local lets need 1-based coordinates to match Span values.
+  let cur_line = line + 1
+  let cur_col = character + 1
+  let with_locals = collect_locals_for_cursor(defs, cur_line, cur_col, acc: with_aliases)
+  let items = reverse_items(xs: with_locals, acc: [])
+  return CompletionList(is_incomplete: false, items)
+end
+
+// Re-export: handler glue layer reads `keyword_items` to build a baseline
+// list when the resolver path isn't reached (e.g. a unit test that only
+// wants to check the keyword set).
+export let keyword_items = fn () -> [CompletionItem] do
+  let rev = keyword_items_go(xs: nexus_keywords(), acc: [])
+  return reverse_items(xs: rev, acc: [])
+end

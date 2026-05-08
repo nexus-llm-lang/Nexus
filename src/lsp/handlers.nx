@@ -68,6 +68,9 @@ import {
   resolve_definition
 } from "src/lsp/definition.nx"
 import {
+  resolve_completion
+} from "src/lsp/completion.nx"
+import {
   ServerCapabilities, TdsFull,
   InitializeResult, ServerInfo,
   initialize_params_from_json, initialize_result_to_json,
@@ -78,6 +81,8 @@ import {
   content_change_event_from_json,
   PublishDiagnosticsParams, publish_diagnostics_params_to_json,
   Position, Range, Diagnostic, DocumentSymbol,
+  CompletionOptions, CompletionList,
+  completion_list_to_json,
   location_to_json,
   document_symbol_to_json,
   DiagSevError,
@@ -370,7 +375,17 @@ let nexus_on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerR
     /// `alias.foo` / bare-identifier references back to their defining
     /// `let` / `cap` site (issue nexus-yvd8).
     definition_provider: Some(val: true),
-    references_provider: None
+    references_provider: None,
+    /// `nexus_on_other` routes textDocument/completion through
+    /// `src/lsp/completion.resolve_completion`. Trigger characters `.` and
+    /// `:` cover future record-field / module-qualified suggestions; the
+    /// MVP returns the same scope-derived list regardless of trigger.
+    /// `resolveProvider: false` — every CompletionItem is fully populated
+    /// in the initial response (issue nexus-x49o).
+    completion_provider: Some(val: CompletionOptions(
+      trigger_characters: [".", ":"],
+      resolve_provider: false
+    ))
   )
   let info = ServerInfo(name: "nexus-lsp", version: Some(val: "0.1.0"))
   let result = InitializeResult(capabilities: caps, server_info: Some(val: info))
@@ -748,6 +763,40 @@ let nexus_on_definition = fn (state: ServerState, params: JsonValue) -> HandlerR
   end
 end
 
+// ─── Handler: textDocument/completion (via on_other) ─────────────────────────
+//
+// Reuses `definition_position` (same TextDocumentPositionParams shape) and
+// hands the text + cursor coordinates to `lsp/completion.resolve_completion`.
+// On any internal failure the resolver returns the keyword-only baseline, so
+// this handler does not produce InvalidParams — the wire-format CompletionList
+// always serialises successfully.
+
+let nexus_on_completion = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let td_v = require_object_field(obj: params, key: "textDocument",
+    ctx: "CompletionParams")
+  let uri_v = require_object_field(obj: td_v, key: "uri",
+    ctx: "CompletionParams.textDocument")
+  let uri = match uri_v do
+    | JsonString(val: s) -> s
+    | _ -> raise LspProtocolError(msg: "CompletionParams.textDocument.uri: expected string")
+  end
+  let pos = definition_position(params)
+  let doc_opt = documents_lookup(store: state_documents(state), uri)
+  let text = match doc_opt do
+    | None -> ""
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text: t, version: _) -> t end
+  end
+  match pos do | Position(line, character) ->
+    let cl = resolve_completion(text, file_uri: uri, line, character)
+    return HandlerResult(
+      state,
+      response: Some(val: completion_list_to_json(cl)),
+      notifications: []
+    )
+  end
+end
+
 let nexus_on_other = fn (state: ServerState, method: string, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   if method == "textDocument/documentSymbol" then
     return nexus_on_document_symbol(state, params)
@@ -757,6 +806,9 @@ let nexus_on_other = fn (state: ServerState, method: string, params: JsonValue) 
   end
   if method == "textDocument/definition" then
     return nexus_on_definition(state, params)
+  end
+  if method == "textDocument/completion" then
+    return nexus_on_completion(state, params)
   end
   // Fall back to MethodNotFound (None response signals it to dispatch_message).
   let _ = params
