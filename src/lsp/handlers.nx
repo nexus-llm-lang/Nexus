@@ -43,7 +43,7 @@
  *   re-bumps the version and clears the cache.
  */
 
-import { JsonValue, JsonInt, JsonString, JsonArray, JsonObject, JsonField, get_field } from "std:json"
+import { JsonValue, JsonNull, JsonInt, JsonString, JsonArray, JsonObject, JsonField, get_field } from "std:json"
 import { Option, Some, None } from "std:option"
 import * as lexer from "src/frontend/lexer.nx"
 import * as parser from "src/frontend/parser.nx"
@@ -192,7 +192,7 @@ end
 // imported function (called from the importer) surfaces as a diagnostic.
 
 let get_defs = fn (prog: Program) -> [SpannedTopLevel] do
-  match prog do | Program(definitions: defs) -> return defs end
+  match prog do | Program(definitions: defs, _) -> return defs end
 end
 
 // Entry-file self-rename entries. Mirrors `driver.build_entry_self_entries`:
@@ -274,7 +274,7 @@ end
 /// before the wire-format DocumentFilter.
 export let compute_diagnostics_for_buffer = fn (text: string, file: string) -> [DiagEntry] require { Fs, Console } throws { Exn } do
   try
-    let prog = parser.parse(tokens: lexer.tokenize(src: text))
+    let prog = parser.parse_source(src: text)
     try
       let hir_prog = build_hir_with_imports(prog, source_file: file)
       // Pass *all* HIR function names as `local_names` so the typechecker
@@ -388,7 +388,11 @@ let nexus_on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerR
     /// `src/lsp/symbols.document_symbols_for_program` walker; advertise
     /// the capability so clients populate the outline view.
     document_symbol_provider: Some(val: true),
-    hover_provider: None,
+    /// `nexus_on_other` routes textDocument/hover to `nexus_on_hover`,
+    /// which surfaces the file-level `/** ... */` doc comment when the
+    /// cursor is on the first line. Per-definition hovers are out of
+    /// scope (issue nexus-ws77 MVP).
+    hover_provider: Some(val: true),
     definition_provider: None,
     references_provider: None
   )
@@ -602,7 +606,7 @@ let compute_document_symbols = fn (doc_opt: Option<DocumentRecord>) -> [Document
     | Some(val: rec) ->
       match rec do | DocumentRecord(uri: _, text, version: _) ->
         try
-          let prog = parser.parse(tokens: lexer.tokenize(src: text))
+          let prog = parser.parse_source(src: text)
           return document_symbols_for_program(prog)
         catch err ->
           // Lex/parse failure: outline is empty for the broken buffer.
@@ -634,9 +638,83 @@ let nexus_on_document_symbol = fn (state: ServerState, params: JsonValue) -> Han
   )
 end
 
+// ─── Handler: textDocument/hover (via on_other) ──────────────────────────────
+//
+// MVP scope (issue nexus-ws77): surface the file-level `/** ... */` doc
+// comment as a markdown Hover when the cursor sits on the first line of
+// the open buffer. Any other position (including line 0 of a buffer with
+// no leading doc comment) returns JSON `null`, which LSP treats as "no
+// hover info" — the editor shows nothing rather than an error.
+//
+// Per the issue's non-goals, the doc text is returned raw (no `*`
+// stripping, no markdown escaping). Definition-granularity hovers
+// (let / type / variant / param) are deferred to follow-up issues.
+
+let hover_position_line = fn (params: JsonValue) -> i64 throws { Exn } do
+  let pos_v = require_object_field(obj: params, key: "position",
+    ctx: "HoverParams")
+  let line_v = require_object_field(obj: pos_v, key: "line",
+    ctx: "HoverParams.position")
+  match line_v do
+    | JsonInt(val: n) -> return n
+    | _ -> raise LspProtocolError(msg: "HoverParams.position.line: expected integer")
+  end
+end
+
+let make_markdown_hover = fn (content: string) -> JsonValue do
+  // Wire format: `Hover { contents: MarkupContent { kind, value } }`.
+  // The optional `range` field is omitted — LSP clients fall back to
+  // word-under-cursor, which is fine for a module-level doc.
+  let markup = JsonObject(fields: [
+    JsonField(key: "kind", value: JsonString(val: "markdown")),
+    JsonField(key: "value", value: JsonString(val: content))
+  ])
+  return JsonObject(fields: [
+    JsonField(key: "contents", value: markup)
+  ])
+end
+
+let compute_hover_response = fn (doc_opt: Option<DocumentRecord>, line: i64) -> JsonValue do
+  // Hover only resolves to module doc on line 0; other lines reply null
+  // until per-definition doc is wired up (post-MVP).
+  if line != 0 then return JsonNull end
+  match doc_opt do
+    | None -> return JsonNull
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text, version: _) ->
+        match lexer.extract_module_doc(src: text) do
+          | None -> return JsonNull
+          | Some(val: doc) -> return make_markdown_hover(content: doc)
+        end
+      end
+  end
+end
+
+let nexus_on_hover = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let td_v = require_object_field(obj: params, key: "textDocument",
+    ctx: "HoverParams")
+  let uri_v = require_object_field(obj: td_v, key: "uri",
+    ctx: "HoverParams.textDocument")
+  let uri = match uri_v do
+    | JsonString(val: s) -> s
+    | _ -> raise LspProtocolError(msg: "HoverParams.textDocument.uri: expected string")
+  end
+  let line = hover_position_line(params)
+  let doc_opt = documents_lookup(store: state_documents(state), uri)
+  let response = compute_hover_response(doc_opt, line)
+  return HandlerResult(
+    state,
+    response: Some(val: response),
+    notifications: []
+  )
+end
+
 let nexus_on_other = fn (state: ServerState, method: string, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   if method == "textDocument/documentSymbol" then
     return nexus_on_document_symbol(state, params)
+  end
+  if method == "textDocument/hover" then
+    return nexus_on_hover(state, params)
   end
   // Fall back to MethodNotFound (None response signals it to dispatch_message).
   let _ = params
