@@ -41,9 +41,7 @@ these directly unless writing compiler internals or runtime tests.
 |-------------|---------|
 | `"std:runtime/math"` | `__nx_f64_*` math intrinsics (`sqrt`, `floor`, ...) |
 | `"std:runtime/mem"` | Bounds-checked load/store, `MemoryOutOfBounds` |
-| `"std:runtime/alloc"` | Bump allocator state used by `runtime/table` |
 | `"std:runtime/arena"` | `heap_mark`, `heap_reset` (compiler arena reset) |
-| `"std:runtime/table"` | Open-addressed hash table substrate for `*_nx` collections |
 
 ### Source-only directories
 
