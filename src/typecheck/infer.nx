@@ -44,7 +44,7 @@ import {
   InferExprResult, InferExprOk, InferExprErr,
   UnifyOk, UnifyErr,
   BindResult, BindOk, BindErr,
-  EnumVariantInfo
+  EnumVariantInfo, TypeDefEntry
 }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
 import * as unify from "src/typecheck/unify.nx"
@@ -278,12 +278,70 @@ let unify_float_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr
   end
 end
 
+// ─── comparable(τ) — T-Cmp side-condition (spec type-system-formal.md) ────────
+//
+// Recursive predicate guarding ==, !=, <, <=, >, >=. Accepts base scalars,
+// records and lists whose elements are themselves comparable, and named
+// (record-typedef) types via tdef expansion. Rejects arrows, handlers, refs,
+// borrows, lazy/thunk wrappers, arrays, and linear values — categories whose
+// runtime equality is undefined per spec. Free type variables are accepted
+// (deferred): unification has not yet pinned the type, and the rest of the
+// pipeline gets a fair shot at constraining it.
+
+let comparable_named_type_list = fn (nts: [NamedType], tdefs: [TypeDefEntry]) -> bool do
+  match nts do
+    | [] -> return true
+    | NamedType(name: _, typ: t) :: rest ->
+      if comparable(typ: t, tdefs) then
+        return comparable_named_type_list(nts: rest, tdefs)
+      end
+      return false
+  end
+end
+
+let comparable = fn (typ: TypeExpr, tdefs: [TypeDefEntry]) -> bool do
+  match typ do
+    | TyI32 -> return true
+    | TyI64 -> return true
+    | TyF32 -> return true
+    | TyF64 -> return true
+    | TyBool -> return true
+    | TyChar -> return true
+    | TyString -> return true
+    | TyUnit -> return true
+    | TyIntLit -> return true
+    | TyFloatLit -> return true
+    | TyVar(_) -> return true
+    | TyRecord(fields: fs) -> return comparable_named_type_list(nts: fs, tdefs)
+    | TyList(elem: e) -> return comparable(typ: e, tdefs)
+    | TyUserDefined(name: n, args: _) ->
+      // Expand record typedef when known; unknown names (enums, opaque) are
+      // accepted to avoid blanket-rejecting practical code beyond the bug at
+      // hand. Tighten in a follow-up once enum equality is specified.
+      match tctypes.typedef_lookup(defs: tdefs, name: n) do
+        | Some(val: RecordDef(fields: fs, _)) ->
+          return comparable_named_type_list(nts: fs, tdefs)
+        | None -> return true
+      end
+    | _ -> return false
+  end
+end
+
+let comparable_reject_msg = fn (typ: TypeExpr) -> string do
+  return "cannot compare values of type `" ++ tctypes.type_to_string(typ) ++ "`: comparison undefined for arrows / handlers / refs / borrows / thunks / arrays"
+end
+
 let unify_cmp_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
   let tdefs = tctypes.state_typedefs(state)
   match unify.unify(t1: lt, t2: rt, tdefs) do
     | UnifyErr(message: m) -> return InferExprErr(message: "comparison: " ++ m, span)
     | UnifyOk(subst: s1) ->
-      return InferExprOk(state, subst: subst.subst_compose(s1: subst, s2: s1), typ: TyBool)
+      let sm = subst.subst_compose(s1: subst, s2: s1)
+      let resolved = subst.subst_apply(subst: sm, typ: lt)
+      if comparable(typ: resolved, tdefs) then
+        return InferExprOk(state, subst: sm, typ: TyBool)
+      end
+      return InferExprErr(message: comparable_reject_msg(typ: resolved), span)
   end
 end
 
@@ -297,7 +355,12 @@ let unify_float_cmp = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, 
       match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: target, tdefs) do
         | UnifyErr(message: m) -> return InferExprErr(message: "float cmp rhs: " ++ m, span)
         | UnifyOk(subst: s2) ->
-          return InferExprOk(state, subst: subst.subst_compose(s1: sm, s2), typ: TyBool)
+          let sm2 = subst.subst_compose(s1: sm, s2)
+          let resolved = subst.subst_apply(subst: sm2, typ: target)
+          if comparable(typ: resolved, tdefs) then
+            return InferExprOk(state, subst: sm2, typ: TyBool)
+          end
+          return InferExprErr(message: comparable_reject_msg(typ: resolved), span)
       end
   end
 end
