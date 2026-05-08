@@ -45,10 +45,8 @@ these directly unless writing compiler internals or runtime tests.
 
 ### Source-only directories
 
-- `nxlib/stdlib/internal/` — handwritten WAT shims (`nexus_host_stub.wat`).
-  Source for the stub-merge build path; not a stdlib module.
-- `nxlib/stdlib/test/` — test framework modules (`assert`, `property`,
-  `snapshot`).  Imported as `std:test/<name>`.
+- `nxlib/stdlib/test/` — test framework modules (`assert`).  Imported as
+  `std:test/<name>`.
 
 ## Capability Permissions
 

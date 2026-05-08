@@ -310,8 +310,6 @@ in expressions.
 - `finalize` in `src/ir/rdrname.nx` uses
   `_ :: _ :: _ -> return Ambiguous(...)` to assert "two or more matches" —
   exactly the chained-cons form.
-- `diff_lines` in `stdlib/test/snapshot.nx` builds `plus :: minus :: acc` in an
-  expression, matching the same `::`-chains-right shape.
 
 ### Exception: independent lists in lockstep
 
