@@ -183,25 +183,43 @@ end
 /// One snapshot of `vars` at a frame boundary. Wraps a `[string]` so the
 /// surrounding LinState can carry a list of these without nesting list-of-
 /// list type syntax (Nexus requires a nominal type for nested generics).
-export type LinFrame = LinFrame(vars: [string])
+/// `non_drop` mirrors `LinState.non_drop` at the snapshot point so a try/catch
+/// pre-try restore preserves the structural-linear classification of every
+/// binding that was alive when the try entered.
+export type LinFrame = LinFrame(vars: [string], non_drop: [string])
 
 /// Live linear bindings + enclosing frame snapshots. `frame_stack` is a
 /// stack of `vars` snapshots at function-body entry and `try`-body entry.
 /// The top is the "covered" set for the throwable-call leak check.
-export type LinState = LinState(vars: [string], frame_stack: [LinFrame])
+/// `non_drop` is the subset of `vars` whose linear-wrapped inner type is
+/// NOT auto-droppable — used for the `let _ = e` wildcard-discard check.
+export type LinState = LinState(vars: [string], frame_stack: [LinFrame], non_drop: [string])
 
 let lin_empty = fn () -> LinState do
-  return LinState(vars: [], frame_stack: [])
+  return LinState(vars: [], frame_stack: [], non_drop: [])
 end
 
 let lin_add = fn (st: LinState, name: string) -> LinState do
-  let LinState(vars: vs, frame_stack: fs) = st
-  return LinState(vars: name :: vs, frame_stack: fs)
+  let LinState(vars: vs, frame_stack: fs, non_drop: nd) = st
+  return LinState(vars: name :: vs, frame_stack: fs, non_drop: nd)
+end
+
+/// Add a linear binding and mark it non-auto-droppable. Used when the
+/// classifier can determine the binding's type is structurally-linear
+/// (a `%T` / `@T` whose inner is not in the auto-droppable set).
+let lin_add_nd = fn (st: LinState, name: string) -> LinState do
+  let LinState(vars: vs, frame_stack: fs, non_drop: nd) = st
+  return LinState(vars: name :: vs, frame_stack: fs, non_drop: name :: nd)
 end
 
 let lin_remove = fn (st: LinState, name: string) -> LinState do
-  let LinState(vars: vs, frame_stack: fs) = st
-  return LinState(vars: remove_one(xs: vs, target: name), frame_stack: fs)
+  let LinState(vars: vs, frame_stack: fs, non_drop: nd) = st
+  return LinState(vars: remove_one(xs: vs, target: name), frame_stack: fs, non_drop: remove_one(xs: nd, target: name))
+end
+
+let lin_is_non_drop = fn (st: LinState, name: string) -> bool do
+  let LinState(vars: _, frame_stack: _, non_drop: nd) = st
+  return str_member(xs: nd, target: name)
 end
 
 let remove_one = fn (xs: [string], target: string) -> [string] do
@@ -214,7 +232,7 @@ let remove_one = fn (xs: [string], target: string) -> [string] do
 end
 
 let lin_member = fn (st: LinState, name: string) -> bool do
-  let LinState(vars: vs, frame_stack: _) = st
+  let LinState(vars: vs, frame_stack: _, non_drop: _) = st
   return str_member(xs: vs, target: name)
 end
 
@@ -250,23 +268,23 @@ let all_in = fn (needles: [string], haystack: [string]) -> bool do
 end
 
 let lin_push_frame = fn (st: LinState) -> LinState do
-  let LinState(vars: vs, frame_stack: fs) = st
-  return LinState(vars: vs, frame_stack: LinFrame(vars: copy(xs: vs)) :: fs)
+  let LinState(vars: vs, frame_stack: fs, non_drop: nd) = st
+  return LinState(vars: vs, frame_stack: LinFrame(vars: copy(xs: vs), non_drop: copy(xs: nd)) :: fs, non_drop: nd)
 end
 
 let lin_pop_frame = fn (st: LinState) -> LinState do
-  let LinState(vars: vs, frame_stack: fs) = st
+  let LinState(vars: vs, frame_stack: fs, non_drop: nd) = st
   match fs do
     | [] -> return st
-    | _ :: rest -> return LinState(vars: vs, frame_stack: rest)
+    | _ :: rest -> return LinState(vars: vs, frame_stack: rest, non_drop: nd)
   end
 end
 
 let lin_top_frame = fn (st: LinState) -> Option<[string]> do
-  let LinState(vars: _, frame_stack: fs) = st
+  let LinState(vars: _, frame_stack: fs, non_drop: _) = st
   match fs do
     | [] -> return None
-    | LinFrame(vars: top) :: _ -> return Some(val: top)
+    | LinFrame(vars: top, non_drop: _) :: _ -> return Some(val: top)
   end
 end
 
@@ -338,8 +356,28 @@ let val_kind = fn (v: HirExpr, sigs: [SigEntry]) -> string do
 end
 
 let lin_set_vars = fn (st: LinState, vs: [string]) -> LinState do
-  let LinState(vars: _, frame_stack: fs) = st
-  return LinState(vars: vs, frame_stack: fs)
+  let LinState(vars: _, frame_stack: fs, non_drop: nd) = st
+  // Restrict non_drop to names still in `vs` — vars dropped by the join
+  // shouldn't keep their non-drop bookkeeping alive.
+  return LinState(vars: vs, frame_stack: fs, non_drop: filter_keep(xs: nd, keep: vs, acc: []))
+end
+
+/// Restore both `vars` and `non_drop` from explicit lists. Used at try/catch
+/// boundaries where the pre-try snapshot captures both projections so a
+/// non-droppable binding alive at try-entry stays classified for the catch
+/// arm and the post-success join.
+let lin_set_vars_nd = fn (st: LinState, vs: [string], nd: [string]) -> LinState do
+  let LinState(vars: _, frame_stack: fs, non_drop: _) = st
+  return LinState(vars: vs, frame_stack: fs, non_drop: filter_keep(xs: nd, keep: vs, acc: []))
+end
+
+let filter_keep = fn (xs: [string], keep: [string], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | x :: rest ->
+      if str_member(xs: keep, target: x) then return filter_keep(xs: rest, keep, acc: x :: acc) end
+      return filter_keep(xs: rest, keep, acc)
+  end
 end
 
 // ─── Lambda-capture consumption ──────────────────────────────────────────────
@@ -571,6 +609,70 @@ let let_binds_linear = fn (
   end
 end
 
+/// True when the let-binding RHS, classified through the same priority order
+/// as `let_binds_linear`, yields a *non-auto-droppable* linear value. Used
+/// to mark the binding as `non_drop` so a later `let _ = name` discard is
+/// rejected, and to reject `let _ = expr` directly when the RHS is
+/// classifiable here.
+let let_binds_non_droppable_linear = fn (
+  sigil: Sigil, ann: Option<TypeExpr>, value: HirExpr, sigs: [SigEntry]
+) -> bool do
+  // Annotation wins when present.
+  match ann do
+    | Some(val: t) ->
+      match t do
+        | TyLinear(inner: i) -> if !is_auto_droppable(t: i) then return true end
+        | TyLazy(inner: i) -> if !is_auto_droppable(t: i) then return true end
+        | _ -> ()
+      end
+    | None -> ()
+  end
+  // Sigil with no annotation: defer to the RHS shape (we cannot recover the
+  // inner type from the sigil alone — `%x = 20` has inner i64 (droppable),
+  // `%x = mk_record()` has inner non-droppable).
+  let HirExpr(node: vnode, span: _) = value
+  match vnode do
+    | Call(func: f, args: _) ->
+      match sig_lookup(sigs, name: f) do
+        | Some(val: SigEntry(name: _, param_types: _, ret_type: rt, throw_row: _)) ->
+          match rt do
+            | TyLinear(inner: i) -> return !is_auto_droppable(t: i)
+            | TyLazy(inner: i) -> return !is_auto_droppable(t: i)
+            | _ -> return false
+          end
+        | None -> return false
+      end
+    | _ -> return false
+  end
+end
+
+/// True when the value expression itself, *standalone*, evaluates to a
+/// non-auto-droppable linear value — i.e., discarding it via `let _ = expr`
+/// would silently leak. Conservative: only fires for shapes the structural
+/// pass can classify. A Variable that resolves to a tracked non-drop linear
+/// is the primary case (the value carries the binding's modality); a Call
+/// whose return type is `%T(non-droppable)` / `@T(non-droppable)` is the
+/// other.
+let value_is_non_droppable_linear = fn (
+  value: HirExpr, st: LinState, sigs: [SigEntry]
+) -> bool do
+  let HirExpr(node: vnode, span: _) = value
+  match vnode do
+    | Variable(name: n, sigil: _) -> return lin_is_non_drop(st, name: n)
+    | Call(func: f, args: _) ->
+      match sig_lookup(sigs, name: f) do
+        | Some(val: SigEntry(name: _, param_types: _, ret_type: rt, throw_row: _)) ->
+          match rt do
+            | TyLinear(inner: i) -> return !is_auto_droppable(t: i)
+            | TyLazy(inner: i) -> return !is_auto_droppable(t: i)
+            | _ -> return false
+          end
+        | None -> return false
+      end
+    | _ -> return false
+  end
+end
+
 // ─── Throwability classification ────────────────────────────────────────────
 
 /// True when `eff_row` is a non-empty throws row (i.e., the call may raise).
@@ -635,8 +737,11 @@ let check_function = fn (func: HirFunction, sigs: [SigEntry]) -> unit throws { T
       | EagerBody(stmts) ->
         // Seed live set with linear params; push frame snapshot so the
         // body's throwable-call check excludes them (call-site contract).
+        // Non-auto-droppable linear params also seed `non_drop` so a
+        // `let _ = param` discard is rejected.
         let initial_vars = collect_linear_params(params: ps, acc: [])
-        let st0 = lin_set_vars(st: lin_empty(), vs: initial_vars)
+        let initial_nd = collect_non_droppable_linear_params(params: ps, acc: [])
+        let st0 = lin_set_non_drop(st: lin_set_vars(st: lin_empty(), vs: initial_vars), nd: initial_nd)
         let st1 = lin_push_frame(st: st0)
         let st2 = check_stmts(stmts, st: st1, sigs)
         // Function-end consumption check: any linear param or local left
@@ -652,8 +757,13 @@ let check_function = fn (func: HirFunction, sigs: [SigEntry]) -> unit throws { T
 end
 
 let lin_state_vars = fn (st: LinState) -> [string] do
-  let LinState(vars: vs, frame_stack: _) = st
+  let LinState(vars: vs, frame_stack: _, non_drop: _) = st
   return vs
+end
+
+let lin_state_non_drop = fn (st: LinState) -> [string] do
+  let LinState(vars: _, frame_stack: _, non_drop: nd) = st
+  return nd
 end
 
 let collect_linear_params = fn (params: [HirParam], acc: [string]) -> [string] do
@@ -665,6 +775,33 @@ let collect_linear_params = fn (params: [HirParam], acc: [string]) -> [string] d
       end
       return collect_linear_params(params: rest, acc)
   end
+end
+
+/// Subset of `collect_linear_params` that yields only the params whose
+/// linear inner is *not* auto-droppable. Mirrors `param_inner_is_auto_droppable`
+/// but inverts the predicate so the result feeds `non_drop`.
+let collect_non_droppable_linear_params = fn (params: [HirParam], acc: [string]) -> [string] do
+  match params do
+    | [] -> return acc
+    | HirParam(name: n, label: _, typ: t) :: rest ->
+      match t do
+        | TyLinear(inner: i) ->
+          if !is_auto_droppable(t: i) then
+            return collect_non_droppable_linear_params(params: rest, acc: n :: acc)
+          end
+        | TyLazy(inner: i) ->
+          if !is_auto_droppable(t: i) then
+            return collect_non_droppable_linear_params(params: rest, acc: n :: acc)
+          end
+        | _ -> ()
+      end
+      return collect_non_droppable_linear_params(params: rest, acc)
+  end
+end
+
+let lin_set_non_drop = fn (st: LinState, nd: [string]) -> LinState do
+  let LinState(vars: vs, frame_stack: fs, non_drop: _) = st
+  return LinState(vars: vs, frame_stack: fs, non_drop: nd)
 end
 
 let require_empty_or_droppable = fn (
@@ -716,10 +853,29 @@ let check_stmt = fn (
 ) -> LinState throws { TypeError } do
   match stmt do
     | Let(name: n, sigil: sig, typ: ann, value: v) ->
+      // Wildcard-discard rejection: `let _ = e` where `e` evaluates to a
+      // structurally-linear (non-auto-droppable) value silently drops it.
+      // Reject before walking the RHS so the diagnostic lands at the let
+      // site rather than at function-end as a stale "_" Unused.
+      if n == "_" then
+        if value_is_non_droppable_linear(value: v, st, sigs) then
+          raise LinearMismatch(detail: "wildcard-bind `let _ = e` discards a structurally-linear value", span)
+        end
+      end
       // Walk RHS first so any linear use inside it is consumed before the
       // new binding is added.
       let st1 = check_expr(expr: v, st, sigs, at_stmt_level: false)
+      // Wildcard never enters the live set: the non-droppable case was
+      // rejected above, and the droppable case (e.g., `let _ = mk_lin_i64()`)
+      // semantically auto-drops at the let site.
+      if n == "_" then return st1 end
       if let_binds_linear(sigil: sig, ann, value: v, sigs) then
+        // Track non-auto-droppable linears so a subsequent `let _ = name`
+        // can be rejected. Auto-droppable linear bindings (e.g., `%i64`)
+        // stay out of `non_drop` and remain freely discardable.
+        if let_binds_non_droppable_linear(sigil: sig, ann, value: v, sigs) then
+          return lin_add_nd(st: st1, name: n)
+        end
         return lin_add(st: st1, name: n)
       end
       return st1
@@ -741,6 +897,7 @@ let check_stmt = fn (
       // is the catch arm's responsibility on raise. Throwable-call check
       // inside the body excludes those vars from "leaked".
       let pre_try_vars = lin_state_vars(st)
+      let pre_try_nd = lin_state_non_drop(st)
       let st_try = lin_push_frame(st)
       let st_after_try = check_stmts(stmts: b, st: st_try, sigs)
       let st_after_try2 = lin_pop_frame(st: st_after_try)
@@ -748,7 +905,7 @@ let check_stmt = fn (
       // not from the post-success state. The catch arm must finish with
       // the same linear-var set as the post-success state (per-arm
       // consistency — bootstrap "Linear mismatch across catch arms").
-      let st_catch_in = lin_set_vars(st: st_after_try2, vs: pre_try_vars)
+      let st_catch_in = lin_set_vars_nd(st: st_after_try2, vs: pre_try_vars, nd: pre_try_nd)
       let st_catch_out = check_stmts(stmts: cb, st: st_catch_in, sigs)
       let post_catch_vars = lin_state_vars(st: st_catch_out)
       let post_try_vars = lin_state_vars(st: st_after_try2)
@@ -867,7 +1024,8 @@ let check_expr_kind = fn (
       // are tracked via `src/typecheck/capture.nx`. Walk the body in a
       // fresh state seeded only with the lambda's own linear params.
       let lparams = collect_linear_params(params: ps, acc: [])
-      let lst0 = lin_set_vars(st: lin_empty(), vs: lparams)
+      let l_nd = collect_non_droppable_linear_params(params: ps, acc: [])
+      let lst0 = lin_set_non_drop(st: lin_set_vars(st: lin_empty(), vs: lparams), nd: l_nd)
       let lst1 = lin_push_frame(st: lst0)
       let lst2 = check_stmts(stmts: b, st: lst1, sigs)
       // A lambda body that leaves linear params unconsumed is a type error
