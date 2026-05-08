@@ -4,17 +4,36 @@
  * Sequential implementation. Each combinator forces thunks in source order
  * using the @ sigil directly, so no host imports are required. The same
  * API contract admits a parallel reimplementation (DAG-driven force) once
- * combinators consume the spawn/join host pair.
+ * combinators consume the spawn/join host pair from `std:lazy_host`.
+ *
+ * Spec-vs-impl divergence (issue nexus-qhms): `cancel` and `race` carry
+ * surface-level semantics in `docs/spec/lazy.md` (cancel = "discard without
+ * evaluating"; race = "loser is cancelled") that require a runtime drop
+ * primitive and a first-of-two arbiter respectively. Neither host primitive
+ * exists; both are absent from the runtime/lazy WIT (only `__nx_lazy_spawn`
+ * and `__nx_lazy_join` are provided, in `std:lazy_host`). The combinators
+ * below preserve the spec's *type signatures* but document the sequential
+ * force-and-discard fallback. Programs depending on the spec's no-evaluate
+ * / cancel-loser semantics will observe both arms running in source order.
+ *
+ * The host-runtime path (`Task<T>`, `host_spawn`, `host_join`,
+ * `host_force`) lives in `std:lazy_host` so that a fixture importing only
+ * the pure combinators here does not pull `nexus:runtime/lazy` host
+ * externals into its produced wasm.
  */
 
-/// race(a, b): Force both thunks, returning `a`'s result.
-/// Sequential semantics only — both thunks always run to completion.
-/// A parallel reimplementation would cancel the loser after the winner
-/// resolves, but under sequential execution there is no loser to cancel.
+/// race(a, b): Sequentially force `a` then `b`, returning `a`'s result.
 ///
-/// Operates on @T (lazy bindings), not %Task<T> handles — orthogonal to
-/// host_spawn / host_join. A task-handle race would require a runtime-side
-/// "first-of" primitive and is not yet provided.
+/// Spec contract (`docs/spec/lazy.md:154-156`): "Returns first to complete;
+/// loser is cancelled". Without a runtime first-of-two arbiter, this
+/// implementation always runs `a` first, then runs `b` and discards its
+/// value. Side effects of `b` are observable. A parallel reimplementation
+/// would cancel `b`'s continuation once `a` resolves, but that requires a
+/// host primitive not currently provided.
+///
+/// Operates on `@T` (lazy bindings), not `%Task<T>` handles — orthogonal to
+/// `std:lazy_host`'s `host_spawn` / `host_join`. A task-handle race would
+/// require a runtime-side "first-of" primitive and is not yet provided.
 export let race = fn <T>(a: @T, b: @T) -> T do
   let result = @a
   let _ = @b
@@ -22,12 +41,16 @@ export let race = fn <T>(a: @T, b: @T) -> T do
 end
 
 /// cancel(a): Discharge a thunk's linearity by forcing it and discarding
-/// the result. Despite the name, the only way to consume a linear @T in
-/// this calculus is to force it — there is no "drop without force" form
-/// (a statement-level `let _ = a` rebinds the linear obligation to the
-/// name `_` instead of releasing it). For sequential semantics this is
-/// indistinguishable from `detach`; the name survives for symmetry with
-/// future parallel runtimes that may add a true cancellation primitive.
+/// the result.
+///
+/// Spec contract (`docs/spec/lazy.md:86,157`): "Discard without
+/// evaluating". The only way to consume a linear `@T` in this calculus is
+/// to force it — there is no "drop without force" form (a statement-level
+/// `let _ = a` rebinds the linear obligation to the name `_` instead of
+/// releasing it), and the runtime/lazy WIT exposes no `__nx_lazy_drop`.
+/// Until such a primitive exists, this implementation is observationally
+/// equivalent to `detach`: the thunk's body runs and any side effects are
+/// observable.
 export let cancel = fn <T>(a: @T) -> unit do
   let _ = @a
   return ()
@@ -41,62 +64,27 @@ export let detach = fn <T>(a: @T) -> unit do
   return ()
 end
 
-// ─── Host-runtime path ──────────────────────────────────────────────────────
-//
-// Two-step protocol against the nexus:runtime/lazy host interface
-// (Rust __nx_lazy_spawn / __nx_lazy_join):
-//
-//   host_spawn : <T>(@T) -> %Task<T>    // consumes thunk, returns linear handle
-//   host_join  : <T>(%Task<T>) -> T     // waits on handle, returns forced value
-//
-// Task<T> is an opaque linear wrapper around the runtime's raw i64 task id.
-// The linearity checker statically rejects spawn-without-join (the entry in
-// the runtime's tasks map and, for threaded thunks, the Rust JoinHandle would
-// otherwise leak for the lifetime of the wasm instance).
-//
-// Zero-capture thunks run on a worker thread; non-zero-capture thunks fall
-// back to inline on the caller thread and the "task id" encodes the inline
-// result directly. The encoding is private to the runtime — callers must
-// always pair spawn with join.
-import external "nexus:runtime/lazy"
-external __nx_lazy_spawn = "__nx_lazy_spawn" : <T>(thunk: @T, num_captures: i32) -> i64
-external __nx_lazy_join = "__nx_lazy_join" : <T>(task_id: i64) -> T
-
-/// A handle to a spawned thunk. Linear — must be consumed by `host_join`.
-/// Phantom T threads the thunk's element type from host_spawn to host_join
-/// so the FFI's type-erased i64 channel cannot be misused across the pair.
-export opaque type Task<T> = Task(id: i64)
-
-/// host_spawn(a): Dispatch a thunk to the runtime. The @T is consumed and
-/// a linear %Task<T> is returned that must be drained by host_join.
+/// force_all(tasks): Force every thunk in the list left-to-right, returning
+/// the results in input order.
 ///
-/// num_captures is passed to the runtime as a hint about whether the
-/// thunk reads captures. The shared-memory runtime threads every thunk
-/// regardless (worker reads captures through the same SharedMemory the
-/// caller writes to), so the value is effectively ignored there. The
-/// non-shared-memory path uses a positive value to force the inline
-/// fallback, since a worker Store would see zero-initialised memory and
-/// silently produce wrong values for capture-bearing thunks.
-export let host_spawn = fn <T>(a: @T) -> %Task<T> do
-  let id = __nx_lazy_spawn(thunk: a, num_captures: 1)
-  let t = Task(id)
-  let %lt = t
-  return %lt
+/// Spec contract (`docs/spec/lazy.md:159`): "Force every thunk; collect
+/// results in order". A parallel implementation would dispatch all thunks
+/// concurrently and join in input order; the sequential fallback walks the
+/// list, forcing each `@T` element as it is unpacked.
+export let force_all = fn <T>(tasks: [ @T ]) -> [ T ] do
+  return force_all_go(tasks, acc: [])
 end
 
-/// host_join(handle): Await a previously spawned thunk and return its
-/// forced value. Consumes the linear handle.
-///
-/// Parameter is named `handle` (not `task`) because `task` is a reserved
-/// keyword in Nexus.
-export let host_join = fn <T>(handle: %Task<T>) -> T do
-  let Task(id) = handle
-  return __nx_lazy_join(task_id: id)
+let force_all_go = fn <T>(tasks: [ @T ], acc: [ T ]) -> [ T ] do
+  match tasks do
+    | [] -> return reverse_list(xs: acc, out: [])
+    | t :: rest -> return force_all_go(tasks: rest, acc: @t :: acc)
+  end
 end
 
-/// host_force(a): Convenience composition of spawn + join. Semantically
-/// equivalent to `@a`, but routes the evaluation through the runtime so
-/// any future cross-thunk parallelism surfaces here.
-export let host_force = fn <T>(a: @T) -> T do
-  return host_join(handle: host_spawn(a))
+let reverse_list = fn <T>(xs: [ T ], out: [ T ]) -> [ T ] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return reverse_list(xs: rest, out: x :: out)
+  end
 end
