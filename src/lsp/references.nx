@@ -1,0 +1,429 @@
+/**
+ * lsp/references: resolve textDocument/references requests.
+ *
+ * Pipeline:
+ *   1. Tokenize the editor buffer; locate the identifier under the cursor
+ *      using `definition.find_ident_at` + `visible_name_for` (so `alias.foo`
+ *      qualified references collapse to one visible name).
+ *   2. Run the same lex+parse+import-aware build pipeline `definition.nx`
+ *      uses (`build_program_state`); resolve the cursor name through the
+ *      importer rename map to its canonical `source#name` form.
+ *   3. Walk every expression in the entry-file's defs PLUS every cached
+ *      imported file's defs. For each `ExprVariable` / `ExprCall` /
+ *      `ExprConstructor`, apply the *that-file's-own-view* rename map and
+ *      compare to the target canonical. Collect spans of all matches.
+ *   4. If `include_declaration` is true, prepend the def-site Location
+ *      (computed via the same logic `definition.resolve_definition` uses).
+ *
+ * Returns `[]` for:
+ *   - cursor outside any identifier,
+ *   - identifier doesn't resolve through the rename map (local binding,
+ *     builtin, typo),
+ *   - lex/parse/import-resolution failure (the buffer is too broken to
+ *     ground a rename map).
+ *
+ * Out of scope (per issue nexus-5pg8 non-goals):
+ *   - workspace-wide reference (every `.nx` outside imported set),
+ *   - type / variant / record-field references,
+ *   - shadowing-aware scope analysis (canonical-name match is sufficient
+ *     for top-level let / cap names — local lets shadow into a different
+ *     space and never collide).
+ *
+ * Coordinate model: same as definition — Span 1-based -> LSP 0-based,
+ * single-line range widened by the identifier name length.
+ */
+
+import { Option, Some, None } from "std:option"
+import * as lexer from "src/frontend/lexer.nx"
+import {
+  SpannedTopLevel, GlobalLet, TLLet, Cap, TLCap, Function,
+  HandlerArm,
+  SpannedExpr, Expr, ExprLiteral, ExprVariable, ExprBorrow,
+  ExprBinaryOp, ExprUnaryOp, ExprCall, ExprConstructor, ExprExternal,
+  ExprArray, ExprList, ExprRecord, ExprIndex, ExprFieldAccess,
+  ExprIf, ExprMatch, ExprWhile, ExprFor, ExprLambda,
+  ExprRaise, ExprForce, ExprHandler,
+  SpannedStmt, Stmt, StmtLet, StmtLetPattern, StmtExpr, StmtReturn,
+  StmtAssign, StmtIndexAssign, StmtTry, StmtInject,
+  MatchCase, CatchArm, CallArg, CtorArg, NamedExpr,
+  RdrName, Unqual, Qual
+} from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { CacheEntry } from "src/ir/imports.nx"
+import { RenameEntry }, * as symtab from "src/ir/symtab.nx"
+import * as rdr from "src/ir/rdrname.nx"
+import {
+  ProgramState, build_program_state, build_self_entries
+} from "src/lsp/program_state.nx"
+import {
+  IdentHit,
+  find_ident_at,
+  visible_name_for,
+  DefEntry,
+  collect_defs_from_file,
+  collect_defs_from_cache,
+  lookup_def,
+  canonical_to_local_name,
+  make_location
+} from "src/lsp/definition.nx"
+import * as str from "std:str"
+import { Fs } from "std:fs"
+import { Console } from "std:stdio"
+import { Location } from "nxlib/lsp/protocol.nx"
+
+// ─── Reference walker ────────────────────────────────────────────────────────
+//
+// We classify a use site by: take its `RdrName`, render it to a visible
+// string (`alias.foo` for Qual, plain name for Unqual), apply the file's
+// own rename map, and compare against the target canonical. Matches collect
+// the SpannedExpr's outer span — the parser anchors that span at the
+// identifier (call sites, variable references), so the LSP highlight lands
+// directly on the name rather than the whole call expression.
+
+let rdr_visible = fn (r: RdrName) -> string do
+  return rdr.rdr_to_string(r)
+end
+
+let rdr_local_name = fn (r: RdrName) -> string do
+  return rdr.rdr_occ(r)
+end
+
+// Append `xs ++ ys`. Used for cross-section reference accumulation.
+let append_locs = fn (xs: [Location], ys: [Location]) -> [Location] do
+  match xs do
+    | [] -> return ys
+    | x :: rest -> return x :: append_locs(xs: rest, ys)
+  end
+end
+
+// Resolve `r` against `entries`; return Some(canonical) if it matches the
+// target, None otherwise. Treats Unqual and Qual the same: visible name is
+// the input to the rename map.
+let rdr_resolves_to = fn (r: RdrName, entries: [RenameEntry], target: string) -> bool do
+  let visible = rdr_visible(r)
+  let canon = symtab.rename(name: visible, entries)
+  return canon == target
+end
+
+let walk_expr = fn (
+  e: SpannedExpr, entries: [RenameEntry], target: string,
+  file: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match e do | SpannedExpr(node: node, span: span) ->
+    return walk_expr_node(
+      node: node, span: span, entries, target, file, target_local_len, acc
+    )
+  end
+end
+
+let walk_exprs = fn (
+  es: [SpannedExpr], entries: [RenameEntry], target: string,
+  file: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match es do
+    | [] -> return acc
+    | e :: rest ->
+      let acc2 = walk_expr(e: e, entries, target, file, target_local_len, acc)
+      return walk_exprs(es: rest, entries, target, file, target_local_len, acc: acc2)
+  end
+end
+
+let walk_call_args = fn (
+  args: [CallArg], entries: [RenameEntry], target: string,
+  file: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match args do
+    | [] -> return acc
+    | CallArg(name: _, value: value) :: rest ->
+      let acc2 = walk_expr(e: value, entries, target, file, target_local_len, acc)
+      return walk_call_args(args: rest, entries, target, file, target_local_len, acc: acc2)
+  end
+end
+
+let walk_ctor_args = fn (
+  args: [CtorArg], entries: [RenameEntry], target: string,
+  file: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match args do
+    | [] -> return acc
+    | CtorArg(name: _, value: value) :: rest ->
+      let acc2 = walk_expr(e: value, entries, target, file, target_local_len, acc)
+      return walk_ctor_args(args: rest, entries, target, file, target_local_len, acc: acc2)
+  end
+end
+
+let walk_named_exprs = fn (
+  fields: [NamedExpr], entries: [RenameEntry], target: string,
+  file: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match fields do
+    | [] -> return acc
+    | NamedExpr(name: _, value: value) :: rest ->
+      let acc2 = walk_expr(e: value, entries, target, file, target_local_len, acc)
+      return walk_named_exprs(fields: rest, entries, target, file, target_local_len, acc: acc2)
+  end
+end
+
+let walk_match_cases = fn (
+  cases: [MatchCase], entries: [RenameEntry], target: string,
+  file: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match cases do
+    | [] -> return acc
+    | MatchCase(pattern: _, body: body) :: rest ->
+      let acc2 = walk_stmts(ss: body, entries, target, file, target_local_len, acc)
+      return walk_match_cases(cases: rest, entries, target, file, target_local_len, acc: acc2)
+  end
+end
+
+let walk_catch_arms = fn (
+  arms: [CatchArm], entries: [RenameEntry], target: string,
+  file: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match arms do
+    | [] -> return acc
+    | CatchArm(pattern: _, body: body) :: rest ->
+      let acc2 = walk_stmts(ss: body, entries, target, file, target_local_len, acc)
+      return walk_catch_arms(arms: rest, entries, target, file, target_local_len, acc: acc2)
+  end
+end
+
+let walk_handler_arms = fn (
+  arms: [HandlerArm], entries: [RenameEntry], target: string,
+  file: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match arms do
+    | [] -> return acc
+    | HandlerArm(arm: arm, cont_binder: _, span: _) :: rest ->
+      match arm do | Function(name: _, is_public: _, type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: body, span: _) ->
+        let acc2 = walk_stmts(ss: body, entries, target, file, target_local_len, acc)
+        return walk_handler_arms(arms: rest, entries, target, file, target_local_len, acc: acc2)
+      end
+  end
+end
+
+let walk_expr_node = fn (
+  node: Expr, span: Span, entries: [RenameEntry], target: string,
+  file: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match node do
+    | ExprLiteral(lit: _) -> return acc
+    | ExprBorrow(name: _, sigil: _) -> return acc
+    | ExprVariable(name: name, sigil: _) ->
+      if rdr_resolves_to(r: name, entries, target) then
+        let local = rdr_local_name(r: name)
+        let loc = make_location(file, span, name_len: str.length(s: local))
+        return loc :: acc
+      end
+      return acc
+    | ExprCall(func: func, args: args) ->
+      let acc1 = if rdr_resolves_to(r: func, entries, target) then
+        let local = rdr_local_name(r: func)
+        make_location(file, span, name_len: str.length(s: local)) :: acc
+      else
+        acc
+      end
+      return walk_call_args(args: args, entries, target, file, target_local_len, acc: acc1)
+    | ExprConstructor(name: name, args: args) ->
+      let acc1 = if rdr_resolves_to(r: name, entries, target) then
+        let local = rdr_local_name(r: name)
+        make_location(file, span, name_len: str.length(s: local)) :: acc
+      else
+        acc
+      end
+      return walk_ctor_args(args: args, entries, target, file, target_local_len, acc: acc1)
+    | ExprExternal(symbol: _, type_params: _, arg_names: _, typ: _) -> return acc
+    | ExprBinaryOp(left: left, op: _, right: right) ->
+      let acc1 = walk_expr(e: left, entries, target, file, target_local_len, acc)
+      return walk_expr(e: right, entries, target, file, target_local_len, acc: acc1)
+    | ExprUnaryOp(op: _, operand: operand) ->
+      return walk_expr(e: operand, entries, target, file, target_local_len, acc)
+    | ExprArray(elements: elements) ->
+      return walk_exprs(es: elements, entries, target, file, target_local_len, acc)
+    | ExprList(elements: elements) ->
+      return walk_exprs(es: elements, entries, target, file, target_local_len, acc)
+    | ExprRecord(fields: fields) ->
+      return walk_named_exprs(fields: fields, entries, target, file, target_local_len, acc)
+    | ExprIndex(target: t, index: index) ->
+      let acc1 = walk_expr(e: t, entries, target, file, target_local_len, acc)
+      return walk_expr(e: index, entries, target, file, target_local_len, acc: acc1)
+    | ExprFieldAccess(target: t, field: _) ->
+      return walk_expr(e: t, entries, target, file, target_local_len, acc)
+    | ExprIf(cond: cond, then_branch: then_branch, else_branch: else_branch) ->
+      let acc1 = walk_expr(e: cond, entries, target, file, target_local_len, acc)
+      let acc2 = walk_stmts(ss: then_branch, entries, target, file, target_local_len, acc: acc1)
+      return walk_stmts(ss: else_branch, entries, target, file, target_local_len, acc: acc2)
+    | ExprMatch(target: t, cases: cases) ->
+      let acc1 = walk_expr(e: t, entries, target, file, target_local_len, acc)
+      return walk_match_cases(cases: cases, entries, target, file, target_local_len, acc: acc1)
+    | ExprWhile(cond: cond, body: body) ->
+      let acc1 = walk_expr(e: cond, entries, target, file, target_local_len, acc)
+      return walk_stmts(ss: body, entries, target, file, target_local_len, acc: acc1)
+    | ExprFor(var: _, start: start, end_expr: end_expr, body: body) ->
+      let acc1 = walk_expr(e: start, entries, target, file, target_local_len, acc)
+      let acc2 = walk_expr(e: end_expr, entries, target, file, target_local_len, acc: acc1)
+      return walk_stmts(ss: body, entries, target, file, target_local_len, acc: acc2)
+    | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: b) ->
+      // Lambda body is a statement list; recurse so identifiers used
+      // inside the lambda count as references.
+      return walk_stmts(ss: b, entries, target, file, target_local_len, acc)
+    | ExprRaise(value: value) ->
+      return walk_expr(e: value, entries, target, file, target_local_len, acc)
+    | ExprForce(value: value) ->
+      return walk_expr(e: value, entries, target, file, target_local_len, acc)
+    | ExprHandler(coeffect_name: _, requires: _, arms: arms) ->
+      return walk_handler_arms(arms: arms, entries, target, file, target_local_len, acc)
+  end
+end
+
+let walk_stmt = fn (
+  s: SpannedStmt, entries: [RenameEntry], target: string,
+  file: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match s do | SpannedStmt(node: node, span: _) ->
+    match node do
+      | StmtLet(name: _, sigil: _, typ: _, value: value) ->
+        return walk_expr(e: value, entries, target, file, target_local_len, acc)
+      | StmtLetPattern(pattern: _, value: value) ->
+        return walk_expr(e: value, entries, target, file, target_local_len, acc)
+      | StmtExpr(expr: expr) ->
+        return walk_expr(e: expr, entries, target, file, target_local_len, acc)
+      | StmtReturn(value: value) ->
+        return walk_expr(e: value, entries, target, file, target_local_len, acc)
+      | StmtAssign(target: _, value: value) ->
+        return walk_expr(e: value, entries, target, file, target_local_len, acc)
+      | StmtIndexAssign(target: t, index: index, value: value) ->
+        let acc1 = walk_expr(e: t, entries, target, file, target_local_len, acc)
+        let acc2 = walk_expr(e: index, entries, target, file, target_local_len, acc: acc1)
+        return walk_expr(e: value, entries, target, file, target_local_len, acc: acc2)
+      | StmtTry(body: body, catch_arms: catch_arms) ->
+        let acc1 = walk_stmts(ss: body, entries, target, file, target_local_len, acc)
+        return walk_catch_arms(arms: catch_arms, entries, target, file, target_local_len, acc: acc1)
+      | StmtInject(handlers: handlers, body: body) ->
+        let acc1 = walk_exprs(es: handlers, entries, target, file, target_local_len, acc)
+        return walk_stmts(ss: body, entries, target, file, target_local_len, acc: acc1)
+    end
+  end
+end
+
+let walk_stmts = fn (
+  ss: [SpannedStmt], entries: [RenameEntry], target: string,
+  file: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match ss do
+    | [] -> return acc
+    | s :: rest ->
+      let acc2 = walk_stmt(s: s, entries, target, file, target_local_len, acc)
+      return walk_stmts(ss: rest, entries, target, file, target_local_len, acc: acc2)
+  end
+end
+
+let walk_top_level = fn (
+  defs: [SpannedTopLevel], entries: [RenameEntry], target: string,
+  file: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match defs do
+    | [] -> return acc
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name: _, is_public: _, typ: _, value: value)), span: _) :: rest ->
+      let acc2 = walk_expr(e: value, entries, target, file, target_local_len, acc)
+      return walk_top_level(defs: rest, entries, target, file, target_local_len, acc: acc2)
+    | _ :: rest ->
+      return walk_top_level(defs: rest, entries, target, file, target_local_len, acc)
+  end
+end
+
+let walk_cache_entries = fn (
+  cache: [CacheEntry], target: string, target_local_len: i64, acc: [Location]
+) -> [Location] do
+  match cache do
+    | [] -> return acc
+    | CacheEntry(path: path, defs: defs, entries: _) :: rest ->
+      // Each cached file resolves identifiers in its OWN body via that
+      // file's own self-entries (e.g. inside `other.nx`, a reference to
+      // local `f` resolves to `other#f`). Importer-view entries from the
+      // CacheEntry would only resolve references the *importer* makes —
+      // not the right view for walking the imported file's body.
+      let self_entries = build_self_entries(defs: defs, source: path)
+      let acc2 = walk_top_level(defs: defs, entries: self_entries, target: target, file: path, target_local_len: target_local_len, acc: acc)
+      return walk_cache_entries(cache: rest, target: target, target_local_len: target_local_len, acc: acc2)
+  end
+end
+
+// ─── Driver ──────────────────────────────────────────────────────────────────
+
+/// Resolve all references to the identifier under the cursor.
+///
+/// `text` / `file_uri` / `line` / `character` mirror `resolve_definition`.
+/// `include_declaration` per LSP `ReferenceContext.includeDeclaration`:
+/// when true, the def-site Location is prepended to the result; when false,
+/// only use sites are returned. Order is "def first, then use sites in
+/// source-walk order" — clients typically display unsorted.
+///
+/// Returns `[]` for any failure path: cursor not on an identifier, the
+/// identifier doesn't resolve through the rename map (locals / builtins),
+/// or the lex/parse/import pipeline failed to build a program state.
+export let find_references = fn (
+  text: string,
+  file_uri: string,
+  line: i64,
+  character: i64,
+  include_declaration: bool
+) -> [Location] require { Fs, Console } do
+  try
+    return find_references_unsafe(text, file_uri, line, character, include_declaration)
+  catch err ->
+    let _ = err
+    return []
+  end
+end
+
+let find_references_unsafe = fn (
+  text: string,
+  file_uri: string,
+  line: i64,
+  character: i64,
+  include_declaration: bool
+) -> [Location] require { Fs, Console } throws { Exn } do
+  let toks = lexer.tokenize(src: text)
+  match find_ident_at(toks, line, character) do
+    | None -> return []
+    | Some(val: hit) ->
+      let visible = visible_name_for(toks, hit)
+      let ProgramState(prog: _, defs, cache, accum: _, self_entries: _, caller_entries: _, all_entries) =
+        build_program_state(text, file: file_uri)
+      let canonical = symtab.rename(name: visible, entries: all_entries)
+      // No rename hit means the visible name is a local binding, a
+      // builtin, or a typo. Mirror definition.nx and return nothing.
+      if canonical == visible then return [] end
+      // The local name (post-`#`) drives the highlight width for use
+      // sites; `IdentHit.name_len` would understate Qual'd refs (`alias.foo`
+      // would highlight only "foo").
+      let target_local = canonical_to_local_name(canonical)
+      let target_local_len = str.length(s: target_local)
+      // Walk the entry buffer's defs with the importer-view rename map
+      // (covers calls into imported modules). Walk each cached file's
+      // defs with that file's own self-entries (so internal recursion
+      // inside other.nx counts against `other#f` too).
+      let entry_uses = walk_top_level(
+        defs: defs, entries: all_entries, target: canonical,
+        file: file_uri, target_local_len: target_local_len, acc: []
+      )
+      let cache_uses = walk_cache_entries(
+        cache: cache, target: canonical, target_local_len: target_local_len, acc: []
+      )
+      let all_uses = append_locs(xs: entry_uses, ys: cache_uses)
+      if !include_declaration then return all_uses end
+      // include_declaration=true: prepend the def-site Location, mirroring
+      // resolve_definition's lookup. If no def found (broken state), just
+      // return the use sites alone.
+      let entry_defs = collect_defs_from_file(defs, source: file_uri, acc: [])
+      let cached_defs = collect_defs_from_cache(cache, acc: entry_defs)
+      match lookup_def(canonical, defs: cached_defs) do
+        | None -> return all_uses
+        | Some(val: DefEntry(canonical: c, file, span)) ->
+          let local = canonical_to_local_name(c)
+          let def_loc = make_location(file, span, name_len: str.length(s: local))
+          return def_loc :: all_uses
+      end
+  end
+end
