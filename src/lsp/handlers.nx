@@ -47,14 +47,9 @@ import { JsonValue, JsonNull, JsonInt, JsonString, JsonArray, JsonObject, JsonFi
 import { Option, Some, None } from "std:option"
 import * as lexer from "src/frontend/lexer.nx"
 import * as parser from "src/frontend/parser.nx"
-import { Program, SpannedTopLevel, GlobalLet, TLLet, Cap, TLCap } from "src/common/ast.nx"
 import { HirProgram, HirFunction } from "src/ir/hir_types.nx"
 import * as hir from "src/ir/hir.nx"
-import * as resolve from "src/ir/resolve.nx"
-import { ImportResult, process_imports, append_entries } from "src/ir/imports.nx"
 import { resolve_all_lazy_no_filter } from "src/ir/demand.nx"
-import { RenameEntry }, * as symtab from "src/ir/symtab.nx"
-import * as rdr from "src/ir/rdrname.nx"
 import { Fs } from "std:fs"
 import { Console } from "std:stdio"
 import {
@@ -67,6 +62,12 @@ import {
   document_symbols_for_program
 } from "src/lsp/symbols.nx"
 import {
+  ProgramState, resolve_imports_for
+} from "src/lsp/program_state.nx"
+import {
+  resolve_definition
+} from "src/lsp/definition.nx"
+import {
   ServerCapabilities, TdsFull,
   InitializeResult, ServerInfo,
   initialize_params_from_json, initialize_result_to_json,
@@ -77,6 +78,7 @@ import {
   content_change_event_from_json,
   PublishDiagnosticsParams, publish_diagnostics_params_to_json,
   Position, Range, Diagnostic, DocumentSymbol,
+  location_to_json,
   document_symbol_to_json,
   DiagSevError,
   LspProtocolError
@@ -184,62 +186,25 @@ end
 
 // ─── HIR build (with imports) ────────────────────────────────────────────────
 //
-// `build_hir_with_imports` runs the same import-resolution pipeline as the
-// main driver: extract `import` statements, recursively read and parse
-// referenced `.nx` files via Fs, and feed the combined defs through HIR
-// accumulation + lazy-binding resolution. The typechecker then sees the
-// importer's own functions plus the imported ones, so a type error in an
-// imported function (called from the importer) surfaces as a diagnostic.
+// `build_hir_with_imports` layers HIR accumulation + lazy resolution on top
+// of `build_program_state`'s shared lex+parse+import-resolution stage. The
+// typechecker then sees the importer's own functions plus the imported
+// ones, so a type error in an imported function (called from the importer)
+// surfaces as a diagnostic.
 
-let get_defs = fn (prog: Program) -> [SpannedTopLevel] do
-  match prog do | Program(definitions: defs, _) -> return defs end
-end
-
-// Entry-file self-rename entries. Mirrors `driver.build_entry_self_entries`:
-// `main` keeps its bare name (so wasm export "main" works); every other
-// top-level def maps to its canonical `source#name` form so internal
-// calls inside the importer's body resolve through the same rdr layer
-// the imported modules use.
-let build_entry_self_entries = fn (defs: [SpannedTopLevel], source: string, acc: [RenameEntry]) -> [RenameEntry] do
-  match defs do
-    | [] -> return acc
-    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value: _)), span: _) :: rest ->
-      if name == "main" then
-        let acc2 = symtab.rename_add(entries: acc, original: name, qualified: "main")
-        return build_entry_self_entries(defs: rest, source, acc: acc2)
-      end
-      let acc2 = symtab.rename_add(entries: acc, original: name,
-        qualified: rdr.canonical_name(source_path: source, name))
-      return build_entry_self_entries(defs: rest, source, acc: acc2)
-    | SpannedTopLevel(node: TLCap(def: Cap(name, is_public: _, functions: _)), span: _) :: rest ->
-      let acc2 = symtab.rename_add(entries: acc, original: name,
-        qualified: rdr.canonical_name(source_path: source, name))
-      return build_entry_self_entries(defs: rest, source, acc: acc2)
-    | _ :: rest -> return build_entry_self_entries(defs: rest, source, acc)
-  end
-end
-
-let build_hir_with_imports = fn (prog: Program, source_file: string) -> HirProgram require { Fs, Console } throws { Exn } do
-  let defs = get_defs(prog)
-  let imports = resolve.extract_imports(defs)
-  let result = process_imports(imports, accum: hir.empty_accum(),
-    import_stack: [], visited: [], cache: [], caller_entries: [],
-    depth: 1, verbose: false)
-  match result do | ImportResult(accum, visited: _, cache: _, caller_entries) ->
-    let self_entries = build_entry_self_entries(defs, source: source_file, acc: [])
-    let entries = append_entries(xs: self_entries, ys: caller_entries)
-    let accum2 = hir.process_defs(defs, entries, accum, source_file)
-    let raw = hir.accum_to_program(accum: accum2)
-    match raw do | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
-      // LSP-mode resolve: convert every LazyBody but skip reachability
-      // filtering. The LSP wants typecheck coverage for *all* loaded defs
-      // (including imported `bar` that the importer never calls) so the
-      // editor surfaces every reachable error in the workspace, not just
-      // those on the codegen path.
-      let resolved = resolve_all_lazy_no_filter(funcs: hf)
-      return HirProgram(ports: hp, functions: resolved, externals: he,
-        handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
-    end
+let build_hir_with_imports = fn (state: ProgramState, source_file: string) -> HirProgram require { Fs, Console } throws { Exn } do
+  let ProgramState(prog: _, defs, cache: _, accum, self_entries: _, caller_entries: _, all_entries) = state
+  let accum2 = hir.process_defs(defs, all_entries, accum, source_file)
+  let raw = hir.accum_to_program(accum: accum2)
+  match raw do | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
+    // LSP-mode resolve: convert every LazyBody but skip reachability
+    // filtering. The LSP wants typecheck coverage for *all* loaded defs
+    // (including imported `bar` that the importer never calls) so the
+    // editor surfaces every reachable error in the workspace, not just
+    // those on the codegen path.
+    let resolved = resolve_all_lazy_no_filter(funcs: hf)
+    return HirProgram(ports: hp, functions: resolved, externals: he,
+      handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
   end
 end
 
@@ -272,11 +237,17 @@ end
 /// imported file's path even though the editor only opened the importer.
 /// Exported so tests / future LSP routing layers can inspect file identity
 /// before the wire-format DocumentFilter.
+///
+/// The `parse_source` + `resolve_imports_for` split mirrors the helpers
+/// `lsp/definition.resolve_definition` consumes through `build_program_state`
+/// — a single Fs walk per request grounds both the typecheck and the
+/// go-to-definition paths.
 export let compute_diagnostics_for_buffer = fn (text: string, file: string) -> [DiagEntry] require { Fs, Console } throws { Exn } do
   try
     let prog = parser.parse_source(src: text)
     try
-      let hir_prog = build_hir_with_imports(prog, source_file: file)
+      let state = resolve_imports_for(prog, file)
+      let hir_prog = build_hir_with_imports(state, source_file: file)
       // Pass *all* HIR function names as `local_names` so the typechecker
       // also walks imported function bodies. Driver-side typecheck restricts
       // to the entry file's own funcs because each imported file is
@@ -393,7 +364,12 @@ let nexus_on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerR
     /// cursor is on the first line. Per-definition hovers are out of
     /// scope (issue nexus-ws77 MVP).
     hover_provider: Some(val: true),
-    definition_provider: None,
+    /// `nexus_on_other` routes textDocument/definition through
+    /// `src/lsp/definition.resolve_definition`, which uses the same
+    /// import-aware build pipeline as the diagnostics path to follow
+    /// `alias.foo` / bare-identifier references back to their defining
+    /// `let` / `cap` site (issue nexus-yvd8).
+    definition_provider: Some(val: true),
     references_provider: None
   )
   let info = ServerInfo(name: "nexus-lsp", version: Some(val: "0.1.0"))
@@ -709,12 +685,78 @@ let nexus_on_hover = fn (state: ServerState, params: JsonValue) -> HandlerResult
   )
 end
 
+// ─── Handler: textDocument/definition (via on_other) ─────────────────────────
+//
+// Resolution scope (issue nexus-yvd8 Phase 1):
+//   - same-file: an identifier referencing a top-level `let` / `cap` in the
+//     entry buffer jumps back to that def's keyword span.
+//   - cross-file: `import { foo } from "./other.nx"` plus a call to `foo`
+//     jumps to other.nx's `let foo = ...` line.
+//   - cross-file with alias: `import * as a from "./other.nx"` plus
+//     `a.foo(...)` jumps to other.nx's `foo` def.
+//
+// Out of scope: local `let` bindings (no top-level rename map entry),
+// parameter names, type / variant / record-field navigation, handler-binding
+// origins. Those return `null` (LSP "no result") rather than InvalidParams
+// so editors silently no-op instead of erroring.
+
+let definition_position = fn (params: JsonValue) -> Position throws { Exn } do
+  let pos_v = require_object_field(obj: params, key: "position",
+    ctx: "DefinitionParams")
+  let line_v = require_object_field(obj: pos_v, key: "line",
+    ctx: "DefinitionParams.position")
+  let char_v = require_object_field(obj: pos_v, key: "character",
+    ctx: "DefinitionParams.position")
+  let line = match line_v do
+    | JsonInt(val: n) -> n
+    | _ -> raise LspProtocolError(msg: "DefinitionParams.position.line: expected integer")
+  end
+  let character = match char_v do
+    | JsonInt(val: n) -> n
+    | _ -> raise LspProtocolError(msg: "DefinitionParams.position.character: expected integer")
+  end
+  return Position(line, character)
+end
+
+let nexus_on_definition = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let td_v = require_object_field(obj: params, key: "textDocument",
+    ctx: "DefinitionParams")
+  let uri_v = require_object_field(obj: td_v, key: "uri",
+    ctx: "DefinitionParams.textDocument")
+  let uri = match uri_v do
+    | JsonString(val: s) -> s
+    | _ -> raise LspProtocolError(msg: "DefinitionParams.textDocument.uri: expected string")
+  end
+  let pos = definition_position(params)
+  let doc_opt = documents_lookup(store: state_documents(state), uri)
+  // No buffer means no Program to walk; reply null. Same convention as
+  // documentSymbol when a request races didOpen.
+  match doc_opt do
+    | None ->
+      return HandlerResult(state, response: Some(val: JsonNull), notifications: [])
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text, version: _) ->
+        match pos do | Position(line, character) ->
+          let loc_opt = resolve_definition(text, file_uri: uri, line, character)
+          let response = match loc_opt do
+            | None -> JsonNull
+            | Some(val: loc) -> location_to_json(loc)
+          end
+          return HandlerResult(state, response: Some(val: response), notifications: [])
+        end
+      end
+  end
+end
+
 let nexus_on_other = fn (state: ServerState, method: string, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   if method == "textDocument/documentSymbol" then
     return nexus_on_document_symbol(state, params)
   end
   if method == "textDocument/hover" then
     return nexus_on_hover(state, params)
+  end
+  if method == "textDocument/definition" then
+    return nexus_on_definition(state, params)
   end
   // Fall back to MethodNotFound (None response signals it to dispatch_message).
   let _ = params

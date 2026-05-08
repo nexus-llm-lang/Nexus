@@ -1,0 +1,312 @@
+/**
+ * lsp/definition: resolve textDocument/definition requests.
+ *
+ * Pipeline:
+ *   1. Tokenize the editor buffer; locate the SpannedToken whose 1-based
+ *      `(line, col)` extent covers the cursor's 0-based `(line, character)`.
+ *   2. Collapse a `TkIdent (TkDot TkIdent)?` cluster into a single visible
+ *      name (covers `alias.foo`-style qualified references). The cursor
+ *      may sit on either side of the dot.
+ *   3. Run the same import-aware build pipeline `compute_diagnostics_for_buffer`
+ *      uses, capture `(self_entries ++ caller_entries)` as the rename map,
+ *      and apply `symtab.rename` to translate the visible name into its
+ *      canonical `source#name` form.
+ *   4. Walk the entry-file's own defs plus every cached imported file's
+ *      defs (from `ImportResult.cache`) for the matching `TLLet` / `TLCap`
+ *      and return its `Location` (file path + 1-based span clamped into
+ *      LSP 0-based coordinates).
+ *
+ * Returns `None` for:
+ *   - cursor outside any identifier (whitespace, comment, literal),
+ *   - identifiers that don't resolve through the rename map (e.g. local
+ *     `let`-bound names — those are captured in HIR scope, not in the
+ *     top-level rename map; out of scope for MVP),
+ *   - identifiers that the rename map fingers but no def matches (broken
+ *     import / dangling reference).
+ *
+ * Coordinate model:
+ *   LSP `Position` is 0-based; AST `Span` is 1-based. The character axis is
+ *   ASCII-fast-path (1 char = 1 byte = 1 UTF-16 code unit). Multi-byte
+ *   strict mapping is deferred (see issue's Design notes).
+ *
+ * Out of scope (deferred per issue nexus-yvd8):
+ *   - LocationLink (origin/target range split)
+ *   - go-to type / variant / record-field
+ *   - go-to handler binding
+ *   - workspace-wide indexing
+ */
+
+import { Option, Some, None } from "std:option"
+import * as lexer from "src/frontend/lexer.nx"
+import { SpannedTopLevel, GlobalLet, TLLet, Cap, TLCap } from "src/common/ast.nx"
+import { Span, SpannedToken, Token, TkIdent, TkUident, TkDot } from "src/common/token.nx"
+import { CacheEntry } from "src/ir/imports.nx"
+import * as symtab from "src/ir/symtab.nx"
+import * as rdr from "src/ir/rdrname.nx"
+import {
+  ProgramState, build_program_state
+} from "src/lsp/program_state.nx"
+import * as str from "std:str"
+import { Fs } from "std:fs"
+import { Console } from "std:stdio"
+import {
+  Position, Range, Location
+} from "nxlib/lsp/protocol.nx"
+
+// ─── Token cursor lookup ─────────────────────────────────────────────────────
+//
+// LSP cursor is `(line: 0-based, character: 0-based)`. AST Span is 1-based.
+// A token covers `[span.col, span.col + name_len)` on `span.line` (1-based).
+// Cursor at `(L, C)` in LSP terms maps to `(L+1, C+1)` in AST terms; an
+// identifier whose span covers it satisfies
+//
+//     span.line == L+1  &&  span.col <= C+1 < span.col + name_len.
+
+let token_name = fn (tok: Token) -> Option<string> do
+  match tok do
+    | TkIdent(name) -> return Some(val: name)
+    | TkUident(name) -> return Some(val: name)
+    | _ -> return None
+  end
+end
+
+export type IdentHit = IdentHit(name: string, span: Span, name_len: i64, index: i64)
+
+let token_covers = fn (sp: Span, name_len: i64, ast_line: i64, ast_col: i64) -> bool do
+  match sp do | Span(offset: _, line, col) ->
+    if line != ast_line then return false end
+    if ast_col < col then return false end
+    if ast_col >= col + name_len then return false end
+    return true
+  end
+end
+
+let scan_for_ident = fn (toks: [SpannedToken], idx: i64, ast_line: i64, ast_col: i64) -> Option<IdentHit> do
+  match toks do
+    | [] -> return None
+    | SpannedToken(token, span) :: rest ->
+      match token_name(tok: token) do
+        | None -> return scan_for_ident(toks: rest, idx: idx + 1, ast_line, ast_col)
+        | Some(val: name) ->
+          let nlen = str.length(s: name)
+          if token_covers(sp: span, name_len: nlen, ast_line, ast_col) then
+            return Some(val: IdentHit(name, span, name_len: nlen, index: idx))
+          end
+          return scan_for_ident(toks: rest, idx: idx + 1, ast_line, ast_col)
+      end
+  end
+end
+
+/// Walk `toks` and return the IdentHit whose span covers the LSP-coordinate
+/// `(line, character)`, or None if the cursor is on whitespace / a non-identifier.
+export let find_ident_at = fn (toks: [SpannedToken], line: i64, character: i64) -> Option<IdentHit> do
+  return scan_for_ident(toks, idx: 0, ast_line: line + 1, ast_col: character + 1)
+end
+
+// ─── Qualified-name reconstruction ──────────────────────────────────────────
+//
+// `import * as alias from "..."` calls expose `alias.foo`. The lexer emits
+// three tokens: `TkIdent("alias") TkDot TkIdent("foo")`. The cursor may sit
+// on either identifier; either way the visible name we present to the rename
+// map is `"alias.foo"`. Hovering on the dot itself returns no hit (the prior
+// step already filtered to identifier tokens).
+
+let nth_token_kind = fn (toks: [SpannedToken], idx: i64) -> Option<Token> do
+  if idx < 0 then return None end
+  match toks do
+    | [] -> return None
+    | SpannedToken(token, span: _) :: rest ->
+      if idx == 0 then return Some(val: token) end
+      return nth_token_kind(toks: rest, idx: idx - 1)
+  end
+end
+
+// Look up the identifier name at relative position `sign` from the hit's
+// token index, but only if the token at `hit_idx + sign` is a TkDot. Returns
+// "" when the neighbour shape doesn't match the `(... TkDot ident)` pattern
+// we're probing for. Sign convention: -1 means "look at prev/prev2 (cursor
+// on right-hand side of dot)", +1 means "look at next/next2 (cursor on
+// left-hand side of dot)".
+let neighbour_dotted_name = fn (toks: [SpannedToken], hit_idx: i64, sign: i64) -> string do
+  let dot_idx = hit_idx + sign
+  if let Some(val: dot_tok) = nth_token_kind(toks, idx: dot_idx) then
+    if let TkDot = dot_tok then
+      let other_idx = hit_idx + (sign + sign)
+      if let Some(val: other_tok) = nth_token_kind(toks, idx: other_idx) then
+        if let Some(val: other_name) = token_name(tok: other_tok) then
+          return other_name
+        end
+      end
+    end
+  end
+  return ""
+end
+
+/// Build the visible name surfaced to the rename map by gluing a hit
+/// identifier to a neighbouring dot-qualified extension. The cursor may sit
+/// on either side of the dot — both produce the same `"alias.name"` shape.
+let visible_name_for = fn (toks: [SpannedToken], hit: IdentHit) -> string do
+  let IdentHit(name: hit_name, span: _, name_len: _, index: hit_idx) = hit
+  // Cursor on RHS ("foo" of "alias.foo"): the dot precedes the hit.
+  let prev_neighbour = neighbour_dotted_name(toks, hit_idx, sign: -1)
+  if prev_neighbour != "" then
+    return prev_neighbour ++ "." ++ hit_name
+  end
+  // Cursor on LHS ("alias" of "alias.foo"): the dot follows the hit.
+  let next_neighbour = neighbour_dotted_name(toks, hit_idx, sign: 1)
+  if next_neighbour != "" then
+    return hit_name ++ "." ++ next_neighbour
+  end
+  return hit_name
+end
+
+// ─── Definition table ────────────────────────────────────────────────────────
+//
+// A `(canonical_name, file, span)` triple per top-level `let` / `cap`. Built
+// from the entry file's defs and every cached imported file's defs. The
+// canonical-name string is the same shape `rdr.canonical_name` produces, so a
+// successful `symtab.rename` of the cursor's visible name lands directly on
+// the matching entry.
+
+export type DefEntry = DefEntry(canonical: string, file: string, span: Span)
+
+let collect_defs_from_file = fn (defs: [SpannedTopLevel], source: string, acc: [DefEntry]) -> [DefEntry] do
+  match defs do
+    | [] -> return acc
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value: _)), span) :: rest ->
+      let canonical = if name == "main" then "main" else rdr.canonical_name(source_path: source, name) end
+      let acc2 = DefEntry(canonical, file: source, span) :: acc
+      return collect_defs_from_file(defs: rest, source, acc: acc2)
+    | SpannedTopLevel(node: TLCap(def: Cap(name, is_public: _, functions: _)), span) :: rest ->
+      let canonical = rdr.canonical_name(source_path: source, name)
+      let acc2 = DefEntry(canonical, file: source, span) :: acc
+      return collect_defs_from_file(defs: rest, source, acc: acc2)
+    | _ :: rest -> return collect_defs_from_file(defs: rest, source, acc)
+  end
+end
+
+let collect_defs_from_cache = fn (cache: [CacheEntry], acc: [DefEntry]) -> [DefEntry] do
+  match cache do
+    | [] -> return acc
+    | CacheEntry(path, defs, entries: _) :: rest ->
+      let acc2 = collect_defs_from_file(defs, source: path, acc)
+      return collect_defs_from_cache(cache: rest, acc: acc2)
+  end
+end
+
+let lookup_def = fn (canonical: string, defs: [DefEntry]) -> Option<DefEntry> do
+  match defs do
+    | [] -> return None
+    | DefEntry(canonical: c, file, span) :: rest ->
+      if c == canonical then return Some(val: DefEntry(canonical: c, file, span)) end
+      return lookup_def(canonical, defs: rest)
+  end
+end
+
+// ─── Position translation (Span 1-based → LSP 0-based) ──────────────────────
+
+let saturating_pred = fn (n: i64) -> i64 do
+  if n <= 0 then return 0 end
+  return n - 1
+end
+
+let span_to_position = fn (sp: Span) -> Position do
+  match sp do | Span(offset: _, line, col) ->
+    return Position(
+      line: saturating_pred(n: line),
+      character: saturating_pred(n: col)
+    )
+  end
+end
+
+// Single-line range: AST nodes carry only the start position, so we widen by
+// the identifier length (matches the `selectionRange` choice in `lsp/symbols`).
+let single_line_range = fn (sp: Span, name_len: i64) -> Range do
+  let start = span_to_position(sp)
+  match start do | Position(line, character) ->
+    let end_pos = Position(line, character: character + name_len)
+    return Range(start, end_: end_pos)
+  end
+end
+
+// Build a Location for a defining file + span. We size the range to the
+// identifier name so editors highlight the keyword + name together.
+let make_location = fn (file: string, span: Span, name_len: i64) -> Location do
+  return Location(uri: file, range: single_line_range(sp: span, name_len))
+end
+
+// Return the ident length to use for the def-site range. The Span we have
+// points to the `let` / `cap` keyword, not the identifier; the AST does not
+// thread an inner identifier span. Widening by the source name's length
+// gives the editor a stable highlight target. We use the *original* name
+// (the identifier the user typed), which is what `DefEntry.canonical` peels
+// after the `#`.
+
+let canonical_to_local_name = fn (canonical: string) -> string do
+  let pos = str.index_of(s: canonical, sub: "#")
+  if pos < 0 then return canonical end
+  let total = str.length(s: canonical)
+  return str.substring(s: canonical, start: pos + 1, len: total - pos - 1)
+end
+
+// ─── Driver ──────────────────────────────────────────────────────────────────
+
+/// Resolve the definition of the identifier under the cursor.
+///
+/// `text` is the editor's current buffer contents. `file_uri` is the URI the
+/// editor advertised for it (mirrors what diagnostics use). `line` and
+/// `character` are 0-based LSP coordinates.
+///
+/// Returns `Some(Location)` on a successful lookup, `None` for any of:
+///   - lex/parse failure (the buffer is too broken to ground a rename map),
+///   - import resolution failure (a cycle or a missing imported file),
+///   - cursor not on an identifier,
+///   - identifier doesn't resolve to a known top-level def.
+///
+/// All Fs / Console reads happen inside the `try` (process_imports walks the
+/// import graph through the Fs cap) — a catch turns every recoverable failure
+/// into `None` so the LSP layer never crashes for a malformed buffer.
+export let resolve_definition = fn (
+  text: string,
+  file_uri: string,
+  line: i64,
+  character: i64
+) -> Option<Location> require { Fs, Console } do
+  try
+    return resolve_definition_unsafe(text, file_uri, line, character)
+  catch err ->
+    let _ = err
+    return None
+  end
+end
+
+let resolve_definition_unsafe = fn (
+  text: string,
+  file_uri: string,
+  line: i64,
+  character: i64
+) -> Option<Location> require { Fs, Console } throws { Exn } do
+  let toks = lexer.tokenize(src: text)
+  match find_ident_at(toks, line, character) do
+    | None -> return None
+    | Some(val: hit) ->
+      let visible = visible_name_for(toks, hit)
+      // Reuse the same lex+parse+import pipeline `compute_diagnostics_for_buffer`
+      // runs through; the wrapping `try` in `resolve_definition` swallows any
+      // import-resolution failure (cycle, missing file, parse error in import).
+      let ProgramState(prog: _, defs, cache, accum: _, self_entries: _, caller_entries: _, all_entries) =
+        build_program_state(text, file: file_uri)
+      let canonical = symtab.rename(name: visible, entries: all_entries)
+      // No rename hit means the visible name is a local binding, a
+      // builtin, or a typo. We have no def-site for those.
+      if canonical == visible then return None end
+      let entry_defs = collect_defs_from_file(defs, source: file_uri, acc: [])
+      let cached_defs = collect_defs_from_cache(cache, acc: entry_defs)
+      match lookup_def(canonical, defs: cached_defs) do
+        | None -> return None
+        | Some(val: DefEntry(canonical: c, file, span)) ->
+          let local_name = canonical_to_local_name(canonical: c)
+          return Some(val: make_location(file, span, name_len: str.length(s: local_name)))
+      end
+  end
+end

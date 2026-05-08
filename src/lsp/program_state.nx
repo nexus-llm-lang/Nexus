@@ -1,0 +1,111 @@
+/**
+ * lsp/program_state: shared lex+parse+import-resolution stage for LSP handlers.
+ *
+ * Both `compute_diagnostics_for_buffer` (typecheck path) and
+ * `resolve_definition` (go-to-definition path) need the same prefix work:
+ *
+ *   text  ->  Program
+ *           |
+ *           v
+ *   imports + cache + caller_entries (importer view)
+ *           +
+ *   self_entries (entry-file's own renames)
+ *
+ * Splitting the import-walk + entries build out of `handlers.nx` lets both
+ * paths share one lex+parse + one Fs-walk per request. The HIR-only stage
+ * (`hir.process_defs` + lazy resolution + typecheck) stays in
+ * `handlers.build_hir_with_imports` because the definition path does not
+ * need it.
+ *
+ * The `caller_entries` returned by `process_imports` are already in
+ * importer-view form. We build `self_entries` (the entry-file's own
+ * top-level renames) here in the same shape `handlers.build_entry_self_entries`
+ * uses, so both call-sites consume an identical entries list.
+ *
+ * `main` keeps its bare name (matches wasm export "main"); every other
+ * top-level def gets the `source#name` canonical form so internal calls
+ * inside the entry file's bodies resolve through the same rdr layer the
+ * imported modules use.
+ */
+
+import { Program, SpannedTopLevel, GlobalLet, TLLet, Cap, TLCap } from "src/common/ast.nx"
+import { ImportResult, CacheEntry, process_imports, append_entries } from "src/ir/imports.nx"
+import { RenameEntry }, * as symtab from "src/ir/symtab.nx"
+import * as parser from "src/frontend/parser.nx"
+import * as resolve from "src/ir/resolve.nx"
+import * as hir from "src/ir/hir.nx"
+import { HirAccum } from "src/ir/hir_types.nx"
+import * as rdr from "src/ir/rdrname.nx"
+import { Fs } from "std:fs"
+import { Console } from "std:stdio"
+
+/// Bundle of products consumed by handlers downstream. `prog` is the parsed
+/// entry buffer; `defs` mirrors `Program.definitions` for callers that destruct
+/// the program in different ways. `cache` is the imported-file cache emitted
+/// by `process_imports` (one CacheEntry per imported `.nx` file). `accum`
+/// is the imports' partial HIR — diagnostics extends it with the entry
+/// file's defs before typechecking. `all_entries` is
+/// `self_entries ++ caller_entries`, the full importer-view rename map the
+/// rdr / symtab layer needs to resolve identifier references.
+export type ProgramState = ProgramState(
+  prog: Program,
+  defs: [SpannedTopLevel],
+  cache: [CacheEntry],
+  accum: HirAccum,
+  self_entries: [RenameEntry],
+  caller_entries: [RenameEntry],
+  all_entries: [RenameEntry]
+)
+
+let build_self_entries_go = fn (defs: [SpannedTopLevel], source: string, acc: [RenameEntry]) -> [RenameEntry] do
+  match defs do
+    | [] -> return acc
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value: _)), span: _) :: rest ->
+      let qualified = if name == "main" then "main" else rdr.canonical_name(source_path: source, name) end
+      let acc2 = symtab.rename_add(entries: acc, original: name, qualified)
+      return build_self_entries_go(defs: rest, source, acc: acc2)
+    | SpannedTopLevel(node: TLCap(def: Cap(name, is_public: _, functions: _)), span: _) :: rest ->
+      let acc2 = symtab.rename_add(entries: acc, original: name,
+        qualified: rdr.canonical_name(source_path: source, name))
+      return build_self_entries_go(defs: rest, source, acc: acc2)
+    | _ :: rest -> return build_self_entries_go(defs: rest, source, acc)
+  end
+end
+
+/// Build the entry-file's own rename entries: mirrors the importer-view
+/// shape `build_importer_entries` produces for imported files, so the
+/// rename map sees one consistent table covering both sides.
+export let build_self_entries = fn (defs: [SpannedTopLevel], source: string) -> [RenameEntry] do
+  return build_self_entries_go(defs, source, acc: [])
+end
+
+/// Resolve a parsed program's imports and assemble the ProgramState bundle.
+/// Raises through `process_imports` on cycle / missing file / parse error
+/// inside an imported module; callers in handlers want this distinct from
+/// the entry-file parse error so they wrap this and `parser.parse_source`
+/// in separate try blocks.
+export let resolve_imports_for = fn (prog: Program, file: string) -> ProgramState
+    require { Fs, Console } throws { Exn } do
+  let Program(definitions: defs, module_doc: _) = prog
+  let imports = resolve.extract_imports(defs)
+  let ImportResult(accum, visited: _, cache, caller_entries) = process_imports(
+    imports, accum: hir.empty_accum(),
+    import_stack: [], visited: [], cache: [], caller_entries: [],
+    depth: 1, verbose: false
+  )
+  let self_entries = build_self_entries(defs, source: file)
+  let all_entries = append_entries(xs: self_entries, ys: caller_entries)
+  return ProgramState(prog, defs, cache, accum, self_entries, caller_entries, all_entries)
+end
+
+/// Run the full lex+parse+import-resolution stage on the editor buffer.
+/// Returns every product downstream LSP handlers need; raises through the
+/// underlying `parse` / `process_imports` paths on lex failures, parse
+/// failures, cycle detection, missing imported files, and so on. Callers
+/// wrap in their own `try` to convert failures into the per-handler
+/// null / empty response.
+export let build_program_state = fn (text: string, file: string) -> ProgramState
+    require { Fs, Console } throws { Exn } do
+  let prog = parser.parse_source(src: text)
+  return resolve_imports_for(prog, file)
+end
