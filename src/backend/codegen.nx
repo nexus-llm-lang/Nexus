@@ -251,6 +251,7 @@ end
 let emit_sched_spawn = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
   match args do
     | LirCallArg(label: _, value: a) :: _ ->
+      let CodegenCtx(functions: fns, internal_func_map: ifm, ss_cont_type_idx: cti, _) = ctx
       let exts = wdefs.ctx_externals(ctx)
       // Push thunk to host pending-thunk queue
       let %buf = emit_atom(atom: a, %buf, ctx)
@@ -285,16 +286,15 @@ let emit_sched_spawn = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx
       let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
       let tramp_idx = find_func_idx_by_suffix(
         suffix: "__nx_sched_trampoline_body",
-        funcs: wdefs.ctx_functions(ctx),
-        internal_func_map: wdefs.ctx_internal_func_map(ctx))
+        funcs: fns,
+        internal_func_map: &ifm)
       if tramp_idx < 0 then
         raise SymbolNotFound(name: "__nx_sched_trampoline_body", kind: "sched intrinsic", context: "spawn requires sched.nx import")
       end
       let %buf = bb.push_byte(%buf, byte: op_ref_func)
       let %buf = bb.push_uleb128(%buf, val: tramp_idx)
       let %buf = bb.push_byte(%buf, byte: op_cont_new)
-      let cont_t_idx = wdefs.ctx_ss_cont_type_idx(ctx)
-      let %buf = bb.push_uleb128(%buf, val: cont_t_idx)
+      let %buf = bb.push_uleb128(%buf, val: cti)
       let %buf = bb.push_byte(%buf, byte: op_table_set)
       let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_table_idx)
 
@@ -360,7 +360,8 @@ end
 /// (alloc_mode != 2 → no `__nx_alloc_mark` import) the upper 32 bits are
 /// zero and `heap_reset` rewinds G0 only.
 let emit_heap_mark = fn (buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer do
-  let mark_idx = wdefs.lookup_func_fast(name: "__nx_alloc_mark", map: wdefs.ctx_external_func_map(ctx))
+  let CodegenCtx(external_func_map: efm, _) = ctx
+  let mark_idx = wdefs.lookup_func_fast(name: "__nx_alloc_mark", map: &efm)
   if mark_idx >= 0 then
     // call __nx_alloc_mark → i32; extend_u → i64; shl 32; OR (G0 extended u)
     let %buf = bb.push_byte(%buf, byte: op_call)
@@ -388,7 +389,8 @@ end
 let emit_heap_reset = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
   match args do
     | LirCallArg(label: _, value: a) :: _ ->
-      let reset_idx = wdefs.lookup_func_fast(name: "__nx_alloc_reset", map: wdefs.ctx_external_func_map(ctx))
+      let CodegenCtx(external_func_map: efm, _) = ctx
+      let reset_idx = wdefs.lookup_func_fast(name: "__nx_alloc_reset", map: &efm)
       let %buf = if reset_idx >= 0 then
         // mark (i64) → upper 32 → i32; call __nx_alloc_reset(i32)
         let %b = emit_atom(atom: a, buf: %buf, ctx)
@@ -1161,7 +1163,7 @@ let emit_internal_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer,
                               is_tail: bool, in_try: bool, int_idx: i64) -> %ByteBuffer throws { CodegenError } do
   match wdefs.ctx_find_function(ctx, name: func) do
     | Some(val: LirFunction(name: _, params, ret_type: callee_rt, body: _, ret: _, span: _)) ->
-      let caller_rt = wdefs.ctx_func_ret_type(ctx)
+      let CodegenCtx(func_ret_type: caller_rt, memo_target_names: mtn, memo_target_slots: mts, _) = ctx
       // return_call requires callee return type ≡ caller return type. When a
       // unit-returning fn is tail-called from a non-unit-returning wrapper
       // (e.g. closure body wrapping `let @t = unit_returning_fn()`), fall
@@ -1172,8 +1174,8 @@ let emit_internal_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer,
       // Memoization (nexus-e6uh): single-slot last-call cache for 1-arg
       // single-word-key pure fns, gated on slot-table membership and a
       // non-tail / non-try call site so the if/else result discipline holds.
-      let memo_slot = lookup_memo_slot(name: func, targets_names: wdefs.ctx_memo_target_names(ctx),
-                                          targets_slots: wdefs.ctx_memo_target_slots(ctx))
+      let memo_slot = lookup_memo_slot(name: func, targets_names: mtn,
+                                          targets_slots: mts)
       if !use_tail && !in_try && memo_slot >= 0 then
         return emit_memoized_internal_call(func: func, args, params, callee_rt: callee_rt,
                                             buf: %buf, ctx: ctx,
@@ -1198,7 +1200,7 @@ let emit_memoized_internal_call = fn (func: string, args: [LirCallArg], params: 
                                          callee_rt: TypeExpr,
                                          buf: %ByteBuffer, ctx: CodegenCtx,
                                          int_idx: i64, slot: i64) -> %ByteBuffer throws { CodegenError } do
-  let memo_base = wdefs.ctx_memo_globals_base(ctx)
+  let CodegenCtx(memo_globals_base: memo_base, _) = ctx
   let valid_idx = memo.memo_valid_global_idx(base: memo_base, slot)
   let key_idx = memo.memo_key_global_idx(base: memo_base, slot)
   let val_idx = memo.memo_val_global_idx(base: memo_base, slot)
@@ -1408,11 +1410,12 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
   else if simd_wn == "simd-f32x4-div-array" then return emit_simd_binop_array(sub_op: op_simd_f32x4_div, args, %buf, ctx, name: "__nx_simd_f32x4_div_array")
   else if simd_wn == "simd-f64x2-div-array" then return emit_simd_binop_array(sub_op: op_simd_f64x2_div, args, %buf, ctx, name: "__nx_simd_f64x2_div_array")
   else
-    let int_idx = wdefs.lookup_func_fast(name: func, map: wdefs.ctx_internal_func_map(ctx))
+    let CodegenCtx(internal_func_map: ifm, external_func_map: efm, _) = ctx
+    let int_idx = wdefs.lookup_func_fast(name: func, map: &ifm)
     if int_idx >= 0 then
       return emit_internal_call(func, args, %buf, ctx, is_tail, in_try, int_idx)
     else
-      let ext_idx = wdefs.lookup_func_fast(name: func, map: wdefs.ctx_external_func_map(ctx))
+      let ext_idx = wdefs.lookup_func_fast(name: func, map: &efm)
       if ext_idx >= 0 then
         return emit_external_call(func, args, %buf, ctx, ext_idx)
       else
@@ -1569,10 +1572,10 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       // Per-function backtrace capture (issue nexus-55x0). Emit a `call`
       // to the imported `__nx_main_wrap_bt_capture` immediately before
       // `op_throw` so the host can snapshot the wasm call stack before
-      // unwinding. ctx_bt_capture_idx returns -1 when the enclosing
-      // function's EffectMap entry has can_throw=false or when the
-      // capture import was never resolved (no main_wrap fired).
-      let bt_capture_idx = wdefs.ctx_bt_capture_idx(ctx)
+      // unwinding. bt_capture_idx is -1 when the enclosing function's
+      // EffectMap entry has can_throw=false or when the capture import
+      // was never resolved (no main_wrap fired).
+      let CodegenCtx(bt_capture_idx: bt_capture_idx, _) = ctx
       let %buf = if bt_capture_idx >= 0 then
         let %b = bb.push_byte(%buf, byte: op_call)
         bb.push_uleb128(buf: %b, val: bt_capture_idx)
@@ -1600,7 +1603,8 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = bb.push_byte(%buf, byte: op_i64_load)
       let %buf = wdefs.emit_memarg_i64(%buf, offset: 0)
       let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_call_indirect])
-      let type_idx = lookup_closure_type_idx_pairs(arity: 0, pairs: wdefs.ctx_closure_type_indices(ctx))
+      let CodegenCtx(closure_type_indices: cti, _) = ctx
+      let type_idx = lookup_closure_type_idx_pairs(arity: 0, pairs: cti)
       let %buf = bb.push_uleb128(%buf, val: type_idx)
       let %buf = bb.push_uleb128(%buf, val: heap_global_idx)
       return %buf
@@ -1611,7 +1615,8 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = emit_alloc_object(%buf, ctx, words: 1 + n_caps)
       let obj_ptr = wdefs.ctx_temps_base(ctx) + 3
       // Store table_idx at offset 0
-      let table_idx = lookup_closure_table_idx(name: fname, entries: wdefs.ctx_closure_table(ctx))
+      let CodegenCtx(closure_table: ctab, _) = ctx
+      let table_idx = lookup_closure_table_idx(name: fname, entries: ctab)
       let %buf = bb.push_byte(%buf, byte: op_local_get)
       let %buf = bb.push_uleb128(%buf, val: obj_ptr)
       let %buf = bb.push_byte(%buf, byte: op_i64_const)
@@ -1642,7 +1647,8 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
       // call_indirect: type_idx, table 0
       let n_args = list.length(xs: cargs)
-      let type_idx = lookup_closure_type_idx_pairs(arity: n_args, pairs: wdefs.ctx_closure_type_indices(ctx))
+      let CodegenCtx(closure_type_indices: cti, _) = ctx
+      let type_idx = lookup_closure_type_idx_pairs(arity: n_args, pairs: cti)
       let %buf = bb.push_byte(%buf, byte: op_call_indirect)
       let %buf = bb.push_uleb128(%buf, val: type_idx)
       let %buf = bb.push_uleb128(%buf, val: heap_global_idx)
@@ -1658,8 +1664,8 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       // Multi-arm dispatch: each `<port>::<method>` gets its own wasm tag.
       // ss_base = the wasm tag index of the FIRST stack-switching tag (after
       // the optional EH tag); offset = position of `tn` in `ss_tag_names`.
-      let ss_base = wdefs.ctx_ss_tag_idx(ctx)
-      let tag_offset = wcollect.lookup_tag_idx(tag_name: tn, tag_names: wdefs.ctx_ss_tag_names(ctx))
+      let CodegenCtx(ss_tag_idx: ss_base, ss_tag_names: tns, _) = ctx
+      let tag_offset = wcollect.lookup_tag_idx(tag_name: tn, tag_names: tns)
       if tag_offset < 0 then
         raise SymbolNotFound(name: tn, kind: "suspend tag", context: "LirExprSuspend tag missing in ss_tag_names")
       end
@@ -1708,11 +1714,10 @@ end
 /// returns sidestep whatever Nexus runtime pattern was responsible).
 let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm_fns: [string],
                                     arm_tags: [string], ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
-  let body_idx = wdefs.lookup_func_fast(name: body_fn, map: wdefs.ctx_internal_func_map(ctx))
-  let cont_t_idx = wdefs.ctx_ss_cont_type_idx(ctx)
-  let dispatch_t_idx = wdefs.ctx_ss_dispatch_block_type_idx(ctx)
-  let ss_base = wdefs.ctx_ss_tag_idx(ctx)
-  let tag_names = wdefs.ctx_ss_tag_names(ctx)
+  let CodegenCtx(internal_func_map: ifm, ss_cont_type_idx: cont_t_idx,
+                  ss_dispatch_block_type_idx: dispatch_t_idx, ss_tag_idx: ss_base,
+                  ss_tag_names: tag_names, _) = ctx
+  let body_idx = wdefs.lookup_func_fast(name: body_fn, map: &ifm)
   let n_arms_raw = list.length(xs: arm_fns)
   // Phase-2 fallback: arm_tags may be empty (legacy MIR path). Force a
   // single-on-clause shape so the dispatcher remains valid; first arm gets
@@ -1857,7 +1862,8 @@ let close_and_dispatch_arms = fn (buf: %ByteBuffer, arm_fns: [string], n_arms: i
 end
 
 let emit_arm_dispatch = fn (buf: %ByteBuffer, arm_fn: string, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
-  let arm_idx = wdefs.lookup_func_fast(name: arm_fn, map: wdefs.ctx_internal_func_map(ctx))
+  let CodegenCtx(internal_func_map: ifm, _) = ctx
+  let arm_idx = wdefs.lookup_func_fast(name: arm_fn, map: &ifm)
   if arm_idx < 0 then
     raise SymbolNotFound(name: arm_fn, kind: "arm function", context: "emit_arm_dispatch")
   end
@@ -1969,7 +1975,8 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
         end
         // Single-scan packed lookup folds the previous double linear scan
         // (issue nexus-m2xq). Layout: `(index << 32) | valtype`.
-        let packed = wdefs.lookup_local_packed(name: n, entries: wdefs.ctx_locals(ctx))
+        let CodegenCtx(locals: locs, _) = ctx
+        let packed = wdefs.lookup_local_packed(name: n, entries: locs)
         let idx = if packed < 0 then
           raise SymbolNotFound(name: n, kind: "local variable", context: "emit_stmt: let-binding target")
         else packed / 4294967296 end
@@ -2025,7 +2032,8 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
 
     | LirStmtTryCatch(body: b, body_ret: br, catch_param: cp, catch_param_typ: _,
                           catch_body: cb, catch_ret: cr) ->
-      let catch_local_idx = wdefs.lookup_local(name: cp, entries: wdefs.ctx_locals(ctx))
+      let CodegenCtx(locals: locs, func_ret_type: ret_t, _) = ctx
+      let catch_local_idx = wdefs.lookup_local(name: cp, entries: locs)
 
       // WASM EH: block $skip { block $catch (result i64) { try_table (catch tag0 $catch) { body } end; br 1 } end; catch body } end
       // Emit block $skip
@@ -2047,7 +2055,7 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = match br do
         | Some(val: a) ->
           let %b = emit_atom(atom: a, %buf, ctx)
-          let %b = emit_coercion(from_type: wdefs.atom_type(atom: a), to_type: wdefs.ctx_func_ret_type(ctx), buf: %b)
+          let %b = emit_coercion(from_type: wdefs.atom_type(atom: a), to_type: ret_t, buf: %b)
           bb.push_byte(buf: %b, byte: op_return)
         | None -> %buf
       end
@@ -2067,7 +2075,7 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = match cr do
         | Some(val: a) ->
           let %b = emit_atom(atom: a, %buf, ctx)
-          let %b = emit_coercion(from_type: wdefs.atom_type(atom: a), to_type: wdefs.ctx_func_ret_type(ctx), buf: %b)
+          let %b = emit_coercion(from_type: wdefs.atom_type(atom: a), to_type: ret_t, buf: %b)
           bb.push_byte(buf: %b, byte: op_return)
         | None -> %buf
       end
@@ -2123,7 +2131,8 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuff
   // apply to them.
   let rt = if is_closure_lift(name: fname) && wdefs.is_unit(typ: raw_rt) then TyI64 else raw_rt end
   let %body = bb.empty()
-  let %body = wsect.emit_local_decls(buf: %body, locals: wdefs.ctx_locals(ctx), param_count: list.length(xs: ps))
+  let CodegenCtx(locals: locs, _) = ctx
+  let %body = wsect.emit_local_decls(buf: %body, locals: locs, param_count: list.length(xs: ps))
 
   // TCMC: detect pattern and set up locals
   let tcmc_raw = detect_tcmc(body: b, func_name: fname)
