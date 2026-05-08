@@ -1,0 +1,94 @@
+// Regression: nexus-3u93 — wasm/merge::rw_instrs must classify op_try_table
+// (modern try_table, opcode 0x1F). Pre-fix the walker had no arm for
+// op_try_table, fell through to cls_no_operand, and mis-decoded the
+// subsequent blocktype + handler-table bytes — corrupting every function
+// past the first try-catch. Post-fix the cls_try_table arm copies the
+// blocktype + ULEB handler count + per-handler (catch_kind, [tag], label)
+// triples verbatim.
+//
+// This is an end-to-end fixture: the merge-walker fix is exercised by the
+// `nexus build` pipeline, which always runs merge_with_stdlib on the
+// emitted core wasm. A try-catch in user code lowers to op_try_table in
+// the emitted module, so this fixture's mere ability to compile + run
+// is a strict round-trip check on the walker.
+//
+// Shape: multiple try_table sites with mixed handler shapes — a bare
+// `catch e` (1 catch_ref handler), a selective `catch | Pat -> ... | _ ->`
+// (multiple handlers including catch_all), and a nested try around a call
+// site (so the second try_table's bytecode position depends on the first
+// one's handler-table being walked correctly). If rw_instrs misreads the
+// first handler table, the second try_table's blocktype byte is
+// reinterpreted as an opcode and the merged module fails wasm-validate
+// before wasmtime even loads it.
+import * as test_assert from "std:test/assert"
+
+exception Boom(code: i64)
+exception Bang(label: string)
+
+// Single try_table, bare catch — the simplest catch_ref-with-tag handler shape.
+let single_bare = fn () -> i64 throws { Exn } do
+  try
+    raise Boom(code: 11)
+    return 0
+  catch e ->
+    return 1
+  end
+  return 0
+end
+
+// Selective catch with two ctor arms + catch-all wildcard. Lowers to a
+// try_table with three handlers (two catch[_ref] + one catch_all[_ref]),
+// stressing the per-handler walker beyond the n=1 case.
+let selective = fn () -> i64 throws { Exn } do
+  try
+    raise Bang(label: "x")
+    return 0
+  catch
+    | Boom(code: c) -> return c
+    | Bang(label: _) -> return 22
+    | _ -> return 99
+  end
+  return 0
+end
+
+// Nested try-catch — the inner try_table sits inside the outer's
+// instruction stream, so the outer's handler-table walk has to advance
+// `pos` correctly past the inner block. Pre-fix the inner blocktype byte
+// was misread as an opcode, breaking the merged module structurally.
+let nested = fn () -> i64 throws { Exn } do
+  try
+    try
+      raise Boom(code: 33)
+      return -1
+    catch
+      | Boom(code: c) -> raise Bang(label: "rethrown")
+      | _ -> return -2
+    end
+    return -3
+  catch outer ->
+    return 44
+  end
+  return 0
+end
+
+let body = fn () -> unit throws { Exn } do
+  test_assert.assert_eq_i64(actual: single_bare(), expected: 1, label: "single try_table, bare catch")
+  test_assert.assert_eq_i64(actual: selective(), expected: 22, label: "selective catch — three handlers")
+  test_assert.assert_eq_i64(actual: nested(), expected: 44, label: "nested try_table — outer walks past inner handlers")
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end

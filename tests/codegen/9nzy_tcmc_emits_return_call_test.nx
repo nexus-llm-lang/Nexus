@@ -1,0 +1,131 @@
+// Regression: nexus-9nzy — `detect_tcmc` must classify Let-Call-self +
+// Let-Constructor pairs as TcmcActive so the codegen path emits the
+// in-place list-build TCO loop instead of unbounded recursion.
+//
+// The 9nzy re-enable was reverted within ~1 minute of landing: against
+// current main `detect_tcmc` returns `NoTcmc` unconditionally, which is
+// a safe no-op (the function still compiles as ordinary recursion).
+// Without a fixture, when 9nzy re-lands the only signal is self-host
+// build success — there is no regression test that asserts TCMC actually
+// fires.
+//
+// This is a *pin* test: case 1 below constructs the canonical
+// TCMC-eligible shape (a self-recursive function whose body is two
+// consecutive lets — Call(self, ...) followed by Constructor referencing
+// the call result in a recursive field). Today `detect_tcmc` returns
+// `NoTcmc` for it, and the assertion below pins that current state.
+//
+// When 9nzy re-lands and `detect_tcmc` starts returning `TcmcActive` for
+// the eligible body, this test FAILS — a deliberate signal to flip the
+// case-1 assertion to `is_tcmc_active(...)` (which then becomes the
+// forward regression test that TCMC keeps firing).
+//
+// Case 2 (the empty / non-recursive body) must remain `NoTcmc` in both
+// states; flipping that assertion when 9nzy re-lands would be a bug.
+//
+// Style mirrors `tests/runtime/list_fusion_test.nx` — unit-style call
+// against the LIR pass entry point, no full-compiler driver.
+import * as test_assert from "std:test/assert"
+import { TyI64 } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { LirAtomInt, LirAtomVar, LirExprAtom, LirExprCall, LirExprConstructor,
+         LirCallArg, LirStmt, LirStmtLet } from "src/ir/lir_types.nx"
+import { TcmcCtx, NoTcmc, TcmcActive, detect_tcmc } from "src/backend/codegen/tcmc.nx"
+
+let dummy_span = fn () -> Span do
+  return Span(offset: 0, line: 1, col: 1)
+end
+
+// Eligible body shape — the canonical TCMC pattern:
+//
+//   let r = self(rest: tail)         // recursive Call to func_name
+//   let cons = Cons(v: head, rest: r) // Constructor whose argument list
+//                                      // contains LirAtomVar(name: "r")
+//
+// `find_var_in_atoms` on Cons's args finds "r" at index 1 (the rest
+// field), so `check_tcmc_pair` would return TcmcActive(rest_field_idx=1)
+// once `detect_tcmc` is wired through to it.
+let eligible_body = fn () -> [LirStmt] do
+  return [
+    LirStmtLet(
+      name: "r",
+      typ: TyI64,
+      expr: LirExprCall(
+        func: "self_fn",
+        args: [LirCallArg(label: "rest", value: LirAtomVar(name: "tail", typ: TyI64))],
+        typ: TyI64
+      )
+    ),
+    LirStmtLet(
+      name: "cons",
+      typ: TyI64,
+      expr: LirExprConstructor(
+        name: "Cons",
+        args: [LirAtomVar(name: "head", typ: TyI64), LirAtomVar(name: "r", typ: TyI64)],
+        typ: TyI64
+      )
+    )
+  ]
+end
+
+// Non-eligible body — single Let with an Atom RHS, no Call/Constructor
+// pair. Must always return NoTcmc, regardless of TCMC enable state.
+let non_eligible_body = fn () -> [LirStmt] do
+  return [
+    LirStmtLet(
+      name: "r",
+      typ: TyI64,
+      expr: LirExprAtom(atom: LirAtomInt(val: 0))
+    )
+  ]
+end
+
+let is_tcmc_active = fn (c: TcmcCtx) -> bool do
+  if let TcmcActive(_) = c then return true end
+  return false
+end
+
+let is_no_tcmc = fn (c: TcmcCtx) -> bool do
+  if let NoTcmc = c then return true end
+  return false
+end
+
+let body = fn () -> unit throws { Exn } do
+  // ─── Case 1: eligible shape, current state pin ──────────────────────────
+  // `detect_tcmc` currently returns NoTcmc unconditionally (9nzy reverted).
+  // When 9nzy re-lands this assertion FAILS — flip to is_tcmc_active(c1)
+  // and the test becomes the forward regression check that TCMC still
+  // fires on the canonical Let-Call-self + Let-Constructor shape.
+  let c1 = detect_tcmc(body: eligible_body(), func_name: "self_fn")
+  test_assert.assert_true(
+    cond: is_no_tcmc(c1),
+    label: "9nzy pin: detect_tcmc returns NoTcmc on eligible shape (FLIP TO is_tcmc_active WHEN 9nzy RE-LANDS)"
+  )
+
+  // ─── Case 2: non-eligible shape, invariant in both states ───────────────
+  // No Call(self) + Constructor pair, so this must remain NoTcmc whether
+  // or not 9nzy is enabled. Catches a regression in find_tcmc_in_stmts
+  // that would over-detect (e.g. matching on Call alone without the
+  // following Constructor).
+  let c2 = detect_tcmc(body: non_eligible_body(), func_name: "self_fn")
+  test_assert.assert_true(
+    cond: is_no_tcmc(c2),
+    label: "9nzy invariant: detect_tcmc returns NoTcmc on non-eligible shape"
+  )
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end
