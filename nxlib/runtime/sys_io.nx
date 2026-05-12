@@ -1,0 +1,1052 @@
+/**
+ * runtime/sys_io: console (stdio) + filesystem runtime, ported to Nexus over
+ * raw WASI preview1.
+ *
+ * Phase 6b of nexus-f90i: reimplements the `__nx_print` / `__nx_eprint` /
+ * `__nx_read_line` / `__nx_getchar` (stdio.nx) and `__nx_read_to_string` /
+ * `__nx_write_string` / `__nx_append_string` / `__nx_exists` / `__nx_is_file` /
+ * `__nx_read_dir` / `__nx_create_dir_all` / `__nx_remove_file` / `__nx_fd_*`
+ * (fs.nx) plus `__nx_exit` / `__nx_argv` (proc.nx) FFI surfaces that the
+ * source-less prebuilt `stdlib.wasm` exports, so they can become part of a
+ * Nexus-built thread-safe replacement.
+ *
+ * The implementations only CALL WASI preview1 imports (the host implements
+ * them); see https://github.com/WebAssembly/WASI/blob/main/legacy/preview1.
+ *
+ * ABI note (same as buffer.nx / string.nx): Nexus lays out wasm function params
+ * in alphabetical name order, but external callers (codegen) pass them
+ * positionally in external-decl declaration order (each `string` expanded to
+ * <name>_ptr, <name>_len; a `string` RETURN is the single packed (ptr<<32)|len
+ * i64). So every exported impl function prefixes its params a_, b_, c_, ... in
+ * the order codegen supplies them, and every WASI `external` decl below names
+ * its params a_, b_, ... in the WASI ABI order, so alphabetical == positional
+ * in both directions.
+ *
+ * Storage for returned strings + WASI out-param scratch comes from
+ * `nxlib/runtime/alloc.nx` (the Phase 4 bump allocator). A 256-byte scratch
+ * region is lazily allocated and its pointer cached in linear-memory cell 8
+ * (the [8,16) slice of the bundle's reserved [0,16) range -- the allocator only
+ * touches the i32 at offset 0, so 8..16 is free). Reuse of one scratch region
+ * is fine single-threaded; with wasi-threads concurrent fs/stdio calls would
+ * race it -- an accepted, documented caveat (nexus-f90i route a), the same as
+ * the allocator's reset race.
+ *
+ * Path resolution: WASI path_* ops take a (preopen-dir fd, relative path) pair.
+ * `resolve_path` walks the preopen table (fd 3, 4, 5, ...): a preopen named "."
+ * becomes the cwd fallback; a preopen whose name is a path prefix (e.g. "/tmp")
+ * is matched and the path made relative to it. Paths that match no preopen are
+ * tried relative to the cwd preopen (or fd 3). Limitation: this handles
+ * cwd-relative paths and paths under an explicit `--dir=` preopen; arbitrary
+ * absolute paths with no covering preopen will fail (the host's std::fs in the
+ * old Rust impl did libc preopen-walking which is roughly the same).
+ *
+ * Stubbed (TODO -- later follow-ups):
+ *   __nx_fd_path -> "" (would need a fd -> path table; the compiler never calls
+ *                       Fs.handle_path, so this is unused in practice)
+ * Known gaps:
+ *   - `__nx_buf_write_file` in nxlib/runtime/buffer.nx is STILL stubbed to
+ *     false. ByteBuffer.write_file -> __nx_buf_write_file is how the compiler
+ *     writes its `.wasm` output to disk, so the Nexus-built bundle cannot yet
+ *     compile programs to a file until that stub is replaced (a follow-up can
+ *     reuse `__nx_write_string` here -- the buffer layout is in buffer.nx).
+ *   - create_dir_all only creates the LAST path component (preview1's
+ *     path_create_directory is single-level; the old Rust used std::fs's
+ *     recursive create_dir_all). Parents must already exist.
+ */
+import external "wasi_snapshot_preview1"
+import * as mem from "std:runtime/mem"
+import * as cast from "std:runtime/cast"
+import * as alloc from "nxlib/runtime/alloc.nx"
+
+// === WASI preview1 imports (params named in ABI order) =======================
+
+/// fd_write(fd, iovs_ptr, iovs_len, nwritten_ptr) -> errno. iovec = {buf:i32, buf_len:i32}.
+external w_fd_write = "fd_write" : (a_fd: i32, b_iovs_ptr: i32, c_iovs_len: i32, d_nwritten_ptr: i32) -> i32
+/// fd_read(fd, iovs_ptr, iovs_len, nread_ptr) -> errno.
+external w_fd_read = "fd_read" : (a_fd: i32, b_iovs_ptr: i32, c_iovs_len: i32, d_nread_ptr: i32) -> i32
+/// fd_close(fd) -> errno.
+external w_fd_close = "fd_close" : (a_fd: i32) -> i32
+/// fd_seek(fd, offset:i64, whence:i32, newoffset_ptr) -> errno. whence: 0=SET,1=CUR,2=END.
+external w_fd_seek = "fd_seek" : (a_fd: i32, b_offset: i64, c_whence: i32, d_newoffset_ptr: i32) -> i32
+/// fd_filestat_get(fd, filestat_ptr) -> errno. filestat: 64 bytes; filetype u8 @16, size u64 @32.
+external w_fd_filestat_get = "fd_filestat_get" : (a_fd: i32, b_filestat_ptr: i32) -> i32
+/// path_open(dirfd, dirflags, path_ptr, path_len, oflags, rights_base:i64, rights_inh:i64, fdflags, opened_fd_ptr) -> errno.
+external w_path_open = "path_open" : (a_dirfd: i32, b_dirflags: i32, c_path_ptr: i32, d_path_len: i32, e_oflags: i32, f_rights_base: i64, g_rights_inh: i64, h_fdflags: i32, i_opened_fd_ptr: i32) -> i32
+/// path_filestat_get(dirfd, flags, path_ptr, path_len, filestat_ptr) -> errno.
+external w_path_filestat_get = "path_filestat_get" : (a_dirfd: i32, b_flags: i32, c_path_ptr: i32, d_path_len: i32, e_filestat_ptr: i32) -> i32
+/// path_create_directory(dirfd, path_ptr, path_len) -> errno.
+external w_path_create_directory = "path_create_directory" : (a_dirfd: i32, b_path_ptr: i32, c_path_len: i32) -> i32
+/// path_unlink_file(dirfd, path_ptr, path_len) -> errno.
+external w_path_unlink_file = "path_unlink_file" : (a_dirfd: i32, b_path_ptr: i32, c_path_len: i32) -> i32
+/// fd_readdir(fd, buf_ptr, buf_len, cookie:i64, bufused_ptr) -> errno. dirent header = 24 bytes.
+external w_fd_readdir = "fd_readdir" : (a_fd: i32, b_buf_ptr: i32, c_buf_len: i32, d_cookie: i64, e_bufused_ptr: i32) -> i32
+/// fd_prestat_get(fd, prestat_ptr) -> errno. prestat: tag u8 @0, pr_name_len u32 @4.
+external w_fd_prestat_get = "fd_prestat_get" : (a_fd: i32, b_prestat_ptr: i32) -> i32
+/// fd_prestat_dir_name(fd, path_ptr, path_len) -> errno.
+external w_fd_prestat_dir_name = "fd_prestat_dir_name" : (a_fd: i32, b_path_ptr: i32, c_path_len: i32) -> i32
+/// proc_exit(code) -> unit (does not return -- traps/exits the instance).
+external w_proc_exit = "proc_exit" : (a_code: i32) -> unit
+/// args_sizes_get(argc_ptr, argv_buf_size_ptr) -> errno.
+external w_args_sizes_get = "args_sizes_get" : (a_argc_ptr: i32, b_argv_buf_size_ptr: i32) -> i32
+/// args_get(argv_ptr, argv_buf_ptr) -> errno.
+external w_args_get = "args_get" : (a_argv_ptr: i32, b_argv_buf_ptr: i32) -> i32
+
+// === constants ==============================================================
+
+/// 2^32 -- multiplier to pack a (ptr, len) pair into a returned string i64.
+let two_pow_32 = fn () -> i64 do return 4294967296 end
+
+/// path_open oflags bits.
+let oflag_creat = fn () -> i64 do return 1 end
+let oflag_directory = fn () -> i64 do return 2 end
+let oflag_trunc = fn () -> i64 do return 8 end
+/// fdflags: append.
+let fdflag_append = fn () -> i64 do return 1 end
+/// lookupflags: symlink_follow.
+let lookup_symlink_follow = fn () -> i64 do return 1 end
+/// filetype enum: regular file / directory.
+let filetype_regular_file = fn () -> i64 do return 4 end
+let filetype_directory = fn () -> i64 do return 3 end
+/// fd_seek whence: from start.
+let whence_set = fn () -> i64 do return 0 end
+
+/// Rights requested when opening a regular FILE for reading: fd_read(1<<1),
+/// fd_seek(1<<2), fd_fdstat_set_flags(1<<3), fd_tell(1<<5), fd_advise(1<<7),
+/// path_open(1<<13), path_readlink(1<<15), path_filestat_get(1<<18),
+/// fd_filestat_get(1<<21) = 2 + 4 + 8 + 32 + 128 + 8192 + 32768 + 262144 +
+/// 2097152 = 2402430. Omits all write-ish rights.
+let rights_read = fn () -> i64 do return 2402430 end
+
+/// Rights requested when opening a DIRECTORY (for fd_readdir): just
+/// fd_readdir(1<<14) | fd_filestat_get(1<<21) = 16384 + 2097152 = 2113536.
+/// Requesting a broader set (fd_read, path_*, ...) on a directory makes
+/// wasmtime's path_open return EISDIR (errno 31) -- this minimal set works.
+let rights_dir = fn () -> i64 do return 2113536 end
+
+/// Rights requested for WRITE / append opens: a broad "all 29 rights bits" mask
+/// (path_open intersects with the parent preopen's rights). Used only on file
+/// paths the caller intends to write, so EISDIR-on-write correctly fails.
+let rights_write = fn () -> i64 do return 536870911 end
+
+/// Linear-memory cell holding the (lazily allocated) scratch-region pointer.
+/// Lives in the bundle's reserved [0,16) range at offset 8 (the allocator only
+/// uses the i32 at offset 0). 0 means "not yet allocated".
+let scratch_cell = fn () -> i64 do return 8 end
+
+/// Scratch region size (bytes). Holds (at fixed offsets) an iovec, an
+/// nwritten/nread i32, a seek out-param, args sizes, a (dirfd, rel_ptr, rel_len)
+/// triple, an opened-fd i32, a prestat, a preopen dir-name buffer, a 64-byte
+/// filestat, and the fd_readdir running state. 512 is comfortable.
+let scratch_size = fn () -> i64 do return 512 end
+
+// --- fixed scratch-region slot offsets (all relative to scratch()) ---
+let sl_iovec = fn () -> i64 do return 0 end       // iovec {buf:i32, len:i32}, 8 bytes
+let sl_nrw = fn () -> i64 do return 8 end         // fd_read/fd_write n out (i32)
+let sl_seek = fn () -> i64 do return 16 end       // fd_seek newoffset out (i64)
+let sl_argc = fn () -> i64 do return 24 end       // args_sizes_get argc out (i32)
+let sl_argbufsz = fn () -> i64 do return 28 end   // args_sizes_get bufsize out (i32)
+let sl_triple = fn () -> i64 do return 32 end     // resolve_path out: dirfd(8), rel_ptr(8), rel_len(8) -> 32..56
+let sl_opened = fn () -> i64 do return 56 end     // path_open opened-fd out (i32)
+let sl_prestat = fn () -> i64 do return 64 end    // fd_prestat_get prestat out (8 bytes)
+let sl_dirname = fn () -> i64 do return 72 end    // fd_prestat_dir_name name buffer (128 bytes) -> 72..200
+let sl_filestat = fn () -> i64 do return 200 end  // filestat (64 bytes) -> 200..264
+let sl_dd_base = fn () -> i64 do return 264 end   // readdir: pairs-array base (i64)
+let sl_dd_cookie = fn () -> i64 do return 272 end // readdir: last d_next cookie (i64)
+let sl_dd_cap = fn () -> i64 do return 280 end    // readdir: pairs-array capacity (i64)
+let sl_dd_used = fn () -> i64 do return 288 end   // readdir: fd_readdir bufused out (i32)
+/// Largest preopen dir-name we accept (the sl_dirname slot is 128 bytes).
+let max_preopen_name = fn () -> i64 do return 128 end
+
+// === low-level helpers ======================================================
+
+let i32of = fn (x: i64) -> i32 do return cast.i32_of(x: x) end
+let i64of = fn (x: i32) -> i64 do return cast.i64_of(x: x) end
+
+/// Allocate `n` bytes; return the byte offset (0 when n <= 0).
+let alloc_bytes = fn (n: i64) -> i64 do
+  if n <= 0 then return 0 end
+  return i64of(x: alloc.allocate(size: i32of(x: n)))
+end
+
+/// Pack a (ptr, len) pair into the string return i64 (0 when len <= 0).
+let pack = fn (ptr: i64, len: i64) -> i64 do
+  if len <= 0 then return 0 end
+  return (ptr * two_pow_32()) + len
+end
+
+/// The (lazily allocated) scratch region pointer.
+let scratch = fn () -> i64 do
+  let cur = mem.load_i64(addr: scratch_cell())
+  if cur != 0 then return cur end
+  let p = alloc_bytes(n: scratch_size())
+  let _ = mem.store_i64(addr: scratch_cell(), val: p)
+  return p
+end
+
+/// Copy `count` bytes from `src` to `dst` (forward; non-overlapping).
+let copy_bytes = fn (dst: i64, src: i64, count: i64) -> unit do return copy_bytes_at(dst, src, count, i: 0) end
+let copy_bytes_at = fn (dst: i64, src: i64, count: i64, i: i64) -> unit do
+  if i >= count then return () end
+  let _ = mem.store_u8(addr: dst + i, val: mem.load_u8(addr: src + i))
+  return copy_bytes_at(dst, src, count, i: i + 1)
+end
+
+/// True iff [pa, pa+n) byte-equals [pb, pb+n).
+let bytes_eq = fn (pa: i64, pb: i64, n: i64) -> bool do return bytes_eq_go(pa, pb, n, i: 0) end
+let bytes_eq_go = fn (pa: i64, pb: i64, n: i64, i: i64) -> bool do
+  if i >= n then return true end
+  if mem.load_u8(addr: pa + i) != mem.load_u8(addr: pb + i) then return false end
+  return bytes_eq_go(pa, pb, n, i: i + 1)
+end
+
+/// Lexicographic byte comparison of [pa, pa+la) vs [pb, pb+lb): <0, 0, >0.
+let bytes_cmp = fn (pa: i64, la: i64, pb: i64, lb: i64) -> i64 do return bytes_cmp_go(pa, la, pb, lb, i: 0) end
+let bytes_cmp_go = fn (pa: i64, la: i64, pb: i64, lb: i64, i: i64) -> i64 do
+  if i >= la && i >= lb then return 0 end
+  if i >= la then return 0 - 1 end
+  if i >= lb then return 1 end
+  let a = mem.load_u8(addr: pa + i)
+  let b = mem.load_u8(addr: pb + i)
+  if a < b then return 0 - 1 end
+  if a > b then return 1 end
+  return bytes_cmp_go(pa, la, pb, lb, i: i + 1)
+end
+
+/// Copy [src, src+len) into a fresh allocation; return packed (ptr<<32)|len.
+let make_string = fn (src: i64, len: i64) -> i64 do
+  if len <= 0 then return 0 end
+  let p = alloc_bytes(n: len)
+  let _ = copy_bytes(dst: p, src, count: len)
+  return pack(ptr: p, len)
+end
+
+// === path resolution ========================================================
+
+/// Strip a leading "./" (repeatedly) from [ptr, ptr+len); return the new len
+/// via subtraction and the new ptr via... -- returns the new ptr; the new len
+/// is `len - (returned_ptr - ptr)`. Also collapses a leading "/" run? No -- only
+/// "./" (the common form `./src/foo.nx`).
+let strip_dot_slash = fn (ptr: i64, len: i64) -> i64 do
+  if len >= 2 && mem.load_u8(addr: ptr) == 46 && mem.load_u8(addr: ptr + 1) == 47 then
+    return strip_dot_slash(ptr: ptr + 2, len: len - 2)
+  end
+  return ptr
+end
+
+/// Returns true iff [path, path+plen) starts with [pre, pre+prelen) followed by
+/// either end-of-string or a '/'.
+let path_has_prefix = fn (path: i64, plen: i64, pre: i64, prelen: i64) -> bool do
+  if prelen > plen then return false end
+  if !bytes_eq(pa: path, pb: pre, n: prelen) then return false end
+  if prelen == plen then return true end
+  return mem.load_u8(addr: path + prelen) == 47
+end
+
+/// Resolve a path to a (preopen dirfd, relative ptr, relative len) triple,
+/// written as three i64 words into `out` (out+0=dirfd, out+8=rel_ptr,
+/// out+16=rel_len). Walks preopens fd 3.. : preopen "." -> cwd fallback;
+/// a preopen whose name is a path prefix (e.g. "/tmp") -> matched, path made
+/// relative. Falls back to the cwd preopen (or fd 3) with the (dot-slash-
+/// stripped) path as-is. Callers pass `out = scratch() + sl_triple()` and read
+/// the dirfd/rel_ptr/rel_len back from there, then issue the WASI path_* call
+/// before any other scratch use.
+let resolve_path = fn (path_ptr: i64, path_len: i64, out: i64) -> unit do
+  let p2 = strip_dot_slash(ptr: path_ptr, len: path_len)
+  let l2 = path_len - (p2 - path_ptr)
+  // Default: fd 3 (the conventional cwd preopen under wasmtime --dir=.), whole path.
+  let _ = mem.store_i64(addr: out, val: 3)
+  let _ = mem.store_i64(addr: out + 8, val: p2)
+  let _ = mem.store_i64(addr: out + 16, val: l2)
+  return resolve_walk(path_ptr: p2, path_len: l2, fd: 3, out)
+end
+
+let resolve_walk = fn (path_ptr: i64, path_len: i64, fd: i64, out: i64) -> unit do
+  let s = scratch()
+  let pre = s + sl_prestat()
+  let nm = s + sl_dirname()
+  if w_fd_prestat_get(a_fd: i32of(x: fd), b_prestat_ptr: i32of(x: pre)) != i32of(x: 0) then return () end
+  // prestat tag (u8 @0) must be 0 (a directory preopen); name length is u32 @4.
+  if mem.load_u8(addr: pre) != 0 then return resolve_walk(path_ptr, path_len, fd: fd + 1, out) end
+  let nlen = mem.load_i32(addr: pre + 4)
+  if nlen <= 0 || nlen > max_preopen_name() then return resolve_walk(path_ptr, path_len, fd: fd + 1, out) end
+  if w_fd_prestat_dir_name(a_fd: i32of(x: fd), b_path_ptr: i32of(x: nm), c_path_len: i32of(x: nlen)) != i32of(x: 0) then
+    return resolve_walk(path_ptr, path_len, fd: fd + 1, out)
+  end
+  // preopen named "." -> a cwd preopen: record it (overrides the fd-3 default),
+  // but keep walking in case a more-specific named preopen also matches.
+  if nlen == 1 && mem.load_u8(addr: nm) == 46 then
+    let _ = mem.store_i64(addr: out, val: fd)
+    let _ = mem.store_i64(addr: out + 8, val: path_ptr)
+    let _ = mem.store_i64(addr: out + 16, val: path_len)
+    return resolve_walk(path_ptr, path_len, fd: fd + 1, out)
+  end
+  // preopen name is a path prefix -> match: open relative to this dir.
+  if path_has_prefix(path: path_ptr, plen: path_len, pre: nm, prelen: nlen) then
+    let _ = mem.store_i64(addr: out, val: fd)
+    if nlen == path_len then
+      // path == preopen name: relative path is ".". Reuse the dir-name slot
+      // (now consumed) to hold a single '.' byte and point at it.
+      let _ = mem.store_u8(addr: nm, val: 46)
+      let _ = mem.store_i64(addr: out + 8, val: nm)
+      let _ = mem.store_i64(addr: out + 16, val: 1)
+    else
+      // skip the prefix and the following '/'
+      let _ = mem.store_i64(addr: out + 8, val: path_ptr + nlen + 1)
+      let _ = mem.store_i64(addr: out + 16, val: path_len - nlen - 1)
+    end
+    return ()
+  end
+  return resolve_walk(path_ptr, path_len, fd: fd + 1, out)
+end
+
+/// Open `path` (resolving preopens) with the given oflags/fdflags/rights.
+/// Returns the opened fd (>= 0) on success, or -1 on any failure. (`rights` is
+/// the fs_rights_base/_inheriting bitmask; use rights_read() for read/dir opens
+/// -- requesting write rights on a directory makes path_open return EISDIR.)
+let open_path_rights = fn (path_ptr: i64, path_len: i64, oflags: i64, fdflags: i64, rights: i64) -> i64 do
+  if path_len <= 0 then return 0 - 1 end
+  let s = scratch()
+  let triple = s + sl_triple()
+  let _ = resolve_path(path_ptr, path_len, out: triple)
+  let dirfd = mem.load_i64(addr: triple)
+  let rp = mem.load_i64(addr: triple + 8)
+  let rl = mem.load_i64(addr: triple + 16)
+  if rl <= 0 then return 0 - 1 end
+  let opened = s + sl_opened()
+  let errno = w_path_open(a_dirfd: i32of(x: dirfd),
+                          b_dirflags: i32of(x: lookup_symlink_follow()),
+                          c_path_ptr: i32of(x: rp), d_path_len: i32of(x: rl),
+                          e_oflags: i32of(x: oflags),
+                          f_rights_base: rights, g_rights_inh: rights,
+                          h_fdflags: i32of(x: fdflags),
+                          i_opened_fd_ptr: i32of(x: opened))
+  if errno != i32of(x: 0) then return 0 - 1 end
+  return mem.load_i32(addr: opened)
+end
+
+/// Open `path` for reading (read rights, no oflags/fdflags).
+let open_path_read = fn (path_ptr: i64, path_len: i64) -> i64 do
+  return open_path_rights(path_ptr, path_len, oflags: 0, fdflags: 0, rights: rights_read())
+end
+
+/// Open `path` create+trunc for writing (broad write rights).
+let open_path_write = fn (path_ptr: i64, path_len: i64) -> i64 do
+  return open_path_rights(path_ptr, path_len, oflags: oflag_creat() | oflag_trunc(), fdflags: 0, rights: rights_write())
+end
+
+/// Open `path` create+append for writing (broad write rights, append fdflag).
+let open_path_append = fn (path_ptr: i64, path_len: i64) -> i64 do
+  return open_path_rights(path_ptr, path_len, oflags: oflag_creat(), fdflags: fdflag_append(), rights: rights_write())
+end
+
+/// The filestat scratch slot (64 bytes): filetype is u8 at +16, size is u64 at +32.
+let filestat_slot = fn () -> i64 do return scratch() + sl_filestat() end
+
+/// path_filestat_get(path) into the filestat slot; returns errno (0 == ok).
+let do_path_filestat = fn (path_ptr: i64, path_len: i64) -> i64 do
+  if path_len <= 0 then return 0 - 1 end
+  let s = scratch()
+  let triple = s + sl_triple()
+  let _ = resolve_path(path_ptr, path_len, out: triple)
+  let dirfd = mem.load_i64(addr: triple)
+  let rp = mem.load_i64(addr: triple + 8)
+  let rl = mem.load_i64(addr: triple + 16)
+  if rl <= 0 then return 0 - 1 end
+  let errno = w_path_filestat_get(a_dirfd: i32of(x: dirfd), b_flags: i32of(x: lookup_symlink_follow()),
+                                  c_path_ptr: i32of(x: rp), d_path_len: i32of(x: rl),
+                                  e_filestat_ptr: i32of(x: filestat_slot()))
+  return i64of(x: errno)
+end
+
+// === fd read/write primitives ===============================================
+
+/// Write all `len` bytes at `buf` to `fd` via repeated fd_write. Returns true
+/// iff every byte went out.
+let write_all = fn (fd: i64, buf: i64, len: i64) -> bool do
+  if len <= 0 then return true end
+  let s = scratch()
+  let iov = s + sl_iovec()
+  let nw = s + sl_nrw()
+  let _ = mem.store_i32(addr: iov, val: buf)
+  let _ = mem.store_i32(addr: iov + 4, val: len)
+  let errno = w_fd_write(a_fd: i32of(x: fd), b_iovs_ptr: i32of(x: iov), c_iovs_len: i32of(x: 1), d_nwritten_ptr: i32of(x: nw))
+  if errno != i32of(x: 0) then return false end
+  let n = mem.load_i32(addr: nw)
+  if n <= 0 then return false end
+  if n >= len then return true end
+  return write_all(fd, buf: buf + n, len: len - n)
+end
+
+/// Read up to `lim` bytes from `fd` into `buf` via repeated fd_read until EOF
+/// or `lim` reached. Returns the total byte count read (>= 0), or -1 on error.
+let read_fill = fn (fd: i64, buf: i64, lim: i64) -> i64 do return read_fill_go(fd, buf, lim, total: 0) end
+let read_fill_go = fn (fd: i64, buf: i64, lim: i64, total: i64) -> i64 do
+  if total >= lim then return total end
+  let s = scratch()
+  let iov = s + sl_iovec()
+  let nr = s + sl_nrw()
+  let _ = mem.store_i32(addr: iov, val: buf + total)
+  let _ = mem.store_i32(addr: iov + 4, val: lim - total)
+  let errno = w_fd_read(a_fd: i32of(x: fd), b_iovs_ptr: i32of(x: iov), c_iovs_len: i32of(x: 1), d_nread_ptr: i32of(x: nr))
+  if errno != i32of(x: 0) then
+    if total > 0 then return total end
+    return 0 - 1
+  end
+  let n = mem.load_i32(addr: nr)
+  if n <= 0 then return total end
+  return read_fill_go(fd, buf, lim, total: total + n)
+end
+
+/// Read the entire file at `fd` (seeks to 0 first), returning a packed string.
+/// Uses fd_filestat_get to size the allocation; for a 0/unknown size it falls
+/// back to a 1 MiB buffer (compiler source files are far smaller).
+let read_whole_fd = fn (fd: i64) -> i64 do
+  let s = scratch()
+  let _ = w_fd_seek(a_fd: i32of(x: fd), b_offset: 0, c_whence: i32of(x: whence_set()), d_newoffset_ptr: i32of(x: s + sl_seek()))
+  let st = filestat_slot()
+  let have_stat = w_fd_filestat_get(a_fd: i32of(x: fd), b_filestat_ptr: i32of(x: st)) == i32of(x: 0)
+  let sz = if have_stat then mem.load_i64(addr: st + 32) else 0 end
+  if sz == 0 then
+    let fb = alloc_bytes(n: 1048576)
+    let g0 = read_fill(fd, buf: fb, lim: 1048576)
+    if g0 <= 0 then return 0 end
+    return pack(ptr: fb, len: g0)
+  end
+  let buf = alloc_bytes(n: sz)
+  let got = read_fill(fd, buf, lim: sz)
+  if got <= 0 then return 0 end
+  return pack(ptr: buf, len: got)
+end
+
+// === exported: console (stdio.nx) ===========================================
+
+/// __nx_print(s): write s's bytes verbatim to fd 1. wasm sig (i32 i32) -> ().
+export let __nx_print = fn (a_s_ptr: i32, b_s_len: i32) -> unit do
+  let _ = write_all(fd: 1, buf: i64of(x: a_s_ptr), len: i64of(x: b_s_len))
+  return ()
+end
+
+/// __nx_eprint(s): write s's bytes verbatim to fd 2. wasm sig (i32 i32) -> ().
+export let __nx_eprint = fn (a_s_ptr: i32, b_s_len: i32) -> unit do
+  let _ = write_all(fd: 2, buf: i64of(x: a_s_ptr), len: i64of(x: b_s_len))
+  return ()
+end
+
+/// __nx_getchar(): read one UTF-8 char from fd 0; return it as a packed string
+/// (0 == empty string on EOF/error). Reads the lead byte, then the continuation
+/// bytes its top bits imply (1..4 total). wasm sig () -> i64 (string).
+export let __nx_getchar = fn () -> i64 do
+  let buf = alloc_bytes(n: 4)
+  let n0 = read_n_exact(fd: 0, buf, off: 0, n: 1)
+  if n0 < 1 then return 0 end
+  let b0 = mem.load_u8(addr: buf)
+  let width = if b0 < 128 then 1 else if b0 < 224 then 2 else if b0 < 240 then 3 else 4 end
+  if width == 1 then return pack(ptr: buf, len: 1) end
+  let _ = read_n_exact(fd: 0, buf, off: 1, n: width - 1)
+  return pack(ptr: buf, len: width)
+end
+
+/// Read exactly `n` bytes from `fd` into `buf+off` (best effort -- loops on
+/// short reads). Returns the number actually read (< n on EOF/error).
+let read_n_exact = fn (fd: i64, buf: i64, off: i64, n: i64) -> i64 do
+  if n <= 0 then return 0 end
+  let s = scratch()
+  let iov = s + sl_iovec()
+  let nr = s + sl_nrw()
+  let _ = mem.store_i32(addr: iov, val: buf + off)
+  let _ = mem.store_i32(addr: iov + 4, val: n)
+  let errno = w_fd_read(a_fd: i32of(x: fd), b_iovs_ptr: i32of(x: iov), c_iovs_len: i32of(x: 1), d_nread_ptr: i32of(x: nr))
+  if errno != i32of(x: 0) then return 0 end
+  let got = mem.load_i32(addr: nr)
+  if got <= 0 then return 0 end
+  if got >= n then return n end
+  return got + read_n_exact(fd, buf, off: off + got, n: n - got)
+end
+
+/// __nx_read_line(): read fd 0 until '\n' or EOF; strip a trailing "\r\n" /
+/// "\n"; return the line as a packed string. On immediate EOF (no bytes at all)
+/// returns 0 (empty), matching the old Rust's Ok(0) -> empty. wasm sig () -> i64.
+export let __nx_read_line = fn () -> i64 do
+  let cap0 = 256
+  let buf = alloc_bytes(n: cap0)
+  return read_line_go(buf, lim: cap0, len: 0)
+end
+
+/// Read one more byte from fd 0; append to buf; stop on '\n' or EOF. Growth
+/// allocates a fresh 2x buffer and copies (bump-allocator leak, fine).
+let read_line_go = fn (buf: i64, lim: i64, len: i64) -> i64 do
+  if len >= lim then
+    let ncap = lim * 2
+    let nbuf = alloc_bytes(n: ncap)
+    let _ = copy_bytes(dst: nbuf, src: buf, count: len)
+    return read_line_go(buf: nbuf, lim: ncap, len)
+  end
+  let s = scratch()
+  let iov = s + sl_iovec()
+  let nr = s + sl_nrw()
+  let _ = mem.store_i32(addr: iov, val: buf + len)
+  let _ = mem.store_i32(addr: iov + 4, val: 1)
+  let errno = w_fd_read(a_fd: i32of(x: 0), b_iovs_ptr: i32of(x: iov), c_iovs_len: i32of(x: 1), d_nread_ptr: i32of(x: nr))
+  if errno != i32of(x: 0) || mem.load_i32(addr: nr) <= 0 then
+    return strip_eol(buf, len)
+  end
+  let b = mem.load_u8(addr: buf + len)
+  if b == 10 then return strip_eol(buf, len: len + 1) end
+  return read_line_go(buf, lim, len: len + 1)
+end
+
+/// Trim a trailing "\n" then a trailing "\r" from [buf, buf+len); pack.
+let strip_eol = fn (buf: i64, len: i64) -> i64 do
+  let l1 = if len > 0 && mem.load_u8(addr: buf + len - 1) == 10 then len - 1 else len end
+  let l2 = if l1 > 0 && mem.load_u8(addr: buf + l1 - 1) == 13 then l1 - 1 else l1 end
+  return pack(ptr: buf, len: l2)
+end
+
+// === exported: process (proc.nx) ============================================
+
+/// __nx_exit(code): terminate the instance. proc_exit does not return; the
+/// `return ()` after is dead (Nexus has no `unreachable`). wasm sig (i64) -> ().
+export let __nx_exit = fn (a_status: i64) -> unit do
+  let _ = w_proc_exit(a_code: i32of(x: a_status))
+  return ()
+end
+
+/// __nx_argv(): the program arguments joined with '\n' (arg0 = program name),
+/// as a packed string -- the form proc.nx splits on. The WASI argv buffer is
+/// already NUL-separated, so we just replace the NUL terminators with '\n' and
+/// drop the trailing one (result len == argv_buf_size - 1). wasm sig () -> i64.
+export let __nx_argv = fn () -> i64 do
+  let s = scratch()
+  let argc_p = s + sl_argc()
+  let bufsz_p = s + sl_argbufsz()
+  if w_args_sizes_get(a_argc_ptr: i32of(x: argc_p), b_argv_buf_size_ptr: i32of(x: bufsz_p)) != i32of(x: 0) then return 0 end
+  let argc = mem.load_i32(addr: argc_p)
+  let bufsz = mem.load_i32(addr: bufsz_p)
+  if argc <= 0 || bufsz <= 1 then return 0 end
+  let ptrs = alloc_bytes(n: argc * 4)
+  let abuf = alloc_bytes(n: bufsz)
+  if w_args_get(a_argv_ptr: i32of(x: ptrs), b_argv_buf_ptr: i32of(x: abuf)) != i32of(x: 0) then return 0 end
+  let _ = nul_to_nl(p: abuf, n: bufsz, i: 0)
+  return pack(ptr: abuf, len: bufsz - 1)
+end
+
+let nul_to_nl = fn (p: i64, n: i64, i: i64) -> unit do
+  if i >= n then return () end
+  if mem.load_u8(addr: p + i) == 0 then let _ = mem.store_u8(addr: p + i, val: 10) end
+  return nul_to_nl(p, n, i: i + 1)
+end
+
+// === exported: filesystem -- path ops (fs.nx) ===============================
+
+/// __nx_exists(path): true iff path_filestat_get succeeds. wasm sig (i32 i32) -> i32 (bool).
+export let __nx_exists = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
+  return do_path_filestat(path_ptr: i64of(x: a_path_ptr), path_len: i64of(x: b_path_len)) == 0
+end
+
+/// __nx_is_file(path): true iff path exists and its filetype is regular_file.
+/// wasm sig (i32 i32) -> i32 (bool).
+export let __nx_is_file = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
+  if do_path_filestat(path_ptr: i64of(x: a_path_ptr), path_len: i64of(x: b_path_len)) != 0 then return false end
+  return mem.load_u8(addr: filestat_slot() + 16) == filetype_regular_file()
+end
+
+/// __nx_read_to_string(path): open for read, read whole file, close. Returns a
+/// packed string (0 on any failure -- the .nx wrapper gates with __nx_exists).
+/// wasm sig (i32 i32) -> i64 (string).
+export let __nx_read_to_string = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  let fd = open_path_read(path_ptr: i64of(x: a_path_ptr), path_len: i64of(x: b_path_len))
+  if fd < 0 then return 0 end
+  let r = read_whole_fd(fd)
+  let _ = w_fd_close(a_fd: i32of(x: fd))
+  return r
+end
+
+/// __nx_write_string(path, content): open create+trunc, write content, close.
+/// Returns 1 on success / 0 on failure. wasm sig (i32 i32 i32 i32) -> i32 (bool).
+export let __nx_write_string = fn (a_path_ptr: i32, b_path_len: i32, c_content_ptr: i32, d_content_len: i32) -> bool do
+  let fd = open_path_write(path_ptr: i64of(x: a_path_ptr), path_len: i64of(x: b_path_len))
+  if fd < 0 then return false end
+  let ok = write_all(fd, buf: i64of(x: c_content_ptr), len: i64of(x: d_content_len))
+  let _ = w_fd_close(a_fd: i32of(x: fd))
+  return ok
+end
+
+/// __nx_append_string(path, content): open create+append, write content, close.
+/// Returns 1 on success / 0 on failure. wasm sig (i32 i32 i32 i32) -> i32 (bool).
+export let __nx_append_string = fn (a_path_ptr: i32, b_path_len: i32, c_content_ptr: i32, d_content_len: i32) -> bool do
+  let fd = open_path_append(path_ptr: i64of(x: a_path_ptr), path_len: i64of(x: b_path_len))
+  if fd < 0 then return false end
+  let ok = write_all(fd, buf: i64of(x: c_content_ptr), len: i64of(x: d_content_len))
+  let _ = w_fd_close(a_fd: i32of(x: fd))
+  return ok
+end
+
+/// __nx_remove_file(path): path_unlink_file. Returns 1/0. wasm sig (i32 i32) -> i32 (bool).
+export let __nx_remove_file = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
+  let pp = i64of(x: a_path_ptr)
+  let pl = i64of(x: b_path_len)
+  if pl <= 0 then return false end
+  let s = scratch()
+  let triple = s + sl_triple()
+  let _ = resolve_path(path_ptr: pp, path_len: pl, out: triple)
+  let dirfd = mem.load_i64(addr: triple)
+  let rp = mem.load_i64(addr: triple + 8)
+  let rl = mem.load_i64(addr: triple + 16)
+  if rl <= 0 then return false end
+  return w_path_unlink_file(a_dirfd: i32of(x: dirfd), b_path_ptr: i32of(x: rp), c_path_len: i32of(x: rl)) == i32of(x: 0)
+end
+
+/// __nx_create_dir_all(path): path_create_directory of the LAST component only
+/// (preview1 has no recursive mkdir; parents must already exist -- documented
+/// limitation). Returns 1 on success (or if it already exists as a dir) / 0
+/// else. wasm sig (i32 i32) -> i32 (bool).
+export let __nx_create_dir_all = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
+  let pp = i64of(x: a_path_ptr)
+  let pl = i64of(x: b_path_len)
+  if pl <= 0 then return false end
+  if do_path_filestat(path_ptr: pp, path_len: pl) == 0 then
+    return mem.load_u8(addr: filestat_slot() + 16) == filetype_directory()
+  end
+  let s = scratch()
+  let triple = s + sl_triple()
+  let _ = resolve_path(path_ptr: pp, path_len: pl, out: triple)
+  let dirfd = mem.load_i64(addr: triple)
+  let rp = mem.load_i64(addr: triple + 8)
+  let rl = mem.load_i64(addr: triple + 16)
+  if rl <= 0 then return false end
+  return w_path_create_directory(a_dirfd: i32of(x: dirfd), b_path_ptr: i32of(x: rp), c_path_len: i32of(x: rl)) == i32of(x: 0)
+end
+
+/// __nx_read_dir(path): list directory entry names, sorted (byte order), joined
+/// with '\n' (matching the old Rust, which sorts and omits "." / ".."). When the
+/// path resolves to a preopen directory itself (relative part == "."), fd_readdir
+/// runs directly on the preopen fd (which must NOT be closed); otherwise the dir
+/// is path_open'd (oflags=directory, READ rights -- write rights would make
+/// path_open return EISDIR) and closed afterward. The fd_readdir loop accumulates
+/// (name_ptr, name_len) pairs in a growable array (the running base/cap live in
+/// scratch's readdir slots because the array may be reallocated mid-loop), then
+/// the names are sorted and concatenated. wasm sig (i32 i32) -> i64 (string).
+export let __nx_read_dir = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  let pp = i64of(x: a_path_ptr)
+  let pl = i64of(x: b_path_len)
+  if pl <= 0 then return 0 end
+  let s = scratch()
+  let triple = s + sl_triple()
+  let _ = resolve_path(path_ptr: pp, path_len: pl, out: triple)
+  let dirfd = mem.load_i64(addr: triple)
+  let rp = mem.load_i64(addr: triple + 8)
+  let rl = mem.load_i64(addr: triple + 16)
+  if rl <= 0 then return 0 end
+  let is_preopen = rl == 1 && mem.load_u8(addr: rp) == 46
+  let fd = if is_preopen then dirfd else
+    w_path_open_dir(dirfd, rp, rl) end
+  if fd < 0 then return 0 end
+  let cap0 = 32
+  let pairs0 = alloc_bytes(n: cap0 * 16)
+  let _ = mem.store_i64(addr: s + sl_dd_base(), val: pairs0)
+  let _ = mem.store_i64(addr: s + sl_dd_cap(), val: cap0)
+  let n = readdir_loop(fd, cookie: 0, count: 0)
+  let _ = if is_preopen then i32of(x: 0) else w_fd_close(a_fd: i32of(x: fd)) end
+  if n <= 0 then return 0 end
+  let pairs = mem.load_i64(addr: s + sl_dd_base())
+  let _ = sort_pairs(pairs, count: n)
+  let total = sum_lens(pairs, count: n, i: 0, acc: 0) + (n - 1)
+  if total <= 0 then return 0 end
+  let outp = alloc_bytes(n: total)
+  let _ = join_pairs(pairs, count: n, i: 0, dst: outp, off: 0)
+  return pack(ptr: outp, len: total)
+end
+
+/// path_open a relative subdir (oflags=directory, READ rights). Returns the fd
+/// (>= 0) or -1. The (dirfd, rel_ptr, rel_len) come from a prior resolve_path
+/// into the triple slot; rel must still be valid in memory.
+let w_path_open_dir = fn (dirfd: i64, rel_ptr: i64, rel_len: i64) -> i64 do
+  let opened = scratch() + sl_opened()
+  let errno = w_path_open(a_dirfd: i32of(x: dirfd),
+                          b_dirflags: i32of(x: lookup_symlink_follow()),
+                          c_path_ptr: i32of(x: rel_ptr), d_path_len: i32of(x: rel_len),
+                          e_oflags: i32of(x: oflag_directory()),
+                          f_rights_base: rights_dir(), g_rights_inh: rights_dir(),
+                          h_fdflags: i32of(x: 0),
+                          i_opened_fd_ptr: i32of(x: opened))
+  if errno != i32of(x: 0) then return 0 - 1 end
+  return mem.load_i32(addr: opened)
+end
+
+/// fd_readdir into a 4 KiB buffer; parse_dirents each round; loop while the
+/// buffer came back full and the cookie advanced. Reads/updates the running
+/// pairs base/cap in scratch's sl_dd_* slots. Returns the final entry count.
+let readdir_loop = fn (fd: i64, cookie: i64, count: i64) -> i64 do
+  let bufcap = 4096
+  let dbuf = alloc_bytes(n: bufcap)
+  let s = scratch()
+  let used_p = s + sl_dd_used()
+  if w_fd_readdir(a_fd: i32of(x: fd), b_buf_ptr: i32of(x: dbuf), c_buf_len: i32of(x: bufcap), d_cookie: cookie, e_bufused_ptr: i32of(x: used_p)) != i32of(x: 0) then
+    return count
+  end
+  let used = mem.load_i32(addr: used_p)
+  let _ = mem.store_i64(addr: s + sl_dd_cookie(), val: cookie)
+  let r = parse_dirents(dbuf, used, off: 0, count)
+  let last_cookie = mem.load_i64(addr: s + sl_dd_cookie())
+  if used >= bufcap && last_cookie != cookie then
+    return readdir_loop(fd, cookie: last_cookie, count: r)
+  end
+  return r
+end
+
+/// Parse dirent records from [dbuf+off, dbuf+used). Each dirent: d_next u64 @0,
+/// d_ino u64 @8, d_namlen u32 @16, d_type u8 @20 (24-byte header), then namlen
+/// name bytes. For each non-"."/non-".." name, copy it to a fresh allocation and
+/// push (ptr, len) to the pairs array (growing it via sl_dd_base/sl_dd_cap).
+/// Updates sl_dd_cookie to the last record's d_next. Returns the resulting count.
+let parse_dirents = fn (dbuf: i64, used: i64, off: i64, count: i64) -> i64 do
+  if off + 24 > used then return count end
+  let namlen = mem.load_i32(addr: dbuf + off + 16)
+  let name_off = off + 24
+  if name_off + namlen > used then return count end
+  let s = scratch()
+  let next_cookie = mem.load_i64(addr: dbuf + off)
+  let _ = mem.store_i64(addr: s + sl_dd_cookie(), val: next_cookie)
+  let name_ptr = dbuf + name_off
+  if is_dot_or_dotdot(p: name_ptr, n: namlen) then
+    return parse_dirents(dbuf, used, off: name_off + namlen, count)
+  end
+  let owned = alloc_bytes(n: namlen)
+  let _ = copy_bytes(dst: owned, src: name_ptr, count: namlen)
+  let base = mem.load_i64(addr: s + sl_dd_base())
+  let lim = mem.load_i64(addr: s + sl_dd_cap())
+  if count >= lim then
+    let ncap = if lim * 2 > count + 1 then lim * 2 else count + 1 end
+    let nbase = alloc_bytes(n: ncap * 16)
+    let _ = copy_bytes(dst: nbase, src: base, count: lim * 16)
+    let _ = mem.store_i64(addr: s + sl_dd_base(), val: nbase)
+    let _ = mem.store_i64(addr: s + sl_dd_cap(), val: ncap)
+    let _ = mem.store_i64(addr: nbase + count * 16, val: owned)
+    let _ = mem.store_i64(addr: nbase + count * 16 + 8, val: namlen)
+    return parse_dirents(dbuf, used, off: name_off + namlen, count: count + 1)
+  end
+  let _ = mem.store_i64(addr: base + count * 16, val: owned)
+  let _ = mem.store_i64(addr: base + count * 16 + 8, val: namlen)
+  return parse_dirents(dbuf, used, off: name_off + namlen, count: count + 1)
+end
+
+let is_dot_or_dotdot = fn (p: i64, n: i64) -> bool do
+  if n == 1 then return mem.load_u8(addr: p) == 46 end
+  if n == 2 then return mem.load_u8(addr: p) == 46 && mem.load_u8(addr: p + 1) == 46 end
+  return false
+end
+
+/// Insertion sort the (ptr,len) pairs array in place by byte order of the names.
+let sort_pairs = fn (pairs: i64, count: i64) -> unit do return sort_outer(pairs, count, i: 1) end
+let sort_outer = fn (pairs: i64, count: i64, i: i64) -> unit do
+  if i >= count then return () end
+  let _ = sort_inner(pairs, j: i)
+  return sort_outer(pairs, count, i: i + 1)
+end
+let sort_inner = fn (pairs: i64, j: i64) -> unit do
+  if j <= 0 then return () end
+  let prev_p = mem.load_i64(addr: pairs + (j - 1) * 16)
+  let prev_l = mem.load_i64(addr: pairs + (j - 1) * 16 + 8)
+  let cur_p = mem.load_i64(addr: pairs + j * 16)
+  let cur_l = mem.load_i64(addr: pairs + j * 16 + 8)
+  if bytes_cmp(pa: prev_p, la: prev_l, pb: cur_p, lb: cur_l) <= 0 then return () end
+  let _ = mem.store_i64(addr: pairs + (j - 1) * 16, val: cur_p)
+  let _ = mem.store_i64(addr: pairs + (j - 1) * 16 + 8, val: cur_l)
+  let _ = mem.store_i64(addr: pairs + j * 16, val: prev_p)
+  let _ = mem.store_i64(addr: pairs + j * 16 + 8, val: prev_l)
+  return sort_inner(pairs, j: j - 1)
+end
+
+let sum_lens = fn (pairs: i64, count: i64, i: i64, acc: i64) -> i64 do
+  if i >= count then return acc end
+  return sum_lens(pairs, count, i: i + 1, acc: acc + mem.load_i64(addr: pairs + i * 16 + 8))
+end
+
+/// Concatenate the pair names into `dst`, '\n'-separated.
+let join_pairs = fn (pairs: i64, count: i64, i: i64, dst: i64, off: i64) -> unit do
+  if i >= count then return () end
+  let np = mem.load_i64(addr: pairs + i * 16)
+  let nl = mem.load_i64(addr: pairs + i * 16 + 8)
+  let _ = copy_bytes(dst: dst + off, src: np, count: nl)
+  if i + 1 >= count then return () end
+  let _ = mem.store_u8(addr: dst + off + nl, val: 10)
+  return join_pairs(pairs, count, i: i + 1, dst, off: off + nl + 1)
+end
+
+// === exported: filesystem -- fd ops (fs.nx) =================================
+
+/// __nx_fd_open_read(path): open for reading; return the fd (>= 0) or -1.
+/// wasm sig (i32 i32) -> i64.
+export let __nx_fd_open_read = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  return open_path_read(path_ptr: i64of(x: a_path_ptr), path_len: i64of(x: b_path_len))
+end
+
+/// __nx_fd_open_write(path): open create+trunc; return the fd (>= 0) or -1.
+/// wasm sig (i32 i32) -> i64.
+export let __nx_fd_open_write = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  return open_path_write(path_ptr: i64of(x: a_path_ptr), path_len: i64of(x: b_path_len))
+end
+
+/// __nx_fd_open_append(path): open create+append; return the fd (>= 0) or -1.
+/// wasm sig (i32 i32) -> i64.
+export let __nx_fd_open_append = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  return open_path_append(path_ptr: i64of(x: a_path_ptr), path_len: i64of(x: b_path_len))
+end
+
+/// __nx_fd_close(fd): close the fd. Returns 1 on success / 0 on bad fd.
+/// wasm sig (i64) -> i32 (bool).
+export let __nx_fd_close = fn (a_fd: i64) -> bool do
+  if a_fd < 0 then return false end
+  return w_fd_close(a_fd: i32of(x: a_fd)) == i32of(x: 0)
+end
+
+/// __nx_fd_read(fd): read the entire file (seeks to 0 first); return a packed
+/// string (0 on failure). wasm sig (i64) -> i64 (string).
+export let __nx_fd_read = fn (a_fd: i64) -> i64 do
+  if a_fd < 0 then return 0 end
+  return read_whole_fd(fd: a_fd)
+end
+
+/// __nx_fd_write(fd, content): write content's bytes to fd. Returns 1 on
+/// success / 0 on failure. wasm sig (i64 i32 i32) -> i32 (bool).
+export let __nx_fd_write = fn (a_fd: i64, b_content_ptr: i32, c_content_len: i32) -> bool do
+  if a_fd < 0 then return false end
+  return write_all(fd: a_fd, buf: i64of(x: b_content_ptr), len: i64of(x: c_content_len))
+end
+
+/// __nx_fd_path(fd): STUB -- the old Rust returned the path the fd was opened
+/// with; emulating that needs a fd -> path table. The compiler never calls
+/// Fs.handle_path, so this is unused; returns "" (0). TODO(nexus-f90i): add a
+/// fd table here if a consumer ever needs it. wasm sig (i64) -> i64 (string).
+export let __nx_fd_path = fn (a_fd: i64) -> i64 do
+  return 0
+end
+
+// === test functions (return a single i64, checked via wasmtime --invoke) ====
+//
+// Run with: wasmtime --invoke test_xxx /tmp/sys_io.wasm  (with --dir=. --dir=/tmp).
+
+/// Print "hi\n" to stdout and return 0. (Visual check: prints "hi".)
+export let test_print = fn () -> i64 do
+  let p = alloc_bytes(n: 3)
+  let _ = mem.store_u8(addr: p, val: 104)
+  let _ = mem.store_u8(addr: p + 1, val: 105)
+  let _ = mem.store_u8(addr: p + 2, val: 10)
+  let _ = __nx_print(a_s_ptr: i32of(x: p), b_s_len: i32of(x: 3))
+  return 0
+end
+
+/// Write "hello" to /tmp/nxtest_io.txt, read it back, check the bytes.
+/// Returns 1 if the round-trip is exact ("hello", len 5), else 0.
+export let test_writeread = fn () -> i64 do
+  // path "/tmp/nxtest_io.txt" = 18 bytes
+  let path = make_bytes18(b0: 47, b1: 116, b2: 109, b3: 112, b4: 47, b5: 110, b6: 120, b7: 116, b8: 101, b9: 115, b10: 116, b11: 95, b12: 105, b13: 111, b14: 46, b15: 116, b16: 120, b17: 116)
+  let content = make_bytes5(b0: 104, b1: 101, b2: 108, b3: 108, b4: 111) // "hello"
+  let okw = __nx_write_string(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18), c_content_ptr: i32of(x: content), d_content_len: i32of(x: 5))
+  if !okw then return 0 end
+  let r = __nx_read_to_string(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18))
+  let rp = (r / two_pow_32()) & 4294967295
+  let rl = r & 4294967295
+  if rl != 5 then return 0 end
+  let ok = mem.load_u8(addr: rp) == 104 && mem.load_u8(addr: rp + 1) == 101 && mem.load_u8(addr: rp + 2) == 108
+        && mem.load_u8(addr: rp + 3) == 108 && mem.load_u8(addr: rp + 4) == 111
+  return if ok then 1 else 0 end
+end
+
+/// Append " world" to /tmp/nxtest_io.txt (after test_writeread leaves "hello"),
+/// read back -> "hello world" (len 11). Returns 11 if correct, else 0.
+export let test_append = fn () -> i64 do
+  let path = make_bytes18(b0: 47, b1: 116, b2: 109, b3: 112, b4: 47, b5: 110, b6: 120, b7: 116, b8: 101, b9: 115, b10: 116, b11: 95, b12: 105, b13: 111, b14: 46, b15: 116, b16: 120, b17: 116)
+  let h = make_bytes5(b0: 104, b1: 101, b2: 108, b3: 108, b4: 111)
+  let _ = __nx_write_string(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18), c_content_ptr: i32of(x: h), d_content_len: i32of(x: 5))
+  // " world" = 32 119 111 114 108 100
+  let w = alloc_bytes(n: 6)
+  let _ = mem.store_u8(addr: w, val: 32)
+  let _ = mem.store_u8(addr: w + 1, val: 119)
+  let _ = mem.store_u8(addr: w + 2, val: 111)
+  let _ = mem.store_u8(addr: w + 3, val: 114)
+  let _ = mem.store_u8(addr: w + 4, val: 108)
+  let _ = mem.store_u8(addr: w + 5, val: 100)
+  let oka = __nx_append_string(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18), c_content_ptr: i32of(x: w), d_content_len: i32of(x: 6))
+  if !oka then return 0 end
+  let r = __nx_read_to_string(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18))
+  let rl = r & 4294967295
+  let rp = (r / two_pow_32()) & 4294967295
+  if rl != 11 then return 0 end
+  let ok = mem.load_u8(addr: rp + 5) == 32 && mem.load_u8(addr: rp + 10) == 100
+  return if ok then 11 else 0 end
+end
+
+/// exists("/tmp") == true; exists("/tmp/nx_nonexistent_xyz") == false;
+/// is_file("/tmp") == false. Returns 7 if all three hold, else 0.
+export let test_exists = fn () -> i64 do
+  // "/tmp" = 47 116 109 112
+  let tmp = alloc_bytes(n: 4)
+  let _ = mem.store_u8(addr: tmp, val: 47)
+  let _ = mem.store_u8(addr: tmp + 1, val: 116)
+  let _ = mem.store_u8(addr: tmp + 2, val: 109)
+  let _ = mem.store_u8(addr: tmp + 3, val: 112)
+  let e1 = __nx_exists(a_path_ptr: i32of(x: tmp), b_path_len: i32of(x: 4))
+  let isf = __nx_is_file(a_path_ptr: i32of(x: tmp), b_path_len: i32of(x: 4))
+  // "/tmp/nx_nonexistent_xyz" -- just reuse /tmp + a junk suffix; build 23 bytes
+  let bad = alloc_bytes(n: 23)
+  let _ = copy_bytes(dst: bad, src: tmp, count: 4)
+  let _ = mem.store_u8(addr: bad + 4, val: 47)  // '/'
+  let _ = fill_x(p: bad, off: 5, n: 18)         // 18 'x'
+  let e2 = __nx_exists(a_path_ptr: i32of(x: bad), b_path_len: i32of(x: 23))
+  let ok = e1 && !e2 && !isf
+  return if ok then 7 else 0 end
+end
+
+/// read_dir(".") should include "Cargo.toml"-ish entries... we just check it's
+/// non-empty and sorted. Returns the entry count if the first byte of the first
+/// entry name is <= the first byte of the second (sorted), else 0. Simpler:
+/// just return 1 if read_dir("/tmp") returns a non-empty packed string (it has
+/// our test file), else 0.
+export let test_readdir = fn () -> i64 do
+  let tmp = alloc_bytes(n: 4)
+  let _ = mem.store_u8(addr: tmp, val: 47)
+  let _ = mem.store_u8(addr: tmp + 1, val: 116)
+  let _ = mem.store_u8(addr: tmp + 2, val: 109)
+  let _ = mem.store_u8(addr: tmp + 3, val: 112)
+  let r = __nx_read_dir(a_path_ptr: i32of(x: tmp), b_path_len: i32of(x: 4))
+  let rl = r & 4294967295
+  return if rl > 0 then 1 else 0 end
+end
+
+/// create_dir_all("/tmp/nxd_io") then write two files "b.txt" and "a.txt" in
+/// it, then read_dir -> sorted "a.txt\nb.txt" (len 11). Returns 11 iff the
+/// listing is exactly that (first byte 'a'=97, byte after "a.txt\n" is 'b'=98).
+export let test_dir_create_readdir = fn () -> i64 do
+  // "/tmp/nxd_io" = 11 bytes: 47 116 109 112 47 110 120 100 95 105 111
+  let dir = alloc_bytes(n: 11)
+  let _ = wb11(p: dir, b0: 47, b1: 116, b2: 109, b3: 112, b4: 47, b5: 110, b6: 120, b7: 100, b8: 95, b9: 105, b10: 111)
+  let okd = __nx_create_dir_all(a_path_ptr: i32of(x: dir), b_path_len: i32of(x: 11))
+  if !okd then return 0 end
+  // "/tmp/nxd_io/b.txt" and ".../a.txt" = 17 bytes each
+  let pb = alloc_bytes(n: 17)
+  let _ = copy_bytes(dst: pb, src: dir, count: 11)
+  let _ = mem.store_u8(addr: pb + 11, val: 47)   // '/'
+  let _ = mem.store_u8(addr: pb + 12, val: 98)   // 'b'
+  let _ = mem.store_u8(addr: pb + 13, val: 46)   // '.'
+  let _ = mem.store_u8(addr: pb + 14, val: 116)  // 't'
+  let _ = mem.store_u8(addr: pb + 15, val: 120)  // 'x'
+  let _ = mem.store_u8(addr: pb + 16, val: 116)  // 't'
+  let pa = alloc_bytes(n: 17)
+  let _ = copy_bytes(dst: pa, src: pb, count: 17)
+  let _ = mem.store_u8(addr: pa + 12, val: 97)   // 'a'
+  let c1 = make_bytes5(b0: 49, b1: 50, b2: 51, b3: 52, b4: 53)
+  let _ = __nx_write_string(a_path_ptr: i32of(x: pb), b_path_len: i32of(x: 17), c_content_ptr: i32of(x: c1), d_content_len: i32of(x: 5))
+  let _ = __nx_write_string(a_path_ptr: i32of(x: pa), b_path_len: i32of(x: 17), c_content_ptr: i32of(x: c1), d_content_len: i32of(x: 5))
+  let r = __nx_read_dir(a_path_ptr: i32of(x: dir), b_path_len: i32of(x: 11))
+  let rl = r & 4294967295
+  let rp = (r / two_pow_32()) & 4294967295
+  if rl != 11 then return 0 end
+  let ok = mem.load_u8(addr: rp) == 97 && mem.load_u8(addr: rp + 5) == 10 && mem.load_u8(addr: rp + 6) == 98
+  let _ = __nx_remove_file(a_path_ptr: i32of(x: pa), b_path_len: i32of(x: 17))
+  let _ = __nx_remove_file(a_path_ptr: i32of(x: pb), b_path_len: i32of(x: 17))
+  return if ok then 11 else 0 end
+end
+
+let wb11 = fn (p: i64, b0: i64, b1: i64, b2: i64, b3: i64, b4: i64, b5: i64, b6: i64, b7: i64, b8: i64, b9: i64, b10: i64) -> unit do
+  let _ = mem.store_u8(addr: p, val: b0)
+  let _ = mem.store_u8(addr: p + 1, val: b1)
+  let _ = mem.store_u8(addr: p + 2, val: b2)
+  let _ = mem.store_u8(addr: p + 3, val: b3)
+  let _ = mem.store_u8(addr: p + 4, val: b4)
+  let _ = mem.store_u8(addr: p + 5, val: b5)
+  let _ = mem.store_u8(addr: p + 6, val: b6)
+  let _ = mem.store_u8(addr: p + 7, val: b7)
+  let _ = mem.store_u8(addr: p + 8, val: b8)
+  let _ = mem.store_u8(addr: p + 9, val: b9)
+  return mem.store_u8(addr: p + 10, val: b10)
+end
+
+/// remove_file: write /tmp/nxtest_rm.txt, then remove it, then exists() == false.
+/// Returns 9 on success, else 0.
+export let test_remove = fn () -> i64 do
+  // "/tmp/nxtest_rm.txt" = 18 bytes: 47 116 109 112 47 110 120 116 101 115 116 95 114 109 46 116 120 116
+  let path = make_bytes18(b0: 47, b1: 116, b2: 109, b3: 112, b4: 47, b5: 110, b6: 120, b7: 116, b8: 101, b9: 115, b10: 116, b11: 95, b12: 114, b13: 109, b14: 46, b15: 116, b16: 120, b17: 116)
+  let c = make_bytes5(b0: 120, b1: 121, b2: 122, b3: 119, b4: 118)
+  let _ = __nx_write_string(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18), c_content_ptr: i32of(x: c), d_content_len: i32of(x: 5))
+  let okr = __nx_remove_file(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18))
+  if !okr then return 0 end
+  let still = __nx_exists(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18))
+  return if !still then 9 else 0 end
+end
+
+/// fd ops: open /tmp/nxtest_fd.txt for write, write "abc", close; open for
+/// read, fd_read whole -> "abc", close. Returns 3 if exact, else 0.
+export let test_fd = fn () -> i64 do
+  // "/tmp/nxtest_fd.txt" = 18 bytes
+  let path = make_bytes18(b0: 47, b1: 116, b2: 109, b3: 112, b4: 47, b5: 110, b6: 120, b7: 116, b8: 101, b9: 115, b10: 116, b11: 95, b12: 102, b13: 100, b14: 46, b15: 116, b16: 120, b17: 116)
+  let abc = alloc_bytes(n: 3)
+  let _ = mem.store_u8(addr: abc, val: 97)
+  let _ = mem.store_u8(addr: abc + 1, val: 98)
+  let _ = mem.store_u8(addr: abc + 2, val: 99)
+  let wfd = __nx_fd_open_write(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18))
+  if wfd < 0 then return 0 end
+  let okw = __nx_fd_write(a_fd: wfd, b_content_ptr: i32of(x: abc), c_content_len: i32of(x: 3))
+  let _ = __nx_fd_close(a_fd: wfd)
+  if !okw then return 0 end
+  let rfd = __nx_fd_open_read(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18))
+  if rfd < 0 then return 0 end
+  let r = __nx_fd_read(a_fd: rfd)
+  let _ = __nx_fd_close(a_fd: rfd)
+  let rl = r & 4294967295
+  let rp = (r / two_pow_32()) & 4294967295
+  if rl != 3 then return 0 end
+  let ok = mem.load_u8(addr: rp) == 97 && mem.load_u8(addr: rp + 1) == 98 && mem.load_u8(addr: rp + 2) == 99
+  return if ok then 3 else 0 end
+end
+
+/// argv: returns 1 if __nx_argv() yields a non-empty packed string (the program
+/// name is always arg0 under wasmtime), else 0.
+export let test_argv = fn () -> i64 do
+  let r = __nx_argv()
+  let rl = r & 4294967295
+  return if rl > 0 then 1 else 0 end
+end
+
+// --- byte-builder helpers for tests ---
+
+let fill_x = fn (p: i64, off: i64, n: i64) -> unit do
+  if n <= 0 then return () end
+  let _ = mem.store_u8(addr: p + off, val: 120)
+  return fill_x(p, off: off + 1, n: n - 1)
+end
+
+let make_bytes5 = fn (b0: i64, b1: i64, b2: i64, b3: i64, b4: i64) -> i64 do
+  let p = alloc_bytes(n: 5)
+  let _ = mem.store_u8(addr: p, val: b0)
+  let _ = mem.store_u8(addr: p + 1, val: b1)
+  let _ = mem.store_u8(addr: p + 2, val: b2)
+  let _ = mem.store_u8(addr: p + 3, val: b3)
+  let _ = mem.store_u8(addr: p + 4, val: b4)
+  return p
+end
+
+let make_bytes18 = fn (b0: i64, b1: i64, b2: i64, b3: i64, b4: i64, b5: i64, b6: i64, b7: i64, b8: i64, b9: i64, b10: i64, b11: i64, b12: i64, b13: i64, b14: i64, b15: i64, b16: i64, b17: i64) -> i64 do
+  let p = alloc_bytes(n: 18)
+  let _ = mem.store_u8(addr: p, val: b0)
+  let _ = mem.store_u8(addr: p + 1, val: b1)
+  let _ = mem.store_u8(addr: p + 2, val: b2)
+  let _ = mem.store_u8(addr: p + 3, val: b3)
+  let _ = mem.store_u8(addr: p + 4, val: b4)
+  let _ = mem.store_u8(addr: p + 5, val: b5)
+  let _ = mem.store_u8(addr: p + 6, val: b6)
+  let _ = mem.store_u8(addr: p + 7, val: b7)
+  let _ = mem.store_u8(addr: p + 8, val: b8)
+  let _ = mem.store_u8(addr: p + 9, val: b9)
+  let _ = mem.store_u8(addr: p + 10, val: b10)
+  let _ = mem.store_u8(addr: p + 11, val: b11)
+  let _ = mem.store_u8(addr: p + 12, val: b12)
+  let _ = mem.store_u8(addr: p + 13, val: b13)
+  let _ = mem.store_u8(addr: p + 14, val: b14)
+  let _ = mem.store_u8(addr: p + 15, val: b15)
+  let _ = mem.store_u8(addr: p + 16, val: b16)
+  let _ = mem.store_u8(addr: p + 17, val: b17)
+  return p
+end
+
+export let main = fn () -> unit do return () end
