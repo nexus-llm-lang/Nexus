@@ -101,11 +101,12 @@ tail -c +$((OFFSET + 1)) "$0" | head -c "$SIZE" > "$TMP"
 
 # Compose the wasmtime feature flag set. Both payloads are self-contained
 # core WASM with preview1 imports satisfied by --dir mounts.
-W_FLAGS="max-wasm-stack=${NEXUS_MAX_WASM_STACK:-67108864},tail-call=y,exceptions=y,function-references=y,stack-switching=y"
+W_FLAGS="max-wasm-stack=${NEXUS_MAX_WASM_STACK:-67108864},tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y,shared-memory=y"
 
 # shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS is intentionally word-split.
 exec wasmtime run \
   -W "$W_FLAGS" \
+  -S threads \
   --dir=. --dir="${TMPDIR:-/tmp}" \
   ${NEXUS_WASMTIME_ARGS:-} \
   "$TMP" "$@"

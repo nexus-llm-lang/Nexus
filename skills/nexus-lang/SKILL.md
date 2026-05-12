@@ -86,12 +86,17 @@ let ~x = 10                     // mutable ref, stack-confined
 let v = ~x                      // dereference
 ```
 
-### 5. Lazy evaluation with `@` (parallel execution)
+### 5. Lazy evaluation with `@`
 ```nexus
-let @result = expensive_call(data: input)  // deferred, runs in parallel
+let @result = expensive_call(data: input)  // deferred thunk
 // ... other work ...
-let val = @result                          // force: blocks until ready
+let val = @result                          // force: runs the thunk now (synchronous)
 ```
+A single `@x` force is synchronous. For real parallelism use `std:lazy`'s
+`force_all([@a, @b, ...])` (each thunk runs on its own OS thread, WASI threads;
+results returned in input order) or `std:lazy_host`'s `host_spawn` / `host_join`
+for explicit per-thunk control. Run threaded programs via the bundled `nexus`
+launcher (it passes `-W threads=y,shared-memory=y -S threads` to wasmtime).
 
 ### 6. Explicit `return` required (except unit)
 ```nexus
@@ -185,7 +190,7 @@ end
 | Generic | `Option<T>`, `Result<T, E>` | Explicit type params |
 | Linear | `%T` | Must consume exactly once |
 | Borrow | `&T` | Immutable view |
-| Lazy | `@T` | Deferred thunk, forced with `@x` (parallel) |
+| Lazy | `@T` | Deferred thunk; `@x` forces synchronously, `std:lazy.force_all` / `std:lazy_host` run in parallel |
 | Opaque | `opaque type X = ...` | Hidden constructors |
 
 ## Common Patterns

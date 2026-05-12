@@ -1462,12 +1462,51 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
     m_buf: &dep, m_sec: get_sec(map: &d_secs, sec: 1),
     d_buf: &core_wasm, d_sec: get_sec(map: &m_secs, sec: 1))
 
-  // Section 2: merged imports (dep WASI imports + main non-stdlib imports)
+  // Initial-page count for the merged memory — cover both dep and main static
+  // data; floor at 256 pages (16 MiB). Computed early because the memory is
+  // emitted as an import in section 2 (see below).
+  let d_data_end = find_data_end(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 11))
+  let m_data_end = find_data_end(buf: &core_wasm, sec_pk: get_sec(map: &m_secs, sec: 11))
+  let max_data = if d_data_end > m_data_end then d_data_end else m_data_end end
+  let min_pages = (max_data + 65535) / 65536
+  let dep_pages = if get_sec(map: &d_secs, sec: 5) > 0 then
+    let pk_mem = rd_uleb(buf: &dep, pos: sec_off(pk: get_sec(map: &d_secs, sec: 5)))
+    let pk_min = rd_uleb(buf: &dep, pos: ppos(pk: pk_mem) + 1)
+    pval(pk: pk_min)
+  else 0 end
+  let pages_raw = if dep_pages > min_pages then dep_pages else min_pages end
+  let pages = if pages_raw < 256 then 256 else pages_raw end
+
+  // Section 2: merged imports (env.memory + dep WASI imports + main non-stdlib).
+  // The merged module imports its (shared) linear memory from "env" rather than
+  // defining it, so the WASI-threads host hands every worker instance the SAME
+  // backing — a *defined* `shared` memory is per-instance under `-S threads`,
+  // which would silently un-share the heap. The memory index space is separate
+  // from the function index space, so prepending this import does not shift any
+  // function index. The defined memory section (5) is skipped below; "memory"
+  // is still exported (now pointing at the imported memory 0). Limits flags
+  // byte 0x03 = has-max (0x01) | shared (0x02); max = 65536 pages (4 GiB).
   let d_imp_pk = get_sec(map: &d_secs, sec: 2)
   let dep_imp_count = count_sec(buf: &dep, sec_pk: d_imp_pk)
-  let total_imp_count = dep_imp_count + m_kept_all
+  let total_imp_count = dep_imp_count + m_kept_all + 1
   let %tmp_i = bb.empty()
   let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: total_imp_count)
+  // env.memory import (memory 0)
+  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: 3)
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 101)  // 'e'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 110)  // 'n'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 118)  // 'v'
+  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: 6)
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 109)  // 'm'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 101)  // 'e'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 109)  // 'm'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 111)  // 'o'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 114)  // 'r'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 121)  // 'y'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 2)    // import desc: memory
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 3)    // limits flags: has-max | shared
+  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: pages)
+  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: 65536)
   // Copy dep imports with type offset
   let %tmp_i = if d_imp_pk > 0 then
     copy_imports_with_type_off(out: %tmp_i, buf: &dep,
@@ -1527,30 +1566,9 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   else
     copy_raw_sec(%out, src: &dep, sec_pk: d_tbl_pk, sec_id: 4)
   end
-  // Compute relocation base: dep_initial_pages * 65536 (above dep's entire memory region)
-  // This ensures main data doesn't overlap with dep's stack, data, or heap.
-  // Size memory to cover both dep and main data (main already at absolute offsets)
-  let d_data_end = find_data_end(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 11))
-  let m_data_end = find_data_end(buf: &core_wasm, sec_pk: get_sec(map: &m_secs, sec: 11))
-  let max_data = if d_data_end > m_data_end then d_data_end else m_data_end end
-  let min_pages = (max_data + 65535) / 65536
-  let dep_pages = if get_sec(map: &d_secs, sec: 5) > 0 then
-    let pk_mem = rd_uleb(buf: &dep, pos: sec_off(pk: get_sec(map: &d_secs, sec: 5)))
-    let pk_min = rd_uleb(buf: &dep, pos: ppos(pk: pk_mem) + 1)
-    pval(pk: pk_min)
-  else 0 end
-  let pages_raw = if dep_pages > min_pages then dep_pages else min_pages end
-  // Reserve ≥256 initial pages (16MB) for merged modules. The compiler loads
-  // stdlib (~300KB) + main code + allocates Vec<u8>-backed buffers; dlmalloc
-  // fragmentation under doubling-growth patterns exhausts a 1.2MB heap well
-  // before memory.grow proves out. 16MB suffices for stage2.
-  let pages = if pages_raw < 256 then 256 else pages_raw end
-  let %tmp_mem = bb.empty()
-  let %tmp_mem = bb.push_uleb128(buf: %tmp_mem, val: 1)
-  let %tmp_mem = bb.push_byte(buf: %tmp_mem, byte: 0)
-  let %tmp_mem = bb.push_uleb128(buf: %tmp_mem, val: pages)
-  let %out = emit_sec(%out, sec_id: 5, content: &tmp_mem)
-  bb.free(buf: %tmp_mem)
+  // Section 5 (defined memory) is intentionally omitted — the merged module's
+  // memory is the `env.memory` import declared in section 2 above (shared, so
+  // WASI-threads workers see the same backing).
   // Section 13: tag (from main, type indices offset by m_type_off)
   let %out = emit_tag_sec_with_off(%out, buf: &core_wasm, sec_pk: get_sec(map: &m_secs, sec: 13), off: m_type_off)
 

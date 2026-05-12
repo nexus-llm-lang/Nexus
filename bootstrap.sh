@@ -28,7 +28,8 @@ NEXUS_ENTRY="src/driver.nx"
 WASMTIME="${WASMTIME:-wasmtime}"
 # shellcheck disable=SC2054  # commas inside -W are wasmtime delimiters, not array separators
 WASMTIME_FLAGS_CORE=(
-  -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,max-memory-size=8589934592,max-wasm-stack=33554432
+  -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y,shared-memory=y,max-memory-size=8589934592,max-wasm-stack=33554432
+  -S threads
   --dir=. --dir="${TMPDIR:-/tmp}"
 )
 

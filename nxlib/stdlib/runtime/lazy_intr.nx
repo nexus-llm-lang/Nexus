@@ -1,0 +1,95 @@
+/**
+ * runtime/lazy_intr: low-level wasi-threads runtime for `@`-thunk parallelism.
+ *
+ * Backs `std:lazy_host`'s `host_spawn` / `host_join` and `std:lazy`'s
+ * `force_all`. A "task" is a 24-byte struct in (shared) linear memory:
+ *
+ *   offset  0  ready      i32 (0 = pending, 1 = done; padded to 8 bytes)
+ *   offset  8  result     i64 (the thunk's forced value, when ready == 1)
+ *   offset 16  closure_ptr i64 (the 0-arg closure heap pointer to force)
+ *
+ * `__nx_lazy_spawn` allocates the task, records the thunk's closure pointer,
+ * and calls the `wasi.thread-spawn` import; the spawned OS thread re-enters
+ * the module at the `wasi_thread_start` export below (passing the task ptr as
+ * its argument), forces the closure, parks the result, sets `ready`, and
+ * `notify`s any joiner. `__nx_lazy_join` `wait32`s on `ready` and reads the
+ * result. The closure runs against the same shared linear memory the caller
+ * sees, so captures are visible without copying.
+ *
+ * `force-closure` / `thunk-addr` / `value-of-i64` are codegen intrinsics
+ * (`nexus:runtime/lazy`, no import entry): the first inlines a `call_indirect`
+ * on a 0-arg closure (mirror of the `@` force op); the latter two are pure
+ * type puns (every Nexus value is an i64 at the WASM level).
+ *
+ * Linearity / params: `wasi_thread_start` is exported under exactly that name
+ * with the WASI-threads ABI `(tid: i32, arg: i32) -> ()`; Nexus orders WASM
+ * params alphabetically, so its params are named `a_tid`, `b_arg` to land in
+ * ABI order.
+ */
+import external "nexus:runtime/lazy"
+
+/// Invoke `a_p` as a 0-arg closure (the closure pointer is the env arg; word 0
+/// of the heap object is its funcref-table index). Returns the closure's value.
+external __nx_force_closure = "__nx_force_closure" : (a_p: i64) -> i64
+
+/// Reinterpret a lazy thunk as its underlying heap pointer (a 0-arg closure).
+external __nx_thunk_addr = "__nx_thunk_addr" : <T>(a_thunk: @T) -> i64
+
+/// Reinterpret a raw i64 (a thunk's forced result) back to its value type.
+external __nx_value_of_i64 = "__nx_value_of_i64" : <T>(a_x: i64) -> T
+
+import external "wasi"
+
+/// The WASI-threads spawn primitive: starts a new OS thread that re-enters the
+/// module at the `wasi_thread_start` export with `(new_tid, a_arg)`. Returns
+/// the thread id, or a negative value on failure.
+external __nx_thread_spawn = "thread-spawn" : (a_arg: i32) -> i32
+
+import * as alloc from "nxlib/stdlib_src/alloc.nx"
+import * as mem from "std:runtime/mem"
+import * as atomic from "std:runtime/atomic"
+import * as cast from "std:runtime/cast"
+
+/// Block until the task's `ready` flag is non-zero. Recursive (no `while`); the
+/// recursion is a tail call, so it lowers to a loop.
+let wait_ready = fn (a_t: i64) -> unit do
+  if atomic.load_i32(addr: a_t) != 0 then return () end
+  let _ = atomic.wait32(addr: a_t, expected: 0, timeout_ns: 0 - 1)
+  return wait_ready(a_t)
+end
+
+/// Spawn `a_thunk` on a worker thread. Returns the task pointer (an i64) — pair
+/// it with `__nx_lazy_join`. The thunk is consumed.
+export let __nx_lazy_spawn = fn <T>(a_thunk: @T) -> i64 do
+  let cl = __nx_thunk_addr(a_thunk)
+  let t = cast.i64_of(x: alloc.allocate(size: 24))
+  let _ = mem.store_i64(addr: t + 8, val: 0)
+  let _ = mem.store_i64(addr: t + 16, val: cl)
+  let _ = atomic.store_i32(addr: t, val: 0)
+  let _ = __nx_thread_spawn(a_arg: cast.i32_of(x: t))
+  return t
+end
+
+/// Wait for `a_task` to complete and return its forced value.
+export let __nx_lazy_join = fn <T>(a_task: i64) -> T do
+  let _ = wait_ready(a_t: a_task)
+  return __nx_value_of_i64(a_x: mem.load_i64(addr: a_task + 8))
+end
+
+/// Force the task's closure, park the result, mark the task ready, and wake any
+/// joiner. Called on the worker thread by `wasi_thread_start`.
+export let __nx_lazy_run_task = fn (a_task: i64) -> unit do
+  let cl = mem.load_i64(addr: a_task + 16)
+  let r = __nx_force_closure(a_p: cl)
+  let _ = mem.store_i64(addr: a_task + 8, val: r)
+  let _ = atomic.store_i32(addr: a_task, val: 1)
+  let _ = atomic.notify(addr: a_task, count: 1000000)
+  return ()
+end
+
+/// WASI-threads worker entry point. `b_arg` is the task pointer passed to
+/// `thread-spawn`. Exported under exactly this name by codegen. Returns
+/// normally (must not `proc_exit` while a continuation stack is live).
+export let wasi_thread_start = fn (a_tid: i32, b_arg: i32) -> unit do
+  return __nx_lazy_run_task(a_task: cast.i64_of(x: b_arg))
+end

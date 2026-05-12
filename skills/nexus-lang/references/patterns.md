@@ -368,24 +368,50 @@ array.consume(arr: %arr, f: fn (val: %i64) -> unit do end)
 ## Lazy Evaluation & Parallel Execution
 
 The `@` sigil marks lazy bindings. A lazy binding defers evaluation until forced.
-Forcing (`@expr`) triggers parallel execution: the thunk is spawned as an independent
-task and joined when the result is needed.
+A single `@expr` force is **synchronous** — it runs the thunk on the calling
+thread. Real parallelism comes from forcing many thunks at once via the
+`std:lazy` / `std:lazy_host` combinators (each thunk then runs on its own OS
+thread, via WASI threads).
 
 ```nexus
 // Lazy binding: RHS is NOT evaluated here
 let @expensive = heavy_computation(input: data)
 
-// Force: spawns thunk, blocks until result ready
+// Force: runs the thunk now (synchronous), returns the result
 let result = @expensive
 
 // Lazy with captured variables
 let base = 100
 let @derived = base * 2 + some_call(n: base)
-let val = @derived    // captures `base`, evaluates in parallel
+let val = @derived    // captures `base`; forced synchronously here
 
 // Inline force on expression (no binding needed)
 let quick = @(x + y)
 ```
+
+### Parallel: `std:lazy.force_all` and `std:lazy_host`
+
+```nexus
+import * as lazy from "std:lazy"
+
+let @a = work(n: 1000)
+let @b = work(n: 1001)
+let @c = work(n: 1002)
+let results = lazy.force_all(tasks: [a, b, c])   // a, b, c run on 3 OS threads
+                                                 // results in input order: [ra, rb, rc]
+```
+
+```nexus
+import { host_spawn, host_join } from "std:lazy_host"
+
+let @t = expensive()
+let h = host_spawn(a: t)        // %Task<T> — linear, must be joined
+// ... overlapping work on this thread ...
+let v = host_join(handle: h)    // waits for the worker, returns the value
+```
+
+Run threaded programs via the bundled `nexus` launcher (it passes
+`-W threads=y,shared-memory=y -S threads` to wasmtime).
 
 ### Type: `@T`
 
@@ -400,10 +426,16 @@ end
 
 ### Runtime model
 
-- `let @x = expr` compiles to a `LazySpawn` — the expression is packaged as a
-  thunk with captured free variables and submitted to `nexus:runtime/lazy` for
-  parallel execution
-- `@x` compiles to a `LazyJoin` — blocks the current thread until the thunk
-  completes and returns the result
-- Thunks that have no side effects can safely run in parallel with the main thread
+- `let @x = expr` packages the expression as a 0-arg closure (a heap object
+  whose word 0 is its funcref-table index); the captured free variables ride in
+  the closure object
+- `@x` is a synchronous `call_indirect` on that closure
+- `std:lazy.force_all` / `std:lazy_host.host_spawn` allocate a small task struct
+  in shared linear memory and call the `wasi.thread-spawn` import; the spawned
+  thread re-enters at the `wasi_thread_start` export, forces the closure against
+  the same shared memory, parks the result, and `notify`s the joiner — which is
+  parked in `memory.atomic.wait32`
+- Thunks with no side effects parallelise cleanly; combinators do not insulate
+  observable effects (`race` / `cancel` / `detach` in `std:lazy` are still
+  sequential — see their docstrings)
 

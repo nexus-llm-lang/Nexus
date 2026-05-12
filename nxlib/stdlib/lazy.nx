@@ -1,27 +1,21 @@
 /**
  * lazy: Combinators for lazy (@) thunk evaluation.
  *
- * Sequential implementation. Each combinator forces thunks in source order
- * using the @ sigil directly, so no host imports are required. The same
- * API contract admits a parallel reimplementation (DAG-driven force) once
- * combinators consume the spawn/join host pair from `std:lazy_host`.
+ * `force_all` runs in parallel: every thunk is dispatched onto its own OS
+ * thread (via `std:lazy_host` / WASI threads), then the results are joined in
+ * input order. A single `@x` force is still synchronous (a `call_indirect`);
+ * for explicit per-thunk control use `std:lazy_host`'s `host_spawn` /
+ * `host_join` directly.
  *
  * Spec-vs-impl divergence (issue nexus-qhms): `cancel` and `race` carry
  * surface-level semantics in `docs/spec/lazy.md` (cancel = "discard without
  * evaluating"; race = "loser is cancelled") that require a runtime drop
  * primitive and a first-of-two arbiter respectively. Neither host primitive
- * exists; both are absent from the runtime/lazy host module (only
- * `__nx_lazy_spawn` and `__nx_lazy_join` are provided, in `std:lazy_host`).
- * The combinators
- * below preserve the spec's *type signatures* but document the sequential
- * force-and-discard fallback. Programs depending on the spec's no-evaluate
- * / cancel-loser semantics will observe both arms running in source order.
- *
- * The host-runtime path (`Task<T>`, `host_spawn`, `host_join`) lives in
- * `std:lazy_host` so that a fixture importing only the pure combinators
- * here does not pull `nexus:runtime/lazy` host externals into its
- * produced wasm.
+ * exists, so both `race` and `cancel` below run their argument(s)
+ * synchronously and document the force-and-discard fallback. `detach` is the
+ * honest fire-and-forget form.
  */
+import * as lz from "nxlib/stdlib/runtime/lazy_intr.nx"
 
 /// race(a, b): Sequentially force `a` then `b`, returning `a`'s result.
 ///
@@ -48,10 +42,9 @@ end
 /// evaluating". The only way to consume a linear `@T` in this calculus is
 /// to force it — there is no "drop without force" form (a statement-level
 /// `let _ = a` rebinds the linear obligation to the name `_` instead of
-/// releasing it), and the runtime/lazy host module exposes no `__nx_lazy_drop`.
-/// Until such a primitive exists, this implementation is observationally
-/// equivalent to `detach`: the thunk's body runs and any side effects are
-/// observable.
+/// releasing it). Until such a primitive exists, this implementation is
+/// observationally equivalent to `detach`: the thunk's body runs and any
+/// side effects are observable.
 export let cancel = fn <T>(a: @T) -> unit do
   let _ = @a
   return ()
@@ -65,21 +58,32 @@ export let detach = fn <T>(a: @T) -> unit do
   return ()
 end
 
-/// force_all(tasks): Force every thunk in the list left-to-right, returning
-/// the results in input order.
-///
-/// Spec contract (`docs/spec/lazy.md:159`): "Force every thunk; collect
-/// results in order". A parallel implementation would dispatch all thunks
-/// concurrently and join in input order; the sequential fallback walks the
-/// list, forcing each `@T` element as it is unpacked.
+/// force_all(tasks): Force every thunk in the list in parallel, returning
+/// the results in input order. Each thunk is dispatched onto its own OS
+/// thread; the forces all run concurrently and are joined left-to-right.
 export let force_all = fn <T>(tasks: [ @T ]) -> [ T ] do
-  return force_all_go(tasks, acc: [])
+  let ids = spawn_all(tasks, acc: [])
+  return join_all(ids, acc: [])
 end
 
-let force_all_go = fn <T>(tasks: [ @T ], acc: [ T ]) -> [ T ] do
+let spawn_all = fn <T>(tasks: [ @T ], acc: [ i64 ]) -> [ i64 ] do
   match tasks do
+    | [] -> return reverse_i64(xs: acc, out: [])
+    | t :: rest -> return spawn_all(tasks: rest, acc: lz.__nx_lazy_spawn(a_thunk: t) :: acc)
+  end
+end
+
+let join_all = fn <T>(ids: [ i64 ], acc: [ T ]) -> [ T ] do
+  match ids do
     | [] -> return reverse_list(xs: acc, out: [])
-    | t :: rest -> return force_all_go(tasks: rest, acc: @t :: acc)
+    | id :: rest -> return join_all(ids: rest, acc: lz.__nx_lazy_join(a_task: id) :: acc)
+  end
+end
+
+let reverse_i64 = fn (xs: [ i64 ], out: [ i64 ]) -> [ i64 ] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return reverse_i64(xs: rest, out: x :: out)
   end
 end
 

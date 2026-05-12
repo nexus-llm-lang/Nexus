@@ -166,6 +166,20 @@ let is_cast_external = fn (ext: LirExternal) -> bool do
   end
 end
 
+/** `nexus:runtime/lazy` intrinsics back the WASI-threads `@`-thunk runtime
+ * (`nxlib/stdlib/runtime/lazy_intr.nx`). Three ops, all emitted inline (no
+ * host call, no import entry — filtered out like the atomics):
+ *   force-closure  ((p: i64) -> i64)        : call_indirect a 0-arg closure
+ *   thunk-addr     (<T>(@T) -> i64)          : reinterpret a thunk as its ptr
+ *   value-of-i64   (<T>(i64) -> T)           : reinterpret an i64 back to a value
+ * The latter two are no-ops at the WASM level (every Nexus value is an i64). */
+let is_lazy_external = fn (ext: LirExternal) -> bool do
+  match ext do
+    | LirExternal(name: _, wasm_module: m, wasm_name: _, params: _, ret_type: _, throw_row: _) ->
+      return m == "nexus:runtime/lazy"
+  end
+end
+
 /** True when name corresponds to a lifted lambda (`__closure_N`). Matches both */
 /** the bare form and the canonical-path form (`<sanitized-path>#__closure_N`) */
 /** because `lift_lambda` (mir.nx) names lambdas `__closure_N` but downstream */
@@ -260,6 +274,17 @@ let resolve_bundle_exports = fn (names: [string], funcs: [LirFunction], internal
   end
 end
 
+/// If the program defines `wasi_thread_start` (pulled in via `std:lazy` /
+/// `std:lazy_host`), it must be exported under exactly that name so wasi-threads
+/// workers can find it; its `(i32, i32) -> ()` signature is produced by the
+/// `lazy_intr.nx` source. Returns a singleton `[ExportNameIdx]` or `[]`.
+let wasi_thread_start_export = fn (funcs: [LirFunction], internal_func_map: &HashMap) -> [ExportNameIdx] throws { CodegenError } do
+  let bare = wdefs.lookup_func_fast(name: "wasi_thread_start", map: internal_func_map)
+  let idx = if bare >= 0 then bare else find_func_idx_by_suffix(suffix: "#wasi_thread_start", funcs, internal_func_map) end
+  if idx < 0 then return [] end
+  return [ExportNameIdx(name: "wasi_thread_start", index: idx)]
+end
+
 /** Find the import index for a sched runtime function by its wasm_name. Uses */
 /** linear scan over the externals list because hash lookup by Nexus FFI name */
 /** is fragile when several `nexus:runtime/sched` imports share a prefix. */
@@ -270,7 +295,7 @@ let find_sched_import_idx = fn (wn: string, exts: [LirExternal], idx: i64) -> i6
   match exts do
     | [] -> return -1
     | e :: rest ->
-      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_simd_external(ext: e) || is_atomic_external(ext: e) || is_cast_external(ext: e) || is_intrinsic_sched_external(ext: e) then
+      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_simd_external(ext: e) || is_atomic_external(ext: e) || is_cast_external(ext: e) || is_lazy_external(ext: e) || is_intrinsic_sched_external(ext: e) then
         return find_sched_import_idx(wn, exts: rest, idx)
       end
       match e do | LirExternal(name: _, wasm_module: m, wasm_name: w, params: _, ret_type: _, throw_row: _) ->
@@ -350,7 +375,7 @@ let filter_arena_externals = fn (exts: [LirExternal]) -> [LirExternal] do
   match exts do
     | [] -> return []
     | e :: rest ->
-      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_simd_external(ext: e) || is_atomic_external(ext: e) || is_cast_external(ext: e) || is_intrinsic_sched_external(ext: e) then
+      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_simd_external(ext: e) || is_atomic_external(ext: e) || is_cast_external(ext: e) || is_lazy_external(ext: e) || is_intrinsic_sched_external(ext: e) then
         return filter_arena_externals(exts: rest)
       else
         return e :: filter_arena_externals(exts: rest)
@@ -781,6 +806,54 @@ let emit_cast_to_i64 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx
       return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
     | _ ->
       raise SymbolNotFound(name: "__nx_cast_to_i64", kind: "cast intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+// ─── Lazy / WASI-threads intrinsics (`nexus:runtime/lazy`) ──────────────────
+
+let get_lazy_wasm_name = fn (func: string, exts: [LirExternal]) -> string do
+  match wdefs.find_external(name: func, exts) do
+    | None -> ""
+    | Some(val: ext) ->
+      if !is_lazy_external(ext) then return "" end
+      match ext do
+        | LirExternal(name: _, wasm_module: _, wasm_name: wn, params: _, ret_type: _, throw_row: _) -> wn
+      end
+  end
+end
+
+/// `__nx_thunk_addr(t: @T) -> i64` / `__nx_value_of_i64(x: i64) -> T`: both are
+/// pure type puns at the WASM level (every Nexus value is an i64). Emit the
+/// argument atom and nothing else.
+let emit_lazy_passthrough = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ -> return emit_atom(atom: a, %buf, ctx)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_lazy_passthrough", kind: "lazy intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+/// `__nx_force_closure(p: i64) -> i64`: invoke `p` as a 0-arg closure — mirror
+/// of `LirExprForce` (closure pointer is the env arg; word 0 is the funcref
+/// table index; `call_indirect (type closure/0) (table 0)`).
+let emit_force_closure = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = bb.push_byte(%buf, byte: op_i64_load)
+      let %buf = wdefs.emit_memarg_i64(%buf, offset: 0)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_call_indirect])
+      let CodegenCtx(closure_type_indices: cti, _) = ctx
+      let type_idx = lookup_closure_type_idx_pairs(arity: 0, pairs: cti)
+      let %buf = bb.push_uleb128(%buf, val: type_idx)
+      let %buf = bb.push_uleb128(%buf, val: heap_global_idx)
+      return %buf
+    | _ ->
+      raise SymbolNotFound(name: "__nx_force_closure", kind: "lazy intrinsic arg", context: "")
       return %buf
   end
 end
@@ -1536,6 +1609,7 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
   let simd_wn = get_simd_wasm_name(func, exts)
   let atomic_wn = get_atomic_wasm_name(func, exts)
   let cast_wn = get_cast_wasm_name(func, exts)
+  let lazy_wn = get_lazy_wasm_name(func, exts)
   if func == "__array_get" then return emit_array_get(args, %buf, ctx)
   else if func == "__array_set" then return emit_array_set(args, %buf, ctx)
   else if arena_wn == "heap-mark" then return emit_heap_mark(%buf, ctx)
@@ -1563,6 +1637,9 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
   else if atomic_wn == "atomic-notify" then return emit_atomic_notify(args, %buf, ctx)
   else if cast_wn == "cast-to-i32" then return emit_cast_to_i32(args, %buf, ctx)
   else if cast_wn == "cast-to-i64" then return emit_cast_to_i64(args, %buf, ctx)
+  else if lazy_wn == "force-closure" then return emit_force_closure(args, %buf, ctx)
+  else if lazy_wn == "thunk-addr" then return emit_lazy_passthrough(args, %buf, ctx)
+  else if lazy_wn == "value-of-i64" then return emit_lazy_passthrough(args, %buf, ctx)
   else if math_wn == "f64-sqrt" then return emit_f64_unary(opcode: op_f64_sqrt, args, %buf, ctx, name: "__nx_f64_sqrt")
   else if math_wn == "f64-floor" then return emit_f64_unary(opcode: op_f64_floor, args, %buf, ctx, name: "__nx_f64_floor")
   else if math_wn == "f64-ceil" then return emit_f64_unary(opcode: op_f64_ceil, args, %buf, ctx, name: "__nx_f64_ceil")
@@ -2891,7 +2968,11 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
 
       let main_idx = wdefs.lookup_func_fast(name: "main", map: &internal_func_map)
       // `--bundle-exports` library mode: resolve requested names → (name, idx).
-      let resolved_bundle_exports = resolve_bundle_exports(names: bundle_exports, funcs, internal_func_map: &internal_func_map)
+      // Plus an implicit `wasi_thread_start` export when the lazy/threads
+      // runtime is linked (so wasi-threads workers can find the trampoline).
+      let resolved_bundle_exports = list.concat(
+        xs: resolve_bundle_exports(names: bundle_exports, funcs, internal_func_map: &internal_func_map),
+        ys: wasi_thread_start_export(funcs, internal_func_map: &internal_func_map))
       let main_ret = match wdefs.find_function_fast(name: "main", funcs, map: &internal_func_map, import_count) do
         | Some(val: LirFunction(name: _, params: _, ret_type: rt, body: _, ret: _, span: _)) -> rt
         | None -> TyUnit
