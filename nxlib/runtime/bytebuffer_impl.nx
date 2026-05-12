@@ -1,0 +1,375 @@
+/**
+ * runtime/bytebuffer_impl: ByteBuffer runtime, ported to Nexus.
+ *
+ * Phase 5a of nexus-f90i: reimplements the `__nx_buf_*` FFI surface that
+ * `nxlib/stdlib/bytebuffer.nx` declares as `external`, so it can become part
+ * of a Nexus-built replacement for the source-less prebuilt `stdlib.wasm`.
+ *
+ * A ByteBuffer `id` is a pointer to a 24-byte header in linear memory,
+ * three i64 words:
+ *   offset 0  : len      -- current number of bytes
+ *   offset 8  : cap      -- allocated capacity in bytes
+ *   offset 16 : data_ptr -- pointer to a cap-byte data region (0 when cap==0)
+ *
+ * Storage comes from `nxlib/runtime/alloc.nx` (the Phase 4 bump allocator):
+ * growth leaks the old data region, which is fine for a bump allocator.
+ *
+ * ABI note: Nexus lays out wasm function params in alphabetical name order,
+ * but external callers (codegen) pass them positionally in the external-decl
+ * declaration order (with each `string` param expanded to ptr,len). So every
+ * exported impl function prefixes its params a_, b_, c_, ... in the order the
+ * codegen-emitted call supplies them, so alphabetical == positional.
+ *
+ * Stubbed (TODO, a later phase does proper WASI file I/O):
+ *   __nx_buf_write_file      -> always false
+ *   __nx_buf_read_file       -> always -1
+ *   __nx_buf_read_stdin      -> returns a fresh empty buffer
+ *   __nx_buf_push_f64_str_le -> appends 8 zero bytes (f64 string parsing TODO)
+ */
+import * as mem from "std:runtime/mem"
+import * as cast from "std:runtime/cast"
+import * as alloc from "nxlib/runtime/alloc.nx"
+
+/// Mask that turns an arithmetic (signed) i64 >> 7 into a logical one:
+/// (1 << 57) - 1, i.e. clears the top 7 bits after the shift.
+let shr7_logical_mask = fn () -> i64 do return 144115188075855871 end
+
+/// 2^32, the multiplier used to pack a (ptr, len) pair into a returned i64.
+let two_pow_32 = fn () -> i64 do return 4294967296 end
+
+// --- header accessors ---
+
+let hdr_len = fn (h: i64) -> i64 do return mem.load_i64(addr: h) end
+let hdr_cap = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 8) end
+let hdr_data = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 16) end
+let set_len = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h, val: v) end
+let set_cap = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 8, val: v) end
+let set_data = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 16, val: v) end
+
+// --- low-level helpers ---
+
+/// Copy `count` bytes from `src` to `dst` (forward; non-overlapping or
+/// dst < src). Recursive byte loop.
+let copy_bytes = fn (dst: i64, src: i64, count: i64) -> unit do
+  return copy_bytes_at(dst, src, count, i: 0)
+end
+
+let copy_bytes_at = fn (dst: i64, src: i64, count: i64, i: i64) -> unit do
+  if i >= count then return () end
+  let _ = mem.store_u8(addr: dst + i, val: mem.load_u8(addr: src + i))
+  return copy_bytes_at(dst, src, count, i: i + 1)
+end
+
+/// Pick a new capacity >= `need`: start at max(8, old_cp*2), double until it fits.
+let grow_cap_to = fn (old_cp: i64, need: i64) -> i64 do
+  let start = if old_cp * 2 > 8 then old_cp * 2 else 8 end
+  return grow_cap_loop(c: start, need)
+end
+
+let grow_cap_loop = fn (c: i64, need: i64) -> i64 do
+  if c >= need then return c end
+  return grow_cap_loop(c: c * 2, need)
+end
+
+/// Make sure the buffer at `h` can hold `need` more bytes.
+let ensure_cap = fn (h: i64, need: i64) -> unit do
+  let len = hdr_len(h)
+  let cur_cp = hdr_cap(h)
+  if len + need <= cur_cp then return () end
+  let new_cap = grow_cap_to(old_cp: cur_cp, need: len + need)
+  let new_data = cast.i64_of(x: alloc.allocate(size: cast.i32_of(x: new_cap)))
+  let _ = copy_bytes(dst: new_data, src: hdr_data(h), count: len)
+  let _ = set_cap(h, v: new_cap)
+  return set_data(h, v: new_data)
+end
+
+/// Append one byte (low 8 bits) to the buffer at `h`.
+let bput = fn (h: i64, byte: i64) -> unit do
+  let _ = ensure_cap(h, need: 1)
+  let len = hdr_len(h)
+  let _ = mem.store_u8(addr: hdr_data(h) + len, val: byte & 255)
+  return set_len(h, v: len + 1)
+end
+
+/// Append `count` bytes read from `src` to the buffer at `h`.
+let bput_range = fn (h: i64, src: i64, count: i64) -> unit do
+  if count <= 0 then return () end
+  let _ = ensure_cap(h, need: count)
+  let len = hdr_len(h)
+  let _ = copy_bytes(dst: hdr_data(h) + len, src, count)
+  return set_len(h, v: len + count)
+end
+
+// --- the __nx_buf_* contract ---
+
+/// Allocate a fresh empty buffer; returns its header pointer (the opaque id).
+export let __nx_buf_new = fn () -> i64 do
+  let h = cast.i64_of(x: alloc.allocate(size: 24))
+  let _ = set_len(h, v: 0)
+  let _ = set_cap(h, v: 0)
+  let _ = set_data(h, v: 0)
+  return h
+end
+
+export let __nx_buf_push_byte = fn (a_id: i64, b_byte: i64) -> unit do
+  return bput(h: a_id, byte: b_byte)
+end
+
+/// Append the low 32 bits of `b_val` as 4 little-endian bytes.
+export let __nx_buf_push_i32_le = fn (a_id: i64, b_val: i64) -> unit do
+  let _ = bput(h: a_id, byte: b_val & 255)
+  let _ = bput(h: a_id, byte: (b_val >> 8) & 255)
+  let _ = bput(h: a_id, byte: (b_val >> 16) & 255)
+  return bput(h: a_id, byte: (b_val >> 24) & 255)
+end
+
+/// Append all 8 bytes of `b_val` little-endian. (Exported by stdlib.wasm but
+/// not declared in bytebuffer.nx; implemented for completeness.)
+export let __nx_buf_push_i64_le = fn (a_id: i64, b_val: i64) -> unit do
+  let _ = bput(h: a_id, byte: b_val & 255)
+  let _ = bput(h: a_id, byte: (b_val >> 8) & 255)
+  let _ = bput(h: a_id, byte: (b_val >> 16) & 255)
+  let _ = bput(h: a_id, byte: (b_val >> 24) & 255)
+  let _ = bput(h: a_id, byte: (b_val >> 32) & 255)
+  let _ = bput(h: a_id, byte: (b_val >> 40) & 255)
+  let _ = bput(h: a_id, byte: (b_val >> 48) & 255)
+  return bput(h: a_id, byte: (b_val >> 56) & 255)
+end
+
+/// TODO(nexus-f90i Phase 6): parse `s` as f64 and append its 8 IEEE-754 LE
+/// bytes; on parse failure append 0.0. f64 string parsing in Nexus is not yet
+/// available here (the string-to-f64 runtime is itself being rewritten), so
+/// for now this appends 0.0's 8 bytes (all zero) unconditionally. This
+/// function is rarely used.
+export let __nx_buf_push_f64_str_le = fn (a_id: i64, b_s_ptr: i32, c_s_len: i32) -> unit do
+  let _ = bput(h: a_id, byte: 0)
+  let _ = bput(h: a_id, byte: 0)
+  let _ = bput(h: a_id, byte: 0)
+  let _ = bput(h: a_id, byte: 0)
+  let _ = bput(h: a_id, byte: 0)
+  let _ = bput(h: a_id, byte: 0)
+  let _ = bput(h: a_id, byte: 0)
+  return bput(h: a_id, byte: 0)
+end
+
+/// Append unsigned LEB128 of `b_val` (treated as u64).
+export let __nx_buf_push_leb128_u = fn (a_id: i64, b_val: i64) -> unit do
+  return leb128_u_go(h: a_id, v: b_val)
+end
+
+let leb128_u_go = fn (h: i64, v: i64) -> unit do
+  let byte = v & 127
+  let rest = (v >> 7) & shr7_logical_mask()
+  if rest == 0 then return bput(h, byte) end
+  let _ = bput(h, byte: byte | 128)
+  return leb128_u_go(h, v: rest)
+end
+
+/// Append signed LEB128 of `b_val`.
+export let __nx_buf_push_leb128_s = fn (a_id: i64, b_val: i64) -> unit do
+  return leb128_s_go(h: a_id, v: b_val)
+end
+
+let leb128_s_go = fn (h: i64, v: i64) -> unit do
+  let byte = v & 127
+  let rest = v >> 7
+  let done = (rest == 0 && (byte & 64) == 0) || (rest == 0 - 1 && (byte & 64) != 0)
+  if done then return bput(h, byte) end
+  let _ = bput(h, byte: byte | 128)
+  return leb128_s_go(h, v: rest)
+end
+
+/// Append the raw bytes of string `b_s`.
+export let __nx_buf_push_string = fn (a_id: i64, b_s_ptr: i32, c_s_len: i32) -> unit do
+  return bput_range(h: a_id, src: cast.i64_of(x: b_s_ptr), count: cast.i64_of(x: c_s_len))
+end
+
+/// Append every byte of buffer `b_src_id` to buffer `a_dst_id`.
+export let __nx_buf_push_buf = fn (a_dst_id: i64, b_src_id: i64) -> unit do
+  return bput_range(h: a_dst_id, src: hdr_data(h: b_src_id), count: hdr_len(h: b_src_id))
+end
+
+export let __nx_buf_length = fn (a_id: i64) -> i64 do
+  return hdr_len(h: a_id)
+end
+
+/// Byte at `b_idx` (0..255), or -1 if out of bounds.
+export let __nx_buf_get_byte = fn (a_id: i64, b_idx: i64) -> i64 do
+  if b_idx < 0 || b_idx >= hdr_len(h: a_id) then return 0 - 1 end
+  return mem.load_u8(addr: hdr_data(h: a_id) + b_idx)
+end
+
+/// Buffer contents as a string: allocate a fresh region, copy, return the
+/// packed (ptr<<32)|len i64.
+export let __nx_buf_to_string = fn (a_id: i64) -> i64 do
+  let len = hdr_len(h: a_id)
+  if len <= 0 then return 0 end
+  let dst = cast.i64_of(x: alloc.allocate(size: cast.i32_of(x: len)))
+  let _ = copy_bytes(dst, src: hdr_data(h: a_id), count: len)
+  return (dst * two_pow_32()) + len
+end
+
+/// TODO(nexus-f90i Phase 6): write buffer contents to `b_path` over WASI
+/// (path_open + fd_write on a preopened dir fd). Stubbed to false for now;
+/// the compiler does need a working write_file, so this is a known gap.
+export let __nx_buf_write_file = fn (a_id: i64, b_path_ptr: i32, c_path_len: i32) -> bool do
+  return false
+end
+
+/// Free is a no-op under the bump allocator (arena reset is the reclaim path).
+export let __nx_buf_free = fn (a_id: i64) -> bool do
+  return true
+end
+
+/// Set length to min(b_len, current len), keeping capacity.
+export let __nx_buf_truncate = fn (a_id: i64, b_len: i64) -> unit do
+  let cur = hdr_len(h: a_id)
+  let n = if b_len < cur then b_len else cur end
+  let n2 = if n < 0 then 0 else n end
+  return set_len(h: a_id, v: n2)
+end
+
+/// Append src bytes [c_start, min(d_end_pos, src.len)) to dst.
+export let __nx_buf_copy_range = fn (a_dst_id: i64, b_src_id: i64, c_start: i64, d_end_pos: i64) -> unit do
+  let src_len = hdr_len(h: b_src_id)
+  let start = if c_start < 0 then 0 else c_start end
+  let endp = if d_end_pos > src_len then src_len else d_end_pos end
+  if endp <= start then return () end
+  return bput_range(h: a_dst_id, src: hdr_data(h: b_src_id) + start, count: endp - start)
+end
+
+/// TODO(nexus-f90i Phase 6): read file at `a_path` into a new buffer over
+/// WASI. Stubbed to -1 (error) for now.
+export let __nx_buf_read_file = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  return 0 - 1
+end
+
+/// TODO(nexus-f90i Phase 6): read up to `a_n` bytes from stdin over WASI.
+/// Stubbed to return a fresh empty buffer (length 0 == EOF/closed to callers).
+export let __nx_buf_read_stdin = fn (a_n: i64) -> i64 do
+  return __nx_buf_new()
+end
+
+// --- test functions (return a single i64 to check via wasmtime --invoke) ---
+
+/// push 65,66,67 then read them back packed: 65*65536 + 66*256 + 67 = 4276547.
+export let test_pushget = fn () -> i64 do
+  let b = __nx_buf_new()
+  let _ = __nx_buf_push_byte(a_id: b, b_byte: 65)
+  let _ = __nx_buf_push_byte(a_id: b, b_byte: 66)
+  let _ = __nx_buf_push_byte(a_id: b, b_byte: 67)
+  let r = (__nx_buf_get_byte(a_id: b, b_idx: 0) * 65536)
+        + (__nx_buf_get_byte(a_id: b, b_idx: 1) * 256)
+        + __nx_buf_get_byte(a_id: b, b_idx: 2)
+  return r
+end
+
+/// length, truncate, get-out-of-bounds, push_buf, copy_range packed into one.
+/// Build A=[1,2,3,4,5] -> len 5. truncate to 3 -> len 3, get_byte(3) == -1.
+/// B = new; push_buf(B, A) -> len 3, B[2] == 3. copy_range(B, A, 1, 99) ->
+/// appends A[1..3] = [2,3] -> len 5, B[4] == 3.
+/// Returns len_A_after_trunc*1000000 + (B_len after copy_range)*1000
+///       + B[4]*10 + (A get_byte(3) == -1 ? 1 : 0)  => 3*1000000 + 5*1000 + 3*10 + 1 = 3005031.
+export let test_len = fn () -> i64 do
+  let a = __nx_buf_new()
+  let _ = __nx_buf_push_byte(a_id: a, b_byte: 1)
+  let _ = __nx_buf_push_byte(a_id: a, b_byte: 2)
+  let _ = __nx_buf_push_byte(a_id: a, b_byte: 3)
+  let _ = __nx_buf_push_byte(a_id: a, b_byte: 4)
+  let _ = __nx_buf_push_byte(a_id: a, b_byte: 5)
+  let _ = __nx_buf_truncate(a_id: a, b_len: 3)
+  let a_len = __nx_buf_length(a_id: a)
+  let oob = if __nx_buf_get_byte(a_id: a, b_idx: 3) == 0 - 1 then 1 else 0 end
+  let b = __nx_buf_new()
+  let _ = __nx_buf_push_buf(a_dst_id: b, b_src_id: a)
+  let _ = __nx_buf_copy_range(a_dst_id: b, b_src_id: a, c_start: 1, d_end_pos: 99)
+  let b_len = __nx_buf_length(a_id: b)
+  let b4 = __nx_buf_get_byte(a_id: b, b_idx: 4)
+  return (a_len * 1000000) + (b_len * 1000) + (b4 * 10) + oob
+end
+
+/// push_leb128_u(300) -> bytes [0xAC, 0x02] = [172, 2]; push_leb128_s(-1) ->
+/// byte [0x7F] = [127]. push_leb128_s(63) -> [0x3F]=[63]; push_leb128_s(64) ->
+/// [0xC0,0x00]=[192,0]. Then to_string roundtrip of "AB" (push_string).
+/// Returns: leb_u byte0*100000 + byte1*1000 + sleb_neg1*10 + (sleb checks ok? ... )
+/// Simpler: bytes are [172,2,127, 63, 192,0] then "AB" appended.
+///   idx0=172 idx1=2 idx2=127 idx3=63 idx4=192 idx5=0 idx6=65('A') idx7=66('B') len=8.
+/// Return 172*1 + 2*1000 + 127*1000000 ... that overflows readability; instead:
+/// return idx0*10000000 + idx1*100000 + idx2*1000 + idx3*10 + (idx6==65 && idx7==66 ? 1 : 0)
+///      = 172*10000000 + 2*100000 + 127*1000 + 63*10 + 1 = 1720000000 + 200000 + 127000 + 630 + 1 = 1720327631.
+export let test_leb = fn () -> i64 do
+  let b = __nx_buf_new()
+  let _ = __nx_buf_push_leb128_u(a_id: b, b_val: 300)
+  let _ = __nx_buf_push_leb128_s(a_id: b, b_val: 0 - 1)
+  let _ = __nx_buf_push_leb128_s(a_id: b, b_val: 63)
+  let _ = __nx_buf_push_leb128_s(a_id: b, b_val: 64)
+  let _ = __nx_buf_push_string(a_id: b, b_s_ptr: cast.i32_of(x: 0), c_s_len: cast.i32_of(x: 0))
+  let _ = __nx_buf_push_byte(a_id: b, b_byte: 65)
+  let _ = __nx_buf_push_byte(a_id: b, b_byte: 66)
+  let i0 = __nx_buf_get_byte(a_id: b, b_idx: 0)
+  let i1 = __nx_buf_get_byte(a_id: b, b_idx: 1)
+  let i2 = __nx_buf_get_byte(a_id: b, b_idx: 2)
+  let i3 = __nx_buf_get_byte(a_id: b, b_idx: 3)
+  let i4 = __nx_buf_get_byte(a_id: b, b_idx: 4)
+  let i5 = __nx_buf_get_byte(a_id: b, b_idx: 5)
+  let i6 = __nx_buf_get_byte(a_id: b, b_idx: 6)
+  let i7 = __nx_buf_get_byte(a_id: b, b_idx: 7)
+  let len = __nx_buf_length(a_id: b)
+  let extra = if i4 == 192 && i5 == 0 && i6 == 65 && i7 == 66 && len == 8 then 1 else 0 end
+  return (i0 * 10000000) + (i1 * 100000) + (i2 * 1000) + (i3 * 10) + extra
+end
+
+/// to_string roundtrip: push 'X'(88) 'Y'(89) 'Z'(90), to_string -> packed.
+/// Check (packed & 0xFFFFFFFF) == 3 and mem byte at (packed >> 32) == 88,
+/// next == 89, next == 90.
+/// Return len*1000 + b0*100 ... too narrow; return:
+///   len * 1000000 + b0 * 10000 + b1 * 100 + b2  (3*1000000 + 88*10000 + 89*100 + 90 = 3880990)
+export let test_tostring = fn () -> i64 do
+  let b = __nx_buf_new()
+  let _ = __nx_buf_push_byte(a_id: b, b_byte: 88)
+  let _ = __nx_buf_push_byte(a_id: b, b_byte: 89)
+  let _ = __nx_buf_push_byte(a_id: b, b_byte: 90)
+  let packed = __nx_buf_to_string(a_id: b)
+  let len = packed & 4294967295
+  let ptr = (packed >> 32) & 4294967295
+  let b0 = mem.load_u8(addr: ptr)
+  let b1 = mem.load_u8(addr: ptr + 1)
+  let b2 = mem.load_u8(addr: ptr + 2)
+  return (len * 1000000) + (b0 * 10000) + (b1 * 100) + b2
+end
+
+/// i32_le / i64_le roundtrip. push_i32_le(0x04030201) -> [1,2,3,4];
+/// push_i64_le(0x0807060504030201) bytes [1,2,3,4,5,6,7,8] appended at idx 4..11.
+/// Return idx0 + idx3*1000 + idx4*10 + idx11  -> 1 + 4*1000 + 1*10 + 8 = 4019.
+export let test_le = fn () -> i64 do
+  let b = __nx_buf_new()
+  let _ = __nx_buf_push_i32_le(a_id: b, b_val: 67305985)
+  let _ = __nx_buf_push_i64_le(a_id: b, b_val: 578437695752307201)
+  let i0 = __nx_buf_get_byte(a_id: b, b_idx: 0)
+  let i3 = __nx_buf_get_byte(a_id: b, b_idx: 3)
+  let i4 = __nx_buf_get_byte(a_id: b, b_idx: 4)
+  let i11 = __nx_buf_get_byte(a_id: b, b_idx: 11)
+  let len = __nx_buf_length(a_id: b)
+  let okl = if len == 12 then 1 else 0 end
+  return i0 + (i3 * 1000) + (i4 * 10) + i11 + (okl * 100000)
+end
+
+/// Growth stress: push 100 bytes (value == idx & 255), check length and a
+/// few samples. Return len*1000 + byte[50] + byte[99]*... -> 100*1000 + 50 + 99? narrow.
+/// return len * 10000 + byte50 * 100 + byte99  = 100*10000 + 50*100 + 99 = 1005099.
+export let test_grow = fn () -> i64 do
+  let b = __nx_buf_new()
+  let _ = push_n(h: b, i: 0, n: 100)
+  let len = __nx_buf_length(a_id: b)
+  let b50 = __nx_buf_get_byte(a_id: b, b_idx: 50)
+  let b99 = __nx_buf_get_byte(a_id: b, b_idx: 99)
+  return (len * 10000) + (b50 * 100) + b99
+end
+
+let push_n = fn (h: i64, i: i64, n: i64) -> unit do
+  if i >= n then return () end
+  let _ = __nx_buf_push_byte(a_id: h, b_byte: i & 255)
+  return push_n(h, i: i + 1, n)
+end
+
+export let main = fn () -> unit do return () end
