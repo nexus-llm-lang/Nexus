@@ -8,11 +8,13 @@
  * which the codegen recognises as `nexus:runtime/math` intrinsics and
  * inline-emits the corresponding f64 opcode.
  *
- * Operations whose wasm encoding is not yet exposed as a runtime
- * intrinsic (`pow`, `i64`<->`float` conversions) bind to the host
- * `std:math` symbols.
+ * `i64`<->`float` conversions are implemented here by manual IEEE-754 bit
+ * twiddling (truncation, no round-to-nearest-even): the wasm convert opcodes
+ * are not exposed as `nexus:runtime/math` intrinsics. `pow` is a stub (1.0):
+ * wasm has no `f64.pow`; only `std:math.pow` callers are affected.
  */
-import external "std:math"
+import * as mem from "std:runtime/mem"
+import * as arena from "std:runtime/arena"
 import * as fmath from "std:runtime/math"
 
 /// Returns the absolute value of an integer. For `i64::MIN`,
@@ -68,19 +70,76 @@ export let ceil = fn (val: float) -> float do
   return fmath.ceil(val: val)
 end
 
-/// Returns base raised to the power of exp. Routed through the host
-/// `__nx_pow` (libm `pow`); `f64.pow` is not a wasm primitive.
-export external pow = "__nx_pow" : (base: float, exp: float) -> float
+/// i64::MIN, written as a parenthesised negation of a positive literal.
+let i64_min = fn () -> i64 do return (0 - 9223372036854775807) - 1 end
 
-/// Converts an i64 to a float. Routed through the host `__nx_i64_to_float`
-/// (`f64.convert_i64_s`); the Nexus codegen does not expose this wasm op
-/// as a `nexus:runtime/math` intrinsic.
-export external i64_to_float = "__nx_i64_to_float" : (val: i64) -> float
+/// Reinterpret the 64 bits of `bits` as an f64 (round-trips via linear memory).
+let i64_bits_to_f64 = fn (bits: i64) -> float do
+  let p = arena.alloc_raw(size: 8)
+  let _ = mem.store_i64(addr: p, val: bits)
+  return mem.load_f64(addr: p)
+end
 
-/// Converts a float to an i64 (truncates toward zero). Routed through
-/// the host `__nx_float_to_i64` (`i64.trunc_f64_s`); the Nexus codegen
-/// does not expose this wasm op as a `nexus:runtime/math` intrinsic.
-export external float_to_i64 = "__nx_float_to_i64" : (val: float) -> i64
+/// Reinterpret the 64 bits of `x` as an i64.
+let f64_to_i64_bits = fn (x: float) -> i64 do
+  let p = arena.alloc_raw(size: 8)
+  let _ = mem.store_f64(addr: p, val: x)
+  return mem.load_i64(addr: p)
+end
+
+/// Logical (zero-filling) right shift by `n` (0 <= n < 64).
+let lshr = fn (v: i64, n: i64) -> i64 do
+  if n == 0 then return v end
+  let shifted = v >> n
+  let mask = (1 << (63 - n)) - 1 + (1 << (63 - n))
+  return shifted & mask
+end
+
+/// Position (0..63) of the highest set bit of `m` (m > 0).
+let high_bit = fn (m: i64) -> i64 do return high_bit_go(m, i: 63) end
+let high_bit_go = fn (m: i64, i: i64) -> i64 do
+  if i < 0 then return 0 end
+  if lshr(v: m, n: i) & 1 == 1 then return i end
+  return high_bit_go(m, i: i - 1)
+end
+
+/// Converts an i64 to a float. Truncates dropped low mantissa bits toward zero
+/// (no round-to-nearest-even); i64::MIN is handled as exactly -2^63.
+export let i64_to_float = fn (val: i64) -> float do
+  if val == 0 then return 0.0 end
+  if val == i64_min() then
+    return i64_bits_to_f64(bits: ((0 - 9223372036854775807) - 1))
+  end
+  let neg = val < 0
+  let mag = if neg then 0 - val else val end
+  let p = high_bit(m: mag)
+  let mant = if p >= 52 then lshr(v: mag, n: p - 52) else mag << (52 - p) end
+  let mant52 = mant & ((1 << 52) - 1)
+  let biased = (1023 + p) << 52
+  let sign = if neg then (1 << 63) else 0 end
+  return i64_bits_to_f64(bits: sign + biased + mant52)
+end
+
+/// Converts a float to an i64 (truncates toward zero). Best-effort for
+/// NaN/inf/out-of-range (NaN -> 0; |x| beyond i64 range -> a large value,
+/// not necessarily the saturated bound).
+export let float_to_i64 = fn (val: float) -> i64 do
+  let bits = f64_to_i64_bits(x: val)
+  let neg = lshr(v: bits, n: 63) & 1 == 1
+  let biased = lshr(v: bits, n: 52) & 2047
+  let frac = bits & ((1 << 52) - 1)
+  if biased == 2047 then return 0 end
+  if biased == 0 then return 0 end
+  let unbiased = biased - 1023
+  if unbiased < 0 then return 0 end
+  let mant = frac + (1 << 52)
+  let mag = if unbiased >= 52 then mant << (unbiased - 52) else lshr(v: mant, n: 52 - unbiased) end
+  return if neg then 0 - mag else mag end
+end
+
+/// Returns base raised to the power of exp. Stub (1.0): `f64.pow` is not a
+/// wasm primitive. Only `std:math.pow` callers are affected.
+export let pow = fn (base: float, exp: float) -> float do return 1.0 end
 
 /// Negates a boolean value.
 export let negate = fn (val: bool) -> bool do

@@ -1,14 +1,12 @@
 /**
- * runtime/sys_io: console (stdio) + filesystem runtime, ported to Nexus over
- * raw WASI preview1.
- *
- * reimplements the `__nx_print` / `__nx_eprint` /
- * `__nx_read_line` / `__nx_getchar` (stdio.nx) and `__nx_read_to_string` /
- * `__nx_write_string` / `__nx_append_string` / `__nx_exists` / `__nx_is_file` /
- * `__nx_read_dir` / `__nx_create_dir_all` / `__nx_remove_file` / `__nx_fd_*`
- * (fs.nx) plus `__nx_exit` / `__nx_argv` (proc.nx) FFI surfaces that the
- * source-less prebuilt `stdlib.wasm` exports, so they can become part of a
- * Nexus-built thread-safe replacement.
+ * runtime/sysio_impl: console (stdio) + filesystem + process runtime, on raw
+ * WASI preview1. Shared internal module — `std:stdio` (print/eprint/getchar/
+ * read_line), `std:fs` (read/write/exists/dir/fd ops), `std:proc` (exit/argv)
+ * and `std:bytebuffer` (write_file/read_file) wrap the raw `__nx_*` entry
+ * points exported here. It lives as one module rather than inline in each
+ * interface file because all of these share a single 512-byte scratch region
+ * and the WASI import block, and splitting would either duplicate that or
+ * introduce cyclic imports.
  *
  * The implementations only CALL WASI preview1 imports (the host implements
  * them); see https://github.com/WebAssembly/WASI/blob/main/legacy/preview1.
@@ -22,11 +20,11 @@
  * its params a_, b_, ... in the WASI ABI order, so alphabetical == positional
  * in both directions.
  *
- * Storage for returned strings + WASI out-param scratch comes from
- * `nxlib/stdlib_src/alloc.nx` (the bump allocator). A 256-byte scratch
+ * Storage for returned strings + WASI out-param scratch comes from the
+ * unified bump arena (`arena.alloc_raw`). A 256-byte scratch
  * region is lazily allocated and its pointer cached in linear-memory cell 8
- * (the [8,16) slice of the bundle's reserved [0,16) range -- the allocator only
- * touches the i32 at offset 0, so 8..16 is free). Reuse of one scratch region
+ * (the [8,16) slice of the reserved low memory -- the bump cell only
+ * uses the i64 at offset 0, so 8..16 is free). Reuse of one scratch region
  * is fine single-threaded; with wasi-threads concurrent fs/stdio calls would
  * race it -- an accepted, documented caveat, the same as
  * the allocator's reset race.
@@ -43,15 +41,6 @@
  * Stubbed (TODO -- later follow-ups):
  *   __nx_fd_path -> "" (would need a fd -> path table; the compiler never calls
  *                       Fs.handle_path, so this is unused in practice)
- * Known gaps:
- *   - `__nx_buf_write_file` in nxlib/stdlib_src/buffer.nx is STILL stubbed to
- *     false. ByteBuffer.write_file -> __nx_buf_write_file is how the compiler
- *     writes its `.wasm` output to disk, so the Nexus-built bundle cannot yet
- *     compile programs to a file until that stub is replaced (a follow-up can
- *     reuse `__nx_write_string` here -- the buffer layout is in buffer.nx).
- *   - create_dir_all only creates the LAST path component (preview1's
- *     path_create_directory is single-level; the old Rust used std::fs's
- *     recursive create_dir_all). Parents must already exist.
  */
 import external "wasi_snapshot_preview1"
 import * as mem from "std:runtime/mem"
@@ -129,8 +118,8 @@ let rights_dir = fn () -> i64 do return 2113536 end
 let rights_write = fn () -> i64 do return 536870911 end
 
 /// Linear-memory cell holding the (lazily allocated) scratch-region pointer.
-/// Lives in the bundle's reserved [0,16) range at offset 8 (the allocator only
-/// uses the i32 at offset 0). 0 means "not yet allocated".
+/// Lives in reserved low memory at offset 8 (the bump cell only uses the
+/// i64 at offset 0). 0 means "not yet allocated".
 let scratch_cell = fn () -> i64 do return 8 end
 
 /// Scratch region size (bytes). Holds (at fixed offsets) an iovec, an
@@ -822,231 +811,52 @@ export let __nx_fd_path = fn (a_fd: i64) -> i64 do
   return 0
 end
 
-// === test functions (return a single i64, checked via wasmtime --invoke) ====
+// === string-typed wrappers (the surface std:stdio / std:fs / std:proc use) ===
 //
-// Run with: wasmtime --invoke test_xxx /tmp/sys_io.wasm  (with --dir=. --dir=/tmp).
+// These bridge a Nexus `string` (a packed i64 (ptr<<32)|len) to the raw
+// (ptr,len) ABI of the impls above, and re-tag packed-i64 returns as `string`,
+// via the `nexus:runtime/lazy` type-pun intrinsic (a no-op at the WASM level).
 
-/// Print "hi\n" to stdout and return 0. (Visual check: prints "hi".)
-export let test_print = fn () -> i64 do
-  let p = alloc_bytes(n: 3)
-  let _ = mem.store_u8(addr: p, val: 104)
-  let _ = mem.store_u8(addr: p + 1, val: 105)
-  let _ = mem.store_u8(addr: p + 2, val: 10)
-  let _ = __nx_print(a_s_ptr: i32of(x: p), b_s_len: i32of(x: 3))
-  return 0
+import external "nexus:runtime/lazy"
+external pun_raw = "__nx_value_of_i64" : <T>(a_x: T) -> i64
+external pun_str = "__nx_value_of_i64" : <T>(a_x: i64) -> T
+
+let s_p = fn (s: string) -> i32 do return cast.i32_of(x: (pun_raw(a_x: s) / two_pow_32()) & 4294967295) end
+let s_l = fn (s: string) -> i32 do return cast.i32_of(x: pun_raw(a_x: s) & 4294967295) end
+
+// --- console ---
+export let print_str = fn (s: string) -> unit do return __nx_print(a_s_ptr: s_p(s), b_s_len: s_l(s)) end
+export let eprint_str = fn (s: string) -> unit do return __nx_eprint(a_s_ptr: s_p(s), b_s_len: s_l(s)) end
+export let getchar_str = fn () -> string do return pun_str(a_x: __nx_getchar()) end
+export let read_line_str = fn () -> string do return pun_str(a_x: __nx_read_line()) end
+
+// --- process ---
+export let exit_proc = fn (status: i64) -> unit do return __nx_exit(a_status: status) end
+export let argv_str = fn () -> string do return pun_str(a_x: __nx_argv()) end
+
+// --- filesystem: path ops ---
+export let exists_path = fn (path: string) -> bool do return __nx_exists(a_path_ptr: s_p(s: path), b_path_len: s_l(s: path)) end
+export let is_file_path = fn (path: string) -> bool do return __nx_is_file(a_path_ptr: s_p(s: path), b_path_len: s_l(s: path)) end
+export let read_to_string_path = fn (path: string) -> string do return pun_str(a_x: __nx_read_to_string(a_path_ptr: s_p(s: path), b_path_len: s_l(s: path))) end
+export let write_string_path = fn (path: string, content: string) -> bool do return __nx_write_string(a_path_ptr: s_p(s: path), b_path_len: s_l(s: path), c_content_ptr: s_p(s: content), d_content_len: s_l(s: content)) end
+export let append_string_path = fn (path: string, content: string) -> bool do return __nx_append_string(a_path_ptr: s_p(s: path), b_path_len: s_l(s: path), c_content_ptr: s_p(s: content), d_content_len: s_l(s: content)) end
+export let remove_file_path = fn (path: string) -> bool do return __nx_remove_file(a_path_ptr: s_p(s: path), b_path_len: s_l(s: path)) end
+export let create_dir_all_path = fn (path: string) -> bool do return __nx_create_dir_all(a_path_ptr: s_p(s: path), b_path_len: s_l(s: path)) end
+export let read_dir_path = fn (path: string) -> string do return pun_str(a_x: __nx_read_dir(a_path_ptr: s_p(s: path), b_path_len: s_l(s: path))) end
+
+// --- filesystem: fd ops ---
+export let fd_open_read_path = fn (path: string) -> i64 do return __nx_fd_open_read(a_path_ptr: s_p(s: path), b_path_len: s_l(s: path)) end
+export let fd_open_write_path = fn (path: string) -> i64 do return __nx_fd_open_write(a_path_ptr: s_p(s: path), b_path_len: s_l(s: path)) end
+export let fd_open_append_path = fn (path: string) -> i64 do return __nx_fd_open_append(a_path_ptr: s_p(s: path), b_path_len: s_l(s: path)) end
+export let fd_close_n = fn (fd: i64) -> bool do return __nx_fd_close(a_fd: fd) end
+export let fd_read_n = fn (fd: i64) -> string do return pun_str(a_x: __nx_fd_read(a_fd: fd)) end
+export let fd_write_n = fn (fd: i64, content: string) -> bool do return __nx_fd_write(a_fd: fd, b_content_ptr: s_p(s: content), c_content_len: s_l(s: content)) end
+export let fd_path_n = fn (fd: i64) -> string do return pun_str(a_x: __nx_fd_path(a_fd: fd)) end
+
+// --- bytebuffer write/read raw (ptr,len) entry points (no string boxing) ---
+export let write_string_raw = fn (a_path_ptr: i32, b_path_len: i32, c_content_ptr: i32, d_content_len: i32) -> bool do
+  return __nx_write_string(a_path_ptr, b_path_len, c_content_ptr, d_content_len)
 end
-
-/// Write "hello" to /tmp/nxtest_io.txt, read it back, check the bytes.
-/// Returns 1 if the round-trip is exact ("hello", len 5), else 0.
-export let test_writeread = fn () -> i64 do
-  // path "/tmp/nxtest_io.txt" = 18 bytes
-  let path = make_bytes18(b0: 47, b1: 116, b2: 109, b3: 112, b4: 47, b5: 110, b6: 120, b7: 116, b8: 101, b9: 115, b10: 116, b11: 95, b12: 105, b13: 111, b14: 46, b15: 116, b16: 120, b17: 116)
-  let content = make_bytes5(b0: 104, b1: 101, b2: 108, b3: 108, b4: 111) // "hello"
-  let okw = __nx_write_string(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18), c_content_ptr: i32of(x: content), d_content_len: i32of(x: 5))
-  if !okw then return 0 end
-  let r = __nx_read_to_string(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18))
-  let rp = (r / two_pow_32()) & 4294967295
-  let rl = r & 4294967295
-  if rl != 5 then return 0 end
-  let ok = mem.load_u8(addr: rp) == 104 && mem.load_u8(addr: rp + 1) == 101 && mem.load_u8(addr: rp + 2) == 108
-        && mem.load_u8(addr: rp + 3) == 108 && mem.load_u8(addr: rp + 4) == 111
-  return if ok then 1 else 0 end
+export let read_to_string_raw = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  return __nx_read_to_string(a_path_ptr, b_path_len)
 end
-
-/// Append " world" to /tmp/nxtest_io.txt (after test_writeread leaves "hello"),
-/// read back -> "hello world" (len 11). Returns 11 if correct, else 0.
-export let test_append = fn () -> i64 do
-  let path = make_bytes18(b0: 47, b1: 116, b2: 109, b3: 112, b4: 47, b5: 110, b6: 120, b7: 116, b8: 101, b9: 115, b10: 116, b11: 95, b12: 105, b13: 111, b14: 46, b15: 116, b16: 120, b17: 116)
-  let h = make_bytes5(b0: 104, b1: 101, b2: 108, b3: 108, b4: 111)
-  let _ = __nx_write_string(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18), c_content_ptr: i32of(x: h), d_content_len: i32of(x: 5))
-  // " world" = 32 119 111 114 108 100
-  let w = alloc_bytes(n: 6)
-  let _ = mem.store_u8(addr: w, val: 32)
-  let _ = mem.store_u8(addr: w + 1, val: 119)
-  let _ = mem.store_u8(addr: w + 2, val: 111)
-  let _ = mem.store_u8(addr: w + 3, val: 114)
-  let _ = mem.store_u8(addr: w + 4, val: 108)
-  let _ = mem.store_u8(addr: w + 5, val: 100)
-  let oka = __nx_append_string(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18), c_content_ptr: i32of(x: w), d_content_len: i32of(x: 6))
-  if !oka then return 0 end
-  let r = __nx_read_to_string(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18))
-  let rl = r & 4294967295
-  let rp = (r / two_pow_32()) & 4294967295
-  if rl != 11 then return 0 end
-  let ok = mem.load_u8(addr: rp + 5) == 32 && mem.load_u8(addr: rp + 10) == 100
-  return if ok then 11 else 0 end
-end
-
-/// exists("/tmp") == true; exists("/tmp/nx_nonexistent_xyz") == false;
-/// is_file("/tmp") == false. Returns 7 if all three hold, else 0.
-export let test_exists = fn () -> i64 do
-  // "/tmp" = 47 116 109 112
-  let tmp = alloc_bytes(n: 4)
-  let _ = mem.store_u8(addr: tmp, val: 47)
-  let _ = mem.store_u8(addr: tmp + 1, val: 116)
-  let _ = mem.store_u8(addr: tmp + 2, val: 109)
-  let _ = mem.store_u8(addr: tmp + 3, val: 112)
-  let e1 = __nx_exists(a_path_ptr: i32of(x: tmp), b_path_len: i32of(x: 4))
-  let isf = __nx_is_file(a_path_ptr: i32of(x: tmp), b_path_len: i32of(x: 4))
-  // "/tmp/nx_nonexistent_xyz" -- just reuse /tmp + a junk suffix; build 23 bytes
-  let bad = alloc_bytes(n: 23)
-  let _ = copy_bytes(dst: bad, src: tmp, count: 4)
-  let _ = mem.store_u8(addr: bad + 4, val: 47)  // '/'
-  let _ = fill_x(p: bad, off: 5, n: 18)         // 18 'x'
-  let e2 = __nx_exists(a_path_ptr: i32of(x: bad), b_path_len: i32of(x: 23))
-  let ok = e1 && !e2 && !isf
-  return if ok then 7 else 0 end
-end
-
-/// read_dir(".") should include "Cargo.toml"-ish entries... we just check it's
-/// non-empty and sorted. Returns the entry count if the first byte of the first
-/// entry name is <= the first byte of the second (sorted), else 0. Simpler:
-/// just return 1 if read_dir("/tmp") returns a non-empty packed string (it has
-/// our test file), else 0.
-export let test_readdir = fn () -> i64 do
-  let tmp = alloc_bytes(n: 4)
-  let _ = mem.store_u8(addr: tmp, val: 47)
-  let _ = mem.store_u8(addr: tmp + 1, val: 116)
-  let _ = mem.store_u8(addr: tmp + 2, val: 109)
-  let _ = mem.store_u8(addr: tmp + 3, val: 112)
-  let r = __nx_read_dir(a_path_ptr: i32of(x: tmp), b_path_len: i32of(x: 4))
-  let rl = r & 4294967295
-  return if rl > 0 then 1 else 0 end
-end
-
-/// create_dir_all("/tmp/nxd_io") then write two files "b.txt" and "a.txt" in
-/// it, then read_dir -> sorted "a.txt\nb.txt" (len 11). Returns 11 iff the
-/// listing is exactly that (first byte 'a'=97, byte after "a.txt\n" is 'b'=98).
-export let test_dir_create_readdir = fn () -> i64 do
-  // "/tmp/nxd_io" = 11 bytes: 47 116 109 112 47 110 120 100 95 105 111
-  let dir = alloc_bytes(n: 11)
-  let _ = wb11(p: dir, b0: 47, b1: 116, b2: 109, b3: 112, b4: 47, b5: 110, b6: 120, b7: 100, b8: 95, b9: 105, b10: 111)
-  let okd = __nx_create_dir_all(a_path_ptr: i32of(x: dir), b_path_len: i32of(x: 11))
-  if !okd then return 0 end
-  // "/tmp/nxd_io/b.txt" and ".../a.txt" = 17 bytes each
-  let pb = alloc_bytes(n: 17)
-  let _ = copy_bytes(dst: pb, src: dir, count: 11)
-  let _ = mem.store_u8(addr: pb + 11, val: 47)   // '/'
-  let _ = mem.store_u8(addr: pb + 12, val: 98)   // 'b'
-  let _ = mem.store_u8(addr: pb + 13, val: 46)   // '.'
-  let _ = mem.store_u8(addr: pb + 14, val: 116)  // 't'
-  let _ = mem.store_u8(addr: pb + 15, val: 120)  // 'x'
-  let _ = mem.store_u8(addr: pb + 16, val: 116)  // 't'
-  let pa = alloc_bytes(n: 17)
-  let _ = copy_bytes(dst: pa, src: pb, count: 17)
-  let _ = mem.store_u8(addr: pa + 12, val: 97)   // 'a'
-  let c1 = make_bytes5(b0: 49, b1: 50, b2: 51, b3: 52, b4: 53)
-  let _ = __nx_write_string(a_path_ptr: i32of(x: pb), b_path_len: i32of(x: 17), c_content_ptr: i32of(x: c1), d_content_len: i32of(x: 5))
-  let _ = __nx_write_string(a_path_ptr: i32of(x: pa), b_path_len: i32of(x: 17), c_content_ptr: i32of(x: c1), d_content_len: i32of(x: 5))
-  let r = __nx_read_dir(a_path_ptr: i32of(x: dir), b_path_len: i32of(x: 11))
-  let rl = r & 4294967295
-  let rp = (r / two_pow_32()) & 4294967295
-  if rl != 11 then return 0 end
-  let ok = mem.load_u8(addr: rp) == 97 && mem.load_u8(addr: rp + 5) == 10 && mem.load_u8(addr: rp + 6) == 98
-  let _ = __nx_remove_file(a_path_ptr: i32of(x: pa), b_path_len: i32of(x: 17))
-  let _ = __nx_remove_file(a_path_ptr: i32of(x: pb), b_path_len: i32of(x: 17))
-  return if ok then 11 else 0 end
-end
-
-let wb11 = fn (p: i64, b0: i64, b1: i64, b2: i64, b3: i64, b4: i64, b5: i64, b6: i64, b7: i64, b8: i64, b9: i64, b10: i64) -> unit do
-  let _ = mem.store_u8(addr: p, val: b0)
-  let _ = mem.store_u8(addr: p + 1, val: b1)
-  let _ = mem.store_u8(addr: p + 2, val: b2)
-  let _ = mem.store_u8(addr: p + 3, val: b3)
-  let _ = mem.store_u8(addr: p + 4, val: b4)
-  let _ = mem.store_u8(addr: p + 5, val: b5)
-  let _ = mem.store_u8(addr: p + 6, val: b6)
-  let _ = mem.store_u8(addr: p + 7, val: b7)
-  let _ = mem.store_u8(addr: p + 8, val: b8)
-  let _ = mem.store_u8(addr: p + 9, val: b9)
-  return mem.store_u8(addr: p + 10, val: b10)
-end
-
-/// remove_file: write /tmp/nxtest_rm.txt, then remove it, then exists() == false.
-/// Returns 9 on success, else 0.
-export let test_remove = fn () -> i64 do
-  // "/tmp/nxtest_rm.txt" = 18 bytes: 47 116 109 112 47 110 120 116 101 115 116 95 114 109 46 116 120 116
-  let path = make_bytes18(b0: 47, b1: 116, b2: 109, b3: 112, b4: 47, b5: 110, b6: 120, b7: 116, b8: 101, b9: 115, b10: 116, b11: 95, b12: 114, b13: 109, b14: 46, b15: 116, b16: 120, b17: 116)
-  let c = make_bytes5(b0: 120, b1: 121, b2: 122, b3: 119, b4: 118)
-  let _ = __nx_write_string(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18), c_content_ptr: i32of(x: c), d_content_len: i32of(x: 5))
-  let okr = __nx_remove_file(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18))
-  if !okr then return 0 end
-  let still = __nx_exists(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18))
-  return if !still then 9 else 0 end
-end
-
-/// fd ops: open /tmp/nxtest_fd.txt for write, write "abc", close; open for
-/// read, fd_read whole -> "abc", close. Returns 3 if exact, else 0.
-export let test_fd = fn () -> i64 do
-  // "/tmp/nxtest_fd.txt" = 18 bytes
-  let path = make_bytes18(b0: 47, b1: 116, b2: 109, b3: 112, b4: 47, b5: 110, b6: 120, b7: 116, b8: 101, b9: 115, b10: 116, b11: 95, b12: 102, b13: 100, b14: 46, b15: 116, b16: 120, b17: 116)
-  let abc = alloc_bytes(n: 3)
-  let _ = mem.store_u8(addr: abc, val: 97)
-  let _ = mem.store_u8(addr: abc + 1, val: 98)
-  let _ = mem.store_u8(addr: abc + 2, val: 99)
-  let wfd = __nx_fd_open_write(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18))
-  if wfd < 0 then return 0 end
-  let okw = __nx_fd_write(a_fd: wfd, b_content_ptr: i32of(x: abc), c_content_len: i32of(x: 3))
-  let _ = __nx_fd_close(a_fd: wfd)
-  if !okw then return 0 end
-  let rfd = __nx_fd_open_read(a_path_ptr: i32of(x: path), b_path_len: i32of(x: 18))
-  if rfd < 0 then return 0 end
-  let r = __nx_fd_read(a_fd: rfd)
-  let _ = __nx_fd_close(a_fd: rfd)
-  let rl = r & 4294967295
-  let rp = (r / two_pow_32()) & 4294967295
-  if rl != 3 then return 0 end
-  let ok = mem.load_u8(addr: rp) == 97 && mem.load_u8(addr: rp + 1) == 98 && mem.load_u8(addr: rp + 2) == 99
-  return if ok then 3 else 0 end
-end
-
-/// argv: returns 1 if __nx_argv() yields a non-empty packed string (the program
-/// name is always arg0 under wasmtime), else 0.
-export let test_argv = fn () -> i64 do
-  let r = __nx_argv()
-  let rl = r & 4294967295
-  return if rl > 0 then 1 else 0 end
-end
-
-// --- byte-builder helpers for tests ---
-
-let fill_x = fn (p: i64, off: i64, n: i64) -> unit do
-  if n <= 0 then return () end
-  let _ = mem.store_u8(addr: p + off, val: 120)
-  return fill_x(p, off: off + 1, n: n - 1)
-end
-
-let make_bytes5 = fn (b0: i64, b1: i64, b2: i64, b3: i64, b4: i64) -> i64 do
-  let p = alloc_bytes(n: 5)
-  let _ = mem.store_u8(addr: p, val: b0)
-  let _ = mem.store_u8(addr: p + 1, val: b1)
-  let _ = mem.store_u8(addr: p + 2, val: b2)
-  let _ = mem.store_u8(addr: p + 3, val: b3)
-  let _ = mem.store_u8(addr: p + 4, val: b4)
-  return p
-end
-
-let make_bytes18 = fn (b0: i64, b1: i64, b2: i64, b3: i64, b4: i64, b5: i64, b6: i64, b7: i64, b8: i64, b9: i64, b10: i64, b11: i64, b12: i64, b13: i64, b14: i64, b15: i64, b16: i64, b17: i64) -> i64 do
-  let p = alloc_bytes(n: 18)
-  let _ = mem.store_u8(addr: p, val: b0)
-  let _ = mem.store_u8(addr: p + 1, val: b1)
-  let _ = mem.store_u8(addr: p + 2, val: b2)
-  let _ = mem.store_u8(addr: p + 3, val: b3)
-  let _ = mem.store_u8(addr: p + 4, val: b4)
-  let _ = mem.store_u8(addr: p + 5, val: b5)
-  let _ = mem.store_u8(addr: p + 6, val: b6)
-  let _ = mem.store_u8(addr: p + 7, val: b7)
-  let _ = mem.store_u8(addr: p + 8, val: b8)
-  let _ = mem.store_u8(addr: p + 9, val: b9)
-  let _ = mem.store_u8(addr: p + 10, val: b10)
-  let _ = mem.store_u8(addr: p + 11, val: b11)
-  let _ = mem.store_u8(addr: p + 12, val: b12)
-  let _ = mem.store_u8(addr: p + 13, val: b13)
-  let _ = mem.store_u8(addr: p + 14, val: b14)
-  let _ = mem.store_u8(addr: p + 15, val: b15)
-  let _ = mem.store_u8(addr: p + 16, val: b16)
-  let _ = mem.store_u8(addr: p + 17, val: b17)
-  return p
-end
-
-export let main = fn () -> unit do return () end

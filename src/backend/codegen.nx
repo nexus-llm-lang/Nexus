@@ -256,24 +256,7 @@ let find_func_idx_by_suffix = fn (suffix: string, funcs: [LirFunction], internal
   end
 end
 
-/** Resolve `--bundle-exports` names (each is both the requested Nexus function */
-/** name and the wasm export symbol to emit) to `(name, wasm-func-idx)` pairs. */
-/** Entry-file functions are source-qualified (`<path>#name`), so a bare lookup */
-/** failure falls back to a `#<name>` suffix match — mirroring how `argv` is */
-/** located. Raises if a requested name has no matching function. */
-let resolve_bundle_exports = fn (names: [string], funcs: [LirFunction], internal_func_map: &HashMap) -> [ExportNameIdx] throws { CodegenError } do
-  match names do
-    | [] -> return []
-    | nm :: rest ->
-      let bare = wdefs.lookup_func_fast(name: nm, map: internal_func_map)
-      let idx = if bare >= 0 then bare else find_func_idx_by_suffix(suffix: "#" ++ nm, funcs, internal_func_map) end
-      if idx < 0 then
-        raise SymbolNotFound(name: nm, kind: "function", context: "--bundle-exports")
-      end
-      return ExportNameIdx(name: nm, index: idx) :: resolve_bundle_exports(names: rest, funcs, internal_func_map)
-  end
-end
-
+/** Find a function index by source-qualified `#name` suffix match (mirrors */
 /// If the program defines `wasi_thread_start` (pulled in via `std:lazy` /
 /// `std:lazy_host`), it must be exported under exactly that name so wasi-threads
 /// workers can find it; its `(i32, i32) -> ()` signature is produced by the
@@ -460,7 +443,7 @@ let emit_heap_swap = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) 
 end
 
 /** `nexus:runtime/arena.alloc-raw : (size: i64) -> i64` — raw byte allocation */
-/** off the unified atomic bump cell. Used by `nxlib/stdlib_src` impls. Emits: */
+/** off the unified atomic bump cell. Used by stdlib runtime impls. Emits: */
 /** wrap the i64 size to i32, atomic-bump (rounds up to 8, grows memory), */
 /** zero-extend the resulting i32 base pointer back to i64. */
 let emit_alloc_raw = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
@@ -2413,10 +2396,12 @@ end
 
 /** cabi_realloc: bump allocator emitted alongside the canonical-ABI */
 /** string-lift/lower path (currently dormant — see collect.needs_cabi_realloc). */
-/** Bumps the unified atomic heap cell (`wdefs.heap_ptr_cell`). The cell always */
-/** holds an 8-aligned value (heap_base is align8 and every bump is a multiple */
-/** of 8), which covers the canonical ABI's `align` (always <= 8), so the */
-/** `align` parameter is ignored. Signature: */
+/** Bumps the unified atomic heap cell (`wdefs.heap_ptr_cell`); the cell always */
+/** holds an 8-aligned value (every bump is a multiple of 8), which covers the */
+/** canonical ABI's `align` (always <= 8), so the `align` parameter is ignored. */
+/** Like emit_atomic_bump, it lazily seeds the cell via */
+/** `cmpxchg(cell, 0, memory.size()*65536)` so it is correct even before any */
+/** other allocation has run. Signature: */
 /** `(orig_ptr i32, orig_size i32, align i32, new_size i32) -> i32`. */
 let compile_cabi_realloc = fn (heap_base: i64) -> %ByteBuffer throws { CodegenError } do
   let _ = heap_base
@@ -2425,6 +2410,18 @@ let compile_cabi_realloc = fn (heap_base: i64) -> %ByteBuffer throws { CodegenEr
   let %body = bb.push_uleb128(buf: %body, val: 1)
   let %body = bb.push_uleb128(buf: %body, val: 2)
   let %body = bb.push_byte(buf: %body, byte: vt_i32)
+  // Idempotent seed: cmpxchg(cell, 0, memory.size()*65536); drop old.
+  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
+  let %body = bb.push_sleb128(buf: %body, val: wdefs.heap_ptr_cell)
+  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
+  let %body = bb.push_sleb128(buf: %body, val: 0)
+  let %body = bb.push_byte(buf: %body, byte: op_memory_size)
+  let %body = bb.push_byte(buf: %body, byte: 0)
+  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
+  let %body = bb.push_sleb128(buf: %body, val: 16)
+  let %body = bb.push_byte(buf: %body, byte: wdefs.op_i32_shl)
+  let %body = wdefs.emit_atomic_op32(buf: %body, sub_op: wdefs.op_i32_atomic_rmw_cmpxchg, offset: 0)
+  let %body = bb.push_byte(buf: %body, byte: op_drop)
   // rounded_size = (new_size + 7) & ~8
   let %body = bb.push_byte(buf: %body, byte: op_local_get)
   let %body = bb.push_uleb128(buf: %body, val: 3) // new_size
@@ -2920,7 +2917,7 @@ end
 // ─── Module entry point ────────────────────────────────────────────────────
 
 export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
-                                       effect_map: &EffectMap, bundle_exports: [string]) -> %ByteBuffer throws { CodegenError } do
+                                       effect_map: &EffectMap) -> %ByteBuffer throws { CodegenError } do
   match program do
     | LirProgram(functions: funcs, externals: all_exts) ->
 
@@ -2945,10 +2942,6 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
       let heap_enabled = wcollect.program_uses_heap(funcs)
       let has_cabi = wcollect.needs_cabi_realloc(exts)
       let n_cabi = if has_cabi then 1 else 0 end
-      // `--bundle-exports` library mode (compiling nxlib/stdlib_src/bundle_main.nx):
-      // the cell-0 heap-pointer data segment is emitted only for non-bundle
-      // builds; the program a bundle is merged into provides cell init.
-      let bundle_mode = list.length(xs: bundle_exports) > 0
       // alloc_mode (legacy — still stored in CodegenCtx but no longer branched
       // on by emit_*): 1 = program allocates on the heap, 0 = it does not. All
       // allocations now bump the atomic cell at wdefs.heap_ptr_cell.
@@ -2970,12 +2963,9 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
       let closure_arities = collect_closure_arities(funcs)
 
       let main_idx = wdefs.lookup_func_fast(name: "main", map: &internal_func_map)
-      // `--bundle-exports` library mode: resolve requested names → (name, idx).
-      // Plus an implicit `wasi_thread_start` export when the lazy/threads
-      // runtime is linked (so wasi-threads workers can find the trampoline).
-      let resolved_bundle_exports = list.concat(
-        xs: resolve_bundle_exports(names: bundle_exports, funcs, internal_func_map: &internal_func_map),
-        ys: wasi_thread_start_export(funcs, internal_func_map: &internal_func_map))
+      // Implicit `wasi_thread_start` export when the lazy/threads runtime is
+      // linked (so wasi-threads workers can find the trampoline). `[]` otherwise.
+      let extra_exports = wasi_thread_start_export(funcs, internal_func_map: &internal_func_map)
       let main_ret = match wdefs.find_function_fast(name: "main", funcs, map: &internal_func_map, import_count) do
         | Some(val: LirFunction(name: _, params: _, ret_type: rt, body: _, ret: _, span: _)) -> rt
         | None -> TyUnit
@@ -3119,7 +3109,7 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
                                                            mem_mode,
                                                            has_table: n_closures > 0,
                                                            has_ss,
-                                                           extra_exports: resolved_bundle_exports))
+                                                           extra_exports: extra_exports))
 
       // Element section (populate funcref table)
       let %m = if n_closures > 0 then
@@ -3162,14 +3152,15 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
       let %code = append_body_to_buf(buf: %code, body: %wasi_body)
       let %m = wdefs.emit_section(buf: %m, id: sec_code, content: %code)
 
-      // Data section. For non-bundle builds, prepend a 4-byte active data
-      // segment at offset wdefs.heap_ptr_cell that initialises the atomic bump
-      // cell to `heap_base` (no lazy CAS init). Bundle builds (stdlib.wasm)
-      // omit it — the program a bundle is merged into provides cell init.
-      let cell_init = if bundle_mode then (0 - 1) else heap_base end
-      let %m = if has_strings || !bundle_mode then
-        wdefs.emit_section(buf: %m, id: sec_data, content: wsect.build_data_section(entries: string_entries, cell_init: cell_init))
-      else %m end
+      // Data section — string literals only. The atomic bump cell at
+      // wdefs.heap_ptr_cell is NOT data-segment initialised: under WASI threads
+      // each worker spawns a fresh instance that re-runs the module's data
+      // segments against the SHARED linear memory, so a cell-0 data segment
+      // would clobber the bump pointer mid-run. Instead emit_atomic_bump's
+      // idempotent `cmpxchg(cell, 0, memory.size()*65536)` lazily seeds the
+      // cell on the first allocation (the seed is the top of all static data,
+      // since string literals live in the initial pages).
+      let %m = wdefs.emit_section(buf: %m, id: sec_data, content: wsect.build_data_section(entries: string_entries, cell_init: 0 - 1))
 
       // Name section (custom)
       let total_named_funcs = import_count + n_funcs + 1

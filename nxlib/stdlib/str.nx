@@ -1,87 +1,635 @@
 /**
  * string: String inspection and manipulation functions.
+ *
+ * The `__nx_string_*` byte-level primitives are implemented here directly
+ * (UTF-8 aware, ASCII-fast). They keep the historical `(ptr, len) -> packed`
+ * shape internally; the public surface wraps them, decomposing a Nexus
+ * `string` (a packed i64 `(ptr << 32) | len`) at the call boundary via the
+ * `nexus:runtime/lazy` type-pun intrinsic and re-tagging packed results.
+ *
+ * Caveats:
+ *   - to_lower/to_upper: ASCII only (no Unicode case folding).
+ *   - trim: ASCII whitespace (space, tab, \n, \r) only.
+ *   - pad_left/pad_right: fill is cycled byte-by-byte; exact only when fill is
+ *     ASCII (the universal case). Pad amount is computed in characters.
+ *   - from_char/from_char_code: no surrogate/range validation -- encodes the
+ *     low bits as UTF-8; negative inputs return "".
+ *   - from_float / to_f64 / is_valid_f64: f64 round-trip formatting/parsing in
+ *     Nexus is not yet available; stubbed ("" / 0.0 / false).
  */
-import external "std:str"
+import * as mem from "std:runtime/mem"
+import * as cast from "std:runtime/cast"
+import * as arena from "std:runtime/arena"
+import external "nexus:runtime/lazy"
+
+/// Type puns (pure passthrough at the WASM level — every Nexus value is an i64).
+external pun_i64 = "__nx_value_of_i64" : <T>(a_x: T) -> i64
+external pun_val = "__nx_value_of_i64" : <T>(a_x: i64) -> T
+
+/// 2^32 -- multiplier to pack a (ptr, len) pair into a returned string i64.
+let two_pow_32 = fn () -> i64 do return 4294967296 end
+
+let s_ptr = fn (s: string) -> i32 do return cast.i32_of(x: (pun_i64(a_x: s) / two_pow_32()) & 4294967295) end
+let s_len = fn (s: string) -> i32 do return cast.i32_of(x: pun_i64(a_x: s) & 4294967295) end
+let to_str = fn (packed: i64) -> string do return pun_val(a_x: packed) end
+
+// --- byte helpers ---
+
+let byte_at_addr = fn (base: i64, i: i64) -> i64 do return mem.load_u8(addr: base + i) end
+let load_at = fn (a: i64) -> i64 do return mem.load_u8(addr: a) end
+let store_at = fn (a: i64, v: i64) -> unit do return mem.store_u8(addr: a, val: v & 255) end
+let put_byte = fn (base: i64, i: i64, v: i64) -> unit do return mem.store_u8(addr: base + i, val: v & 255) end
+
+let copy_bytes = fn (dst: i64, src: i64, count: i64) -> unit do return copy_bytes_at(dst, src, count, i: 0) end
+let copy_bytes_at = fn (dst: i64, src: i64, count: i64, i: i64) -> unit do
+  if i >= count then return () end
+  let _ = mem.store_u8(addr: dst + i, val: mem.load_u8(addr: src + i))
+  return copy_bytes_at(dst, src, count, i: i + 1)
+end
+
+/// Allocate `n` bytes; return the byte offset (0 when n <= 0 -- empty result).
+let alloc_bytes = fn (n: i64) -> i64 do
+  if n <= 0 then return 0 end
+  return arena.alloc_raw(size: n)
+end
+
+/// Pack a (ptr, len) pair into the string return i64.
+let pack = fn (ptr: i64, len: i64) -> i64 do
+  if len <= 0 then return 0 end
+  return (ptr * two_pow_32()) + len
+end
+
+/// Allocate and copy `len` bytes from `src` into a fresh region; return packed.
+let make_string = fn (src: i64, len: i64) -> i64 do
+  if len <= 0 then return 0 end
+  let p = alloc_bytes(n: len)
+  let _ = copy_bytes(dst: p, src, count: len)
+  return pack(ptr: p, len)
+end
+
+// --- UTF-8 helpers ---
+
+/// UTF-8 sequence length implied by lead byte `b` (1..4).
+let seq_len = fn (b: i64) -> i64 do
+  if b < 128 then return 1 end
+  if b < 224 then return 2 end
+  if b < 240 then return 3 end
+  return 4
+end
+
+/// Count characters in [base, base+len): bytes whose top two bits != 10.
+let char_count = fn (base: i64, len: i64) -> i64 do return char_count_go(base, len, i: 0, n: 0) end
+let char_count_go = fn (base: i64, len: i64, i: i64, n: i64) -> i64 do
+  if i >= len then return n end
+  let b = byte_at_addr(base, i)
+  let add = if (b & 192) != 128 then 1 else 0 end
+  return char_count_go(base, len, i: i + 1, n: n + add)
+end
+
+/// Byte offset of character index `ci` (clamped to [0, len]). If `ci` is past
+/// the end, returns `len`.
+let char_to_byte = fn (base: i64, len: i64, ci: i64) -> i64 do
+  if ci <= 0 then return 0 end
+  return char_to_byte_go(base, len, remaining: ci, i: 0)
+end
+let char_to_byte_go = fn (base: i64, len: i64, remaining: i64, i: i64) -> i64 do
+  if i >= len then return len end
+  if remaining <= 0 then return i end
+  let step = seq_len(b: byte_at_addr(base, i))
+  return char_to_byte_go(base, len, remaining: remaining - 1, i: i + step)
+end
+
+/// Decode the codepoint of the UTF-8 sequence starting at byte offset `i`
+/// (assumes `i` is a valid lead-byte position and the sequence fits).
+let decode_cp = fn (base: i64, i: i64) -> i64 do
+  let b0 = byte_at_addr(base, i)
+  if b0 < 128 then return b0 end
+  let b1 = byte_at_addr(base, i: i + 1) & 63
+  if b0 < 224 then return ((b0 & 31) * 64) + b1 end
+  let b2 = byte_at_addr(base, i: i + 2) & 63
+  if b0 < 240 then return ((b0 & 15) * 4096) + (b1 * 64) + b2 end
+  let b3 = byte_at_addr(base, i: i + 3) & 63
+  return ((b0 & 7) * 262144) + (b1 * 4096) + (b2 * 64) + b3
+end
+
+/// Number of UTF-8 bytes needed to encode codepoint `cp` (cp >= 0).
+let enc_len = fn (cp: i64) -> i64 do
+  if cp < 128 then return 1 end
+  if cp < 2048 then return 2 end
+  if cp < 65536 then return 3 end
+  return 4
+end
+
+/// Encode codepoint `cp` as UTF-8 into [base, base+enc_len(cp)).
+let encode_cp = fn (base: i64, cp: i64) -> unit do
+  if cp < 128 then return put_byte(base, i: 0, v: cp) end
+  if cp < 2048 then
+    let _ = put_byte(base, i: 0, v: 192 + (cp / 64))
+    return put_byte(base, i: 1, v: 128 + (cp & 63))
+  end
+  if cp < 65536 then
+    let _ = put_byte(base, i: 0, v: 224 + (cp / 4096))
+    let _ = put_byte(base, i: 1, v: 128 + ((cp / 64) & 63))
+    return put_byte(base, i: 2, v: 128 + (cp & 63))
+  end
+  let _ = put_byte(base, i: 0, v: 240 + (cp / 262144))
+  let _ = put_byte(base, i: 1, v: 128 + ((cp / 4096) & 63))
+  let _ = put_byte(base, i: 2, v: 128 + ((cp / 64) & 63))
+  return put_byte(base, i: 3, v: 128 + (cp & 63))
+end
+
+// --- ASCII predicates ---
+
+let is_ws = fn (b: i64) -> bool do return b == 32 || b == 9 || b == 10 || b == 13 end
+let is_digit_byte = fn (b: i64) -> bool do return b >= 48 && b <= 57 end
+let is_alpha_byte = fn (b: i64) -> bool do return (b >= 65 && b <= 90) || (b >= 97 && b <= 122) end
+let is_ident_byte = fn (b: i64) -> bool do return is_alpha_byte(b) || is_digit_byte(b) || b == 95 end
+
+let to_lower_byte = fn (b: i64) -> i64 do if b >= 65 && b <= 90 then return b + 32 else return b end end
+let to_upper_byte = fn (b: i64) -> i64 do if b >= 97 && b <= 122 then return b - 32 else return b end end
+
+/// Clamp `v` to [0, hi].
+let clamp = fn (v: i64, hi: i64) -> i64 do
+  let lo = if v < 0 then 0 else v end
+  return if lo > hi then hi else lo end
+end
+
+// --- substring search (byte-level, naive) ---
+
+let mem_eq_at = fn (base: i64, at: i64, sb: i64, slen: i64) -> bool do return mem_eq_at_go(base, at, sb, slen, i: 0) end
+let mem_eq_at_go = fn (base: i64, at: i64, sb: i64, slen: i64, i: i64) -> bool do
+  if i >= slen then return true end
+  if load_at(a: base + at + i) != load_at(a: sb + i) then return false end
+  return mem_eq_at_go(base, at, sb, slen, i: i + 1)
+end
+
+let find_sub = fn (base: i64, len: i64, sb: i64, slen: i64, start_at: i64) -> i64 do
+  if slen <= 0 then return start_at end
+  return find_sub_go(base, len, sb, slen, i: start_at)
+end
+let find_sub_go = fn (base: i64, len: i64, sb: i64, slen: i64, i: i64) -> i64 do
+  if i + slen > len then return 0 - 1 end
+  if mem_eq_at(base, at: i, sb, slen) then return i end
+  return find_sub_go(base, len, sb, slen, i: i + 1)
+end
+
+// === byte-level primitives (internal; (ptr,len,...) -> i64/bool/i32) ===
+
+let __nx_string_length = fn (a_s_ptr: i32, b_s_len: i32) -> i64 do
+  return char_count(base: cast.i64_of(x: a_s_ptr), len: cast.i64_of(x: b_s_len))
+end
+
+let __nx_string_byte_length = fn (a_s_ptr: i32, b_s_len: i32) -> i64 do
+  return cast.i64_of(x: b_s_len)
+end
+
+let __nx_string_byte_at = fn (a_s_ptr: i32, b_s_len: i32, c_idx: i64) -> i32 do
+  let len = cast.i64_of(x: b_s_len)
+  if c_idx < 0 || c_idx >= len then return cast.i32_of(x: 0) end
+  return cast.i32_of(x: byte_at_addr(base: cast.i64_of(x: a_s_ptr), i: c_idx))
+end
+
+let __nx_string_char_at = fn (a_s_ptr: i32, b_s_len: i32, c_idx: i64) -> i32 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  if c_idx < 0 then return cast.i32_of(x: 0) end
+  let off = char_to_byte(base, len, ci: c_idx)
+  if off >= len then return cast.i32_of(x: 0) end
+  return cast.i32_of(x: decode_cp(base, i: off))
+end
+
+let __nx_string_char_code = fn (a_s_ptr: i32, b_s_len: i32, c_idx: i64) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  if c_idx < 0 then return 0 - 1 end
+  let off = char_to_byte(base, len, ci: c_idx)
+  if off >= len then return 0 - 1 end
+  return decode_cp(base, i: off)
+end
+
+let __nx_string_byte_substring = fn (a_s_ptr: i32, b_s_len: i32, c_start: i64, d_len: i64) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  let start = clamp(v: c_start, hi: len)
+  let want = if d_len < 0 then 0 else d_len end
+  let avail = len - start
+  let n = if want > avail then avail else want end
+  return make_string(src: base + start, len: n)
+end
+
+let __nx_string_substring = fn (a_s_ptr: i32, b_s_len: i32, c_start: i64, d_len: i64) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  let s_off = char_to_byte(base, len, ci: if c_start < 0 then 0 else c_start end)
+  let nchars = if d_len < 0 then 0 else d_len end
+  let e_off = char_to_byte_go(base, len, remaining: nchars, i: s_off)
+  return make_string(src: base + s_off, len: e_off - s_off)
+end
+
+let __nx_string_from_char = fn (a_c: i32) -> i64 do
+  let cp = cast.i64_of(x: a_c)
+  if cp < 0 then return 0 end
+  let n = enc_len(cp)
+  let p = alloc_bytes(n)
+  let _ = encode_cp(base: p, cp)
+  return pack(ptr: p, len: n)
+end
+
+let __nx_string_from_char_code = fn (a_code: i64) -> i64 do
+  if a_code < 0 then return 0 end
+  let n = enc_len(cp: a_code)
+  let p = alloc_bytes(n)
+  let _ = encode_cp(base: p, cp: a_code)
+  return pack(ptr: p, len: n)
+end
+
+let __nx_string_contains = fn (a_s_ptr: i32, b_s_len: i32, c_sub_ptr: i32, d_sub_len: i32) -> bool do
+  return find_sub(base: cast.i64_of(x: a_s_ptr), len: cast.i64_of(x: b_s_len),
+                  sb: cast.i64_of(x: c_sub_ptr), slen: cast.i64_of(x: d_sub_len), start_at: 0) >= 0
+end
+
+let __nx_string_starts_with = fn (a_s_ptr: i32, b_s_len: i32, c_prefix_ptr: i32, d_prefix_len: i32) -> bool do
+  let plen = cast.i64_of(x: d_prefix_len)
+  if plen > cast.i64_of(x: b_s_len) then return false end
+  return mem_eq_at(base: cast.i64_of(x: a_s_ptr), at: 0, sb: cast.i64_of(x: c_prefix_ptr), slen: plen)
+end
+
+let __nx_string_ends_with = fn (a_s_ptr: i32, b_s_len: i32, c_suffix_ptr: i32, d_suffix_len: i32) -> bool do
+  let len = cast.i64_of(x: b_s_len)
+  let slen = cast.i64_of(x: d_suffix_len)
+  if slen > len then return false end
+  return mem_eq_at(base: cast.i64_of(x: a_s_ptr), at: len - slen, sb: cast.i64_of(x: c_suffix_ptr), slen)
+end
+
+let __nx_string_index_of = fn (a_s_ptr: i32, b_s_len: i32, c_sub_ptr: i32, d_sub_len: i32) -> i64 do
+  return find_sub(base: cast.i64_of(x: a_s_ptr), len: cast.i64_of(x: b_s_len),
+                  sb: cast.i64_of(x: c_sub_ptr), slen: cast.i64_of(x: d_sub_len), start_at: 0)
+end
+
+let __nx_string_find_byte = fn (a_s_ptr: i32, b_s_len: i32, c_start: i64, d_ch: i32) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  let start = clamp(v: c_start, hi: len)
+  return find_byte_go(base, len, target: cast.i64_of(x: d_ch) & 255, i: start)
+end
+let find_byte_go = fn (base: i64, len: i64, target: i64, i: i64) -> i64 do
+  if i >= len then return 0 - 1 end
+  if byte_at_addr(base, i) == target then return i end
+  return find_byte_go(base, len, target, i: i + 1)
+end
+
+let __nx_string_count_newlines_in = fn (a_s_ptr: i32, b_s_len: i32, c_start: i64, d_end_pos: i64) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  let start = clamp(v: c_start, hi: len)
+  let endp = clamp(v: d_end_pos, hi: len)
+  return count_nl_go(base, endp, i: start, n: 0)
+end
+let count_nl_go = fn (base: i64, endp: i64, i: i64, n: i64) -> i64 do
+  if i >= endp then return n end
+  let add = if byte_at_addr(base, i) == 10 then 1 else 0 end
+  return count_nl_go(base, endp, i: i + 1, n: n + add)
+end
+
+let __nx_string_last_newline_in = fn (a_s_ptr: i32, b_s_len: i32, c_start: i64, d_end_pos: i64) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  let start = clamp(v: c_start, hi: len)
+  let endp = clamp(v: d_end_pos, hi: len)
+  return last_nl_go(base, start, i: endp - 1)
+end
+let last_nl_go = fn (base: i64, start: i64, i: i64) -> i64 do
+  if i < start then return 0 - 1 end
+  if byte_at_addr(base, i) == 10 then return i end
+  return last_nl_go(base, start, i: i - 1)
+end
+
+let __nx_string_scan_ident = fn (a_s_ptr: i32, b_s_len: i32, c_start: i64) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  return scan_ident_go(base, len, i: clamp(v: c_start, hi: len))
+end
+let scan_ident_go = fn (base: i64, len: i64, i: i64) -> i64 do
+  if i >= len then return len end
+  if !is_ident_byte(b: byte_at_addr(base, i)) then return i end
+  return scan_ident_go(base, len, i: i + 1)
+end
+
+let __nx_string_scan_digits = fn (a_s_ptr: i32, b_s_len: i32, c_start: i64) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  return scan_digits_go(base, len, i: clamp(v: c_start, hi: len))
+end
+let scan_digits_go = fn (base: i64, len: i64, i: i64) -> i64 do
+  if i >= len then return len end
+  if !is_digit_byte(b: byte_at_addr(base, i)) then return i end
+  return scan_digits_go(base, len, i: i + 1)
+end
+
+let __nx_string_skip_ws = fn (a_s_ptr: i32, b_s_len: i32, c_start: i64) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  return skip_ws_go(base, len, i: clamp(v: c_start, hi: len))
+end
+let skip_ws_go = fn (base: i64, len: i64, i: i64) -> i64 do
+  if i >= len then return len end
+  if !is_ws(b: byte_at_addr(base, i)) then return i end
+  return skip_ws_go(base, len, i: i + 1)
+end
+
+let __nx_string_to_lower = fn (a_s_ptr: i32, b_s_len: i32) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  if len <= 0 then return 0 end
+  let p = alloc_bytes(n: len)
+  let _ = case_map_go(src: base, dst: p, len, i: 0, upper: false)
+  return pack(ptr: p, len)
+end
+
+let __nx_string_to_upper = fn (a_s_ptr: i32, b_s_len: i32) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  if len <= 0 then return 0 end
+  let p = alloc_bytes(n: len)
+  let _ = case_map_go(src: base, dst: p, len, i: 0, upper: true)
+  return pack(ptr: p, len)
+end
+let case_map_go = fn (src: i64, dst: i64, len: i64, i: i64, upper: bool) -> unit do
+  if i >= len then return () end
+  let b = load_at(a: src + i)
+  let m = if upper then to_upper_byte(b) else to_lower_byte(b) end
+  let _ = store_at(a: dst + i, v: m)
+  return case_map_go(src, dst, len, i: i + 1, upper)
+end
+
+let __nx_string_trim = fn (a_s_ptr: i32, b_s_len: i32) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  let lo = trim_lo(base, len, i: 0)
+  let hi = trim_hi(base, i: len - 1)
+  if hi < lo then return 0 end
+  return make_string(src: base + lo, len: (hi - lo) + 1)
+end
+let trim_lo = fn (base: i64, len: i64, i: i64) -> i64 do
+  if i >= len then return len end
+  if !is_ws(b: byte_at_addr(base, i)) then return i end
+  return trim_lo(base, len, i: i + 1)
+end
+let trim_hi = fn (base: i64, i: i64) -> i64 do
+  if i < 0 then return 0 - 1 end
+  if !is_ws(b: byte_at_addr(base, i)) then return i end
+  return trim_hi(base, i: i - 1)
+end
+
+let __nx_string_replace = fn (a_s_ptr: i32, b_s_len: i32, c_from_ptr: i32, d_from_len: i32, e_to_ptr: i32, f_to_len: i32) -> i64 do
+  let sb = cast.i64_of(x: a_s_ptr)
+  let slen = cast.i64_of(x: b_s_len)
+  let fb = cast.i64_of(x: c_from_ptr)
+  let flen = cast.i64_of(x: d_from_len)
+  let tb = cast.i64_of(x: e_to_ptr)
+  let tlen = cast.i64_of(x: f_to_len)
+  if flen <= 0 || slen <= 0 then return make_string(src: sb, len: slen) end
+  let occ = count_occ(sb, slen, fb, flen, start_at: 0, n: 0)
+  if occ == 0 then return make_string(src: sb, len: slen) end
+  let out_len = (slen - (occ * flen)) + (occ * tlen)
+  if out_len <= 0 then return 0 end
+  let p = alloc_bytes(n: out_len)
+  let _ = replace_go(sb, slen, fb, flen, tb, tlen, si: 0, dst: p, di: 0)
+  return pack(ptr: p, len: out_len)
+end
+let count_occ = fn (sb: i64, slen: i64, fb: i64, flen: i64, start_at: i64, n: i64) -> i64 do
+  let hit = find_sub_go(base: sb, len: slen, sb: fb, slen: flen, i: start_at)
+  if hit < 0 then return n end
+  return count_occ(sb, slen, fb, flen, start_at: hit + flen, n: n + 1)
+end
+let replace_go = fn (sb: i64, slen: i64, fb: i64, flen: i64, tb: i64, tlen: i64, si: i64, dst: i64, di: i64) -> unit do
+  let hit = find_sub_go(base: sb, len: slen, sb: fb, slen: flen, i: si)
+  if hit < 0 then
+    return copy_bytes(dst: dst + di, src: sb + si, count: slen - si)
+  end
+  let _ = copy_bytes(dst: dst + di, src: sb + si, count: hit - si)
+  let _ = copy_bytes(dst: dst + di + (hit - si), src: tb, count: tlen)
+  return replace_go(sb, slen, fb, flen, tb, tlen, si: hit + flen, dst, di: di + (hit - si) + tlen)
+end
+
+let __nx_string_repeat = fn (a_s_ptr: i32, b_s_len: i32, c_n: i64) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  let count = if c_n < 0 then 0 else c_n end
+  let out_len = len * count
+  if out_len <= 0 then return 0 end
+  let p = alloc_bytes(n: out_len)
+  let _ = repeat_go(src: base, len, dst: p, remaining: count, off: 0)
+  return pack(ptr: p, len: out_len)
+end
+let repeat_go = fn (src: i64, len: i64, dst: i64, remaining: i64, off: i64) -> unit do
+  if remaining <= 0 then return () end
+  let _ = copy_bytes(dst: dst + off, src, count: len)
+  return repeat_go(src, len, dst, remaining: remaining - 1, off: off + len)
+end
+
+let __nx_string_pad_left = fn (a_s_ptr: i32, b_s_len: i32, c_width: i64, d_fill_ptr: i32, e_fill_len: i32) -> i64 do
+  return do_pad(sb: cast.i64_of(x: a_s_ptr), slen: cast.i64_of(x: b_s_len), width: c_width,
+                fb: cast.i64_of(x: d_fill_ptr), flen: cast.i64_of(x: e_fill_len), left: true)
+end
+
+let __nx_string_pad_right = fn (a_s_ptr: i32, b_s_len: i32, c_width: i64, d_fill_ptr: i32, e_fill_len: i32) -> i64 do
+  return do_pad(sb: cast.i64_of(x: a_s_ptr), slen: cast.i64_of(x: b_s_len), width: c_width,
+                fb: cast.i64_of(x: d_fill_ptr), flen: cast.i64_of(x: e_fill_len), left: false)
+end
+let do_pad = fn (sb: i64, slen: i64, width: i64, fb: i64, flen: i64, left: bool) -> i64 do
+  let w = if width < 0 then 0 else width end
+  let cc = char_count(base: sb, len: slen)
+  if cc >= w || flen <= 0 then return make_string(src: sb, len: slen) end
+  let pad_chars = w - cc
+  let out_len = slen + pad_chars
+  let p = alloc_bytes(n: out_len)
+  if left then
+    let _ = fill_cycle(dst: p, off: 0, fb, flen, remaining: pad_chars)
+    let _ = copy_bytes(dst: p + pad_chars, src: sb, count: slen)
+  else
+    let _ = copy_bytes(dst: p, src: sb, count: slen)
+    let _ = fill_cycle(dst: p, off: slen, fb, flen, remaining: pad_chars)
+  end
+  return pack(ptr: p, len: out_len)
+end
+let fill_cycle = fn (dst: i64, off: i64, fb: i64, flen: i64, remaining: i64) -> unit do
+  if remaining <= 0 then return () end
+  let _ = mem.store_u8(addr: dst + off, val: load_at(a: fb + (off % flen)))
+  return fill_cycle(dst, off: off + 1, fb, flen, remaining: remaining - 1)
+end
+
+let __nx_string_is_valid_i64 = fn (a_s_ptr: i32, b_s_len: i32) -> bool do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  let lo = trim_lo(base, len, i: 0)
+  let hi = trim_hi(base, i: len - 1)
+  if hi < lo then return false end
+  let first = load_at(a: base + lo)
+  let dstart = if first == 45 || first == 43 then lo + 1 else lo end
+  if dstart > hi then return false end
+  return all_digits(base, i: dstart, hi)
+end
+let all_digits = fn (base: i64, i: i64, hi: i64) -> bool do
+  if i > hi then return true end
+  if !is_digit_byte(b: byte_at_addr(base, i)) then return false end
+  return all_digits(base, i: i + 1, hi)
+end
+
+let __nx_string_to_i64 = fn (a_s_ptr: i32, b_s_len: i32) -> i64 do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  let lo = trim_lo(base, len, i: 0)
+  let hi = trim_hi(base, i: len - 1)
+  if hi < lo then return 0 end
+  let first = load_at(a: base + lo)
+  let neg = first == 45
+  let dstart = if first == 45 || first == 43 then lo + 1 else lo end
+  let mag = parse_digits(base, i: dstart, hi, acc: 0)
+  return if neg then 0 - mag else mag end
+end
+let parse_digits = fn (base: i64, i: i64, hi: i64, acc: i64) -> i64 do
+  if i > hi then return acc end
+  let d = byte_at_addr(base, i) - 48
+  return parse_digits(base, i: i + 1, hi, acc: (acc * 10) + d)
+end
+
+let __nx_string_from_i64 = fn (a_val: i64) -> i64 do
+  if a_val == 0 then
+    let p = alloc_bytes(n: 1)
+    let _ = store_at(a: p, v: 48)
+    return pack(ptr: p, len: 1)
+  end
+  let neg = a_val < 0
+  let nd = count_digits(v: a_val, n: 0)
+  let total = if neg then nd + 1 else nd end
+  let p = alloc_bytes(n: total)
+  if neg then
+    let _ = store_at(a: p, v: 45)
+    let _ = write_digits_neg(v: a_val, dst: p, i: total - 1)
+  else
+    let _ = write_digits_pos(v: a_val, dst: p, i: total - 1)
+  end
+  return pack(ptr: p, len: total)
+end
+let count_digits = fn (v: i64, n: i64) -> i64 do
+  if v == 0 then return n end
+  return count_digits(v: v / 10, n: n + 1)
+end
+let write_digits_pos = fn (v: i64, dst: i64, i: i64) -> unit do
+  if v == 0 then return () end
+  let _ = store_at(a: dst + i, v: 48 + (v % 10))
+  return write_digits_pos(v: v / 10, dst, i: i - 1)
+end
+let write_digits_neg = fn (v: i64, dst: i64, i: i64) -> unit do
+  if v == 0 then return () end
+  let _ = store_at(a: dst + i, v: 48 + (0 - (v % 10)))
+  return write_digits_neg(v: v / 10, dst, i: i - 1)
+end
+
+let __nx_string_from_bool = fn (a_val: bool) -> i64 do
+  if a_val then
+    let p = alloc_bytes(n: 4)
+    let _ = store_at(a: p, v: 116)
+    let _ = store_at(a: p + 1, v: 114)
+    let _ = store_at(a: p + 2, v: 117)
+    let _ = store_at(a: p + 3, v: 101)
+    return pack(ptr: p, len: 4)
+  end
+  let p = alloc_bytes(n: 5)
+  let _ = store_at(a: p, v: 102)
+  let _ = store_at(a: p + 1, v: 97)
+  let _ = store_at(a: p + 2, v: 108)
+  let _ = store_at(a: p + 3, v: 115)
+  let _ = store_at(a: p + 4, v: 101)
+  return pack(ptr: p, len: 5)
+end
+
+/// f64 round-trip formatting/parsing in Nexus is not yet available; stubbed.
+let __nx_string_from_float = fn (a_val: float) -> i64 do return 0 end
+let __nx_string_to_f64 = fn (a_s_ptr: i32, b_s_len: i32) -> float do return 0.0 end
+let __nx_string_is_valid_f64 = fn (a_s_ptr: i32, b_s_len: i32) -> bool do return false end
+
+// === public surface ===
 
 /// Returns the number of characters in the string.
-export external length = "__nx_string_length" : (s: string) -> i64
+export let length = fn (s: string) -> i64 do return __nx_string_length(a_s_ptr: s_ptr(s), b_s_len: s_len(s)) end
 
 /// Returns the number of UTF-8 bytes in the string.
-export external byte_length = "__nx_string_byte_length" : (s: string) -> i64
+export let byte_length = fn (s: string) -> i64 do return __nx_string_byte_length(a_s_ptr: s_ptr(s), b_s_len: s_len(s)) end
 
-// ─── Byte-level scanning primitives (O(1) or O(scan_length)) ─────────────────
-
-/// Returns the raw byte at the given byte position as a char. O(1).
-/// Returns '\0' if out of bounds. For ASCII source code, byte value == codepoint.
-export external byte_at = "__nx_string_byte_at" : (s: string, idx: i64) -> char
+/// Returns the raw byte at the given byte position as a char. O(1). '\0' if oob.
+export let byte_at = fn (s: string, idx: i64) -> char do return __nx_string_byte_at(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_idx: idx) end
 
 /// Scans from start while characters are ident chars (a-z, A-Z, 0-9, _). Returns end position.
-export external scan_ident = "__nx_string_scan_ident" : (s: string, start: i64) -> i64
+export let scan_ident = fn (s: string, start: i64) -> i64 do return __nx_string_scan_ident(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_start: start) end
 
 /// Scans from start while characters are digits (0-9). Returns end position.
-export external scan_digits = "__nx_string_scan_digits" : (s: string, start: i64) -> i64
+export let scan_digits = fn (s: string, start: i64) -> i64 do return __nx_string_scan_digits(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_start: start) end
 
 /// Skips ASCII whitespace (space, tab, \n, \r) from start. Returns end position.
-export external skip_ws = "__nx_string_skip_ws" : (s: string, start: i64) -> i64
+export let skip_ws = fn (s: string, start: i64) -> i64 do return __nx_string_skip_ws(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_start: start) end
 
 /// Counts newlines (\n) in byte range [start, end).
-export external count_newlines_in = "__nx_string_count_newlines_in" : (s: string, start: i64, end_pos: i64) -> i64
+export let count_newlines_in = fn (s: string, start: i64, end_pos: i64) -> i64 do return __nx_string_count_newlines_in(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_start: start, d_end_pos: end_pos) end
 
 /// Returns position of last newline (\n) in range [start, end), or -1.
-export external last_newline_in = "__nx_string_last_newline_in" : (s: string, start: i64, end_pos: i64) -> i64
+export let last_newline_in = fn (s: string, start: i64, end_pos: i64) -> i64 do return __nx_string_last_newline_in(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_start: start, d_end_pos: end_pos) end
 
 /// Finds first occurrence of byte ch from start. Returns position or -1.
-export external find_byte = "__nx_string_find_byte" : (s: string, start: i64, ch: char) -> i64
+export let find_byte = fn (s: string, start: i64, ch: char) -> i64 do return __nx_string_find_byte(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_start: start, d_ch: cast.i32_of(x: cast.i64_of(x: ch))) end
 
 /// Extracts substring by byte offset and byte length. O(len).
-export external byte_substring = "__nx_string_byte_substring" : (s: string, start: i64, len: i64) -> string
+export let byte_substring = fn (s: string, start: i64, len: i64) -> string do return to_str(packed: __nx_string_byte_substring(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_start: start, d_len: len)) end
 
 /// Returns true if s contains the substring sub.
-export external contains = "__nx_string_contains" : (s: string, sub: string) -> bool
+export let contains = fn (s: string, sub: string) -> bool do return __nx_string_contains(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_sub_ptr: s_ptr(s: sub), d_sub_len: s_len(s: sub)) end
 
 /// Extracts a substring starting at start with the given length.
-export external substring = "__nx_string_substring" : (s: string, start: i64, len: i64) -> string
+export let substring = fn (s: string, start: i64, len: i64) -> string do return to_str(packed: __nx_string_substring(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_start: start, d_len: len)) end
 
 /// Returns the index of the first occurrence of sub in s, or -1 if not found.
-export external index_of = "__nx_string_index_of" : (s: string, sub: string) -> i64
+export let index_of = fn (s: string, sub: string) -> i64 do return __nx_string_index_of(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_sub_ptr: s_ptr(s: sub), d_sub_len: s_len(s: sub)) end
 
 /// Returns true if s starts with the given prefix.
-export external starts_with = "__nx_string_starts_with" : (s: string, prefix: string) -> bool
+export let starts_with = fn (s: string, prefix: string) -> bool do return __nx_string_starts_with(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_prefix_ptr: s_ptr(s: prefix), d_prefix_len: s_len(s: prefix)) end
 
 /// Returns true if s ends with the given suffix.
-export external ends_with = "__nx_string_ends_with" : (s: string, suffix: string) -> bool
+export let ends_with = fn (s: string, suffix: string) -> bool do return __nx_string_ends_with(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_suffix_ptr: s_ptr(s: suffix), d_suffix_len: s_len(s: suffix)) end
 
 /// Returns s with leading and trailing whitespace removed.
-export external trim = "__nx_string_trim" : (s: string) -> string
+export let trim = fn (s: string) -> string do return to_str(packed: __nx_string_trim(a_s_ptr: s_ptr(s), b_s_len: s_len(s))) end
 
 /// Returns s with all characters converted to uppercase.
-export external to_upper = "__nx_string_to_upper" : (s: string) -> string
+export let to_upper = fn (s: string) -> string do return to_str(packed: __nx_string_to_upper(a_s_ptr: s_ptr(s), b_s_len: s_len(s))) end
 
 /// Returns s with all characters converted to lowercase.
-export external to_lower = "__nx_string_to_lower" : (s: string) -> string
+export let to_lower = fn (s: string) -> string do return to_str(packed: __nx_string_to_lower(a_s_ptr: s_ptr(s), b_s_len: s_len(s))) end
 
 /// Replaces all occurrences of from_str with to_str in s.
-export external replace = "__nx_string_replace" : (s: string, from_str: string, to_str: string) -> string
+export let replace = fn (s: string, from_str: string, to_str: string) -> string do
+  return pun_val(a_x: __nx_string_replace(a_s_ptr: s_ptr(s), b_s_len: s_len(s),
+    c_from_ptr: s_ptr(s: from_str), d_from_len: s_len(s: from_str),
+    e_to_ptr: s_ptr(s: to_str), f_to_len: s_len(s: to_str)))
+end
 
 /// Returns the character at the given index.
-export external char_at = "__nx_string_char_at" : (s: string, idx: i64) -> char
+export let char_at = fn (s: string, idx: i64) -> char do return __nx_string_char_at(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_idx: idx) end
 
-/// Converts a char to its UTF-8 encoded string (1-4 bytes).
-/// Raises InvalidUnicode if `c` is not a valid Unicode scalar
-/// (negative, >0x10FFFF, or in the surrogate range 0xD800-0xDFFF).
-export external from_char = "__nx_string_from_char" : (c: char) -> string
+/// Converts a char to its UTF-8 encoded string (1-4 bytes). Negative inputs yield "".
+export let from_char = fn (c: char) -> string do return to_str(packed: __nx_string_from_char(a_c: cast.i32_of(x: cast.i64_of(x: c)))) end
 
 /// Converts an i64 integer to its string representation.
-export external from_i64 = "__nx_string_from_i64" : (val: i64) -> string
+export let from_i64 = fn (val: i64) -> string do return to_str(packed: __nx_string_from_i64(a_val: val)) end
 
-/// Converts a float to its string representation.
-export external from_float = "__nx_string_from_float" : (val: float) -> string
+/// Converts a float to its string representation. Currently stubbed to "".
+export let from_float = fn (val: float) -> string do return to_str(packed: __nx_string_from_float(a_val: val)) end
 
 /// Converts a bool to "true" or "false".
-export external from_bool = "__nx_string_from_bool" : (val: bool) -> string
+export let from_bool = fn (val: bool) -> string do return to_str(packed: __nx_string_from_bool(a_val: val)) end
 
-/// Raw FFI for string-to-i64 conversion (panics on invalid input).
-external to_i64_raw = "__nx_string_to_i64" : (s: string) -> i64
+/// Raw string-to-i64 conversion (returns 0 on invalid input; callers gate with is_valid_i64).
+export let to_i64_raw = fn (s: string) -> i64 do return __nx_string_to_i64(a_s_ptr: s_ptr(s), b_s_len: s_len(s)) end
 
 /// Parses a string as an i64. Raises on invalid input.
 let to_i64 = fn (s: string) -> i64 throws { Exn } do
@@ -93,7 +641,7 @@ let to_i64 = fn (s: string) -> i64 throws { Exn } do
 end
 
 /// Returns true if the string is a valid i64.
-external is_valid_i64 = "__nx_string_is_valid_i64" : (s: string) -> bool
+let is_valid_i64 = fn (s: string) -> bool do return __nx_string_is_valid_i64(a_s_ptr: s_ptr(s), b_s_len: s_len(s)) end
 
 let rev_string_list = fn (xs: [ string ], acc: [ string ]) -> [ string ] do
   match xs do
@@ -119,9 +667,6 @@ end
 /**
  * Splits s by the given separator and returns a list of substrings.
  * Returns a single-element list if sep is empty or not found.
- * Implemented by tail-recursively finding each occurrence of sep via
- * index_of, accumulating segments on a reversed accumulator, and
- * reversing at the end. Produces segments in left-to-right order.
  */
 export let split = fn (s: string, sep: string) -> [ string ] do
   if length(s: sep) == 0 then
@@ -132,18 +677,16 @@ export let split = fn (s: string, sep: string) -> [ string ] do
 end
 
 /// Returns the Unicode codepoint of the character at the given index, or -1 if out of bounds.
-export external char_code = "__nx_string_char_code" : (s: string, idx: i64) -> i64
+export let char_code = fn (s: string, idx: i64) -> i64 do return __nx_string_char_code(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_idx: idx) end
 
-/// Encodes a Unicode codepoint as a UTF-8 string (1-4 bytes).
-/// Raises InvalidUnicode if `code` is not a valid Unicode scalar
-/// (negative, >0x10FFFF, or in the surrogate range 0xD800-0xDFFF).
-export external from_char_code = "__nx_string_from_char_code" : (code: i64) -> string
+/// Encodes a Unicode codepoint as a UTF-8 string (1-4 bytes). Negative inputs yield "".
+export let from_char_code = fn (code: i64) -> string do return to_str(packed: __nx_string_from_char_code(a_code: code)) end
 
-/// Parses a string as a float. Returns NaN on invalid input.
-external to_f64_raw = "__nx_string_to_f64" : (s: string) -> f64
+/// Parses a string as a float. Currently stubbed to 0.0.
+let to_f64_raw = fn (s: string) -> f64 do return __nx_string_to_f64(a_s_ptr: s_ptr(s), b_s_len: s_len(s)) end
 
-/// Returns true if the string is a valid f64.
-external is_valid_f64 = "__nx_string_is_valid_f64" : (s: string) -> bool
+/// Returns true if the string is a valid f64. Currently stubbed to false.
+let is_valid_f64 = fn (s: string) -> bool do return __nx_string_is_valid_f64(a_s_ptr: s_ptr(s), b_s_len: s_len(s)) end
 
 /// Parses a string as an f64. Returns None on invalid input.
 export let parse_f64_checked = fn (s: string) -> Option<f64> do
@@ -164,13 +707,13 @@ export let to_f64 = fn (s: string) -> f64 throws { Exn } do
 end
 
 /// Repeats the string s n times.
-export external repeat = "__nx_string_repeat" : (s: string, n: i64) -> string
+export let repeat = fn (s: string, n: i64) -> string do return to_str(packed: __nx_string_repeat(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_n: n)) end
 
 /// Pads s on the left to width characters using fill as padding.
-export external pad_left = "__nx_string_pad_left" : (s: string, width: i64, fill: string) -> string
+export let pad_left = fn (s: string, width: i64, fill: string) -> string do return to_str(packed: __nx_string_pad_left(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_width: width, d_fill_ptr: s_ptr(s: fill), e_fill_len: s_len(s: fill))) end
 
 /// Pads s on the right to width characters using fill as padding.
-export external pad_right = "__nx_string_pad_right" : (s: string, width: i64, fill: string) -> string
+export let pad_right = fn (s: string, width: i64, fill: string) -> string do return to_str(packed: __nx_string_pad_right(a_s_ptr: s_ptr(s), b_s_len: s_len(s), c_width: width, d_fill_ptr: s_ptr(s: fill), e_fill_len: s_len(s: fill))) end
 
 /// Concatenates two strings. Equivalent to a ++ b.
 export let concat = fn (a: string, b: string) -> string do

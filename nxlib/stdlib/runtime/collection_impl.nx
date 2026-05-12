@@ -1,17 +1,13 @@
 /**
- * runtime/collection: HashMap / HashSet / StringMap runtime, ported to Nexus.
+ * runtime/collection_impl: HashMap / HashSet / StringMap runtime.
  *
- * reimplements the `__nx_hmap_*`, `__nx_hset_*` and
- * `__nx_smap_*` FFI surface that `nxlib/stdlib/hashmap.nx` and
- * `nxlib/stdlib/stringmap.nx` declare as `external`, plus the extra symbols
- * the prebuilt `stdlib.wasm` exports (`__nx_hmap_keys`, `__nx_hmap_vals`,
- * `__nx_hset_to_list`, `__nx_hset_union/intersection/difference`,
- * `__nx_smap_vals`). The original implementation lived in Rust and kept the
- * collections in a host-side pool keyed by an i64 `id`; here each `id` is a
- * pointer to a header struct in linear memory and the buckets are arrays in
- * linear memory, all from `nxlib/stdlib_src/alloc.nx` (the bump
- * allocator). Growth leaks the old bucket array, which is fine for a bump
- * allocator.
+ * Shared internal module backing `std:hashmap` (HashMap + HashSet) and
+ * `std:stringmap` — one module rather than inline in each interface file
+ * because hmap/hset/smap share the open-addressing core, the hashing, the
+ * snapshot machinery and the 32-byte header layout. Each collection `id` is a
+ * pointer to a header struct in linear memory; the buckets are arrays in
+ * linear memory, all from the unified bump arena (`arena.alloc_raw`). Growth
+ * leaks the old bucket array, which is fine for a bump allocator.
  *
  * Hash maps / sets are open-addressed (linear probing) with tombstones.
  * Header layout (32 bytes, four i64 words), shared by hmap / hset / smap:
@@ -31,11 +27,11 @@
  * The `_at` family returns the element at an iteration index. A snapshot of
  * the live entries is built lazily on the first `_at` after a mutation and
  * cached in the header's `snapshot` word, so a full enumeration is O(n) total.
- * Out-of-bounds / negative indices return 0 (matching the Rust impl).
+ * Out-of-bounds / negative indices return 0.
  *
  * `__nx_hmap_keys` / `__nx_hmap_vals` / `__nx_hset_to_list` / `__nx_smap_vals`
  * return a newline-joined string of the decimal representations of the i64
- * elements (as in the Rust impl); `__nx_smap_keys` returns the keys joined by
+ * elements; `__nx_smap_keys` returns the keys joined by
  * newline verbatim. A `string` return is the packed (ptr<<32)|len i64, 0 for
  * the empty string.
  *
@@ -769,206 +765,21 @@ let parse_go = fn (ptr: i64, len: i64, i: i64, cur: i64, acc: i64) -> i64 do
   return parse_go(ptr: ptr, len: len, i: i + 1, cur: (cur * 10) + (c - 48), acc: acc)
 end
 
-/// hmap put/get/has/size. put 3->30, 7->70, 7->77 (update). size==2,
-/// get(3)==30, get(7)==77, get(99,default 5)==5, has(3)==1, has(99)==0.
-/// Returns 2*100000 + 30*1000 + 77*10 + 1 = 230771.
-export let test_hmap_basic = fn () -> i64 do
-  let m = __nx_hmap_new()
-  let _ = __nx_hmap_put(a_id: m, b_key: 3, c_value: 30)
-  let _ = __nx_hmap_put(a_id: m, b_key: 7, c_value: 70)
-  let _ = __nx_hmap_put(a_id: m, b_key: 7, c_value: 77)
-  let sz = __nx_hmap_size(a_id: m)
-  let g3 = __nx_hmap_get(a_id: m, b_key: 3, c_default_val: 0)
-  let g7 = __nx_hmap_get(a_id: m, b_key: 7, c_default_val: 0)
-  let gd = __nx_hmap_get(a_id: m, b_key: 99, c_default_val: 5)
-  let h3 = if __nx_hmap_has(a_id: m, b_key: 3) then 1 else 0 end
-  let h99 = if __nx_hmap_has(a_id: m, b_key: 99) then 1 else 0 end
-  let ok = if gd == 5 && h99 == 0 then 1 else 0 end
-  return (sz * 100000) + (g3 * 1000) + (g7 * 10) + h3 + (ok - 1)
-end
+// === string-typed wrappers (the surface std:hashmap / std:stringmap use) =====
+//
+// Bridge a Nexus `string` (a packed i64 (ptr<<32)|len) to/from the raw
+// (ptr,len) ABI of the smap impls and the packed-i64 string returns, via the
+// `nexus:runtime/lazy` type-pun intrinsic (a no-op at the WASM level).
 
-/// hmap del. put 1->10,2->20,3->30; del(2)->true; size==2; has(2)==0;
-/// del(2) again -> false; get(1)==10, get(3)==30.
-/// Returns 2*1000 + 10*10 + 1 = 2101.
-export let test_hmap_del = fn () -> i64 do
-  let m = __nx_hmap_new()
-  let _ = __nx_hmap_put(a_id: m, b_key: 1, c_value: 10)
-  let _ = __nx_hmap_put(a_id: m, b_key: 2, c_value: 20)
-  let _ = __nx_hmap_put(a_id: m, b_key: 3, c_value: 30)
-  let d1 = __nx_hmap_del(a_id: m, b_key: 2)
-  let sz = __nx_hmap_size(a_id: m)
-  let h2 = __nx_hmap_has(a_id: m, b_key: 2)
-  let d2 = __nx_hmap_del(a_id: m, b_key: 2)
-  let g1 = __nx_hmap_get(a_id: m, b_key: 1, c_default_val: 0)
-  let g3 = __nx_hmap_get(a_id: m, b_key: 3, c_default_val: 0)
-  let ok = if d1 && !h2 && !d2 && g3 == 30 then 1 else 0 end
-  return (sz * 1000) + (g1 * 10) + ok
-end
+import external "nexus:runtime/lazy"
+external pun_raw = "__nx_value_of_i64" : <T>(a_x: T) -> i64
+external pun_str = "__nx_value_of_i64" : <T>(a_x: i64) -> T
 
-/// hmap iteration via key_at/val_at, with resizes. put i -> i*100 for i in 1..20.
-/// sum keys 1..20 = 210; sum vals = 21000. Then del(10): size 19,
-/// sum keys = 200, sum vals = 20000. Returns 200*1000000 + 20000 = 200020000.
-export let test_hmap_iter = fn () -> i64 do
-  let m = __nx_hmap_new()
-  let _ = fill_hmap(m: m, i: 1, n: 21)
-  let sk0 = sum_keys(m: m, j: 0, n: __nx_hmap_size(a_id: m), acc: 0)
-  let sv0 = sum_vals(m: m, j: 0, n: __nx_hmap_size(a_id: m), acc: 0)
-  let _ = __nx_hmap_del(a_id: m, b_key: 10)
-  let sk1 = sum_keys(m: m, j: 0, n: __nx_hmap_size(a_id: m), acc: 0)
-  let sv1 = sum_vals(m: m, j: 0, n: __nx_hmap_size(a_id: m), acc: 0)
-  let pre_ok = if sk0 == 210 && sv0 == 21000 then 1 else 0 end
-  return (sk1 * 1000000) + sv1 + (pre_ok - 1)
-end
+let k_p = fn (s: string) -> i32 do return cast.i32_of(x: (pun_raw(a_x: s) / two_pow_32()) & 4294967295) end
+let k_l = fn (s: string) -> i32 do return cast.i32_of(x: pun_raw(a_x: s) & 4294967295) end
 
-let fill_hmap = fn (m: i64, i: i64, n: i64) -> unit do
-  if i >= n then return () end
-  let _ = __nx_hmap_put(a_id: m, b_key: i, c_value: i * 100)
-  return fill_hmap(m: m, i: i + 1, n: n)
-end
-
-let sum_keys = fn (m: i64, j: i64, n: i64, acc: i64) -> i64 do
-  if j >= n then return acc end
-  return sum_keys(m: m, j: j + 1, n: n, acc: acc + __nx_hmap_key_at(a_id: m, b_idx: j))
-end
-
-let sum_vals = fn (m: i64, j: i64, n: i64, acc: i64) -> i64 do
-  if j >= n then return acc end
-  return sum_vals(m: m, j: j + 1, n: n, acc: acc + __nx_hmap_val_at(a_id: m, b_idx: j))
-end
-
-/// hmap_keys / hmap_vals join. put 5->50, 12->120. key-sum 17, val-sum 170.
-/// Returns 17*1000 + 170 = 17170.
-export let test_hmap_join = fn () -> i64 do
-  let m = __nx_hmap_new()
-  let _ = __nx_hmap_put(a_id: m, b_key: 5, c_value: 50)
-  let _ = __nx_hmap_put(a_id: m, b_key: 12, c_value: 120)
-  let ksum = parse_lines_sum(packed: __nx_hmap_keys(a_id: m))
-  let vsum = parse_lines_sum(packed: __nx_hmap_vals(a_id: m))
-  return (ksum * 1000) + vsum
-end
-
-/// hset basic. insert 1,2,3,2(dup). size==3, dup-insert false, contains(2)==1,
-/// contains(9)==0, remove(2)->true, size==2, remove(2)->false.
-/// Returns 2*1000 + 1 = 2001.
-export let test_hset_basic = fn () -> i64 do
-  let s = __nx_hset_new()
-  let i1 = __nx_hset_insert(a_id: s, b_val: 1)
-  let i2 = __nx_hset_insert(a_id: s, b_val: 2)
-  let i3 = __nx_hset_insert(a_id: s, b_val: 3)
-  let idup = __nx_hset_insert(a_id: s, b_val: 2)
-  let sz1 = __nx_hset_size(a_id: s)
-  let c2 = __nx_hset_contains(a_id: s, b_val: 2)
-  let c9 = __nx_hset_contains(a_id: s, b_val: 9)
-  let r2 = __nx_hset_remove(a_id: s, b_val: 2)
-  let sz2 = __nx_hset_size(a_id: s)
-  let r2b = __nx_hset_remove(a_id: s, b_val: 2)
-  let ok = if i1 && i2 && i3 && !idup && sz1 == 3 && c2 && !c9 && r2 && !r2b then 1 else 0 end
-  return (sz2 * 1000) + ok
-end
-
-/// hset union / intersection / difference. A={1,2,3,4}, B={3,4,5,6}.
-/// union size 6, intersection {3,4} sum 7 size 2, difference {1,2} sum 3 size 2.
-/// Returns 6*100000 + 7*1000 + 3 = 607003.
-export let test_hset_ops = fn () -> i64 do
-  let a = __nx_hset_new()
-  let _ = __nx_hset_insert(a_id: a, b_val: 1)
-  let _ = __nx_hset_insert(a_id: a, b_val: 2)
-  let _ = __nx_hset_insert(a_id: a, b_val: 3)
-  let _ = __nx_hset_insert(a_id: a, b_val: 4)
-  let b = __nx_hset_new()
-  let _ = __nx_hset_insert(a_id: b, b_val: 3)
-  let _ = __nx_hset_insert(a_id: b, b_val: 4)
-  let _ = __nx_hset_insert(a_id: b, b_val: 5)
-  let _ = __nx_hset_insert(a_id: b, b_val: 6)
-  let u = __nx_hset_union(a_id_a: a, b_id_b: b)
-  let it = __nx_hset_intersection(a_id_a: a, b_id_b: b)
-  let df = __nx_hset_difference(a_id_a: a, b_id_b: b)
-  let usize = __nx_hset_size(a_id: u)
-  let isum = parse_lines_sum(packed: __nx_hset_to_list(a_id: it))
-  let dsum = parse_lines_sum(packed: __nx_hset_to_list(a_id: df))
-  let ok = if __nx_hset_size(a_id: it) == 2 && __nx_hset_size(a_id: df) == 2 then 1 else 0 end
-  return (usize * 100000) + (isum * 1000) + dsum + (ok - 1)
-end
-
-// --- smap test helpers: write key bytes into linear memory, then drive the
-//     exported __nx_smap_* functions with raw (ptr, len) i32 pairs. ---
-
-let i32of = fn (x: i64) -> i32 do return cast.i32_of(x: x) end
-
-/// Write 5 raw bytes into a fresh allocation; returns the pointer.
-let mk5 = fn (b0: i64, b1: i64, b2: i64, b3: i64, b4: i64) -> i64 do
-  let p = arena.alloc_raw(size: 5)
-  let _ = mem.store_u8(addr: p, val: b0)
-  let _ = mem.store_u8(addr: p + 1, val: b1)
-  let _ = mem.store_u8(addr: p + 2, val: b2)
-  let _ = mem.store_u8(addr: p + 3, val: b3)
-  let _ = mem.store_u8(addr: p + 4, val: b4)
-  return p
-end
-
-/// Key "k<i/10><i%10>", 3 bytes, distinct for i in 0..99.
-let mk_k = fn (i: i64) -> i64 do
-  let p = arena.alloc_raw(size: 3)
-  let _ = mem.store_u8(addr: p, val: 107)
-  let _ = mem.store_u8(addr: p + 1, val: 48 + (i / 10))
-  let _ = mem.store_u8(addr: p + 2, val: 48 + (i % 10))
-  return p
-end
-
-/// smap basic. keys "ax"(2), "by"(2), update "ax". size==2, get("ax")==11,
-/// get("by")==2, get("zz",7)==7, has("ax")==1, has("zz")==0, del("by")->true,
-/// size==1, has("by")==0. Returns 1*100000 + 11*1000 + 2*10 + 1 = 111021.
-export let test_smap_basic = fn () -> i64 do
-  let m = __nx_smap_new()
-  let ax = mk5(b0: 97, b1: 120, b2: 0, b3: 0, b4: 0)
-  let by = mk5(b0: 98, b1: 121, b2: 0, b3: 0, b4: 0)
-  let zz = mk5(b0: 122, b1: 122, b2: 0, b3: 0, b4: 0)
-  let _ = __nx_smap_put(a_id: m, b_key_ptr: i32of(x: ax), c_key_len: i32of(x: 2), d_value: 1)
-  let _ = __nx_smap_put(a_id: m, b_key_ptr: i32of(x: by), c_key_len: i32of(x: 2), d_value: 2)
-  let _ = __nx_smap_put(a_id: m, b_key_ptr: i32of(x: ax), c_key_len: i32of(x: 2), d_value: 11)
-  let sz1 = __nx_smap_size(a_id: m)
-  let ga = __nx_smap_get(a_id: m, b_key_ptr: i32of(x: ax), c_key_len: i32of(x: 2), d_default_val: 0)
-  let gb = __nx_smap_get(a_id: m, b_key_ptr: i32of(x: by), c_key_len: i32of(x: 2), d_default_val: 0)
-  let gd = __nx_smap_get(a_id: m, b_key_ptr: i32of(x: zz), c_key_len: i32of(x: 2), d_default_val: 7)
-  let ha = __nx_smap_has(a_id: m, b_key_ptr: i32of(x: ax), c_key_len: i32of(x: 2))
-  let hz = __nx_smap_has(a_id: m, b_key_ptr: i32of(x: zz), c_key_len: i32of(x: 2))
-  let db = __nx_smap_del(a_id: m, b_key_ptr: i32of(x: by), c_key_len: i32of(x: 2))
-  let sz2 = __nx_smap_size(a_id: m)
-  let hb = __nx_smap_has(a_id: m, b_key_ptr: i32of(x: by), c_key_len: i32of(x: 2))
-  let ok = if sz1 == 2 && gd == 7 && ha && !hz && db && !hb then 1 else 0 end
-  return (sz2 * 100000) + (ga * 1000) + (gb * 10) + ok
-end
-
-/// smap iteration / growth. put "k00".."k29" -> 0..29 (forces resizes).
-/// get-all sum = 435 (sum 0..29). val_at-all sum = 435. vals-join parse = 435.
-/// keys-join length = 30*3 + 29 = 119. size == 30.
-/// Returns sumGet*1000 + size + (ok - 1) = 435*1000 + 30 = 435030.
-export let test_smap_grow = fn () -> i64 do
-  let m = __nx_smap_new()
-  let _ = smap_fill(m: m, i: 0, n: 30)
-  let sumget = smap_sum_get(m: m, i: 0, n: 30, acc: 0)
-  let sumat = smap_sum_at(m: m, j: 0, n: __nx_smap_val_count(a_id: m), acc: 0)
-  let kslen = __nx_smap_keys(a_id: m) & 4294967295
-  let vparsed = parse_lines_sum(packed: __nx_smap_vals(a_id: m))
-  let ok = if sumat == 435 && vparsed == 435 && kslen == 119 then 1 else 0 end
-  return (sumget * 1000) + __nx_smap_size(a_id: m) + (ok - 1)
-end
-
-let smap_fill = fn (m: i64, i: i64, n: i64) -> unit do
-  if i >= n then return () end
-  let _ = __nx_smap_put(a_id: m, b_key_ptr: i32of(x: mk_k(i: i)), c_key_len: i32of(x: 3), d_value: i)
-  return smap_fill(m: m, i: i + 1, n: n)
-end
-
-let smap_sum_get = fn (m: i64, i: i64, n: i64, acc: i64) -> i64 do
-  if i >= n then return acc end
-  let v = __nx_smap_get(a_id: m, b_key_ptr: i32of(x: mk_k(i: i)), c_key_len: i32of(x: 3), d_default_val: 0 - 1000)
-  return smap_sum_get(m: m, i: i + 1, n: n, acc: acc + v)
-end
-
-let smap_sum_at = fn (m: i64, j: i64, n: i64, acc: i64) -> i64 do
-  if j >= n then return acc end
-  return smap_sum_at(m: m, j: j + 1, n: n, acc: acc + __nx_smap_val_at(a_id: m, b_idx: j))
-end
-
-export let main = fn () -> unit do return () end
+export let smap_put_str = fn (id: i64, key: string, value: i64) -> i64 do return __nx_smap_put(a_id: id, b_key_ptr: k_p(s: key), c_key_len: k_l(s: key), d_value: value) end
+export let smap_get_str = fn (id: i64, key: string, default_val: i64) -> i64 do return __nx_smap_get(a_id: id, b_key_ptr: k_p(s: key), c_key_len: k_l(s: key), d_default_val: default_val) end
+export let smap_has_str = fn (id: i64, key: string) -> bool do return __nx_smap_has(a_id: id, b_key_ptr: k_p(s: key), c_key_len: k_l(s: key)) end
+export let smap_del_str = fn (id: i64, key: string) -> bool do return __nx_smap_del(a_id: id, b_key_ptr: k_p(s: key), c_key_len: k_l(s: key)) end
+export let smap_keys_str = fn (id: i64) -> string do return pun_str(a_x: __nx_smap_keys(a_id: id)) end

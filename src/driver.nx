@@ -14,7 +14,7 @@ import { InvalidUsage, WriteFailed, InTargetFile }, * as err from "src/common/er
 import { RenameEntry }, * as symtab from "src/ir/symtab.nx"
 import * as resolve from "src/ir/resolve.nx"
 import { CacheEntry, ImportResult, get_defs, process_imports, append_entries, dump_import_graph } from "src/ir/imports.nx"
-import { iterative_resolve, resolve_all_lazy_no_filter } from "src/ir/demand.nx"
+import { iterative_resolve } from "src/ir/demand.nx"
 import * as main_wrap from "src/ir/main_wrap.nx"
 import * as rdr from "src/ir/rdrname.nx"
 import { HirProgram } from "src/ir/hir_types.nx"
@@ -30,10 +30,7 @@ import * as linearity from "src/ir/linearity.nx"
 import * as tc_linearity from "src/typecheck/linearity.nx"
 import * as repl_mod from "src/repl.nx"
 import * as bb from "std:bytebuffer"
-import * as wmerge from "src/backend/wasm/merge.nx"
 import * as polyglot from "src/backend/polyglot.nx"
-import * as pkg from "src/ir/package.nx"
-import { rd_uleb, pval, uleb_size } from "src/backend/wasm/read.nx"
 import { Fs }, * as fs_mod from "std:fs"
 import { Console }, * as stdio from "std:stdio"
 import { Clock }, * as clock_mod from "std:clock"
@@ -43,13 +40,6 @@ import { IndexOutOfBounds }, * as list from "std:list"
 import { Option, Some, None } from "std:option"
 import { run_test_subcommand, strip_test_subcommand, ParsedTestSubcommand } from "src/test_runner.nx"
 
-// ─── Dep memory pages reader ────────────────────────────────────────────────
-// Read initial pages from a WASM binary's memory section (section 5).
-// Uses the shared ULEB reader from src/backend/wasm/read.nx.
-let read_dep_pages = fn (buf: &ByteBuffer) -> i64 do
-  return scan_sections(buf, pos: 8, end_pos: bb.length(buf))
-end
-
 // Backtrace-elision percentage (issue nexus-kyf8): integer percent of raise
 // sites where codegen elides the bt-capture call. Guards against division
 // by zero (programs with no raise sites) by returning 0.
@@ -57,23 +47,6 @@ let compute_elision_pct = fn (skip: i64, total: i64) -> i64 do
   if total == 0 then return 0 end
   return (skip * 100) / total
 end
-let scan_sections = fn (buf: &ByteBuffer, pos: i64, end_pos: i64) -> i64 do
-  if pos >= end_pos then return 0 end
-  let sec_id = bb.get_byte(buf, idx: pos)
-  let sec_size = pval(pk: rd_uleb(buf, pos: pos + 1))
-  let hdr = uleb_size(buf, pos: pos + 1)
-  let next = pos + 1 + hdr + sec_size
-  if sec_id == 5 then
-    // Memory section: skip count ULEB, skip flags byte, read min pages ULEB
-    let body = pos + 1 + hdr
-    let count_sz = uleb_size(buf, pos: body)
-    let flags_pos = body + count_sz
-    let min_pos = flags_pos + 1
-    return pval(pk: rd_uleb(buf, pos: min_pos))
-  end
-  return scan_sections(buf, pos: next, end_pos)
-end
-
 // ─── Pipeline ───────────────────────────────────────────────────────────────
 
 let list_has_str = fn (xs: [string], s: string) -> bool do
@@ -230,29 +203,6 @@ let strip_polyglot_flags = fn (xs: [string], polyglot: bool, remain_manifest: bo
       end
       let ParsedPolyglotFlags(remaining: rest_args, polyglot: p2, remain_manifest: m2) = strip_polyglot_flags(xs: rest, polyglot, remain_manifest)
       return ParsedPolyglotFlags(remaining: flag :: rest_args, polyglot: p2, remain_manifest: m2)
-  end
-end
-
-type ParsedBundleExports = ParsedBundleExports(remaining: [string], exports: [string])
-
-/** Strip `--bundle-exports name1,name2,...` from `xs` (library mode). When */
-/** present, codegen emits each named function as a wasm export and the driver */
-/** skips `merge_with_stdlib` + skips reachability DCE — used to compile a */
-/** Nexus-written replacement for `stdlib.wasm`. The flag requires a value. */
-let strip_bundle_exports_flag = fn (xs: [string], exports: [string]) -> ParsedBundleExports throws { Exn } do
-  match xs do
-    | [] -> return ParsedBundleExports(remaining: [], exports)
-    | flag :: [] ->
-      if flag == "--bundle-exports" then
-        raise InvalidUsage(detail: "--bundle-exports requires a comma-separated function-name list")
-      end
-      return ParsedBundleExports(remaining: [flag], exports)
-    | flag :: value :: rest2 ->
-      if flag == "--bundle-exports" then
-        return strip_bundle_exports_flag(xs: rest2, exports: str.split(s: value, sep: ","))
-      end
-      let ParsedBundleExports(remaining: rest_args, exports: e2) = strip_bundle_exports_flag(xs: value :: rest2, exports)
-      return ParsedBundleExports(remaining: flag :: rest_args, exports: e2)
   end
 end
 
@@ -459,10 +409,10 @@ let collect_all_wasmtime_flags = fn (caps: [string]) -> [string] do
   end
 end
 
-/** Wasm proposals required at runtime. The bundled stdlib uses every one of */
-/** these (TCO, raise/throws, closures, handlers), so emit all four whenever */
-/** wasmtime mode is selected — detection on the user's AST alone would */
-/** underreport because stdlib brings them in regardless. */
+/** Wasm proposals required at runtime. The inlined stdlib uses every one of */
+/** these (TCO, raise/throws, closures, handlers, threads/atomics for `@`), so */
+/** emit them all whenever wasmtime mode is selected — detection on the user's */
+/** AST alone would underreport because stdlib brings them in regardless. */
 let wasmtime_feature_flags = fn () -> [string] do
   return ["-W", "tail-call=y", "-W", "exceptions=y", "-W", "function-references=y", "-W", "stack-switching=y", "-W", "threads=y", "-W", "shared-memory=y", "-S", "threads"]
 end
@@ -576,19 +526,14 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock,
     end
     let ParsedTypecheckSubcommand(remaining: args_after_tc, typecheck_only) = strip_typecheck_subcommand(xs: args_after_output)
     let ParsedPolyglotFlags(remaining: args_after_polyglot, polyglot: polyglot_mode, remain_manifest) = strip_polyglot_flags(xs: args_after_tc, polyglot: false, remain_manifest: false)
-    let ParsedBundleExports(remaining: args_after_bundle, exports: bundle_exports) = strip_bundle_exports_flag(xs: args_after_polyglot, exports: [])
-    let bundle_mode = list.length(xs: bundle_exports) > 0
     if remain_manifest && !polyglot_mode then
       raise InvalidUsage(detail: "--remain-manifest requires --polyglot")
     end
     if polyglot_mode && typecheck_only then
       raise InvalidUsage(detail: "--polyglot is incompatible with `typecheck`")
     end
-    if bundle_mode && (polyglot_mode || typecheck_only) then
-      raise InvalidUsage(detail: "--bundle-exports is incompatible with --polyglot / `typecheck`")
-    end
     // When `typecheck` has already been stripped, args lack `build` by design.
-    let clean_args = if typecheck_only then args_after_bundle else strip_build_subcommand(xs: args_after_bundle) end
+    let clean_args = if typecheck_only then args_after_polyglot else strip_build_subcommand(xs: args_after_polyglot) end
     let argc = list.length(xs: clean_args)
     if argc < 2 then
       print_usage()
@@ -641,13 +586,9 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock,
     if verbose then Console.eprintln(val: "[nxc] HIR (" ++ str.from_i64(val: t4 - t3) ++ "ms)") end
 
     // Iterative resolve: filter by reachability, resolve, repeat until stable.
-    // Library mode (`--bundle-exports`) resolves every body without the
-    // reachability filter, so the named wasm exports survive even though no
-    // call site references them.
     let hir_resolved = match hir_raw do
       | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
-        let resolved = if bundle_mode then resolve_all_lazy_no_filter(funcs: hf)
-          else iterative_resolve(funcs: hf, hb, max_rounds: 100) end
+        let resolved = iterative_resolve(funcs: hf, hb, max_rounds: 100)
         HirProgram(ports: hp, functions: resolved, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
     end
     let t4b = Clock.now()
@@ -770,28 +711,17 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock,
         ++ str.from_i64(val: memo_plan.memo_plan_size(plan: memo)) ++ " eligible)")
     end
 
-    // String data placed after the std package's data section in the merged
-    // output. In library mode there is no dep to merge with, so strings start
-    // near the bottom of memory (offset 16 reserves a scratch word for the
-    // future allocator's bump-pointer cell — Phase 4 of nexus-f90i).
-    let std_wasm_path = pkg.package_wasm_path(pkg: "std")
-    let str_base = if bundle_mode then 16
-      else
-        let %dep = bb.read_binary_file(path: std_wasm_path)
-        let dp = read_dep_pages(buf: &dep)
-        bb.free(buf: %dep)
-        dp * 65536
-      end
+    // String data starts at offset 16. The reserved low memory [0,16) holds the
+    // unified atomic bump-pointer cell at [0,8) (heap_ptr_cell = 0) and the
+    // std:runtime/sysio_impl lazy-scratch-pointer slot at [8,16).
+    let str_base = 16
     let %wasm_buf = codegen.compile_lir_to_wasm(program: lir_opt, string_data_base: str_base,
-                                                  effect_map: &effect_map, bundle_exports)
+                                                  effect_map: &effect_map)
     // Codegen and metric passes have run; release the EffectMap's StringMap
     // handle now so the linear value does not outlive its usefulness.
     effect_analysis.free_effect_map(em: %effect_map)
     let t9 = Clock.now()
     if verbose then Console.eprintln(val: "[nxc] codegen (" ++ str.from_i64(val: t9 - t8c) ++ "ms)") end
-
-    let %wasm_buf = if bundle_mode then %wasm_buf
-      else wmerge.merge_with_stdlib(core_wasm: %wasm_buf, stdlib_path: std_wasm_path) end
 
     // Capabilities must be extracted before the arena reset; for the polyglot
     // emit path they are also baked into the launcher header, so the extract

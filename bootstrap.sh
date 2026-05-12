@@ -71,8 +71,9 @@ run_seed_compile "$NEXUS_ENTRY" "$STAGE0"
 ok "Stage 0 complete: $STAGE0 ($(wc -c < "$STAGE0" | tr -d ' ') bytes)"
 
 # ─── Stage 1: stage0.wasm compiles src → stage1.wasm ──────────────────────
-# Stage0 may be a stub (no merge). If stage1 is core WASM with unresolved imports,
-# compose it with stdlib. Once stage1 has the merge code, stage2+ are self-contained.
+# The stdlib is inlined into every program (no separate stdlib.wasm, no merge
+# step). Stage 1 must be self-contained core WASM — assert it has no unresolved
+# nexus:std imports.
 
 STAGE1_RAW="$BUILD_DIR/stage1_raw.wasm"
 STAGE1="$BUILD_DIR/stage1.wasm"
