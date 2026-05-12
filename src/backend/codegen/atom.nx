@@ -214,30 +214,95 @@ end
 
 // ─── Object allocation ──────────────────────────────────────────────────────
 
+/** Atomic bump allocation against linear-memory cell `wdefs.heap_ptr_cell`. */
+/** */
+/** Stack in:  [size_bytes : i32]   (consumed) */
+/** Stack out: []                                (clean) */
+/** Effect:    (1) if the cell is still 0 (the "uninitialised" sentinel), seed */
+/**            it to `memory.size() * 65536` via a compare-and-swap — covers */
+/**            the case where no cell-0 data segment ran (e.g. a `--bundle- */
+/**            exports` library merged into an old-codegen program); for */
+/**            normal builds the data segment already set it, so the CAS */
+/**            no-ops. (2) round `size_bytes` up to a multiple of 8, atomically */
+/**            add it to the cell, store the *old* cell value (= the freshly- */
+/**            allocated, 8-aligned base pointer) into `ptr_local` (an i32 */
+/**            local), then grow linear memory so `[ptr, ptr + rounded)` is */
+/**            backed. */
+/** */
+/** Scratch:   `temps_base + 2` (i32) is used transiently. */
+export let emit_atomic_bump = fn (buf: %ByteBuffer, ctx: CodegenCtx, ptr_local: i64) -> %ByteBuffer do
+  let scratch = wdefs.ctx_temps_base(ctx) + 2
+  // Idempotent seed: cmpxchg(cell, 0, memory.size()*65536); drop old.
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: wdefs.heap_ptr_cell)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 0)
+  let %buf = bb.push_byte(%buf, byte: op_memory_size)
+  let %buf = bb.push_byte(%buf, byte: 0)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 16)
+  let %buf = bb.push_byte(%buf, byte: op_i32_shl)
+  let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_rmw_cmpxchg, offset: 0)
+  let %buf = bb.push_byte(%buf, byte: op_drop)
+  // rounded = (size + 7) & ~8   (i.e. round up to a multiple of 8)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 7)
+  let %buf = bb.push_byte(%buf, byte: op_i32_add)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 0 - 8)
+  let %buf = bb.push_byte(%buf, byte: wdefs.op_i32_and)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: scratch)
+  // ptr = atomic.rmw.add(cell, rounded)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: wdefs.heap_ptr_cell)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: scratch)
+  let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_rmw_add, offset: 0)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: ptr_local)
+  // new_top = ptr + rounded   (reuse `scratch` to hold it; `rounded` is dead)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: ptr_local)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: scratch)
+  let %buf = bb.push_byte(%buf, byte: op_i32_add)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: scratch)
+  // if (new_top > memory.size * 65536) { memory.grow(ceil((new_top - mem_bytes)/65536)); drop }
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: scratch)
+  let %buf = bb.push_byte(%buf, byte: op_memory_size)
+  let %buf = bb.push_byte(%buf, byte: 0)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 16)
+  let %buf = bb.push_byte(%buf, byte: op_i32_shl)
+  let %buf = bb.push_bytes(%buf, bytes: [op_i32_gt_u, op_if])
+  let %buf = bb.push_byte(%buf, byte: bt_void)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: scratch)
+  let %buf = bb.push_byte(%buf, byte: op_memory_size)
+  let %buf = bb.push_byte(%buf, byte: 0)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 16)
+  let %buf = bb.push_bytes(%buf, bytes: [op_i32_shl, op_i32_sub])
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 65535)
+  let %buf = bb.push_byte(%buf, byte: op_i32_add)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 16)
+  let %buf = bb.push_byte(%buf, byte: op_i32_shr_u)
+  let %buf = bb.push_byte(%buf, byte: op_memory_grow)
+  let %buf = bb.push_byte(%buf, byte: 0)
+  let %buf = bb.push_byte(%buf, byte: op_drop)
+  return bb.push_byte(%buf, byte: op_end)
+end
+
 export let emit_alloc_object = fn (buf: %ByteBuffer, ctx: CodegenCtx, words: i64) -> %ByteBuffer do
-  let CodegenCtx(external_func_map: efm, alloc_mode: am, _) = ctx
   let obj_ptr = wdefs.ctx_temps_base(ctx) + 3
-  let alloc_idx = wdefs.lookup_func_fast(name: "__nx_allocate", map: &efm)
-  if alloc_idx >= 0 then
-    // stdlib allocate: call allocate(bytes) -> ptr
-    let %buf = bb.push_byte(%buf, byte: op_i32_const)
-    let %buf = bb.push_sleb128(%buf, val: words * 8)
-    let %buf = bb.push_byte(%buf, byte: op_call)
-    let %buf = bb.push_uleb128(%buf, val: alloc_idx)
-    let %buf = bb.push_byte(%buf, byte: op_local_set)
-    return bb.push_uleb128(%buf, val: obj_ptr)
-  end
-  // bump allocator: global_get 0, tee ptr, add bytes, global_set 0
-  let %buf = bb.push_byte(%buf, byte: op_global_get)
-  let %buf = bb.push_uleb128(%buf, val: heap_global_idx)
-  let %buf = bb.push_byte(%buf, byte: op_local_tee)
-  let %buf = bb.push_uleb128(%buf, val: obj_ptr)
   let %buf = bb.push_byte(%buf, byte: op_i32_const)
   let %buf = bb.push_sleb128(%buf, val: words * 8)
-  let %buf = bb.push_bytes(%buf, bytes: [op_i32_add, op_global_set])
-  let %buf = bb.push_uleb128(%buf, val: heap_global_idx)
-  // Grow memory if heap exceeds current pages (skip when stdlib manages memory)
-  return emit_memory_grow_check(%buf, skip: am == 2)
+  return emit_atomic_bump(%buf, ctx, ptr_local: obj_ptr)
 end
 
 // ─── String unpack ──────────────────────────────────────────────────────────
