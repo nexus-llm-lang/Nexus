@@ -14,12 +14,17 @@
  *     ASCII (the universal case). Pad amount is computed in characters.
  *   - from_char/from_char_code: no surrogate/range validation -- encodes the
  *     low bits as UTF-8; negative inputs return "".
- *   - from_float / to_f64 / is_valid_f64: f64 round-trip formatting/parsing in
- *     Nexus is not yet available; stubbed ("" / 0.0 / false).
+ *   - from_float: extracts ~17 significant digits (not a shortest-repr dtoa),
+ *     trims trailing zeros, fixed notation for exponents in [-4, 17) else
+ *     scientific. Round-trips, but the text may differ from Rust's Display.
+ *   - to_f64 / is_valid_f64: full `[+-]?(d('.'d?)?|'.'d)([eE][+-]?d)?` grammar
+ *     plus case-insensitive inf/infinity/nan; scaling via repeated *10 so the
+ *     last ulp or two can be off for extreme exponents.
  */
 import * as mem from "std:runtime/mem"
 import * as cast from "std:runtime/cast"
 import * as arena from "std:runtime/arena"
+import { i64_to_float, float_to_i64 } from "std:math"
 import external "nexus:runtime/lazy"
 
 /// Type puns (pure passthrough at the WASM level — every Nexus value is an i64).
@@ -545,10 +550,565 @@ let __nx_string_from_bool = fn (a_val: bool) -> i64 do
   return pack(ptr: p, len: 5)
 end
 
-/// f64 round-trip formatting/parsing in Nexus is not yet available; stubbed.
-let __nx_string_from_float = fn (a_val: float) -> i64 do return 0 end
-let __nx_string_to_f64 = fn (a_s_ptr: i32, b_s_len: i32) -> float do return 0.0 end
-let __nx_string_is_valid_f64 = fn (a_s_ptr: i32, b_s_len: i32) -> bool do return false end
+// === f64 <-> string ==========================================================
+//
+// These avoid f64 *literals* on purpose: float literals are themselves encoded
+// at compile time via `bb.push_f64_str_le` -> `__nx_string_to_f64`, so the
+// seed compiler that builds this file must not depend on a working float-literal
+// path here. All constants are materialised via `i64_to_float`.
+
+/// f64 +0.0 (built from bits, not a literal).
+let f0 = fn () -> float do return i64_to_float(val: 0) end
+/// f64 1.0.
+let f1 = fn () -> float do return i64_to_float(val: 1) end
+/// f64 10.0.
+let f10 = fn () -> float do return i64_to_float(val: 10) end
+/// f64 NaN, written as the canonical quiet-NaN bit pattern.
+let fnan = fn () -> float do return reinterpret_to_f64(bits: 9221120237041090560) end
+
+/// Reinterpret the 64 bits of `bits` as an f64 (round-trips via linear memory).
+let reinterpret_to_f64 = fn (bits: i64) -> float do
+  let p = arena.alloc_raw(size: 8)
+  let _ = mem.store_i64(addr: p, val: bits)
+  return mem.load_f64(addr: p)
+end
+/// Reinterpret the 64 bits of `x` as an i64.
+let reinterpret_to_i64 = fn (x: float) -> i64 do
+  let p = arena.alloc_raw(size: 8)
+  let _ = mem.store_f64(addr: p, val: x)
+  return mem.load_i64(addr: p)
+end
+
+/// 10^n as an i64 for 0 <= n <= 18 (exact).
+let int_pow10 = fn (n: i64) -> i64 do return int_pow10_go(n, acc: 1) end
+let int_pow10_go = fn (n: i64, acc: i64) -> i64 do
+  if n <= 0 then return acc end
+  return int_pow10_go(n: n - 1, acc: acc * 10)
+end
+
+/// 10^n as an f64 for n >= 0 (exact for n <= 22; a few ulps beyond).
+let pow10_pos = fn (n: i64) -> float do
+  if n <= 0 then return f1() end
+  if n <= 18 then return i64_to_float(val: int_pow10(n)) end
+  return i64_to_float(val: int_pow10(n: 18)) *. pow10_pos(n: n - 18)
+end
+/// 10^n as an f64 for any n (1 ulp from the divide when n < 0).
+let pow10 = fn (n: i64) -> float do
+  if n >= 0 then return pow10_pos(n) end
+  return f1() /. pow10_pos(n: 0 - n)
+end
+
+/// Lowercase a single ASCII byte.
+let lc = fn (b: i64) -> i64 do if b >= 65 && b <= 90 then return b + 32 else return b end end
+
+/// f64-string scan state, stored in a 5-word scratch block:
+///   w0: pos (current byte offset, absolute)
+///   w1: sign (0 or 1)
+///   w2: mantissa (i64, accumulated, capped at 18 digits)
+///   w3: decexp (i64, the base-10 exponent adjustment so far)
+///   w4: flags: bit0 = saw at least one mantissa digit; bit1 = malformed
+let st_alloc = fn () -> i64 do return arena.alloc_raw(size: 40) end
+let st_pos = fn (s: i64) -> i64 do return mem.load_i64(addr: s) end
+let st_set_pos = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s, val: v) end
+let st_sign = fn (s: i64) -> i64 do return mem.load_i64(addr: s + 8) end
+let st_set_sign = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s + 8, val: v) end
+let st_mant = fn (s: i64) -> i64 do return mem.load_i64(addr: s + 16) end
+let st_set_mant = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s + 16, val: v) end
+let st_dexp = fn (s: i64) -> i64 do return mem.load_i64(addr: s + 24) end
+let st_set_dexp = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s + 24, val: v) end
+let st_flags = fn (s: i64) -> i64 do return mem.load_i64(addr: s + 32) end
+let st_set_flags = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s + 32, val: v) end
+let st_saw_digit = fn (s: i64) -> bool do return (st_flags(s) & 1) != 0 end
+let st_mark_digit = fn (s: i64) -> unit do return st_set_flags(s, v: st_flags(s) | 1) end
+let st_bad = fn (s: i64) -> bool do return (st_flags(s) & 2) != 0 end
+let st_mark_bad = fn (s: i64) -> unit do return st_set_flags(s, v: st_flags(s) | 2) end
+
+/// Accumulate one decimal digit `d` (0..9) into the mantissa, but stop growing
+/// it past 18 digits -- excess integer digits bump `decexp` instead. `in_frac`
+/// indicates we are past the '.', so accepted fraction digits lower `decexp`.
+let acc_digit = fn (s: i64, d: i64, in_frac: bool) -> unit do
+  let _ = st_mark_digit(s)
+  let m = st_mant(s)
+  // 10^18 < 2^63 < 10^19; accept up to 18 digits into the mantissa.
+  if m < 100000000000000000 then
+    let _ = st_set_mant(s, v: (m * 10) + d)
+    if in_frac then let _ = st_set_dexp(s, v: st_dexp(s) - 1) end
+    return ()
+  end
+  // mantissa full: a dropped integer digit raises decexp; a dropped fraction
+  // digit is simply ignored (its place value is already absorbed by mantissa).
+  if !in_frac then let _ = st_set_dexp(s, v: st_dexp(s) + 1) end
+  return ()
+end
+
+/// Scan the sign at `s.pos` over [base, base+len): sets st_sign, advances pos.
+let scan_sign = fn (s: i64, base: i64, len: i64) -> unit do
+  let p = st_pos(s)
+  if p >= len then return () end
+  let c = byte_at_addr(base, i: p)
+  if c == 45 then let _ = st_set_sign(s, v: 1) end
+  if c == 45 || c == 43 then let _ = st_set_pos(s, v: p + 1) end
+  return ()
+end
+
+/// Scan a run of digits from `s.pos`, feeding each to acc_digit(in_frac).
+let scan_digit_run = fn (s: i64, base: i64, len: i64, in_frac: bool) -> unit do
+  let p = st_pos(s)
+  if p >= len then return () end
+  let c = byte_at_addr(base, i: p)
+  if c < 48 || c > 57 then return () end
+  let _ = acc_digit(s, d: c - 48, in_frac)
+  let _ = st_set_pos(s, v: p + 1)
+  return scan_digit_run(s, base, len, in_frac)
+end
+
+/// Scan a plain (unsigned) decimal int from `s.pos` into `acc`; advance pos.
+/// Returns the value; sets `saw` via the out word at `s + 32` is too coarse,
+/// so callers check whether pos advanced. Caps the magnitude (exponent values
+/// far past +-9999 are clamped to keep this i64).
+let scan_uint = fn (s: i64, base: i64, len: i64, acc: i64) -> i64 do
+  let p = st_pos(s)
+  if p >= len then return acc end
+  let c = byte_at_addr(base, i: p)
+  if c < 48 || c > 57 then return acc end
+  let _ = st_set_pos(s, v: p + 1)
+  let nacc = if acc > 100000 then acc else (acc * 10) + (c - 48) end
+  return scan_uint(s, base, len, acc: nacc)
+end
+
+/// Skip trailing ASCII whitespace from `s.pos`.
+let skip_trailing_ws = fn (s: i64, base: i64, len: i64) -> unit do
+  let p = st_pos(s)
+  if p >= len then return () end
+  if !is_ws(b: byte_at_addr(base, i: p)) then return () end
+  let _ = st_set_pos(s, v: p + 1)
+  return skip_trailing_ws(s, base, len)
+end
+
+/// True iff the 3 bytes at [base+p, base+p+3) are an ASCII match for "inf"/"nan".
+let three_eq = fn (base: i64, p: i64, len: i64, a: i64, b: i64, c: i64) -> bool do
+  if p + 3 > len then return false end
+  return lc(b: byte_at_addr(base, i: p)) == a && lc(b: byte_at_addr(base, i: p + 1)) == b && lc(b: byte_at_addr(base, i: p + 2)) == c
+end
+
+/// Run the shared scan over [base, base+len): skips leading ws, sign, the
+/// mantissa (digits, optional '.', digits), the optional exponent, then trailing
+/// ws. Recognises "inf"/"nan" (case-insensitive) after the sign as a whole-token
+/// match. Returns the scratch state `s`; the caller inspects st_bad / the final
+/// pos (== len means well-formed). When "inf"/"nan" matched, mantissa is left 0
+/// and a sentinel flag is encoded by setting decexp to a huge value (inf) -- but
+/// to keep the contract simple, callers use `scan_special` separately.
+let run_scan = fn (base: i64, len: i64) -> i64 do
+  let s = st_alloc()
+  let _ = st_set_pos(s, v: 0)
+  let _ = st_set_sign(s, v: 0)
+  let _ = st_set_mant(s, v: 0)
+  let _ = st_set_dexp(s, v: 0)
+  let _ = st_set_flags(s, v: 0)
+  // leading ws
+  let _ = st_set_pos(s, v: skip_ws_go(base, len, i: 0))
+  let _ = scan_sign(s, base, len)
+  // int digits, optional '.', frac digits
+  let _ = scan_digit_run(s, base, len, in_frac: false)
+  let p0 = st_pos(s)
+  if p0 < len && byte_at_addr(base, i: p0) == 46 then
+    let _ = st_set_pos(s, v: p0 + 1)
+    let _ = scan_digit_run(s, base, len, in_frac: true)
+  end
+  if !st_saw_digit(s) then let _ = st_mark_bad(s) end
+  // optional exponent
+  let pe = st_pos(s)
+  if pe < len && (byte_at_addr(base, i: pe) == 101 || byte_at_addr(base, i: pe) == 69) then
+    let _ = st_set_pos(s, v: pe + 1)
+    // exponent sign
+    let pe2 = st_pos(s)
+    let esign = if pe2 < len && byte_at_addr(base, i: pe2) == 45 then 1 else 0 end
+    if pe2 < len && (byte_at_addr(base, i: pe2) == 45 || byte_at_addr(base, i: pe2) == 43) then
+      let _ = st_set_pos(s, v: pe2 + 1)
+    end
+    let pe3 = st_pos(s)
+    let eval = scan_uint(s, base, len, acc: 0)
+    if st_pos(s) == pe3 then
+      // 'e' with no digits after -> malformed
+      let _ = st_mark_bad(s)
+    else
+      let signed_e = if esign == 1 then 0 - eval else eval end
+      let _ = st_set_dexp(s, v: st_dexp(s) + signed_e)
+    end
+  end
+  let _ = skip_trailing_ws(s, base, len)
+  return s
+end
+
+/// Detect a leading [+-]? "inf"/"infinity"/"nan" token (case-insensitive),
+/// possibly surrounded by whitespace. Returns: 0 = not special, 1 = +inf,
+/// 2 = -inf, 3 = nan. Anything trailing the token (other than ws) -> 0.
+let scan_special = fn (base: i64, len: i64) -> i64 do
+  let p0 = skip_ws_go(base, len, i: 0)
+  let sign = if p0 < len && byte_at_addr(base, i: p0) == 45 then 1 else 0 end
+  let p1 = if p0 < len && (byte_at_addr(base, i: p0) == 45 || byte_at_addr(base, i: p0) == 43) then p0 + 1 else p0 end
+  // "inf" (optionally "inity")
+  if three_eq(base, p: p1, len, a: 105, b: 110, c: 102) then
+    let after = if p1 + 8 <= len && lc(b: byte_at_addr(base, i: p1 + 3)) == 105 && lc(b: byte_at_addr(base, i: p1 + 4)) == 110 && lc(b: byte_at_addr(base, i: p1 + 5)) == 105 && lc(b: byte_at_addr(base, i: p1 + 6)) == 116 && lc(b: byte_at_addr(base, i: p1 + 7)) == 121 then p1 + 8 else p1 + 3 end
+    let tail = skip_ws_go(base, len, i: after)
+    if tail != len then return 0 end
+    return if sign == 1 then 2 else 1 end
+  end
+  // "nan"
+  if three_eq(base, p: p1, len, a: 110, b: 97, c: 110) then
+    let tail = skip_ws_go(base, len, i: p1 + 3)
+    if tail != len then return 0 end
+    return 3
+  end
+  return 0
+end
+
+/// Combine a scan-state into an f64.
+let assemble_f64 = fn (s: i64) -> float do
+  let mant_f = i64_to_float(val: st_mant(s))
+  let scaled = mant_f *. pow10(n: st_dexp(s))
+  if st_sign(s) == 1 then return f0() -. scaled else return scaled end
+end
+
+/// Parse [a_s_ptr, a_s_ptr+b_s_len) as an f64. Whitespace-tolerant; accepts
+/// the usual `[+-]?(digits('.'digits?)?|'.'digits)([eE][+-]?digits)?` grammar
+/// plus case-insensitive `inf`/`infinity`/`nan`. Returns 0.0 on a malformed
+/// string (callers gate with `__nx_string_is_valid_f64`).
+let __nx_string_to_f64 = fn (a_s_ptr: i32, b_s_len: i32) -> float do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  if len <= 0 then return f0() end
+  let sp = scan_special(base, len)
+  if sp == 1 then return pow10_pos(n: 400) end
+  if sp == 2 then return f0() -. pow10_pos(n: 400) end
+  if sp == 3 then return fnan() end
+  let s = run_scan(base, len)
+  if st_bad(s) || st_pos(s) != len then return f0() end
+  return assemble_f64(s)
+end
+
+/// True iff [a_s_ptr, a_s_ptr+b_s_len) is a syntactically valid f64 literal
+/// (per the grammar above, including `inf`/`nan`).
+let __nx_string_is_valid_f64 = fn (a_s_ptr: i32, b_s_len: i32) -> bool do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  if len <= 0 then return false end
+  if scan_special(base, len) != 0 then return true end
+  let s = run_scan(base, len)
+  return !st_bad(s) && st_pos(s) == len && st_saw_digit(s)
+end
+
+// --- dtoa: f64 -> shortest-ish decimal string ---
+//
+// Not a Grisu/Ryu shortest-representation algorithm: extracts ~17 significant
+// decimal digits, trims trailing zeros, and picks fixed vs. scientific notation
+// by the decimal exponent. Round-trips for the values that matter; the textual
+// form may differ from Rust's `f64::to_string` for some inputs.
+
+/// IEEE-754 field accessors on an f64's bit pattern.
+let f_sign_bit = fn (bits: i64) -> i64 do
+  // logical >> 63
+  let sh = bits >> 63
+  return sh & 1
+end
+let f_raw_exp = fn (bits: i64) -> i64 do return (bits >> 52) & 2047 end
+let f_frac = fn (bits: i64) -> i64 do return bits & ((1 << 52) - 1) end
+
+/// ln(2) and ln(10), as f64 (built bit-wise via to_f64 of their text -- but
+/// that recurses through this module; instead use the literal mantissa form).
+let ln10_f = fn () -> float do
+  // 2.302585092994046 = 2302585092994046 * 10^-15
+  return i64_to_float(val: 2302585092994046) *. pow10(n: 0 - 15)
+end
+let ln2_f = fn () -> float do
+  // 0.6931471805599453 = 6931471805599453 * 10^-16
+  return i64_to_float(val: 6931471805599453) *. pow10(n: 0 - 16)
+end
+let sqrt2_f = fn () -> float do
+  return i64_to_float(val: 14142135623730951) *. pow10(n: 0 - 16)
+end
+
+/// floor(x) for f64, via truncation toward zero adjusted for negatives.
+let floorf = fn (x: float) -> float do
+  let t = i64_to_float(val: float_to_i64(val: x))
+  if t >. x then return t -. f1() else return t end
+end
+
+/// ln(x) for x > 0 (atanh series after the m*2^k decomposition).
+let lnf = fn (x: float) -> float do
+  if x <=. f0() then return f0() end
+  let bits = reinterpret_to_i64(x)
+  let k0 = f_raw_exp(bits) - 1023
+  let m_bits = f_frac(bits) | (1023 << 52)
+  let m0 = reinterpret_to_f64(bits: m_bits)
+  let split = m0 >. sqrt2_f()
+  let m = if split then m0 /. i64_to_float(val: 2) else m0 end
+  let k = if split then k0 + 1 else k0 end
+  let t = (m -. f1()) /. (m +. f1())
+  let t2 = t *. t
+  let t3 = t2 *. t
+  let t5 = t3 *. t2
+  let t7 = t5 *. t2
+  let t9 = t7 *. t2
+  let series = t +. (t3 /. i64_to_float(val: 3)) +. (t5 /. i64_to_float(val: 5)) +. (t7 /. i64_to_float(val: 7)) +. (t9 /. i64_to_float(val: 9))
+  return (i64_to_float(val: k) *. ln2_f()) +. (i64_to_float(val: 2) *. series)
+end
+/// log10(x) for x > 0.
+let log10f = fn (x: float) -> float do return lnf(x) /. ln10_f() end
+
+/// Write up to 17 significant decimal digits of `m` (m in [1, 10)) into the
+/// byte buffer `dst`; returns the count of digits written (always 17). The
+/// last digit may be slightly off; trailing zeros are trimmed by the caller.
+let extract_digits = fn (m: float, dst: i64, i: i64, n: i64) -> i64 do
+  if i >= n then return n end
+  let d = float_to_i64(val: floorf(x: m))
+  let dd = if d < 0 then 0 else if d > 9 then 9 else d end
+  let _ = mem.store_u8(addr: dst + i, val: 48 + dd)
+  let m2 = (m -. i64_to_float(val: dd)) *. f10()
+  return extract_digits(m: m2, dst, i: i + 1, n)
+end
+
+/// Find the last index in [0, n) that is non-'0' in [dst, dst+n); -1 if all '0'.
+let last_nonzero = fn (dst: i64, n: i64, i: i64) -> i64 do
+  if i < 0 then return 0 - 1 end
+  if mem.load_u8(addr: dst + i) != 48 then return i end
+  return last_nonzero(dst, n, i: i - 1)
+end
+
+/// Round the digit string at [dst, dst+nd): `next_digit` is the ASCII byte of
+/// the first dropped digit ('0'..'9'). Rounds half-up; a carry may propagate
+/// past the most significant digit, in which case the digits become "100..0"
+/// and the returned exponent is `exp + 1` (else `exp` unchanged).
+let round_digits = fn (dst: i64, nd: i64, next_digit: i64, exp: i64) -> i64 do
+  if next_digit < 53 then return exp end
+  return round_carry(dst, i: nd - 1, exp)
+end
+let round_carry = fn (dst: i64, i: i64, exp: i64) -> i64 do
+  if i < 0 then
+    // carry past the most significant digit: shift right, leading '1'.
+    let _ = mem.store_u8(addr: dst, val: 49)
+    return exp + 1
+  end
+  let v = mem.load_u8(addr: dst + i)
+  if v == 57 then
+    let _ = mem.store_u8(addr: dst + i, val: 48)
+    return round_carry(dst, i: i - 1, exp)
+  end
+  let _ = mem.store_u8(addr: dst + i, val: v + 1)
+  return exp
+end
+
+/// Write n '0' bytes at dst.
+let fill_zeros = fn (dst: i64, n: i64) -> unit do
+  if n <= 0 then return () end
+  let _ = mem.store_u8(addr: dst, val: 48)
+  return fill_zeros(dst: dst + 1, n: n - 1)
+end
+
+/// If `neg`, write '-' at p[0] and return 1; else return 0.
+let neg_prefix = fn (p: i64, neg: bool) -> i64 do
+  if neg then
+    let _ = mem.store_u8(addr: p, val: 45)
+    return 1
+  end
+  return 0
+end
+
+/// Write the decimal digits of v (>= 0) to dst, MSD first; return the count.
+let write_uint_digits = fn (v: i64, dst: i64) -> i64 do
+  if v == 0 then
+    let _ = mem.store_u8(addr: dst, val: 48)
+    return 1
+  end
+  let nd = count_digits(v, n: 0)
+  let _ = write_digits_pos(v, dst, i: nd - 1)
+  return nd
+end
+
+/// Body length of a fixed-notation rendering of `nd` digits at exponent `e`.
+let fixed_body_len = fn (nd: i64, e: i64) -> i64 do
+  if e >= 0 then
+    if e + 1 >= nd then return e + 1 end
+    return nd + 1
+  end
+  return 2 + (0 - e - 1) + nd
+end
+
+/// Emit a fixed-notation rendering of `nd` digits at `digs` with decimal
+/// exponent `e` (value = D[0].D[1..] * 10^e); return packed (ptr<<32)|len.
+/// e >= 0 puts the point inside or after the digits (zero-padding past nd);
+/// e < 0 renders "0." then (-e-1) zeros then the digits. `neg` prepends '-'.
+let render_fixed = fn (digs: i64, nd: i64, e: i64, neg: bool) -> i64 do
+  let body_len = fixed_body_len(nd, e)
+  let total = if neg then body_len + 1 else body_len end
+  let p = alloc_bytes(n: total)
+  let off0 = neg_prefix(p, neg)
+  if e >= 0 then
+    if e + 1 >= nd then
+      let _ = copy_bytes(dst: p + off0, src: digs, count: nd)
+      let _ = fill_zeros(dst: p + off0 + nd, n: e + 1 - nd)
+      return pack(ptr: p, len: total)
+    end
+    let _ = copy_bytes(dst: p + off0, src: digs, count: e + 1)
+    let _ = mem.store_u8(addr: p + off0 + e + 1, val: 46)
+    let _ = copy_bytes(dst: p + off0 + e + 2, src: digs + e + 1, count: nd - e - 1)
+    return pack(ptr: p, len: total)
+  end
+  let _ = mem.store_u8(addr: p + off0, val: 48)
+  let _ = mem.store_u8(addr: p + off0 + 1, val: 46)
+  let nz = 0 - e - 1
+  let _ = fill_zeros(dst: p + off0 + 2, n: nz)
+  let _ = copy_bytes(dst: p + off0 + 2 + nz, src: digs, count: nd)
+  return pack(ptr: p, len: total)
+end
+
+/// Emit scientific notation: ('-')? D[0] ('.' D[1..])? 'e' ('-')? exp-digits.
+let render_sci = fn (digs: i64, nd: i64, e: i64, neg: bool) -> i64 do
+  let eabs = if e < 0 then 0 - e else e end
+  let edigs_p = alloc_bytes(n: 8)
+  let en = write_uint_digits(v: eabs, dst: edigs_p)
+  let frac_n = nd - 1
+  let dot_part = if frac_n > 0 then 1 + frac_n else 0 end
+  let esign_part = if e < 0 then 1 else 0 end
+  let body_len = 1 + dot_part + 1 + esign_part + en
+  let total = if neg then body_len + 1 else body_len end
+  let p = alloc_bytes(n: total)
+  let off0 = neg_prefix(p, neg)
+  let _ = mem.store_u8(addr: p + off0, val: mem.load_u8(addr: digs))
+  let after_d = render_sci_frac(p, at: off0 + 1, digs, frac_n)
+  let _ = mem.store_u8(addr: p + after_d, val: 101)
+  let after_e = render_sci_esign(p, at: after_d + 1, e)
+  let _ = copy_bytes(dst: p + after_e, src: edigs_p, count: en)
+  return pack(ptr: p, len: total)
+end
+/// Write ('.' digs[1..frac_n+1])? at p+at; return the offset just past it.
+let render_sci_frac = fn (p: i64, at: i64, digs: i64, frac_n: i64) -> i64 do
+  if frac_n <= 0 then return at end
+  let _ = mem.store_u8(addr: p + at, val: 46)
+  let _ = copy_bytes(dst: p + at + 1, src: digs + 1, count: frac_n)
+  return at + 1 + frac_n
+end
+/// Write ('-')? at p+at when e < 0; return the offset just past it.
+let render_sci_esign = fn (p: i64, at: i64, e: i64) -> i64 do
+  if e >= 0 then return at end
+  let _ = mem.store_u8(addr: p + at, val: 45)
+  return at + 1
+end
+
+/// Write the bytes of the literal `txt` (a sequence of byte values) into a
+/// fresh n-byte allocation; return packed. Used for the nan/inf/0 names.
+let small_str3 = fn (a: i64, b: i64, c: i64) -> i64 do
+  let p = alloc_bytes(n: 3)
+  let _ = store_at(a: p, v: a)
+  let _ = store_at(a: p + 1, v: b)
+  let _ = store_at(a: p + 2, v: c)
+  return pack(ptr: p, len: 3)
+end
+
+/// Parse the first `k` decimal digits at [digs, digs+k) as an i64.
+let digits_to_int = fn (digs: i64, k: i64) -> i64 do return digits_to_int_go(digs, k, i: 0, acc: 0) end
+let digits_to_int_go = fn (digs: i64, k: i64, i: i64, acc: i64) -> i64 do
+  if i >= k then return acc end
+  return digits_to_int_go(digs, k, i: i + 1, acc: (acc * 10) + (mem.load_u8(addr: digs + i) - 48))
+end
+
+/// Find the fewest leading digits (1..maxk, maxk <= 15) whose value, rounded
+/// at the next digit, reconstructs `mag` bit-exactly (using the same
+/// i64_to_float * pow10 recipe `assemble_f64` uses for parsing). Writes the
+/// chosen digits into `out` (which may pick up a rounding carry, shifting the
+/// exponent), and returns the (count << 8) | (1 if the exponent grew) -- the
+/// caller adds the bump to `e`. Returns 0 if nothing in range matched.
+let shortest_digits = fn (digs: i64, e: i64, mag: float, out: i64) -> i64 do
+  return shortest_go(digs, e, mag, out, k: 1)
+end
+let shortest_go = fn (digs: i64, e: i64, mag: float, out: i64, k: i64) -> i64 do
+  if k > 15 then return 0 end
+  // copy first k digits to out, round at digit[k]
+  let _ = copy_bytes(dst: out, src: digs, count: k)
+  let next_d = mem.load_u8(addr: digs + k)
+  let e_bumped = round_digits(dst: out, nd: k, next_digit: next_d, exp: 0)
+  let m_int = digits_to_int(digs: out, k)
+  // reconstruct: m_int has k digits, value = m_int * 10^(e + e_bumped - (k-1))
+  let recon = i64_to_float(val: m_int) *. pow10(n: e + e_bumped - (k - 1))
+  if recon ==. mag then return (k * 256) + e_bumped end
+  return shortest_go(digs, e, mag, out, k: k + 1)
+end
+
+/// Render an f64 to a decimal string. `0.0` -> "0"; `-0.0` -> "-0" (the IEEE
+/// sign is preserved). NaN -> "nan"; +-inf -> "inf"/"-inf". Exact integers
+/// below 2^53 print without a decimal point. Otherwise: the shortest leading
+/// digit string (<= 15 digits) that round-trips is used when one exists, else
+/// a 17-digit extraction with trailing zeros trimmed. Fixed notation for
+/// decimal exponents in [-4, 17), scientific notation outside.
+let __nx_string_from_float = fn (a_val: float) -> i64 do
+  let bits = reinterpret_to_i64(x: a_val)
+  let neg = f_sign_bit(bits) == 1
+  let raw_e = f_raw_exp(bits)
+  if raw_e == 2047 then
+    if f_frac(bits) != 0 then return small_str3(a: 110, b: 97, c: 110) end
+    if neg then
+      let p = alloc_bytes(n: 4)
+      let _ = store_at(a: p, v: 45)
+      let _ = store_at(a: p + 1, v: 105)
+      let _ = store_at(a: p + 2, v: 110)
+      let _ = store_at(a: p + 3, v: 102)
+      return pack(ptr: p, len: 4)
+    end
+    return small_str3(a: 105, b: 110, c: 102)
+  end
+  if raw_e == 0 && f_frac(bits) == 0 then
+    if neg then
+      let p = alloc_bytes(n: 2)
+      let _ = store_at(a: p, v: 45)
+      let _ = store_at(a: p + 1, v: 48)
+      return pack(ptr: p, len: 2)
+    end
+    let p = alloc_bytes(n: 1)
+    let _ = store_at(a: p, v: 48)
+    return pack(ptr: p, len: 1)
+  end
+  let mag = if neg then f0() -. a_val else a_val end
+  // Exact small integer? Print without a decimal point via from_i64.
+  let as_int = float_to_i64(val: mag)
+  if as_int < 9007199254740992 && i64_to_float(val: as_int) ==. mag then
+    if neg then return __nx_string_from_i64(a_val: 0 - as_int) end
+    return __nx_string_from_i64(a_val: as_int)
+  end
+  // Decimal exponent estimate, then up to two 1-step corrections so the
+  // normalised mantissa lands in [1, 10).
+  let e0 = float_to_i64(val: floorf(x: log10f(x: mag)))
+  let m0 = mag /. pow10(n: e0)
+  let e1 = if m0 >=. f10() then e0 + 1 else if m0 <. f1() then e0 - 1 else e0 end
+  let m1 = mag /. pow10(n: e1)
+  let e = if m1 >=. f10() then e1 + 1 else if m1 <. f1() then e1 - 1 else e1 end
+  let m = mag /. pow10(n: e)
+  // Extract 18 digits.
+  let raw = alloc_bytes(n: 24)
+  let _ = extract_digits(m, dst: raw, i: 0, n: 18)
+  // Try the shortest round-tripping prefix; fall back to a rounded 17 digits.
+  let chosen = alloc_bytes(n: 24)
+  let sh = shortest_digits(digs: raw, e, mag, out: chosen)
+  if sh != 0 then
+    let k = sh / 256
+    let e_after = e + (sh & 255)
+    let lnz = last_nonzero(dst: chosen, n: k, i: k - 1)
+    let nd = if lnz < 0 then 1 else lnz + 1 end
+    if e_after >= 0 - 4 && e_after < 17 then return render_fixed(digs: chosen, nd, e: e_after, neg) end
+    return render_sci(digs: chosen, nd, e: e_after, neg)
+  end
+  let next_digit = mem.load_u8(addr: raw + 17)
+  let e_after = round_digits(dst: raw, nd: 17, next_digit, exp: e)
+  let lnz = last_nonzero(dst: raw, n: 17, i: 16)
+  let nd = if lnz < 0 then 1 else lnz + 1 end
+  if e_after >= 0 - 4 && e_after < 17 then return render_fixed(digs: raw, nd, e: e_after, neg) end
+  return render_sci(digs: raw, nd, e: e_after, neg)
+end
+
+/// Return the raw 8-byte IEEE-754 bit pattern of the f64 parsed from
+/// [a_s_ptr, a_s_ptr+b_s_len) as an i64 (used by bytebuffer's push_f64_str_le).
+export let f64_str_bits = fn (a_s_ptr: i32, b_s_len: i32) -> i64 do
+  return reinterpret_to_i64(x: __nx_string_to_f64(a_s_ptr, b_s_len))
+end
 
 // === public surface ===
 
@@ -622,7 +1182,8 @@ export let from_char = fn (c: char) -> string do return to_str(packed: __nx_stri
 /// Converts an i64 integer to its string representation.
 export let from_i64 = fn (val: i64) -> string do return to_str(packed: __nx_string_from_i64(a_val: val)) end
 
-/// Converts a float to its string representation. Currently stubbed to "".
+/// Converts a float to its string representation (~17 significant digits, no
+/// trailing zeros; fixed notation for moderate exponents, else scientific).
 export let from_float = fn (val: float) -> string do return to_str(packed: __nx_string_from_float(a_val: val)) end
 
 /// Converts a bool to "true" or "false".
@@ -682,10 +1243,11 @@ export let char_code = fn (s: string, idx: i64) -> i64 do return __nx_string_cha
 /// Encodes a Unicode codepoint as a UTF-8 string (1-4 bytes). Negative inputs yield "".
 export let from_char_code = fn (code: i64) -> string do return to_str(packed: __nx_string_from_char_code(a_code: code)) end
 
-/// Parses a string as a float. Currently stubbed to 0.0.
+/// Parses a string as a float (returns 0.0 on malformed input; callers gate
+/// with is_valid_f64).
 let to_f64_raw = fn (s: string) -> f64 do return __nx_string_to_f64(a_s_ptr: s_ptr(s), b_s_len: s_len(s)) end
 
-/// Returns true if the string is a valid f64. Currently stubbed to false.
+/// Returns true if the string is a syntactically valid f64 literal.
 let is_valid_f64 = fn (s: string) -> bool do return __nx_string_is_valid_f64(a_s_ptr: s_ptr(s), b_s_len: s_len(s)) end
 
 /// Parses a string as an f64. Returns None on invalid input.

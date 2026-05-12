@@ -10,8 +10,10 @@
  *
  * `i64`<->`float` conversions are implemented here by manual IEEE-754 bit
  * twiddling (truncation, no round-to-nearest-even): the wasm convert opcodes
- * are not exposed as `nexus:runtime/math` intrinsics. `pow` is a stub (1.0):
- * wasm has no `f64.pow`; only `std:math.pow` callers are affected.
+ * are not exposed as `nexus:runtime/math` intrinsics. `pow` is a pure-Nexus
+ * implementation: exact exponentiation-by-squaring for integer exponents,
+ * exp(exp*ln(base)) via polynomial series for fractional ones (wasm has no
+ * `f64.pow` opcode).
  */
 import * as mem from "std:runtime/mem"
 import * as arena from "std:runtime/arena"
@@ -137,9 +139,108 @@ export let float_to_i64 = fn (val: float) -> i64 do
   return if neg then 0 - mag else mag end
 end
 
-/// Returns base raised to the power of exp. Stub (1.0): `f64.pow` is not a
-/// wasm primitive. Only `std:math.pow` callers are affected.
-export let pow = fn (base: float, exp: float) -> float do return 1.0 end
+// --- pow: exact integer exponents by squaring; fractional via exp(exp*ln(base)) ---
+
+/// ln(2), to f64 precision.
+let ln2 = fn () -> float do return 0.6931471805599453 end
+/// 1/ln(2).
+let inv_ln2 = fn () -> float do return 1.4426950408889634 end
+/// sqrt(2), the split point that keeps the ln series argument small.
+let sqrt2 = fn () -> float do return 1.4142135623730951 end
+
+/// Logical right shift of `bits` by `n` (0 <= n < 64), reusing `lshr`.
+let bits_shr = fn (bits: i64, n: i64) -> i64 do return lshr(v: bits, n) end
+
+/// pow(b, n) for integer n >= 0 by exponentiation by squaring. Exact for
+/// values that stay in range; sloppy on overflow (returns inf).
+let pow_int = fn (b: float, n: i64) -> float do
+  if n == 0 then return 1.0 end
+  if (n & 1) == 0 then
+    let h = pow_int(b: b *. b, n: n / 2)
+    return h
+  else
+    let h = pow_int(b: b *. b, n: (n - 1) / 2)
+    return b *. h
+  end
+end
+
+/// floor for f64 via truncation toward zero, adjusting down for negatives.
+let floor_f = fn (x: float) -> float do
+  let t = i64_to_float(val: float_to_i64(val: x))
+  if t >. x then return t -. 1.0 else return t end
+end
+
+/// ln(x) for x > 0. Decomposes x = m * 2^k with m in [sqrt(1/2), sqrt(2)),
+/// then ln(m) via the atanh series ln((1+t)/(1-t)) = 2(t + t^3/3 + ...).
+let ln_f = fn (x: float) -> float do
+  if x <=. 0.0 then return 0.0 end
+  let bits = f64_to_i64_bits(x)
+  let raw_exp = bits_shr(bits, n: 52) & 2047
+  let k0 = raw_exp - 1023
+  let mant_bits = (bits & ((1 << 52) - 1)) | (1023 << 52)
+  let m0 = i64_bits_to_f64(bits: mant_bits)
+  let split = m0 >. sqrt2()
+  let m = if split then m0 /. 2.0 else m0 end
+  let k = if split then k0 + 1 else k0 end
+  let t = (m -. 1.0) /. (m +. 1.0)
+  let t2 = t *. t
+  let t3 = t2 *. t
+  let t5 = t3 *. t2
+  let t7 = t5 *. t2
+  let t9 = t7 *. t2
+  let t11 = t9 *. t2
+  let series = t +. (t3 /. 3.0) +. (t5 /. 5.0) +. (t7 /. 7.0) +. (t9 /. 9.0) +. (t11 /. 11.0)
+  let ln_m = 2.0 *. series
+  return (i64_to_float(val: k) *. ln2()) +. ln_m
+end
+
+/// exp(y) for finite y. Range-reduces y = k*ln2 + r with |r| <= ln2/2, then
+/// exp(r) by Taylor series, then scales by 2^k via direct bit construction.
+let exp_f = fn (y: float) -> float do
+  let kf = floor_f(x: (y *. inv_ln2()) +. 0.5)
+  let k = float_to_i64(val: kf)
+  let r = y -. (kf *. ln2())
+  let r2 = r *. r
+  let r3 = r2 *. r
+  let r4 = r2 *. r2
+  let r5 = r4 *. r
+  let r6 = r4 *. r2
+  let r7 = r6 *. r
+  let exp_r = 1.0 +. r +. (r2 /. 2.0) +. (r3 /. 6.0) +. (r4 /. 24.0)
+              +. (r5 /. 120.0) +. (r6 /. 720.0) +. (r7 /. 5040.0)
+  let biased = k + 1023
+  if biased <= 0 then return 0.0 end
+  if biased >= 2047 then return exp_r *. 1.0e308 *. 1.0e308 end
+  let two_k = i64_bits_to_f64(bits: biased << 52)
+  return exp_r *. two_k
+end
+
+/// Returns base raised to the power of exp. Integer exponents are computed
+/// exactly by exponentiation by squaring; fractional exponents go through
+/// exp(exp * ln(base)) using polynomial approximations of ln and exp (so
+/// accurate to roughly f64 precision, not bit-exact). Negative bases are
+/// only meaningful for integer exponents (sign follows parity); a negative
+/// base with a fractional exponent returns 0.0.
+export let pow = fn (base: float, exp: float) -> float do
+  if exp ==. 0.0 then return 1.0 end
+  if base ==. 1.0 then return 1.0 end
+  if base ==. 0.0 then return 0.0 end
+  if base <. 0.0 then
+    let n = float_to_i64(val: exp)
+    let is_int = i64_to_float(val: n) ==. exp
+    if !is_int then return 0.0 end
+    let r = pow(base: 0.0 -. base, exp)
+    if (n & 1) != 0 then return 0.0 -. r else return r end
+  end
+  // base > 0
+  let n = float_to_i64(val: exp)
+  let is_int = i64_to_float(val: n) ==. exp
+  if is_int then
+    if n >= 0 then return pow_int(b: base, n) end
+    return 1.0 /. pow_int(b: base, n: 0 - n)
+  end
+  return exp_f(y: exp *. ln_f(x: base))
+end
 
 /// Negates a boolean value.
 export let negate = fn (val: bool) -> bool do

@@ -10,15 +10,17 @@
  * cap == 0). Storage comes from the unified bump arena (`arena.alloc_raw`);
  * growth leaks the old data region, which is fine for a bump allocator.
  *
- * Stubbed: `read_stdin_bytes` returns a fresh empty buffer (length 0 == EOF
- * to callers); `push_f64_str_le` appends 8 zero bytes (f64 string parsing in
- * Nexus is not yet available).
+ * `push_f64_str_le` parses its argument as an f64 (via `std:str`'s parser --
+ * this is also the path codegen uses to encode f64 literals) and appends the
+ * 8 IEEE-754 bytes little-endian. `read_stdin_bytes` reads from fd 0 over WASI
+ * `fd_read` in chunks until EOF or the requested byte count.
  */
 import * as mem from "std:runtime/mem"
 import * as cast from "std:runtime/cast"
 import * as arena from "std:runtime/arena"
 import { FileNotFound, FsThrow } from "std:fs"
-import { write_string_raw as fs_write_string_raw, read_to_string_raw as fs_read_to_string_raw } from "std:runtime/sysio_impl"
+import { write_string_raw as fs_write_string_raw, read_to_string_raw as fs_read_to_string_raw, read_fd_bytes_into } from "std:runtime/sysio_impl"
+import { f64_str_bits } from "std:str"
 import external "nexus:runtime/lazy"
 
 /// Type puns (pure passthrough — every Nexus value is an i64 at the WASM level).
@@ -115,16 +117,18 @@ let __nx_buf_push_i32_le = fn (a_id: i64, b_val: i64) -> unit do
   return bput(h: a_id, byte: (b_val >> 24) & 255)
 end
 
-/// f64 string parsing in Nexus is not yet available; appends 0.0's 8 bytes.
+/// Parse (b_s_ptr, c_s_len) as an f64 and append its 8 IEEE-754 bytes,
+/// little-endian. (This is the path codegen uses to encode f64 literals.)
 let __nx_buf_push_f64_str_le = fn (a_id: i64, b_s_ptr: i32, c_s_len: i32) -> unit do
-  let _ = bput(h: a_id, byte: 0)
-  let _ = bput(h: a_id, byte: 0)
-  let _ = bput(h: a_id, byte: 0)
-  let _ = bput(h: a_id, byte: 0)
-  let _ = bput(h: a_id, byte: 0)
-  let _ = bput(h: a_id, byte: 0)
-  let _ = bput(h: a_id, byte: 0)
-  return bput(h: a_id, byte: 0)
+  let bits = f64_str_bits(a_s_ptr: b_s_ptr, b_s_len: c_s_len)
+  let _ = bput(h: a_id, byte: bits & 255)
+  let _ = bput(h: a_id, byte: (bits >> 8) & 255)
+  let _ = bput(h: a_id, byte: (bits >> 16) & 255)
+  let _ = bput(h: a_id, byte: (bits >> 24) & 255)
+  let _ = bput(h: a_id, byte: (bits >> 32) & 255)
+  let _ = bput(h: a_id, byte: (bits >> 40) & 255)
+  let _ = bput(h: a_id, byte: (bits >> 48) & 255)
+  return bput(h: a_id, byte: (bits >> 56) & 255)
 end
 
 let __nx_buf_push_leb128_u = fn (a_id: i64, b_val: i64) -> unit do
@@ -212,9 +216,23 @@ let __nx_buf_read_file = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
   return h
 end
 
-/// Stubbed to return a fresh empty buffer (length 0 == EOF/closed to callers).
+/// Read up to `a_n` bytes from stdin (fd 0) into a fresh buffer; return its id.
+/// Reads in chunks via WASI fd_read until EOF or `a_n` bytes; a non-positive
+/// `a_n` yields an empty buffer (length 0, which callers treat as EOF/closed).
 let __nx_buf_read_stdin = fn (a_n: i64) -> i64 do
-  return __nx_buf_new()
+  let h = __nx_buf_new()
+  if a_n <= 0 then return h end
+  return read_stdin_chunks(h, want: a_n)
+end
+let read_stdin_chunks = fn (h: i64, want: i64) -> i64 do
+  let len = hdr_len(h)
+  if len >= want then return h end
+  let chunk = if want - len < 65536 then want - len else 65536 end
+  let _ = ensure_cap(h, need: chunk)
+  let got = read_fd_bytes_into(a_fd: 0, b_dst: hdr_data(h) + len, c_cap: chunk)
+  if got <= 0 then return h end
+  let _ = set_len(h, v: len + got)
+  return read_stdin_chunks(h, want)
 end
 
 // --- Public API ---
@@ -258,7 +276,8 @@ end
 /// Appends an f64 (parsed from string) as 8 IEEE 754 LE bytes. Consumes and returns the buffer.
 export let push_f64_str_le = fn (buf: %ByteBuffer, s: string) -> %ByteBuffer do
   match buf do | ByteBuffer(id) ->
-    __nx_buf_push_f64_str_le(a_id: id, b_s_ptr: cast.i32_of(x: 0), c_s_len: cast.i32_of(x: 0))
+    let raw = pun_raw(a_x: s)
+    __nx_buf_push_f64_str_le(a_id: id, b_s_ptr: cast.i32_of(x: (raw / two_pow_32()) & 4294967295), c_s_len: cast.i32_of(x: raw & 4294967295))
     let b = ByteBuffer(id)
     let %lb = b
     return %lb
@@ -370,8 +389,8 @@ export let read_binary_file = fn (path: string) -> %ByteBuffer throws { FsThrow 
   return %lb
 end
 
-/// Reads up to n bytes from stdin into a new ByteBuffer. Currently stubbed:
-/// always returns an empty buffer (length 0 == EOF/closed to callers).
+/// Reads up to n bytes from stdin (fd 0) into a new ByteBuffer, stopping at
+/// EOF. A non-positive n (or immediate EOF) yields an empty buffer.
 export let read_stdin_bytes = fn (n: i64) -> %ByteBuffer do
   let id = __nx_buf_read_stdin(a_n: n)
   let b = ByteBuffer(id)

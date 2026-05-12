@@ -38,9 +38,13 @@
  * absolute paths with no covering preopen will fail (the host's std::fs in the
  * old Rust impl did libc preopen-walking which is roughly the same).
  *
- * Stubbed (TODO -- later follow-ups):
- *   __nx_fd_path -> "" (would need a fd -> path table; the compiler never calls
- *                       Fs.handle_path, so this is unused in practice)
+ * `__nx_fd_path` is backed by a tiny growable fd->path side table in linear
+ * memory (head pointer cached in the reserved low-memory cell at offset 16;
+ * see `fd_table_cell`). Each `__nx_fd_open_*` success copies the opened path
+ * into the table keyed by the returned fd (overwriting any stale entry for
+ * the same fd); `fd_close` does not prune (a closed-then-reopened fd is
+ * re-keyed on the next open). `read_to_string` / `write_string` / etc. use
+ * the internal `open_path_*` helpers and do NOT touch the table.
  */
 import external "wasi_snapshot_preview1"
 import * as mem from "std:runtime/mem"
@@ -121,6 +125,16 @@ let rights_write = fn () -> i64 do return 536870911 end
 /// Lives in reserved low memory at offset 8 (the bump cell only uses the
 /// i64 at offset 0). 0 means "not yet allocated".
 let scratch_cell = fn () -> i64 do return 8 end
+
+/// Linear-memory cell holding the (lazily allocated) fd->path side-table
+/// pointer. Reserved low memory at offset 16. 0 means "not yet allocated".
+/// The table is `[count: i64, cap: i64, then cap*(fd:i64, path_ptr:i64,
+/// path_len:i64)]`; entries are appended/overwritten, never removed.
+let fd_table_cell = fn () -> i64 do return 16 end
+/// Bytes per fd-table entry: (fd, path_ptr, path_len).
+let fd_entry_size = fn () -> i64 do return 24 end
+/// Initial fd-table capacity (entries).
+let fd_table_cap0 = fn () -> i64 do return 16 end
 
 /// Scratch region size (bytes). Holds (at fixed offsets) an iovec, an
 /// nwritten/nread i32, a seek out-param, args sizes, a (dirfd, rel_ptr, rel_len)
@@ -764,22 +778,103 @@ end
 
 // === exported: filesystem -- fd ops (fs.nx) =================================
 
+// --- fd -> path side table -------------------------------------------------
+
+/// Read/write the fd-table header words.
+let ft_count = fn (h: i64) -> i64 do return mem.load_i64(addr: h) end
+let ft_cap = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 8) end
+let ft_set_count = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h, val: v) end
+let ft_set_cap = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 8, val: v) end
+/// Address of entry `i`'s (fd, path_ptr, path_len) triple.
+let ft_entry = fn (h: i64, i: i64) -> i64 do return h + 16 + (i * fd_entry_size()) end
+
+/// The fd-table head (lazily allocated). 0 -> allocate the initial table.
+let fd_table = fn () -> i64 do
+  let cur = mem.load_i64(addr: fd_table_cell())
+  if cur != 0 then return cur end
+  let cp = fd_table_cap0()
+  let h = alloc_bytes(n: 16 + (cp * fd_entry_size()))
+  let _ = ft_set_count(h, v: 0)
+  let _ = ft_set_cap(h, v: cp)
+  let _ = mem.store_i64(addr: fd_table_cell(), val: h)
+  return h
+end
+
+/// Index of the entry for `fd`, or -1 if absent.
+let ft_find = fn (h: i64, fd: i64) -> i64 do return ft_find_go(h, fd, i: 0, n: ft_count(h)) end
+let ft_find_go = fn (h: i64, fd: i64, i: i64, n: i64) -> i64 do
+  if i >= n then return 0 - 1 end
+  if mem.load_i64(addr: ft_entry(h, i)) == fd then return i end
+  return ft_find_go(h, fd, i: i + 1, n)
+end
+
+/// Record (a copy of) `[path_ptr, path_ptr+path_len)` as the path of `fd`.
+/// Overwrites a prior entry for `fd`; grows the table (2x) when full.
+let fd_table_put = fn (fd: i64, path_ptr: i64, path_len: i64) -> unit do
+  if fd < 0 || path_len <= 0 then return () end
+  let owned = alloc_bytes(n: path_len)
+  let _ = copy_bytes(dst: owned, src: path_ptr, count: path_len)
+  let h0 = fd_table()
+  let existing = ft_find(h: h0, fd)
+  if existing >= 0 then
+    let e = ft_entry(h: h0, i: existing)
+    let _ = mem.store_i64(addr: e + 8, val: owned)
+    let _ = mem.store_i64(addr: e + 16, val: path_len)
+    return ()
+  end
+  let h = if ft_count(h0) < ft_cap(h0) then h0 else fd_table_grow(h0) end
+  let n = ft_count(h)
+  let e = ft_entry(h, i: n)
+  let _ = mem.store_i64(addr: e, val: fd)
+  let _ = mem.store_i64(addr: e + 8, val: owned)
+  let _ = mem.store_i64(addr: e + 16, val: path_len)
+  let _ = ft_set_count(h, v: n + 1)
+  return ()
+end
+/// Double the table's capacity (copy header + entries to a fresh region; the
+/// old region leaks, which is fine under the bump allocator). Updates the cell.
+let fd_table_grow = fn (h0: i64) -> i64 do
+  let old_cap = ft_cap(h0)
+  let new_cap = old_cap * 2
+  let cnt = ft_count(h0)
+  let h = alloc_bytes(n: 16 + (new_cap * fd_entry_size()))
+  let _ = copy_bytes(dst: h, src: h0, count: 16 + (cnt * fd_entry_size()))
+  let _ = ft_set_cap(h, v: new_cap)
+  let _ = mem.store_i64(addr: fd_table_cell(), val: h)
+  return h
+end
+
+/// Common open path: open via `opener`, and on success record the path.
+let fd_open_and_track = fn (path_ptr: i64, path_len: i64, fd: i64) -> i64 do
+  if fd >= 0 then let _ = fd_table_put(fd, path_ptr, path_len) end
+  return fd
+end
+
 /// __nx_fd_open_read(path): open for reading; return the fd (>= 0) or -1.
+/// On success, the path is recorded for later __nx_fd_path lookup.
 /// wasm sig (i32 i32) -> i64.
 export let __nx_fd_open_read = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
-  return open_path_read(path_ptr: i64of(x: a_path_ptr), path_len: i64of(x: b_path_len))
+  let pp = i64of(x: a_path_ptr)
+  let pl = i64of(x: b_path_len)
+  return fd_open_and_track(path_ptr: pp, path_len: pl, fd: open_path_read(path_ptr: pp, path_len: pl))
 end
 
 /// __nx_fd_open_write(path): open create+trunc; return the fd (>= 0) or -1.
+/// On success, the path is recorded for later __nx_fd_path lookup.
 /// wasm sig (i32 i32) -> i64.
 export let __nx_fd_open_write = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
-  return open_path_write(path_ptr: i64of(x: a_path_ptr), path_len: i64of(x: b_path_len))
+  let pp = i64of(x: a_path_ptr)
+  let pl = i64of(x: b_path_len)
+  return fd_open_and_track(path_ptr: pp, path_len: pl, fd: open_path_write(path_ptr: pp, path_len: pl))
 end
 
 /// __nx_fd_open_append(path): open create+append; return the fd (>= 0) or -1.
+/// On success, the path is recorded for later __nx_fd_path lookup.
 /// wasm sig (i32 i32) -> i64.
 export let __nx_fd_open_append = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
-  return open_path_append(path_ptr: i64of(x: a_path_ptr), path_len: i64of(x: b_path_len))
+  let pp = i64of(x: a_path_ptr)
+  let pl = i64of(x: b_path_len)
+  return fd_open_and_track(path_ptr: pp, path_len: pl, fd: open_path_append(path_ptr: pp, path_len: pl))
 end
 
 /// __nx_fd_close(fd): close the fd. Returns 1 on success / 0 on bad fd.
@@ -803,12 +898,18 @@ export let __nx_fd_write = fn (a_fd: i64, b_content_ptr: i32, c_content_len: i32
   return write_all(fd: a_fd, buf: i64of(x: b_content_ptr), len: i64of(x: c_content_len))
 end
 
-/// __nx_fd_path(fd): STUB -- the old Rust returned the path the fd was opened
-/// with; emulating that needs a fd -> path table. The compiler never calls
-/// Fs.handle_path, so this is unused; returns "" (0). TODO: add a
-/// fd table here if a consumer ever needs it. wasm sig (i64) -> i64 (string).
+/// __nx_fd_path(fd): the path `fd` was opened with via __nx_fd_open_*, as a
+/// packed string; 0 ("") when the fd is unknown to the side table (never
+/// opened through the fd-handle API, or a stdio/preopen fd). The stored path
+/// is a private copy, so the result is stable. wasm sig (i64) -> i64 (string).
 export let __nx_fd_path = fn (a_fd: i64) -> i64 do
-  return 0
+  if a_fd < 0 then return 0 end
+  let cur = mem.load_i64(addr: fd_table_cell())
+  if cur == 0 then return 0 end
+  let idx = ft_find(h: cur, fd: a_fd)
+  if idx < 0 then return 0 end
+  let e = ft_entry(h: cur, i: idx)
+  return pack(ptr: mem.load_i64(addr: e + 8), len: mem.load_i64(addr: e + 16))
 end
 
 // === string-typed wrappers (the surface std:stdio / std:fs / std:proc use) ===
@@ -859,4 +960,19 @@ export let write_string_raw = fn (a_path_ptr: i32, b_path_len: i32, c_content_pt
 end
 export let read_to_string_raw = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
   return __nx_read_to_string(a_path_ptr, b_path_len)
+end
+
+/// Single fd_read of up to `c_cap` bytes from `a_fd` into linear memory at
+/// `b_dst`. Returns the byte count read (0 at EOF), or -1 on error. Used by
+/// ByteBuffer.read_stdin_bytes, which loops this until EOF / its limit.
+export let read_fd_bytes_into = fn (a_fd: i64, b_dst: i64, c_cap: i64) -> i64 do
+  if c_cap <= 0 then return 0 end
+  let s = scratch()
+  let iov = s + sl_iovec()
+  let nr = s + sl_nrw()
+  let _ = mem.store_i32(addr: iov, val: b_dst)
+  let _ = mem.store_i32(addr: iov + 4, val: c_cap)
+  let errno = w_fd_read(a_fd: i32of(x: a_fd), b_iovs_ptr: i32of(x: iov), c_iovs_len: i32of(x: 1), d_nread_ptr: i32of(x: nr))
+  if errno != i32of(x: 0) then return 0 - 1 end
+  return mem.load_i32(addr: nr)
 end

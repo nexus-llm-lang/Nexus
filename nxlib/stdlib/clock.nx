@@ -5,12 +5,15 @@
  * Requires PermClock capability.
  *
  * `now` is CLOCK_REALTIME milliseconds since the UNIX epoch (via WASI
- * preview1 `clock_time_get`). `sleep` is a stub: WASI preview1 sleep is
- * `poll_oneoff` with a clock subscription, not worth the complexity here.
+ * preview1 `clock_time_get`). `sleep` uses WASI preview1 `poll_oneoff` with a
+ * single relative-timeout clock subscription (best-effort: any errno from
+ * poll_oneoff is ignored).
  */
 import external "wasi_snapshot_preview1"
 /// clock_time_get(clock_id, precision:i64, time_out_ptr) -> errno.
 external w_clock_time_get = "clock_time_get" : (a_clock_id: i32, b_precision: i64, c_time_out_ptr: i32) -> i32
+/// poll_oneoff(subscriptions_ptr, events_out_ptr, nsubscriptions, nevents_out_ptr) -> errno.
+external w_poll_oneoff = "poll_oneoff" : (a_in: i32, b_out: i32, c_nsub: i32, d_nevents_out: i32) -> i32
 
 import * as mem from "std:runtime/mem"
 import * as cast from "std:runtime/cast"
@@ -29,8 +32,30 @@ export let now_ms = fn () -> i64 do
   return ns / ns_per_ms()
 end
 
-/// Sleep stub: WASI preview1 has no simple sleep primitive. No-op.
-let __nx_sleep = fn (ms: i64) -> unit do return () end
+/// Sleep for `ms` milliseconds (best effort). Builds one WASI preview1
+/// `__wasi_subscription_t` for a relative `monotonic` clock timeout in a fresh
+/// 192-byte scratch region ([0..48) subscription, [64..96) event-out, [128..132)
+/// nevents-out), runs `poll_oneoff`, and ignores the result. A non-positive
+/// `ms` returns immediately.
+///
+/// subscription layout (48 bytes): userdata u64 @0; subscription_u tag u8 @8
+/// (0 = clock -- the `__wasi_eventtype_t` enum is clock=0, fd_read=1, fd_write=2);
+/// subscription_clock: id u32 @16 (1 = monotonic), timeout u64 @24 (nanoseconds),
+/// precision u64 @32, flags u16 @40 (0 = relative, not ABSTIME).
+let __nx_sleep = fn (ms: i64) -> unit do
+  if ms <= 0 then return () end
+  let s = arena.alloc_raw(size: 192)
+  let _ = mem.store_i64(addr: s, val: 0)            // userdata
+  let _ = mem.store_i64(addr: s + 8, val: 0)        // tag u8 = 0 (clock); high 7 bytes = padding, zeroed
+  let _ = mem.store_i64(addr: s + 16, val: 1)       // clock id u32 = 1 (monotonic); next 4 bytes = padding
+  let _ = mem.store_i64(addr: s + 24, val: ms * ns_per_ms())  // timeout u64 (ns)
+  let _ = mem.store_i64(addr: s + 32, val: ns_per_ms())       // precision u64 (ns)
+  let _ = mem.store_i64(addr: s + 40, val: 0)       // flags u16 = 0 (relative); rest = padding
+  let _ = mem.store_i32(addr: s + 128, val: 0)      // nevents out
+  let _ = w_poll_oneoff(a_in: cast.i32_of(x: s), b_out: cast.i32_of(x: s + 64),
+                        c_nsub: cast.i32_of(x: 1), d_nevents_out: cast.i32_of(x: s + 128))
+  return ()
+end
 
 export cap Clock do
   fn sleep(ms: i64) -> unit
