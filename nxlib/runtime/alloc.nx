@@ -1,0 +1,81 @@
+/**
+ * runtime/alloc: thread-safe bump allocator for the Nexus stdlib bundle.
+ *
+ * Replaces the prebuilt `stdlib.wasm`'s dlmalloc (which is single-threaded on
+ * wasm32-wasi and would corrupt under wasi-threads). Exports the symbols the
+ * stdlib-merge step / codegen wire into every program: `allocate` (the routed
+ * object allocator), `deallocate`, `__nx_alloc_mark`, `__nx_alloc_reset` (the
+ * arena heap_mark/heap_reset back-end). `cabi_realloc` is not exported here —
+ * codegen synthesises its own per-program (bumping G0, which in alloc_mode=2
+ * sits in the unused gap below this allocator's region).
+ *
+ * Design: a single i32 bump pointer in linear memory cell 0 (the [0,16) range
+ * is reserved by the bundle's str_base=16). 0 doubles as the "uninitialised"
+ * sentinel — the first allocation seeds the cell to memory.size()*65536 (the
+ * top of all static data, which after the stdlib-merge includes the user
+ * module's data + strings) via a compare-and-swap, so concurrent first calls
+ * are safe and converge on the same value. Thereafter every allocation is one
+ * `i32.atomic.rmw.add`; that, plus `__nx_alloc_reset` racing a still-running
+ * worker thread, is the documented thread-safety caveat (nexus-f90i route a).
+ *
+ * heap_mark/heap_reset (arena) bind to (alloc_mark, alloc_reset): the mark is
+ * the bump-pointer value, reset stores it back. All allocations are 8-byte
+ * aligned (matching codegen's `words * 8` object layout).
+ */
+import * as mem from "std:runtime/mem"
+import * as atomic from "std:runtime/atomic"
+import * as cast from "std:runtime/cast"
+
+/// Linear-memory offset of the i32 bump-pointer cell.
+let bump_cell = fn () -> i64 do return 0 end
+
+/// Current end of backed linear memory, in bytes.
+let memsize_bytes = fn () -> i64 do return mem.size() * 65536 end
+
+/// Round `n` up to a multiple of 8.
+let align_up8 = fn (n: i64) -> i64 do return (n + 7) - ((n + 7) % 8) end
+
+/// Idempotent, race-safe seed of the bump cell to the static-data extent.
+let ensure_init = fn () -> unit do
+  let _ = atomic.cmpxchg_i32(addr: bump_cell(), expected: 0, replacement: memsize_bytes())
+  return ()
+end
+
+/// Grow linear memory so `[0, end_addr)` is backed. Returns false on OOM.
+let ensure_capacity = fn (end_addr: i64) -> bool do
+  let cur = memsize_bytes()
+  if cur >= end_addr then return true end
+  let need_pages = (end_addr - cur + 65535) / 65536
+  return mem.grow(delta: need_pages) >= 0
+end
+
+/// Allocate `size` bytes (8-aligned), returning the byte offset, or 0 on OOM.
+export let allocate = fn (size: i32) -> i32 do
+  return cast.i32_of(x: allocate_bytes(n: cast.i64_of(x: size)))
+end
+
+let allocate_bytes = fn (n: i64) -> i64 do
+  if n <= 0 then return 0 end
+  let _ = ensure_init()
+  let want = align_up8(n: n)
+  let ptr = atomic.rmw_add_i32(addr: bump_cell(), val: want)
+  if !ensure_capacity(end_addr: ptr + want) then return 0 end
+  return ptr
+end
+
+/// Free is a no-op for a bump allocator — arena `heap_reset` is the reclaim path.
+export let deallocate = fn (ptr: i32, size: i32) -> unit do
+  return ()
+end
+
+/// Snapshot the bump pointer (arena mark). Pair with `__nx_alloc_reset`.
+export let __nx_alloc_mark = fn () -> i32 do
+  let _ = ensure_init()
+  return cast.i32_of(x: atomic.load_i32(addr: bump_cell()))
+end
+
+/// Rewind the bump pointer to a previous mark, reclaiming everything allocated
+/// since. Racy if a worker thread is allocating concurrently (nexus-f90i caveat).
+export let __nx_alloc_reset = fn (mark: i32) -> unit do
+  return atomic.store_i32(addr: bump_cell(), val: cast.i64_of(x: mark))
+end
