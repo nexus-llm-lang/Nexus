@@ -152,6 +152,13 @@ let is_simd_external = fn (ext: LirExternal) -> bool do
   end
 end
 
+let is_atomic_external = fn (ext: LirExternal) -> bool do
+  match ext do
+    | LirExternal(name: _, wasm_module: m, wasm_name: _, params: _, ret_type: _, throw_row: _) ->
+      return m == "nexus:runtime/atomic"
+  end
+end
+
 /** True when name corresponds to a lifted lambda (`__closure_N`). Matches both */
 /** the bare form and the canonical-path form (`<sanitized-path>#__closure_N`) */
 /** because `lift_lambda` (mir.nx) names lambdas `__closure_N` but downstream */
@@ -238,7 +245,7 @@ let find_sched_import_idx = fn (wn: string, exts: [LirExternal], idx: i64) -> i6
   match exts do
     | [] -> return -1
     | e :: rest ->
-      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_simd_external(ext: e) || is_intrinsic_sched_external(ext: e) then
+      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_simd_external(ext: e) || is_atomic_external(ext: e) || is_intrinsic_sched_external(ext: e) then
         return find_sched_import_idx(wn, exts: rest, idx)
       end
       match e do | LirExternal(name: _, wasm_module: m, wasm_name: w, params: _, ret_type: _, throw_row: _) ->
@@ -318,7 +325,7 @@ let filter_arena_externals = fn (exts: [LirExternal]) -> [LirExternal] do
   match exts do
     | [] -> return []
     | e :: rest ->
-      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_simd_external(ext: e) || is_intrinsic_sched_external(ext: e) then
+      if is_arena_external(ext: e) || is_memory_external(ext: e) || is_math_external(ext: e) || is_simd_external(ext: e) || is_atomic_external(ext: e) || is_intrinsic_sched_external(ext: e) then
         return filter_arena_externals(exts: rest)
       else
         return e :: filter_arena_externals(exts: rest)
@@ -610,6 +617,109 @@ let emit_mem_grow = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -
       return bb.push_byte(%buf, byte: op_i64_extend_i32_s)
     | _ ->
       raise SymbolNotFound(name: "__nx_mem_grow", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+// ─── Atomic intrinsics (`nexus:runtime/atomic`) ─────────────────────────────
+// Each lowers to a single 0xFE-prefixed wasm instruction (no host call). Like
+// the memory intrinsics, addresses/values cross the FFI as Nexus `i64` and are
+// wrapped to wasm i32 at the boundary. `wait32` / `notify` trap unless the
+// linear memory is `shared`. These externals are filtered from the import
+// section (filter_arena_externals).
+
+let get_atomic_wasm_name = fn (func: string, exts: [LirExternal]) -> string do
+  match wdefs.find_external(name: func, exts) do
+    | None -> ""
+    | Some(val: ext) ->
+      if !is_atomic_external(ext) then return "" end
+      match ext do
+        | LirExternal(name: _, wasm_module: _, wasm_name: wn, params: _, ret_type: _, throw_row: _) -> wn
+      end
+  end
+end
+
+let emit_atomic_rmw_add_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_rmw_add, offset: 0)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_atomic_rmw_add_i32", kind: "atomic intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+let emit_atomic_load_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_load, offset: 0)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_atomic_load_i32", kind: "atomic intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+let emit_atomic_store_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      return wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_store, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_atomic_store_i32", kind: "atomic intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+let emit_atomic_cmpxchg_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: ex) :: LirCallArg(label: _, value: rp) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: ex, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = emit_atom(atom: rp, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_rmw_cmpxchg, offset: 0)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_atomic_cmpxchg_i32", kind: "atomic intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+let emit_atomic_wait32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: ex) :: LirCallArg(label: _, value: tmo) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: ex, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      // wait32's timeout operand is i64; pass through unwrapped.
+      let %buf = emit_atom(atom: tmo, %buf, ctx)
+      let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_atomic_wait32, offset: 0)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_atomic_wait32", kind: "atomic intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+let emit_atomic_notify = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: c) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: c, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_atomic_notify, offset: 0)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_atomic_notify", kind: "atomic intrinsic arg", context: "")
       return %buf
   end
 end
@@ -1363,6 +1473,7 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
   let mem_wn = get_memory_wasm_name(func, exts)
   let math_wn = get_math_wasm_name(func, exts)
   let simd_wn = get_simd_wasm_name(func, exts)
+  let atomic_wn = get_atomic_wasm_name(func, exts)
   if func == "__array_get" then return emit_array_get(args, %buf, ctx)
   else if func == "__array_set" then return emit_array_set(args, %buf, ctx)
   else if arena_wn == "heap-mark" then return emit_heap_mark(%buf, ctx)
@@ -1382,6 +1493,12 @@ let emit_call = fn (func: string, args: [LirCallArg], buf: %ByteBuffer, ctx: Cod
   else if mem_wn == "mem-store-f64" then return emit_mem_store_f64(args, %buf, ctx)
   else if mem_wn == "mem-size" then return emit_mem_size(%buf)
   else if mem_wn == "mem-grow" then return emit_mem_grow(args, %buf, ctx)
+  else if atomic_wn == "atomic-rmw-add-i32" then return emit_atomic_rmw_add_i32(args, %buf, ctx)
+  else if atomic_wn == "atomic-load-i32" then return emit_atomic_load_i32(args, %buf, ctx)
+  else if atomic_wn == "atomic-store-i32" then return emit_atomic_store_i32(args, %buf, ctx)
+  else if atomic_wn == "atomic-cmpxchg-i32" then return emit_atomic_cmpxchg_i32(args, %buf, ctx)
+  else if atomic_wn == "atomic-wait32" then return emit_atomic_wait32(args, %buf, ctx)
+  else if atomic_wn == "atomic-notify" then return emit_atomic_notify(args, %buf, ctx)
   else if math_wn == "f64-sqrt" then return emit_f64_unary(opcode: op_f64_sqrt, args, %buf, ctx, name: "__nx_f64_sqrt")
   else if math_wn == "f64-floor" then return emit_f64_unary(opcode: op_f64_floor, args, %buf, ctx, name: "__nx_f64_floor")
   else if math_wn == "f64-ceil" then return emit_f64_unary(opcode: op_f64_ceil, args, %buf, ctx, name: "__nx_f64_ceil")
