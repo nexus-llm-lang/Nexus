@@ -2186,10 +2186,9 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
         else
           emit_coercion(from_type: et, to_type: t, %buf)
         end
-        // Single-scan packed lookup folds the previous double linear scan
-        // (issue nexus-m2xq). Layout: `(index << 32) | valtype`.
-        let CodegenCtx(locals: locs, _) = ctx
-        let packed = wdefs.lookup_local_packed(name: n, entries: locs)
+        // O(1) packed local lookup via per-function HashMap (issue nexus-m2xq).
+        // Layout: `(index << 32) | valtype`.
+        let packed = wdefs.ctx_lookup_local(ctx, name: n)
         let idx = if packed < 0 then
           raise SymbolNotFound(name: n, kind: "local variable", context: "emit_stmt: let-binding target")
         else packed / 4294967296 end
@@ -2240,8 +2239,10 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
 
     | LirStmtTryCatch(body: b, body_ret: br, catch_param: cp, catch_param_typ: _,
                           catch_body: cb, catch_ret: cr) ->
-      let CodegenCtx(locals: locs, func_ret_type: ret_t, _) = ctx
-      let catch_local_idx = wdefs.lookup_local(name: cp, entries: locs)
+      let CodegenCtx(func_ret_type: ret_t, _) = ctx
+      // O(1) catch-param lookup; -1 = catch param is Unit/unused (issue nexus-m2xq).
+      let packed = wdefs.ctx_lookup_local(ctx, name: cp)
+      let catch_local_idx = if packed < 0 then 0 - 1 else packed / 4294967296 end
 
       // WASM EH: block $skip { block $catch (result i64) { try_table (catch tag0 $catch) { body } end; br 1 } end; catch body } end
       // Emit block $skip
@@ -2537,7 +2538,26 @@ let build_param_locals_go = fn (params: [LirParam], idx: i64, acc: [LocalEntry])
   end
 end
 
-let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
+/** Per-function locals data: `[LocalEntry]` for decl emission, packed map */
+/** for O(1) name lookup, and `temps_base` for scratch-local indexing. The */
+/** %HashMap is owned by `emit_one_body` so it can be freed after the body */
+/** finishes (locals never escape a function). */
+export type LocalsResult = LocalsResult(locals: [LocalEntry], temps_base: i64, local_map: %HashMap)
+
+let build_func_locals = fn (func: LirFunction) -> LocalsResult do
+  let LirFunction(name: _, params: ps, ret_type: _, body: b, ret: _, span: _) = func
+  let param_locals = build_param_locals(params: ps, idx: 0)
+  let param_count = list.length(xs: ps)
+  let %local_map = wdefs.build_local_map(entries: param_locals)
+  match wcollect.collect_local_stmts(stmts: b, locals: param_locals, next_idx: param_count, %local_map) do
+    | LocalResult(locals: collected_locals, next_idx: collected_next_idx, local_map: lm) ->
+      return LocalsResult(locals: collected_locals, temps_base: collected_next_idx, local_map: %lm)
+  end
+end
+
+let build_func_ctx = fn (func: LirFunction,
+                          locals: [LocalEntry], temps_base: i64, local_map: &HashMap,
+                          internal_funcs: [FuncEntry],
                           external_funcs: [FuncEntry], string_lits: [StringEntry],
                           alloc_mode: i64, functions: [LirFunction],
                           externals: [LirExternal],
@@ -2553,16 +2573,11 @@ let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
                           memo_target_names: [string],
                           memo_target_slots: [i64],
                           memo_globals_base: i64,
-                          import_count: i64) -> CodegenCtx throws { CodegenError } do
-  let LirFunction(name: fname, params: ps, ret_type: rt, body: b, ret: _, span: _) = func
-  let param_locals = build_param_locals(params: ps, idx: 0)
-  let param_count = list.length(xs: ps)
-  let %local_map = wdefs.build_local_map(entries: param_locals)
-  match wcollect.collect_local_stmts(stmts: b, locals: param_locals, next_idx: param_count, %local_map) do | LocalResult(locals: collected_locals, next_idx: collected_next_idx, local_map: lm) ->
-  hmap.free(map: %lm)
+                          import_count: i64) -> CodegenCtx do
+  let LirFunction(name: fname, params: _, ret_type: rt, body: _, ret: _, span: _) = func
   return CodegenCtx(
-    locals: collected_locals, internal_funcs, external_funcs,
-    string_lits, alloc_mode, temps_base: collected_next_idx,
+    locals, internal_funcs, external_funcs,
+    string_lits, alloc_mode, temps_base,
     func_ret_type: rt, functions, externals,
     closure_table, closure_type_indices,
     internal_func_map, external_func_map,
@@ -2575,9 +2590,9 @@ let build_func_ctx = fn (func: LirFunction, internal_funcs: [FuncEntry],
     memo_target_names,
     memo_target_slots,
     memo_globals_base,
-    import_count
+    import_count,
+    local_map
   )
-  end
 end
 
 let append_body_to_buf = fn (buf: %ByteBuffer, body: %ByteBuffer) -> %ByteBuffer do
@@ -2633,22 +2648,29 @@ let emit_one_body = fn (buf: %ByteBuffer, f: LirFunction,
   let LirFunction(name: fname, _) = f
   let bt_capture_idx = resolve_bt_capture_for_func(func_name: fname, effect_map,
                                                      bt_capture_idx_global)
-  let ctx = build_func_ctx(func: f, internal_funcs,
-                            external_funcs, string_lits,
-                            alloc_mode, functions, externals,
-                            closure_table, closure_type_indices,
-                            internal_func_map, external_func_map,
-                            ss_tag_idx,
-                            ss_cont_type_idx,
-                            ss_dispatch_block_type_idx,
-                            ss_tag_names,
-                            bt_capture_idx,
-                            memo_target_names,
-                            memo_target_slots,
-                            memo_globals_base,
-                            import_count)
-  let %body = compile_function_body(func: f, ctx)
-  return append_body_to_buf(%buf, %body)
+  // Build locals + packed map up front; map is owned here so we can free it
+  // after the body finishes (issue nexus-m2xq).
+  match build_func_locals(func: f) do
+    | LocalsResult(locals: ls, temps_base: tb, local_map: lm) ->
+      let ctx = build_func_ctx(func: f, locals: ls, temps_base: tb, local_map: &lm,
+                                internal_funcs,
+                                external_funcs, string_lits,
+                                alloc_mode, functions, externals,
+                                closure_table, closure_type_indices,
+                                internal_func_map, external_func_map,
+                                ss_tag_idx,
+                                ss_cont_type_idx,
+                                ss_dispatch_block_type_idx,
+                                ss_tag_names,
+                                bt_capture_idx,
+                                memo_target_names,
+                                memo_target_slots,
+                                memo_globals_base,
+                                import_count)
+      let %body = compile_function_body(func: f, ctx)
+      hmap.free(map: %lm)
+      return append_body_to_buf(%buf, %body)
+  end
 end
 
 let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
