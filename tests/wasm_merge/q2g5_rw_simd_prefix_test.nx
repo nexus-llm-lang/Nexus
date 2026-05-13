@@ -1,0 +1,109 @@
+// Issue nexus-q2g5: unit-test merge.rw_simd_prefix — the 0xFD sub-opcode
+// dispatcher inside rw_instrs's cls_simd_prefix arm.
+//
+// Three operand shapes to cover:
+//   1. memarg ops (v128.load / v128.store) — copy 2 ULEBs verbatim
+//   2. zero-operand ops (i32x4.splat etc.) — copy nothing, pos unchanged
+//   3. unhandled sub-op — emit op_unreachable (0x00) and hold pos steady
+//      (the SIMD walker's belt-and-suspenders fallthrough for unknown
+//      sub-ops gated by codegen.emit_simd_*)
+//
+// The fallthrough behaviour is intentional: any new SIMD op added to
+// codegen without a matching arm here must trip wasm-validate, never
+// silently mis-decode. See comments at rw_simd_prefix in merge.nx.
+//
+// Note on `op_simd_*()` call syntax: top-level `let foo = 17` bindings
+// in Nexus are typed as `() -> i64` (TyLazy), so passing them as a
+// scalar argument needs an explicit force `op_simd_v128_load()`. The
+// in-module callers in merge.nx dodge this via `==` which auto-forces
+// TyLazy in operator-context.
+import * as test_assert from "std:test/assert"
+import * as bb from "std:bytebuffer"
+import { ByteBuffer } from "std:bytebuffer"
+import { rw_simd_prefix, BufPos } from "src/backend/wasm/merge.nx"
+import { op_simd_v128_load, op_simd_i32x4_splat, op_unreachable } from "src/backend/wasm/defs.nx"
+
+let read_all = fn (buf: &ByteBuffer) -> [ i64 ] do
+  return read_all_go(buf, idx: 0, len: bb.length(buf), acc: [])
+end
+let read_all_go = fn (buf: &ByteBuffer, idx: i64, len: i64, acc: [ i64 ]) -> [ i64 ] do
+  if idx >= len then return reverse(xs: acc, out: []) end
+  let b = bb.get_byte(buf, idx)
+  return read_all_go(buf, idx: idx + 1, len, acc: b :: acc)
+end
+let reverse = fn (xs: [ i64 ], out: [ i64 ]) -> [ i64 ] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return reverse(xs: rest, out: x :: out)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  // ── case 1: v128.load with memarg (align=4, offset=8) ──
+  // src = [4, 8] — both fit in single ULEB byte (< 0x80).
+  let %s_a0 = bb.empty()
+  let %s_a1 = bb.push_byte(buf: %s_a0, byte: 4)   // align
+  let %s_a2 = bb.push_byte(buf: %s_a1, byte: 8)   // offset
+  let %o_a0 = bb.empty()
+  let BufPos(buf: %o_a1, pos: end_a) = rw_simd_prefix(out: %o_a0, src: &s_a2, pos: 0, sub_op: op_simd_v128_load())
+  let a_len = bb.length(buf: &o_a1)
+  let a_bytes = read_all(buf: &o_a1)
+  bb.free(buf: %o_a1)
+  bb.free(buf: %s_a2)
+
+  test_assert.assert_eq_i64(actual: end_a, expected: 2,
+    label: "v128.load: pos advances past 2-ULEB memarg")
+  test_assert.assert_eq_i64(actual: a_len, expected: 2,
+    label: "v128.load: 2 bytes copied (align + offset)")
+  test_assert.assert_eq_i64_list(actual: a_bytes, expected: [ 4, 8 ],
+    label: "v128.load: memarg bytes copied verbatim")
+
+  // ── case 2: i32x4.splat — no operand ──
+  // src is irrelevant after pos; rw_simd_prefix must not consume any byte.
+  let %s_b0 = bb.empty()
+  let %s_b1 = bb.push_byte(buf: %s_b0, byte: 99)   // sentinel — must remain untouched
+  let %o_b0 = bb.empty()
+  let BufPos(buf: %o_b1, pos: end_b) = rw_simd_prefix(out: %o_b0, src: &s_b1, pos: 0, sub_op: op_simd_i32x4_splat())
+  let b_len = bb.length(buf: &o_b1)
+  bb.free(buf: %o_b1)
+  bb.free(buf: %s_b1)
+
+  test_assert.assert_eq_i64(actual: end_b, expected: 0,
+    label: "i32x4.splat: pos unchanged (no operand bytes)")
+  test_assert.assert_eq_i64(actual: b_len, expected: 0,
+    label: "i32x4.splat: 0 bytes written to output")
+
+  // ── case 3: unknown sub-op (sub 0x7F = 127, well outside the recognised
+  // splat / arithmetic / load-store set) → emit op_unreachable, pos steady.
+  let %s_c0 = bb.empty()
+  let %s_c1 = bb.push_byte(buf: %s_c0, byte: 77)   // sentinel
+  let %o_c0 = bb.empty()
+  let BufPos(buf: %o_c1, pos: end_c) = rw_simd_prefix(out: %o_c0, src: &s_c1, pos: 0, sub_op: 127)
+  let c_len = bb.length(buf: &o_c1)
+  let c_bytes = read_all(buf: &o_c1)
+  bb.free(buf: %o_c1)
+  bb.free(buf: %s_c1)
+
+  test_assert.assert_eq_i64(actual: end_c, expected: 0,
+    label: "unknown SIMD sub-op: pos held steady (no operand consumed)")
+  test_assert.assert_eq_i64(actual: c_len, expected: 1,
+    label: "unknown SIMD sub-op: one byte emitted (the trap marker)")
+  test_assert.assert_eq_i64_list(actual: c_bytes, expected: [ op_unreachable() ],
+    label: "unknown SIMD sub-op: emitted byte is op_unreachable (0x00)")
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end

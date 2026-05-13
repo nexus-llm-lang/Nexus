@@ -1,0 +1,137 @@
+// Issue nexus-q2g5: unit-test merge.rw_instrs for the call_indirect /
+// table.get / table.set opcode classes — the merge-walker dispatch that
+// has to additively remap type / table indices when the dep module's
+// types and tables are appended after the main module's.
+//
+// Two opcode shapes covered:
+//   - cls_call_indirect (op 0x11): operand = (type_idx ULEB, table_idx ULEB)
+//     → must emit (type_idx + type_off, table_idx + tbl_off).
+//   - cls_table (op 0x25 table.get / 0x26 table.set): operand = (tbl_idx ULEB)
+//     → must emit (tbl_idx + tbl_off).
+//
+// rw_instrs walks until pos == end_pos, classifying each opcode byte
+// and dispatching to a per-class arm. An op_end (0x0B) terminator is
+// included to confirm the walker stops cleanly at the trailing byte
+// without re-classifying past end_pos.
+//
+// Why these shapes specifically: call_indirect is the lone instruction
+// that touches BOTH type_off and tbl_off in one operand, so it's the
+// tightest cross-check for offset bookkeeping. table.get/set isolates
+// tbl_off so a regression that swaps tbl_off ↔ glo_off (both i64
+// fields on RwCtx) surfaces here, not just in the bigger call_indirect.
+import * as test_assert from "std:test/assert"
+import * as bb from "std:bytebuffer"
+import { ByteBuffer } from "std:bytebuffer"
+import { rw_instrs, RwCtx, intarr_new } from "src/backend/wasm/merge.nx"
+import { op_call_indirect, op_table_get, op_table_set, op_end } from "src/backend/wasm/defs.nx"
+
+let read_all = fn (buf: &ByteBuffer) -> [ i64 ] do
+  return read_all_go(buf, idx: 0, len: bb.length(buf), acc: [])
+end
+let read_all_go = fn (buf: &ByteBuffer, idx: i64, len: i64, acc: [ i64 ]) -> [ i64 ] do
+  if idx >= len then return reverse(xs: acc, out: []) end
+  let b = bb.get_byte(buf, idx)
+  return read_all_go(buf, idx: idx + 1, len, acc: b :: acc)
+end
+let reverse = fn (xs: [ i64 ], out: [ i64 ]) -> [ i64 ] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return reverse(xs: rest, out: x :: out)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  // ── case 1: call_indirect — type_idx=3, table_idx=1, then op_end ──
+  // RwCtx(type_off=10, tbl_off=5, glo_off=0) → expect call_indirect emits
+  // (3+10=13, 1+5=6). All operands < 0x80 so ULEB is a single byte each.
+  // The intarr remap is unused by cls_call_indirect (only cls_call /
+  // cls_ref_func touch it), so a fresh empty one is fine.
+  let %s_a0 = bb.empty()
+  let %s_a1 = bb.push_byte(buf: %s_a0, byte: op_call_indirect())  // 0x11
+  let %s_a2 = bb.push_byte(buf: %s_a1, byte: 3)                   // type_idx
+  let %s_a3 = bb.push_byte(buf: %s_a2, byte: 1)                   // table_idx
+  let %s_a4 = bb.push_byte(buf: %s_a3, byte: op_end())            // 0x0B terminator
+  let %o_a0 = bb.empty()
+  let %remap_a = intarr_new()
+  let end_pos_a = bb.length(buf: &s_a4)
+  let %o_a1 = rw_instrs(ctx: RwCtx(type_off: 10, tbl_off: 5, glo_off: 0),
+                        remap: &remap_a, out: %o_a0, src: &s_a4,
+                        pos: 0, end_pos: end_pos_a)
+  let a_len = bb.length(buf: &o_a1)
+  let a_bytes = read_all(buf: &o_a1)
+  bb.free(buf: %o_a1)
+  bb.free(buf: %s_a4)
+  bb.free(buf: %remap_a)
+
+  test_assert.assert_eq_i64(actual: a_len, expected: 4,
+    label: "call_indirect: 4 bytes out (opcode + 2 remapped ULEBs + end)")
+  test_assert.assert_eq_i64_list(actual: a_bytes,
+    expected: [ 17, 13, 6, 11 ],
+    label: "call_indirect: type_idx + type_off, table_idx + tbl_off, op_end")
+
+  // ── case 2: table.get — tbl_idx=2, then op_end ──
+  // RwCtx(type_off=10, tbl_off=4, glo_off=99) → expect (2+4=6).
+  // glo_off=99 is a tripwire: if cls_table ever swaps tbl_off ↔ glo_off
+  // (both i64 fields on RwCtx), the emitted index becomes 2+99=101 ≠ 6
+  // and the assertion fails loudly.
+  let %s_b0 = bb.empty()
+  let %s_b1 = bb.push_byte(buf: %s_b0, byte: op_table_get())   // 0x25
+  let %s_b2 = bb.push_byte(buf: %s_b1, byte: 2)                // tbl_idx
+  let %s_b3 = bb.push_byte(buf: %s_b2, byte: op_end())
+  let %o_b0 = bb.empty()
+  let %remap_b = intarr_new()
+  let end_pos_b = bb.length(buf: &s_b3)
+  let %o_b1 = rw_instrs(ctx: RwCtx(type_off: 10, tbl_off: 4, glo_off: 99),
+                        remap: &remap_b, out: %o_b0, src: &s_b3,
+                        pos: 0, end_pos: end_pos_b)
+  let b_len = bb.length(buf: &o_b1)
+  let b_bytes = read_all(buf: &o_b1)
+  bb.free(buf: %o_b1)
+  bb.free(buf: %s_b3)
+  bb.free(buf: %remap_b)
+
+  test_assert.assert_eq_i64(actual: b_len, expected: 3,
+    label: "table.get: 3 bytes out (opcode + remapped ULEB + end)")
+  test_assert.assert_eq_i64_list(actual: b_bytes,
+    expected: [ 37, 6, 11 ],
+    label: "table.get: tbl_idx + tbl_off, op_end (glo_off must NOT leak)")
+
+  // ── case 3: table.set — tbl_idx=0, then op_end ──
+  // Spot-check that table.set goes through the same cls_table arm —
+  // adding 0 to the offset is the identity edge that catches an arm
+  // accidentally adding twice or shifting by an extra ULEB byte.
+  let %s_c0 = bb.empty()
+  let %s_c1 = bb.push_byte(buf: %s_c0, byte: op_table_set())   // 0x26
+  let %s_c2 = bb.push_byte(buf: %s_c1, byte: 0)                // tbl_idx=0
+  let %s_c3 = bb.push_byte(buf: %s_c2, byte: op_end())
+  let %o_c0 = bb.empty()
+  let %remap_c = intarr_new()
+  let end_pos_c = bb.length(buf: &s_c3)
+  let %o_c1 = rw_instrs(ctx: RwCtx(type_off: 0, tbl_off: 7, glo_off: 0),
+                        remap: &remap_c, out: %o_c0, src: &s_c3,
+                        pos: 0, end_pos: end_pos_c)
+  let c_bytes = read_all(buf: &o_c1)
+  bb.free(buf: %o_c1)
+  bb.free(buf: %s_c3)
+  bb.free(buf: %remap_c)
+
+  test_assert.assert_eq_i64_list(actual: c_bytes,
+    expected: [ 38, 7, 11 ],
+    label: "table.set: tbl_idx=0 + tbl_off=7 = 7, op_end")
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end
