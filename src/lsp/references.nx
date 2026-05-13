@@ -67,6 +67,7 @@ import {
   make_location
 } from "src/lsp/definition.nx"
 import * as str from "std:str"
+import * as lazy from "std:lazy"
 import { Fs } from "std:fs"
 import { Console } from "std:stdio"
 import { Location } from "src/lsp/protocol.nx"
@@ -332,20 +333,56 @@ let walk_top_level = fn (
   end
 end
 
-let walk_cache_entries = fn (
-  cache: [CacheEntry], target: string, target_local_len: i64, acc: [Location]
+// Per-file walk: each cached imported file resolves identifiers in its OWN
+// body via that file's own self-entries (e.g. inside `other.nx`, a reference
+// to local `f` resolves to `other#f`). Importer-view entries from the
+// CacheEntry would only resolve references the *importer* makes — not the
+// right view for walking the imported file's body. Returns the locations
+// from this one file; the driver concatenates per-file results.
+let walk_cache_entry = fn (
+  e: CacheEntry, target: string, target_local_len: i64
 ) -> [Location] do
+  match e do | CacheEntry(path, defs, entries: _) ->
+    let self_entries = build_self_entries(defs, source: path)
+    return walk_top_level(defs, entries: self_entries, target,
+      file: path, target_local_len, acc: [])
+  end
+end
+
+// Build a list of @[Location] thunks, one per cached imported file, in
+// cache order. Paired with `lazy.force_all` below, each cached-file walk
+// is dispatched onto its own OS thread; results are joined in input order
+// so the final reference list preserves source-walk order. Per-file walks
+// are independent (own defs, own self_entries, no shared mutable state) —
+// the canonical multi-document parallel case for the LSP.
+let build_cache_walk_thunks = fn (
+  cache: [CacheEntry], target: string, target_local_len: i64,
+  acc: [@[Location]]
+) -> [@[Location]] do
   match cache do
+    | [] -> return reverse_thunks(xs: acc, acc: [])
+    | e :: rest ->
+      let @t = walk_cache_entry(e, target, target_local_len)
+      return build_cache_walk_thunks(cache: rest, target, target_local_len,
+        acc: t :: acc)
+  end
+end
+
+let reverse_thunks = fn (xs: [@[Location]], acc: [@[Location]]) -> [@[Location]] do
+  match xs do
     | [] -> return acc
-    | CacheEntry(path, defs, entries: _) :: rest ->
-      // Each cached file resolves identifiers in its OWN body via that
-      // file's own self-entries (e.g. inside `other.nx`, a reference to
-      // local `f` resolves to `other#f`). Importer-view entries from the
-      // CacheEntry would only resolve references the *importer* makes —
-      // not the right view for walking the imported file's body.
-      let self_entries = build_self_entries(defs, source: path)
-      let acc2 = walk_top_level(defs, entries: self_entries, target, file: path, target_local_len, acc)
-      return walk_cache_entries(cache: rest, target, target_local_len, acc: acc2)
+    | t :: rest -> return reverse_thunks(xs: rest, acc: t :: acc)
+  end
+end
+
+// Flatten the per-file location chunks (in cache-walk order) into a single
+// flat list. Mirrors the prior `walk_cache_entries` left-to-right append.
+let concat_loc_chunks = fn (xs: [[Location]], acc: [Location]) -> [Location] do
+  match xs do
+    | [] -> return acc
+    | chunk :: rest ->
+      let acc2 = append_locs(xs: acc, ys: chunk)
+      return concat_loc_chunks(xs: rest, acc: acc2)
   end
 end
 
@@ -403,14 +440,27 @@ let find_references_unsafe = fn (
       // (covers calls into imported modules). Walk each cached file's
       // defs with that file's own self-entries (so internal recursion
       // inside other.nx counts against `other#f` too).
-      let entry_uses = walk_top_level(
+      //
+      // The entry walk and every cached-file walk are independent reads
+      // over disjoint AST roots — dispatch each as its own `@[Location]`
+      // thunk so `lazy.force_all` runs them concurrently on WASI threads.
+      // `force_all` joins in input order, so the flattened result preserves
+      // the original "entry buffer first, then cache files in cache order"
+      // sequence the LSP tests rely on for stable reference lists.
+      let @entry_thunk = walk_top_level(
         defs, entries: all_entries, target: canonical,
         file: file_uri, target_local_len, acc: []
       )
-      let cache_uses = walk_cache_entries(
+      let cache_thunks = build_cache_walk_thunks(
         cache, target: canonical, target_local_len, acc: []
       )
-      let all_uses = append_locs(xs: entry_uses, ys: cache_uses)
+      // Mirror test_runner.run_all: build a list of @[Location] thunks and
+      // hand them to force_all. The entry-buffer thunk goes first so its
+      // result heads the joined chunk list; cache thunks follow in cache
+      // order.
+      let all_thunks = entry_thunk :: cache_thunks
+      let chunks = lazy.force_all(tasks: all_thunks)
+      let all_uses = concat_loc_chunks(xs: chunks, acc: [])
       if !include_declaration then return all_uses end
       // include_declaration=true: prepend the def-site Location, mirroring
       // resolve_definition's lookup. If no def found (broken state), just
