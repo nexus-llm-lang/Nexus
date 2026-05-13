@@ -1,25 +1,22 @@
 /**
- * lsp/handlers: Nexus-specific LSP method handlers.
+ * lsp/handlers: Nexus-specific LSP server core.
  *
- * Bundles the pipeline-specific handler functions (initialize, didOpen,
- * didChange, documentSymbol, ...) and exposes a single entry point —
- * `nexus_handlers()` — that returns a populated `Handlers` vtable for the
- * scaffold's `dispatch_message` / `run_server`.
- *
- * Splitting these handlers out of `src/lsp/main.nx` lets test fixtures
- * import the vtable without dragging the entry-point `main` (which is
- * not exported but still emitted into the link unit) into the same
- * binary. Tests can drive `nexus_handlers()` through the pure
- * `drive_messages` API and assert wire-format outputs without booting
- * a real LSP loop.
+ * Owns the entire LSP server surface: document store, lifecycle, per-URI
+ * diagnostics cache, JSON-RPC method dispatch, and the stdin/stdout loop.
+ * The Nexus compiler is the sole LSP consumer, so the previous
+ * language-agnostic scaffold (the `Handlers` vtable + `default_*` row in
+ * `nxlib/lsp/server.nx`) collapsed into direct dispatch here.
  *
  * Layering:
- *   nxlib/lsp/protocol.nx      - wire types + JSON codecs
- *   nxlib/lsp/server.nx        - generic dispatch loop + state machine
- *   src/lsp/diagnostics.nx     - typecheck -> internal Diagnostic stream
- *   src/lsp/symbols.nx         - parsed AST -> DocumentSymbol tree
- *   src/lsp/handlers.nx (here) - method-name -> handler glue
- *   src/lsp/main.nx            - entry point (capability injection only)
+ *   nxlib/jsonrpc.nx         — Content-Length framing, frame error mapping
+ *   src/lsp/protocol.nx      — wire types + JSON codecs (LSP spec shapes)
+ *   src/lsp/diagnostics.nx   — typecheck → internal Diagnostic stream
+ *   src/lsp/symbols.nx       — parsed AST → DocumentSymbol tree
+ *   src/lsp/definition.nx    — go-to-definition resolver
+ *   src/lsp/completion.nx    — completion provider
+ *   src/lsp/references.nx    — references provider
+ *   src/lsp/handlers.nx (this file) — server state + method dispatch + loop
+ *   src/lsp/main.nx          — entry point (capability injection only)
  *
  * Multi-file diagnostics:
  *   `compute_diagnostics_for_buffer` parses the buffer's `import` statements,
@@ -29,21 +26,35 @@
  *   an imported function whose signature the importer relies on) surface as
  *   diagnostics on the importer.
  *
- * Per-URI cache:
- *   The handler vtable is purely functional; the cache lives in
- *   `ServerState.user_data` as a JSON-encoded `(uri -> {version, diagnostics})`
- *   map. A `didChange` whose version matches the cached entry returns the
- *   stored wire-format diagnostics array verbatim — same buffer text plus
- *   identical imports means identical diagnostics. Any version bump (the
- *   client's contract for "buffer changed") invalidates the entry and
- *   triggers a fresh typecheck. Cross-file invalidation (an imported file
- *   changing on disk while the importing file's version stays put) is not
- *   modelled here and is post-MVP per the issue's scope note; the editor
- *   triggering a `didChange` on the importer (e.g. via "Reload Window")
- *   re-bumps the version and clears the cache.
+ * Per-URI diagnostics cache:
+ *   `ServerState.diagnostics_cache` is a typed `[DiagCacheEntry]` (one row
+ *   per open URI) carrying `(version, [Diagnostic])`. A `didChange` whose
+ *   version matches the cached entry reuses the stored wire diagnostics
+ *   verbatim — same buffer text plus identical imports means identical
+ *   diagnostics. Any version bump invalidates the entry and triggers a
+ *   fresh typecheck. Cross-file invalidation (an imported file changing
+ *   on disk while the importing file's version stays put) is not modelled
+ *   here and is post-MVP; the editor triggering a `didChange` on the
+ *   importer (e.g. via "Reload Window") re-bumps the version and clears
+ *   the cache.
+ *
+ * Lifecycle invariants (LSP base spec §`Lifecycle Messages`):
+ *   - `initialize` is the first request; other requests before it return
+ *     a JSON-RPC error with code -32002 (server not initialized).
+ *   - `shutdown` flips a flag; further requests return InvalidRequest.
+ *   - `exit` returns `StepExit` from the dispatch step; the I/O loop
+ *     observes it and stops reading.
+ *
+ * Document sync is full-content only (TextDocumentSyncKind = 1).
+ * Incremental sync is post-MVP — an incremental change in the stream
+ * raises `LspProtocolError` so the gap is visible rather than silently
+ * dropped.
  */
 
-import { JsonValue, JsonNull, JsonInt, JsonString, JsonArray, JsonBool, JsonObject, JsonField, get_field } from "std:json"
+import {
+  JsonValue, JsonNull, JsonInt, JsonString, JsonArray, JsonBool, JsonObject,
+  JsonField, get_field
+} from "std:json"
 import { Option, Some, None } from "std:option"
 import * as lexer from "src/frontend/lexer.nx"
 import * as parser from "src/frontend/parser.nx"
@@ -52,6 +63,13 @@ import * as hir from "src/ir/hir.nx"
 import { resolve_all_lazy_no_filter } from "src/ir/demand.nx"
 import { Fs } from "std:fs"
 import { Console } from "std:stdio"
+import {
+  IncomingMessage, Request, Notification, Malformed,
+  JsonRpcFrameError,
+  response_ok, response_error,
+  method_not_found, invalid_request, invalid_params, internal_error,
+  classify, read_message, write_message
+} from "nxlib/jsonrpc.nx"
 import {
   DiagEntry, DiagRange,
   SeverityError,
@@ -83,100 +101,274 @@ import {
   ContentChangeFull, ContentChangeIncremental,
   content_change_event_from_json,
   PublishDiagnosticsParams, publish_diagnostics_params_to_json,
-  Position, Range, Diagnostic, DocumentSymbol,
+  Position, Range, Diagnostic, DocumentSymbol, Location,
   CompletionOptions, CompletionList,
   completion_list_to_json,
   location_to_json,
   document_symbol_to_json,
   DiagSevError,
   LspProtocolError
-} from "nxlib/lsp/protocol.nx"
-import {
-  ServerState, DocumentRecord, DocumentStore, LifecycleRunning,
-  Handlers, HandlerResult,
-  empty_handlers,
-  documents_put, documents_lookup,
-  make_publish_diagnostics_notification
-} from "nxlib/lsp/server.nx"
+} from "src/lsp/protocol.nx"
+
+// ─── Server-not-initialized error code (LSP spec §3.6) ───────────────────────
+
+let server_not_initialized = fn () -> i64 do return -32002 end
+
+// ─── Document buffer state ───────────────────────────────────────────────────
+//
+// LSP servers track open documents keyed by `uri`. Full-content sync stores
+// the latest text + version; the version is the integer the client last
+// sent in `didOpen` / `didChange`. A list-based assoc structure is fine for
+// MVP — typical editors keep tens of files open, and lookup/update is
+// linear in that count.
+
+export type DocumentRecord = DocumentRecord(
+  uri: string,
+  text: string,
+  version: i64
+)
+
+export type DocumentStore = DocumentStore(records: [DocumentRecord])
+
+let documents_empty = fn () -> DocumentStore do
+  return DocumentStore(records: [])
+end
+
+let docs_lookup_go = fn (xs: [DocumentRecord], uri: string) -> Option<DocumentRecord> do
+  match xs do
+    | [] -> return None
+    | r :: rest ->
+      match r do | DocumentRecord(uri: u, text: _, version: _) ->
+        if u == uri then return Some(val: r) end
+        return docs_lookup_go(xs: rest, uri)
+      end
+  end
+end
+
+/// Look up the latest record for `uri`. Returns `None` if no document with
+/// this URI is open.
+let documents_lookup = fn (store: DocumentStore, uri: string) -> Option<DocumentRecord> do
+  match store do | DocumentStore(records) ->
+    return docs_lookup_go(xs: records, uri)
+  end
+end
+
+let reverse_records = fn (xs: [DocumentRecord], acc: [DocumentRecord]) -> [DocumentRecord] do
+  match xs do
+    | [] -> return acc
+    | r :: rest -> return reverse_records(xs: rest, acc: r :: acc)
+  end
+end
+
+let reverse_records_then_append = fn (xs: [DocumentRecord], tail: [DocumentRecord]) -> [DocumentRecord] do
+  match xs do
+    | [] -> return tail
+    | r :: rest -> return reverse_records_then_append(xs: rest, tail: r :: tail)
+  end
+end
+
+let docs_remove_go = fn (xs: [DocumentRecord], uri: string, acc: [DocumentRecord]) -> [DocumentRecord] do
+  match xs do
+    | [] -> return reverse_records(xs: acc, acc: [])
+    | r :: rest ->
+      match r do | DocumentRecord(uri: u, text: _, version: _) ->
+        if u == uri then
+          return reverse_records_then_append(xs: acc, tail: rest)
+        end
+        return docs_remove_go(xs: rest, uri, acc: r :: acc)
+      end
+  end
+end
+
+/// Insert or replace the record for `uri`. Existing entries with the same
+/// URI are removed first so each URI maps to at most one record.
+let documents_put = fn (store: DocumentStore, rec: DocumentRecord) -> DocumentStore do
+  match store do | DocumentStore(records) ->
+    match rec do | DocumentRecord(uri, text: _, version: _) ->
+      let pruned = docs_remove_go(xs: records, uri, acc: [])
+      return DocumentStore(records: rec :: pruned)
+    end
+  end
+end
+
+/// Remove the record for `uri` (no-op if absent).
+let documents_remove = fn (store: DocumentStore, uri: string) -> DocumentStore do
+  match store do | DocumentStore(records) ->
+    return DocumentStore(records: docs_remove_go(xs: records, uri, acc: []))
+  end
+end
+
+// ─── Typed per-URI diagnostics cache ─────────────────────────────────────────
+//
+// One row per open URI, carrying the most recent `(version, diagnostics)` pair
+// from the typecheck pipeline. Replacing the old `ServerState.user_data:
+// JsonValue` slot with a typed list drops the JSON encode/decode round-trip
+// that every cache read used to incur.
+
+export type DiagCacheEntry = DiagCacheEntry(
+  uri: string,
+  version: i64,
+  diagnostics: [Diagnostic]
+)
+
+let cache_lookup_go = fn (xs: [DiagCacheEntry], uri: string, version: i64) -> Option<[Diagnostic]> do
+  match xs do
+    | [] -> return None
+    | DiagCacheEntry(uri: u, version: v, diagnostics: d) :: rest ->
+      if u == uri && v == version then return Some(val: d) end
+      return cache_lookup_go(xs: rest, uri, version)
+  end
+end
+
+let cache_lookup = fn (cache: [DiagCacheEntry], uri: string, version: i64) -> Option<[Diagnostic]> do
+  return cache_lookup_go(xs: cache, uri, version)
+end
+
+// Strip any existing row for `uri`, then prepend the fresh entry.
+let cache_drop_uri = fn (xs: [DiagCacheEntry], uri: string, acc: [DiagCacheEntry]) -> [DiagCacheEntry] do
+  match xs do
+    | [] -> return reverse_cache(xs: acc, acc: [])
+    | DiagCacheEntry(uri: u, version: v, diagnostics: d) :: rest ->
+      if u == uri then return cache_drop_uri(xs: rest, uri, acc) end
+      return cache_drop_uri(xs: rest, uri, acc: DiagCacheEntry(uri: u, version: v, diagnostics: d) :: acc)
+  end
+end
+
+let reverse_cache = fn (xs: [DiagCacheEntry], acc: [DiagCacheEntry]) -> [DiagCacheEntry] do
+  match xs do
+    | [] -> return acc
+    | e :: rest -> return reverse_cache(xs: rest, acc: e :: acc)
+  end
+end
+
+let cache_put = fn (cache: [DiagCacheEntry], uri: string, version: i64, diagnostics: [Diagnostic]) -> [DiagCacheEntry] do
+  let pruned = cache_drop_uri(xs: cache, uri, acc: [])
+  return DiagCacheEntry(uri, version, diagnostics) :: pruned
+end
+
+// ─── Server state ────────────────────────────────────────────────────────────
+//
+// Tracks lifecycle phase, open documents, and the typed diagnostics cache.
+
+export type Lifecycle =
+    LifecycleUninitialized
+  | LifecycleRunning
+  | LifecycleShutdown
+
+export type ServerState = ServerState(
+  lifecycle: Lifecycle,
+  documents: DocumentStore,
+  diagnostics_cache: [DiagCacheEntry]
+)
+
+export let empty_state = fn () -> ServerState do
+  return ServerState(
+    lifecycle: LifecycleUninitialized,
+    documents: documents_empty(),
+    diagnostics_cache: []
+  )
+end
 
 // ─── State accessors ─────────────────────────────────────────────────────────
 
 let state_documents = fn (state: ServerState) -> DocumentStore do
-  match state do | ServerState(lifecycle: _, documents, user_data: _) ->
+  match state do | ServerState(lifecycle: _, documents, diagnostics_cache: _) ->
     return documents
   end
 end
 
-let state_user_data = fn (state: ServerState) -> JsonValue do
-  match state do | ServerState(lifecycle: _, documents: _, user_data) ->
-    return user_data
+let state_cache = fn (state: ServerState) -> [DiagCacheEntry] do
+  match state do | ServerState(lifecycle: _, documents: _, diagnostics_cache) ->
+    return diagnostics_cache
   end
 end
 
 let with_documents = fn (state: ServerState, docs: DocumentStore) -> ServerState do
-  match state do | ServerState(lifecycle, documents: _, user_data) ->
-    return ServerState(lifecycle, documents: docs, user_data)
+  match state do | ServerState(lifecycle, documents: _, diagnostics_cache) ->
+    return ServerState(lifecycle, documents: docs, diagnostics_cache)
   end
 end
 
-let with_user_data = fn (state: ServerState, user_data: JsonValue) -> ServerState do
-  match state do | ServerState(lifecycle, documents, user_data: _) ->
-    return ServerState(lifecycle, documents, user_data)
+let with_cache = fn (state: ServerState, cache: [DiagCacheEntry]) -> ServerState do
+  match state do | ServerState(lifecycle, documents, diagnostics_cache: _) ->
+    return ServerState(lifecycle, documents, diagnostics_cache: cache)
   end
 end
 
 let with_lifecycle_running = fn (state: ServerState) -> ServerState do
-  match state do | ServerState(lifecycle: _, documents, user_data) ->
-    return ServerState(lifecycle: LifecycleRunning, documents, user_data)
+  match state do | ServerState(lifecycle: _, documents, diagnostics_cache) ->
+    return ServerState(lifecycle: LifecycleRunning, documents, diagnostics_cache)
   end
 end
 
-// ─── Range translation: 1-based (Span) -> 0-based (LSP wire) ────────────────
+let lifecycle_is_uninitialized = fn (state: ServerState) -> bool do
+  match state do | ServerState(lifecycle, documents: _, diagnostics_cache: _) ->
+    match lifecycle do
+      | LifecycleUninitialized -> return true
+      | _ -> return false
+    end
+  end
+end
+
+let lifecycle_is_shutdown = fn (state: ServerState) -> bool do
+  match state do | ServerState(lifecycle, documents: _, diagnostics_cache: _) ->
+    match lifecycle do
+      | LifecycleShutdown -> return true
+      | _ -> return false
+    end
+  end
+end
+
+// ─── JSON object-field helper (shared across handlers) ───────────────────────
+
+let require_object_field = fn (obj: JsonValue, key: string, ctx: string) -> JsonValue throws { Exn } do
+  match get_field(obj, key) do
+    | Some(val: v) -> return v
+    | None -> raise LspProtocolError(msg: ctx ++ ": missing '" ++ key ++ "'")
+  end
+end
+
+// ─── Diagnostic translation: internal DiagEntry -> wire Diagnostic ───────────
 //
-// Saturating clamp: a bogus 0 in the input becomes wire 0 (the closest
-// valid LSP coordinate) rather than -1 which the spec rejects.
+// Saturating clamp on coordinate conversion: a bogus 0 in the input becomes
+// wire 0 (the closest valid LSP coordinate) rather than -1 which the spec
+// rejects.
 
 let saturating_pred = fn (n: i64) -> i64 do
   if n <= 0 then return 0 end
   return n - 1
 end
 
-let to_wire_range = fn (r: DiagRange) -> Range do
-  match r do | DiagRange(start_line, start_col, end_line, end_col) ->
-    let start_pos = Position(
-      line: saturating_pred(n: start_line),
-      character: saturating_pred(n: start_col)
-    )
-    let end_pos = Position(
-      line: saturating_pred(n: end_line),
-      character: saturating_pred(n: end_col)
-    )
-    return Range(start: start_pos, end_: end_pos)
-  end
-end
-
-// ─── Diagnostic translation: internal -> wire ────────────────────────────────
-
 let to_wire_diagnostic = fn (d: DiagEntry) -> Diagnostic do
   match d do | DiagEntry(file: _, range, severity, code, message) ->
-    let wire_sev = match severity do
-      | SeverityError -> Some(val: DiagSevError)
+    match range do | DiagRange(start_line, start_col, end_line, end_col) ->
+      let start_pos = Position(
+        line: saturating_pred(n: start_line),
+        character: saturating_pred(n: start_col)
+      )
+      let end_pos = Position(
+        line: saturating_pred(n: end_line),
+        character: saturating_pred(n: end_col)
+      )
+      let wire_sev = match severity do
+        | SeverityError -> Some(val: DiagSevError)
+      end
+      let wire_code = if code == "" then None else Some(val: code) end
+      return Diagnostic(
+        range: Range(start: start_pos, end_: end_pos),
+        severity: wire_sev,
+        code: wire_code,
+        source: Some(val: "nexus"),
+        message
+      )
     end
-    let wire_code = if code == "" then None else Some(val: code) end
-    return Diagnostic(
-      range: to_wire_range(r: range),
-      severity: wire_sev,
-      code: wire_code,
-      source: Some(val: "nexus"),
-      message
-    )
   end
 end
 
 let translate_diagnostics_go = fn (xs: [DiagEntry], acc: [Diagnostic]) -> [Diagnostic] do
   match xs do
     | [] -> return acc
-    | d :: rest -> return translate_diagnostics_go(xs: rest, acc: to_wire_diagnostic(d) :: acc)
+    | d :: rest -> return translate_diagnostics_go(xs: rest, acc: to_wire_diagnostic(d: d) :: acc)
   end
 end
 
@@ -211,13 +403,8 @@ let build_hir_with_imports = fn (state: ProgramState, source_file: string) -> Hi
     // editor surfaces every reachable error in the workspace, not just
     // those on the codegen path.
     let resolved = resolve_all_lazy_no_filter(funcs: hf)
-    // Re-run exception-group expansion: the original pass in accum_to_program
-    // only saw stub bodies, so catch arms inside newly-resolved function
-    // bodies still reference raw group names (nexus-vks5).
-    let expanded_fs = hir.expand_groups_in_functions(funcs: resolved, groups: heg)
-    let expanded_hb = hir.expand_groups_in_handler_bindings(bindings: hb, groups: heg)
-    return HirProgram(ports: hp, functions: expanded_fs, externals: he,
-      handler_bindings: expanded_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
+    return HirProgram(ports: hp, functions: resolved, externals: he,
+      handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
   end
 end
 
@@ -244,17 +431,17 @@ let reverse_strings = fn (xs: [string], acc: [string]) -> [string] do
   end
 end
 
-/** Compute internal diagnostics for an editor buffer: lex+parse → import-aware */
-/** HIR build → typecheck. Each `DiagEntry` carries the *originating* file path */
-/** (issue nexus-qgfh) — a TypeMismatch inside an imported function reports the */
-/** imported file's path even though the editor only opened the importer. */
-/** Exported so tests / future LSP routing layers can inspect file identity */
-/** before the wire-format DocumentFilter. */
-/** */
-/** The `parse_source` + `resolve_imports_for` split mirrors the helpers */
-/** `lsp/definition.resolve_definition` consumes through `build_program_state` */
-/** — a single Fs walk per request grounds both the typecheck and the */
-/** go-to-definition paths. */
+/// Compute internal diagnostics for an editor buffer: lex+parse → import-aware
+/// HIR build → typecheck. Each `DiagEntry` carries the *originating* file path
+/// (issue nexus-qgfh) — a TypeMismatch inside an imported function reports the
+/// imported file's path even though the editor only opened the importer.
+/// Exported so tests / future LSP routing layers can inspect file identity
+/// before the wire-format DocumentFilter.
+///
+/// The `parse_source` + `resolve_imports_for` split mirrors the helpers
+/// `lsp/definition.resolve_definition` consumes through `build_program_state`
+/// — a single Fs walk per request grounds both the typecheck and the
+/// go-to-definition paths.
 export let compute_diagnostics_for_buffer = fn (text: string, file: string) -> [DiagEntry] require { Fs, Console } throws { Exn } do
   try
     let prog = parser.parse_source(src: text)
@@ -269,130 +456,92 @@ export let compute_diagnostics_for_buffer = fn (text: string, file: string) -> [
       let HirProgram(ports: _, functions: funcs, externals: _, handler_bindings: _, enum_defs: _, _) = hir_prog
       let all_names = extract_hir_function_names(funcs, acc: [])
       return enumerate_diagnostics(hir: hir_prog, local_names: all_names, file)
-    catch _ ->
+    catch import_err ->
       // Import resolution failure (missing file, parse error in an imported
       // module, cycle): surface as a single origin-anchored diagnostic. The
       // raw exception carries the offending path; we render it via the
       // generic format_error path inside `make_origin_error_diagnostic`.
+      let _ = import_err
       return [make_origin_error_diagnostic(file, message: "lsp: import resolution failed")]
     end
-  catch _ ->
+  catch err ->
+    let _ = err
     return [make_origin_error_diagnostic(file, message: "lsp: failed to lex or parse source")]
   end
 end
 
-// ─── Per-URI version cache ──────────────────────────────────────────────────
-//
-// Cache shape: `JsonObject { fields: [JsonField(uri, {version, diagnostics})...] }`
-// where the inner `diagnostics` is a `JsonArray` of wire-format Diagnostic
-// objects (the exact value we'd publish). Lookup is linear in URIs open;
-// LSP sessions rarely keep more than a few dozen, and a list-shaped cache
-// avoids dragging in a hashmap for MVP.
-//
-// Invalidation: a `didChange` carries a fresh integer version. If the
-// cached version equals the incoming one we reuse `diagnostics`; otherwise
-// we typecheck and overwrite the entry. Closing the buffer drops the
-// cache row (the on_did_close handler removes the URI from `documents`,
-// and the cache key is dead weight thereafter — a future cleanup pass can
-// prune by walking documents \ cache, but it doesn't impact correctness).
+// ─── Notification frame builders ─────────────────────────────────────────────
 
-let cache_lookup_diagnostics = fn (user_data: JsonValue, uri: string, version: i64) -> Option<[JsonValue]> throws { Exn } do
-  match get_field(obj: user_data, key: uri) do
-    | None -> return None
-    | Some(val: entry) ->
-      match get_field(obj: entry, key: "version") do
-        | None -> return None
-        | Some(val: v) ->
-          match v do
-            | JsonInt(val: cached_version) ->
-              if cached_version != version then return None end
-              match get_field(obj: entry, key: "diagnostics") do
-                | None -> return None
-                | Some(val: diags) ->
-                  match diags do
-                    | JsonArray(items) -> return Some(val: items)
-                    | _ -> return None
-                  end
-              end
-            | _ -> return None
-          end
-      end
-  end
-end
-
-// Replace (or insert) the cache row for `uri`. Other URIs' rows stay
-// untouched. The final layout is a JsonObject with the URI as the field
-// key — JSON keys are strings, which matches LSP URI semantics.
-
-let drop_field_with_key = fn (fields: [JsonField], key: string, acc: [JsonField]) -> [JsonField] do
-  match fields do
-    | [] -> return reverse_fields(xs: acc, acc: [])
-    | JsonField(key: k, value: v) :: rest ->
-      if k == key then
-        return drop_field_with_key(fields: rest, key, acc)
-      end
-      return drop_field_with_key(fields: rest, key, acc: JsonField(key: k, value: v) :: acc)
-  end
-end
-
-let reverse_fields = fn (xs: [JsonField], acc: [JsonField]) -> [JsonField] do
-  match xs do
-    | [] -> return acc
-    | f :: rest -> return reverse_fields(xs: rest, acc: f :: acc)
-  end
-end
-
-let user_data_fields = fn (user_data: JsonValue) -> [JsonField] do
-  match user_data do
-    | JsonObject(fields) -> return fields
-    | _ -> return []
-  end
-end
-
-let cache_put = fn (user_data: JsonValue, uri: string, version: i64, diagnostics: [JsonValue]) -> JsonValue do
-  let pruned = drop_field_with_key(fields: user_data_fields(user_data), key: uri, acc: [])
-  let entry = JsonObject(fields: [
-    JsonField(key: "version", value: JsonInt(val: version)),
-    JsonField(key: "diagnostics", value: JsonArray(items: diagnostics))
+let notification_frame = fn (method: string, params: JsonValue) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "jsonrpc", value: JsonString(val: "2.0")),
+    JsonField(key: "method", value: JsonString(val: method)),
+    JsonField(key: "params", value: params)
   ])
-  return JsonObject(fields: JsonField(key: uri, value: entry) :: pruned)
 end
 
-// ─── Handler: on_initialize ──────────────────────────────────────────────────
+let make_publish_diagnostics_notification = fn (params: PublishDiagnosticsParams) -> JsonValue do
+  return notification_frame(
+    method: "textDocument/publishDiagnostics",
+    params: publish_diagnostics_params_to_json(p: params)
+  )
+end
 
-let nexus_on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+// ─── Per-step dispatch ───────────────────────────────────────────────────────
+//
+// Outcome of routing a single inbound message. `Continue` advances the
+// loop with possibly-updated state plus an optional response and any
+// outbound notifications; `Exit` stops the loop (received on the LSP
+// `exit` notification).
+
+export type StepOutcome =
+    StepContinue(
+      state: ServerState,
+      response: Option<JsonValue>,
+      notifications: [JsonValue]
+    )
+  | StepExit(state: ServerState)
+
+// ─── HandlerResult: per-handler return shape ─────────────────────────────────
+
+type HandlerResult = HandlerResult(
+  state: ServerState,
+  response: Option<JsonValue>,
+  notifications: [JsonValue]
+)
+
+// ─── Handler: initialize ─────────────────────────────────────────────────────
+
+let on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   // Validate input shape; we don't read fields beyond what the protocol
   // codec checks. Errors propagate as LspProtocolError -> InvalidParams.
-  initialize_params_from_json(v: params)
+  let _ = initialize_params_from_json(v: params)
   let caps = ServerCapabilities(
     text_document_sync: Some(val: TdsFull),
-    /** `nexus_on_other` routes textDocument/documentSymbol through the */
-    /** `src/lsp/symbols.document_symbols_for_program` walker; advertise */
-    /** the capability so clients populate the outline view. */
+    /// textDocument/documentSymbol is routed through
+    /// `src/lsp/symbols.document_symbols_for_program`; advertise the
+    /// capability so clients populate the outline view.
     document_symbol_provider: Some(val: true),
-    /** `nexus_on_other` routes textDocument/hover to `nexus_on_hover`, */
-    /** which surfaces the file-level `/** ... */` doc comment when the */
-    /** cursor is on the first line. Per-definition hovers are out of */
-    /** scope (issue nexus-ws77 MVP). */
+    /// textDocument/hover surfaces the file-level `/** ... */` doc comment
+    /// when the cursor is on the first line. Per-definition hovers are
+    /// out of scope (issue nexus-ws77 MVP).
     hover_provider: Some(val: true),
-    /** `nexus_on_other` routes textDocument/definition through */
-    /** `src/lsp/definition.resolve_definition`, which uses the same */
-    /** import-aware build pipeline as the diagnostics path to follow */
-    /** `alias.foo` / bare-identifier references back to their defining */
-    /** `let` / `cap` site (issue nexus-yvd8). */
+    /// textDocument/definition routes through `src/lsp/definition.resolve_definition`,
+    /// which uses the same import-aware build pipeline as the diagnostics
+    /// path to follow `alias.foo` / bare-identifier references back to
+    /// their defining `let` / `cap` site (issue nexus-yvd8).
     definition_provider: Some(val: true),
-    /** `nexus_on_other` routes textDocument/references through */
-    /** `src/lsp/references.find_references`, which reuses the */
-    /** definition-path rename pipeline plus a full AST walk to collect */
-    /** every use site for the canonical name under the cursor (issue */
-    /** nexus-5pg8). */
+    /// textDocument/references routes through `src/lsp/references.find_references`,
+    /// which reuses the definition-path rename pipeline plus a full AST
+    /// walk to collect every use site for the canonical name under the
+    /// cursor (issue nexus-5pg8).
     references_provider: Some(val: true),
-    /** `nexus_on_other` routes textDocument/completion through */
-    /** `src/lsp/completion.resolve_completion`. Trigger characters `.` and */
-    /** `:` cover future record-field / module-qualified suggestions; the */
-    /** MVP returns the same scope-derived list regardless of trigger. */
-    /** `resolveProvider: false` — every CompletionItem is fully populated */
-    /** in the initial response (issue nexus-x49o). */
+    /// textDocument/completion routes through `src/lsp/completion.resolve_completion`.
+    /// Trigger characters `.` and `:` cover future record-field /
+    /// module-qualified suggestions; the MVP returns the same scope-derived
+    /// list regardless of trigger. `resolveProvider: false` — every
+    /// CompletionItem is fully populated in the initial response
+    /// (issue nexus-x49o).
     completion_provider: Some(val: CompletionOptions(
       trigger_characters: [".", ":"],
       resolve_provider: false
@@ -400,57 +549,11 @@ let nexus_on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerR
   )
   let info = ServerInfo(name: "nexus-lsp", version: Some(val: "0.1.0"))
   let result = InitializeResult(capabilities: caps, server_info: Some(val: info))
-  // Seed user_data with an empty cache object so subsequent didOpen /
-  // didChange handlers can `get_field` without first checking shape.
-  let seeded = with_user_data(state: with_lifecycle_running(state),
-    user_data: JsonObject(fields: []))
   return HandlerResult(
-    state: seeded,
+    state: with_lifecycle_running(state),
     response: Some(val: initialize_result_to_json(r: result)),
     notifications: []
   )
-end
-
-// ─── Helpers: wire-format Diagnostic JSON ───────────────────────────────────
-
-let wire_diagnostics_to_json_items = fn (xs: [Diagnostic]) -> [JsonValue] throws { Exn } do
-  // Round-trip the wire-format Diagnostic[] through the protocol codec so
-  // the cache stores values byte-identical to what we'd publish on a fresh
-  // typecheck. Wrap into a synthetic PublishDiagnosticsParams and extract
-  // the resulting JsonArray's items.
-  let wrapped = PublishDiagnosticsParams(uri: "", version: None, diagnostics: xs)
-  let wrapped_json = publish_diagnostics_params_to_json(p: wrapped)
-  match get_field(obj: wrapped_json, key: "diagnostics") do
-    | None -> raise LspProtocolError(msg: "publish_diagnostics_params_to_json missing 'diagnostics' field")
-    | Some(val: arr) ->
-      match arr do
-        | JsonArray(items) -> return items
-        | _ -> raise LspProtocolError(msg: "publish_diagnostics_params_to_json 'diagnostics' is not an array")
-      end
-  end
-end
-
-let reverse_jsonvals = fn (xs: [JsonValue], acc: [JsonValue]) -> [JsonValue] do
-  match xs do
-    | [] -> return acc
-    | v :: rest -> return reverse_jsonvals(xs: rest, acc: v :: acc)
-  end
-end
-
-// Build a publishDiagnostics frame from raw JSON-encoded diagnostic items
-// (as stored in the cache). Avoids a wire-internal -> internal -> wire
-// roundtrip when the cache hits.
-let make_publish_frame_from_json = fn (uri: string, version: i64, diagnostics: [JsonValue]) -> JsonValue do
-  let params = JsonObject(fields: [
-    JsonField(key: "uri", value: JsonString(val: uri)),
-    JsonField(key: "version", value: JsonInt(val: version)),
-    JsonField(key: "diagnostics", value: JsonArray(items: diagnostics))
-  ])
-  return JsonObject(fields: [
-    JsonField(key: "jsonrpc", value: JsonString(val: "2.0")),
-    JsonField(key: "method", value: JsonString(val: "textDocument/publishDiagnostics")),
-    JsonField(key: "params", value: params)
-  ])
 end
 
 // ─── Buffer update + diagnostics emission ────────────────────────────────────
@@ -460,6 +563,19 @@ end
 // publishDiagnostics notification. The internal DiagEntry stream may be
 // empty (clean program); we still publish an empty array because LSP
 // clients use that signal to clear stale markers.
+
+let diagnostics_to_json_array = fn (xs: [Diagnostic]) -> JsonValue throws { Exn } do
+  // Re-encode through publish_diagnostics_params_to_json's diagnostics-field
+  // walk so the encoded order matches what a fresh publish would emit. The
+  // wrapper carries an empty uri/None version; we only need the
+  // `diagnostics` JsonArray it produces.
+  let wrapped = PublishDiagnosticsParams(uri: "", version: None, diagnostics: xs)
+  let wrapped_json = publish_diagnostics_params_to_json(p: wrapped)
+  match get_field(obj: wrapped_json, key: "diagnostics") do
+    | None -> raise RuntimeError(val: "publish_diagnostics_params_to_json missing 'diagnostics' field")
+    | Some(val: arr) -> return arr
+  end
+end
 
 let publish_for_buffer = fn (
   state: ServerState,
@@ -471,15 +587,16 @@ let publish_for_buffer = fn (
     store: state_documents(state),
     rec: DocumentRecord(uri, text, version)
   )
-  let cache = state_user_data(state)
-  let cached = cache_lookup_diagnostics(user_data: cache, uri, version)
-  match cached do
-    | Some(val: cached_items) ->
+  let cache = state_cache(state)
+  match cache_lookup(cache, uri, version) do
+    | Some(val: cached_diags) ->
       // Cache hit: same (uri, version) -> reuse stored wire diagnostics.
-      // Document text is already cached, but we still update `documents`
-      // because a new client session may put a fresh DocumentRecord with
-      // identical version that we want to track.
-      let frame = make_publish_frame_from_json(uri, version, diagnostics: cached_items)
+      let params = PublishDiagnosticsParams(
+        uri,
+        version: Some(val: version),
+        diagnostics: cached_diags
+      )
+      let frame = make_publish_diagnostics_notification(params)
       return HandlerResult(
         state: with_documents(state, docs: new_docs),
         response: None,
@@ -488,17 +605,16 @@ let publish_for_buffer = fn (
     | None ->
       let internal = compute_diagnostics_for_buffer(text, file: uri)
       let wire = to_wire_diagnostics(xs: internal)
-      let wire_items = wire_diagnostics_to_json_items(xs: wire)
-      let new_cache = cache_put(user_data: cache, uri, version, diagnostics: wire_items)
+      let new_cache = cache_put(cache, uri, version, diagnostics: wire)
       let params = PublishDiagnosticsParams(
         uri,
         version: Some(val: version),
         diagnostics: wire
       )
       let frame = make_publish_diagnostics_notification(params)
-      let updated = with_user_data(
+      let updated = with_cache(
         state: with_documents(state, docs: new_docs),
-        user_data: new_cache
+        cache: new_cache
       )
       return HandlerResult(
         state: updated,
@@ -510,14 +626,7 @@ end
 
 // ─── Handler: on_did_open ────────────────────────────────────────────────────
 
-let require_object_field = fn (obj: JsonValue, key: string, ctx: string) -> JsonValue throws { Exn } do
-  match get_field(obj, key) do
-    | Some(val: v) -> return v
-    | None -> raise LspProtocolError(msg: ctx ++ ": missing '" ++ key ++ "'")
-  end
-end
-
-let nexus_on_did_open = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+let on_did_open = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   let td_v = require_object_field(obj: params, key: "textDocument",
     ctx: "DidOpenTextDocumentParams")
   let td = text_document_item_from_json(v: td_v)
@@ -532,7 +641,7 @@ end
 // contentChanges array. An incremental change in this stream is a protocol
 // violation per our advertised TextDocumentSyncKind.Full -- surface as
 // LspProtocolError so the dispatch layer routes InvalidParams (for
-// requests; notifications log + drop, matching the scaffold default).
+// requests; notifications log + drop).
 
 let pick_full_text = fn (items: [JsonValue], current: Option<string>) -> string throws { Exn } do
   match items do
@@ -566,7 +675,7 @@ let json_array_items = fn (v: JsonValue) -> [JsonValue] throws { Exn } do
   end
 end
 
-let nexus_on_did_change = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+let on_did_change = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   let td_v = require_object_field(obj: params, key: "textDocument",
     ctx: "DidChangeTextDocumentParams")
   let id = versioned_text_document_identifier_from_json(v: td_v)
@@ -579,13 +688,68 @@ let nexus_on_did_change = fn (state: ServerState, params: JsonValue) -> HandlerR
   end
 end
 
-// ─── Handler: textDocument/documentSymbol (via on_other) ─────────────────────
+// ─── Handler: on_did_close ───────────────────────────────────────────────────
+
+let extract_text_document_uri = fn (params: JsonValue, ctx: string) -> string throws { Exn } do
+  match get_field(obj: params, key: "textDocument") do
+    | None -> raise LspProtocolError(msg: ctx ++ ": missing 'textDocument'")
+    | Some(val: v) ->
+      match get_field(obj: v, key: "uri") do
+        | None -> raise LspProtocolError(msg: ctx ++ ".textDocument: missing 'uri'")
+        | Some(val: u) ->
+          match u do
+            | JsonString(val: s) -> return s
+            | _ -> raise LspProtocolError(msg: ctx ++ ".textDocument.uri: expected string")
+          end
+      end
+  end
+end
+
+let on_did_close = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let uri = extract_text_document_uri(params, ctx: "DidCloseTextDocumentParams")
+  let new_docs = documents_remove(store: state_documents(state), uri)
+  return HandlerResult(
+    state: with_documents(state, docs: new_docs),
+    response: None,
+    notifications: []
+  )
+end
+
+// ─── Handler: on_did_save / on_initialized (no-ops) ──────────────────────────
+
+let on_noop = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let _ = params
+  return HandlerResult(state, response: None, notifications: [])
+end
+
+// ─── Handler: on_shutdown ────────────────────────────────────────────────────
+
+let on_shutdown = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let _ = params
+  let new_state = match state do | ServerState(lifecycle: _, documents, diagnostics_cache) ->
+    ServerState(lifecycle: LifecycleShutdown, documents, diagnostics_cache)
+  end
+  return HandlerResult(
+    state: new_state,
+    response: Some(val: JsonNull),
+    notifications: []
+  )
+end
+
+// ─── Handler: textDocument/documentSymbol ────────────────────────────────────
 //
 // Outline view: parse the buffer text we cached on didOpen / didChange and
 // hand the resulting Program to `src/lsp/symbols.document_symbols_for_program`
 // for the AST -> DocumentSymbol[] conversion. The wire reply is the array
 // itself (not wrapped in an object); LSP clients accept either flat
 // SymbolInformation[] or DocumentSymbol[] as the response shape.
+
+let reverse_jsonvals = fn (xs: [JsonValue], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | v :: rest -> return reverse_jsonvals(xs: rest, acc: v :: acc)
+  end
+end
 
 let symbols_to_json_items_go = fn (xs: [DocumentSymbol], acc: [JsonValue]) -> [JsonValue] do
   match xs do
@@ -610,18 +774,19 @@ let compute_document_symbols = fn (doc_opt: Option<DocumentRecord>) -> [Document
         try
           let prog = parser.parse_source(src: text)
           return document_symbols_for_program(prog)
-        catch _ ->
+        catch err ->
           // Lex/parse failure: outline is empty for the broken buffer.
           // The client already sees publishDiagnostics with the parse
           // error (pushed by didOpen / didChange), so flooding the
           // outline with a synthetic symbol would be redundant.
+          let _ = err
           return []
         end
       end
   end
 end
 
-let nexus_on_document_symbol = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+let on_document_symbol = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   let td_v = require_object_field(obj: params, key: "textDocument",
     ctx: "DocumentSymbolParams")
   let uri_v = require_object_field(obj: td_v, key: "uri",
@@ -639,17 +804,12 @@ let nexus_on_document_symbol = fn (state: ServerState, params: JsonValue) -> Han
   )
 end
 
-// ─── Handler: textDocument/hover (via on_other) ──────────────────────────────
+// ─── Handler: textDocument/hover ─────────────────────────────────────────────
 //
 // MVP scope (issue nexus-ws77): surface the file-level `/** ... */` doc
 // comment as a markdown Hover when the cursor sits on the first line of
-// the open buffer. Any other position (including line 0 of a buffer with
-// no leading doc comment) returns JSON `null`, which LSP treats as "no
-// hover info" — the editor shows nothing rather than an error.
-//
-// Per the issue's non-goals, the doc text is returned raw (no `*`
-// stripping, no markdown escaping). Definition-granularity hovers
-// (let / type / variant / param) are deferred to follow-up issues.
+// the open buffer. Any other position returns JSON `null`, which LSP
+// treats as "no hover info".
 
 let hover_position_line = fn (params: JsonValue) -> i64 throws { Exn } do
   let pos_v = require_object_field(obj: params, key: "position",
@@ -663,9 +823,6 @@ let hover_position_line = fn (params: JsonValue) -> i64 throws { Exn } do
 end
 
 let make_markdown_hover = fn (content: string) -> JsonValue do
-  // Wire format: `Hover { contents: MarkupContent { kind, value } }`.
-  // The optional `range` field is omitted — LSP clients fall back to
-  // word-under-cursor, which is fine for a module-level doc.
   let markup = JsonObject(fields: [
     JsonField(key: "kind", value: JsonString(val: "markdown")),
     JsonField(key: "value", value: JsonString(val: content))
@@ -691,7 +848,7 @@ let compute_hover_response = fn (doc_opt: Option<DocumentRecord>, line: i64) -> 
   end
 end
 
-let nexus_on_hover = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+let on_hover = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   let td_v = require_object_field(obj: params, key: "textDocument",
     ctx: "HoverParams")
   let uri_v = require_object_field(obj: td_v, key: "uri",
@@ -710,7 +867,7 @@ let nexus_on_hover = fn (state: ServerState, params: JsonValue) -> HandlerResult
   )
 end
 
-// ─── Handler: textDocument/definition (via on_other) ─────────────────────────
+// ─── Handler: textDocument/definition ────────────────────────────────────────
 //
 // Resolution scope (issue nexus-yvd8 Phase 1):
 //   - same-file: an identifier referencing a top-level `let` / `cap` in the
@@ -719,11 +876,6 @@ end
 //     jumps to other.nx's `let foo = ...` line.
 //   - cross-file with alias: `import * as a from "./other.nx"` plus
 //     `a.foo(...)` jumps to other.nx's `foo` def.
-//
-// Out of scope: local `let` bindings (no top-level rename map entry),
-// parameter names, type / variant / record-field navigation, handler-binding
-// origins. Those return `null` (LSP "no result") rather than InvalidParams
-// so editors silently no-op instead of erroring.
 
 let definition_position = fn (params: JsonValue) -> Position throws { Exn } do
   let pos_v = require_object_field(obj: params, key: "position",
@@ -743,7 +895,7 @@ let definition_position = fn (params: JsonValue) -> Position throws { Exn } do
   return Position(line, character)
 end
 
-let nexus_on_definition = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+let on_definition = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   let td_v = require_object_field(obj: params, key: "textDocument",
     ctx: "DefinitionParams")
   let uri_v = require_object_field(obj: td_v, key: "uri",
@@ -754,8 +906,6 @@ let nexus_on_definition = fn (state: ServerState, params: JsonValue) -> HandlerR
   end
   let pos = definition_position(params)
   let doc_opt = documents_lookup(store: state_documents(state), uri)
-  // No buffer means no Program to walk; reply null. Same convention as
-  // documentSymbol when a request races didOpen.
   match doc_opt do
     | None ->
       return HandlerResult(state, response: Some(val: JsonNull), notifications: [])
@@ -773,15 +923,14 @@ let nexus_on_definition = fn (state: ServerState, params: JsonValue) -> HandlerR
   end
 end
 
-// ─── Handler: textDocument/completion (via on_other) ─────────────────────────
+// ─── Handler: textDocument/completion ────────────────────────────────────────
 //
 // Reuses `definition_position` (same TextDocumentPositionParams shape) and
 // hands the text + cursor coordinates to `lsp/completion.resolve_completion`.
 // On any internal failure the resolver returns the keyword-only baseline, so
-// this handler does not produce InvalidParams — the wire-format CompletionList
-// always serialises successfully.
+// this handler does not produce InvalidParams.
 
-let nexus_on_completion = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+let on_completion = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   let td_v = require_object_field(obj: params, key: "textDocument",
     ctx: "CompletionParams")
   let uri_v = require_object_field(obj: td_v, key: "uri",
@@ -807,14 +956,10 @@ let nexus_on_completion = fn (state: ServerState, params: JsonValue) -> HandlerR
   end
 end
 
-// ─── Handler: textDocument/references (via on_other) ─────────────────────────
+// ─── Handler: textDocument/references ────────────────────────────────────────
 //
-// Resolution scope (issue nexus-5pg8 Phase 1): mirrors the definition path —
-// same-file plus cached imported files. The `context.includeDeclaration`
-// boolean toggles whether the def-site Location prefixes the use-site list.
-// Any failure (cursor not on identifier, unresolved name, broken pipeline)
-// surfaces as an empty array, matching the LSP "no result" convention for
-// reference providers (clients render nothing rather than an error).
+// Mirrors the definition path. The `context.includeDeclaration` boolean
+// toggles whether the def-site Location prefixes the use-site list.
 
 let references_position = fn (params: JsonValue) -> Position throws { Exn } do
   let pos_v = require_object_field(obj: params, key: "position",
@@ -836,9 +981,7 @@ end
 
 let references_include_declaration = fn (params: JsonValue) -> bool do
   // `context` is optional per the spec (some clients omit it on
-  // peek-references). Default: true — including the declaration is the
-  // historically expected behaviour and most clients pass it explicitly
-  // anyway.
+  // peek-references). Default: true.
   match get_field(obj: params, key: "context") do
     | None -> return true
     | Some(val: ctx) ->
@@ -860,7 +1003,7 @@ let locations_to_json_items = fn (xs: [Location], acc: [JsonValue]) -> [JsonValu
   end
 end
 
-let nexus_on_references = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+let on_references = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
   let td_v = require_object_field(obj: params, key: "textDocument",
     ctx: "ReferenceParams")
   let uri_v = require_object_field(obj: td_v, key: "uri",
@@ -874,7 +1017,6 @@ let nexus_on_references = fn (state: ServerState, params: JsonValue) -> HandlerR
   let doc_opt = documents_lookup(store: state_documents(state), uri)
   match doc_opt do
     | None ->
-      // No buffer: empty array (LSP "no result" — clients render nothing).
       return HandlerResult(state, response: Some(val: JsonArray(items: [])), notifications: [])
     | Some(val: rec) ->
       match rec do | DocumentRecord(uri: _, text, version: _) ->
@@ -887,41 +1029,199 @@ let nexus_on_references = fn (state: ServerState, params: JsonValue) -> HandlerR
   end
 end
 
-let nexus_on_other = fn (state: ServerState, method: string, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
-  if method == "textDocument/documentSymbol" then
-    return nexus_on_document_symbol(state, params)
-  end
-  if method == "textDocument/hover" then
-    return nexus_on_hover(state, params)
-  end
-  if method == "textDocument/definition" then
-    return nexus_on_definition(state, params)
-  end
-  if method == "textDocument/completion" then
-    return nexus_on_completion(state, params)
-  end
-  if method == "textDocument/references" then
-    return nexus_on_references(state, params)
-  end
-  // Fall back to MethodNotFound (None response signals it to dispatch_message).
+// ─── Method-name dispatch ────────────────────────────────────────────────────
+//
+// Direct switch on method name. Returns `HandlerResult` with `response: None`
+// for unknown methods so the caller can route the sentinel as MethodNotFound
+// on requests (no-op on notifications).
+
+let invoke_method = fn (
+  state: ServerState,
+  method: string,
+  params: JsonValue
+) -> HandlerResult require { Fs, Console } throws { Exn } do
+  if method == "initialize" then return on_initialize(state, params) end
+  if method == "initialized" then return on_noop(state, params) end
+  if method == "textDocument/didOpen" then return on_did_open(state, params) end
+  if method == "textDocument/didChange" then return on_did_change(state, params) end
+  if method == "textDocument/didClose" then return on_did_close(state, params) end
+  if method == "textDocument/didSave" then return on_noop(state, params) end
+  if method == "shutdown" then return on_shutdown(state, params) end
+  if method == "textDocument/documentSymbol" then return on_document_symbol(state, params) end
+  if method == "textDocument/hover" then return on_hover(state, params) end
+  if method == "textDocument/definition" then return on_definition(state, params) end
+  if method == "textDocument/completion" then return on_completion(state, params) end
+  if method == "textDocument/references" then return on_references(state, params) end
+  // Unknown method → None response sentinel; request dispatch turns it into
+  // MethodNotFound, notifications collapse to a no-op.
+  let _ = params
   return HandlerResult(state, response: None, notifications: [])
 end
 
-// ─── Build the handler vtable ────────────────────────────────────────────────
+// ─── Pure single-message dispatch ────────────────────────────────────────────
+//
+// Routes `msg` through the per-method handlers while enforcing LSP lifecycle
+// invariants. Returns a StepOutcome the I/O loop (or a test driver) consumes.
 
-export let nexus_handlers = fn () -> Handlers do
-  match empty_handlers() do
-    | Handlers(on_initialize: _, on_initialized, on_did_open: _, on_did_change: _,
-               on_did_close, on_did_save, on_shutdown, on_other: _) ->
-      return Handlers(
-        on_initialize: nexus_on_initialize,
-        on_initialized,
-        on_did_open: nexus_on_did_open,
-        on_did_change: nexus_on_did_change,
-        on_did_close,
-        on_did_save,
-        on_shutdown,
-        on_other: nexus_on_other
+export let dispatch_message = fn (
+  state: ServerState,
+  msg: IncomingMessage
+) -> StepOutcome require { Fs, Console } throws { Exn } do
+  match msg do
+    | Request(id, method, params) ->
+      // Pre-initialize gate: only `initialize` is permitted before handshake.
+      if lifecycle_is_uninitialized(state) && method != "initialize" then
+        let err = response_error(id,
+          code: server_not_initialized(),
+          message: "server not initialized")
+        return StepContinue(state, response: Some(val: err), notifications: [])
+      end
+      // Post-shutdown gate: any request other than `exit` (a notification)
+      // is rejected per spec.
+      if lifecycle_is_shutdown(state) then
+        let err = response_error(id,
+          code: invalid_request(),
+          message: "server has shut down")
+        return StepContinue(state, response: Some(val: err), notifications: [])
+      end
+      try
+        let result = invoke_method(state, method, params)
+        match result do | HandlerResult(state: new_state, response, notifications) ->
+          let response_envelope = match response do
+            | Some(val: r) -> Some(val: response_ok(id, result: r))
+            | None ->
+              // Unknown method → MethodNotFound.
+              Some(val: response_error(id,
+                code: method_not_found(),
+                message: "method not found: " ++ method))
+          end
+          return StepContinue(state: new_state, response: response_envelope, notifications)
+        end
+      catch err ->
+        let err_response = match err do
+          | LspProtocolError(msg) ->
+            response_error(id, code: invalid_params(), message: msg)
+          | _ ->
+            response_error(id,
+              code: internal_error(),
+              message: "internal error in handler")
+        end
+        return StepContinue(state, response: Some(val: err_response), notifications: [])
+      end
+    | Notification(method, params) ->
+      // `exit` short-circuits. Per spec, the server must exit even if no
+      // shutdown was received; the I/O loop converts StepExit into a
+      // graceful loop termination.
+      if method == "exit" then
+        return StepExit(state)
+      end
+      // Pre-initialize gate for notifications: spec drops them silently
+      // except `exit` (handled above) and `$/cancelRequest` (allowed but
+      // not handled here).
+      if lifecycle_is_uninitialized(state) && method != "initialized" then
+        return StepContinue(state, response: None, notifications: [])
+      end
+      try
+        let result = invoke_method(state, method, params)
+        match result do | HandlerResult(state: new_state, response: _, notifications) ->
+          return StepContinue(state: new_state, response: None, notifications)
+        end
+      catch err ->
+        // Notifications have no reply channel; per LSP spec the server
+        // logs and continues. Catch LspProtocolError (malformed params)
+        // here and discharge as a no-op state transition. Other
+        // exceptions propagate so genuine invariant violations surface
+        // at the entry point.
+        match err do
+          | LspProtocolError(_) -> return StepContinue(state, response: None, notifications: [])
+          | _ -> raise err
+        end
+      end
+    | Malformed(reason) ->
+      // Already-classified malformed input (no `method` or non-string method).
+      // Surface as a JSON-RPC error with null id.
+      return StepContinue(
+        state,
+        response: Some(val: response_error(
+          id: JsonNull,
+          code: invalid_request(),
+          message: reason
+        )),
+        notifications: []
       )
   end
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// I/O layer
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `run_server` ties the pure dispatch to stdin/stdout via the nxlib/jsonrpc
+// framing primitives. The loop is hand-rolled (rather than calling
+// jsonrpc.dispatch_loop) because we need to thread `ServerState` through
+// each step and observe StepExit — both of which the generic dispatch_loop
+// can't carry through its closure-based API.
+
+let write_notifications = fn (xs: [JsonValue]) -> unit require { Console } throws { Exn } do
+  match xs do
+    | [] -> return ()
+    | n :: rest ->
+      write_message(value: n)
+      return write_notifications(xs: rest)
+  end
+end
+
+let run_server_go = fn (
+  state: ServerState,
+  remaining: i64
+) -> ServerState require { Fs, Console } throws { Exn } do
+  if remaining == 0 then return state end
+  try
+    match read_message() do
+      | None -> return state
+      | Some(val: value) ->
+        let classified = classify(value)
+        match dispatch_message(state, msg: classified) do
+          | StepExit(state: new_state) -> return new_state
+          | StepContinue(state: new_state, response, notifications) ->
+            match response do
+              | Some(val: r) -> write_message(value: r)
+              | None -> ()
+            end
+            write_notifications(xs: notifications)
+            let next_remaining = if remaining < 0 then -1 else remaining - 1 end
+            return run_server_go(state: new_state, remaining: next_remaining)
+        end
+    end
+  catch err ->
+    // Frame and JSON parse errors mirror jsonrpc.dispatch_loop's policy:
+    // log to stderr and continue. Other exceptions propagate.
+    match err do
+      | JsonRpcFrameError(msg) ->
+        Console.eprintln(val: "[lsp/server] frame error: " ++ msg)
+        let next_remaining = if remaining < 0 then -1 else remaining - 1 end
+        return run_server_go(state, remaining: next_remaining)
+      | _ -> raise err
+    end
+  end
+end
+
+/// Read JSON-RPC frames off stdin, dispatch through the per-method handlers
+/// while threading `state`, and write responses + notifications back to
+/// stdout. Returns the final ServerState when the loop terminates (EOF,
+/// `exit` notification, or `max_iters` reached).
+///
+/// `max_iters < 0` is unbounded (production setting); tests pass a small
+/// bound to drive a finite synthetic stream.
+///
+/// Capability discipline: the import-aware diagnostics path requires `Fs`
+/// (cross-file reads) and `Console` (log lines). The caller discharges
+/// both via a wrapping `inject` block — typically
+/// `inject stdio.system_handler, fs_mod.system_handler do run_server(...) end`
+/// at the entry point.
+export let run_server = fn (
+  initial_state: ServerState,
+  max_iters: i64
+) -> ServerState require { Fs, Console } throws { Exn } do
+  return run_server_go(state: initial_state, remaining: max_iters)
 end
