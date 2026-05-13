@@ -184,10 +184,29 @@ ok "Installed lsp.wasm ($(wc -c < lsp.wasm | tr -d ' ') bytes)"
 info "Building polyglot launcher: header.sh + nexus.wasm + lsp.wasm → nexus"
 COMPILER_SIZE=$(wc -c < nexus.wasm | tr -d ' ')
 LSP_SIZE=$(wc -c < lsp.wasm | tr -d ' ')
+
+# Embed sha256 of each payload. The launcher uses these to detect a stale
+# `./nexus` (e.g. after a git checkout that updated nexus.wasm but left the
+# polyglot launcher from a prior bootstrap on disk). See header.sh staleness
+# check. We require sha256sum or shasum -a 256; if neither is available,
+# embed an empty sha so the launcher skips the check rather than misbehaving.
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  else
+    printf ''
+  fi
+}
+COMPILER_SHA=$(sha256_file nexus.wasm)
+LSP_SHA=$(sha256_file lsp.wasm)
 {
   cat header.sh
   printf 'compiler:%s\n' "$COMPILER_SIZE"
   printf 'lsp:%s\n' "$LSP_SIZE"
+  printf 'sha:compiler:%s\n' "$COMPILER_SHA"
+  printf 'sha:lsp:%s\n' "$LSP_SHA"
   printf '#__NEXUS_PAYLOAD_BEGIN__\n'
   cat nexus.wasm
   cat lsp.wasm

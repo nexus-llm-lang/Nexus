@@ -79,6 +79,13 @@ HEAD_BYTES=$(head -n "$BEGIN_LINE" "$0" | wc -c | tr -d ' ')
 # HEAD_BYTES plus the cumulative size of preceding entries. The result is
 # written to a temp file because `while` runs in a subshell and cannot
 # export variables back.
+#
+# Two manifest line shapes are recognized:
+#   <name>:<size>             -> payload entry (recorded with computed offset)
+#   sha:<name>:<sha256-hex>   -> hash of the payload bytes named <name>
+# Entries with 3 fields where the first is literally `sha` are written as
+# `__sha__ <name> <hex>` to the manifest file so the staleness check below
+# can look them up without re-parsing.
 MANIFEST_FILE=$(mktemp)
 awk -v head_bytes="$HEAD_BYTES" '
   /^#__NEXUS_PAYLOAD_BEGIN__$/ { exit }
@@ -88,6 +95,8 @@ awk -v head_bytes="$HEAD_BYTES" '
     if (n == 2) {
       print parts[1] " " parts[2] " " offset
       offset += parts[2]
+    } else if (n == 3 && parts[1] == "sha") {
+      print "__sha__ " parts[2] " " parts[3]
     }
   }
   /^#__NEXUS_PAYLOAD_MANIFEST__$/ {
@@ -95,6 +104,52 @@ awk -v head_bytes="$HEAD_BYTES" '
     offset = head_bytes + 0
   }
 ' "$0" > "$MANIFEST_FILE"
+
+# ─── Stale-launcher check ────────────────────────────────────────────────
+# Detect the common gotcha where `./nexus` was built by a prior bootstrap
+# and now embeds older wasm bytes than the on-disk `nexus.wasm` (or
+# `lsp.wasm`) sitting next to the launcher. This happens after `git
+# checkout` or worktree creation: the tracked `nexus.wasm` advances with
+# the source, but `./nexus` is gitignored and only rebuilt by
+# `./bootstrap.sh`. Running the stale launcher silently against new
+# source bytes wastes hours of debugging (see nexus-r9ga, nexus-xnob).
+#
+# We compare the sha256 embedded in the launcher manifest against the
+# sha256 of the sibling file `<launcher-dir>/<name>.wasm`. Mismatch =>
+# fail loud. The check is skipped when:
+#   * the embedded sha is empty (launcher built without a sha tool), OR
+#   * no sibling wasm exists (launcher installed standalone, e.g. via
+#     `cp ./nexus /usr/local/bin/`), OR
+#   * no local sha256 tool is available (we cannot verify), OR
+#   * NEXUS_SKIP_STALE_CHECK is set non-empty (escape hatch).
+if [ -z "${NEXUS_SKIP_STALE_CHECK:-}" ]; then
+  EXPECTED_SHA=$(awk -v want="$PAYLOAD_NAME" '$1 == "__sha__" && $2 == want { print $3; exit }' "$MANIFEST_FILE")
+  LAUNCHER_DIR=$(dirname -- "$0")
+  case "$PAYLOAD_NAME" in
+    compiler) SIBLING="$LAUNCHER_DIR/nexus.wasm" ;;
+    lsp)      SIBLING="$LAUNCHER_DIR/lsp.wasm" ;;
+    *)        SIBLING="" ;;
+  esac
+  if [ -n "$EXPECTED_SHA" ] && [ -n "$SIBLING" ] && [ -f "$SIBLING" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      ACTUAL_SHA=$(sha256sum "$SIBLING" | awk '{ print $1 }')
+    elif command -v shasum >/dev/null 2>&1; then
+      ACTUAL_SHA=$(shasum -a 256 "$SIBLING" | awk '{ print $1 }')
+    else
+      ACTUAL_SHA=""
+    fi
+    if [ -n "$ACTUAL_SHA" ] && [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+      echo "nexus: stale launcher detected." >&2
+      echo "nexus:   embedded $PAYLOAD_NAME sha: $EXPECTED_SHA" >&2
+      echo "nexus:   on-disk  $SIBLING sha: $ACTUAL_SHA" >&2
+      echo "nexus: ./nexus was built by a prior bootstrap and no longer matches the" >&2
+      echo "nexus: wasm sitting next to it. Re-bootstrap to refresh the launcher:" >&2
+      echo "nexus:   ./bootstrap.sh" >&2
+      echo "nexus: (or set NEXUS_SKIP_STALE_CHECK=1 to bypass this check)" >&2
+      exit 3
+    fi
+  fi
+fi
 
 # Locate the requested entry by name.
 ENTRY=$(awk -v want="$PAYLOAD_NAME" '$1 == want { print $2, $3; exit }' "$MANIFEST_FILE")
