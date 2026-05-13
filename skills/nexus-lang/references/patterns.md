@@ -318,6 +318,40 @@ no nested cons pattern that captures both lists' shapes in a single arm. Leave
 the staircase or restructure into a helper. Tuple-pattern matching is not used
 in the current codebase; do not introduce it speculatively.
 
+## Integer-range `for` loop
+
+Nexus has one built-in `for` form: a bounded integer-range loop. There is no
+collection-iteration `for x in list` — see the anti-patterns table in
+`SKILL.md`.
+
+```nexus
+// Sum 0 + 1 + 2 + 3 + 4 = 10. Upper bound is exclusive.
+let ~sum = 0
+for i = 0 to 5 do
+  ~sum <- ~sum + i
+end
+
+// Empty when lower == upper.
+for i = 5 to 5 do
+  // never executed
+end
+
+// Walks 1, 2, 3, 4, 5.
+let ~product = 1
+for i = 1 to 6 do
+  ~product <- ~product * i
+end
+```
+
+- `i` is bound fresh per iteration as an `i64`.
+- The upper bound is **exclusive** — `for i = lo to hi do ... end` runs the
+  body for `i ∈ [lo, hi)`. When `hi <= lo` the loop body is skipped entirely.
+- The body sees the enclosing scope, so mutate state via an outer `let ~x = ...`
+  (the loop binder itself is immutable).
+
+For traversing a list or array, use `match`/recursion or `list.fold_left` /
+`array.fold_left` instead — there is no `for x in xs` syntax.
+
 ## Linear Resource Management
 
 Nexus linear types (`%`) enforce exactly-once consumption at compile time.

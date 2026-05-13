@@ -30,6 +30,10 @@ The standard library is the `std` package, rooted at `nxlib/stdlib/`. Every modu
 | `"std:exn"` | pure | Exception helpers, `backtrace()` |
 | `"std:lazy"` | pure | `Lazy<T>`, host-side lazy force |
 | `"std:core"` | pure | `id` (polymorphic identity) |
+| `"std:json"` | pure | `parse`, `serialize`, `get_field`, `JsonValue` algebra (`JsonInt`, `JsonString`, `JsonArray`, `JsonObject`, ...) |
+| `"std:simd"` | FFI | 128-bit SIMD intrinsics — lane-wise `i32x4`/`i64x2` `_add`/`_mul`, autovectorized `*_add_array`/`*_mul_array`/`*_sub_array`/`*_div_array` over `f32x4`/`f64x2`/`i32x4`/`i64x2`, plus `scalar_*_array` non-SIMD fallbacks |
+
+Modules occasionally referenced by name elsewhere — `std:chan`, `std:sched`, `std:string`, `std:_nx` — are intentionally omitted: they're either duplicates of an existing module under a different label or speculative names with no `nxlib/stdlib/<name>.nx` source (see nexus-ds7e / nexus-xqzl).
 
 ### Runtime intrinsics (compiler-internal)
 

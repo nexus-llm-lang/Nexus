@@ -481,7 +481,7 @@ end
 | `let _ = linear_val` | Consume linear values via function call or pattern match |
 | Implicit I/O | Declare via `require { PermConsole }` + inject handler |
 | `var x = 5` | `let ~x = 5` for mutable |
-| `for x in list` | Use `match`/recursion or `list.fold_left` |
+| `for x in list` (collection iteration) | No such form exists — use `match`/recursion or `list.fold_left`. The integer-range `for i = lo to hi do ... end` *does* exist (exclusive upper); see `references/patterns.md`. |
 | `throws { Exn }` for a function with a known exception set | List the actual exceptions or an `exception group` (see rule #7) |
 | `raise RuntimeError(val: "...")` from a partial function | Declare a domain-specific `exception` and raise that |
 | `let r = ...; let r2 = ...; let r3 = ...` when intermediates are dead | Shadow: reuse `r` (see rule #6) |
