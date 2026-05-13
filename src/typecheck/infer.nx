@@ -159,17 +159,50 @@ let infer_variable = fn (state: CheckState, name: string, sigil: Sigil, span: Sp
 end
 
 let infer_borrow = fn (state: CheckState, name: string, span: Span) -> InferExprResult throws { TypeError } do
-  // Borrow walks the env directly (without sigil dereference) — `&x` may
-  // borrow Linear/Lazy/Borrow bindings the same way as plain Immutable ones.
+  // T-Borrow (spec, type-system-formal.md §T-Borrow, nexus-mqin.11):
+  //   x :^ω ∀ᾱ.τ ∈ Γ    τ' = inst(∀ᾱ.τ)    σ = stripBorrow(τ')
+  //   ────────────────────────────────────────────────────────────
+  //   Γ; ρ_q ⊢_e &x : &σ ! { }
+  //
+  // "Only unrestricted bindings (q = ω) can be borrowed." Per spec §1
+  // (binding qualifiers), a binding has q = 1 iff its type is %τ, @τ, or
+  // an array [|τ|] at the outermost form; all others are ω.
+  //
+  // Pre-fix, this function stripped %/@ wrappers indiscriminately and
+  // emitted &σ — accepting `&x` for a linear `let %b = make_box()`
+  // binding even though spec requires rejection. Pattern:
+  //   let %b = make_box()
+  //   let r = &b           ← was accepted; should be rejected
+  //   consume(b: b)        ← linear consumption still tracked, but the
+  //                          intervening borrow violates T-Borrow's ^ω
+  //                          precondition.
+  //
+  // Surfaces as a TypeMismatch (E2001) so the diagnostic flows through
+  // the standard typecheck error path; the message names the binding
+  // and references the spec rule.
   match infer_variable(state, name, sigil: SigilImmutable, span) do
     | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
     | InferExprOk(state: st1, subst: s, typ: t) ->
-      // Strip Linear/Lazy/Borrow/Ref wrapper, then wrap in Borrow.
-      // stripBorrow(τ) per spec: τ ∈ {%σ, @σ, &σ, ~σ} -> σ. Borrowing a `~τ`
-      // binding yields `&τ` of the cell's contents, not `&(~τ)`.
+      // Reject borrow of linear (q = 1) bindings up front. Plain types,
+      // borrows (&σ), and refs (~σ) are ^ω and continue to the strip step.
+      match t do
+        | TyLinear(_) ->
+          return InferExprErr(
+            message: "cannot borrow '" ++ name ++ "': binding is linear (q = 1); T-Borrow requires x :^ω (unrestricted). See spec type-system-formal.md §T-Borrow.",
+            span
+          )
+        | TyLazy(_) ->
+          return InferExprErr(
+            message: "cannot borrow '" ++ name ++ "': binding is lazy/one-shot (q = 1); T-Borrow requires x :^ω (unrestricted). See spec type-system-formal.md §T-Borrow.",
+            span
+          )
+        | _ -> ()
+      end
+      // stripBorrow(τ) per spec: τ ∈ {%σ, @σ, &σ, ~σ} -> σ. The %σ/@σ
+      // arms above already rejected; here we only see &σ, ~σ, or plain
+      // types. Borrowing a `~τ` binding yields `&τ` of the cell's
+      // contents, not `&(~τ)`; borrowing a `&τ` rebinds the borrow.
       let inner = match t do
-        | TyLinear(inner: u) -> u
-        | TyLazy(inner: u) -> u
         | TyBorrow(inner: u) -> u
         | TyRef(inner: u) -> u
         | _ -> t
