@@ -543,7 +543,112 @@ let check_each_callee_member_admitted = fn (
   end
 end
 
+/** nexus-323x: validation result for call-arg label checking. Kept */
+/** separate from `InferExprResult` so the helpers don't need a CheckState. */
+type ArgLabelCheck = ArgLabelOk | ArgLabelErr(message: string)
+
 let check_call_args = fn (
+  state: CheckState, params: [NamedType], args: [HirCallArg],
+  ret: TypeExpr, subst: [SubstEntry], span: Span
+) -> InferExprResult throws { TypeError } do
+  // nexus-323x: validate that every call-arg label matches a parameter
+  // name (and vice versa) BEFORE the positional walk. The MIR→LIR
+  // lowering sorts both call args and params alphabetically by label (see
+  // sort_lir_call_args / sort_lir_params in src/ir/lir.nx). A pun like
+  // `f(x, y)` against `fn (a, b)` previously typechecked by the old
+  // positional walk (which discarded the label), then the sort placed the
+  // x/y values into the a/b slots in the wrong alphabetic order — a
+  // silent wrong-slot runtime miscompile (nexus-j6mr / 323x). Reordering
+  // by label IS still allowed: declared `fn (a, b)` accepts `f(b: 10, a: 52)`
+  // because the sort brings both sides into alignment.
+  match validate_arg_labels(args, params) do
+    | ArgLabelErr(message: m) -> return InferExprErr(message: m, span)
+    | ArgLabelOk ->
+      let ordered = reorder_args_by_params(args, params)
+      return check_call_args_walk(state, params, args: ordered, ret, subst, span)
+  end
+end
+
+let validate_arg_labels = fn (args: [HirCallArg], params: [NamedType]) -> ArgLabelCheck do
+  match check_args_have_param_names(args, params) do
+    | ArgLabelErr(message: m) -> return ArgLabelErr(message: m)
+    | ArgLabelOk -> return check_params_have_arg_labels(params, args)
+  end
+end
+
+let check_args_have_param_names = fn (args: [HirCallArg], params: [NamedType]) -> ArgLabelCheck do
+  match args do
+    | [] -> return ArgLabelOk
+    | HirCallArg(label: l, value: _) :: rest ->
+      if param_set_contains(params, name: l) then
+        return check_args_have_param_names(args: rest, params)
+      else
+        return ArgLabelErr(
+          message: "function call argument label '" ++ l
+            ++ "' does not match any parameter name — use 'name: value' (got positional or mismatched-label argument)"
+        )
+      end
+  end
+end
+
+let check_params_have_arg_labels = fn (params: [NamedType], args: [HirCallArg]) -> ArgLabelCheck do
+  match params do
+    | [] -> return ArgLabelOk
+    | NamedType(name: pn, typ: _) :: rest ->
+      if arg_set_contains(args, label: pn) then
+        return check_params_have_arg_labels(params: rest, args)
+      else
+        return ArgLabelErr(message: "missing argument: " ++ pn)
+      end
+  end
+end
+
+let param_set_contains = fn (params: [NamedType], name: string) -> bool do
+  match params do
+    | [] -> return false
+    | NamedType(name: pn, typ: _) :: rest ->
+      if pn == name then return true end
+      return param_set_contains(params: rest, name)
+  end
+end
+
+let arg_set_contains = fn (args: [HirCallArg], label: string) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: l, value: _) :: rest ->
+      if l == label then return true end
+      return arg_set_contains(args: rest, label)
+  end
+end
+
+/** Reorder `args` so its labels appear in `params`-declared order. */
+/** Precondition: validate_arg_labels has already succeeded, so every */
+/** param has a unique matching arg. */
+let reorder_args_by_params = fn (args: [HirCallArg], params: [NamedType]) -> [HirCallArg] do
+  return reorder_args_by_params_go(args, params, acc: [])
+end
+
+let reorder_args_by_params_go = fn (args: [HirCallArg], params: [NamedType], acc: [HirCallArg]) -> [HirCallArg] do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | NamedType(name: pn, typ: _) :: rest ->
+      match find_arg_by_label(args, label: pn) do
+        | None -> return list.reverse(xs: acc)  // unreachable post-validation
+        | Some(val: a) -> return reorder_args_by_params_go(args, params: rest, acc: a :: acc)
+      end
+  end
+end
+
+let find_arg_by_label = fn (args: [HirCallArg], label: string) -> Option<HirCallArg> do
+  match args do
+    | [] -> return None
+    | HirCallArg(label: l, value: v) :: rest ->
+      if l == label then return Some(val: HirCallArg(label: l, value: v)) end
+      return find_arg_by_label(args: rest, label)
+  end
+end
+
+let check_call_args_walk = fn (
   state: CheckState, params: [NamedType], args: [HirCallArg],
   ret: TypeExpr, subst: [SubstEntry], span: Span
 ) -> InferExprResult throws { TypeError } do
@@ -566,7 +671,7 @@ let check_call_args = fn (
               match unify.unify(t1: arg_t, t2: expected, tdefs) do
                 | UnifyOk(subst: s2) ->
                   let s_all = subst.subst_compose(s1: s_merged, s2)
-                  return check_call_args(state: st1, params: rp, args: ra, ret, subst: s_all, span)
+                  return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span)
                 | UnifyErr(message: m) ->
                   // Linearity-weakening at call sites: permit passing a plain
                   // value `T` where the parameter is `%T` or `@T` by re-unifying
@@ -579,14 +684,14 @@ let check_call_args = fn (
                       match unify.unify(t1: arg_t, t2: pinner, tdefs) do
                         | UnifyOk(subst: s2) ->
                           let s_all = subst.subst_compose(s1: s_merged, s2)
-                          return check_call_args(state: st1, params: rp, args: ra, ret, subst: s_all, span)
+                          return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span)
                         | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
                       end
                     | TyLazy(inner: pinner) ->
                       match unify.unify(t1: arg_t, t2: pinner, tdefs) do
                         | UnifyOk(subst: s2) ->
                           let s_all = subst.subst_compose(s1: s_merged, s2)
-                          return check_call_args(state: st1, params: rp, args: ra, ret, subst: s_all, span)
+                          return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span)
                         | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
                       end
                     | _ ->
@@ -611,21 +716,21 @@ let check_call_args = fn (
                           match unify.unify(t1: ainner, t2: expected, tdefs) do
                             | UnifyOk(subst: s2) ->
                               let s_all = subst.subst_compose(s1: s_merged, s2)
-                              return check_call_args(state: st1, params: rp, args: ra, ret, subst: s_all, span)
+                              return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span)
                             | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
                           end
                         | TyLinear(inner: TyLazy(inner: ainner)) ->
                           match unify.unify(t1: ainner, t2: expected, tdefs) do
                             | UnifyOk(subst: s2) ->
                               let s_all = subst.subst_compose(s1: s_merged, s2)
-                              return check_call_args(state: st1, params: rp, args: ra, ret, subst: s_all, span)
+                              return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span)
                             | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
                           end
                         | TyArrow(params: [], ret: aret, requires: _, throw_row: _) ->
                           match unify.unify(t1: aret, t2: expected, tdefs) do
                             | UnifyOk(subst: s2) ->
                               let s_all = subst.subst_compose(s1: s_merged, s2)
-                              return check_call_args(state: st1, params: rp, args: ra, ret, subst: s_all, span)
+                              return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span)
                             | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
                           end
                         | _ -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
