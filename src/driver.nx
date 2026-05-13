@@ -32,6 +32,7 @@ import * as tc_linearity from "src/typecheck/linearity.nx"
 import * as repl_mod from "src/repl.nx"
 import * as bb from "std:bytebuffer"
 import * as polyglot from "src/backend/polyglot.nx"
+import * as lazy_host from "std:lazy_host"
 import { Fs }, * as fs_mod from "std:fs"
 import { Console }, * as stdio from "std:stdio"
 import { Clock }, * as clock_mod from "std:clock"
@@ -87,6 +88,12 @@ let get_type_defs = fn (hir: HirProgram) -> [RecordDef] do
 end
 
 type HirBuildResult = HirBuildResult(program: HirProgram, import_cache: [CacheEntry])
+
+// Bundled result of the capability extraction + wasm write phase. The
+// non-polyglot branch runs them in parallel via `std:lazy_host`; both
+// branches funnel through this record so the surrounding driver code
+// reads `caps` / `ok` uniformly.
+type CapsWriteResult = CapsWriteResult(caps: [string], ok: bool)
 
 /** Add rename entries for the entry file's own top-level defs so that local */
 /** calls (foo(), Console.println(...)) rename to canonical targets. */
@@ -757,10 +764,26 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock,
 
     // Capabilities must be extracted before the arena reset; for the polyglot
     // emit path they are also baked into the launcher header, so the extract
-    // happens here regardless of `explain` mode.
-    let caps = find_main_caps(defs: get_defs(prog))
-
-    let ok = write_emit(%wasm_buf, output_path, caps, polyglot_mode, remain_manifest, verbose)
+    // is bracketed with `write_emit` either inline (polyglot, must precede the
+    // header) or in parallel (non-polyglot, `write_emit` ignores `caps`).
+    //
+    // The non-polyglot branch dogfoods `std:lazy_host.host_spawn` /
+    // `host_join`: `find_main_caps` is pure (no I/O, no raises) and only
+    // reads the AST, which lives in the shared arena-backed heap, so it is
+    // safe to force on a worker thread while the main thread runs
+    // `write_emit` (file I/O, also non-raising). The two operations cannot
+    // raise so the linear `%Task<T>` handle is always joined exactly once.
+    let CapsWriteResult(caps: caps, ok: ok) = if polyglot_mode then
+        let caps_now = find_main_caps(defs: get_defs(prog))
+        let ok_now = write_emit(%wasm_buf, output_path, caps: caps_now, polyglot_mode: true, remain_manifest, verbose)
+        CapsWriteResult(caps: caps_now, ok: ok_now)
+      else
+        let @caps_thunk = find_main_caps(defs: get_defs(prog))
+        let caps_task = lazy_host.host_spawn(a: caps_thunk)
+        let ok_par = write_emit(%wasm_buf, output_path, caps: [], polyglot_mode: false, remain_manifest, verbose)
+        let caps_par = lazy_host.host_join(handle: caps_task)
+        CapsWriteResult(caps: caps_par, ok: ok_par)
+      end
     let t10 = Clock.now()
 
     if ok then
