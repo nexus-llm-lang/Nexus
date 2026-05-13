@@ -165,8 +165,10 @@ if [ "$TEST_MODE" = "1" ]; then
 
   # The per-fixture runner runs inline under xargs below — `xargs -L 1 sh -c
   # '...'` reads (idx, file) pairs from the plan file and invokes wasmtime
-  # twice (compile, then run). Result lines land in RESULTS_DIR/result_$idx,
-  # so the parent can replay them in plan order regardless of finish order.
+  # twice (compile, then run). Each worker prints its own PASS/FAIL line to
+  # stderr as soon as it finishes (so the user sees parallel progress live)
+  # and also writes a TSV record to RESULTS_DIR/result_$idx for the
+  # plan-ordered final replay (summary + JUnit XML).
   export TMP W_FLAGS TMPDIR_REAL RESULTS_DIR NEXUS_WASMTIME_ARGS
   IDX=0
   PLAN_FILE="$RESULTS_DIR/plan.tsv"
@@ -176,7 +178,9 @@ if [ "$TEST_MODE" = "1" ]; then
     printf '%d\t%s\n' "$IDX" "$f" >> "$PLAN_FILE"
   done
 
-  # The inline runner uses awk to split the idx+path pair from xargs.
+  # The inline runner uses positional args from `xargs -L 1`: $1=idx, $2=file.
+  # The streamed PASS/FAIL line goes to fd 2 (stderr); fd 1 is reserved for
+  # silent / further pipeline use.
   cat "$PLAN_FILE" | xargs -P "$JOBS" -L 1 -- /bin/sh -c '
     idx="$1"; f="$2"
     wasm="$RESULTS_DIR/test_$idx.wasm"
@@ -191,6 +195,7 @@ if [ "$TEST_MODE" = "1" ]; then
       tail_txt="$(tail -8 "$elog" 2>/dev/null)"
       printf "FAIL\t%s\tcompile\t%s\t%s\n" "$ms" "$f" "$tail_txt" \
         > "$RESULTS_DIR/result_$idx.tsv"
+      printf "FAIL  %s  (%sms, compile)\n" "$f" "$ms" >&2
       rm -f "$wasm"
       exit 0
     fi
@@ -204,6 +209,7 @@ if [ "$TEST_MODE" = "1" ]; then
       tail_txt="$(tail -16 "$elog" 2>/dev/null)"
       printf "FAIL\t%s\trun\t%s\t%s\n" "$ms" "$f" "$tail_txt" \
         > "$RESULTS_DIR/result_$idx.tsv"
+      printf "FAIL  %s  (%sms, run)\n" "$f" "$ms" >&2
       rm -f "$wasm"
       exit 0
     fi
@@ -211,10 +217,13 @@ if [ "$TEST_MODE" = "1" ]; then
     ms=$(( (t2 - t1) / 1000000 ))
     printf "PASS\t%s\t-\t%s\t-\n" "$ms" "$f" \
       > "$RESULTS_DIR/result_$idx.tsv"
+    printf "PASS  %s  (%sms)\n" "$f" "$ms" >&2
     rm -f "$wasm"
   ' _
 
-  # Replay results in plan order, accumulate totals.
+  # Replay results in plan order to accumulate totals. The PASS/FAIL lines
+  # were already streamed live by the workers above; this loop is silent
+  # except for the summary at the bottom.
   PASSED=0; FAILED=0; TOTAL_MS=0
   IDX=0
   for f in $FILES; do
@@ -225,16 +234,12 @@ if [ "$TEST_MODE" = "1" ]; then
       FAILED=$((FAILED + 1))
       continue
     fi
-    # Fields: status, ms, stage, file, tail
     status=$(awk -F'\t' '{ print $1; exit }' "$rf")
     ms=$(awk -F'\t' '{ print $2; exit }' "$rf")
-    stage=$(awk -F'\t' '{ print $3; exit }' "$rf")
     TOTAL_MS=$((TOTAL_MS + ms))
     if [ "$status" = "PASS" ]; then
-      printf 'PASS  %s  (%sms)\n' "$f" "$ms" >&2
       PASSED=$((PASSED + 1))
     else
-      printf 'FAIL  %s  (%sms, %s)\n' "$f" "$ms" "$stage" >&2
       FAILED=$((FAILED + 1))
     fi
   done
