@@ -1,0 +1,128 @@
+// Runtime regression for nexus-l1h0: SIMD horizontal-reduce primitives
+// (f32x4_horizontal_sum, i32x4_horizontal_max, f64x2_horizontal_min).
+//
+// A "horizontal" reduce collapses all lanes of one v128 into a single
+// scalar across the lane axis. WebAssembly SIMD has no single-instruction
+// horizontal reduce; the stdlib composes scalar loads from each lane
+// offset + a fold, which is byte-identical to the textbook
+// `v128.load + per-lane extract + scalar fold` sequence because the
+// inputs come from the same 16-byte memory region.
+//
+// Coverage (≥ 2 cases per reduce):
+//   1. f32x4_horizontal_sum
+//        simple: lanes {1.0, 2.0, 3.0, 4.0}             → 10.0
+//        nan:    lanes {1.0, NaN, 3.0, 4.0}             → NaN (propagates)
+//   2. i32x4_horizontal_max
+//        simple: lanes {1, 7, 3, 5}                     → 7
+//        signed: lanes {-2147483648, -1, -2147483647,
+//                       -2147483647}                    → -1
+//                (every lane is the most-negative half;
+//                  -1 is the largest; verifies the i32 sign-extend path
+//                  on negative inputs).
+//   3. f64x2_horizontal_min
+//        simple: lanes {2.5, 1.25}                      → 1.25
+//        nan:    lanes {NaN, 1.0}                       → NaN (propagates)
+//
+// NaN detection in assertions: NaN is the unique f64 satisfying
+// `x !=. x`, so we assert that on the reduce result.
+//
+// On success main returns unit; on any mismatch an AssertionFailed
+// escapes through main's throws { Exn } row.
+
+import * as mem from "std:runtime/mem"
+import * as simd from "std:simd"
+import * as test_assert from "std:test/assert"
+
+// 0x7FF8000000000000 is a canonical quiet NaN bit pattern (sign 0,
+// all exponent bits, mantissa MSB set). Materialize via store_i64 +
+// load_f64 to avoid relying on float-literal NaN syntax.
+let nan_f64 = fn (scratch: i64) -> float do
+  let _ = mem.store_i64(addr: scratch, val: 9221120237041090560)
+  return mem.load_f64(addr: scratch)
+end
+
+let body = fn () -> unit throws { Exn } do
+  let prev_pages = mem.grow(delta: 1)
+  let base = prev_pages * 65536
+
+  // Region layout: f32x4 region (16B) at base+0; i32x4 region (16B) at
+  // base+16; f64x2 region (16B) at base+32; NaN scratch at base+48.
+  let f32_addr = base
+  let i32_addr = base + 16
+  let f64_addr = base + 32
+  let scratch  = base + 48
+
+  // ── 1. f32x4_horizontal_sum: simple {1, 2, 3, 4} → 10 ─────────────────
+  let _ = mem.store_f32(addr: f32_addr,      val: 1.0)
+  let _ = mem.store_f32(addr: f32_addr + 4,  val: 2.0)
+  let _ = mem.store_f32(addr: f32_addr + 8,  val: 3.0)
+  let _ = mem.store_f32(addr: f32_addr + 12, val: 4.0)
+  let sum = simd.f32x4_horizontal_sum(addr: f32_addr)
+  test_assert.assert_true(cond: sum ==. 10.0,
+    label: "f32x4_horizontal_sum: {1,2,3,4} == 10.0")
+
+  // Scalar reference (byte-equal check): re-derive via mem loads.
+  let ref_sum = mem.load_f32(addr: f32_addr)
+    +. mem.load_f32(addr: f32_addr + 4)
+    +. mem.load_f32(addr: f32_addr + 8)
+    +. mem.load_f32(addr: f32_addr + 12)
+  test_assert.assert_true(cond: sum ==. ref_sum,
+    label: "f32x4_horizontal_sum: matches scalar reference")
+
+  // ── 1b. f32x4_horizontal_sum: NaN in lane 1 → NaN ─────────────────────
+  let nan = nan_f64(scratch)
+  let _ = mem.store_f32(addr: f32_addr,      val: 1.0)
+  let _ = mem.store_f32(addr: f32_addr + 4,  val: nan)
+  let _ = mem.store_f32(addr: f32_addr + 8,  val: 3.0)
+  let _ = mem.store_f32(addr: f32_addr + 12, val: 4.0)
+  let nan_sum = simd.f32x4_horizontal_sum(addr: f32_addr)
+  test_assert.assert_true(cond: nan_sum !=. nan_sum,
+    label: "f32x4_horizontal_sum: NaN in lane propagates to NaN result")
+
+  // ── 2. i32x4_horizontal_max: simple {1, 7, 3, 5} → 7 ──────────────────
+  let _ = mem.store_i32(addr: i32_addr,      val: 1)
+  let _ = mem.store_i32(addr: i32_addr + 4,  val: 7)
+  let _ = mem.store_i32(addr: i32_addr + 8,  val: 3)
+  let _ = mem.store_i32(addr: i32_addr + 12, val: 5)
+  let mx = simd.i32x4_horizontal_max(addr: i32_addr)
+  test_assert.assert_eq_i64(actual: mx, expected: 7,
+    label: "i32x4_horizontal_max: {1,7,3,5} == 7")
+
+  // ── 2b. i32x4_horizontal_max: signed lanes (verify sign-extension on
+  //        load — -1 must compare greater than i32::MIN, not less). ──────
+  let _ = mem.store_i32(addr: i32_addr,      val: 0 - 2147483648)
+  let _ = mem.store_i32(addr: i32_addr + 4,  val: 0 - 1)
+  let _ = mem.store_i32(addr: i32_addr + 8,  val: 0 - 2147483647)
+  let _ = mem.store_i32(addr: i32_addr + 12, val: 0 - 2147483647)
+  let mx_signed = simd.i32x4_horizontal_max(addr: i32_addr)
+  test_assert.assert_eq_i64(actual: mx_signed, expected: 0 - 1,
+    label: "i32x4_horizontal_max: signed lanes (max is -1)")
+
+  // ── 3. f64x2_horizontal_min: simple {2.5, 1.25} → 1.25 ────────────────
+  let _ = mem.store_f64(addr: f64_addr,     val: 2.5)
+  let _ = mem.store_f64(addr: f64_addr + 8, val: 1.25)
+  let mn = simd.f64x2_horizontal_min(addr: f64_addr)
+  test_assert.assert_true(cond: mn ==. 1.25,
+    label: "f64x2_horizontal_min: {2.5, 1.25} == 1.25")
+
+  // Scalar reference: smaller of the two f64s, bit-for-bit.
+  let l0 = mem.load_f64(addr: f64_addr)
+  let l1 = mem.load_f64(addr: f64_addr + 8)
+  let ref_min = if l0 <. l1 then l0 else l1 end
+  test_assert.assert_true(cond: mn ==. ref_min,
+    label: "f64x2_horizontal_min: matches scalar reference")
+
+  // ── 3b. f64x2_horizontal_min: NaN in lane 0 → NaN ─────────────────────
+  let _ = mem.store_f64(addr: f64_addr,     val: nan)
+  let _ = mem.store_f64(addr: f64_addr + 8, val: 1.0)
+  let nan_min = simd.f64x2_horizontal_min(addr: f64_addr)
+  test_assert.assert_true(cond: nan_min !=. nan_min,
+    label: "f64x2_horizontal_min: NaN in lane propagates to NaN result")
+
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end
