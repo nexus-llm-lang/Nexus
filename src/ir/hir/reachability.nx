@@ -15,7 +15,7 @@
  * import the public API directly (collect_reachable, filter_reachable_functions,
  * collect_calls_stmts).
  */
-import { HirStmt, HirStmtKind, HirExpr, HirExprKind, HirCallArg, HirNamedExpr, HirMatchCase, HirFunction, HirHandlerArm, HirHandlerBinding, HirHandlerBindingEntry, EagerBody, LazyBody } from "src/ir/hir_types.nx"
+import { HirStmt, HirStmtKind, HirExpr, HirExprKind, HirCallArg, HirNamedExpr, HirMatchCase, HirFunction, HirHandlerArm, HirHandlerBinding, HirHandlerBindingEntry, HirExternal, EagerBody, LazyBody } from "src/ir/hir_types.nx"
 import * as str from "std:str"
 import { StrMap }, * as smap from "src/common/strmap.nx"
 
@@ -32,6 +32,13 @@ let rev_hir_function = fn (lst: [HirFunction], out: [HirFunction]) -> [HirFuncti
   match lst do
     | [] -> return out
     | x :: rest -> return rev_hir_function(lst: rest, out: x :: out)
+  end
+end
+
+let rev_hir_external = fn (lst: [HirExternal], out: [HirExternal]) -> [HirExternal] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_hir_external(lst: rest, out: x :: out)
   end
 end
 
@@ -198,6 +205,20 @@ export let collect_reachable = fn (functions: [HirFunction], handler_bindings: [
   return reachable_go(worklist, visited: [], seen: seen0, func_index, handler_bindings)
 end
 
+/** Like `collect_reachable` but skips the `wasi_thread_start` codegen anchor */
+/** seed (issue nexus-g6qr). Driver post-processing uses this variant to */
+/** decide whether the WASI-threads callback is actually used; importing */
+/** `std:lazy` without invoking `lazy.spawn` should not drag in the */
+/** `lazy_run_task`/`force_closure` chain that wasmtime cannot instantiate. */
+export let collect_reachable_no_thread_start = fn (functions: [HirFunction], handler_bindings: [HirHandlerBindingEntry]) -> [string] do
+  let handler_seeds = collect_handler_seeds(bindings: handler_bindings, acc: [])
+  let trampoline_seeds = collect_trampoline_seeds(functions, acc: [])
+  let func_index = build_func_index(functions, acc: smap.empty())
+  let seen0: StrMap<i64> = smap.empty()
+  let worklist = concat_str_lists(a: ["main"], b: concat_str_lists(a: handler_seeds, b: trampoline_seeds))
+  return reachable_go(worklist, visited: [], seen: seen0, func_index, handler_bindings)
+end
+
 /** name → defining function, so worklist steps are a hash lookup rather than */
 /** an O(|functions|) list scan. Later entries shadow earlier ones; the */
 /** compiler has already rejected genuine duplicate definitions upstream. */
@@ -226,6 +247,31 @@ let collect_intrinsic_seeds = fn (functions: [HirFunction], acc: [string]) -> [s
         return collect_intrinsic_seeds(functions: rest, acc: n :: acc)
       end
       return collect_intrinsic_seeds(functions: rest, acc)
+  end
+end
+
+/** Subset of `collect_intrinsic_seeds` excluding the `wasi_thread_start` */
+/** anchor; used by `collect_reachable_no_thread_start`. */
+let collect_trampoline_seeds = fn (functions: [HirFunction], acc: [string]) -> [string] do
+  match functions do
+    | [] -> return acc
+    | HirFunction(name: n, type_params: _, params: _, ret_type: _, _) :: rest ->
+      if str_ends_with_trampoline_body(s: n) then
+        return collect_trampoline_seeds(functions: rest, acc: n :: acc)
+      end
+      return collect_trampoline_seeds(functions: rest, acc)
+  end
+end
+
+/** True when any canonical name in `names` ends with `#lazy_spawn`. The driver */
+/** uses this as the proxy for "this program needs WASI-threads plumbing", */
+/** flipping post-`iterative_resolve` DCE on or off (issue nexus-g6qr). */
+export let any_canonical_lazy_spawn = fn (names: [string]) -> bool do
+  match names do
+    | [] -> return false
+    | n :: rest ->
+      if str_ends_with_suffix(s: n, suffix: "#lazy_spawn") then return true end
+      return any_canonical_lazy_spawn(names: rest)
   end
 end
 
@@ -344,6 +390,29 @@ let filter_reachable_functions_go = fn (functions: [HirFunction], reachable: [st
         return filter_reachable_functions_go(functions: rest, reachable, acc: f :: acc)
       else
         return filter_reachable_functions_go(functions: rest, reachable, acc)
+      end
+  end
+end
+
+/** Filter externals down to those whose canonical name appears in `reachable`. */
+/** `reachable` is produced by `collect_reachable`, which `visited`s every name */
+/** off the worklist — external callees included — so set membership suffices. */
+/** Unreachable externals would otherwise emit wasm imports that no caller */
+/** references (issue nexus-g6qr), preventing wasmtime instantiation when the */
+/** import resolver can't satisfy the spurious declaration. */
+export let filter_reachable_externals = fn (externals: [HirExternal], reachable: [string]) -> [HirExternal] do
+  return filter_reachable_externals_go(externals, reachable, acc: [])
+end
+
+let filter_reachable_externals_go = fn (externals: [HirExternal], reachable: [string], acc: [HirExternal]) -> [HirExternal] do
+  match externals do
+    | [] -> return rev_hir_external(lst: acc, out: [])
+    | e :: rest ->
+      let HirExternal(name: n, wasm_module: _, wasm_name: _, type_params: _, params: _, ret_type: _, throw_row: _) = e
+      if str_in_list(s: n, xs: reachable) then
+        return filter_reachable_externals_go(externals: rest, reachable, acc: e :: acc)
+      else
+        return filter_reachable_externals_go(externals: rest, reachable, acc)
       end
   end
 end
