@@ -2403,14 +2403,64 @@ let find_func_by_suffix = fn (funcs: [LirFunction], map: &HashMap, suffix: strin
   end
 end
 
+/// True when `main` in the program is declared with one or more params
+/// (e.g. `main(args: [string])`). The wasi_run wrapper must supply an
+/// argument before `call main` in that case (issue nexus-6z4h).
+let program_main_has_args = fn (funcs: [LirFunction]) -> bool do
+  match funcs do
+    | [] -> return false
+    | LirFunction(name: n, params: ps, ret_type: _, body: _, ret: _, span: _) :: rest ->
+      if n == "main" then
+        match ps do
+          | [] -> return false
+          | _ :: _ -> return true
+        end
+      end
+      return program_main_has_args(funcs: rest)
+  end
+end
+
 let compile_wasi_run_wrapper = fn (main_idx: i64, main_ret_type: TypeExpr,
-    argv_idx: i64) -> %ByteBuffer throws { CodegenError } do
+    argv_idx: i64, synth_empty_argv: bool) -> %ByteBuffer throws { CodegenError } do
   let %body = bb.empty()
-  let %body = bb.push_uleb128(buf: %body, val: 0)
-  // If argv_idx >= 0, main takes args: call argv() first, pass result to main
+  // Locals: one i32 for the synthesised Nil pointer when synthesising, else 0.
+  let %body = if synth_empty_argv then
+    let %body = bb.push_uleb128(buf: %body, val: 1)
+    let %body = bb.push_uleb128(buf: %body, val: 1)
+    bb.push_byte(buf: %body, byte: vt_i32)
+  else
+    bb.push_uleb128(buf: %body, val: 0)
+  end
+  // If argv_idx >= 0, main takes args: call argv() first, pass result to main.
+  // Else if synth_empty_argv, bump-allocate a 1-word Nil object and pass
+  // its pointer (extended to i64) as the args list. Else: nothing pushed.
   let %body = if argv_idx >= 0 then
     let %body = bb.push_byte(buf: %body, byte: op_call)
     bb.push_uleb128(buf: %body, val: argv_idx)
+  else if synth_empty_argv then
+    // obj_ptr = global.get G0; local.tee 0; G0 = ptr + 8
+    let %body = bb.push_byte(buf: %body, byte: op_global_get)
+    let %body = bb.push_uleb128(buf: %body, val: heap_global_idx)
+    let %body = bb.push_byte(buf: %body, byte: op_local_tee)
+    let %body = bb.push_uleb128(buf: %body, val: 0)
+    let %body = bb.push_byte(buf: %body, byte: op_i32_const)
+    let %body = bb.push_sleb128(buf: %body, val: 8)
+    let %body = bb.push_byte(buf: %body, byte: op_i32_add)
+    let %body = bb.push_byte(buf: %body, byte: op_global_set)
+    let %body = bb.push_uleb128(buf: %body, val: heap_global_idx)
+    let %body = emit_memory_grow_check(buf: %body, skip: false)
+    // mem[obj_ptr] = Nil tag (i64)
+    let nil_tag = wdefs.constructor_tag(name: "Nil", arity: 0)
+    let %body = bb.push_byte(buf: %body, byte: op_local_get)
+    let %body = bb.push_uleb128(buf: %body, val: 0)
+    let %body = bb.push_byte(buf: %body, byte: op_i64_const)
+    let %body = bb.push_sleb128(buf: %body, val: nil_tag)
+    let %body = bb.push_byte(buf: %body, byte: op_i64_store)
+    let %body = wdefs.emit_memarg_i64(buf: %body, offset: 0)
+    // Push obj_ptr (extended to i64) as the main argument.
+    let %body = bb.push_byte(buf: %body, byte: op_local_get)
+    let %body = bb.push_uleb128(buf: %body, val: 0)
+    bb.push_byte(buf: %body, byte: op_i64_extend_i32_u)
   else %body end
   let %body = bb.push_byte(buf: %body, byte: op_call)
   let %body = bb.push_uleb128(buf: %body, val: main_idx)
@@ -2848,7 +2898,12 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
       let bt_capture_idx_global = find_bt_capture_idx(exts)
       let has_eh = wcollect.program_needs_eh(funcs)
       let has_ss = wcollect.program_needs_stack_switching(funcs)
-      let heap_enabled = wcollect.program_uses_heap(funcs)
+      // When `main(args)` is declared but `argv` isn't compiled in (no
+      // `import "std:proc"`), the wasi_run wrapper synthesises an empty
+      // Nil-shaped list on the bump heap — force heap_enabled so G0 and
+      // own memory exist (issue nexus-6z4h).
+      let main_has_args = program_main_has_args(funcs)
+      let heap_enabled = wcollect.program_uses_heap(funcs) || main_has_args
       let has_cabi = wcollect.needs_cabi_realloc(exts)
       let n_cabi = if has_cabi then 1 else 0 end
       // alloc_mode (legacy — still stored in CodegenCtx but no longer branched
@@ -3050,7 +3105,11 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
         let %cabi_body = compile_cabi_realloc(heap_base)
         append_body_to_buf(buf: %code, body: %cabi_body)
       else %code end
-      let %wasi_body = compile_wasi_run_wrapper(main_idx, main_ret_type: main_ret, argv_idx)
+      // Synthesise an empty argv only when main has args but the program
+      // doesn't pull in `argv` (issue nexus-6z4h). Requires heap_enabled
+      // (forced above) so G0 + own memory exist.
+      let synth_empty_argv = main_has_args && argv_idx < 0 && heap_enabled
+      let %wasi_body = compile_wasi_run_wrapper(main_idx, main_ret_type: main_ret, argv_idx, synth_empty_argv)
       let %code = append_body_to_buf(buf: %code, body: %wasi_body)
       let %m = wdefs.emit_section(buf: %m, id: sec_code, content: %code)
 
