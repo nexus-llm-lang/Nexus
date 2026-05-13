@@ -32,12 +32,12 @@ end
 
 let desugar_list_pat = fn (pats: [SpannedPattern], sp: Span) -> SpannedPattern do
   match pats do
-    | [] -> return SpannedPattern(node: PatConstructor(name: Unqual(name: "Nil"), fields: []), span: sp)
+    | [] -> return SpannedPattern(node: PatConstructor(name: Unqual(name: "Nil"), fields: [], sigil: SigilImmutable), span: sp)
     | p :: rest ->
       let tail = desugar_list_pat(pats: rest, sp)
       let fields = [CtorPatternField(name: "v", pattern: p),
         CtorPatternField(name: "rest", pattern: tail)]
-      return SpannedPattern(node: PatConstructor(name: Unqual(name: "Cons"), fields), span: sp)
+      return SpannedPattern(node: PatConstructor(name: Unqual(name: "Cons"), fields, sigil: SigilImmutable), span: sp)
   end
 end
 
@@ -51,15 +51,21 @@ let parse_atom_pattern = fn (toks: [SpannedToken]) -> ParsedPat throws { ParseEr
         return ParsedPat(pat: SpannedPattern(node: PatWildcard, span: sp), rest: pcore.skip(toks))
       end
       let r_id = pcore.skip(toks)
-      return try_qualified_ctor_pat(toks: r_id, sp, prefix: n, fallback_is_var: true)
+      return try_qualified_ctor_pat(toks: r_id, sp, prefix: n, fallback_is_var: true, sigil: SigilImmutable)
     | TkUident(name: n) ->
       let r = pcore.skip(toks)
-      return try_qualified_ctor_pat(toks: r, sp, prefix: n, fallback_is_var: false)
+      return try_qualified_ctor_pat(toks: r, sp, prefix: n, fallback_is_var: false, sigil: SigilImmutable)
     | TkTilde ->
       let ParsedIdent(name: n, rest: r2) = pcore.expect_ident(toks: pcore.skip(toks))
       return ParsedPat(pat: SpannedPattern(node: PatVariable(name: n, sigil: SigilMutable), span: sp), rest: r2)
     | TkPercent ->
-      let ParsedIdent(name: n, rest: r2) = pcore.expect_ident(toks: pcore.skip(toks))
+      // %Ctor(...) linear constructor pattern vs %ident linear variable pattern
+      let r = pcore.skip(toks)
+      if let TkUident(name: cn) = pcore.peek_token(toks: r) then
+        let r2 = pcore.skip(toks: r)
+        return try_qualified_ctor_pat(toks: r2, sp, prefix: cn, fallback_is_var: false, sigil: SigilLinear)
+      end
+      let ParsedIdent(name: n, rest: r2) = pcore.expect_ident(toks: r)
       return ParsedPat(pat: SpannedPattern(node: PatVariable(name: n, sigil: SigilLinear), span: sp), rest: r2)
     | TkAt ->
       let ParsedIdent(name: n, rest: r2) = pcore.expect_ident(toks: pcore.skip(toks))
@@ -90,7 +96,7 @@ let parse_atom_pattern = fn (toks: [SpannedToken]) -> ParsedPat throws { ParseEr
       // [p1, p2, ...] is sugar for nested Cons/[]
       let r = pcore.skip(toks)
       if pcore.is_tok(toks: r, expected: "]") then
-        return ParsedPat(pat: SpannedPattern(node: PatConstructor(name: Unqual(name: "Nil"), fields: []), span: sp), rest: pcore.skip(toks: r))
+        return ParsedPat(pat: SpannedPattern(node: PatConstructor(name: Unqual(name: "Nil"), fields: [], sigil: SigilImmutable), span: sp), rest: pcore.skip(toks: r))
       end
       let ParsedListPats(pats, rest: r2) = parse_list_pats(toks: r, acc: [])
       let r3 = pcore.expect(toks: r2, expected: "]")
@@ -106,7 +112,7 @@ end
 
 /** Try to parse a qualified constructor pattern (prefix.Ctor). If dot+uppercase found, */
 /** returns the qualified constructor. Otherwise falls back to variable or bare constructor. */
-let try_qualified_ctor_pat = fn (toks: [SpannedToken], sp: Span, prefix: string, fallback_is_var: bool) -> ParsedPat throws { ParseError } do
+let try_qualified_ctor_pat = fn (toks: [SpannedToken], sp: Span, prefix: string, fallback_is_var: bool, sigil: Sigil) -> ParsedPat throws { ParseError } do
   match pcore.peek_token(toks) do
     | TkDot ->
       let r_dot = pcore.skip(toks)
@@ -114,21 +120,21 @@ let try_qualified_ctor_pat = fn (toks: [SpannedToken], sp: Span, prefix: string,
         | TkUident(name: uname) ->
           let qname = prefix ++ "." ++ uname
           let r_u = pcore.skip(toks: r_dot)
-          return parse_ctor_pattern_with_name(toks: r_u, sp, name: qname)
+          return parse_ctor_pattern_with_name(toks: r_u, sp, name: qname, sigil)
         | _ ->
-          return pat_fallback(toks, sp, name: prefix, is_var: fallback_is_var)
+          return pat_fallback(toks, sp, name: prefix, is_var: fallback_is_var, sigil)
       end
     | _ ->
-      return pat_fallback(toks, sp, name: prefix, is_var: fallback_is_var)
+      return pat_fallback(toks, sp, name: prefix, is_var: fallback_is_var, sigil)
   end
 end
 
 /** Fallback: either variable pattern (lowercase ident) or bare constructor (uppercase ident). */
-let pat_fallback = fn (toks: [SpannedToken], sp: Span, name: string, is_var: bool) -> ParsedPat throws { ParseError } do
+let pat_fallback = fn (toks: [SpannedToken], sp: Span, name: string, is_var: bool, sigil: Sigil) -> ParsedPat throws { ParseError } do
   if is_var then
     return ParsedPat(pat: SpannedPattern(node: PatVariable(name, sigil: SigilImmutable), span: sp), rest: toks)
   else
-    return parse_ctor_pattern_with_name(toks, sp, name)
+    return parse_ctor_pattern_with_name(toks, sp, name, sigil)
   end
 end
 
@@ -149,23 +155,23 @@ let is_ctor_wildcard_all = fn (toks: [SpannedToken]) -> bool do
 end
 
 /** Parse constructor pattern body given an already-parsed name (handles TkUnit/TkLParen/bare). */
-let parse_ctor_pattern_with_name = fn (toks: [SpannedToken], sp: Span, name: string) -> ParsedPat throws { ParseError } do
+let parse_ctor_pattern_with_name = fn (toks: [SpannedToken], sp: Span, name: string, sigil: Sigil) -> ParsedPat throws { ParseError } do
   let rdr = rdr.rdr_from_dotted(s: name)
   match pcore.peek_token(toks) do
     | TkUnit ->
-      return ParsedPat(pat: SpannedPattern(node: PatConstructor(name: rdr, fields: []), span: sp), rest: pcore.skip(toks))
+      return ParsedPat(pat: SpannedPattern(node: PatConstructor(name: rdr, fields: [], sigil), span: sp), rest: pcore.skip(toks))
     | TkLParen ->
       let r2 = pcore.skip(toks)
       if is_ctor_wildcard_all(toks: r2) then
         let r3 = pcore.skip(toks: r2)
         let r4 = pcore.expect(toks: r3, expected: ")")
-        return ParsedPat(pat: SpannedPattern(node: PatConstructorWildcard(name: rdr), span: sp), rest: r4)
+        return ParsedPat(pat: SpannedPattern(node: PatConstructorWildcard(name: rdr, sigil), span: sp), rest: r4)
       end
       let ParsedCtorPatFields(fields: fs, rest: r3) = parse_ctor_pat_fields(toks: r2, acc: [])
       let r4 = pcore.expect(toks: r3, expected: ")")
-      return ParsedPat(pat: SpannedPattern(node: PatConstructor(name: rdr, fields: fs), span: sp), rest: r4)
+      return ParsedPat(pat: SpannedPattern(node: PatConstructor(name: rdr, fields: fs, sigil), span: sp), rest: r4)
     | _ ->
-      return ParsedPat(pat: SpannedPattern(node: PatConstructor(name: rdr, fields: []), span: sp), rest: toks)
+      return ParsedPat(pat: SpannedPattern(node: PatConstructor(name: rdr, fields: [], sigil), span: sp), rest: toks)
   end
 end
 
@@ -180,7 +186,7 @@ export let parse_pattern = fn (toks: [SpannedToken]) -> ParsedPat throws { Parse
       let SpannedPattern(node: _, span: sp) = lhs
       let fields = [CtorPatternField(name: "v", pattern: lhs),
         CtorPatternField(name: "rest", pattern: rhs)]
-      return ParsedPat(pat: SpannedPattern(node: PatConstructor(name: Unqual(name: "Cons"), fields), span: sp), rest: r2)
+      return ParsedPat(pat: SpannedPattern(node: PatConstructor(name: Unqual(name: "Cons"), fields, sigil: SigilImmutable), span: sp), rest: r2)
     | _ -> return ParsedPat(pat: lhs, rest: r)
   end
 end
