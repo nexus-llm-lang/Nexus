@@ -2064,9 +2064,58 @@ let emit_arm_dispatch = fn (buf: %ByteBuffer, arm_fn: string, ctx: CodegenCtx) -
   return bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
 end
 
+// nexus-eo09: when the body of a LirStmtIfReturn already ends with a
+// LirStmtIfReturn whose then_ret matches the outer's then_ret, the outer's
+// trailing op_return would fire with a STALE value on fall-through paths
+// inside the inner conditional. The atom matches because lir.nx hoisted the
+// inner's then_ret up to the outer wrapper via fallback_ret_from_*. Detect
+// the hoist at codegen time and skip the trailing op_return so control falls
+// through naturally to the next branch / function tail.
+let lir_atom_eq = fn (a: LirAtom, b: LirAtom) -> bool throws { CodegenError } do
+  match a do
+    | LirAtomVar(name: na, typ: _) ->
+      match b do
+        | LirAtomVar(name: nb, typ: _) -> return na == nb
+        | _ -> return false
+      end
+    | LirAtomInt(val: va) ->
+      match b do | LirAtomInt(val: vb) -> return va == vb | _ -> return false end
+    | LirAtomBool(val: va) ->
+      match b do | LirAtomBool(val: vb) -> return va == vb | _ -> return false end
+    | LirAtomChar(val: va) ->
+      match b do | LirAtomChar(val: vb) -> return va == vb | _ -> return false end
+    | LirAtomString(val: va) ->
+      match b do | LirAtomString(val: vb) -> return va == vb | _ -> return false end
+    | LirAtomFloat(val: va) ->
+      match b do | LirAtomFloat(val: vb) -> return va == vb | _ -> return false end
+    | LirAtomUnit ->
+      match b do | LirAtomUnit -> return true | _ -> return false end
+  end
+end
+
+// True iff the last stmt of `stmts` is a LirStmtIfReturn whose `then_ret`
+// atom equals `outer_ret` — i.e., the outer wrapper's return value was
+// hoisted from this inner conditional via lir.nx fallback_ret_from_*.
+let body_ends_with_hoisted_inner = fn (stmts: [LirStmt], outer_ret: LirAtom) -> bool throws { CodegenError } do
+  match stmts do
+    | [] -> return false
+    | [LirStmtIfReturn(cond: _, then_body: _, then_ret: tr, else_body: _, else_ret: _, ret_type: _)] ->
+      return lir_atom_eq(a: tr, b: outer_ret)
+    | [_] -> return false
+    | _ :: rest -> return body_ends_with_hoisted_inner(stmts: rest, outer_ret)
+  end
+end
+
 let emit_if_return_unconditional = fn (buf: %ByteBuffer, then_body: [LirStmt], then_ret: LirAtom,
     ret_type: TypeExpr, ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer throws { CodegenError } do
   let %buf = emit_stmts(stmts: then_body, %buf, ctx, in_try, tcmc)
+  // nexus-eo09: skip the redundant op_return if the body already ends with a
+  // LirStmtIfReturn whose then_ret is the SAME atom we'd be returning. The
+  // inner's op_return handles the genuine path; on fall-through, the outer's
+  // op_return would fire with a stale (uninitialised) value.
+  if body_ends_with_hoisted_inner(stmts: then_body, outer_ret: then_ret) then
+    return %buf
+  end
   return emit_return_with_tcmc(%buf, ret_val: then_ret, ret_type, ctx, tcmc)
 end
 
@@ -2077,14 +2126,20 @@ let emit_if_return_conditional = fn (buf: %ByteBuffer, cond: LirAtom, then_body:
   let %buf = emit_coercion(from_type: wdefs.atom_type(atom: cond), to_type: TyBool, %buf)
   let %buf = bb.push_bytes(%buf, bytes: [op_if, bt_void])
   let %buf = emit_stmts(stmts: then_body, %buf, ctx, in_try, tcmc)
-  let %buf = emit_return_with_tcmc(%buf, ret_val: then_ret, ret_type, ctx, tcmc)
+  // nexus-eo09: see comment in emit_if_return_unconditional. Same hoist
+  // hazard applies inside the then-branch of a conditional IfReturn.
+  let skip_then_ret = body_ends_with_hoisted_inner(stmts: then_body, outer_ret: then_ret)
+  let %buf = if skip_then_ret then %buf
+             else emit_return_with_tcmc(%buf, ret_val: then_ret, ret_type, ctx, tcmc) end
   let has_else = list.length(xs: else_body) > 0
   let has_else_ret = if let Some(_) = else_ret then true else false end
   let %buf = if has_else || has_else_ret then
     let %buf = bb.push_byte(%buf, byte: op_else)
     let %buf = emit_stmts(stmts: else_body, %buf, ctx, in_try, tcmc)
     match else_ret do
-      | Some(val: a) -> emit_return_with_tcmc(%buf, ret_val: a, ret_type, ctx, tcmc)
+      | Some(val: a) ->
+        let er_skip = body_ends_with_hoisted_inner(stmts: else_body, outer_ret: a)
+        if er_skip then %buf else emit_return_with_tcmc(%buf, ret_val: a, ret_type, ctx, tcmc) end
       | None -> %buf
     end
   else %buf end
