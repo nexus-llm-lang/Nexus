@@ -28,7 +28,8 @@ The standard library is the `std` package, rooted at `nxlib/stdlib/`. Every modu
 | `"std:result"` | pure | `Result<T, E>` = `Ok(val) \| Err(err)` |
 | `"std:tuple"` | pure | `Pair<A, B>(left, right)`, `fst`, `snd` |
 | `"std:exn"` | pure | Exception helpers, `backtrace()` |
-| `"std:lazy"` | pure | `Lazy<T>`, host-side lazy force |
+| `"std:lazy"` | pure | `Lazy<T>` combinators — `force_all` (real parallel via host_spawn/host_join), `race`/`cancel`/`detach` (sequential pending first-of/drop primitives) |
+| `"std:lazy_host"` | FFI / WASI threads | `host_spawn(@T) -> %Task<T>`, `host_join(%Task<T>) -> T`, `host_force` — lower-level parallel-lazy primitives backing `std:lazy.force_all` |
 | `"std:core"` | pure | `id` (polymorphic identity) |
 | `"std:json"` | pure | `parse`, `serialize`, `get_field`, `JsonValue` algebra (`JsonInt`, `JsonString`, `JsonArray`, `JsonObject`, ...) |
 | `"std:simd"` | FFI | 128-bit SIMD intrinsics — lane-wise `i32x4`/`i64x2` `_add`/`_mul`, autovectorized `*_add_array`/`*_mul_array`/`*_sub_array`/`*_div_array` over `f32x4`/`f64x2`/`i32x4`/`i64x2`, plus `scalar_*_array` non-SIMD fallbacks |
