@@ -1,0 +1,1024 @@
+/**
+ * codegen/intrinsics: inline-emitted compiler intrinsics.
+ *
+ * Owns:
+ * - Memo target list extractors (extract_memo_names / extract_memo_slots),
+ *   the parallel-list form used by CodegenCtx
+ * - `is_intrinsic_external` / `get_intrinsic_wasm_name` (recognition + dispatch
+ *   key for the `nexus:intrinsic` namespace) + `filter_intrinsic_externals`
+ *   (the import-section elision filter)
+ * - `is_closure_lift` name classifier
+ * - `wasi_thread_start_export` (locates the optional `wasi_thread_start`
+ *   internal for the export section)
+ * - `nexus:intrinsic` op emitters: bump-allocator (mark / reset / swap /
+ *   alloc-raw), raw memory load/store (mem-load-* / mem-store-* / mem-size /
+ *   mem-grow), atomics (rmw-add-i32 / load-i32 / store-i32 / cmpxchg-i32 /
+ *   wait32 / notify), width casts (cast-to-i32 / cast-to-i64), lazy passthrough
+ *   (thunk-addr / value-of-i64), backtrace stubs (bt-depth / bt-frame /
+ *   capture-backtrace), array intrinsics (__array_get / __array_set /
+ *   array-length), f64 unary math (sqrt / floor / ceil / abs), SIMD lane
+ *   binops (one-shot + autovectorized array form)
+ * - `nexus:runtime/sched` inline intrinsics (sched-set-next, sched-spawn)
+ *   and the predicates / lookups that support them
+ *
+ * Does not own:
+ * - `emit_intrinsic` dispatcher itself — stays in codegen.nx because the
+ *   `force-closure` arm needs `lookup_closure_type_idx_pairs` from the
+ *   closure-helpers band, which is interleaved with the emit_expr chain
+ * - `emit_force_closure` — same reason; lives next to the closure helpers
+ * - Memo-cache target planning (see src/backend/memo_plan.nx)
+ * - Atom emission (see codegen/atom.nx)
+ *
+ * Every emitter here is reachable from emit_intrinsic / emit_call (codegen.nx)
+ * by a name match against the LirExternal wasm_name; none recurse through
+ * emit_expr.
+ */
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { LirFunction, LirExternal, LirCallArg, LirAtom } from "src/ir/lir/types.nx"
+import { CodegenCtx, ExportNameIdx,
+         heap_global_idx,
+         op_call,
+         op_ref_func, op_cont_new, op_table_set,
+         op_local_get, op_local_set, op_local_tee, op_global_get, op_global_set,
+         op_i32_load, op_i64_load, op_f32_load, op_f64_load, op_i32_load8_u,
+         op_i32_store, op_i64_store, op_f32_store, op_f64_store, op_i32_store8,
+         op_i32_const, op_i64_const,
+         op_i32_add, op_i32_mul,
+         op_i64_add, op_i64_sub, op_i64_and,
+         op_i64_or, op_i64_shl, op_i64_shr_u,
+         op_i32_wrap_i64, op_i64_extend_i32_s, op_i64_extend_i32_u,
+         op_f64_promote_f32, op_f32_demote_f64,
+         op_memory_size, op_memory_grow,
+         op_simd_prefix,
+         op_simd_v128_load, op_simd_v128_store,
+         op_block, op_loop, op_br, op_br_if, op_end, op_drop,
+         bt_void }, * as wdefs from "src/backend/wasm/defs.nx"
+import { emit_atom, emit_atomic_bump } from "src/backend/codegen/atom.nx"
+import { HashMap } from "std:hashmap"
+import { MemoTarget } from "src/backend/codegen/memo.nx"
+import { Some, None } from "std:option"
+import * as str from "std:str"
+import { SymbolNotFound, CodegenError } from "src/common/error.nx"
+
+// ─── Memo target list extractors (nexus-e6uh) ──────────────────────────────
+// CodegenCtx stores name/slot lists in parallel rather than the structured
+// MemoTarget type so the per-call lookup stays a tight string compare without
+// re-deconstructing a record on every call site. These extractors split the
+// MemoTarget list once at module-assembly time.
+
+export let extract_memo_names = fn (targets: [MemoTarget], acc: [string]) -> [string] do
+  match targets do
+    | [] -> return reverse_str_list(lst: acc, out: [])
+    | MemoTarget(name: n, slot: _) :: rest ->
+      return extract_memo_names(targets: rest, acc: n :: acc)
+  end
+end
+
+export let extract_memo_slots = fn (targets: [MemoTarget], acc: [i64]) -> [i64] do
+  match targets do
+    | [] -> return reverse_i64_list(lst: acc, out: [])
+    | MemoTarget(name: _, slot: s) :: rest ->
+      return extract_memo_slots(targets: rest, acc: s :: acc)
+  end
+end
+
+let reverse_str_list = fn (lst: [string], out: [string]) -> [string] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_str_list(lst: rest, out: x :: out)
+  end
+end
+
+let reverse_i64_list = fn (lst: [i64], out: [i64]) -> [i64] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_i64_list(lst: rest, out: x :: out)
+  end
+end
+
+// ─── Inline-emitted runtime intrinsics ──────────────────────────────────────
+// All compiler intrinsics — raw memory load/store, atomic ops, f64 ops, integer
+// width casts, SIMD lane ops, the bump allocator's mark/reset/swap/alloc-raw,
+// and the lazy `@`-thunk type-puns — live under one wasm-module name,
+// `nexus:intrinsic` (declared by the stdlib's intrinsic decl files via
+// `import external "nexus:intrinsic"`). Their externals are emitted as inline
+// WASM (load/store, f64 unary, etc.), never as host calls, and are filtered out
+// of the import section entirely (`filter_intrinsic_externals`). Recognition,
+// the import-filter test, and codegen dispatch all key on the `wasm_name`
+// string (the kebab-cased FFI name, e.g. `mem-load-i32`, `heap-mark`,
+// `f64-sqrt`, `force-closure`).
+export let is_intrinsic_external = fn (ext: LirExternal) -> bool do
+  match ext do
+    | LirExternal(name: _, wasm_module: m, wasm_name: _, params: _, ret_type: _, throw_row: _) ->
+      return m == "nexus:intrinsic"
+  end
+end
+
+/** Returns the `wasm_name` of `func` if it resolves to a `nexus:intrinsic` */
+/** external, `""` otherwise. The returned string is the dispatch key consumed */
+/** by `emit_intrinsic` (e.g. `"mem-load-i32"`, `"heap-mark"`, `"f64-sqrt"`, */
+/** `"force-closure"`). */
+export let get_intrinsic_wasm_name = fn (func: string, exts: [LirExternal]) -> string do
+  match wdefs.find_external(name: func, exts) do
+    | None -> ""
+    | Some(val: ext) ->
+      if !is_intrinsic_external(ext) then return "" end
+      match ext do
+        | LirExternal(name: _, wasm_module: _, wasm_name: wn, params: _, ret_type: _, throw_row: _) -> wn
+      end
+  end
+end
+
+/** True when name corresponds to a lifted lambda (`__closure_N`). Matches both */
+/** the bare form and the canonical-path form (`<sanitized-path>#__closure_N`) */
+/** because `lift_lambda` (mir.nx) names lambdas `__closure_N` but downstream */
+/** passes may prepend the source-file path to disambiguate cross-module */
+/** imports. Distinct from `is_closure_func`, which also matches inject bodies */
+/** and the sched trampoline — those need a function-table elem entry for */
+/** ref.func but follow their own (non-canonical-closure) signature. */
+export let is_closure_lift = fn (name: string) -> bool do
+  let nlen = str.length(s: name)
+  let bare = "__closure_"
+  let blen = str.length(s: bare)
+  if nlen >= blen then
+    if str.substring(s: name, start: 0, len: blen) == bare then return true end
+  end
+  let infix = "#__closure_"
+  let ilen = str.length(s: infix)
+  return nlen >= ilen && str.contains(s: name, sub: infix)
+end
+
+/** `__nx_sched_set_next(k)` is a compiler intrinsic that compiles to inline */
+/** `global.set ss_resume_slot_global_idx`. Routing it through a host call */
+/** trips wasmtime's CallThreadState chain when invoked inside a continuation */
+/** arm body (after suspend, before resume); inline emission sidesteps the */
+/** host-side trap-handler bookkeeping entirely. */
+export let is_sched_set_next = fn (func: string, exts: [LirExternal]) -> bool do
+  match wdefs.find_external(name: func, exts) do
+    | None -> false
+    | Some(val: LirExternal(name: _, wasm_module: m, wasm_name: wn, params: _, ret_type: _, throw_row: _)) ->
+      return m == "nexus:runtime/sched" && wn == "sched-set-next"
+  end
+end
+
+export let emit_sched_set_next = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_global_set)
+      return bb.push_uleb128(%buf, val: wdefs.ss_resume_slot_global_idx)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_sched_set_next", kind: "sched intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+/** `__nx_sched_spawn(thunk)` is a compiler intrinsic that turns a `@unit` thunk */
+/** into a fresh fiber: pushes the thunk onto the host's pending-thunk FIFO, */
+/** allocates a new cont_table slot, cont.new's the trampoline body for that */
+/** slot, and enqueues the slot in the run queue. The spawned fiber actually */
+/** starts running when the dispatcher dequeues the slot, resumes the cont, */
+/** and the trampoline pops the matching thunk and forces it. */
+export let is_sched_spawn = fn (func: string, exts: [LirExternal]) -> bool do
+  match wdefs.find_external(name: func, exts) do
+    | None -> false
+    | Some(val: LirExternal(name: _, wasm_module: m, wasm_name: wn, params: _, ret_type: _, throw_row: _)) ->
+      return m == "nexus:runtime/sched" && wn == "sched-spawn"
+  end
+end
+
+/** Look up a function by suffix match. Used to locate the sched trampoline */
+/** regardless of which package path (nxlib/stdlib/sched.nx vs an alias) the */
+/** stdlib was imported from. */
+let find_func_idx_by_suffix = fn (suffix: string, funcs: [LirFunction], internal_func_map: &HashMap) -> i64 throws { CodegenError } do
+  match funcs do
+    | [] -> return -1
+    | LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
+      let slen = str.length(s: n)
+      let suflen = str.length(s: suffix)
+      if slen >= suflen then
+        if str.substring(s: n, start: slen - suflen, len: suflen) == suffix then
+          return wdefs.lookup_func_fast(name: n, map: internal_func_map)
+        end
+      end
+      return find_func_idx_by_suffix(suffix, funcs: rest, internal_func_map)
+  end
+end
+
+/** Find a function index by source-qualified `#name` suffix match (mirrors */
+/// If the program defines `wasi_thread_start` (pulled in via `std:lazy` /
+/// `std:lazy_host`), it must be exported under exactly that name so wasi-threads
+/// workers can find it; its `(i32, i32) -> ()` signature is produced by the
+/// `lazy.nx` source. Returns a singleton `[ExportNameIdx]` or `[]`.
+export let wasi_thread_start_export = fn (funcs: [LirFunction], internal_func_map: &HashMap) -> [ExportNameIdx] throws { CodegenError } do
+  let bare = wdefs.lookup_func_fast(name: "wasi_thread_start", map: internal_func_map)
+  let idx = if bare >= 0 then bare else find_func_idx_by_suffix(suffix: "#wasi_thread_start", funcs, internal_func_map) end
+  if idx < 0 then return [] end
+  return [ExportNameIdx(name: "wasi_thread_start", index: idx)]
+end
+
+/** Find the import index for a sched runtime function by its wasm_name. Uses */
+/** linear scan over the externals list because hash lookup by Nexus FFI name */
+/** is fragile when several `nexus:runtime/sched` imports share a prefix. */
+/** Skips arena and intrinsic-sched externals to mirror `filter_intrinsic_externals` */
+/** — those entries are inlined and thus excluded from the wasm import section, */
+/** so they do not occupy index slots in the codegen's pre-merge function space. */
+export let find_sched_import_idx = fn (wn: string, exts: [LirExternal], idx: i64) -> i64 throws { CodegenError } do
+  match exts do
+    | [] -> return -1
+    | e :: rest ->
+      if is_intrinsic_external(ext: e) || is_intrinsic_sched_external(ext: e) then
+        return find_sched_import_idx(wn, exts: rest, idx)
+      end
+      match e do | LirExternal(name: _, wasm_module: m, wasm_name: w, params: _, ret_type: _, throw_row: _) ->
+        if m == "nexus:runtime/sched" && w == wn then return idx end
+        return find_sched_import_idx(wn, exts: rest, idx: idx + 1)
+      end
+  end
+end
+
+export let emit_sched_spawn = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let CodegenCtx(functions: fns, internal_func_map: ifm, ss_cont_type_idx: cti, _) = ctx
+      let exts = wdefs.ctx_externals(ctx)
+      // Push thunk to host pending-thunk queue
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let push_idx = find_sched_import_idx(wn: "sched-push-pending", exts, idx: 0)
+      if push_idx < 0 then
+        raise SymbolNotFound(name: "sched-push-pending", kind: "sched intrinsic", context: "spawn requires push_pending external")
+      end
+      let %buf = bb.push_byte(%buf, byte: op_call)
+      let %buf = bb.push_uleb128(%buf, val: push_idx)
+
+      // slot = next_alloc + 1 (skip past the captured-cont slot the surrounding
+      // InjectResume dispatcher just claimed for its own arm-call bookkeeping);
+      // next_alloc = slot + 1 so the dispatcher's post-arm `++` advances to a
+      // fresh free slot instead of overwriting our trampoline cont.
+      let slot_local = wdefs.ctx_temps_base(ctx) + 4
+      let %buf = bb.push_byte(%buf, byte: op_global_get)
+      let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 1)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i64_add, op_local_tee])
+      let %buf = bb.push_uleb128(%buf, val: slot_local)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 1)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i64_add, op_global_set])
+      let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+
+      // cont_table[slot] = cont.new(ref.func $trampoline)
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: slot_local)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let tramp_idx = find_func_idx_by_suffix(
+        suffix: "__nx_sched_trampoline_body",
+        funcs: fns,
+        internal_func_map: &ifm)
+      if tramp_idx < 0 then
+        raise SymbolNotFound(name: "__nx_sched_trampoline_body", kind: "sched intrinsic", context: "spawn requires sched.nx import")
+      end
+      let %buf = bb.push_byte(%buf, byte: op_ref_func)
+      let %buf = bb.push_uleb128(%buf, val: tramp_idx)
+      let %buf = bb.push_byte(%buf, byte: op_cont_new)
+      let %buf = bb.push_uleb128(%buf, val: cti)
+      let %buf = bb.push_byte(%buf, byte: op_table_set)
+      let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_table_idx)
+
+      // enqueue(slot)
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: slot_local)
+      let enqueue_idx = find_sched_import_idx(wn: "sched-enqueue", exts, idx: 0)
+      if enqueue_idx < 0 then
+        raise SymbolNotFound(name: "sched-enqueue", kind: "sched intrinsic", context: "spawn requires enqueue external")
+      end
+      let %buf = bb.push_byte(%buf, byte: op_call)
+      let %buf = bb.push_uleb128(%buf, val: enqueue_idx)
+      return %buf
+    | _ ->
+      raise SymbolNotFound(name: "__nx_sched_spawn", kind: "sched intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let filter_intrinsic_externals = fn (exts: [LirExternal]) -> [LirExternal] do
+  match exts do
+    | [] -> return []
+    | e :: rest ->
+      if is_intrinsic_external(ext: e) || is_intrinsic_sched_external(ext: e) then
+        return filter_intrinsic_externals(exts: rest)
+      else
+        return e :: filter_intrinsic_externals(exts: rest)
+      end
+  end
+end
+
+/** True if this `nexus:runtime/sched` external is fulfilled inline by a */
+/** compiler intrinsic, so the import entry must be elided from the final */
+/** import section. `sched-set-next` and `sched-spawn` qualify; the others */
+/** (enqueue, dequeue, push/pop_pending, queue-size) still go through the */
+/** host linker. */
+export let is_intrinsic_sched_external = fn (ext: LirExternal) -> bool do
+  match ext do
+    | LirExternal(name: _, wasm_module: m, wasm_name: wn, params: _, ret_type: _, throw_row: _) ->
+      if m != "nexus:runtime/sched" then return false end
+      return wn == "sched-set-next" || wn == "sched-spawn"
+  end
+end
+
+/** Emit inline WASM for the bump-allocator (arena) intrinsics. */
+/** */
+/** Since the allocator is now a single atomic bump pointer at linear-memory */
+/** cell `wdefs.heap_ptr_cell`, a region "mark" *is* the bump-pointer value: */
+/** `heap_mark` reads the cell, `heap_reset` stores a previous value back, */
+/** and `heap_swap` does both (returning the old). All three operate */
+/** atomically; everything that allocates bumps the same cell, so a reset */
+/** reclaims it all at once. */
+export let emit_heap_mark = fn (buf: %ByteBuffer) -> %ByteBuffer do
+  // i32.atomic.load cell → i64.extend_i32_u
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: wdefs.heap_ptr_cell)
+  let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_load, offset: 0)
+  return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+end
+
+export let emit_heap_reset = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      // i32.atomic.store cell <- i32.wrap_i64(mark)   (pops [addr, value])
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: wdefs.heap_ptr_cell)
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      return wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_store, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_heap_reset", kind: "arena intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_heap_swap = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      // old = i32.atomic.load cell ; cell <- i32.wrap_i64(base) ; push old (i64)
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: wdefs.heap_ptr_cell)
+      let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_load, offset: 0)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i64_extend_i32_u, op_i32_const])
+      let %buf = bb.push_sleb128(%buf, val: wdefs.heap_ptr_cell)
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      return wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_store, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_heap_swap", kind: "arena intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+/** `alloc-raw : (size: i64) -> i64` — raw byte allocation */
+/** off the unified atomic bump cell. Used by stdlib runtime impls. Emits: */
+/** wrap the i64 size to i32, atomic-bump (rounds up to 8, grows memory), */
+/** zero-extend the resulting i32 base pointer back to i64. */
+export let emit_alloc_raw = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let obj_ptr = wdefs.ctx_temps_base(ctx) + 3
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = emit_atomic_bump(%buf, ctx, ptr_local: obj_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: obj_ptr)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_alloc_raw", kind: "arena intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+// ─── Memory intrinsics (mem-load-* / mem-store-* / mem-size / mem-grow) ─────
+// Inline-emit raw load/store and memory.size/grow ops. Argument policy
+// (kebab-canonical, all i64 across the FFI boundary):
+//   mem-load-i32(addr)        : i32.wrap addr → i32.load{align=2,offset=0} → i64.extend_i32_s
+//   mem-store-i32(addr, val)  : i32.wrap addr; i32.wrap val; i32.store{align=2,offset=0}
+//   mem-load-u8(addr)         : i32.wrap addr → i32.load8_u{align=0,offset=0} → i64.extend_i32_u
+//   mem-store-u8(addr, val)   : i32.wrap addr; i32.wrap val; i32.store8{align=0,offset=0}
+//   mem-load-i64(addr)        : i32.wrap addr → i64.load{align=3,offset=0}
+//   mem-store-i64(addr, val)  : i32.wrap addr; val (already i64); i64.store{align=3,offset=0}
+//   mem-size()                : memory.size(mem 0) → i64.extend_i32_u   (returns pages)
+//   mem-grow(delta)           : i32.wrap delta → memory.grow(mem 0) → i64.extend_i32_s
+//                               (sign-extend so the wasm `-1` failure sentinel surfaces as `-1`)
+
+let emit_addr_arg = fn (atom: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  // Nexus i64 → wasm i32 address (truncating wrap).
+  let %buf = emit_atom(atom, %buf, ctx)
+  return bb.push_byte(%buf, byte: op_i32_wrap_i64)
+end
+
+export let emit_mem_load_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_load)
+      let %buf = wdefs.emit_memarg_i32(%buf, offset: 0)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_s)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_load_i32", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_mem_store_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_i32_store])
+      return wdefs.emit_memarg_i32(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_store_i32", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_mem_load_u8 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_load8_u)
+      let %buf = wdefs.emit_memarg_i8(%buf)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_load_u8", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_mem_store_u8 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_i32_store8])
+      return wdefs.emit_memarg_i8(%buf)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_store_u8", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_mem_load_i64 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_load)
+      return wdefs.emit_memarg_i64(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_load_i64", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_mem_store_i64 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_store)
+      return wdefs.emit_memarg_i64(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_store_i64", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+// f32 / f64 mem ops (nexus-ybda). Float values cross the FFI as Nexus `float`
+// (= wasm f64), so load_f32 promotes (f32 -> f64) on read and store_f32
+// demotes (f64 -> f32) on write. Roundtrip is bitwise-stable as long as the
+// stored value is exactly representable in f32 (which holds when the value
+// originally came from a load_f32 or an f32 SIMD lane).
+export let emit_mem_load_f32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_f32_load)
+      let %buf = wdefs.emit_memarg_f32(%buf, offset: 0)
+      return bb.push_byte(%buf, byte: op_f64_promote_f32)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_load_f32", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_mem_store_f32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [op_f32_demote_f64, op_f32_store])
+      return wdefs.emit_memarg_f32(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_store_f32", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_mem_load_f64 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_f64_load)
+      return wdefs.emit_memarg_f64(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_load_f64", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_mem_store_f64 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_f64_store)
+      return wdefs.emit_memarg_f64(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_store_f64", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_mem_size = fn (buf: %ByteBuffer) -> %ByteBuffer do
+  // memory.size mem_idx=0 → i32 pages → extend_u to i64
+  return bb.push_bytes(%buf, bytes: [op_memory_size, 0, op_i64_extend_i32_u])
+end
+
+export let emit_mem_grow = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_memory_grow, 0])
+      // Sign-extend so the wasm `-1` failure sentinel surfaces unchanged at i64.
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_s)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_mem_grow", kind: "memory intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+// ─── Atomic intrinsics (atomic-rmw-add-i32 / atomic-load-i32 / ...) ─────────
+// Each lowers to a single 0xFE-prefixed wasm instruction (no host call). Like
+// the memory intrinsics, addresses/values cross the FFI as Nexus `i64` and are
+// wrapped to wasm i32 at the boundary. `wait32` / `notify` trap unless the
+// linear memory is `shared`. These externals are filtered from the import
+// section (filter_intrinsic_externals).
+
+export let emit_atomic_rmw_add_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_rmw_add, offset: 0)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_atomic_rmw_add_i32", kind: "atomic intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_atomic_load_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_load, offset: 0)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_atomic_load_i32", kind: "atomic intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_atomic_store_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      return wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_store, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_atomic_store_i32", kind: "atomic intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_atomic_cmpxchg_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: ex) :: LirCallArg(label: _, value: rp) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: ex, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = emit_atom(atom: rp, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_rmw_cmpxchg, offset: 0)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_atomic_cmpxchg_i32", kind: "atomic intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_atomic_wait32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: ex) :: LirCallArg(label: _, value: tmo) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: ex, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      // wait32's timeout operand is i64; pass through unwrapped.
+      let %buf = emit_atom(atom: tmo, %buf, ctx)
+      let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_atomic_wait32, offset: 0)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_atomic_wait32", kind: "atomic intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_atomic_notify = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: c) :: _ ->
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = emit_atom(atom: c, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_atomic_notify, offset: 0)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_atomic_notify", kind: "atomic intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+// ─── Width-cast intrinsics (cast-to-i32 / cast-to-i64) ─────────────────────
+// i32_of(x: i64) -> i32  emits  i32.wrap_i64 ; i64_of(x: i32) -> i64  emits  i64.extend_i32_u
+
+export let emit_cast_to_i32 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      return bb.push_byte(%buf, byte: op_i32_wrap_i64)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_cast_to_i32", kind: "cast intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+export let emit_cast_to_i64 = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_cast_to_i64", kind: "cast intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+// ─── Lazy / WASI-threads intrinsics (force-closure / thunk-addr / value-of-i64)
+
+/// `__nx_thunk_addr(t: @T) -> i64` / `__nx_value_of_i64(x: i64) -> T`: both are
+/// pure type puns at the WASM level (every Nexus value is an i64). Emit the
+/// argument atom and nothing else.
+export let emit_lazy_passthrough = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ -> return emit_atom(atom: a, %buf, ctx)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_lazy_passthrough", kind: "lazy intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+// ─── Backtrace intrinsics (nexus:runtime/backtrace, now nexus:intrinsic) ────
+//
+// WASM cannot introspect its own call stack without a host. There is no
+// in-tree provider for `nexus:runtime/backtrace`, so these ops are inlined to
+// constants: `raise` works, `Exn.backtrace(e)` returns `[]`, and the
+// main_wrap catch-all prints the variant name then 0 frames.
+
+/// `__nx_bt_depth() -> i64`: number of captured frames — always 0.
+export let emit_bt_depth = fn (buf: %ByteBuffer) -> %ByteBuffer do
+  let %buf = bb.push_byte(%buf, byte: op_i64_const)
+  return bb.push_sleb128(%buf, val: 0)
+end
+
+/// `__nx_bt_frame(idx: i64) -> string`: name of frame `idx` — always the
+/// empty string (packed `(ptr << 32) | len` value 0).
+export let emit_bt_frame = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [op_drop, op_i64_const])
+      return bb.push_sleb128(%buf, val: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__nx_bt_frame", kind: "backtrace intrinsic arg", context: "")
+      return %buf
+  end
+end
+
+/// `capture-backtrace(...) -> unit`: snapshot the call stack before a raise
+/// unwinds it — a no-op (no host). Drops every argument; unit return = empty
+/// stack. Normally never reached: the external is filtered from the import
+/// section so the raise-site `call` is elided, but kept for completeness.
+export let emit_capture_backtrace = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  return drop_all_args(args, %buf, ctx)
+end
+
+let drop_all_args = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | [] -> return %buf
+    | LirCallArg(label: _, value: a) :: rest ->
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_drop)
+      return drop_all_args(args: rest, %buf, ctx)
+  end
+end
+
+// ─── Array intrinsic (__array_get) ──────────────────────────────────────────
+// MirIndex (`arr[idx]`) lowers to LirExprCall("__array_get", arr, idx). Arrays
+// are heap records `[tag(i64) | e0(i64) | e1(i64) | ...]` (see MirArray in
+// src/ir/lir/lir.nx). The array atom is the canonical packed `(ptr<<32) | len`
+// form — pointer in the upper 32 bits, length in the lower 32 bits — so the
+// host stub `__nx_array_length(ptr: i32, len: i32) -> i64` and any other
+// extern receiving `&[| T |]` can read both fields after a single packed-i64
+// argument. `__array_get` is never registered as a real wasm import; emit_call
+// detects the symbol and inlines a `(ptr + (idx + 1) * 8) -> i64.load`
+// sequence below, extracting `ptr` via `(arr_atom >> 32)`.
+
+export let emit_array_get = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: arr_atom) :: LirCallArg(label: _, value: idx_atom) :: _ ->
+      // Push base ptr: extract upper 32 bits of arr_atom -> i32
+      let %buf = emit_atom(atom: arr_atom, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 32)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i64_shr_u, op_i32_wrap_i64])
+      // Push offset: i32_wrap_i64(idx) * 8 + 8
+      let %buf = emit_atom(atom: idx_atom, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_i32_const])
+      let %buf = bb.push_sleb128(%buf, val: 8)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_mul, op_i32_const])
+      let %buf = bb.push_sleb128(%buf, val: 8)
+      let %buf = bb.push_byte(%buf, byte: op_i32_add)
+      // Combine: ptr + offset
+      let %buf = bb.push_byte(%buf, byte: op_i32_add)
+      // Load i64 element
+      let %buf = bb.push_byte(%buf, byte: op_i64_load)
+      return wdefs.emit_memarg_i64(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__array_get", kind: "array intrinsic arg", context: "expected (arr, idx)")
+      return %buf
+  end
+end
+
+// `__array_set(arr, idx, val)` is the write counterpart to __array_get.
+// Layout matches: `(ptr + (idx + 1) * 8) <- i64.store val`. The intrinsic
+// returns unit; emit_stmt's LirStmtLet branch detects expr_type == TyUnit
+// and leaves the stack untouched (no drop, no local_set), so emit_array_set
+// must NOT push any synthetic value — exactly mirroring how a real
+// unit-returning host call (e.g. `__nx_heap_reset`) ends.
+export let emit_array_set = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: arr_atom) :: LirCallArg(label: _, value: idx_atom) :: LirCallArg(label: _, value: val_atom) :: _ ->
+      // Push address: base_ptr + ((idx + 1) * 8)
+      // arr_atom is the canonical `(ptr<<32) | len` i64 — extract ptr via
+      // `(arr_atom >> 32) -> i32_wrap_i64`, exactly mirroring emit_array_get.
+      // (Earlier this used a bare i32_wrap_i64 which gave the LEN low half,
+      //  causing writes to land in the array's length cell — nexus-tf49.)
+      let %buf = emit_atom(atom: arr_atom, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 32)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i64_shr_u, op_i32_wrap_i64])
+      let %buf = emit_atom(atom: idx_atom, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_i32_const])
+      let %buf = bb.push_sleb128(%buf, val: 8)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_mul, op_i32_const])
+      let %buf = bb.push_sleb128(%buf, val: 8)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_add, op_i32_add])
+      // Push value
+      let %buf = emit_atom(atom: val_atom, %buf, ctx)
+      // Store i64 — leaves no stack value (matches TyUnit return).
+      let %buf = bb.push_byte(%buf, byte: op_i64_store)
+      return wdefs.emit_memarg_i64(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name: "__array_set", kind: "array intrinsic arg", context: "expected (arr, idx, val)")
+      return %buf
+  end
+end
+
+// `array-length(arr: &[| T |]) -> i64` — the `nexus:intrinsic` op behind the
+// `__nx_array_length` FFI name (kebab-cased). Array atoms are the canonical
+// packed `(ptr<<32) | len` i64, so the count is the low 32 bits: emit the
+// atom, then `i64.const 0xFFFFFFFF`, then `i64.and`. Mirrors how
+// `emit_array_get` recovers the pointer via `arr >> 32`.
+export let emit_array_length = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: arr_atom) :: _ ->
+      let %buf = emit_atom(atom: arr_atom, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 4294967295)
+      return bb.push_byte(%buf, byte: op_i64_and)
+    | _ ->
+      raise SymbolNotFound(name: "array-length", kind: "array intrinsic arg", context: "expected (arr)")
+      return %buf
+  end
+end
+
+// ─── Math intrinsics (f64-sqrt / f64-floor / f64-ceil / f64-abs) ────────────
+// Inline-emit f64 unary ops. Each takes a single `val: float` and pushes the
+// f64 result; no coercion needed since the FFI types are already f64.
+
+export let emit_f64_unary = fn (opcode: i64, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx, name: string) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      return bb.push_byte(%buf, byte: opcode)
+    | _ ->
+      raise SymbolNotFound(name, kind: "math intrinsic arg", context: "f64 unary requires one argument")
+      return %buf
+  end
+end
+
+// ─── SIMD intrinsics (simd-f32x4-add / simd-...-array / ...) ────────────────
+// 128-bit fixed-width SIMD primitives — `simd-{lane}x{count}-{op}` for the
+// f32x4 / f64x2 / i32x4 / i64x2 lane shapes and add / mul lane-wise ops, plus
+// `simd-f32x4-add-array` which expands to a SIMD loop over a contiguous
+// quad-aligned region (the autovectorized form of an element-wise scalar
+// `dst[i] = a[i] + b[i]` loop).
+//
+// Argument policy: addresses are i64 across the FFI boundary, truncating to
+// i32 for wasm load/store. Lane width is implicit in the wasm_name. A v128
+// never escapes a single intrinsic emission — load → op → store stays inside
+// one instruction sequence so v128 never becomes a Nexus-visible local type
+// (which would require widening type_to_valtype across the compiler).
+//
+// Verified opcodes (see wasm/defs.nx for the full table):
+//   v128.load (sub 0x00) / v128.store (sub 0x0B): memarg align=4 offset=0
+//   {i32x4,i64x2,f32x4,f64x2}.add / .mul: no further operand bytes
+//
+// SIMD extension is part of the WebAssembly 2.0 baseline and is enabled by
+// default in wasmtime 13+; bootstrap.sh's launch flags inherit that default
+// (no explicit -W simd toggle is required).
+
+/** Emit a single v128 lane-wise binary op: load 16 bytes from each input */
+/** address, run the lane-op, store 16 bytes to dst. Address args are in */
+/** LirCallArg order `(a_addr, b_addr, dst_addr)`. Caller passes the SIMD */
+/** sub-opcode (e.g. `op_simd_f32x4_add`) for the lane operation. */
+export let emit_simd_binop_one = fn (sub_op: i64, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx, name: string) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: b) :: LirCallArg(label: _, value: d) :: _ ->
+      // dst_addr (for the final store) — push first so the store's base addr
+      // is below the v128 result on the wasm operand stack.
+      let %buf = emit_addr_arg(atom: d, %buf, ctx)
+      // v128.load a_addr
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: op_simd_v128_load)
+      let %buf = wdefs.emit_memarg_v128(%buf, offset: 0)
+      // v128.load b_addr
+      let %buf = emit_addr_arg(atom: b, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: op_simd_v128_load)
+      let %buf = wdefs.emit_memarg_v128(%buf, offset: 0)
+      // lane-op
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: sub_op)
+      // v128.store
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: op_simd_v128_store)
+      return wdefs.emit_memarg_v128(%buf, offset: 0)
+    | _ ->
+      raise SymbolNotFound(name, kind: "simd intrinsic arg", context: "simd lane binop requires (a_addr, b_addr, dst_addr)")
+      return %buf
+  end
+end
+
+/** Emit an autovectorized SIMD loop: for each of `n` quads (16-byte chunks), */
+/** load v128 from a, load v128 from b, lane-op, v128.store to dst, advance */
+/** each pointer by 16. This is the autovectorized form of: */
+/**   for i in 0..(n*4): dst[i] = a[i] + b[i]   (when sub_op = f32x4.add) */
+/** */
+/** Arg policy: `(a_addr: i64, b_addr: i64, dst_addr: i64, n_quads: i64)`. */
+/** Local-slot layout (drawn from the reserved-temps range that */
+/** section.nx::emit_local_decls declares — 2x i64, 2x i32, 2x i64, 7x i32, */
+/** then the tcmc pair): */
+/**   counter at temps_base+0   (i64 slot — quad-remaining countdown) */
+/**   a_ptr   at temps_base+2   (i32 slot — wasm address) */
+/**   b_ptr   at temps_base+3   (i32 slot — wasm address; also used by */
+/**                             emit_alloc_object as obj_ptr, but that helper */
+/**                             sets+uses+is-done before any caller, so the */
+/**                             slot is dead when the SIMD intrinsic body runs) */
+/**   d_ptr   at temps_base+6   (i32 slot — wasm address; shared with the */
+/**                             throw-path retptr which is similarly dead) */
+/** Mismatched-type local.set/get would fail wasm validation; the slot */
+/** assignments above honour the reserved-type bands. */
+/** */
+/** Loop shape (mirrors emit_memcpy_loop in codegen/atom.nx): */
+/**   block */
+/**     loop */
+/**       local.get counter ; i64.eqz ; br_if 1   ; exit when 0 */
+/**       <SIMD body: load a_ptr; load b_ptr; lane-op; store d_ptr> */
+/**       a_ptr += 16; b_ptr += 16; d_ptr += 16 */
+/**       counter -= 1 */
+/**       br 0 */
+/**     end */
+/**   end */
+export let emit_simd_binop_array = fn (sub_op: i64, args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx, name: string) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: LirCallArg(label: _, value: b) :: LirCallArg(label: _, value: d) :: LirCallArg(label: _, value: n) :: _ ->
+      let temps = wdefs.ctx_temps_base(ctx)
+      let counter = temps        // i64 slot
+      let a_ptr = temps + 2      // i32 slot
+      let b_ptr = temps + 3      // i32 slot
+      let d_ptr = temps + 6      // i32 slot
+      // Initialize pointer locals from the i64 address args (truncate to i32).
+      let %buf = emit_addr_arg(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_local_set)
+      let %buf = bb.push_uleb128(%buf, val: a_ptr)
+      let %buf = emit_addr_arg(atom: b, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_local_set)
+      let %buf = bb.push_uleb128(%buf, val: b_ptr)
+      let %buf = emit_addr_arg(atom: d, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_local_set)
+      let %buf = bb.push_uleb128(%buf, val: d_ptr)
+      // counter (i64) ← n
+      let %buf = emit_atom(atom: n, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_local_set)
+      let %buf = bb.push_uleb128(%buf, val: counter)
+      // block ; loop
+      let %buf = bb.push_bytes(%buf, bytes: [op_block, bt_void, op_loop, bt_void])
+      // counter == 0 → break out (br 1 → exits the outer block)
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: counter)
+      let %buf = bb.push_byte(%buf, byte: 80)   // i64.eqz
+      let %buf = bb.push_byte(%buf, byte: op_br_if)
+      let %buf = bb.push_uleb128(%buf, val: 1)
+      // SIMD body: emit equivalent of one-shot binop using the i32 pointer locals.
+      // dst pointer first so the store's base sits below v128 on the stack.
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: d_ptr)
+      // load a
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: a_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: op_simd_v128_load)
+      let %buf = wdefs.emit_memarg_v128(%buf, offset: 0)
+      // load b
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: b_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: op_simd_v128_load)
+      let %buf = wdefs.emit_memarg_v128(%buf, offset: 0)
+      // lane-op
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: sub_op)
+      // store dst
+      let %buf = bb.push_byte(%buf, byte: op_simd_prefix)
+      let %buf = bb.push_uleb128(%buf, val: op_simd_v128_store)
+      let %buf = wdefs.emit_memarg_v128(%buf, offset: 0)
+      // a_ptr += 16
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: a_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: 16)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_add, op_local_set])
+      let %buf = bb.push_uleb128(%buf, val: a_ptr)
+      // b_ptr += 16
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: b_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: 16)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_add, op_local_set])
+      let %buf = bb.push_uleb128(%buf, val: b_ptr)
+      // d_ptr += 16
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: d_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: 16)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_add, op_local_set])
+      let %buf = bb.push_uleb128(%buf, val: d_ptr)
+      // counter -= 1
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: counter)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 1)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i64_sub, op_local_set])
+      let %buf = bb.push_uleb128(%buf, val: counter)
+      // br 0 (loop back)
+      let %buf = bb.push_byte(%buf, byte: op_br)
+      let %buf = bb.push_uleb128(%buf, val: 0)
+      // end loop ; end block
+      let %buf = bb.push_bytes(%buf, bytes: [op_end, op_end])
+      return %buf
+    | _ ->
+      raise SymbolNotFound(name, kind: "simd intrinsic arg", context: "simd array binop requires (a_addr, b_addr, dst_addr, n_quads)")
+      return %buf
+  end
+end

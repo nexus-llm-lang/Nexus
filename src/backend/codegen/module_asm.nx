@@ -1,0 +1,285 @@
+/**
+ * codegen/module_asm: module-assembly helpers for compile_lir_to_wasm.
+ *
+ * Owns:
+ * - FuncEntry list builders for internal / external imports
+ * - find_bt_capture_idx (locate __nx_main_wrap_bt_capture import slot)
+ * - External deduplication (DedupExtResult, dedup_externals, remaps)
+ * - Closure analysis: build_closure_table, collect_closure_arities,
+ *   insert_sorted_i64 helper
+ * - WASM name custom-section payload (build_name_section)
+ * - build_closure_type_idx_list (arity → canonical type index pair list)
+ *
+ * Does not own:
+ * - compile_lir_to_wasm itself — the top-level entry stays in codegen.nx
+ *   because it sequences calls into emit_code_bodies / compile_function_body
+ *   which live with the recursive emit_expr / emit_stmt chain.
+ * - Code-section emission (emit_one_body / emit_code_bodies / compile_*)
+ *
+ * Functions here are reachable only by the module-assembly path (after
+ * all function bodies are compiled). None recurse through emit_expr.
+ */
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { LirFunction, LirExternal } from "src/ir/lir/types.nx"
+import { FuncEntry, ArityTypeIdx }, * as wdefs from "src/backend/wasm/defs.nx"
+import { HashMap } from "std:hashmap"
+import { bt_capture_symbol_name } from "src/ir/main_wrap.nx"
+import * as list from "std:list"
+import { CodegenError } from "src/common/error.nx"
+
+export let build_internal_func_entries = fn (funcs: [LirFunction], import_count: i64, idx: i64) -> [FuncEntry] throws { CodegenError } do
+  return build_internal_func_entries_go(funcs, import_count, idx, acc: [])
+end
+let build_internal_func_entries_go = fn (funcs: [LirFunction], import_count: i64, idx: i64, acc: [FuncEntry]) -> [FuncEntry] throws { CodegenError } do
+  match funcs do
+    | [] -> return rev_func_entries(lst: acc, out: [])
+    | LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
+      return build_internal_func_entries_go(funcs: rest, import_count, idx: idx + 1, acc: FuncEntry(name: n, index: import_count + idx) :: acc)
+  end
+end
+
+export let build_external_func_entries = fn (exts: [LirExternal], idx: i64) -> [FuncEntry] throws { CodegenError } do
+  return build_external_func_entries_go(exts, idx, acc: [])
+end
+let build_external_func_entries_go = fn (exts: [LirExternal], idx: i64, acc: [FuncEntry]) -> [FuncEntry] throws { CodegenError } do
+  match exts do
+    | [] -> return rev_func_entries(lst: acc, out: [])
+    | LirExternal(name: n, wasm_module: _, wasm_name: _, params: _, ret_type: _, throw_row: _) :: rest ->
+      return build_external_func_entries_go(exts: rest, idx: idx + 1, acc: FuncEntry(name: n, index: idx) :: acc)
+  end
+end
+
+/** Locate the import slot for the backtrace-capture host function. Returns */
+/** -1 when the symbol is absent (e.g. the program has no main_wrap-injected */
+/** catch handler). The match is by Nexus-side symbol name so codegen does */
+/** not need to know the kebab-cased wasm_name. */
+export let find_bt_capture_idx = fn (exts: [LirExternal]) -> i64 do
+  return find_bt_capture_idx_go(exts, idx: 0)
+end
+
+let find_bt_capture_idx_go = fn (exts: [LirExternal], idx: i64) -> i64 do
+  match exts do
+    | [] -> return -1
+    | LirExternal(name: n, _) :: rest ->
+      if n == bt_capture_symbol_name() then return idx end
+      return find_bt_capture_idx_go(exts: rest, idx: idx + 1)
+  end
+end
+
+// ─── External deduplication ─────────────────────────────────────────────────
+// Multiple Nexus names can point to the same WASM import (diamond imports).
+// Deduplicate by (wasm_module, wasm_name), keeping only the first occurrence.
+// Returns deduped ext list + FuncEntry remaps for duplicate names.
+
+export type DedupExtResult = DedupExtResult(exts: [LirExternal], remaps: [FuncEntry])
+
+let find_ext_dedup_index = fn (exts: [LirExternal], wm: string, wn: string, idx: i64) -> i64 do
+  match exts do
+    | [] -> return -1
+    | LirExternal(name: _, wasm_module: m, wasm_name: n, params: _, ret_type: _, throw_row: _) :: rest ->
+      if m == wm && n == wn then return idx end
+      return find_ext_dedup_index(exts: rest, wm, wn, idx: idx + 1)
+  end
+end
+
+let rev_externals = fn (lst: [LirExternal], out: [LirExternal]) -> [LirExternal] do
+  match lst do
+    | [] -> out
+    | x :: rest -> rev_externals(lst: rest, out: x :: out)
+  end
+end
+
+export let dedup_externals = fn (exts: [LirExternal]) -> DedupExtResult throws { CodegenError } do
+  return dedup_externals_go(exts, deduped: [], remaps: [], dedup_idx: 0)
+end
+
+let dedup_externals_go = fn (exts: [LirExternal], deduped: [LirExternal], remaps: [FuncEntry], dedup_idx: i64) -> DedupExtResult throws { CodegenError } do
+  match exts do
+    | [] -> return DedupExtResult(exts: rev_externals(lst: deduped, out: []), remaps)
+    | e :: rest ->
+      let LirExternal(name: n, wasm_module: wm, wasm_name: wn, params: _, ret_type: _, throw_row: _) = e
+      let existing = find_ext_dedup_index(exts: rev_externals(lst: deduped, out: []), wm, wn, idx: 0)
+      if existing >= 0 then
+        return dedup_externals_go(exts: rest, deduped, remaps: FuncEntry(name: n, index: existing) :: remaps, dedup_idx)
+      else
+        return dedup_externals_go(exts: rest, deduped: e :: deduped, remaps, dedup_idx: dedup_idx + 1)
+      end
+  end
+end
+
+export let append_func_entries = fn (a: [FuncEntry], b: [FuncEntry]) -> [FuncEntry] do
+  match a do
+    | [] -> b
+    | x :: rest -> x :: append_func_entries(a: rest, b)
+  end
+end
+
+// ─── Closure analysis helpers ───────────────────────────────────────────────
+
+/** Build closure table entries: maps table index → function index for __closure_* functions. */
+export let build_closure_table = fn (funcs: [LirFunction], internal_func_map: &HashMap, table_idx: i64) -> [FuncEntry] throws { CodegenError } do
+  return build_closure_table_go(funcs, internal_func_map, table_idx, acc: [])
+end
+let build_closure_table_go = fn (funcs: [LirFunction], internal_func_map: &HashMap, table_idx: i64, acc: [FuncEntry]) -> [FuncEntry] throws { CodegenError } do
+  match funcs do
+    | [] -> return rev_func_entries(lst: acc, out: [])
+    | LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
+      if wdefs.is_closure_func(name: n) then
+        let func_idx = wdefs.lookup_func_fast(name: n, map: internal_func_map)
+        return build_closure_table_go(funcs: rest, internal_func_map, table_idx: table_idx + 1, acc: FuncEntry(name: n, index: func_idx) :: acc)
+      end
+      return build_closure_table_go(funcs: rest, internal_func_map, table_idx, acc)
+  end
+end
+
+/** Insert a value into a sorted list, skipping if already present. O(K) per insert. */
+let insert_sorted_i64 = fn (val: i64, xs: [i64]) -> [i64] throws { CodegenError } do
+  return insert_sorted_i64_go(val, xs, acc: [])
+end
+
+let insert_sorted_i64_go = fn (val: i64, xs: [i64], acc: [i64]) -> [i64] throws { CodegenError } do
+  match xs do
+    | [] -> return rev_i64s(lst: acc, out: [val])
+    | x :: rest ->
+      if val == x then
+        return rev_i64s(lst: acc, out: xs)
+      end
+      if val < x then
+        return rev_i64s(lst: acc, out: val :: xs)
+      end
+      return insert_sorted_i64_go(val, xs: rest, acc: x :: acc)
+  end
+end
+
+/** Get distinct closure arities from __closure_* functions. */
+/** Arity = param count - 1 (subtract the __env param). */
+/** Builds a sorted+deduped list in a single pass. Seeds arity 0 so */
+/** `LirExprCallClosure(args: [])` and `LirExprForce` (lazy thunks) always */
+/** resolve their `lookup_closure_type_idx_pairs(arity: 0)` lookup, even */
+/** when no `__closure_*` wrapper or sched trampoline carries arity 0. */
+export let collect_closure_arities = fn (funcs: [LirFunction]) -> [i64] throws { CodegenError } do
+  return collect_closure_arities_acc(funcs, acc: [0])
+end
+
+let collect_closure_arities_acc = fn (funcs: [LirFunction], acc: [i64]) -> [i64] throws { CodegenError } do
+  match funcs do
+    | [] -> acc
+    | LirFunction(name: n, params: ps, ret_type: _, body: _, ret: _, span: _) :: rest ->
+      // Only `__closure_*` and `__inject_*` carry the canonical
+      // (env: i64, arg0..argN-1) -> i64 closure-call signature whose arity
+      // must be registered in the type section. The sched trampoline is
+      // `() -> ()` and uses a regular call_indirect against the existing
+      // arity-0 closure type — its presence in the elem segment for ref.func
+      // does not add a new arity entry, but its body forces arity 0 to be
+      // present in the type table. A 0-arity closure call also forces arity
+      // 0 even when no __closure_* wrapper carries it (e.g. `let f = pure_fn; f()`
+      // where pure_fn is a top-level let bound to `fn () -> T`).
+      if wdefs.is_sched_trampoline_func(name: n) then
+        return collect_closure_arities_acc(funcs: rest, acc: insert_sorted_i64(val: 0, xs: acc))
+      end
+      if wdefs.is_closure_func(name: n) then
+        let arity = list.length(xs: ps) - 1
+        return collect_closure_arities_acc(funcs: rest, acc: insert_sorted_i64(val: arity, xs: acc))
+      end
+      return collect_closure_arities_acc(funcs: rest, acc)
+  end
+end
+
+// ─── Name section (custom) ─────────────────────────────────────────────────
+
+/** Build name subsection entries for external (imported) functions */
+let emit_external_name_entries = fn (buf: %ByteBuffer, exts: [LirExternal], idx: i64) -> %ByteBuffer throws { CodegenError } do
+  match exts do
+    | [] -> return %buf
+    | LirExternal(name: _, wasm_module: _, wasm_name: wn, params: _, ret_type: _, throw_row: _) :: rest ->
+      let %buf = bb.push_uleb128(%buf, val: idx)
+      let %buf = wdefs.emit_name(%buf, name: wn)
+      return emit_external_name_entries(%buf, exts: rest, idx: idx + 1)
+  end
+end
+
+/** Build name subsection entries for internal functions */
+let emit_internal_name_entries = fn (buf: %ByteBuffer, funcs: [LirFunction], idx: i64) -> %ByteBuffer throws { CodegenError } do
+  match funcs do
+    | [] -> return %buf
+    | LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
+      let %buf = bb.push_uleb128(%buf, val: idx)
+      let %buf = wdefs.emit_name(%buf, name: n)
+      return emit_internal_name_entries(%buf, funcs: rest, idx: idx + 1)
+  end
+end
+
+/** Build the WASM name custom section payload (section name + function subsection) */
+export let build_name_section = fn (exts: [LirExternal], funcs: [LirFunction],
+                              has_alloc: bool,
+                              n_exts: i64, n_alloc_imports: i64,
+                              total_funcs: i64) -> %ByteBuffer throws { CodegenError } do
+  let %entries = bb.empty()
+  let %entries = bb.push_uleb128(buf: %entries, val: total_funcs)
+  let %entries = emit_external_name_entries(buf: %entries, exts, idx: 0)
+  let %entries = if has_alloc then
+    let %entries = bb.push_uleb128(buf: %entries, val: n_exts)
+    let %entries = wdefs.emit_name(buf: %entries, name: "allocate")
+    let %entries = bb.push_uleb128(buf: %entries, val: n_exts + 1)
+    let %entries = wdefs.emit_name(buf: %entries, name: "__nx_alloc_mark")
+    let %entries = bb.push_uleb128(buf: %entries, val: n_exts + 2)
+    wdefs.emit_name(buf: %entries, name: "__nx_alloc_reset")
+  else %entries end
+  let internal_start = n_exts + n_alloc_imports
+  let %entries = emit_internal_name_entries(buf: %entries, funcs, idx: internal_start)
+  let wasi_idx = total_funcs - 1
+  let %entries = bb.push_uleb128(buf: %entries, val: wasi_idx)
+  let %entries = wdefs.emit_name(buf: %entries, name: "wasi:cli/run@0.2.0#run")
+
+  let entries_len = bb.length(buf: &entries)
+  let %subsec = bb.empty()
+  let %subsec = bb.push_byte(buf: %subsec, byte: 1)
+  let %subsec = bb.push_uleb128(buf: %subsec, val: entries_len)
+  let %subsec = bb.push_buf(dst: %subsec, src: &entries)
+  bb.free(buf: %entries)
+
+  let %payload = bb.empty()
+  let %payload = wdefs.emit_name(buf: %payload, name: "name")
+  let %payload = bb.push_buf(dst: %payload, src: &subsec)
+  bb.free(buf: %subsec)
+  return %payload
+end
+
+export let build_closure_type_idx_list = fn (arities: [i64], type_idxs: [i64]) -> [ArityTypeIdx] throws { CodegenError } do
+  return build_closure_type_idx_list_go(arities, type_idxs, acc: [])
+end
+let build_closure_type_idx_list_go = fn (arities: [i64], type_idxs: [i64], acc: [ArityTypeIdx]) -> [ArityTypeIdx] throws { CodegenError } do
+  match arities do
+    | [] -> return rev_arity_type_idxs(lst: acc, out: [])
+    | a :: rest_a ->
+      match type_idxs do
+        | [] -> return rev_arity_type_idxs(lst: acc, out: [])
+        | ti :: rest_ti ->
+          return build_closure_type_idx_list_go(arities: rest_a, type_idxs: rest_ti,
+            acc: ArityTypeIdx(arity: a, type_idx: ti) :: acc)
+      end
+  end
+end
+
+// ─── Local type-specific reverses (see src/common/mono_reverse.nx) ─────────
+
+let rev_func_entries = fn (lst: [FuncEntry], out: [FuncEntry]) -> [FuncEntry] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_func_entries(lst: rest, out: x :: out)
+  end
+end
+
+let rev_arity_type_idxs = fn (lst: [ArityTypeIdx], out: [ArityTypeIdx]) -> [ArityTypeIdx] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_arity_type_idxs(lst: rest, out: x :: out)
+  end
+end
+
+let rev_i64s = fn (lst: [i64], out: [i64]) -> [i64] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_i64s(lst: rest, out: x :: out)
+  end
+end
