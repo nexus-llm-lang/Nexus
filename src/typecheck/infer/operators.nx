@@ -1,0 +1,265 @@
+/**
+ * typecheck/infer/operators: binary / unary operator post-processing.
+ *
+ * Holds the parts of binop / unop inference that don't recurse into
+ * infer_expr — operand-type resolution (`resolve_binop_types`),
+ * type-driven unification helpers (`unify_int_binop`, `unify_float_binop`,
+ * `unify_cmp_binop`, `unify_float_cmp`, `unify_bool_binop`), the
+ * `comparable(τ)` predicate guarding equality / ordering, and the
+ * numeric defaulting helpers `select_int_type` / `select_float_type`.
+ *
+ * The outer `infer_binop` / `infer_unop` wrappers stay in src/typecheck/infer.nx
+ * because they call back into infer_expr to type the operands.
+ *
+ * Extracted from src/typecheck/infer.nx (nexus-95iz.8).
+ */
+
+import { Span } from "src/common/token.nx"
+import {
+  TypeExpr, TyI32, TyI64, TyF32, TyF64, TyBool, TyChar, TyString, TyUnit,
+  TyIntLit, TyFloatLit, TyUserDefined, TyVar, TyList, TyRecord,
+  BinaryOp, OpAdd, OpSub, OpMul, OpDiv, OpMod,
+  OpFAdd, OpFSub, OpFMul, OpFDiv,
+  OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
+  OpFEq, OpFNe, OpFLt, OpFLe, OpFGt, OpFGe,
+  OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr,
+  OpAnd, OpOr, OpConcat,
+  NamedType, RecordDef
+} from "src/common/ast.nx"
+import {
+  SubstEntry, CheckState,
+  InferExprResult, InferExprOk, InferExprErr,
+  UnifyOk, UnifyErr,
+  TypeDefEntry
+}, * as tctypes from "src/typecheck/types.nx"
+import * as subst from "src/typecheck/subst.nx"
+import * as unify from "src/typecheck/unify.nx"
+import { TypeError } from "src/common/error.nx"
+import { Option, Some, None } from "std:option"
+
+// ─── Numeric type selection ─────────────────────────────────────────────────
+//
+// select_int_type / select_float_type: HM numeric literal defaulting site.
+//
+// Both operands reaching here are already numeric-flex (TyIntLit / TyFloatLit)
+// or concrete (TyI32/TyI64 / TyF32/TyF64). When both are flex, no context
+// has constrained the width, so we commit to the principal type (TyI64 / TyF64)
+// — the same default the rest of HM applies to unresolved integer / float
+// literals. This is an intentional commit, not a silent failure: the alternative
+// (emit a fresh var and defer) would just leak TyIntLit up the expression tree
+// until some outer site had to pick the same default anyway.
+export let select_int_type = fn (a: TypeExpr, b: TypeExpr) -> TypeExpr throws { TypeError } do
+  match a do
+    | TyI32 -> return TyI32
+    | TyI64 -> return TyI64
+    | _ -> ()
+  end
+  match b do
+    | TyI32 -> return TyI32
+    | TyI64 -> return TyI64
+    | _ -> ()
+  end
+  return TyI64
+end
+
+export let select_float_type = fn (a: TypeExpr, b: TypeExpr) -> TypeExpr throws { TypeError } do
+  match a do
+    | TyF32 -> return TyF32
+    | TyF64 -> return TyF64
+    | _ -> ()
+  end
+  match b do
+    | TyF32 -> return TyF32
+    | TyF64 -> return TyF64
+    | _ -> ()
+  end
+  return TyF64
+end
+
+// ─── comparable(τ) — T-Cmp side-condition (spec type-system-formal.md) ────────
+//
+// Recursive predicate guarding ==, !=, <, <=, >, >=. Accepts base scalars,
+// records and lists whose elements are themselves comparable, and named
+// (record-typedef) types via tdef expansion. Rejects arrows, handlers, refs,
+// borrows, lazy/thunk wrappers, arrays, and linear values — categories whose
+// runtime equality is undefined per spec. Free type variables are accepted
+// (deferred): unification has not yet pinned the type, and the rest of the
+// pipeline gets a fair shot at constraining it.
+
+let comparable_named_type_list = fn (nts: [NamedType], tdefs: [TypeDefEntry]) -> bool do
+  match nts do
+    | [] -> return true
+    | NamedType(name: _, typ: t) :: rest ->
+      if comparable(typ: t, tdefs) then
+        return comparable_named_type_list(nts: rest, tdefs)
+      end
+      return false
+  end
+end
+
+let comparable = fn (typ: TypeExpr, tdefs: [TypeDefEntry]) -> bool do
+  match typ do
+    | TyI32 -> return true
+    | TyI64 -> return true
+    | TyF32 -> return true
+    | TyF64 -> return true
+    | TyBool -> return true
+    | TyChar -> return true
+    | TyString -> return true
+    | TyUnit -> return true
+    | TyIntLit -> return true
+    | TyFloatLit -> return true
+    | TyVar(_) -> return true
+    | TyRecord(fields: fs) -> return comparable_named_type_list(nts: fs, tdefs)
+    | TyList(elem: e) -> return comparable(typ: e, tdefs)
+    | TyUserDefined(name: n, args: _) ->
+      // Expand record typedef when known; unknown names (enums, opaque) are
+      // accepted to avoid blanket-rejecting practical code beyond the bug at
+      // hand. Tighten in a follow-up once enum equality is specified.
+      match tctypes.typedef_lookup(defs: tdefs, name: n) do
+        | Some(val: RecordDef(fields: fs, _)) ->
+          return comparable_named_type_list(nts: fs, tdefs)
+        | None -> return true
+      end
+    | _ -> return false
+  end
+end
+
+let comparable_reject_msg = fn (typ: TypeExpr) -> string do
+  return "cannot compare values of type `" ++ tctypes.type_to_string(typ) ++ "`: comparison undefined for arrows / handlers / refs / borrows / thunks / arrays"
+end
+
+// ─── Type-driven binop unifiers ─────────────────────────────────────────────
+
+let unify_int_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
+  let target = select_int_type(a: lt, b: rt)
+  let tdefs = tctypes.state_typedefs(state)
+  match unify.unify(t1: lt, t2: target, tdefs) do
+    | UnifyErr(message: m) -> return InferExprErr(message: "int op lhs: " ++ m, span)
+    | UnifyOk(subst: s1) ->
+      let sm = subst.subst_compose(s1: subst, s2: s1)
+      match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: target, tdefs) do
+        | UnifyErr(message: m) -> return InferExprErr(message: "int op rhs: " ++ m, span)
+        | UnifyOk(subst: s2) ->
+          return InferExprOk(state, subst: subst.subst_compose(s1: sm, s2), typ: target)
+      end
+  end
+end
+
+let unify_float_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
+  let target = select_float_type(a: lt, b: rt)
+  let tdefs = tctypes.state_typedefs(state)
+  match unify.unify(t1: lt, t2: target, tdefs) do
+    | UnifyErr(message: m) -> return InferExprErr(message: "float op lhs: " ++ m, span)
+    | UnifyOk(subst: s1) ->
+      let sm = subst.subst_compose(s1: subst, s2: s1)
+      match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: target, tdefs) do
+        | UnifyErr(message: m) -> return InferExprErr(message: "float op rhs: " ++ m, span)
+        | UnifyOk(subst: s2) ->
+          return InferExprOk(state, subst: subst.subst_compose(s1: sm, s2), typ: target)
+      end
+  end
+end
+
+let unify_cmp_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
+  let tdefs = tctypes.state_typedefs(state)
+  match unify.unify(t1: lt, t2: rt, tdefs) do
+    | UnifyErr(message: m) -> return InferExprErr(message: "comparison: " ++ m, span)
+    | UnifyOk(subst: s1) ->
+      let sm = subst.subst_compose(s1: subst, s2: s1)
+      let resolved = subst.subst_apply(subst: sm, typ: lt)
+      if comparable(typ: resolved, tdefs) then
+        return InferExprOk(state, subst: sm, typ: TyBool)
+      end
+      return InferExprErr(message: comparable_reject_msg(typ: resolved), span)
+  end
+end
+
+let unify_float_cmp = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
+  let tdefs = tctypes.state_typedefs(state)
+  let target = select_float_type(a: lt, b: rt)
+  match unify.unify(t1: lt, t2: target, tdefs) do
+    | UnifyErr(message: m) -> return InferExprErr(message: "float cmp lhs: " ++ m, span)
+    | UnifyOk(subst: s1) ->
+      let sm = subst.subst_compose(s1: subst, s2: s1)
+      match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: target, tdefs) do
+        | UnifyErr(message: m) -> return InferExprErr(message: "float cmp rhs: " ++ m, span)
+        | UnifyOk(subst: s2) ->
+          let sm2 = subst.subst_compose(s1: sm, s2)
+          let resolved = subst.subst_apply(subst: sm2, typ: target)
+          if comparable(typ: resolved, tdefs) then
+            return InferExprOk(state, subst: sm2, typ: TyBool)
+          end
+          return InferExprErr(message: comparable_reject_msg(typ: resolved), span)
+      end
+  end
+end
+
+let unify_bool_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
+  let tdefs = tctypes.state_typedefs(state)
+  match unify.unify(t1: lt, t2: TyBool, tdefs) do
+    | UnifyErr(message: m) -> return InferExprErr(message: "logical lhs: " ++ m, span)
+    | UnifyOk(subst: s1) ->
+      let sm = subst.subst_compose(s1: subst, s2: s1)
+      match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: TyBool, tdefs) do
+        | UnifyErr(message: m) -> return InferExprErr(message: "logical rhs: " ++ m, span)
+        | UnifyOk(subst: s2) ->
+          return InferExprOk(state, subst: subst.subst_compose(s1: sm, s2), typ: TyBool)
+      end
+  end
+end
+
+// ─── Binop dispatch ─────────────────────────────────────────────────────────
+
+export let resolve_binop_types = fn (state: CheckState, subst: [SubstEntry], op: BinaryOp, lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
+  match op do
+    // Integer arithmetic -> result is integer type
+    | OpAdd -> return unify_int_binop(state, subst, lt, rt, span)
+    | OpSub -> return unify_int_binop(state, subst, lt, rt, span)
+    | OpMul -> return unify_int_binop(state, subst, lt, rt, span)
+    | OpDiv -> return unify_int_binop(state, subst, lt, rt, span)
+    | OpMod -> return unify_int_binop(state, subst, lt, rt, span)
+    | OpBitAnd -> return unify_int_binop(state, subst, lt, rt, span)
+    | OpBitOr -> return unify_int_binop(state, subst, lt, rt, span)
+    | OpBitXor -> return unify_int_binop(state, subst, lt, rt, span)
+    | OpShl -> return unify_int_binop(state, subst, lt, rt, span)
+    | OpShr -> return unify_int_binop(state, subst, lt, rt, span)
+    // Float arithmetic
+    | OpFAdd -> return unify_float_binop(state, subst, lt, rt, span)
+    | OpFSub -> return unify_float_binop(state, subst, lt, rt, span)
+    | OpFMul -> return unify_float_binop(state, subst, lt, rt, span)
+    | OpFDiv -> return unify_float_binop(state, subst, lt, rt, span)
+    // Integer comparisons -> bool
+    | OpEq -> return unify_cmp_binop(state, subst, lt, rt, span)
+    | OpNe -> return unify_cmp_binop(state, subst, lt, rt, span)
+    | OpLt -> return unify_cmp_binop(state, subst, lt, rt, span)
+    | OpLe -> return unify_cmp_binop(state, subst, lt, rt, span)
+    | OpGt -> return unify_cmp_binop(state, subst, lt, rt, span)
+    | OpGe -> return unify_cmp_binop(state, subst, lt, rt, span)
+    // Float comparisons -> bool
+    | OpFEq -> return unify_float_cmp(state, subst, lt, rt, span)
+    | OpFNe -> return unify_float_cmp(state, subst, lt, rt, span)
+    | OpFLt -> return unify_float_cmp(state, subst, lt, rt, span)
+    | OpFLe -> return unify_float_cmp(state, subst, lt, rt, span)
+    | OpFGt -> return unify_float_cmp(state, subst, lt, rt, span)
+    | OpFGe -> return unify_float_cmp(state, subst, lt, rt, span)
+    // Logical -> bool
+    | OpAnd ->
+      return unify_bool_binop(state, subst, lt, rt, span)
+    | OpOr ->
+      return unify_bool_binop(state, subst, lt, rt, span)
+    // String concat
+    | OpConcat ->
+      let tdefs = tctypes.state_typedefs(state)
+      match unify.unify(t1: lt, t2: TyString, tdefs) do
+        | UnifyErr(message: m) -> return InferExprErr(message: "concat lhs: " ++ m, span)
+        | UnifyOk(subst: s1) ->
+          let s_merged = subst.subst_compose(s1: subst, s2: s1)
+          match unify.unify(t1: subst.subst_apply(subst: s_merged, typ: rt), t2: TyString, tdefs) do
+            | UnifyErr(message: m) -> return InferExprErr(message: "concat rhs: " ++ m, span)
+            | UnifyOk(subst: s2) ->
+              return InferExprOk(state, subst: subst.subst_compose(s1: s_merged, s2), typ: TyString)
+          end
+      end
+  end
+end

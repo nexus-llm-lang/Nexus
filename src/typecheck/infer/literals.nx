@@ -1,0 +1,111 @@
+/**
+ * typecheck/infer/literals: leaf inference rules — literals, variables, borrows.
+ *
+ * Extracted from src/typecheck/infer.nx (nexus-95iz.8). These four entry
+ * points are leaves (no call-back into infer_expr) and so escape the
+ * infer_stmt ↔ infer_expr cycle that pins the rest of the module together.
+ *
+ * Also hosts `instantiate_scheme` and `freshen_type_params`: scheme
+ * instantiation is invoked from infer_variable / infer_call / infer_constructor
+ * and the pattern-bind path, but the work itself is pure — no expression
+ * recursion involved.
+ */
+
+import { Span } from "src/common/token.nx"
+import {
+  TypeExpr, TyIntLit, TyFloatLit, TyBool, TyChar, TyString, TyUnit,
+  TyRef, TyLinear, TyLazy, TyBorrow,
+  Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit,
+  Sigil, SigilImmutable, SigilMutable
+} from "src/common/ast.nx"
+import {
+  SubstEntry, Scheme, CheckState, FreshResult,
+  InferExprResult, InferExprOk, InferExprErr
+}, * as tctypes from "src/typecheck/types.nx"
+import * as subst from "src/typecheck/subst.nx"
+import { TypeError } from "src/common/error.nx"
+import { Option, Some, None } from "std:option"
+
+// ─── Literal inference ──────────────────────────────────────────────────────
+
+export let infer_literal = fn (state: CheckState, lit: Literal, span: Span) -> InferExprResult throws { TypeError } do
+  let typ = match lit do
+    | LitInt(_) -> TyIntLit
+    | LitFloat(_) -> TyFloatLit
+    | LitBool(_) -> TyBool
+    | LitChar(_) -> TyChar
+    | LitString(_) -> TyString
+    | LitUnit -> TyUnit
+  end
+  return InferExprOk(state, subst: subst.subst_empty(), typ)
+end
+
+// ─── Scheme instantiation ───────────────────────────────────────────────────
+
+export type InstantiateResult = InstantiateResult(state: CheckState, typ: TypeExpr)
+
+export type FreshenResult = FreshenResult(state: CheckState, param_subst: [SubstEntry])
+
+export let freshen_type_params = fn (state: CheckState, params: [string]) -> FreshenResult throws { TypeError } do
+  match params do
+    | [] -> return FreshenResult(state, param_subst: subst.subst_empty())
+    | p :: rest ->
+      let FreshResult(state: st1, typ: tv) = tctypes.tc_fresh_var(state)
+      let FreshenResult(state: st2, param_subst: ps) = freshen_type_params(state: st1, params: rest)
+      return FreshenResult(
+        state: st2,
+        param_subst: SubstEntry(var: p, typ: tv) :: ps
+      )
+  end
+end
+
+export let instantiate_scheme = fn (state: CheckState, scheme: Scheme) -> InstantiateResult throws { TypeError } do
+  match scheme do
+    | Scheme(vars: [], typ: t) -> return InstantiateResult(state, typ: t)
+    | Scheme(vars: vs, typ: t) ->
+      let fr = freshen_type_params(state, params: vs)
+      let FreshenResult(state: st1, param_subst: psubst) = fr
+      return InstantiateResult(state: st1, typ: subst.subst_apply(subst: psubst, typ: t))
+  end
+end
+
+// ─── Variable inference ─────────────────────────────────────────────────────
+
+export let infer_variable = fn (state: CheckState, name: string, sigil: Sigil, span: Span) -> InferExprResult throws { TypeError } do
+  match tctypes.env_lookup(env: tctypes.state_env(state), name) do
+    | Some(val: sch) ->
+      let InstantiateResult(state: st1, typ: t) = instantiate_scheme(state, scheme: sch)
+      // T-DerefRef (nexus-mqin.8): `~x` at use site reads through the mutable
+      // cell, yielding the inner value type. A `~`-sigil applied to a non-Ref
+      // binding is a modality mismatch.
+      if let SigilMutable = sigil then
+        match t do
+          | TyRef(inner: i) -> return InferExprOk(state: st1, subst: subst.subst_empty(), typ: i)
+          | _ -> return InferExprErr(message: "cannot dereference '~" ++ name ++ "': binding is not a mutable ref", span)
+        end
+      end
+      return InferExprOk(state: st1, subst: subst.subst_empty(), typ: t)
+    | None ->
+      return InferExprErr(message: "unbound variable: " ++ name, span)
+  end
+end
+
+export let infer_borrow = fn (state: CheckState, name: string, span: Span) -> InferExprResult throws { TypeError } do
+  // Borrow walks the env directly (without sigil dereference) — `&x` may
+  // borrow Linear/Lazy/Borrow bindings the same way as plain Immutable ones.
+  match infer_variable(state, name, sigil: SigilImmutable, span) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    | InferExprOk(state: st1, subst: s, typ: t) ->
+      // Strip Linear/Lazy/Borrow/Ref wrapper, then wrap in Borrow.
+      // stripBorrow(τ) per spec: τ ∈ {%σ, @σ, &σ, ~σ} -> σ. Borrowing a `~τ`
+      // binding yields `&τ` of the cell's contents, not `&(~τ)`.
+      let inner = match t do
+        | TyLinear(inner: u) -> u
+        | TyLazy(inner: u) -> u
+        | TyBorrow(inner: u) -> u
+        | TyRef(inner: u) -> u
+        | _ -> t
+      end
+      return InferExprOk(state: st1, subst: s, typ: TyBorrow(inner))
+  end
+end

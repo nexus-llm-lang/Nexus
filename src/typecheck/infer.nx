@@ -50,6 +50,16 @@ import * as subst from "src/typecheck/subst.nx"
 import * as unify from "src/typecheck/unify.nx"
 import * as capture from "src/typecheck/capture.nx"
 import * as exhaustive from "src/typecheck/exhaustive.nx"
+import {
+  InstantiateResult, FreshenResult,
+  infer_literal, infer_variable, infer_borrow,
+  instantiate_scheme, freshen_type_params
+}, * as literals from "src/typecheck/infer/literals.nx"
+import * as operators from "src/typecheck/infer/operators.nx"
+import {
+  reverse_named_types, lookup_named_type,
+  find_linear_field, type_carries_linear
+}, * as collections from "src/typecheck/infer/collections.nx"
 import { TypeError, ThrowsRowInvariantBroken } from "src/common/error.nx"
 import * as str from "std:str"
 import * as list from "std:list"
@@ -109,75 +119,6 @@ export let infer_expr = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr
   end
 end
 
-// ─── Literal inference ──────────────────────────────────────────────────────
-
-let infer_literal = fn (state: CheckState, lit: Literal, span: Span) -> InferExprResult throws { TypeError } do
-  let typ = match lit do
-    | LitInt(_) -> TyIntLit
-    | LitFloat(_) -> TyFloatLit
-    | LitBool(_) -> TyBool
-    | LitChar(_) -> TyChar
-    | LitString(_) -> TyString
-    | LitUnit -> TyUnit
-  end
-  return InferExprOk(state, subst: subst.subst_empty(), typ)
-end
-
-// ─── Scheme instantiation ───────────────────────────────────────────────────
-
-type InstantiateResult = InstantiateResult(state: CheckState, typ: TypeExpr)
-
-let instantiate_scheme = fn (state: CheckState, scheme: Scheme) -> InstantiateResult throws { TypeError } do
-  match scheme do
-    | Scheme(vars: [], typ: t) -> return InstantiateResult(state, typ: t)
-    | Scheme(vars: vs, typ: t) ->
-      let fr = freshen_type_params(state, params: vs)
-      let FreshenResult(state: st1, param_subst: psubst) = fr
-      return InstantiateResult(state: st1, typ: subst.subst_apply(subst: psubst, typ: t))
-  end
-end
-
-// ─── Variable inference ─────────────────────────────────────────────────────
-
-let infer_variable = fn (state: CheckState, name: string, sigil: Sigil, span: Span) -> InferExprResult throws { TypeError } do
-  match tctypes.env_lookup(env: tctypes.state_env(state), name) do
-    | Some(val: sch) ->
-      let InstantiateResult(state: st1, typ: t) = instantiate_scheme(state, scheme: sch)
-      // T-DerefRef (nexus-mqin.8): `~x` at use site reads through the mutable
-      // cell, yielding the inner value type. A `~`-sigil applied to a non-Ref
-      // binding is a modality mismatch.
-      if let SigilMutable = sigil then
-        match t do
-          | TyRef(inner: i) -> return InferExprOk(state: st1, subst: subst.subst_empty(), typ: i)
-          | _ -> return InferExprErr(message: "cannot dereference '~" ++ name ++ "': binding is not a mutable ref", span)
-        end
-      end
-      return InferExprOk(state: st1, subst: subst.subst_empty(), typ: t)
-    | None ->
-      return InferExprErr(message: "unbound variable: " ++ name, span)
-  end
-end
-
-let infer_borrow = fn (state: CheckState, name: string, span: Span) -> InferExprResult throws { TypeError } do
-  // Borrow walks the env directly (without sigil dereference) — `&x` may
-  // borrow Linear/Lazy/Borrow bindings the same way as plain Immutable ones.
-  match infer_variable(state, name, sigil: SigilImmutable, span) do
-    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
-    | InferExprOk(state: st1, subst: s, typ: t) ->
-      // Strip Linear/Lazy/Borrow/Ref wrapper, then wrap in Borrow.
-      // stripBorrow(τ) per spec: τ ∈ {%σ, @σ, &σ, ~σ} -> σ. Borrowing a `~τ`
-      // binding yields `&τ` of the cell's contents, not `&(~τ)`.
-      let inner = match t do
-        | TyLinear(inner: u) -> u
-        | TyLazy(inner: u) -> u
-        | TyBorrow(inner: u) -> u
-        | TyRef(inner: u) -> u
-        | _ -> t
-      end
-      return InferExprOk(state: st1, subst: s, typ: TyBorrow(inner))
-  end
-end
-
 // ─── Binary operator inference ──────────────────────────────────────────────
 
 let infer_binop = fn (state: CheckState, left: HirExpr, op: BinaryOp, right: HirExpr, span: Span) -> InferExprResult throws { TypeError } do
@@ -190,177 +131,7 @@ let infer_binop = fn (state: CheckState, left: HirExpr, op: BinaryOp, right: Hir
           let s12 = subst.subst_compose(s1, s2)
           let lt = subst.subst_apply(subst: s12, typ: t1)
           let rt = subst.subst_apply(subst: s12, typ: t2)
-          return resolve_binop_types(state: st2, subst: s12, op, lt, rt, span)
-      end
-  end
-end
-
-let resolve_binop_types = fn (state: CheckState, subst: [SubstEntry], op: BinaryOp, lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
-  match op do
-    // Integer arithmetic -> result is integer type
-    | OpAdd -> return unify_int_binop(state, subst, lt, rt, span)
-    | OpSub -> return unify_int_binop(state, subst, lt, rt, span)
-    | OpMul -> return unify_int_binop(state, subst, lt, rt, span)
-    | OpDiv -> return unify_int_binop(state, subst, lt, rt, span)
-    | OpMod -> return unify_int_binop(state, subst, lt, rt, span)
-    | OpBitAnd -> return unify_int_binop(state, subst, lt, rt, span)
-    | OpBitOr -> return unify_int_binop(state, subst, lt, rt, span)
-    | OpBitXor -> return unify_int_binop(state, subst, lt, rt, span)
-    | OpShl -> return unify_int_binop(state, subst, lt, rt, span)
-    | OpShr -> return unify_int_binop(state, subst, lt, rt, span)
-    // Float arithmetic
-    | OpFAdd -> return unify_float_binop(state, subst, lt, rt, span)
-    | OpFSub -> return unify_float_binop(state, subst, lt, rt, span)
-    | OpFMul -> return unify_float_binop(state, subst, lt, rt, span)
-    | OpFDiv -> return unify_float_binop(state, subst, lt, rt, span)
-    // Integer comparisons -> bool
-    | OpEq -> return unify_cmp_binop(state, subst, lt, rt, span)
-    | OpNe -> return unify_cmp_binop(state, subst, lt, rt, span)
-    | OpLt -> return unify_cmp_binop(state, subst, lt, rt, span)
-    | OpLe -> return unify_cmp_binop(state, subst, lt, rt, span)
-    | OpGt -> return unify_cmp_binop(state, subst, lt, rt, span)
-    | OpGe -> return unify_cmp_binop(state, subst, lt, rt, span)
-    // Float comparisons -> bool
-    | OpFEq -> return unify_float_cmp(state, subst, lt, rt, span)
-    | OpFNe -> return unify_float_cmp(state, subst, lt, rt, span)
-    | OpFLt -> return unify_float_cmp(state, subst, lt, rt, span)
-    | OpFLe -> return unify_float_cmp(state, subst, lt, rt, span)
-    | OpFGt -> return unify_float_cmp(state, subst, lt, rt, span)
-    | OpFGe -> return unify_float_cmp(state, subst, lt, rt, span)
-    // Logical -> bool
-    | OpAnd ->
-      return unify_bool_binop(state, subst, lt, rt, span)
-    | OpOr ->
-      return unify_bool_binop(state, subst, lt, rt, span)
-    // String concat
-    | OpConcat ->
-      let tdefs = tctypes.state_typedefs(state)
-      match unify.unify(t1: lt, t2: TyString, tdefs) do
-        | UnifyErr(message: m) -> return InferExprErr(message: "concat lhs: " ++ m, span)
-        | UnifyOk(subst: s1) ->
-          let s_merged = subst.subst_compose(s1: subst, s2: s1)
-          match unify.unify(t1: subst.subst_apply(subst: s_merged, typ: rt), t2: TyString, tdefs) do
-            | UnifyErr(message: m) -> return InferExprErr(message: "concat rhs: " ++ m, span)
-            | UnifyOk(subst: s2) ->
-              return InferExprOk(state, subst: subst.subst_compose(s1: s_merged, s2), typ: TyString)
-          end
-      end
-  end
-end
-
-let unify_int_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
-  let target = select_int_type(a: lt, b: rt)
-  let tdefs = tctypes.state_typedefs(state)
-  match unify.unify(t1: lt, t2: target, tdefs) do
-    | UnifyErr(message: m) -> return InferExprErr(message: "int op lhs: " ++ m, span)
-    | UnifyOk(subst: s1) ->
-      let sm = subst.subst_compose(s1: subst, s2: s1)
-      match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: target, tdefs) do
-        | UnifyErr(message: m) -> return InferExprErr(message: "int op rhs: " ++ m, span)
-        | UnifyOk(subst: s2) ->
-          return InferExprOk(state, subst: subst.subst_compose(s1: sm, s2), typ: target)
-      end
-  end
-end
-
-let unify_float_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
-  let target = select_float_type(a: lt, b: rt)
-  let tdefs = tctypes.state_typedefs(state)
-  match unify.unify(t1: lt, t2: target, tdefs) do
-    | UnifyErr(message: m) -> return InferExprErr(message: "float op lhs: " ++ m, span)
-    | UnifyOk(subst: s1) ->
-      let sm = subst.subst_compose(s1: subst, s2: s1)
-      match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: target, tdefs) do
-        | UnifyErr(message: m) -> return InferExprErr(message: "float op rhs: " ++ m, span)
-        | UnifyOk(subst: s2) ->
-          return InferExprOk(state, subst: subst.subst_compose(s1: sm, s2), typ: target)
-      end
-  end
-end
-
-// ─── comparable(τ) — T-Cmp side-condition (spec type-system-formal.md) ────────
-//
-// Recursive predicate guarding ==, !=, <, <=, >, >=. Accepts base scalars,
-// records and lists whose elements are themselves comparable, and named
-// (record-typedef) types via tdef expansion. Rejects arrows, handlers, refs,
-// borrows, lazy/thunk wrappers, arrays, and linear values — categories whose
-// runtime equality is undefined per spec. Free type variables are accepted
-// (deferred): unification has not yet pinned the type, and the rest of the
-// pipeline gets a fair shot at constraining it.
-
-let comparable_named_type_list = fn (nts: [NamedType], tdefs: [TypeDefEntry]) -> bool do
-  match nts do
-    | [] -> return true
-    | NamedType(name: _, typ: t) :: rest ->
-      if comparable(typ: t, tdefs) then
-        return comparable_named_type_list(nts: rest, tdefs)
-      end
-      return false
-  end
-end
-
-let comparable = fn (typ: TypeExpr, tdefs: [TypeDefEntry]) -> bool do
-  match typ do
-    | TyI32 -> return true
-    | TyI64 -> return true
-    | TyF32 -> return true
-    | TyF64 -> return true
-    | TyBool -> return true
-    | TyChar -> return true
-    | TyString -> return true
-    | TyUnit -> return true
-    | TyIntLit -> return true
-    | TyFloatLit -> return true
-    | TyVar(_) -> return true
-    | TyRecord(fields: fs) -> return comparable_named_type_list(nts: fs, tdefs)
-    | TyList(elem: e) -> return comparable(typ: e, tdefs)
-    | TyUserDefined(name: n, args: _) ->
-      // Expand record typedef when known; unknown names (enums, opaque) are
-      // accepted to avoid blanket-rejecting practical code beyond the bug at
-      // hand. Tighten in a follow-up once enum equality is specified.
-      match tctypes.typedef_lookup(defs: tdefs, name: n) do
-        | Some(val: RecordDef(fields: fs, _)) ->
-          return comparable_named_type_list(nts: fs, tdefs)
-        | None -> return true
-      end
-    | _ -> return false
-  end
-end
-
-let comparable_reject_msg = fn (typ: TypeExpr) -> string do
-  return "cannot compare values of type `" ++ tctypes.type_to_string(typ) ++ "`: comparison undefined for arrows / handlers / refs / borrows / thunks / arrays"
-end
-
-let unify_cmp_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
-  let tdefs = tctypes.state_typedefs(state)
-  match unify.unify(t1: lt, t2: rt, tdefs) do
-    | UnifyErr(message: m) -> return InferExprErr(message: "comparison: " ++ m, span)
-    | UnifyOk(subst: s1) ->
-      let sm = subst.subst_compose(s1: subst, s2: s1)
-      let resolved = subst.subst_apply(subst: sm, typ: lt)
-      if comparable(typ: resolved, tdefs) then
-        return InferExprOk(state, subst: sm, typ: TyBool)
-      end
-      return InferExprErr(message: comparable_reject_msg(typ: resolved), span)
-  end
-end
-
-let unify_float_cmp = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
-  let tdefs = tctypes.state_typedefs(state)
-  let target = select_float_type(a: lt, b: rt)
-  match unify.unify(t1: lt, t2: target, tdefs) do
-    | UnifyErr(message: m) -> return InferExprErr(message: "float cmp lhs: " ++ m, span)
-    | UnifyOk(subst: s1) ->
-      let sm = subst.subst_compose(s1: subst, s2: s1)
-      match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: target, tdefs) do
-        | UnifyErr(message: m) -> return InferExprErr(message: "float cmp rhs: " ++ m, span)
-        | UnifyOk(subst: s2) ->
-          let sm2 = subst.subst_compose(s1: sm, s2)
-          let resolved = subst.subst_apply(subst: sm2, typ: target)
-          if comparable(typ: resolved, tdefs) then
-            return InferExprOk(state, subst: sm2, typ: TyBool)
-          end
-          return InferExprErr(message: comparable_reject_msg(typ: resolved), span)
+          return operators.resolve_binop_types(state: st2, subst: s12, op, lt, rt, span)
       end
   end
 end
@@ -373,8 +144,8 @@ let infer_unop = fn (state: CheckState, op: UnaryOp, operand: HirExpr, span: Spa
     | InferExprOk(state: st1, subst: s1, typ: t) ->
       let tdefs = tctypes.state_typedefs(state: st1)
       let target = match op do
-        | OpNeg -> select_int_type(a: t, b: t)
-        | OpFNeg -> select_float_type(a: t, b: t)
+        | OpNeg -> operators.select_int_type(a: t, b: t)
+        | OpFNeg -> operators.select_float_type(a: t, b: t)
         | OpNot -> TyBool
       end
       match unify.unify(t1: t, t2: target, tdefs) do
@@ -383,59 +154,6 @@ let infer_unop = fn (state: CheckState, op: UnaryOp, operand: HirExpr, span: Spa
           return InferExprOk(state: st1, subst: subst.subst_compose(s1, s2), typ: target)
       end
   end
-end
-
-let unify_bool_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
-  let tdefs = tctypes.state_typedefs(state)
-  match unify.unify(t1: lt, t2: TyBool, tdefs) do
-    | UnifyErr(message: m) -> return InferExprErr(message: "logical lhs: " ++ m, span)
-    | UnifyOk(subst: s1) ->
-      let sm = subst.subst_compose(s1: subst, s2: s1)
-      match unify.unify(t1: subst.subst_apply(subst: sm, typ: rt), t2: TyBool, tdefs) do
-        | UnifyErr(message: m) -> return InferExprErr(message: "logical rhs: " ++ m, span)
-        | UnifyOk(subst: s2) ->
-          return InferExprOk(state, subst: subst.subst_compose(s1: sm, s2), typ: TyBool)
-      end
-  end
-end
-
-// ─── Numeric type selection ─────────────────────────────────────────────────
-
-// select_int_type / select_float_type: HM numeric literal defaulting site.
-//
-// Both operands reaching here are already numeric-flex (TyIntLit / TyFloatLit)
-// or concrete (TyI32/TyI64 / TyF32/TyF64). When both are flex, no context
-// has constrained the width, so we commit to the principal type (TyI64 / TyF64)
-// — the same default the rest of HM applies to unresolved integer / float
-// literals. This is an intentional commit, not a silent failure: the alternative
-// (emit a fresh var and defer) would just leak TyIntLit up the expression tree
-// until some outer site had to pick the same default anyway.
-let select_int_type = fn (a: TypeExpr, b: TypeExpr) -> TypeExpr throws { TypeError } do
-  match a do
-    | TyI32 -> return TyI32
-    | TyI64 -> return TyI64
-    | _ -> ()
-  end
-  match b do
-    | TyI32 -> return TyI32
-    | TyI64 -> return TyI64
-    | _ -> ()
-  end
-  return TyI64
-end
-
-let select_float_type = fn (a: TypeExpr, b: TypeExpr) -> TypeExpr throws { TypeError } do
-  match a do
-    | TyF32 -> return TyF32
-    | TyF64 -> return TyF64
-    | _ -> ()
-  end
-  match b do
-    | TyF32 -> return TyF32
-    | TyF64 -> return TyF64
-    | _ -> ()
-  end
-  return TyF64
 end
 
 // ─── Call inference ─────────────────────────────────────────────────────────
@@ -819,21 +537,6 @@ let tc_str_lt = fn (a: string, b: string) -> bool throws { TypeError } do
   return tc_str_lt_loop(a, b, idx: 0, la: str.length(s: a), lb: str.length(s: b))
 end
 
-type FreshenResult = FreshenResult(state: CheckState, param_subst: [SubstEntry])
-
-let freshen_type_params = fn (state: CheckState, params: [string]) -> FreshenResult throws { TypeError } do
-  match params do
-    | [] -> return FreshenResult(state, param_subst: subst.subst_empty())
-    | p :: rest ->
-      let FreshResult(state: st1, typ: tv) = tctypes.tc_fresh_var(state)
-      let FreshenResult(state: st2, param_subst: ps) = freshen_type_params(state: st1, params: rest)
-      return FreshenResult(
-        state: st2,
-        param_subst: SubstEntry(var: p, typ: tv) :: ps
-      )
-  end
-end
-
 let build_enum_type = fn (name: string, params: [string], param_subst: [SubstEntry]) -> TypeExpr throws { TypeError } do
   let args = build_type_args(params, param_subst)
   return TyUserDefined(name, args)
@@ -908,17 +611,6 @@ let infer_record_fields = fn (state: CheckState, fields: [HirNamedExpr], subst: 
       end
   end
 end
-
-let reverse_named_types = fn (nts: [NamedType], out: [NamedType]) -> [NamedType] throws { TypeError } do
-  match nts do
-    | [] -> return out
-    | h :: rest ->
-      return reverse_named_types(nts: rest, out: h :: out)
-  end
-end
-
-// Fix infer_record to use the correct helper
-// (Override the earlier definition by redefining)
 
 // ─── Array inference ────────────────────────────────────────────────────────
 
@@ -1017,59 +709,6 @@ let infer_field_access = fn (state: CheckState, target: HirExpr, field: string, 
           end
         | _ -> return InferExprErr(message: "field access on non-record type", span)
       end
-  end
-end
-
-// Walk record fields; report the name of the first field that carries a
-// linear type (TyLinear / TyLazy), looking through anonymous TyRecord
-// nesting and named-type aliases (RecordDef). `depth` caps recursion in
-// case a typedef has a cycle.
-let find_linear_field = fn (
-  fields: [NamedType], tdefs: [tctypes.TypeDefEntry], depth: i64
-) -> Option<string> throws { TypeError } do
-  match fields do
-    | [] -> return None
-    | NamedType(name: fname, typ: ft) :: rest ->
-      if type_carries_linear(typ: ft, tdefs, depth) then
-        return Some(val: fname)
-      end
-      return find_linear_field(fields: rest, tdefs, depth)
-  end
-end
-
-let type_carries_linear = fn (
-  typ: TypeExpr, tdefs: [tctypes.TypeDefEntry], depth: i64
-) -> bool throws { TypeError } do
-  if depth <= 0 then return false end
-  match typ do
-    | TyLinear(_) -> return true
-    | TyLazy(_) -> return true
-    | TyRecord(fields: fs) ->
-      match find_linear_field(fields: fs, tdefs, depth: depth - 1) do
-        | Some(_) -> return true
-        | None -> return false
-      end
-    | TyUserDefined(name: n, args: _) ->
-      match tctypes.typedef_lookup(defs: tdefs, name: n) do
-        | Some(val: RecordDef(name: _, is_public: _, type_params: _, fields: rec_fields)) ->
-          match find_linear_field(fields: rec_fields, tdefs, depth: depth - 1) do
-            | Some(_) -> return true
-            | None -> return false
-          end
-        | None -> return false
-      end
-    | _ -> return false
-  end
-end
-
-let lookup_named_type = fn (nts: [NamedType], name: string) -> Option<TypeExpr> throws { TypeError } do
-  match nts do
-    | [] -> return None
-    | NamedType(name: n, typ: t) :: rest ->
-      if n == name then
-        return Some(val: t)
-      end
-      return lookup_named_type(nts: rest, name)
   end
 end
 
