@@ -234,6 +234,11 @@ let main = fn () -> unit require { PermConsole } do
 end
 ```
 
+Convention: `require { ... }` and `throws { ... }` rows are sets — order is
+irrelevant to the typechecker. List entries alphabetically (e.g.
+`require { Console, Fs }`, `require { PermClock, PermConsole, PermFs, PermProc }`).
+Omit `require { ... }` entirely when the body needs no caps.
+
 ## Type System Summary
 
 | Type | Syntax | Notes |

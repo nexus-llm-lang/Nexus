@@ -11,6 +11,11 @@ npx skills add nexus-llm-lang/Nexus --skill nexus-lang
 ## Nix-managed Repository
 Development tooling/targets change → update `flake.nix` first.
 
+## Capability Row Ordering
+`require { ... }` and `throws { ... }` rows are sets — order is not load-bearing.
+By convention, list capabilities/exceptions alphabetically (e.g. `require { Console, Fs }`, `require { PermClock, PermConsole, PermFs, PermProc }`).
+Drop `require { ... }` entirely if the body uses no caps.
+
 ## Session Completion
 1. Create issues for remaining work (`bd create`)
 2. Run quality gates if code changed
