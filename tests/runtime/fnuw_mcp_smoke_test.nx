@@ -1,0 +1,259 @@
+// Issue nexus-fnuw — MCP server end-to-end smoke test.
+//
+// Drives `dispatch_message` directly rather than spawning `nexus mcp` as a
+// subprocess. Rationale: `Proc.exec` is a -1 stub under WASI preview1 (the
+// runtime profile the test harness runs under), so the subprocess path
+// would never reach actual MCP code. Calling the dispatch function with
+// synthesised IncomingMessage values exercises the same code path the I/O
+// loop does — minus the framing layer, which is independently covered by
+// the std:jsonrpc tests.
+//
+// Coverage:
+//   1. initialize  -> response carries `protocolVersion`, `capabilities`,
+//      and `serverInfo` fields.
+//   2. tools/list  -> result.tools is a 2-element JsonArray (typecheck +
+//      explain). Asserts each tool's name.
+//   3. tools/call typecheck on a deliberately broken source file -> reply
+//      contains a `content` array with at least one text block, and the
+//      embedded payload mentions a diagnostic (count > 0).
+import * as test_assert from "std:test/assert"
+import * as mcp from "src/mcp/main.nx"
+import {
+  JsonValue, JsonInt, JsonString, JsonObject, JsonArray, JsonField,
+  get_field
+} from "std:json"
+import { Some, None } from "std:option"
+import {
+  Request, IncomingMessage
+} from "std:jsonrpc"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+import * as str from "std:str"
+import * as list from "std:list"
+
+let req_id = fn () -> JsonValue do
+  return JsonInt(val: 1)
+end
+
+let empty_params = fn () -> JsonValue do
+  return JsonObject(fields: [])
+end
+
+let expect_object = fn (v: JsonValue, label: string) -> [JsonField] throws { Exn } do
+  match v do
+    | JsonObject(fields) -> return fields
+    | _ -> raise RuntimeError(val: label ++ ": expected JsonObject")
+  end
+end
+
+let expect_array = fn (v: JsonValue, label: string) -> [JsonValue] throws { Exn } do
+  match v do
+    | JsonArray(items) -> return items
+    | _ -> raise RuntimeError(val: label ++ ": expected JsonArray")
+  end
+end
+
+let expect_string = fn (v: JsonValue, label: string) -> string throws { Exn } do
+  match v do
+    | JsonString(val: s) -> return s
+    | _ -> raise RuntimeError(val: label ++ ": expected JsonString")
+  end
+end
+
+let require_field = fn (obj: JsonValue, key: string, label: string) -> JsonValue throws { Exn } do
+  match get_field(obj, key) do
+    | Some(val: v) -> return v
+    | None -> raise RuntimeError(val: label ++ ": missing field '" ++ key ++ "'")
+  end
+end
+
+let array_length = fn (xs: [JsonValue]) -> i64 do
+  return list.length(xs)
+end
+
+// ─── Test 1: initialize ─────────────────────────────────────────────────────
+
+let test_initialize = fn () -> unit require { Console, Fs } throws { Exn } do
+  let msg = Request(id: req_id(), method: "initialize", params: empty_params())
+  match mcp.dispatch_message(msg) do
+    | None -> raise RuntimeError(val: "initialize: expected response, got None")
+    | Some(val: resp) ->
+      let result = require_field(obj: resp, key: "result", label: "initialize.response")
+      let pv = require_field(obj: result, key: "protocolVersion", label: "initialize.result")
+      let pv_str = expect_string(v: pv, label: "protocolVersion")
+      test_assert.assert_eq_string(
+        actual: pv_str, expected: "2024-11-05",
+        label: "MCP protocol version"
+      )
+      let _ = require_field(obj: result, key: "capabilities", label: "initialize.result")
+      let server_info = require_field(obj: result, key: "serverInfo", label: "initialize.result")
+      let name = expect_string(
+        v: require_field(obj: server_info, key: "name", label: "serverInfo"),
+        label: "serverInfo.name"
+      )
+      test_assert.assert_eq_string(
+        actual: name, expected: "nexus-mcp",
+        label: "serverInfo.name"
+      )
+      return ()
+  end
+end
+
+// ─── Test 2: tools/list ─────────────────────────────────────────────────────
+
+let test_tools_list = fn () -> unit require { Console, Fs } throws { Exn } do
+  let msg = Request(id: req_id(), method: "tools/list", params: empty_params())
+  match mcp.dispatch_message(msg) do
+    | None -> raise RuntimeError(val: "tools/list: expected response")
+    | Some(val: resp) ->
+      let result = require_field(obj: resp, key: "result", label: "tools/list.response")
+      let tools_v = require_field(obj: result, key: "tools", label: "tools/list.result")
+      let tools = expect_array(v: tools_v, label: "tools")
+      let n = array_length(xs: tools)
+      test_assert.assert_eq_i64(
+        actual: n, expected: 2,
+        label: "tools/list tool count"
+      )
+      // Both tools must carry a `name` field. We don't pin a specific order
+      // (the dispatcher's spec only says "an array"); check membership.
+      match tools do
+        | t0 :: t1 :: [] ->
+          let n0 = expect_string(
+            v: require_field(obj: t0, key: "name", label: "tools[0]"),
+            label: "tools[0].name"
+          )
+          let n1 = expect_string(
+            v: require_field(obj: t1, key: "name", label: "tools[1]"),
+            label: "tools[1].name"
+          )
+          let both = (n0 == "typecheck" && n1 == "explain") || (n0 == "explain" && n1 == "typecheck")
+          test_assert.assert(
+            cond: both,
+            label: "tools/list names == {typecheck, explain}"
+          )
+        | _ -> raise RuntimeError(val: "tools/list: expected exactly 2 tools")
+      end
+      // Each tool must have an inputSchema object.
+      match tools do
+        | t0 :: t1 :: [] ->
+          let _ = require_field(obj: t0, key: "inputSchema", label: "tools[0]")
+          let _ = require_field(obj: t1, key: "inputSchema", label: "tools[1]")
+          return ()
+        | _ -> raise RuntimeError(val: "tools/list: expected exactly 2 tools (schema check)")
+      end
+  end
+end
+
+// ─── Test 3: tools/call typecheck on a broken file ──────────────────────────
+//
+// We write a deliberately broken Nexus source file into the working
+// directory, drive `tools/call typecheck file=...`, and assert the reply
+// envelope contains a `content[].text` payload whose serialised JSON
+// mentions at least one diagnostic.
+
+let broken_source = fn () -> string do
+  // Type mismatch: a function declared `-> i64` returns a string literal.
+  return "let main = fn () -> unit do\n"
+      ++ "  let _ = bad_fn(x: 7)\n"
+      ++ "  return ()\n"
+      ++ "end\n"
+      ++ "let bad_fn = fn (x: i64) -> i64 do\n"
+      ++ "  return \"not an i64\"\n"
+      ++ "end\n"
+end
+
+let broken_file_path = fn () -> string do
+  return "./.fnuw_mcp_broken.nx"
+end
+
+let test_typecheck_tool = fn () -> unit require { Console, Fs } throws { Exn } do
+  let path = broken_file_path()
+  Fs.write_string(path, content: broken_source())
+  let args = JsonObject(fields: [
+    JsonField(key: "file", value: JsonString(val: path))
+  ])
+  let params = JsonObject(fields: [
+    JsonField(key: "name", value: JsonString(val: "typecheck")),
+    JsonField(key: "arguments", value: args)
+  ])
+  let msg = Request(id: req_id(), method: "tools/call", params)
+  match mcp.dispatch_message(msg) do
+    | None -> raise RuntimeError(val: "tools/call: expected response")
+    | Some(val: resp) ->
+      let result = require_field(obj: resp, key: "result", label: "tools/call.response")
+      let content_v = require_field(obj: result, key: "content", label: "tools/call.result")
+      let content = expect_array(v: content_v, label: "content")
+      let n = array_length(xs: content)
+      test_assert.assert(
+        cond: n >= 1,
+        label: "tools/call.result.content[] non-empty"
+      )
+      match content do
+        | block :: _ ->
+          let typ = expect_string(
+            v: require_field(obj: block, key: "type", label: "content[0]"),
+            label: "content[0].type"
+          )
+          test_assert.assert_eq_string(
+            actual: typ, expected: "text",
+            label: "content[0].type"
+          )
+          let text = expect_string(
+            v: require_field(obj: block, key: "text", label: "content[0]"),
+            label: "content[0].text"
+          )
+          // The embedded JSON payload should mention `diagnostics`; this is
+          // a brittle-but-cheap signal that the typecheck pipeline actually
+          // produced one.
+          let has_diag_word = str.index_of(s: text, sub: "diagnostics") >= 0
+          test_assert.assert(
+            cond: has_diag_word,
+            label: "typecheck output mentions 'diagnostics'"
+          )
+          // The summary field carries either "ok: ..." or "found N ..." —
+          // for a broken file we expect the latter.
+          let found_count = str.index_of(s: text, sub: "\"summary\":\"found")
+          test_assert.assert(
+            cond: found_count >= 0,
+            label: "typecheck summary reports 'found' for broken source"
+          )
+        | [] -> raise RuntimeError(val: "tools/call: empty content")
+      end
+      // Best-effort cleanup; ignore failure (e.g. running in --dir without write).
+      try
+        Fs.remove_file(path)
+        return ()
+      catch _ -> return ()
+      end
+  end
+end
+
+// ─── Driver ─────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit require { Console, Fs } throws { Exn } do
+  test_initialize()
+  test_tools_list()
+  test_typecheck_tool()
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console, Fs } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole, PermFs } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    // Trap-on-failure: dividing by zero produces a non-zero exit code which
+    // the test harness reads as FAIL.
+    let _ = 1 / ok
+    return ()
+  end
+end

@@ -1,0 +1,493 @@
+/**
+ * mcp/main: Nexus Model Context Protocol server.
+ *
+ * Exposes a subset of compiler queries to MCP clients (Claude Code, IDE
+ * agents, etc.) over the same Content-Length framed JSON-RPC transport the
+ * LSP uses. Reading typecheck/explain results through MCP avoids the
+ * subprocess-per-query overhead of `nexus typecheck` + parsing stderr that
+ * agent harnesses currently pay.
+ *
+ * Wire shape (MCP 2024-11-05):
+ *   - initialize       -> {protocolVersion, capabilities: {tools: {}}, serverInfo: {name, version}}
+ *   - tools/list       -> {tools: [{name, description, inputSchema}]}
+ *   - tools/call name=... arguments={...}
+ *                      -> {content: [{type: "text", text}], isError?: bool}
+ *
+ * V1 tool surface (issue nexus-fnuw):
+ *   - typecheck(file: string)
+ *       Reads `file` via Fs, runs the import-aware lex+parse+typecheck pipeline
+ *       reused from `src/lsp/diagnostics_pipeline`, returns one diagnostic per
+ *       reported error (or "ok" when the program typechecks clean).
+ *   - explain(file: string, line: i64, col: i64)
+ *       Resolves the identifier under the cursor through `src/lsp/handlers/definition`.
+ *       Returns either a JSON-shaped definition location ({file, line, col}) or
+ *       a "no definition found" message.
+ *
+ * Follow-up bd issues track find_refs, hover, completion, run_sandbox, and
+ * explain_capabilities — each is a small additive PR once this scaffold is in.
+ *
+ * Capability discipline mirrors src/lsp/main.nx:
+ *   PermConsole — read JSON-RPC frames from stdin, write responses to stdout.
+ *   PermFs      — read source files (and their imports) for typecheck/explain.
+ */
+
+import {
+  JsonValue, JsonNull, JsonInt, JsonString, JsonBool, JsonArray, JsonObject,
+  JsonField, JsonError, get_field
+}, * as json from "std:json"
+import { Option, Some, None } from "std:option"
+import { Fs } from "std:fs"
+import * as fs_mod from "std:fs"
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+import {
+  IncomingMessage, Request, Notification, Malformed,
+  JsonRpcFrameError, JsonRpcError,
+  response_ok, response_error,
+  method_not_found, invalid_request, invalid_params, internal_error,
+  classify, read_message, write_message
+} from "std:jsonrpc"
+import {
+  DiagEntry, DiagRange, SeverityError
+} from "src/lsp/diagnostics.nx"
+import {
+  compute_diagnostics_for_buffer
+} from "src/lsp/diagnostics_pipeline.nx"
+import {
+  resolve_definition
+} from "src/lsp/handlers/definition.nx"
+import {
+  Location, Range, Position
+} from "src/lsp/protocol.nx"
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+/// MCP wire-protocol version. The 2024-11-05 revision is the one Claude Code
+/// negotiates; bumping requires no code change here as long as the response
+/// shape stays the same.
+let mcp_protocol_version = "2024-11-05"
+
+let server_name = "nexus-mcp"
+let server_version = "0.1.0"
+
+// ─── Tool schemas ────────────────────────────────────────────────────────────
+//
+// MCP `tools/list` returns a JSON object per tool with `name`, `description`,
+// and `inputSchema` (a JSON Schema fragment). Two tools for V1.
+
+let typecheck_schema = fn () -> JsonValue do
+  let file_prop = JsonObject(fields: [
+    JsonField(key: "type", value: JsonString(val: "string")),
+    JsonField(key: "description", value: JsonString(val: "Path to the Nexus source file to typecheck."))
+  ])
+  let props = JsonObject(fields: [
+    JsonField(key: "file", value: file_prop)
+  ])
+  return JsonObject(fields: [
+    JsonField(key: "type", value: JsonString(val: "object")),
+    JsonField(key: "properties", value: props),
+    JsonField(key: "required", value: JsonArray(items: [JsonString(val: "file")]))
+  ])
+end
+
+let explain_schema = fn () -> JsonValue do
+  let file_prop = JsonObject(fields: [
+    JsonField(key: "type", value: JsonString(val: "string")),
+    JsonField(key: "description", value: JsonString(val: "Path to the Nexus source file containing the cursor."))
+  ])
+  let line_prop = JsonObject(fields: [
+    JsonField(key: "type", value: JsonString(val: "integer")),
+    JsonField(key: "description", value: JsonString(val: "0-based line index of the cursor."))
+  ])
+  let col_prop = JsonObject(fields: [
+    JsonField(key: "type", value: JsonString(val: "integer")),
+    JsonField(key: "description", value: JsonString(val: "0-based column (character) index of the cursor."))
+  ])
+  let props = JsonObject(fields: [
+    JsonField(key: "file", value: file_prop),
+    JsonField(key: "line", value: line_prop),
+    JsonField(key: "col", value: col_prop)
+  ])
+  return JsonObject(fields: [
+    JsonField(key: "type", value: JsonString(val: "object")),
+    JsonField(key: "properties", value: props),
+    JsonField(key: "required", value: JsonArray(items: [
+      JsonString(val: "file"), JsonString(val: "line"), JsonString(val: "col")
+    ]))
+  ])
+end
+
+let tool_descriptor = fn (name: string, description: string, schema: JsonValue) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "name", value: JsonString(val: name)),
+    JsonField(key: "description", value: JsonString(val: description)),
+    JsonField(key: "inputSchema", value: schema)
+  ])
+end
+
+/// Static `tools/list` payload. The two-entry shape is the V1 scope; follow-up
+/// bd issues add find_refs / hover / completion / run_sandbox / explain_capabilities
+/// in separate PRs.
+let tools_list_result = fn () -> JsonValue do
+  let typecheck_tool = tool_descriptor(
+    name: "typecheck",
+    description: "Run the Nexus typechecker against a source file and return any diagnostics.",
+    schema: typecheck_schema()
+  )
+  let explain_tool = tool_descriptor(
+    name: "explain",
+    description: "Resolve the identifier at (line, col) in a Nexus source file and return its definition site.",
+    schema: explain_schema()
+  )
+  return JsonObject(fields: [
+    JsonField(key: "tools", value: JsonArray(items: [typecheck_tool, explain_tool]))
+  ])
+end
+
+// ─── Initialize response ─────────────────────────────────────────────────────
+
+let initialize_result = fn () -> JsonValue do
+  let server_info = JsonObject(fields: [
+    JsonField(key: "name", value: JsonString(val: server_name)),
+    JsonField(key: "version", value: JsonString(val: server_version))
+  ])
+  // capabilities.tools is an object (empty per spec when no list-changed
+  // notification is advertised) — clients use its presence as the
+  // "this server has tools" signal and then call tools/list.
+  let capabilities = JsonObject(fields: [
+    JsonField(key: "tools", value: JsonObject(fields: []))
+  ])
+  return JsonObject(fields: [
+    JsonField(key: "protocolVersion", value: JsonString(val: mcp_protocol_version)),
+    JsonField(key: "capabilities", value: capabilities),
+    JsonField(key: "serverInfo", value: server_info)
+  ])
+end
+
+// ─── MCP content + result envelope helpers ───────────────────────────────────
+//
+// Every `tools/call` reply must wrap its payload in `{content: [{type, text}],
+// isError?}`. We always emit a single text block — structured JSON output is
+// produced by serialising into the `text` field. This keeps the V1 surface
+// uniform and matches what every MCP client renders.
+
+let text_content_block = fn (text: string) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "type", value: JsonString(val: "text")),
+    JsonField(key: "text", value: JsonString(val: text))
+  ])
+end
+
+let tool_result_ok = fn (text: string) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "content", value: JsonArray(items: [text_content_block(text)]))
+  ])
+end
+
+let tool_result_error = fn (text: string) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "content", value: JsonArray(items: [text_content_block(text)])),
+    JsonField(key: "isError", value: JsonBool(val: true))
+  ])
+end
+
+// ─── tools/call argument extraction ──────────────────────────────────────────
+
+let get_string_arg = fn (args: JsonValue, key: string) -> Option<string> do
+  match get_field(obj: args, key) do
+    | None -> return None
+    | Some(val: v) ->
+      match v do
+        | JsonString(val: s) -> return Some(val: s)
+        | _ -> return None
+      end
+  end
+end
+
+let get_int_arg = fn (args: JsonValue, key: string) -> Option<i64> do
+  match get_field(obj: args, key) do
+    | None -> return None
+    | Some(val: v) ->
+      match v do
+        | JsonInt(val: n) -> return Some(val: n)
+        | _ -> return None
+      end
+  end
+end
+
+// ─── Diagnostic → JSON ───────────────────────────────────────────────────────
+//
+// One JSON object per `DiagEntry`. Range coordinates stay 1-based here (the
+// internal/diagnostic surface format) — agents consuming this output read
+// alongside `nexus typecheck` text output which is also 1-based, so converting
+// to 0-based LSP coordinates would be the surprise.
+
+let diag_to_json = fn (d: DiagEntry) -> JsonValue do
+  match d do | DiagEntry(file, range, severity: _, code, message) ->
+    match range do | DiagRange(start_line, start_col, end_line, end_col) ->
+      let range_json = JsonObject(fields: [
+        JsonField(key: "startLine", value: JsonInt(val: start_line)),
+        JsonField(key: "startCol", value: JsonInt(val: start_col)),
+        JsonField(key: "endLine", value: JsonInt(val: end_line)),
+        JsonField(key: "endCol", value: JsonInt(val: end_col))
+      ])
+      return JsonObject(fields: [
+        JsonField(key: "file", value: JsonString(val: file)),
+        JsonField(key: "severity", value: JsonString(val: "error")),
+        JsonField(key: "code", value: JsonString(val: code)),
+        JsonField(key: "range", value: range_json),
+        JsonField(key: "message", value: JsonString(val: message))
+      ])
+    end
+  end
+end
+
+let diags_to_json_items = fn (xs: [DiagEntry], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | d :: rest -> return diags_to_json_items(xs: rest, acc: diag_to_json(d) :: acc)
+  end
+end
+
+let reverse_json_values = fn (xs: [JsonValue], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | v :: rest -> return reverse_json_values(xs: rest, acc: v :: acc)
+  end
+end
+
+let diags_to_json_array = fn (xs: [DiagEntry]) -> JsonValue do
+  let reversed = diags_to_json_items(xs, acc: [])
+  return JsonArray(items: reverse_json_values(xs: reversed, acc: []))
+end
+
+let count_diags = fn (xs: [DiagEntry], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_diags(xs: rest, acc: acc + 1)
+  end
+end
+
+// ─── Tool: typecheck ─────────────────────────────────────────────────────────
+
+/// Run the typecheck pipeline against `file` and return a `tools/call`
+/// payload. `Fs.read_to_string` may raise `FileNotFound`; the caller wraps
+/// us in a try/catch that converts that into an isError result.
+export let run_typecheck_tool = fn (file: string) -> JsonValue require { Console, Fs } do
+  try
+    let text = Fs.read_to_string(path: file)
+    // compute_diagnostics_for_buffer already absorbs lex/parse/import-resolve
+    // failures into single origin-anchored DiagEntry rows, so the typecheck
+    // tool never raises out of this point.
+    let diags = compute_diagnostics_for_buffer(text, file)
+    let n = count_diags(xs: diags, acc: 0)
+    let summary = if n == 0 then
+        "ok: typecheck succeeded with no diagnostics"
+      else
+        "found " ++ str.from_i64(val: n) ++ " diagnostic(s)"
+      end
+    let payload = JsonObject(fields: [
+      JsonField(key: "file", value: JsonString(val: file)),
+      JsonField(key: "summary", value: JsonString(val: summary)),
+      JsonField(key: "diagnostics", value: diags_to_json_array(xs: diags))
+    ])
+    // The MCP wire convention is one stringly-typed `text` block; we emit
+    // the JSON serialisation so agents parse structured data, falling
+    // back to display text for humans.
+    return tool_result_ok(text: serialize_payload(payload))
+  catch _ ->
+    return tool_result_error(text: "typecheck: failed to read file: " ++ file)
+  end
+end
+
+// ─── Tool: explain ───────────────────────────────────────────────────────────
+
+let explain_payload_no_def = fn (file: string, line: i64, col: i64) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "file", value: JsonString(val: file)),
+    JsonField(key: "line", value: JsonInt(val: line)),
+    JsonField(key: "col", value: JsonInt(val: col)),
+    JsonField(key: "found", value: JsonBool(val: false)),
+    JsonField(key: "message", value: JsonString(val: "no definition found at cursor"))
+  ])
+end
+
+let explain_payload_def = fn (file: string, line: i64, col: i64, loc: Location) -> JsonValue do
+  match loc do | Location(uri: def_uri, range: Range(start: Position(line: def_line, character: def_char), end_: _)) ->
+    let def_obj = JsonObject(fields: [
+      JsonField(key: "file", value: JsonString(val: def_uri)),
+      JsonField(key: "line", value: JsonInt(val: def_line)),
+      JsonField(key: "col", value: JsonInt(val: def_char))
+    ])
+    return JsonObject(fields: [
+      JsonField(key: "file", value: JsonString(val: file)),
+      JsonField(key: "line", value: JsonInt(val: line)),
+      JsonField(key: "col", value: JsonInt(val: col)),
+      JsonField(key: "found", value: JsonBool(val: true)),
+      JsonField(key: "definition", value: def_obj)
+    ])
+  end
+end
+
+/// Look up the definition site for the identifier at (line, col) in `file`.
+/// Reuses `resolve_definition` from the LSP layer so the agent surface and
+/// the editor surface stay in lockstep.
+export let run_explain_tool = fn (file: string, line: i64, col: i64) -> JsonValue require { Console, Fs } do
+  try
+    let text = Fs.read_to_string(path: file)
+    let loc_opt = resolve_definition(text, file_uri: file, line, character: col)
+    let payload = match loc_opt do
+      | None -> explain_payload_no_def(file, line, col)
+      | Some(val: loc) -> explain_payload_def(file, line, col, loc)
+    end
+    return tool_result_ok(text: serialize_payload(payload))
+  catch _ ->
+    return tool_result_error(text: "explain: failed to read file: " ++ file)
+  end
+end
+
+// ─── JSON payload serialisation ──────────────────────────────────────────────
+
+/// Best-effort serialise an MCP payload to a JSON string. If serialisation
+/// itself raises (it shouldn't for our shapes; we never embed NaN/Inf), we
+/// fall back to a sentinel string so the response is still wire-valid.
+let serialize_payload = fn (v: JsonValue) -> string do
+  try
+    return json.serialize(v)
+  catch _ ->
+    return "{\"error\":\"failed to serialise payload\"}"
+  end
+end
+
+// ─── tools/call dispatch ─────────────────────────────────────────────────────
+
+export let dispatch_tool_call = fn (params: JsonValue) -> JsonValue require { Console, Fs } do
+  let name_opt = get_string_arg(args: params, key: "name")
+  let args_opt = get_field(obj: params, key: "arguments")
+  let args = match args_opt do
+    | Some(val: a) -> a
+    | None -> JsonObject(fields: [])
+  end
+  match name_opt do
+    | None -> return tool_result_error(text: "tools/call: missing 'name'")
+    | Some(val: name) ->
+      if name == "typecheck" then
+        match get_string_arg(args, key: "file") do
+          | None -> return tool_result_error(text: "typecheck: missing 'file' argument")
+          | Some(val: file) -> return run_typecheck_tool(file)
+        end
+      end
+      if name == "explain" then
+        let file_opt = get_string_arg(args, key: "file")
+        let line_opt = get_int_arg(args, key: "line")
+        let col_opt = get_int_arg(args, key: "col")
+        match file_opt do
+          | None -> return tool_result_error(text: "explain: missing 'file' argument")
+          | Some(val: file) ->
+            let line = match line_opt do | None -> 0 | Some(val: n) -> n end
+            let col = match col_opt do | None -> 0 | Some(val: n) -> n end
+            return run_explain_tool(file, line, col)
+        end
+      end
+      return tool_result_error(text: "tools/call: unknown tool '" ++ name ++ "'")
+  end
+end
+
+// ─── Method dispatch ─────────────────────────────────────────────────────────
+//
+// Returns the JSON-RPC response (or notification ack `None`) for each
+// inbound message. Exported so the test fixture can drive it directly
+// without spawning a subprocess (Proc.exec is a -1 stub under preview1).
+
+export let dispatch_message = fn (msg: IncomingMessage) -> Option<JsonValue> require { Console, Fs } do
+  match msg do
+    | Request(id, method, params) ->
+      if method == "initialize" then
+        return Some(val: response_ok(id, result: initialize_result()))
+      end
+      if method == "tools/list" then
+        return Some(val: response_ok(id, result: tools_list_result()))
+      end
+      if method == "tools/call" then
+        let result = dispatch_tool_call(params)
+        return Some(val: response_ok(id, result))
+      end
+      if method == "shutdown" then
+        return Some(val: response_ok(id, result: JsonNull))
+      end
+      return Some(val: response_error(id,
+        code: method_not_found,
+        message: "method not found: " ++ method))
+    | Notification(method, params: _) ->
+      // MCP `notifications/initialized` and `exit` arrive as notifications;
+      // both are no-op acks on the response channel. `exit` is observed by
+      // the I/O loop separately.
+      let _ = method
+      return None
+    | Malformed(reason) ->
+      return Some(val: response_error(id: JsonNull,
+        code: invalid_request,
+        message: reason))
+  end
+end
+
+// ─── I/O loop ────────────────────────────────────────────────────────────────
+
+let is_exit_notification = fn (msg: IncomingMessage) -> bool do
+  match msg do
+    | Notification(method, params: _) ->
+      if method == "exit" then return true end
+      return false
+    | _ -> return false
+  end
+end
+
+let run_mcp_loop = fn (remaining: i64) -> unit require { Console, Fs } throws { JsonRpcError } do
+  if remaining == 0 then return () end
+  try
+    match read_message() do
+      | None -> return ()
+      | Some(val: value) ->
+        let classified = classify(value)
+        if is_exit_notification(msg: classified) then return () end
+        let reply = dispatch_message(msg: classified)
+        match reply do
+          | Some(val: r) -> write_message(value: r)
+          | None -> ()
+        end
+        let next_remaining = if remaining < 0 then -1 else remaining - 1 end
+        return run_mcp_loop(remaining: next_remaining)
+    end
+  catch err ->
+    match err do
+      | JsonRpcFrameError(msg) ->
+        Console.eprintln(val: "[mcp] frame error: " ++ msg)
+        let next_remaining = if remaining < 0 then -1 else remaining - 1 end
+        return run_mcp_loop(remaining: next_remaining)
+      | JsonError(msg, pos: _) ->
+        Console.eprintln(val: "[mcp] json parse error: " ++ msg)
+        let next_remaining = if remaining < 0 then -1 else remaining - 1 end
+        return run_mcp_loop(remaining: next_remaining)
+      | _ -> raise err
+    end
+  end
+end
+
+/// Stand-alone entry point used by `nexus mcp`. Drains stdin in the
+/// Content-Length-framed JSON-RPC format, dispatches MCP method names, and
+/// writes responses back to stdout. The `max_iters` knob bounds the loop
+/// for tests; production passes -1 (unbounded, terminate on EOF / exit).
+export let run_mcp_server = fn (max_iters: i64) -> unit require { PermConsole, PermFs } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    try
+      run_mcp_loop(remaining: max_iters)
+      return ()
+    catch _ ->
+      // Frame and JSON parse errors are caught inside run_mcp_loop; this
+      // catch covers genuine invariant violations only.
+      Console.eprintln(val: "[mcp] server terminated abnormally")
+      return ()
+    end
+  end
+end
