@@ -1,0 +1,203 @@
+/**
+ * effect_map: Public surface for the per-function effect summary map.
+ *
+ * Pure data types and read-side accessors for the `EffectMap` produced by
+ * `src/backend/effect_analysis.nx`. Lives in the IR layer so consumers in
+ * `src/ir/lir_opt.nx` (and other IR-layer passes) can read summaries
+ * without importing from the backend.
+ *
+ * Layering:
+ *   * Types, packed-bit helpers, and read accessors (`lookup_bits` etc.)
+ *     are defined here.
+ *   * The producer (`analyze_effects`) lives in `src/backend/effect_analysis.nx`
+ *     and constructs an `EffectMap` via `make_effect_map`, which is the only
+ *     factory exposed across module boundaries (the underlying constructor
+ *     stays opaque).
+ *
+ * Storage layout (see `EffectMap`):
+ *   * `entries` — ordered list of `EffectEntry` (one per LirFunction). Used
+ *     by metric passes (classify, count_raise_sites) and tests that walk
+ *     the full per-function record.
+ *   * `lookup` — linear `%StringMap` keyed by function name; values are
+ *     packed i64s holding `(can_throw << 2) | (is_pure << 1) | 1`. Bit 0
+ *     is the presence flag so `get_or(default: 0)` distinguishes "not in
+ *     map" from "present with both bits clear". This collapses the hot
+ *     `lookup_summary` path from O(N) list scan to O(1) FFI lookup.
+ *
+ * Linear: each EffectMap owns its StringMap and must be freed via
+ * `free_effect_map`. Read-only consumers take `&EffectMap` so the
+ * underlying handle is borrowed, not consumed, on each lookup.
+ */
+
+import { StringMap } from "std:stringmap"
+import * as smap from "std:stringmap"
+
+// ─── Public Types ────────────────────────────────────────────────────────────
+
+/** Per-function effect summary. Field semantics: */
+/** * `capabilities_used` — capability names (e.g. "Fs", "Console") that any */
+/**   transitive callee reaches. Names match the `perm_to_cap_name` mapping */
+/**   in driver.nx so they line up with `--explain-capabilities`. */
+/** * `can_throw` — at least one transitive callee may raise (LirExprRaise, */
+/**   throwing external, or dynamic closure call which is conservatively */
+/**   assumed throwing). */
+/** * `is_pure` — capabilities_used == [] AND can_throw == false AND no */
+/**   transitive call reaches a side-effecting external. Derived field. */
+export type EffectSummary = EffectSummary(
+  capabilities_used: [string],
+  can_throw: bool,
+  is_pure: bool
+)
+
+export type EffectEntry = EffectEntry(name: string, summary: EffectSummary)
+export opaque type EffectMap = EffectMap(entries: [EffectEntry], lookup: %StringMap)
+
+/** Packed (can_throw, is_pure) bits returned from the O(1) lookup path. */
+export type EffectBits = EffectBits(can_throw: bool, is_pure: bool)
+
+// ─── Packed-Bit Helpers ──────────────────────────────────────────────────────
+//
+// The `lookup` StringMap stores per-function bits packed into a single i64:
+//   bit 0 — presence flag (so smap.get_or(default: 0) means "no entry")
+//   bit 1 — is_pure
+//   bit 2 — can_throw
+// `pack_summary` is exported because the producer (effect_analysis.finalise_smap)
+// writes into the same packed format; the `packed_*` getters are internal to
+// `lookup_bits`.
+
+// Bitwise OR helper. When `a` and `b` are bit-disjoint this reduces to
+// `a + b`; when they overlap, `(a + b) - (a & b)` counts the shared bits
+// once. Exported for the producer's cap-bitmask union path.
+export let bit_or = fn (a: i64, b: i64) -> i64 do
+  return (a + b) - (a & b)
+end
+
+export let pack_summary = fn (can_throw: bool, is_pure: bool) -> i64 do
+  let ct_bit = if can_throw then 4 else 0 end
+  let ip_bit = if is_pure then 2 else 0 end
+  return bit_or(a: bit_or(a: ct_bit, b: ip_bit), b: 1)
+end
+
+let packed_present = fn (packed: i64) -> bool do
+  return (packed & 1) != 0
+end
+
+let packed_can_throw = fn (packed: i64) -> bool do
+  return (packed & 4) != 0
+end
+
+let packed_is_pure = fn (packed: i64) -> bool do
+  return (packed & 2) != 0
+end
+
+// ─── Factory ─────────────────────────────────────────────────────────────────
+//
+// `EffectMap` is opaque: the constructor is private to this module. The
+// producer (`src/backend/effect_analysis.nx::finalise_smap`) calls
+// `make_effect_map` to materialise the result from its converged state.
+
+/** Wrap the producer's converged (entries, lookup) pair in an EffectMap. */
+/** Consumes the linear `%StringMap` handle; the resulting %EffectMap owns it. */
+export let make_effect_map = fn (entries: [EffectEntry], lookup: %StringMap) -> %EffectMap do
+  let em = EffectMap(entries, lookup: %lookup)
+  let %em = em
+  return %em
+end
+
+// ─── Lookup helpers (consumer convenience) ───────────────────────────────────
+
+/** Releases the EffectMap's StringMap handle. Consumes the linear value. */
+export let free_effect_map = fn (em: %EffectMap) -> unit do
+  let EffectMap(entries: _, lookup) = em
+  smap.free(map: %lookup)
+  return ()
+end
+
+/** Lookup the (can_throw, is_pure) bits for `name`. Returns None if the */
+/** name is not in the map. This is the hot path used by codegen / lir_opt */
+/** / memo_plan; capabilities_used is intentionally not surfaced here */
+/** because no consumer reads it. Backed by O(1) StringMap lookup. */
+export let lookup_bits = fn (em: &EffectMap, name: string) -> Option<EffectBits> do
+  let EffectMap(entries: _, lookup) = em
+  let packed = smap.get_or(map: &lookup, key: name, default: 0)
+  if packed_present(packed) then
+    return Some(val: EffectBits(can_throw: packed_can_throw(packed), is_pure: packed_is_pure(packed)))
+  end
+  return None
+end
+
+/** Lookup a function's full summary by name. Returns None if `name` is not */
+/** in the map (e.g. caller mistyped the function name or the function was */
+/** added after analysis ran). Used by tests; production consumers prefer */
+/** `lookup_bits` for the O(1) packed-bits path. */
+export let lookup_summary = fn (em: &EffectMap, name: string) -> Option<EffectSummary> do
+  let EffectMap(entries, lookup: _) = em
+  return lookup_summary_go(entries, name)
+end
+
+let lookup_summary_go = fn (entries: [EffectEntry], name: string) -> Option<EffectSummary> do
+  match entries do
+    | [] -> return None
+    | EffectEntry(name: en, summary) :: rest ->
+      if en == name then return Some(val: summary) end
+      return lookup_summary_go(entries: rest, name)
+  end
+end
+
+/** Convenience: total number of summarised functions. */
+export let effect_map_size = fn (em: &EffectMap) -> i64 do
+  let EffectMap(entries, lookup: _) = em
+  return effect_map_size_go(entries)
+end
+
+let effect_map_size_go = fn (entries: [EffectEntry]) -> i64 do
+  match entries do
+    | [] -> return 0
+    | _ :: rest -> return 1 + effect_map_size_go(entries: rest)
+  end
+end
+
+// ─── Classification Counts (issue nexus-kyf8) ────────────────────────────────
+//
+// Aggregate the EffectMap into a coarse per-class population:
+//   * pure            — is_pure == true (no caps, no throw, no side effect)
+//   * can_throw       — can_throw == true
+//   * impure_no_throw — !is_pure AND !can_throw (caps used or non-throwing
+//                       side effect, e.g. a Console.println-only function)
+// The three classes partition the EffectMap exactly: every function lands in
+// one and only one bucket. `total` is provided redundantly so callers can
+// sanity-check without re-summing.
+
+export type EffectClassCounts = EffectClassCounts(
+  pure: i64,
+  can_throw: i64,
+  impure_no_throw: i64,
+  total: i64
+)
+
+export let classify_effect_map = fn (em: &EffectMap) -> EffectClassCounts do
+  let EffectMap(entries, lookup: _) = em
+  return classify_effect_map_go(entries, pure: 0, can_throw: 0, impure: 0, total: 0)
+end
+
+let classify_effect_map_go = fn (
+  entries: [EffectEntry],
+  pure: i64,
+  can_throw: i64,
+  impure: i64,
+  total: i64
+) -> EffectClassCounts do
+  match entries do
+    | [] -> return EffectClassCounts(pure, can_throw, impure_no_throw: impure, total)
+    | EffectEntry(name: _, summary) :: rest ->
+      let EffectSummary(capabilities_used: _, can_throw: ct, is_pure: ip) = summary
+      let new_pure = if ip then pure + 1 else pure end
+      let new_throw = if ct then can_throw + 1 else can_throw end
+      let new_impure = if ip then impure
+        else if ct then impure
+        else impure + 1
+        end
+      return classify_effect_map_go(entries: rest,
+        pure: new_pure, can_throw: new_throw, impure: new_impure, total: total + 1)
+  end
+end
