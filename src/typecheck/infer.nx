@@ -1094,7 +1094,15 @@ let check_handlers_bound = fn (state: CheckState, handlers: [string], span: Span
     | h :: rest ->
       match tctypes.env_lookup(env: tctypes.state_env(state), name: h) do
         | None -> return InferExprErr(message: "inject: unbound handler '" ++ h ++ "'", span)
-        | Some(_) -> return check_handlers_bound(state, handlers: rest, span)
+        | Some(val: Scheme(vars: _, typ: ht)) ->
+          // spec T-Inject (nexus-2yxp): strip(τ) does not peel @, so a
+          // thunk handler @σ does not unify with `handler P ρ`. Surface a
+          // suggestion to force the thunk explicitly.
+          match ht do
+            | TyLazy(inner: _) ->
+              return InferExprErr(message: "inject: handler '" ++ h ++ "' has thunk type `" ++ tctypes.type_to_string(typ: ht) ++ "`; force it explicitly (e.g. `inject @" ++ h ++ " do ... end`)", span)
+            | _ -> return check_handlers_bound(state, handlers: rest, span)
+          end
       end
   end
 end
@@ -1190,7 +1198,15 @@ let infer_stmt = fn (state: CheckState, stmt: HirStmtKind, ret_type: TypeExpr, s
       match check_handlers_bound(state, handlers, span) do
         | InferExprErr(message: m, span: esp) -> return InferExprErr(message: m, span: esp)
         | InferExprOk(_) ->
-          return infer_stmts(state, stmts: body, ret_type)
+          // T-Inject (nexus-lcr1): close the block scope — bindings introduced
+          // inside the inject body must not leak past `end`. Mirrors the env
+          // pop in infer_match_cases/infer_try.
+          match infer_stmts(state, stmts: body, ret_type) do
+            | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+            | InferExprOk(state: st1, subst: s1, typ: t) ->
+              let st2 = tctypes.state_with_env(state: st1, env: tctypes.state_env(state))
+              return InferExprOk(state: st2, subst: s1, typ: t)
+          end
       end
   end
 end
@@ -1651,10 +1667,14 @@ let bind_constructor_pattern = fn (
   state: CheckState, variant: string,
   fields: [HirPatternField], target_type: TypeExpr
 ) -> BindResult throws { TypeError } do
-  // Strip Linear/Lazy/Ref/Borrow wrapper for pattern matching (e.g., let ByteBuffer(id) = %buf)
+  // spec strip(τ) peels %/& only — @σ thunks must be forced explicitly (nexus-2yxp).
+  match target_type do
+    | TyLazy(inner: _) ->
+      return BindErr(message: "cannot pattern-match constructor `" ++ variant ++ "` on thunk type `" ++ tctypes.type_to_string(typ: target_type) ++ "`; force the thunk first (e.g. `match @x do | " ++ variant ++ "(...) -> ... end`)")
+    | _ -> ()
+  end
   let unwrapped = match target_type do
     | TyLinear(inner: i) -> i
-    | TyLazy(inner: i) -> i
     | TyRef(inner: i) -> i
     | TyBorrow(inner: i) -> i
     | _ -> target_type
@@ -1721,11 +1741,16 @@ end
 let bind_record_pattern = fn (
   state: CheckState, fields: [HirRecordPatField], target_type: TypeExpr
 ) -> BindResult throws { TypeError } do
-  // Peel modality wrappers (Linear/Lazy/Borrow/Ref) so `match h: %T do | {f: x} -> ...`
+  // spec strip(τ) peels %/& only — @σ thunks must be forced explicitly (nexus-2yxp).
+  match target_type do
+    | TyLazy(inner: _) ->
+      return BindErr(message: "cannot pattern-match record on thunk type `" ++ tctypes.type_to_string(typ: target_type) ++ "`; force the thunk first (e.g. `match @x do | {...} -> ... end`)")
+    | _ -> ()
+  end
+  // Peel modality wrappers (Linear/Borrow/Ref) so `match h: %T do | {f: x} -> ...`
   // can match on the underlying record (nexus-lyh6).
   let inner = match target_type do
     | TyLinear(inner: i) -> i
-    | TyLazy(inner: i) -> i
     | TyBorrow(inner: i) -> i
     | TyRef(inner: i) -> i
     | _ -> target_type
