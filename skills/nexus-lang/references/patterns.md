@@ -427,6 +427,63 @@ end)
 array.consume(arr: %arr, f: fn (val: %i64) -> unit do end)
 ```
 
+## Pattern shorthands
+
+### `Ctor(_)` — match any constructor instance (all fields ignored)
+
+When matching on a constructor and you don't need any of its fields,
+`Ctor(_)` is the shorthand for "match any payload":
+
+```nexus
+match opt do
+  | Some(_) -> "got some"          // any payload, don't bind it
+  | None -> "got none"
+end
+```
+
+This is distinct from `Ctor(field: _)` (named-field wildcard) and from
+plain `_` (matches anything). Use `Ctor(_)` when you care about the
+constructor tag but not the data.
+
+Equivalent expansions for a ctor with N fields:
+
+```nexus
+| Some(_)             // shorthand
+| Some(val: _)        // explicit single-field wildcard
+| Some(_, _)          // not valid — positional patterns aren't accepted
+```
+
+The parser recognises this in `src/frontend/parse_pattern.nx::is_ctor_wildcard_all`.
+
+## Handler `require { Row }` — always row-typed
+
+Handler declarations must spell out their cap requirements as a row in
+braces, never as a bare type identifier:
+
+```nexus
+// CORRECT — required row
+let logger_handler = handler Logger require { PermConsole } do
+  fn info(msg: string) -> unit do
+    Console.println(val: msg)
+  end
+end
+
+// CORRECT — no requirements (empty row)
+let pure_handler = handler PureCap do
+  fn pure_op() -> i64 do return 0 end
+end
+
+// WRONG — bare type, src rejects this even though some lenient grammars
+// would parse it
+let logger_handler = handler Logger require PermConsole do
+  ...
+end
+```
+
+The same braced-row form applies wherever `require { ... }` appears
+(function signatures, cap declarations). Empty row is `require { }` or
+omit `require` entirely.
+
 ## Bitwise OR (`|`)
 
 The `|` operator is bitwise-or on integers. The compiler resolves `|` to
@@ -542,4 +599,3 @@ end
 - Thunks with no side effects parallelise cleanly; combinators do not insulate
   observable effects (`race` / `cancel` / `detach` in `std:lazy` are still
   sequential — see their docstrings)
-

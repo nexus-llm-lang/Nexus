@@ -137,6 +137,21 @@ Path forms:
 
 The `std` package always maps to `nxlib/stdlib/`.
 
+### 8. Comments: line + block (nesting OK)
+
+```nexus
+// line comment
+
+/* block comment */
+
+/* outer /* nested */ still inside the outer comment */
+```
+
+Both `//` and `/* ... */` comment forms are supported. Block comments
+**nest correctly** — the lexer counts `/*` / `*/` depth, so nested blocks
+close in the right order. Useful for commenting out a region that already
+contains block-comment'd code.
+
 ## Effect System (Caps & Handlers)
 
 Nexus uses coeffects for dependency injection, NOT algebraic effects. See https://nexus-llm-lang.github.io/latest/spec/effects for details.
