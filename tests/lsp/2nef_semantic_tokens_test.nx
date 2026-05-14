@@ -1,0 +1,184 @@
+// Issue nexus-2nef: textDocument/semanticTokens — type-aware syntax highlighting.
+//
+// Buffer fixture covers every legend category we care about for MVP:
+//
+//   type Color = Red | Green             // type def + variants
+//   let pi = 314                          // top-level value (variable)
+//   let add = fn (x: i64) -> i64 do      // top-level fn (function)
+//     // a line comment                   // comment
+//     return x + 1                        // operator + number
+//   end
+//
+// We assert the SemTok stream (intermediate form, not delta-encoded) so the
+// fixture pins specific (line, col, length, token_type) tuples for the
+// highest-leverage cases: a keyword, a type def name, a variant, a function
+// binding name, a variable binding name, a parameter, a type name, a string,
+// a number, a comment, and an operator. Delta-encoding is exercised
+// separately through the `compute_semantic_tokens` driver — we only check
+// that the data array length is `5 * len(tokens)`.
+
+import * as sem from "src/lsp/semantic_tokens.nx"
+import * as test_assert from "std:test/assert"
+import { Some, None } from "std:option"
+import { SemanticTokens } from "src/lsp/protocol.nx"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+let buffer_text = fn () -> string do
+  // Line 1: `type Color = Red | Green`
+  // Line 2: `let pi = 314`
+  // Line 3: `let add = fn (x: i64) -> i64 do`
+  // Line 4: `  // a line comment`
+  // Line 5: `  let name = "hi"`
+  // Line 6: `  return x + 1`
+  // Line 7: `end`
+  return "type Color = Red | Green\n"
+      ++ "let pi = 314\n"
+      ++ "let add = fn (x: i64) -> i64 do\n"
+      ++ "  // a line comment\n"
+      ++ "  let name = \"hi\"\n"
+      ++ "  return x + 1\n"
+      ++ "end\n"
+end
+
+// Look up the first SemTok matching (line, col). Returns None if no token
+// starts at that position. Used to assert specific points in the stream
+// without depending on the exact ordering of unrelated tokens.
+let find_at = fn (xs: [sem.SemTok], line: i64, col: i64) -> sem.SemTok throws { Exn } do
+  match xs do
+    | [] -> raise RuntimeError(val: "no SemTok at (" ++ "line, col)")
+    | t :: rest ->
+      match t do | sem.SemTok(line: tl, col: tc, length: _, token_type: _) ->
+        if tl == line && tc == col then return t end
+        return find_at(xs: rest, line, col)
+      end
+  end
+end
+
+let assert_tok_at = fn (
+  toks: [sem.SemTok],
+  line: i64,
+  col: i64,
+  expected_length: i64,
+  expected_type: i64,
+  label: string
+) -> unit throws { Exn } do
+  let t = find_at(xs: toks, line, col)
+  match t do | sem.SemTok(line: _, col: _, length, token_type) ->
+    test_assert.assert_eq_i64(actual: length, expected: expected_length,
+      label: label ++ " length")
+    test_assert.assert_eq_i64(actual: token_type, expected: expected_type,
+      label: label ++ " token_type")
+  end
+end
+
+let count_semtoks = fn (xs: [sem.SemTok], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_semtoks(xs: rest, acc: acc + 1)
+  end
+end
+
+let count_ints = fn (xs: [i64], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_ints(xs: rest, acc: acc + 1)
+  end
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  let toks = sem.compute_sem_toks(text: buffer_text())
+
+  // Line 1: `type Color = Red | Green`
+  // Cols (1-based): t=1 (type kw), C=6 (type def name), G=18 (variant)
+  // Red is at col 14 (variant after `=`), Green at col 20
+  // Let's trace: `type Color = Red | Green`
+  //   t y p e   C o l o r   =   R e d   |   G r e e n
+  //   1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24
+  // So `type` at 1, `Color` at 6, `=` at 12, `Red` at 14, `|` at 18, `Green` at 20.
+  assert_tok_at(toks, line: 1, col: 1, expected_length: 4,
+    expected_type: sem.tt_keyword, label: "`type` keyword")
+  assert_tok_at(toks, line: 1, col: 6, expected_length: 5,
+    expected_type: sem.tt_type, label: "`Color` type def name")
+  assert_tok_at(toks, line: 1, col: 12, expected_length: 1,
+    expected_type: sem.tt_operator, label: "`=` operator")
+  assert_tok_at(toks, line: 1, col: 14, expected_length: 3,
+    expected_type: sem.tt_variant, label: "`Red` variant")
+  assert_tok_at(toks, line: 1, col: 18, expected_length: 1,
+    expected_type: sem.tt_operator, label: "`|` operator (variant alt)")
+  assert_tok_at(toks, line: 1, col: 20, expected_length: 5,
+    expected_type: sem.tt_variant, label: "`Green` variant")
+
+  // Line 2: `let pi = 314`
+  //   l e t   p i   =   3 1 4
+  //   1 2 3 4 5 6 7 8 9 10 11 12
+  assert_tok_at(toks, line: 2, col: 1, expected_length: 3,
+    expected_type: sem.tt_keyword, label: "`let` keyword")
+  assert_tok_at(toks, line: 2, col: 5, expected_length: 2,
+    expected_type: sem.tt_variable, label: "`pi` variable binding")
+  assert_tok_at(toks, line: 2, col: 10, expected_length: 3,
+    expected_type: sem.tt_number, label: "`314` number")
+
+  // Line 3: `let add = fn (x: i64) -> i64 do`
+  //   l e t   a d d   =   f n   ( x :   i 6 4 )   - >   i 6 4   d o
+  //   1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30
+  assert_tok_at(toks, line: 3, col: 5, expected_length: 3,
+    expected_type: sem.tt_function, label: "`add` function binding")
+  assert_tok_at(toks, line: 3, col: 11, expected_length: 2,
+    expected_type: sem.tt_keyword, label: "`fn` keyword")
+  assert_tok_at(toks, line: 3, col: 15, expected_length: 1,
+    expected_type: sem.tt_parameter, label: "`x` parameter")
+  assert_tok_at(toks, line: 3, col: 18, expected_length: 3,
+    expected_type: sem.tt_type, label: "`i64` builtin type")
+
+  // Line 4: `  // a line comment`
+  // Comment starts at col 3, length is 17 (`// a line comment`).
+  assert_tok_at(toks, line: 4, col: 3, expected_length: 17,
+    expected_type: sem.tt_comment, label: "line comment")
+
+  // Line 5: `  let name = "hi"`
+  // `let` at 3, `name` at 7, `=` at 12, `"hi"` at 14, length 4.
+  assert_tok_at(toks, line: 5, col: 14, expected_length: 4,
+    expected_type: sem.tt_string, label: "string literal")
+
+  // Line 6: `  return x + 1`
+  // `return` at 3 length 6, `x` at 10 length 1 (variable ref), `+` at 12, `1` at 14.
+  assert_tok_at(toks, line: 6, col: 3, expected_length: 6,
+    expected_type: sem.tt_keyword, label: "`return` keyword")
+  assert_tok_at(toks, line: 6, col: 10, expected_length: 1,
+    expected_type: sem.tt_variable, label: "`x` value reference")
+  assert_tok_at(toks, line: 6, col: 12, expected_length: 1,
+    expected_type: sem.tt_operator, label: "`+` operator")
+  assert_tok_at(toks, line: 6, col: 14, expected_length: 1,
+    expected_type: sem.tt_number, label: "`1` number")
+
+  // Sanity: the wire `data` array length is exactly 5 * SemTok count.
+  let st = sem.compute_semantic_tokens(text: buffer_text())
+  match st do | SemanticTokens(data) ->
+    let n_toks = count_semtoks(xs: toks, acc: 0)
+    let n_ints = count_ints(xs: data, acc: 0)
+    test_assert.assert_eq_i64(actual: n_ints, expected: 5 * n_toks,
+      label: "wire data length is 5x token count")
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
