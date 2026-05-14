@@ -1,0 +1,180 @@
+// nexus-kmel: --format=json diagnostics with stable error IDs.
+//
+// The driver's `--format=json` flag turns every emitted diagnostic into a
+// single-line JSON object (NDJSON). V1 covers the parser-recovery path:
+// each ParseError becomes one CompilerDiagnostic record, rendered via
+// `format_diagnostic_json`, followed by a `format_summary_json` trailer.
+//
+// We unit-test the helpers directly rather than shelling out to a compiled
+// nexus.wasm: `Proc.exec` is a -1 stub under WASI preview1 (the runtime
+// profile the test harness runs under), so a subprocess invocation would
+// never reach actual driver code. The two helpers covered here
+// (`format_diagnostic_json` and the full Exn → CompilerDiagnostic path via
+// `diagnostic_from_exn`) are exactly what the driver invokes per
+// diagnostic, so this exercises the same code path the driver does.
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import {
+  CompilerDiagnostic,
+  diagnostic_from_exn,
+  format_diagnostic_json,
+  format_summary_json,
+  UnexpectedToken,
+  UnexpectedEof
+} from "src/common/error.nx"
+import { Span } from "src/common/token.nx"
+import * as parser from "src/frontend/parser.nx"
+import * as json from "std:json"
+
+// ─── Helper: assert a string is valid JSON ──────────────────────────────────
+
+let assert_parses_json = fn (s: string, label: string) -> unit throws { Exn } do
+  try
+    let _ = json.parse(s)
+    return ()
+  catch _ ->
+    test_assert.assert_true(cond: false, label: "kmel: " ++ label ++ " is not valid JSON: " ++ s)
+  end
+end
+
+// ─── Helper: extract a JSON string field ────────────────────────────────────
+
+let json_string_field = fn (obj: json.JsonValue, key: string) -> string throws { Exn } do
+  match json.get_field(obj, key) do
+    | Some(val: v) ->
+      match v do
+        | JsonString(val: s) -> return s
+        | _ -> raise RuntimeError(val: "field " ++ key ++ " is not a string")
+      end
+    | None -> raise RuntimeError(val: "missing field " ++ key)
+  end
+end
+
+// ─── Test 1: format_diagnostic_json shape ───────────────────────────────────
+
+let test_basic_shape = fn () -> unit throws { Exn } do
+  let diag = CompilerDiagnostic(
+    code: "E1001",
+    severity: "error",
+    file: "test.nx",
+    line: 5,
+    column: 12,
+    message: "parse error: expected expression, got 'end'"
+  )
+  let line = format_diagnostic_json(diag)
+  // The line must be valid JSON and carry every expected field.
+  assert_parses_json(s: line, label: "format_diagnostic_json output")
+  let obj = json.parse(s: line)
+  let code = json_string_field(obj, key: "code")
+  let severity = json_string_field(obj, key: "severity")
+  let file = json_string_field(obj, key: "file")
+  let message = json_string_field(obj, key: "message")
+  test_assert.assert_eq_string(actual: code, expected: "E1001", label: "kmel: code = E1001")
+  test_assert.assert_eq_string(actual: severity, expected: "error", label: "kmel: severity = error")
+  test_assert.assert_eq_string(actual: file, expected: "test.nx", label: "kmel: file = test.nx")
+  test_assert.assert_eq_string(actual: message, expected: "parse error: expected expression, got 'end'", label: "kmel: message round-trip")
+  return ()
+end
+
+// ─── Test 2: JSON string escaping ───────────────────────────────────────────
+
+let test_escape = fn () -> unit throws { Exn } do
+  let diag = CompilerDiagnostic(
+    code: "E0099",
+    severity: "error",
+    file: "x.nx",
+    line: 0,
+    column: 0,
+    message: "needs \"quoting\" and \\ backslashes\nand newlines"
+  )
+  let line = format_diagnostic_json(diag)
+  assert_parses_json(s: line, label: "escape round-trip")
+  let obj = json.parse(s: line)
+  let message = json_string_field(obj, key: "message")
+  test_assert.assert_eq_string(
+    actual: message,
+    expected: "needs \"quoting\" and \\ backslashes\nand newlines",
+    label: "kmel: escape decode matches original"
+  )
+  return ()
+end
+
+// ─── Test 3: diagnostic_from_exn carries Span info ──────────────────────────
+
+let test_from_exn = fn () -> unit throws { Exn } do
+  let sp = Span(offset: 42, line: 7, col: 3)
+  let exn = UnexpectedToken(expected: "expression", got: "TkEnd", span: sp)
+  let diag = diagnostic_from_exn(err: exn, file: "snippet.nx")
+  match diag do | CompilerDiagnostic(code, severity, file, line, column, message) ->
+    test_assert.assert_eq_string(actual: code, expected: "E1001", label: "kmel: UnexpectedToken → E1001")
+    test_assert.assert_eq_string(actual: severity, expected: "error", label: "kmel: severity = error")
+    test_assert.assert_eq_string(actual: file, expected: "snippet.nx", label: "kmel: file propagated")
+    test_assert.assert_eq_i64(actual: line, expected: 7, label: "kmel: line = 7")
+    test_assert.assert_eq_i64(actual: column, expected: 3, label: "kmel: column = 3")
+    // The message must NOT carry the trailing `[Exxxx]` tag (it's in `code`).
+    let has_tag = str.contains(s: message, sub: "[E1001]")
+    test_assert.assert_eq_bool(actual: has_tag, expected: false, label: "kmel: tag stripped from message")
+  end
+  return ()
+end
+
+// ─── Test 4: 2-error fixture via parse_source_collect ───────────────────────
+
+let make_two_error_source = fn () -> string do
+  // Two unrelated parse errors. First triggers UnexpectedToken in an
+  // expression context; the second is a malformed `type` head.
+  return "let good_a = 1\n"
+    ++ "let bad1 = 1 +\n"
+    ++ "let good_b = 2\n"
+    ++ "type Bad2 =\n"
+    ++ "let good_c = 3\n"
+end
+
+let assert_each_line_valid_json = fn (lines: [string]) -> unit throws { Exn } do
+  match lines do
+    | [] -> return ()
+    | l :: rest ->
+      // The NDJSON stream is one JSON object per line; every non-empty line
+      // must parse and carry a `code` + `severity` field.
+      assert_parses_json(s: l, label: "NDJSON line")
+      let obj = json.parse(s: l)
+      let _code = json_string_field(obj, key: "code")
+      let _severity = json_string_field(obj, key: "severity")
+      return assert_each_line_valid_json(lines: rest)
+  end
+end
+
+let test_two_error_fixture = fn () -> unit throws { Exn } do
+  let src = make_two_error_source()
+  match parser.parse_source_collect(src, file: "kmel_fixture.nx") do | parser.ParseDiagnostics(prog: _, diags) ->
+    let n = list.length(xs: diags)
+    test_assert.assert_eq_i64(actual: n, expected: 2, label: "kmel: 2 parse diagnostics accumulated")
+    // Render each diagnostic + the summary trailer as NDJSON lines and
+    // verify every one round-trips through std:json.parse.
+    let ndjson_lines = render_each(diags)
+    assert_each_line_valid_json(lines: ndjson_lines)
+    // Append the summary trailer; it too must be valid JSON.
+    let summary = format_summary_json(count: n)
+    assert_parses_json(s: summary, label: "summary trailer")
+    // Total NDJSON lines = N diagnostics + 1 summary.
+    let total = list.length(xs: ndjson_lines) + 1
+    test_assert.assert_eq_i64(actual: total, expected: 3, label: "kmel: 2 diag lines + 1 summary = 3")
+  end
+  return ()
+end
+
+let render_each = fn (diags: [CompilerDiagnostic]) -> [string] do
+  match diags do
+    | [] -> return []
+    | d :: rest -> return format_diagnostic_json(diag: d) :: render_each(diags: rest)
+  end
+end
+
+let main = fn () -> unit throws { Exn } do
+  test_basic_shape()
+  test_escape()
+  test_from_exn()
+  test_two_error_fixture()
+  return ()
+end

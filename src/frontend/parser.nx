@@ -21,7 +21,7 @@ import { Span, SpannedToken } from "src/common/token.nx"
 import { Sigil, OpNeg, OpFNeg, OpNot, SpannedExpr, SpannedStmt, SpannedPattern, SpannedTopLevel, Param, Function, HandlerArm, MatchCase, CatchArm, CallArg, CtorArg, NamedExpr, GlobalLet, Program, Unqual } from "src/common/ast.nx"
 import { extract_module_doc, tokenize } from "src/frontend/lexer.nx"
 import * as rdr from "src/ir/rdrname.nx"
-import { UnexpectedToken, ParseError, format_error } from "src/common/error.nx"
+import { UnexpectedToken, ParseError, CompilerDiagnostic, format_error, diagnostic_from_exn } from "src/common/error.nx"
 import { ParsedType, ParsedExpr, ParsedStmt, ParsedPat, ParsedIdent, ParsedSigil, ParsedStmts, ParsedCallArgs, ParsedCtorArgs, ParsedParams, ParsedMatchCases, ParsedCatchArms, ParsedHandlerArms, ParsedExprs, ParsedNamedExprs, ParsedStrings, ParsedTopLevel }, * as pcore from "src/frontend/parse_core.nx"
 import * as ptype from "src/frontend/parse_type.nx"
 import * as ppat from "src/frontend/parse_pattern.nx"
@@ -903,53 +903,67 @@ end
 // final "too many parse errors" diagnostic to keep cascade explosions from
 // drowning the real signal.
 
-/** Diagnostics carry pre-formatted strings (see `format_error`) rather */
-/** than raw Exn values: the existing error-formatting path is the single */
-/** source of truth, and stringifying eagerly lets callers store the list */
-/** in plain data structures (records, AST nodes) without an Exn-in-field */
-/** typing hazard. */
-export type ParseDiagnostics = ParseDiagnostics(prog: Program, diags: [string])
+/** CompilerDiagnostics carry structured `CompilerDiagnostic` records (see */
+/** `src/common/error.nx`). Renaming from `[string]` to `[CompilerDiagnostic]` */
+/** (issue nexus-kmel) lets callers render either the human text path via */
+/** `format_error` or the JSON path via `format_diagnostic_json` without */
+/** needing to re-parse the error. The `file` field is threaded through */
+/** `parse_collect` so each CompilerDiagnostic knows its source path. */
+export type ParseDiagnostics = ParseDiagnostics(prog: Program, diags: [CompilerDiagnostic])
 
 let max_parse_diags = 50
 
+/** Synthetic CompilerDiagnostic for the recovery-cap trailer. Spanless (line=0, */
+/** column=0); the cap is a meta-diagnostic, not tied to a token. */
+let cap_diagnostic = fn (file: string) -> CompilerDiagnostic do
+  return CompilerDiagnostic(
+    code: "E1003",
+    severity: "error",
+    file,
+    line: 0,
+    column: 0,
+    message: "parse error: too many parse errors (cap = " ++ str.from_i64(val: max_parse_diags) ++ "); aborting recovery"
+  )
+end
+
 /** Inner recovery loop. `n_diags` is the running count so the cap can */
 /** trigger before we attempt yet another flailing parse_top_level. */
-let parse_collect_loop = fn (toks: [SpannedToken], acc: [SpannedTopLevel], diags: [string], n_diags: i64) -> ParseDiagnostics do
+let parse_collect_loop = fn (toks: [SpannedToken], acc: [SpannedTopLevel], diags: [CompilerDiagnostic], n_diags: i64, file: string) -> ParseDiagnostics do
   match pcore.peek_token(toks) do
     | TkEof -> return ParseDiagnostics(prog: Program(definitions: list.reverse(xs: acc), module_doc: None), diags: list.reverse(xs: diags))
     | _ -> ()
   end
   if n_diags >= max_parse_diags then
-    let cap_msg = "parse error: too many parse errors (cap = " ++ str.from_i64(val: max_parse_diags) ++ "); aborting recovery [E1003]"
-    return ParseDiagnostics(prog: Program(definitions: list.reverse(xs: acc), module_doc: None), diags: list.reverse(xs: cap_msg :: diags))
+    return ParseDiagnostics(prog: Program(definitions: list.reverse(xs: acc), module_doc: None), diags: list.reverse(xs: cap_diagnostic(file) :: diags))
   end
   try
     let ParsedTopLevel(item, rest: r) = parse_top_level(toks)
-    return parse_collect_loop(toks: r, acc: item :: acc, diags, n_diags)
+    return parse_collect_loop(toks: r, acc: item :: acc, diags, n_diags, file)
   catch e ->
-    let msg = format_error(err: e)
+    let diag = diagnostic_from_exn(err: e, file)
     // Recovery: drop tokens until we reach the next col-1 top-level start
     // (or EOF). `started: false` lets the helper consume at least one token
     // even when the failure points at a col-1 keyword (e.g. `let` with a
     // malformed body) so the loop cannot livelock on the same input.
     let r2 = pcore.recover_to_top_level(toks, started: false)
-    return parse_collect_loop(toks: r2, acc, diags: msg :: diags, n_diags: n_diags + 1)
+    return parse_collect_loop(toks: r2, acc, diags: diag :: diags, n_diags: n_diags + 1, file)
   end
 end
 
 /** Parse with error recovery: returns the partial Program plus a list of */
-/** formatted diagnostics. Empty diag list means the parse was clean and the */
-/** Program is equivalent to `parse(tokens)`. Drivers that want multi-error */
-/** output should prefer this entry point over `parse`. */
-export let parse_collect = fn (tokens: [SpannedToken]) -> ParseDiagnostics do
-  return parse_collect_loop(toks: tokens, acc: [], diags: [], n_diags: 0)
+/** structured CompilerDiagnostics. Empty diag list means the parse was clean and */
+/** the Program is equivalent to `parse(tokens)`. The `file` argument is */
+/** stored in each CompilerDiagnostic for downstream JSON serialization; pass */
+/** empty string when the caller doesn't have one (LSP, unit tests). */
+export let parse_collect = fn (tokens: [SpannedToken], file: string) -> ParseDiagnostics do
+  return parse_collect_loop(toks: tokens, acc: [], diags: [], n_diags: 0, file)
 end
 
 /** Source-text variant of `parse_collect`. Populates `Program.module_doc` */
 /** from the file's leading `/** ... */` block exactly like `parse_source`. */
-export let parse_source_collect = fn (src: string) -> ParseDiagnostics do
+export let parse_source_collect = fn (src: string, file: string) -> ParseDiagnostics do
   let tokens = tokenize(src)
-  let ParseDiagnostics(prog, diags) = parse_collect(tokens)
+  let ParseDiagnostics(prog, diags) = parse_collect(tokens, file)
   let doc = extract_module_doc(src)
   match prog do | Program(definitions: defs, module_doc: _) ->
     return ParseDiagnostics(prog: Program(definitions: defs, module_doc: doc), diags)

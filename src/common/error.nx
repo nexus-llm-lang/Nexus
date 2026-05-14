@@ -33,6 +33,7 @@
 import { Span } from "src/common/token.nx"
 import * as str from "std:str"
 import { FileNotFound } from "std:fs"
+import { Option, Some, None } from "std:option"
 
 // ─── Parse exceptions ───────────────────────────────────────────────────────
 
@@ -322,4 +323,151 @@ export let format_error = fn (err: Exn) -> string do
     | _ ->
       with_code(body: "internal compiler error: uncategorized compiler exception", c: "E0099") ++ ice_suffix
   end
+end
+
+// ─── Structured diagnostics (issue nexus-kmel V1) ───────────────────────────
+//
+// `CompilerDiagnostic` is the JSON-serializable shape that backs `--format=json`.
+// Built from a raw Exn via `diagnostic_from_exn`; rendered to NDJSON via
+// `format_diagnostic_json`. The text path keeps using `format_error` directly,
+// so backward-compatibility is preserved when `--format` is unspecified.
+//
+// Future (out of scope V1): SARIF emit, fix-it suggestion arrays, and
+// migrating every direct `raise` site in typecheck/linearity through this
+// pipeline. Tracked as nexus-kmel.1 / .2.
+
+/** Structured diagnostic record. `file` may be empty when the raising */
+/** phase doesn't know its source path (e.g. unit-test invocations). */
+/** `line`/`column` mirror the underlying `Span`; both are 0 when the */
+/** exception has no span (MissingMain, ParseErrorsCollected, ICEs). */
+export type CompilerDiagnostic = CompilerDiagnostic(code: string, severity: string, file: string, line: i64, column: i64, message: string)
+
+/** Backward scan: return the highest index in `s` at which `sub` */
+/** appears, or -1 if absent. Inlined here because std:str does not */
+/** expose `last_index_of`. */
+let last_index_of_in = fn (s: string, sub: string) -> i64 do
+  let n = str.length(s)
+  let m = str.length(s: sub)
+  if m == 0 then return n end
+  if m > n then return 0 - 1 end
+  return last_index_of_loop(s, sub, m, i: n - m)
+end
+
+let last_index_of_loop = fn (s: string, sub: string, m: i64, i: i64) -> i64 do
+  if i < 0 then return 0 - 1 end
+  let window = str.substring(s, start: i, len: m)
+  if window == sub then return i end
+  return last_index_of_loop(s, sub, m, i: i - 1)
+end
+
+/** Forward scan for the next `target` byte at or after `start`. Returns */
+/** -1 if absent. */
+let index_of_byte_from = fn (s: string, start: i64, target: char) -> i64 do
+  let n = str.length(s)
+  return index_of_byte_loop(s, n, i: start, target)
+end
+
+let index_of_byte_loop = fn (s: string, n: i64, i: i64, target: char) -> i64 do
+  if i >= n then return 0 - 1 end
+  if str.char_at(s, idx: i) == target then return i end
+  return index_of_byte_loop(s, n, i: i + 1, target)
+end
+
+/** Extract the E-code from an already-formatted error message. The code */
+/** lives inside the last `[Exxxx]` bracket pair appended by */
+/** `with_code`; if the arm produced no code (file-context wrappers, */
+/** RuntimeError pass-through, catch-all), return empty string. */
+let extract_code = fn (msg: string) -> string do
+  let last_idx = last_index_of_in(s: msg, sub: "[E")
+  if last_idx < 0 then return "" end
+  let close_idx = index_of_byte_from(s: msg, start: last_idx, target: ']')
+  if close_idx < 0 then return "" end
+  return str.substring(s: msg, start: last_idx + 1, len: close_idx - last_idx - 1)
+end
+
+/** Strip the trailing `[Exxxx]` tag (and any surrounding whitespace) so */
+/** the JSON `message` field carries the human prose only. The ICE suffix */
+/** is also dropped — it is recoverable from the code (E00xx). */
+let strip_code_tag = fn (msg: string) -> string do
+  let last_idx = last_index_of_in(s: msg, sub: " [E")
+  if last_idx < 0 then return msg end
+  return str.substring(s: msg, start: 0, len: last_idx)
+end
+
+/** Pull the Span out of an exception, if it carries one. Returns None */
+/** for spanless variants (MissingMain, ICEs, file-context wrappers). */
+let span_of_exn = fn (err: Exn) -> Option<Span> do
+  match err do
+    | UnexpectedToken(expected: _, got: _, span: sp) -> return Some(val: sp)
+    | UnexpectedEof(expected: _, span: sp) -> return Some(val: sp)
+    | TypeMismatch(func_name: _, detail: _, span: sp) -> return Some(val: sp)
+    | LazyBindingUnused(name: _, span: sp) -> return Some(val: sp)
+    | LazyBindingDoubleUse(name: _, span: sp) -> return Some(val: sp)
+    | LinearUnused(name: _, span: sp) -> return Some(val: sp)
+    | LinearReuse(name: _, span: sp) -> return Some(val: sp)
+    | LinearMismatch(detail: _, span: sp) -> return Some(val: sp)
+    | LinearLeakAcrossThrowableCall(callee: _, leaked: _, span: sp) -> return Some(val: sp)
+    | DuplicateTopLevelBinding(name: _, span: sp) -> return Some(val: sp)
+    | _ -> return None
+  end
+end
+
+/** Build a `CompilerDiagnostic` from an `Exn` plus the source file path. The */
+/** `severity` is hard-coded to "error" in V1 — every variant the */
+/** compiler raises today is fatal. Warnings will land with a separate */
+/** infra change. */
+export let diagnostic_from_exn = fn (err: Exn, file: string) -> CompilerDiagnostic do
+  let full = format_error(err)
+  let code = extract_code(msg: full)
+  let body = strip_code_tag(msg: full)
+  let { line, column } = match span_of_exn(err) do
+    | Some(val: sp) -> match sp do | Span(offset: _, line: l, col: c) -> { line: l, column: c } end
+    | None -> { line: 0, column: 0 }
+  end
+  return CompilerDiagnostic(code: code, severity: "error", file: file, line: line, column: column, message: body)
+end
+
+/** JSON-string escape. Mirrors the subset stdlib's `json.serialize_string` */
+/** handles, kept inline here to avoid a new dependency edge from */
+/** `src/common/` to `std:json` (the JSON encoder is on the user side, */
+/** not a compiler-internal helper). Escapes `"`, `\`, and ASCII control */
+/** characters; other bytes pass through verbatim. */
+let json_escape = fn (s: string) -> string do
+  return json_escape_loop(s, i: 0, n: str.length(s), acc: "")
+end
+
+let json_escape_loop = fn (s: string, i: i64, n: i64, acc: string) -> string do
+  if i >= n then return acc end
+  let ch = str.char_at(s, idx: i)
+  let esc = if ch == '"' then "\\\""
+    else if ch == '\\' then "\\\\"
+    else if ch == '\n' then "\\n"
+    else if ch == '\r' then "\\r"
+    else if ch == '\t' then "\\t"
+    else str.from_char(ch)
+  end
+  return json_escape_loop(s, i: i + 1, n, acc: acc ++ esc)
+end
+
+/** Render a `CompilerDiagnostic` as a single-line JSON object string (NDJSON). */
+/** Field order: code, severity, file, line, column, message — stable so */
+/** downstream `jq` selectors don't break across compiler versions. */
+export let format_diagnostic_json = fn (diag: CompilerDiagnostic) -> string do
+  match diag do | CompilerDiagnostic(code: c, severity: sv, file: f, line: ln, column: col, message: msg) ->
+    return "{\"code\":\"" ++ json_escape(s: c)
+      ++ "\",\"severity\":\"" ++ json_escape(s: sv)
+      ++ "\",\"file\":\"" ++ json_escape(s: f)
+      ++ "\",\"line\":" ++ str.from_i64(val: ln)
+      ++ ",\"column\":" ++ str.from_i64(val: col)
+      ++ ",\"message\":\"" ++ json_escape(s: msg) ++ "\"}"
+  end
+end
+
+/** Summary-trailer object emitted after the per-diag NDJSON lines under */
+/** `--format=json`. Mirrors what `ParseErrorsCollected`'s text rendering */
+/** would print ("parse failed: N errors [E1004]") but as a structured */
+/** record so tools can `jq '.count'` to skip the human prose entirely. */
+export let format_summary_json = fn (count: i64) -> string do
+  return "{\"code\":\"E1004\",\"severity\":\"error\",\"message\":\"parse failed: "
+    ++ str.from_i64(val: count) ++ " errors\",\"count\":" ++ str.from_i64(val: count) ++ "}"
 end
