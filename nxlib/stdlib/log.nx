@@ -1,0 +1,386 @@
+/**
+ * log: Structured logging port + reference handlers.
+ *
+ * Provides the `Logger` cap with severity-leveled methods and a key/value
+ * `fields` payload that reuses `std:json.JsonValue` as the field-value
+ * algebra. Two reference handlers are shipped:
+ *
+ *   * `console_logger`  — newline-delimited text, one record per line:
+ *                         `LEVEL ts=<ms> msg=<...> k1=<v1> k2=<v2>`
+ *   * `json_logger`     — newline-delimited JSON (JSON Lines / NDJSON), one
+ *                         record per line, suitable for log aggregators.
+ *
+ * Filtering knobs (level threshold + 1-in-N sampling) are global module
+ * state — set them once before injecting either reference handler. Both
+ * knobs degrade to no-ops if left at defaults (everything emitted).
+ *
+ *   `set_min_level(level)`   — drop records below this priority.
+ *   `set_sample_every(n)`    — emit every n-th record, drop the rest.
+ *                              `n <= 1` disables sampling.
+ *
+ * The cap itself does no filtering; both reference handlers consult these
+ * knobs before emitting so user-defined handlers can opt in via
+ * `should_emit(level)`. A bespoke handler is free to ignore them and
+ * implement its own policy (per-tenant gates, async batching, …).
+ *
+ * ── State cell layout ────────────────────────────────────────────────────
+ * 32 bytes reserved at LOG_STATE_OFFSET = 1048576 (= 16 * 65536, page 16).
+ *
+ *   offset +  0..7   : i64 min_level (priority; 0 = Trace .. 4 = Error)
+ *   offset +  8..15  : i64 sample_every (>= 1)
+ *   offset + 16..19  : i32 sample_counter (atomic; rolls over at 2^31-1)
+ *   offset + 24..31  : i64 init flag (0 = defaults installed lazily)
+ *
+ * Page 15 is reserved by `std:rand`; page 16 is the next free region and is
+ * zero-initialised by the wasm runtime, so the lazy-init flag at offset+24
+ * reads 0 on first use without any data-segment cooperation.
+ *
+ * Coeffect contract: `Logger` operations are direct calls into the injected
+ * handler value. There is no continuation/suspension. Reference handlers
+ * declare `require { Console }` to emit text — propagate that requirement
+ * through `inject stdio.system_handler do ...` at the entry point.
+ */
+
+import * as str from "std:str"
+import * as bb from "std:bytebuffer"
+import * as mem from "std:runtime/mem"
+import * as atomic from "std:runtime/atomic"
+import { now_ms as now } from "std:clock"
+import { JsonValue, JsonField, JsonObject, JsonNull, JsonBool, JsonInt, JsonFloat, JsonString,
+         JsonThrow, serialize as json_serialize } from "std:json"
+import { Console } from "std:stdio"
+
+// ─── Algebra ────────────────────────────────────────────────────────────────
+
+/// Severity priorities. Ordered low→high: Trace is the noisiest, Error is the
+/// loudest. `priority_of_level` exposes the numeric mapping so callers can
+/// thread it through their own thresholds without re-deriving it.
+export type LogLevel =
+    Trace
+  | Debug
+  | Info
+  | Warn
+  | Error
+
+/// One structured field on a log record. `key` is the user-facing label;
+/// `value` reuses the JsonValue algebra so payloads serialise unambiguously
+/// in `json_logger` and render as `k=<json>` in `console_logger`.
+export type LogField = LogField(key: string, value: JsonValue)
+
+// ─── Field builders ─────────────────────────────────────────────────────────
+
+/// Build a string-valued field.
+export let field_str = fn (key: string, value: string) -> LogField do
+  return LogField(key, value: JsonString(val: value))
+end
+
+/// Build an i64-valued field.
+export let field_i64 = fn (key: string, value: i64) -> LogField do
+  return LogField(key, value: JsonInt(val: value))
+end
+
+/// Build an f64-valued field.
+export let field_f64 = fn (key: string, value: f64) -> LogField do
+  return LogField(key, value: JsonFloat(val: value))
+end
+
+/// Build a bool-valued field.
+export let field_bool = fn (key: string, value: bool) -> LogField do
+  return LogField(key, value: JsonBool(val: value))
+end
+
+/// Build a null-valued field (use sparingly — most consumers prefer absence).
+export let field_null = fn (key: string) -> LogField do
+  return LogField(key, value: JsonNull)
+end
+
+/// Pass-through builder for callers that have already constructed a JsonValue
+/// (arrays, nested objects, etc).
+export let field_json = fn (key: string, value: JsonValue) -> LogField do
+  return LogField(key, value)
+end
+
+// ─── Level helpers ──────────────────────────────────────────────────────────
+
+/// Numeric priority of a level. Trace=0 .. Error=4. Used by the threshold
+/// gate and by callers comparing two levels.
+export let priority_of_level = fn (level: LogLevel) -> i64 do
+  match level do
+    | Trace -> return 0
+    | Debug -> return 1
+    | Info  -> return 2
+    | Warn  -> return 3
+    | Error -> return 4
+  end
+end
+
+/// Canonical uppercase label for a level — what both reference handlers
+/// emit. Tests pin the exact spelling.
+export let level_to_string = fn (level: LogLevel) -> string do
+  match level do
+    | Trace -> return "TRACE"
+    | Debug -> return "DEBUG"
+    | Info  -> return "INFO"
+    | Warn  -> return "WARN"
+    | Error -> return "ERROR"
+  end
+end
+
+// ─── Cap definition ─────────────────────────────────────────────────────────
+
+/// Structured logger port. `log` is the primary entry; the leveled
+/// shortcuts are sugar — handlers implement all six, but the four
+/// shortcut arms typically just delegate to `log` with a fixed level.
+export cap Logger do
+  fn log(level: LogLevel, msg: string, fields: [LogField]) -> unit
+  fn trace(msg: string, fields: [LogField]) -> unit
+  fn debug(msg: string, fields: [LogField]) -> unit
+  fn info(msg: string, fields: [LogField]) -> unit
+  fn warn(msg: string, fields: [LogField]) -> unit
+  fn error(msg: string, fields: [LogField]) -> unit
+end
+
+// ─── Global filter state ────────────────────────────────────────────────────
+
+// Reserved at page 16 of linear memory (= 16 * 65536 = 1048576). Layout:
+//   1048576..1048583 : i64 min_level priority
+//   1048584..1048591 : i64 sample_every
+//   1048592..1048595 : i32 sample_counter (atomic)
+//   1048600..1048607 : i64 init flag
+let min_level_addr = 1048576
+let sample_every_addr = 1048584
+let sample_counter_addr = 1048592
+let init_flag_addr = 1048600
+
+let default_min_priority = 0
+let default_sample_every = 1
+
+let ensure_initialised = fn () -> unit do
+  let flag = mem.load_i64(addr: init_flag_addr)
+  if flag != 0 then return () end
+  mem.store_i64(addr: min_level_addr, val: default_min_priority)
+  mem.store_i64(addr: sample_every_addr, val: default_sample_every)
+  atomic.store_i32(addr: sample_counter_addr, val: 0)
+  mem.store_i64(addr: init_flag_addr, val: 1)
+  return ()
+end
+
+/// Install a severity threshold. Records with priority below the threshold
+/// are dropped by `should_emit`. Defaults to Trace (no filtering).
+export let set_min_level = fn (level: LogLevel) -> unit do
+  ensure_initialised()
+  mem.store_i64(addr: min_level_addr, val: priority_of_level(level))
+  return ()
+end
+
+/// Inspect the currently-installed minimum level. Returns Trace if no
+/// explicit threshold has been set.
+export let get_min_priority = fn () -> i64 do
+  ensure_initialised()
+  return mem.load_i64(addr: min_level_addr)
+end
+
+/// Install a 1-in-N sampler. `n <= 1` disables sampling (every record
+/// emitted). `n == 10` emits records 0, 10, 20, … and drops the rest.
+/// The counter is shared across handlers; this is intentional.
+export let set_sample_every = fn (n: i64) -> unit do
+  ensure_initialised()
+  let actual = if n <= 1 then 1 else n end
+  mem.store_i64(addr: sample_every_addr, val: actual)
+  atomic.store_i32(addr: sample_counter_addr, val: 0)
+  return ()
+end
+
+/// Reset the sampler counter to 0 without changing the sampling rate.
+/// Useful between test cases that share filter state.
+export let reset_sampler = fn () -> unit do
+  ensure_initialised()
+  atomic.store_i32(addr: sample_counter_addr, val: 0)
+  return ()
+end
+
+/// Returns true iff `level` meets or exceeds the installed threshold.
+/// Stateless — does NOT advance the sampler counter; callers usually want
+/// `should_emit_record` instead, which combines the two gates.
+export let should_emit_level = fn (level: LogLevel) -> bool do
+  ensure_initialised()
+  let min_prio = mem.load_i64(addr: min_level_addr)
+  return priority_of_level(level) >= min_prio
+end
+
+/// Advance the sampler counter and return whether this record should pass.
+/// Each call increments the counter; with `set_sample_every(n)`, only the
+/// 1st, (n+1)th, (2n+1)th, … calls return true.
+export let should_emit_sample = fn () -> bool do
+  ensure_initialised()
+  let every = mem.load_i64(addr: sample_every_addr)
+  if every <= 1 then return true end
+  let prev = atomic.rmw_add_i32(addr: sample_counter_addr, val: 1)
+  return (prev % every) == 0
+end
+
+/// Composite gate: level threshold AND sampling. Reference handlers call
+/// this before formatting; user handlers can do the same to inherit the
+/// stdlib's filter semantics.
+export let should_emit = fn (level: LogLevel) -> bool do
+  if should_emit_level(level) then
+    return should_emit_sample()
+  end
+  return false
+end
+
+// ─── Field rendering helpers ────────────────────────────────────────────────
+
+/// Render a JsonValue as the bareword the text formatter uses. Strings are
+/// JSON-quoted so embedded `=` / spaces / newlines remain parseable;
+/// scalars are bare. Falls back to JSON serialisation for compound values.
+let value_to_text = fn (v: JsonValue) -> string throws { JsonThrow } do
+  match v do
+    | JsonNull -> return "null"
+    | JsonBool(val: b) -> return str.from_bool(val: b)
+    | JsonInt(val: i) -> return str.from_i64(val: i)
+    | JsonFloat(val: f) -> return str.from_float(val: f)
+    | JsonString(val: s) -> return json_serialize(v: JsonString(val: s))
+    | _ -> return json_serialize(v)
+  end
+end
+
+let render_fields_text_tail = fn (buf: %bb.ByteBuffer, fields: [LogField]) -> %bb.ByteBuffer throws { JsonThrow } do
+  match fields do
+    | [] -> return buf
+    | LogField(key: k, value: v) :: rest ->
+      let %buf1 = bb.push_string(buf: %buf, s: " ")
+      let %buf2 = bb.push_string(buf: %buf1, s: k)
+      let %buf3 = bb.push_string(buf: %buf2, s: "=")
+      let chunk = value_to_text(v: v)
+      let %buf4 = bb.push_string(buf: %buf3, s: chunk)
+      return render_fields_text_tail(buf: %buf4, fields: rest)
+  end
+end
+
+/// Render `[LogField]` into a space-separated `key=value` suffix used by the
+/// text formatter. Empty list yields `""`.
+export let render_fields_text = fn (fields: [LogField]) -> string throws { JsonThrow } do
+  let buf = bb.empty()
+  let %buf1 = render_fields_text_tail(buf: %buf, fields)
+  let result = bb.to_string(buf: &buf1)
+  bb.free(buf: %buf1)
+  return result
+end
+
+let log_fields_to_json_fields = fn (fields: [LogField]) -> [JsonField] do
+  match fields do
+    | [] -> return []
+    | LogField(key: k, value: v) :: rest ->
+      let rest_js = log_fields_to_json_fields(fields: rest)
+      return JsonField(key: k, value: v) :: rest_js
+  end
+end
+
+/// Build the canonical JSON-Lines record for one log entry. Layout:
+///   `{"level":"INFO","ts":<ms>,"msg":<...>,"fields":{...}}`
+/// `fields` is included even when empty so downstream parsers can rely on
+/// the key existing.
+export let render_record_json = fn (level: LogLevel, ts: i64, msg: string, fields: [LogField]) -> string throws { JsonThrow } do
+  let js_fields = log_fields_to_json_fields(fields)
+  let record = JsonObject(fields: [
+    JsonField(key: "level", value: JsonString(val: level_to_string(level))),
+    JsonField(key: "ts", value: JsonInt(val: ts)),
+    JsonField(key: "msg", value: JsonString(val: msg)),
+    JsonField(key: "fields", value: JsonObject(fields: js_fields)),
+  ])
+  return json_serialize(v: record)
+end
+
+/// Build the text-formatter line for one log entry. Layout:
+///   `<LEVEL> ts=<ms> msg=<json-quoted> [k=v]...`
+/// `msg` is always JSON-quoted so embedded whitespace round-trips.
+export let render_record_text = fn (level: LogLevel, ts: i64, msg: string, fields: [LogField]) -> string throws { JsonThrow } do
+  let suffix = render_fields_text(fields)
+  let msg_quoted = json_serialize(v: JsonString(val: msg))
+  return level_to_string(level) ++ " ts=" ++ str.from_i64(val: ts) ++ " msg=" ++ msg_quoted ++ suffix
+end
+
+// ─── Reference handlers ─────────────────────────────────────────────────────
+//
+// Handler arms delegate to plain functions instead of calling `Logger.log`
+// directly: cap method dispatch is dynamic, so a `Logger.log(...)` call
+// inside `info(...)` would re-enter through whatever handler happens to be
+// at the top of the stack, not necessarily *this* handler. The plain-fn
+// indirection sidesteps that ambiguity (and makes the formatters independent
+// of which handler is wrapping them).
+
+let emit_text = fn (level: LogLevel, msg: string, fields: [LogField]) -> unit require { Console } do
+  if should_emit(level) then
+    let ts = now()
+    try
+      let line = render_record_text(level, ts, msg, fields)
+      Console.println(val: line)
+    catch _ ->
+      return ()
+    end
+  end
+  return ()
+end
+
+let emit_json = fn (level: LogLevel, msg: string, fields: [LogField]) -> unit require { Console } do
+  if should_emit(level) then
+    let ts = now()
+    try
+      let line = render_record_json(level, ts, msg, fields)
+      Console.println(val: line)
+    catch _ ->
+      return ()
+    end
+  end
+  return ()
+end
+
+/// Text-formatted logger. One line per record on stdout. Respects the
+/// global level + sampler gates. Drops records that fail either gate
+/// silently.
+export let console_logger = handler Logger require { Console } do
+  fn log(level: LogLevel, msg: string, fields: [LogField]) -> unit do
+    return emit_text(level, msg, fields)
+  end
+  fn trace(msg: string, fields: [LogField]) -> unit do
+    return emit_text(level: Trace, msg, fields)
+  end
+  fn debug(msg: string, fields: [LogField]) -> unit do
+    return emit_text(level: Debug, msg, fields)
+  end
+  fn info(msg: string, fields: [LogField]) -> unit do
+    return emit_text(level: Info, msg, fields)
+  end
+  fn warn(msg: string, fields: [LogField]) -> unit do
+    return emit_text(level: Warn, msg, fields)
+  end
+  fn error(msg: string, fields: [LogField]) -> unit do
+    return emit_text(level: Error, msg, fields)
+  end
+end
+
+/// JSON-Lines logger. Emits one valid JSON object per stdout line. Respects
+/// the global level + sampler gates. Drops records that fail either gate
+/// silently. Serialisation failures (NaN/Infinity in a JsonFloat field) are
+/// suppressed — the record is dropped rather than aborting the program.
+export let json_logger = handler Logger require { Console } do
+  fn log(level: LogLevel, msg: string, fields: [LogField]) -> unit do
+    return emit_json(level, msg, fields)
+  end
+  fn trace(msg: string, fields: [LogField]) -> unit do
+    return emit_json(level: Trace, msg, fields)
+  end
+  fn debug(msg: string, fields: [LogField]) -> unit do
+    return emit_json(level: Debug, msg, fields)
+  end
+  fn info(msg: string, fields: [LogField]) -> unit do
+    return emit_json(level: Info, msg, fields)
+  end
+  fn warn(msg: string, fields: [LogField]) -> unit do
+    return emit_json(level: Warn, msg, fields)
+  end
+  fn error(msg: string, fields: [LogField]) -> unit do
+    return emit_json(level: Error, msg, fields)
+  end
+end
