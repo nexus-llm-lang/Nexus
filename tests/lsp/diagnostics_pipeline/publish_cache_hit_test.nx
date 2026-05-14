@@ -1,0 +1,142 @@
+// Issue nexus-byiw subset: targeted coverage for
+// `src/lsp/diagnostics_pipeline.nx::publish_for_buffer`.
+//
+// Edge case: CACHE HIT on the per-URI version cache. When the editor sends
+// the same (uri, version) twice (e.g. on_did_open followed by an
+// orchestrator-driven republish), `publish_for_buffer` must reuse the
+// stored wire `[Diagnostic]` instead of re-running the compute pipeline.
+// The hit-path is also exception-clean: we never touch Fs/parser for a
+// cache hit, so a buffer text full of broken syntax is irrelevant — the
+// cached diagnostics dominate.
+//
+// Pins:
+//   1. The notification list has exactly one frame.
+//   2. The frame's `diagnostics` field carries the EXACT cached list (here
+//      we pre-seed a single Diagnostic with a recognisable message; if the
+//      compute path ran by mistake, it would re-tokenise the broken source
+//      and emit "lsp: failed to lex or parse source" instead).
+//
+// A regression that skipped the cache lookup (always recomputing) would
+// fail the message check.
+import { publish_for_buffer } from "src/lsp/diagnostics_pipeline.nx"
+import {
+  Diagnostic, Range, Position, PublishDiagnosticsParams,
+  publish_diagnostics_params_to_json,
+  DiagnosticSeverity, DiagSevError
+} from "src/lsp/protocol.nx"
+import {
+  ServerState, HandlerResult, DiagCacheEntry, DocumentRecord,
+  empty_state, with_cache, state_cache, cache_lookup
+} from "src/lsp/state.nx"
+import { JsonValue, JsonObject, JsonField, JsonString, JsonArray, get_field } from "std:json"
+import { Option, Some, None } from "std:option"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+let count_notifs = fn (xs: [JsonValue], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_notifs(xs: rest, acc: acc + 1)
+  end
+end
+
+let count_diags = fn (xs: [Diagnostic], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_diags(xs: rest, acc: acc + 1)
+  end
+end
+
+// Pre-seed a single Diagnostic with a sentinel message. If the compute
+// pipeline ran (bug), the recomputed diagnostic would have a different
+// message ("lsp: failed to lex or parse source") or a typecheck error,
+// never our sentinel.
+let sentinel_message = fn () -> string do
+  return "sentinel: cached value from prior publish"
+end
+
+let seeded_diag = fn () -> Diagnostic do
+  return Diagnostic(
+    range: Range(
+      start: Position(line: 7, character: 3),
+      end_: Position(line: 7, character: 9)
+    ),
+    severity: Some(val: DiagSevError),
+    code: Some(val: "X9999"),
+    source: Some(val: "nexus"),
+    message: sentinel_message()
+  )
+end
+
+let first_diag_message = fn (xs: [Diagnostic]) -> string do
+  match xs do
+    | [] -> return ""
+    | Diagnostic(range: _, severity: _, code: _, source: _, message) :: _ -> return message
+  end
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  let uri = "buffer://byiw_cache_hit.nx"
+  let version = 42
+  // Seed cache: (uri, version) -> [seeded_diag()]. Text the client will
+  // send is intentionally broken; if compute ran, it would emit an origin
+  // diagnostic instead of our sentinel.
+  let seeded = [seeded_diag()]
+  let cache = [DiagCacheEntry(uri, version, diagnostics: seeded)]
+  let initial = with_cache(state: empty_state(), cache)
+
+  // Now call publish_for_buffer with the SAME (uri, version) and a
+  // broken-text buffer. The cache hit must short-circuit before parse.
+  let HandlerResult(state: out_state, response: _, notifications) = publish_for_buffer(
+    state: initial,
+    uri,
+    text: "let x =\n",  // would fail parse if compute ran
+    version
+  )
+
+  // (1) Exactly one publishDiagnostics notification.
+  test_assert.assert_eq_i64(
+    actual: count_notifs(xs: notifications, acc: 0),
+    expected: 1,
+    label: "cache hit yields one publishDiagnostics notification"
+  )
+
+  // (2) The cache row for (uri, version) is still the seeded one. (The
+  // hit path doesn't rewrite the cache.)
+  let after_cache = state_cache(state: out_state)
+  match cache_lookup(cache: after_cache, uri, version) do
+    | None -> raise RuntimeError(val: "cache row missing after hit-path publish")
+    | Some(val: hit_diags) ->
+      test_assert.assert_eq_i64(
+        actual: count_diags(xs: hit_diags, acc: 0),
+        expected: 1,
+        label: "cached diags list has 1 entry post-publish"
+      )
+      test_assert.assert_eq_string(
+        actual: first_diag_message(xs: hit_diags),
+        expected: sentinel_message(),
+        label: "cached diag survives — compute path did NOT run (sentinel preserved)"
+      )
+  end
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end

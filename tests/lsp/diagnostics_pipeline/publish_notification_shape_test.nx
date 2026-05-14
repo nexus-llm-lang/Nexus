@@ -1,0 +1,131 @@
+// Issue nexus-byiw subset: targeted coverage for
+// `src/lsp/diagnostics_pipeline.nx::publish_for_buffer` — cache-MISS path.
+//
+// Edge case: on a fresh ServerState (empty cache), `publish_for_buffer`
+// must (a) compute diagnostics for the buffer, (b) cache them under
+// (uri, version), and (c) emit a JSON-RPC notification frame whose wire
+// shape matches the LSP spec for `textDocument/publishDiagnostics`:
+//
+//   { "jsonrpc": "2.0",
+//     "method":  "textDocument/publishDiagnostics",
+//     "params":  { "uri": <uri>, "version": <v>, "diagnostics": [...] } }
+//
+// This fixture pins the frame skeleton (jsonrpc / method / params.uri).
+// Frame skeleton is independent of how many diagnostics the compute path
+// returns, so the test is robust against unrelated diagnostic-shape
+// changes downstream.
+//
+// A regression that emitted the wrong method string (e.g. dropping the
+// `textDocument/` prefix) or stripped the URI field would surface here.
+import { publish_for_buffer } from "src/lsp/diagnostics_pipeline.nx"
+import {
+  ServerState, HandlerResult, DocumentRecord,
+  empty_state, state_cache, cache_lookup,
+  documents_lookup, state_documents
+} from "src/lsp/state.nx"
+import {
+  JsonValue, JsonObject, JsonField, JsonString, JsonArray, get_field
+} from "std:json"
+import { Diagnostic } from "src/lsp/protocol.nx"
+import { Option, Some, None } from "std:option"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+let count_notifs = fn (xs: [JsonValue], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_notifs(xs: rest, acc: acc + 1)
+  end
+end
+
+let extract_string = fn (jv: JsonValue, dflt: string) -> string do
+  match jv do
+    | JsonString(val) -> return val
+    | _ -> return dflt
+  end
+end
+
+let extract_field_string = fn (jv: JsonValue, key: string, dflt: string) -> string do
+  match get_field(obj: jv, key) do
+    | None -> return dflt
+    | Some(val: f) -> return extract_string(jv: f, dflt)
+  end
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  let uri = "buffer://byiw_notif_shape.nx"
+  let version = 1
+  // Empty buffer (text = ""). Compute path will run (no cache row).
+  let HandlerResult(state: out_state, response: _, notifications) = publish_for_buffer(
+    state: empty_state(),
+    uri,
+    text: "",
+    version
+  )
+
+  // (1) Exactly one notification frame.
+  test_assert.assert_eq_i64(
+    actual: count_notifs(xs: notifications, acc: 0),
+    expected: 1,
+    label: "cache miss yields one publishDiagnostics notification"
+  )
+
+  // (2) Frame skeleton: { jsonrpc: "2.0", method: "textDocument/publishDiagnostics", params: { uri: <uri>, ... } }
+  match notifications do
+    | [] -> raise RuntimeError(val: "unreachable: count asserted 1")
+    | frame :: _ ->
+      test_assert.assert_eq_string(
+        actual: extract_field_string(jv: frame, key: "jsonrpc", dflt: ""),
+        expected: "2.0",
+        label: "notification.jsonrpc == \"2.0\""
+      )
+      test_assert.assert_eq_string(
+        actual: extract_field_string(jv: frame, key: "method", dflt: ""),
+        expected: "textDocument/publishDiagnostics",
+        label: "notification.method == textDocument/publishDiagnostics"
+      )
+      match get_field(obj: frame, key: "params") do
+        | None -> raise RuntimeError(val: "notification has no params field")
+        | Some(val: params) ->
+          test_assert.assert_eq_string(
+            actual: extract_field_string(jv: params, key: "uri", dflt: ""),
+            expected: uri,
+            label: "params.uri == buffer URI"
+          )
+      end
+  end
+
+  // (3) Document store now has this URI registered (publish_for_buffer's
+  // documents_put step). Independent of the cache state.
+  match documents_lookup(store: state_documents(state: out_state), uri) do
+    | None -> raise RuntimeError(val: "document not registered after publish")
+    | Some(val: DocumentRecord(uri: u, text: t, version: v)) ->
+      test_assert.assert_eq_string(actual: u, expected: uri,
+        label: "doc store: URI roundtrips")
+      test_assert.assert_eq_string(actual: t, expected: "",
+        label: "doc store: text roundtrips")
+      test_assert.assert_eq_i64(actual: v, expected: version,
+        label: "doc store: version roundtrips")
+  end
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end

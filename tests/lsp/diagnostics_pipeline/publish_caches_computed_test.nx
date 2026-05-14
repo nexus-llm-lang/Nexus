@@ -1,0 +1,104 @@
+// Issue nexus-byiw subset: targeted coverage for
+// `src/lsp/diagnostics_pipeline.nx::publish_for_buffer` — cache POPULATION
+// on the cache-miss path.
+//
+// Edge case: after a fresh compute_diagnostics_for_buffer run, the result
+// must be stored in the per-URI cache so a subsequent (same uri, same
+// version) call short-circuits via the hit-path (covered by the sibling
+// `publish_cache_hit_test`). This pins the WRITE side of that flow.
+//
+// Two-call sequence:
+//   1. First call: empty cache → compute runs → wire diags cached.
+//   2. Inspect post-state: cache_lookup(state2.cache, uri, version) is
+//      Some(<the wire diags>), not None.
+//
+// We pick a buffer that triggers a deterministic parse-error origin
+// diagnostic so the cached entry has a stable expected size (exactly 1
+// Diagnostic). A regression that forgot to call `cache_put` on the
+// miss-path would surface as None on the post-publish lookup.
+import { publish_for_buffer } from "src/lsp/diagnostics_pipeline.nx"
+import {
+  ServerState, HandlerResult,
+  empty_state, state_cache, cache_lookup
+} from "src/lsp/state.nx"
+import { Diagnostic } from "src/lsp/protocol.nx"
+import { Option, Some, None } from "std:option"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+let count_diags = fn (xs: [Diagnostic], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_diags(xs: rest, acc: acc + 1)
+  end
+end
+
+let first_message = fn (xs: [Diagnostic]) -> string do
+  match xs do
+    | [] -> return ""
+    | Diagnostic(range: _, severity: _, code: _, source: _, message) :: _ -> return message
+  end
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  let uri = "buffer://byiw_cache_write.nx"
+  let version = 11
+  // Deterministic parse failure (let with no RHS): compute path emits
+  // exactly one origin DiagEntry → one wire Diagnostic with the fixed
+  // lex/parse message.
+  let broken = "let q =\n"
+  let HandlerResult(state: state2, response: _, notifications: _) = publish_for_buffer(
+    state: empty_state(),
+    uri,
+    text: broken,
+    version
+  )
+
+  // Post-publish: cache row must exist for (uri, version).
+  match cache_lookup(cache: state_cache(state: state2), uri, version) do
+    | None ->
+      raise RuntimeError(val: "cache miss after publish — cache_put was skipped")
+    | Some(val: cached) ->
+      test_assert.assert_eq_i64(
+        actual: count_diags(xs: cached, acc: 0),
+        expected: 1,
+        label: "cache stores exactly the one wire diagnostic emitted"
+      )
+      test_assert.assert_eq_string(
+        actual: first_message(xs: cached),
+        expected: "lsp: failed to lex or parse source",
+        label: "cached wire diagnostic carries the parse-origin message"
+      )
+  end
+
+  // Cache row is keyed on (uri, version): a different version under the
+  // same URI must NOT hit (otherwise we would have a stale-data bug). The
+  // freshly-populated row is keyed strictly to `version`.
+  let other_version = version + 1
+  match cache_lookup(cache: state_cache(state: state2), uri, version: other_version) do
+    | None -> return ()  // expected
+    | Some(_) ->
+      raise RuntimeError(val: "cache key collapsed version — lookup hit on a different version")
+  end
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
