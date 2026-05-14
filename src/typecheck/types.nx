@@ -13,6 +13,7 @@ import {
   EnumDef, VariantDef, VariantField, RecordDef
 } from "src/common/ast.nx"
 import { ExceptionGroupEntry } from "src/ir/hir/types.nx"
+import { VariantIndex, VariantInfo }, * as vidx from "src/common/variant_index.nx"
 import { Option, Some, None } from "std:option"
 import * as str from "std:str"
 
@@ -56,7 +57,10 @@ export type CheckState = CheckState(
   /** raised value's type against this row; T-TryCatch's catch param draws */
   /** its admissible exception types from here too. */
   throw_row: TypeExpr,
-  exception_groups: [ExceptionGroupEntry]
+  exception_groups: [ExceptionGroupEntry],
+  /** Pre-built `variant_name -> VariantInfo` index for O(1) `find_variant`. */
+  /** Derived from `enum_defs` once at `tc_new_state` time; never mutated. */
+  variant_index: VariantIndex
 )
 
 // ─── Result types ───────────────────────────────────────────────────────────
@@ -84,18 +88,32 @@ export type EnumVariantInfo = EnumVariantInfo(
 // ─── State operations ───────────────────────────────────────────────────────
 
 export let tc_new_state = fn (enum_defs: [EnumEntry], type_defs: [TypeDefEntry], exception_groups: [ExceptionGroupEntry]) -> CheckState do
+  let variant_index = build_variant_index_from_entries(entries: enum_defs)
   return CheckState(
     supply: 0, env: [], enum_defs, type_defs,
     throw_row: TyRow(types: [], rest: None),
-    exception_groups
+    exception_groups,
+    variant_index
   )
 end
 
+let build_variant_index_from_entries = fn (entries: [EnumEntry]) -> VariantIndex do
+  return build_variant_index_from_entries_go(entries, acc: vidx.empty_variant_index())
+end
+
+let build_variant_index_from_entries_go = fn (entries: [EnumEntry], acc: VariantIndex) -> VariantIndex do
+  match entries do
+    | [] -> return acc
+    | EnumEntry(name: _, def: ed) :: rest ->
+      return build_variant_index_from_entries_go(entries: rest, acc: vidx.extend_variant_index(idx: acc, defs: [ed]))
+  end
+end
+
 export let tc_fresh_var = fn (state: CheckState) -> FreshResult do
-  let CheckState(supply: n, env: e, enum_defs: ed, type_defs: td, throw_row: tw, exception_groups: egs) = state
+  let CheckState(supply: n, env: e, enum_defs: ed, type_defs: td, throw_row: tw, exception_groups: egs, variant_index: vi) = state
   let name = "?" ++ str.from_i64(val: n)
   return FreshResult(
-    state: CheckState(supply: n + 1, env: e, enum_defs: ed, type_defs: td, throw_row: tw, exception_groups: egs),
+    state: CheckState(supply: n + 1, env: e, enum_defs: ed, type_defs: td, throw_row: tw, exception_groups: egs, variant_index: vi),
     typ: TyVar(name)
   )
 end
@@ -134,40 +152,26 @@ export let typedef_lookup = fn (defs: [TypeDefEntry], name: string) -> Option<Re
   end
 end
 
-/** Find which enum a variant belongs to and return its info. */
-export let find_variant = fn (defs: [EnumEntry], variant: string) -> Option<EnumVariantInfo> do
-  match defs do
-    | [] -> return None
-    | EnumEntry(name: _, def: EnumDef(name: ename, is_public: _, is_opaque: _, type_params: tps, variants: vs)) :: rest ->
-      match find_variant_in_list(variants: vs, variant) do
-        | Some(val: VariantDef(name: _, fields: fs)) ->
-          return Some(val: EnumVariantInfo(enum_name: ename, type_params: tps, fields: fs))
-        | None -> return find_variant(defs: rest, variant)
-      end
-  end
-end
-
-let find_variant_in_list = fn (variants: [VariantDef], variant: string) -> Option<VariantDef> do
-  match variants do
-    | [] -> return None
-    | VariantDef(name: n, fields: fs) :: rest ->
-      if n == variant then
-        return Some(val: VariantDef(name: n, fields: fs))
-      end
-      return find_variant_in_list(variants: rest, variant)
+/** Find which enum a variant belongs to and return its info. O(1) via the */
+/** pre-built `variant_index` carried in CheckState. */
+export let find_variant = fn (idx: VariantIndex, variant: string) -> Option<EnumVariantInfo> do
+  match vidx.lookup_variant_info(idx, variant) do
+    | None -> return None
+    | Some(val: VariantInfo(enum_name: ename, type_params: tps, def: VariantDef(name: _, fields: fs))) ->
+      return Some(val: EnumVariantInfo(enum_name: ename, type_params: tps, fields: fs))
   end
 end
 
 // ─── State with env helpers ─────────────────────────────────────────────────
 
 export let state_with_env = fn (state: CheckState, env: [EnvEntry]) -> CheckState do
-  let CheckState(supply: s, env: _, enum_defs: ed, type_defs: td, throw_row: tw, exception_groups: egs) = state
-  return CheckState(supply: s, env, enum_defs: ed, type_defs: td, throw_row: tw, exception_groups: egs)
+  let CheckState(supply: s, env: _, enum_defs: ed, type_defs: td, throw_row: tw, exception_groups: egs, variant_index: vi) = state
+  return CheckState(supply: s, env, enum_defs: ed, type_defs: td, throw_row: tw, exception_groups: egs, variant_index: vi)
 end
 
 export let state_with_throw_row = fn (state: CheckState, throw_row: TypeExpr) -> CheckState do
-  let CheckState(supply: s, env: e, enum_defs: ed, type_defs: td, throw_row: _, exception_groups: egs) = state
-  return CheckState(supply: s, env: e, enum_defs: ed, type_defs: td, throw_row, exception_groups: egs)
+  let CheckState(supply: s, env: e, enum_defs: ed, type_defs: td, throw_row: _, exception_groups: egs, variant_index: vi) = state
+  return CheckState(supply: s, env: e, enum_defs: ed, type_defs: td, throw_row, exception_groups: egs, variant_index: vi)
 end
 
 export let state_env = fn (state: CheckState) -> [EnvEntry] do
@@ -186,13 +190,18 @@ export let state_typedefs = fn (state: CheckState) -> [TypeDefEntry] do
 end
 
 export let state_throw_row = fn (state: CheckState) -> TypeExpr do
-  let CheckState(supply: _, env: _, enum_defs: _, type_defs: _, throw_row: tw, exception_groups: _) = state
+  let CheckState(supply: _, env: _, enum_defs: _, type_defs: _, throw_row: tw, exception_groups: _, variant_index: _) = state
   return tw
 end
 
 export let state_exception_groups = fn (state: CheckState) -> [ExceptionGroupEntry] do
-  let CheckState(supply: _, env: _, enum_defs: _, type_defs: _, throw_row: _, exception_groups: egs) = state
+  let CheckState(supply: _, env: _, enum_defs: _, type_defs: _, throw_row: _, exception_groups: egs, variant_index: _) = state
   return egs
+end
+
+export let state_variant_index = fn (state: CheckState) -> VariantIndex do
+  let CheckState(supply: _, env: _, enum_defs: _, type_defs: _, throw_row: _, exception_groups: _, variant_index: vi) = state
+  return vi
 end
 
 // ─── Type display ──────────────────────────────────────────────────────────

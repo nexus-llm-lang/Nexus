@@ -1,0 +1,92 @@
+/**
+ * variant_index: pre-built O(1) lookup from variant-constructor name to its
+ * defining enum + field shape.
+ *
+ * Replaces the recursive list scan that was duplicated in
+ * `typecheck/types.nx::find_variant_in_list` and
+ * `ir/lir/match_tree.nx::lookup_variant_def`. The original scans were called
+ * per pattern node during type checking and decision-tree construction;
+ * cost was O(N_enums * variants_per_enum) per pattern.
+ *
+ * Build the index once per program (where the `enums` table becomes
+ * available) and re-use across all callers. The shape carries both
+ * `VariantDef` (for the LIR path which only needs name + fields) and
+ * the owning enum's name + type parameters (for the typecheck path which
+ * produces `EnumVariantInfo`).
+ *
+ * Disambiguation: variant names are globally unique across enums in
+ * surface Nexus, so a flat `variant_name -> VariantInfo` map suffices.
+ * On collision the first-defined variant wins (mirrors the previous
+ * list-scan first-match semantics).
+ */
+
+import { EnumDef, VariantDef } from "src/common/ast.nx"
+import { StrMap }, * as smap from "src/common/strmap.nx"
+import { Option, Some, None } from "std:option"
+
+// `enum_name` / `type_params` mirror the owning EnumDef. `def` is the
+// raw VariantDef (with its field list) so callers that only need
+// arity / fields don't have to re-scan.
+export type VariantInfo = VariantInfo(
+  enum_name: string,
+  type_params: [string],
+  def: VariantDef
+)
+
+export type VariantIndex = VariantIndex(by_variant: StrMap<VariantInfo>)
+
+let insert_variants = fn (acc: StrMap<VariantInfo>, enum_name: string, type_params: [string], variants: [VariantDef]) -> StrMap<VariantInfo> do
+  match variants do
+    | [] -> return acc
+    | vd :: rest ->
+      match vd do | VariantDef(name: vn, fields: _) ->
+        // First-define-wins: skip if already present so collisions
+        // resolve identically to the prior recursive list scan.
+        let next = match smap.get(m: acc, k: vn) do
+          | Some(_) -> acc
+          | None -> smap.insert(m: acc, k: vn, v: VariantInfo(enum_name, type_params, def: vd))
+        end
+        return insert_variants(acc: next, enum_name, type_params, variants: rest)
+      end
+  end
+end
+
+let build_go = fn (defs: [EnumDef], acc: StrMap<VariantInfo>) -> StrMap<VariantInfo> do
+  match defs do
+    | [] -> return acc
+    | ed :: rest ->
+      match ed do | EnumDef(name: ename, is_public: _, is_opaque: _, type_params: tps, variants: vs) ->
+        let acc2 = insert_variants(acc, enum_name: ename, type_params: tps, variants: vs)
+        return build_go(defs: rest, acc: acc2)
+      end
+  end
+end
+
+export let build_variant_index = fn (defs: [EnumDef]) -> VariantIndex do
+  return VariantIndex(by_variant: build_go(defs, acc: smap.empty()))
+end
+
+/** Direct path that consumes an `EnumDef` stream lazily without first */
+/** materialising it; mirrors `build_variant_index` but threads a starting */
+/** map so the typecheck builder can pre-seed with built-ins via a single */
+/** chained call from the unwrapped `[EnumEntry]`. */
+export let extend_variant_index = fn (idx: VariantIndex, defs: [EnumDef]) -> VariantIndex do
+  let VariantIndex(by_variant: m) = idx
+  return VariantIndex(by_variant: build_go(defs, acc: m))
+end
+
+export let empty_variant_index = fn () -> VariantIndex do
+  return VariantIndex(by_variant: smap.empty())
+end
+
+export let lookup_variant_info = fn (idx: VariantIndex, variant: string) -> Option<VariantInfo> do
+  let VariantIndex(by_variant: m) = idx
+  return smap.get(m, k: variant)
+end
+
+export let lookup_variant_def_in_index = fn (idx: VariantIndex, variant: string) -> Option<VariantDef> do
+  match lookup_variant_info(idx, variant) do
+    | None -> return None
+    | Some(val: VariantInfo(enum_name: _, type_params: _, def: vd)) -> return Some(val: vd)
+  end
+end

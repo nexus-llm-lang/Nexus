@@ -115,6 +115,7 @@ import { DedupExtResult,
          build_name_section, build_closure_type_idx_list } from "src/backend/codegen/module_asm.nx"
 import { LocalResult, MemoryMode, MemoryNone, MemoryDefined, MemoryImported }, * as wcollect from "src/backend/wasm/collect.nx"
 import { HashMap }, * as hmap from "std:hashmap"
+import { StrMap } from "src/common/strmap.nx"
 import { DedupedTypes }, * as wsect from "src/backend/wasm/section.nx"
 import { build_memo_targets, lookup_memo_slot, memo_target_count }, * as memo from "src/backend/codegen/memo.nx"
 import { TyI64, TyIntLit } from "src/common/ast.nx"
@@ -817,8 +818,8 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       // Multi-arm dispatch: each `<port>::<method>` gets its own wasm tag.
       // ss_base = the wasm tag index of the FIRST stack-switching tag (after
       // the optional EH tag); offset = position of `tn` in `ss_tag_names`.
-      let CodegenCtx(ss_tag_idx: ss_base, ss_tag_names: tns, _) = ctx
-      let tag_offset = wcollect.lookup_tag_idx(tag_name: tn, tag_names: tns)
+      let CodegenCtx(ss_tag_idx: ss_base, ss_tag_idx_map: tim, _) = ctx
+      let tag_offset = wcollect.lookup_tag_idx_map(tag_name: tn, idx_map: tim)
       if tag_offset < 0 then
         raise SymbolNotFound(name: tn, kind: "suspend tag", context: "LirExprSuspend tag missing in ss_tag_names")
       end
@@ -869,7 +870,7 @@ let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm_fns: [
                                     arm_tags: [string], ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
   let CodegenCtx(internal_func_map: ifm, ss_cont_type_idx: cont_t_idx,
                   ss_dispatch_block_type_idx: dispatch_t_idx, ss_tag_idx: ss_base,
-                  ss_tag_names: tag_names, _) = ctx
+                  ss_tag_idx_map: tag_idx_map, _) = ctx
   let body_idx = wdefs.lookup_func_fast(name: body_fn, map: &ifm)
   let n_arms_raw = list.length(xs: arm_fns)
   // Phase-2 fallback: arm_tags may be empty (legacy MIR path). Force a
@@ -917,7 +918,7 @@ let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm_fns: [
   let %buf = bb.push_byte(%buf, byte: op_resume)
   let %buf = bb.push_uleb128(%buf, val: cont_t_idx)
   let %buf = bb.push_uleb128(%buf, val: n_arms)
-  let %buf = emit_arm_on_clauses(%buf, arm_tags, ss_base, tag_names, n_arms, idx: 0)
+  let %buf = emit_arm_on_clauses(%buf, arm_tags, ss_base, tag_idx_map, n_arms, idx: 0)
 
   // Normal-return path. The naive `br N+1` (exit dispatcher) prematurely
   // strands queued fibers when the spawner cont (main's body) finishes
@@ -967,21 +968,21 @@ end
 /** (innermost arm = depth 0). When arm_tags is empty (legacy single-arm */
 /** path), fall through to ss_base for the only on-clause. */
 let emit_arm_on_clauses = fn (buf: %ByteBuffer, arm_tags: [string],
-                              ss_base: i64, tag_names: [string], n_arms: i64, idx: i64) -> %ByteBuffer throws { CodegenError } do
+                              ss_base: i64, tag_idx_map: StrMap<i64>, n_arms: i64, idx: i64) -> %ByteBuffer throws { CodegenError } do
   if idx >= n_arms then return %buf end
   let tag_idx = match arm_tags do
     | [] -> ss_base
-    | _ -> ss_base + arm_tag_offset_at(arm_tags, idx, tag_names)
+    | _ -> ss_base + arm_tag_offset_at(arm_tags, idx, tag_idx_map)
   end
   let %buf = bb.push_byte(%buf, byte: 0)
   let %buf = bb.push_uleb128(%buf, val: tag_idx)
   let %buf = bb.push_uleb128(%buf, val: idx)
-  return emit_arm_on_clauses(%buf, arm_tags, ss_base, tag_names, n_arms, idx: idx + 1)
+  return emit_arm_on_clauses(%buf, arm_tags, ss_base, tag_idx_map, n_arms, idx: idx + 1)
 end
 
-let arm_tag_offset_at = fn (arm_tags: [string], idx: i64, tag_names: [string]) -> i64 throws { CodegenError } do
+let arm_tag_offset_at = fn (arm_tags: [string], idx: i64, tag_idx_map: StrMap<i64>) -> i64 throws { CodegenError } do
   let tn = nth_string(xs: arm_tags, idx)
-  let off = wcollect.lookup_tag_idx(tag_name: tn, tag_names)
+  let off = wcollect.lookup_tag_idx_map(tag_name: tn, idx_map: tag_idx_map)
   if off < 0 then
     raise SymbolNotFound(name: tn, kind: "arm tag", context: "arm_tag_offset_at: tag missing in ss_tag_names")
   end
@@ -1558,6 +1559,8 @@ type CompileCtx = CompileCtx(
   ss_cont_type_idx: i64,
   ss_dispatch_block_type_idx: i64,
   ss_tag_names: [string],
+  /** O(1) tag-name → position index; mirrors `ss_tag_names` order. */
+  ss_tag_idx_map: StrMap<i64>,
   effect_map: &EffectMap,
   bt_capture_idx_global: i64,
   memo_target_names: [string],
@@ -1586,6 +1589,7 @@ let build_func_ctx = fn (func: LirFunction,
     ss_cont_type_idx: scti_,
     ss_dispatch_block_type_idx: sdbti_,
     ss_tag_names: stn_,
+    ss_tag_idx_map: stim_,
     effect_map: _,
     bt_capture_idx_global: _,
     memo_target_names: mtn_,
@@ -1612,6 +1616,7 @@ let build_func_ctx = fn (func: LirFunction,
     ss_cont_type_idx: scti_,
     ss_dispatch_block_type_idx: sdbti_,
     ss_tag_names: stn_,
+    ss_tag_idx_map: stim_,
     bt_capture_idx,
     memo_target_names: mtn_,
     memo_target_slots: mts_,
@@ -1880,6 +1885,7 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
       let ss_tag_idx = if has_ss then (if has_eh then 1 else 0 end) else -1 end
       // Reuse the list computed for the tag section above.
       let ss_tag_names = ss_tag_names_for_tags
+      let ss_tag_idx_map = wcollect.build_tag_idx_map(tag_names: ss_tag_names)
       let cctx = CompileCtx(
         internal_funcs,
         external_funcs,
@@ -1895,6 +1901,7 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
         ss_cont_type_idx: my_cont_idx,
         ss_dispatch_block_type_idx,
         ss_tag_names,
+        ss_tag_idx_map,
         effect_map,
         bt_capture_idx_global,
         memo_target_names,

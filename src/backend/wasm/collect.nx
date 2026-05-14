@@ -12,6 +12,7 @@ import * as list from "std:list"
 
 import * as str from "std:str"
 import { HashMap }, * as hmap from "std:hashmap"
+import { StrMap }, * as smap from "src/common/strmap.nx"
 import { rev_strings } from "src/common/listrev.nx"
 
 // ─── String literal collection ──────────────────────────────────────────────
@@ -336,39 +337,33 @@ end
 // trigger an apparent infinite loop on bootstrap-self-compile (root cause
 // not nailed; defensive uniformity).
 
-let str_list_contains = fn (xs: [string], target: string) -> bool do
-  match xs do
-    | [] -> return false
-    | x :: rest ->
-      if x == target then return true end
-      return str_list_contains(xs: rest, target)
-  end
-end
+// Collection happens in two phases:
+//   1. Walk the program appending every tag occurrence into a raw list
+//      (with duplicates) — O(N) without per-step membership probing.
+//   2. dedup_tags reduces to first-seen entries using a StrMap<i64> for
+//      O(1) membership — one O(N) pass instead of the previous O(N²)
+//      str_list_contains-driven merge.
+//
+// The dedup map is also reused (re-computed cheaply at codegen time) to
+// answer `lookup_tag_idx` in O(1) — see `build_tag_idx_map` below.
 
 let collect_expr_tag_names = fn (expr: LirExpr, acc: [string]) -> [string] do
   match expr do
     | LirExprSuspend(tag_name: tn, payload: _, typ: _) ->
-      if str_list_contains(xs: acc, target: tn) then return acc end
       return tn :: acc
     | LirExprInjectResume(body_fn: _, arm_fns: _, arm_tags: ats, typ: _) ->
       // Include arm declarations even if no suspend uses them. A handler may
       // declare arms (yield, spawn) but a particular fixture only uses one;
       // the dispatcher still emits on-clauses for all, so all need a tag.
-      return merge_tag_list(xs: ats, acc)
+      return prepend_all(xs: ats, acc)
     | _ -> return acc
   end
 end
 
-/** Append unique entries from `xs` to `acc`. Linear in |xs| × |acc|; both */
-/** lists are tiny in practice (≤ a handful of cap-method tags). */
-let merge_tag_list = fn (xs: [string], acc: [string]) -> [string] do
+let prepend_all = fn (xs: [string], acc: [string]) -> [string] do
   match xs do
     | [] -> return acc
-    | x :: rest ->
-      if str_list_contains(xs: acc, target: x) then
-        return merge_tag_list(xs: rest, acc)
-      end
-      return merge_tag_list(xs: rest, acc: x :: acc)
+    | x :: rest -> return prepend_all(xs: rest, acc: x :: acc)
   end
 end
 
@@ -397,8 +392,35 @@ let collect_stmts_tag_names = fn (stmts: [LirStmt], acc: [string]) -> [string] d
   end
 end
 
+// O(N) dedup that preserves the prior first-define-wins-then-prepended
+// order: walk `raw` in encounter order; for each tag, if it's the first
+// time we see it, prepend onto `out_acc`; afterwards `out_acc` is the
+// reversed deduped order, exactly matching the previous merge_tag_list
+// invariant (older entries end up deeper in `acc`).
+let dedup_tags = fn (raw: [string]) -> [string] do
+  return dedup_tags_go(raw, seen: smap.empty(), out_acc: [])
+end
+
+let dedup_tags_go = fn (raw: [string], seen: StrMap<i64>, out_acc: [string]) -> [string] do
+  match raw do
+    | [] -> return out_acc
+    | x :: rest ->
+      if smap.contains(m: seen, k: x) then
+        return dedup_tags_go(raw: rest, seen, out_acc)
+      end
+      let seen2 = smap.insert(m: seen, k: x, v: 0)
+      return dedup_tags_go(raw: rest, seen: seen2, out_acc: x :: out_acc)
+  end
+end
+
 export let collect_program_tag_names = fn (funcs: [LirFunction]) -> [string] do
-  return collect_program_tag_names_go(funcs, acc: [])
+  // Phase 1: collect raw (with duplicates), in reverse-encounter order on `acc`.
+  let raw = collect_program_tag_names_go(funcs, acc: [])
+  // Phase 2: dedup. The previous merge_tag_list pushed unique tags onto the
+  // head as they were first encountered — i.e. result order = first-seen,
+  // newest-prepended. `dedup_tags` walks `raw` in the same order and
+  // prepends on first sight, preserving that exact ordering.
+  return dedup_tags(raw: list.reverse(xs: raw))
 end
 
 let collect_program_tag_names_go = fn (funcs: [LirFunction], acc: [string]) -> [string] do
@@ -410,17 +432,30 @@ let collect_program_tag_names_go = fn (funcs: [LirFunction], acc: [string]) -> [
   end
 end
 
-/** Linear lookup: tag_name → index in `tag_names`. Returns -1 if absent. */
-export let lookup_tag_idx = fn (tag_name: string, tag_names: [string]) -> i64 do
-  return lookup_tag_idx_go(tag_name, tag_names, idx: 0)
+// Build a `tag_name -> position` map for O(1) `lookup_tag_idx`. Position
+// matches the index that the prior linear scan would have returned.
+export let build_tag_idx_map = fn (tag_names: [string]) -> StrMap<i64> do
+  return build_tag_idx_map_go(tag_names, idx: 0, acc: smap.empty())
 end
 
-let lookup_tag_idx_go = fn (tag_name: string, tag_names: [string], idx: i64) -> i64 do
+let build_tag_idx_map_go = fn (tag_names: [string], idx: i64, acc: StrMap<i64>) -> StrMap<i64> do
   match tag_names do
-    | [] -> return -1
+    | [] -> return acc
     | x :: rest ->
-      if x == tag_name then return idx end
-      return lookup_tag_idx_go(tag_name, tag_names: rest, idx: idx + 1)
+      // First occurrence wins (matches the linear-scan semantics).
+      let acc2 = match smap.get(m: acc, k: x) do
+        | Some(_) -> acc
+        | None -> smap.insert(m: acc, k: x, v: idx)
+      end
+      return build_tag_idx_map_go(tag_names: rest, idx: idx + 1, acc: acc2)
+  end
+end
+
+/** O(1) lookup: tag_name → index. Returns -1 if absent. */
+export let lookup_tag_idx_map = fn (tag_name: string, idx_map: StrMap<i64>) -> i64 do
+  match smap.get(m: idx_map, k: tag_name) do
+    | Some(val: i) -> return i
+    | None -> return -1
   end
 end
 
