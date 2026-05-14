@@ -611,6 +611,7 @@ end
   observable effects (`race` / `cancel` / `detach` in `std:lazy` are still
   sequential — see their docstrings)
 
+<<<<<<< HEAD
 ## Spec-vs-implementation deltas
 
 These are points where the in-tree typechecker behaves consistently but the
@@ -678,3 +679,62 @@ returning a fixed `TyHandler(name, requires: TyRow([], None))` without
 walking arm bodies for type purposes (arm typechecking happens at the
 top-level handler-arm path in `check.nx`, which inherits the enclosing
 function's env via `state_with_env`).
+
+## Row & exhaustiveness deltas
+
+These are points where `docs/spec/type-system-formal.md` is silent or
+non-deterministic and the implementation has picked a specific reading. Treat
+the impl as the source of truth until the spec is amended.
+
+### Row union over open rows (nexus-w6vp)
+
+The spec defines `merge(ρ₁, ρ₂) = ρ₁ ∪ ρ₂` and a closed-closed `U-Row-Exn`, but
+leaves open-row unions and `Exn`-with-open-tail formally undefined.
+
+- **Impl**: There is no standalone `merge` function. Row mixing is performed
+  inline by `unify_rows_kind` in `src/typecheck/unify.nx` (≈ L362–L405).
+  Surplus labels from each side (`row_split_surplus`) are absorbed by the
+  partner's tail variable when present; if the partner is closed and surplus is
+  non-empty, unification fails with "extra label(s) … not admitted".
+- **Effect**: `{A | ?r₁}` unifying with `{B}` succeeds by instantiating
+  `?r₁ := {B | …}`; the result is the closed `{A, B}` shape. `Exn` is never
+  given special treatment in the row walk — it flows through `row_remove_label`
+  via structural `type_eq` like any other label.
+- **Reading**: open tails win; there is no separate `U-Row-Exn-Open` because
+  the algorithm makes the "instantiate-then-re-apply" sequence happen in one
+  pass.
+
+### Maranget rule priority (nexus-n4pl)
+
+The spec's six `Exh-*` rules (Empty / Done / Bool / Sum / Record / Default) do
+not state a selection order, so `Exh-Default` looks like it could fire at any
+time.
+
+- **Impl**: `src/typecheck/exhaustive.nx` is a full Maranget usefulness/spec
+  algorithm (predicate `is_useful` over `S(M, c)` and `default(M)`). Order is
+  fixed by the algorithm: at each step, if the column type has a known signature
+  (`bool`, sum/enum with full variants, record), it specializes first;
+  `default` only runs against wild-like rows on the head. So in practice the
+  priority is `Empty → Done → constructor-specialize (Bool/Sum/Record) →
+  Default`, exactly Maranget.
+- **Bonus**: redundancy is reported as an error (no warning subsystem), and
+  free type vars in the column type force the conservative "infinite signature"
+  branch (wildcards only). The Maranget pass closed by nexus-j6mr supersedes
+  the spec's ambiguity at the algorithmic level.
+
+### `comparable(?α)` for unresolved/poly type vars (nexus-njx8)
+
+Spec's `comparable(τ)` predicate at `T-Cmp` is partial: no clause for `?α`
+(unification var) or `α` (declared polymorphic var).
+
+- **Impl**: `src/typecheck/infer/operators.nx::comparable` (≈ L100–L126) has
+  `TyVar(_) -> return true`. The choice is the **lenient** reading: free type
+  vars are accepted at the comparison site; later unification decides whether
+  the concrete substitute is comparable.
+- **Caveat**: this is documented as "deferred" — there is currently *no*
+  follow-up check after instantiation that re-evaluates comparability against
+  the resolved type. A generic `fn (x: T, y: T) -> bool do return x == y end`
+  type-checks today even if `T` resolves to a function/handler/ref at the call
+  site. Tighten when the spec picks a side.
+- Also note `TyUserDefined` falls through to `true` for unknown names (opaque /
+  enum), so enum equality is silently accepted pending an enum-equality spec.
