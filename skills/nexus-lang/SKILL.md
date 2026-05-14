@@ -397,22 +397,40 @@ end
 ```
 
 ### 4. Or-patterns to share an arm body across alternatives
-When two arms run the same body, fuse them with `|` instead of duplicating. All alternatives must bind the same variable names with compatible types.
+Whenever **two or more** arms in the same `match` have **identical RHS**, fuse them with `|` into a single arm. This includes the 3+ case — `p1 -> e | p2 -> e | p3 -> e` collapses to `p1 | p2 | p3 -> e`. All alternatives must bind the same variable names with compatible types (or no bindings at all, which is the common case).
+
+This is a hard preference, not a suggestion: duplicated RHS rots — when one arm's body changes, the others silently drift.
 
 ```nexus
-// PREFER — one arm, two ctors share the body
-match sign do
-  | Pos | Neg -> 1
-  | Zero -> 0
+// PREFER — one arm, three ctors share the body
+match tok do
+  | TkPlus | TkMinus | TkStar -> precedence_arith()
+  | TkAnd | TkOr -> precedence_logic()
+  | _ -> 0
 end
 
-// AVOID — duplicated body
-match sign do
-  | Pos -> 1
-  | Neg -> 1
+// AVOID — three arms with the same body
+match tok do
+  | TkPlus -> precedence_arith()
+  | TkMinus -> precedence_arith()
+  | TkStar -> precedence_arith()
+  | TkAnd -> precedence_logic()
+  | TkOr -> precedence_logic()
+  | _ -> 0
+end
+```
+
+Mixing bindings is fine when the names and types line up:
+
+```nexus
+// PREFER — both ctors carry an i64 named `n`
+match num do
+  | Pos(n) | Neg(n) -> abs(x: n)
   | Zero -> 0
 end
 ```
+
+Skip the fusion when the bodies *look* identical but reference different binders (`Foo(x) -> use(x)` vs `Bar(y) -> use(y)`) — those are genuinely different bodies; either rename one binder or leave the arms separate.
 
 ### 5. Punning — drop the label when it matches the local name
 When a function call, constructor call, constructor pattern, record literal, or record pattern passes/binds a variable whose name equals the field label, omit `label:`. The parser desugars `f(x)` to `f(x: x)`, `| Ok(v)` to `| Ok(v: v)`, `{name, age}` to `{name: name, age: age}`, and `let {x} = r` to `let {x: x} = r`. Sigils ride along: `f(%v)`, `f(&v)`, `f(~v)`, `f(@v)`, `f(&%v)` all pun to `f(v: ...)`; the same shapes work inside `{ … }`.
@@ -540,6 +558,7 @@ end
 | `var x = 5` | `let ~x = 5` for mutable |
 | `for x in list` (collection iteration) | No such form exists — use `match`/recursion or `list.fold_left`. The integer-range `for i = lo to hi do ... end` *does* exist (exclusive upper); see `references/patterns.md`. |
 | `throws { Exn }` for a function with a known exception set | List the actual exceptions or an `exception group` (see rule #7) |
+| Multiple match arms with identical RHS: `p1 -> e | p2 -> e | p3 -> e` | Fuse with `|`: `p1 \| p2 \| p3 -> e` (see rule #4) |
 | `raise RuntimeError(val: "...")` from a partial function | Declare a domain-specific `exception` and raise that |
 | `let r = ...; let r2 = ...; let r3 = ...` when intermediates are dead | Shadow: reuse `r` (see rule #6) |
 
