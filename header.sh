@@ -12,8 +12,16 @@
 # manifest order.
 #
 # Subcommand routing:
-#   nexus lsp [args...]    -> run the embedded `lsp` payload
-#   nexus <anything else>  -> run the embedded `compiler` payload (build/exec/etc.)
+#   nexus lsp [args...]              -> run the embedded `lsp` payload
+#   nexus test [args...]             -> host-shell-driven test loop (see below)
+#   nexus run FILE.nx [-- ARGS...]   -> compile FILE.nx and exec the wasm here
+#                                       (the in-wasm driver's `run` path returns
+#                                       a Proc.exec stub diagnostic under
+#                                       preview1, so we intercept it at the
+#                                       shell layer for the same reason `test`
+#                                       is shell-driven)
+#   nexus <anything else>            -> run the embedded `compiler` payload
+#                                       (build/typecheck/etc.)
 #
 # When no `lsp` payload is embedded (unbundled compiler-only build), `nexus lsp`
 # fails with a clear diagnostic rather than executing the compiler with
@@ -37,6 +45,7 @@ trap cleanup EXIT INT TERM HUP
 # the compiler payload. `nexus test` is special-cased — see below.
 PAYLOAD_NAME="compiler"
 TEST_MODE=0
+RUN_MODE=0
 if [ "$#" -gt 0 ]; then
   case "$1" in
     lsp)
@@ -59,6 +68,15 @@ if [ "$#" -gt 0 ]; then
       # truth for the report format and is the path that will light up if
       # a future WASI preview gives us subprocess back.
       TEST_MODE=1
+      shift
+      ;;
+    run)
+      # `nexus run` — same preview1 constraint as test (Proc.exec is a -1
+      # stub), so build + exec are driven from the host shell. The in-wasm
+      # `src/driver.nx` still parses `run` and would Proc.exec wasmtime if
+      # subprocess was available; under preview1 it emits the same
+      # "use the polyglot launcher" hint as the test path.
+      RUN_MODE=1
       shift
       ;;
   esac
@@ -170,6 +188,104 @@ tail -c +$((OFFSET + 1)) "$0" | head -c "$SIZE" > "$TMP"
 # Compose the wasmtime feature flag set. Both payloads are self-contained
 # core WASM with preview1 imports satisfied by --dir mounts.
 W_FLAGS="max-wasm-stack=${NEXUS_MAX_WASM_STACK:-67108864},tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y,shared-memory=y"
+
+if [ "$RUN_MODE" = "1" ]; then
+  # ─── nexus run: build + exec wasm under wasmtime ─────────────────────
+  # Compile the input .nx to a temp wasm using the embedded compiler
+  # payload, then exec wasmtime against the result with the user's args.
+  # The `--` separator splits compile-time tokens from program argv.
+  if [ "$#" -lt 1 ]; then
+    echo "nexus run: missing input file" >&2
+    echo "  usage: nexus run FILE.nx [-- ARGS...]" >&2
+    exit 2
+  fi
+  RUN_INPUT=""
+  RUN_PROG_ARGS=""
+  HAVE_PROG_ARGS=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --)
+        shift
+        HAVE_PROG_ARGS=1
+        # Remaining args go to the program. Quote so paths with spaces survive
+        # the eventual `eval`-equivalent re-expansion below.
+        while [ "$#" -gt 0 ]; do
+          if [ -z "$RUN_PROG_ARGS" ]; then
+            RUN_PROG_ARGS=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+            RUN_PROG_ARGS="'$RUN_PROG_ARGS'"
+          else
+            esc=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+            RUN_PROG_ARGS="$RUN_PROG_ARGS '$esc'"
+          fi
+          shift
+        done
+        ;;
+      *)
+        if [ -z "$RUN_INPUT" ]; then
+          RUN_INPUT="$1"
+        else
+          echo "nexus run: unexpected argument: $1" >&2
+          echo "  (forward program args after a literal '--')" >&2
+          exit 2
+        fi
+        shift
+        ;;
+    esac
+  done
+  if [ -z "$RUN_INPUT" ]; then
+    echo "nexus run: missing input file" >&2
+    echo "  usage: nexus run FILE.nx [-- ARGS...]" >&2
+    exit 2
+  fi
+
+  RUN_WASM=$(mktemp "${TMPDIR:-/tmp}/nexus-run.XXXXXX.wasm")
+  cleanup_run() {
+    [ -n "${RUN_WASM:-}" ] && rm -f "$RUN_WASM"
+    [ -n "$TMP" ] && rm -f "$TMP"
+    [ -n "$MANIFEST_FILE" ] && rm -f "$MANIFEST_FILE"
+  }
+  trap cleanup_run EXIT INT TERM HUP
+
+  # Compile via the compiler payload. Stash both streams of compile output so
+  # the program's own stdio is the only thing the user sees on success; on
+  # failure replay the captured stderr (where the compiler writes its
+  # diagnostics).
+  COMPILE_ELOG=$(mktemp "${TMPDIR:-/tmp}/nexus-run-compile.XXXXXX.log")
+  # shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS is intentionally word-split.
+  if ! wasmtime run \
+      -W "$W_FLAGS" -S threads \
+      --dir=. --dir="${TMPDIR:-/tmp}" \
+      ${NEXUS_WASMTIME_ARGS:-} \
+      "$TMP" build "$RUN_INPUT" -o "$RUN_WASM" --explain-capabilities none \
+      >/dev/null 2>"$COMPILE_ELOG"; then
+    cat "$COMPILE_ELOG" >&2
+    rm -f "$COMPILE_ELOG"
+    exit 1
+  fi
+  rm -f "$COMPILE_ELOG"
+
+  # Run-phase: same flag set as the compiler payload. The cap-derived
+  # `--wasi inherit-network` is omitted because we'd need to parse the
+  # program's `require` row; wasmtime treats missing `--dir`/`--wasi`
+  # as deny-by-default, so over-granting `--dir=.` matches what
+  # `./nexus` already exposes to the compiler payload itself.
+  if [ "$HAVE_PROG_ARGS" = "1" ]; then
+    # shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS + RUN_PROG_ARGS both word-split.
+    eval exec wasmtime run \
+      -W \"\$W_FLAGS\" \
+      -S threads \
+      --dir=. --dir=\"\${TMPDIR:-/tmp}\" \
+      \${NEXUS_WASMTIME_ARGS:-} \
+      \"\$RUN_WASM\" "$RUN_PROG_ARGS"
+  else
+    # shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS is intentionally word-split.
+    exec wasmtime run \
+      -W "$W_FLAGS" -S threads \
+      --dir=. --dir="${TMPDIR:-/tmp}" \
+      ${NEXUS_WASMTIME_ARGS:-} \
+      "$RUN_WASM"
+  fi
+fi
 
 if [ "$TEST_MODE" = "1" ]; then
   # ─── nexus test: host-driven loop ─────────────────────────────────────

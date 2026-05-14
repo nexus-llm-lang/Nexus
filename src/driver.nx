@@ -38,7 +38,7 @@ import { Fs }, * as fs_mod from "std:fs"
 import { Console }, * as stdio from "std:stdio"
 import { Clock }, * as clock_mod from "std:clock"
 import * as str from "std:str"
-import * as proc from "std:proc"
+import { Proc, ExecResult }, * as proc from "std:proc"
 import { IndexOutOfBounds }, * as list from "std:list"
 import { Option, Some, None } from "std:option"
 import { run_test_subcommand, strip_test_subcommand, ParsedTestSubcommand } from "src/tools/test_runner.nx"
@@ -228,7 +228,7 @@ end
 /** typecheck / repl / test) is deferred to a later issue — currently `help */
 /** <subcommand>` emits the same full form so users still see the synopsis. */
 let print_usage = fn () -> unit require { Console } do
-  Console.eprintln(val: "Usage: nexus <subcommand> [options] <args>\n\nSubcommands:\n  build <input.nx> [-o output.wasm] [--polyglot [--remain-manifest]]\n  typecheck <input.nx>\n  repl\n  test [path] [--junit FILE] [--nexus-bin PATH] [--wasmtime-bin PATH]\n  fmt [--check] FILE [FILE...]\n  fmt [--check] -\n  help [subcommand]\n\nGlobal options:\n  --verbose\n  --explain-capabilities {yes|none|wasmtime}\n  --explain-capabilities-format {text|json}\n  --dump-imports <input.nx>")
+  Console.eprintln(val: "Usage: nexus <subcommand> [options] <args>\n\nSubcommands:\n  build <input.nx> [-o output.wasm] [--polyglot [--remain-manifest]]\n  run <input.nx> [-- ARGS...]\n  typecheck <input.nx>\n  repl\n  test [path] [--junit FILE] [--nexus-bin PATH] [--wasmtime-bin PATH]\n  fmt [--check] FILE [FILE...]\n  fmt [--check] -\n  help [subcommand]\n\nGlobal options:\n  --verbose\n  --explain-capabilities {yes|none|wasmtime}\n  --explain-capabilities-format {text|json}\n  --dump-imports <input.nx>")
 end
 
 /** Require a leading `build` subcommand. Symmetry with `repl`/`typecheck`/ */
@@ -280,6 +280,40 @@ let strip_typecheck_subcommand = fn (xs: [string]) -> ParsedTypecheckSubcommand 
         return ParsedTypecheckSubcommand(remaining: prog :: rest2, typecheck_only: true)
       end
       return ParsedTypecheckSubcommand(remaining: xs, typecheck_only: false)
+  end
+end
+
+export type ParsedRunSubcommand = ParsedRunSubcommand(remaining: [string], run_mode: bool, run_args: [string])
+
+/** Split a positional-args list on the first `--` separator. Returns the */
+/** prefix (compiler-visible args) and suffix (program argv forwarded to the */
+/** built wasm). When `--` is absent every token stays in the prefix and the */
+/** suffix is empty. */
+let split_on_dashdash = fn (xs: [string], prefix: [string]) -> ParsedRunSubcommand do
+  match xs do
+    | [] -> return ParsedRunSubcommand(remaining: list.reverse(xs: prefix), run_mode: true, run_args: [])
+    | v :: rest ->
+      if v == "--" then
+        return ParsedRunSubcommand(remaining: list.reverse(xs: prefix), run_mode: true, run_args: rest)
+      end
+      return split_on_dashdash(xs: rest, prefix: v :: prefix)
+  end
+end
+
+/** Detect a leading `run` subcommand. Form: `nexus run <input.nx> [-- ARGS...]`. */
+/** The `--` separator forwards every following token to the built program as */
+/** its argv; tokens before `--` remain available to the build pipeline (so */
+/** `--verbose` etc. still work). */
+export let strip_run_subcommand = fn (xs: [string]) -> ParsedRunSubcommand do
+  match xs do
+    | [] -> return ParsedRunSubcommand(remaining: [], run_mode: false, run_args: [])
+    | prog :: [] -> return ParsedRunSubcommand(remaining: [prog], run_mode: false, run_args: [])
+    | prog :: second :: rest2 ->
+      if second == "run" then
+        let ParsedRunSubcommand(remaining: pre, run_mode: _, run_args) = split_on_dashdash(xs: rest2, prefix: [])
+        return ParsedRunSubcommand(remaining: prog :: pre, run_mode: true, run_args)
+      end
+      return ParsedRunSubcommand(remaining: xs, run_mode: false, run_args: [])
   end
 end
 
@@ -456,6 +490,42 @@ let build_run_cmd = fn (output_name: string, caps: [string]) -> string do
   return "wasmtime run " ++ str.join(xs: argv, sep: " ")
 end
 
+/** Build the wasmtime argv for `nexus run`: `["run", -W..., -S..., cap-flags, */
+/** wasm_path, user_args...]`. Mirrors `build_run_cmd` but emits a list so it */
+/** can be fed straight to `Proc.exec`. */
+let build_wasmtime_run_argv = fn (wasm_path: string, caps: [string], user_args: [string]) -> [string] do
+  let feat_flags = wasmtime_feature_flags()
+  let cap_flags = collect_all_wasmtime_flags(caps)
+  let prefix = list.concat(xs: ["run"], ys: list.concat(xs: feat_flags, ys: cap_flags))
+  return list.concat(xs: prefix, ys: list.concat(xs: [wasm_path], ys: user_args))
+end
+
+/** Spawn `wasmtime run` against the freshly-built artifact and return the */
+/** child's exit code. The Proc.exec stub returns -1 under WASI preview1 (the */
+/** wasmtime profile this driver actually runs under); detect that and tell */
+/** the user to switch to the polyglot `./nexus` launcher, which intercepts */
+/** `run` at the shell layer and drives wasmtime directly. */
+let exec_run_artifact = fn (wasm_path: string, source: string, caps: [string], user_args: [string], verbose: bool) -> i64 require { Console, Proc } do
+  let argv = build_wasmtime_run_argv(wasm_path, caps, user_args)
+  if verbose then
+    Console.eprintln(val: "[nexus] exec wasmtime " ++ str.join(xs: argv, sep: " "))
+  end
+  match Proc.exec(cmd: "wasmtime", args: argv) do | ExecResult(exit_code, stdout, stderr) ->
+    if exit_code == (0 - 1) then
+      Console.eprintln(val: "nexus run: subprocess unavailable (WASI preview1 has no exec).")
+      Console.eprintln(val: "  Run via the polyglot launcher (`./nexus run " ++ source ++ "`) — it")
+      Console.eprintln(val: "  drives wasmtime from the host shell.")
+      return 1
+    end
+    // Stream the child's stdio so `nexus run` is transparent. `eprint` /
+    // `print` (without -ln) preserve any trailing newline emitted by the
+    // program so output is byte-identical to a direct wasmtime invocation.
+    if str.length(s: stdout) > 0 then Console.print(val: stdout) end
+    if str.length(s: stderr) > 0 then Console.eprint(val: stderr) end
+    return exit_code
+  end
+end
+
 let print_build_result_text = fn (output_name: string, caps: [string], explain: ExplainCaps, output: OutputMode) -> unit require { Console } do
   let polyglot_mode = if let PolyglotLauncher = output then true else false end
   Console.eprintln(val: "Built " ++ output_name)
@@ -564,7 +634,15 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
       proc.exit(status: exit_code)
     end
     let ParsedTypecheckSubcommand(remaining: args_after_tc, typecheck_only) = strip_typecheck_subcommand(xs: args_after_output)
-    let ParsedPolyglotFlags(remaining: args_after_polyglot, output: output_mode, manifest: manifest_mode) = strip_polyglot_flags(xs: args_after_tc, output: BareBinary, manifest: StripManifest)
+    // `nexus run <input.nx> [-- ARGS...]` (issue nexus-tr79). Compiles to a
+    // temp wasm then `Proc.exec`s wasmtime against it. The actual exec only
+    // succeeds under a runtime with subprocess (preview2 or host shell); the
+    // polyglot launcher intercepts `run` in shell for the preview1 path.
+    let ParsedRunSubcommand(remaining: args_after_run, run_mode, run_args) = strip_run_subcommand(xs: args_after_output)
+    if run_mode && typecheck_only then
+      raise InvalidUsage(detail: "`run` is incompatible with `typecheck`")
+    end
+    let ParsedPolyglotFlags(remaining: args_after_polyglot, output: output_mode, manifest: manifest_mode) = strip_polyglot_flags(xs: args_after_run, output: BareBinary, manifest: StripManifest)
     let polyglot_mode = if let PolyglotLauncher = output_mode then true else false end
     let remain_manifest = if let KeepManifest = manifest_mode then true else false end
     if remain_manifest && !polyglot_mode then
@@ -573,8 +651,15 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
     if polyglot_mode && typecheck_only then
       raise InvalidUsage(detail: "--polyglot is incompatible with `typecheck`")
     end
-    // When `typecheck` has already been stripped, args lack `build` by design.
-    let clean_args = if typecheck_only then args_after_polyglot else strip_build_subcommand(xs: args_after_polyglot) end
+    if polyglot_mode && run_mode then
+      raise InvalidUsage(detail: "--polyglot is incompatible with `run`")
+    end
+    // When `typecheck` or `run` has already been stripped, args lack `build` by design.
+    let clean_args = if typecheck_only || run_mode then args_after_polyglot else strip_build_subcommand(xs: args_after_polyglot) end
+    // Override output to a side-by-side temp wasm when running. We avoid TMPDIR
+    // (would require PermEnv) and `Fs` is already on the driver's cap list, so
+    // a cwd-relative path needs no extra `--dir` mount.
+    let run_output_path = "./.nexus-run.wasm"
     let argc = list.length(xs: clean_args)
     if argc < 2 then
       print_usage()
@@ -591,7 +676,7 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
     end
 
     let input_path = first_arg
-    let output_path = resolve_output_path(opt_output, xs: clean_args, argc)
+    let output_path = if run_mode then run_output_path else resolve_output_path(opt_output, xs: clean_args, argc) end
 
     if verbose then
       if typecheck_only then
@@ -820,7 +905,11 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
         Console.eprintln(val: "[nexus] write (" ++ str.from_i64(val: t10 - t9) ++ "ms)")
         Console.eprintln(val: "nexus: wrote " ++ output_path ++ " (total " ++ str.from_i64(val: t10 - t0) ++ "ms)")
       end
-      print_build_result(output_name: output_path, caps, explain, format, output: output_mode)
+      // `run` swallows the build-result chatter: the goal is the program's
+      // output, not the compile artifact.
+      if !run_mode then
+        print_build_result(output_name: output_path, caps, explain, format, output: output_mode)
+      end
     else
       raise WriteFailed(path: output_path)
     end
@@ -828,6 +917,11 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
     // All IR data is now dead. ByteBuffer is host-managed (not on nexus heap).
     // Reset heap to free all compiler data structures.
     arena.heap_reset(mark: pipeline_mark)
+
+    if run_mode then
+      let exit_code = exec_run_artifact(wasm_path: output_path, source: input_path, caps, user_args: run_args, verbose)
+      proc.exit(status: exit_code)
+    end
     catch inner ->
       raise InTargetFile(path: input_path, detail: err.format_error(err: inner))
     end
