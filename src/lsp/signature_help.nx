@@ -1,0 +1,476 @@
+/**
+ * lsp/signature_help: resolve textDocument/signatureHelp requests.
+ *
+ * Pipeline:
+ *   1. Tokenize the editor buffer. Find the innermost `TkLParen` whose
+ *      bracket span sits before the cursor and whose matching `TkRParen`
+ *      (or end-of-stream, for an unclosed call) sits after the cursor.
+ *   2. Walk left of that `(` to recover the function identifier — either a
+ *      bare `TkIdent` or `TkIdent TkDot TkIdent` for `alias.foo`-style calls.
+ *   3. Run the same import-aware build pipeline `definition.nx` uses
+ *      (`build_program_state`), resolve the visible name through the
+ *      importer rename map, and locate the matching top-level `GlobalLet`
+ *      whose value is an `ExprLambda` (or — for `alias.foo` — the import
+ *      cache entry's lambda).
+ *   4. Count commas at brace-depth 0 between the call's `(` and the cursor;
+ *      that's the active parameter index. Render the signature label as
+ *      `name(p0: T0, p1: T1, ...)`, build one `ParameterInformation` per
+ *      param using `types.type_to_string` for the rendered type.
+ *
+ * Returns `None` (LSP `null`) for any failure path:
+ *   - cursor not inside any function call,
+ *   - innermost open paren is for a tuple / grouping expression (no
+ *     preceding identifier),
+ *   - identifier doesn't resolve to a known top-level lambda (locals,
+ *     records, builtins are out of scope),
+ *   - lex / parse / import-resolution failure (the buffer is too broken
+ *     to ground a rename map).
+ *
+ * Coordinate model: same as definition / references — LSP `(line, character)`
+ * is 0-based; AST `Span` is 1-based. The cursor in AST coords is
+ * `(line + 1, character + 1)`.
+ *
+ * Out of scope (deferred):
+ *   - method-on-record / handler-arm signatures (only top-level lambdas
+ *     are inspected for params; cap-method calls fall back to `None`),
+ *   - generic instantiation in the rendered type (we print the syntactic
+ *     `TypeExpr` from the AST, not the substituted type from typecheck),
+ *   - documentation: `SignatureInformation.documentation` is always None
+ *     until per-definition doc-comment harvesting lands.
+ */
+
+import { Option, Some, None } from "std:option"
+import * as lexer from "src/frontend/lexer.nx"
+import {
+  SpannedTopLevel, GlobalLet, TLLet,
+  SpannedExpr, Expr, ExprLambda,
+  Param, TypeExpr,
+  RdrName, Unqual, Qual
+} from "src/common/ast.nx"
+import { Span, SpannedToken, Token,
+         TkIdent, TkUident, TkDot,
+         TkLParen, TkRParen, TkComma,
+         TkLBrace, TkRBrace, TkLBracket, TkRBracket } from "src/common/token.nx"
+import { CacheEntry } from "src/ir/imports.nx"
+import { RenameEntry }, * as symtab from "src/ir/symtab.nx"
+import * as rdr from "src/ir/rdrname.nx"
+import * as types from "src/typecheck/types.nx"
+import {
+  ProgramState, build_program_state
+} from "src/lsp/program_state.nx"
+import * as str from "std:str"
+import { Fs } from "std:fs"
+import { Console } from "std:stdio"
+import {
+  SignatureHelp, SignatureInformation, ParameterInformation
+} from "src/lsp/protocol.nx"
+
+// ─── Call-site detection (token-based) ───────────────────────────────────────
+//
+// We walk the token stream tracking the nesting of (), [], {} brackets.
+// Each `TkLParen` opens a candidate call frame whose preceding identifier
+// (if any) names the callee. We keep a stack of *open* paren frames; once a
+// `TkRParen` matches the top, it pops. The cursor's position selects which
+// stack frame is "innermost open at cursor" — that frame's identifier is
+// the callee, and the comma count *inside* that frame (at its own paren
+// depth) is the active parameter index.
+
+// CallFrame: identifier name preceding the `(`, the `(` span, plus the
+// comma count seen so far inside this frame at paren-depth 0 relative to
+// the frame.
+export type CallFrame = CallFrame(
+  name: string,
+  paren_span: Span,
+  comma_count: i64
+)
+
+// Pos: a 1-based (line, col) pair used for ordering tokens against the
+// AST-aligned cursor. `column` is the column of the *next* unread char,
+// which matches the column-after-token spec we use for "cursor is past
+// this token" comparisons.
+let pos_le = fn (a_line: i64, a_col: i64, b_line: i64, b_col: i64) -> bool do
+  if a_line < b_line then return true end
+  if a_line > b_line then return false end
+  return a_col <= b_col
+end
+
+let pos_lt = fn (a_line: i64, a_col: i64, b_line: i64, b_col: i64) -> bool do
+  if a_line < b_line then return true end
+  if a_line > b_line then return false end
+  return a_col < b_col
+end
+
+// Build the visible identifier name preceding the opening paren at `idx`
+// (the index of the `TkLParen`). Returns "" when there is no identifier
+// immediately before the paren (e.g. a grouping `(expr)` or an arrow-typed
+// parameter list `fn (x: i64)`).
+//
+// Recognised shapes:
+//   ...  TkIdent("foo")              "("    → "foo"
+//   ...  TkIdent("alias") TkDot TkIdent("foo") "("  → "alias.foo"
+// We do NOT accept a constructor (TkUident-only) — Nexus syntax is
+// `Foo(x: 1)` (record / variant) which the parser routes through
+// ExprConstructor, not ExprCall.
+let token_at = fn (toks: [SpannedToken], idx: i64) -> Option<SpannedToken> do
+  if idx < 0 then return None end
+  match toks do
+    | [] -> return None
+    | t :: rest ->
+      if idx == 0 then return Some(val: t) end
+      return token_at(toks: rest, idx: idx - 1)
+  end
+end
+
+let token_ident_name = fn (t: SpannedToken) -> Option<string> do
+  match t do | SpannedToken(token, span: _) ->
+    match token do
+      | TkIdent(name) -> return Some(val: name)
+      | _ -> return None
+    end
+  end
+end
+
+let token_is_dot = fn (t: SpannedToken) -> bool do
+  match t do | SpannedToken(token, span: _) ->
+    match token do
+      | TkDot -> return true
+      | _ -> return false
+    end
+  end
+end
+
+let callee_name_before_paren = fn (toks: [SpannedToken], paren_idx: i64) -> string do
+  match token_at(toks, idx: paren_idx - 1) do
+    | None -> return ""
+    | Some(val: t1) ->
+      match token_ident_name(t: t1) do
+        | None -> return ""
+        | Some(val: n1) ->
+          // Probe further left for the `alias.` qualifier.
+          match token_at(toks, idx: paren_idx - 2) do
+            | None -> return n1
+            | Some(val: t2) ->
+              if !token_is_dot(t: t2) then return n1 end
+              match token_at(toks, idx: paren_idx - 3) do
+                | None -> return n1
+                | Some(val: t3) ->
+                  match token_ident_name(t: t3) do
+                    | None -> return n1
+                    | Some(val: n2) -> return n2 ++ "." ++ n1
+                  end
+              end
+          end
+      end
+  end
+end
+
+// ─── Scan tokens to find the innermost open paren-frame at cursor ────────────
+//
+// Algorithm: maintain a stack of *currently-open* paren frames. For every
+// other bracket kind, just track nesting depth so a mismatched `)` inside
+// `[ ... ]` doesn't pop our frame. We snapshot the stack *just before* the
+// cursor position and return its top.
+
+// Stack of open CallFrames, plus a parallel running count of `[`/`{` depths.
+// We collapse those into a single `other_depth` because we don't need to
+// distinguish kinds — any non-paren bracket nesting just prevents us from
+// treating their contents' parens as call frames at the outer level.
+
+export type SigState = SigState(
+  frames: [CallFrame],
+  // Total `[` minus `]` depth + `{` minus `}` depth seen so far. Counts
+  // tokens *outside* call frames; a `(...)` opened while `other_depth > 0`
+  // still gets a frame because tuple grouping inside a list literal can
+  // still hold a call site.
+  other_depth: i64
+)
+
+let push_frame = fn (frames: [CallFrame], f: CallFrame) -> [CallFrame] do
+  return f :: frames
+end
+
+let pop_frame = fn (frames: [CallFrame]) -> [CallFrame] do
+  match frames do
+    | [] -> return []
+    | _ :: rest -> return rest
+  end
+end
+
+let bump_comma = fn (frames: [CallFrame]) -> [CallFrame] do
+  match frames do
+    | [] -> return []
+    | CallFrame(name, paren_span, comma_count) :: rest ->
+      return CallFrame(name, paren_span, comma_count: comma_count + 1) :: rest
+  end
+end
+
+let scan_to_cursor = fn (
+  all_toks: [SpannedToken],
+  toks: [SpannedToken],
+  idx: i64,
+  state: SigState,
+  cur_line: i64,
+  cur_col: i64
+) -> SigState do
+  match toks do
+    | [] -> return state
+    | SpannedToken(token, span: Span(offset: _, line, col)) :: rest ->
+      // Stop as soon as a token starts at or past the cursor — the frame
+      // stack snapshot at that point is what the cursor sees.
+      if !pos_lt(a_line: line, a_col: col, b_line: cur_line, b_col: cur_col) then
+        return state
+      end
+      match state do | SigState(frames, other_depth) ->
+        let new_state = match token do
+          | TkLParen ->
+            // Look up the identifier preceding this LParen in the FULL
+            // token list using its absolute index. Whether we're inside
+            // a `[`/`{` block or not, we still record the frame: nested
+            // `f([g(<cursor>)])` should resolve the innermost call.
+            let name = callee_name_before_paren(toks: all_toks, paren_idx: idx)
+            let frame = CallFrame(name, paren_span: Span(offset: 0, line, col), comma_count: 0)
+            SigState(frames: push_frame(frames, f: frame), other_depth)
+          | TkRParen ->
+            SigState(frames: pop_frame(frames), other_depth)
+          | TkLBracket -> SigState(frames, other_depth: other_depth + 1)
+          | TkRBracket -> SigState(frames, other_depth: other_depth - 1)
+          | TkLBrace -> SigState(frames, other_depth: other_depth + 1)
+          | TkRBrace -> SigState(frames, other_depth: other_depth - 1)
+          | TkComma -> SigState(frames: bump_comma(frames), other_depth)
+          | _ -> state
+        end
+        return scan_to_cursor(all_toks, toks: rest, idx: idx + 1, state: new_state, cur_line, cur_col)
+      end
+  end
+end
+
+let initial_state = fn () -> SigState do
+  return SigState(frames: [], other_depth: 0)
+end
+
+/// Snapshot the call-frame stack at the cursor. Returns the innermost
+/// open call frame (top of the stack), or None if the cursor is not
+/// inside any unmatched `(`. `cur_line` / `cur_col` are AST 1-based
+/// coordinates (LSP `line + 1`, `character + 1`).
+export let innermost_call_at = fn (
+  toks: [SpannedToken],
+  cur_line: i64,
+  cur_col: i64
+) -> Option<CallFrame> do
+  let final = scan_to_cursor(all_toks: toks, toks, idx: 0, state: initial_state(), cur_line, cur_col)
+  match final do | SigState(frames, other_depth: _) ->
+    match frames do
+      | [] -> return None
+      | f :: _ -> return Some(val: f)
+    end
+  end
+end
+
+// ─── Lambda-param lookup ────────────────────────────────────────────────────
+//
+// Resolve a canonical name to the parameter list of its top-level
+// `GlobalLet` value, when that value is an `ExprLambda`. We walk the
+// entry file's defs first, then every cached imported file's defs.
+
+let find_lambda_in_defs = fn (
+  defs: [SpannedTopLevel],
+  source: string,
+  target_canonical: string
+) -> Option<[Param]> do
+  match defs do
+    | [] -> return None
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value)), span: _) :: rest ->
+      let canonical = if name == "main" then "main" else rdr.canonical_name(source_path: source, name) end
+      if canonical == target_canonical then
+        match value do | SpannedExpr(node, span: _) ->
+          match node do
+            | ExprLambda(type_params: _, params, ret_type: _, requires: _, throw_row: _, body: _) ->
+              return Some(val: params)
+            | _ -> return None
+          end
+        end
+      end
+      return find_lambda_in_defs(defs: rest, source, target_canonical)
+    | _ :: rest -> return find_lambda_in_defs(defs: rest, source, target_canonical)
+  end
+end
+
+let find_lambda_in_cache = fn (
+  cache: [CacheEntry],
+  target_canonical: string
+) -> Option<[Param]> do
+  match cache do
+    | [] -> return None
+    | CacheEntry(path, defs, entries: _) :: rest ->
+      match find_lambda_in_defs(defs, source: path, target_canonical) do
+        | Some(val: params) -> return Some(val: params)
+        | None -> return find_lambda_in_cache(cache: rest, target_canonical)
+      end
+  end
+end
+
+// ─── Signature rendering ─────────────────────────────────────────────────────
+//
+// Build the wire-format `SignatureInformation` for a (name, params) pair.
+// Label shape: `name(p0: T0, p1: T1, ...)` so the client renders the
+// canonical call form. Each ParameterInformation's `label` is the parameter
+// name plus its type, mirroring the substring that appears inside the
+// signature label — the LSP spec permits either substring or [start,end]
+// offsets and most clients accept the substring form.
+
+let param_label = fn (p: Param) -> string do
+  match p do | Param(name, sigil: _, typ) ->
+    return name ++ ": " ++ types.type_to_string(typ)
+  end
+end
+
+let params_to_label_parts = fn (params: [Param], acc: [string]) -> [string] do
+  match params do
+    | [] -> return reverse_strings(xs: acc, acc: [])
+    | p :: rest -> return params_to_label_parts(params: rest, acc: param_label(p) :: acc)
+  end
+end
+
+let reverse_strings = fn (xs: [string], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | s :: rest -> return reverse_strings(xs: rest, acc: s :: acc)
+  end
+end
+
+let join_with = fn (parts: [string], sep: string, acc: string, first: bool) -> string do
+  match parts do
+    | [] -> return acc
+    | p :: rest ->
+      let next = if first then p else acc ++ sep ++ p end
+      return join_with(parts: rest, sep, acc: next, first: false)
+  end
+end
+
+let build_signature_label = fn (name: string, params: [Param]) -> string do
+  let labels = params_to_label_parts(params, acc: [])
+  let inside = join_with(parts: labels, sep: ", ", acc: "", first: true)
+  return name ++ "(" ++ inside ++ ")"
+end
+
+let params_to_parameter_infos = fn (params: [Param], acc: [ParameterInformation]) -> [ParameterInformation] do
+  match params do
+    | [] -> return reverse_param_infos(xs: acc, acc: [])
+    | p :: rest ->
+      let info = ParameterInformation(label: param_label(p), documentation: None)
+      return params_to_parameter_infos(params: rest, acc: info :: acc)
+  end
+end
+
+let reverse_param_infos = fn (xs: [ParameterInformation], acc: [ParameterInformation]) -> [ParameterInformation] do
+  match xs do
+    | [] -> return acc
+    | p :: rest -> return reverse_param_infos(xs: rest, acc: p :: acc)
+  end
+end
+
+// Clamp active param index into [0, len(params)]. If the user is typing
+// beyond the last expected argument we still report the last index so the
+// client renders *something*.
+let param_count = fn (params: [Param], acc: i64) -> i64 do
+  match params do
+    | [] -> return acc
+    | _ :: rest -> return param_count(params: rest, acc: acc + 1)
+  end
+end
+
+let clamp_active = fn (idx: i64, total: i64) -> i64 do
+  if total <= 0 then return 0 end
+  if idx < 0 then return 0 end
+  if idx >= total then return total - 1 end
+  return idx
+end
+
+let make_signature_help = fn (
+  name: string,
+  params: [Param],
+  active_param: i64
+) -> SignatureHelp do
+  let label = build_signature_label(name, params)
+  let infos = params_to_parameter_infos(params, acc: [])
+  let total = param_count(params, acc: 0)
+  let active = clamp_active(idx: active_param, total)
+  let sig = SignatureInformation(
+    label,
+    documentation: None,
+    parameters: infos,
+    active_parameter: Some(val: active)
+  )
+  return SignatureHelp(
+    signatures: [sig],
+    active_signature: Some(val: 0),
+    active_parameter: Some(val: active)
+  )
+end
+
+// ─── Driver ──────────────────────────────────────────────────────────────────
+
+/// Resolve signature help for the call enclosing the cursor.
+///
+/// `text` is the editor buffer contents; `file_uri` mirrors what diagnostics
+/// uses. `line` / `character` are 0-based LSP coordinates.
+///
+/// Returns `Some(SignatureHelp)` when the cursor is inside a function call
+/// whose callee resolves to a known top-level lambda; `None` for any other
+/// case (cursor not inside `(`, callee is a local / builtin / record ctor,
+/// or the lex/parse/import pipeline fails). The wrapping `try` collapses
+/// every recoverable error into None so the LSP layer never crashes.
+export let resolve_signature_help = fn (
+  text: string,
+  file_uri: string,
+  line: i64,
+  character: i64
+) -> Option<SignatureHelp> require { Fs, Console } do
+  try
+    return resolve_signature_help_unsafe(text, file_uri, line, character)
+  catch err ->
+    let _ = err
+    return None
+  end
+end
+
+let resolve_signature_help_unsafe = fn (
+  text: string,
+  file_uri: string,
+  line: i64,
+  character: i64
+) -> Option<SignatureHelp> require { Fs, Console } throws { Exn } do
+  let toks = lexer.tokenize(src: text)
+  let cur_line = line + 1
+  let cur_col = character + 1
+  match innermost_call_at(toks, cur_line, cur_col) do
+    | None -> return None
+    | Some(val: CallFrame(name: visible, paren_span: _, comma_count)) ->
+      // Empty `visible` means the `(` had no preceding identifier (a
+      // tuple-grouping `(expr)` or an annotated arrow param list). No
+      // signature to surface.
+      if visible == "" then return None end
+      let ProgramState(prog: _, defs, cache, accum: _, self_entries: _, caller_entries: _, all_entries) =
+        build_program_state(text, file: file_uri)
+      let canonical = symtab.rename(name: visible, entries: all_entries)
+      // No rename hit: visible is a local binding, builtin, or typo.
+      if canonical == visible then return None end
+      // Look up the lambda. Entry file's defs first; then the imports cache.
+      let local_lookup = find_lambda_in_defs(defs, source: file_uri, target_canonical: canonical)
+      let params_opt = match local_lookup do
+        | Some(val: ps) -> Some(val: ps)
+        | None -> find_lambda_in_cache(cache, target_canonical: canonical)
+      end
+      match params_opt do
+        | None -> return None
+        | Some(val: params) ->
+          // The displayed signature name is the LOCAL identifier (post-`#`),
+          // so `alias.foo` and same-file `foo` both render as `foo(...)`.
+          let pos = str.index_of(s: canonical, sub: "#")
+          let local_name = if pos < 0 then canonical else
+            str.substring(s: canonical, start: pos + 1, len: str.length(s: canonical) - pos - 1)
+          end
+          return Some(val: make_signature_help(name: local_name, params, active_param: comma_count))
+      end
+  end
+end

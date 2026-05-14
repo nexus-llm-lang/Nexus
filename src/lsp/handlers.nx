@@ -92,6 +92,9 @@ import {
   find_references
 } from "src/lsp/references.nx"
 import {
+  resolve_signature_help
+} from "src/lsp/signature_help.nx"
+import {
   ServerCapabilities, TdsFull,
   InitializeResult, ServerInfo,
   initialize_params_from_json, initialize_result_to_json,
@@ -104,6 +107,8 @@ import {
   Position, Range, Diagnostic, DocumentSymbol, Location,
   CompletionOptions, CompletionList,
   completion_list_to_json,
+  SignatureHelpOptions, SignatureHelp,
+  signature_help_to_json,
   location_to_json,
   document_symbol_to_json,
   DiagSevError,
@@ -545,6 +550,14 @@ let on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerResult 
     completion_provider: Some(val: CompletionOptions(
       trigger_characters: [".", ":"],
       resolve_provider: false
+    )),
+    /// textDocument/signatureHelp routes through
+    /// `src/lsp/signature_help.resolve_signature_help`. Trigger character
+    /// `(` opens the popup; `,` advances to the next parameter. The MVP
+    /// emits one SignatureInformation per call site (no overload
+    /// resolution; Nexus has none) (issue nexus-w2um).
+    signature_help_provider: Some(val: SignatureHelpOptions(
+      trigger_characters: ["(", ","]
     ))
   )
   let info = ServerInfo(name: "nexus-lsp", version: Some(val: "0.1.0"))
@@ -1029,6 +1042,44 @@ let on_references = fn (state: ServerState, params: JsonValue) -> HandlerResult 
   end
 end
 
+// ─── Handler: textDocument/signatureHelp ─────────────────────────────────────
+//
+// Resolution scope (issue nexus-w2um Phase 1): mirrors definition / references
+// — same-file plus cached imported files. Reuses `definition_position` for
+// the TextDocumentPositionParams shape, hands the text + cursor coordinates
+// to `lsp/signature_help.resolve_signature_help`. The resolver returns None
+// for any failure path; the handler maps that to JSON `null`, which clients
+// treat as "no signature info" (no popup) rather than an error.
+
+let on_signature_help = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let td_v = require_object_field(obj: params, key: "textDocument",
+    ctx: "SignatureHelpParams")
+  let uri_v = require_object_field(obj: td_v, key: "uri",
+    ctx: "SignatureHelpParams.textDocument")
+  let uri = match uri_v do
+    | JsonString(val: s) -> s
+    | _ -> raise LspProtocolError(msg: "SignatureHelpParams.textDocument.uri: expected string")
+  end
+  let pos = definition_position(params)
+  let doc_opt = documents_lookup(store: state_documents(state), uri)
+  match doc_opt do
+    | None ->
+      // No buffer: null (LSP "no result" — clients render no popup).
+      return HandlerResult(state, response: Some(val: JsonNull), notifications: [])
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text, version: _) ->
+        match pos do | Position(line, character) ->
+          let help_opt = resolve_signature_help(text, file_uri: uri, line, character)
+          let response = match help_opt do
+            | None -> JsonNull
+            | Some(val: h) -> signature_help_to_json(h: h)
+          end
+          return HandlerResult(state, response: Some(val: response), notifications: [])
+        end
+      end
+  end
+end
+
 // ─── Method-name dispatch ────────────────────────────────────────────────────
 //
 // Direct switch on method name. Returns `HandlerResult` with `response: None`
@@ -1052,6 +1103,7 @@ let invoke_method = fn (
   if method == "textDocument/definition" then return on_definition(state, params) end
   if method == "textDocument/completion" then return on_completion(state, params) end
   if method == "textDocument/references" then return on_references(state, params) end
+  if method == "textDocument/signatureHelp" then return on_signature_help(state, params) end
   // Unknown method → None response sentinel; request dispatch turns it into
   // MethodNotFound, notifications collapse to a no-op.
   let _ = params
