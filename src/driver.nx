@@ -43,6 +43,7 @@ import { IndexOutOfBounds }, * as list from "std:list"
 import { Option, Some, None } from "std:option"
 import { run_test_subcommand, strip_test_subcommand, ParsedTestSubcommand } from "src/tools/test_runner.nx"
 import { run_fmt_subcommand, strip_fmt_subcommand, ParsedFmtSubcommand } from "src/tools/fmt.nx"
+import { ManifestMode, KeepManifest, StripManifest } from "src/backend/polyglot.nx"
 
 // Backtrace-elision percentage (issue nexus-kyf8): integer percent of raise
 // sites where codegen elides the bt-capture call. Guards against division
@@ -197,25 +198,29 @@ let strip_output_flag = fn (xs: [string], output: Option<string>) -> ParsedOutpu
   end
 end
 
-type ParsedPolyglotFlags = ParsedPolyglotFlags(remaining: [string], polyglot: bool, remain_manifest: bool)
+/** Build emit selector. `BareBinary` writes the raw merged wasm; */
+/** `PolyglotLauncher` wraps it in the self-extracting POSIX-sh launcher. */
+type OutputMode = BareBinary | PolyglotLauncher
+
+type ParsedPolyglotFlags = ParsedPolyglotFlags(remaining: [string], output: OutputMode, manifest: ManifestMode)
 
 /** Strip `--polyglot` and `--remain-manifest` from `xs`. `--polyglot` selects */
 /** the self-extracting POSIX-sh + wasm launcher emit path. `--remain-manifest` */
 /** is opt-in and only meaningful with `--polyglot`; it switches the launcher */
 /** to the manifest-bearing layout (single `app:<size>` entry, format-extensible */
 /** for future multi-payload bundles). */
-let strip_polyglot_flags = fn (xs: [string], polyglot: bool, remain_manifest: bool) -> ParsedPolyglotFlags do
+let strip_polyglot_flags = fn (xs: [string], output: OutputMode, manifest: ManifestMode) -> ParsedPolyglotFlags do
   match xs do
-    | [] -> return ParsedPolyglotFlags(remaining: [], polyglot, remain_manifest)
+    | [] -> return ParsedPolyglotFlags(remaining: [], output, manifest)
     | flag :: rest ->
       if flag == "--polyglot" then
-        return strip_polyglot_flags(xs: rest, polyglot: true, remain_manifest)
+        return strip_polyglot_flags(xs: rest, output: PolyglotLauncher, manifest)
       end
       if flag == "--remain-manifest" then
-        return strip_polyglot_flags(xs: rest, polyglot, remain_manifest: true)
+        return strip_polyglot_flags(xs: rest, output, manifest: KeepManifest)
       end
-      let ParsedPolyglotFlags(remaining: rest_args, polyglot: p2, remain_manifest: m2) = strip_polyglot_flags(xs: rest, polyglot, remain_manifest)
-      return ParsedPolyglotFlags(remaining: flag :: rest_args, polyglot: p2, remain_manifest: m2)
+      let ParsedPolyglotFlags(remaining: rest_args, output: o2, manifest: m2) = strip_polyglot_flags(xs: rest, output, manifest)
+      return ParsedPolyglotFlags(remaining: flag :: rest_args, output: o2, manifest: m2)
   end
 end
 
@@ -284,16 +289,17 @@ let write_and_free = fn (buf: %ByteBuffer, path: string) -> bool do
   return ok
 end
 
-/** Emit either the raw merged wasm or, when `polyglot_mode` is set, the */
-/** self-extracting launcher. Both paths consume `wasm_buf` and free it; the */
-/** boolean return matches `write_and_free`. */
-let write_emit = fn (wasm_buf: %ByteBuffer, output_path: string, caps: [string], polyglot_mode: bool, remain_manifest: bool, verbose: bool) -> bool require { Console } do
+/** Emit either the raw merged wasm or, when `output` is `PolyglotLauncher`, */
+/** the self-extracting launcher. Both paths consume `wasm_buf` and free it; */
+/** the boolean return matches `write_and_free`. */
+let write_emit = fn (wasm_buf: %ByteBuffer, output_path: string, caps: [string], output: OutputMode, manifest: ManifestMode, verbose: bool) -> bool require { Console } do
+  let polyglot_mode = if let PolyglotLauncher = output then true else false end
   if polyglot_mode then
     let payload_size = bb.length(buf: &wasm_buf)
-    let %launcher = polyglot.pack_polyglot(wasm: &wasm_buf, caps, manifest: remain_manifest)
+    let %launcher = polyglot.pack_polyglot(wasm: &wasm_buf, caps, manifest)
     bb.free(buf: %wasm_buf)
     if verbose then
-      let header_n = polyglot.header_size(caps, manifest: remain_manifest, payload_size)
+      let header_n = polyglot.header_size(caps, manifest, payload_size)
       let total_n = bb.length(buf: &launcher)
       Console.eprintln(val: "[nexus] polyglot launcher = header(" ++ str.from_i64(val: header_n)
         ++ ") + payload(" ++ str.from_i64(val: payload_size)
@@ -450,7 +456,8 @@ let build_run_cmd = fn (output_name: string, caps: [string]) -> string do
   return "wasmtime run " ++ str.join(xs: argv, sep: " ")
 end
 
-let print_build_result_text = fn (output_name: string, caps: [string], explain: ExplainCaps, polyglot_mode: bool) -> unit require { Console } do
+let print_build_result_text = fn (output_name: string, caps: [string], explain: ExplainCaps, output: OutputMode) -> unit require { Console } do
+  let polyglot_mode = if let PolyglotLauncher = output then true else false end
   Console.eprintln(val: "Built " ++ output_name)
   match explain do
     | ExplainNone -> return ()
@@ -473,7 +480,8 @@ let print_build_result_text = fn (output_name: string, caps: [string], explain: 
   end
 end
 
-let print_build_result_json = fn (output_name: string, caps: [string], explain: ExplainCaps, polyglot_mode: bool) -> unit require { Console } do
+let print_build_result_json = fn (output_name: string, caps: [string], explain: ExplainCaps, output: OutputMode) -> unit require { Console } do
+  let polyglot_mode = if let PolyglotLauncher = output then true else false end
   match explain do
     | ExplainNone ->
       Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\"}")
@@ -494,10 +502,10 @@ let print_build_result_json = fn (output_name: string, caps: [string], explain: 
   end
 end
 
-let print_build_result = fn (output_name: string, caps: [string], explain: ExplainCaps, format: ExplainFormat, polyglot_mode: bool) -> unit require { Console } do
+let print_build_result = fn (output_name: string, caps: [string], explain: ExplainCaps, format: ExplainFormat, output: OutputMode) -> unit require { Console } do
   match format do
-    | FormatText -> print_build_result_text(output_name, caps, explain, polyglot_mode)
-    | FormatJson -> print_build_result_json(output_name, caps, explain, polyglot_mode)
+    | FormatText -> print_build_result_text(output_name, caps, explain, output)
+    | FormatJson -> print_build_result_json(output_name, caps, explain, output)
   end
 end
 
@@ -556,7 +564,9 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock,
       proc.exit(status: exit_code)
     end
     let ParsedTypecheckSubcommand(remaining: args_after_tc, typecheck_only) = strip_typecheck_subcommand(xs: args_after_output)
-    let ParsedPolyglotFlags(remaining: args_after_polyglot, polyglot: polyglot_mode, remain_manifest) = strip_polyglot_flags(xs: args_after_tc, polyglot: false, remain_manifest: false)
+    let ParsedPolyglotFlags(remaining: args_after_polyglot, output: output_mode, manifest: manifest_mode) = strip_polyglot_flags(xs: args_after_tc, output: BareBinary, manifest: StripManifest)
+    let polyglot_mode = if let PolyglotLauncher = output_mode then true else false end
+    let remain_manifest = if let KeepManifest = manifest_mode then true else false end
     if remain_manifest && !polyglot_mode then
       raise InvalidUsage(detail: "--remain-manifest requires --polyglot")
     end
@@ -794,12 +804,12 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock,
     // raise so the linear `%Task<T>` handle is always joined exactly once.
     let CapsWriteResult(caps: caps, ok: ok) = if polyglot_mode then
         let caps_now = find_main_caps(defs: get_defs(prog))
-        let ok_now = write_emit(%wasm_buf, output_path, caps: caps_now, polyglot_mode: true, remain_manifest, verbose)
+        let ok_now = write_emit(%wasm_buf, output_path, caps: caps_now, output: PolyglotLauncher, manifest: manifest_mode, verbose)
         CapsWriteResult(caps: caps_now, ok: ok_now)
       else
         let @caps_thunk = find_main_caps(defs: get_defs(prog))
         let caps_task = lazy_host.host_spawn(a: caps_thunk)
-        let ok_par = write_emit(%wasm_buf, output_path, caps: [], polyglot_mode: false, remain_manifest, verbose)
+        let ok_par = write_emit(%wasm_buf, output_path, caps: [], output: BareBinary, manifest: manifest_mode, verbose)
         let caps_par = lazy_host.host_join(handle: caps_task)
         CapsWriteResult(caps: caps_par, ok: ok_par)
       end
@@ -810,7 +820,7 @@ let main = fn (args: [string]) -> unit require { PermFs, PermConsole, PermClock,
         Console.eprintln(val: "[nexus] write (" ++ str.from_i64(val: t10 - t9) ++ "ms)")
         Console.eprintln(val: "nexus: wrote " ++ output_path ++ " (total " ++ str.from_i64(val: t10 - t0) ++ "ms)")
       end
-      print_build_result(output_name: output_path, caps, explain, format, polyglot_mode)
+      print_build_result(output_name: output_path, caps, explain, format, output: output_mode)
     else
       raise WriteFailed(path: output_path)
     end
