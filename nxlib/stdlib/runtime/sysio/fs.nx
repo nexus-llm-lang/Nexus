@@ -1,0 +1,441 @@
+/**
+ * runtime/sysio/fs: filesystem runtime, backing `std:fs` (path ops + fd ops)
+ * and `std:bytebuffer` (raw write_string/read_to_string + fd-bytes read).
+ * Internal — re-exported by `runtime/sysio.nx`.
+ *
+ * `fd_path` is backed by a tiny growable fd->path side table in linear
+ * memory (head pointer cached in the reserved low-memory cell at offset 16;
+ * see `fd_table_cell`). Each `fd_open_*` success copies the opened path
+ * into the table keyed by the returned fd (overwriting any stale entry for
+ * the same fd); `fd_close` does not prune (a closed-then-reopened fd is
+ * re-keyed on the next open). `read_to_string` / `write_string` / etc. use
+ * the internal `open_path_*` helpers and do NOT touch the table.
+ */
+import * as mem from "std:runtime/mem"
+import * as core from "std:runtime/sysio/core"
+
+/// Linear-memory cell holding the (lazily allocated) fd->path side-table
+/// pointer. Reserved low memory at offset 16. 0 means "not yet allocated".
+/// The table is `[count: i64, cap: i64, then cap*(fd:i64, path_ptr:i64,
+/// path_len:i64)]`; entries are appended/overwritten, never removed.
+let fd_table_cell = 16
+/// Bytes per fd-table entry: (fd, path_ptr, path_len).
+let fd_entry_size = 24
+/// Initial fd-table capacity (entries).
+let fd_table_cap0 = 16
+
+// === exported: filesystem -- path ops (fs.nx) ===============================
+
+/// exists(path): true iff path_filestat_get succeeds. wasm sig (i32 i32) -> i32 (bool).
+export let exists = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
+  return core.do_path_filestat(path_ptr: core.i64of(x: a_path_ptr), path_len: core.i64of(x: b_path_len)) == 0
+end
+
+/// is_file(path): true iff path exists and its filetype is regular_file.
+/// wasm sig (i32 i32) -> i32 (bool).
+export let is_file = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
+  if core.do_path_filestat(path_ptr: core.i64of(x: a_path_ptr), path_len: core.i64of(x: b_path_len)) != 0 then return false end
+  return mem.load_u8(addr: core.filestat_slot() + 16) == core.filetype_regular_file
+end
+
+/// read_to_string(path): open for read, read whole file, close. Returns a
+/// packed string (0 on any failure -- the .nx wrapper gates with exists).
+/// wasm sig (i32 i32) -> i64 (string).
+export let read_to_string = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  let fd = core.open_path_read(path_ptr: core.i64of(x: a_path_ptr), path_len: core.i64of(x: b_path_len))
+  if fd < 0 then return 0 end
+  let r = core.read_whole_fd(fd)
+  let _ = core.w_fd_close(a_fd: core.i32of(x: fd))
+  return r
+end
+
+/// write_string(path, content): open create+trunc, write content, close.
+/// Returns 1 on success / 0 on failure. wasm sig (i32 i32 i32 i32) -> i32 (bool).
+export let write_string = fn (a_path_ptr: i32, b_path_len: i32, c_content_ptr: i32, d_content_len: i32) -> bool do
+  let fd = core.open_path_write(path_ptr: core.i64of(x: a_path_ptr), path_len: core.i64of(x: b_path_len))
+  if fd < 0 then return false end
+  let ok = core.write_all(fd, buf: core.i64of(x: c_content_ptr), len: core.i64of(x: d_content_len))
+  let _ = core.w_fd_close(a_fd: core.i32of(x: fd))
+  return ok
+end
+
+/// append_string(path, content): open create+append, write content, close.
+/// Returns 1 on success / 0 on failure. wasm sig (i32 i32 i32 i32) -> i32 (bool).
+export let append_string = fn (a_path_ptr: i32, b_path_len: i32, c_content_ptr: i32, d_content_len: i32) -> bool do
+  let fd = core.open_path_append(path_ptr: core.i64of(x: a_path_ptr), path_len: core.i64of(x: b_path_len))
+  if fd < 0 then return false end
+  let ok = core.write_all(fd, buf: core.i64of(x: c_content_ptr), len: core.i64of(x: d_content_len))
+  let _ = core.w_fd_close(a_fd: core.i32of(x: fd))
+  return ok
+end
+
+/// remove_file(path): path_unlink_file. Returns 1/0. wasm sig (i32 i32) -> i32 (bool).
+export let remove_file = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
+  let pp = core.i64of(x: a_path_ptr)
+  let pl = core.i64of(x: b_path_len)
+  if pl <= 0 then return false end
+  let s = core.scratch()
+  let triple = s + core.sl_triple
+  let _ = core.resolve_path(path_ptr: pp, path_len: pl, out: triple)
+  let dirfd = mem.load_i64(addr: triple)
+  let rp = mem.load_i64(addr: triple + 8)
+  let rl = mem.load_i64(addr: triple + 16)
+  if rl <= 0 then return false end
+  return core.w_path_unlink_file(a_dirfd: core.i32of(x: dirfd), b_path_ptr: core.i32of(x: rp), c_path_len: core.i32of(x: rl)) == core.i32of(x: 0)
+end
+
+/// create_dir_all(path): path_create_directory of the LAST component only
+/// (preview1 has no recursive mkdir; parents must already exist -- documented
+/// limitation). Returns 1 on success (or if it already exists as a dir) / 0
+/// else. wasm sig (i32 i32) -> i32 (bool).
+export let create_dir_all = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
+  let pp = core.i64of(x: a_path_ptr)
+  let pl = core.i64of(x: b_path_len)
+  if pl <= 0 then return false end
+  if core.do_path_filestat(path_ptr: pp, path_len: pl) == 0 then
+    return mem.load_u8(addr: core.filestat_slot() + 16) == core.filetype_directory
+  end
+  let s = core.scratch()
+  let triple = s + core.sl_triple
+  let _ = core.resolve_path(path_ptr: pp, path_len: pl, out: triple)
+  let dirfd = mem.load_i64(addr: triple)
+  let rp = mem.load_i64(addr: triple + 8)
+  let rl = mem.load_i64(addr: triple + 16)
+  if rl <= 0 then return false end
+  return core.w_path_create_directory(a_dirfd: core.i32of(x: dirfd), b_path_ptr: core.i32of(x: rp), c_path_len: core.i32of(x: rl)) == core.i32of(x: 0)
+end
+
+/// read_dir(path): list directory entry names, sorted (byte order), joined
+/// with '\n' (matching the old Rust, which sorts and omits "." / ".."). When the
+/// path resolves to a preopen directory itself (relative part == "."), fd_readdir
+/// runs directly on the preopen fd (which must NOT be closed); otherwise the dir
+/// is path_open'd (oflags=directory, READ rights -- write rights would make
+/// path_open return EISDIR) and closed afterward. The fd_readdir loop accumulates
+/// (name_ptr, name_len) pairs in a growable array (the running base/cap live in
+/// scratch's readdir slots because the array may be reallocated mid-loop), then
+/// the names are sorted and concatenated. wasm sig (i32 i32) -> i64 (string).
+export let read_dir = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  let pp = core.i64of(x: a_path_ptr)
+  let pl = core.i64of(x: b_path_len)
+  if pl <= 0 then return 0 end
+  let s = core.scratch()
+  let triple = s + core.sl_triple
+  let _ = core.resolve_path(path_ptr: pp, path_len: pl, out: triple)
+  let dirfd = mem.load_i64(addr: triple)
+  let rp = mem.load_i64(addr: triple + 8)
+  let rl = mem.load_i64(addr: triple + 16)
+  if rl <= 0 then return 0 end
+  let is_preopen = rl == 1 && mem.load_u8(addr: rp) == 46
+  let fd = if is_preopen then dirfd else
+    w_path_open_dir(dirfd, rp, rl) end
+  if fd < 0 then return 0 end
+  let cap0 = 32
+  let pairs0 = core.alloc_bytes(n: cap0 * 16)
+  let _ = mem.store_i64(addr: s + core.sl_dd_base, val: pairs0)
+  let _ = mem.store_i64(addr: s + core.sl_dd_cap, val: cap0)
+  let n = readdir_loop(fd, cookie: 0, count: 0)
+  let _ = if is_preopen then core.i32of(x: 0) else core.w_fd_close(a_fd: core.i32of(x: fd)) end
+  if n <= 0 then return 0 end
+  let pairs = mem.load_i64(addr: s + core.sl_dd_base)
+  let _ = sort_pairs(pairs, count: n)
+  let total = sum_lens(pairs, count: n, i: 0, acc: 0) + (n - 1)
+  if total <= 0 then return 0 end
+  let outp = core.alloc_bytes(n: total)
+  let _ = join_pairs(pairs, count: n, i: 0, dst: outp, off: 0)
+  return core.pack(ptr: outp, len: total)
+end
+
+/// path_open a relative subdir (oflags=directory, READ rights). Returns the fd
+/// (>= 0) or -1. The (dirfd, rel_ptr, rel_len) come from a prior resolve_path
+/// into the triple slot; rel must still be valid in memory.
+let w_path_open_dir = fn (dirfd: i64, rel_ptr: i64, rel_len: i64) -> i64 do
+  let opened = core.scratch() + core.sl_opened
+  let errno = core.w_path_open(a_dirfd: core.i32of(x: dirfd),
+                          b_dirflags: core.i32of(x: core.lookup_symlink_follow),
+                          c_path_ptr: core.i32of(x: rel_ptr), d_path_len: core.i32of(x: rel_len),
+                          e_oflags: core.i32of(x: core.oflag_directory),
+                          f_rights_base: core.rights_dir, g_rights_inh: core.rights_dir,
+                          h_fdflags: core.i32of(x: 0),
+                          i_opened_fd_ptr: core.i32of(x: opened))
+  if errno != core.i32of(x: 0) then return 0 - 1 end
+  return mem.load_i32(addr: opened)
+end
+
+/// fd_readdir into a 4 KiB buffer; parse_dirents each round; loop while the
+/// buffer came back full and the cookie advanced. Reads/updates the running
+/// pairs base/cap in scratch's sl_dd_* slots. Returns the final entry count.
+let readdir_loop = fn (fd: i64, cookie: i64, count: i64) -> i64 do
+  let bufcap = 4096
+  let dbuf = core.alloc_bytes(n: bufcap)
+  let s = core.scratch()
+  let used_p = s + core.sl_dd_used
+  if core.w_fd_readdir(a_fd: core.i32of(x: fd), b_buf_ptr: core.i32of(x: dbuf), c_buf_len: core.i32of(x: bufcap), d_cookie: cookie, e_bufused_ptr: core.i32of(x: used_p)) != core.i32of(x: 0) then
+    return count
+  end
+  let used = mem.load_i32(addr: used_p)
+  let _ = mem.store_i64(addr: s + core.sl_dd_cookie, val: cookie)
+  let r = parse_dirents(dbuf, used, off: 0, count)
+  let last_cookie = mem.load_i64(addr: s + core.sl_dd_cookie)
+  if used >= bufcap && last_cookie != cookie then
+    return readdir_loop(fd, cookie: last_cookie, count: r)
+  end
+  return r
+end
+
+/// Parse dirent records from [dbuf+off, dbuf+used). Each dirent: d_next u64 @0,
+/// d_ino u64 @8, d_namlen u32 @16, d_type u8 @20 (24-byte header), then namlen
+/// name bytes. For each non-"."/non-".." name, copy it to a fresh allocation and
+/// push (ptr, len) to the pairs array (growing it via sl_dd_base/sl_dd_cap).
+/// Updates sl_dd_cookie to the last record's d_next. Returns the resulting count.
+let parse_dirents = fn (dbuf: i64, used: i64, off: i64, count: i64) -> i64 do
+  if off + 24 > used then return count end
+  let namlen = mem.load_i32(addr: dbuf + off + 16)
+  let name_off = off + 24
+  if name_off + namlen > used then return count end
+  let s = core.scratch()
+  let next_cookie = mem.load_i64(addr: dbuf + off)
+  let _ = mem.store_i64(addr: s + core.sl_dd_cookie, val: next_cookie)
+  let name_ptr = dbuf + name_off
+  if is_dot_or_dotdot(p: name_ptr, n: namlen) then
+    return parse_dirents(dbuf, used, off: name_off + namlen, count)
+  end
+  let owned = core.alloc_bytes(n: namlen)
+  let _ = core.copy_bytes(dst: owned, src: name_ptr, count: namlen)
+  let base = mem.load_i64(addr: s + core.sl_dd_base)
+  let lim = mem.load_i64(addr: s + core.sl_dd_cap)
+  if count >= lim then
+    let ncap = if lim * 2 > count + 1 then lim * 2 else count + 1 end
+    let nbase = core.alloc_bytes(n: ncap * 16)
+    let _ = core.copy_bytes(dst: nbase, src: base, count: lim * 16)
+    let _ = mem.store_i64(addr: s + core.sl_dd_base, val: nbase)
+    let _ = mem.store_i64(addr: s + core.sl_dd_cap, val: ncap)
+    let _ = mem.store_i64(addr: nbase + count * 16, val: owned)
+    let _ = mem.store_i64(addr: nbase + count * 16 + 8, val: namlen)
+    return parse_dirents(dbuf, used, off: name_off + namlen, count: count + 1)
+  end
+  let _ = mem.store_i64(addr: base + count * 16, val: owned)
+  let _ = mem.store_i64(addr: base + count * 16 + 8, val: namlen)
+  return parse_dirents(dbuf, used, off: name_off + namlen, count: count + 1)
+end
+
+let is_dot_or_dotdot = fn (p: i64, n: i64) -> bool do
+  if n == 1 then return mem.load_u8(addr: p) == 46 end
+  if n == 2 then return mem.load_u8(addr: p) == 46 && mem.load_u8(addr: p + 1) == 46 end
+  return false
+end
+
+/// Insertion sort the (ptr,len) pairs array in place by byte order of the names.
+let sort_pairs = fn (pairs: i64, count: i64) -> unit do return sort_outer(pairs, count, i: 1) end
+let sort_outer = fn (pairs: i64, count: i64, i: i64) -> unit do
+  if i >= count then return () end
+  let _ = sort_inner(pairs, j: i)
+  return sort_outer(pairs, count, i: i + 1)
+end
+let sort_inner = fn (pairs: i64, j: i64) -> unit do
+  if j <= 0 then return () end
+  let prev_p = mem.load_i64(addr: pairs + (j - 1) * 16)
+  let prev_l = mem.load_i64(addr: pairs + (j - 1) * 16 + 8)
+  let cur_p = mem.load_i64(addr: pairs + j * 16)
+  let cur_l = mem.load_i64(addr: pairs + j * 16 + 8)
+  if core.bytes_cmp(pa: prev_p, la: prev_l, pb: cur_p, lb: cur_l) <= 0 then return () end
+  let _ = mem.store_i64(addr: pairs + (j - 1) * 16, val: cur_p)
+  let _ = mem.store_i64(addr: pairs + (j - 1) * 16 + 8, val: cur_l)
+  let _ = mem.store_i64(addr: pairs + j * 16, val: prev_p)
+  let _ = mem.store_i64(addr: pairs + j * 16 + 8, val: prev_l)
+  return sort_inner(pairs, j: j - 1)
+end
+
+let sum_lens = fn (pairs: i64, count: i64, i: i64, acc: i64) -> i64 do
+  if i >= count then return acc end
+  return sum_lens(pairs, count, i: i + 1, acc: acc + mem.load_i64(addr: pairs + i * 16 + 8))
+end
+
+/// Concatenate the pair names into `dst`, '\n'-separated.
+let join_pairs = fn (pairs: i64, count: i64, i: i64, dst: i64, off: i64) -> unit do
+  if i >= count then return () end
+  let np = mem.load_i64(addr: pairs + i * 16)
+  let nl = mem.load_i64(addr: pairs + i * 16 + 8)
+  let _ = core.copy_bytes(dst: dst + off, src: np, count: nl)
+  if i + 1 >= count then return () end
+  let _ = mem.store_u8(addr: dst + off + nl, val: 10)
+  return join_pairs(pairs, count, i: i + 1, dst, off: off + nl + 1)
+end
+
+// === exported: filesystem -- fd ops (fs.nx) =================================
+
+// --- fd -> path side table -------------------------------------------------
+
+/// Read/write the fd-table header words.
+let ft_count = fn (h: i64) -> i64 do return mem.load_i64(addr: h) end
+let ft_cap = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 8) end
+let ft_set_count = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h, val: v) end
+let ft_set_cap = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 8, val: v) end
+/// Address of entry `i`'s (fd, path_ptr, path_len) triple.
+let ft_entry = fn (h: i64, i: i64) -> i64 do return h + 16 + (i * fd_entry_size) end
+
+/// The fd-table head (lazily allocated). 0 -> allocate the initial table.
+let fd_table = fn () -> i64 do
+  let cur = mem.load_i64(addr: fd_table_cell)
+  if cur != 0 then return cur end
+  let cp = fd_table_cap0
+  let h = core.alloc_bytes(n: 16 + (cp * fd_entry_size))
+  let _ = ft_set_count(h, v: 0)
+  let _ = ft_set_cap(h, v: cp)
+  let _ = mem.store_i64(addr: fd_table_cell, val: h)
+  return h
+end
+
+/// Index of the entry for `fd`, or -1 if absent.
+let ft_find = fn (h: i64, fd: i64) -> i64 do return ft_find_go(h, fd, i: 0, n: ft_count(h)) end
+let ft_find_go = fn (h: i64, fd: i64, i: i64, n: i64) -> i64 do
+  if i >= n then return 0 - 1 end
+  if mem.load_i64(addr: ft_entry(h, i)) == fd then return i end
+  return ft_find_go(h, fd, i: i + 1, n)
+end
+
+/// Record (a copy of) `[path_ptr, path_ptr+path_len)` as the path of `fd`.
+/// Overwrites a prior entry for `fd`; grows the table (2x) when full.
+let fd_table_put = fn (fd: i64, path_ptr: i64, path_len: i64) -> unit do
+  if fd < 0 || path_len <= 0 then return () end
+  let owned = core.alloc_bytes(n: path_len)
+  let _ = core.copy_bytes(dst: owned, src: path_ptr, count: path_len)
+  let h0 = fd_table()
+  let existing = ft_find(h: h0, fd)
+  if existing >= 0 then
+    let e = ft_entry(h: h0, i: existing)
+    let _ = mem.store_i64(addr: e + 8, val: owned)
+    let _ = mem.store_i64(addr: e + 16, val: path_len)
+    return ()
+  end
+  let h = if ft_count(h0) < ft_cap(h0) then h0 else fd_table_grow(h0) end
+  let n = ft_count(h)
+  let e = ft_entry(h, i: n)
+  let _ = mem.store_i64(addr: e, val: fd)
+  let _ = mem.store_i64(addr: e + 8, val: owned)
+  let _ = mem.store_i64(addr: e + 16, val: path_len)
+  let _ = ft_set_count(h, v: n + 1)
+  return ()
+end
+/// Double the table's capacity (copy header + entries to a fresh region; the
+/// old region leaks, which is fine under the bump allocator). Updates the cell.
+let fd_table_grow = fn (h0: i64) -> i64 do
+  let old_cap = ft_cap(h0)
+  let new_cap = old_cap * 2
+  let cnt = ft_count(h0)
+  let h = core.alloc_bytes(n: 16 + (new_cap * fd_entry_size))
+  let _ = core.copy_bytes(dst: h, src: h0, count: 16 + (cnt * fd_entry_size))
+  let _ = ft_set_cap(h, v: new_cap)
+  let _ = mem.store_i64(addr: fd_table_cell, val: h)
+  return h
+end
+
+/// Common open path: open via `opener`, and on success record the path.
+let fd_open_and_track = fn (path_ptr: i64, path_len: i64, fd: i64) -> i64 do
+  if fd >= 0 then let _ = fd_table_put(fd, path_ptr, path_len) end
+  return fd
+end
+
+/// fd_open_read(path): open for reading; return the fd (>= 0) or -1.
+/// On success, the path is recorded for later fd_path lookup.
+/// wasm sig (i32 i32) -> i64.
+export let fd_open_read = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  let pp = core.i64of(x: a_path_ptr)
+  let pl = core.i64of(x: b_path_len)
+  return fd_open_and_track(path_ptr: pp, path_len: pl, fd: core.open_path_read(path_ptr: pp, path_len: pl))
+end
+
+/// fd_open_write(path): open create+trunc; return the fd (>= 0) or -1.
+/// On success, the path is recorded for later fd_path lookup.
+/// wasm sig (i32 i32) -> i64.
+export let fd_open_write = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  let pp = core.i64of(x: a_path_ptr)
+  let pl = core.i64of(x: b_path_len)
+  return fd_open_and_track(path_ptr: pp, path_len: pl, fd: core.open_path_write(path_ptr: pp, path_len: pl))
+end
+
+/// fd_open_append(path): open create+append; return the fd (>= 0) or -1.
+/// On success, the path is recorded for later fd_path lookup.
+/// wasm sig (i32 i32) -> i64.
+export let fd_open_append = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  let pp = core.i64of(x: a_path_ptr)
+  let pl = core.i64of(x: b_path_len)
+  return fd_open_and_track(path_ptr: pp, path_len: pl, fd: core.open_path_append(path_ptr: pp, path_len: pl))
+end
+
+/// fd_close(fd): close the fd. Returns 1 on success / 0 on bad fd.
+/// wasm sig (i64) -> i32 (bool).
+export let fd_close = fn (a_fd: i64) -> bool do
+  if a_fd < 0 then return false end
+  return core.w_fd_close(a_fd: core.i32of(x: a_fd)) == core.i32of(x: 0)
+end
+
+/// fd_read(fd): read the entire file (seeks to 0 first); return a packed
+/// string (0 on failure). wasm sig (i64) -> i64 (string).
+export let fd_read = fn (a_fd: i64) -> i64 do
+  if a_fd < 0 then return 0 end
+  return core.read_whole_fd(fd: a_fd)
+end
+
+/// fd_write(fd, content): write content's bytes to fd. Returns 1 on
+/// success / 0 on failure. wasm sig (i64 i32 i32) -> i32 (bool).
+export let fd_write = fn (a_fd: i64, b_content_ptr: i32, c_content_len: i32) -> bool do
+  if a_fd < 0 then return false end
+  return core.write_all(fd: a_fd, buf: core.i64of(x: b_content_ptr), len: core.i64of(x: c_content_len))
+end
+
+/// fd_path(fd): the path `fd` was opened with via fd_open_*, as a
+/// packed string; 0 ("") when the fd is unknown to the side table (never
+/// opened through the fd-handle API, or a stdio/preopen fd). The stored path
+/// is a private copy, so the result is stable. wasm sig (i64) -> i64 (string).
+export let fd_path = fn (a_fd: i64) -> i64 do
+  if a_fd < 0 then return 0 end
+  let cur = mem.load_i64(addr: fd_table_cell)
+  if cur == 0 then return 0 end
+  let idx = ft_find(h: cur, fd: a_fd)
+  if idx < 0 then return 0 end
+  let e = ft_entry(h: cur, i: idx)
+  return core.pack(ptr: mem.load_i64(addr: e + 8), len: mem.load_i64(addr: e + 16))
+end
+
+// --- string-typed wrappers ---
+
+export let exists_path = fn (path: string) -> bool do return exists(a_path_ptr: core.s_p(s: path), b_path_len: core.s_l(s: path)) end
+export let is_file_path = fn (path: string) -> bool do return is_file(a_path_ptr: core.s_p(s: path), b_path_len: core.s_l(s: path)) end
+export let read_to_string_path = fn (path: string) -> string do return core.pun_str(a_x: read_to_string(a_path_ptr: core.s_p(s: path), b_path_len: core.s_l(s: path))) end
+export let write_string_path = fn (path: string, content: string) -> bool do return write_string(a_path_ptr: core.s_p(s: path), b_path_len: core.s_l(s: path), c_content_ptr: core.s_p(s: content), d_content_len: core.s_l(s: content)) end
+export let append_string_path = fn (path: string, content: string) -> bool do return append_string(a_path_ptr: core.s_p(s: path), b_path_len: core.s_l(s: path), c_content_ptr: core.s_p(s: content), d_content_len: core.s_l(s: content)) end
+export let remove_file_path = fn (path: string) -> bool do return remove_file(a_path_ptr: core.s_p(s: path), b_path_len: core.s_l(s: path)) end
+export let create_dir_all_path = fn (path: string) -> bool do return create_dir_all(a_path_ptr: core.s_p(s: path), b_path_len: core.s_l(s: path)) end
+export let read_dir_path = fn (path: string) -> string do return core.pun_str(a_x: read_dir(a_path_ptr: core.s_p(s: path), b_path_len: core.s_l(s: path))) end
+
+export let fd_open_read_path = fn (path: string) -> i64 do return fd_open_read(a_path_ptr: core.s_p(s: path), b_path_len: core.s_l(s: path)) end
+export let fd_open_write_path = fn (path: string) -> i64 do return fd_open_write(a_path_ptr: core.s_p(s: path), b_path_len: core.s_l(s: path)) end
+export let fd_open_append_path = fn (path: string) -> i64 do return fd_open_append(a_path_ptr: core.s_p(s: path), b_path_len: core.s_l(s: path)) end
+export let fd_close_n = fn (fd: i64) -> bool do return fd_close(a_fd: fd) end
+export let fd_read_n = fn (fd: i64) -> string do return core.pun_str(a_x: fd_read(a_fd: fd)) end
+export let fd_write_n = fn (fd: i64, content: string) -> bool do return fd_write(a_fd: fd, b_content_ptr: core.s_p(s: content), c_content_len: core.s_l(s: content)) end
+export let fd_path_n = fn (fd: i64) -> string do return core.pun_str(a_x: fd_path(a_fd: fd)) end
+
+// --- bytebuffer write/read raw (ptr,len) entry points (no string boxing) ---
+
+export let write_string_raw = fn (a_path_ptr: i32, b_path_len: i32, c_content_ptr: i32, d_content_len: i32) -> bool do
+  return write_string(a_path_ptr, b_path_len, c_content_ptr, d_content_len)
+end
+export let read_to_string_raw = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
+  return read_to_string(a_path_ptr, b_path_len)
+end
+
+/// Single fd_read of up to `c_cap` bytes from `a_fd` into linear memory at
+/// `b_dst`. Returns the byte count read (0 at EOF), or -1 on error. Used by
+/// ByteBuffer.read_stdin_bytes, which loops this until EOF / its limit.
+export let read_fd_bytes_into = fn (a_fd: i64, b_dst: i64, c_cap: i64) -> i64 do
+  if c_cap <= 0 then return 0 end
+  let s = core.scratch()
+  let iov = s + core.sl_iovec
+  let nr = s + core.sl_nrw
+  let _ = mem.store_i32(addr: iov, val: b_dst)
+  let _ = mem.store_i32(addr: iov + 4, val: c_cap)
+  let errno = core.w_fd_read(a_fd: core.i32of(x: a_fd), b_iovs_ptr: core.i32of(x: iov), c_iovs_len: core.i32of(x: 1), d_nread_ptr: core.i32of(x: nr))
+  if errno != core.i32of(x: 0) then return 0 - 1 end
+  return mem.load_i32(addr: nr)
+end

@@ -1,0 +1,273 @@
+/**
+ * runtime/collection/stringmap: string-key -> i64 StringMap, backing
+ * `std:stringmap`. Internal — re-exported by `runtime/collection.nx`.
+ *
+ * smap slot i lives at buckets + i*32 : [key_ptr (0), key_len (8),
+ *                                        value (16), state (24)].
+ *
+ * smap keys are copied into a fresh allocation on `put`, so the caller's
+ * (possibly transient) string buffer need not outlive the call.
+ */
+import * as mem from "std:runtime/mem"
+import * as cast from "std:runtime/cast"
+import * as arena from "std:runtime/arena"
+import * as core from "std:runtime/collection/core"
+
+let sm_kptr = fn (b: i64, i: i64) -> i64 do return mem.load_i64(addr: b + (i * 32)) end
+let sm_klen = fn (b: i64, i: i64) -> i64 do return mem.load_i64(addr: b + (i * 32) + 8) end
+let sm_val = fn (b: i64, i: i64) -> i64 do return mem.load_i64(addr: b + (i * 32) + 16) end
+let sm_state = fn (b: i64, i: i64) -> i64 do return mem.load_i64(addr: b + (i * 32) + 24) end
+let sm_put_kptr = fn (b: i64, i: i64, v: i64) -> unit do return mem.store_i64(addr: b + (i * 32), val: v) end
+let sm_put_klen = fn (b: i64, i: i64, v: i64) -> unit do return mem.store_i64(addr: b + (i * 32) + 8, val: v) end
+let sm_put_val = fn (b: i64, i: i64, v: i64) -> unit do return mem.store_i64(addr: b + (i * 32) + 16, val: v) end
+let sm_put_state = fn (b: i64, i: i64, v: i64) -> unit do return mem.store_i64(addr: b + (i * 32) + 24, val: v) end
+
+let sm_mk = fn () -> i64 do
+  let h = core.alloc_words(nw: 4)
+  let cp = core.initial_cap
+  let _ = core.set_count(h, v: 0)
+  let _ = core.set_cp(h, v: cp)
+  let _ = core.set_buckets(h, v: core.alloc_words(nw: cp * 4))
+  let _ = core.set_snap(h, v: 0)
+  return h
+end
+
+let sm_eq = fn (b: i64, i: i64, kptr: i64, klen: i64) -> bool do
+  return sm_klen(b, i) == klen && core.bytes_eq(p1: sm_kptr(b, i), p2: kptr, n: klen, i: 0)
+end
+
+/// Index of the occupied slot holding key (kptr,klen), or -1.
+let sm_find = fn (b: i64, cp: i64, kptr: i64, klen: i64) -> i64 do
+  return sm_find_go(b, cp, kptr, klen, i: core.slot_of(hash: core.fnv1a(ptr: kptr, len: klen), cp), steps: 0)
+end
+
+let sm_find_go = fn (b: i64, cp: i64, kptr: i64, klen: i64, i: i64, steps: i64) -> i64 do
+  if steps >= cp then return 0 - 1 end
+  let s = sm_state(b, i)
+  if s == core.st_empty then return 0 - 1 end
+  if s == core.st_full && sm_eq(b, i, kptr, klen) then return i end
+  return sm_find_go(b, cp, kptr, klen, i: core.next_slot(i, cp), steps: steps + 1)
+end
+
+/// Insert key (kptr,klen)->value into `b` (cp, has room). `kptr` already
+/// points at a stable copy of the key bytes. Returns 1 if a new key was added.
+let sm_insert = fn (b: i64, cp: i64, kptr: i64, klen: i64, value: i64) -> i64 do
+  return sm_insert_go(b, cp, kptr, klen, value, i: core.slot_of(hash: core.fnv1a(ptr: kptr, len: klen), cp), first_tomb: 0 - 1, steps: 0)
+end
+
+let sm_insert_go = fn (b: i64, cp: i64, kptr: i64, klen: i64, value: i64, i: i64, first_tomb: i64, steps: i64) -> i64 do
+  if steps >= cp then
+    let _ = sm_put_kptr(b, i: first_tomb, v: kptr)
+    let _ = sm_put_klen(b, i: first_tomb, v: klen)
+    let _ = sm_put_val(b, i: first_tomb, v: value)
+    let _ = sm_put_state(b, i: first_tomb, v: core.st_full)
+    return 1
+  end
+  let s = sm_state(b, i)
+  if s == core.st_full then
+    if sm_eq(b, i, kptr, klen) then
+      let _ = sm_put_val(b, i, v: value)
+      return 0
+    end
+    return sm_insert_go(b, cp, kptr, klen, value, i: core.next_slot(i, cp), first_tomb, steps: steps + 1)
+  end
+  if s == core.st_tomb then
+    let ft = if first_tomb == 0 - 1 then i else first_tomb end
+    return sm_insert_go(b, cp, kptr, klen, value, i: core.next_slot(i, cp), first_tomb: ft, steps: steps + 1)
+  end
+  let dest = if first_tomb == 0 - 1 then i else first_tomb end
+  let _ = sm_put_kptr(b, i: dest, v: kptr)
+  let _ = sm_put_klen(b, i: dest, v: klen)
+  let _ = sm_put_val(b, i: dest, v: value)
+  let _ = sm_put_state(b, i: dest, v: core.st_full)
+  return 1
+end
+
+let sm_grow = fn (h: i64) -> unit do
+  let old_b = core.hdr_buckets(h)
+  let old_cp = core.hdr_cp(h)
+  let new_cp = old_cp * 2
+  let new_b = core.alloc_words(nw: new_cp * 4)
+  let _ = sm_rehash(old_b, old_cp, new_b, new_cp, i: 0)
+  let _ = core.set_cp(h, v: new_cp)
+  return core.set_buckets(h, v: new_b)
+end
+
+let sm_rehash = fn (old_b: i64, old_cp: i64, new_b: i64, new_cp: i64, i: i64) -> unit do
+  if i >= old_cp then return () end
+  if sm_state(b: old_b, i) == core.st_full then
+    let _ = sm_insert(b: new_b, cp: new_cp, kptr: sm_kptr(b: old_b, i), klen: sm_klen(b: old_b, i), value: sm_val(b: old_b, i))
+    return sm_rehash(old_b, old_cp, new_b, new_cp, i: i + 1)
+  end
+  return sm_rehash(old_b, old_cp, new_b, new_cp, i: i + 1)
+end
+
+let sm_reserve_one = fn (h: i64) -> unit do
+  if (core.hdr_count(h) + 1) * 4 < core.hdr_cp(h) * 3 then return () end
+  return sm_grow(h)
+end
+
+let copy_key = fn (src: i64, len: i64) -> i64 do
+  if len <= 0 then return 0 end
+  let dst = arena.alloc_raw(size: len)
+  let _ = core.copy_bytes(dst, src, n: len, i: 0)
+  return dst
+end
+
+/// Core put: copies the key bytes into a fresh allocation, then inserts.
+/// Returns 1 if a new key was added, else 0.
+let sm_put = fn (h: i64, kptr: i64, klen: i64, value: i64) -> i64 do
+  let _ = sm_reserve_one(h)
+  let existing = sm_find(b: core.hdr_buckets(h), cp: core.hdr_cp(h), kptr, klen)
+  if existing != 0 - 1 then
+    let _ = sm_put_val(b: core.hdr_buckets(h), i: existing, v: value)
+    let _ = core.invalidate(h)
+    return 0
+  end
+  let added = sm_insert(b: core.hdr_buckets(h), cp: core.hdr_cp(h), kptr: copy_key(src: kptr, len: klen), klen, value)
+  let _ = if added == 1 then core.set_count(h, v: core.hdr_count(h) + 1) else () end
+  let _ = core.invalidate(h)
+  return added
+end
+
+let sm_del = fn (h: i64, kptr: i64, klen: i64) -> bool do
+  let b = core.hdr_buckets(h)
+  let idx = sm_find(b, cp: core.hdr_cp(h), kptr, klen)
+  if idx == 0 - 1 then return false end
+  let _ = sm_put_state(b, i: idx, v: core.st_tomb)
+  let _ = core.set_count(h, v: core.hdr_count(h) - 1)
+  let _ = core.invalidate(h)
+  return true
+end
+
+// --- snapshot for smap val_at: [v0, v1, ...], count words ---
+
+let sm_ensure_vsnap = fn (h: i64) -> i64 do
+  let cur = core.hdr_snap(h)
+  if cur != 0 then return cur end
+  let n = core.hdr_count(h)
+  let snap = core.alloc_words(nw: if n <= 0 then 1 else n end)
+  let _ = if n > 0 then sm_fill_vsnap(b: core.hdr_buckets(h), cp: core.hdr_cp(h), snap, src_i: 0, dst: 0) else () end
+  let _ = core.set_snap(h, v: snap)
+  return snap
+end
+
+let sm_fill_vsnap = fn (b: i64, cp: i64, snap: i64, src_i: i64, dst: i64) -> unit do
+  if src_i >= cp then return () end
+  if sm_state(b, i: src_i) == core.st_full then
+    let _ = mem.store_i64(addr: snap + (dst * 8), val: sm_val(b, i: src_i))
+    return sm_fill_vsnap(b, cp, snap, src_i: src_i + 1, dst: dst + 1)
+  end
+  return sm_fill_vsnap(b, cp, snap, src_i: src_i + 1, dst)
+end
+
+// --- the smap_* contract ---
+
+export let smap_new = fn () -> i64 do return sm_mk() end
+
+/// Insert / update `b_key` -> `d_value`. Returns 0 (matching the Rust impl).
+export let smap_put = fn (a_id: i64, b_key_ptr: i32, c_key_len: i32, d_value: i64) -> i64 do
+  let _ = sm_put(h: a_id, kptr: cast.i64_of(x: b_key_ptr), klen: cast.i64_of(x: c_key_len), value: d_value)
+  return 0
+end
+
+/// Look up `b_key`; returns its value, or `d_default_val` if absent.
+export let smap_get = fn (a_id: i64, b_key_ptr: i32, c_key_len: i32, d_default_val: i64) -> i64 do
+  let idx = sm_find(b: core.hdr_buckets(h: a_id), cp: core.hdr_cp(h: a_id), kptr: cast.i64_of(x: b_key_ptr), klen: cast.i64_of(x: c_key_len))
+  if idx == 0 - 1 then return d_default_val end
+  return sm_val(b: core.hdr_buckets(h: a_id), i: idx)
+end
+
+export let smap_has = fn (a_id: i64, b_key_ptr: i32, c_key_len: i32) -> bool do
+  return sm_find(b: core.hdr_buckets(h: a_id), cp: core.hdr_cp(h: a_id), kptr: cast.i64_of(x: b_key_ptr), klen: cast.i64_of(x: c_key_len)) != 0 - 1
+end
+
+export let smap_del = fn (a_id: i64, b_key_ptr: i32, c_key_len: i32) -> bool do
+  return sm_del(h: a_id, kptr: cast.i64_of(x: b_key_ptr), klen: cast.i64_of(x: c_key_len))
+end
+
+export let smap_size = fn (a_id: i64) -> i64 do return core.hdr_count(h: a_id) end
+
+/// All keys, joined by newline (returns the packed string i64; 0 if empty).
+export let smap_keys = fn (a_id: i64) -> i64 do return sm_join_keys(h: a_id) end
+
+/// All values, decimal, newline-joined (returns the packed string i64).
+export let smap_vals = fn (a_id: i64) -> i64 do return sm_join_vals(h: a_id) end
+
+export let smap_val_count = fn (a_id: i64) -> i64 do return core.hdr_count(h: a_id) end
+
+/// Value at iteration index `b_idx` (0 if out of bounds).
+export let smap_val_at = fn (a_id: i64, b_idx: i64) -> i64 do
+  if b_idx < 0 || b_idx >= core.hdr_count(h: a_id) then return 0 end
+  return mem.load_i64(addr: sm_ensure_vsnap(h: a_id) + (b_idx * 8))
+end
+
+export let smap_free = fn (a_id: i64) -> bool do return true end
+
+// --- smap value join (decimal, newline-separated) ---
+
+let sm_vsize = fn (b: i64, cp: i64, i: i64, acc: i64) -> i64 do
+  if i >= cp then return acc end
+  if sm_state(b, i) == core.st_full then
+    return sm_vsize(b, cp, i: i + 1, acc: acc + core.i64_len(v: sm_val(b, i)) + 1)
+  end
+  return sm_vsize(b, cp, i: i + 1, acc)
+end
+
+let sm_vwrite = fn (dst: i64, b: i64, cp: i64, i: i64, off: i64, first: bool) -> i64 do
+  if i >= cp then return off end
+  if sm_state(b, i) == core.st_full then
+    let off1 = if first then off else off + core.put_sep(dst: dst + off) end
+    let w = core.write_i64(dst: dst + off1, v: sm_val(b, i))
+    return sm_vwrite(dst, b, cp, i: i + 1, off: off1 + w, first: false)
+  end
+  return sm_vwrite(dst, b, cp, i: i + 1, off, first)
+end
+
+let sm_join_vals = fn (h: i64) -> i64 do
+  let n = core.hdr_count(h)
+  if n <= 0 then return 0 end
+  let total = sm_vsize(b: core.hdr_buckets(h), cp: core.hdr_cp(h), i: 0, acc: 0) - 1
+  let dst = arena.alloc_raw(size: total)
+  let _ = sm_vwrite(dst, b: core.hdr_buckets(h), cp: core.hdr_cp(h), i: 0, off: 0, first: true)
+  return (dst * core.two_pow_32) + total
+end
+
+// --- smap key join (raw key bytes, newline-separated) ---
+
+let sm_ksize = fn (b: i64, cp: i64, i: i64, acc: i64) -> i64 do
+  if i >= cp then return acc end
+  if sm_state(b, i) == core.st_full then
+    return sm_ksize(b, cp, i: i + 1, acc: acc + sm_klen(b, i) + 1)
+  end
+  return sm_ksize(b, cp, i: i + 1, acc)
+end
+
+let sm_kwrite = fn (dst: i64, b: i64, cp: i64, i: i64, off: i64, first: bool) -> i64 do
+  if i >= cp then return off end
+  if sm_state(b, i) == core.st_full then
+    let off1 = if first then off else off + core.put_sep(dst: dst + off) end
+    let kl = sm_klen(b, i)
+    let _ = core.copy_bytes(dst: dst + off1, src: sm_kptr(b, i), n: kl, i: 0)
+    return sm_kwrite(dst, b, cp, i: i + 1, off: off1 + kl, first: false)
+  end
+  return sm_kwrite(dst, b, cp, i: i + 1, off, first)
+end
+
+let sm_join_keys = fn (h: i64) -> i64 do
+  let n = core.hdr_count(h)
+  if n <= 0 then return 0 end
+  let total = sm_ksize(b: core.hdr_buckets(h), cp: core.hdr_cp(h), i: 0, acc: 0) - 1
+  if total <= 0 then return 0 end
+  let dst = arena.alloc_raw(size: total)
+  let _ = sm_kwrite(dst, b: core.hdr_buckets(h), cp: core.hdr_cp(h), i: 0, off: 0, first: true)
+  return (dst * core.two_pow_32) + total
+end
+
+// --- string-typed wrappers ---
+
+export let smap_put_str = fn (id: i64, key: string, value: i64) -> i64 do return smap_put(a_id: id, b_key_ptr: core.k_p(s: key), c_key_len: core.k_l(s: key), d_value: value) end
+export let smap_get_str = fn (id: i64, key: string, default_val: i64) -> i64 do return smap_get(a_id: id, b_key_ptr: core.k_p(s: key), c_key_len: core.k_l(s: key), d_default_val: default_val) end
+export let smap_has_str = fn (id: i64, key: string) -> bool do return smap_has(a_id: id, b_key_ptr: core.k_p(s: key), c_key_len: core.k_l(s: key)) end
+export let smap_del_str = fn (id: i64, key: string) -> bool do return smap_del(a_id: id, b_key_ptr: core.k_p(s: key), c_key_len: core.k_l(s: key)) end
+export let smap_keys_str = fn (id: i64) -> string do return core.pun_str(a_x: smap_keys(a_id: id)) end

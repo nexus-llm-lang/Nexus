@@ -1,0 +1,359 @@
+/**
+ * runtime/collection/core: shared open-addressing infrastructure for
+ * `runtime/collection/hashmap.nx`, `runtime/collection/hashset.nx`, and
+ * `runtime/collection/stringmap.nx`. Internal — the public surface lives at
+ * `runtime/collection.nx` (the umbrella).
+ *
+ * Hash maps / sets are open-addressed (linear probing) with tombstones.
+ * Header layout (32 bytes, four i64 words), shared by hmap / hset / smap:
+ *   offset 0  : count     -- number of live entries
+ *   offset 8  : capacity  -- number of bucket slots (a power of two)
+ *   offset 16 : buckets   -- pointer to the slot array (0 when capacity==0)
+ *   offset 24 : snapshot  -- pointer to a cached iteration snapshot, or 0 if
+ *                            stale; invalidated (set to 0) on every mutation.
+ *
+ * hmap / hset slot = three i64 words: [key, value, state].
+ * smap slot       = four  i64 words: [key_ptr, key_len, value, state].
+ *   state: 0 = empty, 1 = occupied, 2 = tombstone.
+ *
+ * The `_at` family returns the element at an iteration index. A snapshot of
+ * the live entries is built lazily on the first `_at` after a mutation and
+ * cached in the header's `snapshot` word, so a full enumeration is O(n) total.
+ * Out-of-bounds / negative indices return 0.
+ *
+ * `*_keys` / `*_vals` / `hset_to_list` return a newline-joined string of the
+ * decimal representations of the i64 elements; `smap_keys` returns the keys
+ * joined by newline verbatim. A `string` return is the packed (ptr<<32)|len
+ * i64, 0 for the empty string.
+ *
+ * Codegen note: Nexus lays out wasm function params alphabetically; external
+ * callers pass them positionally in declaration order (each `string` expanded
+ * to ptr,len). So every export prefixes its params a_, b_, c_, ... in that
+ * order, making alphabetical == positional.
+ */
+import * as mem from "std:runtime/mem"
+import * as cast from "std:runtime/cast"
+import * as arena from "std:runtime/arena"
+
+/// 2^32, used to pack a (ptr, len) pair into a returned i64.
+export let two_pow_32 = 4294967296
+/// Initial bucket count for a fresh map / set (power of two).
+export let initial_cap = 8
+// Slot states.
+export let st_empty = 0
+export let st_full = 1
+export let st_tomb = 2
+
+// --- header accessors (shared) ---
+
+export let hdr_count = fn (h: i64) -> i64 do return mem.load_i64(addr: h) end
+export let hdr_cp = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 8) end
+export let hdr_buckets = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 16) end
+export let hdr_snap = fn (h: i64) -> i64 do return mem.load_i64(addr: h + 24) end
+export let set_count = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h, val: v) end
+export let set_cp = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 8, val: v) end
+export let set_buckets = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 16, val: v) end
+export let set_snap = fn (h: i64, v: i64) -> unit do return mem.store_i64(addr: h + 24, val: v) end
+
+/// Mark the iteration snapshot stale (call after every mutation).
+export let invalidate = fn (h: i64) -> unit do return set_snap(h, v: 0) end
+
+/// Allocate a zeroed i64 array of `nw` words; returns its byte pointer.
+/// (arena.alloc_raw does not zero its result, so we clear it ourselves.)
+export let alloc_words = fn (nw: i64) -> i64 do
+  let p = arena.alloc_raw(size: nw * 8)
+  let _ = zero_words(p, i: 0, n: nw)
+  return p
+end
+
+let zero_words = fn (p: i64, i: i64, n: i64) -> unit do
+  if i >= n then return () end
+  let _ = mem.store_i64(addr: p + (i * 8), val: 0)
+  return zero_words(p, i: i + 1, n)
+end
+
+/// Copy `n` bytes from `src` to `dst` (forward).
+export let copy_bytes = fn (dst: i64, src: i64, n: i64, i: i64) -> unit do
+  if i >= n then return () end
+  let _ = mem.store_u8(addr: dst + i, val: mem.load_u8(addr: src + i))
+  return copy_bytes(dst, src, n, i: i + 1)
+end
+
+/// True if the byte range [p1, p1+n) equals [p2, p2+n).
+export let bytes_eq = fn (p1: i64, p2: i64, n: i64, i: i64) -> bool do
+  if i >= n then return true end
+  if mem.load_u8(addr: p1 + i) != mem.load_u8(addr: p2 + i) then return false end
+  return bytes_eq(p1, p2, n, i: i + 1)
+end
+
+// --- hashing ---
+
+/// (v >> n) treated as a logical (unsigned) shift, for 1 <= n <= 63.
+let lshr = fn (v: i64, n: i64) -> i64 do
+  return (v >> n) & ((1 << (64 - n)) - 1)
+end
+
+/// SplitMix64-style 64-bit mix of an i64 key. The big multiplier constants do
+/// not fit in a positive i64 literal, so they are written as `0 - K`.
+export let mix64 = fn (x: i64) -> i64 do
+  let z0 = x + (0 - 7046029254386353131)
+  let z1 = (z0 ^ lshr(v: z0, n: 30)) * (0 - 4658895280553007687)
+  let z2 = (z1 ^ lshr(v: z1, n: 27)) * (0 - 7723592293110705685)
+  return z2 ^ lshr(v: z2, n: 31)
+end
+
+/// FNV-1a 64-bit hash over a byte range. The offset basis 14695981039346656037
+/// does not fit a positive i64 literal, so it is written as `0 - 3750763034362895579`.
+export let fnv1a = fn (ptr: i64, len: i64) -> i64 do
+  return fnv1a_go(ptr, len, i: 0, h: 0 - 3750763034362895579)
+end
+
+let fnv1a_go = fn (ptr: i64, len: i64, i: i64, h: i64) -> i64 do
+  if i >= len then return h end
+  let h2 = (h ^ mem.load_u8(addr: ptr + i)) * 1099511628211
+  return fnv1a_go(ptr, len, i: i + 1, h: h2)
+end
+
+/// Reduce a (possibly negative) 64-bit hash to a slot index in [0, cp).
+/// cp is a power of two; the bitwise AND keeps the (always non-negative) low bits.
+export let slot_of = fn (hash: i64, cp: i64) -> i64 do return hash & (cp - 1) end
+
+export let next_slot = fn (i: i64, cp: i64) -> i64 do return (i + 1) & (cp - 1) end
+
+// =====================================================================
+//  HashMap / HashSet core  (i64 key -> i64 value; hset value slot is 0)
+// =====================================================================
+//
+// hmap/hset slot i lives at  buckets + i*24 :  [key (0), value (8), state (16)].
+
+export let hm_key = fn (b: i64, i: i64) -> i64 do return mem.load_i64(addr: b + (i * 24)) end
+export let hm_val = fn (b: i64, i: i64) -> i64 do return mem.load_i64(addr: b + (i * 24) + 8) end
+export let hm_state = fn (b: i64, i: i64) -> i64 do return mem.load_i64(addr: b + (i * 24) + 16) end
+let hm_put_key = fn (b: i64, i: i64, v: i64) -> unit do return mem.store_i64(addr: b + (i * 24), val: v) end
+let hm_put_val = fn (b: i64, i: i64, v: i64) -> unit do return mem.store_i64(addr: b + (i * 24) + 8, val: v) end
+let hm_put_state = fn (b: i64, i: i64, v: i64) -> unit do return mem.store_i64(addr: b + (i * 24) + 16, val: v) end
+
+/// Allocate a header for a fresh, capacity-`initial_cap` hmap/hset.
+export let hm_mk = fn () -> i64 do
+  let h = alloc_words(nw: 4)
+  let cp = initial_cap
+  let _ = set_count(h, v: 0)
+  let _ = set_cp(h, v: cp)
+  let _ = set_buckets(h, v: alloc_words(nw: cp * 3))
+  let _ = set_snap(h, v: 0)
+  return h
+end
+
+/// Index of the occupied slot holding `key` in bucket array `b` of size `cp`,
+/// or -1 if absent.
+export let hm_find = fn (b: i64, cp: i64, key: i64) -> i64 do
+  return hm_find_go(b, cp, key, i: slot_of(hash: mix64(x: key), cp), steps: 0)
+end
+
+let hm_find_go = fn (b: i64, cp: i64, key: i64, i: i64, steps: i64) -> i64 do
+  if steps >= cp then return 0 - 1 end
+  let s = hm_state(b, i)
+  if s == st_empty then return 0 - 1 end
+  if s == st_full && hm_key(b, i) == key then return i end
+  return hm_find_go(b, cp, key, i: next_slot(i, cp), steps: steps + 1)
+end
+
+/// Insert `key`->`value` into bucket array `b` (size `cp`), which must have
+/// room. Returns 1 if a new key was added, 0 if an existing key was updated.
+let hm_insert = fn (b: i64, cp: i64, key: i64, value: i64) -> i64 do
+  return hm_insert_go(b, cp, key, value, i: slot_of(hash: mix64(x: key), cp), first_tomb: 0 - 1, steps: 0)
+end
+
+let hm_insert_go = fn (b: i64, cp: i64, key: i64, value: i64, i: i64, first_tomb: i64, steps: i64) -> i64 do
+  if steps >= cp then
+    let _ = hm_put_key(b, i: first_tomb, v: key)
+    let _ = hm_put_val(b, i: first_tomb, v: value)
+    let _ = hm_put_state(b, i: first_tomb, v: st_full)
+    return 1
+  end
+  let s = hm_state(b, i)
+  if s == st_full then
+    if hm_key(b, i) == key then
+      let _ = hm_put_val(b, i, v: value)
+      return 0
+    end
+    return hm_insert_go(b, cp, key, value, i: next_slot(i, cp), first_tomb, steps: steps + 1)
+  end
+  if s == st_tomb then
+    let ft = if first_tomb == 0 - 1 then i else first_tomb end
+    return hm_insert_go(b, cp, key, value, i: next_slot(i, cp), first_tomb: ft, steps: steps + 1)
+  end
+  let dest = if first_tomb == 0 - 1 then i else first_tomb end
+  let _ = hm_put_key(b, i: dest, v: key)
+  let _ = hm_put_val(b, i: dest, v: value)
+  let _ = hm_put_state(b, i: dest, v: st_full)
+  return 1
+end
+
+let hm_grow = fn (h: i64) -> unit do
+  let old_b = hdr_buckets(h)
+  let old_cp = hdr_cp(h)
+  let new_cp = old_cp * 2
+  let new_b = alloc_words(nw: new_cp * 3)
+  let _ = hm_rehash(old_b, old_cp, new_b, new_cp, i: 0)
+  let _ = set_cp(h, v: new_cp)
+  return set_buckets(h, v: new_b)
+end
+
+let hm_rehash = fn (old_b: i64, old_cp: i64, new_b: i64, new_cp: i64, i: i64) -> unit do
+  if i >= old_cp then return () end
+  if hm_state(b: old_b, i) == st_full then
+    let _ = hm_insert(b: new_b, cp: new_cp, key: hm_key(b: old_b, i), value: hm_val(b: old_b, i))
+    return hm_rehash(old_b, old_cp, new_b, new_cp, i: i + 1)
+  end
+  return hm_rehash(old_b, old_cp, new_b, new_cp, i: i + 1)
+end
+
+/// Ensure room for one more entry (load factor < 3/4).
+let hm_reserve_one = fn (h: i64) -> unit do
+  if (hdr_count(h) + 1) * 4 < hdr_cp(h) * 3 then return () end
+  return hm_grow(h)
+end
+
+/// Core put: returns 1 if a new key was added, else 0.
+export let hm_put = fn (h: i64, key: i64, value: i64) -> i64 do
+  let _ = hm_reserve_one(h)
+  let added = hm_insert(b: hdr_buckets(h), cp: hdr_cp(h), key, value)
+  let _ = if added == 1 then set_count(h, v: hdr_count(h) + 1) else () end
+  let _ = invalidate(h)
+  return added
+end
+
+/// Core delete: returns true if the key was present and removed.
+export let hm_del = fn (h: i64, key: i64) -> bool do
+  let b = hdr_buckets(h)
+  let idx = hm_find(b, cp: hdr_cp(h), key)
+  if idx == 0 - 1 then return false end
+  let _ = hm_put_state(b, i: idx, v: st_tomb)
+  let _ = set_count(h, v: hdr_count(h) - 1)
+  let _ = invalidate(h)
+  return true
+end
+
+// --- snapshot for hmap _at: [k0, v0, k1, v1, ...], count*2 words ---
+
+let hm_ensure_snap = fn (h: i64) -> i64 do
+  let cur = hdr_snap(h)
+  if cur != 0 then return cur end
+  let n = hdr_count(h)
+  if n <= 0 then
+    let p = alloc_words(nw: 1)
+    let _ = set_snap(h, v: p)
+    return p
+  end
+  let snap = alloc_words(nw: n * 2)
+  let _ = hm_fill_snap(b: hdr_buckets(h), cp: hdr_cp(h), snap, src_i: 0, dst: 0)
+  let _ = set_snap(h, v: snap)
+  return snap
+end
+
+let hm_fill_snap = fn (b: i64, cp: i64, snap: i64, src_i: i64, dst: i64) -> unit do
+  if src_i >= cp then return () end
+  if hm_state(b, i: src_i) == st_full then
+    let _ = mem.store_i64(addr: snap + (dst * 16), val: hm_key(b, i: src_i))
+    let _ = mem.store_i64(addr: snap + (dst * 16) + 8, val: hm_val(b, i: src_i))
+    return hm_fill_snap(b, cp, snap, src_i: src_i + 1, dst: dst + 1)
+  end
+  return hm_fill_snap(b, cp, snap, src_i: src_i + 1, dst)
+end
+
+export let hm_key_at = fn (h: i64, idx: i64) -> i64 do
+  if idx < 0 || idx >= hdr_count(h) then return 0 end
+  return mem.load_i64(addr: hm_ensure_snap(h) + (idx * 16))
+end
+
+export let hm_val_at = fn (h: i64, idx: i64) -> i64 do
+  if idx < 0 || idx >= hdr_count(h) then return 0 end
+  return mem.load_i64(addr: hm_ensure_snap(h) + (idx * 16) + 8)
+end
+
+// =====================================================================
+//  Building newline-joined string results
+// =====================================================================
+//
+// Strategy: compute the exact byte total first, allocate once, then fill.
+
+/// Decimal-digit count of a non-negative i64 (>= 1).
+export let dec_digits = fn (n: i64) -> i64 do
+  if n < 10 then return 1 end
+  return 1 + dec_digits(n: n / 10)
+end
+
+/// Bytes needed to render i64 `v` in decimal (incl. a leading '-' if negative).
+export let i64_len = fn (v: i64) -> i64 do
+  if v < 0 then return 1 + dec_digits(n: 0 - v) end
+  return dec_digits(n: v)
+end
+
+/// Write `len` decimal digits of non-negative `v` right-aligned in [dst, dst+len).
+let write_u64 = fn (dst: i64, v: i64, len: i64) -> unit do
+  let _ = mem.store_u8(addr: dst + (len - 1), val: 48 + (v % 10))
+  if len <= 1 then return () end
+  return write_u64(dst, v: v / 10, len: len - 1)
+end
+
+/// Write the decimal text of i64 `v` at `dst`; returns bytes written.
+export let write_i64 = fn (dst: i64, v: i64) -> i64 do
+  if v < 0 then
+    let _ = mem.store_u8(addr: dst, val: 45)
+    let nd = dec_digits(n: 0 - v)
+    let _ = write_u64(dst: dst + 1, v: 0 - v, len: nd)
+    return 1 + nd
+  end
+  let nd = dec_digits(n: v)
+  let _ = write_u64(dst, v, len: nd)
+  return nd
+end
+
+export let put_sep = fn (dst: i64) -> i64 do
+  let _ = mem.store_u8(addr: dst, val: 10)
+  return 1
+end
+
+// --- hmap / hset element join (decimal, newline-separated) ---
+
+let hm_join_size = fn (b: i64, cp: i64, want_value: bool, i: i64, acc: i64) -> i64 do
+  if i >= cp then return acc end
+  if hm_state(b, i) == st_full then
+    let v = if want_value then hm_val(b, i) else hm_key(b, i) end
+    return hm_join_size(b, cp, want_value, i: i + 1, acc: acc + i64_len(v) + 1)
+  end
+  return hm_join_size(b, cp, want_value, i: i + 1, acc)
+end
+
+let hm_join_write = fn (dst: i64, b: i64, cp: i64, want_value: bool, i: i64, off: i64, first: bool) -> i64 do
+  if i >= cp then return off end
+  if hm_state(b, i) == st_full then
+    let v = if want_value then hm_val(b, i) else hm_key(b, i) end
+    let off1 = if first then off else off + put_sep(dst: dst + off) end
+    let w = write_i64(dst: dst + off1, v)
+    return hm_join_write(dst, b, cp, want_value, i: i + 1, off: off1 + w, first: false)
+  end
+  return hm_join_write(dst, b, cp, want_value, i: i + 1, off, first)
+end
+
+export let hm_join_i64 = fn (h: i64, want_value: bool) -> i64 do
+  let n = hdr_count(h)
+  if n <= 0 then return 0 end
+  let total = hm_join_size(b: hdr_buckets(h), cp: hdr_cp(h), want_value, i: 0, acc: 0) - 1
+  let dst = arena.alloc_raw(size: total)
+  let _ = hm_join_write(dst, b: hdr_buckets(h), cp: hdr_cp(h), want_value, i: 0, off: 0, first: true)
+  return (dst * two_pow_32) + total
+end
+
+// === string-pun helpers (used by stringmap.nx's *_str wrappers) =============
+
+import external "nexus:intrinsic"
+export external pun_raw = "value_of_i64" : <T>(a_x: T) -> i64
+export external pun_str = "value_of_i64" : <T>(a_x: i64) -> T
+
+/// (ptr<<32)|len string -> high i32 (ptr).
+export let k_p = fn (s: string) -> i32 do return cast.i32_of(x: (pun_raw(a_x: s) / two_pow_32) & 4294967295) end
+/// (ptr<<32)|len string -> low i32 (len).
+export let k_l = fn (s: string) -> i32 do return cast.i32_of(x: pun_raw(a_x: s) & 4294967295) end
+
