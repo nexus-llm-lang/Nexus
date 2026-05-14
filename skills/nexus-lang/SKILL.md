@@ -98,6 +98,13 @@ results returned in input order) or `std:lazy_host`'s `host_spawn` / `host_join`
 for explicit per-thunk control. Run threaded programs via the bundled `nexus`
 launcher (it passes `-W threads=y,shared-memory=y -S threads` to wasmtime).
 
+Thunk-creation vs force: `let @x = e` (let-binding sigil) is the **only**
+thunk-creation form — it wraps `e` into an `@T` thunk. Every `@e` in
+expression position is **force** (`@T → T`), including `@x` (bare ident) and
+`@(expr)` (parenthesized compound). The let-sigil form follows the formal
+spec's `wrapSigil(@, τ) = @τ`; `@(expr)` thunk-creation has no corresponding
+spec rule and is not supported — write `let @x = expr` instead.
+
 ### 6. Explicit `return` required (except unit)
 ```nexus
 // Non-unit functions must have explicit return

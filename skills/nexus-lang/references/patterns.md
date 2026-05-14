@@ -534,8 +534,18 @@ thread. Real parallelism comes from forcing many thunks at once via the
 `std:lazy` / `std:lazy_host` combinators (each thunk then runs on its own OS
 thread, via WASI threads).
 
+**Thunk-creation vs force.** The only surface form that *creates* a thunk is
+the let-binding sigil `let @x = e` — it wraps `e : T` into a thunk of type
+`@T`. Every `@e` in expression position is **force** (`@T → T`), including
+both `@x` (bare ident) and `@(expr)` (parenthesized compound). The parser
+treats `@(...)` as `ExprForce`, not as thunk-introduction. This matches the
+formal type-system rule `wrapSigil(@, τ) = @τ` on let-bindings together with
+T-Force on expressions; a thunk-introduction form like `@(...) : T → @T` is
+not part of the canonical spec (see bd: nexus-s7mq for the spec cross-doc
+gap).
+
 ```nexus
-// Lazy binding: RHS is NOT evaluated here
+// Thunk creation: only via `let @x = e` — RHS becomes an @T thunk
 let @expensive = heavy_computation(input: data)
 
 // Force: runs the thunk now (synchronous), returns the result
@@ -546,8 +556,9 @@ let base = 100
 let @derived = base * 2 + some_call(n: base)
 let val = @derived    // captures `base`; forced synchronously here
 
-// Inline force on expression (no binding needed)
-let quick = @(x + y)
+// `@(expr)` in expression position is force, NOT thunk creation —
+// the inner expression must already be of type @T.
+let quick = @(some_thunk)
 ```
 
 ### Parallel: `std:lazy.force_all` and `std:lazy_host`
