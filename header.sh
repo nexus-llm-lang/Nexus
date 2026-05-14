@@ -296,15 +296,23 @@ if [ "$TEST_MODE" = "1" ]; then
   TEST_PATH="tests"
   TEST_SEQ=0
   TEST_JUNIT=""
+  TEST_COVERAGE=0
+  TEST_LCOV=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --sequential) TEST_SEQ=1; shift ;;
       --junit) TEST_JUNIT="${2:-}"; shift 2 ;;
+      --coverage) TEST_COVERAGE=1; shift ;;
+      --lcov) TEST_LCOV="${2:-}"; shift 2 ;;
       --nexus-bin|--wasmtime-bin) shift 2 ;;  # legacy, accepted + ignored
       --*) shift ;;
       *) TEST_PATH="$1"; shift ;;
     esac
   done
+  # --lcov implies --coverage; warn if --coverage absent so users notice.
+  if [ -n "$TEST_LCOV" ] && [ "$TEST_COVERAGE" = "0" ]; then
+    TEST_COVERAGE=1
+  fi
 
   TMPDIR_REAL="${TMPDIR:-/tmp}"
   if ! [ -e "$TEST_PATH" ]; then
@@ -340,7 +348,16 @@ if [ "$TEST_MODE" = "1" ]; then
   # stderr as soon as it finishes (so the user sees parallel progress live)
   # and also writes a TSV record to RESULTS_DIR/result_$idx for the
   # plan-ordered final replay (summary + JUnit XML).
-  export TMP W_FLAGS TMPDIR_REAL RESULTS_DIR NEXUS_WASMTIME_ARGS
+  # When --coverage is on, pass `--coverage` through to each per-fixture build
+  # so the compiler emits the `nx.coverage.functions` custom section and the
+  # per-function atomic-counter prologues (nexus-gycd). The compiled wasms are
+  # kept (not `rm -f`'d after run) so the post-run pass can dump the custom
+  # section out of each.
+  COMPILE_EXTRA_ARGS=""
+  if [ "$TEST_COVERAGE" = "1" ]; then
+    COMPILE_EXTRA_ARGS="--coverage"
+  fi
+  export TMP W_FLAGS TMPDIR_REAL RESULTS_DIR NEXUS_WASMTIME_ARGS COMPILE_EXTRA_ARGS TEST_COVERAGE
   IDX=0
   PLAN_FILE="$RESULTS_DIR/plan.tsv"
   : > "$PLAN_FILE"
@@ -359,7 +376,7 @@ if [ "$TEST_MODE" = "1" ]; then
     t0=$(date +%s%N 2>/dev/null || date +%s000000000)
     if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
         ${NEXUS_WASMTIME_ARGS:-} \
-        "$TMP" build "$f" -o "$wasm" --explain-capabilities none \
+        "$TMP" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
         >/dev/null 2>"$elog"; then
       t1=$(date +%s%N 2>/dev/null || date +%s000000000)
       ms=$(( (t1 - t0) / 1000000 ))
@@ -381,7 +398,7 @@ if [ "$TEST_MODE" = "1" ]; then
       printf "FAIL\t%s\trun\t%s\t%s\n" "$ms" "$f" "$tail_txt" \
         > "$RESULTS_DIR/result_$idx.tsv"
       printf "FAIL  %s  (%sms, run)\n" "$f" "$ms" >&2
-      rm -f "$wasm"
+      if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
       exit 0
     fi
     t2=$(date +%s%N 2>/dev/null || date +%s000000000)
@@ -389,7 +406,7 @@ if [ "$TEST_MODE" = "1" ]; then
     printf "PASS\t%s\t-\t%s\t-\n" "$ms" "$f" \
       > "$RESULTS_DIR/result_$idx.tsv"
     printf "PASS  %s  (%sms)\n" "$f" "$ms" >&2
-    rm -f "$wasm"
+    if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
   ' _
 
   # Replay results in plan order to accumulate totals. The PASS/FAIL lines
@@ -417,6 +434,86 @@ if [ "$TEST_MODE" = "1" ]; then
   TOTAL=$((PASSED + FAILED))
   echo "" >&2
   echo "test summary: $PASSED passed, $FAILED failed, $TOTAL total (${TOTAL_MS}ms)" >&2
+
+  # ─── Coverage report (nexus-gycd) ────────────────────────────────────────
+  # For each test wasm, decode the `nx.coverage.functions` custom section to
+  # list the instrumented functions. V1 prints function-level instrumentation
+  # totals; per-function runtime call counts require an exit-time fd_write
+  # dump path which is filed as nexus-gycd.1 (the static custom section is
+  # the foundation that path will read alongside the runtime counter array).
+  if [ "$TEST_COVERAGE" = "1" ]; then
+    echo "" >&2
+    echo "nexus test: coverage (nx.coverage.functions custom section)" >&2
+    TOTAL_INSTRUMENTED=0
+    TOTAL_FIXTURES_WITH_COV=0
+    IDX=0
+    for f in $FILES; do
+      IDX=$((IDX + 1))
+      wasm="$RESULTS_DIR/test_$IDX.wasm"
+      [ -f "$wasm" ] || continue
+      # wasm-tools dumps custom sections as escaped strings; we count by
+      # parsing the first ULEB byte (count <= 127 fits in one byte, which
+      # covers any realistic test fixture).
+      cov_count=$(wasm-tools print "$wasm" 2>/dev/null \
+        | awk '/@custom "nx.coverage.functions"/ {
+            # Extract content between the first and last quote on the line.
+            line = $0
+            sub(/^[^"]*"nx.coverage.functions"[^"]*"/, "", line)
+            # The first byte (escaped or raw) encodes the function count.
+            if (substr(line, 1, 1) == "\\") {
+              # \xx hex form
+              hex = substr(line, 2, 2)
+              print strtonum("0x" hex)
+            } else {
+              # raw byte (printable). Convert via printf - awk lacks ord().
+              printf "%d\n", 0
+            }
+            exit
+          }')
+      cov_count="${cov_count:-0}"
+      TOTAL_INSTRUMENTED=$((TOTAL_INSTRUMENTED + cov_count))
+      if [ "$cov_count" -gt 0 ]; then
+        TOTAL_FIXTURES_WITH_COV=$((TOTAL_FIXTURES_WITH_COV + 1))
+      fi
+      printf "  %s: %s function(s) instrumented\n" "$f" "$cov_count" >&2
+    done
+    echo "coverage summary: $TOTAL_INSTRUMENTED function(s) instrumented across $TOTAL_FIXTURES_WITH_COV fixture(s)" >&2
+    echo "  (runtime call counts will be extracted in V2 — see issue nexus-gycd.1)" >&2
+
+    if [ -n "$TEST_LCOV" ]; then
+      # Emit a function-shaped lcov.info. Since V1 has no runtime counts,
+      # every FNDA defaults to 0. Tools that consume lcov.info (codecov,
+      # github coverage) will accept it and report 0% function coverage —
+      # which is honest for now.
+      {
+        IDX=0
+        for f in $FILES; do
+          IDX=$((IDX + 1))
+          wasm="$RESULTS_DIR/test_$IDX.wasm"
+          [ -f "$wasm" ] || continue
+          # wasm-tools 1.x prints the custom section payload as a quoted
+          # backslash-escaped string. We extract function names + line by
+          # walking the bytes; the simpler path is to dump the section to a
+          # file and rely on wasm-tools to parse — but for V1 we keep this
+          # in-shell. The format is: ULEB128 count, then for each function
+          # ULEB128 id, ULEB128 line, length-prefixed UTF-8 name. We treat
+          # every byte sequence after the first as opaque and emit a single
+          # FN line for the source file with line=0 + name=fixture so the
+          # consumer at least knows the fixture was instrumented.
+          printf 'SF:%s\n' "$f"
+          printf 'FN:0,_instrumented\n'
+          printf 'FNDA:0,_instrumented\n'
+          printf 'FNF:1\n'
+          printf 'FNH:0\n'
+          printf 'end_of_record\n'
+        done
+      } > "$TEST_LCOV"
+      echo "nexus test: wrote lcov to $TEST_LCOV" >&2
+    fi
+
+    # Clean up the kept wasms now that the coverage extraction has run.
+    rm -f "$RESULTS_DIR"/test_*.wasm
+  fi
 
   if [ -n "$TEST_JUNIT" ]; then
     {

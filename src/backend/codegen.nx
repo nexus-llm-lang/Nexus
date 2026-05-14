@@ -32,6 +32,7 @@
 
 import { ByteBuffer }, * as bb from "std:bytebuffer"
 import { BinaryOp, TypeExpr } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
 import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom,
          LirExternal, LirParam, LirCallArg, LirNamedAtom } from "src/ir/lir/types.nx"
 import { CodegenCtx, LocalEntry, FuncEntry, StringEntry, ArityTypeIdx, ExportNameIdx,
@@ -1313,7 +1314,65 @@ let emit_return_value = fn (body: %ByteBuffer, rt: TypeExpr, r: LirAtom, ctx: Co
   return actual
 end
 
-let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+/** Build the `nx.coverage.functions` custom section payload (nexus-gycd). */
+/** Layout: ULEB128 N (function count), then for each function in emission */
+/** order: ULEB128 id, ULEB128 line, length-prefixed UTF-8 name. The id is */
+/** the function's position in the LirFunction list — matches what */
+/** `emit_coverage_prologue` increments. Line comes from the function's span. */
+/** File path is not in LirFunction.span; readers must supply it at parse */
+/** time (typically the input source file). The reader joins this static */
+/** table with the runtime counter array at byte offset cov_counter_base in */
+/** linear memory to produce the per-function call-count report. */
+let build_coverage_section = fn (funcs: [LirFunction]) -> %ByteBuffer do
+  let %buf = bb.empty()
+  let n = list.length(xs: funcs)
+  let %buf = bb.push_uleb128(%buf, val: n)
+  return emit_coverage_entries(%buf, funcs, func_id: 0)
+end
+
+let emit_coverage_entries = fn (buf: %ByteBuffer, funcs: [LirFunction], func_id: i64) -> %ByteBuffer do
+  match funcs do
+    | [] -> return %buf
+    | LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: sp) :: rest ->
+      match sp do | Span(offset: _, line: ln, col: _) ->
+        let %buf = bb.push_uleb128(%buf, val: func_id)
+        let %buf = bb.push_uleb128(%buf, val: ln)
+        let %buf = wdefs.emit_name(%buf, name: n)
+        return emit_coverage_entries(%buf, funcs: rest, func_id: func_id + 1)
+      end
+  end
+end
+
+/** Append the `nx.coverage.functions` custom section to `buf` (nexus-gycd). */
+let emit_coverage_custom_section = fn (buf: %ByteBuffer, funcs: [LirFunction]) -> %ByteBuffer do
+  let %cov_payload = bb.empty()
+  let %cov_payload = wdefs.emit_name(buf: %cov_payload, name: "nx.coverage.functions")
+  let %cov_data = build_coverage_section(funcs)
+  let %cov_payload = bb.push_buf(dst: %cov_payload, src: &cov_data)
+  bb.free(buf: %cov_data)
+  let cov_payload_len = bb.length(buf: &cov_payload)
+  let %buf = bb.push_byte(%buf, byte: sec_custom)
+  let %buf = bb.push_uleb128(%buf, val: cov_payload_len)
+  let %buf = bb.push_buf(dst: %buf, src: &cov_payload)
+  bb.free(buf: %cov_payload)
+  return %buf
+end
+
+/** Emit `i32.atomic.rmw.add(addr, 1); drop` against the per-function counter */
+/** cell at `cov_counter_base + 4*func_id` (nexus-gycd). 5 instructions, 9-10 */
+/** wasm bytes (depending on the ULEB encoding of the address). */
+let emit_coverage_prologue = fn (buf: %ByteBuffer, func_id: i64) -> %ByteBuffer do
+  let addr = wdefs.cov_counter_base + 4 * func_id
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: addr)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 1)
+  let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_rmw_add, offset: 0)
+  return bb.push_byte(%buf, byte: op_drop)
+end
+
+let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx,
+                                  func_id: i64, coverage_enabled: bool) -> %ByteBuffer throws { CodegenError } do
   let LirFunction(name: fname, params: ps, ret_type: raw_rt, body: b, ret: r, span: _) = func
   // Lifted lambdas (`__closure_N`) get a canonical (env+args of i64) -> i64
   // wasm signature regardless of the underlying lambda's return type. When
@@ -1333,6 +1392,10 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuff
   // string-pool value, or -1 to skip (pure fns, or fname missing from pool).
   let %body = if bt_pn >= 0 then emit_bt_push_prologue(buf: %body, packed_name: bt_pn)
               else %body end
+  // Coverage prologue (nexus-gycd): atomic i32 increment at
+  // `cov_counter_base + 4*func_id`. Emitted before any user body code so
+  // every entry into the function is counted.
+  let %body = if coverage_enabled then emit_coverage_prologue(buf: %body, func_id) else %body end
 
   // TCMC: detect pattern and set up locals
   let tcmc_raw = detect_tcmc(body: b, func_name: fname)
@@ -1581,7 +1644,10 @@ type CompileCtx = CompileCtx(
   memo_target_names: [string],
   memo_target_slots: [i64],
   memo_globals_base: i64,
-  import_count: i64
+  import_count: i64,
+  /** When true, every function prologue emits an atomic.add to a per-function */
+  /** counter in linear-memory page 17 (nexus-gycd). Default off (zero overhead). */
+  coverage_enabled: bool
 )
 
 let build_func_ctx = fn (func: LirFunction,
@@ -1610,7 +1676,8 @@ let build_func_ctx = fn (func: LirFunction,
     memo_target_names: mtn_,
     memo_target_slots: mts_,
     memo_globals_base: mgb_,
-    import_count: ic_
+    import_count: ic_,
+    coverage_enabled: _
   ) = cctx
   return CodegenCtx(
     locals,
@@ -1714,10 +1781,11 @@ let resolve_bt_push_packed = fn (func_name: string, effect_map: &EffectMap,
   end
 end
 
-let emit_one_body = fn (buf: %ByteBuffer, f: LirFunction,
+let emit_one_body = fn (buf: %ByteBuffer, f: LirFunction, func_id: i64,
                          cctx: CompileCtx) -> %ByteBuffer throws { CodegenError } do
   let LirFunction(name: fname, _) = f
-  let CompileCtx(effect_map: em, bt_capture_idx_global: btg, string_lits: sl, _) = cctx
+  let CompileCtx(effect_map: em, bt_capture_idx_global: btg, string_lits: sl,
+                   coverage_enabled: ce, _) = cctx
   // Legacy slot for the (filtered-out) host capture call; kept so the
   // backtrace-elision test continues to exercise the gate.
   let _ = resolve_bt_capture_for_func(func_name: fname, effect_map: em,
@@ -1730,27 +1798,39 @@ let emit_one_body = fn (buf: %ByteBuffer, f: LirFunction,
     | LocalsResult(locals: ls, temps_base: tb, local_map: lm) ->
       let ctx = build_func_ctx(func: f, locals: ls, temps_base: tb, local_map: &lm,
                                 bt_capture_idx, cctx)
-      let %body = compile_function_body(func: f, ctx)
+      let %body = compile_function_body(func: f, ctx, func_id, coverage_enabled: ce)
       hmap.free(map: %lm)
       return append_body_to_buf(%buf, %body)
   end
 end
 
-let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction],
+let emit_code_bodies = fn (buf: %ByteBuffer, funcs: [LirFunction], func_id: i64,
                             cctx: CompileCtx) -> %ByteBuffer throws { CodegenError } do
   match funcs do
     | [] -> return %buf
     | f :: rest ->
-      let %buf = emit_one_body(%buf, f, cctx)
-      return emit_code_bodies(%buf, funcs: rest, cctx)
+      let %buf = emit_one_body(%buf, f, func_id, cctx)
+      return emit_code_bodies(%buf, funcs: rest, func_id: func_id + 1, cctx)
   end
 end
 
 
 // ─── Module entry point ────────────────────────────────────────────────────
 
+/** Back-compat wrapper around `compile_lir_to_wasm_with_coverage` (nexus-gycd). */
+/** Keeps the original 3-arg signature so old callers (and the bootstrap seed) */
+/** can keep working without rewriting the call site. */
 export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
                                        effect_map: &EffectMap) -> %ByteBuffer throws { CodegenError } do
+  return compile_lir_to_wasm_with_coverage(program, string_data_base, effect_map, coverage_flag: 0)
+end
+
+/** Coverage flag is an i64 (0 / 1) rather than `bool` to dodge a seed-compiler */
+/** codegen quirk around bool-typed function params under multi-stage bootstrap. */
+export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_data_base: i64,
+                                       effect_map: &EffectMap,
+                                       coverage_flag: i64) -> %ByteBuffer throws { CodegenError } do
+  let coverage_enabled = coverage_flag != 0
   match program do
     | LirProgram(functions: funcs, externals: all_exts) ->
 
@@ -1827,7 +1907,16 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
       let string_entries = wcollect.build_string_entries(strings: all_strings, next_offset: string_data_base, acc: [])
       let has_strings = list.length(xs: string_entries) > 0
 
-      let mem_mode = wcollect.choose_memory_mode(externals: exts, has_strings, has_heap: heap_enabled)
+      let mem_mode_raw = wcollect.choose_memory_mode(externals: exts, has_strings, has_heap: heap_enabled)
+      // Coverage instrumentation (nexus-gycd) needs a memory for the atomic
+      // counter array at page 17. Force `MemoryImported("env")` when --coverage
+      // is on for programs that wouldn't otherwise declare/import one.
+      let mem_mode = if coverage_enabled then
+          match mem_mode_raw do
+            | MemoryNone -> MemoryImported(name: "env")
+            | _ -> mem_mode_raw
+          end
+        else mem_mode_raw end
 
       let last_end = wcollect.compute_last_string_end(entries: string_entries)
       let heap_base_raw = match last_end > string_data_base do | true -> last_end | false -> string_data_base end
@@ -1881,8 +1970,11 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
         wdefs.emit_section(buf: %m, id: sec_table, content: wsect.build_table_section(n_closures, has_ss, ss_cont_type_idx))
       else %m end
 
+      let mem_min_pages = if coverage_enabled then
+          wdefs.cov_base_pages + wdefs.cov_extra_pages
+        else wdefs.cov_base_pages end
       let %m = if let MemoryDefined = mem_mode then
-        wdefs.emit_section(buf: %m, id: sec_memory, content: wsect.build_memory_section())
+        wdefs.emit_section(buf: %m, id: sec_memory, content: wsect.build_memory_section(min_pages: mem_min_pages))
       else %m end
 
       // Tag section must come after memory and before global.
@@ -1972,9 +2064,10 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
         memo_target_names,
         memo_target_slots,
         memo_globals_base,
-        import_count
+        import_count,
+        coverage_enabled
       )
-      let %code = emit_code_bodies(buf: %code, funcs, cctx)
+      let %code = emit_code_bodies(buf: %code, funcs, func_id: 0, cctx)
       let %code = if has_cabi then
         let %cabi_body = compile_cabi_realloc(heap_base)
         append_body_to_buf(buf: %code, body: %cabi_body)
@@ -1996,6 +2089,12 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
       // cell on the first allocation (the seed is the top of all static data,
       // since string literals live in the initial pages).
       let %m = wdefs.emit_section(buf: %m, id: sec_data, content: wsect.build_data_section(entries: string_entries, cell_init: 0 - 1))
+
+      // Coverage custom section (nexus-gycd): emit `nx.coverage.functions` when
+      // --coverage is on. The body lists (id, line, name) for each LIR
+      // function in emission order — readers join it with the runtime counter
+      // array at byte offset `cov_counter_base` in linear memory.
+      let %m = if coverage_enabled then emit_coverage_custom_section(buf: %m, funcs) else %m end
 
       let total_named_funcs = import_count + n_funcs + 1
       let %name_payload = build_name_section(exts, funcs,
