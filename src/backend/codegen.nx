@@ -763,7 +763,6 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let n_caps = list.length(xs: caps)
       let %buf = emit_alloc_object(%buf, ctx, words: 1 + n_caps)
       let obj_ptr = wdefs.ctx_temps_base(ctx) + 3
-      // Store table_idx at offset 0
       let CodegenCtx(closure_table: ctab, _) = ctx
       let table_idx = lookup_closure_table_idx(name: fname, entries: ctab)
       let %buf = bb.push_byte(%buf, byte: op_local_get)
@@ -772,19 +771,14 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = bb.push_sleb128(%buf, val: table_idx)
       let %buf = bb.push_byte(%buf, byte: op_i64_store)
       let %buf = wdefs.emit_memarg_i64(%buf, offset: 0)
-      // Store captures at offset 8, 16, ...
       let %buf = emit_closure_captures(%buf, caps, ctx, obj_ptr, field_idx: 1)
-      // Result: obj_ptr as i64
       let %buf = bb.push_byte(%buf, byte: op_local_get)
       let %buf = bb.push_uleb128(%buf, val: obj_ptr)
       return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
 
     | LirExprCallClosure(closure: clos, args: cargs, typ: _) ->
-      // Push env (closure pointer) as first arg
       let %buf = emit_atom(atom: clos, %buf, ctx)
-      // Push actual args (packed to i64)
       let %buf = emit_closure_call_args(%buf, args: cargs, ctx)
-      // Load table_idx from "closure"
       let obj_ptr = wdefs.ctx_temps_base(ctx) + 3
       let %buf = emit_atom(atom: clos, %buf, ctx)
       let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_local_set])
@@ -794,7 +788,6 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let %buf = bb.push_byte(%buf, byte: op_i64_load)
       let %buf = wdefs.emit_memarg_i64(%buf, offset: 0)
       let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
-      // call_indirect: type_idx, table 0
       let n_args = list.length(xs: cargs)
       let CodegenCtx(closure_type_indices: cti, _) = ctx
       let type_idx = lookup_closure_type_idx_pairs(arity: n_args, pairs: cti)
@@ -1140,7 +1133,6 @@ end
 let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bool, tcmc: TcmcCtx) -> %ByteBuffer throws { CodegenError } do
   match stmt do
     | LirStmtLet(name: n, typ: t, expr: e) ->
-      // TCMC interception: skip self-call, intercept constructor
       match tcmc do
         | TcmcActive(head_local: _, prev_local: _, rest_field_idx: _, call_var: cv,
                          cons_var: consv, call_args: _, ctor_name: _, ctor_args: _, func_name: _, loop_depth: _) ->
@@ -1197,7 +1189,6 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       return bb.push_byte(%buf, byte: op_end)
 
     | LirStmtIfReturn(cond: c, then_body: tb, then_ret: tr, else_body: eb, else_ret: er, ret_type: rt) ->
-      // Optimize: if cond is always true and no else, emit body directly (no if wrapper)
       if is_unconditional_return(cond: c, else_body: eb, else_ret: er) then
         return emit_if_return_unconditional(%buf, then_body: tb, then_ret: tr,
           ret_type: rt, ctx, in_try, tcmc)
@@ -1226,12 +1217,9 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       let packed = wdefs.ctx_lookup_local(ctx, name: cp)
       let catch_local_idx = if packed < 0 then 0 - 1 else packed / 4294967296 end
 
-      // WASM EH: block $skip { block $catch (result i64) { try_table (catch tag0 $catch) { body } end; br 1 } end; catch body } end
-      // Emit block $skip
+      // WASM EH layout: block $skip { block $catch (result i64) { try_table (catch tag0 $catch) { body } end; br 1 } end; catch body } end
       let %buf = bb.push_bytes(%buf, bytes: [op_block, bt_void])
-      // Emit block $catch (result i64)
       let %buf = bb.push_bytes(%buf, bytes: [op_block, bt_i64])
-      // Emit try_table (catch tag0 label0)
       let %buf = bb.push_bytes(%buf, bytes: [op_try_table, bt_void])
       let %buf = bb.push_uleb128(%buf, val: 1)
       let %buf = bb.push_byte(%buf, byte: catch_kind_one)
@@ -1248,12 +1236,12 @@ let emit_stmt = fn (stmt: LirStmt, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       end
       let %buf = bb.push_byte(%buf, byte: op_end)
 
-      // Try succeeded — skip catch
+      // Try-success path: br over the catch body.
       let %buf = bb.push_byte(%buf, byte: op_br)
       let %buf = bb.push_uleb128(%buf, val: 1)
       let %buf = bb.push_byte(%buf, byte: op_end)
 
-      // Catch body — i64 payload on stack from $catch block
+      // Catch entry: i64 payload is sitting on the stack from the $catch block.
       let %buf = if catch_local_idx >= 0 then
         let %buf = bb.push_byte(%buf, byte: op_local_set)
         bb.push_uleb128(%buf, val: catch_local_idx)
@@ -1717,11 +1705,11 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
   match program do
     | LirProgram(functions: funcs, externals: all_exts) ->
 
-      // Filter out arena intrinsics — they are emitted as inline WASM, not imported.
+      // Arena intrinsics are emitted as inline WASM, not imported.
       let intrinsic_filtered = filter_intrinsic_externals(exts: all_exts)
       let has_intrinsics = list.length(xs: all_exts) != list.length(xs: intrinsic_filtered)
-      // Deduplicate externals by (wasm_module, wasm_name) — diamond imports can
-      // register the same WASM function under multiple Nexus names.
+      // Diamond imports can register the same WASM function under multiple Nexus
+      // names; collapse them so the import section has one entry per WASM target.
       let DedupExtResult(exts, remaps: ext_remaps) = dedup_externals(exts: intrinsic_filtered)
       let filtered_program = LirProgram(functions: funcs, externals: exts)
       let n_exts = list.length(xs: exts)
@@ -1751,14 +1739,12 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
 
       let internal_funcs = build_internal_func_entries(funcs, import_count, idx: 0)
       let base_external_funcs = build_external_func_entries(exts, idx: 0)
-      // Add remap entries for deduplicated externals (duplicate names → original index)
+      // Remap entries point duplicate names at the surviving external's index.
       let external_funcs = append_func_entries(a: ext_remaps, b: base_external_funcs)
 
-      // Build hash maps for O(1) function lookup
       let %internal_func_map = wdefs.build_func_map(entries: internal_funcs)
       let %external_func_map = wdefs.build_func_map(entries: external_funcs)
 
-      // Closure analysis
       let closure_table = build_closure_table(funcs, &internal_func_map, table_idx: 0)
       let n_closures = list.length(xs: closure_table)
       let closure_arities = collect_closure_arities(funcs)
@@ -1796,13 +1782,11 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
       let cabi_realloc_idx = import_count + n_funcs
       let wasi_run_idx = import_count + n_funcs + n_cabi
 
-      // WASM magic + version
       let %m = bb.empty()
       let %m = bb.push_bytes(buf: %m, bytes: [0, 97, 115, 109, 1, 0, 0, 0])
 
-      // Type section — deduplicated by signature; returns canonical indices per entity.
-      // No `__nx_allocate` import any more: the allocator is fully inline
-      // (atomic bump cell), so the alloc-related type slots are never reserved.
+      // The allocator is fully inline (atomic bump cell), so no `__nx_allocate`
+      // import — the alloc-related type slots are never reserved.
       let has_alloc = false
       let DedupedTypes(section: %type_sec, count: _,
                        ext_type_idxs,
@@ -1823,7 +1807,6 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
       let ss_dispatch_block_type_idx = my_dispatch_idx
       let %m = wdefs.emit_section(buf: %m, id: sec_type, content: %type_sec)
 
-      // Import section
       if n_exts > 0 || (mem_mode != "none" && mem_mode != "defined") || has_alloc then
         let %m = wdefs.emit_section(buf: %m, id: sec_import,
                                content: wsect.build_import_section(exts, ext_type_idxs,
@@ -1833,25 +1816,21 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
                                  alloc_module: mem_mode))
       end
 
-      // Function section
       let %m = wdefs.emit_section(buf: %m, id: sec_function,
                              content: wsect.build_function_section(func_type_idxs,
                                                                    wasi_run_type_idx,
                                                                    has_cabi,
                                                                    cabi_type_idx))
 
-      // Table section (closures and/or cont ref table for stack-switching)
       let %m = if n_closures > 0 || has_ss then
         wdefs.emit_section(buf: %m, id: sec_table, content: wsect.build_table_section(n_closures, has_ss, ss_cont_type_idx))
       else %m end
 
-      // Memory section
       let %m = if mem_mode == "defined" then
         wdefs.emit_section(buf: %m, id: sec_memory, content: wsect.build_memory_section())
       else %m end
 
-      // Tag section — emits the EH tag and the stack-switching tag if either
-      // is in use. Must come after memory, before global.
+      // Tag section must come after memory and before global.
       // Phase-3 multi-arm dispatch: one wasm tag per distinct cap method
       // (`<port>::<method>`) collected at codegen time. Computed here (early
       // enough for the tag section emission) and re-used downstream by
@@ -1895,7 +1874,6 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
         wdefs.emit_section(buf: %m, id: sec_global, content: wsect.build_global_section(heap_base, has_ss, ss_cont_type_idx, memo_cache_count: n_memo_targets))
       else %m end
 
-      // Export section
       let %m = wdefs.emit_section(buf: %m, id: sec_export,
                              content: wsect.build_export_section(main_idx, wasi_run_idx,
                                                            cabi_realloc_idx,
@@ -1905,22 +1883,17 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
                                                            has_ss,
                                                            extra_exports))
 
-      // Element section (populate funcref table)
       let %m = if n_closures > 0 then
         wdefs.emit_section(buf: %m, id: sec_element, content: wsect.build_element_section(closure_entries: closure_table))
       else %m end
 
-      // Code section
-      // Build closure_type_indices: map arity → canonical (deduped) type section index
       let closure_type_idx_list = build_closure_type_idx_list(arities: closure_arities, type_idxs: closure_type_idxs)
       let %code = bb.empty()
       let %code = bb.push_uleb128(buf: %code, val: n_funcs + n_cabi + 1)
-      // Pass all_exts (including arena) so emit_arena_intrinsic can find them via find_external
       // ss_tag_idx is the tag-section ordinal of the stack-switching tag:
-      // 1 if EH is also enabled (EH tag at 0), 0 if SS-only, -1 if absent.
+      // 1 when EH is also enabled (EH tag at 0), 0 if SS-only, -1 if absent.
       let ss_tag_idx = if has_ss then (if has_eh then 1 else 0 end) else -1 end
-      // Reuse the list computed earlier for the tag section so we don't
-      // re-walk the LIR program.
+      // Reuse the list computed for the tag section above.
       let ss_tag_names = ss_tag_names_for_tags
       let %code = emit_code_bodies(buf: %code, funcs, internal_funcs,
                                     external_funcs, string_lits: string_entries,
@@ -1937,7 +1910,6 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
                                     memo_target_slots,
                                     memo_globals_base,
                                     import_count)
-      // cabi_realloc: aligned bump allocator for the canonical-ABI string path
       let %code = if has_cabi then
         let %cabi_body = compile_cabi_realloc(heap_base)
         append_body_to_buf(buf: %code, body: %cabi_body)
@@ -1960,7 +1932,6 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
       // since string literals live in the initial pages).
       let %m = wdefs.emit_section(buf: %m, id: sec_data, content: wsect.build_data_section(entries: string_entries, cell_init: 0 - 1))
 
-      // Name section (custom)
       let total_named_funcs = import_count + n_funcs + 1
       let %name_payload = build_name_section(exts, funcs,
                                               has_alloc,
@@ -1973,7 +1944,6 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
       let %m = bb.push_buf(dst: %m, src: &name_payload)
       bb.free(buf: %name_payload)
 
-      // Free function lookup maps
       wdefs.free_func_map(map: %internal_func_map)
       wdefs.free_func_map(map: %external_func_map)
 
