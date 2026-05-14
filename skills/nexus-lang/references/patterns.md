@@ -610,3 +610,71 @@ end
 - Thunks with no side effects parallelise cleanly; combinators do not insulate
   observable effects (`race` / `cancel` / `detach` in `std:lazy` are still
   sequential — see their docstrings)
+
+## Spec-vs-implementation deltas
+
+These are points where the in-tree typechecker behaves consistently but the
+canonical spec (`type-system-formal.md`, in submodule) doesn't yet have the
+corresponding rule annotated. Listed here so a reader of `src/typecheck` can
+predict the implementation without chasing spec text.
+
+### T-Lambda throws/requires — declared vs inferred
+
+In `src/typecheck/infer.nx::infer_lambda` (around line 899) the constructed
+`TyArrow` hardcodes both `requires` and `throw_row` to `TyRow([], None)` — the
+body's inferred effect row is never lifted onto the lambda's arrow type. The
+function-decl boundary, by contrast, threads the declared throws row through
+`CheckState.throw_row` (`check.nx::check_function`, line 575) and enforces
+admission at every `raise` (`check_raise_admitted`, infer.nx:971) and every
+call site (`check_call_throw_row_admitted`, infer.nx:220). Inside a lambda
+body the *outer* function's throw_row is what's checked — there is no
+per-lambda fresh ρ. The spec's T-Lambda premise `... ⊢_s s̄ : Γ' ! ρ_e` and
+arrow conclusion `(...) → τ_r; ρ_q; ρ_e` literally force `declared = body-
+inferred`; the impl side-steps this entirely by never populating the lambda's
+arrow row. See bd `nexus-uy3l` (closed-deferred on mqin.1) for the unify-arrow
+blocker analysis, and `nexus-xyhv` for the missing spec subsumption rule.
+
+### T-Var: sigil-bound variables (`%x`)
+
+`src/frontend/parser.nx:159` parses `%x` to `ExprVariable(name, sigil:
+SigilLinear)`, identical in shape to the bare `x` form (`SigilImmutable`).
+`src/typecheck/infer/literals.nx::infer_variable` (line 74) ignores the sigil
+unless it is `SigilMutable` (which triggers the `~x` deref path); for
+`SigilLinear` it falls through to plain env lookup and returns the binding's
+type unchanged. So `%x` and `x` are typed identically by the same code path;
+the linearity discipline lives in `src/typecheck/linearity.nx`, not in T-Var.
+The spec's T-Var prose restricts μ to ε; the impl treats μ ∈ {ε, %} as a
+single rule, with `~` handled by an inlined `SigilMutable` branch in the same
+function. No separate T-Var-Linear rule exists in the impl.
+
+### T-App: ρ_q subsumption vs ρ_e' union
+
+`src/typecheck/infer.nx::infer_call` (line 177) destructures the callee's
+arrow as `TyArrow(params, ret, requires: _, throw_row: callee_thr)` —
+`requires` is fully ignored at the call site (no `open()`, no unify, no
+admission check). Only `throw_row` is consulted: `check_call_throw_row_
+admitted` (line 220) performs a literal membership check of each callee
+exception against the caller's `state_throw_row`, with several back-compat
+carve-outs (closed-empty on either side, open row on either side, non-row
+shape all admit). There is no `∪` and no `open()` — neither limb of the spec
+asymmetry exists in the impl. The capability side is silent; the effect side
+is a one-directional admission check, not a union.
+
+### T-Lambda / T-Handler: Γ_ω capture
+
+`src/typecheck/infer.nx::infer_lambda` (line 888) reads `outer_env =
+state_env(state)`, extends it with the lambda's parameters via
+`add_params_to_env`, and threads the result straight into the body
+inference state. The body therefore sees every binding visible at the
+lambda's definition point — Γ_ω, Γ_cap, and Γ_rest alike — with no
+partitioning at the type level. `src/typecheck/capture.nx::scan_lambda_
+captures` does walk the body to classify captures, but only to decide
+whether the arrow gets wrapped in `TyLinear` (the Γ_cap ≠ ∅ → %τ_→ rule)
+and to reject `~x` captures; Γ_ω is not materialized as a separate
+environment slice. The spec's Γ_ω-on-the-left-of-the-conclusion question
+simply does not arise: the impl carries the ambient Γ wholesale.
+Inline `Handler(...)` expressions (`infer.nx:108`) sidestep the issue by
+returning a fixed `TyHandler(name, requires: TyRow([], None))` without
+walking arm bodies for type purposes (arm typechecking happens at the
+top-level handler-arm path in `check.nx`, which inherits the enclosing
+function's env via `state_with_env`).
