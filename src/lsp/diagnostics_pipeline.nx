@@ -1,0 +1,266 @@
+/**
+ * lsp/diagnostics_pipeline: per-buffer diagnostics emission.
+ *
+ * Layers on top of `src/lsp/diagnostics.nx` (the position-keyed surface over
+ * the typechecker). This module owns the editor-facing pipeline:
+ *
+ *   1. Lex + parse + import resolution (`program_state.build_program_state`).
+ *   2. Import-aware HIR build (`build_hir_with_imports` here).
+ *   3. Typecheck via `enumerate_diagnostics`.
+ *   4. Translate internal `DiagEntry` → wire `Diagnostic`.
+ *   5. Build the `textDocument/publishDiagnostics` notification, consulting
+ *      the per-URI version cache.
+ *
+ * The split keeps `lsp/handlers.nx` focused on method routing while this
+ * file owns the diagnostics flow shared by `on_did_open`, `on_did_change`
+ * and any future "republish" trigger.
+ *
+ * Name chosen to avoid collision with `src/lsp/diagnostics.nx`, which holds
+ * the smaller `DiagEntry` / `enumerate_diagnostics` surface this module
+ * sits above.
+ */
+
+import {
+  JsonValue, JsonObject, JsonString, JsonField, get_field
+} from "std:json"
+import { Option, Some, None } from "std:option"
+import { HirProgram, HirFunction } from "src/ir/hir_types.nx"
+import * as hir from "src/ir/hir.nx"
+import * as parser from "src/frontend/parser.nx"
+import { resolve_all_lazy_no_filter } from "src/ir/demand.nx"
+import { Fs } from "std:fs"
+import { Console } from "std:stdio"
+import {
+  DiagEntry, DiagRange,
+  SeverityError,
+  enumerate_diagnostics,
+  make_origin_error_diagnostic
+} from "src/lsp/diagnostics.nx"
+import {
+  ProgramState, resolve_imports_for
+} from "src/lsp/program_state.nx"
+import {
+  PublishDiagnosticsParams, publish_diagnostics_params_to_json,
+  Position, Range, Diagnostic,
+  DiagSevError
+} from "src/lsp/protocol.nx"
+import {
+  ServerState, DocumentRecord, HandlerResult,
+  documents_put, state_documents, state_cache,
+  cache_lookup, cache_put,
+  with_documents, with_cache
+} from "src/lsp/state.nx"
+
+// ─── Diagnostic translation: internal DiagEntry -> wire Diagnostic ───────────
+//
+// Saturating clamp on coordinate conversion: a bogus 0 in the input becomes
+// wire 0 (the closest valid LSP coordinate) rather than -1 which the spec
+// rejects.
+
+let saturating_pred = fn (n: i64) -> i64 do
+  if n <= 0 then return 0 end
+  return n - 1
+end
+
+let to_wire_diagnostic = fn (d: DiagEntry) -> Diagnostic do
+  match d do | DiagEntry(file: _, range, severity, code, message) ->
+    match range do | DiagRange(start_line, start_col, end_line, end_col) ->
+      let start_pos = Position(
+        line: saturating_pred(n: start_line),
+        character: saturating_pred(n: start_col)
+      )
+      let end_pos = Position(
+        line: saturating_pred(n: end_line),
+        character: saturating_pred(n: end_col)
+      )
+      let wire_sev = match severity do
+        | SeverityError -> Some(val: DiagSevError)
+      end
+      let wire_code = if code == "" then None else Some(val: code) end
+      return Diagnostic(
+        range: Range(start: start_pos, end_: end_pos),
+        severity: wire_sev,
+        code: wire_code,
+        source: Some(val: "nexus"),
+        message
+      )
+    end
+  end
+end
+
+let translate_diagnostics_go = fn (xs: [DiagEntry], acc: [Diagnostic]) -> [Diagnostic] do
+  match xs do
+    | [] -> return acc
+    | d :: rest -> return translate_diagnostics_go(xs: rest, acc: to_wire_diagnostic(d: d) :: acc)
+  end
+end
+
+let reverse_wire_diags = fn (xs: [Diagnostic], acc: [Diagnostic]) -> [Diagnostic] do
+  match xs do
+    | [] -> return acc
+    | d :: rest -> return reverse_wire_diags(xs: rest, acc: d :: acc)
+  end
+end
+
+let to_wire_diagnostics = fn (xs: [DiagEntry]) -> [Diagnostic] do
+  let reversed = translate_diagnostics_go(xs, acc: [])
+  return reverse_wire_diags(xs: reversed, acc: [])
+end
+
+// ─── HIR build (with imports) ────────────────────────────────────────────────
+//
+// `build_hir_with_imports` layers HIR accumulation + lazy resolution on top
+// of `build_program_state`'s shared lex+parse+import-resolution stage. The
+// typechecker then sees the importer's own functions plus the imported
+// ones, so a type error in an imported function (called from the importer)
+// surfaces as a diagnostic.
+
+let build_hir_with_imports = fn (state: ProgramState, source_file: string) -> HirProgram require { Fs, Console } throws { Exn } do
+  let ProgramState(prog: _, defs, cache: _, accum, self_entries: _, caller_entries: _, all_entries) = state
+  let accum2 = hir.process_defs(defs, all_entries, accum, source_file)
+  let raw = hir.accum_to_program(accum: accum2)
+  match raw do | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
+    // LSP-mode resolve: convert every LazyBody but skip reachability
+    // filtering. The LSP wants typecheck coverage for *all* loaded defs
+    // (including imported `bar` that the importer never calls) so the
+    // editor surfaces every reachable error in the workspace, not just
+    // those on the codegen path.
+    let resolved = resolve_all_lazy_no_filter(funcs: hf)
+    return HirProgram(ports: hp, functions: resolved, externals: he,
+      handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
+  end
+end
+
+// ─── Diagnostics for a buffer ────────────────────────────────────────────────
+//
+// Pipeline: lex -> parse -> import-aware HIR build -> typecheck. Each phase
+// boundary is wrapped so a failure surfaces as a single file-origin
+// DiagEntry instead of crashing the LSP loop. The typechecker itself
+// returns either an empty list (clean) or one DiagEntry per CompileError.
+
+let reverse_strings = fn (xs: [string], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | s :: rest -> return reverse_strings(xs: rest, acc: s :: acc)
+  end
+end
+
+let extract_hir_function_names = fn (funcs: [HirFunction], acc: [string]) -> [string] do
+  match funcs do
+    | [] -> return reverse_strings(xs: acc, acc: [])
+    | f :: rest ->
+      let HirFunction(name, type_params: _, params: _, ret_type: _, _) = f
+      return extract_hir_function_names(funcs: rest, acc: name :: acc)
+  end
+end
+
+/// Compute internal diagnostics for an editor buffer: lex+parse → import-aware
+/// HIR build → typecheck. Each `DiagEntry` carries the *originating* file path
+/// (issue nexus-qgfh) — a TypeMismatch inside an imported function reports the
+/// imported file's path even though the editor only opened the importer.
+/// Exported so tests / future LSP routing layers can inspect file identity
+/// before the wire-format DocumentFilter.
+///
+/// The `parse_source` + `resolve_imports_for` split mirrors the helpers
+/// `lsp/definition.resolve_definition` consumes through `build_program_state`
+/// — a single Fs walk per request grounds both the typecheck and the
+/// go-to-definition paths.
+export let compute_diagnostics_for_buffer = fn (text: string, file: string) -> [DiagEntry] require { Fs, Console } throws { Exn } do
+  try
+    let prog = parser.parse_source(src: text)
+    try
+      let state = resolve_imports_for(prog, file)
+      let hir_prog = build_hir_with_imports(state, source_file: file)
+      // Pass *all* HIR function names as `local_names` so the typechecker
+      // also walks imported function bodies. Driver-side typecheck restricts
+      // to the entry file's own funcs because each imported file is
+      // independently checked by its own pipeline; the LSP scope is
+      // editor-as-single-driver — surface every reachable error.
+      let HirProgram(ports: _, functions: funcs, externals: _, handler_bindings: _, enum_defs: _, _) = hir_prog
+      let all_names = extract_hir_function_names(funcs, acc: [])
+      return enumerate_diagnostics(hir: hir_prog, local_names: all_names, file)
+    catch import_err ->
+      // Import resolution failure (missing file, parse error in an imported
+      // module, cycle): surface as a single origin-anchored diagnostic. The
+      // raw exception carries the offending path; we render it via the
+      // generic format_error path inside `make_origin_error_diagnostic`.
+      let _ = import_err
+      return [make_origin_error_diagnostic(file, message: "lsp: import resolution failed")]
+    end
+  catch err ->
+    let _ = err
+    return [make_origin_error_diagnostic(file, message: "lsp: failed to lex or parse source")]
+  end
+end
+
+// ─── Notification frame builders ─────────────────────────────────────────────
+
+export let notification_frame = fn (method: string, params: JsonValue) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "jsonrpc", value: JsonString(val: "2.0")),
+    JsonField(key: "method", value: JsonString(val: method)),
+    JsonField(key: "params", value: params)
+  ])
+end
+
+let make_publish_diagnostics_notification = fn (params: PublishDiagnosticsParams) -> JsonValue do
+  return notification_frame(
+    method: "textDocument/publishDiagnostics",
+    params: publish_diagnostics_params_to_json(p: params)
+  )
+end
+
+// ─── Buffer update + diagnostics emission ────────────────────────────────────
+//
+// Shared between on_did_open and on_did_change. Updates the document
+// store, consults the per-URI version cache, and produces a
+// publishDiagnostics notification. The internal DiagEntry stream may be
+// empty (clean program); we still publish an empty array because LSP
+// clients use that signal to clear stale markers.
+
+export let publish_for_buffer = fn (
+  state: ServerState,
+  uri: string,
+  text: string,
+  version: i64
+) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let new_docs = documents_put(
+    store: state_documents(state),
+    rec: DocumentRecord(uri, text, version)
+  )
+  let cache = state_cache(state)
+  match cache_lookup(cache, uri, version) do
+    | Some(val: cached_diags) ->
+      // Cache hit: same (uri, version) -> reuse stored wire diagnostics.
+      let params = PublishDiagnosticsParams(
+        uri,
+        version: Some(val: version),
+        diagnostics: cached_diags
+      )
+      let frame = make_publish_diagnostics_notification(params)
+      return HandlerResult(
+        state: with_documents(state, docs: new_docs),
+        response: None,
+        notifications: [frame]
+      )
+    | None ->
+      let internal = compute_diagnostics_for_buffer(text, file: uri)
+      let wire = to_wire_diagnostics(xs: internal)
+      let new_cache = cache_put(cache, uri, version, diagnostics: wire)
+      let params = PublishDiagnosticsParams(
+        uri,
+        version: Some(val: version),
+        diagnostics: wire
+      )
+      let frame = make_publish_diagnostics_notification(params)
+      let updated = with_cache(
+        state: with_documents(state, docs: new_docs),
+        cache: new_cache
+      )
+      return HandlerResult(
+        state: updated,
+        response: None,
+        notifications: [frame]
+      )
+  end
+end

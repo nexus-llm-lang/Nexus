@@ -1,0 +1,563 @@
+/**
+ * lsp/request_handlers: per-method LSP handlers.
+ *
+ * Each `on_*` function here matches one inbound JSON-RPC method name routed
+ * by `lsp/handlers.invoke_method`. Handlers are pure functions over
+ * `ServerState` × params → `HandlerResult`; the dispatcher converts that
+ * into the wire response/notification stream and threads the new state.
+ *
+ * Methods covered:
+ *   - lifecycle (no-op): initialized, didSave
+ *   - document sync: didOpen, didChange, didClose
+ *   - query handlers: documentSymbol, hover, definition, completion,
+ *     references, signatureHelp, semanticTokens/full
+ *   - workspace handlers: workspace/symbol
+ *
+ * `initialize` and `shutdown` stay in `handlers.nx` because they touch the
+ * capability advertisement and lifecycle flag respectively, both of which
+ * the dispatcher is closely coupled to.
+ *
+ * Helper conventions:
+ *   - URI extraction lives in `extract_text_document_uri_strict` (raises
+ *     `LspProtocolError` on missing / non-string).
+ *   - Position decoding lives in `decode_position` (re-used across
+ *     definition, completion, references, signatureHelp).
+ *   - List → JsonArray reversals follow the rest of the codebase's
+ *     accumulator-then-reverse idiom.
+ */
+
+import {
+  JsonValue, JsonNull, JsonInt, JsonString, JsonArray, JsonBool, JsonObject,
+  JsonField, get_field
+} from "std:json"
+import { Option, Some, None } from "std:option"
+import * as lexer from "src/frontend/lexer.nx"
+import * as parser from "src/frontend/parser.nx"
+import { Fs } from "std:fs"
+import { Console } from "std:stdio"
+import {
+  document_symbols_for_program
+} from "src/lsp/symbols.nx"
+import {
+  resolve_definition
+} from "src/lsp/definition.nx"
+import {
+  resolve_completion
+} from "src/lsp/completion.nx"
+import {
+  find_references
+} from "src/lsp/references.nx"
+import {
+  resolve_signature_help
+} from "src/lsp/signature_help.nx"
+import {
+  compute_semantic_tokens
+} from "src/lsp/semantic_tokens.nx"
+import {
+  find_workspace_symbols, WorkspaceBuffer
+} from "src/lsp/workspace_symbol.nx"
+import {
+  TextDocumentItem, text_document_item_from_json,
+  VersionedTextDocumentIdentifier,
+  versioned_text_document_identifier_from_json,
+  ContentChangeFull, ContentChangeIncremental,
+  content_change_event_from_json,
+  Position, DocumentSymbol, Location,
+  CompletionList,
+  completion_list_to_json,
+  SignatureHelp,
+  signature_help_to_json,
+  SemanticTokens,
+  semantic_tokens_to_json,
+  location_to_json,
+  document_symbol_to_json,
+  SymbolInformation, symbol_information_to_json,
+  LspProtocolError
+} from "src/lsp/protocol.nx"
+import {
+  ServerState, DocumentRecord, DocumentStore, HandlerResult,
+  documents_lookup, documents_remove, state_documents,
+  with_documents, with_lifecycle_shutdown,
+  require_object_field
+} from "src/lsp/state.nx"
+import {
+  publish_for_buffer
+} from "src/lsp/diagnostics_pipeline.nx"
+
+// ─── Shared helpers ──────────────────────────────────────────────────────────
+
+let reverse_jsonvals = fn (xs: [JsonValue], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | v :: rest -> return reverse_jsonvals(xs: rest, acc: v :: acc)
+  end
+end
+
+/// Decode a TextDocumentIdentifier's `uri` field as a string. Raises
+/// `LspProtocolError` on missing field or non-string value. Shared by every
+/// handler that takes `TextDocumentPositionParams`-shaped params.
+let extract_text_document_uri_strict = fn (params: JsonValue, ctx: string) -> string throws { Exn } do
+  let td_v = require_object_field(obj: params, key: "textDocument", ctx)
+  let uri_v = require_object_field(obj: td_v, key: "uri", ctx: ctx ++ ".textDocument")
+  match uri_v do
+    | JsonString(val: s) -> return s
+    | _ -> raise LspProtocolError(msg: ctx ++ ".textDocument.uri: expected string")
+  end
+end
+
+/// Decode a `Position` from a params object. Raises on missing fields or
+/// non-integer line/character. Shared across definition / completion /
+/// references / signatureHelp (all consume `TextDocumentPositionParams`).
+let decode_position = fn (params: JsonValue, ctx: string) -> Position throws { Exn } do
+  let pos_v = require_object_field(obj: params, key: "position", ctx)
+  let line_v = require_object_field(obj: pos_v, key: "line", ctx: ctx ++ ".position")
+  let char_v = require_object_field(obj: pos_v, key: "character", ctx: ctx ++ ".position")
+  let line = match line_v do
+    | JsonInt(val: n) -> n
+    | _ -> raise LspProtocolError(msg: ctx ++ ".position.line: expected integer")
+  end
+  let character = match char_v do
+    | JsonInt(val: n) -> n
+    | _ -> raise LspProtocolError(msg: ctx ++ ".position.character: expected integer")
+  end
+  return Position(line, character)
+end
+
+// ─── Handler: on_did_open ────────────────────────────────────────────────────
+
+export let on_did_open = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let td_v = require_object_field(obj: params, key: "textDocument",
+    ctx: "DidOpenTextDocumentParams")
+  let td = text_document_item_from_json(v: td_v)
+  match td do | TextDocumentItem(uri, language_id: _, version, text) ->
+    return publish_for_buffer(state, uri, text, version)
+  end
+end
+
+// ─── Handler: on_did_change ──────────────────────────────────────────────────
+//
+// Full-content sync: pick the trailing ContentChangeFull from the
+// contentChanges array. An incremental change in this stream is a protocol
+// violation per our advertised TextDocumentSyncKind.Full -- surface as
+// LspProtocolError so the dispatch layer routes InvalidParams (for
+// requests; notifications log + drop).
+
+let pick_full_text = fn (items: [JsonValue], current: Option<string>) -> string throws { Exn } do
+  match items do
+    | [] ->
+      match current do
+        | Some(val: t) -> return t
+        | None ->
+          raise LspProtocolError(
+            msg: "DidChangeTextDocumentParams.contentChanges: empty array"
+          )
+      end
+    | v :: rest ->
+      let ev = content_change_event_from_json(v)
+      match ev do
+        | ContentChangeFull(text) ->
+          return pick_full_text(items: rest, current: Some(val: text))
+        | ContentChangeIncremental(range: _, range_length: _, text: _) ->
+          raise LspProtocolError(
+            msg: "incremental contentChanges not supported (server advertises TextDocumentSyncKind.Full)"
+          )
+      end
+  end
+end
+
+let json_array_items = fn (v: JsonValue) -> [JsonValue] throws { Exn } do
+  match v do
+    | JsonArray(items) -> return items
+    | _ -> raise LspProtocolError(
+        msg: "DidChangeTextDocumentParams.contentChanges: expected array"
+      )
+  end
+end
+
+export let on_did_change = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let td_v = require_object_field(obj: params, key: "textDocument",
+    ctx: "DidChangeTextDocumentParams")
+  let id = versioned_text_document_identifier_from_json(v: td_v)
+  let changes_v = require_object_field(obj: params, key: "contentChanges",
+    ctx: "DidChangeTextDocumentParams")
+  let arr = json_array_items(v: changes_v)
+  let new_text = pick_full_text(items: arr, current: None)
+  match id do | VersionedTextDocumentIdentifier(uri, version) ->
+    return publish_for_buffer(state, uri, text: new_text, version)
+  end
+end
+
+// ─── Handler: on_did_close ───────────────────────────────────────────────────
+
+let extract_text_document_uri = fn (params: JsonValue, ctx: string) -> string throws { Exn } do
+  match get_field(obj: params, key: "textDocument") do
+    | None -> raise LspProtocolError(msg: ctx ++ ": missing 'textDocument'")
+    | Some(val: v) ->
+      match get_field(obj: v, key: "uri") do
+        | None -> raise LspProtocolError(msg: ctx ++ ".textDocument: missing 'uri'")
+        | Some(val: u) ->
+          match u do
+            | JsonString(val: s) -> return s
+            | _ -> raise LspProtocolError(msg: ctx ++ ".textDocument.uri: expected string")
+          end
+      end
+  end
+end
+
+export let on_did_close = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let uri = extract_text_document_uri(params, ctx: "DidCloseTextDocumentParams")
+  let new_docs = documents_remove(store: state_documents(state), uri)
+  return HandlerResult(
+    state: with_documents(state, docs: new_docs),
+    response: None,
+    notifications: []
+  )
+end
+
+// ─── Handler: on_did_save / on_initialized (no-ops) ──────────────────────────
+
+export let on_noop = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let _ = params
+  return HandlerResult(state, response: None, notifications: [])
+end
+
+// ─── Handler: textDocument/documentSymbol ────────────────────────────────────
+//
+// Outline view: parse the buffer text we cached on didOpen / didChange and
+// hand the resulting Program to `src/lsp/symbols.document_symbols_for_program`
+// for the AST -> DocumentSymbol[] conversion. The wire reply is the array
+// itself (not wrapped in an object); LSP clients accept either flat
+// SymbolInformation[] or DocumentSymbol[] as the response shape.
+
+let symbols_to_json_items_go = fn (xs: [DocumentSymbol], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return reverse_jsonvals(xs: acc, acc: [])
+    | s :: rest -> return symbols_to_json_items_go(xs: rest, acc: document_symbol_to_json(s) :: acc)
+  end
+end
+
+let document_symbols_to_json = fn (xs: [DocumentSymbol]) -> JsonValue do
+  return JsonArray(items: symbols_to_json_items_go(xs, acc: []))
+end
+
+let compute_document_symbols = fn (doc_opt: Option<DocumentRecord>) -> [DocumentSymbol] do
+  match doc_opt do
+    | None ->
+      // No buffer cached for this URI -- return an empty outline rather
+      // than InvalidParams. Some clients query documentSymbol before
+      // didOpen completes; an empty list is the LSP-friendly response.
+      return []
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text, version: _) ->
+        try
+          let prog = parser.parse_source(src: text)
+          return document_symbols_for_program(prog)
+        catch err ->
+          // Lex/parse failure: outline is empty for the broken buffer.
+          // The client already sees publishDiagnostics with the parse
+          // error (pushed by didOpen / didChange), so flooding the
+          // outline with a synthetic symbol would be redundant.
+          let _ = err
+          return []
+        end
+      end
+  end
+end
+
+export let on_document_symbol = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let uri = extract_text_document_uri_strict(params, ctx: "DocumentSymbolParams")
+  let doc_opt = documents_lookup(store: state_documents(state), uri)
+  let symbols = compute_document_symbols(doc_opt)
+  return HandlerResult(
+    state,
+    response: Some(val: document_symbols_to_json(xs: symbols)),
+    notifications: []
+  )
+end
+
+// ─── Handler: textDocument/hover ─────────────────────────────────────────────
+//
+// MVP scope (issue nexus-ws77): surface the file-level `/** ... */` doc
+// comment as a markdown Hover when the cursor sits on the first line of
+// the open buffer. Any other position returns JSON `null`, which LSP
+// treats as "no hover info".
+
+let hover_position_line = fn (params: JsonValue) -> i64 throws { Exn } do
+  let pos_v = require_object_field(obj: params, key: "position",
+    ctx: "HoverParams")
+  let line_v = require_object_field(obj: pos_v, key: "line",
+    ctx: "HoverParams.position")
+  match line_v do
+    | JsonInt(val: n) -> return n
+    | _ -> raise LspProtocolError(msg: "HoverParams.position.line: expected integer")
+  end
+end
+
+let make_markdown_hover = fn (content: string) -> JsonValue do
+  let markup = JsonObject(fields: [
+    JsonField(key: "kind", value: JsonString(val: "markdown")),
+    JsonField(key: "value", value: JsonString(val: content))
+  ])
+  return JsonObject(fields: [
+    JsonField(key: "contents", value: markup)
+  ])
+end
+
+let compute_hover_response = fn (doc_opt: Option<DocumentRecord>, line: i64) -> JsonValue do
+  // Hover only resolves to module doc on line 0; other lines reply null
+  // until per-definition doc is wired up (post-MVP).
+  if line != 0 then return JsonNull end
+  match doc_opt do
+    | None -> return JsonNull
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text, version: _) ->
+        match lexer.extract_module_doc(src: text) do
+          | None -> return JsonNull
+          | Some(val: doc) -> return make_markdown_hover(content: doc)
+        end
+      end
+  end
+end
+
+export let on_hover = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let uri = extract_text_document_uri_strict(params, ctx: "HoverParams")
+  let line = hover_position_line(params)
+  let doc_opt = documents_lookup(store: state_documents(state), uri)
+  let response = compute_hover_response(doc_opt, line)
+  return HandlerResult(
+    state,
+    response: Some(val: response),
+    notifications: []
+  )
+end
+
+// ─── Handler: textDocument/definition ────────────────────────────────────────
+//
+// Resolution scope (issue nexus-yvd8 Phase 1):
+//   - same-file: an identifier referencing a top-level `let` / `cap` in the
+//     entry buffer jumps back to that def's keyword span.
+//   - cross-file: `import { foo } from "./other.nx"` plus a call to `foo`
+//     jumps to other.nx's `let foo = ...` line.
+//   - cross-file with alias: `import * as a from "./other.nx"` plus
+//     `a.foo(...)` jumps to other.nx's `foo` def.
+
+export let on_definition = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let uri = extract_text_document_uri_strict(params, ctx: "DefinitionParams")
+  let pos = decode_position(params, ctx: "DefinitionParams")
+  let doc_opt = documents_lookup(store: state_documents(state), uri)
+  match doc_opt do
+    | None ->
+      return HandlerResult(state, response: Some(val: JsonNull), notifications: [])
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text, version: _) ->
+        match pos do | Position(line, character) ->
+          let loc_opt = resolve_definition(text, file_uri: uri, line, character)
+          let response = match loc_opt do
+            | None -> JsonNull
+            | Some(val: loc) -> location_to_json(loc)
+          end
+          return HandlerResult(state, response: Some(val: response), notifications: [])
+        end
+      end
+  end
+end
+
+// ─── Handler: textDocument/completion ────────────────────────────────────────
+//
+// Reuses `decode_position` (same TextDocumentPositionParams shape) and
+// hands the text + cursor coordinates to `lsp/completion.resolve_completion`.
+// On any internal failure the resolver returns the keyword-only baseline, so
+// this handler does not produce InvalidParams.
+
+export let on_completion = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let uri = extract_text_document_uri_strict(params, ctx: "CompletionParams")
+  let pos = decode_position(params, ctx: "CompletionParams")
+  let doc_opt = documents_lookup(store: state_documents(state), uri)
+  let text = match doc_opt do
+    | None -> ""
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text: t, version: _) -> t end
+  end
+  match pos do | Position(line, character) ->
+    let cl = resolve_completion(text, file_uri: uri, line, character)
+    return HandlerResult(
+      state,
+      response: Some(val: completion_list_to_json(cl)),
+      notifications: []
+    )
+  end
+end
+
+// ─── Handler: textDocument/references ────────────────────────────────────────
+//
+// Mirrors the definition path. The `context.includeDeclaration` boolean
+// toggles whether the def-site Location prefixes the use-site list.
+
+let references_include_declaration = fn (params: JsonValue) -> bool do
+  // `context` is optional per the spec (some clients omit it on
+  // peek-references). Default: true.
+  match get_field(obj: params, key: "context") do
+    | None -> return true
+    | Some(val: ctx) ->
+      match get_field(obj: ctx, key: "includeDeclaration") do
+        | None -> return true
+        | Some(val: v) ->
+          match v do
+            | JsonBool(val: b) -> return b
+            | _ -> return true
+          end
+      end
+  end
+end
+
+let locations_to_json_items = fn (xs: [Location], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return reverse_jsonvals(xs: acc, acc: [])
+    | l :: rest -> return locations_to_json_items(xs: rest, acc: location_to_json(loc: l) :: acc)
+  end
+end
+
+export let on_references = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let uri = extract_text_document_uri_strict(params, ctx: "ReferenceParams")
+  let pos = decode_position(params, ctx: "ReferenceParams")
+  let include_decl = references_include_declaration(params)
+  let doc_opt = documents_lookup(store: state_documents(state), uri)
+  match doc_opt do
+    | None ->
+      return HandlerResult(state, response: Some(val: JsonArray(items: [])), notifications: [])
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text, version: _) ->
+        match pos do | Position(line, character) ->
+          let locs = find_references(text, file_uri: uri, line, character, include_declaration: include_decl)
+          let items = locations_to_json_items(xs: locs, acc: [])
+          return HandlerResult(state, response: Some(val: JsonArray(items)), notifications: [])
+        end
+      end
+  end
+end
+
+// ─── Handler: textDocument/signatureHelp ─────────────────────────────────────
+//
+// Resolution scope (issue nexus-w2um Phase 1): mirrors definition / references
+// — same-file plus cached imported files. Reuses `decode_position` for
+// the TextDocumentPositionParams shape, hands the text + cursor coordinates
+// to `lsp/signature_help.resolve_signature_help`. The resolver returns None
+// for any failure path; the handler maps that to JSON `null`, which clients
+// treat as "no signature info" (no popup) rather than an error.
+
+export let on_signature_help = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let uri = extract_text_document_uri_strict(params, ctx: "SignatureHelpParams")
+  let pos = decode_position(params, ctx: "SignatureHelpParams")
+  let doc_opt = documents_lookup(store: state_documents(state), uri)
+  match doc_opt do
+    | None ->
+      // No buffer: null (LSP "no result" — clients render no popup).
+      return HandlerResult(state, response: Some(val: JsonNull), notifications: [])
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text, version: _) ->
+        match pos do | Position(line, character) ->
+          let help_opt = resolve_signature_help(text, file_uri: uri, line, character)
+          let response = match help_opt do
+            | None -> JsonNull
+            | Some(val: h) -> signature_help_to_json(h: h)
+          end
+          return HandlerResult(state, response: Some(val: response), notifications: [])
+        end
+      end
+  end
+end
+
+// ─── Handler: textDocument/semanticTokens/full ───────────────────────────────
+//
+// Resolution scope (issue nexus-2nef): walks the editor buffer's tokens via
+// `lsp/semantic_tokens.compute_semantic_tokens` and emits a flat
+// delta-encoded `SemanticTokens.data` array. Returns an empty `data` array
+// (a valid "no highlights" reply) when no buffer is cached for the URI; the
+// resolver itself never fails for lex / parse errors because it falls back
+// to whatever subset of the buffer did tokenize cleanly.
+
+export let on_semantic_tokens = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let uri = extract_text_document_uri_strict(params, ctx: "SemanticTokensParams")
+  let doc_opt = documents_lookup(store: state_documents(state), uri)
+  let text = match doc_opt do
+    | None -> ""
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text: t, version: _) -> t end
+  end
+  let tokens = compute_semantic_tokens(text)
+  return HandlerResult(
+    state,
+    response: Some(val: semantic_tokens_to_json(st: tokens)),
+    notifications: []
+  )
+end
+
+// ─── Handler: workspace/symbol ───────────────────────────────────────────────
+//
+// Walks every open buffer's top-level definitions and returns a flat
+// `SymbolInformation[]` filtered by the client's case-insensitive query.
+// `params.query` is required by the spec; we tolerate its absence by
+// defaulting to "" (all symbols) so a misbehaving client still gets a
+// useful response instead of InvalidParams.
+
+let reverse_buffers = fn (xs: [WorkspaceBuffer], acc: [WorkspaceBuffer]) -> [WorkspaceBuffer] do
+  match xs do
+    | [] -> return acc
+    | b :: rest -> return reverse_buffers(xs: rest, acc: b :: acc)
+  end
+end
+
+let records_to_buffers = fn (xs: [DocumentRecord], acc: [WorkspaceBuffer]) -> [WorkspaceBuffer] do
+  match xs do
+    | [] -> return reverse_buffers(xs: acc, acc: [])
+    | DocumentRecord(uri, text, version: _) :: rest ->
+      return records_to_buffers(xs: rest, acc: WorkspaceBuffer(uri, text) :: acc)
+  end
+end
+
+let document_store_to_buffers = fn (store: DocumentStore, acc: [WorkspaceBuffer]) -> [WorkspaceBuffer] do
+  match store do | DocumentStore(records) ->
+    return records_to_buffers(xs: records, acc)
+  end
+end
+
+let symbol_infos_to_json_items = fn (xs: [SymbolInformation], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return reverse_jsonvals(xs: acc, acc: [])
+    | s :: rest -> return symbol_infos_to_json_items(xs: rest, acc: symbol_information_to_json(s) :: acc)
+  end
+end
+
+let workspace_symbol_query = fn (params: JsonValue) -> string do
+  match get_field(obj: params, key: "query") do
+    | None -> return ""
+    | Some(val: v) ->
+      match v do
+        | JsonString(val: s) -> return s
+        | _ -> return ""
+      end
+  end
+end
+
+export let on_workspace_symbol = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let query = workspace_symbol_query(params)
+  let buffers = document_store_to_buffers(store: state_documents(state), acc: [])
+  let symbols = find_workspace_symbols(buffers, query)
+  let items = symbol_infos_to_json_items(xs: symbols, acc: [])
+  return HandlerResult(
+    state,
+    response: Some(val: JsonArray(items)),
+    notifications: []
+  )
+end
+
+// ─── Handler: on_shutdown ────────────────────────────────────────────────────
+
+export let on_shutdown = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let _ = params
+  return HandlerResult(
+    state: with_lifecycle_shutdown(state),
+    response: Some(val: JsonNull),
+    notifications: []
+  )
+end

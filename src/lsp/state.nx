@@ -1,0 +1,254 @@
+/**
+ * lsp/state: server state types + accessors.
+ *
+ * Owns the document buffer store, the per-URI diagnostics cache, the
+ * `ServerState` aggregate, and the small `require_object_field` helper
+ * shared by every handler that decodes wire JSON.
+ *
+ * Split out of `lsp/handlers.nx` so the dispatch layer can stay focused on
+ * method routing while the value types and their accessors live alongside
+ * each other. No public-API change: every export here was an export (or
+ * an internal let) in the old `handlers.nx`; callers in `lsp/main.nx`
+ * and the sibling handler modules continue to import the same names.
+ */
+
+import {
+  JsonValue, get_field
+} from "std:json"
+import { Option, Some, None } from "std:option"
+import {
+  Diagnostic,
+  LspProtocolError
+} from "src/lsp/protocol.nx"
+
+// ─── Server-not-initialized error code (LSP spec §3.6) ───────────────────────
+
+export let server_not_initialized = fn () -> i64 do return -32002 end
+
+// ─── Document buffer state ───────────────────────────────────────────────────
+//
+// LSP servers track open documents keyed by `uri`. Full-content sync stores
+// the latest text + version; the version is the integer the client last
+// sent in `didOpen` / `didChange`. A list-based assoc structure is fine for
+// MVP — typical editors keep tens of files open, and lookup/update is
+// linear in that count.
+
+export type DocumentRecord = DocumentRecord(
+  uri: string,
+  text: string,
+  version: i64
+)
+
+export type DocumentStore = DocumentStore(records: [DocumentRecord])
+
+export let documents_empty = fn () -> DocumentStore do
+  return DocumentStore(records: [])
+end
+
+let docs_lookup_go = fn (xs: [DocumentRecord], uri: string) -> Option<DocumentRecord> do
+  match xs do
+    | [] -> return None
+    | r :: rest ->
+      match r do | DocumentRecord(uri: u, text: _, version: _) ->
+        if u == uri then return Some(val: r) end
+        return docs_lookup_go(xs: rest, uri)
+      end
+  end
+end
+
+/// Look up the latest record for `uri`. Returns `None` if no document with
+/// this URI is open.
+export let documents_lookup = fn (store: DocumentStore, uri: string) -> Option<DocumentRecord> do
+  match store do | DocumentStore(records) ->
+    return docs_lookup_go(xs: records, uri)
+  end
+end
+
+let reverse_records = fn (xs: [DocumentRecord], acc: [DocumentRecord]) -> [DocumentRecord] do
+  match xs do
+    | [] -> return acc
+    | r :: rest -> return reverse_records(xs: rest, acc: r :: acc)
+  end
+end
+
+let reverse_records_then_append = fn (xs: [DocumentRecord], tail: [DocumentRecord]) -> [DocumentRecord] do
+  match xs do
+    | [] -> return tail
+    | r :: rest -> return reverse_records_then_append(xs: rest, tail: r :: tail)
+  end
+end
+
+let docs_remove_go = fn (xs: [DocumentRecord], uri: string, acc: [DocumentRecord]) -> [DocumentRecord] do
+  match xs do
+    | [] -> return reverse_records(xs: acc, acc: [])
+    | r :: rest ->
+      match r do | DocumentRecord(uri: u, text: _, version: _) ->
+        if u == uri then
+          return reverse_records_then_append(xs: acc, tail: rest)
+        end
+        return docs_remove_go(xs: rest, uri, acc: r :: acc)
+      end
+  end
+end
+
+/// Insert or replace the record for `uri`. Existing entries with the same
+/// URI are removed first so each URI maps to at most one record.
+export let documents_put = fn (store: DocumentStore, rec: DocumentRecord) -> DocumentStore do
+  match store do | DocumentStore(records) ->
+    match rec do | DocumentRecord(uri, text: _, version: _) ->
+      let pruned = docs_remove_go(xs: records, uri, acc: [])
+      return DocumentStore(records: rec :: pruned)
+    end
+  end
+end
+
+/// Remove the record for `uri` (no-op if absent).
+export let documents_remove = fn (store: DocumentStore, uri: string) -> DocumentStore do
+  match store do | DocumentStore(records) ->
+    return DocumentStore(records: docs_remove_go(xs: records, uri, acc: []))
+  end
+end
+
+// ─── Typed per-URI diagnostics cache ─────────────────────────────────────────
+//
+// One row per open URI, carrying the most recent `(version, diagnostics)` pair
+// from the typecheck pipeline. Replacing the old `ServerState.user_data:
+// JsonValue` slot with a typed list drops the JSON encode/decode round-trip
+// that every cache read used to incur.
+
+export type DiagCacheEntry = DiagCacheEntry(
+  uri: string,
+  version: i64,
+  diagnostics: [Diagnostic]
+)
+
+let cache_lookup_go = fn (xs: [DiagCacheEntry], uri: string, version: i64) -> Option<[Diagnostic]> do
+  match xs do
+    | [] -> return None
+    | DiagCacheEntry(uri: u, version: v, diagnostics: d) :: rest ->
+      if u == uri && v == version then return Some(val: d) end
+      return cache_lookup_go(xs: rest, uri, version)
+  end
+end
+
+export let cache_lookup = fn (cache: [DiagCacheEntry], uri: string, version: i64) -> Option<[Diagnostic]> do
+  return cache_lookup_go(xs: cache, uri, version)
+end
+
+let reverse_cache = fn (xs: [DiagCacheEntry], acc: [DiagCacheEntry]) -> [DiagCacheEntry] do
+  match xs do
+    | [] -> return acc
+    | e :: rest -> return reverse_cache(xs: rest, acc: e :: acc)
+  end
+end
+
+// Strip any existing row for `uri`, then prepend the fresh entry.
+let cache_drop_uri = fn (xs: [DiagCacheEntry], uri: string, acc: [DiagCacheEntry]) -> [DiagCacheEntry] do
+  match xs do
+    | [] -> return reverse_cache(xs: acc, acc: [])
+    | DiagCacheEntry(uri: u, version: v, diagnostics: d) :: rest ->
+      if u == uri then return cache_drop_uri(xs: rest, uri, acc) end
+      return cache_drop_uri(xs: rest, uri, acc: DiagCacheEntry(uri: u, version: v, diagnostics: d) :: acc)
+  end
+end
+
+export let cache_put = fn (cache: [DiagCacheEntry], uri: string, version: i64, diagnostics: [Diagnostic]) -> [DiagCacheEntry] do
+  let pruned = cache_drop_uri(xs: cache, uri, acc: [])
+  return DiagCacheEntry(uri, version, diagnostics) :: pruned
+end
+
+// ─── Server state ────────────────────────────────────────────────────────────
+//
+// Tracks lifecycle phase, open documents, and the typed diagnostics cache.
+
+export type Lifecycle =
+    LifecycleUninitialized
+  | LifecycleRunning
+  | LifecycleShutdown
+
+export type ServerState = ServerState(
+  lifecycle: Lifecycle,
+  documents: DocumentStore,
+  diagnostics_cache: [DiagCacheEntry]
+)
+
+export let empty_state = fn () -> ServerState do
+  return ServerState(
+    lifecycle: LifecycleUninitialized,
+    documents: documents_empty(),
+    diagnostics_cache: []
+  )
+end
+
+// ─── State accessors ─────────────────────────────────────────────────────────
+
+export let state_documents = fn (state: ServerState) -> DocumentStore do
+  match state do | ServerState(lifecycle: _, documents, diagnostics_cache: _) ->
+    return documents
+  end
+end
+
+export let state_cache = fn (state: ServerState) -> [DiagCacheEntry] do
+  match state do | ServerState(lifecycle: _, documents: _, diagnostics_cache) ->
+    return diagnostics_cache
+  end
+end
+
+export let with_documents = fn (state: ServerState, docs: DocumentStore) -> ServerState do
+  match state do | ServerState(lifecycle, documents: _, diagnostics_cache) ->
+    return ServerState(lifecycle, documents: docs, diagnostics_cache)
+  end
+end
+
+export let with_cache = fn (state: ServerState, cache: [DiagCacheEntry]) -> ServerState do
+  match state do | ServerState(lifecycle, documents, diagnostics_cache: _) ->
+    return ServerState(lifecycle, documents, diagnostics_cache: cache)
+  end
+end
+
+export let with_lifecycle_running = fn (state: ServerState) -> ServerState do
+  match state do | ServerState(lifecycle: _, documents, diagnostics_cache) ->
+    return ServerState(lifecycle: LifecycleRunning, documents, diagnostics_cache)
+  end
+end
+
+export let with_lifecycle_shutdown = fn (state: ServerState) -> ServerState do
+  match state do | ServerState(lifecycle: _, documents, diagnostics_cache) ->
+    return ServerState(lifecycle: LifecycleShutdown, documents, diagnostics_cache)
+  end
+end
+
+export let lifecycle_is_uninitialized = fn (state: ServerState) -> bool do
+  match state do | ServerState(lifecycle, documents: _, diagnostics_cache: _) ->
+    match lifecycle do
+      | LifecycleUninitialized -> return true
+      | _ -> return false
+    end
+  end
+end
+
+export let lifecycle_is_shutdown = fn (state: ServerState) -> bool do
+  match state do | ServerState(lifecycle, documents: _, diagnostics_cache: _) ->
+    match lifecycle do
+      | LifecycleShutdown -> return true
+      | _ -> return false
+    end
+  end
+end
+
+// ─── JSON object-field helper (shared across handlers) ───────────────────────
+
+export let require_object_field = fn (obj: JsonValue, key: string, ctx: string) -> JsonValue throws { Exn } do
+  match get_field(obj, key) do
+    | Some(val: v) -> return v
+    | None -> raise LspProtocolError(msg: ctx ++ ": missing '" ++ key ++ "'")
+  end
+end
+
+// ─── HandlerResult: per-handler return shape ─────────────────────────────────
+
+export type HandlerResult = HandlerResult(
+  state: ServerState,
+  response: Option<JsonValue>,
+  notifications: [JsonValue]
+)
