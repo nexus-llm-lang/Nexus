@@ -1,0 +1,318 @@
+/**
+ * lsp/workspace_symbol: resolve workspace/symbol requests.
+ *
+ * Cross-file symbol search across every open `.nx` document the editor has
+ * advertised through `didOpen` / `didChange`. Each open buffer is parsed in
+ * isolation (no import walk — that's the definition/references path's job);
+ * top-level definitions are flattened into a single `[SymbolInformation]`
+ * stream, then filtered by case-insensitive substring match against the
+ * query.
+ *
+ * SymbolKind mapping (LSP spec integer codes via `lsp/protocol.SymbolKind`):
+ *   TLLet (lambda value)         -> Function
+ *   TLLet (non-lambda value)     -> Variable
+ *   TLEnum                       -> Class
+ *   TLEnum.variants              -> Constructor (flattened — workspace/symbol
+ *                                  is a flat list per LSP spec; variants are
+ *                                  surfaced alongside their parent enum so the
+ *                                  picker can jump straight to a constructor
+ *                                  by name)
+ *   TLCap                        -> Class
+ *   TLCap.functions              -> Method (flattened)
+ *   TLTypeDef (record)           -> Class
+ *   TLException                  -> Constructor
+ *   TLExceptionGroup             -> Module
+ *   TLImport                     -> omitted (LSP convention — `import` is a
+ *                                  reference, not a definition)
+ *
+ * Filtering:
+ *   The query is the case-insensitive substring the client typed into its
+ *   workspace quick-jump panel. An empty query returns every symbol — some
+ *   clients call this on workspace open to populate the panel up-front.
+ *
+ * Order:
+ *   Source order within each document, document order across documents
+ *   (whatever order `DocumentStore` keeps; the current store prepends new
+ *   `didOpen` records so the most-recently-opened buffer leads the list).
+ *
+ * Coordinate model:
+ *   Span 1-based -> LSP 0-based, single-line range widened by the identifier
+ *   name length — mirrors `lsp/symbols.single_line_range` so workspace-symbol
+ *   and document-symbol agree on a symbol's location.
+ *
+ * Failure mode:
+ *   Per-document parse failure is swallowed (the buffer is too broken to
+ *   ground a symbol table); the broken document contributes zero entries and
+ *   the walk continues with the next buffer. Symbol search never crashes the
+ *   LSP loop.
+ */
+
+import { Option, Some, None } from "std:option"
+import * as parser from "src/frontend/parser.nx"
+import {
+  Program, SpannedTopLevel,
+  TLLet, TLEnum, TLCap, TLTypeDef, TLException, TLExceptionGroup, TLImport,
+  GlobalLet, EnumDef, VariantDef, Cap, FunctionSig,
+  RecordDef, ExceptionDef, ExceptionGroupDef,
+  ExprLambda, SpannedExpr
+} from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import {
+  Position, Range, Location,
+  SymbolInformation, SymbolKind,
+  SymbolKindFunction, SymbolKindVariable, SymbolKindClass,
+  SymbolKindMethod, SymbolKindConstructor, SymbolKindModule
+} from "src/lsp/protocol.nx"
+import * as str from "std:str"
+
+// ─── Buffer record ───────────────────────────────────────────────────────────
+//
+// A minimal (uri, text) pair fed into the workspace walker. The LSP handler
+// adapts its `DocumentStore` to this shape so the walker stays decoupled from
+// the server's wider record types (version, diagnostics cache slot, etc.).
+
+export type WorkspaceBuffer = WorkspaceBuffer(uri: string, text: string)
+
+// ─── Coordinate translation ──────────────────────────────────────────────────
+
+let saturating_pred = fn (n: i64) -> i64 do
+  if n <= 0 then return 0 end
+  return n - 1
+end
+
+let span_to_position = fn (sp: Span) -> Position do
+  match sp do | Span(offset: _, line, col) ->
+    return Position(
+      line: saturating_pred(n: line),
+      character: saturating_pred(n: col)
+    )
+  end
+end
+
+let single_line_range = fn (sp: Span, name_len: i64) -> Range do
+  let start = span_to_position(sp)
+  match start do | Position(line: l, character: c) ->
+    let end_pos = Position(line: l, character: c + name_len)
+    return Range(start, end_: end_pos)
+  end
+end
+
+// ─── Lambda detection (TLLet → Function vs Variable) ─────────────────────────
+
+let is_lambda_value = fn (value: SpannedExpr) -> bool do
+  match value do | SpannedExpr(node, span: _) ->
+    match node do
+      | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: _) ->
+        return true
+      | _ -> return false
+    end
+  end
+end
+
+// ─── Substring filtering (case-insensitive ASCII) ────────────────────────────
+//
+// The LSP spec leaves the matching algorithm up to the server; case-insensitive
+// substring is the de-facto convention (VSCode's built-in client uses it as a
+// fallback when the server doesn't pre-filter). ASCII-only `to_lower` matches
+// what `nxlib/stdlib/str` ships today; future Unicode case-folding is an
+// orthogonal upgrade applied to both sides of the comparison.
+
+let matches_query = fn (name: string, query_lower: string) -> bool do
+  if str.length(s: query_lower) == 0 then return true end
+  let name_lower = str.to_lower(s: name)
+  return str.contains(s: name_lower, sub: query_lower)
+end
+
+// ─── SymbolInformation builders ──────────────────────────────────────────────
+
+let make_symbol_info = fn (
+  name: string,
+  kind: SymbolKind,
+  file: string,
+  span: Span,
+  container: Option<string>
+) -> SymbolInformation do
+  let nlen = str.length(s: name)
+  let r = single_line_range(sp: span, name_len: nlen)
+  return SymbolInformation(
+    name,
+    kind,
+    location: Location(uri: file, range: r),
+    container_name: container
+  )
+end
+
+// Variants of an enum: flat entries in the workspace stream. Each variant
+// reuses its parent enum's Span (the parser does not thread per-variant spans
+// today); `container_name` carries the enum identifier so two enums sharing a
+// variant name (e.g. `Ok` from `Result` vs `Ok` from a custom enum) remain
+// distinguishable in the picker.
+let collect_variants = fn (
+  parent_name: string, parent_span: Span, vs: [VariantDef],
+  file: string, query_lower: string, acc: [SymbolInformation]
+) -> [SymbolInformation] do
+  match vs do
+    | [] -> return acc
+    | VariantDef(name, fields: _) :: rest ->
+      let acc2 = if matches_query(name, query_lower) then
+        make_symbol_info(name, kind: SymbolKindConstructor, file,
+          span: parent_span, container: Some(val: parent_name)) :: acc
+      else
+        acc
+      end
+      return collect_variants(parent_name, parent_span, vs: rest, file, query_lower, acc: acc2)
+  end
+end
+
+let collect_methods = fn (
+  parent_name: string, parent_span: Span, sigs: [FunctionSig],
+  file: string, query_lower: string, acc: [SymbolInformation]
+) -> [SymbolInformation] do
+  match sigs do
+    | [] -> return acc
+    | FunctionSig(name, params: _, ret_type: _, requires: _, throw_row: _) :: rest ->
+      let acc2 = if matches_query(name, query_lower) then
+        make_symbol_info(name, kind: SymbolKindMethod, file,
+          span: parent_span, container: Some(val: parent_name)) :: acc
+      else
+        acc
+      end
+      return collect_methods(parent_name, parent_span, sigs: rest, file, query_lower, acc: acc2)
+  end
+end
+
+// ─── Top-level dispatch ──────────────────────────────────────────────────────
+
+let collect_top_level = fn (
+  defs: [SpannedTopLevel], file: string, query_lower: string,
+  acc: [SymbolInformation]
+) -> [SymbolInformation] do
+  match defs do
+    | [] -> return acc
+    | SpannedTopLevel(node, span) :: rest ->
+      let acc2 = match node do
+        | TLLet(def) ->
+          match def do | GlobalLet(name, is_public: _, typ: _, value) ->
+            if matches_query(name, query_lower) then
+              let kind = if is_lambda_value(value) then SymbolKindFunction else SymbolKindVariable end
+              make_symbol_info(name, kind, file, span, container: None) :: acc
+            else
+              acc
+            end
+          end
+        | TLEnum(def) ->
+          match def do | EnumDef(name, is_public: _, is_opaque: _, type_params: _, variants) ->
+            let acc_self = if matches_query(name, query_lower) then
+              make_symbol_info(name, kind: SymbolKindClass, file, span, container: None) :: acc
+            else
+              acc
+            end
+            collect_variants(parent_name: name, parent_span: span, vs: variants,
+              file, query_lower, acc: acc_self)
+          end
+        | TLCap(def) ->
+          match def do | Cap(name, is_public: _, functions) ->
+            let acc_self = if matches_query(name, query_lower) then
+              make_symbol_info(name, kind: SymbolKindClass, file, span, container: None) :: acc
+            else
+              acc
+            end
+            collect_methods(parent_name: name, parent_span: span, sigs: functions,
+              file, query_lower, acc: acc_self)
+          end
+        | TLTypeDef(def) ->
+          match def do | RecordDef(name, is_public: _, type_params: _, fields: _) ->
+            if matches_query(name, query_lower) then
+              make_symbol_info(name, kind: SymbolKindClass, file, span, container: None) :: acc
+            else
+              acc
+            end
+          end
+        | TLException(def) ->
+          match def do | ExceptionDef(name, is_public: _, fields: _) ->
+            if matches_query(name, query_lower) then
+              make_symbol_info(name, kind: SymbolKindConstructor, file, span, container: None) :: acc
+            else
+              acc
+            end
+          end
+        | TLExceptionGroup(def) ->
+          match def do | ExceptionGroupDef(name, is_public: _, members: _) ->
+            if matches_query(name, query_lower) then
+              make_symbol_info(name, kind: SymbolKindModule, file, span, container: None) :: acc
+            else
+              acc
+            end
+          end
+        | TLImport(def: _) -> acc
+      end
+      return collect_top_level(defs: rest, file, query_lower, acc: acc2)
+  end
+end
+
+let reverse_symbols = fn (xs: [SymbolInformation], acc: [SymbolInformation]) -> [SymbolInformation] do
+  match xs do
+    | [] -> return acc
+    | s :: rest -> return reverse_symbols(xs: rest, acc: s :: acc)
+  end
+end
+
+// Per-document symbol collection. Parse failure surfaces as an empty list;
+// the driver continues with the next buffer so one malformed file never
+// hides the symbols of the rest.
+let collect_for_document = fn (
+  uri: string, text: string, query_lower: string
+) -> [SymbolInformation] do
+  try
+    let prog = parser.parse_source(src: text)
+    match prog do | Program(definitions, module_doc: _) ->
+      let rev = collect_top_level(defs: definitions, file: uri, query_lower, acc: [])
+      return reverse_symbols(xs: rev, acc: [])
+    end
+  catch _ ->
+    return []
+  end
+end
+
+// Concat two lists left-to-right preserving order.
+let append_symbols = fn (xs: [SymbolInformation], ys: [SymbolInformation]) -> [SymbolInformation] do
+  match xs do
+    | [] -> return ys
+    | x :: rest -> return x :: append_symbols(xs: rest, ys)
+  end
+end
+
+// ─── Driver ──────────────────────────────────────────────────────────────────
+
+/** Workspace-symbol search across a list of `(uri, text)` buffers. */
+/** */
+/** Each buffer is parsed independently; top-level definitions are flattened */
+/** and filtered by case-insensitive substring match against `query`. An */
+/** empty `query` returns every symbol from every buffer. Order is */
+/** "documents in input order, defs in source order within each document". */
+/** */
+/** This pure function takes a plain list rather than the LSP-internal */
+/** `DocumentStore` so tests can drive it without constructing a server */
+/** state. The LSP handler in `handlers.nx` adapts `DocumentStore` to this */
+/** shape at the call site. */
+export let find_workspace_symbols = fn (
+  buffers: [WorkspaceBuffer],
+  query: string
+) -> [SymbolInformation] do
+  let query_lower = str.to_lower(s: query)
+  return walk_buffers(buffers, query_lower, acc: [])
+end
+
+let walk_buffers = fn (
+  buffers: [WorkspaceBuffer],
+  query_lower: string,
+  acc: [SymbolInformation]
+) -> [SymbolInformation] do
+  match buffers do
+    | [] -> return acc
+    | WorkspaceBuffer(uri, text) :: rest ->
+      let chunk = collect_for_document(uri, text, query_lower)
+      let acc2 = append_symbols(xs: acc, ys: chunk)
+      return walk_buffers(buffers: rest, query_lower, acc: acc2)
+  end
+end

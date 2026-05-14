@@ -1,0 +1,173 @@
+// Issue nexus-iq17: workspace/symbol — cross-file flat symbol search.
+//
+// Two open buffers are exposed as a WorkspaceBuffer list:
+//   buffer://iq17_a.nx — defines `apple` (function), `apricot` (variable),
+//                        and enum `Fruit { Apple | Banana }`.
+//   buffer://iq17_b.nx — defines `banana_func` (function) and type
+//                        record `Box`.
+//
+// Query "apple" matches the function `apple` plus the enum variant `Apple`
+// (case-insensitive substring). Query "" returns every symbol.
+// Across both buffers we exercise SymbolKindFunction, SymbolKindVariable,
+// SymbolKindClass (enum + record), and SymbolKindConstructor (variant).
+import { find_workspace_symbols, WorkspaceBuffer } from "src/lsp/workspace_symbol.nx"
+import * as test_assert from "std:test/assert"
+import {
+  SymbolInformation, Location, Range, Position,
+  SymbolKind, SymbolKindRaw,
+  symbol_kind_to_int
+} from "src/lsp/protocol.nx"
+import { Option, Some, None } from "std:option"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+let buffer_a_text = fn () -> string do
+  return "let apple = fn (x: i64) -> i64 do\n"
+      ++ "  return x + 1\n"
+      ++ "end\n"
+      ++ "let apricot = 42\n"
+      ++ "type Fruit = Apple | Banana\n"
+end
+
+let buffer_b_text = fn () -> string do
+  return "let banana_func = fn (n: i64) -> i64 do\n"
+      ++ "  return n * 2\n"
+      ++ "end\n"
+      ++ "type Box = { value: i64 }\n"
+end
+
+let make_buffers = fn () -> [WorkspaceBuffer] do
+  return [
+    WorkspaceBuffer(uri: "buffer://iq17_a.nx", text: buffer_a_text()),
+    WorkspaceBuffer(uri: "buffer://iq17_b.nx", text: buffer_b_text())
+  ]
+end
+
+let count_syms = fn (xs: [SymbolInformation], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_syms(xs: rest, acc: acc + 1)
+  end
+end
+
+// Sentinel SymbolInformation used when a lookup misses; the assert
+// machinery checks the surrounding match arms, so a non-matching sentinel
+// surfaces as an explicit RuntimeError below rather than a silent miss.
+let zero_range = fn () -> Range do
+  return Range(start: Position(line: 0, character: 0), end_: Position(line: 0, character: 0))
+end
+
+let none_sym = fn () -> SymbolInformation do
+  return SymbolInformation(
+    name: "",
+    kind: SymbolKindRaw(code: -1),
+    location: Location(uri: "", range: zero_range()),
+    container_name: None
+  )
+end
+
+let find_by_name = fn (xs: [SymbolInformation], name: string) -> SymbolInformation do
+  match xs do
+    | [] -> return none_sym()
+    | s :: rest ->
+      match s do | SymbolInformation(name: n, kind: _, location: _, container_name: _) ->
+        if n == name then return s end
+        return find_by_name(xs: rest, name)
+      end
+  end
+end
+
+let assert_kind = fn (sym: SymbolInformation, expected_code: i64, label: string) -> unit throws { Exn } do
+  match sym do | SymbolInformation(name: _, kind, location: _, container_name: _) ->
+    test_assert.assert_eq_i64(actual: symbol_kind_to_int(k: kind),
+      expected: expected_code, label)
+  end
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  // ── Empty query: every symbol from both buffers ─────────────────────────
+  let all = find_workspace_symbols(buffers: make_buffers(), query: "")
+  // Buffer A: apple, apricot, Fruit, Apple (variant), Banana (variant) = 5
+  // Buffer B: banana_func, Box = 2
+  // Total: 7
+  test_assert.assert_eq_i64(actual: count_syms(xs: all, acc: 0),
+    expected: 7, label: "empty query returns every symbol across both buffers")
+
+  // Kinds (LSP spec): Function=12, Variable=13, Class=5, Constructor=9.
+  let apple = find_by_name(xs: all, name: "apple")
+  assert_kind(sym: apple, expected_code: 12, label: "`apple` is Function")
+  match apple do | SymbolInformation(name: _, kind: _, location: Location(uri, range: _), container_name: _) ->
+    test_assert.assert_eq_string(actual: uri,
+      expected: "buffer://iq17_a.nx",
+      label: "`apple` location URI matches buffer A")
+  end
+
+  let apricot = find_by_name(xs: all, name: "apricot")
+  assert_kind(sym: apricot, expected_code: 13, label: "`apricot` is Variable (non-lambda let)")
+
+  let fruit = find_by_name(xs: all, name: "Fruit")
+  assert_kind(sym: fruit, expected_code: 5, label: "`Fruit` is Class (enum)")
+
+  let apple_variant = find_by_name(xs: all, name: "Apple")
+  assert_kind(sym: apple_variant, expected_code: 9, label: "`Apple` variant is Constructor")
+  match apple_variant do | SymbolInformation(name: _, kind: _, location: _, container_name) ->
+    match container_name do
+      | None -> raise RuntimeError(val: "expected container_name=Some(\"Fruit\")")
+      | Some(val: c) ->
+        test_assert.assert_eq_string(actual: c, expected: "Fruit",
+          label: "`Apple` variant container is `Fruit`")
+    end
+  end
+
+  let banana_func = find_by_name(xs: all, name: "banana_func")
+  assert_kind(sym: banana_func, expected_code: 12, label: "`banana_func` is Function (buffer B)")
+  match banana_func do | SymbolInformation(name: _, kind: _, location: Location(uri, range: _), container_name: _) ->
+    test_assert.assert_eq_string(actual: uri,
+      expected: "buffer://iq17_b.nx",
+      label: "`banana_func` URI matches buffer B")
+  end
+
+  let box = find_by_name(xs: all, name: "Box")
+  assert_kind(sym: box, expected_code: 5, label: "`Box` record is Class")
+
+  // ── Query "apple" (case-insensitive): function `apple` + variant `Apple` ──
+  let apple_hits = find_workspace_symbols(buffers: make_buffers(), query: "apple")
+  test_assert.assert_eq_i64(actual: count_syms(xs: apple_hits, acc: 0),
+    expected: 2, label: "query 'apple' matches `apple` (fn) and `Apple` (variant)")
+
+  // ── Query "APPLE" matches the same (case-insensitive). ─────────────────
+  let upper_hits = find_workspace_symbols(buffers: make_buffers(), query: "APPLE")
+  test_assert.assert_eq_i64(actual: count_syms(xs: upper_hits, acc: 0),
+    expected: 2, label: "query 'APPLE' (uppercase) matches same names case-insensitively")
+
+  // ── Query "banana" matches Banana (variant in A) + banana_func (B). ────
+  let banana_hits = find_workspace_symbols(buffers: make_buffers(), query: "banana")
+  test_assert.assert_eq_i64(actual: count_syms(xs: banana_hits, acc: 0),
+    expected: 2, label: "query 'banana' matches across buffer boundary")
+
+  // ── Query with no matches returns []. ────────────────────────────────
+  let none_hits = find_workspace_symbols(buffers: make_buffers(), query: "xyzzy")
+  test_assert.assert_eq_i64(actual: count_syms(xs: none_hits, acc: 0),
+    expected: 0, label: "query 'xyzzy' matches nothing")
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end

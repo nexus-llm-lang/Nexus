@@ -99,6 +99,9 @@ import {
   semantic_tokens_legend
 } from "src/lsp/semantic_tokens.nx"
 import {
+  find_workspace_symbols, WorkspaceBuffer
+} from "src/lsp/workspace_symbol.nx"
+import {
   ServerCapabilities, TdsFull,
   InitializeResult, ServerInfo,
   initialize_params_from_json, initialize_result_to_json,
@@ -117,6 +120,7 @@ import {
   semantic_tokens_to_json,
   location_to_json,
   document_symbol_to_json,
+  SymbolInformation, symbol_information_to_json,
   DiagSevError,
   LspProtocolError
 } from "src/lsp/protocol.nx"
@@ -575,7 +579,13 @@ let on_initialize = fn (state: ServerState, params: JsonValue) -> HandlerResult 
     semantic_tokens_provider: Some(val: SemanticTokensOptions(
       legend: semantic_tokens_legend(),
       full: true
-    ))
+    )),
+    /// workspace/symbol routes through
+    /// `src/lsp/workspace_symbol.find_workspace_symbols`. Each open document
+    /// contributes its top-level lets / caps / types / exceptions to a flat
+    /// SymbolInformation stream, filtered by case-insensitive substring
+    /// match against the client query (issue nexus-iq17).
+    workspace_symbol_provider: Some(val: true)
   )
   let info = ServerInfo(name: "nexus-lsp", version: Some(val: "0.1.0"))
   let result = InitializeResult(capabilities: caps, server_info: Some(val: info))
@@ -1129,6 +1139,65 @@ let on_semantic_tokens = fn (state: ServerState, params: JsonValue) -> HandlerRe
   )
 end
 
+// ─── Handler: workspace/symbol ───────────────────────────────────────────────
+//
+// Walks every open buffer's top-level definitions and returns a flat
+// `SymbolInformation[]` filtered by the client's case-insensitive query.
+// `params.query` is required by the spec; we tolerate its absence by
+// defaulting to "" (all symbols) so a misbehaving client still gets a
+// useful response instead of InvalidParams.
+
+let document_store_to_buffers = fn (store: DocumentStore, acc: [WorkspaceBuffer]) -> [WorkspaceBuffer] do
+  match store do | DocumentStore(records) ->
+    return records_to_buffers(xs: records, acc)
+  end
+end
+
+let records_to_buffers = fn (xs: [DocumentRecord], acc: [WorkspaceBuffer]) -> [WorkspaceBuffer] do
+  match xs do
+    | [] -> return reverse_buffers(xs: acc, acc: [])
+    | DocumentRecord(uri, text, version: _) :: rest ->
+      return records_to_buffers(xs: rest, acc: WorkspaceBuffer(uri, text) :: acc)
+  end
+end
+
+let reverse_buffers = fn (xs: [WorkspaceBuffer], acc: [WorkspaceBuffer]) -> [WorkspaceBuffer] do
+  match xs do
+    | [] -> return acc
+    | b :: rest -> return reverse_buffers(xs: rest, acc: b :: acc)
+  end
+end
+
+let symbol_infos_to_json_items = fn (xs: [SymbolInformation], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return reverse_jsonvals(xs: acc, acc: [])
+    | s :: rest -> return symbol_infos_to_json_items(xs: rest, acc: symbol_information_to_json(s) :: acc)
+  end
+end
+
+let workspace_symbol_query = fn (params: JsonValue) -> string do
+  match get_field(obj: params, key: "query") do
+    | None -> return ""
+    | Some(val: v) ->
+      match v do
+        | JsonString(val: s) -> return s
+        | _ -> return ""
+      end
+  end
+end
+
+let on_workspace_symbol = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Fs, Console } throws { Exn } do
+  let query = workspace_symbol_query(params)
+  let buffers = document_store_to_buffers(store: state_documents(state), acc: [])
+  let symbols = find_workspace_symbols(buffers, query)
+  let items = symbol_infos_to_json_items(xs: symbols, acc: [])
+  return HandlerResult(
+    state,
+    response: Some(val: JsonArray(items)),
+    notifications: []
+  )
+end
+
 // ─── Method-name dispatch ────────────────────────────────────────────────────
 //
 // Direct switch on method name. Returns `HandlerResult` with `response: None`
@@ -1154,6 +1223,7 @@ let invoke_method = fn (
   if method == "textDocument/references" then return on_references(state, params) end
   if method == "textDocument/signatureHelp" then return on_signature_help(state, params) end
   if method == "textDocument/semanticTokens/full" then return on_semantic_tokens(state, params) end
+  if method == "workspace/symbol" then return on_workspace_symbol(state, params) end
   // Unknown method → None response sentinel; request dispatch turns it into
   // MethodNotFound, notifications collapse to a no-op.
   let _ = params
