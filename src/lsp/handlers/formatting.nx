@@ -1,0 +1,94 @@
+/**
+ * lsp/handlers/formatting: textDocument/formatting → fmt pipeline bridge.
+ *
+ * Reads the buffered document text the LSP server tracks (via the
+ * `DocumentRecord` cached on didOpen / didChange), passes it through the
+ * pure `src/tools/fmt.format_source` helper, and returns a single
+ * full-document `TextEdit` whose `range` covers the entire buffer.
+ *
+ * Why full-document edit:
+ *   The fmt pipeline operates on whole sources. Producing a minimal-diff
+ *   `TextEdit[]` would require diffing the input against the formatted
+ *   output token-by-token; that's a strictly additive refinement that can
+ *   come later without changing this handler's surface. Clients apply the
+ *   replace atomically — `range` (0,0)..(end_line, end_char) followed by
+ *   `newText` = formatted source.
+ *
+ * Failure policy:
+ *   `format_source` is a byte-level pass that cannot fail (it preserves
+ *   string / comment / bracket regions verbatim and emits whitespace deltas
+ *   only). If a future formatter pass needs to bail on unparseable input,
+ *   `compute_formatting_edits` returns `[]` — an empty array is the LSP
+ *   "no edits" reply, which is safer than a partial fmt that would discard
+ *   the user's work.
+ */
+
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+import {
+  Position, Range, TextEdit
+} from "src/lsp/protocol.nx"
+import { DocumentRecord } from "src/lsp/state.nx"
+import { format_source } from "src/tools/fmt.nx"
+
+// ─── End-of-document coordinate ──────────────────────────────────────────────
+//
+// LSP positions are 0-based (line, character). The "end of document" position
+// is one past the last byte: (last_line, last_line_length). Counting newlines
+// gives `line`; the index of the last newline gives the prefix; the remaining
+// bytes after that newline (or the whole buffer if no newline) give
+// `character`. An empty document maps to (0, 0).
+
+let count_newlines = fn (s: string, pos: i64, len: i64, acc: i64) -> i64 do
+  if pos >= len then return acc end
+  let b = str.byte_at(s, idx: pos)
+  if b == '\n' then return count_newlines(s, pos: pos + 1, len, acc: acc + 1) end
+  return count_newlines(s, pos: pos + 1, len, acc)
+end
+
+// Walk backwards from `len-1` until we find a '\n' or reach the start. Return
+// the byte index of the last newline, or -1 if none. The resulting character
+// column for the document end is `len - (last_nl + 1)`.
+let find_last_newline = fn (s: string, pos: i64) -> i64 do
+  if pos < 0 then return -1 end
+  let b = str.byte_at(s, idx: pos)
+  if b == '\n' then return pos end
+  return find_last_newline(s, pos: pos - 1)
+end
+
+/// Compute the LSP end-of-document Position for `text`.
+/// Empty / null buffer → (0, 0).
+/// Buffer ending in `\n` → (line_count, 0).
+/// Buffer with trailing non-newline → (line_count, trailing_byte_count).
+export let end_of_document_position = fn (text: string) -> Position do
+  let len = str.byte_length(s: text)
+  if len <= 0 then return Position(line: 0, character: 0) end
+  let lines = count_newlines(s: text, pos: 0, len, acc: 0)
+  let last_nl = find_last_newline(s: text, pos: len - 1)
+  let last_char = len - (last_nl + 1)
+  return Position(line: lines, character: last_char)
+end
+
+// ─── Edit construction ───────────────────────────────────────────────────────
+
+/// Compute the formatting edits for a buffered document. Returns an empty
+/// list when no formatting change is needed (`format_source(text) == text`);
+/// otherwise returns a single TextEdit replacing the full document.
+///
+/// `doc_opt` follows the same `Option<DocumentRecord>` shape every handler
+/// gets from `documents_lookup` — `None` (no buffer cached for this URI)
+/// also maps to `[]` (nothing to format).
+export let compute_formatting_edits = fn (doc_opt: Option<DocumentRecord>) -> [TextEdit] do
+  match doc_opt do
+    | None -> return []
+    | Some(val: rec) ->
+      match rec do | DocumentRecord(uri: _, text, version: _) ->
+        let formatted = format_source(src: text)
+        if formatted == text then return [] end
+        let start = Position(line: 0, character: 0)
+        let end_pos = end_of_document_position(text)
+        let range = Range(start, end_: end_pos)
+        return [TextEdit(range, new_text: formatted)]
+      end
+  end
+end
