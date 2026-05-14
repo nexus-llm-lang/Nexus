@@ -1,0 +1,400 @@
+/**
+ * semantic_types: MIR-side semantic type inference & layout helpers for LIR
+ * lowering.
+ *
+ * Owns:
+ * - Semantic type inference (per MirExpr) and binary-op result typing
+ * - Record builder: atoms → semantic record type
+ * - Record field resolution (sorted-name index + type lookup)
+ * - Canonical alphabetical sorting for MirParam / LirCallArg / LirNamedAtom
+ * - Monomorphic reverse helpers for NamedType / MirParam / LirCallArg /
+ *   LirNamedAtom (re-exported for lir.nx)
+ *
+ * Does not own:
+ * - LowerCtx & atom helpers (see src/ir/lir/context.nx)
+ * - Match-tree construction (see src/ir/lir/match_tree.nx)
+ * - Body / statement / function lowering (see src/ir/lir.nx)
+ */
+import { BinaryOp, TypeExpr, TyRecord, NamedType, TyArrow } from "src/common/ast.nx"
+import { LirError, LirFieldOnNonVariable, LirFieldOnNonRecord, LirFieldNotInRecord } from "src/common/error.nx"
+import { Some, None } from "std:option"
+import { MirExpr, MirStmt, MirParam, MirCallArg, MirMatchCase, MirNamedExpr } from "src/ir/mir_types.nx"
+import { LirAtom, LirCallArg, LirNamedAtom } from "src/ir/lir_types.nx"
+import { LowerCtx, lir_lookup_type, atom_type } from "src/ir/lir/context.nx"
+import * as str from "std:str"
+
+// ─── Semantic Type Inference ─────────────────────────────────────────────────
+
+export let infer_semantic_type = fn (expr: MirExpr, ctx: LowerCtx) -> TypeExpr throws { LirError } do
+  match ctx do | LowerCtx(vars: _, semantic_vars: sv, stmts: _, temp_counter: _, enum_defs: _) ->
+    match expr do
+      | MirVariable(name: n) ->
+        match lir_lookup_type(name: n, entries: sv) do
+          | Some(val: t) -> return t
+          | None -> return TyI64
+        end
+      | MirCall(func: _, args: _, ret_type: rt) -> return rt
+      | MirLiteral(lit: l) ->
+        match l do
+          | LitInt(_) -> return TyI64
+          | LitFloat(_) -> return TyF64
+          | LitBool(_) -> return TyBool
+          | LitChar(_) -> return TyChar
+          | LitString(_) -> return TyString
+          | LitUnit -> return TyUnit
+        end
+      | MirConstructor(_) -> return TyI64
+      | MirBinaryOp(left: _, op, right: _) ->
+        match op do
+          | OpConcat -> return TyString
+          | OpEq -> return TyBool
+          | OpNe -> return TyBool
+          | OpLt -> return TyBool
+          | OpLe -> return TyBool
+          | OpGt -> return TyBool
+          | OpGe -> return TyBool
+          | OpFEq -> return TyBool
+          | OpFNe -> return TyBool
+          | OpFLt -> return TyBool
+          | OpFLe -> return TyBool
+          | OpFGt -> return TyBool
+          | OpFGe -> return TyBool
+          | OpAnd -> return TyBool
+          | OpOr -> return TyBool
+          | OpFAdd -> return TyF64
+          | OpFSub -> return TyF64
+          | OpFMul -> return TyF64
+          | OpFDiv -> return TyF64
+          | _ -> return TyI64
+        end
+      | MirIf(cond: _, then_body: tb, else_body: _) ->
+        return infer_stmts_type(stmts: tb, ctx)
+      | MirMatch(target: _, cases: cs) ->
+        match cs do
+          | MirMatchCase(pattern: _, body: b) :: _ ->
+            return infer_stmts_type(stmts: b, ctx)
+          | [] -> return TyUnit
+        end
+      | MirRecord(fields: fs) ->
+        return TyRecord(fields: infer_record_field_types(fields: fs, ctx))
+      | MirMakeClosure(_) -> return TyI64
+      | MirCallClosure(closure: _, args: _, ret_type: rt) -> return rt
+      | MirEnvLoad(_) -> return TyI64
+      | _ -> return TyI64
+    end
+  end
+end
+
+/** Resolve the real return type of a closure-call site. The MIR side stores a */
+/** TyI64 placeholder when lowering a variable-call; the actual TyArrow lives */
+/** in semantic_vars (populated at function entry from the param's declared */
+/** type). Falls back to the MIR-supplied type for non-variable callees. */
+export let resolve_closure_ret_type = fn (clos: MirExpr, fallback: TypeExpr, ctx: LowerCtx) -> TypeExpr throws { LirError } do
+  if let MirVariable(name: n) = clos then
+    match ctx do | LowerCtx(vars: _, semantic_vars: sv, stmts: _, temp_counter: _, enum_defs: _) ->
+      if let Some(val: TyArrow(params: _, ret: r, requires: _, throw_row: _)) = lir_lookup_type(name: n, entries: sv) then
+        return r
+      else
+        return fallback
+      end
+    end
+  else
+    return fallback
+  end
+end
+
+export let infer_record_field_types = fn (fields: [MirNamedExpr], ctx: LowerCtx) -> [NamedType] throws { LirError } do
+  return infer_record_field_types_go(fields, ctx, acc: [])
+end
+
+let infer_record_field_types_go = fn (fields: [MirNamedExpr], ctx: LowerCtx, acc: [NamedType]) -> [NamedType] throws { LirError } do
+  match fields do
+    | [] -> return rev_named_types(lst: acc, out: [])
+    | MirNamedExpr(name: n, value: e) :: rest ->
+      let ft = infer_semantic_type(expr: e, ctx)
+      return infer_record_field_types_go(fields: rest, ctx, acc: NamedType(name: n, typ: ft) :: acc)
+  end
+end
+
+export let infer_stmts_type = fn (stmts: [MirStmt], ctx: LowerCtx) -> TypeExpr throws { LirError } do
+  match stmts do
+    | [] -> return TyUnit
+    | [s] ->
+      // Last statement determines the type
+      match s do
+        | MirStmtExpr(expr: e) -> return infer_semantic_type(expr: e, ctx)
+        | MirStmtReturn(expr: e) -> return infer_semantic_type(expr: e, ctx)
+        | _ -> return TyUnit
+      end
+    | _ :: rest -> return infer_stmts_type(stmts: rest, ctx)
+  end
+end
+
+export let is_semantic_string = fn (t: TypeExpr) -> bool throws { LirError } do
+  return if let TyString = t then true else false end
+end
+
+// ─── Binary Type Inference ───────────────────────────────────────────────────
+
+export let infer_binary_type = fn (op: BinaryOp, lhs_type: TypeExpr, rhs_type: TypeExpr) -> TypeExpr throws { LirError } do
+  match op do
+    | OpEq -> return TyBool
+    | OpNe -> return TyBool
+    | OpLt -> return TyBool
+    | OpLe -> return TyBool
+    | OpGt -> return TyBool
+    | OpGe -> return TyBool
+    | OpFEq -> return TyBool
+    | OpFNe -> return TyBool
+    | OpFLt -> return TyBool
+    | OpFLe -> return TyBool
+    | OpFGt -> return TyBool
+    | OpFGe -> return TyBool
+    | OpAnd -> return TyBool
+    | OpOr -> return TyBool
+    | OpConcat -> return TyString
+    | OpFAdd -> return TyF64
+    | OpFSub -> return TyF64
+    | OpFMul -> return TyF64
+    | OpFDiv -> return TyF64
+    | OpAdd ->
+      match lhs_type do
+        | TyString -> return TyString
+        | TyF64 -> return TyF64
+        | _ -> return TyI64
+      end
+    | OpSub ->
+      match lhs_type do
+        | TyF64 -> return TyF64
+        | _ -> return TyI64
+      end
+    | OpMul ->
+      match lhs_type do
+        | TyF64 -> return TyF64
+        | _ -> return TyI64
+      end
+    | OpDiv ->
+      match lhs_type do
+        | TyF64 -> return TyF64
+        | _ -> return TyI64
+      end
+    | OpMod -> return TyI64
+    | _ -> return lhs_type
+  end
+end
+
+// Character-by-character string comparison (lexicographic less-than)
+let lir_str_less_than_loop = fn (a: string, b: string, idx: i64, la: i64, lb: i64) -> bool throws { LirError } do
+  if idx >= la then
+    return idx < lb
+  else if idx >= lb then
+    return false
+  else
+    let ca = str.char_code(s: a, idx)
+    let cb = str.char_code(s: b, idx)
+    if ca < cb then
+      return true
+    else if ca > cb then
+      return false
+    else
+      return lir_str_less_than_loop(a, b, idx: idx + 1, la, lb)
+    end
+  end
+end
+
+export let lir_str_less_than = fn (a: string, b: string) -> bool throws { LirError } do
+  return lir_str_less_than_loop(a, b, idx: 0, la: str.length(s: a), lb: str.length(s: b))
+end
+
+// ─── Sorting helpers (alphabetical by label) ────────────────────────────────
+
+let insert_mir_param = fn (p: MirParam, sorted: [MirParam]) -> [MirParam] throws { LirError } do
+  return insert_mir_param_go(p, sorted, acc: [])
+end
+
+let insert_mir_param_go = fn (p: MirParam, sorted: [MirParam], acc: [MirParam]) -> [MirParam] throws { LirError } do
+  match sorted do
+    | [] -> return rev_mir_params(lst: acc, out: [p])
+    | head :: rest ->
+      match p do | MirParam(label: la, name: _, typ: _) ->
+        match head do | MirParam(label: lb, name: _, typ: _) ->
+          if lir_str_less_than(a: la, b: lb) then
+            return rev_mir_params(lst: acc, out: p :: sorted)
+          else
+            return insert_mir_param_go(p, sorted: rest, acc: head :: acc)
+          end
+        end
+      end
+  end
+end
+
+export let sort_mir_params = fn (params: [MirParam]) -> [MirParam] throws { LirError } do
+  match params do
+    | [] -> return []
+    | p :: rest -> return insert_mir_param(p, sorted: sort_mir_params(params: rest))
+  end
+end
+
+let insert_lir_call_arg = fn (a: LirCallArg, sorted: [LirCallArg]) -> [LirCallArg] throws { LirError } do
+  return insert_lir_call_arg_go(a, sorted, acc: [])
+end
+
+let insert_lir_call_arg_go = fn (a: LirCallArg, sorted: [LirCallArg], acc: [LirCallArg]) -> [LirCallArg] throws { LirError } do
+  match sorted do
+    | [] -> return rev_lir_call_args(lst: acc, out: [a])
+    | head :: rest ->
+      match a do | LirCallArg(label: la, value: _) ->
+        match head do | LirCallArg(label: lb, value: _) ->
+          if lir_str_less_than(a: la, b: lb) then
+            return rev_lir_call_args(lst: acc, out: a :: sorted)
+          else
+            return insert_lir_call_arg_go(a, sorted: rest, acc: head :: acc)
+          end
+        end
+      end
+  end
+end
+
+export let sort_lir_call_args = fn (args: [LirCallArg]) -> [LirCallArg] throws { LirError } do
+  match args do
+    | [] -> return []
+    | a :: rest -> return insert_lir_call_arg(a, sorted: sort_lir_call_args(args: rest))
+  end
+end
+
+let insert_lir_named_atom = fn (a: LirNamedAtom, sorted: [LirNamedAtom]) -> [LirNamedAtom] throws { LirError } do
+  return insert_lir_named_atom_go(a, sorted, acc: [])
+end
+
+let insert_lir_named_atom_go = fn (a: LirNamedAtom, sorted: [LirNamedAtom], acc: [LirNamedAtom]) -> [LirNamedAtom] throws { LirError } do
+  match sorted do
+    | [] -> return rev_lir_named_atoms(lst: acc, out: [a])
+    | head :: rest ->
+      match a do | LirNamedAtom(name: na, value: _) ->
+        match head do | LirNamedAtom(name: nb, value: _) ->
+          if lir_str_less_than(a: na, b: nb) then
+            return rev_lir_named_atoms(lst: acc, out: a :: sorted)
+          else
+            return insert_lir_named_atom_go(a, sorted: rest, acc: head :: acc)
+          end
+        end
+      end
+  end
+end
+
+export let sort_lir_named_atoms = fn (atoms: [LirNamedAtom]) -> [LirNamedAtom] throws { LirError } do
+  match atoms do
+    | [] -> return []
+    | a :: rest -> return insert_lir_named_atom(a, sorted: sort_lir_named_atoms(atoms: rest))
+  end
+end
+
+// ─── Record Semantic Type Builder ────────────────────────────────────────────
+
+export let build_record_semantic_type = fn (atoms: [LirNamedAtom], ctx: LowerCtx) -> TypeExpr throws { LirError } do
+  return TyRecord(fields: build_named_types_from_atoms(atoms, ctx))
+end
+
+let build_named_types_from_atoms = fn (atoms: [LirNamedAtom], ctx: LowerCtx) -> [NamedType] throws { LirError } do
+  return build_named_types_from_atoms_go(atoms, ctx, acc: [])
+end
+
+let build_named_types_from_atoms_go = fn (atoms: [LirNamedAtom], ctx: LowerCtx, acc: [NamedType]) -> [NamedType] throws { LirError } do
+  match atoms do
+    | [] -> return rev_named_types(lst: acc, out: [])
+    | LirNamedAtom(name: n, value: v) :: rest ->
+      let sem = match v do
+        | LirAtomVar(name: vn, typ: _) ->
+          match ctx do | LowerCtx(vars: _, semantic_vars: sv, stmts: _, temp_counter: _, enum_defs: _) ->
+            match lir_lookup_type(name: vn, entries: sv) do
+              | Some(val: t) -> t
+              | None -> wasm_to_semantic(typ: atom_type(atom: v))
+            end
+          end
+        | _ -> wasm_to_semantic(typ: atom_type(atom: v))
+      end
+      return build_named_types_from_atoms_go(atoms: rest, ctx, acc: NamedType(name: n, typ: sem) :: acc)
+  end
+end
+
+let wasm_to_semantic = fn (typ: TypeExpr) -> TypeExpr throws { LirError } do
+  // Best-effort reverse mapping from WASM type to semantic type
+  match typ do
+    | TyI32 -> return TyI64
+    | TyF64 -> return TyF64
+    | TyI64 -> return TyI64
+    | _ -> return typ
+  end
+end
+
+// ─── Record Field Resolution ────────────────────────────────────────────────
+
+export type FieldResolution = FieldResolution(index: i64, typ: TypeExpr)
+
+let sorted_named_type_index = fn (target: string, fields: [NamedType]) -> i64 throws { LirError } do
+  match fields do
+    | [] -> return 0
+    | NamedType(name: n, typ: _) :: rest ->
+      if lir_str_less_than(a: n, b: target) then
+        return 1 + sorted_named_type_index(target, fields: rest)
+      else
+        return sorted_named_type_index(target, fields: rest)
+      end
+  end
+end
+
+let find_named_type = fn (target: string, fields: [NamedType]) -> TypeExpr throws { LirError } do
+  match fields do
+    | [] -> raise LirFieldNotInRecord(field: target)
+    | NamedType(name: n, typ: t) :: rest ->
+      if n == target then return t
+      else return find_named_type(target, fields: rest)
+      end
+  end
+end
+
+export let resolve_record_field = fn (atom: LirAtom, field: string, ctx: LowerCtx) -> FieldResolution throws { LirError } do
+  if let LirAtomVar(name: n, typ: _) = atom then
+    match ctx do | LowerCtx(vars: _, semantic_vars: sv, stmts: _, temp_counter: _, enum_defs: _) ->
+      match lir_lookup_type(name: n, entries: sv) do
+        | Some(val: TyRecord(fields: fs)) ->
+          let idx = sorted_named_type_index(target: field, fields: fs)
+          let ft = find_named_type(target: field, fields: fs)
+          return FieldResolution(index: idx, typ: ft)
+        | _ -> raise LirFieldOnNonRecord(field, variable: n)
+      end
+    end
+  else
+    raise LirFieldOnNonVariable(field)
+  end
+end
+
+// ─── Local type-specific reverses (see src/common/mono_reverse.nx) ─────────────
+
+export let rev_named_types = fn (lst: [NamedType], out: [NamedType]) -> [NamedType] throws { LirError } do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_named_types(lst: rest, out: x :: out)
+  end
+end
+
+export let rev_mir_params = fn (lst: [MirParam], out: [MirParam]) -> [MirParam] throws { LirError } do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_mir_params(lst: rest, out: x :: out)
+  end
+end
+
+export let rev_lir_call_args = fn (lst: [LirCallArg], out: [LirCallArg]) -> [LirCallArg] throws { LirError } do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_lir_call_args(lst: rest, out: x :: out)
+  end
+end
+
+export let rev_lir_named_atoms = fn (lst: [LirNamedAtom], out: [LirNamedAtom]) -> [LirNamedAtom] throws { LirError } do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_lir_named_atoms(lst: rest, out: x :: out)
+  end
+end
