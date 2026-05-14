@@ -144,6 +144,34 @@ than another's — e.g. injecting a mock repo only around a specific test step
 while keeping logging available throughout. If both handlers want the same
 scope, write one `inject`.
 
+## Handler arm `with @ k` (named continuation binder)
+
+Inside a handler arm body, the resumption continuation is implicitly in
+scope. The `with @ name` clause **binds the continuation to an explicit
+name** for the body, shadowing the implicit form. Useful when an arm needs
+to capture-and-defer (e.g. enqueue the continuation, run it on another
+thread, or invoke it more than once).
+
+```nexus
+let yielding_sched = handler Coroutine do
+  fn yield(val: i64) -> i64 with @ k do
+    // `k` is the continuation; calling it with the resume value steps
+    // the suspended computation forward by one tick.
+    enqueue(task: @k)
+    return 0  // arm returns to whoever called yield, not to the user code
+  end
+end
+```
+
+- The bare arm form `fn yield(val: i64) -> i64 do ... end` still works
+  without `with @ k` — the continuation is just unnameable.
+- Without `with @ k`, calling-the-continuation syntax (`resume(val: ...)`)
+  exposes it under a fixed implicit name; the explicit form lets you choose
+  the name (`k`, `kont`, `cc`, etc.) and is required if the arm body
+  contains a nested closure that wants to capture the continuation.
+- Parsed by `src/frontend/parser.nx::parse_optional_with_kont`; carried as
+  `cont_binder: Option<string>` on `HandlerArm` in `src/common/ast.nx`.
+
 ## Error Handling Patterns
 
 ### Result-based (prefer for recoverable errors)
@@ -398,6 +426,48 @@ end)
 // Consume (f receives each element as linear)
 array.consume(arr: %arr, f: fn (val: %i64) -> unit do end)
 ```
+
+## Bitwise OR (`|`)
+
+The `|` operator is bitwise-or on integers. The compiler resolves `|` to
+either pattern alternation (`| Pat -> ...`) or bitwise-or based on lookahead
+to the next `->` at depth 0.
+
+```nexus
+let masked = 12 | 10   // bitwise-or: 0b1100 | 0b1010 = 0b1110 = 14
+```
+
+### Disambiguation rule
+
+At the **tail expression** of a match/catch arm body, `|` defers to the
+outer arm parser when followed by a pattern + `->` at depth 0. To force
+bitwise-or in tail position, wrap with parens:
+
+```nexus
+// Tail-position bitwise-or — needs parens:
+match x do
+  | 0 -> 256
+  | _ -> (x | 1)        // OK
+end
+
+// Without parens, this would re-enter arm parsing:
+match x do
+  | 0 -> 256
+  | _ -> x | 1          // parse error: `1` expected to be followed by `->`
+end
+```
+
+Other operator positions don't need disambiguation:
+
+```nexus
+let v = a | b           // OK — let-rhs is unambiguous
+let w = (a | b) + c     // OK — paren'd
+if (flags | MASK) != 0 then ... end   // OK — if-cond is unambiguous
+```
+
+The disambiguation logic lives in `src/frontend/parser.nx::parse_prec_loop`
+via `pcore.pipe_starts_arm` (depth-tracking lookahead scan, 64-token fuel
+cap).
 
 ## Lazy Evaluation & Parallel Execution
 
