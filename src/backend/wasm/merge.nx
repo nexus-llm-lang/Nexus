@@ -293,6 +293,121 @@ let remap_dep_locals = fn (remap: %ByteBuffer, dep_fimp: i64, d_loc: i64,
     off: kept_fimp + n_stubs - dep_fimp)
 end
 
+// ─── Section assembly helpers ─────────────────────────────────────────────
+// Extracted from merge_with_stdlib's inline section emission. Each owns one
+// of WASM's structurally distinct sections in the merged output. Keeping the
+// per-section logic self-contained makes the orchestrator readable as a
+// sequence of "emit section N" steps rather than a 230-line straight-line
+// assembler. All helpers thread %out linearly and free their temp buffers
+// before returning.
+
+/** Section 2 (imports): env.memory + dep imports (type-offset) + main */
+/** non-stdlib imports. `pages` is the chosen initial-page count for the */
+/** shared memory import; `dep_imp_count` counts dep import entries. */
+let emit_merged_imports = fn (out: %ByteBuffer, dep: &ByteBuffer, core_wasm: &ByteBuffer,
+                              d_imp_pk: i64, m_imp_sec_pk: i64,
+                              dep_imp_count: i64, m_kept_all: i64,
+                              pages: i64, d_type_off: i64, m_type_off: i64) -> %ByteBuffer do
+  let total_imp_count = dep_imp_count + m_kept_all + 1
+  let %tmp_i = bb.empty()
+  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: total_imp_count)
+  // env.memory import (memory 0)
+  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: 3)
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 101)  // 'e'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 110)  // 'n'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 118)  // 'v'
+  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: 6)
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 109)  // 'm'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 101)  // 'e'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 109)  // 'm'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 111)  // 'o'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 114)  // 'r'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 121)  // 'y'
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 2)    // import desc: memory
+  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 3)    // limits flags: has-max | shared
+  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: pages)
+  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: 65536)
+  // Copy dep imports with type offset
+  let %tmp_i = if d_imp_pk > 0 then
+    copy_imports_with_type_off(out: %tmp_i, buf: dep,
+      pos: sec_body(buf: dep, sec_pk: d_imp_pk), remaining: dep_imp_count, type_off: d_type_off)
+  else %tmp_i end
+  let %tmp_i = copy_main_kept_imps(out: %tmp_i, buf: core_wasm, sec_pk: m_imp_sec_pk, type_off: m_type_off)
+  let %out = emit_sec(%out, sec_id: 2, content: &tmp_i)
+  bb.free(buf: %tmp_i)
+  return %out
+end
+
+/** Section 3 (function types): count header followed by dep entries verbatim */
+/** and main entries with type-offset applied. Function-section count must */
+/** equal code-section count (WASM §5.5.6/§5.5.10), so we key off the code */
+/** sections to keep the two in lock-step. */
+let emit_merged_func_types = fn (out: %ByteBuffer, dep: &ByteBuffer, core_wasm: &ByteBuffer,
+                                 d_func_sec_pk: i64, m_func_sec_pk: i64,
+                                 d_code_cnt: i64, m_code_cnt: i64,
+                                 n_stubs: i64, m_type_off: i64) -> %ByteBuffer do
+  let %tmp_f = bb.empty()
+  let n_total_funcs = n_stubs + d_code_cnt + m_code_cnt
+  let %tmp_f = bb.push_uleb128(buf: %tmp_f, val: n_total_funcs)
+  // Dep func types: NO offset (dep types first)
+  let %tmp_f = copy_sec_body(buf: %tmp_f, src: dep, sec_pk: d_func_sec_pk)
+  // Main func types: offset by m_type_off
+  let %tmp_f = if m_func_sec_pk > 0 then
+    copy_func_types_with_off(out: %tmp_f, buf: core_wasm, sec_pk: m_func_sec_pk, off: m_type_off)
+  else %tmp_f end
+  let %out = emit_sec(%out, sec_id: 3, content: &tmp_f)
+  bb.free(buf: %tmp_f)
+  return %out
+end
+
+/** Section 4 (tables): dep tables + main's extra tables (skipping main's */
+/** first table — that one is replaced by dep's). When main has only its */
+/** default table, falls through to a raw copy of dep's section. */
+let emit_merged_tables = fn (out: %ByteBuffer, dep: &ByteBuffer, core_wasm: &ByteBuffer,
+                             d_tbl_pk: i64, m_tbl_pk: i64,
+                             d_tbl_count: i64, m_tbl_total: i64, m_type_off: i64) -> %ByteBuffer do
+  if m_tbl_total > 1 then
+    let %tmp_t = bb.empty()
+    let %tmp_t = bb.push_uleb128(buf: %tmp_t, val: d_tbl_count + m_tbl_total - 1)
+    let %tmp_t = if d_tbl_pk > 0 then
+      let d_off = sec_off(pk: d_tbl_pk)
+      let d_sz = sec_sz(pk: d_tbl_pk)
+      let d_cnt_pk = rd_uleb(buf: dep, pos: d_off)
+      bb.copy_range(dst: %tmp_t, src: dep, start: ppos(pk: d_cnt_pk), end_pos: d_off + d_sz)
+    else %tmp_t end
+    let m_off = sec_off(pk: m_tbl_pk)
+    let m_sz = sec_sz(pk: m_tbl_pk)
+    let m_cnt_pk = rd_uleb(buf: core_wasm, pos: m_off)
+    let after_first = skip_table_entry(buf: core_wasm, pos: ppos(pk: m_cnt_pk))
+    let %tmp_t = copy_table_entries_with_type_off(buf: %tmp_t, src: core_wasm, pos: after_first, end_pos: m_off + m_sz, off: m_type_off)
+    return emit_sec_and_free(%out, sec_id: 4, tmp: %tmp_t)
+  end
+  return copy_raw_sec(%out, src: dep, sec_pk: d_tbl_pk, sec_id: 4)
+end
+
+/** Section 10 (code): n_stubs stub bodies + dep bodies (rewritten) + main */
+/** bodies (rewritten). Use actual code-section counts so the header matches */
+/** the bodies written by rewrite_code_bodies. */
+let emit_merged_code = fn (out: %ByteBuffer, dep: &ByteBuffer, core_wasm: &ByteBuffer,
+                           remap_d: &ByteBuffer, remap_m: &ByteBuffer,
+                           d_code_sec_pk: i64, m_code_sec_pk: i64,
+                           d_code_count: i64, m_code_count: i64,
+                           n_stubs: i64, m_type_off: i64,
+                           d_tbl_count: i64, d_glo: i64) -> %ByteBuffer do
+  let %tmp_c = bb.empty()
+  let %tmp_c = bb.push_uleb128(buf: %tmp_c, val: d_code_count + m_code_count)
+  let %tmp_c = emit_stub_bodies(out: %tmp_c, i: 0, n: n_stubs)
+  let dep_rw_ctx = RwCtx(type_off: 0, tbl_off: 0, glo_off: 0)
+  let %tmp_c = maybe_rewrite_bodies(ctx: dep_rw_ctx, remap: remap_d, buf: %tmp_c, src: dep, sec_pk: d_code_sec_pk)
+  // Main code bodies — rewrite with intarr-backed func remap (remap_m covers
+  // all main fidxs: imports 0..m_fimp, locals m_fimp..m_fimp+m_loc)
+  let rw_ctx = RwCtx(type_off: m_type_off, tbl_off: d_tbl_count - 1, glo_off: d_glo)
+  let %tmp_c = maybe_rewrite_bodies(ctx: rw_ctx, remap: remap_m, buf: %tmp_c, src: core_wasm, sec_pk: m_code_sec_pk)
+  let %out = emit_sec(%out, sec_id: 10, content: &tmp_c)
+  bb.free(buf: %tmp_c)
+  return %out
+end
+
 // ─── Full merge assembler ─────────────────────────────────────────────────
 export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) -> %ByteBuffer throws { FileNotFound } do
   let %dep = bb.read_binary_file(path: stdlib_path)
@@ -347,8 +462,8 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   let d_glo = count_sec(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 6))
   let d_tbl_count = count_sec(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 4))
 
-  // Assemble output — all section emission inlined to avoid parameter-passing bugs
-  // in Nexus functions with many params (param sorting causes confusion)
+  // Assemble output — section emission is split into per-section helpers
+  // above. Orchestrator stays a straight sequence of "emit section N" steps.
   let %out = assemble_header()
 
   // Section 1: merged types (DEP first, then main)
@@ -382,38 +497,12 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   // byte 0x03 = has-max (0x01) | shared (0x02); max = 65536 pages (4 GiB).
   let d_imp_pk = get_sec(map: &d_secs, sec: 2)
   let dep_imp_count = count_sec(buf: &dep, sec_pk: d_imp_pk)
-  let total_imp_count = dep_imp_count + m_kept_all + 1
-  let %tmp_i = bb.empty()
-  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: total_imp_count)
-  // env.memory import (memory 0)
-  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: 3)
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 101)  // 'e'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 110)  // 'n'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 118)  // 'v'
-  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: 6)
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 109)  // 'm'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 101)  // 'e'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 109)  // 'm'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 111)  // 'o'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 114)  // 'r'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 121)  // 'y'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 2)    // import desc: memory
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 3)    // limits flags: has-max | shared
-  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: pages)
-  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: 65536)
-  // Copy dep imports with type offset
-  let %tmp_i = if d_imp_pk > 0 then
-    copy_imports_with_type_off(out: %tmp_i, buf: &dep,
-      pos: sec_body(buf: &dep, sec_pk: d_imp_pk), remaining: dep_imp_count, type_off: d_type_off)
-  else %tmp_i end
-  let %tmp_i = copy_main_kept_imps(out: %tmp_i, buf: &core_wasm, sec_pk: m_imp_sec_pk, type_off: m_type_off)
-  let %out = emit_sec(%out, sec_id: 2, content: &tmp_i)
-  bb.free(buf: %tmp_i)
+  let %out = emit_merged_imports(%out, dep: &dep, core_wasm: &core_wasm,
+    d_imp_pk, m_imp_sec_pk,
+    dep_imp_count, m_kept_all,
+    pages, d_type_off, m_type_off)
 
   // Section 3: merged func types (count + dep with type offset + main)
-  let d_func_sec_pk = get_sec(map: &d_secs, sec: 3)
-  let m_func_sec_pk = get_sec(map: &m_secs, sec: 3)
-  let %tmp_f = bb.empty()
   // Invariant (WASM spec §5.5.6/§5.5.10): function-section count must equal
   // code-section count for any valid module, so for our inputs
   //   d_code_cnt == d_loc   and   m_code_cnt == m_loc.
@@ -425,41 +514,20 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
   // section 10 keeps the two counts in lock-step even if a future input ever
   // drifted (validation would reject the module either way, but the merge
   // would emit consistent header/body byte counts).
+  let d_func_sec_pk = get_sec(map: &d_secs, sec: 3)
+  let m_func_sec_pk = get_sec(map: &m_secs, sec: 3)
   let d_code_cnt = count_sec(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 10))
   let m_code_cnt = count_sec(buf: &core_wasm, sec_pk: get_sec(map: &m_secs, sec: 10))
-  let n_total_funcs = n_stubs + d_code_cnt + m_code_cnt
-  let %tmp_f = bb.push_uleb128(buf: %tmp_f, val: n_total_funcs)
-  // Dep func types: NO offset (dep types first)
-  let %tmp_f = copy_sec_body(buf: %tmp_f, src: &dep, sec_pk: d_func_sec_pk)
-  // Main func types: offset by m_type_off
-  let %tmp_f = if m_func_sec_pk > 0 then
-    copy_func_types_with_off(out: %tmp_f, buf: &core_wasm, sec_pk: m_func_sec_pk, off: m_type_off)
-  else %tmp_f end
-  let %out = emit_sec(%out, sec_id: 3, content: &tmp_f)
-  bb.free(buf: %tmp_f)
+  let %out = emit_merged_func_types(%out, dep: &dep, core_wasm: &core_wasm,
+    d_func_sec_pk, m_func_sec_pk,
+    d_code_cnt, m_code_cnt, n_stubs, m_type_off)
 
   // Section 4: table (dep tables + main's extra tables if any)
   let d_tbl_pk = get_sec(map: &d_secs, sec: 4)
   let m_tbl_pk = get_sec(map: &m_secs, sec: 4)
   let m_tbl_total = count_sec(buf: &core_wasm, sec_pk: m_tbl_pk)
-  let %out = if m_tbl_total > 1 then
-    let %tmp_t = bb.empty()
-    let %tmp_t = bb.push_uleb128(buf: %tmp_t, val: d_tbl_count + m_tbl_total - 1)
-    let %tmp_t = if d_tbl_pk > 0 then
-      let d_off = sec_off(pk: d_tbl_pk)
-      let d_sz = sec_sz(pk: d_tbl_pk)
-      let d_cnt_pk = rd_uleb(buf: &dep, pos: d_off)
-      bb.copy_range(dst: %tmp_t, src: &dep, start: ppos(pk: d_cnt_pk), end_pos: d_off + d_sz)
-    else %tmp_t end
-    let m_off = sec_off(pk: m_tbl_pk)
-    let m_sz = sec_sz(pk: m_tbl_pk)
-    let m_cnt_pk = rd_uleb(buf: &core_wasm, pos: m_off)
-    let after_first = skip_table_entry(buf: &core_wasm, pos: ppos(pk: m_cnt_pk))
-    let %tmp_t = copy_table_entries_with_type_off(buf: %tmp_t, src: &core_wasm, pos: after_first, end_pos: m_off + m_sz, off: m_type_off)
-    emit_sec_and_free(%out, sec_id: 4, tmp: %tmp_t)
-  else
-    copy_raw_sec(%out, src: &dep, sec_pk: d_tbl_pk, sec_id: 4)
-  end
+  let %out = emit_merged_tables(%out, dep: &dep, core_wasm: &core_wasm,
+    d_tbl_pk, m_tbl_pk, d_tbl_count, m_tbl_total, m_type_off)
   // Section 5 (defined memory) is intentionally omitted — the merged module's
   // memory is the `env.memory` import declared in section 2 above (shared, so
   // WASI-threads workers see the same backing).
@@ -482,23 +550,18 @@ export let merge_with_stdlib = fn (core_wasm: %ByteBuffer, stdlib_path: string) 
     d_buf: &dep, d_sec: get_sec(map: &d_secs, sec: 9), &remap_d,
     m_buf: &core_wasm, m_sec: get_sec(map: &m_secs, sec: 9), &remap_m)
 
-  // Section 10: merged code (stubs + dep bodies rewritten + main bodies rewritten) — inlined
+  // Section 10: merged code (stubs + dep bodies rewritten + main bodies rewritten)
+  // Use actual code section counts (must match bodies written by rewrite_code_bodies)
   let d_code_sec_pk = get_sec(map: &d_secs, sec: 10)
   let m_code_sec_pk = get_sec(map: &m_secs, sec: 10)
-  // Use actual code section counts (must match bodies written by rewrite_code_bodies)
   let d_code_count = count_sec(buf: &dep, sec_pk: d_code_sec_pk)
   let m_code_count = count_sec(buf: &core_wasm, sec_pk: m_code_sec_pk)
-  let %tmp_c = bb.empty()
-  let %tmp_c = bb.push_uleb128(buf: %tmp_c, val: d_code_count + m_code_count)
-  let %tmp_c = emit_stub_bodies(out: %tmp_c, i: 0, n: n_stubs)
-  let dep_rw_ctx = RwCtx(type_off: 0, tbl_off: 0, glo_off: 0)
-  let %tmp_c = maybe_rewrite_bodies(ctx: dep_rw_ctx, remap: &remap_d, buf: %tmp_c, src: &dep, sec_pk: d_code_sec_pk)
-  // Main code bodies — rewrite with intarr-backed func remap (remap_m covers
-  // all main fidxs: imports 0..m_fimp, locals m_fimp..m_fimp+m_loc)
-  let rw_ctx = RwCtx(type_off: m_type_off, tbl_off: d_tbl_count - 1, glo_off: d_glo)
-  let %tmp_c = maybe_rewrite_bodies(ctx: rw_ctx, remap: &remap_m, buf: %tmp_c, src: &core_wasm, sec_pk: m_code_sec_pk)
-  let %out = emit_sec(%out, sec_id: 10, content: &tmp_c)
-  bb.free(buf: %tmp_c)
+  let %out = emit_merged_code(%out, dep: &dep, core_wasm: &core_wasm,
+    remap_d: &remap_d, remap_m: &remap_m,
+    d_code_sec_pk, m_code_sec_pk,
+    d_code_count, m_code_count,
+    n_stubs, m_type_off,
+    d_tbl_count, d_glo)
 
   // Section 11: merged data (dep + main, both verbatim — codegen already used correct offsets)
   let %out = emit_merged_data(%out,
