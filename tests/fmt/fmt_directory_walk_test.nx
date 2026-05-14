@@ -1,0 +1,175 @@
+// Directory-arg expansion for `nexus fmt` (nexus-7tdn).
+//
+// v1 of the formatter only accepted FILE args. Once `nexus fmt DIR` is
+// supported, the walker has to:
+//   (a) recurse into sub-directories,
+//   (b) filter to `*.nx` so README.md / Cargo.toml / binaries aren't touched,
+//   (c) skip the hardcoded ignore list (`.git`, `.claude`, `target`,
+//       `build`, `node_modules`, and any dot-prefixed entry),
+//   (d) honor `--check` so CI exits 1 if any file in the swept tree differs.
+//
+// The fixture builds a small temp tree under /tmp and asserts the four
+// invariants. `collect_fmt_inputs` is the unit under test for (a)/(b)/(c);
+// `run_fmt_subcommand` covers (d) end-to-end.
+import * as test_assert from "std:test/assert"
+import { Fs } from "std:fs"
+import { Console } from "std:stdio"
+import * as fs_mod from "std:fs"
+import * as stdio from "std:stdio"
+import * as list from "std:list"
+import { collect_fmt_inputs, run_fmt_subcommand, format_source } from "src/fmt.nx"
+
+// Membership for string lists — std:list only ships an i64 `contains`.
+let str_list_contains = fn (xs: [string], val: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == val then return true end
+      return str_list_contains(xs: rest, val)
+  end
+end
+
+let count_list = fn (xs: [string]) -> i64 do
+  return list.length(xs)
+end
+
+// ─── Temp-tree construction ─────────────────────────────────────────────
+//
+// Per-test unique root keeps reruns idempotent and avoids cross-test
+// interference. bootstrap.sh mounts /tmp into the wasmtime sandbox.
+let root_dir = fn () -> string do
+  return "/tmp/nx_7tdn_walk"
+end
+
+// `a.nx` is already in canonical form so a `--check` sweep would say "OK"
+// for this file. `b.nx` has trailing whitespace and a missing final newline
+// — `--check` MUST flag it; a write-mode pass MUST rewrite it.
+let a_nx_text = fn () -> string do return "let a = 1\n" end
+let b_nx_text_dirty = fn () -> string do return "let b = 2   " end
+let b_nx_text_clean = fn () -> string do return "let b = 2\n" end
+let c_nx_text = fn () -> string do return "let c = 3\n" end
+let readme_text = fn () -> string do return "# not a nexus source\n" end
+let hidden_text = fn () -> string do return "let hidden = 99   \n" end
+
+let setup_tree = fn () -> unit require { Fs } throws { Exn } do
+  let root = root_dir()
+  let sub = root ++ "/sub"
+  let dot_git = root ++ "/.git"
+  let target = root ++ "/target"
+  Fs.create_dir_all(path: root)
+  Fs.create_dir_all(path: sub)
+  Fs.create_dir_all(path: dot_git)
+  Fs.create_dir_all(path: target)
+  // Top-level .nx files.
+  Fs.write_string(path: root ++ "/a.nx", content: a_nx_text())
+  Fs.write_string(path: root ++ "/b.nx", content: b_nx_text_dirty())
+  // Non-`.nx`: must be skipped by the walk even though it's a normal file.
+  Fs.write_string(path: root ++ "/README.md", content: readme_text())
+  // Subdir .nx: must be discovered by the recursive walk.
+  Fs.write_string(path: sub ++ "/c.nx", content: c_nx_text())
+  // Files inside ignored dirs MUST NOT appear in the walk result, even
+  // though their basename has the `.nx` suffix.
+  Fs.write_string(path: dot_git ++ "/hidden.nx", content: hidden_text())
+  Fs.write_string(path: target ++ "/build_artifact.nx", content: hidden_text())
+  return ()
+end
+
+let cleanup_file_if_exists = fn (path: string) -> unit require { Fs } throws { Exn } do
+  if Fs.exists(path) then
+    Fs.remove_file(path)
+  end
+  return ()
+end
+
+let cleanup_tree = fn () -> unit require { Fs } throws { Exn } do
+  let root = root_dir()
+  cleanup_file_if_exists(path: root ++ "/a.nx")
+  cleanup_file_if_exists(path: root ++ "/b.nx")
+  cleanup_file_if_exists(path: root ++ "/README.md")
+  cleanup_file_if_exists(path: root ++ "/sub/c.nx")
+  cleanup_file_if_exists(path: root ++ "/.git/hidden.nx")
+  cleanup_file_if_exists(path: root ++ "/target/build_artifact.nx")
+  // Leave the dirs themselves: Fs has no rmdir cap in v1, and an empty dir
+  // doesn't affect the next test run.
+  return ()
+end
+
+// ─── Test bodies ────────────────────────────────────────────────────────
+
+// (a) Single directory arg returns exactly the `.nx` files under it,
+//     skipping README.md and ignored directories.
+let case_single_dir = fn () -> unit require { Fs, Console } throws { Exn } do
+  let inputs = collect_fmt_inputs(paths: [root_dir()])
+  test_assert.assert_eq_i64(actual: count_list(xs: inputs), expected: 3, label: "single-dir walk count")
+  test_assert.assert_true(cond: str_list_contains(xs: inputs, val: root_dir() ++ "/a.nx"), label: "walk includes a.nx")
+  test_assert.assert_true(cond: str_list_contains(xs: inputs, val: root_dir() ++ "/b.nx"), label: "walk includes b.nx")
+  test_assert.assert_true(cond: str_list_contains(xs: inputs, val: root_dir() ++ "/sub/c.nx"), label: "walk includes sub/c.nx")
+  test_assert.assert_false(cond: str_list_contains(xs: inputs, val: root_dir() ++ "/README.md"), label: "walk skips README.md")
+  test_assert.assert_false(cond: str_list_contains(xs: inputs, val: root_dir() ++ "/.git/hidden.nx"), label: "walk skips .git/")
+  test_assert.assert_false(cond: str_list_contains(xs: inputs, val: root_dir() ++ "/target/build_artifact.nx"), label: "walk skips target/")
+  return ()
+end
+
+// (b) Mixed: dir + explicit file. The explicit file passes through verbatim
+//     (even if its name doesn't end in `.nx`), preserving v1 file-arg
+//     semantics. The dir still expands.
+let case_dir_plus_file = fn () -> unit require { Fs, Console } throws { Exn } do
+  let explicit = root_dir() ++ "/README.md"
+  let inputs = collect_fmt_inputs(paths: [root_dir() ++ "/sub", explicit])
+  // sub/ has just c.nx, plus the explicit README.md.
+  test_assert.assert_eq_i64(actual: count_list(xs: inputs), expected: 2, label: "dir+file count")
+  test_assert.assert_true(cond: str_list_contains(xs: inputs, val: root_dir() ++ "/sub/c.nx"), label: "dir+file: c.nx via sub/")
+  test_assert.assert_true(cond: str_list_contains(xs: inputs, val: explicit), label: "dir+file: README.md kept as explicit")
+  return ()
+end
+
+// (c) `--check` on a dir where ONE file would change must exit 1.
+//     b.nx is the dirty one; the rest are already canonical.
+let case_check_dir_with_dirty_file = fn () -> unit require { Fs, Console } throws { Exn } do
+  let exit_code = run_fmt_subcommand(args: ["--check", root_dir()])
+  test_assert.assert_eq_i64(actual: exit_code, expected: 1, label: "--check exit 1 when dirty file found")
+  // --check must NOT mutate the file on disk.
+  let still_dirty = Fs.read_to_string(path: root_dir() ++ "/b.nx")
+  test_assert.assert_eq_string(actual: still_dirty, expected: b_nx_text_dirty(), label: "--check leaves b.nx untouched")
+  return ()
+end
+
+// (d) Hidden / ignored directories are not recursed (verified directly via
+//     `collect_fmt_inputs`, complementing case_single_dir).
+let case_hidden_dir_skipped = fn () -> unit require { Fs, Console } throws { Exn } do
+  let inputs = collect_fmt_inputs(paths: [root_dir() ++ "/.git"])
+  // Walking a hidden dir directly (passed as an explicit arg) still walks
+  // it — the ignore-list filter applies to children encountered during
+  // recursion, not to the entry point the user named. So the user can opt
+  // in by being explicit. The hidden.nx file under .git/ should appear.
+  test_assert.assert_eq_i64(actual: count_list(xs: inputs), expected: 1, label: "explicit .git/ still walks")
+  test_assert.assert_true(cond: str_list_contains(xs: inputs, val: root_dir() ++ "/.git/hidden.nx"), label: "explicit .git/ surfaces hidden.nx")
+  return ()
+end
+
+// (e) Write mode (no --check) on a dir actually rewrites b.nx. Run last so
+//     the cleaner state doesn't disrupt case_check_dir_with_dirty_file.
+let case_write_dir_reformats = fn () -> unit require { Fs, Console } throws { Exn } do
+  let exit_code = run_fmt_subcommand(args: [root_dir()])
+  test_assert.assert_eq_i64(actual: exit_code, expected: 0, label: "write-mode exit 0")
+  let cleaned = Fs.read_to_string(path: root_dir() ++ "/b.nx")
+  test_assert.assert_eq_string(actual: cleaned, expected: b_nx_text_clean(), label: "b.nx reformatted in place")
+  // Other files left unchanged.
+  let a_after = Fs.read_to_string(path: root_dir() ++ "/a.nx")
+  test_assert.assert_eq_string(actual: a_after, expected: a_nx_text(), label: "a.nx unchanged (already clean)")
+  return ()
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } throws { Exn } do
+  inject fs_mod.system_handler, stdio.system_handler do
+    cleanup_tree()
+    setup_tree()
+    case_single_dir()
+    case_dir_plus_file()
+    case_hidden_dir_skipped()
+    case_check_dir_with_dirty_file()
+    case_write_dir_reformats()
+    cleanup_tree()
+  end
+  return ()
+end
