@@ -1,0 +1,154 @@
+/**
+ * lir_opt/propagate: combined fold + constant/copy propagation +
+ * dead-branch elimination forward pass over a LirStmt list.
+ *
+ * Extracted from src/ir/lir_opt.nx (nexus-95iz.2). Single forward walk
+ * that:
+ *   1. substitutes constants/copies into expressions (substitution.nx),
+ *   2. folds binary expressions to atoms where possible (folding.nx),
+ *   3. inlines the live branch of LirStmtIf when its condition folds
+ *      to a constant bool (dead-branch elimination).
+ *
+ * Multiply-bound Let names are excluded from the propagation table:
+ * match-expression lowering binds the same result_name in several
+ * branches plus a default, so the compile-time atom may differ from the
+ * runtime value. The orchestrator computes the multi-bound set with
+ * `opt_find_multi(opt_let_names_stmts(body))` and passes it through.
+ *
+ * Preserves the backtrace-stability contract: never reorders or removes
+ * raises / returns / try-catch / tail-calls; the only structural edit
+ * is inlining the live arm of a constant-condition if-statement, which
+ * preserves all bt_push/bt_pop pairings.
+ */
+
+import { LirStmt, LirAtom } from "src/ir/lir_types.nx"
+import { OptSubstEntry, FoldResult, opt_has_name,
+         reverse_stmts_opt } from "src/ir/lir_opt/helpers.nx"
+import { opt_subst_atom, opt_subst_opt_atom,
+         opt_subst_expr } from "src/ir/lir_opt/substitution.nx"
+import { opt_fold_expr } from "src/ir/lir_opt/folding.nx"
+
+// ─── Combined Fold + Propagate Pass ─────────────────────────────────────────
+
+export let opt_fp_stmts = fn (stmts: [LirStmt], subst: [OptSubstEntry], multi: [string]) -> FoldResult do
+  return opt_fp_stmts_go(stmts, subst, multi, acc: [])
+end
+
+let opt_fp_stmts_go = fn (stmts: [LirStmt], subst: [OptSubstEntry], multi: [string], acc: [LirStmt]) -> FoldResult do
+  match stmts do
+    | [] -> return FoldResult(stmts: reverse_stmts_opt(lst: acc, out: []), subst)
+    | s :: rest ->
+      match opt_fp_stmt(stmt: s, subst, multi) do | FoldResult(stmts: processed, subst: new_subst) ->
+        let new_acc = opt_prepend_reversed(stmts: processed, acc)
+        return opt_fp_stmts_go(stmts: rest, subst: new_subst, multi, acc: new_acc)
+      end
+  end
+end
+
+// Prepend a short list (processed stmts) to acc in reverse order (for later reversal)
+let opt_prepend_reversed = fn (stmts: [LirStmt], acc: [LirStmt]) -> [LirStmt] do
+  match stmts do
+    | [] -> return acc
+    | s :: rest -> return opt_prepend_reversed(stmts: rest, acc: s :: acc)
+  end
+end
+
+let opt_fp_stmt = fn (stmt: LirStmt, subst: [OptSubstEntry], multi: [string]) -> FoldResult do
+  match stmt do
+    | LirStmtLet(name: n, typ: t, expr: e) ->
+      let subst_expr = opt_subst_expr(expr: e, subst)
+      let folded_expr = opt_fold_expr(expr: subst_expr)
+      // Track for propagation: if result is atom (literal or variable copy)
+      // Skip multiply-bound names — not SSA-safe for copy propagation
+      let new_subst = match folded_expr do
+        | LirExprAtom(atom: a) ->
+          if opt_has_name(name: n, names: multi) then
+            subst
+          else
+            OptSubstEntry(name: n, atom: a) :: subst
+          end
+        | _ -> subst
+      end
+      return FoldResult(
+        stmts: [LirStmtLet(name: n, typ: t, expr: folded_expr)],
+        subst: new_subst
+      )
+
+    | LirStmtIf(cond: c, then_body: tb, else_body: eb) ->
+      let new_c = opt_subst_atom(atom: c, subst)
+      // Dead branch elimination: constant condition → inline live branch
+      match new_c do
+        | LirAtomBool(val: true) ->
+          return opt_fp_stmts(stmts: tb, subst, multi)
+        | LirAtomBool(val: false) ->
+          return opt_fp_stmts(stmts: eb, subst, multi)
+        | _ ->
+          let tb_r = opt_fp_stmts(stmts: tb, subst, multi)
+          let eb_r = opt_fp_stmts(stmts: eb, subst, multi)
+          match tb_r do | FoldResult(stmts: new_tb, subst: _) ->
+            match eb_r do | FoldResult(stmts: new_eb, subst: _) ->
+              return FoldResult(
+                stmts: [LirStmtIf(cond: new_c, then_body: new_tb,
+                                          else_body: new_eb)],
+                subst
+              )
+            end
+          end
+      end
+
+    | LirStmtIfReturn(cond: c, then_body: tb, then_ret: tr,
+                          else_body: eb, else_ret: er, ret_type: rt) ->
+      let new_c = opt_subst_atom(atom: c, subst)
+      let tb_r = opt_fp_stmts(stmts: tb, subst, multi)
+      let eb_r = opt_fp_stmts(stmts: eb, subst, multi)
+      match tb_r do | FoldResult(stmts: new_tb, subst: tb_subst) ->
+        match eb_r do | FoldResult(stmts: new_eb, subst: eb_subst) ->
+          return FoldResult(
+            stmts: [LirStmtIfReturn(
+              cond: new_c,
+              then_body: new_tb,
+              then_ret: opt_subst_atom(atom: tr, subst: tb_subst),
+              else_body: new_eb,
+              else_ret: opt_subst_opt_atom(opt: er, subst: eb_subst),
+              ret_type: rt
+            )],
+            subst
+          )
+        end
+      end
+
+    | LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
+      let cs_r = opt_fp_stmts(stmts: cs, subst, multi)
+      match cs_r do | FoldResult(stmts: new_cs, subst: cs_subst) ->
+        let new_c = opt_subst_atom(atom: c, subst: cs_subst)
+        let b_r = opt_fp_stmts(stmts: b, subst: cs_subst, multi)
+        match b_r do | FoldResult(stmts: new_b, subst: _) ->
+          return FoldResult(
+            stmts: [LirStmtLoop(cond_stmts: new_cs, cond: new_c,
+                                        body: new_b)],
+            subst
+          )
+        end
+      end
+
+    | LirStmtTryCatch(body: b, body_ret: br, catch_param: cp,
+                          catch_param_typ: cpt, catch_body: cb, catch_ret: cr) ->
+      let b_r = opt_fp_stmts(stmts: b, subst, multi)
+      let cb_r = opt_fp_stmts(stmts: cb, subst, multi)
+      match b_r do | FoldResult(stmts: new_b, subst: b_subst) ->
+        match cb_r do | FoldResult(stmts: new_cb, subst: cb_subst) ->
+          return FoldResult(
+            stmts: [LirStmtTryCatch(
+              body: new_b,
+              body_ret: opt_subst_opt_atom(opt: br, subst: b_subst),
+              catch_param: cp, catch_param_typ: cpt,
+              catch_body: new_cb,
+              catch_ret: opt_subst_opt_atom(opt: cr, subst: cb_subst)
+            )],
+            subst
+          )
+        end
+      end
+
+  end
+end

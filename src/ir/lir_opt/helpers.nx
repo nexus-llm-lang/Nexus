@@ -1,0 +1,176 @@
+/**
+ * lir_opt/helpers: shared utilities for the LIR optimization passes.
+ *
+ * Extracted from src/ir/lir_opt.nx (nexus-95iz.2). Owns:
+ *   - OptSubstEntry / FoldResult value types
+ *   - lookup / has_name / append_names
+ *   - opt_is_pure (intrinsic-pure expression classifier)
+ *   - Multiply-bound name detection (opt_let_names_* / opt_find_multi*)
+ *   - Local typed reverses used by every sibling pass
+ *
+ * The backtrace-stability contract is documented at the top of the
+ * orchestrator (src/ir/lir_opt.nx). All passes that consume these helpers
+ * preserve it by construction — the helpers themselves do not touch
+ * function boundaries, raises, returns, try-catch, or tail calls.
+ */
+
+import { LirProgram, LirFunction, LirExternal, LirStmt, LirExpr, LirAtom,
+         LirCallArg, LirNamedAtom } from "src/ir/lir_types.nx"
+
+// ─── Helper Types ───────────────────────────────────────────────────────────
+
+export type OptSubstEntry = OptSubstEntry(name: string, atom: LirAtom)
+export type FoldResult = FoldResult(stmts: [LirStmt], subst: [OptSubstEntry])
+
+// ─── Core Helpers ───────────────────────────────────────────────────────────
+
+export let opt_lookup = fn (name: string, entries: [OptSubstEntry]) -> Option<LirAtom> do
+  match entries do
+    | [] -> return None
+    | OptSubstEntry(name: n, atom: a) :: rest ->
+      if n == name then return Some(val: a) end
+      return opt_lookup(name, entries: rest)
+  end
+end
+
+export let opt_has_name = fn (name: string, names: [string]) -> bool do
+  match names do
+    | [] -> return false
+    | n :: rest ->
+      if n == name then return true end
+      return opt_has_name(name, names: rest)
+  end
+end
+
+export let opt_is_pure = fn (expr: LirExpr) -> bool do
+  match expr do
+    | LirExprAtom(_) -> true
+    | LirExprBinary(_) -> true
+    | LirExprConstructor(_) -> true
+    | LirExprRecord(_) -> true
+    | LirExprObjectTag(_) -> true
+    | LirExprObjectField(_) -> true
+    | LirExprMakeClosure(_) -> true
+    | LirExprCall(_) -> false
+    | LirExprTailCall(_) -> false
+    | LirExprRaise(_) -> false
+    | LirExprForce(_) -> true
+    | LirExprCallClosure(_) -> false
+    | LirExprSuspend(_) -> false
+    | LirExprResume(_) -> false
+    | LirExprContNew(_) -> false
+    | LirExprInjectResume(_) -> false
+  end
+end
+
+export let opt_append_names = fn (a: [string], b: [string]) -> [string] do
+  return opt_append_names_go(xs: a, ys: b, acc: [])
+end
+
+let opt_append_names_go = fn (xs: [string], ys: [string], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return reverse_strings(lst: acc, out: ys)
+    | x :: rest -> return opt_append_names_go(xs: rest, ys, acc: x :: acc)
+  end
+end
+
+// ─── Multiply-Bound Name Detection ─────────────────────────────────────────
+//
+// Variables bound by Let more than once (across all scopes in a function)
+// are NOT safe for copy propagation. Match-expression lowering binds the
+// same result_name in multiple if-branches plus a default, so the compile-
+// time value may differ from the runtime value.
+
+export let opt_let_names_stmt = fn (stmt: LirStmt) -> [string] do
+  match stmt do
+    | LirStmtLet(name: n, typ: _, expr: _) ->
+      [n]
+    | LirStmtIf(cond: _, then_body: tb, else_body: eb) ->
+      opt_append_names(a: opt_let_names_stmts(stmts: tb),
+                       b: opt_let_names_stmts(stmts: eb))
+    | LirStmtIfReturn(cond: _, then_body: tb, then_ret: _,
+                          else_body: eb, else_ret: _, ret_type: _) ->
+      opt_append_names(a: opt_let_names_stmts(stmts: tb),
+                       b: opt_let_names_stmts(stmts: eb))
+    | LirStmtLoop(cond_stmts: cs, cond: _, body: bd) ->
+      opt_append_names(a: opt_let_names_stmts(stmts: cs),
+                       b: opt_let_names_stmts(stmts: bd))
+    | LirStmtTryCatch(body: bd, body_ret: _, catch_param: _,
+                          catch_param_typ: _, catch_body: cb, catch_ret: _) ->
+      opt_append_names(a: opt_let_names_stmts(stmts: bd),
+                       b: opt_let_names_stmts(stmts: cb))
+  end
+end
+
+export let opt_let_names_stmts = fn (stmts: [LirStmt]) -> [string] do
+  match stmts do
+    | [] -> []
+    | s :: rest ->
+      opt_append_names(a: opt_let_names_stmt(stmt: s),
+                       b: opt_let_names_stmts(stmts: rest))
+  end
+end
+
+let opt_find_multi_go = fn (names: [string], seen: [string], multi: [string]) -> [string] do
+  match names do
+    | [] -> multi
+    | nm :: rest ->
+      if opt_has_name(name: nm, names: multi) then
+        return opt_find_multi_go(names: rest, seen, multi)
+      end
+      if opt_has_name(name: nm, names: seen) then
+        return opt_find_multi_go(names: rest, seen,
+                                 multi: nm :: multi)
+      end
+      return opt_find_multi_go(names: rest, seen: nm :: seen,
+                               multi)
+  end
+end
+
+export let opt_find_multi = fn (names: [string]) -> [string] do
+  opt_find_multi_go(names, seen: [], multi: [])
+end
+
+// ─── Local type-specific reverses (see src/common/mono_reverse.nx) ─────────────
+
+export let reverse_funcs = fn (lst: [LirFunction], out: [LirFunction]) -> [LirFunction] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_funcs(lst: rest, out: x :: out)
+  end
+end
+
+export let reverse_stmts_opt = fn (lst: [LirStmt], out: [LirStmt]) -> [LirStmt] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_stmts_opt(lst: rest, out: x :: out)
+  end
+end
+
+export let reverse_strings = fn (lst: [string], out: [string]) -> [string] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_strings(lst: rest, out: x :: out)
+  end
+end
+
+export let reverse_atoms = fn (lst: [LirAtom], out: [LirAtom]) -> [LirAtom] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_atoms(lst: rest, out: x :: out)
+  end
+end
+
+export let reverse_call_args = fn (lst: [LirCallArg], out: [LirCallArg]) -> [LirCallArg] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_call_args(lst: rest, out: x :: out)
+  end
+end
+
+export let reverse_named_atoms = fn (lst: [LirNamedAtom], out: [LirNamedAtom]) -> [LirNamedAtom] do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return reverse_named_atoms(lst: rest, out: x :: out)
+  end
+end

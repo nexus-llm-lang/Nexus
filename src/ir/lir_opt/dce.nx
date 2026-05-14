@@ -1,0 +1,310 @@
+/**
+ * lir_opt/dce: use collection + dead code elimination (standard and
+ * effect-aware).
+ *
+ * Extracted from src/ir/lir_opt.nx (nexus-95iz.2). Two stages:
+ *
+ *   1. `opt_collect_stmts` walks expressions and statements collecting
+ *      every variable name referenced as a use. The orchestrator seeds
+ *      this with the function's return atom and the body's transitive
+ *      uses.
+ *   2. `opt_dce_stmts` removes LirStmtLet bindings whose bound name is
+ *      not in the used set AND whose RHS is pure (opt_is_pure). Nested
+ *      blocks recurse.
+ *
+ * The effect-aware variant (`opt_dce_stmts_eff`) accepts a precomputed
+ * EffectMap + the program's externals and additionally drops
+ * `LirExprCall` bindings whose callee is reported pure and is not a
+ * host-capability external. Tail calls are NEVER dropped — codegen
+ * pairs `bt_pop` with the return_call so removing one would break the
+ * backtrace contract documented at the top of the orchestrator.
+ *
+ * Safety gates (fail-closed) for the effect-aware drop:
+ *   * Callee MUST appear in the EffectMap with is_pure = true.
+ *     Missing summary → keep.
+ *   * Callee MUST NOT name an LIR external (host capability — never
+ *     a DCE candidate even if a summary somehow reports pure).
+ *   * Result MUST be unused (the LirStmtLet-name classifier).
+ *   * LirExprTailCall is excluded by construction.
+ *
+ * Only LirExprCall expressions go through the effect-aware gate;
+ * LirExprCallClosure (indirect dispatch) and LirExprForce remain
+ * conservative because the callee identity is a runtime value the
+ * EffectMap cannot index.
+ */
+
+import { LirExternal, LirStmt, LirExpr, LirAtom,
+         LirCallArg, LirNamedAtom } from "src/ir/lir_types.nx"
+import { EffectMap, lookup_bits, EffectBits } from "src/ir/effect_map.nx"
+import { opt_has_name, opt_is_pure,
+         reverse_stmts_opt } from "src/ir/lir_opt/helpers.nx"
+
+// ─── Use Collection (for DCE) ───────────────────────────────────────────────
+
+export let opt_collect_atom = fn (atom: LirAtom, used: [string]) -> [string] do
+  if let LirAtomVar(name: n, typ: _) = atom then n :: used else used end
+end
+
+let opt_collect_opt_atom = fn (opt: Option<LirAtom>, used: [string]) -> [string] do
+  if let Some(val: a) = opt then opt_collect_atom(atom: a, used) else used end
+end
+
+let opt_collect_atoms = fn (atoms: [LirAtom], used: [string]) -> [string] do
+  match atoms do
+    | [] -> used
+    | a :: rest -> opt_collect_atoms(atoms: rest, used: opt_collect_atom(atom: a, used))
+  end
+end
+
+let opt_collect_call_args = fn (args: [LirCallArg], used: [string]) -> [string] do
+  match args do
+    | [] -> used
+    | LirCallArg(label: _, value: v) :: rest ->
+      opt_collect_call_args(args: rest, used: opt_collect_atom(atom: v, used))
+  end
+end
+
+let opt_collect_named_atoms = fn (fields: [LirNamedAtom], used: [string]) -> [string] do
+  match fields do
+    | [] -> used
+    | LirNamedAtom(name: _, value: v) :: rest ->
+      opt_collect_named_atoms(fields: rest, used: opt_collect_atom(atom: v, used))
+  end
+end
+
+let opt_collect_expr = fn (expr: LirExpr, used: [string]) -> [string] do
+  match expr do
+    | LirExprAtom(atom: a) -> opt_collect_atom(atom: a, used)
+    | LirExprBinary(op: _, lhs: l, rhs: r, typ: _) ->
+      opt_collect_atom(atom: r, used: opt_collect_atom(atom: l, used))
+    | LirExprCall(func: _, args, typ: _) ->
+      opt_collect_call_args(args, used)
+    | LirExprTailCall(func: _, args, typ: _) ->
+      opt_collect_call_args(args, used)
+    | LirExprConstructor(name: _, args, typ: _) ->
+      opt_collect_atoms(atoms: args, used)
+    | LirExprRecord(fields: fs, typ: _) ->
+      opt_collect_named_atoms(fields: fs, used)
+    | LirExprObjectTag(value: v, typ: _) ->
+      opt_collect_atom(atom: v, used)
+    | LirExprObjectField(value: v, index: _, typ: _) ->
+      opt_collect_atom(atom: v, used)
+    | LirExprRaise(value: v, typ: _) ->
+      opt_collect_atom(atom: v, used)
+    | LirExprForce(value: v, typ: _) ->
+      opt_collect_atom(atom: v, used)
+    | LirExprMakeClosure(func_name: _, captures: cs, typ: _) ->
+      opt_collect_atoms(atoms: cs, used)
+    | LirExprCallClosure(closure: c, args, typ: _) ->
+      opt_collect_call_args(args, used: opt_collect_atom(atom: c, used))
+    | LirExprSuspend(tag_name: _, payload: p, typ: _) ->
+      opt_collect_atom(atom: p, used)
+    | LirExprResume(cont: c, value: v, typ: _) ->
+      opt_collect_atom(atom: v, used: opt_collect_atom(atom: c, used))
+    | LirExprContNew(func_ref: _, typ: _) -> used
+    | LirExprInjectResume(body_fn: _, arm_fns: _, arm_tags: _, typ: _) -> used
+  end
+end
+
+let opt_collect_stmt = fn (stmt: LirStmt, used: [string]) -> [string] do
+  match stmt do
+    | LirStmtLet(name: _, typ: _, expr: e) ->
+      opt_collect_expr(expr: e, used)
+    | LirStmtIf(cond: c, then_body: tb, else_body: eb) ->
+      let u1 = opt_collect_atom(atom: c, used)
+      let u2 = opt_collect_stmts(stmts: tb, used: u1)
+      opt_collect_stmts(stmts: eb, used: u2)
+    | LirStmtIfReturn(cond: c, then_body: tb, then_ret: tr,
+                          else_body: eb, else_ret: er, ret_type: _) ->
+      let u1 = opt_collect_atom(atom: c, used)
+      let u2 = opt_collect_stmts(stmts: tb, used: u1)
+      let u3 = opt_collect_atom(atom: tr, used: u2)
+      let u4 = opt_collect_stmts(stmts: eb, used: u3)
+      opt_collect_opt_atom(opt: er, used: u4)
+    | LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
+      let u1 = opt_collect_stmts(stmts: cs, used)
+      let u2 = opt_collect_atom(atom: c, used: u1)
+      opt_collect_stmts(stmts: b, used: u2)
+    | LirStmtTryCatch(body: b, body_ret: br, catch_param: _,
+                          catch_param_typ: _, catch_body: cb, catch_ret: cr) ->
+      let u1 = opt_collect_stmts(stmts: b, used)
+      let u2 = opt_collect_opt_atom(opt: br, used: u1)
+      let u3 = opt_collect_stmts(stmts: cb, used: u2)
+      opt_collect_opt_atom(opt: cr, used: u3)
+  end
+end
+
+export let opt_collect_stmts = fn (stmts: [LirStmt], used: [string]) -> [string] do
+  match stmts do
+    | [] -> used
+    | s :: rest -> opt_collect_stmts(stmts: rest, used: opt_collect_stmt(stmt: s, used))
+  end
+end
+
+// ─── Dead Code Elimination ──────────────────────────────────────────────────
+//
+// Removes LirStmtLet bindings where the bound name has zero uses AND the
+// expression is pure (no side effects). Recurses into nested blocks.
+
+export let opt_dce_stmts = fn (stmts: [LirStmt], used: [string]) -> [LirStmt] do
+  return opt_dce_stmts_go(stmts, used, acc: [])
+end
+
+let opt_dce_stmts_go = fn (stmts: [LirStmt], used: [string], acc: [LirStmt]) -> [LirStmt] do
+  match stmts do
+    | [] -> return reverse_stmts_opt(lst: acc, out: [])
+    | s :: rest ->
+      match opt_dce_one(stmt: s, used) do
+        | Some(val: stmt) -> return opt_dce_stmts_go(stmts: rest, used, acc: stmt :: acc)
+        | None -> return opt_dce_stmts_go(stmts: rest, used, acc)
+      end
+  end
+end
+
+let opt_dce_one = fn (stmt: LirStmt, used: [string]) -> Option<LirStmt> do
+  match stmt do
+    | LirStmtLet(name: n, typ: t, expr: e) ->
+      if opt_has_name(name: n, names: used) then
+        return Some(val: LirStmtLet(name: n, typ: t, expr: e))
+      end
+      if opt_is_pure(expr: e) then
+        return None
+      else
+        return Some(val: LirStmtLet(name: n, typ: t, expr: e))
+      end
+    | LirStmtIf(cond: c, then_body: tb, else_body: eb) ->
+      return Some(val: LirStmtIf(cond: c,
+                         then_body: opt_dce_stmts(stmts: tb, used),
+                         else_body: opt_dce_stmts(stmts: eb, used)))
+    | LirStmtIfReturn(cond: c, then_body: tb, then_ret: tr,
+                          else_body: eb, else_ret: er, ret_type: rt) ->
+      return Some(val: LirStmtIfReturn(cond: c,
+                               then_body: opt_dce_stmts(stmts: tb, used),
+                               then_ret: tr,
+                               else_body: opt_dce_stmts(stmts: eb, used),
+                               else_ret: er, ret_type: rt))
+    | LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
+      return Some(val: LirStmtLoop(cond_stmts: opt_dce_stmts(stmts: cs, used),
+                           cond: c,
+                           body: opt_dce_stmts(stmts: b, used)))
+    | LirStmtTryCatch(body: b, body_ret: br, catch_param: cp,
+                          catch_param_typ: cpt, catch_body: cb, catch_ret: cr) ->
+      return Some(val: LirStmtTryCatch(body: opt_dce_stmts(stmts: b, used),
+                               body_ret: br, catch_param: cp,
+                               catch_param_typ: cpt,
+                               catch_body: opt_dce_stmts(stmts: cb, used),
+                               catch_ret: cr))
+  end
+end
+
+// ─── Effect-Aware Dead Code Elimination ────────────────────────────────────
+
+let opt_is_external_name = fn (name: string, exts: [LirExternal]) -> bool do
+  match exts do
+    | [] -> return false
+    | e :: rest ->
+      let LirExternal(name: en, wasm_module: _, wasm_name: _, params: _, ret_type: _, throw_row: _) = e
+      if en == name then return true end
+      return opt_is_external_name(name, exts: rest)
+  end
+end
+
+let opt_callee_is_pure = fn (
+  callee: string,
+  effects: &EffectMap,
+  exts: [LirExternal]
+) -> bool do
+  // Externals: host capability calls — never drop, even if a summary
+  // claims purity (the existing analysis maps non-pure modules at
+  // module level, but the externals list is the authoritative gate).
+  if opt_is_external_name(name: callee, exts) then return false end
+  match lookup_bits(em: effects, name: callee) do
+    | Some(val: EffectBits(can_throw: _, is_pure: pure)) -> return pure
+    | None -> return false
+  end
+end
+
+let opt_expr_is_droppable = fn (
+  expr: LirExpr,
+  effects: &EffectMap,
+  exts: [LirExternal]
+) -> bool do
+  // Pure-by-construction expressions: defer to the existing predicate.
+  // The existing rule already covers atoms, binary, constructors,
+  // records, object accessors, MakeClosure, Force.
+  if opt_is_pure(expr) then return true end
+  // Effect-aware extension: static calls whose callee summary is pure.
+  // Tail calls are deliberately excluded — see the section header.
+  if let LirExprCall(func: f, args: _, typ: _) = expr then
+    return opt_callee_is_pure(callee: f, effects, exts)
+  end
+  return false
+end
+
+export let opt_dce_stmts_eff = fn (
+  stmts: [LirStmt],
+  used: [string],
+  effects: &EffectMap,
+  exts: [LirExternal]
+) -> [LirStmt] do
+  return opt_dce_stmts_eff_go(stmts, used, effects, exts, acc: [])
+end
+
+let opt_dce_stmts_eff_go = fn (
+  stmts: [LirStmt],
+  used: [string],
+  effects: &EffectMap,
+  exts: [LirExternal],
+  acc: [LirStmt]
+) -> [LirStmt] do
+  match stmts do
+    | [] -> return reverse_stmts_opt(lst: acc, out: [])
+    | s :: rest ->
+      match opt_dce_one_eff(stmt: s, used, effects, exts) do
+        | Some(val: stmt) ->
+          return opt_dce_stmts_eff_go(stmts: rest, used, effects, exts, acc: stmt :: acc)
+        | None ->
+          return opt_dce_stmts_eff_go(stmts: rest, used, effects, exts, acc)
+      end
+  end
+end
+
+let opt_dce_one_eff = fn (
+  stmt: LirStmt,
+  used: [string],
+  effects: &EffectMap,
+  exts: [LirExternal]
+) -> Option<LirStmt> do
+  match stmt do
+    | LirStmtLet(name: n, typ: t, expr: e) ->
+      if opt_has_name(name: n, names: used) then
+        return Some(val: LirStmtLet(name: n, typ: t, expr: e))
+      end
+      if opt_expr_is_droppable(expr: e, effects, exts) then
+        return None
+      end
+      return Some(val: LirStmtLet(name: n, typ: t, expr: e))
+    | LirStmtIf(cond: c, then_body: tb, else_body: eb) ->
+      return Some(val: LirStmtIf(cond: c,
+                         then_body: opt_dce_stmts_eff(stmts: tb, used, effects, exts),
+                         else_body: opt_dce_stmts_eff(stmts: eb, used, effects, exts)))
+    | LirStmtIfReturn(cond: c, then_body: tb, then_ret: tr,
+                          else_body: eb, else_ret: er, ret_type: rt) ->
+      return Some(val: LirStmtIfReturn(cond: c,
+                               then_body: opt_dce_stmts_eff(stmts: tb, used, effects, exts),
+                               then_ret: tr,
+                               else_body: opt_dce_stmts_eff(stmts: eb, used, effects, exts),
+                               else_ret: er, ret_type: rt))
+    | LirStmtLoop(cond_stmts: cs, cond: c, body: b) ->
+      return Some(val: LirStmtLoop(cond_stmts: opt_dce_stmts_eff(stmts: cs, used, effects, exts),
+                           cond: c,
+                           body: opt_dce_stmts_eff(stmts: b, used, effects, exts)))
+    | LirStmtTryCatch(body: b, body_ret: br, catch_param: cp,
+                          catch_param_typ: cpt, catch_body: cb, catch_ret: cr) ->
+      return Some(val: LirStmtTryCatch(body: opt_dce_stmts_eff(stmts: b, used, effects, exts),
+                               body_ret: br, catch_param: cp,
+                               catch_param_typ: cpt,
+                               catch_body: opt_dce_stmts_eff(stmts: cb, used, effects, exts),
+                               catch_ret: cr))
+  end
+end
