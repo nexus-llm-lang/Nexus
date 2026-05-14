@@ -61,6 +61,7 @@ import {
   find_linear_field, type_carries_linear
 }, * as collections from "src/typecheck/infer/collections.nx"
 import { TypeError, ThrowsRowInvariantBroken } from "src/common/error.nx"
+import { StrMap }, * as smap from "src/common/strmap.nx"
 import * as str from "std:str"
 import * as list from "std:list"
 import { Option, Some, None } from "std:option"
@@ -1557,17 +1558,28 @@ let bind_or_alts_validate = fn (
   state: CheckState, alts: [HirPatternKind], target_type: TypeExpr,
   ref_env: [EnvEntry], acc_subst: [SubstEntry]
 ) -> BindResult throws { TypeError } do
+  // nexus-d7qz.1: hoist the haystack into a StrMap once per call so
+  // env_keys_match / unify_or_envs do O(1) lookups instead of O(N) per name.
+  let ref_map = env_to_strmap(env: ref_env)
+  return bind_or_alts_validate_go(state, alts, target_type, ref_env, ref_map, acc_subst)
+end
+
+let bind_or_alts_validate_go = fn (
+  state: CheckState, alts: [HirPatternKind], target_type: TypeExpr,
+  ref_env: [EnvEntry], ref_map: StrMap<Scheme>, acc_subst: [SubstEntry]
+) -> BindResult throws { TypeError } do
   match alts do
     | [] -> return BindOk(state, subst: acc_subst, env: ref_env)
     | alt :: rest ->
       match bind_pattern(state, pattern: alt, target_type) do
         | BindErr(message: m) -> return BindErr(message: "or-pattern alternative: " ++ m)
         | BindOk(state: st1, subst: s1, env: alt_env) ->
-          if env_keys_match(a: ref_env, b: alt_env) then
-            match unify_or_envs(state: st1, first: ref_env, alt: alt_env, acc: subst.subst_compose(s1: acc_subst, s2: s1)) do
+          let alt_map = env_to_strmap(env: alt_env)
+          if env_keys_match(a: ref_env, a_map: ref_map, b: alt_env, b_map: alt_map) then
+            match unify_or_envs(state: st1, first: ref_env, alt_map, acc: subst.subst_compose(s1: acc_subst, s2: s1)) do
               | BindErr(message: m) -> return BindErr(message: m)
               | BindOk(state: st2, subst: s2, env: _) ->
-                return bind_or_alts_validate(state: st2, alts: rest, target_type, ref_env, acc_subst: s2)
+                return bind_or_alts_validate_go(state: st2, alts: rest, target_type, ref_env, ref_map, acc_subst: s2)
             end
           else
             return BindErr(message: "or-pattern alternatives bind different variable sets")
@@ -1576,17 +1588,31 @@ let bind_or_alts_validate = fn (
   end
 end
 
-let env_keys_match = fn (a: [EnvEntry], b: [EnvEntry]) -> bool throws { TypeError } do
-  if list.length(xs: a) != list.length(xs: b) then return false end
-  return all_keys_in(needles: a, haystack: b) && all_keys_in(needles: b, haystack: a)
+let env_to_strmap = fn (env: [EnvEntry]) -> StrMap<Scheme> throws { TypeError } do
+  return env_to_strmap_go(env, acc: smap.empty())
 end
 
-let all_keys_in = fn (needles: [EnvEntry], haystack: [EnvEntry]) -> bool throws { TypeError } do
+let env_to_strmap_go = fn (env: [EnvEntry], acc: StrMap<Scheme>) -> StrMap<Scheme> throws { TypeError } do
+  match env do
+    | [] -> return acc
+    | EnvEntry(name: n, scheme: s) :: rest ->
+      return env_to_strmap_go(env: rest, acc: smap.insert(m: acc, k: n, v: s))
+  end
+end
+
+// Two envs share the same key set iff |a| = |b| and every key in `a` is
+// present in `b_map`. Pre-built StrMaps make the membership check O(1).
+let env_keys_match = fn (a: [EnvEntry], a_map: StrMap<Scheme>, b: [EnvEntry], b_map: StrMap<Scheme>) -> bool throws { TypeError } do
+  if list.length(xs: a) != list.length(xs: b) then return false end
+  return all_keys_in_map(needles: a, haystack: b_map) && all_keys_in_map(needles: b, haystack: a_map)
+end
+
+let all_keys_in_map = fn (needles: [EnvEntry], haystack: StrMap<Scheme>) -> bool throws { TypeError } do
   match needles do
     | [] -> return true
     | EnvEntry(name: n, scheme: _) :: rest ->
-      if has_env_key(name: n, env: haystack) then
-        return all_keys_in(needles: rest, haystack)
+      if smap.contains(m: haystack, k: n) then
+        return all_keys_in_map(needles: rest, haystack)
       else
         return false
       end
@@ -1618,13 +1644,15 @@ let find_env_overlap = fn (base: [EnvEntry], extra: [EnvEntry]) -> Option<string
   end
 end
 
+// nexus-d7qz.1: `alt_map` replaces a linear-scan `find_env_entry` (was O(M)
+// per name; total O(M²)). The caller pre-builds it once per or-alternative.
 let unify_or_envs = fn (
-  state: CheckState, first: [EnvEntry], alt: [EnvEntry], acc: [SubstEntry]
+  state: CheckState, first: [EnvEntry], alt_map: StrMap<Scheme>, acc: [SubstEntry]
 ) -> BindResult throws { TypeError } do
   match first do
     | [] -> return BindOk(state, subst: acc, env: [])
     | EnvEntry(name: n, scheme: rs) :: rest_first ->
-      match find_env_entry(name: n, env: alt) do
+      match smap.get(m: alt_map, k: n) do
         | None -> return BindErr(message: "or-pattern: missing binding `" ++ n ++ "` in alternative")
         | Some(val: as_) ->
           let tdefs = tctypes.state_typedefs(state)
@@ -1634,17 +1662,9 @@ let unify_or_envs = fn (
             | UnifyErr(message: m) ->
               return BindErr(message: "or-pattern: variable `" ++ n ++ "` has incompatible types across alternatives: " ++ m)
             | UnifyOk(subst: s) ->
-              return unify_or_envs(state, first: rest_first, alt, acc: subst.subst_compose(s1: acc, s2: s))
+              return unify_or_envs(state, first: rest_first, alt_map, acc: subst.subst_compose(s1: acc, s2: s))
           end
       end
-  end
-end
-
-let find_env_entry = fn (name: string, env: [EnvEntry]) -> Option<Scheme> throws { TypeError } do
-  match env do
-    | [] -> return None
-    | EnvEntry(name: n, scheme: s) :: rest ->
-      if n == name then return Some(val: s) else return find_env_entry(name, env: rest) end
   end
 end
 
