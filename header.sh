@@ -55,7 +55,7 @@ if [ "$#" -gt 0 ]; then
       # in-wasm runner cannot invoke the per-test `nexus build` /
       # `wasmtime run`. Drive the loop from the shell instead, reusing
       # this same launcher (the compiler payload) for every per-test
-      # compile. The in-Nexus `src/test_runner.nx` stays as the source of
+      # compile. The in-Nexus `src/tools/test_runner.nx` stays as the source of
       # truth for the report format and is the path that will light up if
       # a future WASI preview gives us subprocess back.
       TEST_MODE=1
