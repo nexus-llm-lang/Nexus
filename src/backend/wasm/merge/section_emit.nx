@@ -1,0 +1,721 @@
+/**
+ * wasm/merge/section_emit: per-section emitters for the stdlib-merge phase.
+ *
+ * Owns:
+ * - Section-info helpers (sec_off / sec_sz / count_sec / sec_body)
+ * - String + import-descriptor readers (rd_str / StrPos, skip_limits,
+ *   skip_imp_desc, skip_table_entry, copy_table_entries_with_type_off)
+ * - Per-section emitters: type (merged + offsets), import (kept w/ type_off),
+ *   function, table, global, export (remapped), element (remapped), code
+ *   (bodies rewritten), data (offset-relocated), tag (type_off), custom
+ *   (name-section remapped; others verbatim)
+ *
+ * Does not own:
+ * - Instruction rewriting — see src/backend/wasm/merge/instruction_rewrite.nx
+ * - Top-level merge orchestration — see src/backend/wasm/merge.nx
+ */
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { StringMap }, * as sm from "std:stringmap"
+import * as str from "std:str"
+import { SlebRes, pack, pval, ppos, rd_uleb, rd_sleb, scan_sleb_end } from "src/backend/wasm/read.nx"
+import { op_end, op_ref_null, form_cont, vt_ref_null_ht, vt_ref_ht } from "src/backend/wasm/defs.nx"
+import { BufPos, RwCtx, intarr_get, rw_body } from "src/backend/wasm/merge/instruction_rewrite.nx"
+
+// Multi-return record for rd_str: parsed string + position after string bytes.
+export type StrPos = StrPos(s: string, pos: i64)
+
+// ─── Section-info helpers ────────────────────────────────────────────────
+// Get packed section info (0 if section not present)
+export let get_sec = fn (map: &StringMap, sec: i64) -> i64 do
+  return sm.get_or(map, key: str.from_i64(val: sec), default: 0)
+end
+// Extract content offset from packed section info
+export let sec_off = fn (pk: i64) -> i64 do return pval(pk) end
+// Extract section size from packed section info
+export let sec_sz = fn (pk: i64) -> i64 do return ppos(pk) end
+
+// Read the ULEB count at the start of a section (0 if section absent)
+export let count_sec = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
+  if sec_pk == 0 then return 0 end
+  return pval(pk: rd_uleb(buf, pos: sec_off(pk: sec_pk)))
+end
+
+// Position right after the section count ULEB
+export let sec_body = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
+  if sec_pk == 0 then return 0 end
+  return ppos(pk: rd_uleb(buf, pos: sec_off(pk: sec_pk)))
+end
+
+// ─── String reading ───────────────────────────────────────────────────────
+// Read a WASM string (ULEB length + bytes). Returns parsed string + position
+// immediately after the string bytes.
+export let rd_str = fn (buf: &ByteBuffer, pos: i64) -> StrPos do
+  let pk = rd_uleb(buf, pos)
+  let len = pval(pk)
+  let start = ppos(pk)
+  let %tmp = bb.empty()
+  let %tmp = bb.copy_range(dst: %tmp, src: buf, start, end_pos: start + len)
+  let s = bb.to_string(buf: &tmp)
+  bb.free(buf: %tmp)
+  return StrPos(s, pos: start + len)
+end
+
+// ─── Import descriptor skipping ───────────────────────────────────────────
+// Skip limits encoding (flags + min [+ max])
+export let skip_limits = fn (buf: &ByteBuffer, pos: i64) -> i64 do
+  let flags = bb.get_byte(buf, idx: pos)
+  let pk = rd_uleb(buf, pos: pos + 1)
+  if flags == 0 then return ppos(pk) end
+  return ppos(pk: rd_uleb(buf, pos: ppos(pk)))
+end
+
+export let skip_table_entry = fn (buf: &ByteBuffer, pos: i64) -> i64 do
+  let rt = bb.get_byte(buf, idx: pos)
+  if rt == 112 || rt == 111 then return skip_limits(buf, pos: pos + 1) end
+  let SlebRes(val: _, pos: after_tidx) = rd_sleb(buf, pos: pos + 1)
+  return skip_limits(buf, pos: after_tidx)
+end
+
+export let copy_table_entries_with_type_off = fn (buf: %ByteBuffer, src: &ByteBuffer, pos: i64, end_pos: i64, off: i64) -> %ByteBuffer do
+  if pos >= end_pos then return %buf end
+  let rt = bb.get_byte(buf: src, idx: pos)
+  let %buf = bb.push_byte(%buf, byte: rt)
+  if rt == 112 || rt == 111 then
+    let lim_end = skip_limits(buf: src, pos: pos + 1)
+    let %buf = bb.copy_range(dst: %buf, src, start: pos + 1, end_pos: lim_end)
+    return copy_table_entries_with_type_off(%buf, src, pos: lim_end, end_pos, off)
+  end
+  let SlebRes(val: tidx, pos: after_tidx) = rd_sleb(buf: src, pos: pos + 1)
+  let %buf = bb.push_sleb128(%buf, val: tidx + off)
+  let lim_end = skip_limits(buf: src, pos: after_tidx)
+  let %buf = bb.copy_range(dst: %buf, src, start: after_tidx, end_pos: lim_end)
+  return copy_table_entries_with_type_off(%buf, src, pos: lim_end, end_pos, off)
+end
+
+// Skip an import descriptor; returns position after it
+export let skip_imp_desc = fn (buf: &ByteBuffer, pos: i64) -> i64 do
+  let kind = bb.get_byte(buf, idx: pos)
+  if kind == 0 then
+    // func: skip type index ULEB
+    return ppos(pk: rd_uleb(buf, pos: pos + 1))
+  end
+  if kind == 1 then
+    // table: reftype byte + limits
+    return skip_limits(buf, pos: pos + 2)
+  end
+  if kind == 2 then
+    // memory: limits
+    return skip_limits(buf, pos: pos + 1)
+  end
+  if kind == 3 then
+    // global: valtype + mutability = 2 bytes
+    return pos + 3
+  end
+  // tag: attribute ULEB + type index ULEB
+  let pk = rd_uleb(buf, pos: pos + 1)
+  return ppos(pk: rd_uleb(buf, pos: ppos(pk)))
+end
+
+// ─── Section emitters ─────────────────────────────────────────────────────
+
+export let emit_sec = fn (out: %ByteBuffer, sec_id: i64, content: &ByteBuffer) -> %ByteBuffer do
+  let %out = bb.push_byte(buf: %out, byte: sec_id)
+  let %out = bb.push_uleb128(buf: %out, val: bb.length(buf: content))
+  return bb.push_buf(dst: %out, src: content)
+end
+
+export let emit_sec_and_free = fn (out: %ByteBuffer, sec_id: i64, tmp: %ByteBuffer) -> %ByteBuffer do
+  let %out = emit_sec(%out, sec_id, content: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+
+export let copy_raw_sec = fn (out: %ByteBuffer, src: &ByteBuffer, sec_pk: i64, sec_id: i64) -> %ByteBuffer do
+  if sec_pk == 0 then return %out end
+  let off = sec_off(pk: sec_pk)
+  let sz = sec_sz(pk: sec_pk)
+  let %tmp = bb.empty()
+  let %tmp = bb.copy_range(dst: %tmp, src, start: off, end_pos: off + sz)
+  let %out = emit_sec(%out, sec_id, content: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+
+export let copy_sec_body = fn (buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
+  if sec_pk > 0 then
+    let body = sec_body(buf: src, sec_pk)
+    return bb.copy_range(dst: %buf, src, start: body, end_pos: sec_off(pk: sec_pk) + sec_sz(pk: sec_pk))
+  end
+  return %buf
+end
+
+let skip_n_valtypes = fn (src: &ByteBuffer, pos: i64, remaining: i64) -> i64 do
+  if remaining <= 0 then return pos end
+  let b = bb.get_byte(buf: src, idx: pos)
+  if b == vt_ref_null_ht then return skip_n_valtypes(src, pos: scan_sleb_end(buf: src, pos: pos + 1), remaining: remaining - 1) end
+  if b == vt_ref_ht then return skip_n_valtypes(src, pos: scan_sleb_end(buf: src, pos: pos + 1), remaining: remaining - 1) end
+  return skip_n_valtypes(src, pos: pos + 1, remaining: remaining - 1)
+end
+
+let emit_valtypes_off = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64, off: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let b = bb.get_byte(buf: src, idx: pos)
+  if b == vt_ref_null_ht then
+    let %out = bb.push_byte(buf: %out, byte: vt_ref_null_ht)
+    let SlebRes(val: heap_idx, pos: next) = rd_sleb(buf: src, pos: pos + 1)
+    let %out = bb.push_sleb128(buf: %out, val: heap_idx + off)
+    return emit_valtypes_off(%out, src, pos: next, remaining: remaining - 1, off)
+  end
+  if b == vt_ref_ht then
+    let %out = bb.push_byte(buf: %out, byte: vt_ref_ht)
+    let SlebRes(val: heap_idx, pos: next) = rd_sleb(buf: src, pos: pos + 1)
+    let %out = bb.push_sleb128(buf: %out, val: heap_idx + off)
+    return emit_valtypes_off(%out, src, pos: next, remaining: remaining - 1, off)
+  end
+  let %out = bb.push_byte(buf: %out, byte: b)
+  return emit_valtypes_off(%out, src, pos: pos + 1, remaining: remaining - 1, off)
+end
+
+let skip_one_type_entry = fn (src: &ByteBuffer, pos: i64) -> i64 do
+  let form = bb.get_byte(buf: src, idx: pos)
+  if form == form_cont then
+    let SlebRes(val: _, pos: next) = rd_sleb(buf: src, pos: pos + 1)
+    return next
+  end
+  let pk_p = rd_uleb(buf: src, pos: pos + 1)
+  let after_p = skip_n_valtypes(src, pos: ppos(pk: pk_p), remaining: pval(pk: pk_p))
+  let pk_r = rd_uleb(buf: src, pos: after_p)
+  return skip_n_valtypes(src, pos: ppos(pk: pk_r), remaining: pval(pk: pk_r))
+end
+
+let copy_one_type_entry_off = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, off: i64) -> %ByteBuffer do
+  let form = bb.get_byte(buf: src, idx: pos)
+  if form == form_cont then
+    let %out = bb.push_byte(buf: %out, byte: form_cont)
+    let SlebRes(val: tidx, pos: _) = rd_sleb(buf: src, pos: pos + 1)
+    return bb.push_sleb128(buf: %out, val: tidx + off)
+  end
+  let %out = bb.push_byte(buf: %out, byte: form)
+  let pk_p = rd_uleb(buf: src, pos: pos + 1)
+  let n_params = pval(pk: pk_p)
+  let params_start = ppos(pk: pk_p)
+  let %out = bb.push_uleb128(buf: %out, val: n_params)
+  let %out = emit_valtypes_off(%out, src, pos: params_start, remaining: n_params, off)
+  let after_p = skip_n_valtypes(src, pos: params_start, remaining: n_params)
+  let pk_r = rd_uleb(buf: src, pos: after_p)
+  let n_results = pval(pk: pk_r)
+  let results_start = ppos(pk: pk_r)
+  let %out = bb.push_uleb128(buf: %out, val: n_results)
+  return emit_valtypes_off(%out, src, pos: results_start, remaining: n_results, off)
+end
+
+let copy_type_entries_with_off = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64, off: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let next = skip_one_type_entry(src, pos)
+  let %out = copy_one_type_entry_off(%out, src, pos, off)
+  return copy_type_entries_with_off(%out, src, pos: next, remaining: remaining - 1, off)
+end
+
+export let emit_merged_types_inline = fn (d_buf: &ByteBuffer, d_sec: i64, m_buf: &ByteBuffer, m_sec: i64, out: %ByteBuffer) -> %ByteBuffer do
+  let %tmp = bb.empty()
+  let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
+  let d_count = count_sec(buf: d_buf, sec_pk: d_sec)
+  let %tmp = bb.push_uleb128(buf: %tmp, val: m_count + d_count)
+  let %tmp = copy_sec_body(buf: %tmp, src: m_buf, sec_pk: m_sec)
+  let %tmp = if d_sec > 0 then
+    copy_type_entries_with_off(out: %tmp, src: d_buf, pos: sec_body(buf: d_buf, sec_pk: d_sec), remaining: d_count, off: m_count)
+  else %tmp end
+  let %out = emit_sec(%out, sec_id: 1, content: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+
+export let copy_imports_with_type_off = fn (out: %ByteBuffer, buf: &ByteBuffer,
+    pos: i64, remaining: i64, type_off: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let start = pos
+  let StrPos(s: _mod, pos: pos2) = rd_str(buf, pos)
+  let StrPos(s: _name, pos: pos3) = rd_str(buf, pos: pos2)
+  let kind = bb.get_byte(buf, idx: pos3)
+  if kind == 0 then
+    // Function import: copy name bytes, then offset type index
+    let %out = bb.copy_range(dst: %out, src: buf, start, end_pos: pos3 + 1)
+    let pk = rd_uleb(buf, pos: pos3 + 1)
+    let type_idx = pval(pk)
+    let %out = bb.push_uleb128(buf: %out, val: type_idx + type_off)
+    return copy_imports_with_type_off(%out, buf,
+      pos: ppos(pk), remaining: remaining - 1, type_off)
+  end
+  // Non-function import: copy everything as-is
+  let pos4 = skip_imp_desc(buf, pos: pos3)
+  let %out = bb.copy_range(dst: %out, src: buf, start, end_pos: pos4)
+  return copy_imports_with_type_off(%out, buf,
+    pos: pos4, remaining: remaining - 1, type_off)
+end
+
+export let copy_func_types_with_off = fn (out: %ByteBuffer, buf: &ByteBuffer, sec_pk: i64, off: i64) -> %ByteBuffer do
+  let pk = rd_uleb(buf, pos: sec_off(pk: sec_pk))
+  let count = pval(pk)
+  return copy_func_types_go(%out, buf, pos: ppos(pk), remaining: count, off)
+end
+let copy_func_types_go = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64, off: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let pk = rd_uleb(buf, pos)
+  let %out = bb.push_uleb128(buf: %out, val: pval(pk) + off)
+  return copy_func_types_go(%out, buf, pos: ppos(pk), remaining: remaining - 1, off)
+end
+
+export let emit_merged_globals = fn (out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
+    d_buf: &ByteBuffer, d_sec: i64, type_off: i64) -> %ByteBuffer do
+  let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
+  let d_count = count_sec(buf: d_buf, sec_pk: d_sec)
+  if m_count + d_count == 0 then return %out end
+  let %tmp = bb.empty()
+  let %tmp = bb.push_uleb128(buf: %tmp, val: d_count + m_count)
+  let %tmp = copy_sec_body(buf: %tmp, src: d_buf, sec_pk: d_sec)
+  let %tmp = copy_globals_with_type_off(out: %tmp, buf: m_buf, pos: sec_body(buf: m_buf, sec_pk: m_sec), remaining: m_count, off: type_off)
+  let %out = emit_sec(%out, sec_id: 6, content: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+
+let copy_globals_with_type_off = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64, off: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let vt = bb.get_byte(buf, idx: pos)
+  if vt == vt_ref_null_ht || vt == vt_ref_ht then
+    let %out = bb.push_byte(buf: %out, byte: vt)
+    let SlebRes(val: tv, pos: tp) = rd_sleb(buf, pos: pos + 1)
+    let %out = bb.push_sleb128(buf: %out, val: tv + off)
+    let mut_byte = bb.get_byte(buf, idx: tp)
+    let %out = bb.push_byte(buf: %out, byte: mut_byte)
+    let init_start = tp + 1
+    let init_op = bb.get_byte(buf, idx: init_start)
+    if init_op == op_ref_null then
+      let %out = bb.push_byte(buf: %out, byte: op_ref_null)
+      let SlebRes(val: tv2, pos: tp2) = rd_sleb(buf, pos: init_start + 1)
+      let %out = bb.push_sleb128(buf: %out, val: tv2 + off)
+      let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf, idx: tp2))
+      return copy_globals_with_type_off(%out, buf, pos: tp2 + 1, remaining: remaining - 1, off)
+    end
+    let end2 = scan_to_end(buf, pos: init_start)
+    let %out = bb.copy_range(dst: %out, src: buf, start: init_start, end_pos: end2)
+    return copy_globals_with_type_off(%out, buf, pos: end2, remaining: remaining - 1, off)
+  end
+  let %out = bb.push_byte(buf: %out, byte: vt)
+  let mut_byte = bb.get_byte(buf, idx: pos + 1)
+  let %out = bb.push_byte(buf: %out, byte: mut_byte)
+  let init_start = pos + 2
+  let end2 = scan_to_end(buf, pos: init_start)
+  let %out = bb.copy_range(dst: %out, src: buf, start: init_start, end_pos: end2)
+  return copy_globals_with_type_off(%out, buf, pos: end2, remaining: remaining - 1, off)
+end
+
+let scan_to_end = fn (buf: &ByteBuffer, pos: i64) -> i64 do
+  let b = bb.get_byte(buf, idx: pos)
+  if b == op_end then return pos + 1 end
+  return scan_to_end(buf, pos: pos + 1)
+end
+
+// Like emit_merged_globals but patches main G0 (heap_base += reloc) and G1 (str_base = reloc).
+// Main globals are: G0 (heap_base), G1 (str_base=0→patched), G2 (placeholder).
+// Each global: valtype(1) + mut(1) + i32.const(1) + sleb128(value) + end(1).
+export let emit_remapped_exports = fn (out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
+    remap: &ByteBuffer) -> %ByteBuffer do
+  if m_sec == 0 then return %out end
+  let %tmp = bb.empty()
+  let pk = rd_uleb(buf: m_buf, pos: sec_off(pk: m_sec))
+  let count = pval(pk)
+  let %tmp = bb.push_uleb128(buf: %tmp, val: count)
+  let %tmp = remap_export_entries(out: %tmp, buf: m_buf, pos: ppos(pk),
+    remaining: count, remap)
+  let %out = emit_sec(%out, sec_id: 7, content: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+
+let remap_export_entries = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64,
+    remaining: i64, remap: &ByteBuffer) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let name_start = pos
+  let StrPos(s: _name, pos: pos2) = rd_str(buf, pos)
+  let kind = bb.get_byte(buf, idx: pos2)
+  let pk = rd_uleb(buf, pos: pos2 + 1)
+  let old_idx = pval(pk)
+  let pos3 = ppos(pk)
+  let %out = bb.copy_range(dst: %out, src: buf, start: name_start, end_pos: pos2)
+  let %out = bb.push_byte(buf: %out, byte: kind)
+  if kind == 0 then
+    let new_idx = intarr_get(arr: remap, idx: old_idx)
+    let %out = bb.push_uleb128(buf: %out, val: new_idx)
+    return remap_export_entries(%out, buf, pos: pos3, remaining: remaining - 1, remap)
+  end
+  let %out = bb.push_uleb128(buf: %out, val: old_idx)
+  return remap_export_entries(%out, buf, pos: pos3, remaining: remaining - 1, remap)
+end
+
+export let maybe_rewrite_bodies = fn (ctx: RwCtx, remap: &ByteBuffer, buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
+  if sec_pk > 0 then
+    return rewrite_code_bodies(ctx, remap, out: %buf, src, sec_pk)
+  end
+  return %buf
+end
+
+export let emit_stub_bodies = fn (out: %ByteBuffer, i: i64, n: i64) -> %ByteBuffer do
+  if i >= n then return %out end
+  let %out = bb.push_uleb128(buf: %out, val: 3)
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 0, op_end])
+  return emit_stub_bodies(%out, i: i + 1, n)
+end
+
+let rewrite_code_bodies = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
+  let pk = rd_uleb(buf: src, pos: sec_off(pk: sec_pk))
+  let count = pval(pk)
+  let %body_buf = bb.empty()
+  let %out = rewrite_code_go(ctx, remap, %out, src, pos: ppos(pk), remaining: count, %body_buf)
+  return %out
+end
+let rewrite_code_go = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64, body_buf: %ByteBuffer) -> %ByteBuffer do
+  if remaining <= 0 then
+    bb.free(buf: %body_buf)
+    return %out
+  end
+  let pk = rd_uleb(buf: src, pos)
+  let body_size = pval(pk)
+  let body_start = ppos(pk)
+  let body_end = body_start + body_size
+  let %body_buf = bb.truncate(buf: %body_buf, len: 0)
+  let %body_buf = rw_body(ctx, remap, out: %body_buf, src, body_start, body_end)
+  let new_size = bb.length(buf: &body_buf)
+  let %out = bb.push_uleb128(buf: %out, val: new_size)
+  let %out = bb.push_buf(dst: %out, src: &body_buf)
+  return rewrite_code_go(ctx, remap, %out, src, pos: body_end, remaining: remaining - 1, %body_buf)
+end
+
+// Find the highest data-segment end (offset + length) in a data section.
+// Returns 0 if no data segments.
+export let find_data_end = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
+  if sec_pk == 0 then return 0 end
+  let pk = rd_uleb(buf, pos: sec_off(pk: sec_pk))
+  return find_data_end_go(buf, pos: ppos(pk), remaining: pval(pk), max_end: 0)
+end
+let find_data_end_go = fn (buf: &ByteBuffer, pos: i64, remaining: i64, max_end: i64) -> i64 do
+  if remaining <= 0 then return max_end end
+  // Active segment: flags=0x00, i32.const(0x41), uleb128(offset), end(0x0B), uleb128(len), data
+  let _flags = bb.get_byte(buf, idx: pos)
+  let _opcode = bb.get_byte(buf, idx: pos + 1)
+  let pk_off = rd_uleb(buf, pos: pos + 2)
+  let offset = pval(pk: pk_off)
+  let end_expr = ppos(pk: pk_off) + 1
+  let pk_len = rd_uleb(buf, pos: end_expr)
+  let data_len = pval(pk: pk_len)
+  let data_start = ppos(pk: pk_len)
+  let seg_end = offset + data_len
+  let new_max = if seg_end > max_end then seg_end else max_end end
+  return find_data_end_go(buf, pos: data_start + data_len, remaining: remaining - 1, max_end: new_max)
+end
+
+// Copy main data segments with offset relocation: each segment's i32.const offset += reloc.
+let copy_data_relocated = fn (out: %ByteBuffer, src: &ByteBuffer, sec_pk: i64, reloc: i64) -> %ByteBuffer do
+  if sec_pk == 0 then return %out end
+  let pk = rd_uleb(buf: src, pos: sec_off(pk: sec_pk))
+  return copy_data_relocated_go(%out, src, pos: ppos(pk), remaining: pval(pk), reloc)
+end
+let copy_data_relocated_go = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64, reloc: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  // Emit flags + opcode
+  let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
+  let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos + 1))
+  // Read original offset, add reloc, emit new offset
+  let pk_off = rd_uleb(buf: src, pos: pos + 2)
+  let new_offset = pval(pk: pk_off) + reloc
+  let %out = bb.push_sleb128(buf: %out, val: new_offset)
+  // Emit end opcode
+  let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: ppos(pk: pk_off)))
+  // Copy data length + data bytes
+  let end_expr = ppos(pk: pk_off) + 1
+  let pk_len = rd_uleb(buf: src, pos: end_expr)
+  let data_len = pval(pk: pk_len)
+  let data_start = ppos(pk: pk_len)
+  let %out = bb.push_uleb128(buf: %out, val: data_len)
+  let %out = bb.copy_range(dst: %out, src, start: data_start, end_pos: data_start + data_len)
+  return copy_data_relocated_go(%out, src, pos: data_start + data_len, remaining: remaining - 1, reloc)
+end
+
+export let emit_merged_data = fn (out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
+    d_buf: &ByteBuffer, d_sec: i64, reloc: i64) -> %ByteBuffer do
+  let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
+  let d_count = count_sec(buf: d_buf, sec_pk: d_sec)
+  if m_count + d_count == 0 then return %out end
+  let %tmp = bb.empty()
+  let %tmp = bb.push_uleb128(buf: %tmp, val: d_count + m_count)
+  let %tmp = copy_sec_body(buf: %tmp, src: d_buf, sec_pk: d_sec)
+  let %tmp = copy_data_relocated(out: %tmp, src: m_buf, sec_pk: m_sec, reloc)
+  let %out = emit_sec(%out, sec_id: 11, content: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+
+let maybe_remap_elem = fn (buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64, remap: &ByteBuffer) -> %ByteBuffer do
+  if sec_pk > 0 then
+    return remap_elem_segments(out: %buf, buf: src, sec_pk, remap)
+  end
+  return %buf
+end
+
+export let emit_merged_elements = fn (out: %ByteBuffer,
+    d_buf: &ByteBuffer, d_sec: i64, remap_d: &ByteBuffer,
+    m_buf: &ByteBuffer, m_sec: i64, remap_m: &ByteBuffer) -> %ByteBuffer do
+  let d_count = count_sec(buf: d_buf, sec_pk: d_sec)
+  let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
+  if d_count + m_count == 0 then return %out end
+  let %tmp = bb.empty()
+  let %tmp = bb.push_uleb128(buf: %tmp, val: d_count + m_count)
+  let %tmp = maybe_remap_elem(buf: %tmp, src: d_buf, sec_pk: d_sec, remap: remap_d)
+  let %tmp = maybe_remap_elem(buf: %tmp, src: m_buf, sec_pk: m_sec, remap: remap_m)
+  let %out = emit_sec(%out, sec_id: 9, content: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+
+let remap_elem_segments = fn (out: %ByteBuffer, buf: &ByteBuffer, sec_pk: i64, remap: &ByteBuffer) -> %ByteBuffer do
+  let pk = rd_uleb(buf, pos: sec_off(pk: sec_pk))
+  return remap_elem_go(%out, buf, pos: ppos(pk), remaining: pval(pk), remap)
+end
+let remap_elem_go = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64, remap: &ByteBuffer) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let kind = bb.get_byte(buf, idx: pos)
+  let %out = bb.push_byte(buf: %out, byte: kind)
+  if kind == 0 then
+    // Init expression: i32.const <sleb-offset> end — no remap needed.
+    // Bulk-copy the opcode + SLEB + end byte (scan_sleb_end finds terminal).
+    let sleb_start = pos + 2
+    let sleb_end = scan_sleb_end(buf, pos: sleb_start)
+    // Copy [pos+1 .. sleb_end+1) — opcode + SLEB + end byte
+    let %out = bb.copy_range(dst: %out, src: buf, start: pos + 1, end_pos: sleb_end + 1)
+    let pk = rd_uleb(buf, pos: sleb_end + 1)
+    let n_funcs = pval(pk)
+    let %out = bb.push_uleb128(buf: %out, val: n_funcs)
+    let BufPos(buf: %out, pos: next_pos) = remap_elem_funcs(%out, buf, pos: ppos(pk), remaining: n_funcs, remap)
+    return remap_elem_go(%out, buf, pos: next_pos, remaining: remaining - 1, remap)
+  end
+  return %out
+end
+
+let remap_elem_funcs = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64, remap: &ByteBuffer) -> BufPos do
+  if remaining <= 0 then return BufPos(buf: %out, pos) end
+  let pk = rd_uleb(buf, pos)
+  let old_idx = pval(pk)
+  let new_idx = intarr_get(arr: remap, idx: old_idx)
+  let %out = bb.push_uleb128(buf: %out, val: new_idx)
+  return remap_elem_funcs(%out, buf, pos: ppos(pk), remaining: remaining - 1, remap)
+end
+
+export let emit_tag_sec_with_off = fn (out: %ByteBuffer, buf: &ByteBuffer, sec_pk: i64, off: i64) -> %ByteBuffer do
+  if sec_pk == 0 then return %out end
+  let tag_count = count_sec(buf, sec_pk)
+  let %tmp = bb.empty()
+  let %tmp = bb.push_uleb128(buf: %tmp, val: tag_count)
+  let %tmp = offset_tag_types(out: %tmp, buf, pos: sec_body(buf, sec_pk), remaining: tag_count, off)
+  let %out = emit_sec(%out, sec_id: 13, content: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+let offset_tag_types = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaining: i64, off: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let pk1 = rd_uleb(buf, pos)
+  let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk1))
+  let pk2 = rd_uleb(buf, pos: ppos(pk: pk1))
+  let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2) + off)
+  return offset_tag_types(%out, buf, pos: ppos(pk: pk2), remaining: remaining - 1, off)
+end
+
+// ─── Custom section preservation ──────────────────────────────────────────
+// Scan all custom sections (id=0) in buf. Returns an smap keyed by sequential
+// index ("0", "1", …) -> pack(content_start, sec_size). The special key
+// "__count" holds the total number of custom sections discovered.
+// `scan_secs` collapses all customs onto key="0", which is why we need this.
+export let scan_custom_secs = fn (buf: &ByteBuffer) -> %StringMap do
+  let %map = sm.empty()
+  return scan_custom_go(buf, pos: 8, end_pos: bb.length(buf), %map, idx: 0)
+end
+let scan_custom_go = fn (buf: &ByteBuffer, pos: i64, end_pos: i64, map: %StringMap, idx: i64) -> %StringMap do
+  if pos >= end_pos then
+    return sm.put(%map, key: "__count", value: idx)
+  end
+  let sec_id = bb.get_byte(buf, idx: pos)
+  let pk = rd_uleb(buf, pos: pos + 1)
+  let sec_size = pval(pk)
+  let content_start = ppos(pk)
+  if sec_id == 0 then
+    let %map = sm.put(%map, key: str.from_i64(val: idx), value: pack(val: content_start, p: sec_size))
+    return scan_custom_go(buf, pos: content_start + sec_size, end_pos, %map, idx: idx + 1)
+  end
+  return scan_custom_go(buf, pos: content_start + sec_size, end_pos, %map, idx)
+end
+
+// Compare the ULEB-prefixed section name at `content_start` to `target`.
+let custom_name_equals = fn (buf: &ByteBuffer, content_start: i64, target: string) -> bool do
+  let pk = rd_uleb(buf, pos: content_start)
+  let len = pval(pk)
+  let name_start = ppos(pk)
+  let tlen = str.byte_length(s: target)
+  if len != tlen then return false end
+  return name_eq_go(buf, start: name_start, target, i: 0, n: tlen)
+end
+let name_eq_go = fn (buf: &ByteBuffer, start: i64, target: string, i: i64, n: i64) -> bool do
+  if i >= n then return true end
+  if bb.get_byte(buf, idx: start + i) != str.char_code(s: target, idx: i) then return false end
+  return name_eq_go(buf, start, target, i: i + 1, n)
+end
+
+// Emit a custom section verbatim: id=0, ULEB(size), content bytes.
+let emit_custom_raw = fn (out: %ByteBuffer, src: &ByteBuffer, content_start: i64, sec_size: i64) -> %ByteBuffer do
+  let %out = bb.push_byte(buf: %out, byte: 0)
+  let %out = bb.push_uleb128(buf: %out, val: sec_size)
+  return bb.copy_range(dst: %out, src, start: content_start, end_pos: content_start + sec_size)
+end
+
+// Iterate name-section subsections; dispatch on subsec id.
+// Subsec 1 (func names) and 2 (local names) get func_idx remapped.
+// All other subsecs are pass-through.
+let emit_name_subsecs_go = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64,
+                                 end_pos: i64, remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+  if pos >= end_pos then return %out end
+  let sub_id = bb.get_byte(buf: src, idx: pos)
+  let pk = rd_uleb(buf: src, pos: pos + 1)
+  let sub_size = pval(pk)
+  let sub_start = ppos(pk)
+  let sub_end = sub_start + sub_size
+  let %out = if sub_id == 1 then
+      emit_name_funcsubsec(%out, src, sub_start, remap, remap_size)
+    else if sub_id == 2 then
+      emit_name_localsubsec(%out, src, sub_start, sub_size, remap, remap_size)
+    else
+      bb.copy_range(dst: %out, src, start: pos, end_pos: sub_end)
+    end
+  return emit_name_subsecs_go(%out, src, pos: sub_end, end_pos, remap, remap_size)
+end
+
+// Re-emit subsec 1 (function names): vec<(func_idx:ULEB, name:ULEB+bytes)>.
+// Build into tmp buf so we can prefix with ULEB(payload_len).
+let emit_name_funcsubsec = fn (out: %ByteBuffer, src: &ByteBuffer, sub_start: i64,
+                                 remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+  let pk = rd_uleb(buf: src, pos: sub_start)
+  let count = pval(pk)
+  let entries_start = ppos(pk)
+  let %tmp = bb.empty()
+  let %tmp = bb.push_uleb128(buf: %tmp, val: count)
+  let %tmp = emit_name_func_entries(out: %tmp, src, pos: entries_start,
+                                      remaining: count, remap, remap_size)
+  let tmp_len = bb.length(buf: &tmp)
+  let %out = bb.push_byte(buf: %out, byte: 1)
+  let %out = bb.push_uleb128(buf: %out, val: tmp_len)
+  let %out = bb.push_buf(dst: %out, src: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+let emit_name_func_entries = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64,
+                                   remaining: i64, remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let pk1 = rd_uleb(buf: src, pos)
+  let old_idx = pval(pk: pk1)
+  let after_idx = ppos(pk: pk1)
+  let pk2 = rd_uleb(buf: src, pos: after_idx)
+  let n_len = pval(pk: pk2)
+  let n_end = ppos(pk: pk2) + n_len
+  let new_idx = if old_idx < remap_size then intarr_get(arr: remap, idx: old_idx) else old_idx end
+  let %out = bb.push_uleb128(buf: %out, val: new_idx)
+  let %out = bb.copy_range(dst: %out, src, start: after_idx, end_pos: n_end)
+  return emit_name_func_entries(%out, src, pos: n_end, remaining: remaining - 1, remap, remap_size)
+end
+
+// Re-emit subsec 2 (local names): vec<(func_idx:ULEB, vec<(local_idx, name)>)>.
+// Only the outer func_idx is remapped; inner local vec is copied verbatim.
+let emit_name_localsubsec = fn (out: %ByteBuffer, src: &ByteBuffer, sub_start: i64, sub_size: i64,
+                                  remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+  let pk = rd_uleb(buf: src, pos: sub_start)
+  let count = pval(pk)
+  let entries_start = ppos(pk)
+  let sub_end = sub_start + sub_size
+  let %tmp = bb.empty()
+  let %tmp = bb.push_uleb128(buf: %tmp, val: count)
+  let %tmp = emit_name_local_entries(out: %tmp, src, pos: entries_start, end_pos: sub_end,
+                                       remaining: count, remap, remap_size)
+  let tmp_len = bb.length(buf: &tmp)
+  let %out = bb.push_byte(buf: %out, byte: 2)
+  let %out = bb.push_uleb128(buf: %out, val: tmp_len)
+  let %out = bb.push_buf(dst: %out, src: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+let emit_name_local_entries = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, end_pos: i64,
+                                    remaining: i64, remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let pk1 = rd_uleb(buf: src, pos)
+  let old_idx = pval(pk: pk1)
+  let after_idx = ppos(pk: pk1)
+  let pk2 = rd_uleb(buf: src, pos: after_idx)
+  let inner_count = pval(pk: pk2)
+  let inner_start = ppos(pk: pk2)
+  let inner_end = skip_local_inner(src, pos: inner_start, remaining: inner_count)
+  let new_idx = if old_idx < remap_size then intarr_get(arr: remap, idx: old_idx) else old_idx end
+  let %out = bb.push_uleb128(buf: %out, val: new_idx)
+  let %out = bb.copy_range(dst: %out, src, start: after_idx, end_pos: inner_end)
+  return emit_name_local_entries(%out, src, pos: inner_end, end_pos,
+                                   remaining: remaining - 1, remap, remap_size)
+end
+let skip_local_inner = fn (src: &ByteBuffer, pos: i64, remaining: i64) -> i64 do
+  if remaining <= 0 then return pos end
+  let pk1 = rd_uleb(buf: src, pos)
+  let pk2 = rd_uleb(buf: src, pos: ppos(pk: pk1))
+  let name_end = ppos(pk: pk2) + pval(pk: pk2)
+  return skip_local_inner(src, pos: name_end, remaining: remaining - 1)
+end
+
+// Emit a "name" custom section with function indices remapped via `remap`.
+// The section-name ULEB-string is copied verbatim; subsections are walked.
+let emit_name_remapped = fn (out: %ByteBuffer, src: &ByteBuffer,
+                              content_start: i64, sec_size: i64,
+                              remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+  let sec_end = content_start + sec_size
+  let pk = rd_uleb(buf: src, pos: content_start)
+  let name_len = pval(pk)
+  let name_end = ppos(pk) + name_len
+  let %payload = bb.empty()
+  let %payload = bb.copy_range(dst: %payload, src, start: content_start, end_pos: name_end)
+  let %payload = emit_name_subsecs_go(out: %payload, src, pos: name_end, end_pos: sec_end,
+                                        remap, remap_size)
+  let payload_len = bb.length(buf: &payload)
+  let %out = bb.push_byte(buf: %out, byte: 0)
+  let %out = bb.push_uleb128(buf: %out, val: payload_len)
+  let %out = bb.push_buf(dst: %out, src: &payload)
+  bb.free(buf: %payload)
+  return %out
+end
+
+// Emit all preserved custom sections from `buf`:
+//   * "name"  → rewritten via `remap` (func indices remapped per merge).
+//   * others  → passed through byte-for-byte (DWARF, producers, target_features,
+//     etc.). For .debug_* this is a placeholder — PC-offset rewriting is only
+//     needed when codegen starts emitting DWARF (currently it does not).
+export let emit_preserved_customs = fn (out: %ByteBuffer, buf: &ByteBuffer, customs: &StringMap,
+                                   remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+  let total = sm.get_or(map: customs, key: "__count", default: 0)
+  return emit_custom_each(%out, buf, customs, idx: 0, total,
+                            remap, remap_size)
+end
+let emit_custom_each = fn (out: %ByteBuffer, buf: &ByteBuffer, customs: &StringMap, idx: i64, total: i64,
+                             remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+  if idx >= total then return %out end
+  let pk = sm.get_or(map: customs, key: str.from_i64(val: idx), default: 0)
+  let content_start = pval(pk)
+  let sec_size = ppos(pk)
+  let %out = if custom_name_equals(buf, content_start, target: "name") then
+      emit_name_remapped(%out, src: buf, content_start, sec_size,
+                          remap, remap_size)
+    else
+      emit_custom_raw(%out, src: buf, content_start, sec_size)
+    end
+  return emit_custom_each(%out, buf, customs, idx: idx + 1, total,
+                            remap, remap_size)
+end

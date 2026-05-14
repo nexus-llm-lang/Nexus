@@ -1,0 +1,436 @@
+/**
+ * wasm/merge/instruction_rewrite: instruction-level rewriter for the
+ * stdlib-merge phase. Walks WASM function bodies, classifying each opcode
+ * into an operand-decode class and remapping function / type / global /
+ * table indices per the merge layout.
+ *
+ * Owns:
+ * - Operand-decode classes (`cls_*` constants)
+ * - Dense i32 array helpers (intarr_new / intarr_push / intarr_get)
+ * - Shared multi-return records (BufPos, RwCtx)
+ * - rw_instrs + per-class handlers (fc / simd / atomic prefixes, blocktype,
+ *   legacy_try / try_table, resume handlers)
+ *
+ * Does not own:
+ * - Section scanning / orchestration — see src/backend/wasm/merge.nx
+ * - Section emission — see src/backend/wasm/merge/section_emit.nx
+ */
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { SlebRes, pval, ppos, rd_uleb, rd_sleb, scan_sleb_end } from "src/backend/wasm/read.nx"
+import { op_unreachable,
+         op_block, op_loop, op_if, op_legacy_try, op_try_table, op_throw, op_br, op_br_if, op_br_table,
+         op_call, op_call_indirect, op_return_call,
+         op_local_get, op_local_set, op_local_tee,
+         op_global_get, op_global_set, op_table_get, op_table_set,
+         op_memory_size, op_memory_grow,
+         op_i32_const, op_i64_const, op_f64_const,
+         op_i32_load, op_i64_store32,
+         op_ref_func, op_fc_prefix,
+         op_cont_new, op_cont_bind, op_suspend, op_resume,
+         bt_void, wasm_form_func,
+         op_fc_memory_init, op_fc_memory_copy, op_fc_memory_fill,
+         op_fc_table_init, op_fc_table_copy,
+         op_simd_prefix,
+         op_atomic_prefix, op_atomic_fence,
+         op_simd_v128_load, op_simd_v128_store,
+         op_simd_i32x4_splat, op_simd_i64x2_splat,
+         op_simd_f32x4_splat, op_simd_f64x2_splat,
+         op_simd_i32x4_add, op_simd_i32x4_sub, op_simd_i32x4_mul,
+         op_simd_i64x2_add, op_simd_i64x2_sub, op_simd_i64x2_mul,
+         op_simd_f32x4_add, op_simd_f32x4_sub, op_simd_f32x4_mul, op_simd_f32x4_div,
+         op_simd_f64x2_add, op_simd_f64x2_sub, op_simd_f64x2_mul, op_simd_f64x2_div } from "src/backend/wasm/defs.nx"
+
+// ─── Operand-decode classes (rw_instrs) ──────────────────────────────────
+// Each opcode maps to one of these classes; the class then drives how
+// rw_instrs reads/copies the operand bytes after the opcode byte.
+let cls_no_operand   = 0   // already-pushed opcode byte; no operand to copy
+let cls_uleb         = 1   // single ULEB (no remap needed)
+let cls_call_indirect = 2   // type_idx (+ type_off), table_idx (+ tbl_off)
+let cls_blocktype    = 3   // blocktype byte or sleb heaptype
+let cls_sleb         = 4   // single SLEB128 (i32/i64 const)
+let cls_f64          = 5   // 8 raw bytes (f64.const)
+let cls_memarg       = 6   // 2 ULEBs (load/store: align, offset)
+let cls_mem_idx_byte = 7   // single byte (memory.size/grow memory index)
+let cls_br_table     = 8   // ULEB count + (count+1) ULEB labels
+let cls_legacy_try   = 9   // blocktype + ULEB count + (ULEB,ULEB) handlers
+let cls_fc_prefix    = 10  // 0xFC sub-opcode dispatch
+let cls_call         = 11  // call/return_call (remap func idx)
+let cls_global       = 12  // global.get/set (add glo_off)
+let cls_ref_func     = 13  // ref.func (remap func idx)
+let cls_cont_new     = 14
+let cls_cont_bind    = 15
+let cls_resume       = 16
+let cls_table        = 17  // table.get/set (add tbl_off)
+let cls_simd_prefix  = 18  // 0xFD sub-opcode dispatch (no func/type/global remap)
+let cls_try_table    = 19  // blocktype + ULEB count + (catch_kind, [tag], label) handlers
+let cls_atomic_prefix = 20 // 0xFE sub-opcode dispatch (threads/atomics; memarg operand, no remap)
+
+// ─── Dense i32 array (int→int table) ─────────────────────────────────────
+// Thin wrapper over stdlib ByteBuffer — avoids the from_i64 string allocation
+// that a StringMap lookup would do on every hot-path func-index remap (happens
+// thousands of times per merge).
+// Uses push_i32_le for writes and a 4-byte little-endian reassembly for reads.
+export let intarr_new = fn () -> %ByteBuffer do return bb.empty() end
+export let intarr_push = fn (arr: %ByteBuffer, val: i64) -> %ByteBuffer do
+  return bb.push_i32_le(buf: %arr, val)
+end
+export let intarr_get = fn (arr: &ByteBuffer, idx: i64) -> i64 do
+  let pos = idx * 4
+  let b0 = bb.get_byte(buf: arr, idx: pos)
+  let b1 = bb.get_byte(buf: arr, idx: pos + 1)
+  let b2 = bb.get_byte(buf: arr, idx: pos + 2)
+  let b3 = bb.get_byte(buf: arr, idx: pos + 3)
+  return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+end
+
+// Multi-return records.
+// BufPos: sub-emitters that consume src bytes return new buf + new src position.
+// RwCtx: type / table / global offsets applied during instruction rewriting.
+//        The remap intarr is passed as a separate &ByteBuffer borrow (rw_instrs
+//        only reads the remap, no linear threading needed).
+export type BufPos = BufPos(buf: %ByteBuffer, pos: i64)
+export type RwCtx = RwCtx(type_off: i64, tbl_off: i64, glo_off: i64)
+
+// ─── Instruction rewriter ─────────────────────────────────────────────────
+
+export let rw_body = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &ByteBuffer,
+    body_start: i64, body_end: i64) -> %ByteBuffer do
+  let pk = rd_uleb(buf: src, pos: body_start)
+  let n_local_groups = pval(pk)
+  let locals_end = skip_local_decls(buf: src, pos: ppos(pk), remaining: n_local_groups)
+  let %out = bb.copy_range(dst: %out, src, start: body_start, end_pos: locals_end)
+  return rw_instrs(ctx, remap, %out, src, pos: locals_end, end_pos: body_end)
+end
+
+let skip_local_decls = fn (buf: &ByteBuffer, pos: i64, remaining: i64) -> i64 do
+  if remaining <= 0 then return pos end
+  let pk = rd_uleb(buf, pos)
+  return skip_local_decls(buf, pos: ppos(pk) + 1, remaining: remaining - 1)
+end
+
+// Scan forward past `n` LEB128 values, returning the position after the last.
+// `scan_sleb_end` works for both ULEB and SLEB (terminator detection is shared).
+// Used by span-copy paths that avoid re-encoding index-free operands.
+let scan_lebs = fn (buf: &ByteBuffer, pos: i64, n: i64) -> i64 do
+  if n <= 0 then return pos end
+  return scan_lebs(buf, pos: scan_sleb_end(buf, pos), n: n - 1)
+end
+
+export let rw_instrs = fn (ctx: RwCtx, remap: &ByteBuffer, out: %ByteBuffer, src: &ByteBuffer, pos: i64, end_pos: i64) -> %ByteBuffer do
+  if pos >= end_pos then return %out end
+  let op = bb.get_byte(buf: src, idx: pos)
+  let pos = pos + 1
+
+  // Classify opcode into one of cls_* handling groups (see definitions above).
+  // Single flat else-if chain: Nexus's parser collapses `else if` into one
+  // chain, so two separate if-trees stitched with an outer `else (newline) if`
+  // double-nest beyond what the chain-collapsing logic can close. Keep flat.
+  let cls = if op_i32_load <= op && op <= op_i64_store32 then cls_memarg
+    else if op == op_memory_size then cls_mem_idx_byte
+    else if op == op_memory_grow then cls_mem_idx_byte
+    else if op == op_i32_const then cls_sleb
+    else if op == op_i64_const then cls_sleb
+    else if op == op_f64_const then cls_f64
+    else if op == op_ref_func then cls_ref_func
+    else if op == op_cont_new then cls_cont_new
+    else if op == op_cont_bind then cls_cont_bind
+    else if op == op_suspend then cls_uleb
+    else if op == op_resume then cls_resume
+    else if op == op_fc_prefix then cls_fc_prefix
+    else if op == op_simd_prefix then cls_simd_prefix
+    else if op == op_atomic_prefix then cls_atomic_prefix
+    else if op == op_block then cls_blocktype
+    else if op == op_loop then cls_blocktype
+    else if op == op_if then cls_blocktype
+    else if op == op_legacy_try then cls_legacy_try
+    else if op == op_try_table then cls_try_table
+    else if op == op_throw then cls_uleb
+    else if op == op_br then cls_uleb
+    else if op == op_br_if then cls_uleb
+    else if op == op_br_table then cls_br_table
+    else if op == op_call then cls_call
+    else if op == op_call_indirect then cls_call_indirect
+    else if op == op_return_call then cls_call
+    else if op == op_local_get then cls_uleb
+    else if op == op_local_set then cls_uleb
+    else if op == op_local_tee then cls_uleb
+    else if op == op_global_get then cls_global
+    else if op == op_global_set then cls_global
+    else if op == op_table_get then cls_table
+    else if op == op_table_set then cls_table
+    else cls_no_operand
+    end
+
+  let RwCtx(type_off, tbl_off, glo_off) = ctx
+
+  // Handle each class — flat if-return-end pattern for TCO + typechecker compat
+  let %out = bb.push_byte(buf: %out, byte: op)
+
+  if cls == cls_uleb then
+    // Single ULEB (local.get/set/tee, br, br_if, etc.) — no remap needed.
+    // Span-copy avoids rd_uleb (recursive shl arithmetic) + push_uleb128 re-encoding.
+    let end1 = scan_sleb_end(buf: src, pos)
+    let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: end1)
+    return rw_instrs(ctx, remap, %out, src, pos: end1, end_pos)
+  end
+  if cls == cls_call_indirect then
+    let pk = rd_uleb(buf: src, pos)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk) + type_off)
+    let pk2 = rd_uleb(buf: src, pos: ppos(pk))
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2) + tbl_off)
+    return rw_instrs(ctx, remap, %out, src, pos: ppos(pk: pk2), end_pos)
+  end
+  if cls == cls_blocktype then
+    let BufPos(buf: %out, pos) = rw_blocktype_operand(%out, src, pos, type_off)
+    return rw_instrs(ctx, remap, %out, src, pos, end_pos)
+  end
+  if cls == cls_sleb then
+    // SLEB operand: no remap needed, just copy bytes verbatim.
+    // Find terminal byte (first byte < 128 or >= 128 flipped — i.e., high bit clear)
+    // and bulk-copy. Avoids rd_sleb entirely (which was hitting a codegen quirk).
+    let end_sleb = scan_sleb_end(buf: src, pos)
+    let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: end_sleb)
+    return rw_instrs(ctx, remap, %out, src, pos: end_sleb, end_pos)
+  end
+  if cls == cls_f64 then
+    let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: pos + 8)
+    return rw_instrs(ctx, remap, %out, src, pos: pos + 8, end_pos)
+  end
+  if cls == cls_memarg then
+    // Memarg (align + offset) on load/store — 2 ULEBs, no remap. Span-copy.
+    let end1 = scan_sleb_end(buf: src, pos)
+    let end2 = scan_sleb_end(buf: src, pos: end1)
+    let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: end2)
+    return rw_instrs(ctx, remap, %out, src, pos: end2, end_pos)
+  end
+  if cls == cls_mem_idx_byte then
+    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
+    return rw_instrs(ctx, remap, %out, src, pos: pos + 1, end_pos)
+  end
+  if cls == cls_br_table then
+    // br_table: ULEB count + (count+1) ULEB labels — no remap. Span-copy the whole run.
+    let pk = rd_uleb(buf: src, pos)
+    let count = pval(pk)
+    let all_end = scan_lebs(buf: src, pos: ppos(pk), n: count + 1)
+    let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: all_end)
+    return rw_instrs(ctx, remap, %out, src, pos: all_end, end_pos)
+  end
+  if cls == cls_legacy_try then
+    let BufPos(buf: %out, pos) = rw_blocktype_operand(%out, src, pos, type_off)
+    let pk = rd_uleb(buf: src, pos)
+    let n_handlers = pval(pk)
+    let %out = bb.push_uleb128(buf: %out, val: n_handlers)
+    let BufPos(buf: %out, pos) = copy_try_handlers(%out, src, pos: ppos(pk), remaining: n_handlers)
+    return rw_instrs(ctx, remap, %out, src, pos, end_pos)
+  end
+  if cls == cls_try_table then
+    // Modern try_table: same operand shape as legacy_try — blocktype, ULEB
+    // handler count, then (catch_kind, [tag], label) per handler. The
+    // catch-kind encoding is identical (0/1 = catch[_ref] with tag+label,
+    // 2/3 = catch_all[_ref] with label only), so copy_try_handlers reuses
+    // exactly. Without this case, walker fell through to cls_no_operand and
+    // mis-decoded subsequent bytes — see nexus-3u93.
+    let BufPos(buf: %out, pos) = rw_blocktype_operand(%out, src, pos, type_off)
+    let pk = rd_uleb(buf: src, pos)
+    let n_handlers = pval(pk)
+    let %out = bb.push_uleb128(buf: %out, val: n_handlers)
+    let BufPos(buf: %out, pos) = copy_try_handlers(%out, src, pos: ppos(pk), remaining: n_handlers)
+    return rw_instrs(ctx, remap, %out, src, pos, end_pos)
+  end
+  if cls == cls_fc_prefix then
+    let pk = rd_uleb(buf: src, pos)
+    let sub_op = pval(pk)
+    let %out = bb.push_uleb128(buf: %out, val: sub_op)
+    let BufPos(buf: %out, pos) = rw_fc_prefix(%out, src, pos: ppos(pk), sub_op)
+    return rw_instrs(ctx, remap, %out, src, pos, end_pos)
+  end
+  if cls == cls_simd_prefix then
+    let pk = rd_uleb(buf: src, pos)
+    let sub_op = pval(pk)
+    let %out = bb.push_uleb128(buf: %out, val: sub_op)
+    let BufPos(buf: %out, pos) = rw_simd_prefix(%out, src, pos: ppos(pk), sub_op)
+    return rw_instrs(ctx, remap, %out, src, pos, end_pos)
+  end
+  if cls == cls_atomic_prefix then
+    let pk = rd_uleb(buf: src, pos)
+    let sub_op = pval(pk)
+    let %out = bb.push_uleb128(buf: %out, val: sub_op)
+    let BufPos(buf: %out, pos) = rw_atomic_prefix(%out, src, pos: ppos(pk), sub_op)
+    return rw_instrs(ctx, remap, %out, src, pos, end_pos)
+  end
+  if cls == cls_call then
+    // call / return_call: remap function index via intarr (dense i32 lookup)
+    let pk = rd_uleb(buf: src, pos)
+    let old_idx = pval(pk)
+    let new_idx = intarr_get(arr: remap, idx: old_idx)
+    let %out = bb.push_uleb128(buf: %out, val: new_idx)
+    return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
+  end
+  if cls == cls_global then
+    // global.get / global.set: add glo_off to index
+    let pk = rd_uleb(buf: src, pos)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk) + glo_off)
+    return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
+  end
+  if cls == cls_ref_func then
+    // ref.func: remap function index via intarr
+    let pk = rd_uleb(buf: src, pos)
+    let old_idx = pval(pk)
+    let new_idx = intarr_get(arr: remap, idx: old_idx)
+    let %out = bb.push_uleb128(buf: %out, val: new_idx)
+    return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
+  end
+  if cls == cls_cont_new then
+    // cont.new / cont.bind-single: type index + type_off
+    let pk = rd_uleb(buf: src, pos)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk) + type_off)
+    return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
+  end
+  if cls == cls_cont_bind then
+    // cont.bind: two type indices, both + type_off
+    let pk1 = rd_uleb(buf: src, pos)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk1) + type_off)
+    let pk2 = rd_uleb(buf: src, pos: ppos(pk: pk1))
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2) + type_off)
+    return rw_instrs(ctx, remap, %out, src, pos: ppos(pk: pk2), end_pos)
+  end
+  if cls == cls_resume then
+    // resume: cont type index + type_off, then handler table (pass-through)
+    let pk = rd_uleb(buf: src, pos)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk) + type_off)
+    let pk2 = rd_uleb(buf: src, pos: ppos(pk))
+    let n_ht = pval(pk: pk2)
+    let %out = bb.push_uleb128(buf: %out, val: n_ht)
+    let BufPos(buf: %out, pos: after_ht) = copy_resume_handlers(%out, src, pos: ppos(pk: pk2), remaining: n_ht)
+    return rw_instrs(ctx, remap, %out, src, pos: after_ht, end_pos)
+  end
+  if cls == cls_table then
+    let pk = rd_uleb(buf: src, pos)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk) + tbl_off)
+    return rw_instrs(ctx, remap, %out, src, pos: ppos(pk), end_pos)
+  end
+  // cls_no_operand: no operand, already pushed byte
+  return rw_instrs(ctx, remap, %out, src, pos, end_pos)
+end
+
+// Handle 0xFC prefix sub-opcodes (extracted to avoid deep nesting)
+let rw_fc_prefix = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, sub_op: i64) -> BufPos do
+  if sub_op <= 7 then return BufPos(buf: %out, pos) end
+  if sub_op == op_fc_memory_copy then
+    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
+    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos + 1))
+    return BufPos(buf: %out, pos: pos + 2)
+  end
+  if sub_op == op_fc_memory_fill then
+    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
+    return BufPos(buf: %out, pos: pos + 1)
+  end
+  if sub_op >= op_fc_memory_init then
+    let pk2 = rd_uleb(buf: src, pos)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2))
+    if sub_op == op_fc_memory_init then
+      let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: ppos(pk: pk2)))
+      return BufPos(buf: %out, pos: ppos(pk: pk2) + 1)
+    end
+    if sub_op == op_fc_table_init then
+      let pk3 = rd_uleb(buf: src, pos: ppos(pk: pk2))
+      let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk3))
+      return BufPos(buf: %out, pos: ppos(pk: pk3))
+    end
+    if sub_op == op_fc_table_copy then
+      let pk3 = rd_uleb(buf: src, pos: ppos(pk: pk2))
+      let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk3))
+      return BufPos(buf: %out, pos: ppos(pk: pk3))
+    end
+    return BufPos(buf: %out, pos: ppos(pk: pk2))
+  end
+  return BufPos(buf: %out, pos)
+end
+
+// Handle 0xFD prefix sub-opcodes (SIMD / fixed-width 128-bit). Subset coverage
+// matches the SIMD ops emitted by codegen.nx — load/store carry a memarg
+// (two ULEBs, no remap), splat / lane-arithmetic carry no further operands.
+// SIMD instructions never embed a func/type/global index, so no remap path
+// is exercised here.
+export let rw_simd_prefix = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, sub_op: i64) -> BufPos do
+  if sub_op == op_simd_v128_load || sub_op == op_simd_v128_store then
+    // memarg: 2 ULEBs (align, offset). Span-copy verbatim.
+    let end1 = scan_sleb_end(buf: src, pos)
+    let end2 = scan_sleb_end(buf: src, pos: end1)
+    let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: end2)
+    return BufPos(buf: %out, pos: end2)
+  end
+  if sub_op == op_simd_i32x4_splat || sub_op == op_simd_i64x2_splat
+      || sub_op == op_simd_f32x4_splat || sub_op == op_simd_f64x2_splat
+      || sub_op == op_simd_i32x4_add || sub_op == op_simd_i32x4_sub || sub_op == op_simd_i32x4_mul
+      || sub_op == op_simd_i64x2_add || sub_op == op_simd_i64x2_sub || sub_op == op_simd_i64x2_mul
+      || sub_op == op_simd_f32x4_add || sub_op == op_simd_f32x4_sub || sub_op == op_simd_f32x4_mul || sub_op == op_simd_f32x4_div
+      || sub_op == op_simd_f64x2_add || sub_op == op_simd_f64x2_sub || sub_op == op_simd_f64x2_mul || sub_op == op_simd_f64x2_div then
+    // No further operand bytes.
+    return BufPos(buf: %out, pos)
+  end
+  // Unhandled SIMD sub-opcode. Emission is gated by codegen.nx's emit_simd_*
+  // dispatch — only sub-ops listed above can appear in well-formed input.
+  // Reaching here means a new emit_simd_* path was added without a matching
+  // operand-decode case here. Splice an `unreachable` byte into the output so
+  // wasmtime traps at runtime instead of returning misdecoded SIMD as garbage,
+  // and hold `pos` steady so the next byte gets re-classified by rw_instrs's
+  // top-level dispatch — yielding a malformed wasm that the validator rejects
+  // at the outer merge_with_stdlib boundary, not silent corruption.
+  let %out = bb.push_byte(buf: %out, byte: op_unreachable)
+  return BufPos(buf: %out, pos)
+end
+
+// Handle 0xFE prefix sub-opcodes (threads / atomics). Every 0xFE op carries a
+// memarg (2 ULEBs: align, offset) and embeds no func/type/global index, so no
+// remap path is exercised — span-copy the operand bytes verbatim. The lone
+// exception is `atomic.fence` (sub 0x03), followed by one reserved memidx byte.
+let rw_atomic_prefix = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, sub_op: i64) -> BufPos do
+  if sub_op == op_atomic_fence then
+    let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
+    return BufPos(buf: %out, pos: pos + 1)
+  end
+  let end1 = scan_sleb_end(buf: src, pos)
+  let end2 = scan_sleb_end(buf: src, pos: end1)
+  let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: end2)
+  return BufPos(buf: %out, pos: end2)
+end
+
+let rw_blocktype_operand = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, type_off: i64) -> BufPos do
+  let b = bb.get_byte(buf: src, idx: pos)
+  // void blocktype (0x40) or valtype (>= 0x60)
+  if b == bt_void then
+    return BufPos(buf: bb.push_byte(buf: %out, byte: bt_void), pos: pos + 1)
+  end
+  // Blocktype encoded as a single valtype byte (0x60+ — covers vt_* and ref-tags).
+  if b >= wasm_form_func then
+    return BufPos(buf: bb.push_byte(buf: %out, byte: b), pos: pos + 1)
+  end
+  // Type index as sleb
+  let SlebRes(val: type_idx, pos: end2) = rd_sleb(buf: src, pos)
+  return BufPos(buf: bb.push_sleb128(buf: %out, val: type_idx + type_off), pos: end2)
+end
+
+export let copy_try_handlers = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64) -> BufPos do
+  if remaining <= 0 then return BufPos(buf: %out, pos) end
+  let catch_kind = bb.get_byte(buf: src, idx: pos)
+  let %out = bb.push_byte(buf: %out, byte: catch_kind)
+  if catch_kind <= 1 then
+    let pk = rd_uleb(buf: src, pos: pos + 1)
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk))
+    let pk2 = rd_uleb(buf: src, pos: ppos(pk))
+    let %out = bb.push_uleb128(buf: %out, val: pval(pk: pk2))
+    return copy_try_handlers(%out, src, pos: ppos(pk: pk2), remaining: remaining - 1)
+  end
+  let pk = rd_uleb(buf: src, pos: pos + 1)
+  let %out = bb.push_uleb128(buf: %out, val: pval(pk))
+  return copy_try_handlers(%out, src, pos: ppos(pk), remaining: remaining - 1)
+end
+
+let copy_resume_handlers = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, remaining: i64) -> BufPos do
+  if remaining <= 0 then return BufPos(buf: %out, pos) end
+  let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
+  let end2 = scan_lebs(buf: src, pos: pos + 1, n: 2)
+  let %out = bb.copy_range(dst: %out, src, start: pos + 1, end_pos: end2)
+  return copy_resume_handlers(%out, src, pos: end2, remaining: remaining - 1)
+end
