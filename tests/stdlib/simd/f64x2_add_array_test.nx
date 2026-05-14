@@ -1,0 +1,127 @@
+// Issue nexus-byiw subset: unit-test
+// `nxlib/stdlib/simd.nx::f64x2_add_array` — autovectorized
+// element-wise f64 addition over `n_quads × 2` lanes. Each quad is
+// 16 bytes (two f64 lanes); the intrinsic expands to a loop that
+// processes one quad per iteration via f64x2.add.
+//
+// Distinct from the existing oxdb_autovectorize_test which only
+// exercises the i32/i64 array intrinsics — float arrays have no
+// `scalar_*_array` fallback in the stdlib (no `mem.load_f32` /
+// `mem.store_f32`-derived float loop), so this is the first
+// fixture pinning the f64x2 array path end-to-end.
+//
+// Edge cases pinned:
+//   1. Single-quad (n_quads=1): dst[0..2] holds two f64 sums.
+//   2. Multi-quad (n_quads=3 → 6 lanes): every lane carries a
+//      distinct expected value so a lane-stride bug (e.g. SIMD
+//      ptr increment by 8 instead of 16 per iteration) surfaces.
+//   3. Negative-and-positive lane mix: catches a sign-handling
+//      regression in the lane-extract path.
+//   4. Zero-quad call (n_quads=0): dst region untouched (the loop
+//      counter starts at 0 and exits immediately).
+import * as test_assert from "std:test/assert"
+import * as mem from "std:runtime/mem"
+import * as arena from "std:runtime/arena"
+import * as simd from "std:simd"
+
+let align16 = fn (p: i64) -> i64 do
+  let r = p % 16
+  if r == 0 then return p end
+  return p + (16 - r)
+end
+
+let body = fn () -> unit throws { Exn } do
+  // Allocate three 64-byte regions (room for 4 quads = 8 f64 lanes each),
+  // aligned to 16 bytes. 80 bytes raw → slide up to next 16-byte boundary.
+  let pa = align16(p: arena.alloc_raw(size: 80))
+  let pb = align16(p: arena.alloc_raw(size: 80))
+  let pd = align16(p: arena.alloc_raw(size: 80))
+
+  // ── case 1: single-quad [1.5, 2.5] + [10.25, -3.75] = [11.75, -1.25]
+  let _ = mem.store_f64(addr: pa,     val: 1.5)
+  let _ = mem.store_f64(addr: pa + 8, val: 2.5)
+  let _ = mem.store_f64(addr: pb,     val: 10.25)
+  let _ = mem.store_f64(addr: pb + 8, val: 0.0 -. 3.75)
+  simd.f64x2_add_array(a_addr: pa, b_addr: pb, dst_addr: pd, n_quads: 1)
+  let s1_l0 = mem.load_f64(addr: pd)
+  let s1_l1 = mem.load_f64(addr: pd + 8)
+  let s1_l0_ok = s1_l0 ==. 11.75
+  let s1_l1_ok = s1_l1 ==. (0.0 -. 1.25)
+
+  // ── case 2: three-quad (6 lanes) — distinct lane values
+  //   a = [1, 2, 3, 4, 5, 6], b = [100, 200, 300, 400, 500, 600]
+  //   expected dst = [101, 202, 303, 404, 505, 606]
+  let _ = mem.store_f64(addr: pa,      val: 1.0)
+  let _ = mem.store_f64(addr: pa + 8,  val: 2.0)
+  let _ = mem.store_f64(addr: pa + 16, val: 3.0)
+  let _ = mem.store_f64(addr: pa + 24, val: 4.0)
+  let _ = mem.store_f64(addr: pa + 32, val: 5.0)
+  let _ = mem.store_f64(addr: pa + 40, val: 6.0)
+  let _ = mem.store_f64(addr: pb,      val: 100.0)
+  let _ = mem.store_f64(addr: pb + 8,  val: 200.0)
+  let _ = mem.store_f64(addr: pb + 16, val: 300.0)
+  let _ = mem.store_f64(addr: pb + 24, val: 400.0)
+  let _ = mem.store_f64(addr: pb + 32, val: 500.0)
+  let _ = mem.store_f64(addr: pb + 40, val: 600.0)
+  // Pre-fill dst with sentinel that none of the expected values match.
+  let _ = mem.store_f64(addr: pd,      val: 0.0 -. 1.0)
+  let _ = mem.store_f64(addr: pd + 8,  val: 0.0 -. 1.0)
+  let _ = mem.store_f64(addr: pd + 16, val: 0.0 -. 1.0)
+  let _ = mem.store_f64(addr: pd + 24, val: 0.0 -. 1.0)
+  let _ = mem.store_f64(addr: pd + 32, val: 0.0 -. 1.0)
+  let _ = mem.store_f64(addr: pd + 40, val: 0.0 -. 1.0)
+  simd.f64x2_add_array(a_addr: pa, b_addr: pb, dst_addr: pd, n_quads: 3)
+  let s2_l0 = mem.load_f64(addr: pd)
+  let s2_l1 = mem.load_f64(addr: pd + 8)
+  let s2_l2 = mem.load_f64(addr: pd + 16)
+  let s2_l3 = mem.load_f64(addr: pd + 24)
+  let s2_l4 = mem.load_f64(addr: pd + 32)
+  let s2_l5 = mem.load_f64(addr: pd + 40)
+
+  // ── case 3: mixed-sign single quad
+  let _ = mem.store_f64(addr: pa,     val: 0.0 -. 10.0)
+  let _ = mem.store_f64(addr: pa + 8, val: 7.5)
+  let _ = mem.store_f64(addr: pb,     val: 2.5)
+  let _ = mem.store_f64(addr: pb + 8, val: 0.0 -. 7.5)
+  simd.f64x2_add_array(a_addr: pa, b_addr: pb, dst_addr: pd, n_quads: 1)
+  let s3_l0 = mem.load_f64(addr: pd)
+  let s3_l1 = mem.load_f64(addr: pd + 8)
+
+  // ── case 4: zero quads — dst pre-fill must survive untouched
+  let _ = mem.store_f64(addr: pd,     val: 42.5)
+  let _ = mem.store_f64(addr: pd + 8, val: 99.25)
+  simd.f64x2_add_array(a_addr: pa, b_addr: pb, dst_addr: pd, n_quads: 0)
+  let s4_l0 = mem.load_f64(addr: pd)
+  let s4_l1 = mem.load_f64(addr: pd + 8)
+
+  test_assert.assert_true(cond: s1_l0_ok,
+    label: "f64x2_add_array n_quads=1 lane 0: 1.5 + 10.25 = 11.75")
+  test_assert.assert_true(cond: s1_l1_ok,
+    label: "f64x2_add_array n_quads=1 lane 1: 2.5 + -3.75 = -1.25")
+  test_assert.assert_true(cond: s2_l0 ==. 101.0,
+    label: "f64x2_add_array n_quads=3 lane 0: 1 + 100 = 101")
+  test_assert.assert_true(cond: s2_l1 ==. 202.0,
+    label: "f64x2_add_array n_quads=3 lane 1: 2 + 200 = 202")
+  test_assert.assert_true(cond: s2_l2 ==. 303.0,
+    label: "f64x2_add_array n_quads=3 lane 2 (quad 1 lane 0): 3 + 300 = 303")
+  test_assert.assert_true(cond: s2_l3 ==. 404.0,
+    label: "f64x2_add_array n_quads=3 lane 3 (quad 1 lane 1): 4 + 400 = 404")
+  test_assert.assert_true(cond: s2_l4 ==. 505.0,
+    label: "f64x2_add_array n_quads=3 lane 4 (quad 2 lane 0): 5 + 500 = 505")
+  test_assert.assert_true(cond: s2_l5 ==. 606.0,
+    label: "f64x2_add_array n_quads=3 lane 5 (quad 2 lane 1): 6 + 600 = 606")
+  test_assert.assert_true(cond: s3_l0 ==. (0.0 -. 7.5),
+    label: "f64x2_add_array mixed-sign lane 0: -10 + 2.5 = -7.5")
+  test_assert.assert_true(cond: s3_l1 ==. 0.0,
+    label: "f64x2_add_array mixed-sign lane 1: 7.5 + -7.5 = 0")
+  test_assert.assert_true(cond: s4_l0 ==. 42.5,
+    label: "f64x2_add_array n_quads=0: dst lane 0 untouched (sentinel preserved)")
+  test_assert.assert_true(cond: s4_l1 ==. 99.25,
+    label: "f64x2_add_array n_quads=0: dst lane 1 untouched (sentinel preserved)")
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end
