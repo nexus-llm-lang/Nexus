@@ -1,0 +1,114 @@
+// Issue nexus-byiw.1: unit-test merge.section_emit.copy_func_types_with_off —
+// the function-section emitter when merging a dep module into the main
+// module's type space. Each type index in the dep's function section
+// must be lifted by `off` (the count of pre-existing main types) so it
+// continues pointing at the same logical type entry after the merge.
+//
+// `copy_func_types_with_off(out, buf, sec_pk, off)`:
+//   * Reads ULEB count at sec_off(sec_pk)
+//   * For each entry, reads ULEB type_idx, emits ULEB(type_idx + off)
+//   * Output is JUST the entries; the caller wraps in a section header.
+//
+// Note the ULEB count is NOT copied — this function is meant to APPEND
+// to an already-counted body, so a test that conflates count vs entries
+// would be wrong. We assert the output equals only the remapped entries.
+//
+// `sec_pk` packing: `pack(val: content_start, p: section_size)`. The size
+// field is unused by this helper (it stops via the entry count), so we
+// pass 0 — the entry count is what governs termination.
+import * as test_assert from "std:test/assert"
+import * as bb from "std:bytebuffer"
+import { ByteBuffer } from "std:bytebuffer"
+import { copy_func_types_with_off } from "src/backend/wasm/merge/section_emit.nx"
+import { pack } from "src/backend/wasm/read.nx"
+
+let read_all = fn (buf: &ByteBuffer) -> [ i64 ] do
+  return read_all_go(buf, idx: 0, len: bb.length(buf), acc: [])
+end
+let read_all_go = fn (buf: &ByteBuffer, idx: i64, len: i64, acc: [ i64 ]) -> [ i64 ] do
+  if idx >= len then return reverse(xs: acc, out: []) end
+  let b = bb.get_byte(buf, idx)
+  return read_all_go(buf, idx: idx + 1, len, acc: b :: acc)
+end
+let reverse = fn (xs: [ i64 ], out: [ i64 ]) -> [ i64 ] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return reverse(xs: rest, out: x :: out)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  // ── case 1: 3 entries, all single-byte ULEBs, offset by 5 ──
+  // Source buffer at offset 2 (mimicking section payload after section
+  // header bytes): [pad, pad, 3, 0, 1, 2, pad]
+  //                            ^ count of entries
+  //                               ^ ^ ^ entries (idx 0, 1, 2)
+  // off = 5 → expected output: [5, 6, 7] (each idx + 5).
+  let %b0 = bb.empty()
+  let %b1 = bb.push_byte(buf: %b0, byte: 99)   // pad
+  let %b2 = bb.push_byte(buf: %b1, byte: 99)   // pad
+  let %b3 = bb.push_byte(buf: %b2, byte: 3)    // entry count
+  let %b4 = bb.push_byte(buf: %b3, byte: 0)    // type_idx 0
+  let %b5 = bb.push_byte(buf: %b4, byte: 1)    // type_idx 1
+  let %b6 = bb.push_byte(buf: %b5, byte: 2)    // type_idx 2
+  let %b7 = bb.push_byte(buf: %b6, byte: 99)   // trailing pad — must not be read
+  // sec_off = 2 (where the count lives), size unused → pack(val=2, p=0).
+  let sec_pk = pack(val: 2, p: 0)
+  let %o0 = bb.empty()
+  let %o1 = copy_func_types_with_off(out: %o0, buf: &b7, sec_pk, off: 5)
+  let out_bytes = read_all(buf: &o1)
+  let out_len = bb.length(buf: &o1)
+  bb.free(buf: %o1)
+  bb.free(buf: %b7)
+  test_assert.assert_eq_i64(actual: out_len, expected: 3,
+    label: "copy_func_types_with_off: 3 entries → 3 single-byte ULEBs out (no count, no pad)")
+  test_assert.assert_eq_i64_list(actual: out_bytes, expected: [ 5, 6, 7 ],
+    label: "copy_func_types_with_off: each type_idx remapped by +off=5")
+
+  // ── case 2: 1 entry, offset by 0 (identity) ──
+  // Sanity check the off=0 edge: function should be a verbatim copy
+  // of the ULEBs, NOT a no-op that drops everything.
+  let %c0 = bb.empty()
+  let %c1 = bb.push_byte(buf: %c0, byte: 1)   // count
+  let %c2 = bb.push_byte(buf: %c1, byte: 42)  // type_idx 42 (still single-byte ULEB)
+  let sec_pk_c = pack(val: 0, p: 0)
+  let %d0 = bb.empty()
+  let %d1 = copy_func_types_with_off(out: %d0, buf: &c2, sec_pk: sec_pk_c, off: 0)
+  let c_bytes = read_all(buf: &d1)
+  bb.free(buf: %d1)
+  bb.free(buf: %c2)
+  test_assert.assert_eq_i64_list(actual: c_bytes, expected: [ 42 ],
+    label: "copy_func_types_with_off: off=0 is identity (idx 42 stays 42)")
+
+  // ── case 3: 0 entries — termination via remaining<=0 ──
+  // count = 0 → output must be empty. A regression that reads even
+  // one trailing byte (treating count<=0 as "read until end") would
+  // surface here.
+  let %z0 = bb.empty()
+  let %z1 = bb.push_byte(buf: %z0, byte: 0)   // count = 0
+  let %z2 = bb.push_byte(buf: %z1, byte: 88)  // sentinel — must NOT be read
+  let sec_pk_z = pack(val: 0, p: 0)
+  let %y0 = bb.empty()
+  let %y1 = copy_func_types_with_off(out: %y0, buf: &z2, sec_pk: sec_pk_z, off: 7)
+  let y_len = bb.length(buf: &y1)
+  bb.free(buf: %y1)
+  bb.free(buf: %z2)
+  test_assert.assert_eq_i64(actual: y_len, expected: 0,
+    label: "copy_func_types_with_off: count=0 emits nothing (sentinel byte untouched)")
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end

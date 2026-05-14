@@ -1,0 +1,107 @@
+// Issue nexus-byiw.1: unit-test merge.section_emit.find_data_end —
+// the high-water-mark scanner over a wasm data section. Returns the
+// largest (offset + length) of any segment, used by merge.nx to pick
+// the relocation base for stitching dep-module data on top of main-
+// module data without clobbering.
+//
+// Active segment encoding (the only shape this scanner handles —
+// passive segments are not currently emitted by codegen):
+//   flags(1 byte = 0x00)
+//   opcode(1 byte = 0x41 i32.const)
+//   offset:ULEB
+//   end(1 byte = 0x0B)
+//   len:ULEB
+//   data:[len bytes]
+//
+// A regression that returned the LAST segment's end instead of the
+// MAX would silently corrupt merge for any data section where segments
+// are non-monotonic. We assert that case explicitly (case 2).
+import * as test_assert from "std:test/assert"
+import * as bb from "std:bytebuffer"
+import { find_data_end } from "src/backend/wasm/merge/section_emit.nx"
+import { pack } from "src/backend/wasm/read.nx"
+
+let body = fn () -> unit throws { Exn } do
+  // ── case 0: sec_pk=0 short-circuits to 0 ──
+  // "no data section" is encoded as sec_pk == 0; must NOT touch the buffer.
+  let %z = bb.empty()
+  let end0 = find_data_end(buf: &z, sec_pk: 0)
+  bb.free(buf: %z)
+  test_assert.assert_eq_i64(actual: end0, expected: 0,
+    label: "find_data_end: sec_pk=0 (no data section) returns 0")
+
+  // ── case 1: single segment, offset=10, len=4 → end = 14 ──
+  // sec_pk MUST be non-zero (sec_pk==0 is the "no data section"
+  // sentinel). We place the section payload at byte offset 1 with a
+  // single byte of padding before it; sec_pk = pack(1, _size_) = u32_radix.
+  // Buffer layout at sec_off=1:
+  //   [pad, count=1, flags=0, opcode=0x41, offset=10, end=0x0B, len=4, d0..d3]
+  let %b0 = bb.empty()
+  let %b1 = bb.push_byte(buf: %b0, byte: 99)   // pad
+  let %b2 = bb.push_byte(buf: %b1, byte: 1)    // count of segments (at sec_off=1)
+  let %b3 = bb.push_byte(buf: %b2, byte: 0)    // flags
+  let %b4 = bb.push_byte(buf: %b3, byte: 65)   // 0x41 i32.const
+  let %b5 = bb.push_byte(buf: %b4, byte: 10)   // offset ULEB
+  let %b6 = bb.push_byte(buf: %b5, byte: 11)   // 0x0B end
+  let %b7 = bb.push_byte(buf: %b6, byte: 4)    // len ULEB
+  let %b8 = bb.push_byte(buf: %b7, byte: 100)  // payload
+  let %b9 = bb.push_byte(buf: %b8, byte: 101)
+  let %ba = bb.push_byte(buf: %b9, byte: 102)
+  let %bb1 = bb.push_byte(buf: %ba, byte: 103)
+  // sec_pk: val=sec_off=1, p=section_size (unused by find_data_end).
+  let sec_pk_1 = pack(val: 1, p: 0)
+  let end1 = find_data_end(buf: &bb1, sec_pk: sec_pk_1)
+  bb.free(buf: %bb1)
+  test_assert.assert_eq_i64(actual: end1, expected: 14,
+    label: "find_data_end: single segment offset=10 + len=4 → 14")
+
+  // ── case 2: two segments, MAX must win (not last) ──
+  // Seg A: offset=100, len=2 → end=102 (the high-water).
+  // Seg B: offset=20,  len=5 → end=25  (smaller; comes AFTER seg A in
+  //   section order — a regression that returned the LAST segment
+  //   would give 25, not 102).
+  // Place payload at sec_off=1 (sec_pk!=0 short-circuit), with one pad byte.
+  let %c0 = bb.empty()
+  let %c1 = bb.push_byte(buf: %c0, byte: 99)    // pad
+  let %c2 = bb.push_byte(buf: %c1, byte: 2)     // count
+  // Seg A
+  let %c3 = bb.push_byte(buf: %c2, byte: 0)     // flags
+  let %c4 = bb.push_byte(buf: %c3, byte: 65)
+  let %c5 = bb.push_byte(buf: %c4, byte: 100)   // offset=100 fits in 1 ULEB byte (100 < 128)
+  let %c6 = bb.push_byte(buf: %c5, byte: 11)
+  let %c7 = bb.push_byte(buf: %c6, byte: 2)     // len=2
+  let %c8 = bb.push_byte(buf: %c7, byte: 1)
+  let %c9 = bb.push_byte(buf: %c8, byte: 2)
+  // Seg B
+  let %ca = bb.push_byte(buf: %c9, byte: 0)
+  let %cb = bb.push_byte(buf: %ca, byte: 65)
+  let %cc = bb.push_byte(buf: %cb, byte: 20)    // offset=20
+  let %cd = bb.push_byte(buf: %cc, byte: 11)
+  let %ce = bb.push_byte(buf: %cd, byte: 5)     // len=5
+  let %cf = bb.push_byte(buf: %ce, byte: 3)
+  let %cg = bb.push_byte(buf: %cf, byte: 4)
+  let %ch = bb.push_byte(buf: %cg, byte: 5)
+  let %ci = bb.push_byte(buf: %ch, byte: 6)
+  let %cj = bb.push_byte(buf: %ci, byte: 7)
+  let sec_pk_2 = pack(val: 1, p: 0)
+  let end2 = find_data_end(buf: &cj, sec_pk: sec_pk_2)
+  bb.free(buf: %cj)
+  test_assert.assert_eq_i64(actual: end2, expected: 102,
+    label: "find_data_end: takes MAX (seg A end=102) even when seg B comes later with smaller end")
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end

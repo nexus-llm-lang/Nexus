@@ -1,0 +1,118 @@
+// Issue nexus-byiw.1: unit-test merge.section_emit.emit_remapped_exports —
+// the export-section emitter that rewrites function-export indices via
+// the func remap table built during merge. Non-func exports (table,
+// memory, global, tag) pass through verbatim.
+//
+// Export entry layout: ULEB(name_len) + name_bytes + kind + ULEB(old_idx).
+// `emit_remapped_exports`:
+//   * Wraps output as full section: [sec_id=7, ULEB(body_len), body].
+//   * Body = ULEB(count) + remapped entries.
+//   * kind==0 (func): old_idx -> intarr_get(remap, old_idx).
+//   * kind!=0: old_idx copied verbatim.
+//
+// The intarr is a packed 4-byte-LE table of i32 indices, built via
+// intarr_push.
+import * as test_assert from "std:test/assert"
+import * as bb from "std:bytebuffer"
+import { ByteBuffer } from "std:bytebuffer"
+import { emit_remapped_exports } from "src/backend/wasm/merge/section_emit.nx"
+import { intarr_new, intarr_push } from "src/backend/wasm/merge/instruction_rewrite.nx"
+import { pack } from "src/backend/wasm/read.nx"
+
+let read_all = fn (buf: &ByteBuffer) -> [ i64 ] do
+  return read_all_go(buf, idx: 0, len: bb.length(buf), acc: [])
+end
+let read_all_go = fn (buf: &ByteBuffer, idx: i64, len: i64, acc: [ i64 ]) -> [ i64 ] do
+  if idx >= len then return reverse(xs: acc, out: []) end
+  let b = bb.get_byte(buf, idx)
+  return read_all_go(buf, idx: idx + 1, len, acc: b :: acc)
+end
+let reverse = fn (xs: [ i64 ], out: [ i64 ]) -> [ i64 ] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return reverse(xs: rest, out: x :: out)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  // ── case 1: m_sec=0 short-circuits, output untouched ──
+  let %z_src = bb.empty()
+  let %z_remap = intarr_new()
+  let %z_out = bb.empty()
+  let %z_out2 = emit_remapped_exports(out: %z_out, m_buf: &z_src, m_sec: 0, remap: &z_remap)
+  let z_len = bb.length(buf: &z_out2)
+  bb.free(buf: %z_out2)
+  bb.free(buf: %z_src)
+  bb.free(buf: %z_remap)
+  test_assert.assert_eq_i64(actual: z_len, expected: 0,
+    label: "emit_remapped_exports: m_sec=0 (no export section) emits nothing")
+
+  // ── case 2: 2 exports — one func (kind=0, remapped), one memory (kind=2, passthrough) ──
+  // Source at sec_off=0 (sec_pk MUST be non-zero — pack(0, sz) where sz>0 works,
+  // since pack(val, p) = val * radix + p and p=sz makes the whole thing non-zero).
+  // Actually we need non-zero pk overall, AND sec_off (which is pval) must point
+  // at the count. We pad by one byte so sec_off=1 (pval=1 ≠ 0).
+  //
+  // Layout starting at byte 1:
+  //   [pad, count=2,
+  //    name_len=1, 'a', kind=0, old_idx=3,   // func export, will be remapped
+  //    name_len=2, 'b', 'c', kind=2, old_idx=0] // memory export, verbatim
+  let %s0 = bb.empty()
+  let %s1 = bb.push_byte(buf: %s0, byte: 99)   // pad
+  let %s2 = bb.push_byte(buf: %s1, byte: 2)    // count
+  // Func export "a" with old_idx=3
+  let %s3 = bb.push_byte(buf: %s2, byte: 1)    // name_len=1
+  let %s4 = bb.push_byte(buf: %s3, byte: 97)   // 'a'
+  let %s5 = bb.push_byte(buf: %s4, byte: 0)    // kind=func
+  let %s6 = bb.push_byte(buf: %s5, byte: 3)    // old_idx=3
+  // Memory export "bc" with old_idx=0
+  let %s7 = bb.push_byte(buf: %s6, byte: 2)    // name_len=2
+  let %s8 = bb.push_byte(buf: %s7, byte: 98)   // 'b'
+  let %s9 = bb.push_byte(buf: %s8, byte: 99)   // 'c'
+  let %sa = bb.push_byte(buf: %s9, byte: 2)    // kind=memory
+  let %sb = bb.push_byte(buf: %sa, byte: 0)    // old_idx=0
+
+  // Remap: idx 0->100, 1->101, 2->102, 3->77. Only idx=3 is hit by this fixture.
+  let %r0 = intarr_new()
+  let %r1 = intarr_push(arr: %r0, val: 100)
+  let %r2 = intarr_push(arr: %r1, val: 101)
+  let %r3 = intarr_push(arr: %r2, val: 102)
+  let %r4 = intarr_push(arr: %r3, val: 77)
+
+  let sec_pk = pack(val: 1, p: 0)
+  let %o0 = bb.empty()
+  let %o1 = emit_remapped_exports(out: %o0, m_buf: &sb, m_sec: sec_pk, remap: &r4)
+  let out_bytes = read_all(buf: &o1)
+  let out_len = bb.length(buf: &o1)
+  bb.free(buf: %o1)
+  bb.free(buf: %sb)
+  bb.free(buf: %r4)
+
+  // Expected body:
+  //   count=2,
+  //   name_len=1, 'a', kind=0, new_idx=77 (remapped from 3),
+  //   name_len=2, 'b', 'c', kind=2, old_idx=0 (verbatim)
+  // = [2, 1, 97, 0, 77, 2, 98, 99, 2, 0] = 10 bytes payload.
+  // Wrapped: [7, 10, ...body...] = 12 bytes total.
+  test_assert.assert_eq_i64(actual: out_len, expected: 12,
+    label: "emit_remapped_exports: 10-byte payload + sec_id + ULEB len = 12 bytes")
+  test_assert.assert_eq_i64_list(actual: out_bytes,
+    expected: [ 7, 10, 2, 1, 97, 0, 77, 2, 98, 99, 2, 0 ],
+    label: "emit_remapped_exports: func idx 3 remapped to 77; memory idx 0 verbatim")
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end
