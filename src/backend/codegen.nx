@@ -83,6 +83,7 @@ import { extract_memo_names, extract_memo_slots,
          emit_cast_to_i32, emit_cast_to_i64,
          emit_lazy_passthrough,
          emit_bt_depth, emit_bt_frame, emit_capture_backtrace,
+         emit_bt_push_prologue, emit_bt_raise_snapshot,
          emit_array_get, emit_array_set, emit_array_length,
          emit_f64_unary,
          emit_simd_binop_one, emit_simd_binop_array,
@@ -112,7 +113,8 @@ import { DedupExtResult,
          build_internal_func_entries, build_external_func_entries,
          find_bt_capture_idx, dedup_externals, append_func_entries,
          build_closure_table, collect_closure_arities,
-         build_name_section, build_closure_type_idx_list } from "src/backend/codegen/module_asm.nx"
+         build_name_section, build_closure_type_idx_list,
+         build_bt_symbols_section } from "src/backend/codegen/module_asm.nx"
 import { LocalResult, MemoryMode, MemoryNone, MemoryDefined, MemoryImported }, * as wcollect from "src/backend/wasm/collect.nx"
 import { HashMap }, * as hmap from "std:hashmap"
 import { StrMap } from "src/common/strmap.nx"
@@ -733,17 +735,12 @@ let emit_expr = fn (expr: LirExpr, buf: %ByteBuffer, ctx: CodegenCtx, in_try: bo
       return emit_typed_field_load(typ: ftyp, %buf, offset: (idx + 1) * 8)
 
     | LirExprRaise(value: v, typ: _) ->
-      // Per-function backtrace capture (issue nexus-55x0). Emit a `call`
-      // to the imported `__nx_main_wrap_bt_capture` immediately before
-      // `op_throw` so the host can snapshot the wasm call stack before
-      // unwinding. bt_capture_idx is -1 when the enclosing function's
-      // EffectMap entry has can_throw=false or when the capture import
-      // was never resolved (no main_wrap fired).
-      let CodegenCtx(bt_capture_idx, _) = ctx
-      let %buf = if bt_capture_idx >= 0 then
-        let %b = bb.push_byte(%buf, byte: op_call)
-        bb.push_uleb128(buf: %b, val: bt_capture_idx)
-      else %buf end
+      // Backtrace snapshot (nexus-i6fj V1). Copy `depth` -> `saved_depth`
+      // on page 18 so __nx_bt_depth/__nx_bt_frame see the raising frame.
+      // The legacy bt_capture_idx call has been folded into this inline
+      // snapshot; the external is filtered out of the import section so
+      // no real `call` is needed.
+      let %buf = emit_bt_raise_snapshot(%buf)
       let %buf = emit_atom(atom: v, %buf, ctx)
       // Unit-typed raise: push i64(0) as payload
       let %buf = if wdefs.is_unit(typ: wdefs.atom_type(atom: v)) then
@@ -1328,8 +1325,14 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx) -> %ByteBuff
   // apply to them.
   let rt = if is_closure_lift(name: fname) && wdefs.is_unit(typ: raw_rt) then TyI64 else raw_rt end
   let %body = bb.empty()
-  let CodegenCtx(locals: locs, _) = ctx
+  let CodegenCtx(locals: locs, bt_capture_idx: bt_pn, _) = ctx
   let %body = wsect.emit_local_decls(buf: %body, locals: locs, param_count: list.length(xs: ps))
+  // Backtrace prologue (nexus-i6fj V1): for can_throw functions, atomically
+  // push the function's packed-name into the page-18 ring buffer so the next
+  // raise's snapshot covers this frame. bt_pn is the packed `(off<<32)|len`
+  // string-pool value, or -1 to skip (pure fns, or fname missing from pool).
+  let %body = if bt_pn >= 0 then emit_bt_push_prologue(buf: %body, packed_name: bt_pn)
+              else %body end
 
   // TCMC: detect pattern and set up locals
   let tcmc_raw = detect_tcmc(body: b, func_name: fname)
@@ -1646,6 +1649,27 @@ let append_body_to_buf = fn (buf: %ByteBuffer, body: %ByteBuffer) -> %ByteBuffer
   return %buf
 end
 
+/** Collect the names of every `can_throw` function so they can be added to */
+/** the string-literal pool (nexus-i6fj V1). The prologue references each */
+/** name via `lookup_string(fname, entries)` → packed `(off<<32)|len`, which */
+/** requires the name to live in the data segment. Pure functions skip the */
+/** pool. */
+let collect_bt_func_names = fn (funcs: [LirFunction], em: &EffectMap, acc: [string]) -> [string] do
+  match funcs do
+    | [] -> return acc
+    | LirFunction(name: n, _) :: rest ->
+      // Avoid `let keep = match ...` — the seed's codegen mishandles bool
+      // arm-results bound to a let. Inline the branch instead.
+      match lookup_bits(em, name: n) do
+        | Some(val: EffectBits(can_throw: ct, is_pure: _)) ->
+          let acc2 = if ct then n :: acc else acc end
+          return collect_bt_func_names(funcs: rest, em, acc: acc2)
+        | None ->
+          return collect_bt_func_names(funcs: rest, em, acc: n :: acc)
+      end
+  end
+end
+
 /** Per-function backtrace-capture index for `func_name`. */
 /** Returns -1 (= elide) when `bt_capture_idx_global == -1` (capture import */
 /** absent from the program) or when the function's EffectMap entry says */
@@ -1670,12 +1694,36 @@ export let resolve_bt_capture_for_func = fn (func_name: string, effect_map: &Eff
   end
 end
 
+/** Per-function packed name for backtrace prologue (nexus-i6fj V1). Returns */
+/** the packed `(offset<<32)|len` of `func_name` in the string-literal pool */
+/** when `EffectMap.can_throw == true`, or -1 to skip the push. EffectMap- */
+/** absent functions (synthesised wrappers) get instrumented on the */
+/** conservative side. The legacy `bt_capture_idx_global` import is */
+/** filtered out of the import section; raise sites now snapshot inline. */
+let resolve_bt_push_packed = fn (func_name: string, effect_map: &EffectMap,
+                                   string_lits: [StringEntry]) -> i64 do
+  // Direct arm-return: avoid binding `match` result to a let-variable
+  // (the seed's codegen double-extends bool-from-arm into i64 and the
+  // resulting wasm fails validation — pattern only matters during the
+  // first stage of bootstrap with the legacy seed).
+  match lookup_bits(em: effect_map, name: func_name) do
+    | Some(val: EffectBits(can_throw: ct, is_pure: _)) ->
+      if ct then return wdefs.lookup_string(value: func_name, entries: string_lits) end
+      return -1
+    | None -> return wdefs.lookup_string(value: func_name, entries: string_lits)
+  end
+end
+
 let emit_one_body = fn (buf: %ByteBuffer, f: LirFunction,
                          cctx: CompileCtx) -> %ByteBuffer throws { CodegenError } do
   let LirFunction(name: fname, _) = f
-  let CompileCtx(effect_map: em, bt_capture_idx_global: btg, _) = cctx
-  let bt_capture_idx = resolve_bt_capture_for_func(func_name: fname, effect_map: em,
-                                                     bt_capture_idx_global: btg)
+  let CompileCtx(effect_map: em, bt_capture_idx_global: btg, string_lits: sl, _) = cctx
+  // Legacy slot for the (filtered-out) host capture call; kept so the
+  // backtrace-elision test continues to exercise the gate.
+  let _ = resolve_bt_capture_for_func(func_name: fname, effect_map: em,
+                                        bt_capture_idx_global: btg)
+  // Prologue push: packed-name from the string pool, or -1 to skip.
+  let bt_capture_idx = resolve_bt_push_packed(func_name: fname, effect_map: em, string_lits: sl)
   // Build locals + packed map up front; map is owned here so we can free it
   // after the body finishes (issue nexus-m2xq).
   match build_func_locals(func: f) do
@@ -1770,7 +1818,12 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
         | _ -> -1
       end
 
-      let all_strings = wcollect.collect_program_strings(funcs, acc: [])
+      let base_strings = wcollect.collect_program_strings(funcs, acc: [])
+      // Append the names of can_throw functions (nexus-i6fj V1) so the
+      // prologue can store each via `i64.const <packed>` referencing the
+      // string-literal pool. Pure functions are NOT instrumented so their
+      // names skip the pool.
+      let all_strings = collect_bt_func_names(funcs, em: effect_map, acc: base_strings)
       let string_entries = wcollect.build_string_entries(strings: all_strings, next_offset: string_data_base, acc: [])
       let has_strings = list.length(xs: string_entries) > 0
 
@@ -1955,6 +2008,17 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
       let %m = bb.push_uleb128(buf: %m, val: name_payload_len)
       let %m = bb.push_buf(dst: %m, src: &name_payload)
       bb.free(buf: %name_payload)
+
+      // `nx.bt.symbols` (nexus-i6fj V1): tool-facing func-idx -> name
+      // mapping. Runtime backtrace resolution does NOT use this section;
+      // the prologue stores the packed name in the page-18 ring buffer
+      // directly. External tooling reads this to decode raw frame ids.
+      let %bt_sym_payload = build_bt_symbols_section(funcs, import_count)
+      let bt_sym_len = bb.length(buf: &bt_sym_payload)
+      let %m = bb.push_byte(buf: %m, byte: sec_custom)
+      let %m = bb.push_uleb128(buf: %m, val: bt_sym_len)
+      let %m = bb.push_buf(dst: %m, src: &bt_sym_payload)
+      bb.free(buf: %bt_sym_payload)
 
       wdefs.free_func_map(map: %internal_func_map)
       wdefs.free_func_map(map: %external_func_map)
