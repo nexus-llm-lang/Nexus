@@ -159,6 +159,41 @@ Both `//` and `/* ... */` comment forms are supported. Block comments
 close in the right order. Useful for commenting out a region that already
 contains block-comment'd code.
 
+## Statement-typing deltas
+
+Points where the in-tree implementation matches user expectation but the
+canonical `type-system-formal.md` spec is incomplete. Code behaves as
+documented here; the spec is being tightened separately.
+
+### Expression statements (T-ExprStmt) — nexus-ka1m
+
+The term grammar `s ::= ... | e` admits a bare expression as a statement,
+but the spec has no rule lifting `Γ; ρ_q ⊢_e e : τ ! ρ_e` into the
+statement judgement `Γ; ρ_q; τ_r ⊢_s e : Γ ! ρ_e`. The implementation
+*does* lift expressions: `infer_stmt` dispatches the `Expr(e)` HIR
+statement straight to `infer_expr` (`src/typecheck/infer.nx`,
+`infer_stmt`'s `Expr` arm). A future spec patch will add a `T-ExprStmt`
+rule with output `Γ` unchanged and `tail(...) = τ`. Until then, treat
+`s ::= e` derivations as "typed by `infer_expr` with the surrounding
+`τ_r`".
+
+### `tail` and divergent destructuring let — nexus-1t8n
+
+The `tail(s̄)` predicate (§Expressions) classifies the last statement
+of a block as ⊥ when it is `return`, an expression-statement `raise e`,
+or a single-binder `let μx = raise e'`. The destructuring form
+`let p = raise e` (handled by `T-LetPat-Diverge`) is **not** in the ⊥
+list and currently falls into the `unit` "otherwise" arm. In practice
+a match arm whose body is exactly `let Some(y) = raise NotFound(...) end`
+types as `unit` rather than ⊥, and `T-Match`'s divergent-arm carve-out
+does not fire — HIR desugars the form to
+`match (raise e) do | p -> end` (`src/ir/hir/hir.nx`, `StmtLetPattern`
+case), and the trailing `infer_stmts([])` yields `TyUnit`. Workaround
+when you want the arm classified as divergent: write `raise e` as an
+expression-statement (or precede with `return`) instead of binding it.
+The pending spec fix extends the ⊥ clause to `let p = raise e'` so both
+binding shapes behave uniformly.
+
 ## Effect System (Caps & Handlers)
 
 Nexus uses coeffects for dependency injection, NOT algebraic effects. See https://nexus-llm-lang.github.io/latest/spec/effects for details.
