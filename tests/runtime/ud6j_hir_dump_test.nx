@@ -1,0 +1,145 @@
+// Issue nexus-ud6j — HIR dump (`nexus hir <file> --format=json|text`) V1.
+//
+// Exercises `hir_to_text` / `hir_to_json` directly rather than spawning a
+// `nexus hir` subprocess. Rationale matches kmel_json_format_test.nx and
+// fnuw_mcp_smoke_test.nx: `Proc.exec` returns -1 under WASI preview1 (the
+// test harness's runtime), so subprocess invocations never reach actual
+// driver code. Direct calls into the dump helpers cover the same code
+// path the driver invokes per request.
+//
+// Coverage:
+//   1. Text dump starts with the "=== HIR dump" banner.
+//   2. JSON dump parses through std:json and exposes a top-level
+//      `{kind: "hir", functions: [...]}` object.
+//   3. A non-empty fixture program produces at least one HirFunction
+//      record carrying the expected fields (`name`, `params`, `ret_type`,
+//      `body_pp`).
+
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import * as ir_dump from "src/tools/ir_dump.nx"
+import * as json from "std:json"
+import { JsonValue, JsonObject, JsonArray, JsonString, get_field } from "std:json"
+import { Some, None } from "std:option"
+import { Span } from "src/common/token.nx"
+import {
+  HirProgram, HirFunction, HirParam, HirBody, EagerBody,
+  HirStmt, HirStmtKind, HirExpr, HirExprKind
+} from "src/ir/hir/types.nx"
+import { SigilImmutable, LitInt, TyI64, TyUnit } from "src/common/ast.nx"
+
+// ─── Fixture: synthesise a minimal HIR program ──────────────────────────────
+
+let synth_program = fn () -> HirProgram do
+  let sp = Span(offset: 0, line: 1, col: 1)
+  // body: return 42
+  let lit_expr = HirExpr(node: Literal(lit: LitInt(val: 42)), span: sp)
+  let ret_stmt = HirStmt(node: Return(expr: lit_expr), span: sp)
+  let body = EagerBody(stmts: [ret_stmt])
+  let f = HirFunction(
+    name: "fortytwo",
+    type_params: [],
+    params: [],
+    ret_type: TyI64,
+    throw_row: TyUnit,
+    body,
+    span: sp,
+    file: "<synth>"
+  )
+  return HirProgram(
+    ports: [],
+    functions: [f],
+    externals: [],
+    handler_bindings: [],
+    enum_defs: [],
+    exception_groups: [],
+    value_binding_names: [],
+    type_defs: []
+  )
+end
+
+// ─── Helpers for poking at JSON ─────────────────────────────────────────────
+
+let expect_object = fn (v: JsonValue, label: string) -> [json.JsonField] throws { Exn } do
+  match v do
+    | JsonObject(fields) -> return fields
+    | _ -> raise RuntimeError(val: label ++ ": expected JsonObject")
+  end
+end
+
+let expect_array = fn (v: JsonValue, label: string) -> [JsonValue] throws { Exn } do
+  match v do
+    | JsonArray(items) -> return items
+    | _ -> raise RuntimeError(val: label ++ ": expected JsonArray")
+  end
+end
+
+let expect_string = fn (v: JsonValue, label: string) -> string throws { Exn } do
+  match v do
+    | JsonString(val: s) -> return s
+    | _ -> raise RuntimeError(val: label ++ ": expected JsonString")
+  end
+end
+
+let require_field = fn (obj: JsonValue, key: string, label: string) -> JsonValue throws { Exn } do
+  match get_field(obj, key) do
+    | Some(val: v) -> return v
+    | None -> raise RuntimeError(val: label ++ ": missing field '" ++ key ++ "'")
+  end
+end
+
+// ─── Test 1: text dump banner ──────────────────────────────────────────────
+
+let test_text_banner = fn () -> unit throws { Exn } do
+  let prog = synth_program()
+  let out = ir_dump.hir_to_text(prog)
+  let starts_with_banner = str.starts_with(s: out, prefix: "=== HIR dump")
+  test_assert.assert_eq_bool(actual: starts_with_banner, expected: true, label: "ud6j: HIR text dump starts with banner")
+  return ()
+end
+
+// ─── Test 2: JSON dump shape ───────────────────────────────────────────────
+
+let test_json_shape = fn () -> unit throws { Exn } do
+  let prog = synth_program()
+  let out = ir_dump.hir_to_json(prog)
+  let starts_with_brace = str.starts_with(s: out, prefix: "{")
+  test_assert.assert_eq_bool(actual: starts_with_brace, expected: true, label: "ud6j: HIR JSON output starts with '{'")
+  let obj = json.parse(s: out)
+  let kind_v = require_field(obj, key: "kind", label: "ud6j hir json")
+  let kind = expect_string(v: kind_v, label: "ud6j hir kind")
+  test_assert.assert_eq_string(actual: kind, expected: "hir", label: "ud6j: kind = hir")
+  let funcs_v = require_field(obj, key: "functions", label: "ud6j hir json")
+  let funcs = expect_array(v: funcs_v, label: "ud6j hir functions")
+  let n = list.length(xs: funcs)
+  test_assert.assert_eq_i64(actual: n, expected: 1, label: "ud6j: 1 synthesised function")
+  // Inspect the single function record.
+  match funcs do
+    | [] -> raise RuntimeError(val: "expected one function")
+    | f :: _ ->
+      let name_v = require_field(obj: f, key: "name", label: "ud6j hir func")
+      let name = expect_string(v: name_v, label: "ud6j hir func name")
+      test_assert.assert_eq_string(actual: name, expected: "fortytwo", label: "ud6j: name round-trips")
+      let ret_v = require_field(obj: f, key: "ret_type", label: "ud6j hir func")
+      let ret = expect_string(v: ret_v, label: "ud6j hir ret_type")
+      test_assert.assert_eq_string(actual: ret, expected: "i64", label: "ud6j: ret_type = i64")
+      // params is a JsonArray (empty for this fixture).
+      let params_v = require_field(obj: f, key: "params", label: "ud6j hir func")
+      let params = expect_array(v: params_v, label: "ud6j hir params")
+      let np = list.length(xs: params)
+      test_assert.assert_eq_i64(actual: np, expected: 0, label: "ud6j: 0 params")
+      // body_pp carries the literal 42.
+      let body_v = require_field(obj: f, key: "body_pp", label: "ud6j hir func")
+      let body_pp = expect_string(v: body_v, label: "ud6j hir body_pp")
+      let has_42 = str.contains(s: body_pp, sub: "42")
+      test_assert.assert_eq_bool(actual: has_42, expected: true, label: "ud6j: body_pp mentions 42")
+  end
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  test_text_banner()
+  test_json_shape()
+  return ()
+end

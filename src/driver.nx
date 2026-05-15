@@ -44,6 +44,8 @@ import { IndexOutOfBounds }, * as list from "std:list"
 import { Option, Some, None } from "std:option"
 import { run_test_subcommand, strip_test_subcommand, ParsedTestSubcommand } from "src/tools/test_runner.nx"
 import { run_fmt_subcommand, strip_fmt_subcommand, ParsedFmtSubcommand } from "src/tools/fmt.nx"
+import { strip_hir_subcommand, ParsedHirSubcommand, strip_lir_subcommand, ParsedLirSubcommand, hir_to_text, hir_to_json, lir_to_text, lir_to_json } from "src/tools/ir_dump.nx"
+import { LirProgram, LirFunction } from "src/ir/lir/types.nx"
 
 // Backtrace-elision percentage (issue nexus-kyf8): integer percent of raise
 // sites where codegen elides the bt-capture call. Guards against division
@@ -284,7 +286,7 @@ end
 /** typecheck / repl / test) is deferred to a later issue — currently `help */
 /** <subcommand>` emits the same full form so users still see the synopsis. */
 let print_usage = fn () -> unit require { Console } do
-  Console.eprintln(val: "Usage: nexus <subcommand> [options] <args>\n\nSubcommands:\n  build <input.nx> [-o output.wasm] [--polyglot [--remain-manifest]]\n  run <input.nx> [-- ARGS...]\n  typecheck <input.nx>\n  repl\n  mcp\n  test [path] [--junit FILE] [--nexus-bin PATH] [--wasmtime-bin PATH]\n  fmt [--check] FILE [FILE...]\n  fmt [--check] -\n  help [subcommand]\n\nGlobal options:\n  --verbose\n  --format={text|json}\n  --explain-capabilities {yes|none|wasmtime}\n  --explain-capabilities-format {text|json}\n  --dump-imports <input.nx>")
+  Console.eprintln(val: "Usage: nexus <subcommand> [options] <args>\n\nSubcommands:\n  build <input.nx> [-o output.wasm] [--polyglot [--remain-manifest]]\n  run <input.nx> [-- ARGS...]\n  typecheck <input.nx>\n  hir <input.nx> [--format=text|json]\n  lir <input.nx> [--format=text|json]\n  repl\n  mcp\n  test [path] [--junit FILE] [--nexus-bin PATH] [--wasmtime-bin PATH]\n  fmt [--check] FILE [FILE...]\n  fmt [--check] -\n  help [subcommand]\n\nGlobal options:\n  --verbose\n  --format={text|json}\n  --explain-capabilities {yes|none|wasmtime}\n  --explain-capabilities-format {text|json}\n  --dump-imports <input.nx>")
 end
 
 /** Require a leading `build` subcommand. Symmetry with `repl`/`typecheck`/ */
@@ -696,6 +698,120 @@ let print_build_result = fn (output_name: string, caps: [string], explain: Expla
   end
 end
 
+// ─── IR-dump subcommand runners (nexus-ud6j) ───────────────────────────────
+//
+// Both `nexus hir <file>` and `nexus lir <file>` run a slimmed pipeline:
+// read → lex → parse → HIR build → (for LIR: + MIR + LIR lower). Output
+// goes to stdout as either text (default) or `--format=json` JSON. We
+// reuse the same parse-error -> NDJSON path as the build pipeline so the
+// diagnostic shape stays consistent.
+
+let run_hir_dump_subcommand = fn (args: [string], format: ExplainFormat, verbose: bool) -> i64 require { Clock, Console, Fs } do
+  try
+    match args do
+      | [] -> raise InvalidUsage(detail: "usage: nexus hir <input.nx> [--format=text|json]")
+      | input_path :: _ ->
+        let src = Fs.read_to_string(path: input_path)
+        let tokens = lexer.tokenize(src)
+        let ParseDiagnostics(prog: prog, diags: parse_diags) = parser.parse_collect(tokens, file: input_path)
+        print_parse_diags(diags: parse_diags, format)
+        let n_parse_diags = list.length(xs: parse_diags)
+        if n_parse_diags > 0 then
+          match format do
+            | FormatJson -> Console.eprintln(val: format_summary_json(count: n_parse_diags))
+            | FormatText -> ()
+          end
+          raise ParseErrorsCollected(count: n_parse_diags)
+        end
+        let HirBuildResult(program: hir_raw, import_cache: _) = build_hir(prog, source_file: input_path, verbose)
+        // Run the same resolve+DCE loop as build so the dump reflects the
+        // post-link HIR rather than raw lazy bodies. Mirrors the inline
+        // `match hir_raw` block in `main`.
+        let hir_resolved = match hir_raw do
+          | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
+            let resolved = iterative_resolve(funcs: hf, hb, max_rounds: 100)
+            let expanded_fs = hir.expand_groups_in_functions(funcs: resolved, groups: heg)
+            let expanded_hb = hir.expand_groups_in_handler_bindings(bindings: hb, groups: heg)
+            let trimmed_reach = reach.collect_reachable_no_thread_start(functions: expanded_fs, handler_bindings: expanded_hb)
+            let final_fs = if reach.any_canonical_lazy_spawn(names: trimmed_reach) then expanded_fs
+              else reach.filter_reachable_functions(functions: expanded_fs, reachable: trimmed_reach)
+            end
+            let final_reach = if reach.any_canonical_lazy_spawn(names: trimmed_reach) then
+                reach.collect_reachable(functions: final_fs, handler_bindings: expanded_hb)
+              else trimmed_reach
+            end
+            let filtered_exts = reach.filter_reachable_externals(externals: he, reachable: final_reach)
+            HirProgram(ports: hp, functions: final_fs, externals: filtered_exts, handler_bindings: expanded_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
+        end
+        let out = match format do
+          | FormatText -> hir_to_text(prog: hir_resolved)
+          | FormatJson -> hir_to_json(prog: hir_resolved)
+        end
+        Console.println(val: out)
+        return 0
+    end
+  catch e ->
+    Console.eprintln(val: err.format_error(err: e))
+    return 1
+  end
+end
+
+let lir_program_functions = fn (p: LirProgram) -> [LirFunction] do
+  match p do | LirProgram(functions, externals: _) -> return functions end
+end
+
+let run_lir_dump_subcommand = fn (args: [string], format: ExplainFormat, verbose: bool) -> i64 require { Clock, Console, Fs } do
+  try
+    match args do
+      | [] -> raise InvalidUsage(detail: "usage: nexus lir <input.nx> [--format=text|json]")
+      | input_path :: _ ->
+        let src = Fs.read_to_string(path: input_path)
+        let tokens = lexer.tokenize(src)
+        let ParseDiagnostics(prog: prog, diags: parse_diags) = parser.parse_collect(tokens, file: input_path)
+        print_parse_diags(diags: parse_diags, format)
+        let n_parse_diags = list.length(xs: parse_diags)
+        if n_parse_diags > 0 then
+          match format do
+            | FormatJson -> Console.eprintln(val: format_summary_json(count: n_parse_diags))
+            | FormatText -> ()
+          end
+          raise ParseErrorsCollected(count: n_parse_diags)
+        end
+        let HirBuildResult(program: hir_raw, import_cache: _) = build_hir(prog, source_file: input_path, verbose)
+        let hir_resolved = match hir_raw do
+          | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
+            let resolved = iterative_resolve(funcs: hf, hb, max_rounds: 100)
+            let expanded_fs = hir.expand_groups_in_functions(funcs: resolved, groups: heg)
+            let expanded_hb = hir.expand_groups_in_handler_bindings(bindings: hb, groups: heg)
+            let trimmed_reach = reach.collect_reachable_no_thread_start(functions: expanded_fs, handler_bindings: expanded_hb)
+            let final_fs = if reach.any_canonical_lazy_spawn(names: trimmed_reach) then expanded_fs
+              else reach.filter_reachable_functions(functions: expanded_fs, reachable: trimmed_reach)
+            end
+            let final_reach = if reach.any_canonical_lazy_spawn(names: trimmed_reach) then
+                reach.collect_reachable(functions: final_fs, handler_bindings: expanded_hb)
+              else trimmed_reach
+            end
+            let filtered_exts = reach.filter_reachable_externals(externals: he, reachable: final_reach)
+            HirProgram(ports: hp, functions: final_fs, externals: filtered_exts, handler_bindings: expanded_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
+        end
+        let enum_defs = get_enum_defs(hir: hir_resolved)
+        let type_defs = get_type_defs(hir: hir_resolved)
+        let mir_prog = mir.lower_hir_to_mir(hir: hir_resolved)
+        let lir_prog = lir.lower_mir_to_lir(mir: mir_prog, enum_defs, type_defs)
+        let funcs = lir_program_functions(p: lir_prog)
+        let out = match format do
+          | FormatText -> lir_to_text(funcs)
+          | FormatJson -> lir_to_json(funcs)
+        end
+        Console.println(val: out)
+        return 0
+    end
+  catch e ->
+    Console.eprintln(val: err.format_error(err: e))
+    return 1
+  end
+end
+
 let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs, PermProc } do
   inject stdio.system_handler, fs_mod.system_handler, clock_mod.system_handler, proc.system_handler do
   try
@@ -764,6 +880,29 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
         | _ :: rest -> rest
       end
       let exit_code = run_fmt_subcommand(args: fmt_args)
+      proc.exit(status: exit_code)
+    end
+    // `nexus hir <input.nx>` / `nexus lir <input.nx>` short-circuit before
+    // typecheck/MIR/codegen: they run the front-end (lex + parse + HIR
+    // build + resolve) and print HIR or LIR in either text (default) or
+    // JSON (`--format=json`). Issue nexus-ud6j V1 — agents need a
+    // machine-readable IR snapshot; full JSON expression trees are V2.
+    let ParsedHirSubcommand(remaining: args_after_hir, is_hir) = strip_hir_subcommand(xs: args_after_output)
+    if is_hir then
+      let hir_args = match args_after_hir do
+        | [] -> []
+        | _ :: rest -> rest
+      end
+      let exit_code = run_hir_dump_subcommand(args: hir_args, format: diag_format, verbose)
+      proc.exit(status: exit_code)
+    end
+    let ParsedLirSubcommand(remaining: args_after_lir, is_lir) = strip_lir_subcommand(xs: args_after_output)
+    if is_lir then
+      let lir_args = match args_after_lir do
+        | [] -> []
+        | _ :: rest -> rest
+      end
+      let exit_code = run_lir_dump_subcommand(args: lir_args, format: diag_format, verbose)
       proc.exit(status: exit_code)
     end
     let ParsedTypecheckSubcommand(remaining: args_after_tc, typecheck_only) = strip_typecheck_subcommand(xs: args_after_output)
