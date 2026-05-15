@@ -11,9 +11,9 @@ against [`index.schema.json`](./index.schema.json)).
 | --- | --- | --- |
 | `examples/` (root) | Historical end-to-end samples (hello, fib, bench) | 7 |
 | `examples/feature/` | One minimal example per language feature / stdlib module | 38 |
-| `examples/negative/` | Intentionally broken snippets; runner asserts the diagnostic (compile-time *or* runtime throw) | 16 |
+| `examples/negative/` | Intentionally broken snippets; runner asserts the diagnostic (compile-time *or* runtime throw) | 17 |
 
-Total: **61 examples**. See [`negative/run.sh`](./negative/run.sh) for
+Total: **62 examples**. See [`negative/run.sh`](./negative/run.sh) for
 the negative-corpus driver.
 
 ## How to use
@@ -139,6 +139,7 @@ a `println` line emitted just before the throwing site.
 | [`negative/str_invalid_f64.nx`](./negative/str_invalid_f64.nx) | runtime | `std:str.to_f64` raises `InvalidF64` |
 | [`negative/hashmap_missing_key.nx`](./negative/hashmap_missing_key.nx) | runtime | Caller raises on `Lookup::Missing` from `hashmap.get` |
 | [`negative/stringmap_missing_key.nx`](./negative/stringmap_missing_key.nx) | runtime | Same shape against `std:stringmap.get` |
+| [`negative/json_parse_invalid.nx`](./negative/json_parse_invalid.nx) | runtime | `std:json.parse` raises `JsonError` on malformed input |
 
 ## Schema
 
