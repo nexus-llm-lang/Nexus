@@ -1,0 +1,273 @@
+/**
+ * fmt_core: Pure byte-level formatter for Nexus source files.
+ *
+ * Split out from src/tools/fmt.nx (issue nexus-8vu5) so that downstream
+ * consumers — notably the LSP `textDocument/formatting` handler — can
+ * import `format_source` without pulling in the argparse-driven CLI
+ * surface that lives in fmt.nx proper. Keeping the LSP build's
+ * transitive reach trimmed avoids the nexus-rxpz codegen-DCE manifestation
+ * that surfaces when a large reachable set of stdlib helpers comes
+ * along for the ride.
+ *
+ * Scope mirrors the v1 spec from fmt.nx:
+ *   1. Tab → 2 spaces in leading indentation.
+ *   2. Strip trailing whitespace on every line.
+ *   3. Collapse runs of 2+ blank lines down to a single blank line.
+ *   4. Ensure exactly one trailing newline at EOF.
+ *
+ * The pass is byte-level and preserves string/char literals, line
+ * comments, block comments (nested), and bracket strings `[=[ ... ]=]`
+ * byte-for-byte — including any newlines they contain.
+ */
+
+import * as str from "std:str"
+import * as char from "std:char"
+import * as bb from "std:bytebuffer"
+import { Option, Some, None } from "std:option"
+
+// FmtState carries the per-byte state of the single-pass walk:
+//   - pos / len: cursor into `src`
+//   - buf: output ByteBuffer (linear)
+//   - ws_run_len: bytes of pending whitespace held back at the end of the
+//     current code line. Emitted on a non-whitespace byte; discarded on
+//     newline (this implements trailing-whitespace strip).
+//   - pending_nls: count of newlines awaiting emission. Newlines are NOT
+//     emitted greedily — they are buffered and released at the next
+//     non-newline byte (capped at 2 = one blank line) or at EOF (capped at
+//     1 = a single trailing terminator). This is what collapses runs of
+//     blank lines and what trims trailing blank lines.
+//   - pending_indent: count of leading-indent spaces (after tab expansion)
+//     awaiting emission. Held back until we see the first non-ws byte on
+//     the line; discarded along with pending_nls if the line turns out to
+//     be blank. This is how trailing-whitespace strip handles blank lines
+//     that are not literally empty (e.g. "   \n").
+//   - emitted_anything: true once at least one non-newline byte has been
+//     emitted. Until then pending newlines are discarded — this strips
+//     leading blank lines at the top of the file.
+//   - at_line_start: true iff next non-newline non-whitespace byte will be
+//     the first non-blank on its line. Drives the tab-as-indent expansion.
+export type FmtState = FmtState(
+  src: string,
+  len: i64,
+  pos: i64,
+  buf: %ByteBuffer,
+  ws_run_len: i64,
+  pending_nls: i64,
+  pending_indent: i64,
+  emitted_anything: bool,
+  at_line_start: bool
+)
+
+/** Format the entire source string. Pure (no I/O), so callable from tests.
+ *  Idempotence is the property to maintain: format(format(src)) == format(src).
+ */
+export let format_source = fn (src: string) -> string do
+  let len = str.byte_length(s: src)
+  let %buf = bb.empty()
+  let st = FmtState(src, len, pos: 0, buf: %buf, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: false, at_line_start: true)
+  let st_final = walk(st)
+  match st_final do | FmtState(src: _, len: _, pos: _, buf: %final_buf, ws_run_len: _, pending_nls: _, pending_indent: _, emitted_anything, at_line_start: _) ->
+    // Trailing newline policy: if we emitted any content, end with exactly
+    // one '\n'. If the file was empty (or all whitespace), produce empty
+    // output rather than a lone newline — keeps `format("") == ""`.
+    if emitted_anything then
+      let %buf_final = bb.push_byte(buf: %final_buf, byte: char.ord(c: '\n'))
+      let result = bb.to_string(buf: &buf_final)
+      bb.free(buf: %buf_final)
+      return result
+    end
+    let result = bb.to_string(buf: &final_buf)
+    bb.free(buf: %final_buf)
+    return result
+  end
+end
+
+// Release any buffered newlines into the output buffer. Cap mid-stream
+// flushes at 2 (one line-break + one blank line). Skipped entirely if
+// nothing has been emitted yet — this drops leading blank lines at the top
+// of the file.
+let flush_pending_nls = fn (buf: %ByteBuffer, pending_nls: i64, emitted_anything: bool) -> %ByteBuffer do
+  if !emitted_anything then return buf end
+  if pending_nls <= 0 then return buf end
+  let n = if pending_nls > 2 then 2 else pending_nls end
+  return push_n_newlines(buf: %buf, n)
+end
+
+let push_n_newlines = fn (buf: %ByteBuffer, n: i64) -> %ByteBuffer do
+  if n <= 0 then return buf end
+  let %buf2 = bb.push_byte(buf: %buf, byte: char.ord(c: '\n'))
+  return push_n_newlines(buf: %buf2, n: n - 1)
+end
+
+// ─── Main byte walk ───────────────────────────────────────────────────────
+
+let walk = fn (st: FmtState) -> FmtState do
+  match st do | FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start) ->
+    if pos >= len then return FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start) end
+    let b = str.byte_at(s: src, idx: pos)
+    // ── Newline ──────────────────────────────────────────────────────────
+    if b == '\n' then
+      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf, ws_run_len: 0, pending_nls: pending_nls + 1, pending_indent: 0, emitted_anything, at_line_start: true))
+    end
+    // ── Carriage return ──────────────────────────────────────────────────
+    if b == '\r' then
+      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start))
+    end
+    // ── Whitespace ───────────────────────────────────────────────────────
+    if b == ' ' || b == '\t' then
+      if at_line_start then
+        let add = if b == '\t' then 2 else 1 end
+        return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf, ws_run_len: 0, pending_nls, pending_indent: pending_indent + add, emitted_anything, at_line_start: true))
+      end
+      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf, ws_run_len: ws_run_len + 1, pending_nls, pending_indent, emitted_anything, at_line_start: false))
+    end
+    // ── Protected regions (line/block comments, strings, chars, bracket) ─
+    if b == '/' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '/' then
+      let line_end = scan_line_comment(src, pos: pos + 2, len)
+      let body_end = trim_trailing_ws_in(src, start: pos, end_pos: line_end)
+      let %buf_nl = flush_pending_nls(buf: %buf, pending_nls, emitted_anything)
+      let %buf_ind = flush_pending_indent(buf: %buf_nl, pending_indent)
+      let %buf_ws = flush_ws(buf: %buf_ind, src, ws_run_len, pos)
+      let chunk = str.byte_substring(s: src, start: pos, len: body_end - pos)
+      let %buf_done = bb.push_string(buf: %buf_ws, s: chunk)
+      return walk(st: FmtState(src, len, pos: line_end, buf: %buf_done, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false))
+    end
+    if b == '/' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '*' then
+      return emit_protected_chunk(st, end_pos: scan_block_comment(src, pos: pos + 2, len, depth: 1))
+    end
+    if b == '"' then
+      return emit_protected_chunk(st, end_pos: scan_string(src, pos: pos + 1, len))
+    end
+    if b == '\'' then
+      let end_pos_opt = scan_char(src, pos: pos + 1, len)
+      match end_pos_opt do
+        | Some(val: end_pos) ->
+          return emit_protected_chunk(st, end_pos)
+        | None ->
+          let %buf_nl = flush_pending_nls(buf: %buf, pending_nls, emitted_anything)
+          let %buf_ind = flush_pending_indent(buf: %buf_nl, pending_indent)
+          let %buf_ws = flush_ws(buf: %buf_ind, src, ws_run_len, pos)
+          let %buf_done = bb.push_byte(buf: %buf_ws, byte: char.ord(c: b))
+          return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf_done, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false))
+      end
+    end
+    if b == '[' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '='
+       && pos + 2 < len && str.byte_at(s: src, idx: pos + 2) == '[' then
+      return emit_protected_chunk(st, end_pos: scan_bracket_string(src, pos: pos + 3, len))
+    end
+    // ── Code byte ────────────────────────────────────────────────────────
+    let %buf_nl = flush_pending_nls(buf: %buf, pending_nls, emitted_anything)
+    let %buf_ind = flush_pending_indent(buf: %buf_nl, pending_indent)
+    let %buf_ws = flush_ws(buf: %buf_ind, src, ws_run_len, pos)
+    let %buf_done = bb.push_byte(buf: %buf_ws, byte: char.ord(c: b))
+    return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf_done, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false))
+  end
+end
+
+let flush_pending_indent = fn (buf: %ByteBuffer, n: i64) -> %ByteBuffer do
+  if n <= 0 then return buf end
+  let %buf2 = bb.push_byte(buf: %buf, byte: char.ord(c: ' '))
+  return flush_pending_indent(buf: %buf2, n: n - 1)
+end
+
+let emit_protected_chunk = fn (st: FmtState, end_pos: i64) -> FmtState do
+  match st do | FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start: _) ->
+    let %buf_nl = flush_pending_nls(buf: %buf, pending_nls, emitted_anything)
+    let %buf_ind = flush_pending_indent(buf: %buf_nl, pending_indent)
+    let %buf_ws = flush_ws(buf: %buf_ind, src, ws_run_len, pos)
+    let chunk = str.byte_substring(s: src, start: pos, len: end_pos - pos)
+    let %buf_done = bb.push_string(buf: %buf_ws, s: chunk)
+    let new_at_ls = chunk_ended_on_newline(s: chunk)
+    return walk(st: FmtState(src, len, pos: end_pos, buf: %buf_done, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: new_at_ls))
+  end
+end
+
+let flush_ws = fn (buf: %ByteBuffer, src: string, ws_run_len: i64, pos: i64) -> %ByteBuffer do
+  if ws_run_len <= 0 then return buf end
+  return flush_ws_go(buf: %buf, src, pos: pos - ws_run_len, end_pos: pos)
+end
+
+let flush_ws_go = fn (buf: %ByteBuffer, src: string, pos: i64, end_pos: i64) -> %ByteBuffer do
+  if pos >= end_pos then return buf end
+  let b = str.byte_at(s: src, idx: pos)
+  let %buf2 = bb.push_byte(buf: %buf, byte: char.ord(c: b))
+  return flush_ws_go(buf: %buf2, src, pos: pos + 1, end_pos)
+end
+
+// ─── Region scanners ──────────────────────────────────────────────────────
+
+let scan_line_comment = fn (src: string, pos: i64, len: i64) -> i64 do
+  if pos >= len then return len end
+  let b = str.byte_at(s: src, idx: pos)
+  if b == '\n' then return pos end
+  return scan_line_comment(src, pos: pos + 1, len)
+end
+
+let trim_trailing_ws_in = fn (src: string, start: i64, end_pos: i64) -> i64 do
+  if end_pos <= start then return start end
+  let b = str.byte_at(s: src, idx: end_pos - 1)
+  if b == ' ' || b == '\t' then return trim_trailing_ws_in(src, start, end_pos: end_pos - 1) end
+  return end_pos
+end
+
+let scan_block_comment = fn (src: string, pos: i64, len: i64, depth: i64) -> i64 do
+  if pos >= len then return len end
+  if depth <= 0 then return pos end
+  let b = str.byte_at(s: src, idx: pos)
+  if b == '*' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '/' then
+    return scan_block_comment(src, pos: pos + 2, len, depth: depth - 1)
+  end
+  if b == '/' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '*' then
+    return scan_block_comment(src, pos: pos + 2, len, depth: depth + 1)
+  end
+  return scan_block_comment(src, pos: pos + 1, len, depth)
+end
+
+let scan_string = fn (src: string, pos: i64, len: i64) -> i64 do
+  if pos >= len then return len end
+  let b = str.byte_at(s: src, idx: pos)
+  if b == '"' then return pos + 1 end
+  if b == '\\' && pos + 1 < len then
+    return scan_string(src, pos: pos + 2, len)
+  end
+  return scan_string(src, pos: pos + 1, len)
+end
+
+let scan_char = fn (src: string, pos: i64, len: i64) -> Option<i64> do
+  return scan_char_go(src, pos, len, budget: 12)
+end
+
+let scan_char_go = fn (src: string, pos: i64, len: i64, budget: i64) -> Option<i64> do
+  if budget <= 0 then return None end
+  if pos >= len then return None end
+  let b = str.byte_at(s: src, idx: pos)
+  if b == '\'' then return Some(val: pos + 1) end
+  if b == '\\' && pos + 1 < len then
+    return scan_char_go(src, pos: pos + 2, len, budget: budget - 1)
+  end
+  if b == '\n' then return None end
+  return scan_char_go(src, pos: pos + 1, len, budget: budget - 1)
+end
+
+let scan_bracket_string = fn (src: string, pos: i64, len: i64) -> i64 do
+  if pos >= len then return len end
+  let b = str.byte_at(s: src, idx: pos)
+  if b == ']'
+     && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '='
+     && pos + 2 < len && str.byte_at(s: src, idx: pos + 2) == ']' then
+    return pos + 3
+  end
+  if b == '\\' && pos + 3 < len
+     && str.byte_at(s: src, idx: pos + 1) == ']'
+     && str.byte_at(s: src, idx: pos + 2) == '='
+     && str.byte_at(s: src, idx: pos + 3) == ']' then
+    return scan_bracket_string(src, pos: pos + 4, len)
+  end
+  return scan_bracket_string(src, pos: pos + 1, len)
+end
+
+let chunk_ended_on_newline = fn (s: string) -> bool do
+  let n = str.byte_length(s)
+  if n <= 0 then return false end
+  return str.byte_at(s, idx: n - 1) == '\n'
+end

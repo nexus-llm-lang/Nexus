@@ -51,6 +51,12 @@ import { strip_ast_subcommand, ParsedAstSubcommand, ast_to_text, ast_to_json } f
 import { strip_types_subcommand, ParsedTypesSubcommand, types_to_text, types_to_json } from "src/tools/types_dump.nx"
 import { strip_grep_subcommand, ParsedGrepSubcommand, run_grep_subcommand } from "src/tools/grep.nx"
 import { LirProgram, LirFunction } from "src/ir/lir/types.nx"
+import {
+  ArgSpec, ParseResult, SubcommandHit,
+  spec_flag, spec_opt, spec_positional, spec_subcommand,
+  parse_permissive, get_flag, get_opt, get_positionals_all, get_remaining, is_ok, first_error,
+  detect_subcommand, render_usage
+} from "std:argparse"
 
 // Backtrace-elision percentage (issue nexus-kyf8): integer percent of raise
 // sites where codegen elides the bt-capture call. Guards against division
@@ -191,29 +197,178 @@ let str_nth = fn (xs: [string], n: i64) -> string throws { IndexOutOfBounds } do
   end
 end
 
-/** Check if --verbose flag is present in args list. */
-let has_verbose_flag = fn (xs: [string]) -> bool do
-  match xs do
-    | [] -> return false
-    | v :: rest ->
-      if v == "--verbose" then return true end
-      return has_verbose_flag(xs: rest)
+// ─── Argparse spec table (issue nexus-8vu5) ────────────────────────────────
+//
+// One source of truth for every argument the driver recognises. Drives:
+//   - `parse_global_args` (one-shot replacement for the legacy chain of
+//     strip_verbose_flag / strip_output_flag / strip_polyglot_flags /
+//     strip_coverage_flag / strip_format_flag / strip_explain_flags).
+//   - `print_usage`, which now feeds `argparse.render_usage` (no more
+//     hand-edited literal — the old block at driver.nx:301).
+//
+// Subcommand entries are advisory only — argparse never consumes them.
+// Subcommand routing still happens via `detect_subcommand` calls in the
+// main dispatcher because the order is load-bearing (`repl` short-circuits
+// before flag parsing; `test`/`fmt` short-circuit before MIR/codegen).
+
+/** Build emit selector. `BareBinary` writes the raw merged wasm;
+ *  `PolyglotLauncher` wraps it in the self-extracting POSIX-sh launcher.
+ */
+type OutputMode = BareBinary | PolyglotLauncher
+
+let cli_specs = fn () -> [ArgSpec] do
+  return [
+    // Subcommands (one entry per top-level routing arm; consumed by
+    // detect_subcommand rather than argparse.parse).
+    spec_subcommand(name: "build", help: "<input.nx> [-o output.wasm] [--polyglot [--remain-manifest]]"),
+    spec_subcommand(name: "run", help: "<input.nx> [-- ARGS...]"),
+    spec_subcommand(name: "typecheck", help: "<input.nx>"),
+    spec_subcommand(name: "ast", help: "<input.nx> [--format=text|json]"),
+    spec_subcommand(name: "hir", help: "<input.nx> [--format=text|json]"),
+    spec_subcommand(name: "lir", help: "<input.nx> [--format=text|json]"),
+    spec_subcommand(name: "types", help: "<input.nx> [--format=text|json]"),
+    spec_subcommand(name: "repl", help: "interactive REPL"),
+    spec_subcommand(name: "mcp", help: "JSON-RPC tool server (stdio)"),
+    spec_subcommand(name: "explain", help: "<symbol> [--file FILE] [--format text|json]"),
+    spec_subcommand(name: "context", help: "<file> [--format text|json]"),
+    spec_subcommand(name: "test", help: "[path] [--junit FILE] [--nexus-bin PATH] [--wasmtime-bin PATH]"),
+    spec_subcommand(name: "fmt", help: "[--check] FILE|- [FILE...]"),
+    spec_subcommand(name: "grep", help: "<pattern> [path...]"),
+    spec_subcommand(name: "help", help: "[subcommand]"),
+    // Global options
+    spec_flag(name: "verbose", short: "", long: "--verbose", help: "enable per-pass timing output"),
+    spec_opt(name: "output", short: "-o", long: "--output", required: false, help: "output wasm path"),
+    spec_opt(name: "format", short: "", long: "--format", required: false, help: "diagnostic format (text|json)"),
+    spec_opt(name: "explain-capabilities", short: "", long: "--explain-capabilities", required: false, help: "capability reporting (yes|none|wasmtime)"),
+    spec_opt(name: "explain-capabilities-format", short: "", long: "--explain-capabilities-format", required: false, help: "capability report format (text|json)"),
+    spec_flag(name: "coverage", short: "", long: "--coverage", help: "emit coverage counters and custom section"),
+    spec_flag(name: "polyglot", short: "", long: "--polyglot", help: "emit self-extracting POSIX-sh + wasm launcher"),
+    spec_flag(name: "remain-manifest", short: "", long: "--remain-manifest", help: "polyglot launcher keeps the manifest layout"),
+    spec_flag(name: "dump-imports", short: "", long: "--dump-imports", help: "print the import graph and exit"),
+  ]
+end
+
+/** Render the consolidated usage block from the spec table (issue
+ *  nexus-8vu5). Per-subcommand detail (build / typecheck / repl / test)
+ *  is deferred to nexus-z35v — until then `help <subcommand>` emits the
+ *  same full form so users still see the synopsis. Routing of `help [sub]`
+ *  is handled by `dispatch_help_subcommand` (nexus-npo6).
+ */
+let print_usage = fn () -> unit require { Console } do
+  Console.eprintln(val: render_usage(summary: "Usage: nexus <subcommand> [options] <args>", specs: cli_specs()))
+end
+
+// Bundled global flags resolved by `parse_global_args`. Replaces the
+// chain of per-flag Parsed* records the legacy strip_* helpers carried.
+type GlobalFlags = GlobalFlags(
+  positionals: [string],
+  remaining: [string],
+  verbose: bool,
+  output: Option<string>,
+  diag_format: ExplainFormat,
+  explain: ExplainCaps,
+  explain_format: ExplainFormat,
+  coverage: bool,
+  output_mode: OutputMode,
+  manifest_mode: ManifestMode,
+  dump_imports: bool
+)
+
+let parse_explain_caps_or_fail = fn (val: string) -> ExplainCaps throws { InvalidUsage } do
+  if let Some(val: e) = parse_explain_caps_value(s: val) then return e end
+  raise InvalidUsage(detail: "invalid --explain-capabilities value: " ++ val)
+end
+
+let parse_format_or_fail = fn (val: string, flag_name: string) -> ExplainFormat throws { InvalidUsage } do
+  if let Some(val: f) = parse_explain_format_value(s: val) then return f end
+  raise InvalidUsage(detail: "invalid " ++ flag_name ++ " value: " ++ val ++ " (expected text|json)")
+end
+
+let read_explain_caps_opt = fn (result: ParseResult) -> ExplainCaps throws { InvalidUsage } do
+  match get_opt(result, name: "explain-capabilities") do
+    | None -> return ExplainYes
+    | Some(val: v) -> return parse_explain_caps_or_fail(val: v)
   end
 end
 
-/** Remove --verbose flag from args list, preserving order. */
-let strip_verbose_flag = fn (xs: [string]) -> [string] do
-  match xs do
-    | [] -> return []
-    | v :: rest ->
-      if v == "--verbose" then return strip_verbose_flag(xs: rest) end
-      return v :: strip_verbose_flag(xs: rest)
+let read_format_opt = fn (result: ParseResult, name: string, flag_name: string) -> ExplainFormat throws { InvalidUsage } do
+  match get_opt(result, name) do
+    | None -> return FormatText
+    | Some(val: v) -> return parse_format_or_fail(val: v, flag_name)
   end
 end
 
-let get_output_path = fn (xs: [string], argc: i64) -> string throws { IndexOutOfBounds } do
-  if argc >= 3 then return str_nth(xs, n: 2) end
-  return "out.wasm"
+/** One-shot replacement for the legacy strip_verbose_flag / strip_output_flag
+ *  / strip_polyglot_flags / strip_coverage_flag / strip_format_flag /
+ *  strip_explain_flags chain (issue nexus-8vu5). Parses every driver-global
+ *  flag in a single argparse pass, leaving subcommand keywords + the input
+ *  filename in `positionals` and any post-`--` user-program argv in
+ *  `remaining`.
+ */
+let parse_global_args = fn (args: [string]) -> GlobalFlags throws { InvalidUsage } do
+  let result = parse_permissive(args, specs: cli_specs())
+  if !is_ok(result) then
+    raise InvalidUsage(detail: first_error(result))
+  end
+  let verbose = get_flag(result, name: "verbose")
+  let output = get_opt(result, name: "output")
+  let diag_format = read_format_opt(result, name: "format", flag_name: "--format")
+  let explain = read_explain_caps_opt(result)
+  let explain_format = read_format_opt(result, name: "explain-capabilities-format", flag_name: "--explain-capabilities-format")
+  let coverage = get_flag(result, name: "coverage")
+  let polyglot = get_flag(result, name: "polyglot")
+  let remain_manifest = get_flag(result, name: "remain-manifest")
+  let dump_imports = get_flag(result, name: "dump-imports")
+  let output_mode = if polyglot then PolyglotLauncher else BareBinary end
+  let manifest_mode = if remain_manifest then KeepManifest else StripManifest end
+  return GlobalFlags(
+    positionals: get_positionals_all(result),
+    remaining: get_remaining(result),
+    verbose, output, diag_format, explain, explain_format, coverage,
+    output_mode, manifest_mode, dump_imports
+  )
+end
+
+// ─── Back-compat exports (issue nexus-8vu5) ────────────────────────────────
+//
+// The legacy `strip_typecheck_subcommand` / `strip_run_subcommand` shapes
+// + their Parsed* record types survive as thin wrappers over argparse's
+// `detect_subcommand` primitive. The regression tests under
+// tests/runtime/{m8ey,tr79}_*_test.nx assert the CLI-shape contract those
+// shapes encode; rewriting the tests against the argparse-based dispatcher
+// is mechanical but out of scope for this issue.
+
+export type ParsedTypecheckSubcommand = ParsedTypecheckSubcommand(remaining: [string], typecheck_only: bool)
+
+export let strip_typecheck_subcommand = fn (xs: [string]) -> ParsedTypecheckSubcommand do
+  match detect_subcommand(args: xs, kw: "typecheck") do | SubcommandHit(present, remaining) ->
+    return ParsedTypecheckSubcommand(remaining, typecheck_only: present)
+  end
+end
+
+export type ParsedRunSubcommand = ParsedRunSubcommand(remaining: [string], run_mode: bool, run_args: [string])
+
+let split_run_args = fn (xs: [string], prefix: [string]) -> ParsedRunSubcommand do
+  match xs do
+    | [] -> return ParsedRunSubcommand(remaining: list.reverse(xs: prefix), run_mode: true, run_args: [])
+    | v :: rest ->
+      if v == "--" then
+        return ParsedRunSubcommand(remaining: list.reverse(xs: prefix), run_mode: true, run_args: rest)
+      end
+      return split_run_args(xs: rest, prefix: v :: prefix)
+  end
+end
+
+export let strip_run_subcommand = fn (xs: [string]) -> ParsedRunSubcommand do
+  match detect_subcommand(args: xs, kw: "run") do | SubcommandHit(present, remaining) ->
+    if !present then return ParsedRunSubcommand(remaining, run_mode: false, run_args: []) end
+    match remaining do
+      | [] -> return ParsedRunSubcommand(remaining: [], run_mode: true, run_args: [])
+      | prog :: post ->
+        let ParsedRunSubcommand(remaining: pre, run_mode: _, run_args) = split_run_args(xs: post, prefix: [])
+        return ParsedRunSubcommand(remaining: prog :: pre, run_mode: true, run_args)
+    end
+  end
 end
 
 /** Resolve the output path: prefer `-o`/`--output` value, otherwise fall back to
@@ -222,197 +377,9 @@ end
 let resolve_output_path = fn (opt_output: Option<string>, xs: [string], argc: i64) -> string throws { IndexOutOfBounds } do
   match opt_output do
     | Some(val: o) -> return o
-    | None -> return get_output_path(xs, argc)
-  end
-end
-
-type ParsedOutputFlag = ParsedOutputFlag(remaining: [string], output: Option<string>)
-
-/** Strip `-o <path>` and `--output <path>` pairs from `xs`. Both spellings
- *  select the output artifact path; `--output` requires a separate argument.
- */
-let strip_output_flag = fn (xs: [string], output: Option<string>) -> ParsedOutputFlag throws { InvalidUsage } do
-  match xs do
-    | [] -> return ParsedOutputFlag(remaining: [], output)
-    | flag :: [] ->
-      if flag == "-o" || flag == "--output" then
-        raise InvalidUsage(detail: "-o/--output requires a path")
-      end
-      return ParsedOutputFlag(remaining: [flag], output)
-    | flag :: value :: rest2 ->
-      if flag == "-o" || flag == "--output" then
-        return strip_output_flag(xs: rest2, output: Some(val: value))
-      end
-      let ParsedOutputFlag(remaining: rest_args, output: out2) = strip_output_flag(xs: value :: rest2, output)
-      return ParsedOutputFlag(remaining: flag :: rest_args, output: out2)
-  end
-end
-
-/** Build emit selector. `BareBinary` writes the raw merged wasm;
- *  `PolyglotLauncher` wraps it in the self-extracting POSIX-sh launcher.
- */
-type OutputMode = BareBinary | PolyglotLauncher
-
-type ParsedPolyglotFlags = ParsedPolyglotFlags(remaining: [string], output: OutputMode, manifest: ManifestMode)
-
-/** Strip `--polyglot` and `--remain-manifest` from `xs`. `--polyglot` selects
- *  the self-extracting POSIX-sh + wasm launcher emit path. `--remain-manifest`
- *  is opt-in and only meaningful with `--polyglot`; it switches the launcher
- *  to the manifest-bearing layout (single `app:<size>` entry, format-extensible
- *  for future multi-payload bundles).
- */
-let strip_polyglot_flags = fn (xs: [string], output: OutputMode, manifest: ManifestMode) -> ParsedPolyglotFlags do
-  match xs do
-    | [] -> return ParsedPolyglotFlags(remaining: [], output, manifest)
-    | flag :: rest ->
-      if flag == "--polyglot" then
-        return strip_polyglot_flags(xs: rest, output: PolyglotLauncher, manifest)
-      end
-      if flag == "--remain-manifest" then
-        return strip_polyglot_flags(xs: rest, output, manifest: KeepManifest)
-      end
-      let ParsedPolyglotFlags(remaining: rest_args, output: o2, manifest: m2) = strip_polyglot_flags(xs: rest, output, manifest)
-      return ParsedPolyglotFlags(remaining: flag :: rest_args, output: o2, manifest: m2)
-  end
-end
-
-type ParsedCoverageFlag = ParsedCoverageFlag(remaining: [string], coverage: bool)
-
-/** Strip `--coverage` from `xs` (nexus-gycd). When present, codegen emits
- *  function-prologue atomic counter increments + a `nx.coverage.functions`
- *  custom section. Default off keeps every existing invocation byte-identical.
- */
-let strip_coverage_flag = fn (xs: [string], coverage: bool) -> ParsedCoverageFlag do
-  match xs do
-    | [] -> return ParsedCoverageFlag(remaining: [], coverage)
-    | flag :: rest ->
-      if flag == "--coverage" then
-        return strip_coverage_flag(xs: rest, coverage: true)
-      end
-      let ParsedCoverageFlag(remaining: rest_args, coverage: c2) = strip_coverage_flag(xs: rest, coverage)
-      return ParsedCoverageFlag(remaining: flag :: rest_args, coverage: c2)
-  end
-end
-
-/** Render the consolidated usage block. Per-subcommand detail (build /
- *  typecheck / repl / test) is deferred to nexus-z35v — until then `help
- *  <subcommand>` emits the same full form so users still see the synopsis.
- *  Routing of `help [sub]` is handled by `dispatch_help_subcommand`
- *  (nexus-npo6).
- */
-let print_usage = fn () -> unit require { Console } do
-  Console.eprintln(val: "Usage: nexus <subcommand> [options] <args>\n\nSubcommands:\n  build <input.nx> [-o output.wasm] [--polyglot [--remain-manifest]]\n  run <input.nx> [-- ARGS...]\n  typecheck <input.nx>\n  ast <input.nx> [--format=text|json]\n  hir <input.nx> [--format=text|json]\n  lir <input.nx> [--format=text|json]\n  types <input.nx> [--format=text|json]\n  repl\n  mcp\n  explain <symbol> [--file FILE] [--format text|json]\n  context <file> [--format text|json]\n  test [path] [--junit FILE] [--nexus-bin PATH] [--wasmtime-bin PATH]\n  fmt [--check] FILE [FILE...]\n  fmt [--check] -\n  grep <pattern> [path...]\n  help [subcommand]\n\nGlobal options:\n  --verbose\n  --format={text|json}\n  --explain-capabilities {yes|none|wasmtime}\n  --explain-capabilities-format {text|json}\n  --dump-imports <input.nx>")
-end
-
-/** Require a leading `build` subcommand. Symmetry with `repl`/`typecheck`/
- *  `test`: the bare `nexus foo.nx` form is rejected so every invocation names
- *  its operation. `--dump-imports` passes through because it terminates other
- *  parsing and is itself subcommand-shaped (handled downstream).
- */
-let strip_build_subcommand = fn (xs: [string]) -> [string] throws { InvalidUsage } do
-  match xs do
-    | prog :: second :: rest2 ->
-      if second == "build" then return prog :: rest2 end
-      if second == "--dump-imports" then return xs end
-      raise InvalidUsage(detail: "missing subcommand: did you mean 'build'?")
-    | _ -> raise InvalidUsage(detail: "missing subcommand: did you mean 'build'?")
-  end
-end
-
-type ParsedReplSubcommand = ParsedReplSubcommand(remaining: [string], repl_mode: bool)
-
-/** Detect a leading `repl` subcommand. When present, signal that the driver
- *  should hand control to `src/tools/repl.nx` and skip the file-input pipeline.
- *  `nexus repl` accepts no positional argument; any extra tokens are
- *  treated as input file/output candidates by the rest of the pipeline only
- *  when `repl_mode` is false.
- */
-let strip_repl_subcommand = fn (xs: [string]) -> ParsedReplSubcommand do
-  match xs do
-    | [] -> return ParsedReplSubcommand(remaining: [], repl_mode: false)
-    | prog :: [] -> return ParsedReplSubcommand(remaining: [prog], repl_mode: false)
-    | prog :: second :: rest2 ->
-      if second == "repl" then
-        return ParsedReplSubcommand(remaining: prog :: rest2, repl_mode: true)
-      end
-      return ParsedReplSubcommand(remaining: xs, repl_mode: false)
-  end
-end
-
-type ParsedMcpSubcommand = ParsedMcpSubcommand(remaining: [string], mcp_mode: bool)
-
-/** Detect a leading `mcp` subcommand. Mirrors `strip_repl_subcommand`: peel
- *  the program name, then check the next arg. When present, control routes
- *  to `src/mcp/main.run_mcp_server`, which reads JSON-RPC frames from stdin
- *  (Content-Length framed, same shape as LSP) and dispatches MCP method
- *  names (initialize, tools/list, tools/call) for the typecheck + explain
- *  tool surface (issue nexus-fnuw).
- */
-let strip_mcp_subcommand = fn (xs: [string]) -> ParsedMcpSubcommand do
-  match xs do
-    | [] -> return ParsedMcpSubcommand(remaining: [], mcp_mode: false)
-    | prog :: [] -> return ParsedMcpSubcommand(remaining: [prog], mcp_mode: false)
-    | prog :: second :: rest2 ->
-      if second == "mcp" then
-        return ParsedMcpSubcommand(remaining: prog :: rest2, mcp_mode: true)
-      end
-      return ParsedMcpSubcommand(remaining: xs, mcp_mode: false)
-  end
-end
-
-export type ParsedTypecheckSubcommand = ParsedTypecheckSubcommand(remaining: [string], typecheck_only: bool)
-
-/** Detect a leading `typecheck` subcommand. When present, strip it and signal
- *  that the driver should run the front-end pipeline only (parse → HIR →
- *  resolve → linearity → typecheck → tc-linearity) and skip MIR/LIR/codegen.
- *  The form is `nexus typecheck <input.nx>`; positional output is rejected
- *  because typecheck-only never writes a wasm artifact.
- */
-export let strip_typecheck_subcommand = fn (xs: [string]) -> ParsedTypecheckSubcommand do
-  match xs do
-    | [] -> return ParsedTypecheckSubcommand(remaining: [], typecheck_only: false)
-    | prog :: [] -> return ParsedTypecheckSubcommand(remaining: [prog], typecheck_only: false)
-    | prog :: second :: rest2 ->
-      if second == "typecheck" then
-        return ParsedTypecheckSubcommand(remaining: prog :: rest2, typecheck_only: true)
-      end
-      return ParsedTypecheckSubcommand(remaining: xs, typecheck_only: false)
-  end
-end
-
-export type ParsedRunSubcommand = ParsedRunSubcommand(remaining: [string], run_mode: bool, run_args: [string])
-
-/** Split a positional-args list on the first `--` separator. Returns the
- *  prefix (compiler-visible args) and suffix (program argv forwarded to the
- *  built wasm). When `--` is absent every token stays in the prefix and the
- *  suffix is empty.
- */
-let split_on_dashdash = fn (xs: [string], prefix: [string]) -> ParsedRunSubcommand do
-  match xs do
-    | [] -> return ParsedRunSubcommand(remaining: list.reverse(xs: prefix), run_mode: true, run_args: [])
-    | v :: rest ->
-      if v == "--" then
-        return ParsedRunSubcommand(remaining: list.reverse(xs: prefix), run_mode: true, run_args: rest)
-      end
-      return split_on_dashdash(xs: rest, prefix: v :: prefix)
-  end
-end
-
-/** Detect a leading `run` subcommand. Form: `nexus run <input.nx> [-- ARGS...]`.
- *  The `--` separator forwards every following token to the built program as
- *  its argv; tokens before `--` remain available to the build pipeline (so
- *  `--verbose` etc. still work).
- */
-export let strip_run_subcommand = fn (xs: [string]) -> ParsedRunSubcommand do
-  match xs do
-    | [] -> return ParsedRunSubcommand(remaining: [], run_mode: false, run_args: [])
-    | prog :: [] -> return ParsedRunSubcommand(remaining: [prog], run_mode: false, run_args: [])
-    | prog :: second :: rest2 ->
-      if second == "run" then
-        let ParsedRunSubcommand(remaining: pre, run_mode: _, run_args) = split_on_dashdash(xs: rest2, prefix: [])
-        return ParsedRunSubcommand(remaining: prog :: pre, run_mode: true, run_args)
-      end
-      return ParsedRunSubcommand(remaining: xs, run_mode: false, run_args: [])
+    | None ->
+      if argc >= 3 then return str_nth(xs, n: 2) end
+      return "out.wasm"
   end
 end
 
@@ -453,8 +420,6 @@ type ExplainCaps = ExplainYes | ExplainNone | ExplainWasmtime
 
 type ExplainFormat = FormatText | FormatJson
 
-type ParsedExplainArgs = ParsedExplainArgs(remaining: [string], explain: ExplainCaps, format: ExplainFormat)
-
 let parse_explain_caps_value = fn (s: string) -> Option<ExplainCaps> do
   if s == "yes" then return Some(val: ExplainYes) end
   if s == "none" then return Some(val: ExplainNone) end
@@ -476,39 +441,9 @@ end
 // linearity to follow in nexus-kmel.2. The two flags share the same
 // `ExplainFormat = FormatText | FormatJson` algebra because the underlying
 // choice is identical and the migration cost is zero.
-
-type ParsedFormatFlag = ParsedFormatFlag(remaining: [string], format: ExplainFormat)
-
-/** Strip the global `--format=VALUE` flag (and its `--format VALUE` two-token
- *  spelling). Default `text` keeps every legacy invocation byte-identical.
- */
-let strip_format_flag = fn (xs: [string], format: ExplainFormat) -> ParsedFormatFlag throws { InvalidUsage } do
-  match xs do
-    | [] -> return ParsedFormatFlag(remaining: [], format)
-    | flag :: rest ->
-      // --format=VALUE attached form
-      if str.starts_with(s: flag, prefix: "--format=") then
-        let value = str.substring(s: flag, start: 9, len: str.length(s: flag) - 9)
-        if let Some(val: f) = parse_explain_format_value(s: value) then
-          return strip_format_flag(xs: rest, format: f)
-        end
-        raise InvalidUsage(detail: "invalid --format value: " ++ value ++ " (expected text|json)")
-      end
-      // --format VALUE two-token form
-      if flag == "--format" then
-        match rest do
-          | [] -> raise InvalidUsage(detail: "--format requires a value (text|json)")
-          | value :: rest2 ->
-            if let Some(val: f) = parse_explain_format_value(s: value) then
-              return strip_format_flag(xs: rest2, format: f)
-            end
-            raise InvalidUsage(detail: "invalid --format value: " ++ value ++ " (expected text|json)")
-        end
-      end
-      let ParsedFormatFlag(remaining: rest_args, format: f2) = strip_format_flag(xs: rest, format)
-      return ParsedFormatFlag(remaining: flag :: rest_args, format: f2)
-  end
-end
+//
+// Both --format and --explain-capabilities-format are parsed in one shot
+// by `parse_global_args` (above) via the argparse spec table.
 
 let perm_to_cap_name = fn (perm: string) -> Option<string> do
   if perm == "PermFs" then return Some(val: "Fs") end
@@ -561,37 +496,9 @@ let find_main_caps = fn (defs: [SpannedTopLevel]) -> [string] do
   end
 end
 
-/** Strip `--explain-capabilities VALUE` and `--explain-capabilities-format VALUE`
- *  pairs from `xs`. Other args are preserved in order.
- */
-let strip_explain_flags = fn (xs: [string], explain: ExplainCaps, format: ExplainFormat) -> ParsedExplainArgs throws { InvalidUsage } do
-  match xs do
-    | [] -> return ParsedExplainArgs(remaining: [], explain, format)
-    | flag :: [] ->
-      if flag == "--explain-capabilities" then
-        raise InvalidUsage(detail: "--explain-capabilities requires a value (yes|none|wasmtime)")
-      end
-      if flag == "--explain-capabilities-format" then
-        raise InvalidUsage(detail: "--explain-capabilities-format requires a value (text|json)")
-      end
-      return ParsedExplainArgs(remaining: [flag], explain, format)
-    | flag :: value :: rest2 ->
-      if flag == "--explain-capabilities" then
-        if let Some(val: e) = parse_explain_caps_value(s: value) then
-          return strip_explain_flags(xs: rest2, explain: e, format)
-        end
-        raise InvalidUsage(detail: "invalid --explain-capabilities value: " ++ value)
-      end
-      if flag == "--explain-capabilities-format" then
-        if let Some(val: f) = parse_explain_format_value(s: value) then
-          return strip_explain_flags(xs: rest2, explain, format: f)
-        end
-        raise InvalidUsage(detail: "invalid --explain-capabilities-format value: " ++ value)
-      end
-      let ParsedExplainArgs(remaining: rest_args, explain: e2, format: f2) = strip_explain_flags(xs: value :: rest2, explain, format)
-      return ParsedExplainArgs(remaining: flag :: rest_args, explain: e2, format: f2)
-  end
-end
+// `--explain-capabilities VALUE` and `--explain-capabilities-format VALUE`
+// are now parsed in one shot by `parse_global_args` (above). The
+// renamed-fields ExplainCaps / ExplainFormat values land in GlobalFlags.
 
 let cap_wasmtime_flags = fn (name: string) -> [string] do
   // Net: only `-S inherit-network` is safe on the preview1 core wasm we
@@ -959,159 +866,141 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
     if list.length(xs: args) < 2 then
       raise InvalidUsage(detail: "no subcommand given; try 'nexus help'")
     end
-    let verbose = has_verbose_flag(xs: args)
-    let args_after_verbose = strip_verbose_flag(xs: args)
-    // `repl` is a no-input subcommand; intercept it before the explain /
-    // output / typecheck flag parsers (which all assume an input-file
-    // pipeline) so `nexus repl` runs cleanly with no other arguments.
-    let ParsedReplSubcommand(remaining: args_after_repl, repl_mode) = strip_repl_subcommand(xs: args_after_verbose)
-    if repl_mode then
-      repl_mod.run(max_iters: -1)
-      return ()
-    end
-    // `mcp` is a no-input subcommand like `repl`; intercept before the
-    // explain/output/typecheck flag parsers (issue nexus-fnuw). Drives a
-    // Content-Length-framed JSON-RPC loop on stdio and dispatches MCP
-    // method names (initialize, tools/list, tools/call). The driver
-    // already discharges PermConsole + PermFs, which is the cap set
-    // `run_mcp_server` requires.
-    let ParsedMcpSubcommand(remaining: args_after_mcp, mcp_mode) = strip_mcp_subcommand(xs: args_after_repl)
-    if mcp_mode then
-      let _ = args_after_mcp
-      mcp_mod.run_mcp_server(max_iters: -1)
-      return ()
-    end
-    // `explain <symbol> [--file FILE] [--format text|json]` (issue nexus-cgfd).
-    // One-shot CLI surface that mirrors the LSP/MCP `explain` query so
-    // agents can drop the JSON-RPC bridge for the common "what is this
-    // symbol?" lookup. Short-circuits before the build-flag parsers so its
-    // `--format` flag is its own.
-    let ParsedExplainSubcommand(remaining: args_after_explain_sub, is_explain) = explain_mod.strip_explain_subcommand(xs: args_after_repl)
-    if is_explain then
-      let explain_args = match args_after_explain_sub do
-        | [] -> []
-        | _ :: rest -> rest
+    // `repl` / `mcp` are no-input subcommands; intercept them before the
+    // global-flag parser (which assumes an input-file pipeline) so they
+    // run cleanly with no other arguments. Same for `explain` and
+    // `context`: those owned their own --file / --format parsing under
+    // `*_subcommand_args` (issue nexus-cgfd).
+    match detect_subcommand(args, kw: "repl") do | SubcommandHit(present: p_repl, _) ->
+      if p_repl then
+        repl_mod.run(max_iters: -1)
+        return ()
       end
-      let exit_code = explain_mod.run_explain_subcommand(args: explain_args)
-      proc.exit(status: exit_code)
     end
-    // `context <file> [--format text|json]` (issue nexus-cgfd). Prints the
-    // file's exports, imports, main capabilities and throwing functions —
-    // a one-shot agent-friendly summary derived from the parsed AST.
-    let ParsedContextSubcommand(remaining: args_after_context_sub, is_context) = context_mod.strip_context_subcommand(xs: args_after_repl)
-    if is_context then
-      let context_args = match args_after_context_sub do
-        | [] -> []
-        | _ :: rest -> rest
+    match detect_subcommand(args, kw: "mcp") do | SubcommandHit(present: p_mcp, _) ->
+      if p_mcp then
+        mcp_mod.run_mcp_server(max_iters: -1)
+        return ()
       end
-      let exit_code = context_mod.run_context_subcommand(args: context_args)
-      proc.exit(status: exit_code)
     end
-    let ParsedExplainArgs(remaining: args_after_explain, explain, format) = strip_explain_flags(xs: args_after_repl, explain: ExplainYes, format: FormatText)
-    // Driver-wide `--format=json|text` (issue nexus-kmel). Default `text`
-    // keeps every legacy invocation byte-identical. Affects per-diagnostic
-    // emission (parser diags in V1) plus the top-level error handler.
-    let ParsedFormatFlag(remaining: args_after_format, format: diag_format) = strip_format_flag(xs: args_after_explain, format: FormatText)
-    let ParsedOutputFlag(remaining: args_after_output, output: opt_output) = strip_output_flag(xs: args_after_format, output: None)
+    match explain_mod.strip_explain_subcommand(xs: args) do | ParsedExplainSubcommand(remaining: args_after_explain_sub, is_explain) ->
+      if is_explain then
+        let explain_args = match args_after_explain_sub do
+          | [] -> []
+          | _ :: rest -> rest
+        end
+        let exit_code = explain_mod.run_explain_subcommand(args: explain_args)
+        proc.exit(status: exit_code)
+      end
+    end
+    match context_mod.strip_context_subcommand(xs: args) do | ParsedContextSubcommand(remaining: args_after_context_sub, is_context) ->
+      if is_context then
+        let context_args = match args_after_context_sub do
+          | [] -> []
+          | _ :: rest -> rest
+        end
+        let exit_code = context_mod.run_context_subcommand(args: context_args)
+        proc.exit(status: exit_code)
+      end
+    end
+    // All driver-global flags are now resolved in one argparse pass
+    // (issue nexus-8vu5). What used to be six chained strip_* helpers
+    // (verbose / output / format / explain-flags / coverage / polyglot)
+    // is one declarative spec table + one `parse` call.
+    let gf = parse_global_args(args)
+    let GlobalFlags(positionals, remaining: args_after_run, verbose, output: opt_output, diag_format, explain, explain_format: format, coverage: coverage_enabled, output_mode, manifest_mode, dump_imports: dump_imports_flag) = gf
+    let polyglot_mode = if let PolyglotLauncher = output_mode then true else false end
+    let remain_manifest = if let KeepManifest = manifest_mode then true else false end
     // `nexus test [path] [flags]` short-circuits before MIR/codegen because
     // the test runner spawns the host nexus binary itself, not the in-process
-    // pipeline. Detected here so test-specific flags like --junit don't go
-    // through strip_output_flag's `-o` handler.
-    let ParsedTestSubcommand(remaining: args_after_test, is_test) = strip_test_subcommand(xs: args_after_output)
-    if is_test then
-      // Drop the program-name token (args_after_test[0]) before passing on.
-      let test_args = match args_after_test do
-        | [] -> []
-        | _ :: rest -> rest
+    // pipeline.
+    match strip_test_subcommand(xs: positionals) do | ParsedTestSubcommand(remaining: args_after_test, is_test) ->
+      if is_test then
+        let test_args = match args_after_test do
+          | [] -> []
+          | _ :: rest -> rest
+        end
+        let exit_code = run_test_subcommand(args: test_args)
+        proc.exit(status: exit_code)
       end
-      let exit_code = run_test_subcommand(args: test_args)
-      proc.exit(status: exit_code)
     end
-    // `nexus fmt [--check] FILE...` short-circuits before MIR/codegen. The
-    // formatter is a self-contained byte-level pass (no parser, no IR), so
-    // it never reaches the rest of the build pipeline.
-    let ParsedFmtSubcommand(remaining: args_after_fmt, is_fmt) = strip_fmt_subcommand(xs: args_after_output)
-    if is_fmt then
-      let fmt_args = match args_after_fmt do
-        | [] -> []
-        | _ :: rest -> rest
+    // `nexus fmt [--check] FILE...` short-circuits before MIR/codegen.
+    match strip_fmt_subcommand(xs: positionals) do | ParsedFmtSubcommand(remaining: args_after_fmt, is_fmt) ->
+      if is_fmt then
+        let fmt_args = match args_after_fmt do
+          | [] -> []
+          | _ :: rest -> rest
+        end
+        let exit_code = run_fmt_subcommand(args: fmt_args)
+        proc.exit(status: exit_code)
       end
-      let exit_code = run_fmt_subcommand(args: fmt_args)
-      proc.exit(status: exit_code)
     end
-    // `nexus grep <pattern> [path...]` (issue nexus-a02c V1). Structural AST
-    // search: short-circuits before MIR/codegen because the pattern matcher
-    // only needs lex + parse + AST walk. Self-contained block.
-    let ParsedGrepSubcommand(remaining: args_after_grep, is_grep) = strip_grep_subcommand(xs: args_after_output)
-    if is_grep then
-      let grep_args = match args_after_grep do
-        | [] -> []
-        | _ :: rest -> rest
+    // `nexus grep <pattern> [path...]` (issue nexus-a02c V1).
+    match strip_grep_subcommand(xs: positionals) do | ParsedGrepSubcommand(remaining: args_after_grep, is_grep) ->
+      if is_grep then
+        let grep_args = match args_after_grep do
+          | [] -> []
+          | _ :: rest -> rest
+        end
+        let exit_code = run_grep_subcommand(args: grep_args)
+        proc.exit(status: exit_code)
       end
-      let exit_code = run_grep_subcommand(args: grep_args)
-      proc.exit(status: exit_code)
     end
-    // `nexus ast <input.nx>` (issue nexus-qqvz). Front-end-only dump: lex
-    // + parse → AST. Pre-typecheck, pre-HIR. Self-contained block so the
-    // parallel-batch `nexus types` arm can be merged mechanically.
-    let ParsedAstSubcommand(remaining: args_after_ast, is_ast) = strip_ast_subcommand(xs: args_after_output)
-    if is_ast then
-      let ast_args = match args_after_ast do
-        | [] -> []
-        | _ :: rest -> rest
+    // `nexus ast <input.nx>` (issue nexus-qqvz). Front-end-only dump.
+    match strip_ast_subcommand(xs: positionals) do | ParsedAstSubcommand(remaining: args_after_ast, is_ast) ->
+      if is_ast then
+        let ast_args = match args_after_ast do
+          | [] -> []
+          | _ :: rest -> rest
+        end
+        let exit_code = run_ast_dump_subcommand(args: ast_args, format: diag_format, verbose)
+        proc.exit(status: exit_code)
       end
-      let exit_code = run_ast_dump_subcommand(args: ast_args, format: diag_format, verbose)
-      proc.exit(status: exit_code)
     end
-    // `nexus hir <input.nx>` / `nexus lir <input.nx>` short-circuit before
-    // typecheck/MIR/codegen: they run the front-end (lex + parse + HIR
-    // build + resolve) and print HIR or LIR in either text (default) or
-    // JSON (`--format=json`). Issue nexus-ud6j V1 — agents need a
-    // machine-readable IR snapshot; full JSON expression trees are V2.
-    let ParsedHirSubcommand(remaining: args_after_hir, is_hir) = strip_hir_subcommand(xs: args_after_output)
-    if is_hir then
-      let hir_args = match args_after_hir do
-        | [] -> []
-        | _ :: rest -> rest
+    // `nexus hir <input.nx>` / `nexus lir <input.nx>` / `nexus types <input.nx>`
+    // short-circuit before typecheck/MIR/codegen.
+    match strip_hir_subcommand(xs: positionals) do | ParsedHirSubcommand(remaining: args_after_hir, is_hir) ->
+      if is_hir then
+        let hir_args = match args_after_hir do
+          | [] -> []
+          | _ :: rest -> rest
+        end
+        let exit_code = run_hir_dump_subcommand(args: hir_args, format: diag_format, verbose)
+        proc.exit(status: exit_code)
       end
-      let exit_code = run_hir_dump_subcommand(args: hir_args, format: diag_format, verbose)
-      proc.exit(status: exit_code)
     end
-    let ParsedLirSubcommand(remaining: args_after_lir, is_lir) = strip_lir_subcommand(xs: args_after_output)
-    if is_lir then
-      let lir_args = match args_after_lir do
-        | [] -> []
-        | _ :: rest -> rest
+    match strip_lir_subcommand(xs: positionals) do | ParsedLirSubcommand(remaining: args_after_lir, is_lir) ->
+      if is_lir then
+        let lir_args = match args_after_lir do
+          | [] -> []
+          | _ :: rest -> rest
+        end
+        let exit_code = run_lir_dump_subcommand(args: lir_args, format: diag_format, verbose)
+        proc.exit(status: exit_code)
       end
-      let exit_code = run_lir_dump_subcommand(args: lir_args, format: diag_format, verbose)
-      proc.exit(status: exit_code)
     end
-    // `nexus types <input.nx>` (nexus-g5el) runs the front-end through
-    // typecheck and dumps the inferred type of each top-level binding.
-    // Self-contained block so the orchestrator can ff-merge against the
-    // parallel `nexus ast --json` work targeting the same dispatcher.
-    let ParsedTypesSubcommand(remaining: args_after_types, is_types) = strip_types_subcommand(xs: args_after_output)
-    if is_types then
-      let types_args = match args_after_types do
-        | [] -> []
-        | _ :: rest -> rest
+    match strip_types_subcommand(xs: positionals) do | ParsedTypesSubcommand(remaining: args_after_types, is_types) ->
+      if is_types then
+        let types_args = match args_after_types do
+          | [] -> []
+          | _ :: rest -> rest
+        end
+        let exit_code = run_types_dump_subcommand(args: types_args, format: diag_format, verbose)
+        proc.exit(status: exit_code)
       end
-      let exit_code = run_types_dump_subcommand(args: types_args, format: diag_format, verbose)
-      proc.exit(status: exit_code)
     end
-    let ParsedTypecheckSubcommand(remaining: args_after_tc, typecheck_only) = strip_typecheck_subcommand(xs: args_after_output)
-    // `nexus run <input.nx> [-- ARGS...]` (issue nexus-tr79). Compiles to a
-    // temp wasm then `Proc.exec`s wasmtime against it. The actual exec only
-    // succeeds under a runtime with subprocess (preview2 or host shell); the
-    // polyglot launcher intercepts `run` in shell for the preview1 path.
-    let ParsedRunSubcommand(remaining: args_after_run, run_mode, run_args) = strip_run_subcommand(xs: args_after_tc)
+    // typecheck / run / build are all build-pipeline routes. The argparse
+    // pass already consumed every global flag; what remains in `positionals`
+    // is `[prog, subcommand_keyword, input.nx, ...]`. `run` forwards every
+    // post-`--` token to the built program via gf.remaining (issue nexus-tr79).
+    let tc_hit = detect_subcommand(args: positionals, kw: "typecheck")
+    let SubcommandHit(present: typecheck_only, remaining: positionals_after_tc) = tc_hit
+    let run_hit = detect_subcommand(args: positionals_after_tc, kw: "run")
+    let SubcommandHit(present: run_mode, remaining: positionals_after_run) = run_hit
+    let run_args = args_after_run
     if run_mode && typecheck_only then
       raise InvalidUsage(detail: "`run` is incompatible with `typecheck`")
     end
-    let ParsedCoverageFlag(remaining: args_after_coverage, coverage: coverage_enabled) = strip_coverage_flag(xs: args_after_run, coverage: false)
-    let ParsedPolyglotFlags(remaining: args_after_polyglot, output: output_mode, manifest: manifest_mode) = strip_polyglot_flags(xs: args_after_coverage, output: BareBinary, manifest: StripManifest)
-    let polyglot_mode = if let PolyglotLauncher = output_mode then true else false end
-    let remain_manifest = if let KeepManifest = manifest_mode then true else false end
     if remain_manifest && !polyglot_mode then
       raise InvalidUsage(detail: "--remain-manifest requires --polyglot")
     end
@@ -1122,27 +1011,37 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
       raise InvalidUsage(detail: "--polyglot is incompatible with `run`")
     end
     // When `typecheck` or `run` has already been stripped, args lack `build` by design.
-    let clean_args = if typecheck_only || run_mode then args_after_polyglot else strip_build_subcommand(xs: args_after_polyglot) end
+    // Otherwise require a `build` subcommand for symmetry with `repl`/`typecheck`/`test`
+    // (the bare `nexus foo.nx` form is rejected). `--dump-imports` is a subcommand-
+    // shaped global flag handled downstream so it bypasses the requirement.
+    let clean_args = if typecheck_only || run_mode || dump_imports_flag then positionals_after_run
+      else
+        let bld_hit = detect_subcommand(args: positionals_after_run, kw: "build")
+        match bld_hit do | SubcommandHit(present: has_build, remaining: positionals_after_build) ->
+          if !has_build then
+            raise InvalidUsage(detail: "missing subcommand: did you mean 'build'?")
+          end
+          positionals_after_build
+        end
+      end
     // Override output to a side-by-side temp wasm when running. We avoid TMPDIR
     // (would require PermEnv) and `Fs` is already on the driver's cap list, so
     // a cwd-relative path needs no extra `--dir` mount.
     let run_output_path = "./.nexus-run.wasm"
     let argc = list.length(xs: clean_args)
+    if dump_imports_flag then
+      if argc < 2 then
+        raise InvalidUsage(detail: "usage: nexus --dump-imports <input.nx>")
+      end
+      dump_import_graph(input_path: str_nth(xs: clean_args, n: 1))
+      return ()
+    end
     if argc < 2 then
       print_usage()
       raise InvalidUsage(detail: "missing input file argument")
     end
 
-    let first_arg = str_nth(xs: clean_args, n: 1)
-    if first_arg == "--dump-imports" then
-      if argc < 3 then
-        raise InvalidUsage(detail: "usage: nexus --dump-imports <input.nx>")
-      end
-      dump_import_graph(input_path: str_nth(xs: clean_args, n: 2))
-      return ()
-    end
-
-    let input_path = first_arg
+    let input_path = str_nth(xs: clean_args, n: 1)
     let output_path = if run_mode then run_output_path else resolve_output_path(opt_output, xs: clean_args, argc) end
 
     if verbose then
