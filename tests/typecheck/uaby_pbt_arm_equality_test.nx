@@ -1,0 +1,342 @@
+// nexus-uaby: property-based test for T-If / T-Match arm-equality on
+// linear consumption.
+//
+// Invariant: when an `if/else` (T-If) or `match` (T-Match) statement is the
+// last visible effect on a linear binding, every non-diverging arm must
+// consume the same linear set. Arm-equality, not intersection: dropping a
+// consume in one arm must be rejected by the linearity pass
+// (`LinearMismatch`, E2009).
+//
+// Strategy. We splice a `Gen<ArmShape>`-driven body into a known-good
+// wrapper program, then drive parse → import-resolve → HIR build →
+// tc_linearity.check_program in-process. `Proc.exec` is unreachable under
+// WASI preview1 (the `nexus` shell launcher cannot fork-exec itself from
+// the wasm guest), so we replicate the relevant slice of the driver
+// pipeline inline. tc_linearity is the only post-typecheck pass that
+// detects linear-set divergence across if/match arms — running it alone
+// (skipping the broader `check_program`) is sufficient for the property,
+// because the wrapper is well-typed under T-If / T-Match.
+//
+// Coverage:
+//   - 50 positive iterations: a shape-driven wrapper whose two arms both
+//     consume `{%a, %b}` passes tc_linearity.
+//   - 50 negative iterations: a shape-driven wrapper whose second arm
+//     consumes only `{%a}` raises LinearMismatch.
+//
+// The seed is threaded through pbt.small_int (xorshift64), the same
+// generator the smoke test uses. We drive the loop manually rather than
+// calling `pbt.forall` because the predicate signature `(x: i64) -> bool`
+// is effect-pure and we need `require { Console, Fs }` for the parse /
+// import-resolve calls.
+
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as parser from "src/frontend/parser.nx"
+import * as state_mod from "src/lsp/program_state.nx"
+import * as hir from "src/ir/hir/hir.nx"
+import * as tc_linearity from "src/typecheck/linearity.nx"
+import { ProgramState } from "src/lsp/program_state.nx"
+import { HirProgram } from "src/ir/hir/types.nx"
+import { resolve_all_lazy_no_filter } from "src/ir/hir/demand.nx"
+import { LinearMismatch } from "src/common/error.nx"
+import { Pair } from "std:tuple"
+import { Gen } from "std:pbt"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+// ─── Local shape sum ───────────────────────────────────────────────────────
+//
+// ArmShape encodes the variant we splice into the wrapper:
+//   IfEqual   — `if cond then drop a; drop b else drop a; drop b end`
+//   IfReorder — `if cond then drop a; drop b else drop b; drop a end`
+//   MatchEq   — `match t do | T1 -> drop a; drop b | T2 -> drop a; drop b end`
+//   MatchRev  — `match t do | T1 -> drop a; drop b | T2 -> drop b; drop a end`
+//
+// All four shapes are arm-equal (both arms consume `{%a, %b}`); the
+// negative driver wraps the same four with one arm's consume dropped.
+
+type ArmShape =
+  IfEqual
+  | IfReorder
+  | MatchEq
+  | MatchRev
+
+// ─── Generator: pick an ArmShape from a small_int draw ──────────────────────
+
+let pick_shape = fn (n: i64) -> ArmShape do
+  let r = n - (n / 4) * 4
+  let abs_r = if r < 0 then 0 - r else r end
+  if abs_r == 0 then return IfEqual end
+  if abs_r == 1 then return IfReorder end
+  if abs_r == 2 then return MatchEq end
+  return MatchRev
+end
+
+let render_shape = fn (s: ArmShape) -> string do
+  match s do
+    | IfEqual -> return "IfEqual"
+    | IfReorder -> return "IfReorder"
+    | MatchEq -> return "MatchEq"
+    | MatchRev -> return "MatchRev"
+  end
+end
+
+// ─── Splice helpers ─────────────────────────────────────────────────────────
+
+// Positive body: BOTH arms consume {%a, %b}. The shape only varies
+// arm-internal ordering (which the linearity pass collapses by set equality).
+let pos_body_for = fn (s: ArmShape) -> string do
+  let da = "    drop_r(x: %a)\n"
+  let db = "    drop_r(x: %b)\n"
+  match s do
+    | IfEqual ->
+      return "  if cond then\n" ++ da ++ db
+          ++ "  else\n" ++ da ++ db ++ "  end\n"
+    | IfReorder ->
+      return "  if cond then\n" ++ da ++ db
+          ++ "  else\n" ++ db ++ da ++ "  end\n"
+    | MatchEq ->
+      return "  match t do\n"
+          ++ "    | T1 ->\n" ++ da ++ db
+          ++ "    | T2 ->\n" ++ da ++ db
+          ++ "  end\n"
+    | MatchRev ->
+      return "  match t do\n"
+          ++ "    | T1 ->\n" ++ da ++ db
+          ++ "    | T2 ->\n" ++ db ++ da
+          ++ "  end\n"
+  end
+end
+
+// Negative body: arm 2 omits `drop_r(x: %b)`. The linearity pass must
+// raise LinearMismatch (E2009) with detail "linear set mismatch".
+let neg_body_for = fn (s: ArmShape) -> string do
+  let da = "    drop_r(x: %a)\n"
+  let db = "    drop_r(x: %b)\n"
+  match s do
+    | IfEqual ->
+      return "  if cond then\n" ++ da ++ db
+          ++ "  else\n" ++ da ++ "  end\n"
+    | IfReorder ->
+      return "  if cond then\n" ++ db ++ da
+          ++ "  else\n" ++ da ++ "  end\n"
+    | MatchEq ->
+      return "  match t do\n"
+          ++ "    | T1 ->\n" ++ da ++ db
+          ++ "    | T2 ->\n" ++ da
+          ++ "  end\n"
+    | MatchRev ->
+      return "  match t do\n"
+          ++ "    | T1 ->\n" ++ db ++ da
+          ++ "    | T2 ->\n" ++ da
+          ++ "  end\n"
+  end
+end
+
+let wrapper_prelude = fn () -> string do
+  return "type R = R(id: i64)\n"
+      ++ "type Tag = T1 | T2\n"
+      ++ "let mk = fn () -> R do return R(id: 0) end\n"
+      ++ "let drop_r = fn (%x: R) -> unit do\n"
+      ++ "  match %x do | R(id: _) -> () end\n"
+      ++ "  return ()\n"
+      ++ "end\n"
+end
+
+let synth_program = fn (s: ArmShape, body: string) -> string do
+  let sig = match s do
+    | MatchEq | MatchRev -> "let test_fn = fn (cond: bool, t: Tag) -> unit do\n"
+    | _ -> "let test_fn = fn (cond: bool) -> unit do\n"
+  end
+  let main_call = match s do
+    | MatchEq | MatchRev -> "  test_fn(cond: true, t: T1)\n"
+    | _ -> "  test_fn(cond: true)\n"
+  end
+  return wrapper_prelude()
+      ++ sig
+      ++ "  let %a = mk()\n"
+      ++ "  let %b = mk()\n"
+      ++ body
+      ++ "  return ()\n"
+      ++ "end\n"
+      ++ "let main = fn () -> unit do\n"
+      ++ main_call
+      ++ "  return ()\n"
+      ++ "end\n"
+end
+
+// ─── In-process tc-linearity pipeline ───────────────────────────────────────
+//
+// Mirrors the slice of `driver.nx::compile_and_run` between `parser.parse_source`
+// and `tc_linearity.check_program`. We skip `tc.check_program` because the
+// synthesised wrappers are well-typed by construction; the only invariant
+// we exercise is the tc_linearity arm-equality lint.
+
+type LinOutcome =
+  LinOk
+  | LinMismatch
+  | LinOtherTypeError(label: string)
+  | LinHirError
+  | LinParseError
+
+let build_hir_no_imports = fn (state: ProgramState, source_file: string) -> HirProgram require { Console, Fs } throws { Exn } do
+  let ProgramState(prog: _, defs, cache: _, accum, self_entries: _, caller_entries: _, all_entries) = state
+  let accum2 = hir.process_defs(defs, entries: all_entries, accum, source_file)
+  let raw = hir.accum_to_program(accum: accum2)
+  match raw do | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
+    let resolved = resolve_all_lazy_no_filter(funcs: hf)
+    return HirProgram(ports: hp, functions: resolved, externals: he,
+      handler_bindings: hb, enum_defs: hed, exception_groups: heg,
+      value_binding_names: hvbns, type_defs: htds)
+  end
+end
+
+let run_tc_linearity = fn (src: string, file: string) -> LinOutcome require { Console, Fs } do
+  try
+    let prog = parser.parse_source(src)
+    try
+      let pstate = state_mod.resolve_imports_for(prog, file)
+      try
+        let hir_prog = build_hir_no_imports(state: pstate, source_file: file)
+        try
+          tc_linearity.check_program(prog: hir_prog)
+          return LinOk
+        catch te ->
+          match te do
+            | LinearMismatch(detail: _, span: _) -> return LinMismatch
+            | _ -> return LinOtherTypeError(label: "tc-linearity: non-mismatch TypeError")
+          end
+        end
+      catch _ -> return LinHirError
+      end
+    catch _ -> return LinHirError
+    end
+  catch _ -> return LinParseError
+  end
+end
+
+// ─── Iteration drivers ──────────────────────────────────────────────────────
+//
+// We use pbt.small_int directly as a Gen<i64>, pulling (value, next_seed)
+// out of the bundled `run`. The seed thread is the same xorshift64 step
+// the runtime uses for `forall`. We start at pbt-style seed 42 + a phase
+// offset so the positive/negative runs see distinct sequences (catches
+// any accidental coupling on shape choice across the two phases).
+
+let pos_seed_start = 42
+let neg_seed_start = 137
+
+let one_iter_pos = fn (g: Gen<i64>, seed: i64) -> Pair<bool, i64> require { Console, Fs } do
+  let Gen(run: g_run, shrink: _, render: _) = g
+  let Pair(left: v, right: s1) = g_run(seed)
+  let shape = pick_shape(n: v)
+  let body = pos_body_for(s: shape)
+  let src = synth_program(s: shape, body)
+  let outcome = run_tc_linearity(src: src, file: "buffer://uaby_pos_" ++ render_shape(s: shape) ++ ".nx")
+  let ok = match outcome do
+    | LinOk -> true
+    | _ -> false
+  end
+  return Pair(left: ok, right: s1)
+end
+
+let one_iter_neg = fn (g: Gen<i64>, seed: i64) -> Pair<bool, i64> require { Console, Fs } do
+  let Gen(run: g_run, shrink: _, render: _) = g
+  let Pair(left: v, right: s1) = g_run(seed)
+  let shape = pick_shape(n: v)
+  let body = neg_body_for(s: shape)
+  let src = synth_program(s: shape, body)
+  let outcome = run_tc_linearity(src: src, file: "buffer://uaby_neg_" ++ render_shape(s: shape) ++ ".nx")
+  let ok = match outcome do
+    | LinMismatch -> true
+    | _ -> false
+  end
+  return Pair(left: ok, right: s1)
+end
+
+// Tail-recursive iteration over `n` samples. Returns the number of
+// iterations whose outcome MATCHED the expected one — the caller asserts
+// this equals `n`. We could short-circuit on the first counterexample,
+// but iterating the full 50 surfaces aggregate flakiness too.
+let run_pos_loop = fn (g: Gen<i64>, n: i64, seed: i64, ok_count: i64) -> i64 require { Console, Fs } do
+  if n <= 0 then return ok_count end
+  let Pair(left: ok, right: s1) = one_iter_pos(g, seed)
+  let next = if ok then ok_count + 1 else ok_count end
+  return run_pos_loop(g, n: n - 1, seed: s1, ok_count: next)
+end
+
+let run_neg_loop = fn (g: Gen<i64>, n: i64, seed: i64, ok_count: i64) -> i64 require { Console, Fs } do
+  if n <= 0 then return ok_count end
+  let Pair(left: ok, right: s1) = one_iter_neg(g, seed)
+  let next = if ok then ok_count + 1 else ok_count end
+  return run_neg_loop(g, n: n - 1, seed: s1, ok_count: next)
+end
+
+// ─── Body ──────────────────────────────────────────────────────────────────
+
+let iter_count = 50
+
+let body = fn () -> unit require { Console, Fs } throws { Exn } do
+  // Sanity probe: a hand-rolled positive program passes tc-linearity, and
+  // the corresponding negative program raises LinearMismatch. Catches the
+  // case where the wrapper template fails for an unrelated reason (parse
+  // error, HIR build failure, etc.) — without the probe a silent
+  // wrapper-side break would falsely look like a linearity-pass bug.
+  let probe_pos = synth_program(s: IfEqual, body: pos_body_for(s: IfEqual))
+  let probe_pos_out = run_tc_linearity(src: probe_pos, file: "buffer://uaby_probe_pos.nx")
+  let pos_ok_probe = match probe_pos_out do | LinOk -> true | _ -> false end
+  test_assert.assert_eq_bool(
+    actual: pos_ok_probe, expected: true,
+    label: "uaby: probe positive wrapper passes tc-linearity"
+  )
+
+  let probe_neg = synth_program(s: IfEqual, body: neg_body_for(s: IfEqual))
+  let probe_neg_out = run_tc_linearity(src: probe_neg, file: "buffer://uaby_probe_neg.nx")
+  let neg_mismatch_probe = match probe_neg_out do | LinMismatch -> true | _ -> false end
+  test_assert.assert_eq_bool(
+    actual: neg_mismatch_probe, expected: true,
+    label: "uaby: probe negative wrapper raises LinearMismatch"
+  )
+
+  // Stash the int Gen as a local value (cross-module top-level lets infer
+  // as `() -> Gen<i64>` thunks; binding to a local pins it as a value).
+  let g = pbt.small_int
+
+  // Positive: 50 iterations, every wrapper must pass tc-linearity cleanly.
+  let pos_ok = run_pos_loop(g, n: iter_count, seed: pos_seed_start, ok_count: 0)
+  test_assert.assert_eq_i64(
+    actual: pos_ok,
+    expected: iter_count,
+    label: "uaby: 50 positive iterations all pass tc-linearity (arm-equal consume)"
+  )
+
+  // Negative: 50 iterations, every wrapper must surface LinearMismatch
+  // because arm 2 drops only `%a`.
+  let neg_ok = run_neg_loop(g, n: iter_count, seed: neg_seed_start, ok_count: 0)
+  test_assert.assert_eq_i64(
+    actual: neg_ok,
+    expected: iter_count,
+    label: "uaby: 50 negative iterations all raise LinearMismatch"
+  )
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console, Fs } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole, PermFs } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
