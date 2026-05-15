@@ -1,0 +1,427 @@
+/**
+ * pbt: Property-based testing infrastructure (MVP).
+ *
+ * Provides the minimum viable surface to express and run properties:
+ * a seedable `Gen<T>` (paired with a shrinker and a stringly-typed
+ * renderer), a `Shrinker<T>` over single-value shrinks, the
+ * `forall(g, prop, n)` runner that detects a counterexample and shrinks
+ * it greedily, and a small library of primitive generators
+ * (`small_int`, `bool_gen`, `string_gen`, `bounded_list`).
+ *
+ * ── Why this exists alongside `std:test/prop` ───────────────────────────────
+ * `std:test/prop` is the established fixture-side property runner used by
+ * concrete tests (`tests/stdlib/prop_*_test.nx`). This module is a smaller,
+ * spec-shaped facade that the open PBT bd issues
+ * (ul9n / tmuv / 2ikx / mu39 / pc43 / rrx7 / uaby / f95m / xpzt / m49r / n7pw)
+ * can target without coupling to `test/prop`'s richer-but-noisier API
+ * (PropOpts, PropResult, render_summary, etc). Keep the surface deliberately
+ * small here; richer combinators (`weighted`, list shrinkers, AST gens) are
+ * follow-up issues.
+ *
+ * ── PRNG ────────────────────────────────────────────────────────────────────
+ * Pure xorshift64 (Marsaglia 13/7/17). Seed is threaded through every step
+ * by value — no module-level state cell — so a given start seed produces an
+ * identical sequence on every run regardless of host clock or process
+ * lifetime. `forall` re-runs the same sequence under shrinking, so a
+ * counterexample is reproducible by recording the seed (currently fixed at
+ * `default_seed`; richer entry points are a follow-up).
+ *
+ * ── Gen<T> shape ────────────────────────────────────────────────────────────
+ * A `Gen<T>` bundles three closures:
+ *
+ *   * `run    : (seed: i64) -> Pair<T, i64>` — draws one value, returns the
+ *                                              next seed.
+ *   * `shrink : (val: T) -> [T]`             — proposes "smaller" candidates
+ *                                              for greedy shrinking.
+ *   * `render : (val: T) -> string`          — renders a witness for the
+ *                                              `TestResult.Fail` payload so
+ *                                              the result type stays
+ *                                              existential-free across `T`.
+ *
+ * `Shrinker<T>` is exported separately so callers can compose custom
+ * generators against named shrink strategies (`shrink_int` for now;
+ * `shrink_list` etc. are follow-up bd issues).
+ *
+ * ── Forall protocol ─────────────────────────────────────────────────────────
+ *   1. Draw `n` samples with the supplied generator, threading the seed.
+ *   2. On the first sample for which `prop` returns false, capture it as
+ *      the witness and stop drawing.
+ *   3. Shrink greedily via the generator's bundled shrinker until no
+ *      smaller candidate still fails.
+ *   4. Print one line to Console with the original and shrunk witnesses
+ *      (so test runners always have a paper trail) and return
+ *      `Fail(witness, shrunk_input)`.
+ *
+ * Console is the only effect — it is declared on `forall` and propagates to
+ * the caller's `require` set.
+ */
+
+import { Console } from "std:stdio"
+import { Pair } from "std:tuple"
+import { Option, Some, None } from "std:option"
+import * as list from "std:list"
+import * as str from "std:str"
+
+// ─── PRNG (pure xorshift64) ─────────────────────────────────────────────────
+//
+// xorshift64 with state==0 is a fixed point, so we re-mix a zero seed with
+// a fixed nonzero constant before stepping.
+
+let xor_fixup = 2685821657736338717
+
+let next_state = fn (s: i64) -> i64 do
+  let s0 = if s == 0 then xor_fixup else s end
+  let s1 = s0 ^ (s0 << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  return s3
+end
+
+let abs_i64 = fn (n: i64) -> i64 do
+  if n < 0 then return 0 - n end
+  return n
+end
+
+// ─── Core types ─────────────────────────────────────────────────────────────
+
+/**
+A seedable generator. `run(seed)` produces a value and the next seed so the
+PRNG stays purely functional. `shrink` proposes smaller candidates for the
+runner's greedy shrink pass. `render` is a stringly-typed printer used by
+`forall` to populate `TestResult.Fail` without leaking `T` into the result
+type.
+*/
+export type Gen<T> = Gen(
+  run: (seed: i64) -> Pair<T, i64>,
+  shrink: (val: T) -> [ T ],
+  render: (val: T) -> string
+)
+
+/**
+A shrinker is a function from a value to a finite list of "smaller"
+candidates. "Smaller" is per-type: i64 toward 0, list by length, etc.
+Returning `[]` signals no further shrinking is possible.
+*/
+export type Shrinker<T> = Shrinker(shrink: (val: T) -> [ T ])
+
+/**
+The outcome of a property run.
+
+  - `Pass` — every trial satisfied the property.
+  - `Fail(witness, shrunk_input)` — at least one trial failed.
+    `witness` is the rendered original counterexample; `shrunk_input` is
+    the rendered minimum counterexample after greedy shrinking. Both are
+    strings so the type stays existential-free across generic `T`.
+*/
+export type TestResult = Pass | Fail(witness: string, shrunk_input: string)
+
+// ─── Generic combinators ────────────────────────────────────────────────────
+
+/** Lift a constant into a generator. No shrinking; renders the constant
+via the supplied `show`. */
+export let pure = fn <T>(x: T, show: (val: T) -> string) -> Gen<T> do
+  let run = fn (seed: i64) -> Pair<T, i64> do
+    return Pair(left: x, right: seed)
+  end
+  let shrink = fn (v: T) -> [ T ] do return [] end
+  return Gen(run, shrink, render: show)
+end
+
+/**
+Map a function over a generator's output. The shrinker bundled on the
+returned `Gen<B>` is empty — there is no general way to lift a shrinker
+through an arbitrary `A -> B`; callers needing post-map shrinking should
+attach a custom `Shrinker<B>` at the call site. `show` is the renderer
+for the mapped type.
+*/
+export let map = fn <A, B>(g: Gen<A>, f: (a: A) -> B, show: (val: B) -> string) -> Gen<B> do
+  let Gen(run: g_run, shrink: _, render: _) = g
+  let run = fn (seed: i64) -> Pair<B, i64> do
+    let Pair(left: a, right: s1) = g_run(seed)
+    return Pair(left: f(a), right: s1)
+  end
+  let shrink = fn (v: B) -> [ B ] do return [] end
+  return Gen(run, shrink, render: show)
+end
+
+/**
+Monadic bind: the second generator may depend on the first sample. The
+inner generator runs against the *next* seed, so the bind preserves the
+seed-threading invariant. The bundled shrinker is empty (same reason as
+`map`); the renderer is the inner generator's.
+*/
+export let bind = fn <A, B>(g: Gen<A>, f: (a: A) -> Gen<B>) -> Gen<B> do
+  let Gen(run: g_run, shrink: _, render: _) = g
+  let run = fn (seed: i64) -> Pair<B, i64> do
+    let Pair(left: a, right: s1) = g_run(seed)
+    let g2 = f(a)
+    let Gen(run: g2_run, shrink: _, render: _) = g2
+    return g2_run(s1)
+  end
+  let shrink = fn (v: B) -> [ B ] do return [] end
+  // Renderer for B is unknown at this layer; we use a placeholder that
+  // returns "<bound>". Callers wanting a real renderer should rebuild the
+  // generator with `Gen(run, shrink, render)` directly.
+  let show = fn (v: B) -> string do return "<bound>" end
+  return Gen(run, shrink, render: show)
+end
+
+let nth_or_first = fn <T>(xs: [ T ], n: i64, fallback: T) -> T do
+  match xs do
+    | [] -> return fallback
+    | v :: rest ->
+      if n <= 0 then
+        return v
+      else
+        return nth_or_first(xs: rest, n: n - 1, fallback: fallback)
+      end
+  end
+end
+
+/**
+Uniformly pick and run one of the supplied generators. Caller must supply
+a non-empty list; the runtime falls back to the first generator if the
+index calculation degenerates. The shrinker/renderer of the *first*
+generator is used for the resulting `Gen<T>` (assumes all sub-generators
+share the same render/shrink contracts — true for the homogeneous-type
+`Gen<T>` shape we expose).
+*/
+export let oneOf = fn <T>(gs: [ Gen<T> ]) -> Gen<T> throws { list.ListError } do
+  let head_gen = list.head(xs: gs)
+  let Gen(run: _, shrink: head_shrink, render: head_render) = head_gen
+  let n = list.length(xs: gs)
+  let run = fn (seed: i64) -> Pair<T, i64> do
+    let s1 = next_state(seed)
+    let idx = abs_i64(s1) % (if n <= 0 then 1 else n end)
+    let chosen = nth_or_first(xs: gs, n: idx, fallback: head_gen)
+    let Gen(run: g_run, shrink: _, render: _) = chosen
+    return g_run(s1)
+  end
+  return Gen(run, shrink: head_shrink, render: head_render)
+end
+
+// ─── Primitive generators ───────────────────────────────────────────────────
+
+let small_int_lo = 0 - 100
+let small_int_hi = 100
+let small_int_span = small_int_hi - small_int_lo + 1
+
+let shrink_int_candidates = fn (v: i64) -> [ i64 ] do
+  if v == 0 then return [] end
+  let half = v / 2
+  if v == half then return [0] end
+  if v < 0 then
+    let neg_half = 0 - (abs_i64(v) / 2)
+    if neg_half == v then
+      return [0]
+    end
+    return [0, neg_half]
+  end
+  return [0, half]
+end
+
+let render_i64 = fn (v: i64) -> string do
+  return str.from_i64(val: v)
+end
+
+/**
+Uniform i64 in [-100, 100]. Small enough that shrinking terminates
+quickly; large enough to surface off-by-one and sign bugs. Shrinker is
+`shrink_int` (toward zero, halving).
+*/
+export let small_int : Gen<i64> = Gen(
+  run: fn (seed: i64) -> Pair<i64, i64> do
+    let s1 = next_state(seed)
+    let raw = abs_i64(s1)
+    let v = small_int_lo + (raw % small_int_span)
+    return Pair(left: v, right: s1)
+  end,
+  shrink: shrink_int_candidates,
+  render: render_i64
+)
+
+let shrink_bool = fn (v: bool) -> [ bool ] do
+  if v then return [false] end
+  return []
+end
+
+let render_bool = fn (v: bool) -> string do
+  return str.from_bool(val: v)
+end
+
+/** Uniform `bool`. Shrinker collapses `true -> false`. */
+export let bool_gen : Gen<bool> = Gen(
+  run: fn (seed: i64) -> Pair<bool, i64> do
+    let s1 = next_state(seed)
+    let v = (abs_i64(s1) % 2) == 1
+    return Pair(left: v, right: s1)
+  end,
+  shrink: shrink_bool,
+  render: render_bool
+)
+
+let printable_lo = 32
+let printable_hi = 126
+let printable_span = printable_hi - printable_lo + 1
+let string_gen_max_len = 16
+
+let gen_string_chars = fn (n: i64, seed: i64, acc: [ string ]) -> Pair<[ string ], i64> do
+  if n <= 0 then
+    return Pair(left: list.reverse(xs: acc), right: seed)
+  else
+    let s1 = next_state(seed)
+    let code = printable_lo + (abs_i64(s1) % printable_span)
+    let ch = str.from_char_code(code)
+    return gen_string_chars(n: n - 1, seed: s1, acc: ch :: acc)
+  end
+end
+
+let shrink_string = fn (s: string) -> [ string ] do
+  let n = str.length(s)
+  if n <= 0 then return [] end
+  let half = n / 2
+  if half == n - 1 then
+    return [str.byte_substring(s, start: 0, len: n - 1)]
+  end
+  if half == 0 then
+    return [str.byte_substring(s, start: 0, len: n - 1)]
+  end
+  return [
+    str.byte_substring(s, start: 0, len: half),
+    str.byte_substring(s, start: 0, len: n - 1)
+  ]
+end
+
+let render_string = fn (s: string) -> string do
+  return "\"" ++ s ++ "\""
+end
+
+/**
+Printable-ASCII string of length [0, 16]. Length is drawn first; each
+character is then drawn independently. Shrinker drops one or many
+characters at a time (length-halving + tail-trim). Suitable for
+round-trip and length-invariant properties; not stress-tested for
+UTF-8 (use a custom generator if you need non-ASCII coverage).
+*/
+export let string_gen : Gen<string> = Gen(
+  run: fn (seed: i64) -> Pair<string, i64> do
+    let s1 = next_state(seed)
+    let len = abs_i64(s1) % (string_gen_max_len + 1)
+    let Pair(left: chars, right: s2) = gen_string_chars(n: len, seed: s1, acc: [])
+    return Pair(left: str.join(xs: chars, sep: ""), right: s2)
+  end,
+  shrink: shrink_string,
+  render: render_string
+)
+
+let gen_list_elems = fn <T>(n: i64, elem: Gen<T>, seed: i64, acc: [ T ]) -> Pair<[ T ], i64> do
+  if n <= 0 then
+    return Pair(left: list.reverse(xs: acc), right: seed)
+  else
+    let Gen(run: e_run, shrink: _, render: _) = elem
+    let Pair(left: v, right: s1) = e_run(seed)
+    return gen_list_elems(n: n - 1, elem: elem, seed: s1, acc: v :: acc)
+  end
+end
+
+let render_list = fn <T>(xs: [ T ], elem_render: (val: T) -> string) -> string do
+  let go = fn (acc: string, x: T) -> string do
+    if str.length(s: acc) == 0 then
+      return elem_render(x)
+    end
+    return acc ++ "," ++ elem_render(x)
+  end
+  return "[" ++ list.fold_left(xs, init: "", f: go) ++ "]"
+end
+
+/**
+List of length [0, max]; elements come from the supplied `g`. Length is
+drawn uniformly. The bundled shrinker proposes dropping the last element
+(length-1 prefix) — list-halving and per-element shrinking are follow-up
+issues.
+*/
+export let bounded_list = fn <T>(g: Gen<T>, max: i64) -> Gen<[ T ]> do
+  let limit = if max < 0 then 0 else max end
+  let Gen(run: _, shrink: _, render: elem_render) = g
+  let run = fn (seed: i64) -> Pair<[ T ], i64> do
+    let s1 = next_state(seed)
+    let len = abs_i64(s1) % (limit + 1)
+    return gen_list_elems(n: len, elem: g, seed: s1, acc: [])
+  end
+  let shrink = fn (xs: [ T ]) -> [ [ T ] ] do
+    let n = list.length(xs)
+    if n <= 0 then return [] end
+    return [list.take(xs, n: n - 1)]
+  end
+  let render = fn (xs: [ T ]) -> string do
+    return render_list(xs, elem_render)
+  end
+  return Gen(run, shrink, render)
+end
+
+// ─── Shrinkers ──────────────────────────────────────────────────────────────
+
+/**
+Integer shrinker biased toward zero. Each step proposes `[0, v/2]` (or
+just `[0]` near the limits), so greedy shrinking converges in
+O(log |v|) iterations. Exported as a `Shrinker<i64>` so callers can
+build custom `Gen<i64>` values reusing the same strategy.
+*/
+export let shrink_int : Shrinker<i64> = Shrinker(shrink: shrink_int_candidates)
+
+// ─── Forall runner ──────────────────────────────────────────────────────────
+
+let default_seed = 42
+
+let find_failing_seed = fn <T>(g: Gen<T>, prop: (x: T) -> bool, trials_left: i64, seed: i64) -> Option<T> do
+  if trials_left <= 0 then return None end
+  let Gen(run: g_run, shrink: _, render: _) = g
+  let Pair(left: v, right: s1) = g_run(seed)
+  if prop(v) then
+    return find_failing_seed(g, prop, trials_left: trials_left - 1, seed: s1)
+  end
+  return Some(val: v)
+end
+
+let find_failing_cand = fn <T>(xs: [ T ], prop: (x: T) -> bool) -> Option<T> do
+  match xs do
+    | [] -> return None
+    | v :: rest ->
+      if prop(v) then
+        return find_failing_cand(xs: rest, prop)
+      end
+      return Some(val: v)
+  end
+end
+
+let shrink_loop = fn <T>(cur: T, shrink_fn: (val: T) -> [ T ], prop: (x: T) -> bool) -> T do
+  let candidates = shrink_fn(cur)
+  match find_failing_cand(xs: candidates, prop) do
+    | None -> return cur
+    | Some(val: smaller) -> return shrink_loop(cur: smaller, shrink_fn, prop)
+  end
+end
+
+/**
+Run a property: draw up to `n` samples from `g`; on the first failing
+sample, shrink it greedily via the generator's bundled shrinker and
+return `Fail(witness, shrunk_input)` with both renderings. On all-pass,
+return `Pass`.
+
+The `Console` effect is used to print a one-line report on failure so
+test runners always see the counterexample. Callers must propagate the
+requirement through their own `require { Console }` and `inject
+stdio.system_handler` boundaries.
+*/
+export let forall = fn <T>(g: Gen<T>, prop: (x: T) -> bool, n: i64) -> TestResult require { Console } do
+  match find_failing_seed(g, prop, trials_left: n, seed: default_seed) do
+    | None -> return Pass
+    | Some(val: original) ->
+      let Gen(run: _, shrink: shrink_fn, render: render_fn) = g
+      let shrunk = shrink_loop(cur: original, shrink_fn, prop)
+      let w_orig = render_fn(original)
+      let w_min = render_fn(shrunk)
+      Console.println(val: "pbt: forall FAIL witness=" ++ w_orig ++ " shrunk=" ++ w_min)
+      return Fail(witness: w_orig, shrunk_input: w_min)
+  end
+end
