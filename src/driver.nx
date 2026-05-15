@@ -50,6 +50,7 @@ import { run_fmt_subcommand, strip_fmt_subcommand, ParsedFmtSubcommand } from "s
 import { strip_hir_subcommand, ParsedHirSubcommand, strip_lir_subcommand, ParsedLirSubcommand, hir_to_text, hir_to_json, lir_to_text, lir_to_json } from "src/tools/ir_dump.nx"
 import { strip_ast_subcommand, ParsedAstSubcommand, ast_to_text, ast_to_json } from "src/tools/ast_dump.nx"
 import { strip_types_subcommand, ParsedTypesSubcommand, types_to_text, types_to_json } from "src/tools/types_dump.nx"
+import { strip_caps_subcommand, ParsedCapsSubcommand, caps_to_text, caps_to_json, symbol_exists as caps_symbol_exists_impl } from "src/tools/caps_dump.nx"
 import { strip_grep_subcommand, ParsedGrepSubcommand, run_grep_subcommand } from "src/tools/grep.nx"
 import { strip_lint_subcommand, ParsedLintSubcommand, run_lint_subcommand } from "src/tools/lint.nx"
 import {
@@ -236,6 +237,7 @@ let cli_specs = fn () -> [ArgSpec] do
     spec_subcommand(name: "hir", help: "<input.nx> [--format=text|json]"),
     spec_subcommand(name: "lir", help: "<input.nx> [--format=text|json]"),
     spec_subcommand(name: "types", help: "<input.nx> [--format=text|json]"),
+    spec_subcommand(name: "caps", help: "<symbol> <input.nx> [--format=text|json]"),
     spec_subcommand(name: "repl", help: "interactive REPL"),
     spec_subcommand(name: "mcp", help: "JSON-RPC tool server (stdio)"),
     spec_subcommand(name: "explain", help: "<symbol> [--file FILE] [--format text|json]"),
@@ -434,6 +436,28 @@ let types_subspec = fn () -> SubcommandSpec do
   )
 end
 
+let caps_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "caps",
+    synopsis: "<symbol> <input.nx> [--format text|json]",
+    description: "Dump the transitive capability closure of one named function: every\ncapability (Fs / Net / Console / Random / Clock / Proc / Env) reached\nby any function transitively called from <symbol>. Useful for agents\nor reviewers asking 'does this function touch the filesystem?' before\nan edit. Symbol resolution accepts either the canonical qualified form\n(`<sanitized_path>#<name>`) or the bare suffix.",
+    flags: list.concat(
+      xs: [spec_opt(name: "format", short: "", long: "--format", required: false, help: "output format (text|json)")],
+      ys: pipeline_flags()
+    ),
+    examples: [
+      example(command: "nexus caps main src/driver.nx", comment: "caps reached from driver's main"),
+      example(command: "nexus caps lint_file src/tools/lint.nx --format json", comment: "JSON dump of a library symbol")
+    ],
+    see_also: ["explain", "types"],
+    exit_codes: [
+      exit_code(code: 0, meaning: "symbol resolved and closure printed"),
+      exit_code(code: 1, meaning: "symbol not found in the named file"),
+      exit_code(code: 2, meaning: "invalid CLI usage (E4002 / E4004)")
+    ]
+  )
+end
+
 let repl_subspec = fn () -> SubcommandSpec do
   return subspec(
     name: "repl",
@@ -588,6 +612,7 @@ let subcommand_specs = fn () -> [SubcommandSpec] do
     hir_subspec(),
     lir_subspec(),
     types_subspec(),
+    caps_subspec(),
     repl_subspec(),
     mcp_subspec(),
     explain_subspec(),
@@ -1232,6 +1257,63 @@ let run_types_dump_subcommand = fn (args: [string], format: ExplainFormat, verbo
   end
 end
 
+// ─── `nexus caps` subcommand (nexus-8fzi) ─────────────────────────────────
+//
+// Resolves <symbol> in <input.nx> and prints the transitive capability
+// closure as text or JSON. Pipeline shape mirrors run_types_dump_subcommand
+// (parse + HIR build + resolve_all_lazy_no_filter, no codegen) because the
+// closure walk consumes the same fully-resolved HIR. linearity / typecheck
+// are intentionally skipped: the cap walk reads name strings + the external
+// table, neither of which the later passes refine, and skipping them keeps
+// caps cheap to run as a pre-flight before an edit.
+//
+// Exit codes track caps_subspec(): 0 on success, 1 on symbol-not-found
+// (the JSON path still emits a parseable found:false envelope so machine
+// consumers don't have to inspect stderr).
+
+let run_caps_dump_subcommand = fn (args: [string], format: ExplainFormat, verbose: bool) -> i64 require { Clock, Console, Fs } do
+  try
+    match args do
+      | [] -> raise InvalidUsage(detail: "usage: nexus caps <symbol> <input.nx> [--format=text|json]")
+      | _ :: [] -> raise InvalidUsage(detail: "usage: nexus caps <symbol> <input.nx> [--format=text|json]")
+      | symbol :: input_path :: _ ->
+        let src = Fs.read_to_string(path: input_path)
+        let tokens = lexer.tokenize(src)
+        let ParseDiagnostics(prog, diags: parse_diags) = parser.parse_collect(tokens, file: input_path)
+        print_parse_diags(diags: parse_diags, format)
+        let n_parse_diags = list.length(xs: parse_diags)
+        if n_parse_diags > 0 then
+          match format do
+            | FormatJson -> Console.eprintln(val: format_summary_json(count: n_parse_diags))
+            | FormatText -> ()
+          end
+          raise ParseErrorsCollected(count: n_parse_diags)
+        end
+        let HirBuildResult(program: hir_raw, import_cache: _) = build_hir(prog, source_file: input_path, verbose)
+        // resolve_all_lazy_no_filter: the closure walk must see every
+        // top-level binding's HIR body, not just those reachable from
+        // `main`. Mirrors run_types_dump_subcommand for the same reason.
+        let hir_resolved = match hir_raw do
+          | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
+            let resolved = resolve_all_lazy_no_filter(funcs: hf)
+            let expanded_fs = hir.expand_groups_in_functions(funcs: resolved, groups: heg)
+            let expanded_hb = hir.expand_groups_in_handler_bindings(bindings: hb, groups: heg)
+            HirProgram(ports: hp, functions: expanded_fs, externals: he, handler_bindings: expanded_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
+        end
+        let found = caps_symbol_exists_impl(prog: hir_resolved, symbol)
+        let out = match format do
+          | FormatText -> caps_to_text(prog: hir_resolved, symbol)
+          | FormatJson -> caps_to_json(prog: hir_resolved, symbol)
+        end
+        Console.println(val: out)
+        if found then return 0 else return 1 end
+    end
+  catch e ->
+    Console.eprintln(val: err.format_error(err: e))
+    return 1
+  end
+end
+
 // ─── `nexus fix` subcommand (nexus-rwoj) ──────────────────────────────────
 //
 // Runs the front-end pipeline against each file, catches the first
@@ -1557,6 +1639,17 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
           | _ :: rest -> rest
         end
         let exit_code = run_types_dump_subcommand(args: types_args, format: diag_format, verbose)
+        proc.exit(status: exit_code)
+      end
+    end
+    // `nexus caps <symbol> <input.nx>` (issue nexus-8fzi). Capability closure dump.
+    match strip_caps_subcommand(xs: positionals) do | ParsedCapsSubcommand(remaining: args_after_caps, is_caps) ->
+      if is_caps then
+        let caps_args = match args_after_caps do
+          | [] -> []
+          | _ :: rest -> rest
+        end
+        let exit_code = run_caps_dump_subcommand(args: caps_args, format: diag_format, verbose)
         proc.exit(status: exit_code)
       end
     end

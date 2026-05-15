@@ -1,0 +1,187 @@
+// Issue nexus-8fzi — `nexus caps <symbol>` capability closure dump V1.
+//
+// Drives `caps_to_text` / `caps_to_json` / `symbol_exists` directly via a
+// synthesised HirProgram fixture. Same subprocess-avoidance rationale as
+// g5el_types_dump_test.nx — `Proc.exec` is unreachable under WASI preview1
+// so we can't shell out to `nexus caps` from inside a test binary.
+//
+// Coverage:
+//   1. `symbol_exists` resolves a bare name to a qualified HIR function.
+//   2. `symbol_exists` returns false for an unknown symbol.
+//   3. The closure walk credits `Console` when the seed function's body
+//      contains a `Call` to `<path>#Console.println` (Cap-method shape).
+//   4. The closure walk credits the wasm_module mapping when reaching a
+//      direct `HirExternal` (here, `nexus:std/fs/path_exists`).
+//   5. The transitive case: callee `helper` reaches Console; seed `entry`
+//      calls `helper`; the closure for `entry` must include Console.
+//   6. `caps_to_json` produces a parseable `kind:"caps", found:true,
+//      capabilities:[...]` envelope; the not-found path emits
+//      `found:false` without a capabilities key.
+
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import * as caps_dump from "src/tools/caps_dump.nx"
+import { caps_to_text, caps_to_json, symbol_exists, compute_caps_closure, closure_capabilities, closure_externals } from "src/tools/caps_dump.nx"
+import * as json from "std:json"
+import { JsonValue, JsonObject, JsonArray, JsonString, JsonBool, get_field } from "std:json"
+import { Some, None } from "std:option"
+import { Span } from "src/common/token.nx"
+import {
+  TypeExpr, TyUnit, TyRow
+} from "src/common/ast.nx"
+import {
+  HirProgram, HirFunction, HirParam, HirBody, EagerBody,
+  HirExternal, HirStmt, HirStmtKind, HirExpr, HirExprKind, HirCallArg
+} from "src/ir/hir/types.nx"
+
+let sp = fn () -> Span do return Span(offset: 0, line: 1, col: 1) end
+
+// ─── HIR synthesis helpers ─────────────────────────────────────────────────
+
+let call_stmt = fn (func: string) -> HirStmt do
+  let call_expr = HirExpr(node: HirExprKind.Call(func, args: []), span: sp())
+  return HirStmt(node: HirStmtKind.Expr(expr: call_expr), span: sp())
+end
+
+let empty_row = fn () -> TypeExpr do return TyRow(types: [], rest: None) end
+
+let mk_function = fn (name: string, body_stmts: [HirStmt]) -> HirFunction do
+  return HirFunction(
+    name,
+    type_params: [],
+    params: [],
+    ret_type: TyUnit,
+    throw_row: empty_row(),
+    body: EagerBody(stmts: body_stmts),
+    span: sp(),
+    file: "fixture.nx"
+  )
+end
+
+let mk_external = fn (name: string, wasm_module: string, wasm_name: string) -> HirExternal do
+  return HirExternal(
+    name,
+    wasm_module,
+    wasm_name,
+    type_params: [],
+    params: [],
+    ret_type: TyUnit,
+    throw_row: empty_row()
+  )
+end
+
+let empty_hir = fn (fs: [HirFunction], exts: [HirExternal]) -> HirProgram do
+  return HirProgram(
+    ports: [],
+    functions: fs,
+    externals: exts,
+    handler_bindings: [],
+    enum_defs: [],
+    exception_groups: [],
+    value_binding_names: [],
+    type_defs: []
+  )
+end
+
+// ─── Test cases ────────────────────────────────────────────────────────────
+
+let test_symbol_exists_bare = fn () -> unit throws { Exn } do
+  let f = mk_function(name: "fixture_nx#entry", body_stmts: [])
+  let prog = empty_hir(fs: [f], exts: [])
+  test_assert.assert(cond: symbol_exists(prog, symbol: "entry"), label: "8fzi: bare name resolves to qualified HIR function")
+  test_assert.assert(cond: symbol_exists(prog, symbol: "fixture_nx#entry"), label: "8fzi: full qualified name also resolves")
+  test_assert.assert(cond: !symbol_exists(prog, symbol: "no_such_symbol"), label: "8fzi: unknown symbol returns false")
+  return ()
+end
+
+let test_cap_method_credit = fn () -> unit throws { Exn } do
+  // Seed function calls `<path>#Console.println` directly. The closure must
+  // record `Console` even though there is no HirExternal for it.
+  let entry = mk_function(name: "fixture_nx#entry", body_stmts: [call_stmt(func: "nxlib_stdlib_stdio_nx#Console.println")])
+  let prog = empty_hir(fs: [entry], exts: [])
+  let txt = caps_to_text(prog, symbol: "entry")
+  test_assert.assert(cond: str.contains(s: txt, sub: "Console"), label: "8fzi: Console attributed for Cap-method call")
+  return ()
+end
+
+let test_external_mapping = fn () -> unit throws { Exn } do
+  // Seed function calls a stdlib FS external directly. The closure must
+  // record `Fs` via wasm_module → capability mapping AND surface the
+  // external in the reachable_externals list.
+  let ext_name = "fs_call"
+  let ext = mk_external(name: ext_name, wasm_module: "nexus:std/fs", wasm_name: "path_exists")
+  let entry = mk_function(name: "fixture_nx#entry", body_stmts: [call_stmt(func: ext_name)])
+  let prog = empty_hir(fs: [entry], exts: [ext])
+  let cl = compute_caps_closure(prog, symbol: "entry")
+  let caps = closure_capabilities(cl: cl)
+  let exts = closure_externals(cl: cl)
+  test_assert.assert(cond: list_has(xs: caps, s: "Fs"), label: "8fzi: Fs attributed for nexus:std/fs external")
+  test_assert.assert(cond: list_has(xs: exts, s: "nexus:std/fs/path_exists"), label: "8fzi: external surfaced in reachable list")
+  return ()
+end
+
+let test_transitive_walk = fn () -> unit throws { Exn } do
+  // entry → helper → Console.println. The closure for `entry` must include
+  // Console even though entry's own body only calls a Nexus function.
+  let helper = mk_function(name: "fixture_nx#helper", body_stmts: [call_stmt(func: "nxlib_stdlib_stdio_nx#Console.println")])
+  let entry = mk_function(name: "fixture_nx#entry", body_stmts: [call_stmt(func: "fixture_nx#helper")])
+  let prog = empty_hir(fs: [entry, helper], exts: [])
+  let cl = compute_caps_closure(prog, symbol: "entry")
+  let caps = closure_capabilities(cl: cl)
+  test_assert.assert(cond: list_has(xs: caps, s: "Console"), label: "8fzi: transitive Console pickup via helper")
+  // Sanity: the helper itself also reports Console when queried directly.
+  let cl_h = compute_caps_closure(prog, symbol: "helper")
+  let caps_h = closure_capabilities(cl: cl_h)
+  test_assert.assert(cond: list_has(xs: caps_h, s: "Console"), label: "8fzi: helper directly reports Console")
+  return ()
+end
+
+let test_json_envelope = fn () -> unit throws { Exn } do
+  let entry = mk_function(name: "fixture_nx#entry", body_stmts: [call_stmt(func: "nxlib_stdlib_stdio_nx#Console.println")])
+  let prog = empty_hir(fs: [entry], exts: [])
+  let payload = caps_to_json(prog, symbol: "entry")
+  test_assert.assert(cond: str.contains(s: payload, sub: "\"kind\":\"caps\""), label: "8fzi: JSON kind:caps")
+  test_assert.assert(cond: str.contains(s: payload, sub: "\"found\":true"), label: "8fzi: JSON found:true")
+  test_assert.assert(cond: str.contains(s: payload, sub: "\"capabilities\""), label: "8fzi: JSON capabilities key")
+  test_assert.assert(cond: str.contains(s: payload, sub: "\"Console\""), label: "8fzi: Console in JSON capabilities list")
+  // Not-found path: short envelope with found:false, no capabilities key.
+  let nf = caps_to_json(prog, symbol: "no_such_symbol")
+  test_assert.assert(cond: str.contains(s: nf, sub: "\"found\":false"), label: "8fzi: not-found JSON found:false")
+  return ()
+end
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+let list_has = fn (xs: [string], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == s then return true end
+      return list_has(xs: rest, s)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  test_symbol_exists_bare()
+  test_cap_method_credit()
+  test_external_mapping()
+  test_transitive_walk()
+  test_json_envelope()
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end

@@ -1,0 +1,374 @@
+/**
+ * caps_dump: `nexus caps <symbol> [--format text|json]` per-function
+ * capability closure dump (issue nexus-8fzi V1).
+ *
+ * Surfaces the transitive capability footprint of one named symbol: union of
+ * every `wasm_module → capability` reached by any function transitively
+ * called from `<symbol>`. Answers the agent-facing question "does this
+ * function touch Fs/Net/Console/..." before an edit, without having to read
+ * every transitive callee by hand.
+ *
+ * Pipeline alignment:
+ *   - Drives the same HIR build the typecheck path uses (no MIR/LIR — going
+ *     all the way to LIR's `analyze_effects` would require a `main` entry
+ *     point and full reachability DCE, which would strand library files).
+ *   - Reuses `collect_calls_stmts` from `src/ir/hir/reachability.nx` for the
+ *     per-function callee enumeration (exported in this commit) rather than
+ *     introducing a parallel `walk_expr ↔ walk_stmt` mutual-recursion.
+ *   - Capability mapping mirrors `module_to_capability` in
+ *     `src/backend/effect_analysis.nx` so the names produced here line up
+ *     with `--explain-capabilities` and the EffectMap consumers.
+ *
+ * JSON shape:
+ *   {
+ *     "kind": "caps",
+ *     "symbol": "<name>",
+ *     "found": true,
+ *     "capabilities": ["Cap1", "Cap2", ...],
+ *     "reachable_externals": ["wasm_module/wasm_name", ...]
+ *   }
+ *
+ * When the symbol is not found:
+ *   {"kind": "caps", "symbol": "<name>", "found": false}
+ */
+
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+import { SubcommandHit, detect_subcommand } from "std:argparse"
+import { JsonValue, JsonString, JsonArray, JsonObject, JsonField, JsonBool, JsonThrow }, * as json from "std:json"
+import { HirProgram, HirFunction, HirExternal, HirBody, EagerBody, LazyBody } from "src/ir/hir/types.nx"
+import { collect_calls_stmts } from "src/ir/hir/reachability.nx"
+
+// ─── Subcommand stripping ──────────────────────────────────────────────────
+
+export type ParsedCapsSubcommand = ParsedCapsSubcommand(remaining: [string], is_caps: bool)
+
+/** Detect a leading `caps` subcommand. Thin wrapper over argparse's shared
+ *  `detect_subcommand` primitive (issue nexus-8vu5). */
+export let strip_caps_subcommand = fn (xs: [string]) -> ParsedCapsSubcommand do
+  match detect_subcommand(args: xs, kw: "caps") do | SubcommandHit(present, remaining) ->
+    if present then return ParsedCapsSubcommand(remaining, is_caps: true) end
+    return ParsedCapsSubcommand(remaining: xs, is_caps: false)
+  end
+end
+
+// ─── Capability mapping ────────────────────────────────────────────────────
+//
+// Capability surfaces are visible in two distinct shapes at HIR level:
+//
+//   (a) Direct external imports: a `HirExternal` whose `wasm_module` is one
+//       of the seven stdlib ports (`nexus:std/fs`, `nexus:std/stdio`, …).
+//       The mapping mirrors `module_to_capability` in
+//       `src/backend/effect_analysis.nx`; kept duplicated rather than
+//       imported because the producer module pulls in LIR types we don't
+//       need here, and the mapping is short and stable enough that drift
+//       risk is low.
+//
+//   (b) Cap-method calls — `Console.println`, `Fs.exists`, etc — appear at
+//       HIR as `Call(func: "<path>#<Cap>.<method>", …)` after rename, well
+//       before handler dispatch resolves them to externals. The Cap name
+//       *is* the capability name we want to report, so we extract the prefix
+//       in front of the `.` after stripping the `<path>#` qualifier and
+//       match it against `is_known_capability`. This is the only path that
+//       attributes Console / Fs / etc. for top-level user code: the actual
+//       wasm imports that the handler arm ultimately calls are
+//       `wasi_snapshot_preview1/*` and `nexus:std/runtime/*`, which carry
+//       no capability vocabulary themselves.
+
+let module_to_capability = fn (wasm_module: string) -> [string] do
+  if wasm_module == "nexus:std/fs" then return ["Fs"] end
+  if wasm_module == "nexus:std/network" then return ["Net"] end
+  if wasm_module == "nexus:std/stdio" then return ["Console"] end
+  if wasm_module == "nexus:std/rand" then return ["Random"] end
+  if wasm_module == "nexus:std/clock" then return ["Clock"] end
+  if wasm_module == "nexus:std/proc" then return ["Proc"] end
+  if wasm_module == "nexus:std/env" then return ["Env"] end
+  return []
+end
+
+/** True when `name` matches the seven-element user-facing capability
+ *  vocabulary. This is the set surfaced by `--explain-capabilities` and the
+ *  EffectMap; capability rows in source `require {…}` clauses use these
+ *  names verbatim. */
+let is_known_capability = fn (name: string) -> bool do
+  if name == "Fs" then return true end
+  if name == "Net" then return true end
+  if name == "Console" then return true end
+  if name == "Random" then return true end
+  if name == "Clock" then return true end
+  if name == "Proc" then return true end
+  if name == "Env" then return true end
+  return false
+end
+
+// ─── Name handling ─────────────────────────────────────────────────────────
+//
+// HIR canonicalises top-level names as `<sanitized_path>#<name>` via
+// `src/ir/rdrname.nx::canonical_name` (every `/` and `.` in the source path
+// becomes `_`, then a literal `#` joins to the unqualified name). The user
+// supplies a bare name on the CLI; we accept either the exact qualified
+// form or the bare suffix, scanning from the right for the first `#`.
+
+let bare_name_go = fn (s: string, i: i64, n: i64) -> string do
+  if i < 0 then return s end
+  let b = str.byte_at(s, idx: i)
+  // '#' = 35 — separator used by rdrname.canonical_name.
+  if b == 35 then return str.substring(s, start: i + 1, len: n - i - 1) end
+  return bare_name_go(s, i: i - 1, n)
+end
+
+let bare_name = fn (qualified: string) -> string do
+  let n = str.length(s: qualified)
+  return bare_name_go(s: qualified, i: n - 1, n)
+end
+
+/** Extract a leading Cap name from a Cap-method call. Returns `Some(cap)`
+ *  when `qualified` is of shape `<path>#<Cap>.<method>` AND `<Cap>` is one
+ *  of the seven known capability names; otherwise None. This is the gate
+ *  that turns `Console.println` call sites into "Console capability used"
+ *  attributions during the closure walk. */
+let cap_from_method_call = fn (qualified: string) -> Option<string> do
+  let bare = bare_name(qualified)
+  let dot_pos = str.index_of(s: bare, sub: ".")
+  if dot_pos < 0 then return None end
+  let cap_name = str.substring(s: bare, start: 0, len: dot_pos)
+  if is_known_capability(name: cap_name) then return Some(val: cap_name) end
+  return None
+end
+
+// ─── String-set helpers ───────────────────────────────────────────────────
+
+let str_in_list = fn (s: string, xs: [string]) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == s then return true end
+      return str_in_list(s, xs: rest)
+  end
+end
+
+let add_unique = fn (xs: [string], item: string) -> [string] do
+  if str_in_list(s: item, xs) then return xs end
+  return list.concat(xs, ys: [item])
+end
+
+let union_strs = fn (acc: [string], xs: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | x :: rest -> return union_strs(acc: add_unique(xs: acc, item: x), xs: rest)
+  end
+end
+
+// ─── HIR lookup helpers ───────────────────────────────────────────────────
+
+/** Resolve a user-supplied bare or qualified name to a HirFunction. Returns
+ *  None when no function in the program matches. */
+let find_function = fn (fs: [HirFunction], target: string) -> Option<HirFunction> do
+  match fs do
+    | [] -> return None
+    | f :: rest ->
+      match f do | HirFunction(name, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span: _, file: _) ->
+        if name == target then return Some(val: f) end
+        if bare_name(qualified: name) == target then return Some(val: f) end
+        return find_function(fs: rest, target)
+      end
+  end
+end
+
+let find_external = fn (es: [HirExternal], target: string) -> Option<HirExternal> do
+  match es do
+    | [] -> return None
+    | e :: rest ->
+      match e do | HirExternal(name, wasm_module: _, wasm_name: _, type_params: _, params: _, ret_type: _, throw_row: _) ->
+        if name == target then return Some(val: e) end
+        return find_external(es: rest, target)
+      end
+  end
+end
+
+/** Per-function callee enumeration. Lazy bodies (deferred convert_expr) carry
+ *  no resolved Call sites so they contribute nothing to the closure; the
+ *  eager branch is the only producer. */
+let callees_of = fn (f: HirFunction) -> [string] do
+  match f do | HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: _, body, span: _, file: _) ->
+    match body do
+      | EagerBody(stmts) -> return collect_calls_stmts(stmts)
+      | LazyBody(ast_expr: _, entries: _) -> return []
+    end
+  end
+end
+
+// ─── Transitive closure walk ───────────────────────────────────────────────
+//
+// Worklist over function names. For each pop:
+//   * if HirExternal: record (module, name) and union its capability.
+//   * if HirFunction: enqueue every callee not yet visited.
+//   * otherwise (unresolved name, e.g. handler-arm wrapper): skip.
+// Bounds: each name is visited at most once; total work O(|reachable funcs|
+// × avg callees-per-func).
+
+type CapsClosure = CapsClosure(
+  caps: [string],
+  externals: [string],
+  visited: [string]
+)
+
+let empty_closure = fn () -> CapsClosure do
+  return CapsClosure(caps: [], externals: [], visited: [])
+end
+
+let mark_visited = fn (cl: CapsClosure, name: string) -> CapsClosure do
+  match cl do | CapsClosure(caps, externals, visited) ->
+    return CapsClosure(caps, externals, visited: add_unique(xs: visited, item: name))
+  end
+end
+
+let record_external = fn (cl: CapsClosure, e: HirExternal) -> CapsClosure do
+  match cl do | CapsClosure(caps, externals, visited) ->
+    match e do | HirExternal(name: _, wasm_module, wasm_name, type_params: _, params: _, ret_type: _, throw_row: _) ->
+      let new_caps = module_to_capability(wasm_module)
+      let merged_caps = union_strs(acc: caps, xs: new_caps)
+      let extkey = wasm_module ++ "/" ++ wasm_name
+      let merged_externals = add_unique(xs: externals, item: extkey)
+      return CapsClosure(caps: merged_caps, externals: merged_externals, visited)
+    end
+  end
+end
+
+let record_cap = fn (cl: CapsClosure, cap_name: string) -> CapsClosure do
+  match cl do | CapsClosure(caps, externals, visited) ->
+    return CapsClosure(caps: add_unique(xs: caps, item: cap_name), externals, visited)
+  end
+end
+
+let walk_worklist = fn (prog: HirProgram, work: [string], cl: CapsClosure) -> CapsClosure do
+  match work do
+    | [] -> return cl
+    | name :: rest ->
+      match cl do | CapsClosure(caps: _, externals: _, visited) ->
+        if str_in_list(s: name, xs: visited) then
+          return walk_worklist(prog, work: rest, cl)
+        end
+      end
+      let cl_v = mark_visited(cl, name)
+      // Cap-method call (`<path>#Cap.method`) — credit the Cap and stop
+      // descending. The Cap method body lives behind handler dispatch and
+      // its leaves are `wasi_snapshot_preview1/*` externals that carry no
+      // user-facing capability label.
+      if let Some(val: cap_name) = cap_from_method_call(qualified: name) then
+        let cl_cap = record_cap(cl: cl_v, cap_name)
+        return walk_worklist(prog, work: rest, cl: cl_cap)
+      end
+      match prog do | HirProgram(ports: _, functions, externals, handler_bindings: _, enum_defs: _, exception_groups: _, value_binding_names: _, type_defs: _) ->
+        match find_external(es: externals, target: name) do
+          | Some(val: e) ->
+            let cl_ext = record_external(cl: cl_v, e)
+            return walk_worklist(prog, work: rest, cl: cl_ext)
+          | None ->
+            match find_function(fs: functions, target: name) do
+              | Some(val: f) ->
+                let cs = callees_of(f)
+                return walk_worklist(prog, work: list.concat(xs: cs, ys: rest), cl: cl_v)
+              | None ->
+                // Unresolved name (intrinsic, handler-arm wrapper). Skip.
+                return walk_worklist(prog, work: rest, cl: cl_v)
+            end
+        end
+      end
+  end
+end
+
+/** Compute the transitive capability closure of `symbol`. Returns the closure
+ *  bundled with the externals visited as witnesses. */
+export let compute_caps_closure = fn (prog: HirProgram, symbol: string) -> CapsClosure do
+  match prog do | HirProgram(ports: _, functions, externals: _, handler_bindings: _, enum_defs: _, exception_groups: _, value_binding_names: _, type_defs: _) ->
+    match find_function(fs: functions, target: symbol) do
+      | None -> return empty_closure()
+      | Some(val: f) ->
+        match f do | HirFunction(name: qn, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span: _, file: _) ->
+          return walk_worklist(prog, work: [qn], cl: empty_closure())
+        end
+    end
+  end
+end
+
+/** True when `symbol` resolves to a known top-level binding. Cheap predicate
+ *  used by the driver to choose between the found / not-found render paths. */
+export let symbol_exists = fn (prog: HirProgram, symbol: string) -> bool do
+  match prog do | HirProgram(ports: _, functions, externals: _, handler_bindings: _, enum_defs: _, exception_groups: _, value_binding_names: _, type_defs: _) ->
+    match find_function(fs: functions, target: symbol) do
+      | Some(val: _) -> return true
+      | None -> return false
+    end
+  end
+end
+
+// ─── Closure accessors ─────────────────────────────────────────────────────
+//
+// CapsClosure is exported as an opaque record from the consumer's POV; the
+// projection helpers keep the field shape behind a stable API so future
+// rearrangement (witness paths, per-cap edges) is invisible.
+
+export let closure_capabilities = fn (cl: CapsClosure) -> [string] do
+  match cl do | CapsClosure(caps, externals: _, visited: _) -> return caps end
+end
+
+export let closure_externals = fn (cl: CapsClosure) -> [string] do
+  match cl do | CapsClosure(caps: _, externals, visited: _) -> return externals end
+end
+
+// ─── Text render ───────────────────────────────────────────────────────────
+
+let join_lines = fn (xs: [string], sep: string) -> string do
+  if list.length(xs) == 0 then return "<none>" end
+  return str.join(xs, sep)
+end
+
+export let caps_to_text = fn (prog: HirProgram, symbol: string) -> string do
+  if !symbol_exists(prog, symbol) then
+    return "caps: symbol not found: " ++ symbol
+  end
+  let cl = compute_caps_closure(prog, symbol)
+  let caps = closure_capabilities(cl)
+  let exts = closure_externals(cl)
+  let cap_line = "Capabilities: " ++ join_lines(xs: caps, sep: ", ")
+  let ext_line = "Reachable externals: " ++ join_lines(xs: exts, sep: ", ")
+  return "=== Capability closure for " ++ symbol ++ " ===\n" ++ cap_line ++ "\n" ++ ext_line ++ "\n"
+end
+
+// ─── JSON render ───────────────────────────────────────────────────────────
+
+let strings_to_json_array = fn (xs: [string]) -> JsonValue do
+  let items = strings_to_json_array_go(xs, acc: [])
+  return JsonArray(items)
+end
+
+let strings_to_json_array_go = fn (xs: [string], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest -> return strings_to_json_array_go(xs: rest, acc: JsonString(val: s) :: acc)
+  end
+end
+
+export let caps_to_json = fn (prog: HirProgram, symbol: string) -> string throws { JsonThrow } do
+  if !symbol_exists(prog, symbol) then
+    let obj_nf = JsonObject(fields: [
+      JsonField(key: "kind", value: JsonString(val: "caps")),
+      JsonField(key: "symbol", value: JsonString(val: symbol)),
+      JsonField(key: "found", value: JsonBool(val: false))
+    ])
+    return json.serialize(v: obj_nf)
+  end
+  let cl = compute_caps_closure(prog, symbol)
+  let caps_arr = strings_to_json_array(xs: closure_capabilities(cl))
+  let ext_arr = strings_to_json_array(xs: closure_externals(cl))
+  let obj = JsonObject(fields: [
+    JsonField(key: "kind", value: JsonString(val: "caps")),
+    JsonField(key: "symbol", value: JsonString(val: symbol)),
+    JsonField(key: "found", value: JsonBool(val: true)),
+    JsonField(key: "capabilities", value: caps_arr),
+    JsonField(key: "reachable_externals", value: ext_arr)
+  ])
+  return json.serialize(v: obj)
+end
