@@ -1,0 +1,498 @@
+// PBT (nexus-mu39): branchType / tail — divergent-arm carve-out
+// exhaustiveness over an `if` / `match` body model.
+//
+// Background. The spec's `tail(s̄)` and `branchType(ā)` operators jointly
+// type if/match expressions: every arm's terminal statement is mapped to
+// a result type (`tail`), then the per-arm types are folded into a single
+// result type (`branchType`) with diverging arms _carved out_ before unify.
+// This test is a TOY-DOMAIN model of that algorithm, written so the carve-
+// out invariants are verified directly against the algebraic shape without
+// dragging in the compiler's typechecker pipeline. Counterexamples here
+// would falsify the model; the compiler's implementation must satisfy the
+// same property structure to be spec-compliant.
+//
+// Model (per bd `nexus-mu39`):
+//   Expr = ENum(i64) | EIf(c, t, e) | EMatch(s, arms) | EDiverge
+//   Ty   = TNum | TDiverge | TUnify(a, b)
+//
+// `branchType(arms)` (the algorithm under test):
+//   1. partition arms into divergent vs non-divergent (`tail = ⊥`).
+//   2. if all arms are divergent → TDiverge (we model the "fresh ?α"
+//      slot as TDiverge since no non-divergent constraint exists).
+//   3. else fold all non-divergent arm types via TUnify, left-biased.
+//
+// `tail(e)` on an expression is just `typeOf(e)` here — the toy domain
+// has no statement-sequence layer, so the "terminal statement type" of
+// an expression is the expression's own type. The carve-out property
+// is identical between the two layers.
+//
+// Properties (8 total, 200 iterations each):
+//   P1. typeOf(EDiverge) ≡ TDiverge.
+//   P2. typeOf(ENum(n))  ≡ TNum.
+//   P3. branchType all-diverge: for any positive k, branchType of a
+//       k-length list of EDiverge is TDiverge.
+//   P4. EIf carve-out (then-divergent): typeOf(EIf(_, EDiverge, e)) ≡ typeOf(e).
+//   P5. EIf carve-out (else-divergent): typeOf(EIf(_, t, EDiverge)) ≡ typeOf(t).
+//   P6. EIf both-divergent: typeOf(EIf(_, EDiverge, EDiverge)) ≡ TDiverge.
+//   P7. EMatch carve-out: appending k extra EDiverge arms to a non-empty
+//       arm list does not change the result (carve-out idempotence
+//       under adding divergent arms).
+//   P8. EMatch all-diverge: a non-empty list of all EDiverge arms types to
+//       TDiverge (matches P3 lifted into the full algorithm).
+//
+// Generators are depth-bounded and local: `gen_expr_run` recursively
+// picks ENum / EIf / EMatch / EDiverge with explicit fuel, and the seed
+// thread is the xorshift64 step the stdlib uses for `small_int`.
+//
+// 200 iterations per property × 8 properties = 1600 sampled witnesses.
+
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as stdio from "std:stdio"
+import * as list from "std:list"
+import { Console } from "std:stdio"
+import { Pass, Fail, Gen } from "std:pbt"
+import { Pair } from "std:tuple"
+import * as str from "std:str"
+
+// ─── Model: Expr + Ty ──────────────────────────────────────────────────────
+
+type Expr =
+  ENum(n: i64)
+  | EIf(c: Expr, t: Expr, e: Expr)
+  | EMatch(s: Expr, arms: [Expr])
+  | EDiverge
+
+type Ty =
+  TNum
+  | TDiverge
+  | TUnify(a: Ty, b: Ty)
+
+// ─── Algebra under test ─────────────────────────────────────────────────────
+
+let is_diverge = fn (t: Ty) -> bool do
+  match t do
+    | TDiverge -> return true
+    | _ -> return false
+  end
+end
+
+// Filter divergent arms out of a Ty list, returning the non-divergent
+// remainder (order-preserving).
+let filter_non_diverge = fn (xs: [Ty]) -> [Ty] do
+  match xs do
+    | [] -> return []
+    | h :: rest ->
+      let r = filter_non_diverge(xs: rest)
+      if is_diverge(t: h) then return r end
+      return h :: r
+  end
+end
+
+// Fold a non-empty Ty list left-biased through TUnify:
+//   [a]              → a
+//   [a, b]           → TUnify(a, b)
+//   [a, b, c]        → TUnify(TUnify(a, b), c)
+//   [a, b, c, d]     → TUnify(TUnify(TUnify(a, b), c), d)
+let unify_fold = fn (acc: Ty, xs: [Ty]) -> Ty do
+  match xs do
+    | [] -> return acc
+    | h :: rest -> return unify_fold(acc: TUnify(a: acc, b: h), xs: rest)
+  end
+end
+
+// `branchType(arms)`:
+//   - all divergent → TDiverge (toy stand-in for the spec's fresh ?α)
+//   - else fold non-divergent arm types left-biased through TUnify.
+let branch_type = fn (arm_tys: [Ty]) -> Ty do
+  let non_div = filter_non_diverge(xs: arm_tys)
+  match non_div do
+    | [] -> return TDiverge
+    | h :: rest -> return unify_fold(acc: h, xs: rest)
+  end
+end
+
+// Map each arm Expr through type_of, building a [Ty] list (order-preserving).
+let arm_types = fn (arms: [Expr]) -> [Ty] do
+  match arms do
+    | [] -> return []
+    | h :: rest ->
+      let h_ty = type_of(e: h)
+      let rest_tys = arm_types(arms: rest)
+      return h_ty :: rest_tys
+  end
+end
+
+// `typeOf(e)` — the toy algorithm under test. Mirrors `tail` ∘ `branchType`
+// for if/match shapes; identity on leaves.
+let type_of = fn (e: Expr) -> Ty do
+  match e do
+    | ENum(n: _) -> return TNum
+    | EDiverge -> return TDiverge
+    | EIf(c: _, t: tb, e: eb) ->
+      let t1 = type_of(e: tb)
+      let t2 = type_of(e: eb)
+      return branch_type(arm_tys: [t1, t2])
+    | EMatch(s: _, arms) ->
+      let arm_tys = arm_types(arms: arms)
+      return branch_type(arm_tys: arm_tys)
+  end
+end
+
+// ─── Structural equality on Ty ──────────────────────────────────────────────
+
+let ty_eq = fn (a: Ty, b: Ty) -> bool do
+  match a do
+    | TNum ->
+      match b do
+        | TNum -> return true
+        | _ -> return false
+      end
+    | TDiverge ->
+      match b do
+        | TDiverge -> return true
+        | _ -> return false
+      end
+    | TUnify(a: a1, b: a2) ->
+      match b do
+        | TUnify(a: b1, b: b2) ->
+          if ty_eq(a: a1, b: b1) then
+            let ok = ty_eq(a: a2, b: b2)
+            return ok
+          end
+          return false
+        | _ -> return false
+      end
+  end
+end
+
+// ─── Render helpers (yebe API expects `render` on Gen) ──────────────────────
+
+let render_ty = fn (t: Ty) -> string do
+  match t do
+    | TNum -> return "TNum"
+    | TDiverge -> return "TDiverge"
+    | TUnify(a: x, b: y) -> return "U(" ++ render_ty(t: x) ++ "," ++ render_ty(t: y) ++ ")"
+  end
+end
+
+let render_expr_list = fn (xs: [Expr], first: bool, acc: string) -> string do
+  match xs do
+    | [] -> return acc ++ "]"
+    | h :: rest ->
+      let sep = if first then "" else "," end
+      return render_expr_list(xs: rest, first: false, acc: acc ++ sep ++ render_expr(e: h))
+  end
+end
+
+let render_expr = fn (e: Expr) -> string do
+  match e do
+    | ENum(n: k) -> return "ENum(" ++ str.from_i64(val: k) ++ ")"
+    | EDiverge -> return "EDiverge"
+    | EIf(c: _, t: tb, e: eb) ->
+      return "EIf(_," ++ render_expr(e: tb) ++ "," ++ render_expr(e: eb) ++ ")"
+    | EMatch(s: _, arms) ->
+      return "EMatch(_," ++ render_expr_list(xs: arms, first: true, acc: "[") ++ ")"
+  end
+end
+
+let render_ty_list = fn (xs: [Ty], first: bool, acc: string) -> string do
+  match xs do
+    | [] -> return acc ++ "]"
+    | h :: rest ->
+      let sep = if first then "" else "," end
+      return render_ty_list(xs: rest, first: false, acc: acc ++ sep ++ render_ty(t: h))
+  end
+end
+
+// ─── Depth-bounded Gen<Expr> + Gen<[Ty]> ───────────────────────────────────
+
+let abs_i64 = fn (n: i64) -> i64 do
+  if n < 0 then return 0 - n end
+  return n
+end
+
+// Inline xorshift64 (Marsaglia 13/7/17), same constants as pbt.next_state.
+let step_seed = fn (seed: i64) -> Pair<i64, i64> do
+  let xor_fixup : i64 = 2685821657736338717
+  let s0 = if seed == 0 then xor_fixup else seed end
+  let s1 = s0 ^ (s0 << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  return Pair(left: s3, right: s3)
+end
+
+// Build an `n`-long arm list by recursive draw at depth-1.
+let gen_arms = fn (n: i64, depth: i64, seed: i64, acc: [Expr]) -> Pair<[Expr], i64> do
+  if n <= 0 then return Pair(left: acc, right: seed) end
+  let Pair(left: e, right: s1) = gen_expr_run(depth: depth - 1, seed)
+  return gen_arms(n: n - 1, depth, seed: s1, acc: e :: acc)
+end
+
+let gen_expr_run = fn (depth: i64, seed: i64) -> Pair<Expr, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  if depth <= 0 then
+    // Leaves only at depth 0: ENum / EDiverge, biased toward ENum.
+    let leaf_choice = raw - (raw / 4) * 4
+    if leaf_choice == 0 then return Pair(left: EDiverge, right: s1) end
+    let n = raw - (raw / 100) * 100
+    return Pair(left: ENum(n: n), right: s1)
+  end
+  let choice = raw - (raw / 8) * 8
+  // 0,1: ENum; 2: EDiverge; 3,4,5: EIf; 6,7: EMatch (≥2 arms).
+  if choice == 0 then
+    let n = raw - (raw / 100) * 100
+    return Pair(left: ENum(n: n), right: s1)
+  end
+  if choice == 1 then
+    let n = raw - (raw / 100) * 100
+    return Pair(left: ENum(n: n), right: s1)
+  end
+  if choice == 2 then return Pair(left: EDiverge, right: s1) end
+  if choice == 3 then
+    let Pair(left: c, right: s2) = gen_expr_run(depth: depth - 1, seed: s1)
+    let Pair(left: t, right: s3) = gen_expr_run(depth: depth - 1, seed: s2)
+    let Pair(left: el, right: s4) = gen_expr_run(depth: depth - 1, seed: s3)
+    return Pair(left: EIf(c: c, t: t, e: el), right: s4)
+  end
+  if choice == 4 then
+    let Pair(left: c, right: s2) = gen_expr_run(depth: depth - 1, seed: s1)
+    let Pair(left: t, right: s3) = gen_expr_run(depth: depth - 1, seed: s2)
+    let Pair(left: el, right: s4) = gen_expr_run(depth: depth - 1, seed: s3)
+    return Pair(left: EIf(c: c, t: t, e: el), right: s4)
+  end
+  if choice == 5 then
+    let Pair(left: c, right: s2) = gen_expr_run(depth: depth - 1, seed: s1)
+    let Pair(left: t, right: s3) = gen_expr_run(depth: depth - 1, seed: s2)
+    let Pair(left: el, right: s4) = gen_expr_run(depth: depth - 1, seed: s3)
+    return Pair(left: EIf(c: c, t: t, e: el), right: s4)
+  end
+  // choice 6 / 7 → EMatch with 2..5 arms.
+  let arm_count_raw = abs_i64(n: v ^ (v >> 11))
+  let arm_count = 2 + (arm_count_raw - (arm_count_raw / 4) * 4)
+  let Pair(left: scrut, right: s2) = gen_expr_run(depth: depth - 1, seed: s1)
+  let Pair(left: arms, right: s3) = gen_arms(n: arm_count, depth, seed: s2, acc: [])
+  return Pair(left: EMatch(s: scrut, arms: arms), right: s3)
+end
+
+// Build a Ty directly (no Expr layer). Used by the property variants that
+// stress branchType directly.
+let gen_ty_run = fn (depth: i64, seed: i64) -> Pair<Ty, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  if depth <= 0 then
+    let c = raw - (raw / 2) * 2
+    if c == 0 then return Pair(left: TNum, right: s1) end
+    return Pair(left: TDiverge, right: s1)
+  end
+  let c = raw - (raw / 3) * 3
+  if c == 0 then return Pair(left: TNum, right: s1) end
+  if c == 1 then return Pair(left: TDiverge, right: s1) end
+  let Pair(left: a, right: s2) = gen_ty_run(depth: depth - 1, seed: s1)
+  let Pair(left: b, right: s3) = gen_ty_run(depth: depth - 1, seed: s2)
+  return Pair(left: TUnify(a: a, b: b), right: s3)
+end
+
+let gen_ty_list_n = fn (n: i64, depth: i64, seed: i64, acc: [Ty]) -> Pair<[Ty], i64> do
+  if n <= 0 then return Pair(left: acc, right: seed) end
+  let Pair(left: t, right: s1) = gen_ty_run(depth, seed)
+  return gen_ty_list_n(n: n - 1, depth, seed: s1, acc: t :: acc)
+end
+
+let gen_ty_list_run = fn (max_len: i64, depth: i64, seed: i64) -> Pair<[Ty], i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  let len = 1 + (raw - (raw / max_len) * max_len)
+  return gen_ty_list_n(n: len, depth, seed: s1, acc: [])
+end
+
+// Build n-many TDiverge in a list.
+let repeat_diverge = fn (n: i64, acc: [Ty]) -> [Ty] do
+  if n <= 0 then return acc end
+  return repeat_diverge(n: n - 1, acc: TDiverge :: acc)
+end
+
+// Build n-many EDiverge in a list (used by P8).
+let repeat_diverge_expr = fn (n: i64, acc: [Expr]) -> [Expr] do
+  if n <= 0 then return acc end
+  return repeat_diverge_expr(n: n - 1, acc: EDiverge :: acc)
+end
+
+// ─── Body ───────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit require { Console } throws { Exn } do
+  // Generators built inside body() — closure-ABI safety (see xpzt notes).
+  let gen_expr_local = Gen(
+    run: fn (seed: i64) -> Pair<Expr, i64> do
+      return gen_expr_run(depth: 3, seed)
+    end,
+    shrink: fn (v: Expr) -> [ Expr ] do return [] end,
+    render: render_expr
+  )
+
+  let gen_ty_list_local = Gen(
+    run: fn (seed: i64) -> Pair<[Ty], i64> do
+      return gen_ty_list_run(max_len: 6, depth: 2, seed)
+    end,
+    shrink: fn (v: [Ty]) -> [ [Ty] ] do return [] end,
+    render: fn (xs: [Ty]) -> string do
+      return render_ty_list(xs, first: true, acc: "[")
+    end
+  )
+
+  let iters = 200
+
+  // ── P1: typeOf(EDiverge) ≡ TDiverge (statement-form ⊥ rule) ──────────────
+  //
+  // Property is parameterised over `x: Expr` but ignores `x`, so the
+  // witness is purely a sanity oracle — 200 invocations exercise the
+  // constant rule under the same forall machinery the other properties use.
+  let prop_diverge_ty = fn (x: Expr) -> bool do
+    let ok = ty_eq(a: type_of(e: EDiverge), b: TDiverge)
+    return ok
+  end
+  let r1 = pbt.forall(g: gen_expr_local, prop: prop_diverge_ty, n: iters)
+  match r1 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1: typeOf(EDiverge) == TDiverge")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1 EDiverge typing failed: " ++ w)
+  end
+
+  // ── P2: typeOf(ENum(n)) ≡ TNum (numeric leaf rule) ───────────────────────
+  let prop_num_ty = fn (x: Expr) -> bool do
+    let ok = ty_eq(a: type_of(e: ENum(n: 7)), b: TNum)
+    return ok
+  end
+  let r2 = pbt.forall(g: gen_expr_local, prop: prop_num_ty, n: iters)
+  match r2 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P2: typeOf(ENum(n)) == TNum")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P2 ENum typing failed: " ++ w)
+  end
+
+  // ── P3: branchType all-diverge → TDiverge ────────────────────────────────
+  //
+  // For each generated type-list `xs`, replace all entries with TDiverge
+  // (the property's "all-divergent" precondition) and assert branchType ==
+  // TDiverge. The original list seed-drives the length (1..6); the content
+  // is overwritten so every iteration exercises the all-divergent path.
+  let prop_all_diverge = fn (xs: [Ty]) -> bool do
+    let n = list.length(xs: xs)
+    let div_list = repeat_diverge(n: n, acc: [])
+    let result = branch_type(arm_tys: div_list)
+    let ok = ty_eq(a: result, b: TDiverge)
+    return ok
+  end
+  let r3 = pbt.forall(g: gen_ty_list_local, prop: prop_all_diverge, n: iters)
+  match r3 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P3: branchType all-diverge → TDiverge")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P3 all-diverge failed: " ++ w)
+  end
+
+  // ── P4: EIf carve-out (then-divergent) ───────────────────────────────────
+  //
+  //   typeOf(EIf(_, EDiverge, e)) ≡ typeOf(e)
+  // We pin the condition to ENum(0) because typeOf ignores the condition slot.
+  let prop_if_then_div = fn (e: Expr) -> bool do
+    let lhs = type_of(e: EIf(c: ENum(n: 0), t: EDiverge, e: e))
+    let rhs = type_of(e: e)
+    let ok = ty_eq(a: lhs, b: rhs)
+    return ok
+  end
+  let r4 = pbt.forall(g: gen_expr_local, prop: prop_if_then_div, n: iters)
+  match r4 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P4: EIf(_, EDiverge, e) carved-out to typeOf(e)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P4 EIf then-div carve-out failed: " ++ w)
+  end
+
+  // ── P5: EIf carve-out (else-divergent) — symmetric to P4 ─────────────────
+  let prop_if_else_div = fn (e: Expr) -> bool do
+    let lhs = type_of(e: EIf(c: ENum(n: 0), t: e, e: EDiverge))
+    let rhs = type_of(e: e)
+    let ok = ty_eq(a: lhs, b: rhs)
+    return ok
+  end
+  let r5 = pbt.forall(g: gen_expr_local, prop: prop_if_else_div, n: iters)
+  match r5 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P5: EIf(_, e, EDiverge) carved-out to typeOf(e)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P5 EIf else-div carve-out failed: " ++ w)
+  end
+
+  // ── P6: EIf both-divergent → TDiverge ────────────────────────────────────
+  //
+  // Witness is unused — we just fire the constant property 200 times.
+  let prop_if_both_div = fn (x: Expr) -> bool do
+    let lhs = type_of(e: EIf(c: ENum(n: 0), t: EDiverge, e: EDiverge))
+    let ok = ty_eq(a: lhs, b: TDiverge)
+    return ok
+  end
+  let r6 = pbt.forall(g: gen_expr_local, prop: prop_if_both_div, n: iters)
+  match r6 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P6: EIf(_, EDiverge, EDiverge) → TDiverge")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P6 EIf both-div failed: " ++ w)
+  end
+
+  // ── P7: EMatch carve-out — adding divergent arms is the identity ─────────
+  //
+  // For any generated arm-list `xs` (Gen<[Ty]> length 1..6):
+  //   branchType(xs ++ [TDiverge, TDiverge, TDiverge])  ≡  branchType(xs)
+  // The property is unconditional — both sides collapse to TDiverge when
+  // `xs` happens to be entirely divergent, and to the same TUnify-fold of
+  // the non-divergent prefix otherwise.
+  let prop_match_diverge_pad = fn (xs: [Ty]) -> bool do
+    let padded = list.concat(xs: xs, ys: [TDiverge, TDiverge, TDiverge])
+    let lhs = branch_type(arm_tys: padded)
+    let rhs = branch_type(arm_tys: xs)
+    let ok = ty_eq(a: lhs, b: rhs)
+    return ok
+  end
+  let r7 = pbt.forall(g: gen_ty_list_local, prop: prop_match_diverge_pad, n: iters)
+  match r7 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P7: EMatch adding divergent arms is identity on branchType")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P7 EMatch diverge-pad failed: " ++ w)
+  end
+
+  // ── P8: EMatch all-diverge lifted into typeOf ────────────────────────────
+  //
+  // For each generated arm count k ∈ 1..6, an EMatch whose arms are all
+  // EDiverge types to TDiverge.
+  let prop_match_all_div = fn (xs: [Ty]) -> bool do
+    let k = list.length(xs: xs)
+    let arms = repeat_diverge_expr(n: k, acc: [])
+    let m = EMatch(s: ENum(n: 0), arms: arms)
+    let lhs = type_of(e: m)
+    let ok = ty_eq(a: lhs, b: TDiverge)
+    return ok
+  end
+  let r8 = pbt.forall(g: gen_ty_list_local, prop: prop_match_all_div, n: iters)
+  match r8 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P8: typeOf(EMatch all-divergent) → TDiverge")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P8 EMatch all-div failed: " ++ w)
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
