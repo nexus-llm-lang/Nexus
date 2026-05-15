@@ -1219,6 +1219,29 @@ end
 
 // ─── Let statement inference ────────────────────────────────────────────────
 
+/** Classification of a `let ~x = v` RHS type w.r.t. the T-Let premise
+ *  `μ = ~ ⟹ ¬linear(τ')`. nexus-t9cl.12: linearity is structural, so we
+ *  must reject not only bare `%T`/`@T` but also TyRecord / TyUserDefined
+ *  whose fields transitively carry linear components.
+ */
+type LetMutLinearKind =
+  LetMutOk
+  | LetMutLinearBare           // TyLinear at top level
+  | LetMutLinearLazy           // TyLazy at top level
+  | LetMutLinearStructural     // Aggregate (record / named record) carrying linear
+
+let let_mut_linear_kind = fn (typ: TypeExpr, tdefs: [tctypes.TypeDefEntry]) -> LetMutLinearKind do
+  match typ do
+    | TyLinear(_) -> return LetMutLinearBare
+    | TyLazy(_) -> return LetMutLinearLazy
+    | _ ->
+      if type_carries_linear(typ, tdefs, depth: 8) then
+        return LetMutLinearStructural
+      end
+      return LetMutOk
+  end
+end
+
 let infer_let = fn (state: CheckState, name: string, sigil: Sigil, ann: Option<TypeExpr>, value: HirExpr, ret_type: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
   let HirExpr(node: val_node, span: _) = value
   // T-Borrow's ^ω precondition (nexus-mqin.11): only an unrestricted
@@ -1316,24 +1339,35 @@ let infer_let = fn (state: CheckState, name: string, sigil: Sigil, ann: Option<T
       // in a mutable cell. The env type is `~τ` (TyRef) so that T-Assign can
       // verify the LHS modality and use-site `~x` reads can auto-deref.
       //
-      // T-Let premise `μ = ~ ⟹ ¬linear(τ')` (nexus-5pgr): mutable refs cannot
-      // hold linear values. Reject `let ~x = <linear>` here with a focused
-      // diagnostic naming the inferred type, instead of silently dropping the
-      // sigil and letting the linearity pass surface a confusing "%x never
-      // consumed" message that doesn't mention `~`.
+      // T-Let premise `μ = ~ ⟹ ¬linear(τ')` (nexus-5pgr / nexus-t9cl.12):
+      // mutable refs cannot hold linear values. "Linear" here is structural:
+      // a bare `%T` / `@T` is rejected, but so is a `TyRecord` or
+      // `TyUserDefined` record whose fields transitively carry linear
+      // components — type_carries_linear walks records, named records, and
+      // unwraps through TyRef/TyBorrow nesting (collections.nx). Spec
+      // type-system-formal.md §Linearity: "Linearity is entirely structural,
+      // so the check also rejects ~ cells holding records or ADTs with any
+      // linear component."
       if let SigilMutable = sigil then
-        match inferred_type do
-          | TyLinear(_) ->
+        let tdefs_for_lin = tctypes.state_typedefs(state: st1)
+        let lin_kind = let_mut_linear_kind(typ: inferred_type, tdefs: tdefs_for_lin)
+        match lin_kind do
+          | LetMutLinearBare ->
             return InferExprErr(
               message: "let ~" ++ name ++ ": mutable-ref binding cannot hold linear value of type `" ++ tctypes.type_to_string(typ: inferred_type) ++ "` (T-Let premise: μ = ~ ⟹ ¬linear(τ'))",
               span
             )
-          | TyLazy(_) ->
+          | LetMutLinearLazy ->
             return InferExprErr(
               message: "let ~" ++ name ++ ": mutable-ref binding cannot hold linear (one-shot) value of type `" ++ tctypes.type_to_string(typ: inferred_type) ++ "` (T-Let premise: μ = ~ ⟹ ¬linear(τ'))",
               span
             )
-          | _ -> ()
+          | LetMutLinearStructural ->
+            return InferExprErr(
+              message: "let ~" ++ name ++ ": mutable-ref binding cannot hold value of type `" ++ tctypes.type_to_string(typ: inferred_type) ++ "` because it transitively carries a linear (%T / @T) component (T-Let premise: μ = ~ ⟹ ¬linear(τ'); nexus-t9cl.12)",
+              span
+            )
+          | LetMutOk -> ()
         end
       end
       let final_type = if let SigilMutable = sigil then wrap_ref(typ: inferred_type) else inferred_type end
