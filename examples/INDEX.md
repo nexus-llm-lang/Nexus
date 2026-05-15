@@ -11,9 +11,9 @@ against [`index.schema.json`](./index.schema.json)).
 | --- | --- | --- |
 | `examples/` (root) | Historical end-to-end samples (hello, fib, bench) | 7 |
 | `examples/feature/` | One minimal example per language feature / stdlib module | 38 |
-| `examples/negative/` | Intentionally broken snippets; runner asserts the diagnostic (compile-time *or* runtime throw) | 14 |
+| `examples/negative/` | Intentionally broken snippets; runner asserts the diagnostic (compile-time *or* runtime throw) | 15 |
 
-Total: **59 examples**. See [`negative/run.sh`](./negative/run.sh) for
+Total: **60 examples**. See [`negative/run.sh`](./negative/run.sh) for
 the negative-corpus driver.
 
 ## How to use
@@ -137,6 +137,7 @@ a `println` line emitted just before the throwing site.
 | [`negative/result_unhandled_err.nx`](./negative/result_unhandled_err.nx) | runtime | Caller raises on `Err(...)` (idiomatic Result→Exn lift) |
 | [`negative/math_div_by_zero.nx`](./negative/math_div_by_zero.nx) | runtime | Bare `/` by 0 on i64 traps (`integer divide by zero`) |
 | [`negative/str_invalid_f64.nx`](./negative/str_invalid_f64.nx) | runtime | `std:str.to_f64` raises `InvalidF64` |
+| [`negative/hashmap_missing_key.nx`](./negative/hashmap_missing_key.nx) | runtime | Caller raises on `Lookup::Missing` from `hashmap.get` |
 
 ## Schema
 
