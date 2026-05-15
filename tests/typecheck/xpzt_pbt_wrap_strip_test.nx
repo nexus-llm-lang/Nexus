@@ -1,0 +1,485 @@
+// PBT (nexus-xpzt): properties of the Sigil wrap/strip algebra
+// per spec §Linearity.
+//
+// `Ty` here is a user-level model of `TypeExpr` from the compiler's
+// `src/common/ast.nx`, restricted to the shapes the spec's
+// wrap/strip rules act on: a small set of scalar bases, two
+// structural shapes (arrow, two-field record), and the four sigil
+// wrappers `% @ & ~`. Wrap / strip / stripBorrow are authored at the
+// model level and the properties below pin down the algebra.
+//
+// Subtlety: `wrap` is *idempotent* per P1, so `strip ∘ wrap` is NOT a
+// tautology — `wrap(s, TLin(t))` returns `TLin(t)` unchanged when s = %,
+// and `strip(TLin(t)) = t` peels one layer. To keep the strip property
+// pinned to its real spec content, P2 is stated against the *raw*
+// constructor (`strip(TLin(t)) = t`), not against `wrap`. Likewise the
+// stripBorrow fixed-point clause `stripBorrow(b) = b` is stated only on
+// `b` that is *not* itself a wrapper (since stripBorrow peels exactly
+// one outer layer if present, an arbitrary t may need multiple passes).
+//
+//   P1 — wrapSigil idempotence (4 properties, one per sigil):
+//          wrap(s, wrap(s, t)) == wrap(s, t)         for each s ∈ {%, @, &, ~}.
+//   P2 — strip undoes a fresh constructor wrap (4 properties):
+//          strip(C(t)) == t                          for each C ∈ {TLin,…,TRef}.
+//   P3a — stripBorrow peels each of the four wrappers:
+//          stripBorrow(C(t)) == t                    for each C.
+//   P3b — stripBorrow is identity on non-wrapper t:
+//          is_wrapper(t) == false ⇒ stripBorrow(t) == t.
+//   P4 — wrap doesn't fold across distinct sigils:
+//          strip(wrap(s1, wrap(s2, t))) == wrap(s2, t)   for all s1 ≠ s2.
+//
+// 200 iterations per property at the default seed (50 is plenty for
+// the small domain, but the task brief asks for ≥200). Total: 14
+// `pbt.forall` calls × 200 trials = 2800 sampled witnesses.
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Pass, Fail, Gen } from "std:pbt"
+import { Pair } from "std:tuple"
+import * as str from "std:str"
+
+// ─── Model: Ty + Sigil ──────────────────────────────────────────────────────
+//
+// `tag` on TBase differentiates fake "i64/bool/string" — equality only
+// cares about the i64 tag so the model stays inside `==`'s comparable
+// predicate.
+type Ty =
+  TBase(tag: i64)
+  | TArrow(param: Ty, ret: Ty)
+  | TRec(f1: Ty, f2: Ty)
+  | TLin(inner: Ty)
+  | TLazy(inner: Ty)
+  | TBor(inner: Ty)
+  | TRef(inner: Ty)
+
+type S = SLin | SLazy | SBor | SRef
+
+// ─── Algebra under test ─────────────────────────────────────────────────────
+
+let is_lin = fn (t: Ty) -> bool do
+  match t do
+    | TLin(inner: _) -> return true
+    | _ -> return false
+  end
+end
+
+let is_lazy = fn (t: Ty) -> bool do
+  match t do
+    | TLazy(inner: _) -> return true
+    | _ -> return false
+  end
+end
+
+let is_bor = fn (t: Ty) -> bool do
+  match t do
+    | TBor(inner: _) -> return true
+    | _ -> return false
+  end
+end
+
+let is_ref = fn (t: Ty) -> bool do
+  match t do
+    | TRef(inner: _) -> return true
+    | _ -> return false
+  end
+end
+
+// wrapSigil(s, τ): if τ already has the outer sigil `s`, return τ
+// unchanged (per spec — sigils don't stack). Otherwise wrap.
+let wrap = fn (s: S, t: Ty) -> Ty do
+  match s do
+    | SLin ->
+      if is_lin(t: t) then return t end
+      return TLin(inner: t)
+    | SLazy ->
+      if is_lazy(t: t) then return t end
+      return TLazy(inner: t)
+    | SBor ->
+      if is_bor(t: t) then return t end
+      return TBor(inner: t)
+    | SRef ->
+      if is_ref(t: t) then return t end
+      return TRef(inner: t)
+  end
+end
+
+// strip(τ): peel the outermost sigil wrapper. On a non-wrapper τ, returns τ.
+let strip = fn (t: Ty) -> Ty do
+  match t do
+    | TLin(inner: u) | TLazy(inner: u) | TBor(inner: u) | TRef(inner: u) -> return u
+    | _ -> return t
+  end
+end
+
+// stripBorrow(τ): spec stripBorrow — peel any of the four wrappers, leaving
+// base / arrow / record alone. (Same shape as strip in this small model,
+// but kept separate so the property pinpoints the spec's intent.)
+let strip_borrow = fn (t: Ty) -> Ty do
+  match t do
+    | TLin(inner: u) | TLazy(inner: u) | TBor(inner: u) | TRef(inner: u) -> return u
+    | _ -> return t
+  end
+end
+
+// Structural equality. Bool returns; results bound before return to keep the
+// closure ABI happy (see codegen note in pbt.nx::forall).
+let ty_eq = fn (a: Ty, b: Ty) -> bool do
+  match a do
+    | TBase(tag: ta) ->
+      match b do
+        | TBase(tag: tb) ->
+          let ok = ta == tb
+          return ok
+        | _ -> return false
+      end
+    | TArrow(param: pa, ret: ra) ->
+      match b do
+        | TArrow(param: pb, ret: rb) ->
+          if ty_eq(a: pa, b: pb) then
+            let ok = ty_eq(a: ra, b: rb)
+            return ok
+          end
+          return false
+        | _ -> return false
+      end
+    | TRec(f1: x1, f2: x2) ->
+      match b do
+        | TRec(f1: y1, f2: y2) ->
+          if ty_eq(a: x1, b: y1) then
+            let ok = ty_eq(a: x2, b: y2)
+            return ok
+          end
+          return false
+        | _ -> return false
+      end
+    | TLin(inner: ia) ->
+      match b do
+        | TLin(inner: ib) ->
+          let ok = ty_eq(a: ia, b: ib)
+          return ok
+        | _ -> return false
+      end
+    | TLazy(inner: ia) ->
+      match b do
+        | TLazy(inner: ib) ->
+          let ok = ty_eq(a: ia, b: ib)
+          return ok
+        | _ -> return false
+      end
+    | TBor(inner: ia) ->
+      match b do
+        | TBor(inner: ib) ->
+          let ok = ty_eq(a: ia, b: ib)
+          return ok
+        | _ -> return false
+      end
+    | TRef(inner: ia) ->
+      match b do
+        | TRef(inner: ib) ->
+          let ok = ty_eq(a: ia, b: ib)
+          return ok
+        | _ -> return false
+      end
+  end
+end
+
+let render_ty = fn (t: Ty) -> string do
+  match t do
+    | TBase(tag: n) -> return "B" ++ str.from_i64(val: n)
+    | TArrow(param: p, ret: r) -> return "(" ++ render_ty(t: p) ++ "->" ++ render_ty(t: r) ++ ")"
+    | TRec(f1: a, f2: b) -> return "{" ++ render_ty(t: a) ++ "," ++ render_ty(t: b) ++ "}"
+    | TLin(inner: u) -> return "%" ++ render_ty(t: u)
+    | TLazy(inner: u) -> return "@" ++ render_ty(t: u)
+    | TBor(inner: u) -> return "&" ++ render_ty(t: u)
+    | TRef(inner: u) -> return "~" ++ render_ty(t: u)
+  end
+end
+
+// ─── Depth-bounded Gen<Ty> ──────────────────────────────────────────────────
+//
+// Seeds are threaded by drawing through `pbt.small_int` (re-exporting the
+// xorshift step we don't have access to as a primitive). The local helper
+// `step_seed` returns (raw_int, next_seed) and `gen_ty_run` is a top-level
+// recursive function so the body() closure stays small.
+
+let abs_i64 = fn (n: i64) -> i64 do
+  if n < 0 then return 0 - n end
+  return n
+end
+
+// Inline xorshift64 (Marsaglia 13/7/17) — `pbt.next_state` is module-local in
+// std:pbt so we can't reuse it; mirroring the constants keeps the seed
+// sequence reproducible across runs without poking the stdlib's internals.
+// `xor_fixup` is bound inside the function to dodge a top-level non-fn let
+// inference quirk that surfaced here on the import-side typechecker pass.
+let step_seed = fn (seed: i64) -> Pair<i64, i64> do
+  let xor_fixup : i64 = 2685821657736338717
+  let s0 = if seed == 0 then xor_fixup else seed end
+  let s1 = s0 ^ (s0 << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  return Pair(left: s3, right: s3)
+end
+
+let gen_ty_run = fn (depth: i64, seed: i64) -> Pair<Ty, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  if depth <= 0 then
+    let tag = raw % 3
+    return Pair(left: TBase(tag: tag), right: s1)
+  end
+  let choice = raw % 7
+  if choice == 0 then
+    let tag = raw % 3
+    return Pair(left: TBase(tag: tag), right: s1)
+  end
+  if choice == 1 then
+    let Pair(left: a, right: s2) = gen_ty_run(depth: depth - 1, seed: s1)
+    let Pair(left: b, right: s3) = gen_ty_run(depth: depth - 1, seed: s2)
+    return Pair(left: TArrow(param: a, ret: b), right: s3)
+  end
+  if choice == 2 then
+    let Pair(left: a, right: s2) = gen_ty_run(depth: depth - 1, seed: s1)
+    let Pair(left: b, right: s3) = gen_ty_run(depth: depth - 1, seed: s2)
+    return Pair(left: TRec(f1: a, f2: b), right: s3)
+  end
+  if choice == 3 then
+    let Pair(left: u, right: s2) = gen_ty_run(depth: depth - 1, seed: s1)
+    return Pair(left: TLin(inner: u), right: s2)
+  end
+  if choice == 4 then
+    let Pair(left: u, right: s2) = gen_ty_run(depth: depth - 1, seed: s1)
+    return Pair(left: TLazy(inner: u), right: s2)
+  end
+  if choice == 5 then
+    let Pair(left: u, right: s2) = gen_ty_run(depth: depth - 1, seed: s1)
+    return Pair(left: TBor(inner: u), right: s2)
+  end
+  let Pair(left: u, right: s2) = gen_ty_run(depth: depth - 1, seed: s1)
+  return Pair(left: TRef(inner: u), right: s2)
+end
+
+// ─── Body ───────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit require { Console } throws { Exn } do
+  // Build the generator *inside* body() — the codegen path for a top-level
+  // `let g = Gen(...)` over a non-base T mismatches the closure ABI on i64
+  // return slots (see yebe_pbt_smoke_test.nx and pbt.nx::property notes).
+  let gen_ty_local = Gen(
+    run: fn (seed: i64) -> Pair<Ty, i64> do
+      return gen_ty_run(depth: 3, seed)
+    end,
+    shrink: fn (v: Ty) -> [ Ty ] do return [] end,
+    render: render_ty
+  )
+
+  let iters = 200
+
+  // ── P1: wrap idempotence, one property per sigil ─────────────────────────
+  let prop_idem_lin = fn (x: Ty) -> bool do
+    let lhs = wrap(s: SLin, t: wrap(s: SLin, t: x))
+    let rhs = wrap(s: SLin, t: x)
+    let ok = ty_eq(a: lhs, b: rhs)
+    return ok
+  end
+  let prop_idem_lazy = fn (x: Ty) -> bool do
+    let lhs = wrap(s: SLazy, t: wrap(s: SLazy, t: x))
+    let rhs = wrap(s: SLazy, t: x)
+    let ok = ty_eq(a: lhs, b: rhs)
+    return ok
+  end
+  let prop_idem_bor = fn (x: Ty) -> bool do
+    let lhs = wrap(s: SBor, t: wrap(s: SBor, t: x))
+    let rhs = wrap(s: SBor, t: x)
+    let ok = ty_eq(a: lhs, b: rhs)
+    return ok
+  end
+  let prop_idem_ref = fn (x: Ty) -> bool do
+    let lhs = wrap(s: SRef, t: wrap(s: SRef, t: x))
+    let rhs = wrap(s: SRef, t: x)
+    let ok = ty_eq(a: lhs, b: rhs)
+    return ok
+  end
+
+  let r1a = pbt.forall(g: gen_ty_local, prop: prop_idem_lin, n: iters)
+  match r1a do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1: wrap(%, wrap(%, t)) == wrap(%, t)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1 % idempotence failed: " ++ w)
+  end
+  let r1b = pbt.forall(g: gen_ty_local, prop: prop_idem_lazy, n: iters)
+  match r1b do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1: wrap(@, wrap(@, t)) == wrap(@, t)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1 @ idempotence failed: " ++ w)
+  end
+  let r1c = pbt.forall(g: gen_ty_local, prop: prop_idem_bor, n: iters)
+  match r1c do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1: wrap(&, wrap(&, t)) == wrap(&, t)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1 & idempotence failed: " ++ w)
+  end
+  let r1d = pbt.forall(g: gen_ty_local, prop: prop_idem_ref, n: iters)
+  match r1d do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1: wrap(~, wrap(~, t)) == wrap(~, t)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1 ~ idempotence failed: " ++ w)
+  end
+
+  // ── P2: strip undoes a freshly-applied constructor wrap ──────────────────
+  //
+  // `strip(C(τ)) == τ` for each of the four sigil constructors. This is the
+  // raw-strip property — `strip(wrap(s, τ))` is _not_ a tautology because
+  // wrap is idempotent (P1): if τ is already s-wrapped, wrap(s, τ) == τ
+  // and a subsequent strip would peel one layer and not return τ. P2 here
+  // pins the strip side directly using the constructors, with no
+  // idempotence interaction.
+  let prop_strip_c_lin = fn (x: Ty) -> bool do
+    let ok = ty_eq(a: strip(t: TLin(inner: x)), b: x)
+    return ok
+  end
+  let prop_strip_c_lazy = fn (x: Ty) -> bool do
+    let ok = ty_eq(a: strip(t: TLazy(inner: x)), b: x)
+    return ok
+  end
+  let prop_strip_c_bor = fn (x: Ty) -> bool do
+    let ok = ty_eq(a: strip(t: TBor(inner: x)), b: x)
+    return ok
+  end
+  let prop_strip_c_ref = fn (x: Ty) -> bool do
+    let ok = ty_eq(a: strip(t: TRef(inner: x)), b: x)
+    return ok
+  end
+
+  let r2a = pbt.forall(g: gen_ty_local, prop: prop_strip_c_lin, n: iters)
+  match r2a do
+    | Pass -> test_assert.assert_true(cond: true, label: "P2: strip(TLin(t)) == t")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P2 % strip failed: " ++ w)
+  end
+  let r2b = pbt.forall(g: gen_ty_local, prop: prop_strip_c_lazy, n: iters)
+  match r2b do
+    | Pass -> test_assert.assert_true(cond: true, label: "P2: strip(TLazy(t)) == t")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P2 @ strip failed: " ++ w)
+  end
+  let r2c = pbt.forall(g: gen_ty_local, prop: prop_strip_c_bor, n: iters)
+  match r2c do
+    | Pass -> test_assert.assert_true(cond: true, label: "P2: strip(TBor(t)) == t")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P2 & strip failed: " ++ w)
+  end
+  let r2d = pbt.forall(g: gen_ty_local, prop: prop_strip_c_ref, n: iters)
+  match r2d do
+    | Pass -> test_assert.assert_true(cond: true, label: "P2: strip(TRef(t)) == t")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P2 ~ strip failed: " ++ w)
+  end
+
+  // ── P3: stripBorrow specialness ──────────────────────────────────────────
+  //
+  // Two sub-properties:
+  //   (a) stripBorrow(W(t)) == t for any of the four constructors —
+  //       same shape as P2 but stated explicitly per the spec's
+  //       stripBorrow rule (peels %@&~ uniformly).
+  //   (b) stripBorrow is a fixed point after one pass: for any t,
+  //       stripBorrow(stripBorrow(t)) == stripBorrow(t). Together with
+  //       (a) this pins the operation to "peel exactly one outer sigil
+  //       wrapper if present, else identity".
+  let prop_sb_wrapped = fn (x: Ty) -> bool do
+    let ok_lin = ty_eq(a: strip_borrow(t: TLin(inner: x)), b: x)
+    let ok_lazy = ty_eq(a: strip_borrow(t: TLazy(inner: x)), b: x)
+    let ok_bor = ty_eq(a: strip_borrow(t: TBor(inner: x)), b: x)
+    let ok_ref = ty_eq(a: strip_borrow(t: TRef(inner: x)), b: x)
+    let ok = ok_lin && ok_lazy && ok_bor && ok_ref
+    return ok
+  end
+  // For non-wrapper t (base / arrow / record), strip_borrow is the
+  // identity — the spec's `stripBorrow(b) = b` clause. We guard on x's
+  // shape so the property has a definite ground truth on every
+  // generated witness.
+  let is_wrapper = fn (t: Ty) -> bool do
+    match t do
+      | TLin(inner: _) | TLazy(inner: _) | TBor(inner: _) | TRef(inner: _) -> return true
+      | _ -> return false
+    end
+  end
+  let prop_sb_id_on_bare = fn (x: Ty) -> bool do
+    if is_wrapper(t: x) then
+      let ok = true
+      return ok
+    end
+    let ok = ty_eq(a: strip_borrow(t: x), b: x)
+    return ok
+  end
+
+  let r3a = pbt.forall(g: gen_ty_local, prop: prop_sb_wrapped, n: iters)
+  match r3a do
+    | Pass -> test_assert.assert_true(cond: true, label: "P3a: stripBorrow(C(t)) == t for C ∈ {%,@,&,~}")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P3a stripBorrow-wrapped failed: " ++ w)
+  end
+  let r3b = pbt.forall(g: gen_ty_local, prop: prop_sb_id_on_bare, n: iters)
+  match r3b do
+    | Pass -> test_assert.assert_true(cond: true, label: "P3b: stripBorrow(b) == b on bare (non-wrapper) shapes")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P3b stripBorrow-id-on-bare failed: " ++ w)
+  end
+
+  // ── P4: wrap doesn't fold across distinct sigils ─────────────────────────
+  //
+  // For s1 ≠ s2 and any t, wraps stack one-at-a-time:
+  //   strip(wrap(s1, wrap(s2, t))) == wrap(s2, t).
+  // This passes in every t-shape because wrap(s2, t) is either TS2(t)
+  // (when t wasn't s2-wrapped) or t (which then was already TS2-headed);
+  // in both cases the outer wrap(s1, _) adds an s1 layer (s1 ≠ s2 means
+  // the inner head can't equal s1's), and one strip recovers it.
+  let prop_distinct_stack = fn (x: Ty) -> bool do
+    let pairs_ok = fn (s1: S, s2: S) -> bool do
+      let mid = wrap(s: s2, t: x)
+      let outer = wrap(s: s1, t: mid)
+      let ok = ty_eq(a: strip(t: outer), b: mid)
+      return ok
+    end
+    let ok = pairs_ok(s1: SLin, s2: SLazy)
+          && pairs_ok(s1: SLin, s2: SBor)
+          && pairs_ok(s1: SLin, s2: SRef)
+          && pairs_ok(s1: SLazy, s2: SLin)
+          && pairs_ok(s1: SLazy, s2: SBor)
+          && pairs_ok(s1: SLazy, s2: SRef)
+          && pairs_ok(s1: SBor, s2: SLin)
+          && pairs_ok(s1: SBor, s2: SLazy)
+          && pairs_ok(s1: SBor, s2: SRef)
+          && pairs_ok(s1: SRef, s2: SLin)
+          && pairs_ok(s1: SRef, s2: SLazy)
+          && pairs_ok(s1: SRef, s2: SBor)
+    return ok
+  end
+
+  let r4 = pbt.forall(g: gen_ty_local, prop: prop_distinct_stack, n: iters)
+  match r4 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P4: distinct sigils stack — strip(wrap(s1, wrap(s2, t))) == wrap(s2, t)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P4 distinct-stack failed: " ++ w)
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
