@@ -54,9 +54,11 @@ import { strip_lint_subcommand, ParsedLintSubcommand, run_lint_subcommand } from
 import { LirProgram, LirFunction } from "src/ir/lir/types.nx"
 import {
   ArgSpec, ParseResult, SubcommandHit,
+  SubcommandSpec, Example, ExitCode,
   spec_flag, spec_opt, spec_positional, spec_subcommand,
+  subspec, example, exit_code,
   parse_permissive, get_flag, get_opt, get_positionals_all, get_remaining, is_ok, first_error,
-  detect_subcommand, render_usage
+  detect_subcommand, render_usage, render_subcommand_help
 } from "std:argparse"
 
 // Backtrace-elision percentage (issue nexus-kyf8): integer percent of raise
@@ -252,12 +254,393 @@ end
 
 /** Render the consolidated usage block from the spec table (issue
  *  nexus-8vu5). Per-subcommand detail (build / typecheck / repl / test)
- *  is deferred to nexus-z35v — until then `help <subcommand>` emits the
- *  same full form so users still see the synopsis. Routing of `help [sub]`
- *  is handled by `dispatch_help_subcommand` (nexus-npo6).
+ *  is delivered via `subcommand_specs()` + `render_subcommand_help`
+ *  (issue nexus-z35v); the top-level overview here remains the
+ *  argparse-derived summary so `nexus help` (no sub) still works as
+ *  before. Routing of `help [sub]` is handled by `dispatch_help` below
+ *  (extends the nexus-npo6 short-circuit).
  */
 let print_usage = fn () -> unit require { Console } do
   Console.eprintln(val: render_usage(summary: "Usage: nexus <subcommand> [options] <args>", specs: cli_specs()))
+end
+
+// ─── Per-subcommand help table (issue nexus-z35v) ──────────────────────────
+//
+// One SubcommandSpec per top-level routing arm. Each carries:
+//   - synopsis      one-line usage shape (no `nexus` prefix)
+//   - description   multi-paragraph prose explaining the command
+//   - flags         per-sub ArgSpec list (auto-derived FLAGS table)
+//   - examples      worked invocations
+//   - see_also      related subcommand names
+//   - exit_codes    canonical exit status meanings
+//
+// Lookups go through `lookup_subcommand_spec(name)`. The top-level
+// `help` dispatch (extending nexus-npo6) routes both `nexus <sub> --help`
+// and `nexus help <sub>` through `render_subcommand_help`, so the two
+// invocations produce byte-identical output.
+
+let std_exit_codes = fn () -> [ExitCode] do
+  return [
+    exit_code(code: 0, meaning: "success"),
+    exit_code(code: 1, meaning: "compilation or runtime failure (diagnostic on stderr)"),
+    exit_code(code: 2, meaning: "invalid CLI usage (E4002 / E4004)")
+  ]
+end
+
+// Global flags relevant to every build-pipeline subcommand
+// (build / run / typecheck / ast / hir / lir / types). Keeping them in
+// one helper avoids spec drift between subs.
+let pipeline_flags = fn () -> [ArgSpec] do
+  return [
+    spec_flag(name: "verbose", short: "", long: "--verbose", help: "enable per-pass timing output"),
+    spec_opt(name: "format", short: "", long: "--format", required: false, help: "diagnostic format (text|json)"),
+    spec_opt(name: "explain-capabilities", short: "", long: "--explain-capabilities", required: false, help: "capability reporting (yes|none|wasmtime)"),
+    spec_opt(name: "explain-capabilities-format", short: "", long: "--explain-capabilities-format", required: false, help: "capability report format (text|json)")
+  ]
+end
+
+let build_subspec = fn () -> SubcommandSpec do
+  let flags = list.concat(
+    xs: [
+      spec_opt(name: "output", short: "-o", long: "--output", required: false, help: "output wasm path (default: out.wasm)"),
+      spec_flag(name: "polyglot", short: "", long: "--polyglot", help: "emit self-extracting POSIX-sh + wasm launcher"),
+      spec_flag(name: "remain-manifest", short: "", long: "--remain-manifest", help: "polyglot launcher keeps manifest layout"),
+      spec_flag(name: "coverage", short: "", long: "--coverage", help: "emit coverage counters and custom section"),
+      spec_flag(name: "dump-imports", short: "", long: "--dump-imports", help: "print the import graph and exit")
+    ],
+    ys: pipeline_flags()
+  )
+  return subspec(
+    name: "build",
+    synopsis: "<input.nx> [-o <output.wasm>] [--polyglot [--remain-manifest]] [--coverage]",
+    description: "Compile a Nexus source file to a self-contained WebAssembly module.\nThe full pipeline runs (parse, resolve, HIR/MIR/LIR, codegen, link, merge) and\nthe resulting wasm is written to the path given by -o (default: out.wasm).\n\nWith --polyglot the output is wrapped in a POSIX-sh self-extracting launcher\nthat embeds wasmtime invocation; the file is executable on any POSIX shell.",
+    flags,
+    examples: [
+      example(command: "nexus build examples/hello.nx -o hello.wasm", comment: "compile a single source file to a wasm module"),
+      example(command: "nexus build src/driver.nx -o nexus.wasm --polyglot", comment: "produce a polyglot launcher (sh + wasm in one file)"),
+      example(command: "nexus build foo.nx --coverage -o foo.cov.wasm", comment: "instrument with coverage counters")
+    ],
+    see_also: ["run", "typecheck", "test"],
+    exit_codes: std_exit_codes()
+  )
+end
+
+let run_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "run",
+    synopsis: "<input.nx> [-- <user-args>...]",
+    description: "Compile a Nexus source file and immediately execute it via wasmtime.\nArguments after `--` are forwarded verbatim to the running program.\n\nFor short iteration cycles this is preferable to `nexus build` followed by\nan explicit wasmtime invocation.",
+    flags: pipeline_flags(),
+    examples: [
+      example(command: "nexus run examples/hello.nx", comment: "compile and run; no program args"),
+      example(command: "nexus run scripts/count.nx -- file1.txt file2.txt", comment: "forward two arguments after `--` to the script")
+    ],
+    see_also: ["build", "repl"],
+    exit_codes: std_exit_codes()
+  )
+end
+
+let typecheck_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "typecheck",
+    synopsis: "<input.nx>",
+    description: "Run only the front-end: parse, resolve, HIR construction, and full\ntypechecking (including effect rows + linearity). No MIR/LIR/codegen.\n\nUseful as a fast feedback loop and as the pre-commit hook target.",
+    flags: pipeline_flags(),
+    examples: [
+      example(command: "nexus typecheck src/driver.nx", comment: "fast typecheck of the self-hosting driver"),
+      example(command: "nexus typecheck foo.nx --format json", comment: "emit JSON diagnostics for editor integration")
+    ],
+    see_also: ["build", "types"],
+    exit_codes: std_exit_codes()
+  )
+end
+
+let ast_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "ast",
+    synopsis: "<input.nx> [--format text|json]",
+    description: "Pretty-print the parsed AST for the given source file. Useful when\ndebugging parser issues or building tooling on top of Nexus.\n\nThe JSON variant is stable enough to feed into external linters.",
+    flags: list.concat(
+      xs: [spec_opt(name: "format", short: "", long: "--format", required: false, help: "output format (text|json)")],
+      ys: pipeline_flags()
+    ),
+    examples: [
+      example(command: "nexus ast examples/hello.nx", comment: "pretty-print the AST as text"),
+      example(command: "nexus ast examples/hello.nx --format json", comment: "machine-readable AST dump")
+    ],
+    see_also: ["hir", "lir", "types"],
+    exit_codes: std_exit_codes()
+  )
+end
+
+let hir_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "hir",
+    synopsis: "<input.nx> [--format text|json]",
+    description: "Dump the High-level IR after name resolution and HIR construction.\nThis is the IR the typechecker consumes; reading it is the fastest way\nto debug `let`/`fn`/handler desugaring or effect-row inference.",
+    flags: list.concat(
+      xs: [spec_opt(name: "format", short: "", long: "--format", required: false, help: "output format (text|json)")],
+      ys: pipeline_flags()
+    ),
+    examples: [
+      example(command: "nexus hir foo.nx", comment: "text dump of the HIR"),
+      example(command: "nexus hir foo.nx --format json", comment: "JSON HIR for tooling")
+    ],
+    see_also: ["ast", "lir", "types"],
+    exit_codes: std_exit_codes()
+  )
+end
+
+let lir_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "lir",
+    synopsis: "<input.nx> [--format text|json]",
+    description: "Dump the Low-level IR after MIR→LIR lowering and the post-codegen\noptimisation passes. Used when chasing codegen bugs or sizing a\nspecific function's wasm output.",
+    flags: list.concat(
+      xs: [spec_opt(name: "format", short: "", long: "--format", required: false, help: "output format (text|json)")],
+      ys: pipeline_flags()
+    ),
+    examples: [
+      example(command: "nexus lir foo.nx", comment: "text dump of the LIR"),
+      example(command: "nexus lir foo.nx --format json", comment: "JSON LIR for diffing")
+    ],
+    see_also: ["ast", "hir", "types"],
+    exit_codes: std_exit_codes()
+  )
+end
+
+let types_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "types",
+    synopsis: "<input.nx> [--format text|json]",
+    description: "Dump every top-level binding's inferred type after full typechecking.\nWith --format json the output is keyed by symbol and includes effect\nrows, which is the canonical input to editor hover/`explain` flows.",
+    flags: list.concat(
+      xs: [spec_opt(name: "format", short: "", long: "--format", required: false, help: "output format (text|json)")],
+      ys: pipeline_flags()
+    ),
+    examples: [
+      example(command: "nexus types foo.nx", comment: "text-format type table"),
+      example(command: "nexus types src/driver.nx --format json", comment: "JSON for editor integration")
+    ],
+    see_also: ["typecheck", "explain"],
+    exit_codes: std_exit_codes()
+  )
+end
+
+let repl_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "repl",
+    synopsis: "",
+    description: "Launch the interactive REPL. Each input line is parsed, typechecked,\nand evaluated against a persistent session; bindings established at one\nprompt are visible at the next. Press Ctrl-D to exit.",
+    flags: [],
+    examples: [
+      example(command: "nexus repl", comment: "start the REPL")
+    ],
+    see_also: ["run"],
+    exit_codes: std_exit_codes()
+  )
+end
+
+let mcp_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "mcp",
+    synopsis: "",
+    description: "Serve the Model Context Protocol over stdio. Exposes Nexus tooling\n(typecheck, explain, context, types) as JSON-RPC methods so an LLM\nclient can drive the compiler without spawning per-call subprocesses.",
+    flags: [],
+    examples: [
+      example(command: "nexus mcp", comment: "start the JSON-RPC server on stdio")
+    ],
+    see_also: ["explain", "context"],
+    exit_codes: std_exit_codes()
+  )
+end
+
+let explain_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "explain",
+    synopsis: "<symbol> [--file FILE] [--format text|json]",
+    description: "Look up a symbol's signature, kind, defining file, and docstring.\nWith --file FILE the lookup is scoped to that source file; without it\nthe lookup spans the project (driven by `nexus context`).\n\nThe JSON output drives editor hover providers.",
+    flags: [
+      spec_opt(name: "file", short: "", long: "--file", required: false, help: "scope lookup to this source file"),
+      spec_opt(name: "format", short: "", long: "--format", required: false, help: "output format (text|json)")
+    ],
+    examples: [
+      example(command: "nexus explain Option --file nxlib/stdlib/option.nx", comment: "explain a type from a specific file"),
+      example(command: "nexus explain parse_global_args --format json", comment: "machine-readable explain for an editor")
+    ],
+    see_also: ["context", "types"],
+    exit_codes: std_exit_codes()
+  )
+end
+
+let context_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "context",
+    synopsis: "<file> [--format text|json]",
+    description: "Emit the project's symbol context (top-level definitions, exports,\nand import edges) as a single document. Drives editor outline views\nand the MCP server's symbol catalogue.",
+    flags: [
+      spec_opt(name: "format", short: "", long: "--format", required: false, help: "output format (text|json)")
+    ],
+    examples: [
+      example(command: "nexus context src/driver.nx", comment: "text-format project context"),
+      example(command: "nexus context src/driver.nx --format json", comment: "JSON context for tooling")
+    ],
+    see_also: ["explain", "mcp"],
+    exit_codes: std_exit_codes()
+  )
+end
+
+let test_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "test",
+    synopsis: "[path] [--junit FILE] [--nexus-bin PATH] [--wasmtime-bin PATH]",
+    description: "Run every `*_test.nx` under `path` (defaults to `tests/`). Each test\nis compiled and executed in a fresh wasmtime invocation; results are\nreported as one PASS/FAIL line per test plus a totals summary.\n\n--junit emits a JUnit XML report. --nexus-bin / --wasmtime-bin pin the\nbinaries (the runner spawns the host nexus, not the in-process pipeline).",
+    flags: [
+      spec_opt(name: "junit", short: "", long: "--junit", required: false, help: "write a JUnit XML report to this path"),
+      spec_opt(name: "nexus-bin", short: "", long: "--nexus-bin", required: false, help: "path to the nexus binary (default: ./nexus)"),
+      spec_opt(name: "wasmtime-bin", short: "", long: "--wasmtime-bin", required: false, help: "path to the wasmtime binary (default: wasmtime)")
+    ],
+    examples: [
+      example(command: "nexus test", comment: "run every test under tests/"),
+      example(command: "nexus test tests/typecheck", comment: "run a subset by directory"),
+      example(command: "nexus test --junit out.xml", comment: "emit a JUnit XML report alongside the run")
+    ],
+    see_also: ["build", "fmt"],
+    exit_codes: [
+      exit_code(code: 0, meaning: "all tests passed"),
+      exit_code(code: 1, meaning: "at least one test failed (see PASS/FAIL summary)"),
+      exit_code(code: 2, meaning: "invalid CLI usage")
+    ]
+  )
+end
+
+let fmt_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "fmt",
+    synopsis: "[--check] <file>|- [<file>...]",
+    description: "Format Nexus source files in place. Pass `-` to read from stdin and\nwrite to stdout. With --check the formatter only verifies the input is\nalready well-formed, leaving files untouched and exiting non-zero on\ndiscrepancy (useful as a CI / pre-commit gate).",
+    flags: [
+      spec_flag(name: "check", short: "", long: "--check", help: "check-only mode; do not modify files")
+    ],
+    examples: [
+      example(command: "nexus fmt src/driver.nx", comment: "format a single file in place"),
+      example(command: "cat foo.nx | nexus fmt -", comment: "format stdin → stdout"),
+      example(command: "nexus fmt --check src/", comment: "verify all files under src/ are well-formed")
+    ],
+    see_also: ["test"],
+    exit_codes: [
+      exit_code(code: 0, meaning: "files were already (or are now) well-formatted"),
+      exit_code(code: 1, meaning: "--check mismatch or unparseable input"),
+      exit_code(code: 2, meaning: "invalid CLI usage")
+    ]
+  )
+end
+
+let grep_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "grep",
+    synopsis: "<pattern> [<path>...]",
+    description: "Structural AST search: match a pattern against the parsed AST of\nevery `.nx` file under the given paths (default: current directory).\nUnlike plain text grep, the pattern matches AST shapes and survives\nrewrites that only change whitespace, comments, or identifier names.",
+    flags: [],
+    examples: [
+      example(command: "nexus grep 'fn ($_) -> $_' src/", comment: "find every single-argument fn under src/"),
+      example(command: "nexus grep 'match $e do' src/driver.nx", comment: "locate every match in one file")
+    ],
+    see_also: ["ast"],
+    exit_codes: [
+      exit_code(code: 0, meaning: "at least one match was found"),
+      exit_code(code: 1, meaning: "no matches"),
+      exit_code(code: 2, meaning: "invalid pattern or CLI usage")
+    ]
+  )
+end
+
+let help_subspec = fn () -> SubcommandSpec do
+  return subspec(
+    name: "help",
+    synopsis: "[<subcommand>]",
+    description: "With no argument, print the top-level usage overview (the same output\nas `nexus --help`). With a subcommand name, print that subcommand's\nstructured help (the same output as `nexus <sub> --help`).",
+    flags: [],
+    examples: [
+      example(command: "nexus help", comment: "top-level overview"),
+      example(command: "nexus help build", comment: "structured help for `nexus build`")
+    ],
+    see_also: ["build", "run", "test"],
+    exit_codes: [exit_code(code: 0, meaning: "help printed")]
+  )
+end
+
+/** Per-subcommand spec table. Order is the canonical sort order used by
+ *  the top-level overview. */
+let subcommand_specs = fn () -> [SubcommandSpec] do
+  return [
+    build_subspec(),
+    run_subspec(),
+    typecheck_subspec(),
+    ast_subspec(),
+    hir_subspec(),
+    lir_subspec(),
+    types_subspec(),
+    repl_subspec(),
+    mcp_subspec(),
+    explain_subspec(),
+    context_subspec(),
+    test_subspec(),
+    fmt_subspec(),
+    grep_subspec(),
+    help_subspec()
+  ]
+end
+
+let lookup_subcommand_spec = fn (specs: [SubcommandSpec], name: string) -> Option<SubcommandSpec> do
+  match specs do
+    | [] -> return None
+    | s :: rest ->
+      match s do | SubcommandSpec(name: n, synopsis: _, description: _, flags: _, examples: _, see_also: _, exit_codes: _) ->
+        if n == name then return Some(val: s) end
+        return lookup_subcommand_spec(specs: rest, name)
+      end
+  end
+end
+
+/** Print the rich per-subcommand help for `sub_name`. Returns true when
+ *  printed; false when no spec was found (caller falls back to the
+ *  top-level overview).
+ */
+let print_subcommand_help = fn (sub_name: string) -> bool require { Console } do
+  match lookup_subcommand_spec(specs: subcommand_specs(), name: sub_name) do
+    | None -> return false
+    | Some(val: s) ->
+      Console.eprintln(val: render_subcommand_help(prog: "nexus", spec: s))
+      return true
+  end
+end
+
+/** Recognise `nexus help <sub>` / `nexus <sub> --help` / `nexus <sub> -h`
+ *  shapes and emit the structured per-sub help. Returns true when help
+ *  was handled (caller exits 0); false when args did not look like a
+ *  help-shaped request (caller continues with normal parsing).
+ *
+ *  Unknown sub-names after `help` or before `--help` fall back to the
+ *  top-level overview rather than failing — keeps the help routing
+ *  uniformly successful.
+ */
+let try_dispatch_help = fn (args: [string]) -> bool require { Console } do
+  match args do
+    | _ :: a :: b :: _ ->
+      if a == "help" then
+        if print_subcommand_help(sub_name: b) then return true end
+        print_usage()
+        return true
+      end
+      if b == "--help" || b == "-h" then
+        if print_subcommand_help(sub_name: a) then return true end
+        print_usage()
+        return true
+      end
+      return false
+    | _ -> return false
+  end
 end
 
 // Bundled global flags resolved by `parse_global_args`. Replaces the
@@ -846,17 +1229,18 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
   inject stdio.system_handler, fs_mod.system_handler, clock_mod.system_handler, proc.system_handler do
   try
     // help / --help / -h short-circuits before any other parsing.
-    // `nexus help [sub]` (nexus-npo6): with no sub or with the help
-    // token itself, print usage and exit 0; per-sub detail is deferred
-    // to nexus-z35v. Other tokens fall through to normal parsing so the
-    // user still sees usage when they typoed (the InvalidUsage error
-    // already references `nexus help`).
-    // `--help`/`-h` retain the legacy print-and-exit-0 contract.
+    // `nexus help [sub]` (nexus-npo6) and `nexus <sub> --help`
+    // (nexus-z35v) are unified here: when a subcommand name is paired
+    // with help (in either direction), look it up in
+    // `subcommand_specs()` and emit the structured per-sub help. With
+    // only the help token (`nexus help`, `nexus --help`, `nexus -h`),
+    // fall back to the top-level overview.
+    // `--help`/`-h` retain the print-and-exit-0 contract.
     // No-args (just program name) → fall through to the InvalidUsage
-    // raise so the existing E4002 contract holds; the message now
-    // references `nexus help` instead of dumping the full usage block.
+    // raise so the existing E4002 contract holds.
     // (Levenshtein-based did-you-mean is deferred until nexus-rxpz —
     // adding reachable arity-2+ helpers here trips that codegen bug.)
+    if try_dispatch_help(args) then proc.exit(status: 0) end
     match args do
       | _ :: tok :: _ ->
         if tok == "help" || tok == "--help" || tok == "-h" then

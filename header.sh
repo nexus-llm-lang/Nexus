@@ -67,8 +67,16 @@ if [ "$#" -gt 0 ]; then
       # compile. The in-Nexus `src/tools/test_runner.nx` stays as the source of
       # truth for the report format and is the path that will light up if
       # a future WASI preview gives us subprocess back.
-      TEST_MODE=1
-      shift
+      #
+      # `nexus test --help|-h` is a help request, not an invocation —
+      # fall through to the compiler payload so the in-wasm
+      # try_dispatch_help (nexus-z35v) can serve it.
+      if [ "$#" -ge 2 ] && { [ "$2" = "--help" ] || [ "$2" = "-h" ]; }; then
+        :
+      else
+        TEST_MODE=1
+        shift
+      fi
       ;;
     run)
       # `nexus run` — same preview1 constraint as test (Proc.exec is a -1
@@ -76,8 +84,15 @@ if [ "$#" -gt 0 ]; then
       # `src/driver.nx` still parses `run` and would Proc.exec wasmtime if
       # subprocess was available; under preview1 it emits the same
       # "use the polyglot launcher" hint as the test path.
-      RUN_MODE=1
-      shift
+      #
+      # `nexus run --help|-h` is a help request — fall through to the
+      # compiler payload (see comment on `test` above).
+      if [ "$#" -ge 2 ] && { [ "$2" = "--help" ] || [ "$2" = "-h" ]; }; then
+        :
+      else
+        RUN_MODE=1
+        shift
+      fi
       ;;
   esac
 fi
