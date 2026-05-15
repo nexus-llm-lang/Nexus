@@ -1,0 +1,297 @@
+// nexus-ul9n — PBT for typecheck/unify.
+//
+// Three properties exercised over a depth-bounded `Gen<Pair<TypeExpr, TypeExpr>>`:
+//
+//   1. Termination (P7): every generated (t1, t2) returns from `unify` in
+//      finite time. `pbt.forall` completing at all witnesses this.
+//   2. Symmetry (subset): for scalar/arrow/record-shaped types, the OK-ness
+//      of `unify(t1, t2)` matches `unify(t2, t1)`. We skip U-Borrow and
+//      free TyVars (where the spec already documents asymmetric handling)
+//      by generating closed first-order types with no `&` and no `?α`.
+//   3. Idempotence: if `unify(t1, t2) = UnifyOk(subst: σ)`, then
+//      `unify(σ t1, σ t2) = UnifyOk(_)` (the re-unify succeeds — we relax
+//      the textbook "empty subst" form to "still Ok" because composed
+//      substitutions can show idempotent but non-empty fixed points).
+//
+// Generators are built locally (per nexus-ul9n guidance — `std:pbt` is
+// kept minimal). All arrow params are named "x" and records have a single
+// "f" field, so the AST-level name-equality used by TyArrow's structural
+// equality is never the failure mode under test.
+//
+// Anti-gotcha notes (see yebe_pbt_smoke_test.nx):
+//   * Predicates live as locals inside `body()` so the closure ABI sees
+//     a `bool` return, not the `i64` slot the wrap path would impose.
+//   * Predicate results bind to a local before `return`.
+//   * `Gen<T>` values are built inside `body()` to avoid top-level
+//     nullary-thunk inference.
+//   * Every Gen<T> carries a renderer.
+//   * `pbt.forall`'s `prop` parameter is named `x` — predicates therefore
+//     bind their input as `x`.
+
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Pass, Fail, Gen } from "std:pbt"
+import { Pair } from "std:tuple"
+import { Option, Some, None } from "std:option"
+import {
+  TypeExpr, TyI32, TyI64, TyF32, TyF64, TyBool, TyChar, TyString, TyUnit,
+  TyIntLit, TyFloatLit, TyArrow, TyList, TyArray, TyRecord, TyRef, TyLinear,
+  TyLazy, NamedType
+} from "src/common/ast.nx"
+import { UnifyResult, UnifyOk, UnifyErr, TypeDefEntry } from "src/typecheck/types.nx"
+import * as tctypes from "src/typecheck/types.nx"
+import * as unify_mod from "src/typecheck/unify.nx"
+import * as subst from "src/typecheck/subst.nx"
+
+// ─── Renderers ──────────────────────────────────────────────────────────────
+
+let show_ty = fn (t: TypeExpr) -> string do
+  return tctypes.type_to_string(typ: t)
+end
+
+let show_pair = fn (p: Pair<TypeExpr, TypeExpr>) -> string do
+  let Pair(left: a, right: b) = p
+  return "(" ++ show_ty(t: a) ++ ", " ++ show_ty(t: b) ++ ")"
+end
+
+// ─── Property bodies ────────────────────────────────────────────────────────
+
+// Helper: `[]` at top-level scope infers as a polymorphic nullary thunk
+// under Nexus' monomorphisation, so wrap it in a function that returns
+// the concrete `[TypeDefEntry]` shape we need at every call site.
+let empty_tdefs = fn () -> [TypeDefEntry] do return [] end
+
+let unify_ok = fn (t1: TypeExpr, t2: TypeExpr) -> bool do
+  match unify_mod.unify(t1, t2, tdefs: empty_tdefs()) do
+    | UnifyOk(subst: _) -> return true
+    | UnifyErr(message: _) -> return false
+  end
+end
+
+let body = fn () -> unit require { Console } throws { Exn } do
+  // ── Build scalar leaf generator ──────────────────────────────────────
+  //
+  // Each leaf is a `pbt.pure(τ, show_ty)`; `oneOf` then samples uniformly.
+  // The renderer on the resulting `Gen<TypeExpr>` is taken from the first
+  // entry — they all share `show_ty`, so this is fine.
+  let g_i32: pbt.Gen<TypeExpr> = pbt.pure(x: TyI32, show: show_ty)
+  let g_i64: pbt.Gen<TypeExpr> = pbt.pure(x: TyI64, show: show_ty)
+  let g_f32: pbt.Gen<TypeExpr> = pbt.pure(x: TyF32, show: show_ty)
+  let g_f64: pbt.Gen<TypeExpr> = pbt.pure(x: TyF64, show: show_ty)
+  let g_bool: pbt.Gen<TypeExpr> = pbt.pure(x: TyBool, show: show_ty)
+  let g_char: pbt.Gen<TypeExpr> = pbt.pure(x: TyChar, show: show_ty)
+  let g_str: pbt.Gen<TypeExpr> = pbt.pure(x: TyString, show: show_ty)
+  let g_unit: pbt.Gen<TypeExpr> = pbt.pure(x: TyUnit, show: show_ty)
+  let g_intlit: pbt.Gen<TypeExpr> = pbt.pure(x: TyIntLit, show: show_ty)
+  let g_floatlit: pbt.Gen<TypeExpr> = pbt.pure(x: TyFloatLit, show: show_ty)
+
+  let scalar_gen: pbt.Gen<TypeExpr> = pbt.oneOf(gs: [
+    g_i32, g_i64, g_f32, g_f64, g_bool, g_char, g_str, g_unit,
+    g_intlit, g_floatlit
+  ])
+
+  // ── Compound generator at bounded depth ──────────────────────────────
+  //
+  // The depth parameter controls how deeply nested the resulting
+  // `TypeExpr` can be. We recurse via direct `Gen(run, shrink, render)`
+  // construction so the inner generator captures the next-depth gen
+  // without needing a recursive `let`. The shrinker is empty (compound
+  // shrinking is a follow-up — pbt.bounded_list etc. don't shrink type
+  // shapes).
+  let no_shrink_ty = fn (t: TypeExpr) -> [TypeExpr] do return [] end
+
+  // Depth 0: scalars only.
+  let depth0_gen: pbt.Gen<TypeExpr> = scalar_gen
+
+  // Depth-1 step: scalar OR list-of-scalar OR array-of-scalar OR
+  // record{f: scalar} OR arrow(scalar -> scalar) OR ref/linear/lazy of
+  // scalar. We compose each branch by lifting the inner `Gen<TypeExpr>`'s
+  // run-closure through a freshly-built outer Gen.
+  let mk_list = fn (inner: pbt.Gen<TypeExpr>) -> pbt.Gen<TypeExpr> do
+    return pbt.map(g: inner, f: fn (a: TypeExpr) -> TypeExpr do
+      return TyList(elem: a)
+    end, show: show_ty)
+  end
+  let mk_array = fn (inner: pbt.Gen<TypeExpr>) -> pbt.Gen<TypeExpr> do
+    return pbt.map(g: inner, f: fn (a: TypeExpr) -> TypeExpr do
+      return TyArray(elem: a)
+    end, show: show_ty)
+  end
+  let mk_ref = fn (inner: pbt.Gen<TypeExpr>) -> pbt.Gen<TypeExpr> do
+    return pbt.map(g: inner, f: fn (a: TypeExpr) -> TypeExpr do
+      return TyRef(inner: a)
+    end, show: show_ty)
+  end
+  let mk_linear = fn (inner: pbt.Gen<TypeExpr>) -> pbt.Gen<TypeExpr> do
+    return pbt.map(g: inner, f: fn (a: TypeExpr) -> TypeExpr do
+      return TyLinear(inner: a)
+    end, show: show_ty)
+  end
+  let mk_lazy = fn (inner: pbt.Gen<TypeExpr>) -> pbt.Gen<TypeExpr> do
+    return pbt.map(g: inner, f: fn (a: TypeExpr) -> TypeExpr do
+      return TyLazy(inner: a)
+    end, show: show_ty)
+  end
+  // Records always use field name "f" — keeps named-field unification
+  // succeeding when shapes match, so failures isolate to inner-type
+  // mismatches (the property we want to stress).
+  let mk_record = fn (inner: pbt.Gen<TypeExpr>) -> pbt.Gen<TypeExpr> do
+    return pbt.map(g: inner, f: fn (a: TypeExpr) -> TypeExpr do
+      return TyRecord(fields: [NamedType(name: "f", typ: a)])
+    end, show: show_ty)
+  end
+  // Arrows are always single-param `fn(x: A) -> B`, with both `requires`
+  // and `throw_row` set to `TyUnit` (a deliberately *non-row* simple
+  // scalar). Fine-grained row unification is out of scope per the bd
+  // task spec — we just need the arrow's structural unification to
+  // exercise nested unify recursion. Both A and B are independent draws;
+  // `pbt.bind` threads the seed correctly.
+  let mk_arrow = fn (inner_a: pbt.Gen<TypeExpr>, inner_b: pbt.Gen<TypeExpr>) -> pbt.Gen<TypeExpr> do
+    return pbt.bind(g: inner_a, f: fn (a: TypeExpr) -> pbt.Gen<TypeExpr> do
+      return pbt.map(g: inner_b, f: fn (b: TypeExpr) -> TypeExpr do
+        return TyArrow(
+          params: [NamedType(name: "x", typ: a)],
+          ret: b,
+          requires: TyUnit,
+          throw_row: TyUnit
+        )
+      end, show: show_ty)
+    end)
+  end
+
+  let depth1_gen: pbt.Gen<TypeExpr> = pbt.oneOf(gs: [
+    scalar_gen,
+    mk_list(inner: scalar_gen),
+    mk_array(inner: scalar_gen),
+    mk_ref(inner: scalar_gen),
+    mk_linear(inner: scalar_gen),
+    mk_lazy(inner: scalar_gen),
+    mk_record(inner: scalar_gen),
+    mk_arrow(inner_a: scalar_gen, inner_b: scalar_gen)
+  ])
+  let depth2_gen: pbt.Gen<TypeExpr> = pbt.oneOf(gs: [
+    scalar_gen,
+    mk_list(inner: depth1_gen),
+    mk_array(inner: depth1_gen),
+    mk_ref(inner: depth1_gen),
+    mk_record(inner: depth1_gen),
+    mk_arrow(inner_a: depth1_gen, inner_b: depth1_gen)
+  ])
+  let depth3_gen: pbt.Gen<TypeExpr> = pbt.oneOf(gs: [
+    scalar_gen,
+    mk_list(inner: depth2_gen),
+    mk_record(inner: depth2_gen),
+    mk_arrow(inner_a: depth2_gen, inner_b: depth2_gen)
+  ])
+  let ty_gen: pbt.Gen<TypeExpr> = depth3_gen
+
+  // ── Pair generator ───────────────────────────────────────────────────
+  //
+  // `pbt.bind` threads the seed so the two draws are independent.
+  let pair_gen: pbt.Gen<Pair<TypeExpr, TypeExpr> > = pbt.bind(g: ty_gen, f: fn (a: TypeExpr) -> pbt.Gen<Pair<TypeExpr, TypeExpr> > do
+    return pbt.map(g: ty_gen, f: fn (b: TypeExpr) -> Pair<TypeExpr, TypeExpr> do
+      return Pair(left: a, right: b)
+    end, show: show_pair)
+  end)
+  // `pbt.bind`'s renderer is "<bound>" by default — rebuild the Gen to
+  // attach our real `show_pair`. We pull the run/shrink fields out and
+  // attach the renderer manually so witnesses print as "(τ_1, τ_2)".
+  let Gen(run: pair_run, shrink: pair_shrink, render: _) = pair_gen
+  let pair_gen_shown: pbt.Gen<Pair<TypeExpr, TypeExpr> > = Gen(
+    run: pair_run,
+    shrink: pair_shrink,
+    render: show_pair
+  )
+
+  // ── Property 1: Termination (P7) ─────────────────────────────────────
+  //
+  // `unify` halts on every input. The predicate is `true` for every
+  // result-shape — we just need `forall` to complete. 250 iterations.
+  let p_term = fn (x: Pair<TypeExpr, TypeExpr>) -> bool do
+    let Pair(left: t1, right: t2) = x
+    let r = unify_mod.unify(t1, t2, tdefs: empty_tdefs())
+    let ok = match r do
+      | UnifyOk(subst: _) -> true
+      | UnifyErr(message: _) -> true
+    end
+    return ok
+  end
+  let r1 = pbt.forall(g: pair_gen_shown, prop: p_term, n: 250)
+  match r1 do
+    | Pass -> test_assert.assert_true(cond: true, label: "termination: forall completed")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false,
+        label: "termination forall unexpectedly returned Fail with witness " ++ w)
+  end
+
+  // ── Property 2: Symmetry (subset) ────────────────────────────────────
+  //
+  // For the type shapes we generate (no free TyVar, no `&` borrow),
+  // unify is symmetric on OK-ness. A failure here flags a real
+  // asymmetry bug — flag it in the report.
+  let p_sym = fn (x: Pair<TypeExpr, TypeExpr>) -> bool do
+    let Pair(left: t1, right: t2) = x
+    let a = unify_ok(t1, t2)
+    let b = unify_ok(t1: t2, t2: t1)
+    let ok = a == b
+    return ok
+  end
+  let r2 = pbt.forall(g: pair_gen_shown, prop: p_sym, n: 250)
+  match r2 do
+    | Pass -> test_assert.assert_true(cond: true, label: "symmetry: forall completed")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "symmetry forall returned Fail (witness=" ++ w ++ ", shrunk=" ++ s ++ ")")
+  end
+
+  // ── Property 3: Idempotence ──────────────────────────────────────────
+  //
+  // If `unify(t1, t2) = UnifyOk(σ)`, then `unify(σ t1, σ t2)` must also
+  // be Ok. Without free TyVars in the generated pool the substitution σ
+  // is always empty, but the property still exercises the round-trip
+  // path through subst_apply + re-unify. Pre-emptively returning `true`
+  // when the initial unify fails is correct: the implication has a
+  // vacuously-true antecedent.
+  let p_idem = fn (x: Pair<TypeExpr, TypeExpr>) -> bool do
+    let Pair(left: t1, right: t2) = x
+    let ok = match unify_mod.unify(t1, t2, tdefs: empty_tdefs()) do
+      | UnifyErr(message: _) -> true  // vacuous
+      | UnifyOk(subst: sigma) ->
+        let t1p = subst.subst_apply(subst: sigma, typ: t1)
+        let t2p = subst.subst_apply(subst: sigma, typ: t2)
+        match unify_mod.unify(t1: t1p, t2: t2p, tdefs: empty_tdefs()) do
+          | UnifyOk(subst: _) -> true
+          | UnifyErr(message: _) -> false
+        end
+    end
+    return ok
+  end
+  let r3 = pbt.forall(g: pair_gen_shown, prop: p_idem, n: 250)
+  match r3 do
+    | Pass -> test_assert.assert_true(cond: true, label: "idempotence: forall completed")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "idempotence forall returned Fail (witness=" ++ w ++ ", shrunk=" ++ s ++ ")")
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
