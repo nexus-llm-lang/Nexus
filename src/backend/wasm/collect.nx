@@ -112,6 +112,7 @@ let collect_func_strings = fn (func: LirFunction, acc: [string]) -> [string] do
   collect_atom_strings(atom: r, acc: collect_stmts_strings(stmts: b, acc))
 end
 
+/** Walk every function body and accumulate the values of every `LirAtomString` literal encountered, prepending into `acc`. Caller is responsible for dedup; pairs with `build_string_entries` to produce the wasm data segment. */
 export let collect_program_strings = fn (funcs: [LirFunction], acc: [string]) -> [string] do
   match funcs do
     | [] -> acc
@@ -169,6 +170,7 @@ let insert_sorted_string_go = fn (s: string, lst: [string], acc: [string]) -> [s
   end
 end
 
+/** Deduplicate `strings` (lexicographic sorted-list set) and lay them out at consecutive byte offsets starting at `next_offset`, producing one `StringEntry(value, offset, len)` per unique string in encounter order. The `acc` parameter is an in-progress accumulator threaded by the recursive worker. */
 export let build_string_entries = fn (strings: [string], next_offset: i64, acc: [StringEntry]) -> [StringEntry] do
   return build_string_entries_go(strings, next_offset, acc: [], seen: [])
 end
@@ -187,6 +189,7 @@ let build_string_entries_go = fn (strings: [string], next_offset: i64, acc: [Str
   end
 end
 
+/** Byte address immediately past the last `StringEntry` (i.e. `offset + slen` of the final entry); used to position the heap base right after the string-literal pool. Returns 0 for an empty list. */
 export let compute_last_string_end = fn (entries: [StringEntry]) -> i64 do
   match entries do
     | [] -> 0
@@ -235,6 +238,7 @@ let stmts_use_heap = fn (stmts: [LirStmt]) -> bool do
   end
 end
 
+/** True iff the program contains any LIR construct that allocates on the bump heap — constructors, records, object ops, string concat / add, or closure capture. Drives whether the wasm output needs a heap-pointer global and `memory.grow` plumbing. */
 export let program_uses_heap = fn (funcs: [LirFunction]) -> bool do
   match funcs do
     | [] -> false
@@ -274,6 +278,7 @@ let stmts_need_eh = fn (stmts: [LirStmt]) -> bool do
   end
 end
 
+/** True iff any `LirExprRaise` or `LirStmtTryCatch` appears anywhere in the program; codegen uses this to decide whether the wasm output should import the exception-handling extension's tag and emit `try_table`/`throw` instructions. */
 export let program_needs_eh = fn (funcs: [LirFunction]) -> bool do
   match funcs do
     | [] -> false
@@ -315,6 +320,7 @@ let stmts_need_ss = fn (stmts: [LirStmt]) -> bool do
   end
 end
 
+/** True iff the program contains any stack-switching construct (`suspend` / `resume` / `cont.new` / `inject` resume dispatch); gates emission of the stack-switching proposal's type table and runtime globals. */
 export let program_needs_stack_switching = fn (funcs: [LirFunction]) -> bool do
   match funcs do
     | [] -> false
@@ -413,6 +419,7 @@ let dedup_tags_go = fn (raw: [string], seen: StrMap<i64>, out_acc: [string]) -> 
   end
 end
 
+/** Walk the program for every `LirExprSuspend.tag_name` and `LirExprInjectResume.arm_tags` occurrence and return the deduped list in first-encounter order. Each entry needs its own wasm tag so resume `on tag_i → label_i` clauses can branch directly to the matching arm. */
 export let collect_program_tag_names = fn (funcs: [LirFunction]) -> [string] do
   // Phase 1: collect raw (with duplicates), in reverse-encounter order on `acc`.
   let raw = collect_program_tag_names_go(funcs, acc: [])
@@ -432,8 +439,7 @@ let collect_program_tag_names_go = fn (funcs: [LirFunction], acc: [string]) -> [
   end
 end
 
-// Build a `tag_name -> position` map for O(1) `lookup_tag_idx`. Position
-// matches the index that the prior linear scan would have returned.
+/** Build a `tag_name -> position` map for O(1) `lookup_tag_idx_map`; position is the index the prior linear scan would have returned. First-occurrence wins so the indexing matches `collect_program_tag_names`'s ordering. */
 export let build_tag_idx_map = fn (tag_names: [string]) -> StrMap<i64> do
   return build_tag_idx_map_go(tag_names, idx: 0, acc: smap.empty())
 end
@@ -483,6 +489,7 @@ let ext_params_use_string = fn (params: [LirParam]) -> bool do
   end
 end
 
+/** Number of wasm parameter slots an external import consumes: strings and arrays cost 2 slots each (ptr + len), every other type costs 1. Drives the type-section signature emission for imports. */
 export let count_ext_param_slots = fn (params: [LirParam]) -> i64 do
   match params do
     | [] -> 0
@@ -535,6 +542,7 @@ export type MemoryMode =
   | MemoryDefined
   | MemoryImported(name: string)
 
+/** Decide whether the wasm module needs no memory, defines its own, or imports one (and from where). Imports `env.memory` for any program that uses strings, the heap, or a component-style string ABI — required by WASI threads so workers share a host-created memory; nexus-std externals carry their own import-module name. */
 export let choose_memory_mode = fn (externals: [LirExternal], has_strings: bool, has_heap: bool) -> MemoryMode do
   match find_string_abi_module(exts: externals) do
     | None ->
@@ -586,12 +594,14 @@ export let needs_cabi_realloc = fn (exts: [LirExternal]) -> bool do
   end
 end
 
+/** Round `v` up to the next multiple of 8; used to keep data-segment offsets and heap allocations 8-byte aligned (the natural i64 boundary). */
 export let align8 = fn (v: i64) -> i64 do
   return (v + 7) / 8 * 8
 end
 
 // ─── Local variable collection ──────────────────────────────────────────────
 
+/** Register a local under `name`, allocating a fresh wasm local index when the name is unseen and widening the existing slot to i64 when a same-name binding shows up later with a different valtype. Returns the updated `(locals, next_idx, local_map)` triple; `TyUnit` locals are skipped because they consume no stack slot. */
 export let register_local = fn (name: string, typ: TypeExpr, locals: [LocalEntry], next_idx: i64, local_map: %HashMap)
     -> LocalResult do
   if wdefs.is_unit(typ) then
@@ -617,8 +627,10 @@ export let register_local = fn (name: string, typ: TypeExpr, locals: [LocalEntry
   return LocalResult(locals: wdefs.widen_local(name, new_vt: 126, entries: locals), next_idx, %local_map)
 end
 
+/** Carrier for `register_local` / `collect_local_stmts`: the accumulated `LocalEntry` list (newest-first), the next free wasm local index, and the linear `name → packed(index,valtype)` hashmap. Linear in the last field so consumers must thread the value through. */
 export type LocalResult = LocalResult(locals: [LocalEntry], next_idx: i64, local_map: %HashMap)
 
+/** Walk `stmts` and register every `let`-bound name plus every `try_catch` catch-param via `register_local`. Recurses into nested if/loop/try arms; the same `LocalResult` triple is threaded through so all sibling arms share one index space. */
 export let collect_local_stmts = fn (stmts: [LirStmt], locals: [LocalEntry], next_idx: i64, local_map: %HashMap)
     -> LocalResult do
   match stmts do
