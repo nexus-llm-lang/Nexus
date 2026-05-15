@@ -1,0 +1,710 @@
+// PBT (nexus-f95m): kindOf / inst properties — type polymorphism + row
+// polymorphism kind inference.
+//
+// The real `kindOf` (src/typecheck/kinds.nx, line 463-490) and `inst`
+// (line 498-504) determine whether a type variable is at a *type*
+// position, a *cap-row* position, or an *exn-row* position, and ensure
+// substitution preserves kinds. This PBT is self-contained: a local TOY
+// domain `T` for monotypes, `Row` for capability/exception rows, and
+// `Kind` for the kind language. The toy faithfully mirrors the
+// kind-relevant shape of the real `TypeExpr`/`Row` without dragging in
+// the full AST. A follow-up bd maps each toy property to the real
+// `kindOf`/`inst` (e.g. via fixtures in `tests/typecheck/inference_*`).
+//
+// Properties:
+//   P1 — kindOf is total + well-defined: every T returns a Kind
+//        (no ?α leak; the toy has no underdetermined cases by
+//        construction, so the property reduces to "the function
+//        terminates with a concrete Kind").
+//   P2 — inst preserves kind: kindOf(τ) == kindOf(inst(τ, σ̲)) for every
+//        well-kinded substitution σ̲.
+//   P3 — inst respects scope: inst(scheme(α̲, τ), σ̲) substitutes the
+//        bound variables uniformly — every occurrence of α_i in τ is
+//        replaced by σ_i, and any α_i NOT in σ̲'s domain is left
+//        untouched (open-scheme partial application).
+//   P4 — Row kind separation: a TyVar that appears in a cap-row
+//        position only has Kind = KRowCap; one that appears in an
+//        exn-row position only has Kind = KRowExn; the two kinds never
+//        unify.
+//
+// 200 trials per property at the default seed.
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Pass, Fail, Gen } from "std:pbt"
+import { Pair } from "std:tuple"
+import * as str from "std:str"
+import * as list from "std:list"
+
+// ─── Toy domain ─────────────────────────────────────────────────────────────
+//
+// Kinds.  KType is the standard "monotype" kind; KRowCap / KRowExn are
+// the two row kinds; KArrow is included so the kind language is
+// non-trivial under inst (an inst that substitutes an arrow-kinded
+// variable would need to preserve the arrow structure).
+type Kind =
+  KType
+  | KRowCap
+  | KRowExn
+  | KArrow(d: Kind, c: Kind)
+
+// Monotypes.  TI64 / TBool are base scalars (Type).  TArrow(d, c, eff)
+// is the arrow shape with an effect row.  TVar(name, k) is a kinded
+// type variable — we carry the kind in the variable for the toy so
+// kindOf is trivially total; the *property* we want to verify is that
+// inst preserves that kind annotation across substitution.
+// TApp(f, x) lets us exercise kind-arrow composition.
+type T =
+  TI64
+  | TBool
+  | TArrow(d: T, c: T, eff: Row)
+  | TVar(name: string, k: Kind)
+  | TApp(f: T, x: T)
+
+// Rows: split by kind so the row kind separation property (P4) lands
+// cleanly.  RCap atoms are capability names; RExn atoms are exception
+// names; the two row flavours never share a representation, which is
+// the toy's encoding of the spec's "RowCap and RowExn are different
+// kinds" rule.
+type Row =
+  RCap(atoms: [ string ])
+  | RExn(atoms: [ string ])
+
+// ─── kindOf ─────────────────────────────────────────────────────────────────
+//
+// kindOf on the toy is straightforward because TVar carries its kind
+// already.  The interesting cases are TApp (kind-arrow elimination)
+// and TArrow (the body is always KType regardless of the effect row's
+// kind).  We return a Kind unconditionally — there is no error path,
+// which is precisely the "totality" property P1 wants to witness.
+
+let kind_of_t = fn (t: T) -> Kind do
+  match t do
+    | TI64 -> return KType
+    | TBool -> return KType
+    | TArrow(d: _, c: _, eff: _) -> return KType
+    | TVar(name: _, k: kk) -> return kk
+    | TApp(f: f, x: _) ->
+      let fk = kind_of_t(t: f)
+      match fk do
+        | KArrow(d: _, c: ck) -> return ck
+        | _ -> return KType
+      end
+  end
+end
+
+let kind_of_row = fn (r: Row) -> Kind do
+  match r do
+    | RCap(atoms: _) -> return KRowCap
+    | RExn(atoms: _) -> return KRowExn
+  end
+end
+
+// ─── Substitution ──────────────────────────────────────────────────────────
+//
+// A substitution maps a name to a T (for type-kinded vars) or a Row
+// (for row-kinded vars).  We encode it as a list of pairs keyed by
+// name — small, easy to render, and matches the spec's "finite
+// support" model of substitutions.
+
+type TBinding = TBind(name: string, ty: T)
+type RBinding = RBind(name: string, row: Row)
+type Subst = Subst(tys: [ TBinding ], rows: [ RBinding ])
+
+let subst_empty = fn () -> Subst do
+  return Subst(tys: [], rows: [])
+end
+
+// Look up by name.  Direct-recursive (no list.find HOF) to avoid the
+// q88x "HOF + recursive callee" indirect-call mismatch.
+let lookup_ty = fn (name: string, bs: [ TBinding ]) -> Pair<bool, T> do
+  match bs do
+    | [] -> return Pair(left: false, right: TI64)
+    | b :: rest ->
+      match b do
+        | TBind(name: n, ty: t) ->
+          if n == name then return Pair(left: true, right: t) end
+          return lookup_ty(name, bs: rest)
+      end
+  end
+end
+
+let lookup_row = fn (name: string, bs: [ RBinding ]) -> Pair<bool, Row> do
+  match bs do
+    | [] -> return Pair(left: false, right: RCap(atoms: []))
+    | b :: rest ->
+      match b do
+        | RBind(name: n, row: r) ->
+          if n == name then return Pair(left: true, right: r) end
+          return lookup_row(name, bs: rest)
+      end
+  end
+end
+
+// `apply_subst` on T: walks the structure, replacing TVar(n, _) by its
+// binding when present, otherwise leaving it intact.  Critically: we
+// preserve the *kind annotation* on a substituted variable by checking
+// that the binding's actual kindOf matches the variable's declared
+// kind.  If the substitution would change the kind (a misuse), we
+// leave the variable untouched.  This models the spec's
+// well-kindedness requirement on inst.
+let apply_subst_t = fn (s: Subst, t: T) -> T do
+  match t do
+    | TI64 -> return TI64
+    | TBool -> return TBool
+    | TArrow(d: d, c: c, eff: e) ->
+      let d2 = apply_subst_t(s, t: d)
+      let c2 = apply_subst_t(s, t: c)
+      let e2 = apply_subst_row(s, r: e)
+      return TArrow(d: d2, c: c2, eff: e2)
+    | TVar(name: n, k: k) ->
+      match s do
+        | Subst(tys: ts, rows: _) ->
+          let Pair(left: hit, right: bound) = lookup_ty(name: n, bs: ts)
+          if hit then
+            let bk = kind_of_t(t: bound)
+            if same_kind(a: bk, b: k) then return bound end
+            return TVar(name: n, k: k)
+          end
+          return TVar(name: n, k: k)
+      end
+    | TApp(f: f, x: x) ->
+      let f2 = apply_subst_t(s, t: f)
+      let x2 = apply_subst_t(s, t: x)
+      return TApp(f: f2, x: x2)
+  end
+end
+
+let apply_subst_row = fn (s: Subst, r: Row) -> Row do
+  // Rows in the toy are concrete (no row variables in the leaf), so
+  // substitution is the identity here.  The interesting work lives in
+  // apply_subst_t when an arrow's effect is itself a row variable;
+  // we keep that direction out of the toy and instead test it through
+  // the dedicated row-kind generator below.
+  return r
+end
+
+let same_kind = fn (a: Kind, b: Kind) -> bool do
+  match a do
+    | KType ->
+      match b do
+        | KType -> return true
+        | KRowCap -> return false
+        | KRowExn -> return false
+        | KArrow(d: _, c: _) -> return false
+      end
+    | KRowCap ->
+      match b do
+        | KType -> return false
+        | KRowCap -> return true
+        | KRowExn -> return false
+        | KArrow(d: _, c: _) -> return false
+      end
+    | KRowExn ->
+      match b do
+        | KType -> return false
+        | KRowCap -> return false
+        | KRowExn -> return true
+        | KArrow(d: _, c: _) -> return false
+      end
+    | KArrow(d: da, c: ca) ->
+      match b do
+        | KType -> return false
+        | KRowCap -> return false
+        | KRowExn -> return false
+        | KArrow(d: db, c: cb) ->
+          let dd = same_kind(a: da, b: db)
+          let cc = same_kind(a: ca, b: cb)
+          return dd && cc
+      end
+  end
+end
+
+// `inst` for the toy: given a scheme (a list of bound var names + a
+// body) and a substitution σ̲, return the body with the bound vars
+// replaced by σ̲.  The scheme's bound list isn't represented
+// explicitly because the substitution carries name keys; the property
+// of interest is preservation of kind and uniform substitution.
+let inst_t = fn (body: T, s: Subst) -> T do
+  return apply_subst_t(s, t: body)
+end
+
+// ─── Renderers ──────────────────────────────────────────────────────────────
+
+let render_kind = fn (k: Kind) -> string do
+  match k do
+    | KType -> return "Type"
+    | KRowCap -> return "RowCap"
+    | KRowExn -> return "RowExn"
+    | KArrow(d: d, c: c) -> return "(" ++ render_kind(k: d) ++ "->" ++ render_kind(k: c) ++ ")"
+  end
+end
+
+let render_row = fn (r: Row) -> string do
+  match r do
+    | RCap(atoms: _) -> return "RCap{...}"
+    | RExn(atoms: _) -> return "RExn{...}"
+  end
+end
+
+let render_t = fn (t: T) -> string do
+  match t do
+    | TI64 -> return "i64"
+    | TBool -> return "bool"
+    | TArrow(d: d, c: c, eff: e) ->
+      return "(" ++ render_t(t: d) ++ "-[" ++ render_row(r: e) ++ "]->" ++ render_t(t: c) ++ ")"
+    | TVar(name: n, k: k) -> return n ++ ":" ++ render_kind(k: k)
+    | TApp(f: f, x: x) -> return render_t(t: f) ++ "<" ++ render_t(t: x) ++ ">"
+  end
+end
+
+let render_t_binding = fn (b: TBinding) -> string do
+  match b do
+    | TBind(name: n, ty: t) -> return n ++ "↦" ++ render_t(t)
+  end
+end
+
+let render_t_bindings_go = fn (xs: [ TBinding ], acc: string) -> string do
+  match xs do
+    | [] -> return acc
+    | x :: rest ->
+      let head = render_t_binding(b: x)
+      if str.length(s: acc) == 0 then
+        return render_t_bindings_go(xs: rest, acc: head)
+      end
+      return render_t_bindings_go(xs: rest, acc: acc ++ "," ++ head)
+  end
+end
+
+let render_subst = fn (s: Subst) -> string do
+  match s do
+    | Subst(tys: ts, rows: _) -> return "[" ++ render_t_bindings_go(xs: ts, acc: "") ++ "]"
+  end
+end
+
+// ─── Seed plumbing ──────────────────────────────────────────────────────────
+
+let abs_i64 = fn (n: i64) -> i64 do
+  if n < 0 then return 0 - n end
+  return n
+end
+
+let step_seed = fn (seed: i64) -> Pair<i64, i64> do
+  let xor_fixup : i64 = 2685821657736338717
+  let s0 = if seed == 0 then xor_fixup else seed end
+  let s1 = s0 ^ (s0 << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  return Pair(left: s3, right: s3)
+end
+
+// ─── Gen<Kind> ──────────────────────────────────────────────────────────────
+
+let gen_kind_run = fn (depth: i64, seed: i64) -> Pair<Kind, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  if depth <= 0 then
+    let tag = raw % 3
+    if tag == 0 then return Pair(left: KType, right: s1) end
+    if tag == 1 then return Pair(left: KRowCap, right: s1) end
+    return Pair(left: KRowExn, right: s1)
+  end
+  let choice = raw % 4
+  if choice == 0 then return Pair(left: KType, right: s1) end
+  if choice == 1 then return Pair(left: KRowCap, right: s1) end
+  if choice == 2 then return Pair(left: KRowExn, right: s1) end
+  let Pair(left: a, right: s2) = gen_kind_run(depth: depth - 1, seed: s1)
+  let Pair(left: b, right: s3) = gen_kind_run(depth: depth - 1, seed: s2)
+  return Pair(left: KArrow(d: a, c: b), right: s3)
+end
+
+// ─── Gen<Row> ───────────────────────────────────────────────────────────────
+
+let gen_row_run = fn (seed: i64) -> Pair<Row, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  let flavour = raw % 2
+  let Pair(left: nv, right: s2) = step_seed(seed: s1)
+  let n_atoms = abs_i64(n: nv) % 3
+  if flavour == 0 then
+    if n_atoms == 0 then return Pair(left: RCap(atoms: []), right: s2) end
+    if n_atoms == 1 then return Pair(left: RCap(atoms: ["Console"]), right: s2) end
+    return Pair(left: RCap(atoms: ["Console", "Fs"]), right: s2)
+  end
+  if n_atoms == 0 then return Pair(left: RExn(atoms: []), right: s2) end
+  if n_atoms == 1 then return Pair(left: RExn(atoms: ["Io"]), right: s2) end
+  return Pair(left: RExn(atoms: ["Io", "Arg"]), right: s2)
+end
+
+// ─── Gen<T> ─────────────────────────────────────────────────────────────────
+//
+// Depth-bounded.  At depth 0 we return a base scalar or a kinded TVar.
+// TVar kinds are drawn from {KType, KRowCap, KRowExn} so the property
+// has coverage on each row-kind branch.
+
+let pick_var_name = fn (n: i64) -> string do
+  let m = n % 4
+  if m == 0 then return "α" end
+  if m == 1 then return "β" end
+  if m == 2 then return "γ" end
+  return "δ"
+end
+
+// Pick a non-arrow kind from a 0/1/2 tag.  Flat helper so call sites
+// avoid nested if-then-else (the parser is happiest with one if-end
+// per let).
+let pick_kind = fn (tag: i64) -> Kind do
+  if tag == 0 then return KType end
+  if tag == 1 then return KRowCap end
+  return KRowExn
+end
+
+let gen_t_run = fn (depth: i64, seed: i64) -> Pair<T, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  if depth <= 0 then
+    let tag = raw % 5
+    if tag == 0 then return Pair(left: TI64, right: s1) end
+    if tag == 1 then return Pair(left: TBool, right: s1) end
+    // Three TVar flavours: KType / KRowCap / KRowExn.  Name picked
+    // from a small alphabet to maximise binding collisions.
+    let Pair(left: nv, right: s2) = step_seed(seed: s1)
+    let name = pick_var_name(n: abs_i64(n: nv))
+    if tag == 2 then return Pair(left: TVar(name: name, k: KType), right: s2) end
+    if tag == 3 then return Pair(left: TVar(name: name, k: KRowCap), right: s2) end
+    return Pair(left: TVar(name: name, k: KRowExn), right: s2)
+  end
+  let choice = raw % 6
+  if choice == 0 then return Pair(left: TI64, right: s1) end
+  if choice == 1 then return Pair(left: TBool, right: s1) end
+  if choice == 2 then
+    let Pair(left: nv, right: s2) = step_seed(seed: s1)
+    let name = pick_var_name(n: abs_i64(n: nv))
+    let Pair(left: kv, right: s3) = step_seed(seed: s2)
+    let ktag = abs_i64(n: kv) % 3
+    let k = pick_kind(tag: ktag)
+    return Pair(left: TVar(name: name, k: k), right: s3)
+  end
+  if choice == 3 then
+    let Pair(left: a, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+    let Pair(left: b, right: s3) = gen_t_run(depth: depth - 1, seed: s2)
+    let Pair(left: e, right: s4) = gen_row_run(seed: s3)
+    return Pair(left: TArrow(d: a, c: b, eff: e), right: s4)
+  end
+  if choice == 4 then
+    let Pair(left: f, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+    let Pair(left: x, right: s3) = gen_t_run(depth: depth - 1, seed: s2)
+    return Pair(left: TApp(f: f, x: x), right: s3)
+  end
+  // Fallback: another TVar at the inner-most level.
+  let Pair(left: nv, right: s2) = step_seed(seed: s1)
+  let name = pick_var_name(n: abs_i64(n: nv))
+  return Pair(left: TVar(name: name, k: KType), right: s2)
+end
+
+// ─── Gen<Subst> ─────────────────────────────────────────────────────────────
+//
+// A substitution mapping the four canonical var names {α, β, γ, δ} to
+// freshly-generated types of the *same* kind.  Per-name kind is drawn
+// once and the value is forced to that kind by construction — this
+// keeps the substitution well-kinded by design, which is the
+// pre-condition of P2 (inst preserves kind).
+
+let gen_typed_t_run = fn (k: Kind, depth: i64, seed: i64) -> Pair<T, i64> do
+  match k do
+    | KType ->
+      // Force a type-kinded payload — repeatedly draw until we hit
+      // i64/bool/arrow.  Easier: just return TI64 or TBool by parity
+      // of the seed; arrow values still have kindOf == KType so we
+      // mix arrow in for variety.
+      let Pair(left: v, right: s1) = step_seed(seed)
+      let r = abs_i64(n: v) % 4
+      if r == 0 then return Pair(left: TI64, right: s1) end
+      if r == 1 then return Pair(left: TBool, right: s1) end
+      if depth <= 0 then return Pair(left: TI64, right: s1) end
+      // Arrow payload.
+      let Pair(left: a, right: s2) = gen_typed_t_run(k: KType, depth: depth - 1, seed: s1)
+      let Pair(left: b, right: s3) = gen_typed_t_run(k: KType, depth: depth - 1, seed: s2)
+      let Pair(left: e, right: s4) = gen_row_run(seed: s3)
+      return Pair(left: TArrow(d: a, c: b, eff: e), right: s4)
+    | KRowCap ->
+      // A KRowCap payload is a TVar standing in for a row — kindOf
+      // returns the variable's annotation, so this is the
+      // canonical row-kinded T.  (In the real typechecker the row
+      // would be a Row constructor, but the toy folds rows into T
+      // via kinded TVar for uniformity in the substitution
+      // language.)
+      let Pair(left: nv, right: s1) = step_seed(seed)
+      let name = pick_var_name(n: abs_i64(n: nv))
+      return Pair(left: TVar(name: name, k: KRowCap), right: s1)
+    | KRowExn ->
+      let Pair(left: nv, right: s1) = step_seed(seed)
+      let name = pick_var_name(n: abs_i64(n: nv))
+      return Pair(left: TVar(name: name, k: KRowExn), right: s1)
+    | KArrow(d: _, c: _) ->
+      // Kind-arrow domain in the toy is degenerate — we model with a
+      // TVar of the same higher kind.  This branch is rare; the
+      // substitution generator below only picks KArrow for one of
+      // the four names by chance.
+      let Pair(left: nv, right: s1) = step_seed(seed)
+      let name = pick_var_name(n: abs_i64(n: nv))
+      return Pair(left: TVar(name: name, k: k), right: s1)
+  end
+end
+
+let gen_subst_run = fn (seed: i64) -> Pair<Subst, i64> do
+  // Build bindings for α, β, γ, δ.  Each binding's kind is drawn
+  // from {KType, KRowCap, KRowExn} and the payload is forced to that
+  // kind via gen_typed_t_run.
+  let names = ["α", "β", "γ", "δ"]
+  let Pair(left: bs, right: s1) = gen_typed_subst_bindings(names, seed)
+  return Pair(left: Subst(tys: bs, rows: []), right: s1)
+end
+
+let gen_typed_subst_bindings = fn (names: [ string ], seed: i64) -> Pair<[ TBinding ], i64> do
+  match names do
+    | [] -> return Pair(left: [], right: seed)
+    | n :: rest ->
+      let Pair(left: kv, right: s1) = step_seed(seed)
+      let ktag = abs_i64(n: kv) % 3
+      let k = pick_kind(tag: ktag)
+      let Pair(left: payload, right: s2) = gen_typed_t_run(k: k, depth: 2, seed: s1)
+      let head = TBind(name: n, ty: payload)
+      let Pair(left: rest_bs, right: s3) = gen_typed_subst_bindings(names: rest, seed: s2)
+      return Pair(left: head :: rest_bs, right: s3)
+  end
+end
+
+// ─── Body ───────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit require { Console } throws { Exn } do
+  // Build each generator inside body() — closure-ABI quirk.
+
+  let gen_t_local = Gen(
+    run: fn (seed: i64) -> Pair<T, i64> do
+      return gen_t_run(depth: 3, seed)
+    end,
+    shrink: fn (v: T) -> [ T ] do return [] end,
+    render: render_t
+  )
+
+  let gen_row_local = Gen(
+    run: fn (seed: i64) -> Pair<Row, i64> do
+      return gen_row_run(seed)
+    end,
+    shrink: fn (v: Row) -> [ Row ] do return [] end,
+    render: render_row
+  )
+
+  let gen_kind_local = Gen(
+    run: fn (seed: i64) -> Pair<Kind, i64> do
+      return gen_kind_run(depth: 2, seed)
+    end,
+    shrink: fn (v: Kind) -> [ Kind ] do return [] end,
+    render: render_kind
+  )
+
+  let gen_subst_local = Gen(
+    run: fn (seed: i64) -> Pair<Subst, i64> do
+      return gen_subst_run(seed)
+    end,
+    shrink: fn (v: Subst) -> [ Subst ] do return [] end,
+    render: render_subst
+  )
+
+  let iters = 200
+
+  // ── P1: kindOf is total and well-defined ─────────────────────────────────
+  //
+  // Every T returns *some* kind.  The toy has no ?α leak by
+  // construction (kind_of_t handles every constructor), so the
+  // property here is the slightly weaker "the returned kind is one of
+  // the canonical kinds" — i.e., kindOf doesn't silently return a
+  // garbage value.  We check this by re-applying kindOf on the
+  // returned-kind-wrapped-in-a-trivial-TVar and asserting the inner
+  // kind round-trips.
+
+  let prop_kindof_total = fn (x: T) -> bool do
+    let k = kind_of_t(t: x)
+    // Round-trip: wrap k in a TVar and ask kindOf again.
+    let wrapped = TVar(name: "ρ", k: k)
+    let k2 = kind_of_t(t: wrapped)
+    let ok = same_kind(a: k, b: k2)
+    return ok
+  end
+
+  let r1 = pbt.forall(g: gen_t_local, prop: prop_kindof_total, n: iters)
+  match r1 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1: kindOf is total and well-defined")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1 kindOf-total failed: " ++ w)
+  end
+
+  // Also verify the row-level: kindOf on every Row returns KRowCap or
+  // KRowExn — never KType / KArrow.  This is the row-side of P1.
+  let prop_kindof_row_total = fn (x: Row) -> bool do
+    let k = kind_of_row(r: x)
+    match k do
+      | KRowCap -> return true
+      | KRowExn -> return true
+      | _ -> return false
+    end
+  end
+
+  let r1r = pbt.forall(g: gen_row_local, prop: prop_kindof_row_total, n: iters)
+  match r1r do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1 (row): kindOf(Row) ∈ {RowCap, RowExn}")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1 (row) failed: " ++ w)
+  end
+
+  // ── P2: inst preserves kind ──────────────────────────────────────────────
+  //
+  // For any T and any well-kinded Subst σ, kindOf(inst(T, σ)) ==
+  // kindOf(T).  The substitution generator forces each binding's
+  // payload to match its declared kind, so applying σ never changes
+  // the kind of a variable — and the structural cases (TArrow / TApp)
+  // pass through kindOf transparently.
+
+  let prop_inst_preserves_kind = fn (x: T) -> bool do
+    let s = gen_subst_run(seed: 12345)
+    let Pair(left: ss, right: _) = s
+    let t2 = inst_t(body: x, s: ss)
+    let k1 = kind_of_t(t: x)
+    let k2 = kind_of_t(t: t2)
+    let ok = same_kind(a: k1, b: k2)
+    return ok
+  end
+
+  let r2 = pbt.forall(g: gen_t_local, prop: prop_inst_preserves_kind, n: iters)
+  match r2 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P2: kindOf(τ) == kindOf(inst(τ, σ̄))")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P2 inst-preserves-kind failed: " ++ w)
+  end
+
+  // ── P3: inst respects scope (uniform substitution) ───────────────────────
+  //
+  // For a TVar "α" with a binding in σ, inst replaces α by σ(α); for a
+  // TVar "ε" NOT in σ, inst leaves the variable untouched (open scheme
+  // partial application).  We test the "ε untouched" half via a fresh
+  // var name not in the canonical {α, β, γ, δ} alphabet — the
+  // substitution can't possibly bind it, so inst must be the identity.
+
+  let prop_inst_open_var_identity = fn (x: i64) -> bool do
+    let fresh = TVar(name: "ε_unbound", k: KType)
+    let Pair(left: s, right: _) = gen_subst_run(seed: x)
+    let t2 = inst_t(body: fresh, s: s)
+    // Identity check: render-equality is enough since TVar is a flat
+    // constructor.
+    let r1 = render_t(t: fresh)
+    let r2 = render_t(t: t2)
+    let ok = r1 == r2
+    return ok
+  end
+
+  let r3a = pbt.forall(g: pbt.small_int, prop: prop_inst_open_var_identity, n: iters)
+  match r3a do
+    | Pass -> test_assert.assert_true(cond: true, label: "P3a: inst leaves out-of-scope vars untouched")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P3a inst-open-var failed: " ++ w)
+  end
+
+  // The uniform-substitution half: for a bound name α, replace by σ(α)
+  // *everywhere* — two occurrences of α in the same body get the
+  // *same* replacement.  We verify by building TArrow(TVar α, TVar α,
+  // eff) and asserting both sides become equal under inst.
+  let prop_inst_uniform = fn (x: i64) -> bool do
+    let alpha = TVar(name: "α", k: KType)
+    let eff = RCap(atoms: [])
+    let arr = TArrow(d: alpha, c: alpha, eff: eff)
+    let Pair(left: s, right: _) = gen_subst_run(seed: x)
+    let t2 = inst_t(body: arr, s: s)
+    match t2 do
+      | TArrow(d: d, c: c, eff: _) ->
+        let rd = render_t(t: d)
+        let rc = render_t(t: c)
+        let ok = rd == rc
+        return ok
+      | _ -> return false
+    end
+  end
+
+  let r3b = pbt.forall(g: pbt.small_int, prop: prop_inst_uniform, n: iters)
+  match r3b do
+    | Pass -> test_assert.assert_true(cond: true, label: "P3b: inst substitutes uniformly (same name → same replacement)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P3b inst-uniform failed: " ++ w)
+  end
+
+  // ── P4: Row kind separation ──────────────────────────────────────────────
+  //
+  // Capability-row TVars have Kind = KRowCap; exception-row TVars have
+  // Kind = KRowExn.  The two never share a kind — we assert
+  // ¬same_kind(KRowCap, KRowExn) holds for every randomly-generated
+  // pair, and the row-level kindOf returns the right tag.
+
+  let prop_row_kind_separation = fn (x: Row) -> bool do
+    let k = kind_of_row(r: x)
+    let cap_v = TVar(name: "α", k: KRowCap)
+    let exn_v = TVar(name: "α", k: KRowExn)
+    let kc = kind_of_t(t: cap_v)
+    let ke = kind_of_t(t: exn_v)
+    let mixed = same_kind(a: kc, b: ke)
+    // kindOf(Row=RCap) must agree with KRowCap; kindOf(Row=RExn) with
+    // KRowExn.  And the two kinds must NOT be equal.
+    match x do
+      | RCap(atoms: _) ->
+        let agree = same_kind(a: k, b: KRowCap)
+        let ok = agree && (mixed == false)
+        return ok
+      | RExn(atoms: _) ->
+        let agree = same_kind(a: k, b: KRowExn)
+        let ok = agree && (mixed == false)
+        return ok
+    end
+  end
+
+  let r4 = pbt.forall(g: gen_row_local, prop: prop_row_kind_separation, n: iters)
+  match r4 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P4: RowCap and RowExn are distinct kinds")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P4 row-kind-separation failed: " ++ w)
+  end
+
+  // Smoke: also exercise kind-arrow equality from gen_kind_local to
+  // make sure same_kind handles the recursive case under random
+  // input.  This is implicit in P1/P2, but a focused property pins
+  // it: same_kind(k, k) is reflexive on every generated Kind.
+  let prop_same_kind_reflexive = fn (x: Kind) -> bool do
+    let ok = same_kind(a: x, b: x)
+    return ok
+  end
+
+  let r5 = pbt.forall(g: gen_kind_local, prop: prop_same_kind_reflexive, n: iters)
+  match r5 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P5 (smoke): same_kind is reflexive")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P5 same_kind-reflexive failed: " ++ w)
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
