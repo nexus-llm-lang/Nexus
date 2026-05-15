@@ -11,7 +11,7 @@ against [`index.schema.json`](./index.schema.json)).
 | --- | --- | --- |
 | `examples/` (root) | Historical end-to-end samples (hello, fib, bench) | 7 |
 | `examples/feature/` | One minimal example per language feature / stdlib module | 38 |
-| `examples/negative/` | Intentionally broken snippets; runner asserts the diagnostic | 10 |
+| `examples/negative/` | Intentionally broken snippets; runner asserts the diagnostic (compile-time *or* runtime throw) | 10 |
 
 Total: **55 examples**. See [`negative/run.sh`](./negative/run.sh) for
 the negative-corpus driver.
@@ -83,24 +83,45 @@ the negative-corpus driver.
 
 ## Negative examples
 
-Each fixture under `examples/negative/` begins with header directives:
+Each fixture under `examples/negative/` declares its expected failure
+mode through one of two header-comment flavors.
+
+### Flavor A — compile-time diagnostic
 
 ```
 // expect-fail: E2007            (required; the diagnostic code)
 // expect-msg: linear binding    (optional; repeatable substring assertion)
 ```
 
-Run them with:
+The runner asserts the fixture (a) fails to compile, (b) reports the
+declared code in the diagnostic, and (c) contains every declared
+substring.
+
+### Flavor B — runtime throw (added in fl9t.1)
+
+```
+// expect-runtime-throw: before unwrap   (required; ≥1; substring assertion
+//                                         against the combined run output)
+// expect-msg: optional extra            (optional; treated as additional
+//                                         substring assertions)
+```
+
+The runner asserts the fixture (a) compiles successfully, (b) exits
+non-zero under `nexus run`, and (c) every declared substring appears in
+the combined stdout+stderr. wasmtime does not surface the exception
+constructor on stderr, so fixtures typically anchor their assertion on
+a `println` line emitted just before the throwing site.
+
+### Run
 
 ```sh
 ./examples/negative/run.sh                 # walks examples/negative/
 ./examples/negative/run.sh <other-dir>     # walks another directory
 ```
 
-The runner asserts each fixture (a) fails to compile, (b) reports the
-declared code, and (c) contains every declared substring.
+### Corpus
 
-| File | Code | Demonstrates |
+| File | Mode | Demonstrates |
 | --- | --- | --- |
 | [`negative/linear_unused.nx`](./negative/linear_unused.nx) | E2007 | `%`-binding falls out of scope unconsumed |
 | [`negative/lazy_unforced.nx`](./negative/lazy_unforced.nx) | E2005 | `@`-binding is never forced |
