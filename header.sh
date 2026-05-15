@@ -455,18 +455,34 @@ if [ "$TEST_MODE" = "1" ]; then
       # parsing the first ULEB byte (count <= 127 fits in one byte, which
       # covers any realistic test fixture).
       cov_count=$(wasm-tools print "$wasm" 2>/dev/null \
-        | awk '/@custom "nx.coverage.functions"/ {
+        | awk 'BEGIN {
+            # Build a printable-ASCII char -> byte-value lookup. awk lacks
+            # ord(); index() against a single string of all printable bytes
+            # (0x20-0x7E) gives us the value as (index - 1 + 0x20).
+            # Backslash (0x5C) is kept in-slot so indexes stay aligned, even
+            # though the escape branch handles that case separately.
+            printable = " !\"#$%&'\''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+          }
+          /@custom "nx.coverage.functions"/ {
             # Extract content between the first and last quote on the line.
             line = $0
             sub(/^[^"]*"nx.coverage.functions"[^"]*"/, "", line)
             # The first byte (escaped or raw) encodes the function count.
-            if (substr(line, 1, 1) == "\\") {
+            first = substr(line, 1, 1)
+            if (first == "\\") {
               # \xx hex form
               hex = substr(line, 2, 2)
               print strtonum("0x" hex)
             } else {
-              # raw byte (printable). Convert via printf - awk lacks ord().
-              printf "%d\n", 0
+              # raw byte (printable, 0x20-0x7E). Look up via index() against
+              # the printable map; offset by 0x20 (first map entry is space).
+              pos = index(printable, first)
+              if (pos > 0) {
+                print pos + 31
+              } else {
+                # Unrecognized — fall back to 0 rather than emit garbage.
+                print 0
+              }
             }
             exit
           }')
