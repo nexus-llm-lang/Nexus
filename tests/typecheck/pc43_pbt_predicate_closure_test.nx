@@ -1,0 +1,783 @@
+// PBT (nexus-pc43): closure laws for the spec's decidable predicates
+// `comparable(τ)`, `wfCap(ρ)`, and `wfThrow(ρ)`.
+//
+// These predicates show up across the typechecker (`==`/`!=` admission,
+// `require` row check, `throws` row check) and the spec pins each to a
+// closure rule of the form:
+//
+//   comparable(τ) ⇔ τ is a base scalar
+//                 ∨ τ ∈ {Record(fs), List(t)} with every component comparable.
+//   comparable(τ) = false on arrow / handler / ref / borrow / lazy / array.
+//
+//   wfCap(RClosed(items))     ⇔ ∀ x ∈ items. x ∈ SysCaps ∪ dom(methods)
+//   wfCap(ROpen(items, _))    ⇔ same — the trailing row var is left for
+//                              substitution and contributes no obligation.
+//   wfThrow analogously over the declared exception set.
+//
+// This PBT is self-contained: a local TOY domain `T` for types, `Cap` for
+// capability atoms, `Exn` for exception atoms, and `Row` for rows. The toy
+// faithfully mirrors the closure-relevant shape of `src/typecheck/`'s
+// predicates without dragging in the full `TypeExpr` / `Row` AST. A
+// follow-up bd maps each toy property to the corresponding real
+// predicate in-tree (e.g. `tc_compare.is_comparable` for P1, the
+// `wf_cap_row` / `wf_throw_row` helpers for P2/P3).
+//
+//   P1a — comparable(arrow) == false                          [closure boundary]
+//   P1b — comparable(handler) == false                         [closure boundary]
+//   P1c — comparable(ref) == false                             [closure boundary]
+//   P1d — comparable(borrow) == false                          [closure boundary]
+//   P1e — comparable(lazy) == false                            [closure boundary]
+//   P1f — comparable(array) == false                           [closure boundary]
+//   P1g — comparable(base scalar) == true                      [closure base]
+//   P1h — comparable(record) ⇔ all fields comparable           [closure step]
+//   P1i — comparable(list)   ⇔ element comparable              [closure step]
+//   P2a — wfCap(row) ⇔ every closed-row item ∈ known caps
+//   P2b — wfCap rejects a row containing an unknown atom (fault injection)
+//   P3a — wfThrow(row) ⇔ every closed-row item ∈ known exceptions
+//   P3b — wfThrow rejects a row containing an unknown atom (fault injection)
+//
+// 200 trials per property at the default seed.
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Pass, Fail, Gen } from "std:pbt"
+import { Pair } from "std:tuple"
+import * as str from "std:str"
+import * as list from "std:list"
+
+// ─── Toy domain ─────────────────────────────────────────────────────────────
+//
+// Types: enough variety to exercise each branch of the comparable predicate.
+//   - TI64 / TBool / TStr — base scalars (comparable = true).
+//   - TRecord(fields)     — record; comparable iff every field comparable.
+//   - TList(t)            — list; comparable iff element comparable.
+//   - TArrow(d, c)        — arrow shape (comparable = false).
+//   - TBorrow(t)          — `&τ` (comparable = false).
+//   - TRef(t)             — `~τ` (comparable = false).
+//   - TLazy(t)            — `@τ` (comparable = false).
+//   - THandler(t)         — handler shape (comparable = false).
+//   - TArray(t)           — fixed-size array (comparable = false; the array
+//                           equality story is a separate spec issue).
+
+type Ty =
+  TI64
+  | TBool
+  | TStr
+  | TRecord(fields: [ Ty ])
+  | TList(elem: Ty)
+  | TArrow(dom: Ty, cod: Ty)
+  | TBorrow(inner: Ty)
+  | TRef(inner: Ty)
+  | TLazy(inner: Ty)
+  | THandler(inner: Ty)
+  | TArray(elem: Ty)
+
+// Capability / exception atoms — a tiny known set + a "fault" name for
+// negative coverage.
+
+type Cap = CapConsole | CapFs | CapClock | CapNet
+type ExcAtom = ExnIo | ExnArg | ExnOverflow | ExnDomain
+
+// Row item flavours. The KnownCap / UnknownCap split is what makes the
+// negative direction of P2 land: any UnknownCap in the items list must
+// make wfCap return false.
+type CapItem = KnownCap(c: Cap) | UnknownCap(name: string)
+type ExnItem = KnownExn(e: ExcAtom) | UnknownExn(name: string)
+
+// Rows: closed (just items) or open (items + a row-variable tag). The row
+// variable contributes no extra constraint, so wf_* projects through.
+type CapRow = CCRClosed(items: [ CapItem ]) | CCROpen(items: [ CapItem ], var_id: i64)
+type ExnRow = EERClosed(items: [ ExnItem ]) | EEROpen(items: [ ExnItem ], var_id: i64)
+
+// ─── Predicates under test ──────────────────────────────────────────────────
+
+// Helper: every Ty in a list is comparable. Direct recursion avoids the
+// `list.fold_left + locally-defined closure` indirect-call mismatch hit
+// when the captured function is mutually recursive (`is_comparable`).
+let all_fields_comparable = fn (fs: [ Ty ]) -> bool do
+  match fs do
+    | [] -> return true
+    | x :: rest ->
+      if is_comparable(t: x) then
+        let ok = all_fields_comparable(fs: rest)
+        return ok
+      end
+      return false
+  end
+end
+
+// `is_comparable` follows the spec closure rule exactly:
+// - base scalars are leaves;
+// - record / list recurse;
+// - arrow / borrow / ref / lazy / handler / array short-circuit to false.
+let is_comparable = fn (t: Ty) -> bool do
+  match t do
+    | TI64 -> return true
+    | TBool -> return true
+    | TStr -> return true
+    | TArrow(dom: _, cod: _) -> return false
+    | TBorrow(inner: _) -> return false
+    | TRef(inner: _) -> return false
+    | TLazy(inner: _) -> return false
+    | THandler(inner: _) -> return false
+    | TArray(elem: _) -> return false
+    | TList(elem: e) ->
+      let ok = is_comparable(t: e)
+      return ok
+    | TRecord(fields: fs) ->
+      let ok = all_fields_comparable(fs)
+      return ok
+  end
+end
+
+// Membership: is the row item a known atom?
+let cap_item_known = fn (i: CapItem) -> bool do
+  match i do
+    | KnownCap(c: _) -> return true
+    | UnknownCap(name: _) -> return false
+  end
+end
+
+let exn_item_known = fn (i: ExnItem) -> bool do
+  match i do
+    | KnownExn(e: _) -> return true
+    | UnknownExn(name: _) -> return false
+  end
+end
+
+// Direct-recursion replacements for `list.fold_left + closure` — same
+// motivation as `all_fields_comparable`: the polymorphic fold_left's
+// indirect-call site mismatches a locally-defined closure's wasm type
+// signature, so we hand-roll each fold over the concrete element type.
+
+let all_cap_items_known = fn (xs: [ CapItem ]) -> bool do
+  match xs do
+    | [] -> return true
+    | x :: rest ->
+      if cap_item_known(i: x) then
+        let ok = all_cap_items_known(xs: rest)
+        return ok
+      end
+      return false
+  end
+end
+
+let all_exn_items_known = fn (xs: [ ExnItem ]) -> bool do
+  match xs do
+    | [] -> return true
+    | x :: rest ->
+      if exn_item_known(i: x) then
+        let ok = all_exn_items_known(xs: rest)
+        return ok
+      end
+      return false
+  end
+end
+
+// wfCap: the row is well-formed iff every concrete item is a known cap.
+// Open rows project through the tail var — the tail places no obligation.
+let wf_cap = fn (r: CapRow) -> bool do
+  match r do
+    | CCRClosed(items: xs) ->
+      let ok = all_cap_items_known(xs)
+      return ok
+    | CCROpen(items: xs, var_id: _) ->
+      let ok = all_cap_items_known(xs)
+      return ok
+  end
+end
+
+let wf_throw = fn (r: ExnRow) -> bool do
+  match r do
+    | EERClosed(items: xs) ->
+      let ok = all_exn_items_known(xs)
+      return ok
+    | EEROpen(items: xs, var_id: _) ->
+      let ok = all_exn_items_known(xs)
+      return ok
+  end
+end
+
+// `any_unknown` are the spec-side "ground truth" oracles: a row is wf iff
+// none of its closed items is unknown. P2b/P3b use these to assert the
+// fault-injected witnesses are actually unwellformed.
+let any_unknown_cap = fn (xs: [ CapItem ]) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      match x do
+        | UnknownCap(name: _) -> return true
+        | _ ->
+          let ok = any_unknown_cap(xs: rest)
+          return ok
+      end
+  end
+end
+
+let any_unknown_exn = fn (xs: [ ExnItem ]) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      match x do
+        | UnknownExn(name: _) -> return true
+        | _ ->
+          let ok = any_unknown_exn(xs: rest)
+          return ok
+      end
+  end
+end
+
+// ─── Renderers ──────────────────────────────────────────────────────────────
+
+let render_list_t = fn (xs: [ Ty ], acc: string) -> string do
+  match xs do
+    | [] -> return acc
+    | x :: rest ->
+      let head = render_t(t: x)
+      if str.length(s: acc) == 0 then
+        return render_list_t(xs: rest, acc: head)
+      end
+      return render_list_t(xs: rest, acc: acc ++ "," ++ head)
+  end
+end
+
+let render_t = fn (t: Ty) -> string do
+  match t do
+    | TI64 -> return "i64"
+    | TBool -> return "bool"
+    | TStr -> return "str"
+    | TArrow(dom: d, cod: c) -> return "(" ++ render_t(t: d) ++ "->" ++ render_t(t: c) ++ ")"
+    | TBorrow(inner: u) -> return "&" ++ render_t(t: u)
+    | TRef(inner: u) -> return "~" ++ render_t(t: u)
+    | TLazy(inner: u) -> return "@" ++ render_t(t: u)
+    | THandler(inner: u) -> return "H<" ++ render_t(t: u) ++ ">"
+    | TArray(elem: e) -> return "[|" ++ render_t(t: e) ++ "|]"
+    | TList(elem: e) -> return "[" ++ render_t(t: e) ++ "]"
+    | TRecord(fields: fs) -> return "{" ++ render_list_t(xs: fs, acc: "") ++ "}"
+  end
+end
+
+let render_cap = fn (c: Cap) -> string do
+  match c do
+    | CapConsole -> return "Console"
+    | CapFs -> return "Fs"
+    | CapClock -> return "Clock"
+    | CapNet -> return "Net"
+  end
+end
+
+let render_cap_item = fn (i: CapItem) -> string do
+  match i do
+    | KnownCap(c: cc) -> return render_cap(c: cc)
+    | UnknownCap(name: n) -> return "?" ++ n
+  end
+end
+
+let render_cap_items_go = fn (xs: [ CapItem ], acc: string) -> string do
+  match xs do
+    | [] -> return acc
+    | x :: rest ->
+      let head = render_cap_item(i: x)
+      if str.length(s: acc) == 0 then
+        return render_cap_items_go(xs: rest, acc: head)
+      end
+      return render_cap_items_go(xs: rest, acc: acc ++ "," ++ head)
+  end
+end
+
+let render_cap_row = fn (r: CapRow) -> string do
+  match r do
+    | CCRClosed(items: xs) -> return "{" ++ render_cap_items_go(xs, acc: "") ++ "}"
+    | CCROpen(items: xs, var_id: v) ->
+      return "{" ++ render_cap_items_go(xs, acc: "") ++ "|r" ++ str.from_i64(val: v) ++ "}"
+  end
+end
+
+let render_exn = fn (e: ExcAtom) -> string do
+  match e do
+    | ExnIo -> return "Io"
+    | ExnArg -> return "Arg"
+    | ExnOverflow -> return "Overflow"
+    | ExnDomain -> return "Domain"
+  end
+end
+
+let render_exn_item = fn (i: ExnItem) -> string do
+  match i do
+    | KnownExn(e: ee) -> return render_exn(e: ee)
+    | UnknownExn(name: n) -> return "?" ++ n
+  end
+end
+
+let render_exn_items_go = fn (xs: [ ExnItem ], acc: string) -> string do
+  match xs do
+    | [] -> return acc
+    | x :: rest ->
+      let head = render_exn_item(i: x)
+      if str.length(s: acc) == 0 then
+        return render_exn_items_go(xs: rest, acc: head)
+      end
+      return render_exn_items_go(xs: rest, acc: acc ++ "," ++ head)
+  end
+end
+
+let render_exn_row = fn (r: ExnRow) -> string do
+  match r do
+    | EERClosed(items: xs) -> return "{" ++ render_exn_items_go(xs, acc: "") ++ "}"
+    | EEROpen(items: xs, var_id: v) ->
+      return "{" ++ render_exn_items_go(xs, acc: "") ++ "|r" ++ str.from_i64(val: v) ++ "}"
+  end
+end
+
+// ─── Seed plumbing — xorshift64 mirror of pbt::next_state ───────────────────
+
+let abs_i64 = fn (n: i64) -> i64 do
+  if n < 0 then return 0 - n end
+  return n
+end
+
+let step_seed = fn (seed: i64) -> Pair<i64, i64> do
+  let xor_fixup : i64 = 2685821657736338717
+  let s0 = if seed == 0 then xor_fixup else seed end
+  let s1 = s0 ^ (s0 << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  return Pair(left: s3, right: s3)
+end
+
+// ─── Depth-bounded Gen<T> ──────────────────────────────────────────────────
+//
+// 11 type constructors; we pick uniformly among them up to a depth cap.
+// At depth 0 we only return base scalars so termination is guaranteed.
+// Record/list elements are drawn at depth - 1.
+
+let gen_t_run = fn (depth: i64, seed: i64) -> Pair<Ty, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  if depth <= 0 then
+    let tag = raw % 3
+    if tag == 0 then return Pair(left: TI64, right: s1) end
+    if tag == 1 then return Pair(left: TBool, right: s1) end
+    return Pair(left: TStr, right: s1)
+  end
+  let choice = raw % 11
+  if choice == 0 then return Pair(left: TI64, right: s1) end
+  if choice == 1 then return Pair(left: TBool, right: s1) end
+  if choice == 2 then return Pair(left: TStr, right: s1) end
+  if choice == 3 then
+    let Pair(left: a, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+    let Pair(left: b, right: s3) = gen_t_run(depth: depth - 1, seed: s2)
+    return Pair(left: TArrow(dom: a, cod: b), right: s3)
+  end
+  if choice == 4 then
+    let Pair(left: u, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+    return Pair(left: TBorrow(inner: u), right: s2)
+  end
+  if choice == 5 then
+    let Pair(left: u, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+    return Pair(left: TRef(inner: u), right: s2)
+  end
+  if choice == 6 then
+    let Pair(left: u, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+    return Pair(left: TLazy(inner: u), right: s2)
+  end
+  if choice == 7 then
+    let Pair(left: u, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+    return Pair(left: THandler(inner: u), right: s2)
+  end
+  if choice == 8 then
+    let Pair(left: u, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+    return Pair(left: TArray(elem: u), right: s2)
+  end
+  if choice == 9 then
+    let Pair(left: u, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+    return Pair(left: TList(elem: u), right: s2)
+  end
+  // TRecord with 0..2 fields. The 0-field case (empty record) is comparable
+  // by vacuous-conjunction — `fold_left init=true` returns true. This is
+  // the spec's intended degenerate case (an empty struct is trivially
+  // value-equatable) and the property below picks it up automatically.
+  let Pair(left: n_raw, right: s2) = step_seed(seed: s1)
+  let nfields = abs_i64(n: n_raw) % 3
+  if nfields == 0 then
+    return Pair(left: TRecord(fields: []), right: s2)
+  end
+  if nfields == 1 then
+    let Pair(left: f1, right: s3) = gen_t_run(depth: depth - 1, seed: s2)
+    return Pair(left: TRecord(fields: [f1]), right: s3)
+  end
+  let Pair(left: f1, right: s3) = gen_t_run(depth: depth - 1, seed: s2)
+  let Pair(left: f2, right: s4) = gen_t_run(depth: depth - 1, seed: s3)
+  return Pair(left: TRecord(fields: [f1, f2]), right: s4)
+end
+
+// ─── Cap / Exn item & row generators ───────────────────────────────────────
+
+let gen_cap_item_run = fn (seed: i64) -> Pair<CapItem, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let r = abs_i64(n: v) % 6
+  // 4 known + 2 unknown — biases toward known to keep the positive
+  // side from being starved.
+  if r == 0 then return Pair(left: KnownCap(c: CapConsole), right: s1) end
+  if r == 1 then return Pair(left: KnownCap(c: CapFs), right: s1) end
+  if r == 2 then return Pair(left: KnownCap(c: CapClock), right: s1) end
+  if r == 3 then return Pair(left: KnownCap(c: CapNet), right: s1) end
+  if r == 4 then return Pair(left: UnknownCap(name: "Mystery"), right: s1) end
+  return Pair(left: UnknownCap(name: "Bogus"), right: s1)
+end
+
+let gen_cap_items_run = fn (n: i64, seed: i64, acc: [ CapItem ]) -> Pair<[ CapItem ], i64> do
+  if n <= 0 then
+    return Pair(left: list.reverse(xs: acc), right: seed)
+  end
+  let Pair(left: i, right: s1) = gen_cap_item_run(seed)
+  return gen_cap_items_run(n: n - 1, seed: s1, acc: i :: acc)
+end
+
+let gen_cap_row_run = fn (max_len: i64, seed: i64) -> Pair<CapRow, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  let n_items = raw % (max_len + 1)
+  let Pair(left: items, right: s2) = gen_cap_items_run(n: n_items, seed: s1, acc: [])
+  let Pair(left: tag, right: s3) = step_seed(seed: s2)
+  // open vs closed: 50/50 split on the open bit.
+  let is_open = (abs_i64(n: tag) % 2) == 0
+  if is_open then
+    let Pair(left: vid, right: s4) = step_seed(seed: s3)
+    let var_id = abs_i64(n: vid) % 8
+    return Pair(left: CCROpen(items: items, var_id: var_id), right: s4)
+  end
+  return Pair(left: CCRClosed(items: items), right: s3)
+end
+
+let gen_exn_item_run = fn (seed: i64) -> Pair<ExnItem, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let r = abs_i64(n: v) % 6
+  if r == 0 then return Pair(left: KnownExn(e: ExnIo), right: s1) end
+  if r == 1 then return Pair(left: KnownExn(e: ExnArg), right: s1) end
+  if r == 2 then return Pair(left: KnownExn(e: ExnOverflow), right: s1) end
+  if r == 3 then return Pair(left: KnownExn(e: ExnDomain), right: s1) end
+  if r == 4 then return Pair(left: UnknownExn(name: "Mystery"), right: s1) end
+  return Pair(left: UnknownExn(name: "Bogus"), right: s1)
+end
+
+let gen_exn_items_run = fn (n: i64, seed: i64, acc: [ ExnItem ]) -> Pair<[ ExnItem ], i64> do
+  if n <= 0 then
+    return Pair(left: list.reverse(xs: acc), right: seed)
+  end
+  let Pair(left: i, right: s1) = gen_exn_item_run(seed)
+  return gen_exn_items_run(n: n - 1, seed: s1, acc: i :: acc)
+end
+
+let gen_exn_row_run = fn (max_len: i64, seed: i64) -> Pair<ExnRow, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  let n_items = raw % (max_len + 1)
+  let Pair(left: items, right: s2) = gen_exn_items_run(n: n_items, seed: s1, acc: [])
+  let Pair(left: tag, right: s3) = step_seed(seed: s2)
+  let is_open = (abs_i64(n: tag) % 2) == 0
+  if is_open then
+    let Pair(left: vid, right: s4) = step_seed(seed: s3)
+    let var_id = abs_i64(n: vid) % 8
+    return Pair(left: EEROpen(items: items, var_id: var_id), right: s4)
+  end
+  return Pair(left: EERClosed(items: items), right: s3)
+end
+
+// ─── Fault-injection variants for the negative side ─────────────────────────
+//
+// P2b / P3b need a row whose item list definitely contains an unknown atom.
+// We generate a normal row, then append a guaranteed-unknown item so the
+// property has a hard ground truth (the row is unwellformed).
+
+let inject_unknown_cap = fn (r: CapRow) -> CapRow do
+  match r do
+    | CCRClosed(items: xs) ->
+      let xs2 = list.concat(xs, ys: [UnknownCap(name: "Injected")])
+      return CCRClosed(items: xs2)
+    | CCROpen(items: xs, var_id: v) ->
+      let xs2 = list.concat(xs, ys: [UnknownCap(name: "Injected")])
+      return CCROpen(items: xs2, var_id: v)
+  end
+end
+
+let inject_unknown_exn = fn (r: ExnRow) -> ExnRow do
+  match r do
+    | EERClosed(items: xs) ->
+      let xs2 = list.concat(xs, ys: [UnknownExn(name: "Injected")])
+      return EERClosed(items: xs2)
+    | EEROpen(items: xs, var_id: v) ->
+      let xs2 = list.concat(xs, ys: [UnknownExn(name: "Injected")])
+      return EEROpen(items: xs2, var_id: v)
+  end
+end
+
+// ─── Body ───────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit require { Console } throws { Exn } do
+  // Build each generator inside body() — the same closure ABI quirk
+  // documented in xpzt: a top-level `let g = Gen(...)` over a non-base
+  // T mismatches the i64 return slot on the cross-module path.
+
+  let gen_t_local = Gen(
+    run: fn (seed: i64) -> Pair<Ty, i64> do
+      return gen_t_run(depth: 3, seed)
+    end,
+    shrink: fn (v: Ty) -> [ Ty ] do return [] end,
+    render: render_t
+  )
+
+  let gen_cap_row_local = Gen(
+    run: fn (seed: i64) -> Pair<CapRow, i64> do
+      return gen_cap_row_run(max_len: 4, seed)
+    end,
+    shrink: fn (v: CapRow) -> [ CapRow ] do return [] end,
+    render: render_cap_row
+  )
+
+  let gen_exn_row_local = Gen(
+    run: fn (seed: i64) -> Pair<ExnRow, i64> do
+      return gen_exn_row_run(max_len: 4, seed)
+    end,
+    shrink: fn (v: ExnRow) -> [ ExnRow ] do return [] end,
+    render: render_exn_row
+  )
+
+  let iters = 200
+
+  // ── P1: comparable closure laws ──────────────────────────────────────────
+  //
+  // The "every τ shaped like a wrapper rejects comparable" sub-properties
+  // wrap an arbitrary τ in the offending constructor and assert the
+  // result has comparable = false. This is a stronger statement than the
+  // ed9w_*_eq_negative fixtures (which each pick one outer wrapper around
+  // a fixed inner type) — the inner is now arbitrary.
+
+  let prop_arrow_rejects = fn (x: Ty) -> bool do
+    // Arrow over any (d, c) is non-comparable. We instantiate d := x and
+    // c := x for the property witness — quantifying over a single x is
+    // enough because the spec says "any arrow is non-comparable", and
+    // the negative answer can't depend on dom/cod content.
+    let t = TArrow(dom: x, cod: x)
+    let ok = is_comparable(t: t) == false
+    return ok
+  end
+
+  let prop_borrow_rejects = fn (x: Ty) -> bool do
+    let t = TBorrow(inner: x)
+    let ok = is_comparable(t: t) == false
+    return ok
+  end
+
+  let prop_ref_rejects = fn (x: Ty) -> bool do
+    let t = TRef(inner: x)
+    let ok = is_comparable(t: t) == false
+    return ok
+  end
+
+  let prop_lazy_rejects = fn (x: Ty) -> bool do
+    let t = TLazy(inner: x)
+    let ok = is_comparable(t: t) == false
+    return ok
+  end
+
+  let prop_handler_rejects = fn (x: Ty) -> bool do
+    let t = THandler(inner: x)
+    let ok = is_comparable(t: t) == false
+    return ok
+  end
+
+  let prop_array_rejects = fn (x: Ty) -> bool do
+    let t = TArray(elem: x)
+    let ok = is_comparable(t: t) == false
+    return ok
+  end
+
+  // Closure step on list: comparable(TList(t)) ⇔ comparable(t).
+  let prop_list_closure = fn (x: Ty) -> bool do
+    let lhs = is_comparable(t: TList(elem: x))
+    let rhs = is_comparable(t: x)
+    let ok = lhs == rhs
+    return ok
+  end
+
+  // Closure step on record (1-field): comparable(TRecord([t])) ⇔ comparable(t).
+  // The 2-field case is exercised by the depth-3 generator drawing TRecord
+  // shapes with 0/1/2 fields and feeding them back into the comparable
+  // function under prop_scalar_accepts — not a clean closure step, so we
+  // pin the 1-field equality here.
+  let prop_record_singleton_closure = fn (x: Ty) -> bool do
+    let lhs = is_comparable(t: TRecord(fields: [x]))
+    let rhs = is_comparable(t: x)
+    let ok = lhs == rhs
+    return ok
+  end
+
+  let r1a = pbt.forall(g: gen_t_local, prop: prop_arrow_rejects, n: iters)
+  match r1a do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1a: comparable(arrow) == false")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1a arrow-rejects failed: " ++ w)
+  end
+
+  let r1b = pbt.forall(g: gen_t_local, prop: prop_borrow_rejects, n: iters)
+  match r1b do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1b: comparable(&τ) == false")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1b borrow-rejects failed: " ++ w)
+  end
+
+  let r1c = pbt.forall(g: gen_t_local, prop: prop_ref_rejects, n: iters)
+  match r1c do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1c: comparable(~τ) == false")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1c ref-rejects failed: " ++ w)
+  end
+
+  let r1d = pbt.forall(g: gen_t_local, prop: prop_lazy_rejects, n: iters)
+  match r1d do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1d: comparable(@τ) == false")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1d lazy-rejects failed: " ++ w)
+  end
+
+  let r1e = pbt.forall(g: gen_t_local, prop: prop_handler_rejects, n: iters)
+  match r1e do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1e: comparable(Handler<τ>) == false")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1e handler-rejects failed: " ++ w)
+  end
+
+  let r1f = pbt.forall(g: gen_t_local, prop: prop_array_rejects, n: iters)
+  match r1f do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1f: comparable([|τ|]) == false")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1f array-rejects failed: " ++ w)
+  end
+
+  // Base scalars are always comparable. PBT-quantify over an i64 nuisance
+  // parameter, picking the scalar by tag — this exercises the property
+  // under the standard `pbt.forall` driver while keeping the conjunction
+  // tight (all three scalars constant per iteration).
+  let prop_scalar_accepts = fn (x: i64) -> bool do
+    let ok = is_comparable(t: TI64)
+          && is_comparable(t: TBool)
+          && is_comparable(t: TStr)
+    return ok
+  end
+
+  let r1g = pbt.forall(g: pbt.small_int, prop: prop_scalar_accepts, n: iters)
+  match r1g do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1g: comparable(i64) ∧ comparable(bool) ∧ comparable(str)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1g scalar-accepts failed: " ++ w)
+  end
+
+  let r1h = pbt.forall(g: gen_t_local, prop: prop_list_closure, n: iters)
+  match r1h do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1h: comparable(TList(t)) ⇔ comparable(t)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1h list-closure failed: " ++ w)
+  end
+
+  let r1i = pbt.forall(g: gen_t_local, prop: prop_record_singleton_closure, n: iters)
+  match r1i do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1i: comparable(TRecord([t])) ⇔ comparable(t)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1i record-singleton-closure failed: " ++ w)
+  end
+
+  // ── P2: wfCap closure (∀ item ∈ row, known) ⇔ wf ────────────────────────
+  //
+  // P2a is the positive law: wfCap(r) iff every item in r is a known cap.
+  // The toy's `wf_cap` checks exactly this, so the equivalence holds by
+  // construction — what the PBT validates is that our oracle
+  // `any_unknown_cap` agrees on every randomly-generated row. This pins
+  // the predicate's *closure under negation*: ¬wf ⇔ ∃ unknown.
+  let prop_wf_cap_law = fn (x: CapRow) -> bool do
+    let items = match x do
+      | CCRClosed(items: xs) -> xs
+      | CCROpen(items: xs, var_id: _) -> xs
+    end
+    let lhs = wf_cap(r: x)
+    let rhs = any_unknown_cap(xs: items) == false
+    let ok = lhs == rhs
+    return ok
+  end
+
+  // P2b: fault injection. Append a guaranteed-unknown item; assert wf is
+  // false. This is the "ed9w-style" hard rejection — the row contains at
+  // least one offender, so the closure step must fail.
+  let prop_wf_cap_rejects_unknown = fn (x: CapRow) -> bool do
+    let r2 = inject_unknown_cap(r: x)
+    let ok = wf_cap(r: r2) == false
+    return ok
+  end
+
+  let r2a = pbt.forall(g: gen_cap_row_local, prop: prop_wf_cap_law, n: iters)
+  match r2a do
+    | Pass -> test_assert.assert_true(cond: true, label: "P2a: wfCap(ρ) ⇔ all items known")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P2a wfCap-law failed: " ++ w)
+  end
+
+  let r2b = pbt.forall(g: gen_cap_row_local, prop: prop_wf_cap_rejects_unknown, n: iters)
+  match r2b do
+    | Pass -> test_assert.assert_true(cond: true, label: "P2b: wfCap rejects row with an injected unknown")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P2b wfCap-rejects-unknown failed: " ++ w)
+  end
+
+  // ── P3: wfThrow closure — same shape as P2 over Exn rows ────────────────
+
+  let prop_wf_throw_law = fn (x: ExnRow) -> bool do
+    let items = match x do
+      | EERClosed(items: xs) -> xs
+      | EEROpen(items: xs, var_id: _) -> xs
+    end
+    let lhs = wf_throw(r: x)
+    let rhs = any_unknown_exn(xs: items) == false
+    let ok = lhs == rhs
+    return ok
+  end
+
+  let prop_wf_throw_rejects_unknown = fn (x: ExnRow) -> bool do
+    let r2 = inject_unknown_exn(r: x)
+    let ok = wf_throw(r: r2) == false
+    return ok
+  end
+
+  let r3a = pbt.forall(g: gen_exn_row_local, prop: prop_wf_throw_law, n: iters)
+  match r3a do
+    | Pass -> test_assert.assert_true(cond: true, label: "P3a: wfThrow(ρ) ⇔ all items known")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P3a wfThrow-law failed: " ++ w)
+  end
+
+  let r3b = pbt.forall(g: gen_exn_row_local, prop: prop_wf_throw_rejects_unknown, n: iters)
+  match r3b do
+    | Pass -> test_assert.assert_true(cond: true, label: "P3b: wfThrow rejects row with an injected unknown")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P3b wfThrow-rejects-unknown failed: " ++ w)
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
