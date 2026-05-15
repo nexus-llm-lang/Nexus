@@ -1,0 +1,402 @@
+// PBT: free-variable / bound-variable sets under α-renaming on a toy
+// lambda calculus AST.
+//
+// nexus-n7pw — V3 verification of the fv/bv algorithms wrt α-equivalence.
+//
+// Property A (fv α-invariance):
+//   For any expression `e` and any pair of names `(α, β)` where α is fresh
+//   wrt fv(e) ∪ bv(e), the renaming `e[α/β]` (which substitutes α for the
+//   *binders* named β plus their bound occurrences, leaving free β untouched)
+//   satisfies fv(e[α/β]) = fv(e).
+//
+//   This captures the slogan "α-renaming is invisible to fv". The "α fresh"
+//   side-condition matters: if α already occurs free in e, picking it as
+//   the new binder would capture, and a sane α-renamer either picks a
+//   different α or the property would not hold. We pick α explicitly fresh.
+//
+// Property B (bv α-renaming):
+//   When α is fresh wrt e and β appears as a binder in bv(e), the same
+//   renaming satisfies bv(e[α/β]) = (bv(e) \ {β}) ∪ {α}. When β is not a
+//   binder of e, bv(e[α/β]) = bv(e) (the renamer is a no-op).
+//
+// Pragmatic scope (per task brief): instead of `Gen<HirExpr>`, build a
+// `Gen<Expr>` over a 3-ctor toy calculus (EVar | EApp | ELam) with a
+// 3-name alphabet ("a", "b", "c") so the bound/free interplay is dense
+// without blowing up the search space.
+
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Pass, Fail } from "std:pbt"
+import { Pair } from "std:tuple"
+import * as list from "std:list"
+import * as str from "std:str"
+
+// ─── Toy lambda calculus ────────────────────────────────────────────────────
+
+type Expr = EVar(name: string) | EApp(f: Expr, x: Expr) | ELam(param: string, body: Expr)
+
+// ─── String list helpers (sorted-unique "set" representation) ──────────────
+
+let str_byte_lt_go = fn (a: string, b: string, na: i64, nb: i64, i: i64) -> bool do
+  let lim = if na < nb then na else nb end
+  if i >= lim then return na < nb end
+  let ca = str.byte_at(s: a, idx: i)
+  let cb = str.byte_at(s: b, idx: i)
+  if ca == cb then return str_byte_lt_go(a, b, na, nb, i: i + 1) end
+  return ca < cb
+end
+
+let str_lt = fn (a: string, b: string) -> bool do
+  if a == b then return false end
+  return str_byte_lt_go(a, b, na: str.byte_length(s: a), nb: str.byte_length(s: b), i: 0)
+end
+
+let set_insert_go = fn (acc: [string], rest: [string], x: string) -> [string] do
+  match rest do
+    | [] -> return list.reverse(xs: x :: acc)
+    | y :: ys ->
+      if x == y then
+        return list.concat(xs: list.reverse(xs: acc), ys: rest)
+      end
+      if str_lt(a: x, b: y) then
+        return list.concat(xs: list.reverse(xs: x :: acc), ys: rest)
+      end
+      return set_insert_go(acc: y :: acc, rest: ys, x)
+  end
+end
+
+let set_insert = fn (xs: [string], x: string) -> [string] do
+  return set_insert_go(acc: [], rest: xs, x)
+end
+
+let set_union_go = fn (xs: [string], ys: [string]) -> [string] do
+  match ys do
+    | [] -> return xs
+    | y :: rest -> return set_union_go(xs: set_insert(xs, x: y), ys: rest)
+  end
+end
+
+let set_union = fn (xs: [string], ys: [string]) -> [string] do
+  return set_union_go(xs, ys)
+end
+
+let set_remove_go = fn (acc: [string], xs: [string], x: string) -> [string] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | y :: rest ->
+      if x == y then
+        return list.concat(xs: list.reverse(xs: acc), ys: rest)
+      end
+      return set_remove_go(acc: y :: acc, xs: rest, x)
+  end
+end
+
+let set_remove = fn (xs: [string], x: string) -> [string] do
+  return set_remove_go(acc: [], xs, x)
+end
+
+let set_member_go = fn (xs: [string], x: string) -> bool do
+  match xs do
+    | [] -> return false
+    | y :: rest ->
+      if x == y then return true end
+      return set_member_go(xs: rest, x)
+  end
+end
+
+let set_member = fn (xs: [string], x: string) -> bool do
+  return set_member_go(xs, x)
+end
+
+let set_eq_go = fn (xs: [string], ys: [string]) -> bool do
+  match xs do
+    | [] ->
+      match ys do
+        | [] -> return true
+        | _ :: _ -> return false
+      end
+    | x :: xrest ->
+      match ys do
+        | [] -> return false
+        | y :: yrest ->
+          if x == y then return set_eq_go(xs: xrest, ys: yrest) end
+          return false
+      end
+  end
+end
+
+let set_eq = fn (xs: [string], ys: [string]) -> bool do
+  return set_eq_go(xs, ys)
+end
+
+// ─── fv / bv / α-renaming ───────────────────────────────────────────────────
+
+let fv_go = fn (e: Expr) -> [string] do
+  match e do
+    | EVar(name: n) -> return [n]
+    | EApp(f: a, x: b) -> return set_union(xs: fv_go(e: a), ys: fv_go(e: b))
+    | ELam(param: p, body: b) -> return set_remove(xs: fv_go(e: b), x: p)
+  end
+end
+
+let bv_go = fn (e: Expr) -> [string] do
+  match e do
+    | EVar(name: _) -> return []
+    | EApp(f: a, x: b) -> return set_union(xs: bv_go(e: a), ys: bv_go(e: b))
+    | ELam(param: p, body: b) -> return set_insert(xs: bv_go(e: b), x: p)
+  end
+end
+
+// α-rename: rename binder β to α throughout, including bound occurrences.
+// Free occurrences of β stay free; free occurrences of α stay free. Under a
+// scope `ELam(β, …)`, the renamer rebinds to α and rewrites bound β refs;
+// inner shadowing by another ELam(β, …) opens a new scope unaffected by the
+// outer renaming. Side-condition for caller: α should be fresh wrt the
+// subterm if you want capture-avoidance — we encode that in the
+// fresh-name picker in `body()`.
+//
+// Semantics: rename_capt(e, α, β) walks `e`. If we enter an `ELam(β, body)`
+// scope, we rebind the lambda to `ELam(α, rename_bound(body, α, β))`,
+// where `rename_bound` swaps the *bound* β references to α but does not
+// touch nested ELam(β, …) (those re-bind β). At other points we recurse.
+
+let rename_bound_go = fn (e: Expr, alpha: string, beta: string) -> Expr do
+  match e do
+    | EVar(name: n) ->
+      if n == beta then return EVar(name: alpha) end
+      return EVar(name: n)
+    | EApp(f: a, x: b) ->
+      return EApp(f: rename_bound_go(e: a, alpha, beta), x: rename_bound_go(e: b, alpha, beta))
+    | ELam(param: p, body: b) ->
+      if p == beta then
+        // inner shadow rebinds β — stop rewriting inside.
+        return ELam(param: p, body: b)
+      end
+      if p == alpha then
+        // inner shadow rebinds α — this would capture; the caller is
+        // expected to have picked a fresh α so this case doesn't occur in
+        // PBT inputs. Conservatively stop rewriting to keep semantics
+        // sane.
+        return ELam(param: p, body: b)
+      end
+      return ELam(param: p, body: rename_bound_go(e: b, alpha, beta))
+  end
+end
+
+// Walk e and at every ELam(β, …) site rebind to α (renaming bound refs).
+// We do not touch free β.
+let alpha_rename_go = fn (e: Expr, alpha: string, beta: string) -> Expr do
+  match e do
+    | EVar(name: n) -> return EVar(name: n)
+    | EApp(f: a, x: b) ->
+      return EApp(f: alpha_rename_go(e: a, alpha, beta), x: alpha_rename_go(e: b, alpha, beta))
+    | ELam(param: p, body: b) ->
+      if p == beta then
+        // Rebind this binder to α; rewrite all bound β refs in body. Then
+        // recurse into the rewritten body to catch *nested* ELam(β, …)
+        // sites that themselves want α-renaming.
+        let b1 = rename_bound_go(e: b, alpha, beta)
+        let b2 = alpha_rename_go(e: b1, alpha, beta)
+        return ELam(param: alpha, body: b2)
+      end
+      return ELam(param: p, body: alpha_rename_go(e: b, alpha, beta))
+  end
+end
+
+// ─── Expr renderer (for pbt witness output) ────────────────────────────────
+
+let render_expr_go = fn (e: Expr) -> string do
+  match e do
+    | EVar(name: n) -> return n
+    | EApp(f: a, x: b) -> return "(" ++ render_expr_go(e: a) ++ " " ++ render_expr_go(e: b) ++ ")"
+    | ELam(param: p, body: b) -> return "(λ" ++ p ++ "." ++ render_expr_go(e: b) ++ ")"
+  end
+end
+
+// ─── Generators (local, depth-bounded recursive) ───────────────────────────
+
+let pick_name = fn (seed: i64) -> Pair<string, i64> do
+  // xorshift-style step from std:pbt is private; use a hand-rolled mix.
+  let s1 = seed ^ (seed << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  let raw = if s3 < 0 then 0 - s3 else s3 end
+  let idx = raw % 3
+  let nm = if idx == 0 then "a" else if idx == 1 then "b" else "c" end
+  return Pair(left: nm, right: s3)
+end
+
+let next_seed = fn (seed: i64) -> i64 do
+  let s0 = if seed == 0 then 2685821657736338717 else seed end
+  let s1 = s0 ^ (s0 << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  return s3
+end
+
+let abs_i64 = fn (n: i64) -> i64 do
+  if n < 0 then return 0 - n end
+  return n
+end
+
+let gen_expr_go = fn (depth: i64, seed: i64) -> Pair<Expr, i64> do
+  let s1 = next_seed(seed: seed)
+  if depth <= 0 then
+    let Pair(left: nm, right: s2) = pick_name(seed: s1)
+    return Pair(left: EVar(name: nm), right: s2)
+  end
+  let pick = abs_i64(n: s1) % 4
+  // Bias toward leaves (2/4) to keep depth in check.
+  if pick == 0 then
+    let Pair(left: nm, right: s2) = pick_name(seed: s1)
+    return Pair(left: EVar(name: nm), right: s2)
+  end
+  if pick == 1 then
+    let Pair(left: nm, right: s2) = pick_name(seed: s1)
+    return Pair(left: EVar(name: nm), right: s2)
+  end
+  if pick == 2 then
+    let Pair(left: f0, right: s2) = gen_expr_go(depth: depth - 1, seed: s1)
+    let Pair(left: x0, right: s3) = gen_expr_go(depth: depth - 1, seed: s2)
+    return Pair(left: EApp(f: f0, x: x0), right: s3)
+  end
+  // pick == 3: lambda
+  let Pair(left: p, right: s2) = pick_name(seed: s1)
+  let Pair(left: b0, right: s3) = gen_expr_go(depth: depth - 1, seed: s2)
+  return Pair(left: ELam(param: p, body: b0), right: s3)
+end
+
+// Pick a fresh name relative to a string set. Returns Pair(name, ok_flag).
+let pick_fresh = fn (avoid: [string]) -> string do
+  if set_member(xs: avoid, x: "a") then
+    if set_member(xs: avoid, x: "b") then
+      if set_member(xs: avoid, x: "c") then
+        // alphabet exhausted; return a synthesized name not in the alphabet
+        return "z"
+      end
+      return "c"
+    end
+    return "b"
+  end
+  return "a"
+end
+
+let pick_beta = fn (e: Expr) -> string do
+  let names = bv_go(e)
+  match names do
+    | [] -> return "a"  // no binders; pick any name (renaming is a no-op)
+    | n :: _ -> return n
+  end
+end
+
+// ─── Properties under test (declared inside body) ──────────────────────────
+
+let body = fn () -> unit require { Console } throws { Exn } do
+  // Build a Gen<Expr> inside body() (avoid top-level nullary thunk gotcha).
+
+  let max_depth = 4
+
+  let expr_run = fn (seed: i64) -> Pair<Expr, i64> do
+    return gen_expr_go(depth: max_depth, seed: seed)
+  end
+  let expr_shrink = fn (v: Expr) -> [Expr] do
+    // No shrinking — the property is universally quantified over a sane
+    // domain and the witness for a *failure* would already be small enough
+    // (depth ≤ 4, alphabet size 3) for debugging.
+    return []
+  end
+  let expr_render = fn (v: Expr) -> string do
+    return render_expr_go(e: v)
+  end
+
+  let expr_gen = pbt.Gen(run: expr_run, shrink: expr_shrink, render: expr_render)
+
+  // ── Property A: fv α-invariance ──────────────────────────────────────────
+  //
+  // For each random e, pick β = some binder of e (or "a" if none), pick α
+  // fresh wrt fv(e) ∪ bv(e). Then fv(α-rename e α β) must equal fv(e).
+  let prop_fv_alpha = fn (x: Expr) -> bool do
+    let beta = pick_beta(e: x)
+    let avoid = set_union(xs: fv_go(e: x), ys: bv_go(e: x))
+    let alpha = pick_fresh(avoid: set_insert(xs: avoid, x: beta))
+    let renamed = alpha_rename_go(e: x, alpha, beta)
+    let ok = set_eq(xs: fv_go(e: renamed), ys: fv_go(e: x))
+    return ok
+  end
+
+  // ── Property B: bv α-renaming ────────────────────────────────────────────
+  //
+  // bv(e[α/β]) = (bv(e) \ {β}) ∪ {α} when β ∈ bv(e) and α is fresh; else
+  // bv(e[α/β]) = bv(e).
+  let prop_bv_alpha = fn (x: Expr) -> bool do
+    let beta = pick_beta(e: x)
+    let avoid = set_union(xs: fv_go(e: x), ys: bv_go(e: x))
+    let alpha = pick_fresh(avoid: set_insert(xs: avoid, x: beta))
+    let renamed = alpha_rename_go(e: x, alpha, beta)
+    let bv_e = bv_go(e: x)
+    let bv_r = bv_go(e: renamed)
+    if set_member(xs: bv_e, x: beta) then
+      let expected = set_insert(xs: set_remove(xs: bv_e, x: beta), x: alpha)
+      let ok = set_eq(xs: bv_r, ys: expected)
+      return ok
+    end
+    let ok = set_eq(xs: bv_r, ys: bv_e)
+    return ok
+  end
+
+  // ── Sanity: α-rename with α = β is identity on fv/bv ──────────────────────
+  let prop_identity_rename = fn (x: Expr) -> bool do
+    let beta = pick_beta(e: x)
+    let renamed = alpha_rename_go(e: x, alpha: beta, beta)
+    let ok = set_eq(xs: fv_go(e: renamed), ys: fv_go(e: x)) && set_eq(xs: bv_go(e: renamed), ys: bv_go(e: x))
+    return ok
+  end
+
+  // Run 200 trials per property.
+  let n = 200
+
+  let r1 = pbt.forall(g: expr_gen, prop: prop_fv_alpha, n)
+  match r1 do
+    | Pass -> test_assert.assert_true(cond: true, label: "fv α-invariance holds across 200 trials")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "fv α-invariance FAILED — witness=" ++ w ++ " shrunk=" ++ s)
+  end
+
+  let r2 = pbt.forall(g: expr_gen, prop: prop_bv_alpha, n)
+  match r2 do
+    | Pass -> test_assert.assert_true(cond: true, label: "bv α-renaming spec holds across 200 trials")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "bv α-renaming FAILED — witness=" ++ w ++ " shrunk=" ++ s)
+  end
+
+  let r3 = pbt.forall(g: expr_gen, prop: prop_identity_rename, n)
+  match r3 do
+    | Pass -> test_assert.assert_true(cond: true, label: "identity α-rename preserves fv/bv across 200 trials")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "identity α-rename FAILED — witness=" ++ w ++ " shrunk=" ++ s)
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
