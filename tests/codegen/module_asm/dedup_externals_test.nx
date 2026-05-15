@@ -1,0 +1,114 @@
+// nexus-byiw — pins dedup_externals in src/backend/codegen/module_asm.nx.
+//
+// Multiple Nexus names can target the same wasm import (diamond imports —
+// e.g. two stdlib modules both bind the same host fn under different
+// idiomatic names). dedup_externals collapses duplicates by the
+// (wasm_module, wasm_name) pair, keeping the FIRST occurrence's position
+// and producing FuncEntry remaps for every duplicate Nexus-name that now
+// shares an existing slot.
+import * as test_assert from "std:test/assert"
+import { TypeExpr, TyUnit, TyRow } from "src/common/ast.nx"
+import { LirExternal } from "src/ir/lir/types.nx"
+import { FuncEntry } from "src/backend/wasm/defs.nx"
+import {
+  DedupExtResult, dedup_externals
+} from "src/backend/codegen/module_asm.nx"
+import { None } from "std:option"
+import * as list from "std:list"
+import * as str from "std:str"
+
+let empty_throw_row = fn () -> TypeExpr do
+  return TyRow(types: [], rest: None)
+end
+
+let mk_ext = fn (name: string, wm: string, wn: string) -> LirExternal do
+  return LirExternal(
+    name, wasm_module: wm, wasm_name: wn,
+    params: [], ret_type: TyUnit, throw_row: empty_throw_row()
+  )
+end
+
+let names_of_exts = fn (exts: [LirExternal]) -> [i64] do
+  return names_of_exts_go(exts, acc: [])
+end
+let names_of_exts_go = fn (exts: [LirExternal], acc: [i64]) -> [i64] do
+  match exts do
+    | [] -> return rev_i64(xs: acc, out: [])
+    | LirExternal(name: _, wasm_module: _, wasm_name: wn, params: _, ret_type: _, throw_row: _) :: rest ->
+      // Project to wasm_name length as a stable scalar tag for ordering
+      // checks (wasm_module/wasm_name as a pair are what identifies
+      // the slot, but per-test names below all have distinct lengths).
+      return names_of_exts_go(exts: rest, acc: str.length(s: wn) :: acc)
+  end
+end
+
+let remap_indices = fn (rs: [FuncEntry]) -> [i64] do
+  return remap_indices_go(rs, acc: [])
+end
+let remap_indices_go = fn (rs: [FuncEntry], acc: [i64]) -> [i64] do
+  match rs do
+    | [] -> return rev_i64(xs: acc, out: [])
+    | FuncEntry(name: _, index: i) :: rest ->
+      return remap_indices_go(rs: rest, acc: i :: acc)
+  end
+end
+let rev_i64 = fn (xs: [i64], out: [i64]) -> [i64] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_i64(xs: rest, out: x :: out)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  // ── case 1: empty input ⇒ empty result, no remaps ──
+  let DedupExtResult(exts: e0, remaps: r0) = dedup_externals(exts: [])
+  test_assert.assert_eq_i64(actual: list.length(xs: e0), expected: 0,
+    label: "dedup_externals: [] input → 0 deduped externals")
+  test_assert.assert_eq_i64(actual: list.length(xs: r0), expected: 0,
+    label: "dedup_externals: [] input → 0 remaps")
+
+  // ── case 2: all distinct (wasm_module, wasm_name) pairs ⇒ identity ──
+  // 3 unique imports → 3 deduped, 0 remaps.
+  let exts3 = [
+    mk_ext(name: "alpha", wm: "wasi:io", wn: "read"),
+    mk_ext(name: "beta",  wm: "wasi:io", wn: "write"),
+    mk_ext(name: "gamma", wm: "wasi:cli", wn: "run")
+  ]
+  let DedupExtResult(exts: e3, remaps: r3) = dedup_externals(exts: exts3)
+  test_assert.assert_eq_i64(actual: list.length(xs: e3), expected: 3,
+    label: "dedup_externals: 3 distinct pairs → 3 deduped (no merging)")
+  test_assert.assert_eq_i64(actual: list.length(xs: r3), expected: 0,
+    label: "dedup_externals: 3 distinct pairs → 0 remaps")
+
+  // ── case 3: a duplicate (wasm_module, wasm_name) — diamond import ──
+  // ("wasi:io","read") appears at positions 0 and 2; the position-2 entry
+  // gets folded onto slot 0 and produces a remap with index=0.
+  // Resulting deduped list: [alpha, beta] (positions 0 and 1 kept;
+  // position 2 dropped). One remap with index=0 for the dropped entry.
+  let exts_dup = [
+    mk_ext(name: "alpha", wm: "wasi:io", wn: "read"),
+    mk_ext(name: "beta",  wm: "wasi:io", wn: "write"),
+    mk_ext(name: "delta", wm: "wasi:io", wn: "read")
+  ]
+  let DedupExtResult(exts: e_dup, remaps: r_dup) = dedup_externals(exts: exts_dup)
+  test_assert.assert_eq_i64(actual: list.length(xs: e_dup), expected: 2,
+    label: "dedup_externals: duplicate (wm,wn) → deduped list shrinks by 1")
+  test_assert.assert_eq_i64(actual: list.length(xs: r_dup), expected: 1,
+    label: "dedup_externals: 1 duplicate → 1 remap entry")
+  test_assert.assert_eq_i64_list(actual: remap_indices(rs: r_dup),
+    expected: [0],
+    label: "dedup_externals: duplicate of slot-0 maps to index=0 (first-wins)")
+
+  // Deduped list preserves the relative order of first-occurrences.
+  // "alpha" (wn len=4) at 0, "beta" (wn len=5) at 1; "delta" (wn len=4) merged.
+  test_assert.assert_eq_i64_list(actual: names_of_exts(exts: e_dup),
+    expected: [4, 5],
+    label: "dedup_externals: deduped list preserves first-occurrence order")
+
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end
