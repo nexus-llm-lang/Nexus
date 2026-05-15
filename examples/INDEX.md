@@ -11,9 +11,9 @@ against [`index.schema.json`](./index.schema.json)).
 | --- | --- | --- |
 | `examples/` (root) | Historical end-to-end samples (hello, fib, bench) | 7 |
 | `examples/feature/` | One minimal example per language feature / stdlib module | 38 |
-| `examples/negative/` | Intentionally broken snippets; runner asserts the diagnostic (compile-time *or* runtime throw) | 11 |
+| `examples/negative/` | Intentionally broken snippets; runner asserts the diagnostic (compile-time *or* runtime throw) | 12 |
 
-Total: **56 examples**. See [`negative/run.sh`](./negative/run.sh) for
+Total: **57 examples**. See [`negative/run.sh`](./negative/run.sh) for
 the negative-corpus driver.
 
 ## How to use
@@ -134,6 +134,7 @@ a `println` line emitted just before the throwing site.
 | [`negative/parse_unterminated_string.nx`](./negative/parse_unterminated_string.nx) | E1001 | Unterminated `"..."` literal |
 | [`negative/import_module_not_found.nx`](./negative/import_module_not_found.nx) | E4004 | `import "std:NAME"` with no matching file |
 | [`negative/option_unwrap_none.nx`](./negative/option_unwrap_none.nx) | runtime | `std:option.unwrap(None)` raises `RuntimeError` |
+| [`negative/result_unhandled_err.nx`](./negative/result_unhandled_err.nx) | runtime | Caller raises on `Err(...)` (idiomatic Result→Exn lift) |
 
 ## Schema
 
