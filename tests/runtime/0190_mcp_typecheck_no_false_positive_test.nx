@@ -1,0 +1,156 @@
+// Issue nexus-0190 — MCP `typecheck` tool must not surface diagnostics that
+// `nexus build` accepts cleanly.
+//
+// Repro: a 5-line file that imports `from_i64` from std:str and calls it
+// from main. `nexus build` returns exit 0 with no warnings. Before the fix,
+// the MCP `tools/call typecheck` handler reported a spurious E2001 inside
+// `nxlib/stdlib/str.nx:1225` (the body of `from_char`, an *unreached*
+// stdlib function with a latent i32/char unify bug). Root cause: MCP
+// inherited the LSP `compute_diagnostics_for_buffer` path, which
+// deliberately widens `local_names` to *all* imported HIR functions so
+// the editor surfaces every reachable error. For the agent-facing tool
+// surface that scope is wrong — we want the driver's narrow scope so MCP
+// reports exactly what `nexus build <file>` would reject.
+//
+// Fix: introduce `compute_driver_diagnostics_for_buffer` in
+// `src/lsp/diagnostics_pipeline.nx` (entry-file-only `local_names`,
+// `require_main: false`) and have MCP swap to it.
+//
+// Assertion: typecheck-tool call returns a `content[0].text` payload whose
+// embedded JSON has the literal substring `"summary":"ok:`. We don't
+// inspect the diagnostics array directly because the wire payload is a
+// stringified JSON blob.
+import * as test_assert from "std:test/assert"
+import * as mcp from "src/mcp/main.nx"
+import {
+  JsonValue, JsonInt, JsonString, JsonObject, JsonArray, JsonField,
+  get_field
+} from "std:json"
+import { Some, None } from "std:option"
+import { Request } from "std:jsonrpc"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+import * as str from "std:str"
+
+let repro_source = fn () -> string do
+  return "import { from_i64 } from \"std:str\"\n"
+      ++ "let main = fn () -> unit do\n"
+      ++ "  let _ = from_i64(val: 42)\n"
+      ++ "  ()\n"
+      ++ "end\n"
+end
+
+let repro_path = fn () -> string do
+  return "./.0190_uses_str.nx"
+end
+
+let expect_object_fields = fn (v: JsonValue, label: string) -> [JsonField] throws { Exn } do
+  match v do
+    | JsonObject(fields) -> return fields
+    | _ -> raise RuntimeError(val: label ++ ": expected JsonObject")
+  end
+end
+
+let expect_array_items = fn (v: JsonValue, label: string) -> [JsonValue] throws { Exn } do
+  match v do
+    | JsonArray(items) -> return items
+    | _ -> raise RuntimeError(val: label ++ ": expected JsonArray")
+  end
+end
+
+let expect_string_val = fn (v: JsonValue, label: string) -> string throws { Exn } do
+  match v do
+    | JsonString(val: s) -> return s
+    | _ -> raise RuntimeError(val: label ++ ": expected JsonString")
+  end
+end
+
+let require_field = fn (obj: JsonValue, key: string, label: string) -> JsonValue throws { Exn } do
+  match get_field(obj, key) do
+    | Some(val: v) -> return v
+    | None -> raise RuntimeError(val: label ++ ": missing field '" ++ key ++ "'")
+  end
+end
+
+let test_no_false_positive = fn () -> unit require { Console, Fs } throws { Exn } do
+  let path = repro_path()
+  Fs.write_string(path, content: repro_source())
+  let args = JsonObject(fields: [
+    JsonField(key: "file", value: JsonString(val: path))
+  ])
+  let params = JsonObject(fields: [
+    JsonField(key: "name", value: JsonString(val: "typecheck")),
+    JsonField(key: "arguments", value: args)
+  ])
+  let msg = Request(id: JsonInt(val: 1), method: "tools/call", params)
+  match mcp.dispatch_message(msg) do
+    | None -> raise RuntimeError(val: "tools/call: expected response")
+    | Some(val: resp) ->
+      let result = require_field(obj: resp, key: "result", label: "tools/call.response")
+      let content_v = require_field(obj: result, key: "content", label: "tools/call.result")
+      let content = expect_array_items(v: content_v, label: "content")
+      match content do
+        | block :: _ ->
+          let typ = expect_string_val(
+            v: require_field(obj: block, key: "type", label: "content[0]"),
+            label: "content[0].type"
+          )
+          test_assert.assert_eq_string(
+            actual: typ, expected: "text",
+            label: "content[0].type"
+          )
+          let text = expect_string_val(
+            v: require_field(obj: block, key: "text", label: "content[0]"),
+            label: "content[0].text"
+          )
+          // The clean-typecheck summary string is "ok: typecheck succeeded
+          // with no diagnostics". Pre-fix this would be "found 1
+          // diagnostic(s)" because the LSP-scoped path walked
+          // `str.from_char` and tripped its latent i32/char unify bug.
+          let ok_idx = str.index_of(s: text, sub: "\"summary\":\"ok:")
+          test_assert.assert(
+            cond: ok_idx >= 0,
+            label: "typecheck summary reports 'ok:' for clean source (nexus-0190)"
+          )
+          // Belt-and-braces: the diagnostics array must be empty. We probe
+          // for `"diagnostics":[]` exactly (whitespace-free since
+          // json.serialize emits compact output).
+          let empty_idx = str.index_of(s: text, sub: "\"diagnostics\":[]")
+          test_assert.assert(
+            cond: empty_idx >= 0,
+            label: "typecheck diagnostics array is empty for clean source"
+          )
+        | [] -> raise RuntimeError(val: "tools/call: empty content")
+      end
+      // Best-effort cleanup.
+      try
+        Fs.remove_file(path)
+        return ()
+      catch _ -> return ()
+      end
+  end
+end
+
+let body = fn () -> unit require { Console, Fs } throws { Exn } do
+  test_no_false_positive()
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console, Fs } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole, PermFs } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
