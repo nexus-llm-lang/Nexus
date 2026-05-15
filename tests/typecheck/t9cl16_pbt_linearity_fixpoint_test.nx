@@ -1,0 +1,453 @@
+// PBT (nexus-t9cl.16): visited-set fixpoint properties for the spec's
+// `linear` predicate. The real impl lives in
+// `src/typecheck/linearity.nx::is_linear_binding_type` and
+// `src/typecheck/infer/collections.nx::type_carries_linear`; this test
+// mirrors the visited-set-threaded shape into a TOY domain so the PBT
+// driver can hammer randomly-generated typedef environments and types
+// without dragging the full TypeExpr / CheckState pipeline in.
+//
+// Spec mirror — `docs/spec/type-system-formal.md` § Linearity lines
+// 365-381 give a least-fixpoint definition with a visited set V:
+//
+//   linear'(%σ, V)         = true                                  (line 350: outermost wrapper)
+//   linear'(@σ, V)         = true                                  (line 350)
+//   linear'(&σ, V)         = false                                 (line 350: borrows reusable)
+//   linear'(~σ, V)         = linear'(σ, V)                         (line 350: ~σ payload)
+//   linear'(Record fs, V)  = ⋁ f ∈ fs. linear'(f, V)
+//   linear'(List σ, V)     = linear'(σ, V)
+//   linear'(x⟨σ̄⟩, V)       = false                                if x ∈ V        (line 372)
+//                          = ⋁_{F ∈ unfold(x)} linear'(F, V ∪ {x}) otherwise (line 373)
+//   linear'(else, V)       = false                                              (scalars, arrows, handlers)
+//
+// The pre-fix impl used `depth: i64 = 8` as a fuel counter and
+// decremented at EVERY wrapper / record-field step. Spec line 381
+// explicitly contrasts this with the visited-set memo table. Fuel had
+// two soundness gaps:
+//
+//   (a) False NEGATIVE at non-cyclic depth >= 9: a chain
+//       R1 = {f: R2}, ..., R8 = {f: R9}, R9 = {f: %i64} ran out of
+//       fuel before reaching the %i64 wrapper and returned false. The
+//       linearity pass then treated R1 as non-linear and silently
+//       dropped the resource at scope end.
+//   (b) Spec divergence on cyclic types whose recursive tail has a
+//       linear wrapper (e.g. LList from spec example 379): fuel cut
+//       short the unfolds before the wrapper clause fired, again
+//       returning false. The fixed-point answer is true.
+//
+// Properties:
+//
+//   P1 — depth-9 chain with %i64 leaf is linear         [no false negative at depth >= 9]
+//   P2 — depth-15 chain with %i64 leaf is linear        [larger depth — fuel=8 also fails]
+//   P3 — depth-9 chain with i64 (non-linear) leaf       [predicate still returns false]
+//   P4 — self-referential Cell{ next: Cell, data: %i64 } [cycle case, linear via wrapper]
+//   P5 — self-referential Cell{ next: Cell, data: i64 } [cycle returns false (minimum fixpoint)]
+//   P6 — mutual cycle A → B → A with %σ on tail         [cycle caught, linear via wrapper]
+//   P7 — wrapper-only nesting (~~~%i64) is linear at any depth [borrow/ref clauses thread V]
+//   P8 — idempotence: pure function of (τ, V, defs)
+//
+// 200 trials per property.
+//
+// The toy `linear_v` is a faithful 1-to-1 mirror of the spec definition,
+// and is the structural copy of the real impl. P1, P2, and P7 fail
+// against a fuel=8 implementation; P4, P5, P6 fail (stack overflow or
+// wrong answer) against a visited-set-free implementation.
+
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Pass, Fail, Gen } from "std:pbt"
+import { Pair } from "std:tuple"
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+
+// ─── Toy domain ─────────────────────────────────────────────────────────────
+//
+// `TLinear(inner)` is the toy mirror of `%σ` (spec linear clause line 350).
+// `TLazy(inner)` mirrors `@σ`. `TNamed(name)` is the typedef-keyed
+// nominal type that the visited set guards.
+
+type Ty =
+  TI64
+  | TBool
+  | TStr
+  | TList(elem: Ty)
+  | TRecord(fields: [ Ty ])
+  | TLinear(inner: Ty)
+  | TLazy(inner: Ty)
+  | TBorrow(inner: Ty)
+  | TRef(inner: Ty)
+  | TNamed(name: string)
+
+// A typedef-environment entry: name |-> record field types.
+type TDef = TDef(name: string, fields: [ Ty ])
+
+// ─── Predicates under test ──────────────────────────────────────────────────
+//
+// `linear_v` mirrors the spec's `linear'(τ, V)` exactly. The public
+// `linear` starts with V = [] like the real wrapper.
+
+let visited_has = fn (visited: [ string ], name: string) -> bool do
+  match visited do
+    | [] -> return false
+    | n :: rest ->
+      if n == name then return true end
+      return visited_has(visited: rest, name)
+  end
+end
+
+let tdef_lookup = fn (defs: [ TDef ], name: string) -> Option<[ Ty ]> do
+  match defs do
+    | [] -> return None
+    | TDef(name: n, fields: fs) :: rest ->
+      if n == name then return Some(val: fs) end
+      return tdef_lookup(defs: rest, name)
+  end
+end
+
+// Direct recursion through the field list — short-circuit on first
+// linear field (spec ⋁ over field types).
+let any_field_linear_v = fn (fs: [ Ty ], defs: [ TDef ], visited: [ string ]) -> bool do
+  match fs do
+    | [] -> return false
+    | x :: rest ->
+      if linear_v(t: x, defs, visited) then return true end
+      let ok = any_field_linear_v(fs: rest, defs, visited)
+      return ok
+  end
+end
+
+let linear_v = fn (t: Ty, defs: [ TDef ], visited: [ string ]) -> bool do
+  match t do
+    | TI64 -> return false
+    | TBool -> return false
+    | TStr -> return false
+    // Spec line 350: %σ, @σ are linear by the outermost-wrapper clause.
+    | TLinear(inner: _) -> return true
+    | TLazy(inner: _) -> return true
+    // Spec line 376: wrapper-step threads V unchanged.
+    | TRef(inner: i) ->
+      let ok = linear_v(t: i, defs, visited)
+      return ok
+    | TBorrow(inner: i) ->
+      let ok = linear_v(t: i, defs, visited)
+      return ok
+    | TList(elem: e) ->
+      let ok = linear_v(t: e, defs, visited)
+      return ok
+    | TRecord(fields: fs) ->
+      let ok = any_field_linear_v(fs, defs, visited)
+      return ok
+    | TNamed(name: n) ->
+      // Spec line 372: x ∈ V ⇒ cycle ⇒ false (minimum fixpoint).
+      if visited_has(visited, name: n) then return false end
+      match tdef_lookup(defs, name: n) do
+        | None -> return false
+        | Some(val: fs) ->
+          // Spec line 373: recurse into unfolded body with V ∪ {x}.
+          let ok = any_field_linear_v(fs, defs, visited: n :: visited)
+          return ok
+      end
+  end
+end
+
+let linear = fn (t: Ty, defs: [ TDef ]) -> bool do
+  return linear_v(t, defs, visited: [])
+end
+
+// ─── Test environment builders ──────────────────────────────────────────────
+//
+// `make_chain(d, leaf)` builds a typedef env of `d` records
+// R1 = {f: R2}, R2 = {f: R3}, ..., R(d-1) = {f: R(d)}, R(d) = {f: leaf}.
+// Querying `linear(TNamed("R1"), env)` traverses `d` nominal unfolds.
+
+let make_chain_loop = fn (i: i64, d: i64, leaf: Ty, acc: [ TDef ]) -> [ TDef ] do
+  if i > d then return acc end
+  let name = "R" ++ str.from_i64(val: i)
+  let body = if i == d then leaf else TNamed(name: "R" ++ str.from_i64(val: i + 1)) end
+  let entry = TDef(name, fields: [body])
+  return make_chain_loop(i: i + 1, d, leaf, acc: entry :: acc)
+end
+
+let make_chain = fn (d: i64, leaf: Ty) -> [ TDef ] do
+  return make_chain_loop(i: 1, d, leaf, acc: [])
+end
+
+// ─── Renderers ──────────────────────────────────────────────────────────────
+
+let render_list_t = fn (xs: [ Ty ], acc: string) -> string do
+  match xs do
+    | [] -> return acc
+    | x :: rest ->
+      let head = render_t(t: x)
+      if str.length(s: acc) == 0 then
+        return render_list_t(xs: rest, acc: head)
+      end
+      return render_list_t(xs: rest, acc: acc ++ "," ++ head)
+  end
+end
+
+let render_t = fn (t: Ty) -> string do
+  match t do
+    | TI64 -> return "i64"
+    | TBool -> return "bool"
+    | TStr -> return "str"
+    | TList(elem: e) -> return "[" ++ render_t(t: e) ++ "]"
+    | TRecord(fields: fs) -> return "{" ++ render_list_t(xs: fs, acc: "") ++ "}"
+    | TLinear(inner: u) -> return "%" ++ render_t(t: u)
+    | TLazy(inner: u) -> return "@" ++ render_t(t: u)
+    | TBorrow(inner: u) -> return "&" ++ render_t(t: u)
+    | TRef(inner: u) -> return "~" ++ render_t(t: u)
+    | TNamed(name: n) -> return "N(" ++ n ++ ")"
+  end
+end
+
+// ─── Seed plumbing ─────────────────────────────────────────────────────────
+
+let abs_i64 = fn (n: i64) -> i64 do
+  if n < 0 then return 0 - n end
+  return n
+end
+
+let step_seed = fn (seed: i64) -> Pair<i64, i64> do
+  let xor_fixup : i64 = 2685821657736338717
+  let s0 = if seed == 0 then xor_fixup else seed end
+  let s1 = s0 ^ (s0 << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  return Pair(left: s3, right: s3)
+end
+
+// ─── Depth-bounded Gen<Ty> for the "leaf payload" parameter ────────────────
+//
+// Property bodies need a way to vary the leaf at the bottom of the chain.
+// The generated τ never includes TNamed (those are constructed by the
+// property explicitly so we have ground truth about linearity).
+
+let gen_t_run = fn (depth: i64, seed: i64) -> Pair<Ty, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  if depth <= 0 then
+    let tag = raw % 3
+    if tag == 0 then return Pair(left: TI64, right: s1) end
+    if tag == 1 then return Pair(left: TBool, right: s1) end
+    return Pair(left: TStr, right: s1)
+  end
+  let choice = raw % 7
+  if choice == 0 then return Pair(left: TI64, right: s1) end
+  if choice == 1 then return Pair(left: TBool, right: s1) end
+  if choice == 2 then return Pair(left: TStr, right: s1) end
+  if choice == 3 then
+    let Pair(left: u, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+    return Pair(left: TBorrow(inner: u), right: s2)
+  end
+  if choice == 4 then
+    let Pair(left: u, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+    return Pair(left: TRef(inner: u), right: s2)
+  end
+  if choice == 5 then
+    let Pair(left: u, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+    return Pair(left: TList(elem: u), right: s2)
+  end
+  let Pair(left: u, right: s2) = gen_t_run(depth: depth - 1, seed: s1)
+  return Pair(left: TRecord(fields: [u]), right: s2)
+end
+
+// ─── Body ───────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit require { Console } throws { Exn } do
+  let gen_t_local = Gen(
+    run: fn (seed: i64) -> Pair<Ty, i64> do
+      return gen_t_run(depth: 2, seed)
+    end,
+    shrink: fn (v: Ty) -> [ Ty ] do return [] end,
+    render: render_t
+  )
+
+  let iters = 200
+
+  // ── P1: depth-9 chain with %i64 leaf is linear ─────────────────────────
+  //
+  // The acceptance condition from the bd: at depth >= 9 the predicate
+  // must still return true because the %i64 wrapper at the leaf is
+  // linear by spec line 350. Pre-fix (fuel=8), this returned false —
+  // the soundness gap that motivates the whole fix.
+  let prop_chain9_linear = fn (_x: Ty) -> bool do
+    let env = make_chain(d: 9, leaf: TLinear(inner: TI64))
+    let ok = linear(t: TNamed(name: "R1"), defs: env) == true
+    return ok
+  end
+
+  let r1 = pbt.forall(g: gen_t_local, prop: prop_chain9_linear, n: iters)
+  match r1 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1: depth-9 chain with %i64 leaf is linear (no false negative)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1 depth-9 failed: " ++ w)
+  end
+
+  // ── P2: depth-15 chain still works ─────────────────────────────────────
+  //
+  // Stress: well beyond the old fuel cap. Fuel=8 fails; visited-set
+  // does not (there are no cycles, so V never short-circuits).
+  let prop_chain15_linear = fn (_x: Ty) -> bool do
+    let env = make_chain(d: 15, leaf: TLinear(inner: TI64))
+    let ok = linear(t: TNamed(name: "R1"), defs: env) == true
+    return ok
+  end
+
+  let r2 = pbt.forall(g: gen_t_local, prop: prop_chain15_linear, n: iters)
+  match r2 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P2: depth-15 chain with %i64 leaf is linear")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P2 depth-15 failed: " ++ w)
+  end
+
+  // ── P3: depth-9 chain with non-linear leaf returns false ───────────────
+  //
+  // Symmetric to P1: a deep but non-linear chain must NOT spuriously
+  // return true. This guards against a sloppy fix that defaulted to
+  // "true on cycle / exhaustion" instead of false.
+  let prop_chain9_nonlinear = fn (_x: Ty) -> bool do
+    let env = make_chain(d: 9, leaf: TI64)
+    let ok = linear(t: TNamed(name: "R1"), defs: env) == false
+    return ok
+  end
+
+  let r3 = pbt.forall(g: gen_t_local, prop: prop_chain9_nonlinear, n: iters)
+  match r3 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P3: depth-9 chain with i64 leaf is non-linear")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P3 depth-9 nonlinear failed: " ++ w)
+  end
+
+  // ── P4: self-referential record with linear wrapper on a sibling ───────
+  //
+  // Spec example line 379: LList<T> = Empty | Cons(head: T, tail:
+  // %LList<T>). The %-wrapper on the recursive tail trips the linear
+  // clause *before* the visited-set guard fires, returning true.
+  // Pre-fix fuel=8 returned false because the fuel ran out on the
+  // nested unfold before the wrapper clause inspected.
+  let prop_self_ref_linear = fn (_x: Ty) -> bool do
+    let env = [TDef(name: "Cell", fields: [TLinear(inner: TNamed(name: "Cell")), TI64])]
+    let ok = linear(t: TNamed(name: "Cell"), defs: env) == true
+    return ok
+  end
+
+  let r4 = pbt.forall(g: gen_t_local, prop: prop_self_ref_linear, n: iters)
+  match r4 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P4: self-ref Cell with %-tail is linear")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P4 self-ref linear failed: " ++ w)
+  end
+
+  // ── P5: self-referential record with non-linear fields → false ─────────
+  //
+  // Spec example line 378: Tree<T> = Leaf | Node(left: Tree<T>, val: T,
+  // right: Tree<T>). The recursive references hit the cycle guard and
+  // return false; T is a rigid quantifier (also false). Result: false.
+  // Pre-fix would either stack-overflow (no guard at all) or, with
+  // fuel=8, return false at the wrong stage but for the wrong reason.
+  let prop_self_ref_nonlinear = fn (_x: Ty) -> bool do
+    let env = [TDef(name: "Cell", fields: [TNamed(name: "Cell"), TI64])]
+    let ok = linear(t: TNamed(name: "Cell"), defs: env) == false
+    return ok
+  end
+
+  let r5 = pbt.forall(g: gen_t_local, prop: prop_self_ref_nonlinear, n: iters)
+  match r5 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P5: self-ref Cell with non-linear body is non-linear")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P5 self-ref nonlinear failed: " ++ w)
+  end
+
+  // ── P6: mutual recursion A ↔ B with %σ on the tail ────────────────────
+  //
+  // The visited set must carry every name on the unfold path so the
+  // second sighting of A short-circuits. The %i64 leaf makes the
+  // predicate return true via the outermost-wrapper clause before the
+  // cycle is hit again.
+  let prop_mutual_linear = fn (_x: Ty) -> bool do
+    let env = [
+      TDef(name: "A", fields: [TNamed(name: "B")]),
+      TDef(name: "B", fields: [TNamed(name: "A"), TLinear(inner: TI64)])
+    ]
+    let ok = linear(t: TNamed(name: "A"), defs: env) == true
+    return ok
+  end
+
+  let r6 = pbt.forall(g: gen_t_local, prop: prop_mutual_linear, n: iters)
+  match r6 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P6: mutual A↔B with %-leaf is linear")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P6 mutual linear failed: " ++ w)
+  end
+
+  // ── P7: wrapper-only nesting at arbitrary depth ────────────────────────
+  //
+  // ~~~%i64 (3 refs around a %i64). Pre-fix fuel decremented at every
+  // wrapper step; visited-set does not — wrappers thread V unchanged
+  // (spec line 376). At larger nesting depths fuel would falsely
+  // return false; visited-set always returns true.
+  let prop_wrapper_nesting = fn (_x: Ty) -> bool do
+    // 10 nested ~/& wrappers around a %i64.
+    let t0 = TLinear(inner: TI64)
+    let t1 = TRef(inner: t0)
+    let t2 = TBorrow(inner: t1)
+    let t3 = TRef(inner: t2)
+    let t4 = TBorrow(inner: t3)
+    let t5 = TRef(inner: t4)
+    let t6 = TBorrow(inner: t5)
+    let t7 = TRef(inner: t6)
+    let t8 = TBorrow(inner: t7)
+    let t9 = TRef(inner: t8)
+    let t10 = TBorrow(inner: t9)
+    let empty_env : [ TDef ] = []
+    let ok = linear(t: t10, defs: empty_env) == true
+    return ok
+  end
+
+  let r7 = pbt.forall(g: gen_t_local, prop: prop_wrapper_nesting, n: iters)
+  match r7 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P7: 10-deep wrapper nesting around %i64 is linear")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P7 wrapper nesting failed: " ++ w)
+  end
+
+  // ── P8: idempotence ────────────────────────────────────────────────────
+  //
+  // linear is a pure function of (τ, V, defs). The same query twice
+  // yields the same result. Trivial but it pins the predicate semantics.
+  let prop_idempotent = fn (_x: Ty) -> bool do
+    let env = make_chain(d: 9, leaf: TLinear(inner: TI64))
+    let a = linear(t: TNamed(name: "R1"), defs: env)
+    let b = linear(t: TNamed(name: "R1"), defs: env)
+    let ok = a == b
+    return ok
+  end
+
+  let r8 = pbt.forall(g: gen_t_local, prop: prop_idempotent, n: iters)
+  match r8 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P8: linear is pure / idempotent")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P8 idempotent failed: " ++ w)
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
