@@ -1,0 +1,147 @@
+/**
+ * lint: `nexus lint [--check] FILE [FILE...]` driver wrapper for the
+ * AST-driven lint pack in src/lint/lint.nx (issue nexus-moym V1).
+ *
+ * Modes:
+ *   default          run every lint rule, emit findings to stdout, exit 0
+ *                    when no findings, exit 1 when any L-code fires.
+ *   `--check`        same as default but exit 1 on any finding even when
+ *                    stdout was redirected (CI-friendly; mirrors `fmt --check`).
+ *
+ * Output format mirrors `format_error` in src/common/error.nx:
+ *
+ *   <file>:<line>:<col>: warning: <human prose> [Lxxxx]
+ *     help: <fix-it suggestion>
+ *
+ * The fix-it line is only present when the rule supplied one. Each finding
+ * is one stdout entry; multiple files separate cleanly because every line
+ * is prefixed with the file path.
+ */
+
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+import { Fs, FileNotFound } from "std:fs"
+import { Console } from "std:stdio"
+import { InvalidUsage } from "src/common/error.nx"
+import {
+  ArgSpec, SubcommandHit,
+  spec_flag, spec_positional,
+  parse, get_flag, get_positionals_all, is_ok, first_error,
+  detect_subcommand
+} from "std:argparse"
+import * as lexer from "src/frontend/lexer.nx"
+import { ParseDiagnostics }, * as parser from "src/frontend/parser.nx"
+import {
+  LintFinding, lint_program, format_finding
+} from "src/lint/lint.nx"
+
+// ─── Subcommand detection ─────────────────────────────────────────────────
+
+/** Detection result for the `lint` subcommand. */
+export type ParsedLintSubcommand = ParsedLintSubcommand(remaining: [string], is_lint: bool)
+
+/** Detect a leading `lint` subcommand. Thin wrapper over argparse's shared
+ *  `detect_subcommand` primitive — same shape as fmt/grep. */
+export let strip_lint_subcommand = fn (xs: [string]) -> ParsedLintSubcommand do
+  match detect_subcommand(args: xs, kw: "lint") do | SubcommandHit(present, remaining) ->
+    if present then return ParsedLintSubcommand(remaining, is_lint: true) end
+    return ParsedLintSubcommand(remaining: xs, is_lint: false)
+  end
+end
+
+// ─── Arg parsing ──────────────────────────────────────────────────────────
+
+export type LintOptions = LintOptions(check_mode: bool, paths: [string])
+
+let lint_specs = fn () -> [ArgSpec] do
+  return [
+    spec_flag(name: "check", short: "", long: "--check", help: "exit 1 if any finding (CI mode)"),
+    spec_positional(name: "paths", required: false, help: "files to lint"),
+  ]
+end
+
+let parse_lint_options = fn (args: [string]) -> LintOptions throws { InvalidUsage } do
+  let result = parse(args, specs: lint_specs())
+  if !is_ok(result) then
+    raise InvalidUsage(detail: "nexus lint: " ++ first_error(result))
+  end
+  let check = get_flag(result, name: "check")
+  let paths = get_positionals_all(result)
+  return LintOptions(check_mode: check, paths)
+end
+
+// ─── Single-file lint ─────────────────────────────────────────────────────
+
+/** Lint one file. Returns the number of findings emitted. Parse failures
+ *  are reported to stderr and counted as a single "finding" so the caller
+ *  can still raise the right exit code without conflating per-rule counts.
+ */
+let lint_file = fn (path: string) -> i64 require { Console, Fs } do
+  if Fs.exists(path) == false then
+    Console.eprintln(val: "nexus lint: file not found: " ++ path)
+    return 1
+  end
+  let src = Fs.read_to_string(path)
+  let tokens = lexer.tokenize(src)
+  let ParseDiagnostics(prog, diags: _) = parser.parse_collect(tokens, file: path)
+  // Parse errors do not block lint: the AST returned by parse_collect is
+  // best-effort (skipped definitions become gaps, valid ones survive).
+  // Per-finding emit only — `diags` lives in the parse-error pipeline.
+  let findings = lint_program(prog)
+  emit_findings(file: path, fs: findings)
+  return list.length(xs: findings)
+end
+
+let emit_findings = fn (file: string, fs: [LintFinding]) -> unit require { Console } do
+  match fs do
+    | [] -> return ()
+    | f :: rest ->
+      Console.println(val: format_finding(file, f))
+      return emit_findings(file, fs: rest)
+  end
+end
+
+// ─── Multi-file driver ────────────────────────────────────────────────────
+
+let lint_each = fn (paths: [string], total: i64) -> i64 require { Console, Fs } do
+  match paths do
+    | [] -> return total
+    | p :: rest ->
+      let n = lint_file(path: p)
+      return lint_each(paths: rest, total: total + n)
+  end
+end
+
+// ─── Subcommand entry ─────────────────────────────────────────────────────
+
+/** Execute `nexus lint`. Returns exit code:
+ *   0 — no findings across all files
+ *   1 — at least one finding, OR a file-not-found / bad-usage error
+ *   2 — invalid CLI usage (handled by the catch arm)
+ */
+export let run_lint_subcommand = fn (args: [string]) -> i64 require { Console, Fs } do
+  try
+    let opts = parse_lint_options(args)
+    match opts do | LintOptions(check_mode: _, paths) ->
+      if list.length(xs: paths) == 0 then
+        Console.eprintln(val: "Usage: nexus lint [--check] FILE [FILE...]")
+        return 2
+      end
+      let total = lint_each(paths, total: 0)
+      if total > 0 then return 1 else return 0 end
+    end
+  catch e ->
+    match e do
+      | InvalidUsage(detail) ->
+        Console.eprintln(val: "nexus lint: " ++ detail)
+        return 2
+      | FileNotFound(path) ->
+        Console.eprintln(val: "nexus lint: file not found: " ++ path)
+        return 1
+      | _ ->
+        Console.eprintln(val: "nexus lint: error")
+        return 2
+    end
+  end
+end

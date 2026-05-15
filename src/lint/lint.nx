@@ -1,0 +1,760 @@
+/**
+ * lint: AST-driven lint pack for AI-frequent error patterns (nexus-moym).
+ *
+ * Scope V1: minimal framework + two reliable rules that fire on programs
+ * that type-check successfully but exhibit smell patterns LLM-generated
+ * code routinely produces. Each rule has a stable L-code so downstream
+ * tooling (LSP, fix-it appliers) can key on it.
+ *
+ * Rules implemented:
+ *   L0001  empty-inject: `inject H do end` with no statements in the body.
+ *          The handler binding is allocated and the cap is in scope but
+ *          nothing in the body uses it; the entire wrapper is dead code.
+ *          Fix-it: delete the inject wrapper, keep the (empty) body.
+ *   L0002  unused-require-cap: a function declares `require { Cap }` but
+ *          the body has NO call (direct or via helpers) — i.e. it cannot
+ *          consume any capability. The declared row is purely decorative.
+ *          Fix-it: drop the capability from the `require` row.
+ *
+ * Design choices (V1):
+ *   - Walks the parsed AST directly. No HIR / typecheck dependency: lint
+ *     runs against source files independently of the build pipeline and
+ *     can surface findings on partially-valid programs (when extended).
+ *   - L0002 is **deliberately narrow**: it fires only when the body is
+ *     call-free (no `f(...)` calls anywhere). A function that calls a
+ *     helper could be transitively consuming the cap through that
+ *     helper's own require-row; without a real effect analysis the
+ *     syntactic walker cannot tell, so the narrower rule has zero
+ *     false positives at the cost of missing the
+ *     "cap-declared-but-consumed-only-via-helper" pattern. That broader
+ *     rule is tracked as L0004 (deferred — needs effect-row analysis).
+ *   - Each finding carries an optional `fix_it` suggestion string. V1
+ *     reports the suggestion textually; a future `nexus lint --fix`
+ *     applier (deferred) can consume the L-code + span to rewrite source.
+ *
+ * Deferred rules (tracked under nexus-moym follow-ups):
+ *   L0003  missing-require-cap (the symmetric `b` case from the bd —
+ *          calls a cap method without declaring the cap)
+ *   L0004  effect-row-based unused-cap (broader L0002 that walks the
+ *          callee graph via the typecheck effect map, catching caps
+ *          consumed only through helpers)
+ *   L0005  unnecessary-inject-handler (handler in `inject H1, H2 do …`
+ *          whose port never receives a body-side call)
+ */
+
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+
+import { Span } from "src/common/token.nx"
+import {
+  Program, SpannedTopLevel, TopLevel, TLLet, GlobalLet,
+  SpannedExpr, Expr, ExprLambda, ExprCall, ExprIf, ExprMatch, ExprWhile,
+  ExprFor, ExprBinaryOp, ExprUnaryOp, ExprArray, ExprList, ExprRecord,
+  ExprIndex, ExprFieldAccess, ExprRaise, ExprForce, ExprHandler,
+  ExprConstructor,
+  SpannedStmt, Stmt, StmtLet, StmtLetPattern, StmtExpr, StmtReturn,
+  StmtAssign, StmtIndexAssign, StmtTry, StmtInject,
+  TypeExpr, TyRow, TyUserDefined,
+  HandlerArm, MatchCase, CatchArm, Function,
+  NamedExpr, CallArg, CtorArg
+} from "src/common/ast.nx"
+import * as rdr from "src/ir/rdrname.nx"
+
+// ─── Diagnostic shape ────────────────────────────────────────────────────────
+
+/** Severity tag for lint findings. V1 emits only Warning — Info / Error
+ *  reserved for future rule classes (e.g. style nits vs. likely bugs).
+ */
+export type LintSeverity = LintWarning | LintInfo
+
+/** One lint finding. `code` is the stable Lxxxx identifier; `fix_it` is a
+ *  human-readable suggestion (None when the rule has no auto-applicable
+ *  hint). `span` localises the finding to a source range; the file path
+ *  is held at the runner level rather than per-finding to keep the type
+ *  small.
+ */
+export type LintFinding = LintFinding(
+  code: string,
+  severity: LintSeverity,
+  message: string,
+  fix_it: Option<string>,
+  span: Span
+)
+
+// ─── Capability name extraction ──────────────────────────────────────────────
+//
+// A capability appears in the source as a bare `TyUserDefined(name: C, args:
+// [])` entry inside the function's `require {…}` row. The set of names that
+// look like capabilities for L0002 purposes is the set of "Cap-shaped" idents
+// — capitalised, no `Perm` prefix (those are permission tokens consumed by
+// system handlers, not user-facing cap surfaces). Permission tokens are
+// excluded because the user does not call methods on `PermConsole`; only
+// `Console.*` is callable.
+
+let starts_with_upper = fn (s: string) -> bool do
+  if str.length(s) == 0 then return false end
+  let c = str.char_at(s, idx: 0)
+  return c >= 'A' && c <= 'Z'
+end
+
+let is_perm_token = fn (name: string) -> bool do
+  return str.starts_with(s: name, prefix: "Perm")
+end
+
+/** Extract capability names declared in a `TyRow` requires-clause. Skips
+ *  `PermX` permission tokens (those are system-handler private surfaces)
+ *  and any non-identifier-shaped entry. Order-preserving so the lint
+ *  reports findings in declaration order.
+ */
+let cap_names_in_row = fn (row: TypeExpr) -> [string] do
+  match row do
+    | TyRow(types: ts, rest: _) -> return cap_names_in_row_loop(xs: ts, acc: [])
+    | _ -> return []
+  end
+end
+
+let cap_names_in_row_loop = fn (xs: [TypeExpr], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | TyUserDefined(name: n, args: _) :: rest ->
+      if is_perm_token(name: n) then
+        return cap_names_in_row_loop(xs: rest, acc: acc)
+      end
+      if !starts_with_upper(s: n) then
+        return cap_names_in_row_loop(xs: rest, acc: acc)
+      end
+      return cap_names_in_row_loop(xs: rest, acc: n :: acc)
+    | _ :: rest -> return cap_names_in_row_loop(xs: rest, acc: acc)
+  end
+end
+
+// ─── L0002: scan body for `Cap.<method>` invocations ─────────────────────────
+//
+// A `Console.println(val: "x")` parses as `ExprCall(func: <qualified-rdr>,
+// args: …)`. The rdr's first segment (or only segment in unqual form) is
+// the cap name. To stay seed-compatible we walk the rdr via the rdr.nx
+// helpers rather than pattern-matching the variant directly.
+
+let call_targets_cap = fn (func: rdr.RdrName, c_name: string) -> bool do
+  let s = rdr.rdr_to_string(r: func)
+  // The renamed string form is `Cap.method` for qualified port-method
+  // calls. Strict prefix check: `Console` must not also fire on
+  // `ConsoleEx.method` if such a name ever exists.
+  let needle = c_name ++ "."
+  return str.starts_with(s, prefix: needle)
+end
+
+let any_call_to_cap_in_expr = fn (e: SpannedExpr, c_name: string) -> bool do
+  match e do | SpannedExpr(node, span: _) ->
+    return any_call_to_cap_in_node(e: node, c_name: c_name)
+  end
+end
+
+let any_call_to_cap_in_node = fn (e: Expr, c_name: string) -> bool do
+  match e do
+    | ExprCall(func, args) ->
+      if call_targets_cap(func: func, c_name: c_name) then return true end
+      return any_call_to_cap_in_args(args: args, c_name: c_name)
+    | ExprBinaryOp(left, op: _, right) ->
+      if any_call_to_cap_in_expr(e: left, c_name: c_name) then return true end
+      return any_call_to_cap_in_expr(e: right, c_name: c_name)
+    | ExprUnaryOp(op: _, operand) ->
+      return any_call_to_cap_in_expr(e: operand, c_name: c_name)
+    | ExprConstructor(name: _, args, sigil: _) ->
+      return any_call_to_cap_in_ctor_args(args: args, c_name: c_name)
+    | ExprArray(elements) ->
+      return any_call_to_cap_in_exprs(es: elements, c_name: c_name)
+    | ExprList(elements) ->
+      return any_call_to_cap_in_exprs(es: elements, c_name: c_name)
+    | ExprRecord(fields) ->
+      return any_call_to_cap_in_record_fields(fs: fields, c_name: c_name)
+    | ExprIndex(target, index) ->
+      if any_call_to_cap_in_expr(e: target, c_name: c_name) then return true end
+      return any_call_to_cap_in_expr(e: index, c_name: c_name)
+    | ExprFieldAccess(target, field: _) ->
+      return any_call_to_cap_in_expr(e: target, c_name: c_name)
+    | ExprIf(cond, then_branch, else_branch) ->
+      if any_call_to_cap_in_expr(e: cond, c_name: c_name) then return true end
+      if any_call_to_cap_in_stmts(ss: then_branch, c_name: c_name) then return true end
+      return any_call_to_cap_in_stmts(ss: else_branch, c_name: c_name)
+    | ExprMatch(target, cases) ->
+      if any_call_to_cap_in_expr(e: target, c_name: c_name) then return true end
+      return any_call_to_cap_in_cases(cs: cases, c_name: c_name)
+    | ExprWhile(cond, body) ->
+      if any_call_to_cap_in_expr(e: cond, c_name: c_name) then return true end
+      return any_call_to_cap_in_stmts(ss: body, c_name: c_name)
+    | ExprFor(var: _, start, end_expr, body) ->
+      if any_call_to_cap_in_expr(e: start, c_name: c_name) then return true end
+      if any_call_to_cap_in_expr(e: end_expr, c_name: c_name) then return true end
+      return any_call_to_cap_in_stmts(ss: body, c_name: c_name)
+    | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body) ->
+      // A nested lambda introduces its own require-clause, but its body
+      // can still reference the outer cap as a captured handler. Treat
+      // the inner body as part of the outer for L0002 purposes — under
+      // this check, the cap is "used" if any textual `Cap.` call appears
+      // anywhere reachable from the function body.
+      return any_call_to_cap_in_stmts(ss: body, c_name: c_name)
+    | ExprRaise(value) ->
+      return any_call_to_cap_in_expr(e: value, c_name: c_name)
+    | ExprForce(value) ->
+      return any_call_to_cap_in_expr(e: value, c_name: c_name)
+    | ExprHandler(coeffect_name: _, requires: _, arms) ->
+      return any_call_to_cap_in_handler_arms(arms: arms, c_name: c_name)
+    | _ -> return false
+  end
+end
+
+let any_call_to_cap_in_args = fn (args: [CallArg], c_name: string) -> bool do
+  match args do
+    | [] -> return false
+    | a :: rest ->
+      match a do | CallArg(name: _, value) ->
+        if any_call_to_cap_in_expr(e: value, c_name: c_name) then return true end
+        return any_call_to_cap_in_args(args: rest, c_name: c_name)
+      end
+  end
+end
+
+let any_call_to_cap_in_ctor_args = fn (args: [CtorArg], c_name: string) -> bool do
+  match args do
+    | [] -> return false
+    | a :: rest ->
+      match a do | CtorArg(name: _, value) ->
+        if any_call_to_cap_in_expr(e: value, c_name: c_name) then return true end
+        return any_call_to_cap_in_ctor_args(args: rest, c_name: c_name)
+      end
+  end
+end
+
+let any_call_to_cap_in_exprs = fn (es: [SpannedExpr], c_name: string) -> bool do
+  match es do
+    | [] -> return false
+    | e :: rest ->
+      if any_call_to_cap_in_expr(e: e, c_name: c_name) then return true end
+      return any_call_to_cap_in_exprs(es: rest, c_name: c_name)
+  end
+end
+
+let any_call_to_cap_in_record_fields = fn (fs: [NamedExpr], c_name: string) -> bool do
+  match fs do
+    | [] -> return false
+    | f :: rest ->
+      match f do | NamedExpr(name: _, value) ->
+        if any_call_to_cap_in_expr(e: value, c_name: c_name) then return true end
+        return any_call_to_cap_in_record_fields(fs: rest, c_name: c_name)
+      end
+  end
+end
+
+let any_call_to_cap_in_cases = fn (cs: [MatchCase], c_name: string) -> bool do
+  match cs do
+    | [] -> return false
+    | c :: rest ->
+      match c do | MatchCase(pattern: _, body) ->
+        if any_call_to_cap_in_stmts(ss: body, c_name: c_name) then return true end
+        return any_call_to_cap_in_cases(cs: rest, c_name: c_name)
+      end
+  end
+end
+
+let any_call_to_cap_in_handler_arms = fn (arms: [HandlerArm], c_name: string) -> bool do
+  match arms do
+    | [] -> return false
+    | a :: rest ->
+      match a do | HandlerArm(arm, cont_binder: _, span: _) ->
+        match arm do | Function(name: _, is_public: _, type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body, span: _) ->
+          if any_call_to_cap_in_stmts(ss: body, c_name: c_name) then return true end
+          return any_call_to_cap_in_handler_arms(arms: rest, c_name: c_name)
+        end
+      end
+  end
+end
+
+let any_call_to_cap_in_stmts = fn (ss: [SpannedStmt], c_name: string) -> bool do
+  match ss do
+    | [] -> return false
+    | s :: rest ->
+      match s do | SpannedStmt(node, span: _) ->
+        if any_call_to_cap_in_stmt(s: node, c_name: c_name) then return true end
+        return any_call_to_cap_in_stmts(ss: rest, c_name: c_name)
+      end
+  end
+end
+
+let any_call_to_cap_in_stmt = fn (s: Stmt, c_name: string) -> bool do
+  match s do
+    | StmtLet(name: _, sigil: _, typ: _, value) -> return any_call_to_cap_in_expr(e: value, c_name: c_name)
+    | StmtLetPattern(pattern: _, value) -> return any_call_to_cap_in_expr(e: value, c_name: c_name)
+    | StmtExpr(expr) -> return any_call_to_cap_in_expr(e: expr, c_name: c_name)
+    | StmtReturn(value) -> return any_call_to_cap_in_expr(e: value, c_name: c_name)
+    | StmtAssign(target: _, value) -> return any_call_to_cap_in_expr(e: value, c_name: c_name)
+    | StmtIndexAssign(target, index, value) ->
+      if any_call_to_cap_in_expr(e: target, c_name: c_name) then return true end
+      if any_call_to_cap_in_expr(e: index, c_name: c_name) then return true end
+      return any_call_to_cap_in_expr(e: value, c_name: c_name)
+    | StmtTry(body, catch_arms) ->
+      if any_call_to_cap_in_stmts(ss: body, c_name: c_name) then return true end
+      return any_call_to_cap_in_catch_arms(arms: catch_arms, c_name: c_name)
+    | StmtInject(handlers, body) ->
+      // Handler expression list may itself reference Cap.method as a
+      // value (rare but possible). Walk both.
+      if any_call_to_cap_in_exprs(es: handlers, c_name: c_name) then return true end
+      return any_call_to_cap_in_stmts(ss: body, c_name: c_name)
+  end
+end
+
+let any_call_to_cap_in_catch_arms = fn (arms: [CatchArm], c_name: string) -> bool do
+  match arms do
+    | [] -> return false
+    | a :: rest ->
+      match a do | CatchArm(pattern: _, body) ->
+        if any_call_to_cap_in_stmts(ss: body, c_name: c_name) then return true end
+        return any_call_to_cap_in_catch_arms(arms: rest, c_name: c_name)
+      end
+  end
+end
+
+// ─── L0001: empty inject statement ───────────────────────────────────────────
+//
+// `inject H1, H2 do end` (zero statements) compiles fine but the wrapper is
+// dead code: the handlers go out of scope unused. Walk every Inject site
+// across function bodies and report when its body is empty.
+
+let collect_empty_injects_in_stmts = fn (ss: [SpannedStmt], acc: [LintFinding]) -> [LintFinding] do
+  match ss do
+    | [] -> return acc
+    | s :: rest ->
+      let acc2 = match s do | SpannedStmt(node, span) ->
+        collect_empty_injects_in_stmt(s: node, sp: span, acc: acc)
+      end
+      return collect_empty_injects_in_stmts(ss: rest, acc: acc2)
+  end
+end
+
+let collect_empty_injects_in_stmt = fn (s: Stmt, sp: Span, acc: [LintFinding]) -> [LintFinding] do
+  match s do
+    | StmtInject(handlers: _, body) ->
+      let acc2 = if list.length(xs: body) == 0 then
+          LintFinding(
+            code: "L0001",
+            severity: LintWarning,
+            message: "`inject` block has an empty body; the handler bindings are unreachable",
+            fix_it: Some(val: "remove the surrounding `inject ... do ... end` and keep the (empty) body"),
+            span: sp
+          ) :: acc
+        else acc end
+      return collect_empty_injects_in_stmts(ss: body, acc: acc2)
+    | StmtLet(name: _, sigil: _, typ: _, value) -> return collect_empty_injects_in_expr(e: value, acc: acc)
+    | StmtLetPattern(pattern: _, value) -> return collect_empty_injects_in_expr(e: value, acc: acc)
+    | StmtExpr(expr) -> return collect_empty_injects_in_expr(e: expr, acc: acc)
+    | StmtReturn(value) -> return collect_empty_injects_in_expr(e: value, acc: acc)
+    | StmtAssign(target: _, value) -> return collect_empty_injects_in_expr(e: value, acc: acc)
+    | StmtIndexAssign(target, index, value) ->
+      let a1 = collect_empty_injects_in_expr(e: target, acc: acc)
+      let a2 = collect_empty_injects_in_expr(e: index, acc: a1)
+      return collect_empty_injects_in_expr(e: value, acc: a2)
+    | StmtTry(body, catch_arms) ->
+      let a1 = collect_empty_injects_in_stmts(ss: body, acc: acc)
+      return collect_empty_injects_in_catch_arms(arms: catch_arms, acc: a1)
+  end
+end
+
+let collect_empty_injects_in_catch_arms = fn (arms: [CatchArm], acc: [LintFinding]) -> [LintFinding] do
+  match arms do
+    | [] -> return acc
+    | a :: rest ->
+      let acc2 = match a do | CatchArm(pattern: _, body) ->
+        collect_empty_injects_in_stmts(ss: body, acc: acc)
+      end
+      return collect_empty_injects_in_catch_arms(arms: rest, acc: acc2)
+  end
+end
+
+let collect_empty_injects_in_expr = fn (e: SpannedExpr, acc: [LintFinding]) -> [LintFinding] do
+  match e do | SpannedExpr(node, span: _) ->
+    return collect_empty_injects_in_node(e: node, acc: acc)
+  end
+end
+
+let collect_empty_injects_in_node = fn (e: Expr, acc: [LintFinding]) -> [LintFinding] do
+  match e do
+    | ExprBinaryOp(left, op: _, right) ->
+      let a1 = collect_empty_injects_in_expr(e: left, acc: acc)
+      return collect_empty_injects_in_expr(e: right, acc: a1)
+    | ExprUnaryOp(op: _, operand) -> return collect_empty_injects_in_expr(e: operand, acc: acc)
+    | ExprCall(func: _, args) -> return collect_empty_injects_in_call_args(args: args, acc: acc)
+    | ExprConstructor(name: _, args, sigil: _) -> return collect_empty_injects_in_ctor_args(args: args, acc: acc)
+    | ExprArray(elements) -> return collect_empty_injects_in_exprs(es: elements, acc: acc)
+    | ExprList(elements) -> return collect_empty_injects_in_exprs(es: elements, acc: acc)
+    | ExprRecord(fields) -> return collect_empty_injects_in_record_fields(fs: fields, acc: acc)
+    | ExprIndex(target, index) ->
+      let a1 = collect_empty_injects_in_expr(e: target, acc: acc)
+      return collect_empty_injects_in_expr(e: index, acc: a1)
+    | ExprFieldAccess(target, field: _) -> return collect_empty_injects_in_expr(e: target, acc: acc)
+    | ExprIf(cond, then_branch, else_branch) ->
+      let a1 = collect_empty_injects_in_expr(e: cond, acc: acc)
+      let a2 = collect_empty_injects_in_stmts(ss: then_branch, acc: a1)
+      return collect_empty_injects_in_stmts(ss: else_branch, acc: a2)
+    | ExprMatch(target, cases) ->
+      let a1 = collect_empty_injects_in_expr(e: target, acc: acc)
+      return collect_empty_injects_in_cases(cs: cases, acc: a1)
+    | ExprWhile(cond, body) ->
+      let a1 = collect_empty_injects_in_expr(e: cond, acc: acc)
+      return collect_empty_injects_in_stmts(ss: body, acc: a1)
+    | ExprFor(var: _, start, end_expr, body) ->
+      let a1 = collect_empty_injects_in_expr(e: start, acc: acc)
+      let a2 = collect_empty_injects_in_expr(e: end_expr, acc: a1)
+      return collect_empty_injects_in_stmts(ss: body, acc: a2)
+    | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body) ->
+      return collect_empty_injects_in_stmts(ss: body, acc: acc)
+    | ExprRaise(value) -> return collect_empty_injects_in_expr(e: value, acc: acc)
+    | ExprForce(value) -> return collect_empty_injects_in_expr(e: value, acc: acc)
+    | ExprHandler(coeffect_name: _, requires: _, arms) ->
+      return collect_empty_injects_in_handler_arms(arms: arms, acc: acc)
+    | _ -> return acc
+  end
+end
+
+let collect_empty_injects_in_call_args = fn (args: [CallArg], acc: [LintFinding]) -> [LintFinding] do
+  match args do
+    | [] -> return acc
+    | a :: rest ->
+      let acc2 = match a do | CallArg(name: _, value) ->
+        collect_empty_injects_in_expr(e: value, acc: acc)
+      end
+      return collect_empty_injects_in_call_args(args: rest, acc: acc2)
+  end
+end
+
+let collect_empty_injects_in_ctor_args = fn (args: [CtorArg], acc: [LintFinding]) -> [LintFinding] do
+  match args do
+    | [] -> return acc
+    | a :: rest ->
+      let acc2 = match a do | CtorArg(name: _, value) ->
+        collect_empty_injects_in_expr(e: value, acc: acc)
+      end
+      return collect_empty_injects_in_ctor_args(args: rest, acc: acc2)
+  end
+end
+
+let collect_empty_injects_in_exprs = fn (es: [SpannedExpr], acc: [LintFinding]) -> [LintFinding] do
+  match es do
+    | [] -> return acc
+    | e :: rest ->
+      let acc2 = collect_empty_injects_in_expr(e: e, acc: acc)
+      return collect_empty_injects_in_exprs(es: rest, acc: acc2)
+  end
+end
+
+let collect_empty_injects_in_record_fields = fn (fs: [NamedExpr], acc: [LintFinding]) -> [LintFinding] do
+  match fs do
+    | [] -> return acc
+    | f :: rest ->
+      let acc2 = match f do | NamedExpr(name: _, value) ->
+        collect_empty_injects_in_expr(e: value, acc: acc)
+      end
+      return collect_empty_injects_in_record_fields(fs: rest, acc: acc2)
+  end
+end
+
+let collect_empty_injects_in_cases = fn (cs: [MatchCase], acc: [LintFinding]) -> [LintFinding] do
+  match cs do
+    | [] -> return acc
+    | c :: rest ->
+      let acc2 = match c do | MatchCase(pattern: _, body) ->
+        collect_empty_injects_in_stmts(ss: body, acc: acc)
+      end
+      return collect_empty_injects_in_cases(cs: rest, acc: acc2)
+  end
+end
+
+let collect_empty_injects_in_handler_arms = fn (arms: [HandlerArm], acc: [LintFinding]) -> [LintFinding] do
+  match arms do
+    | [] -> return acc
+    | a :: rest ->
+      let acc2 = match a do | HandlerArm(arm, cont_binder: _, span: _) ->
+        match arm do | Function(name: _, is_public: _, type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body, span: _) ->
+          collect_empty_injects_in_stmts(ss: body, acc: acc)
+        end
+      end
+      return collect_empty_injects_in_handler_arms(arms: rest, acc: acc2)
+  end
+end
+
+// ─── Per-function L0002 check ────────────────────────────────────────────────
+
+/** Walk a single function definition: extract its declared cap names and
+ *  test each against the body's syntactic `Cap.<method>` call set. Emits
+ *  one L0002 finding per unused cap, ordered by appearance in the require
+ *  row.
+ */
+let check_unused_caps_in_function = fn (
+  name: string,
+  requires: TypeExpr,
+  body: [SpannedStmt],
+  fn_span: Span,
+  acc: [LintFinding]
+) -> [LintFinding] do
+  let caps = cap_names_in_row(row: requires)
+  let has_call = has_any_call_in_stmts(ss: body)
+  return check_each_cap(caps: caps, name: name, body: body, fn_span: fn_span, has_any_call: has_call, acc: acc)
+end
+
+let check_each_cap = fn (
+  caps: [string],
+  name: string,
+  body: [SpannedStmt],
+  fn_span: Span,
+  has_any_call: bool,
+  acc: [LintFinding]
+) -> [LintFinding] do
+  match caps do
+    | [] -> return acc
+    | cn :: rest ->
+      let used = any_call_to_cap_in_stmts(ss: body, c_name: cn)
+      // L0002 fires only when the body is also call-free overall: a
+      // function that makes ANY other call could be transitively
+      // consuming the cap through a helper, which the syntactic walker
+      // cannot see. The narrower rule has no documented false positives
+      // — it catches the "stub function with over-declared row" pattern
+      // which is the LLM-frequent error the bd targets. Cases where a
+      // cap is declared but only used by a sub-call are handled by the
+      // deferred L0003 / effect-analysis follow-up.
+      let acc2 = if used || has_any_call then acc else
+          let msg = "function '" ++ name ++ "' declares capability '" ++ cn
+                ++ "' in its `require {…}` row but never calls `" ++ cn ++ ".*`"
+                ++ " (and the body has no calls that could consume it transitively)"
+          let fix = "remove '" ++ cn ++ "' from the `require {…}` clause"
+          LintFinding(
+            code: "L0002",
+            severity: LintWarning,
+            message: msg,
+            fix_it: Some(val: fix),
+            span: fn_span
+          ) :: acc
+        end
+      return check_each_cap(caps: rest, name: name, body: body, fn_span: fn_span, has_any_call: has_any_call, acc: acc2)
+  end
+end
+
+// `has_any_call_in_*`: any function-call in expression position. Mirrors
+// the cap walker minus the per-cap predicate; runs once per function.
+let has_any_call_in_expr = fn (e: SpannedExpr) -> bool do
+  match e do | SpannedExpr(node, span: _) ->
+    return has_any_call_in_node(e: node)
+  end
+end
+
+let has_any_call_in_node = fn (e: Expr) -> bool do
+  match e do
+    | ExprCall(func: _, args: _) -> return true
+    | ExprBinaryOp(left, op: _, right) ->
+      if has_any_call_in_expr(e: left) then return true end
+      return has_any_call_in_expr(e: right)
+    | ExprUnaryOp(op: _, operand) -> return has_any_call_in_expr(e: operand)
+    | ExprConstructor(name: _, args, sigil: _) -> return has_any_call_in_ctor_args(args: args)
+    | ExprArray(elements) -> return has_any_call_in_exprs(es: elements)
+    | ExprList(elements) -> return has_any_call_in_exprs(es: elements)
+    | ExprRecord(fields) -> return has_any_call_in_record_fields(fs: fields)
+    | ExprIndex(target, index) ->
+      if has_any_call_in_expr(e: target) then return true end
+      return has_any_call_in_expr(e: index)
+    | ExprFieldAccess(target, field: _) -> return has_any_call_in_expr(e: target)
+    | ExprIf(cond, then_branch, else_branch) ->
+      if has_any_call_in_expr(e: cond) then return true end
+      if has_any_call_in_stmts(ss: then_branch) then return true end
+      return has_any_call_in_stmts(ss: else_branch)
+    | ExprMatch(target, cases) ->
+      if has_any_call_in_expr(e: target) then return true end
+      return has_any_call_in_cases(cs: cases)
+    | ExprWhile(cond, body) ->
+      if has_any_call_in_expr(e: cond) then return true end
+      return has_any_call_in_stmts(ss: body)
+    | ExprFor(var: _, start, end_expr, body) ->
+      if has_any_call_in_expr(e: start) then return true end
+      if has_any_call_in_expr(e: end_expr) then return true end
+      return has_any_call_in_stmts(ss: body)
+    | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body) ->
+      return has_any_call_in_stmts(ss: body)
+    | ExprRaise(value) -> return has_any_call_in_expr(e: value)
+    | ExprForce(value) -> return has_any_call_in_expr(e: value)
+    | ExprHandler(coeffect_name: _, requires: _, arms) -> return has_any_call_in_handler_arms(arms: arms)
+    | _ -> return false
+  end
+end
+
+let has_any_call_in_exprs = fn (es: [SpannedExpr]) -> bool do
+  match es do
+    | [] -> return false
+    | e :: rest ->
+      if has_any_call_in_expr(e: e) then return true end
+      return has_any_call_in_exprs(es: rest)
+  end
+end
+
+let has_any_call_in_ctor_args = fn (args: [CtorArg]) -> bool do
+  match args do
+    | [] -> return false
+    | a :: rest ->
+      match a do | CtorArg(name: _, value) ->
+        if has_any_call_in_expr(e: value) then return true end
+        return has_any_call_in_ctor_args(args: rest)
+      end
+  end
+end
+
+let has_any_call_in_record_fields = fn (fs: [NamedExpr]) -> bool do
+  match fs do
+    | [] -> return false
+    | f :: rest ->
+      match f do | NamedExpr(name: _, value) ->
+        if has_any_call_in_expr(e: value) then return true end
+        return has_any_call_in_record_fields(fs: rest)
+      end
+  end
+end
+
+let has_any_call_in_cases = fn (cs: [MatchCase]) -> bool do
+  match cs do
+    | [] -> return false
+    | c :: rest ->
+      match c do | MatchCase(pattern: _, body) ->
+        if has_any_call_in_stmts(ss: body) then return true end
+        return has_any_call_in_cases(cs: rest)
+      end
+  end
+end
+
+let has_any_call_in_handler_arms = fn (arms: [HandlerArm]) -> bool do
+  match arms do
+    | [] -> return false
+    | a :: rest ->
+      match a do | HandlerArm(arm, cont_binder: _, span: _) ->
+        match arm do | Function(name: _, is_public: _, type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body, span: _) ->
+          if has_any_call_in_stmts(ss: body) then return true end
+          return has_any_call_in_handler_arms(arms: rest)
+        end
+      end
+  end
+end
+
+let has_any_call_in_stmts = fn (ss: [SpannedStmt]) -> bool do
+  match ss do
+    | [] -> return false
+    | s :: rest ->
+      match s do | SpannedStmt(node, span: _) ->
+        if has_any_call_in_stmt(s: node) then return true end
+        return has_any_call_in_stmts(ss: rest)
+      end
+  end
+end
+
+let has_any_call_in_stmt = fn (s: Stmt) -> bool do
+  match s do
+    | StmtLet(name: _, sigil: _, typ: _, value) -> return has_any_call_in_expr(e: value)
+    | StmtLetPattern(pattern: _, value) -> return has_any_call_in_expr(e: value)
+    | StmtExpr(expr) -> return has_any_call_in_expr(e: expr)
+    | StmtReturn(value) -> return has_any_call_in_expr(e: value)
+    | StmtAssign(target: _, value) -> return has_any_call_in_expr(e: value)
+    | StmtIndexAssign(target, index, value) ->
+      if has_any_call_in_expr(e: target) then return true end
+      if has_any_call_in_expr(e: index) then return true end
+      return has_any_call_in_expr(e: value)
+    | StmtTry(body, catch_arms) ->
+      if has_any_call_in_stmts(ss: body) then return true end
+      return has_any_call_in_catch_arms(arms: catch_arms)
+    | StmtInject(handlers, body) ->
+      if has_any_call_in_exprs(es: handlers) then return true end
+      return has_any_call_in_stmts(ss: body)
+  end
+end
+
+let has_any_call_in_catch_arms = fn (arms: [CatchArm]) -> bool do
+  match arms do
+    | [] -> return false
+    | a :: rest ->
+      match a do | CatchArm(pattern: _, body) ->
+        if has_any_call_in_stmts(ss: body) then return true end
+        return has_any_call_in_catch_arms(arms: rest)
+      end
+  end
+end
+
+// ─── Top-level walker ────────────────────────────────────────────────────────
+
+/** Walk every top-level `let name = fn …` binding. Other top-level forms
+ *  (type defs, enums, exceptions, imports, caps) carry no executable body
+ *  for the V1 rule set so are skipped wholesale.
+ */
+let lint_top_levels = fn (xs: [SpannedTopLevel], acc: [LintFinding]) -> [LintFinding] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | tl :: rest ->
+      let acc2 = match tl do | SpannedTopLevel(node, span) ->
+        match node do
+          | TLLet(def) -> lint_global_let(def: def, acc: acc)
+          | _ -> acc
+        end
+      end
+      return lint_top_levels(xs: rest, acc: acc2)
+  end
+end
+
+let lint_global_let = fn (def: GlobalLet, acc: [LintFinding]) -> [LintFinding] do
+  match def do | GlobalLet(name, is_public: _, typ: _, value) ->
+    return lint_global_value(name: name, value: value, acc: acc)
+  end
+end
+
+let lint_global_value = fn (name: string, value: SpannedExpr, acc: [LintFinding]) -> [LintFinding] do
+  match value do | SpannedExpr(node, span) ->
+    match node do
+      | ExprLambda(type_params: _, params: _, ret_type: _, requires, throw_row: _, body) ->
+        let a1 = check_unused_caps_in_function(name: name, requires: requires, body: body, fn_span: span, acc: acc)
+        return collect_empty_injects_in_stmts(ss: body, acc: a1)
+      | _ -> return collect_empty_injects_in_expr(e: value, acc: acc)
+    end
+  end
+end
+
+// ─── Public API ──────────────────────────────────────────────────────────────
+
+/** Run every V1 lint rule across `prog`. Findings are returned in
+ *  source-order (top-down across top-levels, by rule firing within a
+ *  function). The file path is not embedded in `LintFinding` — callers
+ *  attach it when rendering.
+ */
+export let lint_program = fn (prog: Program) -> [LintFinding] do
+  match prog do | Program(definitions, module_doc: _) ->
+    return lint_top_levels(xs: definitions, acc: [])
+  end
+end
+
+// ─── Diagnostic rendering ────────────────────────────────────────────────────
+
+let severity_label = fn (s: LintSeverity) -> string do
+  match s do
+    | LintWarning -> return "warning"
+    | LintInfo -> return "note"
+  end
+end
+
+/** Render a single finding to the user-facing text format. Mirrors
+ *  `format_error` in src/common/error.nx: human prose + `[Lxxxx]` code
+ *  bracket suffix for grep-ability. The optional fix-it suggestion is
+ *  emitted on a continuation line prefixed with `  help: `.
+ */
+export let format_finding = fn (file: string, f: LintFinding) -> string do
+  match f do | LintFinding(code, severity, message, fix_it, span) ->
+    match span do | Span(offset: _, line: l, col: c) ->
+      let head = file ++ ":" ++ str.from_i64(val: l) ++ ":" ++ str.from_i64(val: c)
+        ++ ": " ++ severity_label(s: severity) ++ ": " ++ message
+        ++ " [" ++ code ++ "]"
+      match fix_it do
+        | Some(val: hint) -> return head ++ "\n  help: " ++ hint
+        | None -> return head
+      end
+    end
+  end
+end

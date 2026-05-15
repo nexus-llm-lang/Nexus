@@ -1,0 +1,210 @@
+// Issue nexus-moym — AST-driven lint pack V1 smoke test.
+//
+// Exercises `lint_program` directly on a parsed AST rather than spawning
+// `nexus lint` (Proc.exec is -1 under WASI preview1 — same pattern as
+// the a02c grep test).
+//
+// V1 rules covered:
+//   - L0001 empty-inject: `inject H do end` body has zero statements
+//   - L0002 unused-require-cap: `require { Cap }` declared, body never
+//           invokes `Cap.*`
+//
+// Negative coverage: clean programs (neither rule should fire), inject
+// with non-empty body (L0001 should NOT fire), capability that IS used
+// via `Cap.method(...)` (L0002 should NOT fire).
+
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Option, Some, None } from "std:option"
+import * as lexer from "src/frontend/lexer.nx"
+import { ParseDiagnostics }, * as parser from "src/frontend/parser.nx"
+import { LintFinding, lint_program, format_finding } from "src/lint/lint.nx"
+import { Span } from "src/common/token.nx"
+
+// Helper: parse a source string and run the full lint pack.
+let lint_source = fn (src: string) -> [LintFinding] do
+  let tokens = lexer.tokenize(src: src)
+  let ParseDiagnostics(prog, diags: _) = parser.parse_collect(tokens: tokens, file: "fixture.nx")
+  return lint_program(prog: prog)
+end
+
+// Helper: extract codes from findings as a list.
+let codes_of = fn (fs: [LintFinding]) -> [string] do
+  return codes_of_loop(fs, acc: [])
+end
+
+let codes_of_loop = fn (fs: [LintFinding], acc: [string]) -> [string] do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | LintFinding(code, severity: _, message: _, fix_it: _, span: _) :: rest ->
+      return codes_of_loop(fs: rest, acc: code :: acc)
+  end
+end
+
+let list_has_str = fn (xs: [string], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | h :: rest ->
+      if h == s then return true end
+      return list_has_str(xs: rest, s)
+  end
+end
+
+// ─── L0001: empty inject ────────────────────────────────────────────────
+
+let test_l0001_empty_inject_fires = fn () -> unit throws { Exn } do
+  let src = "import { Console, system_handler } from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { PermConsole } do\n"
+    ++ "  inject system_handler do\n"
+    ++ "  end\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+  let findings = lint_source(src)
+  let codes = codes_of(fs: findings)
+  test_assert.assert(cond: list_has_str(xs: codes, s: "L0001"),
+    label: "moym: L0001 fires on empty inject body")
+  return ()
+end
+
+let test_l0001_does_not_fire_when_inject_body_nonempty = fn () -> unit throws { Exn } do
+  let src = "import { Console, system_handler } from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { PermConsole } do\n"
+    ++ "  inject system_handler do\n"
+    ++ "    Console.println(val: \"hi\")\n"
+    ++ "  end\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+  let findings = lint_source(src)
+  let codes = codes_of(fs: findings)
+  test_assert.assert(cond: !list_has_str(xs: codes, s: "L0001"),
+    label: "moym: L0001 silent on non-empty inject body")
+  return ()
+end
+
+// ─── L0002: unused require capability ───────────────────────────────────
+
+let test_l0002_unused_cap_fires = fn () -> unit throws { Exn } do
+  // `Console` declared but never called as `Console.*`.
+  let src = "import { Console } from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { Console } do\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+  let findings = lint_source(src)
+  let codes = codes_of(fs: findings)
+  test_assert.assert(cond: list_has_str(xs: codes, s: "L0002"),
+    label: "moym: L0002 fires on unused require cap")
+  return ()
+end
+
+let test_l0002_silent_when_cap_used = fn () -> unit throws { Exn } do
+  // `Console` declared AND called via Console.println — must be silent.
+  let src = "import { Console } from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { Console } do\n"
+    ++ "  Console.println(val: \"hi\")\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+  let findings = lint_source(src)
+  let codes = codes_of(fs: findings)
+  test_assert.assert(cond: !list_has_str(xs: codes, s: "L0002"),
+    label: "moym: L0002 silent when cap is invoked")
+  return ()
+end
+
+let test_l0002_silent_when_body_has_any_call = fn () -> unit throws { Exn } do
+  // `Fs` declared, body has a helper call (no Fs.* directly) — the
+  // conservative L0002 must NOT fire because the helper might consume Fs.
+  let src = "let helper = fn () -> i64 do return 1 end\n"
+    ++ "let main = fn () -> unit require { Fs } do\n"
+    ++ "  let _ = helper()\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+  let findings = lint_source(src)
+  let codes = codes_of(fs: findings)
+  test_assert.assert(cond: !list_has_str(xs: codes, s: "L0002"),
+    label: "moym: L0002 silent when body has any call (conservative)")
+  return ()
+end
+
+let test_l0002_skips_perm_tokens = fn () -> unit throws { Exn } do
+  // `PermConsole` is a permission token (not a user-callable cap surface),
+  // so the lint must skip it even when no `PermConsole.*` call appears.
+  let src = "import { Console } from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { PermConsole } do\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+  let findings = lint_source(src)
+  let codes = codes_of(fs: findings)
+  test_assert.assert(cond: !list_has_str(xs: codes, s: "L0002"),
+    label: "moym: L0002 skips Perm* tokens")
+  return ()
+end
+
+// ─── Clean program: nothing fires ───────────────────────────────────────
+
+let test_clean_program_zero_findings = fn () -> unit throws { Exn } do
+  let src = "let add = fn (a: i64, b: i64) -> i64 do\n"
+    ++ "  return a + b\n"
+    ++ "end\n"
+  let findings = lint_source(src)
+  test_assert.assert_eq_i64(actual: list.length(xs: findings), expected: 0,
+    label: "moym: clean program produces zero lint findings")
+  return ()
+end
+
+// ─── Finding rendering ──────────────────────────────────────────────────
+
+let test_format_finding_carries_code = fn () -> unit throws { Exn } do
+  let src = "import { Console } from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { Console } do\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+  let findings = lint_source(src)
+  match findings do
+    | [] -> raise RuntimeError(val: "expected at least one finding")
+    | f :: _ ->
+      let rendered = format_finding(file: "fixture.nx", f)
+      // Sanity: the rendered string must include the L-code in brackets
+      // and the file path prefix.
+      test_assert.assert(cond: str.contains(s: rendered, sub: "[L0002]"),
+        label: "moym: format_finding includes L-code")
+      test_assert.assert(cond: str.contains(s: rendered, sub: "fixture.nx:"),
+        label: "moym: format_finding includes file path")
+      test_assert.assert(cond: str.contains(s: rendered, sub: "help:"),
+        label: "moym: format_finding includes fix-it help line")
+  end
+  return ()
+end
+
+// ─── Runner ─────────────────────────────────────────────────────────────
+
+let body = fn () -> unit throws { Exn } do
+  test_l0001_empty_inject_fires()
+  test_l0001_does_not_fire_when_inject_body_nonempty()
+  test_l0002_unused_cap_fires()
+  test_l0002_silent_when_cap_used()
+  test_l0002_silent_when_body_has_any_call()
+  test_l0002_skips_perm_tokens()
+  test_clean_program_zero_findings()
+  test_format_finding_carries_code()
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
