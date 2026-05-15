@@ -1,0 +1,1378 @@
+/**
+ * regexp: Thompson-NFA regular expressions over byte-indexed strings.
+ *
+ * Pure Nexus, no host functions. The implementation is the canonical
+ * Pike/Cox VM:
+ *
+ *   parse → AST → compile → bytecode → NFA simulation
+ *
+ * The simulator is a parallel thread set with two epoch-marked occupancy
+ * arrays, so a program of m instructions runs against an n-byte input in
+ * O(n × m) time with no backtracking and no exponential blowup on
+ * pathological patterns (e.g. `(a|a)*b` against `aaaa…ac`).
+ *
+ * Surface is the ERE subset described in nexus-wvu9:
+ *
+ *   literals, `.`, `\d \w \s \D \W \S`
+ *   character classes `[abc]`, `[^abc]`, `[a-z]` (range)
+ *   anchors `^` `$`
+ *   quantifiers `*` `+` `?` `{n}` `{n,}` `{n,m}` (greedy only)
+ *   alternation `a|b`, concatenation, groups `(...)` / `(?:...)`
+ *   escapes `\.` `\\` `\(` etc.
+ *
+ * Capture text is sliced from the input by byte offset, so captures inherit
+ * the input's UTF-8 representation verbatim. Anchors, classes, and `.` all
+ * operate on bytes — multi-byte UTF-8 codepoints match `.` as a sequence of
+ * single-byte iterations, the same policy std:str uses (UTF-8 awareness is
+ * tracked in a follow-up).
+ *
+ * Unsupported features (backreferences `\1`, lookaround `(?=...)`, Unicode
+ * property `\p{...}`, named groups `(?<name>...)`) are rejected at parse
+ * time with InvalidRegexp.
+ */
+
+import * as str from "std:str"
+import * as bb from "std:bytebuffer"
+import { Option, Some, None } from "std:option"
+
+// ─── Public types ────────────────────────────────────────────────────────────
+
+/**
+Raised by `from_string` when the pattern cannot be parsed. `src` is the
+input pattern (verbatim) and `msg` includes a "(at position N)" suffix
+pointing at the byte offset where parsing failed.
+*/
+export exception InvalidRegexp(src: string, msg: string)
+
+/**
+Group covering every exception raised by this module. Sole member is
+InvalidRegexp; the group exists so cross-module callers route errors
+through a stable group name instead of the universal Exn.
+*/
+export exception group RegexpThrow = InvalidRegexp
+
+/**
+A single match. `start` and `end` are byte offsets (end is exclusive),
+`text` is the matched substring sliced out of the input, and `groups`
+holds the capture-group values. `groups[0]` is always `Some(text)` (the
+whole match); subsequent entries are `Some(s)` for groups that
+participated and `None` for groups inside an unfollowed alternation.
+*/
+export type Match = Match(
+  start: i64,
+  end_pos: i64,
+  text: string,
+  groups: [ Option<string> ]
+)
+
+// ─── AST ─────────────────────────────────────────────────────────────────────
+//
+// A CharClass is materialized as a 32-byte (256-bit) bitmap stored as a
+// list of i64 bytes — every membership test is O(1) given the byte value.
+// The bitmap is built at parse time so the compiler/VM never re-walks the
+// class literal.
+
+type CharSet = CharSet(bits: [ i64 ])
+
+type Re =
+    Empty
+  | Lit(byte_val: i64)
+  | AnyByte
+  | Class(set_val: CharSet)
+  | StartAnchor
+  | EndAnchor
+  | Concat(a_node: Re, b_node: Re)
+  | Alt(a_node: Re, b_node: Re)
+  | Star(node: Re)
+  | Plus(node: Re)
+  | Opt(node: Re)
+  | Bounded(node: Re, lo: i64, hi: i64) // hi == -1 → unbounded above
+  | CapGroup(idx: i64, node: Re)
+
+// ─── Bytecode ────────────────────────────────────────────────────────────────
+//
+// Eight opcodes encoded uniformly as `Inst(op, a, b, set)`. Unused operand
+// slots are 0 / empty.
+//
+//   OP_MATCH        terminal accept
+//   OP_BYTE         consume byte == a
+//   OP_ANY          consume any byte
+//   OP_CLASS        consume byte ∈ set
+//   OP_SPLIT        non-consuming, fork into pc=a and pc=b
+//   OP_JMP          non-consuming, jump to pc=a
+//   OP_SAVE         record current input offset into capture slot a
+//   OP_START        non-consuming, match only at the start of input
+//   OP_END          non-consuming, match only at the end of input
+
+let op_match = 0
+let op_byte = 1
+let op_any = 2
+let op_class = 3
+let op_split = 4
+let op_jmp = 5
+let op_save = 6
+let op_start = 7
+let op_end = 8
+
+let empty_set = CharSet(bits: [])
+
+type Inst = Inst(op: i64, a_arg: i64, b_arg: i64, set_val: CharSet)
+
+let inst_op = fn (ins: Inst) -> i64 do
+  let Inst(op, a_arg: _, b_arg: _, set_val: _) = ins
+  return op
+end
+
+let inst_a = fn (ins: Inst) -> i64 do
+  let Inst(op: _, a_arg, b_arg: _, set_val: _) = ins
+  return a_arg
+end
+
+let inst_b = fn (ins: Inst) -> i64 do
+  let Inst(op: _, a_arg: _, b_arg, set_val: _) = ins
+  return b_arg
+end
+
+let inst_set = fn (ins: Inst) -> CharSet do
+  let Inst(op: _, a_arg: _, b_arg: _, set_val) = ins
+  return set_val
+end
+
+let mk_match = fn () -> Inst do return Inst(op: op_match, a_arg: 0, b_arg: 0, set_val: empty_set) end
+let mk_byte = fn (b: i64) -> Inst do return Inst(op: op_byte, a_arg: b, b_arg: 0, set_val: empty_set) end
+let mk_any = fn () -> Inst do return Inst(op: op_any, a_arg: 0, b_arg: 0, set_val: empty_set) end
+let mk_class = fn (s: CharSet) -> Inst do return Inst(op: op_class, a_arg: 0, b_arg: 0, set_val: s) end
+let mk_split = fn (a_t: i64, b_t: i64) -> Inst do return Inst(op: op_split, a_arg: a_t, b_arg: b_t, set_val: empty_set) end
+let mk_jmp = fn (t: i64) -> Inst do return Inst(op: op_jmp, a_arg: t, b_arg: 0, set_val: empty_set) end
+let mk_save = fn (slot: i64) -> Inst do return Inst(op: op_save, a_arg: slot, b_arg: 0, set_val: empty_set) end
+let mk_start = fn () -> Inst do return Inst(op: op_start, a_arg: 0, b_arg: 0, set_val: empty_set) end
+let mk_end = fn () -> Inst do return Inst(op: op_end, a_arg: 0, b_arg: 0, set_val: empty_set) end
+
+// ─── Compiled program ────────────────────────────────────────────────────────
+
+/**
+An opaque compiled regular expression. The instruction stream is kept as
+a list because the simulator never indexes by integer position more than
+once per thread step; `code_at` walks once.
+
+(The type is named `Regexp` rather than the lowercase `regexp` shown in
+the bd sketch — Nexus type names are uppercase.)
+*/
+export type Regexp = Regexp(
+  src: string,
+  code: [ Inst ],
+  code_len: i64,
+  n_groups: i64
+)
+
+// ─── Bit set helpers ─────────────────────────────────────────────────────────
+//
+// 256-bit set stored as 32 i64 bytes (each 0..=255). Cheaper than 4 packed
+// i64 words because Nexus i64 bit ops still go through arithmetic, and
+// most regex classes touch only a handful of bytes.
+
+let empty_bits_go = fn (n: i64, acc: [ i64 ]) -> [ i64 ] do
+  if n <= 0 then return acc end
+  return empty_bits_go(n: n - 1, acc: 0 :: acc)
+end
+
+let empty_bits = fn () -> [ i64 ] do return empty_bits_go(n: 32, acc: []) end
+
+let nth_i64 = fn (xs: [ i64 ], n: i64) -> i64 do
+  match xs do
+    | [] -> return 0
+    | v :: rest ->
+      if n <= 0 then return v end
+      return nth_i64(xs: rest, n: n - 1)
+  end
+end
+
+let set_nth_go = fn (xs: [ i64 ], n: i64, v: i64, acc: [ i64 ]) -> [ i64 ] do
+  match xs do
+    | [] -> return rev_i64(xs: acc, ys: [])
+    | h :: rest ->
+      if n <= 0 then
+        return rev_i64(xs: acc, ys: v :: rest)
+      end
+      return set_nth_go(xs: rest, n: n - 1, v, acc: h :: acc)
+  end
+end
+
+let rev_i64 = fn (xs: [ i64 ], ys: [ i64 ]) -> [ i64 ] do
+  match xs do
+    | [] -> return ys
+    | h :: rest -> return rev_i64(xs: rest, ys: h :: ys)
+  end
+end
+
+let set_nth = fn (xs: [ i64 ], n: i64, v: i64) -> [ i64 ] do
+  return set_nth_go(xs, n, v, acc: [])
+end
+
+// Bit indexing helpers — division and modulo to avoid relying on bit ops
+// being constant-fold-friendly here. Byte index = b/8 (0..31), bit mask
+// inside the byte = 1 << (b & 7), implemented as a small power-of-two table.
+
+let bit_mask_for = fn (lo3: i64) -> i64 do
+  if lo3 == 0 then return 1 end
+  if lo3 == 1 then return 2 end
+  if lo3 == 2 then return 4 end
+  if lo3 == 3 then return 8 end
+  if lo3 == 4 then return 16 end
+  if lo3 == 5 then return 32 end
+  if lo3 == 6 then return 64 end
+  return 128
+end
+
+let set_add = fn (s: CharSet, b: i64) -> CharSet do
+  let CharSet(bits: bs) = s
+  let bi = b / 8
+  let mask = bit_mask_for(lo3: b - bi * 8)
+  let cur = nth_i64(xs: bs, n: bi)
+  let new_v = cur | mask
+  return CharSet(bits: set_nth(xs: bs, n: bi, v: new_v))
+end
+
+let set_has = fn (s: CharSet, b: i64) -> bool do
+  if b < 0 || b > 255 then return false end
+  let CharSet(bits: bs) = s
+  let bi = b / 8
+  let mask = bit_mask_for(lo3: b - bi * 8)
+  let cur = nth_i64(xs: bs, n: bi)
+  return (cur & mask) != 0
+end
+
+let add_range_go = fn (s: CharSet, lo: i64, hi: i64) -> CharSet do
+  if lo > hi then return s end
+  return add_range_go(s: set_add(s, b: lo), lo: lo + 1, hi)
+end
+
+let add_range = fn (s: CharSet, lo: i64, hi: i64) -> CharSet do return add_range_go(s, lo, hi) end
+
+let invert_go = fn (s: CharSet, acc: CharSet, b: i64) -> CharSet do
+  if b > 255 then return acc end
+  let next = if set_has(s, b) then acc else set_add(s: acc, b) end
+  return invert_go(s, acc: next, b: b + 1)
+end
+
+let invert_set = fn (s: CharSet) -> CharSet do
+  return invert_go(s, acc: CharSet(bits: empty_bits()), b: 0)
+end
+
+let empty_charset = fn () -> CharSet do return CharSet(bits: empty_bits()) end
+
+// Built-in classes ── \d, \w, \s, and their negations.
+
+let digit_set = fn () -> CharSet do
+  return add_range(s: empty_charset(), lo: 48, hi: 57)
+end
+
+let word_set = fn () -> CharSet do
+  let s1 = add_range(s: empty_charset(), lo: 48, hi: 57)
+  let s2 = add_range(s: s1, lo: 65, hi: 90)
+  let s3 = add_range(s: s2, lo: 97, hi: 122)
+  return set_add(s: s3, b: 95) // '_'
+end
+
+let ws_set = fn () -> CharSet do
+  let s1 = set_add(s: empty_charset(), b: 32)
+  let s2 = set_add(s: s1, b: 9)
+  let s3 = set_add(s: s2, b: 10)
+  let s4 = set_add(s: s3, b: 13)
+  let s5 = set_add(s: s4, b: 12) // \f
+  return set_add(s: s5, b: 11) // \v
+end
+
+// ─── Parser ──────────────────────────────────────────────────────────────────
+//
+// Recursive-descent over byte offsets. The parser threads (pattern, len,
+// pos, next_group_idx) and returns ParseStep records carrying the produced
+// node, the new position, and the updated group counter.
+//
+// Precedence (highest first):
+//   atom    → literal | . | char-class | escape | (...) | (?:...)
+//   factor  → atom quantifier?
+//   concat  → factor*
+//   re      → concat ('|' concat)*
+
+type ParseStep = ParseStep(node: Re, pos: i64, ngroups: i64)
+
+// Byte-level pattern read — these helpers operate on the raw pattern bytes
+// rather than chars to avoid the char/i64 conversion dance above.
+let p_byte_at = fn (p: string, i: i64) -> i64 do
+  let plen = str.byte_length(s: p)
+  if i < 0 || i >= plen then return 0 - 1 end
+  return str.char_code(s: str.byte_substring(s: p, start: i, len: 1), idx: 0)
+end
+
+let pat_len = fn (p: string) -> i64 do return str.byte_length(s: p) end
+
+// Decimal parser used by {n}, {n,}, {n,m}. Returns (value, new_pos). If
+// no digits are consumed, value == -1 and pos is unchanged.
+type IntScan = IntScan(value: i64, pos: i64)
+
+let scan_int_go = fn (p: string, plen: i64, i: i64, acc: i64, any_digit: bool) -> IntScan do
+  if i >= plen then
+    if any_digit then return IntScan(value: acc, pos: i) end
+    return IntScan(value: 0 - 1, pos: i)
+  end
+  let b = p_byte_at(p, i)
+  if b >= 48 && b <= 57 then
+    return scan_int_go(p, plen, i: i + 1, acc: acc * 10 + (b - 48), any_digit: true)
+  end
+  if any_digit then return IntScan(value: acc, pos: i) end
+  return IntScan(value: 0 - 1, pos: i)
+end
+
+let scan_int = fn (p: string, i: i64) -> IntScan do
+  return scan_int_go(p, plen: pat_len(p), i, acc: 0, any_digit: false)
+end
+
+// ── Parse: character class ───────────────────────────────────────────────────
+//
+// `pos` is positioned just after the opening `[`. Returns the constructed
+// class and the position just after the closing `]`. A leading `^` flips
+// to negation; a literal `]` is allowed as the first character.
+
+type ClassScan = ClassScan(set_val: CharSet, pos: i64)
+
+let parse_class_body_go = fn (
+  p: string, plen: i64, src: string, i: i64, s: CharSet, last: i64
+) -> ClassScan throws { RegexpThrow } do
+  if i >= plen then
+    raise InvalidRegexp(src, msg: "unterminated character class (at position " ++ str.from_i64(val: i) ++ ")")
+  end
+  let b = p_byte_at(p, i)
+  if b == 93 then // ']'
+    return ClassScan(set_val: s, pos: i + 1)
+  end
+  // Escape inside a class.
+  if b == 92 then // '\\'
+    let next_pos = i + 1
+    if next_pos >= plen then
+      raise InvalidRegexp(src, msg: "dangling backslash in character class (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+    let nb = p_byte_at(p, i: next_pos)
+    let nv = class_escape_value(b: nb)
+    if nv >= 0 then
+      let s1 = set_add(s, b: nv)
+      return parse_class_body_go(p, plen, src, i: next_pos + 1, s: s1, last: nv)
+    end
+    // Built-in escape class like \d, \w, \s (lowercase) or negations.
+    let extras = class_builtin_or_none(b: nb)
+    match extras do
+      | Some(val: extra_set) ->
+        let merged = merge_sets(a: s, b: extra_set)
+        return parse_class_body_go(p, plen, src, i: next_pos + 1, s: merged, last: 0 - 1)
+      | None ->
+        raise InvalidRegexp(src, msg: "unsupported escape '\\" ++ str.byte_substring(s: p, start: next_pos, len: 1) ++ "' in character class (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+  end
+  // Range: <last>-<right>. Only if last >= 0, next is '-', and char after
+  // is not the closing bracket.
+  if b == 45 && last >= 0 && i + 1 < plen && p_byte_at(p, i: i + 1) != 93 then
+    let right_pos = i + 1
+    let rb = p_byte_at(p, i: right_pos)
+    if rb == 92 then
+      // Escape forms the range upper bound.
+      let next_pos = right_pos + 1
+      if next_pos >= plen then
+        raise InvalidRegexp(src, msg: "dangling backslash in range (at position " ++ str.from_i64(val: right_pos) ++ ")")
+      end
+      let rv = class_escape_value(b: p_byte_at(p, i: next_pos))
+      if rv < 0 then
+        raise InvalidRegexp(src, msg: "invalid range upper bound (at position " ++ str.from_i64(val: right_pos) ++ ")")
+      end
+      if last > rv then
+        raise InvalidRegexp(src, msg: "reversed range in character class (at position " ++ str.from_i64(val: i) ++ ")")
+      end
+      let s2 = add_range(s, lo: last, hi: rv)
+      return parse_class_body_go(p, plen, src, i: next_pos + 1, s: s2, last: 0 - 1)
+    end
+    if last > rb then
+      raise InvalidRegexp(src, msg: "reversed range in character class (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+    let s2 = add_range(s, lo: last, hi: rb)
+    return parse_class_body_go(p, plen, src, i: right_pos + 1, s: s2, last: 0 - 1)
+  end
+  // Plain literal byte.
+  let s3 = set_add(s, b)
+  return parse_class_body_go(p, plen, src, i: i + 1, s: s3, last: b)
+end
+
+// Bytes that an escape inside a class shorthand maps to: \n \t \r \f \v
+// \\ \] \[ \. \- \^ etc. -1 means "not a literal".
+let class_escape_value = fn (b: i64) -> i64 do
+  if b == 110 then return 10 end // \n
+  if b == 116 then return 9 end  // \t
+  if b == 114 then return 13 end // \r
+  if b == 102 then return 12 end // \f
+  if b == 118 then return 11 end // \v
+  if b == 48 then return 0 end   // \0
+  if b == 92 then return 92 end  // \\
+  if b == 93 then return 93 end  // \]
+  if b == 91 then return 91 end  // \[
+  if b == 46 then return 46 end  // \.
+  if b == 45 then return 45 end  // \-
+  if b == 94 then return 94 end  // \^
+  if b == 47 then return 47 end  // \/
+  if b == 40 then return 40 end  // \(
+  if b == 41 then return 41 end  // \)
+  if b == 123 then return 123 end // \{
+  if b == 125 then return 125 end // \}
+  if b == 124 then return 124 end // \|
+  if b == 42 then return 42 end  // \*
+  if b == 43 then return 43 end  // \+
+  if b == 63 then return 63 end  // \?
+  if b == 36 then return 36 end  // \$
+  return 0 - 1
+end
+
+// Built-in classes referenced inside or outside a `[...]` block.
+let class_builtin_or_none = fn (b: i64) -> Option<CharSet> do
+  if b == 100 then return Some(val: digit_set()) end // \d
+  if b == 119 then return Some(val: word_set()) end  // \w
+  if b == 115 then return Some(val: ws_set()) end   // \s
+  if b == 68 then return Some(val: invert_set(s: digit_set())) end // \D
+  if b == 87 then return Some(val: invert_set(s: word_set())) end  // \W
+  if b == 83 then return Some(val: invert_set(s: ws_set())) end   // \S
+  return None
+end
+
+let merge_sets_go = fn (a: CharSet, b: CharSet, i: i64) -> CharSet do
+  if i > 255 then return a end
+  if set_has(s: b, b: i) then return merge_sets_go(a: set_add(s: a, b: i), b, i: i + 1) end
+  return merge_sets_go(a, b, i: i + 1)
+end
+let merge_sets = fn (a: CharSet, b: CharSet) -> CharSet do return merge_sets_go(a, b, i: 0) end
+
+let parse_class = fn (p: string, src: string, i: i64) -> ClassScan throws { RegexpThrow } do
+  let plen = pat_len(p)
+  if i >= plen then
+    raise InvalidRegexp(src, msg: "unterminated character class (at position " ++ str.from_i64(val: i - 1) ++ ")")
+  end
+  let negate = p_byte_at(p, i) == 94 // '^'
+  let start_i = if negate then i + 1 else i end
+  // Allow ']' immediately after the (optional) '^' as a literal.
+  let s0 = empty_charset()
+  let first_b = p_byte_at(p, i: start_i)
+  let i0 = if first_b == 93 then start_i + 1 else start_i end
+  let s0_with_first = if first_b == 93 then set_add(s: s0, b: 93) else s0 end
+  let scanned = parse_class_body_go(p, plen, src, i: i0, s: s0_with_first, last: if first_b == 93 then 93 else 0 - 1 end)
+  let ClassScan(set_val: built, pos: after) = scanned
+  if negate then
+    return ClassScan(set_val: invert_set(s: built), pos: after)
+  end
+  return ClassScan(set_val: built, pos: after)
+end
+
+// ── Parse: atom / factor / concat / alt ──────────────────────────────────────
+//
+// We unfold the AST builder a bit: every parse_* returns a ParseStep so the
+// caller can thread the new (pos, ngroups). All exceptions raised carry the
+// failing position in `msg`.
+
+let parse_atom = fn (p: string, src: string, i: i64, ngroups: i64) -> ParseStep throws { RegexpThrow } do
+  let plen = pat_len(p)
+  if i >= plen then
+    return ParseStep(node: Empty, pos: i, ngroups)
+  end
+  let b = p_byte_at(p, i)
+  if b == 40 then // '('
+    let next_i = i + 1
+    // Non-capturing group: (?:...)
+    if next_i + 1 < plen && p_byte_at(p, i: next_i) == 63 && p_byte_at(p, i: next_i + 1) == 58 then
+      let body = parse_re(p, src, i: next_i + 2, ngroups)
+      let ParseStep(node: inner, pos: after, ngroups: ng2) = body
+      if after >= plen || p_byte_at(p, i: after) != 41 then
+        raise InvalidRegexp(src, msg: "unclosed group (at position " ++ str.from_i64(val: i) ++ ")")
+      end
+      return ParseStep(node: inner, pos: after + 1, ngroups: ng2)
+    end
+    // Reject every other (? ...) form: lookaround, named groups, flags.
+    if next_i < plen && p_byte_at(p, i: next_i) == 63 then
+      raise InvalidRegexp(src, msg: "unsupported group extension '(?' (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+    let g_idx = ngroups
+    let body = parse_re(p, src, i: next_i, ngroups: ngroups + 1)
+    let ParseStep(node: inner, pos: after, ngroups: ng2) = body
+    if after >= plen || p_byte_at(p, i: after) != 41 then
+      raise InvalidRegexp(src, msg: "unclosed group (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+    return ParseStep(node: CapGroup(idx: g_idx, node: inner), pos: after + 1, ngroups: ng2)
+  end
+  if b == 46 then // '.'
+    return ParseStep(node: AnyByte, pos: i + 1, ngroups)
+  end
+  if b == 91 then // '['
+    let scanned = parse_class(p, src, i: i + 1)
+    let ClassScan(set_val: s, pos: after) = scanned
+    return ParseStep(node: Class(set_val: s), pos: after, ngroups)
+  end
+  if b == 94 then // '^'
+    return ParseStep(node: StartAnchor, pos: i + 1, ngroups)
+  end
+  if b == 36 then // '$'
+    return ParseStep(node: EndAnchor, pos: i + 1, ngroups)
+  end
+  if b == 92 then // '\\'
+    let next_pos = i + 1
+    if next_pos >= plen then
+      raise InvalidRegexp(src, msg: "dangling backslash (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+    let nb = p_byte_at(p, i: next_pos)
+    // Reject numeric backrefs: \1, \2, ...
+    if nb >= 49 && nb <= 57 then
+      raise InvalidRegexp(src, msg: "backreferences are not supported (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+    let escval = class_escape_value(b: nb)
+    if escval >= 0 then
+      return ParseStep(node: Lit(byte_val: escval), pos: next_pos + 1, ngroups)
+    end
+    let extras = class_builtin_or_none(b: nb)
+    match extras do
+      | Some(val: cs) -> return ParseStep(node: Class(set_val: cs), pos: next_pos + 1, ngroups)
+      | None -> raise InvalidRegexp(src, msg: "unsupported escape '\\" ++ str.byte_substring(s: p, start: next_pos, len: 1) ++ "' (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+  end
+  // Reject closing-side metachars when met as atoms.
+  if b == 41 || b == 124 then
+    return ParseStep(node: Empty, pos: i, ngroups)
+  end
+  if b == 42 || b == 43 || b == 63 || b == 123 || b == 125 then
+    raise InvalidRegexp(src, msg: "unexpected metacharacter '" ++ str.byte_substring(s: p, start: i, len: 1) ++ "' (at position " ++ str.from_i64(val: i) ++ ")")
+  end
+  // Plain literal byte.
+  return ParseStep(node: Lit(byte_val: b), pos: i + 1, ngroups)
+end
+
+let parse_factor = fn (p: string, src: string, i: i64, ngroups: i64) -> ParseStep throws { RegexpThrow } do
+  let atom = parse_atom(p, src, i, ngroups)
+  let ParseStep(node: a, pos: after, ngroups: ng2) = atom
+  let plen = pat_len(p)
+  if after >= plen then return atom end
+  let q = p_byte_at(p, i: after)
+  if q == 42 then
+    // Detect and reject lazy quantifier `*?` early.
+    if after + 1 < plen && p_byte_at(p, i: after + 1) == 63 then
+      raise InvalidRegexp(src, msg: "lazy quantifier '*?' is not supported (at position " ++ str.from_i64(val: after) ++ ")")
+    end
+    return ParseStep(node: Star(node: a), pos: after + 1, ngroups: ng2)
+  end
+  if q == 43 then
+    if after + 1 < plen && p_byte_at(p, i: after + 1) == 63 then
+      raise InvalidRegexp(src, msg: "lazy quantifier '+?' is not supported (at position " ++ str.from_i64(val: after) ++ ")")
+    end
+    return ParseStep(node: Plus(node: a), pos: after + 1, ngroups: ng2)
+  end
+  if q == 63 then
+    if after + 1 < plen && p_byte_at(p, i: after + 1) == 63 then
+      raise InvalidRegexp(src, msg: "lazy quantifier '??' is not supported (at position " ++ str.from_i64(val: after) ++ ")")
+    end
+    return ParseStep(node: Opt(node: a), pos: after + 1, ngroups: ng2)
+  end
+  if q == 123 then
+    return parse_bounded_after(p, src, anchor: a, pos: after, ngroups: ng2)
+  end
+  return atom
+end
+
+let parse_bounded_after = fn (
+  p: string, src: string, anchor: Re, pos: i64, ngroups: i64
+) -> ParseStep throws { RegexpThrow } do
+  let plen = pat_len(p)
+  // pos is the '{'.
+  let scan_lo = scan_int(p, i: pos + 1)
+  let IntScan(value: lo, pos: after_lo) = scan_lo
+  if lo < 0 then
+    raise InvalidRegexp(src, msg: "expected number in '{...}' (at position " ++ str.from_i64(val: pos) ++ ")")
+  end
+  if after_lo >= plen then
+    raise InvalidRegexp(src, msg: "unclosed '{...}' (at position " ++ str.from_i64(val: pos) ++ ")")
+  end
+  let next_b = p_byte_at(p, i: after_lo)
+  if next_b == 125 then // '}' → {n}
+    return ParseStep(node: Bounded(node: anchor, lo, hi: lo), pos: after_lo + 1, ngroups)
+  end
+  if next_b == 44 then // ',' → {n,} or {n,m}
+    let after_comma = after_lo + 1
+    if after_comma < plen && p_byte_at(p, i: after_comma) == 125 then
+      return ParseStep(node: Bounded(node: anchor, lo, hi: 0 - 1), pos: after_comma + 1, ngroups)
+    end
+    let scan_hi = scan_int(p, i: after_comma)
+    let IntScan(value: hi, pos: after_hi) = scan_hi
+    if hi < 0 then
+      raise InvalidRegexp(src, msg: "expected number after ',' in '{n,m}' (at position " ++ str.from_i64(val: pos) ++ ")")
+    end
+    if after_hi >= plen || p_byte_at(p, i: after_hi) != 125 then
+      raise InvalidRegexp(src, msg: "unclosed '{n,m}' (at position " ++ str.from_i64(val: pos) ++ ")")
+    end
+    if hi < lo then
+      raise InvalidRegexp(src, msg: "'{n,m}' has m < n (at position " ++ str.from_i64(val: pos) ++ ")")
+    end
+    return ParseStep(node: Bounded(node: anchor, lo, hi), pos: after_hi + 1, ngroups)
+  end
+  raise InvalidRegexp(src, msg: "malformed '{...}' (at position " ++ str.from_i64(val: pos) ++ ")")
+end
+
+// Build a Concat node from a list of factors, right-associating to keep the
+// emitter simple (compile traverses with no special handling either way).
+let mk_concat = fn (factors: [ Re ]) -> Re do
+  match factors do
+    | [] -> return Empty
+    | x :: rest ->
+      match rest do
+        | [] -> return x
+        | _ :: _ -> return Concat(a_node: x, b_node: mk_concat(factors: rest))
+      end
+  end
+end
+
+let parse_concat_go = fn (
+  p: string, src: string, i: i64, ngroups: i64, acc: [ Re ]
+) -> ParseStep throws { RegexpThrow } do
+  let plen = pat_len(p)
+  if i >= plen then
+    return ParseStep(node: mk_concat(factors: rev_re(xs: acc, ys: [])), pos: i, ngroups)
+  end
+  let b = p_byte_at(p, i)
+  if b == 41 || b == 124 then
+    return ParseStep(node: mk_concat(factors: rev_re(xs: acc, ys: [])), pos: i, ngroups)
+  end
+  let factor = parse_factor(p, src, i, ngroups)
+  let ParseStep(node: f, pos: after, ngroups: ng2) = factor
+  if after == i then
+    // No progress (empty factor) — bail to avoid infinite loops.
+    return ParseStep(node: mk_concat(factors: rev_re(xs: acc, ys: [])), pos: i, ngroups: ng2)
+  end
+  return parse_concat_go(p, src, i: after, ngroups: ng2, acc: f :: acc)
+end
+
+let rev_re = fn (xs: [ Re ], ys: [ Re ]) -> [ Re ] do
+  match xs do
+    | [] -> return ys
+    | v :: rest -> return rev_re(xs: rest, ys: v :: ys)
+  end
+end
+
+let parse_re = fn (p: string, src: string, i: i64, ngroups: i64) -> ParseStep throws { RegexpThrow } do
+  let lhs = parse_concat_go(p, src, i, ngroups, acc: [])
+  let ParseStep(node: l, pos: after, ngroups: ng2) = lhs
+  let plen = pat_len(p)
+  if after >= plen then return lhs end
+  if p_byte_at(p, i: after) == 124 then
+    let rhs = parse_re(p, src, i: after + 1, ngroups: ng2)
+    let ParseStep(node: r, pos: after2, ngroups: ng3) = rhs
+    return ParseStep(node: Alt(a_node: l, b_node: r), pos: after2, ngroups: ng3)
+  end
+  return lhs
+end
+
+// ─── Compile ─────────────────────────────────────────────────────────────────
+//
+// Compile the AST to a flat instruction list. We track total length
+// incrementally to avoid an extra length() pass before emitting jumps.
+//
+// Group 0 always wraps the entire program: emit Save(0), <body>, Save(1),
+// Match. Internal groups use even/odd slot pairs 2k / 2k+1.
+
+type EmitState = EmitState(code: [ Inst ], n: i64)
+
+let push_inst = fn (st: EmitState, i: Inst) -> EmitState do
+  let EmitState(code: c, n) = st
+  return EmitState(code: i :: c, n: n + 1)
+end
+
+let st_n = fn (st: EmitState) -> i64 do
+  let EmitState(code: _, n) = st
+  return n
+end
+
+let patch_at_go = fn (xs: [ Inst ], idx: i64, new_inst: Inst, acc: [ Inst ]) -> [ Inst ] do
+  match xs do
+    | [] -> return rev_inst(xs: acc, ys: [])
+    | h :: rest ->
+      if idx == 0 then
+        return rev_inst(xs: acc, ys: new_inst :: rest)
+      end
+      return patch_at_go(xs: rest, idx: idx - 1, new_inst, acc: h :: acc)
+  end
+end
+
+let rev_inst = fn (xs: [ Inst ], ys: [ Inst ]) -> [ Inst ] do
+  match xs do
+    | [] -> return ys
+    | v :: rest -> return rev_inst(xs: rest, ys: v :: ys)
+  end
+end
+
+let patch_at = fn (xs: [ Inst ], idx: i64, new_inst: Inst) -> [ Inst ] do
+  return patch_at_go(xs, idx, new_inst, acc: [])
+end
+
+// Reverse the in-progress accumulator and translate forward emit-order
+// positions to final (forward) program-counter values. Since we push onto
+// the front of `code` and increment `n` per push, the indices into `code`
+// (after reverse) are exactly the values we tracked as `n` at emit time.
+let emit_compile = fn (node: Re, st: EmitState) -> EmitState do
+  match node do
+    | Empty -> return st
+    | Lit(byte_val: v) -> return push_inst(st, i: mk_byte(b: v))
+    | AnyByte -> return push_inst(st, i: mk_any())
+    | Class(set_val: cs) -> return push_inst(st, i: mk_class(s: cs))
+    | StartAnchor -> return push_inst(st, i: mk_start())
+    | EndAnchor -> return push_inst(st, i: mk_end())
+    | Concat(a_node: a, b_node: b) ->
+      let st1 = emit_compile(node: a, st)
+      return emit_compile(node: b, st: st1)
+    | Alt(a_node: a, b_node: b) ->
+      // L1: SPLIT L2 L3
+      // L2: <a>
+      //     JMP L4
+      // L3: <b>
+      // L4:
+      let split_at = st_n(st)
+      let st1 = push_inst(st, i: mk_split(a_t: 0, b_t: 0))
+      let l2 = st_n(st: st1)
+      let st2 = emit_compile(node: a, st: st1)
+      let jmp_at = st_n(st: st2)
+      let st3 = push_inst(st: st2, i: mk_jmp(t: 0))
+      let l3 = st_n(st: st3)
+      let st4 = emit_compile(node: b, st: st3)
+      let l4 = st_n(st: st4)
+      let EmitState(code: c1, n: n1) = st4
+      let c2 = patch_at(xs: c1, idx: n1 - 1 - split_at, new_inst: mk_split(a_t: l2, b_t: l3))
+      let c3 = patch_at(xs: c2, idx: n1 - 1 - jmp_at, new_inst: mk_jmp(t: l4))
+      return EmitState(code: c3, n: n1)
+    | Star(node: inner) ->
+      // L1: SPLIT L2 L3
+      // L2: <inner>
+      //     JMP L1
+      // L3:
+      let split_at = st_n(st)
+      let st1 = push_inst(st, i: mk_split(a_t: 0, b_t: 0))
+      let l2 = st_n(st: st1)
+      let st2 = emit_compile(node: inner, st: st1)
+      let jmp_at = st_n(st: st2)
+      let st3 = push_inst(st: st2, i: mk_jmp(t: split_at))
+      let l3 = st_n(st: st3)
+      let EmitState(code: c1, n: n1) = st3
+      let c2 = patch_at(xs: c1, idx: n1 - 1 - split_at, new_inst: mk_split(a_t: l2, b_t: l3))
+      return EmitState(code: c2, n: n1)
+    | Plus(node: inner) ->
+      // L1: <inner>
+      // L2: SPLIT L1 L3
+      // L3:
+      let l1 = st_n(st)
+      let st1 = emit_compile(node: inner, st)
+      let split_at = st_n(st: st1)
+      let st2 = push_inst(st: st1, i: mk_split(a_t: 0, b_t: 0))
+      let l3 = st_n(st: st2)
+      let EmitState(code: c1, n: n1) = st2
+      let c2 = patch_at(xs: c1, idx: n1 - 1 - split_at, new_inst: mk_split(a_t: l1, b_t: l3))
+      return EmitState(code: c2, n: n1)
+    | Opt(node: inner) ->
+      // L1: SPLIT L2 L3
+      // L2: <inner>
+      // L3:
+      let split_at = st_n(st)
+      let st1 = push_inst(st, i: mk_split(a_t: 0, b_t: 0))
+      let l2 = st_n(st: st1)
+      let st2 = emit_compile(node: inner, st: st1)
+      let l3 = st_n(st: st2)
+      let EmitState(code: c1, n: n1) = st2
+      let c2 = patch_at(xs: c1, idx: n1 - 1 - split_at, new_inst: mk_split(a_t: l2, b_t: l3))
+      return EmitState(code: c2, n: n1)
+    | Bounded(node: inner, lo, hi) ->
+      return emit_bounded(inner, lo, hi, st)
+    | CapGroup(idx, node: inner) ->
+      let slot_open = (idx + 1) * 2
+      let slot_close = slot_open + 1
+      let st1 = push_inst(st, i: mk_save(slot: slot_open))
+      let st2 = emit_compile(node: inner, st: st1)
+      return push_inst(st: st2, i: mk_save(slot: slot_close))
+  end
+end
+
+// Bounded compiles to a sequence: `lo` mandatory copies followed by either
+// (hi - lo) Opt copies or a Star copy when hi is unbounded.
+let emit_bounded = fn (inner: Re, lo: i64, hi: i64, st: EmitState) -> EmitState do
+  let st1 = emit_n_copies(inner, n: lo, st)
+  if hi == 0 - 1 then
+    return emit_compile(node: Star(node: inner), st: st1)
+  end
+  let opt_count = hi - lo
+  return emit_n_opts(inner, n: opt_count, st: st1)
+end
+
+let emit_n_copies = fn (inner: Re, n: i64, st: EmitState) -> EmitState do
+  if n <= 0 then return st end
+  let st1 = emit_compile(node: inner, st)
+  return emit_n_copies(inner, n: n - 1, st: st1)
+end
+
+let emit_n_opts = fn (inner: Re, n: i64, st: EmitState) -> EmitState do
+  if n <= 0 then return st end
+  let st1 = emit_compile(node: Opt(node: inner), st)
+  return emit_n_opts(inner, n: n - 1, st: st1)
+end
+
+let compile_program = fn (root: Re, n_caps: i64) -> [ Inst ] do
+  // Wrap with capture group 0 (whole match) at slots 0/1.
+  let st0 = EmitState(code: [], n: 0)
+  let st1 = push_inst(st: st0, i: mk_save(slot: 0))
+  let st2 = emit_compile(node: root, st: st1)
+  let st3 = push_inst(st: st2, i: mk_save(slot: 1))
+  let st4 = push_inst(st: st3, i: mk_match())
+  let EmitState(code: rev_c, n: _) = st4
+  return rev_inst(xs: rev_c, ys: [])
+end
+
+// ─── Public compile API ──────────────────────────────────────────────────────
+
+/**
+Compile a regular-expression pattern. Throws `InvalidRegexp` (with the
+failing byte offset embedded in the message) on a parse error. The
+returned value is safe to share — there is no per-match mutable state.
+*/
+export let from_string = fn (src: string) -> Regexp throws { RegexpThrow } do
+  let step = parse_re(p: src, src, i: 0, ngroups: 0)
+  let ParseStep(node: root, pos: after, ngroups) = step
+  let plen = pat_len(p: src)
+  if after < plen then
+    let leftover_b = p_byte_at(p: src, i: after)
+    if leftover_b == 41 then
+      raise InvalidRegexp(src, msg: "unmatched ')' (at position " ++ str.from_i64(val: after) ++ ")")
+    end
+    raise InvalidRegexp(src, msg: "unexpected trailing input (at position " ++ str.from_i64(val: after) ++ ")")
+  end
+  let code = compile_program(root, n_caps: ngroups)
+  return Regexp(src, code, code_len: code_length(code), n_groups: ngroups)
+end
+
+let code_length_go = fn (xs: [ Inst ], n: i64) -> i64 do
+  match xs do
+    | [] -> return n
+    | _ :: rest -> return code_length_go(xs: rest, n: n + 1)
+  end
+end
+
+let code_length = fn (xs: [ Inst ]) -> i64 do return code_length_go(xs, n: 0) end
+
+// ─── NFA Simulation ──────────────────────────────────────────────────────────
+//
+// Thread = (pc, captures). Captures are a list of i64 byte offsets, length
+// 2 * (n_groups + 1); -1 means "not set".
+//
+// We maintain two queues (`current`, `next`) and a per-step "visited"
+// markers list of length `code_len` — a thread whose pc has already been
+// enqueued this step is dropped, which is what bounds total work at
+// O(n × m).
+//
+// The simulator finds the leftmost-longest match (greedy):
+//   - For each position in the input, advance the thread set by reading
+//     one byte. If a thread hits Match, remember its captures and the
+//     end position; keep advancing the set with the same start in case a
+//     later byte yields a longer match (still leftmost since we keep the
+//     same start).
+
+type Thread = Thread(pc: i64, caps: [ i64 ])
+
+let make_caps_go = fn (n: i64, acc: [ i64 ]) -> [ i64 ] do
+  if n <= 0 then return acc end
+  return make_caps_go(n: n - 1, acc: (0 - 1) :: acc)
+end
+
+let make_caps = fn (n_groups: i64) -> [ i64 ] do
+  // Slots: 2 per group (group 0 included), so length is 2 * (n_groups + 1).
+  let n_slots = (n_groups + 1) * 2
+  return make_caps_go(n: n_slots, acc: [])
+end
+
+// Fetch an instruction at index `pc`. We pay O(pc) per fetch, but pc is
+// bounded by code_len and the thread set is bounded by code_len, so the
+// whole step is O(m^2) in the pathological worst case — still O(n × m^2)
+// total. For the regex sizes this stdlib targets (< a few hundred
+// instructions), the constant factor wins over carrying a more elaborate
+// random-access encoding.
+let code_at = fn (code: [ Inst ], pc: i64) -> Inst do
+  match code do
+    | [] -> return mk_match() // unreachable for well-formed pc
+    | h :: rest ->
+      if pc <= 0 then return h end
+      return code_at(code: rest, pc: pc - 1)
+  end
+end
+
+// Visited list: 0 means "not seen this step", non-zero means "seen".
+let visited_get = fn (xs: [ i64 ], pc: i64) -> bool do
+  match xs do
+    | [] -> return false
+    | v :: rest ->
+      if pc <= 0 then return v != 0 end
+      return visited_get(xs: rest, pc: pc - 1)
+  end
+end
+
+let visited_set = fn (xs: [ i64 ], pc: i64) -> [ i64 ] do
+  return set_nth(xs, n: pc, v: 1)
+end
+
+let visited_init_go = fn (n: i64, acc: [ i64 ]) -> [ i64 ] do
+  if n <= 0 then return acc end
+  return visited_init_go(n: n - 1, acc: 0 :: acc)
+end
+let visited_init = fn (n: i64) -> [ i64 ] do return visited_init_go(n, acc: []) end
+
+// Add a thread at `pc` to the queue, performing eager epsilon-closure on
+// Split/Jmp/Save/anchors. The visited array is updated in place.
+type AddState = AddState(threads: [ Thread ], visited: [ i64 ])
+
+let set_cap_at = fn (caps: [ i64 ], slot: i64, val: i64) -> [ i64 ] do
+  return set_nth(xs: caps, n: slot, v: val)
+end
+
+let as_threads = fn (st: AddState) -> [ Thread ] do
+  let AddState(threads, visited: _) = st
+  return threads
+end
+
+let as_visited = fn (st: AddState) -> [ i64 ] do
+  let AddState(threads: _, visited) = st
+  return visited
+end
+
+let add_thread = fn (
+  code: [ Inst ], code_len: i64, pc: i64, caps: [ i64 ], pos: i64,
+  s: string, slen: i64, st: AddState
+) -> AddState do
+  if pc < 0 || pc >= code_len then return st end
+  if visited_get(xs: as_visited(st), pc) then return st end
+  let st1 = AddState(threads: as_threads(st), visited: visited_set(xs: as_visited(st), pc))
+  let ins = code_at(code, pc)
+  let op_v = inst_op(ins)
+  if op_v == op_split then
+    // Process the HIGH-priority branch (`inst_a`) first so it claims the
+    // visited slot on a shared pc with the high-priority caps. The list
+    // is reversed at the add_thread/step boundary, so head-position
+    // changes between accumulation and iteration order.
+    let st_a = add_thread(code, code_len, pc: inst_a(ins), caps, pos, s, slen, st: st1)
+    return add_thread(code, code_len, pc: inst_b(ins), caps, pos, s, slen, st: st_a)
+  end
+  if op_v == op_jmp then
+    return add_thread(code, code_len, pc: inst_a(ins), caps, pos, s, slen, st: st1)
+  end
+  if op_v == op_save then
+    let caps2 = set_cap_at(caps, slot: inst_a(ins), val: pos)
+    return add_thread(code, code_len, pc: pc + 1, caps: caps2, pos, s, slen, st: st1)
+  end
+  if op_v == op_start then
+    if pos == 0 then
+      return add_thread(code, code_len, pc: pc + 1, caps, pos, s, slen, st: st1)
+    end
+    return st1
+  end
+  if op_v == op_end then
+    if pos >= slen then
+      return add_thread(code, code_len, pc: pc + 1, caps, pos, s, slen, st: st1)
+    end
+    return st1
+  end
+  // Consuming opcode: enqueue.
+  let nt = Thread(pc, caps)
+  return AddState(threads: nt :: as_threads(st: st1), visited: as_visited(st: st1))
+end
+
+type StepResult = StepResult(threads: [ Thread ], matched: bool, match_caps: [ i64 ])
+
+// Run one input byte through `threads`. Returns the surviving thread set
+// for the next step plus an optional "best match so far". The match list
+// is preserved (and updated) across calls.
+let step_threads = fn (
+  code: [ Inst ], code_len: i64, threads: [ Thread ], byte_val: i64,
+  pos: i64, s: string, slen: i64, prior_match: bool, prior_caps: [ i64 ]
+) -> StepResult do
+  let init = AddState(threads: [], visited: visited_init(n: code_len))
+  return step_threads_go(code, code_len, threads, byte_val, pos, s, slen,
+    prior_match, prior_caps, st: init)
+end
+
+let reverse_threads = fn (xs: [ Thread ], acc: [ Thread ]) -> [ Thread ] do
+  match xs do
+    | [] -> return acc
+    | t :: rest -> return reverse_threads(xs: rest, acc: t :: acc)
+  end
+end
+
+let step_threads_go = fn (
+  code: [ Inst ], code_len: i64, threads: [ Thread ], byte_val: i64,
+  pos: i64, s: string, slen: i64, prior_match: bool, prior_caps: [ i64 ],
+  st: AddState
+) -> StepResult do
+  match threads do
+    | [] ->
+      // Reverse: add_thread prepends to keep insertion O(1); we want
+      // higher-priority threads (those reached via inst_a first) at the
+      // head of the next iteration. The reverse flips the accumulated
+      // order so first-added (highest priority) wins on the next step.
+      return StepResult(threads: reverse_threads(xs: as_threads(st), acc: []), matched: prior_match, match_caps: prior_caps)
+    | Thread(pc, caps) :: rest ->
+      let ins = code_at(code, pc)
+      let op_v = inst_op(ins)
+      if op_v == op_match then
+        // Record this match and drop lower-priority threads (they would
+        // produce strictly worse matches under leftmost-greedy semantics).
+        // Continuing to advance the higher-priority threads still in `st`
+        // is what lets greedy quantifiers extend further on the next byte.
+        return StepResult(threads: reverse_threads(xs: as_threads(st), acc: []), matched: true, match_caps: caps)
+      end
+      if op_v == op_byte then
+        if byte_val == inst_a(ins) then
+          let st2 = add_thread(code, code_len, pc: pc + 1, caps, pos: pos + 1, s, slen, st)
+          return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st: st2)
+        end
+        return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st)
+      end
+      if op_v == op_any then
+        if byte_val >= 0 then
+          let st2 = add_thread(code, code_len, pc: pc + 1, caps, pos: pos + 1, s, slen, st)
+          return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st: st2)
+        end
+        return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st)
+      end
+      if op_v == op_class then
+        if byte_val >= 0 && set_has(s: inst_set(ins), b: byte_val) then
+          let st2 = add_thread(code, code_len, pc: pc + 1, caps, pos: pos + 1, s, slen, st)
+          return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st: st2)
+        end
+        return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st)
+      end
+      // Non-consuming opcodes reach here only if add_thread didn't strip
+      // them — keep them on the dead-thread floor.
+      return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st)
+  end
+end
+
+// Drive a single match attempt starting at byte offset `start_pos`. Returns
+// Some(match_caps) (with capture slots filled in) if any path accepted, or
+// None.
+let search_at = fn (
+  re: Regexp, s: string, slen: i64, start_pos: i64
+) -> Option<[ i64 ]> do
+  let Regexp(src: _, code, code_len, n_groups) = re
+  let caps0 = make_caps(n_groups)
+  // Seed the thread set with pc=0 at start_pos.
+  let init_add = AddState(threads: [], visited: visited_init(n: code_len))
+  let seeded = add_thread(code, code_len, pc: 0, caps: caps0, pos: start_pos, s, slen, st: init_add)
+  return drive_match(code, code_len, threads: reverse_threads(xs: as_threads(st: seeded), acc: []), pos: start_pos, s, slen, matched: false, caps: caps0)
+end
+
+let drive_match = fn (
+  code: [ Inst ], code_len: i64, threads: [ Thread ], pos: i64,
+  s: string, slen: i64, matched: bool, caps: [ i64 ]
+) -> Option<[ i64 ]> do
+  match threads do
+    | [] ->
+      if matched then return Some(val: caps) end
+      return None
+    | _ :: _ ->
+      if pos >= slen then
+        // EOF: flush via step with byte_val = -1 so no consumer fires.
+        let final_result = step_threads(code, code_len, threads, byte_val: 0 - 1, pos, s, slen, prior_match: matched, prior_caps: caps)
+        let StepResult(threads: _, matched: m_final, match_caps: caps_final) = final_result
+        if m_final then return Some(val: caps_final) end
+        return None
+      end
+      let b = str.char_code(s: str.byte_substring(s, start: pos, len: 1), idx: 0)
+      let step = step_threads(code, code_len, threads, byte_val: b, pos, s, slen, prior_match: matched, prior_caps: caps)
+      let StepResult(threads: next_threads, matched: m2, match_caps: caps2) = step
+      return drive_match(code, code_len, threads: next_threads, pos: pos + 1, s, slen, matched: m2, caps: caps2)
+  end
+end
+
+// ─── Public match API ────────────────────────────────────────────────────────
+
+/**
+Returns true if `re` matches anywhere inside `s` (substring containment
+semantics, like `Regexp.is_match` in most languages).
+*/
+export let test = fn (re: Regexp, s: string) -> bool do
+  match find(re, s) do
+    | Some(_) -> return true
+    | None -> return false
+  end
+end
+
+let nth_cap = fn (caps: [ i64 ], n: i64) -> i64 do return nth_i64(xs: caps, n) end
+
+let caps_to_groups_go = fn (
+  caps: [ i64 ], s: string, idx: i64, n_groups: i64, acc: [ Option<string> ]
+) -> [ Option<string> ] do
+  if idx > n_groups then return rev_opt_str(xs: acc, ys: []) end
+  let start_p = nth_cap(caps, n: idx * 2)
+  let end_p = nth_cap(caps, n: idx * 2 + 1)
+  let entry = if start_p < 0 || end_p < 0 then
+    None
+  else
+    Some(val: str.byte_substring(s, start: start_p, len: end_p - start_p))
+  end
+  return caps_to_groups_go(caps, s, idx: idx + 1, n_groups, acc: entry :: acc)
+end
+
+let rev_opt_str = fn (xs: [ Option<string> ], ys: [ Option<string> ]) -> [ Option<string> ] do
+  match xs do
+    | [] -> return ys
+    | v :: rest -> return rev_opt_str(xs: rest, ys: v :: ys)
+  end
+end
+
+let caps_to_match = fn (caps: [ i64 ], s: string, n_groups: i64) -> Match do
+  let start_p = nth_cap(caps, n: 0)
+  let end_p = nth_cap(caps, n: 1)
+  let text = str.byte_substring(s, start: start_p, len: end_p - start_p)
+  return Match(
+    start: start_p,
+    end_pos: end_p,
+    text,
+    groups: caps_to_groups_go(caps, s, idx: 0, n_groups, acc: [])
+  )
+end
+
+/**
+Find the leftmost match of `re` in `s`. Returns the match record or
+`None`. Greedy semantics: among all matches starting at the leftmost
+position, the longest is returned.
+*/
+export let find = fn (re: Regexp, s: string) -> Option<Match> do
+  let slen = str.byte_length(s)
+  return find_from(re, s, slen, start_pos: 0)
+end
+
+let find_from = fn (re: Regexp, s: string, slen: i64, start_pos: i64) -> Option<Match> do
+  if start_pos > slen then return None end
+  match search_at(re, s, slen, start_pos) do
+    | Some(val: caps) ->
+      let Regexp(src: _, code: _, code_len: _, n_groups) = re
+      return Some(val: caps_to_match(caps, s, n_groups))
+    | None ->
+      if start_pos >= slen then return None end
+      return find_from(re, s, slen, start_pos: start_pos + 1)
+  end
+end
+
+/**
+Return every non-overlapping match of `re` in `s`, left-to-right. Empty
+matches are emitted but do not stall progress — the search position
+advances by at least one byte after a zero-width hit.
+*/
+export let find_all = fn (re: Regexp, s: string) -> [ Match ] do
+  let slen = str.byte_length(s)
+  return rev_match(xs: find_all_go(re, s, slen, start_pos: 0, acc: []), ys: [])
+end
+
+let find_all_go = fn (
+  re: Regexp, s: string, slen: i64, start_pos: i64, acc: [ Match ]
+) -> [ Match ] do
+  if start_pos > slen then return acc end
+  match find_from(re, s, slen, start_pos) do
+    | None -> return acc
+    | Some(val: m) ->
+      let Match(start: _, end_pos: e, text: _, groups: _) = m
+      let next_start = if e <= start_pos then start_pos + 1 else e end
+      return find_all_go(re, s, slen, start_pos: next_start, acc: m :: acc)
+  end
+end
+
+let rev_match = fn (xs: [ Match ], ys: [ Match ]) -> [ Match ] do
+  match xs do
+    | [] -> return ys
+    | v :: rest -> return rev_match(xs: rest, ys: v :: ys)
+  end
+end
+
+// ─── Replacement helpers ─────────────────────────────────────────────────────
+//
+// `$&` expands to the whole match, `$N` (N in 1..=9) expands to group N's
+// text (empty string when the group did not participate), and `$$` is a
+// literal `$`. Anything else passes through verbatim.
+
+let expand_template_go = fn (
+  repl: string, rlen: i64, i: i64, m: Match, acc: string
+) -> string do
+  if i >= rlen then return acc end
+  let b = str.char_code(s: str.byte_substring(s: repl, start: i, len: 1), idx: 0)
+  if b != 36 then // '$'
+    let chunk = str.byte_substring(s: repl, start: i, len: 1)
+    return expand_template_go(repl, rlen, i: i + 1, m, acc: acc ++ chunk)
+  end
+  if i + 1 >= rlen then
+    let chunk = str.byte_substring(s: repl, start: i, len: 1)
+    return expand_template_go(repl, rlen, i: i + 1, m, acc: acc ++ chunk)
+  end
+  let nb = str.char_code(s: str.byte_substring(s: repl, start: i + 1, len: 1), idx: 0)
+  if nb == 36 then // '$$'
+    return expand_template_go(repl, rlen, i: i + 2, m, acc: acc ++ "$")
+  end
+  if nb == 38 then // '$&'
+    let Match(start: _, end_pos: _, text, groups: _) = m
+    return expand_template_go(repl, rlen, i: i + 2, m, acc: acc ++ text)
+  end
+  if nb >= 48 && nb <= 57 then
+    let idx = nb - 48
+    let chunk = group_text(m, idx)
+    return expand_template_go(repl, rlen, i: i + 2, m, acc: acc ++ chunk)
+  end
+  // Unrecognized: pass `$` through literally.
+  let chunk = str.byte_substring(s: repl, start: i, len: 1)
+  return expand_template_go(repl, rlen, i: i + 1, m, acc: acc ++ chunk)
+end
+
+let group_text = fn (m: Match, idx: i64) -> string do
+  let Match(start: _, end_pos: _, text: _, groups) = m
+  let entry = nth_opt(xs: groups, n: idx)
+  match entry do
+    | Some(val: s) -> return s
+    | None -> return ""
+  end
+end
+
+let nth_opt = fn (xs: [ Option<string> ], n: i64) -> Option<string> do
+  match xs do
+    | [] -> return None
+    | v :: rest ->
+      if n <= 0 then return v end
+      return nth_opt(xs: rest, n: n - 1)
+  end
+end
+
+let expand_template = fn (repl: string, m: Match) -> string do
+  return expand_template_go(repl, rlen: str.byte_length(s: repl), i: 0, m, acc: "")
+end
+
+// ─── Public replace / split API ──────────────────────────────────────────────
+
+/**
+Replace only the first match in `s`. `repl` supports `$&` (whole match),
+`$1..$9` (group captures), and `$$` (literal `$`). Other `$X` sequences
+pass through verbatim.
+*/
+export let sub = fn (re: Regexp, s: string, repl: string) -> string do
+  let slen = str.byte_length(s)
+  match find_from(re, s, slen, start_pos: 0) do
+    | None -> return s
+    | Some(val: m) ->
+      let Match(start: a, end_pos: b, text: _, groups: _) = m
+      let prefix = str.byte_substring(s, start: 0, len: a)
+      let suffix = str.byte_substring(s, start: b, len: slen - b)
+      return prefix ++ expand_template(repl, m) ++ suffix
+  end
+end
+
+/**
+Replace every non-overlapping match in `s`. Zero-width matches consume
+one byte each (copied verbatim) so the loop always makes progress.
+*/
+export let gsub = fn (re: Regexp, s: string, repl: string) -> string do
+  let slen = str.byte_length(s)
+  return gsub_go(re, s, slen, start_pos: 0, repl, acc: "")
+end
+
+let gsub_go = fn (
+  re: Regexp, s: string, slen: i64, start_pos: i64, repl: string, acc: string
+) -> string do
+  if start_pos > slen then return acc end
+  match find_from(re, s, slen, start_pos) do
+    | None ->
+      let tail = str.byte_substring(s, start: start_pos, len: slen - start_pos)
+      return acc ++ tail
+    | Some(val: m) ->
+      let Match(start: a, end_pos: b, text: _, groups: _) = m
+      let prefix = str.byte_substring(s, start: start_pos, len: a - start_pos)
+      let replaced = expand_template(repl, m)
+      let acc2 = acc ++ prefix ++ replaced
+      // Zero-width: advance by one and copy that byte verbatim so we make
+      // progress without dropping content.
+      if b <= a then
+        if a >= slen then return acc2 end
+        let one = str.byte_substring(s, start: a, len: 1)
+        return gsub_go(re, s, slen, start_pos: a + 1, repl, acc: acc2 ++ one)
+      end
+      return gsub_go(re, s, slen, start_pos: b, repl, acc: acc2)
+  end
+end
+
+/**
+Functional variant of `gsub`: each match is fed to the user-supplied
+callback whose return value becomes the replacement. Useful for context-
+sensitive replacements that cannot be expressed as a template.
+*/
+export let gsub_with = fn (re: Regexp, s: string, f: (m: Match) -> string) -> string do
+  let slen = str.byte_length(s)
+  return gsub_with_go(re, s, slen, start_pos: 0, f, acc: "")
+end
+
+let gsub_with_go = fn (
+  re: Regexp, s: string, slen: i64, start_pos: i64, f: (m: Match) -> string, acc: string
+) -> string do
+  if start_pos > slen then return acc end
+  match find_from(re, s, slen, start_pos) do
+    | None ->
+      let tail = str.byte_substring(s, start: start_pos, len: slen - start_pos)
+      return acc ++ tail
+    | Some(val: m) ->
+      let Match(start: a, end_pos: b, text: _, groups: _) = m
+      let prefix = str.byte_substring(s, start: start_pos, len: a - start_pos)
+      let replaced = f(m)
+      let acc2 = acc ++ prefix ++ replaced
+      if b <= a then
+        if a >= slen then return acc2 end
+        let one = str.byte_substring(s, start: a, len: 1)
+        return gsub_with_go(re, s, slen, start_pos: a + 1, f, acc: acc2 ++ one)
+      end
+      return gsub_with_go(re, s, slen, start_pos: b, f, acc: acc2)
+  end
+end
+
+/**
+Split `s` on every non-overlapping match of `re`. The separator text is
+dropped; the surrounding substrings (possibly empty) are returned in
+order. An empty pattern returns the input as a single element to avoid
+emitting one entry per character (which the literal `std:str.split` also
+does for an empty separator).
+*/
+export let split = fn (re: Regexp, s: string) -> [ string ] do
+  let slen = str.byte_length(s)
+  return rev_str(xs: split_go(re, s, slen, start_pos: 0, acc: []), ys: [])
+end
+
+let split_go = fn (
+  re: Regexp, s: string, slen: i64, start_pos: i64, acc: [ string ]
+) -> [ string ] do
+  match find_from(re, s, slen, start_pos) do
+    | None ->
+      let tail = str.byte_substring(s, start: start_pos, len: slen - start_pos)
+      return tail :: acc
+    | Some(val: m) ->
+      let Match(start: a, end_pos: b, text: _, groups: _) = m
+      // Zero-width match: advance by one byte and append a single-char
+      // piece so split doesn't infinite-loop. The element added is the
+      // byte we had to skip, preserving the input on reassembly.
+      if b <= a then
+        if a >= slen then
+          let tail = str.byte_substring(s, start: start_pos, len: slen - start_pos)
+          return tail :: acc
+        end
+        let prefix = str.byte_substring(s, start: start_pos, len: a - start_pos)
+        return split_go(re, s, slen, start_pos: a + 1, acc: prefix :: acc)
+      end
+      let prefix = str.byte_substring(s, start: start_pos, len: a - start_pos)
+      return split_go(re, s, slen, start_pos: b, acc: prefix :: acc)
+  end
+end
+
+let rev_str = fn (xs: [ string ], ys: [ string ]) -> [ string ] do
+  match xs do
+    | [] -> return ys
+    | v :: rest -> return rev_str(xs: rest, ys: v :: ys)
+  end
+end
