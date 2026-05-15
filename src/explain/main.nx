@@ -1,0 +1,436 @@
+/**
+ * explain/main: `nexus explain <symbol> [--file FILE]` subcommand.
+ *
+ * V1 (issue nexus-cgfd): one-shot CLI surface that mirrors the LSP/MCP
+ * `explain` query so agents can drop the JSON-RPC bridge for the common
+ * "what is this symbol?" lookup. Re-uses `src/lsp/program_state` for the
+ * shared lex+parse+import-resolve stage and the same DefEntry walk
+ * `lsp/handlers/definition` uses to locate the symbol's def site.
+ *
+ * Output (text mode):
+ *   <symbol>
+ *     location: <file>:<line>:<col>
+ *     signature: <name>(p0: T0, ...) -> Ret require { ... } throws { ... }
+ *     docstring: <attached /** ... */ block, or "(none)">
+ *
+ * Output (--format=json):
+ *   {"symbol": "...", "file": "...", "line": N, "col": N,
+ *    "signature": "...", "docstring": "..." | null }
+ *
+ * Symbol resolution: bare top-level name in `--file` (default `main.nx`)
+ * or the entry file. Cross-file qualified lookups (`alias.foo`) are out
+ * of V1 scope — file follow-up `cgfd.3` if demanded.
+ */
+
+import { Option, Some, None } from "std:option"
+import {
+  Program, SpannedTopLevel, GlobalLet, TLLet, Cap, TLCap, FunctionSig,
+  SpannedExpr, Expr, ExprLambda, Param, TypeExpr,
+  TyRow, TyUserDefined
+} from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import {
+  ProgramState, build_program_state
+} from "src/lsp/program_state.nx"
+import * as types from "src/typecheck/types.nx"
+import { Fs }, * as fs_mod from "std:fs"
+import { Console }, * as stdio from "std:stdio"
+import * as str from "std:str"
+import * as list from "std:list"
+import { InvalidUsage }, * as err from "src/common/error.nx"
+
+// ─── Output format ───────────────────────────────────────────────────────────
+
+export type ExplainOutputFormat = ExplainText | ExplainJson
+
+// ─── CLI parsing ─────────────────────────────────────────────────────────────
+
+export type ParsedExplainSubcommand = ParsedExplainSubcommand(
+  remaining: [string],
+  is_explain: bool
+)
+
+/** Detect a leading `explain` subcommand. Mirrors `strip_mcp_subcommand`. */
+export let strip_explain_subcommand = fn (xs: [string]) -> ParsedExplainSubcommand do
+  match xs do
+    | [] -> return ParsedExplainSubcommand(remaining: [], is_explain: false)
+    | prog :: [] -> return ParsedExplainSubcommand(remaining: [prog], is_explain: false)
+    | prog :: second :: rest2 ->
+      if second == "explain" then
+        return ParsedExplainSubcommand(remaining: prog :: rest2, is_explain: true)
+      end
+      return ParsedExplainSubcommand(remaining: xs, is_explain: false)
+  end
+end
+
+type ExplainArgs = ExplainArgs(symbol: string, file: string, format: ExplainOutputFormat)
+
+let parse_args_go = fn (
+  xs: [string],
+  positional: Option<string>,
+  file: Option<string>,
+  format: ExplainOutputFormat
+) -> ExplainArgs throws { InvalidUsage } do
+  match xs do
+    | [] ->
+      let sym = match positional do
+        | Some(val: s) -> s
+        | None -> raise InvalidUsage(detail: "explain: missing <symbol> argument")
+      end
+      let fpath = match file do
+        | Some(val: f) -> f
+        | None -> "main.nx"
+      end
+      return ExplainArgs(symbol: sym, file: fpath, format)
+    | flag :: rest ->
+      if flag == "--file" then
+        match rest do
+          | [] -> raise InvalidUsage(detail: "explain: --file requires a path")
+          | value :: rest2 ->
+            return parse_args_go(xs: rest2, positional, file: Some(val: value), format)
+        end
+      end
+      if flag == "--format=text" then
+        return parse_args_go(xs: rest, positional, file, format: ExplainText)
+      end
+      if flag == "--format=json" then
+        return parse_args_go(xs: rest, positional, file, format: ExplainJson)
+      end
+      if flag == "--format" then
+        match rest do
+          | [] -> raise InvalidUsage(detail: "explain: --format requires text|json")
+          | value :: rest2 ->
+            if value == "text" then return parse_args_go(xs: rest2, positional, file, format: ExplainText) end
+            if value == "json" then return parse_args_go(xs: rest2, positional, file, format: ExplainJson) end
+            raise InvalidUsage(detail: "explain: invalid --format value: " ++ value)
+        end
+      end
+      // Positional symbol: first non-flag wins.
+      match positional do
+        | None -> return parse_args_go(xs: rest, positional: Some(val: flag), file, format)
+        | Some(val: _) -> raise InvalidUsage(detail: "explain: unexpected extra argument: " ++ flag)
+      end
+  end
+end
+
+// ─── Top-level def lookup by name ────────────────────────────────────────────
+
+type DefHit = DefHit(
+  name: string,
+  span: Span,
+  signature: string,
+  docstring: Option<string>
+)
+
+let render_param = fn (p: Param) -> string do
+  match p do | Param(name, sigil: _, typ) ->
+    return name ++ ": " ++ types.type_to_string(typ)
+  end
+end
+
+let render_params_go = fn (ps: [Param], acc: [string]) -> [string] do
+  match ps do
+    | [] -> return list.reverse(xs: acc)
+    | p :: rest -> return render_params_go(ps: rest, acc: render_param(p) :: acc)
+  end
+end
+
+let render_params = fn (ps: [Param]) -> string do
+  let labels = render_params_go(ps, acc: [])
+  return str.join(xs: labels, sep: ", ")
+end
+
+let collect_cap_names = fn (xs: [TypeExpr], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | t :: rest ->
+      match t do
+        | TyUserDefined(name, args: []) -> return collect_cap_names(xs: rest, acc: name :: acc)
+        | _ -> return collect_cap_names(xs: rest, acc)
+      end
+  end
+end
+
+/** Render a row `{Console, Fs}` etc. from a TyRow into the brace-suffix form. */
+/** Returns "" when the row is empty (no `require`/`throws` clause needed). */
+let render_row = fn (row: TypeExpr, kw: string) -> string do
+  match row do
+    | TyRow(types: ts, rest: _) ->
+      let names = collect_cap_names(xs: ts, acc: [])
+      if list.length(xs: names) == 0 then return "" end
+      return " " ++ kw ++ " { " ++ str.join(xs: names, sep: ", ") ++ " }"
+    | _ -> return ""
+  end
+end
+
+/** Render a top-level lambda's signature as a single `name(...) -> Ret ...` line. */
+let render_lambda_signature = fn (name: string, lam: Expr) -> string do
+  match lam do
+    | ExprLambda(type_params: _, params, ret_type, requires, throw_row, body: _) ->
+      let ps = render_params(params)
+      let ret = types.type_to_string(typ: ret_type)
+      let req = render_row(row: requires, kw: "require")
+      let thr = render_row(row: throw_row, kw: "throws")
+      return name ++ "(" ++ ps ++ ") -> " ++ ret ++ req ++ thr
+    | _ -> return name
+  end
+end
+
+/** Render a non-lambda global let: `name: T` if annotated, else `name = ...`. */
+let render_value_signature = fn (name: string, typ_opt: Option<TypeExpr>) -> string do
+  match typ_opt do
+    | Some(val: t) -> return name ++ ": " ++ types.type_to_string(typ: t)
+    | None -> return name
+  end
+end
+
+/** Render a Cap's signature (member functions). */
+let render_function_sig_go = fn (sigs: [FunctionSig], acc: [string]) -> [string] do
+  match sigs do
+    | [] -> return list.reverse(xs: acc)
+    | FunctionSig(name, params, ret_type, requires, throw_row) :: rest ->
+      let ps = render_params(params)
+      let ret = types.type_to_string(typ: ret_type)
+      let req = render_row(row: requires, kw: "require")
+      let thr = render_row(row: throw_row, kw: "throws")
+      let line = "  fn " ++ name ++ "(" ++ ps ++ ") -> " ++ ret ++ req ++ thr
+      return render_function_sig_go(sigs: rest, acc: line :: acc)
+  end
+end
+
+let render_cap_signature = fn (name: string, cap_def: Cap) -> string do
+  match cap_def do | Cap(name: _, is_public: _, functions) ->
+    let lines = render_function_sig_go(sigs: functions, acc: [])
+    if list.length(xs: lines) == 0 then
+      return "cap " ++ name ++ " {}"
+    end
+    return "cap " ++ name ++ " {\n" ++ str.join(xs: lines, sep: "\n") ++ "\n}"
+  end
+end
+
+// ─── Docstring extraction ────────────────────────────────────────────────────
+//
+// V1 doc-comment harvesting: walk the source bytes backwards from the def's
+// span looking for the closest preceding `*/`; if that closes a `/** ... */`
+// block whose `/**` start is reachable by walking only whitespace/newlines
+// between the close and the def, treat the inner content as the docstring.
+// This matches the convention every Nexus stdlib file uses without
+// requiring an AST-level pass.
+
+let is_ws_byte = fn (b: char) -> bool do
+  return b == 32 || b == 9 || b == 10 || b == 13
+end
+
+let scan_back_ws = fn (src: string, pos: i64) -> i64 do
+  if pos <= 0 then return pos end
+  let b = str.byte_at(s: src, idx: pos - 1)
+  if is_ws_byte(b) then return scan_back_ws(src, pos: pos - 1) end
+  return pos
+end
+
+// Walk backwards from end_pos (exclusive) looking for the slash-star-star
+// sequence that opens the block whose close lies at end_pos - 2. Returns
+// Some(start) where start is the byte offset of the opener, or None if the
+// comment is malformed / not a doc block (open is two-star only, no third).
+let scan_back_open_doc = fn (src: string, end_pos: i64, pos: i64) -> Option<i64> do
+  if pos < 0 then return None end
+  if pos + 3 > end_pos then return scan_back_open_doc(src, end_pos, pos: pos - 1) end
+  let b0 = str.byte_at(s: src, idx: pos)
+  let b1 = str.byte_at(s: src, idx: pos + 1)
+  let b2 = str.byte_at(s: src, idx: pos + 2)
+  if b0 == 47 && b1 == 42 && b2 == 42 then
+    // Reject `/**/` shape (b3 == '/'): not a doc block.
+    if pos + 3 < end_pos then
+      let b3 = str.byte_at(s: src, idx: pos + 3)
+      if b3 == 47 then return None end
+    end
+    return Some(val: pos)
+  end
+  return scan_back_open_doc(src, end_pos, pos: pos - 1)
+end
+
+// Trim outer whitespace; the leading-star line-prefix strip is deferred (V1).
+let strip_doc_line_prefixes = fn (s: string) -> string do
+  let trimmed = str.trim(s)
+  return trimmed
+end
+
+let extract_preceding_docstring = fn (src: string, def_offset: i64) -> Option<string> do
+  let ws_end = scan_back_ws(src, pos: def_offset)
+  // Need at least `*/` (2 bytes) before the whitespace run.
+  if ws_end < 2 then return None end
+  let b1 = str.byte_at(s: src, idx: ws_end - 1)
+  let b2 = str.byte_at(s: src, idx: ws_end - 2)
+  if b2 != 42 || b1 != 47 then return None end
+  let close_pos = ws_end - 2
+  match scan_back_open_doc(src, end_pos: close_pos, pos: close_pos - 3) do
+    | None -> return None
+    | Some(val: open_pos) ->
+      let inner_start = open_pos + 3
+      let inner_len = close_pos - inner_start
+      if inner_len <= 0 then return None end
+      let raw = str.byte_substring(s: src, start: inner_start, len: inner_len)
+      return Some(val: strip_doc_line_prefixes(s: raw))
+  end
+end
+
+// ─── Walk defs to find the symbol ────────────────────────────────────────────
+
+let find_def_go = fn (
+  defs: [SpannedTopLevel],
+  target: string,
+  src: string
+) -> Option<DefHit> do
+  match defs do
+    | [] -> return None
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ, value)), span) :: rest ->
+      if name == target then
+        let sig = match value do | SpannedExpr(node, span: _) ->
+          match node do
+            | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: _) ->
+              render_lambda_signature(name, lam: node)
+            | _ -> render_value_signature(name, typ_opt: typ)
+          end
+        end
+        let Span(offset: off, line: _, col: _) = span
+        let doc = extract_preceding_docstring(src, def_offset: off)
+        return Some(val: DefHit(name, span, signature: sig, docstring: doc))
+      end
+      return find_def_go(defs: rest, target, src)
+    | SpannedTopLevel(node: TLCap(def: cap_def), span) :: rest ->
+      match cap_def do | Cap(name, is_public: _, functions: _) ->
+        if name == target then
+          let sig = render_cap_signature(name, cap_def)
+          let Span(offset: off, line: _, col: _) = span
+          let doc = extract_preceding_docstring(src, def_offset: off)
+          return Some(val: DefHit(name, span, signature: sig, docstring: doc))
+        end
+      end
+      return find_def_go(defs: rest, target, src)
+    | _ :: rest -> return find_def_go(defs: rest, target, src)
+  end
+end
+
+// ─── Output rendering ────────────────────────────────────────────────────────
+
+let render_text = fn (hit: DefHit, file: string) -> string do
+  match hit do | DefHit(name, span, signature, docstring) ->
+    match span do | Span(offset: _, line, col) ->
+      let doc_line = match docstring do
+        | None -> "  docstring: (none)"
+        | Some(val: d) -> "  docstring: " ++ d
+      end
+      return name ++ "\n"
+        ++ "  location: " ++ file ++ ":" ++ str.from_i64(val: line) ++ ":" ++ str.from_i64(val: col) ++ "\n"
+        ++ "  signature: " ++ signature ++ "\n"
+        ++ doc_line
+    end
+  end
+end
+
+let escape_one_byte = fn (s: string, i: i64, b: char, acc: string) -> string do
+  if b == 34 then return acc ++ "\\\"" end
+  if b == 92 then return acc ++ "\\\\" end
+  if b == 10 then return acc ++ "\\n" end
+  if b == 13 then return acc ++ "\\r" end
+  if b == 9 then return acc ++ "\\t" end
+  return acc ++ str.byte_substring(s, start: i, len: 1)
+end
+
+let escape_json_str_go = fn (s: string, i: i64, n: i64, acc: string) -> string do
+  if i >= n then return acc end
+  let b = str.byte_at(s, idx: i)
+  let next = escape_one_byte(s, i, b, acc)
+  return escape_json_str_go(s, i: i + 1, n, acc: next)
+end
+
+let json_escape = fn (s: string) -> string do
+  return escape_json_str_go(s, i: 0, n: str.byte_length(s), acc: "")
+end
+
+let render_json = fn (hit: DefHit, file: string) -> string do
+  match hit do | DefHit(name, span, signature, docstring) ->
+    match span do | Span(offset: _, line, col) ->
+      let doc_field = match docstring do
+        | None -> "\"docstring\":null"
+        | Some(val: d) -> "\"docstring\":\"" ++ json_escape(s: d) ++ "\""
+      end
+      return "{\"symbol\":\"" ++ json_escape(s: name) ++ "\""
+        ++ ",\"file\":\"" ++ json_escape(s: file) ++ "\""
+        ++ ",\"line\":" ++ str.from_i64(val: line)
+        ++ ",\"col\":" ++ str.from_i64(val: col)
+        ++ ",\"signature\":\"" ++ json_escape(s: signature) ++ "\""
+        ++ "," ++ doc_field
+        ++ "}"
+    end
+  end
+end
+
+let render_not_found_text = fn (symbol: string, file: string) -> string do
+  return "explain: symbol '" ++ symbol ++ "' not found in " ++ file
+end
+
+let render_not_found_json = fn (symbol: string, file: string) -> string do
+  return "{\"symbol\":\"" ++ json_escape(s: symbol) ++ "\""
+    ++ ",\"file\":\"" ++ json_escape(s: file) ++ "\""
+    ++ ",\"found\":false}"
+end
+
+// ─── Entry point ────────────────────────────────────────────────────────────
+
+/** Look up `symbol` in `file` and return the rendered explain output. */
+/** Returns the rendered string ready to write to stdout. `Fs` reads the */
+/** source, lex/parse runs through `build_program_state` (same path as LSP). */
+export let run_explain = fn (
+  symbol: string,
+  file: string,
+  format: ExplainOutputFormat
+) -> string require { Console, Fs } do
+  try
+    let src = Fs.read_to_string(path: file)
+    let ProgramState(prog, defs, cache: _, accum: _, self_entries: _, caller_entries: _, all_entries: _) =
+      build_program_state(text: src, file)
+    let _ = prog
+    match find_def_go(defs, target: symbol, src) do
+      | None ->
+        match format do
+          | ExplainText -> return render_not_found_text(symbol, file)
+          | ExplainJson -> return render_not_found_json(symbol, file)
+        end
+      | Some(val: hit) ->
+        match format do
+          | ExplainText -> return render_text(hit, file)
+          | ExplainJson -> return render_json(hit, file)
+        end
+    end
+  catch _ ->
+    match format do
+      | ExplainText -> return "explain: failed to read or parse " ++ file
+      | ExplainJson -> return "{\"file\":\"" ++ json_escape(s: file) ++ "\",\"error\":\"failed to read or parse\"}"
+    end
+  end
+end
+
+/** CLI driver for `nexus explain <symbol> [--file FILE] [--format text|json]`. */
+/** Returns the process exit code (0 on success, 1 on symbol-not-found, */
+/** 2 on usage error). */
+export let run_explain_subcommand = fn (args: [string]) -> i64 require { PermConsole, PermFs } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    try
+      let parsed = parse_args_go(xs: args, positional: None, file: None, format: ExplainText)
+      match parsed do | ExplainArgs(symbol, file, format) ->
+        let out = run_explain(symbol, file, format)
+        Console.println(val: out)
+        // Heuristic: not-found path emits the "not found" prefix or
+        // `"found":false`. Map those to exit 1.
+        if str.starts_with(s: out, prefix: "explain: symbol '") then return 1 end
+        if str.index_of(s: out, sub: "\"found\":false") >= 0 then return 1 end
+        return 0
+      end
+    catch
+      | InvalidUsage(detail: d) ->
+        Console.eprintln(val: err.format_error(err: InvalidUsage(detail: d)))
+        return 2
+    end
+  end
+end

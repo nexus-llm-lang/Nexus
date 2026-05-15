@@ -1,0 +1,577 @@
+/**
+ * context/main: `nexus context <file>` subcommand.
+ *
+ * V1 (issue nexus-cgfd): structured summary of a single source file for
+ * agent context. Re-uses the parsed Program (no HIR, no typecheck) so the
+ * surface is fast and tolerant of half-broken files.
+ *
+ * Emits:
+ *   - Top-level exports (public `let`, `type`, `enum`, `cap`, `exception`)
+ *     with their syntactic signatures.
+ *   - Imports (raw path + alias as written in the source).
+ *   - Capability requirements of `main` (the `require { ... }` row).
+ *   - Functions with non-empty `throws { ... }` rows.
+ *
+ * Text mode:
+ *   File: <path>
+ *
+ *   Imports:
+ *     - <path> [as <alias>]
+ *
+ *   Exports:
+ *     - <signature>
+ *
+ *   Main capabilities: <Cap1, Cap2, ...>
+ *
+ *   Throwing functions:
+ *     - <name>: <Exn1, Exn2, ...>
+ *
+ * JSON mode mirrors the same shape under
+ *   {"file": "...", "imports": [...], "exports": [...],
+ *    "main_capabilities": [...], "throwing_functions": [...]}.
+ *
+ * Out of V1 scope (follow-ups cgfd.1 / cgfd.2):
+ *   - transitive imports / import graph,
+ *   - call-graph reachability summary,
+ *   - resolved (typechecked) types instead of syntactic ones.
+ */
+
+import { Option, Some, None } from "std:option"
+import {
+  Program, SpannedTopLevel, GlobalLet, TLLet, TLImport, TLEnum, TLCap,
+  TLTypeDef, TLException, TLExceptionGroup,
+  ImportDef, ImportItem, EnumDef, RecordDef, ExceptionDef, ExceptionGroupDef,
+  Cap, FunctionSig, VariantDef,
+  SpannedExpr, Expr, ExprLambda, Param, TypeExpr,
+  TyRow, TyUserDefined, VariantField, NamedType
+} from "src/common/ast.nx"
+import * as parser from "src/frontend/parser.nx"
+import * as types from "src/typecheck/types.nx"
+import { Fs }, * as fs_mod from "std:fs"
+import { Console }, * as stdio from "std:stdio"
+import * as str from "std:str"
+import * as list from "std:list"
+import { InvalidUsage }, * as err from "src/common/error.nx"
+
+// ─── Output format ───────────────────────────────────────────────────────────
+
+export type ContextOutputFormat = ContextText | ContextJson
+
+// ─── CLI parsing ─────────────────────────────────────────────────────────────
+
+export type ParsedContextSubcommand = ParsedContextSubcommand(
+  remaining: [string],
+  is_context: bool
+)
+
+/** Detect a leading `context` subcommand. */
+export let strip_context_subcommand = fn (xs: [string]) -> ParsedContextSubcommand do
+  match xs do
+    | [] -> return ParsedContextSubcommand(remaining: [], is_context: false)
+    | prog :: [] -> return ParsedContextSubcommand(remaining: [prog], is_context: false)
+    | prog :: second :: rest2 ->
+      if second == "context" then
+        return ParsedContextSubcommand(remaining: prog :: rest2, is_context: true)
+      end
+      return ParsedContextSubcommand(remaining: xs, is_context: false)
+  end
+end
+
+type ContextArgs = ContextArgs(file: string, format: ContextOutputFormat)
+
+let parse_args_go = fn (
+  xs: [string],
+  positional: Option<string>,
+  format: ContextOutputFormat
+) -> ContextArgs throws { InvalidUsage } do
+  match xs do
+    | [] ->
+      let f = match positional do
+        | Some(val: f) -> f
+        | None -> raise InvalidUsage(detail: "context: missing <file> argument")
+      end
+      return ContextArgs(file: f, format)
+    | flag :: rest ->
+      if flag == "--format=text" then
+        return parse_args_go(xs: rest, positional, format: ContextText)
+      end
+      if flag == "--format=json" then
+        return parse_args_go(xs: rest, positional, format: ContextJson)
+      end
+      if flag == "--format" then
+        match rest do
+          | [] -> raise InvalidUsage(detail: "context: --format requires text|json")
+          | value :: rest2 ->
+            if value == "text" then return parse_args_go(xs: rest2, positional, format: ContextText) end
+            if value == "json" then return parse_args_go(xs: rest2, positional, format: ContextJson) end
+            raise InvalidUsage(detail: "context: invalid --format value: " ++ value)
+        end
+      end
+      match positional do
+        | None -> return parse_args_go(xs: rest, positional: Some(val: flag), format)
+        | Some(val: _) -> raise InvalidUsage(detail: "context: unexpected extra argument: " ++ flag)
+      end
+  end
+end
+
+// ─── Render helpers ──────────────────────────────────────────────────────────
+
+let render_param = fn (p: Param) -> string do
+  match p do | Param(name, sigil: _, typ) ->
+    return name ++ ": " ++ types.type_to_string(typ)
+  end
+end
+
+let render_params_go = fn (ps: [Param], acc: [string]) -> [string] do
+  match ps do
+    | [] -> return list.reverse(xs: acc)
+    | p :: rest -> return render_params_go(ps: rest, acc: render_param(p) :: acc)
+  end
+end
+
+let render_params = fn (ps: [Param]) -> string do
+  return str.join(xs: render_params_go(ps, acc: []), sep: ", ")
+end
+
+let collect_row_names_go = fn (xs: [TypeExpr], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | t :: rest ->
+      match t do
+        | TyUserDefined(name, args: []) -> return collect_row_names_go(xs: rest, acc: name :: acc)
+        | _ -> return collect_row_names_go(xs: rest, acc)
+      end
+  end
+end
+
+/** Extract the labels from a {Cap1, Cap2, ...} or {Exn1, Exn2, ...} row. */
+/** Empty rows / non-row TypeExpr return an empty list. */
+let row_names = fn (row: TypeExpr) -> [string] do
+  match row do
+    | TyRow(types: ts, rest: _) -> return collect_row_names_go(xs: ts, acc: [])
+    | _ -> return []
+  end
+end
+
+let render_row_clause = fn (row: TypeExpr, kw: string) -> string do
+  let names = row_names(row)
+  if list.length(xs: names) == 0 then return "" end
+  return " " ++ kw ++ " { " ++ str.join(xs: names, sep: ", ") ++ " }"
+end
+
+let render_lambda_sig = fn (name: string, value: SpannedExpr) -> Option<string> do
+  match value do | SpannedExpr(node, span: _) ->
+    match node do
+      | ExprLambda(type_params: _, params, ret_type, requires, throw_row, body: _) ->
+        let ps = render_params(params)
+        let ret = types.type_to_string(typ: ret_type)
+        let req = render_row_clause(row: requires, kw: "require")
+        let thr = render_row_clause(row: throw_row, kw: "throws")
+        return Some(val: "let " ++ name ++ "(" ++ ps ++ ") -> " ++ ret ++ req ++ thr)
+      | _ -> return None
+    end
+  end
+end
+
+let render_let_export = fn (name: string, typ_opt: Option<TypeExpr>, value: SpannedExpr) -> string do
+  match render_lambda_sig(name, value) do
+    | Some(val: s) -> return s
+    | None ->
+      match typ_opt do
+        | Some(val: t) -> return "let " ++ name ++ ": " ++ types.type_to_string(typ: t)
+        | None -> return "let " ++ name
+      end
+  end
+end
+
+let render_variant_field = fn (vf: VariantField) -> string do
+  match vf do | VariantField(name: name_opt, typ) ->
+    match name_opt do
+      | Some(val: n) -> return n ++ ": " ++ types.type_to_string(typ)
+      | None -> return types.type_to_string(typ)
+    end
+  end
+end
+
+let render_variant_fields_go = fn (fields: [VariantField], acc: [string]) -> [string] do
+  match fields do
+    | [] -> return list.reverse(xs: acc)
+    | f :: rest -> return render_variant_fields_go(fields: rest, acc: render_variant_field(vf: f) :: acc)
+  end
+end
+
+let render_variant = fn (v: VariantDef) -> string do
+  match v do | VariantDef(name, fields) ->
+    if list.length(xs: fields) == 0 then return name end
+    let parts = render_variant_fields_go(fields, acc: [])
+    return name ++ "(" ++ str.join(xs: parts, sep: ", ") ++ ")"
+  end
+end
+
+let render_variants_go = fn (vs: [VariantDef], acc: [string]) -> [string] do
+  match vs do
+    | [] -> return list.reverse(xs: acc)
+    | v :: rest -> return render_variants_go(vs: rest, acc: render_variant(v) :: acc)
+  end
+end
+
+let render_enum_export = fn (def: EnumDef) -> string do
+  match def do | EnumDef(name, is_public: _, is_opaque: _, type_params: _, variants) ->
+    let parts = render_variants_go(vs: variants, acc: [])
+    return "enum " ++ name ++ " = " ++ str.join(xs: parts, sep: " | ")
+  end
+end
+
+let render_named_type = fn (nt: NamedType) -> string do
+  match nt do | NamedType(name, typ) ->
+    return name ++ ": " ++ types.type_to_string(typ)
+  end
+end
+
+let render_named_types_go = fn (fs: [NamedType], acc: [string]) -> [string] do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | f :: rest -> return render_named_types_go(fs: rest, acc: render_named_type(nt: f) :: acc)
+  end
+end
+
+let render_record_export = fn (def: RecordDef) -> string do
+  match def do | RecordDef(name, is_public: _, type_params: _, fields) ->
+    let parts = render_named_types_go(fs: fields, acc: [])
+    return "type " ++ name ++ " = " ++ name ++ "(" ++ str.join(xs: parts, sep: ", ") ++ ")"
+  end
+end
+
+let render_exception_export = fn (def: ExceptionDef) -> string do
+  match def do | ExceptionDef(name, is_public: _, fields) ->
+    if list.length(xs: fields) == 0 then return "exception " ++ name end
+    let parts = render_variant_fields_go(fields, acc: [])
+    return "exception " ++ name ++ "(" ++ str.join(xs: parts, sep: ", ") ++ ")"
+  end
+end
+
+let render_exception_group_export = fn (def: ExceptionGroupDef) -> string do
+  match def do | ExceptionGroupDef(name, is_public: _, members) ->
+    return "exception_group " ++ name ++ " = { " ++ str.join(xs: members, sep: ", ") ++ " }"
+  end
+end
+
+let render_function_sig = fn (sig: FunctionSig) -> string do
+  match sig do | FunctionSig(name, params, ret_type, requires, throw_row) ->
+    let ps = render_params(params)
+    let ret = types.type_to_string(typ: ret_type)
+    let req = render_row_clause(row: requires, kw: "require")
+    let thr = render_row_clause(row: throw_row, kw: "throws")
+    return "  fn " ++ name ++ "(" ++ ps ++ ") -> " ++ ret ++ req ++ thr
+  end
+end
+
+let render_function_sigs_go = fn (sigs: [FunctionSig], acc: [string]) -> [string] do
+  match sigs do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest -> return render_function_sigs_go(sigs: rest, acc: render_function_sig(sig: s) :: acc)
+  end
+end
+
+let render_cap_export = fn (def: Cap) -> string do
+  match def do | Cap(name, is_public: _, functions) ->
+    let lines = render_function_sigs_go(sigs: functions, acc: [])
+    if list.length(xs: lines) == 0 then return "cap " ++ name ++ " {}" end
+    return "cap " ++ name ++ " {\n" ++ str.join(xs: lines, sep: "\n") ++ "\n}"
+  end
+end
+
+// ─── Export collection ───────────────────────────────────────────────────────
+
+let collect_exports_go = fn (defs: [SpannedTopLevel], acc: [string]) -> [string] do
+  match defs do
+    | [] -> return list.reverse(xs: acc)
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public, typ, value)), span: _) :: rest ->
+      if !is_public then return collect_exports_go(defs: rest, acc) end
+      return collect_exports_go(defs: rest, acc: render_let_export(name, typ_opt: typ, value) :: acc)
+    | SpannedTopLevel(node: TLEnum(def: enum_def), span: _) :: rest ->
+      match enum_def do | EnumDef(name: _, is_public, is_opaque: _, type_params: _, variants: _) ->
+        if !is_public then return collect_exports_go(defs: rest, acc) end
+        return collect_exports_go(defs: rest, acc: render_enum_export(def: enum_def) :: acc)
+      end
+    | SpannedTopLevel(node: TLTypeDef(def: rec_def), span: _) :: rest ->
+      match rec_def do | RecordDef(name: _, is_public, type_params: _, fields: _) ->
+        if !is_public then return collect_exports_go(defs: rest, acc) end
+        return collect_exports_go(defs: rest, acc: render_record_export(def: rec_def) :: acc)
+      end
+    | SpannedTopLevel(node: TLException(def: exn_def), span: _) :: rest ->
+      match exn_def do | ExceptionDef(name: _, is_public, fields: _) ->
+        if !is_public then return collect_exports_go(defs: rest, acc) end
+        return collect_exports_go(defs: rest, acc: render_exception_export(def: exn_def) :: acc)
+      end
+    | SpannedTopLevel(node: TLExceptionGroup(def: exg_def), span: _) :: rest ->
+      match exg_def do | ExceptionGroupDef(name: _, is_public, members: _) ->
+        if !is_public then return collect_exports_go(defs: rest, acc) end
+        return collect_exports_go(defs: rest, acc: render_exception_group_export(def: exg_def) :: acc)
+      end
+    | SpannedTopLevel(node: TLCap(def: cap_def), span: _) :: rest ->
+      match cap_def do | Cap(name: _, is_public, functions: _) ->
+        if !is_public then return collect_exports_go(defs: rest, acc) end
+        return collect_exports_go(defs: rest, acc: render_cap_export(def: cap_def) :: acc)
+      end
+    | _ :: rest -> return collect_exports_go(defs: rest, acc)
+  end
+end
+
+// ─── Import collection ───────────────────────────────────────────────────────
+
+type ImportSummary = ImportSummary(path: string, alias: Option<string>, items: [string])
+
+let collect_item_names_go = fn (items: [ImportItem], acc: [string]) -> [string] do
+  match items do
+    | [] -> return list.reverse(xs: acc)
+    | ImportItem(name, item_alias) :: rest ->
+      let label = match item_alias do
+        | Some(val: a) -> name ++ " as " ++ a
+        | None -> name
+      end
+      return collect_item_names_go(items: rest, acc: label :: acc)
+  end
+end
+
+let collect_imports_go = fn (defs: [SpannedTopLevel], acc: [ImportSummary]) -> [ImportSummary] do
+  match defs do
+    | [] -> return list.reverse(xs: acc)
+    | SpannedTopLevel(node: TLImport(def: ImportDef(path, alias, items, is_external: _)), span: _) :: rest ->
+      let entry = ImportSummary(path, alias, items: collect_item_names_go(items, acc: []))
+      return collect_imports_go(defs: rest, acc: entry :: acc)
+    | _ :: rest -> return collect_imports_go(defs: rest, acc)
+  end
+end
+
+let render_import_text = fn (imp: ImportSummary) -> string do
+  match imp do | ImportSummary(path, alias, items) ->
+    let alias_part = match alias do
+      | Some(val: a) -> " as " ++ a
+      | None -> ""
+    end
+    let items_part = if list.length(xs: items) == 0 then ""
+      else " { " ++ str.join(xs: items, sep: ", ") ++ " }" end
+    return "\"" ++ path ++ "\"" ++ alias_part ++ items_part
+  end
+end
+
+// ─── Main capabilities + throwing functions ──────────────────────────────────
+
+let find_main_caps_go = fn (defs: [SpannedTopLevel]) -> [string] do
+  match defs do
+    | [] -> return []
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value)), span: _) :: rest ->
+      if name == "main" then
+        match value do | SpannedExpr(node, span: _) ->
+          match node do
+            | ExprLambda(type_params: _, params: _, ret_type: _, requires, throw_row: _, body: _) ->
+              return row_names(row: requires)
+            | _ -> return []
+          end
+        end
+      end
+      return find_main_caps_go(defs: rest)
+    | _ :: rest -> return find_main_caps_go(defs: rest)
+  end
+end
+
+type ThrowingFn = ThrowingFn(name: string, exns: [string])
+
+let collect_throwing_go = fn (defs: [SpannedTopLevel], acc: [ThrowingFn]) -> [ThrowingFn] do
+  match defs do
+    | [] -> return list.reverse(xs: acc)
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value)), span: _) :: rest ->
+      match value do | SpannedExpr(node, span: _) ->
+        match node do
+          | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row, body: _) ->
+            let exns = row_names(row: throw_row)
+            if list.length(xs: exns) == 0 then return collect_throwing_go(defs: rest, acc) end
+            return collect_throwing_go(defs: rest, acc: ThrowingFn(name, exns) :: acc)
+          | _ -> return collect_throwing_go(defs: rest, acc)
+        end
+      end
+    | _ :: rest -> return collect_throwing_go(defs: rest, acc)
+  end
+end
+
+// ─── Text rendering ──────────────────────────────────────────────────────────
+
+let render_line_list_go = fn (xs: [string], prefix: string, acc: string) -> string do
+  match xs do
+    | [] -> return acc
+    | s :: rest ->
+      let next = if str.length(s: acc) == 0 then prefix ++ s else acc ++ "\n" ++ prefix ++ s end
+      return render_line_list_go(xs: rest, prefix, acc: next)
+  end
+end
+
+let render_imports_text_go = fn (xs: [ImportSummary], acc: string) -> string do
+  match xs do
+    | [] -> return acc
+    | i :: rest ->
+      let line = "  - " ++ render_import_text(imp: i)
+      let next = if str.length(s: acc) == 0 then line else acc ++ "\n" ++ line end
+      return render_imports_text_go(xs: rest, acc: next)
+  end
+end
+
+let render_throws_text_go = fn (xs: [ThrowingFn], acc: string) -> string do
+  match xs do
+    | [] -> return acc
+    | ThrowingFn(name, exns) :: rest ->
+      let line = "  - " ++ name ++ ": " ++ str.join(xs: exns, sep: ", ")
+      let next = if str.length(s: acc) == 0 then line else acc ++ "\n" ++ line end
+      return render_throws_text_go(xs: rest, acc: next)
+  end
+end
+
+let render_text = fn (
+  file: string,
+  imports: [ImportSummary],
+  exports: [string],
+  main_caps: [string],
+  throwing: [ThrowingFn]
+) -> string do
+  let header = "File: " ++ file
+  let imports_block = if list.length(xs: imports) == 0 then "Imports: (none)"
+    else "Imports:\n" ++ render_imports_text_go(xs: imports, acc: "") end
+  let exports_block = if list.length(xs: exports) == 0 then "Exports: (none)"
+    else "Exports:\n" ++ render_line_list_go(xs: exports, prefix: "  - ", acc: "") end
+  let caps_block = if list.length(xs: main_caps) == 0 then "Main capabilities: (none — no `main` or no `require`)"
+    else "Main capabilities: " ++ str.join(xs: main_caps, sep: ", ") end
+  let throws_block = if list.length(xs: throwing) == 0 then "Throwing functions: (none)"
+    else "Throwing functions:\n" ++ render_throws_text_go(xs: throwing, acc: "") end
+  return header ++ "\n\n" ++ imports_block ++ "\n\n" ++ exports_block ++ "\n\n" ++ caps_block ++ "\n\n" ++ throws_block
+end
+
+// ─── JSON rendering ──────────────────────────────────────────────────────────
+
+let escape_one_byte = fn (s: string, i: i64, b: char, acc: string) -> string do
+  if b == 34 then return acc ++ "\\\"" end
+  if b == 92 then return acc ++ "\\\\" end
+  if b == 10 then return acc ++ "\\n" end
+  if b == 13 then return acc ++ "\\r" end
+  if b == 9 then return acc ++ "\\t" end
+  return acc ++ str.byte_substring(s, start: i, len: 1)
+end
+
+let escape_json_str_go = fn (s: string, i: i64, n: i64, acc: string) -> string do
+  if i >= n then return acc end
+  let b = str.byte_at(s, idx: i)
+  let next = escape_one_byte(s, i, b, acc)
+  return escape_json_str_go(s, i: i + 1, n, acc: next)
+end
+
+let json_escape = fn (s: string) -> string do
+  return escape_json_str_go(s, i: 0, n: str.byte_length(s), acc: "")
+end
+
+let quote_json_strs_go = fn (xs: [string], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest -> return quote_json_strs_go(xs: rest, acc: ("\"" ++ json_escape(s) ++ "\"") :: acc)
+  end
+end
+
+let json_array_of_strings = fn (xs: [string]) -> string do
+  return "[" ++ str.join(xs: quote_json_strs_go(xs, acc: []), sep: ",") ++ "]"
+end
+
+let render_import_json = fn (imp: ImportSummary) -> string do
+  match imp do | ImportSummary(path, alias, items) ->
+    let alias_field = match alias do
+      | Some(val: a) -> "\"alias\":\"" ++ json_escape(s: a) ++ "\""
+      | None -> "\"alias\":null"
+    end
+    return "{\"path\":\"" ++ json_escape(s: path) ++ "\""
+      ++ "," ++ alias_field
+      ++ ",\"items\":" ++ json_array_of_strings(xs: items)
+      ++ "}"
+  end
+end
+
+let render_imports_json_go = fn (xs: [ImportSummary], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | i :: rest -> return render_imports_json_go(xs: rest, acc: render_import_json(imp: i) :: acc)
+  end
+end
+
+let render_throwing_json = fn (t: ThrowingFn) -> string do
+  match t do | ThrowingFn(name, exns) ->
+    return "{\"name\":\"" ++ json_escape(s: name) ++ "\""
+      ++ ",\"throws\":" ++ json_array_of_strings(xs: exns)
+      ++ "}"
+  end
+end
+
+let render_throwing_json_go = fn (xs: [ThrowingFn], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | t :: rest -> return render_throwing_json_go(xs: rest, acc: render_throwing_json(t) :: acc)
+  end
+end
+
+let render_json = fn (
+  file: string,
+  imports: [ImportSummary],
+  exports: [string],
+  main_caps: [string],
+  throwing: [ThrowingFn]
+) -> string do
+  return "{\"file\":\"" ++ json_escape(s: file) ++ "\""
+    ++ ",\"imports\":[" ++ str.join(xs: render_imports_json_go(xs: imports, acc: []), sep: ",") ++ "]"
+    ++ ",\"exports\":" ++ json_array_of_strings(xs: exports)
+    ++ ",\"main_capabilities\":" ++ json_array_of_strings(xs: main_caps)
+    ++ ",\"throwing_functions\":[" ++ str.join(xs: render_throwing_json_go(xs: throwing, acc: []), sep: ",") ++ "]"
+    ++ "}"
+end
+
+// ─── Entry point ────────────────────────────────────────────────────────────
+
+/** Build the file summary. `parser.parse_source` raises on lex/parse */
+/** failures; the caller wraps in try/catch so the CLI can surface a single */
+/** error message instead of crashing. */
+export let run_context = fn (file: string, format: ContextOutputFormat) -> string require { Console, Fs } do
+  try
+    let src = Fs.read_to_string(path: file)
+    let prog = parser.parse_source(src)
+    match prog do | Program(definitions: defs, module_doc: _) ->
+      let imports = collect_imports_go(defs, acc: [])
+      let exports = collect_exports_go(defs, acc: [])
+      let main_caps = find_main_caps_go(defs)
+      let throwing = collect_throwing_go(defs, acc: [])
+      match format do
+        | ContextText -> return render_text(file, imports, exports, main_caps, throwing)
+        | ContextJson -> return render_json(file, imports, exports, main_caps, throwing)
+      end
+    end
+  catch _ ->
+    match format do
+      | ContextText -> return "context: failed to read or parse " ++ file
+      | ContextJson -> return "{\"file\":\"" ++ json_escape(s: file) ++ "\",\"error\":\"failed to read or parse\"}"
+    end
+  end
+end
+
+/** CLI driver for `nexus context <file> [--format text|json]`. */
+/** Returns the exit code (0 on success, 2 on usage error). */
+export let run_context_subcommand = fn (args: [string]) -> i64 require { PermConsole, PermFs } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    try
+      let parsed = parse_args_go(xs: args, positional: None, format: ContextText)
+      match parsed do | ContextArgs(file, format) ->
+        let out = run_context(file, format)
+        Console.println(val: out)
+        if str.starts_with(s: out, prefix: "context: failed") then return 1 end
+        if str.index_of(s: out, sub: "\"error\":") >= 0 then return 1 end
+        return 0
+      end
+    catch
+      | InvalidUsage(detail: d) ->
+        Console.eprintln(val: err.format_error(err: InvalidUsage(detail: d)))
+        return 2
+    end
+  end
+end
