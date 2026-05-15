@@ -1,0 +1,149 @@
+// Issue nexus-a02c — `nexus grep <pattern>` structural AST search V1 smoke test.
+//
+// Exercises `parse_pattern` + `find_hits` directly rather than spawning a
+// `nexus grep` subprocess (Proc.exec is -1 under WASI preview1 — see qqvz/ud6j
+// notes).
+//
+// V1 scope: structural matching of top-level `let` / `fn` bindings by name.
+// `call` / `var` patterns parse correctly but currently return no matches
+// because the recursive expression walker miscompiles under the seed
+// nexus.wasm (see commit notes / grep.nx docstring). Once the seed is
+// regenerated past that fix, the V2 walker fills in the call/var coverage.
+//
+// Coverage:
+//   1. `parse_pattern` accepts each supported kind keyword + bareword.
+//   2. `find_hits` on a synthesized source finds the right number of
+//      top-level let/fn bindings.
+//   3. Hits carry the requested file name + a non-empty snippet.
+
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { GrepHit, find_hits, parse_pattern, PatCall, PatFn, PatLet, PatVar, NameLit, NameAny } from "src/tools/grep.nx"
+import { Span } from "src/common/token.nx"
+
+let fixture_source = fn () -> string do
+  // Three top-level bindings: two `let NAME = fn (...)` and one literal.
+  return "let helper = fn (n: i64) -> i64 do\n"
+      ++ "  return n + 1\n"
+      ++ "end\n"
+      ++ "\n"
+      ++ "let twice = fn (n: i64) -> i64 do\n"
+      ++ "  return n + n\n"
+      ++ "end\n"
+      ++ "\n"
+      ++ "let answer = 42\n"
+end
+
+let test_parse_pattern = fn () -> unit throws { Exn } do
+  let p1 = parse_pattern(src: "call Fs.open_read")
+  match p1 do
+    | PatCall(name: NameLit(name)) -> test_assert.assert_eq_string(actual: name, expected: "Fs.open_read", label: "a02c: PatCall(NameLit) parsed")
+    | _ -> raise RuntimeError(val: "expected PatCall(NameLit)")
+  end
+  let p2 = parse_pattern(src: "fn $_")
+  match p2 do
+    | PatFn(name: NameAny) -> ()
+    | _ -> raise RuntimeError(val: "expected PatFn(NameAny)")
+  end
+  let p3 = parse_pattern(src: "let $x")
+  match p3 do
+    | PatLet(name: NameAny) -> ()
+    | _ -> raise RuntimeError(val: "expected PatLet(NameAny)")
+  end
+  let p4 = parse_pattern(src: "var foo")
+  match p4 do
+    | PatVar(name: NameLit(name)) -> test_assert.assert_eq_string(actual: name, expected: "foo", label: "a02c: PatVar(NameLit) parsed")
+    | _ -> raise RuntimeError(val: "expected PatVar(NameLit)")
+  end
+  // Bareword → defaults to PatCall.
+  let p5 = parse_pattern(src: "Fs.open_read")
+  match p5 do
+    | PatCall(name: NameLit(name)) -> test_assert.assert_eq_string(actual: name, expected: "Fs.open_read", label: "a02c: bareword PatCall parsed")
+    | _ -> raise RuntimeError(val: "expected bareword to default to PatCall(NameLit)")
+  end
+  return ()
+end
+
+let test_let_all = fn () -> unit throws { Exn } do
+  let src = fixture_source()
+  let pat = parse_pattern(src: "let $_")
+  let hits = find_hits(pat: pat, file: "fixture.nx", src: src)
+  // 3 top-level lets.
+  test_assert.assert_eq_i64(actual: list.length(xs: hits), expected: 3, label: "a02c: 3 top-level let bindings")
+  return ()
+end
+
+let test_let_named = fn () -> unit throws { Exn } do
+  let src = fixture_source()
+  let pat = parse_pattern(src: "let helper")
+  let hits = find_hits(pat: pat, file: "fixture.nx", src: src)
+  test_assert.assert_eq_i64(actual: list.length(xs: hits), expected: 1, label: "a02c: literal 'helper' matches one let")
+  let first_ok = match hits do
+    | GrepHit(file, span: _, snippet) :: _ ->
+      file == "fixture.nx" && str.contains(s: snippet, sub: "helper")
+    | [] -> false
+  end
+  test_assert.assert(cond: first_ok, label: "a02c: hit carries file + non-empty snippet")
+  return ()
+end
+
+let test_fn_all = fn () -> unit throws { Exn } do
+  let src = fixture_source()
+  let pat = parse_pattern(src: "fn $_")
+  let hits = find_hits(pat: pat, file: "fixture.nx", src: src)
+  // V1: `fn $_` behaves like `let $_` (lambda-shape gate deferred).
+  // 3 top-level lets total → 3 hits.
+  test_assert.assert_eq_i64(actual: list.length(xs: hits), expected: 3, label: "a02c: fn $_ matches every top-level let in V1")
+  return ()
+end
+
+let test_let_no_match = fn () -> unit throws { Exn } do
+  let src = fixture_source()
+  let pat = parse_pattern(src: "let NoSuchBinding")
+  let hits = find_hits(pat: pat, file: "fixture.nx", src: src)
+  test_assert.assert_eq_i64(actual: list.length(xs: hits), expected: 0, label: "a02c: no hits for missing name")
+  return ()
+end
+
+let raised_for_pattern = fn (p: string) -> bool do
+  try
+    let _ = parse_pattern(src: p)
+    return false
+  catch _ -> return true
+  end
+end
+
+let test_invalid_pattern_raises = fn () -> unit throws { Exn } do
+  test_assert.assert(cond: raised_for_pattern(p: "weird $x"), label: "a02c: unknown pattern kind raises")
+  return ()
+end
+
+let body = fn () -> unit throws { Exn } do
+  test_parse_pattern()
+  test_let_all()
+  test_let_named()
+  test_fn_all()
+  test_let_no_match()
+  test_invalid_pattern_raises()
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
