@@ -172,6 +172,16 @@ let main = fn () -> unit require { PermConsole } do
 end
 ```
 
+## Examples
+
+The [`examples/`](./examples/) directory ships minimal, runnable
+demonstrations of every language surface: linear types and borrowing,
+mutable references, generics, pattern matching, exceptions, capabilities
+and handlers, lazy evaluation, and FFI. Each file is buildable on its
+own with `nexus build examples/<path>` and runnable with
+`nexus run examples/<path>`. See [`examples/README.md`](./examples/README.md)
+for the indexed listing.
+
 ## AI Coding Agent Support
 
 Nexus ships a [Claude Code skill](https://docs.anthropic.com/en/docs/claude-code/skills) that teaches coding agents the language syntax, type system, effect system, and standard library.
