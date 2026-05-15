@@ -1,0 +1,358 @@
+// nexus-t9cl.17 — PBT for U-Row-Exn absorption in unify_rows_kind.
+//
+// Spec: docs/spec/type-system-formal.md §Unification, U-Row-Exn (lines
+// 496-508). When one side of a row unification carries the catch-all
+// sentinel `Exn`, any constructors of Exn on the partner side are
+// absorbed by it. This is the only row-inclusion relationship admitted
+// by the type system, restricted to closed-closed shapes.
+//
+// We exercise the rule end-to-end via arrow-arrow unification: an arrow's
+// `throw_row` field is the only place where TyRow flows through
+// `unify_with_kind(kind: "throws")`, so building two `TyArrow`s with
+// different throw rows and `unify`-ing them is the genuine path
+// `unify_rows_kind` is invoked from.
+//
+// Three properties (each with closed-closed throws rows over a small
+// fixed exception alphabet {NotFound, OutOfBounds, IoError}):
+//
+//   1. EXN-ABSORBS-ANY:    unify({Exn}, S) succeeds for any S drawn from
+//                          the exception alphabet (including the empty
+//                          row and S itself = {Exn}).
+//
+//   2. NO-CHANGE-ON-EXN-FREE:
+//                          unify(R, S) where neither contains Exn
+//                          behaves exactly like multiset equality on
+//                          the exception alphabet. This is the
+//                          regression guard against the absorption
+//                          branch leaking into the non-Exn path.
+//
+//   3. SYMMETRIC-EXN:      unify({Exn,...}, S) succeeds in both
+//                          argument orders (spec line 508: "applies in
+//                          both argument orders by the symmetry
+//                          convention").
+//
+// Anti-gotcha notes (per ul9n / m49r):
+//   * Predicates live inside `body()` and take param `x`.
+//   * Predicate results bind to `let ok = ...` before return.
+//   * Every Gen<T> carries a renderer.
+//   * `[]` at top level needs a fn-wrapper for typing.
+
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Pass, Fail, Gen } from "std:pbt"
+import { Pair } from "std:tuple"
+import { Option, Some, None } from "std:option"
+import {
+  TypeExpr, TyI64, TyUnit, TyArrow, TyRow, TyUserDefined,
+  NamedType
+} from "src/common/ast.nx"
+import { UnifyResult, UnifyOk, UnifyErr, TypeDefEntry } from "src/typecheck/types.nx"
+import * as tctypes from "src/typecheck/types.nx"
+import * as unify_mod from "src/typecheck/unify.nx"
+import * as list from "std:list"
+import * as str from "std:str"
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+let empty_tdefs = fn () -> [TypeDefEntry] do return [] end
+
+// Exception alphabet — three concrete exception names plus the Exn
+// sentinel. Each is rendered via TyUserDefined for inclusion in a row.
+let exn_sentinel = fn () -> TypeExpr do return TyUserDefined(name: "Exn", args: []) end
+let exn_notfound = fn () -> TypeExpr do return TyUserDefined(name: "NotFound", args: []) end
+let exn_oob      = fn () -> TypeExpr do return TyUserDefined(name: "OutOfBounds", args: []) end
+let exn_io       = fn () -> TypeExpr do return TyUserDefined(name: "IoError", args: []) end
+
+// Build a closed TyRow from a list of exception type-exprs.
+let mk_closed_row = fn (ts: [TypeExpr]) -> TypeExpr do
+  return TyRow(types: ts, rest: None)
+end
+
+// Build an arrow `fn () -> i64 throws {row}` with empty requires.
+let mk_arrow_with_throws = fn (row: TypeExpr) -> TypeExpr do
+  return TyArrow(
+    params: [],
+    ret: TyI64,
+    requires: TyRow(types: [], rest: None),
+    throw_row: row
+  )
+end
+
+// True iff `unify(t1, t2)` returns Ok under empty tdefs.
+let unify_ok = fn (t1: TypeExpr, t2: TypeExpr) -> bool do
+  match unify_mod.unify(t1, t2, tdefs: empty_tdefs()) do
+    | UnifyOk(subst: _) -> return true
+    | UnifyErr(message: _) -> return false
+  end
+end
+
+// Membership on a list of TypeExpr-as-exception by name equality.
+let exn_name = fn (t: TypeExpr) -> string do
+  match t do
+    | TyUserDefined(name: n, args: _) -> return n
+    | _ -> return "<non-exn>"
+  end
+end
+
+let name_in = fn (n: string, xs: [TypeExpr]) -> bool do
+  match xs do
+    | [] -> return false
+    | h :: rest ->
+      if exn_name(t: h) == n then return true end
+      return name_in(n, xs: rest)
+  end
+end
+
+// Remove the first occurrence of `n` (by exn-name) from `xs`. Returns
+// (found, rest).
+type RemRes = RemRes(found: bool, rest: [TypeExpr])
+
+let remove_first_name = fn (n: string, xs: [TypeExpr]) -> RemRes do
+  match xs do
+    | [] -> return RemRes(found: false, rest: [])
+    | h :: rest ->
+      if exn_name(t: h) == n then
+        return RemRes(found: true, rest)
+      end
+      let RemRes(found: f, rest: r) = remove_first_name(n, xs: rest)
+      return RemRes(found: f, rest: h :: r)
+  end
+end
+
+// Multiset equality on exception lists (by name). Mirrors what
+// row_split_surplus does inside unify_rows_kind so this PBT can predict
+// whether unify will succeed for Exn-free rows.
+let multiset_eq = fn (xs: [TypeExpr], ys: [TypeExpr]) -> bool do
+  match xs do
+    | [] ->
+      match ys do
+        | [] -> return true
+        | _ -> return false
+      end
+    | h :: rest ->
+      let RemRes(found: f, rest: ys_after) = remove_first_name(n: exn_name(t: h), xs: ys)
+      if f then
+        return multiset_eq(xs: rest, ys: ys_after)
+      end
+      return false
+  end
+end
+
+// ─── Renderers ──────────────────────────────────────────────────────────────
+
+let show_ty = fn (t: TypeExpr) -> string do
+  return tctypes.type_to_string(typ: t)
+end
+
+let show_row_list = fn (ts: [TypeExpr]) -> string do
+  match ts do
+    | [] -> return "{}"
+    | _ ->
+      let names = list.map(xs: ts, f: exn_name)
+      return "{" ++ str.join(xs: names, sep: ", ") ++ "}"
+  end
+end
+
+let show_pair_rows = fn (p: Pair<[TypeExpr], [TypeExpr]>) -> string do
+  let Pair(left: a, right: b) = p
+  return "(" ++ show_row_list(ts: a) ++ ", " ++ show_row_list(ts: b) ++ ")"
+end
+
+// ─── PBT generators (built inside body()) ──────────────────────────────────
+
+// xorshift helper duplicated locally — see m49r note.
+let abs_i64 = fn (n: i64) -> i64 do
+  if n < 0 then return 0 - n end
+  return n
+end
+
+let step_seed = fn (s: i64) -> i64 do
+  let s0 = if s == 0 then 2685821657736338717 else s end
+  let s1 = s0 ^ (s0 << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  return s3
+end
+
+// One draw from the 3-element non-Exn exception alphabet.
+let draw_specific_exn = fn (seed: i64) -> Pair<TypeExpr, i64> do
+  let s1 = step_seed(s: seed)
+  let idx = abs_i64(n: s1) % 3
+  let t =
+    if idx == 0 then exn_notfound()
+    else if idx == 1 then exn_oob()
+    else exn_io()
+    end
+  return Pair(left: t, right: s1)
+end
+
+// Draw a closed list of specific (non-Exn) exceptions, length in [0,3].
+let draw_specific_list_n = fn (n: i64, seed: i64, acc: [TypeExpr]) -> Pair<[TypeExpr], i64> do
+  if n <= 0 then
+    return Pair(left: list.reverse(xs: acc), right: seed)
+  end
+  let Pair(left: t, right: s1) = draw_specific_exn(seed)
+  return draw_specific_list_n(n: n - 1, seed: s1, acc: t :: acc)
+end
+
+let draw_specific_list = fn (seed: i64) -> Pair<[TypeExpr], i64> do
+  let s1 = step_seed(s: seed)
+  let len = abs_i64(n: s1) % 4
+  return draw_specific_list_n(n: len, seed: s1, acc: [])
+end
+
+let body = fn () -> unit require { Console } throws { Exn } do
+  // No-op shrinker for opaque payloads.
+  let no_shrink_pair = fn (v: Pair<[TypeExpr], [TypeExpr]>) -> [Pair<[TypeExpr], [TypeExpr]>] do
+    return []
+  end
+
+  // Gen<Pair<[TypeExpr], [TypeExpr]>> for property 1: left is fixed
+  // `[Exn]`, right is any drawn specific list.
+  let gen_p1_run = fn (seed: i64) -> Pair<Pair<[TypeExpr], [TypeExpr]>, i64> do
+    let Pair(left: rhs, right: s1) = draw_specific_list(seed)
+    let lhs = [exn_sentinel()]
+    return Pair(left: Pair(left: lhs, right: rhs), right: s1)
+  end
+  let gen_p1: pbt.Gen<Pair<[TypeExpr], [TypeExpr]> > = Gen(
+    run: gen_p1_run,
+    shrink: no_shrink_pair,
+    render: show_pair_rows
+  )
+
+  // Gen<Pair> for property 2: two independent specific-only rows.
+  let gen_p2_run = fn (seed: i64) -> Pair<Pair<[TypeExpr], [TypeExpr]>, i64> do
+    let Pair(left: a, right: s1) = draw_specific_list(seed)
+    let Pair(left: b, right: s2) = draw_specific_list(seed: s1)
+    return Pair(left: Pair(left: a, right: b), right: s2)
+  end
+  let gen_p2: pbt.Gen<Pair<[TypeExpr], [TypeExpr]> > = Gen(
+    run: gen_p2_run,
+    shrink: no_shrink_pair,
+    render: show_pair_rows
+  )
+
+  // Gen<Pair> for property 3: one side has Exn (plus 0-2 extras), the
+  // other is any specific list. Symmetry is checked inside the predicate.
+  let gen_p3_run = fn (seed: i64) -> Pair<Pair<[TypeExpr], [TypeExpr]>, i64> do
+    let Pair(left: extras, right: s1) = draw_specific_list(seed)
+    let lhs = exn_sentinel() :: extras
+    let Pair(left: rhs, right: s2) = draw_specific_list(seed: s1)
+    return Pair(left: Pair(left: lhs, right: rhs), right: s2)
+  end
+  let gen_p3: pbt.Gen<Pair<[TypeExpr], [TypeExpr]> > = Gen(
+    run: gen_p3_run,
+    shrink: no_shrink_pair,
+    render: show_pair_rows
+  )
+
+  // ─── Property 1: EXN-ABSORBS-ANY ────────────────────────────────────
+  //
+  // unify({Exn}, S) must succeed for any closed S of exception entries.
+  // This is the core soundness fix — without U-Row-Exn impl the existing
+  // row_split_surplus path rejects {Exn} vs {NotFound} as "extra label".
+  let p_absorbs = fn (x: Pair<[TypeExpr], [TypeExpr]>) -> bool do
+    let Pair(left: lhs, right: rhs) = x
+    let a1 = mk_arrow_with_throws(row: mk_closed_row(ts: lhs))
+    let a2 = mk_arrow_with_throws(row: mk_closed_row(ts: rhs))
+    let ok = unify_ok(t1: a1, t2: a2)
+    return ok
+  end
+  let r1 = pbt.forall(g: gen_p1, prop: p_absorbs, n: 200)
+  match r1 do
+    | Pass -> test_assert.assert_true(cond: true, label: "U-Row-Exn: {Exn} absorbs specific row")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "U-Row-Exn absorption FAIL witness=" ++ w ++ " shrunk=" ++ s)
+  end
+
+  // ─── Property 2: NO-CHANGE-ON-EXN-FREE ──────────────────────────────
+  //
+  // Without Exn on either side, unify must respect multiset equality
+  // (modulo set-equality since the closed-closed branch requires both
+  // surplus sets to be empty). This guards against the absorption branch
+  // accidentally accepting non-Exn mismatches.
+  let p_no_change = fn (x: Pair<[TypeExpr], [TypeExpr]>) -> bool do
+    let Pair(left: lhs, right: rhs) = x
+    let a1 = mk_arrow_with_throws(row: mk_closed_row(ts: lhs))
+    let a2 = mk_arrow_with_throws(row: mk_closed_row(ts: rhs))
+    let got = unify_ok(t1: a1, t2: a2)
+    let expected = multiset_eq(xs: lhs, ys: rhs)
+    let ok = got == expected
+    return ok
+  end
+  let r2 = pbt.forall(g: gen_p2, prop: p_no_change, n: 200)
+  match r2 do
+    | Pass -> test_assert.assert_true(cond: true, label: "U-Row-Exn: non-Exn rows unchanged")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "U-Row-Exn non-Exn regression FAIL witness=" ++ w ++ " shrunk=" ++ s)
+  end
+
+  // ─── Property 3: SYMMETRIC-EXN ──────────────────────────────────────
+  //
+  // unify is symmetric on rows with Exn — both argument orders must
+  // agree (and both succeed since lhs always carries Exn).
+  let p_symmetric = fn (x: Pair<[TypeExpr], [TypeExpr]>) -> bool do
+    let Pair(left: lhs, right: rhs) = x
+    let a1 = mk_arrow_with_throws(row: mk_closed_row(ts: lhs))
+    let a2 = mk_arrow_with_throws(row: mk_closed_row(ts: rhs))
+    let fwd = unify_ok(t1: a1, t2: a2)
+    let bwd = unify_ok(t1: a2, t2: a1)
+    // The Exn-bearing side absorbs the other unconditionally, so both
+    // directions must succeed AND agree.
+    let ok = fwd && bwd
+    return ok
+  end
+  let r3 = pbt.forall(g: gen_p3, prop: p_symmetric, n: 200)
+  match r3 do
+    | Pass -> test_assert.assert_true(cond: true, label: "U-Row-Exn: symmetric in both arg orders")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "U-Row-Exn symmetry FAIL witness=" ++ w ++ " shrunk=" ++ s)
+  end
+
+  // ─── Targeted minimal cases (not under PBT — direct asserts) ────────
+  //
+  // Mirrors the bd's reproduction sketch:
+  //   wrapper: throws { Exn }   ←→   lib: throws { NotFound }
+  // Pre-fix, the arrow-arrow unify rejected this. Post-fix it must Ok.
+  let lib_arr = mk_arrow_with_throws(row: mk_closed_row(ts: [exn_notfound()]))
+  let wrap_arr = mk_arrow_with_throws(row: mk_closed_row(ts: [exn_sentinel()]))
+  test_assert.assert_true(cond: unify_ok(t1: wrap_arr, t2: lib_arr),
+    label: "bd repro: wrapper {Exn} absorbs lib {NotFound}")
+  test_assert.assert_true(cond: unify_ok(t1: lib_arr, t2: wrap_arr),
+    label: "bd repro (reversed): lib {NotFound} absorbed by wrapper {Exn}")
+
+  // Both-Exn case.
+  let both_exn = mk_arrow_with_throws(row: mk_closed_row(ts: [exn_sentinel()]))
+  test_assert.assert_true(cond: unify_ok(t1: both_exn, t2: both_exn),
+    label: "U-Row-Exn: both sides {Exn} unify")
+
+  // Empty vs {Exn}: empty has no constructors of Exn, so trivially
+  // absorbable.
+  let empty_arr = mk_arrow_with_throws(row: mk_closed_row(ts: []))
+  test_assert.assert_true(cond: unify_ok(t1: wrap_arr, t2: empty_arr),
+    label: "U-Row-Exn: {Exn} absorbs empty row")
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
