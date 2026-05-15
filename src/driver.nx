@@ -10,7 +10,8 @@ import * as lexer from "src/frontend/lexer.nx"
 import { ParseDiagnostics }, * as parser from "src/frontend/parser.nx"
 import * as arena from "std:runtime/arena"
 import { Program, SpannedTopLevel, EnumDef, RecordDef, GlobalLet, SpannedExpr, ExprLambda, TypeExpr, TyRow, TyUserDefined } from "src/common/ast.nx"
-import { CompilerDiagnostic, InvalidUsage, WriteFailed, InTargetFile, HirError, ParseErrorsCollected, format_diagnostic_json, format_summary_json }, * as err from "src/common/error.nx"
+import { CompilerDiagnostic, InvalidUsage, WriteFailed, InTargetFile, HirError, ParseErrorsCollected, LazyBindingUnused, LinearUnused, format_diagnostic_json, format_summary_json }, * as err from "src/common/error.nx"
+import { Span } from "src/common/token.nx"
 import { RenameEntry }, * as symtab from "src/ir/symtab.nx"
 import * as resolve from "src/ir/resolve.nx"
 import { CacheEntry, ImportResult, get_defs, process_imports, append_entries, dump_import_graph } from "src/ir/imports.nx"
@@ -51,6 +52,11 @@ import { strip_ast_subcommand, ParsedAstSubcommand, ast_to_text, ast_to_json } f
 import { strip_types_subcommand, ParsedTypesSubcommand, types_to_text, types_to_json } from "src/tools/types_dump.nx"
 import { strip_grep_subcommand, ParsedGrepSubcommand, run_grep_subcommand } from "src/tools/grep.nx"
 import { strip_lint_subcommand, ParsedLintSubcommand, run_lint_subcommand } from "src/tools/lint.nx"
+import {
+  ParsedFixSubcommand, FixOptions, FixMode, ModeCheck, ModeWrite, ModeDiff, Fixit,
+  strip_fix_subcommand, parse_fix_options, fixit_for_code, fixit_for_exn, apply_fixit,
+  format_check_line, format_diff_block, slice_old_text, fix_usage
+} from "src/tools/fix.nx"
 import { LirProgram, LirFunction } from "src/ir/lir/types.nx"
 import {
   ArgSpec, ParseResult, SubcommandHit,
@@ -238,6 +244,7 @@ let cli_specs = fn () -> [ArgSpec] do
     spec_subcommand(name: "fmt", help: "[--check] FILE|- [FILE...]"),
     spec_subcommand(name: "grep", help: "<pattern> [path...]"),
     spec_subcommand(name: "lint", help: "[--check] FILE [FILE...]"),
+    spec_subcommand(name: "fix",  help: "[--check|--write|--diff] FILE [FILE...]"),
     spec_subcommand(name: "help", help: "[subcommand]"),
     // Global options
     spec_flag(name: "verbose", short: "", long: "--verbose", help: "enable per-pass timing output"),
@@ -1225,6 +1232,164 @@ let run_types_dump_subcommand = fn (args: [string], format: ExplainFormat, verbo
   end
 end
 
+// ─── `nexus fix` subcommand (nexus-rwoj) ──────────────────────────────────
+//
+// Runs the front-end pipeline against each file, catches the first
+// fix-able diagnostic (LazyBindingUnused / LinearUnused), and either
+// reports the suggested rewrite (--check), rewrites the file in place
+// looping until no further fix-its appear (--write), or prints a
+// before/after view (--diff). Pipeline shape mirrors run_types_dump_subcommand
+// but without the render step — we only care whether the pipeline raised.
+//
+// Iteration cap: under --write we run at most `fix_max_passes` passes per
+// file to guarantee termination even if a future fix-it generator emits
+// a no-op rewrite (which would otherwise loop forever).
+
+let fix_max_passes = fn () -> i64 do return 32 end
+
+/** Outcome of one front-end pass against `src`. We can't return an
+ *  Exn through Option (the typer can't carry the open exception row as a
+ *  generic-arg payload), so we model the success/failure axis with our
+ *  own variant and stash the rewrite eagerly during the catch arm. */
+type FixOutcome = FixOk | FixSkipped(message: string) | FixApplied(src: string, sp: Span, fix: Fixit)
+
+// Run parse + HIR + linearity + typecheck against `src` (no codegen).
+// On success: FixOk. On a fix-able diagnostic: FixApplied(new_src,...).
+// On any other diagnostic: FixSkipped(formatted message).
+//
+// The mode-aware "what to print / whether to write" decision lives in
+// fix_loop; this helper is concerned only with classifying the outcome
+// of the front-end against the supplied source text.
+let typecheck_for_fix = fn (src: string, input_path: string, verbose: bool) -> FixOutcome require { Console, Fs } do
+  try
+    let tokens = lexer.tokenize(src)
+    let ParseDiagnostics(prog: prog, diags: parse_diags) = parser.parse_collect(tokens, file: input_path)
+    let n_parse_diags = list.length(xs: parse_diags)
+    if n_parse_diags > 0 then
+      raise ParseErrorsCollected(count: n_parse_diags)
+    end
+    let HirBuildResult(program: hir_raw, import_cache: _) = build_hir(prog, source_file: input_path, verbose)
+    let hir_resolved = match hir_raw do
+      | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
+        let resolved = resolve_all_lazy_no_filter(funcs: hf)
+        let expanded_fs = hir.expand_groups_in_functions(funcs: resolved, groups: heg)
+        let expanded_hb = hir.expand_groups_in_handler_bindings(bindings: hb, groups: heg)
+        HirProgram(ports: hp, functions: expanded_fs, externals: he, handler_bindings: expanded_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
+    end
+    let hir_wrapped = main_wrap.wrap_main_if_needed(prog: hir_resolved)
+    linearity.check_program(prog: hir_wrapped)
+    let local_names = main_wrap.user_main_name() :: extract_function_names(defs: get_defs(prog), source: input_path)
+    let hir_checked = tc.check_program(hir: hir_wrapped, local_names, require_main: false)
+    // tc_linearity is the typecheck-phase linearity pass (separate from
+    // src/ir/linearity.nx above). LinearUnused / LinearReuse / LinearMismatch
+    // raise here — the variants we know how to fix. The main build path runs
+    // both, so we mirror it.
+    tc_linearity.check_program(prog: hir_checked)
+    return FixOk
+  catch e ->
+    match fixit_for_exn(src, err: e) do
+      | Some(val: fix) ->
+        let sp = match e do
+          | LazyBindingUnused(name: _, span: sp) -> sp
+          | LinearUnused(name: _, span: sp) -> sp
+          | _ -> Span(offset: 0, line: 0, col: 0)
+        end
+        return FixApplied(src, sp, fix)
+      | None ->
+        return FixSkipped(message: err.format_error(err: e))
+    end
+  end
+end
+
+// Per-file driver. Under --write the loop reruns the pipeline against the
+// rewritten text until no fix-it appears or the iteration cap fires.
+// --check / --diff terminate after the first fix-it (they don't mutate).
+let run_fix_on_file = fn (path: string, mode: FixMode, verbose: bool) -> i64 require { Clock, Console, Fs } do
+  if Fs.exists(path) == false then
+    Console.eprintln(val: "nexus fix: file not found: " ++ path)
+    return 1
+  end
+  try
+    let initial_src = Fs.read_to_string(path)
+    return fix_loop(path, src: initial_src, mode, verbose, pass: 0, fixes_applied: 0)
+  catch e ->
+    Console.eprintln(val: err.format_error(err: e))
+    return 1
+  end
+end
+
+let fix_loop = fn (path: string, src: string, mode: FixMode, verbose: bool, pass: i64, fixes_applied: i64) -> i64 require { Clock, Console, Fs } do
+  if pass >= fix_max_passes() then
+    Console.eprintln(val: "nexus fix: iteration cap reached for " ++ path ++ "; remaining fix-its skipped")
+    return 0
+  end
+  let outcome = typecheck_for_fix(src, input_path: path, verbose)
+  match outcome do
+    | FixOk ->
+      return 0
+    | FixSkipped(message) ->
+      Console.eprintln(val: message)
+      if fixes_applied > 0 then return 0 end
+      return 1
+    | FixApplied(src: _orig_src, sp, fix) ->
+      match mode do
+        | ModeCheck ->
+          Console.println(val: format_check_line(file: path, sp, fix))
+          return 0
+        | ModeDiff ->
+          let old_text = slice_old_text(src, fix)
+          Console.println(val: format_diff_block(file: path, fix, old_text))
+          return 0
+        | ModeWrite ->
+          let src2 = apply_fixit(src, fix)
+          if src2 == src then
+            Console.eprintln(val: "nexus fix: rewrite was a no-op for " ++ path ++ " at pass " ++ str.from_i64(val: pass))
+            return 0
+          end
+          Fs.write_string(path, content: src2)
+          Console.println(val: format_check_line(file: path, sp, fix))
+          return fix_loop(path, src: src2, mode, verbose, pass: pass + 1, fixes_applied: fixes_applied + 1)
+      end
+  end
+end
+
+let run_fix_subcommand = fn (args: [string]) -> i64 require { Clock, Console, Fs } throws { InvalidUsage } do
+  // --help short-circuits before argparse so the user can self-discover
+  // the flag set even before nexus-z35v's per-sub help router lands.
+  if contains_help_flag(args) then
+    Console.println(val: fix_usage())
+    return 0
+  end
+  let opts = parse_fix_options(args)
+  match opts do | FixOptions(mode, paths) ->
+    if list.length(xs: paths) == 0 then
+      Console.eprintln(val: fix_usage())
+      return 2
+    end
+    return run_fix_each(paths, mode, all_ok: true)
+  end
+end
+
+let contains_help_flag = fn (args: [string]) -> bool do
+  match args do
+    | [] -> return false
+    | a :: rest ->
+      if a == "--help" || a == "-h" then return true end
+      return contains_help_flag(args: rest)
+  end
+end
+
+let run_fix_each = fn (paths: [string], mode: FixMode, all_ok: bool) -> i64 require { Clock, Console, Fs } do
+  match paths do
+    | [] ->
+      if all_ok then return 0 else return 1 end
+    | p :: rest ->
+      let rc = run_fix_on_file(path: p, mode, verbose: false)
+      let ok2 = all_ok && (rc == 0)
+      return run_fix_each(paths: rest, mode, all_ok: ok2)
+  end
+end
+
 let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs, PermProc } do
   inject stdio.system_handler, fs_mod.system_handler, clock_mod.system_handler, proc.system_handler do
   try
@@ -1332,9 +1497,6 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
         proc.exit(status: exit_code)
       end
     end
-    // `nexus lint [--check] FILE [...]` (issue nexus-moym V1). AST-driven
-    // lint pack — runs before build/typecheck so partially-valid files can
-    // still surface findings.
     match strip_lint_subcommand(xs: positionals) do | ParsedLintSubcommand(remaining: args_after_lint, is_lint) ->
       if is_lint then
         let lint_args = match args_after_lint do
@@ -1342,6 +1504,16 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
           | _ :: rest -> rest
         end
         let exit_code = run_lint_subcommand(args: lint_args)
+        proc.exit(status: exit_code)
+      end
+    end
+    match strip_fix_subcommand(xs: positionals) do | ParsedFixSubcommand(remaining: args_after_fix, is_fix) ->
+      if is_fix then
+        let fix_args = match args_after_fix do
+          | [] -> []
+          | _ :: rest -> rest
+        end
+        let exit_code = run_fix_subcommand(args: fix_args)
         proc.exit(status: exit_code)
       end
     end

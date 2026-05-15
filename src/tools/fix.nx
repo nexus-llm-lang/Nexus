@@ -1,0 +1,293 @@
+/**
+ * fix: auto-apply structured fix-its for compiler diagnostics (nexus-rwoj).
+ *
+ * `nexus fix [--check|--write|--diff] FILE` runs the front-end (parse +
+ * HIR + linearity + typecheck) over FILE, catches the first fix-able
+ * diagnostic, generates a textual replacement for it, and either prints
+ * the suggestion (`--check`, default), rewrites the file (`--write`), or
+ * shows the before/after as a unified-ish diff (`--diff`). With `--write`
+ * the routine reloops up to a small iteration cap so a single invocation
+ * collapses every fix-able diagnostic in the file.
+ *
+ * V1 fix-it coverage (the mechanical, span-preserving rewrites):
+ *   - E2005 (LazyBindingUnused) — prefix the offending name with `_` so
+ *     the lazy-linearity pass treats it as a sink.
+ *   - E2007 (LinearUnused)      — same `_`-prefix rewrite; convention
+ *     across the codebase is `_x` for "deliberately unused".
+ *
+ * Out of scope (deferred until kmel.1 lands real structured `replacement[]`
+ * in `CompilerDiagnostic`):
+ *   - import / require auto-trim, missing-await injection, did-you-mean
+ *     identifier rewrites, multi-span composite fixes.
+ *   - `--conflict skip|first|all` (only relevant once multiple fix-its can
+ *     come from a single diagnostic).
+ *
+ * The driver wires `run_fix_subcommand` into the dispatch table; this
+ * module owns argparse + rewrite logic but not the front-end pipeline
+ * (driver.nx keeps the pipeline private to avoid cross-module visibility
+ * churn — see ast/types/hir/lir dump runners).
+ */
+
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+import {
+  ArgSpec, SubcommandHit,
+  spec_flag, spec_positional,
+  parse, get_flag, get_positionals_all, is_ok, first_error,
+  detect_subcommand
+} from "std:argparse"
+import { InvalidUsage, LazyBindingUnused, LinearUnused } from "src/common/error.nx"
+import { Span } from "src/common/token.nx"
+
+// ─── Subcommand stripping ─────────────────────────────────────────────────
+
+export type ParsedFixSubcommand = ParsedFixSubcommand(remaining: [string], is_fix: bool)
+
+/** Detect a leading `fix` subcommand. Mirrors strip_fmt_subcommand /
+ *  strip_grep_subcommand — thin wrapper over `detect_subcommand`. */
+export let strip_fix_subcommand = fn (xs: [string]) -> ParsedFixSubcommand do
+  match detect_subcommand(args: xs, kw: "fix") do | SubcommandHit(present, remaining) ->
+    if present then return ParsedFixSubcommand(remaining, is_fix: true) end
+    return ParsedFixSubcommand(remaining: xs, is_fix: false)
+  end
+end
+
+// ─── Mode + parsed options ────────────────────────────────────────────────
+
+/** Three operating modes. `Check` is the default (print suggestion, leave
+ *  the file alone). `Write` rewrites in place. `Diff` prints a unified-ish
+ *  before/after view but does not touch the file. */
+export type FixMode = ModeCheck | ModeWrite | ModeDiff
+
+export type FixOptions = FixOptions(mode: FixMode, paths: [string])
+
+let fix_specs = fn () -> [ArgSpec] do
+  return [
+    spec_flag(name: "check", short: "", long: "--check", help: "report fix-its without rewriting (default)"),
+    spec_flag(name: "write", short: "", long: "--write", help: "apply fix-its to FILE in place"),
+    spec_flag(name: "diff",  short: "", long: "--diff",  help: "print before/after for each fix-it (no write)"),
+    spec_positional(name: "paths", required: false, help: "files to fix"),
+  ]
+end
+
+/** Render the help text for `nexus fix --help`. The driver's global help
+ *  reaches per-subcommand help via nexus-z35v; this string is the local
+ *  fallback. */
+export let fix_usage = fn () -> string do
+  return "Usage: nexus fix [--check|--write|--diff] FILE [FILE...]\n"
+    ++ "Apply structured fix-its from compiler diagnostics (nexus-rwoj).\n"
+    ++ "\n"
+    ++ "Modes (mutually exclusive; --check is the default):\n"
+    ++ "  --check   print each fix-it suggestion; do not touch the file\n"
+    ++ "  --write   rewrite the file in place, iterating until no more fix-its\n"
+    ++ "  --diff    print a before/after view (no write)\n"
+    ++ "\n"
+    ++ "Supported diagnostics:\n"
+    ++ "  E2005 lazy binding never forced  → prefix the name with `_`\n"
+    ++ "  E2007 linear binding never consumed → prefix the name with `_`"
+end
+
+let mode_of_flags = fn (check: bool, write: bool, diff: bool) -> FixMode throws { InvalidUsage } do
+  let n = (if check then 1 else 0 end) + (if write then 1 else 0 end) + (if diff then 1 else 0 end)
+  if n > 1 then
+    raise InvalidUsage(detail: "nexus fix: --check, --write, --diff are mutually exclusive")
+  end
+  if write then return ModeWrite end
+  if diff  then return ModeDiff  end
+  return ModeCheck
+end
+
+/** Parse the argv passed to `nexus fix`. Pure; argparse-driven, so
+ *  unknown flags / missing values land as InvalidUsage via first_error. */
+export let parse_fix_options = fn (args: [string]) -> FixOptions throws { InvalidUsage } do
+  let result = parse(args, specs: fix_specs())
+  if !is_ok(result) then
+    raise InvalidUsage(detail: "nexus fix: " ++ first_error(result))
+  end
+  let paths = get_positionals_all(result)
+  let mode = mode_of_flags(
+    check: get_flag(result, name: "check"),
+    write: get_flag(result, name: "write"),
+    diff:  get_flag(result, name: "diff")
+  )
+  return FixOptions(mode, paths)
+end
+
+// ─── Fix-it model ────────────────────────────────────────────────────────
+
+/** A single structured rewrite. `start` and `len` are absolute byte
+ *  offsets into the source string. `replacement` is the literal text to
+ *  splice in. `code` is the originating diagnostic code (E2005 etc.) and
+ *  `message` is the human-readable description (carried for `--check`
+ *  / `--diff` output). */
+export type Fixit = Fixit(
+  start: i64,
+  len: i64,
+  replacement: string,
+  code: string,
+  message: string
+)
+
+/** Apply a Fixit by splicing its `replacement` over `[start, start+len)`
+ *  in `src`. Returns the rewritten source unchanged when the span is out
+ *  of range (defensive: a stale Span shouldn't corrupt the file). */
+export let apply_fixit = fn (src: string, fix: Fixit) -> string do
+  match fix do | Fixit(start, len, replacement, code: _, message: _) ->
+    let n = str.length(s: src)
+    if start < 0 then return src end
+    if start > n then return src end
+    let stop = start + len
+    if stop > n then return src end
+    let before = str.substring(s: src, start: 0, len: start)
+    let after = str.substring(s: src, start: stop, len: n - stop)
+    return before ++ replacement ++ after
+  end
+end
+
+// ─── Identifier locator ──────────────────────────────────────────────────
+//
+// HIR-level linearity raises carry the *statement* span (the `let`
+// keyword), not the binding name. We forward-scan from span.offset for
+// the first occurrence of the bare identifier `name`, skipping past
+// keyword `let`, optional sigil (`%`/`@`), and any inline whitespace.
+// The scan is conservative: if the identifier isn't visible within the
+// next 64 bytes, we bail out with None so a bad Span never rewrites
+// arbitrary source.
+
+let scan_window = fn () -> i64 do return 256 end
+
+let is_ident_byte = fn (c: char) -> bool do
+  if c >= 'a' && c <= 'z' then return true end
+  if c >= 'A' && c <= 'Z' then return true end
+  if c >= '0' && c <= '9' then return true end
+  if c == '_' then return true end
+  return false
+end
+
+let find_name_at = fn (src: string, start: i64, name: string) -> i64 do
+  let n = str.length(s: src)
+  let m = str.length(s: name)
+  let stop = start + scan_window()
+  let limit = if stop > n then n else stop end
+  return find_name_loop(src, i: start, limit, name, m)
+end
+
+let find_name_loop = fn (src: string, i: i64, limit: i64, name: string, m: i64) -> i64 do
+  if i + m > limit then return 0 - 1 end
+  let window = str.substring(s: src, start: i, len: m)
+  if window == name then
+    let prev_ok = if i == 0 then true else !is_ident_byte(c: str.char_at(s: src, idx: i - 1)) end
+    let next_ok = if i + m >= str.length(s: src) then true else !is_ident_byte(c: str.char_at(s: src, idx: i + m)) end
+    if prev_ok && next_ok then return i end
+  end
+  return find_name_loop(src, i: i + 1, limit, name, m)
+end
+
+// ─── Fix-it builders ─────────────────────────────────────────────────────
+//
+// One generator per supported diagnostic. Each takes the source text, the
+// raised name (e.g. "foo"), and the Span the front-end attached, and
+// returns Some(Fixit) when a safe rewrite is available or None when the
+// situation is ambiguous (already `_`-prefixed, identifier not visible at
+// the span, etc.). The driver consumes these via `fixit_for_unused`.
+
+/** Build a `name` → `_` rewrite at the first occurrence of `name`
+ *  at-or-after the binding's statement span. The single underscore is
+ *  the "drop / sink" convention used by both the lazy linearity pass
+ *  (`let @_ = thunk(...)`) and the linear-binding pass (`let %_ = ...`).
+ *  A bare `_` keeps the value's evaluation effects (so a side-effecting
+ *  thunk still runs / a linear ctor still gets allocated and then
+ *  dropped) while letting the linearity pass treat it as deliberately
+ *  unused.
+ *
+ *  Returns None when the binding name is already a single `_` (no work
+ *  to do) or the identifier isn't found at-or-after `sp` within the
+ *  scan window. */
+let fixit_underscore_rename = fn (src: string, name: string, sp: Span, code: string, kind_label: string) -> Option<Fixit> do
+  if str.length(s: name) == 0 then return None end
+  if name == "_" then return None end
+  match sp do | Span(offset, line: _, col: _) ->
+    let pos = find_name_at(src, start: offset, name)
+    if pos < 0 then return None end
+    let msg = "rename " ++ kind_label ++ " binding `" ++ name ++ "` to `_` (drop / mark as deliberately unused)"
+    return Some(val: Fixit(start: pos, len: str.length(s: name), replacement: "_", code, message: msg))
+  end
+end
+
+/** Suggest a fix for an unused lazy binding (E2005). */
+export let fixit_for_lazy_unused = fn (src: string, name: string, sp: Span) -> Option<Fixit> do
+  return fixit_underscore_rename(src, name, sp, code: "E2005", kind_label: "lazy")
+end
+
+/** Suggest a fix for an unused linear binding (E2007). */
+export let fixit_for_linear_unused = fn (src: string, name: string, sp: Span) -> Option<Fixit> do
+  return fixit_underscore_rename(src, name, sp, code: "E2007", kind_label: "linear")
+end
+
+// ─── Diagnostic-driven dispatch ──────────────────────────────────────────
+//
+// The driver catches an Exn, then calls `fixit_for_exn_code` with the
+// extracted (code, name, span). We keep the dispatch in this module so
+// new fix-its can be added without driver edits — driver only sees the
+// `Option<Fixit>` shape.
+
+/** Look up a fix-it for a given (E-code, name, span) triple. Returns None
+ *  when the code isn't covered or the rewrite would be unsafe. */
+export let fixit_for_code = fn (src: string, code: string, name: string, sp: Span) -> Option<Fixit> do
+  if code == "E2005" then return fixit_for_lazy_unused(src, name, sp) end
+  if code == "E2007" then return fixit_for_linear_unused(src, name, sp) end
+  return None
+end
+
+/** Inspect an Exn produced by the front-end pipeline and return a Fixit
+ *  when the exception is one of the supported fix-able variants. This is
+ *  the high-level entry point used by the driver. Unsupported / spanless
+ *  exceptions return None so the caller can fall back to plain error
+ *  reporting. */
+export let fixit_for_exn = fn (src: string, err: Exn) -> Option<Fixit> do
+  match err do
+    | LazyBindingUnused(name: n, span: sp) -> return fixit_for_lazy_unused(src, name: n, sp)
+    | LinearUnused(name: n, span: sp) -> return fixit_for_linear_unused(src, name: n, sp)
+    | _ -> return None
+  end
+end
+
+// ─── Output rendering ────────────────────────────────────────────────────
+//
+// `--check` and `--diff` need user-facing renderers. The text shapes are
+// deliberately conservative — no ANSI, no column-aware highlighting — so
+// downstream tooling (LSP, agents) can grep them without regex acrobatics.
+
+/** One-line summary for `--check` mode. Format:
+ *  `<file>:<line>:<col>: [<code>] <message>` */
+export let format_check_line = fn (file: string, sp: Span, fix: Fixit) -> string do
+  match sp do | Span(offset: _, line, col) ->
+    match fix do | Fixit(start: _, len: _, replacement: _, code, message) ->
+      return file ++ ":" ++ str.from_i64(val: line) ++ ":" ++ str.from_i64(val: col)
+        ++ ": [" ++ code ++ "] " ++ message
+    end
+  end
+end
+
+/** A minimal three-line `--diff` view per fix: the file/code header, the
+ *  removed token, and the replacement. Sufficient for human review and
+ *  for agents looking for the literal old/new pair. */
+export let format_diff_block = fn (file: string, fix: Fixit, old_text: string) -> string do
+  match fix do | Fixit(start: _, len: _, replacement, code, message: _) ->
+    return "--- " ++ file ++ " [" ++ code ++ "]\n"
+      ++ "- " ++ old_text ++ "\n"
+      ++ "+ " ++ replacement
+  end
+end
+
+/** Slice the `len` bytes starting at `start` out of `src`. Used by the
+ *  diff renderer to show the original token. Returns "" on out-of-range. */
+export let slice_old_text = fn (src: string, fix: Fixit) -> string do
+  match fix do | Fixit(start, len, replacement: _, code: _, message: _) ->
+    let n = str.length(s: src)
+    if start < 0 then return "" end
+    if start + len > n then return "" end
+    return str.substring(s: src, start, len)
+  end
+end
