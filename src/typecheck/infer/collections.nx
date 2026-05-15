@@ -52,47 +52,90 @@ end
 //
 // Walk record fields; report the name of the first field that carries a
 // linear type (TyLinear / TyLazy), looking through anonymous TyRecord
-// nesting and named-type aliases (RecordDef). `depth` caps recursion in
-// case a typedef has a cycle.
+// nesting and named-type aliases (RecordDef).
+//
+// Cycle handling (nexus-t9cl.16) — spec type-system-formal.md §Linearity
+// lines 365-381 define the predicate as a least fixpoint with a visited
+// set V threaded through:
+//   linear'(x⟨σ̄⟩, V) = false                                 if x ∈ V        (line 372)
+//                    = ⋁_F linear'(F, V ∪ {x})  for F ∈ unfold(x⟨σ̄⟩)  (line 373)
+// We thread a `[string]` of named-type names along every recursive call.
+// Only nominal type lookup (TyUserDefined) extends V — wrapper / list /
+// record-field traversals thread V unchanged (line 376). The prior
+// implementation capped recursion at depth=8 (fuel); fuel decremented
+// on every step and caused false negatives on non-cyclic but
+// deeply-nested record chains. Visited-set semantics is monotonic.
 
-/** Return the name of the first record field whose type is linear (TyLinear/TyLazy) or contains a linear component, or None. `depth` caps recursion through nested typedef cycles. */
+let lin_visited_has = fn (visited: [string], name: string) -> bool do
+  match visited do
+    | [] -> return false
+    | n :: rest ->
+      if n == name then return true end
+      return lin_visited_has(visited: rest, name)
+  end
+end
+
+/** Return the name of the first record field whose type is linear (TyLinear/TyLazy) or contains a linear component, or None. Public entry-point that starts the visited-set fixpoint walk with `V = []`. */
 export let find_linear_field = fn (
   fields: [NamedType], tdefs: [tctypes.TypeDefEntry], depth: i64
+) -> Option<string> do
+  // `depth` is retained for ABI compatibility but the visited-set walk
+  // is the actual cycle guard; the parameter is ignored.
+  let _ignore_depth: i64 = depth
+  return find_linear_field_visited(fields, tdefs, visited: [])
+end
+
+let find_linear_field_visited = fn (
+  fields: [NamedType], tdefs: [tctypes.TypeDefEntry], visited: [string]
 ) -> Option<string> do
   match fields do
     | [] -> return None
     | NamedType(name: fname, typ: ft) :: rest ->
-      if type_carries_linear(typ: ft, tdefs, depth) then
+      if type_carries_linear_visited(typ: ft, tdefs, visited) then
         return Some(val: fname)
       end
-      return find_linear_field(fields: rest, tdefs, depth)
+      return find_linear_field_visited(fields: rest, tdefs, visited)
   end
 end
 
 /** True if `typ` is structurally linear (TyLinear/TyLazy) or transitively
  *  contains a linear component through records / aliases / wrappers.
- *  `depth` caps cyclic recursion. nexus-t9cl.12: spec linearity is
- *  entirely structural — we therefore look through `~τ` (TyRef) /
- *  `&τ` (TyBorrow) wrappers and array/list element types, in addition
- *  to TyRecord fields and TyUserDefined record-typedef fields.
+ *  Public entry-point that starts the visited-set fixpoint walk with
+ *  `V = []`. nexus-t9cl.12: spec linearity is entirely structural — we
+ *  look through `~τ` (TyRef) / `&τ` (TyBorrow) wrappers and array/list
+ *  element types in addition to TyRecord fields and TyUserDefined
+ *  record-typedef fields.
  */
 export let type_carries_linear = fn (
   typ: TypeExpr, tdefs: [tctypes.TypeDefEntry], depth: i64
 ) -> bool do
-  if depth <= 0 then return false end
+  // `depth` is retained for ABI compatibility but the visited-set walk
+  // is the actual cycle guard; the parameter is ignored.
+  let _ignore_depth: i64 = depth
+  return type_carries_linear_visited(typ, tdefs, visited: [])
+end
+
+let type_carries_linear_visited = fn (
+  typ: TypeExpr, tdefs: [tctypes.TypeDefEntry], visited: [string]
+) -> bool do
   match typ do
+    // Spec line 350: %σ, @σ are linear by the outermost-wrapper clause.
     | TyLinear(_) | TyLazy(_) -> return true
-    | TyRef(inner: i) | TyBorrow(inner: i) -> return type_carries_linear(typ: i, tdefs, depth: depth - 1)
-    | TyArray(elem: e) | TyList(elem: e) -> return type_carries_linear(typ: e, tdefs, depth: depth - 1)
+    // Spec line 376: wrapper / list / record-field traversals thread V unchanged.
+    | TyRef(inner: i) | TyBorrow(inner: i) -> return type_carries_linear_visited(typ: i, tdefs, visited)
+    | TyArray(elem: e) | TyList(elem: e) -> return type_carries_linear_visited(typ: e, tdefs, visited)
     | TyRecord(fields: fs) ->
-      match find_linear_field(fields: fs, tdefs, depth: depth - 1) do
+      match find_linear_field_visited(fields: fs, tdefs, visited) do
         | Some(_) -> return true
         | None -> return false
       end
     | TyUserDefined(name: n, args: _) ->
+      // Spec line 372: x ∈ V → false (minimum fixpoint base case).
+      if lin_visited_has(visited, name: n) then return false end
       match tctypes.typedef_lookup(defs: tdefs, name: n) do
         | Some(val: RecordDef(name: _, is_public: _, type_params: _, fields: rec_fields)) ->
-          match find_linear_field(fields: rec_fields, tdefs, depth: depth - 1) do
+          // Spec line 373: recurse into unfolded body with V ∪ {x}.
+          match find_linear_field_visited(fields: rec_fields, tdefs, visited: n :: visited) do
             | Some(_) -> return true
             | None -> return false
           end
