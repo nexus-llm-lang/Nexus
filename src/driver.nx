@@ -14,7 +14,7 @@ import { CompilerDiagnostic, InvalidUsage, WriteFailed, InTargetFile, HirError, 
 import { RenameEntry }, * as symtab from "src/ir/symtab.nx"
 import * as resolve from "src/ir/resolve.nx"
 import { CacheEntry, ImportResult, get_defs, process_imports, append_entries, dump_import_graph } from "src/ir/imports.nx"
-import { iterative_resolve } from "src/ir/hir/demand.nx"
+import { iterative_resolve, resolve_all_lazy_no_filter } from "src/ir/hir/demand.nx"
 import * as reach from "src/ir/hir/reachability.nx"
 import * as main_wrap from "src/ir/main_wrap.nx"
 import * as rdr from "src/ir/rdrname.nx"
@@ -48,6 +48,7 @@ import { run_test_subcommand, strip_test_subcommand, ParsedTestSubcommand } from
 import { run_fmt_subcommand, strip_fmt_subcommand, ParsedFmtSubcommand } from "src/tools/fmt.nx"
 import { strip_hir_subcommand, ParsedHirSubcommand, strip_lir_subcommand, ParsedLirSubcommand, hir_to_text, hir_to_json, lir_to_text, lir_to_json } from "src/tools/ir_dump.nx"
 import { strip_ast_subcommand, ParsedAstSubcommand, ast_to_text, ast_to_json } from "src/tools/ast_dump.nx"
+import { strip_types_subcommand, ParsedTypesSubcommand, types_to_text, types_to_json } from "src/tools/types_dump.nx"
 import { LirProgram, LirFunction } from "src/ir/lir/types.nx"
 
 // Backtrace-elision percentage (issue nexus-kyf8): integer percent of raise
@@ -289,7 +290,7 @@ end
 /** typecheck / repl / test) is deferred to a later issue — currently `help */
 /** <subcommand>` emits the same full form so users still see the synopsis. */
 let print_usage = fn () -> unit require { Console } do
-  Console.eprintln(val: "Usage: nexus <subcommand> [options] <args>\n\nSubcommands:\n  build <input.nx> [-o output.wasm] [--polyglot [--remain-manifest]]\n  run <input.nx> [-- ARGS...]\n  typecheck <input.nx>\n  ast <input.nx> [--format=text|json]\n  hir <input.nx> [--format=text|json]\n  lir <input.nx> [--format=text|json]\n  repl\n  mcp\n  explain <symbol> [--file FILE] [--format text|json]\n  context <file> [--format text|json]\n  test [path] [--junit FILE] [--nexus-bin PATH] [--wasmtime-bin PATH]\n  fmt [--check] FILE [FILE...]\n  fmt [--check] -\n  help [subcommand]\n\nGlobal options:\n  --verbose\n  --format={text|json}\n  --explain-capabilities {yes|none|wasmtime}\n  --explain-capabilities-format {text|json}\n  --dump-imports <input.nx>")
+  Console.eprintln(val: "Usage: nexus <subcommand> [options] <args>\n\nSubcommands:\n  build <input.nx> [-o output.wasm] [--polyglot [--remain-manifest]]\n  run <input.nx> [-- ARGS...]\n  typecheck <input.nx>\n  ast <input.nx> [--format=text|json]\n  hir <input.nx> [--format=text|json]\n  lir <input.nx> [--format=text|json]\n  types <input.nx> [--format=text|json]\n  repl\n  mcp\n  explain <symbol> [--file FILE] [--format text|json]\n  context <file> [--format text|json]\n  test [path] [--junit FILE] [--nexus-bin PATH] [--wasmtime-bin PATH]\n  fmt [--check] FILE [FILE...]\n  fmt [--check] -\n  help [subcommand]\n\nGlobal options:\n  --verbose\n  --format={text|json}\n  --explain-capabilities {yes|none|wasmtime}\n  --explain-capabilities-format {text|json}\n  --dump-imports <input.nx>")
 end
 
 /** Require a leading `build` subcommand. Symmetry with `repl`/`typecheck`/ */
@@ -850,6 +851,64 @@ let run_lir_dump_subcommand = fn (args: [string], format: ExplainFormat, verbose
   end
 end
 
+// ─── `nexus types` subcommand (nexus-g5el) ────────────────────────────────
+//
+// Runs the front-end through typecheck and dumps the inferred type of each
+// top-level binding as text (default) or JSON. The pipeline is shorter than
+// `nexus build`: parse → HIR build → resolve (no DCE) → linearity →
+// typecheck → render. No MIR/LIR/codegen — types_dump only needs the
+// post-resolution HirProgram plus the source AST (for the `requires` row).
+let run_types_dump_subcommand = fn (args: [string], format: ExplainFormat, verbose: bool) -> i64 require { Clock, Console, Fs } do
+  try
+    match args do
+      | [] -> raise InvalidUsage(detail: "usage: nexus types <input.nx> [--format=text|json]")
+      | input_path :: _ ->
+        let src = Fs.read_to_string(path: input_path)
+        let tokens = lexer.tokenize(src)
+        let ParseDiagnostics(prog: prog, diags: parse_diags) = parser.parse_collect(tokens, file: input_path)
+        print_parse_diags(diags: parse_diags, format)
+        let n_parse_diags = list.length(xs: parse_diags)
+        if n_parse_diags > 0 then
+          match format do
+            | FormatJson -> Console.eprintln(val: format_summary_json(count: n_parse_diags))
+            | FormatText -> ()
+          end
+          raise ParseErrorsCollected(count: n_parse_diags)
+        end
+        let HirBuildResult(program: hir_raw, import_cache: _) = build_hir(prog, source_file: input_path, verbose)
+        // Skip the build-pipeline's reachability DCE pass: dumping types for a
+        // library file (no `main`) would otherwise collapse to "0 bindings"
+        // because `iterative_resolve` filters by reachability from `main`.
+        // Mirrors the LSP diagnostics pipeline (src/lsp/diagnostics_pipeline.nx)
+        // which calls `resolve_all_lazy_no_filter` so every loaded def is
+        // typechecked regardless of call-graph membership.
+        let hir_resolved = match hir_raw do
+          | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
+            let resolved = resolve_all_lazy_no_filter(funcs: hf)
+            let expanded_fs = hir.expand_groups_in_functions(funcs: resolved, groups: heg)
+            let expanded_hb = hir.expand_groups_in_handler_bindings(bindings: hb, groups: heg)
+            HirProgram(ports: hp, functions: expanded_fs, externals: he, handler_bindings: expanded_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
+        end
+        // Run the same linearity + typecheck the build path does so the dump
+        // reflects a fully validated HIR. require_main: false allows library
+        // files without `main` to be queried for type info.
+        let hir_wrapped = main_wrap.wrap_main_if_needed(prog: hir_resolved)
+        linearity.check_program(prog: hir_wrapped)
+        let local_names = main_wrap.user_main_name() :: extract_function_names(defs: get_defs(prog), source: input_path)
+        let hir_checked = tc.check_program(hir: hir_wrapped, local_names, require_main: false)
+        let out = match format do
+          | FormatText -> types_to_text(prog, hir: hir_checked)
+          | FormatJson -> types_to_json(prog, hir: hir_checked)
+        end
+        Console.println(val: out)
+        return 0
+    end
+  catch e ->
+    Console.eprintln(val: err.format_error(err: e))
+    return 1
+  end
+end
+
 let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs, PermProc } do
   inject stdio.system_handler, fs_mod.system_handler, clock_mod.system_handler, proc.system_handler do
   try
@@ -979,6 +1038,19 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
         | _ :: rest -> rest
       end
       let exit_code = run_lir_dump_subcommand(args: lir_args, format: diag_format, verbose)
+      proc.exit(status: exit_code)
+    end
+    // `nexus types <input.nx>` (nexus-g5el) runs the front-end through
+    // typecheck and dumps the inferred type of each top-level binding.
+    // Self-contained block so the orchestrator can ff-merge against the
+    // parallel `nexus ast --json` work targeting the same dispatcher.
+    let ParsedTypesSubcommand(remaining: args_after_types, is_types) = strip_types_subcommand(xs: args_after_output)
+    if is_types then
+      let types_args = match args_after_types do
+        | [] -> []
+        | _ :: rest -> rest
+      end
+      let exit_code = run_types_dump_subcommand(args: types_args, format: diag_format, verbose)
       proc.exit(status: exit_code)
     end
     let ParsedTypecheckSubcommand(remaining: args_after_tc, typecheck_only) = strip_typecheck_subcommand(xs: args_after_output)

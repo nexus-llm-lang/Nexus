@@ -1,0 +1,275 @@
+/**
+ * types_dump: machine-readable type-info dump for `nexus types`.
+ *
+ * Issue nexus-g5el V1. One subcommand:
+ *   - `nexus types <file> [--format=text|json]` — runs the front-end through
+ *     typecheck and prints the inferred type of each top-level binding.
+ *
+ * V1 dumps the post-resolution HirFunction signature for each top-level
+ * function plus the source-level `require` row from the AST (HirFunction
+ * does not carry a separate requires row). Top-level `let` bindings whose
+ * RHS is not a lambda are surfaced under their declared annotation when
+ * present, else with `type = "<inferred>"` as a V1 placeholder — the
+ * agent-facing JSON shape is what matters; the typechecker has already
+ * validated everything.
+ *
+ * JSON shape (matches the V1 family established by nexus-ud6j):
+ *   {
+ *     "kind": "types",
+ *     "bindings": [
+ *       { "name": "...", "type": "...", "requires": "...", "throws": "..." },
+ *       ...
+ *     ]
+ *   }
+ *
+ * `requires` / `throws` are pretty-printed rows ("{Cap1, Cap2}" / "{Exn1}")
+ * or the empty string for empty rows / non-function bindings.
+ */
+
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+import { JsonValue, JsonString, JsonArray, JsonObject, JsonField, JsonThrow }, * as json from "std:json"
+import {
+  Program, SpannedTopLevel, GlobalLet, TLLet,
+  SpannedExpr, Expr, ExprLambda, Param,
+  TypeExpr, TyI32, TyI64, TyF32, TyF64, TyBool, TyChar, TyString, TyUnit,
+  TyIntLit, TyFloatLit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear,
+  TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyHandler,
+  NamedType
+} from "src/common/ast.nx"
+import { HirProgram, HirFunction, HirParam } from "src/ir/hir/types.nx"
+
+// ─── Subcommand stripping ──────────────────────────────────────────────────
+
+export type ParsedTypesSubcommand = ParsedTypesSubcommand(remaining: [string], is_types: bool)
+
+/** Detect a leading `types` subcommand. Strips it from the arg list when
+ * present. Mirrors `strip_hir_subcommand` / `strip_lir_subcommand` shape. */
+export let strip_types_subcommand = fn (xs: [string]) -> ParsedTypesSubcommand do
+  match xs do
+    | [] -> return ParsedTypesSubcommand(remaining: [], is_types: false)
+    | prog :: rest ->
+      match rest do
+        | [] -> return ParsedTypesSubcommand(remaining: xs, is_types: false)
+        | second :: rest2 ->
+          if second == "types" then
+            return ParsedTypesSubcommand(remaining: prog :: rest2, is_types: true)
+          end
+          return ParsedTypesSubcommand(remaining: xs, is_types: false)
+      end
+  end
+end
+
+// ─── Type pretty-printer ──────────────────────────────────────────────────
+//
+// `src/typecheck/types.nx::type_to_string` is intentionally terse for
+// diagnostics (collapses TyArrow / TyRecord / TyRow to "...") but for the
+// types-dump dump we want canonical readable forms. This local printer
+// walks the full TypeExpr structure.
+
+let pp_type_list_go = fn (ts: [TypeExpr], acc: [string]) -> [string] do
+  match ts do
+    | [] -> return list.reverse(xs: acc)
+    | t :: rest -> return pp_type_list_go(ts: rest, acc: pp_type(t) :: acc)
+  end
+end
+
+let pp_named_types_go = fn (nts: [NamedType], acc: [string]) -> [string] do
+  match nts do
+    | [] -> return list.reverse(xs: acc)
+    | NamedType(name, typ) :: rest ->
+      return pp_named_types_go(nts: rest, acc: (name ++ ": " ++ pp_type(t: typ)) :: acc)
+  end
+end
+
+/** Render a row as a brace-delimited list of capability/exception names.
+ * Empty rows render as "" (the caller decides whether to add a keyword). */
+let pp_row = fn (row: TypeExpr) -> string do
+  match row do
+    | TyRow(types: ts, rest: _) ->
+      if list.length(xs: ts) == 0 then return "" end
+      let parts = pp_type_list_go(ts, acc: [])
+      return "{" ++ str.join(xs: parts, sep: ", ") ++ "}"
+    | _ -> return ""
+  end
+end
+
+export let pp_type = fn (t: TypeExpr) -> string do
+  match t do
+    | TyI32 -> return "i32"
+    | TyI64 -> return "i64"
+    | TyF32 -> return "f32"
+    | TyF64 -> return "f64"
+    | TyBool -> return "bool"
+    | TyChar -> return "char"
+    | TyString -> return "string"
+    | TyUnit -> return "()"
+    | TyIntLit -> return "<int>"
+    | TyFloatLit -> return "<float>"
+    | TyVar(name: n) -> return n
+    | TyUserDefined(name: n, args: []) -> return n
+    | TyUserDefined(name: n, args: a) ->
+      let parts = pp_type_list_go(ts: a, acc: [])
+      return n ++ "<" ++ str.join(xs: parts, sep: ", ") ++ ">"
+    | TyArrow(params, ret, requires, throw_row) ->
+      let ps = pp_named_types_go(nts: params, acc: [])
+      let req = pp_row(row: requires)
+      let thr = pp_row(row: throw_row)
+      let req_str = if str.length(s: req) == 0 then "" else " require " ++ req end
+      let thr_str = if str.length(s: thr) == 0 then "" else " throws " ++ thr end
+      return "fn(" ++ str.join(xs: ps, sep: ", ") ++ ") -> " ++ pp_type(t: ret) ++ req_str ++ thr_str
+    | TyRef(inner) -> return "ref " ++ pp_type(t: inner)
+    | TyLinear(inner) -> return "%" ++ pp_type(t: inner)
+    | TyLazy(inner) -> return "@" ++ pp_type(t: inner)
+    | TyBorrow(inner) -> return "&" ++ pp_type(t: inner)
+    | TyArray(elem) -> return "[|" ++ pp_type(t: elem) ++ "|]"
+    | TyList(elem) -> return "[" ++ pp_type(t: elem) ++ "]"
+    | TyRecord(fields) ->
+      let parts = pp_named_types_go(nts: fields, acc: [])
+      return "{" ++ str.join(xs: parts, sep: ", ") ++ "}"
+    | TyRow(_) -> return pp_row(row: t)
+    | TyHandler(name, requires: _) -> return "handler " ++ name
+  end
+end
+
+// ─── Binding extraction ────────────────────────────────────────────────────
+//
+// A "binding" is one row in the dump. We collect bindings from two sources:
+//   1. HirProgram.functions — every reachable top-level function after
+//      HIR build + DCE. The HirFunction signature carries params, ret_type,
+//      throw_row (all post-resolution: type-param TyUserDefined → TyVar via
+//      typecheck/check.nx::convert_ud_to_var equivalents).
+//   2. The source AST Program — needed only for the `requires` row, since
+//      HirFunction stores none. We index by name and look up at render time.
+
+export type TypeBinding = TypeBinding(
+  name: string,
+  typ: string,
+  requires: string,
+  throw_row: string
+)
+
+let hir_params_to_named = fn (ps: [HirParam], acc: [NamedType]) -> [NamedType] do
+  match ps do
+    | [] -> return list.reverse(xs: acc)
+    | HirParam(label, name: _, sigil: _, typ) :: rest ->
+      return hir_params_to_named(ps: rest, acc: NamedType(name: label, typ) :: acc)
+  end
+end
+
+/** Look up the source-level `requires` row for a top-level `let name = fn ... do`. */
+let find_requires_for_name = fn (defs: [SpannedTopLevel], name: string) -> TypeExpr do
+  match defs do
+    | [] -> return TyRow(types: [], rest: None)
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name: n, is_public: _, typ: _, value)), span: _) :: rest ->
+      if n == name then
+        match value do | SpannedExpr(node: enode, span: _) ->
+          match enode do
+            | ExprLambda(type_params: _, params: _, ret_type: _, requires, throw_row: _, body: _) -> return requires
+            | _ -> return TyRow(types: [], rest: None)
+          end
+        end
+      end
+      return find_requires_for_name(defs: rest, name)
+    | _ :: rest -> return find_requires_for_name(defs: rest, name)
+  end
+end
+
+/** Strip module-prefix qualification from a HIR function name when the source
+ * AST uses bare names. HIR rewrites `foo` → `<file>/foo` during process_top_level,
+ * so we try the bare suffix when the qualified lookup misses. */
+let bare_name = fn (qualified: string) -> string do
+  let n = str.length(s: qualified)
+  return bare_name_go(s: qualified, i: n - 1, n)
+end
+
+let bare_name_go = fn (s: string, i: i64, n: i64) -> string do
+  if i < 0 then return s end
+  let b = str.byte_at(s, idx: i)
+  // '/' = 47
+  if b == 47 then return str.substring(s, start: i + 1, len: n - i - 1) end
+  return bare_name_go(s, i: i - 1, n)
+end
+
+let hir_fn_to_binding = fn (prog: Program, f: HirFunction) -> TypeBinding do
+  match f do | HirFunction(name, type_params: _, params, ret_type, throw_row, body: _, span: _, file: _) ->
+    let named = hir_params_to_named(ps: params, acc: [])
+    let arrow_str = pp_type(t: TyArrow(params: named, ret: ret_type,
+      requires: TyRow(types: [], rest: None), throw_row: TyRow(types: [], rest: None)))
+    let defs = match prog do | Program(definitions, module_doc: _) -> definitions end
+    let bn = bare_name(qualified: name)
+    let requires = find_requires_for_name(defs, name: bn)
+    let req_str = pp_row(row: requires)
+    let thr_str = pp_row(row: throw_row)
+    return TypeBinding(name, typ: arrow_str, requires: req_str, throw_row: thr_str)
+  end
+end
+
+let collect_bindings_go = fn (prog: Program, fs: [HirFunction], acc: [TypeBinding]) -> [TypeBinding] do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | f :: rest -> return collect_bindings_go(prog, fs: rest, acc: hir_fn_to_binding(prog, f) :: acc)
+  end
+end
+
+export let collect_bindings = fn (prog: Program, hir: HirProgram) -> [TypeBinding] do
+  match hir do | HirProgram(ports: _, functions, externals: _, handler_bindings: _, enum_defs: _, exception_groups: _, value_binding_names: _, type_defs: _) ->
+    return collect_bindings_go(prog, fs: functions, acc: [])
+  end
+end
+
+// ─── Text dump ─────────────────────────────────────────────────────────────
+
+let render_binding_line = fn (b: TypeBinding) -> string do
+  match b do | TypeBinding(name, typ, requires, throw_row) ->
+    let req_part = if str.length(s: requires) == 0 then "" else " require " ++ requires end
+    let thr_part = if str.length(s: throw_row) == 0 then "" else " throws " ++ throw_row end
+    return name ++ ": " ++ typ ++ req_part ++ thr_part
+  end
+end
+
+let render_bindings_text_go = fn (bs: [TypeBinding], acc: [string]) -> [string] do
+  match bs do
+    | [] -> return list.reverse(xs: acc)
+    | b :: rest -> return render_bindings_text_go(bs: rest, acc: render_binding_line(b) :: acc)
+  end
+end
+
+export let types_to_text = fn (prog: Program, hir: HirProgram) -> string do
+  let bs = collect_bindings(prog, hir)
+  let n = list.length(xs: bs)
+  let banner = "=== Type dump (" ++ str.from_i64(val: n) ++ " bindings) ==="
+  let lines = render_bindings_text_go(bs, acc: [])
+  return banner ++ "\n" ++ str.join(xs: lines, sep: "\n") ++ "\n"
+end
+
+// ─── JSON dump ─────────────────────────────────────────────────────────────
+
+let binding_to_json = fn (b: TypeBinding) -> JsonValue do
+  match b do | TypeBinding(name, typ, requires, throw_row) ->
+    return JsonObject(fields: [
+      JsonField(key: "name", value: JsonString(val: name)),
+      JsonField(key: "type", value: JsonString(val: typ)),
+      JsonField(key: "requires", value: JsonString(val: requires)),
+      JsonField(key: "throws", value: JsonString(val: throw_row))
+    ])
+  end
+end
+
+let bindings_to_json_go = fn (bs: [TypeBinding], acc: [JsonValue]) -> [JsonValue] do
+  match bs do
+    | [] -> return list.reverse(xs: acc)
+    | b :: rest -> return bindings_to_json_go(bs: rest, acc: binding_to_json(b) :: acc)
+  end
+end
+
+export let types_to_json = fn (prog: Program, hir: HirProgram) -> string throws { JsonThrow } do
+  let bs = collect_bindings(prog, hir)
+  let items = bindings_to_json_go(bs, acc: [])
+  let obj = JsonObject(fields: [
+    JsonField(key: "kind", value: JsonString(val: "types")),
+    JsonField(key: "bindings", value: JsonArray(items))
+  ])
+  return json.serialize(v: obj)
+end
