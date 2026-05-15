@@ -1,0 +1,205 @@
+// Issue nexus-qqvz — AST dump (`nexus ast <file> --format=json|text`) V1.
+//
+// Exercises `ast_to_text` / `ast_to_json` directly rather than spawning a
+// `nexus ast` subprocess (same rationale as ud6j: Proc.exec is -1 under
+// WASI preview1, so subprocess invocations never reach driver code).
+// Direct calls cover the same code path the driver invokes per request.
+//
+// Coverage:
+//   1. Text dump starts with the "=== AST dump" banner and mentions the
+//      function name.
+//   2. JSON dump parses through std:json and exposes the V1 envelope
+//      `{kind: "ast", top_levels: [...]}`.
+//   3. A synthesised fixture with: a function definition, a let-binding,
+//      a match expression, and a record literal — exercises Spanned*
+//      wrappers and pattern algebra.
+
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import * as ast_dump from "src/tools/ast_dump.nx"
+import * as json from "std:json"
+import { JsonValue, JsonObject, JsonArray, JsonString, JsonInt, get_field } from "std:json"
+import { Some, None } from "std:option"
+import { Span } from "src/common/token.nx"
+import {
+  Program, SpannedTopLevel, TLLet, GlobalLet,
+  SpannedExpr, Expr, ExprLambda, ExprLiteral, ExprMatch, ExprRecord, ExprVariable,
+  SpannedStmt, Stmt, StmtLet, StmtReturn, StmtExpr,
+  SpannedPattern, Pattern, PatLiteral, PatWildcard,
+  MatchCase, NamedExpr, Param,
+  SigilImmutable, LitInt, LitString,
+  TyI64, TyString, TyUnit, TyRow,
+  Unqual
+} from "src/common/ast.nx"
+
+// ─── Fixture ────────────────────────────────────────────────────────────────
+
+let sp = fn () -> Span do return Span(offset: 0, line: 1, col: 1) end
+
+// Build:
+//   let foo = fn () -> i64 do
+//     let x = 42
+//     match x do
+//       | 0 -> {kind: "zero"}
+//       | _ -> {kind: "nonzero"}
+//     end
+//   end
+let synth_program = fn () -> Program do
+  let s = sp()
+  // record literal arms: {kind: "zero"} and {kind: "nonzero"}
+  let zero_rec = SpannedExpr(node: ExprRecord(fields: [
+    NamedExpr(name: "kind", value: SpannedExpr(node: ExprLiteral(lit: LitString(val: "zero")), span: s))
+  ]), span: s)
+  let nonzero_rec = SpannedExpr(node: ExprRecord(fields: [
+    NamedExpr(name: "kind", value: SpannedExpr(node: ExprLiteral(lit: LitString(val: "nonzero")), span: s))
+  ]), span: s)
+  let case_zero = MatchCase(
+    pattern: SpannedPattern(node: PatLiteral(lit: LitInt(val: 0)), span: s),
+    body: [SpannedStmt(node: StmtExpr(expr: zero_rec), span: s)]
+  )
+  let case_wild = MatchCase(
+    pattern: SpannedPattern(node: PatWildcard, span: s),
+    body: [SpannedStmt(node: StmtExpr(expr: nonzero_rec), span: s)]
+  )
+  let x_var = SpannedExpr(node: ExprVariable(name: Unqual(name: "x"), sigil: SigilImmutable), span: s)
+  let match_expr = SpannedExpr(node: ExprMatch(target: x_var, cases: [case_zero, case_wild]), span: s)
+  // body: let x = 42; match x do ... end
+  let let_stmt = SpannedStmt(node: StmtLet(
+    name: "x", sigil: SigilImmutable, typ: None,
+    value: SpannedExpr(node: ExprLiteral(lit: LitInt(val: 42)), span: s)
+  ), span: s)
+  let match_stmt = SpannedStmt(node: StmtReturn(value: match_expr), span: s)
+  // lambda
+  let lam = SpannedExpr(node: ExprLambda(
+    type_params: [],
+    params: [],
+    ret_type: TyI64,
+    requires: TyRow(types: [], rest: None),
+    throw_row: TyRow(types: [], rest: None),
+    body: [let_stmt, match_stmt]
+  ), span: s)
+  let glet = GlobalLet(name: "foo", is_public: false, typ: None, value: lam)
+  let tl = SpannedTopLevel(node: TLLet(def: glet), span: s)
+  return Program(definitions: [tl], module_doc: None)
+end
+
+// ─── Helpers for poking at JSON ─────────────────────────────────────────────
+
+let expect_object = fn (v: JsonValue, label: string) -> [json.JsonField] throws { Exn } do
+  match v do
+    | JsonObject(fields) -> return fields
+    | _ -> raise RuntimeError(val: label ++ ": expected JsonObject")
+  end
+end
+
+let expect_array = fn (v: JsonValue, label: string) -> [JsonValue] throws { Exn } do
+  match v do
+    | JsonArray(items) -> return items
+    | _ -> raise RuntimeError(val: label ++ ": expected JsonArray")
+  end
+end
+
+let expect_string = fn (v: JsonValue, label: string) -> string throws { Exn } do
+  match v do
+    | JsonString(val: s) -> return s
+    | _ -> raise RuntimeError(val: label ++ ": expected JsonString")
+  end
+end
+
+let require_field = fn (obj: JsonValue, key: string, label: string) -> JsonValue throws { Exn } do
+  match get_field(obj, key) do
+    | Some(val: v) -> return v
+    | None -> raise RuntimeError(val: label ++ ": missing field '" ++ key ++ "'")
+  end
+end
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+let test_text_dump = fn () -> unit throws { Exn } do
+  let prog = synth_program()
+  let out = ast_dump.ast_to_text(prog)
+  let starts_with_banner = str.starts_with(s: out, prefix: "=== AST dump")
+  test_assert.assert_eq_bool(actual: starts_with_banner, expected: true, label: "qqvz: AST text dump starts with banner")
+  let mentions_foo = str.contains(s: out, sub: "foo")
+  test_assert.assert_eq_bool(actual: mentions_foo, expected: true, label: "qqvz: text dump mentions 'foo'")
+  return ()
+end
+
+let test_json_envelope = fn () -> unit throws { Exn } do
+  let prog = synth_program()
+  let out = ast_dump.ast_to_json(prog)
+  let starts_with_brace = str.starts_with(s: out, prefix: "{")
+  test_assert.assert_eq_bool(actual: starts_with_brace, expected: true, label: "qqvz: AST JSON starts with '{'")
+  let obj = json.parse(s: out)
+  let kind_v = require_field(obj, key: "kind", label: "qqvz ast json")
+  let kind = expect_string(v: kind_v, label: "qqvz kind")
+  test_assert.assert_eq_string(actual: kind, expected: "ast", label: "qqvz: kind = ast")
+  let tls_v = require_field(obj, key: "top_levels", label: "qqvz ast json")
+  let tls = expect_array(v: tls_v, label: "qqvz top_levels")
+  let n = list.length(xs: tls)
+  test_assert.assert_eq_i64(actual: n, expected: 1, label: "qqvz: 1 top-level item")
+  return ()
+end
+
+let test_json_structure = fn () -> unit throws { Exn } do
+  let prog = synth_program()
+  let out = ast_dump.ast_to_json(prog)
+  let obj = json.parse(s: out)
+  let tls = expect_array(v: require_field(obj, key: "top_levels", label: "qqvz tls"), label: "qqvz tls")
+  match tls do
+    | [] -> raise RuntimeError(val: "expected one top-level")
+    | tl :: _ ->
+      let tl_kind = expect_string(v: require_field(obj: tl, key: "kind", label: "qqvz tl"), label: "qqvz tl kind")
+      test_assert.assert_eq_string(actual: tl_kind, expected: "TLLet", label: "qqvz: top-level is TLLet")
+      let name = expect_string(v: require_field(obj: tl, key: "name", label: "qqvz tl"), label: "qqvz tl name")
+      test_assert.assert_eq_string(actual: name, expected: "foo", label: "qqvz: name = foo")
+      // Spans present.
+      let sp_v = require_field(obj: tl, key: "span", label: "qqvz tl span")
+      let _sp_fields = expect_object(v: sp_v, label: "qqvz tl span obj")
+      let start_v = require_field(obj: sp_v, key: "start", label: "qqvz tl span")
+      match start_v do
+        | JsonInt(val) -> test_assert.assert_eq_i64(actual: val, expected: 0, label: "qqvz: span.start = 0")
+        | _ -> raise RuntimeError(val: "expected JsonInt for span.start")
+      end
+      // children: the GlobalLet's value (the lambda).
+      let kids = expect_array(v: require_field(obj: tl, key: "children", label: "qqvz tl"), label: "qqvz tl kids")
+      test_assert.assert_eq_i64(actual: list.length(xs: kids), expected: 1, label: "qqvz: TLLet has 1 child")
+      match kids do
+        | [] -> raise RuntimeError(val: "tl kids empty")
+        | lam :: _ ->
+          let lam_kind = expect_string(v: require_field(obj: lam, key: "kind", label: "qqvz lam"), label: "qqvz lam kind")
+          test_assert.assert_eq_string(actual: lam_kind, expected: "ExprLambda", label: "qqvz: child is ExprLambda")
+      end
+  end
+  return ()
+end
+
+// Round-trip JSON contains the literal "42" (StmtLet value) and the record
+// kind string. Cheap sanity that we descended through Lambda → body
+// statements → expressions.
+let test_json_round_trip_contents = fn () -> unit throws { Exn } do
+  let prog = synth_program()
+  let out = ast_dump.ast_to_json(prog)
+  let has_42 = str.contains(s: out, sub: "42")
+  test_assert.assert_eq_bool(actual: has_42, expected: true, label: "qqvz: JSON mentions literal 42")
+  let has_zero = str.contains(s: out, sub: "zero")
+  test_assert.assert_eq_bool(actual: has_zero, expected: true, label: "qqvz: JSON mentions 'zero' record field value")
+  let has_match = str.contains(s: out, sub: "ExprMatch")
+  test_assert.assert_eq_bool(actual: has_match, expected: true, label: "qqvz: JSON mentions ExprMatch")
+  let has_pat_lit = str.contains(s: out, sub: "PatLiteral")
+  test_assert.assert_eq_bool(actual: has_pat_lit, expected: true, label: "qqvz: JSON mentions PatLiteral")
+  let has_pat_wild = str.contains(s: out, sub: "PatWildcard")
+  test_assert.assert_eq_bool(actual: has_pat_wild, expected: true, label: "qqvz: JSON mentions PatWildcard")
+  let has_record = str.contains(s: out, sub: "ExprRecord")
+  test_assert.assert_eq_bool(actual: has_record, expected: true, label: "qqvz: JSON mentions ExprRecord")
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  test_text_dump()
+  test_json_envelope()
+  test_json_structure()
+  test_json_round_trip_contents()
+  return ()
+end

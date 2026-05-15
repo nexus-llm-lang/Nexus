@@ -1,0 +1,833 @@
+/**
+ * ast_dump: machine-readable AST dump for `nexus ast <file>`.
+ *
+ * Issue nexus-qqvz. One subcommand:
+ *   - `nexus ast <file> [--format=text|json]` — parses to AST (pre-typecheck,
+ *     pre-HIR) and prints it. Mirrors the V1 envelope shipped by ir_dump
+ *     (`{kind: "ast", top_levels: [...]}`).
+ *
+ * The AST carries Spanned* wrappers and RdrName (scope-unresolved names) that
+ * HIR has already collapsed; this dump is the right surface for agents that
+ * want pre-resolution source positions or to study the raw pattern algebra.
+ *
+ * Every node has `{kind, span?, ...flat_fields, children: [...]}`. Sub-nodes
+ * recurse through `children`; leaf data (names, literal values) is flat.
+ */
+
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+import { JsonValue, JsonString, JsonInt, JsonBool, JsonArray, JsonObject, JsonField, JsonThrow }, * as json from "std:json"
+import { Span } from "src/common/token.nx"
+import {
+  Program, SpannedTopLevel, TopLevel, TLTypeDef, TLEnum, TLException,
+  TLExceptionGroup, TLImport, TLCap, TLLet,
+  RecordDef, EnumDef, VariantDef, ExceptionDef, ExceptionGroupDef, ImportDef,
+  ImportItem, Cap, FunctionSig, GlobalLet,
+  NamedType, VariantField, Param, CallArg, CtorArg, NamedExpr,
+  CtorPatternField, RecordPatField, HandlerArm, MatchCase, CatchArm,
+  Function, Sigil, SigilImmutable, SigilMutable, SigilLinear, SigilBorrow, SigilLazy,
+  BinaryOp, UnaryOp, Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit,
+  RdrName, Unqual, Qual,
+  TypeExpr,
+  SpannedPattern, Pattern,
+  SpannedExpr, Expr,
+  SpannedStmt, Stmt
+} from "src/common/ast.nx"
+import { type_to_string } from "src/typecheck/types.nx"
+import { sigil_to_str } from "src/tools/ir_dump.nx"
+
+// ─── Subcommand stripping ──────────────────────────────────────────────────
+
+export type ParsedAstSubcommand = ParsedAstSubcommand(remaining: [string], is_ast: bool)
+
+/** Detect a leading `ast` subcommand. Mirrors `strip_hir_subcommand`. */
+export let strip_ast_subcommand = fn (xs: [string]) -> ParsedAstSubcommand do
+  match xs do
+    | [] -> return ParsedAstSubcommand(remaining: [], is_ast: false)
+    | prog :: rest ->
+      match rest do
+        | [] -> return ParsedAstSubcommand(remaining: xs, is_ast: false)
+        | second :: rest2 ->
+          if second == "ast" then
+            return ParsedAstSubcommand(remaining: prog :: rest2, is_ast: true)
+          end
+          return ParsedAstSubcommand(remaining: xs, is_ast: false)
+      end
+  end
+end
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+let join_strs = fn (xs: [string], sep: string) -> string do
+  return str.join(xs, sep)
+end
+
+let rdr_to_str = fn (n: RdrName) -> string do
+  match n do
+    | Unqual(name) -> return name
+    | Qual(alias, name) -> return alias ++ "." ++ name
+  end
+end
+
+let literal_to_str = fn (lit: Literal) -> string do
+  match lit do
+    | LitInt(val) -> return str.from_i64(val)
+    | LitFloat(val) -> return val
+    | LitBool(val) -> return str.from_bool(val)
+    | LitChar(val) -> return "char(" ++ str.from_i64(val) ++ ")"
+    | LitString(val) -> return "\"" ++ val ++ "\""
+    | LitUnit -> return "()"
+  end
+end
+
+let binop_to_str = fn (op: BinaryOp) -> string do
+  match op do
+    | OpAdd -> return "+"
+    | OpSub -> return "-"
+    | OpMul -> return "*"
+    | OpDiv -> return "/"
+    | OpMod -> return "%"
+    | OpFAdd -> return "+."
+    | OpFSub -> return "-."
+    | OpFMul -> return "*."
+    | OpFDiv -> return "/."
+    | OpEq -> return "=="
+    | OpNe -> return "!="
+    | OpLt -> return "<"
+    | OpLe -> return "<="
+    | OpGt -> return ">"
+    | OpGe -> return ">="
+    | OpFEq -> return "==."
+    | OpFNe -> return "!=."
+    | OpFLt -> return "<."
+    | OpFLe -> return "<=."
+    | OpFGt -> return ">."
+    | OpFGe -> return ">=."
+    | OpBitAnd -> return "&"
+    | OpBitOr -> return "|"
+    | OpBitXor -> return "^"
+    | OpShl -> return "<<"
+    | OpShr -> return ">>"
+    | OpAnd -> return "&&"
+    | OpOr -> return "||"
+    | OpConcat -> return "++"
+  end
+end
+
+let unop_to_str = fn (op: UnaryOp) -> string do
+  match op do
+    | OpNeg -> return "-"
+    | OpFNeg -> return "-."
+    | OpNot -> return "!"
+  end
+end
+
+let literal_to_value_json = fn (lit: Literal) -> JsonValue do
+  match lit do
+    | LitInt(val) -> return JsonInt(val)
+    | LitFloat(val) -> return JsonString(val)
+    | LitBool(val) -> return JsonBool(val)
+    | LitChar(val) -> return JsonInt(val)
+    | LitString(val) -> return JsonString(val)
+    | LitUnit -> return JsonString(val: "()")
+  end
+end
+
+let literal_kind = fn (lit: Literal) -> string do
+  match lit do
+    | LitInt(val: _) -> return "int"
+    | LitFloat(val: _) -> return "float"
+    | LitBool(val: _) -> return "bool"
+    | LitChar(val: _) -> return "char"
+    | LitString(val: _) -> return "string"
+    | LitUnit -> return "unit"
+  end
+end
+
+let span_to_json = fn (s: Span) -> JsonValue do
+  match s do | Span(offset, line, col) ->
+    // The AST has single-point spans; emit {start, end, line, col}
+    // for compatibility with the V1 envelope shape and downstream
+    // consumers that expect a range.
+    return JsonObject(fields: [
+      JsonField(key: "start", value: JsonInt(val: offset)),
+      JsonField(key: "end", value: JsonInt(val: offset)),
+      JsonField(key: "line", value: JsonInt(val: line)),
+      JsonField(key: "col", value: JsonInt(val: col))
+    ])
+  end
+end
+
+// ─── JSON: types, patterns, expressions, statements ─────────────────────────
+
+let type_to_json = fn (t: TypeExpr) -> JsonValue do
+  // Types don't carry spans in the AST. Emit a leaf-only node keyed by
+  // the type-printer string — enough for round-tripping; deep
+  // pretty-printing is V2.
+  return JsonObject(fields: [
+    JsonField(key: "kind", value: JsonString(val: "Type")),
+    JsonField(key: "repr", value: JsonString(val: type_to_string(typ: t))),
+    JsonField(key: "children", value: JsonArray(items: []))
+  ])
+end
+
+let pattern_to_json = fn (sp: SpannedPattern) -> JsonValue do
+  match sp do | SpannedPattern(node, span) ->
+    let sp_field = JsonField(key: "span", value: span_to_json(s: span))
+    match node do
+      | PatLiteral(lit) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "PatLiteral")),
+          sp_field,
+          JsonField(key: "lit_kind", value: JsonString(val: literal_kind(lit))),
+          JsonField(key: "value", value: literal_to_value_json(lit)),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | PatVariable(name, sigil) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "PatVariable")),
+          sp_field,
+          JsonField(key: "name", value: JsonString(val: name)),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | PatConstructor(name, fields, sigil) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "PatConstructor")),
+          sp_field,
+          JsonField(key: "name", value: JsonString(val: rdr_to_str(n: name))),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "children", value: JsonArray(items: pat_ctor_fields_to_json(fields, acc: [])))
+        ])
+      | PatConstructorWildcard(name, sigil) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "PatConstructorWildcard")),
+          sp_field,
+          JsonField(key: "name", value: JsonString(val: rdr_to_str(n: name))),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | PatRecord(fields, has_wildcard) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "PatRecord")),
+          sp_field,
+          JsonField(key: "has_wildcard", value: JsonBool(val: has_wildcard)),
+          JsonField(key: "children", value: JsonArray(items: pat_rec_fields_to_json(fields, acc: [])))
+        ])
+      | PatWildcard ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "PatWildcard")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | PatOr(alts) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "PatOr")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: patterns_to_json(alts, acc: [])))
+        ])
+    end
+  end
+end
+
+let pat_ctor_fields_to_json = fn (fs: [CtorPatternField], acc: [JsonValue]) -> [JsonValue] do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | CtorPatternField(name, pattern: p) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "CtorPatternField")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "children", value: JsonArray(items: [pattern_to_json(sp: p)]))
+      ])
+      return pat_ctor_fields_to_json(fs: rest, acc: node :: acc)
+  end
+end
+
+let pat_rec_fields_to_json = fn (fs: [RecordPatField], acc: [JsonValue]) -> [JsonValue] do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | RecordPatField(name, pattern: p) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "RecordPatField")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "children", value: JsonArray(items: [pattern_to_json(sp: p)]))
+      ])
+      return pat_rec_fields_to_json(fs: rest, acc: node :: acc)
+  end
+end
+
+let patterns_to_json = fn (ps: [SpannedPattern], acc: [JsonValue]) -> [JsonValue] do
+  match ps do
+    | [] -> return list.reverse(xs: acc)
+    | p :: rest -> return patterns_to_json(ps: rest, acc: pattern_to_json(sp: p) :: acc)
+  end
+end
+
+let exprs_to_json = fn (es: [SpannedExpr], acc: [JsonValue]) -> [JsonValue] do
+  match es do
+    | [] -> return list.reverse(xs: acc)
+    | e :: rest -> return exprs_to_json(es: rest, acc: expr_to_json(se: e) :: acc)
+  end
+end
+
+let stmts_to_json = fn (ss: [SpannedStmt], acc: [JsonValue]) -> [JsonValue] do
+  match ss do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest -> return stmts_to_json(ss: rest, acc: stmt_to_json(ss: s) :: acc)
+  end
+end
+
+let call_args_to_json = fn (xs: [CallArg], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | CallArg(name, value: v) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "CallArg")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: v)]))
+      ])
+      return call_args_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let ctor_args_to_json = fn (xs: [CtorArg], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | CtorArg(name, value: v) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "CtorArg")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: v)]))
+      ])
+      return ctor_args_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let named_exprs_to_json = fn (xs: [NamedExpr], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | NamedExpr(name, value: v) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "NamedExpr")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: v)]))
+      ])
+      return named_exprs_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let params_to_json = fn (xs: [Param], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | Param(name, sigil, typ) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "Param")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+      return params_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let match_cases_to_json = fn (cs: [MatchCase], acc: [JsonValue]) -> [JsonValue] do
+  match cs do
+    | [] -> return list.reverse(xs: acc)
+    | MatchCase(pattern, body) :: rest ->
+      let body_children = stmts_to_json(ss: body, acc: [])
+      let kids = pattern_to_json(sp: pattern) :: body_children
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "MatchCase")),
+        JsonField(key: "body_len", value: JsonInt(val: list.length(xs: body))),
+        JsonField(key: "children", value: JsonArray(items: kids))
+      ])
+      return match_cases_to_json(cs: rest, acc: node :: acc)
+  end
+end
+
+let catch_arms_to_json = fn (xs: [CatchArm], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | CatchArm(pattern, body) :: rest ->
+      let body_children = stmts_to_json(ss: body, acc: [])
+      let kids = pattern_to_json(sp: pattern) :: body_children
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "CatchArm")),
+        JsonField(key: "body_len", value: JsonInt(val: list.length(xs: body))),
+        JsonField(key: "children", value: JsonArray(items: kids))
+      ])
+      return catch_arms_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let handler_arms_to_json = fn (xs: [HandlerArm], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | HandlerArm(arm, cont_binder, span) :: rest ->
+      let cb = match cont_binder do | Some(val: n) -> n | None -> "" end
+      let arm_child = match arm do | Function(name, is_public, type_params: _, params, ret_type, requires: _, throw_row: _, body, span: arm_sp) ->
+        let kids = list.concat(xs: params_to_json(xs: params, acc: []), ys: stmts_to_json(ss: body, acc: []))
+        JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Function")),
+          JsonField(key: "span", value: span_to_json(s: arm_sp)),
+          JsonField(key: "name", value: JsonString(val: name)),
+          JsonField(key: "is_public", value: JsonBool(val: is_public)),
+          JsonField(key: "ret_type", value: JsonString(val: type_to_string(typ: ret_type))),
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      end
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "HandlerArm")),
+        JsonField(key: "span", value: span_to_json(s: span)),
+        JsonField(key: "cont_binder", value: JsonString(val: cb)),
+        JsonField(key: "children", value: JsonArray(items: [arm_child]))
+      ])
+      return handler_arms_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let expr_to_json = fn (se: SpannedExpr) -> JsonValue do
+  match se do | SpannedExpr(node, span) ->
+    let sp_field = JsonField(key: "span", value: span_to_json(s: span))
+    match node do
+      | ExprLiteral(lit) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprLiteral")),
+          sp_field,
+          JsonField(key: "lit_kind", value: JsonString(val: literal_kind(lit))),
+          JsonField(key: "value", value: literal_to_value_json(lit)),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | ExprVariable(name, sigil) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprVariable")),
+          sp_field,
+          JsonField(key: "name", value: JsonString(val: rdr_to_str(n: name))),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | ExprBorrow(name, sigil) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprBorrow")),
+          sp_field,
+          JsonField(key: "name", value: JsonString(val: name)),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | ExprBinaryOp(left, op, right) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprBinaryOp")),
+          sp_field,
+          JsonField(key: "op", value: JsonString(val: binop_to_str(op))),
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: left), expr_to_json(se: right)]))
+        ])
+      | ExprUnaryOp(op, operand) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprUnaryOp")),
+          sp_field,
+          JsonField(key: "op", value: JsonString(val: unop_to_str(op))),
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: operand)]))
+        ])
+      | ExprCall(func, args) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprCall")),
+          sp_field,
+          JsonField(key: "func", value: JsonString(val: rdr_to_str(n: func))),
+          JsonField(key: "children", value: JsonArray(items: call_args_to_json(xs: args, acc: [])))
+        ])
+      | ExprConstructor(name, args, sigil) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprConstructor")),
+          sp_field,
+          JsonField(key: "name", value: JsonString(val: rdr_to_str(n: name))),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "children", value: JsonArray(items: ctor_args_to_json(xs: args, acc: [])))
+        ])
+      | ExprExternal(symbol, type_params: _, arg_names: _, typ) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprExternal")),
+          sp_field,
+          JsonField(key: "symbol", value: JsonString(val: symbol)),
+          JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | ExprArray(elements) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprArray")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: exprs_to_json(es: elements, acc: [])))
+        ])
+      | ExprList(elements) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprList")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: exprs_to_json(es: elements, acc: [])))
+        ])
+      | ExprRecord(fields) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprRecord")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: named_exprs_to_json(xs: fields, acc: [])))
+        ])
+      | ExprIndex(target, index) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprIndex")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: target), expr_to_json(se: index)]))
+        ])
+      | ExprFieldAccess(target, field) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprFieldAccess")),
+          sp_field,
+          JsonField(key: "field", value: JsonString(val: field)),
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: target)]))
+        ])
+      | ExprIf(cond, then_branch, else_branch) ->
+        let kids0 = expr_to_json(se: cond) :: stmts_to_json(ss: then_branch, acc: [])
+        let kids = list.concat(xs: kids0, ys: stmts_to_json(ss: else_branch, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprIf")),
+          sp_field,
+          JsonField(key: "then_len", value: JsonInt(val: list.length(xs: then_branch))),
+          JsonField(key: "else_len", value: JsonInt(val: list.length(xs: else_branch))),
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      | ExprMatch(target, cases) ->
+        let kids = expr_to_json(se: target) :: match_cases_to_json(cs: cases, acc: [])
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprMatch")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      | ExprWhile(cond, body) ->
+        let kids = expr_to_json(se: cond) :: stmts_to_json(ss: body, acc: [])
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprWhile")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      | ExprFor(var, start, end_expr, body) ->
+        let kids0 = [expr_to_json(se: start), expr_to_json(se: end_expr)]
+        let kids = list.concat(xs: kids0, ys: stmts_to_json(ss: body, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprFor")),
+          sp_field,
+          JsonField(key: "var", value: JsonString(val: var)),
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      | ExprLambda(type_params: _, params, ret_type, requires: _, throw_row: _, body) ->
+        let kids = list.concat(xs: params_to_json(xs: params, acc: []), ys: stmts_to_json(ss: body, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprLambda")),
+          sp_field,
+          JsonField(key: "ret_type", value: JsonString(val: type_to_string(typ: ret_type))),
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      | ExprRaise(value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprRaise")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: value)]))
+        ])
+      | ExprForce(value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprForce")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: value)]))
+        ])
+      | ExprHandler(coeffect_name, requires: _, arms) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprHandler")),
+          sp_field,
+          JsonField(key: "coeffect_name", value: JsonString(val: coeffect_name)),
+          JsonField(key: "children", value: JsonArray(items: handler_arms_to_json(xs: arms, acc: [])))
+        ])
+    end
+  end
+end
+
+let stmt_to_json = fn (ss: SpannedStmt) -> JsonValue do
+  match ss do | SpannedStmt(node, span) ->
+    let sp_field = JsonField(key: "span", value: span_to_json(s: span))
+    match node do
+      | StmtLet(name, sigil, typ, value) ->
+        let typ_str = match typ do | Some(val: t) -> type_to_string(typ: t) | None -> "" end
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtLet")),
+          sp_field,
+          JsonField(key: "name", value: JsonString(val: name)),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "type", value: JsonString(val: typ_str)),
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: value)]))
+        ])
+      | StmtLetPattern(pattern, value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtLetPattern")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [pattern_to_json(sp: pattern), expr_to_json(se: value)]))
+        ])
+      | StmtExpr(expr) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtExpr")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: expr)]))
+        ])
+      | StmtReturn(value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtReturn")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: value)]))
+        ])
+      | StmtAssign(target, value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtAssign")),
+          sp_field,
+          JsonField(key: "target", value: JsonString(val: target)),
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: value)]))
+        ])
+      | StmtIndexAssign(target, index, value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtIndexAssign")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: target), expr_to_json(se: index), expr_to_json(se: value)]))
+        ])
+      | StmtTry(body, catch_arms) ->
+        let kids = list.concat(xs: stmts_to_json(ss: body, acc: []), ys: catch_arms_to_json(xs: catch_arms, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtTry")),
+          sp_field,
+          JsonField(key: "body_len", value: JsonInt(val: list.length(xs: body))),
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      | StmtInject(handlers, body) ->
+        let kids = list.concat(xs: exprs_to_json(es: handlers, acc: []), ys: stmts_to_json(ss: body, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtInject")),
+          sp_field,
+          JsonField(key: "handlers_len", value: JsonInt(val: list.length(xs: handlers))),
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+    end
+  end
+end
+
+// ─── JSON: top-level helpers ───────────────────────────────────────────────
+
+let named_types_to_json = fn (xs: [NamedType], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | NamedType(name, typ) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "NamedType")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+      return named_types_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let variant_fields_to_json = fn (xs: [VariantField], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | VariantField(name, typ) :: rest ->
+      let nm = match name do | Some(val: n) -> n | None -> "" end
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "VariantField")),
+        JsonField(key: "name", value: JsonString(val: nm)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+      return variant_fields_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let variants_to_json = fn (xs: [VariantDef], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | VariantDef(name, fields) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "VariantDef")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "children", value: JsonArray(items: variant_fields_to_json(xs: fields, acc: [])))
+      ])
+      return variants_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let strs_to_json = fn (xs: [string], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest -> return strs_to_json(xs: rest, acc: JsonString(val: s) :: acc)
+  end
+end
+
+let import_items_to_json = fn (xs: [ImportItem], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | ImportItem(name, item_alias) :: rest ->
+      let al = match item_alias do | Some(val: a) -> a | None -> "" end
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "ImportItem")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "item_alias", value: JsonString(val: al)),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+      return import_items_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let function_sigs_to_json = fn (xs: [FunctionSig], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | FunctionSig(name, params, ret_type, requires: _, throw_row: _) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "FunctionSig")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "ret_type", value: JsonString(val: type_to_string(typ: ret_type))),
+        JsonField(key: "children", value: JsonArray(items: params_to_json(xs: params, acc: [])))
+      ])
+      return function_sigs_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let top_level_to_json = fn (stl: SpannedTopLevel) -> JsonValue do
+  match stl do | SpannedTopLevel(node, span) ->
+    let sp_field = JsonField(key: "span", value: span_to_json(s: span))
+    match node do
+      | TLTypeDef(def) ->
+        match def do | RecordDef(name, is_public, type_params, fields) ->
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLTypeDef")),
+            sp_field,
+            JsonField(key: "name", value: JsonString(val: name)),
+            JsonField(key: "is_public", value: JsonBool(val: is_public)),
+            JsonField(key: "type_params", value: JsonArray(items: strs_to_json(xs: type_params, acc: []))),
+            JsonField(key: "children", value: JsonArray(items: named_types_to_json(xs: fields, acc: [])))
+          ])
+        end
+      | TLEnum(def) ->
+        match def do | EnumDef(name, is_public, is_opaque, type_params, variants) ->
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLEnum")),
+            sp_field,
+            JsonField(key: "name", value: JsonString(val: name)),
+            JsonField(key: "is_public", value: JsonBool(val: is_public)),
+            JsonField(key: "is_opaque", value: JsonBool(val: is_opaque)),
+            JsonField(key: "type_params", value: JsonArray(items: strs_to_json(xs: type_params, acc: []))),
+            JsonField(key: "children", value: JsonArray(items: variants_to_json(xs: variants, acc: [])))
+          ])
+        end
+      | TLException(def) ->
+        match def do | ExceptionDef(name, is_public, fields) ->
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLException")),
+            sp_field,
+            JsonField(key: "name", value: JsonString(val: name)),
+            JsonField(key: "is_public", value: JsonBool(val: is_public)),
+            JsonField(key: "children", value: JsonArray(items: variant_fields_to_json(xs: fields, acc: [])))
+          ])
+        end
+      | TLExceptionGroup(def) ->
+        match def do | ExceptionGroupDef(name, is_public, members) ->
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLExceptionGroup")),
+            sp_field,
+            JsonField(key: "name", value: JsonString(val: name)),
+            JsonField(key: "is_public", value: JsonBool(val: is_public)),
+            JsonField(key: "members", value: JsonArray(items: strs_to_json(xs: members, acc: []))),
+            JsonField(key: "children", value: JsonArray(items: []))
+          ])
+        end
+      | TLImport(def) ->
+        match def do | ImportDef(path, alias, items, is_external) ->
+          let al = match alias do | Some(val: a) -> a | None -> "" end
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLImport")),
+            sp_field,
+            JsonField(key: "path", value: JsonString(val: path)),
+            JsonField(key: "alias", value: JsonString(val: al)),
+            JsonField(key: "is_external", value: JsonBool(val: is_external)),
+            JsonField(key: "children", value: JsonArray(items: import_items_to_json(xs: items, acc: [])))
+          ])
+        end
+      | TLCap(def) ->
+        match def do | Cap(name, is_public, functions) ->
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLCap")),
+            sp_field,
+            JsonField(key: "name", value: JsonString(val: name)),
+            JsonField(key: "is_public", value: JsonBool(val: is_public)),
+            JsonField(key: "children", value: JsonArray(items: function_sigs_to_json(xs: functions, acc: [])))
+          ])
+        end
+      | TLLet(def) ->
+        match def do | GlobalLet(name, is_public, typ, value) ->
+          let typ_str = match typ do | Some(val: t) -> type_to_string(typ: t) | None -> "" end
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLLet")),
+            sp_field,
+            JsonField(key: "name", value: JsonString(val: name)),
+            JsonField(key: "is_public", value: JsonBool(val: is_public)),
+            JsonField(key: "type", value: JsonString(val: typ_str)),
+            JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: value)]))
+          ])
+        end
+    end
+  end
+end
+
+let top_levels_to_json = fn (xs: [SpannedTopLevel], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | tl :: rest -> return top_levels_to_json(xs: rest, acc: top_level_to_json(stl: tl) :: acc)
+  end
+end
+
+export let ast_to_json = fn (prog: Program) -> string throws { JsonThrow } do
+  match prog do | Program(definitions, module_doc) ->
+    let doc_str = match module_doc do | Some(val: d) -> d | None -> "" end
+    let tls = JsonArray(items: top_levels_to_json(xs: definitions, acc: []))
+    let obj = JsonObject(fields: [
+      JsonField(key: "kind", value: JsonString(val: "ast")),
+      JsonField(key: "module_doc", value: JsonString(val: doc_str)),
+      JsonField(key: "top_levels", value: tls)
+    ])
+    return json.serialize(v: obj)
+  end
+end
+
+// ─── Text dump ─────────────────────────────────────────────────────────────
+
+let top_level_name_and_kind = fn (stl: SpannedTopLevel) -> string do
+  match stl do | SpannedTopLevel(node, span: _) ->
+    match node do
+      | TLTypeDef(def) -> match def do | RecordDef(name, is_public: _, type_params: _, fields: _) -> return "record " ++ name end
+      | TLEnum(def) -> match def do | EnumDef(name, is_public: _, is_opaque: _, type_params: _, variants: _) -> return "enum " ++ name end
+      | TLException(def) -> match def do | ExceptionDef(name, is_public: _, fields: _) -> return "exception " ++ name end
+      | TLExceptionGroup(def) -> match def do | ExceptionGroupDef(name, is_public: _, members: _) -> return "exception group " ++ name end
+      | TLImport(def) -> match def do | ImportDef(path, alias: _, items: _, is_external: _) -> return "import \"" ++ path ++ "\"" end
+      | TLCap(def) -> match def do | Cap(name, is_public: _, functions: _) -> return "cap " ++ name end
+      | TLLet(def) -> match def do | GlobalLet(name, is_public: _, typ: _, value: _) -> return "let " ++ name end
+    end
+  end
+end
+
+let top_levels_to_lines_go = fn (xs: [SpannedTopLevel], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | tl :: rest ->
+      let line = "  " ++ top_level_name_and_kind(stl: tl)
+      return top_levels_to_lines_go(xs: rest, acc: line :: acc)
+  end
+end
+
+export let ast_to_text = fn (prog: Program) -> string do
+  match prog do | Program(definitions, module_doc: _) ->
+    let banner = "=== AST dump (" ++ str.from_i64(val: list.length(xs: definitions)) ++ " top-level items) ==="
+    let lines = top_levels_to_lines_go(xs: definitions, acc: [])
+    return banner ++ "\n" ++ join_strs(xs: lines, sep: "\n") ++ "\n"
+  end
+end
