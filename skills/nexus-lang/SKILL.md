@@ -401,6 +401,33 @@ match res do
 end
 ```
 
+**List variant — peel multiple heads on the surface, not by re-matching the tail.** When an outer arm binds `head :: tail` only to immediately re-`match` `tail`, fold the inner shapes into the outer pattern. Use `[x]` for single-element, `a :: b :: rest` for two-or-more, etc. `::` chains right-associatively in patterns just like in expressions.
+
+```nexus
+// PREFER — arity each arm expects is visible in the pattern
+match xs do
+  | [] -> handle_empty()
+  | [x] -> handle_one(x)
+  | x :: y :: ys -> handle_two_or_more(x, y, ys)
+end
+
+// AVOID — second match buries the arity in nested indentation
+match xs do
+  | [] -> handle_empty()
+  | x :: rest ->
+    match rest do
+      | [] -> handle_one(x)
+      | y :: ys -> handle_two_or_more(x, y, ys)
+    end
+end
+```
+
+Internally the compiler produces the same decision tree either way; this is pure legibility. The pattern says "this arm wants exactly N elements" / "this arm wants at least N elements" — buried in a second `match` it says only "this arm has a head".
+
+Exception: when the inner `match` is on a *different* list (zip-style lockstep traversal), no single-arm flattening exists. Leave the staircase or extract a recursive helper.
+
+See `references/patterns.md` § "List Pattern Flattening" for more.
+
 ### 4. Or-patterns to share an arm body across alternatives
 Whenever **two or more** arms in the same `match` have **identical RHS**, fuse them with `|` into a single arm. This includes the 3+ case — `p1 -> e | p2 -> e | p3 -> e` collapses to `p1 | p2 | p3 -> e`. All alternatives must bind the same variable names with compatible types (or no bindings at all, which is the common case).
 
@@ -563,7 +590,8 @@ end
 | `var x = 5` | `let ~x = 5` for mutable |
 | `for x in list` (collection iteration) | No such form exists — use `match`/recursion or `list.fold_left`. The integer-range `for i = lo to hi do ... end` *does* exist (exclusive upper); see `references/patterns.md`. |
 | `throws { Exn }` for a function with a known exception set | List the actual exceptions or an `exception group` (see rule #7) |
-| Multiple match arms with identical RHS: `p1 -> e | p2 -> e | p3 -> e` | Fuse with `|`: `p1 \| p2 \| p3 -> e` (see rule #4) |
+| Multiple match arms with identical RHS: `p1 -> e \| p2 -> e \| p3 -> e` | Fuse with: `p1 \| p2 \| p3 -> e` (see rule #4) |
+| List arm that re-matches its tail: `\| x :: rest -> match rest do ...` | Peel heads on the surface: `\| [x] -> ...` and `\| x :: y :: ys -> ...` (see rule #3 list variant) |
 | `raise RuntimeError(val: "...")` from a partial function | Declare a domain-specific `exception` and raise that |
 | `let r = ...; let r2 = ...; let r3 = ...` when intermediates are dead | Shadow: reuse `r` (see rule #6) |
 
