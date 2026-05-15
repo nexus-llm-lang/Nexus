@@ -1,0 +1,468 @@
+// Regression / PBT for nexus-m49r: row-algebra laws on a toy Row.
+//
+// This fixture stays at the test-layer (no compiler-side Row plumbing) —
+// it defines a small ClosedRow/OpenRow ADT, hand-rolls subset / diff /
+// member / merge / open_row, and uses std:pbt's forall to verify five
+// algebraic laws over a finite atom alphabet {Console, Fs, Clock}.
+//
+// Mapping to the real `TyRow` in src/typecheck/types.nx is intentionally
+// out of scope — once the toy laws hold we have confidence in the
+// reference algebra; binding it to TyRow is a follow-up issue.
+//
+// ── PBT closure-ABI caveats (see prop_reverse_test.nx + pbt.nx) ────────
+//   * predicates have the param named `x` (forall's `prop: (x: T) -> bool`
+//     drives nominal arg matching).
+//   * predicates / generators live inside `body()` as locals so codegen
+//     skips the top-level closure_wrap path that mismatches bool returns.
+//   * each predicate binds its result to `let ok = …` before returning.
+
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Pass, Fail } from "std:pbt"
+import { Pair } from "std:tuple"
+import * as list from "std:list"
+import * as str from "std:str"
+
+// ─── Toy Row ADT ───────────────────────────────────────────────────────
+//
+// ClosedRow carries a flat list of atoms (the "exact" set).
+// OpenRow additionally carries a row-variable name (any string) standing
+// for "+ unknown extra atoms".
+type Row = ClosedRow(atoms: [ string ]) | OpenRow(atoms: [ string ], tail: string)
+
+// Atom alphabet — kept tiny so the generator hits a high duplicate rate
+// and stresses the set-semantics of subset/merge. Defined as a `fn () ->
+// string` because top-level `let X = "literal"` triggers an "expected
+// arrow type" path in the closure-ABI layer (see codegen note in
+// pbt.nx::property and the prop_reverse_test.nx caveat).
+let atom_console = fn () -> string do return "Console" end
+let atom_fs = fn () -> string do return "Fs" end
+let atom_clock = fn () -> string do return "Clock" end
+
+// ─── Set-ish helpers on [ string ] ─────────────────────────────────────
+
+let str_mem = fn (a: string, xs: [ string ]) -> bool do
+  match xs do
+    | [] -> return false
+    | y :: rest ->
+      if a == y then return true end
+      return str_mem(a, xs: rest)
+  end
+end
+
+let str_dedup_go = fn (xs: [ string ], acc: [ string ]) -> [ string ] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | y :: rest ->
+      if str_mem(a: y, xs: acc) then
+        return str_dedup_go(xs: rest, acc)
+      else
+        return str_dedup_go(xs: rest, acc: y :: acc)
+      end
+  end
+end
+
+let str_dedup = fn (xs: [ string ]) -> [ string ] do
+  return str_dedup_go(xs, acc: [])
+end
+
+// Subset over atom lists: every element of xs is in ys.
+let atoms_subset = fn (xs: [ string ], ys: [ string ]) -> bool do
+  match xs do
+    | [] -> return true
+    | y :: rest ->
+      if str_mem(a: y, xs: ys) then
+        return atoms_subset(xs: rest, ys)
+      else
+        return false
+      end
+  end
+end
+
+// Bag-equality after dedup → "same as sets".
+let atoms_set_eq = fn (xs: [ string ], ys: [ string ]) -> bool do
+  let a = str_dedup(xs)
+  let b = str_dedup(xs: ys)
+  let ok = atoms_subset(xs: a, ys: b) && atoms_subset(xs: b, ys: a)
+  return ok
+end
+
+let atoms_remove = fn (xs: [ string ], a: string) -> [ string ] do
+  match xs do
+    | [] -> return []
+    | y :: rest ->
+      if y == a then
+        return atoms_remove(xs: rest, a)
+      else
+        return y :: atoms_remove(xs: rest, a)
+      end
+  end
+end
+
+// ─── Row operations ────────────────────────────────────────────────────
+
+let row_atoms = fn (r: Row) -> [ string ] do
+  match r do
+    | ClosedRow(atoms: a) -> return a
+    | OpenRow(atoms: a, tail: _) -> return a
+  end
+end
+
+// `member(atom, ρ)` — true iff atom ∈ ρ's atom set. Open vs closed does
+// not change membership for atoms named explicitly (the row-variable
+// represents *unknown* extra atoms, not these).
+let member = fn (a: string, r: Row) -> bool do
+  return str_mem(a, xs: row_atoms(r))
+end
+
+// `subset(ρ₁, ρ₂)` — ρ₁ ⊆ ρ₂.
+//   Closed ⊆ Closed  : set-inclusion on atoms.
+//   Closed ⊆ Open    : every atom of ρ₁ ∈ ρ₂.atoms (the row-var absorbs
+//                      anything else, but a Closed ρ₁ declares no extras).
+//   Open ⊆ Open      : same tail var AND atom-subset (a different tail
+//                      var could stand for incompatible extras).
+//   Open ⊆ Closed    : never (open declares unknown extras).
+let subset = fn (r1: Row, r2: Row) -> bool do
+  match r1 do
+    | ClosedRow(atoms: a1) ->
+      return atoms_subset(xs: a1, ys: row_atoms(r: r2))
+    | OpenRow(atoms: a1, tail: t1) ->
+      match r2 do
+        | ClosedRow(atoms: _) -> return false
+        | OpenRow(atoms: a2, tail: t2) ->
+          if t1 == t2 then
+            return atoms_subset(xs: a1, ys: a2)
+          else
+            return false
+          end
+      end
+  end
+end
+
+// `diff(ρ, a)` — remove a from ρ's explicit atom set. Tail var is
+// preserved for OpenRow.
+let diff = fn (r: Row, a: string) -> Row do
+  match r do
+    | ClosedRow(atoms: xs) -> return ClosedRow(atoms: atoms_remove(xs, a))
+    | OpenRow(atoms: xs, tail: t) ->
+      return OpenRow(atoms: atoms_remove(xs, a), tail: t)
+  end
+end
+
+// `merge(ρ₁, ρ₂)` — union of atom sets. Tail var resolution:
+//   Closed/Closed -> Closed
+//   _/Open or Open/_ -> Open (left tail wins; this is the law we will
+//   *not* test as part of m49r — we test commutativity over the
+//   merge-of-Closed-rows case, which is fully symmetric).
+//
+// To keep merge fully commutative on the surface used by the law-4
+// generator, we restrict its generator to ClosedRow on both sides.
+let merge = fn (r1: Row, r2: Row) -> Row do
+  match r1 do
+    | ClosedRow(atoms: a1) ->
+      match r2 do
+        | ClosedRow(atoms: a2) ->
+          return ClosedRow(atoms: str_dedup(xs: list.concat(xs: a1, ys: a2)))
+        | OpenRow(atoms: a2, tail: t2) ->
+          return OpenRow(atoms: str_dedup(xs: list.concat(xs: a1, ys: a2)), tail: t2)
+      end
+    | OpenRow(atoms: a1, tail: t1) ->
+      match r2 do
+        | ClosedRow(atoms: a2) ->
+          return OpenRow(atoms: str_dedup(xs: list.concat(xs: a1, ys: a2)), tail: t1)
+        | OpenRow(atoms: a2, tail: _) ->
+          return OpenRow(atoms: str_dedup(xs: list.concat(xs: a1, ys: a2)), tail: t1)
+      end
+  end
+end
+
+// `open_row(ρ)` — Closed ↦ Open(same atoms, fresh tail "r0");
+// already-open rows are returned unchanged (the canonical tail name is
+// the one already on the row, so a second application is a no-op).
+let open_row = fn (r: Row) -> Row do
+  match r do
+    | ClosedRow(atoms: xs) -> return OpenRow(atoms: xs, tail: "r0")
+    | OpenRow(atoms: _, tail: _) -> return r
+  end
+end
+
+// ─── Row equality (set-on-atoms, exact on tail) ────────────────────────
+
+let row_eq = fn (r1: Row, r2: Row) -> bool do
+  match r1 do
+    | ClosedRow(atoms: a1) ->
+      match r2 do
+        | ClosedRow(atoms: a2) -> return atoms_set_eq(xs: a1, ys: a2)
+        | OpenRow(atoms: _, tail: _) -> return false
+      end
+    | OpenRow(atoms: a1, tail: t1) ->
+      match r2 do
+        | ClosedRow(atoms: _) -> return false
+        | OpenRow(atoms: a2, tail: t2) ->
+          if t1 == t2 then return atoms_set_eq(xs: a1, ys: a2) end
+          return false
+      end
+  end
+end
+
+// ─── Rendering helpers (for witness strings) ───────────────────────────
+
+let render_atoms = fn (xs: [ string ]) -> string do
+  return "[" ++ str.join(xs, sep: ",") ++ "]"
+end
+
+let render_row = fn (r: Row) -> string do
+  match r do
+    | ClosedRow(atoms: a) -> return "Closed" ++ render_atoms(xs: a)
+    | OpenRow(atoms: a, tail: t) -> return "Open" ++ render_atoms(xs: a) ++ "|" ++ t
+  end
+end
+
+let render_pair_row = fn (p: Pair<Row, Row>) -> string do
+  let Pair(left: l, right: r) = p
+  return "(" ++ render_row(r: l) ++ ", " ++ render_row(r) ++ ")"
+end
+
+let render_row_atom = fn (p: Pair<Row, string>) -> string do
+  let Pair(left: r, right: a) = p
+  return "(" ++ render_row(r) ++ ", " ++ a ++ ")"
+end
+
+// ─── Generators (built inside body()) ──────────────────────────────────
+//
+// abs_i64 here is local — pbt.nx has its own private copy.
+let abs_i64 = fn (n: i64) -> i64 do
+  if n < 0 then return 0 - n end
+  return n
+end
+
+// xorshift step — duplicates pbt.next_state so we can advance the seed
+// inside a custom Gen<Row>. The fixup constant is inlined (top-level
+// `let X = i64-literal` works in stdlib but currently trips the
+// "expected arrow type" path when used in test fixtures).
+let step_seed = fn (s: i64) -> i64 do
+  let s0 = if s == 0 then 2685821657736338717 else s end
+  let s1 = s0 ^ (s0 << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  return s3
+end
+
+let atom_of_idx = fn (idx: i64) -> string do
+  if idx == 0 then
+    return atom_console()
+  else if idx == 1 then
+    return atom_fs()
+  else
+    return atom_clock()
+  end
+end
+
+// Draw one atom from the 3-atom alphabet.
+let draw_atom = fn (seed: i64) -> Pair<string, i64> do
+  let s1 = step_seed(s: seed)
+  let idx = abs_i64(n: s1) % 3
+  let a = atom_of_idx(idx)
+  return Pair(left: a, right: s1)
+end
+
+// Draw a length-n atom list (n drawn first, capped at 3 so dedup matters).
+let draw_atoms_n = fn (n: i64, seed: i64, acc: [ string ]) -> Pair<[ string ], i64> do
+  if n <= 0 then
+    return Pair(left: list.reverse(xs: acc), right: seed)
+  end
+  let Pair(left: a, right: s1) = draw_atom(seed)
+  return draw_atoms_n(n: n - 1, seed: s1, acc: a :: acc)
+end
+
+let draw_atoms = fn (seed: i64) -> Pair<[ string ], i64> do
+  let s1 = step_seed(s: seed)
+  let len = abs_i64(n: s1) % 4
+  return draw_atoms_n(n: len, seed: s1, acc: [])
+end
+
+let body = fn () -> unit require { Console } throws { Exn } do
+  // ─── Predicates (must take param `x` and bind result before return) ──
+
+  // Law 1: ρ ⊆ ρ.
+  let law_reflexive = fn (x: Row) -> bool do
+    let ok = subset(r1: x, r2: x)
+    return ok
+  end
+
+  // Law 2: (ρ ∪ {a}) \\ {a} = ρ, conditioned on a ∉ ρ. We pack the
+  // (row, candidate-atom) pair into a Pair<Row, string> and skip the
+  // property (return true) when the precondition is violated — standard
+  // PBT idiom for conditional laws.
+  let law_diff_inverse = fn (x: Pair<Row, string>) -> bool do
+    let Pair(left: r, right: a) = x
+    if member(a, r) then
+      let ok = true
+      return ok
+    end
+    // Build (ρ ∪ {a}) as a ClosedRow / OpenRow by prepending atom; merge
+    // collapses duplicates anyway but we want to exercise the
+    // remove-of-fresh-atom path.
+    let added = match r do
+      | ClosedRow(atoms: xs) -> ClosedRow(atoms: a :: xs)
+      | OpenRow(atoms: xs, tail: t) -> OpenRow(atoms: a :: xs, tail: t)
+    end
+    let removed = diff(r: added, a)
+    let ok = row_eq(r1: removed, r2: r)
+    return ok
+  end
+
+  // Law 3: a ∈ ρ ⇔ {a} ⊆ ρ. Use the same Pair<Row, string> shape.
+  let law_member_subset = fn (x: Pair<Row, string>) -> bool do
+    let Pair(left: r, right: a) = x
+    let lhs = member(a, r)
+    let singleton = ClosedRow(atoms: [a])
+    let rhs = subset(r1: singleton, r2: r)
+    let ok = (if lhs then rhs else (! rhs) end)
+    return ok
+  end
+
+  // Law 4: merge(ρ₁, ρ₂) = merge(ρ₂, ρ₁), specialised to ClosedRow inputs
+  // (tail-var handling for Open/Open isn't commutative in our toy because
+  // left-tail wins — see merge's docstring). The generator only emits
+  // ClosedRow pairs.
+  let law_merge_commutative = fn (x: Pair<Row, Row>) -> bool do
+    let Pair(left: r1, right: r2) = x
+    let lhs = merge(r1, r2)
+    let rhs = merge(r1: r2, r2: r1)
+    let ok = row_eq(r1: lhs, r2: rhs)
+    return ok
+  end
+
+  // Law 5: open(open(ρ)) = open(ρ).
+  let law_open_idempotent = fn (x: Row) -> bool do
+    let once = open_row(r: x)
+    let twice = open_row(r: once)
+    let ok = row_eq(r1: twice, r2: once)
+    return ok
+  end
+
+  // ─── Generators ──────────────────────────────────────────────────────
+
+  // Gen<Row>: 50/50 ClosedRow vs OpenRow; OpenRow uses a small finite
+  // tail-var alphabet so two independently-drawn rows can occasionally
+  // share a tail (necessary for the subset law to exercise the
+  // same-tail branch). Three-atom alphabet keeps the state space tiny.
+  let gen_row_run = fn (seed: i64) -> Pair<Row, i64> do
+    let s1 = step_seed(s: seed)
+    let bit = abs_i64(n: s1) % 2
+    let Pair(left: atoms, right: s2) = draw_atoms(seed: s1)
+    if bit == 0 then
+      return Pair(left: ClosedRow(atoms), right: s2)
+    end
+    let s3 = step_seed(s: s2)
+    let tv_idx = abs_i64(n: s3) % 2
+    let tv = if tv_idx == 0 then "r0" else "r1" end
+    return Pair(left: OpenRow(atoms, tail: tv), right: s3)
+  end
+  // No useful shrinker for a tagged-union Row; pass an always-empty list.
+  let gen_row_shrink = fn (v: Row) -> [ Row ] do return [] end
+  let gen_row = pbt.Gen(run: gen_row_run, shrink: gen_row_shrink, render: render_row)
+
+  // Gen<Row> restricted to ClosedRow (for merge commutativity).
+  let gen_closed_row_run = fn (seed: i64) -> Pair<Row, i64> do
+    let Pair(left: atoms, right: s1) = draw_atoms(seed)
+    return Pair(left: ClosedRow(atoms), right: s1)
+  end
+  let gen_closed_row = pbt.Gen(
+    run: gen_closed_row_run,
+    shrink: gen_row_shrink,
+    render: render_row)
+
+  // Gen<Pair<Row, string>>: a row and an atom from the same alphabet.
+  let gen_row_atom_run = fn (seed: i64) -> Pair<Pair<Row, string>, i64> do
+    let Pair(left: r, right: s1) = gen_row_run(seed)
+    let Pair(left: a, right: s2) = draw_atom(seed: s1)
+    return Pair(left: Pair(left: r, right: a), right: s2)
+  end
+  let gen_row_atom_shrink = fn (v: Pair<Row, string>) -> [ Pair<Row, string> ] do
+    return []
+  end
+  let gen_row_atom = pbt.Gen(
+    run: gen_row_atom_run,
+    shrink: gen_row_atom_shrink,
+    render: render_row_atom)
+
+  // Gen<Pair<Row, Row>> over ClosedRow.
+  let gen_pair_run = fn (seed: i64) -> Pair<Pair<Row, Row>, i64> do
+    let Pair(left: r1, right: s1) = gen_closed_row_run(seed)
+    let Pair(left: r2, right: s2) = gen_closed_row_run(seed: s1)
+    return Pair(left: Pair(left: r1, right: r2), right: s2)
+  end
+  let gen_pair_shrink = fn (v: Pair<Row, Row>) -> [ Pair<Row, Row> ] do
+    return []
+  end
+  let gen_pair = pbt.Gen(
+    run: gen_pair_run,
+    shrink: gen_pair_shrink,
+    render: render_pair_row)
+
+  // ─── Run laws ────────────────────────────────────────────────────────
+  let trials = 200
+
+  let r1 = pbt.forall(g: gen_row, prop: law_reflexive, n: trials)
+  match r1 do
+    | Pass -> test_assert.assert_true(cond: true, label: "law 1: subset reflexive")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "law 1 FAIL witness=" ++ w ++ " shrunk=" ++ s)
+  end
+
+  let r2 = pbt.forall(g: gen_row_atom, prop: law_diff_inverse, n: trials)
+  match r2 do
+    | Pass -> test_assert.assert_true(cond: true, label: "law 2: diff left-inverse of insert")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "law 2 FAIL witness=" ++ w ++ " shrunk=" ++ s)
+  end
+
+  let r3 = pbt.forall(g: gen_row_atom, prop: law_member_subset, n: trials)
+  match r3 do
+    | Pass -> test_assert.assert_true(cond: true, label: "law 3: member iff singleton subset")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "law 3 FAIL witness=" ++ w ++ " shrunk=" ++ s)
+  end
+
+  let r4 = pbt.forall(g: gen_pair, prop: law_merge_commutative, n: trials)
+  match r4 do
+    | Pass -> test_assert.assert_true(cond: true, label: "law 4: merge commutative (closed)")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "law 4 FAIL witness=" ++ w ++ " shrunk=" ++ s)
+  end
+
+  let r5 = pbt.forall(g: gen_row, prop: law_open_idempotent, n: trials)
+  match r5 do
+    | Pass -> test_assert.assert_true(cond: true, label: "law 5: open idempotent")
+    | Fail(witness: w, shrunk_input: s) ->
+      test_assert.assert_true(cond: false,
+        label: "law 5 FAIL witness=" ++ w ++ " shrunk=" ++ s)
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
