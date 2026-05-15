@@ -11,9 +11,9 @@ against [`index.schema.json`](./index.schema.json)).
 | --- | --- | --- |
 | `examples/` (root) | Historical end-to-end samples (hello, fib, bench) | 7 |
 | `examples/feature/` | One minimal example per language feature / stdlib module | 38 |
-| `examples/negative/` | Intentionally broken snippets; runner asserts the diagnostic (compile-time *or* runtime throw) | 12 |
+| `examples/negative/` | Intentionally broken snippets; runner asserts the diagnostic (compile-time *or* runtime throw) | 13 |
 
-Total: **57 examples**. See [`negative/run.sh`](./negative/run.sh) for
+Total: **58 examples**. See [`negative/run.sh`](./negative/run.sh) for
 the negative-corpus driver.
 
 ## How to use
@@ -135,6 +135,7 @@ a `println` line emitted just before the throwing site.
 | [`negative/import_module_not_found.nx`](./negative/import_module_not_found.nx) | E4004 | `import "std:NAME"` with no matching file |
 | [`negative/option_unwrap_none.nx`](./negative/option_unwrap_none.nx) | runtime | `std:option.unwrap(None)` raises `RuntimeError` |
 | [`negative/result_unhandled_err.nx`](./negative/result_unhandled_err.nx) | runtime | Caller raises on `Err(...)` (idiomatic Result→Exn lift) |
+| [`negative/math_div_by_zero.nx`](./negative/math_div_by_zero.nx) | runtime | Bare `/` by 0 on i64 traps (`integer divide by zero`) |
 
 ## Schema
 
