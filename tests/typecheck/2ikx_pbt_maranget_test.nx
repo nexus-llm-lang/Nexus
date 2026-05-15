@@ -1,0 +1,1000 @@
+// PBT (nexus-2ikx): determinism + soundness of Maranget's pattern-matrix
+// algorithm for exhaustiveness / usefulness checking.
+//
+// The real check lives in src/typecheck/exhaustive*.nx; this fixture
+// stays at the test-layer with a TOY pattern domain and a hand-rolled
+// reference impl that mirrors the canonical Maranget recursion
+// (Useful(P, q), with column-0 specialization S(c, P) and default D(P)).
+//
+// Toy signature: a single algebraic data type modelling cons-lists over
+// a one-element value space.
+//
+//   ctor N : ()         // nil,  arity 0
+//   ctor C : (Pat, Pat) // cons, arity 2
+//
+// Patterns over this signature:
+//   PWild                — _
+//   PVar(name)           — x (treated identically to wild for matching;
+//                          name is irrelevant to usefulness)
+//   PCtor(name, args)    — N() or C(h, t)
+//
+// Single canonical type for column 0 = "list" (cons-list of unit). Values
+// are closed terms VNil | VCons(VHead, VTail), depth-bounded for the
+// soundness oracle.
+//
+// Properties (200+ iters each):
+//
+//   P-Det1  — useful(M, q) is invariant under row reordering of M
+//             (deterministic on the canonical algorithm).
+//   P-Det2  — useful(M, q) is idempotent: same call twice = same answer.
+//   P-Exh-AllWild — matrix [[PWild]] is exhaustive at arity 1.
+//   P-Exh-Empty   — matrix [] is *not* exhaustive at arity 1 (and the
+//                   witness pattern PWild itself is useful).
+//   P-Exh-Sound-Pos — if exhaustive(M) reports TRUE, every depth-bounded
+//                     closed value is matched by some row of M.
+//   P-Exh-Sound-Neg — if exhaustive(M) reports FALSE with witness w,
+//                     then w (interpreted as a depth-bounded value, by
+//                     replacing wilds with VNil) is NOT matched by any
+//                     row of M.
+//   P-Exh-Monotone  — adding a row to M never makes M less exhaustive.
+//   P-Exh-RowEq     — duplicating a row in M doesn't change exhaustiveness
+//                     (closure under set-semantics on rows).
+//   P-Useful-Specialize — `useful(M, PCtor(c, args)::qs)` agrees with
+//                     `useful(S(c, M), args ++ qs)` (the spec's column-0
+//                     specialization step is sound on our toy).
+//   P-Useful-Default — when col-0 is wild and the matrix's col-0 head-ctor
+//                     set is *incomplete*, `useful(M, PWild::qs)` agrees
+//                     with `useful(D(M), qs)` (default-row step).
+//
+// Closure-ABI caveats (consistent with the six prior PBT agents):
+//   * forall's prop param must be named `x`.
+//   * Gen<…> built inside body() — top-level Gen with non-i64 T trips
+//     the closure_wrap mismatch.
+//   * Predicates declared inside body(); each binds its result via
+//     `let ok = …` before `return`.
+//   * Direct-recursion helpers replace `list.fold_left + closure-with-
+//     -recursive-callee` (q88x).
+//   * Every new helper is local to this file (rxpz blocker).
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Pass, Fail, Gen } from "std:pbt"
+import { Pair } from "std:tuple"
+import * as list from "std:list"
+import * as str from "std:str"
+
+// ─── Toy pattern domain ────────────────────────────────────────────────────
+//
+// PCtor's `name` is one of "N" / "C" — we keep it stringly because the toy
+// signature has a closed-world set of two ctors and switching on strings
+// matches the spec's natural presentation. The `args` length is the
+// constructor's arity (0 for N, 2 for C) — we maintain that invariant
+// in the generator and assert it where useful (the algorithm refuses to
+// specialize on ill-arity rows, which would be a generator bug).
+
+type Pat =
+  PWild
+  | PVar(name: string)
+  | PCtor(name: string, args: [ Pat ])
+
+// Values for the soundness oracle. VNil = N(); VCons(h, t) = C(h, t).
+type Val = VNil | VCons(head: Val, tail: Val)
+
+// A row is a vector of patterns (the matrix's row), and the matrix is
+// a list of rows. We use plain [[Pat]] rather than a wrapping ctor.
+
+// ─── Arity / ctor signature ────────────────────────────────────────────────
+
+let ctor_arity = fn (name: string) -> i64 do
+  if name == "N" then return 0 end
+  if name == "C" then return 2 end
+  // Unknown ctor — return -1 sentinel; the algorithm never produces an
+  // unknown name because the generator only emits "N" / "C".
+  return 0 - 1
+end
+
+// All ctors of the column-0 type. Used to decide "is the head-ctor set
+// of column 0 of M *complete*?" — Maranget's exhaustive-Σ rule.
+let all_ctors = fn () -> [ string ] do
+  return ["N", "C"]
+end
+
+// ─── Matching ──────────────────────────────────────────────────────────────
+//
+// `match_pat(p, v)` — does pattern p match value v? Wildcards and vars
+// match anything; PCtor matches iff the ctor names align and every arg
+// matches the corresponding sub-value (only meaningful for "C" here,
+// which has two args; "N" has zero args and matches only VNil).
+
+let match_pat = fn (p: Pat, v: Val) -> bool do
+  match p do
+    | PWild -> return true
+    | PVar(name: _) -> return true
+    | PCtor(name: nm, args: a) ->
+      match v do
+        | VNil ->
+          if nm == "N" then return true end
+          return false
+        | VCons(head: vh, tail: vt) ->
+          if nm == "C" then
+            // arity check is implicit: generator always emits a 2-arg C.
+            match a do
+              | [] -> return false
+              | hp :: rest ->
+                match rest do
+                  | [] -> return false
+                  | tp :: rest2 ->
+                    match rest2 do
+                      | [] ->
+                        let okh = match_pat(p: hp, v: vh)
+                        if okh then
+                          let okt = match_pat(p: tp, v: vt)
+                          return okt
+                        end
+                        return false
+                      | _ :: _ -> return false
+                    end
+                end
+            end
+          end
+          return false
+      end
+  end
+end
+
+// `row_matches(row, vec)` — does a full row of patterns match a vector
+// of values? Lengths must agree (the matrix invariant). Direct recursion
+// because we zip-and-match a polymorphic pair of lists.
+let row_matches = fn (row: [ Pat ], vec: [ Val ]) -> bool do
+  match row do
+    | [] ->
+      match vec do
+        | [] -> return true
+        | _ :: _ -> return false
+      end
+    | p :: ps ->
+      match vec do
+        | [] -> return false
+        | v :: vs ->
+          let okh = match_pat(p, v)
+          if okh then
+            let okt = row_matches(row: ps, vec: vs)
+            return okt
+          end
+          return false
+      end
+  end
+end
+
+// `any_row_matches(M, v)` — ∃ row ∈ M. row_matches(row, v).
+let any_row_matches = fn (m: [ [ Pat ] ], v: [ Val ]) -> bool do
+  match m do
+    | [] -> return false
+    | row :: rest ->
+      let okh = row_matches(row, vec: v)
+      if okh then return true end
+      let okt = any_row_matches(m: rest, v)
+      return okt
+  end
+end
+
+// ─── Specialization S(c, P) ───────────────────────────────────────────────
+//
+// Maranget's S(c, P): for each row of P, look at col-0:
+//   - PCtor(c, args)  →  args ++ row[1..]      (keep)
+//   - PCtor(c', _)    →  drop the row          (c' ≠ c)
+//   - PWild / PVar    →  arity(c) wilds ++ row[1..]   (expand)
+//
+// We return the new matrix as [[Pat]]; arity(c) wilds are prepended.
+
+let n_wilds = fn (n: i64, acc: [ Pat ]) -> [ Pat ] do
+  if n <= 0 then return acc end
+  return n_wilds(n: n - 1, acc: PWild :: acc)
+end
+
+// Drop the first cell of a non-empty row.
+let row_tail = fn (row: [ Pat ]) -> [ Pat ] do
+  match row do
+    | [] -> return []
+    | _ :: rest -> return rest
+  end
+end
+
+// Specialize one row against ctor c (with arity a). Returns Pair<keep, new_row>.
+// We pack the answer as Pair<bool, [Pat]>: left=true means "include the
+// rewritten row", left=false means "drop this row".
+let specialize_row = fn (c: string, a: i64, row: [ Pat ]) -> Pair<bool, [ Pat ]> do
+  match row do
+    | [] -> return Pair(left: false, right: [])  // shouldn't happen at this level
+    | hd :: tl ->
+      match hd do
+        | PWild ->
+          let prefix = n_wilds(n: a, acc: [])
+          return Pair(left: true, right: list.concat(xs: prefix, ys: tl))
+        | PVar(name: _) ->
+          let prefix = n_wilds(n: a, acc: [])
+          return Pair(left: true, right: list.concat(xs: prefix, ys: tl))
+        | PCtor(name: nm, args: cargs) ->
+          if nm == c then
+            return Pair(left: true, right: list.concat(xs: cargs, ys: tl))
+          end
+          return Pair(left: false, right: [])
+      end
+  end
+end
+
+let specialize_go = fn (c: string, a: i64, m: [ [ Pat ] ], acc: [ [ Pat ] ]) -> [ [ Pat ] ] do
+  match m do
+    | [] -> return list.reverse(xs: acc)
+    | row :: rest ->
+      let Pair(left: keep, right: r2) = specialize_row(c, a, row)
+      if keep then
+        return specialize_go(c, a, m: rest, acc: r2 :: acc)
+      end
+      return specialize_go(c, a, m: rest, acc)
+  end
+end
+
+let specialize = fn (c: string, m: [ [ Pat ] ]) -> [ [ Pat ] ] do
+  let a = ctor_arity(name: c)
+  return specialize_go(c, a, m, acc: [])
+end
+
+// ─── Default D(P) ──────────────────────────────────────────────────────────
+//
+// For each row of P with col-0 = PWild / PVar, drop col-0 and keep the
+// suffix. Drop the row entirely if col-0 is a PCtor.
+
+let default_row = fn (row: [ Pat ]) -> Pair<bool, [ Pat ]> do
+  match row do
+    | [] -> return Pair(left: false, right: [])
+    | hd :: tl ->
+      match hd do
+        | PWild -> return Pair(left: true, right: tl)
+        | PVar(name: _) -> return Pair(left: true, right: tl)
+        | PCtor(name: _, args: _) -> return Pair(left: false, right: [])
+      end
+  end
+end
+
+let default_mat_go = fn (m: [ [ Pat ] ], acc: [ [ Pat ] ]) -> [ [ Pat ] ] do
+  match m do
+    | [] -> return list.reverse(xs: acc)
+    | row :: rest ->
+      let Pair(left: keep, right: r2) = default_row(row)
+      if keep then
+        return default_mat_go(m: rest, acc: r2 :: acc)
+      end
+      return default_mat_go(m: rest, acc)
+  end
+end
+
+let default_mat = fn (m: [ [ Pat ] ]) -> [ [ Pat ] ] do
+  return default_mat_go(m, acc: [])
+end
+
+// ─── Σ — set of head-ctor names appearing in col-0 of M ────────────────────
+
+let str_mem = fn (s: string, xs: [ string ]) -> bool do
+  match xs do
+    | [] -> return false
+    | y :: rest ->
+      if s == y then return true end
+      return str_mem(s, xs: rest)
+  end
+end
+
+let col0_ctors_go = fn (m: [ [ Pat ] ], acc: [ string ]) -> [ string ] do
+  match m do
+    | [] -> return acc
+    | row :: rest ->
+      match row do
+        | [] -> return col0_ctors_go(m: rest, acc)
+        | hd :: _ ->
+          match hd do
+            | PCtor(name: nm, args: _) ->
+              if str_mem(s: nm, xs: acc) then
+                return col0_ctors_go(m: rest, acc)
+              end
+              return col0_ctors_go(m: rest, acc: nm :: acc)
+            | _ -> return col0_ctors_go(m: rest, acc)
+          end
+      end
+  end
+end
+
+let col0_ctors = fn (m: [ [ Pat ] ]) -> [ string ] do
+  return col0_ctors_go(m, acc: [])
+end
+
+// Is the col-0 head-ctor set complete (i.e. covers all_ctors())?
+let is_complete_sig = fn (sigma: [ string ]) -> bool do
+  // For every name in all_ctors(), name ∈ sigma.
+  let all = all_ctors()
+  return all_in(xs: all, ys: sigma)
+end
+
+let all_in = fn (xs: [ string ], ys: [ string ]) -> bool do
+  match xs do
+    | [] -> return true
+    | y :: rest ->
+      if str_mem(s: y, xs: ys) then
+        return all_in(xs: rest, ys)
+      end
+      return false
+  end
+end
+
+// ─── Maranget Useful(M, q) ────────────────────────────────────────────────
+//
+// q is a [Pat] of length n; M is a [[Pat]] each of length n. Result is
+// true iff some value vector matches q and no row of M.
+//
+// Base cases:
+//   n = 0, m = 0 → true   (vacuous: q matches the empty value vector,
+//                           no row contradicts)
+//   n = 0, m > 0 → false  (some row matches the empty value vector)
+//
+// Recursive cases on q's head:
+//   q[0] = PCtor(c, args) → Useful(S(c, M), args ++ q[1..])
+//   q[0] = PWild / PVar:
+//     if Σ(M col-0) = full signature:
+//       OR over c ∈ Σ of Useful(S(c, M), arity(c)-wilds ++ q[1..])
+//     else:
+//       Useful(D(M), q[1..])
+
+let n_cols = fn (q: [ Pat ]) -> i64 do
+  return list.length(xs: q)
+end
+
+let n_rows = fn (m: [ [ Pat ] ]) -> i64 do
+  return list.length(xs: m)
+end
+
+// OR over ctor-list: useful(S(c, M), wilds(arity(c)) ++ qs) for any c?
+// Direct recursion (q88x: avoid HOF+recursive-callee mismatch).
+let useful_or_over_ctors = fn (cs: [ string ], m: [ [ Pat ] ], qs: [ Pat ]) -> bool do
+  match cs do
+    | [] -> return false
+    | c :: rest ->
+      let a = ctor_arity(name: c)
+      let prefix = n_wilds(n: a, acc: [])
+      let q2 = list.concat(xs: prefix, ys: qs)
+      let m2 = specialize(c, m)
+      let okh = useful(m: m2, q: q2)
+      if okh then return true end
+      let okt = useful_or_over_ctors(cs: rest, m, qs)
+      return okt
+  end
+end
+
+let useful = fn (m: [ [ Pat ] ], q: [ Pat ]) -> bool do
+  let n = n_cols(q)
+  if n == 0 then
+    let r = n_rows(m)
+    if r == 0 then return true end
+    return false
+  end
+  match q do
+    | [] -> return false  // unreachable: n_cols handled above
+    | hd :: rest ->
+      match hd do
+        | PCtor(name: c, args: a) ->
+          let m2 = specialize(c, m)
+          let q2 = list.concat(xs: a, ys: rest)
+          let ok = useful(m: m2, q: q2)
+          return ok
+        | _ ->
+          // PWild or PVar
+          let sigma = col0_ctors(m)
+          if is_complete_sig(sigma) then
+            let ok = useful_or_over_ctors(cs: all_ctors(), m, qs: rest)
+            return ok
+          end
+          let m2 = default_mat(m)
+          let ok = useful(m: m2, q: rest)
+          return ok
+      end
+  end
+end
+
+// ─── exhaustive(M, arity) and witness-producing variant ────────────────────
+//
+// exhaustive(M, n) ⇔ ¬useful(M, [PWild]^n). For our tests we use n = 1
+// (the single-column case) — that's the canonical "is the match
+// statement exhaustive?" oracle.
+//
+// We also produce a witness pattern for the non-exhaustive case. The
+// witness is built by `synth_witness(M, q)` which constructs a pattern
+// vector that is matched by some value not matched by M. It mirrors the
+// Useful recursion: when Σ is complete it picks a c whose specialization
+// is useful and recurses; when Σ is incomplete it picks any c ∉ Σ (or
+// PWild if Σ = {}).
+
+// Pick the first c ∈ all_ctors() such that c ∉ sigma. Returns Some(c)
+// otherwise (sigma is incomplete so such c exists). We use a stringly-
+// nullable encoding ("" = no name found) to keep the toy free of Option.
+let first_missing_ctor = fn (sigma: [ string ]) -> string do
+  return first_missing_go(cs: all_ctors(), sigma)
+end
+
+let first_missing_go = fn (cs: [ string ], sigma: [ string ]) -> string do
+  match cs do
+    | [] -> return ""
+    | c :: rest ->
+      if str_mem(s: c, xs: sigma) then
+        return first_missing_go(cs: rest, sigma)
+      end
+      return c
+  end
+end
+
+// Pick the first c ∈ all_ctors() whose specialization yields a useful
+// witness suffix. Returns Pair(left: name, right: useful_witness_suffix)
+// — name "" means "none". Used inside synth_witness when Σ is complete.
+let first_useful_ctor = fn (cs: [ string ], m: [ [ Pat ] ], qs: [ Pat ]) -> string do
+  match cs do
+    | [] -> return ""
+    | c :: rest ->
+      let a = ctor_arity(name: c)
+      let prefix = n_wilds(n: a, acc: [])
+      let q2 = list.concat(xs: prefix, ys: qs)
+      let m2 = specialize(c, m)
+      let okh = useful(m: m2, q: q2)
+      if okh then return c end
+      return first_useful_ctor(cs: rest, m, qs)
+  end
+end
+
+// synth_witness(M, q): returns a witness q' of the same shape as q (a
+// vector of patterns) such that q' is useful and concrete on col 0
+// where possible. Precondition: useful(M, q) = true.
+let synth_witness = fn (m: [ [ Pat ] ], q: [ Pat ]) -> [ Pat ] do
+  let n = n_cols(q)
+  if n == 0 then return [] end
+  match q do
+    | [] -> return []
+    | hd :: rest ->
+      match hd do
+        | PCtor(name: c, args: a) ->
+          let m2 = specialize(c, m)
+          let q2 = list.concat(xs: a, ys: rest)
+          let w2 = synth_witness(m: m2, q: q2)
+          // Re-fold: take the first arity(c) cells back into a PCtor(c, _).
+          let arc = ctor_arity(name: c)
+          let Pair(left: head_args, right: tail_qs) = split_at(n: arc, xs: w2, acc: [])
+          return PCtor(name: c, args: head_args) :: tail_qs
+        | _ ->
+          let sigma = col0_ctors(m)
+          if is_complete_sig(sigma) then
+            let cuse = first_useful_ctor(cs: all_ctors(), m, qs: rest)
+            // Σ complete and useful holds → some c has a useful
+            // specialization. (Caller's precondition.)
+            if cuse == "" then
+              // Defensive fallback — shouldn't be hit under the precondition.
+              return PWild :: rest
+            end
+            let a = ctor_arity(name: cuse)
+            let prefix = n_wilds(n: a, acc: [])
+            let q2 = list.concat(xs: prefix, ys: rest)
+            let m2 = specialize(c: cuse, m)
+            let w2 = synth_witness(m: m2, q: q2)
+            let Pair(left: head_args, right: tail_qs) = split_at(n: a, xs: w2, acc: [])
+            return PCtor(name: cuse, args: head_args) :: tail_qs
+          end
+          // Σ incomplete: pick a missing ctor and apply arity(c) wilds.
+          let cmis = first_missing_ctor(sigma)
+          if cmis == "" then
+            // Σ is empty: default suffices.
+            let m2 = default_mat(m)
+            let w2 = synth_witness(m: m2, q: rest)
+            return PWild :: w2
+          end
+          let a = ctor_arity(name: cmis)
+          let wilds = n_wilds(n: a, acc: [])
+          let m2 = default_mat(m)
+          let w2 = synth_witness(m: m2, q: rest)
+          return PCtor(name: cmis, args: wilds) :: w2
+      end
+  end
+end
+
+// Helper: split_at(n, xs) = Pair(first n, rest). Uses an accumulator
+// (reversed during construction, reversed back on exit).
+let split_at = fn (n: i64, xs: [ Pat ], acc: [ Pat ]) -> Pair<[ Pat ], [ Pat ]> do
+  if n <= 0 then
+    return Pair(left: list.reverse(xs: acc), right: xs)
+  end
+  match xs do
+    | [] -> return Pair(left: list.reverse(xs: acc), right: [])
+    | y :: rest -> return split_at(n: n - 1, xs: rest, acc: y :: acc)
+  end
+end
+
+// `exhaustive(M, n)` — Useful(M, [_; ...; _] of length n) = false.
+let exhaustive = fn (m: [ [ Pat ] ], n: i64) -> bool do
+  let q = n_wilds(n, acc: [])
+  let u = useful(m, q)
+  if u then return false end
+  return true
+end
+
+// ─── Pattern → Value coercion (wild ↦ VNil) for witness checking ──────────
+//
+// To check that a witness pattern w is uncovered by M, we coerce w to a
+// closed value by replacing every PWild / PVar with VNil. For PCtor(c, _)
+// at our two ctors:
+//   N() → VNil
+//   C(h, t) → VCons(coerce(h), coerce(t))
+//
+// This produces *one specific value* in the equivalence class of values
+// matching w. If M did not match w as a pattern, then M does not match
+// that specific value either (because the value is a refinement of w,
+// and PCtor patterns refine wilds — never broaden).
+
+let coerce_to_val = fn (p: Pat) -> Val do
+  match p do
+    | PWild -> return VNil
+    | PVar(name: _) -> return VNil
+    | PCtor(name: nm, args: a) ->
+      if nm == "N" then return VNil end
+      if nm == "C" then
+        match a do
+          | [] -> return VNil
+          | hp :: rest ->
+            match rest do
+              | [] -> return VCons(head: coerce_to_val(p: hp), tail: VNil)
+              | tp :: _ ->
+                return VCons(head: coerce_to_val(p: hp), tail: coerce_to_val(p: tp))
+            end
+        end
+      end
+      return VNil
+  end
+end
+
+// Coerce a witness vector q = [PCol0] (single column) to a value vector.
+let coerce_vec = fn (q: [ Pat ]) -> [ Val ] do
+  match q do
+    | [] -> return []
+    | p :: rest ->
+      let v = coerce_to_val(p)
+      let vs = coerce_vec(q: rest)
+      return v :: vs
+  end
+end
+
+// ─── Depth-bounded value enumeration (for P-Exh-Sound-Pos) ─────────────────
+//
+// All values of depth ≤ d:
+//   depth 0: { VNil }
+//   depth d: { VNil } ∪ { VCons(h, t) | depth(h) ≤ d-1, depth(t) ≤ d-1 }
+// (kept small — d=2 yields 1 + 2*2 + (1+2*2)^2 = 5 + 25 = 30 values.)
+
+let vals_at_depth_le = fn (d: i64) -> [ Val ] do
+  if d <= 0 then return [VNil] end
+  let smaller = vals_at_depth_le(d: d - 1)
+  let conses = build_conses(hs: smaller, ts: smaller, acc: [])
+  return VNil :: conses
+end
+
+let build_conses = fn (hs: [ Val ], ts: [ Val ], acc: [ Val ]) -> [ Val ] do
+  match hs do
+    | [] -> return list.reverse(xs: acc)
+    | h :: rest ->
+      let acc2 = pair_with_all(h, ts, acc)
+      return build_conses(hs: rest, ts, acc: acc2)
+  end
+end
+
+let pair_with_all = fn (h: Val, ts: [ Val ], acc: [ Val ]) -> [ Val ] do
+  match ts do
+    | [] -> return acc
+    | t :: rest ->
+      return pair_with_all(h, ts: rest, acc: VCons(head: h, tail: t) :: acc)
+  end
+end
+
+// For every v ∈ values, some row of M matches [v].
+let all_vals_covered_go = fn (vs: [ Val ], m: [ [ Pat ] ]) -> bool do
+  match vs do
+    | [] -> return true
+    | v :: rest ->
+      let okh = any_row_matches(m, v: [v])
+      if okh then
+        let okt = all_vals_covered_go(vs: rest, m)
+        return okt
+      end
+      return false
+  end
+end
+
+let all_vals_covered = fn (m: [ [ Pat ] ], depth: i64) -> bool do
+  let vs = vals_at_depth_le(d: depth)
+  return all_vals_covered_go(vs, m)
+end
+
+// ─── Renderers ─────────────────────────────────────────────────────────────
+
+let render_pat = fn (p: Pat) -> string do
+  match p do
+    | PWild -> return "_"
+    | PVar(name: n) -> return n
+    | PCtor(name: c, args: a) ->
+      if c == "N" then return "N" end
+      // C(h, t)
+      let parts = render_pats_csv(xs: a, acc: "")
+      return "C(" ++ parts ++ ")"
+  end
+end
+
+let render_pats_csv = fn (xs: [ Pat ], acc: string) -> string do
+  match xs do
+    | [] -> return acc
+    | p :: rest ->
+      let s = render_pat(p)
+      if str.length(s: acc) == 0 then
+        return render_pats_csv(xs: rest, acc: s)
+      end
+      return render_pats_csv(xs: rest, acc: acc ++ "," ++ s)
+  end
+end
+
+let render_row = fn (row: [ Pat ]) -> string do
+  return "[" ++ render_pats_csv(xs: row, acc: "") ++ "]"
+end
+
+let render_rows_csv = fn (m: [ [ Pat ] ], acc: string) -> string do
+  match m do
+    | [] -> return acc
+    | row :: rest ->
+      let s = render_row(row)
+      if str.length(s: acc) == 0 then
+        return render_rows_csv(m: rest, acc: s)
+      end
+      return render_rows_csv(m: rest, acc: acc ++ ";" ++ s)
+  end
+end
+
+let render_matrix = fn (m: [ [ Pat ] ]) -> string do
+  return "[" ++ render_rows_csv(m, acc: "") ++ "]"
+end
+
+// ─── Seed plumbing — xorshift64, same as the rest of the PBT fixtures ──────
+
+let abs_i64 = fn (n: i64) -> i64 do
+  if n < 0 then return 0 - n end
+  return n
+end
+
+let step_seed = fn (seed: i64) -> Pair<i64, i64> do
+  let xor_fixup : i64 = 2685821657736338717
+  let s0 = if seed == 0 then xor_fixup else seed end
+  let s1 = s0 ^ (s0 << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  return Pair(left: s3, right: s3)
+end
+
+// ─── Depth-bounded Pat generator ───────────────────────────────────────────
+//
+// At depth 0: emit one of {PWild, PVar("x"), PCtor("N", [])}.
+// At depth d: above plus PCtor("C", [sub, sub]) with sub @ depth d-1.
+
+let gen_pat_run = fn (depth: i64, seed: i64) -> Pair<Pat, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  if depth <= 0 then
+    let tag = raw % 3
+    if tag == 0 then return Pair(left: PWild, right: s1) end
+    if tag == 1 then return Pair(left: PVar(name: "x"), right: s1) end
+    return Pair(left: PCtor(name: "N", args: []), right: s1)
+  end
+  let tag = raw % 5
+  if tag == 0 then return Pair(left: PWild, right: s1) end
+  if tag == 1 then return Pair(left: PVar(name: "x"), right: s1) end
+  if tag == 2 then return Pair(left: PCtor(name: "N", args: []), right: s1) end
+  // PCtor("C", [h, t])
+  let Pair(left: h, right: s2) = gen_pat_run(depth: depth - 1, seed: s1)
+  let Pair(left: t, right: s3) = gen_pat_run(depth: depth - 1, seed: s2)
+  return Pair(left: PCtor(name: "C", args: [h, t]), right: s3)
+end
+
+// ─── Matrix generator (single column, 0..4 rows) ──────────────────────────
+
+let gen_rows_run = fn (n: i64, depth: i64, seed: i64, acc: [ [ Pat ] ]) -> Pair<[ [ Pat ] ], i64> do
+  if n <= 0 then
+    return Pair(left: list.reverse(xs: acc), right: seed)
+  end
+  let Pair(left: p, right: s1) = gen_pat_run(depth, seed)
+  return gen_rows_run(n: n - 1, depth, seed: s1, acc: [p] :: acc)
+end
+
+let gen_matrix_run = fn (depth: i64, seed: i64) -> Pair<[ [ Pat ] ], i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let n = abs_i64(n: v) % 5  // 0..4 rows
+  return gen_rows_run(n, depth, seed: s1, acc: [])
+end
+
+// ─── Row reordering (for P-Det1) ──────────────────────────────────────────
+//
+// Deterministic shuffle: split into evens / odds (by index) and concat
+// in the order odds ++ evens. This is a perfect permutation that's
+// non-trivial whenever the matrix has ≥ 2 rows.
+
+let split_even_odd_go = fn (m: [ [ Pat ] ], idx: i64, ev: [ [ Pat ] ], od: [ [ Pat ] ]) -> Pair<[ [ Pat ] ], [ [ Pat ] ]> do
+  match m do
+    | [] -> return Pair(left: list.reverse(xs: ev), right: list.reverse(xs: od))
+    | row :: rest ->
+      if (idx % 2) == 0 then
+        return split_even_odd_go(m: rest, idx: idx + 1, ev: row :: ev, od)
+      end
+      return split_even_odd_go(m: rest, idx: idx + 1, ev, od: row :: od)
+  end
+end
+
+let shuffle_rows = fn (m: [ [ Pat ] ]) -> [ [ Pat ] ] do
+  let Pair(left: ev, right: od) = split_even_odd_go(m, idx: 0, ev: [], od: [])
+  return list.concat(xs: od, ys: ev)
+end
+
+// ─── Body ──────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit require { Console } throws { Exn } do
+  let iters = 200
+
+  let gen_pat_local = Gen(
+    run: fn (seed: i64) -> Pair<Pat, i64> do return gen_pat_run(depth: 2, seed) end,
+    shrink: fn (v: Pat) -> [ Pat ] do return [] end,
+    render: render_pat
+  )
+
+  let gen_matrix_local = Gen(
+    run: fn (seed: i64) -> Pair<[ [ Pat ] ], i64> do return gen_matrix_run(depth: 2, seed) end,
+    shrink: fn (v: [ [ Pat ] ]) -> [ [ [ Pat ] ] ] do return [] end,
+    render: render_matrix
+  )
+
+  // ── P-Det1: useful(M, [_]) invariant under row reordering ───────────────
+  //
+  // Maranget's algorithm is *order-independent* on rows (set-semantics).
+  // We shuffle via split-even-odd (idempotent on length-≤1 matrices, a
+  // true permutation otherwise).
+  let prop_det_reorder = fn (x: [ [ Pat ] ]) -> bool do
+    let q = [PWild]
+    let lhs = useful(m: x, q)
+    let m2 = shuffle_rows(m: x)
+    let rhs = useful(m: m2, q)
+    let ok = lhs == rhs
+    return ok
+  end
+
+  let r_det1 = pbt.forall(g: gen_matrix_local, prop: prop_det_reorder, n: iters)
+  match r_det1 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P-Det1: useful(M, [_]) invariant under row reorder")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P-Det1 reorder-determinism failed: " ++ w)
+  end
+
+  // ── P-Det2: useful(M, [_]) is idempotent (same answer on two runs) ──────
+  let prop_det_idem = fn (x: [ [ Pat ] ]) -> bool do
+    let q = [PWild]
+    let a = useful(m: x, q)
+    let b = useful(m: x, q)
+    let ok = a == b
+    return ok
+  end
+
+  let r_det2 = pbt.forall(g: gen_matrix_local, prop: prop_det_idem, n: iters)
+  match r_det2 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P-Det2: useful is idempotent")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P-Det2 idempotency failed: " ++ w)
+  end
+
+  // ── P-Exh-AllWild: [[_]] is exhaustive at arity 1 ───────────────────────
+  let prop_exh_allwild = fn (x: i64) -> bool do
+    let m : [ [ Pat ] ] = [[PWild]]
+    let ok = exhaustive(m, n: 1)
+    return ok
+  end
+
+  let r_aw = pbt.forall(g: pbt.small_int, prop: prop_exh_allwild, n: iters)
+  match r_aw do
+    | Pass -> test_assert.assert_true(cond: true, label: "P-Exh-AllWild: [[_]] is exhaustive")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P-Exh-AllWild failed: " ++ w)
+  end
+
+  // ── P-Exh-Empty: [] is not exhaustive at arity 1, witness = [_] is useful ─
+  let prop_exh_empty = fn (x: i64) -> bool do
+    let m : [ [ Pat ] ] = []
+    let exh = exhaustive(m, n: 1)
+    if exh then return false end
+    let u = useful(m, q: [PWild])
+    let ok = u
+    return ok
+  end
+
+  let r_em = pbt.forall(g: pbt.small_int, prop: prop_exh_empty, n: iters)
+  match r_em do
+    | Pass -> test_assert.assert_true(cond: true, label: "P-Exh-Empty: [] is not exhaustive (witness [_] useful)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P-Exh-Empty failed: " ++ w)
+  end
+
+  // ── P-Exh-Sound-Pos: exhaustive(M) ⇒ ∀ depth-2 value v. some row matches [v] ─
+  //
+  // The depth-2 value enumeration is 30 values (1 + 4 + 25). If
+  // exhaustive(M) reports true, the soundness oracle must agree.
+  let prop_exh_sound_pos = fn (x: [ [ Pat ] ]) -> bool do
+    let exh = exhaustive(m: x, n: 1)
+    if exh == false then return true end  // vacuously
+    let ok = all_vals_covered(m: x, depth: 2)
+    return ok
+  end
+
+  let r_pos = pbt.forall(g: gen_matrix_local, prop: prop_exh_sound_pos, n: iters)
+  match r_pos do
+    | Pass -> test_assert.assert_true(cond: true, label: "P-Exh-Sound-Pos: exhaustive(M) ⇒ all depth-2 values covered")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P-Exh-Sound-Pos failed: " ++ w)
+  end
+
+  // ── P-Exh-Sound-Neg: ¬exhaustive(M) ⇒ synthesized witness is uncovered ──
+  //
+  // When useful(M, [_]) returns true, synth_witness gives back a vector
+  // [w]. Coerce w to a concrete value and check no row of M matches it.
+  let prop_exh_sound_neg = fn (x: [ [ Pat ] ]) -> bool do
+    let q = [PWild]
+    let u = useful(m: x, q)
+    if u == false then return true end  // vacuously: exhaustive
+    let w = synth_witness(m: x, q)
+    // Coerce the witness to a concrete value vector.
+    let vs = coerce_vec(q: w)
+    let covered = any_row_matches(m: x, v: vs)
+    let ok = covered == false
+    return ok
+  end
+
+  let r_neg = pbt.forall(g: gen_matrix_local, prop: prop_exh_sound_neg, n: iters)
+  match r_neg do
+    | Pass -> test_assert.assert_true(cond: true, label: "P-Exh-Sound-Neg: ¬exhaustive ⇒ witness uncovered")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P-Exh-Sound-Neg failed: " ++ w)
+  end
+
+  // ── P-Exh-Monotone: adding a row never decreases exhaustiveness ─────────
+  //
+  // M ⊆ M' (set-theoretically — M' = M ++ [extra_row]) ⇒
+  //   exhaustive(M) ⇒ exhaustive(M').
+  // The contrapositive — adding a row can only *fix* an exhaustiveness
+  // hole, never create one — is the spec-relevant direction.
+  let prop_exh_monotone = fn (x: [ [ Pat ] ]) -> bool do
+    let exh = exhaustive(m: x, n: 1)
+    if exh == false then return true end  // vacuous
+    // Append a wildcard row (the "weakest" row); exhaustiveness is preserved.
+    let m2 = list.concat(xs: x, ys: [[PWild]])
+    let ok = exhaustive(m: m2, n: 1)
+    return ok
+  end
+
+  let r_mon = pbt.forall(g: gen_matrix_local, prop: prop_exh_monotone, n: iters)
+  match r_mon do
+    | Pass -> test_assert.assert_true(cond: true, label: "P-Exh-Monotone: exhaustive(M) ⇒ exhaustive(M ++ [_])")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P-Exh-Monotone failed: " ++ w)
+  end
+
+  // ── P-Exh-RowEq: duplicating a row doesn't change exhaustiveness ────────
+  //
+  // Set-semantics on rows: M = M ∪ M (as a multiset, but useful is a
+  // function of the set of rows because duplicates don't add coverage).
+  let prop_exh_roweq = fn (x: [ [ Pat ] ]) -> bool do
+    let lhs = exhaustive(m: x, n: 1)
+    let m2 = list.concat(xs: x, ys: x)
+    let rhs = exhaustive(m: m2, n: 1)
+    let ok = lhs == rhs
+    return ok
+  end
+
+  let r_eq = pbt.forall(g: gen_matrix_local, prop: prop_exh_roweq, n: iters)
+  match r_eq do
+    | Pass -> test_assert.assert_true(cond: true, label: "P-Exh-RowEq: exhaustive(M) = exhaustive(M ++ M)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P-Exh-RowEq failed: " ++ w)
+  end
+
+  // ── P-Useful-Specialize: useful(M, PCtor(c,a)::qs) = useful(S(c,M), a++qs) ─
+  //
+  // Pick c = "N" (arity 0). q = [PCtor("N", [])] is a single-column
+  // probe. The law says useful agrees with the specialization step.
+  let prop_useful_spec = fn (x: [ [ Pat ] ]) -> bool do
+    let q = [PCtor(name: "N", args: [])]
+    let lhs = useful(m: x, q)
+    let m2 = specialize(c: "N", m: x)
+    // After specialize, q's PCtor("N", []) head is consumed and replaced
+    // by zero args, so the new q is [] (suffix of original q).
+    let rhs = useful(m: m2, q: [])
+    let ok = lhs == rhs
+    return ok
+  end
+
+  let r_us = pbt.forall(g: gen_matrix_local, prop: prop_useful_spec, n: iters)
+  match r_us do
+    | Pass -> test_assert.assert_true(cond: true, label: "P-Useful-Specialize: useful(M, [N])=useful(S(N,M), [])")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P-Useful-Specialize failed: " ++ w)
+  end
+
+  // ── P-Useful-Default: when col-0 head set is incomplete, useful(M, [_])
+  //    agrees with useful(D(M), []).
+  //
+  // We construct an explicitly incomplete matrix by filtering: take the
+  // input M and drop every row whose col-0 head is PCtor("C", _) — the
+  // remaining matrix has col-0 head set ⊆ {"N"}, hence incomplete. The
+  // default-step law then must hold on the filtered matrix.
+  let prop_useful_default = fn (x: [ [ Pat ] ]) -> bool do
+    let filtered = filter_no_c(m: x, acc: [])
+    let sigma = col0_ctors(m: filtered)
+    // sigma cannot contain "C" because we filtered them out; ensure
+    // sigma is also missing "N" or is otherwise non-empty incomplete —
+    // either way it's incomplete (since {"N","C"} is the full sig).
+    if is_complete_sig(sigma) then
+      // Defensive: filter should make this unreachable.
+      return true
+    end
+    let lhs = useful(m: filtered, q: [PWild])
+    let m2 = default_mat(m: filtered)
+    let rhs = useful(m: m2, q: [])
+    let ok = lhs == rhs
+    return ok
+  end
+
+  let r_ud = pbt.forall(g: gen_matrix_local, prop: prop_useful_default, n: iters)
+  match r_ud do
+    | Pass -> test_assert.assert_true(cond: true, label: "P-Useful-Default: useful(M, [_])=useful(D(M), []) on incomplete-Σ M")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P-Useful-Default failed: " ++ w)
+  end
+
+  return ()
+end
+
+// Helper used by P-Useful-Default: drop rows whose col-0 head is PCtor("C", _).
+let filter_no_c = fn (m: [ [ Pat ] ], acc: [ [ Pat ] ]) -> [ [ Pat ] ] do
+  match m do
+    | [] -> return list.reverse(xs: acc)
+    | row :: rest ->
+      match row do
+        | [] -> return filter_no_c(m: rest, acc)
+        | hd :: _ ->
+          match hd do
+            | PCtor(name: nm, args: _) ->
+              if nm == "C" then
+                return filter_no_c(m: rest, acc)
+              end
+              return filter_no_c(m: rest, acc: row :: acc)
+            | _ -> return filter_no_c(m: rest, acc: row :: acc)
+          end
+      end
+  end
+end
+
+let safe_run = fn () -> i64 require { Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
