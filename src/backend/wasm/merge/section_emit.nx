@@ -21,34 +21,35 @@ import { SlebRes, pack, pval, ppos, rd_uleb, rd_sleb, scan_sleb_end } from "src/
 import { op_end, op_ref_null, form_cont, vt_ref_null_ht, vt_ref_ht } from "src/backend/wasm/defs.nx"
 import { BufPos, RwCtx, intarr_get, rw_body } from "src/backend/wasm/merge/instruction_rewrite.nx"
 
-// Multi-return record for rd_str: parsed string + position after string bytes.
+/** Multi-return carrier for `rd_str`: the decoded string `s` and the byte position immediately after its bytes. */
 export type StrPos = StrPos(s: string, pos: i64)
 
 // ─── Section-info helpers ────────────────────────────────────────────────
-// Get packed section info (0 if section not present)
+
+/** Look up the packed `(offset, size)` info for wasm section id `sec` in a `scan_secs` map, returning 0 when the section is absent. */
 export let get_sec = fn (map: &StringMap, sec: i64) -> i64 do
   return sm.get_or(map, key: str.from_i64(val: sec), default: 0)
 end
-// Extract content offset from packed section info
+/** Extract the section-content offset from a packed section info value (the value half of `pack`). */
 export let sec_off = fn (pk: i64) -> i64 do return pval(pk) end
-// Extract section size from packed section info
+/** Extract the section size from a packed section info value (the position half of `pack`). */
 export let sec_sz = fn (pk: i64) -> i64 do return ppos(pk) end
 
-// Read the ULEB count at the start of a section (0 if section absent)
+/** Decode the leading ULEB128 element count of a wasm section identified by `sec_pk`; returns 0 when the section is absent. */
 export let count_sec = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
   if sec_pk == 0 then return 0 end
   return pval(pk: rd_uleb(buf, pos: sec_off(pk: sec_pk)))
 end
 
-// Position right after the section count ULEB
+/** Byte position immediately after the section's leading element-count ULEB — i.e. the cursor where the first entry's bytes start. Returns 0 for an absent section. */
 export let sec_body = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
   if sec_pk == 0 then return 0 end
   return ppos(pk: rd_uleb(buf, pos: sec_off(pk: sec_pk)))
 end
 
 // ─── String reading ───────────────────────────────────────────────────────
-// Read a WASM string (ULEB length + bytes). Returns parsed string + position
-// immediately after the string bytes.
+
+/** Read a wasm name string at `pos` (ULEB length + UTF-8 bytes) and return both the decoded string and the position past its bytes; allocates a temp `ByteBuffer` to materialise the string. */
 export let rd_str = fn (buf: &ByteBuffer, pos: i64) -> StrPos do
   let pk = rd_uleb(buf, pos)
   let len = pval(pk)
@@ -69,6 +70,7 @@ let skip_limits = fn (buf: &ByteBuffer, pos: i64) -> i64 do
   return ppos(pk: rd_uleb(buf, pos: ppos(pk)))
 end
 
+/** Advance past one table-section entry at `pos` (reftype byte — funcref/externref — or a `(ref-null) typeidx`, followed by a limits block). Returns the position after the entry. */
 export let skip_table_entry = fn (buf: &ByteBuffer, pos: i64) -> i64 do
   let rt = bb.get_byte(buf, idx: pos)
   if rt == 112 || rt == 111 then return skip_limits(buf, pos: pos + 1) end
@@ -76,6 +78,7 @@ export let skip_table_entry = fn (buf: &ByteBuffer, pos: i64) -> i64 do
   return skip_limits(buf, pos: after_tidx)
 end
 
+/** Copy `[pos, end_pos)` table-section entries from `src` into `buf`, adding `off` to each `typeidx` referenced by a `(ref-null) typeidx` entry. Untyped (funcref/externref) entries pass through with their limits block unchanged. */
 export let copy_table_entries_with_type_off = fn (buf: %ByteBuffer, src: &ByteBuffer, pos: i64, end_pos: i64, off: i64) -> %ByteBuffer do
   if pos >= end_pos then return %buf end
   let rt = bb.get_byte(buf: src, idx: pos)
@@ -92,7 +95,7 @@ export let copy_table_entries_with_type_off = fn (buf: %ByteBuffer, src: &ByteBu
   return copy_table_entries_with_type_off(%buf, src, pos: lim_end, end_pos, off)
 end
 
-// Skip an import descriptor; returns position after it
+/** Advance past one import descriptor at `pos` — dispatch on the kind byte (func/table/memory/global/tag) and skip the appropriate per-kind operands. Used by the import-rewrite walker to find the next entry's start. */
 export let skip_imp_desc = fn (buf: &ByteBuffer, pos: i64) -> i64 do
   let kind = bb.get_byte(buf, idx: pos)
   if kind == 0 then
@@ -118,18 +121,21 @@ end
 
 // ─── Section emitters ─────────────────────────────────────────────────────
 
+/** Emit one wasm section to `out`: section-id byte, ULEB content length, then the `content` body bytes. The lowest-level building block used by every per-section emitter. */
 export let emit_sec = fn (out: %ByteBuffer, sec_id: i64, content: &ByteBuffer) -> %ByteBuffer do
   let %out = bb.push_byte(buf: %out, byte: sec_id)
   let %out = bb.push_uleb128(buf: %out, val: bb.length(buf: content))
   return bb.push_buf(dst: %out, src: content)
 end
 
+/** Convenience over `emit_sec` for the common pattern of building a section's content in a scratch `ByteBuffer` and freeing it once the section is emitted. */
 export let emit_sec_and_free = fn (out: %ByteBuffer, sec_id: i64, tmp: %ByteBuffer) -> %ByteBuffer do
   let %out = emit_sec(%out, sec_id, content: &tmp)
   bb.free(buf: %tmp)
   return %out
 end
 
+/** Copy the section identified by `sec_pk` from `src` verbatim into `out` under section id `sec_id`. No-op when `sec_pk == 0` (section absent). Used for sections that need no per-entry transform. */
 export let copy_raw_sec = fn (out: %ByteBuffer, src: &ByteBuffer, sec_pk: i64, sec_id: i64) -> %ByteBuffer do
   if sec_pk == 0 then return %out end
   let off = sec_off(pk: sec_pk)
@@ -141,6 +147,7 @@ export let copy_raw_sec = fn (out: %ByteBuffer, src: &ByteBuffer, sec_pk: i64, s
   return %out
 end
 
+/** Append the body of section `sec_pk` (entries only — not the leading element-count ULEB) from `src` onto `buf`. Used when merging two sections into one and the caller has already written a combined count. */
 export let copy_sec_body = fn (buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
   if sec_pk > 0 then
     let body = sec_body(buf: src, sec_pk)
@@ -216,6 +223,7 @@ let copy_type_entries_with_off = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i6
   return copy_type_entries_with_off(%out, src, pos: next, remaining: remaining - 1, off)
 end
 
+/** Emit a merged wasm type section: main module's type entries first (their indices unchanged), then the dep's entries offset by `m_count` for every embedded heap-type reference. The single point where the type-index space gets laid out for the merge. */
 export let emit_merged_types_inline = fn (d_buf: &ByteBuffer, d_sec: i64, m_buf: &ByteBuffer, m_sec: i64, out: %ByteBuffer) -> %ByteBuffer do
   let %tmp = bb.empty()
   let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
@@ -230,6 +238,7 @@ export let emit_merged_types_inline = fn (d_buf: &ByteBuffer, d_sec: i64, m_buf:
   return %out
 end
 
+/** Copy `remaining` import entries from `buf` (starting at `pos`) into `out`, adding `type_off` to each function import's type-index ULEB. Non-func imports (table/memory/global/tag) pass through verbatim. */
 export let copy_imports_with_type_off = fn (out: %ByteBuffer, buf: &ByteBuffer,
     pos: i64, remaining: i64, type_off: i64) -> %ByteBuffer do
   if remaining <= 0 then return %out end
@@ -252,6 +261,7 @@ export let copy_imports_with_type_off = fn (out: %ByteBuffer, buf: &ByteBuffer,
     pos: pos4, remaining: remaining - 1, type_off)
 end
 
+/** Walk the wasm function section and emit each type-index ULEB with `off` added. Used when concatenating the main module's function section into the merged layout where its types live at a higher offset. */
 export let copy_func_types_with_off = fn (out: %ByteBuffer, buf: &ByteBuffer, sec_pk: i64, off: i64) -> %ByteBuffer do
   let pk = rd_uleb(buf, pos: sec_off(pk: sec_pk))
   let count = pval(pk)
@@ -264,6 +274,7 @@ let copy_func_types_go = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remai
   return copy_func_types_go(%out, buf, pos: ppos(pk), remaining: remaining - 1, off)
 end
 
+/** Emit a merged wasm global section: dep globals first (unchanged), then the main module's globals with each embedded type-index reference (in `vt_ref*` valtype slots or `ref.null` init exprs) bumped by `type_off`. */
 export let emit_merged_globals = fn (out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
     d_buf: &ByteBuffer, d_sec: i64, type_off: i64) -> %ByteBuffer do
   let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
@@ -315,6 +326,7 @@ let scan_to_end = fn (buf: &ByteBuffer, pos: i64) -> i64 do
   return scan_to_end(buf, pos: pos + 1)
 end
 
+/** Emit the main module's export section with each function-kind export's index remapped through `remap` (intarr from `instruction_rewrite`). Non-func exports keep their original index. */
 export let emit_remapped_exports = fn (out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
     remap: &ByteBuffer) -> %ByteBuffer do
   if m_sec == 0 then return %out end
@@ -349,6 +361,7 @@ let remap_export_entries = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64,
   return remap_export_entries(%out, buf, pos: pos3, remaining: remaining - 1, remap)
 end
 
+/** Run the per-function `rw_body` over every code-section entry in `src` (under the offsets and remap in `ctx`/`remap`), emitting the rewritten bodies into `buf`. No-op when `sec_pk == 0`. */
 export let maybe_rewrite_bodies = fn (ctx: RwCtx, remap: &ByteBuffer, buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64) -> %ByteBuffer do
   if sec_pk > 0 then
     return rewrite_code_bodies(ctx, remap, out: %buf, src, sec_pk)
@@ -356,6 +369,7 @@ export let maybe_rewrite_bodies = fn (ctx: RwCtx, remap: &ByteBuffer, buf: %Byte
   return %buf
 end
 
+/** Emit `n` placeholder function bodies (each: 0 locals + `unreachable`-ish 2-byte body + `end`) needed to keep the dep's function-index space dense when its imports are dropped. */
 export let emit_stub_bodies = fn (out: %ByteBuffer, i: i64, n: i64) -> %ByteBuffer do
   if i >= n then return %out end
   let %out = bb.push_uleb128(buf: %out, val: 3)
@@ -389,6 +403,7 @@ end
 
 // Find the highest data-segment end (offset + length) in a data section.
 // Returns 0 if no data segments.
+/** Scan all active data segments in section `sec_pk` and return the maximum `offset + length` — i.e. the first free byte past every dep data segment. Used as the relocation base when laying the main module's data section after the dep's. */
 export let find_data_end = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
   if sec_pk == 0 then return 0 end
   let pk = rd_uleb(buf, pos: sec_off(pk: sec_pk))
@@ -433,6 +448,7 @@ let copy_data_relocated_go = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64, r
   return copy_data_relocated_go(%out, src, pos: data_start + data_len, remaining: remaining - 1, reloc)
 end
 
+/** Emit a merged wasm data section: dep segments first (unchanged), then main-module segments with each active-segment `i32.const` offset relocated by `reloc` so they sit past the dep's data without overlap. */
 export let emit_merged_data = fn (out: %ByteBuffer, m_buf: &ByteBuffer, m_sec: i64,
     d_buf: &ByteBuffer, d_sec: i64, reloc: i64) -> %ByteBuffer do
   let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
@@ -454,6 +470,7 @@ let maybe_remap_elem = fn (buf: %ByteBuffer, src: &ByteBuffer, sec_pk: i64, rema
   return %buf
 end
 
+/** Emit a merged element section by appending both modules' element segments and remapping each embedded function index through its own per-module intarr (dep funcs via `remap_d`, main funcs via `remap_m`). */
 export let emit_merged_elements = fn (out: %ByteBuffer,
     d_buf: &ByteBuffer, d_sec: i64, remap_d: &ByteBuffer,
     m_buf: &ByteBuffer, m_sec: i64, remap_m: &ByteBuffer) -> %ByteBuffer do
@@ -501,6 +518,7 @@ let remap_elem_funcs = fn (out: %ByteBuffer, buf: &ByteBuffer, pos: i64, remaini
   return remap_elem_funcs(%out, buf, pos: ppos(pk), remaining: remaining - 1, remap)
 end
 
+/** Emit the tag section, adding `off` to each entry's function-type index. The attribute byte at offset 0 of each entry is preserved unchanged. */
 export let emit_tag_sec_with_off = fn (out: %ByteBuffer, buf: &ByteBuffer, sec_pk: i64, off: i64) -> %ByteBuffer do
   if sec_pk == 0 then return %out end
   let tag_count = count_sec(buf, sec_pk)
@@ -525,6 +543,7 @@ end
 // index ("0", "1", …) -> pack(content_start, sec_size). The special key
 // "__count" holds the total number of custom sections discovered.
 // `scan_secs` collapses all customs onto key="0", which is why we need this.
+/** Walk every wasm section in `buf` and record each id-0 custom section into an `StrMap<i64>` keyed by `"0"`, `"1"`, … with values `pack(content_start, sec_size)`. A `"__count"` key holds the total. Needed because the generic `scan_secs` collapses all customs onto a single key. */
 export let scan_custom_secs = fn (buf: &ByteBuffer) -> %StringMap do
   let %map = sm.empty()
   return scan_custom_go(buf, pos: 8, end_pos: bb.length(buf), %map, idx: 0)
@@ -689,6 +708,7 @@ end
 //   * others  → passed through byte-for-byte (DWARF, producers, target_features,
 //     etc.). For .debug_* this is a placeholder — PC-offset rewriting is only
 //     needed when codegen starts emitting DWARF (currently it does not).
+/** Emit every custom section in `customs` (the map from `scan_custom_secs`): the `"name"` section gets its function-index entries remapped through `remap`, every other custom (DWARF, producers, target_features, etc.) passes through byte-for-byte. */
 export let emit_preserved_customs = fn (out: %ByteBuffer, buf: &ByteBuffer, customs: &StringMap,
                                    remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
   let total = sm.get_or(map: customs, key: "__count", default: 0)
