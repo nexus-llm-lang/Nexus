@@ -1,19 +1,31 @@
 /**
  * ir_dump: machine-readable IR dumps for `nexus hir` / `nexus lir`.
  *
- * Issue nexus-ud6j V1. Two subcommands:
+ * Two subcommands:
  *   - `nexus hir <file> [--format=text|json]` — parses + lowers to HIR, prints.
  *   - `nexus lir <file> [--format=text|json]` — same, but through MIR→LIR.
  *
- * JSON shape: one JsonObject per top-level function with `{name, params,
- * ret_type, body_pp}`. The body is opaque-stringified through the inline
- * text pretty-printer below; full JSON expression trees are V2.
+ * JSON shape (V2, issue nexus-stj8): one JsonObject per top-level function
+ * with `{name, params, ret_type, span, body}`. `body` is itself a structured
+ * JSON expression tree (no opaque `body_pp` string) — each node carries
+ *   `{kind: "<VariantName>", <variant-flat-fields>, children: [...]}`
+ * where `children` holds sub-expr/sub-stmt nodes. Non-recursive payload
+ * (literal value, identifier strings, types as strings) sits as flat keys
+ * beside `kind`. Sub-lists with both a label and a child (call args, named
+ * record fields, match arms, handler arms) are emitted under
+ * purpose-specific keys (`args`, `fields`, `cases`, `arms`). Span objects
+ * are `{offset, line, col}`; patterns are non-spanned per types.nx and so
+ * omit `span`.
+ *
+ * V1 (issue nexus-ud6j) emitted `body_pp` as a stringified pretty-print;
+ * V2 deletes that field entirely so consumers walk the tree structurally.
  */
 
 import { Option, Some, None } from "std:option"
 import * as str from "std:str"
 import * as list from "std:list"
-import { JsonValue, JsonString, JsonArray, JsonObject, JsonField, JsonThrow }, * as json from "std:json"
+import { JsonValue, JsonString, JsonArray, JsonObject, JsonField, JsonThrow, JsonInt, JsonBool, JsonNull }, * as json from "std:json"
+import { Span } from "src/common/token.nx"
 import { Sigil, SigilImmutable, SigilMutable, SigilLinear, SigilBorrow, SigilLazy,
   BinaryOp, UnaryOp, Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit,
   TypeExpr } from "src/common/ast.nx"
@@ -360,14 +372,489 @@ let hir_params_to_json_go = fn (ps: [HirParam], acc: [JsonValue]) -> [JsonValue]
   end
 end
 
+// ─── HIR JSON expr/stmt walker (V2: structured tree) ───────────────────────
+
+/** Per-node shape used by the V2 IR-dump walker.
+ *
+ * Every emitted node is a JsonObject with at least:
+ *   - "kind": the variant name (e.g. "Literal", "BinOp", "Let", …)
+ *   - "children": JsonArray of sub-expr/sub-stmt JSON objects, in source order
+ *
+ * Non-recursive payload (variant names, identifier strings, literal values,
+ * span offsets, …) lives as flat keys alongside `kind`/`children`. Sub-lists
+ * that carry both a label and a child (call args, named record fields, match
+ * arms with their pattern, handler arms with arm-function name) are emitted
+ * as objects of their own under purpose-specific keys; the inner expr/stmt
+ * is itself the JSON node, threaded back into the same shape recursively.
+ *
+ * Span is included when cheaply available — HirExpr and HirStmt both carry
+ * one. Patterns are non-spanned (per types.nx) so we omit it there.
+ */
+
+let span_to_json = fn (sp: Span) -> JsonValue do
+  match sp do | Span(offset, line, col) ->
+    return JsonObject(fields: [
+      JsonField(key: "offset", value: JsonInt(val: offset)),
+      JsonField(key: "line", value: JsonInt(val: line)),
+      JsonField(key: "col", value: JsonInt(val: col))
+    ])
+  end
+end
+
+let literal_kind_str = fn (lit: Literal) -> string do
+  match lit do
+    | LitInt(val: _) -> return "Int"
+    | LitFloat(val: _) -> return "Float"
+    | LitBool(val: _) -> return "Bool"
+    | LitChar(val: _) -> return "Char"
+    | LitString(val: _) -> return "String"
+    | LitUnit -> return "Unit"
+  end
+end
+
+let literal_value_json = fn (lit: Literal) -> JsonValue do
+  match lit do
+    | LitInt(val) -> return JsonInt(val)
+    | LitFloat(val) -> return JsonString(val)
+    | LitBool(val) -> return JsonBool(val)
+    | LitChar(val) -> return JsonInt(val)
+    | LitString(val) -> return JsonString(val)
+    | LitUnit -> return JsonNull
+  end
+end
+
+let hir_exprs_to_json_go = fn (es: [HirExpr], acc: [JsonValue]) -> [JsonValue] do
+  match es do
+    | [] -> return list.reverse(xs: acc)
+    | e :: rest -> return hir_exprs_to_json_go(es: rest, acc: hir_expr_to_json(e) :: acc)
+  end
+end
+
+let hir_stmts_to_json_go = fn (ss: [HirStmt], acc: [JsonValue]) -> [JsonValue] do
+  match ss do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest -> return hir_stmts_to_json_go(ss: rest, acc: hir_stmt_to_json(s) :: acc)
+  end
+end
+
+let hir_call_args_to_json_go = fn (args: [HirCallArg], acc: [JsonValue]) -> [JsonValue] do
+  match args do
+    | [] -> return list.reverse(xs: acc)
+    | HirCallArg(label, value: v) :: rest ->
+      let obj = JsonObject(fields: [
+        JsonField(key: "label", value: JsonString(val: label)),
+        JsonField(key: "value", value: hir_expr_to_json(e: v))
+      ])
+      return hir_call_args_to_json_go(args: rest, acc: obj :: acc)
+  end
+end
+
+let hir_named_exprs_to_json_go = fn (fs: [HirNamedExpr], acc: [JsonValue]) -> [JsonValue] do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | HirNamedExpr(name, value: v) :: rest ->
+      let obj = JsonObject(fields: [
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "value", value: hir_expr_to_json(e: v))
+      ])
+      return hir_named_exprs_to_json_go(fs: rest, acc: obj :: acc)
+  end
+end
+
+let hir_pattern_fields_to_json_go = fn (fs: [HirPatternField], acc: [JsonValue]) -> [JsonValue] do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | HirPatternField(name, pattern: p) :: rest ->
+      let name_v = match name do
+        | Some(val: n) -> JsonString(val: n)
+        | None -> JsonNull
+      end
+      let obj = JsonObject(fields: [
+        JsonField(key: "name", value: name_v),
+        JsonField(key: "pattern", value: hir_pattern_to_json(p))
+      ])
+      return hir_pattern_fields_to_json_go(fs: rest, acc: obj :: acc)
+  end
+end
+
+let hir_record_pat_fields_to_json_go = fn (fs: [HirRecordPatField], acc: [JsonValue]) -> [JsonValue] do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | HirRecordPatField(name, pattern: p) :: rest ->
+      let obj = JsonObject(fields: [
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "pattern", value: hir_pattern_to_json(p))
+      ])
+      return hir_record_pat_fields_to_json_go(fs: rest, acc: obj :: acc)
+  end
+end
+
+let hir_pattern_alts_to_json_go = fn (alts: [HirPatternKind], acc: [JsonValue]) -> [JsonValue] do
+  match alts do
+    | [] -> return list.reverse(xs: acc)
+    | a :: rest -> return hir_pattern_alts_to_json_go(alts: rest, acc: hir_pattern_to_json(p: a) :: acc)
+  end
+end
+
+let hir_pattern_to_json = fn (p: HirPatternKind) -> JsonValue do
+  match p do
+    | PLit(lit) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "PLit")),
+        JsonField(key: "lit_kind", value: JsonString(val: literal_kind_str(lit))),
+        JsonField(key: "value", value: literal_value_json(lit)),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | PVar(name, sigil) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "PVar")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | PCtor(variant, fields, sigil) ->
+      let fs_json = JsonArray(items: hir_pattern_fields_to_json_go(fs: fields, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "PCtor")),
+        JsonField(key: "variant", value: JsonString(val: variant)),
+        JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+        JsonField(key: "fields", value: fs_json),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | PRec(fields, is_partial) ->
+      let fs_json = JsonArray(items: hir_record_pat_fields_to_json_go(fs: fields, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "PRec")),
+        JsonField(key: "is_partial", value: JsonBool(val: is_partial)),
+        JsonField(key: "fields", value: fs_json),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | PWild ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "PWild")),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | POr(alts) ->
+      let alts_json = JsonArray(items: hir_pattern_alts_to_json_go(alts, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "POr")),
+        JsonField(key: "alts", value: alts_json),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+  end
+end
+
+let hir_match_cases_to_json_go = fn (cs: [HirMatchCase], acc: [JsonValue]) -> [JsonValue] do
+  match cs do
+    | [] -> return list.reverse(xs: acc)
+    | HirMatchCase(pattern, body) :: rest ->
+      let body_json = JsonArray(items: hir_stmts_to_json_go(ss: body, acc: []))
+      let obj = JsonObject(fields: [
+        JsonField(key: "pattern", value: hir_pattern_to_json(p: pattern)),
+        JsonField(key: "body", value: body_json)
+      ])
+      return hir_match_cases_to_json_go(cs: rest, acc: obj :: acc)
+  end
+end
+
+let hir_handler_arms_to_json_go = fn (arms: [HirHandlerArm], acc: [JsonValue]) -> [JsonValue] do
+  match arms do
+    | [] -> return list.reverse(xs: acc)
+    | HirHandlerArm(arm: HirFunction(name, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span: _, file: _), cont_binder) :: rest ->
+      let cb = match cont_binder do
+        | Some(val: n) -> JsonString(val: n)
+        | None -> JsonNull
+      end
+      let obj = JsonObject(fields: [
+        JsonField(key: "arm_name", value: JsonString(val: name)),
+        JsonField(key: "cont_binder", value: cb)
+      ])
+      return hir_handler_arms_to_json_go(arms: rest, acc: obj :: acc)
+  end
+end
+
+let hir_expr_to_json = fn (e: HirExpr) -> JsonValue do
+  match e do | HirExpr(node, span) ->
+    let sp_json = span_to_json(sp: span)
+    match node do
+      | Literal(lit) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Literal")),
+          JsonField(key: "lit_kind", value: JsonString(val: literal_kind_str(lit))),
+          JsonField(key: "value", value: literal_value_json(lit)),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | Variable(name, sigil) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Variable")),
+          JsonField(key: "name", value: JsonString(val: name)),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | BinOp(left, op, right) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "BinOp")),
+          JsonField(key: "op", value: JsonString(val: binop_to_str(op))),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [
+            hir_expr_to_json(e: left),
+            hir_expr_to_json(e: right)
+          ]))
+        ])
+      | UnOp(op, operand) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "UnOp")),
+          JsonField(key: "op", value: JsonString(val: unop_to_str(op))),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [hir_expr_to_json(e: operand)]))
+        ])
+      | Borrow(name, sigil) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Borrow")),
+          JsonField(key: "name", value: JsonString(val: name)),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | Call(func, args) ->
+        let args_json = JsonArray(items: hir_call_args_to_json_go(args, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Call")),
+          JsonField(key: "func", value: JsonString(val: func)),
+          JsonField(key: "args", value: args_json),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | Ctor(variant, args, sigil) ->
+        let args_json = JsonArray(items: hir_exprs_to_json_go(es: args, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Ctor")),
+          JsonField(key: "variant", value: JsonString(val: variant)),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: args_json)
+        ])
+      | Record(fields) ->
+        let fs_json = JsonArray(items: hir_named_exprs_to_json_go(fs: fields, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Record")),
+          JsonField(key: "fields", value: fs_json),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | Array(elems) ->
+        let es_json = JsonArray(items: hir_exprs_to_json_go(es: elems, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Array")),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: es_json)
+        ])
+      | Index(target, index) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Index")),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [
+            hir_expr_to_json(e: target),
+            hir_expr_to_json(e: index)
+          ]))
+        ])
+      | FieldAccess(target, field) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "FieldAccess")),
+          JsonField(key: "field", value: JsonString(val: field)),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [hir_expr_to_json(e: target)]))
+        ])
+      | If(cond, then_branch, else_branch) ->
+        let then_json = JsonArray(items: hir_stmts_to_json_go(ss: then_branch, acc: []))
+        let else_json = match else_branch do
+          | Some(val: eb) -> JsonArray(items: hir_stmts_to_json_go(ss: eb, acc: []))
+          | None -> JsonNull
+        end
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "If")),
+          JsonField(key: "then_branch", value: then_json),
+          JsonField(key: "else_branch", value: else_json),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [hir_expr_to_json(e: cond)]))
+        ])
+      | Match(target, cases) ->
+        let cs_json = JsonArray(items: hir_match_cases_to_json_go(cs: cases, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Match")),
+          JsonField(key: "cases", value: cs_json),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [hir_expr_to_json(e: target)]))
+        ])
+      | While(cond, body) ->
+        let body_json = JsonArray(items: hir_stmts_to_json_go(ss: body, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "While")),
+          JsonField(key: "body", value: body_json),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [hir_expr_to_json(e: cond)]))
+        ])
+      | For(var, start, end_expr, body) ->
+        let body_json = JsonArray(items: hir_stmts_to_json_go(ss: body, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "For")),
+          JsonField(key: "var", value: JsonString(val: var)),
+          JsonField(key: "body", value: body_json),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [
+            hir_expr_to_json(e: start),
+            hir_expr_to_json(e: end_expr)
+          ]))
+        ])
+      | Lambda(type_params: _, params, ret_type, body) ->
+        let ps_json = JsonArray(items: hir_params_to_json_go(ps: params, acc: []))
+        let body_json = JsonArray(items: hir_stmts_to_json_go(ss: body, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Lambda")),
+          JsonField(key: "params", value: ps_json),
+          JsonField(key: "ret_type", value: JsonString(val: type_to_string(typ: ret_type))),
+          JsonField(key: "body", value: body_json),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | Raise(expr) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Raise")),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [hir_expr_to_json(e: expr)]))
+        ])
+      | Force(expr) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Force")),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [hir_expr_to_json(e: expr)]))
+        ])
+      | Thunk(body) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Thunk")),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [hir_expr_to_json(e: body)]))
+        ])
+      | ExternalRef(symbol, type_params: _, arg_names: _, typ) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExternalRef")),
+          JsonField(key: "symbol", value: JsonString(val: symbol)),
+          JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | Handler(port_name, arms) ->
+        let arms_json = JsonArray(items: hir_handler_arms_to_json_go(arms, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Handler")),
+          JsonField(key: "port_name", value: JsonString(val: port_name)),
+          JsonField(key: "arms", value: arms_json),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+    end
+  end
+end
+
+let hir_stmt_to_json = fn (s: HirStmt) -> JsonValue do
+  match s do | HirStmt(node, span) ->
+    let sp_json = span_to_json(sp: span)
+    match node do
+      | Let(name, sigil, typ, value) ->
+        let ty_v = match typ do
+          | Some(val: t) -> JsonString(val: type_to_string(typ: t))
+          | None -> JsonNull
+        end
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Let")),
+          JsonField(key: "name", value: JsonString(val: name)),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "type", value: ty_v),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [hir_expr_to_json(e: value)]))
+        ])
+      | Expr(expr) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Expr")),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [hir_expr_to_json(e: expr)]))
+        ])
+      | Return(expr) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Return")),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [hir_expr_to_json(e: expr)]))
+        ])
+      | Assign(target, value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Assign")),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: [
+            hir_expr_to_json(e: target),
+            hir_expr_to_json(e: value)
+          ]))
+        ])
+      | Try(body, catch_param, catch_body) ->
+        let body_json = JsonArray(items: hir_stmts_to_json_go(ss: body, acc: []))
+        let catch_json = JsonArray(items: hir_stmts_to_json_go(ss: catch_body, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Try")),
+          JsonField(key: "catch_param", value: JsonString(val: catch_param)),
+          JsonField(key: "body", value: body_json),
+          JsonField(key: "catch_body", value: catch_json),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | Inject(handlers, body) ->
+        let hs_json = JsonArray(items: strings_to_json_go(xs: handlers, acc: []))
+        let body_json = JsonArray(items: hir_stmts_to_json_go(ss: body, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Inject")),
+          JsonField(key: "handlers", value: hs_json),
+          JsonField(key: "body", value: body_json),
+          JsonField(key: "span", value: sp_json),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+    end
+  end
+end
+
+let strings_to_json_go = fn (xs: [string], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest -> return strings_to_json_go(xs: rest, acc: JsonString(val: s) :: acc)
+  end
+end
+
+let hir_body_to_json = fn (body: HirBody) -> JsonValue do
+  match body do
+    | EagerBody(stmts) ->
+      let stmts_json = JsonArray(items: hir_stmts_to_json_go(ss: stmts, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "EagerBody")),
+        JsonField(key: "stmts", value: stmts_json),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LazyBody(ast_expr: _, entries: _) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LazyBody")),
+        JsonField(key: "note", value: JsonString(val: "AST-level body, deferred convert_expr")),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+  end
+end
+
 let hir_func_to_json = fn (f: HirFunction) -> JsonValue do
-  match f do | HirFunction(name, type_params: _, params, ret_type, throw_row: _, body, span: _, file: _) ->
+  match f do | HirFunction(name, type_params: _, params, ret_type, throw_row: _, body, span, file: _) ->
     let ps_json = JsonArray(items: hir_params_to_json_go(ps: params, acc: []))
     return JsonObject(fields: [
       JsonField(key: "name", value: JsonString(val: name)),
       JsonField(key: "params", value: ps_json),
       JsonField(key: "ret_type", value: JsonString(val: type_to_string(typ: ret_type))),
-      JsonField(key: "body_pp", value: JsonString(val: hir_body_to_str(body)))
+      JsonField(key: "span", value: span_to_json(sp: span)),
+      JsonField(key: "body", value: hir_body_to_json(body))
     ])
   end
 end
@@ -560,14 +1047,339 @@ let lir_params_to_json_go = fn (ps: [LirParam], acc: [JsonValue]) -> [JsonValue]
   end
 end
 
+// ─── LIR JSON expr/stmt walker (V2: structured tree) ───────────────────────
+//
+// Shape mirrors the HIR walker: each node is a JsonObject with
+//   - "kind": variant name
+//   - "children": sub-stmt/sub-expr nodes (LIR sub-children that route
+//     structurally to other expr/stmt nodes; atoms are emitted as flat
+//     fields beside `kind`).
+// LIR atoms are leaves (no sub-expr), so we serialise them as
+// `{kind: "<AtomVariant>", ...payload}` JsonObjects under purpose-specific
+// keys (`lhs`/`rhs`/`atom`/`value`/`cond`/`closure`/`payload`/`cont`/`captures`).
+
+let lir_atom_to_json = fn (a: LirAtom) -> JsonValue do
+  match a do
+    | LirAtomVar(name, typ) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirAtomVar")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ)))
+      ])
+    | LirAtomInt(val) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirAtomInt")),
+        JsonField(key: "value", value: JsonInt(val))
+      ])
+    | LirAtomFloat(val) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirAtomFloat")),
+        JsonField(key: "value", value: JsonString(val))
+      ])
+    | LirAtomBool(val) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirAtomBool")),
+        JsonField(key: "value", value: JsonBool(val))
+      ])
+    | LirAtomChar(val) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirAtomChar")),
+        JsonField(key: "value", value: JsonInt(val))
+      ])
+    | LirAtomString(val) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirAtomString")),
+        JsonField(key: "value", value: JsonString(val))
+      ])
+    | LirAtomUnit ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirAtomUnit"))
+      ])
+  end
+end
+
+let lir_atoms_to_json_go = fn (xs: [LirAtom], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | a :: rest -> return lir_atoms_to_json_go(xs: rest, acc: lir_atom_to_json(a) :: acc)
+  end
+end
+
+let lir_call_args_to_json_go = fn (args: [LirCallArg], acc: [JsonValue]) -> [JsonValue] do
+  match args do
+    | [] -> return list.reverse(xs: acc)
+    | LirCallArg(label, value) :: rest ->
+      let obj = JsonObject(fields: [
+        JsonField(key: "label", value: JsonString(val: label)),
+        JsonField(key: "value", value: lir_atom_to_json(a: value))
+      ])
+      return lir_call_args_to_json_go(args: rest, acc: obj :: acc)
+  end
+end
+
+let lir_named_atoms_to_json_go = fn (fs: [LirNamedAtom], acc: [JsonValue]) -> [JsonValue] do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | LirNamedAtom(name, value) :: rest ->
+      let obj = JsonObject(fields: [
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "value", value: lir_atom_to_json(a: value))
+      ])
+      return lir_named_atoms_to_json_go(fs: rest, acc: obj :: acc)
+  end
+end
+
+let lir_arm_pairs_to_json_go = fn (fns: [string], tags: [string], acc: [JsonValue]) -> [JsonValue] do
+  match fns do
+    | [] -> return list.reverse(xs: acc)
+    | f :: rest_f ->
+      match tags do
+        | [] ->
+          let obj = JsonObject(fields: [
+            JsonField(key: "tag", value: JsonNull),
+            JsonField(key: "func", value: JsonString(val: f))
+          ])
+          return lir_arm_pairs_to_json_go(fns: rest_f, tags: [], acc: obj :: acc)
+        | t :: rest_t ->
+          let obj = JsonObject(fields: [
+            JsonField(key: "tag", value: JsonString(val: t)),
+            JsonField(key: "func", value: JsonString(val: f))
+          ])
+          return lir_arm_pairs_to_json_go(fns: rest_f, tags: rest_t, acc: obj :: acc)
+      end
+  end
+end
+
+let lir_expr_to_json = fn (e: LirExpr) -> JsonValue do
+  match e do
+    | LirExprAtom(atom) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprAtom")),
+        JsonField(key: "atom", value: lir_atom_to_json(a: atom)),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprBinary(op, lhs, rhs, typ) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprBinary")),
+        JsonField(key: "op", value: JsonString(val: binop_to_str(op))),
+        JsonField(key: "lhs", value: lir_atom_to_json(a: lhs)),
+        JsonField(key: "rhs", value: lir_atom_to_json(a: rhs)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprCall(func, args, typ) ->
+      let args_json = JsonArray(items: lir_call_args_to_json_go(args, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprCall")),
+        JsonField(key: "func", value: JsonString(val: func)),
+        JsonField(key: "args", value: args_json),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprTailCall(func, args, typ) ->
+      let args_json = JsonArray(items: lir_call_args_to_json_go(args, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprTailCall")),
+        JsonField(key: "func", value: JsonString(val: func)),
+        JsonField(key: "args", value: args_json),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprConstructor(name, args, typ) ->
+      let args_json = JsonArray(items: lir_atoms_to_json_go(xs: args, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprConstructor")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "args", value: args_json),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprRecord(fields, typ) ->
+      let fs_json = JsonArray(items: lir_named_atoms_to_json_go(fs: fields, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprRecord")),
+        JsonField(key: "fields", value: fs_json),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprObjectTag(value, typ) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprObjectTag")),
+        JsonField(key: "value", value: lir_atom_to_json(a: value)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprObjectField(value, index, typ) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprObjectField")),
+        JsonField(key: "value", value: lir_atom_to_json(a: value)),
+        JsonField(key: "index", value: JsonInt(val: index)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprRaise(value, typ) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprRaise")),
+        JsonField(key: "value", value: lir_atom_to_json(a: value)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprForce(value, typ) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprForce")),
+        JsonField(key: "value", value: lir_atom_to_json(a: value)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprMakeClosure(func_name, captures, typ) ->
+      let caps_json = JsonArray(items: lir_atoms_to_json_go(xs: captures, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprMakeClosure")),
+        JsonField(key: "func_name", value: JsonString(val: func_name)),
+        JsonField(key: "captures", value: caps_json),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprCallClosure(closure, args, typ) ->
+      let args_json = JsonArray(items: lir_call_args_to_json_go(args, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprCallClosure")),
+        JsonField(key: "closure", value: lir_atom_to_json(a: closure)),
+        JsonField(key: "args", value: args_json),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprSuspend(tag_name, payload, typ) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprSuspend")),
+        JsonField(key: "tag_name", value: JsonString(val: tag_name)),
+        JsonField(key: "payload", value: lir_atom_to_json(a: payload)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprResume(cont, value, typ) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprResume")),
+        JsonField(key: "cont", value: lir_atom_to_json(a: cont)),
+        JsonField(key: "value", value: lir_atom_to_json(a: value)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprContNew(func_ref, typ) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprContNew")),
+        JsonField(key: "func_ref", value: JsonString(val: func_ref)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirExprInjectResume(body_fn, arm_fns, arm_tags, typ) ->
+      let arms_json = JsonArray(items: lir_arm_pairs_to_json_go(fns: arm_fns, tags: arm_tags, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirExprInjectResume")),
+        JsonField(key: "body_fn", value: JsonString(val: body_fn)),
+        JsonField(key: "arms", value: arms_json),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+  end
+end
+
+let lir_stmts_to_json_go = fn (stmts: [LirStmt], acc: [JsonValue]) -> [JsonValue] do
+  match stmts do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest -> return lir_stmts_to_json_go(stmts: rest, acc: lir_stmt_to_json(s) :: acc)
+  end
+end
+
+let lir_stmt_to_json = fn (s: LirStmt) -> JsonValue do
+  match s do
+    | LirStmtLet(name, typ, expr) ->
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirStmtLet")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: [lir_expr_to_json(e: expr)]))
+      ])
+    | LirStmtIf(cond, then_body, else_body) ->
+      let then_json = JsonArray(items: lir_stmts_to_json_go(stmts: then_body, acc: []))
+      let else_json = JsonArray(items: lir_stmts_to_json_go(stmts: else_body, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirStmtIf")),
+        JsonField(key: "cond", value: lir_atom_to_json(a: cond)),
+        JsonField(key: "then_body", value: then_json),
+        JsonField(key: "else_body", value: else_json),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirStmtIfReturn(cond, then_body, then_ret, else_body, else_ret, ret_type) ->
+      let then_json = JsonArray(items: lir_stmts_to_json_go(stmts: then_body, acc: []))
+      let else_json = JsonArray(items: lir_stmts_to_json_go(stmts: else_body, acc: []))
+      let else_ret_v = match else_ret do
+        | Some(val: v) -> lir_atom_to_json(a: v)
+        | None -> JsonNull
+      end
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirStmtIfReturn")),
+        JsonField(key: "cond", value: lir_atom_to_json(a: cond)),
+        JsonField(key: "then_body", value: then_json),
+        JsonField(key: "then_ret", value: lir_atom_to_json(a: then_ret)),
+        JsonField(key: "else_body", value: else_json),
+        JsonField(key: "else_ret", value: else_ret_v),
+        JsonField(key: "ret_type", value: JsonString(val: type_to_string(typ: ret_type))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirStmtLoop(cond_stmts, cond, body) ->
+      let cs_json = JsonArray(items: lir_stmts_to_json_go(stmts: cond_stmts, acc: []))
+      let body_json = JsonArray(items: lir_stmts_to_json_go(stmts: body, acc: []))
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirStmtLoop")),
+        JsonField(key: "cond_stmts", value: cs_json),
+        JsonField(key: "cond", value: lir_atom_to_json(a: cond)),
+        JsonField(key: "body", value: body_json),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+    | LirStmtTryCatch(body, body_ret, catch_param, catch_param_typ, catch_body, catch_ret) ->
+      let body_json = JsonArray(items: lir_stmts_to_json_go(stmts: body, acc: []))
+      let catch_json = JsonArray(items: lir_stmts_to_json_go(stmts: catch_body, acc: []))
+      let body_ret_v = match body_ret do
+        | Some(val: v) -> lir_atom_to_json(a: v)
+        | None -> JsonNull
+      end
+      let catch_ret_v = match catch_ret do
+        | Some(val: v) -> lir_atom_to_json(a: v)
+        | None -> JsonNull
+      end
+      return JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "LirStmtTryCatch")),
+        JsonField(key: "body", value: body_json),
+        JsonField(key: "body_ret", value: body_ret_v),
+        JsonField(key: "catch_param", value: JsonString(val: catch_param)),
+        JsonField(key: "catch_param_type", value: JsonString(val: type_to_string(typ: catch_param_typ))),
+        JsonField(key: "catch_body", value: catch_json),
+        JsonField(key: "catch_ret", value: catch_ret_v),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+  end
+end
+
+let lir_func_body_to_json = fn (f: LirFunction) -> JsonValue do
+  match f do | LirFunction(name: _, params: _, ret_type: _, body, ret, span: _) ->
+    let body_json = JsonArray(items: lir_stmts_to_json_go(stmts: body, acc: []))
+    return JsonObject(fields: [
+      JsonField(key: "stmts", value: body_json),
+      JsonField(key: "ret", value: lir_atom_to_json(a: ret))
+    ])
+  end
+end
+
 let lir_func_to_json = fn (f: LirFunction) -> JsonValue do
-  match f do | LirFunction(name, params, ret_type, body: _, ret: _, span: _) ->
+  match f do | LirFunction(name, params, ret_type, body: _, ret: _, span) ->
     let ps_json = JsonArray(items: lir_params_to_json_go(ps: params, acc: []))
     return JsonObject(fields: [
       JsonField(key: "name", value: JsonString(val: name)),
       JsonField(key: "params", value: ps_json),
       JsonField(key: "ret_type", value: JsonString(val: type_to_string(typ: ret_type))),
-      JsonField(key: "body_pp", value: JsonString(val: lir_func_body_to_str(f)))
+      JsonField(key: "span", value: span_to_json(sp: span)),
+      JsonField(key: "body", value: lir_func_body_to_json(f))
     ])
   end
 end
