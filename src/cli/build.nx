@@ -1,0 +1,163 @@
+/**
+ * cli/build: The `nexus fix` subcommand runner.
+ *
+ * Runs the front-end pipeline against each file, catches the first
+ * fix-able diagnostic (LazyBindingUnused / LinearUnused), and either
+ * reports the suggested rewrite (--check), rewrites the file in place
+ * looping until no further fix-its appear (--write), or prints a
+ * before/after view (--diff).
+ */
+
+import * as lexer from "src/frontend/lexer.nx"
+import { ParseDiagnostics }, * as parser from "src/frontend/parser.nx"
+import { InvalidUsage, ParseErrorsCollected, LazyBindingUnused, LinearUnused }, * as err from "src/common/error.nx"
+import { Span } from "src/common/token.nx"
+import { iterative_resolve, resolve_all_lazy_no_filter } from "src/ir/hir/demand.nx"
+import * as main_wrap from "src/ir/main_wrap.nx"
+import { HirProgram } from "src/ir/hir/types.nx"
+import * as hir from "src/ir/hir/hir.nx"
+import * as linearity from "src/ir/linearity.nx"
+import * as tc from "src/typecheck/check.nx"
+import * as tc_linearity from "src/typecheck/linearity.nx"
+import {
+  FixOptions, FixMode, ModeCheck, ModeWrite, ModeDiff, Fixit,
+  strip_fix_subcommand, ParsedFixSubcommand, parse_fix_options, fixit_for_code, fixit_for_exn, apply_fixit,
+  format_check_line, format_diff_block, slice_old_text, fix_usage
+} from "src/tools/fix.nx"
+import { Fs }, * as fs_mod from "std:fs"
+import { Console }, * as stdio from "std:stdio"
+import { Clock }, * as clock_mod from "std:clock"
+import * as list from "std:list"
+import * as str from "std:str"
+import { HirBuildResult, build_hir, extract_function_names } from "src/pipeline.nx"
+import { get_defs } from "src/ir/imports.nx"
+
+let fix_max_passes = fn () -> i64 do return 32 end
+
+/** Outcome of one front-end pass against `src`. */
+type FixOutcome = FixOk | FixSkipped(message: string) | FixApplied(src: string, sp: Span, fix: Fixit)
+
+// Run parse + HIR + linearity + typecheck against `src` (no codegen).
+let typecheck_for_fix = fn (src: string, input_path: string, verbose: bool) -> FixOutcome require { Console, Fs } do
+  try
+    let tokens = lexer.tokenize(src)
+    let ParseDiagnostics(prog: prog, diags: parse_diags) = parser.parse_collect(tokens, file: input_path)
+    let n_parse_diags = list.length(xs: parse_diags)
+    if n_parse_diags > 0 then
+      raise ParseErrorsCollected(count: n_parse_diags)
+    end
+    let HirBuildResult(program: hir_raw, import_cache: _) = build_hir(prog, source_file: input_path, verbose)
+    let hir_resolved = match hir_raw do
+      | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
+        let resolved = resolve_all_lazy_no_filter(funcs: hf)
+        let expanded_fs = hir.expand_groups_in_functions(funcs: resolved, groups: heg)
+        let expanded_hb = hir.expand_groups_in_handler_bindings(bindings: hb, groups: heg)
+        HirProgram(ports: hp, functions: expanded_fs, externals: he, handler_bindings: expanded_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
+    end
+    let hir_wrapped = main_wrap.wrap_main_if_needed(prog: hir_resolved)
+    linearity.check_program(prog: hir_wrapped)
+    let local_names = main_wrap.user_main_name() :: extract_function_names(defs: get_defs(prog), source: input_path)
+    let hir_checked = tc.check_program(hir: hir_wrapped, local_names, require_main: false)
+    tc_linearity.check_program(prog: hir_checked)
+    return FixOk
+  catch e ->
+    match e do
+      | LazyBindingUnused(name: _, span: sp) ->
+        match fixit_for_exn(src, err: e) do
+          | Some(val: fix) -> return FixApplied(src, sp, fix)
+          | None -> return FixSkipped(message: err.format_error(err: e))
+        end
+      | LinearUnused(name: _, span: sp) ->
+        match fixit_for_exn(src, err: e) do
+          | Some(val: fix) -> return FixApplied(src, sp, fix)
+          | None -> return FixSkipped(message: err.format_error(err: e))
+        end
+      | _ -> return FixSkipped(message: err.format_error(err: e))
+    end
+  end
+end
+
+// Per-file driver.
+let run_fix_on_file = fn (path: string, mode: FixMode, verbose: bool) -> i64 require { Clock, Console, Fs } do
+  if Fs.exists(path) == false then
+    Console.eprintln(val: "nexus fix: file not found: " ++ path)
+    return 1
+  end
+  try
+    let initial_src = Fs.read_to_string(path)
+    return fix_loop(path, src: initial_src, mode, verbose, pass: 0, fixes_applied: 0)
+  catch e ->
+    Console.eprintln(val: err.format_error(err: e))
+    return 1
+  end
+end
+
+let fix_loop = fn (path: string, src: string, mode: FixMode, verbose: bool, pass: i64, fixes_applied: i64) -> i64 require { Clock, Console, Fs } do
+  if pass >= fix_max_passes() then
+    Console.eprintln(val: "nexus fix: iteration cap reached for " ++ path ++ "; remaining fix-its skipped")
+    return 0
+  end
+  let outcome = typecheck_for_fix(src, input_path: path, verbose)
+  match outcome do
+    | FixOk ->
+      return 0
+    | FixSkipped(message) ->
+      Console.eprintln(val: message)
+      if fixes_applied > 0 then return 0 end
+      return 1
+    | FixApplied(src: _orig_src, sp, fix) ->
+      match mode do
+        | ModeCheck ->
+          Console.println(val: format_check_line(file: path, sp, fix))
+          return 0
+        | ModeDiff ->
+          let old_text = slice_old_text(src, fix)
+          Console.println(val: format_diff_block(file: path, fix, old_text))
+          return 0
+        | ModeWrite ->
+          let src2 = apply_fixit(src, fix)
+          if src2 == src then
+            Console.eprintln(val: "nexus fix: rewrite was a no-op for " ++ path ++ " at pass " ++ str.from_i64(val: pass))
+            return 0
+          end
+          Fs.write_string(path, content: src2)
+          Console.println(val: format_check_line(file: path, sp, fix))
+          return fix_loop(path, src: src2, mode, verbose, pass: pass + 1, fixes_applied: fixes_applied + 1)
+      end
+  end
+end
+
+let contains_help_flag = fn (args: [string]) -> bool do
+  match args do
+    | [] -> return false
+    | a :: rest ->
+      if a == "--help" || a == "-h" then return true end
+      return contains_help_flag(args: rest)
+  end
+end
+
+let run_fix_each = fn (paths: [string], mode: FixMode, all_ok: bool) -> i64 require { Clock, Console, Fs } do
+  match paths do
+    | [] ->
+      if all_ok then return 0 else return 1 end
+    | p :: rest ->
+      let rc = run_fix_on_file(path: p, mode, verbose: false)
+      let ok2 = all_ok && (rc == 0)
+      return run_fix_each(paths: rest, mode, all_ok: ok2)
+  end
+end
+
+export let run_fix_subcommand = fn (args: [string]) -> i64 require { Clock, Console, Fs } throws { InvalidUsage } do
+  if contains_help_flag(args) then
+    Console.println(val: fix_usage())
+    return 0
+  end
+  let opts = parse_fix_options(args)
+  match opts do | FixOptions(mode, paths) ->
+    if list.length(xs: paths) == 0 then
+      Console.eprintln(val: fix_usage())
+      return 2
+    end
+    return run_fix_each(paths, mode, all_ok: true)
+  end
+end
