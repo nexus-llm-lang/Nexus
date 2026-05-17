@@ -26,7 +26,7 @@
  */
 
 import { HirProgram, HirFunction, HirHandlerArm, HirHandlerBinding, HirHandlerBindingEntry, HirStmt, HirStmtKind, HirExpr, HirExprKind, HirMatchCase, HirPatternKind, HirPatternField, HirRecordPatField, HirCallArg, HirNamedExpr, EagerBody, LazyBody } from "src/ir/hir/types.nx"
-import { Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit, Sigil, SigilImmutable } from "src/common/ast.nx"
+import { Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit, Sigil, SigilImmutable, EnumDef, VariantDef } from "src/common/ast.nx"
 import * as list from "std:list"
 import * as str from "std:str"
 
@@ -286,10 +286,13 @@ let phase1_go = fn (cases: [HirMatchCase], group: Option<ArmGroup>, acc: [HirMat
   end
 end
 
-// Phase 2: arm sort.
+// Phase 2: arm sort (enum-defs-aware).
 // Partition into specific (PCtor/PLit/POr) and wildcard (PWild/PVar) arms.
-// Sort specific by variant name. Concatenate: [sorted specifics] ++ [wildcards].
-// Implementation: insertion sort (N is small for match arms).
+// For PCtor specifics: only sort when all PCtor arms belong to the same enum
+// (as determined by enum_defs).  This prevents reordering list `Cons` arms
+// against custom-type constructors that share the PCtor namespace.
+// Sort key: declaration order within the enum (stable, compressor-friendly).
+// Wildcard arms are always preserved last.
 
 type PartitionResult = PartitionResult(specific: [HirMatchCase], wildcard: [HirMatchCase])
 
@@ -309,6 +312,154 @@ let partition_cases = fn (cases: [HirMatchCase], sp_acc: [HirMatchCase], wc_acc:
   end
 end
 
+// --- Enum-def helpers for Phase 2 ---
+
+// Return the declaration-order index of variant `vname` in the given variant list.
+// Returns -1 when not found.
+let find_variant_index = fn (variants: [VariantDef], vname: string, idx: i64) -> i64 do
+  match variants do
+    | [] -> return 0 - 1
+    | VariantDef(name: n, fields: _) :: rest ->
+      if n == vname then
+        return idx
+      else
+        return find_variant_index(variants: rest, vname: vname, idx: idx + 1)
+      end
+  end
+end
+
+// Return the name of the enum that declares variant `vname`, if any.
+let find_enum_for_variant = fn (defs: [EnumDef], vname: string) -> Option<string> do
+  match defs do
+    | [] -> return None
+    | EnumDef(name: ename, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      let idx = find_variant_index(variants: vs, vname: vname, idx: 0)
+      if idx >= 0 then
+        return Some(val: ename)
+      else
+        return find_enum_for_variant(defs: rest, vname: vname)
+      end
+  end
+end
+
+// Return the declaration index of variant `vname` within enum named `ename`.
+// Returns -1 when the enum or variant is not found.
+let variant_index_in_named_enum = fn (defs: [EnumDef], ename: string, vname: string) -> i64 do
+  match defs do
+    | [] -> return 0 - 1
+    | EnumDef(name: n, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      if n == ename then
+        return find_variant_index(variants: vs, vname: vname, idx: 0)
+      else
+        return variant_index_in_named_enum(defs: rest, ename: ename, vname: vname)
+      end
+  end
+end
+
+// Extract the leading variant name of a pattern (for enum-group detection).
+// Returns "" for non-PCtor patterns.
+let pat_ctor_name = fn (pat: HirPatternKind) -> string do
+  match pat do
+    | PCtor(variant: v, fields: _, sigil: _) -> return v
+    | POr(alts: a :: _) ->
+      match a do
+        | PCtor(variant: v, fields: _, sigil: _) -> return v
+        | _ -> return ""
+      end
+    | _ -> return ""
+  end
+end
+
+// Check that all cases in `specific` are PCtor arms belonging to `expected_enum`.
+// Returns false if any arm is a non-PCtor or belongs to a different/unknown enum.
+let all_pctors_in_enum = fn (cases: [HirMatchCase], defs: [EnumDef], expected_enum: string) -> bool do
+  match cases do
+    | [] -> return true
+    | HirMatchCase(pattern: pat, body: _) :: rest ->
+      let vname = pat_ctor_name(pat: pat)
+      if str.length(s: vname) == 0 then
+        // PLit or other non-PCtor: not part of any enum group
+        return false
+      else
+        let found = find_enum_for_variant(defs: defs, vname: vname)
+        match found do
+          | None -> return false
+          | Some(val: ename) ->
+            if ename == expected_enum then
+              return all_pctors_in_enum(cases: rest, defs: defs, expected_enum: expected_enum)
+            else
+              return false
+            end
+        end
+      end
+  end
+end
+
+// Determine whether all PCtor-specific arms belong to the same enum.
+// Returns Some(enum_name) if yes, None otherwise.
+let all_pctors_same_enum = fn (cases: [HirMatchCase], defs: [EnumDef]) -> Option<string> do
+  match cases do
+    | [] -> return None
+    | HirMatchCase(pattern: pat, body: _) :: rest ->
+      let vname = pat_ctor_name(pat: pat)
+      if str.length(s: vname) == 0 then
+        // First arm is non-PCtor: no enum-sort possible
+        return None
+      else
+        let found = find_enum_for_variant(defs: defs, vname: vname)
+        match found do
+          | None -> return None
+          | Some(val: ename) ->
+            if all_pctors_in_enum(cases: rest, defs: defs, expected_enum: ename) then
+              return Some(val: ename)
+            else
+              return None
+            end
+        end
+      end
+  end
+end
+
+// Sort key for an arm when sorting by enum declaration order.
+let case_enum_index = fn (c: HirMatchCase, defs: [EnumDef], ename: string) -> i64 do
+  let HirMatchCase(pattern: pat, body: _) = c
+  let vname = pat_ctor_name(pat: pat)
+  return variant_index_in_named_enum(defs: defs, ename: ename, vname: vname)
+end
+
+// Insertion sort by enum declaration index.
+let isort_by_enum_index = fn (xs: [HirMatchCase], defs: [EnumDef], ename: string) -> [HirMatchCase] do
+  return isort_enum_go(xs: xs, acc: [], defs: defs, ename: ename)
+end
+
+let isort_enum_go = fn (xs: [HirMatchCase], acc: [HirMatchCase], defs: [EnumDef], ename: string) -> [HirMatchCase] do
+  match xs do
+    | [] -> return acc
+    | x :: rest -> return isort_enum_go(xs: rest, acc: insert_by_enum(c: x, into: acc, defs: defs, ename: ename), defs: defs, ename: ename)
+  end
+end
+
+let insert_by_enum = fn (c: HirMatchCase, into: [HirMatchCase], defs: [EnumDef], ename: string) -> [HirMatchCase] do
+  match into do
+    | [] -> return c :: []
+    | h :: rest ->
+      let ic = case_enum_index(c: c, defs: defs, ename: ename)
+      let ih = case_enum_index(c: h, defs: defs, ename: ename)
+      // Use strict less-than for a stable sort: arms with equal declaration
+      // indices (same variant name, different field patterns) keep their
+      // original relative order.  This matters when one variant has multiple
+      // arms differing only in field patterns (e.g. TyUserDefined(args: [])
+      // before TyUserDefined(args: targs)) — swapping them would change which
+      // arm fires first.
+      if ic < ih then
+        return c :: h :: rest
+      else
+        return h :: insert_by_enum(c: c, into: rest, defs: defs, ename: ename)
+      end
+  end
+end
+
+// Fallback: lexicographic sort key for PLit/other non-enum specifics.
 let case_key = fn (c: HirMatchCase) -> string do
   let HirMatchCase(pattern: pat, body: _) = c
   match pat do
@@ -351,9 +502,17 @@ let concat_cases_go = fn (a: [HirMatchCase], b: [HirMatchCase], acc: [HirMatchCa
   end
 end
 
-let phase2_cases = fn (cases: [HirMatchCase]) -> [HirMatchCase] do
+// Phase 2 entry point: enum-defs-aware arm sort.
+// If all PCtor-specific arms belong to the same enum, sort by declaration order.
+// Otherwise fall back to no-sort (preserve original order) to avoid cross-enum
+// reordering (e.g. list Cons vs custom-type ctors).
+let phase2_cases = fn (cases: [HirMatchCase], enum_defs: [EnumDef]) -> [HirMatchCase] do
   let PartitionResult(specific: sp, wildcard: wc) = partition_cases(cases: cases, sp_acc: [], wc_acc: [])
-  let sorted = isort_cases(xs: sp)
+  let same_enum = all_pctors_same_enum(cases: sp, defs: enum_defs)
+  let sorted = match same_enum do
+    | Some(val: ename) -> isort_by_enum_index(xs: sp, defs: enum_defs, ename)
+    | None -> sp
+  end
   return concat_cases(a: sorted, b: wc)
 end
 
@@ -378,198 +537,202 @@ let phase3_go = fn (cases: [HirMatchCase], acc: [HirMatchCase]) -> [HirMatchCase
 end
 
 // Full canonicalization of a single match case list.
+// enum_defs is threaded through to enable Phase 2 enum-aware arm sort.
 
-let canonicalize_cases = fn (cases: [HirMatchCase]) -> [HirMatchCase] do
+let canonicalize_cases = fn (cases: [HirMatchCase], enum_defs: [EnumDef]) -> [HirMatchCase] do
   // Phase 3: strip dead arms after first wildcard.
   let after_p3 = phase3_cases(cases: cases)
-  // Phase 2 (arm sort) is intentionally skipped: reordering PCtor arms across
-  // heterogeneous types (e.g. list Cons vs custom-type ctors in the same match)
-  // changes semantics. Without an enum-def map at this layer we cannot tell
-  // which ctors belong to the same enum, so we conservatively omit the sort.
+  // Phase 2: sort PCtor arms by enum declaration order when all arms belong to
+  // the same enum.  Falls back to no-sort when arms span multiple enums or
+  // include list Cons (which is not a user-defined enum variant).
+  let after_p2 = phase2_cases(cases: after_p3, enum_defs: enum_defs)
   // Phase 1: fuse arms with identical simple bodies into a single POr arm.
-  let after_p1 = phase1_cases(cases: after_p3)
+  let after_p1 = phase1_cases(cases: after_p2)
   return after_p1
 end
 
 // HIR tree rewriter: recurse into every HirExpr/HirStmt and rewrite Match nodes.
+// enum_defs is threaded through every traversal function so Phase 2 can use it.
 
-let canon_expr = fn (e: HirExpr) -> HirExpr do
+let canon_expr = fn (e: HirExpr, enum_defs: [EnumDef]) -> HirExpr do
   let HirExpr(node: k, span: sp) = e
-  return HirExpr(node: canon_expr_kind(k: k), span: sp)
+  return HirExpr(node: canon_expr_kind(k: k, enum_defs: enum_defs), span: sp)
 end
 
-let canon_expr_kind = fn (k: HirExprKind) -> HirExprKind do
+let canon_expr_kind = fn (k: HirExprKind, enum_defs: [EnumDef]) -> HirExprKind do
   match k do
     | Literal(_) | Variable(_) | Borrow(_) | ExternalRef(_) -> return k
     | BinOp(left: l, op, right: r) ->
-      return BinOp(left: canon_expr(e: l), op, right: canon_expr(e: r))
+      return BinOp(left: canon_expr(e: l, enum_defs: enum_defs), op, right: canon_expr(e: r, enum_defs: enum_defs))
     | UnOp(op, operand: o) ->
-      return UnOp(op, operand: canon_expr(e: o))
+      return UnOp(op, operand: canon_expr(e: o, enum_defs: enum_defs))
     | Call(func: f, args) ->
-      return Call(func: f, args: canon_call_args(args: args))
+      return Call(func: f, args: canon_call_args(args: args, enum_defs: enum_defs))
     | Ctor(variant: v, args, sigil: sig) ->
-      return Ctor(variant: v, args: canon_expr_list(es: args), sigil: sig)
+      return Ctor(variant: v, args: canon_expr_list(es: args, enum_defs: enum_defs), sigil: sig)
     | Record(fields: fs) ->
-      return Record(fields: canon_named_exprs(fs: fs))
+      return Record(fields: canon_named_exprs(fs: fs, enum_defs: enum_defs))
     | Array(elems: es) ->
-      return Array(elems: canon_expr_list(es: es))
+      return Array(elems: canon_expr_list(es: es, enum_defs: enum_defs))
     | Index(target: t, index: i) ->
-      return Index(target: canon_expr(e: t), index: canon_expr(e: i))
+      return Index(target: canon_expr(e: t, enum_defs: enum_defs), index: canon_expr(e: i, enum_defs: enum_defs))
     | FieldAccess(target: t, field: f) ->
-      return FieldAccess(target: canon_expr(e: t), field: f)
+      return FieldAccess(target: canon_expr(e: t, enum_defs: enum_defs), field: f)
     | If(cond: c, then_branch: tb, else_branch: eb) ->
       let new_eb = match eb do
         | None -> None
-        | Some(val: s) -> Some(val: canon_stmts(stmts: s))
+        | Some(val: s) -> Some(val: canon_stmts(stmts: s, enum_defs: enum_defs))
       end
-      return If(cond: canon_expr(e: c), then_branch: canon_stmts(stmts: tb), else_branch: new_eb)
+      return If(cond: canon_expr(e: c, enum_defs: enum_defs), then_branch: canon_stmts(stmts: tb, enum_defs: enum_defs), else_branch: new_eb)
     | Match(target: t, cases: cs) ->
-      let new_cs = canonicalize_cases(cases: cs)
-      let rewritten = canon_cases(cases: new_cs)
-      return Match(target: canon_expr(e: t), cases: rewritten)
+      let new_cs = canonicalize_cases(cases: cs, enum_defs: enum_defs)
+      let rewritten = canon_cases(cases: new_cs, enum_defs: enum_defs)
+      return Match(target: canon_expr(e: t, enum_defs: enum_defs), cases: rewritten)
     | While(cond: c, body: b) ->
-      return While(cond: canon_expr(e: c), body: canon_stmts(stmts: b))
+      return While(cond: canon_expr(e: c, enum_defs: enum_defs), body: canon_stmts(stmts: b, enum_defs: enum_defs))
     | For(var: v, start: s, end_expr: ee, body: b) ->
-      return For(var: v, start: canon_expr(e: s), end_expr: canon_expr(e: ee), body: canon_stmts(stmts: b))
+      return For(var: v, start: canon_expr(e: s, enum_defs: enum_defs), end_expr: canon_expr(e: ee, enum_defs: enum_defs), body: canon_stmts(stmts: b, enum_defs: enum_defs))
     | Lambda(type_params: tp, params, ret_type: rt, body: b) ->
-      return Lambda(type_params: tp, params, ret_type: rt, body: canon_stmts(stmts: b))
-    | Raise(expr: e) -> return Raise(expr: canon_expr(e: e))
-    | Force(expr: e) -> return Force(expr: canon_expr(e: e))
-    | Thunk(body: b) -> return Thunk(body: canon_expr(e: b))
+      return Lambda(type_params: tp, params, ret_type: rt, body: canon_stmts(stmts: b, enum_defs: enum_defs))
+    | Raise(expr: e) -> return Raise(expr: canon_expr(e: e, enum_defs: enum_defs))
+    | Force(expr: e) -> return Force(expr: canon_expr(e: e, enum_defs: enum_defs))
+    | Thunk(body: b) -> return Thunk(body: canon_expr(e: b, enum_defs: enum_defs))
     | Handler(port_name: pn, arms) ->
-      return Handler(port_name: pn, arms: canon_handler_arms(arms: arms))
+      return Handler(port_name: pn, arms: canon_handler_arms(arms: arms, enum_defs: enum_defs))
   end
 end
 
-let canon_stmts = fn (stmts: [HirStmt]) -> [HirStmt] do
-  return canon_stmts_go(stmts: stmts, acc: [])
+let canon_stmts = fn (stmts: [HirStmt], enum_defs: [EnumDef]) -> [HirStmt] do
+  return canon_stmts_go(stmts: stmts, acc: [], enum_defs: enum_defs)
 end
 
-let canon_stmts_go = fn (stmts: [HirStmt], acc: [HirStmt]) -> [HirStmt] do
+let canon_stmts_go = fn (stmts: [HirStmt], acc: [HirStmt], enum_defs: [EnumDef]) -> [HirStmt] do
   match stmts do
     | [] -> return rev_stmts(xs: acc, out: [])
     | HirStmt(node: s, span: sp) :: rest ->
-      return canon_stmts_go(stmts: rest, acc: HirStmt(node: canon_stmt_kind(s: s), span: sp) :: acc)
+      return canon_stmts_go(stmts: rest, acc: HirStmt(node: canon_stmt_kind(s: s, enum_defs: enum_defs), span: sp) :: acc, enum_defs: enum_defs)
   end
 end
 
-let canon_stmt_kind = fn (s: HirStmtKind) -> HirStmtKind do
+let canon_stmt_kind = fn (s: HirStmtKind, enum_defs: [EnumDef]) -> HirStmtKind do
   match s do
     | Let(name: n, sigil: sig, typ: t, value: v) ->
-      return Let(name: n, sigil: sig, typ: t, value: canon_expr(e: v))
-    | Expr(expr: e) -> return Expr(expr: canon_expr(e: e))
-    | Return(expr: e) -> return Return(expr: canon_expr(e: e))
+      return Let(name: n, sigil: sig, typ: t, value: canon_expr(e: v, enum_defs: enum_defs))
+    | Expr(expr: e) -> return Expr(expr: canon_expr(e: e, enum_defs: enum_defs))
+    | Return(expr: e) -> return Return(expr: canon_expr(e: e, enum_defs: enum_defs))
     | Assign(target: t, value: v) ->
-      return Assign(target: canon_expr(e: t), value: canon_expr(e: v))
+      return Assign(target: canon_expr(e: t, enum_defs: enum_defs), value: canon_expr(e: v, enum_defs: enum_defs))
     | Try(body: b, catch_param: cp, catch_body: cb) ->
-      return Try(body: canon_stmts(stmts: b), catch_param: cp, catch_body: canon_stmts(stmts: cb))
+      return Try(body: canon_stmts(stmts: b, enum_defs: enum_defs), catch_param: cp, catch_body: canon_stmts(stmts: cb, enum_defs: enum_defs))
     | Inject(handlers: hs, body: b) ->
-      return Inject(handlers: hs, body: canon_stmts(stmts: b))
+      return Inject(handlers: hs, body: canon_stmts(stmts: b, enum_defs: enum_defs))
   end
 end
 
-let canon_cases = fn (cases: [HirMatchCase]) -> [HirMatchCase] do
-  return canon_cases_go(cases: cases, acc: [])
+let canon_cases = fn (cases: [HirMatchCase], enum_defs: [EnumDef]) -> [HirMatchCase] do
+  return canon_cases_go(cases: cases, acc: [], enum_defs: enum_defs)
 end
 
-let canon_cases_go = fn (cases: [HirMatchCase], acc: [HirMatchCase]) -> [HirMatchCase] do
+let canon_cases_go = fn (cases: [HirMatchCase], acc: [HirMatchCase], enum_defs: [EnumDef]) -> [HirMatchCase] do
   match cases do
     | [] -> return rev_cases(xs: acc, out: [])
     | HirMatchCase(pattern: pat, body: b) :: rest ->
-      return canon_cases_go(cases: rest, acc: HirMatchCase(pattern: pat, body: canon_stmts(stmts: b)) :: acc)
+      return canon_cases_go(cases: rest, acc: HirMatchCase(pattern: pat, body: canon_stmts(stmts: b, enum_defs: enum_defs)) :: acc, enum_defs: enum_defs)
   end
 end
 
-let canon_call_args = fn (args: [HirCallArg]) -> [HirCallArg] do
-  return canon_call_args_go(args: args, acc: [])
+let canon_call_args = fn (args: [HirCallArg], enum_defs: [EnumDef]) -> [HirCallArg] do
+  return canon_call_args_go(args: args, acc: [], enum_defs: enum_defs)
 end
 
-let canon_call_args_go = fn (args: [HirCallArg], acc: [HirCallArg]) -> [HirCallArg] do
+let canon_call_args_go = fn (args: [HirCallArg], acc: [HirCallArg], enum_defs: [EnumDef]) -> [HirCallArg] do
   match args do
     | [] -> return rev_call_args(xs: acc, out: [])
     | HirCallArg(label: l, value: v) :: rest ->
-      return canon_call_args_go(args: rest, acc: HirCallArg(label: l, value: canon_expr(e: v)) :: acc)
+      return canon_call_args_go(args: rest, acc: HirCallArg(label: l, value: canon_expr(e: v, enum_defs: enum_defs)) :: acc, enum_defs: enum_defs)
   end
 end
 
-let canon_expr_list = fn (es: [HirExpr]) -> [HirExpr] do
-  return canon_expr_list_go(es: es, acc: [])
+let canon_expr_list = fn (es: [HirExpr], enum_defs: [EnumDef]) -> [HirExpr] do
+  return canon_expr_list_go(es: es, acc: [], enum_defs: enum_defs)
 end
 
-let canon_expr_list_go = fn (es: [HirExpr], acc: [HirExpr]) -> [HirExpr] do
+let canon_expr_list_go = fn (es: [HirExpr], acc: [HirExpr], enum_defs: [EnumDef]) -> [HirExpr] do
   match es do
     | [] -> return rev_exprs(xs: acc, out: [])
-    | e :: rest -> return canon_expr_list_go(es: rest, acc: canon_expr(e: e) :: acc)
+    | e :: rest -> return canon_expr_list_go(es: rest, acc: canon_expr(e: e, enum_defs: enum_defs) :: acc, enum_defs: enum_defs)
   end
 end
 
-let canon_named_exprs = fn (fs: [HirNamedExpr]) -> [HirNamedExpr] do
-  return canon_named_exprs_go(fs: fs, acc: [])
+let canon_named_exprs = fn (fs: [HirNamedExpr], enum_defs: [EnumDef]) -> [HirNamedExpr] do
+  return canon_named_exprs_go(fs: fs, acc: [], enum_defs: enum_defs)
 end
 
-let canon_named_exprs_go = fn (fs: [HirNamedExpr], acc: [HirNamedExpr]) -> [HirNamedExpr] do
+let canon_named_exprs_go = fn (fs: [HirNamedExpr], acc: [HirNamedExpr], enum_defs: [EnumDef]) -> [HirNamedExpr] do
   match fs do
     | [] -> return rev_named_exprs(xs: acc, out: [])
     | HirNamedExpr(name: n, value: v) :: rest ->
-      return canon_named_exprs_go(fs: rest, acc: HirNamedExpr(name: n, value: canon_expr(e: v)) :: acc)
+      return canon_named_exprs_go(fs: rest, acc: HirNamedExpr(name: n, value: canon_expr(e: v, enum_defs: enum_defs)) :: acc, enum_defs: enum_defs)
   end
 end
 
-let canon_handler_arms = fn (arms: [HirHandlerArm]) -> [HirHandlerArm] do
-  return canon_handler_arms_go(arms: arms, acc: [])
+let canon_handler_arms = fn (arms: [HirHandlerArm], enum_defs: [EnumDef]) -> [HirHandlerArm] do
+  return canon_handler_arms_go(arms: arms, acc: [], enum_defs: enum_defs)
 end
 
-let canon_handler_arms_go = fn (arms: [HirHandlerArm], acc: [HirHandlerArm]) -> [HirHandlerArm] do
+let canon_handler_arms_go = fn (arms: [HirHandlerArm], acc: [HirHandlerArm], enum_defs: [EnumDef]) -> [HirHandlerArm] do
   match arms do
     | [] -> return rev_handler_arms(xs: acc, out: [])
     | HirHandlerArm(arm: f, cont_binder: cb) :: rest ->
-      return canon_handler_arms_go(arms: rest, acc: HirHandlerArm(arm: canon_function(f: f), cont_binder: cb) :: acc)
+      return canon_handler_arms_go(arms: rest, acc: HirHandlerArm(arm: canon_function(f: f, enum_defs: enum_defs), cont_binder: cb) :: acc, enum_defs: enum_defs)
   end
 end
 
-let canon_function = fn (f: HirFunction) -> HirFunction do
+let canon_function = fn (f: HirFunction, enum_defs: [EnumDef]) -> HirFunction do
   let HirFunction(name: n, type_params: tp, params: ps, ret_type: rt, throw_row: tr, body: b, span: sp, file: fi, requires: req) = f
   let new_body = match b do
     | LazyBody(_) -> b
-    | EagerBody(stmts: ss) -> EagerBody(stmts: canon_stmts(stmts: ss))
+    | EagerBody(stmts: ss) -> EagerBody(stmts: canon_stmts(stmts: ss, enum_defs: enum_defs))
   end
   return HirFunction(name: n, type_params: tp, params: ps, ret_type: rt, throw_row: tr, body: new_body, span: sp, file: fi, requires: req)
 end
 
-let canon_functions = fn (funcs: [HirFunction]) -> [HirFunction] do
-  return canon_functions_go(funcs: funcs, acc: [])
+let canon_functions = fn (funcs: [HirFunction], enum_defs: [EnumDef]) -> [HirFunction] do
+  return canon_functions_go(funcs: funcs, acc: [], enum_defs: enum_defs)
 end
 
-let canon_functions_go = fn (funcs: [HirFunction], acc: [HirFunction]) -> [HirFunction] do
+let canon_functions_go = fn (funcs: [HirFunction], acc: [HirFunction], enum_defs: [EnumDef]) -> [HirFunction] do
   match funcs do
     | [] -> return rev_functions(xs: acc, out: [])
     | f :: rest ->
-      return canon_functions_go(funcs: rest, acc: canon_function(f: f) :: acc)
+      return canon_functions_go(funcs: rest, acc: canon_function(f: f, enum_defs: enum_defs) :: acc, enum_defs: enum_defs)
   end
 end
 
-let canon_handler_bindings = fn (bindings: [HirHandlerBindingEntry]) -> [HirHandlerBindingEntry] do
-  return canon_handler_bindings_go(bindings: bindings, acc: [])
+let canon_handler_bindings = fn (bindings: [HirHandlerBindingEntry], enum_defs: [EnumDef]) -> [HirHandlerBindingEntry] do
+  return canon_handler_bindings_go(bindings: bindings, acc: [], enum_defs: enum_defs)
 end
 
-let canon_handler_bindings_go = fn (bindings: [HirHandlerBindingEntry], acc: [HirHandlerBindingEntry]) -> [HirHandlerBindingEntry] do
+let canon_handler_bindings_go = fn (bindings: [HirHandlerBindingEntry], acc: [HirHandlerBindingEntry], enum_defs: [EnumDef]) -> [HirHandlerBindingEntry] do
   match bindings do
     | [] -> return rev_handler_bindings(xs: acc, out: [])
     | HirHandlerBindingEntry(name: n, binding: HirHandlerBinding(port_name: pn, arms)) :: rest ->
-      let new_arms = canon_handler_arms(arms: arms)
-      return canon_handler_bindings_go(bindings: rest, acc: HirHandlerBindingEntry(name: n, binding: HirHandlerBinding(port_name: pn, arms: new_arms)) :: acc)
+      let new_arms = canon_handler_arms(arms: arms, enum_defs: enum_defs)
+      return canon_handler_bindings_go(bindings: rest, acc: HirHandlerBindingEntry(name: n, binding: HirHandlerBinding(port_name: pn, arms: new_arms)) :: acc, enum_defs: enum_defs)
   end
 end
 
 /** Run all canonicalization phases over a HirProgram.
  *  Returns a new HirProgram with canonicalized match expressions in every
  *  function body and handler arm.
+ *  Phase 2 (arm sort) uses enum_defs from the program to safely sort only
+ *  arms that belong to the same user-defined enum.
  */
 export let canonicalize_program = fn (prog: HirProgram) -> HirProgram do
   match prog do
     | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
-      let new_funcs = canon_functions(funcs: hf)
-      let new_hb = canon_handler_bindings(bindings: hb)
+      let new_funcs = canon_functions(funcs: hf, enum_defs: hed)
+      let new_hb = canon_handler_bindings(bindings: hb, enum_defs: hed)
       return HirProgram(ports: hp, functions: new_funcs, externals: he, handler_bindings: new_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
   end
 end
