@@ -1,0 +1,575 @@
+/**
+ * canonicalize_match: HIR-level pattern-match canonicalization pass.
+ *
+ * Owns:
+ * - Phase 1 -- arm dedup + POr fusion: arms with structurally-identical
+ *   simple bodies (Return(Literal) or Return(Variable)) are fused into a
+ *   single arm with a POr pattern.  Automating what nexus-95iz.22 did
+ *   manually.
+ * - Phase 2 -- arm sort: PCtor arms are sorted by variant name (lexicographic)
+ *   so the LIR decision-tree builder receives them in a stable, compressor-
+ *   friendly order.  Wildcard/variable arms are preserved last.
+ * - Phase 3 -- redundancy elimination: after the first PWild (or PVar without
+ *   binder use) arm, any subsequent arms are provably unreachable and are
+ *   stripped.
+ *
+ * Phase 4 (list-pattern head peeling) is skipped -- too complex / separate
+ * concern.
+ *
+ * Consumers: called from src/driver.nx after iterative_resolve/expand_groups
+ * and before wrap_main_if_needed.
+ *
+ * Does not own:
+ * - Pattern conversion (src/ir/hir/pattern.nx)
+ * - HIR type definitions (src/ir/hir/types.nx)
+ * - Any MIR/LIR concerns
+ */
+
+import { HirProgram, HirFunction, HirHandlerArm, HirHandlerBinding, HirHandlerBindingEntry, HirStmt, HirStmtKind, HirExpr, HirExprKind, HirMatchCase, HirPatternKind, HirPatternField, HirRecordPatField, HirCallArg, HirNamedExpr, EagerBody, LazyBody } from "src/ir/hir/types.nx"
+import { Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit, Sigil, SigilImmutable } from "src/common/ast.nx"
+import * as list from "std:list"
+import * as str from "std:str"
+
+// Local type-specific reverses (see src/common/mono_reverse.nx)
+
+let rev_cases = fn (xs: [HirMatchCase], out: [HirMatchCase]) -> [HirMatchCase] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_cases(xs: rest, out: x :: out)
+  end
+end
+
+let rev_stmts = fn (xs: [HirStmt], out: [HirStmt]) -> [HirStmt] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_stmts(xs: rest, out: x :: out)
+  end
+end
+
+let rev_functions = fn (xs: [HirFunction], out: [HirFunction]) -> [HirFunction] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_functions(xs: rest, out: x :: out)
+  end
+end
+
+let rev_patterns = fn (xs: [HirPatternKind], out: [HirPatternKind]) -> [HirPatternKind] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_patterns(xs: rest, out: x :: out)
+  end
+end
+
+let rev_call_args = fn (xs: [HirCallArg], out: [HirCallArg]) -> [HirCallArg] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_call_args(xs: rest, out: x :: out)
+  end
+end
+
+let rev_exprs = fn (xs: [HirExpr], out: [HirExpr]) -> [HirExpr] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_exprs(xs: rest, out: x :: out)
+  end
+end
+
+let rev_named_exprs = fn (xs: [HirNamedExpr], out: [HirNamedExpr]) -> [HirNamedExpr] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_named_exprs(xs: rest, out: x :: out)
+  end
+end
+
+let rev_handler_arms = fn (xs: [HirHandlerArm], out: [HirHandlerArm]) -> [HirHandlerArm] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_handler_arms(xs: rest, out: x :: out)
+  end
+end
+
+let rev_handler_bindings = fn (xs: [HirHandlerBindingEntry], out: [HirHandlerBindingEntry]) -> [HirHandlerBindingEntry] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_handler_bindings(xs: rest, out: x :: out)
+  end
+end
+
+// Literal equality
+
+let lit_eq = fn (a: Literal, b: Literal) -> bool do
+  match a do
+    | LitInt(val: va) ->
+      match b do
+        | LitInt(val: vb) -> return va == vb
+        | _ -> return false
+      end
+    | LitBool(val: va) ->
+      match b do
+        | LitBool(val: vb) -> return va == vb
+        | _ -> return false
+      end
+    | LitString(val: va) ->
+      match b do
+        | LitString(val: vb) -> return va == vb
+        | _ -> return false
+      end
+    | LitChar(val: va) ->
+      match b do
+        | LitChar(val: vb) -> return va == vb
+        | _ -> return false
+      end
+    | LitFloat(val: va) ->
+      match b do
+        | LitFloat(val: vb) -> return va == vb
+        | _ -> return false
+      end
+    | LitUnit ->
+      match b do
+        | LitUnit -> return true
+        | _ -> return false
+      end
+  end
+end
+
+// Simple body equality (conservative).
+// Nexus has no structural equality for HirStmt, so we detect only the
+// "trivially equal" shapes:
+//   - single Return(Literal)
+//   - single Return(Variable)
+//   - empty body []
+// Any other shape returns false (safe: we skip dedup rather than mis-fuse).
+
+type SimpleBody =
+  SBLit(lit: Literal)
+  | SBVar(name: string)
+  | SBUnit
+  | SBComplex
+
+let classify_body = fn (stmts: [HirStmt]) -> SimpleBody do
+  match stmts do
+    | [] -> return SBUnit
+    | HirStmt(node: Return(expr: HirExpr(node: Literal(lit: l), span: _)), span: _) :: [] ->
+      return SBLit(lit: l)
+    | HirStmt(node: Return(expr: HirExpr(node: Variable(name: n, sigil: _), span: _)), span: _) :: [] ->
+      return SBVar(name: n)
+    | _ -> return SBComplex
+  end
+end
+
+let simple_body_eq = fn (a: SimpleBody, b: SimpleBody) -> bool do
+  match a do
+    | SBUnit ->
+      match b do | SBUnit -> return true | _ -> return false end
+    | SBLit(lit: la) ->
+      match b do | SBLit(lit: lb) -> return lit_eq(a: la, b: lb) | _ -> return false end
+    | SBVar(name: na) ->
+      match b do | SBVar(name: nb) -> return na == nb | _ -> return false end
+    | SBComplex -> return false
+  end
+end
+
+// Pattern classification
+
+let pat_is_wildcard = fn (pat: HirPatternKind) -> bool do
+  match pat do
+    | PWild -> return true
+    | PVar(name: _, sigil: _) -> return true
+    | _ -> return false
+  end
+end
+
+let pat_or_eligible = fn (pat: HirPatternKind) -> bool do
+  match pat do
+    | PCtor(variant: _, fields: _, sigil: _) -> return true
+    | PLit(_) -> return true
+    | _ -> return false
+  end
+end
+
+// Lexicographic string comparison (std:str has no compare function).
+
+let str_leq_loop = fn (a: string, b: string, idx: i64, la: i64, lb: i64) -> bool do
+  if idx >= la then return true end
+  if idx >= lb then return false end
+  let ca = str.char_at(s: a, idx)
+  let cb = str.char_at(s: b, idx)
+  if ca == cb then
+    return str_leq_loop(a, b, idx: idx + 1, la, lb)
+  else
+    return ca < cb
+  end
+end
+
+let str_leq = fn (a: string, b: string) -> bool do
+  return str_leq_loop(a, b, idx: 0, la: str.length(s: a), lb: str.length(s: b))
+end
+
+let pat_sort_key = fn (pat: HirPatternKind) -> string do
+  match pat do
+    | PCtor(variant: v, fields: _, sigil: _) -> return v
+    | PLit(lit: l) ->
+      match l do
+        | LitInt(val: v) -> return str.from_i64(val: v)
+        | LitBool(val: v) -> if v then return "true" else return "false" end
+        | LitString(val: v) -> return v
+        | LitChar(val: v) -> return str.from_i64(val: v)
+        | LitFloat(val: v) -> return v
+        | LitUnit -> return "()"
+      end
+    | _ -> return ""
+  end
+end
+
+// Phase 1: POr fusion.
+// Walk the arm list linearly. Keep a "current group" = (simple_body, pats).
+// When the next arm has the same simple_body and an or-eligible pattern,
+// extend the group. Otherwise emit the group and start a new one.
+// A group of size 1 emits as-is. A group of size >=2 emits as a single
+// arm with a POr pattern.
+
+type ArmGroup = ArmGroup(body: SimpleBody, pats: [HirPatternKind], stmts: [HirStmt])
+
+let flush_group = fn (grp: ArmGroup, acc: [HirMatchCase]) -> [HirMatchCase] do
+  let ArmGroup(body: _, pats: ps, stmts: ss) = grp
+  match ps do
+    | [] -> return acc
+    | p :: [] -> return HirMatchCase(pattern: p, body: ss) :: acc
+    | _ ->
+      let ordered = rev_patterns(xs: ps, out: [])
+      return HirMatchCase(pattern: POr(alts: ordered), body: ss) :: acc
+  end
+end
+
+let phase1_cases = fn (cases: [HirMatchCase]) -> [HirMatchCase] do
+  match cases do
+    | [] -> return []
+    | _ ->
+      let reversed = phase1_go(cases: cases, group: None, acc: [])
+      return rev_cases(xs: reversed, out: [])
+  end
+end
+
+let phase1_go = fn (cases: [HirMatchCase], group: Option<ArmGroup>, acc: [HirMatchCase]) -> [HirMatchCase] do
+  match cases do
+    | [] ->
+      match group do
+        | None -> return acc
+        | Some(val: grp) -> return flush_group(grp: grp, acc: acc)
+      end
+    | HirMatchCase(pattern: pat, body: stmts) :: rest ->
+      let sb = classify_body(stmts)
+      let eligible = pat_or_eligible(pat)
+      match group do
+        | None ->
+          if eligible then
+            let grp = ArmGroup(body: sb, pats: pat :: [], stmts)
+            return phase1_go(cases: rest, group: Some(val: grp), acc)
+          else
+            return phase1_go(cases: rest, group: None, acc: HirMatchCase(pattern: pat, body: stmts) :: acc)
+          end
+        | Some(val: ArmGroup(body: gsb, pats: gps, stmts: gss)) ->
+          if eligible && simple_body_eq(a: sb, b: gsb) then
+            let grp2 = ArmGroup(body: gsb, pats: pat :: gps, stmts: gss)
+            return phase1_go(cases: rest, group: Some(val: grp2), acc)
+          else
+            let old_grp = ArmGroup(body: gsb, pats: gps, stmts: gss)
+            let acc2 = flush_group(grp: old_grp, acc: acc)
+            if eligible then
+              let grp2 = ArmGroup(body: sb, pats: pat :: [], stmts)
+              return phase1_go(cases: rest, group: Some(val: grp2), acc: acc2)
+            else
+              return phase1_go(cases: rest, group: None, acc: HirMatchCase(pattern: pat, body: stmts) :: acc2)
+            end
+          end
+      end
+  end
+end
+
+// Phase 2: arm sort.
+// Partition into specific (PCtor/PLit/POr) and wildcard (PWild/PVar) arms.
+// Sort specific by variant name. Concatenate: [sorted specifics] ++ [wildcards].
+// Implementation: insertion sort (N is small for match arms).
+
+type PartitionResult = PartitionResult(specific: [HirMatchCase], wildcard: [HirMatchCase])
+
+let partition_cases = fn (cases: [HirMatchCase], sp_acc: [HirMatchCase], wc_acc: [HirMatchCase]) -> PartitionResult do
+  match cases do
+    | [] ->
+      return PartitionResult(
+        specific: rev_cases(xs: sp_acc, out: []),
+        wildcard: rev_cases(xs: wc_acc, out: [])
+      )
+    | HirMatchCase(pattern: pat, body: b) :: rest ->
+      if pat_is_wildcard(pat) then
+        return partition_cases(cases: rest, sp_acc, wc_acc: HirMatchCase(pattern: pat, body: b) :: wc_acc)
+      else
+        return partition_cases(cases: rest, sp_acc: HirMatchCase(pattern: pat, body: b) :: sp_acc, wc_acc)
+      end
+  end
+end
+
+let case_key = fn (c: HirMatchCase) -> string do
+  let HirMatchCase(pattern: pat, body: _) = c
+  match pat do
+    | POr(alts: a :: _) -> return pat_sort_key(a)
+    | _ -> return pat_sort_key(pat)
+  end
+end
+
+let isort_cases = fn (xs: [HirMatchCase]) -> [HirMatchCase] do
+  return isort_go(xs: xs, acc: [])
+end
+
+let isort_go = fn (xs: [HirMatchCase], acc: [HirMatchCase]) -> [HirMatchCase] do
+  match xs do
+    | [] -> return acc
+    | x :: rest -> return isort_go(xs: rest, acc: insert_case(c: x, into: acc))
+  end
+end
+
+let insert_case = fn (c: HirMatchCase, into: [HirMatchCase]) -> [HirMatchCase] do
+  match into do
+    | [] -> return c :: []
+    | h :: rest ->
+      if str_leq(a: case_key(c), b: case_key(h)) then
+        return c :: h :: rest
+      else
+        return h :: insert_case(c: c, into: rest)
+      end
+  end
+end
+
+let concat_cases = fn (a: [HirMatchCase], b: [HirMatchCase]) -> [HirMatchCase] do
+  return concat_cases_go(a: a, b: b, acc: [])
+end
+
+let concat_cases_go = fn (a: [HirMatchCase], b: [HirMatchCase], acc: [HirMatchCase]) -> [HirMatchCase] do
+  match a do
+    | [] -> return rev_cases(xs: acc, out: b)
+    | x :: rest -> return concat_cases_go(a: rest, b: b, acc: x :: acc)
+  end
+end
+
+let phase2_cases = fn (cases: [HirMatchCase]) -> [HirMatchCase] do
+  let PartitionResult(specific: sp, wildcard: wc) = partition_cases(cases: cases, sp_acc: [], wc_acc: [])
+  let sorted = isort_cases(xs: sp)
+  return concat_cases(a: sorted, b: wc)
+end
+
+// Phase 3: redundancy elimination.
+// Once we encounter a PWild or PVar arm (catchall), all subsequent arms
+// are dead. Strip them. The wildcard arm itself is kept.
+
+let phase3_cases = fn (cases: [HirMatchCase]) -> [HirMatchCase] do
+  return phase3_go(cases: cases, acc: [])
+end
+
+let phase3_go = fn (cases: [HirMatchCase], acc: [HirMatchCase]) -> [HirMatchCase] do
+  match cases do
+    | [] -> return rev_cases(xs: acc, out: [])
+    | HirMatchCase(pattern: pat, body: b) :: rest ->
+      if pat_is_wildcard(pat) then
+        return rev_cases(xs: HirMatchCase(pattern: pat, body: b) :: acc, out: [])
+      else
+        return phase3_go(cases: rest, acc: HirMatchCase(pattern: pat, body: b) :: acc)
+      end
+  end
+end
+
+// Full canonicalization of a single match case list.
+
+let canonicalize_cases = fn (cases: [HirMatchCase]) -> [HirMatchCase] do
+  // Phase 3: strip dead arms after first wildcard.
+  let after_p3 = phase3_cases(cases: cases)
+  // Phase 2 (arm sort) is intentionally skipped: reordering PCtor arms across
+  // heterogeneous types (e.g. list Cons vs custom-type ctors in the same match)
+  // changes semantics. Without an enum-def map at this layer we cannot tell
+  // which ctors belong to the same enum, so we conservatively omit the sort.
+  // Phase 1: fuse arms with identical simple bodies into a single POr arm.
+  let after_p1 = phase1_cases(cases: after_p3)
+  return after_p1
+end
+
+// HIR tree rewriter: recurse into every HirExpr/HirStmt and rewrite Match nodes.
+
+let canon_expr = fn (e: HirExpr) -> HirExpr do
+  let HirExpr(node: k, span: sp) = e
+  return HirExpr(node: canon_expr_kind(k: k), span: sp)
+end
+
+let canon_expr_kind = fn (k: HirExprKind) -> HirExprKind do
+  match k do
+    | Literal(_) | Variable(_) | Borrow(_) | ExternalRef(_) -> return k
+    | BinOp(left: l, op, right: r) ->
+      return BinOp(left: canon_expr(e: l), op, right: canon_expr(e: r))
+    | UnOp(op, operand: o) ->
+      return UnOp(op, operand: canon_expr(e: o))
+    | Call(func: f, args) ->
+      return Call(func: f, args: canon_call_args(args: args))
+    | Ctor(variant: v, args, sigil: sig) ->
+      return Ctor(variant: v, args: canon_expr_list(es: args), sigil: sig)
+    | Record(fields: fs) ->
+      return Record(fields: canon_named_exprs(fs: fs))
+    | Array(elems: es) ->
+      return Array(elems: canon_expr_list(es: es))
+    | Index(target: t, index: i) ->
+      return Index(target: canon_expr(e: t), index: canon_expr(e: i))
+    | FieldAccess(target: t, field: f) ->
+      return FieldAccess(target: canon_expr(e: t), field: f)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      let new_eb = match eb do
+        | None -> None
+        | Some(val: s) -> Some(val: canon_stmts(stmts: s))
+      end
+      return If(cond: canon_expr(e: c), then_branch: canon_stmts(stmts: tb), else_branch: new_eb)
+    | Match(target: t, cases: cs) ->
+      let new_cs = canonicalize_cases(cases: cs)
+      let rewritten = canon_cases(cases: new_cs)
+      return Match(target: canon_expr(e: t), cases: rewritten)
+    | While(cond: c, body: b) ->
+      return While(cond: canon_expr(e: c), body: canon_stmts(stmts: b))
+    | For(var: v, start: s, end_expr: ee, body: b) ->
+      return For(var: v, start: canon_expr(e: s), end_expr: canon_expr(e: ee), body: canon_stmts(stmts: b))
+    | Lambda(type_params: tp, params, ret_type: rt, body: b) ->
+      return Lambda(type_params: tp, params, ret_type: rt, body: canon_stmts(stmts: b))
+    | Raise(expr: e) -> return Raise(expr: canon_expr(e: e))
+    | Force(expr: e) -> return Force(expr: canon_expr(e: e))
+    | Thunk(body: b) -> return Thunk(body: canon_expr(e: b))
+    | Handler(port_name: pn, arms) ->
+      return Handler(port_name: pn, arms: canon_handler_arms(arms: arms))
+  end
+end
+
+let canon_stmts = fn (stmts: [HirStmt]) -> [HirStmt] do
+  return canon_stmts_go(stmts: stmts, acc: [])
+end
+
+let canon_stmts_go = fn (stmts: [HirStmt], acc: [HirStmt]) -> [HirStmt] do
+  match stmts do
+    | [] -> return rev_stmts(xs: acc, out: [])
+    | HirStmt(node: s, span: sp) :: rest ->
+      return canon_stmts_go(stmts: rest, acc: HirStmt(node: canon_stmt_kind(s: s), span: sp) :: acc)
+  end
+end
+
+let canon_stmt_kind = fn (s: HirStmtKind) -> HirStmtKind do
+  match s do
+    | Let(name: n, sigil: sig, typ: t, value: v) ->
+      return Let(name: n, sigil: sig, typ: t, value: canon_expr(e: v))
+    | Expr(expr: e) -> return Expr(expr: canon_expr(e: e))
+    | Return(expr: e) -> return Return(expr: canon_expr(e: e))
+    | Assign(target: t, value: v) ->
+      return Assign(target: canon_expr(e: t), value: canon_expr(e: v))
+    | Try(body: b, catch_param: cp, catch_body: cb) ->
+      return Try(body: canon_stmts(stmts: b), catch_param: cp, catch_body: canon_stmts(stmts: cb))
+    | Inject(handlers: hs, body: b) ->
+      return Inject(handlers: hs, body: canon_stmts(stmts: b))
+  end
+end
+
+let canon_cases = fn (cases: [HirMatchCase]) -> [HirMatchCase] do
+  return canon_cases_go(cases: cases, acc: [])
+end
+
+let canon_cases_go = fn (cases: [HirMatchCase], acc: [HirMatchCase]) -> [HirMatchCase] do
+  match cases do
+    | [] -> return rev_cases(xs: acc, out: [])
+    | HirMatchCase(pattern: pat, body: b) :: rest ->
+      return canon_cases_go(cases: rest, acc: HirMatchCase(pattern: pat, body: canon_stmts(stmts: b)) :: acc)
+  end
+end
+
+let canon_call_args = fn (args: [HirCallArg]) -> [HirCallArg] do
+  return canon_call_args_go(args: args, acc: [])
+end
+
+let canon_call_args_go = fn (args: [HirCallArg], acc: [HirCallArg]) -> [HirCallArg] do
+  match args do
+    | [] -> return rev_call_args(xs: acc, out: [])
+    | HirCallArg(label: l, value: v) :: rest ->
+      return canon_call_args_go(args: rest, acc: HirCallArg(label: l, value: canon_expr(e: v)) :: acc)
+  end
+end
+
+let canon_expr_list = fn (es: [HirExpr]) -> [HirExpr] do
+  return canon_expr_list_go(es: es, acc: [])
+end
+
+let canon_expr_list_go = fn (es: [HirExpr], acc: [HirExpr]) -> [HirExpr] do
+  match es do
+    | [] -> return rev_exprs(xs: acc, out: [])
+    | e :: rest -> return canon_expr_list_go(es: rest, acc: canon_expr(e: e) :: acc)
+  end
+end
+
+let canon_named_exprs = fn (fs: [HirNamedExpr]) -> [HirNamedExpr] do
+  return canon_named_exprs_go(fs: fs, acc: [])
+end
+
+let canon_named_exprs_go = fn (fs: [HirNamedExpr], acc: [HirNamedExpr]) -> [HirNamedExpr] do
+  match fs do
+    | [] -> return rev_named_exprs(xs: acc, out: [])
+    | HirNamedExpr(name: n, value: v) :: rest ->
+      return canon_named_exprs_go(fs: rest, acc: HirNamedExpr(name: n, value: canon_expr(e: v)) :: acc)
+  end
+end
+
+let canon_handler_arms = fn (arms: [HirHandlerArm]) -> [HirHandlerArm] do
+  return canon_handler_arms_go(arms: arms, acc: [])
+end
+
+let canon_handler_arms_go = fn (arms: [HirHandlerArm], acc: [HirHandlerArm]) -> [HirHandlerArm] do
+  match arms do
+    | [] -> return rev_handler_arms(xs: acc, out: [])
+    | HirHandlerArm(arm: f, cont_binder: cb) :: rest ->
+      return canon_handler_arms_go(arms: rest, acc: HirHandlerArm(arm: canon_function(f: f), cont_binder: cb) :: acc)
+  end
+end
+
+let canon_function = fn (f: HirFunction) -> HirFunction do
+  let HirFunction(name: n, type_params: tp, params: ps, ret_type: rt, throw_row: tr, body: b, span: sp, file: fi, requires: req) = f
+  let new_body = match b do
+    | LazyBody(_) -> b
+    | EagerBody(stmts: ss) -> EagerBody(stmts: canon_stmts(stmts: ss))
+  end
+  return HirFunction(name: n, type_params: tp, params: ps, ret_type: rt, throw_row: tr, body: new_body, span: sp, file: fi, requires: req)
+end
+
+let canon_functions = fn (funcs: [HirFunction]) -> [HirFunction] do
+  return canon_functions_go(funcs: funcs, acc: [])
+end
+
+let canon_functions_go = fn (funcs: [HirFunction], acc: [HirFunction]) -> [HirFunction] do
+  match funcs do
+    | [] -> return rev_functions(xs: acc, out: [])
+    | f :: rest ->
+      return canon_functions_go(funcs: rest, acc: canon_function(f: f) :: acc)
+  end
+end
+
+let canon_handler_bindings = fn (bindings: [HirHandlerBindingEntry]) -> [HirHandlerBindingEntry] do
+  return canon_handler_bindings_go(bindings: bindings, acc: [])
+end
+
+let canon_handler_bindings_go = fn (bindings: [HirHandlerBindingEntry], acc: [HirHandlerBindingEntry]) -> [HirHandlerBindingEntry] do
+  match bindings do
+    | [] -> return rev_handler_bindings(xs: acc, out: [])
+    | HirHandlerBindingEntry(name: n, binding: HirHandlerBinding(port_name: pn, arms)) :: rest ->
+      let new_arms = canon_handler_arms(arms: arms)
+      return canon_handler_bindings_go(bindings: rest, acc: HirHandlerBindingEntry(name: n, binding: HirHandlerBinding(port_name: pn, arms: new_arms)) :: acc)
+  end
+end
+
+/** Run all canonicalization phases over a HirProgram.
+ *  Returns a new HirProgram with canonicalized match expressions in every
+ *  function body and handler arm.
+ */
+export let canonicalize_program = fn (prog: HirProgram) -> HirProgram do
+  match prog do
+    | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
+      let new_funcs = canon_functions(funcs: hf)
+      let new_hb = canon_handler_bindings(bindings: hb)
+      return HirProgram(ports: hp, functions: new_funcs, externals: he, handler_bindings: new_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
+  end
+end
