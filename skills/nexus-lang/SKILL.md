@@ -337,6 +337,15 @@ let sum2 = fn (xs: [ i64 ]) -> i64 do
 end
 ```
 
+## Comment and Documentation Policy
+
+**Do not embed `bd` issue IDs (`nexus-XXXX`) in source comments or filenames.**
+The `bd` database is local to this repository and unresolvable for external readers.
+Write self-contained comments that explain *why* without referencing the issue tracker.
+Capture bd context in commit messages and PR descriptions instead.
+
+See `AGENTS.md` for the full policy.
+
 ## Preferred Writing Style
 
 These are style preferences beyond correctness — both forms compile, but the left-hand form is idiomatic in this codebase.

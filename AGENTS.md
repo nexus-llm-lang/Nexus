@@ -16,6 +16,14 @@ Development tooling/targets change → update `flake.nix` first.
 By convention, list capabilities/exceptions alphabetically (e.g. `require { Console, Fs }`, `require { PermClock, PermConsole, PermFs, PermProc }`).
 Drop `require { ... }` entirely if the body uses no caps.
 
+## bd Issue IDs in Source
+
+**Do not put bd issue IDs (`nexus-XXXX`) into source code or filenames.**
+The bd database is local to this repo; references are unresolvable for any reader
+outside the owner's machine.
+Capture bd context in **commit messages**, **PR descriptions**, and the bd issue body
+itself — never in source comments or test filenames.
+
 ## Session Completion
 1. Create issues for remaining work (`bd create`)
 2. Run quality gates if code changed
