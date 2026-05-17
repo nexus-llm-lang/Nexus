@@ -37,7 +37,7 @@ import {
   HirCallArg, HirNamedExpr, HirMatchCase, HirParam,
   HirPatternKind, PLit, PVar, PCtor, PRec, PWild, POr,
   HirPatternField, HirRecordPatField,
-  ExceptionGroupEntry,
+  ExceptionGroupEntry, HirPort,
   HirHandlerArm, HirFunction, EagerBody, LazyBody
 } from "src/ir/hir/types.nx"
 import {
@@ -51,6 +51,7 @@ import * as subst from "src/typecheck/subst.nx"
 import * as unify from "src/typecheck/unify.nx"
 import * as capture from "src/typecheck/capture.nx"
 import * as exhaustive from "src/typecheck/exhaustive.nx"
+import * as tcwf from "src/typecheck/tcwf.nx"
 import {
   InstantiateResult, FreshenResult,
   infer_literal, infer_variable, infer_borrow, infer_borrow_arg_position,
@@ -61,7 +62,7 @@ import {
   reverse_named_types, lookup_named_type,
   find_linear_field, type_carries_linear
 }, * as collections from "src/typecheck/infer/collections.nx"
-import { TypeError, ThrowsRowInvariantBroken, DuplicateInjectPort, HandlerRequireNotSubset, DuplicateRecordLabel, DuplicatePatternLabel } from "src/common/error.nx"
+import { TypeError, ThrowsRowInvariantBroken, DuplicateInjectPort, HandlerRequireNotSubset, DuplicateRecordLabel, DuplicatePatternLabel, UnreachableCode } from "src/common/error.nx"
 import { StrMap }, * as smap from "src/common/strmap.nx"
 import * as str from "std:str"
 import * as list from "std:list"
@@ -125,6 +126,16 @@ export let infer_expr = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr
       // checked via check_handler_arm_bodies, but by then the construction-
       // site env is lost. Run the scan here where we still see it, mirroring
       // infer_lambda's RefCaptureHit handling.
+      //
+      // T-Handler wfCap: the declared `require { … }` row of an inline handler
+      // must satisfy wfCap — every named capability must be in SysCaps or a
+      // declared port.  Global handlers are checked in register_handler_bindings
+      // (check.nx); inline expression handlers were previously unchecked.
+      // We pass `ports: []` here because inline handlers cannot name user ports
+      // in their require row (only system capabilities are valid at expression
+      // sites without an enclosing port declaration context) — the same
+      // convention used by check_handler_arm_throw_rows for arm-level caps.
+      tcwf.wf_cap(row: handler_req, ports: [], span: sp)
       match scan_handler_arms_for_ref_capture(arms: hms, outer_env: tctypes.state_env(state)) do
         | Some(val: capture.RefCaptureHit(name: rn, span: rsp)) ->
           return InferExprErr(message: "handler arm captures mutable ref binding " ++ rn ++ " (refs are stack-confined)", span: rsp)
@@ -1230,6 +1241,23 @@ end
 
 // ─── Statement inference ────────────────────────────────────────────────────
 
+/** T-Seq dead-code predicate: returns true when a statement definitely
+ *  diverges (control never reaches the next statement in the sequence).
+ *  Currently recognises:
+ *   - `return e`          — Return stmt
+ *   - `raise Exn(...)`    — Expr stmt whose top-level node is a Raise expr
+ *  These are the only HIR forms whose inferred type is ⊥ (a fresh unconstrained
+ *  type variable representing unreachable context), mirroring infer_return and
+ *  infer_raise which both return a fresh TyVar.
+ */
+let stmt_diverges = fn (s: HirStmtKind) -> bool do
+  match s do
+    | Return(_) -> return true
+    | Expr(expr: HirExpr(node: Raise(_), span: _)) -> return true
+    | _ -> return false
+  end
+end
+
 /** Infer types for a statement sequence, threading state and accumulating subst; the result type is that of the final statement (or unit if empty). */
 export let infer_stmts = fn (state: CheckState, stmts: [HirStmt], ret_type: TypeExpr) -> InferExprResult throws { TypeError } do
   match stmts do
@@ -1241,7 +1269,12 @@ export let infer_stmts = fn (state: CheckState, stmts: [HirStmt], ret_type: Type
           match rest do
             | [] ->
               return InferExprOk(state: st1, subst: s1, typ: stmt_type)
-            | _ ->
+            | HirStmt(node: _, span: rest_sp) :: _ ->
+              // T-Seq: if τ₁ = ⊥ (the statement diverges), all following
+              // statements are unreachable — reject with E2021.
+              if stmt_diverges(s) then
+                raise UnreachableCode(span: rest_sp)
+              end
               let env1 = subst.subst_apply_env(subst: s1, env: tctypes.state_env(state: st1))
               let st2 = tctypes.state_with_env(state: st1, env: env1)
               match infer_stmts(state: st2, stmts: rest, ret_type: subst.subst_apply(subst: s1, typ: ret_type)) do
