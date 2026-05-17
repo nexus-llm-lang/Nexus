@@ -49,7 +49,7 @@ import * as list from "std:list"
 import {
   TypeExpr, TyLinear, TyLazy, TyArray, TyBorrow, TyRef, TyUserDefined,
   TyRow, TyVar, TyList, TyRecord,
-  NamedType, RecordDef,
+  NamedType, RecordDef, EnumDef, VariantDef, VariantField,
   Sigil, SigilLinear, SigilLazy, SigilImmutable, SigilMutable, SigilBorrow
 } from "src/common/ast.nx"
 import {
@@ -227,6 +227,162 @@ let lin_typedef_lookup = fn (defs: [RecordDef], name: string) -> Option<RecordDe
     | RecordDef(name: n, is_public: ip, type_params: tp, fields: f) :: rest ->
       if n == name then return Some(val: RecordDef(name: n, is_public: ip, type_params: tp, fields: f)) end
       return lin_typedef_lookup(defs: rest, name)
+  end
+end
+
+/** Look up the field list for an enum variant named `variant` by scanning all
+ *  EnumDef.variants lists. Returns the VariantField list if found. Used by
+ *  bind_pattern_fields to determine whether each PCtor field is linear.
+ */
+let lin_enum_variant_fields = fn (defs: [EnumDef], variant: string) -> Option<[VariantField]> do
+  match defs do
+    | [] -> return None
+    | EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      match lin_find_variant_in_list(vs, variant) do
+        | Some(val: fs) -> return Some(val: fs)
+        | None -> return lin_enum_variant_fields(defs: rest, variant)
+      end
+  end
+end
+
+let lin_find_variant_in_list = fn (vs: [VariantDef], variant: string) -> Option<[VariantField]> do
+  match vs do
+    | [] -> return None
+    | VariantDef(name: n, fields: fs) :: rest ->
+      if n == variant then return Some(val: fs) end
+      return lin_find_variant_in_list(vs: rest, variant)
+  end
+end
+
+/** Return the TypeExpr for the i-th field of `variant_fields`, matching by
+ *  name when `fname` is Some(…) and `variant_fields` has named fields, or by
+ *  positional index otherwise. Returns None when no match is found.
+ */
+let lin_variant_field_type_at = fn (
+  variant_fields: [VariantField], fname: Option<string>, idx: i64
+) -> Option<TypeExpr> do
+  match variant_fields do
+    | [] -> return None
+    | VariantField(name: vfname, typ: t) :: rest ->
+      match fname do
+        | Some(val: n) ->
+          match vfname do
+            | Some(val: vn) ->
+              if vn == n then return Some(val: t) end
+              return lin_variant_field_type_at(variant_fields: rest, fname, idx: idx + 1)
+            | None ->
+              if idx == 0 then return Some(val: t) end
+              return lin_variant_field_type_at(variant_fields: rest, fname, idx: idx - 1)
+          end
+        | None ->
+          if idx == 0 then return Some(val: t) end
+          return lin_variant_field_type_at(variant_fields: rest, fname, idx: idx - 1)
+      end
+  end
+end
+
+/** Return the TypeExpr for record field `fname` by scanning NamedType list.
+ *  Used by bind_pattern_rec_fields to determine if a PRec field is linear.
+ */
+let lin_record_field_type_by_name = fn (fields: [NamedType], fname: string) -> Option<TypeExpr> do
+  match fields do
+    | [] -> return None
+    | NamedType(name: n, typ: t) :: rest ->
+      if n == fname then return Some(val: t) end
+      return lin_record_field_type_by_name(fields: rest, fname)
+  end
+end
+
+/** Scan all RecordDefs for a record that has a field named `fname` with a
+ *  linear type. Conservative: any match wins. Used for PRec patterns where
+ *  the scrutinee type is not tracked through the pattern AST.
+ */
+let lin_any_record_has_linear_field = fn (
+  tdefs: [RecordDef], fname: string
+) -> bool do
+  match tdefs do
+    | [] -> return false
+    | RecordDef(name: _, is_public: _, type_params: _, fields: fs) :: rest ->
+      match lin_record_field_type_by_name(fields: fs, fname) do
+        | Some(val: ft) -> if is_linear_binding_type(ft, tdefs) then return true end
+        | None -> ()
+      end
+      return lin_any_record_has_linear_field(tdefs: rest, fname)
+  end
+end
+
+/** True when the named field `fname` of variant `variant` is declared with a
+ *  linear type (is_linear_binding_type). Returns false when the variant is
+ *  not found, when the field is not found, or when the field type is not linear.
+ */
+let lin_field_is_linear = fn (
+  defs: [EnumDef], variant: string, fname: string, tdefs: [RecordDef]
+) -> bool do
+  match defs do
+    | [] -> return false
+    | EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      if lin_variant_has_name(vs: vs, variant) then
+        return lin_named_field_linear_in_variant(vs: vs, variant, fname, tdefs)
+      end
+      return lin_field_is_linear(defs: rest, variant, fname, tdefs)
+  end
+end
+
+/** True when any VariantDef in `vs` has name `variant`. Used to distinguish
+ *  "variant found, field not linear" from "variant not found".
+ */
+let lin_variant_has_name = fn (vs: [VariantDef], variant: string) -> bool do
+  match vs do
+    | [] -> return false
+    | VariantDef(name: n, fields: _) :: rest ->
+      if n == variant then return true end
+      return lin_variant_has_name(vs: rest, variant)
+  end
+end
+
+/** True when variant `variant` in `vs` has a field named `fname` with a
+ *  linear declared type. Returns false when variant not found or field not linear.
+ */
+let lin_named_field_linear_in_variant = fn (
+  vs: [VariantDef], variant: string, fname: string, tdefs: [RecordDef]
+) -> bool do
+  match vs do
+    | [] -> return false
+    | VariantDef(name: n, fields: fs) :: rest ->
+      if n == variant then
+        return lin_check_named_field_linear(fields: fs, fname, tdefs)
+      end
+      return lin_named_field_linear_in_variant(vs: rest, variant, fname, tdefs)
+  end
+end
+
+let lin_check_named_field_linear = fn (
+  fields: [VariantField], fname: string, tdefs: [RecordDef]
+) -> bool do
+  match fields do
+    | [] -> return false
+    | VariantField(name: vfname, typ: t) :: rest ->
+      match vfname do
+        | Some(val: n) ->
+          if n == fname then return is_linear_binding_type(t, tdefs) end
+          return lin_check_named_field_linear(fields: rest, fname, tdefs)
+        | None ->
+          return lin_check_named_field_linear(fields: rest, fname, tdefs)
+      end
+  end
+end
+
+/** True when variant `variant` is declared in any EnumDef in `defs`. Used to
+ *  distinguish "variant found, field not linear" from "variant not found" so
+ *  bind_pattern_fields_for_variant can fall back to scrutinee_linear only when
+ *  the variant is truly unknown.
+ */
+let lin_variant_is_known = fn (defs: [EnumDef], variant: string) -> bool do
+  match defs do
+    | [] -> return false
+    | EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      if lin_variant_has_name(vs: vs, variant) then return true end
+      return lin_variant_is_known(defs: rest, variant)
   end
 end
 
@@ -597,42 +753,42 @@ end
 /** Run the linearity pass over every function and handler-arm in `prog`: each linear binding consumed exactly once, no leaks across throwable calls. Raises TypeError on the first violation. */
 export let check_program = fn (prog: HirProgram) -> unit throws { TypeError } do
   let sigs = build_sig_map(prog)
-  match prog do | HirProgram(ports: _, functions: fs, externals: _, handler_bindings: hbs, enum_defs: _, exception_groups: _, value_binding_names: _, type_defs: tdefs) ->
-    check_functions(funcs: fs, sigs, tdefs)
-    return check_handler_bindings(bindings: hbs, sigs, tdefs)
+  match prog do | HirProgram(ports: _, functions: fs, externals: _, handler_bindings: hbs, enum_defs: edefs, exception_groups: _, value_binding_names: _, type_defs: tdefs) ->
+    check_functions(funcs: fs, sigs, tdefs, enum_defs: edefs)
+    return check_handler_bindings(bindings: hbs, sigs, tdefs, enum_defs: edefs)
   end
 end
 
-let check_functions = fn (funcs: [HirFunction], sigs: [SigEntry], tdefs: [RecordDef]) -> unit throws { TypeError } do
+let check_functions = fn (funcs: [HirFunction], sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef]) -> unit throws { TypeError } do
   match funcs do
     | [] -> return ()
     | f :: rest ->
-      check_function(func: f, sigs, tdefs)
-      return check_functions(funcs: rest, sigs, tdefs)
+      check_function(func: f, sigs, tdefs, enum_defs)
+      return check_functions(funcs: rest, sigs, tdefs, enum_defs)
   end
 end
 
 let check_handler_bindings = fn (
-  bindings: [HirHandlerBindingEntry], sigs: [SigEntry], tdefs: [RecordDef]
+  bindings: [HirHandlerBindingEntry], sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef]
 ) -> unit throws { TypeError } do
   match bindings do
     | [] -> return ()
     | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, arms)) :: rest ->
-      check_handler_arms(arms, sigs, tdefs)
-      return check_handler_bindings(bindings: rest, sigs, tdefs)
+      check_handler_arms(arms, sigs, tdefs, enum_defs)
+      return check_handler_bindings(bindings: rest, sigs, tdefs, enum_defs)
   end
 end
 
-let check_handler_arms = fn (arms: [HirHandlerArm], sigs: [SigEntry], tdefs: [RecordDef]) -> unit throws { TypeError } do
+let check_handler_arms = fn (arms: [HirHandlerArm], sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef]) -> unit throws { TypeError } do
   match arms do
     | [] -> return ()
     | HirHandlerArm(arm: f, cont_binder: _) :: rest ->
-      check_function(func: f, sigs, tdefs)
-      return check_handler_arms(arms: rest, sigs, tdefs)
+      check_function(func: f, sigs, tdefs, enum_defs)
+      return check_handler_arms(arms: rest, sigs, tdefs, enum_defs)
   end
 end
 
-let check_function = fn (func: HirFunction, sigs: [SigEntry], tdefs: [RecordDef]) -> unit throws { TypeError } do
+let check_function = fn (func: HirFunction, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef]) -> unit throws { TypeError } do
   match func do | HirFunction(name: _, type_params: _, params: ps, ret_type: _, throw_row: _, body: b, span: sp, file: _, requires: _) ->
     match b do
       | EagerBody(stmts) ->
@@ -641,7 +797,7 @@ let check_function = fn (func: HirFunction, sigs: [SigEntry], tdefs: [RecordDef]
         let initial_vars = collect_linear_params(params: ps, tdefs, acc: [])
         let st0 = lin_set_vars(st: lin_empty(), vs: initial_vars)
         let st1 = lin_push_frame(st: st0)
-        let st2 = check_stmts(stmts, st: st1, sigs, tdefs)
+        let st2 = check_stmts(stmts, st: st1, sigs, tdefs, enum_defs)
         // Function-end consumption check: any linear param or local left
         // live raises Unused.
         return require_empty_or_droppable(
@@ -730,13 +886,13 @@ end
 // ─── Statement walk ──────────────────────────────────────────────────────────
 
 let check_stmts = fn (
-  stmts: [HirStmt], st: LinState, sigs: [SigEntry], tdefs: [RecordDef]
+  stmts: [HirStmt], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef]
 ) -> LinState throws { TypeError } do
   match stmts do
     | [] -> return st
     | HirStmt(node: nd, span: sp) :: rest ->
-      let st1 = check_stmt(stmt: nd, st, sigs, tdefs, span: sp, at_stmt_level: true)
-      return check_stmts(stmts: rest, st: st1, sigs, tdefs)
+      let st1 = check_stmt(stmt: nd, st, sigs, tdefs, enum_defs, span: sp, at_stmt_level: true)
+      return check_stmts(stmts: rest, st: st1, sigs, tdefs, enum_defs)
   end
 end
 
@@ -754,13 +910,13 @@ let call_ret_non_droppable = fn (value: HirExpr, sigs: [SigEntry]) -> bool do
 end
 
 let check_stmt = fn (
-  stmt: HirStmtKind, st: LinState, sigs: [SigEntry], tdefs: [RecordDef], span: Span, at_stmt_level: bool
+  stmt: HirStmtKind, st: LinState, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef], span: Span, at_stmt_level: bool
 ) -> LinState throws { TypeError } do
   match stmt do
     | Let(name: n, sigil: sig, typ: ann, value: v) ->
       // Walk RHS first so any linear use inside it is consumed before the
       // new binding is added.
-      let st1 = check_expr(expr: v, st, sigs, tdefs, at_stmt_level: false)
+      let st1 = check_expr(expr: v, st, sigs, tdefs, enum_defs, at_stmt_level: false)
       let binds_lin = let_binds_linear(sigil: sig, ann, value: v, sigs, tdefs)
       if n == "_" then
         // reject `let _ = e` when e is non-auto-droppable linear.
@@ -774,49 +930,49 @@ let check_stmt = fn (
       // call leak check. Nested calls inside larger
       // expressions are not at stmt level — they consume their inputs and
       // close the leak window via the surrounding consumer.
-      return check_expr(expr: e, st, sigs, tdefs, at_stmt_level)
+      return check_expr(expr: e, st, sigs, tdefs, enum_defs, at_stmt_level)
     | Return(expr: e) ->
       // After return, the function exits; the unused-linear check fires at
       // function level. We still walk e to consume linears used in it.
-      return check_expr(expr: e, st, sigs, tdefs, at_stmt_level: false)
+      return check_expr(expr: e, st, sigs, tdefs, enum_defs, at_stmt_level: false)
     | Assign(target: t, value: v) ->
-      let st1 = check_expr(expr: t, st, sigs, tdefs, at_stmt_level: false)
-      return check_expr(expr: v, st: st1, sigs, tdefs, at_stmt_level: false)
+      let st1 = check_expr(expr: t, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      return check_expr(expr: v, st: st1, sigs, tdefs, enum_defs, at_stmt_level: false)
     | Try(body: b, catch_param: _, catch_body: cb) ->
       // Push pre-try snapshot for Strategy A: anything alive at this point
       // is the catch arm's responsibility on throw. Throwable-call check
       // inside the body excludes those vars from "leaked".
       let pre_try_vars = lin_state_vars(st)
       let st_try = lin_push_frame(st)
-      let st_after_try = check_stmts(stmts: b, st: st_try, sigs, tdefs)
+      let st_after_try = check_stmts(stmts: b, st: st_try, sigs, tdefs, enum_defs)
       let st_after_try2 = lin_pop_frame(st: st_after_try)
       // Catch arm starts from pre-try snapshot (Strategy A),
       // not from the post-success state. The catch arm must finish with
       // the same linear-var set as the post-success state (per-arm
       // consistency — "Linear mismatch across catch arms").
       let st_catch_in = lin_set_vars(st: st_after_try2, vs: pre_try_vars)
-      let st_catch_out = check_stmts(stmts: cb, st: st_catch_in, sigs, tdefs)
+      let st_catch_out = check_stmts(stmts: cb, st: st_catch_in, sigs, tdefs, enum_defs)
       let post_catch_vars = lin_state_vars(st: st_catch_out)
       let post_try_vars = lin_state_vars(st: st_after_try2)
       if !vars_equal(a: post_try_vars, b: post_catch_vars) then
         throw LinearMismatch(detail: "try/catch arms diverge on linear set", span)
       end
       return lin_set_vars(st: st_after_try2, vs: post_try_vars)
-    | Inject(handlers: _, body: b) -> return check_stmts(stmts: b, st, sigs, tdefs)
+    | Inject(handlers: _, body: b) -> return check_stmts(stmts: b, st, sigs, tdefs, enum_defs)
   end
 end
 
 // ─── Expression walk ─────────────────────────────────────────────────────────
 
 let check_expr = fn (
-  expr: HirExpr, st: LinState, sigs: [SigEntry], tdefs: [RecordDef], at_stmt_level: bool
+  expr: HirExpr, st: LinState, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef], at_stmt_level: bool
 ) -> LinState throws { TypeError } do
   let HirExpr(node: nd, span: sp) = expr
-  return check_expr_kind(expr: nd, st, sigs, tdefs, span: sp, at_stmt_level)
+  return check_expr_kind(expr: nd, st, sigs, tdefs, enum_defs, span: sp, at_stmt_level)
 end
 
 let check_expr_kind = fn (
-  expr: HirExprKind, st: LinState, sigs: [SigEntry], tdefs: [RecordDef], span: Span, at_stmt_level: bool
+  expr: HirExprKind, st: LinState, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef], span: Span, at_stmt_level: bool
 ) -> LinState throws { TypeError } do
   match expr do
     | Literal(_) -> return st
@@ -826,12 +982,12 @@ let check_expr_kind = fn (
     | Borrow(name: _, sigil: _) ->
       return st
     | BinOp(left: l, op: _, right: r) ->
-      let st1 = check_expr(expr: l, st, sigs, tdefs, at_stmt_level: false)
-      return check_expr(expr: r, st: st1, sigs, tdefs, at_stmt_level: false)
+      let st1 = check_expr(expr: l, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      return check_expr(expr: r, st: st1, sigs, tdefs, enum_defs, at_stmt_level: false)
     | UnOp(op: _, operand: o) ->
-      return check_expr(expr: o, st, sigs, tdefs, at_stmt_level: false)
+      return check_expr(expr: o, st, sigs, tdefs, enum_defs, at_stmt_level: false)
     | Call(func: f, args: cargs) ->
-      let st1 = check_call_args(args: cargs, st, sigs, tdefs)
+      let st1 = check_call_args(args: cargs, st, sigs, tdefs, enum_defs)
       // If `f` itself is a linear-bound variable (let %g = …), consume it
       // here too: the function name is Linear/Lazy and a call uses it.
       let st2 = if lin_member(st: st1, name: f) then lin_remove(st: st1, name: f) else st1 end
@@ -841,23 +997,23 @@ let check_expr_kind = fn (
       end
       return st2
     | Ctor(variant: _, args: cargs, sigil: _) ->
-      return check_exprs(exprs: cargs, st, sigs, tdefs)
+      return check_exprs(exprs: cargs, st, sigs, tdefs, enum_defs)
     | Record(fields: fs) ->
-      return check_named_exprs(fields: fs, st, sigs, tdefs)
+      return check_named_exprs(fields: fs, st, sigs, tdefs, enum_defs)
     | Array(elems: es) ->
-      return check_exprs(exprs: es, st, sigs, tdefs)
+      return check_exprs(exprs: es, st, sigs, tdefs, enum_defs)
     | Index(target: t, index: i) ->
       // Move-out rejection: indexing a linear-element array would move the
       // element out. Implementing this requires per-Index typing; left to
       // a future linearity follow-up. The structural walk still recurses.
-      let st1 = check_expr(expr: t, st, sigs, tdefs, at_stmt_level: false)
-      return check_expr(expr: i, st: st1, sigs, tdefs, at_stmt_level: false)
+      let st1 = check_expr(expr: t, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      return check_expr(expr: i, st: st1, sigs, tdefs, enum_defs, at_stmt_level: false)
     | FieldAccess(target: t, field: _) ->
-      return check_expr(expr: t, st, sigs, tdefs, at_stmt_level: false)
+      return check_expr(expr: t, st, sigs, tdefs, enum_defs, at_stmt_level: false)
     | If(cond: c, then_branch: tb, else_branch: eb) ->
-      let st1 = check_expr(expr: c, st, sigs, tdefs, at_stmt_level: false)
+      let st1 = check_expr(expr: c, st, sigs, tdefs, enum_defs, at_stmt_level: false)
       let then_diverges = stmts_diverge(stmts: tb)
-      let st_then = check_stmts(stmts: tb, st: st1, sigs, tdefs)
+      let st_then = check_stmts(stmts: tb, st: st1, sigs, tdefs, enum_defs)
       match eb do
         | None ->
           if then_diverges then
@@ -876,7 +1032,7 @@ let check_expr_kind = fn (
           return st1
         | Some(val: ebs) ->
           let else_diverges = stmts_diverge(stmts: ebs)
-          let st_else = check_stmts(stmts: ebs, st: st1, sigs, tdefs)
+          let st_else = check_stmts(stmts: ebs, st: st1, sigs, tdefs, enum_defs)
           if then_diverges && else_diverges then
             check_divergent_arm_unused(arm_out: st_then, outer_vars: lin_state_vars(st: st1), span)
             check_divergent_arm_unused(arm_out: st_else, outer_vars: lin_state_vars(st: st1), span)
@@ -901,8 +1057,8 @@ let check_expr_kind = fn (
       // receives a linear scrutinee must track x as linear (q = 1) even
       // though x carries no % sigil itself.
       let scrutinee_linear = is_linear_scrutinee(target: t, st)
-      let st1 = check_expr(expr: t, st, sigs, tdefs, at_stmt_level: false)
-      return check_match_cases(cases: cs, st: st1, sigs, tdefs, span, scrutinee_linear)
+      let st1 = check_expr(expr: t, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      return check_match_cases(cases: cs, st: st1, sigs, tdefs, enum_defs, span, scrutinee_linear)
     | While(cond: c, body: b) ->
       // T-While (/ spec t9cl.8): the cond expression is
       // evaluated an unbounded number of times (once per iteration plus the
@@ -911,21 +1067,21 @@ let check_expr_kind = fn (
       // We snapshot the pre-cond live set and reject if check_expr on
       // the cond removes any linear from it.
       let pre_vars = lin_state_vars(st)
-      let st_cond = check_expr(expr: c, st, sigs, tdefs, at_stmt_level: false)
+      let st_cond = check_expr(expr: c, st, sigs, tdefs, enum_defs, at_stmt_level: false)
       let post_cond_vars = lin_state_vars(st: st_cond)
       if !vars_equal(a: pre_vars, b: post_cond_vars) then
         throw LinearMismatch(detail: "while-cond consumes linear binding(s); the cond runs an unbounded number of times so any linear consume in it is unsound (pre=" ++ join_simple(xs: pre_vars) ++ " post-cond=" ++ join_simple(xs: post_cond_vars) ++ ")", span)
       end
-      let st_body = check_stmts(stmts: b, st: st_cond, sigs, tdefs)
+      let st_body = check_stmts(stmts: b, st: st_cond, sigs, tdefs, enum_defs)
       // While body must preserve linear set (it may run zero times).
       if !vars_equal(a: lin_state_vars(st: st_cond), b: lin_state_vars(st: st_body)) then
         throw LinearMismatch(detail: "while body diverges on linear set", span)
       end
       return st_cond
     | For(var: _, start: s, end_expr: e, body: b) ->
-      let st1 = check_expr(expr: s, st, sigs, tdefs, at_stmt_level: false)
-      let st2 = check_expr(expr: e, st: st1, sigs, tdefs, at_stmt_level: false)
-      let st_body = check_stmts(stmts: b, st: st2, sigs, tdefs)
+      let st1 = check_expr(expr: s, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      let st2 = check_expr(expr: e, st: st1, sigs, tdefs, enum_defs, at_stmt_level: false)
+      let st_body = check_stmts(stmts: b, st: st2, sigs, tdefs, enum_defs)
       if !vars_equal(a: lin_state_vars(st: st2), b: lin_state_vars(st: st_body)) then
         throw LinearMismatch(detail: "for body diverges on linear set", span)
       end
@@ -937,7 +1093,7 @@ let check_expr_kind = fn (
       let lparams = collect_linear_params(params: ps, tdefs, acc: [])
       let lst0 = lin_set_vars(st: lin_empty(), vs: lparams)
       let lst1 = lin_push_frame(st: lst0)
-      let lst2 = check_stmts(stmts: b, st: lst1, sigs, tdefs)
+      let lst2 = check_stmts(stmts: b, st: lst1, sigs, tdefs, enum_defs)
       // A lambda body that leaves linear params unconsumed is a type error
       // at construction time.
       require_empty_or_droppable(vars: lin_state_vars(st: lst2), params: ps, span)
@@ -954,50 +1110,50 @@ let check_expr_kind = fn (
       // After throw, control transfers to the catch arm; remaining stmts
       // are unreachable. Walk the raised value to consume any linears in it
       // (rare, but the value can reference linear bindings).
-      return check_expr(expr: e, st, sigs, tdefs, at_stmt_level: false)
+      return check_expr(expr: e, st, sigs, tdefs, enum_defs, at_stmt_level: false)
     | Force(expr: e) ->
       // `force(@x)` consumes the lazy. The inner Variable visit handles
       // consumption.
-      return check_expr(expr: e, st, sigs, tdefs, at_stmt_level: false)
+      return check_expr(expr: e, st, sigs, tdefs, enum_defs, at_stmt_level: false)
     | Thunk(body: b) ->
       // The thunk body runs deferred; we don't track linears across the
       // deferral here (the @T binder check in src/ir/linearity.nx covers
       // the lazy-binding-specific case).
-      return check_expr(expr: b, st, sigs, tdefs, at_stmt_level: false)
+      return check_expr(expr: b, st, sigs, tdefs, enum_defs, at_stmt_level: false)
     | ExternalRef(_) | Handler(_) -> return st
   end
 end
 
 let check_exprs = fn (
-  exprs: [HirExpr], st: LinState, sigs: [SigEntry], tdefs: [RecordDef]
+  exprs: [HirExpr], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef]
 ) -> LinState throws { TypeError } do
   match exprs do
     | [] -> return st
     | e :: rest ->
-      let st1 = check_expr(expr: e, st, sigs, tdefs, at_stmt_level: false)
-      return check_exprs(exprs: rest, st: st1, sigs, tdefs)
+      let st1 = check_expr(expr: e, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      return check_exprs(exprs: rest, st: st1, sigs, tdefs, enum_defs)
   end
 end
 
 let check_call_args = fn (
-  args: [HirCallArg], st: LinState, sigs: [SigEntry], tdefs: [RecordDef]
+  args: [HirCallArg], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef]
 ) -> LinState throws { TypeError } do
   match args do
     | [] -> return st
     | HirCallArg(label: _, value: v) :: rest ->
-      let st1 = check_expr(expr: v, st, sigs, tdefs, at_stmt_level: false)
-      return check_call_args(args: rest, st: st1, sigs, tdefs)
+      let st1 = check_expr(expr: v, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      return check_call_args(args: rest, st: st1, sigs, tdefs, enum_defs)
   end
 end
 
 let check_named_exprs = fn (
-  fields: [HirNamedExpr], st: LinState, sigs: [SigEntry], tdefs: [RecordDef]
+  fields: [HirNamedExpr], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef]
 ) -> LinState throws { TypeError } do
   match fields do
     | [] -> return st
     | HirNamedExpr(name: _, value: v) :: rest ->
-      let st1 = check_expr(expr: v, st, sigs, tdefs, at_stmt_level: false)
-      return check_named_exprs(fields: rest, st: st1, sigs, tdefs)
+      let st1 = check_expr(expr: v, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      return check_named_exprs(fields: rest, st: st1, sigs, tdefs, enum_defs)
   end
 end
 
@@ -1016,14 +1172,14 @@ let is_linear_scrutinee = fn (target: HirExpr, st: LinState) -> bool do
 end
 
 let check_match_cases = fn (
-  cases: [HirMatchCase], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], span: Span,
+  cases: [HirMatchCase], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef], span: Span,
   scrutinee_linear: bool
 ) -> LinState throws { TypeError } do
-  return check_match_cases_go(cases, st, sigs, tdefs, span, ref_set: None, scrutinee_linear)
+  return check_match_cases_go(cases, st, sigs, tdefs, enum_defs, span, ref_set: None, scrutinee_linear)
 end
 
 let check_match_cases_go = fn (
-  cases: [HirMatchCase], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], span: Span,
+  cases: [HirMatchCase], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef], span: Span,
   ref_set: Option<[string]>, scrutinee_linear: bool
 ) -> LinState throws { TypeError } do
   match cases do
@@ -1038,26 +1194,23 @@ let check_match_cases_go = fn (
       // the body. scrutinee_linear propagates to bind_pattern_linear so that
       // `| x ->` patterns on a linear scrutinee track x as linear (P-Var).
       let case_state = lin_set_vars(st, vs: lin_state_vars(st))
-      let case_state2 = bind_pattern_linear(pat: p, st: case_state, scrutinee_linear)
+      let case_state2 = bind_pattern_linear(pat: p, st: case_state, scrutinee_linear, tdefs, enum_defs)
       let case_diverges = stmts_diverge(stmts: b)
-      let case_out = check_stmts(stmts: b, st: case_state2, sigs, tdefs)
+      let case_out = check_stmts(stmts: b, st: case_state2, sigs, tdefs, enum_defs)
       if case_diverges then
-        // Before discarding this arm's state, verify that any linear bindings
-        // introduced inside the arm (not present in the outer pre-arm state)
-        // were consumed prior to divergence.  A live inner-scope linear at
-        // divergence point is a silent leak (nexus-bxzy).
+        // Verify inner-scope linears were consumed before divergence (nexus-bxzy)
         check_divergent_arm_unused(arm_out: case_out, outer_vars: lin_state_vars(st), span)
-        return check_match_cases_go(cases: rest, st, sigs, tdefs, span, ref_set, scrutinee_linear)
+        return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, ref_set, scrutinee_linear)
       end
       let case_vars = lin_state_vars(st: case_out)
       match ref_set do
         | None ->
-          return check_match_cases_go(cases: rest, st, sigs, tdefs, span, ref_set: Some(val: case_vars), scrutinee_linear)
+          return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, ref_set: Some(val: case_vars), scrutinee_linear)
         | Some(val: rv) ->
           if !vars_equal(a: rv, b: case_vars) then
             throw LinearMismatch(detail: "match arms diverge on linear set", span)
           end
-          return check_match_cases_go(cases: rest, st, sigs, tdefs, span, ref_set, scrutinee_linear)
+          return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, ref_set, scrutinee_linear)
       end
   end
 end
@@ -1068,56 +1221,153 @@ end
  *  a plain `PVar` (sigil ω / immutable) still introduces a linear binding
  *  because it receives ownership of a linear value (spec P-Var: q = 1 if
  *  linear(τ) else ω). Nested patterns inside PCtor/PRec do NOT inherit this
- *  flag — their field types govern linearity independently. */
-let bind_pattern_linear = fn (pat: HirPatternKind, st: LinState, scrutinee_linear: bool) -> LinState throws { TypeError } do
+ *  flag — their declared field types govern linearity independently via
+ *  `bind_pattern_fields` / `bind_pattern_rec_fields`. */
+let bind_pattern_linear = fn (
+  pat: HirPatternKind, st: LinState, scrutinee_linear: bool,
+  tdefs: [RecordDef], enum_defs: [EnumDef]
+) -> LinState throws { TypeError } do
   match pat do
     | PLit(_) | PWild -> return st
     | PVar(name: n, sigil: s) ->
       // P-Var: q = 1 if linear(τ) else ω.
       // Approximate linear(τ) via sigil (SigilLinear/SigilLazy) OR
-      // scrutinee_linear (the match scrutinee was a live linear variable).
+      // scrutinee_linear (the match scrutinee was a live linear variable, or
+      // the enclosing field's declared type is linear).
       match s do
         | SigilLinear | SigilLazy -> return lin_add(st, name: n)
         | _ ->
           if scrutinee_linear then return lin_add(st, name: n) end
           return st
       end
-    | PCtor(variant: _, fields: fs, sigil: _) -> return bind_pattern_fields(fields: fs, st)
-    | PRec(fields: fs, is_partial: _) -> return bind_pattern_rec_fields(fields: fs, st)
-    | POr(alts) -> return bind_pattern_or(alts, st, scrutinee_linear)
+    | PCtor(variant: v, fields: fs, sigil: _) ->
+      // For each field, determine if its declared type is linear using
+      // lin_field_is_linear_in_variant (direct flat lookup). When the
+      // variant is not found in enum_defs, fall back to scrutinee_linear.
+      return bind_pattern_fields_for_variant(fields: fs, st, variant: v, tdefs, enum_defs, fallback_linear: scrutinee_linear)
+    | PRec(fields: fs, is_partial: _) ->
+      return bind_pattern_rec_fields(fields: fs, st, tdefs, enum_defs)
+    | POr(alts) -> return bind_pattern_or(alts, st, scrutinee_linear, tdefs, enum_defs)
   end
 end
 
+/** Walk PCtor pattern fields, consulting `variant_fields` (the declared
+ *  VariantField list for the matched constructor) to determine per-field
+ *  linearity. When a field's declared type satisfies `is_linear_binding_type`,
+ *  the bound variable is linear regardless of whether it carries a `%` sigil
+ *  in the pattern (spec P-Var: q = 1 if linear(τ) else ω).
+ */
 let bind_pattern_fields = fn (
-  fields: [HirPatternField], st: LinState
+  fields: [HirPatternField], st: LinState,
+  variant_fields: Option<[VariantField]>,
+  fallback_linear: bool,
+  tdefs: [RecordDef], enum_defs: [EnumDef]
 ) -> LinState throws { TypeError } do
   match fields do
     | [] -> return st
-    | HirPatternField(name: _, pattern: p) :: rest ->
-      let st1 = bind_pattern_linear(pat: p, st, scrutinee_linear: false)
-      return bind_pattern_fields(fields: rest, st: st1)
+    | HirPatternField(name: fname, pattern: p) :: rest ->
+      // Determine if the declared type of this field is linear.
+      // When variant_fields is None (lookup failed), fall back to fallback_linear.
+      let field_linear_from_type = lin_pattern_field_is_linear(
+        variant_fields, fname, idx: 0, tdefs
+      )
+      let field_linear = if field_linear_from_type then true else fallback_linear end
+      let st1 = bind_pattern_linear(pat: p, st, scrutinee_linear: field_linear, tdefs, enum_defs)
+      // Advance variant_fields by one position for positional matching.
+      let rest_vfields = lin_drop_first_vfield(variant_fields)
+      return bind_pattern_fields(fields: rest, st: st1, variant_fields: rest_vfields, fallback_linear, tdefs, enum_defs)
   end
 end
 
-let bind_pattern_rec_fields = fn (
-  fields: [HirRecordPatField], st: LinState
+/** Walk PCtor fields using lin_field_is_linear_in_variant for per-field
+ *  linearity — avoids the Option<[VariantField]> nesting and uses a simpler
+ *  flat direct lookup. When the variant is unknown in enum_defs, falls back
+ *  to fallback_linear (typically scrutinee_linear) for each field.
+ */
+let bind_pattern_fields_for_variant = fn (
+  fields: [HirPatternField], st: LinState,
+  variant: string, tdefs: [RecordDef], enum_defs: [EnumDef],
+  fallback_linear: bool
 ) -> LinState throws { TypeError } do
   match fields do
     | [] -> return st
-    | HirRecordPatField(name: _, pattern: p) :: rest ->
-      let st1 = bind_pattern_linear(pat: p, st, scrutinee_linear: false)
-      return bind_pattern_rec_fields(fields: rest, st: st1)
+    | HirPatternField(name: fname, pattern: p) :: rest ->
+      // For named fields, use the direct named lookup. When the variant is
+      // known in enum_defs, use per-field type linearity (authoritative).
+      // When the variant is not found (unknown type) or the field is unnamed
+      // (positional), fall back to fallback_linear (conservative: e.g.
+      // scrutinee_linear).
+      let field_linear = match fname do
+        | None -> fallback_linear
+        | Some(val: fstr) ->
+          if lin_variant_is_known(defs: enum_defs, variant) then
+            lin_field_is_linear(defs: enum_defs, variant, fname: fstr, tdefs)
+          else
+            fallback_linear
+          end
+      end
+      let st1 = bind_pattern_linear(pat: p, st, scrutinee_linear: field_linear, tdefs, enum_defs)
+      return bind_pattern_fields_for_variant(fields: rest, st: st1, variant, tdefs, enum_defs, fallback_linear)
+  end
+end
+
+/** True when the variant field at the current head (positional or by name
+ *  `fname`) has a linear declared type. Returns false when variant_fields is
+ *  None (unknown type) or empty.
+ */
+let lin_pattern_field_is_linear = fn (
+  variant_fields: Option<[VariantField]>, fname: Option<string>, idx: i64, tdefs: [RecordDef]
+) -> bool do
+  match variant_fields do
+    | None -> return false
+    | Some(val: vfs) ->
+      match lin_variant_field_type_at(variant_fields: vfs, fname, idx: 0) do
+        | None -> return false
+        | Some(val: ft) -> return is_linear_binding_type(ft, tdefs)
+      end
+  end
+end
+
+/** Drop the first element from an Option<[VariantField]>, advancing the
+ *  positional cursor used by bind_pattern_fields.
+ */
+let lin_drop_first_vfield = fn (variant_fields: Option<[VariantField]>) -> Option<[VariantField]> do
+  match variant_fields do
+    | None -> return None
+    | Some(val: vfs) ->
+      match vfs do
+        | [] -> return Some(val: [])
+        | _ :: rest -> return Some(val: rest)
+      end
+  end
+end
+
+/** Walk PRec pattern fields, consulting `tdefs` (all RecordDef definitions)
+ *  to determine per-field linearity by field name. When any record type has
+ *  a field with that name whose declared type satisfies `is_linear_binding_type`,
+ *  the bound variable is treated as linear (conservative: any match wins).
+ */
+let bind_pattern_rec_fields = fn (
+  fields: [HirRecordPatField], st: LinState, tdefs: [RecordDef], enum_defs: [EnumDef]
+) -> LinState throws { TypeError } do
+  match fields do
+    | [] -> return st
+    | HirRecordPatField(name: fname, pattern: p) :: rest ->
+      let field_linear = lin_any_record_has_linear_field(tdefs, fname)
+      let st1 = bind_pattern_linear(pat: p, st, scrutinee_linear: field_linear, tdefs, enum_defs)
+      return bind_pattern_rec_fields(fields: rest, st: st1, tdefs, enum_defs)
   end
 end
 
 let bind_pattern_or = fn (
-  alts: [HirPatternKind], st: LinState, scrutinee_linear: bool
+  alts: [HirPatternKind], st: LinState, scrutinee_linear: bool,
+  tdefs: [RecordDef], enum_defs: [EnumDef]
 ) -> LinState throws { TypeError } do
   // Or-patterns require all alternatives to bind the same linear-name set.
   // Use the first alt as the canonical binder set.
   match alts do
     | [] -> return st
-    | a :: _ -> return bind_pattern_linear(pat: a, st, scrutinee_linear)
+    | a :: _ -> return bind_pattern_linear(pat: a, st, scrutinee_linear, tdefs, enum_defs)
   end
 end
 
