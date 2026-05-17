@@ -46,6 +46,8 @@ trap cleanup EXIT INT TERM HUP
 PAYLOAD_NAME="compiler"
 TEST_MODE=0
 RUN_MODE=0
+CAPS_DIFF_REV=""
+CAPS_DIFF_TMP=""
 if [ "$#" -gt 0 ]; then
   case "$1" in
     lsp)
@@ -94,8 +96,84 @@ if [ "$#" -gt 0 ]; then
         shift
       fi
       ;;
+    caps)
+      # `nexus caps --diff <rev>` (nexus-2v8n): the in-wasm `caps` subcommand
+      # needs to compare the working-tree closure against a closure built
+      # from `git show <rev>:<file>`. Proc.exec is a preview1 -1-stub so the
+      # in-wasm side can't shell out; we intercept --diff here, fetch the
+      # base source via `git show`, write it to a TMPDIR file, and rewrite
+      # the arg vector to `--diff-base <tmp>`. The compiler payload sees
+      # only --diff-base, which is just an extra Fs.read_to_string.
+      #
+      # `caps` itself stays in the vector — we hand the whole thing to the
+      # compiler payload at the bottom of this script, same as `build` /
+      # `typecheck`. The rewrite below mutates the positional arg list in
+      # place via `set --` once the rev + input path are known.
+      CAPS_DIFF_REV=""
+      CAPS_INPUT=""
+      _saw_diff=0
+      _pos=0
+      # Single linear scan: discover --diff <rev> and the third positional
+      # (the input file, since the vector is `caps SYMBOL FILE [flags...]`).
+      # Flags with values (--format VALUE etc.) take their next arg, so we
+      # only treat bare non-flag tokens as positionals.
+      _skip_next=0
+      for _arg in "$@"; do
+        if [ "$_saw_diff" = "1" ]; then CAPS_DIFF_REV="$_arg"; _saw_diff=0; continue; fi
+        if [ "$_skip_next" = "1" ]; then _skip_next=0; continue; fi
+        case "$_arg" in
+          --diff) _saw_diff=1 ;;
+          --diff-base|--format|-o|--output) _skip_next=1 ;;
+          -*) ;;
+          *)
+            _pos=$((_pos + 1))
+            if [ "$_pos" = "3" ] && [ -z "$CAPS_INPUT" ]; then
+              CAPS_INPUT="$_arg"
+            fi
+            ;;
+        esac
+      done
+      if [ -n "$CAPS_DIFF_REV" ]; then
+        if [ -z "$CAPS_INPUT" ]; then
+          echo "nexus caps --diff: cannot locate input file in argv" >&2
+          exit 2
+        fi
+        CAPS_DIFF_TMP=$(mktemp "${TMPDIR:-/tmp}/nexus-caps-diff-base.XXXXXX.nx")
+        if ! git show "${CAPS_DIFF_REV}:${CAPS_INPUT}" > "$CAPS_DIFF_TMP" 2>/dev/null; then
+          rm -f "$CAPS_DIFF_TMP"
+          echo "nexus caps --diff ${CAPS_DIFF_REV}: git show failed (revision missing or file absent at that revision?)" >&2
+          exit 1
+        fi
+        # Rebuild argv: drop `--diff <rev>`, append `--diff-base <tmp>`.
+        # Sentinel + eval-set keeps quoting safe for paths with spaces.
+        set -- "$@" "__caps_diff_sentinel__"
+        _new=""
+        _skip=0
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "__caps_diff_sentinel__" ]; then shift; break; fi
+          if [ "$_skip" = "1" ]; then _skip=0; shift; continue; fi
+          if [ "$1" = "--diff" ]; then _skip=1; shift; continue; fi
+          if [ -z "$_new" ]; then
+            _new=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+            _new="'$_new'"
+          else
+            esc=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+            _new="$_new '$esc'"
+          fi
+          shift
+        done
+        esc=$(printf '%s' "$CAPS_DIFF_TMP" | sed "s/'/'\\\\''/g")
+        _new="$_new '--diff-base' '$esc'"
+        eval set -- $_new
+      fi
+      ;;
   esac
 fi
+# Hook caps-diff temp into the cleanup trap so an early exit doesn't leak it.
+cleanup_caps_diff() {
+  [ -n "${CAPS_DIFF_TMP:-}" ] && rm -f "$CAPS_DIFF_TMP"
+}
+trap 'cleanup_caps_diff; cleanup' EXIT INT TERM HUP
 
 # Locate the byte offset of the first payload byte (one past the
 # BEGIN marker line). `head -n LINE | wc -c` gives the cumulative bytes

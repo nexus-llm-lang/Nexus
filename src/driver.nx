@@ -51,7 +51,7 @@ import { run_fmt_subcommand, strip_fmt_subcommand, ParsedFmtSubcommand } from "s
 import { strip_hir_subcommand, ParsedHirSubcommand, strip_lir_subcommand, ParsedLirSubcommand, hir_to_text, hir_to_json, lir_to_text, lir_to_json } from "src/tools/ir_dump.nx"
 import { strip_ast_subcommand, ParsedAstSubcommand, ast_to_text, ast_to_json } from "src/tools/ast_dump.nx"
 import { strip_types_subcommand, ParsedTypesSubcommand, types_to_text, types_to_json, TypesScope, ScopeOwn, ScopeAll } from "src/tools/types_dump.nx"
-import { strip_caps_subcommand, ParsedCapsSubcommand, caps_to_text, caps_to_json, symbol_exists as caps_symbol_exists_impl } from "src/tools/caps_dump.nx"
+import { strip_caps_subcommand, ParsedCapsSubcommand, caps_to_text, caps_to_json, symbol_exists as caps_symbol_exists_impl, compute_caps_closure as caps_compute_closure, closure_capabilities as caps_closure_capabilities, compute_caps_diff, diff_to_text as caps_diff_to_text, diff_to_json as caps_diff_to_json, diff_is_widening, CapsDiff } from "src/tools/caps_dump.nx"
 import { strip_grep_subcommand, ParsedGrepSubcommand, run_grep_subcommand } from "src/tools/grep.nx"
 import { strip_lint_subcommand, ParsedLintSubcommand, run_lint_subcommand } from "src/tools/lint.nx"
 import {
@@ -1335,42 +1335,127 @@ end
 // (the JSON path still emits a parseable found:false envelope so machine
 // consumers don't have to inspect stderr).
 
+// Shared HIR build helper for `nexus caps`. Mirrors the pipeline shape of
+// run_types_dump_subcommand: parse → build_hir → resolve_all_lazy_no_filter
+// → expand_groups (functions + handler bindings). The closure walk consumes
+// fully-resolved HIR but never typecheck/linearity, because caps only reads
+// names + the external table.
+let build_hir_for_caps = fn (src: string, label_path: string, verbose: bool, format: ExplainFormat) -> HirProgram require { Console, Fs } throws { Exn } do
+  let tokens = lexer.tokenize(src)
+  let ParseDiagnostics(prog, diags: parse_diags) = parser.parse_collect(tokens, file: label_path)
+  print_parse_diags(diags: parse_diags, format)
+  let n_parse_diags = list.length(xs: parse_diags)
+  if n_parse_diags > 0 then
+    match format do
+      | FormatJson -> Console.eprintln(val: format_summary_json(count: n_parse_diags))
+      | FormatText -> ()
+    end
+    raise ParseErrorsCollected(count: n_parse_diags)
+  end
+  let HirBuildResult(program: hir_raw, import_cache: _) = build_hir(prog, source_file: label_path, verbose)
+  match hir_raw do
+    | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
+      let resolved = resolve_all_lazy_no_filter(funcs: hf)
+      let expanded_fs = hir.expand_groups_in_functions(funcs: resolved, groups: heg)
+      let expanded_hb = hir.expand_groups_in_handler_bindings(bindings: hb, groups: heg)
+      return HirProgram(ports: hp, functions: expanded_fs, externals: he, handler_bindings: expanded_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
+  end
+end
+
+// Manual flag extraction (nexus-2v8n). The caps subcommand has already been
+// stripped by strip_caps_subcommand, so `args` is whatever the user typed
+// *after* `caps`. We accept either form:
+//   --diff <rev>          user-facing form; the polyglot launcher pre-runs
+//                         `git show <rev>:<file>` and rewrites this to
+//                         --diff-base <tmp>, because Proc.exec is a -1-stub
+//                         under WASI preview1 (the wasm payload's runtime).
+//   --diff-base <path>    in-wasm form; pre-fetched base source on disk.
+//                         The flag is accepted directly so callers without
+//                         a git working copy (CI artifacts, dirty trees) can
+//                         still drive the diff against an arbitrary baseline.
+// Flags can appear anywhere in the tail; positional args are preserved in
+// input order.
+type CapsDiffFlag = CapsDiffFlag(rev: Option<string>, base_path: Option<string>, rest: [string])
+
+let extract_diff_flag_go = fn (args: [string], acc_rev: Option<string>, acc_base: Option<string>, acc_rest: [string]) -> CapsDiffFlag throws { Exn } do
+  match args do
+    | [] -> return CapsDiffFlag(rev: acc_rev, base_path: acc_base, rest: list.reverse(xs: acc_rest))
+    | a :: rest ->
+      if a == "--diff" then
+        match rest do
+          | [] -> raise InvalidUsage(detail: "--diff requires a git revision (e.g., --diff HEAD~1)")
+          | rev :: tail -> return extract_diff_flag_go(args: tail, acc_rev: Some(val: rev), acc_base, acc_rest)
+        end
+      end
+      if a == "--diff-base" then
+        match rest do
+          | [] -> raise InvalidUsage(detail: "--diff-base requires a path to the base source")
+          | bp :: tail -> return extract_diff_flag_go(args: tail, acc_rev, acc_base: Some(val: bp), acc_rest)
+        end
+      end
+      return extract_diff_flag_go(args: rest, acc_rev, acc_base, acc_rest: a :: acc_rest)
+  end
+end
+
+let extract_diff_flag = fn (args: [string]) -> CapsDiffFlag throws { Exn } do
+  return extract_diff_flag_go(args, acc_rev: None, acc_base: None, acc_rest: [])
+end
+
 let run_caps_dump_subcommand = fn (args: [string], format: ExplainFormat, verbose: bool) -> i64 require { Clock, Console, Fs } do
   try
-    match args do
-      | [] -> raise InvalidUsage(detail: "usage: nexus caps <symbol> <input.nx> [--format=text|json]")
-      | _ :: [] -> raise InvalidUsage(detail: "usage: nexus caps <symbol> <input.nx> [--format=text|json]")
+    let CapsDiffFlag(rev: rev_opt, base_path: base_opt, rest: pos_args) = extract_diff_flag(args)
+    // --diff is the user-facing form but the in-wasm path can't run git
+    // (preview1 has no subprocess); the polyglot launcher must intercept
+    // and convert --diff <rev> into --diff-base <tmp>. If we still see
+    // --diff at this point, the user invoked the wasm payload directly.
+    if let Some(val: rev_str) = rev_opt then
+      if let None = base_opt then
+        raise InvalidUsage(detail: "--diff " ++ rev_str ++ ": in-wasm `nexus caps` cannot run `git show` under preview1. Invoke via the polyglot launcher (./nexus), which intercepts --diff and prefetches the base revision.")
+      end
+    end
+    match pos_args do
+      | [] -> raise InvalidUsage(detail: "usage: nexus caps <symbol> <input.nx> [--format=text|json] [--diff <rev>]")
+      | _ :: [] -> raise InvalidUsage(detail: "usage: nexus caps <symbol> <input.nx> [--format=text|json] [--diff <rev>]")
       | symbol :: input_path :: _ ->
         let src = Fs.read_to_string(path: input_path)
-        let tokens = lexer.tokenize(src)
-        let ParseDiagnostics(prog, diags: parse_diags) = parser.parse_collect(tokens, file: input_path)
-        print_parse_diags(diags: parse_diags, format)
-        let n_parse_diags = list.length(xs: parse_diags)
-        if n_parse_diags > 0 then
-          match format do
-            | FormatJson -> Console.eprintln(val: format_summary_json(count: n_parse_diags))
-            | FormatText -> ()
-          end
-          raise ParseErrorsCollected(count: n_parse_diags)
-        end
-        let HirBuildResult(program: hir_raw, import_cache: _) = build_hir(prog, source_file: input_path, verbose)
-        // resolve_all_lazy_no_filter: the closure walk must see every
-        // top-level binding's HIR body, not just those reachable from
-        // `main`. Mirrors run_types_dump_subcommand for the same reason.
-        let hir_resolved = match hir_raw do
-          | HirProgram(ports: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds) ->
-            let resolved = resolve_all_lazy_no_filter(funcs: hf)
-            let expanded_fs = hir.expand_groups_in_functions(funcs: resolved, groups: heg)
-            let expanded_hb = hir.expand_groups_in_handler_bindings(bindings: hb, groups: heg)
-            HirProgram(ports: hp, functions: expanded_fs, externals: he, handler_bindings: expanded_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds)
-        end
+        let hir_resolved = build_hir_for_caps(src, label_path: input_path, verbose, format)
         let found = caps_symbol_exists_impl(prog: hir_resolved, symbol)
-        let out = match format do
-          | FormatText -> caps_to_text(prog: hir_resolved, symbol)
-          | FormatJson -> caps_to_json(prog: hir_resolved, symbol)
+        match base_opt do
+          | None ->
+            let out = match format do
+              | FormatText -> caps_to_text(prog: hir_resolved, symbol)
+              | FormatJson -> caps_to_json(prog: hir_resolved, symbol)
+            end
+            Console.println(val: out)
+            if found then return 0 else return 1 end
+          | Some(val: base_path) ->
+            // Two-pass: replay the same pipeline against the base revision's
+            // source. The base file path is supplied by the polyglot
+            // launcher (or by the user directly with --diff-base), so the
+            // in-wasm side only needs Fs.read_to_string + the standard
+            // build_hir_for_caps pipeline.
+            let base_src = Fs.read_to_string(path: base_path)
+            let hir_base = build_hir_for_caps(src: base_src, label_path: base_path, verbose, format)
+            let found_base = caps_symbol_exists_impl(prog: hir_base, symbol)
+            // Symbol missing on either side: report the diff anyway against
+            // an empty list. A new symbol (absent in base) reads as "all
+            // caps added" which is the correct widening semantics; a removed
+            // symbol reads as "all caps removed" (narrowing).
+            let base_caps = if found_base then caps_closure_capabilities(cl: caps_compute_closure(prog: hir_base, symbol)) else [] end
+            let current_caps = if found then caps_closure_capabilities(cl: caps_compute_closure(prog: hir_resolved, symbol)) else [] end
+            let d = compute_caps_diff(symbol, base: base_caps, current: current_caps)
+            let out = match format do
+              | FormatText -> caps_diff_to_text(d)
+              | FormatJson -> caps_diff_to_json(d)
+            end
+            Console.println(val: out)
+            // Exit code: 0 = no widening, 1 = widening present. Errors
+            // (parse failure, git failure) take the catch arm and also
+            // yield 1 (we don't distinguish error from widening to keep
+            // the CI contract simple: zero exit iff caps unchanged or
+            // narrowed).
+            if diff_is_widening(d) then return 1 else return 0 end
         end
-        Console.println(val: out)
-        if found then return 0 else return 1 end
     end
   catch e ->
     Console.eprintln(val: err.format_error(err: e))
