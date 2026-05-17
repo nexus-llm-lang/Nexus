@@ -61,7 +61,7 @@ import {
   reverse_named_types, lookup_named_type,
   find_linear_field, type_carries_linear
 }, * as collections from "src/typecheck/infer/collections.nx"
-import { TypeError, ThrowsRowInvariantBroken, DuplicateInjectPort, HandlerRequireNotSubset } from "src/common/error.nx"
+import { TypeError, ThrowsRowInvariantBroken, DuplicateInjectPort, HandlerRequireNotSubset, DuplicateRecordLabel, DuplicatePatternLabel } from "src/common/error.nx"
 import { StrMap }, * as smap from "src/common/strmap.nx"
 import * as str from "std:str"
 import * as list from "std:list"
@@ -642,6 +642,11 @@ let infer_record_fields = fn (state: CheckState, fields: [HirNamedExpr], subst: 
     | [] ->
       return InferExprOk(state, subst, typ: TyRecord(fields: list.reverse(xs: acc)))
     | HirNamedExpr(name: n, value: v) :: rest ->
+      // Spec T-Record premise distinct(ℓ̄): reject duplicate field labels.
+      match lookup_named_type(nts: acc, name: n) do
+        | Some(val: _) -> raise DuplicateRecordLabel(label: n, span)
+        | None -> ()
+      end
       match infer_expr(state, expr: v, ret_type: TyUnit) do
         | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "record field " ++ n ++ ": " ++ m, span: espan)
         | InferExprOk(state: st1, subst: s1, typ: ft) ->
@@ -1820,10 +1825,34 @@ end
 
 // ─── Pattern binding ────────────────────────────────────────────────────────
 
+/** True when `t` is "auto-droppable" — primitive scalars and unit drop
+ *  silently at scope end. Wrappers `%`/`&`/`~` peel and recurse; `@T` is
+ *  NOT auto-droppable (forcing triggers side effects). Mirrors
+ *  linearity.nx::is_auto_droppable for use in the type-check phase. */
+let pat_is_auto_droppable = fn (t: TypeExpr) -> bool do
+  match t do
+    | TyI32 | TyI64 | TyF32 | TyF64
+    | TyIntLit | TyFloatLit
+    | TyBool | TyChar | TyString | TyUnit -> return true
+    | TyLazy(_) -> return false
+    | TyLinear(inner: i) | TyBorrow(inner: i) | TyRef(inner: i) ->
+      return pat_is_auto_droppable(t: i)
+    | _ -> return false
+  end
+end
+
 /** Match `pattern` against `target_type`, returning the env extensions and substitution produced by the binding (or a `BindErr` on shape mismatch). */
 export let bind_pattern = fn (state: CheckState, pattern: HirPatternKind, target_type: TypeExpr) -> BindResult throws { TypeError } do
   match pattern do
     | PWild ->
+      // P-Wild: spec premise linear(τ) ∧ ¬autoDrop(τ) → error.
+      // A wildcard silently discards its scrutinee; if the scrutinee is a
+      // non-auto-droppable linear type (e.g. %Handle) that is a linearity
+      // violation — the resource escapes without being consumed.
+      let tdefs = tctypes.state_typedefs(state)
+      if type_carries_linear(target_type, tdefs, depth: 0) && !pat_is_auto_droppable(t: target_type) then
+        return BindErr(message: "wildcard pattern `_` cannot discard linear type `" ++ tctypes.type_to_string(typ: target_type) ++ "` (P-Wild: linear(τ) ∧ ¬autoDrop(τ) → error); bind to a name and consume it explicitly")
+      end
       return BindOk(state, subst: subst.subst_empty(), env: [])
     | PVar(name, sigil: _) ->
       return BindOk(
@@ -2054,9 +2083,39 @@ let bind_ctor_fields = fn (
   end
 end
 
+// Spec P-Record premise distinct(ℓ̄): walk the pattern field list and raise
+// DuplicatePatternLabel on the first repeated label. Uses a seen-list to
+// avoid depending on StrMap (not imported in this module).
+let check_distinct_pat_labels = fn (
+  fields: [HirRecordPatField], seen: [string]
+) -> unit throws { TypeError } do
+  match fields do
+    | [] -> return ()
+    | HirRecordPatField(name: fname, pattern: _) :: rest ->
+      match label_in_list(label: fname, haystack: seen) do
+        | true -> raise DuplicatePatternLabel(label: fname, span: Span(offset: 0, line: 0, col: 0))
+        | false ->
+          return check_distinct_pat_labels(fields: rest, seen: fname :: seen)
+      end
+  end
+end
+
+let label_in_list = fn (label: string, haystack: [string]) -> bool do
+  match haystack do
+    | [] -> return false
+    | h :: rest ->
+      if h == label then return true
+      else return label_in_list(label, haystack: rest)
+      end
+  end
+end
+
 let bind_record_pattern = fn (
   state: CheckState, fields: [HirRecordPatField], target_type: TypeExpr
 ) -> BindResult throws { TypeError } do
+  // Spec P-Record premise distinct(ℓ̄): reject duplicate field labels before
+  // attempting the per-field binding walk.
+  check_distinct_pat_labels(fields, seen: [])
   // spec strip(τ) peels %/& only — @σ thunks must be forced explicitly.
   match target_type do
     | TyLazy(inner: _) ->
