@@ -664,12 +664,52 @@ export type Example = Example(command: string, comment: string)
  *  short human-readable description rendered to the right. */
 export type ExitCode = ExitCode(code: i64, meaning: string)
 
+/** Functional taxonomy a subcommand belongs to. Used by
+ *  `render_subcommand_overview` to group the top-level `nexus help` listing
+ *  so an LLM (or human) immediately sees which layer each subcommand
+ *  serves. Issue nexus-bmu7.
+ *
+ *  Variants:
+ *    - CategoryBuild     compile / run / typecheck / repl / test / fmt
+ *    - CategoryContext   ast / hir / types / caps / explain / context / grep
+ *    - CategorySafety    safety-oriented inspection / diffing
+ *    - CategoryTooling   mcp / lsp / help (host integration)
+ *
+ *  Declaring this as a closed variant (rather than a free-form string)
+ *  forces every `subspec(...)` call site to pick a category — no default.
+ */
+export type SubcommandCategory =
+    CategoryBuild
+  | CategoryContext
+  | CategorySafety
+  | CategoryTooling
+
+/** Human-readable header for a category group. */
+export let category_label = fn (c: SubcommandCategory) -> string do
+  match c do
+    | CategoryBuild -> return "Build & Run"
+    | CategoryContext -> return "Context & Introspection"
+    | CategorySafety -> return "Safety & Diffing"
+    | CategoryTooling -> return "Tooling & Integration"
+  end
+end
+
+let category_tag = fn (c: SubcommandCategory) -> i64 do
+  match c do
+    | CategoryBuild -> return 0
+    | CategoryContext -> return 1
+    | CategorySafety -> return 2
+    | CategoryTooling -> return 3
+  end
+end
+
 /** Per-subcommand help bundle. `flags` is reused with `render_usage`-
  *  style auto-derivation. `synopsis` is the one-liner shown under
  *  SYNOPSIS (do not include a leading "nexus" prefix — the renderer adds
  *  it). `description` is free-form prose for the DESCRIPTION block (use
  *  `\n` to break paragraphs). `examples` / `see_also` / `exit_codes` can
- *  be empty lists when not applicable.
+ *  be empty lists when not applicable. `category` (nexus-bmu7) places
+ *  the subcommand in the top-level grouped overview.
  */
 export type SubcommandSpec = SubcommandSpec(
   name: string,
@@ -678,7 +718,8 @@ export type SubcommandSpec = SubcommandSpec(
   flags: [ArgSpec],
   examples: [Example],
   see_also: [string],
-  exit_codes: [ExitCode]
+  exit_codes: [ExitCode],
+  category: SubcommandCategory
 )
 
 /** Convenience builder so call sites stay declarative. */
@@ -689,9 +730,10 @@ export let subspec = fn (
   flags: [ArgSpec],
   examples: [Example],
   see_also: [string],
-  exit_codes: [ExitCode]
+  exit_codes: [ExitCode],
+  category: SubcommandCategory
 ) -> SubcommandSpec do
-  return SubcommandSpec(name, synopsis, description, flags, examples, see_also, exit_codes)
+  return SubcommandSpec(name, synopsis, description, flags, examples, see_also, exit_codes, category)
 end
 
 /** Build an Example row. Pass `""` for `comment` when no annotation is
@@ -728,7 +770,7 @@ end
  *
  *  Empty sections are elided. No trailing newline (matches print_usage). */
 export let render_subcommand_help = fn (prog: string, spec: SubcommandSpec) -> string do
-  match spec do | SubcommandSpec(name: n, synopsis, description, flags, examples, see_also, exit_codes) ->
+  match spec do | SubcommandSpec(name: n, synopsis, description, flags, examples, see_also, exit_codes, category: _) ->
     let syn_section = render_synopsis_section(prog, name: n, synopsis)
     let desc_section = render_description_section(description)
     let flags_section = render_flags_section(flags)
@@ -840,5 +882,71 @@ let join_with_prefix = fn (parts: [string], prefix: string, acc: string) -> stri
       let next = if str.length(s: acc) == 0 then line else acc ++ "\n" ++ line end
       return join_with_prefix(parts: rest, prefix, acc: next)
   end
+end
+
+// ─── Top-level grouped overview (issue nexus-bmu7) ─────────────────────────
+//
+// `render_subcommand_overview` is the new top-level `nexus help` renderer.
+// Instead of one flat alphabetical-ish list it emits one labelled group
+// per `SubcommandCategory`, in declaration order, then the truly-global
+// options (the qpuz filtered set). Empty groups are elided so a future
+// category without members stays invisible.
+
+let filter_subs_by_category = fn (subs: [SubcommandSpec], target: i64, acc: [SubcommandSpec]) -> [SubcommandSpec] do
+  match subs do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest ->
+      match s do | SubcommandSpec(name: _, synopsis: _, description: _, flags: _, examples: _, see_also: _, exit_codes: _, category) ->
+        if category_tag(c: category) == target then
+          return filter_subs_by_category(subs: rest, target, acc: s :: acc)
+        end
+        return filter_subs_by_category(subs: rest, target, acc)
+      end
+  end
+end
+
+let render_overview_sub_line = fn (s: SubcommandSpec) -> string do
+  match s do | SubcommandSpec(name, synopsis, description: _, flags: _, examples: _, see_also: _, exit_codes: _, category: _) ->
+    if str.length(s: synopsis) == 0 then return pad_label(label: name, width: 16) end
+    return pad_label(label: name, width: 16) ++ synopsis
+  end
+end
+
+let render_overview_sub_lines = fn (subs: [SubcommandSpec], acc: string) -> string do
+  match subs do
+    | [] -> return acc
+    | s :: rest ->
+      let line = render_overview_sub_line(s)
+      let next = if str.length(s: acc) == 0 then "  " ++ line else acc ++ "\n  " ++ line end
+      return render_overview_sub_lines(subs: rest, acc: next)
+  end
+end
+
+let render_category_group = fn (subs: [SubcommandSpec], c: SubcommandCategory) -> string do
+  let members = filter_subs_by_category(subs, target: category_tag(c), acc: [])
+  if list.length(xs: members) == 0 then return "" end
+  return "\n\n" ++ category_label(c) ++ ":\n" ++ render_overview_sub_lines(subs: members, acc: "")
+end
+
+/** Render the top-level `nexus help` overview with subcommands grouped by
+ *  `SubcommandCategory`. `summary` is the first line (e.g. "Usage: nexus
+ *  <subcommand> [options] <args>"); `subs` is the full spec table (any
+ *  order — groups are rendered in category declaration order, then by
+ *  list position within a group); `globals` is the truly-global flag
+ *  ArgSpec list (qpuz: per-sub flags must not leak in here). Empty
+ *  category groups are elided; the "Options:" block is elided when
+ *  `globals` is empty. No trailing newline — matches render_usage.
+ *  Issue nexus-bmu7. */
+export let render_subcommand_overview = fn (summary: string, subs: [SubcommandSpec], globals: [ArgSpec]) -> string do
+  let g_build = render_category_group(subs, c: CategoryBuild)
+  let g_ctx = render_category_group(subs, c: CategoryContext)
+  let g_safety = render_category_group(subs, c: CategorySafety)
+  let g_tool = render_category_group(subs, c: CategoryTooling)
+  let groups = g_build ++ g_ctx ++ g_safety ++ g_tool
+  let opts = filter_opts_and_flags(specs: globals, acc: [])
+  let opt_block = if list.length(xs: opts) > 0 then
+      "\n\nOptions:\n" ++ render_lines(specs: opts, render_one: render_opt_line, acc: "")
+    else "" end
+  return summary ++ groups ++ opt_block
 end
 
