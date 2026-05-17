@@ -237,10 +237,15 @@ let check_call_throw_row_admitted = fn (
   groups: [ExceptionGroupEntry], func: string
 ) -> RaiseAdmissionResult throws { TypeError } do
   match callee_row do
+    // Callee has no throws (or is effect-polymorphic): always admitted.
     | TyRow(types: [], rest: None) | TyRow(types: _, rest: Some(_)) -> return RaiseOk
     | TyRow(types: callee_types, rest: None) ->
       match caller_row do
-        | TyRow(types: [], rest: None) | TyRow(types: _, rest: Some(_)) -> return RaiseOk
+        // Open caller row (includes implicit absent-throws rows parsed as
+        // TyRow([], Some(TyVar("__implicit")))): admits any callee.
+        | TyRow(types: _, rest: Some(_)) -> return RaiseOk
+        // Caller declared an explicit closed row (including `throws {}`):
+        // enforce that every callee exception is covered.
         | TyRow(types: caller_types, rest: None) ->
           return check_each_callee_member_admitted(callee_types, caller_types, groups, func)
         | _ -> return RaiseOk
@@ -1065,34 +1070,60 @@ type RaiseAdmissionResult =
 /** Decide whether raising `name_opt` is admitted by row `row`.
  *  `name_opt = None` means the raised value is not a syntactic exception
  *  constructor (e.g. `raise some_var`); we accept conservatively in that
- *  case because the value's runtime variant can't be inspected statically.
+ *  case because the value's runtime variant can't be inspected statically —
+ *  unless the active throws-row is closed empty (`throws {}`), which
+ *  permits no exceptions whatsoever.
  *
- *  Functions in src/ that declare no `throws` clause currently parse to
- *  `TyRow([], None)` (closed empty). That predates row-typed enforcement,
- *  so we treat that exact shape as "unspecified throws" and accept any
- *  raise — narrow enforcement requires an explicit `throws { ... }`. Once
- *  the codebase declares throws on every raising function, this branch
- *  becomes the only place to delete to flip src/-wide enforcement on
- *  (mqin.1.2 tracks that migration).
+ *  Row semantics (T-Raise, nexus-r7gv):
+ *  - Open row `TyRow(_, rest: Some(_))`: effect-polymorphic or implicitly
+ *    declared (absent `throws` clause).  Any raise is admitted.  Functions
+ *    in `src/` that predate row-typed throws declarations parse to
+ *    `TyRow([], rest: Some(TyVar("__implicit")))` via `parse_optional_throws`
+ *    and fall here.
+ *  - Closed non-empty row `TyRow([X, ...], rest: None)`: only declared
+ *    members (or the universal `Exn` sentinel) are admitted.
+ *  - Closed empty row `TyRow([], rest: None)`: the function explicitly
+ *    declared `throws {}` — no exceptions are permitted and every raise
+ *    site is an error (P5 enforcement).  This branch was previously a
+ *    carve-out that silently admitted all raises; the carve-out has been
+ *    removed as part of nexus-r7gv.
+ *  - Non-row types (TyVar unsolved, etc.): admit conservatively.
  */
 let check_raise_admitted = fn (
   name_opt: Option<string>, row: TypeExpr, groups: [ExceptionGroupEntry]
 ) -> RaiseAdmissionResult throws { TypeError } do
   match row do
-    | TyRow(types: [], rest: None) | TyRow(types: _, rest: Some(_)) -> return RaiseOk
+    | TyRow(types: _, rest: Some(_)) -> return RaiseOk
     | TyRow(types: row_types, rest: None) ->
-      match name_opt do
-        | None -> return RaiseOk
-        | Some(val: name) ->
-          if row_admits_exception(name, row_types, groups) then
-            return RaiseOk
-          else
-            return RaiseRejected(
-              message: "raise " ++ name ++ ": exception not in throws row"
-            )
-          end
-      end
+      return check_raise_admitted_closed(name_opt, row_types, groups)
     | _ -> return RaiseOk
+  end
+end
+
+let check_raise_admitted_closed = fn (
+  name_opt: Option<string>, row_types: [TypeExpr], groups: [ExceptionGroupEntry]
+) -> RaiseAdmissionResult throws { TypeError } do
+  match name_opt do
+    | None ->
+      // Unknown raise target: reject when the row is provably empty (throws {}).
+      if list.length(xs: row_types) == 0 then
+        return RaiseRejected(
+          message: "raise: function declares throws {}, no exceptions are permitted"
+        )
+      end
+      return RaiseOk
+    | Some(val: name) ->
+      if row_admits_exception(name, row_types, groups) then
+        return RaiseOk
+      end
+      if list.length(xs: row_types) == 0 then
+        return RaiseRejected(
+          message: "raise " ++ name ++ ": function declares throws {}, no exceptions are permitted"
+        )
+      end
+      return RaiseRejected(
+        message: "raise " ++ name ++ ": exception not in throws row"
+      )
   end
 end
 
