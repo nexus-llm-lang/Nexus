@@ -1,0 +1,240 @@
+/**
+ * cli/format: Capability reporting types and output formatters.
+ *
+ * Covers --explain-capabilities / --explain-capabilities-format,
+ * wasmtime argv construction, and the exec_run_artifact helper.
+ */
+
+import { Option, Some, None } from "std:option"
+import { Console }, * as stdio from "std:stdio"
+import { Proc, ExecResult }, * as proc from "std:proc"
+import * as str from "std:str"
+import * as list from "std:list"
+import { SpannedTopLevel, ExprLambda, GlobalLet, TypeExpr, TyRow, TyUserDefined } from "src/common/ast.nx"
+import { InvalidUsage } from "src/common/error.nx"
+import { ParseResult, get_opt } from "std:argparse"
+
+export type ExplainCaps = ExplainYes | ExplainNone | ExplainWasmtime
+
+export type ExplainFormat = FormatText | FormatJson
+
+export let parse_explain_caps_value = fn (s: string) -> Option<ExplainCaps> do
+  if s == "yes" then return Some(val: ExplainYes) end
+  if s == "none" then return Some(val: ExplainNone) end
+  if s == "wasmtime" then return Some(val: ExplainWasmtime) end
+  return None
+end
+
+export let parse_explain_format_value = fn (s: string) -> Option<ExplainFormat> do
+  if s == "text" then return Some(val: FormatText) end
+  if s == "json" then return Some(val: FormatJson) end
+  return None
+end
+
+let perm_to_cap_name = fn (perm: string) -> Option<string> do
+  if perm == "PermFs" then return Some(val: "Fs") end
+  if perm == "PermNet" then return Some(val: "Net") end
+  if perm == "PermConsole" then return Some(val: "Console") end
+  if perm == "PermRandom" then return Some(val: "Random") end
+  if perm == "PermClock" then return Some(val: "Clock") end
+  if perm == "PermProc" then return Some(val: "Proc") end
+  if perm == "PermEnv" then return Some(val: "Env") end
+  return None
+end
+
+let collect_cap_names = fn (xs: [TypeExpr]) -> [string] do
+  match xs do
+    | [] -> return []
+    | TyUserDefined(name, args: []) :: rest ->
+      if let Some(val: c) = perm_to_cap_name(perm: name) then
+        return c :: collect_cap_names(xs: rest)
+      end
+      return collect_cap_names(xs: rest)
+    | _ :: rest -> return collect_cap_names(xs: rest)
+  end
+end
+
+let extract_caps_from_row = fn (row: TypeExpr) -> [string] do
+  if let TyRow(types, rest: _) = row then
+    return collect_cap_names(xs: types)
+  end
+  return []
+end
+
+let list_has_str = fn (xs: [string], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == s then return true end
+      return list_has_str(xs: rest, s)
+  end
+end
+
+/** Walk top-level defs; for `let main = fn (...) require { Perm… }`, return
+ *  the capability names. Adds `Proc` when `main` takes `args` so argv can
+ *  be read at runtime.
+ */
+export let find_main_caps = fn (defs: [SpannedTopLevel]) -> [string] do
+  match defs do
+    | [] -> return []
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value: SpannedExpr(node: ExprLambda(type_params: _, params, ret_type: _, requires, throw_row: _, body: _), span: _))), span: _) :: rest ->
+      if name == "main" then
+        let caps = extract_caps_from_row(row: requires)
+        if list.length(xs: params) > 0 then
+          if list_has_str(xs: caps, s: "Proc") then return caps end
+          return list.concat(xs: caps, ys: ["Proc"])
+        end
+        return caps
+      end
+      return find_main_caps(defs: rest)
+    | _ :: rest -> return find_main_caps(defs: rest)
+  end
+end
+
+let cap_wasmtime_flags = fn (name: string) -> [string] do
+  // Net: only `-S inherit-network` is safe on the preview1 core wasm we
+  // emit; `-S http` (wasi-http) requires a preview2 component and would
+  // fail at startup with "Cannot enable wasi-http for core wasm modules"
+  // (nexus-yx5i). Until a preview2 bridge lands the stdlib HTTP primitives
+  // are stubs anyway (see nxlib/stdlib/network.nx), so this flag is mostly
+  // a marker that the program touches the network.
+  if name == "Net" then return ["--wasi", "inherit-network"] end
+  if name == "Fs" then return ["--dir", "."] end
+  return []
+end
+
+let collect_all_wasmtime_flags = fn (caps: [string]) -> [string] do
+  match caps do
+    | [] -> return []
+    | c :: rest -> return list.concat(xs: cap_wasmtime_flags(name: c), ys: collect_all_wasmtime_flags(caps: rest))
+  end
+end
+
+/** Wasm proposals required at runtime. The inlined stdlib uses every one of
+ *  these (TCO, raise/throws, closures, handlers, threads/atomics for `@`), so
+ *  emit them all whenever wasmtime mode is selected — detection on the user's
+ *  AST alone would underreport because stdlib brings them in regardless.
+ */
+export let wasmtime_feature_flags = fn () -> [string] do
+  return ["-W", "tail-call=y", "-W", "exceptions=y", "-W", "function-references=y", "-W", "stack-switching=y", "-W", "threads=y", "-W", "shared-memory=y", "-S", "threads"]
+end
+
+let quote_strings = fn (xs: [string]) -> [string] do
+  match xs do
+    | [] -> return []
+    | v :: rest -> return ("\"" ++ v ++ "\"") :: quote_strings(xs: rest)
+  end
+end
+
+export let build_run_cmd = fn (output_name: string, caps: [string]) -> string do
+  let feat_flags = wasmtime_feature_flags()
+  let cap_flags = collect_all_wasmtime_flags(caps)
+  let argv = list.concat(xs: feat_flags, ys: list.concat(xs: cap_flags, ys: [output_name]))
+  return "wasmtime run " ++ str.join(xs: argv, sep: " ")
+end
+
+/** Build the wasmtime argv for `nexus run`: `["run", -W..., -S..., cap-flags,
+ *  wasm_path, user_args...]`. Mirrors `build_run_cmd` but emits a list so it
+ *  can be fed straight to `Proc.exec`.
+ */
+export let build_wasmtime_run_argv = fn (wasm_path: string, caps: [string], user_args: [string]) -> [string] do
+  let feat_flags = wasmtime_feature_flags()
+  let cap_flags = collect_all_wasmtime_flags(caps)
+  let prefix = list.concat(xs: ["run"], ys: list.concat(xs: feat_flags, ys: cap_flags))
+  return list.concat(xs: prefix, ys: list.concat(xs: [wasm_path], ys: user_args))
+end
+
+/** Spawn `wasmtime run` against the freshly-built artifact and return the
+ *  child's exit code. The Proc.exec stub returns -1 under WASI preview1 (the
+ *  wasmtime profile this driver actually runs under); detect that and tell
+ *  the user to switch to the polyglot `./nexus` launcher, which intercepts
+ *  `run` at the shell layer and drives wasmtime directly.
+ */
+export let exec_run_artifact = fn (wasm_path: string, source: string, caps: [string], user_args: [string], verbose: bool) -> i64 require { Console, Proc } do
+  let argv = build_wasmtime_run_argv(wasm_path, caps, user_args)
+  if verbose then
+    Console.eprintln(val: "[nexus] exec wasmtime " ++ str.join(xs: argv, sep: " "))
+  end
+  match Proc.exec(cmd: "wasmtime", args: argv) do | ExecResult(exit_code, stdout, stderr) ->
+    if exit_code == (0 - 1) then
+      Console.eprintln(val: "nexus run: subprocess unavailable (WASI preview1 has no exec).")
+      Console.eprintln(val: "  Run via the polyglot launcher (`./nexus run " ++ source ++ "`) — it")
+      Console.eprintln(val: "  drives wasmtime from the host shell.")
+      return 1
+    end
+    // Stream the child's stdio so `nexus run` is transparent. `eprint` /
+    // `print` (without -ln) preserve any trailing newline emitted by the
+    // program so output is byte-identical to a direct wasmtime invocation.
+    if str.length(s: stdout) > 0 then Console.print(val: stdout) end
+    if str.length(s: stderr) > 0 then Console.eprint(val: stderr) end
+    return exit_code
+  end
+end
+
+export let print_build_result_text = fn (output_name: string, caps: [string], explain: ExplainCaps, output_is_polyglot: bool) -> unit require { Console } do
+  Console.eprintln(val: "Built " ++ output_name)
+  match explain do
+    | ExplainNone -> return ()
+    | ExplainYes ->
+      if list.length(xs: caps) > 0 then
+        Console.eprintln(val: "Capabilities: " ++ str.join(xs: caps, sep: ", "))
+      end
+    | ExplainWasmtime ->
+      if list.length(xs: caps) > 0 then
+        Console.eprintln(val: "Capabilities: " ++ str.join(xs: caps, sep: ", "))
+      end
+      // Polyglot launchers are run via `chmod +x && ./<launcher>`; the
+      // wasmtime command is embedded inside the launcher itself, so the
+      // user-facing run hint switches to the chmod form.
+      if output_is_polyglot then
+        Console.eprintln(val: "Run: chmod +x " ++ output_name ++ " && ./" ++ output_name)
+      else
+        Console.eprintln(val: "Run: " ++ build_run_cmd(output_name, caps))
+      end
+  end
+end
+
+export let print_build_result_json = fn (output_name: string, caps: [string], explain: ExplainCaps, output_is_polyglot: bool) -> unit require { Console } do
+  match explain do
+    | ExplainNone ->
+      Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\"}")
+    | ExplainYes ->
+      let caps_quoted = quote_strings(xs: caps)
+      Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\",\"capabilities\":[" ++ str.join(xs: caps_quoted, sep: ",") ++ "]}")
+    | ExplainWasmtime ->
+      let caps_quoted = quote_strings(xs: caps)
+      if output_is_polyglot then
+        let cmd = "chmod +x " ++ output_name ++ " && ./" ++ output_name
+        Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\",\"capabilities\":[" ++ str.join(xs: caps_quoted, sep: ",") ++ "],\"polyglot\":{\"command\":\"" ++ cmd ++ "\"}}")
+      else
+        let all_flags = list.concat(xs: wasmtime_feature_flags(), ys: collect_all_wasmtime_flags(caps))
+        let flags_quoted = quote_strings(xs: all_flags)
+        let cmd = build_run_cmd(output_name, caps)
+        Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\",\"capabilities\":[" ++ str.join(xs: caps_quoted, sep: ",") ++ "],\"wasmtime\":{\"command\":\"" ++ cmd ++ "\",\"flags\":[" ++ str.join(xs: flags_quoted, sep: ",") ++ "]}}")
+      end
+  end
+end
+
+export let parse_explain_caps_or_fail = fn (val: string) -> ExplainCaps throws { InvalidUsage } do
+  if let Some(val: e) = parse_explain_caps_value(s: val) then return e end
+  raise InvalidUsage(detail: "invalid --explain-capabilities value: " ++ val)
+end
+
+export let parse_format_or_fail = fn (val: string, flag_name: string) -> ExplainFormat throws { InvalidUsage } do
+  if let Some(val: f) = parse_explain_format_value(s: val) then return f end
+  raise InvalidUsage(detail: "invalid " ++ flag_name ++ " value: " ++ val ++ " (expected text|json)")
+end
+
+export let read_explain_caps_opt = fn (result: ParseResult) -> ExplainCaps throws { InvalidUsage } do
+  match get_opt(result, name: "explain-capabilities") do
+    | None -> return ExplainYes
+    | Some(val: v) -> return parse_explain_caps_or_fail(val: v)
+  end
+end
+
+export let read_format_opt = fn (result: ParseResult, name: string, flag_name: string) -> ExplainFormat throws { InvalidUsage } do
+  match get_opt(result, name) do
+    | None -> return FormatText
+    | Some(val: v) -> return parse_format_or_fail(val: v, flag_name)
+  end
+end
