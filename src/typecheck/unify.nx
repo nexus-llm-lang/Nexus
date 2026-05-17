@@ -32,6 +32,7 @@ import {
   SubstEntry, UnifyResult, UnifyOk, UnifyErr, TypeDefEntry
 }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
+import { type_carries_linear } from "src/typecheck/infer/collections.nx"
 import * as str from "std:str"
 
 // ─── Internal supply-threaded result type ───────────────────────────────────
@@ -203,9 +204,16 @@ let unify_i = fn (t1: TypeExpr, t2: TypeExpr, tdefs: [TypeDefEntry], supply: i64
     // Spec type-system-formal.md §U-Borrow declares this rule intentionally
     // asymmetric — there is no symmetric counterpart. A bare TyBorrow on the
     // right of a non-borrow LHS is a type mismatch and must fall through.
-    return if let TyBorrow(inner: i2) = t2 then
-      unify_i(t1: i1, t2: i2, tdefs, supply)
-    else unify_i(t1: i1, t2, tdefs, supply) end
+    if let TyBorrow(inner: i2) = t2 then
+      return unify_i(t1: i1, t2: i2, tdefs, supply)
+    end
+    // Spec §U-Borrow premise: ¬linear(τ₂). A borrow &σ must not satisfy a
+    // linear context τ₂ — that would let the callee consume the resource
+    // while the caller still holds the borrow's source.
+    if type_carries_linear(typ: t2, tdefs, depth: 8) then
+      return UnifyErrS(message: "U-Borrow: cannot pass borrow where linear type is expected (borrow-to-ownership smuggling rejected)")
+    end
+    return unify_i(t1: i1, t2, tdefs, supply)
   end
 
   if let TyRow(types: ts1, rest: r1) = t1 then
@@ -227,6 +235,37 @@ end
 
 // ─── Arrow unification ──────────────────────────────────────────────────────
 
+// Positional (name-ignoring) unification for function parameter lists.
+// U-Arrow: parameter labels serve as argument routing at call sites (T-App);
+// they are NOT part of the function type's structural identity for unification
+// purposes — fn (x: i64) -> string and fn (y: i64) -> string are the same type.
+// Contrast with U-Record where field names ARE part of the record type's identity.
+let unify_arrow_params_i = fn (nts1: [NamedType], nts2: [NamedType], tdefs: [TypeDefEntry], supply: i64) -> UnifyResultS do
+  match nts1 do
+    | [] ->
+      match nts2 do
+        | [] -> return UnifyOkS(subst: subst.subst_empty(), supply)
+        | _ -> return UnifyErrS(message: "arity mismatch")
+      end
+    | NamedType(name: n1, typ: t1) :: r1 ->
+      match nts2 do
+        | [] -> return UnifyErrS(message: "arity mismatch")
+        | NamedType(name: _, typ: t2) :: r2 ->
+          match unify_i(t1, t2, tdefs, supply) do
+            | UnifyErrS(message: m) -> return UnifyErrS(message: "param " ++ n1 ++ ": " ++ m)
+            | UnifyOkS(subst: s1, supply: sup1) ->
+              let r1a = apply_subst_named_types(subst: s1, nts: r1)
+              let r2a = apply_subst_named_types(subst: s1, nts: r2)
+              match unify_arrow_params_i(nts1: r1a, nts2: r2a, tdefs, supply: sup1) do
+                | UnifyErrS(message: m) -> return UnifyErrS(message: m)
+                | UnifyOkS(subst: s2, supply: sup2) ->
+                  return UnifyOkS(subst: subst.subst_compose(s1, s2), supply: sup2)
+              end
+          end
+      end
+  end
+end
+
 let unify_arrow_i = fn (
   p1: [NamedType], p2: [NamedType],
   r1: TypeExpr, r2: TypeExpr,
@@ -235,7 +274,7 @@ let unify_arrow_i = fn (
   tdefs: [TypeDefEntry],
   supply: i64
 ) -> UnifyResultS do
-  match unify_named_types_i(nts1: p1, nts2: p2, tdefs, supply) do
+  match unify_arrow_params_i(nts1: p1, nts2: p2, tdefs, supply) do
     | UnifyErrS(message: m) -> return UnifyErrS(message: m)
     | UnifyOkS(subst: s1, supply: sup1) ->
       match unify_i(t1: subst.subst_apply(subst: s1, typ: r1), t2: subst.subst_apply(subst: s1, typ: r2), tdefs, supply: sup1) do
@@ -275,6 +314,27 @@ end
 
 // ─── Named type list unification (params, record fields) ────────────────────
 
+// Return type for find_named_type_i: the matched type plus the remaining list
+// (with the matched entry removed), so callers can recurse on the residual.
+type UnifyNamedPair = UnifyNamedPair(typ: TypeExpr, rest: [NamedType])
+
+// Find the NamedType entry with the given name in `nts`, returning the
+// associated type and the list with that entry removed.
+let find_named_type_i = fn (nts: [NamedType], name: string) -> Option<UnifyNamedPair> do
+  match nts do
+    | [] -> return None
+    | NamedType(name: n, typ: t) :: rest ->
+      if n == name then
+        return Some(val: UnifyNamedPair(typ: t, rest))
+      end
+      match find_named_type_i(nts: rest, name) do
+        | None -> return None
+        | Some(val: UnifyNamedPair(typ: t2, rest: r2)) ->
+          return Some(val: UnifyNamedPair(typ: t2, rest: NamedType(name: n, typ: t) :: r2))
+      end
+  end
+end
+
 let unify_named_types_i = fn (nts1: [NamedType], nts2: [NamedType], tdefs: [TypeDefEntry], supply: i64) -> UnifyResultS do
   match nts1 do
     | [] ->
@@ -283,9 +343,13 @@ let unify_named_types_i = fn (nts1: [NamedType], nts2: [NamedType], tdefs: [Type
         | _ -> return UnifyErrS(message: "arity mismatch")
       end
     | NamedType(name: n1, typ: t1) :: r1 ->
-      match nts2 do
-        | [] -> return UnifyErrS(message: "arity mismatch")
-        | NamedType(name: n2, typ: t2) :: r2 ->
+      // Spec §U-Record / §U-Arrow: labels must match by name (∀i. ℓᵢ¹ = ℓᵢ²).
+      // Records may appear with fields in a different order than the parameter
+      // declaration (e.g. { y: 2, x: 1 } vs { x: i64, y: i64 }).
+      // Look up n1 in nts2 by name; if absent, it is a label mismatch.
+      match find_named_type_i(nts: nts2, name: n1) do
+        | None -> return UnifyErrS(message: "label mismatch: field " ++ n1 ++ " not found in counterpart")
+        | Some(val: UnifyNamedPair(typ: t2, rest: r2)) ->
           match unify_i(t1, t2, tdefs, supply) do
             | UnifyErrS(message: m) -> return UnifyErrS(message: "field " ++ n1 ++ ": " ++ m)
             | UnifyOkS(subst: s1, supply: sup1) ->
