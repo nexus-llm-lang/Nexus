@@ -11,7 +11,7 @@ import * as naming from "src/common/naming.nx"
 import { TypeExpr, TyUnit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyHandler, NamedType, EnumDef, RecordDef, VariantDef, VariantField } from "src/common/ast.nx"
 import { HirProgram, HirFunction, HirHandlerArm, HirParam, HirExternal, HirPort, HirPortMethod, HirHandlerBindingEntry, HirHandlerBinding, EagerBody, LazyBody, ExceptionGroupEntry } from "src/ir/hir/types.nx"
 import { Span } from "src/common/token.nx"
-import { TypeError, TypeMismatch, MissingMain, MainNotFunction, MainNotUnit, MainThrowsTooBroad, DuplicateTopLevelBinding, UnusedTypeParam, KindClashTypeParam } from "src/common/error.nx"
+import { TypeError, TypeMismatch, MissingMain, MainNotFunction, MainNotUnit, MainThrowsTooBroad, MainRequiresTooBroad, DuplicateTopLevelBinding, UnusedTypeParam, KindClashTypeParam } from "src/common/error.nx"
 import { CheckState, Scheme, EnvEntry, EnumEntry, TypeDefEntry, InferExprOk, InferExprErr }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
 import * as infer from "src/typecheck/infer.nx"
@@ -60,7 +60,7 @@ export let check_program = fn (hir: HirProgram, local_names: [string], require_m
   // typecheck (require_main=false): files with only exports are legitimate
   // imports for other modules and have no executable entry point.
   if require_main then
-    validate_main(state: st5)
+    validate_main(state: st5, funcs)
   end
 
   return hir
@@ -946,7 +946,17 @@ end
  *  or rows containing non-exception entries — and validate_main rejects
  *  them here as `MainThrowsTooBroad`.
  */
-let validate_main = fn (state: CheckState) -> unit throws { TypeError } do
+let validate_main = fn (state: CheckState, funcs: [HirFunction]) -> unit throws { TypeError } do
+  // The type environment registers TyArrow with requires: TyRow([],None)
+  // for every function (register_functions_go L538). The HirFunction.requires
+  // field carries the source-level require row and must be consulted directly.
+  //
+  // When main_wrap synthesises a wrapper, the original main is renamed to
+  // `__nx_user_main` (requires row preserved). Check that first.
+  match find_func_requires(name: "__nx_user_main", funcs) do
+    | Some(val: user_req) -> validate_main_require_row(require_row: user_req)
+    | None -> ()
+  end
   match tctypes.env_lookup(env: tctypes.state_env(state), name: "main") do
     | None ->
       raise MissingMain
@@ -954,12 +964,62 @@ let validate_main = fn (state: CheckState) -> unit throws { TypeError } do
       match main_type do
         | TyArrow(params: _, ret, requires: _, throw_row: tw) ->
           if subst.type_eq(a: ret, b: TyUnit) then
+            // Check the HirFunction.requires directly (env value is always empty).
+            match find_func_requires(name: "main", funcs) do
+              | Some(val: req) -> validate_main_require_row(require_row: req)
+              | None -> ()
+            end
             return validate_main_throw_row(throw_row: tw)
           end
           raise MainNotUnit
         | _ ->
           raise MainNotFunction
       end
+  end
+end
+
+/** Look up a HirFunction by name and return its source-level require row,
+ *  or None if not found.
+ */
+let find_func_requires = fn (name: string, funcs: [HirFunction]) -> Option<TypeExpr> do
+  match funcs do
+    | [] -> return None
+    | HirFunction(name: n, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span: _, file: _, requires: req) :: rest ->
+      if n == name then return Some(val: req) end
+      return find_func_requires(name, funcs: rest)
+  end
+end
+
+/** Enforce spec P9 wfMain: ρ_q ⊆ SysCaps.
+ *  main's require row may only contain system capabilities. User-declared
+ *  port names are rejected because there is no enclosing inject at the
+ *  program entry point to provide them.
+ *  Empty rows and implicit-tail rows (`__implicit`) are accepted.
+ */
+let validate_main_require_row = fn (require_row: TypeExpr) -> unit throws { TypeError } do
+  match require_row do
+    | TyRow(types: ts, rest: _) ->
+      return validate_main_require_row_entries(entries: ts)
+    | TyUnit -> return ()
+    | _ -> return ()
+  end
+end
+
+let validate_main_require_row_entries = fn (entries: [TypeExpr]) -> unit throws { TypeError } do
+  match entries do
+    | [] -> return ()
+    | t :: rest ->
+      validate_main_require_row_entry(entry: t)
+      return validate_main_require_row_entries(entries: rest)
+  end
+end
+
+let validate_main_require_row_entry = fn (entry: TypeExpr) -> unit throws { TypeError } do
+  match entry do
+    | TyUserDefined(name: n, args: _) ->
+      if tcwf.is_sys_cap(name: n) then return () end
+      raise MainRequiresTooBroad(port_name: n)
+    | _ -> return ()
   end
 end
 
