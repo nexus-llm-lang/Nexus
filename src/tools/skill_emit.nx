@@ -1,0 +1,348 @@
+/**
+ * skill_emit: `nexus skill --emit` subcommand (issue nexus-9j8x).
+ *
+ * Auto-regenerates a CLI-reference markdown document from the compiler's
+ * authoritative spec tables (driver.nx:cli_specs / subcommand_specs).
+ *
+ * Why it exists: the hand-edited `skills/nexus-lang/SKILL.md` and `AGENTS.md`
+ * drift every time a flag/subcommand is added or renamed. The bd plan is to
+ * keep the editorial prose hand-written but emit the mechanical "subcommand
+ * + flag inventory" section from the compiler so an LLM context harness can
+ * be regenerated at any time.
+ *
+ * V1 scope (this module):
+ *   - render a single self-contained CLI-reference document from the supplied
+ *     SubcommandSpec list (one section per subcommand: synopsis, description,
+ *     flags table, examples, see-also, exit codes), plus a top-level options
+ *     block from `global_help_specs()`
+ *   - support `--out PATH` (default: docs/cli-reference.md)
+ *   - support `--check` (CI mode: read existing file, diff, exit 1 on mismatch)
+ *
+ * V2 (deferred — depends on nexus-fl9t / nexus-mdyj / cap-inventory plumbing):
+ *   - inject stdlib symbol surface
+ *   - inject capability inventory
+ *   - inject examples corpus index
+ *
+ * The driver wires the actual spec lists into `run_skill_subcommand` so
+ * this module stays free of driver-internal types.
+ */
+
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+import { Fs, FileNotFound, WriteError } from "std:fs"
+import { Console } from "std:stdio"
+import { InvalidUsage } from "src/common/error.nx"
+import {
+  ArgSpec, ArgKind, Flag, OptValue, Positional, Subcommand,
+  SubcommandSpec, Example, ExitCode,
+  parse, get_flag, get_opt, get_positionals_all, is_ok, first_error,
+  spec_flag, spec_opt,
+  detect_subcommand, SubcommandHit
+} from "std:argparse"
+
+// ─── Subcommand stripping ──────────────────────────────────────────────────
+
+export type ParsedSkillSubcommand = ParsedSkillSubcommand(remaining: [string], is_skill: bool)
+
+/** Detect a leading `skill` subcommand. Thin wrapper over argparse's
+ *  shared `detect_subcommand` primitive. */
+export let strip_skill_subcommand = fn (xs: [string]) -> ParsedSkillSubcommand do
+  match detect_subcommand(args: xs, kw: "skill") do | SubcommandHit(present, remaining) ->
+    if present then return ParsedSkillSubcommand(remaining, is_skill: true) end
+    return ParsedSkillSubcommand(remaining: xs, is_skill: false)
+  end
+end
+
+// ─── Options ───────────────────────────────────────────────────────────────
+
+export type SkillOptions = SkillOptions(emit: bool, check_mode: bool, out_path: string)
+
+let default_out_path = fn () -> string do
+  return "docs/cli-reference.md"
+end
+
+let skill_specs = fn () -> [ArgSpec] do
+  return [
+    spec_flag(name: "emit", short: "", long: "--emit", help: "regenerate the CLI-reference document"),
+    spec_flag(name: "check", short: "", long: "--check", help: "verify the on-disk file matches the generator output (CI mode); exit 1 on drift"),
+    spec_opt(name: "out", short: "", long: "--out", required: false, help: "output path (default: docs/cli-reference.md)")
+  ]
+end
+
+export let parse_skill_options = fn (args: [string]) -> SkillOptions throws { InvalidUsage } do
+  let result = parse(args, specs: skill_specs())
+  if !is_ok(result) then
+    raise InvalidUsage(detail: "nexus skill: " ++ first_error(result))
+  end
+  let emit = get_flag(result, name: "emit")
+  let check = get_flag(result, name: "check")
+  let out = match get_opt(result, name: "out") do
+    | None -> default_out_path()
+    | Some(val: p) -> p
+  end
+  return SkillOptions(emit, check_mode: check, out_path: out)
+end
+
+// ─── Markdown rendering ────────────────────────────────────────────────────
+//
+// The document layout:
+//
+//   # Nexus CLI Reference
+//
+//   _Generated from `subcommand_specs()` / `global_help_specs()` in
+//   `src/driver.nx`. Do not hand-edit — run `nexus skill --emit` to refresh._
+//
+//   ## Global Options
+//
+//   | Flag | Description |
+//   | ---- | ----------- |
+//   | `--verbose` | enable per-pass timing output |
+//
+//   ## Subcommands
+//
+//   ### `nexus build`
+//   **Synopsis**: `nexus build <input.nx> ...`
+//   <description prose>
+//   **Flags**: <flag table or "(none)">
+//   **Examples**: ...
+//   **See also**: ...
+//   **Exit codes**: ...
+//
+// The rendering is deterministic: identical spec lists ⇒ byte-identical
+// output. This is what makes the `--check` CI gate meaningful.
+
+let nl = fn () -> string do return "\n" end
+
+/** Render a single ArgSpec line into the markdown flags table.
+ *  Returns one row of the form: `| <spelling> | <help> |`. */
+let render_flag_row = fn (spec: ArgSpec) -> string do
+  match spec do | ArgSpec(name: _, kind, short, long, takes_value, required: _, help) ->
+    let spelling = render_flag_spelling(short, long, takes_value)
+    return "| `" ++ spelling ++ "` | " ++ help ++ " |"
+  end
+end
+
+let render_flag_spelling = fn (short: Option<string>, long: Option<string>, takes_value: bool) -> string do
+  let short_str = match short do
+    | None -> ""
+    | Some(val: s) -> s
+  end
+  let long_str = match long do
+    | None -> ""
+    | Some(val: l) -> l
+  end
+  let base = if str.length(s: short_str) > 0 then
+      if str.length(s: long_str) > 0 then short_str ++ ", " ++ long_str else short_str end
+    else
+      long_str
+    end
+  if takes_value then return base ++ " VALUE" end
+  return base
+end
+
+/** Walk the spec list and emit the markdown rows for Flag / OptValue
+ *  entries only. Subcommand-typed specs (advisory entries in cli_specs)
+ *  are filtered out — those belong in the Subcommands section, not the
+ *  flag tables. */
+let render_flag_rows = fn (specs: [ArgSpec], acc: [string]) -> [string] do
+  match specs do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest ->
+      match s do | ArgSpec(name: _, kind, short: _, long: _, takes_value: _, required: _, help: _) ->
+        match kind do
+          | Flag -> return render_flag_rows(specs: rest, acc: render_flag_row(spec: s) :: acc)
+          | OptValue -> return render_flag_rows(specs: rest, acc: render_flag_row(spec: s) :: acc)
+          | _ -> return render_flag_rows(specs: rest, acc)
+        end
+      end
+  end
+end
+
+/** Render a complete flags table (header + rows). Returns "(none)\n" when
+ *  the spec list has no Flag/OptValue entries. */
+let render_flags_table = fn (specs: [ArgSpec]) -> string do
+  let rows = render_flag_rows(specs, acc: [])
+  if list.length(xs: rows) == 0 then return "(none)" ++ nl() end
+  let header = "| Flag | Description |" ++ nl() ++ "| ---- | ----------- |"
+  return header ++ nl() ++ list.fold_left(xs: rows, init: "", f: fn (acc: string, row: string) -> string do
+    if str.length(s: acc) == 0 then return row end
+    return acc ++ nl() ++ row
+  end) ++ nl()
+end
+
+/** Render the per-subcommand examples list as a markdown bulleted list.
+ *  Returns "" when the list is empty so the caller can elide the section. */
+let render_examples_list = fn (examples: [Example]) -> string do
+  if list.length(xs: examples) == 0 then return "" end
+  return list.fold_left(xs: examples, init: "", f: fn (acc: string, ex: Example) -> string do
+    match ex do | Example(command, comment) ->
+      let line = if str.length(s: comment) == 0 then
+          "- `" ++ command ++ "`"
+        else
+          "- `" ++ command ++ "` — " ++ comment
+        end
+      if str.length(s: acc) == 0 then return line end
+      return acc ++ nl() ++ line
+    end
+  end) ++ nl()
+end
+
+/** Render the "see also" list as inline backticked names. */
+let render_see_also_list = fn (names: [string]) -> string do
+  if list.length(xs: names) == 0 then return "" end
+  let parts = list.map(xs: names, f: fn (n: string) -> string do
+    return "`nexus " ++ n ++ "`"
+  end)
+  return str.join(xs: parts, sep: ", ") ++ nl()
+end
+
+/** Render the exit codes as a markdown table (code → meaning). */
+let render_exit_codes_table = fn (codes: [ExitCode]) -> string do
+  if list.length(xs: codes) == 0 then return "" end
+  let header = "| Code | Meaning |" ++ nl() ++ "| ---- | ------- |"
+  let rows = list.fold_left(xs: codes, init: "", f: fn (acc: string, ec: ExitCode) -> string do
+    match ec do | ExitCode(code, meaning) ->
+      let row = "| " ++ str.from_i64(val: code) ++ " | " ++ meaning ++ " |"
+      if str.length(s: acc) == 0 then return row end
+      return acc ++ nl() ++ row
+    end
+  end)
+  return header ++ nl() ++ rows ++ nl()
+end
+
+/** Render one SubcommandSpec block.
+ *
+ *  ### `nexus <name>`
+ *
+ *  **Synopsis**
+ *
+ *      nexus <name> <synopsis>
+ *
+ *  <description prose>
+ *
+ *  **Flags**
+ *
+ *  <flag table or "(none)">
+ *
+ *  **Examples**
+ *
+ *  - `<command>` — <comment>
+ *
+ *  **See also**: `nexus <other>`, ...
+ *
+ *  **Exit codes**
+ *
+ *  | Code | Meaning |
+ *  ...
+ */
+let render_subcommand_section = fn (spec: SubcommandSpec) -> string do
+  match spec do | SubcommandSpec(name, synopsis, description, flags, examples, see_also, exit_codes) ->
+    let header = "### `nexus " ++ name ++ "`" ++ nl() ++ nl()
+    let syn_body = if str.length(s: synopsis) == 0 then "nexus " ++ name
+        else "nexus " ++ name ++ " " ++ synopsis
+      end
+    let syn = "**Synopsis**" ++ nl() ++ nl() ++ "    " ++ syn_body ++ nl() ++ nl()
+    let desc = if str.length(s: description) == 0 then ""
+        else description ++ nl() ++ nl()
+      end
+    let flags_section = "**Flags**" ++ nl() ++ nl() ++ render_flags_table(specs: flags) ++ nl()
+    let examples_str = render_examples_list(examples)
+    let ex_section = if str.length(s: examples_str) == 0 then ""
+        else "**Examples**" ++ nl() ++ nl() ++ examples_str ++ nl()
+      end
+    let see_str = render_see_also_list(names: see_also)
+    let see_section = if str.length(s: see_str) == 0 then ""
+        else "**See also**: " ++ see_str ++ nl()
+      end
+    let exit_str = render_exit_codes_table(codes: exit_codes)
+    let exit_section = if str.length(s: exit_str) == 0 then ""
+        else "**Exit codes**" ++ nl() ++ nl() ++ exit_str ++ nl()
+      end
+    return header ++ syn ++ desc ++ flags_section ++ ex_section ++ see_section ++ exit_section
+  end
+end
+
+let render_subcommand_sections = fn (specs: [SubcommandSpec], acc: string) -> string do
+  match specs do
+    | [] -> return acc
+    | s :: rest ->
+      let block = render_subcommand_section(spec: s)
+      let next = if str.length(s: acc) == 0 then block else acc ++ nl() ++ block end
+      return render_subcommand_sections(specs: rest, acc: next)
+  end
+end
+
+/** Render the full CLI reference document. Inputs are the same spec
+ *  tables the driver feeds to `parse_permissive` / `print_subcommand_help`,
+ *  so emitter output stays in lockstep with `nexus --help` / `nexus <sub>
+ *  --help`. */
+export let render_cli_reference = fn (global_specs: [ArgSpec], sub_specs: [SubcommandSpec]) -> string do
+  let banner = "# Nexus CLI Reference" ++ nl() ++ nl()
+    ++ "_Generated by `nexus skill --emit` from `subcommand_specs()` and " ++
+       "`global_help_specs()` in `src/driver.nx`. Do not hand-edit — " ++
+       "run `nexus skill --emit` to refresh, or `nexus skill --check` " ++
+       "to verify the on-disk copy is in sync._" ++ nl() ++ nl()
+  let global_section = "## Global Options" ++ nl() ++ nl()
+    ++ "These flags apply to every subcommand. Per-subcommand flags live " ++
+       "under each subcommand's own section." ++ nl() ++ nl()
+    ++ render_flags_table(specs: global_specs) ++ nl()
+  let sub_header = "## Subcommands" ++ nl() ++ nl()
+  let sub_body = render_subcommand_sections(specs: sub_specs, acc: "")
+  return banner ++ global_section ++ sub_header ++ sub_body
+end
+
+// ─── Subcommand entry ─────────────────────────────────────────────────────
+
+/** Driver entry point. Wires the driver-side spec tables into the
+ *  pure renderer above, then either writes to disk or diffs in place. */
+export let run_skill_subcommand = fn (
+  args: [string],
+  global_specs: [ArgSpec],
+  sub_specs: [SubcommandSpec]
+) -> i64 require { Console, Fs } do
+  try
+    let opts = parse_skill_options(args)
+    match opts do | SkillOptions(emit, check_mode, out_path) ->
+      // Default action is `--emit`. We accept the bare `nexus skill`
+      // form as shorthand for `nexus skill --emit` so the bd's
+      // "auto-regenerate on demand" UX doesn't require remembering the
+      // flag spelling. `--check` overrides into verify-only mode.
+      let do_emit = emit || !check_mode
+      let _ = do_emit
+      let rendered = render_cli_reference(global_specs, sub_specs)
+      if check_mode then
+        // Read the on-disk file and compare. Missing file ⇒ drift.
+        if !Fs.exists(path: out_path) then
+          Console.eprintln(val: "nexus skill --check: " ++ out_path ++ " missing; run `nexus skill --emit` to create it")
+          return 1
+        end
+        let existing = Fs.read_to_string(path: out_path)
+        if existing == rendered then
+          Console.println(val: "nexus skill --check: " ++ out_path ++ " is up to date")
+          return 0
+        end
+        Console.eprintln(val: "nexus skill --check: " ++ out_path ++ " is stale; run `nexus skill --emit` to regenerate")
+        return 1
+      end
+      Fs.write_string(path: out_path, content: rendered)
+      Console.println(val: "nexus skill: wrote " ++ out_path)
+      return 0
+    end
+  catch e ->
+    match e do
+      | InvalidUsage(detail) ->
+        Console.eprintln(val: "nexus skill: " ++ detail)
+        return 2
+      | FileNotFound(path) ->
+        Console.eprintln(val: "nexus skill: file not found: " ++ path)
+        return 1
+      | WriteError(path) ->
+        Console.eprintln(val: "nexus skill: write failed: " ++ path)
+        return 1
+      | _ ->
+        Console.eprintln(val: "nexus skill: error")
+        return 1
+    end
+  end
+end

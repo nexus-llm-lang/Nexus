@@ -1,0 +1,215 @@
+// Issue nexus-9j8x — `nexus skill --emit` smoke test for the CLI-reference
+// markdown renderer.
+//
+// Exercises `render_cli_reference` directly against a synthetic spec
+// list rather than spawning a `nexus skill --emit` subprocess (Proc.exec
+// is -1 under WASI preview1 — see qqvz / ud6j notes).
+//
+// Coverage:
+//   1. render_cli_reference produces a non-empty document with the
+//      banner + Global Options + Subcommands sections.
+//   2. A subcommand section renders synopsis / description / flag table /
+//      examples / see-also / exit-codes when the inputs supply each.
+//   3. An empty per-subcommand flag list renders as the "(none)" placeholder
+//      (we don't emit an empty markdown table header).
+//   4. The renderer is deterministic — required for `--check` to be a
+//      meaningful CI gate.
+//   5. parse_skill_options recognises --emit, --check, --out and rejects
+//      unknown flags.
+//   6. strip_skill_subcommand detects the leading `skill` keyword and
+//      passes through unrelated argv unchanged.
+//
+// The production `subcommand_specs()` / `global_help_specs()` round-trip
+// is covered indirectly: the boot smoke test (./nexus skill --emit during
+// `bootstrap.sh`) exercises the actual driver-side spec tables; if those
+// shapes ever diverge from what the renderer accepts, that path raises.
+
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import {
+  ArgSpec, SubcommandSpec, SubcommandCategory, CategoryBuild, CategoryTooling, Example, ExitCode,
+  spec_flag, spec_opt, subspec, example, exit_code
+} from "std:argparse"
+import {
+  SkillOptions, ParsedSkillSubcommand,
+  parse_skill_options, render_cli_reference, strip_skill_subcommand
+} from "src/tools/skill_emit.nx"
+// Note: intentionally NOT importing from "src/driver.nx". driver.nx
+// transitively re-exports `parse` / `is_ok` from `src/frontend/parser.nx`
+// (via `* as parser` re-export), which shadows the argparse-side names
+// at this file's resolution scope and yields a silent miscompile (the
+// argparse.parse call site binds to parser.parse). The test exercises
+// the pure renderer + parser; the production-spec roundtrip is covered
+// indirectly by the boot smoke test (./nexus skill --emit must succeed
+// during fixed-point bootstrap).
+
+// Tiny synthetic spec set so the assertions don't depend on the
+// production subcommand table churning over time. Two subcommands: one
+// with a full payload (synopsis / description / flags / examples /
+// see-also / exit-codes), one minimal (empty flag list — drives the
+// "(none)" branch in render_flags_table).
+
+let synthetic_global = fn () -> [ArgSpec] do
+  return [
+    spec_flag(name: "verbose", short: "", long: "--verbose", help: "enable timing")
+  ]
+end
+
+let synthetic_subs = fn () -> [SubcommandSpec] do
+  let full = subspec(
+    name: "build",
+    category: CategoryBuild,
+    synopsis: "<input.nx> [-o OUT]",
+    description: "Compile input to wasm.",
+    flags: [
+      spec_opt(name: "output", short: "-o", long: "--output", required: false, help: "output path"),
+      spec_flag(name: "polyglot", short: "", long: "--polyglot", help: "polyglot launcher")
+    ],
+    examples: [
+      example(command: "nexus build foo.nx", comment: "compile a file"),
+      example(command: "nexus build foo.nx -o bar.wasm", comment: "")
+    ],
+    see_also: ["run", "test"],
+    exit_codes: [
+      exit_code(code: 0, meaning: "success"),
+      exit_code(code: 1, meaning: "failure")
+    ]
+  )
+  let minimal = subspec(
+    name: "repl",
+    category: CategoryBuild,
+    synopsis: "",
+    description: "",
+    flags: [],
+    examples: [],
+    see_also: [],
+    exit_codes: []
+  )
+  return [full, minimal]
+end
+
+let test_doc_shape = fn () -> unit throws { Exn } do
+  let doc = render_cli_reference(global_specs: synthetic_global(), sub_specs: synthetic_subs())
+  test_assert.assert(cond: str.length(s: doc) > 0, label: "9j8x: non-empty document")
+  // Banner present
+  test_assert.assert(cond: str.contains(s: doc, sub: "# Nexus CLI Reference"), label: "9j8x: H1 banner present")
+  test_assert.assert(cond: str.contains(s: doc, sub: "## Global Options"), label: "9j8x: Global Options section")
+  test_assert.assert(cond: str.contains(s: doc, sub: "## Subcommands"), label: "9j8x: Subcommands section")
+  // Generation note present (key drift signal for future LLM agents)
+  test_assert.assert(cond: str.contains(s: doc, sub: "nexus skill --emit"), label: "9j8x: regen instructions inline")
+  return ()
+end
+
+let test_subcommand_section = fn () -> unit throws { Exn } do
+  let doc = render_cli_reference(global_specs: synthetic_global(), sub_specs: synthetic_subs())
+  // Subcommand H3
+  test_assert.assert(cond: str.contains(s: doc, sub: "### `nexus build`"), label: "9j8x: build H3 present")
+  // Synopsis line (indented code block; the renderer prefixes 4 spaces)
+  test_assert.assert(cond: str.contains(s: doc, sub: "    nexus build <input.nx> [-o OUT]"), label: "9j8x: synopsis indented")
+  // Description prose
+  test_assert.assert(cond: str.contains(s: doc, sub: "Compile input to wasm."), label: "9j8x: description prose")
+  // Flags table emitted
+  test_assert.assert(cond: str.contains(s: doc, sub: "| Flag | Description |"), label: "9j8x: flag-table header")
+  test_assert.assert(cond: str.contains(s: doc, sub: "`-o, --output VALUE`"), label: "9j8x: -o/--output OptValue spelling")
+  test_assert.assert(cond: str.contains(s: doc, sub: "`--polyglot`"), label: "9j8x: --polyglot Flag spelling")
+  // Examples (with and without comment)
+  test_assert.assert(cond: str.contains(s: doc, sub: "- `nexus build foo.nx` — compile a file"), label: "9j8x: example with comment")
+  test_assert.assert(cond: str.contains(s: doc, sub: "- `nexus build foo.nx -o bar.wasm`"), label: "9j8x: example without comment")
+  // See also
+  test_assert.assert(cond: str.contains(s: doc, sub: "`nexus run`"), label: "9j8x: see-also lists run")
+  test_assert.assert(cond: str.contains(s: doc, sub: "`nexus test`"), label: "9j8x: see-also lists test")
+  // Exit codes
+  test_assert.assert(cond: str.contains(s: doc, sub: "| Code | Meaning |"), label: "9j8x: exit-codes header")
+  return ()
+end
+
+let test_minimal_subcommand = fn () -> unit throws { Exn } do
+  let doc = render_cli_reference(global_specs: synthetic_global(), sub_specs: synthetic_subs())
+  // `repl` has no flags — the rendering must say "(none)" rather than
+  // emit an empty table (which would look broken in markdown).
+  test_assert.assert(cond: str.contains(s: doc, sub: "### `nexus repl`"), label: "9j8x: repl H3 present")
+  test_assert.assert(cond: str.contains(s: doc, sub: "(none)"), label: "9j8x: empty-flags renders as (none)")
+  return ()
+end
+
+let test_deterministic = fn () -> unit throws { Exn } do
+  // Two renders of the same input must be byte-identical — this is what
+  // makes the `--check` CI gate meaningful.
+  let a = render_cli_reference(global_specs: synthetic_global(), sub_specs: synthetic_subs())
+  let b = render_cli_reference(global_specs: synthetic_global(), sub_specs: synthetic_subs())
+  test_assert.assert(cond: a == b, label: "9j8x: deterministic render (a == b)")
+  return ()
+end
+
+let test_parse_options = fn () -> unit throws { Exn } do
+  // --emit alone
+  match parse_skill_options(args: ["--emit"]) do | SkillOptions(emit, check_mode, out_path) ->
+    test_assert.assert(cond: emit, label: "9j8x: --emit parsed")
+    test_assert.assert(cond: !check_mode, label: "9j8x: --check absent")
+    test_assert.assert_eq_string(actual: out_path, expected: "docs/cli-reference.md", label: "9j8x: default out path")
+  end
+  // --check + custom --out
+  match parse_skill_options(args: ["--check", "--out", "/tmp/x.md"]) do | SkillOptions(emit, check_mode, out_path) ->
+    test_assert.assert(cond: !emit, label: "9j8x: --emit absent under --check")
+    test_assert.assert(cond: check_mode, label: "9j8x: --check parsed")
+    test_assert.assert_eq_string(actual: out_path, expected: "/tmp/x.md", label: "9j8x: custom --out path")
+  end
+  return ()
+end
+
+let parse_raised_on = fn (args: [string]) -> bool do
+  try
+    let _ = parse_skill_options(args)
+    return false
+  catch _ -> return true
+  end
+end
+
+let test_invalid_flag_rejected = fn () -> unit throws { Exn } do
+  test_assert.assert(cond: parse_raised_on(args: ["--nope"]), label: "9j8x: unknown flag raises InvalidUsage")
+  return ()
+end
+
+let test_strip_subcommand = fn () -> unit throws { Exn } do
+  // Positive: leading `skill`
+  match strip_skill_subcommand(xs: ["nexus", "skill", "--emit"]) do | ParsedSkillSubcommand(remaining, is_skill) ->
+    test_assert.assert(cond: is_skill, label: "9j8x: strip detects leading skill")
+    let _ = remaining
+  end
+  // Negative: no skill keyword
+  match strip_skill_subcommand(xs: ["nexus", "build", "foo.nx"]) do | ParsedSkillSubcommand(remaining: _, is_skill) ->
+    test_assert.assert(cond: !is_skill, label: "9j8x: strip leaves non-skill argv alone")
+  end
+  return ()
+end
+
+let body = fn () -> unit throws { Exn } do
+  test_doc_shape()
+  test_subcommand_section()
+  test_minimal_subcommand()
+  test_deterministic()
+  test_parse_options()
+  test_invalid_flag_rejected()
+  test_strip_subcommand()
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
