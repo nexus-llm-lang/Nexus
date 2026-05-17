@@ -29,7 +29,7 @@ import {
   OpAnd, OpOr, OpConcat,
   UnaryOp, OpNeg, OpFNeg, OpNot,
   Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit,
-  Sigil, SigilImmutable, SigilMutable, SigilLazy,
+  Sigil, SigilImmutable, SigilMutable, SigilLazy, SigilLinear,
   VariantField, RecordDef
 } from "src/common/ast.nx"
 import {
@@ -506,6 +506,20 @@ let check_call_args_walk = fn (
                             | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
                           end
                         | TyLinear(inner: TyLazy(inner: ainner)) ->
+                          match unify.unify(t1: ainner, t2: expected, tdefs) do
+                            | UnifyOk(subst: s2) ->
+                              let s_all = subst.subst_compose(s1: s_merged, s2)
+                              return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span)
+                            | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
+                          end
+                        | TyLinear(inner: ainner) ->
+                          // T-Let wrapSigil (nexus-u4f3): `let %b = Ctor(...)` gives `b` type
+                          // `TyLinear(T)` in the env. At call sites, param sigils are NOT
+                          // reflected in the Arrow type (build_param_named_types ignores sigil),
+                          // so a `%param: T` param appears with bare type `T`. When arg_t is
+                          // `TyLinear(T)` but expected is the bare `T`, strip the Linear wrapper
+                          // and re-unify. Linearity enforcement is handled by linearity.nx (which
+                          // tracks sigil, not the wrapper), not by the Arrow param type.
                           match unify.unify(t1: ainner, t2: expected, tdefs) do
                             | UnifyOk(subst: s2) ->
                               let s_all = subst.subst_compose(s1: s_merged, s2)
@@ -1683,7 +1697,25 @@ let infer_let = fn (state: CheckState, name: string, sigil: Sigil, ann: Option<T
           | LetMutOk -> ()
         end
       end
-      let final_type = if let SigilMutable = sigil then wrap_ref(typ: inferred_type) else inferred_type end
+      // T-Let wrapSigil (nexus-u4f3): when the binding sigil is `%` (linear)
+      // or `@` (lazy), wrap the inferred type in the corresponding modality
+      // constructor if it is not already wrapped. `infer_constructor` deliberately
+      // omits this wrap (see its comment) to avoid breaking bare-ctor call sites;
+      // the let-binder is the canonical place to apply the sigil to the env type.
+      let final_type = match sigil do
+        | SigilMutable -> wrap_ref(typ: inferred_type)
+        | SigilLinear ->
+          match inferred_type do
+            | TyLinear(_) -> inferred_type
+            | _ -> TyLinear(inner: inferred_type)
+          end
+        | SigilLazy ->
+          match inferred_type do
+            | TyLazy(_) -> inferred_type
+            | _ -> TyLazy(inner: inferred_type)
+          end
+        | _ -> inferred_type
+      end
       let env2 = tctypes.env_insert(
         env: subst.subst_apply_env(subst: s1, env: tctypes.state_env(state: st1)),
         name, scheme: tctypes.mono(typ: final_type)
