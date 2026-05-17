@@ -13,6 +13,8 @@ import { LirProgram, LirFunction, LirExternal, LirParam } from "src/ir/lir/types
 import { StringEntry, LocalEntry, FuncEntry, ExportNameIdx }, * as wdefs from "src/backend/wasm/defs.nx"
 import { MemoryMode, MemoryNone, MemoryDefined, MemoryImported }, * as wcollect from "src/backend/wasm/collect.nx"
 import * as list from "std:list"
+import * as cast from "std:runtime/cast"
+import { fd_write } from "std:runtime/sysio"
 
 // ─── Type section ───────────────────────────────────────────────────────────
 
@@ -1297,4 +1299,105 @@ export let build_p3_component = fn (core_wasm: %ByteBuffer) -> %ByteBuffer do
   bb.free(buf: %final_sec)
 
   return %out
+end
+
+/** Write a ByteBuffer's contents to an fd and free the buffer. */
+let write_buf_to_fd = fn (fd: i64, buf: %ByteBuffer) -> unit do
+  let ptr = bb.raw_data_ptr(buf: &buf)
+  let len = bb.length(buf: &buf)
+  let _ = fd_write(a_fd: fd, b_content_ptr: cast.i32_of(x: ptr), c_content_len: cast.i32_of(x: len))
+  bb.free(buf: %buf)
+  return ()
+end
+
+/** Encode one component section (id + uleb128 length + content) and write it to fd. */
+let write_section_to_fd = fn (fd: i64, section_id: i64, content: %ByteBuffer) -> unit do
+  let %wrapped = cm_wrap_section(section_id, content)
+  write_buf_to_fd(fd, buf: %wrapped)
+  return ()
+end
+
+/** Write the full component-model wrapper for `core_wasm` to `fd` without
+ *  allocating a large intermediate buffer.  Frees `core_wasm`.
+ */
+export let write_p3_component_to_fd = fn (core_wasm: %ByteBuffer, fd: i64) -> unit do
+  let core_ptr = bb.raw_data_ptr(buf: &core_wasm)
+  let core_len = bb.length(buf: &core_wasm)
+  bb.free(buf: %core_wasm)
+  write_p3_component_raw_to_fd(core_ptr, core_len, fd)
+  return ()
+end
+
+/** Write the full component-model wrapper using a raw pointer to core wasm bytes.
+ *  Mirrors build_p3_component exactly but streams each section to fd instead
+ *  of accumulating into a large ByteBuffer.
+ */
+export let write_p3_component_raw_to_fd = fn (core_ptr: i64, core_len: i64, fd: i64) -> unit do
+  // Magic + version (8 bytes component header)
+  // magic: 0 97 115 109 = 0x00 0x61 0x73 0x6d = \0asm
+  // cm version bytes from wdefs: 13 0 1 0 = 0x0d 0x00 0x01 0x00
+  let %hdr = bb.empty()
+  let %hdr = bb.push_bytes(%hdr, bytes: [0, 97, 115, 109])
+  let %hdr = bb.push_bytes(%hdr, bytes: [wdefs.cm_version_byte0, wdefs.cm_version_byte1,
+                                          wdefs.cm_version_byte2, wdefs.cm_version_byte3])
+  write_buf_to_fd(fd, buf: %hdr)
+
+  // Component type section: [type 0] future<u64>
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_type,
+    content: build_cm_type_section_future_u64())
+
+  // Core module 0 (main): section id + uleb128 length prefix, then raw wasm bytes
+  let %mod_hdr = bb.empty()
+  let %mod_hdr = bb.push_uleb128(%mod_hdr, val: wdefs.cm_sec_core_module)
+  let %mod_hdr = bb.push_uleb128(%mod_hdr, val: core_len)
+  write_buf_to_fd(fd, buf: %mod_hdr)
+  let _ = fd_write(a_fd: fd, b_content_ptr: cast.i32_of(x: core_ptr), c_content_len: cast.i32_of(x: core_len))
+
+  // Core module 1 (stub): minimal module providing a memory export
+  let %stub_bytes = build_p3_stub_module()
+  let %stub_hdr = bb.empty()
+  let %stub_hdr = bb.push_uleb128(%stub_hdr, val: wdefs.cm_sec_core_module)
+  let %stub_hdr = bb.push_uleb128(%stub_hdr, val: bb.length(buf: &stub_bytes))
+  write_buf_to_fd(fd, buf: %stub_hdr)
+  write_buf_to_fd(fd, buf: %stub_bytes)
+
+  // Core instance 0: instantiate stub (module 1) with no args
+  let %stub_inst_body = bb.empty()
+  let %stub_inst_body = bb.push_uleb128(%stub_inst_body, val: 1)
+  let %stub_inst_body = bb.push_bytes(%stub_inst_body, bytes: [0, 1, 0])
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_core_instance, content: %stub_inst_body)
+
+  // Canon section: future.new (core func 0)
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_canon,
+    content: build_cm_canon_future_new())
+
+  // Alias section: stub_inst(0).memory -> core memory 0
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_alias,
+    content: build_cm_alias_section_one_memory(instance_idx: 0))
+
+  // Canon section: future.write async (memory 0) (core func 1)
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_canon,
+    content: build_cm_canon_future_write_async(mem_idx: 0))
+
+  // Alias section: stub_inst(0).memory -> core memory 1
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_alias,
+    content: build_cm_alias_section_one_memory(instance_idx: 0))
+
+  // Canon section: future.read + drop-writable + drop-readable + task.return + ws.new (core funcs 2-6)
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_canon,
+    content: build_cm_canon_read_drop_task_ws(mem_idx: 1))
+
+  // Alias section: stub_inst(0).memory -> core memory 2
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_alias,
+    content: build_cm_alias_section_one_memory(instance_idx: 0))
+
+  // Canon section: ws.wait + ws.drop (core funcs 7-8)
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_canon,
+    content: build_cm_canon_ws_wait_drop(mem_idx: 2))
+
+  // Final core instance section: FromExports + Instantiate main (module 0)
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_core_instance,
+    content: build_cm_core_instance_section_final(main_module_idx: 0))
+
+  return ()
 end

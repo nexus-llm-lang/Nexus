@@ -797,12 +797,14 @@ if [ "$TEST_MODE" = "1" ]; then
     case "$TEST_PATH" in
       *_test.nx) FILES="$TEST_PATH";;
       */negative/*.nx) FILES="$TEST_PATH";;
+      */p3_component/*.nx) FILES="$TEST_PATH";;
       *) FILES="";;
     esac
   else
     POS_FILES=$(find "$TEST_PATH" -type f -name '*_test.nx' 2>/dev/null)
     NEG_FILES=$(find "$TEST_PATH" -type f -path '*/negative/*.nx' 2>/dev/null)
-    FILES=$(printf '%s\n%s\n' "$POS_FILES" "$NEG_FILES" | grep -v '^$' | sort)
+    P3C_FILES=$(find "$TEST_PATH" -type f -path '*/p3_component/*.nx' 2>/dev/null)
+    FILES=$(printf '%s\n%s\n%s\n' "$POS_FILES" "$NEG_FILES" "$P3C_FILES" | grep -v '^$' | sort)
   fi
   N=$(printf '%s\n' "$FILES" | grep -c '^.' || true)
   if [ "$N" = "0" ]; then
@@ -880,8 +882,9 @@ if [ "$TEST_MODE" = "1" ]; then
     # the inverted-semantics path; the header parse below picks between
     # the compile-fail and runtime-throw flavors.
     case "$f" in
-      */negative/*) NEG=1;;
-      *)            NEG=0;;
+      */negative/*)    NEG=1; P3C=0;;
+      */p3_component/*) NEG=0; P3C=1;;
+      *)               NEG=0; P3C=0;;
     esac
 
     if [ "$NEG" = "1" ]; then
@@ -1048,6 +1051,45 @@ if [ "$TEST_MODE" = "1" ]; then
       printf "PASS\t%s\tnegative-runtime\t%s\t%s\n" "$ms" "$f" "runtime-throw" \
         > "$RESULTS_DIR/result_$idx.tsv"
       printf "PASS  %s  (%sms, expect-runtime-throw)\n" "$f" "$ms" >&2
+      if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
+      exit 0
+    fi
+
+    # ── p3_component fixture ───────────────────────────────────────────
+    if [ "$P3C" = "1" ]; then
+      t0=$(date +%s%N 2>/dev/null || date +%s000000000)
+      if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+          ${NEXUS_WASMTIME_ARGS:-} \
+          "$TMP" build "$f" -o "$wasm" --p3-component --explain-capabilities none \
+          >/dev/null 2>"$elog"; then
+        t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+        ms=$(( (t1 - t0) / 1000000 ))
+        tail_txt="$(tail -8 "$elog" 2>/dev/null)"
+        printf "FAIL\t%s\tp3c-compile\t%s\t%s\n" "$ms" "$f" "$tail_txt" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, p3c-compile)\n" "$f" "$ms" >&2
+        rm -f "$wasm"
+        exit 0
+      fi
+      t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+      if ! wasmtime run -W component-model=y,component-model-async=y,exceptions=y \
+          -S p3=y --dir=. ${NEXUS_WASMTIME_ARGS:-} \
+          "$wasm" \
+          >/dev/null 2>"$elog"; then
+        t2=$(date +%s%N 2>/dev/null || date +%s000000000)
+        ms=$(( (t2 - t1) / 1000000 ))
+        tail_txt="$(tail -16 "$elog" 2>/dev/null)"
+        printf "FAIL\t%s\tp3c-run\t%s\t%s\n" "$ms" "$f" "$tail_txt" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, p3c-run)\n" "$f" "$ms" >&2
+        if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
+        exit 0
+      fi
+      t2=$(date +%s%N 2>/dev/null || date +%s000000000)
+      ms=$(( (t2 - t1) / 1000000 ))
+      printf "PASS\t%s\tp3c\t%s\t-\n" "$ms" "$f" \
+        > "$RESULTS_DIR/result_$idx.tsv"
+      printf "PASS  %s  (%sms, p3c)\n" "$f" "$ms" >&2
       if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
       exit 0
     fi
