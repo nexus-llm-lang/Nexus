@@ -24,13 +24,13 @@ import {
   OpFEq, OpFNe, OpFLt, OpFLe, OpFGt, OpFGe,
   OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr,
   OpAnd, OpOr, OpConcat,
-  NamedType, RecordDef
+  NamedType, RecordDef, EnumDef, VariantDef, VariantField
 } from "src/common/ast.nx"
 import {
   SubstEntry, CheckState,
   InferExprResult, InferExprOk, InferExprErr,
   UnifyOk, UnifyErr,
-  TypeDefEntry
+  TypeDefEntry, EnumEntry
 }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
 import * as unify from "src/typecheck/unify.nx"
@@ -120,12 +120,54 @@ let cmp_visited_has = fn (visited: [string], name: string) -> bool do
   end
 end
 
-let comparable_named_type_list = fn (nts: [NamedType], tdefs: [TypeDefEntry], visited: [string]) -> bool do
+let comparable_named_type_list = fn (nts: [NamedType], tdefs: [TypeDefEntry], edefs: [EnumEntry], visited: [string]) -> bool do
   match nts do
     | [] -> return true
     | NamedType(name: _, typ: t) :: rest ->
-      if comparable_go(typ: t, tdefs, visited) then
-        return comparable_named_type_list(nts: rest, tdefs, visited)
+      if comparable_go(typ: t, tdefs, edefs, visited) then
+        return comparable_named_type_list(nts: rest, tdefs, edefs, visited)
+      end
+      return false
+  end
+end
+
+/** Look up an enum by name in the enum definitions list. */
+let enum_lookup = fn (edefs: [EnumEntry], name: string) -> Option<[VariantDef]> do
+  match edefs do
+    | [] -> return None
+    | EnumEntry(name: n, def: def) :: rest ->
+      if n == name then
+        match def do
+          | EnumDef(name: _, is_public: _, is_opaque: ob, type_params: _, variants: vs) ->
+            // Opaque enums are not structurally comparable — their body is hidden
+            // across module boundaries, matching unfold(x⟨σ̄⟩) = opaque ⇒ false.
+            if ob then return None end
+            return Some(val: vs)
+        end
+      end
+      return enum_lookup(edefs: rest, name)
+  end
+end
+
+/** Check that all fields of a variant are comparable. */
+let comparable_variant_fields = fn (fields: [VariantField], tdefs: [TypeDefEntry], edefs: [EnumEntry], visited: [string]) -> bool do
+  match fields do
+    | [] -> return true
+    | VariantField(name: _, typ: t) :: rest ->
+      if comparable_go(typ: t, tdefs, edefs, visited) then
+        return comparable_variant_fields(fields: rest, tdefs, edefs, visited)
+      end
+      return false
+  end
+end
+
+/** Check that all variants of a sum type are comparable. */
+let comparable_variants = fn (vs: [VariantDef], tdefs: [TypeDefEntry], edefs: [EnumEntry], visited: [string]) -> bool do
+  match vs do
+    | [] -> return true
+    | VariantDef(name: _, fields: fs) :: rest ->
+      if comparable_variant_fields(fields: fs, tdefs, edefs, visited) then
+        return comparable_variants(vs: rest, tdefs, edefs, visited)
       end
       return false
   end
@@ -134,32 +176,39 @@ end
 // `comparable_go` is the spec's `comparable'(τ, V)` — the visited-set-threaded
 // inner predicate. `comparable` (no `_go` suffix) is the public entry-point
 // that starts with `V = []` and matches the original 2-arg call-site shape.
-let comparable_go = fn (typ: TypeExpr, tdefs: [TypeDefEntry], visited: [string]) -> bool do
+let comparable_go = fn (typ: TypeExpr, tdefs: [TypeDefEntry], edefs: [EnumEntry], visited: [string]) -> bool do
   match typ do
     | TyI32 | TyI64 | TyF32 | TyF64
     | TyBool | TyChar | TyString | TyUnit
     | TyIntLit | TyFloatLit -> return true
     | TyVar(_) -> return false
-    | TyRecord(fields: fs) -> return comparable_named_type_list(nts: fs, tdefs, visited)
-    | TyList(elem: e) -> return comparable_go(typ: e, tdefs, visited)
+    | TyRecord(fields: fs) -> return comparable_named_type_list(nts: fs, tdefs, edefs, visited)
+    | TyList(elem: e) -> return comparable_go(typ: e, tdefs, edefs, visited)
     | TyUserDefined(name: n, args: _) ->
       // Cycle case (spec line 935): if `n` is already on the unfold path,
       // bottom out at false to bound the least-fixpoint approximation.
       if cmp_visited_has(visited, name: n) then return false end
-      // Expand record typedef when known. Unknown names (enums, opaque imports)
-      // return false: the spec's unfold arm for an opaque body yields false, and
-      // sum-body unfolding is the follow-up tracked.
+      // Expand record typedef when known.
       match tctypes.typedef_lookup(defs: tdefs, name: n) do
         | Some(val: RecordDef(fields: fs, _)) ->
-          return comparable_named_type_list(nts: fs, tdefs, visited: n :: visited)
-        | None -> return false
+          return comparable_named_type_list(nts: fs, tdefs, edefs, visited: n :: visited)
+        | None ->
+          // T-Cmp sum unfold: if the name resolves to an enum, check that every
+          // variant (and every field of every variant) is comparable.  Non-opaque
+          // sum types whose payloads are all comparable are themselves comparable —
+          // the runtime ==  operator recurses through the tag + payload uniformly.
+          match enum_lookup(edefs, name: n) do
+            | Some(val: vs) ->
+              return comparable_variants(vs, tdefs, edefs, visited: n :: visited)
+            | None -> return false
+          end
       end
     | _ -> return false
   end
 end
 
-let comparable = fn (typ: TypeExpr, tdefs: [TypeDefEntry]) -> bool do
-  return comparable_go(typ, tdefs, visited: [])
+let comparable = fn (typ: TypeExpr, tdefs: [TypeDefEntry], edefs: [EnumEntry]) -> bool do
+  return comparable_go(typ, tdefs, edefs, visited: [])
 end
 
 let comparable_reject_msg = fn (typ: TypeExpr) -> string do
@@ -200,12 +249,13 @@ end
 
 let unify_cmp_binop = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
   let tdefs = tctypes.state_typedefs(state)
+  let edefs = tctypes.state_enums(state)
   match unify.unify(t1: lt, t2: rt, tdefs) do
     | UnifyErr(message: m) -> return InferExprErr(message: "comparison: " ++ m, span)
     | UnifyOk(subst: s1) ->
       let sm = subst.subst_compose(s1: subst, s2: s1)
       let resolved = subst.subst_apply(subst: sm, typ: lt)
-      if comparable(typ: resolved, tdefs) then
+      if comparable(typ: resolved, tdefs, edefs) then
         return InferExprOk(state, subst: sm, typ: TyBool)
       end
       return InferExprErr(message: comparable_reject_msg(typ: resolved), span)
@@ -214,6 +264,7 @@ end
 
 let unify_float_cmp = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, rt: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
   let tdefs = tctypes.state_typedefs(state)
+  let edefs = tctypes.state_enums(state)
   let target = select_float_type(a: lt, b: rt)
   match unify.unify(t1: lt, t2: target, tdefs) do
     | UnifyErr(message: m) -> return InferExprErr(message: "float cmp lhs: " ++ m, span)
@@ -224,7 +275,7 @@ let unify_float_cmp = fn (state: CheckState, subst: [SubstEntry], lt: TypeExpr, 
         | UnifyOk(subst: s2) ->
           let sm2 = subst.subst_compose(s1: sm, s2)
           let resolved = subst.subst_apply(subst: sm2, typ: target)
-          if comparable(typ: resolved, tdefs) then
+          if comparable(typ: resolved, tdefs, edefs) then
             return InferExprOk(state, subst: sm2, typ: TyBool)
           end
           return InferExprErr(message: comparable_reject_msg(typ: resolved), span)
