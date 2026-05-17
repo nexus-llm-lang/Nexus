@@ -412,14 +412,26 @@ if [ "$TEST_MODE" = "1" ]; then
     echo "nexus test: path not found: $TEST_PATH" >&2
     exit 1
   fi
+  # Discovery: positive fixtures are `*_test.nx` anywhere under TEST_PATH;
+  # negative fixtures are any `*.nx` file living under a `negative/`
+  # directory (the per-fixture worker classifies each negative by the
+  # `// expect-fail:` / `// expect-runtime-throw:` header it carries).
+  # Single-file mode: accept either a `*_test.nx` file or any `*.nx`
+  # under `negative/`; classification is by header content.
   if [ -f "$TEST_PATH" ]; then
-    case "$TEST_PATH" in *_test.nx) FILES="$TEST_PATH";; *) FILES="";; esac
+    case "$TEST_PATH" in
+      *_test.nx) FILES="$TEST_PATH";;
+      */negative/*.nx) FILES="$TEST_PATH";;
+      *) FILES="";;
+    esac
   else
-    FILES=$(find "$TEST_PATH" -type f -name '*_test.nx' 2>/dev/null | sort)
+    POS_FILES=$(find "$TEST_PATH" -type f -name '*_test.nx' 2>/dev/null)
+    NEG_FILES=$(find "$TEST_PATH" -type f -path '*/negative/*.nx' 2>/dev/null)
+    FILES=$(printf '%s\n%s\n' "$POS_FILES" "$NEG_FILES" | grep -v '^$' | sort)
   fi
   N=$(printf '%s\n' "$FILES" | grep -c '^.' || true)
   if [ "$N" = "0" ]; then
-    echo "nexus test: no *_test.nx files found under $TEST_PATH" >&2
+    echo "nexus test: no *_test.nx files (or tests/negative/*.nx fixtures) found under $TEST_PATH" >&2
     exit 1
   fi
 
@@ -462,10 +474,210 @@ if [ "$TEST_MODE" = "1" ]; then
   # The inline runner uses positional args from `xargs -L 1`: $1=idx, $2=file.
   # The streamed PASS/FAIL line goes to fd 2 (stderr); fd 1 is reserved for
   # silent / further pipeline use.
+  #
+  # Three fixture flavors are supported (each worker classifies its own
+  # fixture from path + header — no out-of-band metadata):
+  #
+  #   positive (default; `*_test.nx`): compile must succeed, then run
+  #     must exit 0. Any failure → FAIL.
+  #
+  #   negative compile-fail (`// expect-fail: E####`): compile must fail
+  #     and the captured diagnostic must include `[E####]` plus every
+  #     `// expect-msg: <substring>`.
+  #
+  #   negative runtime-throw (`// expect-runtime-throw: <substring>`):
+  #     compile must succeed; the wasm must then exit non-zero with
+  #     combined stdout+stderr containing every `expect-runtime-throw`
+  #     and `expect-msg` substring. Wasmtime's "thrown Wasm exception"
+  #     line does not carry the constructor name, so fixtures normally
+  #     anchor substring assertions on text the fixture itself prints
+  #     before raising.
+  #
+  # Negatives are identified by their parent directory name (`negative/`).
+  # A `negative/` fixture without a header directive surfaces as
+  # `negative-config` FAIL rather than silently passing.
   cat "$PLAN_FILE" | xargs -P "$JOBS" -L 1 -- /bin/sh -c '
     idx="$1"; f="$2"
     wasm="$RESULTS_DIR/test_$idx.wasm"
     elog="$RESULTS_DIR/err_$idx.log"
+
+    # Classify by file path. Anything under a `negative/` directory uses
+    # the inverted-semantics path; the header parse below picks between
+    # the compile-fail and runtime-throw flavors.
+    case "$f" in
+      */negative/*) NEG=1;;
+      *)            NEG=0;;
+    esac
+
+    if [ "$NEG" = "1" ]; then
+      # Parse the contiguous comment header at the top of the fixture.
+      # Three tab-separated record kinds are emitted: `fail<TAB>E####`,
+      # `rt<TAB><payload>`, `msg<TAB><substring>`. The walker stops at
+      # the first non-comment, non-blank line so fixture bodies cannot
+      # accidentally satisfy the parse.
+      HEADER_TSV=$(awk "
+        /^[[:space:]]*\\/\\/[[:space:]]*expect-fail:/ {
+          sub(/^[[:space:]]*\\/\\/[[:space:]]*expect-fail:[[:space:]]*/, \"\")
+          print \"fail\\t\" \$0
+          next
+        }
+        /^[[:space:]]*\\/\\/[[:space:]]*expect-runtime-throw:/ {
+          sub(/^[[:space:]]*\\/\\/[[:space:]]*expect-runtime-throw:[[:space:]]*/, \"\")
+          print \"rt\\t\" \$0
+          next
+        }
+        /^[[:space:]]*\\/\\/[[:space:]]*expect-msg:/ {
+          sub(/^[[:space:]]*\\/\\/[[:space:]]*expect-msg:[[:space:]]*/, \"\")
+          print \"msg\\t\" \$0
+          next
+        }
+        /^[[:space:]]*\$/ { next }
+        /^[[:space:]]*\\/\\// { next }
+        { exit }
+      " "$f")
+      NEG_CODE=$(printf "%s\n" "$HEADER_TSV" | awk -F"\t" "/^fail\t/ { print \$2; exit }")
+      NEG_RT_PRESENT=$(printf "%s\n" "$HEADER_TSV" | awk -F"\t" "/^rt\t/ { print 1; exit }")
+      NEG_MSGS=$(printf "%s\n" "$HEADER_TSV" | awk -F"\t" "/^msg\t/ { print \$2 }
+                                                            /^rt\t/  { if (\$2 != \"\") print \$2 }")
+
+      t0=$(date +%s%N 2>/dev/null || date +%s000000000)
+
+      # Header-shape validation. Surface either-or violations as a
+      # configuration FAIL rather than degrading to a silent pass.
+      if [ -z "$NEG_CODE" ] && [ -z "$NEG_RT_PRESENT" ]; then
+        t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+        ms=$(( (t1 - t0) / 1000000 ))
+        msg="negative fixture missing // expect-fail: or // expect-runtime-throw: header"
+        printf "FAIL\t%s\tnegative\t%s\t%s\n" "$ms" "$f" "$msg" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, negative-config)\n" "$f" "$ms" >&2
+        exit 0
+      fi
+      if [ -n "$NEG_CODE" ] && [ -n "$NEG_RT_PRESENT" ]; then
+        t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+        ms=$(( (t1 - t0) / 1000000 ))
+        msg="negative fixture mixes // expect-fail: and // expect-runtime-throw: headers"
+        printf "FAIL\t%s\tnegative\t%s\t%s\n" "$ms" "$f" "$msg" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, negative-config)\n" "$f" "$ms" >&2
+        exit 0
+      fi
+
+      # ── flavor A: compile-fail diagnostic ───────────────────────────
+      if [ -n "$NEG_CODE" ]; then
+        if wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+            ${NEXUS_WASMTIME_ARGS:-} \
+            "$TMP" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
+            >/dev/null 2>"$elog"; then
+          t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+          ms=$(( (t1 - t0) / 1000000 ))
+          msg="compiled successfully — expected diagnostic $NEG_CODE"
+          printf "FAIL\t%s\tnegative-compile\t%s\t%s\n" "$ms" "$f" "$msg" \
+            > "$RESULTS_DIR/result_$idx.tsv"
+          printf "FAIL  %s  (%sms, negative-compile)\n" "$f" "$ms" >&2
+          rm -f "$wasm"
+          exit 0
+        fi
+        t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+        ms=$(( (t1 - t0) / 1000000 ))
+        # Verify diagnostic code: a `[E####]` substring must appear in
+        # the captured stderr.
+        if ! grep -q -- "\\[$NEG_CODE\\]" "$elog"; then
+          tail_txt="$(tail -8 "$elog" 2>/dev/null)"
+          msg="expected $NEG_CODE not found in diagnostic; got: $tail_txt"
+          printf "FAIL\t%s\tnegative-compile\t%s\t%s\n" "$ms" "$f" "$msg" \
+            > "$RESULTS_DIR/result_$idx.tsv"
+          printf "FAIL  %s  (%sms, negative-compile)\n" "$f" "$ms" >&2
+          rm -f "$wasm"
+          exit 0
+        fi
+        # Substring assertions: every expect-msg substring must appear.
+        miss=""
+        IFS_BAK=$IFS
+        IFS="
+"
+        for sub in $NEG_MSGS; do
+          [ -z "$sub" ] && continue
+          if ! grep -q -F -- "$sub" "$elog"; then
+            miss="$miss|$sub"
+          fi
+        done
+        IFS=$IFS_BAK
+        if [ -n "$miss" ]; then
+          msg="missing substring(s): ${miss#|}"
+          printf "FAIL\t%s\tnegative-compile\t%s\t%s\n" "$ms" "$f" "$msg" \
+            > "$RESULTS_DIR/result_$idx.tsv"
+          printf "FAIL  %s  (%sms, negative-compile)\n" "$f" "$ms" >&2
+          rm -f "$wasm"
+          exit 0
+        fi
+        printf "PASS\t%s\tnegative-compile\t%s\t%s\n" "$ms" "$f" "$NEG_CODE" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "PASS  %s  (%sms, expect-fail %s)\n" "$f" "$ms" "$NEG_CODE" >&2
+        rm -f "$wasm"
+        exit 0
+      fi
+
+      # ── flavor B: runtime-throw ─────────────────────────────────────
+      # Compile must succeed (the negative is exclusively at run time).
+      if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+          ${NEXUS_WASMTIME_ARGS:-} \
+          "$TMP" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
+          >/dev/null 2>"$elog"; then
+        t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+        ms=$(( (t1 - t0) / 1000000 ))
+        tail_txt="$(tail -8 "$elog" 2>/dev/null)"
+        msg="compile failed — runtime-throw fixture must build cleanly: $tail_txt"
+        printf "FAIL\t%s\tnegative-runtime\t%s\t%s\n" "$ms" "$f" "$msg" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, negative-runtime, compile)\n" "$f" "$ms" >&2
+        rm -f "$wasm"
+        exit 0
+      fi
+      t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+      if wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+          ${NEXUS_WASMTIME_ARGS:-} \
+          "$wasm" \
+          >"$elog" 2>&1; then
+        t2=$(date +%s%N 2>/dev/null || date +%s000000000)
+        ms=$(( (t2 - t1) / 1000000 ))
+        msg="run exited 0 — expected a runtime exception"
+        printf "FAIL\t%s\tnegative-runtime\t%s\t%s\n" "$ms" "$f" "$msg" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, negative-runtime, run-ok)\n" "$f" "$ms" >&2
+        if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
+        exit 0
+      fi
+      t2=$(date +%s%N 2>/dev/null || date +%s000000000)
+      ms=$(( (t2 - t1) / 1000000 ))
+      # Substring assertions over combined stdout+stderr.
+      miss=""
+      IFS_BAK=$IFS
+      IFS="
+"
+      for sub in $NEG_MSGS; do
+        [ -z "$sub" ] && continue
+        if ! grep -q -F -- "$sub" "$elog"; then
+          miss="$miss|$sub"
+        fi
+      done
+      IFS=$IFS_BAK
+      if [ -n "$miss" ]; then
+        msg="missing substring(s) in run output: ${miss#|}"
+        printf "FAIL\t%s\tnegative-runtime\t%s\t%s\n" "$ms" "$f" "$msg" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, negative-runtime, missing-substring)\n" "$f" "$ms" >&2
+        if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
+        exit 0
+      fi
+      printf "PASS\t%s\tnegative-runtime\t%s\t%s\n" "$ms" "$f" "runtime-throw" \
+        > "$RESULTS_DIR/result_$idx.tsv"
+      printf "PASS  %s  (%sms, expect-runtime-throw)\n" "$f" "$ms" >&2
+      if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
+      exit 0
+    fi
+
+    # ── positive fixture (existing path) ──────────────────────────────
     t0=$(date +%s%N 2>/dev/null || date +%s000000000)
     if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
         ${NEXUS_WASMTIME_ARGS:-} \

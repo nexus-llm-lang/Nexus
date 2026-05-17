@@ -6,9 +6,10 @@ with `nexus run <path>`.
 
 This corpus is **positive-only** — every file here compiles and runs.
 Intentionally-broken snippets used as compiler regression tests live
-under [`../tests/negative/`](../tests/negative/) with their own runner
-([`../tests/negative/run.sh`](../tests/negative/run.sh)); they are not
-example material and are not indexed here.
+under [`../tests/negative/`](../tests/negative/); `nexus test`
+discovers them alongside the positive `*_test.nx` corpus and asserts
+the `expect-fail:` / `expect-runtime-throw:` header directive of each.
+They are not example material and are not indexed here.
 
 ## Root corpus — end-to-end samples
 

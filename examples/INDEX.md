@@ -83,10 +83,11 @@ Total: **45 examples**.
 
 Intentionally-broken snippets are not example material — they are
 compiler regression tests and live under
-[`tests/negative/`](../tests/negative/) with their own runner
-([`tests/negative/run.sh`](../tests/negative/run.sh)). See the
-file-local header comments there for the `expect-fail:` /
-`expect-runtime-throw:` directive shapes.
+[`tests/negative/`](../tests/negative/). They are discovered and run
+by `nexus test` alongside the positive `*_test.nx` corpus (the runner
+walks `tests/negative/*.nx` and classifies each fixture by the
+`expect-fail:` / `expect-runtime-throw:` directive in its header
+comment).
 
 ## Schema
 
