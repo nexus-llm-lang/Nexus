@@ -61,7 +61,7 @@ import {
   reverse_named_types, lookup_named_type,
   find_linear_field, type_carries_linear
 }, * as collections from "src/typecheck/infer/collections.nx"
-import { TypeError, ThrowsRowInvariantBroken } from "src/common/error.nx"
+import { TypeError, ThrowsRowInvariantBroken, DuplicateInjectPort, HandlerRequireNotSubset } from "src/common/error.nx"
 import { StrMap }, * as smap from "src/common/strmap.nx"
 import * as str from "std:str"
 import * as list from "std:list"
@@ -108,16 +108,15 @@ export let infer_expr = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr
       return infer_thunk(state, body: b, span: sp)
     | ExternalRef(symbol: _, type_params: _, arg_names: _, typ) ->
       return InferExprOk(state, subst: subst.subst_empty(), typ)
-    | Handler(port_name: pname, arms: hms) ->
-      // Inline handler expressions type as TyHandler(port, empty-row). The
-      // requires row stays empty here, matching register_handler_bindings
-      // (src/typecheck/check.nx) which registers top-level handler bindings
-      // with the same shape — proper row population requires effect-row
-      // inference , which is not yet wired through.
-      // MIR keeps lowering Handler expressions to unit at runtime; only the
-      // type-level identity changes here, so handler values can flow through
-      // generics, records, and lambda captures without breaking the existing
-      // inject-position handler-binding metadata path.
+    | Handler(port_name: pname, requires: handler_req, arms: hms) ->
+      // Inline handler expressions type as TyHandler(port, requires).
+      // The requires row is now preserved from the source-level `require { ... }`
+      // declaration so that inject-site require-subset checking (T-Inject:
+      // ∀i. ρ_i ⊆ ρ_q) can verify it against the ambient row at the inject
+      // site.  Top-level handler bindings go through register_handler_bindings
+      // which still registers an empty requires row; those handlers are
+      // looked up by name at inject time and their TyHandler.requires is used
+      // for the subset check.
       //
       // spec T-Handler (type-system-formal.md line ~1122)
       // requires `∀y ∈ ⋃_j fv(e_j) ∩ dom(Γ). Γ(y) ≠ ~σ` — the same
@@ -130,7 +129,7 @@ export let infer_expr = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr
         | Some(val: capture.RefCaptureHit(name: rn, span: rsp)) ->
           return InferExprErr(message: "handler arm captures mutable ref binding " ++ rn ++ " (refs are stack-confined)", span: rsp)
         | None ->
-          return InferExprOk(state, subst: subst.subst_empty(), typ: TyHandler(name: pname, requires: TyRow(types: [], rest: None)))
+          return InferExprOk(state, subst: subst.subst_empty(), typ: TyHandler(name: pname, requires: handler_req))
       end
   end
 end
@@ -1212,6 +1211,121 @@ let check_handlers_bound = fn (state: CheckState, handlers: [string], span: Span
   end
 end
 
+let str_list_contains = fn (xs: [string], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == s then return true end
+      return str_list_contains(xs: rest, s)
+  end
+end
+
+// ─── T-Inject: injection uniqueness (∀i≠j. P_i ≠ P_j) ──────────────────────
+
+/** Look up a handler name in the env and return its TyHandler port name.
+ *  Returns None if the binding does not resolve to a TyHandler (non-handler
+ *  bindings are already rejected by check_handlers_bound before this runs).
+ */
+let handler_port_name = fn (state: CheckState, h: string) -> Option<string> do
+  match tctypes.env_lookup(env: tctypes.state_env(state), name: h) do
+    | None -> return None
+    | Some(val: Scheme(vars: _, typ: ht)) ->
+      match ht do
+        | TyHandler(name: pname, requires: _) -> return Some(val: pname)
+        | _ -> return None
+      end
+  end
+end
+
+/** Check that no two handlers in the inject list target the same port.
+ *  Enforces T-Inject premise ∀i≠j. P_i ≠ P_j.
+ *  `seen` accumulates port names already encountered.
+ */
+let check_inject_uniqueness = fn (state: CheckState, handlers: [string], seen: [string], span: Span) -> unit throws { TypeError } do
+  match handlers do
+    | [] -> return ()
+    | h :: rest ->
+      match handler_port_name(state: state, h) do
+        | None ->
+          // Not a TyHandler — check_handlers_bound already caught this or it
+          // is a non-handler type that will be rejected elsewhere; skip.
+          return check_inject_uniqueness(state, handlers: rest, seen, span)
+        | Some(val: pname) ->
+          if str_list_contains(xs: seen, s: pname) then
+            raise DuplicateInjectPort(port_name: pname, span)
+          end
+          return check_inject_uniqueness(state, handlers: rest, seen: pname :: seen, span)
+      end
+  end
+end
+
+// ─── T-Inject: handler require ⊆ ambient (∀i. ρ_i ⊆ ρ_q) ───────────────────
+
+/** Check whether a capability name appears in a require row.
+ *  Row entries in a cap/require row are TyUserDefined(name: cap_name, args: []).
+ */
+let row_contains_cap = fn (cap_name: string, row: TypeExpr) -> bool do
+  match row do
+    | TyRow(types: ts, rest: _) -> return cap_entry_list_contains(cap_name: cap_name, ts)
+    | _ -> return false
+  end
+end
+
+let cap_entry_list_contains = fn (cap_name: string, ts: [TypeExpr]) -> bool do
+  match ts do
+    | [] -> return false
+    | TyUserDefined(name: n, args: _) :: rest ->
+      if n == cap_name then return true end
+      return cap_entry_list_contains(cap_name: cap_name, ts: rest)
+    | _ :: rest -> return cap_entry_list_contains(cap_name: cap_name, ts: rest)
+  end
+end
+
+/** Check that every capability in `handler_row` is also present in `ambient_row`.
+ *  Returns None on success; Some(missing_cap_name) on first violation.
+ */
+let first_missing_cap = fn (handler_row: TypeExpr, ambient_row: TypeExpr) -> Option<string> do
+  match handler_row do
+    | TyRow(types: ts, rest: _) -> return first_missing_cap_in_list(ts: ts, ambient_row)
+    | _ -> return None
+  end
+end
+
+let first_missing_cap_in_list = fn (ts: [TypeExpr], ambient_row: TypeExpr) -> Option<string> do
+  match ts do
+    | [] -> return None
+    | TyUserDefined(name: cname, args: _) :: rest ->
+      if row_contains_cap(cap_name: cname, row: ambient_row) then
+        return first_missing_cap_in_list(ts: rest, ambient_row)
+      end
+      return Some(val: cname)
+    | _ :: rest -> return first_missing_cap_in_list(ts: rest, ambient_row)
+  end
+end
+
+/** Check that each handler's require row is a subset of the ambient require row.
+ *  Enforces T-Inject premise ∀i. ρ_i ⊆ ρ_q.
+ */
+let check_inject_require_subset = fn (state: CheckState, handlers: [string], ambient: TypeExpr, span: Span) -> unit throws { TypeError } do
+  match handlers do
+    | [] -> return ()
+    | h :: rest ->
+      match tctypes.env_lookup(env: tctypes.state_env(state), name: h) do
+        | None -> return check_inject_require_subset(state, handlers: rest, ambient, span)
+        | Some(val: Scheme(vars: _, typ: ht)) ->
+          match ht do
+            | TyHandler(name: _, requires: handler_req) ->
+              match first_missing_cap(handler_row: handler_req, ambient_row: ambient) do
+                | None -> return check_inject_require_subset(state, handlers: rest, ambient, span)
+                | Some(val: missing) ->
+                  raise HandlerRequireNotSubset(handler_name: h, missing_cap: missing, span)
+              end
+            | _ -> return check_inject_require_subset(state, handlers: rest, ambient, span)
+          end
+      end
+  end
+end
+
 let infer_stmt = fn (state: CheckState, stmt: HirStmtKind, ret_type: TypeExpr, span: Span) -> InferExprResult throws { TypeError } do
   match stmt do
     | Let(name, sigil, typ: ann, value) ->
@@ -1296,13 +1410,18 @@ let infer_stmt = fn (state: CheckState, stmt: HirStmtKind, ret_type: TypeExpr, s
     | Try(body, catch_param: cp, catch_body: cb) ->
       return infer_try(state, body, catch_param: cp, catch_body: cb, ret_type, span)
     | Inject(handlers, body) ->
-      // Each handler name must resolve to a bound identifier. Port/require-row
-      // matching happens downstream — the typechecker's env does not carry
-      // handler-binding metadata, so full validation requires the MirCtx pass
-      // Here we verify the names at least exist in env.
+      // Step 1: verify all handler names are bound and not thunks.
       match check_handlers_bound(state, handlers, span) do
         | InferExprErr(message: m, span: esp) -> return InferExprErr(message: m, span: esp)
         | InferExprOk(_) ->
+          // Step 2: T-Inject ∀i≠j. P_i ≠ P_j — injection uniqueness.
+          // Each port may appear at most once in an inject site.
+          check_inject_uniqueness(state, handlers, seen: [], span)
+          // Step 3: T-Inject ∀i. ρ_i ⊆ ρ_q — handler require ⊆ ambient.
+          // Each handler's declared require row must be a subset of the
+          // enclosing function's ambient require row.
+          let ambient_req = tctypes.state_require_row(state)
+          check_inject_require_subset(state, handlers, ambient: ambient_req, span)
           // T-Inject: close the block scope — bindings introduced
           // inside the inject body must not leak past `end`. Mirrors the env
           // pop in infer_match_cases/infer_try.
