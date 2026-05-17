@@ -37,7 +37,8 @@ import {
   HirCallArg, HirNamedExpr, HirMatchCase, HirParam,
   HirPatternKind, PLit, PVar, PCtor, PRec, PWild, POr,
   HirPatternField, HirRecordPatField,
-  ExceptionGroupEntry
+  ExceptionGroupEntry,
+  HirHandlerArm, HirFunction, EagerBody, LazyBody
 } from "src/ir/hir/types.nx"
 import {
   SubstEntry, Scheme, EnvEntry, CheckState, FreshResult,
@@ -107,7 +108,7 @@ export let infer_expr = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr
       return infer_thunk(state, body: b, span: sp)
     | ExternalRef(symbol: _, type_params: _, arg_names: _, typ) ->
       return InferExprOk(state, subst: subst.subst_empty(), typ)
-    | Handler(port_name: pname, arms: _) ->
+    | Handler(port_name: pname, arms: hms) ->
       // Inline handler expressions type as TyHandler(port, empty-row). The
       // requires row stays empty here, matching register_handler_bindings
       // (src/typecheck/check.nx) which registers top-level handler bindings
@@ -117,7 +118,20 @@ export let infer_expr = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr
       // type-level identity changes here, so handler values can flow through
       // generics, records, and lambda captures without breaking the existing
       // inject-position handler-binding metadata path.
-      return InferExprOk(state, subst: subst.subst_empty(), typ: TyHandler(name: pname, requires: TyRow(types: [], rest: None)))
+      //
+      // nexus-t9cl.27: spec T-Handler (type-system-formal.md line ~1122)
+      // requires `∀y ∈ ⋃_j fv(e_j) ∩ dom(Γ). Γ(y) ≠ ~σ` — the same
+      // no-ref-capture premise T-Lambda enforces. Handler arms are hoisted
+      // out to top-level HirFunctions later (synthesize_handler) and re-
+      // checked via check_handler_arm_bodies, but by then the construction-
+      // site env is lost. Run the scan here where we still see it, mirroring
+      // infer_lambda's RefCaptureHit handling.
+      match scan_handler_arms_for_ref_capture(arms: hms, outer_env: tctypes.state_env(state)) do
+        | Some(val: capture.RefCaptureHit(name: rn, span: rsp)) ->
+          return InferExprErr(message: "handler arm captures mutable ref binding " ++ rn ++ " (refs are stack-confined)", span: rsp)
+        | None ->
+          return InferExprOk(state, subst: subst.subst_empty(), typ: TyHandler(name: pname, requires: TyRow(types: [], rest: None)))
+      end
   end
 end
 
@@ -971,6 +985,29 @@ let add_params_to_env = fn (env: [EnvEntry], params: [HirParam]) -> [EnvEntry] t
     | [] -> return env
     | HirParam(label: _, name: n, sigil: _, typ: t) :: rest ->
       return add_params_to_env(env: tctypes.env_insert(env, name: n, scheme: tctypes.mono(typ: t)), params: rest)
+  end
+end
+
+// ─── Handler-arm capture scan (T-Handler no-ref-capture, nexus-t9cl.27) ────
+//
+// Spec T-Handler (type-system-formal.md) carries the same `∀y ∈ fv(e_j).
+// Γ(y) ≠ ~σ` premise as T-Lambda. Inline `handler P do fn op(...) ...
+// end end` expressions reach infer_expr with the construction-site env
+// intact; later passes (synthesize_handler, check_handler_arm_bodies)
+// hoist the arm to a top-level HirFunction and lose that env. Scan here
+// where it is still available and reject the first ref-capture hit across
+// all arms — mirroring infer_lambda's RefCaptureHit handling.
+
+let scan_handler_arms_for_ref_capture = fn (arms: [HirHandlerArm], outer_env: [EnvEntry]) -> Option<capture.RefCaptureHit> do
+  match arms do
+    | [] -> return None
+    | HirHandlerArm(arm: HirFunction(name: _, type_params: _, params: ps, ret_type: _, throw_row: _, body: bd, _), cont_binder: _) :: rest ->
+      let body_stmts = match bd do | EagerBody(stmts: ss) -> ss | LazyBody(_) -> [] end
+      let scan = capture.scan_lambda_captures(body: body_stmts, outer_env, params: ps)
+      match scan do
+        | capture.CaptureScan(linear: _, ref_hit: Some(val: hit)) -> return Some(val: hit)
+        | capture.CaptureScan(linear: _, ref_hit: None) -> return scan_handler_arms_for_ref_capture(arms: rest, outer_env)
+      end
   end
 end
 
