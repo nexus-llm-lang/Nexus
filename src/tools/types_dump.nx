@@ -169,9 +169,11 @@ let find_requires_for_name = fn (defs: [SpannedTopLevel], name: string) -> TypeE
   end
 end
 
-/** Strip module-prefix qualification from a HIR function name when the source
- * AST uses bare names. HIR rewrites `foo` → `<file>/foo` during process_top_level,
- * so we try the bare suffix when the qualified lookup misses. */
+/** Strip module-prefix qualification from a HIR canonical function name.
+ *  HIR canonical names have the form `<sanitized_path>#<bare>` (see
+ *  src/ir/rdrname.nx::canonical_name). Returns the substring after the
+ *  rightmost `#`, or the input unchanged when no `#` is present (e.g.
+ *  synthesised functions whose origin is the link unit itself). */
 let bare_name = fn (qualified: string) -> string do
   let n = str.length(s: qualified)
   return bare_name_go(s: qualified, i: n - 1, n)
@@ -180,13 +182,78 @@ end
 let bare_name_go = fn (s: string, i: i64, n: i64) -> string do
   if i < 0 then return s end
   let b = str.byte_at(s, idx: i)
-  // '/' = 47
-  if b == 47 then return str.substring(s, start: i + 1, len: n - i - 1) end
+  // '#' = 35
+  if b == 35 then return str.substring(s, start: i + 1, len: n - i - 1) end
   return bare_name_go(s, i: i - 1, n)
 end
 
-let hir_fn_to_binding = fn (prog: Program, f: HirFunction) -> TypeBinding do
-  match f do | HirFunction(name, type_params: _, params, ret_type, throw_row, body: _, span: _, file: _, requires: _) ->
+/** Reverse the path-sanitization done by `src/ir/rdrname.nx::sanitize_path`
+ *  for the well-known stdlib root so identifiers in `--transitive` output
+ *  match the form users write in import statements
+ *  (`nxlib/stdlib/str.nx` → `std:str`).
+ *
+ *  Returns the rendered module prefix, or the empty string when `file` is
+ *  not a recognised stdlib path. Non-stdlib imports fall back to the
+ *  canonical `<sanitized_path>#<name>` form (no prefix collision risk).
+ */
+let module_prefix_for_file = fn (file: string) -> string do
+  // `file` here is the un-sanitized HIR source path stored at HirFunction.file.
+  let prefix = "nxlib/stdlib/"
+  let plen = str.length(s: prefix)
+  let flen = str.length(s: file)
+  if flen <= plen then return "" end
+  if str.substring(s: file, start: 0, len: plen) != prefix then return "" end
+  let rest = str.substring(s: file, start: plen, len: flen - plen)
+  // Strip trailing ".nx" if present.
+  let rlen = str.length(s: rest)
+  let suf = ".nx"
+  let suflen = str.length(s: suf)
+  let stem = if rlen >= suflen && str.substring(s: rest, start: rlen - suflen, len: suflen) == suf
+    then str.substring(s: rest, start: 0, len: rlen - suflen)
+    else rest
+  end
+  return "std:" ++ stem
+end
+
+// ─── Scope ────────────────────────────────────────────────────────────────
+//
+// A `TypesScope` controls which HIR functions appear in the dump and how
+// their identifiers are rendered.
+//
+//   - `ScopeOwn(file)` — keep only HirFunction whose `file == file`; render
+//     identifiers as bare suffixes. This is the default for
+//     `nexus types <file>`.
+//   - `ScopeAll` — keep every HirFunction (post-resolution closure);
+//     render stdlib-imported bindings in canonical module-path form
+//     (`std:str.load_at`) and other paths in their HIR canonical
+//     `<sanitized_path>#<name>` form (collision-safe across files).
+//
+// `ScopeAll` is used when the caller passes `--transitive`, plus the
+// synthetic-fixture tests that drive `types_to_text` directly without a
+// real input path.
+
+export type TypesScope = ScopeOwn(file: string) | ScopeAll
+
+let render_name = fn (hir_name: string, hir_file: string, scope: TypesScope) -> string do
+  let bn = bare_name(qualified: hir_name)
+  match scope do
+    | ScopeOwn(file: _) -> return bn
+    | ScopeAll ->
+      let prefix = module_prefix_for_file(file: hir_file)
+      if str.length(s: prefix) == 0 then return hir_name end
+      return prefix ++ "." ++ bn
+  end
+end
+
+let keep_in_scope = fn (hir_file: string, scope: TypesScope) -> bool do
+  match scope do
+    | ScopeOwn(file) -> return hir_file == file
+    | ScopeAll -> return true
+  end
+end
+
+let hir_fn_to_binding = fn (prog: Program, f: HirFunction, scope: TypesScope) -> TypeBinding do
+  match f do | HirFunction(name, type_params: _, params, ret_type, throw_row, body: _, span: _, file, requires: _) ->
     let named = hir_params_to_named(ps: params, acc: [])
     let arrow_str = pp_type(t: TyArrow(params: named, ret: ret_type,
       requires: TyRow(types: [], rest: None), throw_row: TyRow(types: [], rest: None)))
@@ -195,20 +262,26 @@ let hir_fn_to_binding = fn (prog: Program, f: HirFunction) -> TypeBinding do
     let requires = find_requires_for_name(defs, name: bn)
     let req_str = pp_row(row: requires)
     let thr_str = pp_row(row: throw_row)
-    return TypeBinding(name, typ: arrow_str, requires: req_str, throw_row: thr_str)
+    let display = render_name(hir_name: name, hir_file: file, scope)
+    return TypeBinding(name: display, typ: arrow_str, requires: req_str, throw_row: thr_str)
   end
 end
 
-let collect_bindings_go = fn (prog: Program, fs: [HirFunction], acc: [TypeBinding]) -> [TypeBinding] do
+let collect_bindings_go = fn (prog: Program, fs: [HirFunction], scope: TypesScope, acc: [TypeBinding]) -> [TypeBinding] do
   match fs do
     | [] -> return list.reverse(xs: acc)
-    | f :: rest -> return collect_bindings_go(prog, fs: rest, acc: hir_fn_to_binding(prog, f) :: acc)
+    | f :: rest ->
+      let HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span: _, file, requires: _) = f
+      if keep_in_scope(hir_file: file, scope) then
+        return collect_bindings_go(prog, fs: rest, scope, acc: hir_fn_to_binding(prog, f, scope) :: acc)
+      end
+      return collect_bindings_go(prog, fs: rest, scope, acc)
   end
 end
 
-export let collect_bindings = fn (prog: Program, hir: HirProgram) -> [TypeBinding] do
+export let collect_bindings = fn (prog: Program, hir: HirProgram, scope: TypesScope) -> [TypeBinding] do
   match hir do | HirProgram(ports: _, functions, externals: _, handler_bindings: _, enum_defs: _, exception_groups: _, value_binding_names: _, type_defs: _) ->
-    return collect_bindings_go(prog, fs: functions, acc: [])
+    return collect_bindings_go(prog, fs: functions, scope, acc: [])
   end
 end
 
@@ -229,8 +302,8 @@ let render_bindings_text_go = fn (bs: [TypeBinding], acc: [string]) -> [string] 
   end
 end
 
-export let types_to_text = fn (prog: Program, hir: HirProgram) -> string do
-  let bs = collect_bindings(prog, hir)
+export let types_to_text = fn (prog: Program, hir: HirProgram, scope: TypesScope) -> string do
+  let bs = collect_bindings(prog, hir, scope)
   let n = list.length(xs: bs)
   let banner = "=== Type dump (" ++ str.from_i64(val: n) ++ " bindings) ==="
   let lines = render_bindings_text_go(bs, acc: [])
@@ -257,8 +330,8 @@ let bindings_to_json_go = fn (bs: [TypeBinding], acc: [JsonValue]) -> [JsonValue
   end
 end
 
-export let types_to_json = fn (prog: Program, hir: HirProgram) -> string throws { JsonThrow } do
-  let bs = collect_bindings(prog, hir)
+export let types_to_json = fn (prog: Program, hir: HirProgram, scope: TypesScope) -> string throws { JsonThrow } do
+  let bs = collect_bindings(prog, hir, scope)
   let items = bindings_to_json_go(bs, acc: [])
   let obj = JsonObject(fields: [
     JsonField(key: "kind", value: JsonString(val: "types")),
