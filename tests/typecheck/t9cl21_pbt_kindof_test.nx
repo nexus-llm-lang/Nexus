@@ -1,0 +1,491 @@
+// PBT (nexus-t9cl.21 / .22): kindOf binding-site enforcement properties.
+//
+// Spec mirror — docs/spec/type-system-formal.md §"Polymorphism Introduction"
+// (L548-L571). For each declared quantifier X in a top-level
+// `fn <X1,...,Xn>(...)` signature, the spec defines
+//
+//   kindOf(X, σ) = { Type   if  occurs_τ(X, σ) ∧ ¬occurs_ρ(X, σ)
+//                  { Row    if  occurs_ρ(X, σ) ∧ ¬occurs_τ(X, σ)
+//                  { undefined  otherwise  ── *unused* (both false) OR *clash* (both true)
+//
+// and explicitly classifies the *undefined* cases as static errors raised
+// at the binding site (T-Let-PolyFn), surfacing as a "malformed quantifier
+// list" rather than as a downstream unification failure at a use site.
+//
+// The toy `occurs_tau` / `occurs_rho` mirror src/typecheck/check.nx 1-to-1.
+// The classifier `classify_quant(X, σ) ∈ {KType, KRow, KUnused, KClash}`
+// is built from them directly. The properties exercised below pin both
+// halves of the spec equation:
+//
+//   P1 — kindOf disjoint cases: classify(σ) ∈ {Type, Row, Unused, Clash}
+//        with no overlap (the four arms are mutually exclusive).
+//   P2 — Unused detection: a signature that never mentions X classifies
+//        as KUnused. This is the nexus-t9cl.21 case.
+//   P3 — Type detection: a signature using X only at a type position
+//        classifies as KType (the well-formed common case).
+//   P4 — Row detection: a signature using X only as a row tail classifies
+//        as KRow (the row-polymorphism common case, mirrors the worked
+//        example at spec L593-L603).
+//   P5 — Clash detection: planting X at both a type position AND a row
+//        tail in the same signature classifies as KClash. This is the
+//        nexus-t9cl.22 case.
+//
+// 200 trials per property at the default seed. Renderers go through
+// `render_sig` for witnesses; the PBT generator builds depth-bounded
+// signature trees with optional X-planting at controlled positions.
+
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Pass, Fail, Gen } from "std:pbt"
+import { Pair } from "std:tuple"
+import * as str from "std:str"
+
+// ─── Toy domain — mirror of src/common/ast.nx::TypeExpr ─────────────────────
+//
+// We keep only the constructors that participate in the spec's `occurs_τ`
+// / `occurs_ρ` recursion (L556-L568). Quantifier occurrences are
+// represented as `SUserDefined(name, [])` — *not* SVar — because the
+// binding-site check fires *before* `convert_ud_to_var` (see check.nx).
+// Row tails are `SRow(types, rest)` where `rest = Some(SUserDefined(X, []))`
+// is the spec's `{τ̄ | X}` form.
+
+type Sig =
+  SI64
+  | SBool
+  | SStr
+  | SUnit
+  // Arbitrary user-defined name with type args (the load-bearing case
+  // when `args == []` — that's the quantifier-occurrence form).
+  | SUserDefined(name: string, args: [ Sig ])
+  // Scoped TypeExpr constructors — same recursive shape as in check.nx.
+  | SList(elem: Sig)
+  | SArray(elem: Sig)
+  | SRef(inner: Sig)
+  | SLinear(inner: Sig)
+  | SLazy(inner: Sig)
+  | SBorrow(inner: Sig)
+  | SRecord(fields: [ Sig ])
+  // The crucial row constructor. `rest = Some(SUserDefined(X, []))`
+  // means `{... | X}` — row-tail occurrence of X.
+  | SRow(types: [ Sig ], rest: SigRest)
+  // Function arrow: params, return, requires-row, throws-row.
+  | SArrow(params: [ Sig ], ret: Sig, requires: Sig, throw_row: Sig)
+  | SHandler(requires: Sig)
+
+type SigRest =
+  SrNone
+  | SrSome(t: Sig)
+
+// ─── Predicates under test — exact mirror of check.nx ──────────────────────
+//
+// `occurs_tau` and `occurs_rho` are line-for-line ports of
+// src/typecheck/check.nx, with the SUserDefined-quantifier-tagging
+// convention preserved. Keep these in sync with the impl.
+
+let occurs_tau_list = fn (x: string, ts: [ Sig ]) -> bool do
+  match ts do
+    | [] -> return false
+    | t :: rest ->
+      if occurs_tau(x, typ: t) then return true end
+      return occurs_tau_list(x, ts: rest)
+  end
+end
+
+let occurs_tau = fn (x: string, typ: Sig) -> bool do
+  match typ do
+    // L557: occurs_τ(X, X) = true.
+    | SUserDefined(name: n, args: []) ->
+      return n == x
+    // L564 (right): occurs_τ(X, x⟨τ̄⟩) = ∃i. occurs_τ(X, τᵢ).
+    | SUserDefined(name: _, args: targs) ->
+      return occurs_tau_list(x, ts: targs)
+    // L560-L561: arrow recurses into params/ret/requires/throws.
+    | SArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
+      if occurs_tau_list(x, ts: ps) then return true end
+      if occurs_tau(x, typ: r) then return true end
+      if occurs_tau(x, typ: req) then return true end
+      return occurs_tau(x, typ: thr)
+    // L562: modality wrappers all peel through.
+    | SList(elem: e) -> return occurs_tau(x, typ: e)
+    | SArray(elem: e) -> return occurs_tau(x, typ: e)
+    | SRef(inner: i) -> return occurs_tau(x, typ: i)
+    | SLinear(inner: i) -> return occurs_tau(x, typ: i)
+    | SLazy(inner: i) -> return occurs_tau(x, typ: i)
+    | SBorrow(inner: i) -> return occurs_tau(x, typ: i)
+    // L564 (left): record fields are type positions.
+    | SRecord(fields: fs) -> return occurs_tau_list(x, ts: fs)
+    // L565-L566: row entries are τ positions; the tail is NOT.
+    | SRow(types: ts, rest: _) -> return occurs_tau_list(x, ts)
+    | SHandler(requires: req) -> return occurs_tau(x, typ: req)
+    | _ -> return false
+  end
+end
+
+let occurs_rho_list = fn (x: string, ts: [ Sig ]) -> bool do
+  match ts do
+    | [] -> return false
+    | t :: rest ->
+      if occurs_rho(x, typ: t) then return true end
+      return occurs_rho_list(x, ts: rest)
+  end
+end
+
+let occurs_rho = fn (x: string, typ: Sig) -> bool do
+  match typ do
+    | SArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
+      if occurs_rho_list(x, ts: ps) then return true end
+      if occurs_rho(x, typ: r) then return true end
+      if occurs_rho(x, typ: req) then return true end
+      return occurs_rho(x, typ: thr)
+    | SList(elem: e) -> return occurs_rho(x, typ: e)
+    | SArray(elem: e) -> return occurs_rho(x, typ: e)
+    | SRef(inner: i) -> return occurs_rho(x, typ: i)
+    | SLinear(inner: i) -> return occurs_rho(x, typ: i)
+    | SLazy(inner: i) -> return occurs_rho(x, typ: i)
+    | SBorrow(inner: i) -> return occurs_rho(x, typ: i)
+    | SRecord(fields: fs) -> return occurs_rho_list(x, ts: fs)
+    // L567: tail `{τ̄ | X}` matches when rest = SrSome(SUserDefined(X, [])).
+    | SRow(types: ts, rest: r) ->
+      if occurs_rho_list(x, ts) then return true end
+      match r do
+        | SrSome(t: t) ->
+          match t do
+            | SUserDefined(name: n, args: []) -> return n == x
+            | _ -> return occurs_rho(x, typ: t)
+          end
+        | SrNone -> return false
+      end
+    | SHandler(requires: req) -> return occurs_rho(x, typ: req)
+    | SUserDefined(name: _, args: targs) -> return occurs_rho_list(x, ts: targs)
+    | _ -> return false
+  end
+end
+
+// ─── Classifier — the spec's kindOf as a 4-way tag ──────────────────────────
+
+type Kind =
+  KType
+  | KRow
+  | KUnused
+  | KClash
+
+let classify_quant = fn (x: string, sigma: Sig) -> Kind do
+  let in_tau = occurs_tau(x, typ: sigma)
+  let in_rho = occurs_rho(x, typ: sigma)
+  if in_tau then
+    if in_rho then return KClash end
+    return KType
+  end
+  if in_rho then return KRow end
+  return KUnused
+end
+
+let kind_eq = fn (a: Kind, b: Kind) -> bool do
+  match a do
+    | KType -> match b do | KType -> return true | _ -> return false end
+    | KRow -> match b do | KRow -> return true | _ -> return false end
+    | KUnused -> match b do | KUnused -> return true | _ -> return false end
+    | KClash -> match b do | KClash -> return true | _ -> return false end
+  end
+end
+
+let render_kind = fn (k: Kind) -> string do
+  match k do
+    | KType -> return "Type"
+    | KRow -> return "Row"
+    | KUnused -> return "Unused"
+    | KClash -> return "Clash"
+  end
+end
+
+// ─── Renderer ───────────────────────────────────────────────────────────────
+
+let render_list = fn (xs: [ Sig ], acc: string) -> string do
+  match xs do
+    | [] -> return acc
+    | x :: rest ->
+      let head = render_sig(s: x)
+      if str.length(s: acc) == 0 then
+        return render_list(xs: rest, acc: head)
+      end
+      return render_list(xs: rest, acc: acc ++ "," ++ head)
+  end
+end
+
+let render_rest = fn (r: SigRest) -> string do
+  match r do
+    | SrNone -> return ""
+    | SrSome(t: t) -> return "|" ++ render_sig(s: t)
+  end
+end
+
+let render_sig = fn (s: Sig) -> string do
+  match s do
+    | SI64 -> return "i64"
+    | SBool -> return "bool"
+    | SStr -> return "str"
+    | SUnit -> return "unit"
+    | SUserDefined(name: n, args: []) -> return n
+    | SUserDefined(name: n, args: ts) -> return n ++ "<" ++ render_list(xs: ts, acc: "") ++ ">"
+    | SList(elem: e) -> return "[" ++ render_sig(s: e) ++ "]"
+    | SArray(elem: e) -> return "[|" ++ render_sig(s: e) ++ "|]"
+    | SRef(inner: i) -> return "~" ++ render_sig(s: i)
+    | SLinear(inner: i) -> return "%" ++ render_sig(s: i)
+    | SLazy(inner: i) -> return "@" ++ render_sig(s: i)
+    | SBorrow(inner: i) -> return "&" ++ render_sig(s: i)
+    | SRecord(fields: fs) -> return "{" ++ render_list(xs: fs, acc: "") ++ "}"
+    | SRow(types: ts, rest: r) -> return "{" ++ render_list(xs: ts, acc: "") ++ render_rest(r) ++ "}"
+    | SArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
+      return "(" ++ render_list(xs: ps, acc: "") ++ ")->" ++ render_sig(s: r) ++ ";" ++ render_sig(s: req) ++ ";" ++ render_sig(s: thr)
+    | SHandler(requires: req) -> return "H{" ++ render_sig(s: req) ++ "}"
+  end
+end
+
+// ─── Seed plumbing — xorshift64 mirror of pbt::next_state ──────────────────
+
+let abs_i64 = fn (n: i64) -> i64 do
+  if n < 0 then return 0 - n end
+  return n
+end
+
+let step_seed = fn (seed: i64) -> Pair<i64, i64> do
+  let xor_fixup : i64 = 2685821657736338717
+  let s0 = if seed == 0 then xor_fixup else seed end
+  let s1 = s0 ^ (s0 << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  return Pair(left: s3, right: s3)
+end
+
+// ─── Depth-bounded Gen<Sig> — never plants the test name "X" ───────────────
+//
+// Random sigs use base scalars and a handful of synthetic UD names that
+// are *never* "X". This guarantees occurs_τ("X", ·) = occurs_ρ("X", ·) =
+// false for any sig from this generator — the random sig is "X-free",
+// and we deterministically plant X at controlled positions for each
+// property's witness.
+
+let pick_other_name = fn (raw: i64) -> string do
+  let tag = raw % 4
+  if tag == 0 then return "Y" end
+  if tag == 1 then return "Z" end
+  if tag == 2 then return "Q" end
+  return "W"
+end
+
+let gen_sig_run = fn (depth: i64, seed: i64) -> Pair<Sig, i64> do
+  let Pair(left: v, right: s1) = step_seed(seed)
+  let raw = abs_i64(n: v)
+  if depth <= 0 then
+    let tag = raw % 5
+    if tag == 0 then return Pair(left: SI64, right: s1) end
+    if tag == 1 then return Pair(left: SBool, right: s1) end
+    if tag == 2 then return Pair(left: SStr, right: s1) end
+    if tag == 3 then return Pair(left: SUnit, right: s1) end
+    return Pair(left: SUserDefined(name: pick_other_name(raw), args: []), right: s1)
+  end
+  let choice = raw % 10
+  if choice == 0 then return Pair(left: SI64, right: s1) end
+  if choice == 1 then return Pair(left: SBool, right: s1) end
+  if choice == 2 then return Pair(left: SUnit, right: s1) end
+  if choice == 3 then
+    let Pair(left: u, right: s2) = gen_sig_run(depth: depth - 1, seed: s1)
+    return Pair(left: SList(elem: u), right: s2)
+  end
+  if choice == 4 then
+    let Pair(left: u, right: s2) = gen_sig_run(depth: depth - 1, seed: s1)
+    return Pair(left: SRef(inner: u), right: s2)
+  end
+  if choice == 5 then
+    let Pair(left: u, right: s2) = gen_sig_run(depth: depth - 1, seed: s1)
+    return Pair(left: SBorrow(inner: u), right: s2)
+  end
+  if choice == 6 then
+    // Random non-X user-defined with no args (a "free" type name).
+    return Pair(left: SUserDefined(name: pick_other_name(raw), args: []), right: s1)
+  end
+  if choice == 7 then
+    let Pair(left: a, right: s2) = gen_sig_run(depth: depth - 1, seed: s1)
+    let Pair(left: b, right: s3) = gen_sig_run(depth: depth - 1, seed: s2)
+    return Pair(left: SRecord(fields: [a, b]), right: s3)
+  end
+  if choice == 8 then
+    // Row with a non-X tail (rest is SrNone or names a "Y"-family var).
+    let Pair(left: a, right: s2) = gen_sig_run(depth: depth - 1, seed: s1)
+    let Pair(left: v2, right: s3) = step_seed(seed: s2)
+    let tag = abs_i64(n: v2) % 3
+    let rest = if tag == 0 then SrNone
+               else SrSome(t: SUserDefined(name: pick_other_name(raw), args: []))
+               end
+    return Pair(left: SRow(types: [a], rest), right: s3)
+  end
+  // SArrow with all four positions filled.
+  let Pair(left: p, right: s2) = gen_sig_run(depth: depth - 1, seed: s1)
+  let Pair(left: r, right: s3) = gen_sig_run(depth: depth - 1, seed: s2)
+  let Pair(left: req, right: s4) = gen_sig_run(depth: depth - 1, seed: s3)
+  let Pair(left: thr, right: s5) = gen_sig_run(depth: depth - 1, seed: s4)
+  return Pair(left: SArrow(params: [p], ret: r, requires: req, throw_row: thr), right: s5)
+end
+
+// ─── Wrappers — plant X (or not) at controlled positions ────────────────────
+//
+// Each takes a random "background" σ and returns a new σ' constructed
+// from it such that X has a known kindOf:
+//
+//   wrap_unused — passthrough; X never appears.
+//   wrap_type   — wrap σ inside `() -> X; {}; {}` so X is the return type.
+//   wrap_row    — wrap σ inside `() -> unit; {... | X}; {}` so X is a row tail.
+//   wrap_clash  — combine both: X in return AND as a requires-row tail.
+
+let wrap_unused = fn (sigma: Sig) -> Sig do
+  // Wrap inside a trivial arrow so the σ has the full shape T-Let-PolyFn
+  // expects, but never plant X anywhere.
+  return SArrow(params: [sigma], ret: SUnit, requires: SRow(types: [], rest: SrNone), throw_row: SRow(types: [], rest: SrNone))
+end
+
+let wrap_type = fn (background: Sig) -> Sig do
+  // σ = (background) -> X ; {} ; {}.
+  // `background` is the random PBT input — it MUST appear in the resulting σ
+  // (else the property degenerates to a constant). Park it in the params
+  // list; the classify result is determined by the X plant in `ret`, not
+  // by what's at the param position.
+  return SArrow(params: [background], ret: SUserDefined(name: "X", args: []), requires: SRow(types: [], rest: SrNone), throw_row: SRow(types: [], rest: SrNone))
+end
+
+let wrap_row = fn (background: Sig) -> Sig do
+  // σ = (background) -> unit ; { | X } ; {}.
+  let req = SRow(types: [], rest: SrSome(t: SUserDefined(name: "X", args: [])))
+  return SArrow(params: [background], ret: SUnit, requires: req, throw_row: SRow(types: [], rest: SrNone))
+end
+
+let wrap_clash = fn (background: Sig) -> Sig do
+  // σ = (background) -> X ; { | X } ; {}.
+  let req = SRow(types: [], rest: SrSome(t: SUserDefined(name: "X", args: [])))
+  return SArrow(params: [background], ret: SUserDefined(name: "X", args: []), requires: req, throw_row: SRow(types: [], rest: SrNone))
+end
+
+// ─── Body ───────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit require { Console } throws { Exn } do
+  let gen_sig_local = Gen(
+    run: fn (seed: i64) -> Pair<Sig, i64> do
+      return gen_sig_run(depth: 3, seed)
+    end,
+    shrink: fn (_v: Sig) -> [ Sig ] do return [] end,
+    render: render_sig
+  )
+
+  let iters = 200
+
+  // ── P1: classify(σ) lands in exactly one of {Type, Row, Unused, Clash} ───
+  //
+  // The four arms in the spec equation (L548-L552) are mutually exclusive
+  // by construction of `classify_quant` — but this property pins the *port*
+  // we wrote in this file: it must not return Kind values that contradict
+  // the boolean conjunction it dispatches on. A regression where, say,
+  // KType silently leaked into KUnused territory would be caught here.
+  let prop_classify_total = fn (sigma: Sig) -> bool do
+    let k = classify_quant(x: "X", sigma)
+    let in_tau = occurs_tau(x: "X", typ: sigma)
+    let in_rho = occurs_rho(x: "X", typ: sigma)
+    match k do
+      | KType -> return in_tau && !in_rho
+      | KRow -> return !in_tau && in_rho
+      | KUnused -> return !in_tau && !in_rho
+      | KClash -> return in_tau && in_rho
+    end
+  end
+  let r1 = pbt.forall(g: gen_sig_local, prop: prop_classify_total, n: iters)
+  match r1 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P1: classify_quant is total + disjoint")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P1 totality failed: " ++ w)
+  end
+
+  // ── P2: wrap_unused ⇒ KUnused (nexus-t9cl.21) ────────────────────────────
+  //
+  // wrap_unused never plants X. Whatever the random background σ looks
+  // like, the final signature mentions only base scalars and non-X user
+  // names, so classify must report KUnused. This is the spec's "neither
+  // occurs_τ nor occurs_ρ" arm — the one the impl previously failed to
+  // enforce at the binding site.
+  let prop_unused = fn (sigma: Sig) -> bool do
+    let s = wrap_unused(sigma: sigma)
+    return kind_eq(a: classify_quant(x: "X", sigma: s), b: KUnused)
+  end
+  let r2 = pbt.forall(g: gen_sig_local, prop: prop_unused, n: iters)
+  match r2 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P2: wrap_unused classifies as KUnused (t9cl.21)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P2 unused failed: " ++ w)
+  end
+
+  // ── P3: wrap_type ⇒ KType (well-formed) ──────────────────────────────────
+  //
+  // X appears only in return-type position, never as a row tail. Spec L548
+  // ("Type" arm) must fire.
+  let prop_type = fn (sigma: Sig) -> bool do
+    let s = wrap_type(background: sigma)
+    return kind_eq(a: classify_quant(x: "X", sigma: s), b: KType)
+  end
+  let r3 = pbt.forall(g: gen_sig_local, prop: prop_type, n: iters)
+  match r3 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P3: wrap_type classifies as KType")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P3 type failed: " ++ w)
+  end
+
+  // ── P4: wrap_row ⇒ KRow (well-formed; the row-polymorphism case) ────────
+  //
+  // X appears only as a requires-row tail, never at a type position. Spec
+  // L549 ("Row" arm) must fire. Mirrors the worked example at L593-L603.
+  let prop_row = fn (sigma: Sig) -> bool do
+    let s = wrap_row(background: sigma)
+    return kind_eq(a: classify_quant(x: "X", sigma: s), b: KRow)
+  end
+  let r4 = pbt.forall(g: gen_sig_local, prop: prop_row, n: iters)
+  match r4 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P4: wrap_row classifies as KRow")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P4 row failed: " ++ w)
+  end
+
+  // ── P5: wrap_clash ⇒ KClash (nexus-t9cl.22) ─────────────────────────────
+  //
+  // X is planted in BOTH return-type position and a requires-row tail.
+  // Spec L551 ("undefined / kind clash") must fire — this is the case
+  // the impl previously deferred to the unifier, surfacing a confusing
+  // downstream "expected Type, got Row" at a use site instead of a
+  // direct "malformed quantifier list" at the binding site.
+  let prop_clash = fn (sigma: Sig) -> bool do
+    let s = wrap_clash(background: sigma)
+    return kind_eq(a: classify_quant(x: "X", sigma: s), b: KClash)
+  end
+  let r5 = pbt.forall(g: gen_sig_local, prop: prop_clash, n: iters)
+  match r5 do
+    | Pass -> test_assert.assert_true(cond: true, label: "P5: wrap_clash classifies as KClash (t9cl.22)")
+    | Fail(witness: w, shrunk_input: _) ->
+      test_assert.assert_true(cond: false, label: "P5 clash failed: " ++ w)
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
