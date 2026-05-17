@@ -1,0 +1,257 @@
+/**
+ * typecheck/tcwf: introduction-site well-formedness checks for capability
+ * and throws rows.
+ *
+ * Enforces the spec-mandated wfCap and wfThrow predicates at every place
+ * a row is *introduced* (T-Lambda fn arrow, D-Port method signatures,
+ * T-Handler annotations). Use sites do not re-check: by the spec, once
+ * a row passes wfCap/wfThrow at introduction, every later operation
+ * (T-App, T-PortCall, T-Inject, T-Raise, T-TryCatch) inherits the
+ * invariant via unification.
+ *
+ * Reference: docs/spec/type-system-formal.md §1
+ *   - line 106 SysCaps definition
+ *   - line 108 wfCap predicate
+ *   - line 112 wfCap introduction-site rule
+ *   - line 116 wfThrow predicate
+ *
+ * The spec rationale that motivates this module (line 112):
+ *   "Without wfCap at the introduction sites, a typo such as
+ *    `require { Logr }` (intended `Logger`) would propagate as an
+ *    uninhabitable row entry and surface only at a use site that
+ *    happens to look it up — moving the diagnostic far from the source
+ *    of the typo."
+ *
+ * Both predicates raise a typed diagnostic on the *first* offending entry
+ * rather than collecting all of them — the rest of the typecheck pipeline
+ * already uses fail-fast for register_functions, and stopping early keeps
+ * the diagnostic shape simple while still giving the user a precise
+ * source-spanned message.
+ *
+ * Issues: nexus-t9cl.24 (wfCap), nexus-t9cl.25 (wfThrow).
+ */
+
+import { Span } from "src/common/token.nx"
+import { TypeExpr, TyUserDefined, TyRow, EnumDef, VariantDef } from "src/common/ast.nx"
+import { HirPort, ExceptionGroupEntry, HirProgram, HirFunction, HirHandlerArm, HirHandlerBindingEntry, HirHandlerBinding } from "src/ir/hir/types.nx"
+import { TypeError, UnknownCapability, UnknownThrowVariant } from "src/common/error.nx"
+import { VariantIndex, VariantInfo }, * as vidx from "src/common/variant_index.nx"
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+
+// ─── SysCaps closed set ─────────────────────────────────────────────────────
+//
+// The seven WASI-grant capabilities. Kept here (rather than imported from
+// driver.nx) because tcwf lives in src/typecheck/ and driver depends on
+// typecheck, not the other way around. The single source of truth for the
+// runtime mapping is driver.nx::perm_to_cap_name; adding a new system cap
+// requires updating both places (small, intentional duplication — there
+// are seven entries and they essentially never change).
+
+/** True when `name` is one of the seven system capabilities defined by
+ *  the spec's `SysCaps` set (`PermFs`, `PermNet`, `PermConsole`,
+ *  `PermRandom`, `PermClock`, `PermProc`, `PermEnv`). */
+export let is_sys_cap = fn (name: string) -> bool do
+  if name == "PermFs" then return true end
+  if name == "PermNet" then return true end
+  if name == "PermConsole" then return true end
+  if name == "PermRandom" then return true end
+  if name == "PermClock" then return true end
+  if name == "PermProc" then return true end
+  if name == "PermEnv" then return true end
+  return false
+end
+
+// ─── wfCap ──────────────────────────────────────────────────────────────────
+
+// Port names land in HirPort.name canonically renamed to
+// "<sanitized_path>#<bare>" (see src/ir/rdrname.nx::canonical_name). The
+// require row, however, carries the source-level identifier — bare
+// `Clock`, not `nxlib_stdlib_clock_nx#Clock` — so we compare against the
+// suffix after the last '#'. When no '#' is present (e.g. local ports
+// in the entry file), the full string is the bare name.
+let base_name_of = fn (qualified: string) -> string do
+  let n = str.length(s: qualified)
+  let idx = last_index_of_hash(s: qualified, i: n - 1)
+  if idx < 0 then return qualified end
+  return str.substring(s: qualified, start: idx + 1, len: n - idx - 1)
+end
+
+let last_index_of_hash = fn (s: string, i: i64) -> i64 do
+  if i < 0 then return 0 - 1 end
+  // 35 = ASCII '#'
+  if str.char_code(s, idx: i) == 35 then return i end
+  return last_index_of_hash(s, i: i - 1)
+end
+
+let port_declared = fn (name: string, ports: [HirPort]) -> bool do
+  match ports do
+    | [] -> return false
+    | HirPort(name: pn, methods: _) :: rest ->
+      if base_name_of(qualified: pn) == name then return true end
+      return port_declared(name, ports: rest)
+  end
+end
+
+let check_cap_entries = fn (entries: [TypeExpr], ports: [HirPort], span: Span) -> unit throws { TypeError } do
+  match entries do
+    | [] -> return ()
+    | t :: rest ->
+      match t do
+        | TyUserDefined(name: n, args: _) ->
+          if is_sys_cap(name: n) then
+            return check_cap_entries(entries: rest, ports, span)
+          end
+          if port_declared(name: n, ports) then
+            return check_cap_entries(entries: rest, ports, span)
+          end
+          raise UnknownCapability(name: n, span)
+        // Spec note (line 114): the row entries are constrained to be
+        // identifiers; non-identifier shapes (TyVar/TyArrow/...) are
+        // rejected at the parser. If one slips through here, treat it as
+        // unknown so we don't silently admit a malformed row.
+        | _ -> raise UnknownCapability(name: "<non-identifier row entry>", span)
+      end
+  end
+end
+
+/** wfCap(ρ_q): every named entry in the require row must be a system
+ *  capability or a port declared by `cap X`. The row tail (`{... | ?r}`)
+ *  is unconstrained — per spec line 110, tail vars are pinned by
+ *  unification at use sites, which transitively inherits well-formedness
+ *  from the closed-row context.
+ *
+ *  `span` is the span of the introducing site (fn-arrow, handler arm)
+ *  used as the diagnostic location when no per-entry span is available.
+ */
+export let wf_cap = fn (row: TypeExpr, ports: [HirPort], span: Span) -> unit throws { TypeError } do
+  match row do
+    | TyRow(types: ts, rest: _) -> return check_cap_entries(entries: ts, ports, span)
+    // Non-row require slots (TyUnit / TyVar) bypass the check — they only
+    // appear via parser defaults or generic-arg substitution that pre-row.
+    | _ -> return ()
+  end
+end
+
+// ─── wfThrow ────────────────────────────────────────────────────────────────
+
+let group_declared = fn (name: string, groups: [ExceptionGroupEntry]) -> bool do
+  match groups do
+    | [] -> return false
+    | ExceptionGroupEntry(name: gn, members: _) :: rest ->
+      if gn == name then return true end
+      return group_declared(name, groups: rest)
+  end
+end
+
+let is_exn_variant = fn (name: string, vidx_: VariantIndex) -> bool do
+  match vidx.lookup_variant_info(idx: vidx_, variant: name) do
+    | Some(val: VariantInfo(enum_name: en, type_params: _, def: _)) ->
+      // Only variants of the Exn enum count as "constructor of Exn".
+      // A variant from another enum (e.g. List.Cons) sharing a name would
+      // not satisfy the throws-row well-formedness criterion.
+      return en == "Exn"
+    | None -> return false
+  end
+end
+
+let check_throw_entries = fn (
+  entries: [TypeExpr], vidx_: VariantIndex,
+  groups: [ExceptionGroupEntry], span: Span
+) -> unit throws { TypeError } do
+  match entries do
+    | [] -> return ()
+    | t :: rest ->
+      match t do
+        | TyUserDefined(name: n, args: _) ->
+          // The universal sentinel `Exn` is always admitted; T-Raise/T-TryCatch
+          // already special-case it (see infer.nx::row_admits_exception). Spec
+          // line 116: "or the catch-all sentinel Exn itself".
+          if n == "Exn" then return check_throw_entries(entries: rest, vidx_, groups, span) end
+          if is_exn_variant(name: n, vidx_) then
+            return check_throw_entries(entries: rest, vidx_, groups, span)
+          end
+          if group_declared(name: n, groups) then
+            return check_throw_entries(entries: rest, vidx_, groups, span)
+          end
+          raise UnknownThrowVariant(name: n, span)
+        | _ -> raise UnknownThrowVariant(name: "<non-identifier row entry>", span)
+      end
+  end
+end
+
+/** wfThrow(ρ_e): every named entry in the throws row must be either the
+ *  universal `Exn` sentinel, a constructor (variant) of `Exn`, or a
+ *  declared exception group. Tail vars are unconstrained (same rationale
+ *  as wfCap).
+ */
+export let wf_throw = fn (
+  row: TypeExpr, vidx_: VariantIndex,
+  groups: [ExceptionGroupEntry], span: Span
+) -> unit throws { TypeError } do
+  match row do
+    | TyRow(types: ts, rest: _) -> return check_throw_entries(entries: ts, vidx_, groups, span)
+    | _ -> return ()
+  end
+end
+
+// ─── Whole-program entry ────────────────────────────────────────────────────
+//
+// `check_program_wf_rows` runs wfCap/wfThrow over every function in the
+// program. Designed to be invoked on the post-build, *pre-DCE* HirProgram so
+// a typo in an unused (dead-code) function is still caught — the spec's
+// rationale (line 112) explicitly cites the "or may never if the cap is
+// unused" case as the failure mode wfCap is meant to prevent.
+
+let variant_index_of = fn (enum_defs: [EnumDef]) -> VariantIndex do
+  return vidx.build_variant_index(defs: enum_defs)
+end
+
+let walk_funcs = fn (
+  funcs: [HirFunction], ports: [HirPort],
+  vidx_: VariantIndex, groups: [ExceptionGroupEntry]
+) -> unit throws { TypeError } do
+  match funcs do
+    | [] -> return ()
+    | HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: tw, body: _, span: sp, file: _, requires: req) :: rest ->
+      wf_cap(row: req, ports, span: sp)
+      wf_throw(row: tw, vidx_, groups, span: sp)
+      return walk_funcs(funcs: rest, ports, vidx_, groups)
+  end
+end
+
+let walk_handler_bindings = fn (
+  hbs: [HirHandlerBindingEntry], ports: [HirPort],
+  vidx_: VariantIndex, groups: [ExceptionGroupEntry]
+) -> unit throws { TypeError } do
+  match hbs do
+    | [] -> return ()
+    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(port_name: _, arms)) :: rest ->
+      walk_handler_arms(arms, ports, vidx_, groups)
+      return walk_handler_bindings(hbs: rest, ports, vidx_, groups)
+  end
+end
+
+let walk_handler_arms = fn (
+  arms: [HirHandlerArm], ports: [HirPort],
+  vidx_: VariantIndex, groups: [ExceptionGroupEntry]
+) -> unit throws { TypeError } do
+  match arms do
+    | [] -> return ()
+    | HirHandlerArm(arm: HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: tw, body: _, span: sp, file: _, requires: req), cont_binder: _) :: rest ->
+      wf_cap(row: req, ports, span: sp)
+      wf_throw(row: tw, vidx_, groups, span: sp)
+      return walk_handler_arms(arms: rest, ports, vidx_, groups)
+  end
+end
+
+/** Run wfCap and wfThrow over every introduction site in the program.
+ *  Designed for the pre-DCE HIR so a typo'd row entry on an unused
+ *  function is still rejected — see file header.
+ */
+export let check_program_wf_rows = fn (prog: HirProgram) -> unit throws { TypeError } do
+  let HirProgram(ports, functions: funcs, externals: _, handler_bindings: hbs, enum_defs: edefs, exception_groups: egs, value_binding_names: _, type_defs: _) = prog
+  let vi = variant_index_of(enum_defs: edefs)
+  walk_funcs(funcs, ports, vidx_: vi, groups: egs)
+  return walk_handler_bindings(hbs, ports, vidx_: vi, groups: egs)
+end

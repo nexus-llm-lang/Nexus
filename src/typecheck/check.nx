@@ -8,12 +8,13 @@
 import * as bb from "std:bytebuffer"
 import * as naming from "src/common/naming.nx"
 import { TypeExpr, TyUnit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyHandler, NamedType, EnumDef, RecordDef, VariantDef, VariantField } from "src/common/ast.nx"
-import { HirProgram, HirFunction, HirHandlerArm, HirParam, HirExternal, HirPort, HirPortMethod, HirHandlerBindingEntry, HirHandlerBinding, EagerBody, LazyBody } from "src/ir/hir/types.nx"
+import { HirProgram, HirFunction, HirHandlerArm, HirParam, HirExternal, HirPort, HirPortMethod, HirHandlerBindingEntry, HirHandlerBinding, EagerBody, LazyBody, ExceptionGroupEntry } from "src/ir/hir/types.nx"
 import { Span } from "src/common/token.nx"
 import { TypeError, TypeMismatch, MissingMain, MainNotFunction, MainNotUnit, MainThrowsTooBroad, DuplicateTopLevelBinding, UnusedTypeParam, KindClashTypeParam } from "src/common/error.nx"
 import { CheckState, Scheme, EnvEntry, EnumEntry, TypeDefEntry, InferExprOk, InferExprErr }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
 import * as infer from "src/typecheck/infer.nx"
+import * as tcwf from "src/typecheck/tcwf.nx"
 
 // ─── Public entry point ─────────────────────────────────────────────────────
 
@@ -29,15 +30,19 @@ export let check_program = fn (hir: HirProgram, local_names: [string], require_m
 
   // Pass 1: Register all signatures
   let st1 = register_externals(state, exts)
-  let st2 = register_functions(state: st1, funcs)
-  let st3 = register_ports(state: st2, ports)
+  // Register-time wfCap/wfThrow needs the full port + exception vocabulary
+  // visible (other files' ports get pulled in via import collection). We
+  // pass `ports` and `egs` directly because CheckState does not carry the
+  // raw port list (only env entries for their methods).
+  let st2 = register_functions(state: st1, funcs, ports, exception_groups: egs)
+  let st3 = register_ports(state: st2, ports, exception_groups: egs)
   // Pass 1b: T-Handler arm/method 1-1 correspondence (spec §T-Handler line 1119).
   // Reject any handler that supplies an extra arm or omits a declared port method
   // before any signature/body is registered; missing arms would otherwise leave
   // a port-method slot unimplemented and turn into runtime UB at port-call
   // dispatch, and extra arms would silently introduce a never-routed name.
   validate_handler_arm_sets(ports, hbs)
-  let st4 = register_handler_bindings(state: st3, hbs)
+  let st4 = register_handler_bindings(state: st3, hbs, ports, exception_groups: egs)
   let st5 = register_enum_constructors(state: st4, defs: edefs)
 
   let cont_binder_map = build_cont_binder_map(hbs)
@@ -519,17 +524,25 @@ end
 // Downstream lir_opt mis-resolves `return_call` for shadowed top-level lets
 // and corrupts UNRELATED functions' return atoms; rejecting at typecheck
 // eliminates the bug class entirely.
-let register_functions = fn (state: CheckState, funcs: [HirFunction]) -> CheckState throws { TypeError } do
-  return register_functions_go(state, funcs, seen: [])
+let register_functions = fn (state: CheckState, funcs: [HirFunction], ports: [HirPort], exception_groups: [ExceptionGroupEntry]) -> CheckState throws { TypeError } do
+  return register_functions_go(state, funcs, seen: [], ports, exception_groups)
 end
 
-let register_functions_go = fn (state: CheckState, funcs: [HirFunction], seen: [string]) -> CheckState throws { TypeError } do
+let register_functions_go = fn (state: CheckState, funcs: [HirFunction], seen: [string], ports: [HirPort], exception_groups: [ExceptionGroupEntry]) -> CheckState throws { TypeError } do
   match funcs do
     | [] -> return state
-    | HirFunction(name: n, type_params: tps, params, ret_type: ret, throw_row: tw, body: _, span: sp, file: _) :: rest ->
+    | HirFunction(name: n, type_params: tps, params, ret_type: ret, throw_row: tw, body: _, span: sp, file: _, requires: req) :: rest ->
       if str_list_contains(xs: seen, s: n) then
         raise DuplicateTopLevelBinding(name: n, span: sp)
       end
+      // Introduction-site well-formedness checks (T-Lambda fn arrow):
+      // wfCap on the require row and wfThrow on the throws row. Per spec
+      // §1 line 112/116, these are checked here so a typo (`require { Logr }`
+      // for `Logger`) is rejected at the source location rather than
+      // surviving as an uninhabitable row entry until a use site looks
+      // it up — issues nexus-t9cl.24 (wfCap) and nexus-t9cl.25 (wfThrow).
+      tcwf.wf_cap(row: req, ports, span: sp)
+      tcwf.wf_throw(row: tw, vidx_: tctypes.state_variant_index(state), groups: exception_groups, span: sp)
       let param_types = hir_params_to_named_types(params)
       // nexus-t9cl.21 / .22: kindOf binding-site enforcement
       // (spec L548–L571). σ for a top-level fn is its parameter types,
@@ -546,24 +559,33 @@ let register_functions_go = fn (state: CheckState, funcs: [HirFunction], seen: [
         throw_row: convert_ud_to_var(typ: tw, vars: tps)
       )
       let env = tctypes.env_insert(env: tctypes.state_env(state), name: n, scheme: Scheme(vars: tps, typ: arrow))
-      return register_functions_go(state: tctypes.state_with_env(state, env), funcs: rest, seen: n :: seen)
+      return register_functions_go(state: tctypes.state_with_env(state, env), funcs: rest, seen: n :: seen, ports, exception_groups)
   end
 end
 
 // ─── Register ports ─────────────────────────────────────────────────────────
-
-let register_ports = fn (state: CheckState, ports: [HirPort]) -> CheckState do
+//
+// Port-method declared `require` / `throws` rows are dropped during HIR
+// conversion (see src/ir/hir/hir.nx::convert_port_sigs, which keeps only
+// the method name). Until that is preserved through HIR, per-method
+// wfCap/wfThrow at D-Port introduction sites cannot run here. The
+// spec's other two introduction sites (T-Lambda fn arrow and T-Handler)
+// remain enforced — handler arm bodies still go through
+// `register_handler_bindings` below which calls wfThrow on each arm's
+// throws row (the arm body is a HirFunction whose `throw_row` IS
+// preserved). Tracked alongside nexus-t9cl.24/.25.
+let register_ports = fn (state: CheckState, ports: [HirPort], exception_groups: [ExceptionGroupEntry]) -> CheckState do
   match ports do
     | [] -> return state
     | HirPort(_) :: rest ->
-      // Ports are structural — methods are registered via handler bindings
-      return register_ports(state, ports: rest)
+      // Ports are structural — methods are registered via handler bindings.
+      return register_ports(state, ports: rest, exception_groups)
   end
 end
 
 // ─── Register handler bindings ──────────────────────────────────────────────
 
-let register_handler_bindings = fn (state: CheckState, hbs: [HirHandlerBindingEntry]) -> CheckState do
+let register_handler_bindings = fn (state: CheckState, hbs: [HirHandlerBindingEntry], ports: [HirPort], exception_groups: [ExceptionGroupEntry]) -> CheckState throws { TypeError } do
   match hbs do
     | [] -> return state
     | HirHandlerBindingEntry(name: n, binding: HirHandlerBinding(port_name: pname, arms)) :: rest ->
@@ -571,8 +593,25 @@ let register_handler_bindings = fn (state: CheckState, hbs: [HirHandlerBindingEn
       let env1 = tctypes.env_insert(env: tctypes.state_env(state), name: n, scheme: tctypes.mono(typ: handler_type))
       let prefix_len = naming.handler_prefix_len(handler_name: n)
       let env2 = register_handler_methods(env: env1, port_name: pname, prefix_len, arms)
+      // Per-arm wfThrow at the T-Handler introduction site: each arm body
+      // is a HirFunction whose `throw_row` was preserved through HIR, so a
+      // typo like `throws { BogusVariant }` on an arm is rejected here.
+      // The arm's `requires` row is currently empty (handler arms don't
+      // declare per-arm caps), so wfCap there is a no-op until that
+      // syntax exists.
+      check_handler_arm_throw_rows(arms, state, exception_groups)
       let st1 = tctypes.state_with_env(state, env: env2)
-      return register_handler_bindings(state: st1, hbs: rest)
+      return register_handler_bindings(state: st1, hbs: rest, ports, exception_groups)
+  end
+end
+
+let check_handler_arm_throw_rows = fn (arms: [HirHandlerArm], state: CheckState, exception_groups: [ExceptionGroupEntry]) -> unit throws { TypeError } do
+  match arms do
+    | [] -> return ()
+    | HirHandlerArm(arm: HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: tw, body: _, span: sp, file: _, requires: req), cont_binder: _) :: rest ->
+      tcwf.wf_cap(row: req, ports: [], span: sp)
+      tcwf.wf_throw(row: tw, vidx_: tctypes.state_variant_index(state), groups: exception_groups, span: sp)
+      return check_handler_arm_throw_rows(arms: rest, state, exception_groups)
   end
 end
 

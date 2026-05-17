@@ -1,0 +1,148 @@
+// Regression for nexus-t9cl.24 (wfCap) and nexus-t9cl.25 (wfThrow).
+//
+// Exercises src/typecheck/tcwf at the unit level:
+//
+//   1. `is_sys_cap` recognises every member of the spec's closed SysCaps
+//      set (PermFs / PermNet / PermConsole / PermRandom / PermClock /
+//      PermProc / PermEnv) and nothing else.
+//   2. `wf_cap` admits a row entirely composed of system capabilities.
+//   3. `wf_cap` admits a row mixing SysCaps with a port whose canonical
+//      name is "<sanitized_path>#<bare>" — verifying that the predicate
+//      strips the source-path prefix before comparing against the
+//      bare-name entry.
+//   4. `wf_cap` rejects an unknown row entry with `UnknownCapability`.
+//   5. `wf_throw` admits the universal `Exn` sentinel.
+//   6. `wf_throw` admits an exception-group name.
+//   7. `wf_throw` rejects an unknown variant with `UnknownThrowVariant`.
+//
+// This complements the negative-corpus fixtures
+// `examples/negative/wf_cap_unknown.nx` and `wf_throw_unknown.nx`, which
+// verify end-to-end via `nexus build`: this file exercises the inner
+// predicates directly so a future refactor to wfCap/wfThrow (e.g.
+// growing SysCaps, or accepting a richer port shape) is caught
+// independently of pipeline orchestration.
+
+import * as test_assert from "std:test/assert"
+import * as tcwf from "src/typecheck/tcwf.nx"
+import * as vidx from "src/common/variant_index.nx"
+import { TypeExpr, TyRow, TyUserDefined, EnumDef, VariantDef, VariantField } from "src/common/ast.nx"
+import { HirPort, HirPortMethod, ExceptionGroupEntry } from "src/ir/hir/types.nx"
+import { Span } from "src/common/token.nx"
+import { UnknownCapability, UnknownThrowVariant } from "src/common/error.nx"
+import { Some, None } from "std:option"
+
+// ─── Test harness ─────────────────────────────────────────────────────
+
+let sp = fn () -> Span do return Span(offset: 0, line: 1, col: 1) end
+
+let bare_row = fn (names: [string]) -> TypeExpr do
+  return TyRow(types: list_map_name(xs: names), rest: None)
+end
+
+let list_map_name = fn (xs: [string]) -> [TypeExpr] do
+  match xs do
+    | [] -> return []
+    | n :: rest -> return TyUserDefined(name: n, args: []) :: list_map_name(xs: rest)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  // ── (1) SysCaps closed set ─────────────────────────────────────────
+  test_assert.assert_true(cond: tcwf.is_sys_cap(name: "PermFs"), label: "PermFs ∈ SysCaps")
+  test_assert.assert_true(cond: tcwf.is_sys_cap(name: "PermNet"), label: "PermNet ∈ SysCaps")
+  test_assert.assert_true(cond: tcwf.is_sys_cap(name: "PermConsole"), label: "PermConsole ∈ SysCaps")
+  test_assert.assert_true(cond: tcwf.is_sys_cap(name: "PermRandom"), label: "PermRandom ∈ SysCaps")
+  test_assert.assert_true(cond: tcwf.is_sys_cap(name: "PermClock"), label: "PermClock ∈ SysCaps")
+  test_assert.assert_true(cond: tcwf.is_sys_cap(name: "PermProc"), label: "PermProc ∈ SysCaps")
+  test_assert.assert_true(cond: tcwf.is_sys_cap(name: "PermEnv"), label: "PermEnv ∈ SysCaps")
+  test_assert.assert_true(cond: !tcwf.is_sys_cap(name: "Logger"), label: "Logger ∉ SysCaps (it's a port)")
+  test_assert.assert_true(cond: !tcwf.is_sys_cap(name: "Logr"), label: "Logr typo ∉ SysCaps")
+  test_assert.assert_true(cond: !tcwf.is_sys_cap(name: ""), label: "empty ∉ SysCaps")
+
+  // ── (2) wfCap admits all-SysCap row ────────────────────────────────
+  // Wraps in a try/catch so the test fails loudly if a SysCap-only row
+  // is wrongly rejected; the body of the try is the assertion.
+  let no_ports = []
+  try
+    tcwf.wf_cap(row: bare_row(names: ["PermFs", "PermConsole"]), ports: no_ports, span: sp())
+    test_assert.assert_true(cond: true, label: "wfCap: PermFs+PermConsole admitted")
+  catch _ ->
+    test_assert.assert_true(cond: false, label: "wfCap: SysCap-only row should not raise")
+  end
+
+  // ── (3) wfCap with a port whose canonical name has a path prefix ───
+  // Real HirPorts are stored as "<sanitized_path>#<bare>" (see
+  // src/ir/rdrname.nx::canonical_name); the predicate must strip the
+  // prefix before comparing.
+  let canonical_port = HirPort(name: "nxlib_stdlib_log_nx#Logger", methods: [])
+  try
+    tcwf.wf_cap(row: bare_row(names: ["PermFs", "Logger"]), ports: [canonical_port], span: sp())
+    test_assert.assert_true(cond: true, label: "wfCap: bare port name matches canonical 'path#Logger'")
+  catch _ ->
+    test_assert.assert_true(cond: false, label: "wfCap: bare port name should match the canonical entry")
+  end
+
+  // ── (4) wfCap rejects unknown name ─────────────────────────────────
+  try
+    tcwf.wf_cap(row: bare_row(names: ["BogusCap"]), ports: [], span: sp())
+    test_assert.assert_true(cond: false, label: "wfCap: BogusCap should have been rejected")
+  catch e ->
+    match e do
+      | UnknownCapability(name: n, span: _) ->
+        test_assert.assert_eq_string(actual: n, expected: "BogusCap", label: "wfCap: diagnostic names the offending entry")
+      | _ ->
+        test_assert.assert_true(cond: false, label: "wfCap: wrong exception type for unknown cap")
+    end
+  end
+
+  // ── (5) wfThrow admits the universal Exn sentinel ──────────────────
+  // Build a minimal variant index containing the Exn enum with one
+  // user-defined variant; mirrors how `register_exn_variant` populates
+  // the real program's variant index.
+  let exn_def = EnumDef(name: "Exn", is_public: true, is_opaque: false,
+    type_params: [],
+    variants: [VariantDef(name: "MyExn", fields: [])])
+  let vi = vidx.build_variant_index(defs: [exn_def])
+  try
+    tcwf.wf_throw(row: bare_row(names: ["Exn"]), vidx_: vi, groups: [], span: sp())
+    test_assert.assert_true(cond: true, label: "wfThrow: universal Exn admitted")
+  catch _ ->
+    test_assert.assert_true(cond: false, label: "wfThrow: Exn sentinel should not raise")
+  end
+
+  // ── (5b) wfThrow admits a declared variant of Exn ─────────────────
+  try
+    tcwf.wf_throw(row: bare_row(names: ["MyExn"]), vidx_: vi, groups: [], span: sp())
+    test_assert.assert_true(cond: true, label: "wfThrow: declared Exn variant admitted")
+  catch _ ->
+    test_assert.assert_true(cond: false, label: "wfThrow: variant of Exn should not raise")
+  end
+
+  // ── (6) wfThrow admits a declared exception-group name ────────────
+  let group = ExceptionGroupEntry(name: "MyGroup", members: ["MyExn"])
+  try
+    tcwf.wf_throw(row: bare_row(names: ["MyGroup"]), vidx_: vi, groups: [group], span: sp())
+    test_assert.assert_true(cond: true, label: "wfThrow: declared group admitted")
+  catch _ ->
+    test_assert.assert_true(cond: false, label: "wfThrow: declared group should not raise")
+  end
+
+  // ── (7) wfThrow rejects unknown variant ───────────────────────────
+  try
+    tcwf.wf_throw(row: bare_row(names: ["BogusVariant"]), vidx_: vi, groups: [], span: sp())
+    test_assert.assert_true(cond: false, label: "wfThrow: BogusVariant should have been rejected")
+  catch e ->
+    match e do
+      | UnknownThrowVariant(name: n, span: _) ->
+        test_assert.assert_eq_string(actual: n, expected: "BogusVariant", label: "wfThrow: diagnostic names the offending entry")
+      | _ ->
+        test_assert.assert_true(cond: false, label: "wfThrow: wrong exception type for unknown variant")
+    end
+  end
+
+  return ()
+end
+
+let main = fn () -> unit do
+  return body()
+end
