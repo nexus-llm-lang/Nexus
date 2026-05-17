@@ -1,0 +1,177 @@
+// Regression for nexus-t9cl.26: T-Handler arm/method 1-1 correspondence
+// (spec §T-Handler line 1119) was not enforced by the typechecker. The
+// handler-binding registration path (register_handler_bindings,
+// register_handler_methods, check_handler_arm_bodies) typed each arm body
+// individually but never compared the supplied arm-name set against the
+// port's declared method set, so:
+//   - an extra arm silently became a never-routed method (dead code, no
+//     diagnostic), and
+//   - a missing arm left the port-method slot unimplemented and surfaced
+//     at runtime as a dispatch-table miss (UB).
+//
+// Spec mapping (🈲submodules/docs/spec/type-system-formal.md):
+//   §T-Handler line 1119: { ℓ_j | j ∈ J } = { ℓ | (ℓ = e) ∈ overline{ℓ_j = e_j} }.
+//   The premise binds the arm-name set to the port's method set as a
+//   rule-level rejection — both extra arms (never indexable by T-PortCall)
+//   and missing arms (dispatch-table holes) are inadmissible.
+//
+// We invoke `validate_handler_arm_sets` directly against handcrafted
+// (ports, handler_bindings) pairs — no full HirProgram needed since the
+// 1-1 correspondence check operates purely on those two lists.
+//
+// Three properties:
+//   1. Perfect match accepts (Twin with first+second arms, both declared).
+//   2. Extra arm rejects (Greeter port declares `say`, handler supplies
+//      `say` + `extra` — `extra` is not on the port).
+//   3. Missing arm rejects (Twin port declares first+second, handler
+//      supplies only `first`).
+
+import * as test_assert from "std:test/assert"
+import * as naming from "src/common/naming.nx"
+import { validate_handler_arm_sets } from "src/typecheck/check.nx"
+import {
+  HirPort, HirPortMethod, HirHandlerBindingEntry, HirHandlerBinding,
+  HirHandlerArm, HirFunction, EagerBody
+} from "src/ir/hir/types.nx"
+import { TypeExpr, TyUnit, TyRow, TyUserDefined } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { TypeError, TypeMismatch } from "src/common/error.nx"
+
+// ─── Shared fixtures ────────────────────────────────────────────────────────
+
+let dummy_span = fn () -> Span do
+  return Span(offset: 0, line: 0, col: 0)
+end
+
+let empty_row = fn () -> TypeExpr do
+  return TyRow(types: [], rest: None)
+end
+
+let make_arm = fn (handler_name: string, method_name: string) -> HirHandlerArm do
+  let synth = naming.handler_func_name(handler_name, method_name)
+  return HirHandlerArm(
+    arm: HirFunction(
+      name: synth,
+      type_params: [],
+      params: [],
+      ret_type: TyUnit,
+      throw_row: empty_row(),
+      body: EagerBody(stmts: []),
+      span: dummy_span(),
+      file: ""
+    ),
+    cont_binder: None
+  )
+end
+
+let make_port = fn (name: string, methods: [string]) -> HirPort do
+  return HirPort(name, methods: lift_methods(names: methods))
+end
+
+let lift_methods = fn (names: [string]) -> [HirPortMethod] do
+  match names do
+    | [] -> return []
+    | n :: rest -> return HirPortMethod(name: n) :: lift_methods(names: rest)
+  end
+end
+
+let make_binding = fn (handler_name: string, port_name: string, arm_names: [string]) -> HirHandlerBindingEntry do
+  return HirHandlerBindingEntry(
+    name: handler_name,
+    binding: HirHandlerBinding(port_name, arms: build_arms(handler_name, names: arm_names))
+  )
+end
+
+let build_arms = fn (handler_name: string, names: [string]) -> [HirHandlerArm] do
+  match names do
+    | [] -> return []
+    | n :: rest -> return make_arm(handler_name, method_name: n) :: build_arms(handler_name, names: rest)
+  end
+end
+
+// ─── Per-case predicate wrappers ────────────────────────────────────────────
+//
+// Pattern: a non-throwing wrapper around each (ports, hbs) shape that runs
+// validate_handler_arm_sets in a `try`/`catch` *statement* and returns the
+// "did a TypeMismatch fire?" boolean. We don't abstract the call through a
+// thunk argument — passing the call through a generic-typed closure trips
+// a codegen indirect-call ABI mismatch ([[nexus-pbt-codegen-gotcha-generic-args]]),
+// so each shape is open-coded.
+
+let perfect_raises_mismatch = fn () -> bool do
+  let ports = [make_port(name: "Twin", methods: ["first", "second"])]
+  let hbs = [make_binding(handler_name: "h", port_name: "Twin", arm_names: ["first", "second"])]
+  try
+    validate_handler_arm_sets(ports, hbs)
+    return false
+  catch e ->
+    match e do
+      | TypeMismatch(_) -> return true
+      | _ -> return false
+    end
+  end
+  return false
+end
+
+let extra_arm_raises_mismatch = fn () -> bool do
+  let ports = [make_port(name: "Greeter", methods: ["say"])]
+  let hbs = [make_binding(handler_name: "h", port_name: "Greeter", arm_names: ["say", "extra"])]
+  try
+    validate_handler_arm_sets(ports, hbs)
+    return false
+  catch e ->
+    match e do
+      | TypeMismatch(_) -> return true
+      | _ -> return false
+    end
+  end
+  return false
+end
+
+let missing_arm_raises_mismatch = fn () -> bool do
+  let ports = [make_port(name: "Twin", methods: ["first", "second"])]
+  let hbs = [make_binding(handler_name: "h", port_name: "Twin", arm_names: ["first"])]
+  try
+    validate_handler_arm_sets(ports, hbs)
+    return false
+  catch e ->
+    match e do
+      | TypeMismatch(_) -> return true
+      | _ -> return false
+    end
+  end
+  return false
+end
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+let test_perfect_match_accepted = fn () -> unit throws { Exn } do
+  test_assert.assert_true(
+    cond: !perfect_raises_mismatch(),
+    label: "perfect-match handler must NOT raise TypeMismatch"
+  )
+  return ()
+end
+
+let test_extra_arm_rejected = fn () -> unit throws { Exn } do
+  test_assert.assert_true(
+    cond: extra_arm_raises_mismatch(),
+    label: "extra-arm handler must raise TypeMismatch (T-Handler 1-1 correspondence)"
+  )
+  return ()
+end
+
+let test_missing_arm_rejected = fn () -> unit throws { Exn } do
+  test_assert.assert_true(
+    cond: missing_arm_raises_mismatch(),
+    label: "missing-arm handler must raise TypeMismatch (T-Handler 1-1 correspondence)"
+  )
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  test_perfect_match_accepted()
+  test_extra_arm_rejected()
+  test_missing_arm_rejected()
+  return ()
+end
