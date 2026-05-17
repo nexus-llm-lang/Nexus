@@ -287,14 +287,45 @@ if [ "$RUN_MODE" = "1" ]; then
   # Compile the input .nx to a temp wasm using the embedded compiler
   # payload, then exec wasmtime against the result with the user's args.
   # The `--` separator splits compile-time tokens from program argv.
+  #
+  # Sandbox flags (--seed, --frozen-clock, --max-time, --max-mem, --no-net,
+  # --no-fs, --no-clock, --no-rand, --tmp-fs) are intercepted here at the
+  # shell layer because WASI preview1 has no subprocess API, so the
+  # in-wasm driver can validate them (cap strip check raises SandboxRefusal)
+  # but must signal the sandbox params to us for wasmtime argv construction.
+  # Strategy: pass sandbox flags through to the compiler build phase as-is
+  # (it validates cap strip and exits 3 on violation), then use them here
+  # to build the wasmtime run argv.
   if [ "$#" -lt 1 ]; then
     echo "nexus run: missing input file" >&2
-    echo "  usage: nexus run FILE.nx [-- ARGS...]" >&2
+    echo "  usage: nexus run FILE.nx [sandbox-flags...] [-- ARGS...]" >&2
     exit 2
   fi
   RUN_INPUT=""
   RUN_PROG_ARGS=""
   HAVE_PROG_ARGS=0
+  # Sandbox state
+  SB_SEED=""
+  SB_FROZEN_CLOCK=""
+  SB_MAX_TIME=""
+  SB_MAX_MEM=""
+  SB_NO_NET=0
+  SB_NO_FS=0
+  SB_NO_CLOCK=0
+  SB_NO_RAND=0
+  SB_TMP_FS=""
+  # Compiler build pass-through flags (all sandbox flags go to the compiler
+  # for cap-strip validation; only then do we construct the run argv).
+  SB_COMPILE_FLAGS=""
+  _append_compile_flag() {
+    if [ -z "$SB_COMPILE_FLAGS" ]; then
+      SB_COMPILE_FLAGS=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+      SB_COMPILE_FLAGS="'$SB_COMPILE_FLAGS'"
+    else
+      esc=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+      SB_COMPILE_FLAGS="$SB_COMPILE_FLAGS '$esc'"
+    fi
+  }
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --)
@@ -313,6 +344,104 @@ if [ "$RUN_MODE" = "1" ]; then
           shift
         done
         ;;
+      --seed)
+        SB_SEED="${2:-}"
+        _append_compile_flag "--seed"
+        _append_compile_flag "${2:-}"
+        shift 2
+        ;;
+      --seed=*)
+        SB_SEED="${1#--seed=}"
+        _append_compile_flag "$1"
+        shift
+        ;;
+      --frozen-clock)
+        # --frozen-clock with no value means epoch=0
+        if [ "$#" -ge 2 ] && [ "${2#-}" = "${2}" ] && [ -n "${2:-}" ] && [ "${2:-}" != "--" ]; then
+          SB_FROZEN_CLOCK="$2"
+          _append_compile_flag "--frozen-clock"
+          _append_compile_flag "$2"
+          shift 2
+        else
+          SB_FROZEN_CLOCK="0"
+          _append_compile_flag "--frozen-clock"
+          _append_compile_flag "0"
+          shift
+        fi
+        ;;
+      --frozen-clock=*)
+        SB_FROZEN_CLOCK="${1#--frozen-clock=}"
+        _append_compile_flag "$1"
+        shift
+        ;;
+      --max-time)
+        SB_MAX_TIME="${2:-}"
+        _append_compile_flag "--max-time"
+        _append_compile_flag "${2:-}"
+        shift 2
+        ;;
+      --max-time=*)
+        SB_MAX_TIME="${1#--max-time=}"
+        _append_compile_flag "$1"
+        shift
+        ;;
+      --max-mem)
+        SB_MAX_MEM="${2:-}"
+        _append_compile_flag "--max-mem"
+        _append_compile_flag "${2:-}"
+        shift 2
+        ;;
+      --max-mem=*)
+        SB_MAX_MEM="${1#--max-mem=}"
+        _append_compile_flag "$1"
+        shift
+        ;;
+      --no-net)
+        SB_NO_NET=1
+        _append_compile_flag "--no-net"
+        shift
+        ;;
+      --no-fs)
+        SB_NO_FS=1
+        _append_compile_flag "--no-fs"
+        shift
+        ;;
+      --no-clock)
+        SB_NO_CLOCK=1
+        _append_compile_flag "--no-clock"
+        shift
+        ;;
+      --no-rand)
+        SB_NO_RAND=1
+        _append_compile_flag "--no-rand"
+        shift
+        ;;
+      --tmp-fs)
+        SB_TMP_FS="${2:-}"
+        _append_compile_flag "--tmp-fs"
+        _append_compile_flag "${2:-}"
+        shift 2
+        ;;
+      --tmp-fs=*)
+        SB_TMP_FS="${1#--tmp-fs=}"
+        _append_compile_flag "$1"
+        shift
+        ;;
+      --explain-capabilities|--format|--explain-capabilities-format)
+        # pass-through: value follows in next token
+        _append_compile_flag "$1"
+        _append_compile_flag "${2:-}"
+        shift 2
+        ;;
+      --verbose)
+        _append_compile_flag "--verbose"
+        shift
+        ;;
+      -*)
+        # Unknown flag: pass through to compile phase for argparse error
+        _append_compile_flag "$1"
+        shift
+        ;;
       *)
         if [ -z "$RUN_INPUT" ]; then
           RUN_INPUT="$1"
@@ -327,7 +456,7 @@ if [ "$RUN_MODE" = "1" ]; then
   done
   if [ -z "$RUN_INPUT" ]; then
     echo "nexus run: missing input file" >&2
-    echo "  usage: nexus run FILE.nx [-- ARGS...]" >&2
+    echo "  usage: nexus run FILE.nx [sandbox-flags...] [-- ARGS...]" >&2
     exit 2
   fi
 
@@ -339,44 +468,99 @@ if [ "$RUN_MODE" = "1" ]; then
   }
   trap cleanup_run EXIT INT TERM HUP
 
-  # Compile via the compiler payload. Stash both streams of compile output so
-  # the program's own stdio is the only thing the user sees on success; on
-  # failure replay the captured stderr (where the compiler writes its
-  # diagnostics).
+  # Compile via the compiler payload. Pass sandbox flags so the in-wasm
+  # driver can validate cap strips (raises SandboxRefusal → exit 3).
+  # Stash both streams of compile output so the program's own stdio is
+  # the only thing the user sees on success; on failure replay stderr.
   COMPILE_ELOG=$(mktemp "${TMPDIR:-/tmp}/nexus-run-compile.XXXXXX.log")
-  # shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS is intentionally word-split.
-  if ! wasmtime run \
-      -W "$W_FLAGS" -S threads \
-      --dir=. --dir="${TMPDIR:-/tmp}" \
-      ${NEXUS_WASMTIME_ARGS:-} \
-      "$TMP" build "$RUN_INPUT" -o "$RUN_WASM" --explain-capabilities none \
+  # shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS + SB_COMPILE_FLAGS intentionally word-split.
+  if ! eval wasmtime run \
+      -W \"\$W_FLAGS\" -S threads \
+      --dir=. --dir=\"\${TMPDIR:-/tmp}\" \
+      \${NEXUS_WASMTIME_ARGS:-} \
+      \"\$TMP\" build \"\$RUN_INPUT\" -o \"\$RUN_WASM\" --explain-capabilities none \
+      ${SB_COMPILE_FLAGS:-} \
       >/dev/null 2>"$COMPILE_ELOG"; then
+    compile_exit=$?
     cat "$COMPILE_ELOG" >&2
     rm -f "$COMPILE_ELOG"
-    exit 1
+    exit $compile_exit
   fi
   rm -f "$COMPILE_ELOG"
 
-  # Run-phase: same flag set as the compiler payload. The cap-derived
-  # `--wasi inherit-network` is omitted because we'd need to parse the
-  # program's `require` row; wasmtime treats missing `--dir`/`--wasi`
-  # as deny-by-default, so over-granting `--dir=.` matches what
-  # `./nexus` already exposes to the compiler payload itself.
+  # Build the run-phase wasmtime argv with sandbox constraints applied.
+  # Cap-derived flags (--dir=., --wasi inherit-network) are suppressed
+  # for stripped caps; sandbox extra flags (--env NEXUS_SEED=N etc.) are
+  # appended.
+  RUN_SB_FLAGS=""
+  _append_run_flag() {
+    if [ -z "$RUN_SB_FLAGS" ]; then
+      esc=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+      RUN_SB_FLAGS="'$esc'"
+    else
+      esc=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+      RUN_SB_FLAGS="$RUN_SB_FLAGS '$esc'"
+    fi
+  }
+  # --max-mem MB → -W max-size=<MB>000000
+  if [ -n "$SB_MAX_MEM" ]; then
+    _append_run_flag "-W"
+    _append_run_flag "max-size=${SB_MAX_MEM}000000"
+  fi
+  # --max-time MS → epoch-interruption + --wasm-timeout <ms>ms
+  if [ -n "$SB_MAX_TIME" ]; then
+    _append_run_flag "-W"
+    _append_run_flag "epoch-interruption=y"
+    _append_run_flag "--wasm-timeout"
+    _append_run_flag "${SB_MAX_TIME}ms"
+  fi
+  # --seed N → NEXUS_SEED env var
+  if [ -n "$SB_SEED" ]; then
+    _append_run_flag "--env"
+    _append_run_flag "NEXUS_SEED=${SB_SEED}"
+  fi
+  # --frozen-clock EPOCH → NEXUS_FROZEN_CLOCK env var
+  if [ -n "$SB_FROZEN_CLOCK" ]; then
+    _append_run_flag "--env"
+    _append_run_flag "NEXUS_FROZEN_CLOCK=${SB_FROZEN_CLOCK}"
+  fi
+  # Filesystem: --tmp-fs overrides default --dir=.; --no-fs suppresses it
+  if [ "$SB_NO_FS" = "0" ]; then
+    if [ -n "$SB_TMP_FS" ]; then
+      # Rebind: --dir <scratch>::.  maps scratch dir as the virtual '.'
+      _append_run_flag "--dir"
+      _append_run_flag "${SB_TMP_FS}::."
+    else
+      _append_run_flag "--dir"
+      _append_run_flag "."
+    fi
+  fi
+  # Network: --no-net suppresses --wasi inherit-network
+  if [ "$SB_NO_NET" = "0" ]; then
+    _append_run_flag "--wasi"
+    _append_run_flag "inherit-network"
+  fi
+  # --dir for tmp always granted (programs need /tmp)
+  _append_run_flag "--dir"
+  _append_run_flag "${TMPDIR:-/tmp}"
+
+  # Run-phase exec.
+  # shellcheck disable=SC2086
   if [ "$HAVE_PROG_ARGS" = "1" ]; then
-    # shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS + RUN_PROG_ARGS both word-split.
     eval exec wasmtime run \
       -W \"\$W_FLAGS\" \
       -S threads \
-      --dir=. --dir=\"\${TMPDIR:-/tmp}\" \
+      ${RUN_SB_FLAGS:-} \
       \${NEXUS_WASMTIME_ARGS:-} \
       \"\$RUN_WASM\" "$RUN_PROG_ARGS"
   else
-    # shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS is intentionally word-split.
-    exec wasmtime run \
-      -W "$W_FLAGS" -S threads \
-      --dir=. --dir="${TMPDIR:-/tmp}" \
-      ${NEXUS_WASMTIME_ARGS:-} \
-      "$RUN_WASM"
+    # shellcheck disable=SC2086
+    eval exec wasmtime run \
+      -W \"\$W_FLAGS\" \
+      -S threads \
+      ${RUN_SB_FLAGS:-} \
+      \${NEXUS_WASMTIME_ARGS:-} \
+      \"\$RUN_WASM\"
   fi
 fi
 

@@ -1,0 +1,198 @@
+// Issue nexus-qny9 — sandbox runner flags for `nexus run`.
+//
+// Tests the argv-building and cap-strip validation logic without
+// requiring a live wasmtime invocation (Proc.exec is unavailable under
+// WASI preview1). Specifically:
+//
+//   1. build_wasmtime_run_argv_sandbox produces expected wasmtime flags
+//      for --max-mem and --max-time.
+//   2. --seed N → --env NEXUS_SEED=N appears in argv.
+//   3. --frozen-clock EPOCH → --env NEXUS_FROZEN_CLOCK=EPOCH in argv.
+//   4. --tmp-fs DIR → --dir DIR::. appears; --dir . is suppressed.
+//   5. --no-net suppresses --wasi inherit-network; --no-fs suppresses --dir ..
+//   6. first_stripped_cap returns a message when a required cap is stripped.
+//   7. first_stripped_cap returns None when no caps are stripped.
+
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import { Option, Some, None } from "std:option"
+import { SandboxOpts, build_wasmtime_run_argv_sandbox, first_stripped_cap } from "src/cli/format.nx"
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+let list_has = fn (xs: [string], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == s then return true end
+      return list_has(xs: rest, s)
+  end
+end
+
+let list_has_pair = fn (xs: [string], a: string, b: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: y :: rest ->
+      if x == a && y == b then return true end
+      return list_has_pair(xs: y :: rest, a, b)
+    | _ :: [] -> return false
+  end
+end
+
+let no_sandbox = fn () -> SandboxOpts do
+  return SandboxOpts(
+    seed: None, frozen_clock: None, max_time: None, max_mem: None,
+    no_net: false, no_fs: false, no_clock: false, no_rand: false, tmp_fs: None
+  )
+end
+
+// ─── Test cases ─────────────────────────────────────────────────────────────
+
+let test_max_mem_flag = fn () -> unit throws { Exn } do
+  let sb = SandboxOpts(
+    seed: None, frozen_clock: None, max_time: None, max_mem: Some(val: "64"),
+    no_net: false, no_fs: false, no_clock: false, no_rand: false, tmp_fs: None
+  )
+  let argv = build_wasmtime_run_argv_sandbox(wasm_path: "test.wasm", caps: [], user_args: [], sb)
+  test_assert.assert(cond: list_has_pair(xs: argv, a: "-W", b: "max-size=64000000"),
+    label: "qny9: --max-mem 64 produces -W max-size=64000000")
+  return ()
+end
+
+let test_max_time_flag = fn () -> unit throws { Exn } do
+  let sb = SandboxOpts(
+    seed: None, frozen_clock: None, max_time: Some(val: "5000"), max_mem: None,
+    no_net: false, no_fs: false, no_clock: false, no_rand: false, tmp_fs: None
+  )
+  let argv = build_wasmtime_run_argv_sandbox(wasm_path: "test.wasm", caps: [], user_args: [], sb)
+  test_assert.assert(cond: list_has_pair(xs: argv, a: "-W", b: "epoch-interruption=y"),
+    label: "qny9: --max-time produces -W epoch-interruption=y")
+  test_assert.assert(cond: list_has_pair(xs: argv, a: "--wasm-timeout", b: "5000ms"),
+    label: "qny9: --max-time 5000 produces --wasm-timeout 5000ms")
+  return ()
+end
+
+let test_seed_env = fn () -> unit throws { Exn } do
+  let sb = SandboxOpts(
+    seed: Some(val: "42"), frozen_clock: None, max_time: None, max_mem: None,
+    no_net: false, no_fs: false, no_clock: false, no_rand: false, tmp_fs: None
+  )
+  let argv = build_wasmtime_run_argv_sandbox(wasm_path: "test.wasm", caps: [], user_args: [], sb)
+  test_assert.assert(cond: list_has_pair(xs: argv, a: "--env", b: "NEXUS_SEED=42"),
+    label: "qny9: --seed 42 produces --env NEXUS_SEED=42")
+  return ()
+end
+
+let test_frozen_clock_env = fn () -> unit throws { Exn } do
+  let sb = SandboxOpts(
+    seed: None, frozen_clock: Some(val: "1700000000"), max_time: None, max_mem: None,
+    no_net: false, no_fs: false, no_clock: false, no_rand: false, tmp_fs: None
+  )
+  let argv = build_wasmtime_run_argv_sandbox(wasm_path: "test.wasm", caps: [], user_args: [], sb)
+  test_assert.assert(cond: list_has_pair(xs: argv, a: "--env", b: "NEXUS_FROZEN_CLOCK=1700000000"),
+    label: "qny9: --frozen-clock 1700000000 produces --env NEXUS_FROZEN_CLOCK=1700000000")
+  return ()
+end
+
+let test_tmp_fs_flag = fn () -> unit throws { Exn } do
+  let sb = SandboxOpts(
+    seed: None, frozen_clock: None, max_time: None, max_mem: None,
+    no_net: false, no_fs: false, no_clock: false, no_rand: false, tmp_fs: Some(val: "/scratch")
+  )
+  let argv = build_wasmtime_run_argv_sandbox(wasm_path: "test.wasm", caps: ["Fs"], user_args: [], sb)
+  // --tmp-fs replaces the default --dir=. with --dir /scratch::.
+  test_assert.assert(cond: list_has_pair(xs: argv, a: "--dir", b: "/scratch::."),
+    label: "qny9: --tmp-fs /scratch produces --dir /scratch::.")
+  // The bare --dir . should NOT be present (tmp-fs replaces it)
+  test_assert.assert(cond: !list_has_pair(xs: argv, a: "--dir", b: "."),
+    label: "qny9: --tmp-fs suppresses default --dir .")
+  return ()
+end
+
+let test_no_net_suppresses_network = fn () -> unit throws { Exn } do
+  let sb = SandboxOpts(
+    seed: None, frozen_clock: None, max_time: None, max_mem: None,
+    no_net: true, no_fs: false, no_clock: false, no_rand: false, tmp_fs: None
+  )
+  let argv = build_wasmtime_run_argv_sandbox(wasm_path: "test.wasm", caps: ["Net"], user_args: [], sb)
+  // --no-net means we must NOT see --wasi inherit-network
+  test_assert.assert(cond: !list_has_pair(xs: argv, a: "--wasi", b: "inherit-network"),
+    label: "qny9: --no-net suppresses --wasi inherit-network")
+  return ()
+end
+
+let test_no_fs_suppresses_dir = fn () -> unit throws { Exn } do
+  let sb = SandboxOpts(
+    seed: None, frozen_clock: None, max_time: None, max_mem: None,
+    no_net: false, no_fs: true, no_clock: false, no_rand: false, tmp_fs: None
+  )
+  let argv = build_wasmtime_run_argv_sandbox(wasm_path: "test.wasm", caps: ["Fs"], user_args: [], sb)
+  // --no-fs means we must NOT see --dir .
+  test_assert.assert(cond: !list_has_pair(xs: argv, a: "--dir", b: "."),
+    label: "qny9: --no-fs suppresses --dir .")
+  return ()
+end
+
+let test_cap_strip_violation_detected = fn () -> unit throws { Exn } do
+  let sb = SandboxOpts(
+    seed: None, frozen_clock: None, max_time: None, max_mem: None,
+    no_net: true, no_fs: false, no_clock: false, no_rand: false, tmp_fs: None
+  )
+  // Program requires Net but --no-net is set
+  let result = first_stripped_cap(caps: ["Net"], sb)
+  match result do
+    | None ->
+      test_assert.assert(cond: false, label: "qny9: expected SandboxRefusal for stripped Net cap")
+    | Some(val: msg) ->
+      test_assert.assert(cond: str.contains(s: msg, sub: "Net"),
+        label: "qny9: refusal message mentions the stripped cap name")
+      test_assert.assert(cond: str.contains(s: msg, sub: "--no-net"),
+        label: "qny9: refusal message mentions the flag")
+      test_assert.assert(cond: str.contains(s: msg, sub: "E4010"),
+        label: "qny9: refusal message carries E4010 code")
+  end
+  return ()
+end
+
+let test_cap_strip_no_violation = fn () -> unit throws { Exn } do
+  let sb = no_sandbox()
+  // No strip flags set: no caps are stripped
+  let result = first_stripped_cap(caps: ["Net", "Fs", "Random", "Clock"], sb)
+  match result do
+    | None -> return ()
+    | Some(val: _) ->
+      test_assert.assert(cond: false, label: "qny9: no violation expected when no strip flags set")
+  end
+  return ()
+end
+
+// ─── Runner ─────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit throws { Exn } do
+  test_max_mem_flag()
+  test_max_time_flag()
+  test_seed_env()
+  test_frozen_clock_env()
+  test_tmp_fs_flag()
+  test_no_net_suppresses_network()
+  test_no_fs_suppresses_dir()
+  test_cap_strip_violation_detected()
+  test_cap_strip_no_violation()
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end
