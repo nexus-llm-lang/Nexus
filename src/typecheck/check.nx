@@ -10,7 +10,7 @@ import * as naming from "src/common/naming.nx"
 import { TypeExpr, TyUnit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyHandler, NamedType, EnumDef, RecordDef, VariantDef, VariantField } from "src/common/ast.nx"
 import { HirProgram, HirFunction, HirHandlerArm, HirParam, HirExternal, HirPort, HirPortMethod, HirHandlerBindingEntry, HirHandlerBinding, EagerBody, LazyBody } from "src/ir/hir/types.nx"
 import { Span } from "src/common/token.nx"
-import { TypeError, TypeMismatch, MissingMain, MainNotFunction, MainNotUnit, MainThrowsTooBroad, DuplicateTopLevelBinding } from "src/common/error.nx"
+import { TypeError, TypeMismatch, MissingMain, MainNotFunction, MainNotUnit, MainThrowsTooBroad, DuplicateTopLevelBinding, UnusedTypeParam, KindClashTypeParam } from "src/common/error.nx"
 import { CheckState, Scheme, EnvEntry, EnumEntry, TypeDefEntry, InferExprOk, InferExprErr }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
 import * as infer from "src/typecheck/infer.nx"
@@ -208,11 +208,19 @@ end
 
 // ─── Register externals ────────────────────────────────────────────────────
 
-let register_externals = fn (state: CheckState, exts: [HirExternal]) -> CheckState do
+let register_externals = fn (state: CheckState, exts: [HirExternal]) -> CheckState throws { TypeError } do
   match exts do
     | [] -> return state
     | HirExternal(name: n, wasm_module: _, wasm_name: _, type_params: tps, params, ret_type: ret, throw_row: thr) :: rest ->
       let param_types = hir_params_to_named_types(params)
+      // nexus-t9cl.21 / .22: kindOf binding-site enforcement (spec L548–L571).
+      // Externals carry no Span, so we attribute the diagnostic to the
+      // externals header (Span(0,0,0)) — the func_name plus the type-param
+      // name in the message is enough to locate the malformed declaration.
+      // The σ pieces for an external arrow are exactly (params, ret, throws);
+      // there is no `requires` slot (always `{}` for FFI declarations).
+      let ext_parts = thr :: (ret :: named_type_typs(nts: param_types))
+      enforce_kindof_quantifiers(tps, parts: ext_parts, func_name: n, span: Span(offset: 0, line: 0, col: 0))
       // Convert TyUserDefined("T",[]) → TyVar("T") for declared type params,
       // then register as a polymorphic Scheme so each call site instantiates
       // T to a fresh metavar. Without this `external f: <T>(val: T) -> unit`
@@ -237,6 +245,202 @@ let str_list_contains = fn (xs: [string], s: string) -> bool do
     | x :: rest ->
       if x == s then return true end
       return str_list_contains(xs: rest, s)
+  end
+end
+
+// ─── kindOf binding-site enforcement (nexus-t9cl.21 / .22) ───────────────────
+//
+// Spec: type-system-formal.md §"Polymorphism Introduction"
+// (L548–L571). For each declared quantifier X in a top-level
+// `fn <X1,...,Xn>(...)` signature, the spec defines
+//
+//   kindOf(X, σ) = { Type   if  occurs_τ(X, σ) ∧ ¬occurs_ρ(X, σ)
+//                  { Row    if  occurs_ρ(X, σ) ∧ ¬occurs_τ(X, σ)
+//                  { undefined otherwise   ── unused (both false) OR clash (both true)
+//
+// and explicitly classifies the *undefined* cases as static errors raised
+// at the binding site (T-Let-PolyFn), surfacing as "malformed quantifier
+// list" rather than as a downstream unification failure at a use site.
+//
+// The two recursive predicates below mirror L556–L568 of the spec.
+// `occurs_tau` covers every place a τ is expected (incl. row entries);
+// `occurs_rho` surfaces *only* row-tail occurrences of X. The driver is
+// `enforce_kindof_quantifiers`, which folds over the declared `tps` and
+// raises `UnusedTypeParam` / `KindClashTypeParam` for the malformed ones.
+//
+// Both predicates accept arbitrary signature TypeExprs (pre-conversion —
+// quantifier names show up as `TyUserDefined(X, [])` at this point, not
+// `TyVar(X)`, because `convert_ud_to_var` has not yet run).
+
+let occurs_tau = fn (x: string, typ: TypeExpr) -> bool do
+  match typ do
+    // L557: occurs_τ(X, X) = true. At binding-site time the quantifier
+    // still appears under its surface name `TyUserDefined(X, [])`.
+    | TyUserDefined(name: n, args: []) ->
+      return n == x
+    // L564 (right disjunct): occurs_τ(X, x<τ̄>) = ∃i. occurs_τ(X, τᵢ).
+    // Generic type applications recurse into their argument list.
+    | TyUserDefined(name: _, args: targs) ->
+      return occurs_tau_in_list(x, types: targs)
+    // L560-L561: occurs_τ(X, (ℓ̄:τ̄) → τr ; ρq ; ρe) recurses into every
+    // parameter type, the return, and (via occurs_τ^ρ) into the row
+    // entries of both requires and throws.
+    | TyArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
+      if occurs_tau_in_named(x, nts: ps) then return true end
+      if occurs_tau(x, typ: r) then return true end
+      if occurs_tau(x, typ: req) then return true end
+      return occurs_tau(x, typ: thr)
+    // L562: occurs_τ(X, %τ) = occurs_τ(X, @τ) = occurs_τ(X, &τ) = occurs_τ(X, τ).
+    // We have an extra TyRef constructor — same recursive rule applies.
+    | TyList(elem: e) -> return occurs_tau(x, typ: e)
+    | TyArray(elem: e) -> return occurs_tau(x, typ: e)
+    | TyRef(inner: i) -> return occurs_tau(x, typ: i)
+    | TyLinear(inner: i) -> return occurs_tau(x, typ: i)
+    | TyLazy(inner: i) -> return occurs_tau(x, typ: i)
+    | TyBorrow(inner: i) -> return occurs_tau(x, typ: i)
+    // L564 (left disjunct): occurs_τ(X, {ℓ̄:τ̄}) = ∃i. occurs_τ(X, τᵢ).
+    | TyRecord(fields: fs) -> return occurs_tau_in_named(x, nts: fs)
+    // L565-L566: occurs_τ^ρ({τ̄}) and occurs_τ^ρ({τ̄ | Y}) both look at
+    // the row entries via occurs_τ. The rest tail is handled separately
+    // by `occurs_rho`, not here — so we do NOT recurse into `rest`.
+    | TyRow(types: ts, rest: _) -> return occurs_tau_in_list(x, types: ts)
+    // TyHandler's `requires` field is a row; recurse via occurs_τ.
+    | TyHandler(name: _, requires: req) -> return occurs_tau(x, typ: req)
+    // L558-L559: base types and unrelated names contribute nothing.
+    | _ -> return false
+  end
+end
+
+let occurs_tau_in_list = fn (x: string, types: [TypeExpr]) -> bool do
+  match types do
+    | [] -> return false
+    | t :: rest ->
+      if occurs_tau(x, typ: t) then return true end
+      return occurs_tau_in_list(x, types: rest)
+  end
+end
+
+let occurs_tau_in_named = fn (x: string, nts: [NamedType]) -> bool do
+  match nts do
+    | [] -> return false
+    | NamedType(name: _, typ: t) :: rest ->
+      if occurs_tau(x, typ: t) then return true end
+      return occurs_tau_in_named(x, nts: rest)
+  end
+end
+
+// L567-L568: occurs_ρ surfaces only row-tail occurrences of X. We recurse
+// through every type-bearing constructor that might *contain* a row, and
+// inspect the row's `rest` slot for a TyUserDefined(X, []) tail.
+let occurs_rho = fn (x: string, typ: TypeExpr) -> bool do
+  match typ do
+    // Arrow: recurse into params (their types may contain inner rows),
+    // return, and most importantly the two row positions (requires/throws).
+    | TyArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
+      if occurs_rho_in_named(x, nts: ps) then return true end
+      if occurs_rho(x, typ: r) then return true end
+      if occurs_rho(x, typ: req) then return true end
+      return occurs_rho(x, typ: thr)
+    | TyList(elem: e) -> return occurs_rho(x, typ: e)
+    | TyArray(elem: e) -> return occurs_rho(x, typ: e)
+    | TyRef(inner: i) -> return occurs_rho(x, typ: i)
+    | TyLinear(inner: i) -> return occurs_rho(x, typ: i)
+    | TyLazy(inner: i) -> return occurs_rho(x, typ: i)
+    | TyBorrow(inner: i) -> return occurs_rho(x, typ: i)
+    | TyRecord(fields: fs) -> return occurs_rho_in_named(x, nts: fs)
+    // The load-bearing case: a row {τ̄ | X} matches L567 — `rest` is
+    // `Some(TyUserDefined(X, []))`. We also recurse into the row's
+    // entries because each entry is itself a TypeExpr that may transport
+    // a nested row (e.g. a closure-typed capability whose own throws-row
+    // mentions X as a tail).
+    | TyRow(types: ts, rest: r) ->
+      if occurs_rho_in_list(x, types: ts) then return true end
+      match r do
+        | Some(val: t) ->
+          match t do
+            | TyUserDefined(name: n, args: []) -> return n == x
+            | _ -> return occurs_rho(x, typ: t)
+          end
+        | None -> return false
+      end
+    | TyHandler(name: _, requires: req) -> return occurs_rho(x, typ: req)
+    // A TyUserDefined<...> can contain nested rows in its type arguments
+    // (e.g. `Option<() -> unit require { Foo | X }>`). Recurse so the
+    // tail is still discovered.
+    | TyUserDefined(name: _, args: targs) -> return occurs_rho_in_list(x, types: targs)
+    // Base types, plain TyVar, etc.: no row tail possible.
+    | _ -> return false
+  end
+end
+
+let occurs_rho_in_list = fn (x: string, types: [TypeExpr]) -> bool do
+  match types do
+    | [] -> return false
+    | t :: rest ->
+      if occurs_rho(x, typ: t) then return true end
+      return occurs_rho_in_list(x, types: rest)
+  end
+end
+
+let occurs_rho_in_named = fn (x: string, nts: [NamedType]) -> bool do
+  match nts do
+    | [] -> return false
+    | NamedType(name: _, typ: t) :: rest ->
+      if occurs_rho(x, typ: t) then return true end
+      return occurs_rho_in_named(x, nts: rest)
+  end
+end
+
+// Spec L548–L552 enforcement. Walks every declared quantifier X in `tps`
+// and inspects the (still-pre-conversion) signature pieces. Raises
+// `UnusedTypeParam` (kindOf=undefined, unused case) or `KindClashTypeParam`
+// (kindOf=undefined, clash case) at the function's binding site span.
+//
+// `signature_parts` is the list of TypeExprs that together form σ —
+// callers pass the params (as their NamedType list — folded into a
+// TyRecord for uniform recursion), the return type, and the throws row.
+// The requires row is part of TyArrow for top-level functions but lives
+// implicitly in `TyRow(types: [], rest: None)` for externals, so callers
+// pass exactly the σ pieces that exist for their declaration form.
+let enforce_kindof_quantifiers = fn (tps: [string], parts: [TypeExpr], func_name: string, span: Span) -> unit throws { TypeError } do
+  match tps do
+    | [] -> return ()
+    | x :: rest ->
+      let in_tau = occurs_tau_in_list(x, types: parts)
+      let in_rho = occurs_rho_in_list(x, types: parts)
+      // Unused case (spec L551, "otherwise / unused"): X appears nowhere
+      // in σ. Diagnostic must surface at the binding site, NOT silently
+      // pass.
+      if !in_tau then
+        if !in_rho then
+          raise UnusedTypeParam(name: x, func_name, span)
+        end
+      end
+      // Clash case (spec L551, "otherwise / kind clash"): X is used at
+      // BOTH a type position and a row tail. The unifier would otherwise
+      // pick one kind and report a confusing downstream mismatch at the
+      // first use site that disagrees. We reject upfront at the binding.
+      if in_tau then
+        if in_rho then
+          raise KindClashTypeParam(name: x, func_name, span)
+        end
+      end
+      return enforce_kindof_quantifiers(tps: rest, parts, func_name, span)
+  end
+end
+
+// Convert the function's param list (NamedType, where `typ` is what
+// matters for kindOf — the parameter *name* never contributes) into a
+// flat list of TypeExprs for `enforce_kindof_quantifiers`.
+let named_type_typs = fn (nts: [NamedType]) -> [TypeExpr] do
+  return named_type_typs_go(nts, acc: [])
+end
+
+let named_type_typs_go = fn (nts: [NamedType], acc: [TypeExpr]) -> [TypeExpr] do
+  match nts do
+    | [] -> return rev_type_exprs(lst: acc, out: [])
+    | NamedType(name: _, typ: t) :: rest ->
+      return named_type_typs_go(nts: rest, acc: t :: acc)
   end
 end
 
@@ -327,6 +531,14 @@ let register_functions_go = fn (state: CheckState, funcs: [HirFunction], seen: [
         raise DuplicateTopLevelBinding(name: n, span: sp)
       end
       let param_types = hir_params_to_named_types(params)
+      // nexus-t9cl.21 / .22: kindOf binding-site enforcement
+      // (spec L548–L571). σ for a top-level fn is its parameter types,
+      // return type, and throws-row. The `requires` slot is always `{}`
+      // here (HirFunction does not surface a separate requires; row
+      // capability requirements live inside higher-order param signatures
+      // and are already covered by recursion into `param_types`).
+      let parts = tw :: (ret :: named_type_typs(nts: param_types))
+      enforce_kindof_quantifiers(tps, parts, func_name: n, span: sp)
       let arrow = TyArrow(
         params: convert_named_types(nts: param_types, vars: tps),
         ret: convert_ud_to_var(typ: ret, vars: tps),
