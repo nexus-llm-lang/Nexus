@@ -1,0 +1,162 @@
+/**
+ * pipeline: Shared HIR-build utilities used by the driver and dump subcommands.
+ *
+ * Covers: build_hir (parse → import-resolution → HIR), helper types
+ * HirBuildResult / CapsWriteResult, emit helpers (write_and_free /
+ * write_emit), and small utilities (str_nth, resolve_output_path).
+ */
+
+import * as lexer from "src/frontend/lexer.nx"
+import { ParseDiagnostics }, * as parser from "src/frontend/parser.nx"
+import { Program, SpannedTopLevel, EnumDef, RecordDef, GlobalLet } from "src/common/ast.nx"
+import { HirError } from "src/common/error.nx"
+import { RenameEntry }, * as symtab from "src/ir/symtab.nx"
+import * as resolve from "src/ir/resolve.nx"
+import { CacheEntry, ImportResult, get_defs, process_imports, append_entries } from "src/ir/imports.nx"
+import { HirProgram } from "src/ir/hir/types.nx"
+import * as hir from "src/ir/hir/hir.nx"
+import * as rdr from "src/ir/rdrname.nx"
+import * as bb from "std:bytebuffer"
+import { ManifestMode, KeepManifest, StripManifest }, * as polyglot from "src/backend/polyglot.nx"
+import { Fs }, * as fs_mod from "std:fs"
+import { Console }, * as stdio from "std:stdio"
+import * as str from "std:str"
+import * as list from "std:list"
+import { IndexOutOfBounds }, * as lst from "std:list"
+import { Option, Some, None } from "std:option"
+
+export type HirBuildResult = HirBuildResult(program: HirProgram, import_cache: [CacheEntry])
+
+// Bundled result of the capability extraction + wasm write phase. The
+// non-polyglot branch runs them in parallel via `std:lazy_host`; both
+// branches funnel through this record so the surrounding driver code
+// reads `caps` / `ok` uniformly.
+export type CapsWriteResult = CapsWriteResult(caps: [string], ok: bool)
+
+export let list_has_str = fn (xs: [string], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == s then return true end
+      return list_has_str(xs: rest, s)
+  end
+end
+
+/** Extract canonical names of all top-level lets in `defs` so they match
+ *  the names assigned by `process_top_level` in src/ir/hir/hir.nx (which runs
+ *  `symtab.rename(name, entries)` against the same rename table built in
+ *  `build_entry_self_entries`). The entry file's `main` keeps its bare
+ *  name; every other top-level let canonicalises to "<sanitized-path>#name"
+ *  per `rdr.canonical_name`. Building the typecheck allow-list with bare
+ *  names (the previous behaviour) silently skipped every non-main top-level
+ *  function body because `is_local` only matches by string equality
+ *  (issue nexus-rfh1).
+ */
+export let extract_function_names = fn (defs: [SpannedTopLevel], source: string) -> [string] do
+  match defs do
+    | [] -> return []
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value: _)), span: _) :: rest ->
+      let qname = if name == "main" then "main" else canonical_name_string(source, name) end
+      return qname :: extract_function_names(defs: rest, source)
+    | _ :: rest -> return extract_function_names(defs: rest, source)
+  end
+end
+
+export let get_enum_defs = fn (hir: HirProgram) -> [EnumDef] do
+  match hir do | HirProgram(ports: _, functions: _, externals: _, handler_bindings: _, enum_defs: eds, _) -> eds end
+end
+
+export let get_type_defs = fn (hir: HirProgram) -> [RecordDef] do
+  match hir do | HirProgram(ports: _, functions: _, externals: _, handler_bindings: _, enum_defs: _, exception_groups: _, value_binding_names: _, type_defs: tds) -> tds end
+end
+
+/** Add rename entries for the entry file's own top-level defs so that local
+ *  calls (foo(), Console.println(...)) rename to canonical targets.
+ *  The entry file's `main` function keeps its bare name so wasm export "main" works.
+ */
+export let build_entry_self_entries = fn (defs: [SpannedTopLevel], source: string, acc: [RenameEntry]) -> [RenameEntry] do
+  match defs do
+    | [] -> return acc
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ: _, value: _)), span: _) :: rest ->
+      if name == "main" then
+        let acc2 = symtab.rename_add(entries: acc, original: name, qualified: "main")
+        return build_entry_self_entries(defs: rest, source, acc: acc2)
+      end
+      let acc2 = symtab.rename_add(entries: acc, original: name, qualified: canonical_name_string(source, name))
+      return build_entry_self_entries(defs: rest, source, acc: acc2)
+    | SpannedTopLevel(node: TLCap(def: Cap(name, is_public: _, functions: _)), span: _) :: rest ->
+      let acc2 = symtab.rename_add(entries: acc, original: name, qualified: canonical_name_string(source, name))
+      return build_entry_self_entries(defs: rest, source, acc: acc2)
+    | _ :: rest -> return build_entry_self_entries(defs: rest, source, acc)
+  end
+end
+
+export let canonical_name_string = fn (source: string, name: string) -> string do
+  return rdr.canonical_name(source_path: source, name)
+end
+
+export let build_hir = fn (prog: Program, source_file: string, verbose: bool) -> HirBuildResult require { Console, Fs } throws { HirError } do
+  let defs = get_defs(prog)
+  let imports = resolve.extract_imports(defs)
+  let result = process_imports(imports, accum: hir.empty_accum(), import_stack: [], visited: [], cache: [], caller_entries: [], depth: 1, verbose)
+  match result do | ImportResult(accum, visited: _, cache: import_cache, caller_entries) ->
+    let self_entries = build_entry_self_entries(defs, source: source_file, acc: [])
+    let entries = append_entries(xs: self_entries, ys: caller_entries)
+    let accum2 = hir.process_defs(defs, entries, accum, source_file)
+    return HirBuildResult(program: hir.accum_to_program(accum: accum2), import_cache)
+  end
+end
+
+export let str_nth = fn (xs: [string], n: i64) -> string throws { IndexOutOfBounds } do
+  match xs do
+    | [] -> raise IndexOutOfBounds(op: "str_nth", index: n)
+    | v :: rest ->
+      if n == 0 then return v end
+      return str_nth(xs: rest, n: n - 1)
+  end
+end
+
+/** Resolve the output path: prefer `-o`/`--output` value, otherwise fall back to
+ *  the positional `[output]` arg or the default `main.wasm`.
+ */
+export let resolve_output_path = fn (opt_output: Option<string>, xs: [string], argc: i64) -> string throws { IndexOutOfBounds } do
+  match opt_output do
+    | Some(val: o) -> return o
+    | None ->
+      if argc >= 3 then return str_nth(xs, n: 2) end
+      return "out.wasm"
+  end
+end
+
+export let write_and_free = fn (buf: %ByteBuffer, path: string) -> bool do
+  let ok = bb.write_file(&buf, path)
+  bb.free(%buf)
+  return ok
+end
+
+/** Emit either the raw merged wasm or, when `output` is `PolyglotLauncher`,
+ *  the self-extracting launcher. Both paths consume `wasm_buf` and free it;
+ *  the boolean return matches `write_and_free`.
+ */
+export let write_emit = fn (wasm_buf: %ByteBuffer, output_path: string, caps: [string], output: OutputMode, manifest: ManifestMode, verbose: bool) -> bool require { Console } do
+  let polyglot_mode = if let PolyglotLauncher = output then true else false end
+  if polyglot_mode then
+    let payload_size = bb.length(buf: &wasm_buf)
+    let %launcher = polyglot.pack_polyglot(wasm: &wasm_buf, caps, manifest)
+    bb.free(buf: %wasm_buf)
+    if verbose then
+      let header_n = polyglot.header_size(caps, manifest, payload_size)
+      let total_n = bb.length(buf: &launcher)
+      Console.eprintln(val: "[nexus] polyglot launcher = header(" ++ str.from_i64(val: header_n)
+        ++ ") + payload(" ++ str.from_i64(val: payload_size)
+        ++ ") = total(" ++ str.from_i64(val: total_n) ++ ")")
+    end
+    return write_and_free(buf: %launcher, path: output_path)
+  end
+  return write_and_free(buf: %wasm_buf, path: output_path)
+end
+
+/** Build emit selector. `BareBinary` writes the raw merged wasm;
+ *  `PolyglotLauncher` wraps it in the self-extracting POSIX-sh launcher.
+ */
+export type OutputMode = BareBinary | PolyglotLauncher
