@@ -314,7 +314,15 @@ let check_call_args = fn (
     | ArgLabelErr(message: m) -> return InferExprErr(message: m, span)
     | ArgLabelOk ->
       let ordered = reorder_args_by_params(args, params)
-      return check_call_args_walk(state, params, args: ordered, ret, subst, span)
+      // T-App B-set premise (spec §T-App): if any arg is Borrow(&x) and
+      // another arg is a consuming use of x (Variable(x), non-Borrow), then
+      // x is NOT in B — it must go through the ⊗-split path, and the &x
+      // falls through to T-Borrow → x:^ω check → reject. Pre-scan the
+      // ordered args before the walk to detect this violation early.
+      match check_bset_no_consume_borrow_conflict(args: ordered) do
+        | ArgLabelErr(message: m) -> return InferExprErr(message: m, span)
+        | ArgLabelOk -> return check_call_args_walk(state, params, args: ordered, ret, subst, span)
+      end
   end
 end
 
@@ -396,6 +404,59 @@ let find_arg_by_label = fn (args: [HirCallArg], label: string) -> Option<HirCall
       if l == label then return Some(val: HirCallArg(label: l, value: v)) end
       return find_arg_by_label(args: rest, label)
   end
+end
+
+// ─── B-set conflict check (T-App B-set premise, spec §T-App) ─────────────────
+
+// Collect the names of all Borrow(&x) arguments in the arg list.
+let collect_borrow_arg_names = fn (args: [HirCallArg], acc: [string]) -> [string] do
+  match args do
+    | [] -> return list.reverse(xs: acc)
+    | HirCallArg(label: _, value: HirExpr(node: Borrow(name: n, sigil: _), span: _)) :: rest ->
+      return collect_borrow_arg_names(args: rest, acc: n :: acc)
+    | _ :: rest ->
+      return collect_borrow_arg_names(args: rest, acc)
+  end
+end
+
+// Return true if `name` appears as a consuming (non-Borrow) use in any arg's
+// top-level node. We only need to check top-level Variable(name) nodes because
+// nested consuming uses (inside subexpressions) cannot be in the B-set anyway.
+let args_has_consuming_use_of = fn (args: [HirCallArg], name: string) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: _, value: HirExpr(node: val_node, span: _)) :: rest ->
+      let is_consuming = match val_node do
+        | Variable(name: vname, sigil: _) -> vname == name
+        | Borrow(name: _, sigil: _) -> false
+        | _ -> false
+      end
+      if is_consuming then return true end
+      return args_has_consuming_use_of(args: rest, name)
+  end
+end
+
+// Check that no Borrow(&x) arg appears alongside a consuming use of x.
+// Iterate over the borrow-name list and check each against the full arg list.
+let check_bset_names_no_conflict = fn (borrow_names: [string], all_args: [HirCallArg]) -> ArgLabelCheck do
+  match borrow_names do
+    | [] -> return ArgLabelOk
+    | n :: rest ->
+      if args_has_consuming_use_of(args: all_args, name: n) then
+        return ArgLabelErr(
+          message: "T-App B-set violation: linear '" ++ n
+            ++ "' is passed both as a consuming argument and as a borrow '&"
+            ++ n ++ "' in the same call — consuming use and borrow cannot coexist (spec §T-App)"
+        )
+      end
+      return check_bset_names_no_conflict(borrow_names: rest, all_args)
+  end
+end
+
+// Entry point: collect all Borrow-arg names then check for consuming conflicts.
+let check_bset_no_consume_borrow_conflict = fn (args: [HirCallArg]) -> ArgLabelCheck do
+  let borrow_names = collect_borrow_arg_names(args, acc: [])
+  return check_bset_names_no_conflict(borrow_names, all_args: args)
 end
 
 let check_call_args_walk = fn (
