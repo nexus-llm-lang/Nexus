@@ -712,6 +712,21 @@ let param_inner_is_auto_droppable = fn (params: [HirParam], name: string) -> boo
   end
 end
 
+/** Check that linear bindings introduced inside a divergent arm are consumed
+ *  before divergence.  `arm_out` is the LinState after walking the arm body;
+ *  `outer_vars` is the live-var set that existed BEFORE entering the arm (i.e.
+ *  `lin_state_vars(st)` at the point of entry).  Any variable that is in
+ *  `arm_out.vars` but was NOT in `outer_vars` was introduced inside the arm
+ *  scope and must be consumed — otherwise it silently leaks past a `return` /
+ *  `raise`. */
+let check_divergent_arm_unused = fn (
+  arm_out: LinState, outer_vars: [string], span: Span
+) -> unit throws { TypeError } do
+  let arm_vars = lin_state_vars(st: arm_out)
+  let inner_leaked = filter_not_in(xs: arm_vars, exclude: outer_vars, acc: [])
+  return require_empty_or_droppable(vars: inner_leaked, params: [], span)
+end
+
 // ─── Statement walk ──────────────────────────────────────────────────────────
 
 let check_stmts = fn (
@@ -847,6 +862,8 @@ let check_expr_kind = fn (
         | None ->
           if then_diverges then
             // Then-branch always exits; only the fall-through path matters.
+            // But first verify no inner-scope linears leaked past the divergence.
+            check_divergent_arm_unused(arm_out: st_then, outer_vars: lin_state_vars(st: st1), span)
             return st1
           end
           // Without an else, the linear set must be the same on both paths
@@ -861,10 +878,18 @@ let check_expr_kind = fn (
           let else_diverges = stmts_diverge(stmts: ebs)
           let st_else = check_stmts(stmts: ebs, st: st1, sigs, tdefs)
           if then_diverges && else_diverges then
+            check_divergent_arm_unused(arm_out: st_then, outer_vars: lin_state_vars(st: st1), span)
+            check_divergent_arm_unused(arm_out: st_else, outer_vars: lin_state_vars(st: st1), span)
             return lin_set_vars(st: st1, vs: [])
           end
-          if then_diverges then return st_else end
-          if else_diverges then return st_then end
+          if then_diverges then
+            check_divergent_arm_unused(arm_out: st_then, outer_vars: lin_state_vars(st: st1), span)
+            return st_else
+          end
+          if else_diverges then
+            check_divergent_arm_unused(arm_out: st_else, outer_vars: lin_state_vars(st: st1), span)
+            return st_then
+          end
           if !vars_equal(a: lin_state_vars(st: st_then), b: lin_state_vars(st: st_else)) then
             raise LinearMismatch(detail: "if/else branches diverge on linear set: then=" ++ join_simple(xs: lin_state_vars(st: st_then)) ++ " else=" ++ join_simple(xs: lin_state_vars(st: st_else)), span)
           end
@@ -1017,6 +1042,11 @@ let check_match_cases_go = fn (
       let case_diverges = stmts_diverge(stmts: b)
       let case_out = check_stmts(stmts: b, st: case_state2, sigs, tdefs)
       if case_diverges then
+        // Before discarding this arm's state, verify that any linear bindings
+        // introduced inside the arm (not present in the outer pre-arm state)
+        // were consumed prior to divergence.  A live inner-scope linear at
+        // divergence point is a silent leak (nexus-bxzy).
+        check_divergent_arm_unused(arm_out: case_out, outer_vars: lin_state_vars(st), span)
         return check_match_cases_go(cases: rest, st, sigs, tdefs, span, ref_set, scrutinee_linear)
       end
       let case_vars = lin_state_vars(st: case_out)
