@@ -72,7 +72,7 @@ import { TcmcCtx, NoTcmc, TcmcActive, tcmc_deeper, detect_tcmc, emit_tcmc_init, 
 import { binary_operand_type, emit_binary } from "src/backend/codegen/binop.nx"
 import { extract_memo_names, extract_memo_slots,
          is_intrinsic_external, get_intrinsic_wasm_name,
-         is_closure_lift, filter_intrinsic_externals,
+         is_closure_lift, filter_intrinsic_externals, filter_externals_p3,
          wasi_thread_start_export,
          emit_heap_mark, emit_heap_reset, emit_heap_swap, emit_alloc_raw,
          emit_mem_load_i32, emit_mem_store_i32, emit_mem_load_u8, emit_mem_store_u8,
@@ -1839,18 +1839,29 @@ export let compile_lir_to_wasm = fn (program: LirProgram, string_data_base: i64,
   return compile_lir_to_wasm_with_coverage(program, string_data_base, effect_map, coverage_flag: 0)
 end
 
-/** Coverage flag is an i64 (0 / 1) rather than `bool` to dodge a seed-compiler
+/** Coverage/build flags packed into a single i64 to dodge a seed-compiler
  *  codegen quirk around bool-typed function params under multi-stage bootstrap.
+ *
+ *  Bit layout:
+ *    bit 0 (value 1): coverage_enabled — emit coverage counters
+ *    bit 1 (value 2): p3_enabled — WASI preview3 mode (non-shared memory,
+ *                     sequential lazy, no wasi.thread-spawn export)
  */
 export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_data_base: i64,
                                        effect_map: &EffectMap,
                                        coverage_flag: i64) -> %ByteBuffer throws { CodegenError } do
-  let coverage_enabled = coverage_flag != 0
+  let coverage_enabled = (coverage_flag & 1) != 0
+  let p3_enabled = (coverage_flag & 2) != 0
   match program do
     | LirProgram(functions: funcs, externals: all_exts) ->
 
       // Arena intrinsics are emitted as inline WASM, not imported.
-      let intrinsic_filtered = filter_intrinsic_externals(exts: all_exts)
+      // In p3 mode, also drop wasi.thread-spawn (wasi-threads not available).
+      let intrinsic_filtered = if p3_enabled then
+          filter_externals_p3(exts: all_exts)
+        else
+          filter_intrinsic_externals(exts: all_exts)
+        end
       let has_intrinsics = list.length(xs: all_exts) != list.length(xs: intrinsic_filtered)
       // Diamond imports can register the same WASM function under multiple Nexus
       // names; collapse them so the import section has one entry per WASM target.
@@ -1896,7 +1907,9 @@ export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_d
       let main_idx = wdefs.lookup_func_fast(name: "main", map: &internal_func_map)
       // Implicit `wasi_thread_start` export when the lazy/threads runtime is
       // linked (so wasi-threads workers can find the trampoline). `[]` otherwise.
-      let extra_exports = wasi_thread_start_export(funcs, &internal_func_map)
+      // In p3 mode, wasi-threads is not used so we suppress this export.
+      let wasi_ts_exports = wasi_thread_start_export(funcs, &internal_func_map)
+      let extra_exports = if p3_enabled then [] else wasi_ts_exports end
       let main_ret = match wdefs.lookup_function_fast(name: "main", funcs, map: &internal_func_map, import_count) do
         | Some(val: LirFunction(name: _, params: _, ret_type: rt, body: _, ret: _, span: _)) -> rt
         | None -> TyUnit
@@ -1922,13 +1935,20 @@ export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_d
       let string_entries = wcollect.build_string_entries(strings: all_strings, next_offset: string_data_base, acc: [])
       let has_strings = list.length(xs: string_entries) > 0
 
-      let mem_mode_raw = wcollect.choose_memory_mode(externals: exts, has_strings, has_heap: heap_enabled)
+      let mem_mode_raw = if p3_enabled then
+          wcollect.choose_memory_mode_p3(externals: exts, has_strings, has_heap: heap_enabled)
+        else
+          wcollect.choose_memory_mode(externals: exts, has_strings, has_heap: heap_enabled)
+        end
       // Coverage instrumentation (nexus-gycd) needs a memory for the atomic
       // counter array at page 17. Force `MemoryImported("env")` when --coverage
       // is on for programs that wouldn't otherwise declare/import one.
+      // In p3 mode, force `MemoryDefined` instead of `MemoryImported`.
       let mem_mode = if coverage_enabled then
           match mem_mode_raw do
-            | MemoryNone -> MemoryImported(name: "env")
+            | MemoryNone ->
+              if p3_enabled then MemoryDefined
+              else MemoryImported(name: "env") end
             | _ -> mem_mode_raw
           end
         else mem_mode_raw end
@@ -1988,8 +2008,18 @@ export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_d
       let mem_min_pages = if coverage_enabled then
           wdefs.cov_base_pages + wdefs.cov_extra_pages
         else wdefs.cov_base_pages end
+      // p3 (non-shared defined memory) needs to cover through page 18 (the
+      // backtrace ring) since the BT prologue accesses bt_page_base without
+      // a grow-check. Preview1 imports shared memory with min=256 so this
+      // is not an issue there. Use p3_base_pages (19) as the floor.
+      let p3_mem_min_pages = if mem_min_pages > wdefs.p3_base_pages then mem_min_pages else wdefs.p3_base_pages end
       let %m = if let MemoryDefined = mem_mode then
-        wdefs.emit_section(buf: %m, id: sec_memory, content: wsect.build_memory_section(min_pages: mem_min_pages))
+        let mem_sec = if p3_enabled then
+          wsect.build_memory_section_unshared(min_pages: p3_mem_min_pages)
+        else
+          wsect.build_memory_section(min_pages: mem_min_pages)
+        end
+        wdefs.emit_section(buf: %m, id: sec_memory, content: mem_sec)
       else %m end
 
       // Tag section must come after memory and before global.

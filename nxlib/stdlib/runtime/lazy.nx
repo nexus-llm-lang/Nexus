@@ -1,20 +1,24 @@
 /**
- * runtime/lazy: low-level wasi-threads runtime for `@`-thunk parallelism.
+ * runtime/lazy: thunk execution runtime for `@`-thunk parallelism.
  *
- * Backs `std:lazy_host`'s `host_spawn` / `host_join` and `std:lazy`'s
- * `force_all`. A "task" is a 24-byte struct in (shared) linear memory:
+ * Phase 1 (WASI p3 compatible): sequential-first implementation.
+ * A "task" is a 24-byte struct in linear memory:
  *
  *   offset  0  ready      i32 (0 = pending, 1 = done; padded to 8 bytes)
  *   offset  8  result     i64 (the thunk's forced value, when ready == 1)
  *   offset 16  closure_ptr i64 (the 0-arg closure heap pointer to force)
  *
- * `lazy_spawn` allocates the task, records the thunk's closure pointer,
- * and calls the `wasi.thread-spawn` import; the spawned OS thread re-enters
- * the module at the `wasi_thread_start` export below (passing the task ptr as
- * its argument), forces the closure, parks the result, sets `ready`, and
- * `notify`s any joiner. `lazy_join` `wait32`s on `ready` and reads the
- * result. The closure runs against the same shared linear memory the caller
- * sees, so captures are visible without copying.
+ * **Sequential path (default, WASI p3 compatible):**
+ * `lazy_spawn` allocates the task, forces the closure immediately, stores
+ * the result, and marks ready=1. `lazy_join` reads the pre-computed result
+ * without blocking. No shared memory or atomic wait/notify required.
+ *
+ * **Threads path (`wasi_thread_start` export, for WASI preview2 + threads):**
+ * The `wasi_thread_start` export is retained for compatibility with
+ * `wasmtime -S threads` builds. However, the sequential `lazy_spawn`
+ * no longer calls `wasi.thread-spawn`; programs that need true parallel
+ * execution should use `-S p3=y -S threads=y` with the WASI threads API
+ * directly (tracked in bd nexus-vqmf future phases).
  *
  * `force-closure` / `thunk-addr` / `value-of-i64` are codegen intrinsics
  * (`nexus:intrinsic`, no import entry): the first inlines a `call_indirect`
@@ -25,6 +29,10 @@
  * with the WASI-threads ABI `(tid: i32, arg: i32) -> ()`; Nexus orders WASM
  * params alphabetically, so its params are named `a_tid`, `b_arg` to land in
  * ABI order.
+ *
+ * nexus-vqmf phase 1: sequential lazy to unblock `-S p3=y` single-threaded
+ * runs. True parallel `future<T>` migration is tracked in nexus-vqmf phase 2
+ * and requires component-model emit.
  */
 import external "nexus:intrinsic"
 
@@ -40,53 +48,44 @@ external thunk_addr = "thunk_addr" : <T>(a_thunk: @T) -> i64
 /** Reinterpret a raw i64 (a thunk's forced result) back to its value type. */
 external value_of_i64 = "value_of_i64" : <T>(a_x: i64) -> T
 
-import external "wasi"
-
-/**
-The WASI-threads spawn primitive: starts a new OS thread that re-enters the
-module at the `wasi_thread_start` export with `(new_tid, a_arg)`. Returns
-the thread id, or a negative value on failure.
-*/
-external thread_spawn = "thread-spawn" : (a_arg: i32) -> i32
-
 import * as arena from "std:runtime/arena"
 import * as mem from "std:runtime/mem"
 import * as atomic from "std:runtime/atomic"
 import * as cast from "std:runtime/cast"
 
 /**
-Block until the task's `ready` flag is non-zero. Recursive (no `while`); the
-recursion is a tail call, so it lowers to a loop.
-*/
-let wait_ready = fn (a_t: i64) -> unit do
-  if atomic.load_i32(addr: a_t) != 0 then return () end
-  let _ = atomic.wait32(addr: a_t, expected: 0, timeout_ns: 0 - 1)
-  return wait_ready(a_t)
-end
+Spawn `a_thunk` — sequential phase 1 implementation: forces the thunk
+immediately, stores the result in a 24-byte task struct on the arena, and
+marks the task ready. Returns the task pointer. No OS thread is created;
+`lazy_join` reads the pre-computed result instantly.
 
-/**
-Spawn `a_thunk` on a worker thread. Returns the task pointer (an i64) — pair
-it with `lazy_join`. The thunk is consumed.
+This is compatible with both WASI preview2 and preview3 since it does not
+import `wasi.thread-spawn` or use shared memory atomics for synchronisation.
 */
 export let lazy_spawn = fn <T>(a_thunk: @T) -> i64 do
   let cl = thunk_addr(a_thunk)
   let t = arena.alloc_raw(size: 24)
-  let _ = mem.store_i64(addr: t + 8, val: 0)
+  // Force the closure inline (sequential; no thread spawned).
+  let r = force_closure(a_p: cl)
+  let _ = mem.store_i64(addr: t + 8, val: r)
   let _ = mem.store_i64(addr: t + 16, val: cl)
-  let _ = atomic.store_i32(addr: t, val: 0)
-  let _ = thread_spawn(a_arg: cast.i32_of(x: t))
+  let _ = atomic.store_i32(addr: t, val: 1)
   return t
 end
 
-/** Wait for `a_task` to complete and return its forced value. */
+/** Wait for `a_task` to complete and return its forced value.
+ *  In sequential mode, ready is always 1 at this point so no blocking occurs.
+ */
 export let lazy_join = fn <T>(a_task: i64) -> T do
-  let _ = wait_ready(a_t: a_task)
+  // ready is already 1 (set by lazy_spawn); no wait needed.
   return value_of_i64(a_x: mem.load_i64(addr: a_task + 8))
 end
 
 /**
 Force the task's closure, park the result, mark the task ready, and wake any
-joiner. Called on the worker thread by `wasi_thread_start`.
+joiner. Called on the worker thread by `wasi_thread_start` (retained for
+compatibility with wasi-threads `wasmtime -S threads` runs, but not invoked
+by the sequential `lazy_spawn`).
 */
 export let lazy_run_task = fn (a_task: i64) -> unit do
   let cl = mem.load_i64(addr: a_task + 16)
@@ -101,6 +100,8 @@ end
 WASI-threads worker entry point. `b_arg` is the task pointer passed to
 `thread-spawn`. Exported under exactly this name by codegen. Returns
 normally (must not `proc_exit` while a continuation stack is live).
+Retained for `wasmtime -S threads` compatibility; not called by the
+sequential `lazy_spawn`.
 */
 export let wasi_thread_start = fn (a_tid: i32, b_arg: i32) -> unit do
   return lazy_run_task(a_task: cast.i64_of(x: b_arg))
