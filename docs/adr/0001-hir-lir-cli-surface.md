@@ -70,7 +70,7 @@ Rationale:
   unaffected.
 
 The gating mechanism (driver-side check for `--dev` or `NEXUS_DEV`) is a
-**separate implementation ticket** (follow-up to nexus-jrco); driver.nx is
+**separate implementation ticket** (follow-up to nexus-jrco); main.nx is
 currently subject to large-scale refactor nexus-95iz.30 and must not be
 modified concurrently.  This ADR records the decision so that the CLI
 follow-up has clear acceptance criteria.

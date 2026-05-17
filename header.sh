@@ -83,7 +83,7 @@ if [ "$#" -gt 0 ]; then
     run)
       # `nexus run` — same preview1 constraint as test (Proc.exec is a -1
       # stub), so build + exec are driven from the host shell. The in-wasm
-      # `src/driver.nx` still parses `run` and would Proc.exec wasmtime if
+      # `src/main.nx` still parses `run` and would Proc.exec wasmtime if
       # subprocess was available; under preview1 it emits the same
       # "use the polyglot launcher" hint as the test path.
       #

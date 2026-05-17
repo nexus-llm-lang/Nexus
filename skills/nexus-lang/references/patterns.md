@@ -125,7 +125,7 @@ end
   handlers.
 - The comma form keeps `BODY`'s indentation flat. Nested `inject` walls add an
   indentation level per handler with no extra meaning.
-- Production code already favours this form: `main` in `src/driver.nx` injects
+- Production code already favours this form: `main` in `src/main.nx` injects
   four system handlers (`stdio`, `fs_mod`, `clock_mod`, `proc`) in a single
   statement.
 

@@ -2,9 +2,9 @@
 #
 # bootstrap.sh — Multi-stage bootstrap for the Nexus self-hosted compiler (src/)
 #
-# Stage 0: Run committed ./nexus.wasm (seed) to compile src/driver.nx → stage0.wasm
-# Stage 1: Run stage0.wasm to compile src/driver.nx → stage1.wasm
-# Stage 2: Run stage1.wasm to compile src/driver.nx → stage2.wasm
+# Stage 0: Run committed ./nexus.wasm (seed) to compile src/main.nx → stage0.wasm
+# Stage 1: Run stage0.wasm to compile src/main.nx → stage1.wasm
+# Stage 2: Run stage1.wasm to compile src/main.nx → stage2.wasm
 # Verify:  stage1.wasm == stage2.wasm (fixed point)
 #
 # The committed ./nexus.wasm is the Stage 0 source of truth; this script
@@ -24,7 +24,7 @@ for arg in "$@"; do
 done
 
 NEXUS_SEED="${NEXUS_SEED:-./nexus.wasm}"
-NEXUS_ENTRY="src/driver.nx"
+NEXUS_ENTRY="src/main.nx"
 WASMTIME="${WASMTIME:-wasmtime}"
 # shellcheck disable=SC2054  # commas inside -W are wasmtime delimiters, not array separators
 WASMTIME_FLAGS_CORE=(
