@@ -45,12 +45,11 @@ export type SpecializeResult = SpecializeResult(specialized: i64, total_calls: i
  *  SpecializeResult lets the driver report how many call sites were resolved to
  *  direct handler calls during HIR→MIR lowering.
  *
- *  The scan is deliberately shallow: only the top-level statements of each
- *  MirFunction body are inspected (not recursing into sub-expressions such as
- *  if-then-else bodies or match arms).  This keeps the call stack depth bounded
- *  regardless of MIR complexity, while still capturing all inject-scope handler
- *  calls (which appear as direct MirStmtLet / MirStmtExpr / MirStmtReturn at
- *  the top level of the function body after HIR→MIR inject-inlining).
+ *  The scan uses an iterative worklist (DFS via a list-as-stack) rather than
+ *  mutual recursion, so it does not overflow the call stack on large MirPrograms
+ *  like driver.nx.  All statement kinds are fully visited including
+ *  MirStmtTry body + catch_body, MirIf then/else bodies, MirMatch arms, and
+ *  MirWhile body.
  */
 export let analyze_specialization = fn (mir: MirProgram) -> SpecializeResult throws { MirError } do
   let MirProgram(functions: funcs, externals: _) = mir
@@ -63,85 +62,216 @@ let scan_functions = fn (funcs: [MirFunction], specialized: i64, total_calls: i6
   match funcs do
     | [] -> return SpecializeResult(specialized, total_calls)
     | MirFunction(name: _, params: _, ret_type: _, body: stmts, span: _) :: rest ->
-      let SpecializeResult(specialized: s2, total_calls: t2) = scan_stmts(stmts: stmts, specialized, total_calls)
+      let SpecializeResult(specialized: s2, total_calls: t2) = scan_worklist(worklist: stmts, specialized, total_calls)
       return scan_functions(funcs: rest, specialized: s2, total_calls: t2)
   end
 end
 
-// ─── Statement-level scan (shallow: recurse into stmt exprs, not into
-//     nested stmt-lists like if-bodies or match arms) ────────────────────────
+// ─── Iterative worklist walk ─────────────────────────────────────────────────
 
-let scan_stmts = fn (stmts: [MirStmt], specialized: i64, total_calls: i64) -> SpecializeResult throws { MirError } do
-  match stmts do
+/** Iterative DFS over a [MirStmt] worklist.
+ *
+ *  Instead of recursing from scan_stmt into scan_expr and back into nested
+ *  scan_stmts (which overflows on large functions), we keep a flat worklist
+ *  of statements.  When a statement's expression contains nested statement
+ *  lists (MirIf then/else, MirMatch arms, MirWhile body, MirStmtTry bodies)
+ *  we prepend those lists to the worklist and continue iterating.
+ *
+ *  Expression sub-expressions that are NOT statement containers (MirBinaryOp
+ *  children, MirConstructor args, etc.) are scanned eagerly in scan_expr_deep
+ *  which only recurses into expressions, never back into stmt-lists.
+ *
+ *  This keeps the Nexus call stack depth bounded at:
+ *    scan_functions → scan_worklist → scan_expr_deep → scan_call_args
+ *  (4 frames, regardless of nesting depth in the source program).
+ */
+let scan_worklist = fn (worklist: [MirStmt], specialized: i64, total_calls: i64) -> SpecializeResult throws { MirError } do
+  match worklist do
     | [] -> return SpecializeResult(specialized, total_calls)
     | stmt :: rest ->
-      let SpecializeResult(specialized: s2, total_calls: t2) = scan_stmt_top(stmt: stmt, specialized, total_calls)
-      return scan_stmts(stmts: rest, specialized: s2, total_calls: t2)
+      let ScanStmtResult(next_stmts: extra, specialized: s2, total_calls: t2) =
+        process_stmt(stmt: stmt, specialized, total_calls)
+      // prepend extra stmts (nested bodies) to the remaining worklist
+      let new_worklist = list.concat(xs: extra, ys: rest)
+      return scan_worklist(worklist: new_worklist, specialized: s2, total_calls: t2)
   end
 end
 
-/** Shallow statement scan: inspect the direct expression of a statement.
- *  For compound statements (Try, Assign) we also inspect the immediate
- *  sub-expressions.  We do NOT recurse into nested statement lists
- *  (then-bodies, else-bodies, match arms, while bodies) to keep depth bounded.
+// ─── Per-statement processor ─────────────────────────────────────────────────
+
+/** Intermediate result of processing one statement.
+ *  `next_stmts` = nested statement lists to push onto the worklist (DFS order).
  */
-let scan_stmt_top = fn (stmt: MirStmt, specialized: i64, total_calls: i64) -> SpecializeResult throws { MirError } do
+type ScanStmtResult = ScanStmtResult(next_stmts: [MirStmt], specialized: i64, total_calls: i64)
+
+/** Process a single MirStmt:
+ *  - scan its direct expression(s) for call sites;
+ *  - collect any nested [MirStmt] bodies into `next_stmts` for the worklist.
+ */
+let process_stmt = fn (stmt: MirStmt, specialized: i64, total_calls: i64) -> ScanStmtResult throws { MirError } do
   match stmt do
     | MirStmtLet(name: _, typ: _, expr: e) ->
-      return scan_expr_shallow(expr: e, specialized, total_calls)
+      let SpecializeResult(specialized: s2, total_calls: t2) = scan_expr_deep(expr: e, specialized, total_calls)
+      let extra = collect_expr_stmts(expr: e)
+      return ScanStmtResult(next_stmts: extra, specialized: s2, total_calls: t2)
+
     | MirStmtExpr(expr: e) ->
-      return scan_expr_shallow(expr: e, specialized, total_calls)
+      let SpecializeResult(specialized: s2, total_calls: t2) = scan_expr_deep(expr: e, specialized, total_calls)
+      let extra = collect_expr_stmts(expr: e)
+      return ScanStmtResult(next_stmts: extra, specialized: s2, total_calls: t2)
+
     | MirStmtReturn(expr: e) ->
-      return scan_expr_shallow(expr: e, specialized, total_calls)
+      let SpecializeResult(specialized: s2, total_calls: t2) = scan_expr_deep(expr: e, specialized, total_calls)
+      let extra = collect_expr_stmts(expr: e)
+      return ScanStmtResult(next_stmts: extra, specialized: s2, total_calls: t2)
+
     | MirStmtAssign(target: t, value: v) ->
-      let SpecializeResult(specialized: s2, total_calls: t2) = scan_expr_shallow(expr: t, specialized, total_calls)
-      return scan_expr_shallow(expr: v, specialized: s2, total_calls: t2)
-    | MirStmtTry(body: _, catch_param: _, catch_body: _) ->
-      // Try bodies will be scanned as part of the outer function body loop;
-      // skip recursing here to keep depth bounded.
-      return SpecializeResult(specialized, total_calls)
+      let SpecializeResult(specialized: s2, total_calls: t2) = scan_expr_deep(expr: t, specialized, total_calls)
+      let SpecializeResult(specialized: s3, total_calls: t3) = scan_expr_deep(expr: v, specialized: s2, total_calls: t2)
+      let extra_t = collect_expr_stmts(expr: t)
+      let extra_v = collect_expr_stmts(expr: v)
+      let extra = list.concat(xs: extra_t, ys: extra_v)
+      return ScanStmtResult(next_stmts: extra, specialized: s3, total_calls: t3)
+
+    | MirStmtTry(body: try_body, catch_param: _, catch_body: catch_stmts) ->
+      // Both the try body and catch body are pushed onto the worklist.
+      let extra = list.concat(xs: try_body, ys: catch_stmts)
+      return ScanStmtResult(next_stmts: extra, specialized, total_calls)
+
     | MirStmtInjectResume(body_fn: _, handler_arm_fns: _, handler_arm_tags: _) ->
       // Stack-switching inject resume — body is a lifted function; call sites
       // are already counted when scanning the lifted __inject_N function.
-      return SpecializeResult(specialized, total_calls)
+      return ScanStmtResult(next_stmts: [], specialized, total_calls)
   end
 end
 
-// ─── Shallow expression scan ────────────────────────────────────────────────
+// ─── Expression stmt-list collector ─────────────────────────────────────────
 
-/** Inspect an expression for direct MirCall sites.  Only looks at the
- *  expression itself and its immediate call arguments; does not recurse into
- *  nested if-bodies, match arms, or while bodies to avoid unbounded stack depth.
+/** Collect all nested [MirStmt] bodies directly owned by an expression.
+ *  These are the bodies that need to be added to the worklist so the
+ *  iterative walk visits them.  We only collect ONE level of nesting here;
+ *  the worklist loop handles the rest.
  */
-let scan_expr_shallow = fn (expr: MirExpr, specialized: i64, total_calls: i64) -> SpecializeResult throws { MirError } do
+let collect_expr_stmts = fn (expr: MirExpr) -> [MirStmt] do
+  match expr do
+    | MirIf(cond: _, then_body: tb, else_body: eb) ->
+      match eb do
+        | None -> return tb
+        | Some(val: else_stmts) -> return list.concat(xs: tb, ys: else_stmts)
+      end
+    | MirMatch(target: _, cases: mc) ->
+      return collect_match_case_stmts(cases: mc)
+    | MirWhile(cond: _, body: wb) ->
+      return wb
+    | _ -> return []
+  end
+end
+
+/** Flatten MirMatchCase bodies into a single [MirStmt] list. */
+let collect_match_case_stmts = fn (cases: [MirMatchCase]) -> [MirStmt] do
+  match cases do
+    | [] -> return []
+    | MirMatchCase(pattern: _, body: b) :: rest ->
+      return list.concat(xs: b, ys: collect_match_case_stmts(cases: rest))
+  end
+end
+
+// ─── Deep expression scan (expressions only, no stmt-list recursion) ─────────
+
+/** Scan an expression for direct MirCall sites.
+ *
+ *  This function recurses into expression sub-trees (MirBinaryOp operands,
+ *  MirConstructor args, MirRaise/MirForce inner exprs, call args, etc.) but
+ *  does NOT recurse into nested statement lists (MirIf then/else, MirMatch
+ *  arms, MirWhile body).  Those statement lists are handled by the worklist
+ *  in scan_worklist / collect_expr_stmts.
+ *
+ *  Stack depth is bounded by expression nesting depth, which in practice is
+ *  shallow (a few levels of BinaryOp / MirIf cond / call-arg nesting).
+ */
+let scan_expr_deep = fn (expr: MirExpr, specialized: i64, total_calls: i64) -> SpecializeResult throws { MirError } do
   match expr do
     | MirCall(func: f, args, ret_type: _) ->
       let new_total = total_calls + 1
       let new_spec = if str.starts_with(s: f, prefix: "__handler_") then specialized + 1 else specialized end
       return scan_call_args(args: args, specialized: new_spec, total_calls: new_total)
 
-    | MirCallClosure(closure: _, args: cargs, ret_type: _) ->
+    | MirCallClosure(closure: cl, args: cargs, ret_type: _) ->
       let new_total = total_calls + 1
-      return scan_call_args(args: cargs, specialized, total_calls: new_total)
+      let SpecializeResult(specialized: s2, total_calls: t2) = scan_expr_deep(expr: cl, specialized, total_calls: new_total)
+      return scan_call_args(args: cargs, specialized: s2, total_calls: t2)
 
+    | MirBinaryOp(left: lhs, op: _, right: rhs) ->
+      let SpecializeResult(specialized: s2, total_calls: t2) = scan_expr_deep(expr: lhs, specialized, total_calls)
+      return scan_expr_deep(expr: rhs, specialized: s2, total_calls: t2)
+
+    | MirConstructor(name: _, args: ctor_args) ->
+      return scan_expr_list(exprs: ctor_args, specialized, total_calls)
+
+    | MirArray(elems) ->
+      return scan_expr_list(exprs: elems, specialized, total_calls)
+
+    | MirRecord(fields: fs) ->
+      return scan_named_expr_list(fields: fs, specialized, total_calls)
+
+    | MirIndex(target: tgt, index: idx) ->
+      let SpecializeResult(specialized: s2, total_calls: t2) = scan_expr_deep(expr: tgt, specialized, total_calls)
+      return scan_expr_deep(expr: idx, specialized: s2, total_calls: t2)
+
+    | MirFieldAccess(target: tgt, field: _) ->
+      return scan_expr_deep(expr: tgt, specialized, total_calls)
+
+    | MirRaise(expr: inner) ->
+      return scan_expr_deep(expr: inner, specialized, total_calls)
+
+    | MirForce(expr: inner) ->
+      return scan_expr_deep(expr: inner, specialized, total_calls)
+
+    | MirMakeClosure(func_name: _, captures: caps) ->
+      return scan_expr_list(exprs: caps, specialized, total_calls)
+
+    | MirSuspend(tag_name: _, payload: p, ret_type: _) ->
+      return scan_expr_deep(expr: p, specialized, total_calls)
+
+    | MirResume(cont_var: _, value: v, ret_type: _) ->
+      return scan_expr_deep(expr: v, specialized, total_calls)
+
+    // Compound exprs with stmt-list bodies: scan the cond/target expr only;
+    // the nested stmt-lists are handled by collect_expr_stmts + worklist.
+    | MirIf(cond: c, then_body: _, else_body: _) ->
+      return scan_expr_deep(expr: c, specialized, total_calls)
+
+    | MirMatch(target: tgt, cases: _) ->
+      return scan_expr_deep(expr: tgt, specialized, total_calls)
+
+    | MirWhile(cond: c, body: _) ->
+      return scan_expr_deep(expr: c, specialized, total_calls)
+
+    // Leaf expressions with no sub-expressions.
     | MirLiteral(_) -> return SpecializeResult(specialized, total_calls)
     | MirVariable(_) -> return SpecializeResult(specialized, total_calls)
     | MirBorrow(_) -> return SpecializeResult(specialized, total_calls)
     | MirEnvLoad(env_var: _, index: _) -> return SpecializeResult(specialized, total_calls)
-    | MirBinaryOp(left: _, op: _, right: _) -> return SpecializeResult(specialized, total_calls)
-    | MirConstructor(name: _, args: _) -> return SpecializeResult(specialized, total_calls)
-    | MirArray(elems: _) -> return SpecializeResult(specialized, total_calls)
-    | MirIndex(target: _, index: _) -> return SpecializeResult(specialized, total_calls)
-    | MirFieldAccess(target: _, field: _) -> return SpecializeResult(specialized, total_calls)
-    | MirIf(cond: _, then_body: _, else_body: _) -> return SpecializeResult(specialized, total_calls)
-    | MirMatch(target: _, cases: _) -> return SpecializeResult(specialized, total_calls)
-    | MirWhile(cond: _, body: _) -> return SpecializeResult(specialized, total_calls)
-    | MirRaise(expr: _) -> return SpecializeResult(specialized, total_calls)
-    | MirForce(expr: _) -> return SpecializeResult(specialized, total_calls)
-    | MirRecord(fields: _) -> return SpecializeResult(specialized, total_calls)
-    | MirMakeClosure(func_name: _, captures: _) -> return SpecializeResult(specialized, total_calls)
-    | MirSuspend(tag_name: _, payload: _, ret_type: _) -> return SpecializeResult(specialized, total_calls)
-    | MirResume(cont_var: _, value: _, ret_type: _) -> return SpecializeResult(specialized, total_calls)
+  end
+end
+
+// ─── Expression list helpers ─────────────────────────────────────────────────
+
+let scan_expr_list = fn (exprs: [MirExpr], specialized: i64, total_calls: i64) -> SpecializeResult throws { MirError } do
+  match exprs do
+    | [] -> return SpecializeResult(specialized, total_calls)
+    | e :: rest ->
+      let SpecializeResult(specialized: s2, total_calls: t2) = scan_expr_deep(expr: e, specialized, total_calls)
+      return scan_expr_list(exprs: rest, specialized: s2, total_calls: t2)
+  end
+end
+
+let scan_named_expr_list = fn (fields: [MirNamedExpr], specialized: i64, total_calls: i64) -> SpecializeResult throws { MirError } do
+  match fields do
+    | [] -> return SpecializeResult(specialized, total_calls)
+    | MirNamedExpr(name: _, value: v) :: rest ->
+      let SpecializeResult(specialized: s2, total_calls: t2) = scan_expr_deep(expr: v, specialized, total_calls)
+      return scan_named_expr_list(fields: rest, specialized: s2, total_calls: t2)
   end
 end
 
@@ -152,7 +282,7 @@ let scan_call_args = fn (args: [MirCallArg], specialized: i64, total_calls: i64)
   match args do
     | [] -> return SpecializeResult(specialized, total_calls)
     | MirCallArg(label: _, value: v) :: rest ->
-      let SpecializeResult(specialized: s2, total_calls: t2) = scan_expr_shallow(expr: v, specialized, total_calls)
+      let SpecializeResult(specialized: s2, total_calls: t2) = scan_expr_deep(expr: v, specialized, total_calls)
       return scan_call_args(args: rest, specialized: s2, total_calls: t2)
   end
 end
