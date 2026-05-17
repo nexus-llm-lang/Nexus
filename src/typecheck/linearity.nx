@@ -871,8 +871,13 @@ let check_expr_kind = fn (
           return st_then
       end
     | Match(target: t, cases: cs) ->
+      // P-Var: determine if the scrutinee is a live linear variable *before*
+      // it is consumed by check_expr below. A plain `| x ->` pattern that
+      // receives a linear scrutinee must track x as linear (q = 1) even
+      // though x carries no % sigil itself.
+      let scrutinee_linear = is_linear_scrutinee(target: t, st)
       let st1 = check_expr(expr: t, st, sigs, tdefs, at_stmt_level: false)
-      return check_match_cases(cases: cs, st: st1, sigs, tdefs, span)
+      return check_match_cases(cases: cs, st: st1, sigs, tdefs, span, scrutinee_linear)
     | While(cond: c, body: b) ->
       // T-While (/ spec t9cl.8): the cond expression is
       // evaluated an unbounded number of times (once per iteration plus the
@@ -973,15 +978,28 @@ end
 
 // ─── Match-case branch consistency ───────────────────────────────────────────
 
+/** True when `target` is a variable expression that is currently live in
+ *  the linear state — i.e., the scrutinee is a linear binding. Used to
+ *  propagate scrutinee linearity into P-Var pattern bindings (spec P-Var:
+ *  q = 1 if linear(τ) else ω). */
+let is_linear_scrutinee = fn (target: HirExpr, st: LinState) -> bool do
+  let HirExpr(node: n, span: _) = target
+  match n do
+    | Variable(name: v, sigil: _) -> return lin_member(st, name: v)
+    | _ -> return false
+  end
+end
+
 let check_match_cases = fn (
-  cases: [HirMatchCase], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], span: Span
+  cases: [HirMatchCase], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], span: Span,
+  scrutinee_linear: bool
 ) -> LinState throws { TypeError } do
-  return check_match_cases_go(cases, st, sigs, tdefs, span, ref_set: None)
+  return check_match_cases_go(cases, st, sigs, tdefs, span, ref_set: None, scrutinee_linear)
 end
 
 let check_match_cases_go = fn (
   cases: [HirMatchCase], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], span: Span,
-  ref_set: Option<[string]>
+  ref_set: Option<[string]>, scrutinee_linear: bool
 ) -> LinState throws { TypeError } do
   match cases do
     | [] ->
@@ -990,40 +1008,53 @@ let check_match_cases_go = fn (
         | Some(val: vs) -> return lin_set_vars(st, vs)
       end
     | HirMatchCase(pattern: p, body: b) :: rest ->
-      // Pattern binders that introduce linear vars (`%v` patterns) are
-      // added before walking the body. Other binders (immutable) do not
-      // become linear bindings.
+      // Pattern binders that introduce linear vars (`%v` patterns, or plain
+      // patterns that receive a linear scrutinee) are added before walking
+      // the body. scrutinee_linear propagates to bind_pattern_linear so that
+      // `| x ->` patterns on a linear scrutinee track x as linear (P-Var).
       let case_state = lin_set_vars(st, vs: lin_state_vars(st))
-      let case_state2 = bind_pattern_linear(pat: p, st: case_state)
+      let case_state2 = bind_pattern_linear(pat: p, st: case_state, scrutinee_linear)
       let case_diverges = stmts_diverge(stmts: b)
       let case_out = check_stmts(stmts: b, st: case_state2, sigs, tdefs)
       if case_diverges then
-        return check_match_cases_go(cases: rest, st, sigs, tdefs, span, ref_set)
+        return check_match_cases_go(cases: rest, st, sigs, tdefs, span, ref_set, scrutinee_linear)
       end
       let case_vars = lin_state_vars(st: case_out)
       match ref_set do
         | None ->
-          return check_match_cases_go(cases: rest, st, sigs, tdefs, span, ref_set: Some(val: case_vars))
+          return check_match_cases_go(cases: rest, st, sigs, tdefs, span, ref_set: Some(val: case_vars), scrutinee_linear)
         | Some(val: rv) ->
           if !vars_equal(a: rv, b: case_vars) then
             raise LinearMismatch(detail: "match arms diverge on linear set", span)
           end
-          return check_match_cases_go(cases: rest, st, sigs, tdefs, span, ref_set)
+          return check_match_cases_go(cases: rest, st, sigs, tdefs, span, ref_set, scrutinee_linear)
       end
   end
 end
 
-let bind_pattern_linear = fn (pat: HirPatternKind, st: LinState) -> LinState throws { TypeError } do
+/** Add linear-tracked names introduced by `pat` to `st`.
+ *  `scrutinee_linear` — true when the match scrutinee is itself a linear
+ *  binding (i.e., was live in LinState before match evaluation). When true,
+ *  a plain `PVar` (sigil ω / immutable) still introduces a linear binding
+ *  because it receives ownership of a linear value (spec P-Var: q = 1 if
+ *  linear(τ) else ω). Nested patterns inside PCtor/PRec do NOT inherit this
+ *  flag — their field types govern linearity independently. */
+let bind_pattern_linear = fn (pat: HirPatternKind, st: LinState, scrutinee_linear: bool) -> LinState throws { TypeError } do
   match pat do
     | PLit(_) | PWild -> return st
     | PVar(name: n, sigil: s) ->
+      // P-Var: q = 1 if linear(τ) else ω.
+      // Approximate linear(τ) via sigil (SigilLinear/SigilLazy) OR
+      // scrutinee_linear (the match scrutinee was a live linear variable).
       match s do
         | SigilLinear | SigilLazy -> return lin_add(st, name: n)
-        | _ -> return st
+        | _ ->
+          if scrutinee_linear then return lin_add(st, name: n) end
+          return st
       end
     | PCtor(variant: _, fields: fs, sigil: _) -> return bind_pattern_fields(fields: fs, st)
     | PRec(fields: fs, is_partial: _) -> return bind_pattern_rec_fields(fields: fs, st)
-    | POr(alts) -> return bind_pattern_or(alts, st)
+    | POr(alts) -> return bind_pattern_or(alts, st, scrutinee_linear)
   end
 end
 
@@ -1033,7 +1064,7 @@ let bind_pattern_fields = fn (
   match fields do
     | [] -> return st
     | HirPatternField(name: _, pattern: p) :: rest ->
-      let st1 = bind_pattern_linear(pat: p, st)
+      let st1 = bind_pattern_linear(pat: p, st, scrutinee_linear: false)
       return bind_pattern_fields(fields: rest, st: st1)
   end
 end
@@ -1044,19 +1075,19 @@ let bind_pattern_rec_fields = fn (
   match fields do
     | [] -> return st
     | HirRecordPatField(name: _, pattern: p) :: rest ->
-      let st1 = bind_pattern_linear(pat: p, st)
+      let st1 = bind_pattern_linear(pat: p, st, scrutinee_linear: false)
       return bind_pattern_rec_fields(fields: rest, st: st1)
   end
 end
 
 let bind_pattern_or = fn (
-  alts: [HirPatternKind], st: LinState
+  alts: [HirPatternKind], st: LinState, scrutinee_linear: bool
 ) -> LinState throws { TypeError } do
   // Or-patterns require all alternatives to bind the same linear-name set.
   // Use the first alt as the canonical binder set.
   match alts do
     | [] -> return st
-    | a :: _ -> return bind_pattern_linear(pat: a, st)
+    | a :: _ -> return bind_pattern_linear(pat: a, st, scrutinee_linear)
   end
 end
 
