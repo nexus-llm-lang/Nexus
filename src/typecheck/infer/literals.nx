@@ -96,16 +96,66 @@ export let infer_variable = fn (state: CheckState, name: string, sigil: Sigil, s
   end
 end
 
-/** T-Borrow: type `&name` by looking up the binding, stripping any outer linear / lazy / borrow / ref wrapper, and re-wrapping in TyBorrow. */
+/** T-Borrow: type `&name` by looking up the binding, stripping any outer linear / lazy / borrow / ref wrapper, and re-wrapping in TyBorrow.
+ *
+ * Enforces the spec premise `x :^ω`: only unrestricted (q = ω) bindings may be
+ * borrowed at non-argument positions. Linear (`%σ`) and lazy (`@σ`) bindings
+ * have q = 1 and are rejected here.
+ *
+ * The argument-position carve-out (T-App-BorrowLin) is handled by the caller
+ * (`check_call_args_walk`) which bypasses `infer_borrow` and calls
+ * `infer_borrow_arg_position` instead when the argument node is syntactically
+ * `&x` and the binding may be linear.
+ */
 export let infer_borrow = fn (state: CheckState, name: string, span: Span) -> InferExprResult throws { TypeError } do
-  // Borrow walks the env directly (without sigil dereference) — `&x` may
-  // borrow Linear/Lazy/Borrow bindings the same way as plain Immutable ones.
   match infer_variable(state, name, sigil: SigilImmutable, span) do
     | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
     | InferExprOk(state: st1, subst: s, typ: t) ->
+      // T-Borrow x:^ω premise: reject linear (q = 1) and lazy (q = 1) bindings.
+      // A `%σ` or `@σ` binding borrowed outside argument position would create a
+      // long-lived `&σ` value with no natural discharge point, violating the
+      // ownership model. See spec §T-Borrow.
+      match t do
+        | TyLinear(_) ->
+          return InferExprErr(
+            message: "cannot borrow '" ++ name ++ "': binding is linear (q = 1); T-Borrow requires x :^ω. Borrowing a linear binding is only permitted in argument position (e.g. `f(p: &" ++ name ++ ")`), where T-App discharges the borrow on return. See spec type-system-formal.md §T-Borrow.",
+            span
+          )
+        | TyLazy(_) ->
+          return InferExprErr(
+            message: "cannot borrow '" ++ name ++ "': binding is lazy/one-shot (q = 1); T-Borrow requires x :^ω. Borrowing a lazy binding is only permitted in argument position. See spec type-system-formal.md §T-Borrow.",
+            span
+          )
+        | _ -> ()
+      end
       // Strip Linear/Lazy/Borrow/Ref wrapper, then wrap in Borrow.
       // stripBorrow(τ) per spec: τ ∈ {%σ, @σ, &σ, ~σ} -> σ. Borrowing a `~τ`
       // binding yields `&τ` of the cell's contents, not `&(~τ)`.
+      let inner = match t do
+        | TyLinear(inner: u) | TyLazy(inner: u)
+        | TyBorrow(inner: u) | TyRef(inner: u) -> u
+        | _ -> t
+      end
+      return InferExprOk(state: st1, subst: s, typ: TyBorrow(inner))
+  end
+end
+
+/** T-App-BorrowLin (argument-position carve-out): type `&name` in argument position
+ * without enforcing T-Borrow's `x :^ω` premise.
+ *
+ * When a call argument is syntactically `&x` and the parameter expects `&σ`,
+ * the borrow is discharged on call return — linear `x` survives the call
+ * unconsumed. This is the T-App-BorrowLin rule from spec §T-App.
+ *
+ * This function must only be called from `check_call_args_walk` when the argument
+ * node is syntactically `Borrow(name, _)`. Never call this from expression position.
+ */
+export let infer_borrow_arg_position = fn (state: CheckState, name: string, span: Span) -> InferExprResult throws { TypeError } do
+  match infer_variable(state, name, sigil: SigilImmutable, span) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    | InferExprOk(state: st1, subst: s, typ: t) ->
+      // No x:^ω check here — T-App-BorrowLin explicitly permits linear/lazy
+      // bindings in argument position (borrow discharged on call return).
       let inner = match t do
         | TyLinear(inner: u) | TyLazy(inner: u)
         | TyBorrow(inner: u) | TyRef(inner: u) -> u
