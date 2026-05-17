@@ -15,11 +15,15 @@
  *
  * Output (--format=json):
  *   {"symbol": "...", "file": "...", "line": N, "col": N,
- *    "signature": "...", "docstring": "..." | null }
+ *    "signature": "...", "docstring": "..." | null,
+ *    "tags": {"intent":...,"invariant":...,"complexity":...,"alternatives":...,"owner":...} }
  *
  * Symbol resolution: bare top-level name in `--file` (default `main.nx`)
  * or the entry file. Cross-file qualified lookups (`alias.foo`) are out
  * of V1 scope — file follow-up `cgfd.3` if demanded.
+ *
+ * @intent surface structured @-tag metadata from /** */ doc blocks alongside
+ *   the existing symbol signature/docstring output (issue nexus-swzh).
  */
 
 import { Option, Some, None } from "std:option"
@@ -99,13 +103,112 @@ let parse_explain_args = fn (xs: [string]) -> ExplainArgs throws { InvalidUsage 
   return ExplainArgs(symbol, file, format)
 end
 
+// ─── Structured doc tags (issue nexus-swzh) ──────────────────────────────────
+
+/** Structured @-tags extracted from a /** */ doc block.
+ *  Each field holds the free-text value after the tag keyword, or None when
+ *  the tag is absent. Multiple occurrences of the same tag use the last value.
+ *  Recognised tags: @intent, @invariant, @complexity, @alternatives, @owner.
+ */
+export type DocTags = DocTags(
+  intent: Option<string>,
+  invariant: Option<string>,
+  complexity: Option<string>,
+  alternatives: Option<string>,
+  owner: Option<string>
+)
+
+let empty_doc_tags = fn () -> DocTags do
+  return DocTags(
+    intent: None,
+    invariant: None,
+    complexity: None,
+    alternatives: None,
+    owner: None
+  )
+end
+
+// Extract the text after `@<tag>` on a single trimmed line.
+// Returns None when the line does not start with the given tag keyword.
+// Strip a single leading `*` from a trimmed doc line (JavaDoc/Nexus doc style:
+// each interior line often has `* text`). Leaves the remainder untrimmed so
+// the caller can trim after the star strip.
+let strip_leading_star = fn (s: string) -> string do
+  if str.byte_length(s) == 0 then return s end
+  let b = str.byte_at(s, idx: 0)
+  // 42 = '*'
+  if b == 42 then
+    let rest_len = str.byte_length(s) - 1
+    if rest_len <= 0 then return "" end
+    return str.trim(s: str.byte_substring(s, start: 1, len: rest_len))
+  end
+  return s
+end
+
+let extract_tag_value = fn (line: string, tag: string) -> Option<string> do
+  let prefix = "@" ++ tag
+  // Strip leading `* ` prefix (JavaDoc/Nexus doc-block style) before matching.
+  let trimmed0 = str.trim(s: line)
+  let trimmed = strip_leading_star(s: trimmed0)
+  if str.starts_with(s: trimmed, prefix) then
+    let plen = str.byte_length(s: prefix)
+    let rest_len = str.byte_length(s: trimmed) - plen
+    if rest_len <= 0 then return Some(val: "") end
+    let rest = str.byte_substring(s: trimmed, start: plen, len: rest_len)
+    return Some(val: str.trim(s: rest))
+  end
+  return None
+end
+
+// Apply a single doc line to the accumulator DocTags. Keeps last-wins for dup tags.
+let apply_doc_line = fn (line: string, acc: DocTags) -> DocTags do
+  let DocTags(intent, invariant, complexity, alternatives, owner) = acc
+  match extract_tag_value(line, tag: "intent") do
+    | Some(val: v) -> return DocTags(intent: Some(val: v), invariant, complexity, alternatives, owner)
+    | None -> ()
+  end
+  match extract_tag_value(line, tag: "invariant") do
+    | Some(val: v) -> return DocTags(intent, invariant: Some(val: v), complexity, alternatives, owner)
+    | None -> ()
+  end
+  match extract_tag_value(line, tag: "complexity") do
+    | Some(val: v) -> return DocTags(intent, invariant, complexity: Some(val: v), alternatives, owner)
+    | None -> ()
+  end
+  match extract_tag_value(line, tag: "alternatives") do
+    | Some(val: v) -> return DocTags(intent, invariant, complexity, alternatives: Some(val: v), owner)
+    | None -> ()
+  end
+  match extract_tag_value(line, tag: "owner") do
+    | Some(val: v) -> return DocTags(intent, invariant, complexity, alternatives, owner: Some(val: v))
+    | None -> ()
+  end
+  return acc
+end
+
+let parse_doc_tags_go = fn (lines: [string], acc: DocTags) -> DocTags do
+  match lines do
+    | [] -> return acc
+    | line :: rest -> return parse_doc_tags_go(lines: rest, acc: apply_doc_line(line, acc))
+  end
+end
+
+/** Parse @-tags from the raw inner text of a /** */ block.
+ *  Lines that do not start with a recognised @tag are ignored (they form the
+ *  prose description part of the docstring). */
+export let parse_doc_tags = fn (raw: string) -> DocTags do
+  let lines = str.split(s: raw, sep: "\n")
+  return parse_doc_tags_go(lines, acc: empty_doc_tags())
+end
+
 // ─── Top-level def lookup by name ────────────────────────────────────────────
 
 type DefHit = DefHit(
   name: string,
   span: Span,
   signature: string,
-  docstring: Option<string>
+  docstring: Option<string>,
+  tags: DocTags
 )
 
 let render_param = fn (p: Param) -> string do
@@ -281,7 +384,11 @@ let find_def_go = fn (
         end
         let Span(offset: off, line: _, col: _) = span
         let doc = extract_preceding_docstring(src, def_offset: off)
-        return Some(val: DefHit(name, span, signature: sig, docstring: doc))
+        let tag_data = match doc do
+          | Some(val: raw) -> parse_doc_tags(raw)
+          | None -> empty_doc_tags()
+        end
+        return Some(val: DefHit(name, span, signature: sig, docstring: doc, tags: tag_data))
       end
       return find_def_go(defs: rest, target, src)
     | SpannedTopLevel(node: TLCap(def: cap_def), span) :: rest ->
@@ -290,7 +397,11 @@ let find_def_go = fn (
           let sig = render_cap_signature(name, cap_def)
           let Span(offset: off, line: _, col: _) = span
           let doc = extract_preceding_docstring(src, def_offset: off)
-          return Some(val: DefHit(name, span, signature: sig, docstring: doc))
+          let tag_data = match doc do
+            | Some(val: raw) -> parse_doc_tags(raw)
+            | None -> empty_doc_tags()
+          end
+          return Some(val: DefHit(name, span, signature: sig, docstring: doc, tags: tag_data))
         end
       end
       return find_def_go(defs: rest, target, src)
@@ -300,17 +411,31 @@ end
 
 // ─── Output rendering ────────────────────────────────────────────────────────
 
+let render_tag_line = fn (label: string, opt: Option<string>) -> string do
+  match opt do
+    | None -> return ""
+    | Some(val: v) -> return "\n  @" ++ label ++ ": " ++ v
+  end
+end
+
 let render_text = fn (hit: DefHit, file: string) -> string do
-  match hit do | DefHit(name, span, signature, docstring) ->
+  match hit do | DefHit(name, span, signature, docstring, tags) ->
     match span do | Span(offset: _, line, col) ->
       let doc_line = match docstring do
         | None -> "  docstring: (none)"
         | Some(val: d) -> "  docstring: " ++ d
       end
+      let DocTags(intent, invariant, complexity, alternatives, owner) = tags
+      let tag_lines = render_tag_line(label: "intent", opt: intent)
+        ++ render_tag_line(label: "invariant", opt: invariant)
+        ++ render_tag_line(label: "complexity", opt: complexity)
+        ++ render_tag_line(label: "alternatives", opt: alternatives)
+        ++ render_tag_line(label: "owner", opt: owner)
       return name ++ "\n"
         ++ "  location: " ++ file ++ ":" ++ str.from_i64(val: line) ++ ":" ++ str.from_i64(val: col) ++ "\n"
         ++ "  signature: " ++ signature ++ "\n"
         ++ doc_line
+        ++ tag_lines
     end
   end
 end
@@ -335,8 +460,26 @@ let json_escape = fn (s: string) -> string do
   return escape_json_str_go(s, i: 0, n: str.byte_length(s), acc: "")
 end
 
+let json_opt_str_field = fn (key: string, opt: Option<string>) -> string do
+  match opt do
+    | None -> return "\"" ++ key ++ "\":null"
+    | Some(val: v) -> return "\"" ++ key ++ "\":\"" ++ json_escape(s: v) ++ "\""
+  end
+end
+
+let render_tags_json = fn (tags: DocTags) -> string do
+  let DocTags(intent, invariant, complexity, alternatives, owner) = tags
+  return "{"
+    ++ json_opt_str_field(key: "intent", opt: intent)
+    ++ "," ++ json_opt_str_field(key: "invariant", opt: invariant)
+    ++ "," ++ json_opt_str_field(key: "complexity", opt: complexity)
+    ++ "," ++ json_opt_str_field(key: "alternatives", opt: alternatives)
+    ++ "," ++ json_opt_str_field(key: "owner", opt: owner)
+    ++ "}"
+end
+
 let render_json = fn (hit: DefHit, file: string) -> string do
-  match hit do | DefHit(name, span, signature, docstring) ->
+  match hit do | DefHit(name, span, signature, docstring, tags) ->
     match span do | Span(offset: _, line, col) ->
       let doc_field = match docstring do
         | None -> "\"docstring\":null"
@@ -348,6 +491,7 @@ let render_json = fn (hit: DefHit, file: string) -> string do
         ++ ",\"col\":" ++ str.from_i64(val: col)
         ++ ",\"signature\":\"" ++ json_escape(s: signature) ++ "\""
         ++ "," ++ doc_field
+        ++ ",\"tags\":" ++ render_tags_json(tags)
         ++ "}"
     end
   end
