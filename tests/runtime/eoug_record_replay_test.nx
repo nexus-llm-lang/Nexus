@@ -1,0 +1,308 @@
+// Issue nexus-eoug — `nexus run --record/--replay` JSONL serializer unit test.
+//
+// Tests the pure serialization/deserialization logic in src/tools/record_replay.nx.
+// The actual subprocess orchestration (build + exec, capture, replay) is
+// implemented in the host-shell layer (header.sh) because WASI preview1
+// has no subprocess API.
+//
+// Coverage:
+//   1. json_escape handles the six special characters: \ " \n \r \t and passthrough.
+//   2. serialize_entry produces the expected JSONL line with all fields.
+//   3. serialize_summary produces the expected JSONL line.
+//   4. serialize_diagnostic produces the expected JSONL line.
+//   5. serialize_output (stdout + stderr) produces the expected JSONL lines.
+//   6. jsonl_get_str extracts string fields from a JSONL line.
+//   7. jsonl_get_i64 extracts integer fields from a JSONL line.
+//   8. jsonl_get_kind reads the "kind" field.
+//   9. parse_summary reconstructs a SummaryRecord from a serialized line.
+//  10. Round-trip: serialize_summary -> parse_summary yields the original record.
+
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Option, Some, None } from "std:option"
+import {
+  EntryRecord, DiagRecord, DiagError, DiagWarning, DiagInfo,
+  OutputRecord, OutputStdout, OutputStderr, SummaryRecord,
+  json_escape,
+  serialize_entry, serialize_diagnostic, serialize_output, serialize_summary,
+  jsonl_get_str, jsonl_get_i64, jsonl_get_kind, parse_summary
+} from "src/tools/record_replay.nx"
+
+// ── json_escape ────────────────────────────────────────────────────────────
+
+let test_json_escape_passthrough = fn () -> unit throws { Exn } do
+  // ASCII alphanumeric and typical path chars pass through unchanged
+  test_assert.assert_eq_string(
+    actual: json_escape(s: "hello world"),
+    expected: "hello world",
+    label: "eoug: passthrough chars unchanged")
+  test_assert.assert_eq_string(
+    actual: json_escape(s: "examples/hello.nx"),
+    expected: "examples/hello.nx",
+    label: "eoug: path slash passthrough")
+  return ()
+end
+
+let test_json_escape_special = fn () -> unit throws { Exn } do
+  test_assert.assert_eq_string(
+    actual: json_escape(s: "a\\b"),
+    expected: "a\\\\b",
+    label: "eoug: backslash escaped")
+  test_assert.assert_eq_string(
+    actual: json_escape(s: "say \"hi\""),
+    expected: "say \\\"hi\\\"",
+    label: "eoug: double-quote escaped")
+  test_assert.assert_eq_string(
+    actual: json_escape(s: "line1\nline2"),
+    expected: "line1\\nline2",
+    label: "eoug: newline escaped")
+  test_assert.assert_eq_string(
+    actual: json_escape(s: "col1\tcol2"),
+    expected: "col1\\tcol2",
+    label: "eoug: tab escaped")
+  return ()
+end
+
+// ── serialize_entry ────────────────────────────────────────────────────────
+
+let test_serialize_entry_with_seed = fn () -> unit throws { Exn } do
+  let r = EntryRecord(
+    source: "examples/hello.nx",
+    source_hash: "abc123",
+    argv: ["examples/hello.nx", "--seed", "42"],
+    seed: Some(val: "42"),
+    frozen_clock: None,
+    caps: ["Console"],
+    nexus_version: "deadbeef"
+  )
+  let line = serialize_entry(r)
+  test_assert.assert(cond: str.contains(s: line, sub: "\"kind\":\"entry\""),
+    label: "eoug: entry kind present")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"source\":\"examples/hello.nx\""),
+    label: "eoug: source field present")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"source_hash\":\"abc123\""),
+    label: "eoug: source_hash field present")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"seed\":\"42\""),
+    label: "eoug: seed field present (Some)")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"frozen_clock\":null"),
+    label: "eoug: frozen_clock null when absent")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"caps\":[\"Console\"]"),
+    label: "eoug: caps array present")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"nexus_version\":\"deadbeef\""),
+    label: "eoug: nexus_version field present")
+  return ()
+end
+
+let test_serialize_entry_no_sandbox = fn () -> unit throws { Exn } do
+  let r = EntryRecord(
+    source: "examples/hello.nx",
+    source_hash: "0000",
+    argv: ["examples/hello.nx"],
+    seed: None,
+    frozen_clock: None,
+    caps: [],
+    nexus_version: "cafe"
+  )
+  let line = serialize_entry(r)
+  test_assert.assert(cond: str.contains(s: line, sub: "\"seed\":null"),
+    label: "eoug: seed null when absent")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"caps\":[]"),
+    label: "eoug: empty caps array")
+  return ()
+end
+
+// ── serialize_diagnostic ──────────────────────────────────────────────────
+
+let test_serialize_diagnostic = fn () -> unit throws { Exn } do
+  let r = DiagRecord(
+    level: DiagError,
+    code: "E1001",
+    message: "undefined variable",
+    span: "examples/hello.nx:5:3"
+  )
+  let line = serialize_diagnostic(r)
+  test_assert.assert(cond: str.contains(s: line, sub: "\"kind\":\"diagnostic\""),
+    label: "eoug: diagnostic kind present")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"level\":\"error\""),
+    label: "eoug: level=error")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"code\":\"E1001\""),
+    label: "eoug: code field present")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"message\":\"undefined variable\""),
+    label: "eoug: message field present")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"span\":\"examples/hello.nx:5:3\""),
+    label: "eoug: span field present")
+  return ()
+end
+
+// ── serialize_output ──────────────────────────────────────────────────────
+
+let test_serialize_output_stdout = fn () -> unit throws { Exn } do
+  let r = OutputRecord(kind: OutputStdout, ts_ms: 1234, line: "Hello, world!")
+  let line = serialize_output(r)
+  test_assert.assert(cond: str.contains(s: line, sub: "\"kind\":\"stdout\""),
+    label: "eoug: output kind=stdout")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"ts_ms\":1234"),
+    label: "eoug: ts_ms present")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"line\":\"Hello, world!\""),
+    label: "eoug: line field present")
+  return ()
+end
+
+let test_serialize_output_stderr = fn () -> unit throws { Exn } do
+  let r = OutputRecord(kind: OutputStderr, ts_ms: 5678, line: "nexus: error")
+  let line = serialize_output(r)
+  test_assert.assert(cond: str.contains(s: line, sub: "\"kind\":\"stderr\""),
+    label: "eoug: output kind=stderr")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"ts_ms\":5678"),
+    label: "eoug: ts_ms present (stderr)")
+  return ()
+end
+
+// ── serialize_summary ─────────────────────────────────────────────────────
+
+let test_serialize_summary = fn () -> unit throws { Exn } do
+  let r = SummaryRecord(exit_code: 0, wall_ms: 312)
+  let line = serialize_summary(r)
+  test_assert.assert(cond: str.contains(s: line, sub: "\"kind\":\"summary\""),
+    label: "eoug: summary kind present")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"exit_code\":0"),
+    label: "eoug: exit_code=0")
+  test_assert.assert(cond: str.contains(s: line, sub: "\"wall_ms\":312"),
+    label: "eoug: wall_ms present")
+  return ()
+end
+
+// ── jsonl_get_str ─────────────────────────────────────────────────────────
+
+let test_jsonl_get_str = fn () -> unit throws { Exn } do
+  let line = "{\"kind\":\"entry\",\"source\":\"examples/hello.nx\",\"seed\":null}"
+  match jsonl_get_str(line, key: "kind") do
+    | Some(val: v) ->
+      test_assert.assert_eq_string(actual: v, expected: "entry",
+        label: "eoug: jsonl_get_str extracts kind")
+    | None -> raise RuntimeError(val: "eoug: jsonl_get_str kind returned None")
+  end
+  match jsonl_get_str(line, key: "source") do
+    | Some(val: v) ->
+      test_assert.assert_eq_string(actual: v, expected: "examples/hello.nx",
+        label: "eoug: jsonl_get_str extracts source")
+    | None -> raise RuntimeError(val: "eoug: jsonl_get_str source returned None")
+  end
+  match jsonl_get_str(line, key: "seed") do
+    | None -> () // null → None is correct
+    | Some(_) -> raise RuntimeError(val: "eoug: jsonl_get_str should return None for null")
+  end
+  match jsonl_get_str(line, key: "absent") do
+    | None -> () // absent key → None
+    | Some(_) -> raise RuntimeError(val: "eoug: jsonl_get_str absent key should be None")
+  end
+  return ()
+end
+
+// ── jsonl_get_i64 ─────────────────────────────────────────────────────────
+
+let test_jsonl_get_i64 = fn () -> unit throws { Exn } do
+  let line = "{\"kind\":\"summary\",\"exit_code\":0,\"wall_ms\":1234}"
+  match jsonl_get_i64(line, key: "exit_code") do
+    | Some(val: v) ->
+      test_assert.assert_eq_i64(actual: v, expected: 0,
+        label: "eoug: jsonl_get_i64 exit_code=0")
+    | None -> raise RuntimeError(val: "eoug: jsonl_get_i64 exit_code returned None")
+  end
+  match jsonl_get_i64(line, key: "wall_ms") do
+    | Some(val: v) ->
+      test_assert.assert_eq_i64(actual: v, expected: 1234,
+        label: "eoug: jsonl_get_i64 wall_ms=1234")
+    | None -> raise RuntimeError(val: "eoug: jsonl_get_i64 wall_ms returned None")
+  end
+  match jsonl_get_i64(line, key: "absent") do
+    | None -> () // absent key → None
+    | Some(_) -> raise RuntimeError(val: "eoug: jsonl_get_i64 absent key should be None")
+  end
+  return ()
+end
+
+// ── jsonl_get_kind ────────────────────────────────────────────────────────
+
+let test_jsonl_get_kind = fn () -> unit throws { Exn } do
+  let entry_line = "{\"kind\":\"entry\",\"source\":\"x.nx\"}"
+  test_assert.assert_eq_string(
+    actual: jsonl_get_kind(line: entry_line),
+    expected: "entry",
+    label: "eoug: jsonl_get_kind entry")
+  let summary_line = "{\"kind\":\"summary\",\"exit_code\":1,\"wall_ms\":50}"
+  test_assert.assert_eq_string(
+    actual: jsonl_get_kind(line: summary_line),
+    expected: "summary",
+    label: "eoug: jsonl_get_kind summary")
+  test_assert.assert_eq_string(
+    actual: jsonl_get_kind(line: "{}"),
+    expected: "",
+    label: "eoug: jsonl_get_kind absent returns empty")
+  return ()
+end
+
+// ── parse_summary round-trip ──────────────────────────────────────────────
+
+let test_parse_summary_round_trip = fn () -> unit throws { Exn } do
+  // Round-trip: serialize then parse
+  let original = SummaryRecord(exit_code: 42, wall_ms: 999)
+  let line = serialize_summary(r: original)
+  match parse_summary(line) do
+    | None -> raise RuntimeError(val: "eoug: parse_summary returned None on valid line")
+    | Some(val: SummaryRecord(exit_code, wall_ms)) ->
+      test_assert.assert_eq_i64(actual: exit_code, expected: 42,
+        label: "eoug: round-trip exit_code=42")
+      test_assert.assert_eq_i64(actual: wall_ms, expected: 999,
+        label: "eoug: round-trip wall_ms=999")
+  end
+  return ()
+end
+
+let test_parse_summary_failure = fn () -> unit throws { Exn } do
+  // Non-summary line returns None
+  match parse_summary(line: "{\"kind\":\"entry\",\"source\":\"x.nx\"}") do
+    | None -> () // correct — no exit_code field
+    | Some(_) -> raise RuntimeError(val: "eoug: parse_summary should fail on entry line")
+  end
+  return ()
+end
+
+// ── runner ────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit throws { Exn } do
+  test_json_escape_passthrough()
+  test_json_escape_special()
+  test_serialize_entry_with_seed()
+  test_serialize_entry_no_sandbox()
+  test_serialize_diagnostic()
+  test_serialize_output_stdout()
+  test_serialize_output_stderr()
+  test_serialize_summary()
+  test_jsonl_get_str()
+  test_jsonl_get_i64()
+  test_jsonl_get_kind()
+  test_parse_summary_round_trip()
+  test_parse_summary_failure()
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end

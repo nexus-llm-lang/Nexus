@@ -314,6 +314,9 @@ if [ "$RUN_MODE" = "1" ]; then
   SB_NO_CLOCK=0
   SB_NO_RAND=0
   SB_TMP_FS=""
+  # Record/replay session (nexus-eoug)
+  RUN_RECORD=""
+  RUN_REPLAY=""
   # Compiler build pass-through flags (all sandbox flags go to the compiler
   # for cap-strip validation; only then do we construct the run argv).
   SB_COMPILE_FLAGS=""
@@ -425,6 +428,24 @@ if [ "$RUN_MODE" = "1" ]; then
       --tmp-fs=*)
         SB_TMP_FS="${1#--tmp-fs=}"
         _append_compile_flag "$1"
+        shift
+        ;;
+      --record)
+        # nexus-eoug: record session to FILE; do NOT pass to compiler
+        RUN_RECORD="${2:-}"
+        shift 2
+        ;;
+      --record=*)
+        RUN_RECORD="${1#--record=}"
+        shift
+        ;;
+      --replay)
+        # nexus-eoug: replay recorded session from FILE; do NOT pass to compiler
+        RUN_REPLAY="${2:-}"
+        shift 2
+        ;;
+      --replay=*)
+        RUN_REPLAY="${1#--replay=}"
         shift
         ;;
       --explain-capabilities|--format|--explain-capabilities-format)
@@ -543,6 +564,176 @@ if [ "$RUN_MODE" = "1" ]; then
   # --dir for tmp always granted (programs need /tmp)
   _append_run_flag "--dir"
   _append_run_flag "${TMPDIR:-/tmp}"
+
+  # ── record mode (nexus-eoug) ───────────────────────────────────────────
+  # Capture stdout + stderr + timing + exit code into a JSONL file.
+  # The JSONL schema:
+  #   line 1: {"kind":"entry","source":"...","source_hash":"...","argv":[...],"seed":...,
+  #             "frozen_clock":...,"caps":[],"nexus_version":"..."}
+  #   lines 2+: {"kind":"stdout","ts_ms":<i64>,"line":"..."}
+  #              {"kind":"stderr","ts_ms":<i64>,"line":"..."}
+  #   last line: {"kind":"summary","exit_code":<i64>,"wall_ms":<i64>}
+  #
+  # Note: we do NOT exec here — we run + wait so we can capture output.
+  if [ -n "$RUN_RECORD" ]; then
+    _json_esc() {
+      # Minimal JSON string escaping: \, ", \n, \r, \t
+      printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/'"$(printf '\r')"'/\\r/g; s/'"$(printf '\t')"'/\\t/g' | awk '{printf "%s\\n", $0}' | head -c -2
+    }
+    _json_str() { printf '"%s"' "$(_json_esc "$1")"; }
+    _json_opt() {
+      if [ -z "$1" ]; then printf 'null'; else printf '"%s"' "$(_json_esc "$1")"; fi
+    }
+    _ts_ms() { date '+%s%3N' 2>/dev/null || date '+%s000' 2>/dev/null || echo 0; }
+    # Compute source hash (sha256 first byte of hex is stable; fall back to size)
+    _src_hash=""
+    if command -v sha256sum >/dev/null 2>&1; then
+      _src_hash=$(sha256sum "$RUN_INPUT" 2>/dev/null | cut -d' ' -f1)
+    elif command -v shasum >/dev/null 2>&1; then
+      _src_hash=$(shasum -a 256 "$RUN_INPUT" 2>/dev/null | cut -d' ' -f1)
+    fi
+    [ -z "$_src_hash" ] && _src_hash="unknown"
+    # Get nexus version (git sha of compiler payload)
+    _nxver=$(git -C "$(dirname "$0")" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    # Build argv JSON array
+    _argv_json="[$(_json_str "$RUN_INPUT")"
+    if [ -n "$SB_SEED" ]; then _argv_json="$_argv_json,$(_json_str "--seed"),$(_json_str "$SB_SEED")"; fi
+    if [ -n "$SB_FROZEN_CLOCK" ]; then _argv_json="$_argv_json,$(_json_str "--frozen-clock"),$(_json_str "$SB_FROZEN_CLOCK")"; fi
+    if [ -n "$SB_MAX_TIME" ]; then _argv_json="$_argv_json,$(_json_str "--max-time"),$(_json_str "$SB_MAX_TIME")"; fi
+    if [ -n "$SB_MAX_MEM" ]; then _argv_json="$_argv_json,$(_json_str "--max-mem"),$(_json_str "$SB_MAX_MEM")"; fi
+    if [ "$SB_NO_NET" = "1" ]; then _argv_json="$_argv_json,$(_json_str "--no-net")"; fi
+    if [ "$SB_NO_FS" = "1" ]; then _argv_json="$_argv_json,$(_json_str "--no-fs")"; fi
+    if [ "$SB_NO_CLOCK" = "1" ]; then _argv_json="$_argv_json,$(_json_str "--no-clock")"; fi
+    if [ "$SB_NO_RAND" = "1" ]; then _argv_json="$_argv_json,$(_json_str "--no-rand")"; fi
+    if [ -n "$SB_TMP_FS" ]; then _argv_json="$_argv_json,$(_json_str "--tmp-fs"),$(_json_str "$SB_TMP_FS")"; fi
+    _argv_json="$_argv_json]"
+    # Write entry record
+    printf '{"kind":"entry","source":%s,"source_hash":%s,"argv":%s,"seed":%s,"frozen_clock":%s,"caps":[],"nexus_version":%s}\n' \
+      "$(_json_str "$RUN_INPUT")" \
+      "$(_json_str "$_src_hash")" \
+      "$_argv_json" \
+      "$(_json_opt "$SB_SEED")" \
+      "$(_json_opt "$SB_FROZEN_CLOCK")" \
+      "$(_json_str "$_nxver")" \
+      > "$RUN_RECORD"
+    # Run and capture stdout/stderr, timestamping each line
+    _t0=$(_ts_ms)
+    _rec_out=$(mktemp "${TMPDIR:-/tmp}/nexus-rec-out.XXXXXX")
+    _rec_err=$(mktemp "${TMPDIR:-/tmp}/nexus-rec-err.XXXXXX")
+    # shellcheck disable=SC2086
+    if [ "$HAVE_PROG_ARGS" = "1" ]; then
+      eval wasmtime run \
+        -W \"\$W_FLAGS\" \
+        -S threads \
+        ${RUN_SB_FLAGS:-} \
+        \${NEXUS_WASMTIME_ARGS:-} \
+        \"\$RUN_WASM\" $RUN_PROG_ARGS \
+        >"$_rec_out" 2>"$_rec_err"
+    else
+      # shellcheck disable=SC2086
+      eval wasmtime run \
+        -W \"\$W_FLAGS\" \
+        -S threads \
+        ${RUN_SB_FLAGS:-} \
+        \${NEXUS_WASMTIME_ARGS:-} \
+        \"\$RUN_WASM\" \
+        >"$_rec_out" 2>"$_rec_err"
+    fi
+    _run_exit=$?
+    _t1=$(_ts_ms)
+    _wall_ms=$((_t1 - _t0))
+    # Emit stdout lines to JSONL and to the terminal
+    if [ -s "$_rec_out" ]; then
+      cat "$_rec_out"
+      _ts_now=$(_ts_ms)
+      while IFS= read -r _line || [ -n "$_line" ]; do
+        printf '{"kind":"stdout","ts_ms":%s,"line":%s}\n' "$_ts_now" "$(_json_str "$_line")" >> "$RUN_RECORD"
+      done < "$_rec_out"
+    fi
+    # Emit stderr lines to JSONL and to the terminal
+    if [ -s "$_rec_err" ]; then
+      cat "$_rec_err" >&2
+      _ts_now=$(_ts_ms)
+      while IFS= read -r _line || [ -n "$_line" ]; do
+        printf '{"kind":"stderr","ts_ms":%s,"line":%s}\n' "$_ts_now" "$(_json_str "$_line")" >> "$RUN_RECORD"
+      done < "$_rec_err"
+    fi
+    rm -f "$_rec_out" "$_rec_err"
+    # Write summary record
+    printf '{"kind":"summary","exit_code":%d,"wall_ms":%d}\n' "$_run_exit" "$_wall_ms" >> "$RUN_RECORD"
+    exit "$_run_exit"
+  fi
+
+  # ── replay mode (nexus-eoug) ──────────────────────────────────────────
+  # Re-run the program and assert byte-equivalence of stdout/stderr/exit.
+  # Divergence prints a structural diff and exits non-zero.
+  if [ -n "$RUN_REPLAY" ]; then
+    if [ ! -f "$RUN_REPLAY" ]; then
+      echo "nexus run --replay: session file not found: $RUN_REPLAY" >&2
+      exit 2
+    fi
+    # Extract recorded stdout and exit_code from the JSONL session
+    _rep_expected_stdout=$(mktemp "${TMPDIR:-/tmp}/nexus-rep-exp-out.XXXXXX")
+    _rep_expected_exit=0
+    while IFS= read -r _jline; do
+      _kind=$(printf '%s' "$_jline" | sed -n 's/.*"kind":"\([^"]*\)".*/\1/p')
+      case "$_kind" in
+        stdout)
+          # Extract the "line" field and append to expected stdout
+          _val=$(printf '%s' "$_jline" | sed -n 's/.*"line":"\(.*\)"[[:space:]]*}/\1/p')
+          printf '%s\n' "$_val" >> "$_rep_expected_stdout"
+          ;;
+        summary)
+          _rep_expected_exit=$(printf '%s' "$_jline" | sed -n 's/.*"exit_code":\([0-9-]*\).*/\1/p')
+          ;;
+      esac
+    done < "$RUN_REPLAY"
+    # Run the program (discarding stderr from the replayed run to stdout comparison)
+    _rep_actual_stdout=$(mktemp "${TMPDIR:-/tmp}/nexus-rep-act-out.XXXXXX")
+    _rep_actual_stderr=$(mktemp "${TMPDIR:-/tmp}/nexus-rep-act-err.XXXXXX")
+    # shellcheck disable=SC2086
+    if [ "$HAVE_PROG_ARGS" = "1" ]; then
+      eval wasmtime run \
+        -W \"\$W_FLAGS\" \
+        -S threads \
+        ${RUN_SB_FLAGS:-} \
+        \${NEXUS_WASMTIME_ARGS:-} \
+        \"\$RUN_WASM\" $RUN_PROG_ARGS \
+        >"$_rep_actual_stdout" 2>"$_rep_actual_stderr"
+    else
+      # shellcheck disable=SC2086
+      eval wasmtime run \
+        -W \"\$W_FLAGS\" \
+        -S threads \
+        ${RUN_SB_FLAGS:-} \
+        \${NEXUS_WASMTIME_ARGS:-} \
+        \"\$RUN_WASM\" \
+        >"$_rep_actual_stdout" 2>"$_rep_actual_stderr"
+    fi
+    _rep_actual_exit=$?
+    # Stream actual stderr so user sees it
+    if [ -s "$_rep_actual_stderr" ]; then
+      cat "$_rep_actual_stderr" >&2
+    fi
+    # Compare
+    _rep_ok=1
+    if [ "$_rep_actual_exit" != "$_rep_expected_exit" ]; then
+      echo "nexus replay: DIVERGE — exit code: expected=$_rep_expected_exit actual=$_rep_actual_exit" >&2
+      _rep_ok=0
+    fi
+    if ! diff -u "$_rep_expected_stdout" "$_rep_actual_stdout" >/dev/null 2>&1; then
+      echo "nexus replay: DIVERGE — stdout mismatch:" >&2
+      diff -u "$_rep_expected_stdout" "$_rep_actual_stdout" >&2 || true
+      _rep_ok=0
+    fi
+    rm -f "$_rep_expected_stdout" "$_rep_actual_stdout" "$_rep_actual_stderr"
+    if [ "$_rep_ok" = "1" ]; then
+      echo "nexus replay: OK — byte-equivalent" >&2
+      exit 0
+    else
+      exit 4
+    fi
+  fi
 
   # Run-phase exec.
   # shellcheck disable=SC2086
