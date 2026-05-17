@@ -8,7 +8,8 @@
 import * as bb from "std:bytebuffer"
 import * as naming from "src/common/naming.nx"
 import { TypeExpr, TyUnit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyHandler, NamedType, EnumDef, RecordDef, VariantDef, VariantField } from "src/common/ast.nx"
-import { HirProgram, HirFunction, HirHandlerArm, HirParam, HirExternal, HirPort, HirHandlerBindingEntry, HirHandlerBinding, EagerBody, LazyBody } from "src/ir/hir/types.nx"
+import { HirProgram, HirFunction, HirHandlerArm, HirParam, HirExternal, HirPort, HirPortMethod, HirHandlerBindingEntry, HirHandlerBinding, EagerBody, LazyBody } from "src/ir/hir/types.nx"
+import { Span } from "src/common/token.nx"
 import { TypeError, TypeMismatch, MissingMain, MainNotFunction, MainNotUnit, MainThrowsTooBroad, DuplicateTopLevelBinding } from "src/common/error.nx"
 import { CheckState, Scheme, EnvEntry, EnumEntry, TypeDefEntry, InferExprOk, InferExprErr }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
@@ -30,6 +31,12 @@ export let check_program = fn (hir: HirProgram, local_names: [string], require_m
   let st1 = register_externals(state, exts)
   let st2 = register_functions(state: st1, funcs)
   let st3 = register_ports(state: st2, ports)
+  // Pass 1b: T-Handler arm/method 1-1 correspondence (spec §T-Handler line 1119).
+  // Reject any handler that supplies an extra arm or omits a declared port method
+  // before any signature/body is registered; missing arms would otherwise leave
+  // a port-method slot unimplemented and turn into runtime UB at port-call
+  // dispatch, and extra arms would silently introduce a never-routed name.
+  validate_handler_arm_sets(ports, hbs)
   let st4 = register_handler_bindings(state: st3, hbs)
   let st5 = register_enum_constructors(state: st4, defs: edefs)
 
@@ -382,6 +389,107 @@ let list_init = fn (xs: [HirParam]) -> [HirParam] do
   match xs do
     | [] | _ :: [] -> return []
     | x :: rest -> return x :: list_init(xs: rest)
+  end
+end
+
+// ─── T-Handler arm/method 1-1 correspondence ────────────────────────────────
+// Spec (type-system-formal.md §T-Handler, line 1119):
+//   { ℓ_j | j ∈ J } = { ℓ | (ℓ = e) ∈ overline{ℓ_j = e_j} }
+// The handler literal must supply exactly the methods declared on its port —
+// no missing arm, no extra arm. The earlier impl in this file registered arms
+// (register_handler_bindings / register_handler_methods) and type-checked each
+// arm body individually (check_handler_arm_bodies) without ever comparing the
+// supplied arm-name set against methods(port). That left a missing arm silently
+// admitted (and exposed at runtime as undefined dispatch) and an extra arm
+// silently admitted as dead, unroutable code.
+//
+// We validate set-equality at the top of check_program, before any arm
+// signature/body work happens, so a structurally incomplete handler is rejected
+// with a TypeMismatch keyed off the handler binding's first failing arm span
+// (or the first arm's span if the failure is "missing arm").
+
+/** Spec §T-Handler arm/method 1-1 correspondence (line 1119): rejects
+ *  handlers that supply an extra arm or omit a declared port method. Public
+ *  for direct unit-test against handcrafted (ports, hbs) pairs without
+ *  building a full HirProgram.
+ */
+export let validate_handler_arm_sets = fn (ports: [HirPort], hbs: [HirHandlerBindingEntry]) -> unit throws { TypeError } do
+  match hbs do
+    | [] -> return ()
+    | HirHandlerBindingEntry(name: hname, binding: HirHandlerBinding(port_name: pname, arms)) :: rest ->
+      let port_methods = lookup_port_methods(ports, port_name: pname)
+      let prefix_len = naming.handler_prefix_len(handler_name: hname)
+      let supplied = collect_arm_original_names(arms, prefix_len)
+      let arm_span = first_arm_span(arms)
+      check_no_extra_arm(handler_name: hname, port_name: pname, supplied, port_methods, arms, prefix_len)
+      check_no_missing_arm(handler_name: hname, port_name: pname, supplied, port_methods, arm_span)
+      return validate_handler_arm_sets(ports, hbs: rest)
+  end
+end
+
+let lookup_port_methods = fn (ports: [HirPort], port_name: string) -> [string] do
+  match ports do
+    | [] -> return []
+    | HirPort(name: n, methods) :: rest ->
+      if n == port_name then return port_method_names(methods) end
+      return lookup_port_methods(ports: rest, port_name)
+  end
+end
+
+let port_method_names = fn (methods: [HirPortMethod]) -> [string] do
+  match methods do
+    | [] -> return []
+    | HirPortMethod(name: n) :: rest -> return n :: port_method_names(methods: rest)
+  end
+end
+
+let collect_arm_original_names = fn (arms: [HirHandlerArm], prefix_len: i64) -> [string] do
+  match arms do
+    | [] -> return []
+    | HirHandlerArm(arm: HirFunction(name: n, _), cont_binder: _) :: rest ->
+      let original = str.substring(s: n, start: prefix_len, len: str.length(s: n) - prefix_len)
+      return original :: collect_arm_original_names(arms: rest, prefix_len)
+  end
+end
+
+let first_arm_span = fn (arms: [HirHandlerArm]) -> Span do
+  match arms do
+    | [] -> return Span(offset: 0, line: 0, col: 0)
+    | HirHandlerArm(arm: HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span, file: _), cont_binder: _) :: _ -> return span
+  end
+end
+
+let check_no_extra_arm = fn (handler_name: string, port_name: string, supplied: [string], port_methods: [string], arms: [HirHandlerArm], prefix_len: i64) -> unit throws { TypeError } do
+  match arms do
+    | [] -> return ()
+    | HirHandlerArm(arm: HirFunction(name: n, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span, file: _), cont_binder: _) :: rest ->
+      let original = str.substring(s: n, start: prefix_len, len: str.length(s: n) - prefix_len)
+      if str_list_contains(xs: port_methods, s: original) then
+        return check_no_extra_arm(handler_name, port_name, supplied, port_methods, arms: rest, prefix_len)
+      end
+      let detail = bb.concat(parts: [
+        "handler '", handler_name, "' for port '", port_name,
+        "' supplies arm '", original,
+        "' which is not declared as a method of port '", port_name,
+        "' (T-Handler arm/method 1-1 correspondence: no extra arm)"
+      ])
+      raise TypeMismatch(func_name: handler_name, detail, span)
+  end
+end
+
+let check_no_missing_arm = fn (handler_name: string, port_name: string, supplied: [string], port_methods: [string], arm_span: Span) -> unit throws { TypeError } do
+  match port_methods do
+    | [] -> return ()
+    | m :: rest ->
+      if str_list_contains(xs: supplied, s: m) then
+        return check_no_missing_arm(handler_name, port_name, supplied, port_methods: rest, arm_span)
+      end
+      let detail = bb.concat(parts: [
+        "handler '", handler_name, "' for port '", port_name,
+        "' is missing arm for declared method '", m,
+        "' (T-Handler arm/method 1-1 correspondence: no missing arm)"
+      ])
+      raise TypeMismatch(func_name: handler_name, detail, span: arm_span)
   end
 end
 
