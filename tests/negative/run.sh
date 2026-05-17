@@ -1,5 +1,5 @@
 #!/bin/sh
-# examples/negative/run.sh — drive the negative-example corpus.
+# tests/negative/run.sh — drive the negative-fixture corpus.
 #
 # Two flavors of negative fixture are supported. Each is selected by the
 # header directive present in the file.
@@ -50,8 +50,8 @@
 # as $1 (default: the dir holding this script).
 #
 # Usage:
-#   ./examples/negative/run.sh                # walks examples/negative/
-#   ./examples/negative/run.sh path/to/fixtures
+#   ./tests/negative/run.sh                # walks tests/negative/
+#   ./tests/negative/run.sh path/to/fixtures
 #
 # Env overrides:
 #   NEXUS_BIN      — path to the nexus launcher (default: ./nexus)

@@ -4,6 +4,12 @@ Minimal, runnable demonstrations of Nexus features. Each file is
 self-contained; build any one with `nexus build <path>` and execute it
 with `nexus run <path>`.
 
+This corpus is **positive-only** — every file here compiles and runs.
+Intentionally-broken snippets used as compiler regression tests live
+under [`../tests/negative/`](../tests/negative/) with their own runner
+([`../tests/negative/run.sh`](../tests/negative/run.sh)); they are not
+example material and are not indexed here.
+
 ## Root corpus — end-to-end samples
 
 | File | What it shows |

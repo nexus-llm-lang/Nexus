@@ -1,7 +1,10 @@
 # Examples index
 
 This corpus is the entry point for both **humans learning Nexus** and
-**LLMs training/referencing** the language. It is paired with a
+**LLMs training/referencing** the language. Everything indexed here is
+*positive* (compilable, runnable) material — intentionally-broken
+fixtures live under [`tests/negative/`](../tests/negative/) as compiler
+regression tests, not as user copy-from material. It is paired with a
 machine-readable counterpart at [`index.json`](./index.json) (validated
 against [`index.schema.json`](./index.schema.json)).
 
@@ -11,10 +14,8 @@ against [`index.schema.json`](./index.schema.json)).
 | --- | --- | --- |
 | `examples/` (root) | Historical end-to-end samples (hello, fib, bench) | 7 |
 | `examples/feature/` | One minimal example per language feature / stdlib module | 38 |
-| `examples/negative/` | Intentionally broken snippets; runner asserts the diagnostic (compile-time *or* runtime throw) | 19 |
 
-Total: **64 examples**. See [`negative/run.sh`](./negative/run.sh) for
-the negative-corpus driver.
+Total: **45 examples**.
 
 ## How to use
 
@@ -23,9 +24,6 @@ the negative-corpus driver.
 * **Find a minimal example for a feature** — every entry under
   `examples/feature/` is the *minimal* compilable demonstration of one
   surface (one cap, one stdlib module, one pattern variety, etc.).
-* **Show me what NOT to do** — `examples/negative/` is the
-  intentionally-broken corpus. Each file declares the diagnostic it
-  expects to provoke via header comments (`// expect-fail: E2007`).
 
 ## Positive examples — by topic
 
@@ -81,67 +79,14 @@ the negative-corpus driver.
 | `std:lazy` | [`feature/lazy_parallel.nx`](./feature/lazy_parallel.nx) |
 | `std:exn` | [`feature/exn_todo.nx`](./feature/exn_todo.nx) |
 
-## Negative examples
+## Negative fixtures
 
-Each fixture under `examples/negative/` declares its expected failure
-mode through one of two header-comment flavors.
-
-### Flavor A — compile-time diagnostic
-
-```
-// expect-fail: E2007            (required; the diagnostic code)
-// expect-msg: linear binding    (optional; repeatable substring assertion)
-```
-
-The runner asserts the fixture (a) fails to compile, (b) reports the
-declared code in the diagnostic, and (c) contains every declared
-substring.
-
-### Flavor B — runtime throw (added in fl9t.1)
-
-```
-// expect-runtime-throw: before unwrap   (required; ≥1; substring assertion
-//                                         against the combined run output)
-// expect-msg: optional extra            (optional; treated as additional
-//                                         substring assertions)
-```
-
-The runner asserts the fixture (a) compiles successfully, (b) exits
-non-zero under `nexus run`, and (c) every declared substring appears in
-the combined stdout+stderr. wasmtime does not surface the exception
-constructor on stderr, so fixtures typically anchor their assertion on
-a `println` line emitted just before the throwing site.
-
-### Run
-
-```sh
-./examples/negative/run.sh                 # walks examples/negative/
-./examples/negative/run.sh <other-dir>     # walks another directory
-```
-
-### Corpus
-
-| File | Mode | Demonstrates |
-| --- | --- | --- |
-| [`negative/linear_unused.nx`](./negative/linear_unused.nx) | E2007 | `%`-binding falls out of scope unconsumed |
-| [`negative/lazy_unforced.nx`](./negative/lazy_unforced.nx) | E2005 | `@`-binding is never forced |
-| [`negative/lazy_double_force.nx`](./negative/lazy_double_force.nx) | E2006 | `@`-binding forced more than once |
-| [`negative/main_wrong_return.nx`](./negative/main_wrong_return.nx) | E2004 | `main` returns non-`unit` |
-| [`negative/non_exhaustive_match.nx`](./negative/non_exhaustive_match.nx) | E2001 | `match` misses a sum-type variant |
-| [`negative/type_mismatch.nx`](./negative/type_mismatch.nx) | E2001 | `let` annotation contradicts RHS |
-| [`negative/unbound_variable.nx`](./negative/unbound_variable.nx) | E2001 | Reference to an undefined identifier |
-| [`negative/missing_argument.nx`](./negative/missing_argument.nx) | E2001 | Call site omits a named parameter |
-| [`negative/parse_unterminated_string.nx`](./negative/parse_unterminated_string.nx) | E1001 | Unterminated `"..."` literal |
-| [`negative/import_module_not_found.nx`](./negative/import_module_not_found.nx) | E4004 | `import "std:NAME"` with no matching file |
-| [`negative/option_unwrap_none.nx`](./negative/option_unwrap_none.nx) | runtime | `std:option.unwrap(None)` raises `RuntimeError` |
-| [`negative/result_unhandled_err.nx`](./negative/result_unhandled_err.nx) | runtime | Caller raises on `Err(...)` (idiomatic Result→Exn lift) |
-| [`negative/math_div_by_zero.nx`](./negative/math_div_by_zero.nx) | runtime | Bare `/` by 0 on i64 traps (`integer divide by zero`) |
-| [`negative/str_invalid_f64.nx`](./negative/str_invalid_f64.nx) | runtime | `std:str.to_f64` raises `InvalidF64` |
-| [`negative/hashmap_missing_key.nx`](./negative/hashmap_missing_key.nx) | runtime | Caller raises on `Lookup::Missing` from `hashmap.get` |
-| [`negative/stringmap_missing_key.nx`](./negative/stringmap_missing_key.nx) | runtime | Same shape against `std:stringmap.get` |
-| [`negative/json_parse_invalid.nx`](./negative/json_parse_invalid.nx) | runtime | `std:json.parse` raises `JsonError` on malformed input |
-| [`negative/bytebuffer_file_not_found.nx`](./negative/bytebuffer_file_not_found.nx) | runtime | `std:bytebuffer.read_binary_file` raises `FileNotFound` |
-| [`negative/regexp_invalid_pattern.nx`](./negative/regexp_invalid_pattern.nx) | runtime | `std:regexp.from_string` raises `InvalidRegexp` on `[` |
+Intentionally-broken snippets are not example material — they are
+compiler regression tests and live under
+[`tests/negative/`](../tests/negative/) with their own runner
+([`tests/negative/run.sh`](../tests/negative/run.sh)). See the
+file-local header comments there for the `expect-fail:` /
+`expect-runtime-throw:` directive shapes.
 
 ## Schema
 
