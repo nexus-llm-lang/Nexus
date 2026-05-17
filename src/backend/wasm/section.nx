@@ -226,6 +226,15 @@ let emit_wasi_run_type_scratch = fn (scratch: %ByteBuffer) -> %ByteBuffer do
   return bb.push_uleb128(%buf, val: 0)
 end
 
+/** For p3-component mode: wasi_run wrapper returns i32 (0=ok) to satisfy
+ *  the component canon lift for `result<none,none>`. */
+let emit_wasi_run_type_scratch_p3 = fn (scratch: %ByteBuffer) -> %ByteBuffer do
+  let %buf = bb.push_byte(buf: %scratch, byte: wdefs.wasm_form_func)
+  let %buf = bb.push_uleb128(%buf, val: 0)
+  let %buf = bb.push_uleb128(%buf, val: 1)
+  return bb.push_byte(buf: %buf, byte: wdefs.vt_i32)
+end
+
 let emit_eh_type_scratch = fn (scratch: %ByteBuffer) -> %ByteBuffer do
   let %buf = bb.push_byte(buf: %scratch, byte: wdefs.wasm_form_func)
   let %buf = bb.push_uleb128(%buf, val: 1)
@@ -416,9 +425,13 @@ let commit_cabi_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64
   return commit_skip(%section, %seen, n_unique)
 end
 
-let commit_wasi_run_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64) -> %CommitStep do
+let commit_wasi_run_type = fn (section: %ByteBuffer, seen: %StringMap, n_unique: i64, p3_component: bool) -> %CommitStep do
   let %scratch = bb.empty()
-  let %scratch = emit_wasi_run_type_scratch(%scratch)
+  let %scratch = if p3_component then
+    emit_wasi_run_type_scratch_p3(%scratch)
+  else
+    emit_wasi_run_type_scratch(%scratch)
+  end
   return td_commit(%section, %seen, n_unique, %scratch)
 end
 
@@ -430,7 +443,8 @@ end
  */
 export let build_type_section_dedup = fn (program: LirProgram, has_eh: bool, has_ss: bool,
                                           has_alloc: bool,
-                                          has_cabi_realloc: bool, closure_arities: [i64]) -> %DedupedTypes do
+                                          has_cabi_realloc: bool, closure_arities: [i64],
+                                          p3_component: bool) -> %DedupedTypes do
   let LirProgram(functions: funcs, externals: exts) = program
   let %section = bb.empty()
   let %seen = sm.empty()
@@ -445,7 +459,7 @@ export let build_type_section_dedup = fn (program: LirProgram, has_eh: bool, has
   let %seen = launder_smap(m: %seen)
 
   let CommitStep(%section, %seen, n_unique: nu_c, idx: wasi_run_idx_raw) =
-    commit_wasi_run_type(%section, %seen, n_unique: nu_b)
+    commit_wasi_run_type(%section, %seen, n_unique: nu_b, p3_component)
   let wasi_run_idx = wasi_run_idx_raw
   let %section = launder_buf(b: %section)
   let %seen = launder_smap(m: %seen)
@@ -1105,11 +1119,9 @@ end
 export let build_cm_canon_ws_wait_drop = fn (mem_idx: i64) -> %ByteBuffer do
   let %sec = bb.empty()
   let %sec = bb.push_uleb128(buf: %sec, val: 2)
-  // waitable-set.wait (cancellable=0, 1 opt: Memory)
+  // waitable-set.wait: opcode, cancellable=0, memory_idx (direct, no opts vector)
   let %sec = bb.push_byte(buf: %sec, byte: wdefs.cm_canon_ws_wait)
   let %sec = bb.push_uleb128(buf: %sec, val: 0)
-  let %sec = bb.push_uleb128(buf: %sec, val: 1)
-  let %sec = bb.push_byte(buf: %sec, byte: wdefs.cm_opt_memory)
   let %sec = bb.push_uleb128(buf: %sec, val: mem_idx)
   // waitable-set.drop
   let %sec = bb.push_byte(buf: %sec, byte: wdefs.cm_canon_ws_drop)
@@ -1148,17 +1160,17 @@ export let build_cm_core_instance_section_final = fn (main_module_idx: i64) -> %
   let %exports_body = cm_emit_func_export_entry(buf: %exports_body, name: "waitable-set.drop", idx: 8)
   // instance 1 entry: kind=0x01 (FromExports) + 9 exports
   let %inst1 = bb.empty()
-  let %inst1 = bb.push_byte(%inst1, byte: 1)
+  let %inst1 = bb.push_byte(buf: %inst1, byte: 1)
   let %inst1 = bb.push_buf(%inst1, src: &exports_body)
   bb.free(buf: %exports_body)
   // instance 2 entry: kind=0x00 (Instantiate), module_idx, 1 arg ("canon" -> instance 1)
   let %inst2 = bb.empty()
-  let %inst2 = bb.push_byte(%inst2, byte: 0)
+  let %inst2 = bb.push_byte(buf: %inst2, byte: 0)
   let %inst2 = bb.push_uleb128(%inst2, val: main_module_idx)
   let %inst2 = bb.push_uleb128(%inst2, val: 1)
   let %inst2 = cm_push_name(buf: %inst2, name: "canon")
   // arg kind = 0x12 (core instance)
-  let %inst2 = bb.push_byte(%inst2, byte: 18)
+  let %inst2 = bb.push_byte(buf: %inst2, byte: 18)
   // arg index = 1 (the FromExports instance)
   let %inst2 = bb.push_uleb128(%inst2, val: 1)
   // section body = count=2 + inst1 + inst2
@@ -1184,14 +1196,20 @@ export let cm_wrap_section = fn (section_id: i64, content: %ByteBuffer) -> %Byte
 end
 
 /** Build one alias section entry: a core memory export from a given instance.
- *  Encoding: `00 02 instance_idx "memory"` (kind=CoreInstanceExport, Memory).
+ *  Encoding: `00 02 01 instance_idx "memory"`
+ *    00 = sort (CoreInstanceExport)
+ *    02 = core_externsort (Memory)
+ *    01 = alias-from-instance tag (per component model binary format)
+ *    instance_idx = u32 ULEB128
+ *    "memory" = length-prefixed name (6 + UTF-8 bytes)
  */
 let cm_build_alias_memory_entry = fn (instance_idx: i64) -> %ByteBuffer do
   let %e = bb.empty()
-  let %e = bb.push_byte(%e, byte: 0)
-  let %e = bb.push_byte(%e, byte: 2)
+  let %e = bb.push_byte(buf: %e, byte: 0)
+  let %e = bb.push_byte(buf: %e, byte: 2)
+  let %e = bb.push_byte(buf: %e, byte: 1)
   let %e = bb.push_uleb128(%e, val: instance_idx)
-  let %e = bb.push_bytes(%e, bytes: [6, 109, 101, 109, 111, 114, 121])
+  let %e = bb.push_bytes(buf: %e, bytes: [6, 109, 101, 109, 111, 114, 121])
   return %e
 end
 
@@ -1221,9 +1239,9 @@ end
 export let build_p3_component = fn (core_wasm: %ByteBuffer) -> %ByteBuffer do
   // Component magic + version
   let %out = bb.empty()
-  let %out = bb.push_bytes(%out, bytes: [0, 97, 115, 109])
-  let %out = bb.push_bytes(%out, bytes: [wdefs.cm_version_byte0, wdefs.cm_version_byte1,
-                                          wdefs.cm_version_byte2, wdefs.cm_version_byte3])
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 97, 115, 109])
+  let %out = bb.push_bytes(buf: %out, bytes: [wdefs.cm_version_byte0, wdefs.cm_version_byte1,
+                                              wdefs.cm_version_byte2, wdefs.cm_version_byte3])
 
   // Component type section: [type 0] future<u64>
   let %type_sec = cm_wrap_section(section_id: wdefs.cm_sec_type, content: build_cm_type_section_future_u64())
@@ -1246,7 +1264,7 @@ export let build_p3_component = fn (core_wasm: %ByteBuffer) -> %ByteBuffer do
   // Core instance 0: instantiate stub (module 1) with no args
   let %stub_inst_body = bb.empty()
   let %stub_inst_body = bb.push_uleb128(%stub_inst_body, val: 1)
-  let %stub_inst_body = bb.push_bytes(%stub_inst_body, bytes: [0, 1, 0])
+  let %stub_inst_body = bb.push_bytes(buf: %stub_inst_body, bytes: [0, 1, 0])
   let %stub_inst_sec = cm_wrap_section(section_id: wdefs.cm_sec_core_instance, content: %stub_inst_body)
   let %out = bb.push_buf(%out, src: &stub_inst_sec)
   bb.free(buf: %stub_inst_sec)
@@ -1317,6 +1335,87 @@ let write_section_to_fd = fn (fd: i64, section_id: i64, content: %ByteBuffer) ->
   return ()
 end
 
+/** Build the alias section entry for the core `wasi:cli/run@0.2.6#run`
+ *  function exported by core instance `instance_idx`.
+ *  Encoding: sort=0x00(CoreInstanceExport) kind=0x00(Func) tag=0x01 instance_idx name
+ */
+let cm_build_alias_run_func_entry = fn (instance_idx: i64) -> %ByteBuffer do
+  let %e = bb.empty()
+  let %e = bb.push_byte(buf: %e, byte: 0)
+  let %e = bb.push_byte(buf: %e, byte: 0)
+  let %e = bb.push_byte(buf: %e, byte: 1)
+  let %e = bb.push_uleb128(%e, val: instance_idx)
+  // "wasi:cli/run@0.2.6#run" = 22 bytes
+  let %e = bb.push_byte(buf: %e, byte: 22)
+  let %e = bb.push_string(buf: %e, s: "wasi:cli/run@0.2.6#run")
+  return %e
+end
+
+/** Build the alias section aliasing the core run func from a given instance. */
+let build_cm_alias_section_run_func = fn (instance_idx: i64) -> %ByteBuffer do
+  let %entry = cm_build_alias_run_func_entry(instance_idx)
+  let %sec = bb.empty()
+  let %sec = bb.push_uleb128(%sec, val: 1)
+  let %sec = bb.push_buf(%sec, src: &entry)
+  bb.free(buf: %entry)
+  return %sec
+end
+
+/** Build the component type section containing:
+ *  type 1 = Result<None,None>  (0x6a 0x00 0x00)
+ *  type 2 = component func () -> Result<None,None>  (0x40 0x00 0x00 type_idx=1)
+ *  These types satisfy the WASI CLI run interface in p3 mode.
+ *  (type 0 = future<u64> is declared in the first type section)
+ *
+ *  Component func returning an unnamed single result uses: 0x40, 0=params, 0x00=single-result, type_idx
+ */
+let build_cm_wasi_run_type_section = fn () -> %ByteBuffer do
+  let %s = bb.empty()
+  // 2 types:
+  // type 1: Result<None,None> = {0x6a, 0x00=ok-none, 0x00=err-none}
+  // type 2: func()->Result = {0x40, 0x00=0params, 0x00=single-result, 0x01=type_idx=1}
+  let %s = bb.push_bytes(buf: %s, bytes: [2, 106, 0, 0, 64, 0, 0, 1])
+  return %s
+end
+
+/** Build the canon lift entry for the WASI run function.
+ *  Lifts core func 9 (the aliased run func — funcs 0-8 are canon builtins)
+ *  with component type index 2
+ *  (type 0 = future<u64>, type 1 = Result<None,None>, type 2 = func()->Result).
+ *  Includes memory option pointing at core memory 3 (aliased from main instance).
+ *  Encoding: count=1, {0x00=Lift, 0x00=pad, func_idx=9, opts_count=1, opt=memory(mem_idx=3), type_idx=2}
+ */
+let build_cm_wasi_run_canon_lift = fn () -> %ByteBuffer do
+  let %s = bb.empty()
+  // {count=1, opcode=0x00=Lift, pad=0x00, core_func=9, opts=1, opt_memory(0x03)+idx(3), type=2}
+  let %s = bb.push_bytes(buf: %s, bytes: [1, 0, 0, 9, 1, 3, 3, 2])
+  return %s
+end
+
+/** Build the component instance section for the WASI CLI run interface.
+ *  Creates instance 0 = FromExports([{name:"run", kind:Func, idx:0}])
+ *  Encoding: count=1, kind=FromExports(1), 1 export: {00 "run" sort=func idx=0}
+ */
+let build_cm_wasi_run_instance = fn () -> %ByteBuffer do
+  let %s = bb.empty()
+  let %s = bb.push_bytes(buf: %s, bytes: [1, 1, 1, 0, 3])
+  let %s = bb.push_string(buf: %s, s: "run")
+  let %s = bb.push_bytes(buf: %s, bytes: [1, 0])
+  return %s
+end
+
+/** Build the component export section exporting `wasi:cli/run@0.2.6` as
+ *  an instance (instance index 0).
+ *  Encoding: count=1, {00 "wasi:cli/run@0.2.6" kind=Instance(5) idx=0 00}
+ */
+let build_cm_wasi_run_export = fn () -> %ByteBuffer do
+  let %s = bb.empty()
+  let %s = bb.push_bytes(buf: %s, bytes: [1, 0, 18])
+  let %s = bb.push_string(buf: %s, s: "wasi:cli/run@0.2.6")
+  let %s = bb.push_bytes(buf: %s, bytes: [5, 0, 0])
+  return %s
+end
+
 /** Write the full component-model wrapper for `core_wasm` to `fd` without
  *  allocating a large intermediate buffer.  Frees `core_wasm`.
  */
@@ -1337,9 +1436,9 @@ export let write_p3_component_raw_to_fd = fn (core_ptr: i64, core_len: i64, fd: 
   // magic: 0 97 115 109 = 0x00 0x61 0x73 0x6d = \0asm
   // cm version bytes from wdefs: 13 0 1 0 = 0x0d 0x00 0x01 0x00
   let %hdr = bb.empty()
-  let %hdr = bb.push_bytes(%hdr, bytes: [0, 97, 115, 109])
-  let %hdr = bb.push_bytes(%hdr, bytes: [wdefs.cm_version_byte0, wdefs.cm_version_byte1,
-                                          wdefs.cm_version_byte2, wdefs.cm_version_byte3])
+  let %hdr = bb.push_bytes(buf: %hdr, bytes: [0, 97, 115, 109])
+  let %hdr = bb.push_bytes(buf: %hdr, bytes: [wdefs.cm_version_byte0, wdefs.cm_version_byte1,
+                                              wdefs.cm_version_byte2, wdefs.cm_version_byte3])
   write_buf_to_fd(fd, buf: %hdr)
 
   // Component type section: [type 0] future<u64>
@@ -1364,7 +1463,7 @@ export let write_p3_component_raw_to_fd = fn (core_ptr: i64, core_len: i64, fd: 
   // Core instance 0: instantiate stub (module 1) with no args
   let %stub_inst_body = bb.empty()
   let %stub_inst_body = bb.push_uleb128(%stub_inst_body, val: 1)
-  let %stub_inst_body = bb.push_bytes(%stub_inst_body, bytes: [0, 1, 0])
+  let %stub_inst_body = bb.push_bytes(buf: %stub_inst_body, bytes: [0, 1, 0])
   write_section_to_fd(fd, section_id: wdefs.cm_sec_core_instance, content: %stub_inst_body)
 
   // Canon section: future.new (core func 0)
@@ -1396,8 +1495,35 @@ export let write_p3_component_raw_to_fd = fn (core_ptr: i64, core_len: i64, fd: 
     content: build_cm_canon_ws_wait_drop(mem_idx: 2))
 
   // Final core instance section: FromExports + Instantiate main (module 0)
+  // After this, core instance 2 is the main module instance.
   write_section_to_fd(fd, section_id: wdefs.cm_sec_core_instance,
     content: build_cm_core_instance_section_final(main_module_idx: 0))
+
+  // WASI CLI run export:
+  // 1. Alias the core `wasi:cli/run@0.2.6#run` func from core instance 2 (main).
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_alias,
+    content: build_cm_alias_section_run_func(instance_idx: 2))
+
+  // 1b. Alias the core memory from main instance (core instance 2) -> core memory 3.
+  //     The canon lift for the run function needs a memory option.
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_alias,
+    content: build_cm_alias_section_one_memory(instance_idx: 2))
+
+  // 2. Component type section: Result<None,None> + func()->(result).
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_type,
+    content: build_cm_wasi_run_type_section())
+
+  // 3. Canon lift: lift core func 9 with memory(3) to component func 0, type 2.
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_canon,
+    content: build_cm_wasi_run_canon_lift())
+
+  // 4. Component instance: {run: func 0}.
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_instance,
+    content: build_cm_wasi_run_instance())
+
+  // 5. Component export: "wasi:cli/run@0.2.6" = instance 0.
+  write_section_to_fd(fd, section_id: wdefs.cm_sec_export,
+    content: build_cm_wasi_run_export())
 
   return ()
 end
