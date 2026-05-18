@@ -99,8 +99,8 @@ export let infer_expr = fn (state: CheckState, expr: HirExpr, ret_type: TypeExpr
       return infer_unop(state, op, operand, span: sp)
     | Call(func, args) ->
       return infer_call(state, func, args, span: sp)
-    | Ctor(variant, args, sigil) ->
-      return infer_constructor(state, variant, args, sigil, span: sp)
+    | Ctor(variant, args, labels, sigil) ->
+      return infer_constructor(state, variant, args, labels, sigil, span: sp)
     | Record(fields) ->
       return infer_record(state, fields, span: sp)
     | Array(elems) ->
@@ -498,7 +498,7 @@ end
 
 // ─── Constructor inference ──────────────────────────────────────────────────
 
-let infer_constructor = fn (state: CheckState, variant: string, args: [HirExpr], sigil: Sigil, span: Span) -> InferExprResult throws { TypeError } do
+let infer_constructor = fn (state: CheckState, variant: string, args: [HirExpr], labels: [string], sigil: Sigil, span: Span) -> InferExprResult throws { TypeError } do
   // The `sigil` parameter records whether the user wrote `%Ctor(...)` at the
   // source — propagated through AST → HIR for downstream consumers (let-binders
   // already see it via the StmtLet sigil bump in parse_let_without_type; the
@@ -517,12 +517,12 @@ let infer_constructor = fn (state: CheckState, variant: string, args: [HirExpr],
       let FreshenResult(state: st1, param_subst: psubst) = fr
       let sorted_fields = sort_variant_fields(fields)
       let enum_type = build_enum_type(name: ename, params: tps, param_subst: psubst)
-      return check_ctor_args(state: st1, fields: sorted_fields, args, param_subst: psubst, enum_type, subst: subst.subst_empty(), span)
+      return check_ctor_args(state: st1, fields: sorted_fields, args, labels, param_subst: psubst, enum_type, subst: subst.subst_empty(), span)
   end
 end
 
 let check_ctor_args = fn (
-  state: CheckState, fields: [VariantField], args: [HirExpr],
+  state: CheckState, fields: [VariantField], args: [HirExpr], labels: [string],
   param_subst: [SubstEntry], enum_type: TypeExpr, subst: [SubstEntry], span: Span
 ) -> InferExprResult throws { TypeError } do
   match fields do
@@ -531,10 +531,19 @@ let check_ctor_args = fn (
         | [] -> return InferExprOk(state, subst, typ: subst.subst_apply(subst, typ: enum_type))
         | _ -> return InferExprErr(message: "too many constructor arguments", span)
       end
-    | VariantField(name: _, typ: ftyp) :: rf ->
+    | VariantField(name: vfname_opt, typ: ftyp) :: rf ->
       match args do
         | [] -> return InferExprErr(message: "missing constructor argument", span)
         | arg :: ra ->
+          // Spec T-Ctor {ℓ} = {ℓ'}: when both the constructor field and the
+          // user-supplied argument carry a label, they must match at each
+          // position — reordered or misspelled labels (e.g. Box(content: 99)
+          // for Box(value: i64)) are rejected here.
+          match check_ctor_field_label(labels, vfname_opt) do
+            | Some(val: err) -> return InferExprErr(message: err, span)
+            | None -> ()
+          end
+          let labels_tail = match labels do | [] -> [] | _ :: tl -> tl end
           match infer_expr(state, expr: arg, ret_type: TyUnit) do
             | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
             | InferExprOk(state: st1, subst: s1, typ: at) ->
@@ -545,12 +554,56 @@ let check_ctor_args = fn (
                 | UnifyErr(message: m) -> return InferExprErr(message: "ctor field: " ++ m, span)
                 | UnifyOk(subst: s2) ->
                   return check_ctor_args(
-                    state: st1, fields: rf, args: ra,
+                    state: st1, fields: rf, args: ra, labels: labels_tail,
                     param_subst, enum_type,
                     subst: subst.subst_compose(s1: sm, s2), span
                   )
               end
           end
+      end
+  end
+end
+
+// Spec T-Ctor {ℓ} = {ℓ'}: check that the head user-supplied label (if any)
+// matches the constructor's declared label at the same position. Both lists
+// are in alphabetical order (sort_ctor_args / sort_variant_fields). Returns
+// Some(error) on mismatch, None if OK.
+let check_ctor_field_label = fn (
+  user_labels: [string], vfname_opt: Option<string>
+) -> Option<string> do
+  match user_labels do
+    | [] -> return None
+    | fname :: _ ->
+      match vfname_opt do
+        | None -> return None
+        | Some(val: vfname) ->
+          // Use ctor_label_in_singleton for the comparison to reuse
+          // proven string-equality logic rather than a raw `==` on
+          // newly-bound strings (stage-0 codegen bug with match-arm strings).
+          if ctor_label_in_singleton(label: fname, expected: vfname) then
+            return None
+          else
+            return Some(val: "constructor argument label `" ++ fname
+              ++ "` does not match the declared field label `" ++ vfname
+              ++ "` at this position; T-Ctor requires {ℓ} = {ℓ'}")
+          end
+      end
+  end
+end
+
+// Checks whether `label` equals `expected` using a list-search pattern to
+// avoid the stage-0 raw-string-== codegen issue on newly-bound match-arm
+// string variables.
+let ctor_label_in_singleton = fn (label: string, expected: string) -> bool do
+  return ctor_label_in_singleton_go(label, haystack: expected :: [])
+end
+
+let ctor_label_in_singleton_go = fn (label: string, haystack: [string]) -> bool do
+  match haystack do
+    | [] -> return false
+    | h :: rest ->
+      if h == label then return true
+      else return ctor_label_in_singleton_go(label, haystack: rest)
       end
   end
 end
