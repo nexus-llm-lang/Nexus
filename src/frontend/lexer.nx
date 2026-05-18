@@ -119,32 +119,51 @@ end
 
 
 let skip_line_comment = fn (st: LexerState) -> LexerState do
-  let LexerState(src: s, sp: SourcePos(pos: p, line: ln, col: _), len: l) = st
+  let LexerState(src: s, sp: SourcePos(pos: p, line: ln, col: c), len: l) = st
   let nl_pos = str.find_byte(s, start: p, ch: ch_newline)
   if nl_pos < 0 then
-    return LexerState(src: s, sp: SourcePos(pos: l, line: ln, col: 1 + l - p), len: l)
+    return LexerState(src: s, sp: SourcePos(pos: l, line: ln, col: c + (l - p)), len: l)
   else
     return LexerState(src: s, sp: SourcePos(pos: nl_pos + 1, line: ln + 1, col: 1), len: l)
   end
 end
 
-let skip_block_comment = fn (st: LexerState, depth: i64) -> LexerState do
-  if at_end(st) then return st end
-  if depth <= 0 then return st end
+// Result of skip_block_comment: either a clean LexerState or an error token
+// for an unterminated block comment (the open span is recorded so the
+// diagnostic points at the `/*`).
+type BlockCommentScan =
+    BlockOk(st: LexerState)
+  | BlockErr(st: LexerState, tok: SpannedToken)
+
+let skip_block_comment = fn (st: LexerState, depth: i64, open_span: Span) -> BlockCommentScan do
+  if at_end(st) then
+    if depth > 0 then
+      return BlockErr(st, tok: SpannedToken(token: TkError(msg: "unterminated block comment"), span: open_span))
+    end
+    return BlockOk(st)
+  end
+  if depth <= 0 then return BlockOk(st) end
   let c = peek(st)
   let c2 = peek_at(st, offset: 1)
   if c == ch_star && c2 == ch_slash then
-    return skip_block_comment(st: advance_n(st, n: 2), depth: depth - 1)
+    return skip_block_comment(st: advance_n(st, n: 2), depth: depth - 1, open_span)
   end
   if c == ch_slash && c2 == ch_star then
-    return skip_block_comment(st: advance_n(st, n: 2), depth: depth + 1)
+    return skip_block_comment(st: advance_n(st, n: 2), depth: depth + 1, open_span)
   end
-  return skip_block_comment(st: advance(st), depth)
+  return skip_block_comment(st: advance(st), depth, open_span)
 end
 
-let skip_whitespace_and_comments = fn (st: LexerState) -> LexerState do
+// Result of skip_whitespace_and_comments: either a LexerState to continue
+// tokenizing from, or an error token (e.g. unterminated block comment) that
+// the tokenizer loop should emit before continuing.
+type SkipResult =
+    SkipOk(st: LexerState)
+  | SkipErr(st: LexerState, tok: SpannedToken)
+
+let skip_whitespace_and_comments = fn (st: LexerState) -> SkipResult do
   let LexerState(src: s, sp: SourcePos(pos: p, line: _, col: _), len: l) = st
-  if p >= l then return st end
+  if p >= l then return SkipOk(st) end
   let ws_end = str.skip_ws(s, start: p)
   if ws_end > p then
     let st1 = update_state_bulk(st, new_pos: ws_end)
@@ -157,9 +176,14 @@ let skip_whitespace_and_comments = fn (st: LexerState) -> LexerState do
     return skip_whitespace_and_comments(st: skip_line_comment(st))
   end
   if c == ch_slash && c2 == ch_star then
-    return skip_whitespace_and_comments(st: skip_block_comment(st: advance_n(st, n: 2), depth: 1))
+    let open_span = current_span(st)
+    let st2 = advance_n(st, n: 2)
+    match skip_block_comment(st: st2, depth: 1, open_span) do
+      | BlockOk(st: st3) -> return skip_whitespace_and_comments(st: st3)
+      | BlockErr(st: st3, tok) -> return SkipErr(st: st3, tok)
+    end
   end
-  return st
+  return SkipOk(st)
 end
 
 //
@@ -603,7 +627,10 @@ end
 
 
 let lex_token = fn (st: LexerState) -> LexResult do
-  let st0 = skip_whitespace_and_comments(st)
+  let st0 = match skip_whitespace_and_comments(st) do
+    | SkipErr(st: st_err, tok) -> return LexResult(st: st_err, tok)
+    | SkipOk(st: st0) -> st0
+  end
   if at_end(st: st0) then
     return spanned(st: st0, token: TkEof, span: current_span(st: st0))
   end
@@ -669,7 +696,11 @@ end
 // SpannedToken reverse (see src/common/mono_reverse.nx)
 // Accumulator-based tokenizer (tail-recursive to avoid stack overflow on large files)
 let tokenize_loop = fn (st: LexerState, acc: [SpannedToken]) -> [SpannedToken] do
-  let st1 = skip_whitespace_and_comments(st)
+  let st1 = match skip_whitespace_and_comments(st) do
+    | SkipErr(st: st_err, tok) ->
+      return tokenize_loop(st: st_err, acc: tok :: acc)
+    | SkipOk(st: st_ok) -> st_ok
+  end
   if at_end(st: st1) then
     return list.reverse(xs: SpannedToken(token: TkEof, span: current_span(st: st1)) :: acc)
   end
