@@ -64,6 +64,7 @@ import { Span, SpannedToken, Token,
          TkIdent, TkUident,
          TkImportPath, TkError, TkEof } from "src/common/token.nx"
 import * as str from "std:str"
+import * as char from "std:char"
 import { SemanticTokens, SemanticTokensLegend } from "src/lsp/protocol/completion.nx"
 import { saturating_pred } from "src/lsp/common.nx"
 import { SourcePos } from "src/common/source_pos.nx"
@@ -428,9 +429,50 @@ let classify_uident = fn (toks: [SpannedToken], idx: i64) -> i64 do
 end
 
 
+// UTF-16 length helpers
+//
+// Per LSP spec, all Position lengths must be UTF-16 code units. The source
+// is UTF-8, so we must convert each byte range to its UTF-16 unit count.
+//
+// Algorithm: walk each codepoint in [from_byte, to_byte).
+//   - 1-byte sequence  (0x00–0x7F): 1 UTF-16 unit
+//   - 2-byte sequence  (0xC0–0xDF): 1 UTF-16 unit
+//   - 3-byte sequence  (0xE0–0xEF): 1 UTF-16 unit
+//   - 4-byte sequence  (0xF0–0xFF): 2 UTF-16 units (surrogate pair)
+// Continuation bytes (0x80–0xBF) are skipped inside each sequence.
+//
+// For identifiers (ASCII-only) the result equals the byte count.
+
+// UTF-8 sequence length from the lead byte's integer value.
+let utf8_seq_len_of = fn (b: i64) -> i64 do
+  if b < 128 then return 1 end
+  if b < 192 then return 1 end  // continuation byte — treat as 1 to avoid stall
+  if b < 224 then return 2 end
+  if b < 240 then return 3 end
+  return 4
+end
+
+/** Count UTF-16 code units for the UTF-8 source substring [from_byte, to_byte). */
+export let utf16_len_range = fn (src: string, from_byte: i64, to_byte: i64) -> i64 do
+  let src_len = str.byte_length(s: src)
+  return utf16_len_range_go(src, src_len, p: from_byte, limit: to_byte, acc: 0)
+end
+
+let utf16_len_range_go = fn (src: string, src_len: i64, p: i64, limit: i64, acc: i64) -> i64 do
+  if p >= limit then return acc end
+  if p >= src_len then return acc end
+  let b = char.ord(c: str.byte_at(s: src, idx: p))
+  let seq = utf8_seq_len_of(b)
+  // A 4-byte UTF-8 sequence encodes a codepoint >= U+10000, which needs a
+  // surrogate pair in UTF-16 (2 code units). All other sequences → 1 unit.
+  let units = if seq == 4 then 2 else 1 end
+  return utf16_len_range_go(src, src_len, p: p + seq, limit, acc: acc + units)
+end
+
 // Identifier surface-name length — bytes between the start span and the
 // next non-ident byte in the source. We reuse `str.scan_ident` to recover
 // the exact byte length the lexer consumed.
+// Identifiers are ASCII-only, so byte count == UTF-16 unit count.
 let ident_length = fn (src: string, span: Span) -> i64 do
   match span do | Span(offset, line: _, col: _) ->
     let end_pos = str.scan_ident(s: src, start: offset)
@@ -536,10 +578,8 @@ let number_length = fn (src: string, span: Span) -> i64 do
 end
 
 // String literal length: from the opening `"` byte, walk to the closing
-// `"`, honouring `\` escapes. The lexer accepts UTF-8 sequences inside
-// strings verbatim, so we count bytes — the LSP wire `length` is in UTF-16
-// code units per the spec; clients tolerate UTF-8 counts in practice for
-// ASCII-only test fixtures, and a UTF-16 conversion pass is post-MVP.
+// `"`, honouring `\` escapes. The result is a UTF-16 code-unit count as
+// required by the LSP spec.
 
 let ch_dquote_byte = '"'
 let ch_backslash_byte = '\\'
@@ -561,7 +601,7 @@ let string_length = fn (src: string, span: Span) -> i64 do
     if offset >= src_len then return 2 end
     let end_pos = scan_string_close(src, src_len, p: offset + 1)
     if end_pos <= offset then return 2 end
-    return end_pos - offset
+    return utf16_len_range(src, from_byte: offset, to_byte: end_pos)
   end
 end
 
@@ -584,7 +624,7 @@ let char_lit_length = fn (src: string, span: Span) -> i64 do
     if offset >= src_len then return 3 end
     let end_pos = scan_char_close(src, src_len, p: offset + 1)
     if end_pos <= offset then return 3 end
-    return end_pos - offset
+    return utf16_len_range(src, from_byte: offset, to_byte: end_pos)
   end
 end
 
@@ -757,7 +797,7 @@ let emit_comment_lines_go = fn (
   let src_len = str.byte_length(s: src)
   let nl_pos = find_newline_or_end(src, src_len, p: start_pos, limit: end_pos)
   let line_end_pos = nl_pos
-  let length = line_end_pos - start_pos
+  let length = utf16_len_range(src, from_byte: start_pos, to_byte: line_end_pos)
   let acc2 = if length > 0 then
     SemTok(line: start_line, col: start_col, length, token_type: tt_comment) :: acc
   else
@@ -802,7 +842,7 @@ let scan_comments_go = fn (
     let after_slashes = bump_col(s: s1)
     let s_end = scan_line_comment_end(src, src_len, s: after_slashes)
     match s_end do | SourcePos(pos: end_pos, line: _, col: _) ->
-      let length = end_pos - pos
+      let length = utf16_len_range(src, from_byte: pos, to_byte: end_pos)
       let acc2 = if length > 0 then
         SemTok(line: start_line, col: start_col, length, token_type: tt_comment) :: acc
       else

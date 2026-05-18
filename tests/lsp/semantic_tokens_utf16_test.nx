@@ -1,0 +1,138 @@
+// nexus-30j8: LSP semantic tokens must emit UTF-16 code-unit lengths,
+// not UTF-8 byte counts.
+//
+// The three cases exercised here:
+//
+//   1. BMP multibyte string literal
+//      `"あいう"` — 3 hiragana code points, each 3 UTF-8 bytes (9 raw bytes).
+//      UTF-16 length = 1 (open quote) + 3 (BMP chars) + 1 (close quote) = 5 units.
+//      Byte length would be 11.  A client using the byte count would under-highlight.
+//
+//   2. Supplementary-plane char inside a string (emoji)
+//      `"😀"` — U+1F600, encoded as 4 UTF-8 bytes.
+//      UTF-16 requires a surrogate pair → 2 code units for the char.
+//      UTF-16 length = 1 + 2 + 1 = 4 units.  Byte length would be 6.
+//
+//   3. BMP multibyte in a line comment
+//      `// コメント` — 4 katakana chars, each 3 UTF-8 bytes.
+//      UTF-16 length of comment = 2 (//) + 1 (space) + 4 = 7 units.
+//      Byte length would be 15.
+//
+//   4. utf16_len_range unit test — ASCII string gives byte == UTF-16.
+
+import * as sem from "src/lsp/handlers/semantic_tokens.nx"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+// -- helpers -----------------------------------------------------------------
+
+let find_at = fn (xs: [sem.SemTok], line: i64, col: i64) -> sem.SemTok throws { Exn } do
+  match xs do
+    | [] -> throw RuntimeError(val: "no SemTok at that position")
+    | t :: rest ->
+      match t do | sem.SemTok(line: tl, col: tc, length: _, token_type: _) ->
+        if tl == line && tc == col then return t end
+        return find_at(xs: rest, line, col)
+      end
+  end
+end
+
+let assert_tok_at = fn (
+  toks: [sem.SemTok],
+  line: i64,
+  col: i64,
+  expected_length: i64,
+  expected_type: i64,
+  label: string
+) -> unit throws { Exn } do
+  let t = find_at(xs: toks, line, col)
+  match t do | sem.SemTok(line: _, col: _, length, token_type) ->
+    test_assert.assert_eq_i64(actual: length, expected: expected_length,
+      label: label ++ " length")
+    test_assert.assert_eq_i64(actual: token_type, expected: expected_type,
+      label: label ++ " token_type")
+  end
+end
+
+// -- test body ---------------------------------------------------------------
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+
+  // Case 1: BMP multibyte string literal.
+  // Buffer: `let s = "あいう"`
+  // Cols: `l`=1 `e`=2 `t`=3 ` `=4 `s`=5 ` `=6 `=`=7 ` `=8 `"`=9 ...
+  // String starts at col 9.
+  // Byte length of `"あいう"` = 1 + 9 + 1 = 11 bytes.
+  // UTF-16 length = 1 (") + 3 (BMP) + 1 (") = 5 units.
+  let buf1 = "let s = \"\u{3042}\u{3044}\u{3046}\""
+  let toks1 = sem.compute_sem_toks(text: buf1)
+  assert_tok_at(toks: toks1, line: 1, col: 9, expected_length: 5,
+    expected_type: sem.tt_string, label: "BMP string UTF-16 length")
+
+  // Case 2: Supplementary-plane emoji string.
+  // Buffer: `let e = "😀"`
+  // String starts at col 9.
+  // Byte length = 1 + 4 + 1 = 6. UTF-16 length = 1 + 2 + 1 = 4 units.
+  let buf2 = "let e = \"\u{1F600}\""
+  let toks2 = sem.compute_sem_toks(text: buf2)
+  assert_tok_at(toks: toks2, line: 1, col: 9, expected_length: 4,
+    expected_type: sem.tt_string, label: "emoji string UTF-16 length")
+
+  // Case 3: BMP multibyte line comment.
+  // Buffer:
+  //   Line 1: `let x = 1`
+  //   Line 2: `// コメント`
+  //
+  // `コメント` = 4 katakana chars, each U+30xx (3 UTF-8 bytes each).
+  // Comment starts at col 1.
+  // UTF-16 length of `// コメント` = 2 + 1 + 4 = 7 units.
+  // Byte length would be 2 + 1 + 12 = 15.
+  let buf3 = "let x = 1\n// \u{30B3}\u{30E1}\u{30F3}\u{30C8}"
+  let toks3 = sem.compute_sem_toks(text: buf3)
+  assert_tok_at(toks: toks3, line: 2, col: 1, expected_length: 7,
+    expected_type: sem.tt_comment, label: "BMP comment UTF-16 length")
+
+  // Case 4: utf16_len_range unit tests.
+  // ASCII string: byte count == UTF-16 count.
+  let ascii = "hello"
+  test_assert.assert_eq_i64(
+    actual: sem.utf16_len_range(src: ascii, from_byte: 0, to_byte: 5),
+    expected: 5,
+    label: "ASCII utf16_len_range")
+
+  // BMP 3-byte sequence: "あいう" = 9 bytes, 3 UTF-16 units.
+  let bmp = "\u{3042}\u{3044}\u{3046}"
+  test_assert.assert_eq_i64(
+    actual: sem.utf16_len_range(src: bmp, from_byte: 0, to_byte: 9),
+    expected: 3,
+    label: "BMP utf16_len_range")
+
+  // Supplementary plane: "😀" = 4 bytes, 2 UTF-16 units.
+  let emoji = "\u{1F600}"
+  test_assert.assert_eq_i64(
+    actual: sem.utf16_len_range(src: emoji, from_byte: 0, to_byte: 4),
+    expected: 2,
+    label: "emoji utf16_len_range")
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
