@@ -1,0 +1,138 @@
+// nexus-tgj1: textDocument/didSave republishes diagnostics.
+//
+// Per LSP spec, servers MAY republish diagnostics on save. Some clients
+// (e.g. VS Code "Problems" panel) rely on this to refresh stale markers.
+// After the fix, `on_did_save` looks up the cached buffer and calls
+// `publish_for_buffer` — emitting a publishDiagnostics notification.
+//
+// Pins:
+//   1. A `didSave` after `didOpen` produces a publishDiagnostics notification.
+//   2. A `didSave` for an uncached URI (no prior didOpen) is a no-op.
+
+import { dispatch_message } from "src/lsp/handlers.nx"
+import {
+  StepContinue, StepExit
+} from "src/lsp/handlers.nx"
+import {
+  ServerState, empty_state, with_lifecycle_running
+} from "src/lsp/state/server_state.nx"
+import {
+  Notification
+} from "std:jsonrpc"
+import {
+  JsonValue, JsonNull, JsonObject, JsonField, JsonString, JsonInt, JsonArray
+} from "std:json"
+import { Option, Some, None } from "std:option"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+// Build a minimal DidOpenTextDocumentParams JSON object.
+let make_did_open_params = fn (uri: string, text: string) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "textDocument", value: JsonObject(fields: [
+      JsonField(key: "uri",        value: JsonString(val: uri)),
+      JsonField(key: "languageId", value: JsonString(val: "nexus")),
+      JsonField(key: "version",    value: JsonInt(val: 1)),
+      JsonField(key: "text",       value: JsonString(val: text))
+    ]))
+  ])
+end
+
+// Build a minimal DidSaveTextDocumentParams JSON object (no `text` field).
+let make_did_save_params = fn (uri: string) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "textDocument", value: JsonObject(fields: [
+      JsonField(key: "uri", value: JsonString(val: uri))
+    ]))
+  ])
+end
+
+let count_notifications = fn (xs: [JsonValue], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_notifications(xs: rest, acc: acc + 1)
+  end
+end
+
+// A running-lifecycle state (post-initialize, pre-shutdown).
+let running_state = fn () -> ServerState do
+  return with_lifecycle_running(state: empty_state())
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  // ── Case 1: didSave after didOpen republishes diagnostics ────────────────
+  // Open a document first (clean source so diagnostics = []).
+  let uri = "buffer://tgj1_save_test.nx"
+  let source = "let x = fn () -> i64 do return 42 end\n"
+  let open_msg = Notification(
+    method: "textDocument/didOpen",
+    params: make_did_open_params(uri, text: source)
+  )
+  let step1 = dispatch_message(state: running_state(), msg: open_msg)
+  let state_after_open = match step1 do
+    | StepContinue(state, response: _, notifications: _) -> state
+    | StepExit(state) -> state
+  end
+
+  // Now send didSave.
+  let save_msg = Notification(
+    method: "textDocument/didSave",
+    params: make_did_save_params(uri)
+  )
+  let step2 = dispatch_message(state: state_after_open, msg: save_msg)
+  match step2 do
+    | StepExit(_) -> throw RuntimeError(val: "didSave must not exit the loop")
+    | StepContinue(state: _, response, notifications) ->
+      // No request-reply for a notification.
+      match response do
+        | Some(val: _) -> throw RuntimeError(val: "didSave must not produce a response")
+        | None -> ()
+      end
+      // Must have emitted exactly one publishDiagnostics notification.
+      test_assert.assert_eq_i64(
+        actual: count_notifications(xs: notifications, acc: 0),
+        expected: 1,
+        label: "didSave after didOpen emits exactly one publishDiagnostics notification"
+      )
+  end
+
+  // ── Case 2: didSave for an uncached URI is a no-op ───────────────────────
+  let save_cold = dispatch_message(
+    state: running_state(),
+    msg: Notification(
+      method: "textDocument/didSave",
+      params: make_did_save_params(uri: "buffer://never_opened.nx")
+    )
+  )
+  match save_cold do
+    | StepExit(_) -> throw RuntimeError(val: "cold didSave must not exit the loop")
+    | StepContinue(state: _, response: _, notifications) ->
+      test_assert.assert_eq_i64(
+        actual: count_notifications(xs: notifications, acc: 0),
+        expected: 0,
+        label: "didSave with no cached buffer emits no notifications"
+      )
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end

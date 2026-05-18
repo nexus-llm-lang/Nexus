@@ -1,0 +1,113 @@
+// nexus-tgj1: notifications after shutdown are silently dropped.
+//
+// Per LSP spec, after the server receives `shutdown`, only `exit` is
+// acknowledged; all other notifications (e.g. textDocument/didChange) must be
+// dropped silently (no response, no diagnostic publish).
+//
+// Pins:
+//   1. A `textDocument/didChange` after shutdown returns StepContinue with
+//      zero notifications and no response.
+//   2. `exit` after shutdown still produces StepExit (not dropped).
+
+import { dispatch_message } from "src/lsp/handlers.nx"
+import {
+  StepContinue, StepExit
+} from "src/lsp/handlers.nx"
+import {
+  ServerState, empty_state, with_lifecycle_running, with_lifecycle_shutdown
+} from "src/lsp/state/server_state.nx"
+import {
+  Notification
+} from "std:jsonrpc"
+import {
+  JsonValue, JsonNull, JsonObject, JsonField, JsonString, JsonInt, JsonArray
+} from "std:json"
+import { Option, Some, None } from "std:option"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+// A post-shutdown state.
+let shutdown_state = fn () -> ServerState do
+  return with_lifecycle_shutdown(state: with_lifecycle_running(state: empty_state()))
+end
+
+let make_did_change_params = fn (uri: string, text: string) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "textDocument", value: JsonObject(fields: [
+      JsonField(key: "uri",     value: JsonString(val: uri)),
+      JsonField(key: "version", value: JsonInt(val: 2))
+    ])),
+    JsonField(key: "contentChanges", value: JsonArray(items: [
+      JsonObject(fields: [
+        JsonField(key: "text", value: JsonString(val: text))
+      ])
+    ]))
+  ])
+end
+
+let count_notifications = fn (xs: [JsonValue], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_notifications(xs: rest, acc: acc + 1)
+  end
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  // ── Case 1: didChange after shutdown is silently dropped ─────────────────
+  let change_msg = Notification(
+    method: "textDocument/didChange",
+    params: make_did_change_params(
+      uri: "buffer://tgj1_shutdown_test.nx",
+      text: "let y = fn () -> i64 do return 99 end\n"
+    )
+  )
+  let step = dispatch_message(state: shutdown_state(), msg: change_msg)
+  match step do
+    | StepExit(_) -> throw RuntimeError(val: "didChange after shutdown must not exit")
+    | StepContinue(state: _, response, notifications) ->
+      // No response for a notification.
+      match response do
+        | Some(val: _) -> throw RuntimeError(val: "dropped notification must not produce a response")
+        | None -> ()
+      end
+      // No diagnostics published (notification was dropped before invoke_method).
+      test_assert.assert_eq_i64(
+        actual: count_notifications(xs: notifications, acc: 0),
+        expected: 0,
+        label: "didChange after shutdown emits zero notifications (dropped)"
+      )
+  end
+
+  // ── Case 2: exit after shutdown is still acknowledged ────────────────────
+  let exit_msg = Notification(method: "exit", params: JsonNull)
+  let exit_step = dispatch_message(state: shutdown_state(), msg: exit_msg)
+  match exit_step do
+    | StepContinue(state: _, response: _, notifications: _) ->
+      throw RuntimeError(val: "exit after shutdown must produce StepExit")
+    | StepExit(_) ->
+      // Correct: exit always terminates the loop regardless of lifecycle.
+      ()
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
