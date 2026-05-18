@@ -931,6 +931,18 @@ let check_divergent_arm_unused = fn (
   return require_empty_or_droppable(vars: inner_leaked, params: [], span)
 end
 
+/** Like `check_divergent_arm_unused` but also checks outer-scope linear vars.
+ *  Used in all-divergent contexts (every arm returns/throws): since every
+ *  execution path exits via a divergent arm, outer-scope linears that were
+ *  not consumed in an arm constitute a real leak (nexus-eeb4). */
+let check_divergent_arm_linears = fn (
+  arm_out: LinState, span: Span
+) -> unit throws { TypeError } do
+  // In an all-divergent arm, ALL remaining live vars (both inner-scope and
+  // outer-scope) must have been consumed before the arm's return/throw.
+  return require_empty_or_droppable(vars: lin_state_vars(st: arm_out), params: [], span)
+end
+
 // ─── Statement walk ──────────────────────────────────────────────────────────
 
 let check_stmts = fn (
@@ -1095,8 +1107,9 @@ let check_expr_kind = fn (
           let else_diverges = stmts_diverge(stmts: ebs)
           let st_else = check_stmts(stmts: ebs, st: st1, sigs, tdefs, enum_defs)
           if then_diverges && else_diverges then
-            check_divergent_arm_unused(arm_out: st_then, outer_vars: lin_state_vars(st: st1), span)
-            check_divergent_arm_unused(arm_out: st_else, outer_vars: lin_state_vars(st: st1), span)
+            // All paths diverge: each arm must have consumed all linears.
+            check_divergent_arm_linears(arm_out: st_then, span)
+            check_divergent_arm_linears(arm_out: st_else, span)
             return lin_set_vars(st: st1, vs: [])
           end
           if then_diverges then
@@ -1243,17 +1256,22 @@ let check_match_cases = fn (
   cases: [HirMatchCase], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef], span: Span,
   scrutinee_linear: bool
 ) -> LinState throws { TypeError } do
-  return check_match_cases_go(cases, st, sigs, tdefs, enum_defs, span, ref_set: None, scrutinee_linear)
+  return check_match_cases_go(cases, st, sigs, tdefs, enum_defs, span, ref_set: None, scrutinee_linear, diverged_arms: [])
 end
 
 let check_match_cases_go = fn (
   cases: [HirMatchCase], st: LinState, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef], span: Span,
-  ref_set: Option<[string]>, scrutinee_linear: bool
+  ref_set: Option<[string]>, scrutinee_linear: bool, diverged_arms: [LinState]
 ) -> LinState throws { TypeError } do
   match cases do
     | [] ->
       match ref_set do
-        | None -> return lin_set_vars(st, vs: [])
+        | None ->
+          // All arms diverged.  Each arm must have consumed its outer-scope
+          // linears — verify now using the accumulated arm-exit states
+          // (nexus-eeb4).
+          check_all_diverged_arms(diverged_arms, span)
+          return lin_set_vars(st, vs: [])
         | Some(val: vs) -> return lin_set_vars(st, vs)
       end
     | HirMatchCase(pattern: p, body: b) :: rest ->
@@ -1266,20 +1284,36 @@ let check_match_cases_go = fn (
       let case_diverges = stmts_diverge(stmts: b)
       let case_out = check_stmts(stmts: b, st: case_state2, sigs, tdefs, enum_defs)
       if case_diverges then
-        // Verify inner-scope linears were consumed before divergence
+        // Verify inner-scope linears were consumed before divergence.
+        // Outer-scope linears are checked later if ALL arms diverge.
         check_divergent_arm_unused(arm_out: case_out, outer_vars: lin_state_vars(st), span)
-        return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, ref_set, scrutinee_linear)
+        return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, ref_set, scrutinee_linear, diverged_arms: case_out :: diverged_arms)
       end
       let case_vars = lin_state_vars(st: case_out)
       match ref_set do
         | None ->
-          return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, ref_set: Some(val: case_vars), scrutinee_linear)
+          return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, ref_set: Some(val: case_vars), scrutinee_linear, diverged_arms: [])
         | Some(val: rv) ->
           if !vars_equal(a: rv, b: case_vars) then
             throw LinearMismatch(detail: "match arms diverge on linear set", span)
           end
-          return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, ref_set, scrutinee_linear)
+          return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, ref_set, scrutinee_linear, diverged_arms: [])
       end
+  end
+end
+
+/** After determining that every match arm diverged, verify that each arm's
+ *  exit state has no remaining linear vars.  Inner-scope leaks were already
+ *  caught by `check_divergent_arm_unused`; this pass additionally catches
+ *  outer-scope linears that were never consumed (nexus-eeb4). */
+let check_all_diverged_arms = fn (
+  diverged_arms: [LinState], span: Span
+) -> unit throws { TypeError } do
+  match diverged_arms do
+    | [] -> return ()
+    | arm :: rest ->
+      check_divergent_arm_linears(arm_out: arm, span)
+      return check_all_diverged_arms(diverged_arms: rest, span)
   end
 end
 
