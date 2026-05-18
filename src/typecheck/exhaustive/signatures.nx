@@ -1,0 +1,285 @@
+/**
+ * typecheck/exhaustive/signatures.nx — column-signature extraction.
+ *
+ * Responsible for: `ColumnSig` / `CtorSig` types, `column_signature`,
+ * enum/record field-type helpers, and the subst-application utilities
+ * needed to instantiate generic enum constructors. These are shared by
+ * both the main entry point (`exhaustive.nx`) and the decision procedure
+ * (`decision.nx`).
+ */
+
+import {
+  TypeExpr, TyBool, TyUserDefined, TyList, TyRecord, TyLinear, TyLazy, TyBorrow, TyRef, TyVar,
+  EnumDef, VariantDef, VariantField, NamedType, RecordDef
+} from "src/common/ast.nx"
+import { EnumEntry, TypeDefEntry } from "src/typecheck/types.nx"
+import { Some, None } from "std:option"
+import * as subst from "src/typecheck/subst.nx"
+import { SubstEntry } from "src/typecheck/types.nx"
+import * as list from "std:list"
+
+// ─── Column signature types ─────────────────────────────────────────────────
+
+export type ColumnSig =
+  SigFinite(ctors: [CtorSig])
+  | SigRecord(fields: [NamedType])
+  | SigInfinite
+
+export type CtorSig = CtorSig(name: string, arity: i64)
+
+// ─── Modality stripping ─────────────────────────────────────────────────────
+
+export let strip_mod = fn (typ: TypeExpr) -> TypeExpr do
+  match typ do
+    | TyLinear(inner: t) | TyLazy(inner: t)
+    | TyBorrow(inner: t) | TyRef(inner: t) -> return strip_mod(typ: t)
+    | _ -> return typ
+  end
+end
+
+// ─── Column signature ───────────────────────────────────────────────────────
+
+/**
+ * Compute the column signature for a type: finite enum/bool/list, a
+ * single-shape record, or infinite (scalars, open Exn, unknowns).
+ */
+export let column_signature = fn (
+  t: TypeExpr, enum_defs: [EnumEntry], type_defs: [TypeDefEntry]
+) -> ColumnSig do
+  match t do
+    | TyBool ->
+      return SigFinite(ctors: [
+        CtorSig(name: "true", arity: 0),
+        CtorSig(name: "false", arity: 0)
+      ])
+    | TyList(_) ->
+      return SigFinite(ctors: [
+        CtorSig(name: "Nil", arity: 0),
+        CtorSig(name: "Cons", arity: 2)
+      ])
+    | TyUserDefined(name: n, args: _) ->
+      // `Exn` is an open enum — surface as SigInfinite so wildcard-head
+      // usefulness falls through to default_matrix.
+      if n == "Exn" then return SigInfinite end
+      match find_enum(defs: enum_defs, name: n) do
+        | Some(val: ed) ->
+          // D-Type-Sum-Opaque: opaque enums with empty variants are SigInfinite
+          // to avoid false-positive unreachable-arm errors.
+          let EnumDef(name: _, is_public: _, is_opaque: opq, type_params: _, variants: vs) = ed
+          match vs do
+            | [] -> if opq then return SigInfinite end
+            | _ -> ()
+          end
+          return SigFinite(ctors: enum_ctor_sigs(def: ed, acc: []))
+        | None ->
+          if n == "List" then
+            return SigFinite(ctors: [
+              CtorSig(name: "Nil", arity: 0),
+              CtorSig(name: "Cons", arity: 2)
+            ])
+          end
+          // Named record typedefs are single-shape products — surface as
+          // SigRecord so wildcard-head usefulness expands into fields.
+          match typedef_lookup(defs: type_defs, name: n) do
+            | Some(val: RecordDef(name: _, is_public: _, type_params: _, fields: fs)) ->
+              return SigRecord(fields: fs)
+            | None -> return SigInfinite
+          end
+      end
+    | TyRecord(fields: fs) -> return SigRecord(fields: fs)
+    | _ -> return SigInfinite
+  end
+end
+
+// ─── Enum helpers ────────────────────────────────────────────────────────────
+
+export let enum_ctor_sigs = fn (def: EnumDef, acc: [CtorSig]) -> [CtorSig] do
+  let EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) = def
+  return variants_to_ctor_sigs(vs: vs, acc: acc)
+end
+
+export let variants_to_ctor_sigs = fn (vs: [VariantDef], acc: [CtorSig]) -> [CtorSig] do
+  match vs do
+    | [] -> return list.reverse(xs: acc)
+    | VariantDef(name: vn, fields: fs) :: rest ->
+      let arity = list_len(xs: fs, acc: 0)
+      return variants_to_ctor_sigs(vs: rest, acc: CtorSig(name: vn, arity: arity) :: acc)
+  end
+end
+
+export let find_enum = fn (defs: [EnumEntry], name: string) -> Option<EnumDef> do
+  match defs do
+    | [] -> return None
+    | EnumEntry(name: n, def: d) :: rest ->
+      if n == name then return Some(val: d) end
+      return find_enum(defs: rest, name: name)
+  end
+end
+
+// ─── Record/typedef helpers ──────────────────────────────────────────────────
+
+export let typedef_lookup = fn (defs: [TypeDefEntry], name: string) -> Option<RecordDef> do
+  match defs do
+    | [] -> return None
+    | TypeDefEntry(name: n, def: d) :: rest ->
+      if n == name then return Some(val: d) end
+      return typedef_lookup(defs: rest, name: name)
+  end
+end
+
+export let record_field_types = fn (t: TypeExpr, type_defs: [TypeDefEntry]) -> Option<[NamedType]> do
+  match strip_mod(typ: t) do
+    | TyRecord(fields: fs) -> return Some(val: fs)
+    | TyUserDefined(name: n, args: _) ->
+      match typedef_lookup(defs: type_defs, name: n) do
+        | Some(val: RecordDef(name: _, is_public: _, type_params: _, fields: fs)) -> return Some(val: fs)
+        | None -> return None
+      end
+    | _ -> return None
+  end
+end
+
+export let named_types_to_types = fn (nts: [NamedType], acc: [TypeExpr]) -> [TypeExpr] do
+  match nts do
+    | [] -> return list.reverse(xs: acc)
+    | NamedType(name: _, typ: t) :: rest ->
+      return named_types_to_types(nts: rest, acc: t :: acc)
+  end
+end
+
+// ─── Constructor field types ─────────────────────────────────────────────────
+
+/**
+ * Returns the field-type column for ctor `c` at type `t`. Substitutes
+ * enum type parameters against the scrutinee's concrete args.
+ */
+export let ctor_field_types = fn (
+  t: TypeExpr, variant: string,
+  enum_defs: [EnumEntry], type_defs: [TypeDefEntry]
+) -> [TypeExpr] do
+  match strip_mod(typ: t) do
+    | TyBool -> return []
+    | TyList(elem: e) ->
+      if variant == "Nil" then return [] end
+      if variant == "Cons" then return [e, TyList(elem: e)] end
+      return []
+    | TyUserDefined(name: tname, args: args) ->
+      if tname == "List" then
+        let elem = match args do
+          | [a] -> a
+          | _ -> TyVar(name: "_unknown")
+        end
+        if variant == "Nil" then return [] end
+        if variant == "Cons" then return [elem, TyList(elem: elem)] end
+        return []
+      end
+      match find_enum(defs: enum_defs, name: tname) do
+        | None -> return []
+        | Some(val: ed) ->
+          let EnumDef(name: _, is_public: _, is_opaque: _, type_params: tps, variants: vs) = ed
+          let s = build_param_subst(params: tps, args: args, acc: [])
+          return find_variant_field_types(vs: vs, variant: variant, s: s)
+      end
+    | _ -> return []
+  end
+end
+
+let build_param_subst = fn (params: [string], args: [TypeExpr], acc: [SubstEntry]) -> [SubstEntry] do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | p :: rest_p ->
+      match args do
+        | [] -> return list.reverse(xs: acc)
+        | a :: rest_a ->
+          return build_param_subst(params: rest_p, args: rest_a, acc: SubstEntry(var: p, typ: a) :: acc)
+      end
+  end
+end
+
+export let find_variant_field_types = fn (
+  vs: [VariantDef], variant: string, s: [SubstEntry]
+) -> [TypeExpr] do
+  match vs do
+    | [] -> return []
+    | VariantDef(name: vn, fields: vfs) :: rest ->
+      if vn == variant then
+        return apply_subst_to_variant_fields(vfs: vfs, s: s, acc: [])
+      end
+      return find_variant_field_types(vs: rest, variant: variant, s: s)
+  end
+end
+
+let apply_subst_to_variant_fields = fn (
+  vfs: [VariantField], s: [SubstEntry], acc: [TypeExpr]
+) -> [TypeExpr] do
+  match vfs do
+    | [] -> return list.reverse(xs: acc)
+    | VariantField(name: _, typ: t) :: rest ->
+      let applied = subst.subst_apply(subst: s, typ: t)
+      return apply_subst_to_variant_fields(vfs: rest, s: s, acc: applied :: acc)
+  end
+end
+
+// ─── Constructor field names ─────────────────────────────────────────────────
+
+export let ctor_field_names = fn (
+  t: TypeExpr, variant: string, enum_defs: [EnumEntry]
+) -> [Option<string>] do
+  match strip_mod(typ: t) do
+    | TyBool -> return []
+    | TyList(_) ->
+      if variant == "Cons" then return [Some(val: "v"), Some(val: "rest")] end
+      return []
+    | TyUserDefined(name: tname, args: _) ->
+      if tname == "List" then
+        if variant == "Cons" then return [Some(val: "v"), Some(val: "rest")] end
+        return []
+      end
+      match find_enum(defs: enum_defs, name: tname) do
+        | None -> return []
+        | Some(val: ed) ->
+          let EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) = ed
+          return find_variant_field_names(vs: vs, variant: variant)
+      end
+    | _ -> return []
+  end
+end
+
+let find_variant_field_names = fn (
+  vs: [VariantDef], variant: string
+) -> [Option<string>] do
+  match vs do
+    | [] -> return []
+    | VariantDef(name: vn, fields: vfs) :: rest ->
+      if vn == variant then return variant_field_names_go(vfs: vfs, acc: []) end
+      return find_variant_field_names(vs: rest, variant: variant)
+  end
+end
+
+let variant_field_names_go = fn (
+  vfs: [VariantField], acc: [Option<string>]
+) -> [Option<string>] do
+  match vfs do
+    | [] -> return list.reverse(xs: acc)
+    | VariantField(name: n, typ: _) :: rest ->
+      return variant_field_names_go(vfs: rest, acc: n :: acc)
+  end
+end
+
+// ─── Small list helpers ─────────────────────────────────────────────────────
+
+export let list_len = fn <T>(xs: [T], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return list_len(xs: rest, acc: acc + 1)
+  end
+end
+
+export let list_contains_str = fn (xs: [string], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | h :: r ->
+      if h == s then return true end
+      return list_contains_str(xs: r, s: s)
+  end
+end
