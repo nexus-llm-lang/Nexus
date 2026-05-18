@@ -1,0 +1,115 @@
+// nexus-486z: diagnostic range_from_span must emit UTF-16 column offsets,
+// not raw byte columns.
+//
+// Scenario: a source buffer whose second line contains multi-byte UTF-8
+// characters BEFORE the position of the type error.  Because UTF-8 BMP
+// characters (U+30B3 = KATAKANA LETTER KO, U+30E1 = KATAKANA LETTER ME)
+// each take 3 bytes but only 1 UTF-16 code unit, the byte column of the
+// error token differs from its UTF-16 column.
+//
+// Buffer (as received by the LSP after the editor opens the file):
+//
+//   let f = fn () -> unit do
+//     let _ = "コメ" ++ undefined_func()
+//     return ()
+//   end
+//
+// Line 2 content (1-based line index): `  let _ = "コメ" ++ undefined_func()`
+//
+//   Byte layout (0-based positions):
+//   `  let _ = `    = bytes 0-9   (10 bytes)
+//   `"` (open)      = byte 10
+//   `コ` (U+30B3)   = bytes 11-13 (3 UTF-8 bytes)
+//   `メ` (U+30E1)   = bytes 14-16 (3 UTF-8 bytes)
+//   `"` (close)     = byte 17
+//   ` ++ `          = bytes 18-21 (4 bytes)
+//   `u` (undefined) = byte 22 → byte col 23 (1-based).
+//
+//   UTF-16 layout (0-based units):
+//   `  let _ = ` (10 units) + `"` (1) + `コ` (1) + `メ` (1) +
+//   `"` (1) + ` ++ ` (4 units) = 18 units before `u`.
+//   `undefined_func` at UTF-16 unit 18 (0-based) = UTF-16 col 19 (1-based).
+//
+// The fix changes range_from_span to call utf16_len_range instead of using
+// Span.col directly.  Expected DiagRange.start_col = 19, not 23.
+
+import * as pipeline from "src/lsp/state/diagnostics_pipeline.nx"
+import { DiagEntry, DiagRange } from "src/lsp/state/diagnostics.nx"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+// Count diagnostics.
+let count_diags = fn (xs: [DiagEntry], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_diags(xs: rest, acc: acc + 1)
+  end
+end
+
+// Buffer text at runtime contains actual UTF-8 bytes for コ (U+30B3, 3 bytes)
+// and メ (U+30E1, 3 bytes).  `undefined_func` does not exist in scope so the
+// typecheck pass produces an InferExprErr whose span points at the call site.
+let buffer_text = fn () -> string do
+  return "let f = fn () -> unit do\n"
+      ++ "  let _ = \"\u{30B3}\u{30E1}\" ++ undefined_func()\n"
+      ++ "  return ()\n"
+      ++ "end\n"
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  let text = buffer_text()
+  let diags = pipeline.compute_diagnostics_for_buffer(
+    text,
+    file: "buffer://utf16_col_test.nx"
+  )
+
+  // Exactly one diagnostic expected.
+  test_assert.assert_eq_i64(
+    actual: count_diags(xs: diags, acc: 0),
+    expected: 1,
+    label: "exactly one diagnostic for unbound function"
+  )
+
+  match diags do
+    | [] -> throw RuntimeError(val: "unreachable: count asserted 1")
+    | DiagEntry(file: _, range: DiagRange(start_line, start_col, end_line: _, end_col: _), severity: _, code: _, message: _) :: _ ->
+      // Error is on line 2 of the source (1-based).
+      test_assert.assert_eq_i64(
+        actual: start_line,
+        expected: 2,
+        label: "diagnostic on line 2"
+      )
+      // UTF-16 column of `undefined_func` on line 2.
+      // `  let _ = ` (10) + `"` (1) + `コ` (1) + `メ` (1) + `" ++ ` (5) = 18
+      //   UTF-16 units before `u`.
+      // UTF-16 col = 19 (1-based).
+      // Byte col = 10 + 1 + 3 + 3 + 1 + 4 = 22 (0-based) = 23 (1-based).
+      // We assert the UTF-16 value (19), not the byte value (23).
+      test_assert.assert_eq_i64(
+        actual: start_col,
+        expected: 19,
+        label: "UTF-16 column of undefined_func (not byte column)"
+      )
+  end
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end

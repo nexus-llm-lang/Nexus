@@ -1,0 +1,131 @@
+// nexus-9wug: find_ident_at must use UTF-16 code-unit widths for token_covers,
+// not codepoint counts.
+//
+// Since Nexus identifiers are ASCII-only (per the lexer's is_ident_byte
+// predicate), byte_length == codepoint count == UTF-16 length for any
+// identifier.  The fix (str.byte_length instead of str.length) is therefore
+// semantics-preserving but aligns the LSP contract: both the cursor's
+// `character` field and the comparison width are now explicitly UTF-16 units.
+//
+// Tests exercised here:
+//
+//   1. find_ident_at on a simple two-function buffer returns the correct
+//      IdentHit name when the cursor lands on each character of the name.
+//      This is the base regression guard for the ASCII path.
+//
+//   2. Cursor one position before the start -> None (boundary check at col 0).
+//
+//   3. Cursor one position past the last char -> None (boundary check at
+//      col == name_len).
+//
+//   4. Buffer with a multi-byte UTF-8 string literal on line 1 followed by an
+//      identifier on line 2.  The identifier column is 1-based byte = 1-based
+//      UTF-16 (all-ASCII line), so find_ident_at must resolve it correctly
+//      using the UTF-16 cursor passed by the LSP client.
+
+import * as defn from "src/lsp/handlers/definition.nx"
+import * as lexer from "src/frontend/lexer.nx"
+import * as test_assert from "std:test/assert"
+import { Option, Some, None } from "std:option"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+// -- helpers -----------------------------------------------------------------
+
+let assert_hit_name = fn (
+  hit_opt: Option<defn.IdentHit>,
+  expected: string,
+  label: string
+) -> unit throws { Exn } do
+  match hit_opt do
+    | None -> throw RuntimeError(val: "expected Some(IdentHit), got None: " ++ label)
+    | Some(val: defn.IdentHit(name, span: _, name_len: _, index: _)) ->
+      test_assert.assert_eq_string(actual: name, expected, label)
+  end
+end
+
+let assert_no_hit = fn (
+  hit_opt: Option<defn.IdentHit>,
+  label: string
+) -> unit throws { Exn } do
+  match hit_opt do
+    | None -> return ()
+    | Some(val: _) -> throw RuntimeError(val: "expected None, got Some: " ++ label)
+  end
+end
+
+// -- test body ---------------------------------------------------------------
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+
+  // Case 1: basic ASCII identifier hit/miss.
+  // Buffer:
+  //   line 0 (LSP): `let foo = 1`
+  //   line 1 (LSP): `let bar = 2`
+  //
+  // `foo` starts at LSP (line=0, character=4) and is 3 chars wide.
+  // Cursor at characters 4, 5, 6 should all hit `foo`.
+  // Character 3 (space before) and 7 (space after) should miss.
+  let buf1 = "let foo = 1\nlet bar = 2\n"
+  let toks1 = lexer.tokenize(src: buf1)
+
+  let hit4 = defn.find_ident_at(toks: toks1, line: 0, character: 4)
+  assert_hit_name(hit_opt: hit4, expected: "foo", label: "foo at col 4")
+
+  let hit5 = defn.find_ident_at(toks: toks1, line: 0, character: 5)
+  assert_hit_name(hit_opt: hit5, expected: "foo", label: "foo at col 5")
+
+  let hit6 = defn.find_ident_at(toks: toks1, line: 0, character: 6)
+  assert_hit_name(hit_opt: hit6, expected: "foo", label: "foo at col 6")
+
+  let miss3 = defn.find_ident_at(toks: toks1, line: 0, character: 3)
+  assert_no_hit(hit_opt: miss3, label: "col before foo")
+
+  let miss7 = defn.find_ident_at(toks: toks1, line: 0, character: 7)
+  assert_no_hit(hit_opt: miss7, label: "col past foo end")
+
+  let bar_hit = defn.find_ident_at(toks: toks1, line: 1, character: 4)
+  assert_hit_name(hit_opt: bar_hit, expected: "bar", label: "bar on line 1")
+
+  // Case 2: buffer with a multi-byte string literal on line 0 (LSP), then an
+  // identifier on line 1 (LSP).
+  //
+  // Line 0 (LSP): `let s = "コメント"`  — contains non-ASCII inside string
+  // Line 1 (LSP): `let x = s`
+  //
+  // `x` is on LSP line 1 at byte column 5 (1-based) = LSP character 4
+  // (0-based).  The identifier's line is all-ASCII so byte col == UTF-16 col.
+  // find_ident_at must return a hit for `x` at (line=1, character=4).
+  let buf2 = "let s = \"\u{30B3}\u{30E1}\u{30F3}\u{30C8}\"\nlet x = s\n"
+  let toks2 = lexer.tokenize(src: buf2)
+
+  let x_hit = defn.find_ident_at(toks: toks2, line: 1, character: 4)
+  assert_hit_name(hit_opt: x_hit, expected: "x", label: "x after multibyte line")
+
+  let x_miss_before = defn.find_ident_at(toks: toks2, line: 1, character: 3)
+  assert_no_hit(hit_opt: x_miss_before, label: "col before x")
+
+  let x_miss_after = defn.find_ident_at(toks: toks2, line: 1, character: 5)
+  assert_no_hit(hit_opt: x_miss_after, label: "col past x end")
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
