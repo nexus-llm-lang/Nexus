@@ -9,7 +9,22 @@
  * catch case ParseError ->             // coarse: any parse error
  * catch case CompileError ->           // broadest: any compiler error
  *
- * ─── Error-contract rule ────────────────────────────────────
+ * Phase-local group files (contain ONLY exception group declarations;
+ * individual exception types are defined below so the seed compiler's
+ * wf_throw and constructor-lookup checks find them in enum_defs):
+ *   src/ir/hir/errors.nx     — HirError group
+ *   src/typecheck/errors.nx  — TypeError group + all T-rule / linearity diagnostics
+ *   src/backend/errors.nx    — CodegenError group + SymbolKind + SymbolNotFound +
+ *                               StackSwitchingNotImplemented
+ *   src/ir/mir/errors.nx     — MirError group + MirPortHandlerNotFound
+ *   src/ir/lir/errors.nx     — LirError group + all Lir* field exceptions
+ *
+ * This file owns: all individual exception definitions (parse, HIR, driver,
+ * file-context, and the HIR sub-exceptions that appear directly in throws rows),
+ * plus ParseError / DriverError / FileContextError / HirError / CompileError
+ * groups and all error formatting.
+ *
+ * ─── Error-contract rule ────────────────────────────────────────────────────
  *
  * Lookup-helper return shapes follow one rule:
  *   1. Hot paths (per AST node / IR atom / match arm)  → i64 with `-1` sentinel
@@ -34,8 +49,43 @@ import { Span } from "src/common/token.nx"
 import * as str from "std:str"
 import { FileNotFound } from "std:fs"
 import { Option, Some, None } from "std:option"
+import {
+  TypeError,
+  TypeMismatch, MissingMain, MainNotFunction, MainNotUnit, MainThrowsTooBroad,
+  MainRequiresTooBroad, MainExported,
+  LazyBindingUnused, LazyBindingDoubleUse,
+  LinearUnused, LinearReuse, LinearMismatch, LinearLeakAcrossThrowableCall,
+  ThrowsRowInvariantBroken,
+  DuplicateTopLevelBinding, UnusedTypeParam, KindClashTypeParam,
+  UnknownCapability, UnknownThrowVariant,
+  DuplicateInjectPort, HandlerRequireNotSubset,
+  DuplicateRecordLabel, DuplicatePatternLabel,
+  UnreachableCode
+} from "src/typecheck/errors.nx"
+import {
+  SymbolKind, SkFunction, SkExternal, SkIntrinsic, SkIntrinsicArg, SkBinaryOp,
+  SkVariable, SkClosureArity, SkArmTag, SkArmTagIndex, SkSuspendTag,
+  SkCallArgLabel, SkInjectHandler,
+  SymbolNotFound, StackSwitchingNotImplemented,
+  CodegenError
+} from "src/backend/errors.nx"
+import {
+  MirPortHandlerNotFound, MirError
+} from "src/ir/mir/errors.nx"
+import {
+  LirFieldOnNonVariable, LirFieldOnNonRecord, LirFieldNotInRecord, LirAtomEntryNotFound,
+  LirError
+} from "src/ir/lir/errors.nx"
 
-// ─── Parse exceptions ───────────────────────────────────────────────────────
+// ─── HIR exceptions (defined here so enum_defs is populated before wf_throw) ─
+
+/** Public exception InvalidSymbolTag. */
+export exception InvalidSymbolTag(tag: i64)
+
+/** Public exception CyclicImport. */
+export exception CyclicImport(path: string)
+
+// ─── Parse exceptions ────────────────────────────────────────────────────────
 
 /** Public exception UnexpectedToken. */
 export exception UnexpectedToken(expected: string, got: string, span: Span)
@@ -59,273 +109,34 @@ export exception DuplicateParamLabel(name: string, span: Span)
 /** Public exception group ParseError. */
 export exception group ParseError = UnexpectedToken | UnexpectedEof | ParseErrorsCollected | DuplicateParamLabel
 
-// ─── Typecheck exceptions ───────────────────────────────────────────────────
+// ─── Driver exceptions ───────────────────────────────────────────────────────
 
-/** Public exception TypeMismatch. */
-export exception TypeMismatch(func_name: string, detail: string, span: Span)
-/** Public exception MissingMain. */
-export exception MissingMain
-/** Public exception MainNotFunction. */
-export exception MainNotFunction
-/** Public exception MainNotUnit. */
-export exception MainNotUnit
-/** `main` declares a throws-row that the HIR main-wrap pass cannot synthesise
- *  a top-level handler for: `Exn` (which would swallow every variant), an open
- *  row (rest is Some), or a row containing non-named entries. Narrow
- *  exception groups and concrete exception variants are accepted because the
- *  pass projects them to a closed catch-all + `__nx_exit(1)`.
- */
-export exception MainThrowsTooBroad(detail: string)
-
-/** `main` declares a require-row that contains a user-declared port capability.
- *  Per spec P9 wfMain: ρ_q ⊆ SysCaps — only the seven system capabilities
- *  (PermFs, PermNet, PermConsole, PermRandom, PermClock, PermProc, PermEnv)
- *  may appear in main's require row. User-declared ports have no enclosing
- *  inject to provide them at the program entry point.
- */
-export exception MainRequiresTooBroad(port_name: string)
-
-/** `main` was declared with the `export` prefix.
- *  Per spec P9 wfMain: main ∉ exports(T) — main is a runtime entry-point hook,
- *  not part of any module's public API. Other modules cannot import and call it.
- */
-export exception MainExported
-
-/** Public exception LazyBindingUnused. */
-export exception LazyBindingUnused(name: string, span: Span)
-/** Public exception LazyBindingDoubleUse. */
-export exception LazyBindingDoubleUse(name: string, span: Span)
-
-/** same-name top-level `let` redeclaration. The HIR-to-WASM
- *  pipeline does not handle lexical shadowing of top-level function names:
- *  the second definition silently overwrites the first in the type env,
- *  while a downstream lir_opt pass mis-resolves `return_call` to itself and
- *  corrupts UNRELATED functions' return atoms with `default_atom(typ)`.
- *  Reject the redeclaration at typecheck time to eliminate the bug class.
- */
-export exception DuplicateTopLevelBinding(name: string, span: Span)
-
-/** a top-level `fn <X1,.,Xn>(.)` declaration whose
- *  quantifier `X` does not occur in the function signature.
- *  Spec §"Polymorphism Introduction" (type-system-formal.md L548–L571):
- *  `kindOf(X, σ)` is *undefined* when neither `occurs_τ(X, σ)` nor
- *  `occurs_ρ(X, σ)` holds — the spec calls this case a static error at
- *  T-Let-PolyFn and asks the diagnostic to surface at the binding site
- *  ("malformed quantifier list"), not at a use site. The impl previously
- *  silently substituted, leaving the surplus quantifier as dead weight in
- *  the scheme.
- */
-export exception UnusedTypeParam(name: string, func_name: string, span: Span)
-
-/** a top-level `fn <X1,.,Xn>(.)` declaration whose
- *  quantifier `X` occurs *both* at a type position and as a row tail in
- *  the signature. Spec §"Polymorphism Introduction" (L548–L571):
- *  `kindOf(X, σ)` is *undefined* when `occurs_τ(X, σ) ∧ occurs_ρ(X, σ)`
- *  ("kind clash"). Without binding-site rejection, the unifier surfaces
- *  a confusing "expected Type, got Row" only when a call site exercises
- *  both positions — the spec asks us to reject at the binding site so
- *  the diagnostic points at the malformed quantifier list directly.
- */
-export exception KindClashTypeParam(name: string, func_name: string, span: Span)
-
-/** %T binding lints: linearity discipline for `%T`
- *  bindings. `LinearUnused` fires when a linear binding leaves scope
- *  without being consumed; `LinearReuse` is reserved for double-use of a
- *  linear local (the structural pass currently relies on consume-removes-
- *  from-set semantics, so a reuse manifests as Unused at the next site;
- *  the constructor is kept as a distinct kind for diagnostic clarity).
- *  `LinearMismatch` fires when an if/match/while/for/try-catch arm
- *  finishes with a different live-linear set than its sibling arms — a
- *  linear that survives one path but not another would silently leak.
- * `LinearLeakAcrossThrowableCall` is the check: a
- *  stmt-level call whose callee may throw must not leave any linear live
- *  that a catch arm would not be obliged to consume.
- */
-/** Public exception LinearUnused. */
-export exception LinearUnused(name: string, span: Span)
-/** Public exception LinearReuse. */
-export exception LinearReuse(name: string, span: Span)
-/** Public exception LinearMismatch. */
-export exception LinearMismatch(detail: string, span: Span)
-/** Public exception LinearLeakAcrossThrowableCall. */
-export exception LinearLeakAcrossThrowableCall(callee: string, leaked: [string], span: Span)
-
-/** Typecheck invariant violation: the throws-row passed to
- *  `catch_param_type_from_row` / `project_exn_from_row_types` was neither
- *  a `TyRow` / `TyVar` nor an Exn-rooted entry. Reaching this arm means
- *  a prior phase produced a malformed throws-row; surface as ICE rather
- * than fabricating a Span(0,0,0)-bearing TypeMismatch.
- *  Raised exclusively by src/typecheck/infer.nx, hence grouped under TypeError.
- */
-export exception ThrowsRowInvariantBroken(detail: string)
-
-/** Raised at every introduction site of a require row (T-Lambda, T-Handler,
- *  D-Port methods) when the row contains a name that is neither a system
- *  capability (`PermFs`, `PermConsole`, ...) nor a port declared by `cap X`.
- *  Enforces wfCap from docs/spec/type-system-formal.md §1 line 112
- * .
- */
-export exception UnknownCapability(name: string, span: Span)
-
-/** Raised at every introduction site of a throws row (T-Lambda fn arrow,
- *  D-Port methods, handler arms) when the row contains a name that is not
- *  the universal `Exn` sentinel, a variant of `Exn` (i.e. a declared
- *  `exception` or built-in), or a declared exception group.
- *  Enforces wfThrow from docs/spec/type-system-formal.md §1 line 116
- * .
- */
-export exception UnknownThrowVariant(name: string, span: Span)
-
-/** Raised when an `inject` site lists two or more handlers that target the
- *  same port (capability). Enforces T-Inject premise ∀i≠j. P_i ≠ P_j
- *  from docs/spec/type-system-formal.md.
- */
-export exception DuplicateInjectPort(port_name: string, span: Span)
-
-/** Raised when an `inject` site includes a handler whose declared `require`
- *  row contains a capability not present in the enclosing function's ambient
- *  require row. Enforces T-Inject premise ∀i. ρ_i ⊆ ρ_q.
- */
-export exception HandlerRequireNotSubset(handler_name: string, missing_cap: string, span: Span)
-
-/** Raised when a record literal `{ℓ₁: e₁, …, ℓₖ: eₖ}` contains a
- *  duplicate field label. Enforces T-Record premise distinct(ℓ̄):
- *  |ℓ̄| = |{ℓ₁, …, ℓₖ}| must hold; a label-set, not a multiset.
- */
-export exception DuplicateRecordLabel(label: string, span: Span)
-
-/** Raised when a record pattern `{ℓ₁: p₁, …, ℓₖ: pₖ}` contains a
- *  duplicate field label. Enforces P-Record premise distinct(ℓ̄).
- */
-export exception DuplicatePatternLabel(label: string, span: Span)
-
-/** Raised when statements follow a diverging statement (return / throw) in
- *  the same block.  Enforces T-Seq premise: if τ₁ = ⊥, the rest is unreachable.
- */
-export exception UnreachableCode(span: Span)
-
-/** Public exception group TypeError. */
-export exception group TypeError = TypeMismatch | MissingMain | MainNotFunction | MainNotUnit | MainThrowsTooBroad
-  | MainRequiresTooBroad | MainExported
-  | LazyBindingUnused | LazyBindingDoubleUse
-  | LinearUnused | LinearReuse | LinearMismatch | LinearLeakAcrossThrowableCall
-  | ThrowsRowInvariantBroken
-  | DuplicateTopLevelBinding
-  | UnusedTypeParam | KindClashTypeParam
-  | UnknownCapability | UnknownThrowVariant
-  | DuplicateInjectPort | HandlerRequireNotSubset
-  | DuplicateRecordLabel | DuplicatePatternLabel
-  | UnreachableCode
-
-// ─── HIR exceptions ─────────────────────────────────────────────────────────
-
-/** Public exception InvalidSymbolTag. */
-export exception InvalidSymbolTag(tag: i64)
-
-// ─── Codegen exceptions ─────────────────────────────────────────────────────
-
-/** Symbol-kind discriminator for `SymbolNotFound` (
- *  part 4). The previous `kind: string` field accepted free-form labels
- *  ("function", "intrinsic", "arm tag", ...); the variant set below is
- *  the audited enumeration of every value the throw sites actually used.
- *  Consolidations: "arm function" → SkFunction; every "X intrinsic arg"
- *  label → SkIntrinsicArg; "sched intrinsic" → SkIntrinsic;
- *  "local variable" → SkVariable. The human label string used in
- *  `format_error` is recovered by `symbol_kind_label` below.
- */
-export type SymbolKind =
-    SkFunction
-  | SkExternal
-  | SkIntrinsic
-  | SkIntrinsicArg
-  | SkBinaryOp
-  | SkVariable
-  | SkClosureArity
-  | SkArmTag
-  | SkArmTagIndex
-  | SkSuspendTag
-  | SkCallArgLabel
-  | SkInjectHandler
-
-let symbol_kind_label = fn (k: SymbolKind) -> string do
-  match k do
-    | SkFunction -> return "function"
-    | SkExternal -> return "external"
-    | SkIntrinsic -> return "intrinsic"
-    | SkIntrinsicArg -> return "intrinsic arg"
-    | SkBinaryOp -> return "binary operator"
-    | SkVariable -> return "variable"
-    | SkClosureArity -> return "closure arity"
-    | SkArmTag -> return "arm tag"
-    | SkArmTagIndex -> return "arm tag index"
-    | SkSuspendTag -> return "suspend tag"
-    | SkCallArgLabel -> return "call argument label"
-    | SkInjectHandler -> return "inject handler"
-  end
-end
-
-/** Public exception SymbolNotFound. */
-export exception SymbolNotFound(name: string, kind: SymbolKind, context: string)
-
-/** Raised when codegen encounters a stack-switching IR node (LirExprSuspend,
- *  LirExprResume, LirExprContNew). The IR types exist as placeholders; codegen
- *  for the with-kont (`with @k`) path is not yet implemented.
- */
-export exception StackSwitchingNotImplemented(node: string)
-
-/** Public exception group CodegenError. */
-export exception group CodegenError = SymbolNotFound | StackSwitchingNotImplemented
-
-// ─── Driver exceptions ──────────────────────────────────────────────────────
-
-/** Public exception CyclicImport. */
-export exception CyclicImport(path: string)
 /** Public exception InvalidUsage. */
 export exception InvalidUsage(detail: string)
 /** Public exception WriteFailed. */
 export exception WriteFailed(path: string)
 /** Public exception SandboxRefusal: a required capability was stripped by a --no-* flag. */
 export exception SandboxRefusal(capability: string, flag: string)
+
 /** Raised when a selective import names a symbol that exists in the module but
  *  is not exported (no export prefix). Enforces D-Export from
  *  docs/spec/type-system-formal.md: only exported names are visible to importing modules.
  */
 export exception ImportNotExported(name: string, module_path: string)
 
-/** Public exception group DriverError. */
-export exception group DriverError = CyclicImport | InvalidUsage | WriteFailed | SandboxRefusal | ImportNotExported
-
-// ─── File-context wrappers ─────────────────────────────────────────────────
-//
-// Attach file-path context to any inner compile error. `detail` is the
-// already-formatted inner message (see format_error), so these wrappers
-// chain naturally: InTargetFile('root', InImport('b', InImport('c', '...'))).
-
-/** Public exception InImport. */
+/** Attach file-path context to any inner compile error. `detail` is the
+ *  already-formatted inner message (see format_error), so these wrappers
+ *  chain naturally: InTargetFile('root', InImport('b', InImport('c', '...'))).
+ */
 export exception InImport(path: string, detail: string)
 /** Public exception InTargetFile. */
 export exception InTargetFile(path: string, detail: string)
 
+/** Public exception group DriverError. */
+export exception group DriverError = CyclicImport | InvalidUsage | WriteFailed | SandboxRefusal | ImportNotExported
+
 /** Public exception group FileContextError. */
 export exception group FileContextError = InImport | InTargetFile
-
-// ─── HIR-phase group (declared after its members are in scope) ─────────────
-//
-// Members are the union of:
-//   - Pure HIR ICE invariants (InvalidSymbolTag).
-//   - HIR-phase user-facing errors raised from src/ir/*
-//     (LazyBindingUnused, LazyBindingDoubleUse, CyclicImport, SymbolNotFound).
-//   - The InImport file-context wrapper, raised by src/ir/imports.nx as the
-//     catch-and-rebrand boundary that attaches file-path context to any
-//     inner compile error encountered while loading an imported module.
-//
-// Several members appear in additional groups by design (multi-membership):
-// SymbolNotFound is also raised by src/backend/codegen/* and lives in
-// CodegenError; LazyBindingUnused / LazyBindingDoubleUse are linearity-phase
-// diagnostics and live in TypeError; CyclicImport is also classified as a
-// DriverError. The duplication is intentional: each group captures the phase
-// that raises its members, and a single variant can be raised by more than
-// one phase.
 
 /** Public exception group HirError. */
 export exception group HirError =
@@ -337,30 +148,7 @@ export exception group HirError =
   | InImport
   | MainExported
 
-// ─── MIR exceptions ─────────────────────────────────────────────────────────
-
-/** Public exception MirPortHandlerNotFound. */
-export exception MirPortHandlerNotFound(port_name: string, method_name: string)
-
-/** Public exception group MirError. */
-export exception group MirError = MirPortHandlerNotFound
-
-// ─── LIR exceptions ─────────────────────────────────────────────────────────
-
-/** Public exception LirFieldOnNonVariable. */
-export exception LirFieldOnNonVariable(field: string)
-/** Public exception LirFieldOnNonRecord. */
-export exception LirFieldOnNonRecord(field: string, variable: string)
-/** Public exception LirFieldNotInRecord. */
-export exception LirFieldNotInRecord(field: string)
-/** Public exception LirAtomEntryNotFound. */
-export exception LirAtomEntryNotFound(id: i64)
-
-/** Public exception group LirError. */
-export exception group LirError =
-    LirFieldOnNonVariable | LirFieldOnNonRecord | LirFieldNotInRecord | LirAtomEntryNotFound
-
-// ─── Top-level group ────────────────────────────────────────────────────────
+// ─── Top-level group ─────────────────────────────────────────────────────────
 
 /** Public exception group CompileError. */
 export exception group CompileError =
@@ -383,7 +171,7 @@ export exception group CompileError =
   | DuplicateRecordLabel | DuplicatePatternLabel
   | StackSwitchingNotImplemented
 
-// ─── Formatting helpers ─────────────────────────────────────────────────────
+// ─── Formatting helpers ──────────────────────────────────────────────────────
 //
 // Style:
 //   - numeric error codes per phase: E0xxx internal, E1xxx lex/parse,
@@ -427,6 +215,23 @@ end
 let format_at = fn (span: Span) -> string do
   match span do | Span(offset: _, line: l, col: c) ->
     return " at line " ++ str.from_i64(val: l) ++ ", column " ++ str.from_i64(val: c)
+  end
+end
+
+let symbol_kind_label = fn (k: SymbolKind) -> string do
+  match k do
+    | SkFunction -> return "function"
+    | SkExternal -> return "external"
+    | SkIntrinsic -> return "intrinsic"
+    | SkIntrinsicArg -> return "intrinsic arg"
+    | SkBinaryOp -> return "binary operator"
+    | SkVariable -> return "variable"
+    | SkClosureArity -> return "closure arity"
+    | SkArmTag -> return "arm tag"
+    | SkArmTagIndex -> return "arm tag index"
+    | SkSuspendTag -> return "suspend tag"
+    | SkCallArgLabel -> return "call argument label"
+    | SkInjectHandler -> return "inject handler"
   end
 end
 
@@ -554,7 +359,7 @@ export let format_error = fn (err: Exn) -> string do
   end
 end
 
-// ─── Structured diagnostics (V1) ───────────────────────────
+// ─── Structured diagnostics (V1) ────────────────────────────────────────────
 //
 // `CompilerDiagnostic` is the JSON-serializable shape that backs `--format=json`.
 // Built from a raw Exn via `diagnostic_from_exn`; rendered to NDJSON via
