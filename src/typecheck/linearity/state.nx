@@ -1,0 +1,171 @@
+/**
+ * typecheck/linearity/state: LinState + frame ops for the linearity pass.
+ *
+ * LinState is the mutable-by-threading state threaded through the linearity
+ * walker: a set of live linear variable names, a stack of frame snapshots for
+ * throwable-call leak detection, and a must_consume set for cont_binder arms.
+ */
+
+import { Option, Some, None } from "std:option"
+
+// ─── Linearity state ─────────────────────────────────────────────────────────
+
+/** One snapshot of `vars` at a frame boundary. Wraps a `[string]` so the
+ *  surrounding LinState can carry a list of these without nesting list-of-
+ *  list type syntax (Nexus requires a nominal type for nested generics).
+ */
+export type LinFrame = LinFrame(vars: [string])
+
+/** Live linear bindings + enclosing frame snapshots. `frame_stack` is a
+ *  stack of `vars` snapshots at function-body entry and `try`-body entry.
+ *  The top is the "covered" set for the throwable-call leak check.
+ *  `must_consume` names bindings (e.g. with-@k cont_binders) that must be
+ *  consumed on EVERY exit path, including early `return` — unlike regular
+ *  linear params whose end-of-function check covers only the fall-through
+ *  path.
+ */
+export type LinState = LinState(vars: [string], frame_stack: [LinFrame], must_consume: [string])
+
+export let lin_empty = fn () -> LinState do
+  return LinState(vars: [], frame_stack: [], must_consume: [])
+end
+
+export let lin_add = fn (st: LinState, name: string) -> LinState do
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc) = st
+  return LinState(vars: name :: vs, frame_stack: fs, must_consume: mc)
+end
+
+export let lin_remove = fn (st: LinState, name: string) -> LinState do
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc) = st
+  return LinState(vars: remove_one(xs: vs, target: name), frame_stack: fs, must_consume: mc)
+end
+
+let remove_one = fn (xs: [string], target: string) -> [string] do
+  match xs do
+    | [] -> return []
+    | x :: rest ->
+      if x == target then return rest end
+      return x :: remove_one(xs: rest, target)
+  end
+end
+
+export let lin_member = fn (st: LinState, name: string) -> bool do
+  let LinState(vars: vs, frame_stack: _, must_consume: _) = st
+  return str_member(xs: vs, target: name)
+end
+
+export let str_member = fn (xs: [string], target: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == target then return true end
+      return str_member(xs: rest, target)
+  end
+end
+
+/** Set equality of two linear-var sets — order-insensitive. */
+export let vars_equal = fn (a: [string], b: [string]) -> bool do
+  if length(xs: a) != length(xs: b) then return false end
+  return all_in(needles: a, haystack: b) && all_in(needles: b, haystack: a)
+end
+
+let length = fn (xs: [string]) -> i64 do
+  match xs do
+    | [] -> return 0
+    | _ :: rest -> return 1 + length(xs: rest)
+  end
+end
+
+let all_in = fn (needles: [string], haystack: [string]) -> bool do
+  match needles do
+    | [] -> return true
+    | n :: rest ->
+      if !str_member(xs: haystack, target: n) then return false end
+      return all_in(needles: rest, haystack)
+  end
+end
+
+export let lin_push_frame = fn (st: LinState) -> LinState do
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc) = st
+  return LinState(vars: vs, frame_stack: LinFrame(vars: copy(xs: vs)) :: fs, must_consume: mc)
+end
+
+export let lin_pop_frame = fn (st: LinState) -> LinState do
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc) = st
+  match fs do
+    | [] -> return st
+    | _ :: rest -> return LinState(vars: vs, frame_stack: rest, must_consume: mc)
+  end
+end
+
+export let lin_top_frame = fn (st: LinState) -> Option<[string]> do
+  let LinState(vars: _, frame_stack: fs, must_consume: _) = st
+  match fs do
+    | [] -> return None
+    | LinFrame(vars: top) :: _ -> return Some(val: top)
+  end
+end
+
+let copy = fn (xs: [string]) -> [string] do
+  match xs do
+    | [] -> return []
+    | x :: rest -> return x :: copy(xs: rest)
+  end
+end
+
+export let join_simple = fn (xs: [string]) -> string do
+  match xs do
+    | [] -> return "{}"
+    | x :: [] -> return "{" ++ x ++ "}"
+    | x :: rest -> return "{" ++ x ++ "," ++ join_inner(xs: rest) ++ "}"
+  end
+end
+
+let join_inner = fn (xs: [string]) -> string do
+  match xs do
+    | [] -> return ""
+    | x :: [] -> return x
+    | x :: rest -> return x ++ "," ++ join_inner(xs: rest)
+  end
+end
+
+export let lin_set_vars = fn (st: LinState, vs: [string]) -> LinState do
+  let LinState(vars: _, frame_stack: fs, must_consume: mc) = st
+  return LinState(vars: vs, frame_stack: fs, must_consume: mc)
+end
+
+/** Return the set of names that must be consumed on every exit path
+ *  (currently seeded only by with-@k cont_binder arms).
+ */
+export let lin_get_must_consume = fn (st: LinState) -> [string] do
+  let LinState(vars: _, frame_stack: _, must_consume: mc) = st
+  return mc
+end
+
+/** Return the first name in `mc` that is still live (in `live`), or None. */
+export let find_live_must_consume = fn (mc: [string], live: [string]) -> Option<string> do
+  match mc do
+    | [] -> return None
+    | n :: rest ->
+      if str_member(xs: live, target: n) then return Some(val: n) end
+      return find_live_must_consume(mc: rest, live)
+  end
+end
+
+export let lin_state_vars = fn (st: LinState) -> [string] do
+  let LinState(vars: vs, frame_stack: _, must_consume: _) = st
+  return vs
+end
+
+export let filter_not_in = fn (
+  xs: [string], exclude: [string], acc: [string]
+) -> [string] do
+  match xs do
+    | [] -> return acc
+    | x :: rest ->
+      if str_member(xs: exclude, target: x) then
+        return filter_not_in(xs: rest, exclude, acc)
+      end
+      return filter_not_in(xs: rest, exclude, acc: x :: acc)
+  end
+end

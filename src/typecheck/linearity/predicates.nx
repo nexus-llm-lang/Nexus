@@ -1,0 +1,177 @@
+/**
+ * typecheck/linearity/predicates: linearity-specific predicates over enum/record defs.
+ *
+ * These helpers resolve per-field and per-variant linearity from the program's
+ * type definitions. The canonical type predicates (is_auto_droppable,
+ * is_linear_binding_type, is_linear, strip_mod) live in
+ * src/ir/shared/type_pred.nx and are re-exported from there; this module
+ * only contains predicates that need to walk EnumDef / RecordDef lists.
+ */
+
+import {
+  TypeExpr, RecordDef, EnumDef, VariantDef, VariantField, NamedType
+} from "src/common/ast.nx"
+import {
+  is_linear_binding_type
+} from "src/ir/shared/type_pred.nx"
+import { Option, Some, None } from "std:option"
+
+// ─── Linearity classification on TypeExpr ────────────────────────────────────
+// Canonical predicates (is_auto_droppable, is_linear_binding_type) are
+// imported from src/ir/shared/type_pred.nx above.
+
+/** Look up the field list for an enum variant named `variant` by scanning all
+ *  EnumDef.variants lists. Returns the VariantField list if found. Used by
+ *  bind_pattern_fields to determine whether each PCtor field is linear.
+ */
+export let lin_enum_variant_fields = fn (defs: [EnumDef], variant: string) -> Option<[VariantField]> do
+  match defs do
+    | [] -> return None
+    | EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      match lin_find_variant_in_list(vs, variant) do
+        | Some(val: fs) -> return Some(val: fs)
+        | None -> return lin_enum_variant_fields(defs: rest, variant)
+      end
+  end
+end
+
+let lin_find_variant_in_list = fn (vs: [VariantDef], variant: string) -> Option<[VariantField]> do
+  match vs do
+    | [] -> return None
+    | VariantDef(name: n, fields: fs) :: rest ->
+      if n == variant then return Some(val: fs) end
+      return lin_find_variant_in_list(vs: rest, variant)
+  end
+end
+
+/** Return the TypeExpr for the i-th field of `variant_fields`, matching by
+ *  name when `fname` is Some(…) and `variant_fields` has named fields, or by
+ *  positional index otherwise. Returns None when no match is found.
+ */
+export let lin_variant_field_type_at = fn (
+  variant_fields: [VariantField], fname: Option<string>, idx: i64
+) -> Option<TypeExpr> do
+  match variant_fields do
+    | [] -> return None
+    | VariantField(name: vfname, typ: t) :: rest ->
+      match fname do
+        | Some(val: n) ->
+          match vfname do
+            | Some(val: vn) ->
+              if vn == n then return Some(val: t) end
+              return lin_variant_field_type_at(variant_fields: rest, fname, idx: idx + 1)
+            | None ->
+              if idx == 0 then return Some(val: t) end
+              return lin_variant_field_type_at(variant_fields: rest, fname, idx: idx - 1)
+          end
+        | None ->
+          if idx == 0 then return Some(val: t) end
+          return lin_variant_field_type_at(variant_fields: rest, fname, idx: idx - 1)
+      end
+  end
+end
+
+/** Return the TypeExpr for record field `fname` by scanning NamedType list.
+ *  Used by bind_pattern_rec_fields to determine if a PRec field is linear.
+ */
+export let lin_record_field_type_by_name = fn (fields: [NamedType], fname: string) -> Option<TypeExpr> do
+  match fields do
+    | [] -> return None
+    | NamedType(name: n, typ: t) :: rest ->
+      if n == fname then return Some(val: t) end
+      return lin_record_field_type_by_name(fields: rest, fname)
+  end
+end
+
+/** Scan all RecordDefs for a record that has a field named `fname` with a
+ *  linear type. Conservative: any match wins. Used for PRec patterns where
+ *  the scrutinee type is not tracked through the pattern AST.
+ */
+export let lin_any_record_has_linear_field = fn (
+  tdefs: [RecordDef], fname: string
+) -> bool do
+  match tdefs do
+    | [] -> return false
+    | RecordDef(name: _, is_public: _, type_params: _, fields: fs) :: rest ->
+      match lin_record_field_type_by_name(fields: fs, fname) do
+        | Some(val: ft) -> if is_linear_binding_type(ft, tdefs) then return true end
+        | None -> ()
+      end
+      return lin_any_record_has_linear_field(tdefs: rest, fname)
+  end
+end
+
+/** True when the named field `fname` of variant `variant` is declared with a
+ *  linear type (is_linear_binding_type). Returns false when the variant is
+ *  not found, when the field is not found, or when the field type is not linear.
+ */
+export let lin_field_is_linear = fn (
+  defs: [EnumDef], variant: string, fname: string, tdefs: [RecordDef]
+) -> bool do
+  match defs do
+    | [] -> return false
+    | EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      if lin_variant_has_name(vs: vs, variant) then
+        return lin_named_field_linear_in_variant(vs: vs, variant, fname, tdefs)
+      end
+      return lin_field_is_linear(defs: rest, variant, fname, tdefs)
+  end
+end
+
+/** True when any VariantDef in `vs` has name `variant`. Used to distinguish
+ *  "variant found, field not linear" from "variant not found".
+ */
+export let lin_variant_has_name = fn (vs: [VariantDef], variant: string) -> bool do
+  match vs do
+    | [] -> return false
+    | VariantDef(name: n, fields: _) :: rest ->
+      if n == variant then return true end
+      return lin_variant_has_name(vs: rest, variant)
+  end
+end
+
+/** True when variant `variant` in `vs` has a field named `fname` with a
+ *  linear declared type. Returns false when variant not found or field not linear.
+ */
+let lin_named_field_linear_in_variant = fn (
+  vs: [VariantDef], variant: string, fname: string, tdefs: [RecordDef]
+) -> bool do
+  match vs do
+    | [] -> return false
+    | VariantDef(name: n, fields: fs) :: rest ->
+      if n == variant then
+        return lin_check_named_field_linear(fields: fs, fname, tdefs)
+      end
+      return lin_named_field_linear_in_variant(vs: rest, variant, fname, tdefs)
+  end
+end
+
+let lin_check_named_field_linear = fn (
+  fields: [VariantField], fname: string, tdefs: [RecordDef]
+) -> bool do
+  match fields do
+    | [] -> return false
+    | VariantField(name: vfname, typ: t) :: rest ->
+      match vfname do
+        | Some(val: n) ->
+          if n == fname then return is_linear_binding_type(t, tdefs) end
+          return lin_check_named_field_linear(fields: rest, fname, tdefs)
+        | None ->
+          return lin_check_named_field_linear(fields: rest, fname, tdefs)
+      end
+  end
+end
+
+/** True when variant `variant` is declared in any EnumDef in `defs`. Used to
+ *  distinguish "variant found, field not linear" from "variant not found" so
+ *  bind_pattern_fields_for_variant can fall back to scrutinee_linear only when
+ *  the variant is truly unknown.
+ */
+export let lin_variant_is_known = fn (defs: [EnumDef], variant: string) -> bool do
+  match defs do
+    | [] -> return false
+    | EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      if lin_variant_has_name(vs: vs, variant) then return true end
+      return lin_variant_is_known(defs: rest, variant)
+  end
+end
