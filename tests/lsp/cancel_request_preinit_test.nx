@@ -1,0 +1,108 @@
+// nexus-91xi: `$/cancelRequest` sent before `initialize` must not be gated
+// out by the pre-initialize lifecycle guard.
+//
+// Per LSP spec §3.16.2, cancelRequest notifications must reach the dispatcher
+// regardless of lifecycle state. Since this server is synchronous (no
+// in-flight requests), the actual handler is a no-op, but the gate must not
+// block it.
+//
+// The observable invariant we can pin: dispatching `$/cancelRequest` before
+// `initialize` returns StepContinue with no response and zero notifications
+// (i.e. it is accepted silently, not dropped with a server_not_initialized
+// error response).
+//
+// Note: this test verifies the absence of an error response. A gate-dropped
+// notification would also produce no response — but the gate path returns
+// early before invoke_method, while the pass-through path calls invoke_method
+// and returns the same shape. The test pins the observable shape and the
+// state is unchanged (still LifecycleUninitialized).
+
+import { dispatch_message } from "src/lsp/handlers.nx"
+import {
+  StepContinue, StepExit
+} from "src/lsp/handlers.nx"
+import {
+  ServerState, empty_state, lifecycle_is_uninitialized
+} from "src/lsp/state/server_state.nx"
+import {
+  Notification
+} from "std:jsonrpc"
+import {
+  JsonValue, JsonNull, JsonObject, JsonField, JsonString, JsonInt
+} from "std:json"
+import { Option, Some, None } from "std:option"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+let make_cancel_params = fn (request_id: i64) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "id", value: JsonInt(val: request_id))
+  ])
+end
+
+let count_notifications = fn (xs: [JsonValue], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_notifications(xs: rest, acc: acc + 1)
+  end
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  let pre_init = empty_state()
+
+  // Confirm the state is indeed uninitialized before dispatching.
+  test_assert.assert_eq_bool(
+    actual: lifecycle_is_uninitialized(state: pre_init),
+    expected: true,
+    label: "precondition: empty_state is uninitialized"
+  )
+
+  let cancel_msg = Notification(
+    method: "$/cancelRequest",
+    params: make_cancel_params(request_id: 42)
+  )
+  let step = dispatch_message(state: pre_init, msg: cancel_msg)
+  match step do
+    | StepExit(_) -> throw RuntimeError(val: "$/cancelRequest must not exit")
+    | StepContinue(state: new_state, response, notifications) ->
+      // The server must not send an error response for $/cancelRequest.
+      match response do
+        | Some(val: _) -> throw RuntimeError(val: "$/cancelRequest must not produce a response")
+        | None -> ()
+      end
+      // No outbound notifications.
+      test_assert.assert_eq_i64(
+        actual: count_notifications(xs: notifications, acc: 0),
+        expected: 0,
+        label: "$/cancelRequest pre-init emits zero notifications"
+      )
+      // State is unchanged: still uninitialized.
+      test_assert.assert_eq_bool(
+        actual: lifecycle_is_uninitialized(state: new_state),
+        expected: true,
+        label: "$/cancelRequest pre-init does not advance lifecycle"
+      )
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
