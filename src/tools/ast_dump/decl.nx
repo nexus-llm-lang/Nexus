@@ -1,0 +1,319 @@
+/**
+ * ast_dump/decl: top-level AST nodes → JSON / text-lines.
+ *
+ * Covers TLTypeDef, TLEnum, TLException, TLExceptionGroup, TLImport, TLCap,
+ * TLLet and their helper types (VariantDef, ImportItem, FunctionSig, …).
+ *
+ * Exports:
+ *   JSON: top_level_to_json, top_levels_to_json
+ *   Text: top_level_to_lines, top_levels_to_lines_go
+ */
+
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+import { JsonValue, JsonString, JsonInt, JsonBool, JsonArray, JsonObject, JsonField } from "std:json"
+import { Span } from "src/common/token.nx"
+import {
+  Sigil, SigilImmutable, SigilMutable, SigilLinear, SigilBorrow, SigilLazy,
+  Program, SpannedTopLevel, TopLevel, TLTypeDef, TLEnum, TLException,
+  TLExceptionGroup, TLImport, TLCap, TLLet,
+  RecordDef, EnumDef, VariantDef, ExceptionDef, ExceptionGroupDef, ImportDef,
+  ImportItem, Cap, FunctionSig, GlobalLet,
+  NamedType, VariantField, Param,
+  SpannedExpr
+} from "src/common/ast.nx"
+import { type_to_string } from "src/typecheck/types.nx"
+import { named_types_to_json, named_types_to_lines } from "src/tools/ast_dump/type.nx"
+import { params_to_json, params_to_lines, expr_to_json, expr_to_lines } from "src/tools/ast_dump/expr.nx"
+
+// ─── Local helpers ────────────────────────────────────────────────────────────
+
+let span_to_json = fn (s: Span) -> JsonValue do
+  match s do | Span(offset, line, col) ->
+    return JsonObject(fields: [
+      JsonField(key: "start", value: JsonInt(val: offset)),
+      JsonField(key: "end", value: JsonInt(val: offset)),
+      JsonField(key: "line", value: JsonInt(val: line)),
+      JsonField(key: "col", value: JsonInt(val: col))
+    ])
+  end
+end
+
+let span_to_text = fn (s: Span) -> string do
+  match s do | Span(offset: _, line, col) ->
+    return "@" ++ str.from_i64(line) ++ ":" ++ str.from_i64(col)
+  end
+end
+
+let indent_str = fn (n: i64) -> string do
+  return indent_str_go(n, acc: "")
+end
+
+let indent_str_go = fn (n: i64, acc: string) -> string do
+  if n <= 0 then return acc end
+  return indent_str_go(n: n - 1, acc: acc ++ "  ")
+end
+
+let join_strs = fn (xs: [string], sep: string) -> string do
+  return str.join(xs, sep)
+end
+
+// ─── JSON helpers ─────────────────────────────────────────────────────────────
+
+let strs_to_json = fn (xs: [string], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest -> return strs_to_json(xs: rest, acc: JsonString(val: s) :: acc)
+  end
+end
+
+let variant_fields_to_json = fn (xs: [VariantField], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | VariantField(name, typ) :: rest ->
+      let nm = match name do | Some(val: n) -> n | None -> "" end
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "VariantField")),
+        JsonField(key: "name", value: JsonString(val: nm)),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+      return variant_fields_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let variants_to_json = fn (xs: [VariantDef], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | VariantDef(name, fields) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "VariantDef")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "children", value: JsonArray(items: variant_fields_to_json(xs: fields, acc: [])))
+      ])
+      return variants_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let import_items_to_json = fn (xs: [ImportItem], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | ImportItem(name, item_alias) :: rest ->
+      let al = match item_alias do | Some(val: a) -> a | None -> "" end
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "ImportItem")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "item_alias", value: JsonString(val: al)),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+      return import_items_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+let function_sigs_to_json = fn (xs: [FunctionSig], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | FunctionSig(name, params, ret_type, requires: _, throw_row: _) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "FunctionSig")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "ret_type", value: JsonString(val: type_to_string(typ: ret_type))),
+        JsonField(key: "children", value: JsonArray(items: params_to_json(xs: params, acc: [])))
+      ])
+      return function_sigs_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+// ─── JSON: top-level ──────────────────────────────────────────────────────────
+
+export let top_level_to_json = fn (stl: SpannedTopLevel) -> JsonValue do
+  match stl do | SpannedTopLevel(node, span) ->
+    let sp_field = JsonField(key: "span", value: span_to_json(s: span))
+    match node do
+      | TLTypeDef(def) ->
+        match def do | RecordDef(name, is_public, type_params, fields) ->
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLTypeDef")),
+            sp_field,
+            JsonField(key: "name", value: JsonString(val: name)),
+            JsonField(key: "is_public", value: JsonBool(val: is_public)),
+            JsonField(key: "type_params", value: JsonArray(items: strs_to_json(xs: type_params, acc: []))),
+            JsonField(key: "children", value: JsonArray(items: named_types_to_json(xs: fields, acc: [])))
+          ])
+        end
+      | TLEnum(def) ->
+        match def do | EnumDef(name, is_public, is_opaque, type_params, variants) ->
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLEnum")),
+            sp_field,
+            JsonField(key: "name", value: JsonString(val: name)),
+            JsonField(key: "is_public", value: JsonBool(val: is_public)),
+            JsonField(key: "is_opaque", value: JsonBool(val: is_opaque)),
+            JsonField(key: "type_params", value: JsonArray(items: strs_to_json(xs: type_params, acc: []))),
+            JsonField(key: "children", value: JsonArray(items: variants_to_json(xs: variants, acc: [])))
+          ])
+        end
+      | TLException(def) ->
+        match def do | ExceptionDef(name, is_public, fields) ->
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLException")),
+            sp_field,
+            JsonField(key: "name", value: JsonString(val: name)),
+            JsonField(key: "is_public", value: JsonBool(val: is_public)),
+            JsonField(key: "children", value: JsonArray(items: variant_fields_to_json(xs: fields, acc: [])))
+          ])
+        end
+      | TLExceptionGroup(def) ->
+        match def do | ExceptionGroupDef(name, is_public, members) ->
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLExceptionGroup")),
+            sp_field,
+            JsonField(key: "name", value: JsonString(val: name)),
+            JsonField(key: "is_public", value: JsonBool(val: is_public)),
+            JsonField(key: "members", value: JsonArray(items: strs_to_json(xs: members, acc: []))),
+            JsonField(key: "children", value: JsonArray(items: []))
+          ])
+        end
+      | TLImport(def) ->
+        match def do | ImportDef(path, alias, items, is_external) ->
+          let al = match alias do | Some(val: a) -> a | None -> "" end
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLImport")),
+            sp_field,
+            JsonField(key: "path", value: JsonString(val: path)),
+            JsonField(key: "alias", value: JsonString(val: al)),
+            JsonField(key: "is_external", value: JsonBool(val: is_external)),
+            JsonField(key: "children", value: JsonArray(items: import_items_to_json(xs: items, acc: [])))
+          ])
+        end
+      | TLCap(def) ->
+        match def do | Cap(name, is_public, functions) ->
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLCap")),
+            sp_field,
+            JsonField(key: "name", value: JsonString(val: name)),
+            JsonField(key: "is_public", value: JsonBool(val: is_public)),
+            JsonField(key: "children", value: JsonArray(items: function_sigs_to_json(xs: functions, acc: [])))
+          ])
+        end
+      | TLLet(def) ->
+        match def do | GlobalLet(name, is_public, typ, value) ->
+          let typ_str = match typ do | Some(val: t) -> type_to_string(typ: t) | None -> "" end
+          return JsonObject(fields: [
+            JsonField(key: "kind", value: JsonString(val: "TLLet")),
+            sp_field,
+            JsonField(key: "name", value: JsonString(val: name)),
+            JsonField(key: "is_public", value: JsonBool(val: is_public)),
+            JsonField(key: "type", value: JsonString(val: typ_str)),
+            JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: value)]))
+          ])
+        end
+    end
+  end
+end
+
+export let top_levels_to_json = fn (xs: [SpannedTopLevel], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | tl :: rest -> return top_levels_to_json(xs: rest, acc: top_level_to_json(stl: tl) :: acc)
+  end
+end
+
+// ─── Text helpers ─────────────────────────────────────────────────────────────
+
+let variant_fields_to_lines = fn (xs: [VariantField], depth: i64, acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | VariantField(name, typ) :: rest ->
+      let nm = match name do | Some(val: n) -> n | None -> "_" end
+      let line = indent_str(depth) ++ " VariantField " ++ nm ++ " : " ++ type_to_string(typ)
+      return variant_fields_to_lines(xs: rest, depth, acc: line :: acc)
+  end
+end
+
+let variants_to_lines = fn (xs: [VariantDef], depth: i64, acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | VariantDef(name, fields) :: rest ->
+      let head = indent_str(depth) ++ " VariantDef " ++ name
+      let acc2 = variant_fields_to_lines(xs: fields, depth: depth + 1, acc: head :: acc)
+      return variants_to_lines(xs: rest, depth, acc: acc2)
+  end
+end
+
+let import_items_to_lines = fn (xs: [ImportItem], depth: i64, acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | ImportItem(name, item_alias) :: rest ->
+      let al = match item_alias do | Some(val: a) -> " as " ++ a | None -> "" end
+      let line = indent_str(depth) ++ " ImportItem " ++ name ++ al
+      return import_items_to_lines(xs: rest, depth, acc: line :: acc)
+  end
+end
+
+let function_sigs_to_lines = fn (xs: [FunctionSig], depth: i64, acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | FunctionSig(name, params, ret_type, requires: _, throw_row: _) :: rest ->
+      let head = indent_str(depth) ++ " FunctionSig " ++ name ++ " -> " ++ type_to_string(typ: ret_type)
+      let acc2 = params_to_lines(xs: params, depth: depth + 1, acc: head :: acc)
+      return function_sigs_to_lines(xs: rest, depth, acc: acc2)
+  end
+end
+
+let pub_marker = fn (is_public: bool) -> string do
+  if is_public then return "pub " end
+  return ""
+end
+
+// ─── Text: top-level ──────────────────────────────────────────────────────────
+
+export let top_level_to_lines = fn (stl: SpannedTopLevel, depth: i64, acc: [string]) -> [string] do
+  match stl do | SpannedTopLevel(node, span) ->
+    let pre = indent_str(depth) ++ span_to_text(s: span)
+    match node do
+      | TLTypeDef(def) -> match def do | RecordDef(name, is_public, type_params: _, fields) ->
+        let head = pre ++ " TLTypeDef " ++ pub_marker(is_public) ++ "record " ++ name
+        return named_types_to_lines(xs: fields, depth: depth + 1, acc: head :: acc)
+      end
+      | TLEnum(def) -> match def do | EnumDef(name, is_public, is_opaque, type_params: _, variants) ->
+        let opq = if is_opaque then "opaque " else "" end
+        let head = pre ++ " TLEnum " ++ pub_marker(is_public) ++ opq ++ "enum " ++ name
+        return variants_to_lines(xs: variants, depth: depth + 1, acc: head :: acc)
+      end
+      | TLException(def) -> match def do | ExceptionDef(name, is_public, fields) ->
+        let head = pre ++ " TLException " ++ pub_marker(is_public) ++ name
+        return variant_fields_to_lines(xs: fields, depth: depth + 1, acc: head :: acc)
+      end
+      | TLExceptionGroup(def) -> match def do | ExceptionGroupDef(name, is_public, members) ->
+        let mems = join_strs(xs: members, sep: ", ")
+        return (pre ++ " TLExceptionGroup " ++ pub_marker(is_public) ++ name ++ " {" ++ mems ++ "}") :: acc
+      end
+      | TLImport(def) -> match def do | ImportDef(path, alias, items, is_external) ->
+        let al = match alias do | Some(val: a) -> " as " ++ a | None -> "" end
+        let ext = if is_external then " (external)" else "" end
+        let head = pre ++ " TLImport \"" ++ path ++ "\"" ++ al ++ ext
+        return import_items_to_lines(xs: items, depth: depth + 1, acc: head :: acc)
+      end
+      | TLCap(def) -> match def do | Cap(name, is_public, functions) ->
+        let head = pre ++ " TLCap " ++ pub_marker(is_public) ++ name
+        return function_sigs_to_lines(xs: functions, depth: depth + 1, acc: head :: acc)
+      end
+      | TLLet(def) -> match def do | GlobalLet(name, is_public, typ, value) ->
+        let ty_str = match typ do | Some(val: t) -> " : " ++ type_to_string(typ: t) | None -> "" end
+        let head = pre ++ " TLLet " ++ pub_marker(is_public) ++ name ++ ty_str
+        return expr_to_lines(se: value, depth: depth + 1, acc: head :: acc)
+      end
+    end
+  end
+end
+
+export let top_levels_to_lines_go = fn (xs: [SpannedTopLevel], depth: i64, acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | tl :: rest ->
+      let acc2 = top_level_to_lines(stl: tl, depth, acc)
+      return top_levels_to_lines_go(xs: rest, depth, acc: acc2)
+  end
+end

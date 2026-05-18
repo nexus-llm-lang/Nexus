@@ -1,0 +1,728 @@
+/**
+ * ast_dump/expr: SpannedExpr / SpannedStmt → JSON / text-lines.
+ *
+ * Expr and Stmt are mutually recursive (ExprIf/ExprMatch/etc. embed stmt
+ * bodies; StmtLet/StmtExpr/etc. embed expr values), so they live in one
+ * module to avoid circular imports.
+ *
+ * Exports:
+ *   JSON: expr_to_json, exprs_to_json,
+ *         stmt_to_json, stmts_to_json,
+ *         call_args_to_json, ctor_args_to_json, named_exprs_to_json,
+ *         params_to_json, match_cases_to_json, catch_arms_to_json,
+ *         handler_arms_to_json
+ *   Text: expr_to_lines, exprs_to_lines,
+ *         stmt_to_lines, stmts_to_lines,
+ *         call_args_to_lines, ctor_args_to_lines, named_exprs_to_lines,
+ *         params_to_lines, match_cases_to_lines, catch_arms_to_lines,
+ *         handler_arms_to_lines
+ */
+
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+import { JsonValue, JsonString, JsonInt, JsonBool, JsonArray, JsonObject, JsonField } from "std:json"
+import { Span } from "src/common/token.nx"
+import {
+  Sigil, SigilImmutable, SigilMutable, SigilLinear, SigilBorrow, SigilLazy,
+  BinaryOp, UnaryOp, Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit,
+  RdrName, Unqual, Qual,
+  TypeExpr,
+  NamedExpr, CallArg, CtorArg, Param, MatchCase, CatchArm, HandlerArm,
+  SpannedExpr, Expr,
+  SpannedStmt, Stmt,
+  SpannedPattern, Function
+} from "src/common/ast.nx"
+import { type_to_string } from "src/typecheck/types.nx"
+import { pattern_to_json, patterns_to_json, pat_to_lines, patterns_to_lines } from "src/tools/ast_dump/pattern.nx"
+
+// ─── Local helpers (duplicated per ir_dump precedent) ────────────────────────
+
+let sigil_to_str = fn (s: Sigil) -> string do
+  match s do
+    | SigilImmutable -> return ""
+    | SigilMutable -> return "mut"
+    | SigilLinear -> return "%"
+    | SigilBorrow -> return "&"
+    | SigilLazy -> return "@"
+  end
+end
+
+let rdr_to_str = fn (n: RdrName) -> string do
+  match n do
+    | Unqual(name) -> return name
+    | Qual(alias, name) -> return alias ++ "." ++ name
+  end
+end
+
+let literal_to_value_json = fn (lit: Literal) -> JsonValue do
+  match lit do
+    | LitInt(val) -> return JsonInt(val)
+    | LitFloat(val) -> return JsonString(val)
+    | LitBool(val) -> return JsonBool(val)
+    | LitChar(val) -> return JsonInt(val)
+    | LitString(val) -> return JsonString(val)
+    | LitUnit -> return JsonString(val: "()")
+  end
+end
+
+let literal_kind = fn (lit: Literal) -> string do
+  match lit do
+    | LitInt(val: _) -> return "int"
+    | LitFloat(val: _) -> return "float"
+    | LitBool(val: _) -> return "bool"
+    | LitChar(val: _) -> return "char"
+    | LitString(val: _) -> return "string"
+    | LitUnit -> return "unit"
+  end
+end
+
+let literal_to_str = fn (lit: Literal) -> string do
+  match lit do
+    | LitInt(val) -> return str.from_i64(val)
+    | LitFloat(val) -> return val
+    | LitBool(val) -> return str.from_bool(val)
+    | LitChar(val) -> return "char(" ++ str.from_i64(val) ++ ")"
+    | LitString(val) -> return "\"" ++ val ++ "\""
+    | LitUnit -> return "()"
+  end
+end
+
+let binop_to_str = fn (op: BinaryOp) -> string do
+  match op do
+    | OpAdd -> return "+"
+    | OpSub -> return "-"
+    | OpMul -> return "*"
+    | OpDiv -> return "/"
+    | OpMod -> return "%"
+    | OpFAdd -> return "+."
+    | OpFSub -> return "-."
+    | OpFMul -> return "*."
+    | OpFDiv -> return "/."
+    | OpEq -> return "=="
+    | OpNe -> return "!="
+    | OpLt -> return "<"
+    | OpLe -> return "<="
+    | OpGt -> return ">"
+    | OpGe -> return ">="
+    | OpFEq -> return "==."
+    | OpFNe -> return "!=."
+    | OpFLt -> return "<."
+    | OpFLe -> return "<=."
+    | OpFGt -> return ">."
+    | OpFGe -> return ">=."
+    | OpBitAnd -> return "&"
+    | OpBitOr -> return "|"
+    | OpBitXor -> return "^"
+    | OpShl -> return "<<"
+    | OpShr -> return ">>"
+    | OpAnd -> return "&&"
+    | OpOr -> return "||"
+    | OpConcat -> return "++"
+  end
+end
+
+let unop_to_str = fn (op: UnaryOp) -> string do
+  match op do
+    | OpNeg -> return "-"
+    | OpFNeg -> return "-."
+    | OpNot -> return "!"
+  end
+end
+
+let span_to_json = fn (s: Span) -> JsonValue do
+  match s do | Span(offset, line, col) ->
+    return JsonObject(fields: [
+      JsonField(key: "start", value: JsonInt(val: offset)),
+      JsonField(key: "end", value: JsonInt(val: offset)),
+      JsonField(key: "line", value: JsonInt(val: line)),
+      JsonField(key: "col", value: JsonInt(val: col))
+    ])
+  end
+end
+
+let span_to_text = fn (s: Span) -> string do
+  match s do | Span(offset: _, line, col) ->
+    return "@" ++ str.from_i64(line) ++ ":" ++ str.from_i64(col)
+  end
+end
+
+let indent_str = fn (n: i64) -> string do
+  return indent_str_go(n, acc: "")
+end
+
+let indent_str_go = fn (n: i64, acc: string) -> string do
+  if n <= 0 then return acc end
+  return indent_str_go(n: n - 1, acc: acc ++ "  ")
+end
+
+// ─── JSON: param/arg helpers ──────────────────────────────────────────────────
+
+export let params_to_json = fn (xs: [Param], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | Param(name, sigil, typ) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "Param")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+        JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+        JsonField(key: "children", value: JsonArray(items: []))
+      ])
+      return params_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+export let call_args_to_json = fn (xs: [CallArg], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | CallArg(name, value: v) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "CallArg")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: v)]))
+      ])
+      return call_args_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+export let ctor_args_to_json = fn (xs: [CtorArg], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | CtorArg(name, value: v) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "CtorArg")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: v)]))
+      ])
+      return ctor_args_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+export let named_exprs_to_json = fn (xs: [NamedExpr], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | NamedExpr(name, value: v) :: rest ->
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "NamedExpr")),
+        JsonField(key: "name", value: JsonString(val: name)),
+        JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: v)]))
+      ])
+      return named_exprs_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+export let match_cases_to_json = fn (cs: [MatchCase], acc: [JsonValue]) -> [JsonValue] do
+  match cs do
+    | [] -> return list.reverse(xs: acc)
+    | MatchCase(pattern, body) :: rest ->
+      let body_children = stmts_to_json(ss: body, acc: [])
+      let kids = pattern_to_json(sp: pattern) :: body_children
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "MatchCase")),
+        JsonField(key: "body_len", value: JsonInt(val: list.length(xs: body))),
+        JsonField(key: "children", value: JsonArray(items: kids))
+      ])
+      return match_cases_to_json(cs: rest, acc: node :: acc)
+  end
+end
+
+export let catch_arms_to_json = fn (xs: [CatchArm], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | CatchArm(pattern, body) :: rest ->
+      let body_children = stmts_to_json(ss: body, acc: [])
+      let kids = pattern_to_json(sp: pattern) :: body_children
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "CatchArm")),
+        JsonField(key: "body_len", value: JsonInt(val: list.length(xs: body))),
+        JsonField(key: "children", value: JsonArray(items: kids))
+      ])
+      return catch_arms_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+export let handler_arms_to_json = fn (xs: [HandlerArm], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | HandlerArm(arm, cont_binder, span) :: rest ->
+      let cb = match cont_binder do | Some(val: n) -> n | None -> "" end
+      let arm_child = match arm do | Function(name, is_public, type_params: _, params, ret_type, requires: _, throw_row: _, body, span: arm_sp) ->
+        let kids = list.concat(xs: params_to_json(xs: params, acc: []), ys: stmts_to_json(ss: body, acc: []))
+        JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "Function")),
+          JsonField(key: "span", value: span_to_json(s: arm_sp)),
+          JsonField(key: "name", value: JsonString(val: name)),
+          JsonField(key: "is_public", value: JsonBool(val: is_public)),
+          JsonField(key: "ret_type", value: JsonString(val: type_to_string(typ: ret_type))),
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      end
+      let node = JsonObject(fields: [
+        JsonField(key: "kind", value: JsonString(val: "HandlerArm")),
+        JsonField(key: "span", value: span_to_json(s: span)),
+        JsonField(key: "cont_binder", value: JsonString(val: cb)),
+        JsonField(key: "children", value: JsonArray(items: [arm_child]))
+      ])
+      return handler_arms_to_json(xs: rest, acc: node :: acc)
+  end
+end
+
+// ─── JSON: expr ───────────────────────────────────────────────────────────────
+
+export let expr_to_json = fn (se: SpannedExpr) -> JsonValue do
+  match se do | SpannedExpr(node, span) ->
+    let sp_field = JsonField(key: "span", value: span_to_json(s: span))
+    match node do
+      | ExprLiteral(lit) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprLiteral")),
+          sp_field,
+          JsonField(key: "lit_kind", value: JsonString(val: literal_kind(lit))),
+          JsonField(key: "value", value: literal_to_value_json(lit)),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | ExprVariable(name, sigil) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprVariable")),
+          sp_field,
+          JsonField(key: "name", value: JsonString(val: rdr_to_str(n: name))),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | ExprBorrow(name, sigil) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprBorrow")),
+          sp_field,
+          JsonField(key: "name", value: JsonString(val: name)),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | ExprBinaryOp(left, op, right) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprBinaryOp")),
+          sp_field,
+          JsonField(key: "op", value: JsonString(val: binop_to_str(op))),
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: left), expr_to_json(se: right)]))
+        ])
+      | ExprUnaryOp(op, operand) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprUnaryOp")),
+          sp_field,
+          JsonField(key: "op", value: JsonString(val: unop_to_str(op))),
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: operand)]))
+        ])
+      | ExprCall(func, args) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprCall")),
+          sp_field,
+          JsonField(key: "func", value: JsonString(val: rdr_to_str(n: func))),
+          JsonField(key: "children", value: JsonArray(items: call_args_to_json(xs: args, acc: [])))
+        ])
+      | ExprConstructor(name, args, sigil) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprConstructor")),
+          sp_field,
+          JsonField(key: "name", value: JsonString(val: rdr_to_str(n: name))),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "children", value: JsonArray(items: ctor_args_to_json(xs: args, acc: [])))
+        ])
+      | ExprExternal(symbol, type_params: _, arg_names: _, typ) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprExternal")),
+          sp_field,
+          JsonField(key: "symbol", value: JsonString(val: symbol)),
+          JsonField(key: "type", value: JsonString(val: type_to_string(typ))),
+          JsonField(key: "children", value: JsonArray(items: []))
+        ])
+      | ExprArray(elements) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprArray")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: exprs_to_json(es: elements, acc: [])))
+        ])
+      | ExprList(elements) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprList")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: exprs_to_json(es: elements, acc: [])))
+        ])
+      | ExprRecord(fields) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprRecord")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: named_exprs_to_json(xs: fields, acc: [])))
+        ])
+      | ExprIndex(target, index) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprIndex")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: target), expr_to_json(se: index)]))
+        ])
+      | ExprFieldAccess(target, field) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprFieldAccess")),
+          sp_field,
+          JsonField(key: "field", value: JsonString(val: field)),
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: target)]))
+        ])
+      | ExprIf(cond, then_branch, else_branch) ->
+        let kids0 = expr_to_json(se: cond) :: stmts_to_json(ss: then_branch, acc: [])
+        let kids = list.concat(xs: kids0, ys: stmts_to_json(ss: else_branch, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprIf")),
+          sp_field,
+          JsonField(key: "then_len", value: JsonInt(val: list.length(xs: then_branch))),
+          JsonField(key: "else_len", value: JsonInt(val: list.length(xs: else_branch))),
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      | ExprMatch(target, cases) ->
+        let kids = expr_to_json(se: target) :: match_cases_to_json(cs: cases, acc: [])
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprMatch")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      | ExprWhile(cond, body) ->
+        let kids = expr_to_json(se: cond) :: stmts_to_json(ss: body, acc: [])
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprWhile")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      | ExprFor(var, start, end_expr, body) ->
+        let kids0 = [expr_to_json(se: start), expr_to_json(se: end_expr)]
+        let kids = list.concat(xs: kids0, ys: stmts_to_json(ss: body, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprFor")),
+          sp_field,
+          JsonField(key: "var", value: JsonString(val: var)),
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      | ExprLambda(type_params: _, params, ret_type, requires: _, throw_row: _, body) ->
+        let kids = list.concat(xs: params_to_json(xs: params, acc: []), ys: stmts_to_json(ss: body, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprLambda")),
+          sp_field,
+          JsonField(key: "ret_type", value: JsonString(val: type_to_string(typ: ret_type))),
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      | ExprRaise(value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprRaise")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: value)]))
+        ])
+      | ExprForce(value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprForce")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: value)]))
+        ])
+      | ExprHandler(coeffect_name, requires: _, arms) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "ExprHandler")),
+          sp_field,
+          JsonField(key: "coeffect_name", value: JsonString(val: coeffect_name)),
+          JsonField(key: "children", value: JsonArray(items: handler_arms_to_json(xs: arms, acc: [])))
+        ])
+    end
+  end
+end
+
+export let exprs_to_json = fn (es: [SpannedExpr], acc: [JsonValue]) -> [JsonValue] do
+  match es do
+    | [] -> return list.reverse(xs: acc)
+    | e :: rest -> return exprs_to_json(es: rest, acc: expr_to_json(se: e) :: acc)
+  end
+end
+
+// ─── JSON: stmt ───────────────────────────────────────────────────────────────
+
+export let stmt_to_json = fn (ss: SpannedStmt) -> JsonValue do
+  match ss do | SpannedStmt(node, span) ->
+    let sp_field = JsonField(key: "span", value: span_to_json(s: span))
+    match node do
+      | StmtLet(name, sigil, typ, value) ->
+        let typ_str = match typ do | Some(val: t) -> type_to_string(typ: t) | None -> "" end
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtLet")),
+          sp_field,
+          JsonField(key: "name", value: JsonString(val: name)),
+          JsonField(key: "sigil", value: JsonString(val: sigil_to_str(s: sigil))),
+          JsonField(key: "type", value: JsonString(val: typ_str)),
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: value)]))
+        ])
+      | StmtLetPattern(pattern, value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtLetPattern")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [pattern_to_json(sp: pattern), expr_to_json(se: value)]))
+        ])
+      | StmtExpr(expr) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtExpr")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: expr)]))
+        ])
+      | StmtReturn(value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtReturn")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: value)]))
+        ])
+      | StmtAssign(target, value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtAssign")),
+          sp_field,
+          JsonField(key: "target", value: JsonString(val: target)),
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: value)]))
+        ])
+      | StmtIndexAssign(target, index, value) ->
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtIndexAssign")),
+          sp_field,
+          JsonField(key: "children", value: JsonArray(items: [expr_to_json(se: target), expr_to_json(se: index), expr_to_json(se: value)]))
+        ])
+      | StmtTry(body, catch_arms) ->
+        let kids = list.concat(xs: stmts_to_json(ss: body, acc: []), ys: catch_arms_to_json(xs: catch_arms, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtTry")),
+          sp_field,
+          JsonField(key: "body_len", value: JsonInt(val: list.length(xs: body))),
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+      | StmtInject(handlers, body) ->
+        let kids = list.concat(xs: exprs_to_json(es: handlers, acc: []), ys: stmts_to_json(ss: body, acc: []))
+        return JsonObject(fields: [
+          JsonField(key: "kind", value: JsonString(val: "StmtInject")),
+          sp_field,
+          JsonField(key: "handlers_len", value: JsonInt(val: list.length(xs: handlers))),
+          JsonField(key: "children", value: JsonArray(items: kids))
+        ])
+    end
+  end
+end
+
+export let stmts_to_json = fn (ss: [SpannedStmt], acc: [JsonValue]) -> [JsonValue] do
+  match ss do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest -> return stmts_to_json(ss: rest, acc: stmt_to_json(ss: s) :: acc)
+  end
+end
+
+// ─── Text: param/arg helpers ──────────────────────────────────────────────────
+
+export let params_to_lines = fn (xs: [Param], depth: i64, acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | Param(name, sigil, typ) :: rest ->
+      let line = indent_str(depth) ++ " Param " ++ sigil_to_str(s: sigil) ++ name ++ " : " ++ type_to_string(typ)
+      return params_to_lines(xs: rest, depth, acc: line :: acc)
+  end
+end
+
+export let call_args_to_lines = fn (xs: [CallArg], depth: i64, acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | CallArg(name, value: v) :: rest ->
+      let head = indent_str(depth) ++ " CallArg " ++ name
+      let acc2 = expr_to_lines(se: v, depth: depth + 1, acc: head :: acc)
+      return call_args_to_lines(xs: rest, depth, acc: acc2)
+  end
+end
+
+export let ctor_args_to_lines = fn (xs: [CtorArg], depth: i64, acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | CtorArg(name, value: v) :: rest ->
+      let head = indent_str(depth) ++ " CtorArg " ++ name
+      let acc2 = expr_to_lines(se: v, depth: depth + 1, acc: head :: acc)
+      return ctor_args_to_lines(xs: rest, depth, acc: acc2)
+  end
+end
+
+export let named_exprs_to_lines = fn (xs: [NamedExpr], depth: i64, acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | NamedExpr(name, value: v) :: rest ->
+      let head = indent_str(depth) ++ " NamedExpr " ++ name
+      let acc2 = expr_to_lines(se: v, depth: depth + 1, acc: head :: acc)
+      return named_exprs_to_lines(xs: rest, depth, acc: acc2)
+  end
+end
+
+export let match_cases_to_lines = fn (cs: [MatchCase], depth: i64, acc: [string]) -> [string] do
+  match cs do
+    | [] -> return acc
+    | MatchCase(pattern, body) :: rest ->
+      let head = indent_str(depth) ++ " MatchCase"
+      let acc1 = pat_to_lines(sp: pattern, depth: depth + 1, acc: head :: acc)
+      let acc2 = stmts_to_lines(ss: body, depth: depth + 1, acc: acc1)
+      return match_cases_to_lines(cs: rest, depth, acc: acc2)
+  end
+end
+
+export let catch_arms_to_lines = fn (xs: [CatchArm], depth: i64, acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | CatchArm(pattern, body) :: rest ->
+      let head = indent_str(depth) ++ " CatchArm"
+      let acc1 = pat_to_lines(sp: pattern, depth: depth + 1, acc: head :: acc)
+      let acc2 = stmts_to_lines(ss: body, depth: depth + 1, acc: acc1)
+      return catch_arms_to_lines(xs: rest, depth, acc: acc2)
+  end
+end
+
+export let handler_arms_to_lines = fn (xs: [HandlerArm], depth: i64, acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | HandlerArm(arm, cont_binder, span) :: rest ->
+      let cb = match cont_binder do | Some(val: n) -> " with @" ++ n | None -> "" end
+      let head = indent_str(depth) ++ span_to_text(s: span) ++ " HandlerArm" ++ cb
+      let acc1 = match arm do | Function(name, is_public: _, type_params: _, params, ret_type, requires: _, throw_row: _, body, span: arm_sp) ->
+        let fhead = indent_str(n: depth + 1) ++ span_to_text(s: arm_sp) ++ " fn " ++ name ++ " -> " ++ type_to_string(typ: ret_type)
+        let acc_p = params_to_lines(xs: params, depth: depth + 2, acc: fhead :: head :: acc)
+        stmts_to_lines(ss: body, depth: depth + 2, acc: acc_p)
+      end
+      return handler_arms_to_lines(xs: rest, depth, acc: acc1)
+  end
+end
+
+// ─── Text: expr ───────────────────────────────────────────────────────────────
+
+export let expr_to_lines = fn (se: SpannedExpr, depth: i64, acc: [string]) -> [string] do
+  match se do | SpannedExpr(node, span) ->
+    let pre = indent_str(depth) ++ span_to_text(s: span)
+    match node do
+      | ExprLiteral(lit) ->
+        return (pre ++ " ExprLiteral " ++ literal_kind(lit) ++ "=" ++ literal_to_str(lit)) :: acc
+      | ExprVariable(name, sigil) ->
+        return (pre ++ " ExprVariable " ++ sigil_to_str(s: sigil) ++ rdr_to_str(n: name)) :: acc
+      | ExprBorrow(name, sigil) ->
+        return (pre ++ " ExprBorrow &" ++ sigil_to_str(s: sigil) ++ name) :: acc
+      | ExprBinaryOp(left, op, right) ->
+        let head = pre ++ " ExprBinaryOp " ++ binop_to_str(op)
+        let acc1 = expr_to_lines(se: left, depth: depth + 1, acc: head :: acc)
+        return expr_to_lines(se: right, depth: depth + 1, acc: acc1)
+      | ExprUnaryOp(op, operand) ->
+        let head = pre ++ " ExprUnaryOp " ++ unop_to_str(op)
+        return expr_to_lines(se: operand, depth: depth + 1, acc: head :: acc)
+      | ExprCall(func, args) ->
+        let head = pre ++ " ExprCall " ++ rdr_to_str(n: func)
+        return call_args_to_lines(xs: args, depth: depth + 1, acc: head :: acc)
+      | ExprConstructor(name, args, sigil) ->
+        let head = pre ++ " ExprConstructor " ++ sigil_to_str(s: sigil) ++ rdr_to_str(n: name)
+        return ctor_args_to_lines(xs: args, depth: depth + 1, acc: head :: acc)
+      | ExprExternal(symbol, type_params: _, arg_names: _, typ) ->
+        return (pre ++ " ExprExternal " ++ symbol ++ " : " ++ type_to_string(typ)) :: acc
+      | ExprArray(elements) ->
+        let head = pre ++ " ExprArray"
+        return exprs_to_lines(es: elements, depth: depth + 1, acc: head :: acc)
+      | ExprList(elements) ->
+        let head = pre ++ " ExprList"
+        return exprs_to_lines(es: elements, depth: depth + 1, acc: head :: acc)
+      | ExprRecord(fields) ->
+        let head = pre ++ " ExprRecord"
+        return named_exprs_to_lines(xs: fields, depth: depth + 1, acc: head :: acc)
+      | ExprIndex(target, index) ->
+        let head = pre ++ " ExprIndex"
+        let acc1 = expr_to_lines(se: target, depth: depth + 1, acc: head :: acc)
+        return expr_to_lines(se: index, depth: depth + 1, acc: acc1)
+      | ExprFieldAccess(target, field) ->
+        let head = pre ++ " ExprFieldAccess ." ++ field
+        return expr_to_lines(se: target, depth: depth + 1, acc: head :: acc)
+      | ExprIf(cond, then_branch, else_branch) ->
+        let head = pre ++ " ExprIf"
+        let acc1 = expr_to_lines(se: cond, depth: depth + 1, acc: head :: acc)
+        let then_head = indent_str(n: depth + 1) ++ " <then>"
+        let acc2 = stmts_to_lines(ss: then_branch, depth: depth + 2, acc: then_head :: acc1)
+        let else_head = indent_str(n: depth + 1) ++ " <else>"
+        return stmts_to_lines(ss: else_branch, depth: depth + 2, acc: else_head :: acc2)
+      | ExprMatch(target, cases) ->
+        let head = pre ++ " ExprMatch"
+        let acc1 = expr_to_lines(se: target, depth: depth + 1, acc: head :: acc)
+        return match_cases_to_lines(cs: cases, depth: depth + 1, acc: acc1)
+      | ExprWhile(cond, body) ->
+        let head = pre ++ " ExprWhile"
+        let acc1 = expr_to_lines(se: cond, depth: depth + 1, acc: head :: acc)
+        return stmts_to_lines(ss: body, depth: depth + 1, acc: acc1)
+      | ExprFor(var, start, end_expr, body) ->
+        let head = pre ++ " ExprFor " ++ var
+        let acc1 = expr_to_lines(se: start, depth: depth + 1, acc: head :: acc)
+        let acc2 = expr_to_lines(se: end_expr, depth: depth + 1, acc: acc1)
+        return stmts_to_lines(ss: body, depth: depth + 1, acc: acc2)
+      | ExprLambda(type_params: _, params, ret_type, requires: _, throw_row: _, body) ->
+        let head = pre ++ " ExprLambda -> " ++ type_to_string(typ: ret_type)
+        let acc1 = params_to_lines(xs: params, depth: depth + 1, acc: head :: acc)
+        return stmts_to_lines(ss: body, depth: depth + 1, acc: acc1)
+      | ExprRaise(value) ->
+        let head = pre ++ " ExprRaise"
+        return expr_to_lines(se: value, depth: depth + 1, acc: head :: acc)
+      | ExprForce(value) ->
+        let head = pre ++ " ExprForce"
+        return expr_to_lines(se: value, depth: depth + 1, acc: head :: acc)
+      | ExprHandler(coeffect_name, requires: _, arms) ->
+        let head = pre ++ " ExprHandler " ++ coeffect_name
+        return handler_arms_to_lines(xs: arms, depth: depth + 1, acc: head :: acc)
+    end
+  end
+end
+
+export let exprs_to_lines = fn (es: [SpannedExpr], depth: i64, acc: [string]) -> [string] do
+  match es do
+    | [] -> return acc
+    | e :: rest ->
+      let acc2 = expr_to_lines(se: e, depth, acc)
+      return exprs_to_lines(es: rest, depth, acc: acc2)
+  end
+end
+
+// ─── Text: stmt ───────────────────────────────────────────────────────────────
+
+export let stmt_to_lines = fn (ss: SpannedStmt, depth: i64, acc: [string]) -> [string] do
+  match ss do | SpannedStmt(node, span) ->
+    let pre = indent_str(depth) ++ span_to_text(s: span)
+    match node do
+      | StmtLet(name, sigil, typ, value) ->
+        let ty_str = match typ do | Some(val: t) -> " : " ++ type_to_string(typ: t) | None -> "" end
+        let head = pre ++ " StmtLet " ++ sigil_to_str(s: sigil) ++ name ++ ty_str
+        return expr_to_lines(se: value, depth: depth + 1, acc: head :: acc)
+      | StmtLetPattern(pattern, value) ->
+        let head = pre ++ " StmtLetPattern"
+        let acc1 = pat_to_lines(sp: pattern, depth: depth + 1, acc: head :: acc)
+        return expr_to_lines(se: value, depth: depth + 1, acc: acc1)
+      | StmtExpr(expr) ->
+        let head = pre ++ " StmtExpr"
+        return expr_to_lines(se: expr, depth: depth + 1, acc: head :: acc)
+      | StmtReturn(value) ->
+        let head = pre ++ " StmtReturn"
+        return expr_to_lines(se: value, depth: depth + 1, acc: head :: acc)
+      | StmtAssign(target, value) ->
+        let head = pre ++ " StmtAssign " ++ target
+        return expr_to_lines(se: value, depth: depth + 1, acc: head :: acc)
+      | StmtIndexAssign(target, index, value) ->
+        let head = pre ++ " StmtIndexAssign"
+        let acc1 = expr_to_lines(se: target, depth: depth + 1, acc: head :: acc)
+        let acc2 = expr_to_lines(se: index, depth: depth + 1, acc: acc1)
+        return expr_to_lines(se: value, depth: depth + 1, acc: acc2)
+      | StmtTry(body, catch_arms) ->
+        let head = pre ++ " StmtTry"
+        let acc1 = stmts_to_lines(ss: body, depth: depth + 1, acc: head :: acc)
+        return catch_arms_to_lines(xs: catch_arms, depth: depth + 1, acc: acc1)
+      | StmtInject(handlers, body) ->
+        let head = pre ++ " StmtInject"
+        let acc1 = exprs_to_lines(es: handlers, depth: depth + 1, acc: head :: acc)
+        return stmts_to_lines(ss: body, depth: depth + 1, acc: acc1)
+    end
+  end
+end
+
+export let stmts_to_lines = fn (ss: [SpannedStmt], depth: i64, acc: [string]) -> [string] do
+  match ss do
+    | [] -> return acc
+    | s :: rest ->
+      let acc2 = stmt_to_lines(ss: s, depth, acc)
+      return stmts_to_lines(ss: rest, depth, acc: acc2)
+  end
+end
