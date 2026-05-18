@@ -1,0 +1,184 @@
+/**
+ * lsp/protocol/diag: LSP diagnostic wire types.
+ *
+ * Covers DiagnosticSeverity, Diagnostic, and PublishDiagnosticsParams —
+ * the types used at the `textDocument/publishDiagnostics` notification
+ * boundary.
+ */
+
+import { JsonValue, JsonField, JsonInt, JsonString,
+         JsonObject, JsonArray, JsonNull } from "std:json"
+import * as list from "std:list"
+import { Option, Some, None } from "std:option"
+import {
+  LspProtocolThrow, LspProtocolError,
+  require_field, optional_field,
+  as_string, as_i64,
+  optional_string, optional_int
+} from "src/lsp/protocol/json.nx"
+import {
+  Range, range_to_json, range_from_json
+} from "src/lsp/protocol/text_doc.nx"
+
+// ─── DiagnosticSeverity ──────────────────────────────────────────────────────
+//
+// Spec uses integer codes 1..4. Modeling as a closed sum forces every site
+// that consumes severity to handle all four cases at compile time, while the
+// integer mapping is centralised in the encode/decode pair.
+
+/** LSP `DiagnosticSeverity` (spec §"Diagnostic") — wire codes 1..4 for Error/Warning/Information/Hint. */
+export type DiagnosticSeverity =
+    DiagSevError
+  | DiagSevWarning
+  | DiagSevInformation
+  | DiagSevHint
+
+let severity_to_int = fn (s: DiagnosticSeverity) -> i64 do
+  match s do
+    | DiagSevError -> return 1
+    | DiagSevWarning -> return 2
+    | DiagSevInformation -> return 3
+    | DiagSevHint -> return 4
+  end
+end
+
+let severity_from_int = fn (n: i64) -> DiagnosticSeverity throws { LspProtocolThrow } do
+  if n == 1 then return DiagSevError end
+  if n == 2 then return DiagSevWarning end
+  if n == 3 then return DiagSevInformation end
+  if n == 4 then return DiagSevHint end
+  throw LspProtocolError(msg: "DiagnosticSeverity out of range (1..4)")
+end
+
+// ─── Diagnostic (wire) ───────────────────────────────────────────────────────
+//
+// Wire layout per LSP spec §`Diagnostic`. `severity`, `code`, and `source`
+// are optional; we always emit `severity` and `message` (the only fields LSP
+// clients reliably render) and elide the rest when absent.
+
+/** LSP `Diagnostic` (spec §"Diagnostic") wire shape — `range` + `message` always emitted; `severity`/`code`/`source` optional. */
+export type Diagnostic = Diagnostic(
+  range: Range,
+  severity: Option<DiagnosticSeverity>,
+  /**
+  Spec allows integer or string; we standardise on string to match the
+  internal `Diagnostic.code` carried by `src/lsp/diagnostics.nx`.
+  */
+  code: Option<string>,
+  source: Option<string>,
+  message: string
+)
+
+// Build the field list back-to-front and reverse — matches json.nx
+// `serialize_object_fields` ordering, which serialises in input order.
+let diagnostic_to_json = fn (d: Diagnostic) -> JsonValue do
+  match d do | Diagnostic(range, severity, code, source, message) ->
+    let fields = [JsonField(key: "range", value: range_to_json(r: range))]
+    let fields = match severity do
+      | None -> fields
+      | Some(val: s) ->
+        JsonField(key: "severity", value: JsonInt(val: severity_to_int(s))) :: fields
+    end
+    let fields = match code do
+      | None -> fields
+      | Some(val: c) -> JsonField(key: "code", value: JsonString(val: c)) :: fields
+    end
+    let fields = match source do
+      | None -> fields
+      | Some(val: src) -> JsonField(key: "source", value: JsonString(val: src)) :: fields
+    end
+    let fields = JsonField(key: "message", value: JsonString(val: message)) :: fields
+    return JsonObject(fields: list.reverse(xs: fields))
+  end
+end
+
+// ─── Grand-fathered Option<T>-AND-throws family ────────────────
+//
+// The `optional_*` JSON parsers below have a genuine tri-state outcome dictated
+// by the LSP wire protocol:
+//   None  = field absent or JsonNull  (legitimate not-found)
+//   Some  = field present and well-typed
+//   throws { LspProtocolThrow } = field present but malformed (wrong JSON type)
+//
+// The throws is propagated from the strict `as_*` accessors and surfaces as an
+// `InvalidParams` JSON-RPC response. See src/common/error.nx header for the
+// general error-contract rule and why these helpers are grand-fathered.
+
+let optional_severity = fn (obj: JsonValue) -> Option<DiagnosticSeverity> throws { LspProtocolThrow } do
+  match optional_field(obj, key: "severity") do
+    | None -> return None
+    | Some(val: v) ->
+      match v do
+        | JsonNull -> return None
+        | _ -> return Some(val: severity_from_int(n: as_i64(v, ctx: "Diagnostic.severity")))
+      end
+  end
+end
+
+let optional_code_string = fn (obj: JsonValue) -> Option<string> throws { LspProtocolThrow } do
+  // Spec also permits integer; we coerce JsonInt → its decimal text since the
+  // internal Diagnostic surface stores `code` as string.
+  match optional_field(obj, key: "code") do
+    | None -> return None
+    | Some(val: v) ->
+      match v do
+        | JsonNull -> return None
+        | JsonString(val: s) -> return Some(val: s)
+        | JsonInt(val: _) ->
+          throw LspProtocolError(msg: "Diagnostic.code as integer not supported (use string form)")
+        | _ -> throw LspProtocolError(msg: "Diagnostic.code: expected string")
+      end
+  end
+end
+
+let diagnostic_from_json = fn (v: JsonValue) -> Diagnostic throws { LspProtocolThrow } do
+  let range = range_from_json(v: require_field(obj: v, key: "range"))
+  let severity = optional_severity(obj: v)
+  let code = optional_code_string(obj: v)
+  let source = optional_string(obj: v, key: "source", ctx: "Diagnostic.source")
+  let message = as_string(v: require_field(obj: v, key: "message"), ctx: "Diagnostic.message")
+  return Diagnostic(range, severity, code, source, message)
+end
+
+// ─── PublishDiagnosticsParams ────────────────────────────────────────────────
+
+/** LSP `PublishDiagnosticsParams` (spec §"textDocument/publishDiagnostics") — the notification payload listing diagnostics for one `uri`. */
+export type PublishDiagnosticsParams = PublishDiagnosticsParams(
+  uri: string,
+  /** Optional per spec; we allow None to round-trip explicit absence. */
+  version: Option<i64>,
+  diagnostics: [Diagnostic]
+)
+
+let diagnostics_to_json_items = fn (xs: [Diagnostic], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | d :: rest -> return diagnostics_to_json_items(xs: rest, acc: diagnostic_to_json(d) :: acc)
+  end
+end
+
+/** Encode `PublishDiagnosticsParams` as `{ uri, version?, diagnostics }` for the outbound notification. */
+export let publish_diagnostics_params_to_json = fn (p: PublishDiagnosticsParams) -> JsonValue do
+  match p do | PublishDiagnosticsParams(uri, version, diagnostics) ->
+    let items_rev = diagnostics_to_json_items(xs: diagnostics, acc: [])
+    let items = list.reverse(xs: items_rev)
+    let fields = [
+      JsonField(key: "uri", value: JsonString(val: uri))
+    ]
+    let fields = match version do
+      | None -> fields
+      | Some(val: n) -> JsonField(key: "version", value: JsonInt(val: n)) :: fields
+    end
+    let fields = JsonField(key: "diagnostics", value: JsonArray(items)) :: fields
+    return JsonObject(fields: list.reverse(xs: fields))
+  end
+end
+
+let diagnostics_from_json_items = fn (xs: [JsonValue], acc: [Diagnostic]) -> [Diagnostic] throws { LspProtocolThrow } do
+  match xs do
+    | [] -> return acc
+    | v :: rest ->
+      let d = diagnostic_from_json(v)
+      return diagnostics_from_json_items(xs: rest, acc: d :: acc)
+  end
+end

@@ -1,0 +1,177 @@
+/**
+ * lsp/protocol/symbols: LSP document- and workspace-symbol wire types.
+ *
+ * Covers SymbolKind, DocumentSymbol, and SymbolInformation — the types
+ * used by `textDocument/documentSymbol` and `workspace/symbol` replies.
+ */
+
+import { JsonValue, JsonField, JsonInt, JsonString,
+         JsonObject, JsonArray, JsonNull } from "std:json"
+import * as list from "std:list"
+import { Option, Some, None } from "std:option"
+import {
+  LspProtocolThrow,
+  require_field, optional_field,
+  as_string, as_i64,
+  optional_string, as_array
+} from "src/lsp/protocol/json.nx"
+import {
+  Range, range_to_json, range_from_json,
+  Location, location_to_json, location_from_json
+} from "src/lsp/protocol/text_doc.nx"
+
+// ─── SymbolKind ──────────────────────────────────────────────────────────────
+//
+// Spec enum 1..26. We only model the kinds the Nexus LSP server emits in MVP
+// (Module, Function, Variable, Class, Method, Constant, Constructor); the
+// rest pass through as `SymbolKindRaw(code)` to keep the codec total without
+// committing to translating every spec entry today. Adding a named variant
+// later is purely additive — existing matches that handle SymbolKindRaw stay
+// valid because the new variant ships with its own integer.
+
+/** LSP `SymbolKind` (spec §"DocumentSymbol", codes 1..26) — MVP names the kinds Nexus emits; unknown codes pass through as `SymbolKindRaw`. */
+export type SymbolKind =
+    SymbolKindModule
+  | SymbolKindFunction
+  | SymbolKindVariable
+  | SymbolKindClass
+  | SymbolKindMethod
+  | SymbolKindConstant
+  | SymbolKindConstructor
+  | SymbolKindRaw(code: i64)
+
+/** Map a SymbolKind to its LSP integer code (spec §"Document Symbols"; Function=12, Variable=13, etc.). SymbolKindRaw passes its code through. */
+export let symbol_kind_to_int = fn (k: SymbolKind) -> i64 do
+  match k do
+    | SymbolKindFunction -> return 12
+    | SymbolKindVariable -> return 13
+    | SymbolKindConstant -> return 14
+    | SymbolKindClass -> return 5
+    | SymbolKindMethod -> return 6
+    | SymbolKindConstructor -> return 9
+    | SymbolKindModule -> return 2
+    | SymbolKindRaw(code) -> return code
+  end
+end
+
+let symbol_kind_from_int = fn (n: i64) -> SymbolKind do
+  if n == 2 then return SymbolKindModule end
+  if n == 5 then return SymbolKindClass end
+  if n == 6 then return SymbolKindMethod end
+  if n == 9 then return SymbolKindConstructor end
+  if n == 12 then return SymbolKindFunction end
+  if n == 13 then return SymbolKindVariable end
+  if n == 14 then return SymbolKindConstant end
+  return SymbolKindRaw(code: n)
+end
+
+// ─── DocumentSymbol ──────────────────────────────────────────────────────────
+//
+// Tree-shaped: each symbol may carry children. The wire payload is
+// "DocumentSymbol[]" returned from textDocument/documentSymbol.
+
+/** LSP DocumentSymbol (spec §"Document Symbols") — tree-shaped per-buffer symbol with name, detail, kind, full and selection ranges, plus nested children. */
+export type DocumentSymbol = DocumentSymbol(
+  name: string,
+  detail: Option<string>,
+  kind: SymbolKind,
+  range: Range,
+  selection_range: Range,
+  children: [DocumentSymbol]
+)
+
+let symbols_to_json_items = fn (xs: [DocumentSymbol], acc: [JsonValue]) -> [JsonValue] do
+  match xs do
+    | [] -> return acc
+    | s :: rest -> return symbols_to_json_items(xs: rest, acc: document_symbol_to_json(s) :: acc)
+  end
+end
+
+/** Serialize a DocumentSymbol (and its children) to LSP wire JSON for `textDocument/documentSymbol` replies. */
+export let document_symbol_to_json = fn (s: DocumentSymbol) -> JsonValue do
+  match s do | DocumentSymbol(name, detail, kind, range, selection_range, children) ->
+    let kids_rev = symbols_to_json_items(xs: children, acc: [])
+    let kids = list.reverse(xs: kids_rev)
+    let fields = [
+      JsonField(key: "name", value: JsonString(val: name))
+    ]
+    let fields = match detail do
+      | None -> fields
+      | Some(val: d) -> JsonField(key: "detail", value: JsonString(val: d)) :: fields
+    end
+    let fields = JsonField(key: "kind", value: JsonInt(val: symbol_kind_to_int(k: kind))) :: fields
+    let fields = JsonField(key: "range", value: range_to_json(r: range)) :: fields
+    let fields = JsonField(key: "selectionRange", value: range_to_json(r: selection_range)) :: fields
+    let fields = JsonField(key: "children", value: JsonArray(items: kids)) :: fields
+    return JsonObject(fields: list.reverse(xs: fields))
+  end
+end
+
+let symbols_from_json_items = fn (xs: [JsonValue], acc: [DocumentSymbol]) -> [DocumentSymbol] throws { LspProtocolThrow } do
+  match xs do
+    | [] -> return acc
+    | v :: rest ->
+      let s = document_symbol_from_json(v)
+      return symbols_from_json_items(xs: rest, acc: s :: acc)
+  end
+end
+
+let document_symbol_from_json = fn (v: JsonValue) -> DocumentSymbol throws { LspProtocolThrow } do
+  let name = as_string(v: require_field(obj: v, key: "name"), ctx: "DocumentSymbol.name")
+  let detail = optional_string(obj: v, key: "detail", ctx: "DocumentSymbol.detail")
+  let kind = symbol_kind_from_int(n: as_i64(v: require_field(obj: v, key: "kind"), ctx: "DocumentSymbol.kind"))
+  let range = range_from_json(v: require_field(obj: v, key: "range"))
+  let selection_range = range_from_json(v: require_field(obj: v, key: "selectionRange"))
+  let children_rev = match optional_field(obj: v, key: "children") do
+    | None -> []
+    | Some(val: jv) ->
+      match jv do
+        | JsonNull -> []
+        | _ ->
+          let arr = as_array(v: jv, ctx: "DocumentSymbol.children")
+          symbols_from_json_items(xs: arr, acc: [])
+      end
+  end
+  let children = list.reverse(xs: children_rev)
+  return DocumentSymbol(name, detail, kind, range, selection_range, children)
+end
+
+// ─── SymbolInformation ──────────────────────────────────────────────────────
+//
+// Flat (URI-anchored) symbol used by `workspace/symbol`. Unlike DocumentSymbol
+// (a tree relative to one buffer), each SymbolInformation carries its own
+// Location, so the workspace-wide list can intermix entries from any number of
+// open documents. `container_name` is the conventional slot for a parent
+// scope (file path / module); we surface the canonical `source#name` lineage
+// there so the client can disambiguate two identically-named exports across
+// open files without polluting the displayed `name`.
+
+/** LSP SymbolInformation (spec §"Workspace Symbols") — flat URI-anchored symbol returned by `workspace/symbol`; `container_name` carries the parent scope (e.g. `source#name` lineage). */
+export type SymbolInformation = SymbolInformation(
+  name: string,
+  kind: SymbolKind,
+  location: Location,
+  container_name: Option<string>
+)
+
+/** Serialize a SymbolInformation (flat, URI-anchored) to LSP wire JSON for `workspace/symbol` replies. */
+export let symbol_information_to_json = fn (s: SymbolInformation) -> JsonValue do
+  match s do | SymbolInformation(name, kind, location, container_name) ->
+    let fields = [JsonField(key: "name", value: JsonString(val: name))]
+    let fields = JsonField(key: "kind", value: JsonInt(val: symbol_kind_to_int(k: kind))) :: fields
+    let fields = JsonField(key: "location", value: location_to_json(loc: location)) :: fields
+    let fields = match container_name do
+      | None -> fields
+      | Some(val: c) -> JsonField(key: "containerName", value: JsonString(val: c)) :: fields
+    end
+    return JsonObject(fields: list.reverse(xs: fields))
+  end
+end
+
+let symbol_information_from_json = fn (v: JsonValue) -> SymbolInformation throws { LspProtocolThrow } do
+  let name = as_string(v: require_field(obj: v, key: "name"), ctx: "SymbolInformation.name")
+  let kind = symbol_kind_from_int(n: as_i64(v: require_field(obj: v, key: "kind"), ctx: "SymbolInformation.kind"))
+  let location = location_from_json(v: require_field(obj: v, key: "location"))
+  let container_name = optional_string(obj: v, key: "containerName", ctx: "SymbolInformation.containerName")
+  return SymbolInformation(name, kind, location, container_name)
+end
