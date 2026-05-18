@@ -1,0 +1,321 @@
+/**
+ * func_lower: function/external lowering — DAG leaf over lir.nx.
+ *
+ * This module is a strict DAG leaf: it calls into lir.nx (lir_lower_stmts)
+ * but lir.nx never calls back. The split is safe because function lowering
+ * is purely a driver over the expr/stmt SCC — it sets up LowerCtx, calls
+ * lir_lower_stmts once per function body, then wraps the result into
+ * LirFunction. The expr/stmt/match SCC in lir.nx has no upward dependency
+ * on anything in this file.
+ *
+ * Owns:
+ * - param sorting and conversion (MirParam → LirParam)
+ * - per-function context construction (build_param_vars, build_param_semantic_vars)
+ * - external conversion (convert_external)
+ * - builtin enum defs injection (List, Option, Result)
+ * - lower_mir_to_lir entry point
+ *
+ * Does not own:
+ * - ANF expression/statement lowering (see src/ir/lir/lir.nx)
+ * - LIR type definitions (see src/ir/lir/types.nx)
+ * - LowerCtx and atom helpers (see src/ir/lir/context.nx)
+ * - Maranget pattern-matrix → DecTree (see src/ir/lir/match_tree.nx)
+ */
+import { TypeExpr, TyUserDefined, TyRecord, EnumDef, VariantDef, VariantField, RecordDef, TyVar, TyList } from "src/common/ast.nx"
+import * as list from "std:list"
+import { LirError } from "src/common/error.nx"
+import { Some, None } from "std:option"
+import { MirProgram, MirFunction, MirParam, MirExternal } from "src/ir/mir/types.nx"
+import { LirProgram, LirFunction, LirExternal, LirParam } from "src/ir/lir/types.nx"
+import { LowerCtx, TypeEntry, wasm_type, insert_type, default_atom } from "src/ir/lir/context.nx"
+import { VariantIndex }, * as vidx from "src/common/variant_index.nx"
+import { lir_lower_stmts, LowerStmtsResult } from "src/ir/lir/lir.nx"
+import { lir_str_less_than, sort_mir_params } from "src/ir/lir/semantic_types.nx"
+
+// ─── Local type-specific reverses (see src/common/mono_reverse.nx) ─────────────
+
+let rev_type_entries = fn (lst: [TypeEntry], out: [TypeEntry]) -> [TypeEntry] throws { LirError } do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_type_entries(lst: rest, out: x :: out)
+  end
+end
+
+let rev_lir_params = fn (lst: [LirParam], out: [LirParam]) -> [LirParam] throws { LirError } do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_lir_params(lst: rest, out: x :: out)
+  end
+end
+
+let rev_enum_defs = fn (lst: [EnumDef], out: [EnumDef]) -> [EnumDef] throws { LirError } do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_enum_defs(lst: rest, out: x :: out)
+  end
+end
+
+// ─── Function Lowering ──────────────────────────────────────────────────────
+
+let lir_lower_function = fn (f: MirFunction, enum_defs: VariantIndex, type_defs: [RecordDef], func_types: [TypeEntry]) -> LirFunction throws { LirError } do
+  match f do | MirFunction(name: fname, params: raw_params, ret_type: rt, body, span: sp) ->
+    // Sort params alphabetically by label (canonical ABI layout)
+    let params = sort_mir_params(params: raw_params)
+    let wasm_ret = wasm_type(typ: rt)
+    // Prepend param_vars before func_types so params shadow any same-named functions.
+    // Store wasm_ret under the sentinel name "#FN_RET#" so nested lowering paths
+    // (match-as-expression branches with `return`) can recover the function's
+    // return type for emitting LirStmtIfReturn without threading ret_type
+    // through ~25 call sites of lower_expr_to_atom.
+    let param_vars = build_param_vars(params)
+    // semantic_vars stores types as observed by match-pattern lowering. We
+    // resolve TyUserDefined → TyRecord eagerly here so that
+    // `match (r: Recd) do | { a, b } ...` looks up field indices on the
+    // expanded record shape rather than reading offset 0 for every field.
+    let param_sem_vars = build_param_semantic_vars(params, type_defs)
+    let sem_vars_with_fn_ret = insert_type(name: "#FN_RET#", typ: wasm_ret, entries: param_sem_vars)
+    let ctx = LowerCtx(
+      vars: prepend_type_entries(xs: param_vars, ys: func_types),
+      semantic_vars: sem_vars_with_fn_ret,
+      stmts: [],
+      temp_counter: 0,
+      enum_defs
+    )
+    match lir_lower_stmts(stmts: body, ret_type: wasm_ret, ctx) do | LowerStmtsResult(ctx: LowerCtx(vars: _, semantic_vars: _, stmts, temp_counter: _, enum_defs: _), ret: ret_val) ->
+      let ret_atom = match ret_val do
+        | Some(val: a) -> a
+        | None -> default_atom(typ: wasm_ret)
+      end
+      let lir_params = lir_convert_params(params)
+      return LirFunction(
+        name: fname,
+        params: lir_params,
+        ret_type: wasm_ret,
+        body: list.reverse(xs: stmts),
+        ret: ret_atom,
+        span: sp
+      )
+    end
+  end
+end
+
+let build_param_vars = fn (params: [MirParam]) -> [TypeEntry] throws { LirError } do
+  return build_param_vars_go(params, acc: [])
+end
+
+let build_param_vars_go = fn (params: [MirParam], acc: [TypeEntry]) -> [TypeEntry] throws { LirError } do
+  match params do
+    | [] -> return rev_type_entries(lst: acc, out: [])
+    | MirParam(label: _, name: n, typ: t) :: rest ->
+      return build_param_vars_go(params: rest, acc: TypeEntry(name: n, typ: wasm_type(typ: t)) :: acc)
+  end
+end
+
+let build_param_semantic_vars = fn (params: [MirParam], type_defs: [RecordDef]) -> [TypeEntry] throws { LirError } do
+  return build_param_semantic_vars_go(params, type_defs, acc: [])
+end
+
+let build_param_semantic_vars_go = fn (params: [MirParam], type_defs: [RecordDef], acc: [TypeEntry]) -> [TypeEntry] throws { LirError } do
+  match params do
+    | [] -> return rev_type_entries(lst: acc, out: [])
+    | MirParam(label: _, name: n, typ: t) :: rest ->
+      let resolved = resolve_typedef(typ: t, type_defs)
+      return build_param_semantic_vars_go(params: rest, type_defs, acc: TypeEntry(name: n, typ: resolved) :: acc)
+  end
+end
+
+/**
+Rewrite TyUserDefined → TyRecord whenever the named type def is a record
+alias. Necessary at param-binding time so match-pattern lowering can read
+sorted field indices instead of falling back to offset 0.
+*/
+let resolve_typedef = fn (typ: TypeExpr, type_defs: [RecordDef]) -> TypeExpr throws { LirError } do
+  if let TyUserDefined(name: n, args: _) = typ then
+    match lookup_record_def(name: n, defs: type_defs) do
+      | Some(val: RecordDef(name: _, is_public: _, type_params: _, fields)) ->
+        return TyRecord(fields)
+      | None -> return typ
+    end
+  else
+    return typ
+  end
+end
+
+let lookup_record_def = fn (name: string, defs: [RecordDef]) -> Option<RecordDef> do
+  match defs do
+    | [] -> return None
+    | RecordDef(name: n, is_public: p, type_params: tps, fields: fs) :: rest ->
+      if n == name then
+        return Some(val: RecordDef(name: n, is_public: p, type_params: tps, fields: fs))
+      end
+      return lookup_record_def(name, defs: rest)
+  end
+end
+
+let lir_convert_params = fn (params: [MirParam]) -> [LirParam] throws { LirError } do
+  let converted = lir_convert_params_go(params, acc: [])
+  return sort_lir_params(params: converted)
+end
+
+let lir_convert_params_go = fn (params: [MirParam], acc: [LirParam]) -> [LirParam] throws { LirError } do
+  match params do
+    | [] -> return rev_lir_params(lst: acc, out: [])
+    | MirParam(label: l, name: n, typ: t) :: rest ->
+      return lir_convert_params_go(params: rest, acc: LirParam(label: l, name: n, typ: wasm_type(typ: t)) :: acc)
+  end
+end
+
+let sort_lir_params = fn (params: [LirParam]) -> [LirParam] throws { LirError } do
+  match params do
+    | [] -> return []
+    | p :: rest -> return insert_lir_param(p, sorted: sort_lir_params(params: rest))
+  end
+end
+
+let insert_lir_param = fn (p: LirParam, sorted: [LirParam]) -> [LirParam] throws { LirError } do
+  return insert_lir_param_go(p, sorted, acc: [])
+end
+
+let insert_lir_param_go = fn (p: LirParam, sorted: [LirParam], acc: [LirParam]) -> [LirParam] throws { LirError } do
+  match sorted do
+    | [] -> return rev_lir_params(lst: acc, out: [p])
+    | head :: rest ->
+      match p do | LirParam(label: la, name: _, typ: _) ->
+        match head do | LirParam(label: lb, name: _, typ: _) ->
+          if lir_str_less_than(a: la, b: lb) then
+            return rev_lir_params(lst: acc, out: p :: sorted)
+          else
+            return insert_lir_param_go(p, sorted: rest, acc: head :: acc)
+          end
+        end
+      end
+  end
+end
+
+// ─── External Conversion ─────────────────────────────────────────────────────
+
+let convert_external = fn (ext: MirExternal) -> LirExternal throws { LirError } do
+  match ext do | MirExternal(name: n, wasm_module: wm, wasm_name: wn, params: ps, ret_type: rt, throw_row: tr) ->
+    // External params stay in source order (must match stdlib WASM ABI)
+    return LirExternal(
+      name: n, wasm_module: wm, wasm_name: wn,
+      params: convert_ext_params(params: ps),
+      ret_type: wasm_type(typ: rt),
+      throw_row: tr
+    )
+  end
+end
+
+let convert_ext_params = fn (params: [MirParam]) -> [LirParam] throws { LirError } do
+  return convert_ext_params_go(params, acc: [])
+end
+
+let convert_ext_params_go = fn (params: [MirParam], acc: [LirParam]) -> [LirParam] throws { LirError } do
+  match params do
+    | [] -> return rev_lir_params(lst: acc, out: [])
+    | MirParam(label: l, name: n, typ: t) :: rest ->
+      // Preserve semantic type for externals (emit_external_arg needs TyString/TyArray)
+      return convert_ext_params_go(params: rest, acc: LirParam(label: l, name: n, typ: t) :: acc)
+  end
+end
+
+// ─── Entry Point ─────────────────────────────────────────────────────────────
+
+let builtin_enum_defs = fn () -> [EnumDef] throws { LirError } do
+  return [
+    EnumDef(name: "List", is_public: true, is_opaque: false,
+      type_params: ["T"],
+      variants: [
+        VariantDef(name: "Nil", fields: []),
+        VariantDef(name: "Cons", fields: [
+          VariantField(name: Some(val: "v"), typ: TyVar(name: "T")),
+          VariantField(name: Some(val: "rest"), typ: TyList(elem: TyVar(name: "T")))])]),
+    EnumDef(name: "Option", is_public: true, is_opaque: false,
+      type_params: ["T"],
+      variants: [
+        VariantDef(name: "None", fields: []),
+        VariantDef(name: "Some", fields: [
+          VariantField(name: Some(val: "val"), typ: TyVar(name: "T"))])]),
+    EnumDef(name: "Result", is_public: true, is_opaque: false,
+      type_params: ["T", "E"],
+      variants: [
+        VariantDef(name: "Ok", fields: [
+          VariantField(name: Some(val: "val"), typ: TyVar(name: "T"))]),
+        VariantDef(name: "Err", fields: [
+          VariantField(name: Some(val: "err"), typ: TyVar(name: "E"))])])]
+end
+
+let prepend_defs = fn (xs: [EnumDef], ys: [EnumDef]) -> [EnumDef] throws { LirError } do
+  return prepend_defs_go(xs, ys, acc: [])
+end
+
+let prepend_defs_go = fn (xs: [EnumDef], ys: [EnumDef], acc: [EnumDef]) -> [EnumDef] throws { LirError } do
+  match xs do
+    | [] -> return rev_enum_defs(lst: acc, out: ys)
+    | x :: rest -> return prepend_defs_go(xs: rest, ys, acc: x :: acc)
+  end
+end
+
+// Build type entries for all function return types so that MirVariable references
+// to top-level constants (zero-arg functions) resolve to the correct WASM type
+// instead of defaulting to TyI64.
+let build_func_type_entries = fn (funcs: [MirFunction]) -> [TypeEntry] throws { LirError } do
+  return build_func_type_entries_go(funcs, acc: [])
+end
+
+let build_func_type_entries_go = fn (funcs: [MirFunction], acc: [TypeEntry]) -> [TypeEntry] throws { LirError } do
+  match funcs do
+    | [] -> return rev_type_entries(lst: acc, out: [])
+    | MirFunction(name: n, params: _, ret_type: rt, body: _, span: _) :: rest ->
+      return build_func_type_entries_go(funcs: rest, acc: TypeEntry(name: n, typ: wasm_type(typ: rt)) :: acc)
+  end
+end
+
+let prepend_type_entries = fn (xs: [TypeEntry], ys: [TypeEntry]) -> [TypeEntry] throws { LirError } do
+  return prepend_type_entries_go(xs, ys, acc: [])
+end
+
+let prepend_type_entries_go = fn (xs: [TypeEntry], ys: [TypeEntry], acc: [TypeEntry]) -> [TypeEntry] throws { LirError } do
+  match xs do
+    | [] -> return rev_type_entries(lst: acc, out: ys)
+    | x :: rest -> return prepend_type_entries_go(xs: rest, ys, acc: x :: acc)
+  end
+end
+
+/** Entry point: lower a MirProgram to a LirProgram. */
+export let lower_mir_to_lir = fn (mir: MirProgram, enum_defs: [EnumDef], type_defs: [RecordDef]) -> LirProgram throws { LirError } do
+  let all_defs = prepend_defs(xs: builtin_enum_defs(), ys: enum_defs)
+  let variant_idx = vidx.build_variant_index(defs: all_defs)
+  match mir do | MirProgram(functions: fs, externals: exts) ->
+    let func_types = build_func_type_entries(funcs: fs)
+    return LirProgram(
+      functions: lir_lower_functions(functions: fs, enum_defs: variant_idx, type_defs, func_types),
+      externals: convert_externals(externals: exts)
+    )
+  end
+end
+
+let lir_lower_functions = fn (functions: [MirFunction], enum_defs: VariantIndex, type_defs: [RecordDef], func_types: [TypeEntry]) -> [LirFunction] throws { LirError } do
+  return lir_lower_functions_go(functions, enum_defs, type_defs, func_types, acc: [])
+end
+
+let lir_lower_functions_go = fn (functions: [MirFunction], enum_defs: VariantIndex, type_defs: [RecordDef], func_types: [TypeEntry], acc: [LirFunction]) -> [LirFunction] throws { LirError } do
+  match functions do
+    | [] -> return list.reverse(xs: acc)
+    | f :: rest ->
+      return lir_lower_functions_go(functions: rest, enum_defs, type_defs, func_types,
+        acc: lir_lower_function(f, enum_defs, type_defs, func_types) :: acc)
+  end
+end
+
+let convert_externals = fn (externals: [MirExternal]) -> [LirExternal] throws { LirError } do
+  return convert_externals_go(externals, acc: [])
+end
+
+let convert_externals_go = fn (externals: [MirExternal], acc: [LirExternal]) -> [LirExternal] throws { LirError } do
+  match externals do
+    | [] -> return list.reverse(xs: acc)
+    | e :: rest ->
+      return convert_externals_go(externals: rest, acc: convert_external(ext: e) :: acc)
+  end
+end
