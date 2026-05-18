@@ -1,0 +1,295 @@
+/**
+ * ir_dump/hir_text: HIR → human-readable text pretty-printer.
+ *
+ * Exports `hir_to_text` — the text format emitter for `nexus hir --format=text`.
+ */
+
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+import { Sigil, SigilImmutable, SigilMutable, SigilLinear, SigilBorrow, SigilLazy,
+  BinaryOp, UnaryOp, Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit,
+  TypeExpr } from "src/common/ast.nx"
+import { type_to_string } from "src/typecheck/types.nx"
+import { HirProgram, HirFunction, HirParam, HirBody, EagerBody, LazyBody,
+  HirExpr, HirExprKind, HirStmt, HirStmtKind, HirCallArg, HirNamedExpr,
+  HirMatchCase, HirPatternKind, HirPatternField, HirRecordPatField,
+  HirHandlerArm } from "src/ir/hir/types.nx"
+
+// ─── Shared helpers (local copies) ─────────────────────────────────────────
+
+let sigil_to_str = fn (s: Sigil) -> string do
+  match s do
+    | SigilImmutable -> return ""
+    | SigilMutable -> return "mut"
+    | SigilLinear -> return "%"
+    | SigilBorrow -> return "&"
+    | SigilLazy -> return "@"
+  end
+end
+
+let literal_to_str = fn (lit: Literal) -> string do
+  match lit do
+    | LitInt(val) -> return str.from_i64(val)
+    | LitFloat(val) -> return val
+    | LitBool(val) -> return str.from_bool(val)
+    | LitChar(val) -> return "char(" ++ str.from_i64(val) ++ ")"
+    | LitString(val) -> return "\"" ++ val ++ "\""
+    | LitUnit -> return "()"
+  end
+end
+
+let binop_to_str = fn (op: BinaryOp) -> string do
+  match op do
+    | OpAdd -> return "+"
+    | OpSub -> return "-"
+    | OpMul -> return "*"
+    | OpDiv -> return "/"
+    | OpMod -> return "%"
+    | OpFAdd -> return "+."
+    | OpFSub -> return "-."
+    | OpFMul -> return "*."
+    | OpFDiv -> return "/."
+    | OpEq -> return "=="
+    | OpNe -> return "!="
+    | OpLt -> return "<"
+    | OpLe -> return "<="
+    | OpGt -> return ">"
+    | OpGe -> return ">="
+    | OpFEq -> return "==."
+    | OpFNe -> return "!=."
+    | OpFLt -> return "<."
+    | OpFLe -> return "<=."
+    | OpFGt -> return ">."
+    | OpFGe -> return ">=."
+    | OpBitAnd -> return "&"
+    | OpBitOr -> return "|"
+    | OpBitXor -> return "^"
+    | OpShl -> return "<<"
+    | OpShr -> return ">>"
+    | OpAnd -> return "&&"
+    | OpOr -> return "||"
+    | OpConcat -> return "++"
+  end
+end
+
+let unop_to_str = fn (op: UnaryOp) -> string do
+  match op do
+    | OpNeg -> return "-"
+    | OpFNeg -> return "-."
+    | OpNot -> return "!"
+  end
+end
+
+let join_strs = fn (xs: [string], sep: string) -> string do
+  return str.join(xs, sep)
+end
+
+// ─── HIR body stringifier (text pretty-printer) ────────────────────────────
+
+let hir_call_args_to_strs = fn (args: [HirCallArg]) -> [string] do
+  match args do
+    | [] -> return []
+    | HirCallArg(label, value: v) :: rest ->
+      let head = if str.length(s: label) > 0 then label ++ ": " ++ hir_expr_to_str(e: v) else hir_expr_to_str(e: v) end
+      return head :: hir_call_args_to_strs(args: rest)
+  end
+end
+
+let hir_exprs_to_strs = fn (es: [HirExpr]) -> [string] do
+  match es do
+    | [] -> return []
+    | e :: rest -> return hir_expr_to_str(e) :: hir_exprs_to_strs(es: rest)
+  end
+end
+
+let hir_named_exprs_to_strs = fn (fs: [HirNamedExpr]) -> [string] do
+  match fs do
+    | [] -> return []
+    | HirNamedExpr(name, value: v) :: rest ->
+      return (name ++ ": " ++ hir_expr_to_str(e: v)) :: hir_named_exprs_to_strs(fs: rest)
+  end
+end
+
+let hir_params_to_strs = fn (ps: [HirParam]) -> [string] do
+  match ps do
+    | [] -> return []
+    | HirParam(label, name, sigil, typ) :: rest ->
+      let pre = sigil_to_str(s: sigil)
+      let head = label ++ ": " ++ pre ++ name ++ ": " ++ type_to_string(typ)
+      return head :: hir_params_to_strs(ps: rest)
+  end
+end
+
+let hir_pattern_fields_to_strs = fn (fs: [HirPatternField]) -> [string] do
+  match fs do
+    | [] -> return []
+    | HirPatternField(name, pattern: p) :: rest ->
+      let pre = match name do | Some(val: n) -> n ++ ": " | None -> "" end
+      return (pre ++ hir_pattern_to_str(p)) :: hir_pattern_fields_to_strs(fs: rest)
+  end
+end
+
+let hir_record_pat_fields_to_strs = fn (fs: [HirRecordPatField]) -> [string] do
+  match fs do
+    | [] -> return []
+    | HirRecordPatField(name, pattern: p) :: rest ->
+      return (name ++ ": " ++ hir_pattern_to_str(p)) :: hir_record_pat_fields_to_strs(fs: rest)
+  end
+end
+
+let hir_pattern_alts_to_strs = fn (alts: [HirPatternKind]) -> [string] do
+  match alts do
+    | [] -> return []
+    | a :: rest -> return hir_pattern_to_str(p: a) :: hir_pattern_alts_to_strs(alts: rest)
+  end
+end
+
+let hir_pattern_to_str = fn (p: HirPatternKind) -> string do
+  match p do
+    | PLit(lit) -> return literal_to_str(lit)
+    | PVar(name, sigil) -> return sigil_to_str(s: sigil) ++ name
+    | PCtor(variant, fields, sigil) ->
+      let fs_str = join_strs(xs: hir_pattern_fields_to_strs(fs: fields), sep: ", ")
+      return sigil_to_str(s: sigil) ++ variant ++ "(" ++ fs_str ++ ")"
+    | PRec(fields, is_partial) ->
+      let fs_str = join_strs(xs: hir_record_pat_fields_to_strs(fs: fields), sep: ", ")
+      let suff = if is_partial then ", _" else "" end
+      return "{" ++ fs_str ++ suff ++ "}"
+    | PWild -> return "_"
+    | POr(alts) -> return join_strs(xs: hir_pattern_alts_to_strs(alts), sep: " | ")
+  end
+end
+
+let hir_match_cases_to_strs = fn (cs: [HirMatchCase]) -> [string] do
+  match cs do
+    | [] -> return []
+    | HirMatchCase(pattern, body) :: rest ->
+      let head = "| " ++ hir_pattern_to_str(p: pattern) ++ " -> " ++ hir_stmts_to_str(stmts: body)
+      return head :: hir_match_cases_to_strs(cs: rest)
+  end
+end
+
+let hir_handler_arms_to_strs = fn (arms: [HirHandlerArm]) -> [string] do
+  match arms do
+    | [] -> return []
+    | HirHandlerArm(arm: HirFunction(name, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span: _, file: _, requires: _), cont_binder) :: rest ->
+      let cb = match cont_binder do | Some(val: n) -> " with @" ++ n | None -> "" end
+      return ("arm " ++ name ++ cb) :: hir_handler_arms_to_strs(arms: rest)
+  end
+end
+
+let hir_expr_to_str = fn (e: HirExpr) -> string do
+  match e do | HirExpr(node, span: _) ->
+    match node do
+      | Literal(lit) -> return literal_to_str(lit)
+      | Variable(name, sigil) -> return sigil_to_str(s: sigil) ++ name
+      | BinOp(left, op, right) ->
+        return "(" ++ hir_expr_to_str(e: left) ++ " " ++ binop_to_str(op) ++ " " ++ hir_expr_to_str(e: right) ++ ")"
+      | UnOp(op, operand) -> return "(" ++ unop_to_str(op) ++ hir_expr_to_str(e: operand) ++ ")"
+      | Borrow(name, sigil) -> return "&" ++ sigil_to_str(s: sigil) ++ name
+      | Call(func, args) ->
+        let args_str = join_strs(xs: hir_call_args_to_strs(args), sep: ", ")
+        return func ++ "(" ++ args_str ++ ")"
+      | Ctor(variant, args, sigil) ->
+        let args_str = join_strs(xs: hir_exprs_to_strs(es: args), sep: ", ")
+        return sigil_to_str(s: sigil) ++ variant ++ "(" ++ args_str ++ ")"
+      | Record(fields) ->
+        let fs_str = join_strs(xs: hir_named_exprs_to_strs(fs: fields), sep: ", ")
+        return "{" ++ fs_str ++ "}"
+      | Array(elems) ->
+        let es_str = join_strs(xs: hir_exprs_to_strs(es: elems), sep: ", ")
+        return "[" ++ es_str ++ "]"
+      | Index(target, index) -> return hir_expr_to_str(e: target) ++ "[" ++ hir_expr_to_str(e: index) ++ "]"
+      | FieldAccess(target, field) -> return hir_expr_to_str(e: target) ++ "." ++ field
+      | If(cond, then_branch, else_branch) ->
+        let else_str = match else_branch do
+          | Some(val: eb) -> " else " ++ hir_stmts_to_str(stmts: eb)
+          | None -> ""
+        end
+        return "if " ++ hir_expr_to_str(e: cond) ++ " then " ++ hir_stmts_to_str(stmts: then_branch) ++ else_str ++ " end"
+      | Match(target, cases) ->
+        let cs_str = join_strs(xs: hir_match_cases_to_strs(cs: cases), sep: " ")
+        return "match " ++ hir_expr_to_str(e: target) ++ " do " ++ cs_str ++ " end"
+      | While(cond, body) ->
+        return "while " ++ hir_expr_to_str(e: cond) ++ " do " ++ hir_stmts_to_str(stmts: body) ++ " end"
+      | For(var, start, end_expr, body) ->
+        return "for " ++ var ++ " in " ++ hir_expr_to_str(e: start) ++ ".." ++ hir_expr_to_str(e: end_expr) ++ " do " ++ hir_stmts_to_str(stmts: body) ++ " end"
+      | Lambda(type_params: _, params, ret_type, body) ->
+        let ps_str = join_strs(xs: hir_params_to_strs(ps: params), sep: ", ")
+        return "fn (" ++ ps_str ++ ") -> " ++ type_to_string(typ: ret_type) ++ " do " ++ hir_stmts_to_str(stmts: body) ++ " end"
+      | Raise(expr) -> return "throw " ++ hir_expr_to_str(e: expr)
+      | Force(expr) -> return "@" ++ hir_expr_to_str(e: expr)
+      | Thunk(body) -> return "@(" ++ hir_expr_to_str(e: body) ++ ")"
+      | ExternalRef(symbol, type_params: _, arg_names: _, typ) -> return "extern " ++ symbol ++ ": " ++ type_to_string(typ)
+      | Handler(port_name, requires: _, arms) ->
+        let arms_str = join_strs(xs: hir_handler_arms_to_strs(arms), sep: ", ")
+        return "handler " ++ port_name ++ " { " ++ arms_str ++ " }"
+    end
+  end
+end
+
+let hir_stmt_to_str = fn (s: HirStmt) -> string do
+  match s do | HirStmt(node, span: _) ->
+    match node do
+      | Let(name, sigil, typ, value) ->
+        let pre = sigil_to_str(s: sigil)
+        let ty_str = match typ do | Some(val: t) -> ": " ++ type_to_string(typ: t) | None -> "" end
+        return "let " ++ pre ++ name ++ ty_str ++ " = " ++ hir_expr_to_str(e: value)
+      | Expr(expr) -> return hir_expr_to_str(e: expr)
+      | Return(expr) -> return "return " ++ hir_expr_to_str(e: expr)
+      | Assign(target, value) -> return hir_expr_to_str(e: target) ++ " <- " ++ hir_expr_to_str(e: value)
+      | Try(body, catch_param, catch_body) ->
+        return "try " ++ hir_stmts_to_str(stmts: body) ++ " catch " ++ catch_param ++ " -> " ++ hir_stmts_to_str(stmts: catch_body) ++ " end"
+      | Inject(handlers, body) ->
+        let hs = join_strs(xs: handlers, sep: ", ")
+        return "inject " ++ hs ++ " do " ++ hir_stmts_to_str(stmts: body) ++ " end"
+    end
+  end
+end
+
+let hir_stmts_to_str_go = fn (stmts: [HirStmt], acc: [string]) -> [string] do
+  match stmts do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest -> return hir_stmts_to_str_go(stmts: rest, acc: hir_stmt_to_str(s) :: acc)
+  end
+end
+
+let hir_stmts_to_str = fn (stmts: [HirStmt]) -> string do
+  return join_strs(xs: hir_stmts_to_str_go(stmts, acc: []), sep: "; ")
+end
+
+let hir_body_to_str = fn (body: HirBody) -> string do
+  match body do
+    | EagerBody(stmts) -> return hir_stmts_to_str(stmts)
+    | LazyBody(ast_expr: _, entries: _) -> return "<lazy-body>"
+  end
+end
+
+// ─── HIR text dump ─────────────────────────────────────────────────────────
+
+let hir_func_to_text_lines = fn (f: HirFunction) -> [string] do
+  match f do | HirFunction(name, type_params: _, params, ret_type, throw_row: _, body, span: _, file: _, requires: _) ->
+    let ps_str = join_strs(xs: hir_params_to_strs(ps: params), sep: ", ")
+    let header = "fn " ++ name ++ "(" ++ ps_str ++ ") -> " ++ type_to_string(typ: ret_type)
+    let body_line = "  body: " ++ hir_body_to_str(body)
+    return [header, body_line]
+  end
+end
+
+let hir_funcs_to_text_go = fn (fs: [HirFunction], acc: [string]) -> [string] do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | f :: rest ->
+      let lines = hir_func_to_text_lines(f)
+      return hir_funcs_to_text_go(fs: rest, acc: list.concat(xs: list.reverse(xs: lines), ys: acc))
+  end
+end
+
+export let hir_to_text = fn (prog: HirProgram) -> string do
+  match prog do | HirProgram(ports: _, functions, externals: _, handler_bindings: _, enum_defs: _, exception_groups: _, value_binding_names: _, type_defs: _) ->
+    let banner = "=== HIR dump (" ++ str.from_i64(val: list.length(xs: functions)) ++ " functions) ==="
+    let lines = hir_funcs_to_text_go(fs: functions, acc: [])
+    return banner ++ "\n" ++ join_strs(xs: lines, sep: "\n") ++ "\n"
+  end
+end
