@@ -1,0 +1,156 @@
+// nexus-3cop: unit-test remap_elem_go — the element-segment remapping loop
+// inside emit_merged_elements.
+//
+// Element section (sec id=9) layout:
+//   ULEB(count)
+//   For each segment (kind=0 active/implicit):
+//     kind(1 byte = 0)
+//     init-expr: i32.const <sleb> end  (65, <sleb>, 11)
+//     ULEB(n_funcs)
+//     ULEB(func_idx) × n_funcs
+//
+// Bug (nexus-3cop): when kind != 0, remap_elem_go pushed the kind byte and
+// returned without processing the remaining segments, silently truncating
+// the element section. Fix: throw WasmMergeUnsupported with kind in detail.
+//
+// Tests:
+//   1. kind=0 (one segment, one func) — expect the remapped output.
+//   2. kind=1 (passive segment) — expect WasmMergeUnsupported to be raised.
+import * as test_assert from "std:test/assert"
+import * as bb from "std:bytebuffer"
+import { ByteBuffer } from "std:bytebuffer"
+import { emit_merged_elements } from "src/backend/wasm/merge/section_emit.nx"
+import { WasmMergeUnsupported } from "src/backend/errors.nx"
+import { pack } from "src/backend/wasm/read.nx"
+import { intarr_new, intarr_push } from "src/backend/wasm/merge/instruction_rewrite.nx"
+
+// Build a ByteBuffer from a list of bytes.
+let of_bytes = fn (xs: [i64]) -> %ByteBuffer do
+  return of_bytes_go(buf: bb.empty(), xs)
+end
+let of_bytes_go = fn (buf: %ByteBuffer, xs: [i64]) -> %ByteBuffer do
+  match xs do
+    | [] -> return %buf
+    | b :: rest -> return of_bytes_go(buf: bb.push_byte(buf: %buf, byte: b), xs: rest)
+  end
+end
+
+// Read all bytes from a ByteBuffer into a list (for assertions).
+let read_all = fn (buf: &ByteBuffer) -> [i64] do
+  return read_all_go(buf, idx: 0, len: bb.length(buf), acc: [])
+end
+let read_all_go = fn (buf: &ByteBuffer, idx: i64, len: i64, acc: [i64]) -> [i64] do
+  if idx >= len then return reverse(xs: acc, out: []) end
+  return read_all_go(buf, idx: idx + 1, len, acc: bb.get_byte(buf, idx) :: acc)
+end
+let reverse = fn (xs: [i64], out: [i64]) -> [i64] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return reverse(xs: rest, out: x :: out)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  // ── case 1: kind=0, one segment, one func idx=0 remapped to 5 ──
+  //
+  // Source element section buffer:
+  //   [99,       // padding byte at index 0 (sec_off=1 → count is at idx 1)
+  //    1,        // ULEB count = 1 segment (at sec_off = 1)
+  //    0,        // kind = 0 (active, implicit table 0)
+  //    65,       // i32.const opcode
+  //    0,        // SLEB value = 0 (offset in table)
+  //    11,       // end opcode
+  //    1,        // ULEB n_funcs = 1
+  //    0]        // func_idx = 0 (to be remapped → 5)
+  //
+  // sec_pk = pack(val: 1, p: 0): sec_off = pval = 1, the count ULEB is at byte 1.
+  // (sec_pk must be non-zero so count_sec and maybe_remap_elem don't short-circuit.)
+  //
+  // remap_m: slot 0 → 5. Only idx=0 appears in this segment.
+  //
+  // Expected output (full sec 9 with header):
+  //   [9,        // sec_id = element
+  //    7,        // ULEB(payload_len = 7): count(1) + kind(1) + init_expr(3) + n_funcs(1) + func_idx(1)
+  //    1,        // count = 1
+  //    0,        // kind = 0
+  //    65, 0, 11,  // init expr (i32.const 0 end)
+  //    1,        // n_funcs
+  //    5]        // remapped func_idx (0 → 5)
+  let %elem_buf = of_bytes(xs: [ 99, 1, 0, 65, 0, 11, 1, 0 ])
+  // sec_pk: sec_off = pval = 1 (count ULEB at byte 1). Non-zero avoids short-circuit.
+  let elem_sec_pk = pack(val: 1, p: 0)
+
+  // Build remap: slot 0 → 5, fill rest with identity.
+  let %remap = intarr_new()
+  let %remap = intarr_push(arr: %remap, val: 5)   // idx 0 → 5
+
+  let %out = bb.empty()
+  let %out = emit_merged_elements(out: %out,
+    d_buf: &elem_buf, d_sec: 0,   remap_d: &remap,   // dep: absent (d_sec=0)
+    m_buf: &elem_buf, m_sec: elem_sec_pk, remap_m: &remap)
+  let out_bytes = read_all(buf: &out)
+  bb.free(buf: %out)
+  bb.free(buf: %elem_buf)
+  bb.free(buf: %remap)
+
+  test_assert.assert_eq_i64_list(
+    actual: out_bytes,
+    expected: [ 9, 7, 1, 0, 65, 0, 11, 1, 5 ],
+    label: "remap_elem_go kind=0: remaps func idx 0→5 and emits full section")
+
+  return ()
+end
+
+// Returns 1 if WasmMergeUnsupported is raised, 0 if it completes or raises something else.
+let try_elem_kind1 = fn () -> i64 do
+  // Source element section buffer:
+  //   [99,  // padding at idx 0
+  //    1,   // count = 1 (at sec_off=1)
+  //    1]   // kind = 1 (passive — NOT handled)
+  let %k1_buf = of_bytes(xs: [ 99, 1, 1 ])
+  let k1_sec_pk = pack(val: 1, p: 0)
+  let %k1_remap = intarr_new()
+  try
+    let %k1_out = bb.empty()
+    let %k1_out = emit_merged_elements(out: %k1_out,
+      d_buf: &k1_buf, d_sec: k1_sec_pk, remap_d: &k1_remap,
+      m_buf: &k1_buf, m_sec: 0, remap_m: &k1_remap)
+    bb.free(buf: %k1_out)
+    bb.free(buf: %k1_buf)
+    bb.free(buf: %k1_remap)
+    return 0
+  catch
+    | WasmMergeUnsupported(_) ->
+      bb.free(buf: %k1_buf)
+      bb.free(buf: %k1_remap)
+      return 1
+    | _ ->
+      bb.free(buf: %k1_buf)
+      bb.free(buf: %k1_remap)
+      return 0
+  end
+end
+
+let body2 = fn () -> unit throws { Exn } do
+  // ── case 2: kind=1 (passive segment) — must raise WasmMergeUnsupported ──
+  let k1_raised = try_elem_kind1()
+  test_assert.assert_eq_i64(actual: k1_raised, expected: 1,
+    label: "remap_elem_go kind=1: raises WasmMergeUnsupported for passive element segment")
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    body2()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end
