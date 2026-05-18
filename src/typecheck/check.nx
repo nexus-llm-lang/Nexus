@@ -584,7 +584,7 @@ end
 let check_port_method_rows = fn (methods: [HirPortMethod], state: CheckState, exception_groups: [ExceptionGroupEntry]) -> unit throws { TypeError } do
   match methods do
     | [] -> return ()
-    | HirPortMethod(name: _, requires: req, throw_row: tw, span: sp) :: rest ->
+    | HirPortMethod(name: _, requires: req, span: sp, throw_row: tw, typ_params: _, typ_ret: _) :: rest ->
       tcwf.wf_cap(row: req, ports: [], span: sp)
       tcwf.wf_throw(row: tw, vidx_: tctypes.state_variant_index(state), groups: exception_groups, span: sp)
       return check_port_method_rows(methods: rest, state, exception_groups)
@@ -608,10 +608,9 @@ let register_handler_bindings = fn (state: CheckState, hbs: [HirHandlerBindingEn
       // declare per-arm caps), so wfCap there is a no-op until that
       // syntax exists.
       check_handler_arm_throw_rows(arms, state, exception_groups)
-      // T-Handler arm signature cross-validation (nexus-rkun):
-      // Validate that each arm's throw_row matches the port method declaration.
-      // (Params and ret_type cannot be validated here since HirPortMethod does
-      // not carry them; that check lives in hir.nx via the process_defs pathway.)
+      // T-Handler arm signature cross-validation (nexus-rkun, nexus-00j4):
+      // Validate throw_row, ret_type, and params of each arm against the port
+      // method declaration. HirPortMethod now carries params+ret_type (nexus-00j4).
       validate_handler_arm_throw_rows(handler_name: n, port_name: pname, arms, ports, prefix_len)
       let st1 = tctypes.state_with_env(state, env: env2)
       return register_handler_bindings(state: st1, hbs: rest, ports, exception_groups)
@@ -631,28 +630,29 @@ let check_handler_arm_throw_rows = fn (arms: [HirHandlerArm], state: CheckState,
   end
 end
 
-// ─── T-Handler arm/port throw_row cross-validation (nexus-rkun) ─────────────
-// Spec T-Handler: each arm's throw_row must match the corresponding port
-// method's declared throw_row (arm ⊆ port). Params and ret_type comparison
-// lives in the HIR-lowering path (hir.nx) where FunctionSig is available.
+// ─── T-Handler arm/port signature cross-validation (nexus-rkun, nexus-00j4) ──
+// Spec T-Handler: each arm's throw_row, params, and ret_type must match the
+// corresponding port method's declaration.
 //
 // We use structural type equality (subst.type_eq) rather than unification.
 
 let validate_handler_arm_throw_rows = fn (handler_name: string, port_name: string, arms: [HirHandlerArm], ports: [HirPort], prefix_len: i64) -> unit throws { TypeError } do
   let port_methods = lookup_port_methods_tw(ports, port_name)
-  return validate_arm_tw_go(handler_name, port_name, arms, port_methods, prefix_len)
+  return validate_arm_sig_go(handler_name, port_name, arms, port_methods, prefix_len)
 end
 
-let validate_arm_tw_go = fn (handler_name: string, port_name: string, arms: [HirHandlerArm], port_methods: [HirPortMethod], prefix_len: i64) -> unit throws { TypeError } do
+let validate_arm_sig_go = fn (handler_name: string, port_name: string, arms: [HirHandlerArm], port_methods: [HirPortMethod], prefix_len: i64) -> unit throws { TypeError } do
   match arms do
     | [] -> return ()
-    | HirHandlerArm(arm: HirFunction(name: n, type_params: _, params: _, ret_type: _, throw_row: arm_tw, body: _, span: sp, file: _, requires: _), cont_binder: _) :: rest ->
+    | HirHandlerArm(arm: HirFunction(name: n, type_params: _, params: arm_params, ret_type: arm_ret, throw_row: arm_tw, body: _, span: sp, file: _, requires: _), cont_binder: kb) :: rest ->
       let original = str.substring(s: n, start: prefix_len, len: str.length(s: n) - prefix_len)
-      match lookup_port_method_tw(methods: port_methods, name: original) do
+      match lookup_port_method(methods: port_methods, name: original) do
         | None ->
           // Port method not found: already caught by validate_handler_arm_sets; skip.
-          return validate_arm_tw_go(handler_name, port_name, arms: rest, port_methods, prefix_len)
-        | Some(val: method_tw) ->
+          return validate_arm_sig_go(handler_name, port_name, arms: rest, port_methods, prefix_len)
+        | Some(val: method) ->
+          let HirPortMethod(name: _, requires: _, span: _, throw_row: method_tw, typ_params: method_params, typ_ret: method_ret) = method
+          // Validate throw_row (nexus-rkun).
           if !subst.type_eq(a: arm_tw, b: method_tw) then
             let detail = bb.concat(parts: [
               "handler '", handler_name, "' arm '", original,
@@ -661,7 +661,32 @@ let validate_arm_tw_go = fn (handler_name: string, port_name: string, arms: [Hir
             ])
             throw TypeMismatch(func_name: handler_name, detail, span: sp)
           end
-          return validate_arm_tw_go(handler_name, port_name, arms: rest, port_methods, prefix_len)
+          // Validate ret_type (nexus-00j4).
+          if !subst.type_eq(a: arm_ret, b: method_ret) then
+            let detail = bb.concat(parts: [
+              "handler '", handler_name, "' arm '", original,
+              "' return type does not match port '", port_name,
+              "' method declaration (T-Handler: arm return type must equal port method return type)"
+            ])
+            throw TypeMismatch(func_name: handler_name, detail, span: sp)
+          end
+          // Validate params (nexus-00j4).
+          // Strip the continuation binder (last param) when present.
+          let user_params = match kb do
+            | Some(_) -> list_init(xs: arm_params)
+            | None -> arm_params
+          end
+          let arm_param_nts = hir_params_to_named_types(params: user_params)
+          let method_param_nts = hir_params_to_named_types(params: method_params)
+          if !check_named_types_eq(a: arm_param_nts, b: method_param_nts) then
+            let detail = bb.concat(parts: [
+              "handler '", handler_name, "' arm '", original,
+              "' parameter types do not match port '", port_name,
+              "' method declaration (T-Handler: arm params must equal port method params)"
+            ])
+            throw TypeMismatch(func_name: handler_name, detail, span: sp)
+          end
+          return validate_arm_sig_go(handler_name, port_name, arms: rest, port_methods, prefix_len)
       end
   end
 end
@@ -675,12 +700,28 @@ let lookup_port_methods_tw = fn (ports: [HirPort], port_name: string) -> [HirPor
   end
 end
 
-let lookup_port_method_tw = fn (methods: [HirPortMethod], name: string) -> Option<TypeExpr> do
+let lookup_port_method = fn (methods: [HirPortMethod], name: string) -> Option<HirPortMethod> do
   match methods do
     | [] -> return None
-    | HirPortMethod(name: n, requires: _, throw_row: tw, span: _) :: rest ->
-      if n == name then return Some(val: tw) end
-      return lookup_port_method_tw(methods: rest, name)
+    | HirPortMethod(name: n, requires: mreq, span: msp, throw_row: mtw, typ_params: mp, typ_ret: mr) :: rest ->
+      if n == name then return Some(val: HirPortMethod(name: n, requires: mreq, span: msp, throw_row: mtw, typ_params: mp, typ_ret: mr)) end
+      return lookup_port_method(methods: rest, name)
+  end
+end
+
+// Structural equality on NamedType lists: same length, same labels, same types.
+let check_named_types_eq = fn (a: [NamedType], b: [NamedType]) -> bool do
+  match a do
+    | [] -> return if let [] = b then true else false end
+    | NamedType(name: na, typ: ta) :: ra ->
+      match b do
+        | [] -> return false
+        | NamedType(name: nb, typ: tb) :: rb ->
+          if na == nb && subst.type_eq(a: ta, b: tb) then
+            return check_named_types_eq(a: ra, b: rb)
+          end
+          return false
+      end
   end
 end
 
@@ -759,7 +800,7 @@ end
 let port_method_names = fn (methods: [HirPortMethod]) -> [string] do
   match methods do
     | [] -> return []
-    | HirPortMethod(name: n, requires: _, throw_row: _, span: _) :: rest -> return n :: port_method_names(methods: rest)
+    | HirPortMethod(name: n, requires: _, span: _, throw_row: _, typ_params: _, typ_ret: _) :: rest -> return n :: port_method_names(methods: rest)
   end
 end
 
