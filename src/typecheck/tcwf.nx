@@ -33,11 +33,12 @@
 
 import { Span } from "src/common/token.nx"
 import { TypeExpr, TyRef, TyArrow, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyUserDefined, NamedType, EnumDef, VariantDef } from "src/common/ast.nx"
-import { HirPort, HirPortMethod, ExceptionGroupEntry, HirProgram, HirFunction, HirHandlerArm, HirHandlerBindingEntry, HirHandlerBinding } from "src/ir/hir/types.nx"
-import { TypeError, UnknownCapability, UnknownThrowVariant, RefEscapes } from "src/typecheck/errors.nx"
+import { HirPort, HirPortMethod, ExceptionGroupEntry, HirProgram, HirFunction, HirHandlerArm, HirHandlerBindingEntry, HirHandlerBinding, HirParam } from "src/ir/hir/types.nx"
+import { TypeError, UnknownCapability, UnknownThrowVariant, RefEscapes, RefInnerLinear } from "src/typecheck/errors.nx"
 import { VariantIndex, VariantInfo }, * as vidx from "src/common/variant_index.nx"
 import { Option, Some, None } from "std:option"
 import * as str from "std:str"
+import * as list from "std:list"
 
 // ─── SysCaps closed set ─────────────────────────────────────────────────────
 //
@@ -255,6 +256,86 @@ export let enforce_no_escapes_ref = fn (typ: TypeExpr, context: string, span: Sp
   end
 end
 
+// ─── wfRef ──────────────────────────────────────────────────────────────────
+//
+// Spec §wfRef (type-system-formal.md L385-400):
+//   wfRef(~σ) ⟺ ¬linear(σ)
+//
+// A ref cell's inner type must not be linear. If it were, each deref (~x)
+// would produce a fresh copy of the linear payload, duplicating the resource
+// and violating the single-use discipline.
+//
+// The spec's `linear(σ)` predicate holds iff σ = %τ (i.e., σ is TyLinear).
+// We check every parameter type annotation: if it is TyRef(inner) and inner
+// is TyLinear, we reject at the declaration site rather than letting a
+// ref(%T) parameter silently smuggle in through successive deref calls.
+//
+// Enforcement sites (spec table L391-398):
+//   - Parameter slots of fn literals (T-Lambda / T-Let-PolyFn)
+//   - Method signature parameters in a cap declaration (D-Cap)
+//   - Type annotation of an external binding (D-External)
+//   - Handler arm parameter annotations (T-Handler)
+//
+// Note: the return-type slot already goes through `enforce_no_escapes_ref`
+// (gravity rule). For params we only need wfRef — a ref param is fine as
+// long as its inner type is not linear.
+
+/** `is_linear(σ)` — true iff σ is `%τ` (TyLinear). The spec's `linear`
+ *  predicate used in `wfRef(~σ) ⟺ ¬linear(σ)`.
+ */
+let is_linear = fn (typ: TypeExpr) -> bool do
+  match typ do
+    | TyLinear(_) -> return true
+    | _ -> return false
+  end
+end
+
+/** Enforce wfRef on a single parameter type: if it is `~σ` (TyRef) and
+ *  σ is linear (TyLinear), throw `RefInnerLinear`.
+ *  `param` is the parameter label used for the diagnostic.
+ */
+let enforce_wf_ref_one = fn (typ: TypeExpr, param: string, span: Span) -> unit throws { TypeError } do
+  match typ do
+    | TyRef(inner: i) ->
+      if is_linear(typ: i) then throw RefInnerLinear(param, span) end
+      return ()
+    | _ -> return ()
+  end
+end
+
+/** Enforce wfRef over a list of named parameter types. Each parameter whose
+ *  declared type is `~σ` is checked: if σ is linear the function throws
+ *  `RefInnerLinear` naming the offending parameter label.
+ */
+export let enforce_wf_ref_params = fn (params: [NamedType], span: Span) -> unit throws { TypeError } do
+  match params do
+    | [] -> return ()
+    | NamedType(name: n, typ: t) :: rest ->
+      enforce_wf_ref_one(typ: t, param: n, span)
+      return enforce_wf_ref_params(params: rest, span)
+  end
+end
+
+// ─── HirParam → NamedType projection for wfRef checking ────────────────────
+//
+// Used by `walk_funcs` and `walk_handler_arms` (pre-DCE whole-program pass)
+// to extract parameter type annotations from HirFunction.params so that
+// `enforce_wf_ref_params` can check them. A separate helper rather than
+// an import of check.nx::hir_params_to_named_types because tcwf.nx must
+// not import typecheck/check.nx (circular dependency).
+
+let hir_params_to_named_types_tcwf = fn (params: [HirParam]) -> [NamedType] do
+  return hir_params_to_nt_go(params, acc: [])
+end
+
+let hir_params_to_nt_go = fn (params: [HirParam], acc: [NamedType]) -> [NamedType] do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | HirParam(label: l, name: _, sigil: _, typ: t) :: rest ->
+      return hir_params_to_nt_go(params: rest, acc: NamedType(name: l, typ: t) :: acc)
+  end
+end
+
 // ─── Whole-program entry ────────────────────────────────────────────────────
 //
 // `check_program_wf_rows` runs wfCap/wfThrow over every function in the
@@ -273,13 +354,17 @@ let walk_funcs = fn (
 ) -> unit throws { TypeError } do
   match funcs do
     | [] -> return ()
-    | HirFunction(name: fn_name, type_params: _, params: _, ret_type: ret, throw_row: tw, body: _, span: sp, file: _, requires: req) :: rest ->
+    | HirFunction(name: fn_name, type_params: _, params: fn_params, ret_type: ret, throw_row: tw, body: _, span: sp, file: _, requires: req) :: rest ->
       wf_cap(row: req, ports, span: sp)
       wf_throw(row: tw, vidx_, groups, span: sp)
       // Gravity rule: ¬escapesRef(τ_r) on the declared return type.
       // Runs here (pre-DCE) so even unused functions with `ref(T)` return
       // types are rejected — mirrors the wfCap/wfThrow rationale (line 112).
       enforce_no_escapes_ref(typ: ret, context: "return type of '" ++ fn_name ++ "'", span: sp)
+      // wfRef on parameter types (spec §wfRef L385-400):
+      // pre-DCE so even unused functions with ref(%T) params are rejected.
+      let fn_param_nts = hir_params_to_named_types_tcwf(params: fn_params)
+      enforce_wf_ref_params(params: fn_param_nts, span: sp)
       return walk_funcs(funcs: rest, ports, vidx_, groups)
   end
 end
@@ -302,9 +387,12 @@ let walk_handler_arms = fn (
 ) -> unit throws { TypeError } do
   match arms do
     | [] -> return ()
-    | HirHandlerArm(arm: HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: tw, body: _, span: sp, file: _, requires: req), cont_binder: _) :: rest ->
+    | HirHandlerArm(arm: HirFunction(name: _, type_params: _, params: arm_ps, ret_type: _, throw_row: tw, body: _, span: sp, file: _, requires: req), cont_binder: _) :: rest ->
       wf_cap(row: req, ports, span: sp)
       wf_throw(row: tw, vidx_, groups, span: sp)
+      // wfRef on handler arm parameter types (spec §wfRef L385-400).
+      let arm_param_nts = hir_params_to_named_types_tcwf(params: arm_ps)
+      enforce_wf_ref_params(params: arm_param_nts, span: sp)
       return walk_handler_arms(arms: rest, ports, vidx_, groups)
   end
 end
