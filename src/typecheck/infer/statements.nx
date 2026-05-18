@@ -506,16 +506,45 @@ export let poly_scheme = fn (vars: [string]) -> bool do
   end
 end
 
+/** True when every entry in `env` except the one named `except_name`
+ *  has multiplicity ω (i.e. its type is not `TyLinear` or `TyLazy`).
+ *  This is the env-level `pure(Γ \ {y})` predicate used by T-Let-Alias.
+ *  spec type-system-formal.md §Linearity: `pure(Γ) = ∀x:^q S ∈ Γ. q = ω`.
+ */
+let env_is_pure_except = fn (env: [EnvEntry], except_name: string) -> bool do
+  match env do
+    | [] -> return true
+    | EnvEntry(name: n, scheme: Scheme(vars: _, typ: t)) :: rest ->
+      if n == except_name then
+        return env_is_pure_except(env: rest, except_name)
+      end
+      match t do
+        | TyLinear(_) | TyLazy(_) -> return false
+        | _ -> return env_is_pure_except(env: rest, except_name)
+      end
+  end
+end
+
 /** Variable-aliasing carve-out helper. Returns
- *  `Some(state')` when the let RHS is a plain immutable, unannotated
- *  reference to a polymorphic binding — in which case `state'` already
- *  has `name` bound to a copy of that scheme. Returns `None` for every
- *  other shape so `infer_let` falls through to the standard path.
+ *  `Some(Ok(state'))` when the let RHS is a plain immutable, unannotated
+ *  reference to a polymorphic binding whose alias site satisfies the
+ *  T-Let-Alias spec premise `pure(Γ \ {y})`.
+ *  `Some(Err(...))` when the alias shape matches but the pure premise fails —
+ *    i.e. there is a live linear binding in scope at the alias site.
+ *  `None` for every other shape so `infer_let` falls through to T-Let.
+ *
+ *  Spec T-Let-Alias (type-system-formal.md §T-Let-Alias):
+ *    pure(Γ \ {y}): the env minus y must contain no linear binders.
+ *    Without this guard, `let f = poly_fn` at a site where a linear
+ *    binding is live would create an alias that could escape the linear
+ *    resource past its scope. Downstream P-FnEnd scope-close enforcement
+ *    provides a compensating safety net, but the premise is explicitly
+ *    required by the spec rule and belongs here at the introduction site.
  */
 export let alias_poly_scheme = fn (
   state: CheckState, name: string, sigil: Sigil,
-  ann: Option<TypeExpr>, val_node: HirExprKind
-) -> Option<CheckState> do
+  ann: Option<TypeExpr>, val_node: HirExprKind, span: Span
+) -> Option<InferExprResult> do
   match sigil do
     | SigilImmutable -> ()
     | _ -> return None
@@ -530,12 +559,25 @@ export let alias_poly_scheme = fn (
         | None -> return None
         | Some(val: Scheme(vars: src_vars, typ: src_typ)) ->
           if poly_scheme(vars: src_vars) then
+            // T-Let-Alias premise: pure(Γ \ {y}) — no linear binders
+            // may be live in scope when aliasing a polymorphic function.
+            // Compensated by P-FnEnd but required explicitly at this site.
+            if !env_is_pure_except(env: tctypes.state_env(state), except_name: src_name) then
+              return Some(val: InferExprErr(
+                message: "let " ++ name ++ " = " ++ src_name ++ ": T-Let-Alias requires pure(Γ\\{" ++ src_name ++ "}) — a live linear binding exists in scope at this alias site (spec type-system-formal.md §T-Let-Alias)",
+                span
+              ))
+            end
             let env_aliased = tctypes.env_insert(
               env: tctypes.state_env(state),
               name,
               scheme: Scheme(vars: src_vars, typ: src_typ)
             )
-            return Some(val: tctypes.state_with_env(state, env: env_aliased))
+            return Some(val: InferExprOk(
+              state: tctypes.state_with_env(state, env: env_aliased),
+              subst: subst.subst_empty(),
+              typ: TyUnit
+            ))
           end
           return None
       end
