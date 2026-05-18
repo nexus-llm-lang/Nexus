@@ -1,0 +1,241 @@
+/**
+ * codegen/inject: inject / resume multi-arm emission.
+ *
+ * Owns:
+ * - emit_inject_resume_multi — outer/loop/arm-block frame layout
+ * - open_nested_arm_blocks — N nested block instructions
+ * - emit_arm_on_clauses — (on tag → label) per arm
+ * - arm_tag_offset_at / nth_string — tag-index lookup helpers
+ * - close_and_dispatch_arms / emit_arm_dispatch — arm body dispatch + br
+ *
+ * Does not own:
+ * - The LirExprInjectResume dispatch arm (see emit_expr in codegen.nx)
+ * - Sched import detection (is_sched_set_next etc. in codegen/intrinsics/sched.nx)
+ *
+ * None of these functions recurse through emit_expr / emit_stmt.
+ */
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { LirFunction } from "src/ir/lir/types.nx"
+import { CodegenCtx, ctx_temps_base, ctx_externals, ctx_lookup_function } from "src/backend/codegen/context.nx"
+import { bt_void,
+         op_block, op_loop, op_end, op_br, op_br_if,
+         op_call, op_global_get, op_global_set,
+         op_local_get, op_local_set, op_local_tee,
+         op_table_get, op_table_set,
+         op_ref_func,
+         op_resume, op_cont_new,
+         op_i32_wrap_i64,
+         op_i64_const, op_i64_lt_s, op_i64_add }, * as wdefs from "src/backend/wasm/defs.nx"
+import { find_sched_import_idx } from "src/backend/codegen/intrinsics/sched.nx"
+import { StrMap } from "src/common/strmap.nx"
+import * as wcollect from "src/backend/wasm/collect.nx"
+import * as list from "std:list"
+import { SymbolNotFound, CodegenError, SkFunction, SkArmTag, SkArmTagIndex } from "src/backend/errors.nx"
+
+/** Multi-arm InjectResume frame.
+ *
+ *  Layout for N=2 arms (innermost = arm 0):
+ *
+ *  block @outer
+ *  setup body cont; resume_slot = next_alloc; next_alloc++
+ *  loop @loop
+ *  block @arm_1 (type dispatch_t_idx)
+ *  block @arm_0 (type dispatch_t_idx)
+ *  resume cont_t (on tag_0 @arm_0) (on tag_1 @arm_1)
+ *  br 3       ;; resume returned normally → exit @outer (depth N+1)
+ *  end
+ *  ;; tag_0 caught: dispatch arm 0 with [payload, contref]
+ *  br 1         ;; back to @loop (depth N - 0 - 1 = 1)
+ *  end
+ *  ;; tag_1 caught
+ *  br 0           ;; back to @loop (depth N - 1 - 1 = 0)
+ *  end
+ *  end
+ *
+ *  Every match arm uses explicit `return` (defensive against an earlier
+ *  self-compile hang whose root cause was never nailed; uniform returns
+ *  sidestep whatever runtime pattern was responsible).
+ */
+export let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm_fns: [string],
+                                           arm_tags: [string], ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  let CodegenCtx(internal_func_map: ifm, ss_cont_type_idx: cont_t_idx,
+                  ss_dispatch_block_type_idx: dispatch_t_idx, ss_tag_idx: ss_base,
+                  ss_tag_idx_map: tag_idx_map, _) = ctx
+  let body_idx = wdefs.lookup_func_fast(name: body_fn, map: &ifm)
+  let n_arms_raw = list.length(xs: arm_fns)
+  // arm_tags may be empty when the MIR path doesn't populate tags. Force
+  // a single-on-clause shape so the dispatcher remains valid; first arm
+  // gets tag 0. arm_fns must have at least one entry (InjectResume is only
+  // constructed when at least one with-kont arm exists).
+  let n_arms = if n_arms_raw == 0 then 1 else n_arms_raw end
+
+  // @outer
+  let %buf = bb.push_bytes(%buf, bytes: [op_block, bt_void])
+
+  // Body cont setup
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_ref_func])
+  let %buf = bb.push_uleb128(%buf, val: body_idx)
+  let %buf = bb.push_byte(%buf, byte: op_cont_new)
+  let %buf = bb.push_uleb128(%buf, val: cont_t_idx)
+  let %buf = bb.push_byte(%buf, byte: op_table_set)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_table_idx)
+
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = bb.push_byte(%buf, byte: op_global_set)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_resume_slot_global_idx)
+
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = bb.push_byte(%buf, byte: op_i64_const)
+  let %buf = bb.push_sleb128(%buf, val: 1)
+  let %buf = bb.push_bytes(%buf, bytes: [op_i64_add, op_global_set])
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+
+  // @loop
+  let %buf = bb.push_bytes(%buf, bytes: [op_loop, bt_void])
+
+  // N nested arm blocks (outermost first)
+  let %buf = open_nested_arm_blocks(%buf, dispatch_t_idx, n: n_arms)
+
+  // resume + on-clauses
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_resume_slot_global_idx)
+  let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_table_get])
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_table_idx)
+  let %buf = bb.push_byte(%buf, byte: op_resume)
+  let %buf = bb.push_uleb128(%buf, val: cont_t_idx)
+  let %buf = bb.push_uleb128(%buf, val: n_arms)
+  let %buf = emit_arm_on_clauses(%buf, arm_tags, ss_base, tag_idx_map, n_arms, idx: 0)
+
+  // Normal-return path. The naive `br N+1` (exit dispatcher) prematurely
+  // strands queued fibers when the spawner cont (main's body) finishes
+  // first — bes5 Q3 termination. Instead: dequeue the next runnable; if
+  // queue empty (sched-dequeue returns -1), THEN exit. Otherwise set
+  // resume_slot and br back to @loop so the fibers drain.
+  let dequeue_idx = find_sched_import_idx(wn: "sched-dequeue", exts: ctx_externals(ctx), idx: 0)
+  let %buf = if dequeue_idx >= 0 then
+    let tmp_local = ctx_temps_base(ctx) + 5
+    let %b = bb.push_byte(%buf, byte: op_call)
+    let %b = bb.push_uleb128(buf: %b, val: dequeue_idx)
+    let %b = bb.push_byte(buf: %b, byte: op_local_tee)
+    let %b = bb.push_uleb128(buf: %b, val: tmp_local)
+    let %b = bb.push_byte(buf: %b, byte: op_i64_const)
+    let %b = bb.push_sleb128(buf: %b, val: 0)
+    let %b = bb.push_bytes(buf: %b, bytes: [op_i64_lt_s, op_br_if])
+    let %b = bb.push_uleb128(buf: %b, val: n_arms + 1)
+    let %b = bb.push_byte(buf: %b, byte: op_local_get)
+    let %b = bb.push_uleb128(buf: %b, val: tmp_local)
+    let %b = bb.push_byte(buf: %b, byte: op_global_set)
+    let %b = bb.push_uleb128(buf: %b, val: wdefs.ss_resume_slot_global_idx)
+    let %b = bb.push_byte(buf: %b, byte: op_br)
+    bb.push_uleb128(buf: %b, val: n_arms)
+  else
+    // No sched runtime imported (e.g., handler_with_kont_resume which uses
+    // a hand-rolled handler with no global queue). Fall back to the simple
+    // exit-on-normal-return path.
+    let %b = bb.push_byte(%buf, byte: op_br)
+    bb.push_uleb128(buf: %b, val: n_arms + 1)
+  end
+
+  // Close arm blocks innermost first; emit per-arm dispatch + br to @loop
+  let %buf = close_and_dispatch_arms(%buf, arm_fns, n_arms, ctx, idx: 0)
+
+  let %buf = bb.push_byte(%buf, byte: op_end)  // close @loop
+  return bb.push_byte(%buf, byte: op_end)      // close @outer
+end
+
+let open_nested_arm_blocks = fn (buf: %ByteBuffer, dispatch_t_idx: i64, n: i64) -> %ByteBuffer throws { CodegenError } do
+  if n <= 0 then return %buf end
+  let %buf = bb.push_byte(%buf, byte: op_block)
+  let %buf = bb.push_sleb128(%buf, val: dispatch_t_idx)
+  return open_nested_arm_blocks(%buf, dispatch_t_idx, n: n - 1)
+end
+
+/** Emit one `(on tag → label)` per arm. Arm `i` targets label depth `i`
+ *  (innermost arm = depth 0). When arm_tags is empty (single-arm path),
+ *  fall through to ss_base for the only on-clause.
+ */
+let emit_arm_on_clauses = fn (buf: %ByteBuffer, arm_tags: [string],
+                              ss_base: i64, tag_idx_map: StrMap<i64>, n_arms: i64, idx: i64) -> %ByteBuffer throws { CodegenError } do
+  if idx >= n_arms then return %buf end
+  let tag_idx = match arm_tags do
+    | [] -> ss_base
+    | _ -> ss_base + arm_tag_offset_at(arm_tags, idx, tag_idx_map)
+  end
+  let %buf = bb.push_byte(%buf, byte: 0)
+  let %buf = bb.push_uleb128(%buf, val: tag_idx)
+  let %buf = bb.push_uleb128(%buf, val: idx)
+  return emit_arm_on_clauses(%buf, arm_tags, ss_base, tag_idx_map, n_arms, idx: idx + 1)
+end
+
+let arm_tag_offset_at = fn (arm_tags: [string], idx: i64, tag_idx_map: StrMap<i64>) -> i64 throws { CodegenError } do
+  let tn = nth_string(xs: arm_tags, idx)
+  let off = wcollect.lookup_tag_idx_map(tag_name: tn, idx_map: tag_idx_map)
+  if off < 0 then
+    throw SymbolNotFound(name: tn, kind: SkArmTag, context: "arm_tag_offset_at: tag missing in ss_tag_names")
+  end
+  return off
+end
+
+let nth_string = fn (xs: [string], idx: i64) -> string throws { CodegenError } do
+  match xs do
+    | [] -> throw SymbolNotFound(name: "<arm_tag>", kind: SkArmTagIndex, context: "nth_string out of range")
+    | x :: rest ->
+      if idx <= 0 then return x end
+      return nth_string(xs: rest, idx: idx - 1)
+  end
+end
+
+let close_and_dispatch_arms = fn (buf: %ByteBuffer, arm_fns: [string], n_arms: i64,
+                                   ctx: CodegenCtx, idx: i64) -> %ByteBuffer throws { CodegenError } do
+  if idx >= n_arms then return %buf end
+  let %buf = bb.push_byte(%buf, byte: op_end)  // close arm `idx`'s block
+  let arm_fn = nth_string(xs: arm_fns, idx)
+  let %buf = emit_arm_dispatch(%buf, arm_fn, ctx)
+  let %buf = bb.push_byte(%buf, byte: op_br)
+  let %buf = bb.push_uleb128(%buf, val: n_arms - idx - 1)
+  return close_and_dispatch_arms(%buf, arm_fns, n_arms, ctx, idx: idx + 1)
+end
+
+let emit_arm_dispatch = fn (buf: %ByteBuffer, arm_fn: string, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  let CodegenCtx(internal_func_map: ifm, _) = ctx
+  let arm_idx = wdefs.lookup_func_fast(name: arm_fn, map: &ifm)
+  if arm_idx < 0 then
+    throw SymbolNotFound(name: arm_fn, kind: SkFunction, context: "emit_arm_dispatch")
+  end
+  let arm_param_count = match ctx_lookup_function(ctx, name: arm_fn) do
+    | Some(val: LirFunction(name: _, params: ps, ret_type: _, body: _, ret: _, span: _)) -> list.length(xs: ps)
+    | None -> 2
+  end
+  let temp_idx = ctx_temps_base(ctx)
+  let %buf = bb.push_byte(%buf, byte: op_global_set)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_global_idx)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: temp_idx)
+
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_global_get])
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_global_idx)
+  let %buf = bb.push_byte(%buf, byte: op_table_set)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_table_idx)
+
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = if arm_param_count >= 2 then
+    let %bb = bb.push_byte(%buf, byte: op_local_get)
+    bb.push_uleb128(buf: %bb, val: temp_idx)
+  else %buf end
+  let %buf = bb.push_byte(%buf, byte: op_call)
+  let %buf = bb.push_uleb128(%buf, val: arm_idx)
+
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = bb.push_byte(%buf, byte: op_i64_const)
+  let %buf = bb.push_sleb128(%buf, val: 1)
+  let %buf = bb.push_bytes(%buf, bytes: [op_i64_add, op_global_set])
+  return bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+end

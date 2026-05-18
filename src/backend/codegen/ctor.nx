@@ -1,0 +1,87 @@
+/**
+ * codegen/ctor: constructor / record-field / array-record emission helpers.
+ *
+ * Owns:
+ * - emit_constructor_fields — store each ctor arg at field_idx * 8
+ * - emit_record_fields — store each LirNamedAtom field
+ * - extract_field_names / extract_field_names_go — [LirNamedAtom] → [string]
+ * - is_array_record / is_array_record_go — detect numeric "0","1",... names
+ *
+ * Does not own:
+ * - Allocation (emit_alloc_object is in codegen/atom.nx)
+ * - The LirExprConstructor / LirExprRecord dispatch (see emit_expr in codegen.nx)
+ *
+ * Callers: codegen.nx emit_expr arms LirExprConstructor and LirExprRecord.
+ * None of these functions recurse through emit_expr / emit_stmt.
+ */
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { LirAtom, LirNamedAtom } from "src/ir/lir/types.nx"
+import { CodegenCtx } from "src/backend/codegen/context.nx"
+import { op_local_get,
+         op_i64_store }, * as wdefs from "src/backend/wasm/defs.nx"
+import { emit_atom, emit_typed_field_store } from "src/backend/codegen/atom.nx"
+import * as list from "std:list"
+import * as str from "std:str"
+import { CodegenError } from "src/backend/errors.nx"
+
+export let emit_constructor_fields = fn (buf: %ByteBuffer, args: [LirAtom], ctx: CodegenCtx,
+                                          obj_ptr: i64, field_idx: i64) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | [] -> %buf
+    | a :: rest ->
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: obj_ptr)
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = emit_typed_field_store(typ: wdefs.atom_type(atom: a), %buf, offset: field_idx * 8)
+      emit_constructor_fields(%buf, args: rest, ctx, obj_ptr, field_idx: field_idx + 1)
+  end
+end
+
+export let emit_record_fields = fn (buf: %ByteBuffer, fields: [LirNamedAtom], ctx: CodegenCtx,
+                                     obj_ptr: i64, field_idx: i64) -> %ByteBuffer throws { CodegenError } do
+  match fields do
+    | [] -> %buf
+    | LirNamedAtom(name: _, value: v) :: rest ->
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: obj_ptr)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = emit_typed_field_store(typ: wdefs.atom_type(atom: v), %buf, offset: field_idx * 8)
+      emit_record_fields(%buf, fields: rest, ctx, obj_ptr, field_idx: field_idx + 1)
+  end
+end
+
+export let extract_field_names = fn (fields: [LirNamedAtom]) -> [string] throws { CodegenError } do
+  return extract_field_names_go(fields, acc: [])
+end
+let extract_field_names_go = fn (fields: [LirNamedAtom], acc: [string]) -> [string] throws { CodegenError } do
+  match fields do
+    | [] -> return list.reverse(xs: acc)
+    | LirNamedAtom(name: n, value: _) :: rest ->
+      return extract_field_names_go(fields: rest, acc: n :: acc)
+  end
+end
+
+// Array literals (`[| e0, e1, ... |]`) lower to `LirExprRecord` with field
+// names `"0", "1", ..., "n-1"` (see lower_expr_to_atom MirArray case in
+// src/ir/lir/lir.nx). Detect that shape so the record codegen can emit the
+// packed `(ptr<<32) | len` atom layout that `emit_external_arg(TyArray)`
+// expects, instead of the `i64.extend_i32_u(ptr)` form used by real
+// records. Real records always have alphabetic field names — there is no
+// source syntax that produces a record whose field is literally `"0"`.
+// Empty fields are ambiguous (both `{}` and `[||]` lower to no-fields), so
+// they use the zero-extended-pointer form to avoid corrupting downstream
+// record field-access of `{}` — `[||]` length is a corner case handled
+// separately.
+export let is_array_record = fn (fields: [LirNamedAtom]) -> bool throws { CodegenError } do
+  return is_array_record_go(fields, idx: 0)
+end
+let is_array_record_go = fn (fields: [LirNamedAtom], idx: i64) -> bool throws { CodegenError } do
+  match fields do
+    | [] -> return idx > 0
+    | LirNamedAtom(name: n, value: _) :: rest ->
+      if n == str.from_i64(val: idx) then
+        return is_array_record_go(fields: rest, idx: idx + 1)
+      else return false
+      end
+  end
+end

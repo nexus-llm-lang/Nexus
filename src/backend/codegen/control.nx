@@ -1,0 +1,169 @@
+/**
+ * codegen/control: control-flow leaf helpers and coverage emission.
+ *
+ * Owns:
+ * - lir_atom_eq — structural equality on LirAtom (for hoist detection)
+ * - body_ends_with_hoisted_inner — detect lir.nx ret-hoist pattern
+ * - is_unconditional_return — true when cond is LirAtomBool(true) w/ no else
+ * - emit_default_for_type — push a zero-value for any TypeExpr valtype
+ * - emit_return_value — emit atom + coercion for function return
+ * - build_coverage_section / emit_coverage_entries — nx.coverage.functions payload
+ * - emit_coverage_custom_section — append coverage section to wasm buffer
+ * - emit_coverage_prologue — per-function atomic counter increment
+ *
+ * Does not own:
+ * - emit_if_return_unconditional / emit_if_return_conditional — these call
+ *   emit_stmts and so belong in the emit_expr/emit_stmt SCC in codegen.nx
+ * - The LirStmtIf / LirStmtIfReturn dispatch (see emit_stmt in codegen.nx)
+ *
+ * None of these functions recurse through emit_expr / emit_stmt.
+ */
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { TypeExpr } from "src/common/ast.nx"
+import { Span } from "src/common/token.nx"
+import { LirFunction, LirStmt, LirStmtIfReturn, LirAtom, LirAtomVar, LirAtomInt,
+         LirAtomBool, LirAtomChar, LirAtomString, LirAtomFloat, LirAtomUnit } from "src/ir/lir/types.nx"
+import { CodegenCtx } from "src/backend/codegen/context.nx"
+import { vt_i32, vt_f64,
+         sec_custom,
+         op_i32_const, op_i64_const, op_f64_const,
+         op_return, op_drop }, * as wdefs from "src/backend/wasm/defs.nx"
+import { emit_atom, emit_coercion } from "src/backend/codegen/atom.nx"
+import { Some, None } from "std:option"
+import * as list from "std:list"
+import { CodegenError } from "src/backend/errors.nx"
+
+// when the body of a LirStmtIfReturn already ends with a
+// LirStmtIfReturn whose then_ret matches the outer's then_ret, the outer's
+// trailing op_return would fire with a STALE value on fall-through paths
+// inside the inner conditional. The atom matches because lir.nx hoisted the
+// inner's then_ret up to the outer wrapper via fallback_ret_from_*. Detect
+// the hoist at codegen time and skip the trailing op_return so control falls
+// through naturally to the next branch / function tail.
+export let lir_atom_eq = fn (a: LirAtom, b: LirAtom) -> bool throws { CodegenError } do
+  match a do
+    | LirAtomVar(name: na, typ: _) ->
+      match b do
+        | LirAtomVar(name: nb, typ: _) -> return na == nb
+        | _ -> return false
+      end
+    | LirAtomInt(val: va) ->
+      match b do | LirAtomInt(val: vb) -> return va == vb | _ -> return false end
+    | LirAtomBool(val: va) ->
+      match b do | LirAtomBool(val: vb) -> return va == vb | _ -> return false end
+    | LirAtomChar(val: va) ->
+      match b do | LirAtomChar(val: vb) -> return va == vb | _ -> return false end
+    | LirAtomString(val: va) ->
+      match b do | LirAtomString(val: vb) -> return va == vb | _ -> return false end
+    | LirAtomFloat(val: va) ->
+      match b do | LirAtomFloat(val: vb) -> return va == vb | _ -> return false end
+    | LirAtomUnit ->
+      match b do | LirAtomUnit -> return true | _ -> return false end
+  end
+end
+
+// True iff the last stmt of `stmts` is a LirStmtIfReturn whose `then_ret`
+// atom equals `outer_ret` — i.e., the outer wrapper's return value was
+// hoisted from this inner conditional via lir.nx fallback_ret_from_*.
+export let body_ends_with_hoisted_inner = fn (stmts: [LirStmt], outer_ret: LirAtom) -> bool throws { CodegenError } do
+  match stmts do
+    | [] -> return false
+    | [LirStmtIfReturn(cond: _, then_body: _, then_ret: tr, else_body: _, else_ret: _, ret_type: _)] ->
+      return lir_atom_eq(a: tr, b: outer_ret)
+    | [_] -> return false
+    | _ :: rest -> return body_ends_with_hoisted_inner(stmts: rest, outer_ret)
+  end
+end
+
+export let is_unconditional_return = fn (cond: LirAtom, else_body: [LirStmt], else_ret: Option<LirAtom>) -> bool throws { CodegenError } do
+  if let LirAtomBool(val: true) = cond then
+    let has_else = list.length(xs: else_body) > 0
+    let has_else_ret = if let Some(_) = else_ret then true else false end
+    return !(has_else || has_else_ret)
+  end
+  return false
+end
+
+export let emit_default_for_type = fn (buf: %ByteBuffer, typ: TypeExpr) -> %ByteBuffer throws { CodegenError } do
+  let vt = wdefs.type_to_valtype(typ)
+  if vt == vt_i32 then
+    let %buf = bb.push_byte(%buf, byte: op_i32_const)
+    return bb.push_sleb128(%buf, val: 0)
+  end
+  if vt == vt_f64 then
+    let %buf = bb.push_byte(%buf, byte: op_f64_const)
+    return bb.push_f64_str_le(%buf, s: "0.0")
+  end
+  let %buf = bb.push_byte(%buf, byte: op_i64_const)
+  return bb.push_sleb128(%buf, val: 0)
+end
+
+export let emit_return_value = fn (body: %ByteBuffer, rt: TypeExpr, r: LirAtom, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  if wdefs.is_unit(typ: rt) then return %body end
+  let actual = match r do
+    | LirAtomUnit -> emit_default_for_type(buf: %body, typ: rt)
+    | _ ->
+      let %body = emit_atom(atom: r, buf: %body, ctx)
+      emit_coercion(from_type: wdefs.atom_type(atom: r), to_type: rt, buf: %body)
+  end
+  return actual
+end
+
+/** Build the `nx.coverage.functions` custom section payload.
+ *  Layout: ULEB128 N (function count), then for each function in emission
+ *  order: ULEB128 id, ULEB128 line, length-prefixed UTF-8 name. The id is
+ *  the function's position in the LirFunction list — matches what
+ *  `emit_coverage_prologue` increments. Line comes from the function's span.
+ *  File path is not in LirFunction.span; readers must supply it at parse
+ *  time (typically the input source file). The reader joins this static
+ *  table with the runtime counter array at byte offset cov_counter_base in
+ *  linear memory to produce the per-function call-count report.
+ */
+export let build_coverage_section = fn (funcs: [LirFunction]) -> %ByteBuffer do
+  let %buf = bb.empty()
+  let n = list.length(xs: funcs)
+  let %buf = bb.push_uleb128(%buf, val: n)
+  return emit_coverage_entries(%buf, funcs, func_id: 0)
+end
+
+let emit_coverage_entries = fn (buf: %ByteBuffer, funcs: [LirFunction], func_id: i64) -> %ByteBuffer do
+  match funcs do
+    | [] -> return %buf
+    | LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: sp) :: rest ->
+      match sp do | Span(offset: _, line: ln, col: _) ->
+        let %buf = bb.push_uleb128(%buf, val: func_id)
+        let %buf = bb.push_uleb128(%buf, val: ln)
+        let %buf = wdefs.emit_name(%buf, name: n)
+        return emit_coverage_entries(%buf, funcs: rest, func_id: func_id + 1)
+      end
+  end
+end
+
+/** Append the `nx.coverage.functions` custom section to `buf`. */
+export let emit_coverage_custom_section = fn (buf: %ByteBuffer, funcs: [LirFunction]) -> %ByteBuffer do
+  let %cov_payload = bb.empty()
+  let %cov_payload = wdefs.emit_name(buf: %cov_payload, name: "nx.coverage.functions")
+  let %cov_data = build_coverage_section(funcs)
+  let %cov_payload = bb.push_buf(dst: %cov_payload, src: &cov_data)
+  bb.free(buf: %cov_data)
+  let cov_payload_len = bb.length(buf: &cov_payload)
+  let %buf = bb.push_byte(%buf, byte: sec_custom)
+  let %buf = bb.push_uleb128(%buf, val: cov_payload_len)
+  let %buf = bb.push_buf(dst: %buf, src: &cov_payload)
+  bb.free(buf: %cov_payload)
+  return %buf
+end
+
+/** Emit `i32.atomic.rmw.add(addr, 1); drop` against the per-function counter
+ * cell at `cov_counter_base + 4*func_id`. 5 instructions, 9-10
+ *  wasm bytes (depending on the ULEB encoding of the address).
+ */
+export let emit_coverage_prologue = fn (buf: %ByteBuffer, func_id: i64) -> %ByteBuffer do
+  let addr = wdefs.cov_counter_base + 4 * func_id
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: addr)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 1)
+  let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_rmw_add, offset: 0)
+  return bb.push_byte(%buf, byte: op_drop)
+end
