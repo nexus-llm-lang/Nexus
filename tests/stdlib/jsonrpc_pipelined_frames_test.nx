@@ -1,0 +1,103 @@
+// nexus-sok2: unframe_one preserves the `rest` field, enabling pipelined frames.
+//
+// Before the fix, read_message dropped the `rest` bytes after the first parsed
+// frame. If two JSON-RPC frames arrived in one TCP segment the second was lost.
+//
+// This test exercises the pure framing layer (no I/O) to verify that two
+// concatenated frames can both be extracted in sequence by calling unframe_one
+// twice and threading the `rest` output of the first call as input to the
+// second.
+//
+// Pins:
+//   1. Two frames concatenated → first call to unframe_one yields the first
+//      value and a non-empty `rest`.
+//   2. Calling unframe_one on `rest` yields the second value.
+//   3. Final `rest` after both frames is empty.
+
+import {
+  frame_message, unframe_one,
+  UnframedStep, UnframedNeedMore, UnframedOk
+} from "std:jsonrpc"
+import {
+  JsonValue, JsonNull, JsonInt, JsonString, JsonObject, JsonField
+} from "std:json"
+import * as test_assert from "std:test/assert"
+
+let make_ping = fn (id: i64) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "jsonrpc", value: JsonString(val: "2.0")),
+    JsonField(key: "id",      value: JsonInt(val: id)),
+    JsonField(key: "method",  value: JsonString(val: "ping"))
+  ])
+end
+
+// Extract the "id" integer from a parsed JSON-RPC request, or -1 on failure.
+let scan_for_id = fn (xs: [JsonField], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | JsonField(key: k, value: v) :: rest ->
+      if k == "id" then
+        match v do
+          | JsonInt(val: n) -> return scan_for_id(xs: rest, acc: n)
+          | _ -> return scan_for_id(xs: rest, acc: acc)
+        end
+      end
+      return scan_for_id(xs: rest, acc: acc)
+  end
+end
+
+let extract_id = fn (v: JsonValue) -> i64 do
+  match v do
+    | JsonObject(fields: fs) -> return scan_for_id(xs: fs, acc: -1)
+    | _ -> return -1
+  end
+end
+
+let main = fn () -> unit throws { Exn } do
+  // Build two frames.
+  let msg1 = make_ping(id: 1)
+  let msg2 = make_ping(id: 2)
+  let frame1 = frame_message(value: msg1)
+  let frame2 = frame_message(value: msg2)
+  let pipelined = frame1 ++ frame2
+
+  // First call to unframe_one: extract frame1.
+  match unframe_one(input: pipelined) do
+    | UnframedNeedMore ->
+      throw RuntimeError(val: "expected UnframedOk for first frame but got UnframedNeedMore")
+    | UnframedOk(value: value1, rest: rest1) ->
+      test_assert.assert_eq_i64(
+        actual: extract_id(v: value1),
+        expected: 1,
+        label: "first pipelined frame has id=1"
+      )
+
+      // (1) rest1 must be non-empty (second frame is still in the buffer).
+      test_assert.assert_eq_i64(
+        actual: if rest1 == "" then 0 else 1 end,
+        expected: 1,
+        label: "rest after first frame is non-empty (second frame buffered)"
+      )
+
+      // Second call to unframe_one: extract frame2 from rest1.
+      match unframe_one(input: rest1) do
+        | UnframedNeedMore ->
+          throw RuntimeError(val: "expected UnframedOk for second frame but got UnframedNeedMore")
+        | UnframedOk(value: value2, rest: rest2) ->
+          test_assert.assert_eq_i64(
+            actual: extract_id(v: value2),
+            expected: 2,
+            label: "second pipelined frame has id=2"
+          )
+
+          // (3) Final rest must be empty (no bytes left after both frames).
+          test_assert.assert_eq_string(
+            actual: rest2,
+            expected: "",
+            label: "rest after second frame is empty"
+          )
+      end
+  end
+
+  return ()
+end

@@ -31,6 +31,7 @@ import {
   JsonField, get_field
 } from "std:json"
 import * as list from "std:list"
+import * as str from "std:str"
 import { Option, Some, None } from "std:option"
 import * as lexer from "src/frontend/lexer.nx"
 import * as parser from "src/frontend/parser.nx"
@@ -84,8 +85,9 @@ import {
 } from "src/lsp/protocol/completion.nx"
 import {
   ServerState, DocumentRecord, DocumentStore, HandlerResult,
-  documents_lookup, documents_remove, state_documents,
-  with_documents, with_lifecycle_shutdown,
+  documents_lookup, documents_remove, state_documents, state_cache,
+  with_documents, with_cache, with_lifecycle_shutdown,
+  cache_evict_uri,
   require_object_field
 } from "src/lsp/state/server_state.nx"
 import {
@@ -215,18 +217,38 @@ let extract_text_document_uri = fn (params: JsonValue, ctx: string) -> string th
   end
 end
 
+// Build an empty `textDocument/publishDiagnostics` notification for `uri`.
+// Per LSP spec §`textDocument/publishDiagnostics`, servers SHOULD clear
+// diagnostics for a closed file by publishing an empty `diagnostics` array.
+let make_empty_publish_diagnostics = fn (uri: string) -> JsonValue do
+  let params = JsonObject(fields: [
+    JsonField(key: "uri",         value: JsonString(val: uri)),
+    JsonField(key: "diagnostics", value: JsonArray(items: []))
+  ])
+  return JsonObject(fields: [
+    JsonField(key: "jsonrpc", value: JsonString(val: "2.0")),
+    JsonField(key: "method",  value: JsonString(val: "textDocument/publishDiagnostics")),
+    JsonField(key: "params",  value: params)
+  ])
+end
+
 /** Handles `textDocument/didClose`: drops the record for the URI from the
- *  document store (via `documents_remove`) so subsequent queries on that
- *  buffer return the empty-outline / null fallbacks. No response, no
- *  notifications.
+ *  document store (via `documents_remove`) and the diagnostics cache (via
+ *  `cache_evict_uri`) so the cache does not grow unbounded. Also publishes
+ *  a `textDocument/publishDiagnostics` with `diagnostics:[]` per LSP spec
+ *  §`textDocument/publishDiagnostics` — clients use this to clear stale
+ *  markers on close.
  */
 export let on_did_close = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Console, Fs } throws { LspProtocolError } do
   let uri = extract_text_document_uri(params, ctx: "DidCloseTextDocumentParams")
   let new_docs = documents_remove(store: state_documents(state), uri)
+  let new_cache = cache_evict_uri(cache: state_cache(state), uri)
+  let new_state = with_cache(state: with_documents(state, docs: new_docs), cache: new_cache)
+  let clear_notif = make_empty_publish_diagnostics(uri)
   return HandlerResult(
-    state: with_documents(state, docs: new_docs),
+    state: new_state,
     response: None,
-    notifications: []
+    notifications: [clear_notif]
   )
 end
 
@@ -328,15 +350,22 @@ end
 // the open buffer. Any other position returns JSON `null`, which LSP
 // treats as "no hover info".
 
-let hover_position_line = fn (params: JsonValue) -> i64 throws { LspProtocolError } do
+let hover_position_line_and_char = fn (params: JsonValue) -> Position throws { LspProtocolError } do
   let pos_v = require_object_field(obj: params, key: "position",
     ctx: "HoverParams")
   let line_v = require_object_field(obj: pos_v, key: "line",
     ctx: "HoverParams.position")
-  match line_v do
-    | JsonInt(val: n) -> return n
+  let char_v = require_object_field(obj: pos_v, key: "character",
+    ctx: "HoverParams.position")
+  let line = match line_v do
+    | JsonInt(val: n) -> n
     | _ -> throw LspProtocolError(msg: "HoverParams.position.line: expected integer")
   end
+  let character = match char_v do
+    | JsonInt(val: n) -> n
+    | _ -> throw LspProtocolError(msg: "HoverParams.position.character: expected integer")
+  end
+  return Position(line, character)
 end
 
 let make_markdown_hover = fn (content: string) -> JsonValue do
@@ -349,7 +378,17 @@ let make_markdown_hover = fn (content: string) -> JsonValue do
   ])
 end
 
-let compute_hover_response = fn (doc_opt: Option<DocumentRecord>, line: i64) -> JsonValue do
+// Return the byte length of line 0 (the number of bytes before the first
+// `\n`, or the total byte length if there is no newline). This bounds the
+// character position check for the module doc comment hover on line 0:
+// the comment occupies [0, line0_byte_length) on that line.
+let line0_byte_length = fn (src: string) -> i64 do
+  let nl_pos = str.find_byte(s: src, start: 0, ch: '\n')
+  if nl_pos < 0 then return str.byte_length(s: src) end
+  return nl_pos
+end
+
+let compute_hover_response = fn (doc_opt: Option<DocumentRecord>, line: i64, character: i64) -> JsonValue do
   // Hover only resolves to module doc on line 0; other lines reply null
   // until per-definition doc is wired up (post-MVP).
   if line != 0 then return JsonNull end
@@ -359,28 +398,39 @@ let compute_hover_response = fn (doc_opt: Option<DocumentRecord>, line: i64) -> 
       match rec do | DocumentRecord(uri: _, text, version: _) ->
         match lexer.extract_module_doc(src: text) do
           | None -> return JsonNull
-          | Some(val: doc) -> return make_markdown_hover(content: doc)
+          | Some(val: doc) ->
+            // Check that the cursor character position falls within the
+            // extent of the module doc comment: the entire first line of
+            // text [0, line0_byte_length). Cursor beyond the end of line 0
+            // returns null (LSP clients use this to clear hover popups when
+            // the cursor moves past the comment).
+            let extent = line0_byte_length(text)
+            if character >= extent then return JsonNull end
+            return make_markdown_hover(content: doc)
         end
       end
   end
 end
 
-/** Handles `textDocument/hover`: when the cursor sits on line 0, returns a
+/** Handles `textDocument/hover`: when the cursor sits on line 0 within the
+ *  character extent of the module doc comment, returns a
  *  `Hover { contents: { kind: "markdown", value } }` carrying the file's
- *  module-level `/** ... */` doc comment; any other position (or missing
- *  buffer / missing module doc) replies JSON `null`, which clients render
- *  as "no hover info".
+ *  module-level `/** ... */` doc comment. Cursors on other lines, beyond
+ *  the doc extent, in missing buffers, or where no module doc exists reply
+ *  JSON `null` ("no hover info").
  */
 export let on_hover = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Console, Fs } throws { LspProtocolError } do
   let uri = extract_text_document_uri_strict(params, ctx: "HoverParams")
-  let line = hover_position_line(params)
+  let pos = hover_position_line_and_char(params)
   let doc_opt = documents_lookup(store: state_documents(state), uri)
-  let response = compute_hover_response(doc_opt, line)
-  return HandlerResult(
-    state,
-    response: Some(val: response),
-    notifications: []
-  )
+  match pos do | Position(line, character) ->
+    let response = compute_hover_response(doc_opt, line, character)
+    return HandlerResult(
+      state,
+      response: Some(val: response),
+      notifications: []
+    )
+  end
 end
 
 //

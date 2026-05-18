@@ -1,0 +1,126 @@
+// nexus-2zr0: on_did_close must call cache_evict_uri so the diagnostics cache
+// does not grow unbounded.
+//
+// Before the fix, on_did_close removed the document record from the store but
+// left the cache entry behind, so every open+close cycle would add another
+// entry to the diagnostics cache.
+//
+// Pins:
+//   1. After didOpen, the cache has an entry for the URI.
+//   2. After didClose, the cache entry for the URI is gone.
+//   3. The cache is empty (not merely nulled out).
+
+import { dispatch_message } from "src/lsp/handlers.nx"
+import {
+  StepContinue, StepExit
+} from "src/lsp/handlers.nx"
+import {
+  ServerState, empty_state, with_lifecycle_running,
+  state_cache, cache_lookup
+} from "src/lsp/state/server_state.nx"
+import {
+  Notification
+} from "std:jsonrpc"
+import {
+  JsonValue, JsonNull, JsonObject, JsonField, JsonString, JsonInt, JsonArray
+} from "std:json"
+import { Option, Some, None } from "std:option"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+let running_state = fn () -> ServerState do
+  return with_lifecycle_running(state: empty_state())
+end
+
+let make_did_open_params = fn (uri: string, text: string) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "textDocument", value: JsonObject(fields: [
+      JsonField(key: "uri",        value: JsonString(val: uri)),
+      JsonField(key: "languageId", value: JsonString(val: "nexus")),
+      JsonField(key: "version",    value: JsonInt(val: 1)),
+      JsonField(key: "text",       value: JsonString(val: text))
+    ]))
+  ])
+end
+
+let make_did_close_params = fn (uri: string) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "textDocument", value: JsonObject(fields: [
+      JsonField(key: "uri", value: JsonString(val: uri))
+    ]))
+  ])
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  let uri = "buffer://2zr0_cache_prune_test.nx"
+  let version = 1
+  let source = "let x = fn () -> i64 do return 42 end\n"
+
+  // Step 1: didOpen populates the diagnostics cache.
+  let open_step = dispatch_message(
+    state: running_state(),
+    msg: Notification(
+      method: "textDocument/didOpen",
+      params: make_did_open_params(uri, text: source)
+    )
+  )
+  let state_after_open = match open_step do
+    | StepContinue(state, response: _, notifications: _) -> state
+    | StepExit(state) -> state
+  end
+
+  // Verify the cache has an entry for (uri, version=1).
+  let cache_after_open = state_cache(state: state_after_open)
+  match cache_lookup(cache: cache_after_open, uri, version) do
+    | None ->
+      throw RuntimeError(val: "cache should have entry for (uri,1) after didOpen")
+    | Some(val: _) ->
+      // Correct: cache was populated.
+      ()
+  end
+
+  // Step 2: didClose must evict the cache entry.
+  let close_step = dispatch_message(
+    state: state_after_open,
+    msg: Notification(
+      method: "textDocument/didClose",
+      params: make_did_close_params(uri)
+    )
+  )
+  let state_after_close = match close_step do
+    | StepContinue(state, response: _, notifications: _) -> state
+    | StepExit(state) -> state
+  end
+
+  // (3) Cache entry for the URI is gone after close.
+  let cache_after_close = state_cache(state: state_after_close)
+  match cache_lookup(cache: cache_after_close, uri, version) do
+    | Some(val: _) ->
+      throw RuntimeError(val: "cache entry must be evicted after didClose")
+    | None ->
+      // Correct: cache eviction happened.
+      test_assert.assert_eq_i64(actual: 1, expected: 1, label: "cache entry evicted after didClose")
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end

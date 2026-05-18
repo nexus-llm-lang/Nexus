@@ -1,0 +1,176 @@
+// nexus-f6b9: on_did_close must publish textDocument/publishDiagnostics with
+// diagnostics:[] per LSP spec.
+//
+// Before the fix, on_did_close returned no notifications. Clients would
+// retain stale diagnostic markers after closing a file.
+//
+// Pins:
+//   1. A didClose after didOpen emits exactly one publishDiagnostics
+//      notification.
+//   2. That notification has method "textDocument/publishDiagnostics" and its
+//      params.diagnostics is an empty array.
+
+import { dispatch_message } from "src/lsp/handlers.nx"
+import {
+  StepContinue, StepExit
+} from "src/lsp/handlers.nx"
+import {
+  ServerState, empty_state, with_lifecycle_running
+} from "src/lsp/state/server_state.nx"
+import {
+  Notification
+} from "std:jsonrpc"
+import {
+  JsonValue, JsonNull, JsonObject, JsonField, JsonString, JsonInt, JsonArray,
+  get_field
+} from "std:json"
+import { Option, Some, None } from "std:option"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+let running_state = fn () -> ServerState do
+  return with_lifecycle_running(state: empty_state())
+end
+
+let make_did_open_params = fn (uri: string, text: string) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "textDocument", value: JsonObject(fields: [
+      JsonField(key: "uri",        value: JsonString(val: uri)),
+      JsonField(key: "languageId", value: JsonString(val: "nexus")),
+      JsonField(key: "version",    value: JsonInt(val: 1)),
+      JsonField(key: "text",       value: JsonString(val: text))
+    ]))
+  ])
+end
+
+let make_did_close_params = fn (uri: string) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "textDocument", value: JsonObject(fields: [
+      JsonField(key: "uri", value: JsonString(val: uri))
+    ]))
+  ])
+end
+
+let count_notifications = fn (xs: [JsonValue], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_notifications(xs: rest, acc: acc + 1)
+  end
+end
+
+// Return the method string from a JSON-RPC notification object, or "" on failure.
+let notification_method = fn (v: JsonValue) -> string do
+  match get_field(obj: v, key: "method") do
+    | None -> return ""
+    | Some(val: m) ->
+      match m do
+        | JsonString(val: s) -> return s
+        | _ -> return ""
+      end
+  end
+end
+
+let count_json_array_items = fn (xs: [JsonValue], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_json_array_items(xs: rest, acc: acc + 1)
+  end
+end
+
+// Return params.diagnostics array length from a publishDiagnostics notification.
+// Returns -1 if the shape is unexpected.
+let diag_count_from_notif = fn (v: JsonValue) -> i64 do
+  match get_field(obj: v, key: "params") do
+    | None -> return -1
+    | Some(val: p) ->
+      match get_field(obj: p, key: "diagnostics") do
+        | None -> return -1
+        | Some(val: d) ->
+          match d do
+            | JsonArray(items) -> return count_json_array_items(xs: items, acc: 0)
+            | _ -> return -1
+          end
+      end
+  end
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  let uri = "buffer://f6b9_close_test.nx"
+  let source = "let x = fn () -> i64 do return 1 end\n"
+
+  // Open the document first (registers it in the store).
+  let open_step = dispatch_message(
+    state: running_state(),
+    msg: Notification(
+      method: "textDocument/didOpen",
+      params: make_did_open_params(uri, text: source)
+    )
+  )
+  let state_after_open = match open_step do
+    | StepContinue(state, response: _, notifications: _) -> state
+    | StepExit(state) -> state
+  end
+
+  // Now close the document.
+  let close_step = dispatch_message(
+    state: state_after_open,
+    msg: Notification(
+      method: "textDocument/didClose",
+      params: make_did_close_params(uri)
+    )
+  )
+  match close_step do
+    | StepExit(_) -> throw RuntimeError(val: "didClose must not exit the loop")
+    | StepContinue(state: _, response, notifications) ->
+      // No request-reply for a notification.
+      match response do
+        | Some(val: _) -> throw RuntimeError(val: "didClose must not produce a response")
+        | None -> ()
+      end
+
+      // (1) Exactly one notification emitted.
+      test_assert.assert_eq_i64(
+        actual: count_notifications(xs: notifications, acc: 0),
+        expected: 1,
+        label: "didClose emits exactly one notification"
+      )
+
+      // (2) That notification is publishDiagnostics with an empty array.
+      match notifications do
+        | [] -> throw RuntimeError(val: "expected one notification but got zero")
+        | notif :: _ ->
+          test_assert.assert_eq_string(
+            actual: notification_method(v: notif),
+            expected: "textDocument/publishDiagnostics",
+            label: "didClose notification method is publishDiagnostics"
+          )
+          test_assert.assert_eq_i64(
+            actual: diag_count_from_notif(v: notif),
+            expected: 0,
+            label: "didClose publishDiagnostics has empty diagnostics array"
+          )
+      end
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end

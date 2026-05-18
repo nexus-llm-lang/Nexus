@@ -43,6 +43,7 @@ import { JsonValue, JsonField, JsonNull, JsonInt, JsonString,
          JsonObject, JsonError,
          parse, serialize, get_field } from "std:json"
 import { Option, Some, None } from "std:option"
+import { Pair } from "std:tuple"
 import { Console } from "std:stdio"
 import { ByteBuffer }, * as bb from "std:bytebuffer"
 import * as str from "std:str"
@@ -88,7 +89,7 @@ length advertised in the header is the byte length of the JSON
 serialisation, so multi-byte characters in payload strings count
 correctly.
 */
-let frame_message = fn (value: JsonValue) -> string throws { JsonRpcError } do
+export let frame_message = fn (value: JsonValue) -> string throws { JsonRpcError } do
   let body = serialize(v: value)
   let n = str.byte_length(s: body)
   let header = "Content-Length: " ++ str.from_i64(val: n) ++ "\r\n\r\n"
@@ -222,8 +223,12 @@ Pull at most one framed message off the front of `input`. Returns
 or body shorter than `Content-Length`). Raises JsonRpcFrameError on a
 header that is structurally present but invalid (non-numeric length,
 missing Content-Length, etc.).
+
+The `rest` field of `UnframedOk` is the unconsumed suffix after the
+parsed frame — callers must thread it back into the next `unframe_one`
+call to correctly handle two frames delivered in one TCP segment.
 */
-let unframe_one = fn (input: string) -> UnframedStep throws { JsonRpcError } do
+export let unframe_one = fn (input: string) -> UnframedStep throws { JsonRpcError } do
   let n = byte_length_of(s: input)
   if n == 0 then return UnframedNeedMore end
   let header_end = find_header_end(s: input, p: 0)
@@ -284,10 +289,9 @@ clean EOF (no bytes pending), `Some(value)` on a successful frame. Raises
 `JsonRpcFrameError` when the wire bytes form a structurally invalid frame
 — the dispatch loop catches it and routes to the configured error path.
 
-Surplus bytes after the parsed message are dropped, matching the LSP
-reference clients which never pipeline two requests into a single read.
-Pipelining support would re-enter `drain_until_frame` with the leftover
-`rest` field; not needed for MVP.
+Surplus bytes after the parsed message are dropped. Use
+`read_message_pipelined` when pipelining is required (e.g. two frames
+arriving in one TCP segment).
 */
 export let read_message = fn () -> Option<JsonValue> require { Console } throws { JsonRpcError } do
   try
@@ -298,6 +302,31 @@ export let read_message = fn () -> Option<JsonValue> require { Console } throws 
   catch err ->
     match err do
       | JsonRpcEof -> return None
+      | _ -> throw err
+    end
+  end
+end
+
+/**
+Pipelined variant of `read_message`. Accepts `leftover` bytes from the
+previous call (initially `""`) and returns a `Pair` of:
+  - `left`: `None` on clean EOF, `Some(value)` on a successful frame.
+  - `right`: the unconsumed suffix bytes to pass as `leftover` on the
+    next call.
+
+When two frames arrive in one TCP segment the second frame is preserved
+in `right` rather than discarded, so the dispatch loop can process it
+without a stalling `Console.read_bytes` call.
+*/
+export let read_message_pipelined = fn (leftover: string) -> Pair<Option<JsonValue>, string> require { Console } throws { JsonRpcError } do
+  try
+    match drain_until_frame(acc: leftover) do
+      | UnframedOk(value, rest) -> return Pair(left: Some(val: value), right: rest)
+      | UnframedNeedMore -> throw JsonRpcFrameError(msg: "unframe stalled despite EOF guard")
+    end
+  catch err ->
+    match err do
+      | JsonRpcEof -> return Pair(left: None, right: "")
       | _ -> throw err
     end
   end

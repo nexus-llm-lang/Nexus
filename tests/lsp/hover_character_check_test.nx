@@ -1,0 +1,229 @@
+// nexus-bubn: on_hover must check the character position, not just the line.
+//
+// Before the fix, on_hover returned the module doc comment for any cursor
+// position on line 0, including column 9999 (far beyond the doc comment
+// extent). Per the LSP spec, the hover region should be bounded by the
+// extent of the token being hovered.
+//
+// Pins:
+//   1. Cursor on line 0, character 0 → hover returned (inside the comment).
+//   2. Cursor on line 0, character well beyond line length → JsonNull.
+//   3. Cursor on line 1 → JsonNull (unchanged behavior).
+//   4. Buffer with no module doc: line 0 / char 0 → JsonNull.
+
+import { dispatch_message } from "src/lsp/handlers.nx"
+import {
+  StepContinue, StepExit
+} from "src/lsp/handlers.nx"
+import {
+  ServerState, empty_state, with_lifecycle_running
+} from "src/lsp/state/server_state.nx"
+import {
+  Request, Notification
+} from "std:jsonrpc"
+import {
+  JsonValue, JsonNull, JsonObject, JsonField, JsonString, JsonInt, JsonArray,
+  get_field
+} from "std:json"
+import { Option, Some, None } from "std:option"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+let running_state = fn () -> ServerState do
+  return with_lifecycle_running(state: empty_state())
+end
+
+let make_did_open_params = fn (uri: string, text: string) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "textDocument", value: JsonObject(fields: [
+      JsonField(key: "uri",        value: JsonString(val: uri)),
+      JsonField(key: "languageId", value: JsonString(val: "nexus")),
+      JsonField(key: "version",    value: JsonInt(val: 1)),
+      JsonField(key: "text",       value: JsonString(val: text))
+    ]))
+  ])
+end
+
+let make_hover_params = fn (uri: string, line: i64, character: i64) -> JsonValue do
+  return JsonObject(fields: [
+    JsonField(key: "textDocument", value: JsonObject(fields: [
+      JsonField(key: "uri", value: JsonString(val: uri))
+    ])),
+    JsonField(key: "position", value: JsonObject(fields: [
+      JsonField(key: "line",      value: JsonInt(val: line)),
+      JsonField(key: "character", value: JsonInt(val: character))
+    ]))
+  ])
+end
+
+// Extract the RPC result payload from a response envelope
+// {"jsonrpc":"2.0","id":n,"result":...}. Returns JsonNull on missing "result".
+let rpc_result = fn (v: JsonValue) -> JsonValue do
+  match get_field(obj: v, key: "result") do
+    | None -> return JsonNull
+    | Some(val: r) -> return r
+  end
+end
+
+// Return true if the response envelope's result is JsonNull (no hover).
+let is_null_response = fn (resp: Option<JsonValue>) -> bool do
+  match resp do
+    | None -> return false
+    | Some(val: envelope) ->
+      match rpc_result(v: envelope) do
+        | JsonNull -> return true
+        | _ -> return false
+      end
+  end
+end
+
+// Return true if the response envelope's result is a non-null Hover object with "contents".
+let is_hover_response = fn (resp: Option<JsonValue>) -> bool do
+  match resp do
+    | None -> return false
+    | Some(val: envelope) ->
+      match rpc_result(v: envelope) do
+        | JsonNull -> return false
+        | JsonObject(fields: _) ->
+          let result = rpc_result(v: envelope)
+          match get_field(obj: result, key: "contents") do
+            | Some(val: _) -> return true
+            | None -> return false
+          end
+        | _ -> return false
+      end
+  end
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  let uri_doc = "buffer://bubn_hover_doc_test.nx"
+  // Source with a module doc comment on line 0: "/** doc comment */"
+  // Followed by a let declaration on line 1.
+  let source_with_doc = "/** Module doc comment for hover test. */\nlet x = fn () -> i64 do return 1 end\n"
+
+  // Open the document.
+  let open_step = dispatch_message(
+    state: running_state(),
+    msg: Notification(
+      method: "textDocument/didOpen",
+      params: make_did_open_params(uri: uri_doc, text: source_with_doc)
+    )
+  )
+  let state_with_doc = match open_step do
+    | StepContinue(state, response: _, notifications: _) -> state
+    | StepExit(state) -> state
+  end
+
+  // (1) Cursor on line 0, character 0 — inside the module doc comment.
+  let hover1 = dispatch_message(
+    state: state_with_doc,
+    msg: Request(
+      id: JsonInt(val: 1),
+      method: "textDocument/hover",
+      params: make_hover_params(uri: uri_doc, line: 0, character: 0)
+    )
+  )
+  match hover1 do
+    | StepExit(_) -> throw RuntimeError(val: "hover must not exit")
+    | StepContinue(state: _, response, notifications: _) ->
+      test_assert.assert_eq_i64(
+        actual: if is_hover_response(resp: response) then 1 else 0 end,
+        expected: 1,
+        label: "hover at line 0 char 0 returns Hover object (inside doc comment)"
+      )
+  end
+
+  // (2) Cursor on line 0, character far beyond line length — outside comment.
+  // The doc line "/** Module doc comment for hover test. */" has 41 chars.
+  // Character 9999 is well beyond that.
+  let hover2 = dispatch_message(
+    state: state_with_doc,
+    msg: Request(
+      id: JsonInt(val: 2),
+      method: "textDocument/hover",
+      params: make_hover_params(uri: uri_doc, line: 0, character: 9999)
+    )
+  )
+  match hover2 do
+    | StepExit(_) -> throw RuntimeError(val: "hover must not exit")
+    | StepContinue(state: _, response, notifications: _) ->
+      test_assert.assert_eq_i64(
+        actual: if is_null_response(resp: response) then 1 else 0 end,
+        expected: 1,
+        label: "hover at line 0 char 9999 returns null (outside doc comment extent)"
+      )
+  end
+
+  // (3) Cursor on line 1 — not on the module doc comment line.
+  let hover3 = dispatch_message(
+    state: state_with_doc,
+    msg: Request(
+      id: JsonInt(val: 3),
+      method: "textDocument/hover",
+      params: make_hover_params(uri: uri_doc, line: 1, character: 0)
+    )
+  )
+  match hover3 do
+    | StepExit(_) -> throw RuntimeError(val: "hover must not exit")
+    | StepContinue(state: _, response, notifications: _) ->
+      test_assert.assert_eq_i64(
+        actual: if is_null_response(resp: response) then 1 else 0 end,
+        expected: 1,
+        label: "hover at line 1 returns null"
+      )
+  end
+
+  // (4) Buffer with no module doc: line 0 / char 0 → null.
+  let uri_no_doc = "buffer://bubn_hover_nodoc_test.nx"
+  let source_no_doc = "let y = fn () -> i64 do return 2 end\n"
+  let open_step2 = dispatch_message(
+    state: running_state(),
+    msg: Notification(
+      method: "textDocument/didOpen",
+      params: make_did_open_params(uri: uri_no_doc, text: source_no_doc)
+    )
+  )
+  let state_no_doc = match open_step2 do
+    | StepContinue(state, response: _, notifications: _) -> state
+    | StepExit(state) -> state
+  end
+  let hover4 = dispatch_message(
+    state: state_no_doc,
+    msg: Request(
+      id: JsonInt(val: 4),
+      method: "textDocument/hover",
+      params: make_hover_params(uri: uri_no_doc, line: 0, character: 0)
+    )
+  )
+  match hover4 do
+    | StepExit(_) -> throw RuntimeError(val: "hover must not exit")
+    | StepContinue(state: _, response, notifications: _) ->
+      test_assert.assert_eq_i64(
+        actual: if is_null_response(resp: response) then 1 else 0 end,
+        expected: 1,
+        label: "hover with no module doc returns null"
+      )
+  end
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
