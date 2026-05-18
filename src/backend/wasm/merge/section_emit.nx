@@ -220,7 +220,7 @@ let copy_type_entries_with_off = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i6
   return copy_type_entries_with_off(%out, src, pos: next, remaining: remaining - 1, off)
 end
 
-/** Emit a merged wasm type section: main module's type entries first (their indices unchanged), then the dep's entries offset by `m_count` for every embedded heap-type reference. The single point where the type-index space gets laid out for the merge. */
+/** Emit a merged wasm type section: dep (stdlib) entries first (unchanged, `m_buf`/`m_sec`), then main-module entries offset by `m_count` for every embedded heap-type reference (`d_buf`/`d_sec`). The single point where the type-index space gets laid out for the merge. */
 export let emit_merged_types_inline = fn (d_buf: &ByteBuffer, d_sec: i64, m_buf: &ByteBuffer, m_sec: i64, out: %ByteBuffer) -> %ByteBuffer do
   let %tmp = bb.empty()
   let m_count = count_sec(buf: m_buf, sec_pk: m_sec)
@@ -602,9 +602,12 @@ end
 
 // Iterate name-section subsections; dispatch on subsec id.
 // Subsec 1 (func names) and 2 (local names) get func_idx remapped.
+// Subsec 4 (type), 5 (table), 7 (global) get their index bumped by the
+// corresponding post-merge offset (type_off / tbl_off / glo_off).
 // All other subsecs are pass-through.
 let emit_name_subsecs_go = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64,
-                                 end_pos: i64, remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+                                 end_pos: i64, remap: &ByteBuffer, remap_size: i64,
+                                 type_off: i64, tbl_off: i64, glo_off: i64) -> %ByteBuffer do
   if pos >= end_pos then return %out end
   let sub_id = bb.get_byte(buf: src, idx: pos)
   let pk = rd_uleb(buf: src, pos: pos + 1)
@@ -615,10 +618,49 @@ let emit_name_subsecs_go = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64,
       emit_name_funcsubsec(%out, src, sub_start, remap, remap_size)
     else if sub_id == 2 then
       emit_name_localsubsec(%out, src, sub_start, sub_size, remap, remap_size)
+    else if sub_id == 4 then
+      emit_name_idx_offset_subsec(%out, src, sub_start, sub_id: 4, off: type_off)
+    else if sub_id == 5 then
+      emit_name_idx_offset_subsec(%out, src, sub_start, sub_id: 5, off: tbl_off)
+    else if sub_id == 7 then
+      emit_name_idx_offset_subsec(%out, src, sub_start, sub_id: 7, off: glo_off)
     else
       bb.copy_range(dst: %out, src, start: pos, end_pos: sub_end)
     end
-  return emit_name_subsecs_go(%out, src, pos: sub_end, end_pos, remap, remap_size)
+  return emit_name_subsecs_go(%out, src, pos: sub_end, end_pos, remap, remap_size,
+                                type_off, tbl_off, glo_off)
+end
+
+// Re-emit a simple index-keyed name subsection (type, table, global …):
+// vec<(idx:ULEB, name:ULEB+bytes)> with every idx bumped by `off`.
+// When off == 0 this is a no-op identity rewrite (used for dep module).
+let emit_name_idx_offset_subsec = fn (out: %ByteBuffer, src: &ByteBuffer, sub_start: i64,
+                                        sub_id: i64, off: i64) -> %ByteBuffer do
+  let pk = rd_uleb(buf: src, pos: sub_start)
+  let count = pval(pk)
+  let entries_start = ppos(pk)
+  let %tmp = bb.empty()
+  let %tmp = bb.push_uleb128(buf: %tmp, val: count)
+  let %tmp = emit_name_idx_offset_entries(out: %tmp, src, pos: entries_start, remaining: count, off)
+  let tmp_len = bb.length(buf: &tmp)
+  let %out = bb.push_byte(buf: %out, byte: sub_id)
+  let %out = bb.push_uleb128(buf: %out, val: tmp_len)
+  let %out = bb.push_buf(dst: %out, src: &tmp)
+  bb.free(buf: %tmp)
+  return %out
+end
+let emit_name_idx_offset_entries = fn (out: %ByteBuffer, src: &ByteBuffer, pos: i64,
+                                         remaining: i64, off: i64) -> %ByteBuffer do
+  if remaining <= 0 then return %out end
+  let pk1 = rd_uleb(buf: src, pos)
+  let old_idx = pval(pk: pk1)
+  let after_idx = ppos(pk: pk1)
+  let pk2 = rd_uleb(buf: src, pos: after_idx)
+  let n_len = pval(pk: pk2)
+  let n_end = ppos(pk: pk2) + n_len
+  let %out = bb.push_uleb128(buf: %out, val: old_idx + off)
+  let %out = bb.copy_range(dst: %out, src, start: after_idx, end_pos: n_end)
+  return emit_name_idx_offset_entries(%out, src, pos: n_end, remaining: remaining - 1, off)
 end
 
 // Re-emit subsec 1 (function names): vec<(func_idx:ULEB, name:ULEB+bytes)>.
@@ -697,11 +739,13 @@ let skip_local_inner = fn (src: &ByteBuffer, pos: i64, remaining: i64) -> i64 do
   return skip_local_inner(src, pos: name_end, remaining: remaining - 1)
 end
 
-// Emit a "name" custom section with function indices remapped via `remap`.
+// Emit a "name" custom section with function indices remapped via `remap`
+// and type/table/global indices bumped by their respective offsets.
 // The section-name ULEB-string is copied verbatim; subsections are walked.
 let emit_name_remapped = fn (out: %ByteBuffer, src: &ByteBuffer,
                               content_start: i64, sec_size: i64,
-                              remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+                              remap: &ByteBuffer, remap_size: i64,
+                              type_off: i64, tbl_off: i64, glo_off: i64) -> %ByteBuffer do
   let sec_end = content_start + sec_size
   let pk = rd_uleb(buf: src, pos: content_start)
   let name_len = pval(pk)
@@ -709,7 +753,7 @@ let emit_name_remapped = fn (out: %ByteBuffer, src: &ByteBuffer,
   let %payload = bb.empty()
   let %payload = bb.copy_range(dst: %payload, src, start: content_start, end_pos: name_end)
   let %payload = emit_name_subsecs_go(out: %payload, src, pos: name_end, end_pos: sec_end,
-                                        remap, remap_size)
+                                        remap, remap_size, type_off, tbl_off, glo_off)
   let payload_len = bb.length(buf: &payload)
   let %out = bb.push_byte(buf: %out, byte: 0)
   let %out = bb.push_uleb128(buf: %out, val: payload_len)
@@ -723,25 +767,27 @@ end
 //   * others  → passed through byte-for-byte (DWARF, producers, target_features,
 //     etc.). For .debug_* this is a placeholder — PC-offset rewriting is only
 //     needed when codegen starts emitting DWARF (currently it does not).
-/** Emit every custom section in `customs` (the map from `scan_custom_secs`): the `"name"` section gets its function-index entries remapped through `remap`, every other custom (DWARF, producers, target_features, etc.) passes through byte-for-byte. */
+/** Emit every custom section in `customs` (the map from `scan_custom_secs`): the `"name"` section gets its function-index entries remapped through `remap` and its type/table/global index entries bumped by `type_off`/`tbl_off`/`glo_off`; every other custom (DWARF, producers, target_features, etc.) passes through byte-for-byte. Pass 0 for all three offsets when emitting the dep module's name section (dep indices are unchanged). */
 export let emit_preserved_customs = fn (out: %ByteBuffer, buf: &ByteBuffer, customs: &StringMap,
-                                   remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+                                   remap: &ByteBuffer, remap_size: i64,
+                                   type_off: i64, tbl_off: i64, glo_off: i64) -> %ByteBuffer do
   let total = sm.get_or(map: customs, key: "__count", default: 0)
   return emit_custom_each(%out, buf, customs, idx: 0, total,
-                            remap, remap_size)
+                            remap, remap_size, type_off, tbl_off, glo_off)
 end
 let emit_custom_each = fn (out: %ByteBuffer, buf: &ByteBuffer, customs: &StringMap, idx: i64, total: i64,
-                             remap: &ByteBuffer, remap_size: i64) -> %ByteBuffer do
+                             remap: &ByteBuffer, remap_size: i64,
+                             type_off: i64, tbl_off: i64, glo_off: i64) -> %ByteBuffer do
   if idx >= total then return %out end
   let pk = sm.get_or(map: customs, key: str.from_i64(val: idx), default: 0)
   let content_start = pval(pk)
   let sec_size = ppos(pk)
   let %out = if custom_name_equals(buf, content_start, target: "name") then
       emit_name_remapped(%out, src: buf, content_start, sec_size,
-                          remap, remap_size)
+                          remap, remap_size, type_off, tbl_off, glo_off)
     else
       emit_custom_raw(%out, src: buf, content_start, sec_size)
     end
   return emit_custom_each(%out, buf, customs, idx: idx + 1, total,
-                            remap, remap_size)
+                            remap, remap_size, type_off, tbl_off, glo_off)
 end
