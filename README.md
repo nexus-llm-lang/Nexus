@@ -4,33 +4,33 @@
   <img src="https://raw.githubusercontent.com/nexus-llm-lang/nexus-llm-lang.github.io/main/assets/img/logo/default.png" alt="Nexus Logo" width="80%"/>
 </center>
 
-Nexus is a programming language designed around one observation: **LLMs are strong at literal program constructs but weak at contextual ones.**
+Nexus is a language built around one bet. **LLMs are good at code you can read on the page, and bad at code that depends on what's off the page.**
 
-Implicit control flow, hidden state, and ambient authority are where LLMs (and humans reviewing LLM-generated code) fail. Nexus eliminates these by making every resource, every side effect, and every capability requirement syntactically visible at the point of use.
+Implicit control flow, hidden state, and ambient authority are where LLMs go wrong. Human review misses these spots too. Nexus puts each resource, each side effect, and each cap need in the syntax at the use site.
 
-## Design Thesis
+## Design thesis
 
-Traditional languages rely heavily on *contextual* mechanisms -- garbage collection, implicit conversions, ambient I/O, exception propagation through unmarked call stacks. These are precisely the patterns where LLM-generated code becomes unreliable and human review becomes difficult.
+Mainstream languages lean on *off-page* mechanisms. GC, implicit casts, ambient I/O, exceptions propagating through unmarked call stacks. These are the patterns where LLM-written code goes wrong and where human review fails to catch it.
 
-Nexus inverts this:
+Nexus flips this around:
 
-| Contextual (eliminated) | Literal (introduced) |
+| Off the page (cut) | On the page (Nexus form) |
 |---|---|
-| Implicit resource cleanup (GC) | `%` linear types -- consumed exactly once |
-| Hidden aliasing | `&` borrow -- explicit read-only view |
-| Ambient I/O | `require { Net }` -- declared capability |
-| Implicit control transfer (continuations) | `try/catch` -- traditional unwind semantics |
-| Positional arguments | `add(a: 1, b: 2)` -- mandatory labels |
+| Implicit resource cleanup (GC) | `%` linear types — used once |
+| Hidden aliasing | `&` borrow — a read-only view |
+| Ambient I/O | `require { Net }` — stated up front |
+| Implicit control transfer (continuations) | `try/catch` — old-school unwind |
+| Positional arguments | `add(a: 1, b: 2)` — labels required |
 
-Every resource state, every side effect, every environmental dependency is visible in the source text. Nothing is implied by context.
+Each resource state, each side effect, and each dep on the environment is visible in the source text. Context implies nothing.
 
-## Why Coeffects, Not Effects
+## Why coeffects, and why not effects
 
-Most effect system research focuses on *algebraic effects* -- functions perform effects, and handlers intercept them using delimited continuations. This gives handlers the power to resume, restart, or abort the effectful computation.
+Most of the effect-system literature centers on *algebraic effects*. A function performs an effect, and a handler picks it up through a delimited continuation. The handler decides whether to resume, restart, or abort the effectful work.
 
-Nexus deliberately rejects this model. Continuations are the quintessential *contextual* construct: the control flow depends on what handler happens to be installed at runtime, and the handler's behavior (resume or not) is invisible at the call site.
+Nexus drops that model. A continuation is the quintessential off-page construct. Control flow turns on which handler happens to be installed at runtime, and the handler's resume-or-not behaviour is invisible at the call site.
 
-Instead, Nexus uses **coeffects** -- the `require { ... }` clause declares what capabilities a function *needs from its environment*, not what it *does to* the environment:
+Instead, Nexus uses **coeffects**. The `require { ... }` clause declares what caps a function *needs from its environment*, rather than what it *does to* the environment:
 
 ```nexus
 cap Logger do
@@ -44,7 +44,7 @@ let greet = fn (name: string) -> unit require { Logger, Console } do
 end
 ```
 
-`Logger.info(...)` is a **direct call** to a statically resolved handler method -- not an effect operation that suspends into a continuation. The handler is a plain value implementing an interface:
+`Logger.info(...)` is a **direct call** to a statically resolved handler method. It does not suspend into a continuation. The handler is a plain value that implements an interface:
 
 ```nexus
 let console_logger = handler Logger require { Console } do
@@ -68,11 +68,11 @@ let main = fn () -> unit require { PermConsole } do
 end
 ```
 
-This is dependency injection, not algebraic effect handling. No continuations, no implicit control transfer, no hidden resume points. The only builtin effect is `Exn` (exceptions), handled via traditional `try/catch` with unwind semantics.
+Read this as dep injection rather than algebraic effect handling. There are no continuations, no implicit control transfer, and no hidden resume points. The only builtin effect is `Exn` (the exception type), handled via the usual `try/catch` with unwind semantics.
 
-## Linear Types and Borrowing
+## Linear types and borrowing
 
-Resources that must be properly released -- file handles, server sockets, database connections -- are tracked as **linear types** (`%`). The compiler enforces exactly-once consumption:
+Resources that have to be released — file handles, server sockets, db connections — are tracked as **linear types** (`%`). The compiler enforces once-and-only-once use:
 
 ```nexus
 let %h = Fs.open_read(path: path)
@@ -83,7 +83,7 @@ match %r do
 end
 ```
 
-When you need to read without consuming, **borrow** with `&`:
+When you need to read without consuming, **borrow** the value with `&`:
 
 ```nexus
 let server = Net.listen(addr: addr)
@@ -93,11 +93,11 @@ Net.respond(req: req, ...)         -- req consumed
 Net.stop(server: server)         -- server consumed
 ```
 
-No garbage collector. No implicit drop. The resource lifecycle is visible in the syntax.
+No garbage collector. No implicit drop. The resource lifecycle is on the page.
 
-## Capability-Based Security
+## Cap-based security
 
-Runtime permissions map directly to WASI capabilities:
+Runtime perms map straight to WASI caps:
 
 ```nexus
 let main = fn () -> unit require { PermNet, PermConsole } do
@@ -113,25 +113,25 @@ let main = fn () -> unit require { PermNet, PermConsole } do
 end
 ```
 
-The `require { PermNet, PermConsole }` clause is checked at compile time and enforced at the WASI runtime level. A function cannot perform network I/O unless it declares `PermNet` and a handler is injected.
+The `require { PermNet, PermConsole }` clause is checked at build time and enforced again at the WASI runtime level. A function may do network I/O only when it declares `PermNet` and a handler is injected.
 
 ## Building
 
-The compiler is shipped as a self-extracting POSIX sh + wasm polyglot. Build it locally:
+The compiler ships as a self-extracting POSIX sh + wasm polyglot. Build it locally:
 
 ```bash
 ./bootstrap.sh        # produces ./nexus (polyglot launcher) and ./nexus.wasm
 cp nexus ~/.local/bin/   # or anywhere on PATH
 ```
 
-[wasmtime](https://wasmtime.dev/) must be installed and on `PATH`. Override the wasm runtime via environment:
+[wasmtime](https://wasmtime.dev/) must be installed and on `PATH`. Override the wasm runtime via env vars:
 
 ```bash
 NEXUS_MAX_WASM_STACK=134217728 nexus build foo.nx -o out.wasm   # 128 MiB stack
 NEXUS_WASMTIME_ARGS="-S http,inherit-network" nexus build foo.nx -o out.wasm
 ```
 
-The committed `nexus.wasm` at the repo root is the Stage0 seed of the self-host. Any change under `src/**` or `nxlib/**` must regenerate it via `./bootstrap.sh` and the resulting `nexus.wasm` must be committed alongside the source change; CI enforces `nexus.wasm == stage1.wasm`.
+The committed `nexus.wasm` at the repo root is the Stage0 seed of the self-host. Any change under `src/**` or `nxlib/**` must regenerate it via `./bootstrap.sh`, and the new `nexus.wasm` must land in the same commit. CI enforces `nexus.wasm == stage1.wasm`.
 
 ## Usage
 
@@ -145,7 +145,7 @@ nexus lsp                           # start Language Server (stdio)
 nexus help                          # full subcommand listing
 ```
 
-Compiled programs run under wasmtime with the capabilities they declare:
+Compiled programs run under wasmtime with the caps they declare:
 
 ```bash
 wasmtime run -Scli main.wasm
@@ -174,27 +174,23 @@ end
 
 ## Examples
 
-The [`examples/`](./examples/) directory ships minimal, runnable
-demonstrations of every language surface: linear types and borrowing,
-mutable references, generics, pattern matching, exceptions, capabilities
-and handlers, lazy evaluation, and FFI. Each file is buildable on its
-own with `nexus build examples/<path>` and runnable with
-`nexus run examples/<path>`. See [`examples/README.md`](./examples/README.md)
-for the indexed listing.
+The [examples](./examples) folder ships minimal, runnable demos of every language surface. The demos cover linear types and borrowing, mutable references, generics, pattern matching, exceptions, caps and handlers, lazy evaluation, and FFI.
 
-## AI Coding Agent Support
+Each file builds and runs on its own through the `nexus build` and `nexus run` commands. The README inside that folder gives an indexed listing.
 
-Nexus ships a [Claude Code skill](https://docs.anthropic.com/en/docs/claude-code/skills) that teaches coding agents the language syntax, type system, effect system, and standard library.
+## AI coding agent support
+
+Nexus ships a [Claude Code skill](https://docs.anthropic.com/en/docs/claude-code/skills) that teaches coding agents the language syntax, type system, effect system, and stdlib.
 
 ```bash
 npx skills add nexus-llm-lang/Nexus --skill nexus-lang
 ```
 
-Once installed, Claude Code automatically activates the skill when writing or reviewing `.nx` files.
+Once installed, Claude Code activates the skill as soon as it writes or reviews a `.nx` file.
 
 ## Documentation
 
-Rendered site: **https://nexus-llm-lang.github.io/** (source: [`nexus-llm-lang/nexus-llm-lang.github.io`](https://github.com/nexus-llm-lang/nexus-llm-lang.github.io))
+The rendered site lives at **<https://nexus-llm-lang.github.io/>**. Its source lives in the [`nexus-llm-lang/nexus-llm-lang.github.io`](https://github.com/nexus-llm-lang/nexus-llm-lang.github.io) repo.
 
 | Document | Description |
 |---|---|
