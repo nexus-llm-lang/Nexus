@@ -22,8 +22,11 @@ import * as tcwf from "src/typecheck/tcwf.nx"
 
 /** Run the typechecker over an `HirProgram`: validates every function body, returns the program unchanged on success, raises `TypeError` on any mismatch. `require_main` enables main-signature checks. */
 export let check_program = fn (hir: HirProgram, local_names: [string], require_main: bool) -> HirProgram throws { TypeError } do
-  let HirProgram(ports, functions: funcs, externals: exts, handler_bindings: hbs, enum_defs: edefs, exception_groups: egs, value_binding_names: _, type_defs: tdefs) = hir
-  let enum_entries = build_enum_entries(defs: edefs)
+  let HirProgram(ports, functions: funcs, externals: exts, handler_bindings: hbs, enum_defs: edefs, exception_groups: egs, value_binding_names: _, type_defs: tdefs, visible_enum_names: venms) = hir
+  // D-Export (nexus-8xke): build_enum_entries receives the visible_enum_names
+  // filter so it can strip variants of non-visible enums in the typecheck
+  // VariantIndex. Codegen uses enum_defs directly (full variants preserved).
+  let enum_entries = build_enum_entries(defs: edefs, visible_names: venms)
   let enum_entries2 = add_builtins(entries: enum_entries)
   // TypeDefEntry list lets the unifier expand `TyUserDefined("Foo", _)`
   // into its underlying record shape.
@@ -45,7 +48,7 @@ export let check_program = fn (hir: HirProgram, local_names: [string], require_m
   // dispatch, and extra arms would silently introduce a never-routed name.
   validate_handler_arm_sets(ports, hbs)
   let st4 = register_handler_bindings(state: st3, hbs, ports, exception_groups: egs)
-  let st5 = register_enum_constructors(state: st4, defs: edefs)
+  let st5 = register_enum_constructors(state: st4, defs: edefs, visible_names: venms)
 
   let cont_binder_map = build_cont_binder_map(hbs)
 
@@ -116,11 +119,11 @@ end
 
 // ─── Build enum entries ─────────────────────────────────────────────────────
 
-let build_enum_entries = fn (defs: [EnumDef]) -> [EnumEntry] do
-  return build_enum_entries_go(defs, acc: [])
+let build_enum_entries = fn (defs: [EnumDef], visible_names: [string]) -> [EnumEntry] do
+  return build_enum_entries_go(defs, visible_names, acc: [])
 end
 
-let build_enum_entries_go = fn (defs: [EnumDef], acc: [EnumEntry]) -> [EnumEntry] do
+let build_enum_entries_go = fn (defs: [EnumDef], visible_names: [string], acc: [EnumEntry]) -> [EnumEntry] do
   match defs do
     | [] -> return list.reverse(xs: acc)
     | EnumDef(name: n, is_public: p, is_opaque: o, type_params: tps, variants: vs) :: rest ->
@@ -128,8 +131,14 @@ let build_enum_entries_go = fn (defs: [EnumDef], acc: [EnumEntry]) -> [EnumEntry
       // that infer_constructor's freshen+subst_apply pipeline can rename T to
       // a fresh metavar. Without this, T survives as a frozen UD inside the
       // EnumVariantInfo and downstream unification fails to instantiate it.
-      let converted_vs = convert_variants(variants: vs, vars: tps)
-      return build_enum_entries_go(defs: rest, acc: EnumEntry(name: n, def: EnumDef(name: n, is_public: p, is_opaque: o, type_params: tps, variants: converted_vs)) :: acc)
+      //
+      // D-Export (nexus-8xke): strip variants to [] for non-visible enums so
+      // that find_variant returns None for their constructors in the typecheck
+      // VariantIndex, producing "unknown constructor" errors for importing code.
+      // The codegen VariantIndex uses enum_defs directly (unchanged).
+      let eff_vs = if enum_name_visible(name: n, names: visible_names) then vs else [] end
+      let converted_vs = convert_variants(variants: eff_vs, vars: tps)
+      return build_enum_entries_go(defs: rest, visible_names, acc: EnumEntry(name: n, def: EnumDef(name: n, is_public: p, is_opaque: o, type_params: tps, variants: converted_vs)) :: acc)
   end
 end
 
@@ -748,12 +757,29 @@ end
 
 // ─── Register enum constructors ─────────────────────────────────────────────
 
-let register_enum_constructors = fn (state: CheckState, defs: [EnumDef]) -> CheckState do
+// D-Export (nexus-8xke): only register constructors for enums whose names
+// appear in `visible_names`. Non-visible enums are kept in `enum_defs` for
+// codegen (VariantIndex field layout) but their constructors must not enter
+// the type environment of the importing module.
+let register_enum_constructors = fn (state: CheckState, defs: [EnumDef], visible_names: [string]) -> CheckState do
   match defs do
     | [] -> return state
     | EnumDef(name: ename, is_public: _, is_opaque: _, type_params: tps, variants: vs) :: rest ->
-      let st1 = register_variants(state, enum_name: ename, type_params: tps, variants: vs)
-      return register_enum_constructors(state: st1, defs: rest)
+      let st1 = if enum_name_visible(name: ename, names: visible_names) then
+        register_variants(state, enum_name: ename, type_params: tps, variants: vs)
+      else
+        state
+      end
+      return register_enum_constructors(state: st1, defs: rest, visible_names)
+  end
+end
+
+let enum_name_visible = fn (name: string, names: [string]) -> bool do
+  match names do
+    | [] -> return false
+    | n :: rest ->
+      if n == name then return true end
+      return enum_name_visible(name, names: rest)
   end
 end
 
