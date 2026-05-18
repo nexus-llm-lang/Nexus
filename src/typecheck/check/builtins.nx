@@ -1,0 +1,144 @@
+/**
+ * typecheck/check/builtins: Built-in EnumEntry construction.
+ *
+ * `add_builtins` prepends the compiler-synthesised entries for Exn, List,
+ * Option, and Result. `build_enum_entries` / `build_type_def_entries`
+ * convert raw HIR defs into the checker's internal EnumEntry / TypeDefEntry
+ * form, including TyUserDefined→TyVar conversion for type parameters.
+ */
+
+import * as list from "std:list"
+import { TypeExpr, TyVar, TyUserDefined, TyList, NamedType, EnumDef, RecordDef, VariantDef, VariantField } from "src/common/ast.nx"
+import { EnumEntry, TypeDefEntry } from "src/typecheck/types.nx"
+import { enum_name_visible, convert_ud_to_var, convert_named_types } from "src/typecheck/check/occurs.nx"
+
+// ─── Built-in types ─────────────────────────────────────────────────────────
+
+export let add_builtins = fn (entries: [EnumEntry]) -> [EnumEntry] do
+  let exn = EnumEntry(
+    name: "Exn",
+    def: EnumDef(name: "Exn", is_public: true, is_opaque: false, type_params: [], variants: [])
+  )
+  let list_variants = [
+    VariantDef(name: "Nil", fields: []),
+    VariantDef(name: "Cons", fields: [
+      VariantField(name: Some(val: "v"), typ: TyVar(name: "T")),
+      VariantField(name: Some(val: "rest"), typ: TyList(elem: TyVar(name: "T")))
+    ])
+  ]
+  let list_def = EnumEntry(
+    name: "List",
+    def: EnumDef(name: "List", is_public: true, is_opaque: false,
+      type_params: ["T"], variants: list_variants)
+  )
+  let option_variants = [
+    VariantDef(name: "None", fields: []),
+    VariantDef(name: "Some", fields: [
+      VariantField(name: Some(val: "val"), typ: TyVar(name: "T"))
+    ])
+  ]
+  let option_def = EnumEntry(
+    name: "Option",
+    def: EnumDef(name: "Option", is_public: true, is_opaque: false,
+      type_params: ["T"], variants: option_variants)
+  )
+  // Add Result with Ok/Err — same auto-prelude treatment as Option.
+  let result_variants = [
+    VariantDef(name: "Ok", fields: [
+      VariantField(name: Some(val: "val"), typ: TyVar(name: "T"))
+    ]),
+    VariantDef(name: "Err", fields: [
+      VariantField(name: Some(val: "err"), typ: TyVar(name: "E"))
+    ])
+  ]
+  let result_def = EnumEntry(
+    name: "Result",
+    def: EnumDef(name: "Result", is_public: true, is_opaque: false,
+      type_params: ["T", "E"], variants: result_variants)
+  )
+  return exn :: list_def :: option_def :: result_def :: entries
+end
+
+// ─── Build enum entries ─────────────────────────────────────────────────────
+
+export let build_enum_entries = fn (defs: [EnumDef], visible_names: [string]) -> [EnumEntry] do
+  return build_enum_entries_go(defs, visible_names, acc: [])
+end
+
+let build_enum_entries_go = fn (defs: [EnumDef], visible_names: [string], acc: [EnumEntry]) -> [EnumEntry] do
+  match defs do
+    | [] -> return list.reverse(xs: acc)
+    | EnumDef(name: n, is_public: p, is_opaque: o, type_params: tps, variants: vs) :: rest ->
+      // Convert TyUserDefined("T",[]) → TyVar("T") in variant field types so
+      // that infer_constructor's freshen+subst_apply pipeline can rename T to
+      // a fresh metavar. Without this, T survives as a frozen UD inside the
+      // EnumVariantInfo and downstream unification fails to instantiate it.
+      //
+      // D-Export (nexus-8xke): strip variants to [] for non-visible enums so
+      // that find_variant returns None for their constructors in the typecheck
+      // VariantIndex, producing "unknown constructor" errors for importing code.
+      // The codegen VariantIndex uses enum_defs directly (unchanged).
+      let eff_vs = if enum_name_visible(name: n, names: visible_names) then vs else [] end
+      let converted_vs = convert_variants(variants: eff_vs, vars: tps)
+      return build_enum_entries_go(defs: rest, visible_names, acc: EnumEntry(name: n, def: EnumDef(name: n, is_public: p, is_opaque: o, type_params: tps, variants: converted_vs)) :: acc)
+  end
+end
+
+let convert_variants = fn (variants: [VariantDef], vars: [string]) -> [VariantDef] do
+  return convert_variants_go(variants, vars, acc: [])
+end
+
+let convert_variants_go = fn (variants: [VariantDef], vars: [string], acc: [VariantDef]) -> [VariantDef] do
+  match variants do
+    | [] -> return list.reverse(xs: acc)
+    | VariantDef(name: vn, fields: fs) :: rest ->
+      let cf = convert_variant_fields(fields: fs, vars)
+      return convert_variants_go(variants: rest, vars, acc: VariantDef(name: vn, fields: cf) :: acc)
+  end
+end
+
+let convert_variant_fields = fn (fields: [VariantField], vars: [string]) -> [VariantField] do
+  return convert_variant_fields_go(fields, vars, acc: [])
+end
+
+let convert_variant_fields_go = fn (fields: [VariantField], vars: [string], acc: [VariantField]) -> [VariantField] do
+  match fields do
+    | [] -> return list.reverse(xs: acc)
+    | VariantField(name: mn, typ: t) :: rest ->
+      return convert_variant_fields_go(fields: rest, vars,
+        acc: VariantField(name: mn, typ: convert_ud_to_var(typ: t, vars)) :: acc)
+  end
+end
+
+// ─── Build type-def entries (record-form `type T = { ... }`) ────────────────
+//
+// Convert each RecordDef collected by HIR construction (TLTypeDef arm in
+// src/ir/hir/hir.nx) into a TypeDefEntry so that the unifier can expand
+// `TyUserDefined("T", args)` into its underlying record shape via
+// `unify_typedef_record`. Without this the unifier raises
+// "unknown type definition: T [E2001]" for any annotation referencing T —
+// the bug fixed.
+//
+// Field types are run through `convert_ud_to_var` against the declared type
+// parameters so that bare `TyUserDefined("T", [])` references to type-params
+// become `TyVar("T")`, mirroring the same conversion applied to enum variant
+// fields. Record-form decls in the codebase are currently monomorphic, but
+// the pipeline must already handle the polymorphic case to avoid frozen-UD
+// regressions when generic record types are introduced.
+
+export let build_type_def_entries = fn (defs: [RecordDef]) -> [TypeDefEntry] do
+  return build_type_def_entries_go(defs, acc: [])
+end
+
+let build_type_def_entries_go = fn (defs: [RecordDef], acc: [TypeDefEntry]) -> [TypeDefEntry] do
+  match defs do
+    | [] -> return list.reverse(xs: acc)
+    | RecordDef(name: n, is_public: p, type_params: tps, fields: fs) :: rest ->
+      let converted_fs = convert_named_types(nts: fs, vars: tps)
+      let entry = TypeDefEntry(
+        name: n,
+        def: RecordDef(name: n, is_public: p, type_params: tps, fields: converted_fs)
+      )
+      return build_type_def_entries_go(defs: rest, acc: entry :: acc)
+  end
+end

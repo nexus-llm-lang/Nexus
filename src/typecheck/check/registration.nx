@@ -1,0 +1,504 @@
+/**
+ * typecheck/check/registration: Pass-1 signature registration.
+ *
+ * Registers externals, functions, ports, handler bindings, and enum
+ * constructors into the CheckState environment. Also validates:
+ *   - T-Handler arm/method 1-1 correspondence (validate_handler_arm_sets)
+ *   - T-Handler arm signature cross-validation (nexus-rkun, nexus-00j4)
+ *   - Per-arm wfThrow / wfRef at introduction sites
+ *   - D-Export constructor visibility (nexus-8xke)
+ */
+
+import * as bb from "std:bytebuffer"
+import * as list from "std:list"
+import * as naming from "src/common/naming.nx"
+import { TypeExpr, TyUserDefined, TyVar, TyArrow, TyRow, TyLinear, TyLazy, TyHandler, NamedType, EnumDef, VariantDef, VariantField } from "src/common/ast.nx"
+import { HirFunction, HirParam, HirExternal, HirPort, HirPortMethod, HirHandlerBindingEntry, HirHandlerBinding, HirHandlerArm, ExceptionGroupEntry } from "src/ir/hir/types.nx"
+import { Span } from "src/common/token.nx"
+import { TypeError, TypeMismatch, DuplicateTopLevelBinding } from "src/typecheck/errors.nx"
+import { CheckState, Scheme, EnvEntry, EnumEntry } from "src/typecheck/types.nx"
+import * as tctypes from "src/typecheck/types.nx"
+import * as subst from "src/typecheck/subst.nx"
+import * as tcwf from "src/typecheck/tcwf.nx"
+import {
+  str_list_contains, enum_name_visible,
+  enforce_kindof_quantifiers, named_type_typs,
+  convert_ud_to_var, convert_named_types, convert_type_list,
+  convert_hir_params
+} from "src/typecheck/check/occurs.nx"
+import * as str from "std:str"
+
+// ─── Shared helpers ──────────────────────────────────────────────────────────
+
+export let hir_params_to_named_types = fn (params: [HirParam]) -> [NamedType] do
+  return hir_params_to_named_types_go(params, acc: [])
+end
+
+let hir_params_to_named_types_go = fn (params: [HirParam], acc: [NamedType]) -> [NamedType] do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | HirParam(label: l, name: _, sigil: _, typ: t) :: rest ->
+      return hir_params_to_named_types_go(params: rest, acc: NamedType(name: l, typ: t) :: acc)
+  end
+end
+
+// ─── Register externals ────────────────────────────────────────────────────
+
+export let register_externals = fn (state: CheckState, exts: [HirExternal]) -> CheckState throws { TypeError } do
+  match exts do
+    | [] -> return state
+    | HirExternal(name: n, wasm_module: _, wasm_name: _, type_params: tps, params, ret_type: ret, throw_row: thr) :: rest ->
+      let param_types = hir_params_to_named_types(params)
+      // kindOf binding-site enforcement (spec L548–L571).
+      // Externals carry no Span, so we attribute the diagnostic to the
+      // externals header (Span(0,0,0)) — the func_name plus the type-param
+      // name in the message is enough to locate the malformed declaration.
+      // The σ pieces for an external arrow are exactly (params, ret, throws);
+      // there is no `requires` slot (always `{}` for FFI declarations).
+      let ext_parts = thr :: (ret :: named_type_typs(nts: param_types))
+      enforce_kindof_quantifiers(tps, parts: ext_parts, func_name: n, span: Span(offset: 0, line: 0, col: 0))
+      // D-External gravity rule: ¬escapesRef(τ_r).
+      // Spec: type-system-formal.md §"Gravity Rule" + §D-External.
+      tcwf.enforce_no_escapes_ref(typ: ret, context: "return type of external '" ++ n ++ "'", span: Span(offset: 0, line: 0, col: 0))
+      // D-External wfRef at parameter annotation sites (spec §wfRef L385-400).
+      tcwf.enforce_wf_ref_params(params: param_types, span: Span(offset: 0, line: 0, col: 0))
+      // Convert TyUserDefined("T",[]) → TyVar("T") for declared type params,
+      // then register as a polymorphic Scheme so each call site instantiates
+      // T to a fresh metavar. Without this `external f: <T>(val: T) -> unit`
+      // freezes T as a frozen non-int type and rejects int-literal callers.
+      let arrow = TyArrow(
+        params: convert_named_types(nts: param_types, vars: tps),
+        ret: convert_ud_to_var(typ: ret, vars: tps),
+        requires: TyRow(types: [], rest: None),
+        throw_row: convert_ud_to_var(typ: thr, vars: tps)
+      )
+      let env = tctypes.env_insert(env: tctypes.state_env(state), name: n, scheme: Scheme(vars: tps, typ: arrow))
+      return register_externals(state: tctypes.state_with_env(state, env), exts: rest)
+  end
+end
+
+// ─── Register functions ─────────────────────────────────────────────────────
+
+// track names registered so far to reject same-name redeclaration.
+// Downstream lir_opt mis-resolves `return_call` for shadowed top-level lets
+// and corrupts UNRELATED functions' return atoms; rejecting at typecheck
+// eliminates the bug class entirely.
+export let register_functions = fn (state: CheckState, funcs: [HirFunction], ports: [HirPort], exception_groups: [ExceptionGroupEntry]) -> CheckState throws { TypeError } do
+  return register_functions_go(state, funcs, seen: [], ports, exception_groups)
+end
+
+let register_functions_go = fn (state: CheckState, funcs: [HirFunction], seen: [string], ports: [HirPort], exception_groups: [ExceptionGroupEntry]) -> CheckState throws { TypeError } do
+  match funcs do
+    | [] -> return state
+    | HirFunction(name: n, type_params: tps, params, ret_type: ret, throw_row: tw, body: _, span: sp, file: _, requires: req) :: rest ->
+      if str_list_contains(xs: seen, s: n) then
+        throw DuplicateTopLevelBinding(name: n, span: sp)
+      end
+      // Introduction-site well-formedness checks (T-Lambda fn arrow):
+      // wfCap on the require row and wfThrow on the throws row. Per spec
+      // §1 line 112/116, these are checked here so a typo (`require { Logr }`
+      // for `Logger`) is rejected at the source location rather than
+      // surviving as an uninhabitable row entry until a use site looks
+      // it up — issues (wfCap) and (wfThrow).
+      tcwf.wf_cap(row: req, ports, span: sp)
+      tcwf.wf_throw(row: tw, vidx_: tctypes.state_variant_index(state), groups: exception_groups, span: sp)
+      // T-Lambda / T-Let-PolyFn gravity rule: ¬escapesRef(τ_r).
+      // Checked at the declaration site so a typo such as `fn () -> ref(i64)`
+      // is rejected at the binding, not at a downstream return statement.
+      // Spec: type-system-formal.md §"Gravity Rule" + §T-Lambda.
+      tcwf.enforce_no_escapes_ref(typ: ret, context: "return type of '" ++ n ++ "'", span: sp)
+      let param_types = hir_params_to_named_types(params)
+      // wfRef at parameter annotation sites (spec §wfRef L385-400):
+      // each parameter type ~σ is rejected if σ is linear (TyLinear).
+      tcwf.enforce_wf_ref_params(params: param_types, span: sp)
+      // kindOf binding-site enforcement
+      // (spec L548–L571). σ for a top-level fn is its parameter types,
+      // return type, and throws-row. The `requires` slot is always `{}`
+      // here (HirFunction does not surface a separate requires; row
+      // capability requirements live inside higher-order param signatures
+      // and are already covered by recursion into `param_types`).
+      let parts = tw :: (ret :: named_type_typs(nts: param_types))
+      enforce_kindof_quantifiers(tps, parts, func_name: n, span: sp)
+      let arrow = TyArrow(
+        params: convert_named_types(nts: param_types, vars: tps),
+        ret: convert_ud_to_var(typ: ret, vars: tps),
+        requires: TyRow(types: [], rest: None),
+        throw_row: convert_ud_to_var(typ: tw, vars: tps)
+      )
+      let env = tctypes.env_insert(env: tctypes.state_env(state), name: n, scheme: Scheme(vars: tps, typ: arrow))
+      return register_functions_go(state: tctypes.state_with_env(state, env), funcs: rest, seen: n :: seen, ports, exception_groups)
+  end
+end
+
+// ─── Register ports ─────────────────────────────────────────────────────────
+//
+// D-Port introduction-site wfCap/wfThrow (spec §D-Port line 1647):
+// `∀j∈J. wfCap(α_j) ∧ wfThrow(β_j)` for each declared method signature.
+// HirPortMethod now carries the full require/throw rows from the source
+// FunctionSig, so we can enforce these premises here at registration time.
+export let register_ports = fn (state: CheckState, ports: [HirPort], exception_groups: [ExceptionGroupEntry]) -> CheckState throws { TypeError } do
+  match ports do
+    | [] -> return state
+    | HirPort(name: _, methods) :: rest ->
+      check_port_method_rows(methods, state, exception_groups)
+      return register_ports(state, ports: rest, exception_groups)
+  end
+end
+
+let check_port_method_rows = fn (methods: [HirPortMethod], state: CheckState, exception_groups: [ExceptionGroupEntry]) -> unit throws { TypeError } do
+  match methods do
+    | [] -> return ()
+    | HirPortMethod(name: _, requires: req, span: sp, throw_row: tw, typ_params: _, typ_ret: _) :: rest ->
+      tcwf.wf_cap(row: req, ports: [], span: sp)
+      tcwf.wf_throw(row: tw, vidx_: tctypes.state_variant_index(state), groups: exception_groups, span: sp)
+      return check_port_method_rows(methods: rest, state, exception_groups)
+  end
+end
+
+// ─── Register handler bindings ──────────────────────────────────────────────
+
+export let register_handler_bindings = fn (state: CheckState, hbs: [HirHandlerBindingEntry], ports: [HirPort], exception_groups: [ExceptionGroupEntry]) -> CheckState throws { TypeError } do
+  match hbs do
+    | [] -> return state
+    | HirHandlerBindingEntry(name: n, binding: HirHandlerBinding(port_name: pname, requires: handler_req, arms)) :: rest ->
+      let handler_type = TyHandler(name: pname, requires: handler_req)
+      let env1 = tctypes.env_insert(env: tctypes.state_env(state), name: n, scheme: tctypes.mono(typ: handler_type))
+      let prefix_len = naming.handler_prefix_len(handler_name: n)
+      let env2 = register_handler_methods(env: env1, port_name: pname, prefix_len, arms)
+      // Per-arm wfThrow at the T-Handler introduction site: each arm body
+      // is a HirFunction whose `throw_row` was preserved through HIR, so a
+      // typo like `throws { BogusVariant }` on an arm is rejected here.
+      // The arm's `requires` row is currently empty (handler arms don't
+      // declare per-arm caps), so wfCap there is a no-op until that
+      // syntax exists.
+      check_handler_arm_throw_rows(arms, state, exception_groups)
+      // T-Handler arm signature cross-validation (nexus-rkun, nexus-00j4):
+      // Validate throw_row, ret_type, and params of each arm against the port
+      // method declaration. HirPortMethod now carries params+ret_type (nexus-00j4).
+      validate_handler_arm_throw_rows(handler_name: n, port_name: pname, arms, ports, prefix_len)
+      let st1 = tctypes.state_with_env(state, env: env2)
+      return register_handler_bindings(state: st1, hbs: rest, ports, exception_groups)
+  end
+end
+
+let check_handler_arm_throw_rows = fn (arms: [HirHandlerArm], state: CheckState, exception_groups: [ExceptionGroupEntry]) -> unit throws { TypeError } do
+  match arms do
+    | [] -> return ()
+    | HirHandlerArm(arm: HirFunction(name: _, type_params: _, params: arm_params, ret_type: _, throw_row: tw, body: _, span: sp, file: _, requires: req), cont_binder: _) :: rest ->
+      tcwf.wf_cap(row: req, ports: [], span: sp)
+      tcwf.wf_throw(row: tw, vidx_: tctypes.state_variant_index(state), groups: exception_groups, span: sp)
+      // T-Handler wfRef at parameter annotation sites (spec §wfRef L385-400).
+      let arm_param_types = hir_params_to_named_types(params: arm_params)
+      tcwf.enforce_wf_ref_params(params: arm_param_types, span: sp)
+      return check_handler_arm_throw_rows(arms: rest, state, exception_groups)
+  end
+end
+
+// ─── T-Handler arm/port signature cross-validation (nexus-rkun, nexus-00j4) ──
+// Spec T-Handler: each arm's throw_row, params, and ret_type must match the
+// corresponding port method's declaration.
+//
+// We use structural type equality (subst.type_eq) rather than unification.
+
+let validate_handler_arm_throw_rows = fn (handler_name: string, port_name: string, arms: [HirHandlerArm], ports: [HirPort], prefix_len: i64) -> unit throws { TypeError } do
+  let port_methods = lookup_port_methods_tw(ports, port_name)
+  return validate_arm_sig_go(handler_name, port_name, arms, port_methods, prefix_len)
+end
+
+let validate_arm_sig_go = fn (handler_name: string, port_name: string, arms: [HirHandlerArm], port_methods: [HirPortMethod], prefix_len: i64) -> unit throws { TypeError } do
+  match arms do
+    | [] -> return ()
+    | HirHandlerArm(arm: HirFunction(name: n, type_params: _, params: arm_params, ret_type: arm_ret, throw_row: arm_tw, body: _, span: sp, file: _, requires: _), cont_binder: kb) :: rest ->
+      let original = str.substring(s: n, start: prefix_len, len: str.length(s: n) - prefix_len)
+      match lookup_port_method(methods: port_methods, name: original) do
+        | None ->
+          // Port method not found: already caught by validate_handler_arm_sets; skip.
+          return validate_arm_sig_go(handler_name, port_name, arms: rest, port_methods, prefix_len)
+        | Some(val: method) ->
+          let HirPortMethod(name: _, requires: _, span: _, throw_row: method_tw, typ_params: method_params, typ_ret: method_ret) = method
+          // Validate throw_row (nexus-rkun).
+          if !subst.type_eq(a: arm_tw, b: method_tw) then
+            let detail = bb.concat(parts: [
+              "handler '", handler_name, "' arm '", original,
+              "' throws row does not match port '", port_name,
+              "' method declaration (T-Handler: arm throws must equal port method throws)"
+            ])
+            throw TypeMismatch(func_name: handler_name, detail, span: sp)
+          end
+          // Validate ret_type (nexus-00j4).
+          if !subst.type_eq(a: arm_ret, b: method_ret) then
+            let detail = bb.concat(parts: [
+              "handler '", handler_name, "' arm '", original,
+              "' return type does not match port '", port_name,
+              "' method declaration (T-Handler: arm return type must equal port method return type)"
+            ])
+            throw TypeMismatch(func_name: handler_name, detail, span: sp)
+          end
+          // Validate params (nexus-00j4).
+          // Strip the continuation binder (last param) when present.
+          let user_params = match kb do
+            | Some(_) -> list_init(xs: arm_params)
+            | None -> arm_params
+          end
+          let arm_param_nts = hir_params_to_named_types(params: user_params)
+          let method_param_nts = hir_params_to_named_types(params: method_params)
+          if !check_named_types_eq(a: arm_param_nts, b: method_param_nts) then
+            let detail = bb.concat(parts: [
+              "handler '", handler_name, "' arm '", original,
+              "' parameter types do not match port '", port_name,
+              "' method declaration (T-Handler: arm params must equal port method params)"
+            ])
+            throw TypeMismatch(func_name: handler_name, detail, span: sp)
+          end
+          return validate_arm_sig_go(handler_name, port_name, arms: rest, port_methods, prefix_len)
+      end
+  end
+end
+
+let lookup_port_methods_tw = fn (ports: [HirPort], port_name: string) -> [HirPortMethod] do
+  match ports do
+    | [] -> return []
+    | HirPort(name: n, methods) :: rest ->
+      if n == port_name then return methods end
+      return lookup_port_methods_tw(ports: rest, port_name)
+  end
+end
+
+let lookup_port_method = fn (methods: [HirPortMethod], name: string) -> Option<HirPortMethod> do
+  match methods do
+    | [] -> return None
+    | HirPortMethod(name: n, requires: mreq, span: msp, throw_row: mtw, typ_params: mp, typ_ret: mr) :: rest ->
+      if n == name then return Some(val: HirPortMethod(name: n, requires: mreq, span: msp, throw_row: mtw, typ_params: mp, typ_ret: mr)) end
+      return lookup_port_method(methods: rest, name)
+  end
+end
+
+// Structural equality on NamedType lists: same length, same labels, same types.
+let check_named_types_eq = fn (a: [NamedType], b: [NamedType]) -> bool do
+  match a do
+    | [] -> return if let [] = b then true else false end
+    | NamedType(name: na, typ: ta) :: ra ->
+      match b do
+        | [] -> return false
+        | NamedType(name: nb, typ: tb) :: rb ->
+          if na == nb && subst.type_eq(a: ta, b: tb) then
+            return check_named_types_eq(a: ra, b: rb)
+          end
+          return false
+      end
+  end
+end
+
+let register_handler_methods = fn (env: [EnvEntry], port_name: string, prefix_len: i64, arms: [HirHandlerArm]) -> [EnvEntry] do
+  match arms do
+    | [] -> return env
+    | HirHandlerArm(arm: HirFunction(name: n, type_params: _, params, ret_type: ret, throw_row: tw, _), cont_binder: kb) :: rest ->
+      let original_name = str.substring(s: n, start: prefix_len, len: str.length(s: n) - prefix_len)
+      let method_name = bb.concat(parts: [port_name, ".", original_name])
+      let user_params = match kb do
+        | Some(_) -> list_init(xs: params)
+        | None -> params
+      end
+      let param_types = hir_params_to_named_types(params: user_params)
+      let arrow = TyArrow(
+        params: param_types, ret,
+        requires: TyRow(types: [], rest: None),
+        throw_row: tw
+      )
+      let env1 = tctypes.env_insert(env, name: method_name, scheme: tctypes.mono(typ: arrow))
+      return register_handler_methods(env: env1, port_name, prefix_len, arms: rest)
+  end
+end
+
+let list_init = fn (xs: [HirParam]) -> [HirParam] do
+  match xs do
+    | [] | _ :: [] -> return []
+    | x :: rest -> return x :: list_init(xs: rest)
+  end
+end
+
+// ─── T-Handler arm/method 1-1 correspondence ────────────────────────────────
+// Spec (type-system-formal.md §T-Handler, line 1119):
+//   { ℓ_j | j ∈ J } = { ℓ | (ℓ = e) ∈ overline{ℓ_j = e_j} }
+// The handler literal must supply exactly the methods declared on its port —
+// no missing arm, no extra arm. The earlier impl in this file registered arms
+// (register_handler_bindings / register_handler_methods) and type-checked each
+// arm body individually (check_handler_arm_bodies) without ever comparing the
+// supplied arm-name set against methods(port). That left a missing arm silently
+// admitted (and exposed at runtime as undefined dispatch) and an extra arm
+// silently admitted as dead, unroutable code.
+//
+// We validate set-equality at the top of check_program, before any arm
+// signature/body work happens, so a structurally incomplete handler is rejected
+// with a TypeMismatch keyed off the handler binding's first failing arm span
+// (or the first arm's span if the failure is "missing arm").
+
+/** Spec §T-Handler arm/method 1-1 correspondence (line 1119): rejects
+ *  handlers that supply an extra arm or omit a declared port method. Public
+ *  for direct unit-test against handcrafted (ports, hbs) pairs without
+ *  building a full HirProgram.
+ */
+export let validate_handler_arm_sets = fn (ports: [HirPort], hbs: [HirHandlerBindingEntry]) -> unit throws { TypeError } do
+  match hbs do
+    | [] -> return ()
+    | HirHandlerBindingEntry(name: hname, binding: HirHandlerBinding(port_name: pname, requires: _, arms)) :: rest ->
+      let port_methods = lookup_port_methods(ports, port_name: pname)
+      let prefix_len = naming.handler_prefix_len(handler_name: hname)
+      let supplied = collect_arm_original_names(arms, prefix_len)
+      let arm_span = first_arm_span(arms)
+      check_no_extra_arm(handler_name: hname, port_name: pname, supplied, port_methods, arms, prefix_len)
+      check_no_missing_arm(handler_name: hname, port_name: pname, supplied, port_methods, arm_span)
+      return validate_handler_arm_sets(ports, hbs: rest)
+  end
+end
+
+let lookup_port_methods = fn (ports: [HirPort], port_name: string) -> [string] do
+  match ports do
+    | [] -> return []
+    | HirPort(name: n, methods) :: rest ->
+      if n == port_name then return port_method_names(methods) end
+      return lookup_port_methods(ports: rest, port_name)
+  end
+end
+
+let port_method_names = fn (methods: [HirPortMethod]) -> [string] do
+  match methods do
+    | [] -> return []
+    | HirPortMethod(name: n, requires: _, span: _, throw_row: _, typ_params: _, typ_ret: _) :: rest -> return n :: port_method_names(methods: rest)
+  end
+end
+
+let collect_arm_original_names = fn (arms: [HirHandlerArm], prefix_len: i64) -> [string] do
+  match arms do
+    | [] -> return []
+    | HirHandlerArm(arm: HirFunction(name: n, _), cont_binder: _) :: rest ->
+      let original = str.substring(s: n, start: prefix_len, len: str.length(s: n) - prefix_len)
+      return original :: collect_arm_original_names(arms: rest, prefix_len)
+  end
+end
+
+let first_arm_span = fn (arms: [HirHandlerArm]) -> Span do
+  match arms do
+    | [] -> return Span(offset: 0, line: 0, col: 0)
+    | HirHandlerArm(arm: HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span, file: _), cont_binder: _) :: _ -> return span
+  end
+end
+
+let check_no_extra_arm = fn (handler_name: string, port_name: string, supplied: [string], port_methods: [string], arms: [HirHandlerArm], prefix_len: i64) -> unit throws { TypeError } do
+  match arms do
+    | [] -> return ()
+    | HirHandlerArm(arm: HirFunction(name: n, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span, file: _), cont_binder: _) :: rest ->
+      let original = str.substring(s: n, start: prefix_len, len: str.length(s: n) - prefix_len)
+      if str_list_contains(xs: port_methods, s: original) then
+        return check_no_extra_arm(handler_name, port_name, supplied, port_methods, arms: rest, prefix_len)
+      end
+      let detail = bb.concat(parts: [
+        "handler '", handler_name, "' for port '", port_name,
+        "' supplies arm '", original,
+        "' which is not declared as a method of port '", port_name,
+        "' (T-Handler arm/method 1-1 correspondence: no extra arm)"
+      ])
+      throw TypeMismatch(func_name: handler_name, detail, span)
+  end
+end
+
+let check_no_missing_arm = fn (handler_name: string, port_name: string, supplied: [string], port_methods: [string], arm_span: Span) -> unit throws { TypeError } do
+  match port_methods do
+    | [] -> return ()
+    | m :: rest ->
+      if str_list_contains(xs: supplied, s: m) then
+        return check_no_missing_arm(handler_name, port_name, supplied, port_methods: rest, arm_span)
+      end
+      let detail = bb.concat(parts: [
+        "handler '", handler_name, "' for port '", port_name,
+        "' is missing arm for declared method '", m,
+        "' (T-Handler arm/method 1-1 correspondence: no missing arm)"
+      ])
+      throw TypeMismatch(func_name: handler_name, detail, span: arm_span)
+  end
+end
+
+// ─── Register enum constructors ─────────────────────────────────────────────
+
+// D-Export (nexus-8xke): only register constructors for enums whose names
+// appear in `visible_names`. Non-visible enums are kept in `enum_defs` for
+// codegen (VariantIndex field layout) but their constructors must not enter
+// the type environment of the importing module.
+export let register_enum_constructors = fn (state: CheckState, defs: [EnumDef], visible_names: [string]) -> CheckState do
+  match defs do
+    | [] -> return state
+    | EnumDef(name: ename, is_public: _, is_opaque: _, type_params: tps, variants: vs) :: rest ->
+      let st1 = if enum_name_visible(name: ename, names: visible_names) then
+        register_variants(state, enum_name: ename, type_params: tps, variants: vs)
+      else
+        state
+      end
+      return register_enum_constructors(state: st1, defs: rest, visible_names)
+  end
+end
+
+// `is_local` is used by check_all_functions in check.nx.
+// Exposed here alongside the registration helpers for linear-name checking.
+export let is_local = fn (name: string, local_names: [string]) -> bool do
+  match local_names do
+    | [] -> return false
+    | n :: rest ->
+      if n == name then return true end
+      return is_local(name, local_names: rest)
+  end
+end
+
+let register_variants = fn (state: CheckState, enum_name: string, type_params: [string], variants: [VariantDef]) -> CheckState do
+  match variants do
+    | [] -> return state
+    | VariantDef(name: vname, fields) :: rest ->
+      let enum_type = build_enum_type_from_params(name: enum_name, params: type_params)
+      let ctor_type = match fields do
+        | [] -> enum_type
+        | _ ->
+          let param_types = variant_fields_to_named_types(fields, idx: 0)
+          TyArrow(
+            params: param_types, ret: enum_type,
+            requires: TyRow(types: [], rest: None),
+            throw_row: TyRow(types: [], rest: None)
+          )
+      end
+      let env = tctypes.env_insert(env: tctypes.state_env(state), name: vname, scheme: tctypes.mono(typ: ctor_type))
+      return register_variants(state: tctypes.state_with_env(state, env), enum_name, type_params, variants: rest)
+  end
+end
+
+let build_enum_type_from_params = fn (name: string, params: [string]) -> TypeExpr do
+  match params do
+    | [] -> return TyUserDefined(name, args: [])
+    | _ -> return TyUserDefined(name, args: params_to_vars(params))
+  end
+end
+
+let params_to_vars = fn (params: [string]) -> [TypeExpr] do
+  return params_to_vars_go(params, acc: [])
+end
+
+let params_to_vars_go = fn (params: [string], acc: [TypeExpr]) -> [TypeExpr] do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | p :: rest ->
+      return params_to_vars_go(params: rest, acc: TyVar(name: p) :: acc)
+  end
+end
+
+let variant_fields_to_named_types = fn (fields: [VariantField], idx: i64) -> [NamedType] do
+  return variant_fields_to_named_types_go(fields, idx, acc: [])
+end
+
+let variant_fields_to_named_types_go = fn (fields: [VariantField], idx: i64, acc: [NamedType]) -> [NamedType] do
+  match fields do
+    | [] -> return list.reverse(xs: acc)
+    | VariantField(name: mname, typ: t) :: rest ->
+      let fname = match mname do
+        | Some(val: n) -> n
+        | None -> "_" ++ str.from_i64(val: idx)
+      end
+      return variant_fields_to_named_types_go(fields: rest, idx: idx + 1, acc: NamedType(name: fname, typ: t) :: acc)
+  end
+end

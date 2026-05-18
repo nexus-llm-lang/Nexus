@@ -1,0 +1,152 @@
+/**
+ * typecheck/check/main_validation: validate_main + require/throw row checks.
+ *
+ * Validates that `main` exists, has a `() -> unit` signature, and that its
+ * declared requires-row ⊆ SysCaps and throws-row is wrappable by main_wrap.
+ */
+
+import { TypeExpr, TyUnit, TyUserDefined, TyVar, TyRow } from "src/common/ast.nx"
+import { HirFunction } from "src/ir/hir/types.nx"
+import { TypeError, MissingMain, MainNotFunction, MainNotUnit, MainThrowsTooBroad, MainRequiresTooBroad } from "src/typecheck/errors.nx"
+import { CheckState } from "src/typecheck/types.nx"
+import * as tctypes from "src/typecheck/types.nx"
+import * as subst from "src/typecheck/subst.nx"
+import * as tcwf from "src/typecheck/tcwf.nx"
+
+/** Validates that `main` exists, is a `() -> unit` (or `[string] -> unit`)
+ *  arrow, and that its declared throws-row is one the runtime can wrap.
+ *
+ *  The HIR main-wrap pass (`src/ir/main_wrap.nx`) replaces a wrappable
+ *  non-empty main with a synthesised wrapper whose throws are `{}`, so by
+ *  the time validate_main runs the row is normally either empty (nothing
+ *  to wrap) or post-wrap empty. The wrap pass intentionally leaves
+ *  unwrappable rows intact — open rows, rows with a free type variable,
+ *  or rows containing non-exception entries — and validate_main rejects
+ *  them here as `MainThrowsTooBroad`.
+ */
+export let validate_main = fn (state: CheckState, funcs: [HirFunction]) -> unit throws { TypeError } do
+  // The type environment registers TyArrow with requires: TyRow([],None)
+  // for every function (register_functions_go L538). The HirFunction.requires
+  // field carries the source-level require row and must be consulted directly.
+  //
+  // When main_wrap synthesises a wrapper, the original main is renamed to
+  // `__nx_user_main` (requires row preserved). Check that first.
+  match find_func_requires(name: "__nx_user_main", funcs) do
+    | Some(val: user_req) -> validate_main_require_row(require_row: user_req)
+    | None -> ()
+  end
+  match tctypes.env_lookup(env: tctypes.state_env(state), name: "main") do
+    | None ->
+      throw MissingMain
+    | Some(val: Scheme(vars: _, typ: main_type)) ->
+      match main_type do
+        | TyArrow(params: _, ret, requires: _, throw_row: tw) ->
+          if subst.type_eq(a: ret, b: TyUnit) then
+            // Check the HirFunction.requires directly (env value is always empty).
+            match find_func_requires(name: "main", funcs) do
+              | Some(val: req) -> validate_main_require_row(require_row: req)
+              | None -> ()
+            end
+            return validate_main_throw_row(throw_row: tw)
+          end
+          throw MainNotUnit
+        | _ ->
+          throw MainNotFunction
+      end
+  end
+end
+
+/** Look up a HirFunction by name and return its source-level require row,
+ *  or None if not found.
+ */
+let find_func_requires = fn (name: string, funcs: [HirFunction]) -> Option<TypeExpr> do
+  match funcs do
+    | [] -> return None
+    | HirFunction(name: n, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span: _, file: _, requires: req) :: rest ->
+      if n == name then return Some(val: req) end
+      return find_func_requires(name, funcs: rest)
+  end
+end
+
+/** Enforce spec P9 wfMain: ρ_q ⊆ SysCaps.
+ *  main's require row may only contain system capabilities. User-declared
+ *  port names are rejected because there is no enclosing inject at the
+ *  program entry point to provide them.
+ *  Empty rows and implicit-tail rows (`__implicit`) are accepted.
+ */
+let validate_main_require_row = fn (require_row: TypeExpr) -> unit throws { TypeError } do
+  match require_row do
+    | TyRow(types: ts, rest: _) ->
+      return validate_main_require_row_entries(entries: ts)
+    | TyUnit -> return ()
+    | _ -> return ()
+  end
+end
+
+let validate_main_require_row_entries = fn (entries: [TypeExpr]) -> unit throws { TypeError } do
+  match entries do
+    | [] -> return ()
+    | t :: rest ->
+      validate_main_require_row_entry(entry: t)
+      return validate_main_require_row_entries(entries: rest)
+  end
+end
+
+let validate_main_require_row_entry = fn (entry: TypeExpr) -> unit throws { TypeError } do
+  match entry do
+    | TyUserDefined(name: n, args: _) ->
+      if tcwf.is_sys_cap(name: n) then return () end
+      throw MainRequiresTooBroad(port_name: n)
+    | _ -> return ()
+  end
+end
+
+/** Reject throws-rows the main-wrap pass cannot handle: open rows, rows
+ *  whose entries are not named exception (group) variants, or rows that
+ *  have collapsed to a free type variable. Empty rows and closed rows of
+ *  named entries (concrete exceptions, exception groups, or the universal
+ *  `Exn`) are accepted — the wrap pass routes them through a match-on-Exn
+ *  with a wildcard arm.
+ */
+let validate_main_throw_row = fn (throw_row: TypeExpr) -> unit throws { TypeError } do
+  match throw_row do
+    | TyRow(types: ts, rest: r) ->
+      match r do
+        // Implicit absent-throws row: `parse_optional_throws` encodes a missing
+        // `throws` clause as `TyRow([], Some(TyVar("__implicit")))`.  Treat it
+        // the same as a closed empty row for main-wrap validation purposes.
+        | Some(val: TyVar(name: "__implicit")) ->
+          return validate_main_throw_row_entries(entries: ts)
+        | Some(_) -> throw MainThrowsTooBroad(detail: "open row (rest tail) is not permitted")
+        | None -> return validate_main_throw_row_entries(entries: ts)
+      end
+    | TyUnit -> return ()
+    | _ -> throw MainThrowsTooBroad(detail: "throws-row must be a closed row, got non-row type")
+  end
+end
+
+let validate_main_throw_row_entries = fn (entries: [TypeExpr]) -> unit throws { TypeError } do
+  match entries do
+    | [] -> return ()
+    | t :: rest ->
+      validate_main_throw_row_entry(entry: t)
+      return validate_main_throw_row_entries(entries: rest)
+  end
+end
+
+let validate_main_throw_row_entry = fn (entry: TypeExpr) -> unit throws { TypeError } do
+  match entry do
+    | TyUserDefined(name: _, args: _) ->
+      // Concrete exceptions, exception groups, and the universal `Exn` are
+      // all admitted: the main-wrap pass synthesises a match-on-Exn with a
+      // wildcard arm that handles any variant. Note that the pass *replaces*
+      // the user's main with a `throws {}` wrapper, so this entry is only
+      // reached for `__nx_user_main` (which validate_main does not visit) or
+      // for the unwrappable cases left intact below.
+      return ()
+    | TyVar(name: _) ->
+      throw MainThrowsTooBroad(detail: "throws-row contains a free type variable; resolve before reaching main")
+    | _ ->
+      throw MainThrowsTooBroad(detail: "throws-row entry is not a named exception or group")
+  end
+end
