@@ -1,0 +1,209 @@
+/**
+ * codegen/intrinsics/threads: lazy/WASI-threads type-puns, backtrace stubs,
+ * and array indexing intrinsics.
+ *
+ * Owns:
+ * - `emit_lazy_passthrough` — thunk-addr / value-of-i64 pure type puns.
+ * - `emit_bt_depth` / `emit_bt_frame` — backtrace ring-buffer readers.
+ * - `emit_bt_push_prologue` — function-entry instrumentation (push depth+name).
+ * - `emit_bt_raise_snapshot` — throw-site depth snapshot (depth → saved_depth).
+ * - `emit_capture_backtrace` — legacy stub (drops args, emits nothing).
+ * - `emit_array_get` / `emit_array_set` / `emit_array_length` — inline array
+ *   indexing over the packed `(ptr<<32)|len` array atom layout.
+ */
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { LirCallArg } from "src/ir/lir/types.nx"
+import { CodegenCtx } from "src/backend/codegen/context.nx"
+import { op_i32_const, op_i64_const,
+         op_i32_wrap_i64, op_i64_extend_i32_u,
+         op_i64_shr_u, op_i64_and,
+         op_i32_mul, op_i32_add,
+         op_i64_load, op_i64_store,
+         op_drop }, * as wdefs from "src/backend/wasm/defs.nx"
+import { emit_atom } from "src/backend/codegen/atom.nx"
+import { SymbolNotFound, CodegenError, SkIntrinsicArg } from "src/backend/errors.nx"
+
+// ─── Lazy / WASI-threads intrinsics ─────────────────────────────────────────
+
+/**
+`__nx_thunk_addr(t: @T) -> i64` / `__nx_value_of_i64(x: i64) -> T`: both are
+pure type puns at the WASM level (every Nexus value is an i64). Emit the
+argument atom and nothing else.
+*/
+export let emit_lazy_passthrough = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ -> return emit_atom(atom: a, %buf, ctx)
+    | _ ->
+      throw SymbolNotFound(name: "__nx_lazy_passthrough", kind: SkIntrinsicArg, context: "")
+      return %buf
+  end
+end
+
+// ─── Backtrace intrinsics ─────────────────────────────────────────────────────
+
+/** `__nx_bt_depth() -> i64`: returns the depth saved at the last throw. */
+export let emit_bt_depth = fn (buf: %ByteBuffer) -> %ByteBuffer do
+  // i32.const bt_page_base; i32.atomic.load offset=bt_saved_depth_offset; i64.extend_i32_u
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: wdefs.bt_page_base)
+  let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_load,
+                                       offset: wdefs.bt_saved_depth_offset)
+  return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+end
+
+/**
+`__nx_bt_frame(idx: i64) -> string`: load packed `(ptr<<32)|len` from
+ring slot `(idx & 63)`. Returns 0 (empty string) for slots that were
+never written. Caller (`backtrace()` in exn.nx) bounds idx by saved_depth.
+*/
+export let emit_bt_frame = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      // Stack: idx (i64)
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      // idx -> i32, mask & 63, shift << 3, add ring base, load i64
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: 63)
+      let %buf = bb.push_byte(%buf, byte: wdefs.op_i32_and)
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: 3)
+      let %buf = bb.push_byte(%buf, byte: wdefs.op_i32_shl)
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: wdefs.bt_page_base + wdefs.bt_ring_offset)
+      let %buf = bb.push_byte(%buf, byte: wdefs.op_i32_add)
+      let %buf = bb.push_byte(%buf, byte: op_i64_load)
+      return wdefs.emit_memarg_i64(%buf, offset: 0)
+    | _ ->
+      throw SymbolNotFound(name: "__nx_bt_frame", kind: SkIntrinsicArg, context: "")
+      return %buf
+  end
+end
+
+/**
+Emit a function-entry prologue that atomically increments `depth` and
+stores `packed_name` into `ring[old_depth & 63]`. Called from
+compile_function_body when EffectMap.can_throw is true (V1).
+*/
+export let emit_bt_push_prologue = fn (buf: %ByteBuffer, packed_name: i64) -> %ByteBuffer do
+  // Pre-load ring base (will receive computed offset).
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: wdefs.bt_page_base + wdefs.bt_ring_offset)
+  // Atomically increment depth, get old value on stack.
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: wdefs.bt_page_base)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 1)
+  let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_rmw_add,
+                                       offset: wdefs.bt_depth_offset)
+  // old_depth & 63, << 3, + ring_base
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 63)
+  let %buf = bb.push_byte(%buf, byte: wdefs.op_i32_and)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 3)
+  let %buf = bb.push_byte(%buf, byte: wdefs.op_i32_shl)
+  let %buf = bb.push_byte(%buf, byte: wdefs.op_i32_add)
+  // Store packed_name at computed slot.
+  let %buf = bb.push_byte(%buf, byte: op_i64_const)
+  let %buf = bb.push_sleb128(%buf, val: packed_name)
+  let %buf = bb.push_byte(%buf, byte: op_i64_store)
+  return wdefs.emit_memarg_i64(%buf, offset: 0)
+end
+
+/**
+Emit a throw-site snapshot: copy `depth` → `saved_depth` so __nx_bt_depth
+and __nx_bt_frame surface the call stack as it was when the throw fired.
+Called from LirExprRaise emission BEFORE op_throw (V1).
+*/
+export let emit_bt_raise_snapshot = fn (buf: %ByteBuffer) -> %ByteBuffer do
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: wdefs.bt_page_base)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: wdefs.bt_page_base)
+  let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_load,
+                                       offset: wdefs.bt_depth_offset)
+  return wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_store,
+                                  offset: wdefs.bt_saved_depth_offset)
+end
+
+let drop_all_args = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | [] -> return %buf
+    | LirCallArg(label: _, value: a) :: rest ->
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_drop)
+      return drop_all_args(args: rest, %buf, ctx)
+  end
+end
+
+/** `capture-backtrace(...) -> unit` — legacy stub kept only because the external still lingers symbolically; the real snapshot now happens via `emit_bt_raise_snapshot` at the throw site. Drops every arg and emits no other instructions. */
+export let emit_capture_backtrace = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  return drop_all_args(args, %buf, ctx)
+end
+
+// ─── Array intrinsics ────────────────────────────────────────────────────────
+
+/** `__array_get(arr, idx)` — inline body for `arr[idx]` indexing: extract the upper-32 pointer from the packed array atom, add `(idx + 1) * 8`, and `i64.load` the slot. Never registered as a real wasm import. */
+export let emit_array_get = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: arr_atom) :: LirCallArg(label: _, value: idx_atom) :: _ ->
+      let %buf = emit_atom(atom: arr_atom, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 32)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i64_shr_u, op_i32_wrap_i64])
+      let %buf = emit_atom(atom: idx_atom, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_i32_const])
+      let %buf = bb.push_sleb128(%buf, val: 8)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_mul, op_i32_const])
+      let %buf = bb.push_sleb128(%buf, val: 8)
+      let %buf = bb.push_byte(%buf, byte: op_i32_add)
+      let %buf = bb.push_byte(%buf, byte: op_i32_add)
+      let %buf = bb.push_byte(%buf, byte: op_i64_load)
+      return wdefs.emit_memarg_i64(%buf, offset: 0)
+    | _ ->
+      throw SymbolNotFound(name: "__array_get", kind: SkIntrinsicArg, context: "expected (arr, idx)")
+      return %buf
+  end
+end
+
+/** `__array_set(arr, idx, val)` — write counterpart to `__array_get`. Returns unit and must leave the stack untouched (no synthetic push/drop) so `emit_stmt`'s TyUnit branch composes correctly; the pointer-extract shift mirrors `emit_array_get` to avoid landing writes in the length cell. */
+export let emit_array_set = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: arr_atom) :: LirCallArg(label: _, value: idx_atom) :: LirCallArg(label: _, value: val_atom) :: _ ->
+      // Address: ptr (from `arr_atom >> 32`) + ((idx + 1) * 8). A bare
+      // i32_wrap_i64 here would give the LEN low half and land writes in
+      // the length cell; the shift mirrors emit_array_get.
+      let %buf = emit_atom(atom: arr_atom, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 32)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i64_shr_u, op_i32_wrap_i64])
+      let %buf = emit_atom(atom: idx_atom, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_wrap_i64, op_i32_const])
+      let %buf = bb.push_sleb128(%buf, val: 8)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_mul, op_i32_const])
+      let %buf = bb.push_sleb128(%buf, val: 8)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i32_add, op_i32_add])
+      let %buf = emit_atom(atom: val_atom, %buf, ctx)
+      // i64.store leaves no stack value (matches TyUnit return).
+      let %buf = bb.push_byte(%buf, byte: op_i64_store)
+      return wdefs.emit_memarg_i64(%buf, offset: 0)
+    | _ ->
+      throw SymbolNotFound(name: "__array_set", kind: SkIntrinsicArg, context: "expected (arr, idx, val)")
+      return %buf
+  end
+end
+
+/** `array-length(arr) -> i64` — extract the low-32 length from the packed array atom; emits `i64.and 0xFFFFFFFF` after pushing the atom. */
+export let emit_array_length = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: arr_atom) :: _ ->
+      let %buf = emit_atom(atom: arr_atom, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: 4294967295)
+      return bb.push_byte(%buf, byte: op_i64_and)
+    | _ ->
+      throw SymbolNotFound(name: "array-length", kind: SkIntrinsicArg, context: "expected (arr)")
+      return %buf
+  end
+end

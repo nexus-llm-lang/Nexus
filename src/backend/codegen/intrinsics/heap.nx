@@ -1,0 +1,84 @@
+/**
+ * codegen/intrinsics/heap: bump-allocator (arena) inline intrinsics.
+ *
+ * Owns the four arena ops: `heap-mark` (read bump pointer), `heap-reset`
+ * (restore a previous mark), `heap-swap` (atomic load-then-store), and
+ * `alloc-raw` (bump-allocate `size` bytes). All operate on the unified
+ * atomic bump cell at `wdefs.heap_ptr_cell`.
+ */
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { LirCallArg } from "src/ir/lir/types.nx"
+import { CodegenCtx, ctx_temps_base } from "src/backend/codegen/context.nx"
+import { op_i32_const, op_i64_extend_i32_u, op_i32_wrap_i64, op_local_get }, * as wdefs from "src/backend/wasm/defs.nx"
+import { emit_atom, emit_atomic_bump } from "src/backend/codegen/atom.nx"
+import { SymbolNotFound, CodegenError, SkIntrinsicArg } from "src/backend/errors.nx"
+
+/** Emit inline WASM for the bump-allocator (arena) intrinsics.
+ *
+ *  Since the allocator is now a single atomic bump pointer at linear-memory
+ *  cell `wdefs.heap_ptr_cell`, a region "mark" *is* the bump-pointer value:
+ *  `heap_mark` reads the cell, `heap_reset` stores a previous value back,
+ *  and `heap_swap` does both (returning the old). All three operate
+ *  atomically; everything that allocates bumps the same cell, so a reset
+ *  reclaims it all at once.
+ */
+export let emit_heap_mark = fn (buf: %ByteBuffer) -> %ByteBuffer do
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: wdefs.heap_ptr_cell)
+  let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_load, offset: 0)
+  return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+end
+
+/** `heap-reset(mark: i64) -> unit` — atomically store a previously captured bump-pointer back into the heap cell, reclaiming every allocation made since the mark in one shot. */
+export let emit_heap_reset = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: wdefs.heap_ptr_cell)
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      return wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_store, offset: 0)
+    | _ ->
+      throw SymbolNotFound(name: "__nx_heap_reset", kind: SkIntrinsicArg, context: "")
+      return %buf
+  end
+end
+
+/** `heap-swap(new_mark: i64) -> i64` — atomic load of the current bump pointer then atomic store of `new_mark`, returning the previous value. Used by arena scope helpers that need to install a fresh region while saving the old one for `heap-reset`. */
+export let emit_heap_swap = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let %buf = bb.push_byte(%buf, byte: op_i32_const)
+      let %buf = bb.push_sleb128(%buf, val: wdefs.heap_ptr_cell)
+      let %buf = wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_load, offset: 0)
+      let %buf = bb.push_bytes(%buf, bytes: [op_i64_extend_i32_u, op_i32_const])
+      let %buf = bb.push_sleb128(%buf, val: wdefs.heap_ptr_cell)
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      return wdefs.emit_atomic_op32(%buf, sub_op: wdefs.op_i32_atomic_store, offset: 0)
+    | _ ->
+      throw SymbolNotFound(name: "__nx_heap_swap", kind: SkIntrinsicArg, context: "")
+      return %buf
+  end
+end
+
+/** `alloc-raw : (size: i64) -> i64` — raw byte allocation
+ *  off the unified atomic bump cell. Used by stdlib runtime impls. Emits:
+ *  wrap the i64 size to i32, atomic-bump (rounds up to 8, grows memory),
+ *  zero-extend the resulting i32 base pointer back to i64.
+ */
+export let emit_alloc_raw = fn (args: [LirCallArg], buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: a) :: _ ->
+      let obj_ptr = ctx_temps_base(ctx) + 3
+      let %buf = emit_atom(atom: a, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i32_wrap_i64)
+      let %buf = emit_atomic_bump(%buf, ctx, ptr_local: obj_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: obj_ptr)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | _ ->
+      throw SymbolNotFound(name: "__nx_alloc_raw", kind: SkIntrinsicArg, context: "")
+      return %buf
+  end
+end
