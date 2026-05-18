@@ -32,9 +32,9 @@
  */
 
 import { Span } from "src/common/token.nx"
-import { TypeExpr, TyUserDefined, TyRow, EnumDef, VariantDef } from "src/common/ast.nx"
+import { TypeExpr, TyRef, TyArrow, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyUserDefined, NamedType, EnumDef, VariantDef } from "src/common/ast.nx"
 import { HirPort, HirPortMethod, ExceptionGroupEntry, HirProgram, HirFunction, HirHandlerArm, HirHandlerBindingEntry, HirHandlerBinding } from "src/ir/hir/types.nx"
-import { TypeError, UnknownCapability, UnknownThrowVariant } from "src/typecheck/errors.nx"
+import { TypeError, UnknownCapability, UnknownThrowVariant, RefEscapes } from "src/typecheck/errors.nx"
 import { VariantIndex, VariantInfo }, * as vidx from "src/common/variant_index.nx"
 import { Option, Some, None } from "std:option"
 import * as str from "std:str"
@@ -195,6 +195,66 @@ export let wf_throw = fn (
   end
 end
 
+// ─── escapesRef ─────────────────────────────────────────────────────────────
+//
+// Spec: docs/spec/type-system-formal.md §"Gravity Rule"
+//
+// escapesRef(τ) iff τ contains ~σ (TyRef) at any structurally reachable
+// position: as the type itself, inside TyLinear/TyLazy/TyBorrow wrappers,
+// as an array or list element, as a record field, or as the parameter/return
+// of an arrow (function types may not expose ref cells in their signatures
+// either — that path is caught at T-Lambda, but structural recursion into
+// arrows ensures nested fn-returning-ref is also caught).
+//
+// The check does NOT recurse into TyArrow param/ret positions here: function
+// types are first-class values and a `fn () -> ref(i64)` *type* in an outer
+// return position would be caught at the outer function's declaration site.
+// Only the *direct* TyRef in a return/field/escape position is our concern.
+// Recursion into structural wrappers (Linear, Lazy, Borrow, Array, List,
+// Record) is performed so that e.g. [~i64] or {f: ~i64} are also rejected.
+
+/** `escapes_ref(τ)` — true iff τ contains a TyRef (~σ) at any structurally
+ *  reachable position. Implements the spec's escapesRef predicate from
+ *  docs/spec/type-system-formal.md §"Gravity Rule". Used to enforce:
+ *    - T-Return: ¬escapesRef(τ) on the inferred return type
+ *    - T-Lambda / T-Let-PolyFn: ¬escapesRef(τ_r) on the declared ret type
+ *    - D-External: ¬escapesRef(τ_r) on the external binding ret type
+ */
+export let escapes_ref = fn (typ: TypeExpr) -> bool do
+  match typ do
+    | TyRef(_) -> return true
+    | TyLinear(inner: i) -> return escapes_ref(typ: i)
+    | TyLazy(inner: i) -> return escapes_ref(typ: i)
+    | TyBorrow(inner: i) -> return escapes_ref(typ: i)
+    | TyArray(elem: e) -> return escapes_ref(typ: e)
+    | TyList(elem: e) -> return escapes_ref(typ: e)
+    | TyRecord(fields: fs) -> return escapes_ref_named(types: fs)
+    // Arrow: do not recurse — a fn-type in return position is not itself a
+    // ref escape; the arrow's own ret-type is screened when that lambda is
+    // registered (T-Lambda / T-Let-PolyFn enforcement).
+    | _ -> return false
+  end
+end
+
+let escapes_ref_named = fn (types: [NamedType]) -> bool do
+  match types do
+    | [] -> return false
+    | NamedType(name: _, typ: t) :: rest ->
+      if escapes_ref(typ: t) then return true end
+      return escapes_ref_named(types: rest)
+  end
+end
+
+/** Enforce ¬escapesRef(τ) at a declaration/return site. Throws `RefEscapes`
+ *  if τ contains a mutable-reference type. `context` is a short description
+ *  for the diagnostic (e.g. "return type of 'foo'" or "return statement").
+ */
+export let enforce_no_escapes_ref = fn (typ: TypeExpr, context: string, span: Span) -> unit throws { TypeError } do
+  if escapes_ref(typ) then
+    throw RefEscapes(context, span)
+  end
+end
+
 // ─── Whole-program entry ────────────────────────────────────────────────────
 //
 // `check_program_wf_rows` runs wfCap/wfThrow over every function in the
@@ -213,9 +273,13 @@ let walk_funcs = fn (
 ) -> unit throws { TypeError } do
   match funcs do
     | [] -> return ()
-    | HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: tw, body: _, span: sp, file: _, requires: req) :: rest ->
+    | HirFunction(name: fn_name, type_params: _, params: _, ret_type: ret, throw_row: tw, body: _, span: sp, file: _, requires: req) :: rest ->
       wf_cap(row: req, ports, span: sp)
       wf_throw(row: tw, vidx_, groups, span: sp)
+      // Gravity rule: ¬escapesRef(τ_r) on the declared return type.
+      // Runs here (pre-DCE) so even unused functions with `ref(T)` return
+      // types are rejected — mirrors the wfCap/wfThrow rationale (line 112).
+      enforce_no_escapes_ref(typ: ret, context: "return type of '" ++ fn_name ++ "'", span: sp)
       return walk_funcs(funcs: rest, ports, vidx_, groups)
   end
 end
