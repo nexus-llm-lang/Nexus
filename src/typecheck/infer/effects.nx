@@ -1,0 +1,85 @@
+/**
+ * typecheck/infer/effects: pure leaf helpers for handler / inject effect typing.
+ *
+ * Hosts self-contained helpers that do NOT recurse through infer_expr /
+ * infer_stmts:
+ *   - `scan_handler_arms_for_ref_capture`: T-Handler no-ref-capture premise scan
+ *     over handler arm bodies at construction site (where outer env is still live).
+ *   - `inject_port_entries_acc` / `extend_require_row`: T-Inject ρ_q' extension —
+ *     collect TyHandler port names from the injected handler list and prepend them
+ *     to the ambient require row.
+ *
+ * The outer `infer_raise` / Handler arm in `infer_expr` / Inject arm in
+ * `infer_stmt` stay in src/typecheck/infer.nx because they call back into
+ * infer_expr / infer_stmts.
+ *
+ * Extracted from src/typecheck/infer.nx.
+ */
+
+import {
+  HirHandlerArm, HirFunction, EagerBody, LazyBody, EnvEntry
+} from "src/ir/hir/types.nx"
+import {
+  TypeExpr, TyRow, TyUserDefined, TyHandler
+} from "src/common/ast.nx"
+import {
+  CheckState, Scheme
+}, * as tctypes from "src/typecheck/types.nx"
+import * as capture from "src/typecheck/capture.nx"
+import { Option, Some, None } from "std:option"
+import * as list from "std:list"
+
+// Handler-arm capture scan (T-Handler no-ref-capture): §T-Handler carries the same
+// `∀y ∈ fv(e_j). Γ(y) ≠ ~σ` premise as T-Lambda. Inline handler expressions
+// reach infer_expr with the construction-site env intact; later passes
+// (synthesize_handler, check_handler_arm_bodies) hoist the arm to a top-level
+// HirFunction and lose that env. Scan here where it is still available and reject
+// the first ref-capture hit across all arms — mirroring infer_lambda's
+// RefCaptureHit handling.
+
+/** Scan handler arms for ref-captures at the construction site (T-Handler premise).
+ *  Returns the first capture hit found, or None if all arms are clean. */
+export let scan_handler_arms_for_ref_capture = fn (arms: [HirHandlerArm], outer_env: [EnvEntry]) -> Option<capture.RefCaptureHit> do
+  match arms do
+    | [] -> return None
+    | HirHandlerArm(arm: HirFunction(name: _, type_params: _, params: ps, ret_type: _, throw_row: _, body: bd, _), cont_binder: _) :: rest ->
+      let body_stmts = match bd do | EagerBody(stmts: ss) -> ss | LazyBody(_) -> [] end
+      let scan = capture.scan_lambda_captures(body: body_stmts, outer_env, params: ps)
+      match scan do
+        | capture.CaptureScan(linear: _, ref_hit: Some(val: hit)) -> return Some(val: hit)
+        | capture.CaptureScan(linear: _, ref_hit: None) -> return scan_handler_arms_for_ref_capture(arms: rest, outer_env)
+      end
+  end
+end
+
+// T-Inject: extend require_row with injected port names.
+// T-Inject: ρ_q' = merge(ρ_q, {P̄}).  Walk the handler list, collect
+// the TyHandler port names, and prepend them to the ambient require row.
+// Returns the extended row; the caller threads it into the body state.
+
+let inject_port_entries_acc = fn (state: CheckState, handlers: [string], acc: [TypeExpr]) -> [TypeExpr] do
+  match handlers do
+    | [] -> return acc
+    | h :: rest ->
+      match tctypes.env_lookup(env: tctypes.state_env(state), name: h) do
+        | None -> return inject_port_entries_acc(state, handlers: rest, acc)
+        | Some(val: Scheme(vars: _, typ: ht)) ->
+          match ht do
+            | TyHandler(name: pname, requires: _) ->
+              return inject_port_entries_acc(state, handlers: rest, acc: TyUserDefined(name: pname, args: []) :: acc)
+            | _ -> return inject_port_entries_acc(state, handlers: rest, acc)
+          end
+      end
+  end
+end
+
+/** Extend the ambient require row with the port names of each injected handler.
+ *  Implements T-Inject ρ_q' = merge(ρ_q, {P̄}). */
+export let extend_require_row = fn (state: CheckState, handlers: [string], ambient: TypeExpr) -> TypeExpr do
+  let ports = inject_port_entries_acc(state, handlers, acc: [])
+  match ambient do
+    | TyRow(types: existing, rest: r) ->
+      return TyRow(types: list.concat(xs: ports, ys: existing), rest: r)
+    | _ -> return ambient
+  end
+end
