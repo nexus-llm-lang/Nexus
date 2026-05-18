@@ -1,0 +1,209 @@
+// nexus-341f: Force→Resume over-eager in with-@k handler arms.
+//
+// Bug: mir.nx::lower_expr used `cb_has_any(cb)` (true when ANY cont binder
+// is installed) instead of `list_has(name: vn, names: cb)` (true only when
+// the forced variable IS the cont binder). Inside a `with @k` arm that also
+// forces an unrelated thunk `lazy_val`, the Force(Variable("lazy_val")) node
+// was misemitted as MirResume(cont_var: "lazy_val") instead of MirForce.
+//
+// Fix: replace `cb_has_any(cb)` with `list_has(name: vn, names: cb)` at
+// mir.nx:693.
+//
+// This test drives the fix by constructing a synthetic HirProgram with a
+// handler arm `prefix` that has cont_binder = Some("k") and a body that:
+//   stmt0: let lazy_val (lazy) = Thunk(Literal("hello"))
+//   stmt1: Expr(Force(Variable("lazy_val")))   ← must → MirStmtExpr(MirForce)
+//   stmt2: Expr(Force(Variable("k")))           ← must → MirStmtExpr(MirResume(k))
+import * as test_assert from "std:test/assert"
+import { lower_hir_to_mir } from "src/ir/mir/mir.nx"
+import { MirProgram, MirFunction, MirStmt, MirExpr } from "src/ir/mir/types.nx"
+import { Span } from "src/common/token.nx"
+import { TypeExpr, TyUnit, TyString, TyRow, Literal, LitString, Sigil, SigilImmutable, SigilLazy } from "src/common/ast.nx"
+import { None, Some } from "std:option"
+import {
+  HirProgram, HirFunction, HirBody, EagerBody,
+  HirParam, HirHandlerArm, HirHandlerBinding, HirHandlerBindingEntry,
+  HirStmt, HirStmtKind, HirExpr, HirExprKind,
+  HirPort, HirPortMethod
+} from "src/ir/hir/types.nx"
+
+let sp = fn () -> Span do return Span(offset: 0, line: 1, col: 1) end
+let empty_row = fn () -> TypeExpr do return TyRow(types: [], rest: None) end
+
+let mk_hir_expr = fn (node: HirExprKind) -> HirExpr do
+  return HirExpr(node, span: sp())
+end
+
+let mk_hir_stmt = fn (node: HirStmtKind) -> HirStmt do
+  return HirStmt(node, span: sp())
+end
+
+let mk_handler_fn = fn (name: string, stmts: [HirStmt]) -> HirFunction do
+  return HirFunction(
+    name,
+    type_params: [],
+    params: [],
+    ret_type: TyString,
+    throw_row: empty_row(),
+    body: EagerBody(stmts: stmts),
+    span: sp(),
+    file: "test.nx",
+    requires: empty_row()
+  )
+end
+
+/** Find first MirStmtExpr in list, return its expr. */
+let find_first_stmtexpr = fn (stmts: [MirStmt]) -> Option<MirExpr> do
+  match stmts do
+    | [] -> return None
+    | MirStmtExpr(expr: e) :: _ -> return Some(val: e)
+    | _ :: rest -> return find_first_stmtexpr(stmts: rest)
+  end
+end
+
+/** Find second MirStmtExpr in list, return its expr. */
+let find_second_stmtexpr = fn (stmts: [MirStmt]) -> Option<MirExpr> do
+  match stmts do
+    | [] -> return None
+    | MirStmtExpr(expr: _) :: rest ->
+      return find_first_stmtexpr(stmts: rest)
+    | _ :: rest -> return find_second_stmtexpr(stmts: rest)
+  end
+end
+
+let is_mir_force = fn (e: MirExpr) -> bool do
+  match e do
+    | MirForce(_) -> return true
+    | _ -> return false
+  end
+end
+
+let is_mir_resume = fn (e: MirExpr) -> bool do
+  match e do
+    | MirResume(_) -> return true
+    | _ -> return false
+  end
+end
+
+let resume_cont_var = fn (e: MirExpr) -> string do
+  match e do
+    | MirResume(cont_var: v, value: _, ret_type: _) -> return v
+    | _ -> return ""
+  end
+end
+
+let find_func_by_name = fn (funcs: [MirFunction], name: string) -> Option<MirFunction> do
+  match funcs do
+    | [] -> return None
+    | f :: rest ->
+      let MirFunction(name: n, _) = f
+      if n == name then return Some(val: f) end
+      return find_func_by_name(funcs: rest, name)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  // Build the handler arm body:
+  //   stmt0: let lazy_val (lazy) = Thunk(Literal("hello"))
+  //   stmt1: Expr(Force(Variable("lazy_val")))   ← must lower to MirForce
+  //   stmt2: Expr(Force(Variable("k")))           ← must lower to MirResume(k)
+
+  let lit_hello = mk_hir_expr(node: Literal(lit: LitString(val: "hello")))
+  let thunk_expr = mk_hir_expr(node: Thunk(body: lit_hello))
+  let stmt_let_lazy = mk_hir_stmt(
+    node: Let(name: "lazy_val", sigil: SigilLazy, typ: None, value: thunk_expr)
+  )
+
+  let force_lazy = mk_hir_expr(
+    node: Force(expr: mk_hir_expr(node: Variable(name: "lazy_val", sigil: SigilImmutable)))
+  )
+  let stmt_force_lazy = mk_hir_stmt(node: Expr(expr: force_lazy))
+
+  let force_k = mk_hir_expr(
+    node: Force(expr: mk_hir_expr(node: Variable(name: "k", sigil: SigilImmutable)))
+  )
+  let stmt_force_k = mk_hir_stmt(node: Expr(expr: force_k))
+
+  let lit_ret = mk_hir_expr(node: Literal(lit: LitString(val: "")))
+  let stmt_ret = mk_hir_stmt(node: Return(expr: lit_ret))
+
+  let arm_fn = mk_handler_fn(name: "prefix", stmts: [stmt_let_lazy, stmt_force_lazy, stmt_force_k, stmt_ret])
+  let arm = HirHandlerArm(arm: arm_fn, cont_binder: Some(val: "k"))
+
+  let binding = HirHandlerBinding(port_name: "PrefixEffect", requires: empty_row(), arms: [arm])
+  let entry = HirHandlerBindingEntry(name: "my_handler", binding)
+
+  let port_method = HirPortMethod(
+    name: "prefix",
+    requires: empty_row(),
+    span: sp(),
+    throw_row: empty_row(),
+    typ_params: [],
+    typ_ret: TyString
+  )
+  let port = HirPort(name: "PrefixEffect", methods: [port_method])
+
+  let hir = HirProgram(
+    ports: [port],
+    functions: [],
+    externals: [],
+    handler_bindings: [entry],
+    enum_defs: [],
+    exception_groups: [],
+    value_binding_names: [],
+    type_defs: [],
+    visible_enum_names: []
+  )
+
+  let MirProgram(functions: mir_funcs, externals: _) = lower_hir_to_mir(hir)
+
+  let mir_body = match find_func_by_name(funcs: mir_funcs, name: "prefix") do
+    | Some(val: MirFunction(name: _, params: _, ret_type: _, body: b, span: _)) -> b
+    | None -> throw RuntimeError(val: "nexus-341f: prefix function not found in MIR output")
+  end
+
+  // stmt_force_lazy lowers to first MirStmtExpr: must be MirForce
+  let first_expr = match find_first_stmtexpr(stmts: mir_body) do
+    | Some(val: e) -> e
+    | None -> throw RuntimeError(val: "nexus-341f: no first MirStmtExpr found")
+  end
+  test_assert.assert(
+    cond: is_mir_force(e: first_expr),
+    label: "nexus-341f: force of non-k var in with-@k arm lowers to MirForce"
+  )
+  test_assert.assert(
+    cond: !is_mir_resume(e: first_expr),
+    label: "nexus-341f: force of non-k var must NOT lower to MirResume"
+  )
+
+  // stmt_force_k lowers to second MirStmtExpr: must be MirResume(cont_var: "k")
+  let second_expr = match find_second_stmtexpr(stmts: mir_body) do
+    | Some(val: e) -> e
+    | None -> throw RuntimeError(val: "nexus-341f: no second MirStmtExpr found")
+  end
+  test_assert.assert(
+    cond: is_mir_resume(e: second_expr),
+    label: "nexus-341f: force of cont binder k in with-@k arm lowers to MirResume"
+  )
+  test_assert.assert(
+    cond: resume_cont_var(e: second_expr) == "k",
+    label: "nexus-341f: MirResume cont_var is k"
+  )
+
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end
