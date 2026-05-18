@@ -1,0 +1,636 @@
+/**
+ * typecheck/infer/statements: pure leaf helpers for statement and pattern inference.
+ *
+ * Hosts self-contained clusters that do NOT recurse through infer_expr /
+ * infer_stmts:
+ *   - Pattern binding (`bind_pattern` and its helper tree): type-directed
+ *     pattern decomposition producing env-entry sets; self-recursive but
+ *     not expression-recursive.
+ *   - Let-binding helpers (`LetMutLinearKind`, `let_mut_linear_kind`,
+ *     `alias_poly_scheme`, `poly_scheme`, `wrap_ref`): pure predicates
+ *     and env-shaping helpers for the `infer_let` entry point.
+ *   - Try/catch helpers (`catch_param_type_from_row`,
+ *     `project_exn_from_row_types`): row-to-type projection for catch
+ *     parameter binding.
+ *   - Numeric defaulting (`default_numeric_literals`, `default_named_types`):
+ *     post-inference literal coercion.
+ *   - `append_env`: disjoint-union helper used by match, ctor-pattern, and
+ *     record-pattern binding.
+ *
+ * The outer `infer_let` / `infer_return` / `infer_try` / `infer_stmt` entry
+ * points stay in src/typecheck/infer.nx because they call back into infer_expr.
+ *
+ * Extracted from src/typecheck/infer.nx.
+ */
+
+import { Span } from "src/common/token.nx"
+import {
+  TypeExpr, TyI32, TyI64, TyF32, TyF64, TyBool, TyChar, TyString, TyUnit,
+  TyIntLit, TyFloatLit, TyUserDefined, TyVar,
+  TyArrow, TyRef, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord,
+  TyRow,
+  NamedType, RecordDef, VariantField,
+  Sigil, SigilImmutable, SigilMutable, SigilLazy, SigilLinear,
+  Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit
+} from "src/common/ast.nx"
+import {
+  HirPatternKind, PLit, PVar, PCtor, PRec, PWild, POr,
+  HirPatternField, HirRecordPatField,
+  HirExprKind
+} from "src/ir/hir/types.nx"
+import {
+  SubstEntry, Scheme, EnvEntry, CheckState,
+  InferExprResult, InferExprOk, InferExprErr,
+  UnifyOk, UnifyErr,
+  BindResult, BindOk, BindErr,
+  EnumVariantInfo, TypeDefEntry
+}, * as tctypes from "src/typecheck/types.nx"
+import * as subst from "src/typecheck/subst.nx"
+import * as unify from "src/typecheck/unify.nx"
+import {
+  FreshenResult,
+  freshen_type_params
+} from "src/typecheck/infer/literals.nx"
+import {
+  build_enum_type
+} from "src/typecheck/infer/constructor.nx"
+import {
+  lookup_named_type, find_linear_field, type_carries_linear
+} from "src/typecheck/infer/collections.nx"
+import { TypeError, ThrowsRowInvariantBroken, DuplicatePatternLabel } from "src/common/error.nx"
+import { StrMap }, * as smap from "src/common/strmap.nx"
+import * as list from "std:list"
+import { Option, Some, None } from "std:option"
+
+// ─── Env list utilities ─────────────────────────────────────────────────────
+
+/** Prepend `extra` entries onto `base`. Used by match-case, ctor-pattern, and record-pattern binding. */
+export let append_env = fn (base: [EnvEntry], extra: [EnvEntry]) -> [EnvEntry] throws { TypeError } do
+  match extra do
+    | [] -> return base
+    | entry :: rest ->
+      return append_env(base: entry :: base, extra: rest)
+  end
+end
+
+// ─── Pattern binding ────────────────────────────────────────────────────────
+
+/** True when `t` is "auto-droppable" — primitive scalars and unit drop
+ *  silently at scope end. Wrappers `%`/`&`/`~` peel and recurse; `@T` is
+ *  NOT auto-droppable (forcing triggers side effects). Mirrors
+ *  linearity.nx::is_auto_droppable for use in the type-check phase. */
+let pat_is_auto_droppable = fn (t: TypeExpr) -> bool do
+  match t do
+    | TyI32 | TyI64 | TyF32 | TyF64
+    | TyIntLit | TyFloatLit
+    | TyBool | TyChar | TyString | TyUnit -> return true
+    | TyLazy(_) -> return false
+    | TyLinear(inner: i) | TyBorrow(inner: i) | TyRef(inner: i) ->
+      return pat_is_auto_droppable(t: i)
+    | _ -> return false
+  end
+end
+
+/** Match `pattern` against `target_type`, returning the env extensions and substitution produced by the binding (or a `BindErr` on shape mismatch). */
+export let bind_pattern = fn (state: CheckState, pattern: HirPatternKind, target_type: TypeExpr) -> BindResult throws { TypeError } do
+  match pattern do
+    | PWild ->
+      // P-Wild: spec premise linear(τ) ∧ ¬autoDrop(τ) → error.
+      // A wildcard silently discards its scrutinee; if the scrutinee is a
+      // non-auto-droppable linear type (e.g. %Handle) that is a linearity
+      // violation — the resource escapes without being consumed.
+      let tdefs = tctypes.state_typedefs(state)
+      // P-Wild: spec premise linear(τ) ∧ ¬autoDrop(τ) → error.
+      // Use inline linear-check (mirrors type_carries_linear L114) to avoid
+      // any import resolution issues with collections.type_carries_linear.
+      let is_linear_type = match target_type do
+        | TyLinear(_) | TyLazy(_) -> true
+        | _ -> false
+      end
+      if is_linear_type && !pat_is_auto_droppable(t: target_type) then
+        return BindErr(message: "wildcard pattern `_` cannot discard linear type `" ++ tctypes.type_to_string(typ: target_type) ++ "` (P-Wild: linear(τ) ∧ ¬autoDrop(τ) → error); bind to a name and consume it explicitly")
+      end
+      return BindOk(state, subst: subst.subst_empty(), env: [])
+    | PVar(name, sigil: _) ->
+      return BindOk(
+        state, subst: subst.subst_empty(),
+        env: [EnvEntry(name, scheme: tctypes.mono(typ: target_type))]
+      )
+    | PLit(lit) ->
+      let lit_type = match lit do
+        | LitInt(_) -> TyIntLit
+        | LitFloat(_) -> TyFloatLit
+        | LitBool(_) -> TyBool
+        | LitChar(_) -> TyChar
+        | LitString(_) -> TyString
+        | LitUnit -> TyUnit
+      end
+      let tdefs = tctypes.state_typedefs(state)
+      match unify.unify(t1: lit_type, t2: target_type, tdefs) do
+        | UnifyErr(message: m) -> return BindErr(message: "literal pattern: " ++ m)
+        | UnifyOk(subst: s) -> return BindOk(state, subst: s, env: [])
+      end
+    | PCtor(variant, fields, sigil: _) ->
+      return bind_constructor_pattern(state, variant, fields, target_type)
+    | PRec(fields, is_partial: _) ->
+      return bind_record_pattern(state, fields, target_type)
+    | POr(alts) ->
+      match alts do
+        | [] -> return BindErr(message: "empty or-pattern")
+        | first :: rest ->
+          match bind_pattern(state, pattern: first, target_type) do
+            | BindErr(message: m) -> return BindErr(message: "or-pattern: " ++ m)
+            | BindOk(state: st1, subst: s1, env: ref_env) ->
+              return bind_or_alts_validate(state: st1, alts: rest, target_type, ref_env, acc_subst: s1)
+          end
+      end
+  end
+end
+
+let bind_or_alts_validate = fn (
+  state: CheckState, alts: [HirPatternKind], target_type: TypeExpr,
+  ref_env: [EnvEntry], acc_subst: [SubstEntry]
+) -> BindResult throws { TypeError } do
+  // hoist the haystack into a StrMap once per call so
+  // env_keys_match / unify_or_envs do O(1) lookups instead of O(N) per name.
+  let ref_map = env_to_strmap(env: ref_env)
+  return bind_or_alts_validate_go(state, alts, target_type, ref_env, ref_map, acc_subst)
+end
+
+let bind_or_alts_validate_go = fn (
+  state: CheckState, alts: [HirPatternKind], target_type: TypeExpr,
+  ref_env: [EnvEntry], ref_map: StrMap<Scheme>, acc_subst: [SubstEntry]
+) -> BindResult throws { TypeError } do
+  match alts do
+    | [] -> return BindOk(state, subst: acc_subst, env: ref_env)
+    | alt :: rest ->
+      match bind_pattern(state, pattern: alt, target_type) do
+        | BindErr(message: m) -> return BindErr(message: "or-pattern alternative: " ++ m)
+        | BindOk(state: st1, subst: s1, env: alt_env) ->
+          let alt_map = env_to_strmap(env: alt_env)
+          if env_keys_match(a: ref_env, a_map: ref_map, b: alt_env, b_map: alt_map) then
+            match unify_or_envs(state: st1, first: ref_env, alt_map, acc: subst.subst_compose(s1: acc_subst, s2: s1)) do
+              | BindErr(message: m) -> return BindErr(message: m)
+              | BindOk(state: st2, subst: s2, env: _) ->
+                return bind_or_alts_validate_go(state: st2, alts: rest, target_type, ref_env, ref_map, acc_subst: s2)
+            end
+          else
+            return BindErr(message: "or-pattern alternatives bind different variable sets")
+          end
+      end
+  end
+end
+
+let env_to_strmap = fn (env: [EnvEntry]) -> StrMap<Scheme> throws { TypeError } do
+  return env_to_strmap_go(env, acc: smap.empty())
+end
+
+let env_to_strmap_go = fn (env: [EnvEntry], acc: StrMap<Scheme>) -> StrMap<Scheme> throws { TypeError } do
+  match env do
+    | [] -> return acc
+    | EnvEntry(name: n, scheme: s) :: rest ->
+      return env_to_strmap_go(env: rest, acc: smap.insert(m: acc, k: n, v: s))
+  end
+end
+
+// Two envs share the same key set iff |a| = |b| and every key in `a` is
+// present in `b_map`. Pre-built StrMaps make the membership check O(1).
+let env_keys_match = fn (a: [EnvEntry], a_map: StrMap<Scheme>, b: [EnvEntry], b_map: StrMap<Scheme>) -> bool throws { TypeError } do
+  if list.length(xs: a) != list.length(xs: b) then return false end
+  return all_keys_in_map(needles: a, haystack: b_map) && all_keys_in_map(needles: b, haystack: a_map)
+end
+
+let all_keys_in_map = fn (needles: [EnvEntry], haystack: StrMap<Scheme>) -> bool throws { TypeError } do
+  match needles do
+    | [] -> return true
+    | EnvEntry(name: n, scheme: _) :: rest ->
+      if smap.contains(m: haystack, k: n) then
+        return all_keys_in_map(needles: rest, haystack)
+      else
+        return false
+      end
+  end
+end
+
+let has_env_key = fn (name: string, env: [EnvEntry]) -> bool do
+  match env do
+    | [] -> return false
+    | EnvEntry(name: n, scheme: _) :: rest ->
+      if n == name then return true else return has_env_key(name, env: rest) end
+  end
+end
+
+// Disjoint-union helper: walks `extra` and returns the first name that
+// already exists in `base`. Spec rule P-Ctor / P-Record: the per-field
+// binding sets must satisfy `⨄_i (Γ_i \ Γ)`, i.e. no name introduced by
+// one field pattern may be reintroduced by a sibling. `_` (PWild) yields
+// no entries and so naturally short-circuits this check.
+let find_env_overlap = fn (base: [EnvEntry], extra: [EnvEntry]) -> Option<string> do
+  match extra do
+    | [] -> return None
+    | EnvEntry(name: n, scheme: _) :: rest ->
+      if has_env_key(name: n, env: base) then
+        return Some(val: n)
+      else
+        return find_env_overlap(base, extra: rest)
+      end
+  end
+end
+
+// `alt_map` replaces a linear-scan `find_env_entry` (was O(M)
+// per name; total O(M²)). The caller pre-builds it once per or-alternative.
+let unify_or_envs = fn (
+  state: CheckState, first: [EnvEntry], alt_map: StrMap<Scheme>, acc: [SubstEntry]
+) -> BindResult throws { TypeError } do
+  match first do
+    | [] -> return BindOk(state, subst: acc, env: [])
+    | EnvEntry(name: n, scheme: rs) :: rest_first ->
+      match smap.get(m: alt_map, k: n) do
+        | None -> return BindErr(message: "or-pattern: missing binding `" ++ n ++ "` in alternative")
+        | Some(val: as_) ->
+          let tdefs = tctypes.state_typedefs(state)
+          let rt = scheme_typ(s: rs)
+          let at = scheme_typ(s: as_)
+          match unify.unify(t1: rt, t2: at, tdefs) do
+            | UnifyErr(message: m) ->
+              return BindErr(message: "or-pattern: variable `" ++ n ++ "` has incompatible types across alternatives: " ++ m)
+            | UnifyOk(subst: s) ->
+              // Spec P-Or: Γ₁ \ Γ = Γ₂ \ Γ requires identity of both type
+              // AND usage annotation (q=1 vs q=ω). Unification alone does
+              // not enforce this because a TyVar on one side can bind to
+              // TyLinear(τ) on the other, silently erasing the discrepancy.
+              // We therefore check that linear(rt) = linear(at) after
+              // structural type matching succeeds.
+              let rt_lin = type_carries_linear(rt, tdefs, depth: 0)
+              let at_lin = type_carries_linear(at, tdefs, depth: 0)
+              if rt_lin != at_lin then
+                return BindErr(message: "or-pattern: variable `" ++ n ++ "` has different linearity across alternatives (one arm binds a linear type, the other does not); P-Or requires identical usage annotations")
+              end
+              return unify_or_envs(state, first: rest_first, alt_map, acc: subst.subst_compose(s1: acc, s2: s))
+          end
+      end
+  end
+end
+
+let scheme_typ = fn (s: Scheme) -> TypeExpr throws { TypeError } do
+  match s do
+    | Scheme(vars: _, typ: t) -> return t
+  end
+end
+
+let bind_constructor_pattern = fn (
+  state: CheckState, variant: string,
+  fields: [HirPatternField], target_type: TypeExpr
+) -> BindResult throws { TypeError } do
+  // spec strip(τ) peels %/& only — @σ thunks must be forced explicitly.
+  match target_type do
+    | TyLazy(inner: _) ->
+      return BindErr(message: "cannot pattern-match constructor `" ++ variant ++ "` on thunk type `" ++ tctypes.type_to_string(typ: target_type) ++ "`; force the thunk first (e.g. `match @x do | " ++ variant ++ "(...) -> ... end`)")
+    | _ -> ()
+  end
+  let unwrapped = match target_type do
+    | TyLinear(inner: i) | TyRef(inner: i) | TyBorrow(inner: i) -> i
+    | _ -> target_type
+  end
+  match tctypes.find_variant(idx: tctypes.state_variant_index(state), variant) do
+    | None -> return BindErr(message: "unknown constructor in pattern: " ++ variant)
+    | Some(val: EnumVariantInfo(enum_name: ename, type_params: tps, fields: field_types)) ->
+      let fr = freshen_type_params(state, params: tps)
+      match fr do
+        | FreshenResult(state: st1, param_subst: psubst) ->
+          let enum_type = build_enum_type(name: ename, params: tps, param_subst: psubst)
+          let tdefs = tctypes.state_typedefs(state: st1)
+          match unify.unify(t1: enum_type, t2: unwrapped, tdefs) do
+            | UnifyErr(message: m) -> return BindErr(message: "constructor pattern type: " ++ m)
+            | UnifyOk(subst: s1) ->
+              let full_subst = subst.subst_compose(s1: psubst, s2: s1)
+              return bind_ctor_fields(state: st1, fields, field_types, param_subst: full_subst, subst: s1, env: [])
+          end
+      end
+  end
+end
+
+let bind_ctor_fields = fn (
+  state: CheckState, fields: [HirPatternField], field_types: [VariantField],
+  param_subst: [SubstEntry], subst: [SubstEntry], env: [EnvEntry]
+) -> BindResult throws { TypeError } do
+  match fields do
+    | [] -> return BindOk(state, subst, env)
+    | HirPatternField(name: fname_opt, pattern: pat) :: rf ->
+      match field_types do
+        | [] -> return BindErr(message: "too many constructor pattern fields")
+        | VariantField(name: vfname_opt, typ: ft) :: rft ->
+          // Spec P-Ctor {ℓ'} = {ℓ}: when both the pattern and the constructor
+          // field carry a label, they must match at each position — reordered
+          // labels (e.g. Point(y: a, x: b) for Point(x, y)) are rejected here.
+          match check_ctor_field_label(fname_opt, vfname_opt) do
+            | Some(val: err) -> return BindErr(message: err)
+            | None -> ()
+          end
+          let expected = subst.subst_apply(subst: param_subst, typ: ft)
+          match bind_pattern(state, pattern: pat, target_type: expected) do
+            | BindErr(message: m) -> return BindErr(message: m)
+            | BindOk(state: st1, subst: ps, env: new_binds) ->
+              // Spec P-Ctor: ⨄_i (Γ_i \ Γ) — sibling field patterns must
+              // bind disjoint variable sets. Without this check, the last
+              // binder for a name silently shadows earlier ones.
+              match find_env_overlap(base: env, extra: new_binds) do
+                | Some(val: dup) ->
+                  let label = match fname_opt do
+                    | Some(val: n) -> n
+                    | None ->
+                      match vfname_opt do
+                        | Some(val: n) -> n
+                        | None -> "(positional)"
+                      end
+                  end
+                  return BindErr(message: "duplicate variable `" ++ dup ++ "` in constructor pattern (introduced by field `" ++ label ++ "`); sibling fields must bind disjoint names")
+                | None ->
+                  let sm = subst.subst_compose(s1: subst, s2: ps)
+                  return bind_ctor_fields(
+                    state: st1, fields: rf, field_types: rft,
+                    param_subst, subst: sm,
+                    env: append_env(base: env, extra: new_binds)
+                  )
+              end
+          end
+      end
+  end
+end
+
+// Spec P-Ctor {ℓ'} = {ℓ}: check that a single pattern field label matches
+// the constructor's declared label at the same position. Returns Some(error)
+// on mismatch (both labels present but different), None if OK.
+let check_ctor_field_label = fn (
+  fname_opt: Option<string>, vfname_opt: Option<string>
+) -> Option<string> do
+  match fname_opt do
+    | None -> return None
+    | Some(val: fname) ->
+      match vfname_opt do
+        | None -> return None
+        | Some(val: vfname) ->
+          // Use label_in_list for the comparison to reuse proven string-equality
+          // logic rather than a raw `==` on newly-bound strings.
+          if label_in_list(label: fname, haystack: vfname :: []) then
+            return None
+          else
+            return Some(val: "constructor pattern field label `" ++ fname
+              ++ "` does not match the declared label `" ++ vfname
+              ++ "` at this position; P-Ctor requires {ℓ'} = {ℓ}")
+          end
+      end
+  end
+end
+
+// Spec P-Record premise distinct(ℓ̄): walk the pattern field list and throw
+// DuplicatePatternLabel on the first repeated label. Uses a seen-list to
+// avoid depending on StrMap (not imported in this module).
+let check_distinct_pat_labels = fn (
+  fields: [HirRecordPatField], seen: [string]
+) -> unit throws { TypeError } do
+  match fields do
+    | [] -> return ()
+    | HirRecordPatField(name: fname, pattern: _) :: rest ->
+      match label_in_list(label: fname, haystack: seen) do
+        | true -> throw DuplicatePatternLabel(label: fname, span: Span(offset: 0, line: 0, col: 0))
+        | false ->
+          return check_distinct_pat_labels(fields: rest, seen: fname :: seen)
+      end
+  end
+end
+
+let label_in_list = fn (label: string, haystack: [string]) -> bool do
+  match haystack do
+    | [] -> return false
+    | h :: rest ->
+      if h == label then return true
+      else return label_in_list(label, haystack: rest)
+      end
+  end
+end
+
+let bind_record_pattern = fn (
+  state: CheckState, fields: [HirRecordPatField], target_type: TypeExpr
+) -> BindResult throws { TypeError } do
+  // Spec P-Record premise distinct(ℓ̄): reject duplicate field labels before
+  // attempting the per-field binding walk.
+  check_distinct_pat_labels(fields, seen: [])
+  // spec strip(τ) peels %/& only — @σ thunks must be forced explicitly.
+  match target_type do
+    | TyLazy(inner: _) ->
+      return BindErr(message: "cannot pattern-match record on thunk type `" ++ tctypes.type_to_string(typ: target_type) ++ "`; force the thunk first (e.g. `match @x do | {...} -> ... end`)")
+    | _ -> ()
+  end
+  // Peel modality wrappers (Linear/Borrow/Ref) so `match h: %T do | {f: x} -> ...`
+  // can match on the underlying record.
+  let inner = match target_type do
+    | TyLinear(inner: i) | TyBorrow(inner: i) | TyRef(inner: i) -> i
+    | _ -> target_type
+  end
+  match inner do
+    | TyRecord(fields: rec_fields) ->
+      return bind_rec_pat_fields(state, fields, rec_fields, subst: subst.subst_empty(), env: [])
+    | TyUserDefined(name: n, args: _) ->
+      // Project named record typedef (`p: Point`) to underlying TyRecord.
+      // Anonymous record alias for surface types like `type Point = {...}`.
+      match tctypes.typedef_lookup(defs: tctypes.state_typedefs(state), name: n) do
+        | Some(val: rd) ->
+          let RecordDef(name: _, is_public: _, type_params: _, fields: rec_fields) = rd
+          return bind_rec_pat_fields(state, fields, rec_fields, subst: subst.subst_empty(), env: [])
+        | None -> return BindErr(message: "record pattern on non-record type")
+      end
+    | _ -> return BindErr(message: "record pattern on non-record type")
+  end
+end
+
+let bind_rec_pat_fields = fn (
+  state: CheckState, fields: [HirRecordPatField],
+  rec_fields: [NamedType], subst: [SubstEntry], env: [EnvEntry]
+) -> BindResult throws { TypeError } do
+  match fields do
+    | [] -> return BindOk(state, subst, env)
+    | HirRecordPatField(name: fname, pattern: pat) :: rest ->
+      match lookup_named_type(nts: rec_fields, name: fname) do
+        | None -> return BindErr(message: "no field " ++ fname ++ " in record pattern")
+        | Some(val: ft) ->
+          match bind_pattern(state, pattern: pat, target_type: ft) do
+            | BindErr(message: m) -> return BindErr(message: m)
+            | BindOk(state: st1, subst: ps, env: new_binds) ->
+              // Spec P-Record: ⨄_i (Γ_i \ Γ) — sibling field patterns
+              // must bind disjoint variable sets.
+              match find_env_overlap(base: env, extra: new_binds) do
+                | Some(val: dup) ->
+                  return BindErr(message: "duplicate variable `" ++ dup ++ "` in record pattern (introduced by field `" ++ fname ++ "`); sibling fields must bind disjoint names")
+                | None ->
+                  let sm = subst.subst_compose(s1: subst, s2: ps)
+                  return bind_rec_pat_fields(
+                    state: st1, fields: rest, rec_fields,
+                    subst: sm, env: append_env(base: env, extra: new_binds)
+                  )
+              end
+          end
+      end
+  end
+end
+
+// ─── Let-binding helpers ────────────────────────────────────────────────────
+
+/** Classification of a `let ~x = v` RHS type w.r.t. the T-Let premise
+ * `μ = ~ ⟹ ¬linear(τ')`.: linearity is structural, so we
+ *  must reject not only bare `%T`/`@T` but also TyRecord / TyUserDefined
+ *  whose fields transitively carry linear components.
+ */
+export type LetMutLinearKind =
+  LetMutOk
+  | LetMutLinearBare           // TyLinear at top level
+  | LetMutLinearLazy           // TyLazy at top level
+  | LetMutLinearStructural     // Aggregate (record / named record) carrying linear
+
+export let let_mut_linear_kind = fn (typ: TypeExpr, tdefs: [TypeDefEntry]) -> LetMutLinearKind do
+  match typ do
+    | TyLinear(_) -> return LetMutLinearBare
+    | TyLazy(_) -> return LetMutLinearLazy
+    | _ ->
+      if type_carries_linear(typ, tdefs, depth: 8) then
+        return LetMutLinearStructural
+      end
+      return LetMutOk
+  end
+end
+
+export let poly_scheme = fn (vars: [string]) -> bool do
+  match vars do
+    | [] -> return false
+    | _ -> return true
+  end
+end
+
+/** Variable-aliasing carve-out helper. Returns
+ *  `Some(state')` when the let RHS is a plain immutable, unannotated
+ *  reference to a polymorphic binding — in which case `state'` already
+ *  has `name` bound to a copy of that scheme. Returns `None` for every
+ *  other shape so `infer_let` falls through to the standard path.
+ */
+export let alias_poly_scheme = fn (
+  state: CheckState, name: string, sigil: Sigil,
+  ann: Option<TypeExpr>, val_node: HirExprKind
+) -> Option<CheckState> do
+  match sigil do
+    | SigilImmutable -> ()
+    | _ -> return None
+  end
+  match ann do
+    | None -> ()
+    | Some(_) -> return None
+  end
+  match val_node do
+    | Variable(name: src_name, sigil: SigilImmutable) ->
+      match tctypes.env_lookup(env: tctypes.state_env(state), name: src_name) do
+        | None -> return None
+        | Some(val: Scheme(vars: src_vars, typ: src_typ)) ->
+          if poly_scheme(vars: src_vars) then
+            let env_aliased = tctypes.env_insert(
+              env: tctypes.state_env(state),
+              name,
+              scheme: Scheme(vars: src_vars, typ: src_typ)
+            )
+            return Some(val: tctypes.state_with_env(state, env: env_aliased))
+          end
+          return None
+      end
+    | _ -> return None
+  end
+end
+
+/** Wrap a binding type in TyRef for `~`-sigil lets unless the value is
+ *  already a Ref/Linear/Lazy/Borrow.
+ */
+export let wrap_ref = fn (typ: TypeExpr) -> TypeExpr do
+  match typ do
+    | TyRef(_) | TyLinear(_) | TyLazy(_) | TyBorrow(_) -> return typ
+    | _ -> return TyRef(inner: typ)
+  end
+end
+
+// ─── Try/catch helpers ──────────────────────────────────────────────────────
+
+/** Project the active throws-row onto the type bound to a catch parameter.
+ *  Every declared exception variant is registered as a member of the
+ *  built-in `Exn` enum, so the universal shape (`Exn` itself), exception
+ *  groups (`LirError`), and individual variants all resolve to the `Exn`
+ *  enum type. The catch param is therefore typed by walking the row rather
+ *  than splicing in the literal `TyUserDefined("Exn", [])`; once row
+ *  entries gain a non-Exn-rooted vocabulary the per-entry walk here will
+ *  surface that as a TypeMismatch caller-side instead of silently flowing
+ *  through (see feedback_no_silent_defaults).
+ */
+export let catch_param_type_from_row = fn (row: TypeExpr) -> TypeExpr throws { TypeError } do
+  match row do
+    | TyRow(types: ts, rest: r) -> return project_exn_from_row_types(ts, has_tail: r)
+    | TyVar(name: _) ->
+      // The whole row was unified to a tail variable (effect-polymorphic).
+      // Catch param falls back to the universal Exn type.
+      return TyUserDefined(name: "Exn", args: [])
+    | _ ->
+      // Throws-row that isn't TyRow / TyVar means a typecheck invariant
+      // was already broken upstream. Raise an ICE rather than
+      // fabricating a span-less TypeMismatch.
+      throw ThrowsRowInvariantBroken(
+        detail: "catch_param_type_from_row: throws row must be TyRow or TyVar, got "
+          ++ tctypes.type_to_string(typ: row)
+      )
+  end
+end
+
+/** Walk row entries, asserting each names an Exn-rooted shape. Closed
+ *  empty rows project to `Exn` so a `catch` body inside a function with
+ *  `throws {}` still type-checks (the body is statically unreachable but
+ *  pattern inference still runs).
+ */
+let project_exn_from_row_types = fn (
+  ts: [TypeExpr], has_tail: Option<TypeExpr>
+) -> TypeExpr throws { TypeError } do
+  match ts do
+    | [] -> return TyUserDefined(name: "Exn", args: [])
+    | TyUserDefined(name: _, args: _) :: rest | TyVar(name: _) :: rest ->
+      return project_exn_from_row_types(ts: rest, has_tail)
+    | other :: _ ->
+      throw ThrowsRowInvariantBroken(
+        detail: "project_exn_from_row_types: row entry must be TyUserDefined or TyVar, got "
+          ++ tctypes.type_to_string(typ: other)
+      )
+  end
+end
+
+// ─── Numeric literal defaulting ─────────────────────────────────────────────
+
+export let default_numeric_literals = fn (typ: TypeExpr) -> TypeExpr throws { TypeError } do
+  match typ do
+    | TyIntLit -> return TyI64
+    | TyFloatLit -> return TyF64
+    | TyArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
+      return TyArrow(
+        params: default_named_types(nts: ps),
+        ret: default_numeric_literals(typ: r),
+        requires: req,
+        throw_row: thr
+      )
+    | TyArray(elem: e) -> return TyArray(elem: default_numeric_literals(typ: e))
+    | TyList(elem: e) -> return TyList(elem: default_numeric_literals(typ: e))
+    | TyRecord(fields: fs) -> return TyRecord(fields: default_named_types(nts: fs))
+    | _ -> return typ
+  end
+end
+
+export let default_named_types = fn (nts: [NamedType]) -> [NamedType] throws { TypeError } do
+  return default_named_types_go(nts, acc: [])
+end
+
+let default_named_types_go = fn (nts: [NamedType], acc: [NamedType]) -> [NamedType] throws { TypeError } do
+  match nts do
+    | [] -> return list.reverse(xs: acc)
+    | NamedType(name: n, typ: t) :: rest ->
+      return default_named_types_go(nts: rest, acc: NamedType(name: n, typ: default_numeric_literals(typ: t)) :: acc)
+  end
+end

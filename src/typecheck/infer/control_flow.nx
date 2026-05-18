@@ -1,0 +1,361 @@
+/**
+ * typecheck/infer/control_flow: pure leaf helpers for control-flow inference.
+ *
+ * Hosts three self-contained clusters that do NOT recurse through
+ * infer_expr / infer_stmts:
+ *   - Raise row-admission check (`RaiseAdmissionResult`, `check_raise_admitted`,
+ *     `row_admits_exception`, `exception_name_of_raised`): decides whether a
+ *     throw or callee throws-row is covered by the ambient row.
+ *   - Divergence predicates (`stmt_diverges`, `infer_expr_diverges_depth`, etc.):
+ *     structural T-Seq ⊥ checks used by infer_stmts to detect unreachable code.
+ *   - Inject-site checks (`check_handlers_bound`, `check_inject_uniqueness`,
+ *     `check_inject_require_subset`): T-Inject premise validation that does not
+ *     recurse into expression inference.
+ *
+ * The outer if/match/while/for/lambda/try/inject entry points stay in
+ * src/typecheck/infer.nx because they call back into infer_expr / infer_stmts.
+ *
+ * Extracted from src/typecheck/infer.nx.
+ */
+
+import { Span } from "src/common/token.nx"
+import {
+  TypeExpr, TyRow, TyVar, TyHandler, TyLazy,
+  TyUnit, TyUserDefined
+} from "src/common/ast.nx"
+import {
+  HirExpr, HirExprKind, HirStmt, HirStmtKind, HirMatchCase,
+  ExceptionGroupEntry
+} from "src/ir/hir/types.nx"
+import {
+  CheckState, InferExprResult, InferExprOk, InferExprErr, Scheme
+}, * as tctypes from "src/typecheck/types.nx"
+import * as subst from "src/typecheck/subst.nx"
+import { TypeError, DuplicateInjectPort, HandlerRequireNotSubset } from "src/common/error.nx"
+import { Option, Some, None } from "std:option"
+import * as list from "std:list"
+
+// ─── Raise row-admission ────────────────────────────────────────────────────
+
+export type RaiseAdmissionResult =
+  RaiseOk
+  | RaiseRejected(message: string)
+
+/** Decide whether raising `name_opt` is admitted by row `row`.
+ *  `name_opt = None` means the raised value is not a syntactic exception
+ *  constructor (e.g. `throw some_var`); we accept conservatively in that
+ *  case because the value's runtime variant can't be inspected statically —
+ *  unless the active throws-row is closed empty (`throws {}`), which
+ *  permits no exceptions whatsoever.
+ *
+ *  Row semantics (T-Raise):
+ *  - Open row `TyRow(_, rest: Some(_))`: effect-polymorphic or implicitly
+ *    declared (absent `throws` clause).  Any throw is admitted.  Functions
+ *    in `src/` that predate row-typed throws declarations parse to
+ *    `TyRow([], rest: Some(TyVar("__implicit")))` via `parse_optional_throws`
+ *    and fall here.
+ *  - Closed non-empty row `TyRow([X, ...], rest: None)`: only declared
+ *    members (or the universal `Exn` sentinel) are admitted.
+ *  - Closed empty row `TyRow([], rest: None)`: the function explicitly
+ *    declared `throws {}` — no exceptions are permitted and every throw
+ *    site is an error (P5 enforcement).
+ *  - Non-row types (TyVar unsolved, etc.): admit conservatively.
+ */
+export let check_raise_admitted = fn (
+  name_opt: Option<string>, row: TypeExpr, groups: [ExceptionGroupEntry]
+) -> RaiseAdmissionResult throws { TypeError } do
+  match row do
+    | TyRow(types: _, rest: Some(_)) -> return RaiseOk
+    | TyRow(types: row_types, rest: None) ->
+      return check_raise_admitted_closed(name_opt, row_types, groups)
+    | _ -> return RaiseOk
+  end
+end
+
+let check_raise_admitted_closed = fn (
+  name_opt: Option<string>, row_types: [TypeExpr], groups: [ExceptionGroupEntry]
+) -> RaiseAdmissionResult throws { TypeError } do
+  match name_opt do
+    | None ->
+      // Unknown throw target: reject when the row is provably empty (throws {}).
+      if list.length(xs: row_types) == 0 then
+        return RaiseRejected(
+          message: "throw: function declares throws {}, no exceptions are permitted"
+        )
+      end
+      return RaiseOk
+    | Some(val: name) ->
+      if row_admits_exception(name, row_types, groups) then
+        return RaiseOk
+      end
+      if list.length(xs: row_types) == 0 then
+        return RaiseRejected(
+          message: "throw " ++ name ++ ": function declares throws {}, no exceptions are permitted"
+        )
+      end
+      return RaiseRejected(
+        message: "throw " ++ name ++ ": exception not in throws row"
+      )
+  end
+end
+
+/** True when the row's head literally contains `name`, contains "Exn"
+ *  (universal), or contains an exception group whose members include `name`.
+ */
+export let row_admits_exception = fn (
+  name: string, row_types: [TypeExpr], groups: [ExceptionGroupEntry]
+) -> bool throws { TypeError } do
+  match row_types do
+    | [] -> return false
+    | t :: rest ->
+      match t do
+        | TyUserDefined(name: n, args: _) ->
+          if n == "Exn" then return true end
+          if n == name then return true end
+          if group_contains(group_name: n, member: name, groups) then return true end
+          return row_admits_exception(name, row_types: rest, groups)
+        | _ -> return row_admits_exception(name, row_types: rest, groups)
+      end
+  end
+end
+
+let group_contains = fn (
+  group_name: string, member: string, groups: [ExceptionGroupEntry]
+) -> bool throws { TypeError } do
+  match groups do
+    | [] -> return false
+    | ExceptionGroupEntry(name: gn, members) :: rest ->
+      if gn == group_name then
+        return member_in_strings(needle: member, haystack: members)
+      end
+      return group_contains(group_name, member, groups: rest)
+  end
+end
+
+let member_in_strings = fn (needle: string, haystack: [string]) -> bool throws { TypeError } do
+  match haystack do
+    | [] -> return false
+    | h :: rest ->
+      if h == needle then return true end
+      return member_in_strings(needle, haystack: rest)
+  end
+end
+
+/** Recover the syntactic exception name from a throw's payload, if any.
+ *  `throw Foo(...)` ⇒ Some("Foo"); `throw x` (variable) ⇒ None.
+ */
+export let exception_name_of_raised = fn (expr: HirExpr) -> Option<string> do
+  let HirExpr(node, span: _) = expr
+  return if let Ctor(variant, args: _, sigil: _) = node then
+    Some(val: variant)
+  else
+    None
+  end
+end
+
+// ─── Divergence predicates (T-Seq ⊥) ───────────────────────────────────────
+
+/** True when a HirExprKind is structurally divergent for T-Seq purposes:
+ *  throws, or every branch of a match/if reduces to divergent.
+ *  Depth-bounded to prevent pathological cycles (64 is sufficient for
+ *  any realistic nesting from the surface language).
+ */
+export let infer_expr_diverges_depth = fn (en: HirExprKind, depth: i64) -> bool do
+  if depth <= 0 then return false end
+  match en do
+    | Raise(_) -> return true
+    | Match(target: _, cases: cs) -> return infer_all_cases_diverge(cases: cs, depth: depth - 1)
+    | If(cond: _, then_branch: tb, else_branch: eb) ->
+      match eb do
+        | None -> return false
+        | Some(val: ebs) ->
+          return infer_stmts_tail_diverges(stmts: tb, depth: depth - 1) &&
+                 infer_stmts_tail_diverges(stmts: ebs, depth: depth - 1)
+      end
+    | _ -> return false
+  end
+end
+
+/** True when all match-case bodies are divergent (used by infer_expr_diverges_depth). */
+export let infer_all_cases_diverge = fn (cases: [HirMatchCase], depth: i64) -> bool do
+  match cases do
+    | [] -> return true
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      if !infer_stmts_tail_diverges(stmts: b, depth) then return false end
+      return infer_all_cases_diverge(cases: rest, depth)
+  end
+end
+
+/** True when the last statement of a block is divergent. */
+export let infer_stmts_tail_diverges = fn (stmts: [HirStmt], depth: i64) -> bool do
+  if depth <= 0 then return false end
+  match stmts do
+    | [] -> return false
+    | HirStmt(node: nd, span: _) :: [] ->
+      return infer_stmt_kind_diverges(s: nd, depth)
+    | _ :: rest ->
+      return infer_stmts_tail_diverges(stmts: rest, depth: depth - 1)
+  end
+end
+
+/** T-Seq dead-code predicate: returns true when a statement definitely
+ *  diverges (control never reaches the next statement in the sequence).
+ *  Recognises (spec tail(s) = ⊥):
+ *   - `return e`                              — Return stmt
+ *   - `throw Exn(...)`                        — Expr stmt whose top node is Raise
+ *   - `let x = throw e'`                      — Let whose RHS is a Raise or other divergent expr
+ *   - `let x = if c then THROW else THROW end` — Let with divergent if/match RHS
+ *   - `if c then THROW else THROW end`        — Expr stmt, if with both arms divergent
+ *   - `match e { p -> THROW | ... }`          — Expr stmt, match with all arms divergent
+ */
+export let stmt_diverges = fn (s: HirStmtKind) -> bool do
+  return infer_stmt_kind_diverges(s, depth: 64)
+end
+
+export let infer_stmt_kind_diverges = fn (s: HirStmtKind, depth: i64) -> bool do
+  if depth <= 0 then return false end
+  match s do
+    | Return(_) -> return true
+    | Expr(expr: HirExpr(node: en, span: _)) ->
+      return infer_expr_diverges_depth(en, depth: depth - 1)
+    | Let(name: _, sigil: _, typ: _, value: HirExpr(node: rhs, span: _)) ->
+      return infer_expr_diverges_depth(rhs, depth: depth - 1)
+    | _ -> return false
+  end
+end
+
+// ─── Inject-site checks ─────────────────────────────────────────────────────
+
+export let check_handlers_bound = fn (state: CheckState, handlers: [string], span: Span) -> InferExprResult throws { TypeError } do
+  match handlers do
+    | [] -> return InferExprOk(state, subst: subst.subst_empty(), typ: TyUnit)
+    | h :: rest ->
+      match tctypes.env_lookup(env: tctypes.state_env(state), name: h) do
+        | None -> return InferExprErr(message: "inject: unbound handler '" ++ h ++ "'", span)
+        | Some(val: Scheme(vars: _, typ: ht)) ->
+          // spec T-Inject: strip(τ) does not peel @, so a
+          // thunk handler @σ does not unify with `handler P ρ`. Surface a
+          // suggestion to force the thunk explicitly.
+          match ht do
+            | TyLazy(inner: _) ->
+              return InferExprErr(message: "inject: handler '" ++ h ++ "' has thunk type `" ++ tctypes.type_to_string(typ: ht) ++ "`; force it explicitly (e.g. `inject @" ++ h ++ " do ... end`)", span)
+            | _ -> return check_handlers_bound(state, handlers: rest, span)
+          end
+      end
+  end
+end
+
+let str_list_contains = fn (xs: [string], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == s then return true end
+      return str_list_contains(xs: rest, s)
+  end
+end
+
+// ─── T-Inject: injection uniqueness (∀i≠j. P_i ≠ P_j) ──────────────────────
+
+/** Look up a handler name in the env and return its TyHandler port name.
+ *  Returns None if the binding does not resolve to a TyHandler (non-handler
+ *  bindings are already rejected by check_handlers_bound before this runs).
+ */
+let handler_port_name = fn (state: CheckState, h: string) -> Option<string> do
+  match tctypes.env_lookup(env: tctypes.state_env(state), name: h) do
+    | None -> return None
+    | Some(val: Scheme(vars: _, typ: ht)) ->
+      match ht do
+        | TyHandler(name: pname, requires: _) -> return Some(val: pname)
+        | _ -> return None
+      end
+  end
+end
+
+/** Check that no two handlers in the inject list target the same port.
+ *  Enforces T-Inject premise ∀i≠j. P_i ≠ P_j.
+ *  `seen` accumulates port names already encountered.
+ */
+export let check_inject_uniqueness = fn (state: CheckState, handlers: [string], seen: [string], span: Span) -> unit throws { TypeError } do
+  match handlers do
+    | [] -> return ()
+    | h :: rest ->
+      match handler_port_name(state: state, h) do
+        | None ->
+          // Not a TyHandler — check_handlers_bound already caught this or it
+          // is a non-handler type that will be rejected elsewhere; skip.
+          return check_inject_uniqueness(state, handlers: rest, seen, span)
+        | Some(val: pname) ->
+          if str_list_contains(xs: seen, s: pname) then
+            throw DuplicateInjectPort(port_name: pname, span)
+          end
+          return check_inject_uniqueness(state, handlers: rest, seen: pname :: seen, span)
+      end
+  end
+end
+
+// ─── T-Inject: handler require ⊆ ambient (∀i. ρ_i ⊆ ρ_q) ───────────────────
+
+/** Check whether a capability name appears in a require row.
+ *  Row entries in a cap/require row are TyUserDefined(name: cap_name, args: []).
+ */
+let row_contains_cap = fn (cap_name: string, row: TypeExpr) -> bool do
+  match row do
+    | TyRow(types: ts, rest: _) -> return cap_entry_list_contains(cap_name: cap_name, ts)
+    | _ -> return false
+  end
+end
+
+let cap_entry_list_contains = fn (cap_name: string, ts: [TypeExpr]) -> bool do
+  match ts do
+    | [] -> return false
+    | TyUserDefined(name: n, args: _) :: rest ->
+      if n == cap_name then return true end
+      return cap_entry_list_contains(cap_name: cap_name, ts: rest)
+    | _ :: rest -> return cap_entry_list_contains(cap_name: cap_name, ts: rest)
+  end
+end
+
+/** Check that every capability in `handler_row` is also present in `ambient_row`.
+ *  Returns None on success; Some(missing_cap_name) on first violation.
+ */
+let first_missing_cap = fn (handler_row: TypeExpr, ambient_row: TypeExpr) -> Option<string> do
+  match handler_row do
+    | TyRow(types: ts, rest: _) -> return first_missing_cap_in_list(ts: ts, ambient_row)
+    | _ -> return None
+  end
+end
+
+let first_missing_cap_in_list = fn (ts: [TypeExpr], ambient_row: TypeExpr) -> Option<string> do
+  match ts do
+    | [] -> return None
+    | TyUserDefined(name: cname, args: _) :: rest ->
+      if row_contains_cap(cap_name: cname, row: ambient_row) then
+        return first_missing_cap_in_list(ts: rest, ambient_row)
+      end
+      return Some(val: cname)
+    | _ :: rest -> return first_missing_cap_in_list(ts: rest, ambient_row)
+  end
+end
+
+/** Check that each handler's require row is a subset of the ambient require row.
+ *  Enforces T-Inject premise ∀i. ρ_i ⊆ ρ_q.
+ */
+export let check_inject_require_subset = fn (state: CheckState, handlers: [string], ambient: TypeExpr, span: Span) -> unit throws { TypeError } do
+  match handlers do
+    | [] -> return ()
+    | h :: rest ->
+      match tctypes.env_lookup(env: tctypes.state_env(state), name: h) do
+        | None -> return check_inject_require_subset(state, handlers: rest, ambient, span)
+        | Some(val: Scheme(vars: _, typ: ht)) ->
+          match ht do
+            | TyHandler(name: _, requires: handler_req) ->
+              match first_missing_cap(handler_row: handler_req, ambient_row: ambient) do
+                | None -> return check_inject_require_subset(state, handlers: rest, ambient, span)
+                | Some(val: missing) ->
+                  throw HandlerRequireNotSubset(handler_name: h, missing_cap: missing, span)
+              end
+            | _ -> return check_inject_require_subset(state, handlers: rest, ambient, span)
+          end
+      end
+  end
+end

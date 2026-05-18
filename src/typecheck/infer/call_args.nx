@@ -1,0 +1,243 @@
+/**
+ * typecheck/infer/call_args: pure leaf helpers for call-argument validation.
+ *
+ * Hosts the parts of call-arg inference that do NOT recurse through
+ * infer_expr — label matching, parameter-order reordering, and the
+ * T-App B-set conflict scan (borrow-vs-consuming-use pre-check).
+ * The entry points `check_call_args` and `check_call_args_walk` stay in
+ * src/typecheck/infer.nx because they call back into infer_expr to type
+ * each argument.
+ *
+ * Extracted from src/typecheck/infer.nx.
+ */
+
+import {
+  HirExpr, HirExprKind, HirCallArg, HirNamedExpr
+} from "src/ir/hir/types.nx"
+import { NamedType, Sigil } from "src/common/ast.nx"
+import { Option, Some, None } from "std:option"
+import * as list from "std:list"
+
+/** Validation result for call-arg label checking. Kept
+ *  separate from `InferExprResult` so the helpers don't need a CheckState.
+ */
+export type ArgLabelCheck = ArgLabelOk | ArgLabelErr(message: string)
+
+// ─── Arg-label validation ───────────────────────────────────────────────────
+
+export let validate_arg_labels = fn (args: [HirCallArg], params: [NamedType]) -> ArgLabelCheck do
+  match check_args_have_param_names(args, params) do
+    | ArgLabelErr(message: m) -> return ArgLabelErr(message: m)
+    | ArgLabelOk -> return check_params_have_arg_labels(params, args)
+  end
+end
+
+let check_args_have_param_names = fn (args: [HirCallArg], params: [NamedType]) -> ArgLabelCheck do
+  match args do
+    | [] -> return ArgLabelOk
+    | HirCallArg(label: l, value: _) :: rest ->
+      if param_set_contains(params, name: l) then
+        return check_args_have_param_names(args: rest, params)
+      else
+        return ArgLabelErr(
+          message: "function call argument label '" ++ l
+            ++ "' does not match any parameter name — use 'name: value' (got positional or mismatched-label argument)"
+        )
+      end
+  end
+end
+
+let check_params_have_arg_labels = fn (params: [NamedType], args: [HirCallArg]) -> ArgLabelCheck do
+  match params do
+    | [] -> return ArgLabelOk
+    | NamedType(name: pn, typ: _) :: rest ->
+      if arg_set_contains(args, label: pn) then
+        return check_params_have_arg_labels(params: rest, args)
+      else
+        return ArgLabelErr(message: "missing argument: " ++ pn)
+      end
+  end
+end
+
+let param_set_contains = fn (params: [NamedType], name: string) -> bool do
+  match params do
+    | [] -> return false
+    | NamedType(name: pn, typ: _) :: rest ->
+      if pn == name then return true end
+      return param_set_contains(params: rest, name)
+  end
+end
+
+let arg_set_contains = fn (args: [HirCallArg], label: string) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: l, value: _) :: rest ->
+      if l == label then return true end
+      return arg_set_contains(args: rest, label)
+  end
+end
+
+/** Reorder `args` so its labels appear in `params`-declared order.
+ *  Precondition: validate_arg_labels has already succeeded, so every
+ *  param has a unique matching arg.
+ */
+export let reorder_args_by_params = fn (args: [HirCallArg], params: [NamedType]) -> [HirCallArg] do
+  return reorder_args_by_params_go(args, params, acc: [])
+end
+
+let reorder_args_by_params_go = fn (args: [HirCallArg], params: [NamedType], acc: [HirCallArg]) -> [HirCallArg] do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | NamedType(name: pn, typ: _) :: rest ->
+      match find_arg_by_label(args, label: pn) do
+        | None -> return list.reverse(xs: acc)  // unreachable post-validation
+        | Some(val: a) -> return reorder_args_by_params_go(args, params: rest, acc: a :: acc)
+      end
+  end
+end
+
+let find_arg_by_label = fn (args: [HirCallArg], label: string) -> Option<HirCallArg> do
+  match args do
+    | [] -> return None
+    | HirCallArg(label: l, value: v) :: rest ->
+      if l == label then return Some(val: HirCallArg(label: l, value: v)) end
+      return find_arg_by_label(args: rest, label)
+  end
+end
+
+// ─── B-set conflict check (T-App B-set premise, spec §T-App) ─────────────────
+
+// Collect the names of all Borrow(&x) arguments in the arg list.
+let collect_borrow_arg_names = fn (args: [HirCallArg], acc: [string]) -> [string] do
+  match args do
+    | [] -> return list.reverse(xs: acc)
+    | HirCallArg(label: _, value: HirExpr(node: Borrow(name: n, sigil: _), span: _)) :: rest ->
+      return collect_borrow_arg_names(args: rest, acc: n :: acc)
+    | _ :: rest ->
+      return collect_borrow_arg_names(args: rest, acc)
+  end
+end
+
+// Recursive helpers: return true if `name` appears as a consuming (non-Borrow)
+// Variable reference anywhere in the PURE sub-expression tree of a call arg.
+// We must walk sub-expressions because a nested call like `id_box(y: x)` is a
+// consuming use of `x` even though the top-level node is `Call(...)`.
+//
+// Spec B-set:
+//   x ∈ B  iff  (∃i. e_i = &x)  ∧  (∀j. x ∈ fv(e_j) → e_j = &x)
+// Any arg that contains `x` as a non-borrow reference is a consuming use, so
+// x is NOT in B and the borrow cannot be valid.
+//
+// Scope: walk Call/Ctor/Record/Array/BinOp/UnOp/Index/FieldAccess — the pure
+// expression forms that appear as call args in practice.  Statement-body forms
+// (If/Match/Lambda/Handler/While/For/Thunk/Force/Raise) are left as false-
+// not-consuming: the B-set check is a pre-scan guard; any residual violation
+// in those forms is caught downstream by the main typechecker.
+
+let expr_has_variable_consuming = fn (expr: HirExpr, name: string) -> bool do
+  let HirExpr(node: node_k, span: _) = expr
+  return expr_kind_has_variable_consuming(k: node_k, name)
+end
+
+let expr_kind_has_variable_consuming = fn (k: HirExprKind, name: string) -> bool do
+  match k do
+    | Literal(_) -> return false
+    | Borrow(name: _, sigil: _) -> return false
+    | ExternalRef(symbol: _, type_params: _, arg_names: _, typ: _) -> return false
+    | Variable(name: vname, sigil: _) -> return vname == name
+    | BinOp(left: lhs, op: _, right: rhs) ->
+      return expr_has_variable_consuming(expr: lhs, name)
+        || expr_has_variable_consuming(expr: rhs, name)
+    | UnOp(op: _, operand: opnd) ->
+      return expr_has_variable_consuming(expr: opnd, name)
+    | Call(func: _, args: cargs) ->
+      return call_args_has_variable_consuming(args: cargs, name)
+    | Ctor(variant: _, args: cargs, sigil: _) ->
+      return expr_list_has_variable_consuming(exprs: cargs, name)
+    | Record(fields: rfields) ->
+      return named_exprs_has_variable_consuming(fields: rfields, name)
+    | Array(elems: aelems) ->
+      return expr_list_has_variable_consuming(exprs: aelems, name)
+    | Index(target: tgt, index: idx) ->
+      return expr_has_variable_consuming(expr: tgt, name)
+        || expr_has_variable_consuming(expr: idx, name)
+    | FieldAccess(target: tgt, field: _) ->
+      return expr_has_variable_consuming(expr: tgt, name)
+    | If(cond: _, then_branch: _, else_branch: _) -> return false
+    | Match(target: _, cases: _) -> return false
+    | While(cond: _, body: _) -> return false
+    | For(var: _, start: _, end_expr: _, body: _) -> return false
+    | Lambda(type_params: _, params: _, ret_type: _, body: _) -> return false
+    | Raise(expr: _) | Force(expr: _) -> return false
+    | Thunk(body: _) -> return false
+    | Handler(port_name: _, requires: _, arms: _) -> return false
+  end
+end
+
+let expr_list_has_variable_consuming = fn (exprs: [HirExpr], name: string) -> bool do
+  match exprs do
+    | [] -> return false
+    | elem :: rest ->
+      if expr_has_variable_consuming(expr: elem, name) then return true end
+      return expr_list_has_variable_consuming(exprs: rest, name)
+  end
+end
+
+let call_args_has_variable_consuming = fn (args: [HirCallArg], name: string) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: _, value: arg_val) :: rest ->
+      if expr_has_variable_consuming(expr: arg_val, name) then return true end
+      return call_args_has_variable_consuming(args: rest, name)
+  end
+end
+
+let named_exprs_has_variable_consuming = fn (fields: [HirNamedExpr], name: string) -> bool do
+  match fields do
+    | [] -> return false
+    | HirNamedExpr(name: _, value: fval) :: rest ->
+      if expr_has_variable_consuming(expr: fval, name) then return true end
+      return named_exprs_has_variable_consuming(fields: rest, name)
+  end
+end
+
+// Return true if `name` appears as a consuming (non-Borrow) use anywhere
+// inside any of the given call args.  Recursively walks pure sub-expressions
+// so that nested calls such as `id_box(y: x)` are correctly detected as
+// consuming uses of `x`.
+let args_has_consuming_use_of = fn (args: [HirCallArg], name: string) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: _, value: HirExpr(node: val_node, span: _)) :: rest ->
+      match val_node do
+        | Borrow(name: _, sigil: _) ->
+          return args_has_consuming_use_of(args: rest, name)
+        | _ ->
+          if expr_kind_has_variable_consuming(k: val_node, name) then return true end
+          return args_has_consuming_use_of(args: rest, name)
+      end
+  end
+end
+
+// Check that no Borrow(&x) arg appears alongside a consuming use of x.
+// Iterate over the borrow-name list and check each against the full arg list.
+let check_bset_names_no_conflict = fn (borrow_names: [string], all_args: [HirCallArg]) -> ArgLabelCheck do
+  match borrow_names do
+    | [] -> return ArgLabelOk
+    | n :: rest ->
+      if args_has_consuming_use_of(args: all_args, name: n) then
+        return ArgLabelErr(
+          message: "T-App B-set violation: linear '" ++ n
+            ++ "' is passed both as a consuming argument and as a borrow '&"
+            ++ n ++ "' in the same call — consuming use and borrow cannot coexist (spec §T-App)"
+        )
+      end
+      return check_bset_names_no_conflict(borrow_names: rest, all_args)
+  end
+end
+
+// Entry point: collect all Borrow-arg names then check for consuming conflicts.
+export let check_bset_no_consume_borrow_conflict = fn (args: [HirCallArg]) -> ArgLabelCheck do
+  let borrow_names = collect_borrow_arg_names(args, acc: [])
+  return check_bset_names_no_conflict(borrow_names, all_args: args)
+end
