@@ -397,21 +397,25 @@ export type LinFrame = LinFrame(vars: [string])
 /** Live linear bindings + enclosing frame snapshots. `frame_stack` is a
  *  stack of `vars` snapshots at function-body entry and `try`-body entry.
  *  The top is the "covered" set for the throwable-call leak check.
+ *  `must_consume` names bindings (e.g. with-@k cont_binders) that must be
+ *  consumed on EVERY exit path, including early `return` — unlike regular
+ *  linear params whose end-of-function check covers only the fall-through
+ *  path.
  */
-export type LinState = LinState(vars: [string], frame_stack: [LinFrame])
+export type LinState = LinState(vars: [string], frame_stack: [LinFrame], must_consume: [string])
 
 let lin_empty = fn () -> LinState do
-  return LinState(vars: [], frame_stack: [])
+  return LinState(vars: [], frame_stack: [], must_consume: [])
 end
 
 let lin_add = fn (st: LinState, name: string) -> LinState do
-  let LinState(vars: vs, frame_stack: fs) = st
-  return LinState(vars: name :: vs, frame_stack: fs)
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc) = st
+  return LinState(vars: name :: vs, frame_stack: fs, must_consume: mc)
 end
 
 let lin_remove = fn (st: LinState, name: string) -> LinState do
-  let LinState(vars: vs, frame_stack: fs) = st
-  return LinState(vars: remove_one(xs: vs, target: name), frame_stack: fs)
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc) = st
+  return LinState(vars: remove_one(xs: vs, target: name), frame_stack: fs, must_consume: mc)
 end
 
 let remove_one = fn (xs: [string], target: string) -> [string] do
@@ -424,7 +428,7 @@ let remove_one = fn (xs: [string], target: string) -> [string] do
 end
 
 let lin_member = fn (st: LinState, name: string) -> bool do
-  let LinState(vars: vs, frame_stack: _) = st
+  let LinState(vars: vs, frame_stack: _, must_consume: _) = st
   return str_member(xs: vs, target: name)
 end
 
@@ -460,20 +464,20 @@ let all_in = fn (needles: [string], haystack: [string]) -> bool do
 end
 
 let lin_push_frame = fn (st: LinState) -> LinState do
-  let LinState(vars: vs, frame_stack: fs) = st
-  return LinState(vars: vs, frame_stack: LinFrame(vars: copy(xs: vs)) :: fs)
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc) = st
+  return LinState(vars: vs, frame_stack: LinFrame(vars: copy(xs: vs)) :: fs, must_consume: mc)
 end
 
 let lin_pop_frame = fn (st: LinState) -> LinState do
-  let LinState(vars: vs, frame_stack: fs) = st
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc) = st
   match fs do
     | [] -> return st
-    | _ :: rest -> return LinState(vars: vs, frame_stack: rest)
+    | _ :: rest -> return LinState(vars: vs, frame_stack: rest, must_consume: mc)
   end
 end
 
 let lin_top_frame = fn (st: LinState) -> Option<[string]> do
-  let LinState(vars: _, frame_stack: fs) = st
+  let LinState(vars: _, frame_stack: fs, must_consume: _) = st
   match fs do
     | [] -> return None
     | LinFrame(vars: top) :: _ -> return Some(val: top)
@@ -504,8 +508,26 @@ let join_inner = fn (xs: [string]) -> string do
 end
 
 let lin_set_vars = fn (st: LinState, vs: [string]) -> LinState do
-  let LinState(vars: _, frame_stack: fs) = st
-  return LinState(vars: vs, frame_stack: fs)
+  let LinState(vars: _, frame_stack: fs, must_consume: mc) = st
+  return LinState(vars: vs, frame_stack: fs, must_consume: mc)
+end
+
+/** Return the set of names that must be consumed on every exit path
+ *  (currently seeded only by with-@k cont_binder arms).
+ */
+let lin_get_must_consume = fn (st: LinState) -> [string] do
+  let LinState(vars: _, frame_stack: _, must_consume: mc) = st
+  return mc
+end
+
+/** Return the first name in `mc` that is still live (in `live`), or None. */
+let find_live_must_consume = fn (mc: [string], live: [string]) -> Option<string> do
+  match mc do
+    | [] -> return None
+    | n :: rest ->
+      if str_member(xs: live, target: n) then return Some(val: n) end
+      return find_live_must_consume(mc: rest, live)
+  end
 end
 
 // ─── Lambda-capture consumption ──────────────────────────────────────────────
@@ -782,20 +804,46 @@ end
 let check_handler_arms = fn (arms: [HirHandlerArm], sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef]) -> unit throws { TypeError } do
   match arms do
     | [] -> return ()
-    | HirHandlerArm(arm: f, cont_binder: _) :: rest ->
-      check_function(func: f, sigs, tdefs, enum_defs)
+    | HirHandlerArm(arm: f, cont_binder: kb) :: rest ->
+      check_function_with_kont(func: f, kont: kb, sigs, tdefs, enum_defs)
       return check_handler_arms(arms: rest, sigs, tdefs, enum_defs)
   end
 end
 
 let check_function = fn (func: HirFunction, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef]) -> unit throws { TypeError } do
+  return check_function_with_kont(func, kont: None, sigs, tdefs, enum_defs)
+end
+
+/** Check one function body for linearity. When `kont` is `Some(k)`, the
+ *  cont_binder `k` is seeded into the live set and into `must_consume` so
+ *  that the path-sensitive check (a) detects `k` left live at function end
+ *  and (b) detects `k` not consumed before any early `return` (the latter
+ *  via the must_consume check in check_stmt Return).
+ */
+let check_function_with_kont = fn (func: HirFunction, kont: Option<string>, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef]) -> unit throws { TypeError } do
   match func do | HirFunction(name: _, type_params: _, params: ps, ret_type: _, throw_row: _, body: b, span: sp, file: _, requires: _) ->
     match b do
       | EagerBody(stmts) ->
         // Seed live set with linear params; push frame snapshot so the
         // body's throwable-call check excludes them (call-site contract).
         let initial_vars = collect_linear_params(params: ps, tdefs, acc: [])
-        let st0 = lin_set_vars(st: lin_empty(), vs: initial_vars)
+        // When a cont_binder k is present it must be consumed on every exit
+        // path (including early `return`). Two cases:
+        //   (a) synthesized handler binding arms: synthesize_handler has
+        //       already added k as a SigilLazy param, so k is already in
+        //       initial_vars — only add k to must_consume, not to vars again.
+        //   (b) inline handler expressions: k is NOT a param (no
+        //       synthesize_handler call); add k to both vars and must_consume.
+        let kont_vars = match kont do | None -> [] | Some(val: k) -> k :: [] end
+        // Seed k into the live set only when it is NOT already present via params.
+        let all_vars = match kont do
+          | None -> initial_vars
+          | Some(val: k) ->
+            if str_member(xs: initial_vars, target: k) then initial_vars
+            else k :: initial_vars
+            end
+        end
+        let st0 = LinState(vars: all_vars, frame_stack: [], must_consume: kont_vars)
         let st1 = lin_push_frame(st: st0)
         let st2 = check_stmts(stmts, st: st1, sigs, tdefs, enum_defs)
         // Function-end consumption check: any linear param or local left
@@ -811,7 +859,7 @@ let check_function = fn (func: HirFunction, sigs: [SigEntry], tdefs: [RecordDef]
 end
 
 let lin_state_vars = fn (st: LinState) -> [string] do
-  let LinState(vars: vs, frame_stack: _) = st
+  let LinState(vars: vs, frame_stack: _, must_consume: _) = st
   return vs
 end
 
@@ -932,9 +980,16 @@ let check_stmt = fn (
       // close the leak window via the surrounding consumer.
       return check_expr(expr: e, st, sigs, tdefs, enum_defs, at_stmt_level)
     | Return(expr: e) ->
-      // After return, the function exits; the unused-linear check fires at
-      // function level. We still walk e to consume linears used in it.
-      return check_expr(expr: e, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      // Walk the returned expression so any linear uses inside it are consumed.
+      let st1 = check_expr(expr: e, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      // must_consume vars (cont_binders from with-@k handler arms) must be
+      // consumed on every exit path, including early returns. After walking
+      // the return-expression any must_consume var still live has leaked.
+      match find_live_must_consume(mc: lin_get_must_consume(st: st1), live: lin_state_vars(st: st1)) do
+        | Some(val: leaked) -> throw LinearUnused(name: leaked, span)
+        | None -> ()
+      end
+      return st1
     | Assign(target: t, value: v) ->
       let st1 = check_expr(expr: t, st, sigs, tdefs, enum_defs, at_stmt_level: false)
       return check_expr(expr: v, st: st1, sigs, tdefs, enum_defs, at_stmt_level: false)
@@ -1126,7 +1181,14 @@ let check_expr_kind = fn (
       // deferral here (the @T binder check in src/ir/linearity.nx covers
       // the lazy-binding-specific case).
       return check_expr(expr: b, st, sigs, tdefs, enum_defs, at_stmt_level: false)
-    | ExternalRef(_) | Handler(_) -> return st
+    | ExternalRef(_) -> return st
+    | Handler(port_name: _, requires: _, arms) ->
+      // Check each inline handler arm for linearity. Arms with a cont_binder
+      // (`with @k`) need path-sensitive checking — k must be consumed on every
+      // exit path. check_function_with_kont handles both the inline case (k
+      // not yet a param) and the synthesized-binding case (k already a param).
+      check_handler_arms(arms, sigs, tdefs, enum_defs)
+      return st
   end
 end
 
