@@ -1,0 +1,560 @@
+/**
+ * typecheck/infer/exprs: expression-form type inference.
+ *
+ * Owns:
+ *   - Record / array / index / field-access inference (infer_record,
+ *     infer_array, infer_index, infer_field_access).
+ *   - Control-flow expression inference (infer_if, infer_match,
+ *     infer_match_cases, infer_while, infer_for).
+ *   - Closure / effect expression inference (infer_lambda, infer_raise,
+ *     infer_force, infer_thunk).
+ *
+ * All entry points receive `infer_expr_fn` (and `infer_stmts_fn` where the
+ * body needs statement-level inference) as callbacks because these forms
+ * recurse through sub-expressions via `infer_expr`.
+ *
+ * Extracted from src/typecheck/infer.nx.
+ */
+
+import { Span } from "src/common/token.nx"
+import {
+  TypeExpr, TyI64, TyBool, TyUnit, TyArray, TyRecord, TyLazy, TyLinear,
+  TyBorrow, TyRef, TyUserDefined, TyArrow,
+  NamedType, RecordDef
+} from "src/common/ast.nx"
+import {
+  HirExpr, HirStmt, HirNamedExpr, HirMatchCase, HirParam
+} from "src/ir/hir/types.nx"
+import {
+  SubstEntry, Scheme, CheckState, FreshResult,
+  InferExprResult, InferExprOk, InferExprErr,
+  UnifyOk, UnifyErr,
+  BindResult, BindOk, BindErr
+}, * as tctypes from "src/typecheck/types.nx"
+import * as subst from "src/typecheck/subst.nx"
+import * as unify from "src/typecheck/unify.nx"
+import * as exhaustive from "src/typecheck/exhaustive.nx"
+import * as capture from "src/typecheck/capture.nx"
+import * as tcwf from "src/typecheck/tcwf.nx"
+import {
+  lookup_named_type, find_linear_field
+} from "src/typecheck/infer/collections.nx"
+import {
+  append_env, bind_pattern
+} from "src/typecheck/infer/statements.nx"
+import {
+  infer_stmts_tail_diverges,
+  check_raise_admitted, exception_name_of_raised,
+  RaiseAdmissionResult, RaiseOk, RaiseRejected
+} from "src/typecheck/infer/control_flow.nx"
+import {
+  build_param_named_types, add_params_to_env
+} from "src/typecheck/infer/closure.nx"
+import { TypeError, DuplicateRecordLabel, UnknownField, RefEscapes } from "src/typecheck/errors.nx"
+import { suggest_names } from "src/common/levenshtein.nx"
+import * as list from "std:list"
+import { Option, Some, None } from "std:option"
+
+export let infer_record = fn (
+  state: CheckState, fields: [HirNamedExpr], span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  return infer_record_fields(state, fields, subst: subst.subst_empty(), acc: [], span, infer_expr_fn)
+end
+
+let infer_record_fields = fn (
+  state: CheckState, fields: [HirNamedExpr], subst: [SubstEntry], acc: [NamedType], span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match fields do
+    | [] ->
+      return InferExprOk(state, subst, typ: TyRecord(fields: list.reverse(xs: acc)))
+    | HirNamedExpr(name: n, value: v) :: rest ->
+      // Spec T-Record premise distinct(ℓ̄): reject duplicate field labels.
+      match lookup_named_type(nts: acc, name: n) do
+        | Some(val: _) -> throw DuplicateRecordLabel(label: n, span)
+        | None -> ()
+      end
+      match infer_expr_fn(state, expr: v, ret_type: TyUnit) do
+        | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "record field " ++ n ++ ": " ++ m, span: espan)
+        | InferExprOk(state: st1, subst: s1, typ: ft) ->
+          let sm = subst.subst_compose(s1: subst, s2: s1)
+          return infer_record_fields(
+            state: st1, fields: rest, subst: sm,
+            acc: NamedType(name: n, typ: ft) :: acc, span, infer_expr_fn
+          )
+      end
+  end
+end
+
+export let infer_array = fn (
+  state: CheckState, elems: [HirExpr], span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match elems do
+    | [] ->
+      let FreshResult(state: st, typ: tv) = tctypes.tc_fresh_var(state)
+      return InferExprOk(state: st, subst: subst.subst_empty(), typ: TyArray(elem: tv))
+    | first :: rest ->
+      match infer_expr_fn(state, expr: first, ret_type: TyUnit) do
+        | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+        | InferExprOk(state: st1, subst: s1, typ: t1) ->
+          return unify_array_elems(state: st1, elems: rest, subst: s1, elem_type: t1, span, infer_expr_fn)
+      end
+  end
+end
+
+let unify_array_elems = fn (
+  state: CheckState, elems: [HirExpr], subst: [SubstEntry], elem_type: TypeExpr, span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match elems do
+    | [] -> return InferExprOk(state, subst, typ: TyArray(elem: subst.subst_apply(subst, typ: elem_type)))
+    | e :: rest ->
+      match infer_expr_fn(state, expr: e, ret_type: TyUnit) do
+        | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+        | InferExprOk(state: st1, subst: s1, typ: et) ->
+          let sm = subst.subst_compose(s1: subst, s2: s1)
+          let tdefs = tctypes.state_typedefs(state: st1)
+          match unify.unify(t1: et, t2: subst.subst_apply(subst: sm, typ: elem_type), tdefs) do
+            | UnifyErr(message: m) -> return InferExprErr(message: "array element: " ++ m, span)
+            | UnifyOk(subst: s2) ->
+              return unify_array_elems(state: st1, elems: rest, subst: subst.subst_compose(s1: sm, s2), elem_type, span, infer_expr_fn)
+          end
+      end
+  end
+end
+
+export let infer_index = fn (
+  state: CheckState, target: HirExpr, index: HirExpr, span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match infer_expr_fn(state, expr: target, ret_type: TyUnit) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    | InferExprOk(state: st1, subst: s1, typ: tt) ->
+      match infer_expr_fn(state: st1, expr: index, ret_type: TyUnit) do
+        | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+        | InferExprOk(state: st2, subst: s2, typ: it) ->
+          let sm = subst.subst_compose(s1, s2)
+          let tdefs = tctypes.state_typedefs(state: st2)
+          match unify.unify(t1: it, t2: TyI64, tdefs) do
+            | UnifyErr(message: m) -> return InferExprErr(message: "index must be i64: " ++ m, span)
+            | UnifyOk(subst: s3) ->
+              let sf = subst.subst_compose(s1: sm, s2: s3)
+              let arr_t = subst.subst_apply(subst: sf, typ: tt)
+              // Peel TyBorrow / TyLinear / TyLazy wrappers so `arr_borrow[idx]`
+              // works whenever the underlying type is `[| T |]`. Same shape as
+              // the read-side of the Index arm in infer_stmt's Assign handler
+              //
+              match arr_t do
+                | TyArray(elem: e)
+                | TyBorrow(inner: TyArray(elem: e))
+                | TyLinear(inner: TyArray(elem: e))
+                | TyLazy(inner: TyArray(elem: e)) -> return InferExprOk(state: st2, subst: sf, typ: e)
+                | _ -> return InferExprErr(message: "cannot index non-array type", span)
+              end
+          end
+      end
+  end
+end
+
+// T-Proj premise `¬linear(τ)`: a record whose any field carries a linear
+// type is itself structurally
+// linear. Projection on such a record would consume `r` via the sub-
+// derivation while exposing only one field — silently dropping the
+// other linear obligations. Reject at projection so the linear field
+// must be decomposed via record-pattern destructuring (P-Record's `⨄`
+// binds every linear field).
+
+export let infer_field_access = fn (
+  state: CheckState, target: HirExpr, field: string, span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match infer_expr_fn(state, expr: target, ret_type: TyUnit) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    | InferExprOk(state: st1, subst: s1, typ: tt) ->
+      let resolved = subst.subst_apply(subst: s1, typ: tt)
+      // T-Proj: expand typedef aliases to their underlying record fields.
+      // When the resolved type is TyUserDefined(name, args), look up the
+      // typedef, substitute type params, and project the requested field.
+      let fs = match resolved do
+        | TyRecord(fields: fs) -> Some(val: fs)
+        | TyUserDefined(name: n, args: targs) ->
+          match tctypes.typedef_lookup(defs: tctypes.state_typedefs(state: st1), name: n) do
+            | Some(val: RecordDef(name: _, is_public: _, type_params: tps, fields: rec_fields)) ->
+              let param_subst = unify.build_param_subst(params: tps, args: targs)
+              Some(val: subst.apply_named_types(subst: param_subst, nts: rec_fields))
+            | None -> None
+          end
+        | _ -> None
+      end
+      match fs do
+        | None -> return InferExprErr(message: "field access on non-record type", span)
+        | Some(val: rec_fields) ->
+          match lookup_named_type(nts: rec_fields, name: field) do
+            | Some(val: ft) ->
+              match find_linear_field(fields: rec_fields, tdefs: tctypes.state_typedefs(state: st1), depth: 8) do
+                | Some(val: leaker) ->
+                  return InferExprErr(
+                    message: "T-Proj: cannot project field `" ++ field ++ "` on structurally-linear record (linear field `" ++ leaker ++ "` would be silently dropped); destructure via record pattern instead",
+                    span
+                  )
+                | None -> return InferExprOk(state: st1, subst: s1, typ: ft)
+              end
+            | None ->
+              let sugs = suggest_names(typo: field, candidates: named_type_names_list(nts: rec_fields))
+              throw UnknownField(name: field, suggestions: sugs, span)
+          end
+      end
+  end
+end
+
+/** Collect field names from a [NamedType] list (for suggestions). */
+let named_type_names_list = fn (nts: [NamedType]) -> [string] do
+  return named_type_names_list_go(nts, acc: [])
+end
+
+let named_type_names_list_go = fn (nts: [NamedType], acc: [string]) -> [string] do
+  match nts do
+    | [] -> return acc
+    | NamedType(name: n, typ: _) :: rest -> return named_type_names_list_go(nts: rest, acc: n :: acc)
+  end
+end
+
+// `if c then T else E end` types as the unified tail-expression type of T
+// and E (mirrors `infer_match_cases`), so `let d = if v == K then 1 else 0
+// end` correctly binds `d : i64` rather than `unit`. An `if` without `else`
+// types as TyUnit (the missing-arm path has no value to unify against), and
+// non-tail / empty branches fall back to TyUnit through `infer_stmts`.
+
+export let infer_if = fn (
+  state: CheckState, cond: HirExpr, then_b: [HirStmt], else_b: Option<[HirStmt]>, ret_type: TypeExpr, span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError },
+  infer_stmts_fn: (state: CheckState, stmts: [HirStmt], ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match infer_expr_fn(state, expr: cond, ret_type: TyUnit) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    | InferExprOk(state: st1, subst: s1, typ: ct) ->
+      let tdefs = tctypes.state_typedefs(state: st1)
+      match unify.unify(t1: ct, t2: TyBool, tdefs) do
+        | UnifyErr(message: m) -> return InferExprErr(message: "if condition must be bool: " ++ m, span)
+        | UnifyOk(subst: s2) ->
+          let sm = subst.subst_compose(s1, s2)
+          let env1 = subst.subst_apply_env(subst: sm, env: tctypes.state_env(state: st1))
+          let st2 = tctypes.state_with_env(state: st1, env: env1)
+          match infer_stmts_fn(state: st2, stmts: then_b, ret_type) do
+            | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "if then: " ++ m, span: espan)
+            | InferExprOk(state: st3, subst: s3, typ: then_t) ->
+              let sm2 = subst.subst_compose(s1: sm, s2: s3)
+              // T-If: close the then-block scope — bindings introduced
+              // inside the then branch must not leak into the else branch or outer scope.
+              // Mirrors the env pop in infer_match_cases / infer_try.
+              let st3_closed = tctypes.state_with_env(state: st3, env: tctypes.state_env(state: st2))
+              match else_b do
+                | None ->
+                  let st_out = tctypes.state_with_env(state: st3, env: tctypes.state_env(state))
+                  return InferExprOk(state: st_out, subst: sm2, typ: TyUnit)
+                | Some(val: else_stmts) ->
+                  match infer_stmts_fn(state: st3_closed, stmts: else_stmts, ret_type) do
+                    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "if else: " ++ m, span: espan)
+                    | InferExprOk(state: st4, subst: s4, typ: else_t) ->
+                      let sm3 = subst.subst_compose(s1: sm2, s2: s4)
+                      let tdefs2 = tctypes.state_typedefs(state: st4)
+                      let then_applied = subst.subst_apply(subst: sm3, typ: then_t)
+                      let else_applied = subst.subst_apply(subst: sm3, typ: else_t)
+                      match unify.unify(t1: then_applied, t2: else_applied, tdefs: tdefs2) do
+                        | UnifyErr(message: m) ->
+                          return InferExprErr(message: "if branches: type mismatch — then `" ++ tctypes.type_to_string(typ: then_applied) ++ "`, else `" ++ tctypes.type_to_string(typ: else_applied) ++ "`: " ++ m, span)
+                        | UnifyOk(subst: s5) ->
+                          let final_subst = subst.subst_compose(s1: sm3, s2: s5)
+                          let result = subst.subst_apply(subst: final_subst, typ: else_applied)
+                          // T-If: close the else-block scope before returning to outer env.
+                          let st_out = tctypes.state_with_env(state: st4, env: tctypes.state_env(state))
+                          return InferExprOk(state: st_out, subst: final_subst, typ: result)
+                      end
+                  end
+              end
+          end
+      end
+  end
+end
+
+export let infer_match = fn (
+  state: CheckState, target: HirExpr, cases: [HirMatchCase], ret_type: TypeExpr, span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError },
+  infer_stmts_fn: (state: CheckState, stmts: [HirStmt], ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match infer_expr_fn(state, expr: target, ret_type: TyUnit) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    | InferExprOk(state: st1, subst: s1, typ: tt) ->
+      let scrutinee = subst.subst_apply(subst: s1, typ: tt)
+      match exhaustive.check_match_exhaustive(cases, scrutinee_type: scrutinee, enum_defs: tctypes.state_enums(state: st1), type_defs: tctypes.state_typedefs(state: st1)) do
+        | exhaustive.Exhaustive ->
+          return infer_match_cases(state: st1, cases, target_type: tt, subst: s1, ret_type, result_type: None, span, infer_stmts_fn)
+        | exhaustive.NonExhaustive(witness: w) ->
+          return InferExprErr(message: "non-exhaustive match on `" ++ tctypes.type_to_string(typ: scrutinee) ++ "`: missing pattern for `" ++ w ++ "`", span)
+        | exhaustive.RedundantArm(witness: w) ->
+          return InferExprErr(message: "redundant match on `" ++ tctypes.type_to_string(typ: scrutinee) ++ "`: " ++ w, span)
+        | exhaustive.ExnNoCatchAll ->
+          // Suppress hasCatchAll inside a try/catch catch body: selective
+          // catch is valid — unmatched exceptions propagate via WASM EH.
+          if tctypes.state_in_catch_body(state: st1) then
+            return infer_match_cases(state: st1, cases, target_type: tt, subst: s1, ret_type, result_type: None, span, infer_stmts_fn)
+          end
+          return InferExprErr(message: "match on `Exn` must include a catch-all arm (`_ -> ...` or a variable pattern) to cover future exception constructors", span)
+      end
+  end
+end
+
+export let infer_match_cases = fn (
+  state: CheckState, cases: [HirMatchCase],
+  target_type: TypeExpr, subst: [SubstEntry], ret_type: TypeExpr,
+  result_type: Option<TypeExpr>, span: Span,
+  infer_stmts_fn: (state: CheckState, stmts: [HirStmt], ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match cases do
+    | [] ->
+      let final_type = match result_type do
+        | Some(val: t) -> t
+        | None -> TyUnit
+      end
+      return InferExprOk(state, subst, typ: final_type)
+    | HirMatchCase(pattern: pat, body) :: rest ->
+      let tt = subst.subst_apply(subst, typ: target_type)
+      match bind_pattern(state, pattern: pat, target_type: tt) do
+        | BindErr(message: m) -> return InferExprErr(message: "match pattern: " ++ m, span)
+        | BindOk(state: st1, subst: ps, env: bindings) ->
+          let sm = subst.subst_compose(s1: subst, s2: ps)
+          let case_env = append_env(base: tctypes.state_env(state: st1), extra: bindings)
+          let st2 = tctypes.state_with_env(state: st1, env: subst.subst_apply_env(subst: sm, env: case_env))
+          match infer_stmts_fn(state: st2, stmts: body, ret_type) do
+            | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "match case: " ++ m, span: espan)
+            | InferExprOk(state: st3, subst: bs, typ: case_type) ->
+              let all_subst = subst.subst_compose(s1: sm, s2: bs)
+              let new_result = match result_type do
+                | None -> case_type
+                | Some(val: prev) ->
+                  let tdefs = tctypes.state_typedefs(state: st3)
+                  let applied_prev = subst.subst_apply(subst: all_subst, typ: prev)
+                  match unify.unify(t1: applied_prev, t2: case_type, tdefs) do
+                    | UnifyOk(_) -> case_type
+                    | UnifyErr(_) ->
+                      return InferExprErr(message: "Match case type mismatch: expected `" ++ tctypes.type_to_string(typ: applied_prev) ++ "`, found `" ++ tctypes.type_to_string(typ: case_type) ++ "`", span)
+                  end
+              end
+              // Pop case-local pattern bindings before threading to the next case.
+              let st4 = tctypes.state_with_env(state: st3, env: tctypes.state_env(state))
+              return infer_match_cases(
+                state: st4, cases: rest,
+                target_type, subst: all_subst,
+                ret_type, result_type: Some(val: new_result), span, infer_stmts_fn
+              )
+          end
+      end
+  end
+end
+
+export let infer_while = fn (
+  state: CheckState, cond: HirExpr, body: [HirStmt], ret_type: TypeExpr, span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError },
+  infer_stmts_fn: (state: CheckState, stmts: [HirStmt], ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match infer_expr_fn(state, expr: cond, ret_type: TyUnit) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    | InferExprOk(state: st1, subst: s1, typ: ct) ->
+      let tdefs = tctypes.state_typedefs(state: st1)
+      match unify.unify(t1: ct, t2: TyBool, tdefs) do
+        | UnifyErr(message: m) -> return InferExprErr(message: "while cond must be bool: " ++ m, span)
+        | UnifyOk(subst: s2) ->
+          let sm = subst.subst_compose(s1, s2)
+          let st2 = tctypes.state_with_env(state: st1, env: subst.subst_apply_env(subst: sm, env: tctypes.state_env(state: st1)))
+          match infer_stmts_fn(state: st2, stmts: body, ret_type) do
+            | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "while body: " ++ m, span: espan)
+            | InferExprOk(state: st3, subst: s3, typ: _) ->
+              // T-While: close the body scope — bindings introduced
+              // inside the loop body must not leak into the outer scope.
+              // Mirrors the env pop in infer_match_cases / infer_try.
+              let st_out = tctypes.state_with_env(state: st3, env: tctypes.state_env(state))
+              return InferExprOk(state: st_out, subst: subst.subst_compose(s1: sm, s2: s3), typ: TyUnit)
+          end
+      end
+  end
+end
+
+export let infer_for = fn (
+  state: CheckState, var: string, start: HirExpr, end_e: HirExpr, body: [HirStmt], ret_type: TypeExpr, span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError },
+  infer_stmts_fn: (state: CheckState, stmts: [HirStmt], ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match infer_expr_fn(state, expr: start, ret_type: TyUnit) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    | InferExprOk(state: st1, subst: s1, typ: st_t) ->
+      let tdefs = tctypes.state_typedefs(state: st1)
+      match unify.unify(t1: st_t, t2: TyI64, tdefs) do
+        | UnifyErr(message: m) -> return InferExprErr(message: "for start must be i64: " ++ m, span)
+        | UnifyOk(subst: s2) ->
+          let sm = subst.subst_compose(s1, s2)
+          match infer_expr_fn(state: st1, expr: end_e, ret_type: TyUnit) do
+            | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+            | InferExprOk(state: st2, subst: s3, typ: et_t) ->
+              let sm2 = subst.subst_compose(s1: sm, s2: s3)
+              match unify.unify(t1: et_t, t2: TyI64, tdefs) do
+                | UnifyErr(message: m) -> return InferExprErr(message: "for end must be i64: " ++ m, span)
+                | UnifyOk(subst: s4) ->
+                  let sm3 = subst.subst_compose(s1: sm2, s2: s4)
+                  let body_env = tctypes.env_insert(env: subst.subst_apply_env(subst: sm3, env: tctypes.state_env(state: st2)), name: var, scheme: tctypes.mono(typ: TyI64))
+                  let st3 = tctypes.state_with_env(state: st2, env: body_env)
+                  match infer_stmts_fn(state: st3, stmts: body, ret_type) do
+                    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "for body: " ++ m, span: espan)
+                    | InferExprOk(state: st4, subst: s5, typ: _) ->
+                      // T-For: close the body scope — the loop variable
+                      // and any bindings introduced inside the for body must not leak
+                      // into the outer scope.  Mirrors T-While and T-If.
+                      let st_out = tctypes.state_with_env(state: st4, env: tctypes.state_env(state))
+                      return InferExprOk(state: st_out, subst: subst.subst_compose(s1: sm3, s2: s5), typ: TyUnit)
+                  end
+              end
+          end
+      end
+  end
+end
+
+export let infer_lambda = fn (
+  state: CheckState, type_params: [string], params: [HirParam], ret_type: TypeExpr, requires: TypeExpr, throw_row: TypeExpr, body: [HirStmt], span: Span,
+  infer_stmts_fn: (state: CheckState, stmts: [HirStmt], ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  // spec narrative §T-Let-PolyFn restricts polymorphic
+  // schemes to top-level `fn`. An inner `let f = fn <T>(...)` would
+  // otherwise silently drop the quantifier list, leaving T as a rigid
+  // TyUserDefined that fails to unify at the first call site (user would
+  // see "cannot unify int literal with non-integer type"). Reject
+  // explicitly so the diagnostic points at the real problem.
+  // Top-level functions never route through infer_lambda — they are
+  // registered with `Scheme(vars: tps, ...)` by `register_functions`
+  // (src/typecheck/check.nx) and checked via `check_function`, so this
+  // restriction only fires for inner lambdas.
+  match type_params do
+    | [] -> ()
+    | _ ->
+      return InferExprErr(
+        message: "inner lambda `fn <...>(...)` carries type parameters: polymorphic schemes are only allowed on top-level `let f = fn <T>(...)` declarations (spec type-system-formal.md §T-Let-PolyFn). Hoist this lambda to a top-level binding to make it polymorphic, or drop the `<...>` quantifier list.",
+        span
+      )
+  end
+  // T-Lambda gravity rule: ¬escapesRef(τ_r) — the declared return type must
+  // not expose a mutable reference cell. Inner lambdas (fn at expression
+  // position) with e.g. `-> ref(i64)` are rejected here.
+  // Spec: type-system-formal.md §"Gravity Rule" table + §T-Lambda.
+  tcwf.enforce_no_escapes_ref(typ: ret_type, context: "return type of lambda", span)
+  let param_types = build_param_named_types(params)
+  // T-Lambda wfRef at parameter annotation sites (spec §wfRef L385-400):
+  // each parameter type ~σ is rejected if σ is linear (TyLinear).
+  tcwf.enforce_wf_ref_params(params: param_types, span)
+  let outer_env = tctypes.state_env(state)
+  let body_env = add_params_to_env(env: outer_env, params)
+  let st1 = tctypes.state_with_env(state, env: body_env)
+  match infer_stmts_fn(state: st1, stmts: body, ret_type) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "lambda body: " ++ m, span: espan)
+    | InferExprOk(state: st2, subst: s1, typ: body_typ) ->
+      // T-Lambda: τ_r ≠ unit ⟹ tail(s†) = ⊥.
+      // The body must supply the return value by one of two means:
+      //   (a) the last statement is a non-unit expression whose type provides
+      //       the implicit return value (body_typ ≠ TyUnit), or
+      //   (b) every control-flow path ends with an explicit `return`/`throw`
+      //       (infer_stmts_tail_diverges = true).
+      // If neither holds — i.e. the body "falls off the end" with unit but
+      // the declared ret_type is non-unit — reject with E2001.
+      let body_is_unit = if let TyUnit = body_typ then true else false end
+      let ret_is_unit = if let TyUnit = ret_type then true else false end
+      if !ret_is_unit && body_is_unit && !infer_stmts_tail_diverges(stmts: body, depth: 64) then
+        return InferExprErr(message: "lambda return type is non-unit but body does not end with a `return` or `throw` on all paths (spec T-Lambda: τ_r ≠ unit ⟹ tail(s†) = ⊥)", span)
+      end
+      let scan = capture.scan_lambda_captures(body, outer_env, params)
+      match scan do
+        | capture.CaptureScan(linear: _, ref_hit: Some(val: capture.RefCaptureHit(name: rn, span: rsp))) ->
+          return InferExprErr(message: "lambda captures mutable ref binding " ++ rn ++ " (refs are stack-confined)", span: rsp)
+        | capture.CaptureScan(linear: lin, ref_hit: None) ->
+          let arrow = TyArrow(
+            params: param_types,
+            ret: ret_type,
+            requires,
+            throw_row
+          )
+          let wrapped = if lin then TyLinear(inner: arrow) else arrow end
+          return InferExprOk(state: st2, subst: s1, typ: subst.subst_apply(subst: s1, typ: wrapped))
+      end
+  end
+end
+
+export let infer_raise = fn (
+  state: CheckState, inner: HirExpr, span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match infer_expr_fn(state, expr: inner, ret_type: TyUnit) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    | InferExprOk(state: st1, subst: s1, typ: t) ->
+      // T-Throw-Val: unify(τ, Exn) — the thrown value must have type Exn.
+      // Constructor applications (T-Throw-Ctor / T-Throw-CtorNullary) satisfy
+      // this trivially because their result type is already Exn via D-Exception.
+      let tdefs = tctypes.state_typedefs(state: st1)
+      let sc = match unify.unify(t1: t, t2: TyUserDefined(name: "Exn", args: []), tdefs) do
+        | UnifyErr(_) -> return InferExprErr(
+            message: "throw: payload must have type Exn, got " ++ tctypes.type_to_string(typ: t),
+            span)
+        | UnifyOk(subst: s2) -> subst.subst_compose(s1, s2)
+      end
+      // T-Raise: the raised value's exception identity must be admitted by
+      // the active throws-row ρ_q. Rows containing TyUserDefined("Exn", _)
+      // accept any Exn variant.  Narrow rows like `throws { LirError }`
+      // accept only declared members.
+      let row = subst.subst_apply(subst: sc, typ: tctypes.state_throw_row(state: st1))
+      let groups = tctypes.state_exception_groups(state: st1)
+      let exn_name_opt = exception_name_of_raised(expr: inner)
+      match check_raise_admitted(name_opt: exn_name_opt, row, groups) do
+        | RaiseOk -> ()
+        | RaiseRejected(message: m) -> return InferExprErr(message: m, span)
+      end
+      // Raise diverges; the result type is unconstrained (fresh tyvar so the
+      // surrounding context can pick whatever it needs).
+      let FreshResult(state: st2, typ: tv) = tctypes.tc_fresh_var(state: st1)
+      return InferExprOk(state: st2, subst: sc, typ: tv)
+  end
+end
+
+export let infer_force = fn (
+  state: CheckState, inner: HirExpr, ret_type: TypeExpr, span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match infer_expr_fn(state, expr: inner, ret_type) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    | InferExprOk(state: st1, subst: s1, typ: t) ->
+      match t do
+        | TyLazy(inner: u) -> return InferExprOk(state: st1, subst: s1, typ: u)
+        | _ ->
+          // T-Force spec: unify(τ, @β) with fresh β, so that unresolved ?α
+          // gets pinned to TyLazy(?β) rather than falling through to an error.
+          let FreshResult(state: st2, typ: tv) = tctypes.tc_fresh_var(state: st1)
+          let tdefs = tctypes.state_typedefs(state: st2)
+          match unify.unify(t1: t, t2: TyLazy(inner: tv), tdefs) do
+            | UnifyErr(_) -> return InferExprErr(
+                message: "force: expected lazy type '@T', got non-lazy value",
+                span)
+            | UnifyOk(subst: s2) ->
+              let sc = subst.subst_compose(s1, s2)
+              return InferExprOk(state: st2, subst: sc, typ: subst.subst_apply(subst: sc, typ: tv))
+          end
+      end
+  end
+end
+
+export let infer_thunk = fn (
+  state: CheckState, body: HirExpr, ret_type: TypeExpr, span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  let _ = span
+  match infer_expr_fn(state, expr: body, ret_type) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    | InferExprOk(state: st1, subst: s1, typ: t) ->
+      return InferExprOk(state: st1, subst: s1, typ: TyLazy(inner: t))
+  end
+end

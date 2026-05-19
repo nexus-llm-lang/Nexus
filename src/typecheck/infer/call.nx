@@ -1,0 +1,282 @@
+/**
+ * typecheck/infer/call: function-call type inference.
+ *
+ * Owns:
+ *   - `infer_call`: looks up the callee type, instantiates its scheme, and
+ *     delegates to `check_call_args` / `check_call_args_walk`.
+ *   - `check_call_args`: validates argument labels and dispatches to the
+ *     per-argument walk.
+ *   - `check_call_args_walk`: walks parameter/argument pairs, calling
+ *     `infer_expr_fn` per argument and unifying types; handles linearity
+ *     weakening (T-App-BorrowLin, %-weakening, @-weakening, auto-force).
+ *
+ * All three entry points receive `infer_expr_fn` as a callback because the
+ * argument expressions must be inferred recursively via `infer_expr`.
+ *
+ * Extracted from src/typecheck/infer.nx.
+ */
+
+import { Span } from "src/common/token.nx"
+import {
+  TypeExpr, TyUnit, TyLinear, TyLazy, TyBorrow, TyArrow,
+  NamedType
+} from "src/common/ast.nx"
+import {
+  HirExpr, HirExprKind, HirCallArg
+} from "src/ir/hir/types.nx"
+import {
+  SubstEntry, CheckState,
+  InferExprResult, InferExprOk, InferExprErr,
+  UnifyOk, UnifyErr
+}, * as tctypes from "src/typecheck/types.nx"
+import * as subst from "src/typecheck/subst.nx"
+import * as unify from "src/typecheck/unify.nx"
+import {
+  InstantiateResult,
+  instantiate_scheme, infer_borrow_arg_position
+} from "src/typecheck/infer/literals.nx"
+import {
+  ArgLabelCheck, ArgLabelOk, ArgLabelErr,
+  validate_arg_labels, reorder_args_by_params,
+  check_bset_no_consume_borrow_conflict
+} from "src/typecheck/infer/call_args.nx"
+import {
+  RaiseAdmissionResult, RaiseOk, RaiseRejected,
+  check_call_throw_row_admitted
+} from "src/typecheck/infer/control_flow.nx"
+import { TypeError } from "src/typecheck/errors.nx"
+
+export let infer_call = fn (
+  state: CheckState, func: string, args: [HirCallArg], span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match tctypes.env_lookup(env: tctypes.state_env(state), name: func) do
+    | None -> return InferExprErr(message: "unbound function: " ++ func, span)
+    | Some(val: sch) ->
+      match instantiate_scheme(state, scheme: sch) do
+        | InstantiateResult(state: st1, typ: func_type_raw) ->
+          // Peel `%`/`@` modality wrappers introduced by linear-capture or
+          // lazy-capture lambdas: `let f = mk_capture(b)` gives
+          // `f : %(z: i64) -> i64`, but calling `f(z: 0)` should still
+          // resolve the inner arrow shape.
+          let func_type = match func_type_raw do
+            | TyLinear(inner: u) | TyLazy(inner: u) -> u
+            | _ -> func_type_raw
+          end
+          match func_type do
+            | TyArrow(params, ret, requires: _, throw_row: callee_thr) ->
+              match check_call_args(state: st1, params, args, ret, subst: subst.subst_empty(), span, infer_expr_fn) do
+                | InferExprErr(message: m, span: esp) -> return InferExprErr(message: m, span: esp)
+                | InferExprOk(state: st2, subst: s_all, typ: rt) ->
+                  // T-App effect side-condition: every concrete exception
+                  // raisable by the callee must be admitted by the caller's
+                  // active throws-row. Without this the typechecker tracks
+                  // throw_row but never enforces it for calls — narrowing
+                  // a function to `throws { LirError }` then calling a
+                  // `throws { TypeError }` callee would type-check while violating
+                  // the narrow contract. Mirrors the row-subsumption logic
+                  // used for direct raises (see check_raise_admitted).
+                  let callee_row = subst.subst_apply(subst: s_all, typ: callee_thr)
+                  let caller_row = subst.subst_apply(subst: s_all, typ: tctypes.state_throw_row(state: st2))
+                  let groups = tctypes.state_exception_groups(state: st2)
+                  match check_call_throw_row_admitted(callee_row, caller_row, groups, func) do
+                    | RaiseOk -> return InferExprOk(state: st2, subst: s_all, typ: rt)
+                    | RaiseRejected(message: m) -> return InferExprErr(message: m, span)
+                  end
+              end
+            | _ ->
+              return InferExprErr(message: func ++ " is not a function", span)
+          end
+      end
+  end
+end
+
+export let check_call_args = fn (
+  state: CheckState, params: [NamedType], args: [HirCallArg],
+  ret: TypeExpr, subst: [SubstEntry], span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  // validate that every call-arg label matches a parameter
+  // name (and vice versa) BEFORE the positional walk. The MIR→LIR
+  // lowering sorts both call args and params alphabetically by label (see
+  // sort_lir_call_args / sort_lir_params in src/ir/lir/lir.nx). A pun like
+  // `f(x, y)` against `fn (a, b)` would otherwise pass through positional-
+  // walk, then the sort would place x/y into a/b slots in wrong alphabetic
+  // order — a silent wrong-slot runtime miscompile. Reordering by label IS
+  // allowed: declared `fn (a, b)` accepts `f(b: 10, a: 52)` because the
+  // sort brings both sides into alignment.
+  match validate_arg_labels(args, params) do
+    | ArgLabelErr(message: m) -> return InferExprErr(message: m, span)
+    | ArgLabelOk ->
+      let ordered = reorder_args_by_params(args, params)
+      // T-App B-set premise (spec §T-App): if any arg is Borrow(&x) and
+      // another arg is a consuming use of x (Variable(x), non-Borrow), then
+      // x is NOT in B — it must go through the ⊗-split path, and the &x
+      // falls through to T-Borrow → x:^ω check → reject. Pre-scan the
+      // ordered args before the walk to detect this violation early.
+      match check_bset_no_consume_borrow_conflict(args: ordered) do
+        | ArgLabelErr(message: m) -> return InferExprErr(message: m, span)
+        | ArgLabelOk -> return check_call_args_walk(state, params, args: ordered, ret, subst, span, infer_expr_fn)
+      end
+  end
+end
+
+export let check_call_args_walk = fn (
+  state: CheckState, params: [NamedType], args: [HirCallArg],
+  ret: TypeExpr, subst: [SubstEntry], span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match params do
+    | [] ->
+      match args do
+        | [] -> return InferExprOk(state, subst, typ: subst.subst_apply(subst, typ: ret))
+        | _ -> return InferExprErr(message: "too many arguments", span)
+      end
+    | NamedType(name: pname, typ: ptyp) :: rp ->
+      match args do
+        | [] -> return InferExprErr(message: "missing argument: " ++ pname, span)
+        | HirCallArg(label: _, value: val) :: ra ->
+          // T-App-BorrowLin (spec §T-App): when the argument is syntactically
+          // `&x`, bypass T-Borrow's x:^ω check and use the arg-position form
+          // that permits linear/lazy targets. The borrow is discharged on call
+          // return; the linear binding `x` survives the call unconsumed.
+          let HirExpr(node: val_node, span: val_sp) = val
+          // T-App-BorrowLin gate: only invoke `infer_borrow_arg_position`
+          // (which skips T-Borrow's x:^ω check) when the *expected* param
+          // type is syntactically `&σ`.  For a non-borrow param `P ≠ &σ`,
+          // a `&x` argument must route through `infer_expr` → ordinary
+          // T-Borrow, which enforces x:^ω and therefore rejects linear `x`.
+          // Without this guard, `&_` silently passed to e.g. `i64` params:
+          // infer_borrow_arg_position produced TyBorrow(i64), U-Borrow
+          // auto-derefed it to i64 during unification, and LinearUnused
+          // was silently skipped for `_`-named bindings (linearity.nx L750).
+          let p_resolved = subst.subst_apply(subst, typ: ptyp)
+          let arg_result = match val_node do
+            | Borrow(name: borrow_target, sigil: _) ->
+              match p_resolved do
+                | TyBorrow(_) ->
+                  infer_borrow_arg_position(state, name: borrow_target, span: val_sp)
+                | _ ->
+                  infer_expr_fn(state, expr: val, ret_type: TyUnit)
+              end
+            | _ ->
+              infer_expr_fn(state, expr: val, ret_type: TyUnit)
+          end
+          match arg_result do
+            | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span: espan)
+            | InferExprOk(state: st1, subst: s1, typ: arg_t) ->
+              let s_merged = subst.subst_compose(s1: subst, s2: s1)
+              let expected = subst.subst_apply(subst: s_merged, typ: ptyp)
+              let tdefs = tctypes.state_typedefs(state: st1)
+              match unify.unify(t1: arg_t, t2: expected, tdefs) do
+                | UnifyOk(subst: s2) ->
+                  let s_all = subst.subst_compose(s1: s_merged, s2)
+                  return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span, infer_expr_fn)
+                | UnifyErr(message: m) ->
+                  // Linearity-weakening at call sites: permit passing a plain
+                  // value `T` where the parameter is `%T` or `@T` by re-unifying
+                  // against the inner type. The wrapper is reintroduced
+                  // lexically by the param sigil; the value's modality is
+                  // preserved by the linear-capture / lazy-capture machinery
+                  // downstream.
+                  //
+                  // a borrow `&x` is syntactically non-linear
+                  // (linear(&σ) = false per spec §Linearity), so the weakening
+                  // would naively strip %T → T and admit &x against %T —
+                  // letting the callee consume the underlying owner of x
+                  // while the caller still believes it's live ('borrow-to-
+                  // ownership smuggling'). T-App-BorrowLin already covers the
+                  // legitimate &x → &σ case; the only remaining shape for an
+                  // &x argument is %σ (or @σ), which we reject here.
+                  match expected do
+                    | TyLinear(inner: pinner) ->
+                      match arg_t do
+                        | TyBorrow(_) ->
+                          return InferExprErr(
+                            message: "arg " ++ pname ++ ": cannot pass borrow '&x' where parameter expects linear '%T'; borrows cannot satisfy ownership-consuming parameters (spec §U-Borrow / §T-App weakening;)",
+                            span
+                          )
+                        | _ -> ()
+                      end
+                      match unify.unify(t1: arg_t, t2: pinner, tdefs) do
+                        | UnifyOk(subst: s2) ->
+                          let s_all = subst.subst_compose(s1: s_merged, s2)
+                          return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span, infer_expr_fn)
+                        | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
+                      end
+                    | TyLazy(inner: pinner) ->
+                      match arg_t do
+                        | TyBorrow(_) ->
+                          return InferExprErr(
+                            message: "arg " ++ pname ++ ": cannot pass borrow '&x' where parameter expects lazy '@T'; borrows cannot satisfy one-shot lazy parameters (spec §U-Borrow;)",
+                            span
+                          )
+                        | _ -> ()
+                      end
+                      match unify.unify(t1: arg_t, t2: pinner, tdefs) do
+                        | UnifyOk(subst: s2) ->
+                          let s_all = subst.subst_compose(s1: s_merged, s2)
+                          return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span, infer_expr_fn)
+                        | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
+                      end
+                    | _ ->
+                      // Auto-force at call sites: top-level `let
+                      // x = e` is registered with type `TyArrow(params: [],
+                      // ret: T)` — a nullary-thunk shape — but MIR lowers a
+                      // bare `Variable(x)` reference to a plain value read
+                      // (no auto-call inserted; see ctx_value_binding_names
+                      // in src/ir/mir/mir.nx). Existing call paths (`x()`, `x + 1`
+                      // via `infer_call`'s callee-peel) already see through
+                      // this thunk shape. The missing symmetric site is the
+                      // labeled-call-arg position: passing such an `x` to a
+                      // parameter expecting bare `T` would otherwise fail with
+                      // a misleading "[E2001] expected arrow type" diagnostic.
+                      // Peel `TyArrow(params: [], ret: T)` (and `TyLazy(T)`
+                      // for handler-arm-style lazy bindings), re-unify against
+                      // the param type. Mirrors the param-side
+                      // `TyLinear`/`TyLazy` weakening above, in the opposite
+                      // direction.
+                      match arg_t do
+                        | TyLazy(inner: ainner) ->
+                          match unify.unify(t1: ainner, t2: expected, tdefs) do
+                            | UnifyOk(subst: s2) ->
+                              let s_all = subst.subst_compose(s1: s_merged, s2)
+                              return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span, infer_expr_fn)
+                            | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
+                          end
+                        | TyLinear(inner: TyLazy(inner: ainner)) ->
+                          match unify.unify(t1: ainner, t2: expected, tdefs) do
+                            | UnifyOk(subst: s2) ->
+                              let s_all = subst.subst_compose(s1: s_merged, s2)
+                              return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span, infer_expr_fn)
+                            | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
+                          end
+                        | TyLinear(inner: ainner) ->
+                          // T-Let wrapSigil: `let %b = Ctor(...)` gives `b` type
+                          // `TyLinear(T)` in the env. At call sites, param sigils are NOT
+                          // reflected in the Arrow type (build_param_named_types ignores sigil),
+                          // so a `%param: T` param appears with bare type `T`. When arg_t is
+                          // `TyLinear(T)` but expected is the bare `T`, strip the Linear wrapper
+                          // and re-unify. Linearity enforcement is handled by linearity.nx (which
+                          // tracks sigil, not the wrapper), not by the Arrow param type.
+                          match unify.unify(t1: ainner, t2: expected, tdefs) do
+                            | UnifyOk(subst: s2) ->
+                              let s_all = subst.subst_compose(s1: s_merged, s2)
+                              return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span, infer_expr_fn)
+                            | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
+                          end
+                        | TyArrow(params: [], ret: aret, requires: _, throw_row: _) ->
+                          match unify.unify(t1: aret, t2: expected, tdefs) do
+                            | UnifyOk(subst: s2) ->
+                              let s_all = subst.subst_compose(s1: s_merged, s2)
+                              return check_call_args_walk(state: st1, params: rp, args: ra, ret, subst: s_all, span, infer_expr_fn)
+                            | UnifyErr(message: _) -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
+                          end
+                        | _ -> return InferExprErr(message: "arg " ++ pname ++ ": " ++ m, span)
+                      end
+                  end
+              end
+          end
+      end
+  end
+end

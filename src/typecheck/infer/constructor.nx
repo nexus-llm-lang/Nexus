@@ -1,26 +1,52 @@
 /**
- * typecheck/infer/constructor: pure leaf helpers for constructor-type building.
+ * typecheck/infer/constructor: variant-field sorting, enum-type building, and
+ * constructor / ctor-arg inference.
  *
- * Hosts variant-field sorting (insertion-sort by label), the string
- * comparison helper it depends on, the enum-type builder
- * (`build_enum_type` / `build_type_args`), and the list-reverse helper
- * for VariantField lists. None of these recurse through infer_expr — the
- * entry points `infer_constructor` and `check_ctor_args` stay in
- * src/typecheck/infer.nx because they call back into infer_expr to type
- * constructor arguments.
+ * Leaf cluster (no infer_expr calls):
+ *   - Variant-field insertion-sort by label (`sort_variant_fields`,
+ *     `insert_variant_field`, `tc_str_lt`).
+ *   - Enum-type builder (`build_enum_type`, `build_type_args`).
+ *   - VariantField list-reverse helper (`rev_variant_fields`).
+ *   - Named-type / variant-name collection helpers (`named_type_names`,
+ *     `all_variant_names`): used by infer_constructor for error suggestions.
+ *   - Ctor field-label check (`check_ctor_field_label`,
+ *     `ctor_label_in_singleton`): T-Ctor {ℓ} = {ℓ'} premise.
+ *
+ * Callback cluster (receive infer_expr as a parameter):
+ *   - `infer_constructor`: looks up the variant, freshens type params,
+ *     delegates to `check_ctor_args`.
+ *   - `check_ctor_args`: walks constructor field list, calling
+ *     `infer_expr_fn` for each argument expression.
  *
  * Extracted from src/typecheck/infer.nx.
  */
 
+import { Span } from "src/common/token.nx"
 import {
-  TypeExpr, TyVar, TyUserDefined,
-  VariantField
+  TypeExpr, TyVar, TyUserDefined, TyUnit,
+  VariantField, NamedType, VariantDef, EnumDef,
+  Sigil
 } from "src/common/ast.nx"
-import { SubstEntry } from "src/typecheck/types.nx"
+import {
+  HirExpr
+} from "src/ir/hir/types.nx"
+import {
+  SubstEntry, Scheme, EnumEntry, CheckState,
+  InferExprResult, InferExprOk, InferExprErr,
+  UnifyOk, UnifyErr,
+  EnumVariantInfo
+}, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
-import { TypeError } from "src/typecheck/errors.nx"
+import * as unify from "src/typecheck/unify.nx"
+import {
+  FreshenResult,
+  freshen_type_params
+} from "src/typecheck/infer/literals.nx"
+import { TypeError, UnknownConstructor } from "src/typecheck/errors.nx"
+import { suggest_names } from "src/common/levenshtein.nx"
 import * as str from "std:str"
 import * as list from "std:list"
+import { Option, Some, None } from "std:option"
 
 // HIR builder sorts labeled ctor args alphabetically; this insertion-sort
 // keeps fields in the same order so positional checking in check_ctor_args aligns.
@@ -93,5 +119,158 @@ export let rev_variant_fields = fn (lst: [VariantField], out: [VariantField]) ->
   match lst do
     | [] -> return out
     | x :: rest -> return rev_variant_fields(lst: rest, out: x :: out)
+  end
+end
+
+/** Collect field names from a [NamedType] list (for UnknownField suggestions). */
+export let named_type_names = fn (nts: [NamedType]) -> [string] do
+  return named_type_names_go(nts, acc: [])
+end
+
+let named_type_names_go = fn (nts: [NamedType], acc: [string]) -> [string] do
+  match nts do
+    | [] -> return acc
+    | NamedType(name: n, typ: _) :: rest -> return named_type_names_go(nts: rest, acc: n :: acc)
+  end
+end
+
+/** Collect all variant names from the enum definitions in state (for suggestions). */
+export let all_variant_names = fn (state: CheckState) -> [string] do
+  return all_variant_names_go(entries: tctypes.state_enums(state), acc: [])
+end
+
+let all_variant_names_go = fn (entries: [EnumEntry], acc: [string]) -> [string] do
+  match entries do
+    | [] -> return acc
+    | EnumEntry(name: _, def: ed) :: rest ->
+      match ed do | EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) ->
+        let acc2 = all_variant_names_variants(vs, acc)
+        return all_variant_names_go(entries: rest, acc: acc2)
+      end
+  end
+end
+
+let all_variant_names_variants = fn (vs: [VariantDef], acc: [string]) -> [string] do
+  match vs do
+    | [] -> return acc
+    | VariantDef(name: n, fields: _) :: rest -> return all_variant_names_variants(vs: rest, acc: n :: acc)
+  end
+end
+
+// Spec T-Ctor {ℓ} = {ℓ'}: check that the head user-supplied label (if any)
+// matches the constructor's declared label at the same position. Both lists
+// are in alphabetical order (sort_ctor_args / sort_variant_fields). Returns
+// Some(error) on mismatch, None if OK.
+export let check_ctor_field_label = fn (
+  user_labels: [string], vfname_opt: Option<string>
+) -> Option<string> do
+  match user_labels do
+    | [] -> return None
+    | fname :: _ ->
+      match vfname_opt do
+        | None -> return None
+        | Some(val: vfname) ->
+          // Use ctor_label_in_singleton for the comparison to reuse
+          // proven string-equality logic rather than a raw `==` on
+          // newly-bound strings (stage-0 codegen bug with match-arm strings).
+          if ctor_label_in_singleton(label: fname, expected: vfname) then
+            return None
+          else
+            return Some(val: "constructor argument label `" ++ fname
+              ++ "` does not match the declared field label `" ++ vfname
+              ++ "` at this position; T-Ctor requires {ℓ} = {ℓ'}")
+          end
+      end
+  end
+end
+
+// Checks whether `label` equals `expected` using a list-search pattern to
+// avoid the stage-0 raw-string-== codegen issue on newly-bound match-arm
+// string variables.
+export let ctor_label_in_singleton = fn (label: string, expected: string) -> bool do
+  return ctor_label_in_singleton_go(label, haystack: expected :: [])
+end
+
+let ctor_label_in_singleton_go = fn (label: string, haystack: [string]) -> bool do
+  match haystack do
+    | [] -> return false
+    | h :: rest ->
+      if h == label then return true
+      else return ctor_label_in_singleton_go(label, haystack: rest)
+      end
+  end
+end
+
+/** Infer the type of a constructor expression. Calls `infer_expr_fn` for each
+ *  constructor argument. */
+export let infer_constructor = fn (
+  state: CheckState, variant: string, args: [HirExpr], labels: [string], sigil: Sigil, span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  // The `sigil` parameter records whether the user wrote `%Ctor(...)` at the
+  // source — propagated through AST → HIR for downstream consumers (let-binders
+  // already see it via the StmtLet sigil bump in parse_let_without_type; the
+  // linearity pass keys off the let's sigil, not the value's inferred type).
+  //
+  // We deliberately do NOT wrap the inferred type in `TyLinear` here. Doing
+  // so would break call sites where `f(%Ctor(...))` already works via the
+  // "fresh ctor passes %T param" leniency: wrapping makes the arg type
+  // `TyLinear<T>` and the param expects bare `T`, so unification fails.
+  // The sigil's role here is bookkeeping, not type-shape mutation.
+  let _ = sigil
+  match tctypes.find_variant(idx: tctypes.state_variant_index(state), variant) do
+    | None ->
+      let sugs = suggest_names(typo: variant, candidates: all_variant_names(state))
+      throw UnknownConstructor(name: variant, suggestions: sugs, span)
+    | Some(val: EnumVariantInfo(enum_name: ename, type_params: tps, fields)) ->
+      let fr = freshen_type_params(state, params: tps)
+      let FreshenResult(state: st1, param_subst: psubst) = fr
+      let sorted_fields = sort_variant_fields(fields)
+      let enum_type = build_enum_type(name: ename, params: tps, param_subst: psubst)
+      return check_ctor_args(state: st1, fields: sorted_fields, args, labels, param_subst: psubst, enum_type, subst: subst.subst_empty(), span, infer_expr_fn)
+  end
+end
+
+let check_ctor_args = fn (
+  state: CheckState, fields: [VariantField], args: [HirExpr], labels: [string],
+  param_subst: [SubstEntry], enum_type: TypeExpr, subst: [SubstEntry], span: Span,
+  infer_expr_fn: (state: CheckState, expr: HirExpr, ret_type: TypeExpr) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match fields do
+    | [] ->
+      match args do
+        | [] -> return InferExprOk(state, subst, typ: subst.subst_apply(subst, typ: enum_type))
+        | _ -> return InferExprErr(message: "too many constructor arguments", span)
+      end
+    | VariantField(name: vfname_opt, typ: ftyp) :: rf ->
+      match args do
+        | [] -> return InferExprErr(message: "missing constructor argument", span)
+        | arg :: ra ->
+          // Spec T-Ctor {ℓ} = {ℓ'}: when both the constructor field and the
+          // user-supplied argument carry a label, they must match at each
+          // position — reordered or misspelled labels (e.g. Box(content: 99)
+          // for Box(value: i64)) are rejected here.
+          match check_ctor_field_label(labels, vfname_opt) do
+            | Some(val: err) -> return InferExprErr(message: err, span)
+            | None -> ()
+          end
+          let labels_tail = match labels do | [] -> [] | _ :: tl -> tl end
+          match infer_expr_fn(state, expr: arg, ret_type: TyUnit) do
+            | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+            | InferExprOk(state: st1, subst: s1, typ: at) ->
+              let sm = subst.subst_compose(s1: subst, s2: s1)
+              let expected = subst.subst_apply(subst: subst.subst_compose(s1: param_subst, s2: sm), typ: ftyp)
+              let tdefs = tctypes.state_typedefs(state: st1)
+              match unify.unify(t1: at, t2: expected, tdefs) do
+                | UnifyErr(message: m) -> return InferExprErr(message: "ctor field: " ++ m, span)
+                | UnifyOk(subst: s2) ->
+                  return check_ctor_args(
+                    state: st1, fields: rf, args: ra, labels: labels_tail,
+                    param_subst, enum_type,
+                    subst: subst.subst_compose(s1: sm, s2), span, infer_expr_fn
+                  )
+              end
+          end
+      end
   end
 end
