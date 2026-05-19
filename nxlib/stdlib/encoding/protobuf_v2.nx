@@ -1,0 +1,311 @@
+/**
+ * protobuf_v2: Protocol Buffers v2 wire format encode/decode.
+ *
+ * Schemaless wire-level API only. Produces/consumes raw field streams.
+ * Does NOT parse .proto IDL or decode into typed structs.
+ *
+ * Types:
+ *   PbValue = PbVarint(val: i64)
+ *           | PbFixed64(val: i64)
+ *           | PbLenDelimited(data: %ByteBuffer)
+ *           | PbFixed32(val: i64)
+ *           | PbSGroup(field_number: i64)   // deprecated proto2 group start
+ *           | PbEGroup(field_number: i64)   // deprecated proto2 group end
+ *
+ *   PbField = PbField(field_number: i64, value: PbValue)
+ *
+ * decode(buf: &ByteBuffer) -> [PbField]  throws { PbThrow }
+ * encode(fields: [PbField])  -> %ByteBuffer  throws { PbThrow }
+ *
+ * Zigzag helpers (for sint32/sint64):
+ *   zigzag_encode_i64(v: i64) -> i64
+ *   zigzag_decode_i64(v: i64) -> i64
+ */
+
+import * as bb from "std:bytebuffer"
+import * as list from "std:list"
+
+// ─── Public exceptions ────────────────────────────────────────────────────────
+
+/** Wire-format parse or encode error. pos is the byte offset (-1 for non-positional errors). */
+export exception PbError(msg: string, pos: i64)
+
+/** Exception group for all errors from decode / encode. */
+export exception group PbThrow = PbError
+
+// ─── Public types ────────────────────────────────────────────────────────────
+
+/**
+ * Wire-type payload.  Groups are proto2-deprecated but still live on the wire.
+ * PbLenDelimited holds the raw inner bytes (string/bytes/submessage/packed).
+ */
+export type PbValue =
+    PbVarint(val: i64)
+  | PbFixed64(val: i64)
+  | PbLenDelimited(data: %bb.ByteBuffer)
+  | PbFixed32(val: i64)
+  | PbSGroup(field_number: i64)
+  | PbEGroup(field_number: i64)
+
+/** One decoded field: field_number (1-based) and its wire payload. */
+export type PbField = PbField(field_number: i64, value: PbValue)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Wire-type constants
+// ═══════════════════════════════════════════════════════════════════════════
+
+let wt_varint = 0
+let wt_i64    = 1
+let wt_len    = 2
+let wt_sgroup = 3
+let wt_egroup = 4
+let wt_i32    = 5
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Zigzag helpers (public, used by sint32/sint64 callers)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Zigzag-encodes a signed i64 to an unsigned representation. */
+export let zigzag_encode_i64 = fn (v: i64) -> i64 do
+  return (v << 1) ^ (v >> 63)
+end
+
+/** Decodes a zigzag-encoded i64 back to a signed value. */
+export let zigzag_decode_i64 = fn (v: i64) -> i64 do
+  let shifted = (v >> 1) & 9223372036854775807
+  let sign = -(v & 1)
+  return shifted ^ sign
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Varint encode (LEB128, unsigned)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Encode a 64-bit unsigned varint into the buffer.
+let push_varint = fn (buf: %bb.ByteBuffer, v: i64) -> %bb.ByteBuffer do
+  if v < 128 then
+    return bb.push_byte(buf: %buf, byte: v & 127)
+  end
+  let %buf2 = bb.push_byte(buf: %buf, byte: (v & 127) | 128)
+  return push_varint(buf: %buf2, v: (v >> 7) & 72057594037927935)
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fixed-width encode helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Push a 64-bit value little-endian (8 bytes).
+let push_i64_le = fn (buf: %bb.ByteBuffer, v: i64) -> %bb.ByteBuffer do
+  let %b1 = bb.push_byte(buf: %buf, byte: v & 255)
+  let %b2 = bb.push_byte(buf: %b1, byte: (v >> 8) & 255)
+  let %b3 = bb.push_byte(buf: %b2, byte: (v >> 16) & 255)
+  let %b4 = bb.push_byte(buf: %b3, byte: (v >> 24) & 255)
+  let %b5 = bb.push_byte(buf: %b4, byte: (v >> 32) & 255)
+  let %b6 = bb.push_byte(buf: %b5, byte: (v >> 40) & 255)
+  let %b7 = bb.push_byte(buf: %b6, byte: (v >> 48) & 255)
+  return bb.push_byte(buf: %b7, byte: (v >> 56) & 255)
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Varint decode
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Returns the decoded varint value starting at pos.
+let decode_varint = fn (buf: &bb.ByteBuffer, pos: i64) -> i64 throws { PbThrow } do
+  return decode_varint_go(buf, pos, acc: 0, shift: 0)
+end
+
+let decode_varint_go = fn (buf: &bb.ByteBuffer, pos: i64, acc: i64, shift: i64) -> i64 throws { PbThrow } do
+  if shift > 63 then
+    throw PbError(msg: "varint overflow", pos)
+  end
+  let blen = bb.length(buf: buf)
+  if pos >= blen then
+    throw PbError(msg: "truncated varint", pos)
+  end
+  let b = bb.get_byte(buf: buf, idx: pos)
+  let chunk = (b & 127) << shift
+  let new_acc = acc | chunk
+  if b < 128 then
+    return new_acc
+  end
+  return decode_varint_go(buf, pos: pos + 1, acc: new_acc, shift: shift + 7)
+end
+
+// Returns the byte length consumed by a varint starting at pos.
+let varint_len = fn (buf: &bb.ByteBuffer, pos: i64) -> i64 throws { PbThrow } do
+  return varint_len_go(buf, pos, cnt: 0)
+end
+
+let varint_len_go = fn (buf: &bb.ByteBuffer, pos: i64, cnt: i64) -> i64 throws { PbThrow } do
+  if cnt > 9 then
+    throw PbError(msg: "varint overflow", pos: pos - cnt)
+  end
+  let blen = bb.length(buf: buf)
+  if pos >= blen then
+    throw PbError(msg: "truncated varint", pos)
+  end
+  let b = bb.get_byte(buf: buf, idx: pos)
+  if b < 128 then
+    return cnt + 1
+  end
+  return varint_len_go(buf, pos: pos + 1, cnt: cnt + 1)
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fixed-width decode helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+let read_i32_le = fn (buf: &bb.ByteBuffer, pos: i64) -> i64 throws { PbThrow } do
+  let blen = bb.length(buf: buf)
+  if pos + 4 > blen then
+    throw PbError(msg: "truncated fixed32", pos)
+  end
+  let b0 = bb.get_byte(buf: buf, idx: pos)
+  let b1 = bb.get_byte(buf: buf, idx: pos + 1)
+  let b2 = bb.get_byte(buf: buf, idx: pos + 2)
+  let b3 = bb.get_byte(buf: buf, idx: pos + 3)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+end
+
+let read_i64_le = fn (buf: &bb.ByteBuffer, pos: i64) -> i64 throws { PbThrow } do
+  let blen = bb.length(buf: buf)
+  if pos + 8 > blen then
+    throw PbError(msg: "truncated fixed64", pos)
+  end
+  let b0 = bb.get_byte(buf: buf, idx: pos)
+  let b1 = bb.get_byte(buf: buf, idx: pos + 1)
+  let b2 = bb.get_byte(buf: buf, idx: pos + 2)
+  let b3 = bb.get_byte(buf: buf, idx: pos + 3)
+  let b4 = bb.get_byte(buf: buf, idx: pos + 4)
+  let b5 = bb.get_byte(buf: buf, idx: pos + 5)
+  let b6 = bb.get_byte(buf: buf, idx: pos + 6)
+  let b7 = bb.get_byte(buf: buf, idx: pos + 7)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Decoder
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Decode all fields from buf, returning a list in wire order.
+let do_decode = fn (buf: &bb.ByteBuffer, pos: i64, acc: [PbField]) -> [PbField] throws { PbThrow } do
+  let blen = bb.length(buf: buf)
+  if pos >= blen then
+    return list.reverse(xs: acc)
+  end
+  let tag_val = decode_varint(buf, pos)
+  let tag_size = varint_len(buf, pos)
+  let wire_type = tag_val & 7
+  let field_number = tag_val >> 3
+  if field_number <= 0 then
+    throw PbError(msg: "invalid field number", pos)
+  end
+  let next_pos = pos + tag_size
+  if wire_type == wt_varint then
+    let vval = decode_varint(buf, pos: next_pos)
+    let vsize = varint_len(buf, pos: next_pos)
+    let fld = PbField(field_number, value: PbVarint(val: vval))
+    return do_decode(buf, pos: next_pos + vsize, acc: fld :: acc)
+  end
+  if wire_type == wt_i64 then
+    let fval = read_i64_le(buf, pos: next_pos)
+    let fld = PbField(field_number, value: PbFixed64(val: fval))
+    return do_decode(buf, pos: next_pos + 8, acc: fld :: acc)
+  end
+  if wire_type == wt_len then
+    let dlen = decode_varint(buf, pos: next_pos)
+    let dsize = varint_len(buf, pos: next_pos)
+    let data_start = next_pos + dsize
+    let data_end = data_start + dlen
+    let blen2 = bb.length(buf: buf)
+    if data_end > blen2 then
+      throw PbError(msg: "truncated length-delimited field", pos: next_pos)
+    end
+    let %dbuf = bb.empty()
+    let %dbuf2 = bb.copy_range(dst: %dbuf, src: buf, start: data_start, end_pos: data_end)
+    let fld = PbField(field_number, value: PbLenDelimited(data: %dbuf2))
+    return do_decode(buf, pos: data_end, acc: fld :: acc)
+  end
+  if wire_type == wt_sgroup then
+    let fld = PbField(field_number, value: PbSGroup(field_number))
+    return do_decode(buf, pos: next_pos, acc: fld :: acc)
+  end
+  if wire_type == wt_egroup then
+    let fld = PbField(field_number, value: PbEGroup(field_number))
+    return do_decode(buf, pos: next_pos, acc: fld :: acc)
+  end
+  if wire_type == wt_i32 then
+    let fval = read_i32_le(buf, pos: next_pos)
+    let fld = PbField(field_number, value: PbFixed32(val: fval))
+    return do_decode(buf, pos: next_pos + 4, acc: fld :: acc)
+  end
+  throw PbError(msg: "unknown wire type", pos)
+end
+
+/**
+ * Decodes a sequence of proto2 wire fields from a ByteBuffer.
+ * Returns a list of PbField in wire order.
+ * Raises PbError on truncated or malformed input.
+ */
+export let decode = fn (buf: &bb.ByteBuffer) -> [PbField] throws { PbThrow } do
+  return do_decode(buf, pos: 0, acc: [])
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Encoder
+// ═══════════════════════════════════════════════════════════════════════════
+
+let encode_field = fn (buf: %bb.ByteBuffer, fld: PbField) -> %bb.ByteBuffer throws { PbThrow } do
+  let PbField(field_number: fnum, value: fval) = fld
+  if fnum <= 0 then
+    throw PbError(msg: "invalid field number for encode", pos: -1)
+  end
+  match fval do
+    | PbVarint(val: vv) ->
+      let tag = (fnum << 3) | wt_varint
+      let %b1 = push_varint(buf: %buf, v: tag)
+      return push_varint(buf: %b1, v: vv)
+    | PbFixed64(val: fv) ->
+      let tag = (fnum << 3) | wt_i64
+      let %b1 = push_varint(buf: %buf, v: tag)
+      return push_i64_le(buf: %b1, v: fv)
+    | PbLenDelimited(data: dbuf) ->
+      let tag = (fnum << 3) | wt_len
+      let dlen = bb.length(buf: &dbuf)
+      let %b1 = push_varint(buf: %buf, v: tag)
+      let %b2 = push_varint(buf: %b1, v: dlen)
+      let %b3 = bb.push_buf(dst: %b2, src: &dbuf)
+      bb.free(buf: %dbuf)
+      return %b3
+    | PbFixed32(val: fv) ->
+      let tag = (fnum << 3) | wt_i32
+      let %b1 = push_varint(buf: %buf, v: tag)
+      return bb.push_i32_le(buf: %b1, val: fv)
+    | PbSGroup(field_number: sg_fn) ->
+      let tag = (sg_fn << 3) | wt_sgroup
+      return push_varint(buf: %buf, v: tag)
+    | PbEGroup(field_number: eg_fn) ->
+      let tag = (eg_fn << 3) | wt_egroup
+      return push_varint(buf: %buf, v: tag)
+  end
+end
+
+let encode_fields_go = fn (buf: %bb.ByteBuffer, fields: [PbField]) -> %bb.ByteBuffer throws { PbThrow } do
+  match fields do
+    | [] -> return buf
+    | fld :: rest ->
+      let %buf2 = encode_field(buf: %buf, fld)
+      return encode_fields_go(buf: %buf2, fields: rest)
+  end
+end
+
+/**
+ * Encodes a list of PbField values into a fresh ByteBuffer in wire order.
+ * The caller owns the returned buffer and must free it.
+ * Raises PbError if field_number <= 0.
+ */
+export let encode = fn (fields: [PbField]) -> %bb.ByteBuffer throws { PbThrow } do
+  let buf = bb.empty()
+  return encode_fields_go(buf: %buf, fields)
+end
