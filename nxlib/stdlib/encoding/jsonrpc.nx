@@ -1,24 +1,26 @@
 /**
- * jsonrpc: JSON-RPC 2.0 base protocol framing (Content-Length headers).
+ * jsonrpc: JSON-RPC 2.0 framing for two stdio transports.
  *
- * Wire format per JSON-RPC 2.0 base protocol (also adopted by LSP):
+ * Two wire formats live here because LSP and MCP made different framing
+ * choices and both clients are first-class:
  *
- *   Content-Length: <n>\r\n
- *   [Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n]
- *   \r\n
- *   <n bytes of UTF-8 JSON body>
+ *   LSP-style — Content-Length-headed frames (per JSON-RPC 2.0 base
+ *   protocol §6):
+ *     Content-Length: <n>\r\n
+ *     [Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n]
+ *     \r\n
+ *     <n bytes of UTF-8 JSON body>
+ *   API: frame_message / unframe_one (pure), read_message /
+ *   read_message_pipelined / write_message (I/O).
  *
- * Two layers are exported:
+ *   MCP-style — newline-delimited JSON (NDJSON) per the MCP stdio
+ *   transport spec: one compact JSON object per message, terminated by
+ *   a single `\n`. Messages MUST NOT contain embedded newlines.
+ *   API: unframe_ndjson_one (pure), read_ndjson_message_pipelined /
+ *   write_ndjson_message (I/O).
  *
- *   Pure layer — operates on strings, no I/O. Used for unit tests and for
- *   embedding the framing in alternative transports (e.g. socket bytes).
- *     frame_message(value) -> string
- *     unframe_one(input)   -> UnframedStep
- *
- *   I/O layer — operates inside the `Console` capability.
- *     read_message()       -> Option<JsonValue>           (None on EOF)
- *     write_message(value) -> unit
- *     dispatch_step(dispatch_fn) -> bool                  (one-frame step)
+ * Both transports share classify / response_ok / response_error /
+ * IncomingMessage downstream.
  *
  * Dispatch model: synchronous, single-threaded. Per LSP spec the server
  * reads one message, computes a response (for requests) or runs the side
@@ -340,6 +342,95 @@ never leak even if the host runtime line-buffers stdout.
 export let write_message = fn (value: JsonValue) -> unit require { Console } throws { JsonRpcError } do
   let framed = frame_message(value)
   Console.print(val: framed)
+  return ()
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NDJSON transport (MCP stdio)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Per MCP 2024-11-05 stdio spec: one compact JSON object per message,
+// terminated by `\n`. No Content-Length headers, no embedded newlines in
+// the body. We tolerate optional `\r` before `\n` so Windows clients that
+// emit CRLF aren't rejected, but the canonical separator is LF.
+
+let strip_trailing_cr = fn (s: string) -> string do
+  let n = str.byte_length(s)
+  if n == 0 then return s end
+  let last = str.byte_at(s, idx: n - 1)
+  if char.ord(c: last) == ch_cr then
+    return str.byte_substring(s, start: 0, len: n - 1)
+  end
+  return s
+end
+
+/**
+Pull at most one newline-delimited JSON message off the front of `input`.
+Returns `UnframedNeedMore` when the buffer does not yet contain a `\n`.
+The body before the terminator is parsed as JSON; a malformed body raises
+`JsonError` (caught by the dispatch loop and routed back as ParseError).
+
+The `rest` field of `UnframedOk` is the unconsumed suffix after the
+terminating `\n` — callers thread it back into the next call to handle
+multiple frames delivered in one read.
+*/
+export let unframe_ndjson_one = fn (input: string) -> UnframedStep throws { JsonRpcError } do
+  let n = byte_length_of(s: input)
+  if n == 0 then return UnframedNeedMore end
+  let nl_idx = str.find_byte(s: input, start: 0, ch: ch_lf)
+  if nl_idx < 0 then return UnframedNeedMore end
+  let body_raw = str.byte_substring(s: input, start: 0, len: nl_idx)
+  let body = strip_trailing_cr(s: body_raw)
+  let value = parse(s: body)
+  let rest_start = nl_idx + 1
+  let rest = str.byte_substring(s: input, start: rest_start, len: n - rest_start)
+  return UnframedOk(value, rest)
+end
+
+let drain_until_ndjson_frame = fn (acc: string) -> UnframedStep require { Console } throws { JsonRpcError } do
+  match unframe_ndjson_one(input: acc) do
+    | UnframedOk(value, rest) -> return UnframedOk(value, rest)
+    | UnframedNeedMore ->
+      let %buf = Console.read_bytes(n: read_chunk_size)
+      let chunk = consume_buf(%buf)
+      if str.byte_length(s: chunk) == 0 then
+        if str.byte_length(s: acc) == 0 then
+          throw JsonRpcEof
+        end
+        throw JsonRpcFrameError(msg: "unexpected EOF mid-ndjson-frame")
+      end
+      return drain_until_ndjson_frame(acc: acc ++ chunk)
+  end
+end
+
+/**
+Pipelined NDJSON read. Accepts leftover bytes from the previous call
+(initially `""`) and returns `Pair(left: None, right: "")` on clean EOF,
+or `Pair(left: Some(value), right: rest)` on a successful frame.
+*/
+export let read_ndjson_message_pipelined = fn (leftover: string) -> Pair<Option<JsonValue>, string> require { Console } throws { JsonRpcError } do
+  try
+    match drain_until_ndjson_frame(acc: leftover) do
+      | UnframedOk(value, rest) -> return Pair(left: Some(val: value), right: rest)
+      | UnframedNeedMore -> throw JsonRpcFrameError(msg: "ndjson unframe stalled despite EOF guard")
+    end
+  catch err ->
+    match err do
+      | JsonRpcEof -> return Pair(left: None, right: "")
+      | _ -> throw err
+    end
+  end
+end
+
+/**
+Write one NDJSON-framed JSON-RPC message to the Console. `serialize`
+emits compact output with no raw newlines, so a single `print` of
+`<body>\n` produces a spec-compliant frame and keeps it atomic against
+line-buffered stdout.
+*/
+export let write_ndjson_message = fn (value: JsonValue) -> unit require { Console } throws { JsonRpcError } do
+  let body = serialize(v: value)
+  Console.print(val: body ++ "\n")
   return ()
 end
 

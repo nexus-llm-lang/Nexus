@@ -1,0 +1,130 @@
+// nexus-r6ey: unframe_ndjson_one parses newline-delimited JSON-RPC for the
+// MCP stdio transport, which uses NDJSON rather than the LSP Content-Length
+// framing. Before the fix `nexus mcp` rejected every spec-compliant MCP
+// client because the read path called the Content-Length unframer.
+//
+// Pure-layer pins (no I/O):
+//   1. A single message followed by `\n` is extracted; rest is empty.
+//   2. Two NDJSON messages concatenated → first call yields msg1 with a
+//      non-empty rest holding msg2; second call yields msg2 with empty rest.
+//   3. An empty buffer returns UnframedNeedMore (not a frame error).
+//   4. A buffer without any `\n` returns UnframedNeedMore (mid-frame).
+//   5. CRLF-terminated frames parse identically to LF-terminated frames
+//      (the trailing `\r` is stripped before JSON parse).
+
+import {
+  unframe_ndjson_one,
+  UnframedStep, UnframedNeedMore, UnframedOk
+} from "std:jsonrpc"
+import {
+  JsonValue, JsonInt, JsonString, JsonObject, JsonField
+} from "std:json"
+import * as test_assert from "std:test/assert"
+
+let scan_for_id = fn (xs: [JsonField], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | JsonField(key: k, value: v) :: rest ->
+      if k == "id" then
+        match v do
+          | JsonInt(val: n) -> return scan_for_id(xs: rest, acc: n)
+          | _ -> return scan_for_id(xs: rest, acc: acc)
+        end
+      end
+      return scan_for_id(xs: rest, acc: acc)
+  end
+end
+
+let extract_id = fn (v: JsonValue) -> i64 do
+  match v do
+    | JsonObject(fields: fs) -> return scan_for_id(xs: fs, acc: -1)
+    | _ -> return -1
+  end
+end
+
+let assert_need_more = fn (step: UnframedStep, label: string) -> unit throws { Exn } do
+  match step do
+    | UnframedNeedMore -> return ()
+    | UnframedOk(value: _, rest: _) ->
+      throw RuntimeError(val: label ++ ": expected UnframedNeedMore but got UnframedOk")
+  end
+end
+
+let assert_ok_with_id = fn (
+  step: UnframedStep, expected_id: i64, label: string
+) -> string throws { Exn } do
+  match step do
+    | UnframedNeedMore ->
+      throw RuntimeError(val: label ++ ": expected UnframedOk but got UnframedNeedMore")
+    | UnframedOk(value, rest) ->
+      test_assert.assert_eq_i64(
+        actual: extract_id(v: value),
+        expected: expected_id,
+        label: label ++ " id"
+      )
+      return rest
+  end
+end
+
+let main = fn () -> unit throws { Exn } do
+  // (1) Single LF-terminated frame.
+  let single = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n"
+  let rest1 = assert_ok_with_id(
+    step: unframe_ndjson_one(input: single),
+    expected_id: 1,
+    label: "single LF frame"
+  )
+  test_assert.assert_eq_string(
+    actual: rest1, expected: "",
+    label: "rest after single LF frame is empty"
+  )
+
+  // (2) Two NDJSON messages concatenated — verify pipelined extraction.
+  let pipelined =
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n"
+   ++ "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n"
+  let after_first = assert_ok_with_id(
+    step: unframe_ndjson_one(input: pipelined),
+    expected_id: 1,
+    label: "pipelined frame 1"
+  )
+  test_assert.assert(
+    cond: after_first != "",
+    label: "rest after frame 1 is non-empty (frame 2 buffered)"
+  )
+  let after_second = assert_ok_with_id(
+    step: unframe_ndjson_one(input: after_first),
+    expected_id: 2,
+    label: "pipelined frame 2"
+  )
+  test_assert.assert_eq_string(
+    actual: after_second, expected: "",
+    label: "rest after frame 2 is empty"
+  )
+
+  // (3) Empty input → NeedMore.
+  assert_need_more(
+    step: unframe_ndjson_one(input: ""),
+    label: "empty buffer"
+  )
+
+  // (4) Partial frame without trailing newline → NeedMore.
+  assert_need_more(
+    step: unframe_ndjson_one(input: "{\"jsonrpc\":\"2.0\",\"id\":3"),
+    label: "no terminator"
+  )
+
+  // (5) CRLF-terminated frame parses as if LF-terminated.
+  let crlf = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"ping\"}\r\n"
+  let rest_crlf = assert_ok_with_id(
+    step: unframe_ndjson_one(input: crlf),
+    expected_id: 4,
+    label: "CRLF frame"
+  )
+  test_assert.assert_eq_string(
+    actual: rest_crlf, expected: "",
+    label: "rest after CRLF frame is empty"
+  )
+
+  return ()
+end
