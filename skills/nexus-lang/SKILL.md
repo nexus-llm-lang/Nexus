@@ -198,41 +198,7 @@ binding shapes behave uniformly.
 
 Nexus uses coeffects for dependency injection, NOT algebraic effects. See https://nexus-llm-lang.github.io/latest/spec/effects for details.
 
-```nexus
-// 1. Define a cap (interface)
-cap Logger do
-  fn info(msg: string) -> unit
-  fn error(msg: string) -> unit
-end
-
-// 2. Implement via handler
-let console_logger = handler Logger require { Console } do
-  fn info(msg: string) -> unit do
-    Console.println(val: "[INFO] " ++ msg)
-    return ()
-  end
-  fn error(msg: string) -> unit do
-    Console.println(val: "[ERROR] " ++ msg)
-    return ()
-  end
-end
-
-// 3. Require cap in functions
-let greet = fn (name: string) -> unit require { Logger } do
-  Logger.info(msg: "Hello, " ++ name)
-  return ()
-end
-
-// 4. Inject handler at call site
-let main = fn () -> unit require { PermConsole } do
-  inject stdio.system_handler do
-    inject console_logger do
-      greet(name: "World")
-    end
-  end
-  return ()
-end
-```
+Working example: [handler_basic.nx](../../examples/feature/handler_basic.nx) (define a `cap`, implement a `handler`, inject with `inject h do ... end`).
 
 Convention: `require { ... }` and `throws { ... }` rows are sets — order is
 irrelevant to the typechecker. List entries alphabetically (e.g.
@@ -270,37 +236,8 @@ end
 ```
 
 ### Error Handling
-```nexus
-import { Result, Ok, Err } from "std:result"
 
-exception NotFound(msg: string)
-
-// Narrow `throws` row — list exactly what may escape, not the catch-all `Exn`
-let find_user = fn (id: i64) -> string throws { NotFound } do
-  if id == 1 then
-    return "Alice"
-  else
-    raise NotFound(msg: "User not found")
-  end
-end
-
-// Selective catch — pattern-match the exception with `|` arms
-try
-  let name = find_user(id: 42)
-  Console.println(val: name)
-catch
-  | NotFound(msg: m) -> Console.println(val: m)
-  | _ -> Console.println(val: "Unknown error")
-end
-
-// Bare catch — single binder, no destructuring (the dominant form in this codebase)
-try
-  let name = find_user(id: 42)
-  Console.println(val: name)
-catch err ->
-  Console.eprintln(val: format_error(err))
-end
-```
+Working example: [try_catch.nx](../../examples/feature/try_catch.nx) (raise, selective catch arms, bare catch).
 
 **When to use which form:**
 - **Bare `catch <ident> -> body end`** — one identifier binds the whole exception value. Use when the handler treats every escaping exception uniformly (log, rethrow, return a default). `catch _ -> ...` is the same shape with the value discarded.
@@ -309,8 +246,6 @@ end
 For multi-exception phases, declare an `exception group` and use the group name in the row:
 
 ```nexus
-exception UnexpectedToken(span: Span)
-exception UnexpectedEof(span: Span)
 exception group ParseError = UnexpectedToken | UnexpectedEof
 
 let parse_top = fn (toks: [Token]) -> Decl throws { ParseError } do
@@ -318,24 +253,11 @@ let parse_top = fn (toks: [Token]) -> Decl throws { ParseError } do
 end
 ```
 
+Working example: [exception_group.nx](../../examples/feature/exception_group.nx) (declare a group, throw members, catch by variant).
+
 ### List Recursion
-```nexus
-import * as list from "std:list"
 
-let sum = fn (xs: [ i64 ]) -> i64 do
-  match xs do
-    | [] -> return 0
-    | v :: rest -> return v + sum(xs: rest)
-  end
-end
-
-// With fold
-let sum2 = fn (xs: [ i64 ]) -> i64 do
-  return list.fold_left(xs: xs, init: 0, f: fn (acc: i64, val: i64) -> i64 do
-    return acc + val
-  end)
-end
-```
+Working example: [list_basics.nx](../../examples/feature/list_basics.nx) (recursive sum, `std:list` combinators, cons patterns).
 
 ## Comment and Documentation Policy
 

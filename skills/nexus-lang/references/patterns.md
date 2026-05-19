@@ -5,92 +5,28 @@
 Every executable Nexus program needs a `main` function:
 
 ```nexus
-// Minimal program
+// Minimal program — no caps required
 let main = fn () -> unit do
   return ()
 end
-
-// With I/O
-import { Console }, * as stdio from "std:stdio"
-
-let main = fn () -> unit require { PermConsole } do
-  inject stdio.system_handler do
-    Console.println(val: "Hello!")
-  end
-  return ()
-end
-
-// Implicit return unit
-import { Console }, * as stdio from "std:stdio"
-
-let main = fn () -> unit require { PermConsole } do
-  inject stdio.system_handler do
-    Console.println(val: "Hello!")
-  end
-  // no need `return ()`
-end
 ```
+
+For I/O programs, see [effects_console_fs.nx](../../../examples/feature/effects_console_fs.nx) (two caps, inject, try/catch) or [import_forms.nx](../../../examples/feature/import_forms.nx) (named / wildcard / combined imports).
 
 ## Import Patterns
 
-```nexus
-// Import cap + module alias (most common for I/O)
-import { Console }, * as stdio from "std:stdio"
+Working example: [import_forms.nx](../../../examples/feature/import_forms.nx) (named / wildcard / combined import forms).
 
-// Import specific items
-import { Option, Some, None } from "std:option"
-import { Result, Ok, Err } from "std:result"
-
-// Import as module alias (for utility functions)
-import * as list from "std:list"
-import * as str from "std:str"
-import * as math from "std:math"
-
-// Combine both
-import { Net, Request, Response }, * as net_mod from "std:network"
-```
+The three shapes:
+- Named: `import { Foo, bar } from "mod"` — bring specific bindings into scope.
+- Wildcard: `import * as m from "mod"` — namespace alias.
+- Combined: `import { Foo }, * as m from "mod"` — both at once.
 
 ## Custom Cap + Handler (Dependency Injection)
 
-```nexus
-// 1. Define domain types
-type User = { id: i64, name: string, email: string }
+Working example: [handler_basic.nx](../../../examples/feature/handler_basic.nx) (define a `cap`, two `handler` implementations, swap via `inject`).
 
-// 2. Define cap (interface)
-cap UserRepository do
-  fn find_by_id(id: i64) -> Option<User>
-  fn save(user: User) -> Result<unit, string>
-end
-
-// 3. Business logic depends on cap
-let register = fn (name: string, email: string) -> Result<unit, string> require { UserRepository, Logger } do
-  let user = { id: 0, name: name, email: email }
-  Logger.info(msg: "Registering: " ++ email)
-  return UserRepository.save(user: user)
-end
-
-// 4. Handler for production
-let db_repo = handler UserRepository require { PermFs } do
-  fn find_by_id(id: i64) -> Option<User> do
-    // ... real implementation
-    return None
-  end
-  fn save(user: User) -> Result<unit, string> do
-    // ... real implementation
-    return Ok(val: ())
-  end
-end
-
-// 5. Handler for testing
-let mock_repo = handler UserRepository do
-  fn find_by_id(id: i64) -> Option<User> do
-    return Some(val: { id: id, name: "Test", email: "test@test.com" })
-  end
-  fn save(user: User) -> Result<unit, string> do
-    return Ok(val: ())
-  end
-end
-```
+Pattern: (1) declare `cap Foo do fn op(...) end`; (2) implement `let h = handler Foo require { ... } do fn op ... end`; (3) annotate callers with `require { Foo }`; (4) install at the boundary with `inject h do ... end`.
 
 ## Multi-Handler Injection (single `inject`, comma-separated)
 
@@ -176,55 +112,13 @@ end
 
 ### Result-based (prefer for recoverable errors)
 
-```nexus
-import { Result, Ok, Err } from "std:result"
-
-let parse_config = fn (raw: string) -> Result<Config, string> do
-  if str.length(s: raw) == 0 then
-    return Err(err: "empty config")
-  else
-    // ... parse
-    return Ok(val: config)
-  end
-end
-```
+Working example: [result_basics.nx](../../../examples/feature/result_basics.nx) (`Ok`/`Err` return, `map`, `unwrap_or`, `is_err`).
 
 ### Exception-based (for unrecoverable or I/O errors)
 
-```nexus
-exception ConfigError(msg: string)
+Working example: [try_catch.nx](../../../examples/feature/try_catch.nx) (declare exceptions, `throw`, selective catch arms, bare catch).
 
-let load_or_die = fn (path: string) -> Config require { Fs } throws { Exn } do
-  let raw = Fs.read_to_string(path: path)
-  let res = parse_config(raw: raw)
-  match res do
-    | Ok(val: c) -> return c
-    | Err(err: msg) -> raise ConfigError(msg: msg)
-  end
-end
-
-// Selective catch in main — pattern-match on exception constructors
-let main = fn () -> unit require { PermFs, PermConsole } do
-  inject fs_mod.system_handler, stdio.system_handler do
-    try
-      let cfg = load_or_die(path: "config.txt")
-      Console.println(val: "Config loaded")
-    catch
-      | ConfigError(msg: m) -> Console.println(val: "Config error: " ++ m)
-      | _ -> Console.println(val: "Unknown error")
-    end
-  end
-end
-
-// Bare catch — single identifier binds the whole exception
-let run_or_log = fn () -> unit require { Console } do
-  try
-    do_work()
-  catch err ->
-    Console.eprintln(val: "<task>: " ++ format_error(err))
-  end
-end
-```
+See also [exception_group.nx](../../../examples/feature/exception_group.nx) for grouping multiple exceptions under one `throws` label.
 
 ### Catch form: bare vs selective
 
@@ -384,23 +278,11 @@ For traversing a list or array, use `match`/recursion or `list.fold_left` /
 
 Nexus linear types (`%`) enforce exactly-once consumption at compile time.
 
-```nexus
-// File handle: open → use → close (compiler enforces the chain)
-let process_file = fn (path: string) -> string require { Fs } throws { Exn } do
-  let %handle = Fs.open_read(path: path)
-  let { content: content, handle: %h } = Fs.read(handle: %handle)
-  Fs.close(handle: %h)
-  return content
-end
-
-// HashMap: create → use → free
-let count_words = fn (words: [ string ]) -> unit do
-  let %map = smap.empty()
-  // ... populate map ...
-  let keys = smap.keys(m: &%map)
-  smap.free(m: %map)    // must explicitly free
-end
-```
+- [linear_consume.nx](../../../examples/feature/linear_consume.nx) — `%Box` consumed exactly once; ownership transferred on call.
+- [linear_borrow.nx](../../../examples/feature/linear_borrow.nx) — `&Box` borrow: inspect without consuming; caller retains ownership.
+- [linear_thread.nx](../../../examples/feature/linear_thread.nx) — threading `%Counter` through recursive accumulation.
+- [hashmap_basics.nx](../../../examples/feature/hashmap_basics.nx) — linear `HashMap`: writes consume + return new handle, reads borrow.
+- [stringmap_basics.nx](../../../examples/feature/stringmap_basics.nx) — linear `StringMap` with the same ownership story.
 
 ## Array Patterns
 
@@ -540,47 +422,11 @@ the let-binding sigil `let @x = e` — it wraps `e : T` into a thunk of type
 both `@x` (bare ident) and `@(expr)` (parenthesized compound). The parser
 treats `@(...)` as `ExprForce`, not as thunk-introduction. This matches the
 formal type-system rule `wrapSigil(@, τ) = @τ` on let-bindings together with
-T-Force on expressions; a thunk-introduction form like `@(...) : T → @T` is
-not part of the canonical spec (see bd: nexus-s7mq for the spec cross-doc
-gap).
+T-Force on expressions.
 
-```nexus
-// Thunk creation: only via `let @x = e` — RHS becomes an @T thunk
-let @expensive = heavy_computation(input: data)
-
-// Force: runs the thunk now (synchronous), returns the result
-let result = @expensive
-
-// Lazy with captured variables
-let base = 100
-let @derived = base * 2 + some_call(n: base)
-let val = @derived    // captures `base`; forced synchronously here
-
-// `@(expr)` in expression position is force, NOT thunk creation —
-// the inner expression must already be of type @T.
-let quick = @(some_thunk)
-```
-
-### Parallel: `std:lazy.force_all` and `std:lazy_host`
-
-```nexus
-import * as lazy from "std:lazy"
-
-let @a = work(n: 1000)
-let @b = work(n: 1001)
-let @c = work(n: 1002)
-let results = lazy.force_all(tasks: [a, b, c])   // a, b, c run on 3 OS threads
-                                                 // results in input order: [ra, rb, rc]
-```
-
-```nexus
-import { host_spawn, host_join } from "std:lazy_host"
-
-let @t = expensive()
-let h = host_spawn(a: t)        // %Task<T> — linear, must be joined
-// ... overlapping work on this thread ...
-let v = host_join(handle: h)    // waits for the worker, returns the value
-```
+Working examples:
+- [lazy_force.nx](../../../examples/feature/lazy_force.nx) — single thunk creation and synchronous force.
+- [lazy_parallel.nx](../../../examples/feature/lazy_parallel.nx) — `lazy.force_all` on multiple thunks (WASI threads).
 
 Run threaded programs via the bundled `nexus` launcher (it passes
 `-W threads=y,shared-memory=y -S threads` to wasmtime).
@@ -611,130 +457,3 @@ end
   observable effects (`race` / `cancel` / `detach` in `std:lazy` are still
   sequential — see their docstrings)
 
-<<<<<<< HEAD
-## Spec-vs-implementation deltas
-
-These are points where the in-tree typechecker behaves consistently but the
-canonical spec (`type-system-formal.md`, in submodule) doesn't yet have the
-corresponding rule annotated. Listed here so a reader of `src/typecheck` can
-predict the implementation without chasing spec text.
-
-### T-Lambda throws/requires — declared vs inferred
-
-In `src/typecheck/infer.nx::infer_lambda` (around line 899) the constructed
-`TyArrow` hardcodes both `requires` and `throw_row` to `TyRow([], None)` — the
-body's inferred effect row is never lifted onto the lambda's arrow type. The
-function-decl boundary, by contrast, threads the declared throws row through
-`CheckState.throw_row` (`check.nx::check_function`, line 575) and enforces
-admission at every `raise` (`check_raise_admitted`, infer.nx:971) and every
-call site (`check_call_throw_row_admitted`, infer.nx:220). Inside a lambda
-body the *outer* function's throw_row is what's checked — there is no
-per-lambda fresh ρ. The spec's T-Lambda premise `... ⊢_s s̄ : Γ' ! ρ_e` and
-arrow conclusion `(...) → τ_r; ρ_q; ρ_e` literally force `declared = body-
-inferred`; the impl side-steps this entirely by never populating the lambda's
-arrow row. See bd `nexus-uy3l` (closed-deferred on mqin.1) for the unify-arrow
-blocker analysis, and `nexus-xyhv` for the missing spec subsumption rule.
-
-### T-Var: sigil-bound variables (`%x`)
-
-`src/frontend/parser.nx:159` parses `%x` to `ExprVariable(name, sigil:
-SigilLinear)`, identical in shape to the bare `x` form (`SigilImmutable`).
-`src/typecheck/infer/literals.nx::infer_variable` (line 74) ignores the sigil
-unless it is `SigilMutable` (which triggers the `~x` deref path); for
-`SigilLinear` it falls through to plain env lookup and returns the binding's
-type unchanged. So `%x` and `x` are typed identically by the same code path;
-the linearity discipline lives in `src/typecheck/linearity.nx`, not in T-Var.
-The spec's T-Var prose restricts μ to ε; the impl treats μ ∈ {ε, %} as a
-single rule, with `~` handled by an inlined `SigilMutable` branch in the same
-function. No separate T-Var-Linear rule exists in the impl.
-
-### T-App: ρ_q subsumption vs ρ_e' union
-
-`src/typecheck/infer.nx::infer_call` (line 177) destructures the callee's
-arrow as `TyArrow(params, ret, requires: _, throw_row: callee_thr)` —
-`requires` is fully ignored at the call site (no `open()`, no unify, no
-admission check). Only `throw_row` is consulted: `check_call_throw_row_
-admitted` (line 220) performs a literal membership check of each callee
-exception against the caller's `state_throw_row`, with several back-compat
-carve-outs (closed-empty on either side, open row on either side, non-row
-shape all admit). There is no `∪` and no `open()` — neither limb of the spec
-asymmetry exists in the impl. The capability side is silent; the effect side
-is a one-directional admission check, not a union.
-
-### T-Lambda / T-Handler: Γ_ω capture
-
-`src/typecheck/infer.nx::infer_lambda` (line 888) reads `outer_env =
-state_env(state)`, extends it with the lambda's parameters via
-`add_params_to_env`, and threads the result straight into the body
-inference state. The body therefore sees every binding visible at the
-lambda's definition point — Γ_ω, Γ_cap, and Γ_rest alike — with no
-partitioning at the type level. `src/typecheck/capture.nx::scan_lambda_
-captures` does walk the body to classify captures, but only to decide
-whether the arrow gets wrapped in `TyLinear` (the Γ_cap ≠ ∅ → %τ_→ rule)
-and to reject `~x` captures; Γ_ω is not materialized as a separate
-environment slice. The spec's Γ_ω-on-the-left-of-the-conclusion question
-simply does not arise: the impl carries the ambient Γ wholesale.
-Inline `Handler(...)` expressions (`infer.nx:108`) sidestep the issue by
-returning a fixed `TyHandler(name, requires: TyRow([], None))` without
-walking arm bodies for type purposes (arm typechecking happens at the
-top-level handler-arm path in `check.nx`, which inherits the enclosing
-function's env via `state_with_env`).
-
-## Row & exhaustiveness deltas
-
-These are points where `docs/spec/type-system-formal.md` is silent or
-non-deterministic and the implementation has picked a specific reading. Treat
-the impl as the source of truth until the spec is amended.
-
-### Row union over open rows (nexus-w6vp)
-
-The spec defines `merge(ρ₁, ρ₂) = ρ₁ ∪ ρ₂` and a closed-closed `U-Row-Exn`, but
-leaves open-row unions and `Exn`-with-open-tail formally undefined.
-
-- **Impl**: There is no standalone `merge` function. Row mixing is performed
-  inline by `unify_rows_kind` in `src/typecheck/unify.nx` (≈ L362–L405).
-  Surplus labels from each side (`row_split_surplus`) are absorbed by the
-  partner's tail variable when present; if the partner is closed and surplus is
-  non-empty, unification fails with "extra label(s) … not admitted".
-- **Effect**: `{A | ?r₁}` unifying with `{B}` succeeds by instantiating
-  `?r₁ := {B | …}`; the result is the closed `{A, B}` shape. `Exn` is never
-  given special treatment in the row walk — it flows through `row_remove_label`
-  via structural `type_eq` like any other label.
-- **Reading**: open tails win; there is no separate `U-Row-Exn-Open` because
-  the algorithm makes the "instantiate-then-re-apply" sequence happen in one
-  pass.
-
-### Maranget rule priority (nexus-n4pl)
-
-The spec's six `Exh-*` rules (Empty / Done / Bool / Sum / Record / Default) do
-not state a selection order, so `Exh-Default` looks like it could fire at any
-time.
-
-- **Impl**: `src/typecheck/exhaustive.nx` is a full Maranget usefulness/spec
-  algorithm (predicate `is_useful` over `S(M, c)` and `default(M)`). Order is
-  fixed by the algorithm: at each step, if the column type has a known signature
-  (`bool`, sum/enum with full variants, record), it specializes first;
-  `default` only runs against wild-like rows on the head. So in practice the
-  priority is `Empty → Done → constructor-specialize (Bool/Sum/Record) →
-  Default`, exactly Maranget.
-- **Bonus**: redundancy is reported as an error (no warning subsystem), and
-  free type vars in the column type force the conservative "infinite signature"
-  branch (wildcards only). The Maranget pass closed by nexus-j6mr supersedes
-  the spec's ambiguity at the algorithmic level.
-
-### `comparable(?α)` for unresolved/poly type vars (nexus-njx8)
-
-Spec's `comparable(τ)` predicate at `T-Cmp` is partial: no clause for `?α`
-(unification var) or `α` (declared polymorphic var).
-
-- **Impl**: `src/typecheck/infer/operators.nx::comparable` (≈ L100–L126) has
-  `TyVar(_) -> return true`. The choice is the **lenient** reading: free type
-  vars are accepted at the comparison site; later unification decides whether
-  the concrete substitute is comparable.
-- **Caveat**: this is documented as "deferred" — there is currently *no*
-  follow-up check after instantiation that re-evaluates comparability against
-  the resolved type. A generic `fn (x: T, y: T) -> bool do return x == y end`
-  type-checks today even if `T` resolves to a function/handler/ref at the call
-  site. Tighten when the spec picks a side.
-- Also note `TyUserDefined` falls through to `true` for unknown names (opaque /
-  enum), so enum equality is silently accepted pending an enum-equality spec.
