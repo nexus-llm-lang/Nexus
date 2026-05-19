@@ -1,0 +1,144 @@
+// nexus-ey2g: user handler bindings must take precedence over inferred ones.
+//
+// Bug: effective_hpn = append_name_pairs(a: handler_cap_names, b: inferred)
+// placed inferred bindings AFTER user-defined ones. build_global_cap_handlers
+// iterates left-to-right with insert_or_replace (last wins), so when both
+// user and inferred bind the same cap, the inferred binding won.
+//
+// Fix: reverse the append order to append_name_pairs(a: inferred, b: handler_cap_names)
+// so user-defined bindings come last and win under last-wins semantics.
+//
+// Test: a HirProgram has cap FooCap with method doFoo, a user handler binding
+// "user_handler" → FooCap, and an inferred __handler_inferred_doFoo function
+// that also matches FooCap. After lowering, a FooCap.doFoo() call must resolve
+// to __handler_user_handler_doFoo, not __handler_inferred_doFoo.
+import * as test_assert from "std:test/assert"
+import { lower_hir_to_mir } from "src/ir/mir/mir.nx"
+import { MirProgram, MirFunction, MirStmt, MirExpr } from "src/ir/mir/types.nx"
+import { TyUnit, Literal, LitUnit } from "src/common/ast.nx"
+import { None, Some } from "std:option"
+import {
+  HirProgram, HirFunction, HirBody, EagerBody,
+  HirParam, HirHandlerArm, HirHandlerBinding, HirHandlerBindingEntry,
+  HirStmt, HirStmtKind, HirExpr, HirExprKind,
+  HirCap, HirCapMethod
+} from "src/ir/hir/types.nx"
+import { mk_hir_expr, mk_hir_stmt, empty_row } from "tests/_fixtures/hir_programs.nx"
+import { dummy_span } from "tests/_fixtures/span.nx"
+
+let mk_simple_fn = fn (name: string, stmts: [HirStmt]) -> HirFunction do
+  return HirFunction(
+    name,
+    type_params: [],
+    params: [],
+    ret_type: TyUnit,
+    throw_row: empty_row(),
+    body: EagerBody(stmts: stmts),
+    span: dummy_span(),
+    file: "test.nx",
+    requires: empty_row()
+  )
+end
+
+let find_func_by_name = fn (funcs: [MirFunction], name: string) -> Option<MirFunction> do
+  match funcs do
+    | [] -> return None
+    | f :: rest ->
+      let MirFunction(name: n, _) = f
+      if n == name then return Some(val: f)
+      else return find_func_by_name(funcs: rest, name)
+      end
+  end
+end
+
+let find_first_call_name = fn (stmts: [MirStmt]) -> Option<string> do
+  match stmts do
+    | [] -> return None
+    | MirStmtExpr(expr: MirCall(func: f, args: _, ret_type: _)) :: _ -> return Some(val: f)
+    | MirStmtReturn(expr: MirCall(func: f, args: _, ret_type: _)) :: _ -> return Some(val: f)
+    | _ :: rest -> return find_first_call_name(stmts: rest)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  // Build cap FooCap with method doFoo.
+  let hcap_method = HirCapMethod(
+    name: "doFoo",
+    requires: empty_row(),
+    span: dummy_span(),
+    throw_row: empty_row(),
+    typ_params: [],
+    typ_ret: TyUnit
+  )
+  let hcap = HirCap(name: "FooCap", methods: [hcap_method])
+
+  // Build user handler binding: "user_handler" → FooCap.
+  // The arm function just returns unit.
+  let ret_stmt = mk_hir_stmt(node: Return(expr: mk_hir_expr(node: Literal(lit: LitUnit))))
+  let arm_fn = mk_simple_fn(name: "__handler_user_handler_doFoo", stmts: [ret_stmt])
+  let arm = HirHandlerArm(arm: arm_fn, cont_binder: None)
+  let binding = HirHandlerBinding(cap_name: "FooCap", requires: empty_row(), arms: [arm])
+  let entry = HirHandlerBindingEntry(name: "user_handler", binding)
+
+  // Build inferred function: __handler_inferred_doFoo.
+  // This is a plain HirFunction whose name matches the infer_handler_cap_names
+  // heuristic, so it will produce NamePair(key: "inferred", value: "FooCap").
+  let inferred_fn = mk_simple_fn(name: "__handler_inferred_doFoo", stmts: [ret_stmt])
+
+  // Build main function with a FooCap.doFoo() call.
+  // detect_cap_call will recognize "FooCap.doFoo" as a cap call on FooCap.
+  let cap_call_expr = mk_hir_expr(node: Call(func: "FooCap.doFoo", args: []))
+  let call_stmt = mk_hir_stmt(node: Expr(expr: cap_call_expr))
+  let main_fn = mk_simple_fn(name: "main", stmts: [call_stmt])
+
+  let hir = HirProgram(
+    caps: [hcap],
+    functions: [inferred_fn, main_fn],
+    externals: [],
+    handler_bindings: [entry],
+    enum_defs: [],
+    exception_groups: [],
+    value_binding_names: [],
+    type_defs: [],
+    visible_enum_names: []
+  )
+
+  let MirProgram(functions: mir_funcs, externals: _) = lower_hir_to_mir(hir)
+
+  // Find the lowered main function and check which handler was called.
+  let mir_main_body = match find_func_by_name(funcs: mir_funcs, name: "main") do
+    | Some(val: MirFunction(name: _, params: _, ret_type: _, body: b, span: _)) -> b
+    | None -> throw RuntimeError(val: "nexus-ey2g: main function not found in MIR output")
+  end
+
+  let called_func = match find_first_call_name(stmts: mir_main_body) do
+    | Some(val: f) -> f
+    | None -> throw RuntimeError(val: "nexus-ey2g: no MirCall found in main body")
+  end
+
+  test_assert.assert(
+    cond: called_func == "__handler_user_handler_doFoo",
+    label: "nexus-ey2g: FooCap.doFoo must resolve to user_handler, not inferred"
+  )
+  test_assert.assert(
+    cond: called_func != "__handler_inferred_doFoo",
+    label: "nexus-ey2g: inferred binding must NOT win over user-defined"
+  )
+
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end
