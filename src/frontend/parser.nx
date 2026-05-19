@@ -715,6 +715,37 @@ let parse_let_without_type = fn (n: string, sig: Sigil, r3: [SpannedToken], sp: 
   ParsedStmt(stmt: SpannedStmt(node: StmtLet(name: n, sigil: sig, typ: None, value: v), span: sp), rest: r5)
 end
 
+/** Lookahead helper: given token list already past the first identifier, scan
+ *  zero or more `.Ident` segments and return true iff the sequence forms a
+ *  valid qualified ctor pattern head.
+ *
+ *  Rules (matching the original depth-1 behaviour, extended to N levels):
+ *    - `Ctor(` → true (bare uppercase ctor with parens)
+ *    - `Mod.Ctor` and `Mod.Ctor(` → true (one-level qualified, with or without `(`)
+ *    - `a.b.C` and `a.b.C(` → true (multi-level qualified, lowercase path segments)
+ *    - bare `Ctor` with no `(` or `.` → false (could be an unboxed value, not a match)
+ *
+ *  `last_was_uident` tracks whether the most recently consumed segment was an
+ *  uppercase identifier (= potentially a constructor).
+ *  `after_dot` is true once at least one `.Seg` has been consumed; it allows
+ *  `Mod.Ctor<terminator>` to return true while `Ctor<terminator>` stays false.
+ */
+let ctor_pat_lookahead = fn (toks: [SpannedToken], last_was_uident: bool, after_dot: bool) -> bool do
+  match pcore.peek_token(toks) do
+    | TkLParen -> return last_was_uident
+    | TkDot ->
+      let r_dot = pcore.skip(toks)
+      match pcore.peek_token(toks: r_dot) do
+        | TkUident(_) -> return ctor_pat_lookahead(toks: pcore.skip(toks: r_dot), last_was_uident: true, after_dot: true)
+        | TkIdent(_)  -> return ctor_pat_lookahead(toks: pcore.skip(toks: r_dot), last_was_uident: false, after_dot: true)
+        | _ -> return false
+      end
+    // Non-dot, non-paren terminator: valid if last seg was Uident AND we already
+    // consumed at least one dot-segment (i.e. the path is `Mod.Ctor`, not bare `Ctor`).
+    | _ -> return last_was_uident && after_dot
+  end
+end
+
 let parse_let_stmt = fn (toks: [SpannedToken]) -> ParsedStmt throws { ParseError } do
   let sp = pcore.peek_span(toks)
   let r_after_let = pcore.expect(toks, expected: "let")
@@ -722,23 +753,12 @@ let parse_let_stmt = fn (toks: [SpannedToken]) -> ParsedStmt throws { ParseError
   // let mod.Ctor(...) = expr (lowercase module alias), or let { ... } = expr
   let is_ctor_pat_head = match pcore.peek_token(toks: r_after_let) do
     | TkUident(_) ->
-      // Bare uppercase ctor `Ctor(` or qualified `Mod.Ctor`
-      let r_after_u = pcore.skip(toks: r_after_let)
-      if pcore.is_tok(toks: r_after_u, expected: "(") then
-        true
-      else if pcore.is_tok(toks: r_after_u, expected: ".") then
-        if let TkUident(_) = pcore.peek_token(toks: pcore.skip(toks: r_after_u)) then true else false end
-      else
-        false
-      end
+      // Bare uppercase ctor `Ctor(` or N-deep qualified `Mod.Sub.Ctor(`
+      ctor_pat_lookahead(toks: pcore.skip(toks: r_after_let), last_was_uident: true, after_dot: false)
     | TkIdent(_) ->
-      // Lowercase module alias `mod.Ctor(` — only trigger on `ident . Uident`
-      let r_after_i = pcore.skip(toks: r_after_let)
-      if pcore.is_tok(toks: r_after_i, expected: ".") then
-        if let TkUident(_) = pcore.peek_token(toks: pcore.skip(toks: r_after_i)) then true else false end
-      else
-        false
-      end
+      // Lowercase module alias: `mod.Ctor(` or `mod.sub.Ctor(` — must have at
+      // least one dot segment ending at an uppercase ctor before `(`.
+      ctor_pat_lookahead(toks: pcore.skip(toks: r_after_let), last_was_uident: false, after_dot: false)
     | _ -> false
   end
   if is_ctor_pat_head then
@@ -762,25 +782,15 @@ let parse_let_stmt = fn (toks: [SpannedToken]) -> ParsedStmt throws { ParseError
   end
   if has_sigil then
     let r_after_sig = pcore.skip(toks: r_after_let)
-    if let TkUident(_) = pcore.peek_token(toks: r_after_sig) then
-      let r_after_sig_uident = pcore.skip(toks: r_after_sig)
-      // Bare ctor: Uident(  or qualified ctor: Uident . Uident
-      let is_ctor_pat_sig = if pcore.is_tok(toks: r_after_sig_uident, expected: "(") then
-        true
-      else if pcore.is_tok(toks: r_after_sig_uident, expected: ".") then
-        if let TkUident(_) = pcore.peek_token(toks: pcore.skip(toks: r_after_sig_uident)) then
-          true
-        else
-          false
-        end
-      else
-        false
-      end
-      if is_ctor_pat_sig then
-        let ParsedPat(pat, rest: r2) = ppat.parse_pattern(toks: r_after_let)
-        let ParsedExpr(expr: v, rest: r3) = parse_expr(toks: pcore.expect(toks: r2, expected: "="))
-        return ParsedStmt(stmt: SpannedStmt(node: StmtLetPattern(pattern: pat, value: v), span: sp), rest: r3)
-      end
+    let is_ctor_pat_sig = match pcore.peek_token(toks: r_after_sig) do
+      | TkUident(_) ->
+        ctor_pat_lookahead(toks: pcore.skip(toks: r_after_sig), last_was_uident: true, after_dot: false)
+      | _ -> false
+    end
+    if is_ctor_pat_sig then
+      let ParsedPat(pat, rest: r2) = ppat.parse_pattern(toks: r_after_let)
+      let ParsedExpr(expr: v, rest: r3) = parse_expr(toks: pcore.expect(toks: r2, expected: "="))
+      return ParsedStmt(stmt: SpannedStmt(node: StmtLetPattern(pattern: pat, value: v), span: sp), rest: r3)
     end
   end
   let ParsedSigil(sigil: sig, rest: r2) = pcore.parse_sigil(toks: r_after_let)
