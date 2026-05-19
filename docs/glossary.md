@@ -21,8 +21,6 @@ does not perform A-normal-form conversion.
 - `src/ir/hir/build/` — AST → HIR conversion
 - `src/ir/hir/pattern.nx` — pattern-shape conversion
 
-**See also:** ADR-0001 (`docs/adr/0001-hir-lir-cli-surface.md`)
-
 ---
 
 ## MIR — Mid-level IR
@@ -59,8 +57,6 @@ instructions.
 - `src/ir/lir/match_tree.nx` — Maranget pattern-matrix → `DecTree` construction
 - `src/ir/lir/func_lower.nx` — function/external lowering entry point
 - `src/ir/lir_opt/` — LIR-level optimisation passes (DCE, constant folding, autovec)
-
-**See also:** ADR-0001 (`docs/adr/0001-hir-lir-cli-surface.md`)
 
 ---
 
