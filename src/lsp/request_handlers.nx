@@ -62,6 +62,9 @@ import {
   compute_formatting_edits
 } from "src/lsp/handlers/formatting.nx"
 import {
+  resolve_hover
+} from "src/lsp/handlers/hover.nx"
+import {
   LspProtocolError, LspProtocolThrow
 } from "src/lsp/protocol/json.nx"
 import {
@@ -387,43 +390,62 @@ let line0_byte_length = fn (src: string) -> i64 do
   return nl_pos
 end
 
-let compute_hover_response = fn (doc_opt: Option<DocumentRecord>, line: i64, character: i64) -> JsonValue do
-  // Hover only resolves to module doc on line 0; other lines reply null
-  // until per-definition doc is wired up (post-MVP).
-  if line != 0 then return JsonNull end
+// Try to produce a hover response for `(line, character)` in `doc_opt`.
+//
+// Priority:
+//   1. If the cursor is on line 0 within the module doc comment extent,
+//      return the module doc. (Unchanged MVP behaviour.)
+//   2. Otherwise, try `resolve_hover` which looks up the identifier at the
+//      cursor in the rename map and renders the function/binding type.
+//   3. Fall back to JsonNull ("no hover info").
+//
+// Phase 1 covers top-level function and `let` binding hovers.
+// Phase 2 (local let bindings, inferred types) deferred — HIR caching needed.
+let compute_hover_response_for_doc = fn (
+  doc_opt: Option<DocumentRecord>,
+  line: i64,
+  character: i64
+) -> JsonValue require { Console, Fs } do
   match doc_opt do
     | None -> return JsonNull
     | Some(val: rec) ->
-      match rec do | DocumentRecord(uri: _, text, version: _) ->
-        match lexer.extract_module_doc(src: text) do
+      match rec do | DocumentRecord(uri, text, version: _) ->
+        // Priority 1: module doc comment on line 0.
+        if line == 0 then
+          match lexer.extract_module_doc(src: text) do
+            | Some(val: doc) ->
+              let extent = line0_byte_length(text)
+              if character < extent then
+                return make_markdown_hover(content: doc)
+              end
+            | None -> let _ = 0
+          end
+        end
+        // Priority 2: identifier type hover via resolve_hover.
+        match resolve_hover(text, file_uri: uri, line, character) do
+          | Some(val: md) -> return make_markdown_hover(content: md)
           | None -> return JsonNull
-          | Some(val: doc) ->
-            // Check that the cursor character position falls within the
-            // extent of the module doc comment: the entire first line of
-            // text [0, line0_byte_length). Cursor beyond the end of line 0
-            // returns null (LSP clients use this to clear hover popups when
-            // the cursor moves past the comment).
-            let extent = line0_byte_length(text)
-            if character >= extent then return JsonNull end
-            return make_markdown_hover(content: doc)
         end
       end
   end
 end
 
-/** Handles `textDocument/hover`: when the cursor sits on line 0 within the
- *  character extent of the module doc comment, returns a
- *  `Hover { contents: { kind: "markdown", value } }` carrying the file's
- *  module-level `/** ... */` doc comment. Cursors on other lines, beyond
- *  the doc extent, in missing buffers, or where no module doc exists reply
- *  JSON `null` ("no hover info").
+/** Handles `textDocument/hover`: returns a markdown `Hover` for the cursor
+ *  position. Coverage:
+ *  - Line 0 within the module doc comment extent → the file's `/** ... */`
+ *    module-level doc comment.
+ *  - Any identifier that resolves to a top-level `let` or `cap` binding →
+ *    the function signature with parameter types, return type, `require {}`,
+ *    and `throws {}` annotations (Phase 1).
+ *  - Non-lambda top-level `let` with a type annotation → `**name**: Type`.
+ *  All other positions reply JSON `null` ("no hover info").
  */
 export let on_hover = fn (state: ServerState, params: JsonValue) -> HandlerResult require { Console, Fs } throws { LspProtocolThrow } do
   let uri = extract_text_document_uri_strict(params, ctx: "HoverParams")
   let pos = hover_position_line_and_char(params)
   let doc_opt = documents_lookup(store: state_documents(state), uri)
   match pos do | Position(line, character) ->
-    let response = compute_hover_response(doc_opt, line, character)
+    let response = compute_hover_response_for_doc(doc_opt, line, character)
     return HandlerResult(
       state,
       response: Some(val: response),

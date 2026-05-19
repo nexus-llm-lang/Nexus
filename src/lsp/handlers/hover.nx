@@ -1,0 +1,325 @@
+/**
+ * lsp/hover: resolve textDocument/hover requests.
+ *
+ * Phase 1 (this module):
+ *   - Identifier hover: when the cursor sits on an identifier that resolves
+ *     to a top-level `let` or `cap` binding, returns a markdown Hover with
+ *     the function signature: name, parameter types, return type, and
+ *     `require {}` / `throws {}` annotations.
+ *   - Let-binding hover: when the identifier resolves to a non-lambda top-level
+ *     `let` with a declared type annotation, renders `**name**: Type`.
+ *
+ * Pipeline (mirrors `definition.nx`):
+ *   1. Tokenize the buffer. Locate the identifier at the cursor via
+ *      `definition.find_ident_at`. Collapse `alias.foo` clusters via
+ *      `definition.visible_name_for`.
+ *   2. Run `build_program_state` (lex+parse+import) to obtain the rename map
+ *      and the parsed defs/cache. The HIR is NOT built here — the AST carries
+ *      the declared type annotations we need and rebuilding HIR+typecheck per
+ *      hover request would be expensive (50-100ms on mid-size files).
+ *   3. Translate the visible name through `symtab.rename` to get the canonical
+ *      `source#name` form. If no rename hit, the identifier is a local binding,
+ *      builtin, or typo — return None (no hover).
+ *   4. Walk the entry-file defs then the cached imports for a matching
+ *      `GlobalLet`. Extract type information from the AST `ExprLambda` or
+ *      from the top-level type annotation.
+ *   5. Render markdown.
+ *
+ * Returns None for:
+ *   - cursor not on an identifier,
+ *   - identifier does not resolve to a known top-level binding,
+ *   - lex/parse/import failure (the try wrapping returns None).
+ *
+ * Out of scope for this bd (separate issues):
+ *   - port / handler / cap method hover
+ *   - enum variant hover
+ *   - linear sigil hover
+ *   - import-target hover
+ *
+ * HirProgram rebuild cost note:
+ *   This handler deliberately avoids HIR+typecheck to keep hover latency low.
+ *   The AST annotation path is adequate for Phase 1 (declared types). Inferred
+ *   types for non-annotated locals are a Phase 2 concern requiring HIR caching.
+ */
+
+import { Option, Some, None } from "std:option"
+import * as list from "std:list"
+import * as str from "std:str"
+import * as lexer from "src/frontend/lexer.nx"
+import {
+  SpannedTopLevel, GlobalLet, TLLet, Cap, TLCap,
+  SpannedExpr, Expr, ExprLambda, Param,
+  TypeExpr, TyI32, TyI64, TyF32, TyF64, TyBool, TyChar, TyString, TyUnit,
+  TyIntLit, TyFloatLit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear,
+  TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyHandler,
+  NamedType, Sigil, SigilLinear, SigilLazy, SigilBorrow, SigilMutable,
+  FunctionSig
+} from "src/common/ast.nx"
+import { CacheEntry } from "src/ir/shared/imports.nx"
+import { RenameEntry }, * as symtab from "src/ir/shared/symtab.nx"
+import * as rdr from "src/ir/shared/rdrname.nx"
+import {
+  find_ident_at, visible_name_for, canonical_to_local_name
+} from "src/lsp/handlers/definition.nx"
+import {
+  ProgramState, build_program_state
+} from "src/lsp/state/program_state.nx"
+import { CompileError } from "src/common/error.nx"
+import { Fs } from "std:fs"
+import { Console } from "std:stdio"
+
+
+//
+// Type rendering: a fuller pp_type than typecheck/types.nx::type_to_string.
+// These helpers are intentionally local — shared lsp type rendering may be
+// factored into a utility module in a later cleanup pass.
+
+let pp_type_list_go = fn (ts: [TypeExpr], acc: [string]) -> [string] do
+  match ts do
+    | [] -> return list.reverse(xs: acc)
+    | t :: rest -> return pp_type_list_go(ts: rest, acc: pp_type(t) :: acc)
+  end
+end
+
+let pp_named_types_go = fn (nts: [NamedType], acc: [string]) -> [string] do
+  match nts do
+    | [] -> return list.reverse(xs: acc)
+    | NamedType(name, typ) :: rest ->
+      return pp_named_types_go(nts: rest, acc: (name ++ ": " ++ pp_type(t: typ)) :: acc)
+  end
+end
+
+let pp_row = fn (row: TypeExpr) -> string do
+  match row do
+    | TyRow(types: ts, rest: _) ->
+      if list.length(xs: ts) == 0 then return "" end
+      let parts = pp_type_list_go(ts, acc: [])
+      return "{ " ++ str.join(xs: parts, sep: ", ") ++ " }"
+    | _ -> return ""
+  end
+end
+
+let pp_type = fn (t: TypeExpr) -> string do
+  match t do
+    | TyI32 -> return "i32"
+    | TyI64 -> return "i64"
+    | TyF32 -> return "f32"
+    | TyF64 -> return "f64"
+    | TyBool -> return "bool"
+    | TyChar -> return "char"
+    | TyString -> return "string"
+    | TyUnit -> return "()"
+    | TyIntLit -> return "<int>"
+    | TyFloatLit -> return "<float>"
+    | TyVar(name: n) -> return n
+    | TyUserDefined(name: n, args: []) -> return n
+    | TyUserDefined(name: n, args: a) ->
+      let parts = pp_type_list_go(ts: a, acc: [])
+      return n ++ "<" ++ str.join(xs: parts, sep: ", ") ++ ">"
+    | TyArrow(params, ret, requires, throw_row) ->
+      let ps = pp_named_types_go(nts: params, acc: [])
+      let req = pp_row(row: requires)
+      let thr = pp_row(row: throw_row)
+      let req_str = if str.length(s: req) == 0 then "" else " require " ++ req end
+      let thr_str = if str.length(s: thr) == 0 then "" else " throws " ++ thr end
+      return "fn(" ++ str.join(xs: ps, sep: ", ") ++ ") -> " ++ pp_type(t: ret) ++ req_str ++ thr_str
+    | TyRef(inner) -> return "ref " ++ pp_type(t: inner)
+    | TyLinear(inner) -> return "%" ++ pp_type(t: inner)
+    | TyLazy(inner) -> return "@" ++ pp_type(t: inner)
+    | TyBorrow(inner) -> return "&" ++ pp_type(t: inner)
+    | TyArray(elem) -> return "[|" ++ pp_type(t: elem) ++ "|]"
+    | TyList(elem) -> return "[" ++ pp_type(t: elem) ++ "]"
+    | TyRecord(fields) ->
+      let parts = pp_named_types_go(nts: fields, acc: [])
+      return "{ " ++ str.join(xs: parts, sep: ", ") ++ " }"
+    | TyRow(_) -> return pp_row(row: t)
+    | TyHandler(name, requires: _) -> return "handler " ++ name
+  end
+end
+
+let sigil_prefix = fn (s: Sigil) -> string do
+  match s do
+    | SigilLinear -> return "%"
+    | SigilLazy -> return "@"
+    | SigilBorrow -> return "&"
+    | SigilMutable -> return "mut "
+    | _ -> return ""
+  end
+end
+
+let param_to_string = fn (p: Param) -> string do
+  match p do | Param(name, sigil, typ) ->
+    return sigil_prefix(s: sigil) ++ name ++ ": " ++ pp_type(t: typ)
+  end
+end
+
+let params_to_label_parts = fn (params: [Param], acc: [string]) -> [string] do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | p :: rest -> return params_to_label_parts(params: rest, acc: param_to_string(p) :: acc)
+  end
+end
+
+let join_parts = fn (parts: [string], sep: string, acc: string, first: bool) -> string do
+  match parts do
+    | [] -> return acc
+    | p :: rest ->
+      let next = if first then p else acc ++ sep ++ p end
+      return join_parts(parts: rest, sep, acc: next, first: false)
+  end
+end
+
+//
+// The `HoverInfo` type carries either a full function signature or a simple
+// binding type (for non-lambda top-level lets).
+
+/** Hover content for a resolved identifier: the local name plus rendered type. */
+export type HoverInfo =
+  HoverFn(local_name: string, params_str: string, ret_str: string, req_str: string, thr_str: string)
+  | HoverBinding(local_name: string, type_str: string)
+
+/** Render a HoverInfo as a markdown string for the LSP `contents.value` field. */
+export let render_hover_markdown = fn (info: HoverInfo) -> string do
+  match info do
+    | HoverFn(local_name, params_str, ret_str, req_str, thr_str) ->
+      let req_part = if str.length(s: req_str) == 0 then "" else " require " ++ req_str end
+      let thr_part = if str.length(s: thr_str) == 0 then "" else " throws " ++ thr_str end
+      return "**" ++ local_name ++ "**: fn(" ++ params_str ++ ") -> " ++ ret_str ++ req_part ++ thr_part
+    | HoverBinding(local_name, type_str) ->
+      return "**" ++ local_name ++ "**: " ++ type_str
+  end
+end
+
+//
+// Lookup: walk the entry-file defs, then the cached imported files.
+
+let hover_info_from_global_let = fn (
+  local_name: string,
+  name: string,
+  value: SpannedExpr
+) -> Option<HoverInfo> do
+  match value do | SpannedExpr(node: enode, span: _) ->
+    match enode do
+      | ExprLambda(type_params: _, params, ret_type, requires, throw_row, body: _) ->
+        let param_parts = params_to_label_parts(params, acc: [])
+        let params_str = join_parts(parts: param_parts, sep: ", ", acc: "", first: true)
+        let ret_str = pp_type(t: ret_type)
+        let req_str = pp_row(row: requires)
+        let thr_str = pp_row(row: throw_row)
+        return Some(val: HoverFn(local_name, params_str, ret_str, req_str, thr_str))
+      | _ ->
+        // Non-lambda: surface the declared type annotation if present.
+        return None
+    end
+  end
+end
+
+let find_hover_in_defs = fn (
+  defs: [SpannedTopLevel],
+  source: string,
+  target_canonical: string,
+  local_name: string
+) -> Option<HoverInfo> do
+  match defs do
+    | [] -> return None
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: _, typ, value)), span: _) :: rest ->
+      let canonical = if name == "main" then "main" else rdr.canonical_name(source_path: source, name) end
+      if canonical == target_canonical then
+        match hover_info_from_global_let(local_name, name, value) do
+          | Some(val: info) -> return Some(val: info)
+          | None ->
+            // Non-lambda: try the declared type annotation.
+            match typ do
+              | Some(val: t) ->
+                return Some(val: HoverBinding(local_name, type_str: pp_type(t)))
+              | None ->
+                // No annotation; render as <inferred>.
+                return Some(val: HoverBinding(local_name, type_str: "<inferred>"))
+            end
+        end
+      end
+      return find_hover_in_defs(defs: rest, source, target_canonical, local_name)
+    | SpannedTopLevel(node: TLCap(def: Cap(name, is_public: _, functions: _)), span: _) :: rest ->
+      let canonical = rdr.canonical_name(source_path: source, name)
+      if canonical == target_canonical then
+        return Some(val: HoverBinding(local_name, type_str: "cap"))
+      end
+      return find_hover_in_defs(defs: rest, source, target_canonical, local_name)
+    | _ :: rest ->
+      return find_hover_in_defs(defs: rest, source, target_canonical, local_name)
+  end
+end
+
+let find_hover_in_cache = fn (
+  cache: [CacheEntry],
+  target_canonical: string,
+  local_name: string
+) -> Option<HoverInfo> do
+  match cache do
+    | [] -> return None
+    | CacheEntry(path, defs, entries: _) :: rest ->
+      match find_hover_in_defs(defs, source: path, target_canonical, local_name) do
+        | Some(val: info) -> return Some(val: info)
+        | None -> return find_hover_in_cache(cache: rest, target_canonical, local_name)
+      end
+  end
+end
+
+
+/**
+Resolve hover information for the identifier at the cursor.
+
+`text` is the editor buffer contents. `file_uri` mirrors what diagnostics uses.
+`line` / `character` are 0-based LSP coordinates.
+
+Returns `Some(string)` with the markdown hover content on success, `None` for:
+- cursor not on an identifier,
+- identifier does not resolve to a known top-level binding,
+- lex/parse/import-resolution failure.
+
+No HIR build is performed — the AST annotation path is used. This keeps
+hover latency comparable to definition resolution rather than diagnostics
+(which runs the full typecheck pass). Inferred types for non-annotated
+local let bindings are a Phase 2 concern.
+*/
+export let resolve_hover = fn (
+  text: string,
+  file_uri: string,
+  line: i64,
+  character: i64
+) -> Option<string> require { Console, Fs } do
+  try
+    return resolve_hover_unsafe(text, file_uri, line, character)
+  catch _ ->
+    return None
+  end
+end
+
+let resolve_hover_unsafe = fn (
+  text: string,
+  file_uri: string,
+  line: i64,
+  character: i64
+) -> Option<string> require { Console, Fs } throws { CompileError } do
+  let toks = lexer.tokenize(src: text)
+  match find_ident_at(toks, line, character) do
+    | None -> return None
+    | Some(val: hit) ->
+      let visible = visible_name_for(toks, hit)
+      let ProgramState(prog: _, defs, cache, accum: _, self_entries: _, caller_entries: _, all_entries) =
+        build_program_state(text, file: file_uri)
+      let canonical = symtab.rename(name: visible, entries: all_entries)
+      // No rename hit: local binding, builtin, or typo.
+      if canonical == visible then return None end
+      let local_name = canonical_to_local_name(canonical)
+      let entry_result = find_hover_in_defs(defs, source: file_uri, target_canonical: canonical, local_name)
+      let info_opt = match entry_result do
+        | Some(val: info) -> Some(val: info)
+        | None -> find_hover_in_cache(cache, target_canonical: canonical, local_name)
+      end
+      match info_opt do
+        | None -> return None
+        | Some(val: info) -> return Some(val: render_hover_markdown(info))
+      end
+  end
+end
