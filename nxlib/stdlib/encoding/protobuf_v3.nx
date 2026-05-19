@@ -1,0 +1,366 @@
+/**
+ * protobuf_v3: Protocol Buffers wire-format encoder/decoder (proto3).
+ *
+ * Implements the four active wire types in proto3:
+ *   0  VARINT  — variable-length integer (unsigned LEB-128)
+ *   1  I64     — 8-byte little-endian integer
+ *   2  LEN     — length-delimited (bytes, embedded messages, packed repeated)
+ *   5  I32     — 4-byte little-endian integer
+ *
+ * Wire types 3 (SGROUP) and 4 (EGROUP) are not defined in proto3.
+ * The decoder raises PbError if either is encountered.
+ *
+ * Packed repeated fields (proto3 default for scalar types):
+ *   encode_packed_varints  — encodes a list of i64 values as a LEN field
+ *   decode_packed_varints  — decodes the payload of a LEN field into [i64]
+ *
+ * Zigzag helpers:
+ *   zigzag_encode  — maps signed i64 → unsigned i64 for sint32/sint64
+ *   zigzag_decode  — inverse
+ *
+ * Fixed-64 encode/decode uses two i32 pushes (low then high word).
+ *
+ * Out of scope: .proto IDL parser, JSON mapping, gRPC framing.
+ */
+
+import * as bb from "std:bytebuffer"
+import * as list from "std:list"
+import * as str from "std:str"
+
+// ─── Public exceptions ────────────────────────────────────────────────────────
+
+/** Decode/encode error. `pos` is the byte offset (-1 for non-position errors). */
+export exception PbError(msg: string, pos: i64)
+
+/** Exception group covering every exception raised by decode / encode. */
+export exception group PbThrow = PbError
+
+// ─── Public types ────────────────────────────────────────────────────────────
+
+/**
+ * A single wire-level value.  The caller is responsible for interpreting the
+ * i64/i32 payload as signed, unsigned, floating-point, or boolean according
+ * to the proto schema.
+ *
+ *   PbVarint    — wire type 0; raw unsigned 64-bit integer
+ *   PbFixed64   — wire type 1; raw 64-bit integer (little-endian on wire)
+ *   PbLenDelim  — wire type 2; arbitrary byte string (length-prefixed on wire)
+ *   PbFixed32   — wire type 5; raw 32-bit integer stored in low 32 bits of i64
+ */
+export type PbValue =
+    PbVarint(val: i64)
+  | PbFixed64(val: i64)
+  | PbLenDelim(data: string)
+  | PbFixed32(val: i64)
+
+/** One decoded field: (field_number, wire value). */
+export type PbField = PbField(field_number: i64, value: PbValue)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Internal constants / helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Mask to keep only the low 7 bits of a byte.
+let varint_lo7 = 127
+
+// Continuation-bit mask.
+let varint_msb = 128
+
+// Mask to treat an i64 as unsigned when doing logical right shift.
+// (Same constant used in bytebuffer's own leb128 encoder.)
+let shr7_mask = 144115188075855871
+
+// Low 32-bit mask.
+let mask32 = 4294967295
+
+// ─── Zigzag helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Zigzag-encode a signed integer for use with sint32/sint64 fields.
+ * Maps: 0→0, -1→1, 1→2, -2→3, 2→4, …
+ * Formula: (n << 1) ^ (n >> 63)  where >> is arithmetic right shift.
+ */
+export let zigzag_encode = fn (n: i64) -> i64 do
+  return (n << 1) ^ (n >> 63)
+end
+
+/**
+ * Zigzag-decode a raw varint back to a signed integer.
+ * Formula: (n >>> 1) ^ -(n & 1)  (>>> = logical shift, filled with 0).
+ * Since zigzag values are non-negative, arithmetic and logical shifts agree
+ * for the top bit, so (n >> 1) is equivalent.
+ */
+export let zigzag_decode = fn (n: i64) -> i64 do
+  return (n >> 1) ^ (0 - (n & 1))
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Encoding
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Varint encode ────────────────────────────────────────────────────────────
+
+// Encode a single unsigned varint into buf.
+let enc_varint = fn (buf: %bb.ByteBuffer, val: i64) -> %bb.ByteBuffer do
+  return bb.push_uleb128(%buf, val)
+end
+
+// ─── Fixed-64 encode (little-endian) ─────────────────────────────────────────
+
+// Push an i64 as 8 bytes little-endian using two i32_le pushes.
+let enc_fixed64 = fn (buf: %bb.ByteBuffer, val: i64) -> %bb.ByteBuffer do
+  let lo = val & mask32
+  let hi = (val >> 32) & mask32
+  let %buf1 = bb.push_i32_le(%buf, val: lo)
+  return bb.push_i32_le(buf: %buf1, val: hi)
+end
+
+// ─── Tag encode ───────────────────────────────────────────────────────────────
+
+// Encode the field tag: (field_number << 3) | wire_type.
+let enc_tag = fn (buf: %bb.ByteBuffer, field_number: i64, wire_type: i64) -> %bb.ByteBuffer do
+  let tag = (field_number << 3) | wire_type
+  return enc_varint(%buf, val: tag)
+end
+
+// ─── Length-delimited encode ──────────────────────────────────────────────────
+
+// Encode a length-delimited field: varint(len) followed by raw bytes.
+let enc_len_delim = fn (buf: %bb.ByteBuffer, data: string, data_len: i64) -> %bb.ByteBuffer do
+  let %buf1 = enc_varint(%buf, val: data_len)
+  return bb.push_string(buf: %buf1, s: data)
+end
+
+// ─── Public encode ────────────────────────────────────────────────────────────
+
+/**
+ * Encode a list of PbField values into a binary protobuf-v3 wire blob.
+ * Returns the encoded bytes as a string.
+ * Raises PbError if a field_number < 1.
+ */
+export let encode = fn (fields: [PbField]) -> string throws { PbThrow } do
+  let %buf = bb.empty()
+  let %buf2 = encode_fields(%buf, fields)
+  let result = bb.to_string(buf: &buf2)
+  bb.free(buf: %buf2)
+  return result
+end
+
+let encode_fields = fn (buf: %bb.ByteBuffer, fields: [PbField]) -> %bb.ByteBuffer throws { PbThrow } do
+  match fields do
+    | [] -> return buf
+    | PbField(field_number: fn_num, value: v) :: rest ->
+      if fn_num < 1 then
+        bb.free(%buf)
+        throw PbError(msg: "field_number must be >= 1", pos: -1)
+      end
+      let %buf1 = encode_one_field(buf: %buf, field_number: fn_num, value: v)
+      return encode_fields(buf: %buf1, fields: rest)
+  end
+end
+
+let encode_one_field = fn (buf: %bb.ByteBuffer, field_number: i64, value: PbValue) -> %bb.ByteBuffer throws { PbThrow } do
+  match value do
+    | PbVarint(val: v) ->
+      let %buf1 = enc_tag(%buf, field_number, wire_type: 0)
+      return enc_varint(buf: %buf1, val: v)
+    | PbFixed64(val: v) ->
+      let %buf1 = enc_tag(%buf, field_number, wire_type: 1)
+      return enc_fixed64(buf: %buf1, val: v)
+    | PbLenDelim(data: d) ->
+      let dlen = str.byte_length(s: d)
+      let %buf1 = enc_tag(%buf, field_number, wire_type: 2)
+      return enc_len_delim(buf: %buf1, data: d, data_len: dlen)
+    | PbFixed32(val: v) ->
+      let %buf1 = enc_tag(%buf, field_number, wire_type: 5)
+      return bb.push_i32_le(buf: %buf1, val: v)
+  end
+end
+
+// ─── Packed repeated varints encode ──────────────────────────────────────────
+
+/**
+ * Encode a packed repeated varint field (proto3 default for scalar types).
+ * Produces a single LEN wire-type record with all varints concatenated.
+ * field_number must be >= 1.
+ */
+export let encode_packed_varints = fn (field_number: i64, values: [i64]) -> string throws { PbThrow } do
+  if field_number < 1 then
+    throw PbError(msg: "field_number must be >= 1", pos: -1)
+  end
+  // Build the payload (all varints concatenated).
+  let %payload = bb.empty()
+  let %payload2 = encode_varint_list(buf: %payload, values)
+  let payload_len = bb.length(buf: &payload2)
+  let payload_str = bb.to_string(buf: &payload2)
+  bb.free(buf: %payload2)
+  // Build the full field.
+  let %out = bb.empty()
+  let %out1 = enc_tag(buf: %out, field_number, wire_type: 2)
+  let %out2 = enc_len_delim(buf: %out1, data: payload_str, data_len: payload_len)
+  let result = bb.to_string(buf: &out2)
+  bb.free(buf: %out2)
+  return result
+end
+
+let encode_varint_list = fn (buf: %bb.ByteBuffer, values: [i64]) -> %bb.ByteBuffer do
+  match values do
+    | [] -> return buf
+    | v :: rest ->
+      let %buf1 = enc_varint(%buf, val: v)
+      return encode_varint_list(buf: %buf1, values: rest)
+  end
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Decoding
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Decode state ─────────────────────────────────────────────────────────────
+
+// We store the input as a ByteBuffer copy so we can use bb.get_byte.
+// All decode functions thread the buf handle as a borrow (&) and a position.
+
+type DecStep = DecStep(val: i64, pos: i64)
+type FieldStep = FieldStep(field: PbField, pos: i64)
+type StringStep = StringStep(data: string, pos: i64)
+
+// ─── Varint decode ────────────────────────────────────────────────────────────
+
+// Decode an unsigned varint from buf at byte position pos.
+// Returns the decoded value and the position after the last consumed byte.
+let dec_varint = fn (buf: &bb.ByteBuffer, pos: i64, total: i64) -> DecStep throws { PbThrow } do
+  return dec_varint_go(buf, pos, total, acc: 0, shift: 0)
+end
+
+let dec_varint_go = fn (buf: &bb.ByteBuffer, pos: i64, total: i64, acc: i64, shift: i64) -> DecStep throws { PbThrow } do
+  if pos >= total then throw PbError(msg: "truncated varint", pos: pos) end
+  let b = bb.get_byte(buf, idx: pos)
+  let lo7 = b & varint_lo7
+  let acc2 = acc | (lo7 << shift)
+  if (b & varint_msb) == 0 then
+    return DecStep(val: acc2, pos: pos + 1)
+  end
+  return dec_varint_go(buf, pos: pos + 1, total, acc: acc2, shift: shift + 7)
+end
+
+// ─── Fixed-64 decode ──────────────────────────────────────────────────────────
+
+let dec_fixed64 = fn (buf: &bb.ByteBuffer, pos: i64, total: i64) -> DecStep throws { PbThrow } do
+  if pos + 8 > total then throw PbError(msg: "truncated fixed64", pos: pos) end
+  let b0 = bb.get_byte(buf, idx: pos)
+  let b1 = bb.get_byte(buf, idx: pos + 1)
+  let b2 = bb.get_byte(buf, idx: pos + 2)
+  let b3 = bb.get_byte(buf, idx: pos + 3)
+  let b4 = bb.get_byte(buf, idx: pos + 4)
+  let b5 = bb.get_byte(buf, idx: pos + 5)
+  let b6 = bb.get_byte(buf, idx: pos + 6)
+  let b7 = bb.get_byte(buf, idx: pos + 7)
+  let lo = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+  let hi = b4 | (b5 << 8) | (b6 << 16) | (b7 << 24)
+  let val = lo | (hi << 32)
+  return DecStep(val, pos: pos + 8)
+end
+
+// ─── Fixed-32 decode ──────────────────────────────────────────────────────────
+
+let dec_fixed32 = fn (buf: &bb.ByteBuffer, pos: i64, total: i64) -> DecStep throws { PbThrow } do
+  if pos + 4 > total then throw PbError(msg: "truncated fixed32", pos: pos) end
+  let b0 = bb.get_byte(buf, idx: pos)
+  let b1 = bb.get_byte(buf, idx: pos + 1)
+  let b2 = bb.get_byte(buf, idx: pos + 2)
+  let b3 = bb.get_byte(buf, idx: pos + 3)
+  let val = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+  return DecStep(val, pos: pos + 4)
+end
+
+// ─── Length-delimited decode ──────────────────────────────────────────────────
+
+let dec_len_delim = fn (src_buf: &bb.ByteBuffer, pos: i64, total: i64) -> StringStep throws { PbThrow } do
+  let DecStep(val: length, pos: p2) = dec_varint(buf: src_buf, pos, total)
+  if p2 + length > total then
+    throw PbError(msg: "truncated length-delimited field", pos: pos)
+  end
+  // Extract bytes as a new ByteBuffer then convert to string.
+  let %dst_buf = bb.empty()
+  let %dst_buf2 = bb.copy_range(dst: %dst_buf, src: src_buf, start: p2, end_pos: p2 + length)
+  let data = bb.to_string(buf: &dst_buf2)
+  bb.free(buf: %dst_buf2)
+  return StringStep(data, pos: p2 + length)
+end
+
+// ─── Single field decode ──────────────────────────────────────────────────────
+
+let dec_field = fn (buf: &bb.ByteBuffer, pos: i64, total: i64) -> FieldStep throws { PbThrow } do
+  let DecStep(val: tag, pos: p2) = dec_varint(buf, pos, total)
+  let wire_type = tag & 7
+  let field_number = (tag >> 3) & shr7_mask
+  if wire_type == 0 then
+    let DecStep(val: v, pos: p3) = dec_varint(buf, pos: p2, total)
+    return FieldStep(field: PbField(field_number, value: PbVarint(val: v)), pos: p3)
+  end
+  if wire_type == 1 then
+    let DecStep(val: v, pos: p3) = dec_fixed64(buf, pos: p2, total)
+    return FieldStep(field: PbField(field_number, value: PbFixed64(val: v)), pos: p3)
+  end
+  if wire_type == 2 then
+    let StringStep(data: d, pos: p3) = dec_len_delim(src_buf: buf, pos: p2, total)
+    return FieldStep(field: PbField(field_number, value: PbLenDelim(data: d)), pos: p3)
+  end
+  if wire_type == 3 then
+    throw PbError(msg: "groups (wire type 3) are not allowed in proto3", pos: pos)
+  end
+  if wire_type == 4 then
+    throw PbError(msg: "groups (wire type 4) are not allowed in proto3", pos: pos)
+  end
+  if wire_type == 5 then
+    let DecStep(val: v, pos: p3) = dec_fixed32(buf, pos: p2, total)
+    return FieldStep(field: PbField(field_number, value: PbFixed32(val: v)), pos: p3)
+  end
+  throw PbError(msg: "unknown wire type", pos: pos)
+end
+
+// ─── All fields decode ────────────────────────────────────────────────────────
+
+let dec_all = fn (buf: &bb.ByteBuffer, pos: i64, total: i64, acc: [PbField]) -> [PbField] throws { PbThrow } do
+  if pos >= total then return list.reverse(acc) end
+  let FieldStep(field: f, pos: p2) = dec_field(buf, pos, total)
+  return dec_all(buf, pos: p2, total, acc: f :: acc)
+end
+
+// ─── Public decode ────────────────────────────────────────────────────────────
+
+/**
+ * Decode a binary protobuf-v3 wire blob (given as a string of raw bytes).
+ * Returns a list of PbField values in wire order.
+ * Raises PbError on any malformed input or if wire types 3/4 (groups) appear.
+ */
+export let decode = fn (data: string) -> [PbField] throws { PbThrow } do
+  let %buf = bb.empty()
+  let %buf2 = bb.push_string(%buf, s: data)
+  let total = bb.length(buf: &buf2)
+  let result = dec_all(buf: &buf2, pos: 0, total, acc: [])
+  bb.free(buf: %buf2)
+  return result
+end
+
+// ─── Packed repeated varints decode ───────────────────────────────────────────
+
+/**
+ * Decode the payload of a PbLenDelim field that contains packed varints.
+ * Call this on the `data` field of a PbLenDelim after checking the field number.
+ */
+export let decode_packed_varints = fn (data: string) -> [i64] throws { PbThrow } do
+  let %buf = bb.empty()
+  let %buf2 = bb.push_string(%buf, s: data)
+  let total = bb.length(buf: &buf2)
+  let result = dec_packed_go(buf: &buf2, pos: 0, total, acc: [])
+  bb.free(buf: %buf2)
+  return result
+end
+
+let dec_packed_go = fn (buf: &bb.ByteBuffer, pos: i64, total: i64, acc: [i64]) -> [i64] throws { PbThrow } do
+  if pos >= total then return list.reverse(acc) end
+  let DecStep(val: v, pos: p2) = dec_varint(buf, pos, total)
+  return dec_packed_go(buf, pos: p2, total, acc: v :: acc)
+end
