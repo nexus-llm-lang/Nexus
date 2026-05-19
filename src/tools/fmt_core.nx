@@ -58,11 +58,91 @@ export type FmtState = FmtState(
   at_line_start: bool
 )
 
-/** Format the entire source string. Pure (no I/O), so callable from tests.
- *  Idempotence is the property to maintain: format(format(src)) == format(src).
- */
+// Walk the source looking for any token that starts a protected region but
+// never closes. Returns `true` if such an unterminated token is found.
+// This drives the bail-out in `format_source`: if the source contains an
+// unclosed `/*`, `"`, or `[=[`, we return the original bytes unchanged so
+// that repeated `fmt` passes cannot accumulate trailing whitespace.
+let contains_unterminated_token = fn (src: string, len: i64, pos: i64) -> bool do
+  if pos >= len then return false end
+  let b = str.byte_at(s: src, idx: pos)
+  // Line comment: skip to end of line — always terminates at '\n' or EOF, never a problem.
+  if b == '/' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '/' then
+    let line_end = scan_line_comment(src, pos: pos + 2, len)
+    return contains_unterminated_token(src, len, pos: line_end)
+  end
+  // Block comment: closed iff block_comment_closed returns true.
+  if b == '/' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '*' then
+    let end_pos = scan_block_comment(src, pos: pos + 2, len, depth: 1)
+    if !block_comment_closed(src, pos: pos + 2, len, depth: 1) then return true end
+    return contains_unterminated_token(src, len, pos: end_pos)
+  end
+  // String literal: unterminated if scan reaches EOF without a closing `"`.
+  // `scan_string` returns the position after the closing `"`. If the closing
+  // `"` was the very last byte, it returns `len` (= byte-after-last). So we
+  // cannot use `end_pos >= len` as the sole sentinel. Instead we re-check
+  // whether the character before end_pos is actually `"`.
+  if b == '"' then
+    let end_pos = scan_string(src, pos: pos + 1, len)
+    if !string_closed(src, end_pos, len) then return true end
+    return contains_unterminated_token(src, len, pos: end_pos)
+  end
+  // Bracket string: unterminated if scan reaches EOF without `]=]`.
+  if b == '[' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '='
+     && pos + 2 < len && str.byte_at(s: src, idx: pos + 2) == '[' then
+    let end_pos = scan_bracket_string(src, pos: pos + 3, len)
+    if !bracket_string_closed(src, end_pos, len) then return true end
+    return contains_unterminated_token(src, len, pos: end_pos)
+  end
+  return contains_unterminated_token(src, len, pos: pos + 1)
+end
+
+// Returns true iff the block comment that starts just before `pos` (i.e.
+// scanning from `pos` with `depth` remaining) actually closes before EOF.
+// Checks `depth <= 0` before the EOF guard so that a `*/` landing exactly
+// at EOF is correctly counted as closed.
+let block_comment_closed = fn (src: string, pos: i64, len: i64, depth: i64) -> bool do
+  if depth <= 0 then return true end
+  if pos >= len then return false end
+  let b = str.byte_at(s: src, idx: pos)
+  if b == '*' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '/' then
+    return block_comment_closed(src, pos: pos + 2, len, depth: depth - 1)
+  end
+  if b == '/' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '*' then
+    return block_comment_closed(src, pos: pos + 2, len, depth: depth + 1)
+  end
+  return block_comment_closed(src, pos: pos + 1, len, depth)
+end
+
+// `scan_string` returns `end_pos` = position after the closing `"` (or `len`
+// on EOF). A string is closed iff the byte just before end_pos is `"`.
+let string_closed = fn (src: string, end_pos: i64, len: i64) -> bool do
+  if end_pos <= 0 then return false end
+  if end_pos > len then return false end
+  return str.byte_at(s: src, idx: end_pos - 1) == '"'
+end
+
+// `scan_bracket_string` returns `end_pos` = position after `]=]` (or `len`).
+// A bracket string is closed iff the 3 bytes ending at end_pos are `]=]`.
+let bracket_string_closed = fn (src: string, end_pos: i64, len: i64) -> bool do
+  if end_pos < 3 then return false end
+  if end_pos > len then return false end
+  if str.byte_at(s: src, idx: end_pos - 1) != ']' then return false end
+  if str.byte_at(s: src, idx: end_pos - 2) != '=' then return false end
+  if str.byte_at(s: src, idx: end_pos - 3) != ']' then return false end
+  return true
+end
+
+// Format the entire source string. Pure (no I/O), so callable from tests.
+// Idempotence is the property to maintain: format(format(src)) == format(src).
+//
+// If the source contains an unterminated protected region (unclosed block
+// comment, unterminated string literal, or unclosed bracket string), the
+// original source is returned unchanged. This prevents repeated fmt passes
+// from accumulating trailing newlines on parse-error fixture files.
 export let format_source = fn (src: string) -> string do
   let len = str.byte_length(s: src)
+  if contains_unterminated_token(src, len, pos: 0) then return src end
   let %buf = bb.empty()
   let st = FmtState(src, len, pos: 0, buf: %buf, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: false, at_line_start: true)
   let st_final = walk(st)
