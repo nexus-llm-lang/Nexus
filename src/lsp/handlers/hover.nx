@@ -178,6 +178,7 @@ export type HoverInfo =
   HoverFn(local_name: string, params_str: string, ret_str: string, req_str: string, thr_str: string)
   | HoverBinding(local_name: string, type_str: string)
   | HoverEnum(enum_name: string, type_params: [string], variants: [VariantDef])
+  | HoverCap(cap_name: string, functions: [FunctionSig])
 
 // Render a single VariantField as "name: Type" or just "Type" for anonymous fields.
 let pp_variant_field = fn (vf: VariantField) -> string do
@@ -222,6 +223,30 @@ let pp_type_params = fn (tps: [string]) -> string do
   end
 end
 
+// Render one FunctionSig as "name(p1, p2) -> ret" for the cap method list.
+let pp_function_sig = fn (fs: FunctionSig) -> string do
+  match fs do | FunctionSig(name: fn_name, params, ret_type, requires, throw_row) ->
+    let param_parts = params_to_label_parts(params, acc: [])
+    let params_str = join_parts(parts: param_parts, sep: ", ", acc: "", first: true)
+    let ret_str = pp_type(t: ret_type)
+    let req_str = pp_row(row: requires)
+    let thr_str = pp_row(row: throw_row)
+    let req_part = if str.length(s: req_str) == 0 then "" else " require " ++ req_str end
+    let thr_part = if str.length(s: thr_str) == 0 then "" else " throws " ++ thr_str end
+    return fn_name ++ "(" ++ params_str ++ ") -> " ++ ret_str ++ req_part ++ thr_part
+  end
+end
+
+let render_cap_methods_go = fn (fns: [FunctionSig], acc: string) -> string do
+  match fns do
+    | [] -> return acc
+    | f :: rest ->
+      let line = "  - " ++ pp_function_sig(fs: f)
+      let next = if str.length(s: acc) == 0 then line else acc ++ "\n" ++ line end
+      return render_cap_methods_go(fns: rest, acc: next)
+  end
+end
+
 /** Render a HoverInfo as a markdown string for the LSP `contents.value` field. */
 export let render_hover_markdown = fn (info: HoverInfo) -> string do
   match info do
@@ -238,6 +263,13 @@ export let render_hover_markdown = fn (info: HoverInfo) -> string do
         return header
       end
       return header ++ "\nvariants:\n" ++ body
+    | HoverCap(cap_name, functions: fns) ->
+      let header = "**" ++ cap_name ++ "** (cap)"
+      let body = render_cap_methods_go(fns, acc: "")
+      if str.length(s: body) == 0 then
+        return header
+      end
+      return header ++ "\nmethods:\n" ++ body
   end
 end
 
@@ -290,10 +322,10 @@ let find_hover_in_defs = fn (
         end
       end
       return find_hover_in_defs(defs: rest, source, target_canonical, local_name)
-    | SpannedTopLevel(node: TLCap(def: Cap(name, is_public: _, functions: _)), span: _) :: rest ->
+    | SpannedTopLevel(node: TLCap(def: Cap(name, is_public: _, functions: fns)), span: _) :: rest ->
       let canonical = rdr.canonical_name(source_path: source, name)
       if canonical == target_canonical then
-        return Some(val: HoverBinding(local_name, type_str: "cap"))
+        return Some(val: HoverCap(cap_name: local_name, functions: fns))
       end
       return find_hover_in_defs(defs: rest, source, target_canonical, local_name)
     | _ :: rest ->
@@ -423,6 +455,10 @@ let resolve_hover_unsafe = fn (
       // all TLEnum defs in the entry file and the import cache.
       // This also handles pattern-position constructors (e.g. `Some(x)` in a
       // match arm) — the token stream is identical to the call-expression case.
+      //
+      // Phase 3 note: cap names also start with uppercase (they are TkUident).
+      // When the enum scan returns None, fall through to the rename path below
+      // which will find the TLCap and return HoverCap instead.
       let ctor_name = bare_ctor_name(visible)
       if is_uppercase_start(ctor_name) then
         let enum_opt = match find_enum_for_ctor_in_defs(defs, ctor_name) do
@@ -430,11 +466,36 @@ let resolve_hover_unsafe = fn (
           | None -> find_enum_for_ctor_in_cache(cache, ctor_name)
         end
         match enum_opt do
-          | None -> return None
           | Some(val: ed) ->
             let EnumDef(name: ename, is_public: _, is_opaque: _, type_params: tps, variants: vs) = ed
             let info = HoverEnum(enum_name: ename, type_params: tps, variants: vs)
             return Some(val: render_hover_markdown(info))
+          | None ->
+            // Not an enum variant. Fall through to the rename path: if `visible`
+            // renames to a known canonical, lookup handles TLLet / TLCap.
+            let _ = 0
+        end
+      end
+      // Phase 3: cap.method qualified reference (e.g. `Console.print`).
+      // visible_name_for collapses `Cap TkDot method` into `Cap.method`. The
+      // rename map has no entry for `Cap.method` as a unit; instead, split on
+      // the first dot, rename just the cap part, then look up the cap def.
+      let dot_pos = str.index_of(s: visible, sub: ".")
+      if dot_pos > 0 then
+        let cap_part = str.substring(s: visible, start: 0, len: dot_pos)
+        if is_uppercase_start(cap_part) then
+          let cap_canonical = symtab.rename(name: cap_part, entries: all_entries)
+          if cap_canonical != cap_part then
+            let cap_local = canonical_to_local_name(cap_canonical)
+            let cap_info_opt = match find_hover_in_defs(defs, source: file_uri, target_canonical: cap_canonical, local_name: cap_local) do
+              | Some(val: info) -> Some(val: info)
+              | None -> find_hover_in_cache(cache, target_canonical: cap_canonical, local_name: cap_local)
+            end
+            match cap_info_opt do
+              | Some(val: info) -> return Some(val: render_hover_markdown(info))
+              | None -> return None
+            end
+          end
         end
       end
       let canonical = symtab.rename(name: visible, entries: all_entries)
