@@ -1,0 +1,194 @@
+/**
+ * codegen/compile_ctx: CompileCtx type, per-function locals, and body helpers.
+ *
+ * Owns:
+ * - LocalsResult type: per-function locals result carrier
+ * - build_param_locals / build_func_locals: collect LIR params/stmts into locals
+ * - CompileCtx: program-wide state threaded through body emission
+ * - build_func_ctx: construct a CodegenCtx from a CompileCtx + per-function inputs
+ * - append_body_to_buf: length-prefix + copy a body ByteBuffer into the code section
+ * - collect_bt_func_names: gather can_throw function names for the string pool
+ * - resolve_bt_capture_for_func: per-function bt-capture gate (export; tested directly)
+ * - resolve_bt_push_packed: per-function packed string-pool name for BT prologue
+ */
+
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { TypeExpr } from "src/common/ast.nx"
+import { LirFunction, LirExternal, LirParam } from "src/ir/lir/types.nx"
+import { CodegenCtx } from "src/backend/codegen/context.nx"
+import { LocalEntry, FuncEntry, StringEntry, ArityTypeIdx } from "src/backend/wasm/defs.nx"
+import { HashMap }, * as hmap from "std:hashmap"
+import { StrMap } from "src/common/strmap.nx"
+import { LocalResult } from "src/backend/wasm/collect.nx"
+import * as wcollect from "src/backend/wasm/collect.nx"
+import * as wdefs from "src/backend/wasm/defs.nx"
+import { EffectMap, EffectBits, lookup_bits } from "src/ir/shared/effect_map.nx"
+import { CodegenError } from "src/backend/errors.nx"
+import * as list from "std:list"
+
+let build_param_locals = fn (params: [LirParam], idx: i64) -> [LocalEntry] throws { CodegenError } do
+  return build_param_locals_go(params, idx, acc: [])
+end
+let build_param_locals_go = fn (params: [LirParam], idx: i64, acc: [LocalEntry]) -> [LocalEntry] throws { CodegenError } do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | LirParam(label: _, name: n, typ: t) :: rest ->
+      return build_param_locals_go(params: rest, idx: idx + 1, acc: LocalEntry(name: n, index: idx, valtype: wdefs.type_to_valtype(typ: t)) :: acc)
+  end
+end
+
+/** Per-function locals data: `[LocalEntry]` for decl emission, packed map
+ *  for O(1) name lookup, and `temps_base` for scratch-local indexing. The
+ *  %HashMap is owned by `emit_one_body` so it can be freed after the body
+ *  finishes (locals never escape a function).
+ */
+export type LocalsResult = LocalsResult(locals: [LocalEntry], temps_base: i64, local_map: %HashMap)
+
+export let build_func_locals = fn (func: LirFunction) -> LocalsResult do
+  let LirFunction(name: _, params: ps, ret_type: _, body: b, ret: _, span: _) = func
+  let param_locals = build_param_locals(params: ps, idx: 0)
+  let param_count = list.length(xs: ps)
+  let %local_map = wdefs.build_local_map(entries: param_locals)
+  match wcollect.collect_local_stmts(stmts: b, locals: param_locals, next_idx: param_count, %local_map) do
+    | LocalResult(locals: collected_locals, next_idx: collected_next_idx, local_map: lm) ->
+      return LocalsResult(locals: collected_locals, temps_base: collected_next_idx, local_map: %lm)
+  end
+end
+
+// Program-wide state threaded through build_func_ctx / emit_one_body /
+// emit_code_bodies. Per-function inputs (current LirFunction, locals,
+// temps_base, local_map, resolved bt_capture_idx) stay as separate args.
+// effect_map / bt_capture_idx_global live here because emit_one_body resolves
+// the per-function bt_capture_idx from them.
+
+export type CompileCtx = CompileCtx(
+  internal_funcs: [FuncEntry],
+  external_funcs: [FuncEntry],
+  string_lits: [StringEntry],
+  alloc_mode: i64,
+  functions: [LirFunction],
+  externals: [LirExternal],
+  closure_table: [FuncEntry],
+  closure_type_indices: [ArityTypeIdx],
+  internal_func_map: &HashMap,
+  external_func_map: &HashMap,
+  ss_tag_idx: i64,
+  ss_cont_type_idx: i64,
+  ss_dispatch_block_type_idx: i64,
+  ss_tag_names: [string],
+  /** O(1) tag-name → position index; mirrors `ss_tag_names` order. */
+  ss_tag_idx_map: StrMap<i64>,
+  effect_map: &EffectMap,
+  bt_capture_idx_global: i64,
+  memo_target_names: [string],
+  memo_target_slots: [i64],
+  memo_globals_base: i64,
+  import_count: i64,
+  /** When true, every function prologue emits an atomic.add to a per-function
+   * counter in linear-memory page 17. Default off (zero overhead).
+   */
+  coverage_enabled: bool
+)
+
+export let build_func_ctx = fn (func: LirFunction,
+                                  locals: [LocalEntry], temps_base: i64, local_map: &HashMap,
+                                  bt_capture_idx: i64,
+                                  cctx: CompileCtx) -> CodegenCtx do
+  let LirFunction(name: _, params: _, ret_type: rt, body: _, ret: _, span: _) = func
+  let CompileCtx(
+    internal_funcs: _,
+    external_funcs: _,
+    string_lits: sl_,
+    alloc_mode: _,
+    functions: fs_,
+    externals: ex_,
+    closure_table: ct_,
+    closure_type_indices: cti_,
+    internal_func_map: ifm_,
+    external_func_map: efm_,
+    ss_tag_idx: sti_,
+    ss_cont_type_idx: scti_,
+    ss_dispatch_block_type_idx: sdbti_,
+    ss_tag_names: _,
+    ss_tag_idx_map: stim_,
+    effect_map: _,
+    bt_capture_idx_global: _,
+    memo_target_names: mtn_,
+    memo_target_slots: mts_,
+    memo_globals_base: mgb_,
+    import_count: ic_,
+    coverage_enabled: _
+  ) = cctx
+  return CodegenCtx(
+    locals,
+    string_lits: sl_,
+    temps_base,
+    func_ret_type: rt,
+    functions: fs_,
+    externals: ex_,
+    closure_table: ct_,
+    closure_type_indices: cti_,
+    internal_func_map: ifm_,
+    external_func_map: efm_,
+    ss_tag_idx: sti_,
+    ss_cont_type_idx: scti_,
+    ss_dispatch_block_type_idx: sdbti_,
+    ss_tag_idx_map: stim_,
+    bt_capture_idx,
+    memo_target_names: mtn_,
+    memo_target_slots: mts_,
+    memo_globals_base: mgb_,
+    import_count: ic_,
+    local_map
+  )
+end
+
+export let append_body_to_buf = fn (buf: %ByteBuffer, body: %ByteBuffer) -> %ByteBuffer do
+  let body_len = bb.length(buf: &body)
+  let %buf = bb.push_uleb128(%buf, val: body_len)
+  let %buf = bb.push_buf(dst: %buf, src: &body)
+  bb.free(buf: %body)
+  return %buf
+end
+
+/** Collect the names of every `can_throw` function so they can be added to
+ * the string-literal pool (V1). The prologue references each
+ *  name via `lookup_string(fname, entries)` → packed `(off<<32)|len`, which
+ *  requires the name to live in the data segment. Pure functions skip the
+ *  pool.
+ */
+export let collect_bt_func_names = fn (funcs: [LirFunction], em: &EffectMap, acc: [string]) -> [string] do
+  match funcs do
+    | [] -> return acc
+    | LirFunction(name: n, _) :: rest ->
+      // Avoid `let keep = match ...` — the seed's codegen mishandles bool
+      // arm-results bound to a let. Inline the branch instead.
+      match lookup_bits(em, name: n) do
+        | Some(val: EffectBits(can_throw: ct, is_pure: _)) ->
+          let acc2 = if ct then n :: acc else acc end
+          return collect_bt_func_names(funcs: rest, em, acc: acc2)
+        | None ->
+          return collect_bt_func_names(funcs: rest, em, acc: n :: acc)
+      end
+  end
+end
+
+/** Per-function packed name for backtrace prologue (V1). Returns
+ *  the packed `(offset<<32)|len` of `func_name` in the string-literal pool
+ *  when `EffectMap.can_throw == true`, or -1 to skip the push. EffectMap-
+ *  absent functions (synthesised wrappers) get instrumented on the
+ *  conservative side. The `bt_capture_idx_global` import is filtered out
+ *  of the import section; throw sites snapshot inline.
+ */
+export let resolve_bt_push_packed = fn (func_name: string, effect_map: &EffectMap,
+                                   string_lits: [StringEntry]) -> i64 do
+  // Direct arm-return: avoid binding `match` result to a let-variable
+  // (the seed's codegen double-extends bool-from-arm into i64 and the
+  // resulting wasm fails validation — works around a Stage-0 seed bug).
+  match lookup_bits(em: effect_map, name: func_name) do
+    | Some(val: EffectBits(can_throw: ct, is_pure: _)) ->
+      if ct then return wdefs.lookup_string(value: func_name, entries: string_lits) end
+      return -1
+    | None -> return wdefs.lookup_string(value: func_name, entries: string_lits)
+  end
+end

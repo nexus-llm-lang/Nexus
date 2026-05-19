@@ -46,13 +46,11 @@
  */
 
 import { ByteBuffer }, * as bb from "std:bytebuffer"
-import { BinaryOp, TypeExpr, TyI64, TyIntLit } from "src/common/ast.nx"
-import { Span } from "src/common/token.nx"
+import { TypeExpr, TyI64 } from "src/common/ast.nx"
 import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom,
-         LirExternal, LirParam, LirCallArg, LirNamedAtom } from "src/ir/lir/types.nx"
+         LirExternal } from "src/ir/lir/types.nx"
 import { CodegenCtx, ctx_temps_base, ctx_externals, ctx_lookup_function, ctx_lookup_local } from "src/backend/codegen/context.nx"
-import { LocalEntry, FuncEntry, StringEntry, ArityTypeIdx, ExportNameIdx,
-         sec_type, sec_import, sec_function, sec_table, sec_memory, sec_global, sec_export, sec_element, sec_code, sec_data, sec_custom, sec_tag,
+import { sec_type, sec_import, sec_function, sec_table, sec_memory, sec_global, sec_export, sec_element, sec_code, sec_data, sec_custom, sec_tag,
          vt_i32, vt_i64, vt_f64, bt_void, bt_i64,
          heap_global_idx,
          catch_kind_one,
@@ -93,9 +91,13 @@ import { DedupExtResult,
          build_closure_table, collect_closure_arities,
          build_name_section, build_closure_type_idx_list,
          build_bt_symbols_section } from "src/backend/codegen/module_asm.nx"
-import { LocalResult, MemoryMode, MemoryNone, MemoryDefined, MemoryImported }, * as wcollect from "src/backend/wasm/collect.nx"
+import { MemoryMode, MemoryNone, MemoryDefined, MemoryImported }, * as wcollect from "src/backend/wasm/collect.nx"
+import { LocalsResult, CompileCtx, build_func_locals, build_func_ctx,
+         append_body_to_buf, collect_bt_func_names,
+         resolve_bt_push_packed } from "src/backend/codegen/compile_ctx.nx"
+import { compile_cabi_realloc, find_func_by_suffix,
+         program_main_has_args, compile_wasi_run_wrapper } from "src/backend/codegen/synth.nx"
 import { HashMap }, * as hmap from "std:hashmap"
-import { StrMap } from "src/common/strmap.nx"
 import * as wsect from "src/backend/wasm/section.nx"
 import { DedupedTypes, build_type_section_dedup } from "src/backend/wasm/section/type_section.nx"
 import { build_memo_targets, memo_target_count }, * as memo from "src/backend/codegen/memo.nx"
@@ -103,11 +105,35 @@ import * as effect_analysis from "src/backend/effect_analysis.nx"
 import * as emap from "src/ir/shared/effect_map.nx"
 import * as memo_plan from "src/backend/memo_plan.nx"
 import * as list from "std:list"
-import * as str from "std:str"
 import { SymbolNotFound, StackSwitchingNotImplemented, CodegenError,
   SkFunction, SkVariable } from "src/backend/errors.nx"
 import { EffectMap, EffectBits, lookup_bits } from "src/ir/shared/effect_map.nx"
 import { Some, None } from "std:option"
+
+/** Per-function backtrace-capture index for `func_name`.
+ *  Returns -1 (= elide) when `bt_capture_idx_global == -1` (capture import
+ *  absent from the program) or when the function's EffectMap entry says
+ * `can_throw == false`. Otherwise returns the import slot
+ *  of `__nx_main_wrap_bt_capture` so emit_expr/LirExprRaise can call it.
+ *  Exported so tests can exercise the elision rule directly without
+ *  bringing up the full codegen pipeline.
+ */
+export let resolve_bt_capture_for_func = fn (func_name: string, effect_map: &EffectMap,
+                                        bt_capture_idx_global: i64) -> i64 do
+  if bt_capture_idx_global < 0 then return -1 end
+  match lookup_bits(em: effect_map, name: func_name) do
+    | Some(val: EffectBits(can_throw: ct, is_pure: _)) ->
+      if ct then return bt_capture_idx_global end
+      return -1
+    | None ->
+      // Function not in EffectMap (synthesised wrapper, etc.) — keep capture
+      // emission enabled to preserve backtrace fidelity. EffectMap covers
+      // every LirFunction in the program by construction, so a miss means
+      // either a pre-LIR synthesised body or a stale lookup; both cases
+      // sound on the conservative side.
+      return bt_capture_idx_global
+  end
+end
 
 // Recover the import-module name to thread into `alloc_module`. The allocator
 // shares the linear-memory provider's module, so this maps `MemoryImported(m)`
@@ -562,361 +588,6 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx,
   bb.push_byte(buf: %body, byte: op_end)
 end
 
-/** cabi_realloc: bump allocator emitted alongside the canonical-ABI
- *  string-lift/lower path (gated by collect.needs_cabi_realloc).
- *  Bumps the unified atomic heap cell (`wdefs.heap_ptr_cell`); the cell always
- *  holds an 8-aligned value (every bump is a multiple of 8), which covers the
- *  canonical ABI's `align` (always <= 8), so the `align` parameter is ignored.
- *  Like emit_atomic_bump, it lazily seeds the cell via
- *  `cmpxchg(cell, 0, memory.size()*65536)` so it is correct even before any
- *  other allocation has run. Signature:
- *  `(orig_ptr i32, orig_size i32, align i32, new_size i32) -> i32`.
- */
-let compile_cabi_realloc = fn (heap_base: i64) -> %ByteBuffer throws { CodegenError } do
-  let _ = heap_base
-  let %body = bb.empty()
-  // 2 locals: rounded_size (i32) at idx 4, ptr (i32) at idx 5
-  let %body = bb.push_uleb128(buf: %body, val: 1)
-  let %body = bb.push_uleb128(buf: %body, val: 2)
-  let %body = bb.push_byte(buf: %body, byte: vt_i32)
-  // Idempotent seed: cmpxchg(cell, 0, memory.size()*65536); drop old.
-  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
-  let %body = bb.push_sleb128(buf: %body, val: wdefs.heap_ptr_cell)
-  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
-  let %body = bb.push_sleb128(buf: %body, val: 0)
-  let %body = bb.push_bytes(buf: %body, bytes: [op_memory_size, 0, op_i32_const])
-  let %body = bb.push_sleb128(buf: %body, val: 16)
-  let %body = bb.push_byte(buf: %body, byte: wdefs.op_i32_shl)
-  let %body = wdefs.emit_atomic_op32(buf: %body, sub_op: wdefs.op_i32_atomic_rmw_cmpxchg, offset: 0)
-  let %body = bb.push_byte(buf: %body, byte: op_drop)
-  // rounded_size = (new_size + 7) & ~8
-  let %body = bb.push_byte(buf: %body, byte: op_local_get)
-  let %body = bb.push_uleb128(buf: %body, val: 3) // new_size
-  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
-  let %body = bb.push_sleb128(buf: %body, val: 7)
-  let %body = bb.push_bytes(buf: %body, bytes: [op_i32_add, op_i32_const])
-  let %body = bb.push_sleb128(buf: %body, val: 0 - 8)
-  let %body = bb.push_bytes(buf: %body, bytes: [op_i32_and, op_local_set])
-  let %body = bb.push_uleb128(buf: %body, val: 4)
-  // ptr = atomic.rmw.add(cell, rounded_size)
-  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
-  let %body = bb.push_sleb128(buf: %body, val: wdefs.heap_ptr_cell)
-  let %body = bb.push_byte(buf: %body, byte: op_local_get)
-  let %body = bb.push_uleb128(buf: %body, val: 4)
-  let %body = wdefs.emit_atomic_op32(buf: %body, sub_op: wdefs.op_i32_atomic_rmw_add, offset: 0)
-  let %body = bb.push_byte(buf: %body, byte: op_local_set)
-  let %body = bb.push_uleb128(buf: %body, val: 5)
-  // new_top = ptr + rounded_size  (reuse idx 4)
-  let %body = bb.push_byte(buf: %body, byte: op_local_get)
-  let %body = bb.push_uleb128(buf: %body, val: 5)
-  let %body = bb.push_byte(buf: %body, byte: op_local_get)
-  let %body = bb.push_uleb128(buf: %body, val: 4)
-  let %body = bb.push_bytes(buf: %body, bytes: [op_i32_add, op_local_set])
-  let %body = bb.push_uleb128(buf: %body, val: 4)
-  // if (new_top > memory.size * 65536) { memory.grow(ceil((new_top - mem_bytes)/65536)); drop }
-  let %body = bb.push_byte(buf: %body, byte: op_local_get)
-  let %body = bb.push_uleb128(buf: %body, val: 4)
-  let %body = bb.push_bytes(buf: %body, bytes: [op_memory_size, 0, op_i32_const])
-  let %body = bb.push_sleb128(buf: %body, val: 16)
-  let %body = bb.push_byte(buf: %body, byte: wdefs.op_i32_shl)
-  let %body = bb.push_bytes(buf: %body, bytes: [wdefs.op_i32_gt_u, op_if])
-  let %body = bb.push_bytes(buf: %body, bytes: [bt_void, op_local_get])
-  let %body = bb.push_uleb128(buf: %body, val: 4)
-  let %body = bb.push_bytes(buf: %body, bytes: [op_memory_size, 0, op_i32_const])
-  let %body = bb.push_sleb128(buf: %body, val: 16)
-  let %body = bb.push_bytes(buf: %body, bytes: [wdefs.op_i32_shl, op_i32_sub])
-  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
-  let %body = bb.push_sleb128(buf: %body, val: 65535)
-  let %body = bb.push_bytes(buf: %body, bytes: [op_i32_add, op_i32_const])
-  let %body = bb.push_sleb128(buf: %body, val: 16)
-  let %body = bb.push_bytes(buf: %body, bytes: [wdefs.op_i32_shr_u, op_memory_grow, 0, op_drop, op_end])
-  // return ptr
-  let %body = bb.push_byte(buf: %body, byte: op_local_get)
-  let %body = bb.push_uleb128(buf: %body, val: 5)
-  return bb.push_byte(buf: %body, byte: op_end)
-end
-
-let find_func_by_suffix = fn (funcs: [LirFunction], map: &HashMap, suffix: string) -> i64 do
-  match funcs do
-    | [] -> return -1
-    | LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
-      if str.ends_with(s: n, suffix) then
-        let idx = wdefs.lookup_func_fast(name: n, map)
-        if idx >= 0 then return idx end
-      end
-      return find_func_by_suffix(funcs: rest, map, suffix)
-  end
-end
-
-/**
-True when `main` in the program is declared with one or more params
-(e.g. `main(args: [string])`). The wasi_run wrapper must supply an
-argument before `call main` in that case.
-*/
-let program_main_has_args = fn (funcs: [LirFunction]) -> bool do
-  match funcs do
-    | [] -> return false
-    | LirFunction(name: n, params: ps, ret_type: _, body: _, ret: _, span: _) :: rest ->
-      if n == "main" then
-        match ps do
-          | [] -> return false
-          | _ :: _ -> return true
-        end
-      end
-      return program_main_has_args(funcs: rest)
-  end
-end
-
-let compile_wasi_run_wrapper = fn (main_idx: i64, main_ret_type: TypeExpr,
-    argv_idx: i64, synth_empty_argv: bool, p3_component: bool) -> %ByteBuffer throws { CodegenError } do
-  let %body = bb.empty()
-  // Locals: one i32 for the synthesised Nil pointer when synthesising, else 0.
-  let %body = if synth_empty_argv then
-    let %body = bb.push_uleb128(buf: %body, val: 1)
-    let %body = bb.push_uleb128(buf: %body, val: 1)
-    bb.push_byte(buf: %body, byte: vt_i32)
-  else
-    bb.push_uleb128(buf: %body, val: 0)
-  end
-  // If argv_idx >= 0, main takes args: call argv() first, pass result to main.
-  // Else if synth_empty_argv, bump-allocate a 1-word Nil object and pass
-  // its pointer (extended to i64) as the args list. Else: nothing pushed.
-  let %body = if argv_idx >= 0 then
-    let %body = bb.push_byte(buf: %body, byte: op_call)
-    bb.push_uleb128(buf: %body, val: argv_idx)
-  else if synth_empty_argv then
-    // obj_ptr = global.get G0; local.tee 0; G0 = ptr + 8
-    let %body = bb.push_byte(buf: %body, byte: op_global_get)
-    let %body = bb.push_uleb128(buf: %body, val: heap_global_idx)
-    let %body = bb.push_byte(buf: %body, byte: op_local_tee)
-    let %body = bb.push_uleb128(buf: %body, val: 0)
-    let %body = bb.push_byte(buf: %body, byte: op_i32_const)
-    let %body = bb.push_sleb128(buf: %body, val: 8)
-    let %body = bb.push_byte(buf: %body, byte: op_i32_add)
-    let %body = bb.push_byte(buf: %body, byte: op_global_set)
-    let %body = bb.push_uleb128(buf: %body, val: heap_global_idx)
-    let %body = emit_memory_grow_check(buf: %body, skip: false)
-    // mem[obj_ptr] = Nil tag (i64)
-    let nil_tag = wdefs.constructor_tag(name: "Nil", arity: 0)
-    let %body = bb.push_byte(buf: %body, byte: op_local_get)
-    let %body = bb.push_uleb128(buf: %body, val: 0)
-    let %body = bb.push_byte(buf: %body, byte: op_i64_const)
-    let %body = bb.push_sleb128(buf: %body, val: nil_tag)
-    let %body = bb.push_byte(buf: %body, byte: op_i64_store)
-    let %body = wdefs.emit_memarg_i64(buf: %body, offset: 0)
-    // Push obj_ptr (extended to i64) as the main argument.
-    let %body = bb.push_byte(buf: %body, byte: op_local_get)
-    let %body = bb.push_uleb128(buf: %body, val: 0)
-    bb.push_byte(buf: %body, byte: op_i64_extend_i32_u)
-  else %body end
-  let %body = bb.push_byte(buf: %body, byte: op_call)
-  let %body = bb.push_uleb128(buf: %body, val: main_idx)
-  let %body = if wdefs.is_unit(typ: main_ret_type) then
-    %body
-  else
-    bb.push_byte(buf: %body, byte: op_drop)
-  end
-  // In p3-component mode the component canon lift expects i32 result (0=ok).
-  let %body = if p3_component then
-    bb.push_byte(buf: %body, byte: op_i32_const)
-  else %body end
-  let %body = if p3_component then
-    bb.push_sleb128(buf: %body, val: 0)
-  else %body end
-  return bb.push_byte(buf: %body, byte: op_end)
-end
-
-let build_param_locals = fn (params: [LirParam], idx: i64) -> [LocalEntry] throws { CodegenError } do
-  return build_param_locals_go(params, idx, acc: [])
-end
-let build_param_locals_go = fn (params: [LirParam], idx: i64, acc: [LocalEntry]) -> [LocalEntry] throws { CodegenError } do
-  match params do
-    | [] -> return list.reverse(xs: acc)
-    | LirParam(label: _, name: n, typ: t) :: rest ->
-      return build_param_locals_go(params: rest, idx: idx + 1, acc: LocalEntry(name: n, index: idx, valtype: wdefs.type_to_valtype(typ: t)) :: acc)
-  end
-end
-
-/** Per-function locals data: `[LocalEntry]` for decl emission, packed map
- *  for O(1) name lookup, and `temps_base` for scratch-local indexing. The
- *  %HashMap is owned by `emit_one_body` so it can be freed after the body
- *  finishes (locals never escape a function).
- */
-export type LocalsResult = LocalsResult(locals: [LocalEntry], temps_base: i64, local_map: %HashMap)
-
-let build_func_locals = fn (func: LirFunction) -> LocalsResult do
-  let LirFunction(name: _, params: ps, ret_type: _, body: b, ret: _, span: _) = func
-  let param_locals = build_param_locals(params: ps, idx: 0)
-  let param_count = list.length(xs: ps)
-  let %local_map = wdefs.build_local_map(entries: param_locals)
-  match wcollect.collect_local_stmts(stmts: b, locals: param_locals, next_idx: param_count, %local_map) do
-    | LocalResult(locals: collected_locals, next_idx: collected_next_idx, local_map: lm) ->
-      return LocalsResult(locals: collected_locals, temps_base: collected_next_idx, local_map: %lm)
-  end
-end
-
-// Program-wide state threaded through build_func_ctx / emit_one_body /
-// emit_code_bodies. Per-function inputs (current LirFunction, locals,
-// temps_base, local_map, resolved bt_capture_idx) stay as separate args.
-// effect_map / bt_capture_idx_global live here because emit_one_body resolves
-// the per-function bt_capture_idx from them.
-
-type CompileCtx = CompileCtx(
-  internal_funcs: [FuncEntry],
-  external_funcs: [FuncEntry],
-  string_lits: [StringEntry],
-  alloc_mode: i64,
-  functions: [LirFunction],
-  externals: [LirExternal],
-  closure_table: [FuncEntry],
-  closure_type_indices: [ArityTypeIdx],
-  internal_func_map: &HashMap,
-  external_func_map: &HashMap,
-  ss_tag_idx: i64,
-  ss_cont_type_idx: i64,
-  ss_dispatch_block_type_idx: i64,
-  ss_tag_names: [string],
-  /** O(1) tag-name → position index; mirrors `ss_tag_names` order. */
-  ss_tag_idx_map: StrMap<i64>,
-  effect_map: &EffectMap,
-  bt_capture_idx_global: i64,
-  memo_target_names: [string],
-  memo_target_slots: [i64],
-  memo_globals_base: i64,
-  import_count: i64,
-  /** When true, every function prologue emits an atomic.add to a per-function
-   * counter in linear-memory page 17. Default off (zero overhead).
-   */
-  coverage_enabled: bool
-)
-
-let build_func_ctx = fn (func: LirFunction,
-                          locals: [LocalEntry], temps_base: i64, local_map: &HashMap,
-                          bt_capture_idx: i64,
-                          cctx: CompileCtx) -> CodegenCtx do
-  let LirFunction(name: _, params: _, ret_type: rt, body: _, ret: _, span: _) = func
-  let CompileCtx(
-    internal_funcs: _,
-    external_funcs: _,
-    string_lits: sl_,
-    alloc_mode: _,
-    functions: fs_,
-    externals: ex_,
-    closure_table: ct_,
-    closure_type_indices: cti_,
-    internal_func_map: ifm_,
-    external_func_map: efm_,
-    ss_tag_idx: sti_,
-    ss_cont_type_idx: scti_,
-    ss_dispatch_block_type_idx: sdbti_,
-    ss_tag_names: _,
-    ss_tag_idx_map: stim_,
-    effect_map: _,
-    bt_capture_idx_global: _,
-    memo_target_names: mtn_,
-    memo_target_slots: mts_,
-    memo_globals_base: mgb_,
-    import_count: ic_,
-    coverage_enabled: _
-  ) = cctx
-  return CodegenCtx(
-    locals,
-    string_lits: sl_,
-    temps_base,
-    func_ret_type: rt,
-    functions: fs_,
-    externals: ex_,
-    closure_table: ct_,
-    closure_type_indices: cti_,
-    internal_func_map: ifm_,
-    external_func_map: efm_,
-    ss_tag_idx: sti_,
-    ss_cont_type_idx: scti_,
-    ss_dispatch_block_type_idx: sdbti_,
-    ss_tag_idx_map: stim_,
-    bt_capture_idx,
-    memo_target_names: mtn_,
-    memo_target_slots: mts_,
-    memo_globals_base: mgb_,
-    import_count: ic_,
-    local_map
-  )
-end
-
-let append_body_to_buf = fn (buf: %ByteBuffer, body: %ByteBuffer) -> %ByteBuffer do
-  let body_len = bb.length(buf: &body)
-  let %buf = bb.push_uleb128(%buf, val: body_len)
-  let %buf = bb.push_buf(dst: %buf, src: &body)
-  bb.free(buf: %body)
-  return %buf
-end
-
-/** Collect the names of every `can_throw` function so they can be added to
- * the string-literal pool (V1). The prologue references each
- *  name via `lookup_string(fname, entries)` → packed `(off<<32)|len`, which
- *  requires the name to live in the data segment. Pure functions skip the
- *  pool.
- */
-let collect_bt_func_names = fn (funcs: [LirFunction], em: &EffectMap, acc: [string]) -> [string] do
-  match funcs do
-    | [] -> return acc
-    | LirFunction(name: n, _) :: rest ->
-      // Avoid `let keep = match ...` — the seed's codegen mishandles bool
-      // arm-results bound to a let. Inline the branch instead.
-      match lookup_bits(em, name: n) do
-        | Some(val: EffectBits(can_throw: ct, is_pure: _)) ->
-          let acc2 = if ct then n :: acc else acc end
-          return collect_bt_func_names(funcs: rest, em, acc: acc2)
-        | None ->
-          return collect_bt_func_names(funcs: rest, em, acc: n :: acc)
-      end
-  end
-end
-
-/** Per-function backtrace-capture index for `func_name`.
- *  Returns -1 (= elide) when `bt_capture_idx_global == -1` (capture import
- *  absent from the program) or when the function's EffectMap entry says
- * `can_throw == false`. Otherwise returns the import slot
- *  of `__nx_main_wrap_bt_capture` so emit_expr/LirExprRaise can call it.
- *  Exported so tests can exercise the elision rule directly without
- *  bringing up the full codegen pipeline.
- */
-export let resolve_bt_capture_for_func = fn (func_name: string, effect_map: &EffectMap,
-                                        bt_capture_idx_global: i64) -> i64 do
-  if bt_capture_idx_global < 0 then return -1 end
-  match lookup_bits(em: effect_map, name: func_name) do
-    | Some(val: EffectBits(can_throw: ct, is_pure: _)) ->
-      if ct then return bt_capture_idx_global end
-      return -1
-    | None ->
-      // Function not in EffectMap (synthesised wrapper, etc.) — keep capture
-      // emission enabled to preserve backtrace fidelity. EffectMap covers
-      // every LirFunction in the program by construction, so a miss means
-      // either a pre-LIR synthesised body or a stale lookup; both cases
-      // sound on the conservative side.
-      return bt_capture_idx_global
-  end
-end
-
-/** Per-function packed name for backtrace prologue (V1). Returns
- *  the packed `(offset<<32)|len` of `func_name` in the string-literal pool
- *  when `EffectMap.can_throw == true`, or -1 to skip the push. EffectMap-
- *  absent functions (synthesised wrappers) get instrumented on the
- *  conservative side. The `bt_capture_idx_global` import is filtered out
- *  of the import section; throw sites snapshot inline.
- */
-let resolve_bt_push_packed = fn (func_name: string, effect_map: &EffectMap,
-                                   string_lits: [StringEntry]) -> i64 do
-  // Direct arm-return: avoid binding `match` result to a let-variable
-  // (the seed's codegen double-extends bool-from-arm into i64 and the
-  // resulting wasm fails validation — works around a Stage-0 seed bug).
-  match lookup_bits(em: effect_map, name: func_name) do
-    | Some(val: EffectBits(can_throw: ct, is_pure: _)) ->
-      if ct then return wdefs.lookup_string(value: func_name, entries: string_lits) end
-      return -1
-    | None -> return wdefs.lookup_string(value: func_name, entries: string_lits)
-  end
-end
 
 let emit_one_body = fn (buf: %ByteBuffer, f: LirFunction, func_id: i64,
                          cctx: CompileCtx) -> %ByteBuffer throws { CodegenError } do

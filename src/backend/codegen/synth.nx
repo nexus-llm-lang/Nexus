@@ -1,0 +1,192 @@
+/**
+ * codegen/synth: Synthesised WASM function bodies emitted by the compiler.
+ *
+ * Owns:
+ * - compile_cabi_realloc: bump-allocator body for the canonical ABI realloc
+ * - compile_wasi_run_wrapper: wasi_run entry-point wrapper body
+ * - find_func_by_suffix: suffix-match helper for resolving `argv` etc.
+ * - program_main_has_args: detects whether `main` takes parameters
+ *
+ * These helpers don't recurse through emit_stmt / emit_expr and don't depend
+ * on CodegenCtx, so they can live outside codegen.nx.
+ */
+
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { TypeExpr } from "src/common/ast.nx"
+import { LirFunction } from "src/ir/lir/types.nx"
+import { HashMap } from "std:hashmap"
+import { vt_i32,
+         op_call, op_drop, op_if, op_end,
+         op_local_get, op_local_set, op_local_tee, op_global_get, op_global_set,
+         op_i32_const, op_i64_const, op_i64_store,
+         op_i32_add, op_i32_sub,
+         op_i64_extend_i32_u,
+         op_memory_size, op_memory_grow,
+         heap_global_idx }, * as wdefs from "src/backend/wasm/defs.nx"
+import { emit_memory_grow_check } from "src/backend/codegen/atom.nx"
+import { CodegenError } from "src/backend/errors.nx"
+import * as str from "std:str"
+
+/** cabi_realloc: bump allocator emitted alongside the canonical-ABI
+ *  string-lift/lower path (gated by collect.needs_cabi_realloc).
+ *  Bumps the unified atomic heap cell (`wdefs.heap_ptr_cell`); the cell always
+ *  holds an 8-aligned value (every bump is a multiple of 8), which covers the
+ *  canonical ABI's `align` (always <= 8), so the `align` parameter is ignored.
+ *  Like emit_atomic_bump, it lazily seeds the cell via
+ *  `cmpxchg(cell, 0, memory.size()*65536)` so it is correct even before any
+ *  other allocation has run. Signature:
+ *  `(orig_ptr i32, orig_size i32, align i32, new_size i32) -> i32`.
+ */
+export let compile_cabi_realloc = fn (heap_base: i64) -> %ByteBuffer throws { CodegenError } do
+  let _ = heap_base
+  let %body = bb.empty()
+  // 2 locals: rounded_size (i32) at idx 4, ptr (i32) at idx 5
+  let %body = bb.push_uleb128(buf: %body, val: 1)
+  let %body = bb.push_uleb128(buf: %body, val: 2)
+  let %body = bb.push_byte(buf: %body, byte: vt_i32)
+  // Idempotent seed: cmpxchg(cell, 0, memory.size()*65536); drop old.
+  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
+  let %body = bb.push_sleb128(buf: %body, val: wdefs.heap_ptr_cell)
+  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
+  let %body = bb.push_sleb128(buf: %body, val: 0)
+  let %body = bb.push_bytes(buf: %body, bytes: [op_memory_size, 0, op_i32_const])
+  let %body = bb.push_sleb128(buf: %body, val: 16)
+  let %body = bb.push_byte(buf: %body, byte: wdefs.op_i32_shl)
+  let %body = wdefs.emit_atomic_op32(buf: %body, sub_op: wdefs.op_i32_atomic_rmw_cmpxchg, offset: 0)
+  let %body = bb.push_byte(buf: %body, byte: op_drop)
+  // rounded_size = (new_size + 7) & ~8
+  let %body = bb.push_byte(buf: %body, byte: op_local_get)
+  let %body = bb.push_uleb128(buf: %body, val: 3) // new_size
+  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
+  let %body = bb.push_sleb128(buf: %body, val: 7)
+  let %body = bb.push_bytes(buf: %body, bytes: [op_i32_add, op_i32_const])
+  let %body = bb.push_sleb128(buf: %body, val: 0 - 8)
+  let %body = bb.push_bytes(buf: %body, bytes: [wdefs.op_i32_and, op_local_set])
+  let %body = bb.push_uleb128(buf: %body, val: 4)
+  // ptr = atomic.rmw.add(cell, rounded_size)
+  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
+  let %body = bb.push_sleb128(buf: %body, val: wdefs.heap_ptr_cell)
+  let %body = bb.push_byte(buf: %body, byte: op_local_get)
+  let %body = bb.push_uleb128(buf: %body, val: 4)
+  let %body = wdefs.emit_atomic_op32(buf: %body, sub_op: wdefs.op_i32_atomic_rmw_add, offset: 0)
+  let %body = bb.push_byte(buf: %body, byte: op_local_set)
+  let %body = bb.push_uleb128(buf: %body, val: 5)
+  // new_top = ptr + rounded_size  (reuse idx 4)
+  let %body = bb.push_byte(buf: %body, byte: op_local_get)
+  let %body = bb.push_uleb128(buf: %body, val: 5)
+  let %body = bb.push_byte(buf: %body, byte: op_local_get)
+  let %body = bb.push_uleb128(buf: %body, val: 4)
+  let %body = bb.push_bytes(buf: %body, bytes: [op_i32_add, op_local_set])
+  let %body = bb.push_uleb128(buf: %body, val: 4)
+  // if (new_top > memory.size * 65536) { memory.grow(ceil((new_top - mem_bytes)/65536)); drop }
+  let %body = bb.push_byte(buf: %body, byte: op_local_get)
+  let %body = bb.push_uleb128(buf: %body, val: 4)
+  let %body = bb.push_bytes(buf: %body, bytes: [op_memory_size, 0, op_i32_const])
+  let %body = bb.push_sleb128(buf: %body, val: 16)
+  let %body = bb.push_byte(buf: %body, byte: wdefs.op_i32_shl)
+  let %body = bb.push_bytes(buf: %body, bytes: [wdefs.op_i32_gt_u, op_if])
+  let %body = bb.push_bytes(buf: %body, bytes: [wdefs.bt_void, op_local_get])
+  let %body = bb.push_uleb128(buf: %body, val: 4)
+  let %body = bb.push_bytes(buf: %body, bytes: [op_memory_size, 0, op_i32_const])
+  let %body = bb.push_sleb128(buf: %body, val: 16)
+  let %body = bb.push_bytes(buf: %body, bytes: [wdefs.op_i32_shl, op_i32_sub])
+  let %body = bb.push_byte(buf: %body, byte: op_i32_const)
+  let %body = bb.push_sleb128(buf: %body, val: 65535)
+  let %body = bb.push_bytes(buf: %body, bytes: [op_i32_add, op_i32_const])
+  let %body = bb.push_sleb128(buf: %body, val: 16)
+  let %body = bb.push_bytes(buf: %body, bytes: [wdefs.op_i32_shr_u, op_memory_grow, 0, op_drop, op_end])
+  // return ptr
+  let %body = bb.push_byte(buf: %body, byte: op_local_get)
+  let %body = bb.push_uleb128(buf: %body, val: 5)
+  return bb.push_byte(buf: %body, byte: op_end)
+end
+
+export let find_func_by_suffix = fn (funcs: [LirFunction], map: &HashMap, suffix: string) -> i64 do
+  match funcs do
+    | [] -> return -1
+    | LirFunction(name: n, params: _, ret_type: _, body: _, ret: _, span: _) :: rest ->
+      if str.ends_with(s: n, suffix) then
+        let idx = wdefs.lookup_func_fast(name: n, map)
+        if idx >= 0 then return idx end
+      end
+      return find_func_by_suffix(funcs: rest, map, suffix)
+  end
+end
+
+/**
+True when `main` in the program is declared with one or more params
+(e.g. `main(args: [string])`). The wasi_run wrapper must supply an
+argument before `call main` in that case.
+*/
+export let program_main_has_args = fn (funcs: [LirFunction]) -> bool do
+  match funcs do
+    | [] -> return false
+    | LirFunction(name: n, params: ps, ret_type: _, body: _, ret: _, span: _) :: rest ->
+      if n == "main" then
+        match ps do
+          | [] -> return false
+          | _ :: _ -> return true
+        end
+      end
+      return program_main_has_args(funcs: rest)
+  end
+end
+
+export let compile_wasi_run_wrapper = fn (main_idx: i64, main_ret_type: TypeExpr,
+    argv_idx: i64, synth_empty_argv: bool, p3_component: bool) -> %ByteBuffer throws { CodegenError } do
+  let %body = bb.empty()
+  // Locals: one i32 for the synthesised Nil pointer when synthesising, else 0.
+  let %body = if synth_empty_argv then
+    let %body = bb.push_uleb128(buf: %body, val: 1)
+    let %body = bb.push_uleb128(buf: %body, val: 1)
+    bb.push_byte(buf: %body, byte: vt_i32)
+  else
+    bb.push_uleb128(buf: %body, val: 0)
+  end
+  // If argv_idx >= 0, main takes args: call argv() first, pass result to main.
+  // Else if synth_empty_argv, bump-allocate a 1-word Nil object and pass
+  // its pointer (extended to i64) as the args list. Else: nothing pushed.
+  let %body = if argv_idx >= 0 then
+    let %body = bb.push_byte(buf: %body, byte: op_call)
+    bb.push_uleb128(buf: %body, val: argv_idx)
+  else if synth_empty_argv then
+    // obj_ptr = global.get G0; local.tee 0; G0 = ptr + 8
+    let %body = bb.push_byte(buf: %body, byte: op_global_get)
+    let %body = bb.push_uleb128(buf: %body, val: heap_global_idx)
+    let %body = bb.push_byte(buf: %body, byte: op_local_tee)
+    let %body = bb.push_uleb128(buf: %body, val: 0)
+    let %body = bb.push_byte(buf: %body, byte: op_i32_const)
+    let %body = bb.push_sleb128(buf: %body, val: 8)
+    let %body = bb.push_byte(buf: %body, byte: op_i32_add)
+    let %body = bb.push_byte(buf: %body, byte: op_global_set)
+    let %body = bb.push_uleb128(buf: %body, val: heap_global_idx)
+    let %body = emit_memory_grow_check(buf: %body, skip: false)
+    // mem[obj_ptr] = Nil tag (i64)
+    let nil_tag = wdefs.constructor_tag(name: "Nil", arity: 0)
+    let %body = bb.push_byte(buf: %body, byte: op_local_get)
+    let %body = bb.push_uleb128(buf: %body, val: 0)
+    let %body = bb.push_byte(buf: %body, byte: op_i64_const)
+    let %body = bb.push_sleb128(buf: %body, val: nil_tag)
+    let %body = bb.push_byte(buf: %body, byte: op_i64_store)
+    let %body = wdefs.emit_memarg_i64(buf: %body, offset: 0)
+    // Push obj_ptr (extended to i64) as the main argument.
+    let %body = bb.push_byte(buf: %body, byte: op_local_get)
+    let %body = bb.push_uleb128(buf: %body, val: 0)
+    bb.push_byte(buf: %body, byte: op_i64_extend_i32_u)
+  else %body end
+  let %body = bb.push_byte(buf: %body, byte: op_call)
+  let %body = bb.push_uleb128(buf: %body, val: main_idx)
+  let %body = if wdefs.is_unit(typ: main_ret_type) then
+    %body
+  else
+    bb.push_byte(buf: %body, byte: op_drop)
+  end
+  // In p3-component mode the component canon lift expects i32 result (0=ok).
+  let %body = if p3_component then
+    bb.push_byte(buf: %body, byte: op_i32_const)
+  else %body end
+  let %body = if p3_component then
+    bb.push_sleb128(buf: %body, val: 0)
+  else %body end
+  return bb.push_byte(buf: %body, byte: op_end)
+end
