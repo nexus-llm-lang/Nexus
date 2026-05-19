@@ -116,6 +116,22 @@ let cmp_visited_has = fn (visited: [string], name: string) -> bool do
   end
 end
 
+// Build a substitution [α₁:=σ₁, …, αₙ:=σₙ] from type-parameter names and
+// the concrete type arguments supplied at the use-site (spec: unfold(x⟨σ̄⟩),
+// line 1226-1231). Stops at the shorter list if lengths differ (safety valve
+// for well-formedness violations already caught upstream).
+let build_type_arg_subst = fn (params: [string], args: [TypeExpr], acc: [SubstEntry]) -> [SubstEntry] do
+  match params do
+    | [] -> return acc
+    | p :: rest_p ->
+      match args do
+        | [] -> return acc
+        | a :: rest_a ->
+          return build_type_arg_subst(params: rest_p, args: rest_a, acc: SubstEntry(var: p, typ: a) :: acc)
+      end
+  end
+end
+
 let comparable_named_type_list = fn (nts: [NamedType], tdefs: [TypeDefEntry], edefs: [EnumEntry], visited: [string]) -> bool do
   match nts do
     | [] -> return true
@@ -127,43 +143,46 @@ let comparable_named_type_list = fn (nts: [NamedType], tdefs: [TypeDefEntry], ed
   end
 end
 
-/** Look up an enum by name in the enum definitions list. */
-let enum_lookup = fn (edefs: [EnumEntry], name: string) -> Option<[VariantDef]> do
+/** Look up an enum by name in the enum definitions list.  Returns the full
+    EnumDef (including type_params) so the caller can perform type-argument
+    substitution.  Returns None for opaque enums whose body is hidden. */
+let enum_lookup = fn (edefs: [EnumEntry], name: string) -> Option<EnumDef> do
   match edefs do
     | [] -> return None
     | EnumEntry(name: n, def: def) :: rest ->
       if n == name then
         match def do
-          | EnumDef(name: _, is_public: _, is_opaque: ob, type_params: _, variants: vs) ->
+          | EnumDef(name: _, is_public: _, is_opaque: ob, type_params: _, variants: _) ->
             // Opaque enums are not structurally comparable — their body is hidden
             // across module boundaries, matching unfold(x⟨σ̄⟩) = opaque ⇒ false.
             if ob then return None end
-            return Some(val: vs)
+            return Some(val: def)
         end
       end
       return enum_lookup(edefs: rest, name)
   end
 end
 
-/** Check that all fields of a variant are comparable. */
-let comparable_variant_fields = fn (fields: [VariantField], tdefs: [TypeDefEntry], edefs: [EnumEntry], visited: [string]) -> bool do
+/** Check that all fields of a variant are comparable after applying substitution `s`. */
+let comparable_variant_fields = fn (fields: [VariantField], tdefs: [TypeDefEntry], edefs: [EnumEntry], visited: [string], s: [SubstEntry]) -> bool do
   match fields do
     | [] -> return true
     | VariantField(name: _, typ: t) :: rest ->
-      if comparable_go(typ: t, tdefs, edefs, visited) then
-        return comparable_variant_fields(fields: rest, tdefs, edefs, visited)
+      let t_subst = subst.subst_apply(subst: s, typ: t)
+      if comparable_go(typ: t_subst, tdefs, edefs, visited) then
+        return comparable_variant_fields(fields: rest, tdefs, edefs, visited, s)
       end
       return false
   end
 end
 
-/** Check that all variants of a sum type are comparable. */
-let comparable_variants = fn (vs: [VariantDef], tdefs: [TypeDefEntry], edefs: [EnumEntry], visited: [string]) -> bool do
+/** Check that all variants of a sum type are comparable after applying substitution `s`. */
+let comparable_variants = fn (vs: [VariantDef], tdefs: [TypeDefEntry], edefs: [EnumEntry], visited: [string], s: [SubstEntry]) -> bool do
   match vs do
     | [] -> return true
     | VariantDef(name: _, fields: fs) :: rest ->
-      if comparable_variant_fields(fields: fs, tdefs, edefs, visited) then
-        return comparable_variants(vs: rest, tdefs, edefs, visited)
+      if comparable_variant_fields(fields: fs, tdefs, edefs, visited, s) then
+        return comparable_variants(vs: rest, tdefs, edefs, visited, s)
       end
       return false
   end
@@ -180,22 +199,27 @@ let comparable_go = fn (typ: TypeExpr, tdefs: [TypeDefEntry], edefs: [EnumEntry]
     | TyVar(_) -> return false
     | TyRecord(fields: fs) -> return comparable_named_type_list(nts: fs, tdefs, edefs, visited)
     | TyList(elem: e) -> return comparable_go(typ: e, tdefs, edefs, visited)
-    | TyUserDefined(name: n, args: _) ->
+    | TyUserDefined(name: n, args: type_args) ->
       // Cycle case (spec line 935): if `n` is already on the unfold path,
       // bottom out at false to bound the least-fixpoint approximation.
       if cmp_visited_has(visited, name: n) then return false end
-      // Expand record typedef when known.
+      // Expand record typedef when known.  Substitute type params with the
+      // concrete args before recursing (spec unfold(x⟨σ̄⟩): F[ᾱ:=σ̄]).
       match tctypes.typedef_lookup(defs: tdefs, name: n) do
-        | Some(val: RecordDef(fields: fs, _)) ->
-          return comparable_named_type_list(nts: fs, tdefs, edefs, visited: n :: visited)
+        | Some(val: RecordDef(name: _, is_public: _, type_params: tps, fields: fs)) ->
+          let s = build_type_arg_subst(params: tps, args: type_args, acc: [])
+          let fs_subst = subst.apply_named_types(subst: s, nts: fs)
+          return comparable_named_type_list(nts: fs_subst, tdefs, edefs, visited: n :: visited)
         | None ->
           // T-Cmp sum unfold: if the name resolves to an enum, check that every
           // variant (and every field of every variant) is comparable.  Non-opaque
           // sum types whose payloads are all comparable are themselves comparable —
           // the runtime ==  operator recurses through the tag + payload uniformly.
+          // Substitute type params with concrete args before recursing.
           match enum_lookup(edefs, name: n) do
-            | Some(val: vs) ->
-              return comparable_variants(vs, tdefs, edefs, visited: n :: visited)
+            | Some(val: EnumDef(name: _, is_public: _, is_opaque: _, type_params: tps, variants: vs)) ->
+              let s = build_type_arg_subst(params: tps, args: type_args, acc: [])
+              return comparable_variants(vs, tdefs, edefs, visited: n :: visited, s)
             | None -> return false
           end
       end
