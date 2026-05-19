@@ -30,7 +30,7 @@ import {
   UnaryOp, OpNeg, OpFNeg, OpNot,
   Literal,
   Sigil, SigilMutable, SigilLazy, SigilLinear,
-  VariantField, RecordDef
+  VariantField, VariantDef, EnumDef, RecordDef
 } from "src/common/ast.nx"
 import {
   HirExprKind, HirExpr, HirStmtKind, HirStmt,
@@ -39,7 +39,7 @@ import {
   ExceptionGroupEntry, HirCap
 } from "src/ir/hir/types.nx"
 import {
-  SubstEntry, Scheme, EnvEntry, CheckState, FreshResult,
+  SubstEntry, Scheme, EnvEntry, EnumEntry, CheckState, FreshResult,
   InferExprResult, InferExprOk, InferExprErr,
   UnifyOk, UnifyErr,
   BindResult, BindOk, BindErr,
@@ -88,7 +88,8 @@ import {
   scan_handler_arms_for_ref_capture,
   extend_require_row
 } from "src/typecheck/infer/effects.nx"
-import { TypeError, DuplicateRecordLabel, UnreachableCode, RefEscapes } from "src/typecheck/errors.nx"
+import { TypeError, DuplicateRecordLabel, UnreachableCode, RefEscapes, UnknownConstructor, UnknownField } from "src/typecheck/errors.nx"
+import { suggest_names } from "src/common/levenshtein.nx"
 import * as list from "std:list"
 import { Option, Some, None } from "std:option"
 
@@ -496,6 +497,41 @@ let check_call_args_walk = fn (
   end
 end
 
+/** Collect field names from a [NamedType] list (for UnknownField suggestions). */
+let named_type_names = fn (nts: [NamedType]) -> [string] do
+  return named_type_names_go(nts, acc: [])
+end
+
+let named_type_names_go = fn (nts: [NamedType], acc: [string]) -> [string] do
+  match nts do
+    | [] -> return acc
+    | NamedType(name: n, typ: _) :: rest -> return named_type_names_go(nts: rest, acc: n :: acc)
+  end
+end
+
+/** Collect all variant names from the enum definitions in state (for suggestions). */
+let all_variant_names = fn (state: CheckState) -> [string] do
+  return all_variant_names_go(entries: tctypes.state_enums(state), acc: [])
+end
+
+let all_variant_names_go = fn (entries: [EnumEntry], acc: [string]) -> [string] do
+  match entries do
+    | [] -> return acc
+    | EnumEntry(name: _, def: ed) :: rest ->
+      match ed do | EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) ->
+        let acc2 = all_variant_names_variants(vs, acc)
+        return all_variant_names_go(entries: rest, acc: acc2)
+      end
+  end
+end
+
+let all_variant_names_variants = fn (vs: [VariantDef], acc: [string]) -> [string] do
+  match vs do
+    | [] -> return acc
+    | VariantDef(name: n, fields: _) :: rest -> return all_variant_names_variants(vs: rest, acc: n :: acc)
+  end
+end
+
 let infer_constructor = fn (state: CheckState, variant: string, args: [HirExpr], labels: [string], sigil: Sigil, span: Span) -> InferExprResult throws { TypeError } do
   // The `sigil` parameter records whether the user wrote `%Ctor(...)` at the
   // source — propagated through AST → HIR for downstream consumers (let-binders
@@ -509,7 +545,9 @@ let infer_constructor = fn (state: CheckState, variant: string, args: [HirExpr],
   // The sigil's role here is bookkeeping, not type-shape mutation.
   let _ = sigil
   match tctypes.find_variant(idx: tctypes.state_variant_index(state), variant) do
-    | None -> return InferExprErr(message: "unknown constructor: " ++ variant, span)
+    | None ->
+      let sugs = suggest_names(typo: variant, candidates: all_variant_names(state))
+      throw UnknownConstructor(name: variant, suggestions: sugs, span)
     | Some(val: EnumVariantInfo(enum_name: ename, type_params: tps, fields)) ->
       let fr = freshen_type_params(state, params: tps)
       let FreshenResult(state: st1, param_subst: psubst) = fr
@@ -734,7 +772,9 @@ let infer_field_access = fn (state: CheckState, target: HirExpr, field: string, 
                   )
                 | None -> return InferExprOk(state: st1, subst: s1, typ: ft)
               end
-            | None -> return InferExprErr(message: "no field " ++ field ++ " in record", span)
+            | None ->
+              let sugs = suggest_names(typo: field, candidates: named_type_names(nts: rec_fields))
+              throw UnknownField(name: field, suggestions: sugs, span)
           end
       end
   end

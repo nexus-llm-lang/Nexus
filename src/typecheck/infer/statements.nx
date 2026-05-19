@@ -29,7 +29,7 @@ import {
   TyIntLit, TyFloatLit, TyUserDefined, TyVar,
   TyArrow, TyRef, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord,
   TyRow,
-  NamedType, RecordDef, VariantField,
+  NamedType, RecordDef, VariantField, VariantDef, EnumDef,
   Sigil, SigilImmutable, SigilMutable, SigilLazy, SigilLinear,
   Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit
 } from "src/common/ast.nx"
@@ -39,7 +39,7 @@ import {
   HirExprKind
 } from "src/ir/hir/types.nx"
 import {
-  SubstEntry, Scheme, EnvEntry, CheckState,
+  SubstEntry, Scheme, EnvEntry, EnumEntry, CheckState,
   InferExprResult, InferExprOk, InferExprErr,
   UnifyOk, UnifyErr,
   BindResult, BindOk, BindErr,
@@ -58,10 +58,59 @@ import {
   lookup_named_type, find_linear_field, type_carries_linear
 } from "src/typecheck/infer/collections.nx"
 import { TypeError, ThrowsRowInvariantBroken, DuplicatePatternLabel } from "src/typecheck/errors.nx"
+import { suggest_names } from "src/common/levenshtein.nx"
 import { StrMap }, * as smap from "src/common/strmap.nx"
 import * as list from "std:list"
 import { Option, Some, None } from "std:option"
 import { is_auto_droppable } from "src/ir/shared/type_pred.nx"
+
+/** Render a suggestion list as "\n  --> did you mean 'x' ?" inline text for BindErr messages. */
+let inline_suggestions = fn (sugs: [string]) -> string do
+  return inline_suggestions_go(sugs, acc: "")
+end
+
+let inline_suggestions_go = fn (sugs: [string], acc: string) -> string do
+  match sugs do
+    | [] -> return acc
+    | s :: rest ->
+      return inline_suggestions_go(sugs: rest, acc: acc ++ "\n  --> did you mean '" ++ s ++ "' ?")
+  end
+end
+
+/** Collect field names from a [NamedType] list (for suggestions). */
+let named_type_field_names = fn (nts: [NamedType]) -> [string] do
+  return named_type_field_names_go(nts, acc: [])
+end
+
+let named_type_field_names_go = fn (nts: [NamedType], acc: [string]) -> [string] do
+  match nts do
+    | [] -> return acc
+    | NamedType(name: n, typ: _) :: rest -> return named_type_field_names_go(nts: rest, acc: n :: acc)
+  end
+end
+
+/** Collect all variant names from enum entries in state (for constructor suggestions). */
+let state_all_variant_names = fn (state: CheckState) -> [string] do
+  return state_all_variant_names_go(entries: tctypes.state_enums(state), acc: [])
+end
+
+let state_all_variant_names_go = fn (entries: [EnumEntry], acc: [string]) -> [string] do
+  match entries do
+    | [] -> return acc
+    | EnumEntry(name: _, def: ed) :: rest ->
+      match ed do | EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) ->
+        let acc2 = state_all_variant_names_variants(vs, acc)
+        return state_all_variant_names_go(entries: rest, acc: acc2)
+      end
+  end
+end
+
+let state_all_variant_names_variants = fn (vs: [VariantDef], acc: [string]) -> [string] do
+  match vs do
+    | [] -> return acc
+    | VariantDef(name: n, fields: _) :: rest -> return state_all_variant_names_variants(vs: rest, acc: n :: acc)
+  end
+end
 
 /** Prepend `extra` entries onto `base`. Used by match-case, ctor-pattern, and record-pattern binding. */
 export let append_env = fn (base: [EnvEntry], extra: [EnvEntry]) -> [EnvEntry] throws { TypeError } do
@@ -274,7 +323,9 @@ let bind_constructor_pattern = fn (
     | _ -> target_type
   end
   match tctypes.find_variant(idx: tctypes.state_variant_index(state), variant) do
-    | None -> return BindErr(message: "unknown constructor in pattern: " ++ variant)
+    | None ->
+      let sugs = suggest_names(typo: variant, candidates: state_all_variant_names(state))
+      return BindErr(message: "unknown constructor in pattern: " ++ variant ++ inline_suggestions(sugs))
     | Some(val: EnumVariantInfo(enum_name: ename, type_params: tps, fields: field_types)) ->
       let fr = freshen_type_params(state, params: tps)
       match fr do
@@ -433,7 +484,9 @@ let bind_rec_pat_fields = fn (
     | [] -> return BindOk(state, subst, env)
     | HirRecordPatField(name: fname, pattern: pat) :: rest ->
       match lookup_named_type(nts: rec_fields, name: fname) do
-        | None -> return BindErr(message: "no field " ++ fname ++ " in record pattern")
+        | None ->
+          let sugs = suggest_names(typo: fname, candidates: named_type_field_names(nts: rec_fields))
+          return BindErr(message: "no field '" ++ fname ++ "' in record pattern" ++ inline_suggestions(sugs))
         | Some(val: ft) ->
           match bind_pattern(state, pattern: pat, target_type: ft) do
             | BindErr(message: m) -> return BindErr(message: m)

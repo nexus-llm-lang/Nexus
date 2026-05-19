@@ -14,6 +14,8 @@ import * as str from "std:str"
 import * as list from "std:list"
 import * as rdr from "src/ir/shared/rdrname.nx"
 import * as pkg from "src/ir/shared/package.nx"
+import { suggest_names } from "src/common/levenshtein.nx"
+import { Option, Some, None } from "std:option"
 
 let find_last_slash_go = fn (s: string, pos: i64, last: i64) -> i64 do
   if pos >= str.length(s) then return last
@@ -101,11 +103,31 @@ let build_wildcard_importer_go = fn (defs: [SpannedTopLevel], source: string, al
   end
 end
 
+/** Collect all exported names from a list of top-level definitions.
+ *  Used to build a candidate list for "did you mean?" suggestions when a
+ *  selective import references a non-exported name.
+ */
+let collect_exported_names = fn (defs: [SpannedTopLevel]) -> [string] do
+  return collect_exported_names_go(defs, acc: [])
+end
+
+let collect_exported_names_go = fn (defs: [SpannedTopLevel], acc: [string]) -> [string] do
+  match defs do
+    | [] -> return acc
+    | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public: true, typ: _, value: _)), span: _) :: rest ->
+      return collect_exported_names_go(defs: rest, acc: name :: acc)
+    | SpannedTopLevel(node: TLCap(def: Cap(name, is_public: true, functions: _)), span: _) :: rest ->
+      return collect_exported_names_go(defs: rest, acc: name :: acc)
+    | _ :: rest ->
+      return collect_exported_names_go(defs: rest, acc)
+  end
+end
+
 /** For selective import `import { foo as bar } from "A"`: caller sees `bar -> canonical(A, foo)`.
  *  D-Export: if a selected name exists in the module but is not exported (is_public=false),
  *  raises ImportNotExported so the user gets a clear diagnostic instead of a silent miss.
  */
-let build_selective_importer_go = fn (defs: [SpannedTopLevel], items: [ImportItem], source: string, acc: [RenameEntry]) -> [RenameEntry] throws { ImportNotExported } do
+let build_selective_importer_go = fn (defs: [SpannedTopLevel], items: [ImportItem], source: string, acc: [RenameEntry], exported: [string]) -> [RenameEntry] throws { ImportNotExported } do
   match defs do
     | [] -> return acc
     | SpannedTopLevel(node: TLLet(def: GlobalLet(name, is_public, typ: _, value: _)), span: _) :: rest ->
@@ -113,27 +135,29 @@ let build_selective_importer_go = fn (defs: [SpannedTopLevel], items: [ImportIte
         | Some(val: visible) ->
           if is_public then
             let acc2 = symtab.rename_add(entries: acc, original: visible, qualified: rdr.canonical_name(source_path: source, name))
-            return build_selective_importer_go(defs: rest, items, source, acc: acc2)
+            return build_selective_importer_go(defs: rest, items, source, acc: acc2, exported)
           else
-            throw ImportNotExported(name, module_path: source)
+            let sugs = suggest_names(typo: name, candidates: exported)
+            throw ImportNotExported(name, module_path: source, suggestions: sugs)
           end
         | None ->
-          return build_selective_importer_go(defs: rest, items, source, acc)
+          return build_selective_importer_go(defs: rest, items, source, acc, exported)
       end
     | SpannedTopLevel(node: TLCap(def: Cap(name, is_public, functions: _)), span: _) :: rest ->
       match find_selected(name, items) do
         | Some(val: visible) ->
           if is_public then
             let acc2 = symtab.rename_add(entries: acc, original: visible, qualified: rdr.canonical_name(source_path: source, name))
-            return build_selective_importer_go(defs: rest, items, source, acc: acc2)
+            return build_selective_importer_go(defs: rest, items, source, acc: acc2, exported)
           else
-            throw ImportNotExported(name, module_path: source)
+            let sugs = suggest_names(typo: name, candidates: exported)
+            throw ImportNotExported(name, module_path: source, suggestions: sugs)
           end
         | None ->
-          return build_selective_importer_go(defs: rest, items, source, acc)
+          return build_selective_importer_go(defs: rest, items, source, acc, exported)
       end
     | _ :: rest ->
-      return build_selective_importer_go(defs: rest, items, source, acc)
+      return build_selective_importer_go(defs: rest, items, source, acc, exported)
   end
 end
 
@@ -156,7 +180,8 @@ export let build_importer_entries = fn (imported_defs: [SpannedTopLevel], import
             end
             return build_wildcard_importer_go(defs: imported_defs, source: physical, alias, acc: [])
           | _ :: _ ->
-            let selective = build_selective_importer_go(defs: imported_defs, items, source: physical, acc: [])
+            let exported = collect_exported_names(defs: imported_defs)
+            let selective = build_selective_importer_go(defs: imported_defs, items, source: physical, acc: [], exported)
             match alias_opt do
               | Some(val: alias) ->
                 return build_wildcard_importer_go(defs: imported_defs, source: physical, alias, acc: selective)
