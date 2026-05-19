@@ -1,0 +1,879 @@
+/**
+ * yaml/parse: YAML 1.2 scanner, tokenizer, and AST builder.
+ * Exports: parse
+ */
+
+import * as str from "std:str"
+import * as list from "std:list"
+import * as char from "std:char"
+import * as bb from "std:bytebuffer"
+import { Option, Some, None } from "std:option"
+import { YamlError, YamlThrow, YamlField, YamlValue, YamlNull, YamlBool, YamlInt, YamlFloat, YamlString, YamlSeq, YamlMap, len_of, infer_scalar } from "std:encoding/yaml/types"
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+let peek = fn (s: string, p: i64) -> char do
+  if p >= len_of(s) then return '\0' end
+  return str.byte_at(s, idx: p)
+end
+
+let starts_with_at = fn (s: string, p: i64, lit: string) -> bool do
+  let n = str.byte_length(s: lit)
+  if p + n > len_of(s) then return false end
+  return str.byte_substring(s, start: p, len: n) == lit
+end
+
+// Skip horizontal whitespace (space + tab) only — not newlines.
+let skip_h = fn (s: string, p: i64) -> i64 do
+  if p >= len_of(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ' ' || c == '\t' then
+    return skip_h(s, p: p + 1)
+  end
+  return p
+end
+
+// Skip all whitespace including newlines.
+let skip_ws_all = fn (s: string, p: i64) -> i64 do
+  if p >= len_of(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ' ' || c == '\t' || c == '\n' || c == '\r' then
+    return skip_ws_all(s, p: p + 1)
+  end
+  return p
+end
+
+// Skip to end of line (does not consume the newline).
+let skip_to_eol = fn (s: string, p: i64) -> i64 do
+  if p >= len_of(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == '\n' then return p end
+  if c == '\r' then return p end
+  return skip_to_eol(s, p: p + 1)
+end
+
+// Skip a newline sequence (\r\n or \n).
+let skip_newline = fn (s: string, p: i64) -> i64 do
+  if p >= len_of(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == '\r' then
+    let p2 = p + 1
+    if p2 < len_of(s) && str.byte_at(s, idx: p2) == '\n' then
+      return p2 + 1
+    end
+    return p2
+  end
+  if c == '\n' then return p + 1 end
+  return p
+end
+
+// Measure indentation of the current line (number of leading spaces).
+let measure_indent = fn (s: string, p: i64) -> i64 do
+  if p >= len_of(s) then return 0 end
+  let c = str.byte_at(s, idx: p)
+  if c == ' ' then return 1 + measure_indent(s, p: p + 1) end
+  return 0
+end
+
+// Find the start of the line that contains position p.
+let line_start = fn (s: string, p: i64) -> i64 do
+  if p <= 0 then return 0 end
+  let c = str.byte_at(s, idx: p - 1)
+  if c == '\n' then return p end
+  return line_start(s, p: p - 1)
+end
+
+// Skip past any comment (# to end of line) and the newline.
+let skip_comment_eol = fn (s: string, p: i64) -> i64 do
+  let p1 = skip_h(s, p)
+  if p1 >= len_of(s) then return p1 end
+  let c = str.byte_at(s, idx: p1)
+  if c == '#' then
+    let p2 = skip_to_eol(s, p: p1)
+    return skip_newline(s, p: p2)
+  end
+  if c == '\n' || c == '\r' then
+    return skip_newline(s, p: p1)
+  end
+  return p1
+end
+
+// Skip blank lines and comment-only lines. Returns position of first
+// non-blank, non-comment content.
+let skip_blank_lines = fn (s: string, p: i64) -> i64 do
+  let p1 = skip_h(s, p)
+  if p1 >= len_of(s) then return p1 end
+  let c = str.byte_at(s, idx: p1)
+  if c == '#' then
+    let p2 = skip_to_eol(s, p: p1)
+    let p3 = skip_newline(s, p: p2)
+    return skip_blank_lines(s, p: p3)
+  end
+  if c == '\n' || c == '\r' then
+    let p2 = skip_newline(s, p: p1)
+    return skip_blank_lines(s, p: p2)
+  end
+  return p1
+end
+
+// ─── Parser internal step types ─────────────────────────────────────────────
+
+type Step = Step(value: YamlValue, pos: i64)
+type StrStep = StrStep(value: string, pos: i64)
+type FieldStep = FieldStep(value: YamlField, pos: i64)
+type FieldsStep = FieldsStep(fields: [YamlField], pos: i64)
+type ItemsStep = ItemsStep(items: [YamlValue], pos: i64)
+
+// ─── Single-quoted scalar ───────────────────────────────────────────────────
+
+let parse_single_body = fn (s: string, p: i64, buf: %bb.ByteBuffer) -> StrStep throws { YamlThrow } do
+  if p >= len_of(s) then
+    bb.free(%buf)
+    throw YamlError(msg: "unterminated single-quoted scalar", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == '\'' then
+    if p + 1 < len_of(s) && str.byte_at(s, idx: p + 1) == '\'' then
+      let %buf1 = bb.push_string(%buf, s: "'")
+      return parse_single_body(s, p: p + 2, buf: %buf1)
+    end
+    let result = bb.to_string(&buf)
+    bb.free(%buf)
+    return StrStep(value: result, pos: p + 1)
+  end
+  if c == '\n' || c == '\r' then
+    let p2 = skip_newline(s, p)
+    let %buf1 = bb.push_string(%buf, s: " ")
+    return parse_single_body(s, p: p2, buf: %buf1)
+  end
+  let %buf1 = bb.push_string(%buf, s: str.byte_substring(s, start: p, len: 1))
+  return parse_single_body(s, p: p + 1, buf: %buf1)
+end
+
+let parse_single_quoted = fn (s: string, p: i64) -> StrStep throws { YamlThrow } do
+  let buf = bb.empty()
+  return parse_single_body(s, p: p + 1, %buf)
+end
+
+// ─── Double-quoted scalar ───────────────────────────────────────────────────
+
+let utf8_bytes_of = fn (code: i64) -> [i64] do
+  if code < 128 then return [code] end
+  if code < 2048 then
+    let b1 = 192 + (code / 64)
+    let b2 = 128 + (code - (code / 64) * 64)
+    return [b1, b2]
+  end
+  if code < 65536 then
+    let b1 = 224 + (code / 4096)
+    let mid = code / 64
+    let b2 = 128 + (mid - (mid / 64) * 64)
+    let b3 = 128 + (code - mid * 64)
+    return [b1, b2, b3]
+  end
+  if code < 1114112 then
+    let b1 = 240 + (code / 262144)
+    let mid_hi = code / 4096
+    let b2 = 128 + (mid_hi - (mid_hi / 64) * 64)
+    let mid_lo = code / 64
+    let b3 = 128 + (mid_lo - (mid_lo / 64) * 64)
+    let b4 = 128 + (code - mid_lo * 64)
+    return [b1, b2, b3, b4]
+  end
+  return []
+end
+
+let codepoint_to_utf8 = fn (code: i64) -> string do
+  if code < 0 then return "" end
+  let bytes = utf8_bytes_of(code)
+  match bytes do
+    | [] -> return ""
+    | _ :: _ ->
+      let %buf = bb.empty()
+      let %buf = bb.push_bytes(%buf, bytes)
+      let result = bb.to_string(&buf)
+      bb.free(%buf)
+      return result
+  end
+end
+
+type HexResult = HexOk(code: i64, end_pos: i64) | HexBad(pos: i64)
+
+let parse_hex_n = fn (s: string, p: i64, n: i64, acc: i64) -> HexResult do
+  if n == 0 then return HexOk(code: acc, end_pos: p) end
+  if p >= len_of(s) then return HexBad(pos: p) end
+  let c = str.byte_at(s, idx: p)
+  let hv = char.hex_digit_value(c)
+  if hv < 0 then return HexBad(pos: p) end
+  return parse_hex_n(s, p: p + 1, n: n - 1, acc: acc * 16 + hv)
+end
+
+let flush_chunk = fn (buf: %bb.ByteBuffer, s: string, start: i64, end_pos: i64) -> %bb.ByteBuffer do
+  let flen = end_pos - start
+  if flen <= 0 then return buf end
+  return bb.push_string(%buf, s: str.byte_substring(s, start, len: flen))
+end
+
+let parse_dq_body = fn (s: string, p: i64, run_start: i64, buf: %bb.ByteBuffer) -> StrStep throws { YamlThrow } do
+  if p >= len_of(s) then
+    bb.free(%buf)
+    throw YamlError(msg: "unterminated double-quoted scalar", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == '"' then
+    let %buf2 = flush_chunk(%buf, s, start: run_start, end_pos: p)
+    let result = bb.to_string(buf: &buf2)
+    bb.free(buf: %buf2)
+    return StrStep(value: result, pos: p + 1)
+  end
+  if c == '\\' then
+    let %buf2 = flush_chunk(%buf, s, start: run_start, end_pos: p)
+    return dq_escape(s, p: p + 1, buf: %buf2)
+  end
+  return parse_dq_body(s, p: p + 1, run_start, %buf)
+end
+
+let dq_escape = fn (s: string, p: i64, buf: %bb.ByteBuffer) -> StrStep throws { YamlThrow } do
+  if p >= len_of(s) then
+    bb.free(%buf)
+    throw YamlError(msg: "unterminated escape in double-quoted scalar", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == '"' then
+    let %b = bb.push_string(%buf, s: "\"")
+    return parse_dq_body(s, p: p + 1, run_start: p + 1, buf: %b)
+  end
+  if c == '\\' then
+    let %b = bb.push_string(%buf, s: "\\")
+    return parse_dq_body(s, p: p + 1, run_start: p + 1, buf: %b)
+  end
+  if c == '/' then
+    let %b = bb.push_string(%buf, s: "/")
+    return parse_dq_body(s, p: p + 1, run_start: p + 1, buf: %b)
+  end
+  if c == 'n' then
+    let %b = bb.push_string(%buf, s: "\n")
+    return parse_dq_body(s, p: p + 1, run_start: p + 1, buf: %b)
+  end
+  if c == 'r' then
+    let %b = bb.push_string(%buf, s: "\r")
+    return parse_dq_body(s, p: p + 1, run_start: p + 1, buf: %b)
+  end
+  if c == 't' then
+    let %b = bb.push_string(%buf, s: "\t")
+    return parse_dq_body(s, p: p + 1, run_start: p + 1, buf: %b)
+  end
+  if c == 'b' then
+    let %b = bb.push_byte(%buf, byte: 8)
+    return parse_dq_body(s, p: p + 1, run_start: p + 1, buf: %b)
+  end
+  if c == 'f' then
+    let %b = bb.push_byte(%buf, byte: 12)
+    return parse_dq_body(s, p: p + 1, run_start: p + 1, buf: %b)
+  end
+  if c == 'a' then
+    let %b = bb.push_byte(%buf, byte: 7)
+    return parse_dq_body(s, p: p + 1, run_start: p + 1, buf: %b)
+  end
+  if c == 'v' then
+    let %b = bb.push_byte(%buf, byte: 11)
+    return parse_dq_body(s, p: p + 1, run_start: p + 1, buf: %b)
+  end
+  if c == 'e' then
+    let %b = bb.push_byte(%buf, byte: 27)
+    return parse_dq_body(s, p: p + 1, run_start: p + 1, buf: %b)
+  end
+  if c == '0' then
+    let %b = bb.push_byte(%buf, byte: 0)
+    return parse_dq_body(s, p: p + 1, run_start: p + 1, buf: %b)
+  end
+  if c == 'x' then
+    match parse_hex_n(s, p: p + 1, n: 2, acc: 0) do
+      | HexBad(pos: q) ->
+        bb.free(%buf)
+        throw YamlError(msg: "invalid \\x escape (need 2 hex digits)", pos: q)
+      | HexOk(code, end_pos: q) ->
+        let encoded = codepoint_to_utf8(code)
+        let %b = bb.push_string(%buf, s: encoded)
+        return parse_dq_body(s, p: q, run_start: q, buf: %b)
+    end
+  end
+  if c == 'u' then
+    match parse_hex_n(s, p: p + 1, n: 4, acc: 0) do
+      | HexBad(pos: q) ->
+        bb.free(%buf)
+        throw YamlError(msg: "invalid \\u escape (need 4 hex digits)", pos: q)
+      | HexOk(code, end_pos: q) ->
+        let encoded = codepoint_to_utf8(code)
+        let %b = bb.push_string(%buf, s: encoded)
+        return parse_dq_body(s, p: q, run_start: q, buf: %b)
+    end
+  end
+  if c == 'U' then
+    match parse_hex_n(s, p: p + 1, n: 8, acc: 0) do
+      | HexBad(pos: q) ->
+        bb.free(%buf)
+        throw YamlError(msg: "invalid \\U escape (need 8 hex digits)", pos: q)
+      | HexOk(code, end_pos: q) ->
+        let encoded = codepoint_to_utf8(code)
+        let %b = bb.push_string(%buf, s: encoded)
+        return parse_dq_body(s, p: q, run_start: q, buf: %b)
+    end
+  end
+  if c == '\n' || c == '\r' then
+    let p2 = skip_newline(s, p)
+    let p3 = skip_h(s, p: p2)
+    return parse_dq_body(s, p: p3, run_start: p3, buf: %buf)
+  end
+  bb.free(%buf)
+  throw YamlError(msg: "invalid escape sequence in double-quoted scalar", pos: p - 1)
+end
+
+let parse_double_quoted = fn (s: string, p: i64) -> StrStep throws { YamlThrow } do
+  let buf = bb.empty()
+  return parse_dq_body(s, p: p + 1, run_start: p + 1, %buf)
+end
+
+// ─── Block scalars (literal | and folded >) ──────────────────────────────────
+
+type BlockHeader = BlockHeader(chomping: i64, indent_hint: i64)
+
+let parse_block_header = fn (s: string, p: i64) -> BlockHeader do
+  let c1 = peek(s, p)
+  if c1 == '-' then
+    let c2 = peek(s, p: p + 1)
+    let ih =
+      if c2 >= '1' && c2 <= '9' then
+        char.digit_value(c2)
+      else
+        0
+      end
+    return BlockHeader(chomping: -1, indent_hint: ih)
+  end
+  if c1 == '+' then
+    let c2 = peek(s, p: p + 1)
+    let ih =
+      if c2 >= '1' && c2 <= '9' then
+        char.digit_value(c2)
+      else
+        0
+      end
+    return BlockHeader(chomping: 1, indent_hint: ih)
+  end
+  if c1 >= '1' && c1 <= '9' then
+    let ih = char.digit_value(c1)
+    let c2 = peek(s, p: p + 1)
+    if c2 == '-' then return BlockHeader(chomping: -1, indent_hint: ih) end
+    if c2 == '+' then return BlockHeader(chomping: 1, indent_hint: ih) end
+    return BlockHeader(chomping: 0, indent_hint: ih)
+  end
+  return BlockHeader(chomping: 0, indent_hint: 0)
+end
+
+let rtrim = fn (s: string) -> string do
+  let n = len_of(s)
+  if n == 0 then return s end
+  let last_c = str.byte_at(s, idx: n - 1)
+  if last_c == ' ' || last_c == '\t' then
+    return rtrim(s: str.byte_substring(s, start: 0, len: n - 1))
+  end
+  return s
+end
+
+let count_trailing_empty = fn (lines: [string], cnt: i64) -> i64 do
+  match lines do
+    | [] -> return cnt
+    | line :: rest ->
+      let trimmed = rtrim(s: line)
+      if len_of(s: trimmed) == 0 then
+        return count_trailing_empty(lines: rest, cnt: cnt + 1)
+      end
+      return cnt
+  end
+end
+
+type LinesResult = LinesResult(lines: [string], pos: i64)
+
+let collect_block_lines = fn (s: string, p: i64, indent: i64) -> LinesResult do
+  let p1 = skip_blank_lines(s, p)
+  if p1 >= len_of(s) then return LinesResult(lines: [], pos: p1) end
+  let ls = line_start(s, p: p1)
+  let line_indent = measure_indent(s, p: ls)
+  if line_indent < indent then
+    return LinesResult(lines: [], pos: p)
+  end
+  let content_start = ls + indent
+  let eol = skip_to_eol(s, p: content_start)
+  let line = str.byte_substring(s, start: content_start, len: eol - content_start)
+  let p2 = skip_newline(s, p: eol)
+  let LinesResult(lines: rest, pos: p3) = collect_block_lines(s, p: p2, indent)
+  return LinesResult(lines: line :: rest, pos: p3)
+end
+
+let append_newlines = fn (buf: %bb.ByteBuffer, n: i64) -> %bb.ByteBuffer do
+  if n <= 0 then return buf end
+  let %b1 = bb.push_string(%buf, s: "\n")
+  return append_newlines(buf: %b1, n: n - 1)
+end
+
+let apply_chomping = fn (content: string, trailing_newlines: i64, chomping: i64) -> string do
+  if chomping == -1 then return content end
+  if chomping == 1 then
+    let buf = bb.empty()
+    let %buf1 = bb.push_string(%buf, s: content)
+    let %buf2 = append_newlines(buf: %buf1, n: trailing_newlines)
+    let result = bb.to_string(buf: &buf2)
+    bb.free(buf: %buf2)
+    return result
+  end
+  return content ++ "\n"
+end
+
+let join_lines_into = fn (buf: %bb.ByteBuffer, lines: [string], first: bool) -> %bb.ByteBuffer do
+  match lines do
+    | [] -> return buf
+    | line :: rest ->
+      let %b1 =
+        if first then
+          bb.push_string(%buf, s: line)
+        else
+          let %tmp = bb.push_string(%buf, s: "\n")
+          bb.push_string(buf: %tmp, s: line)
+        end
+      return join_lines_into(buf: %b1, lines: rest, first: false)
+  end
+end
+
+let join_block_lines = fn (lines: [string], chomping: i64) -> string do
+  let n_trailing = count_trailing_empty(lines: list.reverse(xs: lines), cnt: 0)
+  let total = list.length(xs: lines)
+  let content_count = total - n_trailing
+  if content_count <= 0 then
+    if chomping == 1 then
+      let buf = bb.empty()
+      let %b = append_newlines(buf: %buf, n: n_trailing)
+      let result = bb.to_string(buf: &b)
+      bb.free(buf: %b)
+      return result
+    end
+    return ""
+  end
+  let content_lines = list.take(xs: lines, n: content_count)
+  let buf = bb.empty()
+  let %buf1 = join_lines_into(%buf, lines: content_lines, first: true)
+  let content = bb.to_string(buf: &buf1)
+  bb.free(buf: %buf1)
+  return apply_chomping(content, trailing_newlines: n_trailing, chomping)
+end
+
+let fold_lines_into_sep = fn (buf: %bb.ByteBuffer, line: string) -> %bb.ByteBuffer do
+  let %tmp = bb.push_string(%buf, s: " ")
+  return bb.push_string(buf: %tmp, s: line)
+end
+
+let fold_lines_into = fn (buf: %bb.ByteBuffer, lines: [string], prev_blank: bool, first: bool) -> %bb.ByteBuffer do
+  match lines do
+    | [] -> return buf
+    | line :: rest ->
+      let trimmed_line = rtrim(s: line)
+      let is_blank = len_of(s: trimmed_line) == 0
+      let %b1 =
+        if first then
+          bb.push_string(%buf, s: line)
+        else if is_blank then
+          bb.push_string(%buf, s: "\n")
+        else if prev_blank then
+          bb.push_string(%buf, s: line)
+        else
+          fold_lines_into_sep(%buf, line)
+        end
+      return fold_lines_into(buf: %b1, lines: rest, prev_blank: is_blank, first: false)
+  end
+end
+
+let fold_lines = fn (lines: [string], chomping: i64) -> string do
+  let n_trailing = count_trailing_empty(lines: list.reverse(xs: lines), cnt: 0)
+  let total = list.length(xs: lines)
+  let content_count = total - n_trailing
+  if content_count <= 0 then
+    if chomping == 1 then
+      let buf = bb.empty()
+      let %b = append_newlines(buf: %buf, n: n_trailing)
+      let result = bb.to_string(buf: &b)
+      bb.free(buf: %b)
+      return result
+    end
+    return ""
+  end
+  let content_lines = list.take(xs: lines, n: content_count)
+  let buf = bb.empty()
+  let %buf1 = fold_lines_into(%buf, lines: content_lines, prev_blank: false, first: true)
+  let content = bb.to_string(buf: &buf1)
+  bb.free(buf: %buf1)
+  return apply_chomping(content, trailing_newlines: n_trailing, chomping)
+end
+
+let parse_block_scalar = fn (s: string, p: i64, is_folded: bool, current_indent: i64) -> StrStep throws { YamlThrow } do
+  let BlockHeader(chomping, indent_hint) = parse_block_header(s, p)
+  let eol = skip_to_eol(s, p)
+  let p2 = skip_newline(s, p: eol)
+  let block_indent =
+    if indent_hint > 0 then
+      current_indent + indent_hint
+    else
+      let p3 = skip_blank_lines(s, p: p2)
+      if p3 >= len_of(s) then
+        current_indent + 1
+      else
+        let ls = line_start(s, p: p3)
+        let det = measure_indent(s, p: ls)
+        if det > current_indent then det else current_indent + 1 end
+      end
+    end
+  let LinesResult(lines, pos: p4) = collect_block_lines(s, p: p2, indent: block_indent)
+  let content =
+    if is_folded then
+      fold_lines(lines, chomping)
+    else
+      join_block_lines(lines, chomping)
+    end
+  return StrStep(value: content, pos: p4)
+end
+
+// ─── Plain scalar ────────────────────────────────────────────────────────────
+
+let is_flow_indicator = fn (c: char) -> bool do
+  return c == '{' || c == '}' || c == '[' || c == ']' || c == ','
+end
+
+let scan_plain_to = fn (s: string, p: i64) -> i64 do
+  if p >= len_of(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == '\n' || c == '\r' || c == '\0' then return p end
+  if c == '#' then return p end
+  if is_flow_indicator(c) then return p end
+  if c == ':' then
+    let next = peek(s, p: p + 1)
+    if next == ' ' || next == '\t' || next == '\n' || next == '\r' || next == '\0' then
+      return p
+    end
+  end
+  return scan_plain_to(s, p: p + 1)
+end
+
+let parse_plain_scalar = fn (s: string, p: i64) -> StrStep do
+  let end_p = scan_plain_to(s, p)
+  let raw = rtrim(s: str.byte_substring(s, start: p, len: end_p - p))
+  return StrStep(value: raw, pos: end_p)
+end
+
+// ─── Flow parser ─────────────────────────────────────────────────────────────
+// parse_value_flow, parse_flow_seq_items, parse_flow_map_fields
+// are mutually recursive; Nexus resolves forward references lazily.
+
+let parse_flow_seq_items = fn (s: string, p: i64, acc: [YamlValue]) -> ItemsStep throws { YamlThrow } do
+  let p1 = skip_ws_all(s, p)
+  if p1 >= len_of(s) then
+    throw YamlError(msg: "unterminated flow sequence", pos: p1)
+  end
+  let c = str.byte_at(s, idx: p1)
+  if c == ']' then
+    return ItemsStep(items: list.reverse(xs: acc), pos: p1 + 1)
+  end
+  let Step(value: v, pos: p2) = parse_value_flow(s, p: p1)
+  let p3 = skip_ws_all(s, p: p2)
+  let next = peek(s, p: p3)
+  if next == ',' then
+    return parse_flow_seq_items(s, p: p3 + 1, acc: v :: acc)
+  end
+  if next == ']' then
+    return ItemsStep(items: list.reverse(xs: v :: acc), pos: p3 + 1)
+  end
+  throw YamlError(msg: "expected ',' or ']' in flow sequence", pos: p3)
+end
+
+let parse_flow_map_fields = fn (s: string, p: i64, acc: [YamlField]) -> FieldsStep throws { YamlThrow } do
+  let p1 = skip_ws_all(s, p)
+  if p1 >= len_of(s) then
+    throw YamlError(msg: "unterminated flow mapping", pos: p1)
+  end
+  let c = str.byte_at(s, idx: p1)
+  if c == '}' then
+    return FieldsStep(fields: list.reverse(xs: acc), pos: p1 + 1)
+  end
+  let Step(value: k, pos: p2) = parse_value_flow(s, p: p1)
+  let p3 = skip_ws_all(s, p: p2)
+  if peek(s, p: p3) != ':' then
+    throw YamlError(msg: "expected ':' in flow mapping", pos: p3)
+  end
+  let Step(value: v, pos: p4) = parse_value_flow(s, p: p3 + 1)
+  let entry = YamlField(key: k, value: v)
+  let p5 = skip_ws_all(s, p: p4)
+  let next = peek(s, p: p5)
+  if next == ',' then
+    return parse_flow_map_fields(s, p: p5 + 1, acc: entry :: acc)
+  end
+  if next == '}' then
+    return FieldsStep(fields: list.reverse(xs: entry :: acc), pos: p5 + 1)
+  end
+  throw YamlError(msg: "expected ',' or '}' in flow mapping", pos: p5)
+end
+
+let parse_value_flow = fn (s: string, p: i64) -> Step throws { YamlThrow } do
+  let p1 = skip_ws_all(s, p)
+  if p1 >= len_of(s) then
+    throw YamlError(msg: "unexpected end of input in flow value", pos: p1)
+  end
+  let c = str.byte_at(s, idx: p1)
+  if c == '[' then
+    let ItemsStep(items, pos: p2) = parse_flow_seq_items(s, p: p1 + 1, acc: [])
+    return Step(value: YamlSeq(items), pos: p2)
+  end
+  if c == '{' then
+    let FieldsStep(fields, pos: p2) = parse_flow_map_fields(s, p: p1 + 1, acc: [])
+    return Step(value: YamlMap(fields), pos: p2)
+  end
+  if c == '\'' then
+    let StrStep(value: sv, pos: p2) = parse_single_quoted(s, p: p1)
+    return Step(value: YamlString(val: sv), pos: p2)
+  end
+  if c == '"' then
+    let StrStep(value: sv, pos: p2) = parse_double_quoted(s, p: p1)
+    return Step(value: YamlString(val: sv), pos: p2)
+  end
+  let StrStep(value: raw, pos: p2) = parse_plain_scalar(s, p: p1)
+  return Step(value: infer_scalar(raw), pos: p2)
+end
+
+// ─── Block parser ────────────────────────────────────────────────────────────
+// parse_block_node, parse_block_seq_items, parse_block_map_fields
+// are mutually recursive; resolved lazily.
+
+let scan_plain_key = fn (s: string, p: i64) -> i64 do
+  if p >= len_of(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == '\n' || c == '\r' || c == '\0' then return p end
+  if c == '#' then return p end
+  if c == ':' then
+    let next = peek(s, p: p + 1)
+    if next == ' ' || next == '\t' || next == '\n' || next == '\r' || next == '\0' then
+      return p
+    end
+  end
+  return scan_plain_key(s, p: p + 1)
+end
+
+let is_seq_start = fn (s: string, p: i64, indent: i64) -> bool do
+  let p1 = skip_blank_lines(s, p)
+  if p1 >= len_of(s) then return false end
+  let ls = line_start(s, p: p1)
+  let line_ind = measure_indent(s, p: ls)
+  if line_ind != indent then return false end
+  if peek(s, p: p1) != '-' then return false end
+  let after = peek(s, p: p1 + 1)
+  return after == ' ' || after == '\t' || after == '\n' || after == '\r' || after == '\0'
+end
+
+let is_map_start = fn (s: string, p: i64, indent: i64) -> bool do
+  let p1 = skip_blank_lines(s, p)
+  if p1 >= len_of(s) then return false end
+  let ls = line_start(s, p: p1)
+  let line_ind = measure_indent(s, p: ls)
+  if line_ind != indent then return false end
+  let c = peek(s, p: p1)
+  // Flow collections { and [ are not block map starts.
+  // Quoted scalars ' and " are not block map starts either (they are values).
+  if c == '{' || c == '[' || c == '"' || c == '\'' then return false end
+  // Plain scalar key: scan to end of key, check for colon.
+  let key_end = scan_plain_key(s, p: p1)
+  if key_end <= p1 then return false end
+  let p2 = skip_h(s, p: key_end)
+  return peek(s, p: p2) == ':'
+end
+
+let parse_block_seq_items = fn (s: string, p: i64, indent: i64, acc: [YamlValue]) -> ItemsStep throws { YamlThrow } do
+  let p1 = skip_blank_lines(s, p)
+  if p1 >= len_of(s) then
+    return ItemsStep(items: list.reverse(xs: acc), pos: p1)
+  end
+  let ls = line_start(s, p: p1)
+  let line_ind = measure_indent(s, p: ls)
+  if line_ind != indent then
+    return ItemsStep(items: list.reverse(xs: acc), pos: p)
+  end
+  if peek(s, p: p1) != '-' then
+    return ItemsStep(items: list.reverse(xs: acc), pos: p)
+  end
+  let after_dash = p1 + 1
+  let after_c = peek(s, p: after_dash)
+  if after_c != ' ' && after_c != '\t' && after_c != '\n' && after_c != '\r' && after_c != '\0' then
+    return ItemsStep(items: list.reverse(xs: acc), pos: p)
+  end
+  let p2 = skip_h(s, p: after_dash)
+  let val_indent = indent + 2
+  let Step(value: v, pos: p3) = parse_block_node(s, p: p2, indent: val_indent)
+  return parse_block_seq_items(s, p: p3, indent, acc: v :: acc)
+end
+
+let parse_block_map_fields = fn (s: string, p: i64, indent: i64, acc: [YamlField]) -> FieldsStep throws { YamlThrow } do
+  let p1 = skip_blank_lines(s, p)
+  if p1 >= len_of(s) then
+    return FieldsStep(fields: list.reverse(xs: acc), pos: p1)
+  end
+  let ls = line_start(s, p: p1)
+  let line_ind = measure_indent(s, p: ls)
+  if line_ind != indent then
+    return FieldsStep(fields: list.reverse(xs: acc), pos: p)
+  end
+  let c = peek(s, p: p1)
+  if c == '\'' then
+    let StrStep(value: ks, pos: p2) = parse_single_quoted(s, p: p1)
+    let p3 = skip_h(s, p: p2)
+    if peek(s, p: p3) != ':' then
+      return FieldsStep(fields: list.reverse(xs: acc), pos: p)
+    end
+    let key = YamlString(val: ks)
+    let p4 = skip_h(s, p: p3 + 1)
+    let val_indent = indent + 2
+    let Step(value: v, pos: p5) = parse_block_node(s, p: p4, indent: val_indent)
+    let entry = YamlField(key, value: v)
+    return parse_block_map_fields(s, p: p5, indent, acc: entry :: acc)
+  end
+  if c == '"' then
+    let StrStep(value: ks, pos: p2) = parse_double_quoted(s, p: p1)
+    let p3 = skip_h(s, p: p2)
+    if peek(s, p: p3) != ':' then
+      return FieldsStep(fields: list.reverse(xs: acc), pos: p)
+    end
+    let key = YamlString(val: ks)
+    let p4 = skip_h(s, p: p3 + 1)
+    let val_indent = indent + 2
+    let Step(value: v, pos: p5) = parse_block_node(s, p: p4, indent: val_indent)
+    let entry = YamlField(key, value: v)
+    return parse_block_map_fields(s, p: p5, indent, acc: entry :: acc)
+  end
+  let key_end = scan_plain_key(s, p: p1)
+  if key_end <= p1 then
+    return FieldsStep(fields: list.reverse(xs: acc), pos: p)
+  end
+  let key_raw = rtrim(s: str.byte_substring(s, start: p1, len: key_end - p1))
+  let p2 = skip_h(s, p: key_end)
+  if peek(s, p: p2) != ':' then
+    return FieldsStep(fields: list.reverse(xs: acc), pos: p)
+  end
+  let key = infer_scalar(raw: key_raw)
+  let p3 = skip_h(s, p: p2 + 1)
+  let val_indent = indent + 2
+  let Step(value: v, pos: p4) = parse_block_node(s, p: p3, indent: val_indent)
+  let entry = YamlField(key, value: v)
+  return parse_block_map_fields(s, p: p4, indent, acc: entry :: acc)
+end
+
+let parse_block_node = fn (s: string, p: i64, indent: i64) -> Step throws { YamlThrow } do
+  let p1 = skip_h(s, p)
+  if p1 >= len_of(s) then return Step(value: YamlNull, pos: p1) end
+  let c = str.byte_at(s, idx: p1)
+  if c == '[' then
+    let ItemsStep(items, pos: p2) = parse_flow_seq_items(s, p: p1 + 1, acc: [])
+    return Step(value: YamlSeq(items), pos: p2)
+  end
+  if c == '{' then
+    let FieldsStep(fields, pos: p2) = parse_flow_map_fields(s, p: p1 + 1, acc: [])
+    return Step(value: YamlMap(fields), pos: p2)
+  end
+  if c == '|' then
+    let StrStep(value: sv, pos: p2) = parse_block_scalar(s, p: p1 + 1, is_folded: false, current_indent: indent - 2)
+    return Step(value: YamlString(val: sv), pos: p2)
+  end
+  if c == '>' then
+    let StrStep(value: sv, pos: p2) = parse_block_scalar(s, p: p1 + 1, is_folded: true, current_indent: indent - 2)
+    return Step(value: YamlString(val: sv), pos: p2)
+  end
+  if c == '\'' then
+    let StrStep(value: sv, pos: p2) = parse_single_quoted(s, p: p1)
+    let p3 = skip_comment_eol(s, p: p2)
+    return Step(value: YamlString(val: sv), pos: p3)
+  end
+  if c == '"' then
+    let StrStep(value: sv, pos: p2) = parse_double_quoted(s, p: p1)
+    let p3 = skip_comment_eol(s, p: p2)
+    return Step(value: YamlString(val: sv), pos: p3)
+  end
+  if c == '\n' || c == '\r' then
+    let p2 = skip_blank_lines(s, p: p1)
+    if p2 >= len_of(s) then return Step(value: YamlNull, pos: p2) end
+    if is_seq_start(s, p: p2, indent) then
+      let ItemsStep(items, pos: p3) = parse_block_seq_items(s, p: p2, indent, acc: [])
+      return Step(value: YamlSeq(items), pos: p3)
+    end
+    if is_map_start(s, p: p2, indent) then
+      let FieldsStep(fields, pos: p3) = parse_block_map_fields(s, p: p2, indent, acc: [])
+      return Step(value: YamlMap(fields), pos: p3)
+    end
+    let StrStep(value: raw, pos: p4) = parse_plain_scalar(s, p: p2)
+    let p5 = skip_comment_eol(s, p: p4)
+    return Step(value: infer_scalar(raw), pos: p5)
+  end
+  let StrStep(value: raw, pos: p2) = parse_plain_scalar(s, p: p1)
+  let p3 = skip_comment_eol(s, p: p2)
+  return Step(value: infer_scalar(raw), pos: p3)
+end
+
+// ─── Top-level parse ─────────────────────────────────────────────────────────
+
+/**
+Parse a YAML document. Raises YamlError on syntax errors. Phase 1: single-
+document only; anchors, aliases, and explicit tags are not supported.
+*/
+export let parse = fn (s: string) -> YamlValue throws { YamlThrow } do
+  let bom = "\xef\xbb\xbf"
+  let p_start =
+    if starts_with_at(s, p: 0, lit: bom) then 3 else 0 end
+  let p0 = skip_blank_lines(s, p: p_start)
+  let p1 =
+    if starts_with_at(s, p: p0, lit: "---") then
+      let p_after = p0 + 3
+      skip_comment_eol(s, p: p_after)
+    else
+      p0
+    end
+  let p2 = skip_blank_lines(s, p: p1)
+  if p2 >= len_of(s) then return YamlNull end
+  if is_seq_start(s, p: p2, indent: 0) then
+    let ItemsStep(items, pos: p3) = parse_block_seq_items(s, p: p2, indent: 0, acc: [])
+    let p4 = skip_blank_lines(s, p: p3)
+    if p4 < len_of(s) then
+      if !starts_with_at(s, p: p4, lit: "...") then
+        let ch = peek(s, p: p4)
+        if ch != '\0' then
+          throw YamlError(msg: "trailing content after YAML document", pos: p4)
+        end
+      end
+    end
+    return YamlSeq(items)
+  end
+  if is_map_start(s, p: p2, indent: 0) then
+    let FieldsStep(fields, pos: p3) = parse_block_map_fields(s, p: p2, indent: 0, acc: [])
+    let p4 = skip_blank_lines(s, p: p3)
+    if p4 < len_of(s) then
+      if !starts_with_at(s, p: p4, lit: "...") then
+        let ch = peek(s, p: p4)
+        if ch != '\0' then
+          throw YamlError(msg: "trailing content after YAML document", pos: p4)
+        end
+      end
+    end
+    return YamlMap(fields)
+  end
+  let Step(value: v, pos: p3) = parse_block_node(s, p: p2, indent: 0)
+  let p4 = skip_blank_lines(s, p: p3)
+  if p4 < len_of(s) then
+    if !starts_with_at(s, p: p4, lit: "...") then
+      let ch = peek(s, p: p4)
+      if ch != '\0' then
+        throw YamlError(msg: "trailing content after YAML document", pos: p4)
+      end
+    end
+  end
+  return v
+end
