@@ -1,0 +1,126 @@
+/**
+ * typecheck/linearity/diverge: divergence detection for the linearity walker.
+ *
+ * Determines whether a statement list or expression structurally exits on
+ * every path (return / throw). Used by the walker to skip linear-set
+ * reconciliation on branches that never reach the join point.
+ */
+
+import {
+  HirStmt, HirStmtKind,
+  HirExpr, HirExprKind, HirMatchCase
+} from "src/ir/hir/types.nx"
+import { Option, Some, None } from "std:option"
+
+// ─── Divergence detection ────────────────────────────────────────────────────
+
+/** True when `stmts` ends with a control-flow exit (return / throw). Used
+ *  to skip linear-set reconciliation on branches that never reach the join.
+ *
+ *  Recurses into:
+ *  - `StmtLetPattern` desugar form `Stmt::Expr(Match(scrutinee, [case]))`
+ *  where the single case body is the remainder of the original block —
+ *  so divergence of the desugared body is divergence of the wrapping
+ *  match's first case body.
+ *  - `if X then ... return ... else ... return ... end` lifted to an
+ *  expression: each branch must diverge.
+ *
+ *  Uses HIR depth as the recursion bound to keep the structural walk
+ *  terminating; the inlined helper is `stmts_diverge_depth` and the public
+ *  surface (`stmts_diverge`) seeds depth=64 — enough for typical desugar
+ *  nesting and a hard ceiling against pathological cycles.
+ */
+export let stmts_diverge = fn (stmts: [HirStmt]) -> bool do
+  return stmts_diverge_depth(stmts, depth: 64)
+end
+
+export let stmts_diverge_depth = fn (stmts: [HirStmt], depth: i64) -> bool do
+  if depth <= 0 then return false end
+  match last_stmt(stmts) do
+    | None -> return false
+    | Some(val: HirStmt(node: nd, span: _)) ->
+      match nd do
+        | Return(_) -> return true
+        | Expr(expr: HirExpr(node: en, span: _)) ->
+          return hir_expr_diverges(en, depth: depth - 1)
+        // spec[tail]: `let p = throw e'` is divergent —
+        // the bound name is unreachable. The same applies to a `let`
+        // whose RHS is itself a divergent expression (throw / match
+        // where every arm diverges / if where both branches diverge).
+        // Without this, downstream branch-arm divergence (then_diverges,
+        // all_cases_diverge_depth) sees an "ordinary let" and treats
+        // that arm as non-divergent — leading to a spurious
+        // "Linear mismatch across branches" or to a missed leak check.
+        | Let(name: _, sigil: _, typ: _, value: HirExpr(node: rhs, span: _)) ->
+          return hir_expr_diverges(rhs, depth: depth - 1)
+        | _ -> return false
+      end
+  end
+end
+
+/** True when a HirExprKind is structurally divergent: it raises, returns,
+ *  or every branch of a match/if it reduces to diverges. Shared between
+ *  `stmts_diverge_depth` (tail-of-block) and `Let(_, ..., value: <expr>)`
+ *  to apply the same rule for both `let p = throw e'` and bare `throw e'`.
+ */
+export let hir_expr_diverges = fn (en: HirExprKind, depth: i64) -> bool do
+  if depth <= 0 then return false end
+  match en do
+    | Raise(_) -> return true
+    | Match(target: _, cases: cs) -> return all_cases_diverge_depth(cases: cs, depth: depth - 1)
+    | If(cond: _, then_branch: tb, else_branch: eb) ->
+      match eb do
+        | None -> return false
+        | Some(val: ebs) -> return stmts_diverge_depth(stmts: tb, depth: depth - 1) && stmts_diverge_depth(stmts: ebs, depth: depth - 1)
+      end
+    | _ -> return false
+  end
+end
+
+export let all_cases_diverge_depth = fn (cases: [HirMatchCase], depth: i64) -> bool do
+  match cases do
+    | [] -> return true
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      if !stmts_diverge_depth(stmts: b, depth) then return false end
+      return all_cases_diverge_depth(cases: rest, depth)
+  end
+end
+
+let cases_kinds = fn (cases: [HirMatchCase]) -> string do
+  match cases do
+    | [] -> return ""
+    | HirMatchCase(pattern: _, body: b) :: [] -> return last_stmt_kind(stmts: b)
+    | HirMatchCase(pattern: _, body: b) :: rest -> return last_stmt_kind(stmts: b) ++ "," ++ cases_kinds(cases: rest)
+  end
+end
+
+export let last_stmt = fn (stmts: [HirStmt]) -> Option<HirStmt> do
+  match stmts do
+    | [] -> return None
+    | s :: [] -> return Some(val: s)
+    | _ :: rest -> return last_stmt(stmts: rest)
+  end
+end
+
+let last_stmt_kind = fn (stmts: [HirStmt]) -> string do
+  match last_stmt(stmts) do
+    | None -> return "empty"
+    | Some(val: HirStmt(node: nd, span: _)) ->
+      match nd do
+        | Let(_) -> return "Let"
+        | Expr(expr: HirExpr(node: en, span: _)) ->
+          match en do
+            | Raise(_) -> return "Expr(Raise)"
+            | Call(func: f, args: _) -> return "Expr(Call:" ++ f ++ ")"
+            | Match(target: _, cases: cs) ->
+              return "Expr(Match-cases=" ++ cases_kinds(cases: cs) ++ ")"
+            | If(_) -> return "Expr(If)"
+            | _ -> return "Expr(other)"
+          end
+        | Return(_) -> return "Return"
+        | Assign(_) -> return "Assign"
+        | Try(_) -> return "Try"
+        | Inject(_) -> return "Inject"
+      end
+  end
+end

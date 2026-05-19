@@ -1,0 +1,203 @@
+/**
+ * typecheck/linearity/pattern: pattern-binding helpers for the linearity walker.
+ *
+ * Binds linear-tracked names introduced by HIR patterns (PVar/PCtor/PRec/POr)
+ * into LinState. The match-case branch-consistency loop (check_match_cases_go)
+ * lives in walk.nx because it needs to call back into check_stmts.
+ */
+
+import {
+  RecordDef, EnumDef, VariantField,
+  Sigil, SigilLinear, SigilLazy
+} from "src/common/ast.nx"
+import {
+  HirExpr, HirExprKind,
+  HirPatternKind, HirPatternField, HirRecordPatField
+} from "src/ir/hir/types.nx"
+import {
+  TypeError
+} from "src/typecheck/errors.nx"
+import { Option, Some, None } from "std:option"
+import {
+  is_linear_binding_type
+} from "src/ir/shared/type_pred.nx"
+import {
+  LinState,
+  lin_add, lin_member
+} from "src/typecheck/linearity/state.nx"
+import {
+  lin_field_is_linear, lin_variant_is_known, lin_any_record_has_linear_field,
+  lin_variant_field_type_at
+} from "src/typecheck/linearity/predicates.nx"
+
+// ─── Scrutinee-linearity probe ────────────────────────────────────────────────
+
+/** True when `target` is a variable expression that is currently live in
+ *  the linear state — i.e., the scrutinee is a linear binding. Used to
+ *  propagate scrutinee linearity into P-Var pattern bindings (spec P-Var:
+ *  q = 1 if linear(τ) else ω). */
+export let is_linear_scrutinee = fn (target: HirExpr, st: LinState) -> bool do
+  let HirExpr(node: n, span: _) = target
+  match n do
+    | Variable(name: v, sigil: _) -> return lin_member(st, name: v)
+    | _ -> return false
+  end
+end
+
+// ─── Pattern binding ─────────────────────────────────────────────────────────
+
+/** Add linear-tracked names introduced by `pat` to `st`.
+ *  `scrutinee_linear` — true when the match scrutinee is itself a linear
+ *  binding (i.e., was live in LinState before match evaluation). When true,
+ *  a plain `PVar` (sigil ω / immutable) still introduces a linear binding
+ *  because it receives ownership of a linear value (spec P-Var: q = 1 if
+ *  linear(τ) else ω). Nested patterns inside PCtor/PRec do NOT inherit this
+ *  flag — their declared field types govern linearity independently via
+ *  `bind_pattern_fields` / `bind_pattern_rec_fields`. */
+export let bind_pattern_linear = fn (
+  pat: HirPatternKind, st: LinState, scrutinee_linear: bool,
+  tdefs: [RecordDef], enum_defs: [EnumDef]
+) -> LinState throws { TypeError } do
+  match pat do
+    | PLit(_) | PWild -> return st
+    | PVar(name: n, sigil: s) ->
+      // P-Var: q = 1 if linear(τ) else ω.
+      // Approximate linear(τ) via sigil (SigilLinear/SigilLazy) OR
+      // scrutinee_linear (the match scrutinee was a live linear variable, or
+      // the enclosing field's declared type is linear).
+      match s do
+        | SigilLinear | SigilLazy -> return lin_add(st, name: n)
+        | _ ->
+          if scrutinee_linear then return lin_add(st, name: n) end
+          return st
+      end
+    | PCtor(variant: v, fields: fs, sigil: _) ->
+      // For each field, determine if its declared type is linear using
+      // lin_field_is_linear_in_variant (direct flat lookup). When the
+      // variant is not found in enum_defs, fall back to scrutinee_linear.
+      return bind_pattern_fields_for_variant(fields: fs, st, variant: v, tdefs, enum_defs, fallback_linear: scrutinee_linear)
+    | PRec(fields: fs, is_partial: _) ->
+      return bind_pattern_rec_fields(fields: fs, st, tdefs, enum_defs)
+    | POr(alts) -> return bind_pattern_or(alts, st, scrutinee_linear, tdefs, enum_defs)
+  end
+end
+
+/** Walk PCtor pattern fields, consulting `variant_fields` (the declared
+ *  VariantField list for the matched constructor) to determine per-field
+ *  linearity. When a field's declared type satisfies `is_linear_binding_type`,
+ *  the bound variable is linear regardless of whether it carries a `%` sigil
+ *  in the pattern (spec P-Var: q = 1 if linear(τ) else ω).
+ */
+export let bind_pattern_fields = fn (
+  fields: [HirPatternField], st: LinState,
+  variant_fields: Option<[VariantField]>,
+  fallback_linear: bool,
+  tdefs: [RecordDef], enum_defs: [EnumDef]
+) -> LinState throws { TypeError } do
+  match fields do
+    | [] -> return st
+    | HirPatternField(name: fname, pattern: p) :: rest ->
+      // Determine if the declared type of this field is linear.
+      // When variant_fields is None (lookup failed), fall back to fallback_linear.
+      let field_linear_from_type = lin_pattern_field_is_linear(
+        variant_fields, fname, idx: 0, tdefs
+      )
+      let field_linear = if field_linear_from_type then true else fallback_linear end
+      let st1 = bind_pattern_linear(pat: p, st, scrutinee_linear: field_linear, tdefs, enum_defs)
+      // Advance variant_fields by one position for positional matching.
+      let rest_vfields = lin_drop_first_vfield(variant_fields)
+      return bind_pattern_fields(fields: rest, st: st1, variant_fields: rest_vfields, fallback_linear, tdefs, enum_defs)
+  end
+end
+
+/** Walk PCtor fields using lin_field_is_linear_in_variant for per-field
+ *  linearity — avoids the Option<[VariantField]> nesting and uses a simpler
+ *  flat direct lookup. When the variant is unknown in enum_defs, falls back
+ *  to fallback_linear (typically scrutinee_linear) for each field.
+ */
+export let bind_pattern_fields_for_variant = fn (
+  fields: [HirPatternField], st: LinState,
+  variant: string, tdefs: [RecordDef], enum_defs: [EnumDef],
+  fallback_linear: bool
+) -> LinState throws { TypeError } do
+  match fields do
+    | [] -> return st
+    | HirPatternField(name: fname, pattern: p) :: rest ->
+      // For named fields, use the direct named lookup. When the variant is
+      // known in enum_defs, use per-field type linearity (authoritative).
+      // When the variant is not found (unknown type) or the field is unnamed
+      // (positional), fall back to fallback_linear (conservative: e.g.
+      // scrutinee_linear).
+      let field_linear = match fname do
+        | None -> fallback_linear
+        | Some(val: fstr) ->
+          if lin_variant_is_known(defs: enum_defs, variant) then
+            lin_field_is_linear(defs: enum_defs, variant, fname: fstr, tdefs)
+          else
+            fallback_linear
+          end
+      end
+      let st1 = bind_pattern_linear(pat: p, st, scrutinee_linear: field_linear, tdefs, enum_defs)
+      return bind_pattern_fields_for_variant(fields: rest, st: st1, variant, tdefs, enum_defs, fallback_linear)
+  end
+end
+
+/** True when the variant field at the current head (positional or by name
+ *  `fname`) has a linear declared type. Returns false when variant_fields is
+ *  None (unknown type) or empty.
+ */
+export let lin_pattern_field_is_linear = fn (
+  variant_fields: Option<[VariantField]>, fname: Option<string>, idx: i64, tdefs: [RecordDef]
+) -> bool do
+  match variant_fields do
+    | None -> return false
+    | Some(val: vfs) ->
+      match lin_variant_field_type_at(variant_fields: vfs, fname, idx: 0) do
+        | None -> return false
+        | Some(val: ft) -> return is_linear_binding_type(ft, tdefs)
+      end
+  end
+end
+
+/** Drop the first element from an Option<[VariantField]>, advancing the
+ *  positional cursor used by bind_pattern_fields.
+ */
+export let lin_drop_first_vfield = fn (variant_fields: Option<[VariantField]>) -> Option<[VariantField]> do
+  match variant_fields do
+    | None -> return None
+    | Some(val: vfs) ->
+      match vfs do
+        | [] -> return Some(val: [])
+        | _ :: rest -> return Some(val: rest)
+      end
+  end
+end
+
+/** Walk PRec pattern fields, consulting `tdefs` (all RecordDef definitions)
+ *  to determine per-field linearity by field name. When any record type has
+ *  a field with that name whose declared type satisfies `is_linear_binding_type`,
+ *  the bound variable is treated as linear (conservative: any match wins).
+ */
+export let bind_pattern_rec_fields = fn (
+  fields: [HirRecordPatField], st: LinState, tdefs: [RecordDef], enum_defs: [EnumDef]
+) -> LinState throws { TypeError } do
+  match fields do
+    | [] -> return st
+    | HirRecordPatField(name: fname, pattern: p) :: rest ->
+      let field_linear = lin_any_record_has_linear_field(tdefs, fname)
+      let st1 = bind_pattern_linear(pat: p, st, scrutinee_linear: field_linear, tdefs, enum_defs)
+      return bind_pattern_rec_fields(fields: rest, st: st1, tdefs, enum_defs)
+  end
+end
+
+export let bind_pattern_or = fn (
+  alts: [HirPatternKind], st: LinState, scrutinee_linear: bool,
+  tdefs: [RecordDef], enum_defs: [EnumDef]
+) -> LinState throws { TypeError } do
+  // Or-patterns require all alternatives to bind the same linear-name set.
+  // Use the first alt as the canonical binder set.
+  match alts do
+    | [] -> return st
+    | a :: _ -> return bind_pattern_linear(pat: a, st, scrutinee_linear, tdefs, enum_defs)
+  end
+end
