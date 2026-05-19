@@ -10,8 +10,9 @@
  *
  * **Sequential path (default, WASI p3 compatible):**
  * `lazy_spawn` allocates the task, forces the closure immediately, stores
- * the result, and marks ready=1. `lazy_join` reads the pre-computed result
- * without blocking. No shared memory or atomic wait/notify required.
+ * the result, and marks ready=1. `lazy_join` does a SC atomic spin-wait on
+ * the ready flag (resolved on the first check) then reads the result via
+ * paired SC atomic i32 loads. No shared memory or thread-spawn required.
  *
  * **Threads path (`wasi_thread_start` export, for WASI preview2 + threads):**
  * The `wasi_thread_start` export is retained for compatibility with
@@ -57,7 +58,8 @@ import * as cast from "std:runtime/cast"
 Spawn `a_thunk` — sequential phase 1 implementation: forces the thunk
 immediately, stores the result in a 24-byte task struct on the arena, and
 marks the task ready. Returns the task pointer. No OS thread is created;
-`lazy_join` reads the pre-computed result instantly.
+`lazy_join`'s SC atomic ready-flag check returns on the first iteration
+since the flag is already 1.
 
 This is compatible with both WASI preview2 and preview3 since it does not
 import `wasi.thread-spawn` or use shared memory atomics for synchronisation.
@@ -73,12 +75,51 @@ export let lazy_spawn = fn <T>(a_thunk: @T) -> i64 do
   return t
 end
 
+/**
+Spin-wait until the ready flag at `a_task + 0` reads 1 (SC atomic load).
+In sequential mode the flag is already 1 so this returns on the first
+iteration.  In the thread path the WASM SC total-order guarantees that once
+we observe `ready == 1` we also observe the two SC atomic i32 result stores
+at `a_task + 8` and `a_task + 12` that `lazy_run_task` issued before it
+stored the flag.
+*/
+let lazy_wait_ready = fn (a_task: i64) -> unit do
+  if atomic.load_i32(addr: a_task) == 0 then
+    return lazy_wait_ready(a_task)
+  end
+  return ()
+end
+
 /** Wait for `a_task` to complete and return its forced value.
- *  In sequential mode, ready is always 1 at this point so no blocking occurs.
+ *
+ * Synchronisation protocol (mirrors `lazy_run_task`'s write side):
+ *
+ * 1. Spin-wait on the SC atomic ready flag at `a_task + 0` until it reads 1
+ *    (via `lazy_wait_ready`).  In sequential mode (`lazy_spawn`) this is
+ *    satisfied on the first check; in the thread path the SC total order
+ *    guarantees that once `ready == 1` is observed we also observe both SC
+ *    atomic i32 stores at `a_task + 8` and `a_task + 12`.
+ *
+ * 2. Read the 64-bit result via two SC atomic i32 loads (low half at `a_task
+ *    + 8`, high half at `a_task + 12`) and reconstruct the i64.  A plain
+ *    non-atomic `mem.load_i64` would NOT participate in the SC synchronises-
+ *    with relation established by `lazy_run_task`'s SC stores and would be
+ *    a data race on any shared-memory build (nexus-m1vu).
+ *
+ * Reconstructed value: `(hi << 32) | lo` where `lo` and `hi` are the
+ * zero-extended i32 values returned by the SC atomic loads.
  */
 export let lazy_join = fn <T>(a_task: i64) -> T do
-  // ready is already 1 (set by lazy_spawn); no wait needed.
-  return value_of_i64(a_x: mem.load_i64(addr: a_task + 8))
+  // Step 1: wait until ready == 1 (SC atomic load; no-op in sequential mode).
+  let _ = lazy_wait_ready(a_task)
+  // Step 2: read the result via two SC atomic i32 loads — matching
+  // `lazy_run_task`'s paired SC i32 stores — then reassemble the i64.
+  // Using non-atomic mem.load_i64 here would be a data race on any
+  // shared-memory build: it does not participate in the SC synchronises-with
+  // relation established by the SC stores in lazy_run_task.
+  let lo = atomic.load_i32(addr: a_task + 8)
+  let hi = atomic.load_i32(addr: a_task + 12)
+  return value_of_i64(a_x: lo | (hi << 32))
 end
 
 /**
@@ -107,12 +148,10 @@ export let lazy_run_task = fn (a_task: i64) -> unit do
   // the upper 32 bits of `r >> 32`, but i32.wrap_i64 discards them anyway,
   // so the correct 32-bit high half is stored regardless.
   //
-  // `lazy_join` reads t+8 via `mem.load_i64` (non-atomic); that is safe only
-  // if the join is called AFTER the ready flag is observed (which
-  // `lazy_spawn` guarantees by forcing inline before marking ready, and the
-  // thread path guarantees by atomic.wait32 on the flag).  A future
-  // re-enable of true parallel joins will need an atomic i64 load; tracked
-  // separately in bd nexus-5p31.
+  // `lazy_join` reads t+8 and t+12 via two SC atomic i32 loads (matching
+  // these SC stores) and waits on the ready flag before reading.  The SC
+  // total order guarantees that any thread observing `ready==1` also
+  // observes both result halves stored here (nexus-m1vu fix).
   let _ = atomic.store_i32(addr: a_task + 8, val: r)
   let _ = atomic.store_i32(addr: a_task + 12, val: r >> 32)
   let _ = atomic.store_i32(addr: a_task, val: 1)
