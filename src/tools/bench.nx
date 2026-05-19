@@ -1,0 +1,497 @@
+/**
+ * bench: `nexus bench [--dir DIR] [--iters N] [--baseline PATH]` driver.
+ *
+ * Discovers `bench_*.nx` files under a directory (default
+ * `examples/feature/`), compiles each via `nexus build`, runs the resulting
+ * wasm `iters` times (default 5), and reports per-bench statistics.
+ *
+ * Each bench file must print a single integer (milliseconds) to stdout as its
+ * last output line.  The runner reads that line, collects N samples, and
+ * computes median and p95.
+ *
+ * Output (NDJSON, one JSON object per line to stdout):
+ *   {"name":"arith","median_ms":42,"p95_ms":45,"iters":5}
+ *
+ * Exit code:
+ *   0 — all benches ran (and baseline check passed if --baseline was given)
+ *   1 — at least one bench failed to compile or run
+ *   2 — invalid CLI usage
+ *   3 — --baseline drift gate: at least one bench exceeded ±20% of baseline
+ *
+ * WASI threads note: bench files that use parallel thunks are inherently noisy
+ * across hardware with different core counts.  bench_*.nx files in the suite
+ * use sequential code only; WASI-parallel benches should live in a separate
+ * bench_parallel_*.nx prefix excluded from this discovery.
+ *
+ * TODO (nexus-g0h5 Phase 2): add a `bench-perf` CI job that runs this
+ * subcommand and gates on --baseline bench-baseline.json.
+ */
+
+import { Console } from "std:stdio"
+import { Fs, FileNotFound, WriteError, FsThrow } from "std:fs"
+import { Clock } from "std:clock"
+import { Proc, ExecResult } from "std:proc"
+import * as str from "std:str"
+import { Option, Some, None } from "std:option"
+import * as list from "std:list"
+import * as json from "std:json"
+import { JsonValue, JsonInt, JsonFloat, JsonString, JsonArray, JsonObject, JsonField, JsonNull, JsonBool } from "std:json"
+import { InvalidUsage, DriverError } from "src/common/error.nx"
+import {
+  ArgSpec, SubcommandHit,
+  spec_flag, spec_opt, spec_positional,
+  parse, get_flag, get_opt, get_positionals_all, is_ok, first_error,
+  detect_subcommand
+} from "std:argparse"
+
+
+/** Detection result for the `bench` subcommand. */
+export type ParsedBenchSubcommand = ParsedBenchSubcommand(remaining: [string], is_bench: bool)
+
+/** Detect a leading `bench` subcommand. Thin wrapper over argparse's shared
+ *  `detect_subcommand` primitive — same shape as test/lint/fmt. */
+export let strip_bench_subcommand = fn (xs: [string]) -> ParsedBenchSubcommand do
+  match detect_subcommand(args: xs, kw: "bench") do | SubcommandHit(present, remaining) ->
+    if present then return ParsedBenchSubcommand(remaining, is_bench: true) end
+    return ParsedBenchSubcommand(remaining: xs, is_bench: false)
+  end
+end
+
+
+/** Parsed CLI options for the `bench` subcommand. */
+export type BenchOptions = BenchOptions(
+  dir: string,
+  iters: i64,
+  nexus_bin: string,
+  wasmtime_bin: string,
+  baseline_path: Option<string>
+)
+
+let bench_specs = fn () -> [ArgSpec] do
+  return [
+    spec_opt(name: "dir", short: "", long: "--dir", required: false, help: "bench discovery directory (default: examples/feature/)"),
+    spec_opt(name: "iters", short: "", long: "--iters", required: false, help: "number of iterations per bench (default: 5)"),
+    spec_opt(name: "nexus-bin", short: "", long: "--nexus-bin", required: false, help: "host nexus binary path"),
+    spec_opt(name: "wasmtime-bin", short: "", long: "--wasmtime-bin", required: false, help: "wasmtime binary path"),
+    spec_opt(name: "baseline", short: "", long: "--baseline", required: false, help: "path to baseline JSON; fail if any bench drifts more than ±20%"),
+  ]
+end
+
+let parse_bench_options = fn (args: [string]) -> BenchOptions throws { InvalidUsage } do
+  let result = parse(args, specs: bench_specs())
+  if !is_ok(result) then
+    throw InvalidUsage(detail: "nexus bench: " ++ first_error(result))
+  end
+  let dir = match get_opt(result, name: "dir") do
+    | Some(val: v) -> v
+    | None -> "examples/feature/"
+  end
+  let iters = match get_opt(result, name: "iters") do
+    | Some(val: v) ->
+      match str.parse_i64(v) do
+        | Some(val: n) -> if n < 1 then 5 else n end
+        | None -> throw InvalidUsage(detail: "nexus bench: --iters must be a positive integer")
+      end
+    | None -> 5
+  end
+  let nexus_bin = match get_opt(result, name: "nexus-bin") do
+    | Some(val: v) -> v
+    | None -> "nexus"
+  end
+  let wasmtime_bin = match get_opt(result, name: "wasmtime-bin") do
+    | Some(val: v) -> v
+    | None -> "wasmtime"
+  end
+  let baseline = get_opt(result, name: "baseline")
+  return BenchOptions(dir, iters, nexus_bin, wasmtime_bin, baseline_path: baseline)
+end
+
+
+/** Per-bench result. */
+type BenchResult =
+    BenchOk(name: string, median_ms: i64, p95_ms: i64, iters: i64)
+  | BenchFail(name: string, stage: string, detail: string)
+
+
+/** Strip trailing slash from a directory path. */
+let strip_slash = fn (s: string) -> string do
+  let n = str.length(s)
+  if n == 0 then return s end
+  if str.ends_with(s, suffix: "/") then
+    return str.substring(s, start: 0, len: n - 1)
+  end
+  return s
+end
+
+/** Derive a bench name from a file path like `examples/feature/bench_arith.nx`.
+ *  Returns the stem after the last `/bench_` and before `.nx`. */
+let bench_name_of = fn (path: string) -> string do
+  let base = last_component(path)
+  // strip "bench_" prefix
+  let stem = if str.starts_with(s: base, prefix: "bench_") then
+    str.substring(base, start: 6, len: str.length(base) - 6)
+  else base end
+  // strip ".nx" suffix
+  let n = str.length(stem)
+  if str.ends_with(s: stem, suffix: ".nx") then
+    return str.substring(stem, start: 0, len: n - 3)
+  end
+  return stem
+end
+
+let last_component = fn (path: string) -> string do
+  let idx = last_slash_idx(s: path, i: str.length(path) - 1)
+  if idx < 0 then return path end
+  return str.substring(path, start: idx + 1, len: str.length(path) - idx - 1)
+end
+
+let last_slash_idx = fn (s: string, i: i64) -> i64 do
+  if i < 0 then return -1 end
+  if str.byte_at(s, idx: i) == '/' then return i end
+  return last_slash_idx(s, i: i - 1)
+end
+
+
+/** Discover `bench_*.nx` files directly in `dir` (not recursive).
+ *  Returns them in sorted order (Fs.list_dir is already sorted). */
+let discover_benches = fn (dir: string) -> [string] require { Fs } throws { InvalidUsage, FileNotFound } do
+  if Fs.exists(dir) == false then
+    throw InvalidUsage(detail: "nexus bench: directory not found: " ++ dir)
+  end
+  let names = Fs.list_dir(dir)
+  return collect_bench_files(names, dir: strip_slash(s: dir), acc: [])
+end
+
+let collect_bench_files = fn (names: [string], dir: string, acc: [string]) -> [string] do
+  match names do
+    | [] -> return list.reverse(xs: acc)
+    | name :: rest ->
+      if str.starts_with(s: name, prefix: "bench_") && str.ends_with(s: name, suffix: ".nx") then
+        return collect_bench_files(names: rest, dir, acc: (dir ++ "/" ++ name) :: acc)
+      end
+      return collect_bench_files(names: rest, dir, acc)
+  end
+end
+
+
+/** wasmtime flags for running a bench wasm. */
+let bench_wasmtime_flags = fn (wasm_path: string) -> [string] do
+  return [
+    "run",
+    "-W", "tail-call=y,exceptions=y,function-references=y,stack-switching=y,max-memory-size=8589934592",
+    "--dir=.",
+    "--dir=/tmp",
+    wasm_path
+  ]
+end
+
+/** Run a single bench file through compile + N iterations.
+ *  Returns BenchOk with stats or BenchFail with a human-readable detail. */
+let run_one_bench = fn (file: string, opts: BenchOptions, tmp_wasm: string) -> BenchResult require { Clock, Console, Proc } do
+  let BenchOptions(nexus_bin: nexus_bin, wasmtime_bin: wasmtime_bin, iters: n_iters, _) = opts
+  let name = bench_name_of(file)
+  // Compile phase
+  let compile_args = ["build", file, "-o", tmp_wasm, "--explain-capabilities", "none"]
+  let compile = Proc.exec(cmd: nexus_bin, args: compile_args)
+  match compile do | ExecResult(exit_code: ce, stdout: _, stderr: cerr) ->
+    if ce != 0 then
+      return BenchFail(name, stage: "compile", detail: tail_lines(s: cerr, n: 6))
+    end
+  end
+  // Run phase: collect n_iters samples
+  let samples = collect_samples(name, tmp_wasm, wasmtime_bin, n: n_iters, acc: [])
+  match samples do
+    | SamplesOk(vals) ->
+      let sorted = sort_i64(xs: vals)
+      let median = percentile(xs: sorted, pct: 50)
+      let p95 = percentile(xs: sorted, pct: 95)
+      return BenchOk(name, median_ms: median, p95_ms: p95, iters: n_iters)
+    | SamplesFail(detail: d) ->
+      return BenchFail(name, stage: "run", detail: d)
+  end
+end
+
+type SamplesResult = SamplesOk(vals: [i64]) | SamplesFail(detail: string)
+
+let collect_samples = fn (name: string, tmp_wasm: string, wasmtime_bin: string, n: i64, acc: [i64]) -> SamplesResult require { Proc } do
+  if n <= 0 then return SamplesOk(vals: list.reverse(xs: acc)) end
+  let run_args = bench_wasmtime_flags(wasm_path: tmp_wasm)
+  let run = Proc.exec(cmd: wasmtime_bin, args: run_args)
+  match run do | ExecResult(exit_code: re, stdout: rout, stderr: rerr) ->
+    if re != 0 then
+      return SamplesFail(detail: tail_lines(s: rerr, n: 6))
+    end
+    let ms = parse_last_line_i64(s: rout)
+    match ms do
+      | Some(val: v) ->
+        return collect_samples(name, tmp_wasm, wasmtime_bin, n: n - 1, acc: v :: acc)
+      | None ->
+        return SamplesFail(detail: "bench stdout did not end with an integer (got: " ++ rout ++ ")")
+    end
+  end
+end
+
+/** Parse the last non-empty line of `s` as an i64. */
+let parse_last_line_i64 = fn (s: string) -> Option<i64> do
+  let lines = str.split(s, sep: "\n")
+  let trimmed = filter_nonempty(xs: lines, acc: [])
+  match list.reverse(xs: trimmed) do
+    | [] -> return None
+    | last :: _ -> return str.parse_i64(s: str.trim(s: last))
+  end
+end
+
+let filter_nonempty = fn (xs: [string], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | x :: rest ->
+      let t = str.trim(x)
+      if str.length(t) == 0 then
+        return filter_nonempty(xs: rest, acc)
+      end
+      return filter_nonempty(xs: rest, acc: t :: acc)
+  end
+end
+
+let tail_lines = fn (s: string, n: i64) -> string do
+  let lines = str.split(s, sep: "\n")
+  let total = list.length(xs: lines)
+  if total <= n then return s end
+  let dropped = list.drop_n(xs: lines, n: total - n)
+  return str.join(xs: dropped, sep: "\n")
+end
+
+
+/** Insertion sort for a short sample list (N=5 typical). */
+let sort_i64 = fn (xs: [i64]) -> [i64] do
+  match xs do
+    | [] -> return []
+    | x :: rest -> return insert_sorted(x, into: sort_i64(xs: rest))
+  end
+end
+
+let insert_sorted = fn (x: i64, into: [i64]) -> [i64] do
+  match into do
+    | [] -> return [x]
+    | h :: t ->
+      if x <= h then return x :: h :: t
+      else return h :: insert_sorted(x, into: t)
+      end
+  end
+end
+
+/** Compute a percentile index into a sorted list (0-indexed). */
+let percentile = fn (xs: [i64], pct: i64) -> i64 do
+  let n = list.length(xs)
+  if n == 0 then return 0 end
+  let idx = (n * pct) / 100
+  let clamped = if idx >= n then n - 1 else idx end
+  return list_nth(xs, n: clamped)
+end
+
+let list_nth = fn (xs: [i64], n: i64) -> i64 do
+  match xs do
+    | [] -> return 0
+    | x :: rest ->
+      if n <= 0 then return x
+      else return list_nth(xs: rest, n: n - 1)
+      end
+  end
+end
+
+
+/** Serialise one BenchOk result as a JSON object. */
+let result_to_json = fn (r: BenchResult) -> string do
+  match r do
+    | BenchOk(name, median_ms, p95_ms, iters) ->
+      return "{\"name\":\"" ++ json_escape(s: name) ++ "\","
+        ++ "\"median_ms\":" ++ str.from_i64(val: median_ms) ++ ","
+        ++ "\"p95_ms\":" ++ str.from_i64(val: p95_ms) ++ ","
+        ++ "\"iters\":" ++ str.from_i64(val: iters) ++ "}"
+    | BenchFail(name, stage, detail) ->
+      let err_str = stage ++ ": " ++ detail
+      return "{\"name\":\"" ++ json_escape(s: name) ++ "\","
+        ++ "\"error\":\"" ++ json_escape(s: err_str) ++ "\"}"
+  end
+end
+
+let json_escape = fn (s: string) -> string do
+  let s1 = str.replace(s, from_str: "\\", to_str: "\\\\")
+  let s2 = str.replace(s: s1, from_str: "\"", to_str: "\\\"")
+  let s3 = str.replace(s: s2, from_str: "\n", to_str: "\\n")
+  return str.replace(s: s3, from_str: "\r", to_str: "\\r")
+end
+
+
+/** Parse baseline JSON and extract the array items. Returns None on parse failure. */
+let parse_baseline_items = fn (src: string) -> Option<[JsonValue]> do
+  let v = try_parse_json(src)
+  match v do
+    | None -> return None
+    | Some(val: jv) ->
+      match jv do
+        | JsonArray(items: xs) -> return Some(val: xs)
+        | _ -> return None
+      end
+  end
+end
+
+let try_parse_json = fn (src: string) -> Option<JsonValue> do
+  try
+    let v = json.parse(s: src)
+    return Some(val: v)
+  catch _ ->
+    return None
+  end
+end
+
+/** Check a list of BenchOk results against a baseline JSON file.
+ *
+ *  The baseline JSON is an array of objects with the same shape as the NDJSON
+ *  output: `[{"name":"arith","median_ms":42,...}, ...]`.
+ *
+ *  Returns the number of drift violations (0 = pass). */
+let check_baseline = fn (results: [BenchResult], baseline_path: string) -> i64 require { Console, Fs } do
+  if Fs.exists(baseline_path) == false then
+    Console.eprintln(val: "nexus bench: baseline file not found: " ++ baseline_path)
+    return 1
+  end
+  let src = Fs.read_to_string(path: baseline_path)
+  let baseline_items = parse_baseline_items(src)
+  match baseline_items do
+    | None ->
+      Console.eprintln(val: "nexus bench: failed to parse baseline JSON: " ++ baseline_path)
+      return 1
+    | Some(val: items) ->
+      return check_results_against(results, baseline_items: items, violations: 0)
+  end
+end
+
+let check_results_against = fn (results: [BenchResult], baseline_items: [JsonValue], violations: i64) -> i64 require { Console } do
+  match results do
+    | [] -> return violations
+    | BenchFail(_, _) :: rest ->
+      // failed benches are already reported; skip drift check for them
+      return check_results_against(results: rest, baseline_items, violations)
+    | BenchOk(name, median_ms, _) :: rest ->
+      let base = find_baseline_median(name, items: baseline_items)
+      match base do
+        | None ->
+          // no baseline entry = new bench, not a drift violation
+          return check_results_against(results: rest, baseline_items, violations)
+        | Some(val: base_ms) ->
+          let drift_ok = within_20pct(actual: median_ms, baseline: base_ms)
+          if !drift_ok then
+            let pct = if base_ms == 0 then 0 else ((median_ms - base_ms) * 100) / base_ms end
+            Console.eprintln(val: "DRIFT  " ++ name
+              ++ "  baseline=" ++ str.from_i64(val: base_ms) ++ "ms"
+              ++ "  actual=" ++ str.from_i64(val: median_ms) ++ "ms"
+              ++ "  drift=" ++ str.from_i64(val: pct) ++ "%  (limit ±20%)")
+            return check_results_against(results: rest, baseline_items, violations: violations + 1)
+          end
+          return check_results_against(results: rest, baseline_items, violations)
+      end
+  end
+end
+
+let find_baseline_median = fn (name: string, items: [JsonValue]) -> Option<i64> do
+  match items do
+    | [] -> return None
+    | item :: rest ->
+      match json.get_field(obj: item, key: "name") do
+        | Some(val: JsonString(val: n)) ->
+          if n == name then
+            match json.get_field(obj: item, key: "median_ms") do
+              | Some(val: JsonInt(val: ms)) -> return Some(val: ms)
+              | Some(val: JsonFloat(val: _)) ->
+                // Treat float baseline ms (unlikely) as unrecognised
+                return find_baseline_median(name, items: rest)
+              | _ -> return find_baseline_median(name, items: rest)
+            end
+          end
+          return find_baseline_median(name, items: rest)
+        | _ -> return find_baseline_median(name, items: rest)
+      end
+  end
+end
+
+/** Return true if `actual` is within ±20% of `baseline`. */
+let within_20pct = fn (actual: i64, baseline: i64) -> bool do
+  if baseline <= 0 then return true end
+  // Use integer arithmetic: 20% of baseline = baseline / 5.
+  // Allow: baseline * 0.8 <= actual <= baseline * 1.2
+  // i.e.   4 * baseline <= 5 * actual <= 6 * baseline
+  let lo = (4 * baseline) / 5
+  let hi = (6 * baseline) / 5
+  return actual >= lo && actual <= hi
+end
+
+
+/** Run every discovered bench, print NDJSON to stdout, and return the exit code. */
+export let run_bench_subcommand = fn (args: [string]) -> i64 require { Clock, Console, Fs, Proc } throws { InvalidUsage, FsThrow } do
+  let opts = parse_bench_options(args)
+  let BenchOptions(dir, iters: n_iters, baseline_path: baseline, _) = opts
+  let files = discover_benches(dir)
+  let n = list.length(xs: files)
+  if n == 0 then
+    Console.eprintln(val: "nexus bench: no bench_*.nx files found under " ++ dir)
+    return 1
+  end
+  // Probe Proc.exec: under WASI preview1 it returns -1.  The polyglot
+  // launcher intercepts `bench` and drives the loop from the host shell;
+  // this in-wasm path exists for any future preview that gains subprocess.
+  match Proc.exec(cmd: ":", args: []) do | ExecResult(exit_code: probe_ec, _) ->
+    if probe_ec == (0 - 1) then
+      Console.eprintln(val: "nexus bench: subprocess unavailable (WASI preview1 has no exec).")
+      Console.eprintln(val: "  Run via the polyglot launcher (`./nexus bench`) — it")
+      Console.eprintln(val: "  drives the per-bench compile+run loop from the host shell.")
+      return 1
+    end
+  end
+  Console.eprintln(val: "nexus bench: discovered " ++ str.from_i64(val: n)
+    ++ " bench(es) under " ++ dir
+    ++ " [iters=" ++ str.from_i64(val: n_iters) ++ "]")
+  let results = run_all_benches(files, opts, idx: 0)
+  print_results(results)
+  let any_fail = has_fail(results)
+  if any_fail then return 1 end
+  match baseline do
+    | None -> return 0
+    | Some(val: bpath) ->
+      let violations = check_baseline(results, baseline_path: bpath)
+      if violations > 0 then
+        Console.eprintln(val: "nexus bench: " ++ str.from_i64(val: violations)
+          ++ " bench(es) exceeded ±20% drift gate")
+        return 3
+      end
+      Console.eprintln(val: "nexus bench: baseline check passed")
+      return 0
+  end
+end
+
+let run_all_benches = fn (files: [string], opts: BenchOptions, idx: i64) -> [BenchResult] require { Clock, Console, Proc } do
+  match files do
+    | [] -> return []
+    | f :: rest ->
+      let tmp = "/tmp/nexus_bench_" ++ str.from_i64(val: idx) ++ ".wasm"
+      let result = run_one_bench(file: f, opts, tmp_wasm: tmp)
+      return result :: run_all_benches(files: rest, opts, idx: idx + 1)
+  end
+end
+
+let print_results = fn (results: [BenchResult]) -> unit require { Console } do
+  match results do
+    | [] -> return ()
+    | r :: rest ->
+      Console.println(val: result_to_json(r))
+      return print_results(results: rest)
+  end
+end
+
+let has_fail = fn (results: [BenchResult]) -> bool do
+  match results do
+    | [] -> return false
+    | BenchFail(_, _) :: _ -> return true
+    | _ :: rest -> return has_fail(results: rest)
+  end
+end

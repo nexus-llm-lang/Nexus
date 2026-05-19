@@ -45,6 +45,7 @@ trap cleanup EXIT INT TERM HUP
 # the compiler payload. `nexus test` is special-cased — see below.
 PAYLOAD_NAME="compiler"
 TEST_MODE=0
+BENCH_MODE=0
 RUN_MODE=0
 CAPS_DIFF_REV=""
 CAPS_DIFF_TMP=""
@@ -77,6 +78,21 @@ if [ "$#" -gt 0 ]; then
         :
       else
         TEST_MODE=1
+        shift
+      fi
+      ;;
+    bench)
+      # `nexus bench` — same preview1 subprocess constraint as `nexus test`.
+      # Drive the per-bench compile+run loop from the host shell; the in-wasm
+      # path in `src/tools/bench.nx` exists for any future WASI preview that
+      # gains subprocess back.
+      #
+      # `nexus bench --help|-h` is a help request — fall through to the
+      # compiler payload so the in-wasm try_dispatch_help can serve it.
+      if [ "$#" -ge 2 ] && { [ "$2" = "--help" ] || [ "$2" = "-h" ]; }; then
+        :
+      else
+        BENCH_MODE=1
         shift
       fi
       ;;
@@ -1346,6 +1362,173 @@ if [ "$TEST_MODE" = "1" ]; then
   fi
 
   [ "$FAILED" = "0" ] && exit 0 || exit 1
+fi
+
+if [ "$BENCH_MODE" = "1" ]; then
+  # ─── nexus bench: host-driven loop ────────────────────────────────────
+  # Discover bench_*.nx under BENCH_DIR, compile each, run it BENCH_ITERS
+  # times, collect the integer ms printed on stdout's last line, compute
+  # median + p95, and emit one NDJSON line per bench.
+  BENCH_DIR="examples/feature"
+  BENCH_ITERS=5
+  BENCH_BASELINE=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dir)       BENCH_DIR="${2:-}"; shift 2 ;;
+      --iters)     BENCH_ITERS="${2:-5}"; shift 2 ;;
+      --baseline)  BENCH_BASELINE="${2:-}"; shift 2 ;;
+      --nexus-bin|--wasmtime-bin) shift 2 ;;  # accepted + ignored (we use ourselves)
+      --*) shift ;;
+      *) shift ;;
+    esac
+  done
+
+  TMPDIR_REAL="${TMPDIR:-/tmp}"
+  BENCH_WASM=$(mktemp "${TMPDIR_REAL}/nexus_bench_XXXXXX.wasm")
+  cleanup_bench() { rm -f "$BENCH_WASM"; }
+  trap 'cleanup_bench; cleanup' EXIT INT TERM HUP
+
+  # Use the same W_FLAGS set earlier in this script (includes threads,
+  # shared-memory etc. required by the stdlib allocator).
+
+  # Discover bench_*.nx files in the directory (sorted by find).
+  BENCH_FILES=$(find "$BENCH_DIR" -maxdepth 1 -name 'bench_*.nx' 2>/dev/null | sort)
+  if [ -z "$BENCH_FILES" ]; then
+    echo "nexus bench: no bench_*.nx files found under $BENCH_DIR" >&2
+    exit 1
+  fi
+  N_BENCHES=$(echo "$BENCH_FILES" | wc -l | tr -d ' ')
+  echo "nexus bench: discovered $N_BENCHES bench(es) under $BENCH_DIR [iters=${BENCH_ITERS}]" >&2
+
+  BENCH_RESULTS=""  # accumulate name:median:p95 lines for baseline check
+  BENCH_ANY_FAIL=0
+
+  for bench_file in $BENCH_FILES; do
+    # Derive bench name: strip directory prefix, "bench_" prefix, ".nx" suffix.
+    bench_base=$(basename "$bench_file")
+    bench_stem="${bench_base#bench_}"
+    bench_name="${bench_stem%.nx}"
+
+    # Compile via the compiler payload (same pattern as nexus test loop).
+    if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+        ${NEXUS_WASMTIME_ARGS:-} \
+        "$TMP" build "$bench_file" -o "$BENCH_WASM" --explain-capabilities none \
+        2>/dev/null; then
+      echo "{\"name\":\"${bench_name}\",\"error\":\"compile failed\"}"
+      BENCH_ANY_FAIL=1
+      continue
+    fi
+
+    # Run BENCH_ITERS times; collect integer ms from last stdout line.
+    _samples=""
+    _fail=""
+    _i=0
+    while [ "$_i" -lt "$BENCH_ITERS" ]; do
+      _out=$(wasmtime run \
+        -W "$W_FLAGS" \
+        -S threads \
+        --dir=. --dir="${TMPDIR_REAL}" \
+        "$BENCH_WASM" 2>/dev/null)
+      _ec=$?
+      if [ "$_ec" != "0" ]; then
+        _fail="run exit $_ec"
+        break
+      fi
+      # Extract last non-empty line
+      _last=$(printf '%s\n' "$_out" | grep -v '^[[:space:]]*$' | tail -1 | tr -d '[:space:]')
+      if [ -z "$_last" ]; then
+        _fail="no integer output"
+        break
+      fi
+      _samples="${_samples:+$_samples }${_last}"
+      _i=$((_i + 1))
+    done
+
+    if [ -n "$_fail" ]; then
+      echo "{\"name\":\"${bench_name}\",\"error\":\"${_fail}\"}"
+      BENCH_ANY_FAIL=1
+      continue
+    fi
+
+    # Compute median and p95 from space-separated samples using awk.
+    _stats=$(printf '%s\n' $_samples | awk '
+      BEGIN { n=0 }
+      { a[n++]=$1+0 }
+      END {
+        # insertion sort
+        for(i=1;i<n;i++){v=a[i];j=i-1;while(j>=0&&a[j]>v){a[j+1]=a[j];j--};a[j+1]=v}
+        idx_med = int(n*50/100); if(idx_med>=n) idx_med=n-1
+        idx_p95 = int(n*95/100); if(idx_p95>=n) idx_p95=n-1
+        print a[idx_med] " " a[idx_p95]
+      }
+    ')
+    _median=$(echo "$_stats" | awk '{print $1}')
+    _p95=$(echo "$_stats" | awk '{print $2}')
+
+    echo "{\"name\":\"${bench_name}\",\"median_ms\":${_median},\"p95_ms\":${_p95},\"iters\":${BENCH_ITERS}}"
+    BENCH_RESULTS="${BENCH_RESULTS}${bench_name}:${_median}:${_p95}\n"
+  done
+
+  # Baseline drift gate (±20%)
+  if [ -n "$BENCH_BASELINE" ] && [ "$BENCH_ANY_FAIL" = "0" ]; then
+    if [ ! -f "$BENCH_BASELINE" ]; then
+      echo "nexus bench: baseline file not found: $BENCH_BASELINE" >&2
+      exit 1
+    fi
+    DRIFT_VIOLATIONS=0
+    # For each result line "name:median:p95", look up "name" in the baseline JSON.
+    printf '%b' "$BENCH_RESULTS" | while IFS=: read -r _name _actual _p95_val; do
+      [ -z "$_name" ] && continue
+      _base=$(awk -v name="$_name" '
+        BEGIN { found=0 }
+        /"name"[[:space:]]*:[[:space:]]*"/ {
+          match($0, /"name"[[:space:]]*:[[:space:]]*"([^"]+)"/, arr)
+          if (arr[1] == name) { found=1 }
+        }
+        found && /"median_ms"[[:space:]]*:/ {
+          match($0, /"median_ms"[[:space:]]*:[[:space:]]*([0-9]+)/, arr)
+          if (arr[1]+0 > 0) { print arr[1]+0; found=0 }
+        }
+      ' "$BENCH_BASELINE")
+      if [ -z "$_base" ] || [ "$_base" = "0" ]; then continue; fi
+      # ±20%: lo = base*4/5, hi = base*6/5
+      _lo=$((_base * 4 / 5))
+      _hi=$((_base * 6 / 5))
+      if [ "$_actual" -lt "$_lo" ] || [ "$_actual" -gt "$_hi" ]; then
+        _pct=$(((_actual - _base) * 100 / _base))
+        echo "DRIFT  ${_name}  baseline=${_base}ms  actual=${_actual}ms  drift=${_pct}%  (limit ±20%)" >&2
+        DRIFT_VIOLATIONS=$((DRIFT_VIOLATIONS + 1))
+      fi
+    done
+    # Re-count violations (subshell above can't export; re-scan from results)
+    _viol=$(printf '%b' "$BENCH_RESULTS" | while IFS=: read -r _name _actual _p95_val; do
+      [ -z "$_name" ] && continue
+      _base=$(awk -v name="$_name" '
+        BEGIN { found=0 }
+        /"name"[[:space:]]*:[[:space:]]*"/ {
+          match($0, /"name"[[:space:]]*:[[:space:]]*"([^"]+)"/, arr)
+          if (arr[1] == name) { found=1 }
+        }
+        found && /"median_ms"[[:space:]]*:/ {
+          match($0, /"median_ms"[[:space:]]*:[[:space:]]*([0-9]+)/, arr)
+          if (arr[1]+0 > 0) { print arr[1]+0; found=0 }
+        }
+      ' "$BENCH_BASELINE")
+      if [ -z "$_base" ] || [ "$_base" = "0" ]; then continue; fi
+      _lo=$((_base * 4 / 5))
+      _hi=$((_base * 6 / 5))
+      if [ "$_actual" -lt "$_lo" ] || [ "$_actual" -gt "$_hi" ]; then
+        echo "violation"
+      fi
+    done | wc -l | tr -d ' ')
+    if [ "$_viol" -gt "0" ]; then
+      echo "nexus bench: ${_viol} bench(es) exceeded ±20% drift gate" >&2
+      exit 3
+    fi
+    echo "nexus bench: baseline check passed" >&2
+  fi
+
+  [ "$BENCH_ANY_FAIL" = "0" ] && exit 0 || exit 1
 fi
 
 # shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS is intentionally word-split.
