@@ -10,17 +10,34 @@
 # The committed ./nexus.wasm is the Stage 0 source of truth; this script
 # no longer rebuilds the seed from Rust.
 #
-# Usage: ./bootstrap.sh [--ci]
-#   --ci    Strict mode for CI: fail on stage2 failure or non-identical output
+# Usage: ./bootstrap.sh [--ci] [--install [PREFIX]]
+#   --ci              Strict mode for CI: fail on stage2 failure or non-identical output
+#   --install [PREFIX] Copy ./nexus to ${PREFIX:-/usr/local}/bin/nexus after bootstrap
 #
 set -euo pipefail
 
 CI_MODE=0
-for arg in "$@"; do
+INSTALL_MODE=0
+INSTALL_PREFIX=""
+
+args=("$@")
+i=0
+while [[ $i -lt ${#args[@]} ]]; do
+  arg="${args[$i]}"
   case "$arg" in
     --ci) CI_MODE=1 ;;
+    --install)
+      INSTALL_MODE=1
+      # Peek at next arg: if it exists and does not start with '--', treat as PREFIX
+      next_i=$((i + 1))
+      if [[ $next_i -lt ${#args[@]} ]] && [[ "${args[$next_i]}" != --* ]]; then
+        INSTALL_PREFIX="${args[$next_i]}"
+        i=$next_i
+      fi
+      ;;
     *) echo "Unknown argument: $arg" >&2; exit 1 ;;
   esac
+  i=$((i + 1))
 done
 
 NEXUS_SEED="${NEXUS_SEED:-./nexus.wasm}"
@@ -213,3 +230,17 @@ LSP_SHA=$(sha256_file lsp.wasm)
 } > nexus
 chmod +x nexus
 ok "Installed nexus polyglot ($(wc -c < nexus | tr -d ' ') bytes; compiler=$COMPILER_SIZE, lsp=$LSP_SIZE)"
+
+# ─── --install: copy polyglot launcher to ${PREFIX}/bin/nexus ─────────────
+if [[ "$INSTALL_MODE" -eq 1 ]]; then
+  EFFECTIVE_PREFIX="${INSTALL_PREFIX:-/usr/local}"
+  INSTALL_BIN="${EFFECTIVE_PREFIX}/bin"
+  INSTALL_TARGET="${INSTALL_BIN}/nexus"
+  if [[ -f "$INSTALL_TARGET" ]]; then
+    warn "--install: $INSTALL_TARGET already exists, overwriting."
+  fi
+  mkdir -p "$INSTALL_BIN"
+  cp nexus "$INSTALL_TARGET"
+  chmod 755 "$INSTALL_TARGET"
+  ok "--install: nexus installed to $INSTALL_TARGET"
+fi

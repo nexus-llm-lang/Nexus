@@ -124,6 +124,13 @@ The compiler ships as a self-extracting POSIX sh + wasm polyglot. Build it local
 cp nexus ~/.local/bin/   # or anywhere on PATH
 ```
 
+To bootstrap and install in one step, use `--install [PREFIX]` (defaults to `/usr/local`):
+
+```bash
+./bootstrap.sh --install             # installs to /usr/local/bin/nexus
+./bootstrap.sh --install ~/.local    # installs to ~/.local/bin/nexus
+```
+
 [wasmtime](https://wasmtime.dev/) must be installed and on `PATH`. Override the wasm runtime via env vars:
 
 ```bash
