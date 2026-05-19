@@ -798,17 +798,19 @@ if [ "$TEST_MODE" = "1" ]; then
       *_test.nx) FILES="$TEST_PATH";;
       */negative/*.nx) FILES="$TEST_PATH";;
       */p3_component/*.nx) FILES="$TEST_PATH";;
+      */repl/*.in.txt) FILES="$TEST_PATH";;
       *) FILES="";;
     esac
   else
     POS_FILES=$(find "$TEST_PATH" -type f -name '*_test.nx' 2>/dev/null)
     NEG_FILES=$(find "$TEST_PATH" -type f -path '*/negative/*.nx' 2>/dev/null)
     P3C_FILES=$(find "$TEST_PATH" -type f -path '*/p3_component/*.nx' 2>/dev/null)
-    FILES=$(printf '%s\n%s\n%s\n' "$POS_FILES" "$NEG_FILES" "$P3C_FILES" | grep -v '^$' | sort)
+    REPL_FILES=$(find "$TEST_PATH" -type f -path '*/repl/*.in.txt' 2>/dev/null)
+    FILES=$(printf '%s\n%s\n%s\n%s\n' "$POS_FILES" "$NEG_FILES" "$P3C_FILES" "$REPL_FILES" | grep -v '^$' | sort)
   fi
   N=$(printf '%s\n' "$FILES" | grep -c '^.' || true)
   if [ "$N" = "0" ]; then
-    echo "nexus test: no *_test.nx files (or tests/negative/*.nx fixtures) found under $TEST_PATH" >&2
+    echo "nexus test: no *_test.nx (or tests/negative/*.nx or tests/repl/*.in.txt) fixtures found under $TEST_PATH" >&2
     exit 1
   fi
 
@@ -839,7 +841,7 @@ if [ "$TEST_MODE" = "1" ]; then
   if [ "$TEST_COVERAGE" = "1" ]; then
     COMPILE_EXTRA_ARGS="--coverage"
   fi
-  export TMP W_FLAGS TMPDIR_REAL RESULTS_DIR NEXUS_WASMTIME_ARGS COMPILE_EXTRA_ARGS TEST_COVERAGE
+  export TMP W_FLAGS TMPDIR_REAL RESULTS_DIR NEXUS_WASMTIME_ARGS COMPILE_EXTRA_ARGS TEST_COVERAGE UPDATE_GOLDEN
   IDX=0
   PLAN_FILE="$RESULTS_DIR/plan.tsv"
   : > "$PLAN_FILE"
@@ -880,12 +882,67 @@ if [ "$TEST_MODE" = "1" ]; then
 
     # Classify by file path. Anything under a `negative/` directory uses
     # the inverted-semantics path; the header parse below picks between
-    # the compile-fail and runtime-throw flavors.
+    # the compile-fail and runtime-throw flavors. `repl/*.in.txt` files
+    # are transcript-driven golden tests (nexus-u468).
     case "$f" in
-      */negative/*)    NEG=1; P3C=0;;
-      */p3_component/*) NEG=0; P3C=1;;
-      *)               NEG=0; P3C=0;;
+      */negative/*)    NEG=1; P3C=0; REPL_GOLDEN=0;;
+      */p3_component/*) NEG=0; P3C=1; REPL_GOLDEN=0;;
+      */repl/*.in.txt) NEG=0; P3C=0; REPL_GOLDEN=1;;
+      *)               NEG=0; P3C=0; REPL_GOLDEN=0;;
     esac
+
+    # ── repl golden fixture (nexus-u468) ──────────────────────────────
+    if [ "$REPL_GOLDEN" = "1" ]; then
+      # Derive the matching .out.txt path from the .in.txt path.
+      golden="${f%.in.txt}.out.txt"
+      t0=$(date +%s%N 2>/dev/null || date +%s000000000)
+      # Run the REPL with the input script on stdin; capture stdout only.
+      # Errors go to a separate log so they do not pollute the golden diff.
+      actual="$RESULTS_DIR/repl_actual_$idx.txt"
+      elog="$RESULTS_DIR/err_$idx.log"
+      if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+          ${NEXUS_WASMTIME_ARGS:-} \
+          "$TMP" repl \
+          < "$f" > "$actual" 2>"$elog"; then
+        t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+        ms=$(( (t1 - t0) / 1000000 ))
+        tail_txt="$(tail -8 "$elog" 2>/dev/null)"
+        printf "FAIL\t%s\trepl-run\t%s\t%s\n" "$ms" "$f" "$tail_txt" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, repl-run)\n" "$f" "$ms" >&2
+        exit 0
+      fi
+      t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+      ms=$(( (t1 - t0) / 1000000 ))
+      # UPDATE_GOLDEN=1: regenerate the golden file from actual output.
+      if [ "${UPDATE_GOLDEN:-0}" = "1" ]; then
+        cp "$actual" "$golden"
+        printf "PASS\t%s\trepl-golden-updated\t%s\t-\n" "$ms" "$f" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "PASS  %s  (%sms, golden updated)\n" "$f" "$ms" >&2
+        exit 0
+      fi
+      # Golden compare: .out.txt must exist and match byte-for-byte.
+      if [ ! -f "$golden" ]; then
+        printf "FAIL\t%s\trepl-golden-missing\t%s\t%s\n" "$ms" "$f" \
+          "golden file not found: $golden (run UPDATE_GOLDEN=1 ./nexus test to create)" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, repl-golden-missing)\n" "$f" "$ms" >&2
+        exit 0
+      fi
+      if ! diff -u "$golden" "$actual" > "$RESULTS_DIR/repl_diff_$idx.txt" 2>&1; then
+        diff_txt="$(cat "$RESULTS_DIR/repl_diff_$idx.txt")"
+        printf "FAIL\t%s\trepl-golden-mismatch\t%s\t%s\n" "$ms" "$f" "$diff_txt" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, repl-golden-mismatch)\n" "$f" "$ms" >&2
+        printf "%s\n" "$diff_txt" | head -20 >&2
+        exit 0
+      fi
+      printf "PASS\t%s\trepl-golden\t%s\t-\n" "$ms" "$f" \
+        > "$RESULTS_DIR/result_$idx.tsv"
+      printf "PASS  %s  (%sms, repl-golden)\n" "$f" "$ms" >&2
+      exit 0
+    fi
 
     if [ "$NEG" = "1" ]; then
       # Parse the contiguous comment header at the top of the fixture.
