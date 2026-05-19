@@ -1,0 +1,581 @@
+/**
+ * regexp/parse: recursive-descent parser, character-class builder, and
+ * bytecode compiler. Exports: from_string
+ */
+
+import * as str from "std:str"
+import * as list from "std:list"
+import { Option, Some, None } from "std:option"
+import {
+  InvalidRegexp, RegexpThrow,
+  CharSet, Re, Empty, Lit, AnyByte, Class, StartAnchor, EndAnchor,
+  Concat, Alt, Star, Plus, Opt, Bounded, CapGroup,
+  Inst, Regexp,
+  op_match, op_byte, op_any, op_class, op_split, op_jmp, op_save, op_start, op_end,
+  empty_set,
+  mk_match, mk_byte, mk_any, mk_class, mk_split, mk_jmp, mk_save, mk_start, mk_end,
+  nth_i64, set_nth, set_add, set_has, add_range, invert_set, empty_charset,
+  digit_set, word_set, ws_set, merge_sets
+} from "std:text/regexp/types"
+
+// ─── Parser ──────────────────────────────────────────────────────────────────
+//
+// Recursive-descent over byte offsets. The parser threads (pattern, len,
+// pos, next_group_idx) and returns ParseStep records carrying the produced
+// node, the new position, and the updated group counter.
+//
+// Precedence (highest first):
+//   atom    → literal | . | char-class | escape | (...) | (?:...)
+//   factor  → atom quantifier?
+//   concat  → factor*
+//   re      → concat ('|' concat)*
+
+type ParseStep = ParseStep(node: Re, pos: i64, ngroups: i64)
+
+// Byte-level pattern read — these helpers operate on the raw pattern bytes
+// rather than chars to avoid the char/i64 conversion dance above.
+let p_byte_at = fn (p: string, i: i64) -> i64 do
+  let plen = str.byte_length(s: p)
+  if i < 0 || i >= plen then return 0 - 1 end
+  return str.char_code(s: str.byte_substring(s: p, start: i, len: 1), idx: 0)
+end
+
+let pat_len = fn (p: string) -> i64 do return str.byte_length(s: p) end
+
+// Decimal parser used by {n}, {n,}, {n,m}. Returns (value, new_pos). If
+// no digits are consumed, value == -1 and pos is unchanged.
+type IntScan = IntScan(value: i64, pos: i64)
+
+let scan_int_go = fn (p: string, plen: i64, i: i64, acc: i64, any_digit: bool) -> IntScan do
+  if i >= plen then
+    if any_digit then return IntScan(value: acc, pos: i) end
+    return IntScan(value: 0 - 1, pos: i)
+  end
+  let b = p_byte_at(p, i)
+  if b >= 48 && b <= 57 then
+    return scan_int_go(p, plen, i: i + 1, acc: acc * 10 + (b - 48), any_digit: true)
+  end
+  if any_digit then return IntScan(value: acc, pos: i) end
+  return IntScan(value: 0 - 1, pos: i)
+end
+
+let scan_int = fn (p: string, i: i64) -> IntScan do
+  return scan_int_go(p, plen: pat_len(p), i, acc: 0, any_digit: false)
+end
+
+// ── Parse: character class ───────────────────────────────────────────────────
+//
+// `pos` is positioned just after the opening `[`. Returns the constructed
+// class and the position just after the closing `]`. A leading `^` flips
+// to negation; a literal `]` is allowed as the first character.
+
+type ClassScan = ClassScan(set_val: CharSet, pos: i64)
+
+let parse_class_body_go = fn (
+  p: string, plen: i64, src: string, i: i64, s: CharSet, last: i64
+) -> ClassScan throws { RegexpThrow } do
+  if i >= plen then
+    throw InvalidRegexp(src, msg: "unterminated character class (at position " ++ str.from_i64(val: i) ++ ")")
+  end
+  let b = p_byte_at(p, i)
+  if b == 93 then // ']'
+    return ClassScan(set_val: s, pos: i + 1)
+  end
+  // Escape inside a class.
+  if b == 92 then // '\\'
+    let next_pos = i + 1
+    if next_pos >= plen then
+      throw InvalidRegexp(src, msg: "dangling backslash in character class (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+    let nb = p_byte_at(p, i: next_pos)
+    let nv = class_escape_value(b: nb)
+    if nv >= 0 then
+      let s1 = set_add(s, b: nv)
+      return parse_class_body_go(p, plen, src, i: next_pos + 1, s: s1, last: nv)
+    end
+    // Built-in escape class like \d, \w, \s (lowercase) or negations.
+    let extras = class_builtin_or_none(b: nb)
+    match extras do
+      | Some(val: extra_set) ->
+        let merged = merge_sets(a: s, b: extra_set)
+        return parse_class_body_go(p, plen, src, i: next_pos + 1, s: merged, last: 0 - 1)
+      | None ->
+        throw InvalidRegexp(src, msg: "unsupported escape '\\" ++ str.byte_substring(s: p, start: next_pos, len: 1) ++ "' in character class (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+  end
+  // Range: <last>-<right>. Only if last >= 0, next is '-', and char after
+  // is not the closing bracket.
+  if b == 45 && last >= 0 && i + 1 < plen && p_byte_at(p, i: i + 1) != 93 then
+    let right_pos = i + 1
+    let rb = p_byte_at(p, i: right_pos)
+    if rb == 92 then
+      // Escape forms the range upper bound.
+      let next_pos = right_pos + 1
+      if next_pos >= plen then
+        throw InvalidRegexp(src, msg: "dangling backslash in range (at position " ++ str.from_i64(val: right_pos) ++ ")")
+      end
+      let rv = class_escape_value(b: p_byte_at(p, i: next_pos))
+      if rv < 0 then
+        throw InvalidRegexp(src, msg: "invalid range upper bound (at position " ++ str.from_i64(val: right_pos) ++ ")")
+      end
+      if last > rv then
+        throw InvalidRegexp(src, msg: "reversed range in character class (at position " ++ str.from_i64(val: i) ++ ")")
+      end
+      let s2 = add_range(s, lo: last, hi: rv)
+      return parse_class_body_go(p, plen, src, i: next_pos + 1, s: s2, last: 0 - 1)
+    end
+    if last > rb then
+      throw InvalidRegexp(src, msg: "reversed range in character class (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+    let s2 = add_range(s, lo: last, hi: rb)
+    return parse_class_body_go(p, plen, src, i: right_pos + 1, s: s2, last: 0 - 1)
+  end
+  // Plain literal byte.
+  let s3 = set_add(s, b)
+  return parse_class_body_go(p, plen, src, i: i + 1, s: s3, last: b)
+end
+
+// Bytes that an escape inside a class shorthand maps to: \n \t \r \f \v
+// \\ \] \[ \. \- \^ etc. -1 means "not a literal".
+let class_escape_value = fn (b: i64) -> i64 do
+  if b == 110 then return 10 end // \n
+  if b == 116 then return 9 end  // \t
+  if b == 114 then return 13 end // \r
+  if b == 102 then return 12 end // \f
+  if b == 118 then return 11 end // \v
+  if b == 48 then return 0 end   // \0
+  if b == 92 then return 92 end  // \\
+  if b == 93 then return 93 end  // \]
+  if b == 91 then return 91 end  // \[
+  if b == 46 then return 46 end  // \.
+  if b == 45 then return 45 end  // \-
+  if b == 94 then return 94 end  // \^
+  if b == 47 then return 47 end  // \/
+  if b == 40 then return 40 end  // \(
+  if b == 41 then return 41 end  // \)
+  if b == 123 then return 123 end // \{
+  if b == 125 then return 125 end // \}
+  if b == 124 then return 124 end // \|
+  if b == 42 then return 42 end  // \*
+  if b == 43 then return 43 end  // \+
+  if b == 63 then return 63 end  // \?
+  if b == 36 then return 36 end  // \$
+  return 0 - 1
+end
+
+// Built-in classes referenced inside or outside a `[...]` block.
+let class_builtin_or_none = fn (b: i64) -> Option<CharSet> do
+  if b == 100 then return Some(val: digit_set()) end // \d
+  if b == 119 then return Some(val: word_set()) end  // \w
+  if b == 115 then return Some(val: ws_set()) end   // \s
+  if b == 68 then return Some(val: invert_set(s: digit_set())) end // \D
+  if b == 87 then return Some(val: invert_set(s: word_set())) end  // \W
+  if b == 83 then return Some(val: invert_set(s: ws_set())) end   // \S
+  return None
+end
+
+let parse_class = fn (p: string, src: string, i: i64) -> ClassScan throws { RegexpThrow } do
+  let plen = pat_len(p)
+  if i >= plen then
+    throw InvalidRegexp(src, msg: "unterminated character class (at position " ++ str.from_i64(val: i - 1) ++ ")")
+  end
+  let negate = p_byte_at(p, i) == 94 // '^'
+  let start_i = if negate then i + 1 else i end
+  // Allow ']' immediately after the (optional) '^' as a literal.
+  let s0 = empty_charset()
+  let first_b = p_byte_at(p, i: start_i)
+  let i0 = if first_b == 93 then start_i + 1 else start_i end
+  let s0_with_first = if first_b == 93 then set_add(s: s0, b: 93) else s0 end
+  let scanned = parse_class_body_go(p, plen, src, i: i0, s: s0_with_first, last: if first_b == 93 then 93 else 0 - 1 end)
+  let ClassScan(set_val: built, pos: after) = scanned
+  if negate then
+    return ClassScan(set_val: invert_set(s: built), pos: after)
+  end
+  return ClassScan(set_val: built, pos: after)
+end
+
+// ── Parse: atom / factor / concat / alt ──────────────────────────────────────
+//
+// We unfold the AST builder a bit: every parse_* returns a ParseStep so the
+// caller can thread the new (pos, ngroups). All exceptions raised carry the
+// failing position in `msg`.
+
+let parse_atom = fn (p: string, src: string, i: i64, ngroups: i64) -> ParseStep throws { RegexpThrow } do
+  let plen = pat_len(p)
+  if i >= plen then
+    return ParseStep(node: Empty, pos: i, ngroups)
+  end
+  let b = p_byte_at(p, i)
+  if b == 40 then // '('
+    let next_i = i + 1
+    // Non-capturing group: (?:...)
+    if next_i + 1 < plen && p_byte_at(p, i: next_i) == 63 && p_byte_at(p, i: next_i + 1) == 58 then
+      let body = parse_re(p, src, i: next_i + 2, ngroups)
+      let ParseStep(node: inner, pos: after, ngroups: ng2) = body
+      if after >= plen || p_byte_at(p, i: after) != 41 then
+        throw InvalidRegexp(src, msg: "unclosed group (at position " ++ str.from_i64(val: i) ++ ")")
+      end
+      return ParseStep(node: inner, pos: after + 1, ngroups: ng2)
+    end
+    // Reject every other (? ...) form: lookaround, named groups, flags.
+    if next_i < plen && p_byte_at(p, i: next_i) == 63 then
+      throw InvalidRegexp(src, msg: "unsupported group extension '(?' (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+    let g_idx = ngroups
+    let body = parse_re(p, src, i: next_i, ngroups: ngroups + 1)
+    let ParseStep(node: inner, pos: after, ngroups: ng2) = body
+    if after >= plen || p_byte_at(p, i: after) != 41 then
+      throw InvalidRegexp(src, msg: "unclosed group (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+    return ParseStep(node: CapGroup(idx: g_idx, node: inner), pos: after + 1, ngroups: ng2)
+  end
+  if b == 46 then // '.'
+    return ParseStep(node: AnyByte, pos: i + 1, ngroups)
+  end
+  if b == 91 then // '['
+    let scanned = parse_class(p, src, i: i + 1)
+    let ClassScan(set_val: s, pos: after) = scanned
+    return ParseStep(node: Class(set_val: s), pos: after, ngroups)
+  end
+  if b == 94 then // '^'
+    return ParseStep(node: StartAnchor, pos: i + 1, ngroups)
+  end
+  if b == 36 then // '$'
+    return ParseStep(node: EndAnchor, pos: i + 1, ngroups)
+  end
+  if b == 92 then // '\\'
+    let next_pos = i + 1
+    if next_pos >= plen then
+      throw InvalidRegexp(src, msg: "dangling backslash (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+    let nb = p_byte_at(p, i: next_pos)
+    // Reject numeric backrefs: \1, \2, ...
+    if nb >= 49 && nb <= 57 then
+      throw InvalidRegexp(src, msg: "backreferences are not supported (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+    let escval = class_escape_value(b: nb)
+    if escval >= 0 then
+      return ParseStep(node: Lit(byte_val: escval), pos: next_pos + 1, ngroups)
+    end
+    let extras = class_builtin_or_none(b: nb)
+    match extras do
+      | Some(val: cs) -> return ParseStep(node: Class(set_val: cs), pos: next_pos + 1, ngroups)
+      | None -> throw InvalidRegexp(src, msg: "unsupported escape '\\" ++ str.byte_substring(s: p, start: next_pos, len: 1) ++ "' (at position " ++ str.from_i64(val: i) ++ ")")
+    end
+  end
+  // Reject closing-side metachars when met as atoms.
+  if b == 41 || b == 124 then
+    return ParseStep(node: Empty, pos: i, ngroups)
+  end
+  if b == 42 || b == 43 || b == 63 || b == 123 || b == 125 then
+    throw InvalidRegexp(src, msg: "unexpected metacharacter '" ++ str.byte_substring(s: p, start: i, len: 1) ++ "' (at position " ++ str.from_i64(val: i) ++ ")")
+  end
+  // Plain literal byte.
+  return ParseStep(node: Lit(byte_val: b), pos: i + 1, ngroups)
+end
+
+let parse_factor = fn (p: string, src: string, i: i64, ngroups: i64) -> ParseStep throws { RegexpThrow } do
+  let atom = parse_atom(p, src, i, ngroups)
+  let ParseStep(node: a, pos: after, ngroups: ng2) = atom
+  let plen = pat_len(p)
+  if after >= plen then return atom end
+  let q = p_byte_at(p, i: after)
+  if q == 42 then
+    // Detect and reject lazy quantifier `*?` early.
+    if after + 1 < plen && p_byte_at(p, i: after + 1) == 63 then
+      throw InvalidRegexp(src, msg: "lazy quantifier '*?' is not supported (at position " ++ str.from_i64(val: after) ++ ")")
+    end
+    return ParseStep(node: Star(node: a), pos: after + 1, ngroups: ng2)
+  end
+  if q == 43 then
+    if after + 1 < plen && p_byte_at(p, i: after + 1) == 63 then
+      throw InvalidRegexp(src, msg: "lazy quantifier '+?' is not supported (at position " ++ str.from_i64(val: after) ++ ")")
+    end
+    return ParseStep(node: Plus(node: a), pos: after + 1, ngroups: ng2)
+  end
+  if q == 63 then
+    if after + 1 < plen && p_byte_at(p, i: after + 1) == 63 then
+      throw InvalidRegexp(src, msg: "lazy quantifier '??' is not supported (at position " ++ str.from_i64(val: after) ++ ")")
+    end
+    return ParseStep(node: Opt(node: a), pos: after + 1, ngroups: ng2)
+  end
+  if q == 123 then
+    return parse_bounded_after(p, src, anchor: a, pos: after, ngroups: ng2)
+  end
+  return atom
+end
+
+let parse_bounded_after = fn (
+  p: string, src: string, anchor: Re, pos: i64, ngroups: i64
+) -> ParseStep throws { RegexpThrow } do
+  let plen = pat_len(p)
+  // pos is the '{'.
+  let scan_lo = scan_int(p, i: pos + 1)
+  let IntScan(value: lo, pos: after_lo) = scan_lo
+  if lo < 0 then
+    throw InvalidRegexp(src, msg: "expected number in '{...}' (at position " ++ str.from_i64(val: pos) ++ ")")
+  end
+  if after_lo >= plen then
+    throw InvalidRegexp(src, msg: "unclosed '{...}' (at position " ++ str.from_i64(val: pos) ++ ")")
+  end
+  let next_b = p_byte_at(p, i: after_lo)
+  if next_b == 125 then // '}' → {n}
+    return ParseStep(node: Bounded(node: anchor, lo, hi: lo), pos: after_lo + 1, ngroups)
+  end
+  if next_b == 44 then // ',' → {n,} or {n,m}
+    let after_comma = after_lo + 1
+    if after_comma < plen && p_byte_at(p, i: after_comma) == 125 then
+      return ParseStep(node: Bounded(node: anchor, lo, hi: 0 - 1), pos: after_comma + 1, ngroups)
+    end
+    let scan_hi = scan_int(p, i: after_comma)
+    let IntScan(value: hi, pos: after_hi) = scan_hi
+    if hi < 0 then
+      throw InvalidRegexp(src, msg: "expected number after ',' in '{n,m}' (at position " ++ str.from_i64(val: pos) ++ ")")
+    end
+    if after_hi >= plen || p_byte_at(p, i: after_hi) != 125 then
+      throw InvalidRegexp(src, msg: "unclosed '{n,m}' (at position " ++ str.from_i64(val: pos) ++ ")")
+    end
+    if hi < lo then
+      throw InvalidRegexp(src, msg: "'{n,m}' has m < n (at position " ++ str.from_i64(val: pos) ++ ")")
+    end
+    return ParseStep(node: Bounded(node: anchor, lo, hi), pos: after_hi + 1, ngroups)
+  end
+  throw InvalidRegexp(src, msg: "malformed '{...}' (at position " ++ str.from_i64(val: pos) ++ ")")
+end
+
+// Build a Concat node from a list of factors, right-associating to keep the
+// emitter simple (compile traverses with no special handling either way).
+let mk_concat = fn (factors: [ Re ]) -> Re do
+  match factors do
+    | [] -> return Empty
+    | x :: rest ->
+      match rest do
+        | [] -> return x
+        | _ :: _ -> return Concat(a_node: x, b_node: mk_concat(factors: rest))
+      end
+  end
+end
+
+let parse_concat_go = fn (
+  p: string, src: string, i: i64, ngroups: i64, acc: [ Re ]
+) -> ParseStep throws { RegexpThrow } do
+  let plen = pat_len(p)
+  if i >= plen then
+    return ParseStep(node: mk_concat(factors: list.reverse(xs: acc)), pos: i, ngroups)
+  end
+  let b = p_byte_at(p, i)
+  if b == 41 || b == 124 then
+    return ParseStep(node: mk_concat(factors: list.reverse(xs: acc)), pos: i, ngroups)
+  end
+  let factor = parse_factor(p, src, i, ngroups)
+  let ParseStep(node: f, pos: after, ngroups: ng2) = factor
+  if after == i then
+    // No progress (empty factor) — bail to avoid infinite loops.
+    return ParseStep(node: mk_concat(factors: list.reverse(xs: acc)), pos: i, ngroups: ng2)
+  end
+  return parse_concat_go(p, src, i: after, ngroups: ng2, acc: f :: acc)
+end
+
+let parse_re = fn (p: string, src: string, i: i64, ngroups: i64) -> ParseStep throws { RegexpThrow } do
+  let lhs = parse_concat_go(p, src, i, ngroups, acc: [])
+  let ParseStep(node: l, pos: after, ngroups: ng2) = lhs
+  let plen = pat_len(p)
+  if after >= plen then return lhs end
+  if p_byte_at(p, i: after) == 124 then
+    let rhs = parse_re(p, src, i: after + 1, ngroups: ng2)
+    let ParseStep(node: r, pos: after2, ngroups: ng3) = rhs
+    return ParseStep(node: Alt(a_node: l, b_node: r), pos: after2, ngroups: ng3)
+  end
+  return lhs
+end
+
+// ─── Compile ─────────────────────────────────────────────────────────────────
+//
+// Compile the AST to a flat instruction list. We track total length
+// incrementally to avoid an extra length() pass before emitting jumps.
+//
+// Group 0 always wraps the entire program: emit Save(0), <body>, Save(1),
+// Match. Internal groups use even/odd slot pairs 2k / 2k+1.
+
+type EmitState = EmitState(code: [ Inst ], n: i64)
+
+let push_inst = fn (st: EmitState, i: Inst) -> EmitState do
+  let EmitState(code: c, n) = st
+  return EmitState(code: i :: c, n: n + 1)
+end
+
+let st_n = fn (st: EmitState) -> i64 do
+  let EmitState(code: _, n) = st
+  return n
+end
+
+let patch_at_go = fn (xs: [ Inst ], idx: i64, new_inst: Inst, acc: [ Inst ]) -> [ Inst ] do
+  match xs do
+    | [] -> return rev_inst(xs: acc, ys: [])
+    | h :: rest ->
+      if idx == 0 then
+        return rev_inst(xs: acc, ys: new_inst :: rest)
+      end
+      return patch_at_go(xs: rest, idx: idx - 1, new_inst, acc: h :: acc)
+  end
+end
+
+let rev_inst = fn (xs: [ Inst ], ys: [ Inst ]) -> [ Inst ] do
+  match xs do
+    | [] -> return ys
+    | v :: rest -> return rev_inst(xs: rest, ys: v :: ys)
+  end
+end
+
+let patch_at = fn (xs: [ Inst ], idx: i64, new_inst: Inst) -> [ Inst ] do
+  return patch_at_go(xs, idx, new_inst, acc: [])
+end
+
+// Reverse the in-progress accumulator and translate forward emit-order
+// positions to final (forward) program-counter values. Since we push onto
+// the front of `code` and increment `n` per push, the indices into `code`
+// (after reverse) are exactly the values we tracked as `n` at emit time.
+let emit_compile = fn (node: Re, st: EmitState) -> EmitState do
+  match node do
+    | Empty -> return st
+    | Lit(byte_val: v) -> return push_inst(st, i: mk_byte(b: v))
+    | AnyByte -> return push_inst(st, i: mk_any())
+    | Class(set_val: cs) -> return push_inst(st, i: mk_class(s: cs))
+    | StartAnchor -> return push_inst(st, i: mk_start())
+    | EndAnchor -> return push_inst(st, i: mk_end())
+    | Concat(a_node: a, b_node: b) ->
+      let st1 = emit_compile(node: a, st)
+      return emit_compile(node: b, st: st1)
+    | Alt(a_node: a, b_node: b) ->
+      // L1: SPLIT L2 L3
+      // L2: <a>
+      //     JMP L4
+      // L3: <b>
+      // L4:
+      let split_at = st_n(st)
+      let st1 = push_inst(st, i: mk_split(a_t: 0, b_t: 0))
+      let l2 = st_n(st: st1)
+      let st2 = emit_compile(node: a, st: st1)
+      let jmp_at = st_n(st: st2)
+      let st3 = push_inst(st: st2, i: mk_jmp(t: 0))
+      let l3 = st_n(st: st3)
+      let st4 = emit_compile(node: b, st: st3)
+      let l4 = st_n(st: st4)
+      let EmitState(code: c1, n: n1) = st4
+      let c2 = patch_at(xs: c1, idx: n1 - 1 - split_at, new_inst: mk_split(a_t: l2, b_t: l3))
+      let c3 = patch_at(xs: c2, idx: n1 - 1 - jmp_at, new_inst: mk_jmp(t: l4))
+      return EmitState(code: c3, n: n1)
+    | Star(node: inner) ->
+      // L1: SPLIT L2 L3
+      // L2: <inner>
+      //     JMP L1
+      // L3:
+      let split_at = st_n(st)
+      let st1 = push_inst(st, i: mk_split(a_t: 0, b_t: 0))
+      let l2 = st_n(st: st1)
+      let st2 = emit_compile(node: inner, st: st1)
+      let jmp_at = st_n(st: st2)
+      let st3 = push_inst(st: st2, i: mk_jmp(t: split_at))
+      let l3 = st_n(st: st3)
+      let EmitState(code: c1, n: n1) = st3
+      let c2 = patch_at(xs: c1, idx: n1 - 1 - split_at, new_inst: mk_split(a_t: l2, b_t: l3))
+      return EmitState(code: c2, n: n1)
+    | Plus(node: inner) ->
+      // L1: <inner>
+      // L2: SPLIT L1 L3
+      // L3:
+      let l1 = st_n(st)
+      let st1 = emit_compile(node: inner, st)
+      let split_at = st_n(st: st1)
+      let st2 = push_inst(st: st1, i: mk_split(a_t: 0, b_t: 0))
+      let l3 = st_n(st: st2)
+      let EmitState(code: c1, n: n1) = st2
+      let c2 = patch_at(xs: c1, idx: n1 - 1 - split_at, new_inst: mk_split(a_t: l1, b_t: l3))
+      return EmitState(code: c2, n: n1)
+    | Opt(node: inner) ->
+      // L1: SPLIT L2 L3
+      // L2: <inner>
+      // L3:
+      let split_at = st_n(st)
+      let st1 = push_inst(st, i: mk_split(a_t: 0, b_t: 0))
+      let l2 = st_n(st: st1)
+      let st2 = emit_compile(node: inner, st: st1)
+      let l3 = st_n(st: st2)
+      let EmitState(code: c1, n: n1) = st2
+      let c2 = patch_at(xs: c1, idx: n1 - 1 - split_at, new_inst: mk_split(a_t: l2, b_t: l3))
+      return EmitState(code: c2, n: n1)
+    | Bounded(node: inner, lo, hi) ->
+      return emit_bounded(inner, lo, hi, st)
+    | CapGroup(idx, node: inner) ->
+      let slot_open = (idx + 1) * 2
+      let slot_close = slot_open + 1
+      let st1 = push_inst(st, i: mk_save(slot: slot_open))
+      let st2 = emit_compile(node: inner, st: st1)
+      return push_inst(st: st2, i: mk_save(slot: slot_close))
+  end
+end
+
+// Bounded compiles to a sequence: `lo` mandatory copies followed by either
+// (hi - lo) Opt copies or a Star copy when hi is unbounded.
+let emit_bounded = fn (inner: Re, lo: i64, hi: i64, st: EmitState) -> EmitState do
+  let st1 = emit_n_copies(inner, n: lo, st)
+  if hi == 0 - 1 then
+    return emit_compile(node: Star(node: inner), st: st1)
+  end
+  let opt_count = hi - lo
+  return emit_n_opts(inner, n: opt_count, st: st1)
+end
+
+let emit_n_copies = fn (inner: Re, n: i64, st: EmitState) -> EmitState do
+  if n <= 0 then return st end
+  let st1 = emit_compile(node: inner, st)
+  return emit_n_copies(inner, n: n - 1, st: st1)
+end
+
+let emit_n_opts = fn (inner: Re, n: i64, st: EmitState) -> EmitState do
+  if n <= 0 then return st end
+  let st1 = emit_compile(node: Opt(node: inner), st)
+  return emit_n_opts(inner, n: n - 1, st: st1)
+end
+
+let compile_program = fn (root: Re, n_caps: i64) -> [ Inst ] do
+  // Wrap with capture group 0 (whole match) at slots 0/1.
+  let st0 = EmitState(code: [], n: 0)
+  let st1 = push_inst(st: st0, i: mk_save(slot: 0))
+  let st2 = emit_compile(node: root, st: st1)
+  let st3 = push_inst(st: st2, i: mk_save(slot: 1))
+  let st4 = push_inst(st: st3, i: mk_match())
+  let EmitState(code: rev_c, n: _) = st4
+  return rev_inst(xs: rev_c, ys: [])
+end
+
+// ─── Public compile API ──────────────────────────────────────────────────────
+
+/**
+Compile a regular-expression pattern. Throws `InvalidRegexp` (with the
+failing byte offset embedded in the message) on a parse error. The
+returned value is safe to share — there is no per-match mutable state.
+*/
+export let from_string = fn (src: string) -> Regexp throws { RegexpThrow } do
+  let step = parse_re(p: src, src, i: 0, ngroups: 0)
+  let ParseStep(node: root, pos: after, ngroups) = step
+  let plen = pat_len(p: src)
+  if after < plen then
+    let leftover_b = p_byte_at(p: src, i: after)
+    if leftover_b == 41 then
+      throw InvalidRegexp(src, msg: "unmatched ')' (at position " ++ str.from_i64(val: after) ++ ")")
+    end
+    throw InvalidRegexp(src, msg: "unexpected trailing input (at position " ++ str.from_i64(val: after) ++ ")")
+  end
+  let code = compile_program(root, n_caps: ngroups)
+  return Regexp(src, code, code_len: code_length(code), n_groups: ngroups)
+end
+
+let code_length_go = fn (xs: [ Inst ], n: i64) -> i64 do
+  match xs do
+    | [] -> return n
+    | _ :: rest -> return code_length_go(xs: rest, n: n + 1)
+  end
+end
+
+let code_length = fn (xs: [ Inst ]) -> i64 do return code_length_go(xs, n: 0) end

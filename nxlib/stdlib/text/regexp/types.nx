@@ -1,0 +1,263 @@
+/**
+ * regexp/types: shared internal types, opcodes, bit-set helpers, and
+ * built-in character classes used across parse, exec, and replace layers.
+ */
+
+import * as str from "std:str"
+import * as list from "std:list"
+import { Option, Some, None } from "std:option"
+
+// ─── Public types ────────────────────────────────────────────────────────────
+
+/**
+Raised by `from_string` when the pattern cannot be parsed. `src` is the
+input pattern (verbatim) and `msg` includes a "(at position N)" suffix
+pointing at the byte offset where parsing failed.
+*/
+export exception InvalidRegexp(src: string, msg: string)
+
+/**
+Group covering every exception raised by this module. Sole member is
+InvalidRegexp; the group exists so cross-module callers route errors
+through a stable group name instead of the universal Exn.
+*/
+export exception group RegexpThrow = InvalidRegexp
+
+/**
+A single match. `start` and `end` are byte offsets (end is exclusive),
+`text` is the matched substring sliced out of the input, and `groups`
+holds the capture-group values. `groups[0]` is always `Some(text)` (the
+whole match); subsequent entries are `Some(s)` for groups that
+participated and `None` for groups inside an unfollowed alternation.
+*/
+export type Match = Match(
+  start: i64,
+  end_pos: i64,
+  text: string,
+  groups: [ Option<string> ]
+)
+
+// ─── AST ─────────────────────────────────────────────────────────────────────
+//
+// A CharClass is materialized as a 32-byte (256-bit) bitmap stored as a
+// list of i64 bytes — every membership test is O(1) given the byte value.
+// The bitmap is built at parse time so the compiler/VM never re-walks the
+// class literal.
+
+export type CharSet = CharSet(bits: [ i64 ])
+
+export type Re =
+    Empty
+  | Lit(byte_val: i64)
+  | AnyByte
+  | Class(set_val: CharSet)
+  | StartAnchor
+  | EndAnchor
+  | Concat(a_node: Re, b_node: Re)
+  | Alt(a_node: Re, b_node: Re)
+  | Star(node: Re)
+  | Plus(node: Re)
+  | Opt(node: Re)
+  | Bounded(node: Re, lo: i64, hi: i64) // hi == -1 → unbounded above
+  | CapGroup(idx: i64, node: Re)
+
+// ─── Bytecode ────────────────────────────────────────────────────────────────
+//
+// Eight opcodes encoded uniformly as `Inst(op, a, b, set)`. Unused operand
+// slots are 0 / empty.
+//
+//   OP_MATCH        terminal accept
+//   OP_BYTE         consume byte == a
+//   OP_ANY          consume any byte
+//   OP_CLASS        consume byte ∈ set
+//   OP_SPLIT        non-consuming, fork into pc=a and pc=b
+//   OP_JMP          non-consuming, jump to pc=a
+//   OP_SAVE         record current input offset into capture slot a
+//   OP_START        non-consuming, match only at the start of input
+//   OP_END          non-consuming, match only at the end of input
+
+export let op_match = 0
+export let op_byte = 1
+export let op_any = 2
+export let op_class = 3
+export let op_split = 4
+export let op_jmp = 5
+export let op_save = 6
+export let op_start = 7
+export let op_end = 8
+
+export let empty_set = CharSet(bits: [])
+
+export type Inst = Inst(op: i64, a_arg: i64, b_arg: i64, set_val: CharSet)
+
+export let inst_op = fn (ins: Inst) -> i64 do
+  let Inst(op, a_arg: _, b_arg: _, set_val: _) = ins
+  return op
+end
+
+export let inst_a = fn (ins: Inst) -> i64 do
+  let Inst(op: _, a_arg, b_arg: _, set_val: _) = ins
+  return a_arg
+end
+
+export let inst_b = fn (ins: Inst) -> i64 do
+  let Inst(op: _, a_arg: _, b_arg, set_val: _) = ins
+  return b_arg
+end
+
+export let inst_set = fn (ins: Inst) -> CharSet do
+  let Inst(op: _, a_arg: _, b_arg: _, set_val) = ins
+  return set_val
+end
+
+export let mk_match = fn () -> Inst do return Inst(op: op_match, a_arg: 0, b_arg: 0, set_val: empty_set) end
+export let mk_byte = fn (b: i64) -> Inst do return Inst(op: op_byte, a_arg: b, b_arg: 0, set_val: empty_set) end
+export let mk_any = fn () -> Inst do return Inst(op: op_any, a_arg: 0, b_arg: 0, set_val: empty_set) end
+export let mk_class = fn (s: CharSet) -> Inst do return Inst(op: op_class, a_arg: 0, b_arg: 0, set_val: s) end
+export let mk_split = fn (a_t: i64, b_t: i64) -> Inst do return Inst(op: op_split, a_arg: a_t, b_arg: b_t, set_val: empty_set) end
+export let mk_jmp = fn (t: i64) -> Inst do return Inst(op: op_jmp, a_arg: t, b_arg: 0, set_val: empty_set) end
+export let mk_save = fn (slot: i64) -> Inst do return Inst(op: op_save, a_arg: slot, b_arg: 0, set_val: empty_set) end
+export let mk_start = fn () -> Inst do return Inst(op: op_start, a_arg: 0, b_arg: 0, set_val: empty_set) end
+export let mk_end = fn () -> Inst do return Inst(op: op_end, a_arg: 0, b_arg: 0, set_val: empty_set) end
+
+// ─── Compiled program ────────────────────────────────────────────────────────
+
+/**
+An opaque compiled regular expression. The instruction stream is kept as
+a list because the simulator never indexes by integer position more than
+once per thread step; `code_at` walks once.
+
+(The type is named `Regexp` rather than the lowercase `regexp` shown in
+the bd sketch — Nexus type names are uppercase.)
+*/
+export type Regexp = Regexp(
+  src: string,
+  code: [ Inst ],
+  code_len: i64,
+  n_groups: i64
+)
+
+// ─── Bit set helpers ─────────────────────────────────────────────────────────
+//
+// 256-bit set stored as 32 i64 bytes (each 0..=255). Cheaper than 4 packed
+// i64 words because Nexus i64 bit ops still go through arithmetic, and
+// most regex classes touch only a handful of bytes.
+
+let empty_bits_go = fn (n: i64, acc: [ i64 ]) -> [ i64 ] do
+  if n <= 0 then return acc end
+  return empty_bits_go(n: n - 1, acc: 0 :: acc)
+end
+
+export let empty_bits = fn () -> [ i64 ] do return empty_bits_go(n: 32, acc: []) end
+
+export let nth_i64 = fn (xs: [ i64 ], n: i64) -> i64 do
+  match xs do
+    | [] -> return 0
+    | v :: rest ->
+      if n <= 0 then return v end
+      return nth_i64(xs: rest, n: n - 1)
+  end
+end
+
+let set_nth_go = fn (xs: [ i64 ], n: i64, v: i64, acc: [ i64 ]) -> [ i64 ] do
+  match xs do
+    | [] -> return rev_i64(xs: acc, ys: [])
+    | h :: rest ->
+      if n <= 0 then
+        return rev_i64(xs: acc, ys: v :: rest)
+      end
+      return set_nth_go(xs: rest, n: n - 1, v, acc: h :: acc)
+  end
+end
+
+let rev_i64 = fn (xs: [ i64 ], ys: [ i64 ]) -> [ i64 ] do
+  match xs do
+    | [] -> return ys
+    | h :: rest -> return rev_i64(xs: rest, ys: h :: ys)
+  end
+end
+
+export let set_nth = fn (xs: [ i64 ], n: i64, v: i64) -> [ i64 ] do
+  return set_nth_go(xs, n, v, acc: [])
+end
+
+// Bit indexing helpers — division and modulo to avoid relying on bit ops
+// being constant-fold-friendly here. Byte index = b/8 (0..31), bit mask
+// inside the byte = 1 << (b & 7), implemented as a small power-of-two table.
+
+let bit_mask_for = fn (lo3: i64) -> i64 do
+  if lo3 == 0 then return 1 end
+  if lo3 == 1 then return 2 end
+  if lo3 == 2 then return 4 end
+  if lo3 == 3 then return 8 end
+  if lo3 == 4 then return 16 end
+  if lo3 == 5 then return 32 end
+  if lo3 == 6 then return 64 end
+  return 128
+end
+
+export let set_add = fn (s: CharSet, b: i64) -> CharSet do
+  let CharSet(bits: bs) = s
+  let bi = b / 8
+  let mask = bit_mask_for(lo3: b - bi * 8)
+  let cur = nth_i64(xs: bs, n: bi)
+  let new_v = cur | mask
+  return CharSet(bits: set_nth(xs: bs, n: bi, v: new_v))
+end
+
+export let set_has = fn (s: CharSet, b: i64) -> bool do
+  if b < 0 || b > 255 then return false end
+  let CharSet(bits: bs) = s
+  let bi = b / 8
+  let mask = bit_mask_for(lo3: b - bi * 8)
+  let cur = nth_i64(xs: bs, n: bi)
+  return (cur & mask) != 0
+end
+
+let add_range_go = fn (s: CharSet, lo: i64, hi: i64) -> CharSet do
+  if lo > hi then return s end
+  return add_range_go(s: set_add(s, b: lo), lo: lo + 1, hi)
+end
+
+export let add_range = fn (s: CharSet, lo: i64, hi: i64) -> CharSet do return add_range_go(s, lo, hi) end
+
+let invert_go = fn (s: CharSet, acc: CharSet, b: i64) -> CharSet do
+  if b > 255 then return acc end
+  let next = if set_has(s, b) then acc else set_add(s: acc, b) end
+  return invert_go(s, acc: next, b: b + 1)
+end
+
+export let invert_set = fn (s: CharSet) -> CharSet do
+  return invert_go(s, acc: CharSet(bits: empty_bits()), b: 0)
+end
+
+export let empty_charset = fn () -> CharSet do return CharSet(bits: empty_bits()) end
+
+// Built-in classes ── \d, \w, \s, and their negations.
+
+export let digit_set = fn () -> CharSet do
+  return add_range(s: empty_charset(), lo: 48, hi: 57)
+end
+
+export let word_set = fn () -> CharSet do
+  let s1 = add_range(s: empty_charset(), lo: 48, hi: 57)
+  let s2 = add_range(s: s1, lo: 65, hi: 90)
+  let s3 = add_range(s: s2, lo: 97, hi: 122)
+  return set_add(s: s3, b: 95) // '_'
+end
+
+export let ws_set = fn () -> CharSet do
+  let s1 = set_add(s: empty_charset(), b: 32)
+  let s2 = set_add(s: s1, b: 9)
+  let s3 = set_add(s: s2, b: 10)
+  let s4 = set_add(s: s3, b: 13)
+  let s5 = set_add(s: s4, b: 12) // \f
+  return set_add(s: s5, b: 11) // \v
+end
+
+export let merge_sets_go = fn (a: CharSet, b: CharSet, i: i64) -> CharSet do
+  if i > 255 then return a end
+  if set_has(s: b, b: i) then return merge_sets_go(a: set_add(s: a, b: i), b, i: i + 1) end
+  return merge_sets_go(a, b, i: i + 1)
+end
+export let merge_sets = fn (a: CharSet, b: CharSet) -> CharSet do return merge_sets_go(a, b, i: 0) end

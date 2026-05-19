@@ -1,0 +1,326 @@
+/**
+ * regexp/exec: NFA thread-set simulation and public match API.
+ * Exports: test, find, find_all
+ */
+
+import * as str from "std:str"
+import * as list from "std:list"
+import { Option, Some, None } from "std:option"
+import {
+  Match,
+  Inst, Regexp,
+  op_match, op_byte, op_any, op_class, op_split, op_jmp, op_save, op_start, op_end,
+  inst_op, inst_a, inst_b, inst_set,
+  mk_match,
+  nth_i64, set_nth, set_has
+} from "std:text/regexp/types"
+
+// ─── NFA Simulation ──────────────────────────────────────────────────────────
+//
+// Thread = (pc, captures). Captures are a list of i64 byte offsets, length
+// 2 * (n_groups + 1); -1 means "not set".
+//
+// We maintain two queues (`current`, `next`) and a per-step "visited"
+// markers list of length `code_len` — a thread whose pc has already been
+// enqueued this step is dropped, which is what bounds total work at
+// O(n × m).
+//
+// The simulator finds the leftmost-longest match (greedy):
+//   - For each position in the input, advance the thread set by reading
+//     one byte. If a thread hits Match, remember its captures and the
+//     end position; keep advancing the set with the same start in case a
+//     later byte yields a longer match (still leftmost since we keep the
+//     same start).
+
+type Thread = Thread(pc: i64, caps: [ i64 ])
+
+let make_caps_go = fn (n: i64, acc: [ i64 ]) -> [ i64 ] do
+  if n <= 0 then return acc end
+  return make_caps_go(n: n - 1, acc: (0 - 1) :: acc)
+end
+
+let make_caps = fn (n_groups: i64) -> [ i64 ] do
+  // Slots: 2 per group (group 0 included), so length is 2 * (n_groups + 1).
+  let n_slots = (n_groups + 1) * 2
+  return make_caps_go(n: n_slots, acc: [])
+end
+
+// Fetch an instruction at index `pc`. We pay O(pc) per fetch, but pc is
+// bounded by code_len and the thread set is bounded by code_len, so the
+// whole step is O(m^2) in the pathological worst case — still O(n × m^2)
+// total. For the regex sizes this stdlib targets (< a few hundred
+// instructions), the constant factor wins over carrying a more elaborate
+// random-access encoding.
+let code_at = fn (code: [ Inst ], pc: i64) -> Inst do
+  match code do
+    | [] -> return mk_match() // unreachable for well-formed pc
+    | h :: rest ->
+      if pc <= 0 then return h end
+      return code_at(code: rest, pc: pc - 1)
+  end
+end
+
+// Visited list: 0 means "not seen this step", non-zero means "seen".
+let visited_get = fn (xs: [ i64 ], pc: i64) -> bool do
+  match xs do
+    | [] -> return false
+    | v :: rest ->
+      if pc <= 0 then return v != 0 end
+      return visited_get(xs: rest, pc: pc - 1)
+  end
+end
+
+let visited_set = fn (xs: [ i64 ], pc: i64) -> [ i64 ] do
+  return set_nth(xs, n: pc, v: 1)
+end
+
+let visited_init_go = fn (n: i64, acc: [ i64 ]) -> [ i64 ] do
+  if n <= 0 then return acc end
+  return visited_init_go(n: n - 1, acc: 0 :: acc)
+end
+let visited_init = fn (n: i64) -> [ i64 ] do return visited_init_go(n, acc: []) end
+
+// Add a thread at `pc` to the queue, performing eager epsilon-closure on
+// Split/Jmp/Save/anchors. The visited array is updated in place.
+type AddState = AddState(threads: [ Thread ], visited: [ i64 ])
+
+let set_cap_at = fn (caps: [ i64 ], slot: i64, val: i64) -> [ i64 ] do
+  return set_nth(xs: caps, n: slot, v: val)
+end
+
+let as_threads = fn (st: AddState) -> [ Thread ] do
+  let AddState(threads, visited: _) = st
+  return threads
+end
+
+let as_visited = fn (st: AddState) -> [ i64 ] do
+  let AddState(threads: _, visited) = st
+  return visited
+end
+
+let add_thread = fn (
+  code: [ Inst ], code_len: i64, pc: i64, caps: [ i64 ], pos: i64,
+  s: string, slen: i64, st: AddState
+) -> AddState do
+  if pc < 0 || pc >= code_len then return st end
+  if visited_get(xs: as_visited(st), pc) then return st end
+  let st1 = AddState(threads: as_threads(st), visited: visited_set(xs: as_visited(st), pc))
+  let ins = code_at(code, pc)
+  let op_v = inst_op(ins)
+  if op_v == op_split then
+    // Process the HIGH-priority branch (`inst_a`) first so it claims the
+    // visited slot on a shared pc with the high-priority caps. The list
+    // is reversed at the add_thread/step boundary, so head-position
+    // changes between accumulation and iteration order.
+    let st_a = add_thread(code, code_len, pc: inst_a(ins), caps, pos, s, slen, st: st1)
+    return add_thread(code, code_len, pc: inst_b(ins), caps, pos, s, slen, st: st_a)
+  end
+  if op_v == op_jmp then
+    return add_thread(code, code_len, pc: inst_a(ins), caps, pos, s, slen, st: st1)
+  end
+  if op_v == op_save then
+    let caps2 = set_cap_at(caps, slot: inst_a(ins), val: pos)
+    return add_thread(code, code_len, pc: pc + 1, caps: caps2, pos, s, slen, st: st1)
+  end
+  if op_v == op_start then
+    if pos == 0 then
+      return add_thread(code, code_len, pc: pc + 1, caps, pos, s, slen, st: st1)
+    end
+    return st1
+  end
+  if op_v == op_end then
+    if pos >= slen then
+      return add_thread(code, code_len, pc: pc + 1, caps, pos, s, slen, st: st1)
+    end
+    return st1
+  end
+  // Consuming opcode: enqueue.
+  let nt = Thread(pc, caps)
+  return AddState(threads: nt :: as_threads(st: st1), visited: as_visited(st: st1))
+end
+
+type StepResult = StepResult(threads: [ Thread ], matched: bool, match_caps: [ i64 ])
+
+// Run one input byte through `threads`. Returns the surviving thread set
+// for the next step plus an optional "best match so far". The match list
+// is preserved (and updated) across calls.
+let step_threads = fn (
+  code: [ Inst ], code_len: i64, threads: [ Thread ], byte_val: i64,
+  pos: i64, s: string, slen: i64, prior_match: bool, prior_caps: [ i64 ]
+) -> StepResult do
+  let init = AddState(threads: [], visited: visited_init(n: code_len))
+  return step_threads_go(code, code_len, threads, byte_val, pos, s, slen,
+    prior_match, prior_caps, st: init)
+end
+
+let step_threads_go = fn (
+  code: [ Inst ], code_len: i64, threads: [ Thread ], byte_val: i64,
+  pos: i64, s: string, slen: i64, prior_match: bool, prior_caps: [ i64 ],
+  st: AddState
+) -> StepResult do
+  match threads do
+    | [] ->
+      // Reverse: add_thread prepends to keep insertion O(1); we want
+      // higher-priority threads (those reached via inst_a first) at the
+      // head of the next iteration. The reverse flips the accumulated
+      // order so first-added (highest priority) wins on the next step.
+      return StepResult(threads: list.reverse(xs: as_threads(st)), matched: prior_match, match_caps: prior_caps)
+    | Thread(pc, caps) :: rest ->
+      let ins = code_at(code, pc)
+      let op_v = inst_op(ins)
+      if op_v == op_match then
+        // Record this match and drop lower-priority threads (they would
+        // produce strictly worse matches under leftmost-greedy semantics).
+        // Continuing to advance the higher-priority threads still in `st`
+        // is what lets greedy quantifiers extend further on the next byte.
+        return StepResult(threads: list.reverse(xs: as_threads(st)), matched: true, match_caps: caps)
+      end
+      if op_v == op_byte then
+        if byte_val == inst_a(ins) then
+          let st2 = add_thread(code, code_len, pc: pc + 1, caps, pos: pos + 1, s, slen, st)
+          return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st: st2)
+        end
+        return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st)
+      end
+      if op_v == op_any then
+        if byte_val >= 0 then
+          let st2 = add_thread(code, code_len, pc: pc + 1, caps, pos: pos + 1, s, slen, st)
+          return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st: st2)
+        end
+        return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st)
+      end
+      if op_v == op_class then
+        if byte_val >= 0 && set_has(s: inst_set(ins), b: byte_val) then
+          let st2 = add_thread(code, code_len, pc: pc + 1, caps, pos: pos + 1, s, slen, st)
+          return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st: st2)
+        end
+        return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st)
+      end
+      // Non-consuming opcodes reach here only if add_thread didn't strip
+      // them — keep them on the dead-thread floor.
+      return step_threads_go(code, code_len, threads: rest, byte_val, pos, s, slen, prior_match, prior_caps, st)
+  end
+end
+
+// Drive a single match attempt starting at byte offset `start_pos`. Returns
+// Some(match_caps) (with capture slots filled in) if any path accepted, or
+// None.
+let search_at = fn (
+  re: Regexp, s: string, slen: i64, start_pos: i64
+) -> Option<[ i64 ]> do
+  let Regexp(src: _, code, code_len, n_groups) = re
+  let caps0 = make_caps(n_groups)
+  // Seed the thread set with pc=0 at start_pos.
+  let init_add = AddState(threads: [], visited: visited_init(n: code_len))
+  let seeded = add_thread(code, code_len, pc: 0, caps: caps0, pos: start_pos, s, slen, st: init_add)
+  return drive_match(code, code_len, threads: list.reverse(xs: as_threads(st: seeded)), pos: start_pos, s, slen, matched: false, caps: caps0)
+end
+
+let drive_match = fn (
+  code: [ Inst ], code_len: i64, threads: [ Thread ], pos: i64,
+  s: string, slen: i64, matched: bool, caps: [ i64 ]
+) -> Option<[ i64 ]> do
+  match threads do
+    | [] ->
+      if matched then return Some(val: caps) end
+      return None
+    | _ :: _ ->
+      if pos >= slen then
+        // EOF: flush via step with byte_val = -1 so no consumer fires.
+        let final_result = step_threads(code, code_len, threads, byte_val: 0 - 1, pos, s, slen, prior_match: matched, prior_caps: caps)
+        let StepResult(threads: _, matched: m_final, match_caps: caps_final) = final_result
+        if m_final then return Some(val: caps_final) end
+        return None
+      end
+      let b = str.char_code(s: str.byte_substring(s, start: pos, len: 1), idx: 0)
+      let step = step_threads(code, code_len, threads, byte_val: b, pos, s, slen, prior_match: matched, prior_caps: caps)
+      let StepResult(threads: next_threads, matched: m2, match_caps: caps2) = step
+      return drive_match(code, code_len, threads: next_threads, pos: pos + 1, s, slen, matched: m2, caps: caps2)
+  end
+end
+
+// ─── Public match API ────────────────────────────────────────────────────────
+
+/**
+Returns true if `re` matches anywhere inside `s` (substring containment
+semantics, like `Regexp.is_match` in most languages).
+*/
+export let test = fn (re: Regexp, s: string) -> bool do
+  match find(re, s) do
+    | Some(_) -> return true
+    | None -> return false
+  end
+end
+
+let nth_cap = fn (caps: [ i64 ], n: i64) -> i64 do return nth_i64(xs: caps, n) end
+
+let caps_to_groups_go = fn (
+  caps: [ i64 ], s: string, idx: i64, n_groups: i64, acc: [ Option<string> ]
+) -> [ Option<string> ] do
+  if idx > n_groups then return list.reverse(xs: acc) end
+  let start_p = nth_cap(caps, n: idx * 2)
+  let end_p = nth_cap(caps, n: idx * 2 + 1)
+  let entry = if start_p < 0 || end_p < 0 then
+    None
+  else
+    Some(val: str.byte_substring(s, start: start_p, len: end_p - start_p))
+  end
+  return caps_to_groups_go(caps, s, idx: idx + 1, n_groups, acc: entry :: acc)
+end
+
+let caps_to_match = fn (caps: [ i64 ], s: string, n_groups: i64) -> Match do
+  let start_p = nth_cap(caps, n: 0)
+  let end_p = nth_cap(caps, n: 1)
+  let text = str.byte_substring(s, start: start_p, len: end_p - start_p)
+  return Match(
+    start: start_p,
+    end_pos: end_p,
+    text,
+    groups: caps_to_groups_go(caps, s, idx: 0, n_groups, acc: [])
+  )
+end
+
+/**
+Find the leftmost match of `re` in `s`. Returns the match record or
+`None`. Greedy semantics: among all matches starting at the leftmost
+position, the longest is returned.
+*/
+export let find = fn (re: Regexp, s: string) -> Option<Match> do
+  let slen = str.byte_length(s)
+  return find_from(re, s, slen, start_pos: 0)
+end
+
+export let find_from = fn (re: Regexp, s: string, slen: i64, start_pos: i64) -> Option<Match> do
+  if start_pos > slen then return None end
+  match search_at(re, s, slen, start_pos) do
+    | Some(val: caps) ->
+      let Regexp(src: _, code: _, code_len: _, n_groups) = re
+      return Some(val: caps_to_match(caps, s, n_groups))
+    | None ->
+      if start_pos >= slen then return None end
+      return find_from(re, s, slen, start_pos: start_pos + 1)
+  end
+end
+
+/**
+Return every non-overlapping match of `re` in `s`, left-to-right. Empty
+matches are emitted but do not stall progress — the search position
+advances by at least one byte after a zero-width hit.
+*/
+export let find_all = fn (re: Regexp, s: string) -> [ Match ] do
+  let slen = str.byte_length(s)
+  return list.reverse(xs: find_all_go(re, s, slen, start_pos: 0, acc: []))
+end
+
+let find_all_go = fn (
+  re: Regexp, s: string, slen: i64, start_pos: i64, acc: [ Match ]
+) -> [ Match ] do
+  if start_pos > slen then return acc end
+  match find_from(re, s, slen, start_pos) do
+    | None -> return acc
+    | Some(val: m) ->
+      let Match(start: _, end_pos: e, text: _, groups: _) = m
+      let next_start = if e <= start_pos then start_pos + 1 else e end
+      return find_all_go(re, s, slen, start_pos: next_start, acc: m :: acc)
+  end
+end

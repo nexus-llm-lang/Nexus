@@ -1,0 +1,193 @@
+/**
+ * regexp/replace: template-based replacement and split utilities.
+ * Exports: sub, gsub, gsub_with, split
+ */
+
+import * as str from "std:str"
+import * as list from "std:list"
+import { Option, Some, None } from "std:option"
+import {
+  Match,
+  Regexp
+} from "std:text/regexp/types"
+import { find_from } from "std:text/regexp/exec"
+
+// ─── Replacement helpers ─────────────────────────────────────────────────────
+//
+// `$&` expands to the whole match, `$N` (N in 1..=9) expands to group N's
+// text (empty string when the group did not participate), and `$$` is a
+// literal `$`. Anything else passes through verbatim.
+
+let expand_template_go = fn (
+  repl: string, rlen: i64, i: i64, m: Match, acc: string
+) -> string do
+  if i >= rlen then return acc end
+  let b = str.char_code(s: str.byte_substring(s: repl, start: i, len: 1), idx: 0)
+  if b != 36 then // '$'
+    let chunk = str.byte_substring(s: repl, start: i, len: 1)
+    return expand_template_go(repl, rlen, i: i + 1, m, acc: acc ++ chunk)
+  end
+  if i + 1 >= rlen then
+    let chunk = str.byte_substring(s: repl, start: i, len: 1)
+    return expand_template_go(repl, rlen, i: i + 1, m, acc: acc ++ chunk)
+  end
+  let nb = str.char_code(s: str.byte_substring(s: repl, start: i + 1, len: 1), idx: 0)
+  if nb == 36 then // '$$'
+    return expand_template_go(repl, rlen, i: i + 2, m, acc: acc ++ "$")
+  end
+  if nb == 38 then // '$&'
+    let Match(start: _, end_pos: _, text, groups: _) = m
+    return expand_template_go(repl, rlen, i: i + 2, m, acc: acc ++ text)
+  end
+  if nb >= 48 && nb <= 57 then
+    let idx = nb - 48
+    let chunk = group_text(m, idx)
+    return expand_template_go(repl, rlen, i: i + 2, m, acc: acc ++ chunk)
+  end
+  // Unrecognized: pass `$` through literally.
+  let chunk = str.byte_substring(s: repl, start: i, len: 1)
+  return expand_template_go(repl, rlen, i: i + 1, m, acc: acc ++ chunk)
+end
+
+let group_text = fn (m: Match, idx: i64) -> string do
+  let Match(start: _, end_pos: _, text: _, groups) = m
+  let entry = nth_opt(xs: groups, n: idx)
+  match entry do
+    | Some(val: s) -> return s
+    | None -> return ""
+  end
+end
+
+let nth_opt = fn (xs: [ Option<string> ], n: i64) -> Option<string> do
+  match xs do
+    | [] -> return None
+    | v :: rest ->
+      if n <= 0 then return v end
+      return nth_opt(xs: rest, n: n - 1)
+  end
+end
+
+let expand_template = fn (repl: string, m: Match) -> string do
+  return expand_template_go(repl, rlen: str.byte_length(s: repl), i: 0, m, acc: "")
+end
+
+// ─── Public replace / split API ──────────────────────────────────────────────
+
+/**
+Replace only the first match in `s`. `repl` supports `$&` (whole match),
+`$1..$9` (group captures), and `$$` (literal `$`). Other `$X` sequences
+pass through verbatim.
+*/
+export let sub = fn (re: Regexp, s: string, repl: string) -> string do
+  let slen = str.byte_length(s)
+  match find_from(re, s, slen, start_pos: 0) do
+    | None -> return s
+    | Some(val: m) ->
+      let Match(start: a, end_pos: b, text: _, groups: _) = m
+      let prefix = str.byte_substring(s, start: 0, len: a)
+      let suffix = str.byte_substring(s, start: b, len: slen - b)
+      return prefix ++ expand_template(repl, m) ++ suffix
+  end
+end
+
+/**
+Replace every non-overlapping match in `s`. Zero-width matches consume
+one byte each (copied verbatim) so the loop always makes progress.
+*/
+export let gsub = fn (re: Regexp, s: string, repl: string) -> string do
+  let slen = str.byte_length(s)
+  return gsub_go(re, s, slen, start_pos: 0, repl, acc: "")
+end
+
+let gsub_go = fn (
+  re: Regexp, s: string, slen: i64, start_pos: i64, repl: string, acc: string
+) -> string do
+  if start_pos > slen then return acc end
+  match find_from(re, s, slen, start_pos) do
+    | None ->
+      let tail = str.byte_substring(s, start: start_pos, len: slen - start_pos)
+      return acc ++ tail
+    | Some(val: m) ->
+      let Match(start: a, end_pos: b, text: _, groups: _) = m
+      let prefix = str.byte_substring(s, start: start_pos, len: a - start_pos)
+      let replaced = expand_template(repl, m)
+      let acc2 = acc ++ prefix ++ replaced
+      // Zero-width: advance by one and copy that byte verbatim so we make
+      // progress without dropping content.
+      if b <= a then
+        if a >= slen then return acc2 end
+        let one = str.byte_substring(s, start: a, len: 1)
+        return gsub_go(re, s, slen, start_pos: a + 1, repl, acc: acc2 ++ one)
+      end
+      return gsub_go(re, s, slen, start_pos: b, repl, acc: acc2)
+  end
+end
+
+/**
+Functional variant of `gsub`: each match is fed to the user-supplied
+callback whose return value becomes the replacement. Useful for context-
+sensitive replacements that cannot be expressed as a template.
+*/
+export let gsub_with = fn (re: Regexp, s: string, f: (m: Match) -> string) -> string do
+  let slen = str.byte_length(s)
+  return gsub_with_go(re, s, slen, start_pos: 0, f, acc: "")
+end
+
+let gsub_with_go = fn (
+  re: Regexp, s: string, slen: i64, start_pos: i64, f: (m: Match) -> string, acc: string
+) -> string do
+  if start_pos > slen then return acc end
+  match find_from(re, s, slen, start_pos) do
+    | None ->
+      let tail = str.byte_substring(s, start: start_pos, len: slen - start_pos)
+      return acc ++ tail
+    | Some(val: m) ->
+      let Match(start: a, end_pos: b, text: _, groups: _) = m
+      let prefix = str.byte_substring(s, start: start_pos, len: a - start_pos)
+      let replaced = f(m)
+      let acc2 = acc ++ prefix ++ replaced
+      if b <= a then
+        if a >= slen then return acc2 end
+        let one = str.byte_substring(s, start: a, len: 1)
+        return gsub_with_go(re, s, slen, start_pos: a + 1, f, acc: acc2 ++ one)
+      end
+      return gsub_with_go(re, s, slen, start_pos: b, f, acc: acc2)
+  end
+end
+
+/**
+Split `s` on every non-overlapping match of `re`. The separator text is
+dropped; the surrounding substrings (possibly empty) are returned in
+order. An empty pattern returns the input as a single element to avoid
+emitting one entry per character (which the literal `std:str.split` also
+does for an empty separator).
+*/
+export let split = fn (re: Regexp, s: string) -> [ string ] do
+  let slen = str.byte_length(s)
+  return list.reverse(xs: split_go(re, s, slen, start_pos: 0, acc: []))
+end
+
+let split_go = fn (
+  re: Regexp, s: string, slen: i64, start_pos: i64, acc: [ string ]
+) -> [ string ] do
+  match find_from(re, s, slen, start_pos) do
+    | None ->
+      let tail = str.byte_substring(s, start: start_pos, len: slen - start_pos)
+      return tail :: acc
+    | Some(val: m) ->
+      let Match(start: a, end_pos: b, text: _, groups: _) = m
+      // Zero-width match: advance by one byte and append a single-char
+      // piece so split doesn't infinite-loop. The element added is the
+      // byte we had to skip, preserving the input on reassembly.
+      if b <= a then
+        if a >= slen then
+          let tail = str.byte_substring(s, start: start_pos, len: slen - start_pos)
+          return tail :: acc
+        end
+        let prefix = str.byte_substring(s, start: start_pos, len: a - start_pos)
+        return split_go(re, s, slen, start_pos: a + 1, acc: prefix :: acc)
+      end
+      let prefix = str.byte_substring(s, start: start_pos, len: a - start_pos)
+      return split_go(re, s, slen, start_pos: b, acc: prefix :: acc)
+  end
+end
