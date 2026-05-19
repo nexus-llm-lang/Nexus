@@ -7,9 +7,9 @@
  * memory (head pointer cached in the reserved low-memory cell at offset 16;
  * see `fd_table_cell`). Each `fd_open_*` success copies the opened path
  * into the table keyed by the returned fd (overwriting any stale entry for
- * the same fd); `fd_close` does not prune (a closed-then-reopened fd is
- * re-keyed on the next open). `read_to_string` / `write_string` / etc. use
- * the internal `open_path_*` helpers and do NOT touch the table.
+ * the same fd); `fd_close` prunes the fd from the table (swap-with-last).
+ * `read_to_string` / `write_string` / etc. use the internal `open_path_*`
+ * helpers and do NOT touch the table.
  */
 import * as mem from "std:runtime/mem"
 import * as core from "std:runtime/sysio/core"
@@ -18,7 +18,8 @@ import * as core from "std:runtime/sysio/core"
 Linear-memory cell holding the (lazily allocated) fd->path side-table
 pointer. Reserved low memory at offset 16. 0 means "not yet allocated".
 The table is `[count: i64, cap: i64, then cap*(fd:i64, path_ptr:i64,
-path_len:i64)]`; entries are appended/overwritten, never removed.
+path_len:i64)]`; entries are appended/overwritten; fd_close removes by
+swap-with-last.
 */
 let fd_table_cell = 16
 /** Bytes per fd-table entry: (fd, path_ptr, path_len). */
@@ -95,9 +96,41 @@ export let remove_file = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
 end
 
 /**
-create_dir_all(path): path_create_directory of the LAST component only
-(preview1 has no recursive mkdir; parents must already exist -- documented
-limitation). Returns 1 on success (or if it already exists as a dir) / 0
+mkdir_one(path_ptr, path_len): create the directory named by (path_ptr,
+path_len), treating EEXIST (WASI errno 20) as success. Returns true iff the
+errno is 0 or 20.
+*/
+let mkdir_one = fn (path_ptr: i64, path_len: i64) -> bool do
+  if path_len <= 0 then return true end
+  let s = core.scratch()
+  let triple = s + core.sl_triple
+  let _ = core.resolve_path(path_ptr, path_len, out: triple)
+  let dirfd = mem.load_i64(addr: triple)
+  let rp = mem.load_i64(addr: triple + 8)
+  let rl = mem.load_i64(addr: triple + 16)
+  if rl <= 0 then return false end
+  let errno = core.w_path_create_directory(a_dirfd: core.i32of(x: dirfd), b_path_ptr: core.i32of(x: rp), c_path_len: core.i32of(x: rl))
+  return errno == core.i32of(x: 0) || errno == core.i32of(x: 20)
+end
+
+/**
+Walk the path and issue mkdir for each prefix that ends at a '/' separator,
+then for the full path. `i` starts at 1 (skip leading '/') and advances to
+path_len. Each call returns false immediately if a non-EEXIST mkdir fails.
+*/
+let mkdir_walk = fn (path_ptr: i64, path_len: i64, i: i64) -> bool do
+  if i > path_len then return true end
+  if i == path_len then return mkdir_one(path_ptr, path_len) end
+  if mem.load_u8(addr: path_ptr + i) == 47 then
+    if !mkdir_one(path_ptr, path_len: i) then return false end
+  end
+  return mkdir_walk(path_ptr, path_len, i: i + 1)
+end
+
+/**
+create_dir_all(path): recursively create the full directory path, creating
+each missing component in order (preview1 path_create_directory one level at
+a time). Returns 1 on success (or if the path already exists as a dir) / 0
 else. wasm sig (i32 i32) -> i32 (bool).
 */
 export let create_dir_all = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
@@ -107,14 +140,7 @@ export let create_dir_all = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
   if core.do_path_filestat(path_ptr: pp, path_len: pl) == 0 then
     return mem.load_u8(addr: core.filestat_slot() + 16) == core.filetype_directory
   end
-  let s = core.scratch()
-  let triple = s + core.sl_triple
-  let _ = core.resolve_path(path_ptr: pp, path_len: pl, out: triple)
-  let dirfd = mem.load_i64(addr: triple)
-  let rp = mem.load_i64(addr: triple + 8)
-  let rl = mem.load_i64(addr: triple + 16)
-  if rl <= 0 then return false end
-  return core.w_path_create_directory(a_dirfd: core.i32of(x: dirfd), b_path_ptr: core.i32of(x: rp), c_path_len: core.i32of(x: rl)) == core.i32of(x: 0)
+  return mkdir_walk(path_ptr: pp, path_len: pl, i: 1)
 end
 
 /**
@@ -353,6 +379,28 @@ let fd_table_grow = fn (h0: i64) -> i64 do
   return h
 end
 
+/**
+Remove the entry for `fd` from the table (if present) by swap-with-last.
+O(n) find + O(1) removal; keeps the table compact.
+*/
+let fd_table_remove = fn (fd: i64) -> unit do
+  let cur = mem.load_i64(addr: fd_table_cell)
+  if cur == 0 then return () end
+  let idx = ft_find(h: cur, fd)
+  if idx < 0 then return () end
+  let n = ft_count(cur)
+  let last = n - 1
+  if idx != last then
+    let dst = ft_entry(h: cur, i: idx)
+    let src = ft_entry(h: cur, i: last)
+    let _ = mem.store_i64(addr: dst, val: mem.load_i64(addr: src))
+    let _ = mem.store_i64(addr: dst + 8, val: mem.load_i64(addr: src + 8))
+    let _ = mem.store_i64(addr: dst + 16, val: mem.load_i64(addr: src + 16))
+  end
+  let _ = ft_set_count(cur, v: last)
+  return ()
+end
+
 /** Common open path: open via `opener`, and on success record the path. */
 let fd_open_and_track = fn (path_ptr: i64, path_len: i64, fd: i64) -> i64 do
   if fd >= 0 then let _ = fd_table_put(fd, path_ptr, path_len) end
@@ -393,12 +441,14 @@ export let fd_open_append = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
 end
 
 /**
-fd_close(fd): close the fd. Returns 1 on success / 0 on bad fd.
-wasm sig (i64) -> i32 (bool).
+fd_close(fd): close the fd and prune it from the fd-table. Returns 1 on
+success / 0 on bad fd. wasm sig (i64) -> i32 (bool).
 */
 export let fd_close = fn (a_fd: i64) -> bool do
   if a_fd < 0 then return false end
-  return core.w_fd_close(a_fd: core.i32of(x: a_fd)) == core.i32of(x: 0)
+  let ok = core.w_fd_close(a_fd: core.i32of(x: a_fd)) == core.i32of(x: 0)
+  if ok then let _ = fd_table_remove(fd: a_fd) end
+  return ok
 end
 
 /**
