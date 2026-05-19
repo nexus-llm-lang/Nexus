@@ -66,13 +66,36 @@ let peek_at = fn (st: LexerState, offset: i64) -> char do
   return str.byte_at(s, idx)
 end
 
+// UTF-8 sequence length from the lead byte's integer value.
+// Continuation bytes (0x80-0xBF) are treated as 1 to avoid stalls.
+let utf8_seq_len = fn (b: i64) -> i64 do
+  if b < 128 then return 1 end
+  if b < 192 then return 1 end
+  if b < 224 then return 2 end
+  if b < 240 then return 3 end
+  return 4
+end
+
+// UTF-16 code units for a codepoint whose UTF-8 encoding has `seq` bytes.
+// 4-byte sequences (U+10000 and above) encode as surrogate pairs (2 units);
+// all others are 1 unit.
+let utf16_units = fn (seq: i64) -> i64 do
+  if seq == 4 then return 2 end
+  return 1
+end
+
+// advance() skips one Unicode codepoint (full UTF-8 sequence) and tracks
+// the column in UTF-16 code units, matching LSP convention.
 let advance = fn (st: LexerState) -> LexerState do
   let LexerState(src: s, sp: SourcePos(pos: p, line: ln, col: c), len: l) = st
+  if p >= l then return st end
   if str.byte_at(s, idx: p) == ch_newline then
     return LexerState(src: s, sp: SourcePos(pos: p + 1, line: ln + 1, col: 1), len: l)
-  else
-    return LexerState(src: s, sp: SourcePos(pos: p + 1, line: ln, col: c + 1), len: l)
   end
+  let b = char.ord(c: str.byte_at(s, idx: p))
+  let seq = utf8_seq_len(b)
+  let units = utf16_units(seq)
+  return LexerState(src: s, sp: SourcePos(pos: p + seq, line: ln, col: c + units), len: l)
 end
 
 let advance_n = fn (st: LexerState, n: i64) -> LexerState do
@@ -197,15 +220,26 @@ end
 // `/` — otherwise `/**/` (empty block comment) would qualify, and the issue
 // explicitly excludes that shape.
 
-let scan_to_close_star_slash = fn (st: LexerState) -> Option<i64> do
+// scan_to_close_star_slash finds the closing `*/` for a nested block comment,
+// respecting nesting depth. Returns the byte offset of the `*` that closes
+// the outermost comment, or None if the source is unterminated.
+// `depth` must be >= 1 on the initial call (the outer `/*` has already been
+// consumed; the scan starts just inside the opening delimiter).
+let scan_to_close_star_slash = fn (st: LexerState, depth: i64) -> Option<i64> do
   if at_end(st) then return None end
   let c = peek(st)
   let c2 = peek_at(st, offset: 1)
   if c == ch_star && c2 == ch_slash then
-    let LexerState(src: _, sp: SourcePos(pos: p, line: _, col: _), len: _) = st
-    return Some(val: p)
+    if depth <= 1 then
+      let LexerState(src: _, sp: SourcePos(pos: p, line: _, col: _), len: _) = st
+      return Some(val: p)
+    end
+    return scan_to_close_star_slash(st: advance_n(st, n: 2), depth: depth - 1)
   end
-  return scan_to_close_star_slash(st: advance(st))
+  if c == ch_slash && c2 == ch_star then
+    return scan_to_close_star_slash(st: advance_n(st, n: 2), depth: depth + 1)
+  end
+  return scan_to_close_star_slash(st: advance(st), depth)
 end
 
 /** Scan the source prefix for a `/** ... */` block comment and return its
@@ -227,7 +261,7 @@ export let extract_module_doc = fn (src: string) -> Option<string> do
   if str.byte_at(s: src, idx: after_ws + 3) == ch_slash then return None end
   let body_start = after_ws + 3
   let st = LexerState(src, sp: SourcePos(pos: body_start, line: 1, col: 1), len)
-  match scan_to_close_star_slash(st) do
+  match scan_to_close_star_slash(st, depth: 1) do
     | None -> return None
     | Some(val: close_pos) ->
       let content = str.byte_substring(s: src, start: body_start, len: close_pos - body_start)
@@ -439,6 +473,11 @@ let lex_char_escape = fn (st: LexerState, span: Span, c2: char) -> LexResult do
   if c2 == 'r' then return lex_char_close(st: advance_n(st, n: 2), span, code: 13) end
   if c2 == 't' then return lex_char_close(st: advance_n(st, n: 2), span, code: 9) end
   if c2 == '0' then return lex_char_close(st: advance_n(st, n: 2), span, code: 0) end
+  if c2 == 'a' then return lex_char_close(st: advance_n(st, n: 2), span, code: 7) end
+  if c2 == 'b' then return lex_char_close(st: advance_n(st, n: 2), span, code: 8) end
+  if c2 == 'v' then return lex_char_close(st: advance_n(st, n: 2), span, code: 11) end
+  if c2 == 'f' then return lex_char_close(st: advance_n(st, n: 2), span, code: 12) end
+  if c2 == 'e' then return lex_char_close(st: advance_n(st, n: 2), span, code: 27) end
   if c2 == ch_backslash then return lex_char_close(st: advance_n(st, n: 2), span, code: 92) end
   if c2 == ch_squote then return lex_char_close(st: advance_n(st, n: 2), span, code: 39) end
   if c2 == 'u' then
@@ -449,6 +488,35 @@ let lex_char_escape = fn (st: LexerState, span: Span, c2: char) -> LexResult do
         | LexHexErr(st: st3, msg) ->
           return spanned(st: st3, token: TkError(msg), span)
       end
+    end
+  end
+  // Hex escape: \xNN (exactly 2 hex digits)
+  if c2 == 'x' then
+    let h1 = peek_at(st, offset: 2)
+    let h2 = peek_at(st, offset: 3)
+    let v1 = char.hex_digit_value(c: h1)
+    let v2 = char.hex_digit_value(c: h2)
+    if v1 >= 0 && v2 >= 0 then
+      return lex_char_close(st: advance_n(st, n: 4), span, code: v1 * 16 + v2)
+    else
+      return spanned(st: advance_n(st, n: 2), token: TkError(msg: "\\x requires exactly 2 hex digits"), span)
+    end
+  end
+  // Octal escape: \NNN (1-3 octal digits)
+  if c2 >= '0' && c2 <= '7' then
+    let d1 = char.digit_value(c: c2)
+    let c3 = peek_at(st, offset: 2)
+    if c3 >= '0' && c3 <= '7' then
+      let d2 = char.digit_value(c: c3)
+      let c4 = peek_at(st, offset: 3)
+      if c4 >= '0' && c4 <= '7' then
+        let d3 = char.digit_value(c: c4)
+        return lex_char_close(st: advance_n(st, n: 4), span, code: d1 * 64 + d2 * 8 + d3)
+      else
+        return lex_char_close(st: advance_n(st, n: 3), span, code: d1 * 8 + d2)
+      end
+    else
+      return lex_char_close(st: advance_n(st, n: 2), span, code: d1)
     end
   end
   return spanned(st: advance_n(st, n: 2), token: TkError(msg: "unknown char escape"), span)
