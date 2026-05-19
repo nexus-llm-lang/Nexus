@@ -788,7 +788,6 @@ if [ "$TEST_MODE" = "1" ]; then
       --junit) TEST_JUNIT="${2:-}"; shift 2 ;;
       --coverage) TEST_COVERAGE=1; shift ;;
       --lcov) TEST_LCOV="${2:-}"; shift 2 ;;
-      --nexus-bin|--wasmtime-bin) shift 2 ;;  # legacy, accepted + ignored
       --*) shift ;;
       *) TEST_PATH="$1"; shift ;;
     esac
@@ -1377,7 +1376,6 @@ if [ "$BENCH_MODE" = "1" ]; then
       --dir)       BENCH_DIR="${2:-}"; shift 2 ;;
       --iters)     BENCH_ITERS="${2:-5}"; shift 2 ;;
       --baseline)  BENCH_BASELINE="${2:-}"; shift 2 ;;
-      --nexus-bin|--wasmtime-bin) shift 2 ;;  # accepted + ignored (we use ourselves)
       --*) shift ;;
       *) shift ;;
     esac
