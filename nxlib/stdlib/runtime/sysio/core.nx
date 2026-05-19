@@ -16,13 +16,13 @@
  * ABI order, so alphabetical == positional in both directions.
  *
  * Storage for returned strings + WASI out-param scratch comes from the
- * unified bump arena (`arena.alloc_raw`). A 512-byte scratch region is
- * lazily allocated and its pointer cached in linear-memory cell 8 (the
- * [8,16) slice of the reserved low memory — the bump cell only uses the
- * i64 at offset 0, so 8..16 is free). Reuse of one scratch region is fine
- * single-threaded; with wasi-threads concurrent fs/stdio calls would race
- * it — an accepted, documented caveat, the same as the allocator's reset
- * race.
+ * unified bump arena (`arena.alloc_raw`). `scratch()` allocates a fresh
+ * 512-byte region on every call from the thread-safe atomic bump allocator;
+ * callers must capture the result in a local `let s = scratch()` and use it
+ * only within that single activation — which every call site already does.
+ * This makes concurrent fs/stdio calls race-free with respect to the scratch
+ * region (nexus-kqsq). The prior scheme cached the pointer in low-memory
+ * cell 8 (offset [8,16)) and is no longer used; that slot is now free.
  *
  * Path resolution: WASI path_* ops take a (preopen-dir fd, relative path) pair.
  * `resolve_path` walks the preopen table (fd 3, 4, 5, ...): a preopen named "."
@@ -109,12 +109,6 @@ paths the caller intends to write, so EISDIR-on-write correctly fails.
 */
 let rights_write = 536870911
 /**
-Linear-memory cell holding the (lazily allocated) scratch-region pointer.
-Lives in reserved low memory at offset 8 (the bump cell only uses the
-i64 at offset 0). 0 means "not yet allocated".
-*/
-let scratch_cell = 8
-/**
 Scratch region size (bytes). Holds (at fixed offsets) an iovec, an
 nwritten/nread i32, a seek out-param, args sizes, a (dirfd, rel_ptr, rel_len)
 triple, an opened-fd i32, a prestat, a preopen dir-name buffer, a 64-byte
@@ -156,13 +150,17 @@ export let pack = fn (ptr: i64, len: i64) -> i64 do
   return (ptr * two_pow_32) + len
 end
 
-/** The (lazily allocated) scratch region pointer. */
+/**
+Allocate a fresh 512-byte scratch region from the atomic bump arena.
+Each call returns a new region; callers MUST capture into a local
+`let s = scratch()` and use it within a single activation — never
+pass a scratch pointer across calls or store it globally. This
+per-call allocation strategy is safe under concurrent wasi-threads
+use (nexus-kqsq): every thread gets its own private scratch region
+from the thread-safe atomic bump allocator.
+*/
 export let scratch = fn () -> i64 do
-  let cur = mem.load_i64(addr: scratch_cell)
-  if cur != 0 then return cur end
-  let p = alloc_bytes(n: scratch_size)
-  let _ = mem.store_i64(addr: scratch_cell, val: p)
-  return p
+  return alloc_bytes(n: scratch_size)
 end
 
 /** Copy `count` bytes from `src` to `dst` (forward; non-overlapping). */
@@ -314,11 +312,24 @@ export let open_path_append = fn (path_ptr: i64, path_len: i64) -> i64 do
   return open_path_rights(path_ptr, path_len, oflags: oflag_creat, fdflags: fdflag_append, rights: rights_write)
 end
 
-/** The filestat scratch slot (64 bytes): filetype is u8 at +16, size is u64 at +32. */
+/**
+Allocate a scratch region and return the filestat slot address within it
+(offset sl_filestat = 200). The caller must pass this address to
+`do_path_filestat_into` and read the result from that same address — both
+calls must use the same value returned by a single `filestat_slot()` call
+within one activation. Per-call allocation (nexus-kqsq) means each call to
+`filestat_slot()` returns a new address from the thread-safe arena.
+*/
 export let filestat_slot = fn () -> i64 do return scratch() + sl_filestat end
 
-/** path_filestat_get(path) into the filestat slot; returns errno (0 == ok). */
-export let do_path_filestat = fn (path_ptr: i64, path_len: i64) -> i64 do
+/**
+path_filestat_get(path) into an explicitly provided 64-byte filestat buffer
+at `filestat_ptr`. Returns errno (0 == ok). Callers should pass a value
+returned by `filestat_slot()` (or any suitably-aligned arena allocation of
+>= 64 bytes) and read the filetype / size fields from that same address.
+This explicit-buffer form avoids the cross-call shared-scratch dependency.
+*/
+export let do_path_filestat_into = fn (path_ptr: i64, path_len: i64, filestat_ptr: i64) -> i64 do
   if path_len <= 0 then return 0 - 1 end
   let s = scratch()
   let triple = s + sl_triple
@@ -329,8 +340,19 @@ export let do_path_filestat = fn (path_ptr: i64, path_len: i64) -> i64 do
   if rl <= 0 then return 0 - 1 end
   let errno = w_path_filestat_get(a_dirfd: i32of(x: dirfd), b_flags: i32of(x: lookup_symlink_follow),
                                   c_path_ptr: i32of(x: rp), d_path_len: i32of(x: rl),
-                                  e_filestat_ptr: i32of(x: filestat_slot()))
+                                  e_filestat_ptr: i32of(x: filestat_ptr))
   return i64of(x: errno)
+end
+
+/**
+path_filestat_get(path) into the shared filestat slot; returns errno (0 == ok).
+Deprecated: callers outside core.nx should use `filestat_slot()` +
+`do_path_filestat_into` so that the filestat address is explicit and the
+result can be read back from the same address after return (nexus-kqsq).
+*/
+export let do_path_filestat = fn (path_ptr: i64, path_len: i64) -> i64 do
+  let st = filestat_slot()
+  return do_path_filestat_into(path_ptr, path_len, filestat_ptr: st)
 end
 
 // === fd read/write primitives ===============================================
@@ -344,6 +366,11 @@ export let write_all = fn (fd: i64, buf: i64, len: i64) -> bool do
   let s = scratch()
   let iov = s + sl_iovec
   let nw = s + sl_nrw
+  // WASI preview1 iovec layout is {buf: i32, buf_len: i32} — the buf pointer
+  // field is a 32-bit wasm linear-memory address by ABI spec (nexus-hh3z).
+  // Arena allocations fit in i32 (wasm32 address space is 4 GiB max), so
+  // store_i32 is correct here. If future wasm64 support is added, this will
+  // need to be revisited together with the iovec ABI.
   let _ = mem.store_i32(addr: iov, val: buf)
   let _ = mem.store_i32(addr: iov + 4, val: len)
   let errno = w_fd_write(a_fd: i32of(x: fd), b_iovs_ptr: i32of(x: iov), c_iovs_len: i32of(x: 1), d_nwritten_ptr: i32of(x: nw))
@@ -364,6 +391,8 @@ let read_fill_go = fn (fd: i64, buf: i64, lim: i64, total: i64) -> i64 do
   let s = scratch()
   let iov = s + sl_iovec
   let nr = s + sl_nrw
+  // WASI preview1 iovec buf field is i32 (wasm32 address). See write_all
+  // for the same rationale (nexus-hh3z).
   let _ = mem.store_i32(addr: iov, val: buf + total)
   let _ = mem.store_i32(addr: iov + 4, val: lim - total)
   let errno = w_fd_read(a_fd: i32of(x: fd), b_iovs_ptr: i32of(x: iov), c_iovs_len: i32of(x: 1), d_nread_ptr: i32of(x: nr))
@@ -378,8 +407,10 @@ end
 
 /**
 Read the entire file at `fd` (seeks to 0 first), returning a packed string.
-Uses fd_filestat_get to size the allocation; for a 0/unknown size it falls
-back to a 1 MiB buffer (compiler source files are far smaller).
+Uses fd_filestat_get to size the allocation; for a 0/unknown size (pipes,
+special files) it falls back to a doubling-read loop starting at 64 KiB and
+growing up to 100 MiB, so pipes/procfs entries larger than 1 MiB are read
+correctly (nexus-trpp). Returns 0 on empty or unrecoverable error.
 */
 export let read_whole_fd = fn (fd: i64) -> i64 do
   let s = scratch()
@@ -388,15 +419,36 @@ export let read_whole_fd = fn (fd: i64) -> i64 do
   let have_stat = w_fd_filestat_get(a_fd: i32of(x: fd), b_filestat_ptr: i32of(x: st)) == i32of(x: 0)
   let sz = if have_stat then mem.load_i64(addr: st + 32) else 0 end
   if sz == 0 then
-    let fb = alloc_bytes(n: 1048576)
-    let g0 = read_fill(fd, buf: fb, lim: 1048576)
-    if g0 <= 0 then return 0 end
-    return pack(ptr: fb, len: g0)
+    return read_whole_fd_grow(fd, bufsz: 65536)
   end
   let buf = alloc_bytes(n: sz)
   let got = read_fill(fd, buf, lim: sz)
   if got <= 0 then return 0 end
   return pack(ptr: buf, len: got)
+end
+
+/** 100 MiB hard cap for the grow-loop fallback (pipes / special files). */
+let read_grow_max = 104857600
+
+/**
+Grow-loop fallback for read_whole_fd when fd_filestat_get returns size 0.
+Allocates a buffer of `cap` bytes, attempts to fill it; if we read exactly
+`cap` bytes (buffer full, may be more data) and cap < read_grow_max, double
+and retry from offset 0. Returns a packed string on success, 0 on error.
+*/
+let read_whole_fd_grow = fn (fd: i64, bufsz: i64) -> i64 do
+  let buf = alloc_bytes(n: bufsz)
+  let got = read_fill(fd, buf, lim: bufsz)
+  if got <= 0 then return 0 end
+  if got < bufsz then return pack(ptr: buf, len: got) end
+  // Buffer was full: there may be more data. Double unless we hit the limit.
+  if bufsz >= read_grow_max then return pack(ptr: buf, len: got) end
+  let next_sz = bufsz * 2
+  let use_sz = if next_sz > read_grow_max then read_grow_max else next_sz end
+  // Seek back to start and re-read into the larger buffer.
+  let s = scratch()
+  let _ = w_fd_seek(a_fd: i32of(x: fd), b_offset: 0, c_whence: i32of(x: whence_set), d_newoffset_ptr: i32of(x: s + sl_seek))
+  return read_whole_fd_grow(fd, bufsz: use_sz)
 end
 
 // === string-pun helpers (used by every submodule's *_str wrappers) ==========

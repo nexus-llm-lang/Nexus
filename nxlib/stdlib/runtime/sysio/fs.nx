@@ -39,8 +39,9 @@ is_file(path): true iff path exists and its filetype is regular_file.
 wasm sig (i32 i32) -> i32 (bool).
 */
 export let is_file = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
-  if core.do_path_filestat(path_ptr: core.i64of(x: a_path_ptr), path_len: core.i64of(x: b_path_len)) != 0 then return false end
-  return mem.load_u8(addr: core.filestat_slot() + 16) == core.filetype_regular_file
+  let st = core.filestat_slot()
+  if core.do_path_filestat_into(path_ptr: core.i64of(x: a_path_ptr), path_len: core.i64of(x: b_path_len), filestat_ptr: st) != 0 then return false end
+  return mem.load_u8(addr: st + 16) == core.filetype_regular_file
 end
 
 /**
@@ -137,8 +138,9 @@ export let create_dir_all = fn (a_path_ptr: i32, b_path_len: i32) -> bool do
   let pp = core.i64of(x: a_path_ptr)
   let pl = core.i64of(x: b_path_len)
   if pl <= 0 then return false end
-  if core.do_path_filestat(path_ptr: pp, path_len: pl) == 0 then
-    return mem.load_u8(addr: core.filestat_slot() + 16) == core.filetype_directory
+  let st = core.filestat_slot()
+  if core.do_path_filestat_into(path_ptr: pp, path_len: pl, filestat_ptr: st) == 0 then
+    return mem.load_u8(addr: st + 16) == core.filetype_directory
   end
   return mkdir_walk(path_ptr: pp, path_len: pl, i: 1)
 end
@@ -173,7 +175,10 @@ export let read_dir = fn (a_path_ptr: i32, b_path_len: i32) -> i64 do
   let pairs0 = core.alloc_bytes(n: cap0 * 16)
   let _ = mem.store_i64(addr: s + core.sl_dd_base, val: pairs0)
   let _ = mem.store_i64(addr: s + core.sl_dd_cap, val: cap0)
-  let n = readdir_loop(fd, cookie: 0, count: 0)
+  // Pass the scratch state pointer (s) explicitly so readdir_loop and
+  // parse_dirents share the same sl_dd_* slots (nexus-kqsq: per-call
+  // scratch() would give them different blocks).
+  let n = readdir_loop(fd, cookie: 0, count: 0, dd_state: s)
   let _ = if is_preopen then core.i32of(x: 0) else core.w_fd_close(a_fd: core.i32of(x: fd)) end
   if n <= 0 then return 0 end
   let pairs = mem.load_i64(addr: s + core.sl_dd_base)
@@ -205,23 +210,24 @@ end
 
 /**
 fd_readdir into a 4 KiB buffer; parse_dirents each round; loop while the
-buffer came back full and the cookie advanced. Reads/updates the running
-pairs base/cap in scratch's sl_dd_* slots. Returns the final entry count.
+buffer came back full and the cookie advanced. `dd_state` is the caller's
+scratch block that holds the running sl_dd_* slots (base/cap/cookie/used).
+Passing it explicitly avoids the per-call scratch allocation racing with the
+state maintained across the loop (nexus-kqsq). Returns the final entry count.
 */
-let readdir_loop = fn (fd: i64, cookie: i64, count: i64) -> i64 do
+let readdir_loop = fn (fd: i64, cookie: i64, count: i64, dd_state: i64) -> i64 do
   let bufcap = 4096
   let dbuf = core.alloc_bytes(n: bufcap)
-  let s = core.scratch()
-  let used_p = s + core.sl_dd_used
+  let used_p = dd_state + core.sl_dd_used
   if core.w_fd_readdir(a_fd: core.i32of(x: fd), b_buf_ptr: core.i32of(x: dbuf), c_buf_len: core.i32of(x: bufcap), d_cookie: cookie, e_bufused_ptr: core.i32of(x: used_p)) != core.i32of(x: 0) then
     return count
   end
   let used = mem.load_i32(addr: used_p)
-  let _ = mem.store_i64(addr: s + core.sl_dd_cookie, val: cookie)
-  let r = parse_dirents(dbuf, used, off: 0, count)
-  let last_cookie = mem.load_i64(addr: s + core.sl_dd_cookie)
+  let _ = mem.store_i64(addr: dd_state + core.sl_dd_cookie, val: cookie)
+  let r = parse_dirents(dbuf, used, off: 0, count, dd_state)
+  let last_cookie = mem.load_i64(addr: dd_state + core.sl_dd_cookie)
   if used >= bufcap && last_cookie != cookie then
-    return readdir_loop(fd, cookie: last_cookie, count: r)
+    return readdir_loop(fd, cookie: last_cookie, count: r, dd_state)
   end
   return r
 end
@@ -230,38 +236,37 @@ end
 Parse dirent records from [dbuf+off, dbuf+used). Each dirent: d_next u64 @0,
 d_ino u64 @8, d_namlen u32 @16, d_type u8 @20 (24-byte header), then namlen
 name bytes. For each non-"."/non-".." name, copy it to a fresh allocation and
-push (ptr, len) to the pairs array (growing it via sl_dd_base/sl_dd_cap).
-Updates sl_dd_cookie to the last record's d_next. Returns the resulting count.
+push (ptr, len) to the pairs array (growing it via sl_dd_base/sl_dd_cap in
+`dd_state`). Updates sl_dd_cookie in `dd_state`. Returns the updated count.
 */
-let parse_dirents = fn (dbuf: i64, used: i64, off: i64, count: i64) -> i64 do
+let parse_dirents = fn (dbuf: i64, used: i64, off: i64, count: i64, dd_state: i64) -> i64 do
   if off + 24 > used then return count end
   let namlen = mem.load_i32(addr: dbuf + off + 16)
   let name_off = off + 24
   if name_off + namlen > used then return count end
-  let s = core.scratch()
   let next_cookie = mem.load_i64(addr: dbuf + off)
-  let _ = mem.store_i64(addr: s + core.sl_dd_cookie, val: next_cookie)
+  let _ = mem.store_i64(addr: dd_state + core.sl_dd_cookie, val: next_cookie)
   let name_ptr = dbuf + name_off
   if is_dot_or_dotdot(p: name_ptr, n: namlen) then
-    return parse_dirents(dbuf, used, off: name_off + namlen, count)
+    return parse_dirents(dbuf, used, off: name_off + namlen, count, dd_state)
   end
   let owned = core.alloc_bytes(n: namlen)
   let _ = core.copy_bytes(dst: owned, src: name_ptr, count: namlen)
-  let base = mem.load_i64(addr: s + core.sl_dd_base)
-  let lim = mem.load_i64(addr: s + core.sl_dd_cap)
+  let base = mem.load_i64(addr: dd_state + core.sl_dd_base)
+  let lim = mem.load_i64(addr: dd_state + core.sl_dd_cap)
   if count >= lim then
     let ncap = if lim * 2 > count + 1 then lim * 2 else count + 1 end
     let nbase = core.alloc_bytes(n: ncap * 16)
     let _ = core.copy_bytes(dst: nbase, src: base, count: lim * 16)
-    let _ = mem.store_i64(addr: s + core.sl_dd_base, val: nbase)
-    let _ = mem.store_i64(addr: s + core.sl_dd_cap, val: ncap)
+    let _ = mem.store_i64(addr: dd_state + core.sl_dd_base, val: nbase)
+    let _ = mem.store_i64(addr: dd_state + core.sl_dd_cap, val: ncap)
     let _ = mem.store_i64(addr: nbase + count * 16, val: owned)
     let _ = mem.store_i64(addr: nbase + count * 16 + 8, val: namlen)
-    return parse_dirents(dbuf, used, off: name_off + namlen, count: count + 1)
+    return parse_dirents(dbuf, used, off: name_off + namlen, count: count + 1, dd_state)
   end
   let _ = mem.store_i64(addr: base + count * 16, val: owned)
   let _ = mem.store_i64(addr: base + count * 16 + 8, val: namlen)
-  return parse_dirents(dbuf, used, off: name_off + namlen, count: count + 1)
+  return parse_dirents(dbuf, used, off: name_off + namlen, count: count + 1, dd_state)
 end
 
 let is_dot_or_dotdot = fn (p: i64, n: i64) -> bool do
