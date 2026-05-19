@@ -1,0 +1,176 @@
+// nexus-4px2: strip_handler_arm_prefix must use naming.handler_prefix_len
+// (exact prefix strip) rather than last_underscore_idx (heuristic), so that
+// cap method names containing underscores (e.g. `read_line`) are recovered
+// correctly.
+//
+// Before the fix, strip_handler_arm_prefix("__handler_my_reader_read_line")
+// found the last `_` inside the method suffix and returned "line" instead of
+// "read_line".  The resulting MirStmtInjectResume arm tag was
+// "ReadCap::line", while lower_cap_call emitted MirSuspend(tag_name:
+// "ReadCap::read_line") — a mismatch that causes SymbolNotFound at codegen.
+//
+// This test constructs a synthetic HIR with:
+//   cap ReadCap { fn read_line() -> unit }
+//   handler my_reader for ReadCap { fn read_line() -> unit with @k }
+//   main injects my_reader and calls ReadCap.read_line
+// then drives lower_hir_to_mir and asserts that the MirStmtInjectResume
+// arm_tags list contains "ReadCap::read_line", not "ReadCap::line".
+
+import * as test_assert from "std:test/assert"
+import { lower_hir_to_mir } from "src/ir/mir/mir.nx"
+import { MirProgram, MirFunction, MirStmt } from "src/ir/mir/types.nx"
+import { TyUnit, LitUnit } from "src/common/ast.nx"
+import { None, Some } from "std:option"
+import {
+  HirProgram, HirFunction, EagerBody,
+  HirHandlerArm, HirHandlerBinding, HirHandlerBindingEntry,
+  HirStmt, HirStmtKind, HirExpr, HirExprKind,
+  HirCap, HirCapMethod
+} from "src/ir/hir/types.nx"
+import * as naming from "src/common/naming.nx"
+import { mk_hir_expr, mk_hir_stmt, empty_row } from "tests/_fixtures/hir_programs.nx"
+import { dummy_span } from "tests/_fixtures/span.nx"
+
+// ─── HIR construction helpers ──────────────────────────────────────────────
+
+let mk_handler_fn = fn (name: string, stmts: [HirStmt]) -> HirFunction do
+  return HirFunction(
+    name,
+    type_params: [],
+    params: [],
+    ret_type: TyUnit,
+    throw_row: empty_row(),
+    body: EagerBody(stmts: stmts),
+    span: dummy_span(),
+    file: "test.nx",
+    requires: empty_row()
+  )
+end
+
+let mk_main_fn = fn (stmts: [HirStmt]) -> HirFunction do
+  return HirFunction(
+    name: "main",
+    type_params: [],
+    params: [],
+    ret_type: TyUnit,
+    throw_row: empty_row(),
+    body: EagerBody(stmts: stmts),
+    span: dummy_span(),
+    file: "test.nx",
+    requires: empty_row()
+  )
+end
+
+// ─── Tag-search helpers ────────────────────────────────────────────────────
+
+let find_inject_resume_tags = fn (stmts: [MirStmt]) -> [string] do
+  match stmts do
+    | [] -> return []
+    | MirStmtInjectResume(body_fn: _, handler_arm_fns: _, handler_arm_tags: tags) :: _ -> return tags
+    | _ :: rest -> return find_inject_resume_tags(stmts: rest)
+  end
+end
+
+let find_func_by_name = fn (funcs: [MirFunction], name: string) -> Option<MirFunction> do
+  match funcs do
+    | [] -> return None
+    | f :: rest ->
+      let MirFunction(name: n, _) = f
+      if n == name then return Some(val: f)
+      else return find_func_by_name(funcs: rest, name)
+      end
+  end
+end
+
+let list_contains = fn (xs: [string], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == s then return true
+      else return list_contains(xs: rest, s)
+      end
+  end
+end
+
+// ─── Test body ─────────────────────────────────────────────────────────────
+
+let body = fn () -> unit throws { Exn } do
+  // Cap: ReadCap with method read_line (contains underscore — that's the bug trigger)
+  let hcap_method = HirCapMethod(
+    name: "read_line",
+    requires: empty_row(),
+    span: dummy_span(),
+    throw_row: empty_row(),
+    typ_params: [],
+    typ_ret: TyUnit
+  )
+  let hcap = HirCap(name: "ReadCap", methods: [hcap_method])
+
+  // Handler arm function: naming.handler_func_name("my_reader", "read_line")
+  // = "__handler_my_reader_read_line"
+  let arm_func_name = naming.handler_func_name(handler_name: "my_reader", method_name: "read_line")
+
+  // Arm body: just returns unit
+  let ret_stmt = mk_hir_stmt(node: Return(expr: mk_hir_expr(node: Literal(lit: LitUnit))))
+  let arm_fn = mk_handler_fn(name: arm_func_name, stmts: [ret_stmt])
+
+  // Continuation binder present (with @k): this is what triggers the
+  // any_handler_has_kont → MirStmtInjectResume codepath.
+  let arm = HirHandlerArm(arm: arm_fn, cont_binder: Some(val: "k"))
+
+  let binding = HirHandlerBinding(cap_name: "ReadCap", requires: empty_row(), arms: [arm])
+  let entry = HirHandlerBindingEntry(name: "my_reader", binding)
+
+  // Main: inject my_reader { ReadCap.read_line() }
+  let cap_call_expr = mk_hir_expr(node: Call(func: "ReadCap.read_line", args: []))
+  let cap_call_stmt = mk_hir_stmt(node: Expr(expr: cap_call_expr))
+  let inject_stmt = mk_hir_stmt(node: Inject(handlers: ["my_reader"], body: [cap_call_stmt]))
+  let main_fn = mk_main_fn(stmts: [inject_stmt])
+
+  let hir = HirProgram(
+    caps: [hcap],
+    functions: [main_fn],
+    externals: [],
+    handler_bindings: [entry],
+    enum_defs: [],
+    exception_groups: [],
+    value_binding_names: [],
+    type_defs: [],
+    visible_enum_names: []
+  )
+
+  let MirProgram(functions: mir_funcs, externals: _) = lower_hir_to_mir(hir)
+
+  // Find main's body and scan for MirStmtInjectResume tags.
+  let tags = match find_func_by_name(funcs: mir_funcs, name: "main") do
+    | Some(val: MirFunction(name: _, params: _, ret_type: _, body: b, span: _)) ->
+      find_inject_resume_tags(stmts: b)
+    | None -> throw RuntimeError(val: "nexus-4px2: main not found in MIR output")
+  end
+
+  test_assert.assert(
+    cond: !list_contains(xs: tags, s: "ReadCap::line"),
+    label: "nexus-4px2: truncated tag ReadCap::line must NOT appear (last-underscore bug)"
+  )
+  test_assert.assert(
+    cond: list_contains(xs: tags, s: "ReadCap::read_line"),
+    label: "nexus-4px2: exact tag ReadCap::read_line must appear after prefix-len fix"
+  )
+
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit do
+  let ok = safe_run()
+  let _ = 1 / ok
+  return ()
+end
