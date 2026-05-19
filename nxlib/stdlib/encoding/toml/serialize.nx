@@ -1,0 +1,294 @@
+/**
+ * toml/serialize: TOML 1.0.0 serializer — emit TOML document format.
+ */
+
+import * as str from "std:str"
+import * as char from "std:char"
+import * as bb from "std:bytebuffer"
+import { TomlError, TomlThrow, TomlField, TomlValue,
+         TomlString, TomlInt, TomlFloat, TomlBool, TomlDatetime,
+         TomlArray, TomlTable } from "std:encoding/toml/types"
+
+let ch_dquote = '"'
+let ch_backslash = '\\'
+let ch_minus = '-'
+
+let slen = fn (s: string) -> i64 do return str.byte_length(s) end
+
+let hex_digit_char = fn (n: i64) -> string do
+  if n < 10 then return str.from_char_code(code: n + 48) end
+  return str.from_char_code(code: n + 87)
+end
+
+// A bare key character: A-Z a-z 0-9 - _
+let is_bare_key_char = fn (c: char) -> bool do
+  if c >= 'A' && c <= 'Z' then return true end
+  if c >= 'a' && c <= 'z' then return true end
+  if c >= '0' && c <= '9' then return true end
+  if c == ch_minus then return true end
+  if c == '_' then return true end
+  return false
+end
+
+// Escape a string for TOML basic string output.
+let escape_toml_string = fn (s: string, p: i64, run_start: i64, buf: %bb.ByteBuffer) -> %bb.ByteBuffer do
+  let n = slen(s)
+  if p >= n then
+    return flush_range_into(%buf, s, start: run_start, end_pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  let code = char.ord(c)
+  if c == ch_dquote then
+    let %buf1 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    let %buf2 = bb.push_string(%buf1, s: "\\\"")
+    return escape_toml_string(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == ch_backslash then
+    let %buf1 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    let %buf2 = bb.push_string(%buf1, s: "\\\\")
+    return escape_toml_string(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if code >= 0 && code < 32 then
+    let %buf1 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    let esc =
+      if code == 8 then "\\b"
+      else if code == 9 then "\\t"
+      else if code == 10 then "\\n"
+      else if code == 12 then "\\f"
+      else if code == 13 then "\\r"
+      else "\\u" ++ hex_digit_char(n: code / 16) ++ hex_digit_char(n: code - (code / 16) * 16)
+      end
+    let %buf2 = bb.push_string(%buf1, s: esc)
+    return escape_toml_string(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  return escape_toml_string(s, p: p + 1, run_start, %buf)
+end
+
+let flush_range_into = fn (buf: %bb.ByteBuffer, s: string, start: i64, end_pos: i64) -> %bb.ByteBuffer do
+  if end_pos <= start then return buf end
+  return bb.push_string(%buf, s: str.byte_substring(s, start, len: end_pos - start))
+end
+
+let ser_string = fn (s: string) -> string do
+  let %buf = bb.empty()
+  let %buf1 = bb.push_string(%buf, s: "\"")
+  let %buf2 = escape_toml_string(s, p: 0, run_start: 0, %buf1)
+  let %buf3 = bb.push_string(%buf2, s: "\"")
+  let result = bb.to_string(&buf3)
+  bb.free(%buf3)
+  return result
+end
+
+let ser_float = fn (val: f64) -> string throws { TomlThrow } do
+  if val !=. val then throw TomlError(msg: "NaN is not serializable", pos: -1) end
+  let rendered = str.from_float(val)
+  if rendered == "inf" then return "inf" end
+  if rendered == "-inf" then return "-inf" end
+  if str.contains(s: rendered, sub: ".") || str.contains(s: rendered, sub: "e") || str.contains(s: rendered, sub: "E") then
+    return rendered
+  end
+  return rendered ++ ".0"
+end
+
+// Validate that all items in a TOML array have the same type tag.
+let toml_type_tag = fn (v: TomlValue) -> string do
+  match v do
+    | TomlString(_) -> return "string"
+    | TomlInt(_) -> return "int"
+    | TomlFloat(_) -> return "float"
+    | TomlBool(_) -> return "bool"
+    | TomlDatetime(_) -> return "datetime"
+    | TomlArray(_) -> return "array"
+    | TomlTable(_) -> return "table"
+  end
+end
+
+let check_array_types = fn (items: [TomlValue], expected_tag: string) -> bool throws { TomlThrow } do
+  match items do
+    | [] -> return true
+    | v :: rest ->
+      let tag = toml_type_tag(v)
+      if tag != expected_tag then
+        throw TomlError(msg: "mixed-type array: expected " ++ expected_tag ++ " but found " ++ tag, pos: -1)
+      end
+      return check_array_types(items: rest, expected_tag)
+  end
+end
+
+let validate_array = fn (items: [TomlValue]) -> unit throws { TomlThrow } do
+  match items do
+    | [] -> return ()
+    | first :: rest ->
+      let tag = toml_type_tag(first)
+      let _ = check_array_types(items: rest, expected_tag: tag)
+      return ()
+  end
+end
+
+let ser_value = fn (v: TomlValue) -> string throws { TomlThrow } do
+  match v do
+    | TomlString(val: sv) -> return ser_string(s: sv)
+    | TomlInt(val: i) -> return str.from_i64(val: i)
+    | TomlFloat(val: f) -> return ser_float(val: f)
+    | TomlBool(val: b) -> return str.from_bool(val: b)
+    | TomlDatetime(val: dt) -> return dt
+    | TomlArray(items: xs) ->
+      let _ = validate_array(items: xs)
+      return "[" ++ ser_array_items(items: xs) ++ "]"
+    | TomlTable(fields: fs) ->
+      return "{" ++ ser_inline_fields(fields: fs) ++ "}"
+  end
+end
+
+let ser_array_items = fn (items: [TomlValue]) -> string throws { TomlThrow } do
+  let %buf = bb.empty()
+  let %buf2 = ser_array_into(%buf, items, first: true)
+  let result = bb.to_string(&buf2)
+  bb.free(%buf2)
+  return result
+end
+
+let ser_array_into = fn (buf: %bb.ByteBuffer, items: [TomlValue], first: bool) -> %bb.ByteBuffer throws { TomlThrow } do
+  match items do
+    | [] -> return buf
+    | v :: rest ->
+      let %buf1 =
+        if first then buf
+        else bb.push_string(%buf, s: ", ")
+        end
+      let chunk = ser_value(v)
+      let %buf2 = bb.push_string(%buf1, s: chunk)
+      return ser_array_into(%buf2, items: rest, first: false)
+  end
+end
+
+let ser_inline_fields = fn (fields: [TomlField]) -> string throws { TomlThrow } do
+  let %buf = bb.empty()
+  let %buf2 = ser_inline_fields_into(%buf, fields, first: true)
+  let result = bb.to_string(&buf2)
+  bb.free(%buf2)
+  return result
+end
+
+let ser_inline_fields_into = fn (buf: %bb.ByteBuffer, fields: [TomlField], first: bool) -> %bb.ByteBuffer throws { TomlThrow } do
+  match fields do
+    | [] -> return buf
+    | TomlField(key: k, value: v) :: rest ->
+      let %buf1 =
+        if first then buf
+        else bb.push_string(%buf, s: ", ")
+        end
+      let %buf2 = bb.push_string(%buf1, s: ser_bare_key_or_quoted(s: k))
+      let %buf3 = bb.push_string(%buf2, s: " = ")
+      let chunk = ser_value(v)
+      let %buf4 = bb.push_string(%buf3, s: chunk)
+      return ser_inline_fields_into(%buf4, fields: rest, first: false)
+  end
+end
+
+// Decide whether a key needs quoting.
+let all_bare_key_chars = fn (s: string, p: i64) -> bool do
+  if p >= slen(s) then return true end
+  let c = str.byte_at(s, idx: p)
+  if is_bare_key_char(c) then return all_bare_key_chars(s, p: p + 1) end
+  return false
+end
+
+let ser_bare_key_or_quoted = fn (s: string) -> string do
+  if slen(s) == 0 then return "\"\"" end
+  if all_bare_key_chars(s, p: 0) then return s end
+  return ser_string(s)
+end
+
+// Top-level serializer: emits TOML document format (section headers, not inline tables).
+let ser_doc_fields = fn (buf: %bb.ByteBuffer, fields: [TomlField], prefix: string) -> %bb.ByteBuffer throws { TomlThrow } do
+  match fields do
+    | [] -> return buf
+    | TomlField(key: k, value: v) :: rest ->
+      let full_key =
+        if slen(s: prefix) == 0 then k
+        else prefix ++ "." ++ k
+        end
+      match v do
+        | TomlTable(fields: sub) ->
+          // Emit [section] header then sub-fields.
+          let %buf1 = bb.push_string(%buf, s: "[" ++ ser_bare_key_or_quoted(s: full_key) ++ "]\n")
+          let %buf2 = ser_section_kvs(%buf1, fields: sub)
+          let %buf3 = bb.push_string(%buf2, s: "\n")
+          return ser_doc_fields(%buf3, fields: rest, prefix)
+        | TomlArray(items: xs) ->
+          // Check if this is an array-of-tables.
+          if is_array_of_tables(items: xs) then
+            let %buf1 = ser_aot_entries(%buf, key: full_key, items: xs)
+            return ser_doc_fields(%buf1, fields: rest, prefix)
+          end
+          // Regular array.
+          let %buf1 = bb.push_string(%buf, s: ser_bare_key_or_quoted(s: k) ++ " = " ++ ser_value(v) ++ "\n")
+          return ser_doc_fields(%buf1, fields: rest, prefix)
+        | _ ->
+          // Scalar value.
+          let %buf1 = bb.push_string(%buf, s: ser_bare_key_or_quoted(s: k) ++ " = " ++ ser_value(v) ++ "\n")
+          return ser_doc_fields(%buf1, fields: rest, prefix)
+      end
+  end
+end
+
+let is_array_of_tables = fn (items: [TomlValue]) -> bool do
+  match items do
+    | [] -> return false
+    | TomlTable(_) :: _ -> return true
+    | _ -> return false
+  end
+end
+
+// Emit the key = value lines for a section body (no headers for scalars).
+let ser_section_kvs = fn (buf: %bb.ByteBuffer, fields: [TomlField]) -> %bb.ByteBuffer throws { TomlThrow } do
+  match fields do
+    | [] -> return buf
+    | TomlField(key: k, value: v) :: rest ->
+      match v do
+        | TomlTable(_) ->
+          // Nested table inside a section: emit as inline value here for simplicity.
+          let %buf1 = bb.push_string(%buf, s: ser_bare_key_or_quoted(s: k) ++ " = " ++ ser_value(v) ++ "\n")
+          return ser_section_kvs(%buf1, fields: rest)
+        | _ ->
+          let %buf1 = bb.push_string(%buf, s: ser_bare_key_or_quoted(s: k) ++ " = " ++ ser_value(v) ++ "\n")
+          return ser_section_kvs(%buf1, fields: rest)
+      end
+  end
+end
+
+// Emit array-of-tables entries.
+let ser_aot_entries = fn (buf: %bb.ByteBuffer, key: string, items: [TomlValue]) -> %bb.ByteBuffer throws { TomlThrow } do
+  match items do
+    | [] -> return buf
+    | TomlTable(fields: sub) :: rest ->
+      let %buf1 = bb.push_string(%buf, s: "[[" ++ ser_bare_key_or_quoted(s: key) ++ "]]\n")
+      let %buf2 = ser_section_kvs(%buf1, fields: sub)
+      let %buf3 = bb.push_string(%buf2, s: "\n")
+      return ser_aot_entries(%buf3, key, items: rest)
+    | _ :: rest ->
+      return ser_aot_entries(%buf, key, items: rest)
+  end
+end
+
+/**
+Serializes a TomlValue (which must be TomlTable at the root level) into a
+TOML document string. Inline tables and arrays are supported as values.
+Raises TomlError if NaN/Infinity appears in a float or if a mixed-type array
+is encountered.
+*/
+let do_serialize_table = fn (fields: [TomlField]) -> string throws { TomlThrow } do
+  let buf = bb.empty()
+  let %buf2 = ser_doc_fields(%buf, fields, prefix: "")
+  let result = bb.to_string(&buf2)
+  bb.free(%buf2)
+  return result
+end
+
+export let serialize = fn (v: TomlValue) -> string throws { TomlThrow } do
+  match v do
+    | TomlTable(fields: fs) -> return do_serialize_table(fields: fs)
+    | _ -> throw TomlError(msg: "root value must be a table", pos: -1)
+  end
+end

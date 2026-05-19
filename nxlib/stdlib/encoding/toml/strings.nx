@@ -1,0 +1,385 @@
+/**
+ * toml/strings: TOML string parsing — basic, multi-line basic,
+ * literal, and multi-line literal string variants.
+ */
+
+import * as str from "std:str"
+import * as char from "std:char"
+import * as bb from "std:bytebuffer"
+import { TomlError, TomlThrow } from "std:encoding/toml/types"
+
+// ─── Local helpers ────────────────────────────────────────────────────────────
+
+let ch_eof = '\0'
+let ch_dquote = '"'
+let ch_squote = '\''
+let ch_backslash = '\\'
+let ch_nl = '\n'
+let ch_cr = '\r'
+
+let slen = fn (s: string) -> i64 do return str.byte_length(s) end
+
+let peek = fn (s: string, p: i64) -> char do
+  if p >= slen(s) then return ch_eof end
+  return str.byte_at(s, idx: p)
+end
+
+let starts_with_at = fn (s: string, p: i64, lit: string) -> bool do
+  let n = slen(s: lit)
+  if p + n > slen(s) then return false end
+  return str.byte_substring(s, start: p, len: n) == lit
+end
+
+let hex_digit_val = fn (c: char) -> i64 do
+  return char.hex_digit_value(c)
+end
+
+let utf8_bytes_of = fn (code: i64) -> [i64] do
+  if code < 128 then return [code] end
+  if code < 2048 then
+    let b1 = 192 + (code / 64)
+    let b2 = 128 + (code - (code / 64) * 64)
+    return [b1, b2]
+  end
+  if code < 65536 then
+    let b1 = 224 + (code / 4096)
+    let mid = code / 64
+    let b2 = 128 + (mid - (mid / 64) * 64)
+    let b3 = 128 + (code - mid * 64)
+    return [b1, b2, b3]
+  end
+  if code < 1114112 then
+    let b1 = 240 + (code / 262144)
+    let mid_hi = code / 4096
+    let b2 = 128 + (mid_hi - (mid_hi / 64) * 64)
+    let mid_lo = code / 64
+    let b3 = 128 + (mid_lo - (mid_lo / 64) * 64)
+    let b4 = 128 + (code - mid_lo * 64)
+    return [b1, b2, b3, b4]
+  end
+  return []
+end
+
+let codepoint_to_utf8 = fn (code: i64) -> string do
+  if code < 0 then return "" end
+  let bytes = utf8_bytes_of(code)
+  match bytes do
+    | [] -> return ""
+    | _ :: _ ->
+      let %buf = bb.empty()
+      let %buf = bb.push_bytes(%buf, bytes)
+      let result = bb.to_string(&buf)
+      bb.free(%buf)
+      return result
+  end
+end
+
+// ─── Step type ───────────────────────────────────────────────────────────────
+
+export type StringStep = StringStep(value: string, pos: i64)
+
+// ─── Shared buffer helper ─────────────────────────────────────────────────────
+
+let flush_range_into = fn (buf: %bb.ByteBuffer, s: string, start: i64, end_pos: i64) -> %bb.ByteBuffer do
+  if end_pos <= start then return buf end
+  return bb.push_string(%buf, s: str.byte_substring(s, start, len: end_pos - start))
+end
+
+// ─── Basic string (double-quoted) ────────────────────────────────────────────
+
+let parse_unicode4 = fn (s: string, p: i64, buf: %bb.ByteBuffer) -> StringStep throws { TomlThrow } do
+  if p + 4 > slen(s) then
+    bb.free(%buf)
+    throw TomlError(msg: "\\uXXXX escape needs 4 hex digits", pos: p)
+  end
+  let h1 = hex_digit_val(c: str.byte_at(s, idx: p))
+  let h2 = hex_digit_val(c: str.byte_at(s, idx: p + 1))
+  let h3 = hex_digit_val(c: str.byte_at(s, idx: p + 2))
+  let h4 = hex_digit_val(c: str.byte_at(s, idx: p + 3))
+  if h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0 then
+    bb.free(%buf)
+    throw TomlError(msg: "invalid hex digit in \\uXXXX", pos: p)
+  end
+  let code = h1 * 4096 + h2 * 256 + h3 * 16 + h4
+  let encoded = codepoint_to_utf8(code)
+  let %buf2 = bb.push_string(%buf, s: encoded)
+  return parse_basic_body(s, p: p + 4, run_start: p + 4, %buf2)
+end
+
+let parse_unicode8 = fn (s: string, p: i64, buf: %bb.ByteBuffer) -> StringStep throws { TomlThrow } do
+  if p + 8 > slen(s) then
+    bb.free(%buf)
+    throw TomlError(msg: "\\UXXXXXXXX escape needs 8 hex digits", pos: p)
+  end
+  let h1 = hex_digit_val(c: str.byte_at(s, idx: p))
+  let h2 = hex_digit_val(c: str.byte_at(s, idx: p + 1))
+  let h3 = hex_digit_val(c: str.byte_at(s, idx: p + 2))
+  let h4 = hex_digit_val(c: str.byte_at(s, idx: p + 3))
+  let h5 = hex_digit_val(c: str.byte_at(s, idx: p + 4))
+  let h6 = hex_digit_val(c: str.byte_at(s, idx: p + 5))
+  let h7 = hex_digit_val(c: str.byte_at(s, idx: p + 6))
+  let h8 = hex_digit_val(c: str.byte_at(s, idx: p + 7))
+  if h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0 || h5 < 0 || h6 < 0 || h7 < 0 || h8 < 0 then
+    bb.free(%buf)
+    throw TomlError(msg: "invalid hex digit in \\UXXXXXXXX", pos: p)
+  end
+  let code = h1 * 268435456 + h2 * 16777216 + h3 * 1048576 + h4 * 65536 + h5 * 4096 + h6 * 256 + h7 * 16 + h8
+  let encoded = codepoint_to_utf8(code)
+  let %buf2 = bb.push_string(%buf, s: encoded)
+  return parse_basic_body(s, p: p + 8, run_start: p + 8, %buf2)
+end
+
+let parse_basic_escape = fn (s: string, p: i64, buf: %bb.ByteBuffer) -> StringStep throws { TomlThrow } do
+  if p >= slen(s) then
+    bb.free(%buf)
+    throw TomlError(msg: "unterminated escape sequence", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_dquote then
+    let %buf2 = bb.push_string(%buf, s: "\"")
+    return parse_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == ch_backslash then
+    let %buf2 = bb.push_string(%buf, s: "\\")
+    return parse_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'b' then
+    let %buf2 = bb.push_byte(%buf, byte: 8)
+    return parse_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'f' then
+    let %buf2 = bb.push_byte(%buf, byte: 12)
+    return parse_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'n' then
+    let %buf2 = bb.push_string(%buf, s: "\n")
+    return parse_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'r' then
+    let %buf2 = bb.push_string(%buf, s: "\r")
+    return parse_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 't' then
+    let %buf2 = bb.push_string(%buf, s: "\t")
+    return parse_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'u' then
+    return parse_unicode4(s, p: p + 1, %buf)
+  end
+  if c == 'U' then
+    return parse_unicode8(s, p: p + 1, %buf)
+  end
+  // TOML also allows line-ending backslash (whitespace continuation in ml strings).
+  // For single-line strings this is an error.
+  bb.free(%buf)
+  throw TomlError(msg: "invalid escape sequence", pos: p - 1)
+end
+
+// Parse body of a basic (double-quoted) single-line string.
+// p is just after the opening '"'.
+let parse_basic_body = fn (s: string, p: i64, run_start: i64, buf: %bb.ByteBuffer) -> StringStep throws { TomlThrow } do
+  if p >= slen(s) then
+    bb.free(%buf)
+    throw TomlError(msg: "unterminated basic string", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_dquote then
+    let %buf2 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    let result = bb.to_string(&buf2)
+    bb.free(%buf2)
+    return StringStep(value: result, pos: p + 1)
+  end
+  if c == ch_backslash then
+    let %buf2 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    return parse_basic_escape(s, p: p + 1, buf: %buf2)
+  end
+  if c == ch_nl || c == ch_cr then
+    bb.free(%buf)
+    throw TomlError(msg: "newline in basic string", pos: p)
+  end
+  return parse_basic_body(s, p: p + 1, run_start, %buf)
+end
+
+let parse_basic_string = fn (s: string, p: i64) -> StringStep throws { TomlThrow } do
+  // p is at '"'.
+  let %buf = bb.empty()
+  return parse_basic_body(s, p: p + 1, run_start: p + 1, %buf)
+end
+
+// ─── Multiline basic string (""") ─────────────────────────────────────────────
+
+// Handle backslash-whitespace continuation: skip backslash, then all ws/newlines.
+let skip_ml_ws_continuation = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ' ' || c == '\t' || c == ch_nl || c == ch_cr then
+    return skip_ml_ws_continuation(s, p: p + 1)
+  end
+  return p
+end
+
+let parse_ml_basic_escape = fn (s: string, p: i64, buf: %bb.ByteBuffer) -> StringStep throws { TomlThrow } do
+  if p >= slen(s) then
+    bb.free(%buf)
+    throw TomlError(msg: "unterminated escape in multi-line basic string", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  // Whitespace continuation: backslash at end of line.
+  if c == ' ' || c == '\t' || c == ch_nl || c == ch_cr then
+    let p2 = skip_ml_ws_continuation(s, p)
+    return parse_ml_basic_body(s, p: p2, run_start: p2, %buf)
+  end
+  if c == ch_dquote then
+    let %buf2 = bb.push_string(%buf, s: "\"")
+    return parse_ml_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == ch_backslash then
+    let %buf2 = bb.push_string(%buf, s: "\\")
+    return parse_ml_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'b' then
+    let %buf2 = bb.push_byte(%buf, byte: 8)
+    return parse_ml_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'f' then
+    let %buf2 = bb.push_byte(%buf, byte: 12)
+    return parse_ml_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'n' then
+    let %buf2 = bb.push_string(%buf, s: "\n")
+    return parse_ml_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'r' then
+    let %buf2 = bb.push_string(%buf, s: "\r")
+    return parse_ml_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 't' then
+    let %buf2 = bb.push_string(%buf, s: "\t")
+    return parse_ml_basic_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'u' then
+    return parse_unicode4(s, p: p + 1, %buf)
+  end
+  if c == 'U' then
+    return parse_unicode8(s, p: p + 1, %buf)
+  end
+  bb.free(%buf)
+  throw TomlError(msg: "invalid escape in multi-line basic string", pos: p - 1)
+end
+
+// Parse body of a multi-line basic string.
+// p is just after the opening '"""' (and optional first newline).
+let parse_ml_basic_body = fn (s: string, p: i64, run_start: i64, buf: %bb.ByteBuffer) -> StringStep throws { TomlThrow } do
+  if p >= slen(s) then
+    bb.free(%buf)
+    throw TomlError(msg: "unterminated multi-line basic string", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_dquote then
+    // Check for closing """.
+    if starts_with_at(s, p, lit: "\"\"\"") then
+      let %buf2 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+      let result = bb.to_string(&buf2)
+      bb.free(%buf2)
+      return StringStep(value: result, pos: p + 3)
+    end
+  end
+  if c == ch_backslash then
+    let %buf2 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    return parse_ml_basic_escape(s, p: p + 1, buf: %buf2)
+  end
+  return parse_ml_basic_body(s, p: p + 1, run_start, %buf)
+end
+
+let parse_ml_basic_string = fn (s: string, p: i64) -> StringStep throws { TomlThrow } do
+  // p is at the first '"' of '"""'.
+  // Skip a single newline immediately following the opening delimiter.
+  let body_start = p + 3
+  let body_start2 =
+    if peek(s, p: body_start) == ch_nl then
+      body_start + 1
+    else if peek(s, p: body_start) == ch_cr && peek(s, p: body_start + 1) == ch_nl then
+      body_start + 2
+    else
+      body_start
+    end
+  let %buf = bb.empty()
+  return parse_ml_basic_body(s, p: body_start2, run_start: body_start2, %buf)
+end
+
+// ─── Literal string (single-quoted) ──────────────────────────────────────────
+
+let parse_literal_body = fn (s: string, p: i64, run_start: i64, buf: %bb.ByteBuffer) -> StringStep throws { TomlThrow } do
+  if p >= slen(s) then
+    bb.free(%buf)
+    throw TomlError(msg: "unterminated literal string", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_squote then
+    let %buf2 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    let result = bb.to_string(&buf2)
+    bb.free(%buf2)
+    return StringStep(value: result, pos: p + 1)
+  end
+  if c == ch_nl || c == ch_cr then
+    bb.free(%buf)
+    throw TomlError(msg: "newline in literal string", pos: p)
+  end
+  return parse_literal_body(s, p: p + 1, run_start, %buf)
+end
+
+let parse_literal_string = fn (s: string, p: i64) -> StringStep throws { TomlThrow } do
+  let %buf = bb.empty()
+  return parse_literal_body(s, p: p + 1, run_start: p + 1, %buf)
+end
+
+// ─── Multi-line literal string (''') ─────────────────────────────────────────
+
+let parse_ml_literal_body = fn (s: string, p: i64, run_start: i64, buf: %bb.ByteBuffer) -> StringStep throws { TomlThrow } do
+  if p >= slen(s) then
+    bb.free(%buf)
+    throw TomlError(msg: "unterminated multi-line literal string", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_squote then
+    if starts_with_at(s, p, lit: "'''") then
+      let %buf2 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+      let result = bb.to_string(&buf2)
+      bb.free(%buf2)
+      return StringStep(value: result, pos: p + 3)
+    end
+  end
+  return parse_ml_literal_body(s, p: p + 1, run_start, %buf)
+end
+
+let parse_ml_literal_string = fn (s: string, p: i64) -> StringStep throws { TomlThrow } do
+  let body_start = p + 3
+  let body_start2 =
+    if peek(s, p: body_start) == ch_nl then
+      body_start + 1
+    else if peek(s, p: body_start) == ch_cr && peek(s, p: body_start + 1) == ch_nl then
+      body_start + 2
+    else
+      body_start
+    end
+  let %buf = bb.empty()
+  return parse_ml_literal_body(s, p: body_start2, run_start: body_start2, %buf)
+end
+
+// ─── Dispatch string by quoting style ────────────────────────────────────────
+
+export let parse_any_string = fn (s: string, p: i64) -> StringStep throws { TomlThrow } do
+  if peek(s, p) == ch_dquote then
+    if starts_with_at(s, p, lit: "\"\"\"") then
+      return parse_ml_basic_string(s, p)
+    end
+    return parse_basic_string(s, p)
+  end
+  if peek(s, p) == ch_squote then
+    if starts_with_at(s, p, lit: "'''") then
+      return parse_ml_literal_string(s, p)
+    end
+    return parse_literal_string(s, p)
+  end
+  throw TomlError(msg: "expected string", pos: p)
+end

@@ -1,0 +1,685 @@
+/**
+ * toml/parse: TOML 1.0.0 parser — scanning, key parsing, number/datetime
+ * decoding, and document-level structure assembly.
+ */
+
+import * as str from "std:str"
+import * as list from "std:list"
+import * as char from "std:char"
+import * as bb from "std:bytebuffer"
+import { Option, Some, None } from "std:option"
+import { TomlError, TomlThrow, TomlField, TomlValue,
+         TomlString, TomlInt, TomlFloat, TomlBool, TomlDatetime,
+         TomlArray, TomlTable } from "std:encoding/toml/types"
+import { StringStep, parse_any_string } from "std:encoding/toml/strings"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Internal helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+let ch_eof = '\0'
+let ch_dquote = '"'
+let ch_squote = '\''
+let ch_lbracket = '['
+let ch_rbracket = ']'
+let ch_lbrace = '{'
+let ch_rbrace = '}'
+let ch_comma = ','
+let ch_dot = '.'
+let ch_eq = '='
+let ch_hash = '#'
+let ch_minus = '-'
+let ch_plus = '+'
+let ch_nl = '\n'
+let ch_cr = '\r'
+
+let slen = fn (s: string) -> i64 do return str.byte_length(s) end
+
+let peek = fn (s: string, p: i64) -> char do
+  if p >= slen(s) then return ch_eof end
+  return str.byte_at(s, idx: p)
+end
+
+// Skip spaces and tabs (not newlines — TOML is line-oriented).
+let skip_inline_ws = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ' ' || c == '\t' then
+    return skip_inline_ws(s, p: p + 1)
+  end
+  return p
+end
+
+// Skip a comment from '#' to end of line (position stays at \n or EOF).
+let skip_comment = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_nl then return p end
+  if c == ch_cr then return p end
+  return skip_comment(s, p: p + 1)
+end
+
+// Skip inline whitespace and optional comment; position stops at \n, \r, or EOF.
+let skip_line_tail = fn (s: string, p: i64) -> i64 do
+  let p1 = skip_inline_ws(s, p)
+  if peek(s, p: p1) == ch_hash then
+    return skip_comment(s, p: p1 + 1)
+  end
+  return p1
+end
+
+// Advance past a newline sequence (\r\n or \n).
+let consume_newline = fn (s: string, p: i64) -> i64 do
+  let c = peek(s, p)
+  if c == ch_cr then
+    let p1 = p + 1
+    if peek(s, p: p1) == ch_nl then return p1 + 1 end
+    return p1
+  end
+  if c == ch_nl then return p + 1 end
+  return p
+end
+
+// Skip blank lines and comment-only lines; lands at a non-blank, non-comment line or EOF.
+let skip_empty_lines = fn (s: string, p: i64) -> i64 do
+  let p1 = skip_inline_ws(s, p)
+  let c = peek(s, p: p1)
+  if c == ch_hash then
+    let p2 = skip_comment(s, p: p1 + 1)
+    return skip_empty_lines(s, p: consume_newline(s, p: p2))
+  end
+  if c == ch_nl || c == ch_cr then
+    return skip_empty_lines(s, p: consume_newline(s, p: p1))
+  end
+  return p1
+end
+
+// starts_with_at: check literal match at position p.
+let starts_with_at = fn (s: string, p: i64, lit: string) -> bool do
+  let n = slen(s: lit)
+  if p + n > slen(s) then return false end
+  return str.byte_substring(s, start: p, len: n) == lit
+end
+
+let hex_digit_val = fn (c: char) -> i64 do
+  return char.hex_digit_value(c)
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Parser — step types
+// ═══════════════════════════════════════════════════════════════════════════
+
+type ParseStep  = ParseStep(value: TomlValue, pos: i64)
+type KeyStep    = KeyStep(key: string, pos: i64)
+type FieldStep  = FieldStep(field: TomlField, pos: i64)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Key parsing
+// ═══════════════════════════════════════════════════════════════════════════
+
+// A bare key character: A-Z a-z 0-9 - _
+let is_bare_key_char = fn (c: char) -> bool do
+  if c >= 'A' && c <= 'Z' then return true end
+  if c >= 'a' && c <= 'z' then return true end
+  if c >= '0' && c <= '9' then return true end
+  if c == ch_minus then return true end
+  if c == '_' then return true end
+  return false
+end
+
+let scan_bare_key_end = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  if is_bare_key_char(c: str.byte_at(s, idx: p)) then
+    return scan_bare_key_end(s, p: p + 1)
+  end
+  return p
+end
+
+// Parse a single key segment (bare or quoted).
+let parse_key_seg = fn (s: string, p: i64) -> KeyStep throws { TomlThrow } do
+  let c = peek(s, p)
+  if c == ch_dquote || c == ch_squote then
+    let StringStep(value: seg, pos: p2) = parse_any_string(s, p)
+    return KeyStep(key: seg, pos: p2)
+  end
+  if is_bare_key_char(c) then
+    let end_pos = scan_bare_key_end(s, p: p + 1)
+    let seg = str.byte_substring(s, start: p, len: end_pos - p)
+    return KeyStep(key: seg, pos: end_pos)
+  end
+  throw TomlError(msg: "expected key", pos: p)
+end
+
+// Parse a (possibly dotted) key; return the full dotted key as a single string
+// and the position after the last segment.
+let parse_dotted_key = fn (s: string, p: i64) -> KeyStep throws { TomlThrow } do
+  let KeyStep(key: first, pos: p1) = parse_key_seg(s, p)
+  let p2 = skip_inline_ws(s, p: p1)
+  if peek(s, p: p2) != ch_dot then
+    return KeyStep(key: first, pos: p2)
+  end
+  let p3 = skip_inline_ws(s, p: p2 + 1)
+  let KeyStep(key: rest, pos: p4) = parse_dotted_key(s, p: p3)
+  return KeyStep(key: first ++ "." ++ rest, pos: p4)
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Number parsing
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Scan digit run, allowing underscores between digits.
+let scan_toml_digits = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c >= '0' && c <= '9' then
+    return scan_toml_digits(s, p: p + 1)
+  end
+  if c == '_' then
+    // Underscore only valid between digits; peek ahead.
+    if p + 1 < slen(s) then
+      let next = str.byte_at(s, idx: p + 1)
+      if next >= '0' && next <= '9' then
+        return scan_toml_digits(s, p: p + 2)
+      end
+    end
+  end
+  return p
+end
+
+// Strip underscores from a numeric literal string.
+let strip_underscores = fn (s: string) -> string do
+  let n = slen(s)
+  let %buf = bb.empty()
+  let %buf = strip_underscores_go(%buf, s, p: 0, n)
+  let result = bb.to_string(&buf)
+  bb.free(%buf)
+  return result
+end
+
+let strip_underscores_go = fn (buf: %bb.ByteBuffer, s: string, p: i64, n: i64) -> %bb.ByteBuffer do
+  if p >= n then return buf end
+  let c = str.byte_at(s, idx: p)
+  if c == '_' then
+    return strip_underscores_go(%buf, s, p: p + 1, n)
+  end
+  let %buf2 = bb.push_string(%buf, s: str.byte_substring(s, start: p, len: 1))
+  return strip_underscores_go(%buf2, s, p: p + 1, n)
+end
+
+// Parse hex integer (after "0x").
+let parse_hex_int = fn (s: string, p: i64, start_pos: i64) -> ParseStep throws { TomlThrow } do
+  let end_pos = scan_hex_digits(s, p)
+  if end_pos == p then
+    throw TomlError(msg: "expected hex digits after 0x", pos: p)
+  end
+  let raw = str.byte_substring(s, start: start_pos, len: end_pos - start_pos)
+  let clean = strip_underscores(s: raw)
+  // parse_i64 only handles decimal; do manual hex parse.
+  let val = parse_hex_str(s: clean, p: 0, acc: 0)
+  return ParseStep(value: TomlInt(val), pos: end_pos)
+end
+
+let scan_hex_digits = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') then
+    return scan_hex_digits(s, p: p + 1)
+  end
+  if c == '_' then
+    if p + 1 < slen(s) then
+      let next = str.byte_at(s, idx: p + 1)
+      if (next >= '0' && next <= '9') || (next >= 'a' && next <= 'f') || (next >= 'A' && next <= 'F') then
+        return scan_hex_digits(s, p: p + 2)
+      end
+    end
+  end
+  return p
+end
+
+let parse_hex_str = fn (s: string, p: i64, acc: i64) -> i64 do
+  if p >= slen(s) then return acc end
+  let c = str.byte_at(s, idx: p)
+  let d = hex_digit_val(c)
+  return parse_hex_str(s, p: p + 1, acc: acc * 16 + d)
+end
+
+// Parse octal integer (after "0o").
+let parse_oct_int = fn (s: string, p: i64, start_pos: i64) -> ParseStep throws { TomlThrow } do
+  let end_pos = scan_oct_digits(s, p)
+  if end_pos == p then
+    throw TomlError(msg: "expected octal digits after 0o", pos: p)
+  end
+  let raw = str.byte_substring(s, start: start_pos, len: end_pos - start_pos)
+  let clean = strip_underscores(s: raw)
+  let val = parse_oct_str(s: clean, p: 0, acc: 0)
+  return ParseStep(value: TomlInt(val), pos: end_pos)
+end
+
+let scan_oct_digits = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c >= '0' && c <= '7' then return scan_oct_digits(s, p: p + 1) end
+  if c == '_' then
+    if p + 1 < slen(s) then
+      let next = str.byte_at(s, idx: p + 1)
+      if next >= '0' && next <= '7' then return scan_oct_digits(s, p: p + 2) end
+    end
+  end
+  return p
+end
+
+let parse_oct_str = fn (s: string, p: i64, acc: i64) -> i64 do
+  if p >= slen(s) then return acc end
+  let c = str.byte_at(s, idx: p)
+  let d = char.ord(c) - 48
+  return parse_oct_str(s, p: p + 1, acc: acc * 8 + d)
+end
+
+// Parse binary integer (after "0b").
+let parse_bin_int = fn (s: string, p: i64, start_pos: i64) -> ParseStep throws { TomlThrow } do
+  let end_pos = scan_bin_digits(s, p)
+  if end_pos == p then
+    throw TomlError(msg: "expected binary digits after 0b", pos: p)
+  end
+  let raw = str.byte_substring(s, start: start_pos, len: end_pos - start_pos)
+  let clean = strip_underscores(s: raw)
+  let val = parse_bin_str(s: clean, p: 0, acc: 0)
+  return ParseStep(value: TomlInt(val), pos: end_pos)
+end
+
+let scan_bin_digits = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == '0' || c == '1' then return scan_bin_digits(s, p: p + 1) end
+  if c == '_' then
+    if p + 1 < slen(s) then
+      let next = str.byte_at(s, idx: p + 1)
+      if next == '0' || next == '1' then return scan_bin_digits(s, p: p + 2) end
+    end
+  end
+  return p
+end
+
+let parse_bin_str = fn (s: string, p: i64, acc: i64) -> i64 do
+  if p >= slen(s) then return acc end
+  let c = str.byte_at(s, idx: p)
+  let d = char.ord(c) - 48
+  return parse_bin_str(s, p: p + 1, acc: acc * 2 + d)
+end
+
+// Check whether the decimal literal contains float indicators.
+let is_float_literal = fn (s: string) -> bool do
+  if str.contains(s, sub: ".") then return true end
+  if str.contains(s, sub: "e") then return true end
+  if str.contains(s, sub: "E") then return true end
+  return false
+end
+
+// Main number / datetime entry point.
+let parse_number_or_datetime = fn (s: string, p: i64) -> ParseStep throws { TomlThrow } do
+  // Special float keywords.
+  if starts_with_at(s, p, lit: "nan") then
+    return ParseStep(value: TomlFloat(val: 0.0 /. 0.0), pos: p + 3)
+  end
+  if starts_with_at(s, p, lit: "inf") then
+    return ParseStep(value: TomlFloat(val: 1.0 /. 0.0), pos: p + 3)
+  end
+  if starts_with_at(s, p, lit: "+inf") then
+    return ParseStep(value: TomlFloat(val: 1.0 /. 0.0), pos: p + 4)
+  end
+  if starts_with_at(s, p, lit: "-inf") then
+    return ParseStep(value: TomlFloat(val: 0.0 -. 1.0 /. 0.0), pos: p + 4)
+  end
+  if starts_with_at(s, p, lit: "+nan") then
+    return ParseStep(value: TomlFloat(val: 0.0 /. 0.0), pos: p + 4)
+  end
+  if starts_with_at(s, p, lit: "-nan") then
+    return ParseStep(value: TomlFloat(val: 0.0 /. 0.0), pos: p + 4)
+  end
+  // Sign.
+  let sign_pos = p
+  let after_sign =
+    if peek(s, p) == ch_minus || peek(s, p) == ch_plus then
+      p + 1
+    else
+      p
+    end
+  // Radix prefixes (only decimal has sign prefix per TOML spec).
+  if after_sign == p then
+    if starts_with_at(s, p, lit: "0x") then
+      return parse_hex_int(s, p: p + 2, start_pos: p + 2)
+    end
+    if starts_with_at(s, p, lit: "0o") then
+      return parse_oct_int(s, p: p + 2, start_pos: p + 2)
+    end
+    if starts_with_at(s, p, lit: "0b") then
+      return parse_bin_int(s, p: p + 2, start_pos: p + 2)
+    end
+  end
+  // Scan the full decimal literal.
+  let end_pos = scan_decimal_number(s, p: after_sign)
+  let lit_raw = str.byte_substring(s, start: p, len: end_pos - p)
+  // Check for datetime: contains 'T', 'Z', or ' ' with time-like pattern.
+  if is_datetime_literal(s: lit_raw) then
+    return ParseStep(value: TomlDatetime(val: lit_raw), pos: end_pos)
+  end
+  let lit = strip_underscores(s: lit_raw)
+  if is_float_literal(s: lit) then
+    match str.parse_f64_checked(s: lit) do
+      | Some(val: f) -> return ParseStep(value: TomlFloat(val: f), pos: end_pos)
+      | None -> throw TomlError(msg: "malformed float: " ++ lit, pos: p)
+    end
+  end
+  match str.parse_i64(s: lit) do
+    | Some(val: i) -> return ParseStep(value: TomlInt(val: i), pos: end_pos)
+    | None -> throw TomlError(msg: "integer out of range: " ++ lit, pos: p)
+  end
+end
+
+// Scan a decimal number (digits, sign, dot, e, E, +, -, :, underscore, T, Z, space for datetime).
+let scan_decimal_number = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c >= '0' && c <= '9' then return scan_decimal_number(s, p: p + 1) end
+  if c == '_' then
+    if p + 1 < slen(s) then
+      let next = str.byte_at(s, idx: p + 1)
+      if next >= '0' && next <= '9' then return scan_decimal_number(s, p: p + 2) end
+    end
+    return p
+  end
+  if c == ch_dot then return scan_decimal_number(s, p: p + 1) end
+  if c == 'e' || c == 'E' then return scan_decimal_number(s, p: p + 1) end
+  if c == ch_minus || c == ch_plus then return scan_decimal_number(s, p: p + 1) end
+  // Datetime characters.
+  if c == 'T' || c == 'Z' then return scan_decimal_number(s, p: p + 1) end
+  if c == ':' then return scan_decimal_number(s, p: p + 1) end
+  // Space in datetime "2006-01-02 15:04:05Z".
+  if c == ' ' then
+    if p + 1 < slen(s) then
+      let next = str.byte_at(s, idx: p + 1)
+      if next >= '0' && next <= '9' then return scan_decimal_number(s, p: p + 2) end
+    end
+  end
+  return p
+end
+
+// Heuristic: does this literal look like a datetime?
+let is_datetime_literal = fn (s: string) -> bool do
+  // Must look like YYYY-... at minimum.
+  if slen(s) < 10 then return false end
+  // Has 'T' or 'Z' → definitely datetime.
+  if str.contains(s, sub: "T") then return true end
+  if str.contains(s, sub: "Z") then return true end
+  // Has ':' → time.
+  if str.contains(s, sub: ":") then return true end
+  // Exactly YYYY-MM-DD (10 chars, dots at positions 4 and 7).
+  if slen(s) == 10 then
+    let c4 = str.byte_at(s, idx: 4)
+    let c7 = str.byte_at(s, idx: 7)
+    if c4 == ch_minus && c7 == ch_minus then return true end
+  end
+  return false
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Value parsing
+// ═══════════════════════════════════════════════════════════════════════════
+
+let parse_value = fn (s: string, p: i64) -> ParseStep throws { TomlThrow } do
+  let p1 = skip_inline_ws(s, p)
+  if p1 >= slen(s) then throw TomlError(msg: "unexpected end of input", pos: p1) end
+  let c = str.byte_at(s, idx: p1)
+  // String.
+  if c == ch_dquote || c == ch_squote then
+    let StringStep(value: sv, pos: p2) = parse_any_string(s, p: p1)
+    return ParseStep(value: TomlString(val: sv), pos: p2)
+  end
+  // Array.
+  if c == ch_lbracket then
+    return parse_array(s, p: p1)
+  end
+  // Inline table.
+  if c == ch_lbrace then
+    return parse_inline_table(s, p: p1)
+  end
+  // Boolean.
+  if starts_with_at(s, p: p1, lit: "true") then
+    return ParseStep(value: TomlBool(val: true), pos: p1 + 4)
+  end
+  if starts_with_at(s, p: p1, lit: "false") then
+    return ParseStep(value: TomlBool(val: false), pos: p1 + 5)
+  end
+  // Number / datetime.
+  if c == ch_minus || c == ch_plus || (c >= '0' && c <= '9') ||
+     starts_with_at(s, p: p1, lit: "nan") || starts_with_at(s, p: p1, lit: "inf") then
+    return parse_number_or_datetime(s, p: p1)
+  end
+  throw TomlError(msg: "unexpected character while parsing value", pos: p1)
+end
+
+// ─── Array ───────────────────────────────────────────────────────────────────
+
+let skip_ws_and_newlines = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ' ' || c == '\t' || c == ch_nl || c == ch_cr then
+    return skip_ws_and_newlines(s, p: p + 1)
+  end
+  if c == ch_hash then
+    let p2 = skip_comment(s, p: p + 1)
+    return skip_ws_and_newlines(s, p: p2)
+  end
+  return p
+end
+
+let parse_array_items = fn (s: string, p: i64, acc: [TomlValue]) -> ParseStep throws { TomlThrow } do
+  let p1 = skip_ws_and_newlines(s, p)
+  if peek(s, p: p1) == ch_rbracket then
+    return ParseStep(value: TomlArray(items: list.reverse(xs: acc)), pos: p1 + 1)
+  end
+  let ParseStep(value: v, pos: p2) = parse_value(s, p: p1)
+  let p3 = skip_ws_and_newlines(s, p: p2)
+  let nc = peek(s, p: p3)
+  if nc == ch_comma then
+    return parse_array_items(s, p: p3 + 1, acc: v :: acc)
+  end
+  if nc == ch_rbracket then
+    return ParseStep(value: TomlArray(items: list.reverse(xs: v :: acc)), pos: p3 + 1)
+  end
+  throw TomlError(msg: "expected ',' or ']' in array", pos: p3)
+end
+
+let parse_array = fn (s: string, p: i64) -> ParseStep throws { TomlThrow } do
+  return parse_array_items(s, p: p + 1, acc: [])
+end
+
+// ─── Inline table ────────────────────────────────────────────────────────────
+
+let parse_inline_fields = fn (s: string, p: i64, acc: [TomlField]) -> ParseStep throws { TomlThrow } do
+  let p1 = skip_inline_ws(s, p)
+  if peek(s, p: p1) == ch_rbrace then
+    return ParseStep(value: TomlTable(fields: list.reverse(xs: acc)), pos: p1 + 1)
+  end
+  let FieldStep(field: f, pos: p2) = parse_keyval(s, p: p1)
+  let p3 = skip_inline_ws(s, p: p2)
+  let nc = peek(s, p: p3)
+  if nc == ch_comma then
+    return parse_inline_fields(s, p: p3 + 1, acc: f :: acc)
+  end
+  if nc == ch_rbrace then
+    return ParseStep(value: TomlTable(fields: list.reverse(xs: f :: acc)), pos: p3 + 1)
+  end
+  throw TomlError(msg: "expected ',' or '}' in inline table", pos: p3)
+end
+
+let parse_inline_table = fn (s: string, p: i64) -> ParseStep throws { TomlThrow } do
+  let p1 = skip_inline_ws(s, p: p + 1)
+  if peek(s, p: p1) == ch_rbrace then
+    return ParseStep(value: TomlTable(fields: []), pos: p1 + 1)
+  end
+  return parse_inline_fields(s, p: p + 1, acc: [])
+end
+
+// ─── Key-value pair ──────────────────────────────────────────────────────────
+
+let parse_keyval = fn (s: string, p: i64) -> FieldStep throws { TomlThrow } do
+  let KeyStep(key: k, pos: p1) = parse_dotted_key(s, p)
+  let p2 = skip_inline_ws(s, p: p1)
+  if peek(s, p: p2) != ch_eq then
+    throw TomlError(msg: "expected '=' after key", pos: p2)
+  end
+  let p3 = skip_inline_ws(s, p: p2 + 1)
+  let ParseStep(value: v, pos: p4) = parse_value(s, p: p3)
+  return FieldStep(field: TomlField(key: k, value: v), pos: p4)
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Top-level document parser
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Merge a key/value into an existing field list.
+// TOML forbids duplicate keys (at the same level); we enforce it here.
+let find_field = fn (fields: [TomlField], key: string) -> bool do
+  match fields do
+    | [] -> return false
+    | TomlField(key: k, value: vv) :: rest ->
+      if k == key then return true end
+      return find_field(fields: rest, key)
+  end
+end
+
+// Insert a field at the end.
+let append_field = fn (fields: [TomlField], f: TomlField) -> [TomlField] throws { TomlThrow } do
+  let TomlField(key: k, value: vv) = f
+  if find_field(fields, key: k) then
+    throw TomlError(msg: "duplicate key: " ++ k, pos: -1)
+  end
+  return list.reverse(xs: f :: list.reverse(xs: fields))
+end
+
+// Get (or create) a sub-table by key, returning (sub_fields, remaining_fields).
+type TableLookup = TableFound(sub: [TomlField], rest: [TomlField]) | TableNotFound
+
+let lookup_table = fn (fields: [TomlField], key: string) -> TableLookup do
+  match fields do
+    | [] -> return TableNotFound
+    | TomlField(key: k, value: v) :: rest ->
+      if k == key then
+        match v do
+          | TomlTable(fields: sub) -> return TableFound(sub, rest)
+          | _ -> return TableNotFound
+        end
+      end
+      match lookup_table(fields: rest, key) do
+        | TableNotFound -> return TableNotFound
+        | TableFound(sub, rest: rest2) ->
+          return TableFound(sub, rest: TomlField(key: k, value: v) :: rest2)
+      end
+  end
+end
+
+// Parse the entire document, accumulating top-level fields.
+let parse_doc = fn (s: string, p: i64, fields: [TomlField]) -> [TomlField] throws { TomlThrow } do
+  let p1 = skip_empty_lines(s, p)
+  if p1 >= slen(s) then return fields end
+  let c = str.byte_at(s, idx: p1)
+  // Table header [key] or [[key]].
+  if c == ch_lbracket then
+    if starts_with_at(s, p: p1, lit: "[[") then
+      return parse_aot_header(s, p: p1, fields)
+    else
+      return parse_table_header(s, p: p1, fields)
+    end
+  end
+  // Key-value line.
+  let FieldStep(field: f, pos: p2) = parse_keyval(s, p: p1)
+  let p3 = skip_line_tail(s, p: p2)
+  let p4 = consume_newline(s, p: p3)
+  let new_fields = append_field(fields, f)
+  return parse_doc(s, p: p4, fields: new_fields)
+end
+
+// Parse table header [section.key].
+let parse_table_header = fn (s: string, p: i64, outer_fields: [TomlField]) -> [TomlField] throws { TomlThrow } do
+  // p is at '['.
+  let p1 = skip_inline_ws(s, p: p + 1)
+  let KeyStep(key: section_key, pos: p2) = parse_dotted_key(s, p: p1)
+  let p3 = skip_inline_ws(s, p: p2)
+  if peek(s, p: p3) != ch_rbracket then
+    throw TomlError(msg: "expected ']' after table key", pos: p3)
+  end
+  let p4 = skip_line_tail(s, p: p3 + 1)
+  let p5 = consume_newline(s, p: p4)
+  // Collect key-vals for this section.
+  let section_fields = collect_section_fields(s, p: p5, acc: [])
+  let SectionResult(fields: sec_body, next_pos) = section_fields
+  // Build a TomlField(key: section_key, value: TomlTable(sec_body)) and append.
+  let table_val = TomlTable(fields: sec_body)
+  let f = TomlField(key: section_key, value: table_val)
+  // Check for duplicate section (allow re-opening via dotted key merging; simple check here).
+  let new_outer = list.reverse(xs: f :: list.reverse(xs: outer_fields))
+  return parse_doc(s, p: next_pos, fields: new_outer)
+end
+
+type SectionResult = SectionResult(fields: [TomlField], next_pos: i64)
+
+// Collect key-val lines until the next '[' header or EOF.
+let collect_section_fields = fn (s: string, p: i64, acc: [TomlField]) -> SectionResult throws { TomlThrow } do
+  let p1 = skip_empty_lines(s, p)
+  if p1 >= slen(s) then
+    return SectionResult(fields: list.reverse(xs: acc), next_pos: p1)
+  end
+  let c = str.byte_at(s, idx: p1)
+  if c == ch_lbracket then
+    return SectionResult(fields: list.reverse(xs: acc), next_pos: p1)
+  end
+  let FieldStep(field: f, pos: p2) = parse_keyval(s, p: p1)
+  let p3 = skip_line_tail(s, p: p2)
+  let p4 = consume_newline(s, p: p3)
+  return collect_section_fields(s, p: p4, acc: f :: acc)
+end
+
+// Parse array-of-tables header [[section.key]].
+let parse_aot_header = fn (s: string, p: i64, outer_fields: [TomlField]) -> [TomlField] throws { TomlThrow } do
+  // p is at "[[".
+  let p1 = skip_inline_ws(s, p: p + 2)
+  let KeyStep(key: section_key, pos: p2) = parse_dotted_key(s, p: p1)
+  let p3 = skip_inline_ws(s, p: p2)
+  if !starts_with_at(s, p: p3, lit: "]]") then
+    throw TomlError(msg: "expected ']]' after array-of-tables key", pos: p3)
+  end
+  let p4 = skip_line_tail(s, p: p3 + 2)
+  let p5 = consume_newline(s, p: p4)
+  let SectionResult(fields: sec_body, next_pos) = collect_section_fields(s, p: p5, acc: [])
+  let new_table = TomlTable(fields: sec_body)
+  // Find existing array for this key and append, or start a new array.
+  let new_outer = aot_append(fields: outer_fields, key: section_key, table_val: new_table)
+  return parse_doc(s, p: next_pos, fields: new_outer)
+end
+
+// Append a new table to the named array-of-tables field.
+let aot_append = fn (fields: [TomlField], key: string, table_val: TomlValue) -> [TomlField] do
+  match fields do
+    | [] -> return [TomlField(key, value: TomlArray(items: [table_val]))]
+    | TomlField(key: k, value: v) :: rest ->
+      if k == key then
+        match v do
+          | TomlArray(items: existing) ->
+            return TomlField(key: k, value: TomlArray(items: list.reverse(xs: table_val :: list.reverse(xs: existing)))) :: rest
+          | _ ->
+            return TomlField(key: k, value: TomlArray(items: [table_val])) :: rest
+        end
+      end
+      return TomlField(key: k, value: v) :: aot_append(fields: rest, key, table_val)
+  end
+end
+
+/**
+Parses a complete TOML document. Returns TomlTable with all top-level
+key/value pairs and sections. Throws TomlError on malformed input.
+*/
+export let parse = fn (s: string) -> TomlValue throws { TomlThrow } do
+  let fields = parse_doc(s, p: 0, fields: [])
+  return TomlTable(fields)
+end
