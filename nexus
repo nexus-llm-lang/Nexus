@@ -1466,19 +1466,105 @@ if [ "$BENCH_MODE" = "1" ]; then
     _p95=$(echo "$_stats" | awk '{print $2}')
 
     echo "{\"name\":\"${bench_name}\",\"median_ms\":${_median},\"p95_ms\":${_p95},\"iters\":${BENCH_ITERS}}"
-    BENCH_RESULTS="${BENCH_RESULTS}${bench_name}:${_median}:${_p95}\n"
+    BENCH_RESULTS="${BENCH_RESULTS}${bench_name}:${_median}:${_p95}:20\n"
   done
 
-  # Baseline drift gate (±20%)
+  # ─── compile_self bench: shell-side, times `./nexus build src/main.nx` ────
+  # Cannot be a bench_*.nx file because WASI preview1 has no subprocess;
+  # we time it here directly.  Uses /usr/bin/time -v for peak RSS capture.
+  # Drift gate is ±40% (coarser) because compile time is more variable
+  # than micro-benches (JIT warm-up, I/O, scheduler noise).
+  # Runs min(BENCH_ITERS, 3) iterations to avoid long CI times.
+  if [ "$BENCH_ITERS" -lt "3" ]; then _cs_iters=$BENCH_ITERS; else _cs_iters=3; fi
+  _cs_out_wasm="${TMPDIR_REAL}/nexus_bench_compile_self.wasm"
+  _cs_time_log="${TMPDIR_REAL}/nexus_bench_cs_time.txt"
+  echo "nexus bench: compile_self [iters=${_cs_iters}, shell-driven, drift=±40%]" >&2
+  _cs_ms_samples=""
+  _cs_rss_samples=""
+  _cs_fail=""
+  _cs_i=0
+  while [ "$_cs_i" -lt "$_cs_iters" ]; do
+    # /usr/bin/time -v writes to stderr; capture both stdout (compile msgs) and stderr.
+    /usr/bin/time -v ./nexus build src/main.nx -o "$_cs_out_wasm" \
+      2>"$_cs_time_log" >/dev/null
+    _cs_ec=$?
+    if [ "$_cs_ec" != "0" ]; then
+      _cs_fail="compile exited ${_cs_ec}"
+      break
+    fi
+    # Parse elapsed wall clock: "Elapsed (wall clock) time (h:mm:ss or m:ss): [H:]M:SS.ss"
+    # Use awk to handle both m:ss and h:mm:ss formats and emit integer milliseconds.
+    _cs_ms=$(awk '/Elapsed \(wall clock\)/ {
+      # The value is the last colon-separated token group after the final ": "
+      # e.g. "0:11.00" (m:ss) or "1:02:03.00" (h:mm:ss)
+      n = split($NF, a, ":");
+      if (n == 2) { printf "%d", (a[1]+0)*60000 + (a[2]+0)*1000 }
+      else if (n == 3) { printf "%d", (a[1]+0)*3600000 + (a[2]+0)*60000 + (a[3]+0)*1000 }
+    }' "$_cs_time_log")
+    # Parse peak RSS: "Maximum resident set size (kbytes): N"
+    _cs_rss=$(awk '/Maximum resident set size/ { print $NF+0 }' "$_cs_time_log")
+    if [ -z "$_cs_ms" ] || [ "$_cs_ms" -le "0" ] 2>/dev/null; then
+      _cs_fail="could not parse elapsed time"
+      break
+    fi
+    _cs_ms_samples="${_cs_ms_samples:+$_cs_ms_samples }${_cs_ms}"
+    _cs_rss_samples="${_cs_rss_samples:+$_cs_rss_samples }${_cs_rss:-0}"
+    _cs_i=$((_cs_i + 1))
+  done
+  rm -f "$_cs_time_log" "$_cs_out_wasm"
+
+  if [ -n "$_cs_fail" ]; then
+    echo "{\"name\":\"compile_self\",\"error\":\"${_cs_fail}\"}"
+    BENCH_ANY_FAIL=1
+  else
+    # Compute median and p95 for wall-clock ms.
+    _cs_stats=$(printf '%s\n' $_cs_ms_samples | awk '
+      BEGIN { n=0 }
+      { a[n++]=$1+0 }
+      END {
+        for(i=1;i<n;i++){v=a[i];j=i-1;while(j>=0&&a[j]>v){a[j+1]=a[j];j--};a[j+1]=v}
+        idx_med = int(n*50/100); if(idx_med>=n) idx_med=n-1
+        idx_p95 = int(n*95/100); if(idx_p95>=n) idx_p95=n-1
+        print a[idx_med] " " a[idx_p95]
+      }
+    ')
+    _cs_median=$(echo "$_cs_stats" | awk '{print $1}')
+    _cs_p95=$(echo "$_cs_stats"    | awk '{print $2}')
+    echo "{\"name\":\"compile_self\",\"median_ms\":${_cs_median},\"p95_ms\":${_cs_p95},\"iters\":${_cs_iters}}"
+    BENCH_RESULTS="${BENCH_RESULTS}compile_self:${_cs_median}:${_cs_p95}:40\n"
+
+    # Compute median peak RSS (kbytes).
+    _cs_rss_stats=$(printf '%s\n' $_cs_rss_samples | awk '
+      BEGIN { n=0 }
+      { a[n++]=$1+0 }
+      END {
+        if (n == 0) { print "0 0"; exit }
+        for(i=1;i<n;i++){v=a[i];j=i-1;while(j>=0&&a[j]>v){a[j+1]=a[j];j--};a[j+1]=v}
+        idx_med = int(n*50/100); if(idx_med>=n) idx_med=n-1
+        idx_p95 = int(n*95/100); if(idx_p95>=n) idx_p95=n-1
+        print a[idx_med] " " a[idx_p95]
+      }
+    ')
+    _cs_rss_median=$(echo "$_cs_rss_stats" | awk '{print $1}')
+    _cs_rss_p95=$(echo "$_cs_rss_stats"    | awk '{print $2}')
+    # Emit RSS as a separate bench entry (median_ms field holds kbytes for RSS bench).
+    echo "{\"name\":\"compile_self_rss_kb\",\"median_ms\":${_cs_rss_median},\"p95_ms\":${_cs_rss_p95},\"iters\":${_cs_iters}}"
+    BENCH_RESULTS="${BENCH_RESULTS}compile_self_rss_kb:${_cs_rss_median}:${_cs_rss_p95}:40\n"
+  fi
+
+  # Baseline drift gate (±20% default, ±40% for compile_self entries)
   if [ -n "$BENCH_BASELINE" ] && [ "$BENCH_ANY_FAIL" = "0" ]; then
     if [ ! -f "$BENCH_BASELINE" ]; then
       echo "nexus bench: baseline file not found: $BENCH_BASELINE" >&2
       exit 1
     fi
     DRIFT_VIOLATIONS=0
-    # For each result line "name:median:p95", look up "name" in the baseline JSON.
-    printf '%b' "$BENCH_RESULTS" | while IFS=: read -r _name _actual _p95_val; do
+    # For each result line "name:median:p95:gate", look up "name" in the
+    # baseline JSON and check drift against the per-entry gate percentage.
+    # Normal benches use gate=20 (±20%); compile_self entries use gate=40.
+    printf '%b' "$BENCH_RESULTS" | while IFS=: read -r _name _actual _p95_val _gate; do
       [ -z "$_name" ] && continue
+      _gate="${_gate:-20}"
       _base=$(awk -v name="$_name" '
         BEGIN { found=0 }
         /"name"[[:space:]]*:[[:space:]]*"/ {
@@ -1491,18 +1577,19 @@ if [ "$BENCH_MODE" = "1" ]; then
         }
       ' "$BENCH_BASELINE")
       if [ -z "$_base" ] || [ "$_base" = "0" ]; then continue; fi
-      # ±20%: lo = base*4/5, hi = base*6/5
-      _lo=$((_base * 4 / 5))
-      _hi=$((_base * 6 / 5))
+      # Compute bounds: lo = base*(100-gate)/100, hi = base*(100+gate)/100
+      _lo=$(( _base * (100 - _gate) / 100 ))
+      _hi=$(( _base * (100 + _gate) / 100 ))
       if [ "$_actual" -lt "$_lo" ] || [ "$_actual" -gt "$_hi" ]; then
         _pct=$(((_actual - _base) * 100 / _base))
-        echo "DRIFT  ${_name}  baseline=${_base}ms  actual=${_actual}ms  drift=${_pct}%  (limit ±20%)" >&2
+        echo "DRIFT  ${_name}  baseline=${_base}ms  actual=${_actual}ms  drift=${_pct}%  (limit ±${_gate}%)" >&2
         DRIFT_VIOLATIONS=$((DRIFT_VIOLATIONS + 1))
       fi
     done
-    # Re-count violations (subshell above can't export; re-scan from results)
-    _viol=$(printf '%b' "$BENCH_RESULTS" | while IFS=: read -r _name _actual _p95_val; do
+    # Re-count violations (subshell above cannot export; re-scan from results)
+    _viol=$(printf '%b' "$BENCH_RESULTS" | while IFS=: read -r _name _actual _p95_val _gate; do
       [ -z "$_name" ] && continue
+      _gate="${_gate:-20}"
       _base=$(awk -v name="$_name" '
         BEGIN { found=0 }
         /"name"[[:space:]]*:[[:space:]]*"/ {
@@ -1515,14 +1602,14 @@ if [ "$BENCH_MODE" = "1" ]; then
         }
       ' "$BENCH_BASELINE")
       if [ -z "$_base" ] || [ "$_base" = "0" ]; then continue; fi
-      _lo=$((_base * 4 / 5))
-      _hi=$((_base * 6 / 5))
+      _lo=$(( _base * (100 - _gate) / 100 ))
+      _hi=$(( _base * (100 + _gate) / 100 ))
       if [ "$_actual" -lt "$_lo" ] || [ "$_actual" -gt "$_hi" ]; then
         echo "violation"
       fi
     done | wc -l | tr -d ' ')
     if [ "$_viol" -gt "0" ]; then
-      echo "nexus bench: ${_viol} bench(es) exceeded ±20% drift gate" >&2
+      echo "nexus bench: ${_viol} bench(es) exceeded drift gate" >&2
       exit 3
     fi
     echo "nexus bench: baseline check passed" >&2
