@@ -204,6 +204,7 @@ The rendered site lives at **<https://nexus-llm-lang.github.io/>**. Its source l
 | [FFI](https://nexus-llm-lang.github.io/latest/env/ffi/) | Wasm interop |
 | [Stdlib](https://nexus-llm-lang.github.io/latest/env/stdlib/) | Standard library |
 | [Tools](https://nexus-llm-lang.github.io/latest/env/tools/) | LSP server, CLI diagnostics, AI coding agent skill |
+| [Glossary](docs/glossary.md) | Codebase acronyms: HIR/MIR/LIR, TCMC, TCWF, RdrName, and more |
 
 ## License
 
