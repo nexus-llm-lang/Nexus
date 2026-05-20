@@ -1,0 +1,181 @@
+// bd: nexus-xjbs.1 — codegen foundation: canonical-ABI resource handle lower/lift.
+//
+// Verifies that user-defined types from foreign component-model modules
+// (wasm_module containing ':' but not nexus:intrinsic/runtime/std) lower
+// as i32 (canonical-ABI resource handles = i32 table indices) rather
+// than the default i64 that internal / nexus-namespaced externals use.
+//
+// Three properties tested:
+//   1. is_foreign_component_module correctly classifies nexus-internal
+//      vs foreign component-model modules.
+//   2. build_type_section_dedup emits i32 (0x7f) for a TyUserDefined
+//      parameter on a wasi: external, vs i64 (0x7e) for the same type
+//      on a nexus-internal external.
+//   3. needs_cabi_realloc is false for resource-only externals (resource
+//      handles are plain i32 indices and do not use cabi_realloc).
+import * as test_assert from "std:test/assert"
+import { TypeExpr, TyUnit, TyRow, TyUserDefined } from "src/common/ast.nx"
+import {
+  LirExternal, LirParam, LirProgram,
+  LirFunction, LirAtomUnit
+} from "src/ir/lir/types.nx"
+import { None } from "std:option"
+import * as bb from "std:bytebuffer"
+import { ByteBuffer } from "std:bytebuffer"
+import { is_foreign_component_module, needs_cabi_realloc } from "src/backend/wasm/collect.nx"
+import { build_type_section_dedup, DedupedTypes } from "src/backend/wasm/section/type_section.nx"
+import { Span } from "src/common/token.nx"
+
+let dummy_span = fn () -> Span do
+  return Span(offset: 0, line: 1, col: 1)
+end
+
+let empty_throw_row = fn () -> TypeExpr do
+  return TyRow(types: [], rest: None)
+end
+
+let output_stream_type = fn () -> TypeExpr do
+  return TyUserDefined(name: "output-stream", args: [])
+end
+
+let mk_ext = fn (name: string, wasm_module: string, param_typ: TypeExpr, ret_typ: TypeExpr) -> LirExternal do
+  let p = LirParam(label: "handle", name: "handle", typ: param_typ)
+  return LirExternal(
+    name, wasm_module, wasm_name: name,
+    params: [p], ret_type: ret_typ, throw_row: empty_throw_row()
+  )
+end
+
+let mk_unit_fn = fn (name: string) -> LirFunction do
+  return LirFunction(
+    name, params: [], ret_type: TyUnit, body: [], ret: LirAtomUnit, span: dummy_span()
+  )
+end
+
+let read_all = fn (buf: &ByteBuffer) -> [i64] do
+  return read_all_go(buf, idx: 0, len: bb.length(buf), acc: [])
+end
+let read_all_go = fn (buf: &ByteBuffer, idx: i64, len: i64, acc: [i64]) -> [i64] do
+  if idx >= len then return rev_i64(xs: acc, out: []) end
+  let b = bb.get_byte(buf, idx)
+  return read_all_go(buf, idx: idx + 1, len, acc: b :: acc)
+end
+let rev_i64 = fn (xs: [i64], out: [i64]) -> [i64] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_i64(xs: rest, out: x :: out)
+  end
+end
+
+// Returns the byte at the given 0-based index in a list.
+let nth = fn (xs: [i64], idx: i64) -> i64 do
+  match xs do
+    | [] -> return -1
+    | x :: rest ->
+      if idx <= 0 then return x
+      else return nth(xs: rest, idx: idx - 1)
+      end
+  end
+end
+
+// Extract the first param valtype byte from a type-section payload.
+// Layout (all ULEBs single-byte for small values):
+//   [0] = count, [1] = 0x60 (func form), [2] = n_params, [3] = first param valtype
+let first_param_valtype = fn (sec_bytes: [i64]) -> i64 do
+  return nth(xs: sec_bytes, idx: 3)
+end
+
+let run_type_section = fn (ext: LirExternal) -> [i64] do
+  let main_fn = mk_unit_fn(name: "main")
+  let prog = LirProgram(functions: [main_fn], externals: [ext])
+  let DedupedTypes(
+    section: %ts,
+    count: _,
+    ext_type_idxs: _,
+    func_type_idxs: _,
+    wasi_run_type_idx: _,
+    exn_tag_type_idx: _,
+    ss_tag_type_idx: _,
+    alloc_type_idx: _,
+    alloc_mark_type_idx: _,
+    alloc_reset_type_idx: _,
+    cabi_type_idx: _,
+    closure_type_idxs: _,
+    ss_cont_type_idx: _,
+    ss_dispatch_block_type_idx: _
+  ) = build_type_section_dedup(
+    program: prog,
+    has_eh: false, has_ss: false, has_alloc: false,
+    has_cabi_realloc: false, closure_arities: [],
+    p3_component: false
+  )
+  let bytes = read_all(buf: &ts)
+  bb.free(buf: %ts)
+  return bytes
+end
+
+let body = fn () -> unit throws { Exn } do
+  // ── part 1: is_foreign_component_module classification ──
+
+  test_assert.assert_true(
+    cond: !is_foreign_component_module(m: "nexus:intrinsic"),
+    label: "nexus:intrinsic is not a foreign component module")
+  test_assert.assert_true(
+    cond: !is_foreign_component_module(m: "nexus:runtime/sysio"),
+    label: "nexus:runtime/* is not a foreign component module")
+  test_assert.assert_true(
+    cond: !is_foreign_component_module(m: "nexus:std/math"),
+    label: "nexus:std/* is not a foreign component module")
+  test_assert.assert_true(
+    cond: !is_foreign_component_module(m: "env"),
+    label: "env (no colon) is not a foreign component module")
+  test_assert.assert_true(
+    cond: is_foreign_component_module(m: "wasi:io/streams@0.2.1"),
+    label: "wasi:io/streams is a foreign component module")
+  test_assert.assert_true(
+    cond: is_foreign_component_module(m: "wasi:cli/stdout@0.2.1"),
+    label: "wasi:cli/stdout is a foreign component module")
+
+  // ── part 2: resource handle lowers as i32 in type section ────────────────
+
+  // wasi:io/streams external with TyUserDefined("output-stream") param.
+  // In canonical ABI, resource handles are i32 table indices (vt_i32 = 0x7f = 127).
+  let wasi_ext = mk_ext(
+    name: "write",
+    wasm_module: "wasi:io/streams@0.2.1",
+    param_typ: output_stream_type(),
+    ret_typ: output_stream_type()
+  )
+  let wasi_bytes = run_type_section(ext: wasi_ext)
+  test_assert.assert_eq_i64(
+    actual: first_param_valtype(sec_bytes: wasi_bytes),
+    expected: 127,  // vt_i32 = 0x7f
+    label: "wasi:io/streams TyUserDefined param lowers as i32 (canonical-ABI resource handle)")
+
+  // Same TyUserDefined type on nexus:intrinsic — not a resource, stays i64.
+  let nexus_ext = mk_ext(
+    name: "nop",
+    wasm_module: "nexus:intrinsic",
+    param_typ: output_stream_type(),
+    ret_typ: TyUnit
+  )
+  let nexus_bytes = run_type_section(ext: nexus_ext)
+  test_assert.assert_eq_i64(
+    actual: first_param_valtype(sec_bytes: nexus_bytes),
+    expected: 126,  // vt_i64 = 0x7e
+    label: "nexus:intrinsic TyUserDefined param stays i64 (not a resource module)")
+
+  // ── part 3: needs_cabi_realloc stays false for resource-only externals ────
+  // cabi_realloc is only needed for variable-length memory types (strings).
+  // Resource handles are fixed-size i32 and do not need cabi_realloc.
+  test_assert.assert_true(
+    cond: !needs_cabi_realloc(exts: [wasi_ext]),
+    label: "resource-only foreign component external does not trigger cabi_realloc")
+
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end

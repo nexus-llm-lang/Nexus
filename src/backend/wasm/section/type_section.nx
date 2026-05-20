@@ -14,7 +14,11 @@ import * as wdefs from "src/backend/wasm/defs.nx"
 import * as wcollect from "src/backend/wasm/collect.nx"
 import * as list from "std:list"
 
-let emit_ext_param_types = fn (buf: %ByteBuffer, params: [LirParam]) -> %ByteBuffer do
+/** Emit the wasm valtype bytes for external import params.
+ *  When `is_component` is true (foreign component-model module), user-defined
+ *  types lower as i32 (canonical-ABI resource handles are i32 table indices).
+ */
+let emit_ext_param_types = fn (buf: %ByteBuffer, params: [LirParam], is_component: bool) -> %ByteBuffer do
   match params do
     | [] -> %buf
     | LirParam(label: _, name: _, typ: t) :: rest ->
@@ -23,21 +27,38 @@ let emit_ext_param_types = fn (buf: %ByteBuffer, params: [LirParam]) -> %ByteBuf
           let %b = bb.push_byte(%buf, byte: wdefs.vt_i32)
           bb.push_byte(buf: %b, byte: wdefs.vt_i32)
         | TyChar -> bb.push_byte(%buf, byte: wdefs.vt_i32)
+        | TyUserDefined(name: _, args: _) ->
+          // In foreign component-model modules user-defined types are resource
+          // handles (own<T> / borrow<T>) which lower as i32 table indices.
+          if is_component then bb.push_byte(%buf, byte: wdefs.vt_i32)
+          else bb.push_byte(%buf, byte: wdefs.type_to_valtype(typ: t))
+          end
         | _ -> bb.push_byte(%buf, byte: wdefs.type_to_valtype(typ: t))
       end
-      emit_ext_param_types(%buf, params: rest)
+      emit_ext_param_types(%buf, params: rest, is_component)
   end
 end
 
-let ext_return_valtype = fn (typ: TypeExpr) -> i64 do
-  return if let TyChar = wdefs.peel_linear(typ) then wdefs.vt_i32 else wdefs.type_to_valtype(typ) end
+/** Map an external return type to its wasm valtype byte.
+ *  In foreign component-model modules user-defined return types are resource
+ *  handles and lower as i32 (own<T> borrow<T> → i32 table index).
+ */
+let ext_return_valtype = fn (typ: TypeExpr, is_component: bool) -> i64 do
+  match wdefs.peel_linear(typ) do
+    | TyChar -> return wdefs.vt_i32
+    | TyUserDefined(name: _, args: _) ->
+      if is_component then return wdefs.vt_i32
+      else return wdefs.type_to_valtype(typ)
+      end
+    | _ -> return wdefs.type_to_valtype(typ)
+  end
 end
 
-let emit_ext_return_type = fn (buf: %ByteBuffer, typ: TypeExpr) -> %ByteBuffer do
+let emit_ext_return_type = fn (buf: %ByteBuffer, typ: TypeExpr, is_component: bool) -> %ByteBuffer do
   if wdefs.is_unit(typ) then return bb.push_uleb128(%buf, val: 0)
   else
     let %buf = bb.push_uleb128(%buf, val: 1)
-    return bb.push_byte(%buf, byte: ext_return_valtype(typ))
+    return bb.push_byte(%buf, byte: ext_return_valtype(typ, is_component))
   end
 end
 
@@ -68,18 +89,19 @@ end
 
 let emit_one_ext_type = fn (scratch: %ByteBuffer, ext: LirExternal) -> %ByteBuffer do
   let LirExternal(name: _, wasm_module: m, wasm_name: _, params: ps, ret_type: rt, throw_row: _) = ext
+  let is_component = wcollect.is_foreign_component_module(m)
   let canonical_str_ret = ext_uses_canonical_string_return(wasm_module: m, ret_type: rt)
   // For canonical string return: add 1 slot for retptr param
   let extra_params = match canonical_str_ret do | true -> 1 | false -> 0 end
   let %buf = bb.push_byte(buf: %scratch, byte: wdefs.wasm_form_func)
   let %buf = bb.push_uleb128(%buf, val: wcollect.count_ext_param_slots(params: ps) + extra_params)
-  let %buf = emit_ext_param_types(%buf, params: ps)
+  let %buf = emit_ext_param_types(%buf, params: ps, is_component)
   return if canonical_str_ret then
     // Canonical string return: retptr (i32) as last param, void return
     let %buf = bb.push_byte(%buf, byte: wdefs.vt_i32)
     bb.push_uleb128(%buf, val: 0)
   else
-    emit_ext_return_type(%buf, typ: rt)
+    emit_ext_return_type(%buf, typ: rt, is_component)
   end
 end
 
@@ -88,7 +110,7 @@ let emit_one_func_type = fn (scratch: %ByteBuffer, func: LirFunction) -> %ByteBu
   let %buf = bb.push_byte(buf: %scratch, byte: wdefs.wasm_form_func)
   let %buf = bb.push_uleb128(%buf, val: list.length(xs: ps))
   let %buf = emit_internal_param_types(%buf, params: ps)
-  return emit_ext_return_type(%buf, typ: rt)
+  return emit_ext_return_type(%buf, typ: rt, is_component: false)
 end
 
 let emit_n_i64_params = fn (buf: %ByteBuffer, count: i64) -> %ByteBuffer do
