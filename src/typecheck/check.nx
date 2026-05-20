@@ -14,7 +14,7 @@
 
 import * as list from "std:list"
 import { TypeExpr, TyUnit, TyUserDefined, TyVar, TyArrow, TyRef, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyHandler, NamedType, EnumDef, RecordDef, VariantDef, VariantField } from "src/common/ast.nx"
-import { HirProgram, HirFunction, HirHandlerArm, HirParam, HirExternal, HirCap, HirCapMethod, HirHandlerBindingEntry, HirHandlerBinding, EagerBody, LazyBody, ExceptionGroupEntry } from "src/ir/hir/types.nx"
+import { HirProgram, HirFunction, HirHandlerArm, HirParam, HirExternal, HirCap, HirCapMethod, HirHandlerBindingEntry, HirHandlerBinding, EagerBody, LazyBody, ExceptionGroupEntry, HirStmt, HirStmtKind, HirExpr, HirExprKind, HirCallArg, HirMatchCase, HirNamedExpr } from "src/ir/hir/types.nx"
 import { Span } from "src/common/token.nx"
 import { TypeError, TypeMismatch, MissingMain, MainNotFunction, MainNotUnit, MainThrowsTooBroad, MainRequiresTooBroad, DuplicateTopLevelBinding, UnusedTypeParam, KindClashTypeParam, RefEscapes } from "src/typecheck/errors.nx"
 import { CheckState, Scheme, EnvEntry, EnumEntry, TypeDefEntry, InferExprOk, InferExprErr }, * as tctypes from "src/typecheck/types.nx"
@@ -23,7 +23,7 @@ import * as infer from "src/typecheck/infer.nx"
 import { infer_stmts_tail_diverges } from "src/typecheck/infer/control_flow.nx"
 import * as tcwf from "src/typecheck/tcwf.nx"
 import { add_builtins, build_enum_entries, build_type_def_entries } from "src/typecheck/check/builtins.nx"
-import { convert_ud_to_var, convert_named_types, convert_hir_params } from "src/typecheck/check/occurs.nx"
+import { convert_ud_to_var, convert_named_types, convert_hir_params, str_list_contains } from "src/typecheck/check/occurs.nx"
 import {
   hir_params_to_named_types,
   register_externals, register_functions, register_caps,
@@ -66,19 +66,26 @@ export let check_program = fn (hir: HirProgram, local_names: [string], require_m
 
   let cont_binder_map = build_cont_binder_map(hbs)
 
-  check_all_functions(state: st5, funcs, local_names, cont_map: cont_binder_map)
+  // Build the fn_pure_set: names of top-level functions whose bodies are
+  // provably non-throwing (no direct Raise, no call to a can-throw function).
+  // Used by check_call_throw_row_admitted to admit unannotated callees that
+  // are statically pure under a `throws {}` caller.
+  let pure_set = build_fn_pure_set(funcs)
+  let st6 = tctypes.state_with_fn_pure_set(state: st5, fn_pure_set: pure_set)
+
+  check_all_functions(state: st6, funcs, local_names, cont_map: cont_binder_map)
 
   // Pass 2b: Check handler arm bodies (synthesised function names aren't in
   // local_names, so they're missed by check_all_functions). With-kont arms
   // need their body re-checked with the cont binder bound in env so that
   // forcing @k at the wrong type is a TypeMismatch.
-  check_handler_arm_bodies(state: st5, hbs)
+  check_handler_arm_bodies(state: st6, hbs)
 
   // Validate main exists and has correct signature. Skipped for library-only
   // typecheck (require_main=false): files with only exports are legitimate
   // imports for other modules and have no executable entry point.
   if require_main then
-    validate_main(state: st5, funcs)
+    validate_main(state: st6, funcs)
   end
 
   return hir
@@ -230,5 +237,225 @@ let add_func_params = fn (env: [EnvEntry], params: [HirParam]) -> [EnvEntry] do
     | [] -> return env
     | HirParam(label: _, name: n, sigil: _, typ: t) :: rest ->
       return add_func_params(env: tctypes.env_insert(env, name: n, scheme: tctypes.mono(typ: t)), params: rest)
+  end
+end
+
+// ─── fn_pure_set: provably-non-throwing function set ─────────────────────────
+
+/** Collect all top-level function names. */
+let collect_fn_names = fn (funcs: [HirFunction]) -> [string] do
+  return collect_fn_names_go(funcs, acc: [])
+end
+
+let collect_fn_names_go = fn (funcs: [HirFunction], acc: [string]) -> [string] do
+  match funcs do
+    | [] -> return acc
+    | HirFunction(name: n, _) :: rest ->
+      return collect_fn_names_go(funcs: rest, acc: n :: acc)
+  end
+end
+
+/** True if the HirExpr contains any Raise node or any Call to a function in `can_throw`.
+ *  Also returns true for calls to names NOT in `all_fns` (unknown callees — conservative). */
+let expr_can_escape = fn (expr: HirExpr, can_throw: [string], all_fns: [string]) -> bool do
+  let HirExpr(node: k, span: _) = expr
+  return expr_kind_can_escape(k: k, can_throw, all_fns)
+end
+
+let expr_kind_can_escape = fn (k: HirExprKind, can_throw: [string], all_fns: [string]) -> bool do
+  match k do
+    | Raise(expr: _) -> return true
+    | Call(func: f, args: call_args) ->
+      // Unknown callee (not a top-level fn): conservatively treat as can-throw.
+      if !str_list_contains(xs: all_fns, s: f) then return true end
+      // Known callee in can_throw: this call can throw.
+      if str_list_contains(xs: can_throw, s: f) then return true end
+      // Otherwise check the arg expressions for nested raises/calls.
+      return call_args_can_escape(args: call_args, can_throw, all_fns)
+    | BinOp(left: l, op: _, right: r) ->
+      if expr_can_escape(expr: l, can_throw, all_fns) then return true end
+      return expr_can_escape(expr: r, can_throw, all_fns)
+    | UnOp(op: _, operand: e) -> return expr_can_escape(expr: e, can_throw, all_fns)
+    | Ctor(variant: _, args: es, labels: _, sigil: _) ->
+      return exprs_can_escape(es: es, can_throw, all_fns)
+    | Array(elems: es) -> return exprs_can_escape(es: es, can_throw, all_fns)
+    | Index(target: t, index: i) ->
+      if expr_can_escape(expr: t, can_throw, all_fns) then return true end
+      return expr_can_escape(expr: i, can_throw, all_fns)
+    | FieldAccess(target: t, field: _) -> return expr_can_escape(expr: t, can_throw, all_fns)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      if expr_can_escape(expr: c, can_throw, all_fns) then return true end
+      if stmts_can_escape(stmts: tb, can_throw, all_fns) then return true end
+      match eb do
+        | None -> return false
+        | Some(val: ebs) -> return stmts_can_escape(stmts: ebs, can_throw, all_fns)
+      end
+    | Match(target: t, cases: cs) ->
+      if expr_can_escape(expr: t, can_throw, all_fns) then return true end
+      return cases_can_escape(cs: cs, can_throw, all_fns)
+    | While(cond: c, body: b) ->
+      if expr_can_escape(expr: c, can_throw, all_fns) then return true end
+      return stmts_can_escape(stmts: b, can_throw, all_fns)
+    | For(var: _, start: s, end_expr: e, body: b) ->
+      if expr_can_escape(expr: s, can_throw, all_fns) then return true end
+      if expr_can_escape(expr: e, can_throw, all_fns) then return true end
+      return stmts_can_escape(stmts: b, can_throw, all_fns)
+    | Lambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: _) ->
+      // Lambda bodies are checked independently; don't recurse into them for
+      // the outer function's purity — a lambda that throws is a value, not a
+      // direct escape from the enclosing function.
+      return false
+    | Force(expr: e) -> return expr_can_escape(expr: e, can_throw, all_fns)
+    | Thunk(body: _) ->
+      // Thunk bodies are deferred; same as Lambda — don't recurse.
+      return false
+    | Record(fields: flds) -> return named_exprs_can_escape(flds: flds, can_throw, all_fns)
+    | _ -> return false
+  end
+end
+
+let exprs_can_escape = fn (es: [HirExpr], can_throw: [string], all_fns: [string]) -> bool do
+  match es do
+    | [] -> return false
+    | e :: rest ->
+      if expr_can_escape(expr: e, can_throw, all_fns) then return true end
+      return exprs_can_escape(es: rest, can_throw, all_fns)
+  end
+end
+
+let call_args_can_escape = fn (args: [HirCallArg], can_throw: [string], all_fns: [string]) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: _, value: v) :: rest ->
+      if expr_can_escape(expr: v, can_throw, all_fns) then return true end
+      return call_args_can_escape(args: rest, can_throw, all_fns)
+  end
+end
+
+let named_exprs_can_escape = fn (flds: [HirNamedExpr], can_throw: [string], all_fns: [string]) -> bool do
+  match flds do
+    | [] -> return false
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      if expr_can_escape(expr: v, can_throw, all_fns) then return true end
+      return named_exprs_can_escape(flds: rest, can_throw, all_fns)
+  end
+end
+
+let cases_can_escape = fn (cs: [HirMatchCase], can_throw: [string], all_fns: [string]) -> bool do
+  match cs do
+    | [] -> return false
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      if stmts_can_escape(stmts: b, can_throw, all_fns) then return true end
+      return cases_can_escape(cs: rest, can_throw, all_fns)
+  end
+end
+
+let stmts_can_escape = fn (stmts: [HirStmt], can_throw: [string], all_fns: [string]) -> bool do
+  match stmts do
+    | [] -> return false
+    | HirStmt(node: s, span: _) :: rest ->
+      if stmt_kind_can_escape(s: s, can_throw, all_fns) then return true end
+      return stmts_can_escape(stmts: rest, can_throw, all_fns)
+  end
+end
+
+let stmt_kind_can_escape = fn (s: HirStmtKind, can_throw: [string], all_fns: [string]) -> bool do
+  match s do
+    | Let(name: _, sigil: _, typ: _, value: v) -> return expr_can_escape(expr: v, can_throw, all_fns)
+    | Expr(expr: e) -> return expr_can_escape(expr: e, can_throw, all_fns)
+    | Return(expr: e) -> return expr_can_escape(expr: e, can_throw, all_fns)
+    | Assign(target: t, value: v) ->
+      if expr_can_escape(expr: t, can_throw, all_fns) then return true end
+      return expr_can_escape(expr: v, can_throw, all_fns)
+    | Try(body: tb, catch_param: _, catch_body: cb) ->
+      // try/catch: throws from the try body that are caught don't escape;
+      // throws from the catch body do. Conservatively treat both as potential
+      // escape sources (the try body may still escape if it throws something
+      // the catch doesn't handle).
+      if stmts_can_escape(stmts: tb, can_throw, all_fns) then return true end
+      return stmts_can_escape(stmts: cb, can_throw, all_fns)
+    | Inject(handlers: _, body: b) -> return stmts_can_escape(stmts: b, can_throw, all_fns)
+  end
+end
+
+/** True when a function body can escape exceptions under `can_throw`+`all_fns`. */
+let fn_body_can_escape = fn (func: HirFunction, can_throw: [string], all_fns: [string]) -> bool do
+  let HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: _, body: hir_body, _) = func
+  match hir_body do
+    | LazyBody(ast_expr: _, entries: _) -> return true  // unknown: conservatively treat as can-throw
+    | EagerBody(stmts: stmts) -> return stmts_can_escape(stmts, can_throw, all_fns)
+  end
+end
+
+/** One fixpoint step: add to `can_throw` any fn whose body can escape under current `can_throw`. */
+let fixpoint_step = fn (funcs: [HirFunction], can_throw: [string], all_fns: [string]) -> [string] do
+  return fixpoint_step_go(funcs, can_throw, all_fns, acc: can_throw)
+end
+
+let fixpoint_step_go = fn (funcs: [HirFunction], can_throw: [string], all_fns: [string], acc: [string]) -> [string] do
+  match funcs do
+    | [] -> return acc
+    | func :: rest ->
+      let HirFunction(name: n, _) = func
+      let new_acc = if !str_list_contains(xs: acc, s: n) && fn_body_can_escape(func, can_throw, all_fns) then
+        n :: acc
+      else
+        acc
+      end
+      return fixpoint_step_go(funcs: rest, can_throw, all_fns, acc: new_acc)
+  end
+end
+
+/** Compute the fixpoint of can_throw: iterate until stable. */
+let fixpoint_can_throw = fn (funcs: [HirFunction], can_throw: [string], all_fns: [string]) -> [string] do
+  let next = fixpoint_step(funcs, can_throw, all_fns)
+  let changed = list.length(xs: next) != list.length(xs: can_throw)
+  if changed then
+    return fixpoint_can_throw(funcs, can_throw: next, all_fns)
+  end
+  return next
+end
+
+/** Build the set of provably-non-throwing top-level function names.
+ *  Returns a list of function names that cannot throw (directly or transitively).
+ */
+let build_fn_pure_set = fn (funcs: [HirFunction]) -> [string] do
+  let all_fns = collect_fn_names(funcs)
+  // Initial can_throw: functions whose bodies directly contain Raise or call unknowns.
+  let initial_can_throw = initial_can_throw_set(funcs, all_fns)
+  // Fixpoint: propagate transitively.
+  let final_can_throw = fixpoint_can_throw(funcs, can_throw: initial_can_throw, all_fns)
+  // Pure set = all_fns minus can_throw.
+  return filter_not_in(xs: all_fns, exclude: final_can_throw)
+end
+
+let initial_can_throw_set = fn (funcs: [HirFunction], all_fns: [string]) -> [string] do
+  return initial_can_throw_go(funcs, all_fns, acc: [])
+end
+
+let initial_can_throw_go = fn (funcs: [HirFunction], all_fns: [string], acc: [string]) -> [string] do
+  match funcs do
+    | [] -> return acc
+    | func :: rest ->
+      let HirFunction(name: n, _) = func
+      let new_acc = if fn_body_can_escape(func, can_throw: [], all_fns) then
+        n :: acc
+      else
+        acc
+      end
+      return initial_can_throw_go(funcs: rest, all_fns, acc: new_acc)
+  end
+end
+
+let filter_not_in = fn (xs: [string], exclude: [string]) -> [string] do
+  return filter_not_in_go(xs, exclude, acc: [])
+end
+
+let filter_not_in_go = fn (xs: [string], exclude: [string], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return acc
+    | x :: rest ->
+      let new_acc = if str_list_contains(xs: exclude, s: x) then acc else x :: acc end
+      return filter_not_in_go(xs: rest, exclude, acc: new_acc)
   end
 end
