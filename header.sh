@@ -816,6 +816,7 @@ if [ "$TEST_MODE" = "1" ]; then
       *_test.nx) FILES="$TEST_PATH";;
       */negative/*.nx) FILES="$TEST_PATH";;
       */p3_component/*.nx) FILES="$TEST_PATH";;
+      */p2_component/*.nx) FILES="$TEST_PATH";;
       */repl/*.in.txt) FILES="$TEST_PATH";;
       *) FILES="";;
     esac
@@ -823,8 +824,9 @@ if [ "$TEST_MODE" = "1" ]; then
     POS_FILES=$(find "$TEST_PATH" -type f -name '*_test.nx' 2>/dev/null)
     NEG_FILES=$(find "$TEST_PATH" -type f -path '*/negative/*.nx' 2>/dev/null)
     P3C_FILES=$(find "$TEST_PATH" -type f -path '*/p3_component/*.nx' 2>/dev/null)
+    P2C_FILES=$(find "$TEST_PATH" -type f -path '*/p2_component/*.nx' 2>/dev/null)
     REPL_FILES=$(find "$TEST_PATH" -type f -path '*/repl/*.in.txt' 2>/dev/null)
-    FILES=$(printf '%s\n%s\n%s\n%s\n' "$POS_FILES" "$NEG_FILES" "$P3C_FILES" "$REPL_FILES" | grep -v '^$' | sort)
+    FILES=$(printf '%s\n%s\n%s\n%s\n%s\n' "$POS_FILES" "$NEG_FILES" "$P3C_FILES" "$P2C_FILES" "$REPL_FILES" | grep -v '^$' | sort)
   fi
   N=$(printf '%s\n' "$FILES" | grep -c '^.' || true)
   if [ "$N" = "0" ]; then
@@ -907,10 +909,11 @@ if [ "$TEST_MODE" = "1" ]; then
     # the compile-fail and runtime-throw flavors. `repl/*.in.txt` files
     # are transcript-driven golden tests (nexus-u468).
     case "$f" in
-      */negative/*)    NEG=1; P3C=0; REPL_GOLDEN=0;;
-      */p3_component/*) NEG=0; P3C=1; REPL_GOLDEN=0;;
-      */repl/*.in.txt) NEG=0; P3C=0; REPL_GOLDEN=1;;
-      *)               NEG=0; P3C=0; REPL_GOLDEN=0;;
+      */negative/*)    NEG=1; P3C=0; P2C=0; REPL_GOLDEN=0;;
+      */p3_component/*) NEG=0; P3C=1; P2C=0; REPL_GOLDEN=0;;
+      */p2_component/*) NEG=0; P3C=0; P2C=1; REPL_GOLDEN=0;;
+      */repl/*.in.txt) NEG=0; P3C=0; P2C=0; REPL_GOLDEN=1;;
+      *)               NEG=0; P3C=0; P2C=0; REPL_GOLDEN=0;;
     esac
 
     # ── repl golden fixture (nexus-u468) ──────────────────────────────
@@ -1169,6 +1172,55 @@ if [ "$TEST_MODE" = "1" ]; then
       printf "PASS\t%s\tp3c\t%s\t-\n" "$ms" "$f" \
         > "$RESULTS_DIR/result_$idx.tsv"
       printf "PASS  %s  (%sms, p3c)\n" "$f" "$ms" >&2
+      if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
+      exit 0
+    fi
+
+    # ── p2_component fixture ───────────────────────────────────────────
+    if [ "$P2C" = "1" ]; then
+      t0=$(date +%s%N 2>/dev/null || date +%s000000000)
+      if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+          ${NEXUS_WASMTIME_ARGS:-} \
+          "$TMP" build "$f" -o "$wasm" --p2-component --explain-capabilities none \
+          >/dev/null 2>"$elog"; then
+        t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+        ms=$(( (t1 - t0) / 1000000 ))
+        tail_txt="$(tail -8 "$elog" 2>/dev/null)"
+        printf "FAIL\t%s\tp2c-compile\t%s\t%s\n" "$ms" "$f" "$tail_txt" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, p2c-compile)\n" "$f" "$ms" >&2
+        rm -f "$wasm"
+        exit 0
+      fi
+      t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+      if ! wasm-tools validate --features component-model "$wasm" >/dev/null 2>"$elog"; then
+        t2=$(date +%s%N 2>/dev/null || date +%s000000000)
+        ms=$(( (t2 - t1) / 1000000 ))
+        tail_txt="$(tail -8 "$elog" 2>/dev/null)"
+        printf "FAIL\t%s\tp2c-validate\t%s\t%s\n" "$ms" "$f" "$tail_txt" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, p2c-validate)\n" "$f" "$ms" >&2
+        if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
+        exit 0
+      fi
+      if ! wasmtime run -W component-model=y,exceptions=y \
+          --dir=. --dir="$scratch::/tmp" ${NEXUS_WASMTIME_ARGS:-} \
+          "$wasm" \
+          >/dev/null 2>"$elog"; then
+        t2=$(date +%s%N 2>/dev/null || date +%s000000000)
+        ms=$(( (t2 - t1) / 1000000 ))
+        tail_txt="$(tail -16 "$elog" 2>/dev/null)"
+        printf "FAIL\t%s\tp2c-run\t%s\t%s\n" "$ms" "$f" "$tail_txt" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, p2c-run)\n" "$f" "$ms" >&2
+        if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
+        exit 0
+      fi
+      t2=$(date +%s%N 2>/dev/null || date +%s000000000)
+      ms=$(( (t2 - t1) / 1000000 ))
+      printf "PASS\t%s\tp2c\t%s\t-\n" "$ms" "$f" \
+        > "$RESULTS_DIR/result_$idx.tsv"
+      printf "PASS  %s  (%sms, p2c)\n" "$f" "$ms" >&2
       if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
       exit 0
     fi
