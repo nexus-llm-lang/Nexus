@@ -47,27 +47,21 @@ import { Option, Some, None } from "std:option"
 import * as list from "std:list"
 import * as lexer from "src/frontend/lexer.nx"
 import { Span, SpannedToken, Token,
-         TkLet, TkFn, TkDo, TkEnd, TkIf, TkThen, TkElse, TkMatch, TkWhile,
-         TkFor, TkTo, TkReturn, TkImport, TkFrom, TkAs, TkExternal, TkPub,
-         TkOpaque, TkType, TkCap, TkHandler, TkInject, TkTry, TkCatch,
-         TkThrow, TkRequire, TkThrows, TkException, TkRef, TkWith,
-         TkPlus, TkMinus, TkStar, TkSlash, TkPlusPlus, TkPlusDot,
-         TkMinusDot, TkStarDot, TkSlashDot,
-         TkEqEq, TkBangEq, TkLt, TkGt, TkLe, TkGe,
-         TkEqEqDot, TkBangEqDot, TkLtDot, TkGtDot, TkLeDot, TkGeDot,
-         TkAndAnd, TkPipePipe, TkArrow, TkLArrow, TkEq, TkPipe, TkBang,
-         TkLParen, TkRParen, TkLBrace, TkRBrace, TkLBracket, TkRBracket,
-         TkLArray, TkRArray, TkComma, TkDot, TkColon, TkColonColon,
-         TkTilde, TkPercent, TkAmpersand, TkAt, TkCaret, TkShl, TkShr,
-         TkTrue, TkFalse, TkUnit,
-         TkInt, TkFloat, TkChar, TkString,
-         TkIdent, TkUident,
-         TkImportPath, TkError, TkEof } from "src/common/token.nx"
+         TkIdent, TkUident, TkString, TkInt, TkFloat, TkChar } from "src/common/token.nx"
 import * as str from "std:str"
-import * as char from "std:char"
 import { SemanticTokens, SemanticTokensLegend } from "src/lsp/protocol/completion.nx"
 import { saturating_pred } from "src/lsp/common.nx"
 import { SourcePos } from "src/common/source_pos.nx"
+import {
+  token_is_keyword, keyword_length,
+  token_is_operator, operator_length,
+  classify_ident, classify_uident
+} from "src/lsp/handlers/semantic_tokens/classify.nx"
+import {
+  utf16_len_range as chars_utf16_len_range,
+  ident_length, string_length, char_lit_length, number_length
+} from "src/lsp/handlers/semantic_tokens/chars.nx"
+import { semantic_tokens_legend as _semantic_tokens_legend } from "src/lsp/handlers/semantic_tokens/legend.nx"
 
 //
 // The legend ordering here is the contract advertised to clients via
@@ -96,539 +90,23 @@ export let tt_comment = 8
 /** Legend index for the "operator" semantic-token category. */
 export let tt_operator = 9
 
-/**
-The token-type legend the server advertises in `initialize`. Tests
-assert the exact ordering here; clients build their decoder against it.
-*/
-let legend_token_types = fn () -> [string] do
-  return [
-    "keyword",
-    "function",
-    "variable",
-    "parameter",
-    "type",
-    "variant",
-    "string",
-    "number",
-    "comment",
-    "operator"
-  ]
-end
-
-/**
-MVP modifier list — empty. The wire format still requires the field, so
-the legend exposes an empty array and every emitted tuple uses 0.
-*/
-let legend_token_modifiers = fn () -> [string] do
-  return []
-end
-
 /** Build the SemanticTokensLegend the server advertises in `initialize` — token-type names in legend index order, empty modifier list. */
 export let semantic_tokens_legend = fn () -> SemanticTokensLegend do
-  return SemanticTokensLegend(
-    token_types: legend_token_types(),
-    token_modifiers: legend_token_modifiers()
-  )
+  return _semantic_tokens_legend()
+end
+
+/** Intermediate semantic-token tuple (1-based line/col, length in chars, legend index) emitted in source order before delta-encoding into the wire `data` array. */
+export type SemTok = SemTok(line: i64, col: i64, length: i64, token_type: i64)
+
+/** Count UTF-16 code units for the UTF-8 source substring [from_byte, to_byte). */
+export let utf16_len_range = fn (src: string, from_byte: i64, to_byte: i64) -> i64 do
+  return chars_utf16_len_range(src, from_byte, to_byte)
 end
 
 //
 // We materialise a (line, col, length, token_type) tuple per emitted token
 // before delta-encoding, so the source-order walk can produce tokens out of
 // the lexer's stream (comments are emitted by a separate pass and merged).
-
-/** Intermediate semantic-token tuple (1-based line/col, length in chars, legend index) emitted in source order before delta-encoding into the wire `data` array. */
-export type SemTok = SemTok(line: i64, col: i64, length: i64, token_type: i64)
-
-//
-// Tokens that the LSP layer considers operators per the MVP legend. We
-// deliberately exclude `,` / `:` / `;` / `.` / parens / brackets — those are
-// punctuation and most clients leave them unstyled (or style via a separate
-// category outside the spec's standard legend).
-
-let token_is_operator = fn (t: Token) -> bool do
-  match t do
-    | TkPlus | TkMinus | TkStar | TkSlash
-    | TkPlusPlus | TkPlusDot | TkMinusDot | TkStarDot | TkSlashDot
-    | TkEqEq | TkBangEq | TkLt | TkGt | TkLe | TkGe
-    | TkEqEqDot | TkBangEqDot | TkLtDot | TkGtDot | TkLeDot | TkGeDot
-    | TkAndAnd | TkPipePipe | TkArrow | TkLArrow
-    | TkEq | TkPipe | TkBang | TkShl | TkShr -> return true
-    | _ -> return false
-  end
-end
-
-//
-// SpannedToken carries the source position but not the source-form length;
-// we recover it from the token kind for fixed-width operators. Variable-width
-// tokens (identifiers, literals, strings) carry their own surface form so we
-// inspect those at emit time instead of going through this table.
-
-let operator_length = fn (t: Token) -> i64 do
-  match t do
-    | TkPlus | TkMinus | TkStar | TkSlash
-    | TkLt | TkGt | TkEq | TkPipe | TkBang -> return 1
-    | TkPlusPlus | TkPlusDot | TkMinusDot | TkStarDot | TkSlashDot
-    | TkEqEq | TkBangEq | TkLe | TkGe | TkLtDot | TkGtDot
-    | TkAndAnd | TkPipePipe | TkArrow | TkLArrow | TkShl | TkShr -> return 2
-    | TkEqEqDot | TkBangEqDot | TkLeDot | TkGeDot -> return 3
-    | _ -> return 0
-  end
-end
-
-let token_is_keyword = fn (t: Token) -> bool do
-  match t do
-    | TkLet | TkFn | TkDo | TkEnd
-    | TkIf | TkThen | TkElse
-    | TkMatch | TkWhile | TkFor | TkTo | TkReturn
-    | TkImport | TkFrom | TkAs | TkExternal
-    | TkPub | TkOpaque | TkType | TkCap
-    | TkHandler | TkInject | TkTry | TkCatch | TkThrow
-    | TkRequire | TkThrows | TkException
-    | TkRef | TkWith | TkTrue | TkFalse | TkUnit -> return true
-    | _ -> return false
-  end
-end
-
-//
-// Tokens are interned by kind in the lexer; the source byte length must be
-// recovered from the kind.
-
-let keyword_length = fn (t: Token) -> i64 do
-  match t do
-    | TkLet | TkEnd | TkFor | TkCap | TkTry | TkRef -> return 3
-    | TkFn | TkDo | TkIf | TkTo | TkAs -> return 2
-    | TkThen | TkElse | TkFrom | TkType | TkWith | TkTrue | TkUnit -> return 4
-    | TkMatch | TkWhile | TkCatch | TkThrow | TkFalse -> return 5
-    | TkReturn | TkImport | TkPub | TkOpaque | TkInject | TkThrows -> return 6
-    | TkHandler | TkRequire -> return 7
-    | TkExternal -> return 8
-    | TkException -> return 9
-    | _ -> return 0
-  end
-end
-
-//
-// We need to peek both backwards and forwards inside the token stream while
-// classifying identifiers. The token list is singly-linked so backwards
-// access goes through an index-based view: we keep a parallel `idx` while
-// walking forward, and `token_at_index` reuses the array head for random
-// access. For MVP this is O(n) per peek, but the stream length is bounded
-// by the buffer size and the worst-case is dominated by the lexer pass
-// itself — no need for an index map yet.
-
-let token_at_index = fn (toks: [SpannedToken], idx: i64) -> Option<SpannedToken> do
-  if idx < 0 then return None end
-  match toks do
-    | [] -> return None
-    | t :: rest ->
-      if idx == 0 then return Some(val: t) end
-      return token_at_index(toks: rest, idx: idx - 1)
-  end
-end
-
-let token_kind_at = fn (toks: [SpannedToken], idx: i64) -> Option<Token> do
-  match token_at_index(toks, idx) do
-    | None -> return None
-    | Some(val: SpannedToken(token, span: _)) -> return Some(val: token)
-  end
-end
-
-// Find the previous token index that is "significant" — every token kind we
-// emit is significant; whitespace / comments aren't tokens in our lexer, so
-// `idx - 1` already skips them. This helper exists for future symmetry with
-// any future ignore-set.
-let prev_kind = fn (toks: [SpannedToken], idx: i64) -> Option<Token> do
-  return token_kind_at(toks, idx: idx - 1)
-end
-
-let next_kind = fn (toks: [SpannedToken], idx: i64) -> Option<Token> do
-  return token_kind_at(toks, idx: idx + 1)
-end
-
-let kind_is_let = fn (k: Token) -> bool do
-  match k do | TkLet -> return true | _ -> return false end
-end
-
-let kind_is_fn = fn (k: Token) -> bool do
-  match k do | TkFn -> return true | _ -> return false end
-end
-
-let kind_is_colon = fn (k: Token) -> bool do
-  match k do | TkColon -> return true | _ -> return false end
-end
-
-let kind_is_arrow = fn (k: Token) -> bool do
-  match k do | TkArrow -> return true | _ -> return false end
-end
-
-let kind_is_lparen = fn (k: Token) -> bool do
-  match k do | TkLParen -> return true | _ -> return false end
-end
-
-let kind_is_comma = fn (k: Token) -> bool do
-  match k do | TkComma -> return true | _ -> return false end
-end
-
-let kind_is_pipe = fn (k: Token) -> bool do
-  match k do | TkPipe -> return true | _ -> return false end
-end
-
-let kind_is_eq = fn (k: Token) -> bool do
-  match k do | TkEq -> return true | _ -> return false end
-end
-
-let kind_is_type = fn (k: Token) -> bool do
-  match k do | TkType -> return true | _ -> return false end
-end
-
-let kind_is_exception = fn (k: Token) -> bool do
-  match k do | TkException -> return true | _ -> return false end
-end
-
-let kind_is_dot = fn (k: Token) -> bool do
-  match k do | TkDot -> return true | _ -> return false end
-end
-
-// Skip backwards over tokens until we find one that isn't a `TkPub`/`TkOpaque`
-// modifier, returning the kind of the first content token. Used for the
-// `let NAME =` rule so `export let foo` still highlights `foo` as function /
-// variable.
-let prev_skipping_modifiers = fn (toks: [SpannedToken], idx: i64) -> Option<Token> do
-  if idx < 0 then return None end
-  match token_kind_at(toks, idx) do
-    | None -> return None
-    | Some(val: k) ->
-      match k do
-        | TkPub | TkOpaque -> return prev_skipping_modifiers(toks, idx: idx - 1)
-        | _ -> return Some(val: k)
-      end
-  end
-end
-
-// True when the token at `idx - 1` (after skipping `export` / `opaque`) is
-// `TkLet`. The `let` keyword's identifier is the binding name; classify it
-// based on the rhs (peek forward past `TkIdent TkEq`).
-let is_let_binding_name = fn (toks: [SpannedToken], idx: i64) -> bool do
-  match prev_skipping_modifiers(toks, idx: idx - 1) do
-    | Some(val: k) -> return kind_is_let(k)
-    | None -> return false
-  end
-end
-
-// Look forward over `= <rhs first significant token>` to decide whether a
-// let-binding's name should highlight as `function` or `variable`. If the
-// rhs is `fn`, the binding is a function definition. Otherwise variable.
-let rhs_first_kind = fn (toks: [SpannedToken], name_idx: i64) -> Option<Token> do
-  // Expect: name_idx, possibly `:` <type expr> (skip until `=`), then `=`, rhs.
-  // Walk forward to the `=`, then return the next token's kind.
-  return walk_to_eq_then_next(toks, idx: name_idx + 1, depth: 0)
-end
-
-// Skip tokens until we hit a top-level `=` (depth 0) or run out. `depth`
-// guards against `=` inside a nested type annotation (e.g. an `i64 = ...`
-// wouldn't happen but bracket nesting in the type expr is still tracked
-// defensively). Returns the kind of the token immediately after the `=`.
-let walk_to_eq_then_next = fn (toks: [SpannedToken], idx: i64, depth: i64) -> Option<Token> do
-  match token_kind_at(toks, idx) do
-    | None -> return None
-    | Some(val: k) ->
-      match k do
-        | TkLParen | TkLBracket | TkLBrace | TkLArray -> return walk_to_eq_then_next(toks, idx: idx + 1, depth: depth + 1)
-        | TkRParen | TkRBracket | TkRBrace | TkRArray -> return walk_to_eq_then_next(toks, idx: idx + 1, depth: depth - 1)
-        | TkEq ->
-          if depth == 0 then return token_kind_at(toks, idx: idx + 1) end
-          return walk_to_eq_then_next(toks, idx: idx + 1, depth)
-        | _ -> return walk_to_eq_then_next(toks, idx: idx + 1, depth)
-      end
-  end
-end
-
-// Is this identifier the name of a function parameter? We detect the shape
-// `( IDENT :` or `, IDENT :` directly. Both patterns appear inside `fn (...)`
-// signatures and inside `(name: value)` call sites — the latter aren't
-// parameters but the parser treats their names as field-style labels which
-// the LSP layer also colours as `parameter` for visual consistency.
-let is_parameter_position = fn (toks: [SpannedToken], idx: i64) -> bool do
-  match next_kind(toks, idx) do
-    | Some(val: nk) ->
-      if !kind_is_colon(nk) then return false end
-      match prev_kind(toks, idx) do
-        | Some(val: pk) ->
-          if kind_is_lparen(pk) then return true end
-          if kind_is_comma(pk) then return true end
-          return false
-        | None -> return false
-      end
-    | None -> return false
-  end
-end
-
-// Is this identifier in a type position? Detect `: IDENT` or `-> IDENT`.
-// Used for builtin lowercase type names like `i64`, `string`, `bool`.
-let is_type_position = fn (toks: [SpannedToken], idx: i64) -> bool do
-  match prev_kind(toks, idx) do
-    | Some(val: pk) ->
-      if kind_is_colon(pk) then return true end
-      if kind_is_arrow(pk) then return true end
-      return false
-    | None -> return false
-  end
-end
-
-// Is this uppercase identifier the name on the lhs of a `type` definition?
-// Detect `type IDENT =`. We accept an optional `export` / `opaque` before
-// `type` via `prev_skipping_modifiers`.
-let is_type_def_name = fn (toks: [SpannedToken], idx: i64) -> bool do
-  match prev_skipping_modifiers(toks, idx: idx - 1) do
-    | Some(val: k) -> return kind_is_type(k)
-    | None -> return false
-  end
-end
-
-// Is this uppercase identifier the name of an exception declaration?
-// Detect `exception IDENT(...)` or `exception group IDENT = ...`.
-let is_exception_def_name = fn (toks: [SpannedToken], idx: i64) -> bool do
-  match prev_skipping_modifiers(toks, idx: idx - 1) do
-    | Some(val: k) -> return kind_is_exception(k)
-    | None -> return false
-  end
-end
-
-// Classify a `TkIdent` (lowercase identifier) at `idx`.
-let classify_ident = fn (toks: [SpannedToken], idx: i64) -> i64 do
-  // Let-binding-name? Distinguish fn-binding (function) vs value-binding
-  // (variable) by peeking past `=` at the rhs head.
-  if is_let_binding_name(toks, idx) then
-    match rhs_first_kind(toks, name_idx: idx) do
-      | Some(val: k) ->
-        if kind_is_fn(k) then return tt_function end
-        return tt_variable
-      | None -> return tt_variable
-    end
-  end
-  // Parameter / field-label position?
-  if is_parameter_position(toks, idx) then return tt_parameter end
-  // Builtin lowercase type name (e.g. `i64`) in `: i64` / `-> i64`?
-  if is_type_position(toks, idx) then return tt_type end
-  // Default lowercase identifier — a value reference / call.
-  return tt_variable
-end
-
-// Classify a `TkUident` (uppercase identifier) at `idx`.
-//
-// Default: variant (constructor reference / variant decl). Bump to `type`
-// for the explicit `type Foo` / `exception Foo` decl-site, and for `Foo`
-// appearing in a type position (`: Foo` / `-> Foo`).
-let classify_uident = fn (toks: [SpannedToken], idx: i64) -> i64 do
-  if is_type_def_name(toks, idx) then return tt_type end
-  if is_exception_def_name(toks, idx) then return tt_type end
-  if is_type_position(toks, idx) then return tt_type end
-  return tt_variant
-end
-
-// UTF-16 length helpers
-//
-// Per LSP spec, all Position lengths must be UTF-16 code units. The source
-// is UTF-8, so we must convert each byte range to its UTF-16 unit count.
-//
-// Algorithm: walk each codepoint in [from_byte, to_byte).
-//   - 1-byte sequence  (0x00–0x7F): 1 UTF-16 unit
-//   - 2-byte sequence  (0xC0–0xDF): 1 UTF-16 unit
-//   - 3-byte sequence  (0xE0–0xEF): 1 UTF-16 unit
-//   - 4-byte sequence  (0xF0–0xFF): 2 UTF-16 units (surrogate pair)
-// Continuation bytes (0x80–0xBF) are skipped inside each sequence.
-//
-// For identifiers (ASCII-only) the result equals the byte count.
-
-// UTF-8 sequence length from the lead byte's integer value.
-let utf8_seq_len_of = fn (b: i64) -> i64 do
-  if b < 128 then return 1 end
-  if b < 192 then return 1 end  // continuation byte — treat as 1 to avoid stall
-  if b < 224 then return 2 end
-  if b < 240 then return 3 end
-  return 4
-end
-
-/** Count UTF-16 code units for the UTF-8 source substring [from_byte, to_byte). */
-export let utf16_len_range = fn (src: string, from_byte: i64, to_byte: i64) -> i64 do
-  let src_len = str.byte_length(s: src)
-  return utf16_len_range_go(src, src_len, p: from_byte, limit: to_byte, acc: 0)
-end
-
-let utf16_len_range_go = fn (src: string, src_len: i64, p: i64, limit: i64, acc: i64) -> i64 do
-  if p >= limit then return acc end
-  if p >= src_len then return acc end
-  let b = char.ord(c: str.byte_at(s: src, idx: p))
-  let seq = utf8_seq_len_of(b)
-  // A 4-byte UTF-8 sequence encodes a codepoint >= U+10000, which needs a
-  // surrogate pair in UTF-16 (2 code units). All other sequences → 1 unit.
-  let units = if seq == 4 then 2 else 1 end
-  return utf16_len_range_go(src, src_len, p: p + seq, limit, acc: acc + units)
-end
-
-// Identifier surface-name length — bytes between the start span and the
-// next non-ident byte in the source. We reuse `str.scan_ident` to recover
-// the exact byte length the lexer consumed.
-// Identifiers are ASCII-only, so byte count == UTF-16 unit count.
-let ident_length = fn (src: string, span: Span) -> i64 do
-  match span do | Span(offset, line: _, col: _) ->
-    let end_pos = str.scan_ident(s: src, start: offset)
-    return end_pos - offset
-  end
-end
-
-// Number literal length. The token carries the parsed value but not the
-// surface form; we walk the source from the start span and count digits +
-// optional decimal point + exponent letters. For our MVP we accept the
-// shape `[0-9_]+(\.[0-9_]*)?([eE][+-]?[0-9_]+)?` which covers every literal
-// the lexer emits today.
-
-let ch_zero = '0'
-let ch_nine = '9'
-let ch_dot_byte = '.'
-let ch_underscore_byte = '_'
-let ch_lower_e = 'e'
-let ch_upper_e = 'E'
-let ch_plus_byte = '+'
-let ch_minus_byte = '-'
-let ch_lower_x = 'x'
-let ch_lower_b = 'b'
-let ch_lower_o = 'o'
-let ch_upper_x = 'X'
-let ch_upper_b = 'B'
-let ch_upper_o = 'O'
-let ch_lower_a = 'a'
-let ch_lower_f = 'f'
-let ch_upper_a = 'A'
-let ch_upper_f = 'F'
-
-let is_digit_or_underscore = fn (c: char) -> bool do
-  if c >= ch_zero && c <= ch_nine then return true end
-  if c == ch_underscore_byte then return true end
-  return false
-end
-
-let is_hex_digit = fn (c: char) -> bool do
-  if c >= ch_zero && c <= ch_nine then return true end
-  if c >= ch_lower_a && c <= ch_lower_f then return true end
-  if c >= ch_upper_a && c <= ch_upper_f then return true end
-  if c == ch_underscore_byte then return true end
-  return false
-end
-
-let scan_decimal_run = fn (src: string, src_len: i64, p: i64) -> i64 do
-  if p >= src_len then return p end
-  let c = str.byte_at(s: src, idx: p)
-  if !is_digit_or_underscore(c) then return p end
-  return scan_decimal_run(src, src_len, p: p + 1)
-end
-
-let scan_hex_run = fn (src: string, src_len: i64, p: i64) -> i64 do
-  if p >= src_len then return p end
-  let c = str.byte_at(s: src, idx: p)
-  if !is_hex_digit(c) then return p end
-  return scan_hex_run(src, src_len, p: p + 1)
-end
-
-let number_length = fn (src: string, span: Span) -> i64 do
-  match span do | Span(offset, line: _, col: _) ->
-    let src_len = str.byte_length(s: src)
-    if offset >= src_len then return 1 end
-    // Hex / bin / oct prefix?
-    let c0 = str.byte_at(s: src, idx: offset)
-    if c0 == ch_zero && offset + 1 < src_len then
-      let c1 = str.byte_at(s: src, idx: offset + 1)
-      if c1 == ch_lower_x || c1 == ch_upper_x then
-        let end_pos = scan_hex_run(src, src_len, p: offset + 2)
-        if end_pos == offset + 2 then return 2 end
-        return end_pos - offset
-      end
-      if c1 == ch_lower_b || c1 == ch_upper_b then
-        let end_pos = scan_decimal_run(src, src_len, p: offset + 2)
-        if end_pos == offset + 2 then return 2 end
-        return end_pos - offset
-      end
-      if c1 == ch_lower_o || c1 == ch_upper_o then
-        let end_pos = scan_decimal_run(src, src_len, p: offset + 2)
-        if end_pos == offset + 2 then return 2 end
-        return end_pos - offset
-      end
-    end
-    // Plain decimal (optionally float).
-    let int_end = scan_decimal_run(src, src_len, p: offset)
-    let after_int = int_end
-    let after_frac = if after_int < src_len && str.byte_at(s: src, idx: after_int) == ch_dot_byte then
-      scan_decimal_run(src, src_len, p: after_int + 1)
-    else
-      after_int
-    end
-    let after_exp = if after_frac < src_len && (str.byte_at(s: src, idx: after_frac) == ch_lower_e || str.byte_at(s: src, idx: after_frac) == ch_upper_e) then
-      let exp_start = after_frac + 1
-      let signed_start = if exp_start < src_len && (str.byte_at(s: src, idx: exp_start) == ch_plus_byte || str.byte_at(s: src, idx: exp_start) == ch_minus_byte) then exp_start + 1 else exp_start end
-      scan_decimal_run(src, src_len, p: signed_start)
-    else
-      after_frac
-    end
-    if after_exp <= offset then return 1 end
-    return after_exp - offset
-  end
-end
-
-// String literal length: from the opening `"` byte, walk to the closing
-// `"`, honouring `\` escapes. The result is a UTF-16 code-unit count as
-// required by the LSP spec.
-
-let ch_dquote_byte = '"'
-let ch_backslash_byte = '\\'
-
-let scan_string_close = fn (src: string, src_len: i64, p: i64) -> i64 do
-  if p >= src_len then return p end
-  let c = str.byte_at(s: src, idx: p)
-  if c == ch_dquote_byte then return p + 1 end
-  if c == ch_backslash_byte then
-    if p + 1 >= src_len then return p + 1 end
-    return scan_string_close(src, src_len, p: p + 2)
-  end
-  return scan_string_close(src, src_len, p: p + 1)
-end
-
-let string_length = fn (src: string, span: Span) -> i64 do
-  match span do | Span(offset, line: _, col: _) ->
-    let src_len = str.byte_length(s: src)
-    if offset >= src_len then return 2 end
-    let end_pos = scan_string_close(src, src_len, p: offset + 1)
-    if end_pos <= offset then return 2 end
-    return utf16_len_range(src, from_byte: offset, to_byte: end_pos)
-  end
-end
-
-let ch_squote_byte = '\''
-
-let scan_char_close = fn (src: string, src_len: i64, p: i64) -> i64 do
-  if p >= src_len then return p end
-  let c = str.byte_at(s: src, idx: p)
-  if c == ch_squote_byte then return p + 1 end
-  if c == ch_backslash_byte then
-    if p + 1 >= src_len then return p + 1 end
-    return scan_char_close(src, src_len, p: p + 2)
-  end
-  return scan_char_close(src, src_len, p: p + 1)
-end
-
-let char_lit_length = fn (src: string, span: Span) -> i64 do
-  match span do | Span(offset, line: _, col: _) ->
-    let src_len = str.byte_length(s: src)
-    if offset >= src_len then return 3 end
-    let end_pos = scan_char_close(src, src_len, p: offset + 1)
-    if end_pos <= offset then return 3 end
-    return utf16_len_range(src, from_byte: offset, to_byte: end_pos)
-  end
-end
-
-//
-// Walk the tokens, indexing forward. Emit a SemTok per recognised token,
-// skip the rest. We collect in reverse and reverse once at the end so the
-// per-step append is O(1).
 
 let classify_token = fn (
   src: string,
@@ -703,9 +181,9 @@ end
 let ch_slash_byte = '/'
 let ch_star_byte = '*'
 let ch_nl_byte = '\n'
-
-// Track (line, col) while scanning the source so emitted SemToks carry the
-// 1-based AST coords the rest of the pipeline expects.
+let ch_dquote_byte = '"'
+let ch_backslash_byte = '\\'
+let ch_squote_byte = '\''
 
 let bump_line = fn (s: SourcePos) -> SourcePos do
   match s do | SourcePos(pos, line, col: _) ->
@@ -777,12 +255,18 @@ let scan_block_comment_end = fn (
   return scan_block_comment_end(src, src_len, s: advance_state(src, s), depth)
 end
 
+let find_newline_or_end = fn (src: string, src_len: i64, p: i64, limit: i64) -> i64 do
+  if p >= limit then return limit end
+  if p >= src_len then return src_len end
+  if str.byte_at(s: src, idx: p) == ch_nl_byte then return p end
+  return find_newline_or_end(src, src_len, p: p + 1, limit)
+end
+
 // Emit one SemTok per *line* of a comment that runs from `start_state` to
 // `end_state`. A line comment trivially produces one token. A block comment
 // spanning N lines produces N tokens, each covering the comment's portion
 // of its own line. This keeps the LSP delta-encode happy (each tuple stays
 // on a single line) without forcing the client to handle multi-line spans.
-
 let emit_comment_lines_go = fn (
   src: string,
   start_pos: i64, start_line: i64, start_col: i64,
@@ -790,7 +274,6 @@ let emit_comment_lines_go = fn (
   acc: [SemTok]
 ) -> [SemTok] do
   if start_pos >= end_pos then return acc end
-  // Find the next newline at or after start_pos but before end_pos.
   let src_len = str.byte_length(s: src)
   let nl_pos = find_newline_or_end(src, src_len, p: start_pos, limit: end_pos)
   let line_end_pos = nl_pos
@@ -803,13 +286,6 @@ let emit_comment_lines_go = fn (
   if nl_pos >= end_pos then return acc2 end
   // Skip past the newline and continue on the next line.
   return emit_comment_lines_go(src, start_pos: nl_pos + 1, start_line: start_line + 1, start_col: 1, end_pos, acc: acc2)
-end
-
-let find_newline_or_end = fn (src: string, src_len: i64, p: i64, limit: i64) -> i64 do
-  if p >= limit then return limit end
-  if p >= src_len then return src_len end
-  if str.byte_at(s: src, idx: p) == ch_nl_byte then return p end
-  return find_newline_or_end(src, src_len, p: p + 1, limit)
 end
 
 let scan_comments_go = fn (
@@ -882,6 +358,13 @@ let semtok_pos_lt = fn (a: SemTok, b: SemTok) -> bool do
   end
 end
 
+let prepend_reversed = fn (rest: [SemTok], acc: [SemTok]) -> [SemTok] do
+  match rest do
+    | [] -> return acc
+    | t :: r -> return prepend_reversed(rest: r, acc: t :: acc)
+  end
+end
+
 let merge_streams = fn (a: [SemTok], b: [SemTok], acc: [SemTok]) -> [SemTok] do
   match a do
     | [] -> return prepend_reversed(rest: b, acc)
@@ -894,13 +377,6 @@ let merge_streams = fn (a: [SemTok], b: [SemTok], acc: [SemTok]) -> [SemTok] do
           end
           return merge_streams(a, b: bt, acc: bh :: acc)
       end
-  end
-end
-
-let prepend_reversed = fn (rest: [SemTok], acc: [SemTok]) -> [SemTok] do
-  match rest do
-    | [] -> return acc
-    | t :: r -> return prepend_reversed(rest: r, acc: t :: acc)
   end
 end
 
